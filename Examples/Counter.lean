@@ -36,14 +36,14 @@ def update (m : Model) : Msg → Model
 def view (m : Model) : Html Msg :=
   div [] [
     div [cls "counter"] [
-      button [onClick .decrement] [text "−"],
-      span   [cls "count"]        [text (toString m.count)],
-      button [onClick .increment] [text "+"],
-      button [onClick .reset]     [text "reset"]
+      button [onClick .decrement] "−",
+      span   [cls "count"]        [toString m.count],
+      button [onClick .increment] "+",
+      button [onClick .reset]     "reset"
     ],
     -- This input is never rebuilt by an update: the diff engine only patches the
     -- count text above, so whatever you type here keeps its focus and cursor.
-    input [attr "placeholder" "type here — focus survives every click"]
+    input [placeholder "type here — focus survives every click"]
   ]
 
 def app : App Model Msg := sandbox init update view

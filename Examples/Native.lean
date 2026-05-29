@@ -9,7 +9,7 @@ open Qed
 
 def main : IO Unit := do
   let render (label : String) (m : Model) : IO Unit :=
-    IO.println s!"{label} (count={m.count}): {Html.renderToString (view m)}"
+    IO.println s!"{label} (count={m.count}): {(view m).render}"
   let s0 := init
   let s1 := update s0 .increment
   let s2 := update s1 .increment

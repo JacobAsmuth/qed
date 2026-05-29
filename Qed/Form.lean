@@ -11,9 +11,12 @@
   and the rest of Lean's logic. `Field.validate` needs a `Decidable` instance for
   the spec; writing specs as `abbrev` (reducible) lets Lean synthesise it.
 
-  The `canSubmit_iff` theorem states the UI contract: the submit button is enabled
-  *exactly* when every field satisfies its spec. The "enabled" bit is the decision
-  procedure for validity, so they cannot drift apart.
+  The `form` command declares the structure, its `ofRaw` validator, its `canSubmit`
+  gate, *and* the `canSubmit_iff` proof — written once, no hand proof:
+
+      form Signup where
+        email    : Email;
+        password : MinLen 8
 -/
 namespace Qed
 
@@ -37,11 +40,54 @@ theorem isSome_validate (p : String → Prop) [DecidablePred p] (s : String) :
 
 end Field
 
+/-! ### The `form` command
+
+`form T where f₁ : p₁; …; fₙ : pₙ` expands to a structure with `fieldᵢ : Field pᵢ`,
+an `ofRaw` that validates raw strings into `Option T`, a `canSubmit` gate, and the
+proof `canSubmit … ↔ p₁ … ∧ … ∧ pₙ …`. Core-syntax only (no `import Lean`). -/
+
+open Lean in
+syntax (name := formCmd) "form " ident " where " sepBy1(group(ident " : " term), "; ") : command
+
+open Lean in
+macro_rules
+  | `(form $t:ident where $[$fs:ident : $ps:term];*) => do
+      -- `fs` stays the ident array (for output splices `$fs:ident`); `ft` is the
+      -- same names as terms, for the application/proof syntax we build below.
+      let ft : Array (TSyntax `term) := fs.map fun f => ⟨f.raw⟩
+      let pairs := ft.zip ps
+      let ofRawId     := mkIdent (Name.str t.getId "ofRaw")
+      let canSubmitId := mkIdent (Name.str t.getId "canSubmit")
+      let iffId       := mkIdent (Name.str t.getId "canSubmit_iff")
+      -- validate calls and the two applications, prebuilt (so `$fs` is used once
+      -- per splice — reusing a splice variable twice is rejected).
+      let valCalls ← pairs.mapM fun (f, p) => `(Field.validate $p $f)
+      let ofRawCall     ← ft.foldlM (init := (⟨ofRawId.raw⟩ : TSyntax `term))     fun acc f => `($acc $f)
+      let canSubmitCall ← ft.foldlM (init := (⟨canSubmitId.raw⟩ : TSyntax `term)) fun acc f => `($acc $f)
+      -- RHS conjunction: p₁ f₁ ∧ … ∧ pₙ fₙ
+      let conjs ← pairs.mapM fun (f, p) => `($p $f)
+      let rhs ← match conjs.toList with
+        | []      => `(True)
+        | c :: cs => cs.foldlM (init := c) fun acc x => `($acc ∧ $x)
+      -- Proof: rewrite each spec to `(validate …).isSome`, unfold, case-split.
+      let rwIso    ← pairs.mapM fun (f, p) => `(Lean.Parser.Tactic.rwRule| ← Field.isSome_validate $p $f)
+      let rwUnfold ← #[canSubmitId, ofRawId].mapM fun id => `(Lean.Parser.Tactic.rwRule| $id:ident)
+      let rwRules := rwIso ++ rwUnfold
+      let casesTac ← pairs.foldrM (init := ← `(tactic| simp)) fun (f, p) acc =>
+        `(tactic| cases Field.validate $p $f <;> $acc)
+      `(structure $t where
+          $[$fs:ident : Field $ps:term]*
+        def $ofRawId $[($fs:ident : String)]* : Option $t := do
+          $[let $fs:ident ← $valCalls:term]*
+          return { $[$fs:ident],* }
+        def $canSubmitId $[($fs:ident : String)]* : Bool := ($ofRawCall).isSome
+        theorem $iffId $[($fs:ident : String)]* : $canSubmitCall = true ↔ $rhs := by
+          rw [$rwRules,*] ; $casesTac)
+
 /-! ### An example form
 
 Lives in `Qed.Demo` so its field-spec names (`Email`, `MinLen`) don't collide with
-the ones an application defines. It is also the form whose `canSubmit_iff` the axiom
-manifest checks. -/
+the ones an application defines. Its `canSubmit_iff` is checked by the manifest. -/
 
 namespace Demo
 
@@ -52,30 +98,9 @@ abbrev Email (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
 /-- A field must be at least `n` characters. -/
 abbrev MinLen (n : Nat) (s : String) : Prop := s.length ≥ n
 
-/-- A validated sign-up: each field carries its proof of validity. There is no
-    way to build this from invalid input. -/
-structure Signup where
-  email    : Field Email
-  password : Field (MinLen 8)
-
-/-- Validate the whole form from raw inputs; `none` if any field is invalid. -/
-def Signup.ofRaw (email password : String) : Option Signup := do
-  let email    ← Field.validate Email email
-  let password ← Field.validate (MinLen 8) password
-  return { email, password }
-
-/-- Whether the submit button should be enabled for the given raw inputs. -/
-def Signup.canSubmit (email password : String) : Bool :=
-  (Signup.ofRaw email password).isSome
-
-/-- Submit is enabled *exactly* when every field is valid: the enabled-state and
-    the validity spec are the same proposition. -/
-theorem Signup.canSubmit_iff (email password : String) :
-    Signup.canSubmit email password = true ↔ Email email ∧ MinLen 8 password := by
-  rw [← Field.isSome_validate Email email, ← Field.isSome_validate (MinLen 8) password,
-      canSubmit, Signup.ofRaw]
-  cases Field.validate Email email <;>
-    cases Field.validate (MinLen 8) password <;> simp
+form Signup where
+  email    : Email;
+  password : MinLen 8
 
 end Demo
 

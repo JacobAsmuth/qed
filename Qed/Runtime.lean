@@ -38,12 +38,36 @@ def escapeHtml (s : String) : String :=
       | '\'' => "&#39;"
       | c    => c.toString
 
+/-- The key an attribute occupies, if any (`onClick` occupies none). -/
+def Attr.key? : Attr msg → Option String
+  | .attr k _ => some k
+  | .flag k _ => some k
+  | _         => none
+
+/-- Drop all but the last occurrence of each keyed attribute (last write wins,
+    matching `setAttribute`); keyless attributes (`onClick`) are all kept. -/
+def dedupAttrs : List (Attr msg) → List (Attr msg)
+  | []        => []
+  | a :: rest =>
+      match a.key? with
+      | none   => a :: dedupAttrs rest
+      | some k => if rest.any (·.key? == some k) then dedupAttrs rest else a :: dedupAttrs rest
+
+/-- Collapse an attribute list to a canonical form: every `cls` merged into one
+    `class`, later values winning for duplicate keys. The string renderer and the
+    live DOM driver both apply this, so the markup and the DOM cannot disagree. -/
+def normalizeAttrs (attrs : List (Attr msg)) : List (Attr msg) :=
+  let classes := (attrs.filterMap (fun | .cls c => some c | _ => none)).filter (· != "")
+  let merged  := if classes.isEmpty then [] else [Attr.cls (String.intercalate " " classes)]
+  merged ++ dedupAttrs (attrs.filter (fun | .cls _ => false | _ => true))
+
 /-- Render one attribute, threading the handler table. An `onClick` is emitted as
     a `data-qed-click="<id>"` attribute, where `<id>` indexes the message that the
     JS delegation listener will dispatch back. -/
 def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .cls c     => (s!" class=\"{escapeHtml c}\"", hs)
   | .attr k v  => (s!" {k}=\"{escapeHtml v}\"", hs)
+  | .flag k on => (if on then s!" {k}=\"{k}\"" else "", hs)
   | .onClick m => (s!" data-qed-click=\"{hs.size}\"", hs.push m)
 
 /-- Render a list of attributes left-to-right, threading the handler table. -/
@@ -60,7 +84,7 @@ mutual
   def renderNode (hs : Array msg) : Html msg → String × Array msg
     | .text s => (escapeHtml s, hs)
     | .element tag attrs children =>
-        let (attrStr,  hs1) := renderAttrs hs attrs
+        let (attrStr,  hs1) := renderAttrs hs (normalizeAttrs attrs)
         let (childStr, hs2) := renderChildren hs1 children
         (s!"<{tag}{attrStr}>{childStr}</{tag}>", hs2)
   /-- Render a list of children, threading the handler table. -/
@@ -71,5 +95,9 @@ mutual
         let (s2, hs2) := renderChildren hs1 cs
         (s1 ++ s2, hs2)
 end
+
+/-- Render a node to an HTML string (model data escaped). The single renderer:
+    used for native sanity checks and server-side rendering. -/
+def Html.render (h : Html msg) : String := (renderNode #[] h).1
 
 end Qed

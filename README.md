@@ -48,10 +48,10 @@ def update (m : Model) : Msg → Model
 
 def view (m : Model) : Html Msg :=
   div [cls "counter"] [
-    button [onClick .decrement] [text "−"],
-    span   [cls "count"]        [text (toString m.count)],
-    button [onClick .increment] [text "+"],
-    button [onClick .reset]     [text "reset"]
+    button [onClick .decrement] "−",            -- a bare string is a text child
+    span   [cls "count"]        [toString m.count],
+    button [onClick .increment] "+",
+    button [onClick .reset]     "reset"
   ]
 
 def app : App Model Msg := sandbox init update view
@@ -70,26 +70,19 @@ The snippets below assume `import Qed` and `open Qed`.
 ### Reading JSON, with errors handled
 
 `Json.parse` is total and depth-bounded: malformed or too-deeply-nested input
-returns an `.error`, it never throws. `jsonCodec` generates a typed decoder, so
-turning a response body into a value is one `do` block in the `Except` monad —
-the first failing field is the result.
+returns an `.error`, it never throws. `jsonStruct` declares a structure and its
+typed `ToJson`/`FromJson` in one go — the field list is written *once* — so turning
+a response body into a value is a `do` block in the `Except` monad.
 
 ```lean
-structure User where
-  name : String
-  age  : Nat
-  tags : List String
-deriving Repr
-jsonCodec User [name, age, tags]            -- generates ToJson + FromJson
+jsonStruct User where
+  name : String;
+  age  : Nat;                  -- a `Nat` field rejects negatives
+  bio  : Option String         -- optional: absent or null ⇒ none
 
 def decodeUser (body : String) : Except String User := do
-  let json ← Json.parse body                -- .error on malformed / too-deep input
-  fromJson json                             -- .error "expected …" on a type mismatch
-
--- decodeUser {"name":"Ada","age":36,"tags":["logic"]}
---   ⇒ .ok { name := "Ada", age := 36, tags := ["logic"] }
--- decodeUser {"name":"Ada","age":-1}
---   ⇒ .error "expected a non-negative integer"   -- a missing key reports its name too
+  let json ← Json.parse body   -- .error on malformed / too-deep input
+  fromJson json                -- .error "age: expected a non-negative integer" (names the field)
 ```
 
 When you only need one value out of a larger payload, reach in dynamically. Every
@@ -107,27 +100,26 @@ def cityOf (body : String) : Option String :=
 A form field is a `Field p`: a `String` paired with a proof that the proposition
 `p` holds of it. Specs are ordinary Lean propositions, so they compose with `∧`,
 `≥`, and the rest of the logic; write them as `abbrev` so the `Decidable` instance
-`Field.validate` needs is inferred automatically.
+validation needs is inferred automatically.
 
 ```lean
 abbrev Email  (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
 abbrev MinLen (n : Nat) (s : String) : Prop := s.length ≥ n
 
-structure Signup where
-  email    : Field Email
-  password : Field (MinLen 8)
+form Signup where
+  email    : Email;
+  password : MinLen 8
 ```
 
 A `Field`'s only constructor is validation, so a `Signup` value is itself evidence
 that every field is valid — an invalid form is unrepresentable, and any handler
-taking one cannot run on bad input. Build it only from inputs that pass:
+taking one cannot run on bad input. The `form` command generates, from that one
+declaration:
 
-```lean
-def Signup.ofRaw (email password : String) : Option Signup := do
-  let email    ← Field.validate Email email
-  let password ← Field.validate (MinLen 8) password
-  return { email, password }
-```
+- the `Signup` structure (`email : Field Email`, `password : Field (MinLen 8)`),
+- `Signup.ofRaw (email password : String) : Option Signup` — `some` only when both validate,
+- `Signup.canSubmit … : Bool`, and
+- a proof `Signup.canSubmit e p = true ↔ Email e ∧ MinLen 8 p` — no hand-written proof.
 
 ### Putting it in an app
 
@@ -157,10 +149,9 @@ def update (m : Model) : Msg → Model
 def view (m : Model) : Html Msg :=
   let valid := (Signup.ofRaw m.email m.password).isSome
   div [cls "app"] [
-    input  [attr "type" "email",    attr "value" m.email],
-    input  [attr "type" "password", attr "value" m.password],
-    button (if valid then [onClick .submit] else [attr "disabled" "true"])
-      [text "Create account"]
+    input  [type' "email",    value m.email],       -- typed attrs: key typos won't compile
+    input  [type' "password", value m.password],
+    button [disabled (!valid), onClick .submit] "Create account"
   ]
 ```
 
@@ -236,9 +227,9 @@ CLI against this checkout.
 | `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`) + pure render-to-HTML. |
 | `Qed/Invariant.lean` | The `invariant … preserved_by …` command (auto-proven). |
 | `Qed/Diff.lean` | The diff/patch engine + the `diff_apply` correctness proof. |
-| `Qed/Json.lean` | Full JSON parser/renderer + typed `jsonCodec` + `parse_depth_le` & `parse_render` proofs. |
+| `Qed/Json.lean` | Full JSON parser/renderer + `jsonStruct`/`jsonCodec` + `parse_depth_le` & `parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field) + a route table. |
-| `Qed/Form.lean` | `Prop`-refinement form fields (`Field p`) + the `canSubmit_iff` proof. |
+| `Qed/Form.lean` | `Prop`-refinement fields (`Field p`) + the `form` command (generates the `canSubmit_iff` proof). |
 | `Qed/Dom.lean` | The `@[extern]` DOM node primitives (the trusted boundary). |
 | `Qed/Driver.lean` | The impure browser driver (build + patch) + `@[export]`ed entry points. |
 | `Examples/Counter.lean` | The demo app (shared by both entry points). |

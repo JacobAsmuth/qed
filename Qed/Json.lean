@@ -595,6 +595,32 @@ instance [FromJson α] : FromJson (Array α) :=
 instance [FromJson α] : FromJson (Option α) :=
   ⟨fun j => match j with | .null => .ok none | _ => (fromJson j : Except String α).map some⟩
 
+/-! ### Decoding one object field
+
+`FromJsonField` decodes the value at a key. The default requires the key present
+and prefixes any decode error with the key name (so errors say *which* field
+failed). The `Option` instance treats an absent key — or an explicit `null` — as
+`none`, so optional fields need not appear in the JSON at all. -/
+
+class FromJsonField (α : Type) where
+  fromField : Json → String → Except String α
+export FromJsonField (fromField)
+
+instance (priority := low) [FromJson α] : FromJsonField α where
+  fromField j key := match j.field key with
+    | .error e => .error e                       -- e.g. "missing key 'age'"
+    | .ok v    => match (fromJson v : Except String α) with
+                  | .ok a    => .ok a
+                  | .error e => .error s!"{key}: {e}"
+
+instance [FromJson α] : FromJsonField (Option α) where
+  fromField j key := match j.get? key with
+    | none       => .ok none                     -- key absent
+    | some .null => .ok none                     -- key present but null
+    | some v     => match (fromJson v : Except String α) with
+                    | .ok a    => .ok (some a)
+                    | .error e => .error s!"{key}: {e}"
+
 /-! ### `jsonCodec` — generate ToJson/FromJson for a structure
 
 `jsonCodec User [name, age, tags]` produces both instances, mapping each field to
@@ -614,6 +640,22 @@ macro_rules
           toJson x := Json.obj [$pairs,*]
         instance : FromJson $t where
           fromJson j := do
-            return { $[$fields:ident := (← fromJson (← j.field $keys))],* })
+            return { $[$fields:ident := (← fromField j $keys)],* })
+
+/-! ### `jsonStruct` — declare a structure and its codec at once
+
+`jsonStruct` reads the field names straight from the declaration, so the field
+list is written *once* (a plain `structure` + `jsonCodec User [name, …]` repeats
+it, and the two can silently drift). Still core-syntax only — no `import Lean`. -/
+
+open Lean in
+syntax (name := jsonStructCmd) "jsonStruct " ident " where " sepBy1(group(ident " : " term), "; ") : command
+
+open Lean in
+macro_rules
+  | `(jsonStruct $t:ident where $[$fs:ident : $tys:term];*) =>
+      `(structure $t where
+          $[$fs:ident : $tys:term]*
+        jsonCodec $t [$fs,*])
 
 end Qed

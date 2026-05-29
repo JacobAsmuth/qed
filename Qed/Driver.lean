@@ -21,21 +21,28 @@ import Qed.Dom
 namespace Qed
 
 /-- Install one attribute on a DOM node. An `onClick` is registered by appending
-    its message to the handler table and tagging the node with the index. -/
+    its message to the handler table and tagging the node with the index. A `flag`
+    is applied only when on (clearing handles the off case). -/
 def applyAttr (handlers : IO.Ref (Array msg)) (node : Dom.Node) : Attr msg → IO Unit
   | .cls c     => Dom.setAttribute node "class" c
   | .attr k v  => Dom.setAttribute node k v
+  | .flag k on => if on then Dom.setAttribute node k k else pure ()
   | .onClick m => do
       let hs ← handlers.get
       handlers.set (hs.push m)
       Dom.setAttribute node "data-qed-click" (toString hs.size)
+
+/-- Apply a (normalized) attribute list, so the live DOM matches what `render`
+    would produce — classes merged, duplicate keys collapsed. -/
+def applyAttrs (handlers : IO.Ref (Array msg)) (node : Dom.Node) (attrs : List (Attr msg)) : IO Unit := do
+  for a in normalizeAttrs attrs do applyAttr handlers node a
 
 /-- Build a fresh DOM subtree from an `Html` node, returning its handle. -/
 partial def buildDom (handlers : IO.Ref (Array msg)) : Html msg → IO Dom.Node
   | .text s => Dom.createText s
   | .element tag attrs children => do
       let node ← Dom.createElement tag
-      for a in attrs do applyAttr handlers node a
+      applyAttrs handlers node attrs
       for c in children do
         Dom.appendChild node (← buildDom handlers c)
       return node
@@ -48,7 +55,10 @@ partial def applyToDom (handlers : IO.Ref (Array msg))
       Dom.replaceChild parent index (← buildDom handlers new)
   | .setText s => Dom.setText node s
   | .patchElement attrs kids => do
-      for a in attrs do applyAttr handlers node a
+      -- clear then re-apply so attributes dropped or toggled off since the last
+      -- render actually leave the DOM (node identity, hence focus, is preserved)
+      Dom.clearAttributes node
+      applyAttrs handlers node attrs
       let mut i : UInt32 := 0
       for kid in kids do
         applyToDom handlers node i (← Dom.childAt node i) kid

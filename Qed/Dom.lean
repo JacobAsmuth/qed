@@ -28,6 +28,11 @@ opaque createText (content : String) : IO Node
 @[extern "qed_dom_set_attribute"]
 opaque setAttribute (node : Node) (key value : String) : IO Unit
 
+/-- Remove every attribute from an element. The driver clears then re-applies on
+    each patch, so a dropped or toggled-off attribute actually leaves the DOM. -/
+@[extern "qed_dom_clear_attributes"]
+opaque clearAttributes (node : Node) : IO Unit
+
 /-- Append `child` as the last child of `parent`. -/
 @[extern "qed_dom_append_child"]
 opaque appendChild (parent child : Node) : IO Unit

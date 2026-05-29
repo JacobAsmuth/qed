@@ -37,6 +37,13 @@ EM_JS(void, qed_js_set_attribute, (int node, const char *k, const char *v), {
   if (el) el.setAttribute(UTF8ToString(k), UTF8ToString(v));
 });
 
+EM_JS(void, qed_js_clear_attributes, (int node), {
+  var el = globalThis.__qed.nodes[node];
+  if (el && el.attributes) {
+    while (el.attributes.length > 0) el.removeAttribute(el.attributes[0].name);
+  }
+});
+
 EM_JS(void, qed_js_append_child, (int parent, int child), {
   var N = globalThis.__qed.nodes;
   if (N[parent] && N[child]) N[parent].appendChild(N[child]);
@@ -90,6 +97,12 @@ LEAN_EXPORT lean_object *qed_dom_set_attribute(uint32_t node, lean_object *k, le
   (void) world;
   qed_js_set_attribute((int) node, lean_string_cstr(k), lean_string_cstr(v));
   lean_dec(k); lean_dec(v);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *qed_dom_clear_attributes(uint32_t node, lean_object *world) {
+  (void) world;
+  qed_js_clear_attributes((int) node);
   return lean_io_result_mk_ok(lean_box(0));
 }
 

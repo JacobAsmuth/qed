@@ -15,12 +15,6 @@ Qed apps compile to WebAssembly and run in the browser, and because the code is
   theorem depends only on Lean's core axioms (`propext`, `Quot.sound`), never
   `sorry`.
 
-The design rule is *outside-in*: start from the most readable, maximally-proven
-Lean a developer would want to write, then build whatever elaboration machinery
-(macros, `deriving`, refinement types, proof automation) makes that surface real.
-The macros and notation elaborate into that small typed core, so they don't change
-what is proven.
-
 ## Install
 
 ```bash
@@ -69,87 +63,104 @@ invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
 That's the whole app. `lake build` checking it green *is* the proof that it is
 total and that `counterSafe` holds.
 
-![the counter running in a browser](runtime/counter.png)
+## Examples
 
-## Proven building blocks
+The snippets below assume `import Qed` and `open Qed`.
 
-Beyond the runtime, Qed ships verified pieces for the things frontends actually
-do. Each states a spec and the framework discharges the proof — you never write
-one by hand. (Axioms below are all sound Lean foundations; none use `sorry`.)
+### Reading JSON, with errors handled
 
-**Verified VDOM diff/patch** (`Qed/Diff.lean`). The incremental update path is
-proven identical to a full re-render, so the DOM can never drift from your view:
+`Json.parse` is total and depth-bounded: malformed or too-deeply-nested input
+returns an `.error`, it never throws. `jsonCodec` generates a typed decoder, so
+turning a response body into a value is one `do` block in the `Except` monad —
+the first failing field is the result.
 
 ```lean
-theorem diff_apply (a b : Html msg) : applyPatch (diff a b) a = b
+structure User where
+  name : String
+  age  : Nat
+  tags : List String
+deriving Repr
+jsonCodec User [name, age, tags]            -- generates ToJson + FromJson
+
+def decodeUser (body : String) : Except String User := do
+  let json ← Json.parse body                -- .error on malformed / too-deep input
+  fromJson json                             -- .error "expected …" on a type mismatch
+
+-- decodeUser {"name":"Ada","age":36,"tags":["logic"]}
+--   ⇒ .ok { name := "Ada", age := 36, tags := ["logic"] }
+-- decodeUser {"name":"Ada","age":-1}
+--   ⇒ .error "expected a non-negative integer"   -- a missing key reports its name too
 ```
 
-**JSON** (`Qed/Json.lean`). The full grammar — objects, arrays, strings (with
-escapes incl. `\uXXXX`), and exact numbers (`JsonNumber`) — nested to any depth.
-Termination is free (structural recursion on a fuel counter), and the
-developer-chosen depth bound is a theorem:
+When you only need one value out of a larger payload, reach in dynamically. Every
+step is an `Option`, so the wrong shape is just `none` — no exceptions:
 
 ```lean
-def parse (s : String) (maxDepth : Nat := 64) : Except String Json
-theorem parse_depth_le : parse s maxDepth = .ok j → j.depth ≤ maxDepth
--- and the codec round-trip, proven for the structural core (null/bool/nested arrays):
-theorem parse_render : j.Simple → j.depth ≤ maxDepth → parse (render j) maxDepth = .ok j
+def cityOf (body : String) : Option String :=
+  (Json.parse body).toOption
+    |>.bind (·.path? ["address", "city"])
+    |>.bind (·.str?)
 ```
 
-Typed encode/decode is one line per type via a core-syntax macro (no `import
-Lean`, so no elaborator in the WASM binary):
+### A form that can't carry invalid data
+
+A form field is a `Refined p`: a `String` paired with a proof that the predicate
+`p` holds of it. Its only constructor is validation, so a value of the form type
+is itself evidence that every field is valid — an invalid form is unrepresentable,
+and any handler that takes one cannot run on bad input.
 
 ```lean
-structure User where name : String; age : Nat; address : Address; tags : List String
-jsonCodec User [name, age, address, tags]   -- ToJson + FromJson; nested structs work
+def validEmail (s : String) : Bool := s.contains '@'
+def validAge   (s : String) : Bool :=
+  match s.toNat? with
+  | some n => decide (13 ≤ n)
+  | none   => false
+
+structure Account where
+  email : Refined validEmail
+  age   : Refined validAge
+
+-- Build it only from inputs that pass; `none` otherwise.
+def Account.ofRaw (email age : String) : Option Account := do
+  let email ← Refined.validate validEmail email
+  let age   ← Refined.validate validAge age
+  return { email, age }
 ```
 
-**Round-tripping routes** (`Qed/Router.lean`). The round-trip law is a *field of
-the `Router` class*, so an instance cannot exist without it — no route is
-unreachable, no URL fails to parse back:
+### Putting it in an app
+
+`update` is a pure function from the model and a message to the next model; `view`
+maps the model to typed HTML. The submit button below is enabled *exactly* when
+the inputs validate (`Account.ofRaw … |>.isSome`), so the button can't disagree
+with the data. `lake build` rejects this module unless every `Msg` is handled and
+both functions terminate.
 
 ```lean
-inductive Route | home | about | post (slug : String) | user (name : String)
-theorem Route.round_trip (r : Route) : parse (print r) = some r   -- by `cases r <;> simp`
-```
-
-**Forms where submit-enabled ⇔ valid** (`Qed/Form.lean`). Fields are refinement
-types (a value carries its proof of validity), so an invalid form is
-unrepresentable and the submit gate *is* the validity decision:
-
-```lean
-structure Signup where               -- can only be built from valid input
-  email : Refined isEmail
-  age   : Refined isAdult
-theorem Signup.canSubmit_iff : canSubmit email age = true ↔ isEmail email ∧ isAdult age
-```
-
-## Example: loading data into a typed model
-
-A page that loads a user from an API and tracks its current route:
-
-```lean
-inductive Route | home | profile (name : String) deriving DecidableEq, Repr
-
-structure User where name : String; age : Nat; tags : List String
-jsonCodec User [name, age, tags]              -- one line: ToJson + FromJson
-
 structure Model where
-  route : Route
-  user  : Option User                         -- decoded, or not loaded yet
+  route : Route                               -- a typed page, never a stray string
+  user  : Option User                         -- decoded from the API, or not loaded
+  email : String                              -- raw form inputs
+  age   : String
 
 inductive Msg
   | navigate (to : Route)
-  | apiResult (body : String)                 -- a raw fetch response body
+  | apiResult (body : String)                 -- a fetch response body
+  | submit
 
 def update (m : Model) : Msg → Model
   | .navigate to    => { m with route := to }
-  | .apiResult body => { m with user := (Json.parse body >>= fromJson).toOption }
-```
+  | .apiResult body => { m with user := (decodeUser body).toOption }
+  | .submit         => m
 
-No proof is written, but `lake build` rejects this unless `update` handles every
-`Msg` and terminates, `Json.parse` is depth-bounded for any `body`, `fromJson` is
-total, and nothing uses `sorry`.
+def view (m : Model) : Html Msg :=
+  let valid := (Account.ofRaw m.email m.age).isSome
+  div [cls "app"] [
+    input  [attr "type" "email",  attr "value" m.email],
+    input  [attr "type" "number", attr "value" m.age],
+    button (if valid then [onClick .submit] else [attr "disabled" "true"])
+      [text "Create account"]
+  ]
+```
 
 ## What this lets you prove
 
@@ -182,7 +193,7 @@ runtime/host.js:  qed_run_init() mounts;  DOM event → qed_run_dispatch(id)
 ```
 
 On each event the new view is diffed against the previous one and only the
-changed nodes are patched — so the proven `diff_apply` theorem (see below)
+changed nodes are patched — so the proven `diff_apply` theorem (above)
 guarantees the DOM equals the new view, while untouched nodes keep their identity
 (focus, cursor, scroll, selection all survive an update).
 

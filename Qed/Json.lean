@@ -218,6 +218,11 @@ def parse (s : String) (maxDepth : Nat := 64) : Except String Json :=
   | .error e   => .error e
   | .ok (j, r) => if (skipWs r).isEmpty then .ok j else .error "trailing characters"
 
+/-- The qualified name `Json.parse`, for call sites that prefer it. Reducible, so
+    `parse_depth_le` and friends apply through it unchanged. -/
+abbrev Json.parse (s : String) (maxDepth : Nat := 64) : Except String Json :=
+  Qed.parse s maxDepth
+
 /-! ### The depth bound, proven -/
 
 mutual

@@ -14,3 +14,4 @@ import Examples.Counter
 #print axioms Qed.parse_depth_le     -- JSON depth bound
 #print axioms Qed.Route.round_trip   -- routing round-trip
 #print axioms Qed.Signup.canSubmit_iff  -- form submit ⇔ valid
+#print axioms Qed.parse_render     -- JSON codec round-trip (structural core)

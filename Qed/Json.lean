@@ -144,21 +144,23 @@ mutual
           | 0          => .error "maximum depth exceeded"
           | budget + 1 =>
               match skipWs r with
-              | ']' :: r' => .ok (.arr [], r')           -- empty array
-              | r0 =>
-                  match parseElems fuel budget r0 with
-                  | .ok (es, r') => .ok (.arr es, r')
-                  | .error e     => .error e
+              | []      => .error "unexpected end of input"
+              | c :: r' =>
+                  if c = ']' then .ok (.arr [], r')      -- empty array
+                  else match parseElems fuel budget (c :: r') with
+                       | .ok (es, r'') => .ok (.arr es, r'')
+                       | .error e      => .error e
       | '{' :: r =>
           match budget with
           | 0          => .error "maximum depth exceeded"
           | budget + 1 =>
               match skipWs r with
-              | '}' :: r' => .ok (.obj [], r')           -- empty object
-              | r0 =>
-                  match parseMembers fuel budget r0 with
-                  | .ok (ms, r') => .ok (.obj ms, r')
-                  | .error e     => .error e
+              | []      => .error "unexpected end of input"
+              | c :: r' =>
+                  if c = '}' then .ok (.obj [], r')      -- empty object
+                  else match parseMembers fuel budget (c :: r') with
+                       | .ok (ms, r'') => .ok (.obj ms, r'')
+                       | .error e      => .error e
       | c :: rest =>
           if c == '-' || isDigit c then
             match parseNum (c :: rest) with
@@ -334,12 +336,16 @@ mutual
     | .obj ms       => '{' :: (renderMembersL ms ++ ['}'])
   def renderElemsL : List Json → List Char
     | []      => []
-    | [e]     => renderL e
-    | e :: es => renderL e ++ ',' :: renderElemsL es
+    | e :: es => renderL e ++ renderElemSep es
+  def renderElemSep : List Json → List Char
+    | []      => []
+    | x :: xs => ',' :: (renderL x ++ renderElemSep xs)
   def renderMembersL : List (String × Json) → List Char
     | []           => []
-    | [(k, v)]     => renderStrL k ++ ':' :: renderL v
-    | (k, v) :: ms => renderStrL k ++ ':' :: renderL v ++ ',' :: renderMembersL ms
+    | (k, v) :: ms => renderStrL k ++ ':' :: (renderL v ++ renderMemberSep ms)
+  def renderMemberSep : List (String × Json) → List Char
+    | []           => []
+    | (k, v) :: ms => ',' :: (renderStrL k ++ ':' :: (renderL v ++ renderMemberSep ms))
 end
 
 /-- Render a value to a JSON string. -/
@@ -348,16 +354,183 @@ end Json
 
 /-! ### Codec round-trip
 
-`parse (render j) = .ok j`. Proven here for the scalar leaves null and bool;
-the recursive cases (arrays, objects) and the other scalars (numbers, strings)
-are the next increments — they need render-length arithmetic for the fuel bound,
-an integer `toString`-inverse lemma, and a string escape-inverse lemma. -/
+`parse (render j) = .ok j` for the *structural core*: null, booleans, and (nested)
+arrays. Numbers, strings, and objects are the next increments — they additionally
+need an integer `toString`-inverse lemma and a string escape-inverse lemma. -/
 
-theorem parse_render_null : parse (Json.render Json.null) = .ok Json.null := by rfl
+namespace Json
 
-theorem parse_render_bool (b : Bool) :
-    parse (Json.render (Json.bool b)) = .ok (Json.bool b) := by
-  cases b <;> rfl
+/-- The first round-trip scope: no numbers, strings, or objects. -/
+inductive Simple : Json → Prop
+  | null : Simple .null
+  | bool (b : Bool) : Simple (.bool b)
+  | arr (es : List Json) : (∀ e ∈ es, Simple e) → Simple (.arr es)
+
+/-- A rendered value begins with a non-whitespace character other than `]`. -/
+theorem simple_head {j : Json} (h : Simple j) :
+    ∃ c t, renderL j = c :: t ∧ isWs c = false ∧ c ≠ ']' := by
+  cases h with
+  | null     => exact ⟨'n', ['u','l','l'], rfl, by decide, by decide⟩
+  | bool b   => cases b with
+                | true  => exact ⟨'t', ['r','u','e'], rfl, by decide, by decide⟩
+                | false => exact ⟨'f', ['a','l','s','e'], rfl, by decide, by decide⟩
+  | arr es _ => exact ⟨'[', renderElemsL es ++ [']'], rfl, by decide, by decide⟩
+
+theorem depth_le_maxArr {e : Json} {es : List Json} (h : e ∈ es) : depth e ≤ maxArr es := by
+  induction es with
+  | nil => simp at h
+  | cons x xs ih =>
+      rcases List.mem_cons.mp h with rfl | hmem
+      · simp only [maxArr]; exact Nat.le_max_left _ _
+      · simp only [maxArr]; exact Nat.le_trans (ih hmem) (Nat.le_max_right _ _)
+
+/-- `skipWs` is the identity on rendered output (it never starts with whitespace). -/
+theorem skipWs_renderL {j : Json} (h : Simple j) (x : List Char) :
+    skipWs (renderL j ++ x) = renderL j ++ x := by
+  obtain ⟨c, t, hren, hcws, _⟩ := simple_head h
+  rw [hren, List.cons_append]
+  simp [skipWs, hcws]
+
+theorem skipWs_renderElemsL {e : Json} {es : List Json} (h : Simple e) (x : List Char) :
+    skipWs (renderElemsL (e :: es) ++ x) = renderElemsL (e :: es) ++ x := by
+  simp only [renderElemsL, List.append_assoc]
+  exact skipWs_renderL h _
+
+end Json
+
+/-- The parser's array branch reduces to wrapping `parseElems`, given that the
+    element list does not begin with `]`. This isolates the only `match` on a
+    variable list-head, discharged via `simple_head` (`c ≠ ']'`). -/
+theorem parseVal_arr {e : Json} {es : List Json} (he : Json.Simple e)
+    (f b : Nat) (rest : List Char) :
+    parseVal (f + 1) (b + 1) ('[' :: (Json.renderElemsL (e :: es) ++ ']' :: rest))
+      = (match parseElems f b (Json.renderElemsL (e :: es) ++ ']' :: rest) with
+         | .ok (vs, r') => .ok (Json.arr vs, r')
+         | .error msg   => .error msg) := by
+  obtain ⟨c, t, hren, hcws, hcbr⟩ := Json.simple_head he
+  have hcons : Json.renderElemsL (e :: es) ++ ']' :: rest
+             = c :: (t ++ Json.renderElemSep es ++ ']' :: rest) := by
+    simp only [Json.renderElemsL, hren, List.cons_append, List.append_assoc]
+  -- The parser reduces definitionally up to the (unresolved) inner `skipWs`.
+  have step : parseVal (f + 1) (b + 1) ('[' :: (Json.renderElemsL (e :: es) ++ ']' :: rest))
+            = (match skipWs (Json.renderElemsL (e :: es) ++ ']' :: rest) with
+               | []      => .error "unexpected end of input"
+               | c :: r' => if c = ']' then .ok (Json.arr [], r')
+                            else (match parseElems f b (c :: r') with
+                                  | .ok (es', r'') => .ok (Json.arr es', r'')
+                                  | .error e       => .error e)) := rfl
+  rw [step, Json.skipWs_renderElemsL (es := es) he (']' :: rest), hcons]
+  simp only [if_neg hcbr]
+
+/-- One-step unfolding of `parseElems` at successor fuel (definitional). -/
+theorem parseElems_step (f budget : Nat) (cs : List Char) :
+    parseElems (f + 1) budget cs
+      = (match parseVal f budget cs with
+         | .error msg => .error msg
+         | .ok (v, r) =>
+             match skipWs r with
+             | ',' :: r' =>
+                 (match parseElems f budget (skipWs r') with
+                  | .ok (vs, r'') => .ok (v :: vs, r'')
+                  | .error e      => .error e)
+             | ']' :: r' => .ok ([v], r')
+             | _         => .error "expected ',' or ']'") := rfl
+
+mutual
+  theorem rt_val : ∀ (j : Json), Json.Simple j → ∀ (budget fuel : Nat) (rest : List Char),
+      j.depth ≤ budget → (Json.renderL j).length < fuel →
+      parseVal fuel budget (Json.renderL j ++ rest) = .ok (j, rest)
+    | .null, _, budget, fuel, rest, _, hf => by
+        cases fuel with
+        | zero => simp [Json.renderL] at hf
+        | succ f => simp [Json.renderL, parseVal, skipWs, isWs]
+    | .bool b, _, budget, fuel, rest, _, hf => by
+        cases fuel with
+        | zero => cases b <;> simp [Json.renderL] at hf
+        | succ f => cases b <;> simp [Json.renderL, parseVal, skipWs, isWs]
+    | .arr [], _, budget, fuel, rest, hd, hf => by
+        cases fuel with
+        | zero => simp [Json.renderL, Json.renderElemsL] at hf
+        | succ f => cases budget with
+          | zero => simp [Json.depth, Json.maxArr] at hd
+          | succ b => simp [Json.renderL, Json.renderElemsL, parseVal, skipWs, isWs]
+    | .arr (e :: es), h, budget, fuel, rest, hd, hf => by
+        have hsimp : ∀ x ∈ (e :: es), Json.Simple x := by cases h with | arr _ hs => exact hs
+        have hse : Json.Simple e := hsimp e (by simp)
+        have hses : ∀ x ∈ es, Json.Simple x := fun x hx => hsimp x (by simp [hx])
+        cases budget with
+        | zero => simp [Json.depth] at hd
+        | succ b =>
+            simp only [Json.depth] at hd
+            have hmax : Json.maxArr (e :: es) ≤ b := by omega
+            have hde : Json.depth e ≤ b :=
+              Nat.le_trans (Json.depth_le_maxArr (List.mem_cons_self e es)) hmax
+            have hdes : ∀ x ∈ es, Json.depth x ≤ b :=
+              fun x hx => Nat.le_trans (Json.depth_le_maxArr (List.mem_cons_of_mem e hx)) hmax
+            cases fuel with
+            | zero => simp [Json.renderL, Json.renderElemsL] at hf
+            | succ f =>
+                have hfe : (Json.renderElemsL (e :: es)).length + 1 < f := by
+                  simp only [Json.renderL, List.length_cons, List.length_append] at hf; omega
+                have key := rt_elems e es hse hses b f rest hde hdes hfe
+                have harr : Json.renderL (Json.arr (e :: es)) ++ rest
+                          = '[' :: (Json.renderElemsL (e :: es) ++ ']' :: rest) := by
+                  simp [Json.renderL]
+                rw [harr, parseVal_arr hse f b rest, key]
+    | .num _, h, _, _, _, _, _ => nomatch h
+    | .str _, h, _, _, _, _, _ => nomatch h
+    | .obj _, h, _, _, _, _, _ => nomatch h
+  theorem rt_elems : ∀ (e : Json) (es : List Json), Json.Simple e → (∀ x ∈ es, Json.Simple x) →
+      ∀ (budget fuel : Nat) (rest : List Char),
+      Json.depth e ≤ budget → (∀ x ∈ es, Json.depth x ≤ budget) →
+      (Json.renderElemsL (e :: es)).length + 1 < fuel →
+      parseElems fuel budget (Json.renderElemsL (e :: es) ++ ']' :: rest) = .ok (e :: es, rest)
+    | e, [], he, _, budget, fuel, rest, hde, _, hf => by
+        cases fuel with
+        | zero => omega
+        | succ f =>
+            have hfe : (Json.renderL e).length < f := by
+              simp only [Json.renderElemsL, Json.renderElemSep, List.append_nil,
+                         List.length_append, List.length_nil] at hf; omega
+            have hv := rt_val e he budget f (']' :: rest) hde hfe
+            have harg : Json.renderElemsL (e :: []) ++ ']' :: rest = Json.renderL e ++ ']' :: rest := by
+              simp [Json.renderElemsL, Json.renderElemSep]
+            rw [harg, parseElems_step, hv]
+            simp [skipWs, isWs]
+    | e, x :: xs, he, hxs, budget, fuel, rest, hde, hdxs, hf => by
+        cases fuel with
+        | zero => omega
+        | succ f =>
+            have hxe : Json.Simple x := hxs x (by simp)
+            have hxxs : ∀ y ∈ xs, Json.Simple y := fun y hy => hxs y (by simp [hy])
+            have hdx : Json.depth x ≤ budget := hdxs x (by simp)
+            have hdxxs : ∀ y ∈ xs, Json.depth y ≤ budget := fun y hy => hdxs y (by simp [hy])
+            simp only [Json.renderElemsL, Json.renderElemSep, List.length_append,
+                       List.length_cons] at hf
+            have hfe : (Json.renderL e).length < f := by omega
+            have hfx : (Json.renderElemsL (x :: xs)).length + 1 < f := by
+              simp only [Json.renderElemsL, Json.renderElemSep, List.length_append,
+                         List.length_cons]; omega
+            have hv := rt_val e he budget f
+              (',' :: (Json.renderElemsL (x :: xs) ++ ']' :: rest)) hde hfe
+            have key := rt_elems x xs hxe hxxs budget f rest hdx hdxxs hfx
+            have harg : Json.renderElemsL (e :: x :: xs) ++ ']' :: rest
+                      = Json.renderL e ++ ',' :: (Json.renderElemsL (x :: xs) ++ ']' :: rest) := by
+              simp only [Json.renderElemsL, Json.renderElemSep, List.cons_append, List.append_assoc]
+            have hcomma : skipWs (',' :: (Json.renderElemsL (x :: xs) ++ ']' :: rest))
+                        = ',' :: (Json.renderElemsL (x :: xs) ++ ']' :: rest) := by simp [skipWs, isWs]
+            have h2 := Json.skipWs_renderElemsL (es := xs) hxe (']' :: rest)
+            rw [harg, parseElems_step, hv]
+            simp only [hcomma, h2, key]
+end
+
+/-- **Codec round-trip** for the structural core: parsing a rendered value
+    recovers it exactly. -/
+theorem parse_render {j : Json} (hj : Json.Simple j) {maxDepth : Nat}
+    (h : j.depth ≤ maxDepth) : parse (Json.render j) maxDepth = .ok j := by
+  have hv := rt_val j hj maxDepth ((Json.renderL j).length + 1) [] h (by omega)
+  simp only [List.append_nil] at hv
+  simp only [parse, Json.render, String.toList, hv, skipWs, List.isEmpty_nil, if_true]
 
 /-! ### Dynamic access -/
 

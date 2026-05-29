@@ -92,6 +92,8 @@ developer-chosen depth bound is a theorem:
 ```lean
 def parse (s : String) (maxDepth : Nat := 64) : Except String Json
 theorem parse_depth_le : parse s maxDepth = .ok j → j.depth ≤ maxDepth
+-- and the codec round-trip, proven for the structural core (null/bool/nested arrays):
+theorem parse_render : j.Simple → j.depth ≤ maxDepth → parse (render j) maxDepth = .ok j
 ```
 
 Typed encode/decode is one line per type via a core-syntax macro (no `import
@@ -177,7 +179,7 @@ CLI against this checkout.
 | `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`) + pure render-to-HTML. |
 | `Qed/Invariant.lean` | The `invariant … preserved_by …` command (auto-proven). |
 | `Qed/Diff.lean` | The diff/patch engine + the `diff_apply` correctness proof. |
-| `Qed/Json.lean` | Full JSON parser/renderer + typed `jsonCodec` + the `parse_depth_le` proof. |
+| `Qed/Json.lean` | Full JSON parser/renderer + typed `jsonCodec` + `parse_depth_le` & `parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field) + a route table. |
 | `Qed/Form.lean` | Refinement-typed forms + the `canSubmit_iff` proof. |
 | `Qed/Dom.lean` | The `@[extern]` DOM node primitives (the trusted boundary). |
@@ -204,13 +206,14 @@ CLI against this checkout.
 **Done** (all kernel-checked, `sorry`-free — run `./qed check`):
 the verified core, an end-to-end browser slice, the verified diff/patch engine,
 state-machine invariants, full-grammar JSON (parser + renderer + typed codec +
-depth bound), round-tripping routes, and refinement-typed forms.
+depth bound + codec round-trip on the structural core), round-tripping routes,
+and refinement-typed forms.
 
 **Next:**
 
-- **JSON codec round-trip** — prove `parse (render j) = .ok j`, starting on the
-  structural core and growing it. The hard parts are an integer
-  `toString`/parse-inverse lemma and an escape-inverse lemma for strings.
+- **Extend the JSON codec round-trip** — `parse_render` covers null/bool/nested
+  arrays today; extending it to numbers, strings, and objects needs an integer
+  `toString`/parse-inverse lemma and a string escape-inverse lemma.
 - **`Cmd`-based effects** — async/data-fetching as data, so `update` stays pure
   and total: `update : Model → Msg → Model × Cmd Msg`, with the JS driver
   interpreting fetch/timer commands.

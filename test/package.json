@@ -1,0 +1,1 @@
+{"name":"qed-browser-test","private":true,"type":"module","dependencies":{"puppeteer":"^25.1.0"}}

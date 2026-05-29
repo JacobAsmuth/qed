@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Qed — a provably-total counter</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      max-width: 38rem; margin: 4rem auto; padding: 0 1.5rem; line-height: 1.5;
+    }
+    h1 { font-size: 1.4rem; margin-bottom: .25rem; }
+    .sub { color: #888; font-size: .85rem; margin-top: 0; }
+    .counter {
+      display: flex; align-items: center; gap: .75rem;
+      margin: 2rem 0; font-size: 1.5rem;
+    }
+    .counter button {
+      font-size: 1.1rem; min-width: 2.5rem; padding: .4rem .7rem;
+      border: 1px solid currentColor; border-radius: .5rem; cursor: pointer;
+      background: transparent; color: inherit;
+    }
+    .counter .count { min-width: 3rem; text-align: center; font-variant-numeric: tabular-nums; font-weight: 600; }
+    footer { color: #888; font-size: .8rem; border-top: 1px solid #8884; padding-top: 1rem; }
+    code { background: #8881; padding: .1rem .3rem; border-radius: .25rem; }
+  </style>
+</head>
+<body>
+  <h1>Qed counter</h1>
+  <p class="sub">Written in Lean 4, compiled to WebAssembly. The <code>update</code> and
+     <code>view</code> are <strong>total by construction</strong>, and a kernel-checked
+     theorem proves the count never drops below zero.</p>
+
+  <div id="app">loading…</div>
+
+  <footer>
+    The markup above was produced by a pure Lean function and mounted via a thin
+    JS driver. Try the buttons — every transition is the proven <code>update</code>.
+  </footer>
+
+  <script src="qed.js"></script>
+  <script src="host.js"></script>
+
+  <script>
+    // `qed dev` live-reload: poll the build id and reload when it changes.
+    // In a production build there is no /__build_id, so this is a silent no-op.
+    (function () {
+      let last = null;
+      setInterval(async () => {
+        try {
+          const r = await fetch('/__build_id', { cache: 'no-store' });
+          if (!r.ok) return;
+          const id = await r.text();
+          if (last === null) last = id;
+          else if (id !== last) location.reload();
+        } catch (_) { /* server down between rebuilds — ignore */ }
+      }, 600);
+    })();
+  </script>
+</body>
+</html>

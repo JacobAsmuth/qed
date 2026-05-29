@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#
+# qed — the Qed toolchain entry point.
+#
+# Sets up the environment (Lean via elan, emscripten via emsdk), builds the
+# CLI if needed, then runs it. Usage: `./qed <command>`.
+# Put this directory on your PATH to use `qed <command>` from anywhere in the project.
+set -euo pipefail
+
+# Run from the project root regardless of where we're invoked.
+cd "$(dirname "$(readlink -f "$0")")"
+
+export PATH="${HOME}/.elan/bin:${PATH}"
+# In-repo development: the framework is the current directory, and the demo's
+# web entry is Examples.Web (installed apps default to `Web`).
+export QED_HOME="${PWD}"
+export QED_WEB_ROOT="Examples.Web"
+# shellcheck disable=SC1091
+source "${HOME}/emsdk/emsdk_env.sh" >/dev/null 2>&1 || true
+
+# Build the CLI (fast no-op when up to date), then hand off.
+if ! lake build qed >/dev/null 2>&1; then
+  echo "qed: failed to build the CLI" >&2
+  lake build qed   # re-run to show the error
+  exit 1
+fi
+
+exec .lake/build/bin/qed "$@"

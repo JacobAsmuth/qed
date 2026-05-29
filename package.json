@@ -1,0 +1,14 @@
+{
+  "name": "qed-app",
+  "private": true,
+  "description": "npm-script aliases for the qed toolchain — for web devs who reach for `npm run dev`.",
+  "scripts": {
+    "dev": "./qed dev",
+    "build": "./qed build",
+    "start": "./qed start",
+    "preview": "./qed preview",
+    "test": "./qed test",
+    "check": "./qed check",
+    "clean": "./qed clean"
+  }
+}

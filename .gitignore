@@ -1,0 +1,9 @@
+/.lake/
+/.qed/
+/dist/
+/toolchains/
+/test/node_modules/
+/runtime/qed.js
+/runtime/qed.wasm
+/runtime/__build_id
+*.olean

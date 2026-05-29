@@ -346,6 +346,19 @@ end
 def render (j : Json) : String := ⟨renderL j⟩
 end Json
 
+/-! ### Codec round-trip
+
+`parse (render j) = .ok j`. Proven here for the scalar leaves null and bool;
+the recursive cases (arrays, objects) and the other scalars (numbers, strings)
+are the next increments — they need render-length arithmetic for the fuel bound,
+an integer `toString`-inverse lemma, and a string escape-inverse lemma. -/
+
+theorem parse_render_null : parse (Json.render Json.null) = .ok Json.null := by rfl
+
+theorem parse_render_bool (b : Bool) :
+    parse (Json.render (Json.bool b)) = .ok (Json.bool b) := by
+  cases b <;> rfl
+
 /-! ### Dynamic access -/
 
 def Json.bool? : Json → Option Bool                  | .bool b => some b | _ => none

@@ -124,6 +124,49 @@ structure Signup where               -- can only be built from valid input
 theorem Signup.canSubmit_iff : canSubmit email age = true ↔ isEmail email ∧ isAdult age
 ```
 
+## Example: loading data into a typed model
+
+A page that loads a user from an API and tracks its current route:
+
+```lean
+inductive Route | home | profile (name : String) deriving DecidableEq, Repr
+
+structure User where name : String; age : Nat; tags : List String
+jsonCodec User [name, age, tags]              -- one line: ToJson + FromJson
+
+structure Model where
+  route : Route
+  user  : Option User                         -- decoded, or not loaded yet
+
+inductive Msg
+  | navigate (to : Route)
+  | apiResult (body : String)                 -- a raw fetch response body
+
+def update (m : Model) : Msg → Model
+  | .navigate to    => { m with route := to }
+  | .apiResult body => { m with user := (Json.parse body >>= fromJson).toOption }
+```
+
+No proof is written, but `lake build` rejects this unless `update` handles every
+`Msg` and terminates, `Json.parse` is depth-bounded for any `body`, `fromJson` is
+total, and nothing uses `sorry`.
+
+## What this lets you prove
+
+Each property below is checked by `qed check`, with no hand-written proof:
+
+- **Diff equals re-render** — `applyPatch (diff a b) a = b` (`Qed/Diff.lean`).
+  Untouched nodes keep their focus, scroll, and input state.
+- **Parser depth bound** — `parse s maxDepth = .ok j → j.depth ≤ maxDepth`
+  (`parse_depth_le`), for any input.
+- **JSON round-trip** — `parse (render j) = .ok j` on the structural core (`parse_render`).
+- **URL round-trip** — `parse (print r) = some r` (`Route.round_trip`); the law is a
+  field of the `Router` class, so an instance can't omit it.
+- **Submit ⇔ valid** — `canSubmit e a = true ↔ isEmail e ∧ isAdult a` (`canSubmit_iff`).
+- **Totality** — `update`/`view` have no `panic`, no missing case, no infinite loop.
+- **State-machine invariant** — `invariant p preserved_by update` proves `p` holds
+  after every message.
+
 ## How it works
 
 ```

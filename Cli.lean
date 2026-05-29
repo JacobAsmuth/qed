@@ -141,10 +141,13 @@ def linkWasm (outDir : FilePath) (prod : Bool) : IO Bool := do
   ensureToolchain
   let wr ← webRoot
   if (← sh "lake" #["build", wr ++ ":c.o"]) != 0 then return false
-  -- Collect C from the project and from Lake dependency packages (the qed lib).
+  -- Collect *generated* Lean C from the project and from Lake dependency packages
+  -- (the qed lib) — only files under a `build/ir` dir, never hand-written C like
+  -- the framework's runtime/*.c that a git dependency carries in its checkout.
   -- Native.c / Cli.c each carry their own `main`; only the web entry's belongs.
   let allC ← collect ".lake" "c"
-  let cfiles := allC.filter (fun p => (p.fileName.getD "") ∉ ["Native.c", "Cli.c"])
+  let cfiles := allC.filter (fun p =>
+    (p.toString.splitOn "build/ir").length > 1 && (p.fileName.getD "") ∉ ["Native.c", "Cli.c"])
   IO.FS.createDirAll outDir
   let tc ← toolchainDir
   let qh ← frameworkHome

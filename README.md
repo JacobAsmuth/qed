@@ -84,13 +84,22 @@ proven identical to a full re-render, so the DOM can never drift from your view:
 theorem diff_apply (a b : Html msg) : applyPatch (diff a b) a = b
 ```
 
-**Depth-bounded JSON** (`Qed/Json.lean`). The developer picks a maximum nesting
-depth; a hostile input can never exceed it. Termination is free (structural
-recursion on a fuel counter), and the bound is a theorem:
+**JSON** (`Qed/Json.lean`). The full grammar — objects, arrays, strings (with
+escapes incl. `\uXXXX`), and exact numbers (`JsonNumber`) — nested to any depth.
+Termination is free (structural recursion on a fuel counter), and the
+developer-chosen depth bound is a theorem:
 
 ```lean
-def parse (maxDepth : Nat) (s : String) : Except String Json
-theorem parse_depth_le : parse maxDepth s = .ok j → j.depth ≤ maxDepth
+def parse (s : String) (maxDepth : Nat := 64) : Except String Json
+theorem parse_depth_le : parse s maxDepth = .ok j → j.depth ≤ maxDepth
+```
+
+Typed encode/decode is one line per type via a core-syntax macro (no `import
+Lean`, so no elaborator in the WASM binary):
+
+```lean
+structure User where name : String; age : Nat; address : Address; tags : List String
+jsonCodec User [name, age, address, tags]   -- ToJson + FromJson; nested structs work
 ```
 
 **Round-tripping routes** (`Qed/Router.lean`). The round-trip law is a *field of
@@ -168,7 +177,7 @@ CLI against this checkout.
 | `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`) + pure render-to-HTML. |
 | `Qed/Invariant.lean` | The `invariant … preserved_by …` command (auto-proven). |
 | `Qed/Diff.lean` | The diff/patch engine + the `diff_apply` correctness proof. |
-| `Qed/Json.lean` | Depth-bounded JSON parser + the `parse_depth_le` proof. |
+| `Qed/Json.lean` | Full JSON parser/renderer + typed `jsonCodec` + the `parse_depth_le` proof. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field) + a route table. |
 | `Qed/Form.lean` | Refinement-typed forms + the `canSubmit_iff` proof. |
 | `Qed/Dom.lean` | The `@[extern]` DOM node primitives (the trusted boundary). |
@@ -194,11 +203,14 @@ CLI against this checkout.
 
 **Done** (all kernel-checked, `sorry`-free — run `./qed check`):
 the verified core, an end-to-end browser slice, the verified diff/patch engine,
-state-machine invariants, depth-bounded JSON, round-tripping routes, and
-refinement-typed forms.
+state-machine invariants, full-grammar JSON (parser + renderer + typed codec +
+depth bound), round-tripping routes, and refinement-typed forms.
 
 **Next:**
 
+- **JSON codec round-trip** — prove `parse (render j) = .ok j`, starting on the
+  structural core and growing it. The hard parts are an integer
+  `toString`/parse-inverse lemma and an escape-inverse lemma for strings.
 - **`Cmd`-based effects** — async/data-fetching as data, so `update` stays pure
   and total: `update : Model → Msg → Model × Cmd Msg`, with the JS driver
   interpreting fetch/timer commands.

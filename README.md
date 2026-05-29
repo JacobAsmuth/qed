@@ -21,6 +21,17 @@ Lean a developer would want to write, then build whatever elaboration machinery
 The macros and notation elaborate into that small typed core, so they don't change
 what is proven.
 
+## Install
+
+```bash
+curl -sSfL https://raw.githubusercontent.com/JacobAsmuth/qed/main/install.sh | sh
+qed new myapp && cd myapp && qed dev
+```
+
+The installer adds elan (the Lean toolchain manager) if it's missing, fetches the
+framework into `~/.qed`, builds the `qed` CLI, and puts it on your PATH. The wasm
+toolchain and emscripten are fetched on first `qed build`, not at install time.
+
 ## The counter, in full
 
 ```lean
@@ -134,19 +145,19 @@ your proofs (a failed proof is a build error), the sources are grepped for
 `sorry`/`admit`/`native_decide`, and the axiom manifest is run.
 
 ```bash
-./qed dev      # watch sources, rebuild, serve with live-reload  → localhost:8000
-./qed build    # production build → dist/ (optimized + verified)
-./qed start    # serve the build            (alias: preview)
-./qed test     # headless browser test suite
-./qed check    # verify only: proofs + no-sorry + axiom-clean, no artifacts
-./qed clean    # remove build outputs
-./qed new APP  # scaffold a new app
+qed dev        # watch sources, rebuild, serve with live-reload  → localhost:8000
+qed build      # production build → dist/ (optimized + verified)
+qed start      # serve the build            (alias: preview)
+qed test       # browser test suite (if present)
+qed check      # verify only: proofs + no-sorry + axiom-clean, no artifacts
+qed clean      # remove build outputs
+qed new APP    # scaffold a new app
+qed doctor     # report which dependencies are present
 ```
 
 `npm run dev` / `build` / `test` / … work too (see `package.json`) for muscle
-memory. Prerequisites: [`elan`](https://github.com/leanprover/elan) (pins Lean
-v4.15.0) and the [emscripten SDK](https://emscripten.org) at `~/emsdk`; the
-`./qed` shim wires both into the environment.
+memory. When hacking on the framework itself, the in-repo `./qed` shim runs the
+CLI against this checkout.
 
 ## Layout
 

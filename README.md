@@ -104,43 +104,45 @@ def cityOf (body : String) : Option String :=
 
 ### A form that can't carry invalid data
 
-A form field is a `Refined p`: a `String` paired with a proof that the predicate
-`p` holds of it. Its only constructor is validation, so a value of the form type
-is itself evidence that every field is valid — an invalid form is unrepresentable,
-and any handler that takes one cannot run on bad input.
+A form field is a `Field p`: a `String` paired with a proof that the proposition
+`p` holds of it. Specs are ordinary Lean propositions, so they compose with `∧`,
+`≥`, and the rest of the logic; write them as `abbrev` so the `Decidable` instance
+`Field.validate` needs is inferred automatically.
 
 ```lean
-def validEmail (s : String) : Bool := s.contains '@'
-def validAge   (s : String) : Bool :=
-  match s.toNat? with
-  | some n => decide (13 ≤ n)
-  | none   => false
+abbrev Email  (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
+abbrev MinLen (n : Nat) (s : String) : Prop := s.length ≥ n
 
-structure Account where
-  email : Refined validEmail
-  age   : Refined validAge
+structure Signup where
+  email    : Field Email
+  password : Field (MinLen 8)
+```
 
--- Build it only from inputs that pass; `none` otherwise.
-def Account.ofRaw (email age : String) : Option Account := do
-  let email ← Refined.validate validEmail email
-  let age   ← Refined.validate validAge age
-  return { email, age }
+A `Field`'s only constructor is validation, so a `Signup` value is itself evidence
+that every field is valid — an invalid form is unrepresentable, and any handler
+taking one cannot run on bad input. Build it only from inputs that pass:
+
+```lean
+def Signup.ofRaw (email password : String) : Option Signup := do
+  let email    ← Field.validate Email email
+  let password ← Field.validate (MinLen 8) password
+  return { email, password }
 ```
 
 ### Putting it in an app
 
 `update` is a pure function from the model and a message to the next model; `view`
 maps the model to typed HTML. The submit button below is enabled *exactly* when
-the inputs validate (`Account.ofRaw … |>.isSome`), so the button can't disagree
+the inputs validate (`Signup.ofRaw … |>.isSome`), so the button can't disagree
 with the data. `lake build` rejects this module unless every `Msg` is handled and
 both functions terminate.
 
 ```lean
 structure Model where
-  route : Route                               -- a typed page, never a stray string
-  user  : Option User                         -- decoded from the API, or not loaded
-  email : String                              -- raw form inputs
-  age   : String
+  route    : Route                            -- a typed page, never a stray string
+  user     : Option User                      -- decoded from the API, or not loaded
+  email    : String                           -- raw form inputs
+  password : String
 
 inductive Msg
   | navigate (to : Route)
@@ -153,10 +155,10 @@ def update (m : Model) : Msg → Model
   | .submit         => m
 
 def view (m : Model) : Html Msg :=
-  let valid := (Account.ofRaw m.email m.age).isSome
+  let valid := (Signup.ofRaw m.email m.password).isSome
   div [cls "app"] [
-    input  [attr "type" "email",  attr "value" m.email],
-    input  [attr "type" "number", attr "value" m.age],
+    input  [attr "type" "email",    attr "value" m.email],
+    input  [attr "type" "password", attr "value" m.password],
     button (if valid then [onClick .submit] else [attr "disabled" "true"])
       [text "Create account"]
   ]
@@ -173,7 +175,8 @@ Each property below is checked by `qed check`, with no hand-written proof:
 - **JSON round-trip** — `parse (render j) = .ok j` on the structural core (`parse_render`).
 - **URL round-trip** — `parse (print r) = some r` (`Route.round_trip`); the law is a
   field of the `Router` class, so an instance can't omit it.
-- **Submit ⇔ valid** — `canSubmit e a = true ↔ isEmail e ∧ isAdult a` (`canSubmit_iff`).
+- **Submit ⇔ valid** — `canSubmit e p = true ↔ Email e ∧ MinLen 8 p` (`Signup.canSubmit_iff`);
+  the enabled bit *is* the decision procedure for the field specs.
 - **Totality** — `update`/`view` have no `panic`, no missing case, no infinite loop.
 - **State-machine invariant** — `invariant p preserved_by update` proves `p` holds
   after every message.
@@ -235,7 +238,7 @@ CLI against this checkout.
 | `Qed/Diff.lean` | The diff/patch engine + the `diff_apply` correctness proof. |
 | `Qed/Json.lean` | Full JSON parser/renderer + typed `jsonCodec` + `parse_depth_le` & `parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field) + a route table. |
-| `Qed/Form.lean` | Refinement-typed forms + the `canSubmit_iff` proof. |
+| `Qed/Form.lean` | `Prop`-refinement form fields (`Field p`) + the `canSubmit_iff` proof. |
 | `Qed/Dom.lean` | The `@[extern]` DOM node primitives (the trusted boundary). |
 | `Qed/Driver.lean` | The impure browser driver (build + patch) + `@[export]`ed entry points. |
 | `Examples/Counter.lean` | The demo app (shared by both entry points). |

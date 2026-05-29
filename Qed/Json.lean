@@ -292,47 +292,58 @@ theorem parse_depth_le (s : String) (maxDepth : Nat) (j : Json) :
     · cases h; exact parseVal_depth_le _ maxDepth _ _ _ heq
     · contradiction
 
-/-! ### Rendering -/
+/-! ### Rendering
+
+Rendering produces `List Char` directly (`renderL`); the public `render` wraps it
+as a `String`. Because `parse` works on `String.toList`, and
+`(⟨renderL j⟩ : String).toList = renderL j` definitionally, the codec round-trip
+proof can reason about `parseVal … (renderL j ++ rest)` without `String`-append
+friction. -/
 
 def toHexDigit (n : Nat) : Char :=
   if n < 10 then Char.ofNat ('0'.toNat + n) else Char.ofNat ('a'.toNat + (n - 10))
 
-def escapeChar (c : Char) : String :=
+/-- One character, JSON-escaped, as a list of characters. -/
+def escapeCharL (c : Char) : List Char :=
   match c with
-  | '"'  => "\\\"" | '\\' => "\\\\"
-  | '\n' => "\\n"  | '\r' => "\\r" | '\t' => "\\t"
+  | '"'  => ['\\', '"']  | '\\' => ['\\', '\\']
+  | '\n' => ['\\', 'n']  | '\r' => ['\\', 'r'] | '\t' => ['\\', 't']
   | c =>
       if c.toNat < 0x20 then
         let n := c.toNat
-        ⟨['\\', 'u', toHexDigit (n / 4096 % 16), toHexDigit (n / 256 % 16),
-                     toHexDigit (n / 16 % 16),   toHexDigit (n % 16)]⟩
-      else c.toString
+        ['\\', 'u', toHexDigit (n / 4096 % 16), toHexDigit (n / 256 % 16),
+                    toHexDigit (n / 16 % 16),   toHexDigit (n % 16)]
+      else [c]
 
-def Json.renderStr (s : String) : String :=
-  "\"" ++ s.foldl (fun acc c => acc ++ escapeChar c) "" ++ "\""
+def Json.renderStrL (s : String) : List Char :=
+  '"' :: (s.toList.flatMap escapeCharL ++ ['"'])
 
-def Json.renderNum (n : JsonNumber) : String :=
-  toString n.mantissa ++ (if n.exponent == 0 then "" else "e" ++ toString n.exponent)
+def Json.renderNumL (n : JsonNumber) : List Char :=
+  (toString n.mantissa).toList ++ (if n.exponent == 0 then [] else 'e' :: (toString n.exponent).toList)
 
 namespace Json
 mutual
-  /-- Render a value to a JSON string (numbers in `mantissa e exponent` form). -/
-  def render : Json → String
-    | .null     => "null"
-    | .bool b   => if b then "true" else "false"
-    | .num n    => renderNum n
-    | .str s    => renderStr s
-    | .arr es   => "[" ++ renderElems es ++ "]"
-    | .obj ms   => "{" ++ renderMembers ms ++ "}"
-  def renderElems : List Json → String
-    | []      => ""
-    | [e]     => render e
-    | e :: es => render e ++ "," ++ renderElems es
-  def renderMembers : List (String × Json) → String
-    | []           => ""
-    | [(k, v)]     => renderStr k ++ ":" ++ render v
-    | (k, v) :: ms => renderStr k ++ ":" ++ render v ++ "," ++ renderMembers ms
+  /-- Render a value to a character list (numbers in `mantissa e exponent` form). -/
+  def renderL : Json → List Char
+    | .null         => ['n', 'u', 'l', 'l']
+    | .bool true    => ['t', 'r', 'u', 'e']
+    | .bool false   => ['f', 'a', 'l', 's', 'e']
+    | .num n        => renderNumL n
+    | .str s        => renderStrL s
+    | .arr es       => '[' :: (renderElemsL es ++ [']'])
+    | .obj ms       => '{' :: (renderMembersL ms ++ ['}'])
+  def renderElemsL : List Json → List Char
+    | []      => []
+    | [e]     => renderL e
+    | e :: es => renderL e ++ ',' :: renderElemsL es
+  def renderMembersL : List (String × Json) → List Char
+    | []           => []
+    | [(k, v)]     => renderStrL k ++ ':' :: renderL v
+    | (k, v) :: ms => renderStrL k ++ ':' :: renderL v ++ ',' :: renderMembersL ms
 end
+
+/-- Render a value to a JSON string. -/
+def render (j : Json) : String := ⟨renderL j⟩
 end Json
 
 /-! ### Dynamic access -/

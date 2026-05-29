@@ -23,6 +23,9 @@ inductive Attr (msg : Type) where
   | flag (key : String) (on : Bool)
   /-- A click handler producing the message `m`. -/
   | onClick (m : msg)
+  /-- An input handler: produces a message from the field's current value, fired
+      on every edit. -/
+  | onInput (handler : String → msg)
 
 /-- A typed virtual-DOM node. Note this inductive is *total*: there is no
     constructor for "failed render", so a well-typed `view` cannot crash. -/
@@ -42,10 +45,11 @@ instance : Coe String (List (Html msg)) := ⟨([·])⟩
 
 /-- Remap the message type of an attribute (functoriality in `msg`). -/
 def Attr.map (f : α → β) : Attr α → Attr β
-  | .cls n       => .cls n
-  | .attr k v    => .attr k v
-  | .flag k on   => .flag k on
-  | .onClick m   => .onClick (f m)
+  | .cls n        => .cls n
+  | .attr k v     => .attr k v
+  | .flag k on    => .flag k on
+  | .onClick m    => .onClick (f m)
+  | .onInput h    => .onInput (fun s => f (h s))
 
 mutual
   /-- Remap the message type of a whole tree — the basis of component

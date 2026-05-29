@@ -40,6 +40,8 @@ def label   (attrs : List (Attr msg) := []) (children : List (Html msg) := []) :
 def cls (name : String) : Attr msg := .cls name
 def attr (key value : String) : Attr msg := .attr key value
 def onClick (m : msg) : Attr msg := .onClick m
+/-- Fire `handler currentValue` whenever the field is edited. -/
+def onInput (handler : String → msg) : Attr msg := .onInput handler
 
 /-- Typed string attributes — typos in the key become compile errors. -/
 def value       (v : String) : Attr msg := .attr "value" v

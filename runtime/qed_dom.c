@@ -17,7 +17,8 @@
 
 /* ---- JS-side DOM node handle table --------------------------------------- */
 EM_JS(void, qed_js_init, (void), {
-  if (!globalThis.__qed) globalThis.__qed = { nodes: [null] }; /* index 0 reserved */
+  if (!globalThis.__qed) globalThis.__qed = {};
+  if (!globalThis.__qed.nodes) globalThis.__qed.nodes = [null]; /* index 0 reserved */
 });
 
 EM_JS(int, qed_js_create_element, (const char *tag), {
@@ -42,6 +43,19 @@ EM_JS(void, qed_js_clear_attributes, (int node), {
   if (el && el.attributes) {
     while (el.attributes.length > 0) el.removeAttribute(el.attributes[0].name);
   }
+});
+
+EM_JS(void, qed_js_set_value, (int node, const char *v), {
+  var el = globalThis.__qed.nodes[node];
+  var s = UTF8ToString(v);
+  if (el && el.value !== s) el.value = s; /* guard keeps the caret when unchanged */
+});
+
+/* Streaming POST. The SSE parsing + the Lean callbacks live in host.js
+   (globalThis.__qed.fetchStream), so this shim is a thin delegation. */
+EM_JS(void, qed_js_fetch_stream, (const char *url, const char *body, int cid, int did), {
+  if (globalThis.__qed && globalThis.__qed.fetchStream)
+    globalThis.__qed.fetchStream(UTF8ToString(url), UTF8ToString(body), cid, did);
 });
 
 EM_JS(void, qed_js_append_child, (int parent, int child), {
@@ -106,6 +120,21 @@ LEAN_EXPORT lean_object *qed_dom_clear_attributes(uint32_t node, lean_object *wo
   return lean_io_result_mk_ok(lean_box(0));
 }
 
+LEAN_EXPORT lean_object *qed_dom_set_value(uint32_t node, lean_object *v, lean_object *world) {
+  (void) world;
+  qed_js_set_value((int) node, lean_string_cstr(v));
+  lean_dec(v);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *qed_dom_fetch_stream(lean_object *url, lean_object *body,
+                                              uint32_t cid, uint32_t did, lean_object *world) {
+  (void) world;
+  qed_js_fetch_stream(lean_string_cstr(url), lean_string_cstr(body), (int) cid, (int) did);
+  lean_dec(url); lean_dec(body);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
 LEAN_EXPORT lean_object *qed_dom_append_child(uint32_t parent, uint32_t child, lean_object *world) {
   (void) world;
   qed_js_append_child((int) parent, (int) child);
@@ -140,6 +169,9 @@ LEAN_EXPORT lean_object *qed_dom_mount_root(uint32_t node, lean_object *world) {
 /* ---- JS → Lean entry points (defined by Lean codegen) -------------------- */
 extern lean_object *qed_init(lean_object *world);
 extern lean_object *qed_dispatch(uint32_t id, lean_object *world);
+extern lean_object *qed_dispatch_str(uint32_t id, lean_object *s, lean_object *world);
+extern lean_object *qed_stream_chunk(uint32_t cid, lean_object *chunk, lean_object *world);
+extern lean_object *qed_stream_done(uint32_t did, lean_object *world);
 
 static void qed_run_io(lean_object *res) {
   if (lean_io_result_is_error(res)) lean_io_result_show_error(res);
@@ -151,3 +183,20 @@ void qed_run_init(void) { qed_run_io(qed_init(lean_io_mk_world())); }
 
 EMSCRIPTEN_KEEPALIVE
 void qed_run_dispatch(uint32_t id) { qed_run_io(qed_dispatch(id, lean_io_mk_world())); }
+
+/* Input event: dispatch the field's current value to its handler. */
+EMSCRIPTEN_KEEPALIVE
+void qed_run_dispatch_str(uint32_t id, const char *s) {
+  qed_run_io(qed_dispatch_str(id, lean_mk_string(s), lean_io_mk_world()));
+}
+
+/* Streamed chunk / end-of-stream, called by host.js as the fetch resolves. */
+EMSCRIPTEN_KEEPALIVE
+void qed_run_stream_chunk(uint32_t cid, const char *chunk) {
+  qed_run_io(qed_stream_chunk(cid, lean_mk_string(chunk), lean_io_mk_world()));
+}
+
+EMSCRIPTEN_KEEPALIVE
+void qed_run_stream_done(uint32_t did) {
+  qed_run_io(qed_stream_done(did, lean_io_mk_world()));
+}

@@ -155,6 +155,39 @@ def view (m : Model) : Html Msg :=
   ]
 ```
 
+### Effects: a streaming LLM chat
+
+Side effects are *data*. `update` returns `(model, Cmd)` and stays pure and total;
+the driver runs the `Cmd`. `Cmd.stream` POSTs and reads the response as it arrives,
+dispatching `.chunk` per Server-Sent-Event and `.done` at the end — so a token-by-token
+LLM reply is just more messages through the same `update`. `onInput` captures the
+composer text. JSON in and out goes through the verified `Qed.Json`.
+
+```lean
+inductive Msg
+  | typed (s : String)     -- composer edited
+  | send                   -- submit the draft
+  | chunk (data : String)  -- one streamed SSE payload (an OpenAI delta)
+  | done                   -- stream finished
+
+def update (m : Model) : Msg → Model × Cmd Msg
+  | .typed s   => ({ m with draft := s }, .none)
+  | .send      => (m', .stream "/v1/chat/completions" (reqBody convo) .chunk .done)
+  | .chunk raw => ({ m with turns := appendLast m.turns (deltaOf raw) }, .none)
+  | .done      => ({ m with pending := false }, .none)
+
+def view (m : Model) : Html Msg :=
+  div [cls "chat"] [
+    div [cls "log"] (m.turns.toList.map bubble),                       -- one bubble per turn
+    input  [value m.draft, onInput .typed, placeholder "Message…"],    -- controlled input
+    button [disabled (m.pending || m.draft.trim.isEmpty), onClick .send] "Send"
+  ]
+```
+
+The full app is `Examples/Chat.lean`; `test/chat_test.mjs` drives it in headless
+Chromium against a mock OpenAI streaming backend (`test/mock_llm.py`) and saves a
+screenshot at each stage (`qed test`).
+
 ## What this lets you prove
 
 Each property below is checked by `qed check`, with no hand-written proof:
@@ -182,7 +215,8 @@ emcc  (app C  +  runtime/qed_dom.c [EM_JS DOM shims]  +  prebuilt Lean wasm runt
    ▼
 runtime/qed.js (MODULARIZE factory) + qed.wasm
    ▼
-runtime/host.js:  qed_run_init() mounts;  DOM event → qed_run_dispatch(id)
+runtime/host.js:  qed_run_init() mounts;  click → qed_run_dispatch(id),
+                  input → qed_run_dispatch_str(id, value), stream → chunk/done
                   → pure `update` → diff vs. previous view → patch only what changed
 ```
 
@@ -191,10 +225,14 @@ changed nodes are patched — so the proven `diff_apply` theorem (above)
 guarantees the DOM equals the new view, while untouched nodes keep their identity
 (focus, cursor, scroll, selection all survive an update).
 
+`update` returns `(model, Cmd)`. The driver runs the `Cmd` *after* the render:
+`Cmd.stream` performs a streaming `fetch` whose Server-Sent-Events dispatch
+`.chunk`/`.done` messages back through the same loop, so async stays pure data.
+
 The only impure, unverified surface is `Qed/Dom.lean` (a handful of `@[extern]`
-node primitives) and its C/JS implementation in `runtime/`. Everything above that
-line is pure, total Lean. Events cross back by id and are looked up totally
-(`Array.get?`), so a bad event id can never crash the app.
+node primitives, incl. a streaming fetch) and its C/JS implementation in
+`runtime/`. Everything above that line is pure, total Lean. Events cross back by
+id and are looked up totally (`Array.get?`), so a bad event id can never crash the app.
 
 ## The `qed` CLI
 
@@ -224,7 +262,7 @@ CLI against this checkout.
 |------|------|
 | `Qed/Html.lean` | The core typed virtual DOM — the elaboration target. |
 | `Qed/Notation.lean` | Readable view combinators (`div`, `button`, `onClick`, …). |
-| `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`) + pure render-to-HTML. |
+| `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`), `Cmd` effects + pure render-to-HTML. |
 | `Qed/Invariant.lean` | The `invariant … preserved_by …` command (auto-proven). |
 | `Qed/Diff.lean` | The diff/patch engine + the `diff_apply` correctness proof. |
 | `Qed/Json.lean` | Full JSON parser/renderer + `jsonStruct`/`jsonCodec` + `parse_depth_le` & `parse_render` proofs. |
@@ -232,10 +270,12 @@ CLI against this checkout.
 | `Qed/Form.lean` | `Prop`-refinement fields (`Field p`) + the `form` command (generates the `canSubmit_iff` proof). |
 | `Qed/Dom.lean` | The `@[extern]` DOM node primitives (the trusted boundary). |
 | `Qed/Driver.lean` | The impure browser driver (build + patch) + `@[export]`ed entry points. |
-| `Examples/Counter.lean` | The demo app (shared by both entry points). |
-| `Examples/Native.lean` / `Examples/Web.lean` | Native / WASM entry points. |
+| `Examples/Counter.lean` | The counter demo (shared by both entry points). |
+| `Examples/Chat.lean` / `Examples/ChatWeb.lean` | The streaming LLM chat app + its WASM entry. |
+| `Examples/Native.lean` / `Examples/Web.lean` | Native / WASM counter entry points. |
 | `Cli.lean` + `./qed` | The toolchain (build/dev/test/check/…) and its shim. |
-| `runtime/` | C/JS driver, page, dev server. |
+| `runtime/` | C/JS driver, pages, dev server. |
+| `test/` | Browser tests: counter (`browser_test.mjs`) + chat screenshots (`chat_test.mjs`) + mock LLM (`mock_llm.py`). |
 | `scripts/axioms.lean` | Axiom manifest gated by `qed check`/`qed build`. |
 
 ## Notable constraints
@@ -255,16 +295,15 @@ CLI against this checkout.
 the verified core, an end-to-end browser slice, the verified diff/patch engine,
 state-machine invariants, full-grammar JSON (parser + renderer + typed codec +
 depth bound + codec round-trip on the structural core), round-tripping routes,
-and refinement-typed forms.
+refinement-typed forms, `Cmd`-based effects with **streaming fetch**, text input
+(`onInput`), and a streaming LLM chat (`Examples/Chat.lean`) tested in a real
+browser against a mock OpenAI backend.
 
 **Next:**
 
 - **Extend the JSON codec round-trip** — `parse_render` covers null/bool/nested
   arrays today; extending it to numbers, strings, and objects needs an integer
   `toString`/parse-inverse lemma and a string escape-inverse lemma.
-- **`Cmd`-based effects** — async/data-fetching as data, so `update` stays pure
-  and total: `update : Model → Msg → Model × Cmd Msg`, with the JS driver
-  interpreting fetch/timer commands.
 - **Keyed reconciliation** — extend the diff proof to matched/moved children (the
   current proof is exact for positional children).
 - **`deriving Router` / `deriving Form`** — generate the instances above from the

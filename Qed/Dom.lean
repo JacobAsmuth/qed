@@ -33,6 +33,18 @@ opaque setAttribute (node : Node) (key value : String) : IO Unit
 @[extern "qed_dom_clear_attributes"]
 opaque clearAttributes (node : Node) : IO Unit
 
+/-- Set an input's live `value` *property* (not just the attribute), so a
+    controlled field reflects the model. A no-op when already equal, which keeps
+    the caret where the user left it. -/
+@[extern "qed_dom_set_value"]
+opaque setValue (node : Node) (value : String) : IO Unit
+
+/-- POST `body` to `url` and stream the response. The JS host reads the response
+    as Server-Sent Events and calls back into Lean per data chunk (tagged
+    `chunkId`) and once at end of stream (tagged `doneId`). Fire-and-forget. -/
+@[extern "qed_dom_fetch_stream"]
+opaque fetchStream (url body : String) (chunkId doneId : UInt32) : IO Unit
+
 /-- Append `child` as the last child of `parent`. -/
 @[extern "qed_dom_append_child"]
 opaque appendChild (parent child : Node) : IO Unit

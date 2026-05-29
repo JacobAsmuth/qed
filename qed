@@ -12,9 +12,10 @@ cd "$(dirname "$(readlink -f "$0")")"
 
 export PATH="${HOME}/.elan/bin:${PATH}"
 # In-repo development: the framework is the current directory, and the demo's
-# web entry is Examples.Web (installed apps default to `Web`).
-export QED_HOME="${PWD}"
-export QED_WEB_ROOT="Examples.Web"
+# web entry is Examples.Web (installed apps default to `Web`). Both are
+# overridable, e.g. `QED_WEB_ROOT=Examples.ChatWeb qed build --dev`.
+export QED_HOME="${QED_HOME:-${PWD}}"
+export QED_WEB_ROOT="${QED_WEB_ROOT:-Examples.Web}"
 # shellcheck disable=SC1091
 source "${HOME}/emsdk/emsdk_env.sh" >/dev/null 2>&1 || true
 

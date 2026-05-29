@@ -6,11 +6,11 @@
   correct in `Qed.Diff`) against the live DOM, **reusing existing nodes** rather
   than rebuilding — so focus, cursor, scroll, and selection survive an update.
 
-  Because `diff` only emits `setText`/`patchElement` for unchanged structure, an
-  update touches just the nodes that differ; the input the user is typing in is
-  never recreated. The handler table (event id ↦ message) is rebuilt on each
-  render, in the same walk that sets the matching `data-qed-click` attributes,
-  so delegation stays consistent.
+  Two handler tables (click ↦ message, input ↦ value-to-message) are rebuilt on
+  every render in the same walk that tags nodes with `data-qed-click` /
+  `data-qed-input`, so the JS delegation stays in sync. Effects requested by
+  `update` (a `Cmd`) are interpreted here: a `stream` registers its callbacks and
+  starts a streaming fetch whose chunks dispatch back through the same loop.
 
   Imported by WASM entry points only; pure app code never references it.
 -/
@@ -20,55 +20,68 @@ import Qed.Dom
 
 namespace Qed
 
-/-- Install one attribute on a DOM node. An `onClick` is registered by appending
-    its message to the handler table and tagging the node with the index. A `flag`
-    is applied only when on (clearing handles the off case). -/
-def applyAttr (handlers : IO.Ref (Array msg)) (node : Dom.Node) : Attr msg → IO Unit
-  | .cls c     => Dom.setAttribute node "class" c
-  | .attr k v  => Dom.setAttribute node k v
-  | .flag k on => if on then Dom.setAttribute node k k else pure ()
-  | .onClick m => do
-      let hs ← handlers.get
-      handlers.set (hs.push m)
-      Dom.setAttribute node "data-qed-click" (toString hs.size)
+/-- The two event-handler tables, rebuilt each render. -/
+structure Handlers (msg : Type) where
+  click : IO.Ref (Array msg)
+  input : IO.Ref (Array (String → msg))
+
+/-- Install one attribute on a DOM node, registering event handlers as it goes.
+    `value` is set as the live property (controlled input); a `flag` is set only
+    when on (the patch path clears first, so off needs no work). -/
+def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
+  | .cls c          => Dom.setAttribute node "class" c
+  | .attr "value" v => Dom.setValue node v
+  | .attr k v       => Dom.setAttribute node k v
+  | .flag k on      => if on then Dom.setAttribute node k k else pure ()
+  | .onClick m      => do
+      let cs ← h.click.get
+      h.click.set (cs.push m)
+      Dom.setAttribute node "data-qed-click" (toString cs.size)
+  | .onInput f      => do
+      let is ← h.input.get
+      h.input.set (is.push f)
+      Dom.setAttribute node "data-qed-input" (toString is.size)
 
 /-- Apply a (normalized) attribute list, so the live DOM matches what `render`
     would produce — classes merged, duplicate keys collapsed. -/
-def applyAttrs (handlers : IO.Ref (Array msg)) (node : Dom.Node) (attrs : List (Attr msg)) : IO Unit := do
-  for a in normalizeAttrs attrs do applyAttr handlers node a
+def applyAttrs (h : Handlers msg) (node : Dom.Node) (attrs : List (Attr msg)) : IO Unit := do
+  for a in normalizeAttrs attrs do applyAttr h node a
 
 /-- Build a fresh DOM subtree from an `Html` node, returning its handle. -/
-partial def buildDom (handlers : IO.Ref (Array msg)) : Html msg → IO Dom.Node
+partial def buildDom (h : Handlers msg) : Html msg → IO Dom.Node
   | .text s => Dom.createText s
   | .element tag attrs children => do
       let node ← Dom.createElement tag
-      applyAttrs handlers node attrs
+      applyAttrs h node attrs
       for c in children do
-        Dom.appendChild node (← buildDom handlers c)
+        Dom.appendChild node (← buildDom h c)
       return node
 
 /-- Execute a patch against the live DOM, reusing nodes where possible. `parent`
     and `index` locate `node` within its parent, needed only for `replace`. -/
-partial def applyToDom (handlers : IO.Ref (Array msg))
+partial def applyToDom (h : Handlers msg)
     (parent : Dom.Node) (index : UInt32) (node : Dom.Node) : Patch msg → IO Unit
   | .replace new => do
-      Dom.replaceChild parent index (← buildDom handlers new)
+      Dom.replaceChild parent index (← buildDom h new)
   | .setText s => Dom.setText node s
   | .patchElement attrs kids => do
       -- clear then re-apply so attributes dropped or toggled off since the last
       -- render actually leave the DOM (node identity, hence focus, is preserved)
       Dom.clearAttributes node
-      applyAttrs handlers node attrs
+      applyAttrs h node attrs
       let mut i : UInt32 := 0
       for kid in kids do
-        applyToDom handlers node i (← Dom.childAt node i) kid
+        applyToDom h node i (← Dom.childAt node i) kid
         i := i + 1
 
-/-- A type-erased running application — see `Qed.Runtime` discussion. The
-    monomorphic closures seal the polymorphic `Model`/`Msg`. -/
+/-- A type-erased running application — the monomorphic closures seal the
+    polymorphic `Model`/`Msg` so the export wrappers below stay first-order. -/
 structure Runtime where
-  mount    : IO Unit
-  dispatch : UInt32 → IO Unit
+  mount       : IO Unit
+  dispatch    : UInt32 → IO Unit
+  dispatchStr : UInt32 → String → IO Unit
+  streamChunk : UInt32 → String → IO Unit
+  streamDone  : UInt32 → IO Unit
 
 initialize runtimeRef : IO.Ref (Option Runtime) ← IO.mkRef none
 
@@ -84,40 +97,82 @@ def qedDispatch (id : UInt32) : IO Unit := do
   | some rt => rt.dispatch id
   | none    => pure ()
 
+@[export qed_dispatch_str]
+def qedDispatchStr (id : UInt32) (s : String) : IO Unit := do
+  match ← runtimeRef.get with
+  | some rt => rt.dispatchStr id s
+  | none    => pure ()
+
+@[export qed_stream_chunk]
+def qedStreamChunk (cid : UInt32) (chunk : String) : IO Unit := do
+  match ← runtimeRef.get with
+  | some rt => rt.streamChunk cid chunk
+  | none    => pure ()
+
+@[export qed_stream_done]
+def qedStreamDone (did : UInt32) : IO Unit := do
+  match ← runtimeRef.get with
+  | some rt => rt.streamDone did
+  | none    => pure ()
+
 /-- Register `app` as the running application. The initial `mount` builds the DOM
-    once; thereafter each event diffs the new view against the previous one and
-    applies only the resulting patch. -/
+    and runs the startup effect; thereafter each message updates the model, diffs
+    the new view against the previous one, patches the difference, and interprets
+    the requested effect (which may dispatch further messages over time). -/
 def run (app : App Model Msg) : IO Unit := do
-  let modelRef ← IO.mkRef app.init
+  let modelRef ← IO.mkRef app.init.1
   let treeRef  ← IO.mkRef (none : Option (Html Msg))
   let rootRef  ← IO.mkRef (0 : Dom.Node)
-  let handlers ← IO.mkRef (#[] : Array Msg)
-  let mount : IO Unit := do
-    handlers.set #[]
-    let tree := app.view (← modelRef.get)
-    let node ← buildDom handlers tree
-    Dom.mountRoot node
-    rootRef.set node
-    treeRef.set (some tree)
-  let dispatch : UInt32 → IO Unit := fun id => do
-    let hs ← handlers.get
-    match hs[id.toNat]? with
-    | none => IO.eprintln s!"qed: unknown event id {id}"
-    | some msg => do
-        modelRef.modify (app.update · msg)
-        let newTree := app.view (← modelRef.get)
-        match ← treeRef.get with
-        | none => mount
-        | some oldTree => do
-            handlers.set #[]
-            let root ← rootRef.get
-            match diff oldTree newTree with
-            | .replace newH => do
-                let newNode ← buildDom handlers newH
-                Dom.mountRoot newNode
-                rootRef.set newNode
-            | patch => applyToDom handlers root 0 root patch
-            treeRef.set (some newTree)
-  runtimeRef.set (some { mount := mount, dispatch := dispatch })
+  let clickRef ← IO.mkRef (#[] : Array Msg)
+  let inputRef ← IO.mkRef (#[] : Array (String → Msg))
+  let h : Handlers Msg := { click := clickRef, input := inputRef }
+  -- Stream callbacks persist across renders (a stream outlives many of them).
+  let chunkCbRef ← IO.mkRef (#[] : Array (String → Msg))
+  let doneCbRef  ← IO.mkRef (#[] : Array Msg)
+  let renderModel : IO Unit := do
+    clickRef.set #[]; inputRef.set #[]
+    let newTree := app.view (← modelRef.get)
+    (match ← treeRef.get with
+     | none => do
+         let node ← buildDom h newTree
+         Dom.mountRoot node; rootRef.set node
+     | some oldTree => do
+         let root ← rootRef.get
+         match diff oldTree newTree with
+         | .replace newH => do
+             let node ← buildDom h newH
+             Dom.mountRoot node; rootRef.set node
+         | patch => applyToDom h root 0 root patch)
+    treeRef.set (some newTree)
+  let perform : Cmd Msg → IO Unit := fun
+    | .none => pure ()
+    | .stream url body onChunk onDone => do
+        let cs ← chunkCbRef.get; chunkCbRef.set (cs.push onChunk)
+        let ds ← doneCbRef.get;  doneCbRef.set (ds.push onDone)
+        Dom.fetchStream url body (UInt32.ofNat cs.size) (UInt32.ofNat ds.size)
+  let dispatchMsg : Msg → IO Unit := fun msg => do
+    let (m', cmd) := app.update (← modelRef.get) msg
+    modelRef.set m'
+    renderModel
+    perform cmd
+  runtimeRef.set (some {
+    mount := do renderModel; perform app.init.2
+    dispatch := fun id => do
+      match (← clickRef.get)[id.toNat]? with
+      | some msg => dispatchMsg msg
+      | none     => IO.eprintln s!"qed: unknown click id {id}"
+    dispatchStr := fun id s => do
+      match (← inputRef.get)[id.toNat]? with
+      | some f => dispatchMsg (f s)
+      | none   => pure ()
+    streamChunk := fun cid c => do
+      match (← chunkCbRef.get)[cid.toNat]? with
+      | some f => dispatchMsg (f c)
+      | none   => pure ()
+    streamDone := fun did => do
+      match (← doneCbRef.get)[did.toNat]? with
+      | some msg => dispatchMsg msg
+      | none     => pure ()
+  })
 
 end Qed

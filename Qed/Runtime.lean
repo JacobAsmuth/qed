@@ -13,19 +13,41 @@ import Qed.Html
 
 namespace Qed
 
-/-- A self-contained application: state, a transition function, and a view. -/
+/-- An effect described as *data*, interpreted by the driver after an update so
+    that `update` itself stays pure and total. `stream` POSTs `body` to `url` and
+    feeds each streamed chunk to `onChunk`, then fires `onDone`. -/
+inductive Cmd (msg : Type) where
+  /-- Do nothing. -/
+  | none
+  /-- POST `body` to `url`; dispatch `onChunk c` for each streamed chunk `c`,
+      then `onDone` when the stream ends. -/
+  | stream (url : String) (body : String) (onChunk : String → msg) (onDone : msg)
+
+/-- Relabel the messages an effect will produce (functoriality in `msg`). -/
+def Cmd.map (f : α → β) : Cmd α → Cmd β
+  | .none                      => .none
+  | .stream u b onChunk onDone => .stream u b (fun c => f (onChunk c)) (f onDone)
+
+/-- A self-contained application: an initial (model, startup effect), a transition
+    that may request effects, and a view. A transition returns `(nextModel, cmd)`;
+    use `(m, .none)` (or just the pure `sandbox`) when there is no effect. -/
 structure App (Model : Type) (Msg : Type) where
-  /-- The initial model. -/
-  init   : Model
-  /-- The pure, total state transition. -/
-  update : Model → Msg → Model
+  /-- The initial model and the effect to run on start. -/
+  init   : Model × Cmd Msg
+  /-- The pure, total state transition, optionally requesting an effect. -/
+  update : Model → Msg → Model × Cmd Msg
   /-- The pure, total render. -/
   view   : Model → Html Msg
 
 /-- Build an `App` with no side effects (the Elm "sandbox"). -/
 def sandbox (init : Model) (update : Model → Msg → Model) (view : Model → Html Msg) :
     App Model Msg :=
-  { init, update, view }
+  { init := (init, .none), update := fun m msg => (update m msg, .none), view }
+
+/-- Build an `App` whose `update` may request effects (fetch, streaming, …). -/
+def application (init : Model) (update : Model → Msg → Model × Cmd Msg)
+    (view : Model → Html Msg) : App Model Msg :=
+  { init := (init, .none), update, view }
 
 /-- Escape text/attribute values so model data cannot break out of the markup. -/
 def escapeHtml (s : String) : String :=
@@ -69,6 +91,7 @@ def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .attr k v  => (s!" {k}=\"{escapeHtml v}\"", hs)
   | .flag k on => (if on then s!" {k}=\"{k}\"" else "", hs)
   | .onClick m => (s!" data-qed-click=\"{hs.size}\"", hs.push m)
+  | .onInput _ => ("", hs)   -- no static form; the driver wires input events
 
 /-- Render a list of attributes left-to-right, threading the handler table. -/
 def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg

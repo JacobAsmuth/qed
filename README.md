@@ -26,27 +26,6 @@ The installer adds elan (the Lean toolchain manager) if it's missing, fetches th
 framework into `~/.qed`, builds the `qed` CLI, and puts it on your PATH. The wasm
 toolchain and emscripten are fetched on first `qed build`, not at install time.
 
-## At a glance
-
-A typed view — a mistyped event like `onClick .incremnt` won't compile — and a
-safety property the framework proves for you, here that a counter's value never
-goes negative:
-
-```lean
-def view (m : Model) : Html Msg :=
-  div [cls "counter"] [
-    button [onClick .decrement] "−",
-    span   [cls "count"]        [toString m.count],
-    button [onClick .increment] "+"
-  ]
-
--- No proof written by hand: the kernel checks this holds after every message.
-invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
-```
-
-The rest of that app — `Model`, `Msg`, `update`, and the entry point — is the
-[counter example](#the-counter) below.
-
 ## Examples
 
 The snippets below assume `import Qed` and `open Qed`.

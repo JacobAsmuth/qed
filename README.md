@@ -78,36 +78,34 @@ invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
 
 ### Reading JSON
 
-`Json.parse` assumes the worst - it's total*, so it never throws; bad input just comes back as an
-honest `.error` value.
+`Json.parse` assumes the worst - it's total, so it never throws; bad input just comes back as an `.error` value.
 
-"Depth-bounded" is the part worth actually showing, since it's the kind of thing
-that's easy to just claim. `parse` takes a depth budget (it defaults to 64) - nest
-deeper than that and the parse bounces off instead of recursing until your stack
-gives out. The `.map Json.depth` below is only there so the result prints - try it:
+It's also depth-bounded: every parse takes a budget (it defaults to 64), and
+`parse_depth_le` proves that budget is a real ceiling - whatever comes back nests no
+deeper than the number you handed in, so a hostile, deeply-nested blob can't slip past.
 
-```lean
-#eval (Json.parse "[[[]]]" (maxDepth := 3)).map Json.depth   -- Except.ok 3   (depth 3 fits a budget of 3)
-#eval (Json.parse "[[[]]]" (maxDepth := 2)).map Json.depth   -- Except.error "maximum depth exceeded"
-```
-
-`parse_depth_le` proves that budget is the ceiling.
-Whatever `parse s budget` accepts is guaranteed to nest no deeper than `budget` - so a
-hostile, ten-thousand-level-deep blob can't slip past.
-
-Most of the time, though, you just want to decode the thing as a struct. `jsonStruct` writes the
-tedious `ToJson`/`FromJson` for you - you list the fields exactly once - so decoding a
-response body is a `do` block in the `Except` monad:
+`jsonStruct` declares a struct and, from the same one-line field list, generates its
+`ToJson`/`FromJson` *and* a `decode` (parse + decode in one call). Nested structs are
+decoded recursively, and the depth budget rides along - so you set it right at the
+call site:
 
 ```lean
+jsonStruct Address where
+  city    : String
+  country : String
+
 jsonStruct User where
-  name : String
-  age  : Nat                   -- a Nat can't be negative, so "age": -3 is rejected for free
-  bio  : Option String         -- Option means "this one's allowed to be missing (or null)"
+  name    : String
+  age     : Nat              -- a Nat can't be negative, so "age": -3 → .error "age: expected a non-negative integer"
+  address : Address          -- a nested struct, decoded recursively
+  bio     : Option String    -- Option ⇒ this field can be missing (or null), and comes back `none`
 
-def decodeUser (body : String) : Except String User := do
-  let json ← Json.parse body   -- garbage or too-deeply-nested input stops right here, as an .error
-  fromJson json                -- and a bad field names itself: "age: expected a non-negative integer"
+-- the response body — a user with a nested address, so it's two levels deep:
+--   { "name": "Ada", "age": 36, "address": { "city": "London", "country": "UK" } }
+def body : String := "{\"name\":\"Ada\",\"age\":36,\"address\":{\"city\":\"London\",\"country\":\"UK\"}}"
+
+#eval (User.decode body (maxDepth := 8)).map (·.address.city)   -- Except.ok "London"  (parse + decode in one call)
+#eval (User.decode body (maxDepth := 1)).map (·.name)           -- Except.error "maximum depth exceeded"
 ```
 
 Sometimes you don't want the whole struct - you just want the city out of a big

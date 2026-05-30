@@ -624,8 +624,10 @@ instance [FromJson α] : FromJsonField (Option α) where
 /-! ### `jsonCodec` — generate ToJson/FromJson for a structure
 
 `jsonCodec User [name, age, tags]` produces both instances, mapping each field to
-a JSON key of the same name. It is a core-syntax macro (no `import Lean`), so apps
-that use it do not pull the Lean elaborator into their WASM binary. -/
+a JSON key of the same name, plus the two string-level helpers `User.decode :
+String → Except String User` (parse then decode) and `User.encode : User → String`
+(encode then render). It is a core-syntax macro (no `import Lean`), so apps that use
+it do not pull the Lean elaborator into their WASM binary. -/
 
 open Lean in
 syntax (name := jsonCodecCmd) "jsonCodec " ident "[" ident,* "]" : command
@@ -636,11 +638,21 @@ macro_rules
       let fields := fs.getElems
       let pairs ← fields.mapM fun (f : Ident) => `(term| ($(quote (toString f.getId)), toJson x.$f))
       let keys  ← fields.mapM fun (f : Ident) => `(term| $(quote (toString f.getId)))
+      let decodeId := mkIdent (t.getId ++ `decode)
+      let encodeId := mkIdent (t.getId ++ `encode)
+      -- a non-hygienic `maxDepth` binder, so callers can pass `(maxDepth := …)`
+      let depthId  := mkIdent `maxDepth
       `(instance : ToJson $t where
           toJson x := Json.obj [$pairs,*]
         instance : FromJson $t where
           fromJson j := do
-            return { $[$fields:ident := (← fromField j $keys)],* })
+            return { $[$fields:ident := (← fromField j $keys)],* }
+        /-- Parse a JSON document and decode it into `$t` (depth-bounded by `maxDepth`). -/
+        def $decodeId:ident (s : String) ($depthId : Nat := 64) : Except String $t :=
+          (Json.parse s $depthId).bind fromJson
+        /-- Encode `$t` to a JSON string. -/
+        def $encodeId:ident (x : $t) : String :=
+          Json.render (toJson x))
 
 /-! ### `jsonStruct` — declare a structure and its codec at once
 

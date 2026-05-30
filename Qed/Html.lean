@@ -42,6 +42,10 @@ instance : Inhabited (Html msg) := ⟨.text ""⟩
 instance : Coe String (Html msg) := ⟨.text⟩
 /-- …and a lone string is a one-element child list, so `button [..] "Save"` works. -/
 instance : Coe String (List (Html msg)) := ⟨([·])⟩
+/-- Numbers render as their decimal text, so a model field goes straight into a
+    child list — `span [..] [count]`, no `toString`. -/
+instance : Coe Nat (Html msg) := ⟨fun n => .text (toString n)⟩
+instance : Coe Int (Html msg) := ⟨fun n => .text (toString n)⟩
 
 /-- Remap the message type of an attribute (functoriality in `msg`). -/
 def Attr.map (f : α → β) : Attr α → Attr β

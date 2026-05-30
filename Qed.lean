@@ -13,6 +13,7 @@ import Qed.Invariant
 import Qed.Json
 import Qed.Router
 import Qed.Form
+import Qed.Component
 -- Note: `Qed.Dom` and `Qed.Driver` are intentionally NOT re-exported here. They
 -- reference the browser-only DOM externs, so pure app modules (which `import Qed`)
 -- stay free of them and link on the native target. WASM entry points import

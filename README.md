@@ -98,58 +98,44 @@ def cityOf (body : String) : Option String :=
 
 ### A form that can't carry invalid data
 
-A form field is a `Field p`: a `String` paired with a proof that the proposition
-`p` holds of it. Specs are ordinary Lean propositions, so they compose with `∧`,
-`≥`, and the rest of the logic; write them as `abbrev` so the `Decidable` instance
-validation needs is inferred automatically.
+A form field is a `Field p` — a `String` paired with a proof that the proposition
+`p` holds of it — so an invalid form is unrepresentable and any handler taking a
+`Signup` can't run on bad input. Field specs are ordinary decidable propositions
+(compose them with `∧`, `≥`, …; write them as `abbrev` so validation infers their
+`Decidable` instance). The `form` command generates the structure, an `ofRaw`
+validator, a `canSubmit` gate, and the proof `canSubmit e p = true ↔ Email e ∧
+MinLen 8 p` — with no hand-written proof. The submit button below is enabled
+*exactly* when the inputs validate, so it can't disagree with the data.
 
 ```lean
 abbrev Email  (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
 abbrev MinLen (n : Nat) (s : String) : Prop := s.length ≥ n
 
+-- generates `Signup` (each field a `Field p`), `Signup.ofRaw`, `Signup.canSubmit`,
+-- and the proof `canSubmit e p = true ↔ Email e ∧ MinLen 8 p`
 form Signup where
   email    : Email
   password : MinLen 8
-```
 
-A `Field`'s only constructor is validation, so a `Signup` value is itself evidence
-that every field is valid — an invalid form is unrepresentable, and any handler
-taking one cannot run on bad input. The `form` command generates, from that one
-declaration:
-
-- the `Signup` structure (`email : Field Email`, `password : Field (MinLen 8)`),
-- `Signup.ofRaw (email password : String) : Option Signup` — `some` only when both validate,
-- `Signup.canSubmit … : Bool`, and
-- a proof `Signup.canSubmit e p = true ↔ Email e ∧ MinLen 8 p` — no hand-written proof.
-
-Wired into an app, the submit button is enabled *exactly* when the inputs validate
-(`Signup.ofRaw … |>.isSome`), so it can't disagree with the data. `update` is a pure
-function from the model and a message to the next model; `view` maps the model to
-typed HTML. `lake build` rejects the module unless every `Msg` is handled and both
-functions terminate.
-
-```lean
 structure Model where
-  route    : Route                            -- a typed page, never a stray string
-  user     : Option User                      -- decoded from the API, or not loaded
-  email    : String                           -- raw form inputs
+  email    : String          -- raw inputs, as typed
   password : String
 
 inductive Msg
-  | navigate (to : Route)
-  | apiResult (body : String)                 -- a fetch response body
+  | email    (s : String)
+  | password (s : String)
   | submit
 
 def update (m : Model) : Msg → Model
-  | .navigate to    => { m with route := to }
-  | .apiResult body => { m with user := (decodeUser body).toOption }
-  | .submit         => m
+  | .email s    => { m with email := s }
+  | .password s => { m with password := s }
+  | .submit     => m         -- only reachable when the inputs validate (button gated below)
 
 def view (m : Model) : Html Msg :=
-  let valid := (Signup.ofRaw m.email m.password).isSome
-  div [cls "app"] [
-    input  [type' "email",    value m.email],       -- typed attrs: key typos won't compile
-    input  [type' "password", value m.password],
+  let valid := (Signup.ofRaw m.email m.password).isSome    -- some ⇔ both fields validate
+  div [cls "signup"] [
+    input  [type' "email",    value m.email,    onInput .email],
+    input  [type' "password", value m.password, onInput .password],
     button [disabled (!valid), onClick .submit] "Create account"
   ]
 ```

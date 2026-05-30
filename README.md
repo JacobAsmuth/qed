@@ -26,7 +26,36 @@ The installer adds elan (the Lean toolchain manager) if it's missing, fetches th
 framework into `~/.qed`, builds the `qed` CLI, and puts it on your PATH. The wasm
 toolchain and emscripten are fetched on first `qed build`, not at install time.
 
-## The counter, in full
+## At a glance
+
+A typed view — a mistyped event like `onClick .incremnt` won't compile — and a
+safety property the framework proves for you, here that a counter's value never
+goes negative:
+
+```lean
+def view (m : Model) : Html Msg :=
+  div [cls "counter"] [
+    button [onClick .decrement] "−",
+    span   [cls "count"]        [toString m.count],
+    button [onClick .increment] "+"
+  ]
+
+-- No proof written by hand: the kernel checks this holds after every message.
+invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
+```
+
+The rest of that app — `Model`, `Msg`, `update`, and the entry point — is the
+[counter example](#the-counter) below.
+
+## Examples
+
+The snippets below assume `import Qed` and `open Qed`.
+
+### The counter
+
+The whole app: the state, the messages it answers, a total `update`, a typed
+`view`, and one stated invariant. `lake build` rejects it unless every message is
+handled, both functions terminate, and the invariant's proof discharges.
 
 ```lean
 import Qed
@@ -60,13 +89,6 @@ def app : App Model Msg := sandbox init update view
 invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
 ```
 
-That's the whole app. `lake build` checking it green *is* the proof that it is
-total and that `counterSafe` holds.
-
-## Examples
-
-The snippets below assume `import Qed` and `open Qed`.
-
 ### Reading JSON, with errors handled
 
 `Json.parse` is total and depth-bounded: malformed or too-deeply-nested input
@@ -76,8 +98,8 @@ a response body into a value is a `do` block in the `Except` monad.
 
 ```lean
 jsonStruct User where
-  name : String;
-  age  : Nat;                  -- a `Nat` field rejects negatives
+  name : String
+  age  : Nat                   -- a `Nat` field rejects negatives
   bio  : Option String         -- optional: absent or null ⇒ none
 
 def decodeUser (body : String) : Except String User := do
@@ -107,7 +129,7 @@ abbrev Email  (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
 abbrev MinLen (n : Nat) (s : String) : Prop := s.length ≥ n
 
 form Signup where
-  email    : Email;
+  email    : Email
   password : MinLen 8
 ```
 
@@ -157,10 +179,11 @@ def view (m : Model) : Html Msg :=
 
 ### Effects: a streaming LLM chat
 
-Side effects are *data*. `update` returns `(model, Cmd)` and stays pure and total;
-the driver runs the `Cmd`. `Cmd.stream` POSTs and reads the response as it arrives,
-dispatching `.chunk` per Server-Sent-Event and `.done` at the end — so a token-by-token
-LLM reply is just more messages through the same `update`. `onInput` captures the
+Side effects are *data*. `update` stays a pure `Model → Msg → Model`; a separate
+`effects` function maps a message to the `Cmd` to run after it, which the driver
+interprets. `Cmd.stream` POSTs and reads the response as it arrives, dispatching
+`.chunk` per Server-Sent-Event and `.done` at the end — so a token-by-token LLM
+reply is just more messages through the same `update`. `onInput` captures the
 composer text. JSON in and out goes through the verified `Qed.Json`.
 
 ```lean
@@ -170,11 +193,15 @@ inductive Msg
   | chunk (data : String)  -- one streamed SSE payload (an OpenAI delta)
   | done                   -- stream finished
 
-def update (m : Model) : Msg → Model × Cmd Msg
-  | .typed s   => ({ m with draft := s }, .none)
-  | .send      => (m', .stream "/v1/chat/completions" (reqBody convo) .chunk .done)
-  | .chunk raw => ({ m with turns := appendLast m.turns (deltaOf raw) }, .none)
-  | .done      => ({ m with pending := false }, .none)
+def update (m : Model) : Msg → Model        -- pure: arms are plain record updates
+  | .typed s   => { m with draft := s }
+  | .send      => …                          -- push the user turn, clear the draft
+  | .chunk raw => { m with turns := appendLast m.turns (deltaOf raw) }
+  | .done      => { m with pending := false }
+
+def effects (m : Model) : Msg → Cmd Msg     -- m is the post-update model
+  | .send => .stream "/v1/chat/completions" (reqBody m.turns.pop) .chunk .done
+  | _     => .none
 
 def view (m : Model) : Html Msg :=
   div [cls "chat"] [
@@ -182,11 +209,52 @@ def view (m : Model) : Html Msg :=
     input  [value m.draft, onInput .typed, placeholder "Message…"],    -- controlled input
     button [disabled (m.pending || m.draft.trim.isEmpty), onClick .send] "Send"
   ]
+
+def chatApp : App Model Msg := application init update view effects
 ```
 
 The full app is `Examples/Chat.lean`; `test/chat_test.mjs` drives it in headless
 Chromium against a mock OpenAI streaming backend (`test/mock_llm.py`) and saves a
 screenshot at each stage (`qed test`).
+
+### Reusable components, one per data row
+
+A `Component Model Msg` bundles an `update` and a `view` over its own state and its
+own message type. To repeat it per row — one box per entry in a decoded JSON array —
+`viewList` renders each row and tags its messages with the row index, and `updateAt`
+routes a tagged message back to that one row. A click in row 2 arrives as
+`Msg.box 2 …` and updates only row 2.
+
+```lean
+jsonStruct Entry where
+  name  : String
+  score : Nat
+
+namespace Box                                   -- a self-contained, reusable box
+  structure Model where entry : Entry; expanded : Bool
+  inductive Msg | toggle
+  def update (m : Model) : Msg → Model
+    | .toggle => { m with expanded := !m.expanded }
+  def view (m : Model) : Html Msg :=
+    div [cls (if m.expanded then "box open" else "box"), onClick .toggle]
+      [ h2 [] [m.entry.name], span [cls "score"] [m.entry.score] ]   -- Nat needs no toString
+  def component : Component Model Msg := { update, view }
+end Box
+
+structure Model where boxes : Array Box.Model
+inductive Msg | box (i : Nat) (msg : Box.Msg)     -- a message names the row it came from
+
+def update (m : Model) : Msg → Model
+  | .box i bm => { m with boxes := Box.component.updateAt m.boxes i bm }
+
+def view (m : Model) : Html Msg :=
+  div [cls "boxes"] (Box.component.viewList m.boxes Msg.box)
+```
+
+A component lowers to ordinary `Html` through `Html.map`, so it adds no axioms and
+the proofs above (totality, `diff_apply`) already cover a composed view — nesting
+buys no new trust assumptions. The full example, decoding a JSON array into a list
+of boxes, is `Examples/Boxes.lean`.
 
 ## What this lets you prove
 
@@ -266,45 +334,16 @@ CLI against this checkout.
 | `Qed/Invariant.lean` | The `invariant … preserved_by …` command (auto-proven). |
 | `Qed/Diff.lean` | The diff/patch engine + the `diff_apply` correctness proof. |
 | `Qed/Json.lean` | Full JSON parser/renderer + `jsonStruct`/`jsonCodec` + `parse_depth_le` & `parse_render` proofs. |
-| `Qed/Router.lean` | The `Router` class (round-trip law as a field) + a route table. |
+| `Qed/Router.lean` | The `Router` class (round-trip law as a field) + the `router` command (generates the route enum, `print`/`parse`, the round-trip proof, and the instance). |
 | `Qed/Form.lean` | `Prop`-refinement fields (`Field p`) + the `form` command (generates the `canSubmit_iff` proof). |
+| `Qed/Component.lean` | `Component` (a reusable `update`+`view`) + `viewList`/`updateAt` for repeating it per row. |
 | `Qed/Dom.lean` | The `@[extern]` DOM node primitives (the trusted boundary). |
 | `Qed/Driver.lean` | The impure browser driver (build + patch) + `@[export]`ed entry points. |
 | `Examples/Counter.lean` | The counter demo (shared by both entry points). |
 | `Examples/Chat.lean` / `Examples/ChatWeb.lean` | The streaming LLM chat app + its WASM entry. |
+| `Examples/Boxes.lean` | A `Component` repeated per row of a decoded JSON array. |
 | `Examples/Native.lean` / `Examples/Web.lean` | Native / WASM counter entry points. |
 | `Cli.lean` + `./qed` | The toolchain (build/dev/test/check/…) and its shim. |
 | `runtime/` | C/JS driver, pages, dev server. |
 | `test/` | Browser tests: counter (`browser_test.mjs`) + chat screenshots (`chat_test.mjs`) + mock LLM (`mock_llm.py`). |
 | `scripts/axioms.lean` | Axiom manifest gated by `qed check`/`qed build`. |
-
-## Notable constraints
-
-- **Lean is pinned to v4.15.0** — it is the *last* release that ships the
-  prebuilt `linux_wasm32` toolchain (v4.16+ dropped it), which supplies the Lean
-  runtime already compiled for wasm so we never build it ourselves.
-- **`runtime/uv_stubs.c`** defines four libuv temp-file symbols that `libleanrt`
-  references but the wasm toolchain doesn't bundle. A frontend never calls them;
-  the stubs keep the linker strict.
-- The WASM build is **emscripten, not WASI** (Lean uses C++ exceptions) and uses
-  `-pthread`, so the page must be served cross-origin-isolated (see `serve.py`).
-
-## Roadmap
-
-**Done** (all kernel-checked, `sorry`-free — run `./qed check`):
-the verified core, an end-to-end browser slice, the verified diff/patch engine,
-state-machine invariants, full-grammar JSON (parser + renderer + typed codec +
-depth bound + codec round-trip on the structural core), round-tripping routes,
-refinement-typed forms, `Cmd`-based effects with **streaming fetch**, text input
-(`onInput`), and a streaming LLM chat (`Examples/Chat.lean`) tested in a real
-browser against a mock OpenAI backend.
-
-**Next:**
-
-- **Extend the JSON codec round-trip** — `parse_render` covers null/bool/nested
-  arrays today; extending it to numbers, strings, and objects needs an integer
-  `toString`/parse-inverse lemma and a string escape-inverse lemma.
-- **Keyed reconciliation** — extend the diff proof to matched/moved children (the
-  current proof is exact for positional children).
-- **`deriving Router` / `deriving Form`** — generate the instances above from the
-  type alone, so even the boilerplate disappears (the proofs already auto-discharge).

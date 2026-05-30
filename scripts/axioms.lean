@@ -11,6 +11,8 @@ import Examples.Counter
 
 #print axioms counterSafe            -- state-machine invariant
 #print axioms Qed.diff_apply         -- VDOM diff/patch correctness
+#print axioms Qed.diffChildren_apply -- child-list reconcile (add/remove), any lengths
+#print axioms Qed.diffKeyed_apply    -- keyed child reconcile (reorder/remove by key)
 #print axioms Qed.parse_depth_le     -- JSON depth bound
 #print axioms Qed.Route.round_trip   -- routing round-trip
 #print axioms Qed.Demo.Signup.canSubmit_iff  -- form submit ⇔ valid

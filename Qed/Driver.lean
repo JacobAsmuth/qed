@@ -33,6 +33,7 @@ def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
   | .attr "value" v => Dom.setValue node v
   | .attr k v       => Dom.setAttribute node k v
   | .flag k on      => if on then Dom.setAttribute node k k else Dom.removeAttribute node k
+  | .key _          => pure ()   -- a reconciliation key never touches the DOM
   | .onClick m      => do
       let cs ← h.click.get
       h.click.set (cs.push m)
@@ -62,6 +63,7 @@ partial def buildDom (h : Handlers msg) : Html msg → IO Dom.Node
         Dom.appendChild node (← buildDom h c)
       return node
 
+mutual
 /-- Execute a patch against the live DOM, reusing nodes where possible. `parent`
     and `index` locate `node` within its parent, needed only for `replace`. -/
 partial def applyToDom (h : Handlers msg)
@@ -74,10 +76,48 @@ partial def applyToDom (h : Handlers msg)
       -- not touched, so a typed input keeps its caret) and a toggled-off `flag`
       -- removes its key. node identity — hence focus/cursor — is preserved.
       applyAttrs h node attrs
-      let mut i : UInt32 := 0
-      for kid in kids do
-        applyToDom h node i (← Dom.childAt node i) kid
-        i := i + 1
+      applyChildrenToDom h node 0 kids
+  | .patchKeyed attrs steps => do
+      applyAttrs h node attrs
+      -- Snapshot the current child handles by their original index. Handles stay
+      -- valid as the nodes move, so a `reuse i` always resolves to the same node.
+      let oldCount ← Dom.childCount node
+      let mut live : Array Dom.Node := #[]
+      for i in [0:oldCount.toNat] do
+        live := live.push (← Dom.childAt node (UInt32.ofNat i))
+      -- Walk the steps in new order, placing the right node at each position `j`.
+      -- `insertBefore` moves a reused node (keeping its identity) or inserts a new
+      -- one; reused nodes are then patched in place.
+      let mut j : UInt32 := 0
+      for step in steps do
+        match step with
+        | .reuse oldIndex p => do
+            let child := live.getD oldIndex 0
+            Dom.insertBefore node j child
+            applyToDom h node j child p
+        | .create newH => do
+            Dom.insertBefore node j (← buildDom h newH)
+        j := j + 1
+      -- Old nodes whose key wasn't reused are now past `j`; drop them.
+      let count ← Dom.childCount node
+      for _ in [j.toNat:count.toNat] do Dom.removeChild node j
+
+/-- Mirror a `ChildPatch` onto `node`'s children: patch the prefix in place (so each
+    reused child keeps its identity), then append freshly-built nodes for the surplus
+    new children, or remove the surplus old ones. `i` is the next child index. -/
+partial def applyChildrenToDom (h : Handlers msg) (node : Dom.Node) (i : UInt32) :
+    ChildPatch msg → IO Unit
+  | .patch p rest => do
+      applyToDom h node i (← Dom.childAt node i) p
+      applyChildrenToDom h node (i + 1) rest
+  | .append news => do
+      for nh in news do Dom.appendChild node (← buildDom h nh)
+  | .drop => do
+      -- children at indices [i, count) are gone; removing at `i` repeatedly works
+      -- because each removal shifts the next child down into index `i`.
+      let count ← Dom.childCount node
+      for _ in [i.toNat:count.toNat] do Dom.removeChild node i
+end
 
 /-- A type-erased running application — the monomorphic closures seal the
     polymorphic `Model`/`Msg` so the export wrappers below stay first-order. -/

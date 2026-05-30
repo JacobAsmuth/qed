@@ -108,6 +108,7 @@ def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .cls c     => (s!" class=\"{escapeHtml c}\"", hs)
   | .attr k v  => (s!" {k}=\"{escapeHtml v}\"", hs)
   | .flag k on => (if on then s!" {k}=\"{k}\"" else "", hs)
+  | .key _     => ("", hs)   -- a reconciliation key is virtual-DOM-only; it never renders
   | .onClick m => (s!" data-qed-click=\"{hs.size}\"", hs.push m)
   | .onInput _ => ("", hs)   -- no static form; the driver wires input events
   | .onCheck _ => ("", hs)   -- (same — the driver wires checkbox change events)

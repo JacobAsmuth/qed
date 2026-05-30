@@ -88,10 +88,37 @@ EM_JS(int, qed_js_child_at, (int parent, int index), {
   return N.length - 1;
 });
 
+EM_JS(int, qed_js_child_count, (int parent), {
+  var p = globalThis.__qed.nodes[parent];
+  return p ? p.childNodes.length : 0;
+});
+
+EM_JS(void, qed_js_remove_child, (int parent, int index), {
+  var p = globalThis.__qed.nodes[parent];
+  if (p && p.childNodes[index]) p.removeChild(p.childNodes[index]);
+});
+
 EM_JS(void, qed_js_replace_child, (int parent, int index, int newChild), {
   var N = globalThis.__qed.nodes;
   var p = N[parent];
   if (p && N[newChild] && p.childNodes[index]) p.replaceChild(N[newChild], p.childNodes[index]);
+});
+
+EM_JS(void, qed_js_insert_before, (int parent, int index, int child), {
+  var N = globalThis.__qed.nodes;
+  var p = N[parent], c = N[child];
+  if (!p || !c) return;
+  var ref = p.childNodes[index] || null; /* null reference ⇒ append at the end */
+  if (ref === c) return;                  /* already in place */
+  /* Reordering an already-attached child: `moveBefore` (Chrome 133+) relocates it
+     atomically, preserving focus, selection, and running animations. Plain
+     `insertBefore` works everywhere but is a remove+insert, so it blurs a focused
+     descendant on a move. Use moveBefore when relocating within `p`; otherwise (a
+     freshly-built node, or no support) insert. */
+  if (c.parentNode === p && p.moveBefore) {
+    try { p.moveBefore(c, ref); return; } catch (e) { /* fall through to insertBefore */ }
+  }
+  p.insertBefore(c, ref);
 });
 
 EM_JS(void, qed_js_mount_root, (int node), {
@@ -173,9 +200,27 @@ LEAN_EXPORT lean_object *qed_dom_child_at(uint32_t parent, uint32_t index, lean_
   return lean_io_result_mk_ok(lean_box_uint32(h));
 }
 
+LEAN_EXPORT lean_object *qed_dom_child_count(uint32_t parent, lean_object *world) {
+  (void) world;
+  uint32_t n = (uint32_t) qed_js_child_count((int) parent);
+  return lean_io_result_mk_ok(lean_box_uint32(n));
+}
+
+LEAN_EXPORT lean_object *qed_dom_remove_child(uint32_t parent, uint32_t index, lean_object *world) {
+  (void) world;
+  qed_js_remove_child((int) parent, (int) index);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
 LEAN_EXPORT lean_object *qed_dom_replace_child(uint32_t parent, uint32_t index, uint32_t newChild, lean_object *world) {
   (void) world;
   qed_js_replace_child((int) parent, (int) index, (int) newChild);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *qed_dom_insert_before(uint32_t parent, uint32_t index, uint32_t child, lean_object *world) {
+  (void) world;
+  qed_js_insert_before((int) parent, (int) index, (int) child);
   return lean_io_result_mk_ok(lean_box(0));
 }
 

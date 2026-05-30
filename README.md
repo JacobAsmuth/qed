@@ -237,6 +237,58 @@ the totality and diff/patch proofs already cover a composed view — nesting buy
 new trust assumptions. The full example, decoding a JSON array into a list of
 boxes, is `Examples/Boxes.lean`.
 
+### A list that grows, shrinks, and reorders
+
+Child lists are reconciled in one of two ways. By default it is *positional*: the
+old and new lists need not be the same length — the diff patches the common prefix
+in place and appends or drops the surplus — so adding or removing at the end is
+exact. But a removal or reorder in the *middle* would shift every row below it.
+
+Give each row a **`key`** (just like React's `key` or Vue's `:key`) and the diff
+reconciles *by key* instead: each row is matched to the previous row with the same
+key, so a removed row drops exactly its own node and a row that *moves* — because
+another was removed, or the list was sorted — keeps the **same DOM node**, with the
+focus, scroll, and selection inside it riding along (via an atomic `moveBefore`
+where the browser supports it). `diff_apply` proves the patched list equals the new
+`view` either way: a keyed `reuse` step stores `diff oldChild newChild`, and
+`applyPatch (diff x n) x = n` holds for *any* `x` (`diffKeyed_apply`), so the
+key-matching only chooses *which* node is reused, never the result.
+
+```lean
+structure Item where
+  id   : Nat                 -- a stable identity, used as the reconciliation key
+  text : String
+
+inductive Msg
+  | edit (s : String)
+  | add
+  | remove (id : Nat)        -- delete by id, not position
+  | sort                     -- reorder; keyed rows follow their data
+
+def view (m : Model) : Html Msg :=
+  div [cls "todo"] [
+    div [cls "add"] [
+      input  [cls "new", value m.draft, onInput .edit, placeholder "What needs doing?"],
+      button [onClick .add]  "Add",
+      button [onClick .sort] "Sort"
+    ],
+    ul [cls "items"] (m.items.map fun it =>
+      li [key (toString it.id), cls "item"] [          -- the key: this row IS item id
+        span   [cls "text"]                        [it.text],
+        button [cls "rm", onClick (.remove it.id)] "✕"
+      ]).toList
+  ]
+```
+
+`Examples/Todo.lean` is the full app; `test/todo_test.mjs` drives it in a real
+browser — adding, removing from the middle, and sorting — and asserts that a row's
+DOM node (and a focus inside it) follows its key across both a removal and a
+reorder, which only keyed reconciliation can do.
+
+A node whose *tag* changes is still replaced wholesale; the key matching is by
+identity, not a longest-common-subsequence, so it reuses and moves nodes rather
+than computing a minimal set of moves.
+
 ## How it works
 
 ```
@@ -296,7 +348,7 @@ CLI against this checkout.
 | `Qed/Notation.lean` | Readable view combinators (`div`, `button`, `onClick`, …). |
 | `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`), `Cmd` effects + pure render-to-HTML. |
 | `Qed/Invariant.lean` | The `invariant … preserved_by …` command (auto-proven). |
-| `Qed/Diff.lean` | The diff/patch engine + the `diff_apply` correctness proof. |
+| `Qed/Diff.lean` | The diff/patch engine — positional length-general reconcile (add/remove) and keyed reconcile (reorder/remove by `key`) + the `diff_apply` correctness proof. |
 | `Qed/Json.lean` | Full JSON parser/renderer + `jsonStruct`/`jsonCodec` + `parse_depth_le` & `parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field) + the `router` command (generates the route enum, `print`/`parse`, the round-trip proof, and the instance). |
 | `Qed/Form.lean` | Typed refinement fields (`Field p`), the `Input` controls (text/number/checkbox/date/select/radios), and the `form` command (Draft + `parse` + `formView` + the `canSubmit_iff` proof). |
@@ -307,5 +359,5 @@ CLI against this checkout.
 | `Examples/` | Example programs. |
 | `Cli.lean` + `./qed` | The toolchain (build/dev/test/check/…) and its shim. |
 | `runtime/` | C/JS driver, pages, dev server. |
-| `test/` | Browser tests: counter (`browser_test.mjs`) + chat screenshots (`chat_test.mjs`) + mock LLM (`mock_llm.py`). |
+| `test/` | Browser tests: counter (`browser_test.mjs`), chat screenshots (`chat_test.mjs`), form (`signup_test.mjs`), current-time (`booking_test.mjs`), dynamic list (`todo_test.mjs`) + mock LLM (`mock_llm.py`). |
 | `scripts/axioms.lean` | Axiom manifest gated by `qed check`/`qed build`. |

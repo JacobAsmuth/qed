@@ -25,6 +25,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         pass
 
 
-with socketserver.TCPServer(("", PORT), Handler) as httpd:
+class Server(socketserver.TCPServer):
+    # Rebind immediately after a restart instead of waiting out the prior socket's
+    # TIME_WAIT (so `qed dev` restarts and back-to-back test runs don't collide).
+    allow_reuse_address = True
+
+
+with Server(("", PORT), Handler) as httpd:
     print(f"Qed → http://localhost:{PORT}  (serving {DIR})")
     httpd.serve_forever()

@@ -21,6 +21,10 @@ inductive Attr (msg : Type) where
   /-- A boolean attribute (`disabled`, `checked`, …): present on the node *iff*
       `on`, so there is no `disabled="false"`-still-disables footgun. -/
   | flag (key : String) (on : Bool)
+  /-- A reconciliation key (React/Vue `key`): identifies a child across renders so
+      the diff can match a moved/reordered element to its previous node instead of
+      patching positionally. Virtual-DOM-only — it never renders or touches the DOM. -/
+  | key (k : String)
   /-- A click handler producing the message `m`. -/
   | onClick (m : msg)
   /-- An input handler: produces a message from the field's current value, fired
@@ -54,6 +58,7 @@ def Attr.map (f : α → β) : Attr α → Attr β
   | .cls n        => .cls n
   | .attr k v     => .attr k v
   | .flag k on    => .flag k on
+  | .key k        => .key k
   | .onClick m    => .onClick (f m)
   | .onInput h    => .onInput (fun s => f (h s))
   | .onCheck h    => .onCheck (fun b => f (h b))

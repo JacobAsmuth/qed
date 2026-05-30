@@ -63,9 +63,26 @@ opaque setText (node : Node) (content : String) : IO Unit
 @[extern "qed_dom_child_at"]
 opaque childAt (parent : Node) (index : UInt32) : IO Node
 
+/-- How many children `parent` currently has. The driver uses it to know how many
+    trailing nodes a `drop` must remove. -/
+@[extern "qed_dom_child_count"]
+opaque childCount (parent : Node) : IO UInt32
+
+/-- Remove the `index`-th child of `parent`. Removing repeatedly at the same index
+    deletes a run of trailing children (each removal shifts the rest down). -/
+@[extern "qed_dom_remove_child"]
+opaque removeChild (parent : Node) (index : UInt32) : IO Unit
+
 /-- Replace the `index`-th child of `parent` with `newChild`. -/
 @[extern "qed_dom_replace_child"]
 opaque replaceChild (parent : Node) (index : UInt32) (newChild : Node) : IO Unit
+
+/-- Insert `child` so it becomes the `index`-th child of `parent` (before whatever
+    is currently there; appended if `index` is past the end). If `child` is already
+    in `parent`, the DOM moves it — preserving its identity, focus, and selection.
+    Keyed reconciliation uses this to reorder reused rows. -/
+@[extern "qed_dom_insert_before"]
+opaque insertBefore (parent : Node) (index : UInt32) (child : Node) : IO Unit
 
 /-- Mount `node` as the sole child of the `#app` element. -/
 @[extern "qed_dom_mount_root"]

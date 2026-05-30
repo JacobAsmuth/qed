@@ -48,6 +48,11 @@ def onChange (handler : String → msg) : Attr msg := .onInput handler
 /-- Fire `handler isChecked` whenever a checkbox toggles. -/
 def onCheck (handler : Bool → msg) : Attr msg := .onCheck handler
 
+/-- A reconciliation key (React/Vue `key`): give each item in a repeated list a
+    stable key so the diff matches a moved/removed row to its previous DOM node
+    instead of reconciling positionally. Reconciliation-only; never rendered. -/
+def key (k : String) : Attr msg := .key k
+
 /-- Typed string attributes — typos in the key become compile errors. -/
 def value       (v : String) : Attr msg := .attr "value" v
 def placeholder (v : String) : Attr msg := .attr "placeholder" v

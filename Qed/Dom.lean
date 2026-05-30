@@ -28,16 +28,22 @@ opaque createText (content : String) : IO Node
 @[extern "qed_dom_set_attribute"]
 opaque setAttribute (node : Node) (key value : String) : IO Unit
 
-/-- Remove every attribute from an element. The driver clears then re-applies on
-    each patch, so a dropped or toggled-off attribute actually leaves the DOM. -/
-@[extern "qed_dom_clear_attributes"]
-opaque clearAttributes (node : Node) : IO Unit
+/-- Remove a single attribute from an element. The driver uses this to drop a
+    toggled-off boolean attribute, while leaving unchanged attributes untouched (so
+    a typed input keeps its caret). -/
+@[extern "qed_dom_remove_attribute"]
+opaque removeAttribute (node : Node) (key : String) : IO Unit
 
 /-- Set an input's live `value` *property* (not just the attribute), so a
     controlled field reflects the model. A no-op when already equal, which keeps
     the caret where the user left it. -/
 @[extern "qed_dom_set_value"]
 opaque setValue (node : Node) (value : String) : IO Unit
+
+/-- The current local date as an ISO `YYYY-MM-DD` string (the browser's `new Date()`),
+    for `Cmd.now` to parse into a `Qed.Date` and thread into the model. -/
+@[extern "qed_dom_today"]
+opaque today : IO String
 
 /-- POST `body` to `url` and stream the response. The JS host reads the response
     as Server-Sent Events and calls back into Lean per data chunk (tagged

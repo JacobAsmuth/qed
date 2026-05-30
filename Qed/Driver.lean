@@ -32,7 +32,7 @@ def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
   | .cls c          => Dom.setAttribute node "class" c
   | .attr "value" v => Dom.setValue node v
   | .attr k v       => Dom.setAttribute node k v
-  | .flag k on      => if on then Dom.setAttribute node k k else pure ()
+  | .flag k on      => if on then Dom.setAttribute node k k else Dom.removeAttribute node k
   | .onClick m      => do
       let cs ← h.click.get
       h.click.set (cs.push m)
@@ -41,6 +41,11 @@ def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
       let is ← h.input.get
       h.input.set (is.push f)
       Dom.setAttribute node "data-qed-input" (toString is.size)
+  | .onCheck f      => do
+      -- shares the string-handler table; the host sends "true"/"false" for a check
+      let is ← h.input.get
+      h.input.set (is.push (fun s => f (s == "true")))
+      Dom.setAttribute node "data-qed-check" (toString is.size)
 
 /-- Apply a (normalized) attribute list, so the live DOM matches what `render`
     would produce — classes merged, duplicate keys collapsed. -/
@@ -65,9 +70,9 @@ partial def applyToDom (h : Handlers msg)
       Dom.replaceChild parent index (← buildDom h new)
   | .setText s => Dom.setText node s
   | .patchElement attrs kids => do
-      -- clear then re-apply so attributes dropped or toggled off since the last
-      -- render actually leave the DOM (node identity, hence focus, is preserved)
-      Dom.clearAttributes node
+      -- reconcile attributes in place: `setAttribute` is guarded (unchanged keys are
+      -- not touched, so a typed input keeps its caret) and a toggled-off `flag`
+      -- removes its key. node identity — hence focus/cursor — is preserved.
       applyAttrs h node attrs
       let mut i : UInt32 := 0
       for kid in kids do
@@ -129,6 +134,9 @@ def run (app : App Model Msg) : IO Unit := do
   -- Stream callbacks persist across renders (a stream outlives many of them).
   let chunkCbRef ← IO.mkRef (#[] : Array (String → Msg))
   let doneCbRef  ← IO.mkRef (#[] : Array Msg)
+  -- Forward reference to the dispatcher, so an effect (`Cmd.now`) can feed a
+  -- message back through the loop (set to the real dispatcher just below).
+  let dispatchRef ← IO.mkRef (fun (_ : Msg) => (pure () : IO Unit))
   let renderModel : IO Unit := do
     clickRef.set #[]; inputRef.set #[]
     let newTree := app.view (← modelRef.get)
@@ -150,11 +158,17 @@ def run (app : App Model Msg) : IO Unit := do
         let cs ← chunkCbRef.get; chunkCbRef.set (cs.push onChunk)
         let ds ← doneCbRef.get;  doneCbRef.set (ds.push onDone)
         Dom.fetchStream url body (UInt32.ofNat cs.size) (UInt32.ofNat ds.size)
+    | .now onNow => do
+        -- reading the clock is instant; parse it and feed `onNow today` back in
+        match Qed.Date.parse? (← Dom.today) with
+        | some d => (← dispatchRef.get) (onNow d)
+        | none   => pure ()
   let dispatchMsg : Msg → IO Unit := fun msg => do
     let (m', cmd) := app.update (← modelRef.get) msg
     modelRef.set m'
     renderModel
     perform cmd
+  dispatchRef.set dispatchMsg
   runtimeRef.set (some {
     mount := do renderModel; perform app.init.2
     dispatch := fun id => do

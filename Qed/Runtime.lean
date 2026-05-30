@@ -10,6 +10,7 @@
   this module links on every target; the impure driver lives in `Qed.Driver`.
 -/
 import Qed.Html
+import Qed.Date
 
 namespace Qed
 
@@ -22,11 +23,15 @@ inductive Cmd (msg : Type) where
   /-- POST `body` to `url`; dispatch `onChunk c` for each streamed chunk `c`,
       then `onDone` when the stream ends. -/
   | stream (url : String) (body : String) (onChunk : String → msg) (onDone : msg)
+  /-- Read the current local date from the clock and dispatch `onNow today`. Use it
+      at startup to thread "today" into the model for relative date rules. -/
+  | now (onNow : Date → msg)
 
 /-- Relabel the messages an effect will produce (functoriality in `msg`). -/
 def Cmd.map (f : α → β) : Cmd α → Cmd β
   | .none                      => .none
   | .stream u b onChunk onDone => .stream u b (fun c => f (onChunk c)) (f onDone)
+  | .now onNow                 => .now (fun d => f (onNow d))
 
 /-- A self-contained application: an initial (model, startup effect), a transition
     that may request effects, and a view. A transition returns `(nextModel, cmd)`;
@@ -105,6 +110,7 @@ def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .flag k on => (if on then s!" {k}=\"{k}\"" else "", hs)
   | .onClick m => (s!" data-qed-click=\"{hs.size}\"", hs.push m)
   | .onInput _ => ("", hs)   -- no static form; the driver wires input events
+  | .onCheck _ => ("", hs)   -- (same — the driver wires checkbox change events)
 
 /-- Render a list of attributes left-to-right, threading the handler table. -/
 def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg

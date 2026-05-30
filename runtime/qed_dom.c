@@ -14,6 +14,7 @@
 #include <lean/lean.h>
 #include <emscripten.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 /* ---- JS-side DOM node handle table --------------------------------------- */
 EM_JS(void, qed_js_init, (void), {
@@ -35,20 +36,29 @@ EM_JS(int, qed_js_create_text, (const char *s), {
 
 EM_JS(void, qed_js_set_attribute, (int node, const char *k, const char *v), {
   var el = globalThis.__qed.nodes[node];
-  if (el) el.setAttribute(UTF8ToString(k), UTF8ToString(v));
+  var key = UTF8ToString(k), val = UTF8ToString(v);
+  /* guard: re-setting an unchanged attribute (e.g. type="number" on every patch)
+     resets a typed input's caret, so only touch it when it actually differs */
+  if (el && el.getAttribute(key) !== val) el.setAttribute(key, val);
 });
 
-EM_JS(void, qed_js_clear_attributes, (int node), {
+EM_JS(void, qed_js_remove_attribute, (int node, const char *k), {
   var el = globalThis.__qed.nodes[node];
-  if (el && el.attributes) {
-    while (el.attributes.length > 0) el.removeAttribute(el.attributes[0].name);
-  }
+  if (el) el.removeAttribute(UTF8ToString(k));
 });
 
 EM_JS(void, qed_js_set_value, (int node, const char *v), {
   var el = globalThis.__qed.nodes[node];
   var s = UTF8ToString(v);
   if (el && el.value !== s) el.value = s; /* guard keeps the caret when unchanged */
+});
+
+/* The current local date as ISO YYYY-MM-DD (Lean parses it into a Qed.Date). The
+   returned buffer is malloc'd by stringToNewUTF8 and freed by the caller. */
+EM_JS(char *, qed_js_today, (void), {
+  var d = new Date();
+  var p = (n) => (n < 10 ? '0' : '') + n;
+  return stringToNewUTF8(d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()));
 });
 
 /* Streaming POST. The SSE parsing + the Lean callbacks live in host.js
@@ -114,10 +124,19 @@ LEAN_EXPORT lean_object *qed_dom_set_attribute(uint32_t node, lean_object *k, le
   return lean_io_result_mk_ok(lean_box(0));
 }
 
-LEAN_EXPORT lean_object *qed_dom_clear_attributes(uint32_t node, lean_object *world) {
+LEAN_EXPORT lean_object *qed_dom_remove_attribute(uint32_t node, lean_object *k, lean_object *world) {
   (void) world;
-  qed_js_clear_attributes((int) node);
+  qed_js_remove_attribute((int) node, lean_string_cstr(k));
+  lean_dec(k);
   return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *qed_dom_today(lean_object *world) {
+  (void) world;
+  char *s = qed_js_today();
+  lean_object *r = lean_mk_string(s);
+  free(s);
+  return lean_io_result_mk_ok(r);
 }
 
 LEAN_EXPORT lean_object *qed_dom_set_value(uint32_t node, lean_object *v, lean_object *world) {

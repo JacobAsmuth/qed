@@ -1,0 +1,51 @@
+/-
+  A form across HTML input types, with "submit ⇔ valid" by construction.
+
+  `form Account` generates the editable `Account.Draft` (raw strings), the validated
+  `Account` (each field a proof-carrying `Field`), `Account.parse`, the `canSubmit`
+  gate + its `canSubmit_iff` proof, and `Account.formView` (the widgets). The app
+  holds a draft, replaces it on every edit, and on submit stores the parsed
+  `Option Account` — which is `some` only when every field validates. The submit
+  button `formView` renders is disabled unless the draft parses, so it cannot fire
+  on invalid data.
+-/
+import Qed
+open Qed
+
+namespace Signup
+
+abbrev Email (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
+abbrev Adult (n : Nat)    : Prop := n ≥ 18
+
+form Account where
+  email : Input.text.refine Email
+  age   : Input.nat.refine Adult
+  born  : Input.date
+  agree : Input.checkbox.refine (· = true)
+  plan  : Input.select [("free", "Free"), ("pro", "Pro")]
+
+structure Model where
+  draft     : Account.Draft
+  submitted : Option Account
+
+inductive Msg
+  | edit (d : Account.Draft)   -- the form hands back the whole updated draft
+  | submit
+
+def update (m : Model) : Msg → Model
+  | .edit d => { m with draft := d }
+  | .submit => { m with submitted := Account.parse m.draft }
+
+def view (m : Model) : Html Msg :=
+  div [cls "app"] [
+    h1 [] ["Create account"],
+    Account.formView m.draft .edit .submit,
+    match m.submitted with
+    | some acc => p [cls "ok"] ["Created account for ", acc.email.val]
+    | none     => .text ""
+  ]
+
+def app : App Model Msg :=
+  sandbox { draft := Account.Draft.empty, submitted := none } update view
+
+end Signup

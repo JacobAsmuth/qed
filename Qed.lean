@@ -12,6 +12,7 @@ import Qed.Diff
 import Qed.Invariant
 import Qed.Json
 import Qed.Router
+import Qed.Date
 import Qed.Form
 import Qed.Component
 -- Note: `Qed.Dom` and `Qed.Driver` are intentionally NOT re-exported here. They

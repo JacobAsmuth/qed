@@ -130,7 +130,7 @@ def emccArgs (cfiles : Array FilePath) (outJs : FilePath) (prod : Bool)
   ++ #["-lInit", "-lLean", "-lleancpp", "-lleanrt", "-lStd",
        "-sFORCE_FILESYSTEM", "-sMODULARIZE", "-sEXPORT_NAME=Qed",
        "-sEXPORTED_FUNCTIONS=_main,_qed_run_init,_qed_run_dispatch,_qed_run_dispatch_str,_qed_run_stream_chunk,_qed_run_stream_done,_malloc,_free",
-       "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap",
+       "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,stringToNewUTF8",
        "-sEXIT_RUNTIME=0", "-sMAIN_MODULE=2", "-sLINKABLE=0", "-sEXPORT_ALL=0",
        "-sALLOW_MEMORY_GROWTH=1", "-fwasm-exceptions", "-pthread", "-flto"]
   ++ (if prod then #["-Oz"] else #[])
@@ -148,7 +148,7 @@ def linkWasm (outDir : FilePath) (prod : Bool) : IO Bool := do
   let allC ← collect ".lake" "c"
   -- Each of these modules carries its own `main`; link only the chosen web entry.
   let entryC := ((wr.splitOn ".").getLastD "") ++ ".c"   -- e.g. "ChatWeb.c"
-  let altMains := ["Native.c", "Cli.c", "Web.c", "ChatWeb.c"].filter (· ≠ entryC)
+  let altMains := ["Native.c", "Cli.c", "Web.c", "ChatWeb.c", "SignupWeb.c", "BookingWeb.c"].filter (· ≠ entryC)
   let cfiles := allC.filter (fun p =>
     (p.toString.splitOn "build/ir").length > 1 && (p.fileName.getD "") ∉ altMains)
   IO.FS.createDirAll outDir
@@ -237,6 +237,14 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "chat_test.mjs").pathExists) then
     step "running screenshot tests (chat)"
     if (← sh "node" #["test/chat_test.mjs"]) != 0 then failed := true
+  -- Signup: the form test builds the signup entry itself.
+  if (← (FilePath.mk "test" / "signup_test.mjs").pathExists) then
+    step "running form tests (signup)"
+    if (← sh "node" #["test/signup_test.mjs"]) != 0 then failed := true
+  -- Booking: threads the current time in via Cmd.now; builds its own entry.
+  if (← (FilePath.mk "test" / "booking_test.mjs").pathExists) then
+    step "running current-time tests (booking)"
+    if (← sh "node" #["test/booking_test.mjs"]) != 0 then failed := true
   if failed then return 1 else return 0
 
 def cmdClean : IO UInt32 := do

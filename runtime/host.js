@@ -63,6 +63,14 @@
         const id = parseInt(t.getAttribute('data-qed-input'), 10);
         if (!Number.isNaN(id)) dispatchStr(id, t.value);
       });
+      // checkboxes carry their state in `.checked`, not `.value` — send it as a
+      // string into the same handler table (Lean parses "true"/"false").
+      root.addEventListener('change', (e) => {
+        const t = e.target.closest('[data-qed-check]');
+        if (!t) return;
+        const id = parseInt(t.getAttribute('data-qed-check'), 10);
+        if (!Number.isNaN(id)) dispatchStr(id, t.checked ? 'true' : 'false');
+      });
     }).catch((err) => {
       console.error('Qed boot failed:', err);
       const root = document.getElementById('app');

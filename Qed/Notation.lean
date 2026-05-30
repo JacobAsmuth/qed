@@ -42,6 +42,11 @@ def attr (key value : String) : Attr msg := .attr key value
 def onClick (m : msg) : Attr msg := .onClick m
 /-- Fire `handler currentValue` whenever the field is edited. -/
 def onInput (handler : String → msg) : Attr msg := .onInput handler
+/-- Fire `handler selectedValue` when a `<select>` or radio changes (alias of
+    `onInput`; both fire the `input` event). -/
+def onChange (handler : String → msg) : Attr msg := .onInput handler
+/-- Fire `handler isChecked` whenever a checkbox toggles. -/
+def onCheck (handler : Bool → msg) : Attr msg := .onCheck handler
 
 /-- Typed string attributes — typos in the key become compile errors. -/
 def value       (v : String) : Attr msg := .attr "value" v

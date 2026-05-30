@@ -24,8 +24,10 @@ inductive Attr (msg : Type) where
   /-- A click handler producing the message `m`. -/
   | onClick (m : msg)
   /-- An input handler: produces a message from the field's current value, fired
-      on every edit. -/
+      on every edit. Also serves `<select>`/radio change (both fire `input`). -/
   | onInput (handler : String → msg)
+  /-- A checkbox handler: produces a message from the box's checked state. -/
+  | onCheck (handler : Bool → msg)
 
 /-- A typed virtual-DOM node. Note this inductive is *total*: there is no
     constructor for "failed render", so a well-typed `view` cannot crash. -/
@@ -54,6 +56,7 @@ def Attr.map (f : α → β) : Attr α → Attr β
   | .flag k on    => .flag k on
   | .onClick m    => .onClick (f m)
   | .onInput h    => .onInput (fun s => f (h s))
+  | .onCheck h    => .onCheck (fun b => f (h b))
 
 mutual
   /-- Remap the message type of a whole tree — the basis of component

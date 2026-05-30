@@ -25,6 +25,11 @@ class Router (α : Type) where
 def Router.toURL {α} [Router α] (a : α) : String :=
   "/" ++ String.intercalate "/" (Router.print a)
 
+/-- Parse a URL path string (`"/users/ada"`) into a route, splitting on `/` and
+    dropping empty segments (so `"/"` is the index, `[]`). `none` if no route matches. -/
+def Router.fromURL {α} [Router α] (path : String) : Option α :=
+  Router.parse ((path.splitOn "/").filter (· ≠ ""))
+
 /-! ### The `router` command
 
 `router T where …` declares the page enum *and* its lawful `Router` instance from

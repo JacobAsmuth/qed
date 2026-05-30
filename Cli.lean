@@ -129,7 +129,7 @@ def emccArgs (cfiles : Array FilePath) (outJs : FilePath) (prod : Bool)
   ++ #[(qh / "runtime" / "qed_dom.c").toString, (qh / "runtime" / "uv_stubs.c").toString]
   ++ #["-lInit", "-lLean", "-lleancpp", "-lleanrt", "-lStd",
        "-sFORCE_FILESYSTEM", "-sMODULARIZE", "-sEXPORT_NAME=Qed",
-       "-sEXPORTED_FUNCTIONS=_main,_qed_run_init,_qed_run_dispatch,_qed_run_dispatch_str,_qed_run_stream_chunk,_qed_run_stream_done,_malloc,_free",
+       "-sEXPORTED_FUNCTIONS=_main,_qed_run_init,_qed_run_dispatch,_qed_run_dispatch_str,_qed_run_stream_chunk,_qed_run_stream_done,_qed_run_http_done,_qed_run_url_changed,_malloc,_free",
        "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,stringToNewUTF8",
        "-sEXIT_RUNTIME=0", "-sMAIN_MODULE=2", "-sLINKABLE=0", "-sEXPORT_ALL=0",
        "-sALLOW_MEMORY_GROWTH=1", "-fwasm-exceptions", "-pthread", "-flto"]
@@ -148,7 +148,7 @@ def linkWasm (outDir : FilePath) (prod : Bool) : IO Bool := do
   let allC ← collect ".lake" "c"
   -- Each of these modules carries its own `main`; link only the chosen web entry.
   let entryC := ((wr.splitOn ".").getLastD "") ++ ".c"   -- e.g. "ChatWeb.c"
-  let altMains := ["Native.c", "Cli.c", "Web.c", "ChatWeb.c", "SignupWeb.c", "BookingWeb.c", "TodoWeb.c"].filter (· ≠ entryC)
+  let altMains := ["Native.c", "Cli.c", "Web.c", "ChatWeb.c", "SignupWeb.c", "BookingWeb.c", "TodoWeb.c", "UsersWeb.c"].filter (· ≠ entryC)
   let cfiles := allC.filter (fun p =>
     (p.toString.splitOn "build/ir").length > 1 && (p.fileName.getD "") ∉ altMains)
   IO.FS.createDirAll outDir
@@ -249,6 +249,10 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "todo_test.mjs").pathExists) then
     step "running dynamic-list tests (todo)"
     if (← sh "node" #["test/todo_test.mjs"]) != 0 then failed := true
+  -- Users: HTTP fetch+decode, URL routing, and the form/keyboard/focus events.
+  if (← (FilePath.mk "test" / "users_test.mjs").pathExists) then
+    step "running routing/http/events tests (users)"
+    if (← sh "node" #["test/users_test.mjs"]) != 0 then failed := true
   if failed then return 1 else return 0
 
 def cmdClean : IO UInt32 := do

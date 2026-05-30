@@ -32,6 +32,18 @@ inductive Attr (msg : Type) where
   | onInput (handler : String → msg)
   /-- A checkbox handler: produces a message from the box's checked state. -/
   | onCheck (handler : Bool → msg)
+  /-- A key handler: produces a message from the pressed key's name (`"Enter"`,
+      `"Escape"`, `"a"`, …), fired on `keydown`. -/
+  | onKeydown (handler : String → msg)
+  /-- A key handler fired on `keyup`. -/
+  | onKeyup (handler : String → msg)
+  /-- A form-submit handler. The default page reload is always suppressed
+      (`preventDefault`), so a `<form>` becomes an ordinary message source. -/
+  | onSubmit (m : msg)
+  /-- A focus-lost handler (`blur`). -/
+  | onBlur (m : msg)
+  /-- A focus-gained handler (`focus`). -/
+  | onFocus (m : msg)
 
 /-- A typed virtual-DOM node. Note this inductive is *total*: there is no
     constructor for "failed render", so a well-typed `view` cannot crash. -/
@@ -62,6 +74,11 @@ def Attr.map (f : α → β) : Attr α → Attr β
   | .onClick m    => .onClick (f m)
   | .onInput h    => .onInput (fun s => f (h s))
   | .onCheck h    => .onCheck (fun b => f (h b))
+  | .onKeydown h  => .onKeydown (fun k => f (h k))
+  | .onKeyup h    => .onKeyup (fun k => f (h k))
+  | .onSubmit m   => .onSubmit (f m)
+  | .onBlur m     => .onBlur (f m)
+  | .onFocus m    => .onFocus (f m)
 
 mutual
   /-- Remap the message type of a whole tree — the basis of component

@@ -35,6 +35,13 @@ def nav     (attrs : List (Attr msg) := []) (children : List (Html msg) := []) :
 def strong  (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "strong" attrs children
 def input   (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "input" attrs children
 def label   (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "label" attrs children
+def formEl  (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "form" attrs children
+
+/-- An internal navigation link: an `<a href=path>` the driver intercepts (no full
+    page reload) — clicking it pushes `path` to the URL and routes to it. Pair with
+    `Router.toURL` for a type-checked target. -/
+def link (path : String) (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg :=
+  el "a" (Attr.attr "href" path :: Attr.attr "data-qed-link" "" :: attrs) children
 
 /-- Class / arbitrary-attribute / event helpers. -/
 def cls (name : String) : Attr msg := .cls name
@@ -47,6 +54,17 @@ def onInput (handler : String → msg) : Attr msg := .onInput handler
 def onChange (handler : String → msg) : Attr msg := .onInput handler
 /-- Fire `handler isChecked` whenever a checkbox toggles. -/
 def onCheck (handler : Bool → msg) : Attr msg := .onCheck handler
+/-- Fire `handler key` on `keydown`, where `key` is the pressed key's name
+    (`"Enter"`, `"Escape"`, …). Handy for Enter-to-submit / keyboard shortcuts. -/
+def onKeydown (handler : String → msg) : Attr msg := .onKeydown handler
+/-- Fire `handler key` on `keyup`. -/
+def onKeyup (handler : String → msg) : Attr msg := .onKeyup handler
+/-- Fire `m` when a `<form>` is submitted; the page reload is always suppressed. -/
+def onSubmit (m : msg) : Attr msg := .onSubmit m
+/-- Fire `m` when the element loses focus (`blur`). -/
+def onBlur (m : msg) : Attr msg := .onBlur m
+/-- Fire `m` when the element gains focus. -/
+def onFocus (m : msg) : Attr msg := .onFocus m
 
 /-- A reconciliation key (React/Vue `key`): give each item in a repeated list a
     stable key so the diff matches a moved/removed row to its previous DOM node

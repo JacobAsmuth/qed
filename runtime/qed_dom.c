@@ -68,6 +68,23 @@ EM_JS(void, qed_js_fetch_stream, (const char *url, const char *body, int cid, in
     globalThis.__qed.fetchStream(UTF8ToString(url), UTF8ToString(body), cid, did);
 });
 
+/* HTTP request. The fetch + the Lean callback live in host.js
+   (globalThis.__qed.httpSend); this shim is a thin delegation. */
+EM_JS(void, qed_js_http_send, (const char *method, const char *url, const char *body, int id), {
+  if (globalThis.__qed && globalThis.__qed.httpSend)
+    globalThis.__qed.httpSend(UTF8ToString(method), UTF8ToString(url), UTF8ToString(body), id);
+});
+
+/* The current URL path. The returned buffer is malloc'd by stringToNewUTF8 and
+   freed by the caller. */
+EM_JS(char *, qed_js_current_path, (void), {
+  return stringToNewUTF8(location.pathname);
+});
+
+EM_JS(void, qed_js_push_path, (const char *p), {
+  history.pushState({}, '', UTF8ToString(p));
+});
+
 EM_JS(void, qed_js_append_child, (int parent, int child), {
   var N = globalThis.__qed.nodes;
   if (N[parent] && N[child]) N[parent].appendChild(N[child]);
@@ -181,6 +198,29 @@ LEAN_EXPORT lean_object *qed_dom_fetch_stream(lean_object *url, lean_object *bod
   return lean_io_result_mk_ok(lean_box(0));
 }
 
+LEAN_EXPORT lean_object *qed_dom_http_send(lean_object *method, lean_object *url,
+                                           lean_object *body, uint32_t id, lean_object *world) {
+  (void) world;
+  qed_js_http_send(lean_string_cstr(method), lean_string_cstr(url), lean_string_cstr(body), (int) id);
+  lean_dec(method); lean_dec(url); lean_dec(body);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *qed_dom_current_path(lean_object *world) {
+  (void) world;
+  char *s = qed_js_current_path();
+  lean_object *r = lean_mk_string(s);
+  free(s);
+  return lean_io_result_mk_ok(r);
+}
+
+LEAN_EXPORT lean_object *qed_dom_push_path(lean_object *path, lean_object *world) {
+  (void) world;
+  qed_js_push_path(lean_string_cstr(path));
+  lean_dec(path);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
 LEAN_EXPORT lean_object *qed_dom_append_child(uint32_t parent, uint32_t child, lean_object *world) {
   (void) world;
   qed_js_append_child((int) parent, (int) child);
@@ -236,6 +276,8 @@ extern lean_object *qed_dispatch(uint32_t id, lean_object *world);
 extern lean_object *qed_dispatch_str(uint32_t id, lean_object *s, lean_object *world);
 extern lean_object *qed_stream_chunk(uint32_t cid, lean_object *chunk, lean_object *world);
 extern lean_object *qed_stream_done(uint32_t did, lean_object *world);
+extern lean_object *qed_http_done(uint32_t id, uint32_t ok, lean_object *text, lean_object *world);
+extern lean_object *qed_url_changed(lean_object *path, lean_object *world);
 
 static void qed_run_io(lean_object *res) {
   if (lean_io_result_is_error(res)) lean_io_result_show_error(res);
@@ -263,4 +305,16 @@ void qed_run_stream_chunk(uint32_t cid, const char *chunk) {
 EMSCRIPTEN_KEEPALIVE
 void qed_run_stream_done(uint32_t did) {
   qed_run_io(qed_stream_done(did, lean_io_mk_world()));
+}
+
+/* HTTP response: dispatch the body (and ok flag) to the request's handler. */
+EMSCRIPTEN_KEEPALIVE
+void qed_run_http_done(uint32_t id, int ok, const char *text) {
+  qed_run_io(qed_http_done(id, (uint32_t) (ok ? 1 : 0), lean_mk_string(text), lean_io_mk_world()));
+}
+
+/* URL changed (link click, back/forward, programmatic push): re-route. */
+EMSCRIPTEN_KEEPALIVE
+void qed_run_url_changed(const char *path) {
+  qed_run_io(qed_url_changed(lean_mk_string(path), lean_io_mk_world()));
 }

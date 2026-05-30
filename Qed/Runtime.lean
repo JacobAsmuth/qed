@@ -11,6 +11,7 @@
 -/
 import Qed.Html
 import Qed.Date
+import Qed.Json
 
 namespace Qed
 
@@ -26,12 +27,39 @@ inductive Cmd (msg : Type) where
   /-- Read the current local date from the clock and dispatch `onNow today`. Use it
       at startup to thread "today" into the model for relative date rules. -/
   | now (onNow : Date → msg)
+  /-- Send an HTTP request (`method` `url` with `body`) and dispatch `onResult`
+      with the response text, or an error message if the request failed or returned
+      a non-2xx status. The typed `Cmd.getJson`/`Cmd.postJson` wrap this with a
+      `Qed.Json` decode. -/
+  | request (method url body : String) (onResult : Except String String → msg)
+  /-- Push `path` to the browser URL (no reload) and route to it. Use for
+      programmatic navigation; internal `link`s navigate on their own. -/
+  | pushUrl (path : String)
 
 /-- Relabel the messages an effect will produce (functoriality in `msg`). -/
 def Cmd.map (f : α → β) : Cmd α → Cmd β
   | .none                      => .none
   | .stream u b onChunk onDone => .stream u b (fun c => f (onChunk c)) (f onDone)
   | .now onNow                 => .now (fun d => f (onNow d))
+  | .request m u b onResult    => .request m u b (fun r => f (onResult r))
+  | .pushUrl p                 => .pushUrl p
+
+/-- Decode an HTTP response with `Qed.Json` + `FromJson`, routing a successful
+    decode to `onOk` and any transport/parse/decode error to `onErr`. -/
+def httpDecode [FromJson α] (onOk : α → msg) (onErr : String → msg) :
+    Except String String → msg
+  | .error e   => onErr e
+  | .ok   body => match (Json.parse body).bind FromJson.fromJson with
+                  | .ok a    => onOk a
+                  | .error e => onErr e
+
+/-- GET `url`, decode the JSON body into `α`, and dispatch `onOk`/`onErr`. -/
+def Cmd.getJson [FromJson α] (url : String) (onOk : α → msg) (onErr : String → msg) : Cmd msg :=
+  .request "GET" url "" (httpDecode onOk onErr)
+
+/-- POST `body` to `url`, decode the JSON response into `α`, dispatch `onOk`/`onErr`. -/
+def Cmd.postJson [FromJson α] (url body : String) (onOk : α → msg) (onErr : String → msg) : Cmd msg :=
+  .request "POST" url body (httpDecode onOk onErr)
 
 /-- A self-contained application: an initial (model, startup effect), a transition
     that may request effects, and a view. A transition returns `(nextModel, cmd)`;
@@ -43,6 +71,11 @@ structure App (Model : Type) (Msg : Type) where
   update : Model → Msg → Model × Cmd Msg
   /-- The pure, total render. -/
   view   : Model → Html Msg
+  /-- If set, the message to fire when the browser URL changes (the new path is the
+      argument) — at startup, on `link` clicks, on back/forward, and after
+      `Cmd.pushUrl`. The app parses the path (e.g. `Router.fromURL`) into its route.
+      Left `none` by `sandbox`/`application`; set by `routed`. -/
+  onUrlChange : Option (String → Msg) := none
 
 /-- Build an `App` with no side effects (the Elm "sandbox"). -/
 def sandbox (init : Model) (update : Model → Msg → Model) (view : Model → Html Msg) :
@@ -66,6 +99,20 @@ def application (init : Model)
   { init   := (init, .none)
     update := fun m msg => let m' := update m msg; (m', effects m' msg)
     view }
+
+/-- Build a URL-routed `App`. Same as `application`, plus `onUrlChange`: the message
+    fired with the new path whenever the URL changes (startup, `link` clicks,
+    back/forward, `Cmd.pushUrl`). The app parses the path into its route — typically
+    `fun path => .urlChanged (Router.fromURL path)`. -/
+def routed (init : Model)
+    (update      : Model → Msg → Model)
+    (view        : Model → Html Msg)
+    (onUrlChange : String → Msg)
+    (effects     : Model → Msg → Cmd Msg := fun _ _ => .none) : App Model Msg :=
+  { init   := (init, .none)
+    update := fun m msg => let m' := update m msg; (m', effects m' msg)
+    view
+    onUrlChange := some onUrlChange }
 
 /-- Escape text/attribute values so model data cannot break out of the markup. -/
 def escapeHtml (s : String) : String :=
@@ -112,6 +159,11 @@ def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .onClick m => (s!" data-qed-click=\"{hs.size}\"", hs.push m)
   | .onInput _ => ("", hs)   -- no static form; the driver wires input events
   | .onCheck _ => ("", hs)   -- (same — the driver wires checkbox change events)
+  | .onKeydown _ => ("", hs) -- (same — driver wires keydown)
+  | .onKeyup _   => ("", hs) -- (same — driver wires keyup)
+  | .onSubmit m  => (s!" data-qed-submit=\"{hs.size}\"", hs.push m)
+  | .onBlur m    => (s!" data-qed-blur=\"{hs.size}\"", hs.push m)
+  | .onFocus m   => (s!" data-qed-focus=\"{hs.size}\"", hs.push m)
 
 /-- Render a list of attributes left-to-right, threading the handler table. -/
 def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg

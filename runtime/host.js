@@ -16,6 +16,8 @@
       const dispatchStr = Module.cwrap('qed_run_dispatch_str', null, ['number', 'string']);
       const streamChunk = Module.cwrap('qed_run_stream_chunk', null, ['number', 'string']);
       const streamDone  = Module.cwrap('qed_run_stream_done',  null, ['number']);
+      const httpDone    = Module.cwrap('qed_run_http_done',    null, ['number', 'number', 'string']);
+      const urlChanged  = Module.cwrap('qed_run_url_changed',  null, ['string']);
 
       // Effects ask for a streaming POST; we read it as Server-Sent Events and
       // feed each `data:` payload back into Lean, then signal end-of-stream.
@@ -45,13 +47,38 @@
           .catch((e) => { console.error('Qed stream failed:', e); streamDone(did); });
       };
 
+      // Plain HTTP request: fetch, then hand the response text (and ok flag) back.
+      globalThis.__qed.httpSend = (method, url, body, id) => {
+        const opts = { method, headers: { 'Content-Type': 'application/json' } };
+        if (method !== 'GET' && method !== 'HEAD') opts.body = body;
+        fetch(url, opts)
+          .then(async (r) => { const t = await r.text(); httpDone(id, r.ok ? 1 : 0, t); })
+          .catch((e) => httpDone(id, 0, String(e)));
+      };
+
       // Programmatic dispatch (timers, sockets, tests).
-      window.qed = { init, dispatch, dispatchStr };
+      window.qed = { init, dispatch, dispatchStr, urlChanged };
 
       init(); // initial render + startup effect
 
       const root = document.getElementById('app');
+      // delegated handler for the no-argument event tables (click/submit/focus/blur)
+      const onAt = (attr) => (e) => {
+        const t = e.target.closest(`[${attr}]`);
+        if (!t) return;
+        const id = parseInt(t.getAttribute(attr), 10);
+        if (!Number.isNaN(id)) dispatch(id);
+      };
       root.addEventListener('click', (e) => {
+        // internal navigation links: push the URL and route, no full page load
+        const a = e.target.closest('[data-qed-link]');
+        if (a) {
+          e.preventDefault();
+          const href = a.getAttribute('href');
+          history.pushState({}, '', href);
+          urlChanged(href);
+          return;
+        }
         const t = e.target.closest('[data-qed-click]');
         if (!t) return;
         const id = parseInt(t.getAttribute('data-qed-click'), 10);
@@ -71,6 +98,28 @@
         const id = parseInt(t.getAttribute('data-qed-check'), 10);
         if (!Number.isNaN(id)) dispatchStr(id, t.checked ? 'true' : 'false');
       });
+      // keydown/keyup send the pressed key's name into the string table
+      const onKey = (attr) => (e) => {
+        const t = e.target.closest(`[${attr}]`);
+        if (!t) return;
+        const id = parseInt(t.getAttribute(attr), 10);
+        if (!Number.isNaN(id)) dispatchStr(id, e.key);
+      };
+      root.addEventListener('keydown', onKey('data-qed-keydown'));
+      root.addEventListener('keyup', onKey('data-qed-keyup'));
+      // submit always suppresses the page reload, then dispatches
+      root.addEventListener('submit', (e) => {
+        const t = e.target.closest('[data-qed-submit]');
+        if (!t) return;
+        e.preventDefault();
+        const id = parseInt(t.getAttribute('data-qed-submit'), 10);
+        if (!Number.isNaN(id)) dispatch(id);
+      });
+      // focus/blur don't bubble; focusin/focusout do, so delegate through them
+      root.addEventListener('focusin', onAt('data-qed-focus'));
+      root.addEventListener('focusout', onAt('data-qed-blur'));
+      // back/forward: re-route to the new path
+      window.addEventListener('popstate', () => urlChanged(location.pathname));
     }).catch((err) => {
       console.error('Qed boot failed:', err);
       const root = document.getElementById('app');

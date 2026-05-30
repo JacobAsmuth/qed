@@ -205,6 +205,44 @@ def view (m : Model) : Html Msg :=
 
 The full app is `Examples/Todo.lean`; `test/todo_test.mjs` drives it in a browser.
 
+### Routing, data fetching, and events
+
+`routed` wires the verified `Router` to the URL: `link`s and back/forward navigate
+without a page reload, and the new path is parsed into a route (`Router.fromURL`,
+round-trip proven). `Cmd.getJson` fetches and decodes a JSON response with
+`Qed.Json`. A `<form>` submits on Enter or its button (`onSubmit`), and
+`onKeydown`/`onFocus`/`onBlur` round out the events.
+
+```lean
+router R where
+  home => ""
+  user (name : String) => "users"
+
+jsonStruct Profile where
+  name : String
+  bio  : String
+
+def effects (m : Model) : Msg → Cmd Msg
+  | .submit       => .pushUrl (Router.toURL (R.user m.query))   -- navigate, no reload
+  | .urlChanged _ => match m.route with
+      | .user name => Cmd.getJson s!"/api/users/{name}"          -- GET + decode Profile
+                        (fun p => .gotProfile (.ok p)) (fun e => .gotProfile (.error e))
+      | _          => .none
+  | _ => .none
+
+def view (m : Model) : Html Msg :=
+  formEl [onSubmit .submit] [
+    input [value m.query, onInput .typeQuery, onKeydown .key],   -- Enter submits, Escape clears
+    link "/users/ada" [] "ada"                                    -- a routed link (no reload)
+  ]
+
+def app : App Model Msg :=
+  routed init update view (onUrlChange := Msg.urlChanged) (effects := effects)
+```
+
+`Examples/Users.lean` is the full app; `test/users_test.mjs` drives it against a mock
+API — a deep link, link/submit navigation, back/forward, and the events.
+
 ## How it works
 
 ```text
@@ -262,11 +300,11 @@ CLI against this checkout.
 |------|------|
 | `Qed/Html.lean` | The core typed virtual DOM — the elaboration target. |
 | `Qed/Notation.lean` | Readable view combinators (`div`, `button`, `onClick`, …). |
-| `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`), `Cmd` effects + pure render-to-HTML. |
+| `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`, `routed`), `Cmd` effects (`stream`/`now`/`request`/`getJson`/`pushUrl`) + pure render-to-HTML. |
 | `Qed/Invariant.lean` | The `invariant … preserved_by …` command (auto-proven). |
 | `Qed/Diff.lean` | The diff/patch engine — positional length-general reconcile (add/remove) and keyed reconcile (reorder/remove by `key`) + the `diff_apply` correctness proof. |
 | `Qed/Json.lean` | Full JSON parser/renderer + `jsonStruct`/`jsonCodec` + `parse_depth_le` & `parse_render` proofs. |
-| `Qed/Router.lean` | The `Router` class (round-trip law as a field) + the `router` command (generates the route enum, `print`/`parse`, the round-trip proof, and the instance). |
+| `Qed/Router.lean` | The `Router` class (round-trip law as a field) + the `router` command (generates the route enum, `print`/`parse`, the round-trip proof, and the instance) + `toURL`/`fromURL` for the browser. |
 | `Qed/Form.lean` | Typed refinement fields (`Field p`), the `Input` controls (text/number/checkbox/date/select/radios), and the `form` command (Draft + `parse` + `formView` + the `canSubmit_iff` proof). |
 | `Qed/Date.lean` | A calendar `Date` that can't be invalid (smart constructor + ISO parser; impossible dates parse to `none`). |
 | `Qed/Component.lean` | `Component` (a reusable `update`+`view`) + `viewList`/`updateAt` for repeating it per row. |
@@ -275,5 +313,5 @@ CLI against this checkout.
 | `Examples/` | Example programs. |
 | `Cli.lean` + `./qed` | The toolchain (build/dev/test/check/…) and its shim. |
 | `runtime/` | C/JS driver, pages, dev server. |
-| `test/` | Browser tests: counter (`browser_test.mjs`), chat screenshots (`chat_test.mjs`), form (`signup_test.mjs`), current-time (`booking_test.mjs`), dynamic list (`todo_test.mjs`) + mock LLM (`mock_llm.py`). |
+| `test/` | Browser tests: counter (`browser_test.mjs`), chat screenshots (`chat_test.mjs`), form (`signup_test.mjs`), current-time (`booking_test.mjs`), dynamic list (`todo_test.mjs`), routing/http/events (`users_test.mjs`) + mock LLM (`mock_llm.py`). |
 | `scripts/axioms.lean` | Axiom manifest gated by `qed check`/`qed build`. |

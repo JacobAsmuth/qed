@@ -47,6 +47,26 @@ def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
       let is ← h.input.get
       h.input.set (is.push (fun s => f (s == "true")))
       Dom.setAttribute node "data-qed-check" (toString is.size)
+  | .onKeydown f    => do
+      let is ← h.input.get
+      h.input.set (is.push f)         -- host sends the key name into the string table
+      Dom.setAttribute node "data-qed-keydown" (toString is.size)
+  | .onKeyup f      => do
+      let is ← h.input.get
+      h.input.set (is.push f)
+      Dom.setAttribute node "data-qed-keyup" (toString is.size)
+  | .onSubmit m     => do
+      let cs ← h.click.get            -- no-arg messages share the click table
+      h.click.set (cs.push m)
+      Dom.setAttribute node "data-qed-submit" (toString cs.size)
+  | .onBlur m       => do
+      let cs ← h.click.get
+      h.click.set (cs.push m)
+      Dom.setAttribute node "data-qed-blur" (toString cs.size)
+  | .onFocus m      => do
+      let cs ← h.click.get
+      h.click.set (cs.push m)
+      Dom.setAttribute node "data-qed-focus" (toString cs.size)
 
 /-- Apply a (normalized) attribute list, so the live DOM matches what `render`
     would produce — classes merged, duplicate keys collapsed. -/
@@ -127,6 +147,8 @@ structure Runtime where
   dispatchStr : UInt32 → String → IO Unit
   streamChunk : UInt32 → String → IO Unit
   streamDone  : UInt32 → IO Unit
+  httpDone    : UInt32 → Bool → String → IO Unit
+  urlChanged  : String → IO Unit
 
 initialize runtimeRef : IO.Ref (Option Runtime) ← IO.mkRef none
 
@@ -160,6 +182,18 @@ def qedStreamDone (did : UInt32) : IO Unit := do
   | some rt => rt.streamDone did
   | none    => pure ()
 
+@[export qed_http_done]
+def qedHttpDone (id : UInt32) (ok : UInt32) (text : String) : IO Unit := do
+  match ← runtimeRef.get with
+  | some rt => rt.httpDone id (ok != 0) text
+  | none    => pure ()
+
+@[export qed_url_changed]
+def qedUrlChanged (path : String) : IO Unit := do
+  match ← runtimeRef.get with
+  | some rt => rt.urlChanged path
+  | none    => pure ()
+
 /-- Register `app` as the running application. The initial `mount` builds the DOM
     and runs the startup effect; thereafter each message updates the model, diffs
     the new view against the previous one, patches the difference, and interprets
@@ -174,6 +208,8 @@ def run (app : App Model Msg) : IO Unit := do
   -- Stream callbacks persist across renders (a stream outlives many of them).
   let chunkCbRef ← IO.mkRef (#[] : Array (String → Msg))
   let doneCbRef  ← IO.mkRef (#[] : Array Msg)
+  -- HTTP response callbacks (each request's result arrives later), persistent.
+  let respCbRef  ← IO.mkRef (#[] : Array (Except String String → Msg))
   -- Forward reference to the dispatcher, so an effect (`Cmd.now`) can feed a
   -- message back through the loop (set to the real dispatcher just below).
   let dispatchRef ← IO.mkRef (fun (_ : Msg) => (pure () : IO Unit))
@@ -203,6 +239,14 @@ def run (app : App Model Msg) : IO Unit := do
         match Qed.Date.parse? (← Dom.today) with
         | some d => (← dispatchRef.get) (onNow d)
         | none   => pure ()
+    | .request method url body onResult => do
+        let rs ← respCbRef.get; respCbRef.set (rs.push onResult)
+        Dom.httpSend method url body (UInt32.ofNat rs.size)
+    | .pushUrl path => do
+        Dom.pushPath path
+        match app.onUrlChange with
+        | some f => (← dispatchRef.get) (f path)
+        | none   => pure ()
   let dispatchMsg : Msg → IO Unit := fun msg => do
     let (m', cmd) := app.update (← modelRef.get) msg
     modelRef.set m'
@@ -210,7 +254,13 @@ def run (app : App Model Msg) : IO Unit := do
     perform cmd
   dispatchRef.set dispatchMsg
   runtimeRef.set (some {
-    mount := do renderModel; perform app.init.2
+    mount := do
+      -- If routed, derive the initial model from the current URL before the first
+      -- render (so it reflects the route); otherwise just render.
+      match app.onUrlChange with
+      | some f => do let p ← Dom.currentPath; dispatchMsg (f p)
+      | none   => renderModel
+      perform app.init.2
     dispatch := fun id => do
       match (← clickRef.get)[id.toNat]? with
       | some msg => dispatchMsg msg
@@ -227,6 +277,14 @@ def run (app : App Model Msg) : IO Unit := do
       match (← doneCbRef.get)[did.toNat]? with
       | some msg => dispatchMsg msg
       | none     => pure ()
+    httpDone := fun id ok text => do
+      match (← respCbRef.get)[id.toNat]? with
+      | some f => dispatchMsg (f (if ok then .ok text else .error text))
+      | none   => pure ()
+    urlChanged := fun path => do
+      match app.onUrlChange with
+      | some f => dispatchMsg (f path)
+      | none   => pure ()
   })
 
 end Qed

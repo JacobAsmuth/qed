@@ -51,6 +51,21 @@ opaque today : IO String
 @[extern "qed_dom_fetch_stream"]
 opaque fetchStream (url body : String) (chunkId doneId : UInt32) : IO Unit
 
+/-- Send an HTTP request (`method url` with `body`). The JS host calls back into
+    Lean once the response resolves, tagged `id`, with the response text and whether
+    the status was ok. Fire-and-forget. -/
+@[extern "qed_dom_http_send"]
+opaque httpSend (method url body : String) (id : UInt32) : IO Unit
+
+/-- The current URL path (`window.location.pathname`), for the router to parse into
+    a route at startup and on navigation. -/
+@[extern "qed_dom_current_path"]
+opaque currentPath : IO String
+
+/-- Push `path` onto the browser history (`history.pushState`) without a reload. -/
+@[extern "qed_dom_push_path"]
+opaque pushPath (path : String) : IO Unit
+
 /-- Append `child` as the last child of `parent`. -/
 @[extern "qed_dom_append_child"]
 opaque appendChild (parent child : Node) : IO Unit

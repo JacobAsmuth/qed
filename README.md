@@ -30,16 +30,9 @@ toolchain and emscripten are fetched on first `qed build`, not at install time.
 
 The snippets below assume `import Qed` and `open Qed`.
 
-### The counter
-
-The whole app: the state, the messages it answers, a total `update`, a typed
-`view`, and one stated invariant. `lake build` rejects it unless every message is
-handled, both functions terminate, and the invariant's proof discharges.
+### A counter
 
 ```lean
-import Qed
-open Qed
-
 structure Model where
   count : Int
 deriving Repr, Inhabited
@@ -68,7 +61,7 @@ def app : App Model Msg := sandbox init update view
 invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
 ```
 
-### Reading JSON, with errors handled
+### Parsing JSON with errors handled
 
 `Json.parse` is total and depth-bounded: malformed or too-deeply-nested input
 returns an `.error`, it never throws. `jsonStruct` declares a structure and its
@@ -87,7 +80,7 @@ def decodeUser (body : String) : Except String User := do
 ```
 
 When you only need one value out of a larger payload, reach in dynamically. Every
-step is an `Option`, so the wrong shape is just `none` — no exceptions:
+step is an `Option`, so the wrong shape is just `none` - no exceptions:
 
 ```lean
 def cityOf (body : String) : Option String :=
@@ -97,20 +90,6 @@ def cityOf (body : String) : Option String :=
 ```
 
 ### A form that can't carry invalid data
-
-A field is a *typed* refinement: `Field p` (for `p : α → Prop`) is a value of type
-`α` paired with a proof that `p` holds of it. Its only constructor is validation, so
-a `Signup` value is itself evidence that every field is valid — an invalid form is
-unrepresentable, and any handler taking one can't run on bad input.
-
-Each field names a control: `Input.text`, `Input.nat`/`Input.int`, `Input.checkbox`
-(a `Bool`), `Input.date` (a verified `Qed.Date` — `2026-02-30` parses to `none`),
-`Input.select`/`Input.radios`. The value is *parsed* from the raw string first (a
-number, a real calendar date), then refined with `.refine spec`. From the one
-declaration, `form` generates the editable `Draft`, the validated `Signup`,
-`Signup.parse : Draft → Option Signup`, the `canSubmit` gate and its `canSubmit_iff`
-proof, and `Signup.formView` — so the widgets, the submit-disabled-unless-valid gate,
-and the field names are written once.
 
 ```lean
 abbrev Email (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
@@ -138,34 +117,7 @@ def view (m : Model) : Html Msg :=
   Signup.formView m.draft .edit .submit       -- inputs + a submit gated on validity
 ```
 
-`Examples/Signup.lean` is the full app; `test/signup_test.mjs` drives it in a real
-browser — filling each control, toggling the checkbox, and asserting the submit
-button enables only once every field is valid.
-
-A rule can also depend on the **current time**. `form` takes context binders that
-thread into the gate, and `Cmd.now` reads the clock into the model as data (`view`
-and `update` stay pure):
-
-```lean
-form Appt (today : Date) where
-  when : Input.date.refine (fun d => today < d)   -- must be after today
-
--- read the clock once at startup, then render the form with `today` in scope
-def app : App Model Msg :=
-  { init := (init, .now .gotToday), update := …, view := … }
-```
-
-`Examples/Booking.lean` is the full app; `test/booking_test.mjs` drives it against
-the real clock — a past date keeps submit disabled, a future date enables it.
-
-### Effects: a streaming LLM chat
-
-Side effects are *data*. `update` stays a pure `Model → Msg → Model`; a separate
-`effects` function maps a message to the `Cmd` to run after it, which the driver
-interprets. `Cmd.stream` POSTs and reads the response as it arrives, dispatching
-`.chunk` per Server-Sent-Event and `.done` at the end — so a token-by-token LLM
-reply is just more messages through the same `update`. `onInput` captures the
-composer text. JSON in and out goes through the verified `Qed.Json`.
+### A streaming LLM chat
 
 ```lean
 inductive Msg
@@ -194,104 +146,68 @@ def view (m : Model) : Html Msg :=
 def chatApp : App Model Msg := application init update view effects
 ```
 
-The full app is `Examples/Chat.lean`; `test/chat_test.mjs` drives it in headless
-Chromium against a mock OpenAI streaming backend (`test/mock_llm.py`) and saves a
-screenshot at each stage (`qed test`).
+### A keyed list of reusable rows
 
-### Reusable components, one per data row
-
-A `Component Model Msg` bundles an `update` and a `view` over its own state and its
-own message type. To repeat it per row — one box per entry in a decoded JSON array —
-`viewList` renders each row and tags its messages with the row index, and `updateAt`
-routes a tagged message back to that one row. A click in row 2 arrives as
-`Msg.box 2 …` and updates only row 2.
+Each row is its own `Component` — its state, messages, `update`, and `view` — and
+carries a `key` (like React's `key`). So add, remove, and sort move whole rows: a
+row that moves keeps its DOM node, its local state, and any focus inside it.
 
 ```lean
-jsonStruct Entry where
-  name  : String
-  score : Nat
-
-namespace Box                                   -- a self-contained, reusable box
-  structure Model where entry : Entry; expanded : Bool
+namespace Row                       -- a self-contained row: its own state + messages
+  structure Model where
+    id   : Nat                      -- the row's key
+    text : String
+    done : Bool
   inductive Msg | toggle
   def update (m : Model) : Msg → Model
-    | .toggle => { m with expanded := !m.expanded }
+    | .toggle => { m with done := !m.done }
   def view (m : Model) : Html Msg :=
-    div [cls (if m.expanded then "box open" else "box"), onClick .toggle]
-      [ h2 [] [m.entry.name], span [cls "score"] [m.entry.score] ]   -- Nat needs no toString
+    span [cls (if m.done then "item done" else "item"), onClick .toggle] [m.text]
   def component : Component Model Msg := { update, view }
-end Box
+end Row
 
-structure Model where boxes : Array Box.Model
-inductive Msg | box (i : Nat) (msg : Box.Msg)     -- a message names the row it came from
-
-def update (m : Model) : Msg → Model
-  | .box i bm => { m with boxes := Box.component.updateAt m.boxes i bm }
-
-def view (m : Model) : Html Msg :=
-  div [cls "boxes"] (Box.component.viewList m.boxes Msg.box)
-```
-
-A component lowers to ordinary `Html` through `Html.map`, so it adds no axioms and
-the totality and diff/patch proofs already cover a composed view — nesting buys no
-new trust assumptions. The full example, decoding a JSON array into a list of
-boxes, is `Examples/Boxes.lean`.
-
-### A list that grows, shrinks, and reorders
-
-Child lists are reconciled in one of two ways. By default it is *positional*: the
-old and new lists need not be the same length — the diff patches the common prefix
-in place and appends or drops the surplus — so adding or removing at the end is
-exact. But a removal or reorder in the *middle* would shift every row below it.
-
-Give each row a **`key`** (just like React's `key` or Vue's `:key`) and the diff
-reconciles *by key* instead: each row is matched to the previous row with the same
-key, so a removed row drops exactly its own node and a row that *moves* — because
-another was removed, or the list was sorted — keeps the **same DOM node**, with the
-focus, scroll, and selection inside it riding along (via an atomic `moveBefore`
-where the browser supports it). `diff_apply` proves the patched list equals the new
-`view` either way: a keyed `reuse` step stores `diff oldChild newChild`, and
-`applyPatch (diff x n) x = n` holds for *any* `x` (`diffKeyed_apply`), so the
-key-matching only chooses *which* node is reused, never the result.
-
-```lean
-structure Item where
-  id   : Nat                 -- a stable identity, used as the reconciliation key
-  text : String
+structure Model where
+  rows   : Array Row.Model
+  draft  : String
+  nextId : Nat
 
 inductive Msg
   | edit (s : String)
   | add
-  | remove (id : Nat)        -- delete by id, not position
-  | sort                     -- reorder; keyed rows follow their data
+  | row (i : Nat) (msg : Row.Msg)   -- a click inside row i
+  | remove (id : Nat)
+  | sort
+
+def update (m : Model) : Msg → Model
+  | .edit s    => { m with draft := s }
+  | .add       => let t := m.draft.trim
+                  if t.isEmpty then m
+                  else { m with rows   := m.rows.push { id := m.nextId, text := t, done := false }
+                                draft  := "", nextId := m.nextId + 1 }
+  | .row i msg => { m with rows := Row.component.updateAt m.rows i msg }
+  | .remove id => { m with rows := m.rows.filter (·.id != id) }
+  | .sort      => { m with rows := m.rows.qsort (fun a b => compare a.text b.text == .lt) }
 
 def view (m : Model) : Html Msg :=
   div [cls "todo"] [
     div [cls "add"] [
-      input  [cls "new", value m.draft, onInput .edit, placeholder "What needs doing?"],
+      input  [value m.draft, onInput .edit, placeholder "What needs doing?"],
       button [onClick .add]  "Add",
       button [onClick .sort] "Sort"
     ],
-    ul [cls "items"] (m.items.map fun it =>
-      li [key (toString it.id), cls "item"] [          -- the key: this row IS item id
-        span   [cls "text"]                        [it.text],
-        button [cls "rm", onClick (.remove it.id)] "✕"
+    ul [cls "items"] (m.rows.mapIdx fun i r =>
+      li [key (toString r.id)] [               -- keyed: this row keeps its node when it moves
+        (Row.component.view r).map (Msg.row i),
+        button [cls "rm", onClick (.remove r.id)] "✕"
       ]).toList
   ]
 ```
 
-`Examples/Todo.lean` is the full app; `test/todo_test.mjs` drives it in a real
-browser — adding, removing from the middle, and sorting — and asserts that a row's
-DOM node (and a focus inside it) follows its key across both a removal and a
-reorder, which only keyed reconciliation can do.
-
-A node whose *tag* changes is still replaced wholesale; the key matching is by
-identity, not a longest-common-subsequence, so it reuses and moves nodes rather
-than computing a minimal set of moves.
+The full app is `Examples/Todo.lean`; `test/todo_test.mjs` drives it in a browser.
 
 ## How it works
 
-```
+```text
 Lean app (Model, Msg, update, view, deriving/invariant — proofs auto-discharged)
    │  lake build         (Lean → C, in .lake/build/ir/*.c)
    ▼

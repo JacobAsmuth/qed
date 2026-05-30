@@ -1,12 +1,10 @@
-// todo_test.mjs — end-to-end test for keyed add / remove / reorder of list items.
+// todo_test.mjs — end-to-end test for a keyed list of reusable row components.
 //
 // Builds the todo web entry to .qed/dev, serves it (cross-origin isolated), then
-// drives the real app in headless Chromium. Beyond "the list matches the model",
-// it asserts the things that distinguish KEYED reconciliation from positional:
-//   1. removing a middle row drops that row's node and the row below keeps its own
-//      DOM node (an expando set on it survives), rather than being rewritten;
-//   2. a row follows its key across a Sort (its tagged node, and a focus inside it,
-//      move with it instead of staying at the old position).
+// drives the real app in headless Chromium. It checks the component half (a click
+// inside a row toggles only that row) and the keyed half (removing or sorting moves
+// whole rows, keeping each row's DOM node — proven by an expando that survives — and
+// the focus inside a moved row, via the atomic moveBefore where supported).
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import puppeteer from 'puppeteer';
@@ -44,66 +42,65 @@ try {
   await page.waitForSelector('#app .todo', { timeout: 20000 });
 
   const NEW = '#app .todo .new';
-  const texts = () => page.$$eval('#app .todo .item .text', (els) => els.map((e) => e.textContent));
-  const markAt = (n) => page.$eval(`#app .todo .item:nth-child(${n})`, (el) => el.dataset.mark || '');
+  const texts = () => page.$$eval('#app .todo .row .item', (els) => els.map((e) => e.textContent));
+  const dones = () => page.$$eval('#app .todo .row .item', (els) => els.map((e) => e.classList.contains('done')));
+  const markAt = (n) => page.$eval(`#app .todo .row:nth-child(${n})`, (el) => el.dataset.mark || '');
   const addItem = async (t) => { await page.type(NEW, t); await page.click('#app .addbtn'); await sleep(40); };
-  // tag the row whose text === `t` with a DOM expando (survives iff the node is reused)
-  const tagByText = (t, mark) => page.$$eval('#app .todo .item', (els, t, mark) => {
-    const li = els.find((e) => e.querySelector('.text').textContent === t);
+  // tag the row whose label === `t` with a DOM expando (survives iff the node is reused)
+  const tagRow = (t, mark) => page.$$eval('#app .todo .row', (els, t, mark) => {
+    const li = els.find((e) => e.querySelector('.item').textContent === t);
     if (li) li.dataset.mark = mark;
   }, t, mark);
-  // dispatch a row's remove (or any control's) programmatically — no click, so focus
-  // isn't stolen and the removal can't be confused with a click side effect
-  const dispatchOf = async (sel) => {
-    const id = await page.$eval(sel, (el) => el.getAttribute('data-qed-click'));
+  // dispatch the handler on a row's child (.item toggle or .rm remove) programmatically,
+  // so a click can't be confused with the cause and won't steal focus
+  const dispatchChild = async (t, childSel) => {
+    const id = await page.$$eval('#app .todo .row', (els, t, childSel) => {
+      const li = els.find((e) => e.querySelector('.item').textContent === t);
+      return li ? li.querySelector(childSel).getAttribute('data-qed-click') : null;
+    }, t, childSel);
     await page.evaluate((i) => window.qed.dispatch(Number(i)), id);
     await sleep(50);
   };
-  const removeByText = async (t) => {
-    const id = await page.$$eval('#app .todo .item', (els, t) => {
-      const li = els.find((e) => e.querySelector('.text').textContent === t);
-      return li ? li.querySelector('.rm').getAttribute('data-qed-click') : null;
-    }, t);
-    await page.evaluate((i) => window.qed.dispatch(Number(i)), id);
-    await sleep(50);
-  };
+  const toggle = (t) => dispatchChild(t, '.item');
+  const remove = (t) => dispatchChild(t, '.rm');
 
-  // --- add three items ---
+  // --- add three rows ---
   check('starts empty', await texts(), []);
   await addItem('alpha'); await addItem('beta'); await addItem('gamma');
-  check('three items added', await texts(), ['alpha', 'beta', 'gamma']);
+  check('three rows added', await texts(), ['alpha', 'beta', 'gamma']);
   check('input cleared after add', await page.$eval(NEW, (el) => el.value), '');
 
-  // --- keyed remove from the MIDDLE: gamma's node must survive and move up ---
-  await tagByText('gamma', 'gamma-node');
-  await removeByText('beta');
+  // --- component: a click inside a row toggles only that row ---
+  await toggle('beta');
+  check('toggling a row updates only that row (component, routed by index)',
+    await dones(), [false, true, false]);
+
+  // --- keyed remove from the MIDDLE: gamma's node survives and moves up ---
+  await tagRow('gamma', 'gamma-node');
+  await remove('beta');
   check('middle row removed', await texts(), ['alpha', 'gamma']);
-  check('the row BELOW the removed one kept its own DOM node (keyed, not rewritten)',
-    await markAt(2), 'gamma-node');   // positional diff would have lost this expando
+  check('the row below the removed one kept its own DOM node (keyed)',
+    await markAt(2), 'gamma-node');
 
-  // --- reorder by Sort: a tagged row follows its key to the new position ---
-  await addItem('beta'); await addItem('delta');     // [alpha, gamma, beta, delta]
-  await tagByText('beta', 'beta-node');
-  await page.click('#app .sortbtn'); await sleep(50);
-  check('sorted alphabetically', await texts(), ['alpha', 'beta', 'delta', 'gamma']);
-  check('moved row kept its DOM node across the sort',
-    await markAt(2), 'beta-node');     // beta moved 4th → 2nd, same node
+  // --- keyed sort: a row keeps its node AND its local state across the move ---
+  await addItem('delta');                 // [alpha, gamma, delta]
+  await toggle('delta');                  // delta done
+  await tagRow('delta', 'delta-node');
+  await page.click('#app .sortbtn'); await sleep(50);   // [alpha, delta, gamma]
+  check('sorted alphabetically', await texts(), ['alpha', 'delta', 'gamma']);
+  check('moved row kept its DOM node across the sort', await markAt(2), 'delta-node');
+  check('moved row kept its component state (still done)', (await dones())[1], true);
 
-  // --- focus inside a row follows that row across a reorder ---
-  // Focus gamma's remove button, then trigger a reconcile that MOVES gamma. With
-  // an atomic move (moveBefore, Chrome 133+) the focus rides along; without it a
-  // relocate is a remove+insert that blurs. Node identity is preserved either way
-  // (proven by the expando checks above), so we only assert the focus-follows
-  // bonus where the browser supports the atomic move.
+  // --- focus inside a row follows that row across a keyed move ---
   const hasMoveBefore = await page.evaluate(() => typeof Element.prototype.moveBefore === 'function');
   await page.evaluate(() => {
-    const li = [...document.querySelectorAll('#app .todo .item')]
-      .find((e) => e.querySelector('.text').textContent === 'gamma');
+    const li = [...document.querySelectorAll('#app .todo .row')]
+      .find((e) => e.querySelector('.item').textContent === 'gamma');
     li.querySelector('.rm').focus();
   });
-  await removeByText('delta');                       // [alpha, beta, gamma]; gamma moves up
+  await remove('delta');                  // [alpha, gamma]; gamma moves up
   const focusedRow = await page.evaluate(() =>
-    document.activeElement?.closest?.('.item')?.querySelector?.('.text')?.textContent);
+    document.activeElement?.closest?.('.row')?.querySelector?.('.item')?.textContent);
   if (hasMoveBefore)
     check('focus follows a row across a keyed move (atomic moveBefore)', focusedRow, 'gamma');
   else
@@ -112,7 +109,7 @@ try {
   // --- a focused, half-typed input (a sibling of the list) is untouched by reconcile ---
   await page.focus(NEW);
   await page.type(NEW, 'eggs');
-  await removeByText('beta');
+  await remove('gamma');
   check('input KEEPS focus across a list change',
     await page.evaluate(() => document.activeElement?.classList.contains('new')), true);
   check('input KEEPS its half-typed draft', await page.$eval(NEW, (el) => el.value), 'eggs');

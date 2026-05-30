@@ -1,14 +1,13 @@
 /-
-  The TODO demo — a keyed list that grows, shrinks, and reorders.
+  The TODO demo — a keyed list of reusable row components.
 
-  A text field adds an item; a button on each row removes it; a Sort button
-  reorders. Each row carries a stable `key` (its item id, like React/Vue), so the
-  verified `diff` (`Qed.Diff`) reconciles the list *by key*: a removed row drops
-  exactly its own node, and a row that moves (because another was removed, or the
-  list was sorted) keeps the *same* DOM node — its focus, scroll, and selection
-  ride along — instead of the rows below being rewritten in place. `diff_apply`
-  proves the patched list equals the new `view` exactly, whichever node each key
-  matched.
+  Each row is a self-contained `Component` (its own state, message, `update`, and
+  `view`: a label you can mark done). The list embeds one per item and tags each
+  row's messages with its index (`Msg.row i`), so a click routes to that row alone.
+  Every row carries a `key` (its item id), so the verified `diff` (`Qed.Diff`)
+  reconciles the list *by key*: add appends, remove drops one node, sort reorders —
+  and a row that moves keeps the same DOM node, its local state, and any focus
+  inside it.
 
   Pure Lean, total by construction; the browser entry is `Examples/TodoWeb.lean`.
 -/
@@ -17,55 +16,66 @@ open Qed
 
 namespace Todo
 
-/-- One item, with a stable id used as its reconciliation key. -/
-structure Item where
-  id   : Nat
-  text : String
+-- A reusable row: a label plus its own local "done" state and message.
+namespace Row
 
-/-- The whole app state: the text being typed, the items, and the next id to hand
-    out (so every item's key is unique and stable across edits). -/
 structure Model where
+  id   : Nat            -- a stable identity, used as the reconciliation key
+  text : String
+  done : Bool
+
+inductive Msg | toggle
+
+def update (m : Model) : Msg → Model
+  | .toggle => { m with done := !m.done }
+
+def view (m : Model) : Html Msg :=
+  span [cls (if m.done then "item done" else "item"), onClick .toggle] [m.text]
+
+def component : Component Model Msg := { update, view }
+
+end Row
+
+/-- The whole app state: the rows, the text being typed, and the next id to hand
+    out (so every row's key is unique and stable across edits). -/
+structure Model where
+  rows   : Array Row.Model
   draft  : String
-  items  : Array Item
   nextId : Nat
 
 inductive Msg where
-  | edit (s : String)    -- the text field changed
-  | add                  -- append the (trimmed) draft as a new item
-  | remove (id : Nat)    -- delete the item with this id
-  | sort                 -- reorder the items alphabetically
+  | edit (s : String)            -- the text field changed
+  | add                          -- append the (trimmed) draft as a new row
+  | row (i : Nat) (msg : Row.Msg) -- a message from row i, carrying the row's own Msg
+  | remove (id : Nat)            -- delete the row with this id
+  | sort                         -- reorder the rows alphabetically
 
-def init : Model := { draft := "", items := #[], nextId := 0 }
+def init : Model := { rows := #[], draft := "", nextId := 0 }
 
-/-- Adding ignores blank input, clears the field, and assigns a fresh id; removing
-    and sorting are total array operations that leave keys with their items. -/
 def update (m : Model) : Msg → Model
   | .edit s    => { m with draft := s }
   | .add       =>
       let t := m.draft.trim
       if t.isEmpty then m
-      else { m with items  := m.items.push { id := m.nextId, text := t }
+      else { m with rows   := m.rows.push { id := m.nextId, text := t, done := false }
                     draft  := ""
                     nextId := m.nextId + 1 }
-  | .remove id => { m with items := m.items.filter (·.id != id) }
-  | .sort      => { m with items := m.items.qsort (fun a b => compare a.text b.text == .lt) }
-
-/-- One row, tagged with `key it.id` — the diff uses it to follow this item across
-    removals and reorders. `remove it.id` deletes exactly this item. -/
-def row (it : Item) : Html Msg :=
-  li [key (toString it.id), cls "item"] [
-    span   [cls "text"]                        [it.text],
-    button [cls "rm", onClick (.remove it.id)] "✕"
-  ]
+  | .row i msg => { m with rows := Row.component.updateAt m.rows i msg }
+  | .remove id => { m with rows := m.rows.filter (·.id != id) }
+  | .sort      => { m with rows := m.rows.qsort (fun a b => compare a.text b.text == .lt) }
 
 def view (m : Model) : Html Msg :=
   div [cls "todo"] [
     div [cls "add"] [
-      input  [cls "new", placeholder "What needs doing?", value m.draft, onInput .edit],
+      input  [cls "new", value m.draft, onInput .edit, placeholder "What needs doing?"],
       button [cls "addbtn",  onClick .add]  "Add",
       button [cls "sortbtn", onClick .sort] "Sort"
     ],
-    ul [cls "items"] (m.items.map row).toList
+    ul [cls "items"] (m.rows.mapIdx fun i r =>
+      li [key (toString r.id), cls "row"] [
+        (Row.component.view r).map (Msg.row i),     -- the row's own view, messages tagged row i
+        button [cls "rm", onClick (.remove r.id)] "✕"
+      ]).toList
   ]
 
 def app : App Model Msg := sandbox init update view

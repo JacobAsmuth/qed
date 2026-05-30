@@ -2,35 +2,48 @@
 
 **A formally-verified web frontend framework in Lean 4.**
 
-Qed apps compile to WebAssembly and run in the browser, and because the code is
-*Lean*, the running artifact carries machine-checked guarantees:
+Here's the pitch. You write your app — the state, the messages it answers, how
+state changes, and what the screen looks like — as ordinary [Lean](https://lean-lang.org)
+functions. Lean compiles them to WebAssembly, and the thing that ends up running in
+the browser carries machine-checked guarantees. Not the "we wrote a lot of tests"
+kind — the "the compiler flat-out refused to build it otherwise" kind.
 
-- **Total by construction.** Every `update` and `view` is an ordinary Lean
-  function, so it is proven terminating and exhaustive *to compile*. Runtime
-  crashes, non-exhaustive matches, and infinite render loops are rejected before
-  the app ever builds.
-- **Theorems about your app, discharged for you.** State a property; the
-  framework generates and the kernel checks the proof. The counter below proves
-  its count never drops below zero, with **no hand-written proof** — and the
-  theorem depends only on Lean's core axioms (`propext`, `Quot.sound`), never
-  `sorry`.
+I'm not a type theorist, and the good news is you don't have to be one either. What
+you'll write looks a lot like Elm; Lean does the proving quietly in the background.
+(If you ever catch me claiming something is proven when it isn't, open an issue and
+I'll fix it.)
 
-## Install
+Two things you get without asking:
+
+- **Your `update` and `view` can't crash.** They're total Lean functions, so a
+  forgotten case, a partial match, or an accidental infinite render is a *compile*
+  error — it never reaches a user. This isn't a linter being polite; the build
+  simply won't hand you a binary.
+- **You can state a fact about your app and have it proven.** The counter just
+  below claims its count never drops below zero. We don't test that — the kernel
+  checks it, for every possible message, with no proof written by hand.
+
+## Getting set up
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/JacobAsmuth/qed/main/install.sh | sh
 qed new myapp && cd myapp && qed dev
 ```
 
-The installer adds elan (the Lean toolchain manager) if it's missing, fetches the
-framework into `~/.qed`, builds the `qed` CLI, and puts it on your PATH. The wasm
-toolchain and emscripten are fetched on first `qed build`, not at install time.
+The installer grabs elan (Lean's toolchain manager) if you don't have it, drops the
+framework into `~/.qed`, builds the `qed` command, and puts it on your PATH. The
+wasm toolchain and emscripten are big, so they're fetched lazily on your first
+`qed build` rather than up front.
 
-## Examples
+## Let's build some things
 
-The snippets below assume `import Qed` and `open Qed`.
+Everything below assumes you've got `import Qed` and `open Qed` at the top.
 
 ### A counter
+
+Every Qed app is the same three pieces Elm taught us: a *model* (your state), an
+*update* (how a message changes that state), and a *view* (your state, drawn as
+HTML).
 
 ```lean
 structure Model where
@@ -49,7 +62,7 @@ def update (m : Model) : Msg → Model
 
 def view (m : Model) : Html Msg :=
   div [cls "counter"] [
-    button [onClick .decrement] "−",            -- a bare string is a text child
+    button [onClick .decrement] "−",       -- a plain string works — Qed wraps it in a text node
     span   [cls "count"]        [toString m.count],
     button [onClick .increment] "+",
     button [onClick .reset]     "reset"
@@ -57,39 +70,63 @@ def view (m : Model) : Html Msg :=
 
 def app : App Model Msg := sandbox init update view
 
--- State the safety property; the framework proves it for every transition.
+-- Here's the fun part. We claim the count never goes below zero. Notice we don't
+-- prove it - the `invariant` command does, for every message, no proof by hand.
+-- Try deleting the `if 0 < m.count` guard above and watch the build refuse you.
 invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
 ```
 
-### Parsing JSON with errors handled
+### Reading JSON
 
-`Json.parse` is total and depth-bounded: malformed or too-deeply-nested input
-returns an `.error`, it never throws. `jsonStruct` declares a structure and its
-typed `ToJson`/`FromJson` in one go — the field list is written *once* — so turning
-a response body into a value is a `do` block in the `Except` monad.
+`Json.parse` assumes the worst - it's total*, so it never throws; bad input just comes back as an
+honest `.error` value.
+
+"Depth-bounded" is the part worth actually showing, since it's the kind of thing
+that's easy to just claim. `parse` takes a depth budget (it defaults to 64) - nest
+deeper than that and the parse bounces off instead of recursing until your stack
+gives out. The `.map Json.depth` below is only there so the result prints - try it:
+
+```lean
+#eval (Json.parse "[[[]]]" (maxDepth := 3)).map Json.depth   -- Except.ok 3   (depth 3 fits a budget of 3)
+#eval (Json.parse "[[[]]]" (maxDepth := 2)).map Json.depth   -- Except.error "maximum depth exceeded"
+```
+
+`parse_depth_le` proves that budget is the ceiling.
+Whatever `parse s budget` accepts is guaranteed to nest no deeper than `budget` - so a
+hostile, ten-thousand-level-deep blob can't slip past.
+
+Most of the time, though, you just want to decode the thing as a struct. `jsonStruct` writes the
+tedious `ToJson`/`FromJson` for you - you list the fields exactly once - so decoding a
+response body is a `do` block in the `Except` monad:
 
 ```lean
 jsonStruct User where
   name : String
-  age  : Nat                   -- a `Nat` field rejects negatives
-  bio  : Option String         -- optional: absent or null ⇒ none
+  age  : Nat                   -- a Nat can't be negative, so "age": -3 is rejected for free
+  bio  : Option String         -- Option means "this one's allowed to be missing (or null)"
 
 def decodeUser (body : String) : Except String User := do
-  let json ← Json.parse body   -- .error on malformed / too-deep input
-  fromJson json                -- .error "age: expected a non-negative integer" (names the field)
+  let json ← Json.parse body   -- garbage or too-deeply-nested input stops right here, as an .error
+  fromJson json                -- and a bad field names itself: "age: expected a non-negative integer"
 ```
 
-When you only need one value out of a larger payload, reach in dynamically. Every
-step is an `Option`, so the wrong shape is just `none` - no exceptions:
+Sometimes you don't want the whole struct - you just want the city out of a big
+blob. Reach in dynamically instead. Every step is an `Option`, so a wrong turn is
+just `none`.
 
 ```lean
 def cityOf (body : String) : Option String :=
   (Json.parse body).toOption
-    |>.bind (·.path? ["address", "city"])
-    |>.bind (·.str?)
+    |>.bind (·.path? ["address", "city"])   -- dig down two levels; a missing key is just `none`
+    |>.bind (·.str?)                          -- "...and is it actually a string?" is the last gate
 ```
 
-### A form that can't carry invalid data
+### Forms
+
+A `Field p` is a value paired with a *proof* that `p` holds of it. The only way to
+build one is to validate, so the moment you're holding a `Signup`, every field in it
+is already known-good — an invalid form simply can't exist as a value. Which means
+any handler that takes a `Signup` never has to second-guess what's inside it.
 
 ```lean
 abbrev Email (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
@@ -97,65 +134,69 @@ abbrev Adult (n : Nat)    : Prop := n ≥ 18
 
 form Signup where
   email : Input.text.refine Email
-  age   : Input.nat.refine Adult                  -- parsed to a Nat
-  agree : Input.checkbox.refine (· = true)         -- a Bool; must be checked
+  age   : Input.nat.refine Adult                   -- parsed to a real Nat first, then checked
+  agree : Input.checkbox.refine (· = true)         -- a Bool that has to be true to get through
   plan  : Input.select [("free", "Free"), ("pro", "Pro")]
 
 structure Model where
-  draft     : Signup.Draft           -- raw strings, generated from the fields above
-  submitted : Option Signup           -- the validated account, once created
+  draft     : Signup.Draft   -- what's in the inputs right now — just strings, anything goes
+  submitted : Option Signup  -- the validated account; `some` only once every field checks out
 
 inductive Msg
-  | edit (d : Signup.Draft)           -- the form hands back the whole updated draft
+  | edit (d : Signup.Draft)  -- the form hands you back the whole edited draft
   | submit
 
 def update (m : Model) : Msg → Model
   | .edit d => { m with draft := d }
-  | .submit => { m with submitted := Signup.parse m.draft }   -- `some` only if valid
+  | .submit => { m with submitted := Signup.parse m.draft }   -- `none` if anything's invalid
 
 def view (m : Model) : Html Msg :=
-  Signup.formView m.draft .edit .submit       -- inputs + a submit gated on validity
+  Signup.formView m.draft .edit .submit   -- the inputs, plus a submit button that's dead until valid
 ```
 
-### A streaming LLM chat
+### Streaming
+
+Side effects in Qed are just data. `update` stays a boring pure function - a
+separate `effects` function says "after this message, go do that thing," and the
+driver is the one that actually touches the network. So here's a chat with a live,
+token-by-token LLM reply - and notice there isn't a single `fetch` in the logic.
+`Cmd.stream` opens the streaming request and feeds each token back in as a `.chunk`
+message, which is to say: as far as your `update` is concerned, a streaming reply is
+just more messages showing up.
 
 ```lean
 inductive Msg
-  | typed (s : String)     -- composer edited
-  | send                   -- submit the draft
-  | chunk (data : String)  -- one streamed SSE payload (an OpenAI delta)
-  | done                   -- stream finished
+  | typed (s : String)     -- you typed in the box
+  | send                   -- you hit send
+  | chunk (data : String)  -- one token just arrived from the stream
+  | done                   -- the stream closed
 
-def update (m : Model) : Msg → Model        -- pure: arms are plain record updates
+def update (m : Model) : Msg → Model        -- still pure — Remember, no fetch lives in here
   | .typed s   => { m with draft := s }
-  | .send      => …                          -- push the user turn, clear the draft
-  | .chunk raw => { m with turns := appendLast m.turns (deltaOf raw) }
+  | .send      => …                          -- push your turn, clear the box
+  | .chunk raw => { m with turns := appendLast m.turns (deltaOf raw) }   -- glue the token on
   | .done      => { m with pending := false }
 
-def effects (m : Model) : Msg → Cmd Msg     -- m is the post-update model
+def effects (m : Model) : Msg → Cmd Msg     -- this gets the model *after* update has run
   | .send => .stream "/v1/chat/completions" (reqBody m.turns.pop) .chunk .done
-  | _     => .none
+  | _     => .none                            -- most messages don't need to do anything
 
 def view (m : Model) : Html Msg :=
   div [cls "chat"] [
     div [cls "log"] (m.turns.toList.map bubble),                       -- one bubble per turn
-    input  [value m.draft, onInput .typed, placeholder "Message…"],    -- controlled input
+    input  [value m.draft, onInput .typed, placeholder "Message…"],    -- a controlled input
     button [disabled (m.pending || m.draft.trim.isEmpty), onClick .send] "Send"
   ]
 
 def chatApp : App Model Msg := application init update view effects
 ```
 
-### A keyed list of reusable rows
-
-Each row is its own `Component` — its state, messages, `update`, and `view` — and
-carries a `key` (like React's `key`). So add, remove, and sort move whole rows: a
-row that moves keeps its DOM node, its local state, and any focus inside it.
+### Lists and Components
 
 ```lean
-namespace Row                       -- a self-contained row: its own state + messages
+namespace Row                       -- a component
   structure Model where
-    id   : Nat                      -- the row's key
+    id   : Nat                      -- this is the key
     text : String
     done : Bool
   inductive Msg | toggle
@@ -174,7 +215,7 @@ structure Model where
 inductive Msg
   | edit (s : String)
   | add
-  | row (i : Nat) (msg : Row.Msg)   -- a click inside row i
+  | row (i : Nat) (msg : Row.Msg)   -- a message bubbling up from inside row i
   | remove (id : Nat)
   | sort
 
@@ -184,7 +225,7 @@ def update (m : Model) : Msg → Model
                   if t.isEmpty then m
                   else { m with rows   := m.rows.push { id := m.nextId, text := t, done := false }
                                 draft  := "", nextId := m.nextId + 1 }
-  | .row i msg => { m with rows := Row.component.updateAt m.rows i msg }
+  | .row i msg => { m with rows := Row.component.updateAt m.rows i msg }   -- route it to that one row
   | .remove id => { m with rows := m.rows.filter (·.id != id) }
   | .sort      => { m with rows := m.rows.qsort (fun a b => compare a.text b.text == .lt) }
 
@@ -196,22 +237,24 @@ def view (m : Model) : Html Msg :=
       button [onClick .sort] "Sort"
     ],
     ul [cls "items"] (m.rows.mapIdx fun i r =>
-      li [key (toString r.id)] [               -- keyed: this row keeps its node when it moves
-        (Row.component.view r).map (Msg.row i),
+      li [key (toString r.id)] [               -- the key. Move this row and its DOM node tags along.
+        (Row.component.view r).map (Msg.row i),  -- the row's own view, its messages stamped "row i"
         button [cls "rm", onClick (.remove r.id)] "✕"
       ]).toList
   ]
 ```
 
-The full app is `Examples/Todo.lean`; `test/todo_test.mjs` drives it in a browser.
+The whole app is `Examples/Todo.lean`, and `test/todo_test.mjs` drives it in a real
+browser (it even checks that a row's DOM node survives a sort).
 
-### Routing, data fetching, and events
+### Talking to the outside world
 
-`routed` wires the verified `Router` to the URL: `link`s and back/forward navigate
-without a page reload, and the new path is parsed into a route (`Router.fromURL`,
-round-trip proven). `Cmd.getJson` fetches and decodes a JSON response with
-`Qed.Json`. A `<form>` submits on Enter or its button (`onSubmit`), and
-`onKeydown`/`onFocus`/`onBlur` round out the events.
+`routed` plugs the verified `Router` into
+the browser's URL bar - `link`s navigate without a reload, the back button does the
+sensible thing, and the new path gets parsed back into a route. (That round-trip is
+proven, by the way, so a URL you can print is a URL you can parse back.) `Cmd.getJson`
+does the fetch *and* the decode in one move. And a `<form>` submits on Enter, the way
+forms have since roughly 1995.
 
 ```lean
 router R where
@@ -223,9 +266,9 @@ jsonStruct Profile where
   bio  : String
 
 def effects (m : Model) : Msg → Cmd Msg
-  | .submit       => .pushUrl (Router.toURL (R.user m.query))   -- navigate, no reload
+  | .submit       => .pushUrl (Router.toURL (R.user m.query))   -- go to /users/<query>, no reload
   | .urlChanged _ => match m.route with
-      | .user name => Cmd.getJson s!"/api/users/{name}"          -- GET + decode Profile
+      | .user name => Cmd.getJson s!"/api/users/{name}"          -- GET it, decode it into a Profile
                         (fun p => .gotProfile (.ok p)) (fun e => .gotProfile (.error e))
       | _          => .none
   | _ => .none
@@ -233,17 +276,19 @@ def effects (m : Model) : Msg → Cmd Msg
 def view (m : Model) : Html Msg :=
   formEl [onSubmit .submit] [
     input [value m.query, onInput .typeQuery, onKeydown .key],   -- Enter submits, Escape clears
-    link "/users/ada" [] "ada"                                    -- a routed link (no reload)
+    link "/users/ada" [] "ada"                                    -- a real link — but no page reload
   ]
 
 def app : App Model Msg :=
   routed init update view (onUrlChange := Msg.urlChanged) (effects := effects)
 ```
 
-`Examples/Users.lean` is the full app; `test/users_test.mjs` drives it against a mock
-API — a deep link, link/submit navigation, back/forward, and the events.
+The full app is `Examples/Users.lean`; `test/users_test.mjs` drives it against a mock
+API — a deep link, link and form navigation, the back button, and the events.
 
-## How it works
+## So what's actually happening?
+
+Here's the trip from "I wrote some Lean" to "pixels in a browser":
 
 ```text
 Lean app (Model, Msg, update, view, deriving/invariant — proofs auto-discharged)
@@ -258,26 +303,29 @@ runtime/host.js:  qed_run_init() mounts;  click → qed_run_dispatch(id),
                   → pure `update` → diff vs. previous view → patch only what changed
 ```
 
-On each event the new view is diffed against the previous one and only the
-changed nodes are patched — so the proven `diff_apply` theorem (above)
-guarantees the DOM equals the new view, while untouched nodes keep their identity
-(focus, cursor, scroll, selection all survive an update).
+Every time something happens, Qed re-runs your `view`, diffs the new tree against
+the last one, and patches *only* the bits that actually changed. Notice what that
+buys you: the input you're typing in is never rebuilt, so your cursor, your text
+selection, and your scroll position all survive the update. And this isn't
+hand-waving — `diff_apply` is a theorem that says the patched DOM equals the new
+view, exactly.
 
-`update` returns `(model, Cmd)`. The driver runs the `Cmd` *after* the render:
-`Cmd.stream` performs a streaming `fetch` whose Server-Sent-Events dispatch
-`.chunk`/`.done` messages back through the same loop, so async stays pure data.
+Remember the bit about `update` staying pure? It returns `(model, Cmd)`, and the
+driver runs the `Cmd` *after* the render — a `Cmd.stream` kicks off a streaming
+`fetch` whose events come back in as `.chunk`/`.done` messages. So "async" never
+escapes being plain data flowing through the same loop.
 
-The only impure, unverified surface is `Qed/Dom.lean` (a handful of `@[extern]`
-node primitives, incl. a streaming fetch) and its C/JS implementation in
-`runtime/`. Everything above that line is pure, total Lean. Events cross back by
-id and are looked up totally (`Array.get?`), so a bad event id can never crash the app.
+There's exactly one impure corner in the whole thing: `Qed/Dom.lean`, a short list
+of `@[extern]` calls that poke the real DOM. Everything above that line is pure,
+total Lean. Even events come back across the boundary as integer ids and get looked
+up safely (`Array.get?`), so a stray id can't take the app down with it.
 
-## The `qed` CLI
+## The `qed` command
 
-The toolchain is a single command with a vocabulary web devs already know.
-Verification runs as part of every `build`/`dev`/`check`: the Lean kernel checks
-your proofs (a failed proof is a build error), the sources are grepped for
-`sorry`/`admit`/`native_decide`, and the axiom manifest is run.
+If you've used `npm` or `vite`, you already know most of these. Verification isn't a
+separate step you have to remember — it runs inside every `build`/`dev`/`check`: the
+Lean kernel checks your proofs (a failed proof *is* a failed build), the sources are
+grepped for `sorry`/`admit`/`native_decide`, and the axiom manifest is run.
 
 ```bash
 qed dev        # watch sources, rebuild, serve with live-reload  → localhost:8000
@@ -290,28 +338,28 @@ qed new APP    # scaffold a new app
 qed doctor     # report which dependencies are present
 ```
 
-`npm run dev` / `build` / `test` / … work too (see `package.json`) for muscle
-memory. When hacking on the framework itself, the in-repo `./qed` shim runs the
-CLI against this checkout.
+`npm run dev` / `build` / `test` / … work too (see `package.json`) if that's the
+muscle memory you've got. When you're hacking on the framework itself, the in-repo
+`./qed` shim runs the CLI against this checkout.
 
-## Layout
+## Where everything lives
 
 | Path | What |
 |------|------|
-| `Qed/Html.lean` | The core typed virtual DOM — the elaboration target. |
-| `Qed/Notation.lean` | Readable view combinators (`div`, `button`, `onClick`, …). |
-| `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`, `routed`), `Cmd` effects (`stream`/`now`/`request`/`getJson`/`pushUrl`) + pure render-to-HTML. |
-| `Qed/Invariant.lean` | The `invariant … preserved_by …` command (auto-proven). |
-| `Qed/Diff.lean` | The diff/patch engine — positional length-general reconcile (add/remove) and keyed reconcile (reorder/remove by `key`) + the `diff_apply` correctness proof. |
-| `Qed/Json.lean` | Full JSON parser/renderer + `jsonStruct`/`jsonCodec` + `parse_depth_le` & `parse_render` proofs. |
-| `Qed/Router.lean` | The `Router` class (round-trip law as a field) + the `router` command (generates the route enum, `print`/`parse`, the round-trip proof, and the instance) + `toURL`/`fromURL` for the browser. |
+| `Qed/Html.lean` | The core typed virtual DOM — the thing every bit of nice syntax eventually becomes. |
+| `Qed/Notation.lean` | The readable view combinators (`div`, `button`, `onClick`, …). |
+| `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`, `routed`), the `Cmd` effects (`stream`/`now`/`request`/`getJson`/`pushUrl`), and the pure render-to-HTML. |
+| `Qed/Invariant.lean` | The `invariant … preserved_by …` command (it discharges the proof for you). |
+| `Qed/Diff.lean` | The diff/patch engine — positional reconcile (add/remove) and keyed reconcile (reorder by `key`) — plus the `diff_apply` correctness proof. |
+| `Qed/Json.lean` | The full JSON parser/renderer + `jsonStruct`/`jsonCodec`, with the `parse_depth_le` & `parse_render` proofs. |
+| `Qed/Router.lean` | The `Router` class (round-trip law baked in as a field), the `router` command, and `toURL`/`fromURL` for the browser. |
 | `Qed/Form.lean` | Typed refinement fields (`Field p`), the `Input` controls (text/number/checkbox/date/select/radios), and the `form` command (Draft + `parse` + `formView` + the `canSubmit_iff` proof). |
 | `Qed/Date.lean` | A calendar `Date` that can't be invalid (smart constructor + ISO parser; impossible dates parse to `none`). |
-| `Qed/Component.lean` | `Component` (a reusable `update`+`view`) + `viewList`/`updateAt` for repeating it per row. |
-| `Qed/Dom.lean` | The `@[extern]` DOM node primitives (the trusted boundary). |
-| `Qed/Driver.lean` | The impure browser driver (build + patch) + `@[export]`ed entry points. |
+| `Qed/Component.lean` | `Component` (a reusable `update`+`view`) + `viewList`/`updateAt` for repeating one per row. |
+| `Qed/Dom.lean` | The `@[extern]` DOM primitives — the one trusted boundary. |
+| `Qed/Driver.lean` | The impure browser driver (build + patch) + the `@[export]`ed entry points. |
 | `Examples/` | Example programs. |
 | `Cli.lean` + `./qed` | The toolchain (build/dev/test/check/…) and its shim. |
-| `runtime/` | C/JS driver, pages, dev server. |
-| `test/` | Browser tests: counter (`browser_test.mjs`), chat screenshots (`chat_test.mjs`), form (`signup_test.mjs`), current-time (`booking_test.mjs`), dynamic list (`todo_test.mjs`), routing/http/events (`users_test.mjs`) + mock LLM (`mock_llm.py`). |
-| `scripts/axioms.lean` | Axiom manifest gated by `qed check`/`qed build`. |
+| `runtime/` | The C/JS driver, the page, and the dev server. |
+| `test/` | Browser tests: counter (`browser_test.mjs`), chat (`chat_test.mjs`), form (`signup_test.mjs`), current-time (`booking_test.mjs`), dynamic list (`todo_test.mjs`), routing/http/events (`users_test.mjs`) + the mock LLM (`mock_llm.py`). |
+| `scripts/axioms.lean` | The axiom manifest that `qed check`/`qed build` gate on. |

@@ -98,47 +98,65 @@ def cityOf (body : String) : Option String :=
 
 ### A form that can't carry invalid data
 
-A form field is a `Field p` — a `String` paired with a proof that the proposition
-`p` holds of it — so an invalid form is unrepresentable and any handler taking a
-`Signup` can't run on bad input. Field specs are ordinary decidable propositions
-(compose them with `∧`, `≥`, …; write them as `abbrev` so validation infers their
-`Decidable` instance). The `form` command generates the structure, an `ofRaw`
-validator, a `canSubmit` gate, and the proof `canSubmit e p = true ↔ Email e ∧
-MinLen 8 p` — with no hand-written proof. The submit button below is enabled
-*exactly* when the inputs validate, so it can't disagree with the data.
+A field is a *typed* refinement: `Field p` (for `p : α → Prop`) is a value of type
+`α` paired with a proof that `p` holds of it. Its only constructor is validation, so
+a `Signup` value is itself evidence that every field is valid — an invalid form is
+unrepresentable, and any handler taking one can't run on bad input.
+
+Each field names a control: `Input.text`, `Input.nat`/`Input.int`, `Input.checkbox`
+(a `Bool`), `Input.date` (a verified `Qed.Date` — `2026-02-30` parses to `none`),
+`Input.select`/`Input.radios`. The value is *parsed* from the raw string first (a
+number, a real calendar date), then refined with `.refine spec`. From the one
+declaration, `form` generates the editable `Draft`, the validated `Signup`,
+`Signup.parse : Draft → Option Signup`, the `canSubmit` gate and its `canSubmit_iff`
+proof, and `Signup.formView` — so the widgets, the submit-disabled-unless-valid gate,
+and the field names are written once.
 
 ```lean
-abbrev Email  (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
-abbrev MinLen (n : Nat) (s : String) : Prop := s.length ≥ n
+abbrev Email (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
+abbrev Adult (n : Nat)    : Prop := n ≥ 18
 
--- generates `Signup` (each field a `Field p`), `Signup.ofRaw`, `Signup.canSubmit`,
--- and the proof `canSubmit e p = true ↔ Email e ∧ MinLen 8 p`
 form Signup where
-  email    : Email
-  password : MinLen 8
+  email : Input.text.refine Email
+  age   : Input.nat.refine Adult                  -- parsed to a Nat
+  agree : Input.checkbox.refine (· = true)         -- a Bool; must be checked
+  plan  : Input.select [("free", "Free"), ("pro", "Pro")]
 
 structure Model where
-  email    : String          -- raw inputs, as typed
-  password : String
+  draft     : Signup.Draft           -- raw strings, generated from the fields above
+  submitted : Option Signup           -- the validated account, once created
 
 inductive Msg
-  | email    (s : String)
-  | password (s : String)
+  | edit (d : Signup.Draft)           -- the form hands back the whole updated draft
   | submit
 
 def update (m : Model) : Msg → Model
-  | .email s    => { m with email := s }
-  | .password s => { m with password := s }
-  | .submit     => m         -- only reachable when the inputs validate (button gated below)
+  | .edit d => { m with draft := d }
+  | .submit => { m with submitted := Signup.parse m.draft }   -- `some` only if valid
 
 def view (m : Model) : Html Msg :=
-  let valid := (Signup.ofRaw m.email m.password).isSome    -- some ⇔ both fields validate
-  div [cls "signup"] [
-    input  [type' "email",    value m.email,    onInput .email],
-    input  [type' "password", value m.password, onInput .password],
-    button [disabled (!valid), onClick .submit] "Create account"
-  ]
+  Signup.formView m.draft .edit .submit       -- inputs + a submit gated on validity
 ```
+
+`Examples/Signup.lean` is the full app; `test/signup_test.mjs` drives it in a real
+browser — filling each control, toggling the checkbox, and asserting the submit
+button enables only once every field is valid.
+
+A rule can also depend on the **current time**. `form` takes context binders that
+thread into the gate, and `Cmd.now` reads the clock into the model as data (`view`
+and `update` stay pure):
+
+```lean
+form Appt (today : Date) where
+  when : Input.date.refine (fun d => today < d)   -- must be after today
+
+-- read the clock once at startup, then render the form with `today` in scope
+def app : App Model Msg :=
+  { init := (init, .now .gotToday), update := …, view := … }
+```
+
+`Examples/Booking.lean` is the full app; `test/booking_test.mjs` drives it against
+the real clock — a past date keeps submit disabled, a future date enables it.
 
 ### Effects: a streaming LLM chat
 
@@ -281,7 +299,8 @@ CLI against this checkout.
 | `Qed/Diff.lean` | The diff/patch engine + the `diff_apply` correctness proof. |
 | `Qed/Json.lean` | Full JSON parser/renderer + `jsonStruct`/`jsonCodec` + `parse_depth_le` & `parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field) + the `router` command (generates the route enum, `print`/`parse`, the round-trip proof, and the instance). |
-| `Qed/Form.lean` | `Prop`-refinement fields (`Field p`) + the `form` command (generates the `canSubmit_iff` proof). |
+| `Qed/Form.lean` | Typed refinement fields (`Field p`), the `Input` controls (text/number/checkbox/date/select/radios), and the `form` command (Draft + `parse` + `formView` + the `canSubmit_iff` proof). |
+| `Qed/Date.lean` | A calendar `Date` that can't be invalid (smart constructor + ISO parser; impossible dates parse to `none`). |
 | `Qed/Component.lean` | `Component` (a reusable `update`+`view`) + `viewList`/`updateAt` for repeating it per row. |
 | `Qed/Dom.lean` | The `@[extern]` DOM node primitives (the trusted boundary). |
 | `Qed/Driver.lean` | The impure browser driver (build + patch) + `@[export]`ed entry points. |

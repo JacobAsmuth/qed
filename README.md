@@ -252,26 +252,9 @@ def view (m : Model) : Html Msg :=
 ```
 
 A component lowers to ordinary `Html` through `Html.map`, so it adds no axioms and
-the proofs above (totality, `diff_apply`) already cover a composed view — nesting
-buys no new trust assumptions. The full example, decoding a JSON array into a list
-of boxes, is `Examples/Boxes.lean`.
-
-## What this lets you prove
-
-Each property below is checked by `qed check`, with no hand-written proof:
-
-- **Diff equals re-render** — `applyPatch (diff a b) a = b` (`Qed/Diff.lean`).
-  Untouched nodes keep their focus, scroll, and input state.
-- **Parser depth bound** — `parse s maxDepth = .ok j → j.depth ≤ maxDepth`
-  (`parse_depth_le`), for any input.
-- **JSON round-trip** — `parse (render j) = .ok j` on the structural core (`parse_render`).
-- **URL round-trip** — `parse (print r) = some r` (`Route.round_trip`); the law is a
-  field of the `Router` class, so an instance can't omit it.
-- **Submit ⇔ valid** — `canSubmit e p = true ↔ Email e ∧ MinLen 8 p` (`Signup.canSubmit_iff`);
-  the enabled bit *is* the decision procedure for the field specs.
-- **Totality** — `update`/`view` have no `panic`, no missing case, no infinite loop.
-- **State-machine invariant** — `invariant p preserved_by update` proves `p` holds
-  after every message.
+the totality and diff/patch proofs already cover a composed view — nesting buys no
+new trust assumptions. The full example, decoding a JSON array into a list of
+boxes, is `Examples/Boxes.lean`.
 
 ## How it works
 
@@ -339,10 +322,7 @@ CLI against this checkout.
 | `Qed/Component.lean` | `Component` (a reusable `update`+`view`) + `viewList`/`updateAt` for repeating it per row. |
 | `Qed/Dom.lean` | The `@[extern]` DOM node primitives (the trusted boundary). |
 | `Qed/Driver.lean` | The impure browser driver (build + patch) + `@[export]`ed entry points. |
-| `Examples/Counter.lean` | The counter demo (shared by both entry points). |
-| `Examples/Chat.lean` / `Examples/ChatWeb.lean` | The streaming LLM chat app + its WASM entry. |
-| `Examples/Boxes.lean` | A `Component` repeated per row of a decoded JSON array. |
-| `Examples/Native.lean` / `Examples/Web.lean` | Native / WASM counter entry points. |
+| `Examples/` | Example programs. |
 | `Cli.lean` + `./qed` | The toolchain (build/dev/test/check/…) and its shim. |
 | `runtime/` | C/JS driver, pages, dev server. |
 | `test/` | Browser tests: counter (`browser_test.mjs`) + chat screenshots (`chat_test.mjs`) + mock LLM (`mock_llm.py`). |

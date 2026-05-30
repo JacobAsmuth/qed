@@ -44,10 +44,23 @@ def sandbox (init : Model) (update : Model → Msg → Model) (view : Model → 
     App Model Msg :=
   { init := (init, .none), update := fun m msg => (update m msg, .none), view }
 
-/-- Build an `App` whose `update` may request effects (fetch, streaming, …). -/
-def application (init : Model) (update : Model → Msg → Model × Cmd Msg)
-    (view : Model → Html Msg) : App Model Msg :=
-  { init := (init, .none), update, view }
+/-- Build an `App` whose transitions may request effects (fetch, streaming, …).
+
+    `update` stays pure (`Model → Msg → Model`), so its arms read as ordinary
+    `{ m with … }` record updates. Effects are a *separate* function evaluated on
+    the **updated** model: `effects m' msg` is the `Cmd` to run after a `msg`
+    moved the model to `m'`. It defaults to "no effect", so an app names a `Cmd`
+    only for the messages that actually have one.
+
+    (For an effect that needs state the update discards, build the `App` directly:
+    its `update : Model → Msg → Model × Cmd Msg` field gives the combined form.) -/
+def application (init : Model)
+    (update  : Model → Msg → Model)
+    (view    : Model → Html Msg)
+    (effects : Model → Msg → Cmd Msg := fun _ _ => .none) : App Model Msg :=
+  { init   := (init, .none)
+    update := fun m msg => let m' := update m msg; (m', effects m' msg)
+    view }
 
 /-- Escape text/attribute values so model data cannot break out of the markup. -/
 def escapeHtml (s : String) : String :=

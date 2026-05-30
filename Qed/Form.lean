@@ -15,7 +15,7 @@
   gate, *and* the `canSubmit_iff` proof — written once, no hand proof:
 
       form Signup where
-        email    : Email;
+        email    : Email
         password : MinLen 8
 -/
 namespace Qed
@@ -42,16 +42,17 @@ end Field
 
 /-! ### The `form` command
 
-`form T where f₁ : p₁; …; fₙ : pₙ` expands to a structure with `fieldᵢ : Field pᵢ`,
-an `ofRaw` that validates raw strings into `Option T`, a `canSubmit` gate, and the
-proof `canSubmit … ↔ p₁ … ∧ … ∧ pₙ …`. Core-syntax only (no `import Lean`). -/
+`form T where f₁ : p₁ …` (fields one per line, or `;`-separated on one line) expands
+to a structure with `fieldᵢ : Field pᵢ`, an `ofRaw` that validates raw strings into
+`Option T`, a `canSubmit` gate, and the proof `canSubmit … ↔ p₁ … ∧ … ∧ pₙ …`.
+Core-syntax only (no `import Lean`). -/
 
 open Lean in
-syntax (name := formCmd) "form " ident " where " sepBy1(group(ident " : " term), "; ") : command
+syntax (name := formCmd) "form " ident " where " sepBy1IndentSemicolon(group(ident " : " term)) : command
 
 open Lean in
 macro_rules
-  | `(form $t:ident where $[$fs:ident : $ps:term];*) => do
+  | `(form $t:ident where $[$fs:ident : $ps:term]*) => do
       -- `fs` stays the ident array (for output splices `$fs:ident`); `ft` is the
       -- same names as terms, for the application/proof syntax we build below.
       let ft : Array (TSyntax `term) := fs.map fun f => ⟨f.raw⟩
@@ -99,7 +100,7 @@ abbrev Email (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
 abbrev MinLen (n : Nat) (s : String) : Prop := s.length ≥ n
 
 form Signup where
-  email    : Email;
+  email    : Email
   password : MinLen 8
 
 end Demo

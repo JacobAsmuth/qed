@@ -25,41 +25,88 @@ class Router (α : Type) where
 def Router.toURL {α} [Router α] (a : α) : String :=
   "/" ++ String.intercalate "/" (Router.print a)
 
-/-! ### An example route table -/
+/-! ### The `router` command
 
-/-- The application's pages. -/
-inductive Route
-  | home
-  | about
-  | post (slug : String)
-  | user (name : String)
-  deriving DecidableEq, Repr
+`router T where …` declares the page enum *and* its lawful `Router` instance from
+one table; each line is a constructor:
 
-namespace Route
+    router Route where
+      home => ""                       -- the index route `/`  (empty path)
+      about                            -- `/about`   (segment = constructor name)
+      post (slug : String) => "posts"  -- `/posts/<slug>`
+      user (name : String) => "users"  -- `/users/<name>`
 
-def print : Route → List String
-  | .home      => []
-  | .about     => ["about"]
-  | .post slug => ["posts", slug]
-  | .user name => ["users", name]
+A route's path is its leading segment followed by its string arguments. The
+leading segment defaults to the constructor name; `=> "seg"` overrides it, and
+`=> ""` makes the path empty (the index). The command generates `T.print`,
+`T.parse`, the `T.round_trip` proof (`parse (print r) = some r`, by case
+analysis), and the `Router T` instance — so an unlawful router is impossible and
+none of it is written by hand. Fields use one-per-line or `;`-separated layout.
+Core-syntax only (no `import Lean`). -/
 
-def parse : List String → Option Route
-  | []               => some .home
-  | ["about"]        => some .about
-  | ["posts", slug]  => some (.post slug)
-  | ["users", name]  => some (.user name)
-  | _                => none
+syntax routeBinder := "(" ident " : " term ")"
+syntax routeAlt := ident (routeBinder)* (" => " str)?
+syntax (name := routerCmd) "router " ident " where " sepBy1IndentSemicolon(routeAlt) : command
 
-/-- The round-trip law, discharged by case analysis — no manual reasoning. -/
-theorem round_trip : ∀ r, parse (print r) = some r := by
-  intro r; cases r <;> simp [print, parse]
+open Lean in
+macro_rules
+  | `(router $t:ident where $[$alts:routeAlt]*) => do
+      let printId := mkIdent (t.getId ++ `print)
+      let parseId := mkIdent (t.getId ++ `parse)
+      let rtId    := mkIdent (t.getId ++ `round_trip)
+      -- Parallel arrays, spliced into one core quotation below (no `Lean.Parser`
+      -- categories, so this stays compilable without `import Lean`).
+      let mut ctorNames : Array (TSyntax `ident) := #[]
+      let mut ctorBs    : Array (Array (TSyntax `ident)) := #[]   -- binders per ctor
+      let mut ctorBts   : Array (Array (TSyntax `term))  := #[]
+      let mut printPats : Array (TSyntax `term) := #[]
+      let mut printRhss : Array (TSyntax `term) := #[]
+      let mut parsePats : Array (TSyntax `term) := #[]
+      let mut parseRhss : Array (TSyntax `term) := #[]
+      for alt in alts do
+        match alt with
+        | `(routeAlt| $c:ident $[($bs:ident : $bts:term)]* $[=> $seg:str]?) =>
+            let ctorId := mkIdent (t.getId ++ c.getId)
+            -- leading segment(s): "" ⇒ index (no segment); a string ⇒ that segment;
+            -- omitted ⇒ the constructor name.
+            let segs : Array (TSyntax `term) :=
+              match seg with
+              | some s => if s.getString == "" then #[] else #[quote s.getString]
+              | none   => #[quote (toString c.getId)]
+            let bterms : Array (TSyntax `term) := bs.map (⟨·.raw⟩)
+            let segments := segs ++ bterms          -- one list, used as term and pattern
+            ctorNames := ctorNames.push c
+            ctorBs    := ctorBs.push bs
+            ctorBts   := ctorBts.push bts
+            printPats := printPats.push (← `($ctorId $bs*))
+            printRhss := printRhss.push (← `([$segments,*]))
+            parsePats := parsePats.push (← `([$segments,*]))
+            parseRhss := parseRhss.push (← `(some ($ctorId $bs*)))
+        | _ => Macro.throwErrorAt alt "router: expected `ctor (arg : T)* (=> \"segment\")?`"
+      let parsePatsAll := parsePats.push (← `(_))           -- final wildcard ⇒ none
+      let parseRhssAll := parseRhss.push (← `(none))
+      `(inductive $t:ident where
+          $[| $ctorNames:ident $[($ctorBs:ident : $ctorBts:term)]*]*
+        deriving Repr, DecidableEq
+        def $printId:ident (r : $t) : List String :=
+          match r with
+          $[| $printPats:term => $printRhss:term]*
+        def $parseId:ident (p : List String) : Option $t :=
+          match p with
+          $[| $parsePatsAll:term => $parseRhssAll:term]*
+        theorem $rtId:ident : ∀ a, $parseId:ident ($printId:ident a) = some a := by
+          intro a; cases a <;> simp [$printId:ident, $parseId:ident]
+        instance : Router $t:ident := ⟨$printId, $parseId, $rtId⟩)
 
-end Route
+/-! ### An example route table
 
-/-- `Route` is a lawful `Router`; the instance carries the proof. -/
-instance : Router Route where
-  print      := Route.print
-  parse      := Route.parse
-  round_trip := Route.round_trip
+`Route` is the application's pages; `router` also generates its lawful `Router`
+instance (`Route.print`/`Route.parse`/`Route.round_trip`). -/
+
+router Route where
+  home => ""
+  about
+  post (slug : String) => "posts"
+  user (name : String) => "users"
 
 end Qed

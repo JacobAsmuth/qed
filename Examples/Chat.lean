@@ -1,11 +1,11 @@
 /-
   A streaming LLM chat — the whole app is this pure Lean.
 
-  `update` is total and returns `(model, Cmd)`: most branches just return the next
-  model (it coerces to "no effect"); `send` returns a `Cmd.stream` that the driver
-  runs as a streaming POST, dispatching `.chunk` per Server-Sent-Event and `.done`
-  at end of stream. JSON in (request body) and out (each chunk) goes through the
-  verified `Qed.Json` parser/renderer.
+  `update` is total and pure (`Model → Msg → Model`). Effects live in a separate
+  `effects` function: `send` maps to a `Cmd.stream` that the driver runs as a
+  streaming POST, dispatching `.chunk` per Server-Sent-Event and `.done` at end of
+  stream. JSON in (request body) and out (each chunk) goes through the verified
+  `Qed.Json` parser/renderer.
 -/
 import Qed
 open Qed
@@ -50,18 +50,27 @@ def reqBody (turns : Array Turn) : String :=
 def appendLast (turns : Array Turn) (d : String) : Array Turn :=
   turns.modify (turns.size - 1) fun t => { t with text := t.text ++ d }
 
-def update (m : Model) : Msg → Model × Cmd Msg
-  | .typed s   => ({ m with draft := s }, .none)
+def update (m : Model) : Msg → Model
+  | .typed s   => { m with draft := s }
   | .send      =>
       let draft := m.draft.trim
-      if draft.isEmpty then (m, .none) else
+      if draft.isEmpty then m else
       let convo := m.turns.push { user? := true, text := draft }
-      ({ turns   := convo.push { user? := false, text := "" }
-         draft   := ""
-         pending := true },
-       .stream "/v1/chat/completions" (reqBody convo) .chunk .done)
-  | .chunk raw => ({ m with turns := appendLast m.turns (deltaOf raw) }, .none)
-  | .done      => ({ m with pending := false }, .none)
+      { turns   := convo.push { user? := false, text := "" }
+        draft   := ""
+        pending := true }
+  | .chunk raw => { m with turns := appendLast m.turns (deltaOf raw) }
+  | .done      => { m with pending := false }
+
+/-- The only message with an effect: a non-empty `send` starts a streaming POST
+    of the conversation so far. `m` is the post-update model, so `pending` is set
+    exactly when a send went through, and `m.turns.pop` drops the empty assistant
+    turn `update` appended, leaving the conversation to send. -/
+def effects (m : Model) : Msg → Cmd Msg
+  | .send => if m.pending then
+               .stream "/v1/chat/completions" (reqBody m.turns.pop) .chunk .done
+             else .none
+  | _     => .none
 
 def bubble (t : Turn) : Html Msg :=
   div [cls (if t.user? then "msg user" else "msg bot")] [t.text]
@@ -76,6 +85,6 @@ def view (m : Model) : Html Msg :=
   ]
 
 def chatApp : App Model Msg :=
-  application { turns := #[], draft := "", pending := false } update view
+  application { turns := #[], draft := "", pending := false } update view effects
 
 end Chat

@@ -646,14 +646,16 @@ macro_rules
 
 `jsonStruct` reads the field names straight from the declaration, so the field
 list is written *once* (a plain `structure` + `jsonCodec User [name, …]` repeats
-it, and the two can silently drift). Still core-syntax only — no `import Lean`. -/
+it, and the two can silently drift). Fields use the same layout as a `structure`:
+one per line, or `;`-separated on one line. Still core-syntax only — no
+`import Lean`. -/
 
 open Lean in
-syntax (name := jsonStructCmd) "jsonStruct " ident " where " sepBy1(group(ident " : " term), "; ") : command
+syntax (name := jsonStructCmd) "jsonStruct " ident " where " sepBy1IndentSemicolon(group(ident " : " term)) : command
 
 open Lean in
 macro_rules
-  | `(jsonStruct $t:ident where $[$fs:ident : $tys:term];*) =>
+  | `(jsonStruct $t:ident where $[$fs:ident : $tys:term]*) =>
       `(structure $t where
           $[$fs:ident : $tys:term]*
         jsonCodec $t [$fs,*])

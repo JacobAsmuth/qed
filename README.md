@@ -143,13 +143,11 @@ declaration:
 - `Signup.canSubmit … : Bool`, and
 - a proof `Signup.canSubmit e p = true ↔ Email e ∧ MinLen 8 p` — no hand-written proof.
 
-### Putting it in an app
-
-`update` is a pure function from the model and a message to the next model; `view`
-maps the model to typed HTML. The submit button below is enabled *exactly* when
-the inputs validate (`Signup.ofRaw … |>.isSome`), so the button can't disagree
-with the data. `lake build` rejects this module unless every `Msg` is handled and
-both functions terminate.
+Wired into an app, the submit button is enabled *exactly* when the inputs validate
+(`Signup.ofRaw … |>.isSome`), so it can't disagree with the data. `update` is a pure
+function from the model and a message to the next model; `view` maps the model to
+typed HTML. `lake build` rejects the module unless every `Msg` is handled and both
+functions terminate.
 
 ```lean
 structure Model where

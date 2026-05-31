@@ -63,6 +63,12 @@ inductive Html (msg : Type) where
   | text (content : String)
   /-- An element: a tag, its attributes, and its children. -/
   | element (tag : String) (attrs : List (Attr msg)) (children : List (Html msg))
+  /-- A memoized subtree (`shouldComponentUpdate`/`useMemo` as data): `sub` is the
+      content, `key` summarizes the inputs it was built from. When the key is unchanged
+      since the last render the diff skips it — neither re-diffing `sub` nor touching its
+      DOM — on the promise that *equal key ⇒ equal subtree*. The view still builds `sub`
+      (that cost is the cheap part); the saving is the diff and the DOM patch. -/
+  | lazy (key : String) (sub : Html msg)
 
 instance : Inhabited (Attr msg) := ⟨.cls ""⟩
 instance : Inhabited (Html msg) := ⟨.text ""⟩
@@ -101,6 +107,7 @@ mutual
     | .text s                    => .text s
     | .element tag attrs children =>
         .element tag (attrs.map (Attr.map f)) (Html.mapChildren f children)
+    | .lazy key sub              => .lazy key (Html.map f sub)
   /-- Helper: map over a list of children (mutual recursion gives termination). -/
   def Html.mapChildren (f : α → β) : List (Html α) → List (Html β)
     | []      => []

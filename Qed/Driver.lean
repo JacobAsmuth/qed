@@ -106,6 +106,7 @@ def hostsLocal (attrs : List (Attr msg)) : Bool :=
 /-- Build a fresh DOM subtree from an `Html` node, returning its handle. -/
 partial def buildDom (h : Handlers msg) : Html msg → IO Dom.Node
   | .text s => Dom.createText s
+  | .lazy _ sub => buildDom h sub   -- a lazy node is its content; build it
   | .element tag attrs children => do
       let node ← Dom.createElement tag
       applyAttrs h node attrs          -- a local host's children are added here, by mountLocal
@@ -122,6 +123,11 @@ partial def applyToDom (h : Handlers msg)
   | .replace new => do
       Dom.replaceChild parent index (← buildDom h new)
   | .setText s => Dom.setText node s
+  | .lazyReuse _ _ =>
+      -- the key was unchanged, so the existing DOM is already correct: skip it. This is
+      -- the one place the driver trusts the developer's "equal key ⇒ equal subtree"
+      -- promise rather than mirroring `applyPatch` (which would rebuild `sub`).
+      pure ()
   | .patchElement attrs kids => do
       -- reconcile attributes in place: `setAttribute` is guarded (unchanged keys are
       -- not touched, so a typed input keeps its caret) and a toggled-off `flag`

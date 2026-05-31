@@ -43,7 +43,10 @@ def view (m : Model) : Html Msg :=
     ],
     -- This input is never rebuilt by an update: the diff engine only patches the
     -- count text above, so whatever you type here keeps its focus and cursor.
-    input [placeholder "type here — focus survives every click"]
+    input [placeholder "type here — focus survives every click"],
+    -- A memoized subtree: its key never changes, so after the first render the diff
+    -- skips it — the driver never touches this DOM again, no matter how you click.
+    lazy "banner" (div [cls "banner", attr "id" "banner"] ["built once, then memoized"])
   ]
 
 def app : App Model Msg := sandbox init update view

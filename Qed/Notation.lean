@@ -15,6 +15,11 @@ namespace Qed
 /-- A text node. Rarely needed explicitly — a bare `String` coerces to one. -/
 def text (s : String) : Html msg := .text s
 
+/-- Memoize a subtree by a key (React's `useMemo`/`shouldComponentUpdate` as data): when
+    `key` is unchanged since the last render, the diff skips `sub` — no re-diff, no DOM
+    patch. Make `key` capture exactly the inputs `sub` is built from. -/
+def lazy (key : String) (sub : Html msg) : Html msg := .lazy key sub
+
 /-- A generic element. Attributes and children default to empty so call sites
     stay terse. -/
 def el (tag : String) (attrs : List (Attr msg) := []) (children : List (Html msg) := []) :

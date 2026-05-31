@@ -414,7 +414,17 @@ the last one, and patches *only* the bits that actually changed. Notice what tha
 buys you: the input you're typing in is never rebuilt, so your cursor, your text
 selection, and your scroll position all survive the update. And this isn't
 hand-waving — `diff_apply` is a theorem that says the patched DOM equals the new
-view, exactly.
+view, exactly. The keyed reconcile is `O(n)` (a key→index `HashMap`, not a per-row
+scan), so a 20k-row list diffs in single-digit milliseconds.
+
+When a subtree is genuinely expensive and you know what it depends on, wrap it in
+`lazy "key" subtree` — React's `useMemo`/`shouldComponentUpdate`, as data. When the
+key is unchanged the diff emits a `lazyReuse` and the driver skips that subtree
+entirely (no re-diff, no DOM touch). Here the airtight `diff_apply` stays exactly
+that — the patch carries the new subtree, so the *model* is exact; the one thing
+trusted is the driver eliding DOM work on your promise that equal key ⇒ equal
+subtree, a single line you can read in `Qed/Driver.lean`. `Examples/Bench.lean`
+(`lake exe bench`) measures both paths.
 
 Remember the bit about `update` staying pure? It returns `(model, Cmd)`, and the
 driver runs the `Cmd` *after* the render — a `Cmd.stream` kicks off a streaming
@@ -456,7 +466,7 @@ muscle memory you've got. When you're hacking on the framework itself, the in-re
 | `Qed/Notation.lean` | The readable view combinators (`div`, `button`, `onClick`, …). |
 | `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`, `routed`), the `Cmd` effects (storage, navigation, clipboard, focus, `after`, `setTitle`, `randomInt`, files, `getJson`/`stream`, `batch`) and the `port`/`onPort` escape hatch, local-state components (`LocalDef`, `localMount`, `App.locals`), and the pure render-to-HTML. |
 | `Qed/Invariant.lean` | The `invariant … preserved_by …` command (it discharges the proof for you). |
-| `Qed/Diff.lean` | The diff/patch engine — positional reconcile (add/remove) and keyed reconcile (reorder by `key`) — plus the `diff_apply` correctness proof. |
+| `Qed/Diff.lean` | The diff/patch engine — positional reconcile (add/remove), `O(n)` keyed reconcile (reorder by `key`), and `lazy` subtree memoization — plus the `diff_apply` correctness proof. |
 | `Qed/Json.lean` | The full JSON parser/renderer + `jsonStruct`/`jsonCodec`, with the `parse_depth_le` & `parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law baked in as a field), the `router` command, and `toURL`/`fromURL` for the browser. |
 | `Qed/Form.lean` | Typed refinement fields (`Field p`), the `Input` controls (text/number/checkbox/date/select/radios), and the `form` command (Draft + `parse` + `formView` + the `canSubmit_iff` proof). |

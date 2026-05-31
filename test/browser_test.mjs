@@ -70,6 +70,17 @@ try {
         await page.$eval('#app input', (el) => el.value), 'hello world');
   check('input KEEPS its cursor position',
         await page.$eval('#app input', (el) => el.selectionStart), 1);
+
+  // Html.lazy: the banner's key never changes, so the diff emits a lazyReuse and the
+  // driver skips it. Tag its DOM node and confirm it survives many updates untouched.
+  check('lazy banner rendered', await page.$eval('#banner', (el) => el.textContent), 'built once, then memoized');
+  await page.evaluate(() => { document.getElementById('banner').dataset.mark = 'memoized-node'; });
+  await page.evaluate(() => window.qed.dispatch(1)); await sleep(20);   // increment
+  await page.evaluate(() => window.qed.dispatch(0)); await sleep(20);   // decrement
+  await page.evaluate(() => window.qed.dispatch(2)); await sleep(20);   // reset
+  check('lazy subtree skipped — its DOM node survived every update',
+        await page.$eval('#banner', (el) => el.dataset.mark), 'memoized-node');
+  check('count still updated around the memoized subtree', await count(), '0');
 } finally {
   await browser.close();
   server.kill('SIGTERM');

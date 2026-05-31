@@ -435,6 +435,7 @@ mutual
         let (attrStr,  hs1) := renderAttrs hs (normalizeAttrs attrs)
         let (childStr, hs2) := renderChildren hs1 children
         (s!"<{tag}{attrStr}>{childStr}</{tag}>", hs2)
+    | .lazy _ sub => renderNode hs sub   -- transparent for the string renderer
   /-- Render a list of children, threading the handler table. -/
   def renderChildren (hs : Array msg) : List (Html msg) → String × Array msg
     | []      => ("", hs)
@@ -457,6 +458,7 @@ def Html.render (h : Html msg) : String := (renderNode #[] h).1
     or hydrate; it is for first paint and no-JS rendering. -/
 partial def renderWithLocals {m : Type} (locals : List LocalDef) : Html m → String
   | .text s => escapeHtml s
+  | .lazy _ sub => renderWithLocals locals sub
   | .element tag attrs children =>
       let attrStr := (renderAttrs #[] (normalizeAttrs attrs)).1
       let local?  := attrs.findSome? (fun | .localCell _ comp init _ => some (comp, init) | _ => none)

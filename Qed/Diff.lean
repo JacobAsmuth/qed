@@ -65,6 +65,10 @@ mutual
         the child list from `steps` (each names an old child to reuse, or a new one
         to create), in the new order. -/
     | patchKeyed (attrs : List (Attr msg)) (steps : List (KeyedStep msg))
+    /-- Two `lazy` nodes shared a key: the content is unchanged, so the driver keeps the
+        old DOM. Carries the new node (`lazy key sub`) so the *pure* model still produces
+        it exactly — only the driver elides the work. -/
+    | lazyReuse (key : String) (sub : Html msg)
   /-- How to turn one list of children into another, walking them in parallel. -/
   inductive ChildPatch (msg : Type) where
     /-- Patch the next old child with `p`, then continue with the rest. -/
@@ -94,6 +98,9 @@ mutual
           if childrenKeyed c₂ then .patchKeyed a₂ (diffKeyed c₁.toArray (keyIndex c₁) c₂)
           else .patchElement a₂ (diffChildren c₁ c₂)
         else .replace (.element t₂ a₂ c₂)
+    | .lazy k₁ _,       .lazy k₂ s₂      =>
+        -- same key ⇒ unchanged: skip without diffing `s₂`; else rebuild it
+        if k₁ = k₂ then .lazyReuse k₂ s₂ else .replace (.lazy k₂ s₂)
     | _,                b                 => .replace b
   /-- Positional reconcile: a pairwise-patched prefix, then append the surplus new
       children or drop the surplus old ones. -/
@@ -123,6 +130,7 @@ mutual
     | .setText s,               _                       => .text s
     | .patchElement attrs kids, .element tag _ children => .element tag attrs (applyChildren kids children)
     | .patchKeyed attrs steps,  .element tag _ children => .element tag attrs (applyKeyed steps children)
+    | .lazyReuse key sub,       _                       => .lazy key sub
     | .patchElement _ _,        h                       => h
     | .patchKeyed _ _,          h                       => h
   /-- Apply a positional child-list patch to a list of children. -/
@@ -154,6 +162,13 @@ mutual
           · simp only [applyPatch]; rw [diffKeyed_apply c₁ c₂]
           · simp only [applyPatch]; rw [diffChildren_apply c₁ c₂]
         · simp only [applyPatch]
+    -- a `lazyReuse` (same key) and a `replace` (different key) both yield the new node,
+    -- so the model is exact either way — no appeal to the equal-key promise here.
+    | .lazy _ _,         .lazy _ _         => by simp only [diff]; split <;> simp [applyPatch]
+    | .lazy _ _,         .text _           => by simp [diff, applyPatch]
+    | .lazy _ _,         .element _ _ _    => by simp [diff, applyPatch]
+    | .text _,           .lazy _ _         => by simp [diff, applyPatch]
+    | .element _ _ _,    .lazy _ _         => by simp [diff, applyPatch]
   /-- The positional child-list analogue. Holds for child lists of any lengths. -/
   theorem diffChildren_apply :
       ∀ (as bs : List (Html msg)), applyChildren (diffChildren as bs) as = bs

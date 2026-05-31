@@ -17,6 +17,7 @@
 import Qed.Runtime
 import Qed.Diff
 import Qed.Dom
+import Qed.View
 import Std.Data.HashMap
 
 namespace Qed
@@ -199,6 +200,144 @@ partial def applyChildrenToDom (h : Handlers msg) (node : Dom.Node) (i : UInt32)
       -- because each removal shifts the next child down into index `i`.
       let count ← Dom.childCount node
       for _ in [i.toNat:count.toNat] do Dom.removeChild node i
+end
+
+/-! ### Fine-grained template runtime
+
+    A `View` template is built into DOM *once*; thereafter only the dynamic projections
+    re-run. `VState` is the runtime mirror of a rendered template — it holds the DOM
+    handle of each node plus the last value of each dynamic binding, so an update walks
+    the *template* (constant size — the view code, not the data) and touches only the DOM
+    nodes whose projection changed. No new `Html` tree is built and no tree is diffed for
+    the scalar parts; that is the fine-grained win. Structure that changes shape
+    (`showIf`, `keyedList`) reconciles through the **verified** `diff`/`applyToDom`, so
+    the trusted surface does not grow. -/
+
+/-- Does this attribute carry an event handler (so it must be re-registered each update
+    to keep the handler table in sync), as opposed to a value/class/flag that is set
+    once and only re-touched when it changes? -/
+def Attr.isEvent : Attr msg → Bool
+  | .onClick _ | .onInput _ | .onCheck _ | .onKeydown _ | .onKeyup _
+  | .onSubmit _ | .onBlur _ | .onFocus _ => true
+  | _ => false
+
+/-- The runtime mirror of a rendered `View` node: built *once*, then mutated in place
+    through `IO.Ref`s so an update allocates nothing for the scalar skeleton (the whole
+    point — a functional rebuild would re-allocate an O(n) tree every update, exactly the
+    cost the template is meant to avoid). It holds each node's DOM handle plus whatever
+    the update must remember: a dynamic text's last value, a conditional's current branch,
+    a keyed list's last rows for the next diff. -/
+inductive VState (σ : Type) (msg : Type) where
+  /-- A static text node — never updated. -/
+  | text (node : Dom.Node)
+  /-- A dynamic text node and a cell holding the last value written to it. -/
+  | dyn (node : Dom.Node) (last : IO.Ref String)
+  /-- An element and the (fixed) states of its children, walked in lockstep. -/
+  | elem (node : Dom.Node) (kids : Array (VState σ msg))
+  /-- A conditional slot, identified by its index into the driver's external `condCells`
+      array (which holds the mutable `shown?`/inner state — kept off this inductive
+      because a recursive `IO.Ref (… VState …)` field is not a legal occurrence). -/
+  | cond (cell : Nat)
+  /-- A keyed-list container and a cell of the last rows rendered into it (diffed against
+      the next render through the verified keyed reconcile). -/
+  | list (node : Dom.Node) (rows : IO.Ref (List (Html msg)))
+  /-- An opaque embedded `Html` subtree (`View.static`) — not fine-grained-updated. -/
+  | stat (node : Dom.Node)
+
+instance : Inhabited (VState σ msg) := ⟨.text 0⟩
+
+/-- The mutable state of every `showIf` slot, external to `VState` (so the inductive has
+    no recursive-ref field): `(shown?, inner state when shown)`, indexed by `VState.cond`. -/
+abbrev CondCells (σ msg : Type) := IO.Ref (Array (Bool × Option (VState σ msg)))
+
+mutual
+/-- Build a template into DOM once, returning the root node and its `VState` mirror.
+    Events register into the handler tables exactly as `buildDom` does, so the JS
+    delegation works identically. `cells` accumulates one entry per `showIf`. -/
+partial def buildView (h : Handlers msg) (cells : CondCells σ msg) :
+    View σ msg → σ → IO (Dom.Node × VState σ msg)
+  | .text s,          _ => do let n ← Dom.createText s; return (n, .text n)
+  | .dyn get,         s => do
+      let v := get s; let n ← Dom.createText v; let r ← IO.mkRef v
+      return (n, .dyn n r)
+  | .static html,     _ => do let n ← buildDom h html; return (n, .stat n)
+  | .element tag attrs kids, s => do
+      let node ← Dom.createElement tag
+      applyAttrs h node (attrs.map (VAttr.eval s))
+      let mut ks : Array (VState σ msg) := #[]
+      for k in kids do
+        let (kn, kst) ← buildView h cells k s
+        Dom.appendChild node kn
+        ks := ks.push kst
+      return (node, .elem node ks)
+  | .showIf cond child, s => do
+      -- reserve this slot's cell first, so the child's own slots get later indices
+      let idx := (← cells.get).size
+      cells.modify (·.push (false, none))
+      if cond s then
+        let (cn, cst) ← buildView h cells child s
+        cells.modify (·.set! idx (true, some cst))
+        return (cn, .cond idx)
+      else
+        let n ← Dom.createText ""
+        return (n, .cond idx)
+  | .keyedList tag attrs rows, s => do
+      let node ← Dom.createElement tag
+      applyAttrs h node (attrs.map (VAttr.eval s))
+      let rs := rows s
+      for r in rs do Dom.appendChild node (← buildDom h r)
+      return (node, .list node (← IO.mkRef rs))
+
+/-- Walk the template against the new scope, mutating leaf cells and patching only what
+    changed. `parent`/`index` locate the current node for the one case that replaces it (a
+    `showIf` flip). Events are re-registered in pre-order (matching how the DOM ids were
+    assigned at build), so the handler tables stay consistent without rebuilding the tree. -/
+partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
+    (parent : Dom.Node) (index : UInt32) :
+    View σ msg → σ → VState σ msg → IO Unit
+  | .dyn get, s, .dyn node last => do
+      let v := get s
+      if v != (← last.get) then Dom.setText node v; last.set v
+  | .element _ attrs kids, s, .elem node kstates => do
+      -- re-register events (table stays in sync); re-apply dynamic attrs; leave static
+      -- values alone (set once at build)
+      for va in attrs do
+        let a := VAttr.eval s va
+        match va with
+        | .bind _ => applyAttr h node a
+        | .stat _ => if a.isEvent then applyAttr h node a else pure ()
+      let mut i : UInt32 := 0
+      for k in kids do
+        patchView h cells node i k s (kstates.getD i.toNat default)
+        i := i + 1
+  | .showIf cond child, s, .cond idx => do
+      let (shown, inner) := (← cells.get).getD idx (false, none)
+      let now := cond s
+      if now == shown then
+        match inner with
+        | some ist => patchView h cells parent index child s ist
+        | none     => pure ()
+      else if now then do
+        let (cn, cst) ← buildView h cells child s   -- hidden → shown: install the child
+        Dom.replaceChild parent index cn
+        cells.modify (·.set! idx (true, some cst))
+      else do
+        let n ← Dom.createText ""                   -- shown → hidden: empty the slot
+        Dom.replaceChild parent index n
+        cells.modify (·.set! idx (false, none))
+  | .keyedList tag attrs rows, s, .list node lastRows => do
+      -- structural reconcile through the verified diff: same tag/attrs, children diffed
+      let evAttrs := attrs.map (VAttr.eval s)
+      let newRows := rows s
+      applyToDom h parent index node
+        (diff (.element tag evAttrs (← lastRows.get)) (.element tag evAttrs newRows))
+      lastRows.set newRows
+  | .text _,   _, _ => pure ()
+  | .static _, _, _ => pure ()
+  | v, s, _ => do
+      -- template/state shape disagree (should not happen): rebuild this node
+      let (n, _) ← buildView h cells v s
+      Dom.replaceChild parent index n
 end
 
 /-- Everything the local-component runtime threads around: the registry of declared
@@ -390,9 +529,11 @@ def qedPortRecv (name payload : String) : IO Unit := do
     and runs the startup effect; thereafter each message updates the model, diffs
     the new view against the previous one, patches the difference, and interprets
     the requested effect (which may dispatch further messages over time). -/
-def run (app : App Model Msg) : IO Unit := do
+def run (app : App Model Msg) (template : Option (View Model Msg) := none) : IO Unit := do
   let modelRef ← IO.mkRef app.init.1
   let treeRef  ← IO.mkRef (none : Option (Html Msg))
+  let vstateRef ← IO.mkRef (none : Option (VState Model Msg))
+  let condCells ← IO.mkRef (#[] : Array (Bool × Option (VState Model Msg)))
   let rootRef  ← IO.mkRef (0 : Dom.Node)
   let clickRef ← IO.mkRef (#[] : Array Msg)
   let inputRef ← IO.mkRef (#[] : Array (String → Msg))
@@ -427,19 +568,29 @@ def run (app : App Model Msg) : IO Unit := do
       instancesRef.modify (·.erase k); storeRef.modify (·.erase k)
   let renderModel : IO Unit := do
     clickRef.set #[]; inputRef.set #[]
-    let newTree := app.view (← modelRef.get)
-    (match ← treeRef.get with
-     | none => do
-         let node ← buildDom h newTree
-         Dom.mountRoot node; rootRef.set node
-     | some oldTree => do
-         let root ← rootRef.get
-         match diff oldTree newTree with
-         | .replace newH => do
-             let node ← buildDom h newH
+    match template with
+    | some t => do
+        -- Fine-grained path: build once, thereafter walk the template and patch only
+        -- the bindings whose projection changed (no new tree, no diff for the scalars).
+        match ← vstateRef.get with
+        | none => do
+            let (node, vst) ← buildView h condCells t (← modelRef.get)
+            Dom.mountRoot node; rootRef.set node; vstateRef.set (some vst)
+        | some vst => patchView h condCells (← rootRef.get) 0 t (← modelRef.get) vst
+    | none => do
+        let newTree := app.view (← modelRef.get)
+        (match ← treeRef.get with
+         | none => do
+             let node ← buildDom h newTree
              Dom.mountRoot node; rootRef.set node
-         | patch => applyToDom h root 0 root patch)
-    treeRef.set (some newTree)
+         | some oldTree => do
+             let root ← rootRef.get
+             match diff oldTree newTree with
+             | .replace newH => do
+                 let node ← buildDom h newH
+                 Dom.mountRoot node; rootRef.set node
+             | patch => applyToDom h root 0 root patch)
+        treeRef.set (some newTree)
     gcLocals
   -- Interpret one leaf effect. `batch` is flattened away by `Cmd.flatten` first, so
   -- this stays non-recursive (no termination obligation through `List.forM`).

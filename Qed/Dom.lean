@@ -126,4 +126,9 @@ opaque effectResult (kind a b : String) (id : UInt32) : IO Unit
 @[extern "qed_dom_port_send"]
 opaque portSend (name payload : String) : IO Unit
 
+/-- Bind `node`'s text to the signal `name`: register it so a later `setSignal` updates
+    it, and set its text to the signal's current value. -/
+@[extern "qed_dom_bind_signal"]
+opaque bindSignal (node : Node) (name : String) : IO Unit
+
 end Qed.Dom

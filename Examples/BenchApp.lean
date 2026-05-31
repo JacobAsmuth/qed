@@ -20,12 +20,13 @@ structure Row where
 deriving Inhabited
 
 structure Model where
-  rows    : Array Row
-  useLazy : Bool        -- toggle: wrap each row in `lazy` (memoize on its content)
+  rows      : Array Row
+  useLazy   : Bool        -- toggle: wrap each row in `lazy` (memoize on its content)
+  useSignal : Bool        -- toggle: render each row's value with a `signalText`
 
-def init : Model := { rows := #[], useLazy := false }
+def init : Model := { rows := #[], useLazy := false, useSignal := false }
 
-inductive Msg | create | update | swap | reverse | clear | toggle
+inductive Msg | create | update | swap | reverse | clear | toggle | toggleSignal
 
 def labelFor (i : Nat) : String := s!"item {i} · the quick brown fox"
 
@@ -39,7 +40,8 @@ def update (m : Model) : Msg → Model
       else m
   | .reverse => { m with rows := m.rows.reverse }
   | .clear   => { m with rows := #[] }
-  | .toggle  => { m with useLazy := !m.useLazy }
+  | .toggle       => { m with useLazy := !m.useLazy }
+  | .toggleSignal => { m with useSignal := !m.useSignal }
 
 def rowView (r : Row) : Html Msg :=
   li [key (toString r.id), cls "row"] [span [cls "lbl"] [r.label], span [cls "id"] [toString r.id]]
@@ -47,6 +49,11 @@ def rowView (r : Row) : Html Msg :=
 -- the same row, memoized: `lazy`'s key tracks the content, while the inner `li` keeps the
 -- stable reconcile key. An update skips every unchanged row's subtree entirely.
 def rowViewLazy (r : Row) : Html Msg := lazy s!"{r.id}:{r.label}" (rowView r)
+
+-- the row's value as a signal: structure renders once; `setSignal "r<id>" v` updates the
+-- one bound node directly, no diff at all.
+def rowViewSignal (r : Row) : Html Msg :=
+  li [key (toString r.id), cls "row"] [signalText s!"r{r.id}"]
 
 def view (m : Model) : Html Msg :=
   div [] [
@@ -56,9 +63,11 @@ def view (m : Model) : Html Msg :=
       button [onClick .swap]    "swap",
       button [onClick .reverse] "reverse",
       button [onClick .clear]   "clear",
-      button [onClick .toggle]  "lazy"
+      button [onClick .toggle]       "lazy",
+      button [onClick .toggleSignal] "signal"
     ],
-    ul [attr "id" "list"] (m.rows.map (fun r => if m.useLazy then rowViewLazy r else rowView r)).toList
+    ul [attr "id" "list"] (m.rows.map
+      (fun r => if m.useSignal then rowViewSignal r else if m.useLazy then rowViewLazy r else rowView r)).toList
   ]
 
 def app : App Model Msg := sandbox init update view

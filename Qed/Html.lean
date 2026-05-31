@@ -55,6 +55,13 @@ inductive Attr (msg : Type) where
       type-safe channel by which a self-contained child event can still reach the root
       `update`. The host renders empty; the driver fills its children from local state. -/
   | localCell (key component : String) (init? : Option String) (bubble : String → Option msg)
+  /-- Bind this element's text content to a named *signal* (fine-grained reactivity). The
+      signal's value lives in the driver, not the model; `Cmd.setSignal name v` (or
+      `window.qed.setSignal(name, v)` from JS) updates *only* the bound elements — no
+      `update`, no diff, no tree walk — so a high-frequency or external value (a clock, a
+      socket feed) updates in O(bindings). The element's `Html` children are owned by the
+      signal, so leave them empty. -/
+  | signalBind (name : String)
 
 /-- A typed virtual-DOM node. Note this inductive is *total*: there is no
     constructor for "failed render", so a well-typed `view` cannot crash. -/
@@ -99,6 +106,7 @@ def Attr.map (f : α → β) : Attr α → Attr β
   -- Only the bubble carries `msg`; the child's own view/messages live in the driver,
   -- so relabelling the parent never has to recurse into the local subtree (total).
   | .localCell k c i b => .localCell k c i (fun s => (b s).map f)
+  | .signalBind name   => .signalBind name
 
 mutual
   /-- Remap the message type of a whole tree — the basis of component

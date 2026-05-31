@@ -431,26 +431,38 @@ How does that stack up against React? `test/bench_react.mjs` runs Qed (WASM) and
 10,000-row list, identical operations, timing the synchronous reconcile+patch (median of
 15). On one laptop:
 
-| 10,000 rows | Qed (wasm) | React | React.memo |
+| 10,000 rows, change every 10th | Qed (wasm) | React | React.memo |
 |---|---|---|---|
 | create | **84 ms** | 89 ms | 88 ms |
-| update every 10th | 92 ms · **35 ms** w/ `lazy` | **5 ms** | **2 ms** |
-| swap two | 136 ms | **116 ms** | 123 ms |
-| reorder all | 139 ms | **109 ms** | 125 ms |
+| swap two | 138 ms | **113 ms** | 112 ms |
+| reorder all | 140 ms | 113 ms | **110 ms** |
+| update — plain | 95 ms | 5 ms | 2 ms |
+| update — `lazy` rows | 37 ms | 5 ms | 2 ms |
+| update — `signal` rows | **0.8 ms** | 5 ms | 2 ms |
 
-Qed is in the same ballpark as React on the ops where both have to touch the whole list —
-create, swap, reorder. The interesting one is `update` (change every 10th row's text),
+Qed is in the same ballpark as React on the ops where both have to touch the whole list
+(create, swap, reorder). `update` (change every 10th row's text) is the interesting one,
 and the benchmark is worth as much for *why* as for the score. React commits only the
-~1,000 text nodes that changed; Qed's keyed applier originally walked all 10,000 children
-(a `childAt` + `insertBefore` each, every one a WASM↔JS call). Two fixes got `update` from
-132 ms down to 92, then 35: a driver fast-path that skips the snapshot and per-child move
-when nothing reordered, and `lazy` rows, where unchanged rows are skipped outright and a
-changed row patches its content in place (`lazyPatch`) rather than rebuilding. The
-remaining gap to React is the keyed reconcile still *visiting* all 10,000 children in
-WASM, plus the per-DOM-op FFI tax — real, and the next thing to chip at. Run it yourself:
-`node test/bench_react.mjs` (it vendors React on first run). One thing this shook out: the
-diff recurses one stack frame per child, so the default 64 KB WASM stack overflowed on big
-lists — the build now reserves 16 MB.
+~1,000 text nodes that changed; Qed's keyed applier originally walked all 10,000 (a
+`childAt` + `insertBefore` each, every one a WASM↔JS call), so plain `update` was ~20×
+slower. A driver fast-path (skip the snapshot + per-child move when nothing reordered) and
+`lazy` rows (skip unchanged rows outright; `lazyPatch` a changed one in place) took it to
+37 ms — but the keyed reconcile still *visits* all 10,000.
+
+The way to stop visiting them is to stop diffing — **signals**. `signalText "name"` binds
+an element's text to a driver-side value; `Cmd.setSignal name v` (or
+`window.qed.setSignal(name, v)` from outside the app) writes straight to the bound node —
+no message, no `update`, no diff, no tree walk. With per-row signals, updating 1,000 rows
+is 1,000 direct writes: **0.8 ms, faster than React**, because there's no reconcile at all.
+The trade is that a signal's value lives in the driver, not the model, so it's pushed
+imperatively — the right tool for high-frequency or externally-fed values (a clock, a
+socket, a progress bar) sitting *alongside* the pure model+update loop, not replacing it.
+`Examples/Signals.lean` is the demo; `test/signals_test.mjs` proves a `setSignal` updates
+only its node and never re-renders.
+
+Run it yourself: `node test/bench_react.mjs` (it vendors React on first run). One thing
+this shook out: the diff recurses one stack frame per child, so the default 64 KB WASM
+stack overflowed on big lists — the build now reserves 16 MB.
 
 Remember the bit about `update` staying pure? It returns `(model, Cmd)`, and the
 driver runs the `Cmd` *after* the render — a `Cmd.stream` kicks off a streaming

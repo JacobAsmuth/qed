@@ -21,6 +21,8 @@
 EM_JS(void, qed_js_init, (void), {
   if (!globalThis.__qed) globalThis.__qed = {};
   if (!globalThis.__qed.nodes) globalThis.__qed.nodes = [null]; /* index 0 reserved */
+  if (!globalThis.__qed.sig) globalThis.__qed.sig = new Map();      /* signal name → element */
+  if (!globalThis.__qed.sigVals) globalThis.__qed.sigVals = new Map(); /* signal name → value */
 });
 
 EM_JS(int, qed_js_create_element, (const char *tag), {
@@ -169,6 +171,17 @@ EM_JS(void, qed_js_effect_result, (const char *kind, const char *a, const char *
 EM_JS(void, qed_js_port_send, (const char *name, const char *payload), {
   var p = globalThis.__qed && globalThis.__qed.ports && globalThis.__qed.ports[UTF8ToString(name)];
   if (p) p(UTF8ToString(payload));
+});
+
+/* Bind an element to a signal: remember it under `name` and show the current value. */
+EM_JS(void, qed_js_bind_signal, (int node, const char *name), {
+  var el = globalThis.__qed.nodes[node];
+  if (!el) return;
+  var n = UTF8ToString(name);
+  globalThis.__qed.sig.set(n, el);
+  el.setAttribute('data-qed-signal', n);
+  var v = globalThis.__qed.sigVals.get(n);
+  if (v !== undefined && el.textContent !== v) el.textContent = v;
 });
 
 /* ---- @[extern] implementations (signatures per generated C) -------------- */
@@ -323,6 +336,13 @@ LEAN_EXPORT lean_object *qed_dom_port_send(lean_object *name, lean_object *paylo
   (void) world;
   qed_js_port_send(lean_string_cstr(name), lean_string_cstr(payload));
   lean_dec(name); lean_dec(payload);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *qed_dom_bind_signal(uint32_t node, lean_object *name, lean_object *world) {
+  (void) world;
+  qed_js_bind_signal((int) node, lean_string_cstr(name));
+  lean_dec(name);
   return lean_io_result_mk_ok(lean_box(0));
 }
 

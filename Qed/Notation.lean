@@ -76,6 +76,14 @@ def onFocus (m : msg) : Attr msg := .onFocus m
     instead of reconciling positionally. Reconciliation-only; never rendered. -/
 def key (k : String) : Attr msg := .key k
 
+/-- Bind an element's text to a named signal (fine-grained reactivity). The element's
+    text is driven by `Cmd.setSignal name v` / `window.qed.setSignal(name, v)`, which
+    updates only the bound elements — no `update`, no diff. Keep its children empty. -/
+def signalBind (name : String) : Attr msg := .signalBind name
+
+/-- A `<span>` whose text is a named signal — the common case of `signalBind`. -/
+def signalText (name : String) : Html msg := el "span" [signalBind name] []
+
 /-- Typed string attributes — typos in the key become compile errors. -/
 def value       (v : String) : Attr msg := .attr "value" v
 def placeholder (v : String) : Attr msg := .attr "placeholder" v

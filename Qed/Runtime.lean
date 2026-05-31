@@ -145,6 +145,10 @@ def Cmd.cancel (key : String) : Cmd msg := .fx "timer.cancel" key "" ""
 /-! **Document title.** -/
 def Cmd.setTitle (title : String) : Cmd msg := .fx "document.title" title "" ""
 
+/-! **Signals** (fine-grained reactivity). Set a named signal's value; every element bound
+    to it (`signalBind`/`signalText`) updates its text directly — no `update`, no diff. -/
+def Cmd.setSignal (name value : String) : Cmd msg := .fx "signal.set" name value ""
+
 /-! **Randomness** — `update` is pure, so a random draw must come from an effect.
     Dispatches a uniform integer in `[lo, hi]`. -/
 def Cmd.randomInt (lo hi : Int) (onInt : Int → msg) : Cmd msg :=
@@ -417,6 +421,7 @@ def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .onBlur m    => (s!" data-qed-blur=\"{hs.size}\"", hs.push m)
   | .onFocus m   => (s!" data-qed-focus=\"{hs.size}\"", hs.push m)
   | .localCell key comp _ _ => (s!" data-qed-local=\"{escapeHtml (localKey comp key)}\"", hs)   -- marks the host; the driver fills it
+  | .signalBind name        => (s!" data-qed-signal=\"{escapeHtml name}\"", hs)                 -- driver binds its text to the signal
 
 /-- Render a list of attributes left-to-right, threading the handler table. -/
 def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg

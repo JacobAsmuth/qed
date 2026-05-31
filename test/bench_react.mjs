@@ -71,6 +71,18 @@ try {
     await page.evaluate(() => window.qed.dispatch(5));
     await page.evaluate(() => window.qed.dispatch(0));
     results['qed-lazy'] = { update: await bench(() => t(1), REPS, null) };
+    // signal rows: toggle on (id 6), re-create, seed signals, then time update via
+    // setSignal — no message, no diff, just the bound DOM nodes.
+    await page.evaluate(() => window.qed.dispatch(6));
+    await page.evaluate(() => window.qed.dispatch(0));
+    await page.evaluate(() => { for (let i = 1; i <= 10000; i++) window.qed.setSignal('r' + i, 'item ' + i); });
+    const sigUpdate = () => page.evaluate(() => {
+      window.__tick = (window.__tick || 0) + 1;
+      const t0 = performance.now();
+      for (let i = 1; i <= 10000; i += 10) window.qed.setSignal('r' + i, 'item ' + i + ' ' + window.__tick);
+      return performance.now() - t0;
+    });
+    results['qed-signal'] = { update: await bench(sigUpdate, REPS, null) };
     await page.close();
   }
   // ---- React (plain, then memo) ----
@@ -101,7 +113,9 @@ for (const op of ops) {
   console.log('  ' + op.padEnd(10) + cols.map(([k]) => fmt(results[k][op]).padStart(13)).join(''));
 }
 console.log('  ' + 'update+lazy'.padEnd(10) + fmt(results['qed-lazy'].update).padStart(13) +
-  '       (Qed with lazy rows vs ' + fmt(results['react-memo'].update).trim() + ' React.memo)');
+  '       (Qed lazy rows)');
+console.log('  ' + 'update+sig'.padEnd(10) + fmt(results['qed-signal'].update).padStart(13) +
+  '       (Qed signals — fine-grained, no diff; React.memo is ' + fmt(results['react-memo'].update).trim() + ')');
 console.log('');
 console.log(JSON.stringify(results));
 process.exit(0);

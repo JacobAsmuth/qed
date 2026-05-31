@@ -90,18 +90,19 @@ def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
       -- component (idempotent — a re-render won't remount it).
       Dom.setAttribute node "data-qed-local" (localKey comp key)
       h.mountLocal key comp init bubble node
+  | .signalBind name => Dom.bindSignal node name   -- bind text to the signal; setSignal updates it
 
 /-- Apply a (normalized) attribute list, so the live DOM matches what `render`
     would produce — classes merged, duplicate keys collapsed. -/
 def applyAttrs (h : Handlers msg) (node : Dom.Node) (attrs : List (Attr msg)) : IO Unit := do
   for a in normalizeAttrs attrs do applyAttr h node a
 
-/-- Does this element host a local component? Its children are owned by the driver
-    (filled from local state), so the parent's diff must not reconcile them — an
-    empty `Html` child list is vacuously "keyed", and the keyed applier would treat
-    the injected subtree as surplus and drop it. -/
-def hostsLocal (attrs : List (Attr msg)) : Bool :=
-  attrs.any (fun | .localCell .. => true | _ => false)
+/-- Are this element's children owned by the driver — a local component (filled from
+    local state) or a signal (its text)? Then the parent's diff must not reconcile them:
+    an empty `Html` child list is vacuously "keyed", and the keyed applier would treat the
+    driver-managed child as surplus and drop it. -/
+def ownsChildren (attrs : List (Attr msg)) : Bool :=
+  attrs.any (fun | .localCell .. => true | .signalBind .. => true | _ => false)
 
 /-- Are the keyed steps a pure in-place update — every step a `reuse` whose old index
     equals its position (nothing moved, nothing created)? Then the children stay put, so
@@ -118,7 +119,7 @@ partial def buildDom (h : Handlers msg) : Html msg → IO Dom.Node
   | .element tag attrs children => do
       let node ← Dom.createElement tag
       applyAttrs h node attrs          -- a local host's children are added here, by mountLocal
-      unless hostsLocal attrs do
+      unless ownsChildren attrs do
         for c in children do
           Dom.appendChild node (← buildDom h c)
       return node
@@ -144,10 +145,10 @@ partial def applyToDom (h : Handlers msg)
       -- not touched, so a typed input keeps its caret) and a toggled-off `flag`
       -- removes its key. node identity — hence focus/cursor — is preserved.
       applyAttrs h node attrs
-      unless hostsLocal attrs do applyChildrenToDom h node 0 kids
+      unless ownsChildren attrs do applyChildrenToDom h node 0 kids
   | .patchKeyed attrs steps => do
       applyAttrs h node attrs
-      if hostsLocal attrs then return    -- driver owns this host's children; leave them
+      if ownsChildren attrs then return    -- driver owns this host's children; leave them
       let oldCount ← Dom.childCount node
       -- Fast path: nothing moved or was added/removed (an `update`, not a reorder). Patch
       -- each child where it sits — no snapshot, no insertBefore — and skip those whose

@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>React bench</title></head>
+<body>
+  <div id="root"></div>
+  <script src="vendor/react.production.min.js"></script>
+  <script src="vendor/react-dom.production.min.js"></script>
+  <script>
+    // A keyed list identical in structure to Examples/BenchApp.lean's view:
+    //   ul#list > li[key].row > [span.lbl, span.id]
+    // and the identical operations, exposed on window.__bench so the harness can time
+    // each one synchronously (flushSync). A `?memo` query swaps in React.memo'd rows,
+    // the counterpart to Qed's Html.lazy.
+    const h = React.createElement;
+    const useMemo = (window.location.search.indexOf('memo') >= 0);
+
+    let Row = function Row({ r }) {
+      return h('li', { className: 'row' },
+        h('span', { className: 'lbl' }, r.label),
+        h('span', { className: 'id' }, String(r.id)));
+    };
+    if (useMemo) Row = React.memo(Row);
+
+    let setRows;
+    function App() {
+      const [rows, _set] = React.useState([]);
+      setRows = _set;
+      return h('ul', { id: 'list' }, rows.map((r) => h(Row, { key: r.id, r })));
+    }
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    ReactDOM.flushSync(() => root.render(h(App)));
+
+    let rows = [];
+    const set = (next) => { rows = next; ReactDOM.flushSync(() => setRows(next)); };
+    const labelFor = (i) => 'item ' + i + ' · the quick brown fox';
+
+    window.__bench = {
+      create() { set(Array.from({ length: 10000 }, (_, i) => ({ id: i + 1, label: labelFor(i + 1) }))); },
+      update() { set(rows.map((r, i) => (i % 10 === 0 ? { id: r.id, label: r.label + ' !' } : r))); },
+      swap() {
+        if (rows.length > 4) {
+          const a = rows.slice();
+          const t = a[1]; a[1] = a[a.length - 2]; a[a.length - 2] = t;
+          set(a);
+        }
+      },
+      reverse() { set(rows.slice().reverse()); },
+      clear() { set([]); },
+      ready: true,
+    };
+  </script>
+</body>
+</html>

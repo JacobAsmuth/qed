@@ -81,6 +81,10 @@ try {
   check('lazy subtree skipped — its DOM node survived every update',
         await page.$eval('#banner', (el) => el.dataset.mark), 'memoized-node');
   check('count still updated around the memoized subtree', await count(), '0');
+  // a lazy keyed on the count: the key changes, so it patches content in place (lazyPatch)
+  await page.evaluate(() => window.qed.dispatch(1)); await sleep(20);   // increment → 1
+  check('lazy keyed on a value updates when the key changes (lazyPatch)',
+        await page.$eval('#echo', (el) => el.textContent), 'count is 1');
 } finally {
   await browser.close();
   server.kill('SIGTERM');

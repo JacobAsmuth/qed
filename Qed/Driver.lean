@@ -103,6 +103,14 @@ def applyAttrs (h : Handlers msg) (node : Dom.Node) (attrs : List (Attr msg)) : 
 def hostsLocal (attrs : List (Attr msg)) : Bool :=
   attrs.any (fun | .localCell .. => true | _ => false)
 
+/-- Are the keyed steps a pure in-place update — every step a `reuse` whose old index
+    equals its position (nothing moved, nothing created)? Then the children stay put, so
+    the applier can patch them where they sit and skip the snapshot + per-child move. -/
+def identityReuse : Nat → List (KeyedStep msg) → Bool
+  | _, []                        => true
+  | i, .reuse oldIndex _ :: rest => oldIndex == i && identityReuse (i + 1) rest
+  | _, .create _ :: _            => false
+
 /-- Build a fresh DOM subtree from an `Html` node, returning its handle. -/
 partial def buildDom (h : Handlers msg) : Html msg → IO Dom.Node
   | .text s => Dom.createText s
@@ -128,6 +136,9 @@ partial def applyToDom (h : Handlers msg)
       -- the one place the driver trusts the developer's "equal key ⇒ equal subtree"
       -- promise rather than mirroring `applyPatch` (which would rebuild `sub`).
       pure ()
+  | .lazyPatch _ p =>
+      -- the key changed: the lazy node's DOM *is* its content's, so patch it in place
+      applyToDom h parent index node p
   | .patchElement attrs kids => do
       -- reconcile attributes in place: `setAttribute` is guarded (unchanged keys are
       -- not touched, so a typed input keeps its caret) and a toggled-off `flag`
@@ -137,9 +148,21 @@ partial def applyToDom (h : Handlers msg)
   | .patchKeyed attrs steps => do
       applyAttrs h node attrs
       if hostsLocal attrs then return    -- driver owns this host's children; leave them
-      -- Snapshot the current child handles by their original index. Handles stay
-      -- valid as the nodes move, so a `reuse i` always resolves to the same node.
       let oldCount ← Dom.childCount node
+      -- Fast path: nothing moved or was added/removed (an `update`, not a reorder). Patch
+      -- each child where it sits — no snapshot, no insertBefore — and skip those whose
+      -- subtree didn't change (`lazyReuse`). This makes such an update O(changed) DOM ops.
+      if identityReuse 0 steps && oldCount == UInt32.ofNat steps.length then
+        let mut j : UInt32 := 0
+        for step in steps do
+          match step with
+          | .reuse _ (.lazyReuse _ _) => pure ()
+          | .reuse _ p                => applyToDom h node j (← Dom.childAt node j) p
+          | .create _                 => pure ()
+          j := j + 1
+        return
+      -- General path: snapshot the current child handles by their original index. Handles
+      -- stay valid as the nodes move, so a `reuse i` always resolves to the same node.
       let mut live : Array Dom.Node := #[]
       for i in [0:oldCount.toNat] do
         live := live.push (← Dom.childAt node (UInt32.ofNat i))

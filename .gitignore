@@ -8,3 +8,4 @@
 /runtime/qed.wasm
 /runtime/__build_id
 *.olean
+test/vendor/

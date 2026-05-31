@@ -132,6 +132,10 @@ def emccArgs (cfiles : Array FilePath) (outJs : FilePath) (prod : Bool)
        "-sEXPORTED_FUNCTIONS=_main,_qed_run_init,_qed_run_dispatch,_qed_run_dispatch_str,_qed_run_stream_chunk,_qed_run_stream_done,_qed_run_http_done,_qed_run_url_changed,_qed_run_local_dispatch,_qed_run_local_dispatch_str,_qed_run_local_snapshot,_qed_run_local_restore,_qed_run_effect_done,_qed_run_port_recv,_malloc,_free",
        "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,stringToNewUTF8",
        "-sEXIT_RUNTIME=0", "-sMAIN_MODULE=2", "-sLINKABLE=0", "-sEXPORT_ALL=0",
+       -- the diff/render walk a child list with one stack frame per element; the
+       -- default 64KB wasm stack overflows on long lists, so give it room (16MB),
+       -- and start with enough memory to hold the stack-first layout.
+       "-sSTACK_SIZE=16777216", "-sINITIAL_MEMORY=33554432",
        "-sALLOW_MEMORY_GROWTH=1", "-fwasm-exceptions", "-pthread", "-flto"]
   ++ (if prod then #["-Oz"] else #[])
 
@@ -148,7 +152,7 @@ def linkWasm (outDir : FilePath) (prod : Bool) : IO Bool := do
   let allC ← collect ".lake" "c"
   -- Each of these modules carries its own `main`; link only the chosen web entry.
   let entryC := ((wr.splitOn ".").getLastD "") ++ ".c"   -- e.g. "ChatWeb.c"
-  let altMains := ["Native.c", "Cli.c", "Web.c", "ChatWeb.c", "SignupWeb.c", "BookingWeb.c", "TodoWeb.c", "UsersWeb.c", "LocalWeb.c", "EffectsWeb.c", "Bench.c"].filter (· ≠ entryC)
+  let altMains := ["Native.c", "Cli.c", "Web.c", "ChatWeb.c", "SignupWeb.c", "BookingWeb.c", "TodoWeb.c", "UsersWeb.c", "LocalWeb.c", "EffectsWeb.c", "Bench.c", "BenchAppWeb.c"].filter (· ≠ entryC)
   let cfiles := allC.filter (fun p =>
     (p.toString.splitOn "build/ir").length > 1 && (p.fileName.getD "") ∉ altMains)
   IO.FS.createDirAll outDir

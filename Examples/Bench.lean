@@ -61,6 +61,7 @@ mutual
     | .replace _          => 1
     | .setText _          => 1
     | .lazyReuse _ _      => 1
+    | .lazyPatch _ p      => 1 + patchNodes p
     | .patchElement _ k   => 1 + childNodes k
     | .patchKeyed _ steps => 1 + stepNodes steps
   def childNodes : ChildPatch msg → Nat

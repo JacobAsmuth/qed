@@ -426,6 +426,32 @@ trusted is the driver eliding DOM work on your promise that equal key ⇒ equal
 subtree, a single line you can read in `Qed/Driver.lean`. `Examples/Bench.lean`
 (`lake exe bench`) measures both paths.
 
+How does that stack up against React? `test/bench_react.mjs` runs Qed (WASM) and React
+(production build) side by side in the same headless browser — an identical keyed
+10,000-row list, identical operations, timing the synchronous reconcile+patch (median of
+15). On one laptop:
+
+| 10,000 rows | Qed (wasm) | React | React.memo |
+|---|---|---|---|
+| create | **84 ms** | 89 ms | 88 ms |
+| update every 10th | 92 ms · **35 ms** w/ `lazy` | **5 ms** | **2 ms** |
+| swap two | 136 ms | **116 ms** | 123 ms |
+| reorder all | 139 ms | **109 ms** | 125 ms |
+
+Qed is in the same ballpark as React on the ops where both have to touch the whole list —
+create, swap, reorder. The interesting one is `update` (change every 10th row's text),
+and the benchmark is worth as much for *why* as for the score. React commits only the
+~1,000 text nodes that changed; Qed's keyed applier originally walked all 10,000 children
+(a `childAt` + `insertBefore` each, every one a WASM↔JS call). Two fixes got `update` from
+132 ms down to 92, then 35: a driver fast-path that skips the snapshot and per-child move
+when nothing reordered, and `lazy` rows, where unchanged rows are skipped outright and a
+changed row patches its content in place (`lazyPatch`) rather than rebuilding. The
+remaining gap to React is the keyed reconcile still *visiting* all 10,000 children in
+WASM, plus the per-DOM-op FFI tax — real, and the next thing to chip at. Run it yourself:
+`node test/bench_react.mjs` (it vendors React on first run). One thing this shook out: the
+diff recurses one stack frame per child, so the default 64 KB WASM stack overflowed on big
+lists — the build now reserves 16 MB.
+
 Remember the bit about `update` staying pure? It returns `(model, Cmd)`, and the
 driver runs the `Cmd` *after* the render — a `Cmd.stream` kicks off a streaming
 `fetch` whose events come back in as `.chunk`/`.done` messages. So "async" never

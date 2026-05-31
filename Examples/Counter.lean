@@ -46,7 +46,10 @@ def view (m : Model) : Html Msg :=
     input [placeholder "type here — focus survives every click"],
     -- A memoized subtree: its key never changes, so after the first render the diff
     -- skips it — the driver never touches this DOM again, no matter how you click.
-    lazy "banner" (div [cls "banner", attr "id" "banner"] ["built once, then memoized"])
+    lazy "banner" (div [cls "banner", attr "id" "banner"] ["built once, then memoized"]),
+    -- A memoized subtree keyed on the count: when the count changes the key changes, so
+    -- the diff patches its content in place (`lazyPatch`) rather than skipping.
+    lazy (toString m.count) (div [cls "echo", attr "id" "echo"] [s!"count is {m.count}"])
   ]
 
 def app : App Model Msg := sandbox init update view

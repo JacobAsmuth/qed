@@ -93,7 +93,11 @@ EM_JS(void, qed_js_append_child, (int parent, int child), {
 
 EM_JS(void, qed_js_set_text, (int node, const char *s), {
   var el = globalThis.__qed.nodes[node];
-  if (el) el.textContent = UTF8ToString(s);
+  var str = UTF8ToString(s);
+  /* guard: assigning textContent replaces the text node even when unchanged (and
+     invalidates layout), so only touch it when it actually differs — like the
+     setAttribute/setValue guards. Big win when a diff re-patches unchanged rows. */
+  if (el && el.textContent !== str) el.textContent = str;
 });
 
 EM_JS(int, qed_js_child_at, (int parent, int index), {

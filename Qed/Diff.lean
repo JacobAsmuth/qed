@@ -32,9 +32,12 @@ import Std.Data.HashMap
 
 namespace Qed
 
-/-- A child's reconciliation key, if it set one (an element with an `Attr.key`). -/
+/-- A child's reconciliation key, if it set one (an element with an `Attr.key`, or a
+    `lazy` wrapping one — so a memoized row still reconciles by its stable key while its
+    `lazy` key tracks content). -/
 def Html.keyOf : Html msg → Option String
   | .element _ attrs _ => attrs.findSome? (fun a => match a with | .key k => some k | _ => none)
+  | .lazy _ sub        => Html.keyOf sub
   | _                  => none
 
 /-- Reconcile this child list by key? Only when *every* child carries one. -/
@@ -69,6 +72,9 @@ mutual
         old DOM. Carries the new node (`lazy key sub`) so the *pure* model still produces
         it exactly — only the driver elides the work. -/
     | lazyReuse (key : String) (sub : Html msg)
+    /-- Two `lazy` nodes with *different* keys: the content changed, so patch it in place
+        (cheaper than rebuilding) and record the new key. -/
+    | lazyPatch (key : String) (sub : Patch msg)
   /-- How to turn one list of children into another, walking them in parallel. -/
   inductive ChildPatch (msg : Type) where
     /-- Patch the next old child with `p`, then continue with the rest. -/
@@ -98,9 +104,9 @@ mutual
           if childrenKeyed c₂ then .patchKeyed a₂ (diffKeyed c₁.toArray (keyIndex c₁) c₂)
           else .patchElement a₂ (diffChildren c₁ c₂)
         else .replace (.element t₂ a₂ c₂)
-    | .lazy k₁ _,       .lazy k₂ s₂      =>
-        -- same key ⇒ unchanged: skip without diffing `s₂`; else rebuild it
-        if k₁ = k₂ then .lazyReuse k₂ s₂ else .replace (.lazy k₂ s₂)
+    | .lazy k₁ s₁,      .lazy k₂ s₂      =>
+        -- same key ⇒ unchanged: skip without diffing `s₂`; else patch the content
+        if k₁ = k₂ then .lazyReuse k₂ s₂ else .lazyPatch k₂ (diff s₁ s₂)
     | _,                b                 => .replace b
   /-- Positional reconcile: a pairwise-patched prefix, then append the surplus new
       children or drop the surplus old ones. -/
@@ -131,6 +137,8 @@ mutual
     | .patchElement attrs kids, .element tag _ children => .element tag attrs (applyChildren kids children)
     | .patchKeyed attrs steps,  .element tag _ children => .element tag attrs (applyKeyed steps children)
     | .lazyReuse key sub,       _                       => .lazy key sub
+    | .lazyPatch key p,         .lazy _ s               => .lazy key (applyPatch p s)
+    | .lazyPatch key p,         h                       => .lazy key (applyPatch p h)
     | .patchElement _ _,        h                       => h
     | .patchKeyed _ _,          h                       => h
   /-- Apply a positional child-list patch to a list of children. -/
@@ -162,9 +170,13 @@ mutual
           · simp only [applyPatch]; rw [diffKeyed_apply c₁ c₂]
           · simp only [applyPatch]; rw [diffChildren_apply c₁ c₂]
         · simp only [applyPatch]
-    -- a `lazyReuse` (same key) and a `replace` (different key) both yield the new node,
-    -- so the model is exact either way — no appeal to the equal-key promise here.
-    | .lazy _ _,         .lazy _ _         => by simp only [diff]; split <;> simp [applyPatch]
+    -- a `lazyReuse` (same key) and a `lazyPatch` (different key, carrying `diff s₁ s₂`)
+    -- both reproduce the new node exactly — no appeal to the equal-key promise here.
+    | .lazy k₁ s₁,       .lazy k₂ s₂       => by
+        simp only [diff]
+        split
+        · simp [applyPatch]
+        · simp only [applyPatch]; rw [diff_apply s₁ s₂]
     | .lazy _ _,         .text _           => by simp [diff, applyPatch]
     | .lazy _ _,         .element _ _ _    => by simp [diff, applyPatch]
     | .text _,           .lazy _ _         => by simp [diff, applyPatch]

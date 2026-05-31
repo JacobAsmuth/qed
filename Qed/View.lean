@@ -247,4 +247,49 @@ def templated (init : Model) (update : Model → Msg → Model) (template : View
   application init update (fun m => View.render template m)
     (effects := effects) (locals := locals) (onPort := onPort) (start := start)
 
+/-! ### `view%` — write a template like an ordinary view
+
+`view% fun m => …` rewrites every `text e` whose `e` mentions the model parameter `m`
+into a `dyn` projection, so a dynamic value reads like plain text — the "without onerous
+syntax" front end for fine-grained bindings:
+
+    view% fun m =>
+      V.div [] [
+        V.h1 [] [V.text "Counter"],          -- static, left alone
+        V.text s!"Count: {m.count}",          -- lifted to `dyn (fun m => …)`
+        V.text m.name,                        -- lifted
+        V.forEach "ul" (·.todos) (·.id) row   -- structure: explicit projection
+      ]
+
+Only `text` leaves are auto-lifted; structure (`forEach`/`showIf`) and attributes
+(`dynAttr`) stay explicit with their `(·.field)` projections. -/
+open Lean in
+/-- Is `m` the root of `n` (so `n` is `m` or `m.field…`)? -/
+private partial def viewRootedAt (m : Name) : Name → Bool
+  | n@(.str p _) => n == m || viewRootedAt m p
+  | n@(.num p _) => n == m || viewRootedAt m p
+  | .anonymous   => m == .anonymous
+
+open Lean in
+/-- Does this syntax mention the identifier `m` (as `m` or `m.field…`)? -/
+private partial def viewMentions (m : Name) : Syntax → Bool
+  | .ident _ _ n _ => viewRootedAt m n
+  | .node _ _ args => args.any (viewMentions m)
+  | _              => false
+
+open Lean in
+/-- Rewrite `text e` (with `e` mentioning `m`) to `Qed.V.dyn (fun m => e)`; recurse
+    structurally elsewhere. -/
+private partial def viewLiftText (m : Ident) (stx : Syntax) : MacroM Syntax := do
+  match stx with
+  | `(text $e:term) =>
+      if viewMentions m.getId e then `(Qed.V.dyn (fun $m => $e)) else return stx
+  | _ =>
+      if stx.getArgs.isEmpty then return stx
+      else return stx.setArgs (← stx.getArgs.mapM (viewLiftText m))
+
+open Lean in
+macro "view% " "fun " m:ident " => " body:term : term => do
+  return ⟨← viewLiftText m body⟩
+
 end Qed

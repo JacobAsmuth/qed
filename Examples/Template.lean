@@ -54,22 +54,26 @@ def todoRow : View Todo Msg :=
   li [onClick' (fun t => .toggle t.id)]
      [dyn (fun t => (if t.done then "✓ " else "") ++ t.text)]
 
+-- The `view%` macro lifts each `text e` that mentions the model `m` into a `dyn`
+-- projection, so dynamic values read like plain text. Structure (`showIf`/`forEach`) and
+-- attributes (`dynAttr`) stay explicit with their `(·.field)` projections.
 def template : View Model Msg :=
-  div [cls "demo"] [
-    h1 [] "View template",
-    -- a counter: the count is a single bound text node
-    div [cls "counter"] [
-      button [onClick .dec] "−",
-      span [cls "count"] [dyn (fun m => toString m.count)],
-      button [onClick .inc] "+"
-    ],
-    -- a controlled input bound to `name`, echoed live, greeting shown only when non-empty
-    input [dynAttr "value" (·.name), onInput (Msg.setName ·)],
-    showIf (fun m => m.name != "") (p [] [dyn (fun m => s!"Hello, {m.name}!")]),
-    -- a keyed list; the container is a <ul>, each row keyed by its id
-    button [onClick .add] "add todo",
-    forEach "ul" (·.todos) (fun t => toString t.id) todoRow
-  ]
+  view% fun m =>
+    div [cls "demo"] [
+      h1 [] "View template",
+      -- a counter: the count is a single bound text node
+      div [cls "counter"] [
+        button [onClick .dec] "−",
+        span [cls "count"] [text s!"{m.count}"],
+        button [onClick .inc] "+"
+      ],
+      -- a controlled input bound to `name`, echoed live, greeting shown only when non-empty
+      input [dynAttr "value" (·.name), onInput (Msg.setName ·)],
+      showIf (fun m => m.name != "") (p [] [text s!"Hello, {m.name}!"]),
+      -- a keyed list; the container is a <ul>, each row keyed by its id
+      button [onClick .add] "add todo",
+      forEach "ul" (·.todos) (fun t => toString t.id) todoRow
+    ]
 
 def app : App Model Msg := templated init update template
 

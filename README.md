@@ -416,13 +416,19 @@ def app := templated init update template
 ```
 
 Static structure is built once; `showIf`/`forEach` reconcile through the *same verified
-`diff`* when their shape changes. A keyed list goes further — each row's text is a signal,
-so changing a row's value pushes straight to its node, no `childAt` and no reconcile.
-Against the diff path on the same app (`test/bench_template.mjs`): a 2,000-node mostly-static
-page updates **3.7× faster**, and a 10,000-row list with 1,000 rows changing **4.6× faster**
-(40 ms → 8.8 ms). The honest gap to hand-written signals is that the template re-checks
-every binding to *find* what changed (pure Lean has no dependency tracking), so it's a
-category win over the diff, not a tie with `setSignal`. `Examples/Template.lean` is the
+`diff`* when their shape changes. A keyed list goes further — each row's text *and*
+attributes (a `class`, a `value`) are signals, so changing a row pushes straight to its
+node, no `childAt` and no reconcile. Against the diff path on the same app
+(`test/bench_template.mjs`): a 2,000-node mostly-static page updates **3.7× faster**, and a
+10,000-row list with 1,000 rows changing **4.6× faster** (40 ms → 8.8 ms). The honest gap
+to hand-written signals is that the template re-checks every binding to *find* what changed
+(pure Lean has no dependency tracking), so it's a category win over the diff, not a tie
+with `setSignal`.
+
+And the non-list path is *proven*: `applyValues_render` says that under stable structure,
+the in-place value patch reproduces a full re-render (`applyValues t s' (render t s) =
+render t s'`) — so the template inherits the same "the DOM equals the model's view"
+guarantee `diff_apply` gives, and `qed check` gates on it. `Examples/Template.lean` is the
 demo; `test/template_test.mjs` drives it in a browser.
 
 ## So what's actually happening?

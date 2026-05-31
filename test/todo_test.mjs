@@ -72,7 +72,7 @@ try {
 
   // --- component: a click inside a row toggles only that row ---
   await toggle('beta');
-  check('toggling a row updates only that row (component, routed by index)',
+  check('toggling a row updates only that row (component, routed by key)',
     await dones(), [false, true, false]);
 
   // --- keyed remove from the MIDDLE: gamma's node survives and moves up ---

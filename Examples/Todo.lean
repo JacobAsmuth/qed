@@ -46,11 +46,17 @@ structure Model where
 inductive Msg where
   | edit (s : String)            -- the text field changed
   | add                          -- append the (trimmed) draft as a new row
-  | row (i : Nat) (msg : Row.Msg) -- a message from row i, carrying the row's own Msg
+  | row (k : String) (msg : Row.Msg) -- a message from the row with key k, carrying its own Msg
   | remove (id : Nat)            -- delete the row with this id
   | sort                         -- reorder the rows alphabetically
 
 def init : Model := { rows := #[], draft := "", nextId := 0 }
+
+-- One line wires the reusable `Row` component into this app's keyed list: it generates
+-- `rowView` (the row's view, its messages tagged with the row's key) and `rowUpdate`
+-- (routes a row message to the matching row by key — survives sort/filter). The only
+-- hand-written glue left is the `Msg.row` constructor above.
+embed Row as row keyedBy (fun r => toString r.id) into rows
 
 def update (m : Model) : Msg → Model
   | .edit s    => { m with draft := s }
@@ -60,7 +66,7 @@ def update (m : Model) : Msg → Model
       else { m with rows   := m.rows.push { id := m.nextId, text := t, done := false }
                     draft  := ""
                     nextId := m.nextId + 1 }
-  | .row i msg => { m with rows := Row.component.updateAt m.rows i msg }
+  | .row k msg => rowUpdate m k msg
   | .remove id => { m with rows := m.rows.filter (·.id != id) }
   | .sort      => { m with rows := m.rows.qsort (fun a b => compare a.text b.text == .lt) }
 
@@ -71,9 +77,9 @@ def view (m : Model) : Html Msg :=
       button [cls "addbtn",  onClick .add]  "Add",
       button [cls "sortbtn", onClick .sort] "Sort"
     ],
-    ul [cls "items"] (m.rows.mapIdx fun i r =>
+    ul [cls "items"] (m.rows.map fun r =>
       li [key (toString r.id), cls "row"] [
-        (Row.component.view r).map (Msg.row i),     -- the row's own view, messages tagged row i
+        rowView r,                                  -- the row's own view, messages tagged by key
         button [cls "rm", onClick (.remove r.id)] "✕"
       ]).toList
   ]

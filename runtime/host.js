@@ -64,10 +64,14 @@
           .catch((e) => httpDone(id, 0, String(e)));
       };
 
+      // Keyed timers (Cmd.afterKeyed / Cmd.cancel): scheduling a key clears its pending
+      // timeout first, so a debounce keeps only the last one.
+      const timers = {};
       // Native effects: the framework's typed Cmds (Cmd.storageSet, .copy, .focus, …)
       // arrive here as a `kind` switch. Fire-and-forget.
       globalThis.__qed.effect = (kind, a, b, c) => {
         switch (kind) {
+          case 'timer.cancel': if (timers[a]) { clearTimeout(timers[a]); delete timers[a]; } break;
           case 'storage.set': localStorage.setItem(a, b); break;
           case 'storage.remove': localStorage.removeItem(a); break;
           case 'storage.clear': localStorage.clear(); break;
@@ -98,6 +102,11 @@
             (navigator.clipboard ? navigator.clipboard.readText() : Promise.resolve(''))
               .then((t) => effectDone(id, t)).catch(() => effectDone(id, '')); break;
           case 'timer.after': setTimeout(() => effectDone(id, ''), parseInt(a, 10) || 0); break;
+          case 'timer.afterKeyed': {
+            if (timers[a]) clearTimeout(timers[a]);
+            timers[a] = setTimeout(() => { delete timers[a]; effectDone(id, ''); }, parseInt(b, 10) || 0);
+            break;
+          }
           case 'random.int': {
             const lo = parseInt(a, 10) || 0, hi = parseInt(b, 10) || 0;
             effectDone(id, String(lo + Math.floor(Math.random() * (hi - lo + 1))));

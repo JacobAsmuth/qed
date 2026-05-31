@@ -130,9 +130,17 @@ def Cmd.blur           (elementId : String) : Cmd msg := .fx "dom.blur" elementI
 def Cmd.select         (elementId : String) : Cmd msg := .fx "dom.select" elementId "" ""
 def Cmd.scrollIntoView (elementId : String) : Cmd msg := .fx "dom.scrollIntoView" elementId "" ""
 
-/-! **Timer.** Dispatch `msg` after `ms` milliseconds (`setTimeout`) — the building
-    block for debounce/throttle/delay. -/
+/-! **Timer.** Dispatch `msg` after `ms` milliseconds (`setTimeout`). -/
 def Cmd.after (ms : Nat) (onTick : msg) : Cmd msg := .fxResult "timer.after" (toString ms) "" fun _ => onTick
+
+/-- A timer identified by `key`: scheduling a new one cancels the pending one with the
+    same key, and `Cmd.cancel key` drops it. Debounce is one line — schedule
+    `afterKeyed "search" 300 …` on every keystroke and only the last survives. -/
+def Cmd.afterKeyed (key : String) (ms : Nat) (onTick : msg) : Cmd msg :=
+  .fxResult "timer.afterKeyed" key (toString ms) fun _ => onTick
+
+/-- Cancel a pending `afterKeyed` timer by its key (a no-op if none is pending). -/
+def Cmd.cancel (key : String) : Cmd msg := .fx "timer.cancel" key "" ""
 
 /-! **Document title.** -/
 def Cmd.setTitle (title : String) : Cmd msg := .fx "document.title" title "" ""
@@ -157,6 +165,53 @@ jsonStruct FilePick where
     chosen file decoded as a `FilePick` — or `.error` if it was cancelled or unreadable. -/
 def Cmd.pickFile (accept : String) (onFile : Except String FilePick → msg) : Cmd msg :=
   .fxResult "file.pick" accept "" fun s => onFile (FilePick.decode s)
+
+/-- Find the handler for an inbound port `name` and decode its payload. The `ports`
+    command builds the handler array; an app wires it up as `onPort := some onPort`. -/
+def dispatchPorts (handlers : Array (String × (String → Option msg))) (name payload : String) : Option msg :=
+  match handlers.find? (fun h => h.1 == name) with
+  | some h => h.2 payload
+  | none   => none
+
+/-! ### The `ports` command — typed userland effects, no strings or codecs by hand
+
+`ports where …` declares typed message channels between the pure app and its own JS. A
+channel with **no** `=>` is *outbound* — it generates a `Cmd` constructor that serializes
+its payload. One **with** `=> ctor` is *inbound* — its payload is decoded and mapped to a
+message, and all the inbound channels are assembled into a generated `onPort`:
+
+    ports where
+      wsSend : Command             -- outbound: `wsSend (c : Command) : Cmd msg`
+      wsRecv : Event => .received   -- inbound:  "wsRecv" payload decoded into `Msg.received`
+
+    def app := application init update view (onPort := some onPort)
+
+The JS registers handlers on `globalThis.__qed.ports[name]` and pushes inbound with
+`globalThis.__qed.send(name, payload)`. Payload types need `ToJson` (outbound) /
+`FromJson` (inbound) — a `jsonStruct` gives both. Core-syntax only (no `import Lean`). -/
+syntax portChan := ident " : " term (" => " term)?
+syntax (name := portsCmd) "ports " "where " sepBy1IndentSemicolon(portChan) : command
+
+open Lean in
+macro_rules
+  | `(ports where $[$chans:portChan]*) => do
+      let mut outDefs  : Array (TSyntax `command) := #[]
+      let mut inTuples : Array (TSyntax `term) := #[]
+      for ch in chans do
+        match ch with
+        | `(portChan| $name:ident : $ty:term => $rhs:term) =>
+            -- inbound: ("name", fun p => (fromJson-decoded payload).map ctor)
+            inTuples := inTuples.push (← `(($(quote name.getId.toString),
+              fun p => (((Json.parse p).bind FromJson.fromJson : Except String $ty).toOption).map $rhs)))
+        | `(portChan| $name:ident : $ty:term) =>
+            -- outbound: a Cmd that serializes its payload onto the named port
+            outDefs := outDefs.push (←
+              `(def $name {m : Type} (x : $ty) : Cmd m :=
+                  Cmd.port $(quote name.getId.toString) (Json.render (ToJson.toJson x))))
+        | _ => Macro.throwErrorAt ch "ports: expected `name : Type` (outbound) or `name : Type => ctor` (inbound)"
+      let onPortDef ← `(def $(mkIdent `onPort) : String → String → Option $(mkIdent `Msg) :=
+        dispatchPorts #[$inTuples,*])
+      return mkNullNode ((outDefs.push onPortDef).map (·.raw))
 
 /-! ### Local-state components (React `useState`, keyed)
 
@@ -223,7 +278,8 @@ def sandbox (init : Model) (update : Model → Msg → Model) (view : Model → 
     `{ m with … }` record updates. Effects are a *separate* function evaluated on
     the **updated** model: `effects m' msg` is the `Cmd` to run after a `msg`
     moved the model to `m'`. It defaults to "no effect", so an app names a `Cmd`
-    only for the messages that actually have one.
+    only for the messages that actually have one. `start` is the effect to run once at
+    startup (e.g. `Cmd.storageGet …` to hydrate from localStorage before first paint).
 
     (For an effect that needs state the update discards, build the `App` directly:
     its `update : Model → Msg → Model × Cmd Msg` field gives the combined form.) -/
@@ -232,8 +288,9 @@ def application (init : Model)
     (view    : Model → Html Msg)
     (effects : Model → Msg → Cmd Msg := fun _ _ => .none)
     (locals  : List LocalDef := [])
-    (onPort  : Option (String → String → Option Msg) := none) : App Model Msg :=
-  { init   := (init, .none)
+    (onPort  : Option (String → String → Option Msg) := none)
+    (start   : Cmd Msg := .none) : App Model Msg :=
+  { init   := (init, start)
     update := fun m msg => let m' := update m msg; (m', effects m' msg)
     view, locals, onPort }
 
@@ -245,8 +302,9 @@ def routed (init : Model)
     (update      : Model → Msg → Model)
     (view        : Model → Html Msg)
     (onUrlChange : String → Msg)
-    (effects     : Model → Msg → Cmd Msg := fun _ _ => .none) : App Model Msg :=
-  { init   := (init, .none)
+    (effects     : Model → Msg → Cmd Msg := fun _ _ => .none)
+    (start       : Cmd Msg := .none) : App Model Msg :=
+  { init   := (init, start)
     update := fun m msg => let m' := update m msg; (m', effects m' msg)
     view
     onUrlChange := some onUrlChange }

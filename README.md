@@ -353,34 +353,44 @@ actually reach for — `storageSet`/`storageGet`/`storageRemove`/`storageClear`,
 
 ```lean
 def effects (m : Model) : Msg → Cmd Msg
-  | .inc        => Cmd.storageSet "count" (toString m.count)   -- persist on change
-  | .loadCount  => Cmd.storageGet "count" .loaded             -- … and read it back at startup
-  | .search q   => Cmd.after 300 (.runSearch q)               -- debounce
+  | .inc        => Cmd.storageSet "count" (toString m.count)        -- persist on change
+  | .search q   => Cmd.afterKeyed "search" 300 (.runSearch q)       -- debounce in one line
   | .pickAvatar => Cmd.pickFile "image/*" .gotFile
   | .saveAll    => Cmd.batch [Cmd.storageSet "doc" m.doc, Cmd.setTitle "Saved"]
   | _           => .none
+
+-- `start` runs one effect at boot (e.g. hydrate from localStorage before first paint)
+def app := application init update view (effects := effects)
+             (start := Cmd.storageGet "count" .loaded)
 ```
 
+`afterKeyed`/`cancel` are keyed timers — scheduling a key cancels the pending one, so
+debounce is a single line instead of a generation counter.
+
 And when an effect *isn't* built in — WebSockets, IndexedDB, a hardware API — you don't
-patch the framework. **Ports** are the escape hatch: the pure core sends and receives
-`(name, payload)` strings, and you wire the actual API in your own JS. So the effect
-stays inspectable data (testable!), while reaching anything the platform offers:
+patch the framework. **Ports** are the escape hatch, and the `ports` command makes them
+typed: declare channels once and it generates the outbound `Cmd`s and the inbound
+`onPort` (no magic strings, no hand-rolled codecs). You wire the actual API in your own JS:
 
 ```lean
-effects m | .send => Cmd.port "ws.send" m.outgoing      -- → globalThis.__qed.ports["ws.send"]
-app := application init update view (effects := effects)
-         (onPort := some fun | "ws.msg", p => some (.received p) | _, _ => none)
+ports where
+  wsSend : Command            -- outbound: `wsSend (c : Command) : Cmd msg`
+  wsRecv : Event => .received  -- inbound:  "wsRecv" payload decoded into `Msg.received`
+
+def app := application init update view (effects := effects) (onPort := some onPort)
+-- effects m | .send => wsSend m.command
 ```
 ```js
 const ws = new WebSocket(url);
-globalThis.__qed.ports["ws.send"] = (p) => ws.send(p);
-ws.onmessage = (e) => globalThis.__qed.send("ws.msg", e.data);   // → onPort → a Msg
+globalThis.__qed.ports["wsSend"] = (p) => ws.send(p);
+ws.onmessage = (e) => globalThis.__qed.send("wsRecv", e.data);   // → decoded → a Msg
 ```
 
-The whole battery (with `localStorage`, `setTitle`, `after`, `randomInt`, `pickFile`,
-`batch`, `focus`, and a port round-trip) is `Examples/Effects.lean`, driven in a real
-browser by `test/effects_test.mjs`. Local-component state has a matching pair —
-`window.qed.snapshot()` / `.restore(json)` — for persistence and time-travel.
+The effect stays inspectable data (testable!) while reaching anything the platform
+offers. The whole battery (`localStorage`, `setTitle`, `randomInt`, `pickFile`, `batch`,
+`focus`, a keyed-timer debounce, and a typed-port round-trip) is `Examples/Effects.lean`,
+driven in a real browser by `test/effects_test.mjs`. Local-component state has a matching
+pair — `window.qed.snapshot()` / `.restore(json)` — for persistence and time-travel.
 
 ## So what's actually happening?
 

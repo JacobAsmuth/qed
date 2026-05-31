@@ -76,13 +76,21 @@ try {
   await sleep(400);
   check('Cmd.after fired the delayed message', await status(), 'delayed!');
 
-  // --- ports: app-registered JS handler echoes back via __qed.send → onPort ---
+  // --- typed ports (ports macro): app JS echoes back on the inbound channel ---
+  // payloads are JSON (echoOut sends "ping"), so the handler parses + re-stringifies.
   await page.evaluate(() => {
-    globalThis.__qed.ports['echo'] = (p) => globalThis.__qed.send('echo', p + '-pong');
+    globalThis.__qed.ports['echoOut'] = (p) => globalThis.__qed.send('echoIn', JSON.stringify(JSON.parse(p) + '-pong'));
   });
   await click('.ping');
   await sleep(40);
-  check('port round-trip (Cmd.port → JS → __qed.send → onPort)', await status(), 'echo: ping-pong');
+  check('typed port round-trip (echoOut → JS → echoIn → onPort)', await status(), 'echo: ping-pong');
+
+  // --- debounce via afterKeyed: type fast, only the last keystroke's timer fires ---
+  await page.click('#app .search');
+  await page.type('#app .search', 'abc', { delay: 25 });
+  await sleep(350);                                         // > the 200ms keyed timer
+  check('debounced search ran for the final query', await status(), 'searched: abc');
+  check('afterKeyed cancelled the intermediate timers', await page.$eval('#searches', (e) => e.textContent), '1');
 
   // --- batch: one message, two effects (storageSet + setTitle) ---
   await click('.save');

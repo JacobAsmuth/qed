@@ -131,4 +131,9 @@ opaque portSend (name payload : String) : IO Unit
 @[extern "qed_dom_bind_signal"]
 opaque bindSignal (node : Node) (name : String) : IO Unit
 
+/-- Bind `node`'s `attr` attribute to the signal `name`: a later `setSignal name v` sets
+    `attr="v"` on the node. The attribute counterpart of `bindSignal`. -/
+@[extern "qed_dom_bind_signal_attr"]
+opaque bindSignalAttr (node : Node) (name attr : String) : IO Unit
+
 end Qed.Dom

@@ -47,12 +47,12 @@ def update (m : Model) : Msg → Model
   | .add        => { m with todos := m.todos.push { id := m.nextId, text := s!"item {m.nextId}", done := false },
                             nextId := m.nextId + 1 }
 
-/-- The row template — scoped to a `Todo`. Its text reads the row (a check mark when
-    done); the toggle message reads the row's id (`onClick'`). The text is a signal, so a
-    toggle updates just this row's node — no diff, no `childAt`. -/
+/-- The row template — scoped to a `Todo`. Its `class` and text both read the row, and
+    both are signals: a toggle updates just this row's class and text directly — no diff,
+    no `childAt`. The toggle message reads the row's id (`onClick'`). -/
 def todoRow : View Todo Msg :=
-  li [onClick' (fun t => .toggle t.id)]
-     [dyn (fun t => (if t.done then "✓ " else "") ++ t.text)]
+  li [dynAttr "class" (fun t => if t.done then "done" else ""), onClick' (fun t => .toggle t.id)]
+     [dyn (·.text)]
 
 -- The `view%` macro lifts each `text e` that mentions the model `m` into a `dyn`
 -- projection, so dynamic values read like plain text. Structure (`showIf`/`forEach`) and

@@ -36,8 +36,13 @@ namespace Qed
 inductive VAttr (σ : Type) (msg : Type) where
   /-- A fixed attribute (reuse every `Attr` helper; a `Coe` wraps them silently). -/
   | stat (a : Attr msg)
-  /-- A scope-bound attribute, recomputed from the scope when it changes. -/
+  /-- A scope-bound attribute, recomputed from the scope when it changes (e.g. a
+      scope-dependent event). The driver re-evaluates it on update. -/
   | bind (get : σ → Attr msg)
+  /-- A dynamic *value* attribute `attr="get σ"`. Distinguished from `bind` so a list row
+      can render it as a *signal* (`signalAttr`) — a value-only update sets it directly,
+      no diff. In a scalar element it is just re-applied on update. -/
+  | dynVal (attr : String) (get : σ → String)
 
 /-- A fine-grained view template over a scope `σ`, producing messages `msg`.
 
@@ -74,8 +79,9 @@ inductive View (σ : Type) (msg : Type) where
 
 /-- Evaluate a template attribute against a scope. -/
 def VAttr.eval (s : σ) : VAttr σ msg → Attr msg
-  | .stat a  => a
-  | .bind f  => f s
+  | .stat a          => a
+  | .bind f          => f s
+  | .dynVal attr get => .attr attr (get s)
 
 /-- Attach a reconciliation `key` to a rendered row (a no-op on non-elements, which
     cannot carry one). Keyed-list children render through this so the user writes the
@@ -110,30 +116,49 @@ end
     index `i` names the same binding in both — that is what lets a value-only update set
     just the changed rows' signals with no `childAt` and no reconcile. -/
 
+/-- A row's dynamic *value-attribute* projections (in attribute order). -/
+def dynValGets (attrs : List (VAttr σ msg)) : List (σ → String) :=
+  attrs.filterMap fun | .dynVal _ get => some get | _ => none
+
 mutual
-  /-- A row template's `dyn` projections, in pre-order (index = signal suffix). -/
+  /-- A row template's dynamic projections, in pre-order (index = signal suffix): an
+      element's `dynVal` attributes first, then its children's `dyn` text. -/
   def View.collectDyn : View σ msg → List (σ → String)
-    | .text _           => []
-    | .dyn get          => [get]
-    | .element _ _ kids => View.collectDynList kids
-    | .showIf _ child   => View.collectDyn child
-    | .keyedList ..     => []     -- a nested list owns its own signals
-    | .static _         => []
+    | .text _               => []
+    | .dyn get              => [get]
+    | .element _ attrs kids => dynValGets attrs ++ View.collectDynList kids
+    | .showIf _ child       => View.collectDyn child
+    | .keyedList ..         => []     -- a nested list owns its own signals
+    | .static _             => []
   def View.collectDynList : List (View σ msg) → List (σ → String)
     | []      => []
     | k :: ks => View.collectDyn k ++ View.collectDynList ks
 end
 
+/-- Render a row element's attributes, turning each `dynVal` into a `signalAttr` named
+    `key#n` (its value pushed by `setSignal`); static/bound attrs evaluate normally.
+    Threads the binding index in the same order `collectDyn` walks (attributes first). -/
+def renderSigAttrs (s : σ) (pre : String) : List (VAttr σ msg) → Nat → List (Attr msg) × Nat
+  | [],        n => ([], n)
+  | va :: rest, n =>
+      let (a, n1) := match va with
+        | .dynVal attr get => (Attr.signalAttr s!"{pre}#{n}" attr (get s), n + 1)
+        | other            => (VAttr.eval s other, n)
+      let (as, n2) := renderSigAttrs s pre rest n1
+      (a :: as, n2)
+
 mutual
-  /-- Render a row against its data, each `dyn` a `signalBind` node `key#i` (text filled by
-      `setSignal`). `n` is the running binding index, threaded so hidden `showIf` branches
-      still consume their indices — keeping the naming identical to `collectDyn`. -/
+  /-- Render a row against its data: each `dyn` a `signalBind` node `key#i`, each `dynVal`
+      attribute a `signalAttr` `key#i` — all filled by `setSignal`. `n` is the running
+      binding index, threaded so hidden `showIf` branches still consume their indices,
+      keeping the naming identical to `collectDyn`. -/
   def View.renderSig : View σ msg → σ → String → Nat → Html msg × Nat
     | .text s,          _, _,   n => (.text s, n)
     | .dyn get,         s, pre, n => (.element "span" [.signalBind s!"{pre}#{n}"] [.text (get s)], n + 1)
     | .element tag attrs kids, s, pre, n =>
-        let (cs, n') := View.renderSigList kids s pre n
-        (.element tag (attrs.map (VAttr.eval s)) cs, n')
+        let (attrs', n1) := renderSigAttrs s pre attrs n
+        let (cs, n2) := View.renderSigList kids s pre n1
+        (.element tag attrs' cs, n2)
     | .showIf cond child, s, pre, n =>
         if cond s then View.renderSig child s pre n
         else (.text "", n + (View.collectDyn child).length)
@@ -183,8 +208,9 @@ def onKeydown (h : String → msg) : VAttr σ msg := .stat (.onKeydown h)
 
 /-- A scope-bound attribute (general form): `bindAttr (fun r => onClick (.pick r.id))`. -/
 def bindAttr (get : σ → Attr msg) : VAttr σ msg := .bind get
-/-- A dynamic attribute value bound to the scope: `dynAttr "value" (·.draft)`. -/
-def dynAttr (name : String) (get : σ → String) : VAttr σ msg := .bind (fun s => .attr name (get s))
+/-- A dynamic attribute value bound to the scope: `dynAttr "value" (·.draft)`. In a list
+    row it becomes a fine-grained signal; in a scalar element it is re-applied on update. -/
+def dynAttr (name : String) (get : σ → String) : VAttr σ msg := .dynVal name get
 /-- A click whose message reads the scope: `onClick' (fun r => .pick r.id)`. -/
 def onClick' (get : σ → msg) : VAttr σ msg := .bind (fun s => .onClick (get s))
 /-- An input whose message reads the scope and the field value. -/

@@ -422,6 +422,7 @@ def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .onFocus m   => (s!" data-qed-focus=\"{hs.size}\"", hs.push m)
   | .localCell key comp _ _ => (s!" data-qed-local=\"{escapeHtml (localKey comp key)}\"", hs)   -- marks the host; the driver fills it
   | .signalBind name        => (s!" data-qed-signal=\"{escapeHtml name}\"", hs)                 -- driver binds its text to the signal
+  | .signalAttr _ attr value => (s!" {attr}=\"{escapeHtml value}\"", hs)                        -- driver binds this attr to the signal
 
 /-- Render a list of attributes left-to-right, threading the handler table. -/
 def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg

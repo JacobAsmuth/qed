@@ -62,6 +62,12 @@ inductive Attr (msg : Type) where
       socket feed) updates in O(bindings). The element's `Html` children are owned by the
       signal, so leave them empty. -/
   | signalBind (name : String)
+  /-- Bind this element's `attr` attribute to a named signal (the attribute counterpart of
+      `signalBind`): `setSignal name v` sets `attr="v"` on the bound element directly. The
+      `value` is the current value, rendered into the static markup so SSR matches; the
+      live driver ignores it and reads the signal store. Used by `forEach` so a row's
+      dynamic class/value updates fine-grained, no diff. -/
+  | signalAttr (name attr value : String)
 
 /-- A typed virtual-DOM node. Note this inductive is *total*: there is no
     constructor for "failed render", so a well-typed `view` cannot crash. -/
@@ -107,6 +113,7 @@ def Attr.map (f : α → β) : Attr α → Attr β
   -- so relabelling the parent never has to recurse into the local subtree (total).
   | .localCell k c i b => .localCell k c i (fun s => (b s).map f)
   | .signalBind name   => .signalBind name
+  | .signalAttr n a v  => .signalAttr n a v
 
 mutual
   /-- Remap the message type of a whole tree — the basis of component

@@ -65,15 +65,18 @@
       };
 
       // Signals (fine-grained reactivity): set a named value and update only the element
-      // bound to it (Attr.signalBind) — no dispatch, no diff. The maps are created in
-      // qed_js_init; this just writes a value and the bound element's text.
+      // bound to it — no dispatch, no diff. A binding is `{el, attr}`: `attr` null drives
+      // the element's text (Attr.signalBind), otherwise an attribute (Attr.signalAttr).
+      // The maps are created in qed_js_init; this just writes the value and the binding.
       globalThis.__qed.sig = globalThis.__qed.sig || new Map();
       globalThis.__qed.sigVals = globalThis.__qed.sigVals || new Map();
       globalThis.__qed.setSignal = (name, v) => {
         const s = String(v);
         globalThis.__qed.sigVals.set(name, s);
-        const el = globalThis.__qed.sig.get(name);
-        if (el && el.isConnected && el.textContent !== s) el.textContent = s;
+        const b = globalThis.__qed.sig.get(name);
+        if (!b || !b.el || !b.el.isConnected) return;
+        if (b.attr) { if (b.el.getAttribute(b.attr) !== s) b.el.setAttribute(b.attr, s); }
+        else if (b.el.textContent !== s) b.el.textContent = s;
       };
       // Keyed timers (Cmd.afterKeyed / Cmd.cancel): scheduling a key clears its pending
       // timeout first, so a debounce keeps only the last one.

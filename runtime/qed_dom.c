@@ -173,15 +173,26 @@ EM_JS(void, qed_js_port_send, (const char *name, const char *payload), {
   if (p) p(UTF8ToString(payload));
 });
 
-/* Bind an element to a signal: remember it under `name` and show the current value. */
+/* Bind an element's text to a signal: remember it under `name` and show the current
+   value. A signal binding is `{el, attr}` — `attr` null means the element's text. */
 EM_JS(void, qed_js_bind_signal, (int node, const char *name), {
   var el = globalThis.__qed.nodes[node];
   if (!el) return;
   var n = UTF8ToString(name);
-  globalThis.__qed.sig.set(n, el);
+  globalThis.__qed.sig.set(n, { el: el, attr: null });
   el.setAttribute('data-qed-signal', n);
   var v = globalThis.__qed.sigVals.get(n);
   if (v !== undefined && el.textContent !== v) el.textContent = v;
+});
+
+/* Bind an element's attribute to a signal: a later setSignal sets `attr` on `el`. */
+EM_JS(void, qed_js_bind_signal_attr, (int node, const char *name, const char *attr), {
+  var el = globalThis.__qed.nodes[node];
+  if (!el) return;
+  var n = UTF8ToString(name), a = UTF8ToString(attr);
+  globalThis.__qed.sig.set(n, { el: el, attr: a });
+  var v = globalThis.__qed.sigVals.get(n);
+  if (v !== undefined && el.getAttribute(a) !== v) el.setAttribute(a, v);
 });
 
 /* ---- @[extern] implementations (signatures per generated C) -------------- */
@@ -343,6 +354,13 @@ LEAN_EXPORT lean_object *qed_dom_bind_signal(uint32_t node, lean_object *name, l
   (void) world;
   qed_js_bind_signal((int) node, lean_string_cstr(name));
   lean_dec(name);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *qed_dom_bind_signal_attr(uint32_t node, lean_object *name, lean_object *attr, lean_object *world) {
+  (void) world;
+  qed_js_bind_signal_attr((int) node, lean_string_cstr(name), lean_string_cstr(attr));
+  lean_dec(name); lean_dec(attr);
   return lean_io_result_mk_ok(lean_box(0));
 }
 

@@ -92,6 +92,7 @@ def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
       Dom.setAttribute node "data-qed-local" (localKey comp key)
       h.mountLocal key comp init bubble node
   | .signalBind name => Dom.bindSignal node name   -- bind text to the signal; setSignal updates it
+  | .signalAttr name attr _ => Dom.bindSignalAttr node name attr   -- bind an attribute to the signal
 
 /-- Apply a (normalized) attribute list, so the live DOM matches what `render`
     would produce — classes merged, duplicate keys collapsed. -/
@@ -307,8 +308,9 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
       -- once at build — the tables are not reset, so re-registering would grow them)
       for va in attrs do
         match va with
-        | .bind f => let a := f s; unless a.isEvent do applyAttr h node a
-        | .stat _ => pure ()
+        | .bind f          => let a := f s; unless a.isEvent do applyAttr h node a
+        | .dynVal attr get => applyAttr h node (.attr attr (get s))
+        | .stat _          => pure ()
       let mut i : UInt32 := 0
       for k in kids do
         patchView h cells node i k s (kstates.getD i.toNat default)

@@ -18,6 +18,12 @@
       const streamDone  = Module.cwrap('qed_run_stream_done',  null, ['number']);
       const httpDone    = Module.cwrap('qed_run_http_done',    null, ['number', 'number', 'string']);
       const urlChanged  = Module.cwrap('qed_run_url_changed',  null, ['string']);
+      // Local components: an event inside a [data-qed-local] host routes to that
+      // instance (keyed by the attribute) instead of the root app.
+      const localDispatch    = Module.cwrap('qed_run_local_dispatch',     null, ['string', 'number']);
+      const localDispatchStr = Module.cwrap('qed_run_local_dispatch_str', null, ['string', 'number', 'string']);
+      const localSnapshot    = Module.cwrap('qed_run_local_snapshot',     'string', []);
+      const localRestore     = Module.cwrap('qed_run_local_restore',      null, ['string']);
 
       // Effects ask for a streaming POST; we read it as Server-Sent Events and
       // feed each `data:` payload back into Lean, then signal end-of-stream.
@@ -56,18 +62,32 @@
           .catch((e) => httpDone(id, 0, String(e)));
       };
 
-      // Programmatic dispatch (timers, sockets, tests).
-      window.qed = { init, dispatch, dispatchStr, urlChanged };
+      // Programmatic dispatch (timers, sockets, tests) + local-state snapshot/restore
+      // (persistence, devtools, time-travel).
+      window.qed = { init, dispatch, dispatchStr, urlChanged,
+                     snapshot: localSnapshot, restore: localRestore };
 
       init(); // initial render + startup effect
 
       const root = document.getElementById('app');
+      // If the handler element sits inside a local-component host, route the event to
+      // that instance (keyed by data-qed-local); otherwise to the root app.
+      const fire = (t, id) => {
+        const lh = t.closest('[data-qed-local]');
+        if (lh) localDispatch(lh.getAttribute('data-qed-local'), id);
+        else dispatch(id);
+      };
+      const fireStr = (t, id, v) => {
+        const lh = t.closest('[data-qed-local]');
+        if (lh) localDispatchStr(lh.getAttribute('data-qed-local'), id, v);
+        else dispatchStr(id, v);
+      };
       // delegated handler for the no-argument event tables (click/submit/focus/blur)
       const onAt = (attr) => (e) => {
         const t = e.target.closest(`[${attr}]`);
         if (!t) return;
         const id = parseInt(t.getAttribute(attr), 10);
-        if (!Number.isNaN(id)) dispatch(id);
+        if (!Number.isNaN(id)) fire(t, id);
       };
       root.addEventListener('click', (e) => {
         // internal navigation links: push the URL and route, no full page load
@@ -82,13 +102,13 @@
         const t = e.target.closest('[data-qed-click]');
         if (!t) return;
         const id = parseInt(t.getAttribute('data-qed-click'), 10);
-        if (!Number.isNaN(id)) dispatch(id);
+        if (!Number.isNaN(id)) fire(t, id);
       });
       root.addEventListener('input', (e) => {
         const t = e.target.closest('[data-qed-input]');
         if (!t) return;
         const id = parseInt(t.getAttribute('data-qed-input'), 10);
-        if (!Number.isNaN(id)) dispatchStr(id, t.value);
+        if (!Number.isNaN(id)) fireStr(t, id, t.value);
       });
       // checkboxes carry their state in `.checked`, not `.value` — send it as a
       // string into the same handler table (Lean parses "true"/"false").
@@ -96,14 +116,14 @@
         const t = e.target.closest('[data-qed-check]');
         if (!t) return;
         const id = parseInt(t.getAttribute('data-qed-check'), 10);
-        if (!Number.isNaN(id)) dispatchStr(id, t.checked ? 'true' : 'false');
+        if (!Number.isNaN(id)) fireStr(t, id, t.checked ? 'true' : 'false');
       });
       // keydown/keyup send the pressed key's name into the string table
       const onKey = (attr) => (e) => {
         const t = e.target.closest(`[${attr}]`);
         if (!t) return;
         const id = parseInt(t.getAttribute(attr), 10);
-        if (!Number.isNaN(id)) dispatchStr(id, e.key);
+        if (!Number.isNaN(id)) fireStr(t, id, e.key);
       };
       root.addEventListener('keydown', onKey('data-qed-keydown'));
       root.addEventListener('keyup', onKey('data-qed-keyup'));
@@ -113,7 +133,7 @@
         if (!t) return;
         e.preventDefault();
         const id = parseInt(t.getAttribute('data-qed-submit'), 10);
-        if (!Number.isNaN(id)) dispatch(id);
+        if (!Number.isNaN(id)) fire(t, id);
       });
       // focus/blur don't bubble; focusin/focusout do, so delegate through them
       root.addEventListener('focusin', onAt('data-qed-focus'));

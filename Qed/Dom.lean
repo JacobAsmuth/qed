@@ -103,4 +103,11 @@ opaque insertBefore (parent : Node) (index : UInt32) (child : Node) : IO Unit
 @[extern "qed_dom_mount_root"]
 opaque mountRoot (node : Node) : IO Unit
 
+/-- Is `node` still attached to the live document? The driver sweeps this after each
+    root render to garbage-collect the state of local components whose host element
+    was removed (so an unmounted `useState` cell doesn't leak, and re-mounting starts
+    fresh — React's unmount-loses-state). -/
+@[extern "qed_dom_is_connected"]
+opaque isConnected (node : Node) : IO Bool
+
 end Qed.Dom

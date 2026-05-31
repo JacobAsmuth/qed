@@ -191,6 +191,14 @@ def chatApp : App Model Msg := application init update view effects
 
 ### Lists and Components
 
+A `Component` is a reusable `update`+`view` over its own state and message. Embedding
+one per row used to mean four pieces of hand-written plumbing; `embed` writes three of
+them for you. You still declare the one constructor Lean won't let a macro add to your
+`Msg` — then `embed Row as row keyedBy … into rows` generates `rowView` (the row's view
+with its messages stamped by its key) and `rowUpdate` (route a message to the matching
+row). Routing is by *key*, the same stable identity the diff reconciles by, so a message
+can't land on the wrong row after a sort.
+
 ```lean
 namespace Row                       -- a component
   structure Model where
@@ -213,9 +221,11 @@ structure Model where
 inductive Msg
   | edit (s : String)
   | add
-  | row (i : Nat) (msg : Row.Msg)   -- a message bubbling up from inside row i
+  | row (k : String) (msg : Row.Msg)   -- a message bubbling up from the row with key k
   | remove (id : Nat)
   | sort
+
+embed Row as row keyedBy (fun r => toString r.id) into rows   -- generates rowView / rowUpdate
 
 def update (m : Model) : Msg → Model
   | .edit s    => { m with draft := s }
@@ -223,7 +233,7 @@ def update (m : Model) : Msg → Model
                   if t.isEmpty then m
                   else { m with rows   := m.rows.push { id := m.nextId, text := t, done := false }
                                 draft  := "", nextId := m.nextId + 1 }
-  | .row i msg => { m with rows := Row.component.updateAt m.rows i msg }   -- route it to that one row
+  | .row k msg => rowUpdate m k msg                            -- route it to that one row, by key
   | .remove id => { m with rows := m.rows.filter (·.id != id) }
   | .sort      => { m with rows := m.rows.qsort (fun a b => compare a.text b.text == .lt) }
 
@@ -234,9 +244,9 @@ def view (m : Model) : Html Msg :=
       button [onClick .add]  "Add",
       button [onClick .sort] "Sort"
     ],
-    ul [cls "items"] (m.rows.mapIdx fun i r =>
+    ul [cls "items"] (m.rows.map fun r =>
       li [key (toString r.id)] [               -- the key. Move this row and its DOM node tags along.
-        (Row.component.view r).map (Msg.row i),  -- the row's own view, its messages stamped "row i"
+        rowView r,                             -- the row's own view, its messages stamped by key
         button [cls "rm", onClick (.remove r.id)] "✕"
       ]).toList
   ]
@@ -244,6 +254,54 @@ def view (m : Model) : Html Msg :=
 
 The whole app is `Examples/Todo.lean`, and `test/todo_test.mjs` drives it in a real
 browser (it even checks that a row's DOM node survives a sort).
+
+### Local state
+
+Some state has no business in the root model — whether a row's editor is open, a
+half-typed draft, a per-widget counter. React keeps it in `useState`; Qed keeps it in a
+*local component*, addressed by an explicit key (not call order) and owned by the driver,
+off the verified virtual DOM. Its state is serialized (a one-line `jsonStruct`), its
+message type stays internal (no codec needed), and it can *bubble* a typed output up to
+the parent — the one channel from a self-contained child back to `update`. Incrementing or
+typing in one widget never touches the root model or its siblings, so a half-typed note
+keeps its caret while the rest of the page sits still.
+
+```lean
+namespace Widget
+  jsonStruct State where               -- only the state is serialized
+    count : Int
+    note  : String
+  inductive Msg | inc | dec | setNote (s : String) | report
+  def update (s : State) : Msg → State × Option Int   -- an optional OUTPUT to bubble up
+    | .inc       => ({ s with count := s.count + 1 }, none)
+    | .dec       => ({ s with count := s.count - 1 }, none)
+    | .setNote t => ({ s with note := t }, none)
+    | .report    => (s, some s.count)
+  def view (s : State) : Html Msg :=
+    div [cls "widget"] [
+      button [onClick .dec] "−", span [cls "count"] [toString s.count], button [onClick .inc] "+",
+      input  [value s.note, onInput .setNote],
+      button [onClick .report] "Report ↑"
+    ]
+  def reg : LocalDef := LocalDef.of "widget" { count := 0, note := "" } view update
+end Widget
+
+-- in the parent view: an empty host the driver fills; a Report bubbles up to the root.
+-- `.localInit` seeds THIS instance from row data — React's `useState(propValue)`.
+div [(localMountWith "widget" (toString r.id) (fun c => some (Msg.reported r.id c)))
+       .localInit ({ count := 0, note := r.label } : Widget.State)] []
+
+-- and register it with the app
+def app : App Model Msg := application init update view (locals := [Widget.reg])
+```
+
+Local components **nest** (a widget can embed another, which bubbles up to it), their
+state is **garbage-collected** when their host leaves the DOM (unmount loses state, like
+React), and the whole store **snapshots and restores** through `window.qed.snapshot()` /
+`.restore(json)` — free time-travel and persistence, since it's all serialized. The whole
+app is `Examples/Local.lean`; `test/local_test.mjs` drives all of it in a real browser
+(seeding from props, sibling isolation, caret survival, two-level bubbling, GC, and
+snapshot/restore).
 
 ### Talking to the outside world
 
@@ -346,14 +404,14 @@ muscle memory you've got. When you're hacking on the framework itself, the in-re
 |------|------|
 | `Qed/Html.lean` | The core typed virtual DOM — the thing every bit of nice syntax eventually becomes. |
 | `Qed/Notation.lean` | The readable view combinators (`div`, `button`, `onClick`, …). |
-| `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`, `routed`), the `Cmd` effects (`stream`/`now`/`request`/`getJson`/`pushUrl`), and the pure render-to-HTML. |
+| `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`, `routed`), the `Cmd` effects (`stream`/`now`/`request`/`getJson`/`pushUrl`), local-state components (`LocalDef`, `localMount`/`localMountWith`, `App.locals`), and the pure render-to-HTML. |
 | `Qed/Invariant.lean` | The `invariant … preserved_by …` command (it discharges the proof for you). |
 | `Qed/Diff.lean` | The diff/patch engine — positional reconcile (add/remove) and keyed reconcile (reorder by `key`) — plus the `diff_apply` correctness proof. |
 | `Qed/Json.lean` | The full JSON parser/renderer + `jsonStruct`/`jsonCodec`, with the `parse_depth_le` & `parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law baked in as a field), the `router` command, and `toURL`/`fromURL` for the browser. |
 | `Qed/Form.lean` | Typed refinement fields (`Field p`), the `Input` controls (text/number/checkbox/date/select/radios), and the `form` command (Draft + `parse` + `formView` + the `canSubmit_iff` proof). |
 | `Qed/Date.lean` | A calendar `Date` that can't be invalid (smart constructor + ISO parser; impossible dates parse to `none`). |
-| `Qed/Component.lean` | `Component` (a reusable `update`+`view`) + `viewList`/`updateAt` for repeating one per row. |
+| `Qed/Component.lean` | `Component` (a reusable `update`+`view`), `viewList`/`updateAt`/`updateKeyed` for repeating one per row, and the `embed` macro that writes the per-row wiring. |
 | `Qed/Dom.lean` | The `@[extern]` DOM primitives — the one trusted boundary. |
 | `Qed/Driver.lean` | The impure browser driver (build + patch) + the `@[export]`ed entry points. |
 | `Examples/` | Example programs. |

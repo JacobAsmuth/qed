@@ -61,6 +61,34 @@ def Cmd.getJson [FromJson α] (url : String) (onOk : α → msg) (onErr : String
 def Cmd.postJson [FromJson α] (url body : String) (onOk : α → msg) (onErr : String → msg) : Cmd msg :=
   .request "POST" url body (httpDecode onOk onErr)
 
+/-! ### Local-state components (React `useState`, keyed)
+
+A *local* component owns state the parent never declares: the driver keeps it in a
+keyed store, addressed by an explicit key (not React's fragile call-order). To stay
+off the verified virtual DOM — so `Html.map`/`diff` never recurse into it and remain
+total — a local component's typed `view`/`update` are erased here behind a string
+boundary. The child's **state** is serialized (`ToJson`/`FromJson`); its **message**
+type stays internal (wired by the driver), so it needs no codec. A child may emit a
+typed **output** that the host's `bubble` maps to a parent message (`localMountWith`),
+the one type-safe channel from a self-contained child back to the root `update`. -/
+
+/-- A child message, erased to its effect on serialized state. `run currentState`
+    yields the next serialized state and an optional serialized output to bubble up. -/
+structure LocalMsg where
+  run : String → String × Option String
+
+/-- A registered local component, type-erased over its state/message/output. `view`
+    decodes the stored state, renders the child, and replaces each child message with
+    its erased `LocalMsg`. Lives as pure data in `App.locals`; the driver gives it a
+    keyed store and its own event tables. Build one with `LocalDef.of`/`.ofSimple`. -/
+structure LocalDef where
+  /-- The registry id referenced by `localMount component …`. -/
+  id   : String
+  /-- The serialized initial state, used the first time an instance key is seen. -/
+  init : String
+  /-- Render the child from serialized state, messages erased to `LocalMsg`. -/
+  view : String → Html LocalMsg
+
 /-- A self-contained application: an initial (model, startup effect), a transition
     that may request effects, and a view. A transition returns `(nextModel, cmd)`;
     use `(m, .none)` (or just the pure `sandbox`) when there is no effect. -/
@@ -76,6 +104,11 @@ structure App (Model : Type) (Msg : Type) where
       `Cmd.pushUrl`. The app parses the path (e.g. `Router.fromURL`) into its route.
       Left `none` by `sandbox`/`application`; set by `routed`. -/
   onUrlChange : Option (String → Msg) := none
+  /-- Local components (`useState`-style) this app embeds, registered by id. The
+      driver installs them and routes their events to a per-instance keyed store. A
+      view references one with `localMount`/`localMountWith`. Empty for apps that use
+      none. -/
+  locals : List LocalDef := []
 
 /-- Build an `App` with no side effects (the Elm "sandbox"). -/
 def sandbox (init : Model) (update : Model → Msg → Model) (view : Model → Html Msg) :
@@ -95,10 +128,11 @@ def sandbox (init : Model) (update : Model → Msg → Model) (view : Model → 
 def application (init : Model)
     (update  : Model → Msg → Model)
     (view    : Model → Html Msg)
-    (effects : Model → Msg → Cmd Msg := fun _ _ => .none) : App Model Msg :=
+    (effects : Model → Msg → Cmd Msg := fun _ _ => .none)
+    (locals  : List LocalDef := []) : App Model Msg :=
   { init   := (init, .none)
     update := fun m msg => let m' := update m msg; (m', effects m' msg)
-    view }
+    view, locals }
 
 /-- Build a URL-routed `App`. Same as `application`, plus `onUrlChange`: the message
     fired with the new path whenever the URL changes (startup, `link` clicks,
@@ -113,6 +147,63 @@ def routed (init : Model)
     update := fun m msg => let m' := update m msg; (m', effects m' msg)
     view
     onUrlChange := some onUrlChange }
+
+/-- Register a local component with an output it can bubble to its parent. `update`
+    returns the next state and an optional output; the output is serialized and handed
+    to the host's `bubble` (see `localMountWith`). The message type `M` needs no codec
+    — only the state `S` (round-tripped through the store) and the output `O`. -/
+def LocalDef.of {S M O : Type} [ToJson S] [FromJson S] [ToJson O]
+    (id : String) (init : S)
+    (view : S → Html M) (update : S → M → S × Option O) : LocalDef :=
+  let dec : String → S := fun s => ((Json.parse s).bind FromJson.fromJson).toOption.getD init
+  { id   := id
+    init := Json.render (ToJson.toJson init)
+    view := fun s => (view (dec s)).map fun m =>
+      { run := fun st =>
+          let (s', o) := update (dec st) m
+          (Json.render (ToJson.toJson s'), o.map fun x => Json.render (ToJson.toJson x)) } }
+
+/-- Register a local component with no output (a self-contained widget that never
+    notifies its parent). Only the state `S` needs a codec. -/
+def LocalDef.ofSimple {S M : Type} [ToJson S] [FromJson S]
+    (id : String) (init : S) (view : S → Html M) (update : S → M → S) : LocalDef :=
+  let dec : String → S := fun s => ((Json.parse s).bind FromJson.fromJson).toOption.getD init
+  { id   := id
+    init := Json.render (ToJson.toJson init)
+    view := fun s => (view (dec s)).map fun m =>
+      { run := fun st => (Json.render (ToJson.toJson (update (dec st) m)), none) } }
+
+/-- The driver's internal identity for a local instance: the component id namespaced
+    with the user `key`, so two *different* components that reuse the same key string
+    (e.g. a counter and an editor both keyed by a row id) never collide in the store. -/
+def localKey (component key : String) : String := component ++ "@" ++ key
+
+/-- Mount a registered local component at instance `key`, ignoring any output: a
+    self-contained `useState` cell. `key` need only be unique *within* `component`
+    (the driver namespaces it by component) and stable across renders. -/
+def localMount (component key : String) : Attr msg :=
+  .localCell key component none (fun _ => none)
+
+/-- Mount a registered local component at instance `key`, mapping its serialized
+    output through `onOut` to an optional parent message — the type-safe way a child
+    event reaches the root `update`. -/
+def localMountWith {O msg : Type} [FromJson O] (component key : String)
+    (onOut : O → Option msg) : Attr msg :=
+  .localCell key component none fun s =>
+    (((Json.parse s).bind FromJson.fromJson : Except String O)).toOption.bind onOut
+
+/-- Seed THIS instance's initial state from parent data, overriding the component's
+    registered default — React's `useState(propValue)`. Compose onto a `localMount`/
+    `localMountWith`: `(localMountWith "editor" k onSave).localInit { text := r.text }`.
+    It only applies the first time the key is mounted; a later re-render keeps whatever
+    the user has since typed (the live state wins, exactly like a `useState` seed). -/
+private def attrWithLocalInit {msg : Type} (a : Attr msg) (i : String) : Attr msg :=
+  match a with
+  | .localCell key comp _ bubble => .localCell key comp (some i) bubble
+  | x => x
+
+def Attr.localInit {msg S : Type} [ToJson S] (a : Attr msg) (init : S) : Attr msg :=
+  attrWithLocalInit a (Json.render (ToJson.toJson init))
 
 /-- Escape text/attribute values so model data cannot break out of the markup. -/
 def escapeHtml (s : String) : String :=
@@ -164,6 +255,7 @@ def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .onSubmit m  => (s!" data-qed-submit=\"{hs.size}\"", hs.push m)
   | .onBlur m    => (s!" data-qed-blur=\"{hs.size}\"", hs.push m)
   | .onFocus m   => (s!" data-qed-focus=\"{hs.size}\"", hs.push m)
+  | .localCell key comp _ _ => (s!" data-qed-local=\"{escapeHtml (localKey comp key)}\"", hs)   -- marks the host; the driver fills it
 
 /-- Render a list of attributes left-to-right, threading the handler table. -/
 def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg
@@ -191,8 +283,32 @@ mutual
         (s1 ++ s2, hs2)
 end
 
-/-- Render a node to an HTML string (model data escaped). The single renderer:
-    used for native sanity checks and server-side rendering. -/
+/-- Render a node to an HTML string (model data escaped). The total renderer: a
+    local host renders *empty* (the driver fills it in the browser). Used for native
+    sanity checks and server-side rendering where local content isn't needed. -/
 def Html.render (h : Html msg) : String := (renderNode #[] h).1
+
+/-- Render a node to a string, filling each local host with its component's *initial*
+    view (looked up in `locals`), so native/server-side output isn't blank where a
+    local component will mount. Best-effort and `partial` — a local view is arbitrary
+    and may nest — unlike the total `Html.render`. The browser driver rebuilds local
+    subtrees on mount (a full `replaceChildren`), so this output never has to round-trip
+    or hydrate; it is for first paint and no-JS rendering. -/
+partial def renderWithLocals {m : Type} (locals : List LocalDef) : Html m → String
+  | .text s => escapeHtml s
+  | .element tag attrs children =>
+      let attrStr := (renderAttrs #[] (normalizeAttrs attrs)).1
+      let local?  := attrs.findSome? (fun | .localCell _ comp init _ => some (comp, init) | _ => none)
+      let childStr := match local? with
+        | some (comp, init?) =>
+            match locals.find? (fun d : LocalDef => d.id == comp) with
+            | some ldef => renderWithLocals locals (ldef.view (init?.getD ldef.init))
+            | none      => ""
+        | none => String.join (children.map (renderWithLocals locals))
+      s!"<{tag}{attrStr}>{childStr}</{tag}>"
+
+/-- `Html.render`, but local hosts are filled with their initial view (see
+    `renderWithLocals`). Pass the app's `locals`. -/
+def Html.renderWith (locals : List LocalDef) (h : Html msg) : String := renderWithLocals locals h
 
 end Qed

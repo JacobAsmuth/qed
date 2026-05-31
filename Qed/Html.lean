@@ -44,6 +44,17 @@ inductive Attr (msg : Type) where
   | onBlur (m : msg)
   /-- A focus-gained handler (`focus`). -/
   | onFocus (m : msg)
+  /-- Mark this element as a locally-stateful child instance (React `useState`, but
+      the cell is addressed by an explicit key rather than call order). `key` is the
+      instance's identity in the driver's state store; `component` names a registered
+      local component whose `view`/`update` live in the driver — deliberately *off*
+      the pure virtual DOM, so `Html.map`/`diff` never recurse into it and stay total
+      and proof-free. `init?` optionally seeds *this* instance's state from parent data
+      (the `useState(propValue)` case), overriding the component's registered default.
+      `bubble` maps the child's serialized *output* to an optional parent message: the
+      type-safe channel by which a self-contained child event can still reach the root
+      `update`. The host renders empty; the driver fills its children from local state. -/
+  | localCell (key component : String) (init? : Option String) (bubble : String → Option msg)
 
 /-- A typed virtual-DOM node. Note this inductive is *total*: there is no
     constructor for "failed render", so a well-typed `view` cannot crash. -/
@@ -79,6 +90,9 @@ def Attr.map (f : α → β) : Attr α → Attr β
   | .onSubmit m   => .onSubmit (f m)
   | .onBlur m     => .onBlur (f m)
   | .onFocus m    => .onFocus (f m)
+  -- Only the bubble carries `msg`; the child's own view/messages live in the driver,
+  -- so relabelling the parent never has to recurse into the local subtree (total).
+  | .localCell k c i b => .localCell k c i (fun s => (b s).map f)
 
 mutual
   /-- Remap the message type of a whole tree — the basis of component

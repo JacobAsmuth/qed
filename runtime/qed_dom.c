@@ -15,6 +15,7 @@
 #include <emscripten.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ---- JS-side DOM node handle table --------------------------------------- */
 EM_JS(void, qed_js_init, (void), {
@@ -144,6 +145,11 @@ EM_JS(void, qed_js_mount_root, (int node), {
   if (root && el) { root.replaceChildren(el); }
 });
 
+EM_JS(int, qed_js_is_connected, (int node), {
+  var el = globalThis.__qed.nodes[node];
+  return (el && el.isConnected) ? 1 : 0;
+});
+
 /* ---- @[extern] implementations (signatures per generated C) -------------- */
 LEAN_EXPORT lean_object *qed_dom_create_element(lean_object *tag, lean_object *world) {
   (void) world;
@@ -270,6 +276,12 @@ LEAN_EXPORT lean_object *qed_dom_mount_root(uint32_t node, lean_object *world) {
   return lean_io_result_mk_ok(lean_box(0));
 }
 
+LEAN_EXPORT lean_object *qed_dom_is_connected(uint32_t node, lean_object *world) {
+  (void) world;
+  uint8_t b = (uint8_t) (qed_js_is_connected((int) node) ? 1 : 0);
+  return lean_io_result_mk_ok(lean_box(b));
+}
+
 /* ---- JS → Lean entry points (defined by Lean codegen) -------------------- */
 extern lean_object *qed_init(lean_object *world);
 extern lean_object *qed_dispatch(uint32_t id, lean_object *world);
@@ -278,6 +290,10 @@ extern lean_object *qed_stream_chunk(uint32_t cid, lean_object *chunk, lean_obje
 extern lean_object *qed_stream_done(uint32_t did, lean_object *world);
 extern lean_object *qed_http_done(uint32_t id, uint32_t ok, lean_object *text, lean_object *world);
 extern lean_object *qed_url_changed(lean_object *path, lean_object *world);
+extern lean_object *qed_local_dispatch(lean_object *key, uint32_t id, lean_object *world);
+extern lean_object *qed_local_dispatch_str(lean_object *key, uint32_t id, lean_object *s, lean_object *world);
+extern lean_object *qed_local_snapshot(lean_object *world);
+extern lean_object *qed_local_restore(lean_object *s, lean_object *world);
 
 static void qed_run_io(lean_object *res) {
   if (lean_io_result_is_error(res)) lean_io_result_show_error(res);
@@ -317,4 +333,36 @@ void qed_run_http_done(uint32_t id, int ok, const char *text) {
 EMSCRIPTEN_KEEPALIVE
 void qed_run_url_changed(const char *path) {
   qed_run_io(qed_url_changed(lean_mk_string(path), lean_io_mk_world()));
+}
+
+/* A no-arg event (click/submit/focus/blur) fired inside local instance `key`. */
+EMSCRIPTEN_KEEPALIVE
+void qed_run_local_dispatch(const char *key, uint32_t id) {
+  qed_run_io(qed_local_dispatch(lean_mk_string(key), id, lean_io_mk_world()));
+}
+
+/* A value event (input/check/key) fired inside local instance `key`. */
+EMSCRIPTEN_KEEPALIVE
+void qed_run_local_dispatch_str(const char *key, uint32_t id, const char *s) {
+  qed_run_io(qed_local_dispatch_str(lean_mk_string(key), id, lean_mk_string(s), lean_io_mk_world()));
+}
+
+/* Snapshot the local-state store as a JSON string. The returned buffer lives until the
+   next snapshot call (cwrap reads it synchronously as a UTF8 string). */
+static char *qed_snapshot_buf = 0;
+EMSCRIPTEN_KEEPALIVE
+const char *qed_run_local_snapshot(void) {
+  lean_object *res = qed_local_snapshot(lean_io_mk_world());
+  if (lean_io_result_is_error(res)) { lean_io_result_show_error(res); lean_dec(res); return ""; }
+  lean_object *s = lean_io_result_get_value(res);
+  if (qed_snapshot_buf) free(qed_snapshot_buf);
+  qed_snapshot_buf = strdup(lean_string_cstr(s));
+  lean_dec(res);
+  return qed_snapshot_buf;
+}
+
+/* Restore the local-state store from a snapshot string and re-render every instance. */
+EMSCRIPTEN_KEEPALIVE
+void qed_run_local_restore(const char *s) {
+  qed_run_io(qed_local_restore(lean_mk_string(s), lean_io_mk_world()));
 }

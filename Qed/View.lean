@@ -56,13 +56,18 @@ inductive View (σ : Type) (msg : Type) where
   /-- Conditional structure: render `child` when `cond σ`, else an empty text node
       (the slot stays present so sibling positions/bindings don't shift). -/
   | showIf (cond : σ → Bool) (child : View σ msg)
-  /-- A keyed list: a container `tag` whose children are `rows σ` — a list of already-
-      keyed `Html` rows. Built by the `forEach` combinator, which scopes each row's
-      template to its own row type `α` and renders it (the per-row scope stays fully
-      typed *at the combinator*, off this inductive — a nested `View α` field would be a
-      non-uniform recursive occurrence the kernel rejects). Shape changes reconcile
-      through the verified keyed `diff`. -/
-  | keyedList (tag : String) (attrs : List (VAttr σ msg)) (rows : σ → List (Html msg))
+  /-- A keyed list: a container `tag` whose rows are produced by the `forEach` combinator
+      (which scopes each row's template to its own row type `α`, off this inductive — a
+      nested `View α` field would be a non-uniform recursive occurrence the kernel
+      rejects). The three driver-facing projections of the model are: `keys` (the row keys
+      in order — cheap, drives the structural fast/slow decision), `sigs` (every row's
+      dynamic values as `(signalName, value)` — the per-row *signals* that make a
+      value-only update O(changed) with no diff and no `childAt`), and `rowsHtml` (the
+      keyed `Html` rows, each dynamic leaf a `signalBind` node — used to build and, on a
+      *shape* change, reconcile through the verified keyed `diff`). -/
+  | keyedList (tag : String) (attrs : List (VAttr σ msg))
+      (keys : σ → Array String) (sigs : σ → Array (String × String))
+      (rowsHtml : σ → List (Html msg))
   /-- An escape hatch: drop a fully-formed `Html` subtree into a template (e.g. to reuse
       an existing component). It is opaque to the fine-grained path — always rebuilt. -/
   | static (html : Html msg)
@@ -88,12 +93,59 @@ mutual
     | .dyn get,         s => .text (get s)
     | .element t as ks, s => .element t (as.map (VAttr.eval s)) (View.renderEach ks s)
     | .showIf cond ch,  s => if cond s then View.render ch s else .text ""
-    | .keyedList tag as rows, s => .element tag (as.map (VAttr.eval s)) (rows s)
+    | .keyedList tag as _ _ rowsHtml, s => .element tag (as.map (VAttr.eval s)) (rowsHtml s)
     | .static h,        _ => h
   /-- Render a list of sibling templates against one scope. -/
   def View.renderEach : List (View σ msg) → σ → List (Html msg)
     | [],      _ => []
     | k :: ks, s => View.render k s :: View.renderEach ks s
+end
+
+/-! ### Row instrumentation for fine-grained lists
+
+    A list row's dynamic leaves become *signals*: `collectDyn` lists a row template's
+    `dyn` projections in pre-order (so each gets a stable index), and `renderSig` renders
+    the row with each `dyn` as a `signalBind` node named `key#i` (its text pushed by the
+    driver via `setSignal`, never through a diff). The two walk in the same pre-order, so
+    index `i` names the same binding in both — that is what lets a value-only update set
+    just the changed rows' signals with no `childAt` and no reconcile. -/
+
+mutual
+  /-- A row template's `dyn` projections, in pre-order (index = signal suffix). -/
+  def View.collectDyn : View σ msg → List (σ → String)
+    | .text _           => []
+    | .dyn get          => [get]
+    | .element _ _ kids => View.collectDynList kids
+    | .showIf _ child   => View.collectDyn child
+    | .keyedList ..     => []     -- a nested list owns its own signals
+    | .static _         => []
+  def View.collectDynList : List (View σ msg) → List (σ → String)
+    | []      => []
+    | k :: ks => View.collectDyn k ++ View.collectDynList ks
+end
+
+mutual
+  /-- Render a row against its data, each `dyn` a `signalBind` node `key#i` (text filled by
+      `setSignal`). `n` is the running binding index, threaded so hidden `showIf` branches
+      still consume their indices — keeping the naming identical to `collectDyn`. -/
+  def View.renderSig : View σ msg → σ → String → Nat → Html msg × Nat
+    | .text s,          _, _,   n => (.text s, n)
+    | .dyn get,         s, pre, n => (.element "span" [.signalBind s!"{pre}#{n}"] [.text (get s)], n + 1)
+    | .element tag attrs kids, s, pre, n =>
+        let (cs, n') := View.renderSigList kids s pre n
+        (.element tag (attrs.map (VAttr.eval s)) cs, n')
+    | .showIf cond child, s, pre, n =>
+        if cond s then View.renderSig child s pre n
+        else (.text "", n + (View.collectDyn child).length)
+    | .keyedList tag as _ _ rowsHtml, s, _, n =>
+        (.element tag (as.map (VAttr.eval s)) (rowsHtml s), n)   -- nested list: structure only
+    | .static h,        _, _,   n => (h, n)
+  def View.renderSigList : List (View σ msg) → σ → String → Nat → List (Html msg) × Nat
+    | [],      _, _,   n => ([], n)
+    | k :: ks, s, pre, n =>
+        let (h,  n')  := View.renderSig k s pre n
+        let (hs, n'') := View.renderSigList ks s pre n'
+        (h :: hs, n'')
 end
 
 /-! ### Surface combinators
@@ -165,14 +217,21 @@ def input  (attrs : List (VAttr σ msg) := []) (kids : List (View σ msg) := [])
 /-- Render `child` only while `cond` holds (an empty slot otherwise). -/
 def showIf (cond : σ → Bool) (child : View σ msg) : View σ msg := .showIf cond child
 
-/-- A keyed list: `forEach "ul" (·.rows) (·.id) rowTemplate`. The container is `tag`;
-    each item of `items σ` renders `child` scoped to *that row*, keyed by `key`. The row
-    template is fully typed at its own scope `α`; `forEach` renders it per row (so the
-    `View σ` tree stores only the resulting keyed `Html`). Shape changes reconcile
-    through the verified keyed `diff`. -/
-def forEach {α : Type} (tag : String) (items : σ → List α) (key : α → String)
+/-- A keyed list: `forEach "ul" (·.rows) (·.id) rowTemplate`. The container is `tag`; each
+    item of `items σ` renders `child` scoped to *that row*, keyed by `key`. Each row's
+    dynamic leaves become signals named `key#i`, so the driver updates a changed row with a
+    direct `setSignal` (no `childAt`, no diff); only a change in the *set/order of keys*
+    reconciles through the verified keyed `diff`. The row template is fully typed at its own
+    scope `α` and consumed here, off the `View σ` inductive. -/
+def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → String)
     (child : View α msg) (attrs : List (VAttr σ msg) := []) : View σ msg :=
-  .keyedList tag attrs (fun s => (items s).map (fun a => withKey (key a) (View.render child a)))
+  -- the row's dynamic projections, collected once (index = signal suffix)
+  let projs := View.collectDyn child
+  .keyedList tag attrs
+    (fun s => (items s).map key)                              -- Array: the value path stays
+    (fun s => (items s).flatMap fun a =>                      -- tail-safe at any list size
+      (projs.mapIdx fun i p => (s!"{key a}#{i}", p a)).toArray)
+    (fun s => ((items s).map fun a => withKey (key a) (View.renderSig child a (key a) 0).1).toList)
 
 end V
 

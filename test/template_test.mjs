@@ -44,7 +44,7 @@ try {
 
   const count   = () => page.$eval('.count', (e) => e.textContent);
   const greeting = () => page.$$eval('.demo > p', (ps) => ps.map((p) => p.textContent));
-  const rows    = () => page.$$eval('.demo ul li', (ls) => ls.map((l) => ({ text: l.textContent, done: l.className === 'done' })));
+  const rows    = () => page.$$eval('.demo ul li', (ls) => ls.map((l) => l.textContent));
   const clickText = (t) => page.evaluate((t) => {
     const b = [...document.querySelectorAll('button')].find((b) => b.textContent === t);
     b.click();
@@ -53,7 +53,7 @@ try {
   // initial render
   check('count starts 0', await count(), '0');
   check('no greeting initially', await greeting(), []);
-  check('two todos, first done', await rows(), [{ text: 'learn Lean', done: true }, { text: 'write a template', done: false }]);
+  check('two todos, first done', await rows(), ['✓ learn Lean', 'write a template']);
 
   // node identity across an update: tag the count element, then bump the counter
   await page.$eval('.count', (e) => (e.dataset.tag = 'sentinel'));
@@ -80,15 +80,15 @@ try {
   await sleep(30);
   check('showIf hid the greeting when empty', await greeting(), []);
 
-  // keyed list: toggle a row's done class, then add a row
+  // keyed list, value-only update: toggle a row (its text is a signal) — the row's click
+  // handler must survive even though the handler tables aren't rebuilt
   await page.evaluate(() => [...document.querySelectorAll('.demo ul li')][1].click());
-  check('second row toggled to done', (await rows())[1], { text: 'write a template', done: true });
+  check('second row toggled (signal text update)', (await rows())[1], '✓ write a template');
+  await page.evaluate(() => [...document.querySelectorAll('.demo ul li')][1].click());
+  check('row click still works after a value-only update', (await rows())[1], 'write a template');
+  // structural update: add a row
   await clickText('add todo');
-  check('row added (keyed list grew)', await rows(), [
-    { text: 'learn Lean', done: true },
-    { text: 'write a template', done: true },
-    { text: 'item 3', done: false },
-  ]);
+  check('row added (keyed list grew)', await rows(), ['✓ learn Lean', 'write a template', 'item 3']);
 } finally {
   await browser.close();
   server.kill('SIGTERM');

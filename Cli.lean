@@ -152,7 +152,7 @@ def linkWasm (outDir : FilePath) (prod : Bool) : IO Bool := do
   let allC ← collect ".lake" "c"
   -- Each of these modules carries its own `main`; link only the chosen web entry.
   let entryC := ((wr.splitOn ".").getLastD "") ++ ".c"   -- e.g. "ChatWeb.c"
-  let altMains := ["Native.c", "Cli.c", "Web.c", "ChatWeb.c", "SignupWeb.c", "BookingWeb.c", "TodoWeb.c", "UsersWeb.c", "LocalWeb.c", "EffectsWeb.c", "Bench.c", "BenchAppWeb.c", "SignalsWeb.c", "TemplateWeb.c", "BenchScalarWeb.c", "BenchScalarDiffWeb.c"].filter (· ≠ entryC)
+  let altMains := ["Native.c", "Cli.c", "Web.c", "ChatWeb.c", "SignupWeb.c", "BookingWeb.c", "TodoWeb.c", "UsersWeb.c", "LocalWeb.c", "EffectsWeb.c", "Bench.c", "BenchAppWeb.c", "SignalsWeb.c", "TemplateWeb.c", "BenchScalarWeb.c", "BenchScalarDiffWeb.c", "BenchListWeb.c", "BenchListDiffWeb.c"].filter (· ≠ entryC)
   let cfiles := allC.filter (fun p =>
     (p.toString.splitOn "build/ir").length > 1 && (p.fileName.getD "") ∉ altMains)
   IO.FS.createDirAll outDir
@@ -294,6 +294,10 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "signals_test.mjs").pathExists) then
     step "running signals tests (signals)"
     if (← sh "node" #["test/signals_test.mjs"]) != 0 then failed := true
+  -- View templates: build once, patch only changed bindings; lists update via signals.
+  if (← (FilePath.mk "test" / "template_test.mjs").pathExists) then
+    step "running template tests (View)"
+    if (← sh "node" #["test/template_test.mjs"]) != 0 then failed := true
   if failed then return 1 else return 0
 
 def cmdClean : IO UInt32 := do

@@ -238,9 +238,11 @@ inductive VState (σ : Type) (msg : Type) where
       array (which holds the mutable `shown?`/inner state — kept off this inductive
       because a recursive `IO.Ref (… VState …)` field is not a legal occurrence). -/
   | cond (cell : Nat)
-  /-- A keyed-list container and a cell of the last rows rendered into it (diffed against
-      the next render through the verified keyed reconcile). -/
-  | list (node : Dom.Node) (rows : IO.Ref (List (Html msg)))
+  /-- A keyed-list container and cells of the last render: the row keys (to decide
+      value-only vs structural), the per-row signal values (to push only what changed),
+      and the last `Html` rows (to diff on a shape change). -/
+  | list (node : Dom.Node) (keys : IO.Ref (Array String))
+      (sigs : IO.Ref (Array (String × String))) (rows : IO.Ref (List (Html msg)))
   /-- An opaque embedded `Html` subtree (`View.static`) — not fine-grained-updated. -/
   | stat (node : Dom.Node)
 
@@ -281,12 +283,14 @@ partial def buildView (h : Handlers msg) (cells : CondCells σ msg) :
       else
         let n ← Dom.createText ""
         return (n, .cond idx)
-  | .keyedList tag attrs rows, s => do
+  | .keyedList tag attrs keys sigs rowsHtml, s => do
       let node ← Dom.createElement tag
       applyAttrs h node (attrs.map (VAttr.eval s))
-      let rs := rows s
-      for r in rs do Dom.appendChild node (← buildDom h r)
-      return (node, .list node (← IO.mkRef rs))
+      let sg := sigs s
+      for (nm, v) in sg do Dom.effect "signal.set" nm v ""   -- seed signal values first…
+      let rs := rowsHtml s
+      for r in rs do Dom.appendChild node (← buildDom h r)   -- …so bindSignal reads them
+      return (node, .list node (← IO.mkRef (keys s)) (← IO.mkRef sg) (← IO.mkRef rs))
 
 /-- Walk the template against the new scope, mutating leaf cells and patching only what
     changed. `parent`/`index` locate the current node for the one case that replaces it (a
@@ -299,13 +303,12 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
       let v := get s
       if v != (← last.get) then Dom.setText node v; last.set v
   | .element _ attrs kids, s, .elem node kstates => do
-      -- re-register events (table stays in sync); re-apply dynamic attrs; leave static
-      -- values alone (set once at build)
+      -- re-apply dynamic *value* attributes; leave static attrs and all events alone (set
+      -- once at build — the tables are not reset, so re-registering would grow them)
       for va in attrs do
-        let a := VAttr.eval s va
         match va with
-        | .bind _ => applyAttr h node a
-        | .stat _ => if a.isEvent then applyAttr h node a else pure ()
+        | .bind f => let a := f s; unless a.isEvent do applyAttr h node a
+        | .stat _ => pure ()
       let mut i : UInt32 := 0
       for k in kids do
         patchView h cells node i k s (kstates.getD i.toNat default)
@@ -325,13 +328,27 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
         let n ← Dom.createText ""                   -- shown → hidden: empty the slot
         Dom.replaceChild parent index n
         cells.modify (·.set! idx (false, none))
-  | .keyedList tag attrs rows, s, .list node lastRows => do
-      -- structural reconcile through the verified diff: same tag/attrs, children diffed
-      let evAttrs := attrs.map (VAttr.eval s)
-      let newRows := rows s
-      applyToDom h parent index node
-        (diff (.element tag evAttrs (← lastRows.get)) (.element tag evAttrs newRows))
-      lastRows.set newRows
+  | .keyedList tag attrs keys sigs rowsHtml, s, .list node lastKeys lastSigs lastRows => do
+      if (keys s) == (← lastKeys.get) then
+        -- value-only update: the key set/order is unchanged, so no row was added, removed,
+        -- or moved. Push only the rows whose signal value changed — a direct `setSignal`
+        -- (JS Map write), no `Html` built, no diff, no `childAt`. This is the list win.
+        let newSigs := sigs s
+        let oldSigs ← lastSigs.get
+        for i in [0:newSigs.size] do
+          let (nm, v) := newSigs[i]!
+          if v != (oldSigs.getD i ("", "")).2 then Dom.effect "signal.set" nm v ""
+        lastSigs.set newSigs
+      else
+        -- the keys changed (add/remove/reorder): seed signal values first (so freshly built
+        -- rows bind to them), then reconcile structure through the verified diff.
+        let newSigs := sigs s
+        for (nm, v) in newSigs do Dom.effect "signal.set" nm v ""
+        let evAttrs := attrs.map (VAttr.eval s)
+        let newRows := rowsHtml s
+        applyToDom h parent index node
+          (diff (.element tag evAttrs (← lastRows.get)) (.element tag evAttrs newRows))
+        lastKeys.set (keys s); lastSigs.set newSigs; lastRows.set newRows
   | .text _,   _, _ => pure ()
   | .static _, _, _ => pure ()
   | v, s, _ => do
@@ -567,17 +584,19 @@ def run (app : App Model Msg) (template : Option (View Model Msg) := none) : IO 
     for k in dead do
       instancesRef.modify (·.erase k); storeRef.modify (·.erase k)
   let renderModel : IO Unit := do
-    clickRef.set #[]; inputRef.set #[]
     match template with
     | some t => do
-        -- Fine-grained path: build once, thereafter walk the template and patch only
-        -- the bindings whose projection changed (no new tree, no diff for the scalars).
+        -- Fine-grained path: build once, thereafter walk the template and patch only the
+        -- bindings whose projection changed (no new tree, no diff for the scalars). The
+        -- handler tables are NOT reset here: static events are registered once at build and
+        -- persist, so a value-only update touches no events (and a row click survives it).
         match ← vstateRef.get with
         | none => do
             let (node, vst) ← buildView h condCells t (← modelRef.get)
             Dom.mountRoot node; rootRef.set node; vstateRef.set (some vst)
         | some vst => patchView h condCells (← rootRef.get) 0 t (← modelRef.get) vst
     | none => do
+        clickRef.set #[]; inputRef.set #[]
         let newTree := app.view (← modelRef.get)
         (match ← treeRef.get with
          | none => do

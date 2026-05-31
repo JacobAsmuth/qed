@@ -34,12 +34,15 @@ def update (m : Model) : Msg → Model
       { vals := m.vals.set! i (m.vals.getD i 0 + 1), tick := m.tick + 1 }
 
 def template : View Model Msg :=
-  div [cls "grid"]
-    ((List.range n).map fun i =>
-      if i % 20 == 0 then
-        div [cls "cell"] [dyn (fun m => toString (m.vals.getD i 0))]
-      else
-        div [cls "cell"] [text s!"static cell {i}"])
+  div [] [
+    button [onClick .bump] "bump",          -- click id 0: the benchmark dispatches this
+    div [cls "grid"]
+      ((List.range n).map fun i =>
+        if i % 20 == 0 then
+          div [cls "cell"] [dyn (fun m => toString (m.vals.getD i 0))]
+        else
+          div [cls "cell"] [text s!"static cell {i}"])
+  ]
 
 def app : App Model Msg := templated init update template
 

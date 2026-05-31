@@ -25,13 +25,13 @@ deriving Inhabited
 structure Model where
   count : Nat
   name  : String
-  todos : List Todo
+  todos : Array Todo
   nextId : Nat
 
 def init : Model :=
   { count := 0, name := "", nextId := 3
-    todos := [{ id := 1, text := "learn Lean", done := true },
-              { id := 2, text := "write a template", done := false }] }
+    todos := #[{ id := 1, text := "learn Lean", done := true },
+               { id := 2, text := "write a template", done := false }] }
 
 inductive Msg
   | inc | dec
@@ -44,14 +44,15 @@ def update (m : Model) : Msg → Model
   | .dec        => { m with count := m.count - 1 }
   | .setName s  => { m with name := s }
   | .toggle id  => { m with todos := m.todos.map fun t => if t.id == id then { t with done := !t.done } else t }
-  | .add        => { m with todos := m.todos ++ [{ id := m.nextId, text := s!"item {m.nextId}", done := false }],
+  | .add        => { m with todos := m.todos.push { id := m.nextId, text := s!"item {m.nextId}", done := false },
                             nextId := m.nextId + 1 }
 
-/-- The row template — scoped to a `Todo`. Its text and class read the row; the toggle
-    message reads the row's id (`onClick'`). -/
+/-- The row template — scoped to a `Todo`. Its text reads the row (a check mark when
+    done); the toggle message reads the row's id (`onClick'`). The text is a signal, so a
+    toggle updates just this row's node — no diff, no `childAt`. -/
 def todoRow : View Todo Msg :=
-  li [bindAttr (fun t => Qed.Attr.cls (if t.done then "done" else "")), onClick' (fun t => .toggle t.id)]
-     [dyn (·.text)]
+  li [onClick' (fun t => .toggle t.id)]
+     [dyn (fun t => (if t.done then "✓ " else "") ++ t.text)]
 
 def template : View Model Msg :=
   div [cls "demo"] [

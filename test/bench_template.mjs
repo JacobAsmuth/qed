@@ -40,13 +40,17 @@ async function measure(root, port) {
   }
 }
 
-const templ = await measure('Examples.BenchScalarWeb', 8150);
-const diff  = await measure('Examples.BenchScalarDiffWeb', 8151);
+const sTempl = await measure('Examples.BenchScalarWeb', 8150);
+const sDiff  = await measure('Examples.BenchScalarDiffWeb', 8151);
+const lTempl = await measure('Examples.BenchListWeb', 8152);
+const lDiff  = await measure('Examples.BenchListDiffWeb', 8153);
 await browser.close();
 
-console.log(`\n  ${BenchScalarLabel()} — median of ${REPS} updates (ms)\n`);
-console.log(`  diff path (rebuild + diff 2000 nodes) : ${fmt(diff)}`);
-console.log(`  View template (fine-grained)          : ${fmt(templ)}`);
-console.log(`  speedup                               : ${(diff / templ).toFixed(1)}×\n`);
-function BenchScalarLabel() { return '2000 bound values, 1 changed per update'; }
+console.log(`\n  median of ${REPS} updates (ms)\n`);
+console.log('  scalar — 2000 bound values, 1 changed per update');
+console.log(`    diff path (rebuild + diff 2000 nodes) : ${fmt(sDiff)}`);
+console.log(`    View template (fine-grained)          : ${fmt(sTempl)}   (${(sDiff / sTempl).toFixed(1)}×)`);
+console.log('\n  list — 10,000 keyed rows, every 10th text changed (keys unchanged)');
+console.log(`    diff path (rebuild + diff + childAt)  : ${fmt(lDiff)}`);
+console.log(`    View template (forEach → signals)     : ${fmt(lTempl)}   (${(lDiff / lTempl).toFixed(1)}×)\n`);
 process.exit(0);

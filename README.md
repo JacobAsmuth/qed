@@ -392,6 +392,39 @@ offers. The whole battery (`localStorage`, `setTitle`, `randomInt`, `pickFile`, 
 driven in a real browser by `test/effects_test.mjs`. Local-component state has a matching
 pair — `window.qed.snapshot()` / `.restore(json)` — for persistence and time-travel.
 
+### Fine-grained view templates
+
+`view : Model → Html Msg` rebuilds the whole tree each update and lets the diff find what
+changed — simple, and fast enough to beat React on whole-list operations. But for a page
+that's mostly static with a few live values, rebuilding everything to change one is wasted
+work. A **`View` template** is the alternative: built into DOM once, then on update only
+the model *projections* re-run, patching just the nodes whose value changed — no tree
+rebuilt, nothing diffed. The value still lives in the model and `update` stays the pure
+`Model → Msg → Model`; the binding is *derived*, not a side channel. You write it like an
+ordinary view, and the `view%` macro lifts each `text` that reads the model into a binding:
+
+```lean
+def template : View Model Msg :=
+  view% fun m =>
+    div [] [
+      span [] [text s!"Count: {m.count}"],           -- a bound text node
+      showIf (·.loading) (p [] [text "loading…"]),    -- conditional structure
+      forEach "ul" (·.rows) (·.id) row                -- a keyed list
+    ]
+
+def app := templated init update template
+```
+
+Static structure is built once; `showIf`/`forEach` reconcile through the *same verified
+`diff`* when their shape changes. A keyed list goes further — each row's text is a signal,
+so changing a row's value pushes straight to its node, no `childAt` and no reconcile.
+Against the diff path on the same app (`test/bench_template.mjs`): a 2,000-node mostly-static
+page updates **3.7× faster**, and a 10,000-row list with 1,000 rows changing **4.6× faster**
+(40 ms → 8.8 ms). The honest gap to hand-written signals is that the template re-checks
+every binding to *find* what changed (pure Lean has no dependency tracking), so it's a
+category win over the diff, not a tie with `setSignal`. `Examples/Template.lean` is the
+demo; `test/template_test.mjs` drives it in a browser.
+
 ## So what's actually happening?
 
 Here's the trip from "I wrote some Lean" to "pixels in a browser":
@@ -455,6 +488,7 @@ muscle memory you've got. When you're hacking on the framework itself, the in-re
 | `Qed/Form.lean` | Typed refinement fields (`Field p`), the `Input` controls (text/number/checkbox/date/select/radios), and the `form` command (Draft + `parse` + `formView` + the `canSubmit_iff` proof). |
 | `Qed/Date.lean` | A calendar `Date` that can't be invalid (smart constructor + ISO parser; impossible dates parse to `none`). |
 | `Qed/Component.lean` | `Component` (a reusable `update`+`view`), `viewList`/`updateAt`/`updateKeyed` for repeating one per row, and the `embed` macro that writes the per-row wiring. |
+| `Qed/View.lean` | Fine-grained `View` templates: `dyn`/`showIf`/`forEach`, the `templated` builder, and the `view%` auto-lift macro. Built once, then only changed bindings patch (lists update via signals). |
 | `Qed/Dom.lean` | The `@[extern]` DOM primitives — the one trusted boundary. |
 | `Qed/Driver.lean` | The impure browser driver (build + patch) + the `@[export]`ed entry points. |
 | `Examples/` | Example programs. |

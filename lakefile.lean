@@ -29,3 +29,8 @@ lean_exe web where
     and runs this binary. -/
 lean_exe qed where
   root := `Cli
+
+/-- Native performance benchmarks for the rebuild + diff pipeline. `lake exe bench`.
+    Pure Lean (no DOM externs), so it links natively. -/
+lean_exe bench where
+  root := `Examples.Bench

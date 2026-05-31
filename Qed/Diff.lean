@@ -28,6 +28,7 @@
   wholesale.
 -/
 import Qed.Html
+import Std.Data.HashMap
 
 namespace Qed
 
@@ -39,9 +40,16 @@ def Html.keyOf : Html msg → Option String
 /-- Reconcile this child list by key? Only when *every* child carries one. -/
 def childrenKeyed (cs : List (Html msg)) : Bool := cs.all (fun c => (Html.keyOf c).isSome)
 
-/-- The index of the old child carrying `key`, if any. -/
-def findKeyIdx (old : List (Html msg)) (key : String) : Option Nat :=
-  old.findIdx? (fun o => Html.keyOf o == some key)
+/-- Maps each key to the index of the *first* old child carrying it, built once per
+    keyed list so the reconcile can look a child up in `O(1)`. Correctness does not
+    depend on this map: a wrong or missing index just reuses a different (or default)
+    old node, which `diff` still patches into the correct result, so it carries no
+    proof obligation. -/
+def keyIndex (old : List (Html msg)) : Std.HashMap String Nat :=
+  (old.foldl (init := ((∅ : Std.HashMap String Nat), 0)) fun (acc, i) c =>
+    match Html.keyOf c with
+    | some k => (if acc.contains k then acc else acc.insert k i, i + 1)
+    | none   => (acc, i + 1)).1
 
 mutual
   /-- A description of how to turn one `Html` node into another. -/
@@ -83,7 +91,7 @@ mutual
     | .text _,          .text s          => .setText s
     | .element t₁ _ c₁, .element t₂ a₂ c₂ =>
         if t₁ = t₂ then
-          if childrenKeyed c₂ then .patchKeyed a₂ (diffKeyed c₁ c₂)
+          if childrenKeyed c₂ then .patchKeyed a₂ (diffKeyed c₁.toArray (keyIndex c₁) c₂)
           else .patchElement a₂ (diffChildren c₁ c₂)
         else .replace (.element t₂ a₂ c₂)
     | _,                b                 => .replace b
@@ -94,15 +102,18 @@ mutual
     | [],      bs      => .append bs
     | _ :: _,  []      => .drop
   /-- Keyed reconcile: for each new child (in order) reuse the like-keyed old child
-      patched in place, else create it fresh. -/
-  def diffKeyed : List (Html msg) → List (Html msg) → List (KeyedStep msg)
-    | _,   []      => []
-    | old, n :: ns =>
+      patched in place, else create it fresh. The old children come pre-indexed —
+      `oldArr` for `O(1)` access by position, `km` for `O(1)` key lookup — so the whole
+      reconcile is `O(n)`. -/
+  def diffKeyed (oldArr : Array (Html msg)) (km : Std.HashMap String Nat) :
+      List (Html msg) → List (KeyedStep msg)
+    | []      => []
+    | n :: ns =>
         (match Html.keyOf n with
-         | some k => match findKeyIdx old k with
-                     | some i => .reuse i (diff (old.getD i default) n)
+         | some k => match km[k]? with
+                     | some i => .reuse i (diff (oldArr.getD i default) n)
                      | none   => .create n
-         | none   => .create n) :: diffKeyed old ns
+         | none   => .create n) :: diffKeyed oldArr km ns
 end
 
 mutual
@@ -124,7 +135,7 @@ mutual
       at its recorded index or building a fresh one. -/
   def applyKeyed : List (KeyedStep msg) → List (Html msg) → List (Html msg)
     | [],                _   => []
-    | .reuse i p :: rest, old => applyPatch p (old.getD i default) :: applyKeyed rest old
+    | .reuse i p :: rest, old => applyPatch p (old.toArray.getD i default) :: applyKeyed rest old
     | .create h :: rest,  old => h :: applyKeyed rest old
 end
 
@@ -151,11 +162,13 @@ mutual
         simp only [diffChildren, applyChildren]
         rw [diff_apply a b, diffChildren_apply as bs]
     | _ :: _,  []      => by simp [diffChildren, applyChildren]
-  /-- The keyed analogue: whichever old child a key matched, patching it with the
-      recorded `diff` reproduces the new child (`diff_apply`), so the rebuilt list
-      equals the new children exactly. -/
+  /-- The keyed analogue: whichever old child the key map pointed at, patching it with
+      the recorded `diff` reproduces the new child (`diff_apply`), so the rebuilt list
+      equals the new children exactly. The proof holds for *any* index the map returns,
+      so the map itself needs no correctness proof. -/
   theorem diffKeyed_apply :
-      ∀ (old new : List (Html msg)), applyKeyed (diffKeyed old new) old = new
+      ∀ (old new : List (Html msg)),
+        applyKeyed (diffKeyed old.toArray (keyIndex old) new) old = new
     | _,   []      => by simp [diffKeyed, applyKeyed]
     | old, n :: ns => by
         simp only [diffKeyed]
@@ -163,7 +176,7 @@ mutual
         · split
           · rename_i i _
             simp only [applyKeyed]
-            rw [diff_apply (old.getD i default) n, diffKeyed_apply old ns]
+            rw [diff_apply (old.toArray.getD i default) n, diffKeyed_apply old ns]
           · simp only [applyKeyed]; rw [diffKeyed_apply old ns]
         · simp only [applyKeyed]; rw [diffKeyed_apply old ns]
 end

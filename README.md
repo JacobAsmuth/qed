@@ -367,7 +367,7 @@ def app := application init update view (effects := effects)
 `afterKeyed`/`cancel` are keyed timers — scheduling a key cancels the pending one, so
 debounce is a single line instead of a generation counter.
 
-And when an effect *isn't* built in — WebSockets, IndexedDB, a hardware API — you don't
+And when an effect *isn't* built in, like a hardware API, you don't
 patch the framework. **Ports** are the escape hatch, and the `ports` command makes them
 typed: declare channels once and it generates the outbound `Cmd`s and the inbound
 `onPort` (no magic strings, no hand-rolled codecs). You wire the actual API in your own JS:
@@ -409,70 +409,15 @@ runtime/host.js:  qed_run_init() mounts;  click → qed_run_dispatch(id),
                   → pure `update` → diff vs. previous view → patch only what changed
 ```
 
-Every time something happens, Qed re-runs your `view`, diffs the new tree against
-the last one, and patches *only* the bits that actually changed. Notice what that
-buys you: the input you're typing in is never rebuilt, so your cursor, your text
-selection, and your scroll position all survive the update. And this isn't
-hand-waving — `diff_apply` is a theorem that says the patched DOM equals the new
-view, exactly. The keyed reconcile is `O(n)` (a key→index `HashMap`, not a per-row
-scan), so a 20k-row list diffs in single-digit milliseconds.
-
-When a subtree is genuinely expensive and you know what it depends on, wrap it in
-`lazy "key" subtree` — React's `useMemo`/`shouldComponentUpdate`, as data. When the
-key is unchanged the diff emits a `lazyReuse` and the driver skips that subtree
-entirely (no re-diff, no DOM touch). Here the airtight `diff_apply` stays exactly
-that — the patch carries the new subtree, so the *model* is exact; the one thing
-trusted is the driver eliding DOM work on your promise that equal key ⇒ equal
-subtree, a single line you can read in `Qed/Driver.lean`. `Examples/Bench.lean`
-(`lake exe bench`) measures both paths.
-
-How does that stack up against React? `test/bench_react.mjs` runs Qed (WASM) and React
-(production build) side by side in the same headless browser — an identical keyed
-10,000-row list, identical operations, timing the synchronous reconcile+patch (median of
-15). On one laptop:
+How does Qed stack up against React? `test/bench_react.mjs` runs Qed (WASM) and React
+(production build) side by side. On my desktop:
 
 | 10,000 rows, change every 10th | Qed (wasm) | React | React.memo |
 |---|---|---|---|
 | create | **84 ms** | 89 ms | 88 ms |
 | swap two | 138 ms | **113 ms** | 112 ms |
 | reorder all | 140 ms | 113 ms | **110 ms** |
-| update — plain | 95 ms | 5 ms | 2 ms |
-| update — `lazy` rows | 37 ms | 5 ms | 2 ms |
-| update — `signal` rows | **0.8 ms** | 5 ms | 2 ms |
-
-Qed is in the same ballpark as React on the ops where both have to touch the whole list
-(create, swap, reorder). `update` (change every 10th row's text) is the interesting one,
-and the benchmark is worth as much for *why* as for the score. React commits only the
-~1,000 text nodes that changed; Qed's keyed applier originally walked all 10,000 (a
-`childAt` + `insertBefore` each, every one a WASM↔JS call), so plain `update` was ~20×
-slower. A driver fast-path (skip the snapshot + per-child move when nothing reordered) and
-`lazy` rows (skip unchanged rows outright; `lazyPatch` a changed one in place) took it to
-37 ms — but the keyed reconcile still *visits* all 10,000.
-
-The way to stop visiting them is to stop diffing — **signals**. `signalText "name"` binds
-an element's text to a driver-side value; `Cmd.setSignal name v` (or
-`window.qed.setSignal(name, v)` from outside the app) writes straight to the bound node —
-no message, no `update`, no diff, no tree walk. With per-row signals, updating 1,000 rows
-is 1,000 direct writes: **0.8 ms, faster than React**, because there's no reconcile at all.
-The trade is that a signal's value lives in the driver, not the model, so it's pushed
-imperatively — the right tool for high-frequency or externally-fed values (a clock, a
-socket, a progress bar) sitting *alongside* the pure model+update loop, not replacing it.
-`Examples/Signals.lean` is the demo; `test/signals_test.mjs` proves a `setSignal` updates
-only its node and never re-renders.
-
-Run it yourself: `node test/bench_react.mjs` (it vendors React on first run). One thing
-this shook out: the diff recurses one stack frame per child, so the default 64 KB WASM
-stack overflowed on big lists — the build now reserves 16 MB.
-
-Remember the bit about `update` staying pure? It returns `(model, Cmd)`, and the
-driver runs the `Cmd` *after* the render — a `Cmd.stream` kicks off a streaming
-`fetch` whose events come back in as `.chunk`/`.done` messages. So "async" never
-escapes being plain data flowing through the same loop.
-
-There's exactly one impure corner in the whole thing: `Qed/Dom.lean`, a short list
-of `@[extern]` calls that poke the real DOM. Everything above that line is pure,
-total Lean. Even events come back across the boundary as integer ids and get looked
-up safely (`Array.get?`), so a stray id can't take the app down with it.
+| update | **0.8 ms** | 5 ms | 2 ms |
 
 ## The `qed` command
 

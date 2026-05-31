@@ -107,6 +107,79 @@ mutual
     | k :: ks, s => View.render k s :: View.renderEach ks s
 end
 
+/-! ### The value-patch path is a full re-render (verified)
+
+The fine-grained driver, away from a `keyedList`, does not rebuild the tree: it walks the
+template against the new scope and overwrites only the dynamic text/attributes in place.
+`applyValues` is the pure model of that patch — start from the *old* rendered tree
+(`render t s`) and reapply the dynamic parts at the new scope `s'`. `stable t s s'` is its
+precondition, exactly the driver's value-only fast path: no `keyedList`, and no `showIf`
+condition flips between `s` and `s'`. The theorem `applyValues_render` says that under
+`stable`, the in-place patch reproduces a full re-render — so the non-list template path
+inherits the same "the DOM equals the model's view" guarantee `diff_apply` gives the diff
+path. (`keyedList` rows update through signals, outside `render`, so they are excluded.) -/
+
+mutual
+  /-- The driver's value-patch as a pure function of the old rendered tree: a `dyn` becomes
+      its new text, an element re-evaluates its attributes and recurses, a non-flipping
+      `showIf` recurses into the shown branch; everything else is left as built. -/
+  def applyValues : View σ msg → σ → Html msg → Html msg
+    | .dyn get,              s', _                       => .text (get s')
+    | .element _ attrs kids, s', .element tag _ oldKids  =>
+        .element tag (attrs.map (VAttr.eval s')) (applyValuesList kids s' oldKids)
+    | .showIf cond child,    s', old                     => if cond s' then applyValues child s' old else old
+    | _,                     _,  old                     => old
+  def applyValuesList : List (View σ msg) → σ → List (Html msg) → List (Html msg)
+    | k :: ks, s', o :: os => applyValues k s' o :: applyValuesList ks s' os
+    | _,       _,  _       => []
+end
+
+mutual
+  /-- Is `t`'s structure the same at `s` and `s'` — no `keyedList`, every `showIf`
+      condition unchanged — so a value patch suffices (the driver's fast-path test)? -/
+  def stable : View σ msg → σ → σ → Bool
+    | .element _ _ kids,  s, s' => stableList kids s s'
+    | .showIf cond child, s, s' => (cond s == cond s') && stable child s s'
+    | .keyedList ..,      _, _  => false
+    | _,                  _, _  => true
+  def stableList : List (View σ msg) → σ → σ → Bool
+    | k :: ks, s, s' => stable k s s' && stableList ks s s'
+    | [],      _, _  => true
+end
+
+mutual
+  /-- **Correctness:** under `stable`, patching the old rendered tree in place reproduces
+      a full re-render at the new scope. -/
+  theorem applyValues_render (t : View σ msg) (s s' : σ) :
+      stable t s s' = true → applyValues t s' (View.render t s) = View.render t s' := by
+    intro h
+    cases t with
+    | text c        => simp [View.render, applyValues]
+    | dyn get       => simp [View.render, applyValues]
+    | static hh     => simp [View.render, applyValues]
+    | keyedList _ _ _ _ _ => simp [stable] at h
+    | element tag attrs kids =>
+        simp only [View.render, applyValues]
+        rw [applyValuesList_render kids s s' (by simpa [stable] using h)]
+    | showIf cond child =>
+        simp only [stable, Bool.and_eq_true] at h
+        have hc : cond s = cond s' := by simpa using h.1
+        simp only [View.render, applyValues, hc]
+        split
+        · exact applyValues_render child s s' h.2
+        · rfl
+  /-- The sibling-list analogue. -/
+  theorem applyValuesList_render (ts : List (View σ msg)) (s s' : σ) :
+      stableList ts s s' = true → applyValuesList ts s' (View.renderEach ts s) = View.renderEach ts s' := by
+    intro h
+    cases ts with
+    | nil       => simp [View.renderEach, applyValuesList]
+    | cons k ks =>
+        simp only [stableList, Bool.and_eq_true] at h
+        simp only [View.renderEach, applyValuesList]
+        rw [applyValues_render k s s' h.1, applyValuesList_render ks s s' h.2]
+end
+
 /-! ### Row instrumentation for fine-grained lists
 
     A list row's dynamic leaves become *signals*: `collectDyn` lists a row template's

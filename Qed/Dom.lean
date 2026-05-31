@@ -110,4 +110,20 @@ opaque mountRoot (node : Node) : IO Unit
 @[extern "qed_dom_is_connected"]
 opaque isConnected (node : Node) : IO Bool
 
+/-- Run a fire-and-forget native effect `kind` (localStorage, clipboard, focus, …)
+    with up to three string arguments. The JS host (`globalThis.__qed.effect`) switches
+    on `kind`; backs the typed `Cmd.fx` effects. -/
+@[extern "qed_dom_effect"]
+opaque effect (kind a b c : String) : IO Unit
+
+/-- Run a result-returning native effect `kind` with two arguments; the host calls back
+    `qed_effect_done id result` once it resolves (sync or async). Backs `Cmd.fxResult`. -/
+@[extern "qed_dom_effect_result"]
+opaque effectResult (kind a b : String) (id : UInt32) : IO Unit
+
+/-- Send `payload` to the JS port handler `globalThis.__qed.ports[name]` — the userland
+    effect escape hatch. Inbound comes back via `globalThis.__qed.send` → `App.onPort`. -/
+@[extern "qed_dom_port_send"]
+opaque portSend (name payload : String) : IO Unit
+
 end Qed.Dom

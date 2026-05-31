@@ -271,6 +271,10 @@ structure Runtime where
   snapshot : IO String
   /-- Replace local state from a `snapshot` string and re-render every live instance. -/
   restore  : String → IO Unit
+  /-- A native `fxResult` effect (id) resolved with `result`. -/
+  effectDone : UInt32 → String → IO Unit
+  /-- An inbound port message `(name, payload)` from the app's JS. -/
+  portRecv   : String → String → IO Unit
 
 initialize runtimeRef : IO.Ref (Option Runtime) ← IO.mkRef none
 
@@ -340,6 +344,18 @@ def qedLocalRestore (s : String) : IO Unit := do
   | some rt => rt.restore s
   | none    => pure ()
 
+@[export qed_effect_done]
+def qedEffectDone (id : UInt32) (result : String) : IO Unit := do
+  match ← runtimeRef.get with
+  | some rt => rt.effectDone id result
+  | none    => pure ()
+
+@[export qed_port_recv]
+def qedPortRecv (name payload : String) : IO Unit := do
+  match ← runtimeRef.get with
+  | some rt => rt.portRecv name payload
+  | none    => pure ()
+
 /-- Register `app` as the running application. The initial `mount` builds the DOM
     and runs the startup effect; thereafter each message updates the model, diffs
     the new view against the previous one, patches the difference, and interprets
@@ -355,6 +371,8 @@ def run (app : App Model Msg) : IO Unit := do
   let doneCbRef  ← IO.mkRef (#[] : Array Msg)
   -- HTTP response callbacks (each request's result arrives later), persistent.
   let respCbRef  ← IO.mkRef (#[] : Array (Except String String → Msg))
+  -- Native `fxResult` callbacks (storageGet/after/randomInt/paste/pickFile …), persistent.
+  let effectCbRef ← IO.mkRef (#[] : Array (String → Msg))
   -- Forward reference to the dispatcher, so an effect (`Cmd.now`) — or a local
   -- component bubbling an output — can feed a message back through the loop.
   let dispatchRef ← IO.mkRef (fun (_ : Msg) => (pure () : IO Unit))
@@ -393,7 +411,9 @@ def run (app : App Model Msg) : IO Unit := do
          | patch => applyToDom h root 0 root patch)
     treeRef.set (some newTree)
     gcLocals
-  let perform : Cmd Msg → IO Unit := fun
+  -- Interpret one leaf effect. `batch` is flattened away by `Cmd.flatten` first, so
+  -- this stays non-recursive (no termination obligation through `List.forM`).
+  let performLeaf : Cmd Msg → IO Unit := fun
     | .none => pure ()
     | .stream url body onChunk onDone => do
         let cs ← chunkCbRef.get; chunkCbRef.set (cs.push onChunk)
@@ -412,6 +432,13 @@ def run (app : App Model Msg) : IO Unit := do
         match app.onUrlChange with
         | some f => (← dispatchRef.get) (f path)
         | none   => pure ()
+    | .port name payload => Dom.portSend name payload
+    | .fx kind a b c => Dom.effect kind a b c
+    | .fxResult kind a b onResult => do
+        let cs ← effectCbRef.get; effectCbRef.set (cs.push onResult)
+        Dom.effectResult kind a b (UInt32.ofNat cs.size)
+    | .batch _ => pure ()   -- unreachable: flattened away below
+  let perform : Cmd Msg → IO Unit := fun cmd => (Cmd.flatten cmd).forM performLeaf
   let dispatchMsg : Msg → IO Unit := fun msg => do
     let (m', cmd) := app.update (← modelRef.get) msg
     modelRef.set m'
@@ -432,6 +459,16 @@ def run (app : App Model Msg) : IO Unit := do
                    | some f => localRun ctx fullKey inst (f s)
                    | none   => pure ()
     | none      => pure ()
+  -- A native `fxResult` effect resolved: dispatch its callback with the result string.
+  let effectDone : UInt32 → String → IO Unit := fun id result => do
+    match (← effectCbRef.get)[id.toNat]? with
+    | some onResult => dispatchMsg (onResult result)
+    | none          => pure ()
+  -- An inbound port message (app JS called `__qed.send`): route it through `onPort`.
+  let portRecv : String → String → IO Unit := fun name payload => do
+    match app.onPort with
+    | some f => match f name payload with | some m => dispatchMsg m | none => pure ()
+    | none   => pure ()
   -- Serialize the keyed store to a JSON object {fullKey: <state>} (states are already
   -- JSON, kept here as string values), and restore it, re-rendering every instance.
   let snapshotLocals : IO String := do
@@ -481,6 +518,8 @@ def run (app : App Model Msg) : IO Unit := do
     localDispatchStr
     snapshot := snapshotLocals
     restore  := restoreLocals
+    effectDone
+    portRecv
   })
 
 end Qed

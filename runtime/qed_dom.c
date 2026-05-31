@@ -150,6 +150,23 @@ EM_JS(int, qed_js_is_connected, (int node), {
   return (el && el.isConnected) ? 1 : 0;
 });
 
+/* Native effects + ports: the switch over `kind` and the JS APIs live in host.js
+   (globalThis.__qed.effect / .effectResult / .ports); these shims are thin delegations. */
+EM_JS(void, qed_js_effect, (const char *kind, const char *a, const char *b, const char *c), {
+  if (globalThis.__qed && globalThis.__qed.effect)
+    globalThis.__qed.effect(UTF8ToString(kind), UTF8ToString(a), UTF8ToString(b), UTF8ToString(c));
+});
+
+EM_JS(void, qed_js_effect_result, (const char *kind, const char *a, const char *b, int id), {
+  if (globalThis.__qed && globalThis.__qed.effectResult)
+    globalThis.__qed.effectResult(UTF8ToString(kind), UTF8ToString(a), UTF8ToString(b), id);
+});
+
+EM_JS(void, qed_js_port_send, (const char *name, const char *payload), {
+  var p = globalThis.__qed && globalThis.__qed.ports && globalThis.__qed.ports[UTF8ToString(name)];
+  if (p) p(UTF8ToString(payload));
+});
+
 /* ---- @[extern] implementations (signatures per generated C) -------------- */
 LEAN_EXPORT lean_object *qed_dom_create_element(lean_object *tag, lean_object *world) {
   (void) world;
@@ -282,6 +299,29 @@ LEAN_EXPORT lean_object *qed_dom_is_connected(uint32_t node, lean_object *world)
   return lean_io_result_mk_ok(lean_box(b));
 }
 
+LEAN_EXPORT lean_object *qed_dom_effect(lean_object *kind, lean_object *a, lean_object *b,
+                                        lean_object *c, lean_object *world) {
+  (void) world;
+  qed_js_effect(lean_string_cstr(kind), lean_string_cstr(a), lean_string_cstr(b), lean_string_cstr(c));
+  lean_dec(kind); lean_dec(a); lean_dec(b); lean_dec(c);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *qed_dom_effect_result(lean_object *kind, lean_object *a, lean_object *b,
+                                               uint32_t id, lean_object *world) {
+  (void) world;
+  qed_js_effect_result(lean_string_cstr(kind), lean_string_cstr(a), lean_string_cstr(b), (int) id);
+  lean_dec(kind); lean_dec(a); lean_dec(b);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *qed_dom_port_send(lean_object *name, lean_object *payload, lean_object *world) {
+  (void) world;
+  qed_js_port_send(lean_string_cstr(name), lean_string_cstr(payload));
+  lean_dec(name); lean_dec(payload);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
 /* ---- JS → Lean entry points (defined by Lean codegen) -------------------- */
 extern lean_object *qed_init(lean_object *world);
 extern lean_object *qed_dispatch(uint32_t id, lean_object *world);
@@ -294,6 +334,8 @@ extern lean_object *qed_local_dispatch(lean_object *key, uint32_t id, lean_objec
 extern lean_object *qed_local_dispatch_str(lean_object *key, uint32_t id, lean_object *s, lean_object *world);
 extern lean_object *qed_local_snapshot(lean_object *world);
 extern lean_object *qed_local_restore(lean_object *s, lean_object *world);
+extern lean_object *qed_effect_done(uint32_t id, lean_object *result, lean_object *world);
+extern lean_object *qed_port_recv(lean_object *name, lean_object *payload, lean_object *world);
 
 static void qed_run_io(lean_object *res) {
   if (lean_io_result_is_error(res)) lean_io_result_show_error(res);
@@ -365,4 +407,17 @@ const char *qed_run_local_snapshot(void) {
 EMSCRIPTEN_KEEPALIVE
 void qed_run_local_restore(const char *s) {
   qed_run_io(qed_local_restore(lean_mk_string(s), lean_io_mk_world()));
+}
+
+/* A result-returning native effect resolved (host calls this with the effect id + the
+   result string); dispatch it to the effect's callback. */
+EMSCRIPTEN_KEEPALIVE
+void qed_run_effect_done(uint32_t id, const char *result) {
+  qed_run_io(qed_effect_done(id, lean_mk_string(result), lean_io_mk_world()));
+}
+
+/* An inbound port message (the app's JS called globalThis.__qed.send). */
+EMSCRIPTEN_KEEPALIVE
+void qed_run_port_recv(const char *name, const char *payload) {
+  qed_run_io(qed_port_recv(lean_mk_string(name), lean_mk_string(payload), lean_io_mk_world()));
 }

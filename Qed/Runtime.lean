@@ -35,14 +35,54 @@ inductive Cmd (msg : Type) where
   /-- Push `path` to the browser URL (no reload) and route to it. Use for
       programmatic navigation; internal `link`s navigate on their own. -/
   | pushUrl (path : String)
+  /-- Run several effects from one message. `update` returns a single `Cmd`, so this
+      is how a transition requests more than one effect at once. -/
+  | batch (cmds : List (Cmd msg))
+  /-- Send `payload` to the JS port handler named `name` (`globalThis.__qed.ports[name]`).
+      The userland escape hatch: an app wires any browser API (WebSocket, IndexedDB,
+      …) in its own JS, and the pure core talks to it over `(name, payload)` strings —
+      so a new effect never means patching the framework. Inbound goes through
+      `App.onPort`. See also `Cmd.port`'s typed cousins below. -/
+  | port (name payload : String)
+  /-- A generic fire-and-forget native effect: the JS host runs the operation `kind`
+      with up to three string arguments. The typed effects below (`storageSet`, `copy`,
+      `focus`, …) are thin wrappers; this carrier keeps the core from growing a
+      constructor per effect. -/
+  | fx (kind a b c : String)
+  /-- A generic native effect that returns a string result: the host runs `kind` with
+      two arguments, then dispatches `onResult result`. Backs `storageGet`, `paste`,
+      `after`, `randomInt`, `pickFile`, … -/
+  | fxResult (kind a b : String) (onResult : String → msg)
 
-/-- Relabel the messages an effect will produce (functoriality in `msg`). -/
+/-! Relabel the messages an effect will produce (functoriality in `msg`). -/
+mutual
 def Cmd.map (f : α → β) : Cmd α → Cmd β
   | .none                      => .none
   | .stream u b onChunk onDone => .stream u b (fun c => f (onChunk c)) (f onDone)
   | .now onNow                 => .now (fun d => f (onNow d))
   | .request m u b onResult    => .request m u b (fun r => f (onResult r))
   | .pushUrl p                 => .pushUrl p
+  | .batch cmds                => .batch (Cmd.mapList f cmds)
+  | .port n p                  => .port n p
+  | .fx k a b c                => .fx k a b c
+  | .fxResult k a b onResult   => .fxResult k a b (fun s => f (onResult s))
+/-- Relabel each effect in a batch (mutual recursion gives termination). -/
+def Cmd.mapList (f : α → β) : List (Cmd α) → List (Cmd β)
+  | []      => []
+  | c :: cs => Cmd.map f c :: Cmd.mapList f cs
+end
+
+mutual
+/-- Expand nested `batch`es into a flat list of leaf effects, so the driver can run
+    them with a simple non-recursive interpreter. -/
+def Cmd.flatten : Cmd msg → List (Cmd msg)
+  | .batch cmds => Cmd.flattenList cmds
+  | c           => [c]
+/-- Flatten each effect in a list (mutual recursion gives termination). -/
+def Cmd.flattenList : List (Cmd msg) → List (Cmd msg)
+  | []      => []
+  | c :: cs => Cmd.flatten c ++ Cmd.flattenList cs
+end
 
 /-- Decode an HTTP response with `Qed.Json` + `FromJson`, routing a successful
     decode to `onOk` and any transport/parse/decode error to `onErr`. -/
@@ -60,6 +100,63 @@ def Cmd.getJson [FromJson α] (url : String) (onOk : α → msg) (onErr : String
 /-- POST `body` to `url`, decode the JSON response into `α`, dispatch `onOk`/`onErr`. -/
 def Cmd.postJson [FromJson α] (url body : String) (onOk : α → msg) (onErr : String → msg) : Cmd msg :=
   .request "POST" url body (httpDecode onOk onErr)
+
+/-! ### Native effects — typed wrappers over `fx`/`fxResult`
+
+Common browser effects as ordinary `Cmd`s an app returns from `update`/`effects`. Each
+is a one-line smart constructor over the generic carrier, so the core grows API, not
+constructors-and-driver-arms. For anything not covered, `Cmd.port` reaches userland JS. -/
+
+/-! **localStorage.** `storageGet` decodes the host's JSON (`"value"` or `null`). -/
+def Cmd.storageSet    (key value : String) : Cmd msg := .fx "storage.set" key value ""
+def Cmd.storageRemove (key : String)       : Cmd msg := .fx "storage.remove" key "" ""
+def Cmd.storageClear                       : Cmd msg := .fx "storage.clear" "" "" ""
+def Cmd.storageGet (key : String) (onValue : Option String → msg) : Cmd msg :=
+  .fxResult "storage.get" key "" fun s =>
+    onValue (match (Json.parse s).toOption with | some (.str v) => some v | _ => Option.none)
+
+/-! **Navigation** (`pushUrl` above pushes+routes; these re-route through the host). -/
+def Cmd.replaceUrl (path : String) : Cmd msg := .fx "history.replace" path "" ""
+def Cmd.back    : Cmd msg := .fx "history.back" "" "" ""
+def Cmd.forward : Cmd msg := .fx "history.forward" "" "" ""
+
+/-! **Clipboard.** -/
+def Cmd.copy  (text : String)         : Cmd msg := .fx "clipboard.write" text "" ""
+def Cmd.paste (onText : String → msg) : Cmd msg := .fxResult "clipboard.read" "" "" onText
+
+/-! **Focus / scroll**, addressing an element by its `id`. -/
+def Cmd.focus          (elementId : String) : Cmd msg := .fx "dom.focus" elementId "" ""
+def Cmd.blur           (elementId : String) : Cmd msg := .fx "dom.blur" elementId "" ""
+def Cmd.select         (elementId : String) : Cmd msg := .fx "dom.select" elementId "" ""
+def Cmd.scrollIntoView (elementId : String) : Cmd msg := .fx "dom.scrollIntoView" elementId "" ""
+
+/-! **Timer.** Dispatch `msg` after `ms` milliseconds (`setTimeout`) — the building
+    block for debounce/throttle/delay. -/
+def Cmd.after (ms : Nat) (onTick : msg) : Cmd msg := .fxResult "timer.after" (toString ms) "" fun _ => onTick
+
+/-! **Document title.** -/
+def Cmd.setTitle (title : String) : Cmd msg := .fx "document.title" title "" ""
+
+/-! **Randomness** — `update` is pure, so a random draw must come from an effect.
+    Dispatches a uniform integer in `[lo, hi]`. -/
+def Cmd.randomInt (lo hi : Int) (onInt : Int → msg) : Cmd msg :=
+  .fxResult "random.int" (toString lo) (toString hi) fun s => onInt ((s.toInt?).getD lo)
+
+/-! **Files.** `download` saves `content` as a file; `pickFile` opens the OS picker and
+    reads the chosen file's text. -/
+def Cmd.download (filename mime content : String) : Cmd msg := .fx "file.download" filename mime content
+
+/-! A file the user picked, read as text. Binary needs a data-URL variant or a port. -/
+jsonStruct FilePick where
+  name : String
+  mime : String
+  size : Nat
+  text : String
+
+/-- Open the file picker (filtered by `accept`, e.g. `".json,text/*"`) and dispatch the
+    chosen file decoded as a `FilePick` — or `.error` if it was cancelled or unreadable. -/
+def Cmd.pickFile (accept : String) (onFile : Except String FilePick → msg) : Cmd msg :=
+  .fxResult "file.pick" accept "" fun s => onFile (FilePick.decode s)
 
 /-! ### Local-state components (React `useState`, keyed)
 
@@ -109,6 +206,11 @@ structure App (Model : Type) (Msg : Type) where
       view references one with `localMount`/`localMountWith`. Empty for apps that use
       none. -/
   locals : List LocalDef := []
+  /-- Inbound ports: when the app's JS calls `globalThis.__qed.send(name, payload)`,
+      this turns it into a message (or `none` to ignore). The subscription side of
+      `Cmd.port` — wire WebSocket frames, cross-tab `storage` events, intervals, etc.
+      Left `none` by the builders. -/
+  onPort : Option (String → String → Option Msg) := none
 
 /-- Build an `App` with no side effects (the Elm "sandbox"). -/
 def sandbox (init : Model) (update : Model → Msg → Model) (view : Model → Html Msg) :
@@ -129,10 +231,11 @@ def application (init : Model)
     (update  : Model → Msg → Model)
     (view    : Model → Html Msg)
     (effects : Model → Msg → Cmd Msg := fun _ _ => .none)
-    (locals  : List LocalDef := []) : App Model Msg :=
+    (locals  : List LocalDef := [])
+    (onPort  : Option (String → String → Option Msg) := none) : App Model Msg :=
   { init   := (init, .none)
     update := fun m msg => let m' := update m msg; (m', effects m' msg)
-    view, locals }
+    view, locals, onPort }
 
 /-- Build a URL-routed `App`. Same as `application`, plus `onUrlChange`: the message
     fired with the new path whenever the URL changes (startup, `link` clicks,

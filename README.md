@@ -342,6 +342,46 @@ def app : App Model Msg :=
 The full app is `Examples/Users.lean`; `test/users_test.mjs` drives it against a mock
 API — a deep link, link and form navigation, the back button, and the events.
 
+### Effects, and the escape hatch
+
+Effects are data, so `update` stays pure. Qed ships typed `Cmd`s for the things you
+actually reach for — `storageSet`/`storageGet`/`storageRemove`/`storageClear`,
+`pushUrl`/`replaceUrl`/`back`/`forward`, `copy`/`paste`, `focus`/`blur`/`select`/
+`scrollIntoView`, `after` (the building block for debounce), `setTitle`, `randomInt`
+(since a pure `update` can't roll dice), `download` and `pickFile`, plus
+`getJson`/`postJson`/`stream`. `batch` runs several from one message:
+
+```lean
+def effects (m : Model) : Msg → Cmd Msg
+  | .inc        => Cmd.storageSet "count" (toString m.count)   -- persist on change
+  | .loadCount  => Cmd.storageGet "count" .loaded             -- … and read it back at startup
+  | .search q   => Cmd.after 300 (.runSearch q)               -- debounce
+  | .pickAvatar => Cmd.pickFile "image/*" .gotFile
+  | .saveAll    => Cmd.batch [Cmd.storageSet "doc" m.doc, Cmd.setTitle "Saved"]
+  | _           => .none
+```
+
+And when an effect *isn't* built in — WebSockets, IndexedDB, a hardware API — you don't
+patch the framework. **Ports** are the escape hatch: the pure core sends and receives
+`(name, payload)` strings, and you wire the actual API in your own JS. So the effect
+stays inspectable data (testable!), while reaching anything the platform offers:
+
+```lean
+effects m | .send => Cmd.port "ws.send" m.outgoing      -- → globalThis.__qed.ports["ws.send"]
+app := application init update view (effects := effects)
+         (onPort := some fun | "ws.msg", p => some (.received p) | _, _ => none)
+```
+```js
+const ws = new WebSocket(url);
+globalThis.__qed.ports["ws.send"] = (p) => ws.send(p);
+ws.onmessage = (e) => globalThis.__qed.send("ws.msg", e.data);   // → onPort → a Msg
+```
+
+The whole battery (with `localStorage`, `setTitle`, `after`, `randomInt`, `pickFile`,
+`batch`, `focus`, and a port round-trip) is `Examples/Effects.lean`, driven in a real
+browser by `test/effects_test.mjs`. Local-component state has a matching pair —
+`window.qed.snapshot()` / `.restore(json)` — for persistence and time-travel.
+
 ## So what's actually happening?
 
 Here's the trip from "I wrote some Lean" to "pixels in a browser":
@@ -404,7 +444,7 @@ muscle memory you've got. When you're hacking on the framework itself, the in-re
 |------|------|
 | `Qed/Html.lean` | The core typed virtual DOM — the thing every bit of nice syntax eventually becomes. |
 | `Qed/Notation.lean` | The readable view combinators (`div`, `button`, `onClick`, …). |
-| `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`, `routed`), the `Cmd` effects (`stream`/`now`/`request`/`getJson`/`pushUrl`), local-state components (`LocalDef`, `localMount`/`localMountWith`, `App.locals`), and the pure render-to-HTML. |
+| `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`, `routed`), the `Cmd` effects (storage, navigation, clipboard, focus, `after`, `setTitle`, `randomInt`, files, `getJson`/`stream`, `batch`) and the `port`/`onPort` escape hatch, local-state components (`LocalDef`, `localMount`, `App.locals`), and the pure render-to-HTML. |
 | `Qed/Invariant.lean` | The `invariant … preserved_by …` command (it discharges the proof for you). |
 | `Qed/Diff.lean` | The diff/patch engine — positional reconcile (add/remove) and keyed reconcile (reorder by `key`) — plus the `diff_apply` correctness proof. |
 | `Qed/Json.lean` | The full JSON parser/renderer + `jsonStruct`/`jsonCodec`, with the `parse_depth_le` & `parse_render` proofs. |

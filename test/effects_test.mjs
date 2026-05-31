@@ -38,7 +38,14 @@ const browser = await puppeteer.launch({
 
 try {
   const page = await browser.newPage();
-  page.on('console', (m) => console.log('  [page]', m.text()));
+  page.on('console', (m) => {
+    const t = m.text();
+    console.log('  [page]', t);
+    // a fired effect whose `kind` has no host.js case warns here — catch it at runtime too
+    if (t.includes('unknown effect') || t.includes('unknown result effect')) {
+      console.log('  FAIL  host.js reported an unhandled effect kind'); failures++;
+    }
+  });
   page.on('pageerror', (e) => { console.log('  [pageerror]', e.message); failures++; });
 
   await page.goto(`http://localhost:${PORT}/index.html`, { waitUntil: 'load' });

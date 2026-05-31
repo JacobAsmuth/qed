@@ -191,15 +191,40 @@ def axiomClean : IO Bool := do
   IO.print out
   return !((out.splitOn "sorryAx").length > 1) && !((out.splitOn "error:").length > 1)
 
+/-- Every effect `kind` a `Cmd` can emit (`.fx "…"` / `.fxResult "…"` in `Runtime.lean`)
+    must have a matching `case '…'` in the host's effect switch, or that effect silently
+    no-ops at runtime. This static diff keeps the Lean and JS sides honest — the one bug
+    that otherwise only shows up as a `console.warn` in a user's browser. Silent on
+    success; prints the offenders (and returns false) on a gap. -/
+def effectsCovered : IO Bool := do
+  let qh ← frameworkHome
+  let runtimePath := qh / "Qed" / "Runtime.lean"
+  let hostPath    := qh / "runtime" / "host.js"
+  unless (← runtimePath.pathExists) && (← hostPath.pathExists) do return true  -- not the framework layout
+  let runtime ← IO.FS.readFile runtimePath
+  let host    ← IO.FS.readFile hostPath
+  -- the first quoted token after each `marker`
+  let after (marker close src : String) : List String :=
+    match src.splitOn marker with
+    | _ :: rest => rest.map (fun c => (c.splitOn close).headD "")
+    | []        => []
+  let emitted := (after ".fx \"" "\"" runtime) ++ (after ".fxResult \"" "\"" runtime)
+  let handled := after "case '" "'" host
+  let missing := emitted.filter (fun k => k != "" && !handled.contains k)
+  for k in missing do
+    IO.eprintln (red s!"  effect kind \"{k}\" is emitted by a Cmd but no host.js case handles it")
+  return missing.isEmpty
+
 def verify : IO Bool := do
   step "checking proofs (lake build)"
   if (← sh "lake" #["build"]) != 0 then return false
   let wr ← webRoot
   if (← sh "lake" #["build", wr ++ ":c.o"]) != 0 then return false
-  step "verifying (no sorry / axiom-clean)"
+  step "verifying (no sorry / axiom-clean / effect coverage)"
   let ok1 ← grepForbidden
   let ok2 ← axiomClean
-  return ok1 && ok2
+  let ok3 ← effectsCovered
+  return ok1 && ok2 && ok3
 
 /-! ### Commands -/
 
@@ -281,6 +306,7 @@ partial def watchLoop (marker : FilePath) : IO Unit := do
     if (← linkWasm devDir (prod := false)) then
       stageAssets devDir (withServer := false)
       writeBuildId devDir
+      let _ ← effectsCovered   -- warn (non-fatal) if a new effect lacks a host.js case
       IO.println (green "✓ reloaded")
     else
       IO.eprintln (red "✗ build failed — fix and save again")

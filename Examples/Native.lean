@@ -13,9 +13,10 @@ import Examples.Counter
 open Qed
 
 def main : IO Unit := do
-  -- SSR: the full static document for the initial state, from the verified app.
-  IO.println (renderDocument "Counter" (App.renderInitial app))
-  -- sanity: a few reachable states render as expected.
+  -- SSR: the app's initial `#app` content (stdout), from the same verified view/render the
+  -- browser uses. `renderDocument "Counter" (App.renderInitial app)` wraps it in a full page.
+  IO.println (App.renderInitial app)
+  -- sanity (stderr): a few reachable states render as expected.
   let render (label : String) (m : Model) : IO Unit :=
     IO.eprintln s!"{label} (count={m.count}): {(view m).render}"
   let s0 := init

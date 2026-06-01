@@ -78,6 +78,11 @@ opaque setText (node : Node) (content : String) : IO Unit
 @[extern "qed_dom_child_at"]
 opaque childAt (parent : Node) (index : UInt32) : IO Node
 
+/-- The server-rendered root inside `#app` (its first element child), for hydration; the
+    sentinel `0` (≈ null) if `#app` has no element child yet (so the driver builds fresh). -/
+@[extern "qed_dom_app_root"]
+opaque appRoot : IO Node
+
 /-- How many children `parent` currently has. The driver uses it to know how many
     trailing nodes a `drop` must remove. -/
 @[extern "qed_dom_child_count"]

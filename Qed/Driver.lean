@@ -126,6 +126,25 @@ partial def buildDom (h : Handlers msg) : Html msg → IO Dom.Node
           Dom.appendChild node (← buildDom h c)
       return node
 
+/-- Hydrate server-rendered DOM in place: walk the `Html` in lockstep with the existing
+    nodes, applying each element's attributes — which registers its events into the handler
+    tables (in the *same* pre-order `buildDom` uses, so the ids line up), tags the node, and
+    binds signals — *without* creating or replacing anything. So the markup the server sent
+    stays put (no flash, focus/scroll preserved) and becomes live. An empty-text child
+    produced no DOM node, so it consumes no slot; a local host owns its own children. -/
+partial def hydrateDom (h : Handlers msg) : Html msg → Dom.Node → IO Unit
+  | .text _,     _    => pure ()
+  | .lazy _ sub, node => hydrateDom h sub node
+  | .element _ attrs children, node => do
+      applyAttrs h node attrs
+      unless ownsChildren attrs do
+        let mut i : UInt32 := 0
+        for c in children do
+          match c with
+          | .text "" => pure ()          -- rendered to nothing → no DOM node to advance past
+          | .text _  => i := i + 1       -- a text node: present, nothing to wire
+          | _        => hydrateDom h c (← Dom.childAt node i); i := i + 1
+
 mutual
 /-- Execute a patch against the live DOM, reusing nodes where possible. `parent`
     and `index` locate `node` within its parent, needed only for `replace`. -/
@@ -644,8 +663,16 @@ def run (app : App Model Msg) (template : Option (View Model Msg) := none) : IO 
         let newTree := app.view (← modelRef.get)
         (match ← treeRef.get with
          | none => do
-             let node ← buildDom h newTree
-             Dom.mountRoot node; rootRef.set node
+             -- First render: if the server pre-rendered into #app, adopt that DOM in place
+             -- (hydrate — no flash, events/signals wired onto the existing nodes); otherwise
+             -- build fresh and mount.
+             let existing ← Dom.appRoot
+             if existing != (0 : Dom.Node) then
+               hydrateDom h newTree existing
+               rootRef.set existing
+             else
+               let node ← buildDom h newTree
+               Dom.mountRoot node; rootRef.set node
          | some oldTree => do
              let root ← rootRef.get
              match diff oldTree newTree with

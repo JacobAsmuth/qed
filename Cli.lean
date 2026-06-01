@@ -298,6 +298,10 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "template_test.mjs").pathExists) then
     step "running template tests (View)"
     if (← sh "node" #["test/template_test.mjs"]) != 0 then failed := true
+  -- SSR + hydration: server-rendered #app is adopted in place by the client (no rebuild).
+  if (← (FilePath.mk "test" / "ssr_test.mjs").pathExists) then
+    step "running SSR/hydration tests"
+    if (← sh "node" #["test/ssr_test.mjs"]) != 0 then failed := true
   if failed then return 1 else return 0
 
 def cmdClean : IO UInt32 := do

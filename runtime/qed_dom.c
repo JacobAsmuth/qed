@@ -117,6 +117,19 @@ EM_JS(int, qed_js_child_count, (int parent), {
   return p ? p.childNodes.length : 0;
 });
 
+/* The server-rendered root inside #app (its first element child), as a node handle,
+   or 0 if #app has no element child (nothing to hydrate — build fresh instead). */
+EM_JS(int, qed_js_app_root, (), {
+  if (!globalThis.__qed) globalThis.__qed = {};
+  if (!globalThis.__qed.nodes) globalThis.__qed.nodes = [null];  /* hydrate is the first DOM call */
+  var root = document.getElementById('app');
+  var c = root ? root.firstElementChild : null;
+  if (!c) return 0;
+  var N = globalThis.__qed.nodes;
+  N.push(c);
+  return N.length - 1;
+});
+
 EM_JS(void, qed_js_remove_child, (int parent, int index), {
   var p = globalThis.__qed.nodes[parent];
   if (p && p.childNodes[index]) p.removeChild(p.childNodes[index]);
@@ -288,6 +301,12 @@ LEAN_EXPORT lean_object *qed_dom_set_text(uint32_t node, lean_object *s, lean_ob
 LEAN_EXPORT lean_object *qed_dom_child_at(uint32_t parent, uint32_t index, lean_object *world) {
   (void) world;
   uint32_t h = (uint32_t) qed_js_child_at((int) parent, (int) index);
+  return lean_io_result_mk_ok(lean_box_uint32(h));
+}
+
+LEAN_EXPORT lean_object *qed_dom_app_root(lean_object *world) {
+  (void) world;
+  uint32_t h = (uint32_t) qed_js_app_root();
   return lean_io_result_mk_ok(lean_box_uint32(h));
 }
 

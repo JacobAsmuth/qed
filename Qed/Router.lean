@@ -21,14 +21,68 @@ class Router (α : Type) where
   /-- The guarantee: printing then parsing is the identity. -/
   round_trip : ∀ a, parse (print a) = some a
 
-/-- Render a value to a URL string, e.g. `Route.user "ada"` ↦ `"/users/ada"`. -/
-def Router.toURL {α} [Router α] (a : α) : String :=
-  "/" ++ String.intercalate "/" (Router.print a)
+/-! ### Percent-coding for the URL string boundary
 
-/-- Parse a URL path string (`"/users/ada"`) into a route, splitting on `/` and
-    dropping empty segments (so `"/"` is the index, `[]`). `none` if no route matches. -/
+`print`/`parse` work on segment *lists* and are proven to round-trip (`round_trip`). The
+URL is a *string*, and joining segments with `/` is only reversible if a segment can't
+itself contain `/` (or other URL-structural characters). So `toURL`/`fromURL` percent-code
+each segment on the way in and out. This is the trusted string⟷segments shim — the same
+kind of boundary as the driver (Html⟷DOM) or the renderer (Html⟷markup): the *semantics*
+(which segments map to which route) is verified; the byte-level codec is a small total
+function. With it, a param like `"C++ & Lean"` survives the round trip a browser puts it
+through, instead of corrupting the path. -/
+
+private def hexDigit (n : UInt8) : Char :=
+  let d := n.toNat
+  Char.ofNat (if d < 10 then 48 + d else 55 + d)   -- 0–9, then 'A'–'F'
+
+private def isUnreserved (b : UInt8) : Bool :=
+  let c := b.toNat
+  (48 ≤ c && c ≤ 57) || (65 ≤ c && c ≤ 90) || (97 ≤ c && c ≤ 122)
+    || c == 45 || c == 95 || c == 46 || c == 126   -- - _ . ~
+
+/-- Percent-encode a path segment (`encodeURIComponent`): unreserved bytes stay, every
+    other UTF-8 byte becomes `%XX`. So an encoded segment never contains `/`, making the
+    `/`-join in `toURL` reversible. -/
+def encodeSeg (s : String) : String := Id.run do
+  let bs := s.toUTF8
+  let mut out := ""
+  for i in [0:bs.size] do
+    let b := bs.get! i
+    if isUnreserved b then out := out.push (Char.ofNat b.toNat)
+    else out := ((out.push '%').push (hexDigit (b >>> 4))).push (hexDigit (b &&& 0x0F))
+  return out
+
+private def unhex (c : Char) : Option UInt8 :=
+  let n := c.toNat
+  if 48 ≤ n && n ≤ 57 then some (UInt8.ofNat (n - 48))
+  else if 65 ≤ n && n ≤ 70 then some (UInt8.ofNat (n - 55))
+  else if 97 ≤ n && n ≤ 102 then some (UInt8.ofNat (n - 87))
+  else none
+
+private def decodeBytes : List Char → ByteArray → ByteArray
+  | '%' :: h :: l :: rest, acc =>
+      match unhex h, unhex l with
+      | some hi, some lo => decodeBytes rest (acc.push ((hi <<< 4) ||| lo))
+      | _,       _       => decodeBytes (h :: l :: rest) (acc.push 37)   -- stray '%', keep it
+  | c :: rest, acc => decodeBytes rest (acc ++ c.toString.toUTF8)
+  | [], acc => acc
+
+/-- Invert `encodeSeg`: turn `%XX` back into its byte, pass others through. A malformed
+    `%` is kept literally, so decoding is total. -/
+def decodeSeg (s : String) : String :=
+  (String.fromUTF8? (decodeBytes s.toList .empty)).getD s
+
+/-- Render a value to a URL string, e.g. `Route.user "ada"` ↦ `"/users/ada"`; each segment
+    is percent-encoded so a param with a `/` or a space can't break the path. -/
+def Router.toURL {α} [Router α] (a : α) : String :=
+  "/" ++ String.intercalate "/" ((Router.print a).map encodeSeg)
+
+/-- Parse a URL path string (`"/users/ada"`) into a route: split on `/`, drop empty
+    segments (so `"/"` is the index, `[]`), percent-decode each, then `parse`. `none` if no
+    route matches. -/
 def Router.fromURL {α} [Router α] (path : String) : Option α :=
-  Router.parse ((path.splitOn "/").filter (· ≠ ""))
+  Router.parse (((path.splitOn "/").filter (· ≠ "")).map decodeSeg)
 
 /-! ### The `router` command
 
@@ -74,11 +128,12 @@ macro_rules
         match alt with
         | `(routeAlt| $c:ident $[($bs:ident : $bts:term)]* $[=> $seg:str]?) =>
             let ctorId := mkIdent (t.getId ++ c.getId)
-            -- leading segment(s): "" ⇒ index (no segment); a string ⇒ that segment;
+            -- leading segment(s): "" ⇒ index (no segment); a string ⇒ those segments
+            -- (split on `/`, so `=> "books/archive"` is two segments and stays reachable);
             -- omitted ⇒ the constructor name.
             let segs : Array (TSyntax `term) :=
               match seg with
-              | some s => if s.getString == "" then #[] else #[quote s.getString]
+              | some s => ((s.getString.splitOn "/").filter (· ≠ "")).toArray.map (quote ·)
               | none   => #[quote (toString c.getId)]
             let bterms : Array (TSyntax `term) := bs.map (⟨·.raw⟩)
             let segments := segs ++ bterms          -- one list, used as term and pattern

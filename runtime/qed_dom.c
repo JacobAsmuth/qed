@@ -58,6 +58,19 @@ EM_JS(char *, qed_js_get_attribute, (int node, const char *k), {
   return stringToNewUTF8(v == null ? '' : v);
 });
 
+/* Remove every `data-qed-on…` handler-id attribute (data-qed-on-<event> and
+   data-qed-onv-<event>) from an element. Used on hydration. */
+EM_JS(void, qed_js_clear_handlers, (int node), {
+  var el = globalThis.__qed.nodes[node];
+  if (!el || !el.attributes) return;
+  var names = [];
+  for (var i = 0; i < el.attributes.length; i++) {
+    var n = el.attributes[i].name;
+    if (n.indexOf('data-qed-on') === 0) names.push(n);
+  }
+  for (var j = 0; j < names.length; j++) el.removeAttribute(names[j]);
+});
+
 EM_JS(void, qed_js_set_value, (int node, const char *v), {
   var el = globalThis.__qed.nodes[node];
   var s = UTF8ToString(v);
@@ -254,6 +267,12 @@ LEAN_EXPORT lean_object *qed_dom_get_attribute(uint32_t node, lean_object *k, le
   lean_object *r = lean_mk_string(s);
   free(s);
   return lean_io_result_mk_ok(r);
+}
+
+LEAN_EXPORT lean_object *qed_dom_clear_handlers(uint32_t node, lean_object *world) {
+  (void) world;
+  qed_js_clear_handlers((int) node);
+  return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_object *qed_dom_today(lean_object *world) {

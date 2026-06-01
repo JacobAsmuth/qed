@@ -58,16 +58,10 @@ def normalizeAttrs (attrs : List (Attr msg)) : List (Attr msg) :=
 def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .cls c     => (s!" class=\"{escapeHtml c}\"", hs)
   | .attr k v  => (s!" {k}=\"{escapeHtml v}\"", hs)
-  | .flag k on => (if on then s!" {k}=\"{k}\"" else "", hs)
+  | .flag k present => (if present then s!" {k}=\"{k}\"" else "", hs)
   | .key _     => ("", hs)   -- a reconciliation key is virtual-DOM-only; it never renders
-  | .onClick m => (s!" data-qed-click=\"{hs.size}\"", hs.push m)
-  | .onInput _ => ("", hs)   -- no static form; the driver wires input events
-  | .onCheck _ => ("", hs)   -- (same — the driver wires checkbox change events)
-  | .onKeydown _ => ("", hs) -- (same — driver wires keydown)
-  | .onKeyup _   => ("", hs) -- (same — driver wires keyup)
-  | .onSubmit m  => (s!" data-qed-submit=\"{hs.size}\"", hs.push m)
-  | .onBlur m    => (s!" data-qed-blur=\"{hs.size}\"", hs.push m)
-  | .onFocus m   => (s!" data-qed-focus=\"{hs.size}\"", hs.push m)
+  | .on event m  => (s!" data-qed-on-{event}=\"{hs.size}\"", hs.push m)   -- no-arg handler id, for hydration
+  | .onValue _ _ => ("", hs)   -- value handlers carry no static form; the driver wires them on hydration
   | .localCell key comp _ _ => (s!" data-qed-local=\"{escapeHtml (localKey comp key)}\"", hs)   -- marks the host; the driver fills it
   | .signalBind name        => (s!" data-qed-signal=\"{escapeHtml name}\"", hs)                 -- driver binds its text to the signal
   | .signalAttr _ attr value => (s!" {attr}=\"{escapeHtml value}\"", hs)                        -- driver binds this attr to the signal

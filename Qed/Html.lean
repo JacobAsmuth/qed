@@ -19,31 +19,23 @@ inductive Attr (msg : Type) where
   /-- A raw `key="value"` attribute. -/
   | attr (key value : String)
   /-- A boolean attribute (`disabled`, `checked`, …): present on the node *iff*
-      `on`, so there is no `disabled="false"`-still-disables footgun. -/
-  | flag (key : String) (on : Bool)
+      `present`, so there is no `disabled="false"`-still-disables footgun. -/
+  | flag (key : String) (present : Bool)
   /-- A reconciliation key (React/Vue `key`): identifies a child across renders so
       the diff can match a moved/reordered element to its previous node instead of
       patching positionally. Virtual-DOM-only — it never renders or touches the DOM. -/
   | key (k : String)
-  /-- A click handler producing the message `m`. -/
-  | onClick (m : msg)
-  /-- An input handler: produces a message from the field's current value, fired
-      on every edit. Also serves `<select>`/radio change (both fire `input`). -/
-  | onInput (handler : String → msg)
-  /-- A checkbox handler: produces a message from the box's checked state. -/
-  | onCheck (handler : Bool → msg)
-  /-- A key handler: produces a message from the pressed key's name (`"Enter"`,
-      `"Escape"`, `"a"`, …), fired on `keydown`. -/
-  | onKeydown (handler : String → msg)
-  /-- A key handler fired on `keyup`. -/
-  | onKeyup (handler : String → msg)
-  /-- A form-submit handler. The default page reload is always suppressed
-      (`preventDefault`), so a `<form>` becomes an ordinary message source. -/
-  | onSubmit (m : msg)
-  /-- A focus-lost handler (`blur`). -/
-  | onBlur (m : msg)
-  /-- A focus-gained handler (`focus`). -/
-  | onFocus (m : msg)
+  /-- Listen for DOM `event`, dispatching the constant message `m`. This is the single,
+      open event mechanism — `onClick`/`onSubmit`/`onBlur`/`onFocus`, and `on "mousedown"`,
+      `on "wheel"`, `on "dragstart"`, … are all this; the named helpers in `Qed.Notation` are
+      thin wrappers. The driver delegates by event name, so any DOM event is reachable. A
+      `submit` event always `preventDefault`s, so a `<form>` is just a message source. -/
+  | on (event : String) (m : msg)
+  /-- Listen for DOM `event`, dispatching `decode payload`, where the host supplies the event's
+      natural string payload: an input/select `value`, a checkbox's checked state as
+      `"true"`/`"false"` (on `change`), or a key's name (on `keydown`/`keyup`). Backs
+      `onInput`/`onCheck`/`onKeydown`/`onKeyup`, and `onValue "input"` etc. directly. -/
+  | onValue (event : String) (decode : String → msg)
   /-- Mark this element as a locally-stateful child instance (React `useState`, but
       the cell is addressed by an explicit key rather than call order). `key` is the
       instance's identity in the driver's state store; `component` names a registered
@@ -99,16 +91,10 @@ instance : Coe Int (Html msg) := ⟨fun n => .text (toString n)⟩
 def Attr.map (f : α → β) : Attr α → Attr β
   | .cls n        => .cls n
   | .attr k v     => .attr k v
-  | .flag k on    => .flag k on
+  | .flag k present => .flag k present
   | .key k        => .key k
-  | .onClick m    => .onClick (f m)
-  | .onInput h    => .onInput (fun s => f (h s))
-  | .onCheck h    => .onCheck (fun b => f (h b))
-  | .onKeydown h  => .onKeydown (fun k => f (h k))
-  | .onKeyup h    => .onKeyup (fun k => f (h k))
-  | .onSubmit m   => .onSubmit (f m)
-  | .onBlur m     => .onBlur (f m)
-  | .onFocus m    => .onFocus (f m)
+  | .on e m       => .on e (f m)
+  | .onValue e h  => .onValue e (fun s => f (h s))
   -- Only the bubble carries `msg`; the child's own view/messages live in the driver,
   -- so relabelling the parent never has to recurse into the local subtree (total).
   | .localCell k c i b => .localCell k c i (fun s => (b s).map f)

@@ -29,7 +29,10 @@ def app : App Model Msg :=
       button [cls "inc", onClick .inc] [text "+1"],
       -- these messages embed the *current* model; they must not go stale after an update
       button [cls "double", onClick (.setTo (m.n * 2))] [text "double"],
-      button [cls "plus10", onClick (.setTo (m.n + 10))] [text "+10"]
+      button [cls "plus10", onClick (.setTo (m.n + 10))] [text "+10"],
+      -- a DOM event with no named-helper history of its own: the event set is open, so
+      -- `onDoubleClick` (= `on "dblclick"`) just works, delegated like any other.
+      button [cls "reset", onDoubleClick (.setTo 0)] [text "reset (dbl-click)"]
     ]
 
 end Live

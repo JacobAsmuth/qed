@@ -66,7 +66,7 @@ try {
   check('hydration ADOPTED the server node (data-server survived)', await adopted(), true);
 
   // events were wired onto the adopted DOM
-  await page.click('[data-qed-click="0"]'); await sleep(60);  // − (guarded at 0 → stays 0)
+  await page.click('[data-qed-on-click="0"]'); await sleep(60);  // − (guarded at 0 → stays 0)
   const incBtn = await page.evaluate(() => {
     const b = [...document.querySelectorAll('#app button')].find((b) => b.textContent === '+');
     b.click(); return true;

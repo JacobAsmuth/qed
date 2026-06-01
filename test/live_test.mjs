@@ -59,6 +59,13 @@ try {
   await page.click('#app .double');
   await sleep(30);
   check('double again tracks the latest number', await n(), '32');
+
+  // a generic event (dblclick) — no closed enum, delegated like the rest — resets to 0
+  check('reset button carries the generic handler id',
+    await page.$eval('#app .reset', (e) => e.hasAttribute('data-qed-on-dblclick')), true);
+  await page.$eval('#app .reset', (e) => e.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })));
+  await sleep(30);
+  check('onDoubleClick (generic `on` event) fired', await n(), '0');
 } finally {
   await browser.close();
   server.kill();

@@ -41,6 +41,13 @@ opaque removeAttribute (node : Node) (key : String) : IO Unit
 @[extern "qed_dom_get_attribute"]
 opaque getAttribute (node : Node) (key : String) : IO String
 
+/-- Remove every `data-qed-on…` handler-id attribute from a node. The server emits these
+    during SSR in render order; on hydration the client clears them (it owns the handler
+    tables and re-registers in its own traversal order). Event names are open, so this removes
+    by prefix rather than from a fixed list. -/
+@[extern "qed_dom_clear_handlers"]
+opaque clearHandlers (node : Node) : IO Unit
+
 /-- Set an input's live `value` *property* (not just the attribute), so a
     controlled field reflects the model. A no-op when already equal, which keeps
     the caret where the user left it. -/

@@ -74,17 +74,17 @@ def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
   | .cls c          => Dom.setAttribute node "class" c
   | .attr "value" v => Dom.setValue node v
   | .attr k v       => Dom.setAttribute node k v
-  | .flag k on      => if on then Dom.setAttribute node k k else Dom.removeAttribute node k
+  | .flag k present => if present then Dom.setAttribute node k k else Dom.removeAttribute node k
   | .key _          => pure ()   -- a reconciliation key never touches the DOM
-  | .onClick m      => registerHandler h.click node "data-qed-click" m
-  -- onCheck shares the string table; the host sends "true"/"false" for a check
-  | .onInput f      => registerHandler h.input node "data-qed-input" f
-  | .onCheck f      => registerHandler h.input node "data-qed-check" (fun s => f (s == "true"))
-  | .onKeydown f    => registerHandler h.input node "data-qed-keydown" f   -- host sends the key name
-  | .onKeyup f      => registerHandler h.input node "data-qed-keyup" f
-  | .onSubmit m     => registerHandler h.click node "data-qed-submit" m    -- no-arg msgs share the click table
-  | .onBlur m       => registerHandler h.click node "data-qed-blur" m
-  | .onFocus m      => registerHandler h.click node "data-qed-focus" m
+  -- Events delegate by name: ensure the host has a (capture-phase) listener for this event,
+  -- then register the handler in this node's per-event slot. `on` → the no-arg table,
+  -- `onValue` → the string table (the host supplies the value/checked/key payload).
+  | .on event m      => do
+      Dom.effect "event.listen" event "" ""
+      registerHandler h.click node s!"data-qed-on-{event}" m
+  | .onValue event f => do
+      Dom.effect "event.listen" event "" ""
+      registerHandler h.input node s!"data-qed-onv-{event}" f
   | .localCell key comp init bubble => do
       -- Mark the host (namespaced by component, so keys can't collide) so the JS
       -- delegation routes events inside it to this instance, then mount the local
@@ -112,17 +112,12 @@ def applyDynAttrs (h : Handlers msg) (node : Dom.Node) (attrs : List (VAttr σ m
     | .dynVal attr get => applyAttr h node (.attr attr (get s))
     | .stat _          => pure ()
 
-/-- The attributes that index a handler table. The server emits these during SSR, numbered
-    in *render* order; on hydration the client owns the tables and registers in its own
-    *traversal* order, so it clears the server's placeholders before adopting a node and then
-    tags it with the client's slot. (Build creates fresh nodes that carry none, so this is a
-    no-op there; it only matters when adopting server-rendered markup.) -/
-def handlerIdAttrs : List String :=
-  ["data-qed-click", "data-qed-submit", "data-qed-blur", "data-qed-focus",
-   "data-qed-input", "data-qed-check", "data-qed-keydown", "data-qed-keyup"]
-
-def clearHandlerIds (node : Dom.Node) : IO Unit :=
-  for k in handlerIdAttrs do Dom.removeAttribute node k
+/-- Drop the server-emitted handler ids (`data-qed-on-*`) from a node on hydration. The server
+    numbers them in *render* order; the client owns the tables and registers in its own
+    *traversal* order, so it clears the placeholders before adopting a node, then tags it with
+    its own slot. (Build creates fresh nodes that carry none, so this only matters when adopting
+    server-rendered markup.) Event names are open, so this removes by prefix in the host. -/
+def clearHandlerIds (node : Dom.Node) : IO Unit := Dom.clearHandlers node
 
 /-- Are this element's children owned by the driver — a local component (filled from
     local state) or a signal (its text)? Then the parent's diff must not reconcile them:
@@ -259,13 +254,6 @@ end
     (`showIf`, `keyedList`) reconciles through the **verified** `diff`/`applyToDom`, so
     the trusted surface does not grow. -/
 
-/-- Does this attribute carry an event handler (so it must be re-registered each update
-    to keep the handler table in sync), as opposed to a value/class/flag that is set
-    once and only re-touched when it changes? -/
-def Attr.isEvent : Attr msg → Bool
-  | .onClick _ | .onInput _ | .onCheck _ | .onKeydown _ | .onKeyup _
-  | .onSubmit _ | .onBlur _ | .onFocus _ => true
-  | _ => false
 
 /-- The runtime mirror of a rendered `View` node: built *once*, then mutated in place
     through `IO.Ref`s so an update allocates nothing for the scalar skeleton (the whole

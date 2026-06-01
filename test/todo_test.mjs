@@ -56,7 +56,7 @@ try {
   const dispatchChild = async (t, childSel) => {
     const id = await page.$$eval('#app .todo .row', (els, t, childSel) => {
       const li = els.find((e) => e.querySelector('.item').textContent === t);
-      return li ? li.querySelector(childSel).getAttribute('data-qed-click') : null;
+      return li ? li.querySelector(childSel).getAttribute('data-qed-on-click') : null;
     }, t, childSel);
     await page.evaluate((i) => window.qed.dispatch(Number(i)), id);
     await sleep(50);

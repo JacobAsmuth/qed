@@ -389,15 +389,15 @@ def attr (k v : String) : VAttr σ msg := .stat (.attr k v)
 def value (v : String) : VAttr σ msg := .stat (.attr "value" v)
 def type' (v : String) : VAttr σ msg := .stat (.attr "type" v)
 def placeholder (v : String) : VAttr σ msg := .stat (.attr "placeholder" v)
-def disabled (on : Bool) : VAttr σ msg := .stat (.flag "disabled" on)
-def checked (on : Bool) : VAttr σ msg := .stat (.flag "checked" on)
-def onClick (m : msg) : VAttr σ msg := .stat (.onClick m)
-def onSubmit (m : msg) : VAttr σ msg := .stat (.onSubmit m)
-def onBlur (m : msg) : VAttr σ msg := .stat (.onBlur m)
-def onFocus (m : msg) : VAttr σ msg := .stat (.onFocus m)
-def onInput (h : String → msg) : VAttr σ msg := .stat (.onInput h)
-def onCheck (h : Bool → msg) : VAttr σ msg := .stat (.onCheck h)
-def onKeydown (h : String → msg) : VAttr σ msg := .stat (.onKeydown h)
+def disabled (present : Bool) : VAttr σ msg := .stat (.flag "disabled" present)
+def checked (present : Bool) : VAttr σ msg := .stat (.flag "checked" present)
+def onClick (m : msg) : VAttr σ msg := .stat (.on "click" m)
+def onSubmit (m : msg) : VAttr σ msg := .stat (.on "submit" m)
+def onBlur (m : msg) : VAttr σ msg := .stat (.on "blur" m)
+def onFocus (m : msg) : VAttr σ msg := .stat (.on "focus" m)
+def onInput (h : String → msg) : VAttr σ msg := .stat (.onValue "input" h)
+def onCheck (h : Bool → msg) : VAttr σ msg := .stat (.onValue "change" (fun s => h (s == "true")))
+def onKeydown (h : String → msg) : VAttr σ msg := .stat (.onValue "keydown" h)
 
 /-- A scope-bound attribute (general form): `bindAttr (fun r => onClick (.pick r.id))`. -/
 def bindAttr (get : σ → Attr msg) : VAttr σ msg := .bind get
@@ -405,11 +405,12 @@ def bindAttr (get : σ → Attr msg) : VAttr σ msg := .bind get
     row it becomes a fine-grained signal; in a scalar element it is re-applied on update. -/
 def dynAttr (name : String) (get : σ → String) : VAttr σ msg := .dynVal name get
 /-- A click whose message reads the scope: `onClick' (fun r => .pick r.id)`. -/
-def onClick' (get : σ → msg) : VAttr σ msg := .bind (fun s => .onClick (get s))
+def onClick' (get : σ → msg) : VAttr σ msg := .bind (fun s => .on "click" (get s))
 /-- An input whose message reads the scope and the field value. -/
-def onInput' (get : σ → String → msg) : VAttr σ msg := .bind (fun s => .onInput (get s))
+def onInput' (get : σ → String → msg) : VAttr σ msg := .bind (fun s => .onValue "input" (get s))
 /-- A checkbox whose message reads the scope and the checked state. -/
-def onCheck' (get : σ → Bool → msg) : VAttr σ msg := .bind (fun s => .onCheck (get s))
+def onCheck' (get : σ → Bool → msg) : VAttr σ msg :=
+  .bind (fun s => .onValue "change" (fun str => get s (str == "true")))
 /-- Drop a ready-made `Html` subtree into a template. -/
 def static (h : Html msg) : View σ msg := .static h
 

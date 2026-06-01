@@ -34,11 +34,11 @@ try {
   await page.goto(`http://localhost:${PORT}/index.html`, { waitUntil: 'load' });
 
   // Wait for Lean to mount the counter.
-  await page.waitForSelector('[data-qed-click]', { timeout: 15000 });
+  await page.waitForSelector('[data-qed-on-click]', { timeout: 15000 });
 
   const count = () => page.$eval('#app .count', (el) => el.textContent.trim());
   const click = async (id) => {
-    await page.click(`[data-qed-click="${id}"]`);
+    await page.click(`[data-qed-on-click="${id}"]`);
     await sleep(50); // allow the synchronous re-render to settle
   };
 

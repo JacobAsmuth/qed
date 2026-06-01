@@ -51,25 +51,36 @@ def link (path : String) (attrs : List (Attr msg) := []) (children : List (Html 
 /-- Class / arbitrary-attribute / event helpers. -/
 def cls (name : String) : Attr msg := .cls name
 def attr (key value : String) : Attr msg := .attr key value
-def onClick (m : msg) : Attr msg := .onClick m
+/-- Listen for any DOM `event`, dispatching the constant `m` — the escape hatch when no named
+    helper fits (`on "wheel" .scrolled`, `on "dragover" .dragging`, …). -/
+def on (event : String) (m : msg) : Attr msg := .on event m
+/-- Listen for any DOM `event`, dispatching `handler payload` (the event's value/key/checked
+    string) — e.g. `onValue "paste" .pasted`. -/
+def onValue (event : String) (handler : String → msg) : Attr msg := .onValue event handler
+def onClick (m : msg) : Attr msg := .on "click" m
 /-- Fire `handler currentValue` whenever the field is edited. -/
-def onInput (handler : String → msg) : Attr msg := .onInput handler
+def onInput (handler : String → msg) : Attr msg := .onValue "input" handler
 /-- Fire `handler selectedValue` when a `<select>` or radio changes (alias of
     `onInput`; both fire the `input` event). -/
-def onChange (handler : String → msg) : Attr msg := .onInput handler
+def onChange (handler : String → msg) : Attr msg := .onValue "input" handler
 /-- Fire `handler isChecked` whenever a checkbox toggles. -/
-def onCheck (handler : Bool → msg) : Attr msg := .onCheck handler
+def onCheck (handler : Bool → msg) : Attr msg := .onValue "change" (fun s => handler (s == "true"))
 /-- Fire `handler key` on `keydown`, where `key` is the pressed key's name
     (`"Enter"`, `"Escape"`, …). Handy for Enter-to-submit / keyboard shortcuts. -/
-def onKeydown (handler : String → msg) : Attr msg := .onKeydown handler
+def onKeydown (handler : String → msg) : Attr msg := .onValue "keydown" handler
 /-- Fire `handler key` on `keyup`. -/
-def onKeyup (handler : String → msg) : Attr msg := .onKeyup handler
+def onKeyup (handler : String → msg) : Attr msg := .onValue "keyup" handler
 /-- Fire `m` when a `<form>` is submitted; the page reload is always suppressed. -/
-def onSubmit (m : msg) : Attr msg := .onSubmit m
+def onSubmit (m : msg) : Attr msg := .on "submit" m
 /-- Fire `m` when the element loses focus (`blur`). -/
-def onBlur (m : msg) : Attr msg := .onBlur m
+def onBlur (m : msg) : Attr msg := .on "blur" m
 /-- Fire `m` when the element gains focus. -/
-def onFocus (m : msg) : Attr msg := .onFocus m
+def onFocus (m : msg) : Attr msg := .on "focus" m
+/-- A double-click; `on "dblclick"` under the hood. -/
+def onDoubleClick (m : msg) : Attr msg := .on "dblclick" m
+/-- Mouse button pressed / released over the element. -/
+def onMouseDown (m : msg) : Attr msg := .on "mousedown" m
+def onMouseUp (m : msg) : Attr msg := .on "mouseup" m
 
 /-- A reconciliation key (React/Vue `key`): give each item in a repeated list a
     stable key so the diff matches a moved/removed row to its previous DOM node
@@ -97,9 +108,9 @@ def type'       (v : String) : Attr msg := .attr "type" v
 
 /-- Typed boolean attributes — present on the node *iff* the flag is `true`, so
     `disabled false` actually enables (no `disabled="false"` footgun). -/
-def disabled (on : Bool) : Attr msg := .flag "disabled" on
-def required (on : Bool) : Attr msg := .flag "required" on
-def checked  (on : Bool) : Attr msg := .flag "checked" on
-def readOnly (on : Bool) : Attr msg := .flag "readonly" on
+def disabled (present : Bool) : Attr msg := .flag "disabled" present
+def required (present : Bool) : Attr msg := .flag "required" present
+def checked  (present : Bool) : Attr msg := .flag "checked" present
+def readOnly (present : Bool) : Attr msg := .flag "readonly" present
 
 end Qed

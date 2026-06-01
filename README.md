@@ -394,50 +394,49 @@ pair — `window.qed.snapshot()` / `.restore(json)` — for persistence and time
 
 ### Fine-grained view templates
 
-`view : Model → Html Msg` rebuilds the whole tree each update and lets the diff find what
-changed — simple, and fast enough to beat React on whole-list operations. But for a page
-that's mostly static with a few live values, rebuilding everything to change one is wasted
-work. A **`View` template** is the alternative: built into DOM once, then on update only
-the model *projections* re-run, patching just the nodes whose value changed — no tree
-rebuilt, nothing diffed. The value still lives in the model and `update` stays the pure
-`Model → Msg → Model`; the binding is *derived*, not a side channel. You write it like an
-ordinary view, and the `view%` macro lifts each `text` that reads the model into a binding:
+`view : Model → Html Msg` with `sandbox`/`application` rebuilds the whole tree each update
+and lets the diff find what changed — simple, and fast enough to beat React on whole-list
+operations. The alternative builds the DOM *once* and patches only what changed: `ui` makes
+an app that way from a view written inline.
 
 ```lean
-def template : View Model Msg :=
-  view% fun m =>
-    div [] [
-      span [] [text s!"Count: {m.count}"],           -- a bound text node
-      showIf (·.loading) (p [] [text "loading…"]),    -- conditional structure
-      forEach "ul" (·.rows) (·.id) row                -- a keyed list
-    ]
+def app : App Model Msg := ui init update fun m =>
+  div [] [
+    span [] [text s!"Count: {m.count}"],                       -- live text
+    if m.loading then p [] "loading…" else content,            -- a conditional
+    ul [] (m.rows.map fun r => li [key r.id] [text r.label])   -- a keyed list
+  ]
 
-def app := templated init update template
+-- the WASM entry is just:
+def main := Qed.run app
 ```
 
-Static structure is built once; `showIf`/`forEach` reconcile through the *same verified
-`diff`* when their shape changes. A keyed list goes further — each row's text *and*
-attributes (a `class`, a `value`) are signals, so changing a row pushes straight to its
-node, no `childAt` and no reconcile. Against the diff path on the same app
-(`test/bench_template.mjs`): a 2,000-node mostly-static page updates **3.7× faster**, and a
-10,000-row list with 1,000 rows changing **4.6× faster** (40 ms → 8.8 ms). The honest gap
-to hand-written signals is that the template re-checks every binding to *find* what changed
-(pure Lean has no dependency tracking), so it's a category win over the diff, not a tie
-with `setSignal`.
+`ui` lifts the view for you: string interpolation becomes a bound text node, a model-driven
+`if`/`match` becomes a reconciling slot, a `.map` with a `key` becomes a keyed list, and
+dynamic attributes (`cls (if …)`, `value m.x`) and scope-reading events (`onClick (.toggle
+t.id)`) are wired up — so the dynamic parts need no special syntax. Anything it can't patch
+in place — a keyless `.map`, a free-form subtree — falls back to the verified `diff`, so
+every view compiles and renders. The value stays in the model and `update` stays the pure
+`Model → Msg → Model`. `run app` then drives the patch-in-place path; no template argument.
 
-And the non-list path is *proven*: `applyValues_render` says that under stable structure,
-the in-place value patch reproduces a full re-render (`applyValues t s' (render t s) =
-render t s'`) — so the template inherits the same "the DOM equals the model's view"
-guarantee `diff_apply` gives, and `qed check` gates on it. `Examples/Template.lean` is the
-demo; `test/template_test.mjs` drives it in a browser.
+The build happens once; only the changed bindings patch on update, and a keyed list pushes
+each changed row straight to its node (text and attributes are signals) with no reconcile.
+On a 10,000-row list with ~1,000 rows changing that's about **4× faster** than the diff path
+(42 ms → 10 ms, `test/bench_template.mjs`), and a single fine-grained row update is **0.84 ms**
+— faster than React.memo's 2.10 ms (`test/bench_react.mjs`). The non-list value patch is
+proven: `applyValues_render` shows the in-place patch reproduces a full re-render (`applyValues
+t s' (render t s) = render t s'`), so it inherits `diff_apply`'s "the DOM equals the model's
+view" guarantee, and `qed check` gates on it.
 
-The `view%` macro lets you write that template as an *ordinary* view — native control flow
-is lifted into the fine-grained combinators. `if c then a else b` becomes a reconciling
-conditional, `xs.map (fun x => row …)` with a `key` becomes a keyed list, `match` on the
-model falls back to the verified diff, dynamic attributes (`cls (if …)`, `value m.x`) and
-scope-reading events (`onClick (.toggle t.id)`) are lifted too — so the dynamic parts need
-no special syntax. A conditional inside a row keeps fine-grained updates, and a controlled
-`<input>` inside one keeps its focus and caret while you type.
+For effects, local components, or a named template you reuse, build with `templated` and the
+`view%` macro (the same lift, as a term):
+
+```lean
+def template : View Model Msg := view% fun m => …
+def app := templated init update template (effects := …)
+```
+
+`Examples/Template.lean` is the demo; `test/template_test.mjs` drives it in a browser.
 
 ## A few more ergonomics
 
@@ -542,7 +541,8 @@ muscle memory you've got. When you're hacking on the framework itself, the in-re
 |------|------|
 | `Qed/Html.lean` | The core typed virtual DOM — the thing every bit of nice syntax eventually becomes. |
 | `Qed/Notation.lean` | The readable view combinators (`div`, `button`, `onClick`, …). |
-| `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`, `routed`), the `Cmd` effects (storage, navigation, clipboard, focus, `after`, `setTitle`, `randomInt`, files, `getJson`/`stream`, `batch`) and the `port`/`onPort` escape hatch, local-state components (`LocalDef`, `localMount`, `App.locals`), and the pure render-to-HTML. |
+| `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`, `program`/`routedProgram`, `routed`), the `templated`/`ui` builders (an app carrying a `View` template), the `Cmd` effects (storage, navigation, clipboard, focus, `after`, `setTitle`, `randomInt`, files, `getJson`/`stream`, `batch`) and the `port`/`onPort` escape hatch, local-state components (`LocalDef`, `localMount`, `App.locals`), and server-side render (`App.renderInitial`/`renderModel`, `renderDocument`). |
+| `Qed/Render.lean` | The pure `Html` → string renderer (`Html.render`, `escapeHtml`, `normalizeAttrs`), kept below `Qed.View` so an `App` can carry a `View` template. |
 | `Qed/Invariant.lean` | The `invariant … preserved_by …` command (it discharges the proof for you). |
 | `Qed/Diff.lean` | The diff/patch engine — positional reconcile (add/remove), `O(n)` keyed reconcile (reorder by `key`), and `lazy` subtree memoization — plus the `diff_apply` correctness proof. |
 | `Qed/Json.lean` | The full JSON parser/renderer + `jsonStruct`/`jsonCodec`, with the `parse_depth_le` & `parse_render` proofs. |
@@ -550,7 +550,7 @@ muscle memory you've got. When you're hacking on the framework itself, the in-re
 | `Qed/Form.lean` | Typed refinement fields (`Field p`), the `Input` controls (text/number/checkbox/date/select/radios), and the `form` command (Draft + `parse` + `formView` + the `canSubmit_iff` proof). |
 | `Qed/Date.lean` | A calendar `Date` that can't be invalid (smart constructor + ISO parser; impossible dates parse to `none`). |
 | `Qed/Component.lean` | `Component` (a reusable `update`+`view`), `viewList`/`updateAt`/`updateKeyed` for repeating one per row, and the `embed` macro that writes the per-row wiring. |
-| `Qed/View.lean` | Fine-grained `View` templates: `dyn`/`showIf`/`forEach`, the `templated` builder, and the `view%` auto-lift macro. Built once, then only changed bindings patch (lists update via signals). |
+| `Qed/View.lean` | `View` templates: `dyn`/`showIf`/`ifElse`/`forEach`/`dynNode`, and the `view%` auto-lift macro behind the `ui` builder. Built once, then only changed bindings patch (lists update via signals); anything not liftable falls back to the verified `diff`. |
 | `Qed/Dom.lean` | The `@[extern]` DOM primitives — the one trusted boundary. |
 | `Qed/Driver.lean` | The impure browser driver (build + patch) + the `@[export]`ed entry points. |
 | `Examples/` | Example programs. |

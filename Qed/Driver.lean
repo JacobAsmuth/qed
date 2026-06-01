@@ -51,48 +51,40 @@ structure LocalInstance where
   view     : String → Html LocalMsg
   onOutput : String → IO Unit
 
-/-- Install one attribute on a DOM node, registering event handlers as it goes.
-    `value` is set as the live property (controlled input); a `flag` is set only
-    when on (the patch path clears first, so off needs no work). -/
+/-- Register an event handler at the element's *existing* table slot — read from its
+    `data-qed-*` attribute — so re-applying it on a later render *overwrites* the slot,
+    keeping the message fresh without the table growing. With no slot yet (first build,
+    or a server-rendered id equal to the current table size) it appends one and tags the
+    node. This makes `applyAttr` idempotent per node: build, hydrate, and patch all take
+    the one path, and a scope-dependent message (`onClick (.delete m.id)`) reflects the
+    *current* model rather than the value baked in at build. -/
+def registerHandler {α : Type} (tbl : IO.Ref (Array α)) (node : Dom.Node)
+    (key : String) (v : α) : IO Unit := do
+  let ts ← tbl.get
+  match (← Dom.getAttribute node key).toNat? with
+  | some i => if i < ts.size then tbl.set (ts.set! i v)
+              else do tbl.set (ts.push v); Dom.setAttribute node key (toString ts.size)
+  | none   => do tbl.set (ts.push v); Dom.setAttribute node key (toString ts.size)
+
+/-- Install one attribute on a DOM node, registering event handlers as it goes (idempotent
+    per node via `registerHandler`, so re-applying keeps a handler fresh, not duplicated).
+    `value` is set as the live property (controlled input); a `flag` is set only when on
+    (the patch path clears first, so off needs no work). -/
 def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
   | .cls c          => Dom.setAttribute node "class" c
   | .attr "value" v => Dom.setValue node v
   | .attr k v       => Dom.setAttribute node k v
   | .flag k on      => if on then Dom.setAttribute node k k else Dom.removeAttribute node k
   | .key _          => pure ()   -- a reconciliation key never touches the DOM
-  | .onClick m      => do
-      let cs ← h.click.get
-      h.click.set (cs.push m)
-      Dom.setAttribute node "data-qed-click" (toString cs.size)
-  | .onInput f      => do
-      let is ← h.input.get
-      h.input.set (is.push f)
-      Dom.setAttribute node "data-qed-input" (toString is.size)
-  | .onCheck f      => do
-      -- shares the string-handler table; the host sends "true"/"false" for a check
-      let is ← h.input.get
-      h.input.set (is.push (fun s => f (s == "true")))
-      Dom.setAttribute node "data-qed-check" (toString is.size)
-  | .onKeydown f    => do
-      let is ← h.input.get
-      h.input.set (is.push f)         -- host sends the key name into the string table
-      Dom.setAttribute node "data-qed-keydown" (toString is.size)
-  | .onKeyup f      => do
-      let is ← h.input.get
-      h.input.set (is.push f)
-      Dom.setAttribute node "data-qed-keyup" (toString is.size)
-  | .onSubmit m     => do
-      let cs ← h.click.get            -- no-arg messages share the click table
-      h.click.set (cs.push m)
-      Dom.setAttribute node "data-qed-submit" (toString cs.size)
-  | .onBlur m       => do
-      let cs ← h.click.get
-      h.click.set (cs.push m)
-      Dom.setAttribute node "data-qed-blur" (toString cs.size)
-  | .onFocus m      => do
-      let cs ← h.click.get
-      h.click.set (cs.push m)
-      Dom.setAttribute node "data-qed-focus" (toString cs.size)
+  | .onClick m      => registerHandler h.click node "data-qed-click" m
+  -- onCheck shares the string table; the host sends "true"/"false" for a check
+  | .onInput f      => registerHandler h.input node "data-qed-input" f
+  | .onCheck f      => registerHandler h.input node "data-qed-check" (fun s => f (s == "true"))
+  | .onKeydown f    => registerHandler h.input node "data-qed-keydown" f   -- host sends the key name
+  | .onKeyup f      => registerHandler h.input node "data-qed-keyup" f
+  | .onSubmit m     => registerHandler h.click node "data-qed-submit" m    -- no-arg msgs share the click table
+  | .onBlur m       => registerHandler h.click node "data-qed-blur" m
+  | .onFocus m      => registerHandler h.click node "data-qed-focus" m
   | .localCell key comp init bubble => do
       -- Mark the host (namespaced by component, so keys can't collide) so the JS
       -- delegation routes events inside it to this instance, then mount the local
@@ -106,6 +98,31 @@ def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
     would produce — classes merged, duplicate keys collapsed. -/
 def applyAttrs (h : Handlers msg) (node : Dom.Node) (attrs : List (Attr msg)) : IO Unit := do
   for a in normalizeAttrs attrs do applyAttr h node a
+
+/-- Re-apply an element's *scope-dependent* template attributes against the new scope:
+    a `dynVal` value, and a `bind` (a scope-reading attribute or event). Static attrs were
+    set once at build and don't change. Events go through `registerHandler`, so re-applying
+    overwrites the handler's slot — a message that reads the scope stays current — without
+    growing the table. Shared by the element and keyed-list-container patch paths, so a
+    plain element and a list container update by the same rule. -/
+def applyDynAttrs (h : Handlers msg) (node : Dom.Node) (attrs : List (VAttr σ msg)) (s : σ) : IO Unit := do
+  for va in attrs do
+    match va with
+    | .bind f          => applyAttr h node (f s)
+    | .dynVal attr get => applyAttr h node (.attr attr (get s))
+    | .stat _          => pure ()
+
+/-- The attributes that index a handler table. The server emits these during SSR, numbered
+    in *render* order; on hydration the client owns the tables and registers in its own
+    *traversal* order, so it clears the server's placeholders before adopting a node and then
+    tags it with the client's slot. (Build creates fresh nodes that carry none, so this is a
+    no-op there; it only matters when adopting server-rendered markup.) -/
+def handlerIdAttrs : List String :=
+  ["data-qed-click", "data-qed-submit", "data-qed-blur", "data-qed-focus",
+   "data-qed-input", "data-qed-check", "data-qed-keydown", "data-qed-keyup"]
+
+def clearHandlerIds (node : Dom.Node) : IO Unit :=
+  for k in handlerIdAttrs do Dom.removeAttribute node k
 
 /-- Are this element's children owned by the driver — a local component (filled from
     local state) or a signal (its text)? Then the parent's diff must not reconcile them:
@@ -144,6 +161,7 @@ partial def hydrateDom (h : Handlers msg) : Html msg → Dom.Node → IO Unit
   | .text _,     _    => pure ()
   | .lazy _ sub, node => hydrateDom h sub node
   | .element _ attrs children, node => do
+      clearHandlerIds node             -- drop the server's handler ids; the client owns the tables
       applyAttrs h node attrs
       unless ownsChildren attrs do
         let mut i : UInt32 := 0
@@ -351,13 +369,9 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
       let v := get s
       if v != (← last.get) then Dom.setText node v; last.set v
   | .element _ attrs kids, s, .elem node kstates => do
-      -- re-apply dynamic *value* attributes; leave static attrs and all events alone (set
-      -- once at build — the tables are not reset, so re-registering would grow them)
-      for va in attrs do
-        match va with
-        | .bind f          => let a := f s; unless a.isEvent do applyAttr h node a
-        | .dynVal attr get => applyAttr h node (.attr attr (get s))
-        | .stat _          => pure ()
+      -- re-apply the scope-dependent attributes (values *and* events); static attrs stay.
+      -- Events re-register into their existing slot, so a scope-reading message stays fresh.
+      applyDynAttrs h node attrs s
       let mut i : UInt32 := 0
       for k in kids do
         patchView h cells node i k s (kstates.getD i.toNat default)
@@ -402,8 +416,10 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
   | .keyedList tag attrs keys sigs rowsHtml, s, .list node lastKeys lastSigs lastRows inst => do
       if (keys s) == (← lastKeys.get) then
         -- value-only update: the key set/order is unchanged, so no row was added, removed,
-        -- or moved. Push only the rows whose signal value changed — a direct `setSignal`
-        -- (JS Map write), no `Html` built, no diff, no `childAt`. This is the list win.
+        -- or moved. First refresh the container's own scope-dependent attributes (a `cls m.q`
+        -- on the `<ul>`), then push only the rows whose signal value changed — a direct
+        -- `setSignal` (JS Map write), no `Html` built, no diff, no `childAt`. The list win.
+        applyDynAttrs h node attrs s
         let newSigs := (sigs s).map fun (nm, v) => (inst ++ nm, v)
         let oldSigs ← lastSigs.get
         for i in [0:newSigs.size] do
@@ -445,6 +461,7 @@ partial def hydrateView (h : Handlers msg) (cells : CondCells σ msg) :
   | .dyn get,         s, node => return .dyn node (← IO.mkRef (get s))
   | .static html,     _, node => do hydrateDom h html node; return .stat node
   | .element _ attrs kids, s, node => do
+      clearHandlerIds node
       applyAttrs h node (attrs.map (VAttr.eval s))
       let mut ks : Array (VState σ msg) := #[]
       let mut i : UInt32 := 0
@@ -475,6 +492,7 @@ partial def hydrateView (h : Handlers msg) (cells : CondCells σ msg) :
       hydrateDom h html node
       return .dynNode (← IO.mkRef node) (← IO.mkRef html)
   | .keyedList _ attrs keys sigs rowsHtml, s, node => do
+      clearHandlerIds node
       applyAttrs h node (attrs.map (VAttr.eval s))
       let inst := s!"§{node}§"
       let sg := (sigs s).map fun (nm, v) => (inst ++ nm, v)

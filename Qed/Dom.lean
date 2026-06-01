@@ -34,6 +34,13 @@ opaque setAttribute (node : Node) (key value : String) : IO Unit
 @[extern "qed_dom_remove_attribute"]
 opaque removeAttribute (node : Node) (key : String) : IO Unit
 
+/-- Read an attribute's value, or `""` if the node or attribute is absent. The driver
+    uses it to find an element's existing handler-table slot, so re-registering an event
+    *overwrites* that slot rather than appending — keeping the handler fresh on update
+    without growing the table. -/
+@[extern "qed_dom_get_attribute"]
+opaque getAttribute (node : Node) (key : String) : IO String
+
 /-- Set an input's live `value` *property* (not just the attribute), so a
     controlled field reflects the model. A no-op when already equal, which keeps
     the caret where the user left it. -/

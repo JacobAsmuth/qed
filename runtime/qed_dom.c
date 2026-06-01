@@ -50,6 +50,14 @@ EM_JS(void, qed_js_remove_attribute, (int node, const char *k), {
   if (el) el.removeAttribute(UTF8ToString(k));
 });
 
+/* Read an attribute, or "" if the element or attribute is absent. The returned
+   buffer is malloc'd by stringToNewUTF8 and freed by the caller. */
+EM_JS(char *, qed_js_get_attribute, (int node, const char *k), {
+  var el = globalThis.__qed.nodes[node];
+  var v = el ? el.getAttribute(UTF8ToString(k)) : null;
+  return stringToNewUTF8(v == null ? '' : v);
+});
+
 EM_JS(void, qed_js_set_value, (int node, const char *v), {
   var el = globalThis.__qed.nodes[node];
   var s = UTF8ToString(v);
@@ -237,6 +245,15 @@ LEAN_EXPORT lean_object *qed_dom_remove_attribute(uint32_t node, lean_object *k,
   qed_js_remove_attribute((int) node, lean_string_cstr(k));
   lean_dec(k);
   return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *qed_dom_get_attribute(uint32_t node, lean_object *k, lean_object *world) {
+  (void) world;
+  char *s = qed_js_get_attribute((int) node, lean_string_cstr(k));
+  lean_dec(k);
+  lean_object *r = lean_mk_string(s);
+  free(s);
+  return lean_io_result_mk_ok(r);
 }
 
 LEAN_EXPORT lean_object *qed_dom_today(lean_object *world) {

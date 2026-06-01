@@ -342,6 +342,14 @@ def program (init : Model) (transition : Model → Msg → Model × Cmd Msg)
     App Model Msg :=
   { init := (init, start), update := transition, view, locals, onPort }
 
+/-- A URL-routed app written with a single combined `transition` (the routed analogue of
+    `program`): the `urlChanged` arm can set state *and* fire the page's data fetch in one
+    place, instead of splitting them across `update` and `effects`. -/
+def routedProgram (init : Model) (transition : Model → Msg → Model × Cmd Msg)
+    (view : Model → Html Msg) (onUrlChange : String → Msg) (start : Cmd Msg := .none) :
+    App Model Msg :=
+  { init := (init, start), update := transition, view, onUrlChange := some onUrlChange }
+
 /-- Register a local component with an output it can bubble to its parent. `update`
     returns the next state and an optional output; the output is serialized and handed
     to the host's `bubble` (see `localMountWith`). The message type `M` needs no codec

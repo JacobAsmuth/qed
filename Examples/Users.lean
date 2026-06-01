@@ -43,27 +43,23 @@ inductive Msg where
   | blur
   | key (k : String)
 
-def update (m : Model) : Msg → Model
+-- One combined transition: the `urlChanged` arm sets the route, flips the profile to its
+-- `loading` state, and fires the fetch — all together, instead of splitting the state change
+-- (in `update`) from the effect (in `effects`).
+def transition (m : Model) : Msg → Model × Cmd Msg
   | .urlChanged path =>
       let route : R := (Router.fromURL path).getD .home
-      -- entering a user page shows the loading state; `effects` fires the fetch
-      { m with route, profile := match route with | .user _ => .loading | _ => m.profile }
-  | .typeQuery s    => { m with query := s }
-  | .submit         => m                     -- navigation is the effect below
-  | .gotProfile r   => { m with profile := r }
-  | .focus          => { m with focused := true }
-  | .blur           => { m with focused := false }
-  | .key k          => if k == "Escape" then { m with query := "" } else m
-
-def effects (m : Model) : Msg → Cmd Msg
-  | .submit =>
-      if m.query.trim.isEmpty then .none
-      else .pushUrl (Router.toURL (R.user m.query.trim))
-  | .urlChanged _ =>
-      match m.route with
-      | .user name => Resource.fetch s!"/api/users/{name}" Msg.gotProfile
-      | _          => .none
-  | _ => .none
+      let m' := { m with route, profile := match route with | .user _ => .loading | _ => m.profile }
+      match route with
+      | .user name => also m' (Resource.fetch s!"/api/users/{name}" Msg.gotProfile)
+      | _          => still m'
+  | .typeQuery s => still { m with query := s }
+  | .submit      => if m.query.trim.isEmpty then still m
+                    else also m (.pushUrl (Router.toURL (R.user m.query.trim)))
+  | .gotProfile r => still { m with profile := r }
+  | .focus        => still { m with focused := true }
+  | .blur         => still { m with focused := false }
+  | .key k        => still (if k == "Escape" then { m with query := "" } else m)
 
 def view (m : Model) : Html Msg :=
   div [cls "app"] [
@@ -87,6 +83,6 @@ def view (m : Model) : Html Msg :=
   ]
 
 def app : App Model Msg :=
-  routed init update view (onUrlChange := Msg.urlChanged) (effects := effects)
+  routedProgram init transition view (onUrlChange := Msg.urlChanged)
 
 end Users

@@ -94,19 +94,22 @@ one table; each line is a constructor:
       about                            -- `/about`   (segment = constructor name)
       post (slug : String) => "posts"  -- `/posts/<slug>`
       user (name : String) => "users"  -- `/users/<name>`
+      * notFound => "404"              -- the fallback for an unknown URL (no args)
 
 A route's path is its leading segment followed by its string arguments. The
-leading segment defaults to the constructor name; `=> "seg"` overrides it, and
-`=> ""` makes the path empty (the index). The command generates `T.print`,
+leading segment defaults to the constructor name; `=> "seg"` overrides it (and a
+`"/"` in the override is split into several segments, so `=> "books/new"` is two);
+`=> ""` makes the path empty (the index). A leading `*` marks the *not-found*
+route — a no-argument route that an unknown URL falls back to (it is the route's
+`Inhabited` default, so `(fromURL p).getD default` lands on it); without one, the
+default is the first constructor, as before. The command generates `T.print`,
 `T.parse`, the `T.round_trip` proof (`parse (print r) = some r`, by case
-analysis), the `Router T` instance — so an unlawful router is impossible and
-none of it is written by hand — and `Repr`/`DecidableEq`/`Inhabited` (the last so a
-typed `ui (onRoute := …)` can `default` the route on an unknown URL; the table needs
-at least one no-argument route, e.g. the index). Fields use one-per-line or
-`;`-separated layout. Core-syntax only (no `import Lean`). -/
+analysis), the `Router T` instance — so an unlawful router is impossible and none
+of it is written by hand — and `Repr`/`DecidableEq`/`Inhabited`. Fields use
+one-per-line or `;`-separated layout. Core-syntax only (no `import Lean`). -/
 
 syntax routeBinder := "(" ident " : " term ")"
-syntax routeAlt := ident (routeBinder)* (" => " str)?
+syntax routeAlt := ("*")? ident (routeBinder)* (" => " str)?
 syntax (name := routerCmd) "router " ident " where " sepBy1IndentSemicolon(routeAlt) : command
 
 open Lean in
@@ -124,32 +127,47 @@ macro_rules
       let mut printRhss : Array (TSyntax `term) := #[]
       let mut parsePats : Array (TSyntax `term) := #[]
       let mut parseRhss : Array (TSyntax `term) := #[]
+      let mut markedCtor : Option (TSyntax `ident) := none
       for alt in alts do
-        match alt with
-        | `(routeAlt| $c:ident $[($bs:ident : $bts:term)]* $[=> $seg:str]?) =>
-            let ctorId := mkIdent (t.getId ++ c.getId)
-            -- leading segment(s): "" ⇒ index (no segment); a string ⇒ those segments
-            -- (split on `/`, so `=> "books/archive"` is two segments and stays reachable);
-            -- omitted ⇒ the constructor name.
-            let segs : Array (TSyntax `term) :=
-              match seg with
-              | some s => ((s.getString.splitOn "/").filter (· ≠ "")).toArray.map (quote ·)
-              | none   => #[quote (toString c.getId)]
-            let bterms : Array (TSyntax `term) := bs.map (⟨·.raw⟩)
-            let segments := segs ++ bterms          -- one list, used as term and pattern
-            ctorNames := ctorNames.push c
-            ctorBs    := ctorBs.push bs
-            ctorBts   := ctorBts.push bts
-            printPats := printPats.push (← `($ctorId $bs*))
-            printRhss := printRhss.push (← `([$segments,*]))
-            parsePats := parsePats.push (← `([$segments,*]))
-            parseRhss := parseRhss.push (← `(some ($ctorId $bs*)))
-        | _ => Macro.throwErrorAt alt "router: expected `ctor (arg : T)* (=> \"segment\")?`"
+        -- `* ctor …` marks the not-found route; normalize both forms to one body.
+        let (marked, c, bs, bts, seg) ← (match alt with
+          | `(routeAlt| * $c:ident $[($bs:ident : $bts:term)]* $[=> $seg:str]?) =>
+              pure (true,  c, bs, bts, seg)
+          | `(routeAlt| $c:ident $[($bs:ident : $bts:term)]* $[=> $seg:str]?) =>
+              pure (false, c, bs, bts, seg)
+          | _ => Macro.throwErrorAt alt "router: expected `[*] ctor (arg : T)* (=> \"segment\")?`")
+        let ctorId := mkIdent (t.getId ++ c.getId)
+        -- leading segment(s): "" ⇒ index (no segment); a string ⇒ those segments
+        -- (split on `/`, so `=> "books/archive"` is two segments and stays reachable);
+        -- omitted ⇒ the constructor name.
+        let segs : Array (TSyntax `term) :=
+          match seg with
+          | some s => ((s.getString.splitOn "/").filter (· ≠ "")).toArray.map (quote ·)
+          | none   => #[quote (toString c.getId)]
+        let bterms : Array (TSyntax `term) := bs.map (⟨·.raw⟩)
+        let segments := segs ++ bterms          -- one list, used as term and pattern
+        if marked then
+          if bs.size != 0 then
+            Macro.throwErrorAt c "router: the not-found route (marked `*`) must take no arguments"
+          markedCtor := some c
+        ctorNames := ctorNames.push c
+        ctorBs    := ctorBs.push bs
+        ctorBts   := ctorBts.push bts
+        printPats := printPats.push (← `($ctorId $bs*))
+        printRhss := printRhss.push (← `([$segments,*]))
+        parsePats := parsePats.push (← `([$segments,*]))
+        parseRhss := parseRhss.push (← `(some ($ctorId $bs*)))
       let parsePatsAll := parsePats.push (← `(_))           -- final wildcard ⇒ none
       let parseRhssAll := parseRhss.push (← `(none))
+      -- The `*`-marked route is what a routed app falls back to on an unknown URL (it is the
+      -- `Inhabited` default `fromURL … |>.getD default` lands on). Unmarked ⇒ derive it as before.
+      let inhCmd : TSyntax `command ← match markedCtor with
+        | some mc => `(instance : Inhabited $t := ⟨$(mkIdent (t.getId ++ mc.getId))⟩)
+        | none    => `(deriving instance Inhabited for $t)
       `(inductive $t:ident where
           $[| $ctorNames:ident $[($ctorBs:ident : $ctorBts:term)]*]*
-        deriving Repr, DecidableEq, Inhabited
+        deriving Repr, DecidableEq
+        $inhCmd:command
         def $printId:ident (r : $t) : List String :=
           match r with
           $[| $printPats:term => $printRhss:term]*

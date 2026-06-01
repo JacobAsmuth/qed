@@ -476,10 +476,13 @@ div [card] [ … ]
 **Forms show errors.** `formView` marks a field `aria-invalid` and shows a message once it's
 been edited and fails to validate — the gate and its `canSubmit_iff` proof are unchanged.
 
-**Server-side rendering.** `App.renderInitial app` runs the *same* verified `view`/`render`
-on the server; `renderDocument` wraps it in a static page. The client mounts over it, so
-first paint is the real UI and the two sides are provably one function. (Flash-free
-adopt-in-place hydration is the next step.)
+**Server-side rendering + hydration.** `App.renderInitial app` runs the *same* verified
+`view`/`render` on the server; `renderDocument` wraps it in a static page. The client then
+**hydrates** it — `Driver.hydrateDom` walks the view in lockstep with the server DOM and
+wires events/signals onto the *existing* nodes without rebuilding, so there's no flash and
+focus/scroll survive. Server and client are provably one `view`/`render`. (Hydration covers
+the standard app builders today; fine-grained `view%` templates and a dynamic per-request
+server are the remaining steps.)
 
 ## So what's actually happening?
 

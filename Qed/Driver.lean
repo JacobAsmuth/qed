@@ -246,6 +246,10 @@ inductive VState (σ : Type) (msg : Type) where
       (sigs : IO.Ref (Array (String × String))) (rows : IO.Ref (List (Html msg)))
   /-- An opaque embedded `Html` subtree (`View.static`) — not fine-grained-updated. -/
   | stat (node : Dom.Node)
+  /-- A scope-bound `Html` subtree (`View.dynNode`): the diff escape hatch. Holds a *mutable*
+      node handle (a shape change can replace it) and the last rendered `Html`, so each update
+      reconciles through the verified `diff` — never a value patch. -/
+  | dynNode (nref : IO.Ref Dom.Node) (last : IO.Ref (Html msg))
 
 instance : Inhabited (VState σ msg) := ⟨.text 0⟩
 
@@ -284,6 +288,18 @@ partial def buildView (h : Handlers msg) (cells : CondCells σ msg) :
       else
         let n ← Dom.createText ""
         return (n, .cond idx)
+  | .ifElse cond yes no, s => do
+      -- one slot showing the active branch; reserve this cell before building it so the
+      -- branch's own conditional slots get later indices. The cell's `Bool` is "is `yes`".
+      let idx := (← cells.get).size
+      cells.modify (·.push (false, none))
+      let (cn, cst) ← buildView h cells (if cond s then yes else no) s
+      cells.modify (·.set! idx (cond s, some cst))
+      return (cn, .cond idx)
+  | .dynNode get, s => do
+      let html := get s
+      let n ← buildDom h html
+      return (n, .dynNode (← IO.mkRef n) (← IO.mkRef html))
   | .keyedList tag attrs keys sigs rowsHtml, s => do
       let node ← Dom.createElement tag
       applyAttrs h node (attrs.map (VAttr.eval s))
@@ -330,6 +346,28 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
         let n ← Dom.createText ""                   -- shown → hidden: empty the slot
         Dom.replaceChild parent index n
         cells.modify (·.set! idx (false, none))
+  | .ifElse cond yes no, s, .cond idx => do
+      let (wasYes, inner) := (← cells.get).getD idx (false, none)
+      let now := cond s
+      let active := if now then yes else no
+      if now == wasYes then
+        match inner with                            -- same branch: value-patch it in place
+        | some ist => patchView h cells parent index active s ist
+        | none     => pure ()
+      else do
+        let (cn, cst) ← buildView h cells active s   -- flipped: install the other branch
+        Dom.replaceChild parent index cn
+        cells.modify (·.set! idx (now, some cst))
+  | .dynNode get, s, .dynNode nref last => do
+      let newHtml := get s
+      let node ← nref.get
+      match diff (← last.get) newHtml with
+      | .replace h2 => do                            -- root shape changed: rebuild the subtree
+          let n2 ← buildDom h h2
+          Dom.replaceChild parent index n2
+          nref.set n2
+      | p => applyToDom h parent index node p        -- otherwise patch in place (verified diff)
+      last.set newHtml
   | .keyedList tag attrs keys sigs rowsHtml, s, .list node lastKeys lastSigs lastRows => do
       if (keys s) == (← lastKeys.get) then
         -- value-only update: the key set/order is unchanged, so no row was added, removed,

@@ -14,6 +14,7 @@ import Examples.Counter
 #print axioms Qed.diffChildren_apply -- child-list reconcile (add/remove), any lengths
 #print axioms Qed.diffKeyed_apply    -- keyed child reconcile (reorder/remove by key)
 #print axioms Qed.applyValues_render -- View template value-patch = full re-render (stable structure)
+#print axioms Qed.patch_render       -- View template update step = full re-render (any structure)
 #print axioms Qed.parse_depth_le     -- JSON depth bound
 #print axioms Qed.Route.round_trip   -- routing round-trip
 #print axioms Qed.Demo.Signup.canSubmit_iff  -- form submit ⇔ valid

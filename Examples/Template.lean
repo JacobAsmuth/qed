@@ -20,6 +20,7 @@ structure Todo where
   id   : Nat
   text : String
   done : Bool
+  editing : Bool := false
 deriving Inhabited
 
 structure Model where
@@ -38,6 +39,8 @@ inductive Msg
   | setName (s : String)
   | toggle (id : Nat)
   | add
+  | startEdit (id : Nat)            -- enter inline-edit on a row
+  | editText (id : Nat) (s : String) -- the row's controlled input fired
 
 def update (m : Model) : Msg → Model
   | .inc        => { m with count := m.count + 1 }
@@ -46,17 +49,14 @@ def update (m : Model) : Msg → Model
   | .toggle id  => { m with todos := m.todos.map fun t => if t.id == id then { t with done := !t.done } else t }
   | .add        => { m with todos := m.todos.push { id := m.nextId, text := s!"item {m.nextId}", done := false },
                             nextId := m.nextId + 1 }
+  | .startEdit id => { m with todos := m.todos.map fun t => { t with editing := t.id == id } }
+  | .editText id s => { m with todos := m.todos.map fun t => if t.id == id then { t with text := s } else t }
 
-/-- The row template — scoped to a `Todo`. Its `class` and text both read the row, and
-    both are signals: a toggle updates just this row's class and text directly — no diff,
-    no `childAt`. The toggle message reads the row's id (`onClick'`). -/
-def todoRow : View Todo Msg :=
-  li [dynAttr "class" (fun t => if t.done then "done" else ""), onClick' (fun t => .toggle t.id)]
-     [dyn (·.text)]
-
--- The `view%` macro lifts each `text e` that mentions the model `m` into a `dyn`
--- projection, so dynamic values read like plain text. Structure (`showIf`/`forEach`) and
--- attributes (`dynAttr`) stay explicit with their `(·.field)` projections.
+-- The `view%` macro lets this read like an ordinary `Model → Html` view: string
+-- interpolation becomes `dyn`, a model-driven `if` becomes `ifElse`, a dynamic attribute
+-- (`value m.name`, `cls (if …)`) becomes `dynAttr`, a scope-reading event (`onClick
+-- (.toggle t.id)`) becomes `onClick'`, and `m.todos.map (… key …)` becomes a keyed
+-- `forEach` — none of it written by hand. Each compiles to the same fine-grained core.
 def template : View Model Msg :=
   view% fun m =>
     div [cls "demo"] [
@@ -67,12 +67,37 @@ def template : View Model Msg :=
         span [cls "count"] [text s!"{m.count}"],
         button [onClick .inc] "+"
       ],
-      -- a controlled input bound to `name`, echoed live, greeting shown only when non-empty
-      input [dynAttr "value" (·.name), onInput (Msg.setName ·)],
-      showIf (fun m => m.name != "") (p [] [text s!"Hello, {m.name}!"]),
-      -- a keyed list; the container is a <ul>, each row keyed by its id
+      -- a native `if/else` on the model → `ifElse` (fine-grained slot, reconciled on flip)
+      if m.count == 0
+        then p [cls "hint"] "click + to start"
+        else p [cls "live"] [text s!"count is {m.count}"],
+      -- a controlled input: `value m.name` → `dynAttr "value"`, echoed live; greeting on non-empty
+      input [value m.name, onInput (Msg.setName ·)],
+      showIf (fun m => m.name != "") (p [cls "greeting"] [text s!"Hello, {m.name}!"]),
+      -- a keyed list written as a native `.map`: each row's `class` (`cls (if …)`) and text
+      -- are fine-grained signals, its click reads the row id, and `key` drives reconciliation
       button [onClick .add] "add todo",
-      forEach "ul" (·.todos) (fun t => toString t.id) todoRow
+      ul [cls "todos"] (m.todos.map fun t =>
+        li [key (toString t.id), cls (if t.done then "done" else ""), onClick (.toggle t.id)]
+           [text t.text]),
+      -- a STRUCTURAL conditional inside a row: the element itself differs by `done`
+      -- (`<strong>` vs `<span>`). `view%` lifts it to `ifElse`; because the row bakes that
+      -- statically, `forEach` folds a fingerprint into the row key so a toggle reconciles
+      -- through the verified keyed `diff` instead of being missed by the signal path.
+      ul [cls "structural"] (m.todos.map fun t =>
+        li [key (toString t.id)] [
+          if t.done then p [cls "is-done"] [text "done!"]
+                    else span [cls "is-open"] [text t.text]
+        ]),
+      -- inline editing: a CONTROLLED input lives inside the row's `ifElse`. Because the
+      -- branch's leaves are signals (not baked into the key), typing updates the value in
+      -- place — the row is not rebuilt, so the input keeps focus and caret while you type.
+      ul [cls "edit"] (m.todos.map fun t =>
+        li [key (toString t.id)] [
+          if t.editing
+            then input [cls "editor", value t.text, onInput (Msg.editText t.id ·)]
+            else span [cls "label", onClick (.startEdit t.id)] [text t.text]
+        ])
     ]
 
 def app : App Model Msg := templated init update template

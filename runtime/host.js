@@ -75,8 +75,16 @@
         globalThis.__qed.sigVals.set(name, s);
         const b = globalThis.__qed.sig.get(name);
         if (!b || !b.el || !b.el.isConnected) return;
-        if (b.attr) { if (b.el.getAttribute(b.attr) !== s) b.el.setAttribute(b.attr, s); }
-        else if (b.el.textContent !== s) b.el.textContent = s;
+        if (b.attr === 'value') {
+          // a controlled input/textarea: set the .value PROPERTY, guarded so re-echoing the
+          // value the user just typed is a no-op — the caret (and focus) stay put.
+          if (b.el.value !== s) b.el.value = s;
+        } else if (b.attr === 'checked') {
+          const on = (s !== '' && s !== 'false');
+          if (b.el.checked !== on) b.el.checked = on;
+        } else if (b.attr) {
+          if (b.el.getAttribute(b.attr) !== s) b.el.setAttribute(b.attr, s);
+        } else if (b.el.textContent !== s) b.el.textContent = s;
       };
       // Keyed timers (Cmd.afterKeyed / Cmd.cancel): scheduling a key clears its pending
       // timeout first, so a debounce keeps only the last one.

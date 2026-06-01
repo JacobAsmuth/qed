@@ -43,8 +43,14 @@ try {
   await page.waitForSelector('#app .demo', { timeout: 20000 });
 
   const count   = () => page.$eval('.count', (e) => e.textContent);
-  const greeting = () => page.$$eval('.demo > p', (ps) => ps.map((p) => p.textContent));
-  const rows    = () => page.$$eval('.demo ul li', (ls) => ls.map((l) => ({ text: l.textContent, done: l.className === 'done' })));
+  const greeting = () => page.$$eval('.demo > p.greeting', (ps) => ps.map((p) => p.textContent));
+  // the native `if/else` (lifted to `ifElse`): a `.hint` paragraph at count 0, else `.live`
+  const status  = () => page.$eval('.demo > p.hint, .demo > p.live',
+    (p) => ({ cls: p.className, text: p.textContent }));
+  const rows    = () => page.$$eval('.demo ul.todos li', (ls) => ls.map((l) => ({ text: l.textContent, done: l.className === 'done' })));
+  // the structural list: each row is `<p>` when done, `<span>` when open (an ifElse inside the
+  // row). The tag of row i's single child tells us which branch is live.
+  const structTag = (i) => page.$eval(`.demo ul.structural li:nth-child(${i + 1}) > *`, (e) => e.tagName);
   const clickText = (t) => page.evaluate((t) => {
     const b = [...document.querySelectorAll('button')].find((b) => b.textContent === t);
     b.click();
@@ -53,12 +59,16 @@ try {
   // initial render
   check('count starts 0', await count(), '0');
   check('no greeting initially', await greeting(), []);
+  check('ifElse shows the hint branch at count 0', await status(), { cls: 'hint', text: 'click + to start' });
   check('two todos, first done', await rows(), [{ text: 'learn Lean', done: true }, { text: 'write a template', done: false }]);
+  check('structural row 0 is the done branch (<p>)', await structTag(0), 'P');
+  check('structural row 1 is the open branch (<span>)', await structTag(1), 'SPAN');
 
   // node identity across an update: tag the count element, then bump the counter
   await page.$eval('.count', (e) => (e.dataset.tag = 'sentinel'));
   await clickText('+');
   check('count is 1 after +', await count(), '1');
+  check('ifElse flipped to the live branch after +', await status(), { cls: 'live', text: 'count is 1' });
   check('count node was patched in place, not rebuilt',
     await page.$eval('.count', (e) => e.dataset.tag), 'sentinel');
   await clickText('+'); await clickText('+');
@@ -82,10 +92,15 @@ try {
 
   // keyed list, value-only update: toggle a row — its `class` is a signal-attribute, so
   // the class flips fine-grained (no diff); the click handler survives the value-only update
-  await page.evaluate(() => [...document.querySelectorAll('.demo ul li')][1].click());
+  await page.evaluate(() => [...document.querySelectorAll('.demo ul.todos li')][1].click());
   check('second row toggled to done (signal-attribute class)', (await rows())[1], { text: 'write a template', done: true });
-  await page.evaluate(() => [...document.querySelectorAll('.demo ul li')][1].click());
+  // the staleness fix: the SAME toggle flips the structural row's element from <span> to <p>.
+  // The ifElse is baked statically in the row, so this only updates because the structural
+  // fingerprint changed the row key → reconciled through the verified keyed diff.
+  check('structural row 1 flipped to <p> on toggle (no staleness)', await structTag(1), 'P');
+  await page.evaluate(() => [...document.querySelectorAll('.demo ul.todos li')][1].click());
   check('row click still works after a value-only update', (await rows())[1], { text: 'write a template', done: false });
+  check('structural row 1 flipped back to <span>', await structTag(1), 'SPAN');
   // structural update: add a row
   await clickText('add todo');
   check('row added (keyed list grew)', await rows(), [
@@ -93,6 +108,24 @@ try {
     { text: 'write a template', done: false },
     { text: 'item 3', done: false },
   ]);
+
+  // inline editing: a CONTROLLED input inside a row's ifElse. The crucial property: typing
+  // must NOT rebuild the row, so the input keeps focus and caret. We tag the input node and
+  // verify the tag (and focus) survive several keystrokes.
+  const editSel = '.demo ul.edit li:nth-child(1) input.editor';
+  await page.evaluate(() => document.querySelector('.demo ul.edit li:nth-child(1) .label').click()); // startEdit
+  await sleep(20);
+  check('inline edit: row 0 became a controlled input', (await page.$(editSel)) !== null, true);
+  await page.$eval(editSel, (e) => { e.dataset.tag = 'editsentinel'; e.focus(); e.setSelectionRange(e.value.length, e.value.length); });
+  await page.type(editSel, 'ZZ', { delay: 15 });
+  await sleep(20);
+  check('inline edit: input node survived typing (NOT rebuilt — focus would be lost otherwise)',
+    await page.$eval(editSel, (e) => e.dataset.tag), 'editsentinel');
+  check('inline edit: input still has focus after typing',
+    await page.evaluate(() => document.activeElement && document.activeElement.dataset.tag === 'editsentinel'), true);
+  check('inline edit: controlled value reflects the typing', await page.$eval(editSel, (e) => e.value), 'learn LeanZZ');
+  check('inline edit: model received the edit (other lists show new text)',
+    await page.$eval('.demo ul.todos li:nth-child(1)', (e) => e.textContent), 'learn LeanZZ');
 } finally {
   await browser.close();
   server.kill('SIGTERM');

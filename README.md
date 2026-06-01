@@ -478,11 +478,14 @@ been edited and fails to validate — the gate and its `canSubmit_iff` proof are
 
 **Server-side rendering + hydration.** `App.renderInitial app` runs the *same* verified
 `view`/`render` on the server; `renderDocument` wraps it in a static page. The client then
-**hydrates** it — `Driver.hydrateDom` walks the view in lockstep with the server DOM and
-wires events/signals onto the *existing* nodes without rebuilding, so there's no flash and
-focus/scroll survive. Server and client are provably one `view`/`render`. (Hydration covers
-the standard app builders today; fine-grained `view%` templates and a dynamic per-request
-server are the remaining steps.)
+**hydrates** it — the driver walks the view in lockstep with the server DOM and wires
+events/signals onto the *existing* nodes without rebuilding, so there's no flash and
+focus/scroll survive. Server and client are provably one `view`/`render`. Hydration covers
+both the standard builders (`Driver.hydrateDom`) and the fine-grained `view%` templates
+(`Driver.hydrateView`, which even re-inserts the invisible placeholders the server omits and
+rebinds signals). For dynamic, per-request rendering, `App.renderModel` renders any model —
+a server computes the model for the request and renders it (see `Examples/UsersSSR.lean`,
+which renders each route's page with its data filled server-side).
 
 ## So what's actually happening?
 

@@ -39,3 +39,7 @@ lean_exe bench where
     page for that route, profile filled server-side. A front server calls it per request. -/
 lean_exe users_ssr where
   root := `Examples.UsersSSR
+
+/-- SSR of the `view%` template demo's initial view, for the template-hydration test. -/
+lean_exe template_ssr where
+  root := `Examples.TemplateSSR

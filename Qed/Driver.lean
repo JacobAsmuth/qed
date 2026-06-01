@@ -420,6 +420,64 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
       Dom.replaceChild parent index n
 end
 
+/-- Does this template node render to nothing (an empty text — a `""` `dyn`, an empty static
+    `text`, or a hidden `showIf`)? `buildView` still makes an empty *placeholder* text node for
+    those (so positions stay stable for patching), but the server's `render` omits them, so the
+    hydrator must re-insert the placeholder to keep the `VState` mirror aligned with the DOM. -/
+def rendersEmpty (v : View σ msg) (s : σ) : Bool :=
+  match View.render v s with | .text "" => true | _ => false
+
+/-- Hydrate a `View` template against server-rendered DOM: build the `VState` mirror over the
+    *existing* nodes (wiring events/signals via `applyAttrs`/`hydrateDom`, never creating real
+    content), re-inserting only the invisible empty-text placeholders the server omitted. The
+    result is the same `VState` `buildView` would return, so `patchView` then drives updates. -/
+partial def hydrateView (h : Handlers msg) (cells : CondCells σ msg) :
+    View σ msg → σ → Dom.Node → IO (VState σ msg)
+  | .text _,          _, node => return .text node
+  | .dyn get,         s, node => return .dyn node (← IO.mkRef (get s))
+  | .static html,     _, node => do hydrateDom h html node; return .stat node
+  | .element _ attrs kids, s, node => do
+      applyAttrs h node (attrs.map (VAttr.eval s))
+      let mut ks : Array (VState σ msg) := #[]
+      let mut i : UInt32 := 0
+      for k in kids do
+        -- pick the DOM node for this child: the server emitted one unless it renders empty,
+        -- in which case re-insert the placeholder buildView would have made.
+        let kn ← if rendersEmpty k s then
+            let ph ← Dom.createText ""; Dom.insertBefore node i ph; pure ph
+          else Dom.childAt node i
+        ks := ks.push (← hydrateView h cells k s kn)
+        i := i + 1
+      return .elem node ks
+  | .showIf cond child, s, node => do
+      let idx := (← cells.get).size
+      cells.modify (·.push (false, none))
+      if cond s then
+        let cst ← hydrateView h cells child s node
+        cells.modify (·.set! idx (true, some cst))
+      return .cond idx
+  | .ifElse cond yes no, s, node => do
+      let idx := (← cells.get).size
+      cells.modify (·.push (false, none))
+      let cst ← hydrateView h cells (if cond s then yes else no) s node
+      cells.modify (·.set! idx (cond s, some cst))
+      return .cond idx
+  | .dynNode get, s, node => do
+      let html := get s
+      hydrateDom h html node
+      return .dynNode (← IO.mkRef node) (← IO.mkRef html)
+  | .keyedList _ attrs keys sigs rowsHtml, s, node => do
+      applyAttrs h node (attrs.map (VAttr.eval s))
+      let inst := s!"§{node}§"
+      let sg := (sigs s).map fun (nm, v) => (inst ++ nm, v)
+      for (nm, v) in sg do Dom.effect "signal.set" nm v ""   -- seed before binding the rows
+      let rs := (rowsHtml s).map (Html.prefixSignals inst)
+      let mut i : UInt32 := 0
+      for r in rs do
+        hydrateDom h r (← Dom.childAt node i)   -- wire each existing row's events + signals
+        i := i + 1
+      return .list node (← IO.mkRef (keys s)) (← IO.mkRef sg) (← IO.mkRef rs) inst
+
 /-- Everything the local-component runtime threads around: the registry of declared
     components, the keyed store of serialized state, and the live instances. Shared by
     every nesting level (one flat store, keyed by `localKey component key`). -/
@@ -655,8 +713,14 @@ def run (app : App Model Msg) (template : Option (View Model Msg) := none) : IO 
         -- persist, so a value-only update touches no events (and a row click survives it).
         match ← vstateRef.get with
         | none => do
-            let (node, vst) ← buildView h condCells t (← modelRef.get)
-            Dom.mountRoot node; rootRef.set node; vstateRef.set (some vst)
+            -- First render: hydrate the server-rendered DOM in place if present, else build.
+            let existing ← Dom.appRoot
+            if existing != (0 : Dom.Node) then
+              let vst ← hydrateView h condCells t (← modelRef.get) existing
+              rootRef.set existing; vstateRef.set (some vst)
+            else
+              let (node, vst) ← buildView h condCells t (← modelRef.get)
+              Dom.mountRoot node; rootRef.set node; vstateRef.set (some vst)
         | some vst => patchView h condCells (← rootRef.get) 0 t (← modelRef.get) vst
     | none => do
         clickRef.set #[]; inputRef.set #[]

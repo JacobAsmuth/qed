@@ -431,6 +431,56 @@ render t s'`) — so the template inherits the same "the DOM equals the model's 
 guarantee `diff_apply` gives, and `qed check` gates on it. `Examples/Template.lean` is the
 demo; `test/template_test.mjs` drives it in a browser.
 
+The `view%` macro lets you write that template as an *ordinary* view — native control flow
+is lifted into the fine-grained combinators. `if c then a else b` becomes a reconciling
+conditional, `xs.map (fun x => row …)` with a `key` becomes a keyed list, `match` on the
+model falls back to the verified diff, dynamic attributes (`cls (if …)`, `value m.x`) and
+scope-reading events (`onClick (.toggle t.id)`) are lifted too — so the dynamic parts need
+no special syntax. A conditional inside a row keeps fine-grained updates, and a controlled
+`<input>` inside one keeps its focus and caret while you type.
+
+## A few more ergonomics
+
+These are sugar over the verified core — none of them adds an axiom.
+
+**One transition instead of two.** Rather than splitting `update` (pure) from `effects`,
+write a single transition whose arms return the next model with `still`, or the next model
+plus the effect it triggers with `also`:
+
+```lean
+transition m
+  | .typed s => still { m with draft := s }
+  | .send    => also { m with pending := true } (Cmd.stream url body .chunk .done)
+```
+
+`program init transition view` builds it (`routedProgram` adds URL routing).
+
+**Remote data as a value.** `Resource α` is `idle | loading | ok | failed`. `Resource.fetch`
+GETs and decodes through the verified JSON, reporting the outcome as one message; `.view`
+renders the states:
+
+```lean
+profile.view (fun prof => p [cls "bio"] [prof.bio])
+  (loading := p [] ["Loading…"]) (failed := fun e => p [cls "error"] [e])
+```
+
+**Scoped styles.** `css "…"` makes a `Style` with a hashed (collision-free) class name; drop
+`styleSheet [card, …]` once to emit one `<style>`. A `&` nests; a typo'd reference is a
+compile error:
+
+```lean
+def card : Style := css "padding: 16px; &:hover { transform: translateY(-2px) }"
+div [card] [ … ]
+```
+
+**Forms show errors.** `formView` marks a field `aria-invalid` and shows a message once it's
+been edited and fails to validate — the gate and its `canSubmit_iff` proof are unchanged.
+
+**Server-side rendering.** `App.renderInitial app` runs the *same* verified `view`/`render`
+on the server; `renderDocument` wraps it in a static page. The client mounts over it, so
+first paint is the real UI and the two sides are provably one function. (Flash-free
+adopt-in-place hydration is the next step.)
+
 ## So what's actually happening?
 
 Here's the trip from "I wrote some Lean" to "pixels in a browser":

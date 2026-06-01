@@ -26,6 +26,7 @@
 -/
 import Qed.Runtime
 import Qed.Diff
+import Qed.Style
 
 namespace Qed
 
@@ -367,6 +368,8 @@ namespace V
 
 /-- Any static `Attr` is a template attribute. -/
 instance : Coe (Attr msg) (VAttr σ msg) := ⟨.stat⟩
+/-- A scoped `Style` applies its class, in a template too. -/
+instance : Coe Style (VAttr σ msg) := ⟨fun s => .stat (.cls s.className)⟩
 
 /-- Static text (a bare `String` also coerces). -/
 def text (s : String) : View σ msg := .text s

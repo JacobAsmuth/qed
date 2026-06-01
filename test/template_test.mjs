@@ -61,6 +61,9 @@ try {
   check('no greeting initially', await greeting(), []);
   check('ifElse shows the hint branch at count 0', await status(), { cls: 'hint', text: 'click + to start' });
   check('two todos, first done', await rows(), [{ text: 'learn Lean', done: true }, { text: 'write a template', done: false }]);
+  // scoped styling: the <style> emitted by styleSheet applies to the hashed class
+  check('scoped style applied (padding from styleSheet)',
+    await page.$eval('#styled-banner', (e) => getComputedStyle(e).padding), '7px');
   check('structural row 0 is the done branch (<p>)', await structTag(0), 'P');
   check('structural row 1 is the open branch (<span>)', await structTag(1), 'SPAN');
 

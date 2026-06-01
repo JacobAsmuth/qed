@@ -476,8 +476,14 @@ mutual
     | .text s => (escapeHtml s, hs)
     | .element tag attrs children =>
         let (attrStr,  hs1) := renderAttrs hs (normalizeAttrs attrs)
-        let (childStr, hs2) := renderChildren hs1 children
-        (s!"<{tag}{attrStr}>{childStr}</{tag}>", hs2)
+        -- `<style>`/`<script>` are HTML "raw text" elements: their content is CDATA-like
+        -- (CSS/JS), so escaping `&`/`<` would corrupt it. Emit text children verbatim.
+        if tag == "style" || tag == "script" then
+          let raw := String.join (children.map fun | .text s => s | _ => "")
+          (s!"<{tag}{attrStr}>{raw}</{tag}>", hs1)
+        else
+          let (childStr, hs2) := renderChildren hs1 children
+          (s!"<{tag}{attrStr}>{childStr}</{tag}>", hs2)
     | .lazy _ sub => renderNode hs sub   -- transparent for the string renderer
   /-- Render a list of children, threading the handler table. -/
   def renderChildren (hs : Array msg) : List (Html msg) → String × Array msg

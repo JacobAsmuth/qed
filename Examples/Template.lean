@@ -11,7 +11,7 @@
   Pure Lean; the browser entry is `Examples/TemplateWeb.lean`.
 -/
 import Qed
-open Qed (View App templated)
+open Qed (View App templated Style css styleSheet)
 open Qed.V
 
 namespace TemplateDemo
@@ -57,9 +57,15 @@ def update (m : Model) : Msg → Model
 -- (`value m.name`, `cls (if …)`) becomes `dynAttr`, a scope-reading event (`onClick
 -- (.toggle t.id)`) becomes `onClick'`, and `m.todos.map (… key …)` becomes a keyed
 -- `forEach` — none of it written by hand. Each compiles to the same fine-grained core.
+-- a scoped style, co-located with the view. Its class name is a hash (no global
+-- collisions), and a typo'd reference (`bnner`) would be a compile error.
+def banner : Style := css "padding: 7px; border-radius: 4px; &:hover { opacity: 0.9 }"
+
 def template : View Model Msg :=
   view% fun m =>
     div [cls "demo"] [
+      static (styleSheet [banner]),
+      div [banner, attr "id" "styled-banner"] [text "scoped style"],
       h1 [] "View template",
       -- a counter: the count is a single bound text node
       div [cls "counter"] [

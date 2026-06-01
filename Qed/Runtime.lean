@@ -523,4 +523,27 @@ partial def renderWithLocals {m : Type} (locals : List LocalDef) : Html m → St
     `renderWithLocals`). Pass the app's `locals`. -/
 def Html.renderWith (locals : List LocalDef) (h : Html msg) : String := renderWithLocals locals h
 
+/-! ### Server-side rendering
+
+Render the app once on the server with the *same* verified `view`/`render` the browser uses,
+emit that HTML into `#app`, and the client mounts over it — so first paint is the real content,
+not a spinner, and search engines see the page. Because both sides are the one `view`/`render`,
+the server and client output are the same function of the model, not two implementations that
+can drift. (The current client mount replaces the server markup — a brief swap; flash-free
+adopt-in-place hydration is a later refinement, see README.) -/
+
+/-- The app's initial view as an HTML string — its `view` at the initial model, with local
+    hosts filled by their initial view. This is what a server emits into `#app`. -/
+def App.renderInitial (app : App Model Msg) : String :=
+  Html.renderWith app.locals (app.view app.init.1)
+
+/-- Wrap rendered `#app` content in a complete static HTML document that loads the WASM
+    bundle, which mounts the live app over the pre-rendered markup. -/
+def renderDocument (title : String) (appHtml : String) (script : String := "/qed.js") : String :=
+  "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
+    ++ "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    ++ "<title>" ++ escapeHtml title ++ "</title></head>\n"
+    ++ "<body><div id=\"app\">" ++ appHtml ++ "</div>\n"
+    ++ "<script type=\"module\" src=\"" ++ script ++ "\"></script>\n</body>\n</html>"
+
 end Qed

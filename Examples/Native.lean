@@ -1,15 +1,23 @@
 /-
-  Native entry point for the counter demo: renders a few reachable states to
-  static HTML on stdout. A fast, browser-free sanity check that the verified
-  `app` produces the markup we expect. (`lake exe counter`.)
+  Native entry point for the counter demo. Two jobs, both browser-free:
+
+  * server-side render — emit a complete static HTML document for the app's initial state
+    (`App.renderInitial` runs the *same* verified `view`/`render` the browser uses), so the
+    page's first paint is the real UI and the client just mounts over it; and
+  * a sanity check that a few reachable states produce the markup we expect.
+
+  `lake exe counter` (or `./qed` native build). The static document goes to stdout.
 -/
 import Examples.Counter
 
 open Qed
 
 def main : IO Unit := do
+  -- SSR: the full static document for the initial state, from the verified app.
+  IO.println (renderDocument "Counter" (App.renderInitial app))
+  -- sanity: a few reachable states render as expected.
   let render (label : String) (m : Model) : IO Unit :=
-    IO.println s!"{label} (count={m.count}): {(view m).render}"
+    IO.eprintln s!"{label} (count={m.count}): {(view m).render}"
   let s0 := init
   let s1 := update s0 .increment
   let s2 := update s1 .increment

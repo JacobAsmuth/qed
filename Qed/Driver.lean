@@ -288,9 +288,31 @@ inductive VState (σ : Type) (msg : Type) where
 
 instance : Inhabited (VState σ msg) := ⟨.text 0⟩
 
-/-- The mutable state of every `showIf` slot, external to `VState` (so the inductive has
-    no recursive-ref field): `(shown?, inner state when shown)`, indexed by `VState.cond`. -/
-abbrev CondCells (σ msg : Type) := IO.Ref (Array (Bool × Option (VState σ msg)))
+/-- The mutable state of every conditional slot, external to `VState` (the inductive can't hold
+    a recursive `IO.Ref (… VState …)`, and a branch must be built lazily — eager-building both
+    would run the hidden branch's bindings against a model where its guard is false). It is an
+    *arena*: a slot array plus a free list, so a flip reuses the slots its old branch released
+    instead of appending forever. Each slot is `(shown?, inner state)`, addressed by `VState.cond`. -/
+abbrev CondCells (σ msg : Type) := IO.Ref (Array (Bool × Option (VState σ msg)) × Array Nat)
+
+/-- Take a conditional cell — a freed slot if one is available, otherwise a fresh one. -/
+def allocCell (cells : CondCells σ msg) : IO Nat := do
+  let (cs, free) ← cells.get
+  match free.back? with
+  | some idx => cells.set (cs.set! idx (false, none), free.pop); return idx
+  | none     => cells.set (cs.push (false, none), free); return cs.size
+
+/-- Return every conditional cell a `VState` subtree owns to the free list, so a hidden or
+    replaced branch's slots are reused rather than leaked. (Lists/`dynNode` hold their state in
+    `VState` directly, not in cells, so only `cond` and `elem` children carry cells to reclaim.) -/
+partial def freeCells (cells : CondCells σ msg) : VState σ msg → IO Unit
+  | .cond idx => do
+      match ((← cells.get).1.getD idx (false, none)).2 with
+      | some ist => freeCells cells ist
+      | none     => pure ()
+      cells.modify (fun (cs, free) => (cs.set! idx (false, none), free.push idx))
+  | .elem _ ks => ks.forM (freeCells cells)
+  | _          => pure ()
 
 mutual
 /-- Build a template into DOM once, returning the root node and its `VState` mirror.
@@ -312,25 +334,9 @@ partial def buildView (h : Handlers msg) (cells : CondCells σ msg) :
         Dom.appendChild node kn
         ks := ks.push kst
       return (node, .elem node ks)
-  | .showIf cond child, s => do
-      -- reserve this slot's cell first, so the child's own slots get later indices
-      let idx := (← cells.get).size
-      cells.modify (·.push (false, none))
-      if cond s then
-        let (cn, cst) ← buildView h cells child s
-        cells.modify (·.set! idx (true, some cst))
-        return (cn, .cond idx)
-      else
-        let n ← Dom.createText ""
-        return (n, .cond idx)
-  | .ifElse cond yes no, s => do
-      -- one slot showing the active branch; reserve this cell before building it so the
-      -- branch's own conditional slots get later indices. The cell's `Bool` is "is `yes`".
-      let idx := (← cells.get).size
-      cells.modify (·.push (false, none))
-      let (cn, cst) ← buildView h cells (if cond s then yes else no) s
-      cells.modify (·.set! idx (cond s, some cst))
-      return (cn, .cond idx)
+  -- `showIf` is `ifElse` with an empty else-branch; both build the active branch through `buildCond`.
+  | .showIf cond child, s => buildCond h cells cond child (.text "") s
+  | .ifElse cond yes no, s => buildCond h cells cond yes no s
   | .dynNode get, s => do
       let html := get s
       let n ← buildDom h html
@@ -365,33 +371,8 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
       for k in kids do
         patchView h cells node i k s (kstates.getD i.toNat default)
         i := i + 1
-  | .showIf cond child, s, .cond idx => do
-      let (shown, inner) := (← cells.get).getD idx (false, none)
-      let now := cond s
-      if now == shown then
-        match inner with
-        | some ist => patchView h cells parent index child s ist
-        | none     => pure ()
-      else if now then do
-        let (cn, cst) ← buildView h cells child s   -- hidden → shown: install the child
-        Dom.replaceChild parent index cn
-        cells.modify (·.set! idx (true, some cst))
-      else do
-        let n ← Dom.createText ""                   -- shown → hidden: empty the slot
-        Dom.replaceChild parent index n
-        cells.modify (·.set! idx (false, none))
-  | .ifElse cond yes no, s, .cond idx => do
-      let (wasYes, inner) := (← cells.get).getD idx (false, none)
-      let now := cond s
-      let active := if now then yes else no
-      if now == wasYes then
-        match inner with                            -- same branch: value-patch it in place
-        | some ist => patchView h cells parent index active s ist
-        | none     => pure ()
-      else do
-        let (cn, cst) ← buildView h cells active s   -- flipped: install the other branch
-        Dom.replaceChild parent index cn
-        cells.modify (·.set! idx (now, some cst))
+  | .showIf cond child, s, .cond idx => patchCond h cells parent index cond child (.text "") s idx
+  | .ifElse cond yes no, s, .cond idx => patchCond h cells parent index cond yes no s idx
   | .dynNode get, s, .dynNode nref last => do
       let newHtml := get s
       let node ← nref.get
@@ -431,6 +412,31 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
       -- template/state shape disagree (should not happen): rebuild this node
       let (n, _) ← buildView h cells v s
       Dom.replaceChild parent index n
+
+/-- Build a conditional: take a cell, build the active branch into it. `showIf cond child` is
+    `buildCond cond child (text "")`; `ifElse` passes both branches. -/
+partial def buildCond (h : Handlers msg) (cells : CondCells σ msg)
+    (c : σ → Bool) (yes no : View σ msg) (s : σ) : IO (Dom.Node × VState σ msg) := do
+  let idx ← allocCell cells
+  let (n, st) ← buildView h cells (if c s then yes else no) s
+  cells.modify (fun (cs, free) => (cs.set! idx (c s, some st), free))
+  return (n, .cond idx)
+
+/-- Patch a conditional: value-patch the active branch while the condition holds steady; on a
+    flip, return the old branch's cells to the arena, build the other branch, and swap it in.
+    The free-then-build is what keeps the cell store bounded across repeated flips. -/
+partial def patchCond (h : Handlers msg) (cells : CondCells σ msg)
+    (parent : Dom.Node) (index : UInt32) (c : σ → Bool) (yes no : View σ msg) (s : σ) (idx : Nat) : IO Unit := do
+  let (wasYes, inner) := (← cells.get).1.getD idx (false, none)
+  let now := c s
+  let active := if now then yes else no
+  if now == wasYes then
+    match inner with | some ist => patchView h cells parent index active s ist | none => pure ()
+  else do
+    match inner with | some ist => freeCells cells ist | none => pure ()
+    let (n, st) ← buildView h cells active s
+    Dom.replaceChild parent index n
+    cells.modify (fun (cs, free) => (cs.set! idx (now, some st), free))
 end
 
 /-- Does this template node render to nothing (an empty text — a `""` `dyn`, an empty static
@@ -463,18 +469,17 @@ partial def hydrateView (h : Handlers msg) (cells : CondCells σ msg) :
         ks := ks.push (← hydrateView h cells k s kn)
         i := i + 1
       return .elem node ks
+  -- `showIf` is `ifElse` with an empty else-branch; both hydrate the active branch over `node`
+  -- (a hidden one is an empty text the parent re-inserted as a placeholder, via `rendersEmpty`).
   | .showIf cond child, s, node => do
-      let idx := (← cells.get).size
-      cells.modify (·.push (false, none))
-      if cond s then
-        let cst ← hydrateView h cells child s node
-        cells.modify (·.set! idx (true, some cst))
+      let idx ← allocCell cells
+      let cst ← hydrateView h cells (if cond s then child else .text "") s node
+      cells.modify (fun (cs, fr) => (cs.set! idx (cond s, some cst), fr))
       return .cond idx
   | .ifElse cond yes no, s, node => do
-      let idx := (← cells.get).size
-      cells.modify (·.push (false, none))
+      let idx ← allocCell cells
       let cst ← hydrateView h cells (if cond s then yes else no) s node
-      cells.modify (·.set! idx (cond s, some cst))
+      cells.modify (fun (cs, fr) => (cs.set! idx (cond s, some cst), fr))
       return .cond idx
   | .dynNode get, s, node => do
       let html := get s
@@ -686,7 +691,7 @@ def run (app : App Model Msg) : IO Unit := do
   let template := app.template
   let modelRef ← IO.mkRef app.init.1
   let vstateRef ← IO.mkRef (none : Option (VState Model Msg))
-  let condCells ← IO.mkRef (#[] : Array (Bool × Option (VState Model Msg)))
+  let condCells : CondCells Model Msg ← IO.mkRef (#[], #[])   -- conditional-cell arena: slots + free list
   let rootRef  ← IO.mkRef (0 : Dom.Node)
   let clickRef ← IO.mkRef (#[] : Array Msg)
   let inputRef ← IO.mkRef (#[] : Array (String → Msg))

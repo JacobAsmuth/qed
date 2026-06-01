@@ -549,9 +549,11 @@ def Json.obj?  : Json → Option (List (String × Json))| .obj ms => some ms | _
 def Json.field (j : Json) (key : String) : Except String Json :=
   match j with
   | .obj ms =>
-      match ms.find? (fun kv => kv.1 == key) with
-      | some (_, v) => .ok v
-      | none        => .error s!"missing key '{key}'"
+      -- a duplicate key takes the LAST value, matching `JSON.parse` (and most parsers),
+      -- so a payload a JS client accepts decodes to the same thing here
+      match ms.foldl (fun acc kv => if kv.1 == key then some kv.2 else acc) none with
+      | some v => .ok v
+      | none   => .error s!"missing key '{key}'"
   | _ => .error "expected an object"
 
 def Json.get? (j : Json) (key : String) : Option Json := (j.field key).toOption
@@ -606,6 +608,15 @@ instance [FromJson α] : FromJson (Array α) :=
   ⟨fun j => (fromJson j : Except String (List α)).map List.toArray⟩
 instance [FromJson α] : FromJson (Option α) :=
   ⟨fun j => match j with | .null => .ok none | _ => (fromJson j : Except String α).map some⟩
+
+/-- `Float` round-trips through its decimal form: a JSON number is `mantissa × 10^exponent`
+    (exact), so encoding goes via the float's decimal string and decoding reconstructs it. -/
+instance : ToJson Float := ⟨fun f => (Json.parse (toString f)).toOption.getD (.num ⟨0, 0⟩)⟩
+instance : FromJson Float :=
+  ⟨fun j => match j with
+    | .num n => let mag := Float.ofScientific n.mantissa.natAbs (n.exponent < 0) n.exponent.natAbs
+                .ok (if n.mantissa < 0 then -mag else mag)
+    | _ => .error "expected a number"⟩
 
 /-! ### Decoding one object field
 

@@ -10,6 +10,8 @@
   Core-syntax only (no `import Lean`), so apps that use it don't pull the Lean
   elaborator into their wasm binary.
 -/
+import Qed.Json   -- for the Date ⟷ JSON codec below (Json imports nothing, so no cycle)
+
 namespace Qed
 
 /-- Gregorian leap year: divisible by 4, except centuries not divisible by 400. -/
@@ -75,5 +77,13 @@ instance : LT Date := ⟨fun a b => a.before b = true⟩
 instance : LE Date := ⟨fun a b => b.before a = false⟩
 instance (a b : Date) : Decidable (a < b) := inferInstanceAs (Decidable (a.before b = true))
 instance (a b : Date) : Decidable (a ≤ b) := inferInstanceAs (Decidable (b.before a = false))
+
+/-- A `Date` is JSON as its ISO `YYYY-MM-DD` string, so a `jsonStruct`/form field can persist
+    and reload one (decoding rejects an impossible date, since `parse?` does). -/
+instance : ToJson Date := ⟨fun d => .str (toString d)⟩
+instance : FromJson Date :=
+  ⟨fun j => match j.str? with
+    | some s => (Date.parse? s).elim (.error "expected a date (YYYY-MM-DD)") .ok
+    | none   => .error "expected a date string"⟩
 
 end Qed

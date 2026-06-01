@@ -95,7 +95,10 @@ mutual
         -- `<style>`/`<script>` are HTML "raw text" elements: their content is CDATA-like
         -- (CSS/JS), so escaping `&`/`<` would corrupt it. Emit text children verbatim.
         if tag == "style" || tag == "script" then
-          let raw := String.join (children.map fun | .text s => s | _ => "")
+          -- raw-text content (CSS/JS) is emitted verbatim, but a `</style`/`</script` inside it
+          -- would close the element early and let following markup execute. Break the closing
+          -- sequence (`</` → `<\/`) so injected data can't escape; literal CSS/JS never needs `</`.
+          let raw := (String.join (children.map fun | .text s => s | _ => "")).replace "</" "<\\/"
           (s!"<{tag}{attrStr}>{raw}</{tag}>", hs1)
         else if voidTags.contains tag then
           (s!"<{tag}{attrStr}>", hs1)   -- void element: no children, no closing tag

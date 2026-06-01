@@ -324,6 +324,10 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "bookshelf_ssr_test.mjs").pathExists) then
     step "running end-to-end SSR tests (bookshelf)"
     if (← sh "node" #["test/bookshelf_ssr_test.mjs"]) != 0 then failed := true
+  -- Dehydrated SSR: the client starts from the server's model (no flash, no refetch).
+  if (← (FilePath.mk "test" / "bookshelf_hydrate_test.mjs").pathExists) then
+    step "running end-to-end hydration tests (bookshelf dehydrated SSR)"
+    if (← sh "node" #["test/bookshelf_hydrate_test.mjs"]) != 0 then failed := true
   -- WebSockets: open/send/receive/close over a real socket against an echo server.
   if (← (FilePath.mk "test" / "socket_test.mjs").pathExists) then
     step "running end-to-end WebSocket tests (socket)"

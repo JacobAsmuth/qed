@@ -62,4 +62,22 @@ def map (f : α → β) : Resource α → Resource β
 
 end Resource
 
+/-- JSON for a `Resource`, so a server can dehydrate fetched data into the page and the client
+    rehydrate it (the `t` tag selects the case; `ok` carries the value, `failed` the error). -/
+instance [ToJson α] : ToJson (Resource α) := ⟨fun
+  | .idle     => .obj [("t", .str "idle")]
+  | .loading  => .obj [("t", .str "loading")]
+  | .ok a     => .obj [("t", .str "ok"), ("v", toJson a)]
+  | .failed e => .obj [("t", .str "failed"), ("e", .str e)]⟩
+
+instance [FromJson α] : FromJson (Resource α) := ⟨fun j =>
+  match (j.get? "t").bind (·.str?) with
+  | some "idle"    => .ok .idle
+  | some "loading" => .ok .loading
+  | some "ok"      => match j.get? "v" with
+                      | some v => (FromJson.fromJson v : Except String α).map .ok
+                      | none   => .error "Resource.ok: missing 'v'"
+  | some "failed"  => .ok (.failed (((j.get? "e").bind (·.str?)).getD ""))
+  | _              => .error "expected a Resource (tagged object)"⟩
+
 end Qed

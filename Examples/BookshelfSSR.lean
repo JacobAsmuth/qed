@@ -35,5 +35,8 @@ def modelFor (path : String) : Model :=
 end Bookshelf
 
 def main (args : List String) : IO Unit := do
-  let path := args.head?.getD "/"
-  IO.println (renderDocument s!"Bookshelf — {path}" (Bookshelf.app.renderModel (Bookshelf.modelFor path)))
+  let path  := args.head?.getD "/"
+  let model := Bookshelf.modelFor path
+  -- embed the model as dehydrated state so the client starts from it (no flash, no refetch)
+  IO.println (renderDocument s!"Bookshelf — {path}" (Bookshelf.app.renderModel model)
+                (state := Bookshelf.app.dehydrate model))

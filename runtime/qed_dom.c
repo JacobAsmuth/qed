@@ -58,6 +58,12 @@ EM_JS(char *, qed_js_get_attribute, (int node, const char *k), {
   return stringToNewUTF8(v == null ? '' : v);
 });
 
+/* The dehydrated app state in #qed-state, or "" if absent. Caller frees the buffer. */
+EM_JS(char *, qed_js_app_state, (void), {
+  var el = document.getElementById('qed-state');
+  return stringToNewUTF8(el ? el.textContent : '');
+});
+
 /* Remove every `data-qed-on…` handler-id attribute (data-qed-on-<event> and
    data-qed-onv-<event>) from an element. Used on hydration. */
 EM_JS(void, qed_js_clear_handlers, (int node), {
@@ -278,6 +284,14 @@ LEAN_EXPORT lean_object *qed_dom_clear_handlers(uint32_t node, lean_object *worl
   (void) world;
   qed_js_clear_handlers((int) node);
   return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *qed_dom_app_state(lean_object *world) {
+  (void) world;
+  char *s = qed_js_app_state();
+  lean_object *r = lean_mk_string(s);
+  free(s);
+  return lean_io_result_mk_ok(r);
 }
 
 LEAN_EXPORT lean_object *qed_dom_today(lean_object *world) {

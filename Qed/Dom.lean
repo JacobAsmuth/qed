@@ -48,6 +48,12 @@ opaque getAttribute (node : Node) (key : String) : IO String
 @[extern "qed_dom_clear_handlers"]
 opaque clearHandlers (node : Node) : IO Unit
 
+/-- The dehydrated app state the server embedded in `#qed-state` (`""` if absent). The driver
+    feeds it to `App.rehydrate` on mount, so a client can start from the server's model rather
+    than re-deriving and refetching. -/
+@[extern "qed_dom_app_state"]
+opaque appState : IO String
+
 /-- Set an input's live `value` *property* (not just the attribute), so a
     controlled field reflects the model. A no-op when already equal, which keeps
     the caret where the user left it. -/

@@ -856,11 +856,17 @@ def run (app : App Model Msg) : IO Unit := do
     | _ => pure ()
   runtimeRef.set (some {
     mount := do
-      -- If routed, derive the initial model from the current URL before the first
-      -- render (so it reflects the route); otherwise just render.
-      match app.onUrlChange with
-      | some f => do let p ← Dom.currentPath; dispatchMsg (f p)
-      | none   => renderModel
+      -- If the server dehydrated a model into the page, adopt it directly: the client starts
+      -- from exactly what the server drew, so the first render equals the SSR markup and no
+      -- data is refetched (no re-route). Otherwise: routed apps derive the model from the URL
+      -- before the first render; the rest just render the initial model.
+      let st ← Dom.appState
+      match (if st.isEmpty then none else app.rehydrate st) with
+      | some m => modelRef.set m; renderModel
+      | none   =>
+        match app.onUrlChange with
+        | some f => do let p ← Dom.currentPath; dispatchMsg (f p)
+        | none   => renderModel
       perform app.init.2
     dispatch := fun id => do
       match (← clickRef.get)[id.toNat]? with

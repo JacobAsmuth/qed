@@ -304,6 +304,16 @@ structure App (Model : Type) (Msg : Type) where
   /-- Inbound ports: when the app's JS calls `globalThis.__qed.send(name, payload)`, this turns
       it into a message (or `none` to ignore). The subscription side of `Cmd.port`. -/
   onPort : Option (String → String → Option Msg) := none
+  /-- Serialize the model into the server-rendered page (SSR), so the client starts from the
+      *same* model the server drew instead of re-deriving and refetching — no flash, no reload of
+      data already on the page. Default `""` means "don't dehydrate" (the client starts from `init`
+      / the URL). Pair with `rehydrate`; an app whose `Model` has `ToJson`/`FromJson` can use
+      `Json.render ∘ toJson`. -/
+  dehydrate : Model → String := fun _ => ""
+  /-- Rebuild the model from the string `dehydrate` embedded. `none` (or absent state) falls back
+      to the normal startup. When it returns `some`, the client adopts that model directly and does
+      not re-route on mount, so the first client render equals the server's. -/
+  rehydrate : String → Option Model := fun _ => none
 
 /-- The app's view: its template rendered against the model. Server (SSR) and the fine-grained
     client driver are both checked against this one function, so they cannot drift. -/
@@ -499,12 +509,18 @@ def App.renderInitial (app : App Model Msg) : String :=
   app.renderModel app.init.1
 
 /-- Wrap rendered `#app` content in a complete static HTML document that loads the WASM
-    bundle, which mounts the live app over the pre-rendered markup. -/
-def renderDocument (title : String) (appHtml : String) (script : String := "/qed.js") : String :=
+    bundle, which mounts the live app over the pre-rendered markup. A non-empty `state`
+    (an app's `dehydrate model`) is embedded in a `#qed-state` script so the client starts
+    from the server's model instead of refetching; `</` is broken so the JSON can't close the
+    script early (it stays valid JSON — `\/` is `/`). -/
+def renderDocument (title : String) (appHtml : String) (script : String := "/qed.js")
+    (state : String := "") : String :=
   "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
     ++ "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
     ++ "<title>" ++ escapeHtml title ++ "</title></head>\n"
     ++ "<body><div id=\"app\">" ++ appHtml ++ "</div>\n"
+    ++ (if state.isEmpty then ""
+        else "<script id=\"qed-state\" type=\"application/json\">" ++ state.replace "</" "<\\/" ++ "</script>\n")
     ++ "<script type=\"module\" src=\"" ++ script ++ "\"></script>\n</body>\n</html>"
 
 end Qed

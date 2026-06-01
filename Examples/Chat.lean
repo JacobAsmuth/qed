@@ -50,27 +50,22 @@ def reqBody (turns : Array Turn) : String :=
 def appendLast (turns : Array Turn) (d : String) : Array Turn :=
   turns.modify (turns.size - 1) fun t => { t with text := t.text ++ d }
 
-def update (m : Model) : Msg → Model
-  | .typed s   => { m with draft := s }
+/-- One combined `transition`: each arm returns the next model (`still`) or the next model
+    plus the effect it triggers (`also`). `send` builds the conversation, appends the empty
+    assistant turn to stream into, and starts the streaming POST — all in one place, with no
+    separate `effects` function and no reconstructing what an `update` already did. -/
+def transition (m : Model) : Msg → Model × Cmd Msg
+  | .typed s   => still { m with draft := s }
   | .send      =>
       let draft := m.draft.trim
-      if draft.isEmpty then m else
+      if draft.isEmpty then still m else
       let convo := m.turns.push { user? := true, text := draft }
-      { turns   := convo.push { user? := false, text := "" }
-        draft   := ""
-        pending := true }
-  | .chunk raw => { m with turns := appendLast m.turns (deltaOf raw) }
-  | .done      => { m with pending := false }
-
-/-- The only message with an effect: a non-empty `send` starts a streaming POST
-    of the conversation so far. `m` is the post-update model, so `pending` is set
-    exactly when a send went through, and `m.turns.pop` drops the empty assistant
-    turn `update` appended, leaving the conversation to send. -/
-def effects (m : Model) : Msg → Cmd Msg
-  | .send => if m.pending then
-               .stream "/v1/chat/completions" (reqBody m.turns.pop) .chunk .done
-             else .none
-  | _     => .none
+      also { turns   := convo.push { user? := false, text := "" }
+             draft   := ""
+             pending := true }
+           (.stream "/v1/chat/completions" (reqBody convo) .chunk .done)
+  | .chunk raw => still { m with turns := appendLast m.turns (deltaOf raw) }
+  | .done      => still { m with pending := false }
 
 def bubble (t : Turn) : Html Msg :=
   div [cls (if t.user? then "msg user" else "msg bot")] [t.text]
@@ -85,6 +80,6 @@ def view (m : Model) : Html Msg :=
   ]
 
 def chatApp : App Model Msg :=
-  application { turns := #[], draft := "", pending := false } update view effects
+  program { turns := #[], draft := "", pending := false } transition view
 
 end Chat

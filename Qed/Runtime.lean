@@ -313,6 +313,35 @@ def routed (init : Model)
     view
     onUrlChange := some onUrlChange }
 
+/-! ### Unified transition
+
+`application` splits the pure `update` from `effects`, which means a message with an
+effect is handled in two places (and the effect often has to *reconstruct* what `update`
+did). A `transition` is the single combined `Model → Msg → Model × Cmd Msg`, written with
+two helpers so the effect sits next to the state change that triggers it:
+
+    transition m
+      | .typed s => still { m with draft := s }
+      | .send    => also { m with pending := true } (Cmd.stream url body .chunk .done)
+
+`still`/`also` force their first argument to be the model, so a bare `{ m with … }` arm
+still resolves cleanly (the structure is inferred from `m`, not from the `Model × Cmd`
+return type). -/
+
+/-- A transition arm with no effect. -/
+def still (m : Model) : Model × Cmd Msg := (m, .none)
+/-- A transition arm that also runs `cmd` after the update. -/
+def also (m : Model) (cmd : Cmd Msg) : Model × Cmd Msg := (m, cmd)
+
+/-- Build an `App` from a single combined transition (`still`/`also` arms) rather than the
+    split `update` + `effects`. The `App.update` field type is unchanged, so the driver is
+    untouched. -/
+def program (init : Model) (transition : Model → Msg → Model × Cmd Msg)
+    (view : Model → Html Msg) (start : Cmd Msg := .none)
+    (locals : List LocalDef := []) (onPort : Option (String → String → Option Msg) := none) :
+    App Model Msg :=
+  { init := (init, start), update := transition, view, locals, onPort }
+
 /-- Register a local component with an output it can bubble to its parent. `update`
     returns the next state and an optional output; the output is serialized and handed
     to the host's `bubble` (see `localMountWith`). The message type `M` needs no codec

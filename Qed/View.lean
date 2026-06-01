@@ -24,7 +24,7 @@
   and `keyedList` renders a container whose children carry their derived `key`, exactly
   the keyed-reconcile shape `diff` already proves correct.
 -/
-import Qed.Runtime
+import Qed.Render
 import Qed.Diff
 import Qed.Style
 
@@ -461,18 +461,8 @@ def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → S
     (fun s => ((items s).map fun a => withKey (rkey a) (View.renderSig child a (skey a) 0).1).toList)
 
 end V
-
-/-- Build an `App` from a template: the view is `View.render t`, i.e. the template
-    compiled to the verified `Html` path. (The browser driver makes value updates
-    fine-grained; this builder's *meaning* is a full render each frame, and is what the
-    fine-grained path is proven equal to.) Effects and startup mirror `application`. -/
-def templated (init : Model) (update : Model → Msg → Model) (template : View Model Msg)
-    (effects : Model → Msg → Cmd Msg := fun _ _ => .none)
-    (locals  : List LocalDef := [])
-    (onPort  : Option (String → String → Option Msg) := none)
-    (start   : Cmd Msg := .none) : App Model Msg :=
-  application init update (fun m => View.render template m)
-    (effects := effects) (locals := locals) (onPort := onPort) (start := start)
+-- `templated` (which builds an `App` from a `View`) now lives in `Qed.Runtime`, since `App`
+-- is defined there and `View` no longer imports `Runtime`.
 
 /-! ### `view%` — write a template like an ordinary view
 

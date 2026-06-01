@@ -667,7 +667,7 @@ def qedPortRecv (name payload : String) : IO Unit := do
     and runs the startup effect; thereafter each message updates the model, diffs
     the new view against the previous one, patches the difference, and interprets
     the requested effect (which may dispatch further messages over time). -/
-def run (app : App Model Msg) (template : Option (View Model Msg) := none) : IO Unit := do
+def run (app : App Model Msg) (template : Option (View Model Msg) := app.template) : IO Unit := do
   let modelRef ← IO.mkRef app.init.1
   let treeRef  ← IO.mkRef (none : Option (Html Msg))
   let vstateRef ← IO.mkRef (none : Option (VState Model Msg))

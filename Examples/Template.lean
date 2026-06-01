@@ -1,17 +1,12 @@
 /-
-  A `View` template demo: the same Elm-Architecture app (pure `init`/`update`), but the
-  view is a `View Model Msg` *template* rather than a `Model → Html Msg` function.
-
-  Every dynamic value is a projection of the scope — `dyn (·.name)`, `dyn (·.count)` —
-  so the browser driver updates just those nodes on a change, no tree walk (the value
-  still lives in the model; `update` stays pure). Structure that changes shape uses the
-  two combinators: `showIf` (conditional) and `forEach` (keyed list). The list row is a
-  `View Todo Msg`, scoped to its row, with a scope-bound event (`onClick' …`).
+  An Elm-Architecture app (pure `init`/`update`) whose view is written inline with `ui`:
+  a counter, a conditional, a controlled input, keyed and keyless lists, inline editing,
+  and a scoped style.
 
   Pure Lean; the browser entry is `Examples/TemplateWeb.lean`.
 -/
 import Qed
-open Qed (View App templated Style css styleSheet)
+open Qed (App Style css styleSheet)
 open Qed.V
 
 namespace TemplateDemo
@@ -52,20 +47,13 @@ def update (m : Model) : Msg → Model
   | .startEdit id => { m with todos := m.todos.map fun t => { t with editing := t.id == id } }
   | .editText id s => { m with todos := m.todos.map fun t => if t.id == id then { t with text := s } else t }
 
--- The `view%` macro lets this read like an ordinary `Model → Html` view: string
--- interpolation becomes `dyn`, a model-driven `if` becomes `ifElse`, a dynamic attribute
--- (`value m.name`, `cls (if …)`) becomes `dynAttr`, a scope-reading event (`onClick
--- (.toggle t.id)`) becomes `onClick'`, and `m.todos.map (… key …)` becomes a keyed
--- `forEach` — none of it written by hand. Each compiles to the same fine-grained core.
--- a scoped style, co-located with the view. Its class name is a hash (no global
--- collisions), and a typo'd reference (`bnner`) would be a compile error.
+-- A scoped style, co-located with the view: its class name is a hash (no global collisions),
+-- and a typo'd reference (`bnner`) is a compile error.
 def banner : Style := css "padding: 7px; border-radius: 4px; &:hover { opacity: 0.9 }"
 
--- `view%` lifts this into the fine-grained path; the lift is now TOTAL — anything it can't
--- make fine-grained (a keyless `.map`, a `match`, a free-form subtree) degrades to a `dynNode`
--- reconciled by the verified diff, never a compile error — so it reads like an ordinary view.
-def template : View Model Msg :=
-  view% fun m =>
+-- Write the view inline with ordinary control flow — `if`, `match`, `.map`, string
+-- interpolation, dynamic attributes, scope-reading events. `ui` builds the app from it.
+def app : App Model Msg := ui init update fun m =>
     div [cls "demo"] [
       static (styleSheet [banner]),
       div [banner, attr "id" "styled-banner"] [text "scoped style"],
@@ -76,43 +64,33 @@ def template : View Model Msg :=
         span [cls "count"] [text s!"{m.count}"],
         button [onClick .inc] "+"
       ],
-      -- a native `if/else` on the model → `ifElse` (fine-grained slot, reconciled on flip)
+      -- a conditional that swaps content by the count
       if m.count == 0
         then p [cls "hint"] "click + to start"
         else p [cls "live"] [text s!"count is {m.count}"],
-      -- a controlled input: `value m.name` → `dynAttr "value"`, echoed live; greeting on non-empty
+      -- a controlled input bound to `name`, with a greeting shown once it's non-empty
       input [value m.name, onInput (Msg.setName ·)],
       showIf (fun m => m.name != "") (p [cls "greeting"] [text s!"Hello, {m.name}!"]),
-      -- a keyed list written as a native `.map`: each row's `class` (`cls (if …)`) and text
-      -- are fine-grained signals, its click reads the row id, and `key` drives reconciliation
+      -- a keyed list of todos: each row shows its text, toggles `done` on click
       button [onClick .add] "add todo",
       ul [cls "todos"] (m.todos.map fun t =>
         li [key (toString t.id), cls (if t.done then "done" else ""), onClick (.toggle t.id)]
            [text t.text]),
-      -- a STRUCTURAL conditional inside a row: the element itself differs by `done`
-      -- (`<strong>` vs `<span>`). `view%` lifts it to `ifElse`; because the row bakes that
-      -- statically, `forEach` folds a fingerprint into the row key so a toggle reconciles
-      -- through the verified keyed `diff` instead of being missed by the signal path.
+      -- a row whose element differs by state (`<p>` when done, `<span>` otherwise)
       ul [cls "structural"] (m.todos.map fun t =>
         li [key (toString t.id)] [
           if t.done then p [cls "is-done"] [text "done!"]
                     else span [cls "is-open"] [text t.text]
         ]),
-      -- inline editing: a CONTROLLED input lives inside the row's `ifElse`. Because the
-      -- branch's leaves are signals (not baked into the key), typing updates the value in
-      -- place — the row is not rebuilt, so the input keeps focus and caret while you type.
+      -- inline editing: an `<input>` while editing, a clickable label otherwise
       ul [cls "edit"] (m.todos.map fun t =>
         li [key (toString t.id)] [
           if t.editing
             then input [cls "editor", value t.text, onInput (Msg.editText t.id ·)]
             else span [cls "label", onClick (.startEdit t.id)] [text t.text]
         ]),
-      -- a KEYLESS `.map` (no `key`): the lift can't make it a fine-grained `forEach`, so it
-      -- degrades to a `dynNode` reconciled by the verified positional diff — it still compiles
-      -- and renders, just without per-row signals. (Total fallback: `.map` never fails to lift.)
+      -- a plain list (no `key`)
       ul [cls "keyless"] (m.todos.map fun t => li [] [text t.text])
     ]
-
-def app : App Model Msg := templated init update template
 
 end TemplateDemo

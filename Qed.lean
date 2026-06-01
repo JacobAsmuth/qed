@@ -7,6 +7,7 @@
 -/
 import Qed.Html
 import Qed.Notation
+import Qed.Render
 import Qed.Runtime
 import Qed.Diff
 import Qed.Invariant

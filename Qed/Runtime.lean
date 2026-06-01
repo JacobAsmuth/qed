@@ -12,6 +12,8 @@
 import Qed.Html
 import Qed.Date
 import Qed.Json
+import Qed.Render
+import Qed.View
 
 namespace Qed
 
@@ -270,6 +272,9 @@ structure App (Model : Type) (Msg : Type) where
       `Cmd.port` — wire WebSocket frames, cross-tab `storage` events, intervals, etc.
       Left `none` by the builders. -/
   onPort : Option (String → String → Option Msg) := none
+  /-- An optional `View` template for this app (set by `templated`/`ui`). When present, `run`
+      uses it; `none` (the default) renders `view` through the diff. -/
+  template : Option (View Model Msg) := none
 
 /-- Build an `App` with no side effects (the Elm "sandbox"). -/
 def sandbox (init : Model) (update : Model → Msg → Model) (view : Model → Html Msg) :
@@ -350,6 +355,22 @@ def routedProgram (init : Model) (transition : Model → Msg → Model × Cmd Ms
     App Model Msg :=
   { init := (init, start), update := transition, view, onUrlChange := some onUrlChange }
 
+/-- Build an `App` from a `View` template. The template is carried in the app (so `run app`
+    uses it) and the `view` field is `View.render template`. -/
+def templated (init : Model) (update : Model → Msg → Model) (template : View Model Msg)
+    (effects : Model → Msg → Cmd Msg := fun _ _ => .none)
+    (locals  : List LocalDef := [])
+    (onPort  : Option (String → String → Option Msg) := none)
+    (start   : Cmd Msg := .none) : App Model Msg :=
+  { application init update (fun m => View.render template m)
+      (effects := effects) (locals := locals) (onPort := onPort) (start := start)
+    with template := some template }
+
+/-- `ui init update fun m => …` builds the app from a view written inline: it lifts the body
+    with `view%` and carries the resulting template. For effects/locals, use `templated` with a
+    `view%` template. -/
+macro "ui " init:term:max update:term:max " fun " m:ident " => " body:term : term =>
+  `(Qed.templated $init $update (view% fun $m => $body))
 /-- Register a local component with an output it can bubble to its parent. `update`
     returns the next state and an optional output; the output is serialized and handed
     to the host's `bubble` (see `localMountWith`). The message type `M` needs no codec
@@ -375,10 +396,6 @@ def LocalDef.ofSimple {S M : Type} [ToJson S] [FromJson S]
     view := fun s => (view (dec s)).map fun m =>
       { run := fun st => (Json.render (ToJson.toJson (update (dec st) m)), none) } }
 
-/-- The driver's internal identity for a local instance: the component id namespaced
-    with the user `key`, so two *different* components that reuse the same key string
-    (e.g. a counter and an editor both keyed by a row id) never collide in the store. -/
-def localKey (component key : String) : String := component ++ "@" ++ key
 
 /-- Mount a registered local component at instance `key`, ignoring any output: a
     self-contained `useState` cell. `key` need only be unique *within* `component`
@@ -407,97 +424,8 @@ private def attrWithLocalInit {msg : Type} (a : Attr msg) (i : String) : Attr ms
 def Attr.localInit {msg S : Type} [ToJson S] (a : Attr msg) (init : S) : Attr msg :=
   attrWithLocalInit a (Json.render (ToJson.toJson init))
 
-/-- Escape text/attribute values so model data cannot break out of the markup. -/
-def escapeHtml (s : String) : String :=
-  s.foldl (init := "") fun acc c =>
-    acc ++ match c with
-      | '&'  => "&amp;"
-      | '<'  => "&lt;"
-      | '>'  => "&gt;"
-      | '"'  => "&quot;"
-      | '\'' => "&#39;"
-      | c    => c.toString
-
-/-- The key an attribute occupies, if any (`onClick` occupies none). -/
-def Attr.key? : Attr msg → Option String
-  | .attr k _ => some k
-  | .flag k _ => some k
-  | _         => none
-
-/-- Drop all but the last occurrence of each keyed attribute (last write wins,
-    matching `setAttribute`); keyless attributes (`onClick`) are all kept. -/
-def dedupAttrs : List (Attr msg) → List (Attr msg)
-  | []        => []
-  | a :: rest =>
-      match a.key? with
-      | none   => a :: dedupAttrs rest
-      | some k => if rest.any (·.key? == some k) then dedupAttrs rest else a :: dedupAttrs rest
-
-/-- Collapse an attribute list to a canonical form: every `cls` merged into one
-    `class`, later values winning for duplicate keys. The string renderer and the
-    live DOM driver both apply this, so the markup and the DOM cannot disagree. -/
-def normalizeAttrs (attrs : List (Attr msg)) : List (Attr msg) :=
-  let classes := (attrs.filterMap (fun | .cls c => some c | _ => none)).filter (· != "")
-  let merged  := if classes.isEmpty then [] else [Attr.cls (String.intercalate " " classes)]
-  merged ++ dedupAttrs (attrs.filter (fun | .cls _ => false | _ => true))
-
-/-- Render one attribute, threading the handler table. An `onClick` is emitted as
-    a `data-qed-click="<id>"` attribute, where `<id>` indexes the message that the
-    JS delegation listener will dispatch back. -/
-def renderAttr (hs : Array msg) : Attr msg → String × Array msg
-  | .cls c     => (s!" class=\"{escapeHtml c}\"", hs)
-  | .attr k v  => (s!" {k}=\"{escapeHtml v}\"", hs)
-  | .flag k on => (if on then s!" {k}=\"{k}\"" else "", hs)
-  | .key _     => ("", hs)   -- a reconciliation key is virtual-DOM-only; it never renders
-  | .onClick m => (s!" data-qed-click=\"{hs.size}\"", hs.push m)
-  | .onInput _ => ("", hs)   -- no static form; the driver wires input events
-  | .onCheck _ => ("", hs)   -- (same — the driver wires checkbox change events)
-  | .onKeydown _ => ("", hs) -- (same — driver wires keydown)
-  | .onKeyup _   => ("", hs) -- (same — driver wires keyup)
-  | .onSubmit m  => (s!" data-qed-submit=\"{hs.size}\"", hs.push m)
-  | .onBlur m    => (s!" data-qed-blur=\"{hs.size}\"", hs.push m)
-  | .onFocus m   => (s!" data-qed-focus=\"{hs.size}\"", hs.push m)
-  | .localCell key comp _ _ => (s!" data-qed-local=\"{escapeHtml (localKey comp key)}\"", hs)   -- marks the host; the driver fills it
-  | .signalBind name        => (s!" data-qed-signal=\"{escapeHtml name}\"", hs)                 -- driver binds its text to the signal
-  | .signalAttr _ attr value => (s!" {attr}=\"{escapeHtml value}\"", hs)                        -- driver binds this attr to the signal
-
-/-- Render a list of attributes left-to-right, threading the handler table. -/
-def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg
-  | []      => ("", hs)
-  | a :: as =>
-      let (s1, hs1) := renderAttr hs a
-      let (s2, hs2) := renderAttrs hs1 as
-      (s1 ++ s2, hs2)
-
-mutual
-  /-- Render a node to HTML, accumulating the event-id ↦ message table. Pure and
-      total. -/
-  def renderNode (hs : Array msg) : Html msg → String × Array msg
-    | .text s => (escapeHtml s, hs)
-    | .element tag attrs children =>
-        let (attrStr,  hs1) := renderAttrs hs (normalizeAttrs attrs)
-        -- `<style>`/`<script>` are HTML "raw text" elements: their content is CDATA-like
-        -- (CSS/JS), so escaping `&`/`<` would corrupt it. Emit text children verbatim.
-        if tag == "style" || tag == "script" then
-          let raw := String.join (children.map fun | .text s => s | _ => "")
-          (s!"<{tag}{attrStr}>{raw}</{tag}>", hs1)
-        else
-          let (childStr, hs2) := renderChildren hs1 children
-          (s!"<{tag}{attrStr}>{childStr}</{tag}>", hs2)
-    | .lazy _ sub => renderNode hs sub   -- transparent for the string renderer
-  /-- Render a list of children, threading the handler table. -/
-  def renderChildren (hs : Array msg) : List (Html msg) → String × Array msg
-    | []      => ("", hs)
-    | c :: cs =>
-        let (s1, hs1) := renderNode hs c
-        let (s2, hs2) := renderChildren hs1 cs
-        (s1 ++ s2, hs2)
-end
-
-/-- Render a node to an HTML string (model data escaped). The total renderer: a
-    local host renders *empty* (the driver fills it in the browser). Used for native
-    sanity checks and server-side rendering where local content isn't needed. -/
-def Html.render (h : Html msg) : String := (renderNode #[] h).1
+-- The pure `Html` → string renderer (escapeHtml / normalizeAttrs / renderAttr / renderNode /
+-- `Html.render`) now lives in `Qed.Render`, below `Qed.View`, so `App` here can carry a `View`.
 
 /-- Render a node to a string, filling each local host with its component's *initial*
     view (looked up in `locals`), so native/server-side output isn't blank where a

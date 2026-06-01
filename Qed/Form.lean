@@ -180,9 +180,15 @@ macro_rules
       let runCalls ← pairs.mapM fun (f, inp) => `(($inp).run (d.$f:ident))
       let rows ← pairs.mapM fun (f, inp) => do
         let nameLit := Syntax.mkStrLit (toString f.getId)
-        `(term| label [cls "qed-field"]
-            [ span [cls "qed-label"] [$nameLit],
-              ($inp).render (d.$f:ident) (fun v => onEdit { d with $f:ident := v }) ])
+        let errLit  := Syntax.mkStrLit ("Please enter a valid " ++ toString f.getId)
+        -- a field is shown as invalid once *touched* (raw non-empty) and its control fails to
+        -- run; we surface an error message and `aria-invalid` then, not on an untouched field.
+        `(term|
+            (let bad := d.$f:ident != "" && (($inp).run (d.$f:ident)).isNone
+             label [cls "qed-field", attr "aria-invalid" (if bad then "true" else "false")]
+               ([ span [cls "qed-label"] [$nameLit],
+                  ($inp).render (d.$f:ident) (fun v => onEdit { d with $f:ident := v }) ]
+                ++ (if bad then [span [cls "qed-error"] [$errLit]] else []))))
       `(structure $draftId where
           $[$fs:ident : String]*
         def $emptyId : $draftId := { $[$fs:ident := $emptyVals],* }

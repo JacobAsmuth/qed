@@ -718,12 +718,20 @@ mutual
     if lst.getKind != kList || lst.getArgs.size != 3 then return none
     let lifted ← lst.getArgs[1]!.getSepArgs.mapM fun a => do
       let aT : Term := ⟨a⟩
-      -- A static attribute is wrapped in the `VAttr.stat` constructor (rather than left to the
-      -- `Attr → VAttr` coercion, which can't fire while the element's scope `σ` is still a
-      -- metavar). Covers every helper uniformly — `cls`/`attr`/`href`/`onClick`/`key`/a `Style`.
       match ← tryAttr m a with
       | some a' => pure (⟨a'⟩ : Term)
-      | none    => `(Qed.VAttr.stat $aT)
+      | none    =>
+          -- `tryAttr` only recognises the attrs worth turning into a *signal* (a value
+          -- attribute, a primed event) — that is a performance optimisation, not the gate
+          -- on correctness. Any other attribute that still reads the scope (a boolean
+          -- `disabled (… m …)`, an event we don't special-case, a user's own helper) is
+          -- captured with `bind (fun m => …)`, so the scope variable resolves and the driver
+          -- re-applies it on update. Only a genuinely scope-free attribute stays `stat` (the
+          -- explicit constructor, rather than the `Attr → VAttr` coercion, which can't fire
+          -- while the element's `σ` is still a metavar). So every attribute lifts — fine-grained
+          -- where it pays, a verified-diff `bind` everywhere else.
+          if viewMentions m.getId a then `(Qed.VAttr.bind (fun $m => $aT))
+          else `(Qed.VAttr.stat $aT)
     return some (← `([$lifted,*]))
 
   /-- Lift each child in a list literal (recursively). `none` if not a literal. -/

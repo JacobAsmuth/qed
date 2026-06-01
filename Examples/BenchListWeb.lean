@@ -2,4 +2,4 @@
 import Examples.BenchList
 import Qed.Driver
 
-def main : IO Unit := Qed.run BenchList.app (template := some BenchList.template)
+def main : IO Unit := Qed.run BenchList.app

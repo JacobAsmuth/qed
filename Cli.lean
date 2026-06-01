@@ -152,7 +152,7 @@ def linkWasm (outDir : FilePath) (prod : Bool) : IO Bool := do
   let allC ← collect ".lake" "c"
   -- Each of these modules carries its own `main`; link only the chosen web entry.
   let entryC := ((wr.splitOn ".").getLastD "") ++ ".c"   -- e.g. "ChatWeb.c"
-  let altMains := ["Native.c", "Cli.c", "UsersSSR.c", "TemplateSSR.c", "Web.c", "ChatWeb.c", "SignupWeb.c", "BookingWeb.c", "TodoWeb.c", "UsersWeb.c", "LocalWeb.c", "EffectsWeb.c", "Bench.c", "BenchAppWeb.c", "SignalsWeb.c", "TemplateWeb.c", "BenchScalarWeb.c", "BenchScalarDiffWeb.c", "BenchListWeb.c", "BenchListDiffWeb.c"].filter (· ≠ entryC)
+  let altMains := ["Native.c", "Cli.c", "UsersSSR.c", "TemplateSSR.c", "BookshelfSSR.c", "Web.c", "ChatWeb.c", "SignupWeb.c", "BookingWeb.c", "TodoWeb.c", "UsersWeb.c", "LocalWeb.c", "EffectsWeb.c", "BookshelfWeb.c", "Bench.c", "BenchAppWeb.c", "SignalsWeb.c", "TemplateWeb.c", "BenchScalarWeb.c", "BenchScalarDiffWeb.c", "BenchListWeb.c", "BenchListDiffWeb.c"].filter (· ≠ entryC)
   let cfiles := allC.filter (fun p =>
     (p.toString.splitOn "build/ir").length > 1 && (p.fileName.getD "") ∉ altMains)
   IO.FS.createDirAll outDir
@@ -310,6 +310,14 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "ssr_template_test.mjs").pathExists) then
     step "running template-hydration tests"
     if (← sh "node" #["test/ssr_template_test.mjs"]) != 0 then failed := true
+  -- Bookshelf: the full stack in one app — routing + Resource (list+detail) + form POST + styles.
+  if (← (FilePath.mk "test" / "bookshelf_test.mjs").pathExists) then
+    step "running end-to-end app tests (bookshelf)"
+    if (← sh "node" #["test/bookshelf_test.mjs"]) != 0 then failed := true
+  -- Bookshelf SSR: a per-request Lean renderer produces each route's page server-side.
+  if (← (FilePath.mk "test" / "bookshelf_ssr_test.mjs").pathExists) then
+    step "running end-to-end SSR tests (bookshelf)"
+    if (← sh "node" #["test/bookshelf_ssr_test.mjs"]) != 0 then failed := true
   if failed then return 1 else return 0
 
 def cmdClean : IO UInt32 := do
@@ -388,13 +396,12 @@ def cmdNew (dir : String) : IO UInt32 := do
     "  | .increment => { m with count := m.count + 1 }\n" ++
     "  | .decrement => { m with count := if 0 < m.count then m.count - 1 else m.count }\n" ++
     "  | .reset     => { m with count := 0 }\n\n" ++
-    "def view (m : Model) : Html Msg :=\n" ++
+    "def app : App Model Msg := ui init update fun m =>\n" ++
     "  div [cls \"counter\"] [\n" ++
     "    button [onClick .decrement] [text \"−\"],\n" ++
     "    span   [cls \"count\"]        [text (toString m.count)],\n" ++
     "    button [onClick .increment] [text \"+\"],\n" ++
     "    button [onClick .reset]     [text \"reset\"] ]\n\n" ++
-    "def app : App Model Msg := sandbox init update view\n\n" ++
     "invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update\n"
   IO.FS.writeFile (root / "Web.lean") <|
     "import App\nimport Qed.Driver\n\ndef main : IO Unit := Qed.run app\n"

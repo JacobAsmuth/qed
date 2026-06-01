@@ -11,7 +11,7 @@
   Pure Lean.
 -/
 import Qed
-open Qed (View App templated)
+open Qed (View App mkApp)
 open Qed.V
 
 namespace BenchScalar
@@ -44,6 +44,6 @@ def template : View Model Msg :=
           div [cls "cell"] [text s!"static cell {i}"])
   ]
 
-def app : App Model Msg := templated init update template
+def app : App Model Msg := mkApp init update template
 
 end BenchScalar

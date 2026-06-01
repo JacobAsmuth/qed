@@ -60,15 +60,13 @@ def update (m : Model) : Msg → Model
   | .decrement => { m with count := if 0 < m.count then m.count - 1 else m.count }
   | .reset     => { m with count := 0 }
 
-def view (m : Model) : Html Msg :=
+def app : App Model Msg := ui init update fun m =>
   div [cls "counter"] [
     button [onClick .decrement] "−",       -- a plain string works — Qed wraps it in a text node
-    span   [cls "count"]        [toString m.count],
+    span   [cls "count"]        [text (toString m.count)],
     button [onClick .increment] "+",
     button [onClick .reset]     "reset"
   ]
-
-def app : App Model Msg := sandbox init update view
 
 -- Here's the fun part. We claim the count never goes below zero. Notice we don't
 -- prove it - the `invariant` command does, for every message, no proof by hand.
@@ -169,24 +167,21 @@ inductive Msg
   | chunk (data : String)  -- one token just arrived from the stream
   | done                   -- the stream closed
 
-def update (m : Model) : Msg → Model        -- still pure — Remember, no fetch lives in here
-  | .typed s   => { m with draft := s }
-  | .send      => …                          -- push your turn, clear the box
-  | .chunk raw => { m with turns := appendLast m.turns (deltaOf raw) }   -- glue the token on
-  | .done      => { m with pending := false }
+-- One pure step: each arm returns the next model with `still`, or the next model plus the
+-- effect it fires with `also` — so the fetch sits next to the state change, never in the view.
+def transition (m : Model) : Msg → Model × Cmd Msg
+  | .typed s   => still { m with draft := s }
+  | .send      => also (pushTurn m)            -- push your turn, clear the box…
+                       (.stream "/v1/chat/completions" (reqBody m.turns.pop) .chunk .done)
+  | .chunk raw => still { m with turns := appendLast m.turns (deltaOf raw) }   -- glue the token on
+  | .done      => still { m with pending := false }
 
-def effects (m : Model) : Msg → Cmd Msg     -- this gets the model *after* update has run
-  | .send => .stream "/v1/chat/completions" (reqBody m.turns.pop) .chunk .done
-  | _     => .none                            -- most messages don't need to do anything
-
-def view (m : Model) : Html Msg :=
+def chatApp : App Model Msg := ui init transition fun m =>
   div [cls "chat"] [
     div [cls "log"] (m.turns.toList.map bubble),                       -- one bubble per turn
     input  [value m.draft, onInput .typed, placeholder "Message…"],    -- a controlled input
     button [disabled (m.pending || m.draft.trim.isEmpty), onClick .send] "Send"
   ]
-
-def chatApp : App Model Msg := application init update view effects
 ```
 
 ### Lists and Components
@@ -291,8 +286,8 @@ end Widget
 div [(localMountWith "widget" (toString r.id) (fun c => some (Msg.reported r.id c)))
        .localInit ({ count := 0, note := r.label } : Widget.State)] []
 
--- and register it with the app
-def app : App Model Msg := application init update view (locals := [Widget.reg])
+-- and register it with the app (this view binds local hosts, so it goes in via `View.ofHtml`)
+def app : App Model Msg := mkApp init update (View.ofHtml view) (locals := [Widget.reg])
 ```
 
 Local components **nest** (a widget can embed another, which bubbles up to it), their
@@ -321,22 +316,22 @@ jsonStruct Profile where
   name : String
   bio  : String
 
-def effects (m : Model) : Msg → Cmd Msg
-  | .submit       => .pushUrl (Router.toURL (R.user m.query))   -- go to /users/<query>, no reload
-  | .urlChanged _ => match m.route with
-      | .user name => Cmd.getJson s!"/api/users/{name}"          -- GET it, decode it into a Profile
-                        (fun p => .gotProfile (.ok p)) (fun e => .gotProfile (.error e))
-      | _          => .none
-  | _ => .none
-
-def view (m : Model) : Html Msg :=
-  formEl [onSubmit .submit] [
-    input [value m.query, onInput .typeQuery, onKeydown .key],   -- Enter submits, Escape clears
-    link "/users/ada" [] "ada"                                    -- a real link — but no page reload
-  ]
+-- one transition; the `routed` arm is handed the *parsed* route (typed, not a raw path)
+def transition (m : Model) : Msg → Model × Cmd Msg
+  | .typeQuery s  => still { m with query := s }
+  | .submit       => also m (.pushUrl (Router.toURL (R.user m.query)))  -- go to /users/<query>, no reload
+  | .routed route => match route with
+      | .user name => also { m with route }                             -- GET it, decode into a Profile
+          (Cmd.getJson s!"/api/users/{name}" (fun p => .gotProfile (.ok p)) (fun e => .gotProfile (.error e)))
+      | _          => still { m with route }
+  | .gotProfile r => still { m with profile := r }
 
 def app : App Model Msg :=
-  routed init update view (onUrlChange := Msg.urlChanged) (effects := effects)
+  ui init transition (onRoute := Msg.routed) fun m =>
+    formEl [onSubmit .submit] [
+      input [value m.query, onInput .typeQuery, onKeydown .key],   -- Enter submits, Escape clears
+      link "/users/ada" [] "ada"                                    -- a real link — but no page reload
+    ]
 ```
 
 The full app is `Examples/Users.lean`; `test/users_test.mjs` drives it against a mock
@@ -359,9 +354,10 @@ def effects (m : Model) : Msg → Cmd Msg
   | .saveAll    => Cmd.batch [Cmd.storageSet "doc" m.doc, Cmd.setTitle "Saved"]
   | _           => .none
 
--- `start` runs one effect at boot (e.g. hydrate from localStorage before first paint)
-def app := application init update view (effects := effects)
-             (start := Cmd.storageGet "count" .loaded)
+-- fold the pure `update` and the `effects` above into one transition (next model + the Cmd it
+-- fires), then build with `ui`. `start` runs one effect at boot (hydrate before first paint).
+def transition m msg := let m' := update m msg; (m', effects m' msg)
+def app := ui init transition (start := Cmd.storageGet "count" .loaded) fun m => …
 ```
 
 `afterKeyed`/`cancel` are keyed timers — scheduling a key cancels the pending one, so
@@ -377,8 +373,8 @@ ports where
   wsSend : Command            -- outbound: `wsSend (c : Command) : Cmd msg`
   wsRecv : Event => .received  -- inbound:  "wsRecv" payload decoded into `Msg.received`
 
-def app := application init update view (effects := effects) (onPort := some onPort)
--- effects m | .send => wsSend m.command
+def app := ui init transition (onPort := some onPort) fun m => …
+-- transition m | .send => also m (wsSend m.command)
 ```
 ```js
 const ws = new WebSocket(url);
@@ -392,12 +388,11 @@ offers. The whole battery (`localStorage`, `setTitle`, `randomInt`, `pickFile`, 
 driven in a real browser by `test/effects_test.mjs`. Local-component state has a matching
 pair — `window.qed.snapshot()` / `.restore(json)` — for persistence and time-travel.
 
-### Fine-grained view templates
+### One builder, one fine-grained engine
 
-`view : Model → Html Msg` with `sandbox`/`application` rebuilds the whole tree each update
-and lets the diff find what changed — simple, and fast enough to beat React on whole-list
-operations. The alternative builds the DOM *once* and patches only what changed: `ui` makes
-an app that way from a view written inline.
+There is one way to build an app — `ui` — and one rendering engine behind it. You write the
+view inline as ordinary markup; `ui` lifts it into a fine-grained template that builds the DOM
+once and patches only what changed.
 
 ```lean
 def app : App Model Msg := ui init update fun m =>
@@ -411,32 +406,36 @@ def app : App Model Msg := ui init update fun m =>
 def main := Qed.run app
 ```
 
-`ui` lifts the view for you: string interpolation becomes a bound text node, a model-driven
-`if`/`match` becomes a reconciling slot, a `.map` with a `key` becomes a keyed list, and
-dynamic attributes (`cls (if …)`, `value m.x`) and scope-reading events (`onClick (.toggle
-t.id)`) are wired up — so the dynamic parts need no special syntax. Anything it can't patch
-in place — a keyless `.map`, a free-form subtree — falls back to the verified `diff`, so
-every view compiles and renders. The value stays in the model and `update` stays the pure
-`Model → Msg → Model`. `run app` then drives the patch-in-place path; no template argument.
+`ui` lifts the view for you: `text …` / string interpolation becomes a bound text node, a
+model-driven `if`/`match` becomes a reconciling slot, a `.map` with a `key` becomes a keyed
+list, and dynamic attributes (`value m.x`) and scope-reading events (`onClick (.toggle t.id)`)
+are wired up — so the dynamic parts need no special syntax. Anything it can't patch in place —
+a keyless `.map`, a helper that returns `Html`, a free-form subtree — is reconciled by the
+verified `diff` instead, so every view compiles and renders. The value stays in the model and
+`update` stays the pure `Model → Msg → Model` (return `Model × Cmd Msg` from an arm that needs
+an effect — `ui` accepts either).
 
-The build happens once; only the changed bindings patch on update, and a keyed list pushes
-each changed row straight to its node (text and attributes are signals) with no reconcile.
-On a 10,000-row list with ~1,000 rows changing that's about **4× faster** than the diff path
-(42 ms → 10 ms, `test/bench_template.mjs`), and a single fine-grained row update is **0.84 ms**
-— faster than React.memo's 2.10 ms (`test/bench_react.mjs`). The non-list value patch is
-proven: `applyValues_render` shows the in-place patch reproduces a full re-render (`applyValues
-t s' (render t s) = render t s'`), so it inherits `diff_apply`'s "the DOM equals the model's
-view" guarantee, and `qed check` gates on it.
-
-For effects, local components, or a named template you reuse, build with `templated` and the
-`view%` macro (the same lift, as a term):
+Capabilities are optional arguments on the *same* builder — there is no second builder to pick:
 
 ```lean
-def template : View Model Msg := view% fun m => …
-def app := templated init update template (effects := …)
+ui init transition (onRoute := Msg.go) fun m => …               -- URL routing (a typed route)
+ui init transition (start := Cmd.now .today) fun m => …         -- a startup effect
+ui init update (locals := [w.reg]) (onPort := some onPort) fun m => …
 ```
 
-`Examples/Template.lean` is the demo; `test/template_test.mjs` drives it in a browser.
+The build happens once; only changed bindings patch on update, and a keyed list pushes each
+changed row straight to its node (text and attributes are signals) with no reconcile. On a
+10,000-row list with ~1,000 rows changing that's about **4× faster** than rebuilding and
+diffing the whole tree (42 ms → 10 ms, `test/bench_template.mjs`), and a single fine-grained
+row update is **0.84 ms** — faster than React.memo's 2.10 ms (`test/bench_react.mjs`). The
+update step is proven: `patch_render` shows that for *every* subtree, the engine's step (an
+in-place value patch when the shape is stable, the verified `diff` otherwise) reproduces a full
+re-render — so the whole engine inherits `diff_apply`'s "the DOM equals the model's view"
+guarantee, and `qed check` gates on it.
+
+For a view you build separately or reuse, `view% fun m => …` is that same lift as a term and
+`View.ofHtml` drops a ready-made `Html` view straight in; pass either to `mkApp` (the function
+`ui` is sugar over). `Examples/Template.lean` is the demo; `test/template_test.mjs` drives it.
 
 ## A few more ergonomics
 
@@ -452,7 +451,7 @@ transition m
   | .send    => also { m with pending := true } (Cmd.stream url body .chunk .done)
 ```
 
-`program init transition view` builds it (`routedProgram` adds URL routing).
+`ui init transition fun m => …` builds it; add `(onRoute := …)` for URL routing.
 
 **Remote data as a value.** `Resource α` is `idle | loading | ok | failed`. `Resource.fetch`
 GETs and decodes through the verified JSON, reporting the outcome as one message; `.view`
@@ -475,6 +474,12 @@ div [card] [ … ]
 **Forms show errors.** `formView` marks a field `aria-invalid` and shows a message once it's
 been edited and fails to validate — the gate and its `canSubmit_iff` proof are unchanged.
 
+**One app, the whole stack.** `Examples/Bookshelf.lean` wires these together: a routed catalog
+that fetches a `Resource (Array Book)`, a detail page that fetches one `Resource Book`, and an
+add-book `form` (text/number/select/checkbox, each refined) that POSTs a valid draft and routes
+to the new book. `test/bookshelf_test.mjs` drives all of it in a browser; `Examples/BookshelfSSR.lean`
+renders each route server-side (`test/bookshelf_ssr_test.mjs`).
+
 **Server-side rendering + hydration.** `App.renderInitial app` runs the *same* verified
 `view`/`render` on the server; `renderDocument` wraps it in a static page. The client then
 **hydrates** it — the driver walks the view in lockstep with the server DOM and wires
@@ -485,6 +490,13 @@ both the standard builders (`Driver.hydrateDom`) and the fine-grained `view%` te
 rebinds signals). For dynamic, per-request rendering, `App.renderModel` renders any model —
 a server computes the model for the request and renders it (see `Examples/UsersSSR.lean`,
 which renders each route's page with its data filled server-side).
+
+The client adopts the server markup in place when its first render matches that markup —
+static content, the initial-state demos, and a page like the add-book form below. A page
+whose data is *fetched per route* is the exception today: the client model starts empty and
+the route's fetch refills it, so the first client render is the loading state and the
+server's data is replaced rather than adopted. Embedding the fetched payloads in the page for
+the client to read on boot (a dehydrated cache) is the planned next step.
 
 ## So what's actually happening?
 
@@ -541,16 +553,16 @@ muscle memory you've got. When you're hacking on the framework itself, the in-re
 |------|------|
 | `Qed/Html.lean` | The core typed virtual DOM — the thing every bit of nice syntax eventually becomes. |
 | `Qed/Notation.lean` | The readable view combinators (`div`, `button`, `onClick`, …). |
-| `Qed/Runtime.lean` | The Elm Architecture (`App`, `sandbox`, `application`, `program`/`routedProgram`, `routed`), the `templated`/`ui` builders (an app carrying a `View` template), the `Cmd` effects (storage, navigation, clipboard, focus, `after`, `setTitle`, `randomInt`, files, `getJson`/`stream`, `batch`) and the `port`/`onPort` escape hatch, local-state components (`LocalDef`, `localMount`, `App.locals`), and server-side render (`App.renderInitial`/`renderModel`, `renderDocument`). |
+| `Qed/Runtime.lean` | The Elm Architecture: `App` (carrying a `View` template), the one `ui` builder (over `mkApp`/`mkRoutedApp`, with `still`/`also` and the `ToStep` pure-or-effectful update), the `Cmd` effects (storage, navigation, clipboard, focus, `after`, `setTitle`, `randomInt`, files, `getJson`/`postJson`/`stream`, `batch`) and the `port`/`onPort` escape hatch, local-state components (`LocalDef`, `localMount`, `App.locals`), and server-side render (`App.renderInitial`/`renderModel`, `renderDocument`). |
 | `Qed/Render.lean` | The pure `Html` → string renderer (`Html.render`, `escapeHtml`, `normalizeAttrs`), kept below `Qed.View` so an `App` can carry a `View` template. |
 | `Qed/Invariant.lean` | The `invariant … preserved_by …` command (it discharges the proof for you). |
-| `Qed/Diff.lean` | The diff/patch engine — positional reconcile (add/remove), `O(n)` keyed reconcile (reorder by `key`), and `lazy` subtree memoization — plus the `diff_apply` correctness proof. |
+| `Qed/Diff.lean` | The diff/patch engine the `View` engine reconciles with internally — positional reconcile (add/remove), `O(n)` keyed reconcile (reorder by `key`), and `lazy` subtree memoization — plus the `diff_apply` correctness proof. |
 | `Qed/Json.lean` | The full JSON parser/renderer + `jsonStruct`/`jsonCodec`, with the `parse_depth_le` & `parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law baked in as a field), the `router` command, and `toURL`/`fromURL` for the browser. |
 | `Qed/Form.lean` | Typed refinement fields (`Field p`), the `Input` controls (text/number/checkbox/date/select/radios), and the `form` command (Draft + `parse` + `formView` + the `canSubmit_iff` proof). |
 | `Qed/Date.lean` | A calendar `Date` that can't be invalid (smart constructor + ISO parser; impossible dates parse to `none`). |
 | `Qed/Component.lean` | `Component` (a reusable `update`+`view`), `viewList`/`updateAt`/`updateKeyed` for repeating one per row, and the `embed` macro that writes the per-row wiring. |
-| `Qed/View.lean` | `View` templates: `dyn`/`showIf`/`ifElse`/`forEach`/`dynNode`, and the `view%` auto-lift macro behind the `ui` builder. Built once, then only changed bindings patch (lists update via signals); anything not liftable falls back to the verified `diff`. |
+| `Qed/View.lean` | The one rendering model — `View` templates (`dyn`/`showIf`/`ifElse`/`forEach`/`dynNode`, `View.ofHtml`) and the `view%` macro that lifts ordinary `Html` notation into one (behind every `ui`). Built once, then only changed bindings patch (lists update via signals); structure it can't lift to a binding reconciles through the verified `diff`. The `patch_render`/`applyValues_render` proofs cover the update step. |
 | `Qed/Dom.lean` | The `@[extern]` DOM primitives — the one trusted boundary. |
 | `Qed/Driver.lean` | The impure browser driver (build + patch) + the `@[export]`ed entry points. |
 | `Examples/` | Example programs. |

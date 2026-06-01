@@ -26,14 +26,12 @@ inductive Msg | ping
 def update (m : Model) : Msg → Model
   | .ping => { m with renders := m.renders + 1 }
 
-def view (m : Model) : Html Msg :=
+def app : App Model Msg := ui init update fun m =>
   div [cls "signals"] [
     div [cls "row"] ["a = ", signalText "a"],
     div [cls "row"] ["b = ", signalText "b"],
     button [attr "id" "ping", cls "ping", onClick .ping] "re-render",
-    div [cls "renders", attr "id" "renders"] [toString m.renders]
+    div [cls "renders", attr "id" "renders"] [text (toString m.renders)]
   ]
-
-def app : App Model Msg := sandbox init update view
 
 end Signals

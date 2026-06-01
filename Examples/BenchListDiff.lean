@@ -15,7 +15,9 @@ def viewDiff (m : BenchList.Model) : Html BenchList.Msg :=
     ul [] (m.rows.toList.map fun r => li [key (toString r.id)] [text r.label])
   ]
 
+-- The whole `Html` view as one `View.ofHtml` node: every update rebuilds it and reconciles
+-- through the verified `diff` — the "before templates" baseline, now inside the one engine.
 def diffApp : App BenchList.Model BenchList.Msg :=
-  sandbox BenchList.init BenchList.update viewDiff
+  mkApp BenchList.init BenchList.update (View.ofHtml viewDiff)
 
 end BenchListDiff

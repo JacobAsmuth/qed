@@ -70,6 +70,6 @@ def view (m : Model) : Html Msg :=
       (fun r => if m.useSignal then rowViewSignal r else if m.useLazy then rowViewLazy r else rowView r)).toList
   ]
 
-def app : App Model Msg := sandbox init update view
+def app : App Model Msg := mkApp init update (View.ofHtml view)
 
 end BenchApp

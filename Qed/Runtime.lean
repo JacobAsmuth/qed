@@ -14,6 +14,7 @@ import Qed.Date
 import Qed.Json
 import Qed.Render
 import Qed.View
+import Qed.Router
 
 namespace Qed
 
@@ -247,130 +248,123 @@ structure LocalDef where
   /-- Render the child from serialized state, messages erased to `LocalMsg`. -/
   view : String → Html LocalMsg
 
-/-- A self-contained application: an initial (model, startup effect), a transition
-    that may request effects, and a view. A transition returns `(nextModel, cmd)`;
-    use `(m, .none)` (or just the pure `sandbox`) when there is no effect. -/
+/-- A self-contained application: an initial (model, startup effect), a transition that may
+    request effects, and a `View` template. The runtime always renders through the template
+    (one engine); `App.view` below is its `View.render`, the spec the fine-grained driver is
+    checked against. Build one with `ui`. -/
 structure App (Model : Type) (Msg : Type) where
   /-- The initial model and the effect to run on start. -/
   init   : Model × Cmd Msg
   /-- The pure, total state transition, optionally requesting an effect. -/
   update : Model → Msg → Model × Cmd Msg
-  /-- The pure, total render. -/
-  view   : Model → Html Msg
-  /-- If set, the message to fire when the browser URL changes (the new path is the
-      argument) — at startup, on `link` clicks, on back/forward, and after
-      `Cmd.pushUrl`. The app parses the path (e.g. `Router.fromURL`) into its route.
-      Left `none` by `sandbox`/`application`; set by `routed`. -/
+  /-- The view as a fine-grained template: built once, then only the bindings whose projection
+      changed are patched. The `ui` builder lifts an ordinary `fun m => …` view into this. -/
+  template : View Model Msg
+  /-- If set, the message to fire when the browser URL changes (the new path is the argument) —
+      at startup, on `link` clicks, on back/forward, and after `Cmd.pushUrl`. The routed `ui`
+      builder sets it from a typed `onRoute : R → Msg`. -/
   onUrlChange : Option (String → Msg) := none
-  /-- Local components (`useState`-style) this app embeds, registered by id. The
-      driver installs them and routes their events to a per-instance keyed store. A
-      view references one with `localMount`/`localMountWith`. Empty for apps that use
-      none. -/
+  /-- Local components (`useState`-style) this app embeds, registered by id. The driver installs
+      them and routes their events to a per-instance keyed store. Empty for apps that use none. -/
   locals : List LocalDef := []
-  /-- Inbound ports: when the app's JS calls `globalThis.__qed.send(name, payload)`,
-      this turns it into a message (or `none` to ignore). The subscription side of
-      `Cmd.port` — wire WebSocket frames, cross-tab `storage` events, intervals, etc.
-      Left `none` by the builders. -/
+  /-- Inbound ports: when the app's JS calls `globalThis.__qed.send(name, payload)`, this turns
+      it into a message (or `none` to ignore). The subscription side of `Cmd.port`. -/
   onPort : Option (String → String → Option Msg) := none
-  /-- An optional `View` template for this app (set by `templated`/`ui`). When present, `run`
-      uses it; `none` (the default) renders `view` through the diff. -/
-  template : Option (View Model Msg) := none
 
-/-- Build an `App` with no side effects (the Elm "sandbox"). -/
-def sandbox (init : Model) (update : Model → Msg → Model) (view : Model → Html Msg) :
-    App Model Msg :=
-  { init := (init, .none), update := fun m msg => (update m msg, .none), view }
+/-- The app's view: its template rendered against the model. Server (SSR) and the fine-grained
+    client driver are both checked against this one function, so they cannot drift. -/
+def App.view (app : App Model Msg) (m : Model) : Html Msg := View.render app.template m
 
-/-- Build an `App` whose transitions may request effects (fetch, streaming, …).
+/-! ### Transitions
 
-    `update` stays pure (`Model → Msg → Model`), so its arms read as ordinary
-    `{ m with … }` record updates. Effects are a *separate* function evaluated on
-    the **updated** model: `effects m' msg` is the `Cmd` to run after a `msg`
-    moved the model to `m'`. It defaults to "no effect", so an app names a `Cmd`
-    only for the messages that actually have one. `start` is the effect to run once at
-    startup (e.g. `Cmd.storageGet …` to hydrate from localStorage before first paint).
-
-    (For an effect that needs state the update discards, build the `App` directly:
-    its `update : Model → Msg → Model × Cmd Msg` field gives the combined form.) -/
-def application (init : Model)
-    (update  : Model → Msg → Model)
-    (view    : Model → Html Msg)
-    (effects : Model → Msg → Cmd Msg := fun _ _ => .none)
-    (locals  : List LocalDef := [])
-    (onPort  : Option (String → String → Option Msg) := none)
-    (start   : Cmd Msg := .none) : App Model Msg :=
-  { init   := (init, start)
-    update := fun m msg => let m' := update m msg; (m', effects m' msg)
-    view, locals, onPort }
-
-/-- Build a URL-routed `App`. Same as `application`, plus `onUrlChange`: the message
-    fired with the new path whenever the URL changes (startup, `link` clicks,
-    back/forward, `Cmd.pushUrl`). The app parses the path into its route — typically
-    `fun path => .urlChanged (Router.fromURL path)`. -/
-def routed (init : Model)
-    (update      : Model → Msg → Model)
-    (view        : Model → Html Msg)
-    (onUrlChange : String → Msg)
-    (effects     : Model → Msg → Cmd Msg := fun _ _ => .none)
-    (start       : Cmd Msg := .none) : App Model Msg :=
-  { init   := (init, start)
-    update := fun m msg => let m' := update m msg; (m', effects m' msg)
-    view
-    onUrlChange := some onUrlChange }
-
-/-! ### Unified transition
-
-`application` splits the pure `update` from `effects`, which means a message with an
-effect is handled in two places (and the effect often has to *reconstruct* what `update`
-did). A `transition` is the single combined `Model → Msg → Model × Cmd Msg`, written with
-two helpers so the effect sits next to the state change that triggers it:
+`update` returns the next model, optionally with an effect. A pure app's arms are ordinary
+`{ m with … }` (it returns `Model`); an effectful app's arms pair the model with a `Cmd` using
+the two helpers — so the effect sits next to the state change that triggers it:
 
     transition m
       | .typed s => still { m with draft := s }
       | .send    => also { m with pending := true } (Cmd.stream url body .chunk .done)
 
-`still`/`also` force their first argument to be the model, so a bare `{ m with … }` arm
-still resolves cleanly (the structure is inferred from `m`, not from the `Model × Cmd`
-return type). -/
+The `ToStep` class lets the one builder (`ui`) accept *either* return type, so there is no
+pure-vs-effectful builder choice. -/
 
 /-- A transition arm with no effect. -/
 def still (m : Model) : Model × Cmd Msg := (m, .none)
 /-- A transition arm that also runs `cmd` after the update. -/
 def also (m : Model) (cmd : Cmd Msg) : Model × Cmd Msg := (m, cmd)
 
-/-- Build an `App` from a single combined transition (`still`/`also` arms) rather than the
-    split `update` + `effects`. The `App.update` field type is unchanged, so the driver is
-    untouched. -/
-def program (init : Model) (transition : Model → Msg → Model × Cmd Msg)
-    (view : Model → Html Msg) (start : Cmd Msg := .none)
-    (locals : List LocalDef := []) (onPort : Option (String → String → Option Msg) := none) :
-    App Model Msg :=
-  { init := (init, start), update := transition, view, locals, onPort }
+/-- A transition result the builder can normalise to `(model, cmd)`: either a bare next `Model`
+    (no effect) or an explicit `Model × Cmd Msg`. The two instances never overlap (`Model` vs
+    `Model × Cmd Msg`), so which one applies is determined by `update`'s return type. -/
+class ToStep (Model : Type) (Msg : Type) (α : Type) where
+  toStep : α → Model × Cmd Msg
+instance : ToStep Model Msg Model := ⟨fun m => (m, .none)⟩
+instance : ToStep Model Msg (Model × Cmd Msg) := ⟨id⟩
 
-/-- A URL-routed app written with a single combined `transition` (the routed analogue of
-    `program`): the `urlChanged` arm can set state *and* fire the page's data fetch in one
-    place, instead of splitting them across `update` and `effects`. -/
-def routedProgram (init : Model) (transition : Model → Msg → Model × Cmd Msg)
-    (view : Model → Html Msg) (onUrlChange : String → Msg) (start : Cmd Msg := .none) :
-    App Model Msg :=
-  { init := (init, start), update := transition, view, onUrlChange := some onUrlChange }
+/-- Construct an `App` from `init`, an `update` (returning `Model` or `Model × Cmd Msg` via
+    `ToStep`), and a `View` template. The `ui` builder is the front door; call this directly only
+    to pass a pre-built template — a reused `view%` fragment, or `View.ofHtml` over an `Html`
+    view. -/
+def mkApp [ToStep Model Msg α] (init : Model) (update : Model → Msg → α)
+    (template : View Model Msg) (start : Cmd Msg := .none) (locals : List LocalDef := [])
+    (onPort : Option (String → String → Option Msg) := none) : App Model Msg :=
+  { init := (init, start), update := fun m msg => ToStep.toStep (update m msg),
+    template, locals, onPort }
 
-/-- Build an `App` from a `View` template. The template is carried in the app (so `run app`
-    uses it) and the `view` field is `View.render template`. -/
-def templated (init : Model) (update : Model → Msg → Model) (template : View Model Msg)
-    (effects : Model → Msg → Cmd Msg := fun _ _ => .none)
-    (locals  : List LocalDef := [])
-    (onPort  : Option (String → String → Option Msg) := none)
-    (start   : Cmd Msg := .none) : App Model Msg :=
-  { application init update (fun m => View.render template m)
-      (effects := effects) (locals := locals) (onPort := onPort) (start := start)
-    with template := some template }
+/-- `mkApp` for a URL-routed app: `onRoute` is fired with the *parsed* route on every URL change
+    (an unknown URL falls back to `default`, hence `[Inhabited R]`), so the app never re-parses
+    the path or annotates the route type. -/
+def mkRoutedApp {R : Type} [Router R] [Inhabited R] [ToStep Model Msg α]
+    (init : Model) (update : Model → Msg → α) (template : View Model Msg)
+    (onRoute : R → Msg) (start : Cmd Msg := .none) (locals : List LocalDef := [])
+    (onPort : Option (String → String → Option Msg) := none) : App Model Msg :=
+  { mkApp init update template start locals onPort with
+    onUrlChange := some (fun p => onRoute ((Router.fromURL p).getD default)) }
 
-/-- `ui init update fun m => …` builds the app from a view written inline: it lifts the body
-    with `view%` and carries the resulting template. For effects/locals, use `templated` with a
-    `view%` template. -/
-macro "ui " init:term:max update:term:max " fun " m:ident " => " body:term : term =>
-  `(Qed.templated $init $update (view% fun $m => $body))
+/-! ### The `ui` builder — the one way to build an app
+
+`ui init update fun m => <view>` builds the whole `App`. `update` may return `Model` (pure) or
+`Model × Cmd Msg` (effectful, via `still`/`also`). The view is written inline and lifted to a
+fine-grained template — no `view%` by hand. Capabilities are optional args, in any order, before
+the `fun`:
+
+    ui init update fun m => …                                   -- pure
+    ui init transition (onRoute := Msg.route) fun m => …        -- routed (needs a `router`)
+    ui init transition (start := Cmd.now .today) fun m => …
+    ui init update (locals := [w.reg]) (onPort := some onPort) fun m => …
+
+For a reused/pre-built template, call `mkApp`/`mkRoutedApp` with a `view%` fragment or
+`View.ofHtml`. Core-syntax only (no `import Lean`): quotations over the existing total `view%`. -/
+
+-- One option `(name := value)`. The name is a generic `ident` (not a keyword), so `onRoute`/
+-- `start`/`locals`/`onPort` reserve no tokens; each atom is a single token (`(`, `:=`, `)`).
+syntax uiOpt := "(" ident " := " term ")"
+syntax (name := uiBuilder) "ui " term:max term:max (uiOpt)* " fun " ident " => " term : term
+
+open Lean in
+macro_rules
+  | `(ui $init $update $[$opts:uiOpt]* fun $m => $body) => do
+      let tmpl ← `(view% fun $m => $body)
+      let mut routeE? : Option (TSyntax `term) := none
+      let mut startE  : TSyntax `term ← `(Qed.Cmd.none)
+      let mut localsE : TSyntax `term ← `(([] : List Qed.LocalDef))
+      let mut portE   : TSyntax `term ← `(none)
+      for opt in opts do
+        match opt with
+        | `(uiOpt| ($name:ident := $e)) =>
+            match name.getId with
+            | `onRoute => routeE? := some e
+            | `start   => startE  := e
+            | `locals  => localsE := e
+            | `onPort  => portE   := e
+            | _ => Macro.throwErrorAt name s!"ui: unknown option '{name.getId}' (expected onRoute/start/locals/onPort)"
+        | _ => pure ()
+      match routeE? with
+      | some route =>
+          `(Qed.mkRoutedApp $init $update $tmpl (onRoute := $route)
+              (start := $startE) (locals := $localsE) (onPort := $portE))
+      | none =>
+          `(Qed.mkApp $init $update $tmpl (start := $startE) (locals := $localsE) (onPort := $portE))
 /-- Register a local component with an output it can bubble to its parent. `update`
     returns the next state and an optional output; the output is serialized and handed
     to the host's `bubble` (see `localMountWith`). The message type `M` needs no codec

@@ -70,7 +70,7 @@ def update (m : Model) : Msg → Model
   | .remove id => { m with rows := m.rows.filter (·.id != id) }
   | .sort      => { m with rows := m.rows.qsort (fun a b => compare a.text b.text == .lt) }
 
-def view (m : Model) : Html Msg :=
+def app : App Model Msg := ui init update fun m =>
   div [cls "todo"] [
     div [cls "add"] [
       input  [cls "new", value m.draft, onInput .edit, placeholder "What needs doing?"],
@@ -81,9 +81,7 @@ def view (m : Model) : Html Msg :=
       li [key (toString r.id), cls "row"] [
         rowView r,                                  -- the row's own view, messages tagged by key
         button [cls "rm", onClick (.remove r.id)] "✕"
-      ]).toList
+      ])
   ]
-
-def app : App Model Msg := sandbox init update view
 
 end Todo

@@ -36,22 +36,19 @@ def update (m : Model) : Msg → Model
                       | some appt => { m with booked := some appt.who.val }
                       | none      => m
 
-def view (m : Model) : Html Msg :=
-  match m.today with
-  | none       => p [cls "loading"] ["Loading today's date…"]
-  | some today =>
-      div [cls "app"] [
-        h1 [] ["Book an appointment"],
-        Appt.formView today m.draft .edit .submit,    -- gate uses `today`
-        match m.booked with
-        | some who => p [cls "ok"] ["Booked for ", who]
-        | none     => .text ""
-      ]
-
+-- `Cmd.now` reads the clock once at startup (the `start` effect) and delivers `.gotToday`.
 def app : App Model Msg :=
-  -- built directly so we can run `Cmd.now` as the startup effect
-  { init   := ({ today := none, draft := Appt.Draft.empty, booked := none }, .now .gotToday)
-    update := fun m msg => (update m msg, .none)
-    view   := view }
+  ui { today := none, draft := Appt.Draft.empty, booked := none } update
+    (start := Cmd.now .gotToday) fun m =>
+    match m.today with
+    | none       => p [cls "loading"] ["Loading today's date…"]
+    | some today =>
+        div [cls "app"] [
+          h1 [] ["Book an appointment"],
+          Appt.formView today m.draft .edit .submit,    -- gate uses `today`
+          match m.booked with
+          | some who => p [cls "ok"] ["Booked for ", who]
+          | none     => .text ""
+        ]
 
 end Booking

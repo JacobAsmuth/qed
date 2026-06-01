@@ -45,9 +45,11 @@ A route's path is its leading segment followed by its string arguments. The
 leading segment defaults to the constructor name; `=> "seg"` overrides it, and
 `=> ""` makes the path empty (the index). The command generates `T.print`,
 `T.parse`, the `T.round_trip` proof (`parse (print r) = some r`, by case
-analysis), and the `Router T` instance — so an unlawful router is impossible and
-none of it is written by hand. Fields use one-per-line or `;`-separated layout.
-Core-syntax only (no `import Lean`). -/
+analysis), the `Router T` instance — so an unlawful router is impossible and
+none of it is written by hand — and `Repr`/`DecidableEq`/`Inhabited` (the last so a
+typed `ui (onRoute := …)` can `default` the route on an unknown URL; the table needs
+at least one no-argument route, e.g. the index). Fields use one-per-line or
+`;`-separated layout. Core-syntax only (no `import Lean`). -/
 
 syntax routeBinder := "(" ident " : " term ")"
 syntax routeAlt := ident (routeBinder)* (" => " str)?
@@ -92,7 +94,7 @@ macro_rules
       let parseRhssAll := parseRhss.push (← `(none))
       `(inductive $t:ident where
           $[| $ctorNames:ident $[($ctorBs:ident : $ctorBts:term)]*]*
-        deriving Repr, DecidableEq
+        deriving Repr, DecidableEq, Inhabited
         def $printId:ident (r : $t) : List String :=
           match r with
           $[| $printPats:term => $printRhss:term]*

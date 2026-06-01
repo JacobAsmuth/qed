@@ -70,16 +70,14 @@ def transition (m : Model) : Msg → Model × Cmd Msg
 def bubble (t : Turn) : Html Msg :=
   div [cls (if t.user? then "msg user" else "msg bot")] [t.text]
 
-def view (m : Model) : Html Msg :=
-  div [cls "chat"] [
-    div [cls "log"] (m.turns.toList.map bubble),
-    div [cls "composer"] [
-      input [cls "draft", placeholder "Message the model…", value m.draft, onInput .typed],
-      button [cls "send", disabled (m.pending || m.draft.trim.isEmpty), onClick .send] "Send"
-    ]
-  ]
-
 def chatApp : App Model Msg :=
-  program { turns := #[], draft := "", pending := false } transition view
+  ui { turns := #[], draft := "", pending := false } transition fun m =>
+    div [cls "chat"] [
+      div [cls "log"] (m.turns.toList.map bubble),
+      div [cls "composer"] [
+        input [cls "draft", placeholder "Message the model…", value m.draft, onInput .typed],
+        button [cls "send", disabled (m.pending || m.draft.trim.isEmpty), onClick .send] "Send"
+      ]
+    ]
 
 end Chat

@@ -667,9 +667,9 @@ def qedPortRecv (name payload : String) : IO Unit := do
     and runs the startup effect; thereafter each message updates the model, diffs
     the new view against the previous one, patches the difference, and interprets
     the requested effect (which may dispatch further messages over time). -/
-def run (app : App Model Msg) (template : Option (View Model Msg) := app.template) : IO Unit := do
+def run (app : App Model Msg) : IO Unit := do
+  let template := app.template
   let modelRef ← IO.mkRef app.init.1
-  let treeRef  ← IO.mkRef (none : Option (Html Msg))
   let vstateRef ← IO.mkRef (none : Option (VState Model Msg))
   let condCells ← IO.mkRef (#[] : Array (Bool × Option (VState Model Msg)))
   let rootRef  ← IO.mkRef (0 : Dom.Node)
@@ -705,46 +705,23 @@ def run (app : App Model Msg) (template : Option (View Model Msg) := app.templat
     for k in dead do
       instancesRef.modify (·.erase k); storeRef.modify (·.erase k)
   let renderModel : IO Unit := do
-    match template with
-    | some t => do
-        -- Fine-grained path: build once, thereafter walk the template and patch only the
-        -- bindings whose projection changed (no new tree, no diff for the scalars). The
-        -- handler tables are NOT reset here: static events are registered once at build and
-        -- persist, so a value-only update touches no events (and a row click survives it).
-        match ← vstateRef.get with
-        | none => do
-            -- First render: hydrate the server-rendered DOM in place if present, else build.
-            let existing ← Dom.appRoot
-            if existing != (0 : Dom.Node) then
-              let vst ← hydrateView h condCells t (← modelRef.get) existing
-              rootRef.set existing; vstateRef.set (some vst)
-            else
-              let (node, vst) ← buildView h condCells t (← modelRef.get)
-              Dom.mountRoot node; rootRef.set node; vstateRef.set (some vst)
-        | some vst => patchView h condCells (← rootRef.get) 0 t (← modelRef.get) vst
+    -- The one rendering path: build the template's DOM once, thereafter walk it and patch only
+    -- the bindings whose projection changed (no new tree, no diff for the scalars). Structure
+    -- that changes shape — a `showIf`/`ifElse`, a keyed list, a `dynNode` (the lift target for a
+    -- free-form `match` or a keyless list) — reconciles through the verified `diff` internally.
+    -- The handler tables are NOT reset: static events are registered once at build and persist,
+    -- so a value-only update touches no events (and a row click survives it).
+    match ← vstateRef.get with
     | none => do
-        clickRef.set #[]; inputRef.set #[]
-        let newTree := app.view (← modelRef.get)
-        (match ← treeRef.get with
-         | none => do
-             -- First render: if the server pre-rendered into #app, adopt that DOM in place
-             -- (hydrate — no flash, events/signals wired onto the existing nodes); otherwise
-             -- build fresh and mount.
-             let existing ← Dom.appRoot
-             if existing != (0 : Dom.Node) then
-               hydrateDom h newTree existing
-               rootRef.set existing
-             else
-               let node ← buildDom h newTree
-               Dom.mountRoot node; rootRef.set node
-         | some oldTree => do
-             let root ← rootRef.get
-             match diff oldTree newTree with
-             | .replace newH => do
-                 let node ← buildDom h newH
-                 Dom.mountRoot node; rootRef.set node
-             | patch => applyToDom h root 0 root patch)
-        treeRef.set (some newTree)
+        -- First render: hydrate the server-rendered DOM in place if present, else build.
+        let existing ← Dom.appRoot
+        if existing != (0 : Dom.Node) then
+          let vst ← hydrateView h condCells template (← modelRef.get) existing
+          rootRef.set existing; vstateRef.set (some vst)
+        else
+          let (node, vst) ← buildView h condCells template (← modelRef.get)
+          Dom.mountRoot node; rootRef.set node; vstateRef.set (some vst)
+    | some vst => patchView h condCells (← rootRef.get) 0 template (← modelRef.get) vst
     gcLocals
   -- Interpret one leaf effect. `batch` is flattened away by `Cmd.flatten` first, so
   -- this stays non-recursive (no termination obligation through `List.forM`).
@@ -774,11 +751,27 @@ def run (app : App Model Msg) (template : Option (View Model Msg) := app.templat
         Dom.effectResult kind a b (UInt32.ofNat cs.size)
     | .batch _ => pure ()   -- unreachable: flattened away below
   let perform : Cmd Msg → IO Unit := fun cmd => (Cmd.flatten cmd).forM performLeaf
-  let dispatchMsg : Msg → IO Unit := fun msg => do
+  -- Re-entrancy guard. Removing a focused node during a patch fires `blur` *synchronously*, whose
+  -- handler would dispatch a message and re-enter `renderModel` mid-patch (corrupting the DOM it
+  -- was editing). So a dispatch that arrives while a render is in flight is queued and run after
+  -- the render completes, never nested inside it.
+  let renderingRef ← IO.mkRef false
+  let pendingRef   ← IO.mkRef (#[] : Array Msg)
+  let applyOne : Msg → IO (Cmd Msg) := fun msg => do
     let (m', cmd) := app.update (← modelRef.get) msg
     modelRef.set m'
-    renderModel
-    perform cmd
+    renderingRef.set true
+    try renderModel finally renderingRef.set false
+    pure cmd
+  let dispatchMsg : Msg → IO Unit := fun msg => do
+    if (← renderingRef.get) then
+      pendingRef.modify (·.push msg)
+    else
+      perform (← applyOne msg)
+      while !(← pendingRef.get).isEmpty do
+        let queued ← pendingRef.get
+        pendingRef.set #[]
+        for qm in queued do perform (← applyOne qm)
   dispatchRef.set dispatchMsg
   -- A local event (routed by the JS host to the nearest local host, which is namespaced
   -- by component): look up the instance and run the handler's message on its state.

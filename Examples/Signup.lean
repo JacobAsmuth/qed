@@ -36,16 +36,14 @@ def update (m : Model) : Msg → Model
   | .edit d => { m with draft := d }
   | .submit => { m with submitted := Account.parse m.draft }
 
-def view (m : Model) : Html Msg :=
-  div [cls "app"] [
-    h1 [] ["Create account"],
-    Account.formView m.draft .edit .submit,
-    match m.submitted with
-    | some acc => p [cls "ok"] ["Created account for ", acc.email.val]
-    | none     => .text ""
-  ]
-
 def app : App Model Msg :=
-  sandbox { draft := Account.Draft.empty, submitted := none } update view
+  ui { draft := Account.Draft.empty, submitted := none } update fun m =>
+    div [cls "app"] [
+      h1 [] ["Create account"],
+      Account.formView m.draft .edit .submit,
+      match m.submitted with
+      | some acc => p [cls "ok"] ["Created account for ", acc.email.val]
+      | none     => .text ""
+    ]
 
 end Signup

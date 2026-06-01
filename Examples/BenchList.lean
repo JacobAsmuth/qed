@@ -11,7 +11,7 @@
   Pure Lean.
 -/
 import Qed
-open Qed (View App templated)
+open Qed (View App mkApp)
 open Qed.V
 
 namespace BenchList
@@ -47,6 +47,6 @@ def template : View Model Msg :=
     forEach "ul" (·.rows) (fun r => toString r.id) rowT
   ]
 
-def app : App Model Msg := templated init update template
+def app : App Model Msg := mkApp init update template
 
 end BenchList

@@ -36,9 +36,10 @@ namespace Component
 variable {Model Msg PMsg : Type}
 
 /-- Run a component as a standalone application (no effects). Useful for testing a
-    component in isolation, or when it *is* the whole app. -/
+    component in isolation, or when it *is* the whole app. The component's `Html` view is a
+    value (not inline), so it goes in as a `View.ofHtml` template. -/
 def toApp (c : Component Model Msg) (init : Model) : App Model Msg :=
-  sandbox init c.update c.view
+  mkApp init c.update (View.ofHtml c.view)
 
 /-- Embed a single child: render it and relabel its messages into the parent's
     `Msg` via `wrap`. The parent's transition for `wrap cm` runs `c.update` on the

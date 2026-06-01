@@ -123,6 +123,12 @@ mutual
     | k :: ks, s => View.render k s :: View.renderEach ks s
 end
 
+/-- Lift any `σ → Html` view into a template: a single scope-bound `dynNode`, so the whole
+    subtree reconciles through the verified `diff` on update (`View.render (.ofHtml f) s = f s`).
+    The bridge for a view a builder can't lift syntactically (or a reused `Html`-returning
+    helper) — same behaviour as the old whole-tree-diff path, now inside the one engine. -/
+def View.ofHtml (f : σ → Html msg) : View σ msg := .dynNode f
+
 /-! ### The value-patch path is a full re-render (verified)
 
 The fine-grained driver, away from a `keyedList`, does not rebuild the tree: it walks the
@@ -573,7 +579,9 @@ private def eventPrime? : String → Option String
 private def htmlTags : List String :=
   ["div", "span", "p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "a", "nav",
    "header", "footer", "section", "article", "button", "label", "table", "thead", "tbody",
-   "tfoot", "tr", "td", "th", "strong", "em", "select", "option"]
+   "tfoot", "tr", "td", "th", "strong", "em", "select", "option", "input", "textarea",
+   "img", "br", "hr", "small", "pre", "code", "b", "i", "main", "aside", "figure",
+   "figcaption", "blockquote", "ol", "fieldset", "legend", "datalist", "progress", "meter"]
 
 /-- An element former's tag (`ul` ↦ `"ul"`, `formEl` ↦ `"form"`), if it is a known tag. -/
 private def elementTag? (n : Lean.Name) : Option String :=
@@ -651,36 +659,86 @@ private def extractKey (attrsList : Syntax) : MacroM (Option (Term × Term)) := 
 
 open Lean in
 mutual
-  /-- Rewrite a view body against the current scope `m`: lift dynamic text, model-driven
-      `if`s, dynamic attributes/events, `match`es, and `.map` lists; recurse elsewhere. -/
+  /-- Rewrite a view body (written in ordinary `Qed` `Html` notation) into a fine-grained
+      `View`: `text e`→`dyn`, a model-`if`→`ifElse`, a `.map`→`forEach`, an element former
+      (`div`/`nav`/…) → `V.el` with its attrs/children lifted. Anything it does not recognise —
+      a helper call, `link`, `styleSheet`, a Resource view, a bare expression — is wrapped as
+      `static` (scope-free) or `dynNode` (scope-dependent) `Html` and reconciled through the
+      verified `diff`. So the lift is total over standard notation: fine-grained where provable,
+      verified diff everywhere else. -/
   partial def viewLift (m : Ident) (stx : Syntax) : MacroM Syntax := do
     match stx with
     | `(text $e:term) =>
-        if viewMentions m.getId e then return (← `(Qed.V.dyn (fun $m => $e))) else return stx
+        if viewMentions m.getId e then return (← `(Qed.V.dyn (fun $m => $e)))
+        else return (← `(Qed.V.text $e))
     | `(if $c:term then $t:term else $e:term) =>
         let t' : Term := ⟨← viewLift m t⟩
         let e' : Term := ⟨← viewLift m e⟩
-        if viewMentions m.getId c && (looksLikeView t' || looksLikeView e') then
+        if viewMentions m.getId c then
           -- `if c then true else false` re-uses the original `Decidable`/`Bool` condition,
           -- so the lift works whether `c` is a `Bool` (`==`) or a decidable `Prop` (`<`).
           return (← `(Qed.V.ifElse (fun $m => if $c then true else false) $t' $e'))
         else
           return (← `(if $c then $t' else $e'))
     | _ =>
-        -- a `match` on the model → the verified diff fallback (`dynNode`). Lift the arms
-        -- first (so a `.map`/`if` inside an arm still becomes `forEach`/`ifElse`); the
-        -- scrutinee's `m` is then closed by the `dynNode` lambda.
+        -- a bare string literal is static text (coerces via `Coe String (View …)`)
+        if stx.isStrLit?.isSome then return stx
+        -- a `match` on the model → the verified diff fallback (`dynNode`)
         if stx.getKind == kMatch && viewMentions m.getId stx then
-          let lifted := stx.setArgs (← stx.getArgs.mapM (viewLift m))
-          let st : Term := ⟨lifted⟩
-          return (← `(Qed.V.dynNode (fun $m => Qed.View.render $st $m)))
-        -- an element whose children are `xs.map (fun x => row)` → `forEach`
+          let raw : Term := ⟨stx⟩
+          return (← `(Qed.V.dynNode (fun $m => $raw)))
+        -- an element whose children are `xs.map (fun x => row)` → `forEach` (or a keyless `dynNode`)
         if let some out ← tryForEach m stx then return out
-        -- a scope-dependent attribute or event helper → `dynAttr` / `onClick'` / …
-        if let some out ← tryAttr m stx then return out
-        -- otherwise recurse structurally
-        if stx.getArgs.isEmpty then return stx
-        else return stx.setArgs (← stx.getArgs.mapM (viewLift m))
+        -- a known element former `tag [attrs] [kids]` → `V.el`, attrs and kids lifted
+        if let some out ← tryElement m stx then return out
+        -- anything else (helper call / link / styleSheet / Resource view / bare expr) → diff
+        catchAll m stx
+
+  /-- A known element former (`div`/`nav`/`ul`/…) applied to *list-literal* attrs and children →
+      `Qed.V.el "tag" attrs kids`, with attrs lifted (dynamic ones become signals) and each child
+      lifted. `none` if `stx` is not such a former, or its attrs/children are not list literals (so
+      the caller's `catchAll` wraps the whole element instead). -/
+  partial def tryElement (m : Ident) (stx : Syntax) : MacroM (Option Syntax) := do
+    let some (fn, args) := asApp? (unparen stx) | return none
+    let some n := (match fn with | .ident _ _ nm _ => some nm | _ => none) | return none
+    let some tag := elementTag? n | return none
+    if args.size > 2 then return none
+    let empty : Term ← `([])
+    let attrsO ← if args.size ≥ 1 then liftAttrList m args[0]! else pure (some empty)
+    let kidsO  ← if args.size ≥ 2 then liftKidList  m args[1]! else pure (some empty)
+    match attrsO, kidsO with
+    | some attrsL, some kidsL =>
+        let tagL : Term := ⟨Syntax.mkStrLit tag⟩
+        return some (← `(Qed.V.el $tagL $attrsL $kidsL))
+    | _, _ => return none
+
+  /-- Lift each attribute in a list literal: a scope-dependent helper becomes a signal/bound attr
+      (`tryAttr`), a static one is kept (and coerces `Attr → VAttr`). `none` if not a literal. -/
+  partial def liftAttrList (m : Ident) (lst : Syntax) : MacroM (Option Term) := do
+    if lst.getKind != kList || lst.getArgs.size != 3 then return none
+    let lifted ← lst.getArgs[1]!.getSepArgs.mapM fun a => do
+      let aT : Term := ⟨a⟩
+      -- A static attribute is wrapped in the `VAttr.stat` constructor (rather than left to the
+      -- `Attr → VAttr` coercion, which can't fire while the element's scope `σ` is still a
+      -- metavar). Covers every helper uniformly — `cls`/`attr`/`href`/`onClick`/`key`/a `Style`.
+      match ← tryAttr m a with
+      | some a' => pure (⟨a'⟩ : Term)
+      | none    => `(Qed.VAttr.stat $aT)
+    return some (← `([$lifted,*]))
+
+  /-- Lift each child in a list literal (recursively). `none` if not a literal. -/
+  partial def liftKidList (m : Ident) (lst : Syntax) : MacroM (Option Term) := do
+    if lst.getKind != kList || lst.getArgs.size != 3 then return none
+    let lifted ← lst.getArgs[1]!.getSepArgs.mapM fun k => do pure (⟨← viewLift m k⟩ : Term)
+    return some (← `([$lifted,*]))
+
+  /-- The verified-diff fallback: wrap an `Html` subtree the lift can't decompose as a `static`
+      node (scope-free) or a `dynNode` (scope-dependent). Always well-typed, since the body is
+      written in `Html` notation. -/
+  partial def catchAll (m : Ident) (stx : Syntax) : MacroM Syntax := do
+    let e : Term := ⟨stx⟩
+    if viewMentions m.getId stx then return (← `(Qed.V.dynNode (fun $m => $e)))
+    else return (← `(Qed.V.static $e))
 
   /-- `cls (… m …)` → `dynAttr "class" (fun m => …)`, `attr k (… m …)` → `dynAttr k …`,
       `onClick (… m …)` → `onClick' (fun m => …)`, etc. (`none` if not such a helper). -/
@@ -716,7 +774,7 @@ mutual
         let some (xs, funArg) := asMap? pargs[1]! | return none
         let some (binder, body) := asFun? funArg | return none
         let binderId : Ident := ⟨binder⟩
-        let attrsL : Term := ⟨← viewLift m pargs[0]!⟩
+        let attrsL : Term ← (match ← liftAttrList m pargs[0]! with | some a => pure a | none => pure ⟨pargs[0]!⟩)
         let xsT    : Term := ⟨xs⟩
         let tagL   : Term := ⟨Syntax.mkStrLit tag⟩
         -- A keyed row (an element carrying `key …`) becomes a fine-grained `forEach`. Anything

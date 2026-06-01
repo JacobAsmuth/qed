@@ -6,8 +6,7 @@
   Pure Lean; the browser entry is `Examples/TemplateWeb.lean`.
 -/
 import Qed
-open Qed (App Style css styleSheet)
-open Qed.V
+open Qed
 
 namespace TemplateDemo
 
@@ -55,7 +54,7 @@ def banner : Style := css "padding: 7px; border-radius: 4px; &:hover { opacity: 
 -- interpolation, dynamic attributes, scope-reading events. `ui` builds the app from it.
 def app : App Model Msg := ui init update fun m =>
     div [cls "demo"] [
-      static (styleSheet [banner]),
+      styleSheet [banner],
       div [banner, attr "id" "styled-banner"] [text "scoped style"],
       h1 [] "View template",
       -- a counter: the count is a single bound text node
@@ -70,7 +69,7 @@ def app : App Model Msg := ui init update fun m =>
         else p [cls "live"] [text s!"count is {m.count}"],
       -- a controlled input bound to `name`, with a greeting shown once it's non-empty
       input [value m.name, onInput (Msg.setName ·)],
-      showIf (fun m => m.name != "") (p [cls "greeting"] [text s!"Hello, {m.name}!"]),
+      if m.name != "" then p [cls "greeting"] [text s!"Hello, {m.name}!"] else text "",
       -- a keyed list of todos: each row shows its text, toggles `done` on click
       button [onClick .add] "add todo",
       ul [cls "todos"] (m.todos.map fun t =>

@@ -18,7 +18,7 @@ def main : IO Unit := do
   IO.println (App.renderInitial app)
   -- sanity (stderr): a few reachable states render as expected.
   let render (label : String) (m : Model) : IO Unit :=
-    IO.eprintln s!"{label} (count={m.count}): {(view m).render}"
+    IO.eprintln s!"{label} (count={m.count}): {(app.view m).render}"
   let s0 := init
   let s1 := update s0 .increment
   let s2 := update s1 .increment

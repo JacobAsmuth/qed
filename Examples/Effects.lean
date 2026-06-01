@@ -77,30 +77,31 @@ def effects (m : Model) : Msg → Cmd Msg
   | .typeSearch s => Cmd.afterKeyed "search" 200 (.runSearch s) -- debounce: only the last survives
   | _             => .none
 
-def view (m : Model) : Html Msg :=
-  div [cls "app"] [
-    div [cls "counter"] [
-      button [cls "dec", onClick .dec] "−",
-      span   [cls "count", attr "id" "count"] [toString m.count],
-      button [cls "inc", onClick .inc] "+"
-    ],
-    input  [attr "id" "title-input", cls "title", value m.title, onInput .editTitle, placeholder "page title"],
-    button [cls "apply",  onClick .applyTitle] "Set title",
-    button [cls "roll",   onClick .roll]       "Roll d6",
-    button [cls "delay",  onClick .delayed]    "Delayed",
-    button [cls "ping",   onClick .ping]       "Ping",
-    button [cls "pick",   onClick .pick]       "Pick file",
-    button [cls "focus",  onClick .focusTitle] "Focus title",
-    button [cls "save",   onClick .saveBatch]  "Save (batch)",
-    input  [cls "search", value m.query, onInput .typeSearch, placeholder "debounced search"],
-    span   [cls "searches", attr "id" "searches"] [toString m.searches],
-    div [cls "status", attr "id" "status"] [m.status]
-  ]
+-- One transition: the state change (`update`) plus the effect it triggers (`effects`).
+def transition (m : Model) (msg : Msg) : Model × Cmd Msg :=
+  let m' := update m msg; (m', effects m' msg)
 
 -- `start` hydrates the count from localStorage before the first render; the generated
 -- `onPort` routes inbound port messages.
 def app : App Model Msg :=
-  application init update view (effects := effects) (onPort := some onPort)
-    (start := Cmd.storageGet "count" .loaded)
+  ui init transition (onPort := some onPort) (start := Cmd.storageGet "count" .loaded) fun m =>
+    div [cls "app"] [
+      div [cls "counter"] [
+        button [cls "dec", onClick .dec] "−",
+        span   [cls "count", attr "id" "count"] [text (toString m.count)],
+        button [cls "inc", onClick .inc] "+"
+      ],
+      input  [attr "id" "title-input", cls "title", value m.title, onInput .editTitle, placeholder "page title"],
+      button [cls "apply",  onClick .applyTitle] "Set title",
+      button [cls "roll",   onClick .roll]       "Roll d6",
+      button [cls "delay",  onClick .delayed]    "Delayed",
+      button [cls "ping",   onClick .ping]       "Ping",
+      button [cls "pick",   onClick .pick]       "Pick file",
+      button [cls "focus",  onClick .focusTitle] "Focus title",
+      button [cls "save",   onClick .saveBatch]  "Save (batch)",
+      input  [cls "search", value m.query, onInput .typeSearch, placeholder "debounced search"],
+      span   [cls "searches", attr "id" "searches"] [text (toString m.searches)],
+      div [cls "status", attr "id" "status"] [text m.status]
+    ]
 
 end Effects

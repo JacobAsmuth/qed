@@ -31,28 +31,23 @@ def update (m : Model) : Msg → Model
   | .decrement => { m with count := if 0 < m.count then m.count - 1 else m.count }
   | .reset     => { m with count := 0 }
 
-/-- The view — reads like markup, but every event is a typed `Msg`, so a typo
-    such as `onClick .incremnt` would not compile. -/
-def view (m : Model) : Html Msg :=
+-- The view reads like markup, but every event is a typed `Msg`, so a typo such as
+-- `onClick .incremnt` would not compile. `ui` builds the app from it.
+def app : App Model Msg := ui init update fun m =>
   div [] [
     div [cls "counter"] [
       button [onClick .decrement] "−",
-      span   [cls "count"]        [toString m.count],
+      span   [cls "count"]        [text (toString m.count)],
       button [onClick .increment] "+",
       button [onClick .reset]     "reset"
     ],
-    -- This input is never rebuilt by an update: the diff engine only patches the
-    -- count text above, so whatever you type here keeps its focus and cursor.
+    -- Only the count above is a binding, so typing here keeps its focus and cursor.
     input [placeholder "type here — focus survives every click"],
-    -- A memoized subtree: its key never changes, so after the first render the diff
-    -- skips it — the driver never touches this DOM again, no matter how you click.
-    lazy "banner" (div [cls "banner", attr "id" "banner"] ["built once, then memoized"]),
-    -- A memoized subtree keyed on the count: when the count changes the key changes, so
-    -- the diff patches its content in place (`lazyPatch`) rather than skipping.
-    lazy (toString m.count) (div [cls "echo", attr "id" "echo"] [s!"count is {m.count}"])
+    -- A static subtree: built once, then never touched again.
+    div [cls "banner", attr "id" "banner"] ["built once, then memoized"],
+    -- The count text is a binding: it updates in place while its node stays put.
+    div [cls "echo", attr "id" "echo"] [text s!"count is {m.count}"]
   ]
-
-def app : App Model Msg := sandbox init update view
 
 -- Dream-API #3: we state the safety property; the framework generates and
 -- machine-checks that *every* transition preserves it. No proof written by hand.

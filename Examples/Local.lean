@@ -133,6 +133,9 @@ def view (m : Model) : Html Msg :=
       ]).toList
   ]
 
-def app : App Model Msg := application init update view (locals := [Widget.reg, Tag.reg])
+-- This view binds local-state component hosts (`localMountWith`) and computes a `let` before
+-- the markup, so it goes in as an `Html` view via `View.ofHtml` (reconciled by the verified
+-- diff, which preserves the local hosts) rather than the fine-grained lift.
+def app : App Model Msg := mkApp init update (View.ofHtml view) (locals := [Widget.reg, Tag.reg])
 
 end Local

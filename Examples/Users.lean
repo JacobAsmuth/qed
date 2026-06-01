@@ -29,16 +29,16 @@ jsonStruct Profile where
 structure Model where
   route   : R
   query   : String
-  profile : Option (Except String Profile)   -- the fetched profile on a user page
+  profile : Resource Profile   -- the fetched profile on a user page
   focused : Bool
 
-def init : Model := { route := .home, query := "", profile := none, focused := false }
+def init : Model := { route := .home, query := "", profile := .idle, focused := false }
 
 inductive Msg where
-  | urlChanged (path : String)               -- the URL changed (startup/link/back/push)
+  | urlChanged (path : String)            -- the URL changed (startup/link/back/push)
   | typeQuery (s : String)
-  | submit                                   -- run the search → navigate
-  | gotProfile (res : Except String Profile) -- the fetch resolved
+  | submit                                -- run the search → navigate
+  | gotProfile (r : Resource Profile)     -- the fetch resolved (ok or failed, one message)
   | focus
   | blur
   | key (k : String)
@@ -46,11 +46,11 @@ inductive Msg where
 def update (m : Model) : Msg → Model
   | .urlChanged path =>
       let route : R := (Router.fromURL path).getD .home
-      -- entering a user page clears the old profile; `effects` refetches
-      { m with route, profile := match route with | .user _ => none | _ => m.profile }
+      -- entering a user page shows the loading state; `effects` fires the fetch
+      { m with route, profile := match route with | .user _ => .loading | _ => m.profile }
   | .typeQuery s    => { m with query := s }
   | .submit         => m                     -- navigation is the effect below
-  | .gotProfile res => { m with profile := some res }
+  | .gotProfile r   => { m with profile := r }
   | .focus          => { m with focused := true }
   | .blur           => { m with focused := false }
   | .key k          => if k == "Escape" then { m with query := "" } else m
@@ -61,8 +61,7 @@ def effects (m : Model) : Msg → Cmd Msg
       else .pushUrl (Router.toURL (R.user m.query.trim))
   | .urlChanged _ =>
       match m.route with
-      | .user name => Cmd.getJson s!"/api/users/{name}"
-                        (fun p => .gotProfile (.ok p)) (fun e => .gotProfile (.error e))
+      | .user name => Resource.fetch s!"/api/users/{name}" Msg.gotProfile
       | _          => .none
   | _ => .none
 
@@ -81,10 +80,9 @@ def view (m : Model) : Html Msg :=
     | .user name =>
         div [cls "profile"] [
           h1 [] [name],
-          match m.profile with
-          | none            => p [cls "loading"] ["Loading…"]
-          | some (.ok prof) => p [cls "bio"] [prof.bio]
-          | some (.error e) => p [cls "error"] ["Error: ", e]
+          m.profile.view (fun prof => p [cls "bio"] [prof.bio])
+            (loading := p [cls "loading"] ["Loading…"])
+            (failed  := fun e => p [cls "error"] ["Error: ", e])
         ]
   ]
 

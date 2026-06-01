@@ -56,6 +56,14 @@ inductive Cmd (msg : Type) where
       two arguments, then dispatches `onResult result`. Backs `storageGet`, `paste`,
       `after`, `randomInt`, `pickFile`, … -/
   | fxResult (kind a b : String) (onResult : String → msg)
+  /-- Open a WebSocket to `url`, addressed by `key` (so later `wsSend`/`wsClose` find
+      it). Its lifecycle dispatches messages: `onMessage data` for each frame, and the
+      optional `onOpen`/`onClose`/`onError data`. Like `stream`, the callbacks are
+      persistent — they fire for the life of the connection, not once. A `url` beginning
+      with `/` is resolved against the page origin (`ws://`/`wss://` to match the scheme).
+      Use `Cmd.wsOpen`/`Cmd.wsSend`/`Cmd.wsClose` below rather than this constructor. -/
+  | socket (key url : String) (onMessage : String → msg)
+           (onOpen : Option msg) (onClose : Option msg) (onError : Option (String → msg))
 
 /-! Relabel the messages an effect will produce (functoriality in `msg`). -/
 mutual
@@ -69,6 +77,9 @@ def Cmd.map (f : α → β) : Cmd α → Cmd β
   | .port n p                  => .port n p
   | .fx k a b c                => .fx k a b c
   | .fxResult k a b onResult   => .fxResult k a b (fun s => f (onResult s))
+  | .socket key url onMsg onOpen onClose onErr =>
+      .socket key url (fun d => f (onMsg d)) (onOpen.map f) (onClose.map f)
+              (onErr.map (fun g d => f (g d)))
 /-- Relabel each effect in a batch (mutual recursion gives termination). -/
 def Cmd.mapList (f : α → β) : List (Cmd α) → List (Cmd β)
   | []      => []
@@ -156,6 +167,24 @@ def Cmd.setSignal (name value : String) : Cmd msg := .fx "signal.set" name value
     Dispatches a uniform integer in `[lo, hi]`. -/
 def Cmd.randomInt (lo hi : Int) (onInt : Int → msg) : Cmd msg :=
   .fxResult "random.int" (toString lo) (toString hi) fun s => onInt ((s.toInt?).getD lo)
+
+/-! **WebSockets.** A connection is addressed by a `key` you choose; open it once, then
+    `wsSend`/`wsClose` it by that key. Inbound frames and lifecycle events arrive as
+    messages, so the socket lives behind the same pure `update` as everything else. -/
+
+/-- Open a WebSocket to `url` under `key`, routing each inbound frame to `onMessage`.
+    `onOpen`/`onClose`/`onError` are optional lifecycle messages. A `url` starting with
+    `/` is resolved against the page origin (scheme `ws`/`wss` follows `http`/`https`). -/
+def Cmd.wsOpen (key url : String) (onMessage : String → msg)
+    (onOpen : Option msg := Option.none) (onClose : Option msg := Option.none)
+    (onError : Option (String → msg) := Option.none) : Cmd msg :=
+  .socket key url onMessage onOpen onClose onError
+
+/-- Send `data` on the socket opened under `key` (dropped if it isn't open). -/
+def Cmd.wsSend (key data : String) : Cmd msg := .fx "ws.send" key data ""
+
+/-- Close the socket opened under `key` (a no-op if there is none). -/
+def Cmd.wsClose (key : String) : Cmd msg := .fx "ws.close" key "" ""
 
 /-! **Files.** `download` saves `content` as a file; `pickFile` opens the OS picker and
     reads the chosen file's text. -/

@@ -89,6 +89,12 @@
       // Keyed timers (Cmd.afterKeyed / Cmd.cancel): scheduling a key clears its pending
       // timeout first, so a debounce keeps only the last one.
       const timers = {};
+      // Open WebSockets, keyed by the app's chosen key (Cmd.wsOpen/wsSend/wsClose).
+      // Lifecycle events go back to Lean over the reserved "__ws" port as a JSON
+      // {key, event, data}, where the driver routes them to the socket's callbacks.
+      const sockets = {};
+      const wsEvent = (key, event, data) =>
+        globalThis.__qed.send('__ws', JSON.stringify({ key, event, data: data || '' }));
       // Native effects: the framework's typed Cmds (Cmd.storageSet, .copy, .focus, …)
       // arrive here as a `kind` switch. Fire-and-forget.
       globalThis.__qed.effect = (kind, a, b, c) => {
@@ -107,6 +113,24 @@
           case 'dom.scrollIntoView': { const el = document.getElementById(a); if (el) el.scrollIntoView({ behavior: 'smooth' }); break; }
           case 'document.title': document.title = a; break;
           case 'signal.set': globalThis.__qed.setSignal(a, b); break;
+          case 'ws.open': {
+            // a = key, b = url. A url starting with "/" is resolved against the page
+            // origin, matching the scheme (wss under https).
+            let url = b;
+            if (url.startsWith('/'))
+              url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + url;
+            try {
+              const sock = new WebSocket(url);
+              sockets[a] = sock;
+              sock.onopen    = () => wsEvent(a, 'open');
+              sock.onmessage = (e) => wsEvent(a, 'message', String(e.data));
+              sock.onerror   = () => wsEvent(a, 'error', 'socket error');
+              sock.onclose   = () => { delete sockets[a]; wsEvent(a, 'close'); };
+            } catch (err) { wsEvent(a, 'error', String(err)); }
+            break;
+          }
+          case 'ws.send': { const s = sockets[a]; if (s && s.readyState === 1) s.send(b); break; }
+          case 'ws.close': { const s = sockets[a]; if (s) s.close(); break; }
           case 'file.download': {
             const url = URL.createObjectURL(new Blob([c], { type: b || 'text/plain' }));
             const el = document.createElement('a');

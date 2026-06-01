@@ -152,7 +152,7 @@ def linkWasm (outDir : FilePath) (prod : Bool) : IO Bool := do
   let allC ← collect ".lake" "c"
   -- Each of these modules carries its own `main`; link only the chosen web entry.
   let entryC := ((wr.splitOn ".").getLastD "") ++ ".c"   -- e.g. "ChatWeb.c"
-  let altMains := ["Native.c", "Cli.c", "UsersSSR.c", "TemplateSSR.c", "BookshelfSSR.c", "Web.c", "ChatWeb.c", "SignupWeb.c", "BookingWeb.c", "TodoWeb.c", "UsersWeb.c", "LocalWeb.c", "EffectsWeb.c", "BookshelfWeb.c", "Bench.c", "BenchAppWeb.c", "SignalsWeb.c", "TemplateWeb.c", "BenchScalarWeb.c", "BenchScalarDiffWeb.c", "BenchListWeb.c", "BenchListDiffWeb.c"].filter (· ≠ entryC)
+  let altMains := ["Native.c", "Cli.c", "UsersSSR.c", "TemplateSSR.c", "BookshelfSSR.c", "Web.c", "ChatWeb.c", "SignupWeb.c", "BookingWeb.c", "TodoWeb.c", "UsersWeb.c", "LocalWeb.c", "EffectsWeb.c", "SocketWeb.c", "LiveWeb.c", "BookshelfWeb.c", "Bench.c", "BenchAppWeb.c", "SignalsWeb.c", "TemplateWeb.c", "BenchScalarWeb.c", "BenchScalarDiffWeb.c", "BenchListWeb.c", "BenchListDiffWeb.c"].filter (· ≠ entryC)
   let cfiles := allC.filter (fun p =>
     (p.toString.splitOn "build/ir").length > 1 && (p.fileName.getD "") ∉ altMains)
   IO.FS.createDirAll outDir
@@ -318,6 +318,14 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "bookshelf_ssr_test.mjs").pathExists) then
     step "running end-to-end SSR tests (bookshelf)"
     if (← sh "node" #["test/bookshelf_ssr_test.mjs"]) != 0 then failed := true
+  -- WebSockets: open/send/receive/close over a real socket against an echo server.
+  if (← (FilePath.mk "test" / "socket_test.mjs").pathExists) then
+    step "running end-to-end WebSocket tests (socket)"
+    if (← sh "node" #["test/socket_test.mjs"]) != 0 then failed := true
+  -- Live handlers: a message embedding model state stays current across updates.
+  if (← (FilePath.mk "test" / "live_test.mjs").pathExists) then
+    step "running end-to-end live-handler tests (live)"
+    if (← sh "node" #["test/live_test.mjs"]) != 0 then failed := true
   if failed then return 1 else return 0
 
 def cmdClean : IO UInt32 := do

@@ -22,6 +22,14 @@ import Std.Data.HashMap
 
 namespace Qed
 
+/-- The lifecycle callbacks of an open WebSocket, kept by its key so an inbound
+    event (delivered over the reserved `"__ws"` port) can find the right message. -/
+structure SocketHandlers (msg : Type) where
+  onMessage : String → msg
+  onOpen    : Option msg
+  onClose   : Option msg
+  onError   : Option (String → msg)
+
 /-- The two event-handler tables, rebuilt each render. -/
 structure Handlers (msg : Type) where
   click : IO.Ref (Array msg)
@@ -682,6 +690,9 @@ def run (app : App Model Msg) : IO Unit := do
   let respCbRef  ← IO.mkRef (#[] : Array (Except String String → Msg))
   -- Native `fxResult` callbacks (storageGet/after/randomInt/paste/pickFile …), persistent.
   let effectCbRef ← IO.mkRef (#[] : Array (String → Msg))
+  -- Open WebSockets, keyed by the app's chosen key. Inbound events arrive on the
+  -- reserved `"__ws"` port and are routed through these callbacks.
+  let socketCbRef ← IO.mkRef (∅ : Std.HashMap String (SocketHandlers Msg))
   -- Forward reference to the dispatcher, so an effect (`Cmd.now`) — or a local
   -- component bubbling an output — can feed a message back through the loop.
   let dispatchRef ← IO.mkRef (fun (_ : Msg) => (pure () : IO Unit))
@@ -745,6 +756,9 @@ def run (app : App Model Msg) : IO Unit := do
         | some f => (← dispatchRef.get) (f path)
         | none   => pure ()
     | .port name payload => Dom.portSend name payload
+    | .socket key url onMessage onOpen onClose onError => do
+        socketCbRef.modify (·.insert key { onMessage, onOpen, onClose, onError })
+        Dom.effect "ws.open" key url ""
     | .fx kind a b c => Dom.effect kind a b c
     | .fxResult kind a b onResult => do
         let cs ← effectCbRef.get; effectCbRef.set (cs.push onResult)
@@ -793,10 +807,29 @@ def run (app : App Model Msg) : IO Unit := do
     | some onResult => dispatchMsg (onResult result)
     | none          => pure ()
   -- An inbound port message (app JS called `__qed.send`): route it through `onPort`.
+  -- The reserved `"__ws"` channel carries WebSocket lifecycle events (a JSON
+  -- `{key, event, data}`) and is dispatched through the socket's callbacks instead.
   let portRecv : String → String → IO Unit := fun name payload => do
-    match app.onPort with
-    | some f => match f name payload with | some m => dispatchMsg m | none => pure ()
-    | none   => pure ()
+    if name == "__ws" then
+      match Json.parse payload with
+      | .ok j =>
+          let str (k : String) : String := ((j.get? k).bind (·.str?)).getD ""
+          let key := str "key"
+          match (← socketCbRef.get)[key]? with
+          | some h =>
+              match str "event" with
+              | "message" => dispatchMsg (h.onMessage (str "data"))
+              | "open"    => match h.onOpen with | some m => dispatchMsg m | none => pure ()
+              | "error"   => match h.onError with | some f => dispatchMsg (f (str "data")) | none => pure ()
+              | "close"   =>
+                  socketCbRef.modify (·.erase key)
+                  match h.onClose with | some m => dispatchMsg m | none => pure ()
+              | _         => pure ()
+          | none => pure ()
+      | .error _ => pure ()
+    else match app.onPort with
+      | some f => match f name payload with | some m => dispatchMsg m | none => pure ()
+      | none   => pure ()
   -- Serialize the keyed store to a JSON object {fullKey: <state>} (states are already
   -- JSON, kept here as string values), and restore it, re-rendering every instance.
   let snapshotLocals : IO String := do

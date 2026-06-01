@@ -205,22 +205,34 @@ Qed ships typed `Cmd`s for the things you reach for most: `storageSet`/`storageG
 `setTitle`, `randomInt`, `download`/`pickFile`, `getJson`/`postJson`/`stream`, and `batch` to run
 several at once. A `Cmd` you want to run at startup goes in the `(start := …)` argument.
 
-When an effect isn't built in — a hardware API, a WebSocket — you don't patch the framework. You
-reach for a port. The `ports` command generates the outbound `Cmd`s and the inbound `onPort`, and
-you wire the actual API up in a few lines of JS:
+A WebSocket works the same way. `Cmd.wsOpen` opens one under a key you choose and routes each
+frame to a message; `Cmd.wsSend`/`Cmd.wsClose` address it by that key afterwards. Its open, close,
+and error events are messages too, so the connection stays behind `update` like everything else:
+
+```lean
+def transition (m : Model) : Msg → Model × Cmd Msg
+  | .connect    => also m (Cmd.wsOpen "feed" "/live" .received (onOpen := .opened) (onClose := .closed))
+  | .send       => also { m with draft := "" } (Cmd.wsSend "feed" m.draft)
+  | .received t => still { m with log := m.log.push t }
+  | .opened     => still { m with online := true }
+  | .closed     => still { m with online := false }
+```
+
+When something genuinely isn't built in — IndexedDB, a hardware API, a third-party widget — you
+don't patch the framework. You reach for a port. The `ports` command generates the outbound `Cmd`s
+and the inbound `onPort`, and you wire the actual API up in a few lines of JS:
 
 ```lean
 ports where
-  wsSend : Command             -- outbound: `wsSend (c : Command) : Cmd msg`
-  wsRecv : Event => .received  -- inbound:  "wsRecv" payload decoded into `Msg.received`
+  saveDoc  : Doc          -- outbound: `saveDoc (d : Doc) : Cmd msg`
+  docSaved : Id => .saved  -- inbound:  "docSaved" payload decoded into `Msg.saved`
 ```
 ```js
-const ws = new WebSocket(url);
-globalThis.__qed.ports["wsSend"] = (p) => ws.send(p);
-ws.onmessage = (e) => globalThis.__qed.send("wsRecv", e.data);
+globalThis.__qed.ports["saveDoc"] = (p) => idbPut("docs", JSON.parse(p)).then((id) => __qed.send("docSaved", id));
 ```
 
-`Examples/Effects.lean` exercises the whole battery; `test/effects_test.mjs` drives it.
+`Examples/Effects.lean` exercises the battery and `Examples/Socket.lean` is a WebSocket echo
+client; `test/effects_test.mjs` and `test/socket_test.mjs` drive them.
 
 ### Lists and components
 

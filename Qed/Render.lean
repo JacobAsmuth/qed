@@ -52,19 +52,30 @@ def normalizeAttrs (attrs : List (Attr msg)) : List (Attr msg) :=
   let merged  := if classes.isEmpty then [] else [Attr.cls (String.intercalate " " classes)]
   merged ++ dedupAttrs (attrs.filter (fun | .cls _ => false | _ => true))
 
+/-- Drop characters that could break out of an attribute *name* (quotes, spaces, `<`, `>`,
+    `=`, `/`, control chars), keeping only the URL/HTML-safe name characters. Attribute names
+    are normally literals; this closes the injection an `attr (userKey) v` would otherwise open. -/
+def sanitizeKey (k : String) : String :=
+  String.mk (k.toList.filter (fun c => c.isAlphanum || c == '-' || c == '_' || c == ':' || c == '.'))
+
+/-- HTML void elements: rendered with no children and no closing tag (`<input>`, not
+    `<input></input>`), so server markup parses and hydrates the way the browser builds it. -/
+def voidTags : List String :=
+  ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]
+
 /-- Render one attribute, threading the handler table. An `onClick` is emitted as
-    a `data-qed-click="<id>"` attribute, where `<id>` indexes the message that the
+    a `data-qed-on-click="<id>"` attribute, where `<id>` indexes the message that the
     JS delegation listener will dispatch back. -/
 def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .cls c     => (s!" class=\"{escapeHtml c}\"", hs)
-  | .attr k v  => (s!" {k}=\"{escapeHtml v}\"", hs)
-  | .flag k present => (if present then s!" {k}=\"{k}\"" else "", hs)
+  | .attr k v  => (s!" {sanitizeKey k}=\"{escapeHtml v}\"", hs)
+  | .flag k present => (if present then s!" {sanitizeKey k}=\"{sanitizeKey k}\"" else "", hs)
   | .key _     => ("", hs)   -- a reconciliation key is virtual-DOM-only; it never renders
   | .on event m  => (s!" data-qed-on-{event}=\"{hs.size}\"", hs.push m)   -- no-arg handler id, for hydration
   | .onValue _ _ => ("", hs)   -- value handlers carry no static form; the driver wires them on hydration
   | .localCell key comp _ _ => (s!" data-qed-local=\"{escapeHtml (localKey comp key)}\"", hs)   -- marks the host; the driver fills it
   | .signalBind name        => (s!" data-qed-signal=\"{escapeHtml name}\"", hs)                 -- driver binds its text to the signal
-  | .signalAttr _ attr value => (s!" {attr}=\"{escapeHtml value}\"", hs)                        -- driver binds this attr to the signal
+  | .signalAttr _ attr value => (s!" {sanitizeKey attr}=\"{escapeHtml value}\"", hs)             -- driver binds this attr to the signal
 
 /-- Render a list of attributes left-to-right, threading the handler table. -/
 def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg
@@ -86,6 +97,8 @@ mutual
         if tag == "style" || tag == "script" then
           let raw := String.join (children.map fun | .text s => s | _ => "")
           (s!"<{tag}{attrStr}>{raw}</{tag}>", hs1)
+        else if voidTags.contains tag then
+          (s!"<{tag}{attrStr}>", hs1)   -- void element: no children, no closing tag
         else
           let (childStr, hs2) := renderChildren hs1 children
           (s!"<{tag}{attrStr}>{childStr}</{tag}>", hs2)

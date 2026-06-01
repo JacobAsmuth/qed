@@ -203,16 +203,22 @@ def axiomClean : IO Bool := do
 def effectsCovered : IO Bool := do
   let qh ← frameworkHome
   let runtimePath := qh / "Qed" / "Runtime.lean"
+  let driverPath  := qh / "Qed" / "Driver.lean"
   let hostPath    := qh / "runtime" / "host.js"
   unless (← runtimePath.pathExists) && (← hostPath.pathExists) do return true  -- not the framework layout
   let runtime ← IO.FS.readFile runtimePath
+  let driver  ← if (← driverPath.pathExists) then IO.FS.readFile driverPath else pure ""
   let host    ← IO.FS.readFile hostPath
   -- the first quoted token after each `marker`
   let after (marker close src : String) : List String :=
     match src.splitOn marker with
     | _ :: rest => rest.map (fun c => (c.splitOn close).headD "")
     | []        => []
+  -- kinds come from `Cmd` smart constructors (`.fx`/`.fxResult` in Runtime) AND from the
+  -- driver itself (`Dom.effect "…"`, e.g. `signal.set`/`ws.open`/`event.listen`) — both must
+  -- have a host.js case, so scan both files.
   let emitted := (after ".fx \"" "\"" runtime) ++ (after ".fxResult \"" "\"" runtime)
+              ++ (after "Dom.effect \"" "\"" driver) ++ (after "Dom.effectResult \"" "\"" driver)
   let handled := after "case '" "'" host
   let missing := emitted.filter (fun k => k != "" && !handled.contains k)
   for k in missing do

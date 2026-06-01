@@ -234,6 +234,11 @@ macro_rules
       let mut outDefs  : Array (TSyntax `command) := #[]
       let mut inTuples : Array (TSyntax `term) := #[]
       for ch in chans do
+        -- `__`-prefixed names are reserved for the framework's own channels (e.g. `__ws`,
+        -- which carries WebSocket events); reject them so an app channel can't be hijacked.
+        if let some nm := (ch.raw.find? (·.isIdent)).map (·.getId.toString) then
+          if nm.startsWith "__" then
+            Macro.throwErrorAt ch s!"ports: channel name '{nm}' is reserved (names starting with `__`)"
         match ch with
         | `(portChan| $name:ident : $ty:term => $rhs:term) =>
             -- inbound: ("name", fun p => (fromJson-decoded payload).map ctor)

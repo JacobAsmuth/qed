@@ -582,11 +582,23 @@ instance : FromJson Json := ⟨.ok⟩
 instance : FromJson JsonNumber := ⟨fun j => j.num?.elim (.error "expected a number") .ok⟩
 instance : FromJson Bool := ⟨fun j => j.bool?.elim (.error "expected a boolean") .ok⟩
 instance : FromJson String := ⟨fun j => j.str?.elim (.error "expected a string") .ok⟩
+/-- The integer a JSON number denotes, if it is one — applying the exponent, so a backend's
+    `1e2` or `100.0` decodes to `100` (a non-zero fractional part is *not* an integer). -/
+def JsonNumber.toInt? (n : JsonNumber) : Option Int :=
+  if 0 ≤ n.exponent then some (n.mantissa * (10 ^ n.exponent.toNat))
+  else
+    let d : Int := 10 ^ (-n.exponent).toNat
+    if n.mantissa % d == 0 then some (n.mantissa / d) else none
+
 instance : FromJson Int :=
-  ⟨fun j => match j with | .num ⟨m, 0⟩ => .ok m | _ => .error "expected an integer"⟩
+  ⟨fun j => match j with
+    | .num n => (n.toInt?).elim (.error "expected an integer") .ok
+    | _      => .error "expected an integer"⟩
 instance : FromJson Nat :=
   ⟨fun j => match j with
-    | .num ⟨m, 0⟩ => if 0 ≤ m then .ok m.toNat else .error "expected a non-negative integer"
+    | .num n => match n.toInt? with
+                | some m => if 0 ≤ m then .ok m.toNat else .error "expected a non-negative integer"
+                | none   => .error "expected an integer"
     | _ => .error "expected a natural number"⟩
 instance [FromJson α] : FromJson (List α) :=
   ⟨fun j => match j with | .arr es => es.mapM fromJson | _ => .error "expected an array"⟩

@@ -74,6 +74,7 @@ def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
   | .cls c          => Dom.setAttribute node "class" c
   | .attr "value" v => Dom.setValue node v
   | .attr k v       => Dom.setAttribute node k v
+  | .flag "checked" present => Dom.setChecked node present   -- the live property, not the initial-state attribute
   | .flag k present => if present then Dom.setAttribute node k k else Dom.removeAttribute node k
   | .key _          => pure ()   -- a reconciliation key never touches the DOM
   -- Events delegate by name: ensure the host has a (capture-phase) listener for this event,

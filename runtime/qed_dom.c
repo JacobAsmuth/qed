@@ -77,6 +77,11 @@ EM_JS(void, qed_js_set_value, (int node, const char *v), {
   if (el && el.value !== s) el.value = s; /* guard keeps the caret when unchanged */
 });
 
+EM_JS(void, qed_js_set_checked, (int node, int on), {
+  var el = globalThis.__qed.nodes[node];
+  if (el) el.checked = !!on;
+});
+
 /* The current local date as ISO YYYY-MM-DD (Lean parses it into a Qed.Date). The
    returned buffer is malloc'd by stringToNewUTF8 and freed by the caller. */
 EM_JS(char *, qed_js_today, (void), {
@@ -287,6 +292,12 @@ LEAN_EXPORT lean_object *qed_dom_set_value(uint32_t node, lean_object *v, lean_o
   (void) world;
   qed_js_set_value((int) node, lean_string_cstr(v));
   lean_dec(v);
+  return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *qed_dom_set_checked(uint32_t node, uint8_t on, lean_object *world) {
+  (void) world;
+  qed_js_set_checked((int) node, (int) on);
   return lean_io_result_mk_ok(lean_box(0));
 }
 

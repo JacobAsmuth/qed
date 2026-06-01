@@ -54,6 +54,12 @@ opaque clearHandlers (node : Node) : IO Unit
 @[extern "qed_dom_set_value"]
 opaque setValue (node : Node) (value : String) : IO Unit
 
+/-- Set a checkbox/radio's live `checked` *property* (not just the attribute), so a
+    controlled box reflects the model even after the user has toggled it — the attribute
+    reflects only the initial state, the property the live one. -/
+@[extern "qed_dom_set_checked"]
+opaque setChecked (node : Node) (on : Bool) : IO Unit
+
 /-- The current local date as an ISO `YYYY-MM-DD` string (the browser's `new Date()`),
     for `Cmd.now` to parse into a `Qed.Date` and thread into the model. -/
 @[extern "qed_dom_today"]

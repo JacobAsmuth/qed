@@ -136,6 +136,18 @@ macro_rules
           | `(routeAlt| $c:ident $[($bs:ident : $bts:term)]* $[=> $seg:str]?) =>
               pure (false, c, bs, bts, seg)
           | _ => Macro.throwErrorAt alt "router: expected `[*] ctor (arg : T)* (=> \"segment\")?`")
+        -- A parameter is a URL segment verbatim, so only `String` round-trips *by proof* (a
+        -- `Nat`/`Int` would need `(toString n).toNat? = some n`, which has no library lemma, so
+        -- the generated `round_trip` would not close). Reject other types with a
+        -- clear message instead of a confusing error inside the generated code. (Iterate a plain
+        -- `Array` copy so `bts` keeps the `TSyntaxArray` type the splices below need.)
+        let btsArr : Array (TSyntax `term) := bts
+        for bt in btsArr do
+          match bt with
+          | `(String) => pure ()
+          | _ => Macro.throwErrorAt bt
+                   "router: a route parameter must have type `String`; decode richer types from \
+                    the String in your `update` (a verified non-String URL round-trip isn't supported)"
         let ctorId := mkIdent (t.getId ++ c.getId)
         -- leading segment(s): "" ⇒ index (no segment); a string ⇒ those segments
         -- (split on `/`, so `=> "books/archive"` is two segments and stays reachable);

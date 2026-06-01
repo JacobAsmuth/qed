@@ -693,10 +693,12 @@ def run (app : App Model Msg) : IO Unit := do
   -- Stream callbacks persist across renders (a stream outlives many of them).
   let chunkCbRef ← IO.mkRef (#[] : Array (String → Msg))
   let doneCbRef  ← IO.mkRef (#[] : Array Msg)
-  -- HTTP response callbacks (each request's result arrives later), persistent.
-  let respCbRef  ← IO.mkRef (#[] : Array (Except String String → Msg))
-  -- Native `fxResult` callbacks (storageGet/after/randomInt/paste/pickFile …), persistent.
-  let effectCbRef ← IO.mkRef (#[] : Array (String → Msg))
+  -- One-shot callbacks (an HTTP response, an `fxResult`) fire exactly once, so they are kept in
+  -- a map keyed by a monotonic id and ERASED when they fire — memory stays bounded by the number
+  -- in flight, not by how many requests/effects the app has ever issued.
+  let respCbRef  ← IO.mkRef (∅ : Std.HashMap Nat (Except String String → Msg))
+  let effectCbRef ← IO.mkRef (∅ : Std.HashMap Nat (String → Msg))
+  let cbNextRef  ← IO.mkRef (0 : Nat)   -- the id source for both one-shot tables
   -- Open WebSockets, keyed by the app's chosen key. Inbound events arrive on the
   -- reserved `"__ws"` port and are routed through these callbacks.
   let socketCbRef ← IO.mkRef (∅ : Std.HashMap String (SocketHandlers Msg))
@@ -755,8 +757,9 @@ def run (app : App Model Msg) : IO Unit := do
         | some d => (← dispatchRef.get) (onNow d)
         | none   => pure ()
     | .request method url body onResult => do
-        let rs ← respCbRef.get; respCbRef.set (rs.push onResult)
-        Dom.httpSend method url body (UInt32.ofNat rs.size)
+        let id ← cbNextRef.modifyGet (fun n => (n, n + 1))
+        respCbRef.modify (·.insert id onResult)
+        Dom.httpSend method url body (UInt32.ofNat id)
     | .pushUrl path => do
         Dom.pushPath path
         match app.onUrlChange with
@@ -768,8 +771,9 @@ def run (app : App Model Msg) : IO Unit := do
         Dom.effect "ws.open" key url ""
     | .fx kind a b c => Dom.effect kind a b c
     | .fxResult kind a b onResult => do
-        let cs ← effectCbRef.get; effectCbRef.set (cs.push onResult)
-        Dom.effectResult kind a b (UInt32.ofNat cs.size)
+        let id ← cbNextRef.modifyGet (fun n => (n, n + 1))
+        effectCbRef.modify (·.insert id onResult)
+        Dom.effectResult kind a b (UInt32.ofNat id)
     | .batch _ => pure ()   -- unreachable: flattened away below
   let perform : Cmd Msg → IO Unit := fun cmd => (Cmd.flatten cmd).forM performLeaf
   -- Re-entrancy guard. Removing a focused node during a patch fires `blur` *synchronously*, whose
@@ -811,7 +815,7 @@ def run (app : App Model Msg) : IO Unit := do
   -- A native `fxResult` effect resolved: dispatch its callback with the result string.
   let effectDone : UInt32 → String → IO Unit := fun id result => do
     match (← effectCbRef.get)[id.toNat]? with
-    | some onResult => dispatchMsg (onResult result)
+    | some onResult => effectCbRef.modify (·.erase id.toNat); dispatchMsg (onResult result)
     | none          => pure ()
   -- An inbound port message (app JS called `__qed.send`): route it through `onPort`.
   -- The reserved `"__ws"` channel carries WebSocket lifecycle events (a JSON
@@ -876,7 +880,7 @@ def run (app : App Model Msg) : IO Unit := do
       | none     => pure ()
     httpDone := fun id ok text => do
       match (← respCbRef.get)[id.toNat]? with
-      | some f => dispatchMsg (f (if ok then .ok text else .error text))
+      | some f => respCbRef.modify (·.erase id.toNat); dispatchMsg (f (if ok then .ok text else .error text))
       | none   => pure ()
     urlChanged := fun path => do
       match app.onUrlChange with

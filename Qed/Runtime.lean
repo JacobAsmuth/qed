@@ -532,10 +532,15 @@ the server and client output are the same function of the model, not two impleme
 can drift. (The current client mount replaces the server markup — a brief swap; flash-free
 adopt-in-place hydration is a later refinement, see README.) -/
 
+/-- The app's view at an arbitrary model as an HTML string — the per-request SSR primitive:
+    a server computes the model for the request (route, fetched data) and renders it. -/
+def App.renderModel (app : App Model Msg) (m : Model) : String :=
+  Html.renderWith app.locals (app.view m)
+
 /-- The app's initial view as an HTML string — its `view` at the initial model, with local
     hosts filled by their initial view. This is what a server emits into `#app`. -/
 def App.renderInitial (app : App Model Msg) : String :=
-  Html.renderWith app.locals (app.view app.init.1)
+  app.renderModel app.init.1
 
 /-- Wrap rendered `#app` content in a complete static HTML document that loads the WASM
     bundle, which mounts the live app over the pre-rendered markup. -/

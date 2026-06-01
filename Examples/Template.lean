@@ -61,6 +61,9 @@ def update (m : Model) : Msg → Model
 -- collisions), and a typo'd reference (`bnner`) would be a compile error.
 def banner : Style := css "padding: 7px; border-radius: 4px; &:hover { opacity: 0.9 }"
 
+-- `view%` lifts this into the fine-grained path; the lift is now TOTAL — anything it can't
+-- make fine-grained (a keyless `.map`, a `match`, a free-form subtree) degrades to a `dynNode`
+-- reconciled by the verified diff, never a compile error — so it reads like an ordinary view.
 def template : View Model Msg :=
   view% fun m =>
     div [cls "demo"] [
@@ -103,7 +106,11 @@ def template : View Model Msg :=
           if t.editing
             then input [cls "editor", value t.text, onInput (Msg.editText t.id ·)]
             else span [cls "label", onClick (.startEdit t.id)] [text t.text]
-        ])
+        ]),
+      -- a KEYLESS `.map` (no `key`): the lift can't make it a fine-grained `forEach`, so it
+      -- degrades to a `dynNode` reconciled by the verified positional diff — it still compiles
+      -- and renders, just without per-row signals. (Total fallback: `.map` never fails to lift.)
+      ul [cls "keyless"] (m.todos.map fun t => li [] [text t.text])
     ]
 
 def app : App Model Msg := templated init update template

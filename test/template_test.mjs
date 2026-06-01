@@ -64,6 +64,10 @@ try {
   // scoped styling: the <style> emitted by styleSheet applies to the hashed class
   check('scoped style applied (padding from styleSheet)',
     await page.$eval('#styled-banner', (e) => getComputedStyle(e).padding), '7px');
+  // a keyless `.map` still compiles + renders (it degraded to a diffed dynNode list)
+  check('keyless map renders the items (total fallback)',
+    await page.$$eval('.demo ul.keyless li', (ls) => ls.map((l) => l.textContent)),
+    ['learn Lean', 'write a template']);
   check('structural row 0 is the done branch (<p>)', await structTag(0), 'P');
   check('structural row 1 is the open branch (<span>)', await structTag(1), 'SPAN');
 

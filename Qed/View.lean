@@ -725,21 +725,31 @@ mutual
         if pargs.size != 2 then return none
         let some (xs, funArg) := asMap? pargs[1]! | return none
         let some (binder, body) := asFun? funArg | return none
-        let some (_, bodyArgs) := asApp? body | return none
-        if bodyArgs.size < 1 then return none
-        let some (keyV, newAttrs) ← extractKey bodyArgs[0]! | return none
-        -- rebuild the row body with the key attribute removed, then lift it at the row scope
-        let body' := body.setArg 1 (body.getArgs[1]!.setArg 0 newAttrs)
         let binderId : Ident := ⟨binder⟩
         let attrsL : Term := ⟨← viewLift m pargs[0]!⟩
-        let rowL   : Term := ⟨← viewLift binderId body'⟩
         let xsT    : Term := ⟨xs⟩
         let tagL   : Term := ⟨Syntax.mkStrLit tag⟩
-        -- a per-list signal namespace from this `.map`'s source position, so two lists over the
-        -- same row keys don't share signal names (which are a process-wide map).
-        let pos    := (stx.getPos?.map (·.byteIdx)).getD 0
-        let prefT  : Term := ⟨Syntax.mkStrLit (toString pos ++ "@")⟩
-        return some (← `(Qed.V.forEach $tagL (fun $m => $xsT) (fun $binderId => $keyV) $rowL (attrs := $attrsL) (sigPrefix := $prefT)))
+        -- A keyed row (an element carrying `key …`) becomes a fine-grained `forEach`. Anything
+        -- else — a keyless `.map`, or a row that isn't a keyed element — degrades to a `dynNode`
+        -- that renders the list as `Html` and reconciles it through the verified positional
+        -- `diff`. So `.map` never fails to compile; it just isn't fine-grained without a key.
+        let keyOpt ← (match asApp? body with
+                      | some (_, bargs) => if bargs.size ≥ 1 then extractKey bargs[0]! else pure none
+                      | none            => pure none)
+        match keyOpt with
+        | some (keyV, newAttrs) =>
+            let body' := body.setArg 1 (body.getArgs[1]!.setArg 0 newAttrs)
+            let rowL : Term := ⟨← viewLift binderId body'⟩
+            -- a per-list signal namespace from this `.map`'s source position, so two lists over
+            -- the same row keys don't share signal names (which are a process-wide map).
+            let pos   := (stx.getPos?.map (·.byteIdx)).getD 0
+            let prefT : Term := ⟨Syntax.mkStrLit (toString pos ++ "@")⟩
+            return some (← `(Qed.V.forEach $tagL (fun $m => $xsT) (fun $binderId => $keyV) $rowL (attrs := $attrsL) (sigPrefix := $prefT)))
+        | none =>
+            let rowL : Term := ⟨← viewLift binderId body⟩
+            return some (← `(Qed.V.dynNode (fun $m =>
+              Qed.Html.element $tagL (($attrsL).map (Qed.VAttr.eval $m))
+                (($xsT).map (fun $binderId => Qed.View.render $rowL $binderId)).toList)))
     | _ => return none
 end
 

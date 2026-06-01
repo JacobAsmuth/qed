@@ -244,6 +244,7 @@ inductive VState (σ : Type) (msg : Type) where
       and the last `Html` rows (to diff on a shape change). -/
   | list (node : Dom.Node) (keys : IO.Ref (Array String))
       (sigs : IO.Ref (Array (String × String))) (rows : IO.Ref (List (Html msg)))
+      (inst : String)   -- per-instance signal namespace, so two lists never share signal names
   /-- An opaque embedded `Html` subtree (`View.static`) — not fine-grained-updated. -/
   | stat (node : Dom.Node)
   /-- A scope-bound `Html` subtree (`View.dynNode`): the diff escape hatch. Holds a *mutable*
@@ -303,11 +304,14 @@ partial def buildView (h : Handlers msg) (cells : CondCells σ msg) :
   | .keyedList tag attrs keys sigs rowsHtml, s => do
       let node ← Dom.createElement tag
       applyAttrs h node (attrs.map (VAttr.eval s))
-      let sg := sigs s
+      -- a per-instance signal namespace (the container's unique node id), so two lists over
+      -- the same row keys — e.g. a reusable list component used twice — never collide.
+      let inst := s!"§{node}§"
+      let sg := (sigs s).map fun (nm, v) => (inst ++ nm, v)
       for (nm, v) in sg do Dom.effect "signal.set" nm v ""   -- seed signal values first…
-      let rs := rowsHtml s
+      let rs := (rowsHtml s).map (Html.prefixSignals inst)
       for r in rs do Dom.appendChild node (← buildDom h r)   -- …so bindSignal reads them
-      return (node, .list node (← IO.mkRef (keys s)) (← IO.mkRef sg) (← IO.mkRef rs))
+      return (node, .list node (← IO.mkRef (keys s)) (← IO.mkRef sg) (← IO.mkRef rs) inst)
 
 /-- Walk the template against the new scope, mutating leaf cells and patching only what
     changed. `parent`/`index` locate the current node for the one case that replaces it (a
@@ -368,12 +372,12 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
           nref.set n2
       | p => applyToDom h parent index node p        -- otherwise patch in place (verified diff)
       last.set newHtml
-  | .keyedList tag attrs keys sigs rowsHtml, s, .list node lastKeys lastSigs lastRows => do
+  | .keyedList tag attrs keys sigs rowsHtml, s, .list node lastKeys lastSigs lastRows inst => do
       if (keys s) == (← lastKeys.get) then
         -- value-only update: the key set/order is unchanged, so no row was added, removed,
         -- or moved. Push only the rows whose signal value changed — a direct `setSignal`
         -- (JS Map write), no `Html` built, no diff, no `childAt`. This is the list win.
-        let newSigs := sigs s
+        let newSigs := (sigs s).map fun (nm, v) => (inst ++ nm, v)
         let oldSigs ← lastSigs.get
         for i in [0:newSigs.size] do
           let (nm, v) := newSigs[i]!
@@ -382,10 +386,10 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
       else
         -- the keys changed (add/remove/reorder): seed signal values first (so freshly built
         -- rows bind to them), then reconcile structure through the verified diff.
-        let newSigs := sigs s
+        let newSigs := (sigs s).map fun (nm, v) => (inst ++ nm, v)
         for (nm, v) in newSigs do Dom.effect "signal.set" nm v ""
         let evAttrs := attrs.map (VAttr.eval s)
-        let newRows := rowsHtml s
+        let newRows := (rowsHtml s).map (Html.prefixSignals inst)
         applyToDom h parent index node
           (diff (.element tag evAttrs (← lastRows.get)) (.element tag evAttrs newRows))
         lastKeys.set (keys s); lastSigs.set newSigs; lastRows.set newRows

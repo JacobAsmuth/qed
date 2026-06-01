@@ -129,4 +129,24 @@ mutual
     | c :: cs => Html.map f c :: Html.mapChildren f cs
 end
 
+/-- Prefix every signal name (`signalBind`/`signalAttr`) in a subtree. Signals are a
+    process-wide name→node map, so two renders of the same template would share names and
+    overwrite each other; the driver gives each fine-grained list a per-instance prefix
+    (its container's node id) and applies this to its rows so instances stay disjoint. -/
+def Attr.prefixSignal (pfx : String) : Attr msg → Attr msg
+  | .signalBind n     => .signalBind (pfx ++ n)
+  | .signalAttr n a v => .signalAttr (pfx ++ n) a v
+  | other             => other
+
+mutual
+  partial def Html.prefixSignals (pfx : String) : Html msg → Html msg
+    | .text s                     => .text s
+    | .element tag attrs children =>
+        .element tag (attrs.map (Attr.prefixSignal pfx)) (Html.prefixSignalsList pfx children)
+    | .lazy key sub               => .lazy key (Html.prefixSignals pfx sub)
+  partial def Html.prefixSignalsList (pfx : String) : List (Html msg) → List (Html msg)
+    | []      => []
+    | c :: cs => Html.prefixSignals pfx c :: Html.prefixSignalsList pfx cs
+end
+
 end Qed

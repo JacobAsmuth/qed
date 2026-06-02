@@ -34,7 +34,7 @@ if (spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.BenchAppWeb
   console.error('build failed'); process.exit(1);
 }
 
-const qServer = spawn('python3', [`${ROOT}runtime/serve.py`, String(QPORT), `${ROOT}.qed/dev`], { stdio: 'inherit' });
+const qServer = spawn('python3', ['-m', 'http.server', String(QPORT), '--directory', `${ROOT}.qed/dev`], { stdio: 'inherit' });
 const rServer = spawn('python3', ['-m', 'http.server', String(RPORT), '--directory', `${ROOT}test`], { stdio: 'ignore' });
 await sleep(1000);
 

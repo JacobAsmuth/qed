@@ -27,7 +27,7 @@ const profiles = {
   ada:  { name: 'Ada',  bio: 'Wrote the first algorithm.' },
   alan: { name: 'Alan', bio: 'Asked what machines can decide.' },
 };
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm',
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
                '.json': 'application/json', '.css': 'text/css' };
 const server = createServer(async (req, res) => {
   const { pathname } = new URL(req.url, 'http://x');

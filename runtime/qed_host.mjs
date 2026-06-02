@@ -18,6 +18,8 @@ export function boot() {
   const urlChanged  = (path) => app.qed_url_changed(path, W);
   const localDispatch    = (key, id) => app.qed_local_dispatch(key, id, W);
   const localDispatchStr = (key, id, v) => app.qed_local_dispatch_str(key, id, v, W);
+  const localSnapshot = () => $.ioVal(app.qed_local_snapshot(W));   // local state → JSON string
+  const localRestore  = (s) => app.qed_local_restore(s, W);
   const effectDone  = (id, result) => app.qed_effect_done(id, result, W);
   const portRecv    = (name, payload) => app.qed_port_recv(name, payload, W);
 
@@ -119,7 +121,8 @@ export function boot() {
   }
   ensureEvent('click');
   window.addEventListener('popstate', () => urlChanged(location.pathname));
-  window.qed = { init, dispatch, dispatchStr, urlChanged, setSignal: g.setSignal };
+  window.qed = { init, dispatch, dispatchStr, urlChanged, setSignal: g.setSignal,
+                 snapshot: localSnapshot, restore: localRestore };
 
   app.__main(W);    // Qed.run app — set up the runtime
   init();           // initial render + startup effects

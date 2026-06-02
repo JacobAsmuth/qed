@@ -21,8 +21,6 @@ const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.C
   { stdio: 'inherit' });
 if (build.status !== 0) { console.error('build failed'); process.exit(1); }
 
-// 2. Swap in the chat page (the build stages the counter index.html).
-cpSync(`${ROOT}runtime/chat.html`, `${SERVE}/index.html`);
 mkdirSync(SHOTS, { recursive: true });
 
 // 3. Mock LLM + static server.

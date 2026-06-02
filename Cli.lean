@@ -216,15 +216,17 @@ def jsRoot : IO String := do
   | some r => return r
   | none   => return (← env "QED_WEB_ROOT").getD "Web"
 
-/-- The page that loads the transpiled app. In dev it polls `__build_id` to live-reload. -/
+/-- The page that loads the transpiled app. In dev it polls `__build_id` to live-reload.
+    Paths are absolute (and `<base href="/">` is set) so deep-link routes like `/users/ada`
+    still resolve the module and assets correctly. -/
 def indexHtml (dev : Bool) : String :=
   let reload := if dev then
-    "<script>(function(){let v=null;setInterval(async()=>{try{const t=await (await fetch('__build_id',{cache:'no-store'})).text();if(v&&v!==t)location.reload();v=t;}catch(e){}},700)})()</script>\n"
+    "<script>(function(){let v=null;setInterval(async()=>{try{const t=await (await fetch('/__build_id',{cache:'no-store'})).text();if(v&&v!==t)location.reload();v=t;}catch(e){}},700)})()</script>\n"
   else ""
-  "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">" ++
+  "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><base href=\"/\">" ++
   "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>qed</title></head>\n" ++
-  "<body><div id=\"app\"></div>\n" ++ reload ++
-  "<script type=\"module\" src=\"./qed_host.mjs\"></script>\n</body>\n</html>\n"
+  "<body><div id=\"app\">loading…</div>\n" ++ reload ++
+  "<script type=\"module\" src=\"/qed_host.mjs\"></script>\n</body>\n</html>\n"
 
 /-- The transpiler entry set: the app's `main` (`Qed.run app`) plus the framework's 13
     `@[export]` driver functions. This is fixed and app-agnostic — no per-app shim. -/

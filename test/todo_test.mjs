@@ -18,7 +18,7 @@ const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.T
   { stdio: 'inherit' });
 if (build.status !== 0) { console.error('build failed'); process.exit(1); }
 
-const server = spawn('python3', [`${ROOT}runtime/serve.py`, String(PORT), SERVE], { stdio: 'inherit' });
+const server = spawn('python3', ['-m', 'http.server', String(PORT), '--directory', SERVE], { stdio: 'inherit' });
 await sleep(900);
 
 let failures = 0;

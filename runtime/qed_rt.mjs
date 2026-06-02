@@ -162,10 +162,15 @@ export const String_validateUTF8 = (_ba) => 1;
 export const ByteArray_mkEmpty = (_c) => new Uint8Array(0);
 export const ByteArray_push = (ba, b) => { const r = new Uint8Array(ba.length + 1); r.set(ba); r[ba.length] = Number(b); return r; };
 export const ByteArray_size = (ba) => BigInt(ba.length);
-export const ByteArray_getx33 = (ba, i) => BigInt(ba[Number(i)]);   // get!
+export const ByteArray_getx33 = (ba, i) => ba[Number(i)];   // get! → UInt8 (a Number)
 export const ByteArray_copySlice = (src, so, dst, dso, len, _ex) => {
-  const r = dst.slice(); const s = Number(so), d = Number(dso), n = Number(len);
-  for (let i = 0; i < n; i++) r[d + i] = src[s + i]; return r;
+  // copySlice may grow the destination (it backs `ByteArray.append`), and a Uint8Array
+  // is fixed-length, so allocate one large enough rather than writing past `dst`.
+  const s = Number(so), d = Number(dso), n = Number(len);
+  const r = new Uint8Array(Math.max(dst.length, d + n));
+  r.set(dst);
+  for (let i = 0; i < n; i++) r[d + i] = src[s + i];
+  return r;
 };
 
 // ---- mutable refs + IO plumbing (EStateM.Result.ok protocol) ----------------

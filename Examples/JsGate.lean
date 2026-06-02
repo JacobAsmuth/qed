@@ -7,6 +7,7 @@
 -/
 import Qed
 import Examples.JsProbe
+import Examples.Users
 open Qed
 
 namespace JsGate
@@ -48,6 +49,18 @@ def arrP (i : Nat) : String :=
   let b := a.filter (fun x => x % 3 == 0)
   s!"{a.toList}|{b.size}|{a.foldl (· + ·) 0}|{a.reverse.toList}"
 
+def routes : Array String := #["/", "/users/ada", "/users/alan", "/users/a%20b", "/nope/x"]
+/-- The verified `router` — percent-codec + `fromURL` parse + `toURL` print round-trip. -/
+def routeP (i : Nat) : String :=
+  match (Router.fromURL (routes.getD i "") : Option Users.R) with
+  | some r => Router.toURL r
+  | none   => "none"
+
+/-- The decoded segment list `fromURL` feeds to `parse` — isolates split/filter/decodeSeg. -/
+def segP (i : Nat) : String :=
+  let p := routes.getD i ""
+  toString (((p.splitOn "/").filter (· ≠ "")).map decodeSeg)
+
 /-- A probe dispatcher: `run probe i` is the i-th case of the named probe. -/
 def run (probe i : Nat) : String :=
   match probe with
@@ -58,6 +71,8 @@ def run (probe i : Nat) : String :=
   | 4 => jsonRt i
   | 5 => dateP i
   | 6 => arrP i
+  | 7 => routeP i
+  | 8 => segP i
   | _ => ""
 
 def counts (probe : Nat) : Nat :=
@@ -69,11 +84,13 @@ def counts (probe : Nat) : Nat :=
   | 4 => jsons.size
   | 5 => dates.size
   | 6 => 12
+  | 7 => routes.size
+  | 8 => routes.size
   | _ => 0
 
-def probeCount : Nat := 7
+def probeCount : Nat := 9
 
-def names : Array String := #["render", "diff", "arith", "string", "json", "date", "array"]
+def names : Array String := #["render", "diff", "arith", "string", "json", "date", "array", "router", "seg"]
 
 /-- A JSON string literal, so outputs containing tabs/newlines survive the line format. -/
 def jsonStr (s : String) : String :=

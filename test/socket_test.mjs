@@ -36,7 +36,7 @@ const frame = (str) => {
   return Buffer.concat([head, payload]);
 };
 
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm',
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
                '.json': 'application/json', '.css': 'text/css' };
 const server = createServer(async (req, res) => {
   const { pathname } = new URL(req.url, 'http://x');

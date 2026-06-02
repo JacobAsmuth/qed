@@ -378,10 +378,13 @@ markup on load. `Examples/UsersSSR.lean` renders a route per request.
 ## Performance
 
 A keyed list updates each changed row's text and attributes straight at the node (they're
-signals), so a value-only update touches no diff. The update step is proven to match a full
-re-render (`patch_render`), and `qed check` enforces it. `test/bench_react.mjs` measures it
-head-to-head against React on the same workload (10,000 rows); the fine-grained update path
-turns a value-only change into O(changed bindings) with no tree walk.
+signals), so a value-only update touches no diff — it's O(changed bindings), with no tree
+walk. The update step is proven to match a full re-render (`patch_render`), and `qed check`
+enforces it.
+
+One current limit: the renderer and diff recurse once per child, so a single list with many
+thousands of rows can exceed the JavaScript call stack. Ordinary lists are fine; making the
+hot paths iterative is on the list.
 
 ## The `qed` command
 

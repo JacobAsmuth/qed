@@ -21,7 +21,7 @@ async function measure(root, port) {
   if (spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=${root} ./qed build --dev`], { stdio: 'inherit' }).status !== 0) {
     console.error('build failed'); process.exit(1);
   }
-  const server = spawn('python3', [`${ROOT}runtime/serve.py`, String(port), `${ROOT}.qed/dev`], { stdio: 'ignore' });
+  const server = spawn('python3', ['-m', 'http.server', String(port), '--directory', `${ROOT}.qed/dev`], { stdio: 'ignore' });
   await sleep(900);
   try {
     const page = await browser.newPage();

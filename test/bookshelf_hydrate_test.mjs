@@ -24,7 +24,7 @@ if (spawnSync('bash', ['-lc', `cd '${ROOT}' && lake build bookshelf_ssr`], { std
 const ssr = (path) => spawnSync('bash', ['-lc', `cd '${ROOT}' && lake exe bookshelf_ssr '${path}' 2>/dev/null`], { encoding: 'utf8' }).stdout;
 
 let apiHits = 0;
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm', '.css': 'text/css', '.json': 'application/json' };
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm', '.css': 'text/css', '.json': 'application/json' };
 const server = createServer(async (req, res) => {
   const { pathname } = new URL(req.url, 'http://x');
   const head = (code, type) => res.writeHead(code, {

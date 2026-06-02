@@ -36,6 +36,11 @@ def update (m : Model) : Msg → Model
                       | some appt => { m with booked := some appt.who.val }
                       | none      => m
 
+-- A booking can only be recorded after the clock has reported, since `.submit` does
+-- nothing while `today` is `none`. Stated once, machine-checked for every message —
+-- the discharger splits the nested `match`es in `.submit` on its own.
+invariant bookedNeedsToday : (fun m => m.booked.isSome → m.today.isSome) preserved_by update
+
 -- `Cmd.now` reads the clock once at startup (the `start` effect) and delivers `.gotToday`.
 def app : App Model Msg :=
   ui { today := none, draft := Appt.Draft.empty, booked := none } update

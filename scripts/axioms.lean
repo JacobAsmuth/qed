@@ -8,8 +8,12 @@
 -/
 import Qed
 import Examples.Counter
+import Examples.Booking
+import Examples.Chat
 
-#print axioms counterSafe            -- state-machine invariant
+#print axioms counterSafe            -- state-machine invariant (numeric bound, pure)
+#print axioms Booking.bookedNeedsToday -- invariant: a precondition for a state (pure, auto)
+#print axioms Chat.streamSafe        -- invariant: effect safety on an effectful transition (`:=` proof)
 #print axioms Qed.diff_apply         -- VDOM diff/patch correctness
 #print axioms Qed.diffChildren_apply -- child reconcile, any matcher (positional + keyed), any lengths
 #print axioms Qed.applyValues_render -- View template value-patch = full re-render (stable structure)

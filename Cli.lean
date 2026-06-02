@@ -307,55 +307,58 @@ def cmdBuild (prod : Bool) : IO UInt32 := do
   IO.println (green s!"✓ build complete → {outDir}")
   return 0
 
-/-- The app module to transpile to JS. A project sets `QED_JS_ROOT`; it must expose
-    the convention decls `initModel`, `step`, `view`, `diff`, `patch` (monomorphic). -/
-def jsRoot : IO String := return (← env "QED_JS_ROOT").getD "App"
+/-- The app's *web entry* module — the one whose `main` is `Qed.run app` (what
+    `qed new` scaffolds). Set `QED_JS_ROOT` for the framework's own examples. -/
+def jsRoot : IO String := do
+  match ← env "QED_JS_ROOT" with
+  | some r => return r
+  | none   => return (← env "QED_WEB_ROOT").getD "Web"
 
 def indexHtmlJs : String :=
   "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">" ++
   "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>qed</title></head>\n" ++
-  "<body><div id=\"app\"></div>\n<script type=\"module\">\n" ++
-  "  import * as app from './app.mjs';\n  import { mount } from './qed_driver.mjs';\n" ++
-  "  mount(app, document.getElementById('app'), document);\n" ++
-  "</script>\n</body>\n</html>\n"
+  "<body><div id=\"app\"></div>\n<script type=\"module\" src=\"./qed_host.mjs\"></script>\n</body>\n</html>\n"
 
-/-- `qed buildjs` — transpile the app's verified Lean (init/view/update/diff) to plain
-    JavaScript and stage a runnable bundle in `dist-js/`. No WASM, no emscripten, no
-    cross-origin-isolation. The pure framework runs as transpiled Lean; only the small
-    DOM driver is hand-written JS. -/
+/-- The transpiler entry set: the app's `main` (`Qed.run app`) plus the framework's 13
+    `@[export]` driver functions. This is fixed and app-agnostic — no per-app shim. -/
+def driverEntries : Array String := #[
+  "main:__main",
+  "Qed.qedInit:qed_init", "Qed.qedDispatch:qed_dispatch", "Qed.qedDispatchStr:qed_dispatch_str",
+  "Qed.qedStreamChunk:qed_stream_chunk", "Qed.qedStreamDone:qed_stream_done",
+  "Qed.qedHttpDone:qed_http_done", "Qed.qedUrlChanged:qed_url_changed",
+  "Qed.qedLocalDispatch:qed_local_dispatch", "Qed.qedLocalDispatchStr:qed_local_dispatch_str",
+  "Qed.qedLocalSnapshot:qed_local_snapshot", "Qed.qedLocalRestore:qed_local_restore",
+  "Qed.qedEffectDone:qed_effect_done", "Qed.qedPortRecv:qed_port_recv"]
+
+/-- `qed buildjs` — transpile the app AND the verified framework/driver (render, the
+    proven diff, the whole `Qed.run` loop) to plain JavaScript and stage a runnable
+    bundle in `dist-js/`. No WASM, no emscripten, no cross-origin-isolation. The only
+    hand-written JS is the DOM externs + event/effect host (`qed_dom.mjs`/`qed_host.mjs`),
+    the irreducible FFI. Works for any app whose web entry is `Qed.run app`. -/
 def cmdBuildJs (dev : Bool) : IO UInt32 := do
   let mod ← jsRoot
   step s!"lake build {mod}  +  qedjs (transpiler)"
   if (← sh "lake" #["build", mod, "qedjs"]) != 0 then IO.eprintln (red "✗ lake build failed"); return 1
   let outDir : FilePath := "dist-js"
   IO.FS.createDirAll outDir
-  step "transpiling Lean IR → JavaScript"
+  step "transpiling Lean IR → JavaScript (app + framework + driver)"
   let qedjs := ((".lake" : FilePath) / "build" / "bin" / "qedjs").toString
-  -- The convention decls live in the module's namespace (its last path component,
-  -- overridable via QED_JS_NS).
-  let ns := (← env "QED_JS_NS").getD ((mod.splitOn ".").getLastD mod)
-  let entries := #[s!"{ns}.initModel:initModel", s!"{ns}.step:step", s!"{ns}.view:view",
-                   s!"{ns}.diff:diff", s!"{ns}.patch:patch"]
   let appOut := (outDir / "app.mjs").toString
-  -- The transpiler emits only the reachable closure (IR-level tree-shaking); `--min`
-  -- drops comments and indentation. `--dev` keeps it readable.
-  let minArgs := if dev then #[] else #["--min"]
-  if (← sh "lake" (#["env", qedjs] ++ minArgs ++ #[appOut, mod, "--"] ++ entries)) != 0 then
+  let minArgs := if dev then #[] else #["--min"]   -- the transpiler already tree-shakes
+  if (← sh "lake" (#["env", qedjs] ++ minArgs ++ #[appOut, mod, "--"] ++ driverEntries)) != 0 then
     IO.eprintln (red "✗ transpile failed"); return 1
-  step "staging runtime + driver + index.html"
-  for f in ["qed_rt.mjs", "qed_driver.mjs"] do
+  step "staging runtime + DOM externs + host + index.html"
+  for f in ["qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"] do
     IO.FS.writeFile (outDir / f) (← IO.FS.readFile (← runtimeFile f))
   IO.FS.writeFile (outDir / "index.html") indexHtmlJs
-  -- Optional extra squeeze of the hand-written runtime/driver if esbuild is present.
   unless dev do
     if (← onPath "esbuild") then
-      step "minifying runtime with esbuild"
-      for f in ["app.mjs", "qed_rt.mjs", "qed_driver.mjs"] do
+      step "minifying with esbuild"
+      for f in ["app.mjs", "qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"] do
         let p := (outDir / f).toString
         discard <| sh "bash" #["-c", s!"esbuild {p} --minify --format=esm --outfile={p}.min && mv {p}.min {p}"]
-  -- Report the bundle's gzipped size.
   let (_, sz) ← shOut "bash" #["-c",
-    s!"cat {outDir}/app.mjs {outDir}/qed_rt.mjs {outDir}/qed_driver.mjs | gzip -c | wc -c"]
+    s!"cat {outDir}/*.mjs | gzip -c | wc -c"]
   IO.println (green s!"✓ JS build complete → {outDir} (no WASM) — {sz.trim} bytes gzipped")
   return 0
 
@@ -444,6 +447,16 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "live_test.mjs").pathExists) then
     step "running end-to-end live-handler tests (live)"
     if (← sh "node" #["test/live_test.mjs"]) != 0 then failed := true
+  -- JS transpiler — the differential gate: transpiled-from-Lean functions must be
+  -- byte-identical to native Lean (render, diff, JSON, Date, strings, closures…).
+  if (← (FilePath.mk "test" / "js_gate_test.mjs").pathExists) then
+    step "running differential gate (transpiled JS == native Lean)"
+    if (← sh "node" #["test/js_gate_test.mjs"]) != 0 then failed := true
+  -- JS transpiler — the FULL driver (no WASM): `qed buildjs` then drive it in a browser.
+  if (← (FilePath.mk "test" / "js_driver_browser_test.mjs").pathExists) then
+    step "building JS bundle + running transpiled-driver browser test"
+    if (← cmdBuildJs (dev := false)) != 0 then failed := true
+    else if (← sh "node" #["test/js_driver_browser_test.mjs"]) != 0 then failed := true
   if failed then return 1 else return 0
 
 def cmdClean : IO UInt32 := do

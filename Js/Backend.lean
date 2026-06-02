@@ -57,7 +57,10 @@ partial def reach (env : Environment) : List Name → Array Name → Array Name
     else
       let seen := seen.push n
       match findEnvDecl env n with
-      | some (.fdecl (body := b) ..) => reach env (rest ++ (callees b #[]).toList) seen
+      | some (.fdecl (body := b) ..) =>
+          -- follow call-graph callees, plus the init fn of an `initialize x ← act` global
+          let extra := (callees b #[]).toList ++ (getInitFnNameFor? env n).toList
+          reach env (rest ++ extra) seen
       | _ => reach env rest seen
 
 /-! ## Names -/
@@ -165,9 +168,19 @@ partial def emitBody (c : Ctx) (d : Nat) : FnBody → String
 
 def emitDecl (c : Ctx) : Decl → String
   | .fdecl f xs _ body _ =>
-      let ps := String.intercalate ", " (xs.toList.map (v ·.x))
-      let note := if c.min then "" else s!"/* {f} */ "
-      s!"function {c.js f}({ps}) " ++ note ++ "{\n" ++ emitBody c 1 body ++ "}\n"
+      if xs.isEmpty then
+        -- A nullary decl is a module global: computed once, then shared (mirrors the C
+        -- backend's `_init_`/`initialize` caching). `$.memo` makes refs created once.
+        match getInitFnNameFor? c.env f with
+        | some initFn =>
+            -- `initialize x ← act`: value is the IO result of running the init fn once.
+            s!"const {c.js f} = $.memo(() => $.ioVal({c.js initFn}(0)));\n"
+        | none =>
+            s!"const {c.js f} = $.memo(() => " ++ "{\n" ++ emitBody c 1 body ++ "});\n"
+      else
+        let ps := String.intercalate ", " (xs.toList.map (v ·.x))
+        let note := if c.min then "" else s!"/* {f} */ "
+        s!"function {c.js f}({ps}) " ++ note ++ "{\n" ++ emitBody c 1 body ++ "}\n"
   | .extern .. => ""
 
 /-! ## Program assembly -/

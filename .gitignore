@@ -11,3 +11,4 @@
 /runtime/__build_id
 *.olean
 test/vendor/
+/test/.gate/

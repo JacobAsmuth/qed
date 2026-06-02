@@ -225,6 +225,60 @@ def effectsCovered : IO Bool := do
     IO.eprintln (red s!"  effect kind \"{k}\" is emitted by a Cmd but no host.js case handles it")
   return missing.isEmpty
 
+/-- Net bracket nesting a token contributes (`{`/`(`/`[` open, `}`/`)`/`]` close). -/
+def bracketDelta (s : String) : Int :=
+  s.foldl (fun d c =>
+    if c == '{' || c == '(' || c == '[' then d + 1
+    else if c == '}' || c == ')' || c == ']' then d - 1 else d) 0
+
+/-- Drop one `term:max` from the front of a token list — a single token, or a balanced
+    `{…}`/`(…)`/`[…]` group — so a record-literal `init` (`ui { … } update fun …`) is
+    skipped whole and the *next* token is the update term. -/
+def dropTerm : List String → List String
+  | []       => []
+  | t0 :: tl =>
+      let rec skip (depth : Int) : List String → List String
+        | []      => []
+        | r :: rs => if depth ≤ 0 then r :: rs else skip (depth + bracketDelta r) rs
+      skip (bracketDelta t0) tl
+
+/-- A non-fatal nudge (never gates the build): app updates wired into a `ui` builder that
+    carry no `invariant … preserved_by <update>`. Changing your program's state is almost
+    always a claim you can state and have machine-checked, so a zero here is worth a second
+    look — but an honest "nothing to prove here" is fine, which is why this only reports,
+    never fails. Heuristic and per-file (a builder and its invariant live in the same
+    module), comment-aware so prose mentioning `ui` doesn't count. -/
+def invariantNote : IO Unit := do
+  let files := (← collect "." "lean" [".lake", ".qed", "dist", "toolchains", "node_modules", ".git", "scripts"])
+    |>.filter (·.fileName != some "Cli.lean")   -- this file holds the keywords as string data
+  let tokensOf (line : String) : List String :=
+    ((line.replace "\t" " ").splitOn " ").filter (· != "")
+  let isName (s : String) : Bool :=
+    !s.isEmpty && s != "fun" && s.all (fun c => c.isAlphanum || c == '_' || c == '.' || c == '\'')
+  let mut uncovered : Array (FilePath × String) := #[]
+  for f in files do
+    let mut depth : Nat := 0                 -- multi-line `/- … -/` nesting
+    let mut updates : List String := []      -- update fns wired into a `ui` builder here
+    let mut covered : List String := []      -- update fns this file states an invariant for
+    for raw in (← IO.FS.readFile f).splitOn "\n" do
+      let inComment := depth > 0
+      depth := depth + ((raw.splitOn "/-").length - 1) - ((raw.splitOn "-/").length - 1)
+      if inComment then continue             -- inside a block comment: skip the whole line
+      let ts := tokensOf ((raw.splitOn "--").headD raw)   -- drop a `--` line comment
+      match ts.dropWhile (· != "preserved_by") with       -- `… preserved_by upd`
+      | _ :: name :: _ => covered := name :: covered
+      | _              => pure ()
+      let afterUi := (ts.dropWhile (· != "ui")).drop 1     -- tokens after a `ui` builder token
+      if afterUi.contains "fun" then                       -- a real `ui … fun … =>` call, not prose
+        match dropTerm afterUi with                        -- skip the `init` term; update is next
+        | upd :: _ => if isName upd then updates := upd :: updates
+        | []       => pure ()
+    for u in updates do
+      unless covered.contains u do uncovered := uncovered.push (f, u)
+  unless uncovered.isEmpty do
+    IO.println s!"  note: {uncovered.size} update(s) change state with no `invariant … preserved_by` — consider stating one:"
+    for (f, u) in uncovered do IO.println s!"    {u}  ({f})"
+
 def verify : IO Bool := do
   step "checking proofs (lake build)"
   if (← sh "lake" #["build"]) != 0 then return false
@@ -239,7 +293,9 @@ def verify : IO Bool := do
 /-! ### Commands -/
 
 def cmdCheck : IO UInt32 := do
-  if (← verify) then IO.println (green "✓ verified"); return 0
+  if (← verify) then
+    invariantNote          -- informational nudge after a clean verdict; never gates `check`
+    IO.println (green "✓ verified"); return 0
   else IO.eprintln (red "✗ verification failed"); return 1
 
 def cmdBuild (prod : Bool) : IO UInt32 := do

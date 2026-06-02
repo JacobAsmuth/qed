@@ -144,9 +144,11 @@ doesn't validate. The submit gate and its `canSubmit_iff` proof come with it.
 ### Routing and HTTP
 
 `router` declares your pages and, with them, a `Router` whose round-trip is proven: a URL you
-can print is a URL you can parse back to the route that produced it. `link`s navigate in place,
-and `Cmd.getJson` does the fetch and the decode together. The `(onRoute := …)` builder hands
-your transition the route already parsed, not a raw path to pick apart.
+can print is a URL you can parse back to the route that produced it. `linkTo route` builds an
+in-place navigation link from a route *value*, so the target is always a real route — a broken
+or mistyped path won't compile — and `Cmd.getJson` does the fetch and the decode together. The
+`(onRoute := …)` builder hands your transition the route already parsed, not a raw path to pick
+apart.
 
 ```lean
 router R where
@@ -170,7 +172,7 @@ def app : App Model Msg :=
   ui init transition (onRoute := Msg.routed) fun m =>
     formEl [onSubmit .submit] [
       input [value m.query, onInput .typeQuery, onKeydown .key],
-      link "/users/ada" [] "ada"
+      linkTo (R.user "ada") [] "ada"
     ]
 ```
 
@@ -423,7 +425,7 @@ runtime/host.js:  mounts the app; routes clicks/input/stream events to the pure 
 | `Qed/Notation.lean` | The view combinators (`div`, `button`, `onClick`, …). |
 | `Qed/View.lean` | The rendering model: `View` (`dyn`/`showIf`/`ifElse`/`forEach`/`dynNode`, `View.ofHtml`) and the `view%` lift behind `ui`; built once, then changed bindings patch (`patch_render`/`applyValues_render`). |
 | `Qed/Runtime.lean` | The Elm Architecture: `App`, the `ui` builder (`mkApp`/`mkRoutedApp`, `still`/`also`, `ToStep`), the `Cmd` effects + `port`/`onPort`, local components, and server-side render. |
-| `Qed/Diff.lean` | The reconciler the engine uses internally — positional and `O(n)` keyed reconcile, `lazy` memoization — plus the `diff_apply` proof. |
+| `Qed/Diff.lean` | The reconciler the engine uses internally — one children reconcile that positional and keyed share (they differ only in how each new child is matched to an old one), `lazy` memoization — plus the `diff_apply` proof. |
 | `Qed/Json.lean` | JSON parser/renderer + `jsonStruct`/`jsonCodec`, with the `parse_depth_le`/`parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field), the `router` command, `toURL`/`fromURL`. |
 | `Qed/Form.lean` | `Field p`, the `Input` controls, and the `form` command (Draft + `parse` + `formView` + `canSubmit_iff`). |

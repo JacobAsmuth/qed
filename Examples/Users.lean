@@ -62,7 +62,7 @@ def transition (m : Model) : Msg → Model × Cmd Msg
 def app : App Model Msg :=
   ui init transition (onRoute := Msg.routed) fun m =>
     div [cls "app"] [
-      nav [] [ link "/" [cls "home-link"] "Home" ],
+      nav [] [ linkTo R.home [cls "home-link"] "Home" ],
       match m.route with
       | .home =>
           formEl [cls "search", onSubmit .submit] [
@@ -70,7 +70,7 @@ def app : App Model Msg :=
                    placeholder "Find a user…",
                    onInput .typeQuery, onFocus .focus, onBlur .blur, onKeydown .key],
             button [cls "go", type' "submit"] "Search",
-            div [cls "hint"] [ "try ", link "/users/ada" [] "ada", " or ", link "/users/alan" [] "alan" ]
+            div [cls "hint"] [ "try ", linkTo (R.user "ada") [] "ada", " or ", linkTo (R.user "alan") [] "alan" ]
           ]
       | .user name =>
           div [cls "profile"] [

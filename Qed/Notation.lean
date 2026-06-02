@@ -9,6 +9,7 @@
       span [cls "count"] [toString n]
 -/
 import Qed.Html
+import Qed.Router
 
 namespace Qed
 
@@ -44,9 +45,17 @@ def formEl  (attrs : List (Attr msg) := []) (children : List (Html msg) := []) :
 
 /-- An internal navigation link: an `<a href=path>` the driver intercepts (no full
     page reload) — clicking it pushes `path` to the URL and routes to it. Pair with
-    `Router.toURL` for a type-checked target. -/
+    `Router.toURL` for a type-checked target, or use `linkTo` to pass the route directly. -/
 def link (path : String) (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg :=
   el "a" (Attr.attr "href" path :: Attr.attr "data-qed-link" "" :: attrs) children
+
+/-- A type-checked internal link: builds the `<a href>` from a routed value via
+    `Router.toURL`, so the target can only be a real route — never a hand-typed string that
+    might not parse back. The `Router.round_trip` proof then guarantees clicking it navigates
+    to exactly this route. `linkTo (Route.user "ada") [cls "u"] "Ada"`. -/
+def linkTo {α} [Router α] (route : α)
+    (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg :=
+  link (Router.toURL route) attrs children
 
 /-- Class / arbitrary-attribute / event helpers. -/
 def cls (name : String) : Attr msg := .cls name

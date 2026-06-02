@@ -43,19 +43,25 @@ def echo : String := "echo"
 
 def transition (m : Model) : Msg → Model × Cmd Msg
   | .connect    =>
-      also { m with conn := .connecting }
+      also { m with conn := .connecting, draft := "" }   -- a fresh connection starts clean
            (Cmd.wsOpen echo "/echo" Msg.received
               (onOpen := Msg.opened) (onClose := Msg.closed) (onError := Msg.errored))
   | .disconnect => also m (Cmd.wsClose echo)   -- the status flips when `onClose` fires
   | .opened     => still { m with conn := .online,  log := m.log.push "● connected" }
-  | .closed     => still { m with conn := .offline, log := m.log.push "○ disconnected" }
-  | .errored r  => still { m with conn := .offline, log := m.log.push s!"✗ {r}" }
+  | .closed     => still { m with conn := .offline, draft := "", log := m.log.push "○ disconnected" }
+  | .errored r  => still { m with conn := .offline, draft := "", log := m.log.push s!"✗ {r}" }
   | .received t => still { m with log := m.log.push s!"← {t}" }
-  | .typed s    => still { m with draft := s }
+  | .typed s    => still (if m.conn = .online then { m with draft := s } else m)  -- ignore typing while offline
   | .send       =>
       let t := m.draft.trim
       if t.isEmpty then still m
       else also { m with draft := "", log := m.log.push s!"→ {t}" } (Cmd.wsSend echo t)
+
+-- The composer can only hold text while we're connected: typing is ignored unless online, and
+-- the draft is cleared whenever the connection drops or restarts. So a half-typed message can
+-- never linger in a state from which it could never be sent.
+invariant composerOnlyWhenOnline :
+    (fun m => m.draft ≠ "" → m.conn = .online) preserved_by transition
 
 def logLine (line : String) : Html Msg := div [cls "line"] [text line]
 

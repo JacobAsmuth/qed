@@ -87,11 +87,36 @@ The first four usually prove automatically. The last two quantify over a collect
 need a one- or two-line `:=` proof (`cases msg <;> simp_all [update] <;> omega`, plus the relevant
 `Array`/`List` lemma).
 
+## Not every state change needs one
+
+Don't reach for an invariant where there is no honest claim to make. Common cases:
+
+- **The type already proves it.** A form's `submitted : Option Account` can only hold a *valid*
+  `Account` because each field is proof-carrying (`canSubmit_iff`). An `invariant` restating that
+  would be vacuous — the guarantee is the type. (`Examples/Signup.lean`.)
+- **The property is about runtime, not the model.** "Setting a signal doesn't re-render" is a
+  fact about the driver, checked by a browser test, not a model invariant. (`Examples/Signals.lean`.)
+- **External data is arbitrary by type.** A `Resource` message can deliver any state, so a claim
+  like "loading ⇒ on a detail route" isn't preserved without narrower message types — a redesign,
+  not an invariant. (`Examples/Users.lean`, `Examples/Bookshelf.lean`.)
+
+A real property can also be out of reach for a mechanical reason — `Examples/Todo.lean` has the
+same id-uniqueness property as the template below, but its `.sort` reorders with `Array.qsort`,
+and the standard library carries no lemma that `qsort` preserves membership, so the proof would
+have to establish that first.
+
 ## Worked examples in this repo
 
 - `Examples/Counter.lean` — `counterSafe`, a numeric bound, automatic.
 - `Examples/Booking.lean` — `bookedNeedsToday`, an `Option` precondition over nested `match`es,
   automatic.
+- `Examples/Template.lean` — `idsBelowNext`, unique keys (`∀ t ∈ todos, t.id < nextId`) over a
+  list edited by `.map`/`.push`, with a `:=` proof — this is what makes the keyed diff sound.
+- `Examples/Live.lean` — `nonNegative`, a bound preserved by handlers that read the live model,
+  automatic.
+- `Examples/Socket.lean` — `composerOnlyWhenOnline` (`draft ≠ "" → conn = .online`), a precondition
+  on an effectful state machine, automatic — the guards that make it hold also clear a stale draft
+  on disconnect.
 - `Examples/Chat.lean` — `streamSafe`, an effect-safety property on an effectful `transition`,
   with a `:=` proof (it needs the fact that `appendLast` preserves the turn count).
 

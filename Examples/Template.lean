@@ -46,6 +46,39 @@ def update (m : Model) : Msg → Model
   | .startEdit id => { m with todos := m.todos.map fun t => { t with editing := t.id == id } }
   | .editText id s => { m with todos := m.todos.map fun t => if t.id == id then { t with text := s } else t }
 
+-- Every row's id stays below `nextId`, so ids are unique — which is exactly what makes the
+-- keyed `diff` sound (no two rows ever share a reconciliation key). The edits that touch the
+-- list either `map` over it (preserving each id) or `push` a fresh `nextId` and bump it; the
+-- proof below discharges both with the `Array` membership lemmas the automation can't guess.
+invariant idsBelowNext : (fun m => ∀ t ∈ m.todos, t.id < m.nextId)
+    preserved_by update := by
+  intro m msg h
+  cases msg with
+  | inc => simpa [update] using h
+  | dec => simpa [update] using h
+  | setName s => simpa [update] using h
+  | add =>
+      simp only [update, InvTarget.proj_id]
+      intro t ht
+      rcases Array.mem_push.1 ht with hmem | rfl
+      · exact Nat.lt_succ_of_lt (h t hmem)
+      · exact Nat.lt_succ_self _
+  | toggle id =>
+      simp only [update, InvTarget.proj_id]
+      intro t ht
+      obtain ⟨t', ht', rfl⟩ := Array.mem_map.1 ht
+      first | exact h t' ht' | (split <;> exact h t' ht')
+  | startEdit id =>
+      simp only [update, InvTarget.proj_id]
+      intro t ht
+      obtain ⟨t', ht', rfl⟩ := Array.mem_map.1 ht
+      first | exact h t' ht' | (split <;> exact h t' ht')
+  | editText id s =>
+      simp only [update, InvTarget.proj_id]
+      intro t ht
+      obtain ⟨t', ht', rfl⟩ := Array.mem_map.1 ht
+      first | exact h t' ht' | (split <;> exact h t' ht')
+
 -- A scoped style, co-located with the view: its class name is a hash (no global collisions),
 -- and a typo'd reference (`bnner`) is a compile error.
 def banner : Style := css "padding: 7px; border-radius: 4px; &:hover { opacity: 0.9 }"

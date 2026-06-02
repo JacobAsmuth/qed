@@ -10,9 +10,15 @@ import Qed
 import Examples.Counter
 import Examples.Booking
 import Examples.Chat
+import Examples.Template
+import Examples.Live
+import Examples.Socket
 
 #print axioms counterSafe            -- state-machine invariant (numeric bound, pure)
 #print axioms Booking.bookedNeedsToday -- invariant: a precondition for a state (pure, auto)
+#print axioms TemplateDemo.idsBelowNext -- invariant: unique keys over .map/.push (`:=` proof)
+#print axioms Live.nonNegative       -- invariant: a bound preserved by live handlers (pure, auto)
+#print axioms Socket.composerOnlyWhenOnline -- invariant: precondition on an effectful state machine (auto)
 #print axioms Chat.streamSafe        -- invariant: effect safety on an effectful transition (`:=` proof)
 #print axioms Qed.diff_apply         -- VDOM diff/patch correctness
 #print axioms Qed.diffChildren_apply -- child reconcile, any matcher (positional + keyed), any lengths

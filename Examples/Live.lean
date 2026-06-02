@@ -20,7 +20,11 @@ inductive Msg
 
 def update (m : Model) : Msg → Model
   | .inc     => { m with n := m.n + 1 }
-  | .setTo v => { n := v }
+  | .setTo v => { n := max 0 v }   -- a count, so it never goes below zero
+
+-- The number stays non-negative no matter which (live) handler fired — `inc` only adds, and
+-- `setTo` clamps. Proven for every message, so the view never has to guard against `n < 0`.
+invariant nonNegative : (fun m => 0 ≤ m.n) preserved_by update
 
 def app : App Model Msg :=
   ui { n := 0 } update fun m =>

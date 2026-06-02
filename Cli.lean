@@ -323,7 +323,7 @@ def indexHtmlJs : String :=
     JavaScript and stage a runnable bundle in `dist-js/`. No WASM, no emscripten, no
     cross-origin-isolation. The pure framework runs as transpiled Lean; only the small
     DOM driver is hand-written JS. -/
-def cmdBuildJs : IO UInt32 := do
+def cmdBuildJs (dev : Bool) : IO UInt32 := do
   let mod ← jsRoot
   step s!"lake build {mod}  +  qedjs (transpiler)"
   if (← sh "lake" #["build", mod, "qedjs"]) != 0 then IO.eprintln (red "✗ lake build failed"); return 1
@@ -337,13 +337,26 @@ def cmdBuildJs : IO UInt32 := do
   let entries := #[s!"{ns}.initModel:initModel", s!"{ns}.step:step", s!"{ns}.view:view",
                    s!"{ns}.diff:diff", s!"{ns}.patch:patch"]
   let appOut := (outDir / "app.mjs").toString
-  if (← sh "lake" (#["env", qedjs, appOut, mod, "--"] ++ entries)) != 0 then
+  -- The transpiler emits only the reachable closure (IR-level tree-shaking); `--min`
+  -- drops comments and indentation. `--dev` keeps it readable.
+  let minArgs := if dev then #[] else #["--min"]
+  if (← sh "lake" (#["env", qedjs] ++ minArgs ++ #[appOut, mod, "--"] ++ entries)) != 0 then
     IO.eprintln (red "✗ transpile failed"); return 1
   step "staging runtime + driver + index.html"
   for f in ["qed_rt.mjs", "qed_driver.mjs"] do
     IO.FS.writeFile (outDir / f) (← IO.FS.readFile (← runtimeFile f))
   IO.FS.writeFile (outDir / "index.html") indexHtmlJs
-  IO.println (green s!"✓ JS build complete → {outDir} (no WASM)")
+  -- Optional extra squeeze of the hand-written runtime/driver if esbuild is present.
+  unless dev do
+    if (← onPath "esbuild") then
+      step "minifying runtime with esbuild"
+      for f in ["app.mjs", "qed_rt.mjs", "qed_driver.mjs"] do
+        let p := (outDir / f).toString
+        discard <| sh "bash" #["-c", s!"esbuild {p} --minify --format=esm --outfile={p}.min && mv {p}.min {p}"]
+  -- Report the bundle's gzipped size.
+  let (_, sz) ← shOut "bash" #["-c",
+    s!"cat {outDir}/app.mjs {outDir}/qed_rt.mjs {outDir}/qed_driver.mjs | gzip -c | wc -c"]
+  IO.println (green s!"✓ JS build complete → {outDir} (no WASM) — {sz.trim} bytes gzipped")
   return 0
 
 def serveDir (dir : FilePath) : IO UInt32 := do
@@ -543,7 +556,8 @@ def main (args : List String) : IO UInt32 := do
   | ["dev"]                  => cmdDev
   | ["build"]                => cmdBuild (prod := true)
   | ["build", "--dev"]       => cmdBuild (prod := false)
-  | ["buildjs"]              => cmdBuildJs
+  | ["buildjs"]              => cmdBuildJs (dev := false)
+  | ["buildjs", "--dev"]     => cmdBuildJs (dev := true)
   | ["start"] | ["preview"]  => cmdStart
   | ["test"]                 => cmdTest
   | ["check"]                => cmdCheck

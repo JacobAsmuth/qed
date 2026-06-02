@@ -22,7 +22,8 @@ partial def splitDashes : List String → List String × List String
   | a :: rest    => let (h, t) := splitDashes rest; (a :: h, t)
 
 def main (args : List String) : IO Unit := do
-  let (head, rest) := splitDashes args
+  let min := args.contains "--min"
+  let (head, rest) := splitDashes (args.filter (· ≠ "--min"))
   match head with
   | out :: mods =>
     let entries := rest.map parseEntry
@@ -30,7 +31,7 @@ def main (args : List String) : IO Unit := do
     Lean.initSearchPath (← Lean.findSysroot)
     let imports := mods.map fun m => Import.mk m.toName false
     let env ← importModules imports.toArray {} (trustLevel := 1024)
-    match Js.emitProgram env entries with
+    match Js.emitProgram env entries min with
     | .ok js =>
         let p : System.FilePath := out
         if let some dir := p.parent then IO.FS.createDirAll dir

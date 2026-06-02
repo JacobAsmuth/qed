@@ -127,13 +127,21 @@ def clearHandlerIds (node : Dom.Node) : IO Unit := Dom.clearHandlers node
 def ownsChildren (attrs : List (Attr msg)) : Bool :=
   attrs.any (fun | .localCell .. => true | .signalBind .. => true | _ => false)
 
-/-- Are the keyed steps a pure in-place update — every step a `reuse` whose old index
-    equals its position (nothing moved, nothing created)? Then the children stay put, so
-    the applier can patch them where they sit and skip the snapshot + per-child move. -/
-def identityReuse : Nat → List (KeyedStep msg) → Bool
+/-- The remaining steps are all `create`s (so a positional reconcile's creates sit at the tail). -/
+def allCreates : List (KeyedStep msg) → Bool
+  | []                => true
+  | .create _ :: rest => allCreates rest
+  | .reuse _ _ :: _   => false
+
+/-- Are the steps a *positional* update — identity-ordered `reuse`s (each old index equal to
+    its position) optionally followed by `create`s, so nothing moved? Then the children stay
+    put: the applier patches each reused child where it sits, appends the trailing creates, and
+    drops any surplus old children — no snapshot, no per-child move. The keyless reconcile always
+    has this shape, as does a keyed list that didn't reorder. -/
+def positional : Nat → List (KeyedStep msg) → Bool
   | _, []                        => true
-  | i, .reuse oldIndex _ :: rest => oldIndex == i && identityReuse (i + 1) rest
-  | _, .create _ :: _            => false
+  | i, .reuse oldIndex _ :: rest => oldIndex == i && positional (i + 1) rest
+  | _, .create _ :: rest         => allCreates rest
 
 /-- Build a fresh DOM subtree from an `Html` node, returning its handle. -/
 partial def buildDom (h : Handlers msg) : Html msg → IO Dom.Node
@@ -183,36 +191,38 @@ partial def applyToDom (h : Handlers msg)
   | .lazyPatch _ p =>
       -- the key changed: the lazy node's DOM *is* its content's, so patch it in place
       applyToDom h parent index node p
-  | .patchElement attrs kids => do
+  | .patchElement attrs steps => do
       -- reconcile attributes in place: `setAttribute` is guarded (unchanged keys are
       -- not touched, so a typed input keeps its caret) and a toggled-off `flag`
       -- removes its key. node identity — hence focus/cursor — is preserved.
       applyAttrs h node attrs
-      unless ownsChildren attrs do applyChildrenToDom h node 0 kids
-  | .patchKeyed attrs steps => do
-      applyAttrs h node attrs
       if ownsChildren attrs then return    -- driver owns this host's children; leave them
       let oldCount ← Dom.childCount node
-      -- Fast path: nothing moved or was added/removed (an `update`, not a reorder). Patch
-      -- each child where it sits — no snapshot, no insertBefore — and skip those whose
-      -- subtree didn't change (`lazyReuse`). This makes such an update O(changed) DOM ops.
-      if identityReuse 0 steps && oldCount == UInt32.ofNat steps.length then
+      -- Positional fast path: no reused node moves (identity-ordered reuses, creates only at
+      -- the tail) — an `update`, a grow, or a shrink, but not a reorder. Patch each reused
+      -- child where it sits (skipping a `lazyReuse`, whose subtree didn't change), insert each
+      -- trailing create at its new-order position `j` (which appends when `j` is the end), then
+      -- drop any surplus old children. No snapshot, so an update is O(changed) DOM ops. The
+      -- keyless reconcile always lands here, as does a keyed list that only grew/shrank its tail.
+      if positional 0 steps then
         let mut j : UInt32 := 0
         for step in steps do
           match step with
           | .reuse _ (.lazyReuse _ _) => pure ()
           | .reuse _ p                => applyToDom h node j (← Dom.childAt node j) p
-          | .create _                 => pure ()
+          | .create newH              => Dom.insertBefore node j (← buildDom h newH)
           j := j + 1
+        let count ← Dom.childCount node
+        for _ in [steps.length:count.toNat] do Dom.removeChild node (UInt32.ofNat steps.length)
         return
-      -- General path: snapshot the current child handles by their original index. Handles
-      -- stay valid as the nodes move, so a `reuse i` always resolves to the same node.
+      -- General path: a genuine reorder. Snapshot the current child handles by their original
+      -- index. Handles stay valid as the nodes move, so a `reuse i` always resolves to the
+      -- same node. Walk the steps in new order, placing the right node at each position `j`:
+      -- `insertBefore` moves a reused node (keeping its identity) or inserts a new one; reused
+      -- nodes are then patched in place.
       let mut live : Array Dom.Node := #[]
       for i in [0:oldCount.toNat] do
         live := live.push (← Dom.childAt node (UInt32.ofNat i))
-      -- Walk the steps in new order, placing the right node at each position `j`.
-      -- `insertBefore` moves a reused node (keeping its identity) or inserts a new
-      -- one; reused nodes are then patched in place.
       let mut j : UInt32 := 0
       for step in steps do
         match step with
@@ -226,22 +236,6 @@ partial def applyToDom (h : Handlers msg)
       -- Old nodes whose key wasn't reused are now past `j`; drop them.
       let count ← Dom.childCount node
       for _ in [j.toNat:count.toNat] do Dom.removeChild node j
-
-/-- Mirror a `ChildPatch` onto `node`'s children: patch the prefix in place (so each
-    reused child keeps its identity), then append freshly-built nodes for the surplus
-    new children, or remove the surplus old ones. `i` is the next child index. -/
-partial def applyChildrenToDom (h : Handlers msg) (node : Dom.Node) (i : UInt32) :
-    ChildPatch msg → IO Unit
-  | .patch p rest => do
-      applyToDom h node i (← Dom.childAt node i) p
-      applyChildrenToDom h node (i + 1) rest
-  | .append news => do
-      for nh in news do Dom.appendChild node (← buildDom h nh)
-  | .drop => do
-      -- children at indices [i, count) are gone; removing at `i` repeatedly works
-      -- because each removal shifts the next child down into index `i`.
-      let count ← Dom.childCount node
-      for _ in [i.toNat:count.toNat] do Dom.removeChild node i
 end
 
 /-! ### Fine-grained template runtime

@@ -58,16 +58,11 @@ end
 
 mutual
   def patchNodes : Patch msg → Nat
-    | .replace _          => 1
-    | .setText _          => 1
-    | .lazyReuse _ _      => 1
-    | .lazyPatch _ p      => 1 + patchNodes p
-    | .patchElement _ k   => 1 + childNodes k
-    | .patchKeyed _ steps => 1 + stepNodes steps
-  def childNodes : ChildPatch msg → Nat
-    | .patch p rest => patchNodes p + childNodes rest
-    | .append _     => 1
-    | .drop         => 1
+    | .replace _            => 1
+    | .setText _            => 1
+    | .lazyReuse _ _        => 1
+    | .lazyPatch _ p        => 1 + patchNodes p
+    | .patchElement _ steps => 1 + stepNodes steps
   def stepNodes : List (KeyedStep msg) → Nat
     | []                 => 0
     | .reuse _ p :: rest => patchNodes p + stepNodes rest

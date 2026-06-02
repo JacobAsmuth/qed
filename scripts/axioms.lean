@@ -11,8 +11,7 @@ import Examples.Counter
 
 #print axioms counterSafe            -- state-machine invariant
 #print axioms Qed.diff_apply         -- VDOM diff/patch correctness
-#print axioms Qed.diffChildren_apply -- child-list reconcile (add/remove), any lengths
-#print axioms Qed.diffKeyed_apply    -- keyed child reconcile (reorder/remove by key)
+#print axioms Qed.diffChildren_apply -- child reconcile, any matcher (positional + keyed), any lengths
 #print axioms Qed.applyValues_render -- View template value-patch = full re-render (stable structure)
 #print axioms Qed.patch_render       -- View template update step = full re-render (any structure)
 #print axioms Qed.parse_depth_le     -- JSON depth bound

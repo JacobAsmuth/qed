@@ -8,6 +8,14 @@ package qed where
 @[default_target]
 lean_lib Qed where
 
+/-- The Lean-IR → JavaScript transpiler (build-time tool; `import Lean`, never shipped). -/
+lean_lib Js where
+
+/-- The transpiler CLI: `lake exe qedjs <out.mjs> <module>… -- <decl>[:<export>]…`. -/
+lean_exe qedjs where
+  root := `Js.Main
+  supportInterpreter := true
+
 /-- The example modules (shared app + the two entry points). Grouping them in a
     library lets lake build `Examples.Counter` as a dependency of both entries. -/
 lean_lib Examples where

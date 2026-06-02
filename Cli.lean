@@ -307,6 +307,45 @@ def cmdBuild (prod : Bool) : IO UInt32 := do
   IO.println (green s!"✓ build complete → {outDir}")
   return 0
 
+/-- The app module to transpile to JS. A project sets `QED_JS_ROOT`; it must expose
+    the convention decls `initModel`, `step`, `view`, `diff`, `patch` (monomorphic). -/
+def jsRoot : IO String := return (← env "QED_JS_ROOT").getD "App"
+
+def indexHtmlJs : String :=
+  "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">" ++
+  "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>qed</title></head>\n" ++
+  "<body><div id=\"app\"></div>\n<script type=\"module\">\n" ++
+  "  import * as app from './app.mjs';\n  import { mount } from './qed_driver.mjs';\n" ++
+  "  mount(app, document.getElementById('app'), document);\n" ++
+  "</script>\n</body>\n</html>\n"
+
+/-- `qed buildjs` — transpile the app's verified Lean (init/view/update/diff) to plain
+    JavaScript and stage a runnable bundle in `dist-js/`. No WASM, no emscripten, no
+    cross-origin-isolation. The pure framework runs as transpiled Lean; only the small
+    DOM driver is hand-written JS. -/
+def cmdBuildJs : IO UInt32 := do
+  let mod ← jsRoot
+  step s!"lake build {mod}  +  qedjs (transpiler)"
+  if (← sh "lake" #["build", mod, "qedjs"]) != 0 then IO.eprintln (red "✗ lake build failed"); return 1
+  let outDir : FilePath := "dist-js"
+  IO.FS.createDirAll outDir
+  step "transpiling Lean IR → JavaScript"
+  let qedjs := ((".lake" : FilePath) / "build" / "bin" / "qedjs").toString
+  -- The convention decls live in the module's namespace (its last path component,
+  -- overridable via QED_JS_NS).
+  let ns := (← env "QED_JS_NS").getD ((mod.splitOn ".").getLastD mod)
+  let entries := #[s!"{ns}.initModel:initModel", s!"{ns}.step:step", s!"{ns}.view:view",
+                   s!"{ns}.diff:diff", s!"{ns}.patch:patch"]
+  let appOut := (outDir / "app.mjs").toString
+  if (← sh "lake" (#["env", qedjs, appOut, mod, "--"] ++ entries)) != 0 then
+    IO.eprintln (red "✗ transpile failed"); return 1
+  step "staging runtime + driver + index.html"
+  for f in ["qed_rt.mjs", "qed_driver.mjs"] do
+    IO.FS.writeFile (outDir / f) (← IO.FS.readFile (← runtimeFile f))
+  IO.FS.writeFile (outDir / "index.html") indexHtmlJs
+  IO.println (green s!"✓ JS build complete → {outDir} (no WASM)")
+  return 0
+
 def serveDir (dir : FilePath) : IO UInt32 := do
   IO.println s!"serving {dir} → http://localhost:{devPort}"
   let serve ← runtimeFile "serve.py"
@@ -504,6 +543,7 @@ def main (args : List String) : IO UInt32 := do
   | ["dev"]                  => cmdDev
   | ["build"]                => cmdBuild (prod := true)
   | ["build", "--dev"]       => cmdBuild (prod := false)
+  | ["buildjs"]              => cmdBuildJs
   | ["start"] | ["preview"]  => cmdStart
   | ["test"]                 => cmdTest
   | ["check"]                => cmdCheck

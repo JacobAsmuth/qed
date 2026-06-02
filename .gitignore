@@ -1,6 +1,8 @@
 /.lake/
 /.qed/
 /dist/
+/dist-js/
+/scratch/
 /toolchains/
 /test/node_modules/
 /test/screenshots/

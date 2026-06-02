@@ -66,7 +66,11 @@ Notice that the view is just ordinary control flow — an `if`, a `.map`, string
 a call to one of your own helpers. There's no template language to learn. The last line is the
 interesting one: it claims the count is never negative, and `invariant` proves that holds after
 every message. Try deleting the `if 0 < m.count` guard. The build stops, because the claim is no
-longer true.
+longer true — and the error names the message that broke it (`case decrement`).
+
+The same syntax covers effectful transitions, and a `:=` clause supplies a proof for the claims
+the automation can't close on its own. [`docs/invariants.md`](docs/invariants.md) is the menu of
+properties worth stating — bounds, preconditions, mutual exclusion, effect safety, unique keys.
 
 ### Reading JSON
 
@@ -432,7 +436,7 @@ runtime/host.js:  mounts the app; routes clicks/input/stream events to the pure 
 | `Qed/Component.lean` | `Component` and the `embed` macro for repeating one per keyed row. |
 | `Qed/Date.lean` | A calendar `Date` that can't be invalid (smart constructor + ISO parser). |
 | `Qed/Render.lean` | The pure `Html` → string renderer used for SSR. |
-| `Qed/Invariant.lean` | The `invariant … preserved_by …` command. |
+| `Qed/Invariant.lean` | The `invariant … preserved_by …` command (pure or effectful; auto-discharged, or `:=` proof). See [`docs/invariants.md`](docs/invariants.md). |
 | `Qed/Dom.lean` / `Qed/Driver.lean` | The `@[extern]` DOM primitives (the one trusted boundary) and the impure driver. |
 | `Examples/` · `test/` | Example apps and the browser tests that drive them. |
 | `Cli.lean` + `./qed` · `runtime/` · `scripts/axioms.lean` | The toolchain, the C/JS driver + page, and the axiom manifest `qed check` gates on. |

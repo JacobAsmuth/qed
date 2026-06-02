@@ -3,9 +3,10 @@
 **A formally-verified web frontend framework in Lean 4.**
 
 You write your app in [Lean](https://lean-lang.org) — the state, the messages it answers, how
-the state changes, and what it looks like — and Lean compiles it to WebAssembly. If you've
-written Elm, it will feel familiar. The difference is that Lean is a proof assistant, so it can
-check things about your code that other languages can only hope are true.
+the state changes, and what it looks like — and `qed build` transpiles it (and the whole
+verified framework) to plain JavaScript that runs in any browser. If you've written Elm, it
+will feel familiar. The difference is that Lean is a proof assistant, so it can check things
+about your code that other languages can only hope are true.
 
 Two of those come for free:
 
@@ -23,8 +24,9 @@ qed new myapp && cd myapp && qed dev
 ```
 
 The installer grabs elan (Lean's toolchain manager) if you don't have it, drops the framework
-into `~/.qed`, and puts `qed` on your PATH. The wasm toolchain and emscripten are large, so
-they're fetched on your first `qed build`.
+into `~/.qed`, and puts `qed` on your PATH. `qed build` turns your app into plain JavaScript —
+there's no heavy toolchain to download. `qed dev` serves it with live-reload, and `qed test`
+drives it in a headless browser (that part needs node).
 
 ## Building things
 
@@ -59,7 +61,7 @@ def app : App Model Msg := ui init update fun m =>
 
 invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
 
-def main := Qed.run app   -- the WASM entry point
+def main := Qed.run app   -- the browser entry point (transpiled to JS by `qed build`)
 ```
 
 Notice that the view is just ordinary control flow — an `if`, a `.map`, string interpolation,
@@ -375,19 +377,11 @@ markup on load. `Examples/UsersSSR.lean` renders a route per request.
 
 ## Performance
 
-How does it compare to React? `test/bench_react.mjs` runs Qed (compiled to WASM) and React (a
-production build) on the same workload. On my desktop:
-
-| 10,000 rows, change every 10th | Qed (wasm) | React | React.memo |
-|---|---|---|---|
-| create | **84 ms** | 89 ms | 88 ms |
-| swap two | 138 ms | **113 ms** | 112 ms |
-| reorder all | 140 ms | 113 ms | **110 ms** |
-| update | **0.8 ms** | 5 ms | 2 ms |
-
 A keyed list updates each changed row's text and attributes straight at the node (they're
 signals), so a value-only update touches no diff. The update step is proven to match a full
-re-render (`patch_render`), and `qed check` enforces it.
+re-render (`patch_render`), and `qed check` enforces it. `test/bench_react.mjs` measures it
+head-to-head against React on the same workload (10,000 rows); the fine-grained update path
+turns a value-only change into O(changed bindings) with no tree walk.
 
 ## The `qed` command
 
@@ -411,17 +405,24 @@ the in-repo `./qed` shim runs the CLI against this checkout.
 
 ## How it fits together
 
+`qed build` turns your app **and the whole framework** — the `render`, `diff`, and `update`
+you read about above, plus the driver that runs them — into JavaScript. You don't install
+emscripten or anything special; the output is a handful of `.mjs` files you can serve anywhere.
+
 ```text
 Lean app (Model, Msg, update, view, deriving/invariant — proofs auto-discharged)
-   │  lake build         (Lean → C, in .lake/build/ir/*.c)
+   │  lake build              (the kernel checks every proof)
    ▼
-emcc  (app C  +  runtime/qed_dom.c [EM_JS DOM shims]  +  prebuilt Lean wasm runtime)
+qedjs  (transpiles the Lean to JavaScript: your app + the Qed framework + the driver)
    ▼
-runtime/qed.js (MODULARIZE factory) + qed.wasm
+dist/app.mjs  +  runtime/qed_rt.mjs   (a small library of the Lean primitives it uses)
    ▼
-runtime/host.js:  mounts the app; routes clicks/input/stream events to the pure `update`,
-                  then patches only what the new model changed
+runtime/qed_dom.mjs + qed_host.mjs    (the only hand-written JS: the DOM calls and the
+                  event wiring — everything else is your verified Lean, as JavaScript)
 ```
+
+So the proofs that pass `qed check` describe the code that actually runs in the browser, and
+`test/js_gate_test.mjs` checks the generated JavaScript computes exactly what the Lean does.
 
 | Path | What |
 |------|------|

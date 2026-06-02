@@ -1,7 +1,7 @@
 /-
-  WASM entry point for the WebSocket echo demo. Registers `Socket.app`; the driver
+  Browser entry point for the WebSocket echo demo. Registers `Socket.app`; the driver
   opens the connection on `Cmd.wsOpen`, sends on `Cmd.wsSend`, and routes inbound
-  frames and lifecycle events back to `update`. Compiled to WASM only.
+  frames and lifecycle events back to `update`. Transpiled to JavaScript by `qed build`.
 -/
 import Examples.Socket
 import Qed.Driver

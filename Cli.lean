@@ -16,11 +16,14 @@
   every proof — a failed proof is a build error), a grep for
   `sorry`/`admit`/`native_decide`, and the axiom manifest if one is present.
 
+  `build` transpiles the app and the verified framework/driver to plain JavaScript
+  (see `Js/Backend.lean`): the proven `render`/`diff`/`update` and the whole `Qed.run`
+  loop run in the browser unchanged. No WASM, no emscripten, no cross-origin isolation.
+
   Two locations matter, kept separate so the CLI works outside the framework
   checkout: the current directory is the *project* (your app + lakefile), and
-  `QED_HOME` is the *framework* (its `runtime/` driver and `scripts/`). Caches
-  (the wasm runtime, emscripten) live under `~/.qed`. The CLI orchestrates lake,
-  emcc, python3, and node; the build logic and verification policy live here.
+  `QED_HOME` is the *framework* (its `runtime/` JS + `scripts/`). The CLI orchestrates
+  lake, the transpiler (`qedjs`), python3 (a static dev server), and node.
 -/
 open System (FilePath)
 
@@ -28,24 +31,19 @@ namespace Qed.Cli
 
 /-! ### Locations -/
 
-def leanWasmVersion : String := "4.15.0"
-def wasmToolchain   : String := s!"lean-{leanWasmVersion}-linux_wasm32"
-def devDir          : FilePath := ".qed" / "dev"
-def distDir         : FilePath := "dist"
-def devPort         : String := "8000"
+def leanVersion : String := "4.15.0"
+def devDir      : FilePath := ".qed" / "dev"
+def distDir     : FilePath := "dist"
+def devPort     : String := "8000"
 
 def env (k : String) : IO (Option String) := IO.getEnv k
 
-def homeDir : IO FilePath := return (← env "HOME").getD "."
-/-- Cache root for downloaded toolchains and emscripten. -/
-def cacheDir : IO FilePath := return (← homeDir) / ".qed"
-/-- The framework checkout (its `runtime/` and `scripts/`). Defaults to the
+/-- The framework checkout (its `runtime/` JS and `scripts/`). Defaults to the
     current directory for in-repo development. -/
 def frameworkHome : IO FilePath := return (← env "QED_HOME").getD "."
 /-- The project's web-entry module. Apps use `Web`; the framework demo overrides
     this to `Examples.Web` via `QED_WEB_ROOT`. -/
 def webRoot : IO String := return (← env "QED_WEB_ROOT").getD "Web"
-def toolchainDir : IO FilePath := return (← cacheDir) / "toolchains" / wasmToolchain
 def runtimeFile (name : String) : IO FilePath := return (← frameworkHome) / "runtime" / name
 /-- Per-project axiom manifest gated by `check`/`build` (skipped if absent). -/
 def axiomsManifest : FilePath := "scripts" / "axioms.lean"
@@ -83,91 +81,6 @@ partial def collect (dir : FilePath) (ext : String) (skipDirs : List String := [
       acc := acc.push p
   return acc
 
-/-! ### Toolchains (downloaded on demand into ~/.qed) -/
-
-def ensureToolchain : IO Unit := do
-  let tc ← toolchainDir
-  if !(← tc.pathExists) then
-    step s!"downloading {wasmToolchain} (prebuilt Lean wasm runtime)"
-    IO.FS.createDirAll ((← cacheDir) / "toolchains")
-    let url := s!"https://github.com/leanprover/lean4/releases/download/v{leanWasmVersion}/{wasmToolchain}.tar.zst"
-    let tar := ((← cacheDir) / "toolchains" / s!"{wasmToolchain}.tar.zst").toString
-    let _ ← sh "curl" #["-sSfL", url, "-o", tar]
-    let _ ← sh "tar" #["--zstd", "-xf", tar, "-C", ((← cacheDir) / "toolchains").toString]
-
-/-- Find an `emsdk_env.sh` to source (cache first, then `~/emsdk`). -/
-def findEmsdkEnv : IO (Option FilePath) := do
-  for c in [(← cacheDir) / "emsdk" / "emsdk_env.sh", (← homeDir) / "emsdk" / "emsdk_env.sh"] do
-    if (← c.pathExists) then return some c
-  return none
-
-/-- Ensure an emcc is available, installing emscripten into ~/.qed/emsdk only if
-    nothing usable is found. Returns an env file to source, or none if `emcc` is
-    already directly on PATH. -/
-def ensureEmscripten : IO (Option FilePath) := do
-  if let some e ← findEmsdkEnv then return some e
-  if (← onPath "emcc") then return none
-  step "installing emscripten (one-time, ~1GB) into ~/.qed/emsdk"
-  let dir := (← cacheDir) / "emsdk"
-  let _ ← sh "git" #["clone", "--depth", "1", "https://github.com/emscripten-core/emsdk.git", dir.toString]
-  let _ ← sh "bash" #["-c", s!"cd {dir} && ./emsdk install latest && ./emsdk activate latest"]
-  return some (dir / "emsdk_env.sh")
-
-/-- Run emcc, sourcing the emscripten environment if needed. -/
-def runEmcc (args : Array String) : IO UInt32 := do
-  match ← ensureEmscripten with
-  | some envFile =>
-      sh "bash" (#["-c", s!"source {envFile} >/dev/null 2>&1; emcc \"$@\"", "emcc"] ++ args)
-  | none => sh "emcc" args
-
-/-! ### WASM build -/
-
-def emccArgs (cfiles : Array FilePath) (outJs : FilePath) (prod : Bool)
-    (tc qh : FilePath) : Array String :=
-  #["-o", outJs.toString, "-I", (tc / "include").toString, "-L", (tc / "lib" / "lean").toString]
-  ++ cfiles.map (·.toString)
-  ++ #[(qh / "runtime" / "qed_dom.c").toString, (qh / "runtime" / "uv_stubs.c").toString]
-  ++ #["-lInit", "-lLean", "-lleancpp", "-lleanrt", "-lStd",
-       "-sFORCE_FILESYSTEM", "-sMODULARIZE", "-sEXPORT_NAME=Qed",
-       "-sEXPORTED_FUNCTIONS=_main,_qed_run_init,_qed_run_dispatch,_qed_run_dispatch_str,_qed_run_stream_chunk,_qed_run_stream_done,_qed_run_http_done,_qed_run_url_changed,_qed_run_local_dispatch,_qed_run_local_dispatch_str,_qed_run_local_snapshot,_qed_run_local_restore,_qed_run_effect_done,_qed_run_port_recv,_malloc,_free",
-       "-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,stringToNewUTF8",
-       "-sEXIT_RUNTIME=0", "-sMAIN_MODULE=2", "-sLINKABLE=0", "-sEXPORT_ALL=0",
-       -- the diff/render walk a child list with one stack frame per element; the
-       -- default 64KB wasm stack overflows on long lists, so give it room (16MB),
-       -- and start with enough memory to hold the stack-first layout.
-       "-sSTACK_SIZE=16777216", "-sINITIAL_MEMORY=33554432",
-       "-sALLOW_MEMORY_GROWTH=1", "-fwasm-exceptions", "-pthread", "-flto"]
-  ++ (if prod then #["-Oz"] else #[])
-
-/-- Generate C for the web entry (and its dependencies, including the qed package)
-    and link it to `outDir/qed.{js,wasm}`. -/
-def linkWasm (outDir : FilePath) (prod : Bool) : IO Bool := do
-  ensureToolchain
-  let wr ← webRoot
-  if (← sh "lake" #["build", wr ++ ":c.o"]) != 0 then return false
-  -- Collect *generated* Lean C from the project and from Lake dependency packages
-  -- (the qed lib) — only files under a `build/ir` dir, never hand-written C like
-  -- the framework's runtime/*.c that a git dependency carries in its checkout.
-  -- Native.c / Cli.c each carry their own `main`; only the web entry's belongs.
-  let allC ← collect ".lake" "c"
-  -- Each of these modules carries its own `main`; link only the chosen web entry.
-  let entryC := ((wr.splitOn ".").getLastD "") ++ ".c"   -- e.g. "ChatWeb.c"
-  let altMains := ["Native.c", "Cli.c", "UsersSSR.c", "TemplateSSR.c", "BookshelfSSR.c", "Web.c", "ChatWeb.c", "SignupWeb.c", "BookingWeb.c", "TodoWeb.c", "UsersWeb.c", "LocalWeb.c", "EffectsWeb.c", "SocketWeb.c", "LiveWeb.c", "BookshelfWeb.c", "Bench.c", "BenchAppWeb.c", "SignalsWeb.c", "TemplateWeb.c", "BenchScalarWeb.c", "BenchScalarDiffWeb.c", "BenchListWeb.c", "BenchListDiffWeb.c"].filter (· ≠ entryC)
-  let cfiles := allC.filter (fun p =>
-    (p.toString.splitOn "build/ir").length > 1 && (p.fileName.getD "") ∉ altMains)
-  IO.FS.createDirAll outDir
-  let tc ← toolchainDir
-  let qh ← frameworkHome
-  let code ← runEmcc (emccArgs cfiles (outDir / "qed.js") prod tc qh)
-  return code == 0
-
-/-- Copy the page + host driver (+ server for prod) next to the wasm. -/
-def stageAssets (outDir : FilePath) (withServer : Bool) : IO Unit := do
-  let names := if withServer then ["index.html", "host.js", "serve.py"] else ["index.html", "host.js"]
-  for n in names do
-    let src ← runtimeFile n
-    let _ ← sh "cp" #[src.toString, (outDir / n).toString]
-
 def writeBuildId (outDir : FilePath) : IO Unit := do
   IO.FS.writeFile (outDir / "__build_id") (toString (← IO.monoMsNow))
 
@@ -204,7 +117,7 @@ def effectsCovered : IO Bool := do
   let qh ← frameworkHome
   let runtimePath := qh / "Qed" / "Runtime.lean"
   let driverPath  := qh / "Qed" / "Driver.lean"
-  let hostPath    := qh / "runtime" / "host.js"
+  let hostPath    := qh / "runtime" / "qed_host.mjs"
   unless (← runtimePath.pathExists) && (← hostPath.pathExists) do return true  -- not the framework layout
   let runtime ← IO.FS.readFile runtimePath
   let driver  ← if (← driverPath.pathExists) then IO.FS.readFile driverPath else pure ""
@@ -216,13 +129,13 @@ def effectsCovered : IO Bool := do
     | []        => []
   -- kinds come from `Cmd` smart constructors (`.fx`/`.fxResult` in Runtime) AND from the
   -- driver itself (`Dom.effect "…"`, e.g. `signal.set`/`ws.open`/`event.listen`) — both must
-  -- have a host.js case, so scan both files.
+  -- have a qed_host.mjs case, so scan both files.
   let emitted := (after ".fx \"" "\"" runtime) ++ (after ".fxResult \"" "\"" runtime)
               ++ (after "Dom.effect \"" "\"" driver) ++ (after "Dom.effectResult \"" "\"" driver)
   let handled := after "case '" "'" host
   let missing := emitted.filter (fun k => k != "" && !handled.contains k)
   for k in missing do
-    IO.eprintln (red s!"  effect kind \"{k}\" is emitted by a Cmd but no host.js case handles it")
+    IO.eprintln (red s!"  effect kind \"{k}\" is emitted by a Cmd but no qed_host.mjs case handles it")
   return missing.isEmpty
 
 /-- Net bracket nesting a token contributes (`{`/`(`/`[` open, `}`/`)`/`]` close). -/
@@ -282,8 +195,6 @@ def invariantNote : IO Unit := do
 def verify : IO Bool := do
   step "checking proofs (lake build)"
   if (← sh "lake" #["build"]) != 0 then return false
-  let wr ← webRoot
-  if (← sh "lake" #["build", wr ++ ":c.o"]) != 0 then return false
   step "verifying (no sorry / axiom-clean / effect coverage)"
   let ok1 ← grepForbidden
   let ok2 ← axiomClean
@@ -298,15 +209,6 @@ def cmdCheck : IO UInt32 := do
     IO.println (green "✓ verified"); return 0
   else IO.eprintln (red "✗ verification failed"); return 1
 
-def cmdBuild (prod : Bool) : IO UInt32 := do
-  if !(← verify) then IO.eprintln (red "✗ verification failed"); return 1
-  let outDir := if prod then distDir else devDir
-  step (if prod then "linking optimized WASM → dist/" else "linking WASM")
-  if !(← linkWasm outDir prod) then IO.eprintln (red "✗ wasm link failed"); return 1
-  stageAssets outDir (withServer := prod)
-  IO.println (green s!"✓ build complete → {outDir}")
-  return 0
-
 /-- The app's *web entry* module — the one whose `main` is `Qed.run app` (what
     `qed new` scaffolds). Set `QED_JS_ROOT` for the framework's own examples. -/
 def jsRoot : IO String := do
@@ -314,10 +216,15 @@ def jsRoot : IO String := do
   | some r => return r
   | none   => return (← env "QED_WEB_ROOT").getD "Web"
 
-def indexHtmlJs : String :=
+/-- The page that loads the transpiled app. In dev it polls `__build_id` to live-reload. -/
+def indexHtml (dev : Bool) : String :=
+  let reload := if dev then
+    "<script>(function(){let v=null;setInterval(async()=>{try{const t=await (await fetch('__build_id',{cache:'no-store'})).text();if(v&&v!==t)location.reload();v=t;}catch(e){}},700)})()</script>\n"
+  else ""
   "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">" ++
   "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>qed</title></head>\n" ++
-  "<body><div id=\"app\"></div>\n<script type=\"module\" src=\"./qed_host.mjs\"></script>\n</body>\n</html>\n"
+  "<body><div id=\"app\"></div>\n" ++ reload ++
+  "<script type=\"module\" src=\"./qed_host.mjs\"></script>\n</body>\n</html>\n"
 
 /-- The transpiler entry set: the app's `main` (`Qed.run app`) plus the framework's 13
     `@[export]` driver functions. This is fixed and app-agnostic — no per-app shim. -/
@@ -330,45 +237,44 @@ def driverEntries : Array String := #[
   "Qed.qedLocalSnapshot:qed_local_snapshot", "Qed.qedLocalRestore:qed_local_restore",
   "Qed.qedEffectDone:qed_effect_done", "Qed.qedPortRecv:qed_port_recv"]
 
-/-- `qed buildjs` — transpile the app AND the verified framework/driver (render, the
-    proven diff, the whole `Qed.run` loop) to plain JavaScript and stage a runnable
-    bundle in `dist-js/`. No WASM, no emscripten, no cross-origin-isolation. The only
-    hand-written JS is the DOM externs + event/effect host (`qed_dom.mjs`/`qed_host.mjs`),
-    the irreducible FFI. Works for any app whose web entry is `Qed.run app`. -/
-def cmdBuildJs (dev : Bool) : IO UInt32 := do
+/-- Transpile the app AND the verified framework/driver (render, the proven diff, the
+    whole `Qed.run` loop) to plain JavaScript and stage a runnable bundle in `outDir`.
+    The only hand-written JS is the DOM externs + event/effect host (`qed_dom.mjs` /
+    `qed_host.mjs`), the irreducible FFI. Works for any app whose entry is `Qed.run app`. -/
+def buildJs (outDir : FilePath) (prod : Bool) : IO Bool := do
   let mod ← jsRoot
-  step s!"lake build {mod}  +  qedjs (transpiler)"
-  if (← sh "lake" #["build", mod, "qedjs"]) != 0 then IO.eprintln (red "✗ lake build failed"); return 1
-  let outDir : FilePath := "dist-js"
+  if (← sh "lake" #["build", mod, "qedjs"]) != 0 then return false
   IO.FS.createDirAll outDir
-  step "transpiling Lean IR → JavaScript (app + framework + driver)"
   let qedjs := ((".lake" : FilePath) / "build" / "bin" / "qedjs").toString
   let appOut := (outDir / "app.mjs").toString
-  let minArgs := if dev then #[] else #["--min"]   -- the transpiler already tree-shakes
+  let minArgs := if prod then #["--min"] else #[]   -- the transpiler already tree-shakes
   if (← sh "lake" (#["env", qedjs] ++ minArgs ++ #[appOut, mod, "--"] ++ driverEntries)) != 0 then
-    IO.eprintln (red "✗ transpile failed"); return 1
-  step "staging runtime + DOM externs + host + index.html"
+    return false
   for f in ["qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"] do
     IO.FS.writeFile (outDir / f) (← IO.FS.readFile (← runtimeFile f))
-  IO.FS.writeFile (outDir / "index.html") indexHtmlJs
-  unless dev do
+  IO.FS.writeFile (outDir / "index.html") (indexHtml (dev := !prod))
+  if prod then
     if (← onPath "esbuild") then
-      step "minifying with esbuild"
       for f in ["app.mjs", "qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"] do
         let p := (outDir / f).toString
         discard <| sh "bash" #["-c", s!"esbuild {p} --minify --format=esm --outfile={p}.min && mv {p}.min {p}"]
-  let (_, sz) ← shOut "bash" #["-c",
-    s!"cat {outDir}/*.mjs | gzip -c | wc -c"]
-  IO.println (green s!"✓ JS build complete → {outDir} (no WASM) — {sz.trim} bytes gzipped")
+  return true
+
+def cmdBuild (prod : Bool) : IO UInt32 := do
+  if !(← verify) then IO.eprintln (red "✗ verification failed"); return 1
+  let outDir := if prod then distDir else devDir
+  step s!"transpiling Lean → JavaScript → {outDir}/"
+  if !(← buildJs outDir prod) then IO.eprintln (red "✗ build failed"); return 1
+  let (_, sz) ← shOut "bash" #["-c", s!"cat {outDir}/*.mjs | gzip -c | wc -c"]
+  IO.println (green s!"✓ build complete → {outDir} (no WASM) — {sz.trim} bytes gzipped")
   return 0
 
 def serveDir (dir : FilePath) : IO UInt32 := do
   IO.println s!"serving {dir} → http://localhost:{devPort}"
-  let serve ← runtimeFile "serve.py"
-  sh "python3" #[serve.toString, devPort, dir.toString]
+  sh "python3" #["-m", "http.server", devPort, "--directory", dir.toString]
 
 def cmdStart : IO UInt32 := do
-  if !(← (distDir / "qed.wasm").pathExists) then
+  if !(← (distDir / "app.mjs").pathExists) then
     IO.eprintln (red "no production build found — run `qed build` first"); return 1
   serveDir distDir
 
@@ -452,10 +358,10 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "js_gate_test.mjs").pathExists) then
     step "running differential gate (transpiled JS == native Lean)"
     if (← sh "node" #["test/js_gate_test.mjs"]) != 0 then failed := true
-  -- JS transpiler — the FULL driver (no WASM): `qed buildjs` then drive it in a browser.
+  -- JS transpiler — the FULL transpiled driver (no WASM): build, then drive it in a browser.
   if (← (FilePath.mk "test" / "js_driver_browser_test.mjs").pathExists) then
     step "building JS bundle + running transpiled-driver browser test"
-    if (← cmdBuildJs (dev := false)) != 0 then failed := true
+    if !(← buildJs devDir (prod := false)) then failed := true
     else if (← sh "node" #["test/js_driver_browser_test.mjs"]) != 0 then failed := true
   if failed then return 1 else return 0
 
@@ -474,10 +380,9 @@ partial def watchLoop (marker : FilePath) : IO Unit := do
   if out.trim != "" then
     let _ ← sh "touch" #[marker.toString]
     step "change detected — rebuilding"
-    if (← linkWasm devDir (prod := false)) then
-      stageAssets devDir (withServer := false)
+    if (← buildJs devDir (prod := false)) then
       writeBuildId devDir
-      let _ ← effectsCovered   -- warn (non-fatal) if a new effect lacks a host.js case
+      let _ ← effectsCovered   -- warn (non-fatal) if a new effect lacks a qed_host.mjs case
       IO.println (green "✓ reloaded")
     else
       IO.eprintln (red "✗ build failed — fix and save again")
@@ -488,14 +393,11 @@ def cmdDev : IO UInt32 := do
   let marker := devDir / ".watch"
   let _ ← sh "touch" #[marker.toString]
   step "initial build"
-  if (← linkWasm devDir (prod := false)) then
-    stageAssets devDir (withServer := false)
-  else
+  unless (← buildJs devDir (prod := false)) do
     IO.eprintln (red "initial build failed — fix the error and save; dev will rebuild")
   writeBuildId devDir
-  let serve ← runtimeFile "serve.py"
   let _server ← IO.Process.spawn
-    { cmd := "python3", args := #[serve.toString, devPort, devDir.toString],
+    { cmd := "python3", args := #["-m", "http.server", devPort, "--directory", devDir.toString],
       stdin := .null, stdout := .null, stderr := .inherit }
   IO.println (green s!"\nqed dev → http://localhost:{devPort}   (watching; Ctrl-C to stop)\n")
   watchLoop marker
@@ -505,13 +407,8 @@ def cmdDoctor : IO UInt32 := do
   IO.println "qed doctor:"
   let report (label : String) (ok : Bool) : IO Unit :=
     IO.println s!"  {if ok then green "✓" else red "✗"} {label}"
-  for c in ["lean", "lake", "python3", "node", "curl"] do
+  for c in ["lean", "lake", "node", "python3"] do
     report c (← onPath c)
-  let hasEmcc ← onPath "emcc"
-  let hasEmsdk := (← findEmsdkEnv).isSome
-  report "emscripten (emcc / emsdk)" (hasEmcc || hasEmsdk)
-  let tc ← toolchainDir
-  report s!"wasm runtime ({wasmToolchain})" (← tc.pathExists)
   return 0
 
 def cmdNew (dir : String) : IO UInt32 := do
@@ -519,7 +416,7 @@ def cmdNew (dir : String) : IO UInt32 := do
   if (← root.pathExists) then IO.eprintln (red s!"{dir} already exists"); return 1
   step s!"scaffolding {dir}"
   IO.FS.createDirAll root
-  IO.FS.writeFile (root / "lean-toolchain") s!"leanprover/lean4:v{leanWasmVersion}\n"
+  IO.FS.writeFile (root / "lean-toolchain") s!"leanprover/lean4:v{leanVersion}\n"
   IO.FS.writeFile (root / "lakefile.lean") <|
     "import Lake\nopen Lake DSL\n\n" ++
     "package app where\n\n" ++
@@ -569,8 +466,6 @@ def main (args : List String) : IO UInt32 := do
   | ["dev"]                  => cmdDev
   | ["build"]                => cmdBuild (prod := true)
   | ["build", "--dev"]       => cmdBuild (prod := false)
-  | ["buildjs"]              => cmdBuildJs (dev := false)
-  | ["buildjs", "--dev"]     => cmdBuildJs (dev := true)
   | ["start"] | ["preview"]  => cmdStart
   | ["test"]                 => cmdTest
   | ["check"]                => cmdCheck

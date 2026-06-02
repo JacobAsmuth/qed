@@ -4,8 +4,8 @@
 #   curl -sSfL https://raw.githubusercontent.com/JacobAsmuth/qed/main/install.sh | sh
 #
 # Installs the Lean toolchain (elan) if missing, fetches the qed framework into
-# ~/.qed/qed, builds the qed CLI, and puts a `qed` launcher on PATH. The heavy
-# wasm toolchain and emscripten are fetched on first `qed build`, not here.
+# ~/.qed/qed, builds the qed CLI, and puts a `qed` launcher on PATH. `qed build`
+# transpiles the app to plain JavaScript — no emscripten, no wasm toolchain.
 set -euo pipefail
 
 REPO="https://github.com/JacobAsmuth/qed"
@@ -56,9 +56,6 @@ cat > "${BIN}/qed" <<'LAUNCH'
 #!/usr/bin/env bash
 export PATH="${HOME}/.elan/bin:${PATH}"
 export QED_HOME="${HOME}/.qed/qed"
-for e in "${HOME}/.qed/emsdk/emsdk_env.sh" "${HOME}/emsdk/emsdk_env.sh"; do
-  [ -f "$e" ] && { . "$e" >/dev/null 2>&1; break; }
-done
 exec "${HOME}/.qed/qed/.lake/build/bin/qed" "$@"
 LAUNCH
 chmod +x "${BIN}/qed"

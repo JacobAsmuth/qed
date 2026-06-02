@@ -2,8 +2,8 @@ import Lake
 open Lake DSL
 
 package qed where
-  -- WASM is built by `scripts/build_wasm.sh`, which compiles the C generated
-  -- here and links it against the prebuilt Lean `linux_wasm32` runtime.
+  -- The browser build is plain JavaScript: `qed build` runs the `qedjs` transpiler
+  -- below over the verified app + framework. There is no native/WASM browser target.
 
 @[default_target]
 lean_lib Qed where
@@ -26,12 +26,6 @@ lean_lib Examples where
     Uses no DOM externs, so it links natively. -/
 lean_exe counter where
   root := `Examples.Native
-
-/-- The counter demo as the *WASM* entry point. Declared so the build script can
-    generate its C via the `:c.o` facet; it is never linked as a native binary
-    (it references the browser-only DOM externs). -/
-lean_exe web where
-  root := `Examples.Web
 
 /-- The `qed` CLI. Drive it via the `./qed` shim, which sets up the environment
     and runs this binary. -/

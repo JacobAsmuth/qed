@@ -8,7 +8,7 @@
   real calendar day, the same guarantee `Field` gives a validated string.
 
   Core-syntax only (no `import Lean`), so apps that use it don't pull the Lean
-  elaborator into their wasm binary.
+  elaborator into their transpiled JS bundle.
 -/
 import Qed.Json   -- for the Date ⟷ JSON codec below (Json imports nothing, so no cycle)
 

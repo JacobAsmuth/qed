@@ -2,9 +2,9 @@
   Qed.Dom — the FFI boundary to the browser DOM.
 
   This is the only impure, unverified surface in the framework: `@[extern]`
-  declarations whose C implementations (in `runtime/qed_dom.c`) call real
-  JavaScript via emscripten's `EM_JS`. Everything above this line is pure, total
-  Lean.
+  declarations whose implementations (in `runtime/qed_dom.mjs`) touch the real DOM.
+  The transpiler (`Js.Backend`) maps each to its `qed_dom.mjs` method; everything
+  above this FFI line is pure, total Lean that transpiles to plain JavaScript.
 
   DOM nodes are referenced by integer handles into a JS-side table. These
   primitives are deliberately minimal — create/append/set-attr/set-text/replace —

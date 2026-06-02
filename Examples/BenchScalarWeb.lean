@@ -1,5 +1,5 @@
 /-
-  WASM entry: the scalar benchmark run as a fine-grained `View` template.
+  Browser entry: the scalar benchmark run as a fine-grained `View` template.
 -/
 import Examples.BenchScalar
 import Qed.Driver

@@ -1,7 +1,7 @@
 /-
-  WASM entry point for the streaming chat demo. Registers the pure `chatApp` with
+  Browser entry point for the streaming chat demo. Registers the pure `chatApp` with
   the runtime; the JS driver mounts it and dispatches click/input/stream events.
-  Compiled to WASM only (it pulls in the DOM externs), never linked natively.
+  transpiled to JavaScript (it uses the DOM externs).
 -/
 import Examples.Chat
 import Qed.Driver

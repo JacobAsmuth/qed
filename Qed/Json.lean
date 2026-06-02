@@ -650,7 +650,7 @@ instance [FromJson α] : FromJsonField (Option α) where
 a JSON key of the same name, plus the two string-level helpers `User.decode :
 String → Except String User` (parse then decode) and `User.encode : User → String`
 (encode then render). It is a core-syntax macro (no `import Lean`), so apps that use
-it do not pull the Lean elaborator into their WASM binary. -/
+it do not pull the Lean elaborator into their transpiled JS bundle. -/
 
 open Lean in
 syntax (name := jsonCodecCmd) "jsonCodec " ident "[" ident,* "]" : command

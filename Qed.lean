@@ -21,5 +21,5 @@ import Qed.Resource
 import Qed.Style
 -- Note: `Qed.Dom` and `Qed.Driver` are intentionally NOT re-exported here. They
 -- reference the browser-only DOM externs, so pure app modules (which `import Qed`)
--- stay free of them and link on the native target. WASM entry points import
+-- stay free of them (and link natively for SSR). Browser entry points import
 -- `Qed.Driver` explicitly (see `Examples/Web.lean`).

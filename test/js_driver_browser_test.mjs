@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import puppeteer from 'puppeteer';
 const PORT = 8137;
-const DIR = new URL('../dist-js', import.meta.url).pathname;
+const DIR = new URL('../.qed/dev', import.meta.url).pathname;
 const server = spawn('python3', ['-m', 'http.server', String(PORT), '--directory', DIR], { stdio: 'ignore' });
 await sleep(700);
 let failures = 0;

@@ -1,4 +1,4 @@
-/- WASM entry: the plain-Html keyed-list baseline, run through the verified diff path. -/
+/- Browser entry: the plain-Html keyed-list baseline, run through the verified diff path. -/
 import Examples.BenchListDiff
 import Qed.Driver
 

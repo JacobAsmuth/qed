@@ -46,7 +46,7 @@
 
   Note: this file deliberately does *not* `import Lean`. `syntax`/`macro_rules` are
   core features, so the macro carries zero runtime footprint — apps that use it never
-  link the Lean elaborator into their WASM binary. The only import is `Qed.Runtime`,
+  pull the Lean elaborator into their transpiled JS bundle. The only import is `Qed.Runtime`,
   for the `still`/`also` effect wrappers the discharger unfolds; it too is `Lean`-free.
 -/
 import Qed.Runtime

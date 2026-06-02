@@ -1,7 +1,7 @@
 /-
-  WASM entry point for the signup-form demo. Registers the pure `Signup.app` with
+  Browser entry point for the signup-form demo. Registers the pure `Signup.app` with
   the runtime; the JS driver mounts it and dispatches click/input/checkbox events.
-  Compiled to WASM only (it pulls in the DOM externs), never linked natively.
+  transpiled to JavaScript (it uses the DOM externs).
 -/
 import Examples.Signup
 import Qed.Driver

@@ -1,4 +1,4 @@
-/- WASM entry: the keyed-list benchmark as a fine-grained `View` template. -/
+/- Browser entry: the keyed-list benchmark as a fine-grained `View` template. -/
 import Examples.BenchList
 import Qed.Driver
 

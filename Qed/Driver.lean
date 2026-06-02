@@ -12,7 +12,10 @@
   `update` (a `Cmd`) are interpreted here: a `stream` registers its callbacks and
   starts a streaming fetch whose chunks dispatch back through the same loop.
 
-  Imported by WASM entry points only; pure app code never references it.
+  Imported by browser entry points only; pure app code never references it. `qed
+  build` transpiles this whole driver to JavaScript (its `@[export]` functions are
+  the entry points the host calls); the hand-written FFI is only `runtime/qed_dom.mjs`
+  (DOM externs) and `runtime/qed_host.mjs` (event delegation + native effects).
 -/
 import Qed.Runtime
 import Qed.Diff

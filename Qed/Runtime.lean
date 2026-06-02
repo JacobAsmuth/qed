@@ -508,7 +508,7 @@ def App.renderModel (app : App Model Msg) (m : Model) : String :=
 def App.renderInitial (app : App Model Msg) : String :=
   app.renderModel app.init.1
 
-/-- Wrap rendered `#app` content in a complete static HTML document that loads the WASM
+/-- Wrap rendered `#app` content in a complete static HTML document that loads the transpiled JS
     bundle, which mounts the live app over the pre-rendered markup. A non-empty `state`
     (an app's `dehydrate model`) is embedded in a `#qed-state` script so the client starts
     from the server's model instead of refetching; `</` is broken so the JSON can't close the

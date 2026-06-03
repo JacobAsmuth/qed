@@ -73,6 +73,11 @@ structure Ctx where
   externs : Std.HashMap Name Decl
   /-- minified output: no comments, no indentation. -/
   min     : Bool := false
+  /-- the function currently being emitted + its params, so a tail self-call becomes a
+      loop `continue` instead of JS recursion (which has no TCO → stack overflow). Cleared
+      inside join-point bodies, where a `continue` would target the wrong construct. -/
+  selfFn     : Option Name := none
+  selfParams : Array Param := #[]
 
 def Ctx.js (c : Ctx) (n : Name) : String :=
   match c.names.get? n with
@@ -141,11 +146,50 @@ def emitExpr (c : Ctx) (ty : IRType) : IR.Expr → String
   | .lit (.str s)   => jsStr s
   | .isShared _     => "1"                        -- conservative: assume shared (Bool.true as u8)
 
+/-- Skip RC/metadata ops (dropped in JS) to the next real instruction. -/
+partial def skipRC : FnBody → FnBody
+  | .inc _ _ _ _ b => skipRC b
+  | .dec _ _ _ _ b => skipRC b
+  | .del _ b       => skipRC b
+  | .mdata _ b     => skipRC b
+  | b              => b
+
+/-- Is `cont` (after RC ops) just `ret z`? Then a preceding `fap self` is a tail self-call. -/
+def retsVar (z : VarId) (cont : FnBody) : Bool :=
+  match skipRC cont with
+  | .ret (.var w) => w == z
+  | _             => false
+
+/-- Does this body tail-call `self` (so the function needs a `while(true)` wrapper)? Does
+    not look inside join points — a self-call there is handled by the join point itself. -/
+partial def hasSelfTail (self : Name) : FnBody → Bool
+  | .vdecl z _ (.fap f _) cont => (f == self && retsVar z cont) || hasSelfTail self cont
+  | .vdecl _ _ _ b    => hasSelfTail self b
+  | .jdecl _ _ _ b    => hasSelfTail self b      -- skip the JP body; only the continuation
+  | .case _ _ _ alts  => alts.any (fun a => hasSelfTail self a.body)
+  | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b => hasSelfTail self b
+  | .sset _ _ _ _ _ b => hasSelfTail self b
+  | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b | .mdata _ b => hasSelfTail self b
+  | _ => false
+
 partial def emitBody (c : Ctx) (d : Nat) : FnBody → String
-  | .vdecl x ty e b   => s!"{c.ind d}let {v x} = {emitExpr c ty e};\n" ++ emitBody c d b
+  | .vdecl x ty e b   =>
+      -- A tail self-call `let x = self(args); return x` becomes a loop step.
+      match e with
+      | .fap f args =>
+          if c.selfFn == some f && retsVar x b then
+            let ps := c.selfParams
+            let n := min ps.size args.size
+            let tmp := (List.range n).map (fun i => s!"const _t{i} = {emitArg args[i]!};")
+            let asg := (List.range n).map (fun i => s!"{v ps[i]!.x} = _t{i};")
+            s!"{c.ind d}" ++ "{ " ++ String.intercalate " " (tmp ++ asg) ++ " continue; }\n"
+          else s!"{c.ind d}let {v x} = {emitExpr c ty e};\n" ++ emitBody c d b
+      | _ => s!"{c.ind d}let {v x} = {emitExpr c ty e};\n" ++ emitBody c d b
   | .jdecl j xs val b =>
       let ps := String.intercalate ", " (xs.toList.map (v ·.x))
-      s!"{c.ind d}const {jp j} = ({ps}) => " ++ "{\n" ++ emitBody c (d+1) val ++ s!"{c.ind d}" ++ "};\n"
+      -- inside a join point `continue` would target the wrong loop, so disable self-tail there
+      let cj := { c with selfFn := none }
+      s!"{c.ind d}const {jp j} = ({ps}) => " ++ "{\n" ++ emitBody cj (d+1) val ++ s!"{c.ind d}" ++ "};\n"
         ++ emitBody c d b
   | .set x i y b      => s!"{c.ind d}{v x}.f[{i}] = {emitArg y};\n" ++ emitBody c d b
   | .setTag x cidx b  => s!"{c.ind d}{v x}.t = {cidx};\n" ++ emitBody c d b
@@ -180,7 +224,13 @@ def emitDecl (c : Ctx) : Decl → String
       else
         let ps := String.intercalate ", " (xs.toList.map (v ·.x))
         let note := if c.min then "" else s!"/* {f} */ "
-        s!"function {c.js f}({ps}) " ++ note ++ "{\n" ++ emitBody c 1 body ++ "}\n"
+        let c' := { c with selfFn := some f, selfParams := xs }
+        let bodyStr := emitBody c' 1 body
+        -- wrap in a loop only when there's a tail self-call to turn into `continue`
+        let inner := if hasSelfTail f body then
+            s!"{c.ind 1}while (true) " ++ "{\n" ++ bodyStr ++ s!"{c.ind 1}" ++ "}\n"
+          else bodyStr
+        s!"function {c.js f}({ps}) " ++ note ++ "{\n" ++ inner ++ "}\n"
   | .extern .. => ""
 
 /-! ## Program assembly -/

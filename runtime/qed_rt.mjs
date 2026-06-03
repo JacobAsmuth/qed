@@ -26,6 +26,7 @@ export function app(clo, extra) {
 const W = 0;                                  // the IO world token
 export const PUnit = 0, Unit = 0;
 export const ioVal = (r) => r.f[0];           // value out of an EStateM.Result.ok(v, w)
+export const tc = (a) => ({ __tc: a });        // tail-self-call marker (trampoline; see Js.Backend)
 export function memo(f) { let v, done = false; return () => { if (!done) { v = f(); done = true; } return v; }; } // a module global: computed once, shared
 export const mkOk  = (v, w = W) => ({ t: 0, f: [v, w], s: {}, u: {} });   // EStateM.Result.ok
 export const mkErr = (e, w = W) => ({ t: 1, f: [e, w], s: {}, u: {} });   // EStateM.Result.error

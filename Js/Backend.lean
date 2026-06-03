@@ -160,12 +160,12 @@ def retsVar (z : VarId) (cont : FnBody) : Bool :=
   | .ret (.var w) => w == z
   | _             => false
 
-/-- Does this body tail-call `self` (so the function needs a `while(true)` wrapper)? Does
-    not look inside join points — a self-call there is handled by the join point itself. -/
+/-- Does this body tail-call `self` anywhere (including inside join points)? If so the
+    function is a loop and gets a trampoline. -/
 partial def hasSelfTail (self : Name) : FnBody → Bool
   | .vdecl z _ (.fap f _) cont => (f == self && retsVar z cont) || hasSelfTail self cont
   | .vdecl _ _ _ b    => hasSelfTail self b
-  | .jdecl _ _ _ b    => hasSelfTail self b      -- skip the JP body; only the continuation
+  | .jdecl _ _ v b    => hasSelfTail self v || hasSelfTail self b
   | .case _ _ _ alts  => alts.any (fun a => hasSelfTail self a.body)
   | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b => hasSelfTail self b
   | .sset _ _ _ _ _ b => hasSelfTail self b
@@ -174,22 +174,18 @@ partial def hasSelfTail (self : Name) : FnBody → Bool
 
 partial def emitBody (c : Ctx) (d : Nat) : FnBody → String
   | .vdecl x ty e b   =>
-      -- A tail self-call `let x = self(args); return x` becomes a loop step.
+      -- A tail self-call `let x = self(args); return x` returns a trampoline marker
+      -- `$.tc([args])`; the marker propagates up (even out of join points) to the loop
+      -- driver wrapping the function, which re-enters with the new args. No JS recursion.
       match e with
       | .fap f args =>
           if c.selfFn == some f && retsVar x b then
-            let ps := c.selfParams
-            let n := min ps.size args.size
-            let tmp := (List.range n).map (fun i => s!"const _t{i} = {emitArg args[i]!};")
-            let asg := (List.range n).map (fun i => s!"{v ps[i]!.x} = _t{i};")
-            s!"{c.ind d}" ++ "{ " ++ String.intercalate " " (tmp ++ asg) ++ " continue; }\n"
+            s!"{c.ind d}return $.tc([{String.intercalate ", " (args.toList.map emitArg)}]);\n"
           else s!"{c.ind d}let {v x} = {emitExpr c ty e};\n" ++ emitBody c d b
       | _ => s!"{c.ind d}let {v x} = {emitExpr c ty e};\n" ++ emitBody c d b
   | .jdecl j xs val b =>
       let ps := String.intercalate ", " (xs.toList.map (v ·.x))
-      -- inside a join point `continue` would target the wrong loop, so disable self-tail there
-      let cj := { c with selfFn := none }
-      s!"{c.ind d}const {jp j} = ({ps}) => " ++ "{\n" ++ emitBody cj (d+1) val ++ s!"{c.ind d}" ++ "};\n"
+      s!"{c.ind d}const {jp j} = ({ps}) => " ++ "{\n" ++ emitBody c (d+1) val ++ s!"{c.ind d}" ++ "};\n"
         ++ emitBody c d b
   | .set x i y b      => s!"{c.ind d}{v x}.f[{i}] = {emitArg y};\n" ++ emitBody c d b
   | .setTag x cidx b  => s!"{c.ind d}{v x}.t = {cidx};\n" ++ emitBody c d b
@@ -224,13 +220,22 @@ def emitDecl (c : Ctx) : Decl → String
       else
         let ps := String.intercalate ", " (xs.toList.map (v ·.x))
         let note := if c.min then "" else s!"/* {f} */ "
-        let c' := { c with selfFn := some f, selfParams := xs }
-        let bodyStr := emitBody c' 1 body
-        -- wrap in a loop only when there's a tail self-call to turn into `continue`
-        let inner := if hasSelfTail f body then
-            s!"{c.ind 1}while (true) " ++ "{\n" ++ bodyStr ++ s!"{c.ind 1}" ++ "}\n"
-          else bodyStr
-        s!"function {c.js f}({ps}) " ++ note ++ "{\n" ++ inner ++ "}\n"
+        if hasSelfTail f body then
+          -- trampoline: run the body; if it returns a self-call marker, reassign the
+          -- params and re-run — turning self-tail-recursion into a loop with O(1) stack.
+          let c' := { c with selfFn := some f, selfParams := xs }
+          let bodyStr := emitBody c' 2 body
+          let reasn := s!"[{String.intercalate ", " (xs.toList.map (v ·.x))}] = __r.__tc;"
+          s!"function {c.js f}({ps}) " ++ note ++ "{\n" ++
+            s!"{c.ind 1}const __step = () => " ++ "{\n" ++ bodyStr ++ s!"{c.ind 1}" ++ "};\n" ++
+            s!"{c.ind 1}while (true) " ++ "{\n" ++
+            s!"{c.ind 2}const __r = __step();\n" ++
+            s!"{c.ind 2}if (__r !== null && typeof __r === \"object\" && __r.__tc !== undefined) " ++
+              "{ " ++ reasn ++ " continue; }\n" ++
+            s!"{c.ind 2}return __r;\n" ++
+            s!"{c.ind 1}" ++ "}\n}\n"
+        else
+          s!"function {c.js f}({ps}) " ++ note ++ "{\n" ++ emitBody c 1 body ++ "}\n"
   | .extern .. => ""
 
 /-! ## Program assembly -/

@@ -382,9 +382,13 @@ signals), so a value-only update touches no diff — it's O(changed bindings), w
 walk. The update step is proven to match a full re-render (`patch_render`), and `qed check`
 enforces it.
 
-One current limit: the renderer and diff recurse once per child, so a single list with many
-thousands of rows can exceed the JavaScript call stack. Ordinary lists are fine; making the
-hot paths iterative is on the list.
+A note on stack depth: Lean expresses iteration as tail recursion, and the transpiler turns
+every tail call into a loop, so building, folding, diffing, and walking long lists all run in
+constant stack — a list of 100,000+ rows reconciles without trouble. (The verified diff's
+children reconcile runs as a tail-recursive form that's *proven equal* to the structural one,
+so `diff_apply` still describes the code that runs.) A couple of pure helpers off the
+interactive path — the string renderer used for server-side rendering, JSON over a very large
+array — still recurse per element; making those iterative too is on the list.
 
 ## The `qed` command
 

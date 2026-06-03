@@ -106,7 +106,7 @@ try {
 }
 
 const ops = ['create', 'update', 'swap', 'reverse'];
-const cols = [['qed', 'Qed (wasm)'], ['react-plain', 'React'], ['react-memo', 'React.memo']];
+const cols = [['qed', 'Qed (js)  '], ['react-plain', 'React'], ['react-memo', 'React.memo']];
 console.log(`\n  10,000-row keyed list — median of ${REPS} runs, synchronous reconcile+patch (ms)\n`);
 console.log('  op'.padEnd(12) + cols.map(([, h]) => h.padStart(13)).join(''));
 for (const op of ops) {

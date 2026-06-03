@@ -88,7 +88,7 @@ end
 mutual
   /-- Compute the patch from `old` to `new`. Recurses on the *new* tree; the old
       tree is only ever read (positionally, or by key lookup), never recursed into —
-      which is what lets the matched `diff (oldArr.getD j …) n` call in `diffChildren`
+      which is what lets the matched `diff (oldArr.getD j …) n` call in `diffChildrenTR`
       terminate (its second argument `n` is a child of the new tree). -/
   def diff : Html msg → Html msg → Patch msg
     | .text _,          .text s          => .setText s
@@ -103,43 +103,74 @@ mutual
               fun _ n => (Html.keyOf n).bind (fun k => km[k]?)
             else
               fun i _ => if i < oldArr.size then some i else none
-          .patchElement a₂ (diffChildren oldArr pick 0 c₂)
+          .patchElement a₂ (diffChildrenTR oldArr pick #[] 0 c₂).toList
         else .replace (.element t₂ a₂ c₂)
     | .lazy k₁ s₁,      .lazy k₂ s₂      =>
         -- same key ⇒ unchanged: skip without diffing `s₂`; else patch the content
         if k₁ = k₂ then .lazyReuse k₂ s₂ else .lazyPatch k₂ (diff s₁ s₂)
     | _,                b                 => .replace b
-  /-- The one children reconcile. For each new child (in order) `pick` chooses which old
-      child to reuse — by position or by key — patched in place; `none` builds it fresh.
-      Surplus old children are simply never referenced (so they drop). `pick` is a pure
-      performance/identity choice: whatever index it returns, `diff` patches that old child
-      into the new one exactly, so it carries no proof obligation (`diffChildren_apply`). -/
-  def diffChildren (oldArr : Array (Html msg)) (pick : Nat → Html msg → Option Nat) :
-      Nat → List (Html msg) → List (KeyedStep msg)
-    | _, []      => []
+  /-- The one children reconcile, tail-recursive over the new children (accumulating into
+      `acc`), so it runs in O(1) JS stack for a list of any length. For each new child
+      `pick` chooses which old child to reuse — by position or by key — patched in place;
+      `none` builds it fresh. `pick` carries no proof obligation (`diffChildren_apply`). -/
+  def diffChildrenTR (oldArr : Array (Html msg)) (pick : Nat → Html msg → Option Nat)
+      (acc : Array (KeyedStep msg)) : Nat → List (Html msg) → Array (KeyedStep msg)
+    | _, []      => acc
     | i, n :: ns =>
-        (match pick i n with
-         | some j => .reuse j (diff (oldArr.getD j default) n)
-         | none   => .create n) :: diffChildren oldArr pick (i + 1) ns
+        diffChildrenTR oldArr pick (acc.push (match pick i n with
+          | some j => .reuse j (diff (oldArr.getD j default) n)
+          | none   => .create n)) (i + 1) ns
 end
+
+/-- The structural model of the children reconcile — the spec `diff_apply` reasons about.
+    The runtime form `diffChildrenTR` is proven to produce exactly this (`diffChildrenTR_toList`). -/
+def diffChildren (oldArr : Array (Html msg)) (pick : Nat → Html msg → Option Nat) :
+    Nat → List (Html msg) → List (KeyedStep msg)
+  | _, []      => []
+  | i, n :: ns =>
+      (match pick i n with
+       | some j => .reuse j (diff (oldArr.getD j default) n)
+       | none   => .create n) :: diffChildren oldArr pick (i + 1) ns
+
+theorem diffChildrenTR_toList (oldArr : Array (Html msg)) (pick : Nat → Html msg → Option Nat)
+    (news : List (Html msg)) :
+    ∀ (acc : Array (KeyedStep msg)) (i : Nat),
+      (diffChildrenTR oldArr pick acc i news).toList = acc.toList ++ diffChildren oldArr pick i news := by
+  induction news with
+  | nil => intro acc i; simp [diffChildrenTR, diffChildren]
+  | cons n ns ih => intro acc i; simp [diffChildrenTR, diffChildren, ih]
 
 mutual
   /-- The pure model of applying a patch to a node. -/
   def applyPatch : Patch msg → Html msg → Html msg
     | .replace new,              _                       => new
     | .setText s,                _                       => .text s
-    | .patchElement attrs steps, .element tag _ children => .element tag attrs (applyChildren steps children)
+    | .patchElement attrs steps, .element tag _ children => .element tag attrs (applyChildrenTR #[] steps children).toList
     | .lazyReuse key sub,        _                       => .lazy key sub
     | .lazyPatch key p,          .lazy _ s               => .lazy key (applyPatch p s)
     | .lazyPatch key p,          h                       => .lazy key (applyPatch p h)
     | .patchElement _ _,         h                       => h
-  /-- Apply a children reconcile: each step yields one new child, reusing the old child
-      at its recorded index or building a fresh one. -/
-  def applyChildren : List (KeyedStep msg) → List (Html msg) → List (Html msg)
-    | [],                 _   => []
-    | .reuse i p :: rest, old => applyPatch p (old.toArray.getD i default) :: applyChildren rest old
-    | .create h :: rest,  old => h :: applyChildren rest old
+  /-- Apply a children reconcile, tail-recursive (accumulating into `acc`): each step yields
+      one new child, reusing the old child at its recorded index or building a fresh one. -/
+  def applyChildrenTR (acc : Array (Html msg)) :
+      List (KeyedStep msg) → List (Html msg) → Array (Html msg)
+    | [],                 _   => acc
+    | .reuse i p :: rest, old => applyChildrenTR (acc.push (applyPatch p (old.toArray.getD i default))) rest old
+    | .create h :: rest,  old => applyChildrenTR (acc.push h) rest old
 end
+
+/-- The structural model of applying a children reconcile — the spec the proof reasons about. -/
+def applyChildren : List (KeyedStep msg) → List (Html msg) → List (Html msg)
+  | [],                 _   => []
+  | .reuse i p :: rest, old => applyPatch p (old.toArray.getD i default) :: applyChildren rest old
+  | .create h :: rest,  old => h :: applyChildren rest old
+
+theorem applyChildrenTR_toList (steps : List (KeyedStep msg)) :
+    ∀ (acc : Array (Html msg)) (old : List (Html msg)),
+      (applyChildrenTR acc steps old).toList = acc.toList ++ applyChildren steps old := by
+  induction steps with
+  | nil => intro acc old; simp [applyChildrenTR, applyChildren]
+  | cons s rest ih => intro acc old; cases s <;> simp [applyChildrenTR, applyChildren, ih]
 
 mutual
   /-- **Correctness:** patching `a` with `diff a b` reproduces `b` exactly. The element
@@ -154,7 +185,10 @@ mutual
         split
         · rename_i ht
           subst ht
-          simp only [applyPatch]; rw [diffChildren_apply c₁]
+          -- the runtime uses the tail-recursive forms; bridge them to the structural spec
+          simp only [applyPatch, applyChildrenTR_toList, diffChildrenTR_toList,
+                     Array.toList_toArray, List.nil_append, List.toArray_toList]
+          rw [diffChildren_apply c₁]
         · simp only [applyPatch]
     -- a `lazyReuse` (same key) and a `lazyPatch` (different key, carrying `diff s₁ s₂`)
     -- both reproduce the new node exactly — no appeal to the equal-key promise here.
@@ -184,5 +218,6 @@ mutual
           rw [diff_apply (old.toArray.getD j default) n, diffChildren_apply old pick (i + 1) ns]
         · simp only [applyChildren]; rw [diffChildren_apply old pick (i + 1) ns]
 end
+
 
 end Qed

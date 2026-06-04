@@ -63,7 +63,7 @@ claim the automation can't close on its own.
 
 What's worth stating? Bounds, preconditions, mutual exclusion, effect safety, unique keys. See
 [`docs/invariants.md`](docs/invariants.md) for more examples. For many front-end developers and LLM's, an
-auto-checked invariant is a property that can't quietly be violated; for you, it's the "this can't
+auto-checked invariant is a property that can't quietly be violated. For you, it's the "this can't
 happen" finally made true.
 
 ## One way to write a view
@@ -75,7 +75,7 @@ apply each change: a model value that changed is written straight at its node; a
 and that one text node is rewritten, nothing else.
 
 The proof is what makes deciding for you safe: the value-update path is proven to produce the same
-DOM as a full re-render (`patch_render`), and the diff is proven correct (`diff_apply`). So the
+DOM as a full re-render and the diff is proven correct. So the
 cheap update can never drift from re-rendering everything, and the stale row or dropped update that
 a missing `key` or a misplaced `memo` causes elsewhere isn't something you can hit here.
 
@@ -84,9 +84,8 @@ a missing `key` or a misplaced `memo` causes elsewhere isn't something you can h
 A verified framework is worthless if the bytes in the browser aren't the bytes you proved things
 about. This is the question every "verified" claim has to answer, and Qed's answer is that there
 is no hand-written runtime to diverge from the proofs. `qed build` runs the Lean compiler's IR
-through a transpiler (`qedjs`) that emits JavaScript for **your app, the whole framework, and the
-driver that runs them:** the `render`, `diff`, `update`, and `view` you just read about, all of
-it, as JS.
+through a transpiler (`qedjs`) that emits JavaScript for your app, the whole framework, and the
+driver that runs them all as JS.
 
 ```text
 Lean app (Model, Msg, update, view, deriving/invariant; proofs auto-discharged)
@@ -115,8 +114,8 @@ rather than an exception you forgot.
 ### JSON
 
 `Json.parse` is a total function: bad input comes back as an `.error` value, never an exception.
-It also takes a depth budget (64 by default), and there's a proof, `parse_depth_le`, that whatever
-it returns nests no deeper than the number you gave it. A deeply-nested payload can't push past
+It also takes a depth budget (64 by default), and there's a proof that whatever it returns nests
+no deeper than the number you gave it. A deeply-nested payload can't push past
 the limit you set. `jsonStruct` writes the structure and its `ToJson`/`FromJson` from
 one field list, plus a `decode` that parses and decodes in a single call, recursively through
 nested structs:
@@ -136,8 +135,8 @@ jsonStruct User where
 A `Field p` is a value that carries a proof that the predicate `p` holds of it. The only way to
 build one is to pass validation, so by the time you're holding a `Signup`, every field in it is
 already valid, and an invalid form is not a thing you can construct. You write the predicates as
-ordinary `Prop`s and the `form` command does the rest, including the `canSubmit_iff` proof that
-the submit gate matches the validity it claims to enforce:
+ordinary `Prop`s and the `form` command does the rest, including a proof that the submit gate
+matches the validity it claims to enforce:
 
 ```lean
 abbrev Email (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
@@ -249,15 +248,15 @@ Verification doesn't make this slow, and the reason is the same "the framework d
 from earlier. Because the engine knows which subtrees are
 value-updates, a changed row's text and attributes are written straight at the node. A value-only
 update is **O(changed bindings)**, with no tree walk and no diff at all. That fast path is proven
-to agree with a full re-render (`patch_render`), and `qed check` enforces the proof. On the
-standard keyed-list benchmark this lands at React's update/swap/reorder numbers; the one place it's
-still behind is cold *create* of a very large list, which is honest compute and on the list below.
+to agree with a full re-render. On the
+standard keyed-list benchmark this lands ~at React's update/swap/reorder numbers; the one place it's
+still behind is cold *create* of a very large list.
 
 There's a subtler win in stack depth. Lean expresses iteration as tail recursion, and the
 transpiler turns every tail call into a loop, so building, folding, diffing, and walking long
 lists all run in constant stack, and a list of 100,000+ rows reconciles without trouble. (The
 verified diff's children reconcile runs as a tail-recursive form that is proven equal to the
-structural one, so `diff_apply` still describes the code that runs.)
+structural one, so the proof still describes the code that runs.)
 
 ## Getting started
 

@@ -70,8 +70,7 @@ happen" finally made true.
 
 Look again at the counter's view. It's ordinary control flow: a list of children, and where you
 need logic you reach for an `if`, a `.map`, string interpolation, a call to your own helper.
-There's no template language, no JSX, and (this is the part that matters) **no performance
-knobs.**
+There's no template language, no JSX, and **no performance knobs.**
 
 That last absence is deliberate, and it's the central idea of the framework. Other libraries make
 you tell them how to go fast: wrap this in `memo`, give that list `key`s, pull this value into a
@@ -121,12 +120,12 @@ forms, route, talk to a server, and keep lists. Qed's approach to each is the sa
 that can fail into a value the type system can see, so the failure becomes a case you handle
 rather than an exception you forgot.
 
-### JSON that can't throw or blow the stack
+### JSON
 
 `Json.parse` is a total function: bad input comes back as an `.error` value, never an exception.
 It also takes a depth budget (64 by default), and there's a proof, `parse_depth_le`, that whatever
-it returns nests no deeper than the number you gave it. A hostile, deeply-nested payload can't
-push past the limit you set. `jsonStruct` writes the structure and its `ToJson`/`FromJson` from
+it returns nests no deeper than the number you gave it. A deeply-nested payload can't push past
+the limit you set. `jsonStruct` writes the structure and its `ToJson`/`FromJson` from
 one field list, plus a `decode` that parses and decodes in a single call, recursively through
 nested structs:
 
@@ -140,9 +139,9 @@ jsonStruct User where
 #eval (User.decode body (maxDepth := 1)).map (·.name)    -- Except.error "maximum depth exceeded"
 ```
 
-### Forms whose validity is a proof
+### Forms
 
-A `Field p` is a value that carries a *proof* that the predicate `p` holds of it. The only way to
+A `Field p` is a value that carries a proof that the predicate `p` holds of it. The only way to
 build one is to pass validation, so by the time you're holding a `Signup`, every field in it is
 already valid, and an invalid form is not a thing you can construct. You write the predicates as
 ordinary `Prop`s and the `form` command does the rest, including the `canSubmit_iff` proof that
@@ -163,14 +162,14 @@ form Signup where
 every field checks out, marking a field `aria-invalid` once you've touched it and it still doesn't
 validate.
 
-### Routing whose links can't 404 from a typo
+### Routing and HTTP
 
-`router` declares your pages and, with them, a `Router` whose round-trip is *proven*: a URL you
+`router` declares your pages and, with them, a `Router` whose round-trip is proven: a URL you
 can print is a URL you can parse back into the route that produced it. A `String` parameter rides
 the URL verbatim; a `Nat` or `Int` parameter prints with `repr` and parses with `toNat?`/`toInt?`,
-and the round-trip is still discharged automatically. Better, `linkTo route` builds a navigation
-link from a route *value*, not a string, so a mistyped or impossible path won't compile, it'll
-fail to elaborate. The routed app hands your transition the route already parsed, and `Cmd.getJson`
+and the round-trip is still discharged automatically. `linkTo route` builds a navigation link from
+a route value, not a string, so a mistyped or impossible path won't compile, it'll fail to
+elaborate. The routed app hands your transition the route already parsed, and `Cmd.getJson`
 does the fetch and the decode together:
 
 ```lean
@@ -187,14 +186,13 @@ def app : App Model Msg :=
     ]
 ```
 
-### Effects you can read
+### Effects
 
-Side effects in Qed are *data*, which is what keeps `update` pure and therefore provable. An arm
+Side effects in Qed are data, which is what keeps `update` pure and therefore provable. An arm
 returns the next model with `still`, or the next model plus a `Cmd` to run with `also`. The driver
-performs the `Cmd`; your logic never touches the network. The payoff is striking: here is a chat
-that streams an LLM's reply token by token, and there is no `fetch` anywhere in it. `Cmd.stream`
-opens the request and feeds each token back as a `.chunk` message, so a streaming reply is, to
-`update`, just more messages arriving.
+performs the `Cmd`; your logic never touches the network. Here is a chat that streams an LLM's
+reply token by token, with no `fetch` anywhere in it. `Cmd.stream` opens the request and feeds each
+token back as a `.chunk` message, so a streaming reply is, to `update`, just more messages arriving.
 
 ```lean
 def transition (m : Model) : Msg → Model × Cmd Msg
@@ -208,18 +206,18 @@ The battery is typed and covers what you reach for: `storageSet`/`storageGet`, `
 `copy`/`paste`, `focus`/`scrollIntoView`, `after`/`afterKeyed` (debounce), `setTitle`,
 `randomInt`, `download`/`pickFile`, `getJson`/`postJson`/`stream`, and `batch`. A WebSocket is the
 same shape. `Cmd.wsOpen "feed" "/live" .received` opens one under a key, its open/close/error
-events arrive as messages, and `Cmd.wsSend`/`Cmd.wsClose` address it by key. And when something
-genuinely *isn't* built in (IndexedDB, a hardware API, a third-party widget), you don't patch the
-framework, you reach for a port: the `ports` command generates the outbound `Cmd`s and the inbound
-`onPort`, and you wire the real API in a few lines of JS.
+events arrive as messages, and `Cmd.wsSend`/`Cmd.wsClose` address it by key. When something isn't
+built in (IndexedDB, a hardware API, a third-party widget), you reach for a port: the `ports`
+command generates the outbound `Cmd`s and the inbound `onPort`, and you wire the real API in a few
+lines of JS.
 
-### Lists and components, keyed so messages can't go astray
+### Lists and components
 
 A `Component` is a reusable `update`+`view` with its own state and message type. `embed` wires one
 into a keyed list and writes the two pieces you'd otherwise write by hand: `rowView` (the row's
 view with its messages stamped by key) and `rowUpdate` (which delivers a message back to the right
-row). The routing is by *key*, the same identity the diff reconciles by, so once the list
-reorders, a message still can't land on the wrong row:
+row). The routing is by key, the same identity the diff reconciles by, so once the list reorders,
+a message still can't land on the wrong row:
 
 ```lean
 embed Row as row keyedBy (fun r => toString r.id) into rows   -- generates rowView / rowUpdate
@@ -232,15 +230,15 @@ def update (m : Model) : Msg → Model
 ```
 
 For state that has no business in the root model (whether a row's editor is open, a half-typed
-draft, a per-widget count), React reaches for `useState`; Qed reaches for a *local component*,
+draft, a per-widget count), React reaches for `useState`; Qed reaches for a local component,
 addressed by an explicit key and owned by the driver. It serializes its state with a `jsonStruct`,
-keeps its message type private, and can *bubble* a typed value up to its parent when it has
+keeps its message type private, and can bubble a typed value up to its parent when it has
 something to report. The whole local store snapshots and restores through `window.qed.snapshot()`
 / `.restore(json)`.
 
-### One render, server or browser
+### Server-side rendering
 
-`App.renderModel app m` renders any model to HTML with the *same* `view` the browser runs, and
+`App.renderModel app m` renders any model to HTML with the same `view` the browser runs, and
 `renderDocument` wraps it in a page; the client adopts that markup on load (and, with
 `dehydrate`/`rehydrate`, starts from the server's model so there's no refetch and no flash). Two
 small conveniences ride along: `Resource α` (`idle | loading | ok | failed`) turns "fetch and
@@ -255,8 +253,8 @@ it.
 
 ## Does proving things cost you speed?
 
-It would be a poor trade if all this rigor made the result slow. It doesn't, and the reason is the
-same "the framework decides" principle from earlier. Because the engine knows which subtrees are
+Verification doesn't make this slow, and the reason is the same "the framework decides" principle
+from earlier. Because the engine knows which subtrees are
 value-updates, a changed row's text and attributes are written straight at the node. A value-only
 update is **O(changed bindings)**, with no tree walk and no diff at all. That fast path is proven
 to agree with a full re-render (`patch_render`), and `qed check` enforces the proof. On the
@@ -265,8 +263,8 @@ still behind is cold *create* of a very large list, which is honest compute and 
 
 There's a subtler win in stack depth. Lean expresses iteration as tail recursion, and the
 transpiler turns every tail call into a loop, so building, folding, diffing, and walking long
-lists all run in *constant* stack, and a list of 100,000+ rows reconciles without trouble. (The
-verified diff's children reconcile runs as a tail-recursive form that is *proven equal* to the
+lists all run in constant stack, and a list of 100,000+ rows reconciles without trouble. (The
+verified diff's children reconcile runs as a tail-recursive form that is proven equal to the
 structural one, so `diff_apply` still describes the code that runs.)
 
 ## Getting started
@@ -302,8 +300,8 @@ about its edges:
 - **Cold create of huge lists** is the one benchmark gap left versus React, and the pure string
   renderer used for SSR still recurses per element. Making both iterative is on the list.
 
-Give it a try, state an invariant, and let the kernel find the bug for free. Issues
-welcome at [github.com/JacobAsmuth/qed/issues](https://github.com/JacobAsmuth/qed/issues).
+Give it a try and state an invariant. Issues welcome at
+[github.com/JacobAsmuth/qed/issues](https://github.com/JacobAsmuth/qed/issues).
 
 ## Where things live
 

@@ -121,8 +121,7 @@ export function boot() {
   }
   ensureEvent('click');
   window.addEventListener('popstate', () => urlChanged(location.pathname));
-  window.qed = { init, dispatch, dispatchStr, urlChanged, setSignal: g.setSignal,
-                 snapshot: localSnapshot, restore: localRestore };
+  window.qed = { init, dispatch, dispatchStr, urlChanged, snapshot: localSnapshot, restore: localRestore };
 
   app.__main(W);    // Qed.run app — set up the runtime
   init();           // initial render + startup effects

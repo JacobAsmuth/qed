@@ -78,6 +78,10 @@ structure Ctx where
       inside join-point bodies, where a `continue` would target the wrong construct. -/
   selfFn     : Option Name := none
   selfParams : Array Param := #[]
+  /-- vars whose defining expr is provably not an array (a ctor/closure/literal/scalar), so
+      their `inc`/`dec` are guaranteed no-ops and need not be emitted — only refcounted arrays
+      carry a count. Keyed by `VarId.idx`. Cuts both bundle size and per-op call overhead. -/
+  nonArr     : Std.HashSet Nat := {}
 
 def Ctx.js (c : Ctx) (n : Name) : String :=
   match c.names.get? n with
@@ -120,6 +124,11 @@ def jsStr (s : String) : String :=
 
 /-- Emit a full application, stripping irrelevant args for externs (as EmitC does). -/
 def emitApp (c : Ctx) (f : Name) (ys : Array Arg) : String :=
+  -- `Qed.refMark` is a runtime primitive (object identity stamp) the driver uses to skip an
+  -- unchanged list row; its Lean body is a conservative `0`, so emit the real `$.refMark` here.
+  if f == `Qed.refMark then
+    s!"$.refMark({String.intercalate ", " (ys.toList.filterMap fun | .var x => some (v x) | .irrelevant => none)})"
+  else
   let argStrs : List String :=
     match findEnvDecl c.env f with
     | some (.extern (xs := ps) ..) =>
@@ -144,7 +153,7 @@ def emitExpr (c : Ctx) (ty : IRType) : IR.Expr → String
   | .unbox x        => v x
   | .lit (.num n)   => if ty.isObj || ty == .uint64 then s!"{n}n" else s!"{n}"
   | .lit (.str s)   => jsStr s
-  | .isShared _     => "1"                        -- conservative: assume shared (Bool.true as u8)
+  | .isShared x     => s!"$.isShared({v x})"      -- real for refcounted arrays; `1` (shared) otherwise
 
 /-- Skip RC/metadata ops (dropped in JS) to the next real instruction. -/
 partial def skipRC : FnBody → FnBody
@@ -172,6 +181,21 @@ partial def hasSelfTail (self : Name) : FnBody → Bool
   | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b | .mdata _ b => hasSelfTail self b
   | _ => false
 
+/-- Vars whose defining expression is provably not an array — a `ctor`/`reuse` (a tagged record),
+    a `pap` (a closure), a literal, or a (un)boxed scalar. Their `inc`/`dec` only ever hit a value
+    with no refcount, so emitting them is dead weight; collect them so `emitBody` can drop them. -/
+partial def collectNonArr (acc : Std.HashSet Nat) : FnBody → Std.HashSet Nat
+  | .vdecl x _ e b =>
+      let acc := match e with
+        | .ctor .. | .reuse .. | .pap .. | .lit .. | .box .. | .unbox .. | .isShared .. => acc.insert x.idx
+        | _ => acc
+      collectNonArr acc b
+  | .jdecl _ _ v b => collectNonArr (collectNonArr acc v) b
+  | .case _ _ _ alts => alts.foldl (fun acc alt => collectNonArr acc alt.body) acc
+  | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b | .sset _ _ _ _ _ b
+  | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b | .mdata _ b => collectNonArr acc b
+  | _ => acc
+
 partial def emitBody (c : Ctx) (d : Nat) : FnBody → String
   | .vdecl x ty e b   =>
       -- A tail self-call `let x = self(args); return x` returns a trampoline marker
@@ -191,9 +215,12 @@ partial def emitBody (c : Ctx) (d : Nat) : FnBody → String
   | .setTag x cidx b  => s!"{c.ind d}{v x}.t = {cidx};\n" ++ emitBody c d b
   | .uset x i y b     => s!"{c.ind d}{v x}.u[{i}] = {v y};\n" ++ emitBody c d b
   | .sset x n off y _ b => s!"{c.ind d}{v x}.s[{soff n off}] = {v y};\n" ++ emitBody c d b
-  | .inc _ _ _ _ b    => emitBody c d b
-  | .dec _ _ _ _ b    => emitBody c d b
-  | .del _ b          => emitBody c d b
+  -- RC ops: GC reclaims memory, but the counts let array mutators tell a uniquely-owned array
+  -- (mutate in place — O(1)) from a shared one (copy). `$.inc`/`$.dec` only touch refcounted
+  -- arrays; on a var we proved is not an array (`nonArr`) the count is a no-op, so emit nothing.
+  | .inc x n _ _ b    => (if c.nonArr.contains x.idx then "" else s!"{c.ind d}$.inc({v x}, {n});\n") ++ emitBody c d b
+  | .dec x n _ _ b    => (if c.nonArr.contains x.idx then "" else s!"{c.ind d}$.dec({v x}, {n});\n") ++ emitBody c d b
+  | .del x b          => (if c.nonArr.contains x.idx then "" else s!"{c.ind d}$.dec({v x}, 1);\n") ++ emitBody c d b
   | .mdata _ b        => emitBody c d b
   | .ret a            => s!"{c.ind d}return {emitArg a};\n"
   | .jmp j ys         => s!"{c.ind d}return {jp j}({String.intercalate ", " (ys.toList.map emitArg)});\n"
@@ -206,8 +233,9 @@ partial def emitBody (c : Ctx) (d : Nat) : FnBody → String
         | .default b   => s!"{c.ind (d+1)}default: " ++ "{\n" ++ emitBody c (d+2) b ++ s!"{c.ind (d+1)}" ++ "}\n"
       s!"{c.ind d}switch ({scrut}) " ++ "{\n" ++ String.join arms ++ s!"{c.ind d}" ++ "}\n"
 
-def emitDecl (c : Ctx) : Decl → String
+def emitDecl (c0 : Ctx) : Decl → String
   | .fdecl f xs _ body _ =>
+      let c := { c0 with nonArr := collectNonArr {} body }
       if xs.isEmpty then
         -- A nullary decl is a module global: computed once, then shared (mirrors the C
         -- backend's `_init_`/`initialize` caching). `$.memo` makes refs created once.

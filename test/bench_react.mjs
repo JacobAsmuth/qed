@@ -61,28 +61,15 @@ try {
     await page.goto(`http://localhost:${QPORT}/index.html`, { waitUntil: 'load' });
     await page.waitForFunction(() => window.qed && typeof window.qed.dispatch === 'function', { timeout: 20000 });
     const t = (id) => page.evaluate((i) => { const t0 = performance.now(); window.qed.dispatch(i); return performance.now() - t0; }, id);
+    // The app is an ordinary `ui` view; the framework decides the strategy per op —
+    // `update` (same keys, changed text) value-patches the changed bindings, `swap`/
+    // `reverse` (keys reordered) reconcile through the verified diff. No knobs.
     results.qed = {
       create:  await bench(() => t(0), REPS, () => t(4)),   // clear, then time create
       update:  await bench(() => t(1), REPS, null),
       swap:    await bench(() => t(2), REPS, null),
       reverse: await bench(() => t(3), REPS, null),
     };
-    // lazy rows: toggle on (id 5), re-create, then time update again
-    await page.evaluate(() => window.qed.dispatch(5));
-    await page.evaluate(() => window.qed.dispatch(0));
-    results['qed-lazy'] = { update: await bench(() => t(1), REPS, null) };
-    // signal rows: toggle on (id 6), re-create, seed signals, then time update via
-    // setSignal — no message, no diff, just the bound DOM nodes.
-    await page.evaluate(() => window.qed.dispatch(6));
-    await page.evaluate(() => window.qed.dispatch(0));
-    await page.evaluate(() => { for (let i = 1; i <= 10000; i++) window.qed.setSignal('r' + i, 'item ' + i); });
-    const sigUpdate = () => page.evaluate(() => {
-      window.__tick = (window.__tick || 0) + 1;
-      const t0 = performance.now();
-      for (let i = 1; i <= 10000; i += 10) window.qed.setSignal('r' + i, 'item ' + i + ' ' + window.__tick);
-      return performance.now() - t0;
-    });
-    results['qed-signal'] = { update: await bench(sigUpdate, REPS, null) };
     await page.close();
   }
   // ---- React (plain, then memo) ----
@@ -112,10 +99,6 @@ console.log('  op'.padEnd(12) + cols.map(([, h]) => h.padStart(13)).join(''));
 for (const op of ops) {
   console.log('  ' + op.padEnd(10) + cols.map(([k]) => fmt(results[k][op]).padStart(13)).join(''));
 }
-console.log('  ' + 'update+lazy'.padEnd(10) + fmt(results['qed-lazy'].update).padStart(13) +
-  '       (Qed lazy rows)');
-console.log('  ' + 'update+sig'.padEnd(10) + fmt(results['qed-signal'].update).padStart(13) +
-  '       (Qed signals — fine-grained, no diff; React.memo is ' + fmt(results['react-memo'].update).trim() + ')');
 console.log('');
 console.log(JSON.stringify(results));
 process.exit(0);

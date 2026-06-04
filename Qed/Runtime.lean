@@ -159,10 +159,6 @@ def Cmd.cancel (key : String) : Cmd msg := .fx "timer.cancel" key "" ""
 /-! **Document title.** -/
 def Cmd.setTitle (title : String) : Cmd msg := .fx "document.title" title "" ""
 
-/-! **Signals** (fine-grained reactivity). Set a named signal's value; every element bound
-    to it (`signalBind`/`signalText`) updates its text directly — no `update`, no diff. -/
-def Cmd.setSignal (name value : String) : Cmd msg := .fx "signal.set" name value ""
-
 /-! **Randomness** — `update` is pure, so a random draw must come from an effect.
     Dispatches a uniform integer in `[lo, hi]`. -/
 def Cmd.randomInt (lo hi : Int) (onInt : Int → msg) : Cmd msg :=

@@ -47,18 +47,15 @@ inductive Attr (msg : Type) where
       type-safe channel by which a self-contained child event can still reach the root
       `update`. The host renders empty; the driver fills its children from local state. -/
   | localCell (key component : String) (init? : Option String) (bubble : String → Option msg)
-  /-- Bind this element's text content to a named *signal* (fine-grained reactivity). The
-      signal's value lives in the driver, not the model; `Cmd.setSignal name v` (or
-      `window.qed.setSignal(name, v)` from JS) updates *only* the bound elements — no
-      `update`, no diff, no tree walk — so a high-frequency or external value (a clock, a
-      socket feed) updates in O(bindings). The element's `Html` children are owned by the
-      signal, so leave them empty. -/
+  /-- INTERNAL — the engine's value-update mechanism, never written by hand. When the `ui`
+      lift decides a binding can update without a diff (a list row's text derived from the
+      model), it emits this; the driver binds the node to a named slot and a value-only
+      update writes it directly, no `update` re-render, no diff, no tree walk — O(bindings).
+      The value is still *derived from the model*; this is just how the engine delivers it. -/
   | signalBind (name : String)
-  /-- Bind this element's `attr` attribute to a named signal (the attribute counterpart of
-      `signalBind`): `setSignal name v` sets `attr="v"` on the bound element directly. The
-      `value` is the current value, rendered into the static markup so SSR matches; the
-      live driver ignores it and reads the signal store. Used by `forEach` so a row's
-      dynamic class/value updates fine-grained, no diff. -/
+  /-- INTERNAL — the attribute counterpart of `signalBind` (emitted by the `ui` lift for a
+      row's derived attribute/value). `value` is the current value, rendered into the static
+      markup so SSR matches; the live driver reads the slot. Never written by hand. -/
   | signalAttr (name attr value : String)
 
 /-- A typed virtual-DOM node. Note this inductive is *total*: there is no

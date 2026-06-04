@@ -27,7 +27,11 @@ const W = 0;                                  // the IO world token
 export const PUnit = 0, Unit = 0;
 export const ioVal = (r) => r.f[0];           // value out of an EStateM.Result.ok(v, w)
 export const tc = (a) => ({ __tc: a });        // tail-self-call marker (trampoline; see Js.Backend)
-export function memo(f) { let v, done = false; return () => { if (!done) { v = f(); done = true; } return v; }; } // a module global: computed once, shared
+// A module global: computed once, then SHARED by every reference — so it is persistent. Freeze
+// any array it yields (refcount → ∞) so a mutator always copies it instead of mutating the one
+// shared instance in place (mirrors Lean marking top-level constants persistent). `inc`/`dec`
+// leave ∞ unchanged, so it stays frozen for the program's life.
+export function memo(f) { let v, done = false; return () => { if (!done) { v = f(); done = true; if (v !== null && typeof v === 'object' && v.r !== undefined) v.r = Infinity; } return v; }; }
 export const mkOk  = (v, w = W) => ({ t: 0, f: [v, w], s: {}, u: {} });   // EStateM.Result.ok
 export const mkErr = (e, w = W) => ({ t: 1, f: [e, w], s: {}, u: {} });   // EStateM.Result.error
 
@@ -97,21 +101,42 @@ const cons = (h, t) => ({ t: 1, f: [h, t], s: {}, u: {} });
 export function listToArray(l) { const a = []; while (typeof l === 'object' && l !== null) { a.push(l.f[0]); l = l.f[1]; } return a; }
 export function arrayToList(a) { let l = NIL; for (let i = a.length - 1; i >= 0; i--) l = cons(a[i], l); return l; }
 
-// ---- Array (JS Array; copy-on-write for safety) -----------------------------
-export const Array_mkEmpty = (_cap) => [];
-export const Array_mkArray = (n, x) => new Array(Number(n)).fill(x);
-export const Array_mk = (l) => listToArray(l);
+// ---- Refcounting --------------------------------------------------------------
+// The GC reclaims memory, but a refcount still lets an array mutator tell a uniquely-owned
+// array (mutate in place — O(1)) from a shared one (copy — O(n)) — recovering Lean's in-place
+// array updates. Only arrays carry a count (`a.r`); on ctors/closures/scalars `inc`/`dec` are a
+// no-op and `isShared` is conservatively `true`. The transpiler emits `inc`/`dec` from the IR's
+// RC ops, so a count tracks live references exactly as native Lean does. An UNtagged array (no
+// `.r`) is treated as shared — the safe default — so anything that bypasses tagging still copies.
+export const inc = (x, n = 1) => { if (x !== null && typeof x === 'object' && x.r !== undefined) x.r += Number(n); };
+export const dec = (x, n = 1) => { if (x !== null && typeof x === 'object' && x.r !== undefined) x.r -= Number(n); };
+export const isShared = (x) => (x !== null && typeof x === 'object' && x.r !== undefined && x.r <= 1) ? 0 : 1;
+const own = (a) => { a.r = 1; return a; };          // a freshly-owned array
+const owned = (a) => a.r === 1;                      // uniquely owned ⇒ safe to mutate in place
+
+// A per-object identity stamp (≥ 1), for the driver's O(changed) list update: an unchanged row
+// is the SAME object across renders (Lean returns it untouched), so equal marks ⇒ skip it with
+// no field read. Objects get a stable lazy stamp; a primitive (a scalar-valued row) gets a fresh
+// mark every call so it never matches — a safe fall back to recompute. Mirrors `Qed.refMark`,
+// whose pure body is `0` (≠ any real mark), so the native model never skips. Last arg = the value.
+let __markCtr = 0;
+export const refMark = (...a) => { const o = a[a.length - 1]; return (o !== null && typeof o === 'object') ? (o.__m ?? (o.__m = ++__markCtr)) : ++__markCtr; };
+
+// ---- Array (JS Array + refcount; in place when owned, copy when shared) --------
+export const Array_mkEmpty = (_cap) => own([]);
+export const Array_mkArray = (n, x) => { const k = Number(n); inc(x, k); return own(new Array(k).fill(x)); };
+export const Array_mk = (l) => own(listToArray(l));
 export const Array_toList = (a) => arrayToList(a);
 export const Array_size = (a) => BigInt(a.length);
 export const Array_usize = (a) => a.length;
-export const Array_get = (a, i) => a[Number(i)];
-export const Array_uget = (a, i) => a[i];
-export const Array_push = (a, x) => { const b = a.slice(); b.push(x); return b; };
-export const Array_pop = (a) => a.slice(0, a.length - 1);
-export const Array_set = (a, i, x) => { const b = a.slice(); b[Number(i)] = x; return b; };
-export const Array_setx33 = (a, i, x) => { const b = a.slice(); b[Number(i)] = x; return b; };  // set!
-export const Array_uset = (a, i, x) => { const b = a.slice(); b[i] = x; return b; };
-export const Array_swap = (a, i, j) => { const b = a.slice(); const t = b[Number(i)]; b[Number(i)] = b[Number(j)]; b[Number(j)] = t; return b; };
+export const Array_get = (a, i) => { const x = a[Number(i)]; inc(x); return x; };
+export const Array_uget = (a, i) => { const x = a[i]; inc(x); return x; };
+export const Array_push = (a, x) => owned(a) ? (a.push(x), a) : own([...a, x]);
+export const Array_pop = (a) => owned(a) ? (a.pop(), a) : own(a.slice(0, a.length - 1));
+export const Array_uset = (a, i, x) => { const b = owned(a) ? a : own(a.slice()); b[i] = x; return b; };
+export const Array_swap = (a, i, j) => { const b = owned(a) ? a : own(a.slice()); const t = b[Number(i)]; b[Number(i)] = b[Number(j)]; b[Number(j)] = t; return b; };
+export const Array_set = (a, i, x) => { const b = owned(a) ? a : own(a.slice()); b[Number(i)] = x; return b; };
+export const Array_setx33 = (a, i, x) => { const b = owned(a) ? a : own(a.slice()); b[Number(i)] = x; return b; };  // set!
 
 // ---- String (JS string; Pos = UTF-8 byte offset) ----------------------------
 const ENC = new TextEncoder();

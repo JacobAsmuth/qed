@@ -274,7 +274,11 @@ inductive VState (σ : Type) (msg : Type) where
       value-only vs structural), the per-row signal values (to push only what changed),
       and the last `Html` rows (to diff on a shape change). -/
   | list (node : Dom.Node) (keys : IO.Ref (Array String))
-      (sigs : IO.Ref (Array (String × String))) (rows : IO.Ref (List (Html msg)))
+      -- `sigs` is now per-row (the previous render's `(name, value)` for each row) and `marks`
+      -- the per-row identity stamps, so a value-only update can compare a row's stamp and, when
+      -- unchanged, carry its signals forward without recomputing or comparing them — O(changed).
+      (sigs : IO.Ref (Array (Array (String × String)))) (rows : IO.Ref (List (Html msg)))
+      (marks : IO.Ref (Array USize))
       (inst : String)   -- per-instance signal namespace, so two lists never share signal names
   /-- An opaque embedded `Html` subtree (`View.static`) — not fine-grained-updated. -/
   | stat (node : Dom.Node)
@@ -311,6 +315,54 @@ partial def freeCells (cells : CondCells σ msg) : VState σ msg → IO Unit
   | .elem _ ks => ks.forM (freeCells cells)
   | _          => pure ()
 
+/-- key → its index in the list, for the reorder fast path (which relocates a list's existing
+    DOM nodes by key instead of rebuilding them). Mirrors `Qed.keyIndex`, on a key array. -/
+def keyPos (keys : Array String) : Std.HashMap String Nat :=
+  (keys.foldl (init := ((∅ : Std.HashMap String Nat), 0)) fun (m, i) k =>
+    (m.insert k i, i + 1)).1
+
+/-- Collect the leaves of one row whose value moved since last render (`old`), as
+    `(prefixed-name, value)` to `setSignal`. Pure + tail-recursive over a row's few signals. -/
+partial def collectChanged (inst : String) (old new : Array (String × String)) (j : Nat)
+    (acc : Array (String × String)) : Array (String × String) :=
+  if j ≥ new.size then acc
+  else
+    let (nm, v) := new[j]!
+    let acc := if old[j]?.map (·.2) == some v then acc else acc.push (inst ++ nm, v)
+    collectChanged inst old new (j + 1) acc
+
+/-- The O(changed) list update, done *purely* so the transpiler trampolines it (a monadic
+    `for` over 10k rows would recurse through IO continuations and overflow the stack). Walks
+    the rows: an unchanged identity stamp (`mark`, ≠ 0) carries that row's signals forward with
+    no field read; a changed row recomputes via `rowSig` and collects the leaves that moved.
+    Returns the new per-row signals (for the next compare) and the flat leaves to `setSignal`
+    (run in one shallow IO loop by the caller). Seeding (build/hydrate) passes empty `old*` so
+    every row counts as changed. -/
+partial def diffRowSigs (rowSig : Nat → Array (String × String)) (inst : String)
+    (newMarks oldMarks : Array USize) (oldSigs : Array (Array (String × String)))
+    (i : Nat) (accSigs : Array (Array (String × String))) (accEmit : Array (String × String)) :
+    Array (Array (String × String)) × Array (String × String) :=
+  if i ≥ newMarks.size then (accSigs, accEmit)
+  else
+    let m := newMarks[i]!
+    if m != 0 && oldMarks[i]? == some m then
+      diffRowSigs rowSig inst newMarks oldMarks oldSigs (i + 1) (accSigs.push (oldSigs[i]?.getD #[])) accEmit
+    else
+      let rsig := rowSig i
+      let accEmit := collectChanged inst (oldSigs[i]?.getD #[]) rsig 0 accEmit
+      diffRowSigs rowSig inst newMarks oldMarks oldSigs (i + 1) (accSigs.push rsig) accEmit
+
+/-- Push the signal leaves that moved since last render (`oldMarks`/`oldSigs`, aligned to the new
+    row order) and return the new per-row signals. The single seeding step shared by build,
+    hydrate, and every patch path: a fresh row (empty old state) seeds all its leaves; an unchanged
+    row seeds none. -/
+def seedRows (inst : String) (rowSig : Nat → Array (String × String))
+    (newMarks oldMarks : Array USize) (oldSigs : Array (Array (String × String))) :
+    IO (Array (Array (String × String))) := do
+  let (newSigs, toEmit) := diffRowSigs rowSig inst newMarks oldMarks oldSigs 0 #[] #[]
+  for (nm, v) in toEmit do Dom.effect "signal.set" nm v ""
+  return newSigs
+
 mutual
 /-- Build a template into DOM once, returning the root node and its `VState` mirror.
     Events register into the handler tables exactly as `buildDom` does, so the JS
@@ -338,17 +390,17 @@ partial def buildView (h : Handlers msg) (cells : CondCells σ msg) :
       let html := get s
       let n ← buildDom h html
       return (n, .dynNode (← IO.mkRef n) (← IO.mkRef html))
-  | .keyedList tag attrs keys sigs rowsHtml, s => do
+  | .keyedList tag attrs keys marks rowSig rowsHtml, s => do
       let node ← Dom.createElement tag
       applyAttrs h node (attrs.map (VAttr.eval s))
       -- a per-instance signal namespace (the container's unique node id), so two lists over
       -- the same row keys — e.g. a reusable list component used twice — never collide.
       let inst := s!"§{node}§"
-      let sg := (sigs s).map fun (nm, v) => (inst ++ nm, v)
-      for (nm, v) in sg do Dom.effect "signal.set" nm v ""   -- seed signal values first…
+      let perRow ← seedRows inst (rowSig s) (marks s) #[] #[]   -- seed every row first (empty old state)…
       let rs := (rowsHtml s).map (Html.prefixSignals inst)
-      for r in rs do Dom.appendChild node (← buildDom h r)   -- …so bindSignal reads them
-      return (node, .list node (← IO.mkRef (keys s)) (← IO.mkRef sg) (← IO.mkRef rs) inst)
+      for r in rs do Dom.appendChild node (← buildDom h r)      -- …so bindSignal reads them
+      return (node, .list node (← IO.mkRef (keys s)) (← IO.mkRef perRow) (← IO.mkRef rs)
+        (← IO.mkRef (marks s)) inst)
 
 /-- Walk the template against the new scope, mutating leaf cells and patching only what
     changed. `parent`/`index` locate the current node for the one case that replaces it (a
@@ -380,29 +432,44 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
           nref.set n2
       | p => applyToDom h parent index node p        -- otherwise patch in place (verified diff)
       last.set newHtml
-  | .keyedList tag attrs keys sigs rowsHtml, s, .list node lastKeys lastSigs lastRows inst => do
-      if (keys s) == (← lastKeys.get) then
-        -- value-only update: the key set/order is unchanged, so no row was added, removed,
-        -- or moved. First refresh the container's own scope-dependent attributes (a `cls m.q`
-        -- on the `<ul>`), then push only the rows whose signal value changed — a direct
-        -- `setSignal` (JS Map write), no `Html` built, no diff, no `childAt`. The list win.
+  | .keyedList tag attrs keys marks rowSig rowsHtml, s, .list node lastKeys lastSigs lastRows lastMarks inst => do
+      let newKeys  := keys s
+      let oldKeys  ← lastKeys.get
+      let newMarks := marks s
+      if newKeys == oldKeys then
+        -- VALUE update: key set AND order unchanged, so no row was added, removed, or moved. Refresh
+        -- the container's own scope-dependent attributes, then push only the leaves whose value moved
+        -- (mark-based, O(changed)) — no diff, no tree walk. The one path with no structural work.
         applyDynAttrs h node attrs s
-        let newSigs := (sigs s).map fun (nm, v) => (inst ++ nm, v)
-        let oldSigs ← lastSigs.get
-        for i in [0:newSigs.size] do
-          let (nm, v) := newSigs[i]!
-          if v != (oldSigs.getD i ("", "")).2 then Dom.effect "signal.set" nm v ""
-        lastSigs.set newSigs
+        let newSigs ← seedRows inst (rowSig s) newMarks (← lastMarks.get) (← lastSigs.get)
+        lastSigs.set newSigs; lastMarks.set newMarks
       else
-        -- the keys changed (add/remove/reorder): seed signal values first (so freshly built
-        -- rows bind to them), then reconcile structure through the verified diff.
-        let newSigs := (sigs s).map fun (nm, v) => (inst ++ nm, v)
-        for (nm, v) in newSigs do Dom.effect "signal.set" nm v ""
-        let evAttrs := attrs.map (VAttr.eval s)
-        let newRows := (rowsHtml s).map (Html.prefixSignals inst)
-        applyToDom h parent index node
-          (diff (.element tag evAttrs (← lastRows.get)) (.element tag evAttrs newRows))
-        lastKeys.set (keys s); lastSigs.set newSigs; lastRows.set newRows
+        -- STRUCTURAL update — one path for add, remove, reorder, first-fill, and any mix. Align each
+        -- new row to its old slot BY KEY: an existing key REUSES its row (and its mark/sig), so a
+        -- reorder permutes the rows with no rebuild and a moved-but-unchanged row carries forward; a
+        -- NEW key contributes a freshly-built row and empty old state (so it seeds). The VERIFIED
+        -- `diff` turns reused/new/dropped rows into moves/creates/removes (`lazy` rows ⇒ moves are
+        -- `lazyReuse`, no rebuild), and `seedRows` updates the content of whatever changed.
+        let oldPos   := keyPos oldKeys
+        let oldRowsL ← lastRows.get
+        let oldRows  := oldRowsL.toArray
+        let oldMarks ← lastMarks.get
+        let oldSigs  ← lastSigs.get
+        let fresh : Array (Html msg) :=
+          if newKeys.all oldPos.contains then #[]                    -- nothing added ⇒ reuse all, never rebuild
+          else ((rowsHtml s).map (Html.prefixSignals inst)).toArray  -- something added ⇒ build, take the new rows
+        let newRows := (newKeys.mapIdx (fun j k => match oldPos[k]? with
+                        | some op => oldRows.getD op default          -- existing key: reuse its row
+                        | none    => fresh.getD j default)).toList    -- new key: freshly built
+        let newSigs ← seedRows inst (rowSig s) newMarks
+          (newKeys.map (fun k => ((oldPos[k]?).map (fun op => oldMarks.getD op 0)).getD 0))
+          (newKeys.map (fun k => ((oldPos[k]?).map (fun op => oldSigs.getD op #[])).getD #[]))
+        if oldRowsL.isEmpty then
+          for r in newRows do Dom.appendChild node (← buildDom h r)   -- empty → N: every row is new, so append; no diff
+        else
+          let evAttrs := attrs.map (VAttr.eval s)
+          applyToDom h parent index node (diff (.element tag evAttrs oldRowsL) (.element tag evAttrs newRows))
+        lastKeys.set newKeys; lastMarks.set newMarks; lastSigs.set newSigs; lastRows.set newRows
   | .text _,   _, _ => pure ()
   | .static _, _, _ => pure ()
   | v, s, _ => do
@@ -482,18 +549,18 @@ partial def hydrateView (h : Handlers msg) (cells : CondCells σ msg) :
       let html := get s
       hydrateDom h html node
       return .dynNode (← IO.mkRef node) (← IO.mkRef html)
-  | .keyedList _ attrs keys sigs rowsHtml, s, node => do
+  | .keyedList _ attrs keys marks rowSig rowsHtml, s, node => do
       clearHandlerIds node
       applyAttrs h node (attrs.map (VAttr.eval s))
       let inst := s!"§{node}§"
-      let sg := (sigs s).map fun (nm, v) => (inst ++ nm, v)
-      for (nm, v) in sg do Dom.effect "signal.set" nm v ""   -- seed before binding the rows
+      let perRow ← seedRows inst (rowSig s) (marks s) #[] #[]   -- seed before binding the rows
       let rs := (rowsHtml s).map (Html.prefixSignals inst)
       let mut i : UInt32 := 0
       for r in rs do
         hydrateDom h r (← Dom.childAt node i)   -- wire each existing row's events + signals
         i := i + 1
-      return .list node (← IO.mkRef (keys s)) (← IO.mkRef sg) (← IO.mkRef rs) inst
+      return .list node (← IO.mkRef (keys s)) (← IO.mkRef perRow) (← IO.mkRef rs)
+        (← IO.mkRef (marks s)) inst
 
 /-- Everything the local-component runtime threads around: the registry of declared
     components, the keyed store of serialized state, and the live instances. Shared by

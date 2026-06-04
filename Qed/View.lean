@@ -27,6 +27,7 @@
 import Qed.Render
 import Qed.Diff
 import Qed.Style
+import Lean
 
 namespace Qed
 
@@ -78,7 +79,11 @@ inductive View (σ : Type) (msg : Type) where
       keyed `Html` rows, each dynamic leaf a `signalBind` node — used to build and, on a
       *shape* change, reconcile through the verified keyed `diff`). -/
   | keyedList (tag : String) (attrs : List (VAttr σ msg))
-      (keys : σ → Array String) (sigs : σ → Array (String × String))
+      (keys : σ → Array String)
+      -- `marks s` is a per-row identity stamp and `rowSig s i` is row `i`'s signals computed on
+      -- demand: together they let the driver update only the rows whose identity changed (an
+      -- unchanged row is the SAME value, so its mark is unchanged) — O(changed), not O(all rows).
+      (marks : σ → Array USize) (rowSig : σ → Nat → Array (String × String))
       (rowsHtml : σ → List (Html msg))
   /-- An escape hatch: drop a fully-formed `Html` subtree into a template (e.g. to reuse
       an existing component). It is opaque to the fine-grained path — always rebuilt. -/
@@ -90,6 +95,13 @@ inductive View (σ : Type) (msg : Type) where
       `diff_apply`'s guarantee. The `view%` macro emits this for view code it can't
       decompose, making "lift what we can, diff the rest" the default. -/
   | dynNode (get : σ → Html msg)
+
+/-- A per-row identity stamp for the driver's O(changed) list update. The transpiler emits the
+    real `$.refMark` (a stable id per heap object, fresh for a scalar), so an unchanged row — the
+    SAME value Lean returned untouched — keeps its stamp and is skipped with no field read. This
+    pure body is a conservative `0`: it is never a real stamp (those start at 1), so the native/
+    spec model never skips and stays sound. Driver-only — no proof depends on it. -/
+@[noinline] def refMark {α : Type} (a : α) : USize := (fun _ => 0) a
 
 /-- Evaluate a template attribute against a scope. -/
 def VAttr.eval (s : σ) : VAttr σ msg → Attr msg
@@ -114,7 +126,7 @@ mutual
     | .element t as ks, s => .element t (as.map (VAttr.eval s)) (View.renderEach ks s)
     | .showIf cond ch,  s => if cond s then View.render ch s else .text ""
     | .ifElse cond y n, s => if cond s then View.render y s else View.render n s
-    | .keyedList tag as _ _ rowsHtml, s => .element tag (as.map (VAttr.eval s)) (rowsHtml s)
+    | .keyedList tag as _ _ _ rowsHtml, s => .element tag (as.map (VAttr.eval s)) (rowsHtml s)
     | .static h,        _ => h
     | .dynNode get,     s => get s
   /-- Render a list of sibling templates against one scope. -/
@@ -182,7 +194,7 @@ mutual
     | text c        => simp [View.render, applyValues]
     | dyn get       => simp [View.render, applyValues]
     | static hh     => simp [View.render, applyValues]
-    | keyedList _ _ _ _ _ => simp [stable] at h
+    | keyedList _ _ _ _ _ _ => simp [stable] at h
     | dynNode get   => simp [stable] at h
     | element tag attrs kids =>
         simp only [View.render, applyValues]
@@ -276,7 +288,7 @@ mutual
     | .ifElse cond y no, s =>     -- only the branch SELECTOR is structural now; the branch's own
                                   -- leaves are signals, so a value change there needs no reconcile
         if cond s then "1" ++ View.collectShape y s else "0" ++ View.collectShape no s
-    | .keyedList tag as _ _ rowsHtml, s =>
+    | .keyedList tag as _ _ _ rowsHtml, s =>
         "{" ++ Html.render (.element tag (as.map (VAttr.eval s)) (rowsHtml s)) ++ "}"
     | .static _,        _ => ""
     | .dynNode get,     s => "<" ++ Html.render (get s) ++ ">"
@@ -352,7 +364,7 @@ mutual
         else
           let (h, n2) := View.renderSig no s pre (n + (View.collectDyn y).length)
           (h, n2)
-    | .keyedList tag as _ _ rowsHtml, s, _, n =>
+    | .keyedList tag as _ _ _ rowsHtml, s, _, n =>
         (.element tag (as.map (VAttr.eval s)) (rowsHtml s), n)   -- nested list: structure only
     | .static h,        _, _,   n => (h, n)
     | .dynNode get,     s, _,   n => (get s, n)
@@ -462,10 +474,17 @@ def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → S
   let rkey : α → String :=
     if View.hasOpaque child then (fun a => s!"{key a} {View.collectShape child a}") else key
   .keyedList tag attrs
-    (fun s => (items s).map rkey)                             -- Array: the value path stays
-    (fun s => (items s).flatMap fun a =>                      -- tail-safe at any list size
-      (projs.mapIdx fun i p => (s!"{skey a}#{i}", p a)).toArray)  -- signals namespaced per list
-    (fun s => ((items s).map fun a => withKey (rkey a) (View.renderSig child a (skey a) 0).1).toList)
+    (fun s => (items s).map rkey)                             -- keys: drive the structural decision
+    (fun s => (items s).map (fun a => Qed.refMark a))         -- marks: a per-row identity stamp
+    (fun s i => match (items s)[i]? with                      -- rowSig: row `i`'s signals, on demand
+      | some a => (projs.mapIdx fun j p => (s!"{skey a}#{j}", p a)).toArray
+      | none   => #[])
+    -- each row wrapped in `lazy (rkey a)`: a row's structure (its signal *names*, keyed by the
+    -- row key) is fixed by `rkey`, so on a reorder the diff matches by key and `lazyReuse`s the
+    -- row — the driver MOVES its existing DOM (keeping the bound signals) instead of recursing in
+    -- to rebuild/rebind it. Content changes still flow through the value path (signals), never here.
+    (fun s => ((items s).map fun a =>
+      Html.lazy (rkey a) (withKey (rkey a) (View.renderSig child a (skey a) 0).1)).toList)
 
 end V
 -- `templated` (which builds an `App` from a `View`) now lives in `Qed.Runtime`, since `App`
@@ -658,6 +677,31 @@ private def extractKey (attrsList : Syntax) : MacroM (Option (Term × Term)) := 
   | some v => return some (⟨v⟩, ← `([$kept,*]))
   | none   => return none
 
+open Lean Lean.Elab Lean.Elab.Term Lean.Meta in
+/-- The lift's target for a child written the natural way — a bare scope value, not wrapped in
+    `text`/`dynNode`. It decides the update strategy BY TYPE and elaborates *eagerly* (so the
+    row scope is pinned for sibling elaboration — unlike a postponing typeclass, which would
+    strand a sibling's `.ctor` notation): a `String`/`Nat`/`Int` is a *value*, so it becomes a
+    fine-grained `dyn` (value-update — patch just this binding, no diff); any other expression
+    (an `Html` subtree) becomes a `dynNode` (reconciled through the verified `diff`). So
+    `[r.label]` is fast and `[rowView r]` is correct, with nothing for the developer to choose.
+    The decision happens at compile time — nothing leaks to the runtime. -/
+elab "child% " "fun " mb:ident " => " body:term : term <= expectedType => do
+  match_expr (← instantiateMVars expectedType) with
+  | Qed.View σ msg =>
+      withLocalDeclD mb.getId σ fun fv => do
+        let b   ← elabTerm body none
+        let bTy ← whnf (← inferType b)
+        if bTy.isConstOf ``String then
+          mkAppOptM ``Qed.View.dyn #[σ, msg, ← mkLambdaFVars #[fv] b]
+        else if bTy.isConstOf ``Nat || bTy.isConstOf ``Int then
+          let s ← mkAppM ``toString #[b]
+          mkAppOptM ``Qed.View.dyn #[σ, msg, ← mkLambdaFVars #[fv] s]
+        else
+          let b' ← ensureHasType (← mkAppM ``Qed.Html #[msg]) b
+          mkAppOptM ``Qed.View.dynNode #[σ, msg, ← mkLambdaFVars #[fv] b']
+  | _ => throwError "child% expects a `View` expected type"
+
 open Lean in
 mutual
   /-- Rewrite a view body (written in ordinary `Qed` `Html` notation) into a fine-grained
@@ -746,7 +790,9 @@ mutual
       written in `Html` notation. -/
   partial def catchAll (m : Ident) (stx : Syntax) : MacroM Syntax := do
     let e : Term := ⟨stx⟩
-    if viewMentions m.getId stx then return (← `(Qed.V.dynNode (fun $m => $e)))
+    -- a scope-dependent child decides value-update vs diff BY TYPE (`child%`): a `String`/
+    -- `Nat`/`Int` value becomes a fine-grained `dyn`, an `Html` subtree a verified-diff `dynNode`.
+    if viewMentions m.getId stx then return (← `(child% fun $m => $e))
     else return (← `(Qed.V.static $e))
 
   /-- `cls (… m …)` → `dynAttr "class" (fun m => …)`, `attr k (… m …)` → `dynAttr k …`,

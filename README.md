@@ -68,24 +68,16 @@ happen" finally made true.
 
 ## One way to write a view
 
-Look again at the counter's view. It's ordinary control flow: a list of children, and where you
-need logic you reach for an `if`, a `.map`, string interpolation, a call to your own helper.
-There's no template language, no JSX, and **no performance knobs.**
+You write the view the plain way: `if`, `.map`, string interpolation, your own helpers, with no
+`memo`, no `key`s, no `signal`s, no `useState` to place. The framework decides, per subtree, how to
+apply each change: a model value that changed is written straight at its node; a change of shape
+(rows added, removed, reordered, a branch flipped) reconciles through the diff. Change the counter
+and that one text node is rewritten, nothing else.
 
-That last absence is deliberate, and it's the central idea of the framework. Other libraries make
-you tell them how to go fast: wrap this in `memo`, give that list `key`s, pull this value into a
-`signal`, hoist this into `useState`. Each knob is a place to be wrong, and being wrong is usually
-silent: a stale row, a dropped focus, a re-render that didn't happen. Qed takes the decision away
-from you. **You write the view the most straightforward way, and the framework decides, per
-subtree, how to update it:** a model-derived value that changed gets patched straight at the node;
-a change of *shape* (rows added, removed, reordered, a branch flipped) gets reconciled through the
-verified diff. You never pick a strategy, and because the framework picks it, the framework can
-*prove* the pick is correct.
-
-So when the counter's text changes, nothing is diffed: the new number is written to that one text
-node. When a list's rows reorder, the diff runs and the proof `diff_apply` guarantees the DOM ends
-up exactly where the new view says it should. Same code, two strategies, and you wrote neither of
-them down.
+The proof is what makes deciding for you safe: the value-update path is proven to produce the same
+DOM as a full re-render (`patch_render`), and the diff is proven correct (`diff_apply`). So the
+cheap update can never drift from re-rendering everything, and the stale row or dropped update that
+a missing `key` or a misplaced `memo` causes elsewhere isn't something you can hit here.
 
 ## Is the thing that runs the thing you proved?
 

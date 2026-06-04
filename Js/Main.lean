@@ -29,7 +29,7 @@ def main (args : List String) : IO Unit := do
     let entries := rest.map parseEntry
     if entries.isEmpty then throw (IO.userError "no entry decls given (after `--`)")
     Lean.initSearchPath (← Lean.findSysroot)
-    let imports := mods.map fun m => Import.mk m.toName false
+    let imports := mods.map fun m => ({ module := m.toName } : Import)
     let env ← importModules imports.toArray {} (trustLevel := 1024)
     match Js.emitProgram env entries min with
     | .ok js =>

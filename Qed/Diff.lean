@@ -186,8 +186,7 @@ mutual
         · rename_i ht
           subst ht
           -- the runtime uses the tail-recursive forms; bridge them to the structural spec
-          simp only [applyPatch, applyChildrenTR_toList, diffChildrenTR_toList,
-                     Array.toList_toArray, List.nil_append, List.toArray_toList]
+          simp only [applyPatch, applyChildrenTR_toList, diffChildrenTR_toList, List.nil_append]
           rw [diffChildren_apply c₁]
         · simp only [applyPatch]
     -- a `lazyReuse` (same key) and a `lazyPatch` (different key, carrying `diff s₁ s₂`)

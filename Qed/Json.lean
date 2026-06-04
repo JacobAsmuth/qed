@@ -93,7 +93,7 @@ def unescape : Char → Option Char
 
 /-- Parse the contents of a string after the opening quote (structural on input). -/
 def parseStrAux (acc : List Char) : List Char → Except String (String × List Char)
-  | '"' :: rest => .ok (⟨acc.reverse⟩, rest)
+  | '"' :: rest => .ok (String.ofList acc.reverse, rest)
   | '\\' :: 'u' :: a :: b :: c :: d :: rest =>
       match hex4 a b c d with
       | some n => parseStrAux (Char.ofNat n :: acc) rest
@@ -260,12 +260,12 @@ mutual
              obtain ⟨rfl, rfl⟩ := h
              intro e he
              first
-               | exact absurd he (List.not_mem_nil e)
+               | exact absurd he (List.not_mem_nil)
                | (cases he with
                   | head => exact parseVal_depth_le _ _ _ _ _ (by assumption)
                   | tail _ he' => first
                       | exact parseElems_depth_le _ _ _ _ _ (by assumption) _ he'
-                      | exact absurd he' (List.not_mem_nil _)))
+                      | exact absurd he' (List.not_mem_nil)))
   theorem parseMembers_depth_le :
       ∀ (fuel budget : Nat) (cs : List Char) (ms : List (String × Json)) (r : List Char),
         parseMembers fuel budget cs = .ok (ms, r) → ∀ kv ∈ ms, kv.2.depth ≤ budget
@@ -279,12 +279,12 @@ mutual
              obtain ⟨rfl, rfl⟩ := h
              intro kv hkv
              first
-               | exact absurd hkv (List.not_mem_nil kv)
+               | exact absurd hkv (List.not_mem_nil)
                | (cases hkv with
                   | head => exact parseVal_depth_le _ _ _ _ _ (by assumption)
                   | tail _ hkv' => first
                       | exact parseMembers_depth_le _ _ _ _ _ (by assumption) _ hkv'
-                      | exact absurd hkv' (List.not_mem_nil _)))
+                      | exact absurd hkv' (List.not_mem_nil)))
 end
 
 /-- Anything `parse s maxDepth` accepts is within `maxDepth`. -/
@@ -354,7 +354,7 @@ mutual
 end
 
 /-- Render a value to a JSON string. -/
-def render (j : Json) : String := ⟨renderL j⟩
+def render (j : Json) : String := String.ofList (renderL j)
 end Json
 
 /-! ### Codec round-trip
@@ -469,7 +469,7 @@ mutual
             simp only [Json.depth] at hd
             have hmax : Json.maxArr (e :: es) ≤ b := by omega
             have hde : Json.depth e ≤ b :=
-              Nat.le_trans (Json.depth_le_maxArr (List.mem_cons_self e es)) hmax
+              Nat.le_trans (Json.depth_le_maxArr (List.mem_cons_self)) hmax
             have hdes : ∀ x ∈ es, Json.depth x ≤ b :=
               fun x hx => Nat.le_trans (Json.depth_le_maxArr (List.mem_cons_of_mem e hx)) hmax
             cases fuel with
@@ -495,8 +495,7 @@ mutual
         | zero => omega
         | succ f =>
             have hfe : (Json.renderL e).length < f := by
-              simp only [Json.renderElemsL, Json.renderElemSep, List.append_nil,
-                         List.length_append, List.length_nil] at hf; omega
+              simp only [Json.renderElemsL, Json.renderElemSep, List.append_nil] at hf; omega
             have hv := rt_val e he budget f (']' :: rest) hde hfe
             have harg : Json.renderElemsL (e :: []) ++ ']' :: rest = Json.renderL e ++ ']' :: rest := by
               simp [Json.renderElemsL, Json.renderElemSep]
@@ -514,8 +513,7 @@ mutual
                        List.length_cons] at hf
             have hfe : (Json.renderL e).length < f := by omega
             have hfx : (Json.renderElemsL (x :: xs)).length + 1 < f := by
-              simp only [Json.renderElemsL, Json.renderElemSep, List.length_append,
-                         List.length_cons]; omega
+              simp only [Json.renderElemsL, List.length_append]; omega
             have hv := rt_val e he budget f
               (',' :: (Json.renderElemsL (x :: xs) ++ ']' :: rest)) hde hfe
             have key := rt_elems x xs hxe hxxs budget f rest hdx hdxxs hfx
@@ -535,7 +533,7 @@ theorem parse_render {j : Json} (hj : Json.Simple j) {maxDepth : Nat}
     (h : j.depth ≤ maxDepth) : parse (Json.render j) maxDepth = .ok j := by
   have hv := rt_val j hj maxDepth ((Json.renderL j).length + 1) [] h (by omega)
   simp only [List.append_nil] at hv
-  simp only [parse, Json.render, String.toList, hv, skipWs, List.isEmpty_nil, if_true]
+  simp only [parse, Json.render, String.toList_ofList, hv, skipWs, List.isEmpty_nil, if_true]
 
 /-! ### Dynamic access -/
 

@@ -52,7 +52,7 @@ def parse? (s : String) : Option Date :=
   | _ => none
 
 private def padLeft (width : Nat) (s : String) : String :=
-  if s.length < width then String.mk (List.replicate (width - s.length) '0') ++ s else s
+  if s.length < width then String.ofList (List.replicate (width - s.length) '0') ++ s else s
 
 /-- Render back to ISO `YYYY-MM-DD` (the form a `<input type="date">` expects). -/
 protected def toString (d : Date) : String :=

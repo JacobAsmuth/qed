@@ -32,8 +32,11 @@ export const tc = (a) => ({ __tc: a });        // tail-self-call marker (trampol
 // shared instance in place (mirrors Lean marking top-level constants persistent). `inc`/`dec`
 // leave ∞ unchanged, so it stays frozen for the program's life.
 export function memo(f) { let v, done = false; return () => { if (!done) { v = f(); done = true; if (v !== null && typeof v === 'object' && v.r !== undefined) v.r = Infinity; } return v; }; }
-export const mkOk  = (v, w = W) => ({ t: 0, f: [v, w], s: {}, u: {} });   // EStateM.Result.ok
-export const mkErr = (e, w = W) => ({ t: 1, f: [e, w], s: {}, u: {} });   // EStateM.Result.error
+// v4.30 erased the IO RealWorld token: an IO result is a single-field `EST.Out` carrying just
+// the value/error (no world). The monad wraps `pure`/return in `EST.Out.ok`; a fallible IO
+// extern returns one of these, a BaseIO extern returns its value directly (see ST.Prim below).
+export const mkOk  = (v) => ({ t: 0, f: [v], s: {}, u: {} });   // EST.Out.ok
+export const mkErr = (e) => ({ t: 1, f: [e], s: {}, u: {} });   // EST.Out.error
 
 // ---- Int (BigInt) -----------------------------------------------------------
 export const Int_add = (a, b) => a + b;
@@ -199,12 +202,57 @@ export const ByteArray_copySlice = (src, so, dst, dso, len, _ex) => {
   return r;
 };
 
+// ---- v4.30 stdlib externs (renames + the new String.Pos.Raw / UTF-8 byte API) ----
+// Lean 4.30 backs `String` with a UTF-8 `ByteArray` and routes string ops through
+// `String.Pos.Raw` (a byte offset). Our representation is unchanged (JS string, Pos = byte
+// offset), so these reuse the same byte-offset helpers as the pre-4.30 `String.*` externs.
+// (Erased proof args are stripped by the transpiler, so each arrives without them.)
+export const Array_emptyWithCapacity = Array_mkEmpty;            // was Array.mkEmpty
+export const Array_replicate = Array_mkArray;                    // was Array.mkArray
+export const Array_getInternal = Array_get;                      // bounds proof erased
+export const Array_getInternalBorrowed = (a, i) => a[Number(i)]; // borrowed: no inc
+export const Array_ugetBorrowed = (a, i) => a[Number(i)];        // borrowed: no inc
+// `Array.get!Internal : [Inhabited α] → Array α → Nat → α` — the instance is a real runtime arg.
+export const Array_getx33Internal = (_inst, a, i) => { const x = a[Number(i)]; inc(x); return x; };
+export const Array_getx33InternalBorrowed = (_inst, a, i) => a[Number(i)];
+export const Nat_ble = (a, b) => a <= b ? 1 : 0;
+export const String_decidableLT = String_decLt;                  // was String.decLt
+export const Nat_shiftRight = (a, b) => a >> b;
+export const UInt8_decEq = (a, b) => a === b ? 1 : 0;
+export const UInt32_ofBitVec = (bv) => Number(BigInt(bv) & 0xFFFFFFFFn);
+export const USize_ofNatLT = (n) => Number(n & 0x1FFFFFFFFFFFFFn);
+export const String_ofList = String_mk;                          // was String.mk
+export const String_toList = String_data;                        // was String.data
+export const String_ofByteArray = (ba) => new TextDecoder().decode(ba);
+export const String_Internal_append = (a, b) => a + b;
+export const String_Pos_Raw_get = String_get;
+export const String_Pos_Raw_next = String_next;
+export const String_Pos_Raw_atEnd = String_atEnd;
+export const String_Pos_Raw_extract = String_extract;
+export const String_Pos_next = String_next;
+export const String_decodeChar = (s, i) => atByte(s, Number(i))[0];
+export const String_getUTF8Byte = (s, p) => ENC.encode(s)[Number(p)];
+export const ByteArray_emptyWithCapacity = (_c) => new Uint8Array(0);
+export const ByteArray_validateUTF8 = (ba) => { try { new TextDecoder('utf-8', { fatal: true }).decode(ba); return 1; } catch { return 0; } };
+
 // ---- mutable refs + IO plumbing (EStateM.Result.ok protocol) ----------------
-export const ST_Prim_mkRef = (a, w) => mkOk({ v: a }, w);
-export const ST_Prim_Ref_get = (r, w) => mkOk(r.v, w);
-export const ST_Prim_Ref_set = (r, a, w) => { r.v = a; return mkOk(PUnit, w); };
-export const ST_Prim_Ref_take = (r, w) => mkOk(r.v, w);
-export const IO_getStderr = (w) => mkOk({ stderr: true }, w);
+// BaseIO externs return their VALUE directly (the world is erased; no `EST.Out` wrapper).
+export const ST_Prim_mkRef   = (a, _w) => ({ v: a });            // BaseIO (IO.Ref α) → the ref
+export const ST_Prim_Ref_get = (r, _w) => r.v;                   // BaseIO α → the value
+export const ST_Prim_Ref_set = (r, a, _w) => { r.v = a; return PUnit; };
+export const ST_Prim_Ref_take = (r, _w) => r.v;
+// stdout/stderr as an IO.FS.Stream {flush, read, write, getLine, putStr, isTty} (field order
+// per `IO.FS.Stream`); each method is a pap'd closure taking its args + the erased world and
+// returning an `EST.Out.ok` (isTty is BaseIO Bool → returns the bool directly).
+const mkStream = (writeFn) => ctor(0,
+  pap((_w) => mkOk(PUnit), 1, []),
+  pap((_n, _w) => mkOk(new Uint8Array(0)), 2, []),
+  pap((ba, _w) => (writeFn(new TextDecoder().decode(ba)), mkOk(PUnit)), 2, []),
+  pap((_w) => mkOk(''), 1, []),
+  pap((s, _w) => (writeFn(s), mkOk(PUnit)), 2, []),
+  pap((_w) => 0, 1, []));
+export const IO_getStdout = (_w) => mkStream((s) => { const t = String(s).replace(/\n$/, ''); if (t) console.log(t); });
+export const IO_getStderr = (_w) => mkStream((s) => { const t = String(s).replace(/\n$/, ''); if (t) console.error(t); });
 export function panicCore(msg) { throw new Error('Lean panic: ' + (typeof msg === 'string' ? msg : '')); }
 
 // ---- DOM externs: delegate to a host-registered backend ---------------------

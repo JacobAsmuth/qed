@@ -23,7 +23,7 @@ structure Model where
   tick : Nat
 deriving Inhabited
 
-def init : Model := { vals := Array.mkArray n 0, tick := 0 }
+def init : Model := { vals := Array.replicate n 0, tick := 0 }
 
 inductive Msg | bump
 

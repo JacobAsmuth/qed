@@ -32,7 +32,7 @@ namespace Js
 /-- A JS-safe identifier fragment for an extern/global name. -/
 def mangle (n : Name) : String := Id.run do
   let mut s := ""
-  for c in n.toString.data do
+  for c in n.toString.toList do
     if c.isAlphanum then s := s.push c
     else if c == '.' || c == '_' then s := s.push '_'
     else s := s ++ s!"x{c.toNat}"
@@ -89,7 +89,7 @@ def Ctx.js (c : Ctx) (n : Name) : String :=
   | none   => "$." ++ mangle n   -- an extern: a member of the runtime namespace `$`
 
 /-- Indentation (empty when minifying). -/
-def Ctx.ind (c : Ctx) (d : Nat) : String := if c.min then "" else String.mk (List.replicate (2 * d) ' ')
+def Ctx.ind (c : Ctx) (d : Nat) : String := if c.min then "" else String.ofList (List.replicate (2 * d) ' ')
 
 /-! ## Expression / body emission -/
 
@@ -98,7 +98,7 @@ def jp (j : JoinPointId) : String := s!"j{j.idx}"
 
 def emitArg : Arg → String
   | .var x      => v x
-  | .irrelevant => "0"   -- irrelevant value; never inspected
+  | .erased     => "0"   -- erased/irrelevant value; never inspected
 
 /-- A constructor value: nullary → its tag number; otherwise a tagged record. -/
 def ctorVal (i : CtorInfo) (ys : Array Arg) : String :=
@@ -118,7 +118,7 @@ def jsStr (s : String) : String :=
       | c =>
         if c.toNat < 32 then
           let h := Nat.toDigits 16 c.toNat
-          "\\x" ++ String.mk (if h.length == 1 then '0' :: h else h)
+          "\\x" ++ String.ofList (if h.length == 1 then '0' :: h else h)
         else String.singleton c)
   "\"" ++ escaped ++ "\""
 
@@ -127,13 +127,13 @@ def emitApp (c : Ctx) (f : Name) (ys : Array Arg) : String :=
   -- `Qed.refMark` is a runtime primitive (object identity stamp) the driver uses to skip an
   -- unchanged list row; its Lean body is a conservative `0`, so emit the real `$.refMark` here.
   if f == `Qed.refMark then
-    s!"$.refMark({String.intercalate ", " (ys.toList.filterMap fun | .var x => some (v x) | .irrelevant => none)})"
+    s!"$.refMark({String.intercalate ", " (ys.toList.filterMap fun | .var x => some (v x) | .erased => none)})"
   else
   let argStrs : List String :=
     match findEnvDecl c.env f with
     | some (.extern (xs := ps) ..) =>
-        ys.toList.enum.filterMap fun (i, a) =>
-          if i < ps.size && ps[i]!.ty.isIrrelevant then none else some (emitArg a)
+        ys.toList.zipIdx.filterMap fun (a, i) =>
+          if i < ps.size && ps[i]!.ty.isErased then none else some (emitArg a)
     | _ => ys.toList.map emitArg
   s!"{c.js f}({String.intercalate ", " argStrs})"
 
@@ -160,7 +160,6 @@ partial def skipRC : FnBody → FnBody
   | .inc _ _ _ _ b => skipRC b
   | .dec _ _ _ _ b => skipRC b
   | .del _ b       => skipRC b
-  | .mdata _ b     => skipRC b
   | b              => b
 
 /-- Is `cont` (after RC ops) just `ret z`? Then a preceding `fap self` is a tail self-call. -/
@@ -178,7 +177,7 @@ partial def hasSelfTail (self : Name) : FnBody → Bool
   | .case _ _ _ alts  => alts.any (fun a => hasSelfTail self a.body)
   | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b => hasSelfTail self b
   | .sset _ _ _ _ _ b => hasSelfTail self b
-  | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b | .mdata _ b => hasSelfTail self b
+  | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b => hasSelfTail self b
   | _ => false
 
 /-- Vars whose defining expression is provably not an array — a `ctor`/`reuse` (a tagged record),
@@ -193,7 +192,7 @@ partial def collectNonArr (acc : Std.HashSet Nat) : FnBody → Std.HashSet Nat
   | .jdecl _ _ v b => collectNonArr (collectNonArr acc v) b
   | .case _ _ _ alts => alts.foldl (fun acc alt => collectNonArr acc alt.body) acc
   | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b | .sset _ _ _ _ _ b
-  | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b | .mdata _ b => collectNonArr acc b
+  | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b => collectNonArr acc b
   | _ => acc
 
 partial def emitBody (c : Ctx) (d : Nat) : FnBody → String
@@ -221,7 +220,6 @@ partial def emitBody (c : Ctx) (d : Nat) : FnBody → String
   | .inc x n _ _ b    => (if c.nonArr.contains x.idx then "" else s!"{c.ind d}$.inc({v x}, {n});\n") ++ emitBody c d b
   | .dec x n _ _ b    => (if c.nonArr.contains x.idx then "" else s!"{c.ind d}$.dec({v x}, {n});\n") ++ emitBody c d b
   | .del x b          => (if c.nonArr.contains x.idx then "" else s!"{c.ind d}$.dec({v x}, 1);\n") ++ emitBody c d b
-  | .mdata _ b        => emitBody c d b
   | .ret a            => s!"{c.ind d}return {emitArg a};\n"
   | .jmp j ys         => s!"{c.ind d}return {jp j}({String.intercalate ", " (ys.toList.map emitArg)});\n"
   | .unreachable      => s!"{c.ind d}throw new Error('unreachable');\n"

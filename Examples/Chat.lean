@@ -80,10 +80,9 @@ invariant streamSafe : (fun m => m.pending = true → 0 < m.turns.size)
   cases msg <;>
     simp_all only [transition, appendLast, still, also,
                    InvTarget.proj_fst, Array.size_modify, Array.size_push] <;>
-    first
-      | omega
-      | simp_all
-      | (split <;> simp_all <;> omega)
+    (try split) <;>
+    simp_all [Array.size_push, Array.size_modify] <;>
+    omega
 
 def bubble (t : Turn) : Html Msg :=
   div [cls (if t.user? then "msg user" else "msg bot")] [t.text]

@@ -77,7 +77,7 @@ theorem isSome_run (i : Input α) (raw : String) :
 
 private def toInt? (s : String) : Option Int :=
   match s.toList with
-  | '-' :: ds => (String.mk ds).toNat?.map fun n => -(Int.ofNat n)
+  | '-' :: ds => (String.ofList ds).toNat?.map fun n => -(Int.ofNat n)
   | _         => s.toNat?.map Int.ofNat
 
 /-! ### Built-in controls. Each fixes a value type and a widget; `refine` adds a spec. -/

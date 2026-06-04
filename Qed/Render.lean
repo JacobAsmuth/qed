@@ -56,7 +56,7 @@ def normalizeAttrs (attrs : List (Attr msg)) : List (Attr msg) :=
     `=`, `/`, control chars), keeping only the URL/HTML-safe name characters. Attribute names
     are normally literals; this closes the injection an `attr (userKey) v` would otherwise open. -/
 def sanitizeKey (k : String) : String :=
-  String.mk (k.toList.filter (fun c => c.isAlphanum || c == '-' || c == '_' || c == ':' || c == '.'))
+  String.ofList (k.toList.filter (fun c => c.isAlphanum || c == '-' || c == '_' || c == ':' || c == '.'))
 
 /-- HTML void elements: rendered with no children and no closing tag (`<input>`, not
     `<input></input>`), so server markup parses and hydrates the way the browser builds it. -/

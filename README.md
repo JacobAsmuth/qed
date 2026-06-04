@@ -7,15 +7,12 @@ render that throws on an empty list, the "this can't happen" that happens in pro
 framework asks you to *trust* that your code is right, and the best they offer is a type checker
 and a test suite that hope along with you. Qed makes a different bet. You write your app in
 [Lean](https://lean-lang.org), a proof assistant, and the same kernel that mathematicians use to
-check proofs checks your frontend. Things other languages can only hope are true, Lean *knows*.
+check proofs checks your frontend. Things other languages can only hope are true, Lean knows.
 
-For a long time the catch was getting that verified code into a browser. The original plan was
-WebAssembly, and it worked, but it dragged a whole toolchain along with it. As of this milestone
-that's gone. **`qed build` transpiles your app, and the entire verified framework, straight to
+**`qed build` transpiles your app, and the entire verified framework, straight to
 plain JavaScript.** No emscripten, no WASM, no special runtime; the output is a handful of `.mjs`
 files you can serve anywhere. The proofs that pass `qed check` now describe the JavaScript that
-actually runs, and a differential gate keeps the two honest. If you've written Elm, the surface
-will feel familiar. The difference is underneath.
+actually runs. If you've written Elm, its structure will feel familiar. The difference is underneath.
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/JacobAsmuth/qed/main/install.sh | sh
@@ -31,8 +28,7 @@ case in a `match`, or a render that might not terminate, isn't a warning you can
 build error. The broken code never reaches a user, because it never reaches `dist/`.
 
 **You can state a fact about your app and let the kernel prove it.** This is the part that has no
-analogue in a normal framework. Here is the whole of a counter (model, messages, update, view)
-plus a claim that its count is never negative:
+analogue in a normal framework. Below is a simple counter app with an invariant that its count is never negative.
 
 ```lean
 structure Model where
@@ -61,14 +57,14 @@ invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
 
 That last line isn't a test, and you don't write its proof. `invariant` discharges it
 automatically: it checks that *every* message leaves the count non-negative, and the build only
-succeeds if that's true for all of them. Delete the `if 0 < m.count` guard and watch the build
-stop, and notice the error names the message that broke the promise (`case decrement`), not some
-opaque goal. The same syntax covers effectful transitions, and a `:=` clause lets you hand over a
-proof for the rare claim the automation can't close on its own.
+succeeds if that's true for all of them. Delete the `if 0 < m.count` guard and the build
+fails. The error names the message that broke the promise (`case decrement`). The same
+syntax covers effectful transitions, and a `:=` clause lets you hand over a proof for the rare
+claim the automation can't close on its own.
 
-What's worth stating? Bounds, preconditions, mutual exclusion, effect safety, unique keys.
-[`docs/invariants.md`](docs/invariants.md) is the menu. For an LLM writing your code, an
-auto-checked invariant is a property it *can't* quietly violate; for you, it's the "this can't
+What's worth stating? Bounds, preconditions, mutual exclusion, effect safety, unique keys. See
+[`docs/invariants.md`](docs/invariants.md) for more examples. For many front-end developers and LLM's, an
+auto-checked invariant is a property that can't quietly be violated; for you, it's the "this can't
 happen" finally made true.
 
 ## One way to write a view
@@ -115,11 +111,9 @@ runtime/qed_dom.mjs + qed_host.mjs    (the only hand-written JS: the DOM calls a
 ```
 
 The only JavaScript a human wrote is the thin boundary at the bottom: the actual DOM calls and
-event delegation. Everything above it is your proven Lean, mechanically translated. And because
-"mechanically translated" is itself a thing that could go wrong, `test/js_gate_test.mjs` runs the
+event delegation. Everything above it is verified Lean. `test/js_gate_test.mjs` runs the
 same probes through native Lean and through the transpiled JS and asserts they compute *exactly*
-the same thing: render, diff, arithmetic, JSON, routing. The differential test is the new
-verification story: it ties the running JavaScript back to the code the kernel checked.
+the same thing: render, diff, arithmetic, JSON, routing.
 
 ## The rest of the app is data, too
 

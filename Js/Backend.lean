@@ -1,28 +1,47 @@
 /-
   Js.Backend — a faithful Lean-IR → JavaScript transpiler (build-time tool).
 
-  It reads the *compiled* `Lean.IR.Decl` for an app's entry points — the same IR the
-  C backend consumes — and emits JavaScript, mirroring `Lean.IR.EmitC` minus the
-  manual memory model. Because JS is garbage-collected, the whole reference-counting /
-  boxing layer collapses: `inc`/`dec`/`del` are dropped, `box`/`unbox` are identities,
-  `isShared` is conservatively `true` (so `reset`/`reuse` always allocate fresh and we
-  never mutate possibly-shared data), and the IO monad — which the compiler materializes
-  as `EStateM.Result.ok value world` ctors threading a world token — transpiles with the
-  ordinary ctor/proj/case machinery, so even the driver is just data.
+  It reads the *compiled* `Lean.IR.Decl` for an app's entry points — the same IR the C
+  backend consumes — and emits JavaScript, mirroring `Lean.IR.EmitC`. The pieces it
+  reimplements: reachability (a call-graph walk), name mangling, constructor layout
+  (`{t,f,s,u}` + packed-scalar offsets), the closure calling convention (`pap`/`ap`), and a
+  reference-counting layer for ARRAYS (so a uniquely-owned array mutates in place instead of
+  copying — recovering Lean's O(1) array updates); on a non-array `inc`/`dec` are no-ops,
+  since JS is garbage-collected, and `box`/`unbox` are identities.
+
+  IO is just data: a `BaseIO` action returns its value directly, and the `IO`/`EIO` monad's
+  `pure`/return wraps in a single-field `EST.Out.ok`/`.error` (Lean v4.30 erased the RealWorld
+  token, so there is no threaded world). The ordinary ctor/proj/case machinery handles it, so
+  even the driver transpiles as plain data — see the runtime counterpart in `qed_rt.mjs`.
 
   Runtime representation (matches `qed_rt.mjs`):
     • Int / Nat        → BigInt
     • UInt8/16/32, USize, Bool-as-u8, enum tags → Number
     • UInt64           → BigInt
     • String           → JS string (Pos = byte offset, handled in the runtime)
-    • Array            → JS Array
+    • Array            → JS Array (carries a refcount `.r`)
     • nullary ctor     → the number `cidx`            (lean_box(cidx))
     • ctor with fields → {t: cidx, f:[objFields], s:{}, u:{}}
     • closure          → {fn, arity, args}             ($.pap / $.app)
-    • IO world token   → 0 (threaded, never inspected)
+    • IO result        → its value (BaseIO) or {t:0|1, f:[value|err]} (EST.Out, no world)
 
-  Anything the emitter cannot lower, or an extern with no JS implementation, makes the
-  build FAIL LOUDLY — it never emits a silently-wrong program.
+  ── THE LEAN-VERSION DEPENDENT SURFACE (recheck on every toolchain bump; see
+     docs/upgrading-lean.md) ──────────────────────────────────────────────────────────────
+  Everything below is `Lean.IR` internals — unstable across releases — but the coupling is
+  BOUNDED and FAIL-LOUD: a renamed/removed constructor breaks an exhaustive `match` at build
+  time, a renamed accessor fails to resolve, and a runtime extern with no JS impl is caught by
+  the differential gate (`test/js_gate_test.mjs`). The full surface:
+    • env access ..... `findEnvDecl`, `getInitFnNameFor?`, `Environment`
+    • declarations ... `Decl.fdecl`/`.extern` (+ `params`, `body`), `Param`, `CtorInfo`
+                       (`cidx`/`size`/`usize`/`ssize`), `Arg.var`/`.erased`
+    • bodies ......... `FnBody` (vdecl/jdecl/set/setTag/uset/sset/inc/dec/del/case/ret/jmp/
+                       unreachable), `Alt.ctor`/`.default`, `VarId`, `JoinPointId`
+    • expressions .... `IR.Expr` (ctor/reset/reuse/proj/uproj/sproj/fap/pap/ap/box/unbox/lit/
+                       isShared), `LitVal.num`/`.str`
+    • types .......... `IRType` (`isObj`/`isErased`/`.uint64`)
+
+  Anything the emitter cannot lower makes the build FAIL LOUDLY — it never emits a
+  silently-wrong program.
 -/
 import Lean
 open Lean IR

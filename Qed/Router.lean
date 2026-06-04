@@ -10,6 +10,9 @@
   A path is modelled as its list of segments (`/posts/hello` ↦ `["posts","hello"]`),
   which keeps the round-trip proof a clean case analysis.
 -/
+import Std.Data.String.ToNat   -- `Nat.toNat?_repr`: the typed-param round-trip lemma
+import Std.Data.String.ToInt   -- `Int.toInt?_repr`
+
 namespace Qed
 
 /-- A bijective-on-its-image encoding of `α` to/from URL path segments. -/
@@ -136,18 +139,12 @@ macro_rules
           | `(routeAlt| $c:ident $[($bs:ident : $bts:term)]* $[=> $seg:str]?) =>
               pure (false, c, bs, bts, seg)
           | _ => Macro.throwErrorAt alt "router: expected `[*] ctor (arg : T)* (=> \"segment\")?`")
-        -- A parameter is a URL segment verbatim, so only `String` round-trips *by proof* (a
-        -- `Nat`/`Int` would need `(toString n).toNat? = some n`, which has no library lemma, so
-        -- the generated `round_trip` would not close). Reject other types with a
-        -- clear message instead of a confusing error inside the generated code. (Iterate a plain
-        -- `Array` copy so `bts` keeps the `TSyntaxArray` type the splices below need.)
+        let bs : Array (TSyntax `ident) := bs   -- pin the kind so `$bTerm` splices don't re-infer it
+        -- A parameter rides the URL as one path segment. `String` is verbatim; `Nat`/`Int`
+        -- print via `repr` and parse via `toNat?`/`toInt?`, with the round-trip discharged by
+        -- `Nat.toNat?_repr`/`Int.toInt?_repr`. (Plain `Array` copy so `bts` keeps the type the
+        -- splices below need.)
         let btsArr : Array (TSyntax `term) := bts
-        for bt in btsArr do
-          match bt with
-          | `(String) => pure ()
-          | _ => Macro.throwErrorAt bt
-                   "router: a route parameter must have type `String`; decode richer types from \
-                    the String in your `update` (a verified non-String URL round-trip isn't supported)"
         let ctorId := mkIdent (t.getId ++ c.getId)
         -- leading segment(s): "" ⇒ index (no segment); a string ⇒ those segments
         -- (split on `/`, so `=> "books/archive"` is two segments and stays reachable);
@@ -156,8 +153,27 @@ macro_rules
           match seg with
           | some s => ((s.getString.splitOn "/").filter (· ≠ "")).toArray.map (quote ·)
           | none   => #[quote (toString c.getId)]
-        let bterms : Array (TSyntax `term) := bs.map (⟨·.raw⟩)
-        let segments := segs ++ bterms          -- one list, used as term and pattern
+        -- print: each param becomes a segment — String verbatim, Nat/Int via `repr`.
+        let mut printTerms : Array (TSyntax `term) := #[]
+        for i in [0:bs.size] do
+          let bTerm : TSyntax `term := ⟨bs[i]!.raw⟩       -- the binder as a term (keeps `bs : ident`)
+          printTerms := printTerms.push (← match btsArr[i]! with
+            | `(String) => pure bTerm
+            | `(Nat)    => `(Nat.repr $bTerm)
+            | `(Int)    => `(Int.repr $bTerm)
+            | _ => Macro.throwErrorAt btsArr[i]!
+                     "router: a route parameter must have type `String`, `Nat`, or `Int`")
+        let printSeg := segs ++ printTerms
+        -- parse: the pattern binds each param's raw String segment; the body decodes the typed
+        -- ones (`toNat?`/`toInt?`), yielding `none` if any segment fails to decode.
+        let parseSeg := segs ++ bs.map (fun b => (⟨b.raw⟩ : TSyntax `term))
+        let mut parseBody : TSyntax `term ← `(some ($ctorId $bs*))
+        for i in (List.range bs.size).reverse do
+          let bTerm : TSyntax `term := ⟨bs[i]!.raw⟩
+          match btsArr[i]! with
+          | `(Nat) => parseBody ← `(match String.toNat? $bTerm with | some $bTerm => $parseBody | none => none)
+          | `(Int) => parseBody ← `(match String.toInt? $bTerm with | some $bTerm => $parseBody | none => none)
+          | _      => pure ()
         if marked then
           if bs.size != 0 then
             Macro.throwErrorAt c "router: the not-found route (marked `*`) must take no arguments"
@@ -166,9 +182,9 @@ macro_rules
         ctorBs    := ctorBs.push bs
         ctorBts   := ctorBts.push bts
         printPats := printPats.push (← `($ctorId $bs*))
-        printRhss := printRhss.push (← `([$segments,*]))
-        parsePats := parsePats.push (← `([$segments,*]))
-        parseRhss := parseRhss.push (← `(some ($ctorId $bs*)))
+        printRhss := printRhss.push (← `([$printSeg,*]))
+        parsePats := parsePats.push (← `([$parseSeg,*]))
+        parseRhss := parseRhss.push parseBody
       let parsePatsAll := parsePats.push (← `(_))           -- final wildcard ⇒ none
       let parseRhssAll := parseRhss.push (← `(none))
       -- The `*`-marked route is what a routed app falls back to on an unknown URL (it is the
@@ -187,7 +203,7 @@ macro_rules
           match p with
           $[| $parsePatsAll:term => $parseRhssAll:term]*
         theorem $rtId:ident : ∀ a, $parseId:ident ($printId:ident a) = some a := by
-          intro a; cases a <;> simp [$printId:ident, $parseId:ident]
+          intro a; cases a <;> simp [$printId:ident, $parseId:ident, Nat.toNat?_repr, Int.toInt?_repr]
         instance : Router $t:ident := ⟨$printId, $parseId, $rtId⟩)
 
 /-! ### An example route table
@@ -200,5 +216,12 @@ router Route where
   about
   post (slug : String) => "posts"
   user (name : String) => "users"
+
+-- Typed `Nat`/`Int` route parameters round-trip too; the proof is discharged
+-- automatically by `Nat.toNat?_repr` / `Int.toInt?_repr`.
+router TypedRoute where
+  page (n : Nat) => "page"
+  delta (i : Int) => "delta"
+  item (slug : String) (n : Nat) => "items"
 
 end Qed

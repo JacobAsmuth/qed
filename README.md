@@ -7,12 +7,11 @@ render that throws on an empty list, the "this can't happen" that happens in pro
 framework asks you to *trust* that your code is right, and the best they offer is a type checker
 and a test suite that hope along with you. Qed makes a different bet. You write your app in
 [Lean](https://lean-lang.org), a proof assistant, and the same kernel that mathematicians use to
-check proofs checks your frontend. Things other languages can only hope are true, Lean knows.
+check proofs checks your frontend.
 
-**`qed build` transpiles your app, and the entire verified framework, straight to
-plain JavaScript.** No emscripten, no WASM, no special runtime; the output is a handful of `.mjs`
-files you can serve anywhere. The proofs that pass `qed check` now describe the JavaScript that
-actually runs. If you've written Elm, its structure will feel familiar. The difference is underneath.
+`qed build` transpiles your app, and the entire verified framework, straight to plain JavaScript.
+No emscripten, no WASM, no special runtime; the output is a handful of `.mjs` files you can serve anywhere.
+The proofs that pass `qed check` now describe the JavaScript that actually runs. If you've written Elm, its structure will feel familiar.
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/JacobAsmuth/qed/main/install.sh | sh
@@ -120,7 +119,7 @@ the same thing: render, diff, arithmetic, JSON, routing.
 The counter is the whole architecture in miniature, but a real app needs to read JSON, validate
 forms, route, talk to a server, and keep lists. Qed's approach to each is the same: push the thing
 that can fail into a value the type system can see, so the failure becomes a case you handle
-rather than an exception you forgot. A tour.
+rather than an exception you forgot.
 
 ### JSON that can't throw or blow the stack
 
@@ -167,15 +166,18 @@ validate.
 ### Routing whose links can't 404 from a typo
 
 `router` declares your pages and, with them, a `Router` whose round-trip is *proven*: a URL you
-can print is a URL you can parse back into the route that produced it. Better, `linkTo route`
-builds a navigation link from a route *value*, not a string, so a mistyped or impossible path
-won't compile, it'll fail to elaborate. The routed app hands your transition the route already
-parsed, and `Cmd.getJson` does the fetch and the decode together:
+can print is a URL you can parse back into the route that produced it. A `String` parameter rides
+the URL verbatim; a `Nat` or `Int` parameter prints with `repr` and parses with `toNat?`/`toInt?`,
+and the round-trip is still discharged automatically. Better, `linkTo route` builds a navigation
+link from a route *value*, not a string, so a mistyped or impossible path won't compile, it'll
+fail to elaborate. The routed app hands your transition the route already parsed, and `Cmd.getJson`
+does the fetch and the decode together:
 
 ```lean
 router R where
   home => ""
   user (name : String) => "users"
+  post (id : Nat)       => "posts"
 
 def app : App Model Msg :=
   ui init transition (onRoute := Msg.routed) fun m =>
@@ -295,10 +297,6 @@ CLI against this checkout.
 The framework is feature-complete enough to build real apps, and the remaining work is honest
 about its edges:
 
-- **Typed route parameters.** Today a route segment is a `String`; a `Nat` or `Int` parameter
-  wants a `(toString n).toNat? = some n` round-trip lemma that Lean v4.15 doesn't ship, and Qed
-  refuses to paper over the gap with `sorry`. For now a non-`String` parameter is a clear compile
-  error pointing you to decode it in `update`.
 - **SVG**, a typed CSS-property DSL, and `Resource` auto-refetch-on-dependency are deferred
   features, not blocked ones.
 - **Cold create of huge lists** is the one benchmark gap left versus React, and the pure string

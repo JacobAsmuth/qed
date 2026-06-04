@@ -138,7 +138,7 @@ macro_rules
               pure (true,  c, bs, bts, seg)
           | `(routeAlt| $c:ident $[($bs:ident : $bts:term)]* $[=> $seg:str]?) =>
               pure (false, c, bs, bts, seg)
-          | _ => Macro.throwErrorAt alt "router: expected `[*] ctor (arg : T)* (=> \"segment\")?`")
+          | _ => Macro.throwErrorAt alt "router: couldn't read this route. Each one is a constructor name, then zero or more typed params like (slug : String), then an optional path override; mark the not-found fallback with a leading *.")
         let bs : Array (TSyntax `ident) := bs   -- pin the kind so `$bTerm` splices don't re-infer it
         -- A parameter rides the URL as one path segment. `String` is verbatim; `Nat`/`Int`
         -- print via `repr` and parse via `toNat?`/`toInt?`, with the round-trip discharged by
@@ -162,7 +162,7 @@ macro_rules
             | `(Nat)    => `(Nat.repr $bTerm)
             | `(Int)    => `(Int.repr $bTerm)
             | _ => Macro.throwErrorAt btsArr[i]!
-                     "router: a route parameter must have type `String`, `Nat`, or `Int`")
+                     "router: a route parameter must be `String`, `Nat`, or `Int` (these are the types whose URL round-trip Qed can prove). For any other type, take a `String` segment here and decode it in your `update`.")
         let printSeg := segs ++ printTerms
         -- parse: the pattern binds each param's raw String segment; the body decodes the typed
         -- ones (`toNat?`/`toInt?`), yielding `none` if any segment fails to decode.
@@ -176,7 +176,7 @@ macro_rules
           | _      => pure ()
         if marked then
           if bs.size != 0 then
-            Macro.throwErrorAt c "router: the not-found route (marked `*`) must take no arguments"
+            Macro.throwErrorAt c "router: the not-found route (marked `*`) must take no arguments. It is the fallback for any unmatched URL, so there's nothing to parse into it."
           markedCtor := some c
         ctorNames := ctorNames.push c
         ctorBs    := ctorBs.push bs

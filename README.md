@@ -284,8 +284,6 @@ CLI against this checkout.
 The framework is feature-complete enough to build real apps, and the remaining work is honest
 about its edges:
 
-- A typed CSS-property DSL and `Resource` auto-refetch-on-dependency are deferred features, not
-  blocked ones.
 - **Cold create of huge lists** is the one benchmark gap left versus React, and the pure string
   renderer used for SSR still recurses per element. Making both iterative is on the list.
 

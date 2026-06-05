@@ -311,3 +311,7 @@ Give it a try and state an invariant. Issues welcome at
 | `Qed/Dom.lean` / `Qed/Driver.lean` | The DOM primitives (the one trusted boundary) and the impure driver. |
 | `Js/Backend.lean` | The Lean IR to JavaScript transpiler. |
 | `Examples/` · `test/` | Example apps and the browser tests that drive them. |
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).

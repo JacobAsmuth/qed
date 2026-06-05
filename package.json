@@ -1,6 +1,7 @@
 {
   "name": "qed-app",
   "private": true,
+  "license": "MIT",
   "description": "npm-script aliases for the qed toolchain — for web devs who reach for `npm run dev`.",
   "scripts": {
     "dev": "./qed dev",

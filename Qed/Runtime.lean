@@ -385,7 +385,8 @@ open Lean in
 macro_rules
   | `(ui $init $update $[$opts:uiOpt]* fun $m => $body) => do
       let tmpl ← `(view% fun $m => $body)
-      let mut routeE? : Option (TSyntax `term) := none
+      let mut routeE?   : Option (TSyntax `term) := none
+      let mut queriesE? : Option (TSyntax `term) := none
       let mut startE  : TSyntax `term ← `(Qed.Cmd.none)
       let mut localsE : TSyntax `term ← `(([] : List Qed.LocalDef))
       let mut portE   : TSyntax `term ← `(none)
@@ -393,18 +394,26 @@ macro_rules
         match opt with
         | `(uiOpt| ($name:ident := $e)) =>
             match name.getId with
-            | `onRoute => routeE? := some e
+            | `onRoute => routeE?   := some e
+            | `queries => queriesE? := some e
             | `start   => startE  := e
             | `locals  => localsE := e
             | `onPort  => portE   := e
-            | _ => Macro.throwErrorAt name s!"ui: unknown option '{name.getId}' (expected onRoute/start/locals/onPort)"
+            | _ => Macro.throwErrorAt name s!"ui: unknown option '{name.getId}' (expected onRoute/start/locals/onPort/queries)"
         | _ => pure ()
-      match routeE? with
-      | some route =>
-          `(Qed.mkRoutedApp $init $update $tmpl (onRoute := $route)
-              (start := $startE) (locals := $localsE) (onPort := $portE))
-      | none =>
-          `(Qed.mkApp $init $update $tmpl (start := $startE) (locals := $localsE) (onPort := $portE))
+      let base ← match routeE? with
+        | some route =>
+            `(Qed.mkRoutedApp $init $update $tmpl (onRoute := $route)
+                (start := $startE) (locals := $localsE) (onPort := $portE))
+        | none =>
+            `(Qed.mkApp $init $update $tmpl (start := $startE) (locals := $localsE) (onPort := $portE))
+      -- `queries` (auto-refetch) wraps the finished app's update; absent ⇒ the app unchanged.
+      -- `withQueries` lives in `Qed.Resource` (imported by app modules, not by this one), so emit
+      -- it with `mkIdent` — a bare quotation would pre-resolve `Qed.App.` as a struct projection
+      -- here (where `App` exists but the method does not yet) and never find the real constant.
+      match queriesE? with
+      | some qs => `($(mkIdent `Qed.App.withQueries) $qs $base)
+      | none    => pure base
 /-- Register a local component with an output it can bubble to its parent. `update`
     returns the next state and an optional output; the output is serialized and handed
     to the host's `bubble` (see `localMountWith`). The message type `M` needs no codec

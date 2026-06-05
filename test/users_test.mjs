@@ -26,6 +26,7 @@ if (build.status !== 0) { console.error('build failed'); process.exit(1); }
 const profiles = {
   ada:  { name: 'Ada',  bio: 'Wrote the first algorithm.' },
   alan: { name: 'Alan', bio: 'Asked what machines can decide.' },
+  slow: { name: 'Slow', bio: 'Arrived late.' },   // served with a delay, to test the stale-response race
 };
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
                '.json': 'application/json', '.css': 'text/css' };
@@ -43,8 +44,10 @@ const server = createServer(async (req, res) => {
   if (pathname.startsWith('/api/users/')) {
     const name = decodeURIComponent(pathname.slice('/api/users/'.length)).toLowerCase();
     const p = profiles[name];
-    return p ? send(200, 'application/json', JSON.stringify(p))
-             : send(404, 'application/json', JSON.stringify({ error: 'no such user' }));
+    const respond = () => p ? send(200, 'application/json', JSON.stringify(p))
+                            : send(404, 'application/json', JSON.stringify({ error: 'no such user' }));
+    if (name === 'slow') return void setTimeout(respond, 800);   // delay so a faster nav can overtake it
+    return respond();
   }
   // extensionless paths are routes → serve the SPA shell; asset paths serve the file
   const fp = (pathname === '/' || !pathname.includes('.')) ? `${SERVE}/index.html` : SERVE + pathname;
@@ -122,6 +125,22 @@ try {
   await page.waitForSelector('#app .profile .bio', { timeout: 5000 });
   check('Enter submitted the form and navigated', await path(), '/users/ada');
   check('and fetched the profile', await bio(), 'Wrote the first algorithm.');
+
+  // --- stale-response race: start a SLOW fetch, then navigate to a fast one before it resolves.
+  //     The slow (now-stale) response must NOT overwrite the page — Cached.put drops it by key. ---
+  const search = async (name) => {            // clear the box (Escape) then submit a username
+    await page.focus('#app .q'); await page.keyboard.press('Escape'); await sleep(20);
+    await page.type('#app .q', name); await page.keyboard.press('Enter');
+  };
+  await page.click('#app .home-link'); await page.waitForSelector('#app .search', { timeout: 5000 });
+  await search('slow');
+  await page.waitForSelector('#app .loading', { timeout: 5000 });   // slow profile is loading…
+  await page.click('#app .home-link'); await page.waitForSelector('#app .search', { timeout: 5000 });
+  await search('ada');                                              // …overtake it before it resolves
+  await page.waitForSelector('#app .profile .bio', { timeout: 5000 });
+  check('fast navigation shows the current user', await bio(), 'Wrote the first algorithm.');
+  await sleep(1000);                                                // let the slow (stale) response land
+  check('stale response did NOT overwrite the page (race fixed)', await bio(), 'Wrote the first algorithm.');
 } finally {
   await browser.close();
   server.close();

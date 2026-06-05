@@ -7,7 +7,6 @@
 -/
 import Qed
 import Examples.JsProbe
-import Examples.Users
 open Qed
 
 namespace JsGate
@@ -49,10 +48,16 @@ def arrP (i : Nat) : String :=
   let b := a.filter (fun x => x % 3 == 0)
   s!"{a.toList}|{b.size}|{a.foldl (· + ·) 0}|{a.reverse.toList}"
 
+-- A self-contained router for the probe, so the gate stays independent of any example app
+-- (an app refactor must never perturb the differential oracle).
+router GateR where
+  home => ""
+  user (name : String) => "users"
+
 def routes : Array String := #["/", "/users/ada", "/users/alan", "/users/a%20b", "/nope/x"]
 /-- The verified `router` — percent-codec + `fromURL` parse + `toURL` print round-trip. -/
 def routeP (i : Nat) : String :=
-  match (Router.fromURL (routes.getD i "") : Option Users.R) with
+  match (Router.fromURL (routes.getD i "") : Option GateR) with
   | some r => Router.toURL r
   | none   => "none"
 

@@ -29,38 +29,48 @@ jsonStruct Profile where
 structure Model where
   route   : R
   query   : String
-  profile : Resource Profile   -- the fetched profile on a user page
+  profile : Cached Profile   -- the fetched profile (SWR cache), keyed on the username
   focused : Bool
 
-def init : Model := { route := .home, query := "", profile := .idle, focused := false }
+def init : Model := { route := .home, query := "", profile := {}, focused := false }
 
 inductive Msg where
-  | routed (r : R)                        -- the URL changed (startup/link/back/push), parsed
+  | routed (r : R)                                -- the URL changed (startup/link/back/push), parsed
   | typeQuery (s : String)
-  | submit                                -- run the search → navigate
-  | gotProfile (r : Resource Profile)     -- the fetch resolved (ok or failed, one message)
+  | submit                                        -- run the search → navigate
+  | gotProfile (key : String) (r : Resource Profile)   -- a fetch resolved, tagged with its issued key
   | focus
   | blur
   | key (k : String)
 
--- One combined transition: the `routed` arm (handed the parsed route) sets the route, flips the
--- profile to its `loading` state, and fires the fetch — all together.
+-- The username the profile depends on — defined once, used by both the query and the result arm.
+def userKey (m : Model) : String := match m.route with | .user name => name | _ => ""
+
+-- The transition just sets state. The profile is not flipped to `loading` or fetched here — it
+-- auto-refetches whenever `userKey` changes (see `profileQuery`). The result arm folds the response
+-- into the cache via `put`, which drops it if the user has already navigated to a different name.
 def transition (m : Model) : Msg → Model × Cmd Msg
-  | .routed route =>
-      let m' := { m with route, profile := match route with | .user _ => .loading | _ => m.profile }
-      match route with
-      | .user name => also m' (Resource.fetch s!"/api/users/{name}" Msg.gotProfile)
-      | _          => still m'
-  | .typeQuery s => still { m with query := s }
-  | .submit      => if m.query.trim.isEmpty then still m
-                    else also m (.pushUrl (Router.toURL (R.user m.query.trim)))
-  | .gotProfile r => still { m with profile := r }
+  | .routed route => still { m with route }
+  | .typeQuery s  => still { m with query := s }
+  | .submit       => if m.query.trim.isEmpty then still m
+                     else also m (.pushUrl (Router.toURL (R.user m.query.trim)))
+  | .gotProfile k r => still { m with profile := m.profile.put k r (userKey m) }
   | .focus        => still { m with focused := true }
   | .blur         => still { m with focused := false }
   | .key k        => still (if k == "Escape" then { m with query := "" } else m)
 
+-- The profile depends on the route's username. On a change the framework shows the cached value
+-- (revalidating) or `.loading` and refetches `/api/users/<name>`; on a non-user page (empty key) it
+-- clears to `.idle`. The initial deep-link fetch fires too — the URL dispatch takes the key "" → name.
+def profileQuery : Query Model Msg :=
+  Resource.query
+    (key := userKey)
+    (url := fun name => s!"/api/users/{name}")
+    (got := Msg.gotProfile)
+    (get := fun m => m.profile) (set := fun c m => { m with profile := c })
+
 def app : App Model Msg :=
-  ui init transition (onRoute := Msg.routed) fun m =>
+  ui init transition (onRoute := Msg.routed) (queries := [profileQuery]) fun m =>
     div [cls "app"] [
       nav [] [ linkTo R.home [cls "home-link"] "Home" ],
       match m.route with

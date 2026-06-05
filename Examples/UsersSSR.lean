@@ -24,11 +24,11 @@ def modelFor (path : String) : Model :=
   let route : R := (Router.fromURL path).getD .home
   { init with
     route   := route
-    profile := match route with
+    profile := { state := match route with
       | .user name => match serverProfiles.lookup name with
                       | some p => .ok p
                       | none   => .failed "no such user"
-      | _          => .idle }
+      | _          => .idle } }
 
 end Users
 

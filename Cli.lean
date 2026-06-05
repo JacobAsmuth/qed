@@ -195,6 +195,9 @@ def invariantNote : IO Unit := do
 def verify : IO Bool := do
   step "checking proofs (lake build)"
   if (← sh "lake" #["build"]) != 0 then return false
+  -- Build the example modules too, so their proofs are checked — the `invariant`s (model
+  -- `preserved_by` and styling `holds_in`) are theorems that only fire when their module builds.
+  if (← sh "lake" #["build", "Examples"]) != 0 then return false
   step "verifying (no sorry / axiom-clean / effect coverage)"
   let ok1 ← grepForbidden
   let ok2 ← axiomClean

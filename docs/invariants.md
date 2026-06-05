@@ -54,6 +54,54 @@ invariant idsBelowNext : (fun m => ∀ r ∈ m.rows, r.id < m.nextId)
   cases msg <;> simp_all [update] <;> omega
 ```
 
+## Styling invariants (over the view)
+
+Everything above is a property of the **model**, preserved across a transition. A styling rule is a
+property of the **rendered view, for every model** — a different shape — so the same `invariant`
+command takes a different connective, `holds_in`, in place of `preserved_by`:
+
+```lean
+invariant statusStyled : roleHasOneOf "status" [onStyle, offStyle] holds_in view
+```
+
+expands to a machine-checked `∀ m, roleHasOneOf "status" [onStyle, offStyle] (view m) = true` — the
+status badge is shown in one of two known visual states in *every* reachable state, not the ones a
+test happened to render. Tag the element with the `role` attribute and the predicate finds it:
+
+```lean
+def view (m : Model) : Html Msg :=
+  div [] [ button [ role "status", if m.on then onStyle else offStyle ] [ text "…" ] ]
+```
+
+Ready predicates (all `Html msg → Bool`, all auto-discharging):
+
+| Predicate | Reads as |
+|---|---|
+| `roleHasOneOf "x" [a, b]` | every element tagged `role "x"` carries style `a` or `b` |
+| `tagHasOneOf "button" [a, b]` | every `<button>` carries style `a` or `b` (no marker needed) |
+| `everyElement (fun tag attrs => …)` | a custom per-element rule |
+
+**Relating two elements.** `roleHas "x" a` is the single-element query ("the `role "x"` element
+carries `a`); `both`/`either` combine queries, and `exactlyOne` packages the common XOR:
+
+```lean
+invariant savedXorEditing : exactlyOne "save" "cancel" primary secondary holds_in view
+-- ≡ either (both (roleHas "save" primary) (roleHas "cancel" secondary))
+--          (both (roleHas "save" secondary) (roleHas "cancel" primary))
+```
+
+State these over *positive* "has style" facts — `both (roleHas …) (roleHas …)` for AND,
+`either …` for OR, `exactlyOne` (or an `either`-of-`both`s) for XOR. That's a real constraint:
+a class name is a content **hash**, so "this element does *not* have style Y" isn't provable (two
+hashes can't be shown distinct), but "this element *has* style X" is (`x == x`). Phrase the rule
+positively and it proves; reach for a negation and it won't (by design, not by accident).
+
+The discharger unfolds the view and the `Qed.Notation` combinators, splits the view's `if`/`match`,
+and closes each leaf — a class check reduces by `x == x`, never by hashing the class name. A violated
+rule fails to compile (unsolved goal), exactly like a model invariant; the `:= proof` escape is
+there for a view it can't reduce — e.g. one routed through `App.view`/`View.render` rather than a
+plain `Model → Html`. (So point `holds_in` at a named `def view`.)
+
 ## When it can't close it
 
 A failure is reported as an unsolved goal **labelled with the message constructor that breaks the
@@ -119,5 +167,7 @@ have to establish that first.
   on disconnect.
 - `Examples/Chat.lean` — `streamSafe`, an effect-safety property on an effectful `transition`,
   with a `:=` proof (it needs the fact that `appendLast` preserves the turn count).
+- `Examples/Badge.lean` — both forms side by side: `levelSafe` (model, `preserved_by update`) and
+  `statusStyled` (styling, `roleHasOneOf … holds_in view`).
 
 See `Qed/Invariant.lean` for the command itself.

@@ -62,6 +62,7 @@ elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
        (first
          | exact $h                                                       -- pass-through arm
          | exact Qed.ForEach.forall_filter $h                             -- remove (filter)
+         | exact Qed.ForEach.forall_sortBy $h                             -- re-rank (verified sort)
          | exact Qed.ForEach.updateKeyed_forall _ _ $childInv $h          -- keyed child message
          | (refine Qed.ForEach.forall_push $h ?_ <;> ($elemClose:tactic)) -- add (push)
          | skip))))                                                        -- unmatched → left open
@@ -83,9 +84,10 @@ elab "qedDischargeForEach" upd:ident childInv:ident nm:ident pred:term : tactic 
         let s := (← Meta.ppExpr ty).pretty.replace "✝" ""
         let why :=
           if (s.splitOn "qsort").length > 1 then
-            "sorts the list with `Array.qsort`, which has no membership lemma in the standard \
-             library — so Qed can't see automatically that reordering keeps every element valid. It \
-             does (same elements). Use Qed's verified `sortBy`, or prove this case."
+            "sorts with `Array.qsort`, which has no membership lemma in the standard library — so \
+             Qed can't see that reordering keeps every element valid (it does — same elements). \
+             Switch this arm to Qed's verified `Array.sortBy` (a `mergeSort`) and it lifts \
+             automatically; or prove this case."
           else if (s.splitOn " ++ ").length > 1 then
             "appends elements (`++`) that aren't known to satisfy the contract. Validate them on the \
              way in (decode into a type that already carries it) so invalid ones are unrepresentable, \

@@ -150,5 +150,16 @@ theorem updateKeyed_forall {α Msg} {P : α → Prop} (c : Component α Msg) (ke
   · exact hc x msg (h x hx)
   · exact h x hx
 
+/-- A verified, membership-preserving sort, for the `sort`/`rank` arm. Unlike `Array.qsort` —
+    which has no membership lemma in the standard library, so `for_each` can't lift over it — this
+    is `mergeSort`, which does. `le a b` means "`a` sorts before-or-equal `b`". Use it for a feed's
+    re-rank and the lift discharges with no hand proof. -/
+@[reducible] def _root_.Array.sortBy {α} (a : Array α) (le : α → α → Bool) : Array α := a.mergeSort le
+
+/-- A verified sort keeps `P` for every element — it only reorders (a permutation). -/
+theorem forall_sortBy {α} {P : α → Prop} {a : Array α} {le : α → α → Bool}
+    (h : ∀ y ∈ a, P y) : ∀ y ∈ a.sortBy le, P y := by
+  intro y hy; simp only [Array.sortBy, Array.mem_mergeSort] at hy; exact h y hy
+
 end ForEach
 end Qed

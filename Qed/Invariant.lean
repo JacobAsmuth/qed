@@ -106,7 +106,9 @@ elab "qedDischargePreserved" upd:ident nm:ident pred:term : tactic => do
        (try simp_all only [$upd:ident, Qed.still, Qed.also,
                            InvTarget.proj_id, InvTarget.proj_fst]) <;>
        (try ((repeat' split) <;>
-              (first | rfl | omega | assumption | (simp_all <;> done) | trivial))))))
+              (first | rfl | omega | assumption
+                     | (simp_all <;> omega)        -- resolve a branch condition / implication, then arith
+                     | (simp_all <;> done) | trivial))))))
   let goals ← getUnsolvedGoals
   unless goals.isEmpty do
     let mut body : MessageData := m!""
@@ -211,6 +213,66 @@ def either (p q : Html msg → Bool) : Html msg → Bool := fun h => p h || q h
 def exactlyOne (roleA roleB : String) (on off : Style) : Html msg → Bool :=
   either (both (roleHas roleA on) (roleHas roleB off))
          (both (roleHas roleA off) (roleHas roleB on))
+
+/-! ### Lifting a styling contract over a list of children
+
+`embed` renders each child as `(Child.view c).map wrap` (it relabels the child's messages into the
+parent's). These lemmas say a role/class predicate is unaffected by that relabelling, so a parent
+styling invariant over a list — "every rendered card is styled" — reduces to the child's `holds_in`
+contract per card. Behavioural lifting (`for_each … preserved_by`) is automatic; styling lifts over a
+list use these as a short `holds_in … := by …`, since the parent *view*'s shape varies too much for a
+single generic discharger. `roleHasOneOf_map`/`everyElementL_mapList` are the two you reach for. -/
+
+/-- `Attr.map` leaves the class list unchanged (it only relabels event handlers). -/
+theorem attrClasses_map {α β} (f : α → β) (a : List (Attr α)) :
+    attrClasses (a.map (Attr.map f)) = attrClasses a := by
+  induction a with
+  | nil => rfl
+  | cons x xs ih => cases x <;> simp_all [attrClasses, Attr.map]
+
+/-- `Attr.map` leaves the `role` marker unchanged. -/
+theorem attrRole_map {α β} (f : α → β) (a : List (Attr α)) :
+    attrRole (a.map (Attr.map f)) = attrRole a := by
+  induction a with
+  | nil => rfl
+  | cons x xs ih => cases x
+                    case attr k v => by_cases hk : k = "data-role" <;>
+                                       simp [List.map, Attr.map, attrRole, hk, ih]
+                    all_goals simp [List.map, Attr.map, attrRole, ih]
+
+mutual
+/-- A tag/attr-only predicate is preserved under `Html.map` (message relabelling), given it agrees on
+    a relabelled attribute list — the basis for lifting styling over `embed`-rendered children. -/
+theorem everyElement_map {α β} (f : α → β)
+    {pα : String → List (Attr α) → Bool} {pβ : String → List (Attr β) → Bool}
+    (hp : ∀ t a, pβ t (a.map (Attr.map f)) = pα t a) :
+    (h : Html α) → everyElement pβ (h.map f) = everyElement pα h
+  | .text _        => rfl
+  | .lazy _ s      => everyElement_map f hp s
+  | .element t a k => by simp only [Html.map, everyElement, hp, everyElementL_map f hp k]
+/-- `everyElement_map` over a sibling list (mutual recursion gives termination). -/
+theorem everyElementL_map {α β} (f : α → β)
+    {pα : String → List (Attr α) → Bool} {pβ : String → List (Attr β) → Bool}
+    (hp : ∀ t a, pβ t (a.map (Attr.map f)) = pα t a) :
+    (l : List (Html α)) → everyElementL pβ (Html.mapChildren f l) = everyElementL pα l
+  | []     => rfl
+  | c :: cs => by simp only [Html.mapChildren, everyElementL,
+                             everyElement_map f hp c, everyElementL_map f hp cs]
+end
+
+/-- `everyElementL` over a rendered list: every child of `l.map g` satisfies `p` iff every `g x`
+    does — the bridge from a list of child *models* to its rendered subtree. -/
+theorem everyElementL_mapList {α β} (p) (g : β → Html α) (l : List β) :
+    everyElementL p (l.map g) = true ↔ ∀ x ∈ l, everyElement p (g x) = true := by
+  induction l with
+  | nil => simp [everyElementL]
+  | cons x xs ih => simp [List.map, everyElementL, ih, Bool.and_eq_true]
+
+/-- The styling predicate `roleHasOneOf` survives `Html.map` — so a card's contract over `Card.view`
+    transfers to its `embed`-rendered `(Card.view c).map wrap`. The corollary you apply per card. -/
+theorem roleHasOneOf_map {α β} (f : α → β) (r) (styles) (h : Html α) :
+    roleHasOneOf r styles (h.map f) = roleHasOneOf r styles h :=
+  everyElement_map f (fun _ _ => by simp [attrRole_map, attrClasses_map, hasOneClass]) h
 
 /-- `invariant name : pred holds_in view` — `pred : Html msg → Bool` holds of the view for every
     model. The optional `:= proof` supplies a proof the default discharger can't find. -/

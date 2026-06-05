@@ -54,6 +54,51 @@ invariant idsBelowNext : (fun m => ∀ r ∈ m.rows, r.id < m.nextId)
   cases msg <;> simp_all [update] <;> omega
 ```
 
+## Lifting a contract over a list of children (`for_each`)
+
+A reusable `Component` embedded with `embed` lives as a keyed array in the parent's model, and its
+contract is a fact about *one* child. `for_each` lifts that to **every child in the list, across the
+parent's own transition** — in one line, no proof:
+
+```lean
+abbrev Card.Safe (c : Card.Model) : Prop :=                 -- the child's contract, written once
+  0 ≤ c.likes ∧ c.progress ≤ c.duration ∧ (c.liked → 1 ≤ c.likes)
+invariant cardSafe : Card.Safe preserved_by Card.update     -- the card never breaks it
+
+embed Card as card keyedBy (toString ·.id) into cards
+def update : Model → Msg → Model | ...                      -- tap / re-rank / dismiss / add
+
+invariant feedSafe : Card.Safe for_each cards preserved_by update using cardSafe
+-- ⇒ machine-checks: ∀ m msg, (∀ c ∈ m.cards, Card.Safe c) → (∀ c ∈ (update m msg).cards, Card.Safe c)
+```
+
+The discharger *applies* a proven lemma per list operation — a keyed child message keeps it (that's
+the child contract, named in `using`), `filter`/remove keeps it, `push`/add keeps it once the new
+element is valid by construction, and **a re-rank keeps it if you sort with `Array.sortBy`** (a
+verified `mergeSort` — `Array.qsort` has no membership lemma, so it can't be lifted automatically).
+
+Because `feedSafe` is itself a `∀ c ∈ cards, …` fact, it composes: a grandparent that owns several
+feeds lifts it again, one line up — `invariant shellSafe : feedSafe for_each feeds preserved_by update
+using feedSafe`. Lifts track where your data model nests collections, not render depth.
+
+**When an arm can't be lifted** (a `qsort`, a raw `++` of unvalidated data, an `add` whose element
+isn't provably valid), the error names that arm, says which operation blocked it, and hands a
+paste-able skeleton. `forEachLift` is the discharger as a tactic, so you finish only the one arm:
+
+```lean
+invariant feedSafe : Card.Safe for_each cards preserved_by update using cardSafe := by
+  forEachLift update cardSafe Card.Safe     -- closes every arm it can; `m`/`h` are in scope
+  case rank => …                            -- fill only what's left
+```
+
+The behavioural lift above is automatic. The *styling* analogue — "every rendered card is styled" —
+has its proven building blocks in `Qed/Invariant.lean` (`roleHasOneOf_map`, `everyElementL_mapList`:
+a role predicate survives `Html.map`, so a card's `holds_in` contract transfers to its rendered
+subtree), but it's currently a short hand proof rather than a one-liner, because a parent view's
+shape varies more than the fixed set of list operations.
+
+`Examples/Feed.lean` is a TikTok-style feed that puts this together end to end.
+
 ## Styling invariants (over the view)
 
 Everything above is a property of the **model**, preserved across a transition. A styling rule is a

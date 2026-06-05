@@ -110,6 +110,11 @@ opaque appendChild (parent child : Node) : IO Unit
 @[extern "qed_dom_set_text"]
 opaque setText (node : Node) (content : String) : IO Unit
 
+/-- Set an element's inner HTML verbatim (the `rawHtml` attribute / `dangerouslySetInnerHTML`):
+    `node.innerHTML = markup`, parsed by the browser, replacing the element's content. -/
+@[extern "qed_dom_set_inner_html"]
+opaque setInnerHtml (node : Node) (markup : String) : IO Unit
+
 /-- Get a handle to the `index`-th child of `parent`. -/
 @[extern "qed_dom_child_at"]
 opaque childAt (parent : Node) (index : UInt32) : IO Node

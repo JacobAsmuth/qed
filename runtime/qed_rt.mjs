@@ -289,6 +289,7 @@ export const Qed_Dom_removeChild = domCall('removeChild');
 export const Qed_Dom_replaceChild = domCall('replaceChild');
 export const Qed_Dom_setAttribute = domCall('setAttribute');
 export const Qed_Dom_setChecked = domCall('setChecked');
+export const Qed_Dom_setInnerHtml = domCall('setInnerHtml');
 export const Qed_Dom_setText = domCall('setText');
 export const Qed_Dom_setValue = domCall('setValue');
 export const Qed_Dom_today = domCall('today');

@@ -76,6 +76,7 @@ def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .localCell key comp _ _ => (s!" data-qed-local=\"{escapeHtml (localKey comp key)}\"", hs)   -- marks the host; the driver fills it
   | .signalBind name        => (s!" data-qed-signal=\"{escapeHtml name}\"", hs)                 -- driver binds its text to the signal
   | .signalAttr _ attr value => (s!" {sanitizeKey attr}=\"{escapeHtml value}\"", hs)             -- driver binds this attr to the signal
+  | .rawHtml _ => ("", hs)   -- not an attribute; its markup is emitted as the element's content (see renderNode)
 
 /-- Render a list of attributes left-to-right, threading the handler table. -/
 def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg
@@ -85,6 +86,12 @@ def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg
       let (s2, hs2) := renderAttrs hs1 as
       (s1 ++ s2, hs2)
 
+/-- The `rawHtml` markup on an element, if any — its verbatim inner content. -/
+def rawHtml? : List (Attr msg) → Option String
+  | []                  => none
+  | .rawHtml markup :: _ => some markup
+  | _ :: rest           => rawHtml? rest
+
 mutual
   /-- Render a node to HTML, accumulating the event-id ↦ message table. Pure and
       total. -/
@@ -92,9 +99,13 @@ mutual
     | .text s => (escapeHtml s, hs)
     | .element tag attrs children =>
         let (attrStr,  hs1) := renderAttrs hs (normalizeAttrs attrs)
+        -- A `rawHtml` element emits its markup verbatim as content (the children are ignored),
+        -- so server markup matches what the driver sets via `innerHTML`.
+        if let some markup := rawHtml? attrs then
+          (s!"<{tag}{attrStr}>{markup}</{tag}>", hs1)
         -- `<style>`/`<script>` are HTML "raw text" elements: their content is CDATA-like
         -- (CSS/JS), so escaping `&`/`<` would corrupt it. Emit text children verbatim.
-        if tag == "style" || tag == "script" then
+        else if tag == "style" || tag == "script" then
           -- raw-text content (CSS/JS) is emitted verbatim, but a `</style`/`</script` inside it
           -- would close the element early and let following markup execute. Break the closing
           -- sequence (`</` → `<\/`) so injected data can't escape; literal CSS/JS never needs `</`.

@@ -97,6 +97,7 @@ def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
       h.mountLocal key comp init bubble node
   | .signalBind name => Dom.bindSignal node name   -- bind text to the signal; setSignal updates it
   | .signalAttr name attr _ => Dom.bindSignalAttr node name attr   -- bind an attribute to the signal
+  | .rawHtml markup => Dom.setInnerHtml node markup   -- verbatim content; the element owns its children
 
 /-- Apply a (normalized) attribute list, so the live DOM matches what `render`
     would produce — classes merged, duplicate keys collapsed. -/
@@ -128,7 +129,7 @@ def clearHandlerIds (node : Dom.Node) : IO Unit := Dom.clearHandlers node
     an empty `Html` child list is vacuously "keyed", and the keyed applier would treat the
     driver-managed child as surplus and drop it. -/
 def ownsChildren (attrs : List (Attr msg)) : Bool :=
-  attrs.any (fun | .localCell .. => true | .signalBind .. => true | _ => false)
+  attrs.any (fun | .localCell .. => true | .signalBind .. => true | .rawHtml .. => true | _ => false)
 
 /-- The remaining steps are all `create`s (so a positional reconcile's creates sit at the tail). -/
 def allCreates : List (KeyedStep msg) → Bool

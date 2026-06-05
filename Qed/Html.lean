@@ -57,6 +57,11 @@ inductive Attr (msg : Type) where
       row's derived attribute/value). `value` is the current value, rendered into the static
       markup so SSR matches; the live driver reads the slot. Never written by hand. -/
   | signalAttr (name attr value : String)
+  /-- Set the element's inner HTML *verbatim* (React's `dangerouslySetInnerHTML`): the `markup`
+      string becomes the node's content, parsed by the browser, and the element's child list is
+      ignored. The escape hatch for raw markup you already have as a string — an inline SVG icon,
+      a sanitized rich-text snippet. Unescaped by design, so only pass markup you trust. -/
+  | rawHtml (markup : String)
 
 /-- A typed virtual-DOM node. Note this inductive is *total*: there is no
     constructor for "failed render", so a well-typed `view` cannot crash. -/
@@ -97,6 +102,7 @@ def Attr.map (f : α → β) : Attr α → Attr β
   | .localCell k c i b => .localCell k c i (fun s => (b s).map f)
   | .signalBind name   => .signalBind name
   | .signalAttr n a v  => .signalAttr n a v
+  | .rawHtml markup    => .rawHtml markup
 
 mutual
   /-- Remap the message type of a whole tree — the basis of component

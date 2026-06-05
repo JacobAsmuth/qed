@@ -59,6 +59,14 @@ try {
     dom.removeAttribute(use, 'xlink:href', 0);
     o.xlinkRemoved = nodes()[use].getAttributeNS(XLINK, 'href');
 
+    // rawHtml escape hatch: setInnerHtml parses a raw SVG string; inline SVG lands in SVG namespace
+    const host = create('', 'div');
+    dom.setInnerHtml(host, '<svg viewBox="0 0 10 10"><circle cx="5"/></svg>', 0);
+    const hostEl = nodes()[host];
+    o.rawChildCount = hostEl.childElementCount;
+    o.rawSvgNS = hostEl.firstElementChild ? hostEl.firstElementChild.namespaceURI : 'none';
+    o.rawCircleNS = hostEl.querySelector('circle') ? hostEl.querySelector('circle').namespaceURI : 'none';
+
     return { o, SVG, XHTML };
   }, PORT);
 
@@ -76,6 +84,9 @@ try {
   check('bare div (no svg ancestor) is HTML', o.bareDivNS, XHTML);
   check('xlink:href resolved in XLink namespace', o.xlinkResolved, '#icon');
   check('xlink:href removed', o.xlinkRemoved, null);
+  check('rawHtml injected the markup', o.rawChildCount, 1);
+  check('rawHtml <svg> parsed in the SVG namespace', o.rawSvgNS, SVG);
+  check('rawHtml <circle> parsed in the SVG namespace', o.rawCircleNS, SVG);
 } finally {
   await browser.close();
   server.kill();

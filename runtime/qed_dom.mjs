@@ -51,6 +51,7 @@ export const dom = {
   pushPath(p, w) { history.pushState({}, '', p); return ok(PUnit, w); },
   appendChild(parent, child, w) { const N = Q().nodes; if (N[parent] && N[child]) N[parent].appendChild(N[child]); return ok(PUnit, w); },
   setText(node, s, w) { const el = Q().nodes[node]; if (el && el.textContent !== s) el.textContent = s; return ok(PUnit, w); },
+  setInnerHtml(node, html, w) { const el = Q().nodes[node]; if (el && el.innerHTML !== html) el.innerHTML = html; return ok(PUnit, w); },
   childAt(parent, index, w) { const N = Q().nodes, p = N[parent]; const c = p ? p.childNodes[index] : null; if (!c) return ok(0, w); N.push(c); return ok(N.length - 1, w); },
   childCount(parent, w) { const p = Q().nodes[parent]; return ok(p ? p.childNodes.length : 0, w); },
   appRoot(w) { const N = Q().nodes; const root = document.getElementById('app'); const c = root ? root.firstElementChild : null; if (!c) return ok(0, w); N.push(c); return ok(N.length - 1, w); },

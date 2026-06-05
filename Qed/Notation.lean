@@ -74,6 +74,11 @@ def linkTo {α} [Router α] (route : α)
 /-- Class / arbitrary-attribute / event helpers. -/
 def cls (name : String) : Attr msg := .cls name
 def attr (key value : String) : Attr msg := .attr key value
+/-- Set an element's content from a raw markup string (React's `dangerouslySetInnerHTML`): the
+    browser parses `markup` as the node's inner HTML and any child list is ignored. The escape
+    hatch for markup you already have as a string — an inline SVG icon, a sanitized snippet:
+    `span [rawHtml iconSvg] []`. Unescaped by design, so only pass markup you trust. -/
+def rawHtml (markup : String) : Attr msg := .rawHtml markup
 /-- Listen for any DOM `event`, dispatching the constant `m` — the escape hatch when no named
     helper fits (`on "wheel" .scrolled`, `on "dragover" .dragging`, …). -/
 def on (event : String) (m : msg) : Attr msg := .on event m

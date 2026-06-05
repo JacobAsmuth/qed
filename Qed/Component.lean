@@ -112,4 +112,43 @@ macro_rules
         def $updName (m : $pModel) (k : String) (msg : $childMsg) : $pModel :=
           { m with $field:ident := ($comp).updateKeyed $keyFn m.$field k msg })
 
+/-! ### Lifting an invariant over a list of children
+
+These are the proven building blocks behind `invariant … forEach …` (see `Qed.Invariant`). Each says
+a standard list operation keeps a per-element predicate `P`, so a parent invariant "every child stays
+valid" reduces — arm by arm — to applying the matching lemma, rather than re-deriving the membership
+reasoning every time. The keyed one (`updateKeyed_forall`) is the case `embed` introduces: routing a
+child message touches one row via the child's transition, so it preserves `P` whenever the child does. -/
+namespace ForEach
+
+/-- `push` keeps `P` for every element, given it holds of the appended one (the `add` arm). -/
+theorem forall_push {α} {P : α → Prop} {a : Array α} {x : α}
+    (h : ∀ y ∈ a, P y) (hx : P x) : ∀ y ∈ a.push x, P y := by
+  intro y hy; rw [Array.mem_push] at hy; rcases hy with hy | rfl
+  · exact h y hy
+  · exact hx
+
+/-- `filter` keeps `P` for every element — it only drops elements (the `remove` arm). -/
+theorem forall_filter {α} {P : α → Prop} {a : Array α} {f : α → Bool}
+    (h : ∀ y ∈ a, P y) : ∀ y ∈ a.filter f, P y := by
+  intro y hy; rw [Array.mem_filter] at hy; exact h y hy.1
+
+/-- `map g` keeps `P` for every element when `g` does, elementwise. -/
+theorem forall_map {α} {P : α → Prop} {a : Array α} {g : α → α}
+    (hg : ∀ y ∈ a, P (g y)) : ∀ y ∈ a.map g, P y := by
+  intro y hy; rw [Array.mem_map] at hy; obtain ⟨x, hx, rfl⟩ := hy; exact hg x hx
+
+/-- The arm `embed` introduces: delivering a child message through `updateKeyed` keeps `P` for every
+    row, given the child's transition preserves `P`. Generic over the component, so a parent's keyed
+    arm discharges by `exact updateKeyed_forall _ _ childInvariant h` — no per-app proof. -/
+theorem updateKeyed_forall {α Msg} {P : α → Prop} (c : Component α Msg) (key : α → String)
+    (hc : ∀ r m, P r → P (c.update r m))
+    {a : Array α} {k : String} {msg : Msg}
+    (h : ∀ y ∈ a, P y) : ∀ y ∈ Component.updateKeyed c key a k msg, P y := by
+  intro y hy; simp only [Component.updateKeyed, Array.mem_map] at hy
+  obtain ⟨x, hx, rfl⟩ := hy; split
+  · exact hc x msg (h x hx)
+  · exact h x hx
+
+end ForEach
 end Qed

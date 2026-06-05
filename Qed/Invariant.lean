@@ -86,13 +86,22 @@ open Lean Elab Tactic
     `unsolved goals` dump. `upd` is spliced into the unfolding simp set; `nm` names the invariant,
     for the message only. The success path is byte-for-byte the old automation, so passing
     invariants are unaffected; only the *failure* message changes. -/
-elab "qedDischargePreserved" upd:ident nm:ident : tactic => do
+elab "qedDischargePreserved" upd:ident nm:ident pred:term : tactic => do
+  -- If the property is a *named* predicate (`abbrev Card.Safe …`, the way you'd package a
+  -- component's contract) unfold it first, so the leaves are plain arithmetic the closers can
+  -- reach. An inline `fun m => …` isn't an identifier, so this is skipped and it beta-reduces
+  -- as before — passing invariants are unaffected either way.
+  let predI : Ident := ⟨pred.raw⟩
+  let unfoldPred ← if pred.raw.isIdent
+    then `(tactic| try simp only [$predI:ident] at *)
+    else `(tactic| skip)
   -- The exact automation the command used to inline: unfold the transition / effect wrappers /
   -- model projection, split each `if`/`match`, and close every leaf — each alternative
   -- all-or-nothing (`<;> done`) and wrapped in `try`, so an arm it can't close is *left* as a
   -- goal rather than throwing; we then turn whatever remains into a readable error.
   evalTactic (← `(tactic|
     (intro m msg h;
+     $unfoldPred:tactic;
      cases msg <;>
        (try simp_all only [$upd:ident, Qed.still, Qed.also,
                            InvTarget.proj_id, InvTarget.proj_fst]) <;>
@@ -120,7 +129,7 @@ macro_rules
     `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
   | `(invariant $name:ident : $pred preserved_by $upd:ident) =>
     `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
-        qedDischargePreserved $upd $name)
+        qedDischargePreserved $upd $name $pred)
 
 /-! ### Styling invariants — the same `invariant`, over the view
 

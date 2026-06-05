@@ -27,6 +27,11 @@
 -/
 open System (FilePath)
 
+/-- Whitespace-trim returning a `String` — a drop-in for the deprecated `String.trim` (the CLI is a
+    standalone module that doesn't `import Qed`, so it carries its own copy of this one-liner). -/
+def String.trimmed (s : String) : String :=
+  String.ofList (((s.toList.dropWhile Char.isWhitespace).reverse.dropWhile Char.isWhitespace).reverse)
+
 namespace Qed.Cli
 
 /-! ### Locations -/
@@ -98,7 +103,7 @@ def grepForbidden : IO Bool := do
     for line in (← IO.FS.readFile f).splitOn "\n" do
       let isPolicy := (line.splitOn "never emit").length > 1 || (line.splitOn "fails to compile").length > 1
       if !isPolicy && bad.any (fun w => (line.splitOn w).length > 1) then
-        IO.eprintln (red s!"  forbidden tactic in {f}: {line.trim}")
+        IO.eprintln (red s!"  forbidden tactic in {f}: {line.trimmed}")
         clean := false
   return clean
 
@@ -271,7 +276,7 @@ def cmdBuild (prod : Bool) : IO UInt32 := do
   step s!"transpiling Lean → JavaScript → {outDir}/"
   if !(← buildJs outDir prod) then IO.eprintln (red "✗ build failed"); return 1
   let (_, sz) ← shOut "bash" #["-c", s!"cat {outDir}/*.mjs | gzip -c | wc -c"]
-  IO.println (green s!"✓ build complete → {outDir} (no WASM) — {sz.trim} bytes gzipped")
+  IO.println (green s!"✓ build complete → {outDir} (no WASM) — {sz.trimmed} bytes gzipped")
   return 0
 
 def serveDir (dir : FilePath) : IO UInt32 := do
@@ -386,7 +391,7 @@ partial def watchLoop (marker : FilePath) : IO Unit := do
   let find := s!"find . -name '*.lean' -newer {marker} -not -path './.lake/*' -not -path './.qed/*' 2>/dev/null | head -1; " ++
               s!"find {qh}/runtime -newer {marker} 2>/dev/null | head -1"
   let (_, out) ← shOut "bash" #["-c", find]
-  if out.trim != "" then
+  if out.trimmed != "" then
     let _ ← sh "touch" #[marker.toString]
     step "change detected — rebuilding"
     if (← buildJs devDir (prod := false)) then

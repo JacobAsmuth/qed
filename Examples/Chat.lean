@@ -57,7 +57,7 @@ def appendLast (turns : Array Turn) (d : String) : Array Turn :=
 def transition (m : Model) : Msg → Model × Cmd Msg
   | .typed s   => still { m with draft := s }
   | .send      =>
-      let draft := m.draft.trim
+      let draft := m.draft.trimmed
       if draft.isEmpty then still m else
       let convo := m.turns.push { user? := true, text := draft }
       also { turns   := convo.push { user? := false, text := "" }
@@ -79,9 +79,9 @@ invariant streamSafe : (fun m => m.pending = true → 0 < m.turns.size)
   intro m msg h
   cases msg <;>
     simp_all only [transition, appendLast, still, also,
-                   InvTarget.proj_fst, Array.size_modify, Array.size_push] <;>
+                   InvTarget.proj_fst, Array.size_modify] <;>
     (try split) <;>
-    simp_all [Array.size_push, Array.size_modify] <;>
+    simp_all [Array.size_push] <;>
     omega
 
 def bubble (t : Turn) : Html Msg :=
@@ -93,7 +93,7 @@ def chatApp : App Model Msg :=
       div [cls "log"] (m.turns.toList.map bubble),
       div [cls "composer"] [
         input [cls "draft", placeholder "Message the model…", value m.draft, onInput .typed],
-        button [cls "send", disabled (m.pending || m.draft.trim.isEmpty), onClick .send] "Send"
+        button [cls "send", disabled (m.pending || m.draft.trimmed.isEmpty), onClick .send] "Send"
       ]
     ]
 

@@ -24,7 +24,7 @@ def strs : Array String := #["", "a", "héllo", "日本語!", "a<b&c", "  sp  ",
     `drop`, `reverse`, `splitOn`. -/
 def strop (i : Nat) : String :=
   let s := strs.getD i ""
-  s!"{s.length}|{(s ++ "!?").take 4}|{s.drop 2}|{s.toList.reverse.asString}|{String.intercalate "," (s.splitOn "<")}"
+  s!"{s.length}|{(s ++ "!?").take 4}|{s.drop 2}|{s.toList.reverse |> String.ofList}|{String.intercalate "," (s.splitOn "<")}"
 
 def jsons : Array String :=
   #["null", "true", "[1,2,3]", "{\"a\":1,\"b\":[true,null]}", "\"x\\ny\"", "123", "[]", "{}",

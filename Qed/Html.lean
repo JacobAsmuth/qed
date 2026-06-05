@@ -10,6 +10,14 @@
   There is exactly one renderer (`Html.render`, in `Qed.Runtime`); it escapes model
   data. Rendering lives there because it shares the event-id table the driver needs.
 -/
+
+/-- Trim leading/trailing whitespace, returning a `String`. A drop-in for `String.trim`, which is
+    deprecated in Lean ≥ 4.30 in favour of the `String.Slice`-returning `trimAscii`; this keeps the
+    `String → String` shape and the original Unicode-whitespace semantics, built only from
+    primitives the IR→JS transpiler already handles (no `String.Slice` in app bundles). -/
+def String.trimmed (s : String) : String :=
+  String.ofList (((s.toList.dropWhile Char.isWhitespace).reverse.dropWhile Char.isWhitespace).reverse)
+
 namespace Qed
 
 /-- A typed attribute on a DOM node. Event handlers carry the app's `msg`. -/

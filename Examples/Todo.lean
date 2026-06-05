@@ -61,7 +61,7 @@ embed Row as row keyedBy (fun r => toString r.id) into rows
 def update (m : Model) : Msg → Model
   | .edit s    => { m with draft := s }
   | .add       =>
-      let t := m.draft.trim
+      let t := m.draft.trimmed
       if t.isEmpty then m
       else { m with rows   := m.rows.push { id := m.nextId, text := t, done := false }
                     draft  := ""

@@ -17,7 +17,8 @@
   The `form` command reads one declaration and generates: the editable `Draft` (raw
   strings) with `Draft.empty`, the validated structure, `parse : Draft → Option T`,
   the `canSubmit` gate, the `canSubmit_iff` proof, and a widget-aware `formView` —
-  field names written once. Core-syntax only (no `import Lean`):
+  field names written once. (The command is a `command` elaborator so it can pre-check
+  each field's refinement is decidable and, if not, say so clearly — see below.):
 
       form Signup where
         email : Input.text.refine Email
@@ -27,6 +28,7 @@
 -/
 import Qed.Notation
 import Qed.Date
+import Lean
 
 namespace Qed
 
@@ -137,7 +139,11 @@ end Input
 `form T where f : control …` (fields one per line, or `;`-separated) generates, from
 the one declaration: `T.Draft` (raw strings) + `T.Draft.empty`, the validated `T`
 (each field a `Field`), `T.parse : Draft → Option T`, `T.canSubmit`, the proof
-`T.canSubmit_iff`, and `T.formView`. Core-syntax only (no `import Lean`).
+`T.canSubmit_iff`, and `T.formView`.
+
+A field's refinement has to be *decidable* (the form decides validity at runtime). The command
+checks that up front and, when it isn't, reports the field and the fix — write the predicate as
+`abbrev`, not `def` — instead of letting the bare `DecidablePred` synthesis failure cascade.
 
 Context binders after the name — `form Booking (today : Date) where …` — thread into
 the validated type and every generated function, so a refinement can depend on them
@@ -148,8 +154,8 @@ open Lean in
 syntax (name := formCmd) "form " ident ("(" ident " : " term ")")* " where "
   sepBy1IndentSemicolon(group(ident " : " term)) : command
 
-open Lean in
-macro_rules
+open Lean Elab Command Term in
+elab_rules : command
   | `(form $t:ident $[($cbns:ident : $cbts:term)]* where $[$fs:ident : $inputs:term]*) => do
       let draftId := mkIdent (t.getId ++ `Draft)
       let emptyId := mkIdent (t.getId ++ `Draft ++ `empty)
@@ -157,18 +163,38 @@ macro_rules
       let canId   := mkIdent (t.getId ++ `canSubmit)
       let iffId   := mkIdent (t.getId ++ `canSubmit_iff)
       let viewId  := mkIdent (t.getId ++ `formView)
-      -- Context binders (e.g. `(today : Date)`) thread into the validated type and
-      -- every generated function, so a refinement may depend on them. `cbns` stays
-      -- ident-typed for `$cbns:ident` splices; `cbnsT` is the same names in
-      -- application position (`T today`, `parse today`, …).
+      let pairs := fs.zip inputs
+      -- ── Friendly pre-check. Each field's refinement must be decidable, or the form can't decide
+      -- validity. We probe by elaborating the control in isolation and capturing (then suppressing)
+      -- whatever it logs — Lean *logs* a failed instance search rather than throwing it, so a plain
+      -- try/catch wouldn't see it. If the probe logged a missing `DecidablePred`, that field's
+      -- refinement isn't decidable: report it and stop, before the generated code turns one missing
+      -- instance into the five-error synth pile. Any other message (e.g. a context binder not yet in
+      -- scope, like `today`) is discarded here and surfaces from the real generation below, in place.
+      for (f, inp) in pairs do
+        let before := (← get).messages
+        try liftTermElabM (discard <| elabTermAndSynthesize inp none) catch _ => pure ()
+        let probeMsgs := (← get).messages.toList.drop before.toList.length
+        modify fun st => { st with messages := before }
+        let mut undecidable := false
+        for msg in probeMsgs do
+          if ((← msg.data.toString).splitOn "DecidablePred").length > 1 then undecidable := true
+        if undecidable then
+          throwErrorAt inp m!"form field `{f.getId}` has a refinement that isn't decidable, so the \
+            form can't compute whether the field is valid (no `DecidablePred` for it).\n\nThe usual \
+            cause is a predicate written with `def`. Write it as an `abbrev` instead, so Lean sees \
+            it reduces to a decidable check:\n    abbrev MyPredicate (x : …) : Prop := …\nIf it \
+            genuinely can't be decided, give it a `DecidablePred` instance."
+      -- ── Generation. Context binders (e.g. `(today : Date)`) thread into the validated type and
+      -- every generated function, so a refinement may depend on them. `cbns` stays ident-typed for
+      -- `$cbns:ident` splices; `cbnsT` is the same names in application position (`T today`, …).
       let cbnsT : Array (TSyntax `term) := cbns.map fun c => ⟨c.raw⟩
-      let appTo : TSyntax `term → MacroM (TSyntax `term) := fun head =>
+      let appTo : TSyntax `term → CommandElabM (TSyntax `term) := fun head =>
         cbnsT.foldlM (init := head) fun acc c => `($acc $c)
       let tApp     ← appTo ⟨t.raw⟩
       let parseApp ← appTo ⟨parseId.raw⟩
       let canApp   ← appTo ⟨canId.raw⟩
       let emptyVals ← fs.mapM fun _ => `(term| "")
-      let pairs := fs.zip inputs
       -- proof RHS: conjunction of `(inputᵢ.run d.fᵢ).isSome`
       let isSomes ← pairs.mapM fun (f, inp) => `((($inp).run (d.$f:ident)).isSome)
       let rhs ← match isSomes.toList with
@@ -189,22 +215,27 @@ macro_rules
                ([ span [cls "qed-label"] [$nameLit],
                   ($inp).render (d.$f:ident) (fun v => onEdit { d with $f:ident := v }) ]
                 ++ (if bad then [span [cls "qed-error"] [$errLit]] else []))))
-      `(structure $draftId where
-          $[$fs:ident : String]*
-        def $emptyId : $draftId := { $[$fs:ident := $emptyVals],* }
-        structure $t $[($cbns:ident : $cbts:term)]* where
-          $[$fs:ident : Field ($inputs).valid]*
-        def $parseId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Option $tApp := do
-          $[let $fs:ident ← $runCalls:term]*
-          return { $[$fs:ident],* }
-        def $canId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Bool := ($parseApp d).isSome
-        theorem $iffId $[($cbns:ident : $cbts:term)]* (d : $draftId) : $canApp d = true ↔ $rhs := by
-          unfold $canId $parseId; $casesTac
-        def $viewId {msg : Type} $[($cbns:ident : $cbts:term)]* (d : $draftId)
-            (onEdit : $draftId → msg) (submit : msg) : Html msg :=
-          div [cls "qed-form"]
-            [ $[$rows],* ,
-              button [disabled (!($parseApp d).isSome), onClick submit] "Submit" ])
+      -- built as separate commands (not one multi-command quotation) and elaborated in dependency
+      -- order, since `elabCommand` runs one command at a time.
+      let cmds : Array (TSyntax `command) := #[
+        ← `(command| structure $draftId where
+              $[$fs:ident : String]*),
+        ← `(command| def $emptyId : $draftId := { $[$fs:ident := $emptyVals],* }),
+        ← `(command| structure $t $[($cbns:ident : $cbts:term)]* where
+              $[$fs:ident : Field ($inputs).valid]*),
+        ← `(command| def $parseId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Option $tApp := do
+              $[let $fs:ident ← $runCalls:term]*
+              return { $[$fs:ident],* }),
+        ← `(command| def $canId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Bool :=
+              ($parseApp d).isSome),
+        ← `(command| theorem $iffId $[($cbns:ident : $cbts:term)]* (d : $draftId) :
+              $canApp d = true ↔ $rhs := by unfold $canId $parseId; $casesTac),
+        ← `(command| def $viewId {msg : Type} $[($cbns:ident : $cbts:term)]* (d : $draftId)
+              (onEdit : $draftId → msg) (submit : msg) : Html msg :=
+              div [cls "qed-form"]
+                [ $[$rows],* ,
+                  button [disabled (!($parseApp d).isSome), onClick submit] "Submit" ]) ]
+      for c in cmds do elabCommand c
 
 /-! ### An example form
 

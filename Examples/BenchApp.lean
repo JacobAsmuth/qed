@@ -44,7 +44,7 @@ def update (m : Model) : Msg → Model
   | .reverse => { m with rows := m.rows.reverse }
   | .clear   => { rows := #[] }
 
-def app : App Model Msg := ui init update fun m =>
+def app : App Model Msg := ui init update fun _m =>
   div [] [
     div [cls "ops"] [
       button [onClick .create]  "create",
@@ -53,7 +53,7 @@ def app : App Model Msg := ui init update fun m =>
       button [onClick .reverse] "reverse",
       button [onClick .clear]   "clear"
     ],
-    ul [attr "id" "list"] (m.rows.map fun r =>
+    ul [attr "id" "list"] (_m.rows.map fun r =>
       li [key (toString r.id), cls "row"] [span [cls "lbl"] [r.label], span [cls "id"] [toString r.id]])
   ]
 

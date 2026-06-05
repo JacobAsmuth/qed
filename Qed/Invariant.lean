@@ -44,13 +44,17 @@
   the property — the signal you (or an agent) act on: fix the update, or weaken the
   claim to what the code actually guarantees.
 
-  Note: this file deliberately does *not* `import Lean`. `syntax`/`macro_rules` are
-  core features, so the macro carries zero runtime footprint — apps that use it never
-  pull the Lean elaborator into their transpiled JS bundle. The only import is `Qed.Runtime`,
-  for the `still`/`also` effect wrappers the discharger unfolds; it too is `Lean`-free.
+  Note on `import Lean`: this file imports Lean so the discharger can run as a real tactic
+  elaborator (`qedDischargePreserved` / `qedDischargeStyling`) and, on a goal it can't close,
+  report *which message broke the property and what was left to prove* — at the source span,
+  so the message shows up inline in the editor, not just at `qed build`. This costs nothing at
+  runtime: the transpiler emits only the closure reachable from the app's entry decls, and a
+  compile-time elaborator is never reachable, so it is tree-shaken out (adding this import left
+  the JS bundle byte-identical). The cost is build-time only.
 -/
 import Qed.Runtime
 import Qed.Style
+import Lean
 
 namespace Qed
 
@@ -74,22 +78,49 @@ instance {Model β : Type} : InvTarget (Model × β) Model := ⟨Prod.fst⟩
 syntax (name := invariantCmd)
   "invariant " ident " : " term " preserved_by " ident (" := " term)? : command
 
+open Lean Elab Tactic
+
+/-- The discharger behind `invariant … preserved_by`, as a tactic elaborator. It runs the
+    automation, and on any message arm it can't close it reports *which* arm and *what is left to
+    prove* (pinned at the invariant's name, so the editor underlines it) — instead of a raw
+    `unsolved goals` dump. `upd` is spliced into the unfolding simp set; `nm` names the invariant,
+    for the message only. The success path is byte-for-byte the old automation, so passing
+    invariants are unaffected; only the *failure* message changes. -/
+elab "qedDischargePreserved" upd:ident nm:ident : tactic => do
+  -- The exact automation the command used to inline: unfold the transition / effect wrappers /
+  -- model projection, split each `if`/`match`, and close every leaf — each alternative
+  -- all-or-nothing (`<;> done`) and wrapped in `try`, so an arm it can't close is *left* as a
+  -- goal rather than throwing; we then turn whatever remains into a readable error.
+  evalTactic (← `(tactic|
+    (intro m msg h;
+     cases msg <;>
+       (try simp_all only [$upd:ident, Qed.still, Qed.also,
+                           InvTarget.proj_id, InvTarget.proj_fst]) <;>
+       (try ((repeat' split) <;>
+              (first | rfl | omega | assumption | (simp_all <;> done) | trivial))))))
+  let goals ← getUnsolvedGoals
+  unless goals.isEmpty do
+    let mut body : MessageData := m!""
+    for g in goals do
+      body := body ++ (← g.withContext do
+        let tag ← g.getTag
+        -- pretty-print *inside* the goal's context (so its hyps resolve), then drop the `✝`
+        -- daggers Lean marks cleared/inaccessible binders with — noise in a user-facing message.
+        let fmt ← Meta.ppExpr (← instantiateMVars (← g.getType))
+        let tgt := fmt.pretty.replace "✝" ""
+        pure m!"\n  • case `{tag}` still needs:  {tgt}")
+    throwErrorAt nm m!"invariant `{nm.getId}` isn't preserved by `{upd.getId}` — the automation \
+      couldn't close every message.\n{body}\n\nEvery message has to leave the property true; the \
+      case(s) above don't. Fix one of:\n  · guard or repair that branch of `{upd.getId}` so the \
+      property still holds,\n  · weaken the property to what `{upd.getId}` actually guarantees, \
+      or\n  · prove it yourself:  invariant {nm.getId} : … preserved_by {upd.getId} := by …"
+
 macro_rules
   | `(invariant $name:ident : $pred preserved_by $upd:ident := $pf:term) =>
     `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
   | `(invariant $name:ident : $pred preserved_by $upd:ident) =>
     `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
-        intro m msg h
-        cases msg <;>
-          -- Unfold the transition / effect wrappers / model projection, split every
-          -- `if`/`match` the arm introduces, then close each leaf. Each alternative is
-          -- all-or-nothing (`<;> done`), and the whole finisher is wrapped in `try` so an
-          -- arm the automation can't close is left as an *unsolved goal* labelled with its
-          -- message constructor — which fails to compile, rather than slipping through.
-          (try simp_all only [$upd:ident, Qed.still, Qed.also,
-                              InvTarget.proj_id, InvTarget.proj_fst]) <;>
-          (try ((repeat' split) <;>
-                 (first | rfl | omega | assumption | (simp_all <;> done) | trivial))))
+        qedDischargePreserved $upd $name)
 
 /-! ### Styling invariants — the same `invariant`, over the view
 
@@ -177,43 +208,70 @@ def exactlyOne (roleA roleB : String) (on off : Style) : Html msg → Bool :=
 syntax (name := invariantView)
   "invariant " ident " : " term " holds_in " ident (" := " term)? : command
 
+/-- The discharger behind `invariant … holds_in`, as a tactic elaborator: unfold the view and
+    every `Qed.Notation` combinator down to `Html`/`Attr` constructors, split each `if`/`match`,
+    and close every leaf (a class check reduces by `x == x`, never by hashing). On a leaf it can't
+    reduce it reports the unmet obligation at the invariant's name instead of an `unsolved goals`
+    dump. `view` is the view function; `nm` names the invariant. The success path is the old
+    automation verbatim. (Maintenance: this mirror of the element/attribute helpers must list any
+    new one.) -/
+elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => do
+  evalTactic (← `(tactic|
+    (intro m;
+     simp only [$view:ident, Qed.roleHasOneOf, Qed.tagHasOneOf, Qed.roleHas, Qed.both,
+       Qed.either, Qed.exactlyOne, Qed.hasOneClass,
+       Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
+       Qed.text, Qed.lazy, Qed.el, Qed.div, Qed.span, Qed.button, Qed.p, Qed.h1, Qed.h2, Qed.a,
+       Qed.ul, Qed.li, Qed.header, Qed.nav, Qed.strong, Qed.input, Qed.label, Qed.formEl,
+       Qed.svg, Qed.g, Qed.path, Qed.circle, Qed.ellipse, Qed.line, Qed.rect, Qed.polyline,
+       Qed.polygon, Qed.link, Qed.linkTo, Qed.styleSheet, Qed.theme,
+       Qed.sectionEl, Qed.article, Qed.mainEl, Qed.aside, Qed.footer, Qed.figure,
+       Qed.figcaption, Qed.address, Qed.h3, Qed.h4, Qed.h5, Qed.h6, Qed.ol, Qed.dl, Qed.dt,
+       Qed.dd, Qed.pre, Qed.blockquote, Qed.hr, Qed.br, Qed.small, Qed.mark, Qed.sub, Qed.sup,
+       Qed.code, Qed.kbd, Qed.abbr, Qed.cite, Qed.time, Qed.del, Qed.ins, Qed.img, Qed.picture,
+       Qed.source, Qed.video, Qed.audio, Qed.track, Qed.canvas, Qed.iframe, Qed.details,
+       Qed.summary, Qed.dialog, Qed.select, Qed.option, Qed.optgroup, Qed.textarea,
+       Qed.fieldset, Qed.legend, Qed.datalist, Qed.output, Qed.progress, Qed.meter, Qed.table,
+       Qed.caption, Qed.colgroup, Qed.col, Qed.thead, Qed.tbody, Qed.tfoot, Qed.tr, Qed.td,
+       Qed.th,
+       Qed.cls, Qed.attr, Qed.role, Qed.rawHtml, Qed.on,
+       Qed.onValue, Qed.onClick, Qed.onInput, Qed.onChange, Qed.onCheck, Qed.onKeydown,
+       Qed.onKeyup, Qed.onSubmit, Qed.onBlur, Qed.onFocus, Qed.onDoubleClick, Qed.onMouseDown,
+       Qed.onMouseUp, Qed.key, Qed.value, Qed.placeholder, Qed.name, Qed.href, Qed.src, Qed.alt,
+       Qed.title, Qed.style, Qed.type', Qed.disabled, Qed.required, Qed.checked, Qed.readOnly];
+     repeat' split;
+     all_goals (first
+       | rfl
+       | simp_all [Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
+                   Qed.hasOneClass]))))
+  let goals ← getUnsolvedGoals
+  unless goals.isEmpty do
+    -- The residual goal is usually just `False` (the class check reduced away), which says nothing
+    -- useful — so we quote the *rule the user wrote* instead, and only append a goal line on the
+    -- rare occasion it reduced to something more telling than `False`.
+    let mut body : MessageData := m!""
+    for g in goals do
+      body := body ++ (← g.withContext do
+        let fmt ← Meta.ppExpr (← instantiateMVars (← g.getType))
+        let s := (fmt.pretty.replace "✝" "").trimmed
+        pure (if s == "False" then m!"" else m!"\n  • the view still has to satisfy:  {s}"))
+    throwErrorAt nm m!"styling invariant `{nm.getId}` doesn't hold for every model — \
+      `{predLit.getString}` is false for some `{view.getId} m`.{body}\n\nSome element the rule \
+      constrains isn't carrying one of the required style classes. Check that the `role`/tag it \
+      matches really gets one of the styles passed to `roleHasOneOf`/`tagHasOneOf` in every branch \
+      of `{view.getId}`. If the view is routed through `App.view`/`View.render` rather than a plain \
+      `Model → Html`, prove it with:  invariant {nm.getId} : … holds_in {view.getId} := by …"
+
 open Lean in
 macro_rules
   | `(invariant $name:ident : $pred holds_in $view:ident := $pf:term) =>
     `(theorem $name:ident : ∀ m, ($pred) ($view m) = true := $pf)
-  | `(invariant $name:ident : $pred holds_in $view:ident) =>
-    -- Unfold the view and every `Qed.Notation` combinator down to `Html`/`Attr` constructors,
-    -- split each `if`/`match` the view introduces, and close every leaf. A leaf the automation
-    -- can't reduce is left as an unsolved goal — which fails to compile, never a fake guarantee.
-    -- (Maintenance: this mirror of the element/attribute helpers must list any new one.)
+  | `(invariant $name:ident : $pred holds_in $view:ident) => do
+    -- carry the rule's source text through to the discharger, so a failure can quote exactly
+    -- what was asked for (the reduced goal alone is just `False`).
+    let predStr := ((pred.raw.reprint).getD "this rule").trimmed
     `(set_option linter.unusedSimpArgs false in
       theorem $name:ident : ∀ m, ($pred) ($view m) = true := by
-        intro m
-        simp only [$view:ident, Qed.roleHasOneOf, Qed.tagHasOneOf, Qed.roleHas, Qed.both,
-          Qed.either, Qed.exactlyOne, Qed.hasOneClass,
-          Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
-          Qed.text, Qed.lazy, Qed.el, Qed.div, Qed.span, Qed.button, Qed.p, Qed.h1, Qed.h2, Qed.a,
-          Qed.ul, Qed.li, Qed.header, Qed.nav, Qed.strong, Qed.input, Qed.label, Qed.formEl,
-          Qed.svg, Qed.g, Qed.path, Qed.circle, Qed.ellipse, Qed.line, Qed.rect, Qed.polyline,
-          Qed.polygon, Qed.link, Qed.linkTo, Qed.styleSheet, Qed.theme,
-          Qed.sectionEl, Qed.article, Qed.mainEl, Qed.aside, Qed.footer, Qed.figure,
-          Qed.figcaption, Qed.address, Qed.h3, Qed.h4, Qed.h5, Qed.h6, Qed.ol, Qed.dl, Qed.dt,
-          Qed.dd, Qed.pre, Qed.blockquote, Qed.hr, Qed.br, Qed.small, Qed.mark, Qed.sub, Qed.sup,
-          Qed.code, Qed.kbd, Qed.abbr, Qed.cite, Qed.time, Qed.del, Qed.ins, Qed.img, Qed.picture,
-          Qed.source, Qed.video, Qed.audio, Qed.track, Qed.canvas, Qed.iframe, Qed.details,
-          Qed.summary, Qed.dialog, Qed.select, Qed.option, Qed.optgroup, Qed.textarea,
-          Qed.fieldset, Qed.legend, Qed.datalist, Qed.output, Qed.progress, Qed.meter, Qed.table,
-          Qed.caption, Qed.colgroup, Qed.col, Qed.thead, Qed.tbody, Qed.tfoot, Qed.tr, Qed.td,
-          Qed.th,
-          Qed.cls, Qed.attr, Qed.role, Qed.rawHtml, Qed.on,
-          Qed.onValue, Qed.onClick, Qed.onInput, Qed.onChange, Qed.onCheck, Qed.onKeydown,
-          Qed.onKeyup, Qed.onSubmit, Qed.onBlur, Qed.onFocus, Qed.onDoubleClick, Qed.onMouseDown,
-          Qed.onMouseUp, Qed.key, Qed.value, Qed.placeholder, Qed.name, Qed.href, Qed.src, Qed.alt,
-          Qed.title, Qed.style, Qed.type', Qed.disabled, Qed.required, Qed.checked, Qed.readOnly]
-        repeat' split
-        all_goals first
-          | rfl
-          | simp_all [Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
-                      Qed.hasOneClass])
+        qedDischargeStyling $view $name $(Syntax.mkStrLit predStr))
 
 end Qed

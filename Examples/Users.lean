@@ -52,8 +52,8 @@ def userKey (m : Model) : String := match m.route with | .user name => name | _ 
 def transition (m : Model) : Msg → Model × Cmd Msg
   | .routed route => still { m with route }
   | .typeQuery s  => still { m with query := s }
-  | .submit       => if m.query.trim.isEmpty then still m
-                     else also m (.pushUrl (Router.toURL (R.user m.query.trim)))
+  | .submit       => if m.query.trimmed.isEmpty then still m
+                     else also m (.pushUrl (Router.toURL (R.user m.query.trimmed)))
   | .gotProfile k r => still { m with profile := m.profile.put k r (userKey m) }
   | .focus        => still { m with focused := true }
   | .blur         => still { m with focused := false }

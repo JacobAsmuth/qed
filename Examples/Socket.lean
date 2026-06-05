@@ -53,7 +53,7 @@ def transition (m : Model) : Msg → Model × Cmd Msg
   | .received t => still { m with log := m.log.push s!"← {t}" }
   | .typed s    => still (if m.conn = .online then { m with draft := s } else m)  -- ignore typing while offline
   | .send       =>
-      let t := m.draft.trim
+      let t := m.draft.trimmed
       if t.isEmpty then still m
       else also { m with draft := "", log := m.log.push s!"→ {t}" } (Cmd.wsSend echo t)
 

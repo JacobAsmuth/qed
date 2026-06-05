@@ -269,6 +269,7 @@ export const Qed_Dom_bindSignal = domCall('bindSignal');
 export const Qed_Dom_bindSignalAttr = domCall('bindSignalAttr');
 export const Qed_Dom_childAt = domCall('childAt');
 export const Qed_Dom_childCount = domCall('childCount');
+export const Qed_Dom_childNamespace = domCall('childNamespace');
 export const Qed_Dom_clearHandlers = domCall('clearHandlers');
 export const Qed_Dom_createElement = domCall('createElement');
 export const Qed_Dom_createText = domCall('createText');

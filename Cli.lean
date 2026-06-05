@@ -365,6 +365,10 @@ def cmdTest : IO UInt32 := do
     step "building JS bundle + running transpiled-driver browser test"
     if !(← buildJs devDir (prod := false)) then failed := true
     else if (← sh "node" #["test/js_driver_browser_test.mjs"]) != 0 then failed := true
+  -- SVG namespaces: createElement + childNamespace inheritance (incl. foreignObject) + xlink attrs.
+  if (← (FilePath.mk "test" / "svg_test.mjs").pathExists) then
+    step "running SVG namespace tests (DOM boundary)"
+    if (← sh "node" #["test/svg_test.mjs"]) != 0 then failed := true
   if failed then return 1 else return 0
 
 def cmdClean : IO UInt32 := do

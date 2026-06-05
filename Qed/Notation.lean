@@ -43,6 +43,20 @@ def input   (attrs : List (Attr msg) := []) (children : List (Html msg) := []) :
 def label   (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "label" attrs children
 def formEl  (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "form" attrs children
 
+/-- Common SVG elements. Nest them inside `svg`: the driver puts the whole `svg` subtree in the
+    SVG namespace (any element, not just these, so `el "feSpotLight"` works too — see
+    `Dom.childNamespace`). Set geometry with `attr` (`attr "viewBox" "0 0 100 100"`, `attr "cx"
+    "50"`, `attr "d" "M0 0 L10 10"`, …); namespaced links use `attr "xlink:href" "#id"`. -/
+def svg      (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "svg" attrs children
+def g        (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "g" attrs children
+def path     (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "path" attrs children
+def circle   (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "circle" attrs children
+def ellipse  (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "ellipse" attrs children
+def line     (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "line" attrs children
+def rect     (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "rect" attrs children
+def polyline (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "polyline" attrs children
+def polygon  (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "polygon" attrs children
+
 /-- An internal navigation link: an `<a href=path>` the driver intercepts (no full
     page reload) — clicking it pushes `path` to the URL and routes to it. Pair with
     `Router.toURL` for a type-checked target, or use `linkTo` to pass the route directly. -/

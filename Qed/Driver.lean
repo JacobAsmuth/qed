@@ -147,15 +147,16 @@ def positional : Nat → List (KeyedStep msg) → Bool
   | _, .create _ :: rest         => allCreates rest
 
 /-- Build a fresh DOM subtree from an `Html` node, returning its handle. -/
-partial def buildDom (h : Handlers msg) : Html msg → IO Dom.Node
+partial def buildDom (h : Handlers msg) (ns : String) : Html msg → IO Dom.Node
   | .text s => Dom.createText s
-  | .lazy _ sub => buildDom h sub   -- a lazy node is its content; build it
+  | .lazy _ sub => buildDom h ns sub   -- a lazy node is its content; build it
   | .element tag attrs children => do
-      let node ← Dom.createElement tag
+      let node ← Dom.createElement ns tag
       applyAttrs h node attrs          -- a local host's children are added here, by mountLocal
       unless ownsChildren attrs do
+        let childNs ← Dom.childNamespace node   -- SVG subtrees propagate; foreignObject returns to HTML
         for c in children do
-          Dom.appendChild node (← buildDom h c)
+          Dom.appendChild node (← buildDom h childNs c)
       return node
 
 /-- Hydrate server-rendered DOM in place: walk the `Html` in lockstep with the existing
@@ -184,7 +185,7 @@ mutual
 partial def applyToDom (h : Handlers msg)
     (parent : Dom.Node) (index : UInt32) (node : Dom.Node) : Patch msg → IO Unit
   | .replace new => do
-      Dom.replaceChild parent index (← buildDom h new)
+      Dom.replaceChild parent index (← buildDom h (← Dom.childNamespace parent) new)
   | .setText s => Dom.setText node s
   | .lazyReuse _ _ =>
       -- the key was unchanged, so the existing DOM is already correct: skip it. This is
@@ -213,7 +214,7 @@ partial def applyToDom (h : Handlers msg)
           match step with
           | .reuse _ (.lazyReuse _ _) => pure ()
           | .reuse _ p                => applyToDom h node j (← Dom.childAt node j) p
-          | .create newH              => Dom.insertBefore node j (← buildDom h newH)
+          | .create newH              => Dom.insertBefore node j (← buildDom h (← Dom.childNamespace node) newH)
           j := j + 1
         let count ← Dom.childCount node
         for _ in [steps.length:count.toNat] do Dom.removeChild node (UInt32.ofNat steps.length)
@@ -234,7 +235,7 @@ partial def applyToDom (h : Handlers msg)
             Dom.insertBefore node j child
             applyToDom h node j child p
         | .create newH => do
-            Dom.insertBefore node j (← buildDom h newH)
+            Dom.insertBefore node j (← buildDom h (← Dom.childNamespace node) newH)
         j := j + 1
       -- Old nodes whose key wasn't reused are now past `j`; drop them.
       let count ← Dom.childCount node
@@ -367,38 +368,40 @@ mutual
 /-- Build a template into DOM once, returning the root node and its `VState` mirror.
     Events register into the handler tables exactly as `buildDom` does, so the JS
     delegation works identically. `cells` accumulates one entry per `showIf`. -/
-partial def buildView (h : Handlers msg) (cells : CondCells σ msg) :
+partial def buildView (h : Handlers msg) (cells : CondCells σ msg) (ns : String) :
     View σ msg → σ → IO (Dom.Node × VState σ msg)
   | .text s,          _ => do let n ← Dom.createText s; return (n, .text n)
   | .dyn get,         s => do
       let v := get s; let n ← Dom.createText v; let r ← IO.mkRef v
       return (n, .dyn n r)
-  | .static html,     _ => do let n ← buildDom h html; return (n, .stat n)
+  | .static html,     _ => do let n ← buildDom h ns html; return (n, .stat n)
   | .element tag attrs kids, s => do
-      let node ← Dom.createElement tag
+      let node ← Dom.createElement ns tag
       applyAttrs h node (attrs.map (VAttr.eval s))
+      let childNs ← Dom.childNamespace node
       let mut ks : Array (VState σ msg) := #[]
       for k in kids do
-        let (kn, kst) ← buildView h cells k s
+        let (kn, kst) ← buildView h cells childNs k s
         Dom.appendChild node kn
         ks := ks.push kst
       return (node, .elem node ks)
   -- `showIf` is `ifElse` with an empty else-branch; both build the active branch through `buildCond`.
-  | .showIf cond child, s => buildCond h cells cond child (.text "") s
-  | .ifElse cond yes no, s => buildCond h cells cond yes no s
+  | .showIf cond child, s => buildCond h cells ns cond child (.text "") s
+  | .ifElse cond yes no, s => buildCond h cells ns cond yes no s
   | .dynNode get, s => do
       let html := get s
-      let n ← buildDom h html
+      let n ← buildDom h ns html
       return (n, .dynNode (← IO.mkRef n) (← IO.mkRef html))
   | .keyedList tag attrs keys marks rowSig rowsHtml, s => do
-      let node ← Dom.createElement tag
+      let node ← Dom.createElement ns tag
       applyAttrs h node (attrs.map (VAttr.eval s))
       -- a per-instance signal namespace (the container's unique node id), so two lists over
       -- the same row keys — e.g. a reusable list component used twice — never collide.
       let inst := s!"§{node}§"
       let perRow ← seedRows inst (rowSig s) (marks s) #[] #[]   -- seed every row first (empty old state)…
       let rs := (rowsHtml s).map (Html.prefixSignals inst)
-      for r in rs do Dom.appendChild node (← buildDom h r)      -- …so bindSignal reads them
+      let childNs ← Dom.childNamespace node
+      for r in rs do Dom.appendChild node (← buildDom h childNs r)   -- …so bindSignal reads them
       return (node, .list node (← IO.mkRef (keys s)) (← IO.mkRef perRow) (← IO.mkRef rs)
         (← IO.mkRef (marks s)) inst)
 
@@ -427,7 +430,7 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
       let node ← nref.get
       match diff (← last.get) newHtml with
       | .replace h2 => do                            -- root shape changed: rebuild the subtree
-          let n2 ← buildDom h h2
+          let n2 ← buildDom h (← Dom.childNamespace parent) h2
           Dom.replaceChild parent index n2
           nref.set n2
       | p => applyToDom h parent index node p        -- otherwise patch in place (verified diff)
@@ -465,7 +468,8 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
           (newKeys.map (fun k => ((oldPos[k]?).map (fun op => oldMarks.getD op 0)).getD 0))
           (newKeys.map (fun k => ((oldPos[k]?).map (fun op => oldSigs.getD op #[])).getD #[]))
         if oldRowsL.isEmpty then
-          for r in newRows do Dom.appendChild node (← buildDom h r)   -- empty → N: every row is new, so append; no diff
+          let childNs ← Dom.childNamespace node
+          for r in newRows do Dom.appendChild node (← buildDom h childNs r)   -- empty → N: every row is new, so append; no diff
         else
           let evAttrs := attrs.map (VAttr.eval s)
           applyToDom h parent index node (diff (.element tag evAttrs oldRowsL) (.element tag evAttrs newRows))
@@ -474,15 +478,15 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
   | .static _, _, _ => pure ()
   | v, s, _ => do
       -- template/state shape disagree (should not happen): rebuild this node
-      let (n, _) ← buildView h cells v s
+      let (n, _) ← buildView h cells (← Dom.childNamespace parent) v s
       Dom.replaceChild parent index n
 
 /-- Build a conditional: take a cell, build the active branch into it. `showIf cond child` is
     `buildCond cond child (text "")`; `ifElse` passes both branches. -/
-partial def buildCond (h : Handlers msg) (cells : CondCells σ msg)
+partial def buildCond (h : Handlers msg) (cells : CondCells σ msg) (ns : String)
     (c : σ → Bool) (yes no : View σ msg) (s : σ) : IO (Dom.Node × VState σ msg) := do
   let idx ← allocCell cells
-  let (n, st) ← buildView h cells (if c s then yes else no) s
+  let (n, st) ← buildView h cells ns (if c s then yes else no) s
   cells.modify (fun (cs, free) => (cs.set! idx (c s, some st), free))
   return (n, .cond idx)
 
@@ -498,7 +502,7 @@ partial def patchCond (h : Handlers msg) (cells : CondCells σ msg)
     match inner with | some ist => patchView h cells parent index active s ist | none => pure ()
   else do
     match inner with | some ist => freeCells cells ist | none => pure ()
-    let (n, st) ← buildView h cells active s
+    let (n, st) ← buildView h cells (← Dom.childNamespace parent) active s
     Dom.replaceChild parent index n
     cells.modify (fun (cs, free) => (cs.set! idx (now, some st), free))
 end
@@ -589,7 +593,7 @@ partial def spawnInstance (ctx : LocalCtx) (fk : String) (ldef : LocalDef) (s0 :
           | some self => localRun ctx fk self lm
           | none      => pure ()) k c i b hn }
   let tree := ldef.view s0
-  Dom.appendChild host (← buildDom lh tree)
+  Dom.appendChild host (← buildDom lh (← Dom.childNamespace host) tree)
   let tRef ← IO.mkRef tree
   ctx.instances.modify (·.insert fk
     { handlers := lh, treeRef := tRef, host := host, view := ldef.view, onOutput := onOut })
@@ -600,7 +604,7 @@ partial def localRerender (inst : LocalInstance) (s' : String) : IO Unit := do
   inst.handlers.click.set #[]; inst.handlers.input.set #[]
   let newTree := inst.view s'
   match diff (← inst.treeRef.get) newTree with
-  | .replace newH => Dom.replaceChild inst.host 0 (← buildDom inst.handlers newH)
+  | .replace newH => Dom.replaceChild inst.host 0 (← buildDom inst.handlers (← Dom.childNamespace inst.host) newH)
   | patch         => applyToDom inst.handlers inst.host 0 (← Dom.childAt inst.host 0) patch
   inst.treeRef.set newTree
 
@@ -808,7 +812,7 @@ def run (app : App Model Msg) : IO Unit := do
           let vst ← hydrateView h condCells template (← modelRef.get) existing
           rootRef.set existing; vstateRef.set (some vst)
         else
-          let (node, vst) ← buildView h condCells template (← modelRef.get)
+          let (node, vst) ← buildView h condCells "" template (← modelRef.get)
           Dom.mountRoot node; rootRef.set node; vstateRef.set (some vst)
     | some vst => patchView h condCells (← rootRef.get) 0 template (← modelRef.get) vst
     gcLocals

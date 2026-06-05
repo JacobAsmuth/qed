@@ -16,9 +16,19 @@ namespace Qed.Dom
 /-- A handle to a live DOM node (an index into the JS-side node table). -/
 abbrev Node := UInt32
 
-/-- Create a detached element with the given tag. -/
+/-- Create a detached element `tag` in namespace `ns` — `""` is the HTML default, a non-empty
+    URI (e.g. the SVG namespace) creates via `createElementNS`. `ns` is the namespace the *parent*
+    established for its children (see `childNamespace`); an empty `ns` with tag `svg` still enters
+    the SVG namespace, so a root `<svg>` works. -/
 @[extern "qed_dom_create_element"]
-opaque createElement (tag : String) : IO Node
+opaque createElement (ns tag : String) : IO Node
+
+/-- The namespace that children of `node` are created in: the SVG namespace for an element inside
+    an `<svg>` subtree, `""` (HTML) otherwise — including back inside a `<foreignObject>`, whose
+    content is ordinary HTML. The driver threads this down the build so element creation inherits
+    its context (an SVG `<a>`/`<title>` stays SVG) instead of guessing the namespace from the tag. -/
+@[extern "qed_dom_child_namespace"]
+opaque childNamespace (node : Node) : IO String
 
 /-- Create a detached text node. -/
 @[extern "qed_dom_create_text"]

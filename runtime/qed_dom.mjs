@@ -13,11 +13,24 @@ function Q() {
 }
 const ok = (v, w) => mkOk(v, w);
 
+// Namespaces. Elements inside an <svg> subtree must be created in the SVG namespace
+// (createElementNS), and xlink:*/xml:* attributes set in their own namespace (setAttributeNS) —
+// `<use xlink:href>` and friends only resolve when the attribute is namespaced.
+const SVG_NS   = 'http://www.w3.org/2000/svg';
+const XLINK_NS = 'http://www.w3.org/1999/xlink';
+const XML_NS   = 'http://www.w3.org/XML/1998/namespace';
+const attrNS = (k) => k.startsWith('xlink:') ? XLINK_NS : (k.startsWith('xml:') ? XML_NS : null);
+
 export const dom = {
-  createElement(tag, w) { const N = Q().nodes; N.push(document.createElement(tag)); return ok(N.length - 1, w); },
+  // `ns` is the namespace the parent established for its children (see childNamespace); "" is the
+  // HTML default, except a standalone `svg` tag still enters the SVG namespace.
+  createElement(ns, tag, w) { const N = Q().nodes; const real = ns || (tag === 'svg' ? SVG_NS : ''); N.push(real ? document.createElementNS(real, tag) : document.createElement(tag)); return ok(N.length - 1, w); },
+  // The namespace children of `node` inherit: SVG inside an <svg> subtree, HTML otherwise — and
+  // back to HTML inside <foreignObject>, whose content is ordinary HTML.
+  childNamespace(node, w) { const el = Q().nodes[node]; const svg = !!el && el.namespaceURI === SVG_NS && el.localName !== 'foreignObject'; return ok(svg ? SVG_NS : '', w); },
   createText(s, w)      { const N = Q().nodes; N.push(document.createTextNode(s));    return ok(N.length - 1, w); },
-  setAttribute(node, k, v, w) { const el = Q().nodes[node]; if (el && el.getAttribute(k) !== v) el.setAttribute(k, v); return ok(PUnit, w); },
-  removeAttribute(node, k, w) { const el = Q().nodes[node]; if (el) el.removeAttribute(k); return ok(PUnit, w); },
+  setAttribute(node, k, v, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) { if (el.getAttributeNS(ns, k.slice(k.indexOf(':') + 1)) !== v) el.setAttributeNS(ns, k, v); } else if (el.getAttribute(k) !== v) el.setAttribute(k, v); } return ok(PUnit, w); },
+  removeAttribute(node, k, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) el.removeAttributeNS(ns, k.slice(k.indexOf(':') + 1)); else el.removeAttribute(k); } return ok(PUnit, w); },
   getAttribute(node, k, w)    { const el = Q().nodes[node]; const v = el ? el.getAttribute(k) : null; return ok(v == null ? '' : v, w); },
   appState(w) { const el = document.getElementById('qed-state'); return ok(el ? el.textContent : '', w); },
   clearHandlers(node, w) {

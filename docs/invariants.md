@@ -68,12 +68,16 @@ invariant cardSafe : Card.Safe preserved_by Card.update     -- the card never br
 embed Card as card keyedBy (toString ·.id) into cards
 def update : Model → Msg → Model | ...                      -- tap / re-rank / dismiss / add
 
-invariant feedSafe : Card.Safe for_each cards preserved_by update using cardSafe
+invariant feedSafe : cardSafe for_each cards preserved_by update
 -- ⇒ machine-checks: ∀ m msg, (∀ c ∈ m.cards, Card.Safe c) → (∀ c ∈ (update m msg).cards, Card.Safe c)
 ```
 
+Naming the child invariant (`cardSafe`) infers the predicate from it. If you'd rather be explicit —
+or the predicate isn't a child invariant — the full form spells it out:
+`Card.Safe for_each cards preserved_by update using cardSafe`.
+
 The discharger *applies* a proven lemma per list operation — a keyed child message keeps it (that's
-the child contract, named in `using`), `filter`/remove keeps it, `push`/add keeps it once the new
+the child contract `cardSafe`), `filter`/remove keeps it, `push`/add keeps it once the new
 element is valid by construction, and **a re-rank keeps it if you sort with `Array.sortBy`** (a
 verified `mergeSort` — `Array.qsort` has no membership lemma, so it can't be lifted automatically).
 
@@ -96,13 +100,12 @@ contract to "the whole rendered view is styled, chrome and every card":
 
 ```lean
 invariant cardStyled : roleHasOneOf "like" [Card.likeOn, Card.likeOff] holds_in Card.view
-invariant feedStyled : roleHasOneOf "like" [Card.likeOn, Card.likeOff]
-                         for_each cards holds_in view using cardStyled
+invariant feedStyled : cardStyled for_each cards holds_in view
 -- ⇒ machine-checks: ∀ m, roleHasOneOf "like" […] (view m) = true   (the same theorem `holds_in` gives)
 ```
 
 A plain `holds_in view` can't auto-discharge this — it walks into the dynamic `cards.map cardView`
-list and stops. `for_each cards … using cardStyled` is exactly the missing information (which list,
+list and stops. `for_each cards … using cardStyled` (or just naming `cardStyled`) is the missing information (which list,
 which child contract): the discharger reduces the view to its chrome plus that list (a styled child
 view stays styled after `embed`'s message-relabel — `roleHasOneOf_map`) and closes each card with
 `cardStyled`. If the parent view has its *own* element with that role, or its shape is unusual, the

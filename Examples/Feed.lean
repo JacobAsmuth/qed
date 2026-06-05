@@ -87,11 +87,10 @@ def app : App Model Msg := mkApp init update (View.ofHtml view)
 -- ③ EVERY card in the feed stays Safe — across taps, re-rank, dismiss, append.   one line, auto
 --    keyed tap → the child contract carries it; `rank` sorts (verified `sortBy`);
 --    `dismiss` only filters; `append`'s new card is Safe by construction.
-invariant feedSafe : Card.Safe for_each cards preserved_by update using cardSafe
+invariant feedSafe : cardSafe for_each cards preserved_by update
 
 -- ④ EVERY rendered card in the feed is correctly styled — the whole `view`, chrome and cards.
 --    Same `for_each`, over the view instead of the transition; `cardStyled` closes each card.
-invariant feedStyled : roleHasOneOf "like" [Card.likeOn, Card.likeOff]
-                         for_each cards holds_in view using cardStyled
+invariant feedStyled : cardStyled for_each cards holds_in view
 
 end Feed

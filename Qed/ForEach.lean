@@ -179,4 +179,43 @@ macro_rules
       theorem $name:ident : ∀ m, ($pred) ($view m) = true := by
         qedDischargeStyledForEach $view $field $childStyled $name $pred)
 
+/-! ### Single-reference sugar — infer the predicate from the child invariant
+
+`cardSafe for_each cards preserved_by update` (no explicit predicate, no `using`) recovers the
+predicate from `cardSafe`'s type and expands to the explicit form above. The same over the view:
+`cardStyled for_each cards holds_in view`. Both are elaborators (they read the child invariant's
+type), so the child invariant must be a bare identifier. -/
+
+syntax (name := invariantForEachSugar)
+  "invariant " ident " : " ident " for_each " ident " preserved_by " ident : command
+syntax (name := invariantForEachStyledSugar)
+  "invariant " ident " : " ident " for_each " ident " holds_in " ident : command
+
+open Elab Command Term Meta Lean.PrettyPrinter in
+elab_rules : command
+  | `(invariant $name:ident : $childInv:ident for_each $field:ident preserved_by $upd:ident) => do
+      -- `childInv : ∀ m msg, pred m → pred (…)`; recover `pred` as `fun m => (type of the hypothesis)`.
+      let pred ← liftTermElabM do
+        let cn ← realizeGlobalConstNoOverload childInv
+        forallTelescope (← getConstInfo cn).type fun args _ => do
+          if args.size < 2 then throwErrorAt childInv
+            "`{childInv}` doesn't look like a `… preserved_by …` invariant, so its predicate can't \
+             be inferred — write it explicitly (`<pred> for_each … preserved_by … using {childInv}`)."
+          -- `.eta` turns `fun m => Card.Safe m` back into the bare `Card.Safe`, so a *named*
+          -- predicate stays an identifier (the discharger unfolds it); a true inline `fun …` stays
+          -- a lambda (no eta), which is exactly what the discharger wants too.
+          let P ← mkLambdaFVars #[args[0]!] (← inferType args[args.size - 1]!)
+          delab P.eta
+      elabCommand (← `(invariant $name : $pred for_each $field preserved_by $upd using $childInv))
+  | `(invariant $name:ident : $childStyled:ident for_each $field:ident holds_in $view:ident) => do
+      -- `childStyled : ∀ m, pred (childView m) = true`; recover `pred` from the equation's LHS head.
+      let pred ← liftTermElabM do
+        let cn ← realizeGlobalConstNoOverload childStyled
+        forallTelescope (← getConstInfo cn).type fun _ body => do
+          let some lhs := body.eq?.map (·.2.1) | throwErrorAt childStyled
+            "`{childStyled}` doesn't look like a `… holds_in …` invariant, so its predicate can't be \
+             inferred — write it explicitly (`<pred> for_each … holds_in … using {childStyled}`)."
+          delab lhs.appFn!
+      elabCommand (← `(invariant $name : $pred for_each $field holds_in $view using $childStyled))
+
 end Qed

@@ -246,11 +246,9 @@ it.
 
 Verification doesn't make this slow, and the reason is the same "the framework decides" principle
 from earlier. Because the engine knows which subtrees are
-value-updates, a changed row's text and attributes are written straight at the node. A value-only
-update is **O(changed bindings)**, with no tree walk and no diff at all. That fast path is proven
-to agree with a full re-render. On the
-standard keyed-list benchmark this lands ~at React's update/swap/reorder numbers; the one place it's
-still behind is cold *create* of a very large list.
+value-updates, a changed row's text and attributes are written straight at the node. On the
+standard keyed-list benchmark this lands ~at React's update/swap/reorder numbers; the only place it's
+still behind is cold create of a very large list.
 
 There's a subtler win in stack depth. Lean expresses iteration as tail recursion, and the
 transpiler turns every tail call into a loop, so building, folding, diffing, and walking long

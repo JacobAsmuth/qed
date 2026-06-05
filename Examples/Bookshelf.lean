@@ -101,12 +101,20 @@ def transition (m : Model) : Msg → Model × Cmd Msg
       | .failed e => still { m with current := .failed e }
       | _         => still m
 
-/-! Scoped styles, co-located with the view. Each class name is a content hash, and a
-    typo in a reference is a compile error. -/
-def shell : Style := css "max-width: 40rem; margin: 2rem auto; font-family: system-ui, sans-serif; line-height: 1.5"
-def topnav : Style := css "display: flex; gap: 1rem; margin-bottom: 1.5rem"
-def navlink : Style := css "text-decoration: none; color: #06c; font-weight: 600"
-def card : Style := css "padding: 1rem 1.25rem; border: 1px solid #ddd; border-radius: 8px"
+/-! Scoped styles, co-located with the view. Each class name is a content hash; the typed
+    property helpers (`maxWidth`, `display`, `color`, …) make a misspelled property — not just a
+    misspelled reference — a compile error. Raw strings coerce in for compound values, `screenMax`
+    is a responsive block, and `brand` is a design token set once in `theme`. -/
+def brand : Token := token "brand"
+def shell : Style := css [
+  maxWidth (rem 40), margin "2rem auto", fontFamily "system-ui, sans-serif", lineHeight "1.5",
+  screenMax (px 600) [ margin "1rem", maxWidth (pct 100) ] ]
+def topnav : Style := css [
+  display .flex, gap (rem 1), prop "margin-bottom" "1.5rem" ]
+def navlink : Style := css [
+  textDecoration "none", color brand, fontWeight "600" ]
+def card : Style := css [
+  padding "1rem 1.25rem", border "1px solid #ddd", radius (px 8) ]
 
 def bookList (books : Array Book) : Html Msg :=
   ul [cls "books"] (books.toList.map fun b =>
@@ -148,6 +156,7 @@ def rehydrateModel (s : String) : Option Model :=
 def appBase : App Model Msg :=
   ui init transition (onRoute := Msg.routed) fun m =>
     div [shell, cls "app"] [
+      theme [ brand.set "#06c" ],
       styleSheet [shell, topnav, navlink, card],
       nav [topnav] [ link "/" [navlink] ["Catalog"], link "/new" [navlink] ["Add a book"] ],
       match m.route with

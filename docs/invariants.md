@@ -91,13 +91,24 @@ invariant feedSafe : Card.Safe for_each cards preserved_by update using cardSafe
   case rank => …                            -- fill only what's left
 ```
 
-The behavioural lift above is automatic. The *styling* analogue — "every rendered card is styled" —
-has its proven building blocks in `Qed/Invariant.lean` (`roleHasOneOf_map`, `everyElementL_mapList`:
-a role predicate survives `Html.map`, so a card's `holds_in` contract transfers to its rendered
-subtree), but it's currently a short hand proof rather than a one-liner, because a parent view's
-shape varies more than the fixed set of list operations.
+The **styling** analogue is the same line with a different connective — lift a card's `holds_in`
+contract to "the whole rendered view is styled, chrome and every card":
 
-`Examples/Feed.lean` is a TikTok-style feed that puts this together end to end.
+```lean
+invariant cardStyled : roleHasOneOf "like" [Card.likeOn, Card.likeOff] holds_in Card.view
+invariant feedStyled : roleHasOneOf "like" [Card.likeOn, Card.likeOff]
+                         for_each cards holds_in view using cardStyled
+-- ⇒ machine-checks: ∀ m, roleHasOneOf "like" […] (view m) = true   (the same theorem `holds_in` gives)
+```
+
+A plain `holds_in view` can't auto-discharge this — it walks into the dynamic `cards.map cardView`
+list and stops. `for_each cards … using cardStyled` is exactly the missing information (which list,
+which child contract): the discharger reduces the view to its chrome plus that list (a styled child
+view stays styled after `embed`'s message-relabel — `roleHasOneOf_map`) and closes each card with
+`cardStyled`. If the parent view has its *own* element with that role, or its shape is unusual, the
+error names what's left and hands a `forEachStyleLift` skeleton — same bargain as the behavioural side.
+
+`Examples/Feed.lean` is a TikTok-style feed that puts both lifts together end to end.
 
 ## Styling invariants (over the view)
 

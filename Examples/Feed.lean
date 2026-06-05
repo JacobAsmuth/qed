@@ -89,4 +89,9 @@ def app : App Model Msg := mkApp init update (View.ofHtml view)
 --    `dismiss` only filters; `append`'s new card is Safe by construction.
 invariant feedSafe : Card.Safe for_each cards preserved_by update using cardSafe
 
+-- ④ EVERY rendered card in the feed is correctly styled — the whole `view`, chrome and cards.
+--    Same `for_each`, over the view instead of the transition; `cardStyled` closes each card.
+invariant feedStyled : roleHasOneOf "like" [Card.likeOn, Card.likeOff]
+                         for_each cards holds_in view using cardStyled
+
 end Feed

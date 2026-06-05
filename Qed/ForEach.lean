@@ -33,7 +33,7 @@ open Lean Elab Tactic
 /-- `<pred> for_each <field> preserved_by <update> using <childInv>` — see the module docs. The
     optional `:= proof` hands over a proof for an arm the automation can't close on its own. -/
 syntax (name := invariantForEach)
-  "invariant " ident " : " term:max " for_each " ident " preserved_by " ident " using " ident
+  "invariant " ident " : " term " for_each " ident " preserved_by " ident " using " ident
     (" := " term)? : command
 
 /-- The discharge *core*, exposed as a tactic so a hand-written `:= by` can let it close every arm
@@ -117,5 +117,66 @@ macro_rules
         ∀ m msg, (∀ c ∈ m.$field, ($pred) c) →
                  (∀ c ∈ (InvTarget.proj ($upd m msg)).$field, ($pred) c) := by
         qedDischargeForEach $upd $childInv $name $pred)
+
+/-! ### Styling lift — the same `for_each`, over the view (`holds_in`)
+
+`<pred> for_each <field> holds_in <view> using <childStyled>` lifts a child's styling contract to
+"the parent's whole rendered view is styled" — chrome *and* every card. It proves the same theorem a
+plain `holds_in` does (`∀ m, pred (view m) = true`); the difference is the discharger handles the
+*dynamic list* of `embed`-rendered children (which plain `holds_in` can't), by closing each rendered
+card with `<childStyled>`. -/
+
+/-- The styling lift's discharge core, exposed as a tactic so a hand `:= by` can reuse it and fill
+    only an unusual view shape: reduce the view to chrome + a rendered list (`qedStyleReduce`), then
+    close each rendered card via the child `holds_in` contract `childStyled` (a styled child view
+    stays styled after `embed`'s `Html.map` — `everyElement_through_map`). Leaves what it can't (no
+    error). -/
+macro "forEachStyleLift " view:ident childStyled:ident : tactic =>
+  `(tactic|
+    (intro m
+     qedStyleReduce $view
+     all_goals (try (rw [Qed.everyElementL_mapList]
+                     intro c _
+                     refine Qed.everyElement_through_map _ _ ?_ ($childStyled c) <;>
+                       (intro t a; simp [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done)))))
+
+/-- The auto discharger for `for_each … holds_in`: run `forEachStyleLift`, then if anything's left,
+    report it clearly with the fix — instead of a raw goal dump. -/
+elab "qedDischargeStyledForEach" view:ident field:ident childStyled:ident nm:ident pred:term : tactic => do
+  evalTactic (← `(tactic| forEachStyleLift $view $childStyled))
+  let goals ← getUnsolvedGoals
+  unless goals.isEmpty do
+    let mut body : MessageData := m!""
+    for g in goals do
+      body := body ++ (← g.withContext do
+        let s := (← Meta.ppExpr (← instantiateMVars (← g.getType))).pretty.replace "✝" ""
+        let why :=
+          if (s.splitOn "everyElementL").length > 1 then
+            "a leftover rendered list — check `" ++ toString childStyled.getId ++ "`'s predicate is \
+             exactly the one here (same role and the same styles)."
+          else
+            "an element this rule constrains that the lift couldn't place — usually the parent view \
+             has its *own* element with that role (style it), or the view is shaped unusually."
+        pure m!"\n  • {why}\n      still needs:  {s}")
+    let predStr := (pred.raw.reprint.getD "the rule").trimmed
+    throwErrorAt nm m!"styling lift `{nm.getId}` — `{predStr}` couldn't be lifted over every \
+      `{field.getId}` in `{view.getId}`.\n{body}\n\n`for_each … holds_in` reduces `{view.getId}` to \
+      its static chrome plus a `{field.getId}.map (the child view)` list, closing each rendered card \
+      with `{childStyled.getId}`. For anything left, finish by hand — `roleHasOneOf_map` / \
+      `everyElementL_mapList` are the lemmas, and `forEachStyleLift` closes the parts it can:\n\n  \
+      invariant {nm.getId} : {predStr} for_each {field.getId} holds_in {view.getId} using \
+      {childStyled.getId} := by\n    forEachStyleLift {view.getId} {childStyled.getId}\n    <fill the rest>"
+
+syntax (name := invariantForEachStyled)
+  "invariant " ident " : " term " for_each " ident " holds_in " ident " using " ident
+    (" := " term)? : command
+
+macro_rules
+  | `(invariant $name:ident : $pred for_each $_:ident holds_in $view:ident using $_:ident := $pf:term) =>
+    `(theorem $name:ident : ∀ m, ($pred) ($view m) = true := $pf)
+  | `(invariant $name:ident : $pred for_each $field:ident holds_in $view:ident using $childStyled:ident) =>
+    `(set_option linter.unusedSimpArgs false in
+      theorem $name:ident : ∀ m, ($pred) ($view m) = true := by
+        qedDischargeStyledForEach $view $field $childStyled $name $pred)
 
 end Qed

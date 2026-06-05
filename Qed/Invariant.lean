@@ -274,6 +274,51 @@ theorem roleHasOneOf_map {α β} (f : α → β) (r) (styles) (h : Html α) :
     roleHasOneOf r styles (h.map f) = roleHasOneOf r styles h :=
   everyElement_map f (fun _ _ => by simp [attrRole_map, attrClasses_map, hasOneClass]) h
 
+/-- The per-child bridge for the styling lift: a styled child view stays styled after `Html.map`
+    relabels its messages, so `everyElement Pβ (cardView c) = true` follows from the child's
+    `holds_in` contract. `everyElement_through_map _ _ hP childContract` closes one rendered card
+    (`Pα`/`Pβ` are the same role predicate at the child's and parent's message types). -/
+theorem everyElement_through_map {α β} (f : α → β) {Pα : String → List (Attr α) → Bool}
+    {Pβ : String → List (Attr β) → Bool} (h : Html α)
+    (hP : ∀ t a, Pβ t (a.map (Attr.map f)) = Pα t a) (hc : everyElement Pα h = true) :
+    everyElement Pβ (h.map f) = true := by rw [everyElement_map f hP]; exact hc
+
+/-- Reduce a styling goal `pred (view m) = true`: unfold the view and every `Qed.Notation`
+    combinator to `Html`/`Attr` constructors, split each `if`/`match`, and close the static leaves —
+    leaving any *dynamic-list* residual (`everyElementL P (cards.map …)`) for the caller. Shared by
+    the plain `holds_in` discharger and the `for_each … holds_in` lift. (Maintenance: this mirror of
+    the element/attribute helpers must list any new one.) -/
+syntax "qedStyleReduce " ident : tactic
+macro_rules
+  | `(tactic| qedStyleReduce $view:ident) =>
+    `(tactic|
+      (simp only [$view:ident, Qed.roleHasOneOf, Qed.tagHasOneOf, Qed.roleHas, Qed.both,
+         Qed.either, Qed.exactlyOne, Qed.hasOneClass,
+         Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
+         Qed.text, Qed.lazy, Qed.el, Qed.div, Qed.span, Qed.button, Qed.p, Qed.h1, Qed.h2, Qed.a,
+         Qed.ul, Qed.li, Qed.header, Qed.nav, Qed.strong, Qed.input, Qed.label, Qed.formEl,
+         Qed.svg, Qed.g, Qed.path, Qed.circle, Qed.ellipse, Qed.line, Qed.rect, Qed.polyline,
+         Qed.polygon, Qed.link, Qed.linkTo, Qed.styleSheet, Qed.theme,
+         Qed.sectionEl, Qed.article, Qed.mainEl, Qed.aside, Qed.footer, Qed.figure,
+         Qed.figcaption, Qed.address, Qed.h3, Qed.h4, Qed.h5, Qed.h6, Qed.ol, Qed.dl, Qed.dt,
+         Qed.dd, Qed.pre, Qed.blockquote, Qed.hr, Qed.br, Qed.small, Qed.mark, Qed.sub, Qed.sup,
+         Qed.code, Qed.kbd, Qed.abbr, Qed.cite, Qed.time, Qed.del, Qed.ins, Qed.img, Qed.picture,
+         Qed.source, Qed.video, Qed.audio, Qed.track, Qed.canvas, Qed.iframe, Qed.details,
+         Qed.summary, Qed.dialog, Qed.select, Qed.option, Qed.optgroup, Qed.textarea,
+         Qed.fieldset, Qed.legend, Qed.datalist, Qed.output, Qed.progress, Qed.meter, Qed.table,
+         Qed.caption, Qed.colgroup, Qed.col, Qed.thead, Qed.tbody, Qed.tfoot, Qed.tr, Qed.td,
+         Qed.th,
+         Qed.cls, Qed.attr, Qed.role, Qed.rawHtml, Qed.on,
+         Qed.onValue, Qed.onClick, Qed.onInput, Qed.onChange, Qed.onCheck, Qed.onKeydown,
+         Qed.onKeyup, Qed.onSubmit, Qed.onBlur, Qed.onFocus, Qed.onDoubleClick, Qed.onMouseDown,
+         Qed.onMouseUp, Qed.key, Qed.value, Qed.placeholder, Qed.name, Qed.href, Qed.src, Qed.alt,
+         Qed.title, Qed.style, Qed.type', Qed.disabled, Qed.required, Qed.checked, Qed.readOnly];
+       repeat' split;
+       all_goals (first
+         | rfl
+         | simp_all [Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
+                     Qed.hasOneClass])))
+
 /-- `invariant name : pred holds_in view` — `pred : Html msg → Bool` holds of the view for every
     model. The optional `:= proof` supplies a proof the default discharger can't find. -/
 syntax (name := invariantView)
@@ -287,34 +332,7 @@ syntax (name := invariantView)
     automation verbatim. (Maintenance: this mirror of the element/attribute helpers must list any
     new one.) -/
 elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => do
-  evalTactic (← `(tactic|
-    (intro m;
-     simp only [$view:ident, Qed.roleHasOneOf, Qed.tagHasOneOf, Qed.roleHas, Qed.both,
-       Qed.either, Qed.exactlyOne, Qed.hasOneClass,
-       Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
-       Qed.text, Qed.lazy, Qed.el, Qed.div, Qed.span, Qed.button, Qed.p, Qed.h1, Qed.h2, Qed.a,
-       Qed.ul, Qed.li, Qed.header, Qed.nav, Qed.strong, Qed.input, Qed.label, Qed.formEl,
-       Qed.svg, Qed.g, Qed.path, Qed.circle, Qed.ellipse, Qed.line, Qed.rect, Qed.polyline,
-       Qed.polygon, Qed.link, Qed.linkTo, Qed.styleSheet, Qed.theme,
-       Qed.sectionEl, Qed.article, Qed.mainEl, Qed.aside, Qed.footer, Qed.figure,
-       Qed.figcaption, Qed.address, Qed.h3, Qed.h4, Qed.h5, Qed.h6, Qed.ol, Qed.dl, Qed.dt,
-       Qed.dd, Qed.pre, Qed.blockquote, Qed.hr, Qed.br, Qed.small, Qed.mark, Qed.sub, Qed.sup,
-       Qed.code, Qed.kbd, Qed.abbr, Qed.cite, Qed.time, Qed.del, Qed.ins, Qed.img, Qed.picture,
-       Qed.source, Qed.video, Qed.audio, Qed.track, Qed.canvas, Qed.iframe, Qed.details,
-       Qed.summary, Qed.dialog, Qed.select, Qed.option, Qed.optgroup, Qed.textarea,
-       Qed.fieldset, Qed.legend, Qed.datalist, Qed.output, Qed.progress, Qed.meter, Qed.table,
-       Qed.caption, Qed.colgroup, Qed.col, Qed.thead, Qed.tbody, Qed.tfoot, Qed.tr, Qed.td,
-       Qed.th,
-       Qed.cls, Qed.attr, Qed.role, Qed.rawHtml, Qed.on,
-       Qed.onValue, Qed.onClick, Qed.onInput, Qed.onChange, Qed.onCheck, Qed.onKeydown,
-       Qed.onKeyup, Qed.onSubmit, Qed.onBlur, Qed.onFocus, Qed.onDoubleClick, Qed.onMouseDown,
-       Qed.onMouseUp, Qed.key, Qed.value, Qed.placeholder, Qed.name, Qed.href, Qed.src, Qed.alt,
-       Qed.title, Qed.style, Qed.type', Qed.disabled, Qed.required, Qed.checked, Qed.readOnly];
-     repeat' split;
-     all_goals (first
-       | rfl
-       | simp_all [Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
-                   Qed.hasOneClass]))))
+  evalTactic (← `(tactic| (intro m; qedStyleReduce $view)))
   let goals ← getUnsolvedGoals
   unless goals.isEmpty do
     -- The residual goal is usually just `False` (the class check reduced away), which says nothing

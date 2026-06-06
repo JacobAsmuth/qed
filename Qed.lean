@@ -14,7 +14,7 @@ import Qed.Invariant
 import Qed.Json
 import Qed.Router
 import Qed.Date
-import Qed.Form
+import Qed.Schema
 import Qed.Component
 import Qed.ForEach
 import Qed.View

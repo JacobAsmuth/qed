@@ -2,7 +2,7 @@
   Qed.Html — the core typed virtual DOM.
 
   This is the *elaboration target*: every nice surface syntax (combinators in
-  `Qed.Notation`, the `jsonStruct`/`form` macros, …) ultimately produces a value of
+  `Qed.Notation`, the `schema` macro, …) ultimately produces a value of
   this type, so guarantees proven about `Html` hold no matter how prettily the app
   is written. `msg` is the application's message type; event handlers carry a `msg`
   value, so an event wired to the wrong message simply does not type-check.

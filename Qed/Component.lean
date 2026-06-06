@@ -92,7 +92,7 @@ current namespace:
 The one line the macro cannot write (Lean cannot extend an existing `inductive`) is
 the parent message constructor: add `| ctor (k : String) (msg : Child.Msg)` to your
 `Msg`. The `update` arm is then `| .ctor k msg => ctorUpdate m k msg`, and the view
-drops to `ctorView r`. Core-syntax only (no `import Lean`), like `router`/`form`. -/
+drops to `ctorView r`. Core-syntax only (no `import Lean`), like `router`. -/
 syntax (name := embedCmd)
   "embed " ident " as " ident " keyedBy " term " into " ident : command
 

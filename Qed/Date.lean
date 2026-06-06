@@ -78,7 +78,7 @@ instance : LE Date := ⟨fun a b => b.before a = false⟩
 instance (a b : Date) : Decidable (a < b) := inferInstanceAs (Decidable (a.before b = true))
 instance (a b : Date) : Decidable (a ≤ b) := inferInstanceAs (Decidable (b.before a = false))
 
-/-- A `Date` is JSON as its ISO `YYYY-MM-DD` string, so a `jsonStruct`/form field can persist
+/-- A `Date` is JSON as its ISO `YYYY-MM-DD` string, so a `schema` field can persist
     and reload one (decoding rejects an impossible date, since `parse?` does). -/
 instance : ToJson Date := ⟨fun d => .str (toString d)⟩
 instance : FromJson Date :=

@@ -95,7 +95,7 @@ def iframe  (attrs : List (Attr msg) := []) (children : List (Html msg) := []) :
 def details (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "details" attrs children
 def summary (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "summary" attrs children
 def dialog  (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "dialog" attrs children
--- Form controls (the typed `form`/`Field` API is the higher-level way; these are the raw elements)
+-- Form controls (the typed `schema`/`Codec` API is the higher-level way; these are the raw elements)
 def select   (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "select" attrs children
 def option   (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "option" attrs children
 def optgroup (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "optgroup" attrs children

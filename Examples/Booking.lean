@@ -1,7 +1,7 @@
 /-
   A form with a rule relative to the current time.
 
-  `form Appt (today : Date)` threads "today" into the validated type and the gate, so
+  `schema Appt (today : Date)` threads "today" into the validated type and the gate, so
   the `when` field's refinement — `fun d => today < d` ("must be in the future") —
   depends on the clock. The app reads the clock once at startup with `Cmd.now`,
   stores `today` in the model, and only then renders the form. The submit button
@@ -12,9 +12,9 @@ open Qed
 
 namespace Booking
 
-form Appt (today : Date) where
-  who  : Input.text.refine (fun s => s.length ≥ 1)   -- a non-empty name
-  when : Input.date.refine (fun d => today < d)        -- strictly after today
+schema Appt (today : Date) where
+  who  : Codec.text.refine (fun s => s.length ≥ 1)   -- a non-empty name
+  when : Codec.date.refine (fun d => today < d)        -- strictly after today
 
 structure Model where
   today  : Option Date     -- none until `Cmd.now` reports it

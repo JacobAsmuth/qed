@@ -24,8 +24,8 @@ namespace Local
     component (not the root) — the inner half of a two-level bubble chain. -/
 namespace Tag
 
-jsonStruct State where
-  on : Bool
+schema State where
+  on : Codec.checkbox
 
 inductive Msg | flip
 
@@ -44,11 +44,11 @@ end Tag
     root, and `tagged` records what the nested `Tag` bubbled up. -/
 namespace Widget
 
-jsonStruct State where
-  id     : Nat
-  count  : Int
-  note   : String
-  pinned : Bool
+schema State where
+  id     : Codec.nat
+  count  : Codec.int
+  note   : Codec.text
+  pinned : Codec.checkbox
 
 inductive Msg | inc | dec | setNote (s : String) | report | tagged (on : Bool)
 

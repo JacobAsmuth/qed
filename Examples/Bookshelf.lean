@@ -1,14 +1,14 @@
 /-
   Bookshelf — a small catalog that wires the whole stack into one app: routing, a
   typed remote `Resource` (a list and a single record, fetched and decoded), a
-  validated `form` that POSTs and navigates to the result, and scoped styles.
+  validated `schema` whose form POSTs and navigates to the result, and scoped styles.
 
   Three pages, behind the verified router (`R.round_trip`):
 
     /              the catalog — fetches `/api/books` into `Resource (Array Book)`
     /books/<id>    one book — fetches `/api/books/<id>` into `Resource Book`
-    /new           a form (text/number/select/checkbox, each refined) that, on a
-                   valid submit, POSTs the book and routes to its new detail page
+    /new           the `schema`-generated form (text/number/select/checkbox, each refined)
+                   that, on a valid submit, POSTs the book and routes to its new detail page
 
   Navigation goes through `link` / `Cmd.pushUrl`, so it never reloads. The server
   renders any page from a model (`Examples/BookshelfSSR.lean`), and the browser
@@ -25,50 +25,41 @@ router R where
   detail (id : String) => "books"
   newBook => "new"
 
--- One book, with a JSON codec (decode for the GET responses, encode for the POST body).
-jsonStruct Book where
-  id      : String
-  title   : String
-  author  : String
-  year    : Nat
-  genre   : String
-  inPrint : Bool
-
--- Field refinements for the add form. `abbrev` so the `Decidable` instances are inferred.
+-- Field refinements, shared by the form and the JSON decode. `abbrev` so the `Decidable`
+-- instances are inferred.
 abbrev NonEmpty (s : String) : Prop := s.length ≥ 1
 abbrev Year (n : Nat) : Prop := 1 ≤ n ∧ n ≤ 2026
 
--- The add-book form: each control is a typed `Input`, so "submit ⇔ valid" holds by
--- construction. `form` generates the draft, the validated `NewBook`, `parse`, the
--- `canSubmit` gate + its proof, and `formView`.
-form NewBook where
-  title   : Input.text.refine NonEmpty
-  author  : Input.text.refine NonEmpty
-  year    : Input.nat.refine Year
-  genre   : Input.select [("fiction", "Fiction"), ("nonfiction", "Non-fiction"), ("poetry", "Poetry")]
-  inPrint : Input.checkbox
+-- One book, declared once. `schema` generates the editable draft + validated `Book` (each
+-- refined field a proof-carrying `Field`), `parse`, the `canSubmit` gate + its proof, the
+-- `formView` widgets, and the JSON codec — decode for the GET responses, encode for the POST
+-- body. The refinements guard *both* directions, so an out-of-range API record is rejected at
+-- decode exactly as the form rejects it at submit. `id` is server-assigned: it rides the JSON
+-- but never appears in the form.
+schema Book where
+  id      : Codec.text.jsonOnly
+  title   : Codec.text.refine NonEmpty
+  author  : Codec.text.refine NonEmpty
+  year    : Codec.nat.refine Year
+  genre   : Codec.select [("fiction", "Fiction"), ("nonfiction", "Non-fiction"), ("poetry", "Poetry")]
+  inPrint : Codec.checkbox
 
 structure Model where
   route   : R
   catalog : Resource (Array Book)   -- the list page
   current : Resource Book           -- the detail page
-  draft   : NewBook.Draft           -- the add form
+  draft   : Book.Draft              -- the add form
 
 def init : Model :=
-  { route := .catalog, catalog := .idle, current := .idle, draft := NewBook.Draft.empty }
+  { route := .catalog, catalog := .idle, current := .idle, draft := Book.Draft.empty }
 
 inductive Msg where
   | routed     (r : R)                    -- startup / link / back / push, parsed to a route
   | gotCatalog (r : Resource (Array Book))
   | gotBook    (r : Resource Book)
-  | edit       (d : NewBook.Draft)        -- the form hands back the whole draft
+  | edit       (d : Book.Draft)           -- the form hands back the whole draft
   | submit
   | created    (r : Resource Book)        -- the POST resolved (ok with the new book, or failed)
-
-/-- The POST body for a valid draft: a book with an empty id (the server assigns one). -/
-def bodyOf (nb : NewBook) : String :=
-  Book.encode { id := "", title := nb.title.val, author := nb.author.val,
-                year := nb.year.val, genre := nb.genre.val, inPrint := nb.inPrint.val }
 
 -- One combined transition. A page that needs data flips its `Resource` to `.loading` and
 -- fires the fetch in the same arm that sets the route.
@@ -90,13 +81,15 @@ def transition (m : Model) : Msg → Model × Cmd Msg
   | .gotBook r    => still { m with current := r }
   | .edit d       => still { m with draft := d }
   | .submit       =>
-      match NewBook.parse m.draft with
-      | some nb => also m (Cmd.postJson "/api/books" (bodyOf nb)
+      -- `Book.parse` yields a valid book (empty id; the server assigns one) only when every
+      -- refined field passes, so the POST body is `Book.encode` of that — no separate bridge.
+      match Book.parse m.draft with
+      | some book => also m (Cmd.postJson "/api/books" (Book.encode book)
                             (fun b => Msg.created (.ok b)) (fun e => Msg.created (.failed e)))
       | none    => still m
   | .created r    =>
       match r with
-      | .ok b     => also { m with current := .ok b, draft := NewBook.Draft.empty }
+      | .ok b     => also { m with current := .ok b, draft := Book.Draft.empty }
                          (Cmd.pushUrl (Router.toURL (R.detail b.id)))
       | .failed e => still { m with current := .failed e }
       | _         => still m
@@ -119,14 +112,14 @@ def card : Style := css [
 def bookList (books : Array Book) : Html Msg :=
   ul [cls "books"] (books.toList.map fun b =>
     li [key b.id] [
-      link (Router.toURL (R.detail b.id)) [navlink, cls "book-link"] [text b.title],
-      span [cls "byline"] [text s!" — {b.author}"]
+      link (Router.toURL (R.detail b.id)) [navlink, cls "book-link"] [text b.title.val],
+      span [cls "byline"] [text s!" — {b.author.val}"]
     ])
 
 def bookCard (b : Book) : Html Msg :=
   div [card, cls "book"] [
-    h1 [] [text b.title],
-    p [cls "author"] [text s!"by {b.author} ({b.year})"],
+    h1 [] [text b.title.val],
+    p [cls "author"] [text s!"by {b.author.val} ({b.year.val})"],
     p [cls "genre"] [text b.genre],
     p [cls (if b.inPrint then "in-print" else "out-of-print")]
       [text (if b.inPrint then "In print" else "Out of print")]
@@ -176,7 +169,7 @@ def appBase : App Model Msg :=
       | .newBook =>
           div [cls "new"] [
             h1 [] ["Add a book"],
-            NewBook.formView m.draft Msg.edit Msg.submit
+            Book.formView m.draft Msg.edit Msg.submit
           ]
     ]
 

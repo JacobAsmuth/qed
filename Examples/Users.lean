@@ -22,9 +22,9 @@ router R where
   user (name : String) => "users"
 
 -- One profile, decoded from the API response.
-jsonStruct Profile where
-  name : String
-  bio  : String
+schema Profile where
+  name : Codec.text
+  bio  : Codec.text
 
 structure Model where
   route   : R

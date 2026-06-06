@@ -13,11 +13,18 @@ open Qed
 
 namespace Bookshelf
 
+/-- Build a seed `Book`, discharging each refinement on the literal value with `decide` —
+    so an empty title or an out-of-range year would fail to compile, not at runtime. -/
+def book (id title author : String) (year : Nat) (genre : String) (inPrint : Bool)
+    (hTitle : NonEmpty title := by decide) (hAuthor : NonEmpty author := by decide)
+    (hYear : Year year := by decide) : Book :=
+  { id, title := ⟨title, hTitle⟩, author := ⟨author, hAuthor⟩, year := ⟨year, hYear⟩, genre, inPrint }
+
 /-- Stand-in for the server's data source. -/
 def serverBooks : List Book :=
-  [ { id := "dune",        title := "Dune",                author := "Frank Herbert",      year := 1965, genre := "fiction",    inPrint := true },
-    { id := "neuromancer", title := "Neuromancer",         author := "William Gibson",     year := 1984, genre := "fiction",    inPrint := true },
-    { id := "geb",         title := "Gödel, Escher, Bach", author := "Douglas Hofstadter", year := 1979, genre := "nonfiction", inPrint := false } ]
+  [ book "dune"        "Dune"                "Frank Herbert"      1965 "fiction"    true,
+    book "neuromancer" "Neuromancer"         "William Gibson"     1984 "fiction"    true,
+    book "geb"         "Gödel, Escher, Bach" "Douglas Hofstadter" 1979 "nonfiction" false ]
 
 /-- The model for a request path: parse the route and fill its data server-side
     (a real server would hit a DB here). -/

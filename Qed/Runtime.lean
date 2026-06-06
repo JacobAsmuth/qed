@@ -186,12 +186,21 @@ def Cmd.wsClose (key : String) : Cmd msg := .fx "ws.close" key "" ""
     reads the chosen file's text. -/
 def Cmd.download (filename mime content : String) : Cmd msg := .fx "file.download" filename mime content
 
-/-! A file the user picked, read as text. Binary needs a data-URL variant or a port. -/
-jsonStruct FilePick where
+/-! A file the user picked, read as text. Binary needs a data-URL variant or a port.
+    Decoded by hand (not the `schema` command, which lives above this layer). -/
+structure FilePick where
   name : String
   mime : String
   size : Nat
   text : String
+
+instance : FromJson FilePick where
+  fromJson j := do
+    return { name := (← fromField j "name"), mime := (← fromField j "mime"),
+             size := (← fromField j "size"), text := (← fromField j "text") }
+
+def FilePick.decode (s : String) (maxDepth : Nat := 64) : Except String FilePick :=
+  (Json.parse s maxDepth).bind fromJson
 
 /-- Open the file picker (filtered by `accept`, e.g. `".json,text/*"`) and dispatch the
     chosen file decoded as a `FilePick` — or `.error` if it was cancelled or unreadable. -/
@@ -220,7 +229,7 @@ message, and all the inbound channels are assembled into a generated `onPort`:
 
 The JS registers handlers on `globalThis.__qed.ports[name]` and pushes inbound with
 `globalThis.__qed.send(name, payload)`. Payload types need `ToJson` (outbound) /
-`FromJson` (inbound) — a `jsonStruct` gives both. Core-syntax only (no `import Lean`). -/
+`FromJson` (inbound) — a `schema` gives both. -/
 syntax portChan := ident " : " term (" => " term)?
 syntax (name := portsCmd) "ports " "where " sepBy1IndentSemicolon(portChan) : command
 

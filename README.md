@@ -58,13 +58,8 @@ invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
 
 That last line isn't a test, and you don't write its proof. `invariant` discharges it for you. It
 checks that every message leaves the count non-negative, and the build succeeds only if that holds
-for all of them. Delete the `if 0 < m.count` guard and the build fails. The error names the message
-that broke the promise (`case decrement`). The same syntax covers effectful transitions, and a `:=`
-clause lets you hand over a proof for the rare claim the automation can't close.
-
-What's worth stating? Bounds, preconditions, mutual exclusion, effect safety, unique keys. See
-[`docs/invariants.md`](docs/invariants.md) for more. An auto-checked invariant is a property that
-can't quietly be violated. It's the "this can't happen" finally made true.
+for all of them. Delete the `if 0 < m.count` guard and the build will fail with an error naming the message
+that broke the invariant (`case decrement`).
 
 ## One way to write a view
 
@@ -103,53 +98,44 @@ delegation. Everything above it is verified Lean. `test/js_gate_test.mjs` runs t
 through native Lean and through the transpiled JS and asserts they compute exactly the same thing:
 render, diff, arithmetic, JSON, routing.
 
-## The rest of the app is data, too
-
-The counter is the whole architecture in miniature. A real app reads JSON, validates forms, routes,
-talks to a server, and keeps lists. Qed treats each the same way: push the thing that can fail into
-a value the type system can see, so the failure becomes a case you handle instead of an exception
-you forgot.
-
-### JSON
+### Schema — forms and JSON, one declaration
 
 `Json.parse` is a total function. Bad input comes back as an `.error` value, never an exception. It
-takes a depth budget (64 by default), and a proof guarantees whatever it returns nests no deeper
-than the number you gave it. A deeply nested payload can't push past your limit. `jsonStruct` writes
-the structure, its `ToJson`/`FromJson`, and a `decode` that parses and decodes in one call,
-recursively through nested structs:
+takes a depth budget (64 by default), and a proof guarantees whatever it returns nests no deeper than
+the number you gave it — a deeply nested payload can't push past your limit.
+
+A `Field p` is a value carrying a proof that the
+predicate `p` holds of it; the only way to build one is to pass validation, so by the time you hold a
+`Book`, every refined field in it is already valid and an invalid one is not a thing you can
+construct. The `schema` command reads the declaration once and generates the editable `Draft`, the
+validated structure, `parse`, the `canSubmit` gate with a proof that it matches the validity it
+claims, the `formView` widgets, and the `ToJson`/`FromJson` codec with `decode`/`encode`. A field's
+refinement guards *both* directions — the form rejects it at submit, and `decode` rejects it on the
+wire, with the same proof.
 
 ```lean
-jsonStruct User where
-  name    : String
-  age     : Nat              -- a Nat can't be negative: "age": -3 → .error "age: expected a non-negative integer"
-  bio     : Option String    -- Option ⇒ may be missing or null, comes back `none`
+abbrev NonEmpty (s : String) : Prop := s.length ≥ 1
+abbrev Year (n : Nat) : Prop := 1 ≤ n ∧ n ≤ 2026
 
-#eval (User.decode body (maxDepth := 8)).map (·.name)    -- Except.ok "Ada"
-#eval (User.decode body (maxDepth := 1)).map (·.name)    -- Except.error "maximum depth exceeded"
+schema Book where
+  id      : Codec.text.jsonOnly                    -- rides the JSON, never shown in the form
+  title   : Codec.text.refine NonEmpty
+  year    : Codec.nat.refine Year                  -- parsed to a Nat first, then checked
+  inPrint : Codec.checkbox
+  blurb   : Codec.text                             -- unrefined, so it stays a bare `String`
+  tags    : Codec.json (List String)               -- a nested/list field rides the JSON only
 ```
 
-### Forms
-
-A `Field p` is a value carrying a proof that the predicate `p` holds of it. The only way to build one
-is to pass validation. By the time you're holding a `Signup`, every field in it is already valid, and
-an invalid form is not a thing you can construct. You write the predicates as ordinary `Prop`s, and
-the `form` command does the rest, including a proof that the submit gate matches the validity it
-claims to enforce:
-
-```lean
-abbrev Email (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
-abbrev Adult (n : Nat)    : Prop := n ≥ 18
-
-form Signup where
-  email : Input.text.refine Email
-  age   : Input.nat.refine Adult                   -- parsed to a Nat first, then checked
-  agree : Input.checkbox.refine (· = true)
-  plan  : Input.select [("free", "Free"), ("pro", "Pro")]
-```
-
-`Signup.formView draft .edit .submit` renders the inputs and a submit button that stays disabled
-until every field checks out. It marks a field `aria-invalid` once you've touched it and it still
-doesn't validate.
+A refined field is stored as a proof-carrying `Field` (read it with `.val`); an unrefined one stays
+its bare value type, so a plain data record reads exactly as you wrote it (and an `Option` field comes
+back `none` when the key is missing or null). A `Codec.json T` field is for a nested record or a list
+the form doesn't edit — it rides the JSON through `T`'s own `ToJson`/`FromJson`, recursively. `Book.decode body`
+parses and decodes in one call, rejecting an out-of-range `year` — or an invalid value nested inside —
+the same way the form does; `Book.encode` goes the other way. Whether a field is refined is read from
+the elaborated codec, not its spelling, so factoring `Codec.text.refine NonEmpty` into a named helper
+keeps the validation. `Book.formView draft .edit .submit` renders the inputs and a submit button that
+stays disabled until every field checks out, marking a field `aria-invalid` once you've touched it and
+it still doesn't validate.
 
 ### Routing and HTTP
 
@@ -195,9 +181,7 @@ few lines.
 
 ### Components, and lifting their invariants over a list
 
-A `Component` is a self-contained `update` and `view` with its own state and message type. It's the
-reusable unit you reach for in React, written the same way. Here's a feed card. Its last two lines
-are its own contract: one for behavior, one for styling.
+A `Component` is a self-contained `update` and `view` with its own state and message type. Here's a feed card. Its last two lines are its own contract: one for behavior, one for styling.
 
 ```lean
 namespace Card
@@ -249,7 +233,7 @@ up. `Examples/Feed.lean` is the worked feed.
 
 Some state has no business in the root model: a row's open editor, a half-typed draft, a per-widget
 count. React reaches for `useState`. Qed reaches for a local component. It's keyed and driver-owned,
-its state serialized by `jsonStruct`, its message type private, and it can bubble a typed value up to
+its state serialized by `schema`, its message type private, and it can bubble a typed value up to
 its parent. The whole local store snapshots and restores through `window.qed.snapshot()` and
 `.restore(json)`.
 
@@ -259,7 +243,7 @@ its parent. The whole local store snapshots and restores through `window.qed.sna
 `renderDocument` wraps it in a page the client adopts on load. With `dehydrate`/`rehydrate` it starts
 from the server's model, so there's no refetch and no flash. `Examples/Bookshelf.lean` is the worked
 app: a routed catalog over a `Resource (Array Book)` (a remote value as `idle | loading | ok | failed`),
-a detail page, and an add-book `form` that POSTs and routes to the new book, server-rendered and
+a detail page, and an add-book form that POSTs and routes to the new book, server-rendered and
 driven end to end by a browser test. Every feature above has one like it in `Examples/` and `test/`.
 
 ## Does proving things cost you speed?
@@ -304,9 +288,9 @@ Give it a try and state an invariant. Issues welcome at
 | `Qed/View.lean` | The rendering model: `View` (`dyn`/`showIf`/`ifElse`/`forEach`/`dynNode`) and the `view%` lift behind `ui`; built once, then changed bindings patch (`patch_render`/`applyValues_render`). |
 | `Qed/Runtime.lean` | The Elm Architecture: `App`, the `ui` builder (`still`/`also`), the `Cmd` effects + `port`/`onPort`, local components, and server-side render. |
 | `Qed/Diff.lean` | The reconciler the engine uses internally: one children reconcile shared by positional and keyed, `lazy` memoization, and the `diff_apply` proof. |
-| `Qed/Json.lean` | JSON parser/renderer + `jsonStruct`/`jsonCodec`, with the `parse_depth_le`/`parse_render` proofs. |
+| `Qed/Json.lean` | JSON parser/renderer + the `ToJson`/`FromJson` classes, with the `parse_depth_le`/`parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field), the `router` command, `toURL`/`fromURL`. |
-| `Qed/Form.lean` | `Field p`, the `Input` controls, and the `form` command (Draft + `parse` + `formView` + `canSubmit_iff`). |
+| `Qed/Schema.lean` | `Field p`, the `Codec` controls, and the `schema` command — one declaration yields the form (Draft + `parse` + `formView` + `canSubmit_iff`) and the JSON codec (`ToJson`/`FromJson` + `decode`/`encode`). |
 | `Qed/Component.lean` | `Component`, the `embed` macro, and the `for_each` lift lemmas. |
 | `Qed/Invariant.lean` | The `invariant` command (`preserved_by` / `holds_in` / `for_each`). See [`docs/invariants.md`](docs/invariants.md). |
 | `Qed/Dom.lean` / `Qed/Driver.lean` | The DOM primitives (the one trusted boundary) and the impure driver. |

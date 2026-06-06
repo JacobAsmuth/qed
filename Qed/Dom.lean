@@ -30,9 +30,28 @@ opaque createElement (ns tag : String) : IO Node
 @[extern "qed_dom_child_namespace"]
 opaque childNamespace (node : Node) : IO String
 
+/-- The SVG namespace URI (matches `qed_dom.mjs`'s `SVG_NS`). -/
+def svgNs : String := "http://www.w3.org/2000/svg"
+
+/-- The namespace children of an element `tag` created in namespace `ns` inherit — computed purely,
+    identical to what `childNamespace` returns for that element. The build path threads `ns` down, so
+    it can skip the per-element DOM round-trip and use this instead: SVG propagates into a subtree, a
+    `foreignObject` returns to HTML, and a bare `svg` enters SVG. (`childNamespace` stays for the rare
+    paths that hold only an existing node, e.g. a `replace`.) -/
+@[inline] def childNsOf (ns tag : String) : String :=
+  if tag == "foreignObject" then ""
+  else if ns == svgNs || (ns == "" && tag == "svg") then svgNs
+  else ""
+
 /-- Create a detached text node. -/
 @[extern "qed_dom_create_text"]
 opaque createText (content : String) : IO Node
+
+/-- Create an empty `DocumentFragment` — an off-DOM container. Building a batch of fresh rows into a
+    fragment and appending the fragment once keeps the live document untouched until that single
+    commit, instead of inserting each row into the connected tree one at a time. -/
+@[extern "qed_dom_create_fragment"]
+opaque createFragment : IO Node
 
 /-- Set an attribute on an element. -/
 @[extern "qed_dom_set_attribute"]

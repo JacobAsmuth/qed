@@ -29,6 +29,7 @@ export const dom = {
   // back to HTML inside <foreignObject>, whose content is ordinary HTML.
   childNamespace(node, w) { const el = Q().nodes[node]; const svg = !!el && el.namespaceURI === SVG_NS && el.localName !== 'foreignObject'; return ok(svg ? SVG_NS : '', w); },
   createText(s, w)      { const N = Q().nodes; N.push(document.createTextNode(s));    return ok(N.length - 1, w); },
+  createFragment(w)     { const N = Q().nodes; N.push(document.createDocumentFragment()); return ok(N.length - 1, w); },
   setAttribute(node, k, v, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) { if (el.getAttributeNS(ns, k.slice(k.indexOf(':') + 1)) !== v) el.setAttributeNS(ns, k, v); } else if (el.getAttribute(k) !== v) el.setAttribute(k, v); } return ok(PUnit, w); },
   removeAttribute(node, k, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) el.removeAttributeNS(ns, k.slice(k.indexOf(':') + 1)); else el.removeAttribute(k); } return ok(PUnit, w); },
   getAttribute(node, k, w)    { const el = Q().nodes[node]; const v = el ? el.getAttribute(k) : null; return ok(v == null ? '' : v, w); },
@@ -73,7 +74,10 @@ export const dom = {
   portSend(name, payload, w) { Q(); const p = globalThis.__qed.ports && globalThis.__qed.ports[name]; if (p) p(payload); return ok(PUnit, w); },
   bindSignal(node, name, w) {
     const g = Q(), el = g.nodes[node]; if (!el) return ok(PUnit, w);
-    g.sig.set(name, { el, attr: null }); el.setAttribute('data-qed-signal', name);
+    // Register by name in `g.sig` (how `setSignal` finds the node on update). The
+    // `data-qed-signal` attribute is an SSR-only marker (emitted by `Render`, read by no client
+    // code), so the live client doesn't write it — that's one fewer DOM mutation per dynamic leaf.
+    g.sig.set(name, { el, attr: null });
     const v = g.sigVals.get(name); if (v !== undefined && el.textContent !== v) el.textContent = v;
     return ok(PUnit, w);
   },

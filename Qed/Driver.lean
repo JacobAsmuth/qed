@@ -155,7 +155,7 @@ partial def buildDom (h : Handlers msg) (ns : String) : Html msg → IO Dom.Node
       let node ← Dom.createElement ns tag
       applyAttrs h node attrs          -- a local host's children are added here, by mountLocal
       unless ownsChildren attrs do
-        let childNs ← Dom.childNamespace node   -- SVG subtrees propagate; foreignObject returns to HTML
+        let childNs := Dom.childNsOf ns tag   -- pure (no DOM round-trip): SVG propagates, foreignObject returns to HTML
         for c in children do
           Dom.appendChild node (← buildDom h childNs c)
       return node
@@ -379,7 +379,7 @@ partial def buildView (h : Handlers msg) (cells : CondCells σ msg) (ns : String
   | .element tag attrs kids, s => do
       let node ← Dom.createElement ns tag
       applyAttrs h node (attrs.map (VAttr.eval s))
-      let childNs ← Dom.childNamespace node
+      let childNs := Dom.childNsOf ns tag
       let mut ks : Array (VState σ msg) := #[]
       for k in kids do
         let (kn, kst) ← buildView h cells childNs k s
@@ -401,7 +401,7 @@ partial def buildView (h : Handlers msg) (cells : CondCells σ msg) (ns : String
       let inst := s!"§{node}§"
       let perRow ← seedRows inst (rowSig s) (marks s) #[] #[]   -- seed every row first (empty old state)…
       let rs := (rowsHtml s).map (Html.prefixSignals inst)
-      let childNs ← Dom.childNamespace node
+      let childNs := Dom.childNsOf ns tag
       for r in rs do Dom.appendChild node (← buildDom h childNs r)   -- …so bindSignal reads them
       return (node, .list node (← IO.mkRef (keys s)) (← IO.mkRef perRow) (← IO.mkRef rs)
         (← IO.mkRef (marks s)) inst)
@@ -469,8 +469,13 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
           (newKeys.map (fun k => ((oldPos[k]?).map (fun op => oldMarks.getD op 0)).getD 0))
           (newKeys.map (fun k => ((oldPos[k]?).map (fun op => oldSigs.getD op #[])).getD #[]))
         if oldRowsL.isEmpty then
+          -- empty → N: every row is new. Build the whole batch into one off-DOM `DocumentFragment`,
+          -- then commit it to the (live) container in a single `appendChild`, so the connected tree
+          -- is touched once instead of N times.
           let childNs ← Dom.childNamespace node
-          for r in newRows do Dom.appendChild node (← buildDom h childNs r)   -- empty → N: every row is new, so append; no diff
+          let frag ← Dom.createFragment
+          for r in newRows do Dom.appendChild frag (← buildDom h childNs r)
+          Dom.appendChild node frag
         else
           let evAttrs := attrs.map (VAttr.eval s)
           applyToDom h parent index node (diff (.element tag evAttrs oldRowsL) (.element tag evAttrs newRows))

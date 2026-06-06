@@ -272,6 +272,7 @@ export const Qed_Dom_childCount = domCall('childCount');
 export const Qed_Dom_childNamespace = domCall('childNamespace');
 export const Qed_Dom_clearHandlers = domCall('clearHandlers');
 export const Qed_Dom_createElement = domCall('createElement');
+export const Qed_Dom_createFragment = domCall('createFragment');
 export const Qed_Dom_createText = domCall('createText');
 export const Qed_Dom_currentPath = domCall('currentPath');
 export const Qed_Dom_effect = domCall('effect');

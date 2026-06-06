@@ -176,10 +176,9 @@ def app : App Model Msg :=
 
 ### Effects
 
-Side effects in Qed are data, which is what keeps `update` pure and provable. An arm returns the
-next model with `still`, or the next model plus a `Cmd` to run with `also`. The driver performs the
-`Cmd`. Your logic never touches the network. Here's a chat that streams an LLM's reply token by
-token, with no `fetch` anywhere in it. `Cmd.stream` opens the request and feeds each token back as a
+Side effects are data, which keeps `update` pure and provable. An arm returns the next model with
+`still`, or the model plus a `Cmd` to run with `also`, and the driver performs it. Here's a chat that
+streams an LLM's reply token by token, with no `fetch` in it. `Cmd.stream` feeds each token back as a
 `.chunk` message, so a streaming reply is, to `update`, just more messages arriving.
 
 ```lean
@@ -190,13 +189,9 @@ def transition (m : Model) : Msg → Model × Cmd Msg
   | .done      => still { m with pending := false }
 ```
 
-The battery is typed and covers what you reach for: `storageSet`/`storageGet`, `pushUrl`/`back`,
-`copy`/`paste`, `focus`/`scrollIntoView`, `after`/`afterKeyed` (debounce), `setTitle`, `randomInt`,
-`download`/`pickFile`, `getJson`/`postJson`/`stream`, and `batch`. A WebSocket is the same shape.
-`Cmd.wsOpen "feed" "/live" .received` opens one under a key, its open/close/error events arrive as
-messages, and `Cmd.wsSend`/`Cmd.wsClose` address it by key. When something isn't built in (IndexedDB,
-a hardware API, a third-party widget), you reach for a port. The `ports` command generates the
-outbound `Cmd`s and the inbound `onPort`, and you wire the real API in a few lines of JS.
+The typed battery covers what you reach for, from `storageGet` and `getJson` to WebSockets and
+debounced timers. When something isn't built in, the `ports` escape hatch wires a real JS API in a
+few lines.
 
 ### Components, and lifting their invariants over a list
 
@@ -271,9 +266,8 @@ driven end to end by a browser test. Every feature above has one like it in `Exa
 
 No. Because the engine knows which subtrees are value-updates, a changed row's text and attributes go
 straight to its node, and on the standard keyed-list benchmark that lands about at React's
-update/swap/reorder numbers. The one gap is cold create of a very large list. And since the
-transpiler turns Lean's tail recursion into loops, building, diffing, and walking lists run in
-constant stack, so 100,000+ rows reconcile without trouble.
+update/swap/reorder numbers. The transpiler also turns Lean's tail recursion into loops, so building,
+diffing, and walking lists run in constant stack, and 100,000+ rows reconcile without trouble.
 
 ## Getting started
 
@@ -297,14 +291,6 @@ A failed proof is a failed build. The sources are grepped for `sorry`/`admit`/`n
 the axiom manifest runs, so a "proof" that smuggles in an axiom is caught. `npm run dev` / `build` /
 `test` work too. When you're hacking on the framework itself, the in-repo `./qed` shim runs the CLI
 against this checkout.
-
-## What's next
-
-The framework is feature-complete enough to build real apps. The remaining work is honest about its
-edges:
-
-- **Cold create of huge lists** is the one benchmark gap left versus React, and the pure string
-  renderer used for SSR still recurses per element. Making both iterative is on the list.
 
 Give it a try and state an invariant. Issues welcome at
 [github.com/JacobAsmuth/qed/issues](https://github.com/JacobAsmuth/qed/issues).

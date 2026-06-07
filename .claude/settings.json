@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r \".tool_input.file_path // empty\"); if [ -n \"$f\" ] && [ -f \"$f\" ]; then m=$(grep -nP \"[\\x{2014}\\x{2013}]\" \"$f\"); if [ -n \"$m\" ]; then echo \"Em/en dash (U+2014/U+2013) found in $f. This repo bans them; replace with a colon, comma, or period:\" >&2; echo \"$m\" >&2; exit 2; fi; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

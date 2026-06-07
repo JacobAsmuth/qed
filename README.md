@@ -56,8 +56,7 @@ def app : App Model Msg := ui init update fun m =>
 invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
 ```
 
-That last line isn't a test, and you don't write its proof. `invariant` discharges it for you. It
-checks that every message leaves the count non-negative, and the build succeeds only if that holds
+That last line isn't a test, and you don't write its proof. It checks that every message leaves the count non-negative, and the build succeeds only if that holds
 for all of them. Delete the `if 0 < m.count` guard and the build will fail with an error naming the message
 that broke the invariant (`case decrement`).
 
@@ -98,11 +97,11 @@ delegation. Everything above it is verified Lean. `test/js_gate_test.mjs` runs t
 through native Lean and through the transpiled JS and asserts they compute exactly the same thing:
 render, diff, arithmetic, JSON, routing.
 
-### Schema — forms and JSON, one declaration
+### Schema: forms and JSON, one declaration
 
 `Json.parse` is a total function. Bad input comes back as an `.error` value, never an exception. It
 takes a depth budget (64 by default), and a proof guarantees whatever it returns nests no deeper than
-the number you gave it — a deeply nested payload can't push past your limit.
+the number you gave it. A deeply nested payload can't push past your limit.
 
 A `Field p` is a value carrying a proof that the
 predicate `p` holds of it; the only way to build one is to pass validation, so by the time you hold a
@@ -110,7 +109,7 @@ predicate `p` holds of it; the only way to build one is to pass validation, so b
 construct. The `schema` command reads the declaration once and generates the editable `Draft`, the
 validated structure, `parse`, the `canSubmit` gate with a proof that it matches the validity it
 claims, the `formView` widgets, and the `ToJson`/`FromJson` codec with `decode`/`encode`. A field's
-refinement guards *both* directions — the form rejects it at submit, and `decode` rejects it on the
+refinement guards *both* directions: the form rejects it at submit, and `decode` rejects it on the
 wire, with the same proof.
 
 ```lean
@@ -129,8 +128,8 @@ schema Book where
 A refined field is stored as a proof-carrying `Field` (read it with `.val`); an unrefined one stays
 its bare value type, so a plain data record reads exactly as you wrote it (and an `Option` field comes
 back `none` when the key is missing or null). A `Codec.json T` field is for a nested record or a list
-the form doesn't edit — it rides the JSON through `T`'s own `ToJson`/`FromJson`, recursively. `Book.decode body`
-parses and decodes in one call, rejecting an out-of-range `year` — or an invalid value nested inside —
+the form doesn't edit; it rides the JSON through `T`'s own `ToJson`/`FromJson`, recursively. `Book.decode body`
+parses and decodes in one call, rejecting an out-of-range `year` (or an invalid value nested inside)
 the same way the form does; `Book.encode` goes the other way. Whether a field is refined is read from
 the elaborated codec, not its spelling, so factoring `Codec.text.refine NonEmpty` into a named helper
 keeps the validation. `Book.formView draft .edit .submit` renders the inputs and a submit button that
@@ -181,7 +180,11 @@ few lines.
 
 ### Components, and lifting their invariants over a list
 
-A `Component` is a self-contained `update` and `view` with its own state and message type. Here's a feed card. Its last two lines are its own contract: one for behavior, one for styling.
+A `Component` is a reusable piece of UI with its own `Model`, `Msg`, `update`, and `view`. It owns
+its message type, so embedding one means relabeling its messages into the parent's, and a misrouted
+event is a type error.
+
+Here's a feed card. The last two lines are its contract, one over behavior, one over styling.
 
 ```lean
 namespace Card
@@ -205,14 +208,11 @@ invariant cardSafe   : Card.Safe preserved_by Card.update
 invariant cardStyled : roleHasOneOf "like" [Card.likeOn, Card.likeOff] holds_in Card.view
 ```
 
-`embed` drops the card into a keyed list and writes the wiring for you, `cardView` and `cardUpdate`.
-It routes each message back to its row by key, the identity the diff reconciles by, so a reorder
-never misdelivers one.
+`cardSafe` is a model invariant: the like count never goes negative, and a liked card has at least
+one like. `cardStyled` uses `holds_in`, which states a property of the view rather than the model: in
+every state the card can reach, the `role "like"` element carries one of its two styles.
 
-Now the part you can't do in a normal framework. The card's contract lifts to the whole list, one
-line each. `feedSafe` proves every card in the feed stays valid. `feedStyled` proves every card
-renders styled. Both hold across the feed's own transitions, and the kernel discharges them with no
-proof from you:
+To place many cards in a list, `embed` generates the wiring:
 
 ```lean
 embed Card as card keyedBy (toString ·.id) into cards
@@ -226,16 +226,24 @@ invariant feedSafe   : cardSafe   for_each cards preserved_by update  -- ∀ car
 invariant feedStyled : cardStyled for_each cards holds_in view        -- ∀ card, renders styled
 ```
 
-Break the promise and the build breaks with it. Append a card you didn't validate, or sort with the
-unverified `Array.qsort`, and the build fails. It names the arm and the one-line fix. `feedSafe` is
-itself "every card is valid," so it composes. A screen holding several feeds lifts it again, one line
-up. `Examples/Feed.lean` is the worked feed.
+`embed` generates `cardView` and `cardUpdate`. It routes each message by key rather than list index,
+so a message reaches the card it came from after the list is sorted or filtered.
 
-Some state has no business in the root model: a row's open editor, a half-typed draft, a per-widget
-count. React reaches for `useState`. Qed reaches for a local component. It's keyed and driver-owned,
-its state serialized by `schema`, its message type private, and it can bubble a typed value up to
-its parent. The whole local store snapshots and restores through `window.qed.snapshot()` and
-`.restore(json)`.
+`for_each` lifts a child contract to the whole list. `cardSafe for_each cards` proves `cardSafe` for
+every card in `cards` across every transition `update` makes, discharged automatically. It reduces
+arm by arm: a routed message is covered by the card's own contract, `dismiss` only filters, `rank`
+only reorders (through the verified `Array.sortBy`), and an appended card is valid by construction.
+`feedStyled` lifts the styling contract the same way, over the view.
+
+When an arm can't preserve the contract the build fails and names it. `Array.qsort` has no membership
+lemma, so a `rank` written with it won't lift, and neither will an appended card that isn't provably
+valid. `feedSafe` is itself a per-element predicate ("every card is valid"), so it lifts again over a
+list of feeds. `Examples/Feed.lean` is the worked example.
+
+State that doesn't belong in the root model (a row's open editor, a half-typed draft, a per-widget
+counter) goes in a local component: keyed, driver-owned, its state serialized by `schema`, its
+message type private, and able to bubble a typed value to its parent. The
+local store snapshots and restores through `window.qed.snapshot()` and `.restore(json)`.
 
 ### Server-side rendering
 
@@ -290,7 +298,7 @@ Give it a try and state an invariant. Issues welcome at
 | `Qed/Diff.lean` | The reconciler the engine uses internally: one children reconcile shared by positional and keyed, `lazy` memoization, and the `diff_apply` proof. |
 | `Qed/Json.lean` | JSON parser/renderer + the `ToJson`/`FromJson` classes, with the `parse_depth_le`/`parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field), the `router` command, `toURL`/`fromURL`. |
-| `Qed/Schema.lean` | `Field p`, the `Codec` controls, and the `schema` command — one declaration yields the form (Draft + `parse` + `formView` + `canSubmit_iff`) and the JSON codec (`ToJson`/`FromJson` + `decode`/`encode`). |
+| `Qed/Schema.lean` | `Field p`, the `Codec` controls, and the `schema` command. One declaration yields the form (Draft + `parse` + `formView` + `canSubmit_iff`) and the JSON codec (`ToJson`/`FromJson` + `decode`/`encode`). |
 | `Qed/Component.lean` | `Component`, the `embed` macro, and the `for_each` lift lemmas. |
 | `Qed/Invariant.lean` | The `invariant` command (`preserved_by` / `holds_in` / `for_each`). See [`docs/invariants.md`](docs/invariants.md). |
 | `Qed/Dom.lean` / `Qed/Driver.lean` | The DOM primitives (the one trusted boundary) and the impure driver. |

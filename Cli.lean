@@ -1,5 +1,5 @@
 /-
-  The `qed` CLI — build/run/verify tooling for Qed apps.
+  The `qed` CLI: build/run/verify tooling for Qed apps.
 
   Commands mirror the npm/vite vocabulary:
 
@@ -13,7 +13,7 @@
       qed doctor   report which dependencies are present
 
   Every `build`/`dev`/`check` runs verification: `lake build` (so the kernel checks
-  every proof — a failed proof is a build error), a grep for
+  every proof, a failed proof is a build error), a grep for
   `sorry`/`admit`/`native_decide`, and the axiom manifest if one is present.
 
   `build` transpiles the app and the verified framework/driver to plain JavaScript
@@ -27,7 +27,7 @@
 -/
 open System (FilePath)
 
-/-- Whitespace-trim returning a `String` — a drop-in for the deprecated `String.trim` (the CLI is a
+/-- Whitespace-trim returning a `String`, a drop-in for the deprecated `String.trim` (the CLI is a
     standalone module that doesn't `import Qed`, so it carries its own copy of this one-liner). -/
 def String.trimmed (s : String) : String :=
   String.ofList (((s.toList.dropWhile Char.isWhitespace).reverse.dropWhile Char.isWhitespace).reverse)
@@ -115,7 +115,7 @@ def axiomClean : IO Bool := do
 
 /-- Every effect `kind` a `Cmd` can emit (`.fx "…"` / `.fxResult "…"` in `Runtime.lean`)
     must have a matching `case '…'` in the host's effect switch, or that effect silently
-    no-ops at runtime. This static diff keeps the Lean and JS sides honest — the one bug
+    no-ops at runtime. This static diff keeps the Lean and JS sides honest, the one bug
     that otherwise only shows up as a `console.warn` in a user's browser. Silent on
     success; prints the offenders (and returns false) on a gap. -/
 def effectsCovered : IO Bool := do
@@ -133,7 +133,7 @@ def effectsCovered : IO Bool := do
     | _ :: rest => rest.map (fun c => (c.splitOn close).headD "")
     | []        => []
   -- kinds come from `Cmd` smart constructors (`.fx`/`.fxResult` in Runtime) AND from the
-  -- driver itself (`Dom.effect "…"`, e.g. `signal.set`/`ws.open`/`event.listen`) — both must
+  -- driver itself (`Dom.effect "…"`, e.g. `signal.set`/`ws.open`/`event.listen`), both must
   -- have a qed_host.mjs case, so scan both files.
   let emitted := (after ".fx \"" "\"" runtime) ++ (after ".fxResult \"" "\"" runtime)
               ++ (after "Dom.effect \"" "\"" driver) ++ (after "Dom.effectResult \"" "\"" driver)
@@ -149,8 +149,8 @@ def bracketDelta (s : String) : Int :=
     if c == '{' || c == '(' || c == '[' then d + 1
     else if c == '}' || c == ')' || c == ']' then d - 1 else d) 0
 
-/-- Drop one `term:max` from the front of a token list — a single token, or a balanced
-    `{…}`/`(…)`/`[…]` group — so a record-literal `init` (`ui { … } update fun …`) is
+/-- Drop one `term:max` from the front of a token list, a single token, or a balanced
+    `{…}`/`(…)`/`[…]` group, so a record-literal `init` (`ui { … } update fun …`) is
     skipped whole and the *next* token is the update term. -/
 def dropTerm : List String → List String
   | []       => []
@@ -163,7 +163,7 @@ def dropTerm : List String → List String
 /-- A non-fatal nudge (never gates the build): app updates wired into a `ui` builder that
     carry no `invariant … preserved_by <update>`. Changing your program's state is almost
     always a claim you can state and have machine-checked, so a zero here is worth a second
-    look — but an honest "nothing to prove here" is fine, which is why this only reports,
+    look, but an honest "nothing to prove here" is fine, which is why this only reports,
     never fails. Heuristic and per-file (a builder and its invariant live in the same
     module), comment-aware so prose mentioning `ui` doesn't count. -/
 def invariantNote : IO Unit := do
@@ -194,13 +194,13 @@ def invariantNote : IO Unit := do
     for u in updates do
       unless covered.contains u do uncovered := uncovered.push (f, u)
   unless uncovered.isEmpty do
-    IO.println s!"  note: {uncovered.size} update(s) change state with no `invariant … preserved_by` — consider stating one:"
+    IO.println s!"  note: {uncovered.size} update(s) change state with no `invariant … preserved_by`, consider stating one:"
     for (f, u) in uncovered do IO.println s!"    {u}  ({f})"
 
 def verify : IO Bool := do
   step "checking proofs (lake build)"
   if (← sh "lake" #["build"]) != 0 then return false
-  -- Build the example modules too, so their proofs are checked — the `invariant`s (model
+  -- Build the example modules too, so their proofs are checked: the `invariant`s (model
   -- `preserved_by` and styling `holds_in`) are theorems that only fire when their module builds.
   if (← sh "lake" #["build", "Examples"]) != 0 then return false
   step "verifying (no sorry / axiom-clean / effect coverage)"
@@ -217,7 +217,7 @@ def cmdCheck : IO UInt32 := do
     IO.println (green "✓ verified"); return 0
   else IO.eprintln (red "✗ verification failed"); return 1
 
-/-- The app's *web entry* module — the one whose `main` is `Qed.run app` (what
+/-- The app's *web entry* module, the one whose `main` is `Qed.run app` (what
     `qed new` scaffolds). Set `QED_JS_ROOT` for the framework's own examples. -/
 def jsRoot : IO String := do
   match ← env "QED_JS_ROOT" with
@@ -237,7 +237,7 @@ def indexHtml (dev : Bool) : String :=
   "<script type=\"module\" src=\"/qed_host.mjs\"></script>\n</body>\n</html>\n"
 
 /-- The transpiler entry set: the app's `main` (`Qed.run app`) plus the framework's 13
-    `@[export]` driver functions. This is fixed and app-agnostic — no per-app shim. -/
+    `@[export]` driver functions. This is fixed and app-agnostic, no per-app shim. -/
 def driverEntries : Array String := #[
   "main:__main",
   "Qed.qedInit:qed_init", "Qed.qedDispatch:qed_dispatch", "Qed.qedDispatchStr:qed_dispatch_str",
@@ -276,7 +276,7 @@ def cmdBuild (prod : Bool) : IO UInt32 := do
   step s!"transpiling Lean → JavaScript → {outDir}/"
   if !(← buildJs outDir prod) then IO.eprintln (red "✗ build failed"); return 1
   let (_, sz) ← shOut "bash" #["-c", s!"cat {outDir}/*.mjs | gzip -c | wc -c"]
-  IO.println (green s!"✓ build complete → {outDir} (no WASM) — {sz.trimmed} bytes gzipped")
+  IO.println (green s!"✓ build complete → {outDir} (no WASM), {sz.trimmed} bytes gzipped")
   return 0
 
 def serveDir (dir : FilePath) : IO UInt32 := do
@@ -285,7 +285,7 @@ def serveDir (dir : FilePath) : IO UInt32 := do
 
 def cmdStart : IO UInt32 := do
   if !(← (distDir / "app.mjs").pathExists) then
-    IO.eprintln (red "no production build found — run `qed build` first"); return 1
+    IO.eprintln (red "no production build found, run `qed build` first"); return 1
   serveDir distDir
 
 def cmdTest : IO UInt32 := do
@@ -315,7 +315,7 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "users_test.mjs").pathExists) then
     step "running routing/http/events tests (users)"
     if (← sh "node" #["test/users_test.mjs"]) != 0 then failed := true
-  -- Local: keyed local-state components — sibling isolation, caret, bubbling, persist.
+  -- Local: keyed local-state components, sibling isolation, caret, bubbling, persist.
   if (← (FilePath.mk "test" / "local_test.mjs").pathExists) then
     step "running local-state tests (local)"
     if (← sh "node" #["test/local_test.mjs"]) != 0 then failed := true
@@ -323,7 +323,7 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "effects_test.mjs").pathExists) then
     step "running native-effects tests (effects)"
     if (← sh "node" #["test/effects_test.mjs"]) != 0 then failed := true
-  -- Signals: fine-grained reactivity — setSignal updates only the bound node, no re-render.
+  -- Signals: fine-grained reactivity, setSignal updates only the bound node, no re-render.
   if (← (FilePath.mk "test" / "signals_test.mjs").pathExists) then
     step "running signals tests (signals)"
     if (← sh "node" #["test/signals_test.mjs"]) != 0 then failed := true
@@ -343,7 +343,7 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "ssr_template_test.mjs").pathExists) then
     step "running template-hydration tests"
     if (← sh "node" #["test/ssr_template_test.mjs"]) != 0 then failed := true
-  -- Bookshelf: the full stack in one app — routing + Resource (list+detail) + form POST + styles.
+  -- Bookshelf: the full stack in one app, routing + Resource (list+detail) + form POST + styles.
   if (← (FilePath.mk "test" / "bookshelf_test.mjs").pathExists) then
     step "running end-to-end app tests (bookshelf)"
     if (← sh "node" #["test/bookshelf_test.mjs"]) != 0 then failed := true
@@ -363,12 +363,12 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "live_test.mjs").pathExists) then
     step "running end-to-end live-handler tests (live)"
     if (← sh "node" #["test/live_test.mjs"]) != 0 then failed := true
-  -- JS transpiler — the differential gate: transpiled-from-Lean functions must be
+  -- JS transpiler, the differential gate: transpiled-from-Lean functions must be
   -- byte-identical to native Lean (render, diff, JSON, Date, strings, closures…).
   if (← (FilePath.mk "test" / "js_gate_test.mjs").pathExists) then
     step "running differential gate (transpiled JS == native Lean)"
     if (← sh "node" #["test/js_gate_test.mjs"]) != 0 then failed := true
-  -- JS transpiler — the FULL transpiled driver (no WASM): build, then drive it in a browser.
+  -- JS transpiler, the FULL transpiled driver (no WASM): build, then drive it in a browser.
   if (← (FilePath.mk "test" / "js_driver_browser_test.mjs").pathExists) then
     step "building JS bundle + running transpiled-driver browser test"
     if !(← buildJs devDir (prod := false)) then failed := true
@@ -393,13 +393,13 @@ partial def watchLoop (marker : FilePath) : IO Unit := do
   let (_, out) ← shOut "bash" #["-c", find]
   if out.trimmed != "" then
     let _ ← sh "touch" #[marker.toString]
-    step "change detected — rebuilding"
+    step "change detected, rebuilding"
     if (← buildJs devDir (prod := false)) then
       writeBuildId devDir
       let _ ← effectsCovered   -- warn (non-fatal) if a new effect lacks a qed_host.mjs case
       IO.println (green "✓ reloaded")
     else
-      IO.eprintln (red "✗ build failed — fix and save again")
+      IO.eprintln (red "✗ build failed, fix and save again")
   watchLoop marker
 
 def cmdDev : IO UInt32 := do
@@ -408,7 +408,7 @@ def cmdDev : IO UInt32 := do
   let _ ← sh "touch" #[marker.toString]
   step "initial build"
   unless (← buildJs devDir (prod := false)) do
-    IO.eprintln (red "initial build failed — fix the error and save; dev will rebuild")
+    IO.eprintln (red "initial build failed, fix the error and save; dev will rebuild")
   writeBuildId devDir
   let _server ← IO.Process.spawn
     { cmd := "python3", args := #["-m", "http.server", devPort, "--directory", devDir.toString],
@@ -448,10 +448,10 @@ def cmdNew (dir : String) : IO UInt32 := do
     "  | .reset     => { m with count := 0 }\n\n" ++
     "def app : App Model Msg := ui init update fun m =>\n" ++
     "  div [cls \"counter\"] [\n" ++
-    "    button [onClick .decrement] [text \"−\"],\n" ++
-    "    span   [cls \"count\"]        [text (toString m.count)],\n" ++
-    "    button [onClick .increment] [text \"+\"],\n" ++
-    "    button [onClick .reset]     [text \"reset\"] ]\n\n" ++
+    "    button [onClick .decrement] \"−\",\n" ++
+    "    span   [cls \"count\"]        [m.count],\n" ++
+    "    button [onClick .increment] \"+\",\n" ++
+    "    button [onClick .reset]     \"reset\" ]\n\n" ++
     "invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update\n"
   IO.FS.writeFile (root / "Web.lean") <|
     "import App\nimport Qed.Driver\n\ndef main : IO Unit := Qed.run app\n"
@@ -460,7 +460,7 @@ def cmdNew (dir : String) : IO UInt32 := do
   return 0
 
 def usage : IO UInt32 := do
-  IO.println "qed — a verified web frontend toolchain\n"
+  IO.println "qed, a verified web frontend toolchain\n"
   IO.println "Usage: qed <command>\n"
   IO.println "  dev            watch + rebuild + serve with live-reload"
   IO.println "  build          production build → dist/ (optimized, verified)"

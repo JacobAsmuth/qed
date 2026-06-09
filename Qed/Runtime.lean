@@ -1,9 +1,9 @@
 /-
-  Qed.Runtime — The Elm Architecture core (pure, no FFI).
+  Qed.Runtime: The Elm Architecture core (pure, no FFI).
 
   An `App` is three pure, total pieces. Because they are ordinary Lean functions
-  they are total by elaboration — no panics, no missed cases, no infinite render
-  loops — and they are exactly the surface a developer reasons (and proves) about.
+  they are total by elaboration, no panics, no missed cases, no infinite render
+  loops, and they are exactly the surface a developer reasons (and proves) about.
 
   Rendering is *also* pure: `renderNode` turns a typed `Html` into an HTML string
   plus a table mapping event-ids to messages. Nothing here touches the DOM, so
@@ -43,7 +43,7 @@ inductive Cmd (msg : Type) where
   | batch (cmds : List (Cmd msg))
   /-- Send `payload` to the JS port handler named `name` (`globalThis.__qed.ports[name]`).
       The userland escape hatch: an app wires any browser API (WebSocket, IndexedDB,
-      …) in its own JS, and the pure core talks to it over `(name, payload)` strings —
+      …) in its own JS, and the pure core talks to it over `(name, payload)` strings,
       so a new effect never means patching the framework. Inbound goes through
       `App.onPort`. See also `Cmd.port`'s typed cousins below. -/
   | port (name payload : String)
@@ -59,7 +59,7 @@ inductive Cmd (msg : Type) where
   /-- Open a WebSocket to `url`, addressed by `key` (so later `wsSend`/`wsClose` find
       it). Its lifecycle dispatches messages: `onMessage data` for each frame, and the
       optional `onOpen`/`onClose`/`onError data`. Like `stream`, the callbacks are
-      persistent — they fire for the life of the connection, not once. A `url` beginning
+      persistent: they fire for the life of the connection, not once. A `url` beginning
       with `/` is resolved against the page origin (`ws://`/`wss://` to match the scheme).
       Use `Cmd.wsOpen`/`Cmd.wsSend`/`Cmd.wsClose` below rather than this constructor. -/
   | socket (key url : String) (onMessage : String → msg)
@@ -115,7 +115,7 @@ def Cmd.getJson [FromJson α] (url : String) (onOk : α → msg) (onErr : String
 def Cmd.postJson [FromJson α] (url body : String) (onOk : α → msg) (onErr : String → msg) : Cmd msg :=
   .request "POST" url body (httpDecode onOk onErr)
 
-/-! ### Native effects — typed wrappers over `fx`/`fxResult`
+/-! ### Native effects: typed wrappers over `fx`/`fxResult`
 
 Common browser effects as ordinary `Cmd`s an app returns from `update`/`effects`. Each
 is a one-line smart constructor over the generic carrier, so the core grows API, not
@@ -148,7 +148,7 @@ def Cmd.scrollIntoView (elementId : String) : Cmd msg := .fx "dom.scrollIntoView
 def Cmd.after (ms : Nat) (onTick : msg) : Cmd msg := .fxResult "timer.after" (toString ms) "" fun _ => onTick
 
 /-- A timer identified by `key`: scheduling a new one cancels the pending one with the
-    same key, and `Cmd.cancel key` drops it. Debounce is one line — schedule
+    same key, and `Cmd.cancel key` drops it. Debounce is one line, schedule
     `afterKeyed "search" 300 …` on every keystroke and only the last survives. -/
 def Cmd.afterKeyed (key : String) (ms : Nat) (onTick : msg) : Cmd msg :=
   .fxResult "timer.afterKeyed" key (toString ms) fun _ => onTick
@@ -159,7 +159,7 @@ def Cmd.cancel (key : String) : Cmd msg := .fx "timer.cancel" key "" ""
 /-! **Document title.** -/
 def Cmd.setTitle (title : String) : Cmd msg := .fx "document.title" title "" ""
 
-/-! **Randomness** — `update` is pure, so a random draw must come from an effect.
+/-! **Randomness.** `update` is pure, so a random draw must come from an effect.
     Dispatches a uniform integer in `[lo, hi]`. -/
 def Cmd.randomInt (lo hi : Int) (onInt : Int → msg) : Cmd msg :=
   .fxResult "random.int" (toString lo) (toString hi) fun s => onInt ((s.toInt?).getD lo)
@@ -203,7 +203,7 @@ def FilePick.decode (s : String) (maxDepth : Nat := 64) : Except String FilePick
   (Json.parse s maxDepth).bind fromJson
 
 /-- Open the file picker (filtered by `accept`, e.g. `".json,text/*"`) and dispatch the
-    chosen file decoded as a `FilePick` — or `.error` if it was cancelled or unreadable. -/
+    chosen file decoded as a `FilePick`, or `.error` if it was cancelled or unreadable. -/
 def Cmd.pickFile (accept : String) (onFile : Except String FilePick → msg) : Cmd msg :=
   .fxResult "file.pick" accept "" fun s => onFile (FilePick.decode s)
 
@@ -214,11 +214,11 @@ def dispatchPorts (handlers : Array (String × (String → Option msg))) (name p
   | some h => h.2 payload
   | none   => none
 
-/-! ### The `ports` command — typed userland effects, no strings or codecs by hand
+/-! ### The `ports` command: typed userland effects, no strings or codecs by hand
 
 `ports where …` declares typed message channels between the pure app and its own JS. A
-channel with **no** `=>` is *outbound* — it generates a `Cmd` constructor that serializes
-its payload. One **with** `=> ctor` is *inbound* — its payload is decoded and mapped to a
+channel with **no** `=>` is *outbound*: it generates a `Cmd` constructor that serializes
+its payload. One **with** `=> ctor` is *inbound*: its payload is decoded and mapped to a
 message, and all the inbound channels are assembled into a generated `onPort`:
 
     ports where
@@ -229,7 +229,7 @@ message, and all the inbound channels are assembled into a generated `onPort`:
 
 The JS registers handlers on `globalThis.__qed.ports[name]` and pushes inbound with
 `globalThis.__qed.send(name, payload)`. Payload types need `ToJson` (outbound) /
-`FromJson` (inbound) — a `schema` gives both. -/
+`FromJson` (inbound), a `schema` gives both. -/
 syntax portChan := ident " : " term (" => " term)?
 syntax (name := portsCmd) "ports " "where " sepBy1IndentSemicolon(portChan) : command
 
@@ -263,8 +263,8 @@ macro_rules
 
 A *local* component owns state the parent never declares: the driver keeps it in a
 keyed store, addressed by an explicit key (not React's fragile call-order). To stay
-off the verified virtual DOM — so `Html.map`/`diff` never recurse into it and remain
-total — a local component's typed `view`/`update` are erased here behind a string
+off the verified virtual DOM, so `Html.map`/`diff` never recurse into it and remain
+total, a local component's typed `view`/`update` are erased here behind a string
 boundary. The child's **state** is serialized (`ToJson`/`FromJson`); its **message**
 type stays internal (wired by the driver), so it needs no codec. A child may emit a
 typed **output** that the host's `bubble` maps to a parent message (`localMountWith`),
@@ -299,7 +299,7 @@ structure App (Model : Type) (Msg : Type) where
   /-- The view as a fine-grained template: built once, then only the bindings whose projection
       changed are patched. The `ui` builder lifts an ordinary `fun m => …` view into this. -/
   template : View Model Msg
-  /-- If set, the message to fire when the browser URL changes (the new path is the argument) —
+  /-- If set, the message to fire when the browser URL changes (the new path is the argument),
       at startup, on `link` clicks, on back/forward, and after `Cmd.pushUrl`. The routed `ui`
       builder sets it from a typed `onRoute : R → Msg`. -/
   onUrlChange : Option (String → Msg) := none
@@ -310,7 +310,7 @@ structure App (Model : Type) (Msg : Type) where
       it into a message (or `none` to ignore). The subscription side of `Cmd.port`. -/
   onPort : Option (String → String → Option Msg) := none
   /-- Serialize the model into the server-rendered page (SSR), so the client starts from the
-      *same* model the server drew instead of re-deriving and refetching — no flash, no reload of
+      *same* model the server drew instead of re-deriving and refetching, no flash, no reload of
       data already on the page. Default `""` means "don't dehydrate" (the client starts from `init`
       / the URL). Pair with `rehydrate`; an app whose `Model` has `ToJson`/`FromJson` can use
       `Json.render ∘ toJson`. -/
@@ -326,21 +326,17 @@ def App.view (app : App Model Msg) (m : Model) : Html Msg := View.render app.tem
 
 /-! ### Transitions
 
-`update` returns the next model, optionally with an effect. A pure app's arms are ordinary
-`{ m with … }` (it returns `Model`); an effectful app's arms pair the model with a `Cmd` using
-the two helpers — so the effect sits next to the state change that triggers it:
+`update` returns the next model, optionally with an effect. A pure app's `update` returns
+`Model` and its arms are ordinary `{ m with … }`. An effectful app writes its arms with
+`steps` (see `Qed.Steps`): a bare model is an effect-free arm, and a `(model, cmd)` pair
+puts the effect next to the state change that requests it, with no wrapper to remember:
 
-    transition m
-      | .typed s => still { m with draft := s }
-      | .send    => also { m with pending := true } (Cmd.stream url body .chunk .done)
+    def update (m : Model) : Msg → Model × Cmd Msg := steps
+      | .typed s => { m with draft := s }
+      | .send    => ({ m with pending := true }, Cmd.stream url body .chunk .done)
 
 The `ToStep` class lets the one builder (`ui`) accept *either* return type, so there is no
-pure-vs-effectful builder choice. -/
-
-/-- A transition arm with no effect. -/
-def still (m : Model) : Model × Cmd Msg := (m, .none)
-/-- A transition arm that also runs `cmd` after the update. -/
-def also (m : Model) (cmd : Cmd Msg) : Model × Cmd Msg := (m, cmd)
+pure-vs-effectful builder choice; `steps` applies the same normalisation arm by arm. -/
 
 /-- A transition result the builder can normalise to `(model, cmd)`: either a bare next `Model`
     (no effect) or an explicit `Model × Cmd Msg`. The two instances never overlap (`Model` vs
@@ -350,9 +346,17 @@ class ToStep (Model : Type) (Msg : Type) (α : Type) where
 instance : ToStep Model Msg Model := ⟨fun m => (m, .none)⟩
 instance : ToStep Model Msg (Model × Cmd Msg) := ⟨id⟩
 
+/-- An effect-free arm normalises to `(m, Cmd.none)`. (The unfolding the `invariant`
+    discharger uses to read the model out of a `steps` arm.) -/
+@[simp] theorem ToStep.toStep_model (m : Model) :
+    (ToStep.toStep m : Model × Cmd Msg) = (m, .none) := rfl
+/-- An explicit `(model, cmd)` arm is already a step. -/
+@[simp] theorem ToStep.toStep_pair (p : Model × Cmd Msg) :
+    (ToStep.toStep p : Model × Cmd Msg) = p := rfl
+
 /-- Construct an `App` from `init`, an `update` (returning `Model` or `Model × Cmd Msg` via
     `ToStep`), and a `View` template. The `ui` builder is the front door; call this directly only
-    to pass a pre-built template — a reused `view%` fragment, or `View.ofHtml` over an `Html`
+    to pass a pre-built template, a reused `view%` fragment, or `View.ofHtml` over an `Html`
     view. -/
 def mkApp [ToStep Model Msg α] (init : Model) (update : Model → Msg → α)
     (template : View Model Msg) (start : Cmd Msg := .none) (locals : List LocalDef := [])
@@ -370,11 +374,11 @@ def mkRoutedApp {R : Type} [Router R] [Inhabited R] [ToStep Model Msg α]
   { mkApp init update template start locals onPort with
     onUrlChange := some (fun p => onRoute ((Router.fromURL p).getD default)) }
 
-/-! ### The `ui` builder — the one way to build an app
+/-! ### The `ui` builder: the one way to build an app
 
 `ui init update fun m => <view>` builds the whole `App`. `update` may return `Model` (pure) or
-`Model × Cmd Msg` (effectful, via `still`/`also`). The view is written inline and lifted to a
-fine-grained template — no `view%` by hand. Capabilities are optional args, in any order, before
+`Model × Cmd Msg` (effectful, written with `steps`). The view is written inline and lifted to a
+fine-grained template, no `view%` by hand. Capabilities are optional args, in any order, before
 the `fun`:
 
     ui init update fun m => …                                   -- pure
@@ -418,7 +422,7 @@ macro_rules
             `(Qed.mkApp $init $update $tmpl (start := $startE) (locals := $localsE) (onPort := $portE))
       -- `queries` (auto-refetch) wraps the finished app's update; absent ⇒ the app unchanged.
       -- `withQueries` lives in `Qed.Resource` (imported by app modules, not by this one), so emit
-      -- it with `mkIdent` — a bare quotation would pre-resolve `Qed.App.` as a struct projection
+      -- it with `mkIdent`, a bare quotation would pre-resolve `Qed.App.` as a struct projection
       -- here (where `App` exists but the method does not yet) and never find the real constant.
       match queriesE? with
       | some qs => `($(mkIdent `Qed.App.withQueries) $qs $base)
@@ -426,7 +430,7 @@ macro_rules
 /-- Register a local component with an output it can bubble to its parent. `update`
     returns the next state and an optional output; the output is serialized and handed
     to the host's `bubble` (see `localMountWith`). The message type `M` needs no codec
-    — only the state `S` (round-tripped through the store) and the output `O`. -/
+   , only the state `S` (round-tripped through the store) and the output `O`. -/
 def LocalDef.of {S M O : Type} [ToJson S] [FromJson S] [ToJson O]
     (id : String) (init : S)
     (view : S → Html M) (update : S → M → S × Option O) : LocalDef :=
@@ -456,7 +460,7 @@ def localMount (component key : String) : Attr msg :=
   .localCell key component none (fun _ => none)
 
 /-- Mount a registered local component at instance `key`, mapping its serialized
-    output through `onOut` to an optional parent message — the type-safe way a child
+    output through `onOut` to an optional parent message, the type-safe way a child
     event reaches the root `update`. -/
 def localMountWith {O msg : Type} [FromJson O] (component key : String)
     (onOut : O → Option msg) : Attr msg :=
@@ -464,7 +468,7 @@ def localMountWith {O msg : Type} [FromJson O] (component key : String)
     (((Json.parse s).bind FromJson.fromJson : Except String O)).toOption.bind onOut
 
 /-- Seed THIS instance's initial state from parent data, overriding the component's
-    registered default — React's `useState(propValue)`. Compose onto a `localMount`/
+    registered default, React's `useState(propValue)`. Compose onto a `localMount`/
     `localMountWith`: `(localMountWith "editor" k onSave).localInit { text := r.text }`.
     It only applies the first time the key is mounted; a later re-render keeps whatever
     the user has since typed (the live state wins, exactly like a `useState` seed). -/
@@ -481,8 +485,8 @@ def Attr.localInit {msg S : Type} [ToJson S] (a : Attr msg) (init : S) : Attr ms
 
 /-- Render a node to a string, filling each local host with its component's *initial*
     view (looked up in `locals`), so native/server-side output isn't blank where a
-    local component will mount. Best-effort and `partial` — a local view is arbitrary
-    and may nest — unlike the total `Html.render`. The browser driver rebuilds local
+    local component will mount. Best-effort and `partial`, a local view is arbitrary
+    and may nest, unlike the total `Html.render`. The browser driver rebuilds local
     subtrees on mount (a full `replaceChildren`), so this output never has to round-trip
     or hydrate; it is for first paint and no-JS rendering. -/
 partial def renderWithLocals {m : Type} (locals : List LocalDef) : Html m → String
@@ -506,18 +510,18 @@ def Html.renderWith (locals : List LocalDef) (h : Html msg) : String := renderWi
 /-! ### Server-side rendering
 
 Render the app once on the server with the *same* verified `view`/`render` the browser uses,
-emit that HTML into `#app`, and the client mounts over it — so first paint is the real content,
+emit that HTML into `#app`, and the client mounts over it, so first paint is the real content,
 not a spinner, and search engines see the page. Because both sides are the one `view`/`render`,
 the server and client output are the same function of the model, not two implementations that
-can drift. (The current client mount replaces the server markup — a brief swap; flash-free
+can drift. (The current client mount replaces the server markup, a brief swap; flash-free
 adopt-in-place hydration is a later refinement, see README.) -/
 
-/-- The app's view at an arbitrary model as an HTML string — the per-request SSR primitive:
+/-- The app's view at an arbitrary model as an HTML string, the per-request SSR primitive:
     a server computes the model for the request (route, fetched data) and renders it. -/
 def App.renderModel (app : App Model Msg) (m : Model) : String :=
   Html.renderWith app.locals (app.view m)
 
-/-- The app's initial view as an HTML string — its `view` at the initial model, with local
+/-- The app's initial view as an HTML string, its `view` at the initial model, with local
     hosts filled by their initial view. This is what a server emits into `#app`. -/
 def App.renderInitial (app : App Model Msg) : String :=
   app.renderModel app.init.1
@@ -526,7 +530,7 @@ def App.renderInitial (app : App Model Msg) : String :=
     bundle, which mounts the live app over the pre-rendered markup. A non-empty `state`
     (an app's `dehydrate model`) is embedded in a `#qed-state` script so the client starts
     from the server's model instead of refetching; `</` is broken so the JSON can't close the
-    script early (it stays valid JSON — `\/` is `/`). -/
+    script early (it stays valid JSON, `\/` is `/`). -/
 def renderDocument (title : String) (appHtml : String) (script : String := "/qed.js")
     (state : String := "") : String :=
   "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"

@@ -5,7 +5,7 @@
   `Account` (each refined field a proof-carrying `Field`), `Account.parse`, the
   `canSubmit` gate + its `canSubmit_iff` proof, and `Account.formView` (the widgets). The app
   holds a draft, replaces it on every edit, and on submit stores the parsed
-  `Option Account` — which is `some` only when every field validates. The submit
+  `Option Account`, which is `some` only when every field validates. The submit
   button `formView` renders is disabled unless the draft parses, so it cannot fire
   on invalid data.
 -/
@@ -42,7 +42,7 @@ def app : App Model Msg :=
       h1 [] ["Create account"],
       Account.formView m.draft .edit .submit,
       match m.submitted with
-      | some acc => p [cls "ok"] ["Created account for ", acc.email.val]
+      | some acc => p [cls "ok"] ["Created account for ", text acc.email]
       | none     => .text ""
     ]
 

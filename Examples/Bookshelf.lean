@@ -1,12 +1,12 @@
 /-
-  Bookshelf — a small catalog that wires the whole stack into one app: routing, a
+  Bookshelf: a small catalog that wires the whole stack into one app: routing, a
   typed remote `Resource` (a list and a single record, fetched and decoded), a
   validated `schema` whose form POSTs and navigates to the result, and scoped styles.
 
   Three pages, behind the verified router (`R.round_trip`):
 
-    /              the catalog — fetches `/api/books` into `Resource (Array Book)`
-    /books/<id>    one book — fetches `/api/books/<id>` into `Resource Book`
+    /              the catalog, fetches `/api/books` into `Resource (Array Book)`
+    /books/<id>    one book, fetches `/api/books/<id>` into `Resource Book`
     /new           the `schema`-generated form (text/number/select/checkbox, each refined)
                    that, on a valid submit, POSTs the book and routes to its new detail page
 
@@ -32,7 +32,7 @@ abbrev Year (n : Nat) : Prop := 1 ≤ n ∧ n ≤ 2026
 
 -- One book, declared once. `schema` generates the editable draft + validated `Book` (each
 -- refined field a proof-carrying `Field`), `parse`, the `canSubmit` gate + its proof, the
--- `formView` widgets, and the JSON codec — decode for the GET responses, encode for the POST
+-- `formView` widgets, and the JSON codec, decode for the GET responses, encode for the POST
 -- body. The refinements guard *both* directions, so an out-of-range API record is rejected at
 -- decode exactly as the form rejects it at submit. `id` is server-assigned: it rides the JSON
 -- but never appears in the form.
@@ -61,42 +61,43 @@ inductive Msg where
   | submit
   | created    (r : Resource Book)        -- the POST resolved (ok with the new book, or failed)
 
--- One combined transition. A page that needs data flips its `Resource` to `.loading` and
+-- One combined transition, written with `steps`: an arm is the next model, or
+-- `(next model, effect)`. A page that needs data flips its `Resource` to `.loading` and
 -- fires the fetch in the same arm that sets the route.
-def transition (m : Model) : Msg → Model × Cmd Msg
+def transition (m : Model) : Msg → Model × Cmd Msg := steps
   | .routed route =>
       match route with
-      | .catalog   => also { m with route := .catalog, catalog := .loading }
-                          (Resource.fetch "/api/books" Msg.gotCatalog)
+      | .catalog   => ({ m with route := .catalog, catalog := .loading },
+                       Resource.fetch "/api/books" Msg.gotCatalog)
       | .detail id =>
           -- keep a book we already hold (e.g. one we just created), else fetch it
           match m.current with
-          | .ok b => if b.id == id then still { m with route := .detail id }
-                     else also { m with route := .detail id, current := .loading }
-                              (Resource.fetch s!"/api/books/{id}" Msg.gotBook)
-          | _     => also { m with route := .detail id, current := .loading }
-                         (Resource.fetch s!"/api/books/{id}" Msg.gotBook)
-      | .newBook   => still { m with route := .newBook }
-  | .gotCatalog r => still { m with catalog := r }
-  | .gotBook r    => still { m with current := r }
-  | .edit d       => still { m with draft := d }
+          | .ok b => if b.id == id then { m with route := .detail id }
+                     else ({ m with route := .detail id, current := .loading },
+                           Resource.fetch s!"/api/books/{id}" Msg.gotBook)
+          | _     => ({ m with route := .detail id, current := .loading },
+                      Resource.fetch s!"/api/books/{id}" Msg.gotBook)
+      | .newBook   => { m with route := .newBook }
+  | .gotCatalog r => { m with catalog := r }
+  | .gotBook r    => { m with current := r }
+  | .edit d       => { m with draft := d }
   | .submit       =>
       -- `Book.parse` yields a valid book (empty id; the server assigns one) only when every
-      -- refined field passes, so the POST body is `Book.encode` of that — no separate bridge.
+      -- refined field passes, so the POST body is `Book.encode` of that, no separate bridge.
       match Book.parse m.draft with
-      | some book => also m (Cmd.postJson "/api/books" (Book.encode book)
-                            (fun b => Msg.created (.ok b)) (fun e => Msg.created (.failed e)))
-      | none    => still m
+      | some book => (m, Cmd.postJson "/api/books" (Book.encode book)
+                         (fun b => Msg.created (.ok b)) (fun e => Msg.created (.failed e)))
+      | none    => m
   | .created r    =>
       match r with
-      | .ok b     => also { m with current := .ok b, draft := Book.Draft.empty }
-                         (Cmd.pushUrl (Router.toURL (R.detail b.id)))
-      | .failed e => still { m with current := .failed e }
-      | _         => still m
+      | .ok b     => ({ m with current := .ok b, draft := Book.Draft.empty },
+                      Cmd.pushUrl (Router.toURL (R.detail b.id)))
+      | .failed e => { m with current := .failed e }
+      | _         => m
 
 /-! Scoped styles, co-located with the view. Each class name is a content hash; the typed
-    property helpers (`maxWidth`, `display`, `color`, …) make a misspelled property — not just a
-    misspelled reference — a compile error. Raw strings coerce in for compound values, `screenMax`
+    property helpers (`maxWidth`, `display`, `color`, …) make a misspelled property, not just a
+    misspelled reference, a compile error. Raw strings coerce in for compound values, `screenMax`
     is a responsive block, and `brand` is a design token set once in `theme`. -/
 def brand : Token := token "brand"
 def shell : Style := css [
@@ -112,21 +113,21 @@ def card : Style := css [
 def bookList (books : Array Book) : Html Msg :=
   ul [cls "books"] (books.toList.map fun b =>
     li [key b.id] [
-      link (Router.toURL (R.detail b.id)) [navlink, cls "book-link"] [text b.title.val],
-      span [cls "byline"] [text s!" — {b.author.val}"]
+      link (Router.toURL (R.detail b.id)) [navlink, cls "book-link"] [text b.title],
+      span [cls "byline"] [text s!" by {b.author}"]
     ])
 
 def bookCard (b : Book) : Html Msg :=
   div [card, cls "book"] [
-    h1 [] [text b.title.val],
-    p [cls "author"] [text s!"by {b.author.val} ({b.year.val})"],
-    p [cls "genre"] [text b.genre],
+    h1 [] [text b.title],
+    p [cls "author"] [text s!"by {b.author} ({b.year})"],
+    p [cls "genre"] [b.genre],
     p [cls (if b.inPrint then "in-print" else "out-of-print")]
       [text (if b.inPrint then "In print" else "Out of print")]
   ]
 
 /-- Serialize the route + fetched data into the page, so a deep-linked SSR load starts the
-    client from the same model the server drew — no flash, no refetch. The route rides the URL
+    client from the same model the server drew, no flash, no refetch. The route rides the URL
     codec; the catalog/current `Resource`s use their JSON instances; the form draft is left to
     `init` (it's empty on load). -/
 def dehydrateModel (m : Model) : String :=

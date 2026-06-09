@@ -1,5 +1,5 @@
 /-
-  A streaming LLM chat — the whole app is this pure Lean.
+  A streaming LLM chat: the whole app is this pure Lean.
 
   `update` is total and pure (`Model → Msg → Model`). Effects live in a separate
   `effects` function: `send` maps to a `Cmd.stream` that the driver runs as a
@@ -50,22 +50,22 @@ def reqBody (turns : Array Turn) : String :=
 def appendLast (turns : Array Turn) (d : String) : Array Turn :=
   turns.modify (turns.size - 1) fun t => { t with text := t.text ++ d }
 
-/-- One combined `transition`: each arm returns the next model (`still`) or the next model
-    plus the effect it triggers (`also`). `send` builds the conversation, appends the empty
-    assistant turn to stream into, and starts the streaming POST — all in one place, with no
-    separate `effects` function and no reconstructing what an `update` already did. -/
-def transition (m : Model) : Msg → Model × Cmd Msg
-  | .typed s   => still { m with draft := s }
+/-- One combined `transition`, written with `steps`: each arm returns the next model, or
+    `(next model, effect)`. `send` builds the conversation, appends the empty assistant turn
+    to stream into, and starts the streaming POST in the same arm, with no separate
+    `effects` function and no reconstructing what an `update` already did. -/
+def transition (m : Model) : Msg → Model × Cmd Msg := steps
+  | .typed s   => { m with draft := s }
   | .send      =>
       let draft := m.draft.trimmed
-      if draft.isEmpty then still m else
+      if draft.isEmpty then m else
       let convo := m.turns.push { user? := true, text := draft }
-      also { turns   := convo.push { user? := false, text := "" }
-             draft   := ""
-             pending := true }
-           (.stream "/v1/chat/completions" (reqBody convo) .chunk .done)
-  | .chunk raw => still { m with turns := appendLast m.turns (deltaOf raw) }
-  | .done      => still { m with pending := false }
+      ({ turns   := convo.push { user? := false, text := "" }
+         draft   := ""
+         pending := true },
+       .stream "/v1/chat/completions" (reqBody convo) .chunk .done)
+  | .chunk raw => { m with turns := appendLast m.turns (deltaOf raw) }
+  | .done      => { m with pending := false }
 
 -- A safety property of the *effectful* transition: a reply only ever streams into a
 -- turn that already exists, so `appendLast` (which writes the conversation's last turn)
@@ -78,7 +78,7 @@ invariant streamSafe : (fun m => m.pending = true → 0 < m.turns.size)
     preserved_by transition := by
   intro m msg h
   cases msg <;>
-    simp_all only [transition, appendLast, still, also,
+    simp_all only [transition, appendLast, ToStep.toStep_model, ToStep.toStep_pair,
                    InvTarget.proj_fst, Array.size_modify] <;>
     (try split) <;>
     simp_all [Array.size_push] <;>

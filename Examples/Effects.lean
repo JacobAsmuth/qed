@@ -1,15 +1,15 @@
 /-
-  Native effects — a tour of the typed `Cmd`s Qed ships, the typed `ports` escape
+  Native effects: a tour of the typed `Cmd`s Qed ships, the typed `ports` escape
   hatch, keyed-timer debounce, and a startup effect.
 
   `update` stays pure and total; every side effect is described as data in `effects`:
 
-  * **localStorage** — the count is persisted on change and hydrated at *startup*
+  * **localStorage**: the count is persisted on change and hydrated at *startup*
     (the `start` effect), so it survives a refresh.
   * **document.title**, **randomness**, **focus**, **file pick**, and **batch**.
-  * **debounce** — typing in the search box schedules `afterKeyed "search"`, so only the
+  * **debounce**: typing in the search box schedules `afterKeyed "search"`, so only the
     last keystroke's timer survives.
-  * **ports** — the `ports` command declares typed channels; "Ping" sends one to a
+  * **ports**: the `ports` command declares typed channels; "Ping" sends one to a
     userland JS handler that echoes back, decoded straight into a message. No string
     juggling, and no effect here needed a new framework constructor.
 
@@ -88,7 +88,7 @@ def app : App Model Msg :=
     div [cls "app"] [
       div [cls "counter"] [
         button [cls "dec", onClick .dec] "−",
-        span   [cls "count", attr "id" "count"] [text (toString m.count)],
+        span   [cls "count", attr "id" "count"] [m.count],
         button [cls "inc", onClick .inc] "+"
       ],
       input  [attr "id" "title-input", cls "title", value m.title, onInput .editTitle, placeholder "page title"],
@@ -100,8 +100,8 @@ def app : App Model Msg :=
       button [cls "focus",  onClick .focusTitle] "Focus title",
       button [cls "save",   onClick .saveBatch]  "Save (batch)",
       input  [cls "search", value m.query, onInput .typeSearch, placeholder "debounced search"],
-      span   [cls "searches", attr "id" "searches"] [text (toString m.searches)],
-      div [cls "status", attr "id" "status"] [text m.status]
+      span   [cls "searches", attr "id" "searches"] [m.searches],
+      div [cls "status", attr "id" "status"] [m.status]
     ]
 
 end Effects

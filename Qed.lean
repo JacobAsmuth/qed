@@ -1,5 +1,5 @@
 /-
-  Qed — a formally-verified web frontend framework in Lean 4.
+  Qed: a formally-verified web frontend framework in Lean 4.
 
   Importing `Qed` brings the whole framework into scope: the typed virtual DOM,
   the readable view notation, The-Elm-Architecture runtime, and the automatic
@@ -9,6 +9,7 @@ import Qed.Html
 import Qed.Notation
 import Qed.Render
 import Qed.Runtime
+import Qed.Steps
 import Qed.Diff
 import Qed.Invariant
 import Qed.Json

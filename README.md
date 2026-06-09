@@ -48,7 +48,7 @@ def update (m : Model) : Msg → Model
 def app : App Model Msg := ui init update fun m =>
   div [cls "counter"] [
     button [onClick .decrement] "−",
-    span   [cls "count"]        [text (toString m.count)],
+    span   [cls "count"]        [m.count],
     button [onClick .increment] "+",
     button [onClick .reset]     "reset"
   ]
@@ -161,17 +161,17 @@ def app : App Model Msg :=
 
 ### Effects
 
-Side effects are data, which keeps `update` pure and provable. An arm returns the next model with
-`still`, or the model plus a `Cmd` to run with `also`, and the driver performs it. Here's a chat that
-streams an LLM's reply token by token, with no `fetch` in it. `Cmd.stream` feeds each token back as a
-`.chunk` message, so a streaming reply is, to `update`, just more messages arriving.
+Side effects are data, which keeps `update` pure and provable. Write the transition with `steps`:
+an arm returns the next model, or a `(model, cmd)` pair, and the driver performs the `Cmd`. Here's
+a chat that streams an LLM's reply token by token, with no `fetch` in it. `Cmd.stream` feeds each
+token back as a `.chunk` message, so a streaming reply is, to `update`, just more messages arriving.
 
 ```lean
-def transition (m : Model) : Msg → Model × Cmd Msg
-  | .typed s   => still { m with draft := s }
-  | .send      => also (pushTurn m) (.stream "/v1/chat/completions" (reqBody m.turns.pop) .chunk .done)
-  | .chunk raw => still { m with turns := appendLast m.turns (deltaOf raw) }
-  | .done      => still { m with pending := false }
+def transition (m : Model) : Msg → Model × Cmd Msg := steps
+  | .typed s   => { m with draft := s }
+  | .send      => (pushTurn m, .stream "/v1/chat/completions" (reqBody m.turns.pop) .chunk .done)
+  | .chunk raw => { m with turns := appendLast m.turns (deltaOf raw) }
+  | .done      => { m with pending := false }
 ```
 
 The typed battery covers what you reach for, from `storageGet` and `getJson` to WebSockets and
@@ -294,7 +294,8 @@ Give it a try and state an invariant. Issues welcome at
 | `Qed/Html.lean` | The typed virtual DOM every bit of syntax becomes. |
 | `Qed/Notation.lean` | The view combinators (`div`, `button`, `onClick`, …). |
 | `Qed/View.lean` | The rendering model: `View` (`dyn`/`showIf`/`ifElse`/`forEach`/`dynNode`) and the `view%` lift behind `ui`; built once, then changed bindings patch (`patch_render`/`applyValues_render`). |
-| `Qed/Runtime.lean` | The Elm Architecture: `App`, the `ui` builder (`still`/`also`), the `Cmd` effects + `port`/`onPort`, local components, and server-side render. |
+| `Qed/Runtime.lean` | The Elm Architecture: `App`, the `ui` builder, the `Cmd` effects + `port`/`onPort`, local components, and server-side render. |
+| `Qed/Steps.lean` | The `steps` builder for effectful transitions: arms are bare models or `(model, cmd)` pairs. |
 | `Qed/Diff.lean` | The reconciler the engine uses internally: one children reconcile shared by positional and keyed, `lazy` memoization, and the `diff_apply` proof. |
 | `Qed/Json.lean` | JSON parser/renderer + the `ToJson`/`FromJson` classes, with the `parse_depth_le`/`parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field), the `router` command, `toURL`/`fromURL`. |

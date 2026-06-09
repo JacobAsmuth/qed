@@ -2,7 +2,7 @@
   A URL-routed app: HTTP fetch + decode, the verified router wired to the browser,
   and the form/keyboard/focus events.
 
-  Two pages — a search home and a user profile. The router round-trips URLs *by
+  Two pages, a search home and a user profile. The router round-trips URLs *by
   proof* (`R.round_trip`); navigation goes through `link` / `Cmd.pushUrl`, so it
   never reloads the page. Visiting `/users/<name>` fetches `/api/users/<name>` and
   decodes the JSON with the verified `Qed.Json`. Submitting the search runs through
@@ -43,25 +43,25 @@ inductive Msg where
   | blur
   | key (k : String)
 
--- The username the profile depends on — defined once, used by both the query and the result arm.
+-- The username the profile depends on, defined once, used by both the query and the result arm.
 def userKey (m : Model) : String := match m.route with | .user name => name | _ => ""
 
--- The transition just sets state. The profile is not flipped to `loading` or fetched here — it
+-- The transition just sets state. The profile is not flipped to `loading` or fetched here, it
 -- auto-refetches whenever `userKey` changes (see `profileQuery`). The result arm folds the response
 -- into the cache via `put`, which drops it if the user has already navigated to a different name.
-def transition (m : Model) : Msg → Model × Cmd Msg
-  | .routed route => still { m with route }
-  | .typeQuery s  => still { m with query := s }
-  | .submit       => if m.query.trimmed.isEmpty then still m
-                     else also m (.pushUrl (Router.toURL (R.user m.query.trimmed)))
-  | .gotProfile k r => still { m with profile := m.profile.put k r (userKey m) }
-  | .focus        => still { m with focused := true }
-  | .blur         => still { m with focused := false }
-  | .key k        => still (if k == "Escape" then { m with query := "" } else m)
+def transition (m : Model) : Msg → Model × Cmd Msg := steps
+  | .routed route => { m with route }
+  | .typeQuery s  => { m with query := s }
+  | .submit       => if m.query.trimmed.isEmpty then m
+                     else (m, .pushUrl (Router.toURL (R.user m.query.trimmed)))
+  | .gotProfile k r => { m with profile := m.profile.put k r (userKey m) }
+  | .focus        => { m with focused := true }
+  | .blur         => { m with focused := false }
+  | .key k        => if k == "Escape" then { m with query := "" } else m
 
 -- The profile depends on the route's username. On a change the framework shows the cached value
 -- (revalidating) or `.loading` and refetches `/api/users/<name>`; on a non-user page (empty key) it
--- clears to `.idle`. The initial deep-link fetch fires too — the URL dispatch takes the key "" → name.
+-- clears to `.idle`. The initial deep-link fetch fires too, the URL dispatch takes the key "" → name.
 def profileQuery : Query Model Msg :=
   Resource.query
     (key := userKey)

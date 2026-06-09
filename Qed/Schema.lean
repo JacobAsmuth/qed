@@ -1,19 +1,19 @@
 /-
-  Qed.Schema — one declaration, both directions: an editable form *and* a JSON codec,
+  Qed.Schema: one declaration, both directions: an editable form *and* a JSON codec,
   sharing the same field refinements.
 
   A field is a *typed refinement*: `Field p` (for `p : α → Prop`) is a value of type
   `α` paired with a proof that `p` holds of it. The only way to build one is to pass
-  validation, so a value carrying `Field` fields is *evidence* that they are valid —
+  validation, so a value carrying `Field` fields is *evidence* that they are valid,
   an invalid value is unrepresentable, and a handler that takes one can never run on
   bad data, whether the value came from a form or from a parsed payload.
 
   A field's wire behaviour is a `Codec α`: how to parse the raw DOM string into a
   typed `α`, an optional refinement on that `α`, and how to render the widget. The
   JSON side is the value type's own `ToJson`/`FromJson`. Built-ins span the HTML
-  controls — `Codec.text`, `Codec.nat`/`Codec.int`, `Codec.checkbox` (a `Bool`),
+  controls, `Codec.text`, `Codec.nat`/`Codec.int`, `Codec.checkbox` (a `Bool`),
   `Codec.date` (a verified `Qed.Date`), `Codec.select`/`Codec.radios` (one of a fixed
-  set) — plus `Codec.json T`, a widget-less field for a nested record or a list that
+  set), plus `Codec.json T`, a widget-less field for a nested record or a list that
   rides the JSON only (`author : Codec.json Author`, `tags : Codec.json (List Tag)`).
   Validation is "parse, don't validate": the raw string is parsed to `α` first, then
   refined.
@@ -21,11 +21,11 @@
   The `schema` command reads one declaration and generates, with the field names
   written once: the editable `Draft` (raw strings) + `Draft.empty`, the validated
   structure, `parse : Draft → Option T`, the `canSubmit` gate, the `canSubmit_iff`
-  proof, a widget-aware `formView`, and the JSON codec — `toJson`/`fromJson` plus
+  proof, a widget-aware `formView`, and the JSON codec, `toJson`/`fromJson` plus
   `decode`/`encode` (and, for a type with no context parameters, the `ToJson`/`FromJson`
   instances). A refined field decodes through its refinement in *both* directions, so
   out-of-range payload data is rejected at `decode` exactly as the form rejects it at
-  submit — and that holds however the codec is spelled (a refinement factored into a
+  submit, and that holds however the codec is spelled (a refinement factored into a
   `def` is detected by elaborating the codec, not by reading the syntax).
 
       schema Book where
@@ -47,6 +47,16 @@ namespace Qed
 structure Field {α : Type} (p : α → Prop) where
   val : α
   ok  : p val
+
+/-- A refined field reads as its value in display positions, so a view writes
+    `b.title` where the type wants the underlying `α`; `.val` stays available (and is
+    what proofs use). The proof is only ever *added* by validation, never dropped by
+    accident: this is a one-way coercion out. -/
+instance {α : Type} {p : α → Prop} : CoeOut (Field p) α := ⟨Field.val⟩
+
+/-- Show a refined field as its value, so `s!"by {b.author}"` needs no `.val`. -/
+instance {α : Type} {p : α → Prop} [ToString α] : ToString (Field p) :=
+  ⟨fun f => toString f.val⟩
 
 /-- A field's wire behaviour: parse the raw DOM string into a typed `α`, a (decidable)
     refinement on that value, and how to render the widget. `render` is polymorphic in
@@ -91,7 +101,7 @@ def run (c : Codec α) (raw : String) : Option (Field c.valid) :=
   | none   => none
 
 /-- Running succeeds iff the raw string parses to a value satisfying the refinement
-    — the per-field characterisation behind a schema's `canSubmit_iff`. -/
+   , the per-field characterisation behind a schema's `canSubmit_iff`. -/
 theorem isSome_run (c : Codec α) (raw : String) :
     (c.run raw).isSome = true ↔ ∃ a, c.parse raw = some a ∧ c.valid a := by
   haveI := c.dec
@@ -101,7 +111,7 @@ theorem isSome_run (c : Codec α) (raw : String) :
   | some a => by_cases hv : c.valid a <;> simp [hv]
 
 /-- Decode the value at a JSON key and check the refinement, yielding evidence
-    (`Field c.valid`) exactly when the value decodes *and* passes the spec — the JSON
+    (`Field c.valid`) exactly when the value decodes *and* passes the spec, the JSON
     mirror of `run`, so a decoded record carries the same proofs a form would. -/
 def fromJsonField {α} (c : Codec α) [FromJsonField α] (j : Json) (key : String) :
     Except String (Field c.valid) :=
@@ -165,7 +175,7 @@ def radios (group : String) (options : List (String × String)) : Codec String w
       (options.map fun (v, lbl) =>
         label [] [input [type' "radio", Qed.name group, value v, checked (raw == v), onChange set], lbl])
 
-/-- Lift any JSON-codable type into a field that rides the JSON but has no form widget —
+/-- Lift any JSON-codable type into a field that rides the JSON but has no form widget,
     for a nested record or a list, e.g. `author : Codec.json Author`,
     `tags : Codec.json (List Tag)`. The JSON side is the type's own `ToJson`/`FromJson`, so it
     nests recursively. There is no flat widget that fills a nested object, so such a field can't
@@ -191,11 +201,11 @@ instance can't quantify a runtime binder, so a context-parameterised schema expo
 codec only as those functions, e.g. `T.decode today s`).
 
 A field's refinement has to be *decidable* (validity is decided at runtime). The command
-checks that up front and, when it isn't, reports the field and the fix — write the
-predicate as `abbrev`, not `def` — instead of letting the bare `DecidablePred` synthesis
+checks that up front and, when it isn't, reports the field and the fix, write the
+predicate as `abbrev`, not `def`, instead of letting the bare `DecidablePred` synthesis
 failure cascade.
 
-Context binders after the name — `schema Booking (today : Date) where …` — thread into
+Context binders after the name, `schema Booking (today : Date) where …`, thread into
 the validated type and the form functions, so a refinement can depend on them (e.g.
 `when : Codec.date.refine (fun d => today < d)`). A schema with context binders is
 form-only: its type is indexed, so it has no `ToJson`/`FromJson` instance. -/
@@ -205,7 +215,7 @@ syntax (name := schemaCmd) "schema " ident ("(" ident " : " term ")")* " where "
   sepBy1IndentSemicolon(group(ident " : " term)) : command
 
 open Lean Elab Term Meta in
-/-- Decide, field by field, whether it carries a refinement — *semantically*. The codec is
+/-- Decide, field by field, whether it carries a refinement, *semantically*. The codec is
     elaborated (with the schema's context binders in scope, so a refinement like
     `fun d => today < d` resolves), then we check whether its `valid` is just `fun _ => True`.
     Because this inspects the elaborated `valid`, not the surface syntax, it is robust to how
@@ -255,7 +265,7 @@ elab_rules : command
       let refined ← schemaRefinedFlags cbns cbts inputs
       -- ── Friendly pre-check. Each field's refinement must be decidable, or validity can't be
       -- computed. We probe by elaborating the control in isolation and capturing (then suppressing)
-      -- whatever it logs — Lean *logs* a failed instance search rather than throwing it, so a plain
+      -- whatever it logs, Lean *logs* a failed instance search rather than throwing it, so a plain
       -- try/catch wouldn't see it. If the probe logged a missing `DecidablePred`, that field's
       -- refinement isn't decidable: report it and stop, before the generated code turns one missing
       -- instance into a synth pile. Any other message (e.g. a context binder not yet in scope, like
@@ -346,7 +356,7 @@ elab_rules : command
               (onEdit : $draftId → msg) (submit : msg) : Html msg :=
               div [cls "qed-form"] $viewBody) ]
       -- JSON codec. `toJson`/`fromJson`/`decode`/`encode` are generated for EVERY schema, threading
-      -- any context binders as leading arguments — so a context-parameterised schema still has a JSON
+      -- any context binders as leading arguments, so a context-parameterised schema still has a JSON
       -- codec (e.g. `Appt.decode today s`). Only the `ToJson`/`FromJson` *instances* are restricted to
       -- non-indexed types, since a class instance can't quantify a runtime binder.
       let jsonFnCmds : Array (TSyntax `command) := #[

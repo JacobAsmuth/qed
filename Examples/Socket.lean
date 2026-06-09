@@ -1,5 +1,5 @@
 /-
-  A WebSocket echo client — open a connection, send a line, watch it bounce back.
+  A WebSocket echo client: open a connection, send a line, watch it bounce back.
 
   The socket lives behind the same pure `update` as everything else. `Cmd.wsOpen`
   carries the lifecycle messages (open / message / close / error), `Cmd.wsSend` and
@@ -41,21 +41,21 @@ inductive Msg
 /-- The key this app's one socket is opened under; `wsSend`/`wsClose` use it too. -/
 def echo : String := "echo"
 
-def transition (m : Model) : Msg → Model × Cmd Msg
+def transition (m : Model) : Msg → Model × Cmd Msg := steps
   | .connect    =>
-      also { m with conn := .connecting, draft := "" }   -- a fresh connection starts clean
-           (Cmd.wsOpen echo "/echo" Msg.received
-              (onOpen := Msg.opened) (onClose := Msg.closed) (onError := Msg.errored))
-  | .disconnect => also m (Cmd.wsClose echo)   -- the status flips when `onClose` fires
-  | .opened     => still { m with conn := .online,  log := m.log.push "● connected" }
-  | .closed     => still { m with conn := .offline, draft := "", log := m.log.push "○ disconnected" }
-  | .errored r  => still { m with conn := .offline, draft := "", log := m.log.push s!"✗ {r}" }
-  | .received t => still { m with log := m.log.push s!"← {t}" }
-  | .typed s    => still (if m.conn = .online then { m with draft := s } else m)  -- ignore typing while offline
+      ({ m with conn := .connecting, draft := "" },   -- a fresh connection starts clean
+       Cmd.wsOpen echo "/echo" Msg.received
+          (onOpen := Msg.opened) (onClose := Msg.closed) (onError := Msg.errored))
+  | .disconnect => (m, Cmd.wsClose echo)   -- the status flips when `onClose` fires
+  | .opened     => { m with conn := .online,  log := m.log.push "● connected" }
+  | .closed     => { m with conn := .offline, draft := "", log := m.log.push "○ disconnected" }
+  | .errored r  => { m with conn := .offline, draft := "", log := m.log.push s!"✗ {r}" }
+  | .received t => { m with log := m.log.push s!"← {t}" }
+  | .typed s    => if m.conn = .online then { m with draft := s } else m  -- ignore typing while offline
   | .send       =>
       let t := m.draft.trimmed
-      if t.isEmpty then still m
-      else also { m with draft := "", log := m.log.push s!"→ {t}" } (Cmd.wsSend echo t)
+      if t.isEmpty then m
+      else ({ m with draft := "", log := m.log.push s!"→ {t}" }, Cmd.wsSend echo t)
 
 -- The composer can only hold text while we're connected: typing is ignored unless online, and
 -- the draft is cleared whenever the connection drops or restarts. So a half-typed message can

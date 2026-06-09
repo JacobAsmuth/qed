@@ -1,5 +1,5 @@
 /-
-  The counter demo — pure Lean, total by elaboration, with a machine-checked
+  The counter demo: pure Lean, total by elaboration, with a machine-checked
   state-machine invariant. This module defines only the *application*; the thin
   entry points that run it live in `Examples/Native.lean` (renders to stdout) and
   `Examples/Web.lean` (mounts in the browser), so the same verified `app` drives
@@ -14,7 +14,7 @@ structure Model where
   count : Int
 deriving Repr, Inhabited
 
-/-- Every event the UI can produce. `update` must handle all of them — a missing
+/-- Every event the UI can produce. `update` must handle all of them, a missing
     case is a compile error, so the UI logic cannot "forget" an event. -/
 inductive Msg where
   | increment
@@ -25,7 +25,7 @@ deriving Repr
 def init : Model := { count := 0 }
 
 /-- The pure, total transition. `decrement` is guarded so the count never drops
-    below zero — and the framework proves that for us just below. -/
+    below zero, and the framework proves that for us just below. -/
 def update (m : Model) : Msg → Model
   | .increment => { m with count := m.count + 1 }
   | .decrement => { m with count := if 0 < m.count then m.count - 1 else m.count }
@@ -37,12 +37,12 @@ def app : App Model Msg := ui init update fun m =>
   div [] [
     div [cls "counter"] [
       button [onClick .decrement] "−",
-      span   [cls "count"]        [text (toString m.count)],
+      span   [cls "count"]        [m.count],
       button [onClick .increment] "+",
       button [onClick .reset]     "reset"
     ],
     -- Only the count above is a binding, so typing here keeps its focus and cursor.
-    input [placeholder "type here — focus survives every click"],
+    input [placeholder "type here, focus survives every click"],
     -- A static subtree: built once, then never touched again.
     div [cls "banner", attr "id" "banner"] ["built once, then memoized"],
     -- The count text is a binding: it updates in place while its node stays put.

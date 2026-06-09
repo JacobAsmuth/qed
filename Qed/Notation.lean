@@ -1,5 +1,5 @@
 /-
-  Qed.Notation — the readable surface for writing views.
+  Qed.Notation: the readable surface for writing views.
 
   These are *pure sugar*: every combinator below reduces to a `Qed.Html`
   constructor, so using them costs nothing in guarantees. With the `Coe String _`
@@ -13,11 +13,12 @@ import Qed.Router
 
 namespace Qed
 
-/-- A text node. Rarely needed explicitly — a bare `String` coerces to one. -/
-def text (s : String) : Html msg := .text s
+/-- A text node, from anything `ToString`: `text m.count` needs no `toString`. Rarely
+    needed at all: a bare `String`/`Nat`/`Int` child coerces to one. -/
+def text [ToString α] (a : α) : Html msg := .text (toString a)
 
 /-- Memoize a subtree by a key (React's `useMemo`/`shouldComponentUpdate` as data): when
-    `key` is unchanged since the last render, the diff skips `sub` — no re-diff, no DOM
+    `key` is unchanged since the last render, the diff skips `sub`, no re-diff, no DOM
     patch. Make `key` capture exactly the inputs `sub` is built from. -/
 def lazy (key : String) (sub : Html msg) : Html msg := .lazy key sub
 
@@ -26,7 +27,7 @@ def lazy (key : String) (sub : Html msg) : Html msg := .lazy key sub
 def el (tag : String) (attrs : List (Attr msg) := []) (children : List (Html msg) := []) :
     Html msg := .element tag attrs children
 
-/-- Common elements. Add more freely — each is a one-liner. -/
+/-- Common elements. Add more freely, each is a one-liner. -/
 def div     (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "div" attrs children
 def span    (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "span" attrs children
 def button  (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "button" attrs children
@@ -44,7 +45,7 @@ def label   (attrs : List (Attr msg) := []) (children : List (Html msg) := []) :
 def formEl  (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "form" attrs children
 
 /-- The rest of the common HTML elements. Any element is also reachable as `el "tag" …`; these are
-    the named conveniences. A few names are taken — `<section>` is `sectionEl` and `<main>` is
+    the named conveniences. A few names are taken, `<section>` is `sectionEl` and `<main>` is
     `mainEl` (both are reserved), `<form>` is `formEl`, and `<em>` is `el "em"` (the CSS `em` length
     owns the name). -/
 -- Sectioning & layout
@@ -119,7 +120,7 @@ def td       (attrs : List (Attr msg) := []) (children : List (Html msg) := []) 
 def th       (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "th" attrs children
 
 /-- Common SVG elements. Nest them inside `svg`: the driver puts the whole `svg` subtree in the
-    SVG namespace (any element, not just these, so `el "feSpotLight"` works too — see
+    SVG namespace (any element, not just these, so `el "feSpotLight"` works too, see
     `Dom.childNamespace`). Set geometry with `attr` (`attr "viewBox" "0 0 100 100"`, `attr "cx"
     "50"`, `attr "d" "M0 0 L10 10"`, …); namespaced links use `attr "xlink:href" "#id"`. -/
 def svg      (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "svg" attrs children
@@ -133,13 +134,13 @@ def polyline (attrs : List (Attr msg) := []) (children : List (Html msg) := []) 
 def polygon  (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg := el "polygon" attrs children
 
 /-- An internal navigation link: an `<a href=path>` the driver intercepts (no full
-    page reload) — clicking it pushes `path` to the URL and routes to it. Pair with
+    page reload), clicking it pushes `path` to the URL and routes to it. Pair with
     `Router.toURL` for a type-checked target, or use `linkTo` to pass the route directly. -/
 def link (path : String) (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg :=
   el "a" (Attr.attr "href" path :: Attr.attr "data-qed-link" "" :: attrs) children
 
 /-- A type-checked internal link: builds the `<a href>` from a routed value via
-    `Router.toURL`, so the target can only be a real route — never a hand-typed string that
+    `Router.toURL`, so the target can only be a real route, never a hand-typed string that
     might not parse back. The `Router.round_trip` proof then guarantees clicking it navigates
     to exactly this route. `linkTo (Route.user "ada") [cls "u"] "Ada"`. -/
 def linkTo {α} [Router α] (route : α)
@@ -155,14 +156,14 @@ def attr (key value : String) : Attr msg := .attr key value
 def role (name : String) : Attr msg := .attr "data-role" name
 /-- Set an element's content from a raw markup string (React's `dangerouslySetInnerHTML`): the
     browser parses `markup` as the node's inner HTML and any child list is ignored. The escape
-    hatch for markup you already have as a string — an inline SVG icon, a sanitized snippet:
+    hatch for markup you already have as a string, an inline SVG icon, a sanitized snippet:
     `span [rawHtml iconSvg] []`. Unescaped by design, so only pass markup you trust. -/
 def rawHtml (markup : String) : Attr msg := .rawHtml markup
-/-- Listen for any DOM `event`, dispatching the constant `m` — the escape hatch when no named
+/-- Listen for any DOM `event`, dispatching the constant `m`, the escape hatch when no named
     helper fits (`on "wheel" .scrolled`, `on "dragover" .dragging`, …). -/
 def on (event : String) (m : msg) : Attr msg := .on event m
 /-- Listen for any DOM `event`, dispatching `handler payload` (the event's value/key/checked
-    string) — e.g. `onValue "paste" .pasted`. -/
+    string), e.g. `onValue "paste" .pasted`. -/
 def onValue (event : String) (handler : String → msg) : Attr msg := .onValue event handler
 def onClick (m : msg) : Attr msg := .on "click" m
 /-- Fire `handler currentValue` whenever the field is edited. -/
@@ -194,7 +195,7 @@ def onMouseUp (m : msg) : Attr msg := .on "mouseup" m
     instead of reconciling positionally. Reconciliation-only; never rendered. -/
 def key (k : String) : Attr msg := .key k
 
-/-- Typed string attributes — typos in the key become compile errors. -/
+/-- Typed string attributes: typos in the key become compile errors. -/
 def value       (v : String) : Attr msg := .attr "value" v
 def placeholder (v : String) : Attr msg := .attr "placeholder" v
 def name        (v : String) : Attr msg := .attr "name" v
@@ -205,7 +206,7 @@ def title       (v : String) : Attr msg := .attr "title" v
 def style       (v : String) : Attr msg := .attr "style" v
 def type'       (v : String) : Attr msg := .attr "type" v
 
-/-- Typed boolean attributes — present on the node *iff* the flag is `true`, so
+/-- Typed boolean attributes: present on the node *iff* the flag is `true`, so
     `disabled false` actually enables (no `disabled="false"` footgun). -/
 def disabled (present : Bool) : Attr msg := .flag "disabled" present
 def required (present : Bool) : Attr msg := .flag "required" present

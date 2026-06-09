@@ -1,24 +1,24 @@
 /-
-  Qed.View — fine-grained reactive templates.
+  Qed.View: fine-grained reactive templates.
 
   A `View σ msg` is a *template*: a tree whose static parts are fixed and whose
   dynamic leaves are *projections* `σ → String` of a scope value `σ` (the model, or a
-  row of a list). Unlike `view : Model → Html Msg` — re-run every frame, rebuilding
-  the whole tree — a template is built once; on update only the projections re-run, so
+  row of a list). Unlike `view : Model → Html Msg`, re-run every frame, rebuilding
+  the whole tree, a template is built once; on update only the projections re-run, so
   a value change costs O(bindings) and never walks the tree. That is fine-grained
   reactivity (SolidJS-style), but the value still lives in the model and `update` stays
   the pure `Model → Msg → Model`: the signal is *derived*, not a side channel.
 
   The meaning of a template is given by `render : View σ msg → σ → Html msg`, which
   evaluates it against a scope to produce an ordinary `Html`. So a template *is* its
-  rendering — everything proven about `Html` (`diff_apply`) holds of `render t m`, and
+  rendering, everything proven about `Html` (`diff_apply`) holds of `render t m`, and
   the simplest possible runtime is `view m := render t m` (the verified path, no
   fine-grained machinery). `Qed.Driver` then builds the DOM once and re-runs only the
   projections; `View.render` is the specification that fine-grained path is checked
   against (`Qed.ViewDiff`).
 
-  Structure that *changes shape* — a conditional (`showIf`) or a keyed list
-  (`keyedList`) — cannot be a projection, since a projection only changes a value, not
+  Structure that *changes shape*, a conditional (`showIf`) or a keyed list
+  (`keyedList`), cannot be a projection, since a projection only changes a value, not
   the tree. Those reconcile through the existing verified `diff`: `showIf` renders an
   empty text node when false (so the slot is always present and positions stay stable),
   and `keyedList` renders a container whose children carry their derived `key`, exactly
@@ -32,7 +32,7 @@ import Lean
 namespace Qed
 
 /-- A template attribute: either a `stat`ic attribute (any `Attr`), or one `bind`ed to
-    the scope (`σ → Attr msg`) — which covers both a dynamic value (`value="get σ"`) and
+    the scope (`σ → Attr msg`), which covers both a dynamic value (`value="get σ"`) and
     a dynamic event whose message reads the scope (`onClick (.toggle row.id)` inside a
     list row, where `row` is only known per item). The driver re-evaluates `bind` attrs
     on update and leaves `stat` ones alone. -/
@@ -43,7 +43,7 @@ inductive VAttr (σ : Type) (msg : Type) where
       scope-dependent event). The driver re-evaluates it on update. -/
   | bind (get : σ → Attr msg)
   /-- A dynamic *value* attribute `attr="get σ"`. Distinguished from `bind` so a list row
-      can render it as a *signal* (`signalAttr`) — a value-only update sets it directly,
+      can render it as a *signal* (`signalAttr`), a value-only update sets it directly,
       no diff. In a scalar element it is just re-applied on update. -/
   | dynVal (attr : String) (get : σ → String)
 
@@ -52,8 +52,8 @@ inductive VAttr (σ : Type) (msg : Type) where
     `text`/`element`/`static` are fixed structure; `dyn` is a value bound to the scope;
     `showIf`/`keyedList` are the two structural combinators (conditional, keyed list)
     that reconcile through the verified `diff` rather than as bindings. A `keyedList`'s
-    `child` template is scoped to a *row* `α`, not the outer `σ` — its projections read
-    the row — which is what makes per-row updates fine-grained. -/
+    `child` template is scoped to a *row* `α`, not the outer `σ`, its projections read
+    the row, which is what makes per-row updates fine-grained. -/
 inductive View (σ : Type) (msg : Type) where
   /-- Static text. -/
   | text (s : String)
@@ -70,37 +70,37 @@ inductive View (σ : Type) (msg : Type) where
       native `if c then a else b` in a view. -/
   | ifElse (cond : σ → Bool) (yes no : View σ msg)
   /-- A keyed list: a container `tag` whose rows are produced by the `forEach` combinator
-      (which scopes each row's template to its own row type `α`, off this inductive — a
+      (which scopes each row's template to its own row type `α`, off this inductive, a
       nested `View α` field would be a non-uniform recursive occurrence the kernel
       rejects). The three driver-facing projections of the model are: `keys` (the row keys
-      in order — cheap, drives the structural fast/slow decision), `sigs` (every row's
-      dynamic values as `(signalName, value)` — the per-row *signals* that make a
+      in order, cheap, drives the structural fast/slow decision), `sigs` (every row's
+      dynamic values as `(signalName, value)`, the per-row *signals* that make a
       value-only update O(changed) with no diff and no `childAt`), and `rowsHtml` (the
-      keyed `Html` rows, each dynamic leaf a `signalBind` node — used to build and, on a
+      keyed `Html` rows, each dynamic leaf a `signalBind` node, used to build and, on a
       *shape* change, reconcile through the verified keyed `diff`). -/
   | keyedList (tag : String) (attrs : List (VAttr σ msg))
       (keys : σ → Array String)
       -- `marks s` is a per-row identity stamp and `rowSig s i` is row `i`'s signals computed on
       -- demand: together they let the driver update only the rows whose identity changed (an
-      -- unchanged row is the SAME value, so its mark is unchanged) — O(changed), not O(all rows).
+      -- unchanged row is the SAME value, so its mark is unchanged), O(changed), not O(all rows).
       (marks : σ → Array USize) (rowSig : σ → Nat → Array (String × String))
       (rowsHtml : σ → List (Html msg))
   /-- An escape hatch: drop a fully-formed `Html` subtree into a template (e.g. to reuse
-      an existing component). It is opaque to the fine-grained path — always rebuilt. -/
+      an existing component). It is opaque to the fine-grained path, always rebuilt. -/
   | static (html : Html msg)
   /-- The scope-bound escape hatch: an arbitrary `σ → Html` subtree. Unlike `static` it
       reads the scope, so it carries anything the fine-grained combinators can't express
-      (a free-form `match`, a helper call). It is never value-patched — on every update it
+      (a free-form `match`, a helper call). It is never value-patched, on every update it
       reconciles through the verified `diff` (`stable` is `false` for it), so it inherits
       `diff_apply`'s guarantee. The `view%` macro emits this for view code it can't
       decompose, making "lift what we can, diff the rest" the default. -/
   | dynNode (get : σ → Html msg)
 
 /-- A per-row identity stamp for the driver's O(changed) list update. The transpiler emits the
-    real `$.refMark` (a stable id per heap object, fresh for a scalar), so an unchanged row — the
-    SAME value Lean returned untouched — keeps its stamp and is skipped with no field read. This
+    real `$.refMark` (a stable id per heap object, fresh for a scalar), so an unchanged row, the
+    SAME value Lean returned untouched, keeps its stamp and is skipped with no field read. This
     pure body is a conservative `0`: it is never a real stamp (those start at 1), so the native/
-    spec model never skips and stays sound. Driver-only — no proof depends on it. -/
+    spec model never skips and stays sound. Driver-only, no proof depends on it. -/
 @[noinline] def refMark {α : Type} (a : α) : USize := (fun _ => 0) a
 
 /-- Evaluate a template attribute against a scope. -/
@@ -138,18 +138,18 @@ end
 /-- Lift any `σ → Html` view into a template: a single scope-bound `dynNode`, so the whole
     subtree reconciles through the verified `diff` on update (`View.render (.ofHtml f) s = f s`).
     The bridge for a view a builder can't lift syntactically (or a reused `Html`-returning
-    helper) — same behaviour as the old whole-tree-diff path, now inside the one engine. -/
+    helper), same behaviour as the old whole-tree-diff path, now inside the one engine. -/
 def View.ofHtml (f : σ → Html msg) : View σ msg := .dynNode f
 
 /-! ### The value-patch path is a full re-render (verified)
 
 The fine-grained driver, away from a `keyedList`, does not rebuild the tree: it walks the
 template against the new scope and overwrites only the dynamic text/attributes in place.
-`applyValues` is the pure model of that patch — start from the *old* rendered tree
+`applyValues` is the pure model of that patch, start from the *old* rendered tree
 (`render t s`) and reapply the dynamic parts at the new scope `s'`. `stable t s s'` is its
 precondition, exactly the driver's value-only fast path: no `keyedList`, and no `showIf`
 condition flips between `s` and `s'`. The theorem `applyValues_render` says that under
-`stable`, the in-place patch reproduces a full re-render — so the non-list template path
+`stable`, the in-place patch reproduces a full re-render, so the non-list template path
 inherits the same "the DOM equals the model's view" guarantee `diff_apply` gives the diff
 path. (`keyedList` rows update through signals, outside `render`, so they are excluded.) -/
 
@@ -170,8 +170,8 @@ mutual
 end
 
 mutual
-  /-- Is `t`'s structure the same at `s` and `s'` — no `keyedList`, every `showIf`
-      condition unchanged — so a value patch suffices (the driver's fast-path test)? -/
+  /-- Is `t`'s structure the same at `s` and `s'`, no `keyedList`, every `showIf`
+      condition unchanged, so a value patch suffices (the driver's fast-path test)? -/
   def stable : View σ msg → σ → σ → Bool
     | .element _ _ kids,  s, s' => stableList kids s s'
     | .showIf cond child, s, s' => (cond s == cond s') && stable child s s'
@@ -234,12 +234,12 @@ end
 fine-grained value patch when the structure is stable, the verified `diff` otherwise. -/
 
 /-- The complete update step for one (sub)tree: a fine-grained value patch when the shape is
-    stable, else the verified `diff`. Total — defined for every `t, s, s'`. -/
+    stable, else the verified `diff`. Total, defined for every `t, s, s'`. -/
 def patch (t : View σ msg) (s s' : σ) (old : Html msg) : Html msg :=
   if stable t s s' then applyValues t s' old else applyPatch (diff old (View.render t s')) old
 
 /-- **Every (sub)tree, unconditionally.** Applying the update step to the old rendered tree
-    reproduces a full re-render — scalar, `ifElse`, `dynNode`, and shape change alike, with no
+    reproduces a full re-render, scalar, `ifElse`, `dynNode`, and shape change alike, with no
     `stable` precondition. The stable branch is `applyValues_render`; the rest is `diff_apply`. -/
 theorem patch_render (t : View σ msg) (s s' : σ) :
     patch t s s' (View.render t s) = View.render t s' := by
@@ -251,8 +251,8 @@ theorem patch_render (t : View σ msg) (s s' : σ) :
 /-! ### Structural fingerprint for fine-grained list rows
 
 A `forEach` row whose dynamic leaves are all signals updates in place via `setSignal`. But a
-row part that `renderSig` bakes *statically* — an `ifElse`/`dynNode`/nested `keyedList`, or a
-`showIf` flip — is invisible to the signal path, so a change there would be silently missed.
+row part that `renderSig` bakes *statically*, an `ifElse`/`dynNode`/nested `keyedList`, or a
+`showIf` flip, is invisible to the signal path, so a change there would be silently missed.
 `collectShape` fingerprints exactly those parts; `forEach` folds the fingerprint into the row's
 reconciliation key, so such a change becomes a *key* change and reconciles through the verified
 keyed `diff` (`diffKeyed_apply`). Rows with no such parts (`hasOpaque` is `false`) keep the
@@ -279,7 +279,7 @@ mutual
   /-- A string fingerprint of the row's statically-rendered parts: empty for the signal leaves
       (`dyn`/`dynAttr`, handled by `setSignal`), the full rendered content for the opaque parts
       (`ifElse`/`dynNode`/nested `keyedList`) and the branch selector for a `showIf`. Differs
-      iff a change would be missed by the signal path — exactly when the key must change. -/
+      iff a change would be missed by the signal path, exactly when the key must change. -/
   def View.collectShape : View σ msg → σ → String
     | .text _,          _ => ""
     | .dyn _,           _ => ""
@@ -303,7 +303,7 @@ end
     `dyn` projections in pre-order (so each gets a stable index), and `renderSig` renders
     the row with each `dyn` as a `signalBind` node named `key#i` (its text pushed by the
     driver via `setSignal`, never through a diff). The two walk in the same pre-order, so
-    index `i` names the same binding in both — that is what lets a value-only update set
+    index `i` names the same binding in both, that is what lets a value-only update set
     just the changed rows' signals with no `childAt` and no reconcile. -/
 
 /-- A row's dynamic *value-attribute* projections (in attribute order). -/
@@ -342,7 +342,7 @@ def renderSigAttrs (s : σ) (pre : String) : List (VAttr σ msg) → Nat → Lis
 
 mutual
   /-- Render a row against its data: each `dyn` a `signalBind` node `key#i`, each `dynVal`
-      attribute a `signalAttr` `key#i` — all filled by `setSignal`. `n` is the running
+      attribute a `signalAttr` `key#i`, all filled by `setSignal`. `n` is the running
       binding index, threaded so hidden `showIf` branches still consume their indices,
       keeping the naming identical to `collectDyn`. -/
   def View.renderSig : View σ msg → σ → String → Nat → Html msg × Nat
@@ -481,7 +481,7 @@ def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → S
       | none   => #[])
     -- each row wrapped in `lazy (rkey a)`: a row's structure (its signal *names*, keyed by the
     -- row key) is fixed by `rkey`, so on a reorder the diff matches by key and `lazyReuse`s the
-    -- row — the driver MOVES its existing DOM (keeping the bound signals) instead of recursing in
+    -- row, the driver MOVES its existing DOM (keeping the bound signals) instead of recursing in
     -- to rebuild/rebind it. Content changes still flow through the value path (signals), never here.
     (fun s => ((items s).map fun a =>
       Html.lazy (rkey a) (withKey (rkey a) (View.renderSig child a (skey a) 0).1)).toList)
@@ -490,7 +490,7 @@ end V
 -- `templated` (which builds an `App` from a `View`) now lives in `Qed.Runtime`, since `App`
 -- is defined there and `View` no longer imports `Runtime`.
 
-/-! ### `view%` — write a template like an ordinary view
+/-! ### `view%`: write a template like an ordinary view
 
 `view% fun m => …` lets a fine-grained template read like an ordinary `Model → Html`
 view: native control flow is lifted into the reactive combinators, so the dynamic parts
@@ -530,7 +530,7 @@ private partial def viewMentions (m : Name) : Syntax → Bool
     branch headed by one of these (or a bare string, which coerces to text) is treated as
     a view, so a model-driven `if` in *view* position lifts to `ifElse` while one in
     *attribute* position (`cls (if … then "a" else "b")`) is left alone. A misclassification
-    is only ever a type error, never wrong behavior — Lean's checker is the backstop. -/
+    is only ever a type error, never wrong behavior, Lean's checker is the backstop. -/
 private def viewFormers : List String :=
   ["text", "dyn", "el", "div", "span", "button", "p", "h1", "h2", "h3", "ul", "li",
    "label", "input", "a", "nav", "header", "footer", "section", "article", "strong",
@@ -560,7 +560,7 @@ private def looksLikeView (stx : Syntax) : Bool :=
     | none   => false
 
 /-- Single-backtick name literals for the syntax kinds we inspect (a `Name`, not a checked
-    constant reference — so this stays usable without `import Lean`). -/
+    constant reference, so this stays usable without `import Lean`). -/
 private def kApp      : Lean.Name := `Lean.Parser.Term.app
 private def kParen    : Lean.Name := `Lean.Parser.Term.paren
 private def kFun      : Lean.Name := `Lean.Parser.Term.fun
@@ -678,14 +678,14 @@ private def extractKey (attrsList : Syntax) : MacroM (Option (Term × Term)) := 
   | none   => return none
 
 open Lean Lean.Elab Lean.Elab.Term Lean.Meta in
-/-- The lift's target for a child written the natural way — a bare scope value, not wrapped in
+/-- The lift's target for a child written the natural way, a bare scope value, not wrapped in
     `text`/`dynNode`. It decides the update strategy BY TYPE and elaborates *eagerly* (so the
-    row scope is pinned for sibling elaboration — unlike a postponing typeclass, which would
+    row scope is pinned for sibling elaboration, unlike a postponing typeclass, which would
     strand a sibling's `.ctor` notation): a `String`/`Nat`/`Int` is a *value*, so it becomes a
-    fine-grained `dyn` (value-update — patch just this binding, no diff); any other expression
+    fine-grained `dyn` (value-update, patch just this binding, no diff); any other expression
     (an `Html` subtree) becomes a `dynNode` (reconciled through the verified `diff`). So
     `[r.label]` is fast and `[rowView r]` is correct, with nothing for the developer to choose.
-    The decision happens at compile time — nothing leaks to the runtime. -/
+    The decision happens at compile time, nothing leaks to the runtime. -/
 elab "child% " "fun " mb:ident " => " body:term : term <= expectedType => do
   match_expr (← instantiateMVars expectedType) with
   | Qed.View σ msg =>
@@ -706,16 +706,18 @@ open Lean in
 mutual
   /-- Rewrite a view body (written in ordinary `Qed` `Html` notation) into a fine-grained
       `View`: `text e`→`dyn`, a model-`if`→`ifElse`, a `.map`→`forEach`, an element former
-      (`div`/`nav`/…) → `V.el` with its attrs/children lifted. Anything it does not recognise —
-      a helper call, `link`, `styleSheet`, a Resource view, a bare expression — is wrapped as
+      (`div`/`nav`/…) → `V.el` with its attrs/children lifted. Anything it does not recognise,
+      a helper call, `link`, `styleSheet`, a Resource view, a bare expression, is wrapped as
       `static` (scope-free) or `dynNode` (scope-dependent) `Html` and reconciled through the
       verified `diff`. So the lift is total over standard notation: fine-grained where provable,
       verified diff everywhere else. -/
   partial def viewLift (m : Ident) (stx : Syntax) : MacroM Syntax := do
     match stx with
     | `(text $e:term) =>
-        if viewMentions m.getId e then return (← `(Qed.V.dyn (fun $m => $e)))
-        else return (← `(Qed.V.text $e))
+        -- `text` is polymorphic over `ToString`, but a template binding is a `String`
+        -- projection, so normalise here (`toString` on a `String` is the identity).
+        if viewMentions m.getId e then return (← `(Qed.V.dyn (fun $m => toString $e)))
+        else return (← `(Qed.V.text (toString $e)))
     | `(if $c:term then $t:term else $e:term) =>
         let t' : Term := ⟨← viewLift m t⟩
         let e' : Term := ⟨← viewLift m e⟩
@@ -767,13 +769,13 @@ mutual
       | some a' => pure (⟨a'⟩ : Term)
       | none    =>
           -- `tryAttr` only recognises the attrs worth turning into a *signal* (a value
-          -- attribute, a primed event) — that is a performance optimisation, not the gate
+          -- attribute, a primed event), that is a performance optimisation, not the gate
           -- on correctness. Any other attribute that still reads the scope (a boolean
           -- `disabled (… m …)`, an event we don't special-case, a user's own helper) is
           -- captured with `bind (fun m => …)`, so the scope variable resolves and the driver
           -- re-applies it on update. Only a genuinely scope-free attribute stays `stat` (the
           -- explicit constructor, rather than the `Attr → VAttr` coercion, which can't fire
-          -- while the element's `σ` is still a metavar). So every attribute lifts — fine-grained
+          -- while the element's `σ` is still a metavar). So every attribute lifts, fine-grained
           -- where it pays, a verified-diff `bind` everywhere else.
           if viewMentions m.getId a then `(Qed.VAttr.bind (fun $m => $aT))
           else `(Qed.VAttr.stat $aT)
@@ -833,7 +835,7 @@ mutual
         let xsT    : Term := ⟨xs⟩
         let tagL   : Term := ⟨Syntax.mkStrLit tag⟩
         -- A keyed row (an element carrying `key …`) becomes a fine-grained `forEach`. Anything
-        -- else — a keyless `.map`, or a row that isn't a keyed element — degrades to a `dynNode`
+        -- else, a keyless `.map`, or a row that isn't a keyed element, degrades to a `dynNode`
         -- that renders the list as `Html` and reconciles it through the verified positional
         -- `diff`. So `.map` never fails to compile; it just isn't fine-grained without a key.
         let keyOpt ← (match asApp? body with

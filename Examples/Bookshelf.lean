@@ -12,9 +12,12 @@
     /new           the `schema`-generated form (text/number/select/checkbox, each refined)
                    that, on a valid submit, POSTs the book and routes to its new detail page
 
-  Navigation goes through `link` / `Cmd.pushUrl`, so it never reloads. The server
-  renders any page from a model (`Examples/BookshelfSSR.lean`), and the browser
-  adopts that markup on load. Pure Lean; the browser entry is `BookshelfWeb.lean`.
+  Navigation goes through `link` / `Cmd.pushUrl`, so it never reloads. This app contains
+  no SSR code, yet it server-renders: `qed build` emits a request handler (`ssr.mjs`)
+  that routes a URL, runs the queries above server-side, and renders with this same
+  view, dehydrated so the browser adopts the markup on load (`test/bookshelf_ssr_test.mjs`
+  and `test/bookshelf_hydrate_test.mjs` drive it). Pure Lean; the browser entry is
+  `BookshelfWeb.lean`.
 -/
 import Qed
 open Qed

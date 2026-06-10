@@ -1,4 +1,4 @@
-// bookshelf_test.mjs — end-to-end test for the full-stack demo: routing + Resource
+// bookshelf_test.mjs: end-to-end test for the full-stack demo: routing + Resource
 // (a fetched list AND a fetched record) + a validated form that POSTs and routes to
 // its result + scoped styles, all in one app.
 //
@@ -27,7 +27,7 @@ const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.B
   { stdio: 'inherit' });
 if (build.status !== 0) { console.error('build failed'); process.exit(1); }
 
-// In-memory catalog, seeded to match Examples/BookshelfSSR.lean.
+// In-memory catalog (the same seed the SSR tests use).
 const books = [
   { id: 'dune',        title: 'Dune',                author: 'Frank Herbert',      year: 1965, genre: 'fiction',    inPrint: true },
   { id: 'neuromancer', title: 'Neuromancer',         author: 'William Gibson',     year: 1984, genre: 'fiction',    inPrint: true },

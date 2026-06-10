@@ -45,8 +45,3 @@ lean_exe users_ssr where
 /-- SSR of the `view%` template demo's initial view, for the template-hydration test. -/
 lean_exe template_ssr where
   root := `Examples.TemplateSSR
-
-/-- Dynamic per-request SSR of the Bookshelf app: `lake exe bookshelf_ssr <path>` prints the
-    full page for that route, its catalog/detail data filled server-side. -/
-lean_exe bookshelf_ssr where
-  root := `Examples.BookshelfSSR

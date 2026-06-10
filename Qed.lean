@@ -21,6 +21,7 @@ import Qed.ForEach
 import Qed.View
 import Qed.Jsx
 import Qed.Resource
+import Qed.Ssr
 import Qed.Style
 -- Note: `Qed.Dom` and `Qed.Driver` are intentionally NOT re-exported here. They
 -- reference the browser-only DOM externs, so pure app modules (which `import Qed`)

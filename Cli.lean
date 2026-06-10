@@ -447,11 +447,12 @@ def cmdNew (dir : String) : IO UInt32 := do
     "  | .decrement => { m with count := if 0 < m.count then m.count - 1 else m.count }\n" ++
     "  | .reset     => { m with count := 0 }\n\n" ++
     "def app : App Model Msg := ui init update fun m =>\n" ++
-    "  div [cls \"counter\"] [\n" ++
-    "    button [onClick .decrement] \"−\",\n" ++
-    "    span   [cls \"count\"]        [m.count],\n" ++
-    "    button [onClick .increment] \"+\",\n" ++
-    "    button [onClick .reset]     \"reset\" ]\n\n" ++
+    "  <div class=\"counter\">\n" ++
+    "    <button onClick={.decrement}>−</button>\n" ++
+    "    <span class=\"count\">{m.count}</span>\n" ++
+    "    <button onClick={.increment}>+</button>\n" ++
+    "    <button onClick={.reset}>reset</button>\n" ++
+    "  </div>\n\n" ++
     "invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update\n"
   IO.FS.writeFile (root / "Web.lean") <|
     "import App\nimport Qed.Driver\n\ndef main : IO Unit := Qed.run app\n"

@@ -1,4 +1,6 @@
 /-
+  Tour 12 · Effects as data
+
   Native effects: a tour of the typed `Cmd`s Qed ships, the typed `ports` escape
   hatch, keyed-timer debounce, and a startup effect.
 
@@ -85,23 +87,23 @@ def transition (m : Model) (msg : Msg) : Model × Cmd Msg :=
 -- `onPort` routes inbound port messages.
 def app : App Model Msg :=
   ui init transition (onPort := some onPort) (start := Cmd.storageGet "count" .loaded) fun m =>
-    div [cls "app"] [
-      div [cls "counter"] [
-        button [cls "dec", onClick .dec] "−",
-        span   [cls "count", attr "id" "count"] [m.count],
-        button [cls "inc", onClick .inc] "+"
-      ],
-      input  [attr "id" "title-input", cls "title", value m.title, onInput .editTitle, placeholder "page title"],
-      button [cls "apply",  onClick .applyTitle] "Set title",
-      button [cls "roll",   onClick .roll]       "Roll d6",
-      button [cls "delay",  onClick .delayed]    "Delayed",
-      button [cls "ping",   onClick .ping]       "Ping",
-      button [cls "pick",   onClick .pick]       "Pick file",
-      button [cls "focus",  onClick .focusTitle] "Focus title",
-      button [cls "save",   onClick .saveBatch]  "Save (batch)",
-      input  [cls "search", value m.query, onInput .typeSearch, placeholder "debounced search"],
-      span   [cls "searches", attr "id" "searches"] [m.searches],
-      div [cls "status", attr "id" "status"] [m.status]
-    ]
+    <div class="app">
+      <div class="counter">
+        <button class="dec" onClick={.dec}>−</button>
+        <span class="count" id="count">{m.count}</span>
+        <button class="inc" onClick={.inc}>+</button>
+      </div>
+      <input id="title-input" class="title" value={m.title} onInput={.editTitle} placeholder="page title"/>
+      <button class="apply" onClick={.applyTitle}>Set title</button>
+      <button class="roll" onClick={.roll}>Roll d6</button>
+      <button class="delay" onClick={.delayed}>Delayed</button>
+      <button class="ping" onClick={.ping}>Ping</button>
+      <button class="pick" onClick={.pick}>Pick file</button>
+      <button class="focus" onClick={.focusTitle}>Focus title</button>
+      <button class="save" onClick={.saveBatch}>Save (batch)</button>
+      <input class="search" value={m.query} onInput={.typeSearch} placeholder="debounced search"/>
+      <span class="searches" id="searches">{m.searches}</span>
+      <div class="status" id="status">{m.status}</div>
+    </div>
 
 end Effects

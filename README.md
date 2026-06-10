@@ -12,8 +12,8 @@ The same kernel mathematicians use to check proofs checks your frontend.
 
 `qed build` transpiles your app and the whole verified framework straight to plain JavaScript. No
 emscripten, no WASM, no special runtime. The output is a handful of `.mjs` files you serve anywhere.
-The proofs that pass `qed check` describe the JavaScript that actually runs. If you've written Elm,
-the structure will feel familiar.
+The proofs that pass `qed check` describe the JavaScript that actually runs. If you've written
+React, the view syntax will feel familiar; the architecture underneath is Elm's.
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/JacobAsmuth/qed/main/install.sh | sh
@@ -46,12 +46,12 @@ def update (m : Model) : Msg → Model
   | .reset     => { m with count := 0 }
 
 def app : App Model Msg := ui init update fun m =>
-  div [cls "counter"] [
-    button [onClick .decrement] "−",
-    span   [cls "count"]        [m.count],
-    button [onClick .increment] "+",
-    button [onClick .reset]     "reset"
-  ]
+  <div class="counter">
+    <button onClick={.decrement}>−</button>
+    <span class="count">{m.count}</span>
+    <button onClick={.increment}>+</button>
+    <button onClick={.reset}>reset</button>
+  </div>
 
 invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
 ```
@@ -62,9 +62,9 @@ that broke the invariant (`case decrement`).
 
 ## One way to write a view
 
-You write the view the plain way. `if`, `.map`, string interpolation, your own helpers. No `memo`,
-no `key`s, no `signal`s, no `useState` to place. The framework decides, per subtree, how to apply
-each change. A model value that changed is written straight at its node. A change of shape (rows
+You write the view in JSX, with plain Lean in the braces: `if`, `.map`, string interpolation, your
+own helpers. No `memo`, no `signal`s, no `useState` to place. The framework decides, per subtree,
+how to apply each change. A model value that changed is written straight at its node. A change of shape (rows
 added, removed, reordered, a branch flipped) reconciles through the diff. Change the counter and
 that one text node is rewritten. Nothing else.
 
@@ -153,10 +153,10 @@ router R where
 
 def app : App Model Msg :=
   ui init transition (onRoute := Msg.routed) fun m =>
-    formEl [onSubmit .submit] [
-      input [value m.query, onInput .typeQuery],
-      linkTo (R.user "ada") [] "ada"     -- a real route, checked at compile time
-    ]
+    <form onSubmit={.submit}>
+      <input value={m.query} onInput={.typeQuery}/>
+      {linkTo (R.user "ada") [] "ada"}   -- a real route, checked at compile time
+    </form>
 ```
 
 ### Effects
@@ -199,7 +199,7 @@ namespace Card
   def likeOn  : Style := css [ color "#ff2d55" ]
   def likeOff : Style := css [ color "#8a8a8a" ]
   def view (c : Model) : Html Msg :=
-    button [role "like", onClick .toggleLike, if c.liked then likeOn else likeOff] [text s!"♥ {c.likes}"]
+    <button role="like" onClick={.toggleLike} {if c.liked then likeOn else likeOff}>{s!"♥ {c.likes}"}</button>
   def component : Component Model Msg := { update, view }
   abbrev Safe (c : Model) : Prop := 0 ≤ c.likes ∧ (c.liked → 1 ≤ c.likes)
 end Card
@@ -241,9 +241,37 @@ valid. `feedSafe` is itself a per-element predicate ("every card is valid"), so 
 list of feeds. `Examples/Feed.lean` is the worked example.
 
 State that doesn't belong in the root model (a row's open editor, a half-typed draft, a per-widget
-counter) goes in a local component: keyed, driver-owned, its state serialized by `schema`, its
-message type private, and able to bubble a typed value to its parent. The
-local store snapshots and restores through `window.qed.snapshot()` and `.restore(json)`.
+counter) goes in a `component`: state declared next to the view that uses it, keyed, driver-owned,
+serialized, and `set` as the only way to change it. The local store snapshots and restores through
+`window.qed.snapshot()` and `.restore(json)`.
+
+```lean
+component Stepper where
+  state count : Int := 0
+  view =>
+    <div class="stepper">
+      <button onClick={set count (if count ≤ 0 then 0 else count - 1)}>−</button>
+      <span>{count}</span>
+      <button onClick={set count (count + 1)}>+</button>
+    </div>
+
+invariant stepperSafe : (fun s => 0 ≤ s.count) preserved_by Stepper.update
+```
+
+A handler is not a closure. Each distinct `set` site becomes one constructor of a generated
+first-order `Msg`, interpreted by a generated `update` against the state at delivery time (a bare
+`set draft` on an input stores the incoming value). Messages stay data with named cases, so
+everything that depends on that keeps working on the generated code: the invariant above is
+discharged automatically, and dropping the clamp fails the build with "case `set_count` still
+needs: `0 ≤ m.count - 1`". Register the component with `locals := [Stepper.reg]` and mount keyed
+instances with `<div {Stepper.mount "a"}/>`.
+
+A component talks back through a declared output: `emits T` plus `send o` in a handler (or both
+at once, `set f e, send o`), and the parent mounts it with `mountWith key onOut`. Inside another
+component, a payload-form `set f` is exactly such a handler, so nesting is
+`<div {Tag.mountWith key (set pinned)}/>`. Seed an instance from parent data with `.localInit`.
+`Examples/Local.lean` is the worked example (the invariant-carrying `Stepper`, bubbling two
+levels deep, init-from-props, snapshot/restore).
 
 ### Server-side rendering
 
@@ -252,7 +280,9 @@ local store snapshots and restores through `window.qed.snapshot()` and `.restore
 from the server's model, so there's no refetch and no flash. `Examples/Bookshelf.lean` is the worked
 app: a routed catalog over a `Resource (Array Book)` (a remote value as `idle | loading | ok | failed`),
 a detail page, and an add-book form that POSTs and routes to the new book, server-rendered and
-driven end to end by a browser test. Every feature above has one like it in `Examples/` and `test/`.
+driven end to end by a browser test. Every feature above has one like it in `Examples/` and
+`test/`; [`Examples/README.md`](Examples/README.md) orders them as a tour, one concept at a
+time, from the counter to the full Bookshelf app.
 
 ## Does proving things cost you speed?
 
@@ -292,7 +322,8 @@ Give it a try and state an invariant. Issues welcome at
 | Path | What |
 |------|------|
 | `Qed/Html.lean` | The typed virtual DOM every bit of syntax becomes. |
-| `Qed/Notation.lean` | The view combinators (`div`, `button`, `onClick`, …). |
+| `Qed/Jsx.lean` | The JSX view syntax: `<div class="x" onClick={.tap}>…</div>`, expanded to `el "tag" [attrs] [kids]`. |
+| `Qed/Notation.lean` | The attribute and event helpers (`cls`, `onClick`, `value`, …) JSX attributes expand to. |
 | `Qed/View.lean` | The rendering model: `View` (`dyn`/`showIf`/`ifElse`/`forEach`/`dynNode`) and the `view%` lift behind `ui`; built once, then changed bindings patch (`patch_render`/`applyValues_render`). |
 | `Qed/Runtime.lean` | The Elm Architecture: `App`, the `ui` builder, the `Cmd` effects + `port`/`onPort`, local components, and server-side render. |
 | `Qed/Steps.lean` | The `steps` builder for effectful transitions: arms are bare models or `(model, cmd)` pairs. |
@@ -300,7 +331,7 @@ Give it a try and state an invariant. Issues welcome at
 | `Qed/Json.lean` | JSON parser/renderer + the `ToJson`/`FromJson` classes, with the `parse_depth_le`/`parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field), the `router` command, `toURL`/`fromURL`. |
 | `Qed/Schema.lean` | `Field p`, the `Codec` controls, and the `schema` command. One declaration yields the form (Draft + `parse` + `formView` + `canSubmit_iff`) and the JSON codec (`ToJson`/`FromJson` + `decode`/`encode`). |
-| `Qed/Component.lean` | `Component`, the `embed` macro, and the `for_each` lift lemmas. |
+| `Qed/Component.lean` | `Component`, the `embed` macro, the `for_each` lift lemmas, and the `component` declaration (`state`/`view`/`set`). |
 | `Qed/Invariant.lean` | The `invariant` command (`preserved_by` / `holds_in` / `for_each`). See [`docs/invariants.md`](docs/invariants.md). |
 | `Qed/Dom.lean` / `Qed/Driver.lean` | The DOM primitives (the one trusted boundary) and the impure driver. |
 | `Js/Backend.lean` | The Lean IR to JavaScript transpiler. |

@@ -1,4 +1,6 @@
 /-
+  Tour 09 · Schema forms
+
   A form across HTML input types, with "submit ⇔ valid" by construction.
 
   `schema Account` generates the editable `Account.Draft` (raw strings), the validated
@@ -38,12 +40,12 @@ def update (m : Model) : Msg → Model
 
 def app : App Model Msg :=
   ui { draft := Account.Draft.empty, submitted := none } update fun m =>
-    div [cls "app"] [
-      h1 [] ["Create account"],
-      Account.formView m.draft .edit .submit,
-      match m.submitted with
-      | some acc => p [cls "ok"] ["Created account for ", text acc.email]
-      | none     => .text ""
-    ]
+    <div class="app">
+      <h1>Create account</h1>
+      {Account.formView m.draft .edit .submit}
+      {match m.submitted with
+       | some acc => <p class="ok">Created account for {text acc.email}</p>
+       | none     => .text ""}
+    </div>
 
 end Signup

@@ -1,10 +1,10 @@
 /-
-  Performance benchmarks for the rebuild + diff pipeline — the cost *upstream* of the
+  Performance benchmarks for the rebuild + diff pipeline: the cost *upstream* of the
   DOM patch. For a large keyed list it measures, per edit:
 
-    • rebuild — `view newModel`, allocating the whole `Html` tree afresh
-    • diff    — `diff oldTree newTree`, computing the patch
-    • patch-ops — the size of the resulting patch (how much the driver must apply)
+    • rebuild: `view newModel`, allocating the whole `Html` tree afresh
+    • diff: `diff oldTree newTree`, computing the patch
+    • patch-ops: the size of the resulting patch (how much the driver must apply)
 
   under four edits: update one, remove one, add one, reorder all. It runs each over a
   plain view and one whose row bodies are wrapped in `Html.lazy` (keyed on the row's
@@ -29,21 +29,21 @@ def mkRows (count : Nat) : Array Row :=
 
 -- A non-trivial row body (~12 nodes) so the cost of diffing it is visible.
 def rowBody (r : Row) : Html Unit :=
-  div [cls "row-body"] [
-    span [cls "label"] [r.label],
-    div [cls "meta"] [
-      span [cls "id"]    [toString r.id],
-      span [cls "count"] [toString r.n],
-      span [cls "tag"]   [if r.n % 2 == 0 then "even" else "odd"]
-    ],
-    div [cls "controls"] [span [] ["▲"], span [] ["▼"], span [] ["✕"]]
-  ]
+  <div class="row-body">
+    <span class="label">{r.label}</span>
+    <div class="meta">
+      <span class="id">{toString r.id}</span>
+      <span class="count">{toString r.n}</span>
+      <span class="tag">{if r.n % 2 == 0 then "even" else "odd"}</span>
+    </div>
+    <div class="controls"><span>▲</span><span>▼</span><span>✕</span></div>
+  </div>
 
-def rowView     (r : Row) : Html Unit := li [key (toString r.id), cls "row"] [rowBody r]
-def rowViewLazy (r : Row) : Html Unit := li [key (toString r.id), cls "row"] [lazy s!"{r.id}-{r.n}" (rowBody r)]
+def rowView     (r : Row) : Html Unit := <li key={toString r.id} class="row">{rowBody r}</li>
+def rowViewLazy (r : Row) : Html Unit := <li key={toString r.id} class="row">{lazy s!"{r.id}-{r.n}" (rowBody r)}</li>
 
-def view     (rows : Array Row) : Html Unit := ul [cls "list"] (rows.map rowView).toList
-def viewLazy (rows : Array Row) : Html Unit := ul [cls "list"] (rows.map rowViewLazy).toList
+def view     (rows : Array Row) : Html Unit := <ul class="list">{rows.map rowView}</ul>
+def viewLazy (rows : Array Row) : Html Unit := <ul class="list">{rows.map rowViewLazy}</ul>
 
 -- Force a tree / patch to a number, so the work can't be dead-code-eliminated.
 mutual

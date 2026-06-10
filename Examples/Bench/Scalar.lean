@@ -4,8 +4,8 @@
   compares the whole `n`-node tree every update; the template walks its (static) bindings
   and patches the one DOM node whose projection changed, building and diffing nothing.
 
-  The *same* `app` runs both ways: `Examples/BenchScalarWeb` runs it as a template
-  (fine-grained), `Examples/BenchScalarDiffWeb` runs it through the verified diff. The
+  The *same* `app` runs both ways: `Examples/Bench/ScalarWeb` runs it as a template
+  (fine-grained), `Examples/Bench/ScalarDiffWeb` runs it through the verified diff. The
   benchmark (`test/bench_template.mjs`) times `update` for each.
 
   Pure Lean.

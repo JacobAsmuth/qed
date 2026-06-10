@@ -1,4 +1,6 @@
 /-
+  Tour 14 · WebSockets
+
   A WebSocket echo client: open a connection, send a line, watch it bounce back.
 
   The socket lives behind the same pure `update` as everything else. `Cmd.wsOpen`
@@ -63,22 +65,22 @@ def transition (m : Model) : Msg → Model × Cmd Msg := steps
 invariant composerOnlyWhenOnline :
     (fun m => m.draft ≠ "" → m.conn = .online) preserved_by transition
 
-def logLine (line : String) : Html Msg := div [cls "line"] [text line]
+def logLine (line : String) : Html Msg := <div class="line">{line}</div>
 
 def app : App Model Msg :=
   ui { conn := .offline, draft := "", log := #[] } transition fun m =>
-    div [cls "ws"] [
-      div [cls "bar"] [
-        span [cls "status"] [text m.conn.label],
-        button [cls "connect", onClick .connect, disabled (m.conn != .offline)] "Connect",
-        button [cls "disconnect", onClick .disconnect, disabled (m.conn == .offline)] "Disconnect"
-      ],
-      div [cls "log"] (m.log.toList.map logLine),
-      div [cls "composer"] [
-        input [cls "draft", value m.draft, placeholder "Echo something…",
-               onInput .typed, disabled (m.conn != .online)],
-        button [cls "send", onClick .send, disabled (m.conn != .online)] "Send"
-      ]
-    ]
+    <div class="ws">
+      <div class="bar">
+        <span class="status">{m.conn.label}</span>
+        <button class="connect" onClick={.connect} disabled={m.conn != .offline}>Connect</button>
+        <button class="disconnect" onClick={.disconnect} disabled={m.conn == .offline}>Disconnect</button>
+      </div>
+      <div class="log">{m.log.map logLine}</div>
+      <div class="composer">
+        <input class="draft" value={m.draft} placeholder="Echo something…"
+               onInput={.typed} disabled={m.conn != .online}/>
+        <button class="send" onClick={.send} disabled={m.conn != .online}>Send</button>
+      </div>
+    </div>
 
 end Socket

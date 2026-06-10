@@ -1,4 +1,6 @@
 /-
+  Tour 13 · Streaming
+
   A streaming LLM chat: the whole app is this pure Lean.
 
   `update` is total and pure (`Model → Msg → Model`). Effects live in a separate
@@ -85,16 +87,16 @@ invariant streamSafe : (fun m => m.pending = true → 0 < m.turns.size)
     omega
 
 def bubble (t : Turn) : Html Msg :=
-  div [cls (if t.user? then "msg user" else "msg bot")] [t.text]
+  <div class={if t.user? then "msg user" else "msg bot"}>{t.text}</div>
 
 def chatApp : App Model Msg :=
   ui { turns := #[], draft := "", pending := false } transition fun m =>
-    div [cls "chat"] [
-      div [cls "log"] (m.turns.toList.map bubble),
-      div [cls "composer"] [
-        input [cls "draft", placeholder "Message the model…", value m.draft, onInput .typed],
-        button [cls "send", disabled (m.pending || m.draft.trimmed.isEmpty), onClick .send] "Send"
-      ]
-    ]
+    <div class="chat">
+      <div class="log">{m.turns.map bubble}</div>
+      <div class="composer">
+        <input class="draft" placeholder="Message the model…" value={m.draft} onInput={.typed}/>
+        <button class="send" disabled={m.pending || m.draft.trimmed.isEmpty} onClick={.send}>Send</button>
+      </div>
+    </div>
 
 end Chat

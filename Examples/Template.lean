@@ -1,7 +1,11 @@
 /-
+  Tour 05 · The view vocabulary
+
   An Elm-Architecture app (pure `init`/`update`) whose view is written inline with `ui`:
   a counter, a conditional, a controlled input, keyed and keyless lists, inline editing,
-  and a scoped style.
+  and a scoped style. Also the first hand-written invariant proof (`:= by …`), for a
+  claim the automation can't guess: row ids stay unique, which is what makes the keyed
+  diff sound.
 
   Pure Lean; the browser entry is `Examples/TemplateWeb.lean`.
 -/
@@ -46,7 +50,7 @@ def update (m : Model) : Msg → Model
   | .startEdit id => { m with todos := m.todos.map fun t => { t with editing := t.id == id } }
   | .editText id s => { m with todos := m.todos.map fun t => if t.id == id then { t with text := s } else t }
 
--- Every row's id stays below `nextId`, so ids are unique — which is exactly what makes the
+-- Every row's id stays below `nextId`, so ids are unique, which is exactly what makes the
 -- keyed `diff` sound (no two rows ever share a reconciliation key). The edits that touch the
 -- list either `map` over it (preserving each id) or `push` a fresh `nextId` and bump it; the
 -- proof below discharges both with the `Array` membership lemmas the automation can't guess.
@@ -83,46 +87,46 @@ invariant idsBelowNext : (fun m => ∀ t ∈ m.todos, t.id < m.nextId)
 -- and a typo'd reference (`bnner`) is a compile error.
 def banner : Style := css "padding: 7px; border-radius: 4px; &:hover { opacity: 0.9 }"
 
--- Write the view inline with ordinary control flow — `if`, `match`, `.map`, string
+-- Write the view inline in JSX with ordinary control flow: `if`, `match`, `.map`, string
 -- interpolation, dynamic attributes, scope-reading events. `ui` builds the app from it.
 def app : App Model Msg := ui init update fun m =>
-    div [cls "demo"] [
-      styleSheet [banner],
-      div [banner, attr "id" "styled-banner"] [text "scoped style"],
-      h1 [] "View template",
-      -- a counter: the count is a single bound text node
-      div [cls "counter"] [
-        button [onClick .dec] "−",
-        span [cls "count"] [text s!"{m.count}"],
-        button [onClick .inc] "+"
-      ],
-      -- a conditional that swaps content by the count
+    <div class="demo">
+      {styleSheet [banner]}
+      <div {banner} id="styled-banner">scoped style</div>
+      <h1>View template</h1>
+      {-- a counter: the count is a single bound text node
+      <div class="counter">
+        <button onClick={.dec}>−</button>
+        <span class="count">{s!"{m.count}"}</span>
+        <button onClick={.inc}>+</button>
+      </div>}
+      {-- a conditional that swaps content by the count
       if m.count == 0
-        then p [cls "hint"] "click + to start"
-        else p [cls "live"] [text s!"count is {m.count}"],
-      -- a controlled input bound to `name`, with a greeting shown once it's non-empty
-      input [value m.name, onInput (Msg.setName ·)],
-      if m.name != "" then p [cls "greeting"] [text s!"Hello, {m.name}!"] else text "",
-      -- a keyed list of todos: each row shows its text, toggles `done` on click
-      button [onClick .add] "add todo",
-      ul [cls "todos"] (m.todos.map fun t =>
-        li [key (toString t.id), cls (if t.done then "done" else ""), onClick (.toggle t.id)]
-           [text t.text]),
-      -- a row whose element differs by state (`<p>` when done, `<span>` otherwise)
-      ul [cls "structural"] (m.todos.map fun t =>
-        li [key (toString t.id)] [
-          if t.done then p [cls "is-done"] [text "done!"]
-                    else span [cls "is-open"] [text t.text]
-        ]),
-      -- inline editing: an `<input>` while editing, a clickable label otherwise
-      ul [cls "edit"] (m.todos.map fun t =>
-        li [key (toString t.id)] [
-          if t.editing
-            then input [cls "editor", value t.text, onInput (Msg.editText t.id ·)]
-            else span [cls "label", onClick (.startEdit t.id)] [text t.text]
-        ]),
-      -- a plain list (no `key`)
-      ul [cls "keyless"] (m.todos.map fun t => li [] [text t.text])
-    ]
+        then <p class="hint">click + to start</p>
+        else <p class="live">{s!"count is {m.count}"}</p>}
+      {-- a controlled input bound to `name`, with a greeting shown once it's non-empty
+      <input value={m.name} onInput={(Msg.setName ·)}/>}
+      {if m.name != "" then <p class="greeting">{s!"Hello, {m.name}!"}</p> else text ""}
+      {-- a keyed list of todos: each row shows its text, toggles `done` on click
+      <button onClick={.add}>add todo</button>}
+      <ul class="todos">{m.todos.map fun t =>
+        <li key={toString t.id} class={if t.done then "done" else ""} onClick={.toggle t.id}>
+          {t.text}</li>}</ul>
+      {-- a row whose element differs by state (`<p>` when done, `<span>` otherwise)
+      <ul class="structural">{m.todos.map fun t =>
+        <li key={toString t.id}>
+          {if t.done then <p class="is-done">done!</p>
+                     else <span class="is-open">{t.text}</span>}
+        </li>}</ul>}
+      {-- inline editing: an `<input>` while editing, a clickable label otherwise
+      <ul class="edit">{m.todos.map fun t =>
+        <li key={toString t.id}>
+          {if t.editing
+            then <input class="editor" value={t.text} onInput={(Msg.editText t.id ·)}/>
+            else <span class="label" onClick={.startEdit t.id}>{t.text}</span>}
+        </li>}</ul>}
+      {-- a plain list (no `key`)
+      <ul class="keyless">{m.todos.map fun t => <li>{t.text}</li>}</ul>}
+    </div>
 
 end TemplateDemo

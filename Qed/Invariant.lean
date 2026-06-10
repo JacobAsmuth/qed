@@ -181,7 +181,7 @@ def hasOneClass (styles : List Style) (a : List (Attr msg)) : Bool :=
   (attrClasses a).any ((styles.map (·.className)).contains ·)
 
 /-- Every element tagged `role r` carries the class of one of `styles`, pair with the `role`
-    attribute (`button [role "toggle", …] …`). The predicate for `… holds_in view`. -/
+    attribute (`<button role="toggle" …>…</button>`). The predicate for `… holds_in view`. -/
 def roleHasOneOf (r : String) (styles : List Style) : Html msg → Bool :=
   everyElement (fun _ a => !(attrRole a == some r) || hasOneClass styles a)
 
@@ -295,19 +295,7 @@ macro_rules
       (simp only [$view:ident, Qed.roleHasOneOf, Qed.tagHasOneOf, Qed.roleHas, Qed.both,
          Qed.either, Qed.exactlyOne, Qed.hasOneClass,
          Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
-         Qed.text, Qed.lazy, Qed.el, Qed.div, Qed.span, Qed.button, Qed.p, Qed.h1, Qed.h2, Qed.a,
-         Qed.ul, Qed.li, Qed.header, Qed.nav, Qed.strong, Qed.input, Qed.label, Qed.formEl,
-         Qed.svg, Qed.g, Qed.path, Qed.circle, Qed.ellipse, Qed.line, Qed.rect, Qed.polyline,
-         Qed.polygon, Qed.link, Qed.linkTo, Qed.styleSheet, Qed.theme,
-         Qed.sectionEl, Qed.article, Qed.mainEl, Qed.aside, Qed.footer, Qed.figure,
-         Qed.figcaption, Qed.address, Qed.h3, Qed.h4, Qed.h5, Qed.h6, Qed.ol, Qed.dl, Qed.dt,
-         Qed.dd, Qed.pre, Qed.blockquote, Qed.hr, Qed.br, Qed.small, Qed.mark, Qed.sub, Qed.sup,
-         Qed.code, Qed.kbd, Qed.abbr, Qed.cite, Qed.time, Qed.del, Qed.ins, Qed.img, Qed.picture,
-         Qed.source, Qed.video, Qed.audio, Qed.track, Qed.canvas, Qed.iframe, Qed.details,
-         Qed.summary, Qed.dialog, Qed.select, Qed.option, Qed.optgroup, Qed.textarea,
-         Qed.fieldset, Qed.legend, Qed.datalist, Qed.output, Qed.progress, Qed.meter, Qed.table,
-         Qed.caption, Qed.colgroup, Qed.col, Qed.thead, Qed.tbody, Qed.tfoot, Qed.tr, Qed.td,
-         Qed.th,
+         Qed.text, Qed.lazy, Qed.el, Qed.link, Qed.linkTo, Qed.styleSheet, Qed.theme,
          Qed.cls, Qed.attr, Qed.role, Qed.rawHtml, Qed.on,
          Qed.onValue, Qed.onClick, Qed.onInput, Qed.onChange, Qed.onCheck, Qed.onKeydown,
          Qed.onKeyup, Qed.onSubmit, Qed.onBlur, Qed.onFocus, Qed.onDoubleClick, Qed.onMouseDown,

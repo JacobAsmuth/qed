@@ -40,10 +40,10 @@ async function measure(root, port) {
   }
 }
 
-const sTempl = await measure('Examples.BenchScalarWeb', 8150);
-const sDiff  = await measure('Examples.BenchScalarDiffWeb', 8151);
-const lTempl = await measure('Examples.BenchListWeb', 8152);
-const lDiff  = await measure('Examples.BenchListDiffWeb', 8153);
+const sTempl = await measure('Examples.Bench.ScalarWeb', 8150);
+const sDiff  = await measure('Examples.Bench.ScalarDiffWeb', 8151);
+const lTempl = await measure('Examples.Bench.ListWeb', 8152);
+const lDiff  = await measure('Examples.Bench.ListDiffWeb', 8153);
 await browser.close();
 
 console.log(`\n  median of ${REPS} updates (ms)\n`);

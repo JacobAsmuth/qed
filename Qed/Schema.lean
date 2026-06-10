@@ -130,7 +130,7 @@ private def toInt? (s : String) : Option Int :=
 /-- A single-line text field (value `String`). -/
 def text : Codec String where
   parse := some; valid := fun _ => True; dec := fun _ => inferInstance
-  render := fun raw set => input [value raw, onInput set]
+  render := fun raw set => el "input" [value raw, onInput set]
 
 /-- A multi-line text field (value `String`). -/
 def textarea : Codec String where
@@ -140,23 +140,23 @@ def textarea : Codec String where
 /-- A number field parsed to a `Nat` (rejects negatives and non-numbers). -/
 def nat : Codec Nat where
   parse := fun s => s.toNat?; valid := fun _ => True; dec := fun _ => inferInstance
-  render := fun raw set => input [type' "number", attr "min" "0", value raw, onInput set]
+  render := fun raw set => el "input" [type' "number", attr "min" "0", value raw, onInput set]
 
 /-- A number field parsed to an `Int`. -/
 def int : Codec Int where
   parse := toInt?; valid := fun _ => True; dec := fun _ => inferInstance
-  render := fun raw set => input [type' "number", value raw, onInput set]
+  render := fun raw set => el "input" [type' "number", value raw, onInput set]
 
 /-- A checkbox (value `Bool`). `refine (· = true)` makes it required. -/
 def checkbox : Codec Bool where
   parse := fun s => some (s == "true"); valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set =>
-    input [type' "checkbox", checked (raw == "true"), onCheck (fun b => set (toString b))]
+    el "input" [type' "checkbox", checked (raw == "true"), onCheck (fun b => set (toString b))]
 
 /-- A date field parsed to a verified `Qed.Date` (an impossible date is rejected). -/
 def date : Codec Date where
   parse := Date.parse?; valid := fun _ => True; dec := fun _ => inferInstance
-  render := fun raw set => input [type' "date", value raw, onInput set]
+  render := fun raw set => el "input" [type' "date", value raw, onInput set]
 
 /-- A `<select>` over `(value, label)` options; the value must be one of them. -/
 def select (options : List (String × String)) : Codec String where
@@ -173,7 +173,7 @@ def radios (group : String) (options : List (String × String)) : Codec String w
   render := fun raw set =>
     el "div" [cls "qed-radios"]
       (options.map fun (v, lbl) =>
-        label [] [input [type' "radio", Qed.name group, value v, checked (raw == v), onChange set], lbl])
+        el "label" [] [el "input" [type' "radio", Qed.name group, value v, checked (raw == v), onChange set], lbl])
 
 /-- Lift any JSON-codable type into a field that rides the JSON but has no form widget,
     for a nested record or a list, e.g. `author : Codec.json Author`,
@@ -330,12 +330,12 @@ elab_rules : command
         `(term|
             (if ($inp).inForm then
               [(let bad := d.$f:ident != "" && ($rc).isNone
-                label [cls "qed-field", attr "aria-invalid" (if bad then "true" else "false")]
-                  ([ span [cls "qed-label"] [$nameLit],
+                el "label" [cls "qed-field", attr "aria-invalid" (if bad then "true" else "false")]
+                  ([ el "span" [cls "qed-label"] [$nameLit],
                      ($inp).render (d.$f:ident) (fun v => onEdit { d with $f:ident := v }) ]
-                   ++ (if bad then [span [cls "qed-error"] [$errLit]] else [])))]
+                   ++ (if bad then [el "span" [cls "qed-error"] [$errLit]] else [])))]
              else []))
-      let submitBtn ← `(term| button [disabled (!($parseApp d).isSome), onClick submit] "Submit")
+      let submitBtn ← `(term| el "button" [disabled (!($parseApp d).isSome), onClick submit] "Submit")
       let viewBody ← rowGroups.foldrM (init := ← `(term| [$submitBtn])) fun g acc => `(term| $g ++ $acc)
       -- built as separate commands (not one multi-command quotation) and elaborated in dependency
       -- order, since `elabCommand` runs one command at a time.
@@ -354,7 +354,7 @@ elab_rules : command
               $canApp d = true ↔ $rhs := by unfold $canId $parseId; $casesTac),
         ← `(command| def $viewId {msg : Type} $[($cbns:ident : $cbts:term)]* (d : $draftId)
               (onEdit : $draftId → msg) (submit : msg) : Html msg :=
-              div [cls "qed-form"] $viewBody) ]
+              el "div" [cls "qed-form"] $viewBody) ]
       -- JSON codec. `toJson`/`fromJson`/`decode`/`encode` are generated for EVERY schema, threading
       -- any context binders as leading arguments, so a context-parameterised schema still has a JSON
       -- codec (e.g. `Appt.decode today s`). Only the `ToJson`/`FromJson` *instances* are restricted to

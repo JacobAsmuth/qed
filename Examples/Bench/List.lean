@@ -5,8 +5,8 @@
   signal, so a value-only update (keys unchanged) pushes just the changed rows with a direct
   `setSignal` — no diff, no `childAt`.
 
-  The same `app` runs both ways: `Examples/BenchListWeb` (template) and
-  `Examples/BenchListDiffWeb` (diff). Benched by `test/bench_template.mjs`.
+  The same `app` runs both ways: `Examples/Bench/ListWeb` (template) and
+  `Examples/Bench/ListDiffWeb` (diff). Benched by `test/bench_template.mjs`.
 
   Pure Lean.
 -/

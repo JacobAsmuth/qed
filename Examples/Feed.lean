@@ -1,10 +1,12 @@
 /-
-  Feed — a TikTok-style scrollable feed of card components, each with its own contract,
+  Tour 07 · Lifting a contract over a list
+
+  Feed: a TikTok-style scrollable feed of card components, each with its own contract,
   the parent holding them as a *sorted* keyed list. Demonstrates `for_each`: a child
   component's invariant lifted to "every card in the feed stays valid", across the
   feed's own transition (re-rank / dismiss / load), in one line and with no proof.
 
-  Pure Lean; the invariants are erased at runtime, so there is no browser entry — the
+  Pure Lean; the invariants are erased at runtime, so there is no browser entry; the
   guarantee is that this file *builds* (the kernel checked every lift).
 -/
 import Qed
@@ -35,12 +37,11 @@ def likeOn  : Style := css [ color "#ff2d55", fontWeight "700" ]
 def likeOff : Style := css [ color "#8a8a8a" ]
 
 def view (c : Model) : Html Msg :=
-  article [role "card", cls "feed-card"] [
-    progress [attr "max" (toString c.duration), value (toString c.progress)] [],
-    strong   [] [text s!"@{c.author}"],
-    button   [role "like", onClick .toggleLike, if c.liked then likeOn else likeOff]
-             [text s!"♥ {c.likes}"]
-  ]
+  <article role="card" class="feed-card">
+    <progress max={toString c.duration} value={toString c.progress}/>
+    <strong>{s!"@{c.author}"}</strong>
+    <button role="like" onClick={.toggleLike} {if c.liked then likeOn else likeOff}>{s!"♥ {c.likes}"}</button>
+  </article>
 
 def component : Component Model Msg := { update, view }
 
@@ -79,17 +80,17 @@ def update (m : Model) : Msg → Model
                             nextId := m.nextId + 1 }
 
 def view (m : Model) : Html Msg :=
-  sectionEl [cls "feed"] (m.cards.toList.map fun c => cardView c)
+  <section class="feed">{m.cards.map fun c => cardView c}</section>
 
 def init : Model := { cards := #[], nextId := 0 }
 def app : App Model Msg := mkApp init update (View.ofHtml view)
 
--- ③ EVERY card in the feed stays Safe — across taps, re-rank, dismiss, append.   one line, auto
+-- ③ EVERY card in the feed stays Safe, across taps, re-rank, dismiss, append.   one line, auto
 --    keyed tap → the child contract carries it; `rank` sorts (verified `sortBy`);
 --    `dismiss` only filters; `append`'s new card is Safe by construction.
 invariant feedSafe : cardSafe for_each cards preserved_by update
 
--- ④ EVERY rendered card in the feed is correctly styled — the whole `view`, chrome and cards.
+-- ④ EVERY rendered card in the feed is correctly styled: the whole `view`, chrome and cards.
 --    Same `for_each`, over the view instead of the transition; `cardStyled` closes each card.
 invariant feedStyled : cardStyled for_each cards holds_in view
 

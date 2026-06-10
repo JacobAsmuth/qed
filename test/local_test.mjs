@@ -1,14 +1,14 @@
-// local_test.mjs — end-to-end test for keyed local-state components (`useState`).
+// local_test.mjs: end-to-end test for keyed local-state components (`useState`).
 //
 // Builds the local-state web entry to .qed/dev, serves it (cross-origin isolated),
 // then drives the real app in headless Chromium. It covers the whole feature:
-//   • local + sibling isolation — a widget update touches only that widget.
-//   • caret — typing in a local note keeps focus + value across local re-renders.
-//   • bubble — a widget's Report reaches the root `update`.
-//   • init-from-props — each widget's note is seeded from its row label (.localInit).
-//   • nesting — a Tag inside a Widget bubbles up to the Widget (two levels deep).
-//   • unmount GC — removing a row drops its (and its nested tag's) state.
-//   • snapshot/restore — the whole local store round-trips through window.qed.
+//   • local + sibling isolation: a widget update touches only that widget.
+//   • caret: typing in a local note keeps focus + value across local re-renders.
+//   • bubble: a widget's Report reaches the root `update`.
+//   • init-from-props: each widget's note is seeded from its row label (.localInit).
+//   • nesting: a Tag inside a Widget bubbles up to the Widget (two levels deep).
+//   • unmount GC: removing a row drops its (and its nested tag's) state.
+//   • snapshot/restore: the whole local store round-trips through window.qed.
 import { spawn, spawnSync } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import puppeteer from 'puppeteer';
@@ -60,6 +60,23 @@ try {
   const tag    = (sel, mark) => page.$eval(sel, (el, mark) => { el.dataset.mark = mark; }, mark);
   const markOf = (sel) => page.$eval(sel, (el) => el.dataset.mark || '');
 
+  // --- the standalone Stepper: set sites as first-order messages ---
+  const stepCount = () => page.$eval('#app .solo .stepper .count', (e) => e.textContent);
+  const stepSaved = () => page.$eval('#app .solo .stepper .savedv', (e) => e.textContent);
+  const stepClick = async (sel) => {
+    await page.evaluate((s) => document.querySelector(`#app .solo .stepper ${s}`).click(), sel);
+    await sleep(30);
+  };
+  check('stepper starts at its declared default', await stepCount(), '0');
+  await stepClick('.dec');
+  check('decrement at 0 stays 0 (the clamp stepperSafe is proven on)', await stepCount(), '0');
+  await stepClick('.inc'); await stepClick('.inc');
+  check('two increments', await stepCount(), '2');
+  await stepClick('.save');
+  check('save copies count into saved (cross-field set)', await stepSaved(), '2');
+  await stepClick('.inc'); await stepClick('.save');
+  check('save reads the count at delivery time, not a captured one', await stepSaved(), '3');
+
   // --- init-from-props: each widget seeded from its row (note = label) ---
   check('two rows mounted', await labels(), ['Alpha', 'Beta']);
   check('row A widget starts at 0', await countAt(A), '0');
@@ -108,8 +125,8 @@ try {
 
   // --- snapshot / restore: the whole local store round-trips ---
   const snap = await snapshot();
-  check('snapshot holds row 0 widget state', JSON.parse(snap['widget@0']).count, 3);
-  check('snapshot holds the nested tag state', JSON.parse(snap['tag@t0']).on, true);
+  check('snapshot holds row 0 widget state', JSON.parse(snap['Local.Widget@0']).count, 3);
+  check('snapshot holds the nested tag state', JSON.parse(snap['Local.Tag@t0']).on, true);
   await clickIn(A, '.inc'); await clickIn(A, '.inc');     // count 3 → 5
   await page.type(`${A} .widget .note`, 'ZZZ');           // note drift
   check('local state drifted before restore', await countAt(A), '5');
@@ -120,7 +137,7 @@ try {
 
   // --- unmount GC: removing a row drops its (and its nested tag's) state ---
   check('store has row 1 widget + tag before removal',
-    [snap['widget@1'] !== undefined, snap['tag@t1'] !== undefined], [true, true]);
+    [snap['Local.Widget@1'] !== undefined, snap['Local.Tag@t1'] !== undefined], [true, true]);
   await page.evaluate(() => {
     const li = [...document.querySelectorAll('#app .rows .row')].find((e) => e.querySelector('.label').textContent === 'Beta');
     li.querySelector('.rm').click();
@@ -128,9 +145,9 @@ try {
   await sleep(50);
   const after = await snapshot();
   check('Beta removed', await labels(), ['Alpha', 'Gamma']);
-  check('removed row widget state was GC-ed', after['widget@1'], undefined);
-  check('removed row nested tag state was GC-ed', after['tag@t1'], undefined);
-  check('surviving row state kept', JSON.parse(after['widget@0']).count, 3);
+  check('removed row widget state was GC-ed', after['Local.Widget@1'], undefined);
+  check('removed row nested tag state was GC-ed', after['Local.Tag@t1'], undefined);
+  check('surviving row state kept', JSON.parse(after['Local.Widget@0']).count, 3);
 } finally {
   await browser.close();
   server.kill('SIGTERM');

@@ -27,6 +27,11 @@ re-reading two hundred lines of `update` is not.
 so the gaps are visible. If you (or an agent) are changing the state of the program, you can
 almost always make *some* claim about it.
 
+This is also why a `component` declaration compiles its `set` handlers to a generated `Msg` with
+one named constructor per site, never to a closure: `invariant … preserved_by Name.update` reduces
+over the generated cases exactly as over hand-written ones, and a failure names the `set` site that
+broke the property (``case `set_count_2` still needs: 0 ≤ m.count - 1``). See `Examples/Local.lean`.
+
 ## The two forms
 
 **Automatic.** State the property; the discharger handles it. It covers arithmetic (`omega`),
@@ -129,7 +134,7 @@ test happened to render. Tag the element with the `role` attribute and the predi
 
 ```lean
 def view (m : Model) : Html Msg :=
-  div [] [ button [ role "status", if m.on then onStyle else offStyle ] [ text "…" ] ]
+  <div><button role="status" {if m.on then onStyle else offStyle}>…</button></div>
 ```
 
 Ready predicates (all `Html msg → Bool`, all auto-discharging):
@@ -221,6 +226,8 @@ have to establish that first.
   list edited by `.map`/`.push`, with a `:=` proof, this is what makes the keyed diff sound.
 - `Examples/Live.lean`, `nonNegative`, a bound preserved by handlers that read the live model,
   automatic.
+- `Examples/Local.lean`, `stepperSafe`, a bound on a `component`-generated update (the `set` sites
+  are the cases), automatic.
 - `Examples/Socket.lean`, `composerOnlyWhenOnline` (`draft ≠ "" → conn = .online`), a precondition
   on an effectful state machine, automatic, the guards that make it hold also clear a stale draft
   on disconnect.

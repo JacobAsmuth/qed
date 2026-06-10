@@ -19,6 +19,7 @@ import Qed.Schema
 import Qed.Component
 import Qed.ForEach
 import Qed.View
+import Qed.Jsx
 import Qed.Resource
 import Qed.Style
 -- Note: `Qed.Dom` and `Qed.Driver` are intentionally NOT re-exported here. They

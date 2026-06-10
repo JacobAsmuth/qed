@@ -268,7 +268,11 @@ total, a local component's typed `view`/`update` are erased here behind a string
 boundary. The child's **state** is serialized (`ToJson`/`FromJson`); its **message**
 type stays internal (wired by the driver), so it needs no codec. A child may emit a
 typed **output** that the host's `bubble` maps to a parent message (`localMountWith`),
-the one type-safe channel from a self-contained child back to the root `update`. -/
+the one type-safe channel from a self-contained child back to the root `update`.
+
+Everything in this section is the *substrate* the `component` declaration
+(`Qed.Component`) elaborates onto, the way JSX elaborates onto `el`: components are
+written as `component Name where state … view => …`, not against these directly. -/
 
 /-- A child message, erased to its effect on serialized state. `run currentState`
     yields the next serialized state and an optional serialized output to bubble up. -/
@@ -455,13 +459,15 @@ def LocalDef.ofSimple {S M : Type} [ToJson S] [FromJson S]
 
 /-- Mount a registered local component at instance `key`, ignoring any output: a
     self-contained `useState` cell. `key` need only be unique *within* `component`
-    (the driver namespaces it by component) and stable across renders. -/
+    (the driver namespaces it by component) and stable across renders. What a
+    declared component's `Name.mount` expands to. -/
 def localMount (component key : String) : Attr msg :=
   .localCell key component none (fun _ => none)
 
 /-- Mount a registered local component at instance `key`, mapping its serialized
     output through `onOut` to an optional parent message, the type-safe way a child
-    event reaches the root `update`. -/
+    event reaches the root `update`. What a declared component's `Name.mountWith`
+    expands to. -/
 def localMountWith {O msg : Type} [FromJson O] (component key : String)
     (onOut : O → Option msg) : Attr msg :=
   .localCell key component none fun s =>

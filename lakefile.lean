@@ -35,7 +35,7 @@ lean_exe qed where
 /-- Native performance benchmarks for the rebuild + diff pipeline. `lake exe bench`.
     Pure Lean (no DOM externs), so it links natively. -/
 lean_exe bench where
-  root := `Examples.Bench
+  root := `Examples.Bench.Pipeline
 
 /-- Dynamic per-request SSR of the Users app: `lake exe users_ssr <path>` prints the full
     page for that route, profile filled server-side. A front server calls it per request. -/

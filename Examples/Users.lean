@@ -1,4 +1,6 @@
 /-
+  Tour 11 · Routing and HTTP
+
   A URL-routed app: HTTP fetch + decode, the verified router wired to the browser,
   and the form/keyboard/focus events.
 
@@ -71,24 +73,24 @@ def profileQuery : Query Model Msg :=
 
 def app : App Model Msg :=
   ui init transition (onRoute := Msg.routed) (queries := [profileQuery]) fun m =>
-    div [cls "app"] [
-      nav [] [ linkTo R.home [cls "home-link"] "Home" ],
-      match m.route with
-      | .home =>
-          formEl [cls "search", onSubmit .submit] [
-            input [cls (if m.focused then "q focused" else "q"), value m.query,
-                   placeholder "Find a user…",
-                   onInput .typeQuery, onFocus .focus, onBlur .blur, onKeydown .key],
-            button [cls "go", type' "submit"] "Search",
-            div [cls "hint"] [ "try ", linkTo (R.user "ada") [] "ada", " or ", linkTo (R.user "alan") [] "alan" ]
-          ]
-      | .user name =>
-          div [cls "profile"] [
-            h1 [] [name],
-            m.profile.view (fun prof => p [cls "bio"] [prof.bio])
-              (loading := p [cls "loading"] ["Loading…"])
-              (failed  := fun e => p [cls "error"] ["Error: ", e])
-          ]
-    ]
+    <div class="app">
+      <nav>{linkTo R.home [cls "home-link"] "Home"}</nav>
+      {match m.route with
+       | .home =>
+           <form class="search" onSubmit={.submit}>
+             <input class={if m.focused then "q focused" else "q"} value={m.query}
+                    placeholder="Find a user…"
+                    onInput={.typeQuery} onFocus={.focus} onBlur={.blur} onKeydown={.key}/>
+             <button class="go" type="submit">Search</button>
+             <div class="hint">try {linkTo (R.user "ada") [] "ada"} or {linkTo (R.user "alan") [] "alan"}</div>
+           </form>
+       | .user name =>
+           <div class="profile">
+             <h1>{name}</h1>
+             {m.profile.view (fun prof => <p class="bio">{prof.bio}</p>)
+               (loading := <p class="loading">Loading…</p>)
+               (failed  := fun e => <p class="error">Error: {e}</p>)}
+           </div>}
+    </div>
 
 end Users

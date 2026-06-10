@@ -1,9 +1,13 @@
 /-
-  The counter demo: pure Lean, total by elaboration, with a machine-checked
-  state-machine invariant. This module defines only the *application*; the thin
-  entry points that run it live in `Examples/Native.lean` (renders to stdout) and
-  `Examples/Web.lean` (mounts in the browser), so the same verified `app` drives
-  both targets.
+  Tour 01 · The architecture
+
+  The whole shape of a Qed app: a `Model` (the state), a `Msg` (every event), a pure
+  total `update`, a JSX `view`, and `ui` to build the `App`. Plus the first invariant:
+  state a property of the model and the build proves every transition preserves it.
+
+  This module is only the *application*; the entry points that run it live in
+  `Examples/Native.lean` (renders to stdout) and `Examples/Web.lean` (mounts in the
+  browser), so the same verified `app` drives both targets.
 -/
 import Qed
 
@@ -31,24 +35,19 @@ def update (m : Model) : Msg → Model
   | .decrement => { m with count := if 0 < m.count then m.count - 1 else m.count }
   | .reset     => { m with count := 0 }
 
--- The view reads like markup, but every event is a typed `Msg`, so a typo such as
--- `onClick .incremnt` would not compile. `ui` builds the app from it.
+-- The view is JSX, but every event is a typed `Msg`, so a typo such as
+-- `onClick={.incremnt}` would not compile. `ui` builds the app from it.
 def app : App Model Msg := ui init update fun m =>
-  div [] [
-    div [cls "counter"] [
-      button [onClick .decrement] "−",
-      span   [cls "count"]        [m.count],
-      button [onClick .increment] "+",
-      button [onClick .reset]     "reset"
-    ],
-    -- Only the count above is a binding, so typing here keeps its focus and cursor.
-    input [placeholder "type here, focus survives every click"],
-    -- A static subtree: built once, then never touched again.
-    div [cls "banner", attr "id" "banner"] ["built once, then memoized"],
-    -- The count text is a binding: it updates in place while its node stays put.
-    div [cls "echo", attr "id" "echo"] [text s!"count is {m.count}"]
-  ]
+  <div class="counter">
+    <button onClick={.decrement}>−</button>
+    <span class="count">{m.count}</span>
+    <button onClick={.increment}>+</button>
+    <button onClick={.reset}>reset</button>
+    -- Untracked DOM state: only the count above is bound to the model, so typing
+    -- here keeps its value, focus, and cursor across every click.
+    <input placeholder="type here, focus survives every click"/>
+  </div>
 
--- Dream-API #3: we state the safety property; the framework generates and
--- machine-checks that *every* transition preserves it. No proof written by hand.
+-- State the safety property; the framework generates and machine-checks that *every*
+-- transition preserves it. No proof written by hand.
 invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update

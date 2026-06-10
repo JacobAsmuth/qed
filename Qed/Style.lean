@@ -8,7 +8,7 @@
         padding (rem 1), border "1px solid #ddd", radius (px 8),
         nest "&:hover" [ transform "translateY(-2px)" ] ]
 
-      div [card] [ … ]                 -- `card` coerces to its class attribute
+      <div {card}> … </div>            -- `card` coerces to its class attribute
       styleSheet [card, button, …]      -- once in your view: emits one <style>
 
   The class name is a hash of the CSS, so identical styles dedup and names can never

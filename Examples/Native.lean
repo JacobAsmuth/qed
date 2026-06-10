@@ -1,7 +1,9 @@
 /-
+  Tour 02 · The same app, native
+
   Native entry point for the counter demo. Two jobs, both browser-free:
 
-  * server-side render — emit a complete static HTML document for the app's initial state
+  * server-side render: emit a complete static HTML document for the app's initial state
     (`App.renderInitial` runs the *same* verified `view`/`render` the browser uses), so the
     page's first paint is the real UI and the client just mounts over it; and
   * a sanity check that a few reachable states produce the markup we expect.

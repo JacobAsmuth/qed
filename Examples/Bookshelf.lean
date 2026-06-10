@@ -1,4 +1,6 @@
 /-
+  Tour 15 · Everything together
+
   Bookshelf: a small catalog that wires the whole stack into one app: routing, a
   typed remote `Resource` (a list and a single record, fetched and decoded), a
   validated `schema` whose form POSTs and navigates to the result, and scoped styles.
@@ -111,20 +113,20 @@ def card : Style := css [
   padding "1rem 1.25rem", border "1px solid #ddd", radius (px 8) ]
 
 def bookList (books : Array Book) : Html Msg :=
-  ul [cls "books"] (books.toList.map fun b =>
-    li [key b.id] [
-      link (Router.toURL (R.detail b.id)) [navlink, cls "book-link"] [text b.title],
-      span [cls "byline"] [text s!" by {b.author}"]
-    ])
+  <ul class="books">{books.map fun b =>
+    <li key={b.id}>
+      {link (Router.toURL (R.detail b.id)) [navlink, cls "book-link"] [text b.title]}
+      <span class="byline">{s!" by {b.author}"}</span>
+    </li>}</ul>
 
 def bookCard (b : Book) : Html Msg :=
-  div [card, cls "book"] [
-    h1 [] [text b.title],
-    p [cls "author"] [text s!"by {b.author} ({b.year})"],
-    p [cls "genre"] [b.genre],
-    p [cls (if b.inPrint then "in-print" else "out-of-print")]
-      [text (if b.inPrint then "In print" else "Out of print")]
-  ]
+  <div {card} class="book">
+    <h1>{text b.title}</h1>
+    <p class="author">{s!"by {b.author} ({b.year})"}</p>
+    <p class="genre">{b.genre}</p>
+    <p class={if b.inPrint then "in-print" else "out-of-print"}>
+      {if b.inPrint then "In print" else "Out of print"}</p>
+  </div>
 
 /-- Serialize the route + fetched data into the page, so a deep-linked SSR load starts the
     client from the same model the server drew, no flash, no refetch. The route rides the URL
@@ -149,30 +151,33 @@ def rehydrateModel (s : String) : Option Model :=
 
 def appBase : App Model Msg :=
   ui init transition (onRoute := Msg.routed) fun m =>
-    div [shell, cls "app"] [
-      theme [ brand.set "#06c" ],
-      styleSheet [shell, topnav, navlink, card],
-      nav [topnav] [ link "/" [navlink] ["Catalog"], link "/new" [navlink] ["Add a book"] ],
-      match m.route with
-      | .catalog =>
-          div [cls "catalog"] [
-            h1 [] ["Bookshelf"],
-            m.catalog.view (fun books => bookList books)
-              (loading := p [cls "loading"] ["Loading catalog…"])
-              (failed  := fun e => p [cls "error"] ["Error: ", text e])
-          ]
-      | .detail _ =>
-          div [cls "detail"] [
-            m.current.view (fun b => bookCard b)
-              (loading := p [cls "loading"] ["Loading…"])
-              (failed  := fun e => p [cls "error"] ["Error: ", text e])
-          ]
-      | .newBook =>
-          div [cls "new"] [
-            h1 [] ["Add a book"],
-            Book.formView m.draft Msg.edit Msg.submit
-          ]
-    ]
+    <div {shell} class="app">
+      {theme [ brand.set "#06c" ]}
+      {styleSheet [shell, topnav, navlink, card]}
+      <nav {topnav}>
+        {link "/" [navlink] ["Catalog"]}
+        {link "/new" [navlink] ["Add a book"]}
+      </nav>
+      {match m.route with
+       | .catalog =>
+           <div class="catalog">
+             <h1>Bookshelf</h1>
+             {m.catalog.view (fun books => bookList books)
+               (loading := <p class="loading">Loading catalog…</p>)
+               (failed  := fun e => <p class="error">{"Error: "}{e}</p>)}
+           </div>
+       | .detail _ =>
+           <div class="detail">
+             {m.current.view (fun b => bookCard b)
+               (loading := <p class="loading">Loading…</p>)
+               (failed  := fun e => <p class="error">{"Error: "}{e}</p>)}
+           </div>
+       | .newBook =>
+           <div class="new">
+             <h1>Add a book</h1>
+             {Book.formView m.draft Msg.edit Msg.submit}
+           </div>}
+    </div>
 
 /-- The app, with dehydration wired in (so an SSR deep link hydrates without refetching). -/
 def app : App Model Msg := { appBase with dehydrate := dehydrateModel, rehydrate := rehydrateModel }

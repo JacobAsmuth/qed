@@ -1,15 +1,15 @@
 /-
   A Qed app for the head-to-head benchmark against React (`test/bench_react.mjs`). It is
-  a keyed list with the standard operations — create 10k, update every 10th row, swap two,
-  reorder all (reverse), clear — exposed as dispatch ids 0–4 (the op buttons render first).
+  a keyed list with the standard operations: create 10k, update every 10th row, swap two,
+  reorder all (reverse), clear, exposed as dispatch ids 0..4 (the op buttons render first).
 
   This is written the only way there is to write it: an ordinary `view`. The framework
-  decides per operation how to render and update — a value-only change patches just the
-  changed bindings, a shape change reconciles through the verified diff — with nothing for
+  decides per operation how to render and update: a value-only change patches just the
+  changed bindings, a shape change reconciles through the verified diff, with nothing for
   the developer to opt into. The React app in `test/react_bench.html` renders an identical
   DOM and runs the identical operations.
 
-  Pure Lean; the browser entry is `Examples/BenchAppWeb.lean`.
+  Pure Lean; the browser entry is `Examples/Bench/AppWeb.lean`.
 -/
 import Qed
 open Qed
@@ -45,16 +45,16 @@ def update (m : Model) : Msg → Model
   | .clear   => { rows := #[] }
 
 def app : App Model Msg := ui init update fun _m =>
-  div [] [
-    div [cls "ops"] [
-      button [onClick .create]  "create",
-      button [onClick .update]  "update",
-      button [onClick .swap]    "swap",
-      button [onClick .reverse] "reverse",
-      button [onClick .clear]   "clear"
-    ],
-    ul [attr "id" "list"] (_m.rows.map fun r =>
-      li [key (toString r.id), cls "row"] [span [cls "lbl"] [r.label], span [cls "id"] [toString r.id]])
-  ]
+  <div>
+    <div class="ops">
+      <button onClick={.create}>create</button>
+      <button onClick={.update}>update</button>
+      <button onClick={.swap}>swap</button>
+      <button onClick={.reverse}>reverse</button>
+      <button onClick={.clear}>clear</button>
+    </div>
+    <ul id="list">{_m.rows.map fun r =>
+      <li key={toString r.id} class="row"><span class="lbl">{r.label}</span><span class="id">{toString r.id}</span></li>}</ul>
+  </div>
 
 end BenchApp

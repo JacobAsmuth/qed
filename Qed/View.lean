@@ -428,7 +428,7 @@ def static (h : Html msg) : View σ msg := .static h
 
 /-- A bare string is static text. -/
 instance : Coe String (View σ msg) := ⟨.text⟩
-/-- …and a lone string is a one-element child list, so `button [..] "Save"` works. -/
+/-- …and a lone string is a one-element child list, so `<button …>Save</button>` works. -/
 instance : Coe String (List (View σ msg)) := ⟨fun s => [.text s]⟩
 
 /-- A generic element. -/
@@ -472,7 +472,7 @@ def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → S
   -- fold a fingerprint of it in, so a change there reconciles through the verified keyed
   -- `diff` instead of being missed by the signal path. Plain rows keep the bare key.
   let rkey : α → String :=
-    if View.hasOpaque child then (fun a => s!"{key a} {View.collectShape child a}") else key
+    if View.hasOpaque child then (fun a => s!"{key a}\x00{View.collectShape child a}") else key
   .keyedList tag attrs
     (fun s => (items s).map rkey)                             -- keys: drive the structural decision
     (fun s => (items s).map (fun a => Qed.refMark a))         -- marks: a per-row identity stamp
@@ -497,11 +497,11 @@ view: native control flow is lifted into the reactive combinators, so the dynami
 need no special syntax.
 
     view% fun m =>
-      div [cls "page"] [
-        h1 [] [text s!"Hello, {m.name}"],     -- interpolation → `dyn (fun m => …)`
+      el "div" [cls "page"] [
+        el "h1" [] [text s!"Hello, {m.name}"],  -- interpolation → `dyn (fun m => …)`
         if m.count == 0                         -- a model-driven `if` → `ifElse`
-          then p [] "nothing yet"
-          else p [] [text s!"count is {m.count}"],
+          then el "p" [] ["nothing yet"]
+          else el "p" [] [text s!"count is {m.count}"],
         forEach "ul" (·.todos) (·.id) row       -- lists stay explicit (need a key)
       ]
 
@@ -538,7 +538,7 @@ private def viewFormers : List String :=
    "ifElse", "showIf", "forEach", "static", "dynNode"]
 
 open Lean in
-/-- The leftmost identifier in function position (`div [..] [..]` ↦ `div`). -/
+/-- The leftmost identifier in function position (`el "div" [..] [..]` ↦ `el`). -/
 private partial def headIdent? : Syntax → Option Name
   | .ident _ _ n _ => some n
   | .node _ _ args => if 0 < args.size then headIdent? args[0]! else none
@@ -623,9 +623,37 @@ private def unparen (stx : Syntax) : Syntax :=
   if stx.getKind == kParen && stx.getArgs.size == 3 then stx.getArgs[1]! else stx
 
 open Lean in
-/-- View `stx` as `xs.map f`: returns `(xs, f)`, with `xs` rebuilt as an identifier that
+/-- View `stx` as an element former applied to args: `el "tag" [..] [..]` ↦
+    `("tag", #[attrs, kids])`, the form JSX expands to (so *every* tag takes the
+    fine-grained path), and a named former `div [..] [..]` ↦ `("div", #[attrs, kids])`. -/
+private def asElementApp? (stx : Syntax) : Option (String × Array Syntax) :=
+  match asApp? (unparen stx) with
+  | some (fn, args) =>
+      match fn with
+      | .ident _ _ n _ =>
+          if lastStr? n.eraseMacroScopes == some "el" then
+            if 0 < args.size then
+              match args[0]!.isStrLit? with
+              | some tag => some (tag, args.extract 1 args.size)
+              | none     => none
+            else none
+          else
+            match elementTag? n with
+            | some tag => some (tag, args)
+            | none     => none
+      | _ => none
+  | none => none
+
+open Lean in
+/-- View `stx` as `xs.map f` (possibly wrapped in `(…).toList`, the shape JSX emits
+    for a list child): returns `(xs, f)`, with `xs` rebuilt as an identifier that
     keeps the source position so a bound scope variable still resolves. -/
 private def asMap? (stx : Syntax) : Option (Syntax × Syntax) :=
+  let stx :=
+    let s := unparen stx
+    if s.getKind == `Lean.Parser.Term.proj && s.getArgs.size == 3
+        && s.getArgs[2]!.getId.eraseMacroScopes == `toList
+    then s.getArgs[0]! else stx
   match asApp? (unparen stx) with
   | some (fn, args) =>
       if args.size == 1 then
@@ -746,9 +774,7 @@ mutual
       lifted. `none` if `stx` is not such a former, or its attrs/children are not list literals (so
       the caller's `catchAll` wraps the whole element instead). -/
   partial def tryElement (m : Ident) (stx : Syntax) : MacroM (Option Syntax) := do
-    let some (fn, args) := asApp? (unparen stx) | return none
-    let some n := (match fn with | .ident _ _ nm _ => some nm | _ => none) | return none
-    let some tag := elementTag? n | return none
+    let some (tag, args) := asElementApp? stx | return none
     if args.size > 2 then return none
     let empty : Term ← `([])
     let attrsO ← if args.size ≥ 1 then liftAttrList m args[0]! else pure (some empty)
@@ -821,41 +847,42 @@ mutual
         return none
     | _ => return none
 
-  /-- An element `el [attrs] (xs.map fun x => row)` with a keyed row → `forEach`. -/
+  /-- An element `el "tag" [attrs] (xs.map fun x => row)` with a keyed row → `forEach`. -/
   partial def tryForEach (m : Ident) (stx : Syntax) : MacroM (Option Syntax) := do
-    let some (fnP, pargs) := asApp? stx | return none
-    match fnP with
-    | .ident _ _ pn _ =>
-        let some tag := elementTag? pn | return none
-        if pargs.size != 2 then return none
-        let some (xs, funArg) := asMap? pargs[1]! | return none
-        let some (binder, body) := asFun? funArg | return none
-        let binderId : Ident := ⟨binder⟩
-        let attrsL : Term ← (match ← liftAttrList m pargs[0]! with | some a => pure a | none => pure ⟨pargs[0]!⟩)
-        let xsT    : Term := ⟨xs⟩
-        let tagL   : Term := ⟨Syntax.mkStrLit tag⟩
-        -- A keyed row (an element carrying `key …`) becomes a fine-grained `forEach`. Anything
-        -- else, a keyless `.map`, or a row that isn't a keyed element, degrades to a `dynNode`
-        -- that renders the list as `Html` and reconciles it through the verified positional
-        -- `diff`. So `.map` never fails to compile; it just isn't fine-grained without a key.
-        let keyOpt ← (match asApp? body with
-                      | some (_, bargs) => if bargs.size ≥ 1 then extractKey bargs[0]! else pure none
-                      | none            => pure none)
-        match keyOpt with
-        | some (keyV, newAttrs) =>
-            let body' := body.setArg 1 (body.getArgs[1]!.setArg 0 newAttrs)
-            let rowL : Term := ⟨← viewLift binderId body'⟩
-            -- a per-list signal namespace from this `.map`'s source position, so two lists over
-            -- the same row keys don't share signal names (which are a process-wide map).
-            let pos   := (stx.getPos?.map (·.byteIdx)).getD 0
-            let prefT : Term := ⟨Syntax.mkStrLit (toString pos ++ "@")⟩
-            return some (← `(Qed.V.forEach $tagL (fun $m => $xsT) (fun $binderId => $keyV) $rowL (attrs := $attrsL) (sigPrefix := $prefT)))
-        | none =>
-            let rowL : Term := ⟨← viewLift binderId body⟩
-            return some (← `(Qed.V.dynNode (fun $m =>
-              Qed.Html.element $tagL (($attrsL).map (Qed.VAttr.eval $m))
-                (($xsT).map (fun $binderId => Qed.View.render $rowL $binderId)).toList)))
-    | _ => return none
+    let some (tag, pargs) := asElementApp? stx | return none
+    if pargs.size != 2 then return none
+    let some (xs, funArg) := asMap? pargs[1]! | return none
+    let some (binder, body) := asFun? funArg | return none
+    let binderId : Ident := ⟨binder⟩
+    let attrsL : Term ← (match ← liftAttrList m pargs[0]! with | some a => pure a | none => pure ⟨pargs[0]!⟩)
+    let xsT    : Term := ⟨xs⟩
+    let tagL   : Term := ⟨Syntax.mkStrLit tag⟩
+    -- A keyed row (an element carrying `key …`) becomes a fine-grained `forEach`. Anything
+    -- else, a keyless `.map`, or a row that isn't a keyed element, degrades to a `dynNode`
+    -- that renders the list as `Html` and reconciles it through the verified positional
+    -- `diff`. So `.map` never fails to compile; it just isn't fine-grained without a key.
+    let rowEl? := asElementApp? body
+    let keyOpt ← (match rowEl? with
+                  | some (_, bargs) => if bargs.size ≥ 1 then extractKey bargs[0]! else pure none
+                  | none            => pure none)
+    match keyOpt, rowEl? with
+    | some (keyV, newAttrs), some (rowTag, bargs) =>
+        -- rebuild the row with the key lifted out of its attrs (the key becomes
+        -- `forEach`'s projection; left in place its row variable would not resolve)
+        let rowTagL : Term := ⟨Syntax.mkStrLit rowTag⟩
+        let rowKids : Term ← if bargs.size ≥ 2 then pure ⟨bargs[1]!⟩ else `([])
+        let body' ← `(Qed.el $rowTagL $newAttrs $rowKids)
+        let rowL : Term := ⟨← viewLift binderId body'⟩
+        -- a per-list signal namespace from this `.map`'s source position, so two lists over
+        -- the same row keys don't share signal names (which are a process-wide map).
+        let pos   := (stx.getPos?.map (·.byteIdx)).getD 0
+        let prefT : Term := ⟨Syntax.mkStrLit (toString pos ++ "@")⟩
+        return some (← `(Qed.V.forEach $tagL (fun $m => $xsT) (fun $binderId => $keyV) $rowL (attrs := $attrsL) (sigPrefix := $prefT)))
+    | _, _ =>
+        let rowL : Term := ⟨← viewLift binderId body⟩
+        return some (← `(Qed.V.dynNode (fun $m =>
+          Qed.Html.element $tagL (($attrsL).map (Qed.VAttr.eval $m))
+            (($xsT).map (fun $binderId => Qed.View.render $rowL $binderId)).toList)))
 end
 
 open Lean in

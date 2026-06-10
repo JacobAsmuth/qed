@@ -28,4 +28,4 @@ import Examples.Socket
 #print axioms Qed.Route.round_trip   -- routing round-trip
 #print axioms Qed.TypedRoute.round_trip  -- routing round-trip with typed Nat/Int params
 #print axioms Qed.Demo.Signup.canSubmit_iff  -- form submit ⇔ valid
-#print axioms Qed.parse_render     -- JSON codec round-trip (structural core)
+#print axioms Qed.parse_render     -- JSON codec round-trip (whole grammar)

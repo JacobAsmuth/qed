@@ -318,8 +318,11 @@ def cmdBuild (prod : Bool) : IO UInt32 := do
   let outDir := if prod then distDir else devDir
   step s!"transpiling Lean → JavaScript → {outDir}/"
   if !(← buildJs outDir prod) then IO.eprintln (red "✗ build failed"); return 1
-  let (_, sz) ← shOut "bash" #["-c", s!"cat {outDir}/*.mjs | gzip -c | wc -c"]
-  IO.println (green s!"✓ build complete → {outDir} (no WASM), {sz.trimmed} bytes gzipped")
+  -- the size a browser downloads: the client bundle only (ssr_app.mjs/ssr.mjs/
+  -- qed_ssr_host.mjs run on the server and are never sent to a client)
+  let (_, sz) ← shOut "bash" #["-c",
+    s!"cat {outDir}/app.mjs {outDir}/qed_rt.mjs {outDir}/qed_dom.mjs {outDir}/qed_host.mjs | gzip -c | wc -c"]
+  IO.println (green s!"✓ build complete → {outDir}, {sz.trimmed} bytes gzipped to the client")
   return 0
 
 /-- Serve a bundle: the node server when the build has an SSR handler (and node is
@@ -417,7 +420,7 @@ def cmdTest : IO UInt32 := do
   if (← (FilePath.mk "test" / "js_gate_test.mjs").pathExists) then
     step "running differential gate (transpiled JS == native Lean)"
     if (← sh "node" #["test/js_gate_test.mjs"]) != 0 then failed := true
-  -- JS transpiler, the FULL transpiled driver (no WASM): build, then drive it in a browser.
+  -- JS transpiler, the FULL transpiled driver: build, then drive it in a browser.
   if (← (FilePath.mk "test" / "js_driver_browser_test.mjs").pathExists) then
     step "building JS bundle + running transpiled-driver browser test"
     if !(← buildJs devDir (prod := false)) then failed := true

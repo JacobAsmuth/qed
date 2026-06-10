@@ -43,9 +43,19 @@ createServer(async (req, res) => {
       let st = null;
       try { st = await stat(file); } catch {}
       if (st?.isFile()) {
+        // dev: never cache. prod: revalidate (no-cache + Last-Modified), so a repeat
+        // visit costs a 304 per file instead of re-downloading the bundle.
+        const lastMod = new Date(st.mtime).toUTCString();
+        const ims = req.headers['if-modified-since'];
+        if (!dev && ims && Math.floor(st.mtimeMs / 1000) <= Math.floor(Date.parse(ims) / 1000)) {
+          res.writeHead(304, { 'last-modified': lastMod });
+          res.end();
+          return;
+        }
         res.writeHead(200, {
           'content-type': MIME[path.extname(file)] ?? 'application/octet-stream',
-          'cache-control': 'no-store',
+          'cache-control': dev ? 'no-store' : 'no-cache',
+          'last-modified': lastMod,
         });
         res.end(await readFile(file));
         return;

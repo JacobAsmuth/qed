@@ -2,7 +2,7 @@
 //
 // Builds the routed users demo to .qed/dev and serves it from a tiny node server
 // that also answers /api/users/<name> with JSON and SPA-falls-back to index.html
-// (so deep links work), with the COOP/COEP headers the pthread WASM needs. Then it
+// (so deep links work). Then it
 // drives the real app in headless Chromium and checks:
 //   • a deep link fetches + decodes a profile (HTTP + Qed.Json),
 //   • link clicks / form submit navigate without a page reload (router),
@@ -28,15 +28,13 @@ const profiles = {
   alan: { name: 'Alan', bio: 'Asked what machines can decide.' },
   slow: { name: 'Slow', bio: 'Arrived late.' },   // served with a delay, to test the stale-response race
 };
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
                '.json': 'application/json', '.css': 'text/css' };
 const server = createServer(async (req, res) => {
   const { pathname } = new URL(req.url, 'http://x');
   const send = (code, type, body) => {
     res.writeHead(code, {
       'Content-Type': type,
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp',
       'Cache-Control': 'no-store',
     });
     res.end(body);
@@ -68,7 +66,7 @@ const check = (label, got, want) => {
 
 const browser = await puppeteer.launch({
   headless: true,
-  args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=SharedArrayBuffer'],
+  args: ['--no-sandbox', '--disable-setuid-sandbox'],
 });
 
 try {

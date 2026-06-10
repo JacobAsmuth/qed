@@ -25,10 +25,10 @@ const serverApp = ssr.stdout.trim().replace('class="count"', 'class="count" data
 if (!serverApp.includes('data-server')) { console.error('could not mark server node'); process.exit(1); }
 const shell = (await readFile(`${SERVE}/index.html`, 'utf8')).replace('loading…', serverApp);
 
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json', '.css': 'text/css' };
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.json': 'application/json', '.css': 'text/css' };
 const server = createServer(async (req, res) => {
   const { pathname } = new URL(req.url, 'http://x');
-  const head = (t) => ({ 'Content-Type': t, 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp', 'Cache-Control': 'no-store' });
+  const head = (t) => ({ 'Content-Type': t, 'Cache-Control': 'no-store' });
   if (pathname === '/' || pathname === '/index.html') { res.writeHead(200, head('text/html')); return res.end(shell); }
   try {
     const buf = await readFile(SERVE + pathname);
@@ -46,14 +46,14 @@ const check = (label, got, want) => {
   if (!ok) failures++;
 };
 
-const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=SharedArrayBuffer'] });
+const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
 try {
   const page = await browser.newPage();
   page.on('pageerror', (e) => { console.log('  [pageerror]', e.message); failures++; });
 
   await page.goto(`http://localhost:${PORT}/index.html`, { waitUntil: 'load' });
   await page.waitForSelector('#app .count', { timeout: 15000 });
-  await sleep(900); // let the wasm instantiate + hydrate
+  await sleep(900); // let the bundle boot + hydrate
 
   const count = () => page.$eval('#app .count', (e) => e.textContent.trim());
   const adopted = () => page.$eval('#app .count', (e) => e.getAttribute('data-server') === '1');

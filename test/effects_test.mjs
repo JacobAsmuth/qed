@@ -33,7 +33,7 @@ const check = (label, got, want) => {
 
 const browser = await puppeteer.launch({
   headless: true,
-  args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=SharedArrayBuffer'],
+  args: ['--no-sandbox', '--disable-setuid-sandbox'],
 });
 
 try {

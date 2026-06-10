@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Mock OpenAI-compatible chat backend for the Qed chat screenshot test.
 
-- Serves the static build (qed.js/.wasm/host.js/index.html) with the COOP/COEP
-  headers the pthread WASM build needs.
+- Serves the static build (the transpiled bundle + index.html).
 - POST /v1/chat/completions streams a canned reply as Server-Sent Events in the
   OpenAI `chat.completions` streaming shape, token by token, then `[DONE]`.
 
@@ -40,8 +39,6 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         super().__init__(*a, directory=DIR, **k)
 
     def end_headers(self):
-        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
-        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 

@@ -1,4 +1,4 @@
-// qed_host.mjs — boots the transpiled-from-Lean driver (no WASM). Ported from host.js:
+// qed_host.mjs: boots the transpiled-from-Lean driver:
 // it marshals browser events into the exported qed_* entry points and supplies the
 // native effects. All UI logic — render, diff, the driver loop — is transpiled Lean.
 import * as app from './app.mjs';

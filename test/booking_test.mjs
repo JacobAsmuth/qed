@@ -34,7 +34,7 @@ const PAST = `${year - 1}-06-15`;
 
 const browser = await puppeteer.launch({
   headless: true,
-  args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=SharedArrayBuffer'],
+  args: ['--no-sandbox', '--disable-setuid-sandbox'],
 });
 
 try {

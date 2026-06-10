@@ -1,8 +1,8 @@
 // socket_test.mjs — end-to-end test for first-class WebSockets (Cmd.wsOpen/wsSend/wsClose).
 //
 // Builds the echo demo to .qed/dev and serves it from a tiny node server that also
-// speaks WebSocket at /echo (a hand-rolled RFC 6455 echo, so there's no `ws` dep),
-// with the COOP/COEP headers the pthread WASM needs. Then it drives the real app in
+// speaks WebSocket at /echo (a hand-rolled RFC 6455 echo, so there's no `ws` dep).
+// Then it drives the real app in
 // headless Chromium and checks the full lifecycle through the pure `update`:
 //   • Connect opens the socket and the onOpen message flips the status to "online",
 //   • a sent line echoes back and arrives as an inbound `received` message,
@@ -36,15 +36,13 @@ const frame = (str) => {
   return Buffer.concat([head, payload]);
 };
 
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
                '.json': 'application/json', '.css': 'text/css' };
 const server = createServer(async (req, res) => {
   const { pathname } = new URL(req.url, 'http://x');
   const send = (code, type, body) => {
     res.writeHead(code, {
       'Content-Type': type,
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp',
       'Cache-Control': 'no-store',
     });
     res.end(body);
@@ -93,7 +91,7 @@ const check = (label, got, want) => {
 
 const browser = await puppeteer.launch({
   headless: true,
-  args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=SharedArrayBuffer'],
+  args: ['--no-sandbox', '--disable-setuid-sandbox'],
 });
 
 try {

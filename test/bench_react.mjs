@@ -1,4 +1,4 @@
-// bench_react.mjs — a fair, in-browser head-to-head: Qed (WASM) vs React (production).
+// bench_react.mjs — a fair, in-browser head-to-head: Qed (transpiled JS) vs React (production).
 //
 // Both render an identical keyed list (`ul#list > li[key] > [span,span]`, 10k rows) and
 // run the identical operations. For each op we measure the SYNCHRONOUS framework cost —
@@ -41,7 +41,7 @@ await sleep(1000);
 const median = (xs) => { xs = xs.slice().sort((a, b) => a - b); return xs[Math.floor(xs.length / 2)]; };
 const fmt = (ms) => (ms < 10 ? ms.toFixed(2) : ms.toFixed(1)).padStart(7);
 
-const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=SharedArrayBuffer'] });
+const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
 
 // time `timeFn` (returns ms) `reps` times → median; `prepFn` (optional) runs untimed first
 async function bench(timeFn, reps, prepFn) {

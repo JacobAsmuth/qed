@@ -1,7 +1,7 @@
 // qed_dom.mjs — the DOM externs for the transpiled driver, ported from runtime/qed_dom.c.
 // Each method follows the IO protocol: it takes the world token last and returns
 // EStateM.Result.ok(value, world). `Node` is a UInt32 handle into globalThis.__qed.nodes
-// (index 0 = null sentinel), exactly as the WASM build's handle table.
+// (index 0 = null sentinel).
 import { mkOk, PUnit } from './qed_rt.mjs';
 
 function Q() {

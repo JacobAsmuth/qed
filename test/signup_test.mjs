@@ -17,7 +17,7 @@ const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.S
   { stdio: 'inherit' });
 if (build.status !== 0) { console.error('build failed'); process.exit(1); }
 
-// mock_llm.py doubles as a static server with the COOP/COEP headers wasm needs.
+// mock_llm.py doubles as a static server for the build.
 const server = spawn('python3', [`${ROOT}test/mock_llm.py`, String(PORT), SERVE], { stdio: 'inherit' });
 await sleep(900);
 
@@ -30,7 +30,7 @@ const check = (label, got, want) => {
 
 const browser = await puppeteer.launch({
   headless: true,
-  args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=SharedArrayBuffer'],
+  args: ['--no-sandbox', '--disable-setuid-sandbox'],
 });
 
 try {

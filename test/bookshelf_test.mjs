@@ -4,8 +4,8 @@
 //
 // Builds Examples.BookshelfWeb to .qed/dev and serves it from a node server that also
 // implements the API (GET /api/books, GET /api/books/<id>, POST /api/books) and
-// SPA-falls-back to index.html for routes (so deep links work), with the COOP/COEP
-// headers the pthread WASM needs. Then it drives the real app in headless Chromium:
+// SPA-falls-back to index.html for routes (so deep links work). Then it drives the
+// real app in headless Chromium:
 //   • a deep link fetches + decodes one book (HTTP + Qed.Json + router),
 //   • the catalog fetches + lists the collection,
 //   • link clicks navigate without a reload,
@@ -35,15 +35,13 @@ const books = [
 ];
 const slug = (t) => t.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
                '.json': 'application/json', '.css': 'text/css' };
 const server = createServer(async (req, res) => {
   const { pathname } = new URL(req.url, 'http://x');
   const send = (code, type, body) => {
     res.writeHead(code, {
       'Content-Type': type,
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp',
       'Cache-Control': 'no-store',
     });
     res.end(body);
@@ -85,7 +83,7 @@ const check = (label, got, want) => {
 
 const browser = await puppeteer.launch({
   headless: true,
-  args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=SharedArrayBuffer'],
+  args: ['--no-sandbox', '--disable-setuid-sandbox'],
 });
 
 try {

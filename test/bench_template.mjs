@@ -14,7 +14,7 @@ const REPS = 30;
 const median = (xs) => { xs = xs.slice().sort((a, b) => a - b); return xs[Math.floor(xs.length / 2)]; };
 const fmt = (ms) => (ms < 10 ? ms.toFixed(3) : ms.toFixed(1));
 
-const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=SharedArrayBuffer'] });
+const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
 
 async function measure(root, port) {
   console.log(`▸ building ${root} → .qed/dev …`);

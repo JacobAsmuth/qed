@@ -28,10 +28,10 @@ if (!serverApp.includes('data-server')) { console.error('could not mark server n
 
 const shell = (await readFile(`${SERVE}/index.html`, 'utf8')).replace('loading…', serverApp);
 
-const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json', '.css': 'text/css' };
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.json': 'application/json', '.css': 'text/css' };
 const server = createServer(async (req, res) => {
   const { pathname } = new URL(req.url, 'http://x');
-  const head = (type) => ({ 'Content-Type': type, 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp', 'Cache-Control': 'no-store' });
+  const head = (type) => ({ 'Content-Type': type, 'Cache-Control': 'no-store' });
   if (pathname === '/' || pathname === '/index.html') { res.writeHead(200, head('text/html')); return res.end(shell); }
   try {
     const buf = await readFile(SERVE + pathname);
@@ -49,7 +49,7 @@ const check = (label, got, want) => {
   if (!ok) failures++;
 };
 
-const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--enable-features=SharedArrayBuffer'] });
+const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
 try {
   const page = await browser.newPage();
   page.on('pageerror', (e) => { console.log('  [pageerror]', e.message); failures++; });
@@ -61,7 +61,7 @@ try {
   const adopted = () => page.$eval('#app .count', (e) => e.getAttribute('data-server') === '1');
 
   check('server-rendered count is shown', await count(), '0');
-  // give the wasm a beat to instantiate and hydrate
+  // give the bundle a beat to boot and hydrate
   await sleep(800);
   check('hydration ADOPTED the server node (data-server survived)', await adopted(), true);
 

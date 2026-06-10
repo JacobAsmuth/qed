@@ -37,16 +37,19 @@ file compiles.
 
 ## Components
 
-6. **[Todo](Todo.lean)** · a reusable `Component` (own model/msg/update/view) repeated as keyed
-   rows in the parent's list, wired with one `embed` line. Parent-owned state: the rows live in
-   the root model.
+6. **[Todo](Todo.lean)** · a `component` repeated as keyed rows in a parent-owned list, wired
+   with one `embed` line: the rows live in the root model, and a row's message routes back by
+   its stable key.
 7. **[Feed](Feed.lean)** · `for_each`: lift one card's contract to "every card in the feed
-   stays valid" across re-rank, dismiss, and load, in one line. Proof-only, no browser entry.
-8. **[Local](Local.lean)** · the `component` declaration: state declared next to the view that
-   uses it, `set`/`send` as the only mutations, each site compiled to a named `Msg` case the
-   invariant machinery can point at (`stepperSafe`). Components bubble typed output
-   (`emits`/`mountWith`), nest (a `Tag` inside each `Widget`), seed from props (`.localInit`),
-   and the whole local store snapshots/restores.
+   stays valid" across re-rank, tick (the parent updating its rows directly), dismiss, and
+   load, in one line. A multi-field `set` chain in the card's like handler. Proof-only, no
+   browser entry.
+8. **[Local](Local.lean)** · the same `component` declaration mounted the other way: the
+   framework owns the state, keyed per instance, outside the root model. `set`/`send` as the
+   only mutations, each site compiled to a named `Msg` case the invariant machinery can point
+   at (`stepperSafe`). Components bubble typed output (`emits`/`mountWith`), nest (a `Tag`
+   inside each `Widget`), seed from props (`.localInit`), and the whole local store
+   snapshots/restores.
 
 ## Forms and data
 
@@ -72,8 +75,9 @@ file compiles.
 
 15. **[Bookshelf](Bookshelf.lean)** · the capstone: three routed pages over a typed remote
     `Resource`, a schema form that POSTs and navigates to the result, scoped styles, and
-    server-side rendering the client adopts without a refetch or flash
-    ([BookshelfSSR.lean](BookshelfSSR.lean)).
+    server-side rendering the client adopts without a refetch or flash. The app contains
+    no SSR code: `qed build` emits the request handler (`ssr.mjs`) from the app itself
+    (see `test/bookshelf_ssr_test.mjs`).
 
 ## Appendix: entries and infrastructure
 
@@ -81,9 +85,10 @@ These are not part of the tour; they are the plumbing the tour runs on.
 
 - **`*Web.lean`**: one-line browser entries (`import` the app, `Qed.run app`). `qed build`
   picks the entry from `QED_WEB_ROOT`; [Web.lean](Web.lean) (the counter) is the default.
-- **SSR binaries**: [UsersSSR.lean](UsersSSR.lean), [BookshelfSSR.lean](BookshelfSSR.lean),
-  [TemplateSSR.lean](TemplateSSR.lean) render full pages per request/route on the server, from
-  the same views.
+- **SSR substrate binaries**: [UsersSSR.lean](UsersSSR.lean) and
+  [TemplateSSR.lean](TemplateSSR.lean) call the render primitives (`renderModel` /
+  `renderDocument`) directly, for the hydration tests. Apps don't write this; `qed build`
+  generates the per-request handler (`ssr.mjs`) from the app itself.
 - **Benchmarks** ([Bench/](Bench/)): [Pipeline.lean](Bench/Pipeline.lean) (native rebuild+diff,
   `lake exe bench`), [App.lean](Bench/App.lean) (the React head-to-head,
   `test/bench_react.mjs`), and the `Scalar*`/`List*` entries (the template-vs-diff layer bench,

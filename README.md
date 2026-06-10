@@ -99,18 +99,8 @@ render, diff, arithmetic, JSON, routing.
 
 ### Schema: forms and JSON, one declaration
 
-`Json.parse` is a total function. Bad input comes back as an `.error` value, never an exception. It
-takes a depth budget (64 by default), and a proof guarantees whatever it returns nests no deeper than
-the number you gave it. A deeply nested payload can't push past your limit.
-
-A `Field p` is a value carrying a proof that the
-predicate `p` holds of it; the only way to build one is to pass validation, so by the time you hold a
-`Book`, every refined field in it is already valid and an invalid one is not a thing you can
-construct. The `schema` command reads the declaration once and generates the editable `Draft`, the
-validated structure, `parse`, the `canSubmit` gate with a proof that it matches the validity it
-claims, the `formView` widgets, and the `ToJson`/`FromJson` codec with `decode`/`encode`. A field's
-refinement guards *both* directions: the form rejects it at submit, and `decode` rejects it on the
-wire, with the same proof.
+A form and an API payload are usually the same data, validated twice. In Qed you declare the data
+once, rules included, and `schema` generates both sides.
 
 ```lean
 abbrev NonEmpty (s : String) : Prop := s.length ≥ 1
@@ -121,20 +111,16 @@ schema Book where
   title   : Codec.text.refine NonEmpty
   year    : Codec.nat.refine Year                  -- parsed to a Nat first, then checked
   inPrint : Codec.checkbox
-  blurb   : Codec.text                             -- unrefined, so it stays a bare `String`
-  tags    : Codec.json (List String)               -- a nested/list field rides the JSON only
+  blurb   : Codec.text                             -- unrefined, stays a bare `String`
+  tags    : Codec.json (List String)               -- nested data rides the JSON only
 ```
 
-A refined field is stored as a proof-carrying `Field` (read it with `.val`); an unrefined one stays
-its bare value type, so a plain data record reads exactly as you wrote it (and an `Option` field comes
-back `none` when the key is missing or null). A `Codec.json T` field is for a nested record or a list
-the form doesn't edit; it rides the JSON through `T`'s own `ToJson`/`FromJson`, recursively. `Book.decode body`
-parses and decodes in one call, rejecting an out-of-range `year` (or an invalid value nested inside)
-the same way the form does; `Book.encode` goes the other way. Whether a field is refined is read from
-the elaborated codec, not its spelling, so factoring `Codec.text.refine NonEmpty` into a named helper
-keeps the validation. `Book.formView draft .edit .submit` renders the inputs and a submit button that
-stays disabled until every field checks out, marking a field `aria-invalid` once you've touched it and
-it still doesn't validate.
+That one declaration yields the `Book` type, the form (`Book.formView`, whose submit button stays
+disabled until every field validates), and the JSON codec (`Book.decode` / `Book.encode`). A rule
+like `Year` is enforced in both directions by the same proof: the form won't submit an
+out-of-range year, and `decode` rejects one arriving over the wire. So a `Book` you hold is valid;
+an invalid one can't be constructed. And `Json.parse` itself is total, so bad input is an `.error`
+value, never an exception.
 
 ### Routing and HTTP
 
@@ -161,10 +147,13 @@ def app : App Model Msg :=
 
 ### Effects
 
-Side effects are data, which keeps `update` pure and provable. Write the transition with `steps`:
-an arm returns the next model, or a `(model, cmd)` pair, and the driver performs the `Cmd`. Here's
-a chat that streams an LLM's reply token by token, with no `fetch` in it. `Cmd.stream` feeds each
-token back as a `.chunk` message, so a streaming reply is, to `update`, just more messages arriving.
+Your `update` never calls `fetch`. To touch the outside world it returns a `Cmd`, a value
+*describing* the effect; the driver performs it and delivers the result back as ordinary messages.
+That's what keeps `update` a pure function, the thing the proofs are about.
+
+Here's the entire logic of a chat app that streams an LLM's reply token by token. `Cmd.stream`
+feeds each token back as a `.chunk` message, so to `update`, a streaming reply is just more
+messages arriving:
 
 ```lean
 def transition (m : Model) : Msg → Model × Cmd Msg := steps
@@ -174,115 +163,102 @@ def transition (m : Model) : Msg → Model × Cmd Msg := steps
   | .done      => { m with pending := false }
 ```
 
-The typed battery covers what you reach for, from `storageGet` and `getJson` to WebSockets and
-debounced timers. When something isn't built in, the `ports` escape hatch wires a real JS API in a
-few lines.
+(`steps` is how you write an effectful transition: an arm returns the next model, or a
+`(model, cmd)` pair.) The built-in commands cover what you usually reach for: HTTP, localStorage,
+clipboard, timers, WebSockets. For anything else, the `ports` escape hatch wires a real JS API in
+a few lines.
 
-### Components, and lifting their invariants over a list
+### Components
 
-A `Component` is a reusable piece of UI with its own `Model`, `Msg`, `update`, and `view`. It owns
-its message type, so embedding one means relabeling its messages into the parent's, and a misrouted
-event is a type error.
-
-Here's a feed card. The last two lines are its contract, one over behavior, one over styling.
+A component is one declaration: state fields next to the view that uses them, changed only
+through `set` in its own handlers. Here's a feed card. The like handler sets two fields in one
+message, and the two invariants are the card's contract, one over behavior, one over styling.
 
 ```lean
-namespace Card
-  structure Model where
-    id    : Nat
-    likes : Int
-    liked : Bool
-  inductive Msg | toggleLike
-  def update (c : Model) : Msg → Model
-    | .toggleLike => if c.liked then { c with liked := false, likes := c.likes - 1 }
-                     else        { c with liked := true,  likes := c.likes + 1 }
-  def likeOn  : Style := css [ color "#ff2d55" ]
-  def likeOff : Style := css [ color "#8a8a8a" ]
-  def view (c : Model) : Html Msg :=
-    <button role="like" onClick={.toggleLike} {if c.liked then likeOn else likeOff}>{s!"♥ {c.likes}"}</button>
-  def component : Component Model Msg := { update, view }
-  abbrev Safe (c : Model) : Prop := 0 ≤ c.likes ∧ (c.liked → 1 ≤ c.likes)
-end Card
+component Card where
+  state id    : Nat        -- no defaults: the parent fills these in
+  state likes : Int
+  state liked : Bool
+  view =>
+    <button role="like"
+      onClick={set liked (!liked), set likes (if liked then likes - 1 else likes + 1)}
+      {if liked then likeOn else likeOff}>{s!"♥ {likes}"}</button>
 
-invariant cardSafe   : Card.Safe preserved_by Card.update
-invariant cardStyled : roleHasOneOf "like" [Card.likeOn, Card.likeOff] holds_in Card.view
+invariant cardSafe   : (fun c => 0 ≤ c.likes ∧ (c.liked → 1 ≤ c.likes)) preserved_by Card.update
+invariant cardStyled : roleHasOneOf "like" [likeOn, likeOff] holds_in Card.view
 ```
 
-`cardSafe` is a model invariant: the like count never goes negative, and a liked card has at least
-one like. `cardStyled` uses `holds_in`, which states a property of the view rather than the model: in
-every state the card can reach, the `role "like"` element carries one of its two styles.
+A handler is not a closure: each `set` compiles to an ordinary message with a named case, so
+invariants work on a component exactly as they do on the app model, and breaking one fails the
+build naming the handler (`case set_liked_likes …`).
 
-To place many cards in a list, `embed` generates the wiring:
+Who owns a component's state is decided where you *mount* it, not in how you write it. State the
+parent never reads (an open editor, a half-typed draft) stays out of your model entirely: mount
+keyed instances with `<div {Editor.mount "row-7"}/>` and the framework owns it. State the parent
+does read, the parent owns. The feed holds its cards in the model, `embed` wires the component
+over them, and the view shows the list like any other data:
 
 ```lean
-embed Card as card keyedBy (toString ·.id) into cards
+structure Model where
+  cards : Array Card.State
+
+inductive Msg | card (k : String) (msg : Card.Msg) | rank | dismiss (id : Nat)
+
+embed Card as card keyedBy (toString ·.id) into cards     -- generates cardView, cardUpdate
 
 def update (m : Model) : Msg → Model
-  | .card k msg => cardUpdate m k msg                                 -- route a tap to one card
+  | .card k msg => cardUpdate m k msg                     -- route a tap to one card, by key
   | .rank       => { m with cards := m.cards.sortBy (fun a b => a.likes ≥ b.likes) }
   | .dismiss id => { m with cards := m.cards.filter (·.id != id) }
+
+def view (m : Model) : Html Msg :=
+  <section class="feed">
+    <button onClick={.rank}>Most liked</button>
+    <div class="cards">{m.cards.map fun c =>
+      <article key={toString c.id}>
+        {cardView c}
+        <button onClick={.dismiss c.id}>✕</button>
+      </article>}</div>
+  </section>
 
 invariant feedSafe   : cardSafe   for_each cards preserved_by update  -- ∀ card, stays valid
 invariant feedStyled : cardStyled for_each cards holds_in view        -- ∀ card, renders styled
 ```
 
-`embed` generates `cardView` and `cardUpdate`. It routes each message by key rather than list index,
-so a message reaches the card it came from after the list is sorted or filtered.
-
-`for_each` lifts a child contract to the whole list. `cardSafe for_each cards` proves `cardSafe` for
-every card in `cards` across every transition `update` makes, discharged automatically. It reduces
-arm by arm: a routed message is covered by the card's own contract, `dismiss` only filters, `rank`
-only reorders (through the verified `Array.sortBy`), and an appended card is valid by construction.
-`feedStyled` lifts the styling contract the same way, over the view.
-
-When an arm can't preserve the contract the build fails and names it. `Array.qsort` has no membership
-lemma, so a `rank` written with it won't lift, and neither will an appended card that isn't provably
-valid. `feedSafe` is itself a per-element predicate ("every card is valid"), so it lifts again over a
-list of feeds. `Examples/Feed.lean` is the worked example.
-
-State that doesn't belong in the root model (a row's open editor, a half-typed draft, a per-widget
-counter) goes in a `component`: state declared next to the view that uses it, keyed, driver-owned,
-serialized, and `set` as the only way to change it. The local store snapshots and restores through
-`window.qed.snapshot()` and `.restore(json)`.
-
-```lean
-component Stepper where
-  state count : Int := 0
-  view =>
-    <div class="stepper">
-      <button onClick={set count (if count ≤ 0 then 0 else count - 1)}>−</button>
-      <span>{count}</span>
-      <button onClick={set count (count + 1)}>+</button>
-    </div>
-
-invariant stepperSafe : (fun s => 0 ≤ s.count) preserved_by Stepper.update
-```
-
-A handler is not a closure. Each distinct `set` site becomes one constructor of a generated
-first-order `Msg`, interpreted by a generated `update` against the state at delivery time (a bare
-`set draft` on an input stores the incoming value). Messages stay data with named cases, so
-everything that depends on that keeps working on the generated code: the invariant above is
-discharged automatically, and dropping the clamp fails the build with "case `set_count` still
-needs: `0 ≤ m.count - 1`". Register the component with `locals := [Stepper.reg]` and mount keyed
-instances with `<div {Stepper.mount "a"}/>`.
-
-A component talks back through a declared output: `emits T` plus `send o` in a handler (or both
-at once, `set f e, send o`), and the parent mounts it with `mountWith key onOut`. Inside another
-component, a payload-form `set f` is exactly such a handler, so nesting is
-`<div {Tag.mountWith key (set pinned)}/>`. Seed an instance from parent data with `.localInit`.
-`Examples/Local.lean` is the worked example (the invariant-carrying `Stepper`, bubbling two
-levels deep, init-from-props, snapshot/restore).
+A tap inside a card routes back to that card by its key, so sorting or filtering the list can't
+misdeliver it. And the two `for_each` lines lift the card's contract to the whole feed: every
+card stays valid and styled, across every transition, proved automatically. An arm that can't
+preserve the contract fails the build by name. `Examples/Feed.lean` and `Examples/Local.lean`
+are the worked examples, including components that emit typed output up to their parent.
 
 ### Server-side rendering
 
-`App.renderModel app m` renders any model to HTML with the same `view` the browser runs, and
-`renderDocument` wraps it in a page the client adopts on load. With `dehydrate`/`rehydrate` it starts
-from the server's model, so there's no refetch and no flash. `Examples/Bookshelf.lean` is the worked
-app: a routed catalog over a `Resource (Array Book)` (a remote value as `idle | loading | ok | failed`),
-a detail page, and an add-book form that POSTs and routes to the new book, server-rendered and
-driven end to end by a browser test. Every feature above has one like it in `Examples/` and
-`test/`; [`Examples/README.md`](Examples/README.md) orders them as a tour, one concept at a
-time, from the counter to the full Bookshelf app.
+You don't write any SSR code. A routed app already declares everything a server needs, its pages
+(`router`) and their data (`queries`), so `qed build` emits `dist/ssr.mjs`: a request handler
+built from your app. Per request it routes the URL, runs your queries server-side, renders with
+the same verified `view` the browser runs, and embeds the model in the page, so the client adopts
+the HTML with no refetch and no flash.
+
+```bash
+qed dev       # develop against the real thing: SSR + live reload
+qed build     # dist/: the client bundle, plus ssr.mjs (the request handler)
+qed start     # serve it: every route server-rendered, hydrated on load
+```
+
+Deploying stays simple. A static host still works (the same `dist/` is a complete
+single-page app), and server rendering is one import away on any node or edge runtime:
+
+```js
+import render from './dist/ssr.mjs';   // (request) => Response, that's the whole API
+```
+
+`Examples/Bookshelf.lean` is the worked app, a routed catalog with a detail page and an add-book
+form; its hydration test asserts a server-rendered load reaches interactive with zero API calls
+from the client.
+
+Every feature above has an example like it in `Examples/` and `test/`;
+[`Examples/README.md`](Examples/README.md) orders them as a tour, one concept at a time, from the
+counter to the full Bookshelf app.
 
 ## Does proving things cost you speed?
 
@@ -299,9 +275,9 @@ plain JavaScript. Verification isn't a separate step you have to remember. It ru
 build:
 
 ```bash
-qed dev        # watch sources, rebuild, serve with live-reload  → localhost:8000
-qed build      # production build → dist/
-qed start      # serve the build            (alias: preview)
+qed dev        # watch sources, rebuild, serve (SSR) with live-reload  → localhost:8000
+qed build      # production build → dist/ (client bundle + ssr.mjs)
+qed start      # serve the build, server-rendered   (alias: preview)
 qed test       # browser test suite (if present; needs node)
 qed check      # verify only: proofs + no-sorry + axiom-clean, no artifacts
 qed clean      # remove build outputs
@@ -325,7 +301,8 @@ Give it a try and state an invariant. Issues welcome at
 | `Qed/Jsx.lean` | The JSX view syntax: `<div class="x" onClick={.tap}>…</div>`, expanded to `el "tag" [attrs] [kids]`. |
 | `Qed/Notation.lean` | The attribute and event helpers (`cls`, `onClick`, `value`, …) JSX attributes expand to. |
 | `Qed/View.lean` | The rendering model: `View` (`dyn`/`showIf`/`ifElse`/`forEach`/`dynNode`) and the `view%` lift behind `ui`; built once, then changed bindings patch (`patch_render`/`applyValues_render`). |
-| `Qed/Runtime.lean` | The Elm Architecture: `App`, the `ui` builder, the `Cmd` effects + `port`/`onPort`, local components, and server-side render. |
+| `Qed/Runtime.lean` | The Elm Architecture: `App`, the `ui` builder, the `Cmd` effects + `port`/`onPort`, local components, and the render primitives. |
+| `Qed/Ssr.lean` | The per-request SSR step `dist/ssr.mjs` loops: route, run the app's queries, render, dehydrate. |
 | `Qed/Steps.lean` | The `steps` builder for effectful transitions: arms are bare models or `(model, cmd)` pairs. |
 | `Qed/Diff.lean` | The reconciler the engine uses internally: one children reconcile shared by positional and keyed, `lazy` memoization, and the `diff_apply` proof. |
 | `Qed/Json.lean` | JSON parser/renderer + the `ToJson`/`FromJson` classes, with the `parse_depth_le`/`parse_render` proofs. |

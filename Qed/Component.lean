@@ -1,6 +1,11 @@
 /-
   Qed.Component, reusable, nestable view components.
 
+  The authored form is the `component` command at the bottom of this file: ONE way to
+  declare a component, with who owns its state decided at the mount site (framework-owned
+  keyed instances via `mount`, or parent-owned rows via `embed`). Everything above it is
+  the substrate that declaration elaborates onto.
+
   A `Component Model Msg` bundles a `Model → Msg → Model` transition with a
   `Model → Html Msg` view: the reusable behaviour of a self-contained piece of UI,
   with its own state and message type. Because the message type is the component's
@@ -78,12 +83,12 @@ end Component
 
 /-! ### The `embed` command
 
-`embed Child as ctor keyedBy keyFn into field` removes the per-child wiring tax of
-embedding a reusable `Component` in a keyed list. Given a child *namespace* `Child`
-(providing `Child.component`, `Child.Model`, `Child.Msg`) it generates, in the
-current namespace:
+`embed Child as ctor keyedBy keyFn into field` mounts a `component`-declared child in a
+parent-owned keyed list (`field : Array Child.State`), removing the per-child wiring tax.
+It reads the declaration's generated `Child.component`, `Child.State`, `Child.Msg` and
+generates, in the current namespace:
 
-* `ctorView   : Child.Model → Html Msg`, the child's view with its messages tagged
+* `ctorView   : Child.State → Html Msg`, the child's view with its messages tagged
   by the parent constructor `Msg.ctor key`, so a child event routes back as a parent
   message carrying the row's stable key;
 * `ctorUpdate : Model → String → Child.Msg → Model`, runs the child's transition on
@@ -101,7 +106,7 @@ open Lean in
 macro_rules
   | `(embed $child:ident as $ctor:ident keyedBy $keyFn:term into $field:ident) => do
       let comp     := mkIdent (child.getId ++ `component)
-      let childMod := mkIdent (child.getId ++ `Model)
+      let childMod := mkIdent (child.getId ++ `State)
       let childMsg := mkIdent (child.getId ++ `Msg)
       let pModel   := mkIdent `Model
       let pMsg     := mkIdent `Msg
@@ -164,36 +169,52 @@ theorem forall_sortBy {α} {P : α → Prop} {a : Array α} {le : α → α → 
 
 end ForEach
 
-/-! ### The `component` command: state declared next to the view that uses it
+/-! ### The `component` command: THE way to declare a component
 
-`component Name where state f : T := init … view => <jsx>` is the declaration form of a
-*local* component (the keyed `useState` cells of `Qed.LocalDef`): state lives next to the
-view that uses it instead of threading through the root model. Inside the view, the state
+`component Name where state f : T (:= init)? … view => <jsx>` is the one declaration form
+of a component: state fields next to the view that uses them. Inside the view, the state
 fields are in scope by name, and `set` is the only way to change one:
 
 * `set f e`, a message-valued handler (`onClick={set f e}`). `e` may mention the state
   fields; it is evaluated against the *current* state when the message is delivered, not
   when the view rendered.
 * `set f`, a value handler (`onInput={set f}`): stores the incoming payload in `f`.
+* a chain, `set f e, set g e'`: one handler setting several fields in one message, every
+  expression read against the same pre-update state (batched-`setState` semantics).
 * `send o`, with `emits T` declared: bubble `o : T` to the parent's `mountWith` handler.
   `set f e, send o` does both in one message; a component with no `set`/`send` use for a
   field's value can still display it.
 
 Crucially, a handler is **not** a closure. Each distinct `set` site becomes one constructor
-of a generated first-order `Msg` (`set_f`, `set_f_2`, …), and a generated `update`
-interprets it, so messages stay data with named cases: `invariant … preserved_by
+of a generated first-order `Msg` (`set_f`, `set_f_g`, `set_f_2`, …), and a generated
+`update` interprets it, so messages stay data with named cases: `invariant … preserved_by
 Name.update` reduces arm by arm and names the case that broke, local state still
 snapshots/restores through its JSON codec, and replay/the differential gate keep seeing
 serializable messages and a pure transition.
 
-Generated under `Name.`: `State` (+ JSON codec), `init`, `Msg`, `update`, `view`, `reg`
-(the `LocalDef` to register: `ui … (locals := [Name.reg])`), and `mount` (the host
-attribute: `<div {Name.mount "a"}/>`, one instance per key). With `emits T`, also
-`mountWith key onOut`, where `onOut : T → msg` maps the child's output to a parent
-message; inside another component's view, a payload-form `set f` is exactly such a map,
-so nesting reads `<div {Child.mountWith key (set f)}/>`. Seed an instance from parent
-data with `.localInit` on the mount attribute. `LocalDef`/`localMount` (Qed.Runtime) are
-the substrate this elaborates onto, as `el` is to JSX, not a second authored form.
+One declaration, two ways to mount it; who owns the state is the parent's choice per
+use site, not a different way of writing the child:
+
+* **Framework-owned** (`useState`): register `Name.reg` (`ui … (locals := [Name.reg])`)
+  and mount keyed instances with `<div {Name.mount "a"}/>`. The state lives in the
+  driver's keyed store, outside the parent's model. Requires every field to carry a
+  default (they make up `Name.init`).
+* **Parent-owned** (lifted state): hold rows as `field : Array Name.State` in the parent
+  model and wire them with `embed Name as … keyedBy … into field` (see above). The
+  generated `Name.component` is what `embed` consumes; `for_each` lifts the child's
+  invariants over the list. Fields may omit their defaults here (the parent seeds every
+  row); a component with a default-less field is embed-only. A parent arm may also update
+  rows directly (`field.map …`), the props flow, and `for_each` lifts over that too.
+
+Generated under `Name.`: `State`, `Msg`, `update`, `view`, always; `component` when there
+is no `emits` (an embedded child's outputs would have no receiver); and, when every field
+has a default, `init`, the JSON codec, `reg`, `mount`, and (with `emits T`) `mountWith
+key onOut`, where `onOut : T → msg` maps the child's output to a parent message. Inside
+another component's view, a payload-form `set f` is exactly such a map, so nesting reads
+`<div {Child.mountWith key (set f)}/>`. Seed a framework-owned instance from parent data
+with `.localInit` on the mount attribute. `LocalDef`/`localMount` (Qed.Runtime) and the
+`Component` structure are the substrate this elaborates onto, as `el` is to JSX, not a
+second authored form.
 
 Sharp edge (the keywords are identifiers, the price of keeping `component`/`view` usable
 as names): a command that *ends in an open precedence-0 term*, like `#check f`, will
@@ -203,14 +224,19 @@ Components following components are fine: the `view` body is a closed max-preced
 atom. -/
 
 open Lean Parser in
-/-- The component state setter, `set f e` / `set f`, optionally bubbling an output in the
-    same message: `set f e, send o`. It parses as a term so it can sit in a JSX handler
+/-- The component state setter, `set f e` / `set f`, chainable over several fields and
+    optionally bubbling an output, all in one message: `set f e, set g e', send o`. Every
+    expression in the chain is evaluated against the same pre-update state (React's
+    batched `setState` semantics). It parses as a term so it can sit in a JSX handler
     splice, but it only *means* something inside a `component … view =>` body, where the
     elaborator replaces it with a generated `Msg` constructor. `set` stays a usable
     identifier everywhere else (non-reserved). -/
 @[term_parser] def setTerm := leading_parser:maxPrec
   nonReservedSymbol "set" (includeIdent := true) >> Parser.ident >>
   optional (termParser maxPrec) >>
+  many (node `Qed.setMore
+    (atomic (", " >> nonReservedSymbol "set" (includeIdent := true)) >> Parser.ident >>
+     optional (termParser maxPrec))) >>
   optional (", " >> nonReservedSymbol "send" (includeIdent := true) >> termParser maxPrec)
 
 open Lean Parser in
@@ -237,25 +263,29 @@ open Lean Parser in
     names everywhere else (`embed` requires `Child.component`, every app has a `view`). -/
 @[command_parser] def componentCmd : Parser := leading_parser
   optional Command.docComment >> atomic (identEq `component) >> ident >> " where " >>
-  many (node `Qed.componentStateItem
-    -- the default is max-precedence so it cannot swallow the next `state`/`emits`/`view`
-    -- keyword as an application argument; parenthesize a compound default, as in a JSX splice
-    (atomic (identEq `state) >> ident >> " : " >> termParser >> " := " >> termParser maxPrec)) >>
+  -- `manyIndent`, exactly like `structure` fields: the saved column makes a field's TYPE
+  -- term stop at the next `state`/`emits`/`view` line (an application argument must be
+  -- indented past the field's own column), which is what lets the default be optional
+  manyIndent (node `Qed.componentStateItem
+    -- a field without a default makes the component embed-only (no `mount`, the parent
+    -- seeds every instance). The default is max-precedence so it cannot swallow what
+    -- follows on the same line; parenthesize a compound default, as in a JSX splice
+    (atomic (identEq `state) >> ident >> " : " >> termParser >>
+     optional (" := " >> termParser maxPrec))) >>
   optional (node `Qed.componentEmits (atomic (identEq `emits) >> termParser maxPrec)) >>
   -- the body is max-precedence (a JSX element is one closed atom) so that application
   -- cannot extend past it and swallow a following ident-led `component` declaration
   identEq `view >> " => " >> termParser maxPrec
 
-/-- One `set`/`send` site collected from a `component` view: the field it sets (`none` for
-    a pure `send`), the constructor it became, the set expression (`none` with a field is
-    the payload form `set f`), and the sent output, if any. `key` identifies the site
+/-- One `set`/`send` site collected from a `component` view: the fields it sets with
+    their expressions (`none` for the payload form `set f`; empty for a pure `send`), the
+    constructor it became, and the sent output, if any. `key` identifies the site
     syntactically, so identical sites share one constructor. -/
 private structure SetSite where
-  key    : String
-  field  : Option Lean.Name
-  ctor   : Lean.Name
-  expr?  : Option Lean.Term
-  send?  : Option Lean.Term
+  key     : String
+  assigns : Array (Lean.Name × Option Lean.Term)
+  ctor    : Lean.Name
+  send?   : Option Lean.Term
 
 /-- Does `n` occur as an identifier anywhere under `stx`? How the `component` elaborator
     decides which state fields a set expression (or the view body) mentions, so only those
@@ -268,26 +298,27 @@ private partial def mentionsIdent (stx : Lean.Syntax) (n : Lean.Name) : Bool :=
 
 open Lean Elab Command in
 /-- Intern a `set`/`send` site: identical sites share one constructor; fresh ones get a
-    name derived from the field (`set_f`, `set_f_2`, …) or `send`/`send_2` for an output. -/
-private def registerSite (sites : IO.Ref (Array SetSite)) (field : Option Name)
-    (expr? send? : Option Term) : CommandElabM Name := do
+    name derived from the fields (`set_f`, `set_f_g`, `set_f_2`, …) or `send`/`send_2`
+    for a pure output. -/
+private def registerSite (sites : IO.Ref (Array SetSite))
+    (assigns : Array (Name × Option Term)) (send? : Option Term) : CommandElabM Name := do
   let pp : Option Term → String := fun
     | some e => e.raw.reprint.getD (toString e.raw)
     | none   => "·"
-  let key := s!"{field}|{pp expr?}|{pp send?}"
+  let key := String.intercalate "|" (assigns.toList.map fun (f, e?) => s!"{f}={pp e?}")
+    ++ s!"|{pp send?}"
   let cur ← sites.get
   match cur.find? (·.key == key) with
   | some site => return site.ctor
   | none =>
-      let base := match field with
-        | some f => s!"set_{f}"
-        | none   => "send"
+      let base := if assigns.isEmpty then "send"
+        else "set_" ++ String.intercalate "_" (assigns.toList.map (toString ·.1))
       let mut name := Name.mkSimple base
       let mut i := 2
       while cur.any (·.ctor == name) do
         name := Name.mkSimple s!"{base}_{i}"
         i := i + 1
-      sites.set (cur.push { key, field, ctor := name, expr?, send? })
+      sites.set (cur.push { key, assigns, ctor := name, send? })
       return name
 
 open Lean Elab Command in
@@ -299,18 +330,27 @@ private partial def replaceSets (fields : Array Name) (msgPath : Name) (hasEmits
     throwErrorAt ref "`send` bubbles an output, but this component declares no output type; \
       add `emits T` between the `state` fields and the `view`"
   if stx.getKind == ``setTerm then
-    let fId := stx[1]
-    let fname := fId.getId.eraseMacroScopes
-    unless fields.contains fname do
-      throwErrorAt fId "`set {fname}`: not a `state` field of this component (fields: {fields.toList})"
-    let expr? : Option Term := if stx[2].getNumArgs == 1 then some ⟨stx[2][0]⟩ else none
-    let send? : Option Term := if stx[3].getNumArgs == 3 then some ⟨stx[3][2]⟩ else none
-    if send?.isSome && !hasEmits then noEmits stx[3]
-    let ctor ← registerSite sites (some fname) expr? send?
+    -- collect the chain: the leading `set f e?` plus every `, set g e?` continuation
+    let mut assigns : Array (Name × Option Term) := #[]
+    let pairs := #[(stx[1], stx[2])] ++ stx[3].getArgs.map fun more => (more[2], more[3])
+    for (fId, eOpt) in pairs do
+      let fname := fId.getId.eraseMacroScopes
+      unless fields.contains fname do
+        throwErrorAt fId "`set {fname}`: not a `state` field of this component (fields: {fields.toList})"
+      if assigns.any (·.1 == fname) then
+        throwErrorAt fId "`set {fname}`: this handler already sets `{fname}`"
+      let expr? : Option Term := if eOpt.getNumArgs == 1 then some ⟨eOpt[0]⟩ else none
+      if expr?.isNone && assigns.any (·.2.isNone) then
+        throwErrorAt fId "`set {fname}`: only one payload-form `set` (no expression) per \
+          handler, there is just one incoming value to store"
+      assigns := assigns.push (fname, expr?)
+    let send? : Option Term := if stx[4].getNumArgs == 3 then some ⟨stx[4][2]⟩ else none
+    if send?.isSome && !hasEmits then noEmits stx[4]
+    let ctor ← registerSite sites assigns send?
     return mkIdent (msgPath ++ ctor)
   else if stx.getKind == ``sendTerm then
     unless hasEmits do noEmits stx
-    let ctor ← registerSite sites none none (some ⟨stx[1]⟩)
+    let ctor ← registerSite sites #[] (some ⟨stx[1]⟩)
     return mkIdent (msgPath ++ ctor)
   else
     match stx with
@@ -320,7 +360,7 @@ private partial def replaceSets (fields : Array Name) (msgPath : Name) (hasEmits
 
 open Lean Elab Command in
 @[command_elab componentCmd] def elabComponentCmd : CommandElab := fun stx => do
-      -- node shape: [doc?, kw, name, "where", (stateItem: [kw, f, ":", ty, ":=", default])*,
+      -- node shape: [doc?, kw, name, "where", (stateItem: [kw, f, ":", ty, (":=", default)?])*,
       --              (emits: [kw, ty])?, kw, "=>", body]
       let doc? : Option (TSyntax ``Lean.Parser.Command.docComment) :=
         if stx[0].getNumArgs == 1 then some ⟨stx[0][0]⟩ else none
@@ -328,7 +368,8 @@ open Lean Elab Command in
       let items := stx[4].getArgs
       let fs  : Array Ident := items.map fun it => ⟨it[1]⟩
       let tys : Array Term  := items.map fun it => ⟨it[3]⟩
-      let ds  : Array Term  := items.map fun it => ⟨it[5]⟩
+      let ds  : Array (Option Term) := items.map fun it =>
+        if it[4].getNumArgs == 2 then some ⟨it[4][1]⟩ else none
       let outTy? : Option Term := if stx[5].getNumArgs == 1 then some ⟨stx[5][0][1]⟩ else none
       let body : Term := ⟨stx[8]⟩
       let stateId    := mkIdent (t.getId ++ `State)
@@ -349,14 +390,14 @@ open Lean Elab Command in
       let sites ← sitesRef.get
       -- Msg: one first-order constructor per distinct site (the payload form `set f` takes
       -- the field's value type as its argument).
-      let isPayload : SetSite → Bool := fun site => site.field.isSome && site.expr?.isNone
+      let isPayload : SetSite → Bool := fun site => site.assigns.any (·.2.isNone)
       let ctors ← sites.mapM fun site => do
         let cId := mkIdent site.ctor
-        if isPayload site then
-          let some f := site.field | throwError "component: internal"
+        match site.assigns.find? (·.2.isNone) with
+        | some (f, _) =>
           let some idx := fieldNames.findIdx? (· == f) | throwError "component: internal"
           `(Lean.Parser.Command.ctor| | $cId:ident (v : $(tys[idx]!)))
-        else
+        | none =>
           `(Lean.Parser.Command.ctor| | $cId:ident)
       let msgCmd ← if ctors.isEmpty then `(command| inductive $msgId)
         else `(command| inductive $msgId where $[$ctors:ctor]*)
@@ -365,10 +406,14 @@ open Lean Elab Command in
       -- first. With `emits` the arms return `(state', some output / none)`.
       let arms ← sites.mapM fun site => do
         let cFull := mkIdent (t.getId ++ `Msg ++ site.ctor)
-        let stateTerm : Term ← match site.field, site.expr? with
-          | some f, some e => `({ s with $(mkIdent f):ident := $e })
-          | some f, none   => `({ s with $(mkIdent f):ident := v })
-          | none,   _      => `(s)
+        let stateTerm : Term ←
+          if site.assigns.isEmpty then `(s)
+          else do
+            let fIds := site.assigns.map fun (f, _) => mkIdent f
+            let vals ← site.assigns.mapM fun (_, e?) => match e? with
+              | some e => pure e
+              | none   => `(v)
+            `({ s with $[$fIds:ident := $vals],* })
         let rhs0 : Term ← match outTy? with
           | none => pure stateTerm
           | some _ => match site.send? with
@@ -376,7 +421,7 @@ open Lean Elab Command in
             | none   => `(($stateTerm, none))
         let mut rhs := rhs0
         for g in fieldNames.reverse do
-          let mentioned := (site.expr?.any (mentionsIdent ·.raw g)) ||
+          let mentioned := (site.assigns.any fun (_, e?) => e?.any (mentionsIdent ·.raw g)) ||
                            (site.send?.any (mentionsIdent ·.raw g))
           if mentioned then
             let gId := mkIdent g
@@ -404,36 +449,47 @@ open Lean Elab Command in
       let pairs ← (fs.zip keyLits).mapM fun (f, k) => `(($k, toJson (x.$f:ident)))
       let decodes ← (tys.zip keyLits).mapM fun (ty, k) =>
         `((FromJsonField.fromField j $k : Except String $ty))
-      let cmds : Array (TSyntax `command) := #[
+      let mut cmds : Array (TSyntax `command) := #[
         ← `(command| structure $stateId where
               $[$fs:ident : $tys]*),
-        ← `(command| def $initId : $stateId := { $[$fs:ident := $ds],* }),
-        ← `(command| def $toJsonId (x : $stateId) : Json := Json.obj [$[$pairs],*]),
-        ← `(command| def $fromJsonId (j : Json) : Except String $stateId := do
-              $[let $fs:ident ← $decodes:term]*
-              return { $[$fs:ident],* }),
-        ← `(command| instance : ToJson $stateId := ⟨$toJsonId⟩),
-        ← `(command| instance : FromJson $stateId := ⟨$fromJsonId⟩),
         msgCmd,
         updateCmd,
-        ← `(command| def $viewId (s : $stateId) : Html $msgId := $viewBody),
-        ← (match outTy? with
-          | none => `(command| $[$doc?:docComment]? def $regId : LocalDef :=
-              LocalDef.ofSimple $idLit $initId $viewId $updateId)
-          | some _ => `(command| $[$doc?:docComment]? def $regId : LocalDef :=
-              LocalDef.of $idLit $initId $viewId $updateId)),
-        ← `(command| $[$doc?:docComment]? def $mountId {msg : Type} (key : String) : Attr msg :=
-              localMount $idLit key) ]
-      -- with `emits T`, also generate the receiving mount: the parent maps the output to
-      -- one of its own messages (often a payload-form `set f` of its own)
-      let cmds ← match outTy? with
-        | some o => do
-            let mountWithId := mkIdent (t.getId ++ `mountWith)
-            pure <| cmds.push <|
-              ← `(command| $[$doc?:docComment]? def $mountWithId {msg : Type}
-                    (key : String) (onOut : $o → msg) : Attr msg :=
-                    localMountWith $idLit key (fun out => some (onOut out)))
-        | none => pure cmds
+        ← `(command| def $viewId (s : $stateId) : Html $msgId := $viewBody) ]
+      -- without `emits` the update is `State → Msg → State`, so the declaration is also a
+      -- `Component`: `embed` mounts it into a parent-owned keyed list with no extra code
+      if outTy?.isNone then
+        let compId := mkIdent (t.getId ++ `component)
+        cmds := cmds.push <|
+          ← `(command| $[$doc?:docComment]? def $compId : Component $stateId $msgId :=
+                { update := $updateId, view := $viewId })
+      -- the framework-owned mount (`reg`/`mount`) needs an `init` and a serializable state,
+      -- so it exists only when every field has a default; without one the component is
+      -- embed-only and the parent seeds every instance
+      if ds.all (·.isSome) then
+        let dsT := ds.filterMap id
+        cmds := cmds ++ #[
+          ← `(command| def $initId : $stateId := { $[$fs:ident := $dsT],* }),
+          ← `(command| def $toJsonId (x : $stateId) : Json := Json.obj [$[$pairs],*]),
+          ← `(command| def $fromJsonId (j : Json) : Except String $stateId := do
+                $[let $fs:ident ← $decodes:term]*
+                return { $[$fs:ident],* }),
+          ← `(command| instance : ToJson $stateId := ⟨$toJsonId⟩),
+          ← `(command| instance : FromJson $stateId := ⟨$fromJsonId⟩),
+          ← (match outTy? with
+            | none => `(command| $[$doc?:docComment]? def $regId : LocalDef :=
+                LocalDef.ofSimple $idLit $initId $viewId $updateId)
+            | some _ => `(command| $[$doc?:docComment]? def $regId : LocalDef :=
+                LocalDef.of $idLit $initId $viewId $updateId)),
+          ← `(command| $[$doc?:docComment]? def $mountId {msg : Type} (key : String) : Attr msg :=
+                localMount $idLit key) ]
+        -- with `emits T`, also generate the receiving mount: the parent maps the output to
+        -- one of its own messages (often a payload-form `set f` of its own)
+        if let some o := outTy? then
+          let mountWithId := mkIdent (t.getId ++ `mountWith)
+          cmds := cmds.push <|
+            ← `(command| $[$doc?:docComment]? def $mountWithId {msg : Type}
+                  (key : String) (onOut : $o → msg) : Attr msg :=
+                  localMountWith $idLit key (fun out => some (onOut out)))
       for c in cmds do elabCommand c
 
 end Qed

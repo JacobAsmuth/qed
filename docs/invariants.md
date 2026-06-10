@@ -61,12 +61,12 @@ invariant idsBelowNext : (fun m => ∀ r ∈ m.rows, r.id < m.nextId)
 
 ## Lifting a contract over a list of children (`for_each`)
 
-A reusable `Component` embedded with `embed` lives as a keyed array in the parent's model, and its
+A `component` embedded with `embed` lives as a keyed array in the parent's model, and its
 contract is a fact about *one* child. `for_each` lifts that to **every child in the list, across the
 parent's own transition**, in one line, no proof:
 
 ```lean
-abbrev Card.Safe (c : Card.Model) : Prop :=                 -- the child's contract, written once
+abbrev Card.Safe (c : Card.State) : Prop :=                 -- the child's contract, written once
   0 ≤ c.likes ∧ c.progress ≤ c.duration ∧ (c.liked → 1 ≤ c.likes)
 invariant cardSafe : Card.Safe preserved_by Card.update     -- the card never breaks it
 
@@ -83,8 +83,10 @@ or the predicate isn't a child invariant, the full form spells it out:
 
 The discharger *applies* a proven lemma per list operation, a keyed child message keeps it (that's
 the child contract `cardSafe`), `filter`/remove keeps it, `push`/add keeps it once the new
-element is valid by construction, and **a re-rank keeps it if you sort with `Array.sortBy`** (a
-verified `mergeSort`, `Array.qsort` has no membership lemma, so it can't be lifted automatically).
+element is valid by construction, a parent arm that updates the rows directly (an `Array.map`,
+the props flow) keeps it when each updated element does, and **a re-rank keeps it if you sort
+with `Array.sortBy`** (a verified `mergeSort`, `Array.qsort` has no membership lemma, so it can't
+be lifted automatically).
 
 Because `feedSafe` is itself a `∀ c ∈ cards, …` fact, it composes: a grandparent that owns several
 feeds lifts it again, one line up, `invariant shellSafe : feedSafe for_each feeds preserved_by update
@@ -104,7 +106,7 @@ The **styling** analogue is the same line with a different connective, lift a ca
 contract to "the whole rendered view is styled, chrome and every card":
 
 ```lean
-invariant cardStyled : roleHasOneOf "like" [Card.likeOn, Card.likeOff] holds_in Card.view
+invariant cardStyled : roleHasOneOf "like" [likeOn, likeOff] holds_in Card.view
 invariant feedStyled : cardStyled for_each cards holds_in view
 -- ⇒ machine-checks: ∀ m, roleHasOneOf "like" […] (view m) = true   (the same theorem `holds_in` gives)
 ```

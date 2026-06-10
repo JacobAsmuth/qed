@@ -53,8 +53,18 @@ elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
     then `(tactic| (try simp only [$predI:ident]) <;> (try (first | omega | simp_all | decide | trivial)))
     else `(tactic| (try (first | omega | simp | simp_all | decide | trivial)))
   -- non-hygienic binder names, so a hand proof's `case … =>` can reference the model `m` and the
-  -- "all children valid before" hypothesis `h`.
+  -- "all children valid before" hypothesis `h` (and, in a map arm, the row `y` with `hP : P y`).
   let m := mkIdent `m; let msg := mkIdent `msg; let h := mkIdent `h
+  let y := mkIdent `y; let hy := mkIdent `hy; let hP := mkIdent `hP
+  -- the map arm's elementwise goal `P (g y)` comes with `hP : P y` in scope; unfold a named
+  -- predicate on both, then the `preserved_by` battery (`simp_all` splits the conjunctions,
+  -- `omega` finishes the arithmetic a rewrite can't, e.g. a `min`-clamped field)
+  let mapClose ← if pred.raw.isIdent
+    then `(tactic| ((try simp only [$predI:ident] at $hP:ident ⊢) <;>
+                    (try (first | omega | (simp_all <;> omega) | (simp_all <;> done)
+                                | decide | trivial))))
+    else `(tactic| (try (first | omega | (simp_all <;> omega) | (simp_all <;> done)
+                               | decide | trivial)))
   evalTactic (← `(tactic|
     (intro $m $msg $h
      cases $msg:ident <;>
@@ -65,6 +75,8 @@ elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
          | exact Qed.ForEach.forall_filter $h                             -- remove (filter)
          | exact Qed.ForEach.forall_sortBy $h                             -- re-rank (verified sort)
          | exact Qed.ForEach.updateKeyed_forall _ _ $childInv $h          -- keyed child message
+         | (refine Qed.ForEach.forall_map ?_ <;> intro $y $hy <;>         -- parent updates rows
+             have $hP:ident := $h $y $hy <;> ($mapClose:tactic))          --   (props flow, map)
          | (refine Qed.ForEach.forall_push $h ?_ <;> ($elemClose:tactic)) -- add (push)
          | skip))))                                                        -- unmatched → left open
 
@@ -138,8 +150,21 @@ macro "forEachStyleLift " view:ident childStyled:ident : tactic =>
      qedStyleReduce $view
      all_goals (try (rw [Qed.everyElementL_mapList]
                      intro c _
-                     refine Qed.everyElement_through_map _ _ ?_ ($childStyled c) <;>
-                       (intro t a; simp [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done)))))
+                     first
+                       -- the list element IS the rendered child
+                       | (refine Qed.everyElement_through_map _ _ ?_ ($childStyled c) <;>
+                            (intro t a; simp [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done))
+                       -- the rendered child sits inside wrapper chrome (a keyed slot, parent
+                       -- controls next to it): peel the literal wrapper elements, close the
+                       -- chrome leaves by evaluation and each child-view conjunct through the
+                       -- child's contract
+                       | (simp only [Qed.everyElement, Qed.everyElementL, Bool.and_eq_true]
+                          repeat' apply And.intro
+                          all_goals (first
+                            | (refine Qed.everyElement_through_map _ _ ?_ ($childStyled c) <;>
+                                 (intro t a; simp [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done))
+                            | (simp [Qed.attrRole, Qed.attrClasses, Qed.hasOneClass]; done)
+                            | rfl))))))
 
 /-- The auto discharger for `for_each … holds_in`: run `forEachStyleLift`, then if anything's left,
     report it clearly with the fix, instead of a raw goal dump. -/

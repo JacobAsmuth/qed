@@ -3,9 +3,9 @@
 
   The TODO demo: a keyed list of reusable row components.
 
-  Each row is a self-contained `Component` (its own state, message, `update`, and
-  `view`: a label you can mark done). The list embeds one per item and tags each
-  row's messages with its index (`Msg.row i`), so a click routes to that row alone.
+  Each row is an ordinary `component` declaration (a label you can mark done), mounted
+  into the parent-owned list with `embed`. The list embeds one per item and tags each
+  row's messages with its key (`Msg.row k`), so a click routes to that row alone.
   Every row carries a `key` (its item id), so the verified `diff` (`Qed.Diff`)
   reconciles the list *by key*: add appends, remove drops one node, sort reorders,
   and a row that moves keeps the same DOM node, its local state, and any focus
@@ -18,30 +18,19 @@ open Qed
 
 namespace Todo
 
--- A reusable row: a label plus its own local "done" state and message.
-namespace Row
-
-structure Model where
-  id   : Nat            -- a stable identity, used as the reconciliation key
-  text : String
-  done : Bool
-
-inductive Msg | toggle
-
-def update (m : Model) : Msg → Model
-  | .toggle => { m with done := !m.done }
-
-def view (m : Model) : Html Msg :=
-  <span class={if m.done then "item done" else "item"} onClick={.toggle}>{m.text}</span>
-
-def component : Component Model Msg := { update, view }
-
-end Row
+-- A reusable row: a label plus its "done" state. No field defaults, so it is
+-- embed-only: the parent seeds every row.
+component Row where
+  state id   : Nat      -- a stable identity, used as the reconciliation key
+  state text : String
+  state done : Bool
+  view =>
+    <span class={if done then "item done" else "item"} onClick={set done (!done)}>{text}</span>
 
 /-- The whole app state: the rows, the text being typed, and the next id to hand
     out (so every row's key is unique and stable across edits). -/
 structure Model where
-  rows   : Array Row.Model
+  rows   : Array Row.State
   draft  : String
   nextId : Nat
 
@@ -54,7 +43,7 @@ inductive Msg where
 
 def init : Model := { rows := #[], draft := "", nextId := 0 }
 
--- One line wires the reusable `Row` component into this app's keyed list: it generates
+-- One line mounts the `Row` component into this app's keyed list: it generates
 -- `rowView` (the row's view, its messages tagged with the row's key) and `rowUpdate`
 -- (routes a row message to the matching row by key, survives sort/filter). The only
 -- hand-written glue left is the `Msg.row` constructor above.

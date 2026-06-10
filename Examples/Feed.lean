@@ -1,10 +1,12 @@
 /-
   Tour 07 · Lifting a contract over a list
 
-  Feed: a TikTok-style scrollable feed of card components, each with its own contract,
-  the parent holding them as a *sorted* keyed list. Demonstrates `for_each`: a child
-  component's invariant lifted to "every card in the feed stays valid", across the
-  feed's own transition (re-rank / dismiss / load), in one line and with no proof.
+  Feed: a TikTok-style scrollable feed of cards, the parent holding them as a *sorted*
+  keyed list it owns. The card is an ordinary `component` declaration; `embed` mounts it
+  into the parent's list, so who owns the state is a mounting choice, not a different way
+  of writing the child. Demonstrates `for_each`: the card's invariant lifted to "every
+  card in the feed stays valid", across the feed's own transition (re-rank / tick /
+  dismiss / load), in one line and with no proof.
 
   Pure Lean; the invariants are erased at runtime, so there is no browser entry; the
   guarantee is that this file *builds* (the kernel checked every lift).
@@ -15,56 +17,49 @@ open Qed
 namespace Feed
 
 /-! ## The child: one feed card -/
-namespace Card
-
-structure Model where
-  id       : Nat
-  author   : String
-  likes    : Int
-  liked    : Bool
-  progress : Nat        -- playback position …
-  duration : Nat        -- … never past the end
-
-inductive Msg | toggleLike | tick
-
-def update (c : Model) : Msg → Model
-  | .toggleLike =>
-      if c.liked then { c with liked := false, likes := c.likes - 1 }
-                 else { c with liked := true,  likes := c.likes + 1 }
-  | .tick       => { c with progress := min (c.progress + 1) c.duration }
 
 def likeOn  : Style := css [ color "#ff2d55", fontWeight "700" ]
 def likeOff : Style := css [ color "#8a8a8a" ]
 
-def view (c : Model) : Html Msg :=
-  <article role="card" class="feed-card">
-    <progress max={toString c.duration} value={toString c.progress}/>
-    <strong>{s!"@{c.author}"}</strong>
-    <button role="like" onClick={.toggleLike} {if c.liked then likeOn else likeOff}>{s!"♥ {c.likes}"}</button>
-  </article>
-
-def component : Component Model Msg := { update, view }
+/-- One feed card. No field defaults: the parent seeds every card, so this component is
+    embed-only. The like handler sets two fields in one message; both expressions read
+    the same pre-update state. -/
+component Card where
+  state id       : Nat
+  state author   : String
+  state likes    : Int
+  state liked    : Bool
+  state progress : Nat        -- playback position …
+  state duration : Nat        -- … never past the end
+  view =>
+    <article role="card" class="feed-card">
+      <progress max={toString duration} value={toString progress}/>
+      <strong>{s!"@{author}"}</strong>
+      <button role="like"
+        onClick={set liked (!liked), set likes (if liked then likes - 1 else likes + 1)}
+        {if liked then likeOn else likeOff}>{s!"♥ {likes}"}</button>
+    </article>
 
 /-- The card's contract, written once. `abbrev` so it's reusable and decidable. -/
-abbrev Safe (c : Model) : Prop :=
+abbrev Card.Safe (c : Card.State) : Prop :=
   0 ≤ c.likes  ∧  c.progress ≤ c.duration  ∧  (c.liked → 1 ≤ c.likes)
-
-end Card
 
 -- ① a card is always Safe (likes ≥ 0, never past its end, "liked ⇒ counted").   auto
 invariant cardSafe   : Card.Safe preserved_by Card.update
 -- ② the like button always carries one of its two styles.                        auto
-invariant cardStyled : roleHasOneOf "like" [Card.likeOn, Card.likeOff] holds_in Card.view
+invariant cardStyled : roleHasOneOf "like" [likeOn, likeOff] holds_in Card.view
 
 /-! ## The parent: a sorted feed -/
 
 structure Model where
-  cards  : Array Card.Model
+  cards  : Array Card.State
   nextId : Nat
 
 inductive Msg
   | card (k : String) (msg : Card.Msg)    -- a tap inside a card, routed by key
   | rank                                   -- re-sort: most-liked first
+  | tick                                   -- advance every card's playback (props flow;
+                                           --   a `Cmd.every` timer would drive it live)
   | dismiss (id : Nat)                     -- swipe a card away
   | append                                 -- a fresh (valid-by-construction) card arrives
 
@@ -73,6 +68,8 @@ embed Card as card keyedBy (toString ·.id) into cards
 def update (m : Model) : Msg → Model
   | .card k msg => cardUpdate m k msg
   | .rank       => { m with cards := m.cards.sortBy (fun a b => a.likes ≥ b.likes) }
+  | .tick       => { m with cards := m.cards.map fun c =>
+                              { c with progress := min (c.progress + 1) c.duration } }
   | .dismiss id => { m with cards := m.cards.filter (·.id != id) }
   | .append     => { m with cards  := m.cards.push
                               { id := m.nextId, author := "new", likes := 0,
@@ -80,13 +77,22 @@ def update (m : Model) : Msg → Model
                             nextId := m.nextId + 1 }
 
 def view (m : Model) : Html Msg :=
-  <section class="feed">{m.cards.map fun c => cardView c}</section>
+  <section class="feed">
+    <button class="rank" onClick={.rank}>Most liked</button>
+    <button class="more" onClick={.append}>Load more</button>
+    <div class="cards">{m.cards.map fun c =>
+      <article key={toString c.id} class="slot">
+        {cardView c}
+        <button class="dismiss" onClick={.dismiss c.id}>✕</button>
+      </article>}</div>
+  </section>
 
 def init : Model := { cards := #[], nextId := 0 }
 def app : App Model Msg := mkApp init update (View.ofHtml view)
 
--- ③ EVERY card in the feed stays Safe, across taps, re-rank, dismiss, append.   one line, auto
+-- ③ EVERY card in the feed stays Safe, across taps, re-rank, tick, dismiss, append.   one line, auto
 --    keyed tap → the child contract carries it; `rank` sorts (verified `sortBy`);
+--    `tick` maps over the rows (the parent owns them, so it updates them directly);
 --    `dismiss` only filters; `append`'s new card is Safe by construction.
 invariant feedSafe : cardSafe for_each cards preserved_by update
 

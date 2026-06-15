@@ -80,7 +80,7 @@ invariant streamSafe : (fun m => m.pending = true → 0 < m.turns.size)
     preserved_by transition := by
   intro m msg h
   cases msg <;>
-    simp_all only [transition, appendLast, ToStep.toStep_model, ToStep.toStep_pair,
+    simp_all only [transition, appendLast, ToStep.toStep_model,
                    InvTarget.proj_fst, Array.size_modify] <;>
     (try split) <;>
     simp_all [Array.size_push] <;>

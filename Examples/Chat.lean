@@ -72,19 +72,11 @@ def transition (m : Model) : Msg → Model × Cmd Msg := steps
 -- A safety property of the *effectful* transition: a reply only ever streams into a
 -- turn that already exists, so `appendLast` (which writes the conversation's last turn)
 -- is never reached on an empty log. `preserved_by` reads the model out of the
--- `Model × Cmd Msg` the transition returns. The property holds across every message,
--- but re-establishing it after `.chunk` needs the fact that `appendLast` keeps the turn
--- count (it rewrites the last turn, never adds or removes one), so we hand the discharger
--- that lemma after `:=`.
+-- `Model × Cmd Msg` the transition returns. The discharger discovers `appendLast` (a helper
+-- this module defines) by walking what `transition` calls, and already carries the Array
+-- size lemmas, so it re-establishes the count after `.chunk` with no `:= by` and no `using`.
 invariant streamSafe : (fun m => m.pending = true → 0 < m.turns.size)
-    preserved_by transition := by
-  intro m msg h
-  cases msg <;>
-    simp_all only [transition, appendLast, ToStep.toStep_model,
-                   InvTarget.proj_fst, Array.size_modify] <;>
-    (try split) <;>
-    simp_all [Array.size_push] <;>
-    omega
+    preserved_by transition
 
 def bubble (t : Turn) : Html Msg :=
   <div class={if t.user? then "msg user" else "msg bot"}>{t.text}</div>

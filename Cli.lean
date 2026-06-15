@@ -499,23 +499,18 @@ def cmdNew (dir : String) : IO UInt32 := do
     "lean_exe web where\n  root := `Web\n"
   IO.FS.writeFile (root / "App.lean") <|
     "import Qed\nopen Qed\n\n" ++
-    "structure Model where\n  count : Int\nderiving Inhabited\n\n" ++
-    "inductive Msg | increment | decrement | reset\n\n" ++
-    "def init : Model := { count := 0 }\n\n" ++
-    "def update (m : Model) : Msg → Model\n" ++
-    "  | .increment => { m with count := m.count + 1 }\n" ++
-    "  | .decrement => { m with count := if 0 < m.count then m.count - 1 else m.count }\n" ++
-    "  | .reset     => { m with count := 0 }\n\n" ++
-    "def app : App Model Msg := ui init update fun m =>\n" ++
-    "  <div class=\"counter\">\n" ++
-    "    <button onClick={.decrement}>−</button>\n" ++
-    "    <span class=\"count\">{m.count}</span>\n" ++
-    "    <button onClick={.increment}>+</button>\n" ++
-    "    <button onClick={.reset}>reset</button>\n" ++
-    "  </div>\n\n" ++
-    "invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update\n"
+    "component Counter where\n" ++
+    "  state count : Int := 0\n" ++
+    "  view =>\n" ++
+    "    <div class=\"counter\">\n" ++
+    "      <button onClick={set count (if 0 < count then count - 1 else count)}>−</button>\n" ++
+    "      <span class=\"count\">{count}</span>\n" ++
+    "      <button onClick={set count (count + 1)}>+</button>\n" ++
+    "      <button onClick={set count 0}>reset</button>\n" ++
+    "    </div>\n\n" ++
+    "invariant counterSafe : (fun s => 0 ≤ s.count) preserved_by Counter.update\n"
   IO.FS.writeFile (root / "Web.lean") <|
-    "import App\nimport Qed.Driver\n\ndef main : IO Unit := Qed.run app\n"
+    "import App\nimport Qed.Driver\n\ndef main : IO Unit := Qed.run Counter.app\n"
   IO.println (green s!"✓ created {dir}/")
   IO.println s!"  next:  cd {dir} && qed dev"
   return 0

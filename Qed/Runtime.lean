@@ -291,6 +291,13 @@ structure LocalDef where
   /-- Render the child from serialized state, messages erased to `LocalMsg`. -/
   view : String → Html LocalMsg
 
+/-- Drop duplicate registrations (same id), keeping the first. The auto-collected `locals`
+    concatenate the transitive `regs` of every component tag in a view, so a component
+    reachable two ways would otherwise register twice. -/
+def LocalDef.dedupe (ds : List LocalDef) : List LocalDef :=
+  (ds.foldl (fun (acc : Array LocalDef) d =>
+    if acc.any (·.id == d.id) then acc else acc.push d) #[]).toList
+
 /-- A self-contained application: an initial (model, startup effect), a transition that may
     request effects, and a `View` template. The runtime always renders through the template
     (one engine); `App.view` below is its `View.render`, the spec the fine-grained driver is
@@ -388,10 +395,38 @@ the `fun`:
     ui init update fun m => …                                   -- pure
     ui init transition (onRoute := Msg.route) fun m => …        -- routed (needs a `router`)
     ui init transition (start := Cmd.now .today) fun m => …
-    ui init update (locals := [w.reg]) (onPort := some onPort) fun m => …
+    ui init update (onPort := some onPort) fun m => …
 
-For a reused/pre-built template, call `mkApp`/`mkRoutedApp` with a `view%` fragment or
-`View.ofHtml`. Core-syntax only (no `import Lean`): quotations over the existing total `view%`. -/
+Components used as tags in the view (`<Widget …/>`) are registered automatically (each
+tag's transitive `Name.regs`); pass `locals := Name.regs` explicitly only for a component
+mounted inside a helper *function* the view calls, where the tag isn't syntactically
+visible here. For a reused/pre-built template, call `mkApp`/`mkRoutedApp` with a `view%`
+fragment or `View.ofHtml`. Core-syntax only (no `import Lean`): quotations over the
+existing total `view%`. -/
+
+/-- The component tags (`<Widget …/>`, the capitalized-tag rule of `Qed.Jsx`) under a piece
+    of view syntax, by name as written. How `ui` and the `component` declaration collect the
+    registrations (each tag's `Name.regs`) a view needs, with no `locals := […]` by hand.
+    Purely syntactic, so a tag inside a *helper function* the view calls is not seen; list
+    such a helper's components explicitly via `locals := Name.regs`. -/
+partial def componentTagsIn (stx : Lean.Syntax) (acc : Array String := #[]) : Array String :=
+  let tokenVal : Lean.Syntax → String := fun n =>
+    match n with
+    | .node _ _ #[.atom _ v] => v
+    | .atom _ v              => v
+    | _                      => ""
+  let acc :=
+    if stx.getKind == `Qed.Jsx.selfClosing || stx.getKind == `Qed.Jsx.withChildren then
+      let nm := tokenVal (stx.getArg 1)
+      if !nm.isEmpty && nm.front.isUpper && !acc.contains nm then acc.push nm else acc
+    else acc
+  match stx with
+  | .node _ _ args => args.foldl (fun a s => componentTagsIn s a) acc
+  | _              => acc
+
+/-- A tag name as written (`"Foo.Bar"`) to the component's name (`Foo.Bar`). -/
+def componentTagName (tag : String) : Lean.Name :=
+  (tag.splitOn ".").foldl Lean.Name.str Lean.Name.anonymous
 
 -- One option `(name := value)`. The name is a generic `ident` (not a keyword), so `onRoute`/
 -- `start`/`locals`/`onPort` reserve no tokens; each atom is a single token (`(`, `:=`, `)`).
@@ -418,6 +453,14 @@ macro_rules
             | `onPort  => portE   := e
             | _ => Macro.throwErrorAt name s!"ui: unknown option '{name.getId}' (expected onRoute/start/locals/onPort/queries)"
         | _ => pure ()
+      -- auto-register the components the view's tags mount: append each tag's transitive
+      -- `Name.regs` to whatever `locals := …` passed explicitly (needed only for components
+      -- hidden inside helper functions), deduped by id
+      let tags := componentTagsIn body
+      if !tags.isEmpty then
+        for tag in tags do
+          localsE ← `($localsE ++ $(mkIdent (componentTagName tag ++ `regs)))
+        localsE ← `(Qed.LocalDef.dedupe $localsE)
       let base ← match routeE? with
         | some route =>
             `(Qed.mkRoutedApp $init $update $tmpl (onRoute := $route)

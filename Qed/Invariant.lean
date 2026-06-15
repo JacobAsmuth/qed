@@ -216,8 +216,9 @@ def exactlyOne (roleA roleB : String) (on off : Style) : Html msg → Bool :=
 
 /-! ### Lifting a styling contract over a list of children
 
-`embed` renders each child as `(Child.view c).map wrap` (it relabels the child's messages into the
-parent's). These lemmas say a role/class predicate is unaffected by that relabelling, so a parent
+A parent-owned tag (`<Child state={c} onMsg={…}/>`) renders each child as
+`(Child.view c).map wrap` (it relabels the child's messages into the parent's). These lemmas say a
+role/class predicate is unaffected by that relabelling, so a parent
 styling invariant over a list, "every rendered card is styled", reduces to the child's `holds_in`
 contract per card. Behavioural lifting (`for_each … preserved_by`) is automatic; styling lifts over a
 list use these as a short `holds_in … := by …`, since the parent *view*'s shape varies too much for a
@@ -242,7 +243,7 @@ theorem attrRole_map {α β} (f : α → β) (a : List (Attr α)) :
 
 mutual
 /-- A tag/attr-only predicate is preserved under `Html.map` (message relabelling), given it agrees on
-    a relabelled attribute list, the basis for lifting styling over `embed`-rendered children. -/
+    a relabelled attribute list, the basis for lifting styling over tag-rendered children. -/
 theorem everyElement_map {α β} (f : α → β)
     {pα : String → List (Attr α) → Bool} {pβ : String → List (Attr β) → Bool}
     (hp : ∀ t a, pβ t (a.map (Attr.map f)) = pα t a) :
@@ -269,14 +270,14 @@ theorem everyElementL_mapList {α β} (p) (g : β → Html α) (l : List β) :
   | cons x xs ih => simp [List.map, everyElementL, ih, Bool.and_eq_true]
 
 /-- The styling predicate `roleHasOneOf` survives `Html.map`, so a card's contract over `Card.view`
-    transfers to its `embed`-rendered `(Card.view c).map wrap`. The corollary you apply per card. -/
+    transfers to its tag-rendered `(Card.view c).map wrap`. The corollary you apply per card. -/
 theorem roleHasOneOf_map {α β} (f : α → β) (r) (styles) (h : Html α) :
     roleHasOneOf r styles (h.map f) = roleHasOneOf r styles h :=
   everyElement_map f (fun _ _ => by simp [attrRole_map, attrClasses_map, hasOneClass]) h
 
 /-- The per-child bridge for the styling lift: a styled child view stays styled after `Html.map`
-    relabels its messages, so `everyElement Pβ (cardView c) = true` follows from the child's
-    `holds_in` contract. `everyElement_through_map _ _ hP childContract` closes one rendered card
+    relabels its messages, so `everyElement Pβ ((Card.view c).map wrap) = true` follows from the
+    child's `holds_in` contract. `everyElement_through_map _ _ hP childContract` closes one rendered card
     (`Pα`/`Pβ` are the same role predicate at the child's and parent's message types). -/
 theorem everyElement_through_map {α β} (f : α → β) {Pα : String → List (Attr α) → Bool}
     {Pβ : String → List (Attr β) → Bool} (h : Html α)

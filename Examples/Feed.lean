@@ -2,11 +2,11 @@
   Tour 07 · Lifting a contract over a list
 
   Feed: a TikTok-style scrollable feed of cards, the parent holding them as a *sorted*
-  keyed list it owns. The card is an ordinary `component` declaration; `embed` mounts it
-  into the parent's list, so who owns the state is a mounting choice, not a different way
-  of writing the child. Demonstrates `for_each`: the card's invariant lifted to "every
-  card in the feed stays valid", across the feed's own transition (re-rank / tick /
-  dismiss / load), in one line and with no proof.
+  keyed list it owns. The card is an ordinary `component` declaration, rendered with
+  `<Card state={c} onMsg={.card}/>`, so who owns the state is a use-site choice, not a
+  different way of writing the child. Demonstrates `for_each`: the card's invariant
+  lifted to "every card in the feed stays valid", across the feed's own transition
+  (re-rank / tick / dismiss / load), in one line and with no proof.
 
   Pure Lean; the invariants are erased at runtime, so there is no browser entry; the
   guarantee is that this file *builds* (the kernel checked every lift).
@@ -21,9 +21,9 @@ namespace Feed
 def likeOn  : Style := css [ color "#ff2d55", fontWeight "700" ]
 def likeOff : Style := css [ color "#8a8a8a" ]
 
-/-- One feed card. No field defaults: the parent seeds every card, so this component is
-    embed-only. The like handler sets two fields in one message; both expressions read
-    the same pre-update state. -/
+/-- One feed card. No field defaults: the parent owns and seeds every card. The like
+    handler sets two fields in one message; both expressions read the same pre-update
+    state. -/
 component Card where
   state id       : Nat
   state author   : String
@@ -31,6 +31,7 @@ component Card where
   state liked    : Bool
   state progress : Nat        -- playback position …
   state duration : Nat        -- … never past the end
+  key id
   view =>
     <article role="card" class="feed-card">
       <progress max={toString duration} value={toString progress}/>
@@ -63,10 +64,8 @@ inductive Msg
   | dismiss (id : Nat)                     -- swipe a card away
   | append                                 -- a fresh (valid-by-construction) card arrives
 
-embed Card as card keyedBy (toString ·.id) into cards
-
 def update (m : Model) : Msg → Model
-  | .card k msg => cardUpdate m k msg
+  | .card k msg => { m with cards := Card.updateKeyed m.cards k msg }
   | .rank       => { m with cards := m.cards.sortBy (fun a b => a.likes ≥ b.likes) }
   | .tick       => { m with cards := m.cards.map fun c =>
                               { c with progress := min (c.progress + 1) c.duration } }
@@ -82,7 +81,7 @@ def view (m : Model) : Html Msg :=
     <button class="more" onClick={.append}>Load more</button>
     <div class="cards">{m.cards.map fun c =>
       <article key={toString c.id} class="slot">
-        {cardView c}
+        <Card state={c} onMsg={.card}/>
         <button class="dismiss" onClick={.dismiss c.id}>✕</button>
       </article>}</div>
   </section>

@@ -1,7 +1,8 @@
 /-
   Qed.ForEach: lifting a child component's invariant over a list of children.
 
-  A `Component` embedded with `embed` lives as a keyed array in the parent's model. Its contract
+  A parent-owned `Component` (a `<Child state={…} onMsg={…}/>` tag) lives as a keyed array in the
+  parent's model. Its contract
   (`invariant childSafe : Child.Safe preserved_by Child.update`) is then a fact about *one* child.
   This file adds the connective that lifts it to "*every* child in the list stays valid", across the
   parent's own transition:
@@ -14,8 +15,8 @@
                                   (∀ c ∈ (update m msg).cards, Card.Safe c)
 
   and discharges it by *applying* the composition lemmas in `Qed.ForEach` (`Component.lean`), one per
-  list operation, rather than re-deriving the membership reasoning. The keyed arm (the one `embed`
-  introduces) is closed by `updateKeyed_forall` fed the child invariant `cardSafe`; `add`/`remove`
+  list operation, rather than re-deriving the membership reasoning. The keyed arm (the routed child
+  message) is closed by `updateKeyed_forall` fed the child invariant `cardSafe`; `add`/`remove`
   arms by `forall_push`/`forall_filter`. An arm with no matching lemma (a `qsort`, a hand-rolled
   rebuild, an `add` whose new element isn't provably valid) is *named* in the error with the fix.
 
@@ -136,13 +137,13 @@ macro_rules
 `<pred> for_each <field> holds_in <view> using <childStyled>` lifts a child's styling contract to
 "the parent's whole rendered view is styled", chrome *and* every card. It proves the same theorem a
 plain `holds_in` does (`∀ m, pred (view m) = true`); the difference is the discharger handles the
-*dynamic list* of `embed`-rendered children (which plain `holds_in` can't), by closing each rendered
+*dynamic list* of tag-rendered children (which plain `holds_in` can't), by closing each rendered
 card with `<childStyled>`. -/
 
 /-- The styling lift's discharge core, exposed as a tactic so a hand `:= by` can reuse it and fill
     only an unusual view shape: reduce the view to chrome + a rendered list (`qedStyleReduce`), then
     close each rendered card via the child `holds_in` contract `childStyled` (a styled child view
-    stays styled after `embed`'s `Html.map`, `everyElement_through_map`). Leaves what it can't (no
+    stays styled after the tag's `Html.map`, `everyElement_through_map`). Leaves what it can't (no
     error). -/
 macro "forEachStyleLift " view:ident childStyled:ident : tactic =>
   `(tactic|

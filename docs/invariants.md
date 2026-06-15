@@ -61,16 +61,15 @@ invariant idsBelowNext : (fun m => ∀ r ∈ m.rows, r.id < m.nextId)
 
 ## Lifting a contract over a list of children (`for_each`)
 
-A `component` embedded with `embed` lives as a keyed array in the parent's model, and its
-contract is a fact about *one* child. `for_each` lifts that to **every child in the list, across the
-parent's own transition**, in one line, no proof:
+A parent-owned `component` (rendered with `<Card state={c} onMsg={.card}/>`) lives as a keyed
+array in the parent's model, and its contract is a fact about *one* child. `for_each` lifts that
+to **every child in the list, across the parent's own transition**, in one line, no proof:
 
 ```lean
 abbrev Card.Safe (c : Card.State) : Prop :=                 -- the child's contract, written once
   0 ≤ c.likes ∧ c.progress ≤ c.duration ∧ (c.liked → 1 ≤ c.likes)
 invariant cardSafe : Card.Safe preserved_by Card.update     -- the card never breaks it
 
-embed Card as card keyedBy (toString ·.id) into cards
 def update : Model → Msg → Model | ...                      -- tap / re-rank / dismiss / add
 
 invariant feedSafe : cardSafe for_each cards preserved_by update
@@ -111,10 +110,10 @@ invariant feedStyled : cardStyled for_each cards holds_in view
 -- ⇒ machine-checks: ∀ m, roleHasOneOf "like" […] (view m) = true   (the same theorem `holds_in` gives)
 ```
 
-A plain `holds_in view` can't auto-discharge this, it walks into the dynamic `cards.map cardView`
+A plain `holds_in view` can't auto-discharge this, it walks into the dynamic `cards.map …`
 list and stops. `for_each cards … using cardStyled` (or just naming `cardStyled`) is the missing information (which list,
 which child contract): the discharger reduces the view to its chrome plus that list (a styled child
-view stays styled after `embed`'s message-relabel, `roleHasOneOf_map`) and closes each card with
+view stays styled after the tag's message-relabel, `roleHasOneOf_map`) and closes each card with
 `cardStyled`. If the parent view has its *own* element with that role, or its shape is unusual, the
 error names what's left and hands a `forEachStyleLift` skeleton, same bargain as the behavioural side.
 

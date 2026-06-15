@@ -2,9 +2,10 @@
   Qed.Component, reusable, nestable view components.
 
   The authored form is the `component` command at the bottom of this file: ONE way to
-  declare a component, with who owns its state decided at the mount site (framework-owned
-  keyed instances via `mount`, or parent-owned rows via `embed`). Everything above it is
-  the substrate that declaration elaborates onto.
+  declare a component, used from a view as a JSX tag (`<Widget …/>`, see `Qed.Jsx`),
+  with who owns its state decided at the use site (framework-owned keyed instances, or
+  parent-owned rows bound with `state={…}`). Everything above it is the substrate that
+  declaration elaborates onto.
 
   A `Component Model Msg` bundles a `Model → Msg → Model` transition with a
   `Model → Html Msg` view: the reusable behaviour of a self-contained piece of UI,
@@ -13,14 +14,9 @@
   (`Html.map`), so a click inside a child is delivered as a parent message, the
   types make a misrouted event impossible.
 
-  The list helpers (`viewList`/`updateAt`) cover the common case of the same
-  component repeated per data row (e.g. one box per entry in a decoded JSON array):
-  each row's messages are tagged with the row index, so a parent message carries
-  *which* row produced it.
-
   Everything here is pure sugar over `Html.map`; it adds no axioms and links on
-  every target. A child that needs effects (`Cmd`) is not modelled yet, promote it
-  with `toApp` and run it as its own application, or thread effects in the parent.
+  every target. A child that needs effects (`Cmd`) is not modelled yet, run it as its
+  own application (the generated `Name.app`), or thread effects in the parent.
 -/
 import Qed.Html
 import Qed.Runtime
@@ -41,90 +37,32 @@ structure Component (Model : Type) (Msg : Type) where
 namespace Component
 variable {Model Msg PMsg : Type}
 
-/-- Run a component as a standalone application (no effects). Useful for testing a
-    component in isolation, or when it *is* the whole app. The component's `Html` view is a
-    value (not inline), so it goes in as a `View.ofHtml` template. -/
-def toApp (c : Component Model Msg) (init : Model) : App Model Msg :=
-  mkApp init c.update (View.ofHtml c.view)
-
 /-- Embed a single child: render it and relabel its messages into the parent's
     `Msg` via `wrap`. The parent's transition for `wrap cm` runs `c.update` on the
     child's slice of the model. -/
 def render (c : Component Model Msg) (wrap : Msg → PMsg) (m : Model) : Html PMsg :=
   (c.view m).map wrap
 
-/-- Render the same component once per row, tagging each row's messages with its
-    index: `tag i cm` is the parent message for child message `cm` from row `i`.
-    The result is a child list ready to drop into `<ul>{…}</ul>`. -/
-def viewList (c : Component Model Msg) (models : Array Model)
-    (tag : Nat → Msg → PMsg) : List (Html PMsg) :=
-  (models.mapIdx fun i m => (c.view m).map (tag i)).toList
-
-/-- Route a child message to row `i` and run that row's transition, leaving the
-    other rows untouched. The dual of `viewList` for the parent's `update`.
-
-    *Positional*: `i` is an array index, so an in-flight message can land on the
-    wrong row if the list reorders between render and dispatch. Prefer `updateKeyed`
-    (routes by a stable key) for lists that sort/reorder. -/
-def updateAt (c : Component Model Msg) (models : Array Model) (i : Nat) (msg : Msg) :
-    Array Model :=
-  models.modify i (c.update · msg)
-
 /-- Route a child message to the row whose `key` matches `k` and run that row's
-    transition, leaving the others untouched. Unlike `updateAt`, routing is by a
-    stable key (the same identity the keyed `diff` reconciles by), so a message
-    survives the list being sorted or filtered between render and dispatch, the
-    React way of addressing a child by identity, not position. -/
+    transition, leaving the others untouched. Routing is by a stable key (the same
+    identity the keyed `diff` reconciles by), so a message survives the list being
+    sorted or filtered between render and dispatch, the React way of addressing a
+    child by identity, not position. What a declared component's generated
+    `Name.updateKeyed` wraps (with the declaration's `key` baked in). -/
 def updateKeyed (c : Component Model Msg) (key : Model → String)
     (models : Array Model) (k : String) (msg : Msg) : Array Model :=
   models.map fun r => if key r == k then c.update r msg else r
 
 end Component
 
-/-! ### The `embed` command
-
-`embed Child as ctor keyedBy keyFn into field` mounts a `component`-declared child in a
-parent-owned keyed list (`field : Array Child.State`), removing the per-child wiring tax.
-It reads the declaration's generated `Child.component`, `Child.State`, `Child.Msg` and
-generates, in the current namespace:
-
-* `ctorView   : Child.State → Html Msg`, the child's view with its messages tagged
-  by the parent constructor `Msg.ctor key`, so a child event routes back as a parent
-  message carrying the row's stable key;
-* `ctorUpdate : Model → String → Child.Msg → Model`, runs the child's transition on
-  the row in `field` whose key matches, via `updateKeyed` (routing by key, not index,
-  so a sort/filter between render and dispatch can't misroute it).
-
-The one line the macro cannot write (Lean cannot extend an existing `inductive`) is
-the parent message constructor: add `| ctor (k : String) (msg : Child.Msg)` to your
-`Msg`. The `update` arm is then `| .ctor k msg => ctorUpdate m k msg`, and the view
-drops to `ctorView r`. Core-syntax only (no `import Lean`), like `router`. -/
-syntax (name := embedCmd)
-  "embed " ident " as " ident " keyedBy " term " into " ident : command
-
-open Lean in
-macro_rules
-  | `(embed $child:ident as $ctor:ident keyedBy $keyFn:term into $field:ident) => do
-      let comp     := mkIdent (child.getId ++ `component)
-      let childMod := mkIdent (child.getId ++ `State)
-      let childMsg := mkIdent (child.getId ++ `Msg)
-      let pModel   := mkIdent `Model
-      let pMsg     := mkIdent `Msg
-      let pMsgCtor := mkIdent (`Msg ++ ctor.getId)
-      let viewName := mkIdent (Name.mkSimple (ctor.getId.toString ++ "View"))
-      let updName  := mkIdent (Name.mkSimple (ctor.getId.toString ++ "Update"))
-      `(def $viewName (r : $childMod) : Html $pMsg :=
-          (($comp).view r).map ($pMsgCtor ($keyFn r))
-        def $updName (m : $pModel) (k : String) (msg : $childMsg) : $pModel :=
-          { m with $field:ident := ($comp).updateKeyed $keyFn m.$field k msg })
-
 /-! ### Lifting an invariant over a list of children
 
 These are the proven building blocks behind `invariant … forEach …` (see `Qed.Invariant`). Each says
 a standard list operation keeps a per-element predicate `P`, so a parent invariant "every child stays
 valid" reduces, arm by arm, to applying the matching lemma, rather than re-deriving the membership
-reasoning every time. The keyed one (`updateKeyed_forall`) is the case `embed` introduces: routing a
-child message touches one row via the child's transition, so it preserves `P` whenever the child does. -/
+reasoning every time. The keyed one (`updateKeyed_forall`) is the case a parent-owned component tag
+introduces: routing a child message touches one row via the child's transition, so it preserves `P`
+whenever the child does. -/
 namespace ForEach
 
 /-- `push` keeps `P` for every element, given it holds of the appended one (the `add` arm). -/
@@ -144,9 +82,10 @@ theorem forall_map {α} {P : α → Prop} {a : Array α} {g : α → α}
     (hg : ∀ y ∈ a, P (g y)) : ∀ y ∈ a.map g, P y := by
   intro y hy; rw [Array.mem_map] at hy; obtain ⟨x, hx, rfl⟩ := hy; exact hg x hx
 
-/-- The arm `embed` introduces: delivering a child message through `updateKeyed` keeps `P` for every
-    row, given the child's transition preserves `P`. Generic over the component, so a parent's keyed
-    arm discharges by `exact updateKeyed_forall _ _ childInvariant h`, no per-app proof. -/
+/-- The arm a parent-owned component tag introduces: delivering a child message through
+    `updateKeyed` keeps `P` for every row, given the child's transition preserves `P`. Generic over
+    the component, so a parent's keyed arm discharges by
+    `exact updateKeyed_forall _ _ childInvariant h`, no per-app proof. -/
 theorem updateKeyed_forall {α Msg} {P : α → Prop} (c : Component α Msg) (key : α → String)
     (hc : ∀ r m, P r → P (c.update r m))
     {a : Array α} {k : String} {msg : Msg}
@@ -181,7 +120,7 @@ fields are in scope by name, and `set` is the only way to change one:
 * `set f`, a value handler (`onInput={set f}`): stores the incoming payload in `f`.
 * a chain, `set f e, set g e'`: one handler setting several fields in one message, every
   expression read against the same pre-update state (batched-`setState` semantics).
-* `send o`, with `emits T` declared: bubble `o : T` to the parent's `mountWith` handler.
+* `send o`, with `emits T` declared: bubble `o : T` to the parent's `onEmit={…}` handler.
   `set f e, send o` does both in one message; a component with no `set`/`send` use for a
   field's value can still display it.
 
@@ -192,29 +131,37 @@ Name.update` reduces arm by arm and names the case that broke, local state still
 snapshots/restores through its JSON codec, and replay/the differential gate keep seeing
 serializable messages and a pure transition.
 
-One declaration, two ways to mount it; who owns the state is the parent's choice per
-use site, not a different way of writing the child:
+A declared component is used from a view as a JSX tag (the capitalized-tag rule, see
+`Qed.Jsx`). Who owns the state is the parent's choice per use site, not a different way
+of writing the child:
 
-* **Framework-owned** (`useState`): register `Name.reg` (`ui … (locals := [Name.reg])`)
-  and mount keyed instances with `<div {Name.mount "a"}/>`. The state lives in the
-  driver's keyed store, outside the parent's model. Requires every field to carry a
-  default (they make up `Name.init`).
+* **Framework-owned** (`useState`): `<Name key="a"/>`. The state lives in the driver's
+  keyed store, outside the parent's model. Requires every field to carry a default (they
+  make up `Name.init`). Props seed the initial state (`<Editor key={r.id} text={r.text}/>`,
+  React's `useState(propValue)`; the live state wins on re-render), and with `emits T`
+  the parent receives outputs via `onEmit={…}` (`T → msg`). Inside another component's
+  view, a payload-form `set f` is exactly such a map, so nesting reads
+  `<Child key={…} onEmit={set f}/>`.
 * **Parent-owned** (lifted state): hold rows as `field : Array Name.State` in the parent
-  model and wire them with `embed Name as … keyedBy … into field` (see above). The
-  generated `Name.component` is what `embed` consumes; `for_each` lifts the child's
-  invariants over the list. Fields may omit their defaults here (the parent seeds every
-  row); a component with a default-less field is embed-only. A parent arm may also update
+  model and bind each row with `<Name state={r} onMsg={.ctor}/>`, where
+  `| ctor (k : String) (msg : Name.Msg)` is a constructor of the parent's `Msg` (the one
+  line Lean cannot generate into an existing `inductive`). The matching `update` arm is
+  `| .ctor k msg => { m with field := Name.updateKeyed m.field k msg }`; `for_each` lifts
+  the child's invariants over the list. Declare the row identity once with `key f` (a
+  state field, before `emits`/`view`): it generates `Name.keyOf` (the tag's routing key)
+  and `Name.updateKeyed` (keyed delivery, so a sort/filter between render and dispatch
+  can't misroute). Fields may omit their defaults here (the parent seeds every row); a
+  component with a default-less field is parent-owned-only. A parent arm may also update
   rows directly (`field.map …`), the props flow, and `for_each` lifts over that too.
 
-Generated under `Name.`: `State`, `Msg`, `update`, `view`, always; `component` when there
-is no `emits` (an embedded child's outputs would have no receiver); and, when every field
-has a default, `init`, the JSON codec, `reg`, `mount`, and (with `emits T`) `mountWith
-key onOut`, where `onOut : T → msg` maps the child's output to a parent message. Inside
-another component's view, a payload-form `set f` is exactly such a map, so nesting reads
-`<div {Child.mountWith key (set f)}/>`. Seed a framework-owned instance from parent data
-with `.localInit` on the mount attribute. `LocalDef`/`localMount` (Qed.Runtime) and the
-`Component` structure are the substrate this elaborates onto, as `el` is to JSX, not a
-second authored form.
+Generated under `Name.`: `State`, `Msg`, `update`, `view`, `regs` (its transitive
+component registrations, collected from the view's tags), always; `component` when there
+is no `emits` (a parent-owned child's outputs would have no receiver); `keyOf`/`updateKeyed`
+with a `key` clause; and, when every field has a default, `init`, the JSON codec, `reg`,
+`mount`, with `emits T` `mountWith`, and without `emits` also `app` (the component run
+as a whole application: `def app := Name.app` is a complete program). `LocalDef`/
+`localMount` (Qed.Runtime) and the `Component` structure are the substrate this
+elaborates onto, as `el` is to JSX, not a second authored form.
 
 Sharp edge (the keywords are identifiers, the price of keeping `component`/`view` usable
 as names): a command that *ends in an open precedence-0 term*, like `#check f`, will
@@ -259,19 +206,23 @@ open Lean in
 open Lean Parser in
 /-- `component Name where state f : T := init … view => <jsx>`. The keywords are matched as
     plain identifiers (`identEq`), not reserved tokens: the command category dispatches
-    ident-led parsers by the ident *kind*, and `component`/`state`/`view` stay usable as
-    names everywhere else (`embed` requires `Child.component`, every app has a `view`). -/
+    ident-led parsers by the ident *kind*, and `component`/`state`/`key`/`view` stay usable
+    as names everywhere else (tags expand to `Child.component`, every app has a `view`,
+    `key` is a JSX attribute). -/
 @[command_parser] def componentCmd : Parser := leading_parser
   optional Command.docComment >> atomic (identEq `component) >> ident >> " where " >>
   -- `manyIndent`, exactly like `structure` fields: the saved column makes a field's TYPE
   -- term stop at the next `state`/`emits`/`view` line (an application argument must be
   -- indented past the field's own column), which is what lets the default be optional
   manyIndent (node `Qed.componentStateItem
-    -- a field without a default makes the component embed-only (no `mount`, the parent
-    -- seeds every instance). The default is max-precedence so it cannot swallow what
-    -- follows on the same line; parenthesize a compound default, as in a JSX splice
+    -- a field without a default makes the component parent-owned-only (no `mount`, the
+    -- parent seeds every instance). The default is max-precedence so it cannot swallow
+    -- what follows on the same line; parenthesize a compound default, as in a JSX splice
     (atomic (identEq `state) >> ident >> " : " >> termParser >>
      optional (" := " >> termParser maxPrec))) >>
+  -- `key f`: the state field that identifies a row when the parent owns a list of these
+  -- (the reconciliation/routing key a `state={…}` tag uses). Generates `keyOf`/`updateKeyed`.
+  optional (node `Qed.componentKey (atomic (identEq `key) >> ident)) >>
   optional (node `Qed.componentEmits (atomic (identEq `emits) >> termParser maxPrec)) >>
   -- the body is max-precedence (a JSX element is one closed atom) so that application
   -- cannot extend past it and swallow a following ident-led `component` declaration
@@ -361,7 +312,7 @@ private partial def replaceSets (fields : Array Name) (msgPath : Name) (hasEmits
 open Lean Elab Command in
 @[command_elab componentCmd] def elabComponentCmd : CommandElab := fun stx => do
       -- node shape: [doc?, kw, name, "where", (stateItem: [kw, f, ":", ty, (":=", default)?])*,
-      --              (emits: [kw, ty])?, kw, "=>", body]
+      --              (key: [kw, f])?, (emits: [kw, ty])?, kw, "=>", body]
       let doc? : Option (TSyntax ``Lean.Parser.Command.docComment) :=
         if stx[0].getNumArgs == 1 then some ⟨stx[0][0]⟩ else none
       let t : Ident := ⟨stx[2]⟩
@@ -370,8 +321,9 @@ open Lean Elab Command in
       let tys : Array Term  := items.map fun it => ⟨it[3]⟩
       let ds  : Array (Option Term) := items.map fun it =>
         if it[4].getNumArgs == 2 then some ⟨it[4][1]⟩ else none
-      let outTy? : Option Term := if stx[5].getNumArgs == 1 then some ⟨stx[5][0][1]⟩ else none
-      let body : Term := ⟨stx[8]⟩
+      let keyF?  : Option Ident := if stx[5].getNumArgs == 1 then some ⟨stx[5][0][1]⟩ else none
+      let outTy? : Option Term  := if stx[6].getNumArgs == 1 then some ⟨stx[6][0][1]⟩ else none
+      let body : Term := ⟨stx[9]⟩
       let stateId    := mkIdent (t.getId ++ `State)
       let initId     := mkIdent (t.getId ++ `init)
       let msgId      := mkIdent (t.getId ++ `Msg)
@@ -382,6 +334,12 @@ open Lean Elab Command in
       let toJsonId   := mkIdent (t.getId ++ `State ++ `toJson)
       let fromJsonId := mkIdent (t.getId ++ `State ++ `fromJson)
       let fieldNames := fs.map (·.getId)
+      if let some kf := keyF? then
+        unless fieldNames.contains kf.getId.eraseMacroScopes do
+          throwErrorAt kf "`key {kf.getId}`: not a `state` field of this component (fields: {fieldNames.toList})"
+        if outTy?.isSome then
+          throwErrorAt kf "`key` marks the row identity for parent-owned use (`state=\{…}`), \
+            and a parent-owned child's `emits` output would have no receiver; drop one of the two"
       -- the registry id: the component's full name, unique app-wide by construction
       let idLit := Syntax.mkStrLit (((← getCurrNamespace) ++ t.getId).toString)
       -- Collect the `set`/`send` sites; each becomes a `Msg` constructor reference in the body.
@@ -456,15 +414,27 @@ open Lean Elab Command in
         updateCmd,
         ← `(command| def $viewId (s : $stateId) : Html $msgId := $viewBody) ]
       -- without `emits` the update is `State → Msg → State`, so the declaration is also a
-      -- `Component`: `embed` mounts it into a parent-owned keyed list with no extra code
+      -- `Component`: a `state={…}` tag mounts it into a parent-owned keyed list with no
+      -- extra code
       if outTy?.isNone then
         let compId := mkIdent (t.getId ++ `component)
         cmds := cmds.push <|
           ← `(command| $[$doc?:docComment]? def $compId : Component $stateId $msgId :=
                 { update := $updateId, view := $viewId })
+        -- `key f` names the row identity once: `keyOf` is the routing/reconciliation key a
+        -- `state={…}` tag tags messages with, and `updateKeyed` delivers one back to its row
+        if let some kf := keyF? then
+          let keyOfId       := mkIdent (t.getId ++ `keyOf)
+          let updateKeyedId := mkIdent (t.getId ++ `updateKeyed)
+          let kfId          := mkIdent kf.getId.eraseMacroScopes
+          cmds := cmds ++ #[
+            ← `(command| def $keyOfId (s : $stateId) : String := toString s.$kfId),
+            ← `(command| def $updateKeyedId (rows : Array $stateId) (k : String)
+                  (msg : $msgId) : Array $stateId :=
+                  Component.updateKeyed $compId $keyOfId rows k msg)]
       -- the framework-owned mount (`reg`/`mount`) needs an `init` and a serializable state,
       -- so it exists only when every field has a default; without one the component is
-      -- embed-only and the parent seeds every instance
+      -- parent-owned-only and the parent seeds every instance
       if ds.all (·.isSome) then
         let dsT := ds.filterMap id
         cmds := cmds ++ #[
@@ -490,6 +460,25 @@ open Lean Elab Command in
             ← `(command| $[$doc?:docComment]? def $mountWithId {msg : Type}
                   (key : String) (onOut : $o → msg) : Attr msg :=
                   localMountWith $idLit key (fun out => some (onOut out)))
+      -- `regs`: the registrations this component's view needs, its own `reg` (when
+      -- mountable) plus, transitively, those of every component tag in its view. `ui`
+      -- and the generated `app` collect these automatically, no `locals := […]` by hand.
+      let regsId    := mkIdent (t.getId ++ `regs)
+      let deps      := (componentTagsIn body).filter (· != t.getId.toString)
+      let mountable := ds.all (·.isSome)
+      let own : Term ← if mountable then `([$regId]) else `(([] : List LocalDef))
+      let mut regsT : Term := own
+      for d in deps do
+        regsT ← `($regsT ++ $(mkIdent (componentTagName d ++ `regs)))
+      cmds := cmds.push (← `(command| def $regsId : List LocalDef := LocalDef.dedupe $regsT))
+      -- with every field defaulted and no `emits`, the component can BE the whole app:
+      -- `def app := Name.app` is a complete program (state → model, the generated
+      -- update → transition, nested tags registered)
+      if mountable && outTy?.isNone then
+        let appId := mkIdent (t.getId ++ `app)
+        cmds := cmds.push <|
+          ← `(command| $[$doc?:docComment]? def $appId : App $stateId $msgId :=
+                mkApp $initId $updateId (View.ofHtml $viewId) (locals := $regsId))
       for c in cmds do elabCommand c
 
 end Qed

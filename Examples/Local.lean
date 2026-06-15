@@ -12,12 +12,14 @@
     and dropping its clamp fails the build naming the guilty case (`set_count`).
   * **local state**: each row's `Widget` (a counter + a note) keeps state the parent
     never declares; touching one row leaves the root model and every sibling untouched.
-  * **bubbling**: a `Widget`'s Report `send`s its count up to the root as a typed output.
-  * **init-from-props**: each `Widget` is *seeded* from its row (its id, and its note
-    pre-filled with the row label) via `.localInit`, React's `useState(propValue)`.
+  * **bubbling**: a `Widget`'s Report `send`s its count up to the root as a typed output
+    (the tag's `onEmit={…}`).
+  * **init-from-props**: each `Widget` is *seeded* from its row by its tag's props
+    (`<Widget key={r.id} id={r.id} note={r.label} …/>`), React's `useState(propValue)`.
   * **nesting**: a `Widget` itself hosts a `Tag` component (a pin toggle); the `Tag`
-    sends its state up to its parent `Widget` (`mountWith` + a payload-form `set`),
-    which shows it. Components compose to any depth.
+    sends its state up to its parent `Widget` (`onEmit` + a payload-form `set`),
+    which shows it. Components compose to any depth, and every component a view's
+    tags reach is registered automatically (no `locals := …` anywhere here).
 
   Unmount GC and snapshot/restore are driver features the browser test drives directly.
   Pure Lean, total by construction; the browser entry is `Examples/LocalWeb.lean`.
@@ -77,7 +79,7 @@ component Widget where
       <input class="note" value={note} onInput={set note} placeholder="a local note…"/>
       <button class="report" onClick={send count}>Report ↑</button>
       <span class="pinned">{if pinned then "pinned" else ""}</span>
-      <div {Tag.mountWith s!"t{id}" (set pinned)}/>
+      <Tag key={s!"t{id}"} onEmit={set pinned}/>
     </div>
 
 /-- The root owns the shared list (ids + labels) and the last reported count. Per-row
@@ -113,33 +115,28 @@ def update (m : Model) : Msg → Model
   | .remove id     => { m with rows := m.rows.filter (·.id != id) }
   | .reported id c => { m with lastReport := some (id, c) }
 
-def view (m : Model) : Html Msg :=
-  let report := (match m.lastReport with
-    | some (id, c) => s!"last report: row {id} = {c}"
-    | none         => "no reports yet");
+-- The root view goes straight into `ui`: the component tags mount the declared
+-- components, and every registration they need (including the `Tag` nested inside
+-- `Widget`) is collected automatically.
+def app : App Model Msg := ui init update fun m =>
   <div class="app">
     <h1>Local-state rows</h1>
     <div class="add">
       <input class="new" value={m.draft} onInput={.edit} placeholder="New row label"/>
       <button class="addbtn" onClick={.add}>Add row</button>
     </div>
-    <div class="report">{report}</div>
-    <div class="solo" {Stepper.mount "s"}/>
+    <div class="report">{match m.lastReport with
+      | some (id, c) => s!"last report: row {id} = {c}"
+      | none         => "no reports yet"}</div>
+    <div class="solo"><Stepper key="s"/></div>
     <ul class="rows">{m.rows.map fun r =>
-      -- each row hosts a widget, seeded from the row: id + note pre-filled with the
-      -- label. a Report inside it bubbles the count up as `Msg.reported r.id`.
+      -- each row hosts a widget, seeded from the row by props: its id, and its note
+      -- pre-filled with the label. a Report inside it bubbles up as `Msg.reported r.id`.
       <li key={toString r.id} class="row">
         <span class="label">{r.label}</span>
-        <div {(Widget.mountWith (toString r.id) (Msg.reported r.id)).localInit
-              ({ id := r.id, count := 0, note := r.label, pinned := false } : Widget.State)}/>
+        <Widget key={r.id} id={r.id} note={r.label} onEmit={Msg.reported r.id}/>
         <button class="rm" onClick={.remove r.id}>✕</button>
       </li>}</ul>
   </div>
-
--- This view binds component hosts (`Widget.mountWith`) and computes a `let` before
--- the markup, so it goes in as an `Html` view via `View.ofHtml` (reconciled by the verified
--- diff, which preserves the local hosts) rather than the fine-grained lift.
-def app : App Model Msg :=
-  mkApp init update (View.ofHtml view) (locals := [Stepper.reg, Widget.reg, Tag.reg])
 
 end Local

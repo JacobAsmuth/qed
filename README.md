@@ -13,7 +13,9 @@ The same kernel mathematicians use to check proofs checks your frontend.
 `qed build` transpiles your app and the whole verified framework straight to plain JavaScript. No
 emscripten, no WASM, no special runtime. The output is a handful of `.mjs` files you serve anywhere.
 The proofs that pass `qed check` describe the JavaScript that actually runs. If you've written
-React, the view syntax will feel familiar; the architecture underneath is Elm's.
+React, you already know the shape: components with state and props, written in JSX. Underneath,
+every component desugars to Elm's architecture, a typed message and a pure reducer. That's what
+makes the proofs possible.
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/JacobAsmuth/qed/main/install.sh | sh
@@ -24,41 +26,42 @@ qed new myapp && cd myapp && qed dev      # → http://localhost:8000, live-relo
 
 Two guarantees fall out before you write a single proof.
 
-**Your `update` and `view` can't crash.** In Lean they're ordinary total functions. A missing case
-in a `match`, or a render that might not terminate, isn't a warning you can mute. It's a build
-error. The broken code never reaches a user, because it never reaches `dist/`.
+**Your app can't crash at runtime.** State transitions and views are ordinary total Lean
+functions. A missing case in a `match`, or a render that might not terminate, isn't a warning you
+can mute. It's a build error. The broken code never reaches a user, because it never reaches
+`dist/`.
 
 **You can state a fact about your app and let the kernel prove it.** This is the part with no
-analogue in a normal framework. Here's a counter with an invariant that its count is never negative.
+analogue in a normal framework. Here's a complete app, a counter whose count can never go
+negative; `Qed.run Counter.app` is the whole browser entry.
 
 ```lean
-structure Model where
-  count : Int
-deriving Repr, Inhabited
+component Counter where
+  state count : Int := 0
+  view =>
+    <div class="counter">
+      <button onClick={set count (if 0 < count then count - 1 else count)}>−</button>
+      <span class="count">{count}</span>
+      <button onClick={set count (count + 1)}>+</button>
+      <button onClick={set count 0}>reset</button>
+    </div>
 
-inductive Msg | increment | decrement | reset
-
-def init : Model := { count := 0 }
-
-def update (m : Model) : Msg → Model
-  | .increment => { m with count := m.count + 1 }
-  | .decrement => { m with count := if 0 < m.count then m.count - 1 else m.count }
-  | .reset     => { m with count := 0 }
-
-def app : App Model Msg := ui init update fun m =>
-  <div class="counter">
-    <button onClick={.decrement}>−</button>
-    <span class="count">{m.count}</span>
-    <button onClick={.increment}>+</button>
-    <button onClick={.reset}>reset</button>
-  </div>
-
-invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
+invariant counterSafe : (fun s => 0 ≤ s.count) preserved_by Counter.update
 ```
 
-That last line isn't a test, and you don't write its proof. It checks that every message leaves the count non-negative, and the build succeeds only if that holds
-for all of them. Delete the `if 0 < m.count` guard and the build will fail with an error naming the message
-that broke the invariant (`case decrement`).
+State lives next to the view that uses it, and `set` is the only way to change it. But a handler
+is not a closure mutating a cell: each `set` site becomes a constructor of a generated message
+type, and a generated pure reducer (`Counter.update`) interprets it. That's Elm's architecture,
+derived from the component, and it's what the invariant is stated over.
+
+So the last line isn't a test, and you don't write its proof. It checks that every handler leaves
+the count non-negative, and the build succeeds only if that holds for all of them. Delete the
+`if 0 < count` guard and the build fails naming the handler that broke the invariant
+(``case `set_count` still needs: 0 ≤ m.count - 1``).
+
+Those `≤` glyphs aren't something you hunt for on the keyboard. In a Lean editor you type `\le` and
+it turns into `≤` as you go, the same way `\ge \to \and \or` give you `≥ → ∧ ∨`. The comparisons and
+the arrow also take plain ASCII, so `<=`, `>=`, and `->` work as written for `≤`, `≥`, and `→`.
 
 ## One way to write a view
 
@@ -81,7 +84,7 @@ diverge from the proofs. `qed build` runs the Lean compiler's IR through a trans
 emits JavaScript for your app, the whole framework, and the driver that runs them.
 
 ```text
-Lean app (Model, Msg, update, view, deriving/invariant; proofs auto-discharged)
+Lean app (components, Model/Msg/update, invariants; proofs auto-discharged)
    │  lake build              (the kernel checks every proof)
    ▼
 qedjs  (transpiles the Lean to JavaScript: your app + the Qed framework + the driver)
@@ -124,18 +127,17 @@ value, never an exception.
 
 ### Routing and HTTP
 
-`router` declares your pages and gives you a `Router` whose round-trip is proven: a URL you can print
-is a URL you can parse back into the route that produced it. A `String` parameter rides the URL
-verbatim. A `Nat` or `Int` parameter prints with `repr` and parses with `toNat?`/`toInt?`, and the
-round-trip is still discharged automatically. `linkTo route` builds a navigation link from a route
-value, not a string, so a mistyped or impossible path won't compile. The routed app hands your
-transition the route already parsed, and `Cmd.getJson` does the fetch and the decode together:
+`router` declares your pages, and from that one table it proves routing round-trips: any route you
+print is one you can parse back into the exact route that produced it. That proof is why `linkTo`
+takes a route value, not a string. The link below can only point at a page that exists, so a
+mistyped or never-declared route is a compile error, not a broken link you ship.
 
 ```lean
 router R where
   home => ""
   user (name : String) => "users"
   post (id : Nat)       => "posts"
+  * notFound => "404"                    -- where any unmatched URL lands
 
 def app : App Model Msg :=
   ui init transition (onRoute := Msg.routed) fun m =>
@@ -144,6 +146,13 @@ def app : App Model Msg :=
       {linkTo (R.user "ada") [] "ada"}   -- a real route, checked at compile time
     </form>
 ```
+
+A parameter rides the URL as one segment. A `String` goes through verbatim; a `Nat` or `Int` is
+decoded when the URL parses, so `/posts/abc` never reaches your code as a `post`. The proof covers
+the links your app builds, not what someone types in the address bar, so a URL that matches nothing
+still has to resolve to something. Mark a route with `*` and unmatched URLs land there; leave it off
+and they fall back to your first route. `onRoute` hands your transition the parsed route, and
+`Cmd.getJson` does the fetch and the decode in one step.
 
 ### Effects
 
@@ -170,15 +179,16 @@ a few lines.
 
 ### Components
 
-A component is one declaration: state fields next to the view that uses them, changed only
-through `set` in its own handlers. Here's a feed card. The like handler sets two fields in one
-message, and the two invariants are the card's contract, one over behavior, one over styling.
+Every piece of UI is the same declaration the counter at the top used. Here's a feed card. The
+like handler sets two fields in one message, and the two invariants are the card's contract, one
+over behavior, one over styling.
 
 ```lean
 component Card where
   state id    : Nat        -- no defaults: the parent fills these in
   state likes : Int
   state liked : Bool
+  key id                   -- which field identifies a card in a list
   view =>
     <button role="like"
       onClick={set liked (!liked), set likes (if liked then likes - 1 else likes + 1)}
@@ -192,11 +202,13 @@ A handler is not a closure: each `set` compiles to an ordinary message with a na
 invariants work on a component exactly as they do on the app model, and breaking one fails the
 build naming the handler (`case set_liked_likes …`).
 
-Who owns a component's state is decided where you *mount* it, not in how you write it. State the
-parent never reads (an open editor, a half-typed draft) stays out of your model entirely: mount
-keyed instances with `<div {Editor.mount "row-7"}/>` and the framework owns it. State the parent
-does read, the parent owns. The feed holds its cards in the model, `embed` wires the component
-over them, and the view shows the list like any other data:
+A component is used as a JSX tag (capitalized, the React rule), and who owns its state is
+decided at the use site, not in how you write it. State the parent never reads, like an open editor
+or a half-typed draft, stays out of your model entirely. `<Editor key="row-7"/>` mounts a keyed
+instance the framework owns. Props seed it (`<Editor text={r.text}/>`), `onEmit={…}` receives its
+typed output, and registration is automatic. State the parent does read, the parent
+owns: the feed holds its cards in the model, binds each one with `state={…}`, and shows the
+list like any other data:
 
 ```lean
 structure Model where
@@ -204,10 +216,8 @@ structure Model where
 
 inductive Msg | card (k : String) (msg : Card.Msg) | rank | dismiss (id : Nat)
 
-embed Card as card keyedBy (toString ·.id) into cards     -- generates cardView, cardUpdate
-
 def update (m : Model) : Msg → Model
-  | .card k msg => cardUpdate m k msg                     -- route a tap to one card, by key
+  | .card k msg => { m with cards := Card.updateKeyed m.cards k msg }  -- one card, by key
   | .rank       => { m with cards := m.cards.sortBy (fun a b => a.likes ≥ b.likes) }
   | .dismiss id => { m with cards := m.cards.filter (·.id != id) }
 
@@ -216,7 +226,7 @@ def view (m : Model) : Html Msg :=
     <button onClick={.rank}>Most liked</button>
     <div class="cards">{m.cards.map fun c =>
       <article key={toString c.id}>
-        {cardView c}
+        <Card state={c} onMsg={.card}/>
         <button onClick={.dismiss c.id}>✕</button>
       </article>}</div>
   </section>
@@ -230,6 +240,12 @@ misdeliver it. And the two `for_each` lines lift the card's contract to the whol
 card stays valid and styled, across every transition, proved automatically. An arm that can't
 preserve the contract fails the build by name. `Examples/Feed.lean` and `Examples/Local.lean`
 are the worked examples, including components that emit typed output up to their parent.
+
+The feed's root is the architecture written out by hand: a `Model`, a `Msg`, a reducer, exactly
+what `component` generates behind the counter at the top. An app starts as one component
+(`Qed.run Hello.app` is the whole program, `Examples/Hello.lean`) and graduates to an explicit
+root when it needs routing, effects, or state of its own, without rewriting the components it
+already has.
 
 ### Server-side rendering
 
@@ -258,14 +274,15 @@ from the client.
 
 Every feature above has an example like it in `Examples/` and `test/`;
 [`Examples/README.md`](Examples/README.md) orders them as a tour, one concept at a time, from the
-counter to the full Bookshelf app.
+hello-world component to the full Bookshelf app.
 
 ## Does proving things cost you speed?
 
-No. Because the engine knows which subtrees are value-updates, a changed row's text and attributes go
-straight to its node, and on the standard keyed-list benchmark that lands about at React's
-update/swap/reorder numbers. The transpiler also turns Lean's tail recursion into loops, so building,
-diffing, and walking lists run in constant stack, and 100,000+ rows reconcile without trouble.
+No. The engine already knows which subtrees are value updates, so a changed row's text and attributes
+go straight to its node, no diff. On the standard keyed-list benchmark it comes out about even with
+React on update, swap, and reorder. The transpiler turns Lean's tail recursion into real loops, so
+building, diffing, and walking a list all run in constant stack. Even 100,000 rows reconcile without
+trouble.
 
 ## Getting started
 
@@ -308,7 +325,7 @@ Give it a try and state an invariant. Issues welcome at
 | `Qed/Json.lean` | JSON parser/renderer + the `ToJson`/`FromJson` classes, with the `parse_depth_le`/`parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field), the `router` command, `toURL`/`fromURL`. |
 | `Qed/Schema.lean` | `Field p`, the `Codec` controls, and the `schema` command. One declaration yields the form (Draft + `parse` + `formView` + `canSubmit_iff`) and the JSON codec (`ToJson`/`FromJson` + `decode`/`encode`). |
-| `Qed/Component.lean` | `Component`, the `embed` macro, the `for_each` lift lemmas, and the `component` declaration (`state`/`view`/`set`). |
+| `Qed/Component.lean` | `Component`, the `for_each` lift lemmas, and the `component` declaration (`state`/`key`/`emits`/`view`/`set`). |
 | `Qed/Invariant.lean` | The `invariant` command (`preserved_by` / `holds_in` / `for_each`). See [`docs/invariants.md`](docs/invariants.md). |
 | `Qed/Dom.lean` / `Qed/Driver.lean` | The DOM primitives (the one trusted boundary) and the impure driver. |
 | `Js/Backend.lean` | The Lean IR to JavaScript transpiler. |

@@ -14,6 +14,12 @@
     <li>{m.count}</li>                        -- a spliced child (value or Html)
     <ul>{m.rows.map fun r => <li key={r.id}>…</li>}</ul>  -- a keyed list
 
+  A *capitalized* tag is a declared component (the React rule), and its attributes are
+  props, not DOM attributes (see `componentToTerm`):
+    <Stepper key="s"/>                        -- framework-owned instance (`useState`)
+    <Widget key={r.id} note={r.label} onEmit={.reported r.id}/>  -- seeded, with outputs
+    <Row state={r} onMsg={.row}/>             -- parent-owned row (state lifted up)
+
   Text runs are literal. Whitespace normalizes the JSX way: runs collapse to one
   space, and a run containing a newline at a text edge disappears (so indentation
   never renders). `{`, `}` and `<` cannot appear in a text run; splice them
@@ -50,11 +56,12 @@ def jsxText.formatter : Formatter := Formatter.visitAtom `Qed.Jsx.jsxText
 @[combinator_parenthesizer Qed.Jsx.jsxText]
 def jsxText.parenthesizer : Parenthesizer := Parenthesizer.visitToken
 
-/-- A tag or attribute name: letters, digits, `-`, `_` (so `section`, `my-widget`,
-    `aria-label` all parse, none of which an `ident` accepts). -/
+/-- A tag or attribute name: letters, digits, `-`, `_`, `.` (so `section`, `my-widget`,
+    `aria-label` all parse, none of which an `ident` accepts, and a namespaced component
+    tag `<Foo.Bar/>` does too). -/
 def jsxNameFn : ParserFn := fun c s =>
   let startPos := s.pos
-  let s := takeWhile1Fn (fun ch => ch.isAlphanum || ch == '-' || ch == '_')
+  let s := takeWhile1Fn (fun ch => ch.isAlphanum || ch == '-' || ch == '_' || ch == '.')
     "tag or attribute name" c s
   if s.hasError then s else mkNodeToken `Qed.Jsx.jsxName startPos true c s
 
@@ -224,10 +231,98 @@ partial def childrenToTerm (opener : Syntax) (kids : Array Syntax) : MacroM Term
     prev := k
   `([$out,*])
 
-/-- One JSX element → `Qed.el "tag" [attrs] children`. -/
+/-- A component tag (a *capitalized* tag names a declared `component`): expand to its
+    mount. The attributes are props, not DOM attributes:
+
+    * `key={k}`: the instance key (any `ToString`). A framework-owned singleton may omit
+      it (a stable source-position key is derived); a tag rendered per row must pass one
+      (the React rule), or two rows would share state.
+    * `onEmit={h}`: receive the component's `emits` output as a parent message.
+    * `state={r}`: bind a parent-owned row (`r : C.State`), the parent holds the state
+      and the tag renders it. Requires `onMsg={.ctor}`, the parent `Msg` constructor
+      `(k : String) (msg : C.Msg)` its events route through; the routing key is the
+      component's declared `key` field (`C.keyOf r`) unless `key={…}` overrides it.
+    * any other `field={v}`: seed that state field of a framework-owned instance
+      (React's `useState(propValue)`: first mount only, the live state wins after).
+      A bare `field` seeds `true`. -/
+partial def componentToTerm (stx : Syntax) (tag : String)
+    (attrStxs : Array Syntax) (kids : Array Syntax) : MacroM Term := do
+  let cName := (tag.splitOn ".").foldl Name.str Name.anonymous
+  let cId (sub : Name) : Term := ⟨mkIdent (cName ++ sub)⟩
+  unless kids.isEmpty do
+    Macro.throwErrorAt stx s!"<{tag}>: a component tag renders the component's own view, \
+      so it takes no children; write it self-closing (<{tag} …/>)"
+  let mut props   : Array (Syntax × String × Term) := #[]
+  let mut key?    : Option Term := none
+  let mut state?  : Option Term := none
+  let mut onMsg?  : Option Term := none
+  let mut onEmit? : Option Term := none
+  for a in attrStxs do
+    if a.getKind == ``attrSplice then
+      Macro.throwErrorAt a s!"<{tag}>: a component tag takes props (field=\{…}, key, \
+        onEmit, state, onMsg); a spliced attribute belongs on an HTML element"
+    let name := tokenVal a[0]
+    let valNode := a[1]
+    let v : Term ←
+      if valNode.getNumArgs == 0 then `(Bool.true)
+      else
+        let inner := valNode[1][0]
+        if inner.isOfKind strLitKind then pure ⟨inner⟩
+        else pure ⟨← expandJsxIn inner[1]⟩
+    match name with
+    | "key"    => key? := some v
+    | "state"  => state? := some v
+    | "onMsg"  => onMsg? := some v
+    | "onEmit" => onEmit? := some v
+    | _        => props := props.push (a[0], name, v)
+  match state? with
+  | some st =>
+      -- parent-owned: render the bound row, its messages tagged with the row's key, so
+      -- the parent's update routes them back via the generated `C.updateKeyed`
+      if let some (nameStx, n, _) := props[0]? then
+        Macro.throwErrorAt nameStx s!"<{tag} state=\{…}>: the parent owns this state, so \
+          set fields on the bound value, not as props (unexpected `{n}`)"
+      if onEmit?.isSome then
+        Macro.throwErrorAt stx s!"<{tag} state=\{…}>: a parent-owned component routes \
+          every event through onMsg, it has no separate emit channel"
+      match onMsg? with
+      | none =>
+          Macro.throwErrorAt stx s!"<{tag} state=\{…}> needs onMsg=\{…}: the parent Msg \
+            constructor `(k : String) (msg : {tag}.Msg)` its events route through"
+      | some route =>
+          let keyT : Term ← match key? with
+            | some k => `(toString $k)
+            | none   => `($(cId `keyOf) $st)
+          -- `Qed.Component`/`Qed.Runtime` are above this module, so their names are
+          -- emitted unresolved (`mkIdent`) and bind at the use site, which imports `Qed`
+          `($(mkIdent `Qed.Component.render) $(cId `component) (fun cm => $route $keyT cm) $st)
+  | none =>
+      -- framework-owned: a keyed host element the driver mounts the instance into
+      if onMsg?.isSome then
+        Macro.throwErrorAt stx s!"<{tag}>: onMsg routes a parent-owned row; bind one with \
+          state=\{…}, or receive outputs with onEmit=\{…}"
+      let keyT : Term ← match key? with
+        | some k => `(toString $k)
+        | none   => pure ⟨Syntax.mkStrLit s!"@{(stx.getPos?.map (·.byteIdx)).getD 0}"⟩
+      let mountBase : Term ← match onEmit? with
+        | some h => `($(cId `mountWith) $keyT (fun out => $h out))
+        | none   => `($(cId `mount) $keyT)
+      let mountT : Term ←
+        if props.isEmpty then pure mountBase
+        else do
+          let fids := props.map fun (_, n, _) => mkIdent (Name.mkSimple n)
+          let vals := props.map fun (_, _, v) => v
+          let seed ← `({ $(cId `init):term with $[$fids:ident := $vals],* })
+          `($(mkIdent `Qed.Attr.localInit) $mountBase $seed)
+      `(Qed.el "div" [Qed.key $keyT, $mountT] [])
+
+/-- One JSX element → `Qed.el "tag" [attrs] children` (or a component mount, for a
+    capitalized tag). -/
 partial def elementToTerm (stx : Syntax) : MacroM Term := do
   if stx.getKind == ``selfClosing then
     let tag := tokenVal stx[1]
+    if !tag.isEmpty && tag.front.isUpper then
+      return ← componentToTerm stx tag stx[2].getArgs #[]
     let attrs ← stx[2].getArgs.mapM attrToTerm
     `(Qed.el $(Syntax.mkStrLit tag) [$attrs,*] [])
   else if stx.getKind == ``withChildren then
@@ -235,6 +330,8 @@ partial def elementToTerm (stx : Syntax) : MacroM Term := do
     let closeTag := tokenVal stx[6]
     if tag != closeTag then
       Macro.throwErrorAt stx[6] s!"mismatched closing tag: expected </{tag}>, found </{closeTag}>"
+    if !tag.isEmpty && tag.front.isUpper then
+      return ← componentToTerm stx tag stx[2].getArgs stx[4].getArgs
     let attrs ← stx[2].getArgs.mapM attrToTerm
     let kids ← childrenToTerm stx[3] stx[4].getArgs
     `(Qed.el $(Syntax.mkStrLit tag) [$attrs,*] $kids)

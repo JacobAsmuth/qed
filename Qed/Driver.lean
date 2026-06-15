@@ -630,7 +630,8 @@ partial def localMountInstance (ctx : LocalCtx) (parentBubble : LocalMsg → IO 
   let fk := localKey component key
   if (← ctx.instances.get).contains fk then return
   match ctx.registry[component]? with
-  | none      => IO.eprintln s!"qed: unknown local component '{component}'"
+  | none      => IO.eprintln s!"qed: component '{component}' is not registered (a tag inside \
+                   a helper function isn't auto-collected; pass `locals := …regs` to `ui`)"
   | some ldef =>
       let onOut : String → IO Unit := fun out => match bubble out with
         | some lm => parentBubble lm
@@ -646,7 +647,8 @@ partial def localMountRoot {Msg : Type} (ctx : LocalCtx) (dispatchMsg : Msg → 
   let fk := localKey component key
   if (← ctx.instances.get).contains fk then return
   match ctx.registry[component]? with
-  | none      => IO.eprintln s!"qed: unknown local component '{component}'"
+  | none      => IO.eprintln s!"qed: component '{component}' is not registered (a tag inside \
+                   a helper function isn't auto-collected; pass `locals := …regs` to `ui`)"
   | some ldef =>
       let onOut : String → IO Unit := fun out => match bubble out with
         | some m => dispatchMsg m

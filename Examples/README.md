@@ -14,9 +14,11 @@ file compiles.
 
 ## The architecture
 
+0. **[Hello](Hello.lean)** · the smallest app: one `component` declaration is the whole
+   program (`Qed.run Hello.app`). State next to the view, `set` as the only mutation.
 1. **[Counter](Counter.lean)** · `Model`, `Msg`, `update`, `view`, and the `ui` builder: the
-   whole shape of an app, plus the first `invariant … preserved_by`: state a property, the
-   build proves every transition keeps it.
+   whole shape of an app written out (what a `component` generates for you), plus the first
+   `invariant … preserved_by`: state a property, the build proves every transition keeps it.
 2. **[Native](Native.lean)** · the same `app`, run as a native binary: server-renders the
    initial page to stdout from the same verified view the browser uses. Nothing in an app is
    browser-specific.
@@ -37,19 +39,20 @@ file compiles.
 
 ## Components
 
-6. **[Todo](Todo.lean)** · a `component` repeated as keyed rows in a parent-owned list, wired
-   with one `embed` line: the rows live in the root model, and a row's message routes back by
-   its stable key.
+6. **[Todo](Todo.lean)** · a `component` repeated as keyed rows in a parent-owned list:
+   the rows live in the root model, each rendered with `<Row state={r} onMsg={.row}/>`, and
+   a row's message routes back by its declared `key` field.
 7. **[Feed](Feed.lean)** · `for_each`: lift one card's contract to "every card in the feed
    stays valid" across re-rank, tick (the parent updating its rows directly), dismiss, and
    load, in one line. A multi-field `set` chain in the card's like handler. Proof-only, no
    browser entry.
-8. **[Local](Local.lean)** · the same `component` declaration mounted the other way: the
-   framework owns the state, keyed per instance, outside the root model. `set`/`send` as the
-   only mutations, each site compiled to a named `Msg` case the invariant machinery can point
-   at (`stepperSafe`). Components bubble typed output (`emits`/`mountWith`), nest (a `Tag`
-   inside each `Widget`), seed from props (`.localInit`), and the whole local store
-   snapshots/restores.
+8. **[Local](Local.lean)** · the same `component` declaration mounted the other way
+   (`<Widget key={…}/>`): the framework owns the state, keyed per instance, outside the
+   root model. `set`/`send` as the only mutations, each site compiled to a named `Msg` case
+   the invariant machinery can point at (`stepperSafe`). Components bubble typed output
+   (`emits`/`onEmit`), nest (a `Tag` inside each `Widget`), seed from props
+   (`<Widget note={r.label}/>`), register themselves automatically, and the whole local
+   store snapshots/restores.
 
 ## Forms and data
 

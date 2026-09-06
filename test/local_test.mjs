@@ -148,6 +148,31 @@ try {
   check('removed row widget state was GC-ed', after['Local.Widget@1'], undefined);
   check('removed row nested tag state was GC-ed', after['Local.Tag@t1'], undefined);
   check('surviving row state kept', JSON.parse(after['Local.Widget@0']).count, 3);
+  // Live props propagate through extracted helpers and nested local components.
+  await page.focus(`${A} .widget .note`);
+  await page.$eval(`${A} .widget .note`, e => e.setSelectionRange(2, 2));
+  await clickIn(A, '.rename');
+  check('parent prop changes reach an extracted child view',
+    await page.$eval(`${A} .live-label`, e => e.textContent), 'Alpha!');
+  check('live props reach nested local components',
+    await page.$eval(`${A} .pin`, e => e.title), 'Alpha!: AlphaX');
+  check('changing props does not reseed local state', await noteAt(A), 'AlphaX');
+  check('prop updates preserve local focus and caret',
+    await page.$eval(`${A} .note`, e => [document.activeElement === e, e.selectionStart]), [true, 2]);
+  check('props do not enter the persisted state',
+    Object.hasOwn(JSON.parse((await snapshot())['Local.Widget@0']), 'label'), false);
+  await clickIn(A, '.reset-note');
+  check('named actions read current props', await noteAt(A), 'Alpha!');
+  await page.evaluate((s) => window.qed.restore(JSON.stringify(s)), after);
+  await sleep(40);
+  check('restoring state keeps current props',
+    await page.$eval(`${A} .live-label`, e => e.textContent), 'Alpha!');
+  check('restoring state restores the note separately', await noteAt(A), 'AlphaX');
+  check('restore refreshes props derived from parent local state',
+    await page.$eval(`${A} .pin`, e => e.title), 'Alpha!: AlphaX');
+  check('prop refresh does not duplicate local subtrees',
+    await page.$$eval('#app .rows .widget', es => es.length), 2);
+
 } finally {
   await browser.close();
   server.kill('SIGTERM');

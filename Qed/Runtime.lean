@@ -15,6 +15,7 @@ import Qed.Json
 import Qed.Render
 import Qed.View
 import Qed.Router
+import Lean
 
 namespace Qed
 
@@ -290,6 +291,8 @@ structure LocalDef where
   init : String
   /-- Render the child from serialized state, messages erased to `LocalMsg`. -/
   view : String → Html LocalMsg
+  /-- Live props are supplied separately from persisted local state. -/
+  viewProps : Option (String → String → Html LocalMsg) := none
 
 /-- Drop duplicate registrations (same id), keeping the first. The auto-collected `locals`
     concatenate the transitive `regs` of every component tag in a view, so a component
@@ -397,18 +400,13 @@ the `fun`:
     ui init transition (start := Cmd.now .today) fun m => …
     ui init update (onPort := some onPort) fun m => …
 
-Components used as tags in the view (`<Widget …/>`) are registered automatically (each
-tag's transitive `Name.regs`); pass `locals := Name.regs` explicitly only for a component
-mounted inside a helper *function* the view calls, where the tag isn't syntactically
-visible here. For a reused/pre-built template, call `mkApp`/`mkRoutedApp` with a `view%`
-fragment or `View.ofHtml`. Core-syntax only (no `import Lean`): quotations over the
-existing total `view%`. -/
+Component registrations follow elaborated definitions, including imported helpers and
+nested component views. `locals := …` remains available for explicit registrations or
+opaque definitions whose implementations are unavailable to the elaborator. For a
+pre-built template, call `mkApp`/`mkRoutedApp` and wrap it in `withLocalRegistry`. -/
 
-/-- The component tags (`<Widget …/>`, the capitalized-tag rule of `Qed.Jsx`) under a piece
-    of view syntax, by name as written. How `ui` and the `component` declaration collect the
-    registrations (each tag's `Name.regs`) a view needs, with no `locals := […]` by hand.
-    Purely syntactic, so a tag inside a *helper function* the view calls is not seen; list
-    such a helper's components explicitly via `locals := Name.regs`. -/
+/-- Syntactic component-tag discovery, retained for tools inspecting source syntax.
+    App registration uses elaborated dependencies so helper extraction is transparent. -/
 partial def componentTagsIn (stx : Lean.Syntax) (acc : Array String := #[]) : Array String :=
   let tokenVal : Lean.Syntax → String := fun n =>
     match n with
@@ -433,6 +431,53 @@ def componentTagName (tag : String) : Lean.Name :=
 syntax uiOpt := "(" ident " := " term ")"
 syntax (name := uiBuilder) "ui " term:max term:max (uiOpt)* " fun " ident " => " term : term
 
+/-- Add discovered registrations once, retaining explicit registrations first. -/
+def App.addLocals (app : App Model Msg) (locals : List LocalDef) : App Model Msg :=
+  { app with locals := LocalDef.dedupe (app.locals ++ locals) }
+
+/-- Discover registrations through elaborated helper definitions, including imported
+    helpers. A visited set handles shared and recursive dependencies. -/
+syntax (name := localRegistryTerm) "withLocalRegistry " term:max : term
+
+open Lean Elab Term Meta in
+private def registrationsIn (value : Expr) : TermElabM Expr := do
+  let env ← getEnv
+  let mut pending := value.getUsedConstants.toList
+  let mut seen : NameSet := {}
+  let mut regs : Array Expr := #[]
+  while !pending.isEmpty do
+    let n := pending.head!
+    pending := pending.tail!
+    unless seen.contains n do
+      seen := seen.insert n
+      let reg := n.getPrefix ++ `regs
+      let isMount := match n with
+        | .str _ s => s == "mount" || s == "mountWith"
+        | _ => false
+      if isMount && env.contains reg then
+        regs := regs.push (Lean.mkConst reg)
+      else if let some (.defnInfo d) := env.find? n then
+        pending := d.value.getUsedConstants.toList ++ pending
+  let mut locals := Lean.mkApp (Lean.mkConst ``List.nil [Level.zero]) (Lean.mkConst ``LocalDef)
+  for reg in regs do
+    locals ← mkAppM ``List.append #[locals, reg]
+  mkAppM ``LocalDef.dedupe #[locals]
+
+syntax (name := registrationsTerm) "localRegistrations " term:max : term
+
+open Lean Elab Term in
+@[term_elab registrationsTerm] def elabRegistrations : TermElab := fun stx _ => do
+  let value ← elabTerm stx[1] none
+  synthesizeSyntheticMVarsNoPostponing
+  registrationsIn (← instantiateMVars value)
+
+open Lean Elab Term Meta in
+@[term_elab localRegistryTerm] def elabLocalRegistry : TermElab := fun stx expected => do
+  let value ← elabTerm stx[1] expected
+  synthesizeSyntheticMVarsNoPostponing
+  let value ← instantiateMVars value
+  mkAppM ``App.addLocals #[value, ← registrationsIn value]
+
 open Lean in
 macro_rules
   | `(ui $init $update $[$opts:uiOpt]* fun $m => $body) => do
@@ -453,14 +498,6 @@ macro_rules
             | `onPort  => portE   := e
             | _ => Macro.throwErrorAt name s!"ui: unknown option '{name.getId}' (expected onRoute/start/locals/onPort/queries)"
         | _ => pure ()
-      -- auto-register the components the view's tags mount: append each tag's transitive
-      -- `Name.regs` to whatever `locals := …` passed explicitly (needed only for components
-      -- hidden inside helper functions), deduped by id
-      let tags := componentTagsIn body
-      if !tags.isEmpty then
-        for tag in tags do
-          localsE ← `($localsE ++ $(mkIdent (componentTagName tag ++ `regs)))
-        localsE ← `(Qed.LocalDef.dedupe $localsE)
       let base ← match routeE? with
         | some route =>
             `(Qed.mkRoutedApp $init $update $tmpl (onRoute := $route)
@@ -472,8 +509,8 @@ macro_rules
       -- it with `mkIdent`, a bare quotation would pre-resolve `Qed.App.` as a struct projection
       -- here (where `App` exists but the method does not yet) and never find the real constant.
       match queriesE? with
-      | some qs => `($(mkIdent `Qed.App.withQueries) $qs $base)
-      | none    => pure base
+      | some qs => `(withLocalRegistry ($(mkIdent `Qed.App.withQueries) $qs $base))
+      | none    => `(withLocalRegistry ($base))
 /-- Register a local component with an output it can bubble to its parent. `update`
     returns the next state and an optional output; the output is serialized and handed
     to the host's `bubble` (see `localMountWith`). The message type `M` needs no codec
@@ -500,12 +537,32 @@ def LocalDef.ofSimple {S M : Type} [ToJson S] [FromJson S]
       { run := fun st => (Json.render (ToJson.toJson (update (dec st) m)), none) } }
 
 
+/-- Typed live props are decoded once per parent render. Local messages still read
+    the latest persisted state at delivery time. Props never enter that store. -/
+def LocalDef.ofProps {P S M O : Type} [FromJson P] [ToJson S] [FromJson S] [ToJson O]
+    (id : String) (init : S) (view : P → S → Html M)
+    (update : P → S → M → S × Option O) : LocalDef :=
+  let dec : String → S := fun s => ((Json.parse s).bind FromJson.fromJson).toOption.getD init
+  { id, init := Json.render (toJson init), view := fun _ => .text "",
+    viewProps := some fun props =>
+      match (Json.parse props).bind (FromJson.fromJson (α := P)) with
+      | .error e => fun _ => .text s!"Invalid component props: {e}"
+      | .ok p => fun s => (view p (dec s)).map fun m =>
+          { run := fun st =>
+              let (next, out) := update p (dec st) m
+              (Json.render (toJson next), out.map (Json.render ∘ toJson)) } }
+
+def Attr.localProps {msg P : Type} [ToJson P] (a : Attr msg) (props : P) : Attr msg :=
+  match a with
+  | .localCell k c i _ b => .localCell k c i (Json.render (toJson props)) b
+  | x => x
+
 /-- Mount a registered local component at instance `key`, ignoring any output: a
     self-contained `useState` cell. `key` need only be unique *within* `component`
     (the driver namespaces it by component) and stable across renders. What a
     declared component's `Name.mount` expands to. -/
 def localMount (component key : String) : Attr msg :=
-  .localCell key component none (fun _ => none)
+  .localCell key component none "" (fun _ => none)
 
 /-- Mount a registered local component at instance `key`, mapping its serialized
     output through `onOut` to an optional parent message, the type-safe way a child
@@ -513,7 +570,7 @@ def localMount (component key : String) : Attr msg :=
     expands to. -/
 def localMountWith {O msg : Type} [FromJson O] (component key : String)
     (onOut : O → Option msg) : Attr msg :=
-  .localCell key component none fun s =>
+  .localCell key component none "" fun s =>
     (((Json.parse s).bind FromJson.fromJson : Except String O)).toOption.bind onOut
 
 /-- Seed THIS instance's initial state from parent data, overriding the component's
@@ -523,7 +580,7 @@ def localMountWith {O msg : Type} [FromJson O] (component key : String)
     the user has since typed (the live state wins, exactly like a `useState` seed). -/
 private def attrWithLocalInit {msg : Type} (a : Attr msg) (i : String) : Attr msg :=
   match a with
-  | .localCell key comp _ bubble => .localCell key comp (some i) bubble
+  | .localCell key comp _ p bubble => .localCell key comp (some i) p bubble
   | x => x
 
 def Attr.localInit {msg S : Type} [ToJson S] (a : Attr msg) (init : S) : Attr msg :=
@@ -543,11 +600,11 @@ partial def renderWithLocals {m : Type} (locals : List LocalDef) : Html m → St
   | .lazy _ sub => renderWithLocals locals sub
   | .element tag attrs children =>
       let attrStr := (renderAttrs #[] (normalizeAttrs attrs)).1
-      let local?  := attrs.findSome? (fun | .localCell _ comp init _ => some (comp, init) | _ => none)
+      let local?  := attrs.findSome? (fun | .localCell _ comp init p _ => some (comp, init, p) | _ => none)
       let childStr := match local? with
-        | some (comp, init?) =>
+        | some (comp, init?, p) =>
             match locals.find? (fun d : LocalDef => d.id == comp) with
-            | some ldef => renderWithLocals locals (ldef.view (init?.getD ldef.init))
+            | some ldef => renderWithLocals locals (((ldef.viewProps.map (fun (f : String → String → Html LocalMsg) => f p)).getD ldef.view) (init?.getD ldef.init))
             | none      => ""
         | none => String.join (children.map (renderWithLocals locals))
       s!"<{tag}{attrStr}>{childStr}</{tag}>"

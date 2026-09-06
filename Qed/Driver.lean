@@ -38,11 +38,10 @@ structure Handlers (msg : Type) where
   click : IO.Ref (Array msg)
   input : IO.Ref (Array (String → msg))
   /-- Mount the local component `component` at instance `key` into `host`, optionally
-      seeding state with `init?`, and wiring its serialized output through `bubble`.
-      Supplied by `run`; idempotent per key, so a re-render of the parent leaves an
-      already-mounted instance (and its state and focus) untouched. An instance's own
-      tables carry a real `mountLocal` too, so local components nest. -/
-  mountLocal : String → String → Option String → (String → Option msg) → Dom.Node → IO Unit
+      seeding state with `init?`, supplying live serialized props, and wiring output
+      through `bubble`. Parent renders refresh props and the output callback while
+      preserving local state. An instance's own tables support nested local mounts. -/
+  mountLocal : String → String → Option String → String → (String → Option msg) → Dom.Node → IO Unit
 
 /-- A live local-component instance: its own event tables, the last child tree it
     rendered (to diff against), its host node, its view, and an output sink already
@@ -52,6 +51,7 @@ structure LocalInstance where
   treeRef  : IO.Ref (Html LocalMsg)
   host     : Dom.Node
   view     : String → Html LocalMsg
+  props    : String
   onOutput : String → IO Unit
 
 /-- Register an event handler at the element's *existing* table slot — read from its
@@ -91,12 +91,12 @@ def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
   | .onValue event f => do
       Dom.effect "event.listen" event "" ""
       registerHandler h.input node s!"data-qed-onv-{event}" f
-  | .localCell key comp init bubble => do
+  | .localCell key comp init props bubble => do
       -- Mark the host (namespaced by component, so keys can't collide) so the JS
       -- delegation routes events inside it to this instance, then mount the local
       -- component (idempotent — a re-render won't remount it).
       Dom.setAttribute node "data-qed-local" (localKey comp key)
-      h.mountLocal key comp init bubble node
+      h.mountLocal key comp init props bubble node
   | .signalBind name => Dom.bindSignal node name   -- bind text to the signal; setSignal updates it
   | .signalAttr name attr _ => Dom.bindSignalAttr node name attr   -- bind an attribute to the signal
   | .rawHtml markup => Dom.setInnerHtml node markup   -- verbatim content; the element owns its children
@@ -624,7 +624,7 @@ mutual
 /-- Create and register an instance: its own event tables, its child subtree built
     into `host`, and a `mountLocal` for ITS children (so locals nest). `onOut` is how
     its output reaches its parent (root dispatch, or a parent instance's transition). -/
-partial def spawnInstance (ctx : LocalCtx) (fk : String) (ldef : LocalDef) (s0 : String)
+partial def spawnInstance (ctx : LocalCtx) (fk : String) (ldef : LocalDef) (s0 props : String)
     (onOut : String → IO Unit) (host : Dom.Node) : IO Unit := do
   ctx.store.modify (·.insert fk s0)
   let cRef ← IO.mkRef (#[] : Array LocalMsg)
@@ -633,16 +633,17 @@ partial def spawnInstance (ctx : LocalCtx) (fk : String) (ldef : LocalDef) (s0 :
   -- time, since this instance isn't in the map yet while we build its tables).
   let lh : Handlers LocalMsg :=
     { click := cRef, input := iRef,
-      mountLocal := fun k c i b hn =>
+      mountLocal := fun k c i p b hn =>
         localMountInstance ctx (fun lm => do
           match (← ctx.instances.get)[fk]? with
           | some self => localRun ctx fk self lm
-          | none      => pure ()) k c i b hn }
-  let tree := ldef.view s0
+          | none      => pure ()) k c i p b hn }
+  let view := (ldef.viewProps.map (fun f => f props)).getD ldef.view
+  let tree := view s0
   Dom.appendChild host (← buildDom lh (← Dom.childNamespace host) tree)
   let tRef ← IO.mkRef tree
   ctx.instances.modify (·.insert fk
-    { handlers := lh, treeRef := tRef, host := host, view := ldef.view, onOutput := onOut })
+    { handlers := lh, treeRef := tRef, host := host, view, props, onOutput := onOut })
 
 /-- Re-render an instance's subtree from new serialized state, reusing the verified
     `diff`/`applyToDom` at the child's own message type — so focus inside it survives. -/
@@ -662,38 +663,36 @@ partial def localRun (ctx : LocalCtx) (fk : String) (inst : LocalInstance) (lm :
   localRerender inst s'
   match o with | some out => inst.onOutput out | none => pure ()
 
-/-- Mount a local component nested inside another. Its output is a `LocalMsg` for the
-    parent instance (`parentBubble`). Idempotent per namespaced key. -/
-partial def localMountInstance (ctx : LocalCtx) (parentBubble : LocalMsg → IO Unit)
-    (key component : String) (init? : Option String) (bubble : String → Option LocalMsg)
+/-- Mount or refresh a local component. Root and nested mounts share this path;
+    only their parent message types differ. Existing keys retain their state. -/
+partial def localMountInstance {Msg : Type} (ctx : LocalCtx) (parentBubble : Msg → IO Unit)
+    (key component : String) (init? : Option String) (props : String) (bubble : String → Option Msg)
     (host : Dom.Node) : IO Unit := do
   let fk := localKey component key
-  if (← ctx.instances.get).contains fk then return
   match ctx.registry[component]? with
-  | none      => IO.eprintln s!"qed: component '{component}' is not registered (a tag inside \
-                   a helper function isn't auto-collected; pass `locals := …regs` to `ui`)"
+  | none      => IO.eprintln s!"qed: component '{component}' is not registered"
   | some ldef =>
       let onOut : String → IO Unit := fun out => match bubble out with
         | some lm => parentBubble lm
         | none    => pure ()
-      spawnInstance ctx fk ldef ((← ctx.store.get).getD fk (init?.getD ldef.init)) onOut host
+      match (← ctx.instances.get)[fk]? with
+      | some inst =>
+          let next := { inst with
+            view := (ldef.viewProps.map (fun f => f props)).getD ldef.view,
+            props, onOutput := onOut }
+          ctx.instances.modify (·.insert fk next)
+          if props != inst.props then
+            localRerender next ((← ctx.store.get).getD fk ldef.init)
+      | none =>
+          spawnInstance ctx fk ldef ((← ctx.store.get).getD fk (init?.getD ldef.init)) props onOut host
 end
 
 /-- Mount a top-level local component (its host sits in the root view). Its output
     becomes a root message via `dispatchMsg`. Idempotent per namespaced key. -/
 partial def localMountRoot {Msg : Type} (ctx : LocalCtx) (dispatchMsg : Msg → IO Unit)
-    (key component : String) (init? : Option String) (bubble : String → Option Msg)
+    (key component : String) (init? : Option String) (props : String) (bubble : String → Option Msg)
     (host : Dom.Node) : IO Unit := do
-  let fk := localKey component key
-  if (← ctx.instances.get).contains fk then return
-  match ctx.registry[component]? with
-  | none      => IO.eprintln s!"qed: component '{component}' is not registered (a tag inside \
-                   a helper function isn't auto-collected; pass `locals := …regs` to `ui`)"
-  | some ldef =>
-      let onOut : String → IO Unit := fun out => match bubble out with
-        | some m => dispatchMsg m
-        | none   => pure ()
-      spawnInstance ctx fk ldef ((← ctx.store.get).getD fk (init?.getD ldef.init)) onOut host
+  localMountInstance ctx dispatchMsg key component init? props bubble host
 
 /-- A type-erased running application — the monomorphic closures seal the
     polymorphic `Model`/`Msg` so the export wrappers below stay first-order. -/
@@ -836,7 +835,7 @@ def run (app : App Model Msg) : IO Unit := do
   -- The root view mounts top-level locals; a bubbled output becomes a root message.
   let h : Handlers Msg :=
     { click := clickRef, input := inputRef,
-      mountLocal := fun k c i b hn => localMountRoot ctx (fun m => do (← dispatchRef.get) m) k c i b hn }
+      mountLocal := fun k c i p b hn => localMountRoot ctx (fun m => do (← dispatchRef.get) m) k c i p b hn }
   -- Drop instances (and their state) whose host left the DOM, so an unmounted cell
   -- doesn't leak and re-mounting starts fresh (React's unmount-loses-state).
   let gcLocals : IO Unit := do
@@ -972,8 +971,10 @@ def run (app : App Model Msg) : IO Unit := do
     | .ok (.obj members) => do
         for (k, v) in members do
           match v with | .str st => storeRef.modify (·.insert k st) | _ => pure ()
-        for (k, inst) in (← instancesRef.get).toList do
-          localRerender inst ((← storeRef.get).getD k "")
+        for (k, _) in (← instancesRef.get).toList do
+          -- A parent's refresh may have supplied new props to this child already.
+          if let some inst := (← instancesRef.get)[k]? then
+            localRerender inst ((← storeRef.get).getD k "")
     | _ => pure ()
   runtimeRef.set (some {
     mount := do

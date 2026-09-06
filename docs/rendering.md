@@ -33,6 +33,8 @@ The browser implementation needs additional rules:
 - Rows containing helper views, conditionals, nested lists, or dynamic attribute handlers
   use ordinary keyed reconciliation. Equal serialized HTML does not imply equal props or
   event behavior. Rows handled entirely by signals retain their direct update path.
+- Local-component props refresh independently of persisted state. Their parent output
+  callback is refreshed too; changing `initial` does not reset an existing instance.
 - Structural list updates align old rows, marks, and signals in one pass. Fresh row HTML
   is generated only when an added key is encountered, then shared for the remaining additions.
 - Full attribute updates remove obsolete attributes and event slots, and reset removed

@@ -73,7 +73,7 @@ def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .key _     => ("", hs)   -- a reconciliation key is virtual-DOM-only; it never renders
   | .on event m  => (s!" data-qed-on-{event}=\"{hs.size}\"", hs.push m)   -- no-arg handler id, for hydration
   | .onValue _ _ => ("", hs)   -- value handlers carry no static form; the driver wires them on hydration
-  | .localCell key comp _ _ => (s!" data-qed-local=\"{escapeHtml (localKey comp key)}\"", hs)   -- marks the host; the driver fills it
+  | .localCell key comp _ _ _ => (s!" data-qed-local=\"{escapeHtml (localKey comp key)}\"", hs)   -- marks the host; the driver fills it
   | .signalBind name        => (s!" data-qed-signal=\"{escapeHtml name}\"", hs)                 -- driver binds its text to the signal
   | .signalAttr _ attr value => (s!" {sanitizeKey attr}=\"{escapeHtml value}\"", hs)             -- driver binds this attr to the signal
   | .rawHtml _ => ("", hs)   -- not an attribute; its markup is emitted as the element's content (see renderNode)

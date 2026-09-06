@@ -202,9 +202,9 @@ build naming the handler (`case set_liked_likes …`).
 A component is used as a JSX tag (capitalized, the React rule), and who owns its state is
 decided at the use site, not in how you write it. State the parent never reads, like an open editor
 or a half-typed draft, stays out of your model entirely. `<Editor key="row-7"/>` mounts a keyed
-instance the framework owns. Props seed it (`<Editor text={r.text}/>`), `onEmit={…}` receives its
-typed output, and registration is automatic. State the parent does read, the parent
-owns: the feed holds its cards in the model, binds each one with `state={…}`, and shows the
+instance the framework owns. `prop` fields track parent values; `initial={{ text := r.text }}`
+seeds local state once. `onEmit={…}` receives typed output, and registration follows helper functions
+too. State the parent does read, the parent owns: the feed holds its cards in the model, binds each one with `state={…}`, and shows the
 list like any other data:
 
 ```lean
@@ -236,7 +236,8 @@ A tap addresses a card by its key, so unique, stable keys preserve identity acro
 The `for_each` lines lift the card's contracts: updates preserve validity from a valid starting
 state, and the view satisfies the styling predicate for every model. An arm whose contract
 cannot be proved fails the build by name. `Examples/Feed.lean` and `Examples/Local.lean`
-are the worked examples, including components that emit typed output up to their parent.
+are the worked examples. [Component syntax](docs/components.md) covers named actions, live props,
+and `collection` declarations that generate keyed child routing.
 
 The feed's root is the architecture written out by hand: a `Model`, a `Msg`, a reducer, exactly
 what `component` generates behind the counter at the top. An app starts as one component
@@ -324,7 +325,7 @@ Give it a try and state an invariant. Issues welcome at
 | `Qed/Json.lean` | JSON parser/renderer + the `ToJson`/`FromJson` classes, with the `parse_depth_le`/`parse_render` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field), the `router` command, `toURL`/`fromURL`. |
 | `Qed/Schema.lean` | `Field p`, the `Codec` controls, and the `schema` command. One declaration yields the form (Draft + `parse` + `formView` + `canSubmit_iff`) and the JSON codec (`ToJson`/`FromJson` + `decode`/`encode`). |
-| `Qed/Component.lean` | `Component`, the `for_each` lift lemmas, and the `component` declaration (`state`/`key`/`emits`/`view`/`set`). |
+| `Qed/Component.lean` | `Component`, the `for_each` lift lemmas, and the `component` declaration (`state`/`prop`/`action`/`collection`/`view`). |
 | `Qed/Invariant.lean` | The `invariant` command (`preserved_by` / `holds_in` / `for_each`). See [`docs/invariants.md`](docs/invariants.md). |
 | `Qed/Dom.lean` / `Qed/Driver.lean` | The DOM primitives and imperative browser driver; part of the trusted implementation. |
 | `Js/Backend.lean` | The Lean IR to JavaScript transpiler. |

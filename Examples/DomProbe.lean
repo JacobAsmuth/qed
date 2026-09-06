@@ -30,7 +30,7 @@ def tree (seed : Nat) : Html Nat :=
 
 def handlers : IO (Handlers Nat) := do
   return { click := (← IO.mkRef #[]), input := (← IO.mkRef #[]),
-           mountLocal := fun _ _ _ _ _ => pure () }
+           mountLocal := fun _ _ _ _ _ _ => pure () }
 
 initialize liveHandlers : IO.Ref (Option (Handlers Nat)) ← IO.mkRef none
 initialize oldTree : IO.Ref (Html Nat) ← IO.mkRef (.text "")

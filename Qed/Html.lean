@@ -51,10 +51,10 @@ inductive Attr (msg : Type) where
       the pure virtual DOM, so `Html.map`/`diff` never recurse into it and stay total
       and proof-free. `init?` optionally seeds *this* instance's state from parent data
       (the `useState(propValue)` case), overriding the component's registered default.
-      `bubble` maps the child's serialized *output* to an optional parent message: the
+      `props` carries live input separately from that persisted state. `bubble` maps the child's serialized *output* to an optional parent message: the
       type-safe channel by which a self-contained child event can still reach the root
       `update`. The host renders empty; the driver fills its children from local state. -/
-  | localCell (key component : String) (init? : Option String) (bubble : String → Option msg)
+  | localCell (key component : String) (init? : Option String) (props : String) (bubble : String → Option msg)
   /-- INTERNAL: the engine's value-update mechanism, never written by hand. When the `ui`
       lift decides a binding can update without a diff (a list row's text derived from the
       model), it emits this; the driver binds the node to a named slot and a value-only
@@ -111,7 +111,7 @@ def Attr.map (f : α → β) : Attr α → Attr β
   | .onValue e h  => .onValue e (fun s => f (h s))
   -- Only the bubble carries `msg`; the child's own view/messages live in the driver,
   -- so relabelling the parent never has to recurse into the local subtree (total).
-  | .localCell k c i b => .localCell k c i (fun s => (b s).map f)
+  | .localCell k c i p b => .localCell k c i p (fun s => (b s).map f)
   | .signalBind name   => .signalBind name
   | .signalAttr n a v  => .signalAttr n a v
   | .rawHtml markup    => .rawHtml markup

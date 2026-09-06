@@ -53,6 +53,19 @@ def updateKeyed (c : Component Model Msg) (key : Model → String)
     (models : Array Model) (k : String) (msg : Msg) : Array Model :=
   models.map fun r => if key r == k then c.update r msg else r
 
+/-- Render a keyed collection, sharing identity with updateKeyed. A custom wrapper
+    receives the row and its already-routed child; its root gets the same key. -/
+def each (c : Component Model Msg) (keyOf : Model → String) (rows : Array Model)
+    (route : String → Msg → PMsg)
+    (wrap : Model → Html PMsg → Html PMsg := fun _ child => child) : Array (Html PMsg) :=
+  rows.map fun row =>
+    let k := keyOf row
+    let child := wrap row (render c (route k) row)
+    match child with
+    | .element tag attrs children =>
+        .element tag (.key k :: attrs.filter (fun | .key _ => false | _ => true)) children
+    | other => .element "div" [.key k] [other]
+
 end Component
 
 /-! ### Lifting an invariant over a list of children
@@ -106,67 +119,36 @@ theorem forall_sortBy {α} {P : α → Prop} {a : Array α} {le : α → α → 
 
 end ForEach
 
-/-! ### The `component` command: THE way to declare a component
+/-! ### Component declarations
 
-`component Name where state f : T (:= init)? … view => <jsx>` is the one declaration form
-of a component: state fields next to the view that uses them. Inside the view, the state
-fields are in scope by name, and `set` is the only way to change one:
+`component Name where` groups `state`, `prop`, and `collection` fields, an optional
+`key` and `emits` clause, named `action`s, and a JSX `view`.
 
-* `set f e`, a message-valued handler (`onClick={set f e}`). `e` may mention the state
-  fields; it is evaluated against the *current* state when the message is delivered, not
-  when the view rendered.
-* `set f`, a value handler (`onInput={set f}`): stores the incoming payload in `f`.
-* a chain, `set f e, set g e'`: one handler setting several fields in one message, every
-  expression read against the same pre-update state (batched-`setState` semantics).
-* `send o`, with `emits T` declared: bubble `o : T` to the parent's `onEmit={…}` handler.
-  `set f e, send o` does both in one message; a component with no `set`/`send` use for a
-  field's value can still display it.
+* `set f e` updates a state field; `set f` accepts an event payload. Chains assign
+  several fields atomically. Every expression, including `send`, reads the same
+  pre-update state at delivery time.
+* `action save => set saved count` generates the stable constructor `Msg.save`.
+  Actions may take typed parameters and an optional `when (condition)` guard.
+  A false guard leaves state unchanged and emits nothing. Inline setters still work.
+* `prop label : String` is immutable input, separate from `State`. Props refresh
+  on parent renders; `initial={{ note := label }}` seeds local state only once.
+  Defaults may be supplied on either kind of field. `set` cannot target a prop.
+* `collection rows : Row` is an `Array Row.State`, defaulting to empty. It generates
+  `Msg.rows key childMsg` and its keyed update arm. Row must declare `key` and have
+  a state-only update. `Row.each rows .rows` keys the rendered roots; an optional
+  wrapper receives the row and its routed child.
 
-Crucially, a handler is **not** a closure. Each distinct `set` site becomes one constructor
-of a generated first-order `Msg` (`set_f`, `set_f_g`, `set_f_2`, …), and a generated
-`update` interprets it, so messages stay data with named cases: `invariant … preserved_by
-Name.update` reduces arm by arm and names the case that broke, local state still
-snapshots/restores through its JSON codec, and replay/the differential gate keep seeing
-serializable messages and a pure transition.
+Local mounts require defaults for all state fields. Parent-owned tags use
+`state={row}` and `onMsg={.row}`; their fields can omit defaults. Props are passed
+as ordinary tag attributes in either mode. Components with props expose
+`update props state msg`; state-only components retain `update state msg`.
 
-A declared component is used from a view as a JSX tag (the capitalized-tag rule, see
-`Qed.Jsx`). Who owns the state is the parent's choice per use site, not a different way
-of writing the child:
+Generated declarations are ordinary Lean definitions. Invariants can target
+`Name.update`, with props supplied when present. Registration follows helper
+functions as well as tags, including imports. See `docs/components.md`.
 
-* **Framework-owned** (`useState`): `<Name key="a"/>`. The state lives in the driver's
-  keyed store, outside the parent's model. Requires every field to carry a default (they
-  make up `Name.init`). Props seed the initial state (`<Editor key={r.id} text={r.text}/>`,
-  React's `useState(propValue)`; the live state wins on re-render), and with `emits T`
-  the parent receives outputs via `onEmit={…}` (`T → msg`). Inside another component's
-  view, a payload-form `set f` is exactly such a map, so nesting reads
-  `<Child key={…} onEmit={set f}/>`.
-* **Parent-owned** (lifted state): hold rows as `field : Array Name.State` in the parent
-  model and bind each row with `<Name state={r} onMsg={.ctor}/>`, where
-  `| ctor (k : String) (msg : Name.Msg)` is a constructor of the parent's `Msg` (the one
-  line Lean cannot generate into an existing `inductive`). The matching `update` arm is
-  `| .ctor k msg => { m with field := Name.updateKeyed m.field k msg }`; `for_each` lifts
-  the child's invariants over the list. Declare the row identity once with `key f` (a
-  state field, before `emits`/`view`): it generates `Name.keyOf` (the tag's routing key)
-  and `Name.updateKeyed` (keyed delivery, so a sort/filter between render and dispatch
-  can't misroute). Fields may omit their defaults here (the parent seeds every row); a
-  component with a default-less field is parent-owned-only. A parent arm may also update
-  rows directly (`field.map …`), the props flow, and `for_each` lifts over that too.
-
-Generated under `Name.`: `State`, `Msg`, `update`, `view`, `regs` (its transitive
-component registrations, collected from the view's tags), always; `component` when there
-is no `emits` (a parent-owned child's outputs would have no receiver); `keyOf`/`updateKeyed`
-with a `key` clause; and, when every field has a default, `init`, the JSON codec, `reg`,
-`mount`, with `emits T` `mountWith`, and without `emits` also `app` (the component run
-as a whole application: `def app := Name.app` is a complete program). `LocalDef`/
-`localMount` (Qed.Runtime) and the `Component` structure are the substrate this
-elaborates onto, as `el` is to JSX, not a second authored form.
-
-Sharp edge (the keywords are identifiers, the price of keeping `component`/`view` usable
-as names): a command that *ends in an open precedence-0 term*, like `#check f`, will
-swallow a following `component N where` as application arguments and fail at `where`.
-A doc comment on the declaration (or any keyword-led command between) ends the term.
-Components following components are fine: the `view` body is a closed max-precedence
-atom. -/
+Keywords remain usable as identifiers. A preceding open-ended command such as
+`#check f` can consume a following `component`; a doc comment ends that term. -/
 
 open Lean Parser in
 /-- The component state setter, `set f e` / `set f`, chainable over several fields and
@@ -178,10 +160,10 @@ open Lean Parser in
     identifier everywhere else (non-reserved). -/
 @[term_parser] def setTerm := leading_parser:maxPrec
   nonReservedSymbol "set" (includeIdent := true) >> Parser.ident >>
-  optional (termParser maxPrec) >>
+  optional (checkColGt >> termParser maxPrec) >>
   many (node `Qed.setMore
     (atomic (", " >> nonReservedSymbol "set" (includeIdent := true)) >> Parser.ident >>
-     optional (termParser maxPrec))) >>
+     optional (checkColGt >> termParser maxPrec))) >>
   optional (", " >> nonReservedSymbol "send" (includeIdent := true) >> termParser maxPrec)
 
 open Lean Parser in
@@ -216,7 +198,7 @@ open Lean Parser in
     -- a field without a default makes the component parent-owned-only (no `mount`, the
     -- parent seeds every instance). The default is max-precedence so it cannot swallow
     -- what follows on the same line; parenthesize a compound default, as in a JSX splice
-    (atomic (identEq `state) >> ident >> " : " >> termParser >>
+    ((atomic (identEq `state) <|> atomic (identEq `prop) <|> atomic (identEq `collection)) >> ident >> " : " >> termParser >>
      optional (" := " >> termParser maxPrec))) >>
   -- `key f`: the state field that identifies a row when the parent owns a list of these
   -- (the reconciliation/routing key a `state={…}` tag uses). Generates `keyOf`/`updateKeyed`.
@@ -224,6 +206,7 @@ open Lean Parser in
   optional (node `Qed.componentEmits (atomic (identEq `emits) >> termParser maxPrec)) >>
   -- the body is max-precedence (a JSX element is one closed atom) so that application
   -- cannot extend past it and swallow a following ident-led `component` declaration
+  manyIndent (node `Qed.componentAction (atomic (identEq `action) >> ident >> many (node `Qed.componentActionParam ("(" >> ident >> " : " >> termParser >> ")")) >> optional (atomic (identEq `when) >> termParser maxPrec) >> " => " >> termParser maxPrec)) >>
   identEq `view >> " => " >> termParser maxPrec
 
 /-- One `set`/`send` site collected from a `component` view: the fields it sets with
@@ -235,13 +218,15 @@ private structure SetSite where
   assigns : Array (Lean.Name × Option Lean.Term)
   ctor    : Lean.Name
   send?   : Option Lean.Term
+  params  : Array (Lean.Ident × Lean.Term) := #[]
+  guard?  : Option Lean.Term := none
 
 /-- Does `n` occur as an identifier anywhere under `stx`? How the `component` elaborator
     decides which state fields a set expression (or the view body) mentions, so only those
     are bound from the model. -/
 private partial def mentionsIdent (stx : Lean.Syntax) (n : Lean.Name) : Bool :=
   match stx with
-  | .ident _ _ v _ => v.eraseMacroScopes == n
+  | .ident _ _ v _ => n.isPrefixOf v.eraseMacroScopes
   | .node _ _ args => args.any (mentionsIdent · n)
   | _ => false
 
@@ -310,18 +295,30 @@ private partial def replaceSets (fields : Array Name) (msgPath : Name) (hasEmits
 open Lean Elab Command in
 @[command_elab componentCmd] def elabComponentCmd : CommandElab := fun stx => do
       -- node shape: [doc?, kw, name, "where", (stateItem: [kw, f, ":", ty, (":=", default)?])*,
-      --              (key: [kw, f])?, (emits: [kw, ty])?, kw, "=>", body]
+      --              (key: [kw, f])?, (emits: [kw, ty])?, actions*, kw, "=>", body]
       let doc? : Option (TSyntax ``Lean.Parser.Command.docComment) :=
         if stx[0].getNumArgs == 1 then some ⟨stx[0][0]⟩ else none
       let t : Ident := ⟨stx[2]⟩
-      let items := stx[4].getArgs
+      let allItems := stx[4].getArgs
+      let propItems := allItems.filter (fun it => it[0].getId == `prop)
+      let collections := allItems.filter (fun it => it[0].getId == `collection)
+      let items := allItems.filter (fun it => it[0].getId != `prop)
       let fs  : Array Ident := items.map fun it => ⟨it[1]⟩
-      let tys : Array Term  := items.map fun it => ⟨it[3]⟩
-      let ds  : Array (Option Term) := items.map fun it =>
-        if it[4].getNumArgs == 2 then some ⟨it[4][1]⟩ else none
+      let tys : Array Term ← items.mapM fun it =>
+        if it[0].getId == `collection then
+          `(Array $(mkIdent (it[3].getId ++ `State)))
+        else pure ⟨it[3]⟩
+      let ds : Array (Option Term) ← items.mapM fun it =>
+        if it[4].getNumArgs == 2 then pure (some ⟨it[4][1]⟩)
+        else if it[0].getId == `collection then return some (← `(#[]))
+        else pure none
+      let pfs : Array Ident := propItems.map fun it => ⟨it[1]⟩
+      let ptys : Array Term := propItems.map fun it => ⟨it[3]⟩
+      let propsId := mkIdent (t.getId ++ `Props)
+      let hasProps := !propItems.isEmpty
       let keyF?  : Option Ident := if stx[5].getNumArgs == 1 then some ⟨stx[5][0][1]⟩ else none
       let outTy? : Option Term  := if stx[6].getNumArgs == 1 then some ⟨stx[6][0][1]⟩ else none
-      let body : Term := ⟨stx[9]⟩
+      let body : Term := ⟨stx[10]⟩
       let stateId    := mkIdent (t.getId ++ `State)
       let initId     := mkIdent (t.getId ++ `init)
       let msgId      := mkIdent (t.getId ++ `Msg)
@@ -332,6 +329,9 @@ open Lean Elab Command in
       let toJsonId   := mkIdent (t.getId ++ `State ++ `toJson)
       let fromJsonId := mkIdent (t.getId ++ `State ++ `fromJson)
       let fieldNames := fs.map (·.getId)
+      let allNames := fieldNames ++ pfs.map (·.getId)
+      if allNames.toList.eraseDups.length != allNames.size then
+        throwErrorAt t "component fields must have distinct names"
       if let some kf := keyF? then
         unless fieldNames.contains kf.getId.eraseMacroScopes do
           throwErrorAt kf "`key {kf.getId}`: not a `state` field of this component (fields: {fieldNames.toList})"
@@ -342,25 +342,52 @@ open Lean Elab Command in
       let idLit := Syntax.mkStrLit (((← getCurrNamespace) ++ t.getId).toString)
       -- Collect the `set`/`send` sites; each becomes a `Msg` constructor reference in the body.
       let sitesRef ← IO.mkRef (#[] : Array SetSite)
+      for a in stx[7].getArgs do
+        let name := a[1].getId
+        if (← sitesRef.get).any (·.ctor == name) || collections.any (·[1].getId == name) then
+          throwErrorAt a[1] "duplicate action name `{name}`"
+        let before ← sitesRef.get
+        let actionRef ← IO.mkRef (#[] : Array SetSite)
+        let _ ← replaceSets fieldNames (t.getId ++ `Msg) outTy?.isSome actionRef a[5]
+        let actionSites ← actionRef.get
+        unless actionSites.size == 1 && (a[5].getKind == ``setTerm || a[5].getKind == ``sendTerm) do
+          throwErrorAt a[5] "an action must be a `set`/`send` chain"
+        let some site := actionSites[0]? | throwErrorAt a "empty action"
+        let params : Array (Ident × Term) := a[2].getArgs.map fun p => (⟨p[1]⟩, ⟨p[3]⟩)
+        if !params.isEmpty && site.assigns.any (·.2.isNone) then
+          throwErrorAt a "use an explicit set value in an action with parameters"
+        let names := params.map (·.1.getId)
+        if names.toList.eraseDups.length != names.size || names.any allNames.contains then
+          throwErrorAt a "action parameters must be distinct and must not shadow fields"
+        let guard? : Option Term := if a[3].getNumArgs == 2 then some ⟨a[3][1]⟩ else none
+        sitesRef.set (before.push { site with ctor := name, key := s!"action:{name}", params, guard? })
       let body' : Term := ⟨← replaceSets fieldNames (t.getId ++ `Msg) outTy?.isSome sitesRef body⟩
       let sites ← sitesRef.get
       -- Msg: one first-order constructor per distinct site (the payload form `set f` takes
       -- the field's value type as its argument).
       let isPayload : SetSite → Bool := fun site => site.assigns.any (·.2.isNone)
-      let ctors ← sites.mapM fun site => do
+      let mut ctors ← sites.mapM fun site => do
         let cId := mkIdent site.ctor
-        match site.assigns.find? (·.2.isNone) with
+        if !site.params.isEmpty then
+          let ids := site.params.map (·.1)
+          let ts := site.params.map (·.2)
+          `(Lean.Parser.Command.ctor| | $cId:ident $[($ids:ident : $ts)]*)
+        else match site.assigns.find? (·.2.isNone) with
         | some (f, _) =>
           let some idx := fieldNames.findIdx? (· == f) | throwError "component: internal"
           `(Lean.Parser.Command.ctor| | $cId:ident (v : $(tys[idx]!)))
         | none =>
           `(Lean.Parser.Command.ctor| | $cId:ident)
+      for col in collections do
+        let nm := mkIdent col[1].getId
+        let cm := mkIdent (col[3].getId ++ `Msg)
+        ctors := ctors.push (← `(Lean.Parser.Command.ctor| | $nm:ident (key : String) (msg : $cm)))
       let msgCmd ← if ctors.isEmpty then `(command| inductive $msgId)
         else `(command| inductive $msgId where $[$ctors:ctor]*)
       -- update: interpret each constructor. Set/send expressions are evaluated HERE, over
       -- the current (pre-update) state: each state field they mention is bound from `s`
       -- first. With `emits` the arms return `(state', some output / none)`.
-      let arms ← sites.mapM fun site => do
+      let mut arms ← sites.mapM fun site => do
         let cFull := mkIdent (t.getId ++ `Msg ++ site.ctor)
         let stateTerm : Term ←
           if site.assigns.isEmpty then `(s)
@@ -376,45 +403,98 @@ open Lean Elab Command in
             | some o => `(($stateTerm, some $o))
             | none   => `(($stateTerm, none))
         let mut rhs := rhs0
-        for g in fieldNames.reverse do
+        if let some guard := site.guard? then
+          let unchanged ← if outTy?.isSome then `((s, none)) else `(s)
+          rhs ← `(if $guard then $rhs else $unchanged)
+        for g in allNames.reverse do
           let mentioned := (site.assigns.any fun (_, e?) => e?.any (mentionsIdent ·.raw g)) ||
-                           (site.send?.any (mentionsIdent ·.raw g))
+                           (site.send?.any (mentionsIdent ·.raw g)) ||
+                           (site.guard?.any (mentionsIdent ·.raw g))
           if mentioned then
             let gId := mkIdent g
-            rhs ← `(let $gId:ident := (s.$gId:ident); $rhs)
-        if isPayload site then
+            if fieldNames.contains g then
+              rhs ← `(let $gId:ident := (s.$gId:ident); $rhs)
+            else rhs ← `(let $gId:ident := (p.$gId:ident); $rhs)
+        if !site.params.isEmpty then
+          let ids : Array Term := site.params.map (fun p => ⟨p.1.raw⟩)
+          `(Lean.Parser.Term.matchAltExpr| | $cFull:ident $ids* => $rhs)
+        else if isPayload site then
           `(Lean.Parser.Term.matchAltExpr| | $cFull:ident v => $rhs)
         else
           `(Lean.Parser.Term.matchAltExpr| | $cFull:ident => $rhs)
+      for col in collections do
+        let nm := mkIdent col[1].getId
+        let ctor := mkIdent (t.getId ++ `Msg ++ col[1].getId)
+        let upd := mkIdent (col[3].getId ++ `updateKeyed)
+        let next ← `({ s with $nm:ident := $upd s.$nm:ident k msg })
+        let rhs ← if outTy?.isSome then `(($next, none)) else pure next
+        arms := arms.push (← `(Lean.Parser.Term.matchAltExpr| | $ctor k msg => $rhs))
       let retTy : Term ← match outTy? with
         | some o => `($stateId × Option $o)
         | none   => `($stateId)
-      let updateCmd ← if sites.isEmpty then
-          `(command| def $updateId (s : $stateId) : $msgId → $retTy := fun m => nomatch m)
-        else
-          `(command| def $updateId (s : $stateId) : $msgId → $retTy := fun m =>
-              match m with $[$arms:matchAlt]*)
+      let updateBody ← if arms.isEmpty then `(fun m => nomatch m)
+        else `(fun m => match m with $[$arms:matchAlt]*)
+      let updateCmd ← if hasProps then
+          `(command| def $updateId (p : $propsId) (s : $stateId) : $msgId → $retTy := $updateBody)
+        else `(command| def $updateId (s : $stateId) : $msgId → $retTy := $updateBody)
       -- view: the body with set sites replaced; state fields it mentions are in scope by name.
       let mut viewBody := body'
-      for g in fieldNames.reverse do
+      for g in allNames.reverse do
         if mentionsIdent viewBody.raw g then
           let gId := mkIdent g
-          viewBody ← `(let $gId:ident := (s.$gId:ident); $viewBody)
+          if fieldNames.contains g then
+            viewBody ← `(let $gId:ident := (s.$gId:ident); $viewBody)
+          else viewBody ← `(let $gId:ident := (p.$gId:ident); $viewBody)
       -- JSON codec for the state (snapshot/restore and the keyed store are strings).
       let keyLits := fs.map fun f => Syntax.mkStrLit (toString f.getId)
       let pairs ← (fs.zip keyLits).mapM fun (f, k) => `(($k, toJson (x.$f:ident)))
       let decodes ← (tys.zip keyLits).mapM fun (ty, k) =>
         `((FromJsonField.fromField j $k : Except String $ty))
+      let propFields ← propItems.mapM fun it => do
+        let f : Ident := ⟨it[1]⟩
+        let ty : Term := ⟨it[3]⟩
+        if it[4].getNumArgs == 2 then
+          let d : Term := ⟨it[4][1]⟩
+          `(Lean.Parser.Command.structExplicitBinder| ($f : $ty := $d))
+        else `(Lean.Parser.Command.structExplicitBinder| ($f : $ty))
+      let stateFields ← ((fs.zip tys).zip ds).mapM fun ((f, ty), d?) =>
+        match d? with
+        | some d => `(Lean.Parser.Command.structExplicitBinder| ($f : $ty := $d))
+        | none => `(Lean.Parser.Command.structExplicitBinder| ($f : $ty))
       let mut cmds : Array (TSyntax `command) := #[
-        ← `(command| structure $stateId where
-              $[$fs:ident : $tys]*),
+        ← `(command| structure $propsId where $[$propFields:structExplicitBinder]*),
+        ← `(command| structure $stateId where $[$stateFields:structExplicitBinder]*),
         msgCmd,
         updateCmd,
-        ← `(command| def $viewId (s : $stateId) : Html $msgId := $viewBody) ]
+        ← (if hasProps then
+          `(command| def $viewId (p : $propsId) (s : $stateId) : Html $msgId := $viewBody)
+        else `(command| def $viewId (s : $stateId) : Html $msgId := $viewBody)) ]
+      if outTy?.isNone then
+        let renderId := mkIdent (t.getId ++ `render)
+        let rendered ← if hasProps then `($viewId p s) else `($viewId s)
+        cmds := cmds.push (← `(command| def $renderId {parentMsg : Type}
+          (p : $propsId) (route : $msgId → parentMsg) (s : $stateId) : Html parentMsg :=
+          ($rendered).map route))
+        if hasProps then
+          let compId := mkIdent (t.getId ++ `component)
+          cmds := cmds.push (← `(command| def $compId (p : $propsId) : Component $stateId $msgId :=
+            { update := $updateId p, view := $viewId p }))
+          if let some kf := keyF? then
+            let keyId := mkIdent (t.getId ++ `keyOf)
+            let updId := mkIdent (t.getId ++ `updateKeyed)
+            let eachId := mkIdent (t.getId ++ `each)
+            cmds := cmds ++ #[
+              ← `(command| def $keyId (s : $stateId) : String := toString s.$kf:ident),
+              ← `(command| def $updId (p : $propsId) (rows : Array $stateId) (k : String)
+                (msg : $msgId) : Array $stateId := Component.updateKeyed ($compId p) $keyId rows k msg),
+              ← `(command| def $eachId {parentMsg : Type} (p : $propsId) (rows : Array $stateId)
+                (route : String → $msgId → parentMsg)
+                (wrap : $stateId → Html parentMsg → Html parentMsg := fun _ child => child)
+                : Array (Html parentMsg) := Component.each ($compId p) $keyId rows route wrap)]
       -- without `emits` the update is `State → Msg → State`, so the declaration is also a
       -- `Component`: a `state={…}` tag mounts it into a parent-owned keyed list with no
       -- extra code
-      if outTy?.isNone then
+      if outTy?.isNone && !hasProps then
         let compId := mkIdent (t.getId ++ `component)
         cmds := cmds.push <|
           ← `(command| $[$doc?:docComment]? def $compId : Component $stateId $msgId :=
@@ -424,26 +504,47 @@ open Lean Elab Command in
         if let some kf := keyF? then
           let keyOfId       := mkIdent (t.getId ++ `keyOf)
           let updateKeyedId := mkIdent (t.getId ++ `updateKeyed)
+          let eachId := mkIdent (t.getId ++ `each)
           let kfId          := mkIdent kf.getId.eraseMacroScopes
           cmds := cmds ++ #[
             ← `(command| def $keyOfId (s : $stateId) : String := toString s.$kfId),
             ← `(command| def $updateKeyedId (rows : Array $stateId) (k : String)
                   (msg : $msgId) : Array $stateId :=
-                  Component.updateKeyed $compId $keyOfId rows k msg)]
+                  Component.updateKeyed $compId $keyOfId rows k msg),
+            ← `(command| def $eachId {parentMsg : Type} (rows : Array $stateId)
+                (route : String → $msgId → parentMsg)
+                (wrap : $stateId → Html parentMsg → Html parentMsg := fun _ child => child)
+                : Array (Html parentMsg) := Component.each $compId $keyOfId rows route wrap)]
       -- the framework-owned mount (`reg`/`mount`) needs an `init` and a serializable state,
       -- so it exists only when every field has a default; without one the component is
       -- parent-owned-only and the parent seeds every instance
-      if ds.all (·.isSome) then
-        let dsT := ds.filterMap id
+      do
+        let pk := pfs.map fun f => Syntax.mkStrLit (toString f.getId)
+        let pp ← (pfs.zip pk).mapM fun (f, k) => `(($k, toJson (x.$f:ident)))
+        let pd ← (ptys.zip pk).mapM fun (ty, k) => `((FromJsonField.fromField j $k : Except String $ty))
         cmds := cmds ++ #[
-          ← `(command| def $initId : $stateId := { $[$fs:ident := $dsT],* }),
+          ← `(command| instance : ToJson $propsId := ⟨fun x => Json.obj [$[$pp],*]⟩),
+          ← `(command| instance : FromJson $propsId := ⟨fun j => do
+            $[let $pfs:ident ← $pd:term]*
+            return { $[$pfs:ident],* }⟩)]
+      cmds := cmds ++ #[
           ← `(command| def $toJsonId (x : $stateId) : Json := Json.obj [$[$pairs],*]),
           ← `(command| def $fromJsonId (j : Json) : Except String $stateId := do
                 $[let $fs:ident ← $decodes:term]*
                 return { $[$fs:ident],* }),
           ← `(command| instance : ToJson $stateId := ⟨$toJsonId⟩),
-          ← `(command| instance : FromJson $stateId := ⟨$fromJsonId⟩),
-          ← (match outTy? with
+          ← `(command| instance : FromJson $stateId := ⟨$fromJsonId⟩)]
+      if ds.all (·.isSome) then
+        let dsT := ds.filterMap id
+        cmds := cmds ++ #[
+          ← `(command| def $initId : $stateId := { $[$fs:ident := $dsT],* }),
+          ← (if hasProps then
+              match outTy? with
+              | none => `(command| def $regId : LocalDef :=
+                  LocalDef.ofProps $idLit $initId $viewId (fun p s m => ($updateId p s m, (none : Option Bool))))
+              | some _ => `(command| def $regId : LocalDef :=
+                  LocalDef.ofProps $idLit $initId $viewId $updateId)
+            else match outTy? with
             | none => `(command| $[$doc?:docComment]? def $regId : LocalDef :=
                 LocalDef.ofSimple $idLit $initId $viewId $updateId)
             | some _ => `(command| $[$doc?:docComment]? def $regId : LocalDef :=
@@ -462,21 +563,18 @@ open Lean Elab Command in
       -- mountable) plus, transitively, those of every component tag in its view. `ui`
       -- and the generated `app` collect these automatically, no `locals := […]` by hand.
       let regsId    := mkIdent (t.getId ++ `regs)
-      let deps      := (componentTagsIn body).filter (· != t.getId.toString)
       let mountable := ds.all (·.isSome)
       let own : Term ← if mountable then `([$regId]) else `(([] : List LocalDef))
-      let mut regsT : Term := own
-      for d in deps do
-        regsT ← `($regsT ++ $(mkIdent (componentTagName d ++ `regs)))
-      cmds := cmds.push (← `(command| def $regsId : List LocalDef := LocalDef.dedupe $regsT))
+      cmds := cmds.push (← `(command| def $regsId : List LocalDef :=
+        LocalDef.dedupe ($own ++ localRegistrations $viewId)))
       -- with every field defaulted and no `emits`, the component can BE the whole app:
       -- `def app := Name.app` is a complete program (state → model, the generated
       -- update → transition, nested tags registered)
-      if mountable && outTy?.isNone then
+      if mountable && outTy?.isNone && !hasProps then
         let appId := mkIdent (t.getId ++ `app)
         cmds := cmds.push <|
           ← `(command| $[$doc?:docComment]? def $appId : App $stateId $msgId :=
-                mkApp $initId $updateId (View.ofHtml $viewId) (locals := $regsId))
+                withLocalRegistry (mkApp $initId $updateId (View.ofHtml $viewId) (locals := $regsId)))
       for c in cmds do elabCommand c
 
 end Qed

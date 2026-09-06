@@ -185,7 +185,7 @@ partial def attrToTerm (stx : Syntax) : MacroM Term := do
     | some h => return ⟨← `($(mkCIdent h) $vT)⟩
     | none   => return ⟨← `(Qed.attr $(Syntax.mkStrLit name) $vT)⟩
 
-/-- Is this term syntactically `xs.map (fun x => …)` (one argument)? If so a lone
+/-- Is this an array-producing `xs.map (fun x => …)` or `Row.each …` call? If so a lone
     spliced child is passed straight through as the children, the shape the
     `view%` lift turns into a fine-grained keyed list. -/
 partial def isMapCall (stx : Syntax) : Bool :=
@@ -194,8 +194,9 @@ partial def isMapCall (stx : Syntax) : Bool :=
   if s.getKind == ``Lean.Parser.Term.app && s.getNumArgs == 2 then
     match s[0] with
     | .ident _ _ n _ =>
-        (match n.eraseMacroScopes with | .str _ s => s == "map" | _ => false)
-        && s[1].getNumArgs == 1
+        match n.eraseMacroScopes with
+        | .str _ name => (name == "map" && s[1].getNumArgs == 1) || name == "each"
+        | _ => false
     | _ => false
   else false
 
@@ -242,9 +243,8 @@ partial def childrenToTerm (opener : Syntax) (kids : Array Syntax) : MacroM Term
       and the tag renders it. Requires `onMsg={.ctor}`, the parent `Msg` constructor
       `(k : String) (msg : C.Msg)` its events route through; the routing key is the
       component's declared `key` field (`C.keyOf r`) unless `key={…}` overrides it.
-    * any other `field={v}`: seed that state field of a framework-owned instance
-      (React's `useState(propValue)`: first mount only, the live state wins after).
-      A bare `field` seeds `true`. -/
+    * `initial={…}`: seed local state once, without resetting it on parent updates.
+    * other `field={v}` attributes: live fields declared with `prop`. A bare field is `true`. -/
 partial def componentToTerm (stx : Syntax) (tag : String)
     (attrStxs : Array Syntax) (kids : Array Syntax) : MacroM Term := do
   let cName := (tag.splitOn ".").foldl Name.str Name.anonymous
@@ -255,6 +255,7 @@ partial def componentToTerm (stx : Syntax) (tag : String)
   let mut props   : Array (Syntax × String × Term) := #[]
   let mut key?    : Option Term := none
   let mut state?  : Option Term := none
+  let mut initial? : Option Term := none
   let mut onMsg?  : Option Term := none
   let mut onEmit? : Option Term := none
   for a in attrStxs do
@@ -272,6 +273,7 @@ partial def componentToTerm (stx : Syntax) (tag : String)
     match name with
     | "key"    => key? := some v
     | "state"  => state? := some v
+    | "initial" => initial? := some v
     | "onMsg"  => onMsg? := some v
     | "onEmit" => onEmit? := some v
     | _        => props := props.push (a[0], name, v)
@@ -279,9 +281,8 @@ partial def componentToTerm (stx : Syntax) (tag : String)
   | some st =>
       -- parent-owned: render the bound row, its messages tagged with the row's key, so
       -- the parent's update routes them back via the generated `C.updateKeyed`
-      if let some (nameStx, n, _) := props[0]? then
-        Macro.throwErrorAt nameStx s!"<{tag} state=\{…}>: the parent owns this state, so \
-          set fields on the bound value, not as props (unexpected `{n}`)"
+      if initial?.isSome then
+        Macro.throwErrorAt stx "`initial` seeds local state; it cannot accompany `state`"
       if onEmit?.isSome then
         Macro.throwErrorAt stx s!"<{tag} state=\{…}>: a parent-owned component routes \
           every event through onMsg, it has no separate emit channel"
@@ -295,7 +296,10 @@ partial def componentToTerm (stx : Syntax) (tag : String)
             | none   => `($(cId `keyOf) $st)
           -- `Qed.Component`/`Qed.Runtime` are above this module, so their names are
           -- emitted unresolved (`mkIdent`) and bind at the use site, which imports `Qed`
-          `($(mkIdent `Qed.Component.render) $(cId `component) (fun cm => $route $keyT cm) $st)
+          let fids := props.map fun (_, n, _) => mkIdent (Name.mkSimple n)
+          let vals := props.map fun (_, _, v) => v
+          let p ← `(({ $[$fids:ident := $vals],* } : $(cId `Props)))
+          `($(cId `render) $p (fun cm => $route $keyT cm) $st)
   | none =>
       -- framework-owned: a keyed host element the driver mounts the instance into
       if onMsg?.isSome then
@@ -307,13 +311,15 @@ partial def componentToTerm (stx : Syntax) (tag : String)
       let mountBase : Term ← match onEmit? with
         | some h => `($(cId `mountWith) $keyT (fun out => $h out))
         | none   => `($(cId `mount) $keyT)
+      let mountBase ← match initial? with
+        | none => pure mountBase
+        | some seed => `($(mkIdent `Qed.Attr.localInit) $mountBase ($seed : $(cId `State)))
       let mountT : Term ←
-        if props.isEmpty then pure mountBase
-        else do
+        do
           let fids := props.map fun (_, n, _) => mkIdent (Name.mkSimple n)
           let vals := props.map fun (_, _, v) => v
-          let seed ← `({ $(cId `init):term with $[$fids:ident := $vals],* })
-          `($(mkIdent `Qed.Attr.localInit) $mountBase $seed)
+          let values ← `(({ $[$fids:ident := $vals],* } : $(cId `Props)))
+          `($(mkIdent `Qed.Attr.localProps) $mountBase $values)
       `(Qed.el "div" [Qed.key $keyT, $mountT] [])
 
 /-- One JSX element → `Qed.el "tag" [attrs] children` (or a component mount, for a

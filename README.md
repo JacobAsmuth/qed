@@ -1,21 +1,14 @@
 # Qed
 
-**A formally verified web frontend framework in Lean 4.**
+**A web frontend framework in Lean 4 with machine-checked invariants and rendering proofs.**
 
-Frontend bugs are where the ones you ship actually live. The missing case in a reducer. The render
-that throws on an empty list. The "this can't happen" that happens in production. Every framework
-asks you to trust your code is right, and hands you a type checker and a test suite to hope along
-with you.
+Write your frontend in [Lean](https://lean-lang.org), state properties it should preserve, and
+have Lean's kernel check their proofs. If you've written React, you already know the shape:
+components with state and props, written in JSX. Underneath, each component becomes a typed
+message type and a pure reducer. That's what makes the proofs possible.
 
-Qed makes a different bet. You write your app in [Lean](https://lean-lang.org), a proof assistant.
-The same kernel mathematicians use to check proofs checks your frontend.
-
-`qed build` transpiles your app and the whole verified framework straight to plain JavaScript. No
-emscripten, no WASM, no special runtime. The output is a handful of `.mjs` files you serve anywhere.
-The proofs that pass `qed check` describe the JavaScript that actually runs. If you've written
-React, you already know the shape: components with state and props, written in JSX. Underneath,
-every component desugars to Elm's architecture, a typed message and a pure reducer. That's what
-makes the proofs possible.
+`qed build` compiles your app and the framework to plain JavaScript, with a small runtime for
+Lean primitives and browser APIs. No emscripten or WASM is needed.
 
 ```bash
 curl -sSfL https://raw.githubusercontent.com/JacobAsmuth/qed/main/install.sh | sh
@@ -24,16 +17,15 @@ qed new myapp && cd myapp && qed dev      # → http://localhost:8000, live-relo
 
 ## A proof assistant, in my frontend?
 
-Two guarantees fall out before you write a single proof.
+Lean checks your definitions, and Qed can automate proofs of properties you choose.
 
-**Your app can't crash at runtime.** State transitions and views are ordinary total Lean
-functions. A missing case in a `match`, or a render that might not terminate, isn't a warning you
-can mute. It's a build error. The broken code never reaches a user, because it never reaches
-`dist/`.
+**Lean checks exhaustive cases and termination for total definitions.** Missing cases and
+recursion that fails the termination check are build errors. This rules out useful classes of
+mistakes, but does not make the compiled app immune to runtime failures.
 
-**You can state a fact about your app and let the kernel prove it.** This is the part with no
-analogue in a normal framework. Here's a complete app, a counter whose count can never go
-negative; `Qed.run Counter.app` is the whole browser entry.
+**Qed can prove invariants automatically.** When automation cannot finish, you can supply a proof.
+Here's a counter whose reducer preserves a non-negative count, starting from zero;
+`Qed.run Counter.app` is the whole browser entry.
 
 ```lean
 component Counter where
@@ -54,8 +46,8 @@ is not a closure mutating a cell: each `set` site becomes a constructor of a gen
 type, and a generated pure reducer (`Counter.update`) interprets it. That's Elm's architecture,
 derived from the component, and it's what the invariant is stated over.
 
-So the last line isn't a test, and you don't write its proof. It checks that every handler leaves
-the count non-negative, and the build succeeds only if that holds for all of them. Delete the
+The last line proves that a non-negative count stays non-negative after every handler. Starting
+from zero, that covers any sequence of transitions. Delete the
 `if 0 < count` guard and the build fails naming the handler that broke the invariant
 (``case `set_count` still needs: 0 ≤ m.count - 1``).
 
@@ -68,37 +60,43 @@ the arrow also take plain ASCII, so `<=`, `>=`, and `->` work as written for `�
 You write the view in JSX, with plain Lean in the braces: `if`, `.map`, string interpolation, your
 own helpers. No `memo`, no `signal`s, no `useState` to place. The framework decides, per subtree,
 how to apply each change. A model value that changed is written straight at its node. A change of shape (rows
-added, removed, reordered, a branch flipped) reconciles through the diff. Change the counter and
-that one text node is rewritten. Nothing else.
+added, removed, reordered, a branch flipped) reconciles through the diff. For a scalar binding
+such as the counter text, the driver updates the text node without rebuilding its surrounding tree.
 
-The proof is what makes deciding for you safe. The value-update path is proven to produce the same
-DOM as a full re-render, and the diff is proven correct. The cheap update can never drift from
-re-rendering everything. The stale row or dropped update that a missing `key` or a misplaced `memo`
-causes elsewhere isn't something you can hit here.
+The template-update and diff proofs establish equivalence to a fresh render in the pure `Html`
+model. The browser driver's implementation is tested, not proved equivalent to that model.
+Keyed siblings need unique, stable keys. The ordinary diff falls back to position for missing or
+duplicate keys; fine-grained lists reject duplicate reconciliation keys. The lower-level
+`Html.lazy` escape hatch also trusts that equal memo keys mean equal content, including handlers.
 
 ## Is the thing that runs the thing you proved?
 
-A verified framework is worthless if the bytes in the browser aren't the bytes you proved things
-about. Every "verified" claim has to answer this. Qed's answer: there is no hand-written runtime to
-diverge from the proofs. `qed build` runs the Lean compiler's IR through a transpiler (`qedjs`) that
-emits JavaScript for your app, the whole framework, and the driver that runs them.
+`qedjs` translates Lean compiler IR into JavaScript for your app, the framework, and the browser
+driver. The reducer and diff come from the same definitions used in the proofs. The translation
+itself has no correctness proof.
 
 ```text
-Lean app (components, Model/Msg/update, invariants; proofs auto-discharged)
+Lean app (components, Model/Msg/update, invariants; automatic or supplied proofs)
    │  lake build              (the kernel checks every proof)
    ▼
 qedjs  (transpiles the Lean to JavaScript: your app + the Qed framework + the driver)
    ▼
 dist/app.mjs  +  runtime/qed_rt.mjs   (a small library of the Lean primitives it uses)
    ▼
-runtime/qed_dom.mjs + qed_host.mjs    (the only hand-written JS: the DOM calls and the
-                  event wiring; everything else is your verified Lean, as JavaScript)
+runtime/qed_dom.mjs + qed_host.mjs    (hand-written DOM calls, event wiring, and effects)
 ```
 
-The only JavaScript a human wrote is the thin boundary at the bottom: the actual DOM calls and event
-delegation. Everything above it is verified Lean. `test/js_gate_test.mjs` runs the same probes
-through native Lean and through the transpiled JS and asserts they compute exactly the same thing:
-render, diff, arithmetic, JSON, routing.
+The guarantees depend on Lean's kernel and compiler, `qedjs`, the imperative driver, and the
+hand-written JavaScript runtime and hosts. Partial or unsafe code, panic-producing operations,
+resource limits, and browser API failures are not ruled out by the rendering and invariant proofs.
+
+`test/js_gate_test.mjs` compares native Lean and transpiled JavaScript on rendering, diffing,
+arithmetic, JSON, routing, and other probes. Browser tests cover DOM updates, events, effects, and
+hydration. These test the unproved boundary on concrete cases; they do not prove it correct for
+every execution.
+
+`test/dom_equivalence_test.mjs` compares incremental DOM updates with fresh rendering after
+generated update sequences, including attribute removal, event handlers, and keyed reorders.
 
 ### Schema: forms and JSON, one declaration
 
@@ -120,17 +118,16 @@ schema Book where
 
 That one declaration yields the `Book` type, the form (`Book.formView`, whose submit button stays
 disabled until every field validates), and the JSON codec (`Book.decode` / `Book.encode`). A rule
-like `Year` is enforced in both directions by the same proof: the form won't submit an
-out-of-range year, and `decode` rejects one arriving over the wire. So a `Book` you hold is valid;
-an invalid one can't be constructed. And `Json.parse` itself is total, so bad input is an `.error`
-value, never an exception.
+like `Year` is shared by form validation and JSON decoding. Refined fields carry proofs of the
+declared rules: the generated form requires a valid year, and `decode` rejects an out-of-range
+one. The total `Json.parse` function returns `.error` for malformed or over-depth input.
 
 ### Routing and HTTP
 
 `router` declares your pages, and from that one table it proves routing round-trips: any route you
 print is one you can parse back into the exact route that produced it. That proof is why `linkTo`
-takes a route value, not a string. The link below can only point at a page that exists, so a
-mistyped or never-declared route is a compile error, not a broken link you ship.
+takes a route value, not a string. An unknown route constructor is a compile error, though a typed
+route does not guarantee that the referenced user or post exists.
 
 ```lean
 router R where
@@ -235,10 +232,10 @@ invariant feedSafe   : cardSafe   for_each cards preserved_by update  -- ∀ car
 invariant feedStyled : cardStyled for_each cards holds_in view        -- ∀ card, renders styled
 ```
 
-A tap inside a card routes back to that card by its key, so sorting or filtering the list can't
-misdeliver it. And the two `for_each` lines lift the card's contract to the whole feed: every
-card stays valid and styled, across every transition, proved automatically. An arm that can't
-preserve the contract fails the build by name. `Examples/Feed.lean` and `Examples/Local.lean`
+A tap addresses a card by its key, so unique, stable keys preserve identity across sorting.
+The `for_each` lines lift the card's contracts: updates preserve validity from a valid starting
+state, and the view satisfies the styling predicate for every model. An arm whose contract
+cannot be proved fails the build by name. `Examples/Feed.lean` and `Examples/Local.lean`
 are the worked examples, including components that emit typed output up to their parent.
 
 The feed's root is the architecture written out by hand: a `Model`, a `Msg`, a reducer, exactly
@@ -249,11 +246,10 @@ already has.
 
 ### Server-side rendering
 
-You don't write any SSR code. A routed app already declares everything a server needs, its pages
-(`router`) and their data (`queries`), so `qed build` emits `dist/ssr.mjs`: a request handler
-built from your app. Per request it routes the URL, runs your queries server-side, renders with
-the same verified `view` the browser runs, and embeds the model in the page, so the client adopts
-the HTML with no refetch and no flash.
+For a recognized `Qed.run <app>` entry, `qed build` emits `dist/ssr.mjs`. This handler routes each
+request, performs the app's HTTP effects, and renders the same view as the client. With model
+serialization and restoration configured, the client adopts that state without repeating startup
+requests. SSR skips browser-only effects and limits HTTP replay rounds.
 
 ```bash
 qed dev       # develop against the real thing: SSR + live reload
@@ -262,7 +258,8 @@ qed start     # serve it: every route server-rendered, hydrated on load
 ```
 
 Deploying stays simple. A static host still works (the same `dist/` is a complete
-single-page app), and server rendering is one import away on any node or edge runtime:
+single-page app), and the generated handler uses standard `Request`, `Response`, and `fetch` APIs
+for integration with compatible Node or edge runtimes:
 
 ```js
 import render from './dist/ssr.mjs';   // (request) => Response, that's the whole API
@@ -278,16 +275,15 @@ hello-world component to the full Bookshelf app.
 
 ## Does proving things cost you speed?
 
-No. The engine already knows which subtrees are value updates, so a changed row's text and attributes
-go straight to its node, no diff. On the standard keyed-list benchmark it comes out about even with
-React on update, swap, and reorder. The transpiler turns Lean's tail recursion into real loops, so
-building, diffing, and walking a list all run in constant stack. Even 100,000 rows reconcile without
-trouble.
+Proof terms are erased during compilation, so they do not execute in the browser. Eligible value
+bindings update directly; structural changes and opaque subtrees use the diff. Performance still
+depends on the workload. `Examples/Bench/`, `test/bench_template.mjs`, and `test/bench_react.mjs`
+provide native and browser benchmarks; the proofs establish no performance bound.
 
 ## Getting started
 
 The installer grabs elan (Lean's toolchain manager) if you don't have it, drops the framework into
-`~/.qed`, and puts `qed` on your PATH. There's no heavy toolchain to download. `qed build` emits
+`~/.qed`, and puts `qed` on your PATH. Development requires the Lean toolchain; `qed build` emits
 plain JavaScript. Verification isn't a separate step you have to remember. It runs inside every
 build:
 
@@ -296,16 +292,19 @@ qed dev        # watch sources, rebuild, serve (SSR) with live-reload  → local
 qed build      # production build → dist/ (client bundle + ssr.mjs)
 qed start      # serve the build, server-rendered   (alias: preview)
 qed test       # browser test suite (if present; needs node)
-qed check      # verify only: proofs + no-sorry + axiom-clean, no artifacts
+qed check      # build Lean modules, scan forbidden tactics, inspect the axiom manifest
 qed clean      # remove build outputs
 qed new APP    # scaffold a new app
 qed doctor     # report which dependencies are present
 ```
 
-A failed proof is a failed build. The sources are grepped for `sorry`/`admit`/`native_decide`, and
-the axiom manifest runs, so a "proof" that smuggles in an axiom is caught. `npm run dev` / `build` /
-`test` work too. When you're hacking on the framework itself, the in-repo `./qed` shim runs the CLI
-against this checkout.
+An unsolved proof goal fails compilation. Qed also scans selected sources for
+`sorry`/`admit`/`native_decide`. If `scripts/axioms.lean` exists, it runs that manifest and rejects
+output containing `sorryAx` or `error:`. This currently covers only the listed theorems and does
+not enforce an axiom whitelist: a passing check does not rule out unexpected axioms.
+
+`npm run dev` / `build` / `test` work too. When you're hacking on the framework itself, the in-repo
+`./qed` shim runs the CLI against this checkout.
 
 Give it a try and state an invariant. Issues welcome at
 [github.com/JacobAsmuth/qed/issues](https://github.com/JacobAsmuth/qed/issues).
@@ -327,8 +326,9 @@ Give it a try and state an invariant. Issues welcome at
 | `Qed/Schema.lean` | `Field p`, the `Codec` controls, and the `schema` command. One declaration yields the form (Draft + `parse` + `formView` + `canSubmit_iff`) and the JSON codec (`ToJson`/`FromJson` + `decode`/`encode`). |
 | `Qed/Component.lean` | `Component`, the `for_each` lift lemmas, and the `component` declaration (`state`/`key`/`emits`/`view`/`set`). |
 | `Qed/Invariant.lean` | The `invariant` command (`preserved_by` / `holds_in` / `for_each`). See [`docs/invariants.md`](docs/invariants.md). |
-| `Qed/Dom.lean` / `Qed/Driver.lean` | The DOM primitives (the one trusted boundary) and the impure driver. |
+| `Qed/Dom.lean` / `Qed/Driver.lean` | The DOM primitives and imperative browser driver; part of the trusted implementation. |
 | `Js/Backend.lean` | The Lean IR to JavaScript transpiler. |
+| `runtime/` | Hand-written JavaScript for Lean primitives, DOM operations, browser effects, and serving/SSR hosts. |
 | `Examples/` · `test/` | Example apps and the browser tests that drive them. |
 
 ## License

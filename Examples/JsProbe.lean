@@ -44,4 +44,43 @@ def diffCase   (i : Nat) : String := let p := pairs.getD i (t "", t ""); Html.re
 def diffExpect (i : Nat) : String := Html.render (pairs.getD i (t "", t "")).2
 def pairCount : Nat := pairs.size
 
+/-- Exercise pure child patching with wide lists, reordering, creation, a nonempty
+    accumulator, and out-of-range reuse (which the pure model defines via its default). -/
+def childPatchCase (i : Nat) : String :=
+  let n := (#[0, 1, 32, 1000, 8000] : Array Nat).getD i 0
+  let old := (Array.range n).map fun j => e "span" [] [t (toString j)]
+  let steps : List (KeyedStep Unit) :=
+    .create (t "new") :: ((List.range n).reverse.map fun j =>
+      .reuse j (.patchElement [Attr.cls "patched"] [.reuse 0 (.lazyPatch "" (.setText (toString j)))])) ++
+    [.reuse (n + 1) (.patchElement [] [])]
+  let patched := applyChildrenTR #[t "prefix"] steps old
+  -- Render each child separately: this probes the wide patch traversal, without the
+  -- string renderer's recursive sibling walk. Incorporate every character in row order.
+  let (length, checksum) := patched.foldl (init := (0, 0)) fun (length, checksum) child =>
+    let rendered := Html.render child
+    (length + rendered.length,
+      rendered.foldl (init := checksum) fun acc c => (acc * 31 + c.toNat) % 1000000007)
+  s!"{patched.size}|{length}|{checksum}"
+
+/-- Wide HTML serialization and handler order, including a pre-existing handler slot.
+    The previous recursive sibling renderer overflowed the JavaScript stack here. -/
+def wideRenderCase (i : Nat) : String :=
+  let n := (#[0, 1, 32, 8000, 16000] : Array Nat).getD i 0
+  let children : List (Html Nat) := (List.range n).map fun j =>
+    .element "button" [.on "click" j, .attr "title" "<&\""] [.text s!"row {j} & < >"]
+  let (html, handlers) := renderNode #[777] (.element "main" [] children)
+  let digest := html.toList.foldl (init := 0) fun acc c => (acc * 31 + c.toNat) % 1000000007
+  let handlerDigest := handlers.foldl (init := 0) fun acc m => (acc * 31 + m) % 1000000007
+  s!"{html.length}|{digest}|{handlers.size}|{handlerDigest}"
+
+def keyIndexCase (i : Nat) : String :=
+  let row (key : String) := e "div" [.key key] []
+  let cases := #[[], [row "a"], [row "b", row "a"], [row "a", row "a"],
+    [row "a", t "unkeyed"], [row "a", row "b", row "a"]]
+  match validatedKeyIndex (cases.getD i []) with
+  | none => "invalid"
+  | some index =>
+      let showIndex := fun key => match index[key]? with | some n => toString n | none => "missing"
+      showIndex "a" ++ "|" ++ showIndex "b"
+
 end JsProbe

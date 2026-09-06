@@ -50,7 +50,7 @@ inductive VAttr (σ : Type) (msg : Type) where
 /-- A fine-grained view template over a scope `σ`, producing messages `msg`.
 
     `text`/`element`/`static` are fixed structure; `dyn` is a value bound to the scope;
-    `showIf`/`keyedList` are the two structural combinators (conditional, keyed list)
+    `ifElse`/`keyedList` are the two structural constructors (conditional, keyed list)
     that reconcile through the verified `diff` rather than as bindings. A `keyedList`'s
     `child` template is scoped to a *row* `α`, not the outer `σ`, its projections read
     the row, which is what makes per-row updates fine-grained. -/
@@ -61,11 +61,8 @@ inductive View (σ : Type) (msg : Type) where
   | dyn (get : σ → String)
   /-- An element: tag, template attributes, and template children. -/
   | element (tag : String) (attrs : List (VAttr σ msg)) (kids : List (View σ msg))
-  /-- Conditional structure: render `child` when `cond σ`, else an empty text node
-      (the slot stays present so sibling positions/bindings don't shift). -/
-  | showIf (cond : σ → Bool) (child : View σ msg)
   /-- Two-branch conditional: render `yes` when `cond σ`, else `no`. A flip reconciles
-      through the verified `diff` (the slot is replaced), exactly as `showIf` does; while
+      through the verified `diff` (the slot is replaced); while
       `cond` holds steady the active branch value-patches in place. The lift target for a
       native `if c then a else b` in a view. -/
   | ifElse (cond : σ → Bool) (yes no : View σ msg)
@@ -96,6 +93,10 @@ inductive View (σ : Type) (msg : Type) where
       decompose, making "lift what we can, diff the rest" the default. -/
   | dynNode (get : σ → Html msg)
 
+/-- Conditional shorthand. The empty branch keeps the slot present for DOM patching. -/
+def View.showIf (cond : σ → Bool) (child : View σ msg) : View σ msg :=
+  .ifElse cond child (.text "")
+
 /-- A per-row identity stamp for the driver's O(changed) list update. The transpiler emits the
     real `$.refMark` (a stable id per heap object, fresh for a scalar), so an unchanged row, the
     SAME value Lean returned untouched, keeps its stamp and is skipped with no field read. This
@@ -124,7 +125,6 @@ mutual
     | .text s,          _ => .text s
     | .dyn get,         s => .text (get s)
     | .element t as ks, s => .element t (as.map (VAttr.eval s)) (View.renderEach ks s)
-    | .showIf cond ch,  s => if cond s then View.render ch s else .text ""
     | .ifElse cond y n, s => if cond s then View.render y s else View.render n s
     | .keyedList tag as _ _ _ rowsHtml, s => .element tag (as.map (VAttr.eval s)) (rowsHtml s)
     | .static h,        _ => h
@@ -147,8 +147,8 @@ The fine-grained driver, away from a `keyedList`, does not rebuild the tree: it 
 template against the new scope and overwrites only the dynamic text/attributes in place.
 `applyValues` is the pure model of that patch, start from the *old* rendered tree
 (`render t s`) and reapply the dynamic parts at the new scope `s'`. `stable t s s'` is its
-precondition, exactly the driver's value-only fast path: no `keyedList`, and no `showIf`
-condition flips between `s` and `s'`. The theorem `applyValues_render` says that under
+precondition: no `keyedList` or `dynNode` in the active branches, and no conditional flips
+between `s` and `s'`. The theorem `applyValues_render` says that under
 `stable`, the in-place patch reproduces a full re-render, so the non-list template path
 inherits the same "the DOM equals the model's view" guarantee `diff_apply` gives the diff
 path. (`keyedList` rows update through signals, outside `render`, so they are excluded.) -/
@@ -161,7 +161,6 @@ mutual
     | .dyn get,              s', _                       => .text (get s')
     | .element _ attrs kids, s', .element tag _ oldKids  =>
         .element tag (attrs.map (VAttr.eval s')) (applyValuesList kids s' oldKids)
-    | .showIf cond child,    s', old                     => if cond s' then applyValues child s' old else old
     | .ifElse cond y n,      s', old                     => if cond s' then applyValues y s' old else applyValues n s' old
     | _,                     _,  old                     => old
   def applyValuesList : List (View σ msg) → σ → List (Html msg) → List (Html msg)
@@ -170,11 +169,10 @@ mutual
 end
 
 mutual
-  /-- Is `t`'s structure the same at `s` and `s'`, no `keyedList`, every `showIf`
-      condition unchanged, so a value patch suffices (the driver's fast-path test)? -/
+  /-- Do the active branches have stable structure, with no `keyedList` or `dynNode`,
+      so a value patch suffices? Inactive branches need no check. -/
   def stable : View σ msg → σ → σ → Bool
     | .element _ _ kids,  s, s' => stableList kids s s'
-    | .showIf cond child, s, s' => (cond s == cond s') && stable child s s'
     | .ifElse cond y n,   s, s' => (cond s == cond s') && (if cond s then stable y s s' else stable n s s')
     | .keyedList ..,      _, _  => false
     | .dynNode _,         _, _  => false
@@ -191,41 +189,22 @@ mutual
       stable t s s' = true → applyValues t s' (View.render t s) = View.render t s' := by
     intro h
     cases t with
-    | text c        => simp [View.render, applyValues]
-    | dyn get       => simp [View.render, applyValues]
-    | static hh     => simp [View.render, applyValues]
-    | keyedList _ _ _ _ _ _ => simp [stable] at h
-    | dynNode get   => simp [stable] at h
     | element tag attrs kids =>
         simp only [View.render, applyValues]
         rw [applyValuesList_render kids s s' (by simpa [stable] using h)]
-    | showIf cond child =>
-        simp only [stable, Bool.and_eq_true] at h
-        have hc : cond s = cond s' := by simpa using h.1
-        simp only [View.render, applyValues, hc]
-        split
-        · exact applyValues_render child s s' h.2
-        · rfl
     | ifElse cond y no =>
-        simp only [stable, Bool.and_eq_true] at h
-        have hc : cond s = cond s' := by simpa using h.1
-        have hbr := h.2; rw [hc] at hbr
-        simp only [View.render, applyValues, hc]
-        split <;> rename_i hcond
-        · simp only [hcond, if_true] at hbr
-          exact applyValues_render y s s' hbr
-        · simp only [hcond, Bool.false_eq_true, if_false] at hbr
-          exact applyValues_render no s s' hbr
+        cases h₁ : cond s <;> cases h₂ : cond s' <;>
+          simp_all [stable, View.render, applyValues, applyValues_render y s s', applyValues_render no s s']
+    | _ => simp_all [stable, View.render, applyValues]
   /-- The sibling-list analogue. -/
   theorem applyValuesList_render (ts : List (View σ msg)) (s s' : σ) :
       stableList ts s s' = true → applyValuesList ts s' (View.renderEach ts s) = View.renderEach ts s' := by
-    intro h
     cases ts with
-    | nil       => simp [View.renderEach, applyValuesList]
+    | nil => simp [View.renderEach, applyValuesList]
     | cons k ks =>
-        simp only [stableList, Bool.and_eq_true] at h
-        simp only [View.renderEach, applyValuesList]
-        rw [applyValues_render k s s' h.1, applyValuesList_render ks s s' h.2]
+        simp only [stableList, Bool.and_eq_true, View.renderEach, applyValuesList]
+        rintro ⟨hk, hks⟩
+        rw [applyValues_render k s s' hk, applyValuesList_render ks s s' hks]
 end
 
 /-! ### The unconditional per-subtree update step
@@ -243,29 +222,25 @@ def patch (t : View σ msg) (s s' : σ) (old : Html msg) : Html msg :=
     `stable` precondition. The stable branch is `applyValues_render`; the rest is `diff_apply`. -/
 theorem patch_render (t : View σ msg) (s s' : σ) :
     patch t s s' (View.render t s) = View.render t s' := by
-  unfold patch
-  split
-  · rename_i hs; exact applyValues_render t s s' hs
-  · exact diff_apply (View.render t s) (View.render t s')
+  simp only [patch]
+  split <;> simp_all [applyValues_render, diff_apply]
 
 /-! ### Structural fingerprint for fine-grained list rows
 
 A `forEach` row whose dynamic leaves are all signals updates in place via `setSignal`. But a
-row part that `renderSig` bakes *statically*, an `ifElse`/`dynNode`/nested `keyedList`, or a
-`showIf` flip, is invisible to the signal path, so a change there would be silently missed.
-`collectShape` fingerprints exactly those parts; `forEach` folds the fingerprint into the row's
-reconciliation key, so such a change becomes a *key* change and reconciles through the verified
-keyed `diff` (`diffKeyed_apply`). Rows with no such parts (`hasOpaque` is `false`) keep the
-plain key and the untouched signal fast-path. -/
+row part that `renderSig` bakes statically can change without a signal update.
+`hasOpaque` selects ordinary keyed reconciliation for these rows, including dynamic
+attribute handlers and helper views. Serialized markup cannot detect changes to props
+or event closures. Fully signal-driven rows keep the signal fast path. -/
 
 mutual
   /-- Does this row template contain structure `renderSig` renders statically (so a change in
-      it can't be a signal and must reconcile through the key)? -/
+      it cannot be refreshed solely by signals)? -/
   def View.hasOpaque : View σ msg → Bool
     | .text _           => false
     | .dyn _            => false
-    | .element _ _ kids => View.hasOpaqueList kids
-    | .showIf _ _       => true     -- a shown↔hidden flip is structural, not a signal
+    | .element _ attrs kids =>
+        attrs.any (fun | .bind _ => true | _ => false) || View.hasOpaqueList kids
     | .ifElse ..        => true
     | .keyedList ..     => true
     | .static _         => false
@@ -279,12 +254,12 @@ mutual
   /-- A string fingerprint of the row's statically-rendered parts: empty for the signal leaves
       (`dyn`/`dynAttr`, handled by `setSignal`), the full rendered content for the opaque parts
       (`ifElse`/`dynNode`/nested `keyedList`) and the branch selector for a `showIf`. Differs
-      iff a change would be missed by the signal path, exactly when the key must change. -/
+      This summarizes markup only, not event closures or local-component props;
+      it must not be used as an equality test for skipping DOM updates. -/
   def View.collectShape : View σ msg → σ → String
     | .text _,          _ => ""
     | .dyn _,           _ => ""
     | .element _ _ kids, s => View.collectShapeList kids s
-    | .showIf cond child, s => if cond s then "1" ++ View.collectShape child s else "0"
     | .ifElse cond y no, s =>     -- only the branch SELECTOR is structural now; the branch's own
                                   -- leaves are signals, so a value change there needs no reconcile
         if cond s then "1" ++ View.collectShape y s else "0" ++ View.collectShape no s
@@ -317,7 +292,6 @@ mutual
     | .text _               => []
     | .dyn get              => [get]
     | .element _ attrs kids => dynValGets attrs ++ View.collectDynList kids
-    | .showIf _ child       => View.collectDyn child
     | .ifElse _ y no        => View.collectDyn y ++ View.collectDyn no   -- both branches: a fixed
                                                                           -- index range per branch
     | .keyedList ..         => []     -- a nested list owns its own signals
@@ -352,12 +326,9 @@ mutual
         let (attrs', n1) := renderSigAttrs s pre attrs n
         let (cs, n2) := View.renderSigList kids s pre n1
         (.element tag attrs' cs, n2)
-    | .showIf cond child, s, pre, n =>
-        if cond s then View.renderSig child s pre n
-        else (.text "", n + (View.collectDyn child).length)
     | .ifElse cond y no, s, pre, n =>
         -- render the active branch WITH signals from its reserved index range, then reserve the
-        -- inactive branch's range so leaf indices never shift across a flip (mirrors `showIf`).
+        -- inactive branch's range so leaf indices never shift across a flip.
         if cond s then
           let (h, n1) := View.renderSig y s pre n
           (h, n1 + (View.collectDyn no).length)
@@ -375,6 +346,33 @@ mutual
         let (hs, n'') := View.renderSigList ks s pre n'
         (h :: hs, n'')
 end
+
+/-! `showIf` uses the same conditional engine while preserving its rendering and
+    instrumentation contracts, including the indices reserved by a hidden child. -/
+
+@[simp] theorem View.render_showIf (cond : σ → Bool) (child : View σ msg) (s : σ) :
+    (View.showIf cond child).render s = (if cond s then child.render s else .text "") := rfl
+
+/-- A child that stays hidden needs no structural check, even if it contains a list. -/
+theorem View.stable_showIf_hidden (cond : σ → Bool) (child : View σ msg) (s s' : σ)
+    (h : cond s = false) (h' : cond s' = false) :
+    stable (View.showIf cond child) s s' = true := by
+  simp [View.showIf, stable, h, h']
+
+@[simp] theorem View.collectShape_showIf (cond : σ → Bool) (child : View σ msg) (s : σ) :
+    (View.showIf cond child).collectShape s =
+      (if cond s then "1" ++ child.collectShape s else "0") := by
+  simp [View.showIf, View.collectShape]
+
+@[simp] theorem View.collectDyn_showIf (cond : σ → Bool) (child : View σ msg) :
+    (View.showIf cond child).collectDyn = child.collectDyn := by
+  simp [View.showIf, View.collectDyn]
+
+@[simp] theorem View.renderSig_showIf (cond : σ → Bool) (child : View σ msg)
+    (s : σ) (pre : String) (n : Nat) :
+    (View.showIf cond child).renderSig s pre n =
+      (if cond s then child.renderSig s pre n else (.text "", n + child.collectDyn.length)) := by
+  simp [View.showIf, View.renderSig, View.collectDyn]
 
 /-! ### Surface combinators
 
@@ -462,34 +460,37 @@ def dynNode (get : σ → Html msg) : View σ msg := .dynNode get
     scope `α` and consumed here, off the `View σ` inductive. -/
 def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → String)
     (child : View α msg) (attrs : List (VAttr σ msg) := []) (sigPrefix : String := "") : View σ msg :=
-  -- the row's dynamic projections, collected once (index = signal suffix)
-  let projs := View.collectDyn child
-  -- the signal namespace for this list. Signals are a process-wide name→node map, so two lists
-  -- over the same row keys would collide; `sigPrefix` (filled per-list by `view%`) keeps them
-  -- disjoint. Defaults to "" so a lone direct `forEach` is unchanged.
-  let skey : α → String := fun a => sigPrefix ++ key a
-  -- the reconciliation key. If the row bakes any structure statically (`ifElse`/`dynNode`/…),
-  -- fold a fingerprint of it in, so a change there reconciles through the verified keyed
-  -- `diff` instead of being missed by the signal path. Plain rows keep the bare key.
-  let rkey : α → String :=
-    if View.hasOpaque child then (fun a => s!"{key a}\x00{View.collectShape child a}") else key
-  .keyedList tag attrs
-    (fun s => (items s).map rkey)                             -- keys: drive the structural decision
-    (fun s => (items s).map (fun a => Qed.refMark a))         -- marks: a per-row identity stamp
-    (fun s i => match (items s)[i]? with                      -- rowSig: row `i`'s signals, on demand
-      | some a => (projs.mapIdx fun j p => (s!"{skey a}#{j}", p a)).toArray
-      | none   => #[])
-    -- each row wrapped in `lazy (rkey a)`: a row's structure (its signal *names*, keyed by the
-    -- row key) is fixed by `rkey`, so on a reorder the diff matches by key and `lazyReuse`s the
-    -- row, the driver MOVES its existing DOM (keeping the bound signals) instead of recursing in
-    -- to rebuild/rebind it. Content changes still flow through the value path (signals), never here.
-    (fun s => ((items s).map fun a =>
-      Html.lazy (rkey a) (withKey (rkey a) (View.renderSig child a (skey a) 0).1)).toList)
+  -- Opaque helpers can change props or event closures without changing serialized
+  -- HTML. Reconcile those rows by stable identity; a markup fingerprint cannot
+  -- justify skipping their updates. Fully signal-driven rows retain the fast path.
+  if child.hasOpaque then
+    .dynNode fun s => .element tag (attrs.map (VAttr.eval s))
+      (((items s).map fun a => withKey (key a) (child.render a)).toList)
+  else
+    -- the row's dynamic projections, collected once (index = signal suffix)
+    let projs := View.collectDyn child
+    -- the signal namespace for this list. Signals are a process-wide name→node map, so two lists
+    -- over the same row keys would collide; `sigPrefix` (filled per-list by `view%`) keeps them
+    -- disjoint. Defaults to "" so a lone direct `forEach` is unchanged.
+    let skey : α → String := fun a => sigPrefix ++ key a
+    -- Pure signal rows keep the declared identity for reconciliation.
+    let rkey := key
+    .keyedList tag attrs
+      (fun s => (items s).map rkey)                             -- keys: drive the structural decision
+      (fun s => (items s).map (fun a => Qed.refMark a))         -- marks: a per-row identity stamp
+      (fun s i => match (items s)[i]? with                      -- rowSig: row `i`'s signals, on demand
+        | some a => (projs.mapIdx fun j p => (s!"{skey a}#{j}", p a)).toArray
+        | none   => #[])
+      -- each row wrapped in `lazy (rkey a)`: a row's structure (its signal *names*, keyed by the
+      -- row key) is fixed by `rkey`, so on a reorder the diff matches by key and `lazyReuse`s the
+      -- row, the driver MOVES its existing DOM (keeping the bound signals) instead of recursing in
+      -- to rebuild/rebind it. Content changes still flow through the value path (signals), never here.
+      (fun s => ((items s).map fun a =>
+        Html.lazy (rkey a) (withKey (rkey a) (View.renderSig child a (skey a) 0).1)).toList)
 
 end V
 -- `templated` (which builds an `App` from a `View`) now lives in `Qed.Runtime`, since `App`
 -- is defined there and `View` no longer imports `Runtime`.
-
 /-! ### `view%`: write a template like an ordinary view
 
 `view% fun m => …` lets a fine-grained template read like an ordinary `Model → Html`

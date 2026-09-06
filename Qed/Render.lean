@@ -92,39 +92,94 @@ def rawHtml? : List (Attr msg) → Option String
   | .rawHtml markup :: _ => some markup
   | _ :: rest           => rawHtml? rest
 
+/-- Shared element semantics; the child renderer is supplied by the traversal. -/
+def renderElement (renderKids : Array msg → String × Array msg) (hs : Array msg)
+    (tag : String) (attrs : List (Attr msg)) (children : List (Html msg)) : String × Array msg :=
+  let (attrStr,  hs1) := renderAttrs hs (normalizeAttrs attrs)
+  -- A `rawHtml` element emits its markup verbatim as content (the children are ignored),
+  -- so server markup matches what the driver sets via `innerHTML`.
+  if let some markup := rawHtml? attrs then
+    (s!"<{tag}{attrStr}>{markup}</{tag}>", hs1)
+  -- `<style>`/`<script>` are HTML "raw text" elements: their content is CDATA-like
+  -- (CSS/JS), so escaping `&`/`<` would corrupt it. Emit text children verbatim.
+  else if tag == "style" || tag == "script" then
+    -- raw-text content (CSS/JS) is emitted verbatim, but a `</style`/`</script` inside it
+    -- would close the element early and let following markup execute. Break the closing
+    -- sequence (`</` → `<\/`) so injected data can't escape; literal CSS/JS never needs `</`.
+    let raw := (String.join (children.map fun | .text s => s | _ => "")).replace "</" "<\\/"
+    (s!"<{tag}{attrStr}>{raw}</{tag}>", hs1)
+  else if voidTags.contains tag then
+    (s!"<{tag}{attrStr}>", hs1)   -- void element: no children, no closing tag
+  else
+    let (childStr, hs2) := renderKids hs1
+    (s!"<{tag}{attrStr}>{childStr}</{tag}>", hs2)
+
 mutual
-  /-- Render a node to HTML, accumulating the event-id ↦ message table. Pure and
-      total. -/
+  /-- Structural rendering specification, including the handler table. -/
   def renderNode (hs : Array msg) : Html msg → String × Array msg
     | .text s => (escapeHtml s, hs)
-    | .element tag attrs children =>
-        let (attrStr,  hs1) := renderAttrs hs (normalizeAttrs attrs)
-        -- A `rawHtml` element emits its markup verbatim as content (the children are ignored),
-        -- so server markup matches what the driver sets via `innerHTML`.
-        if let some markup := rawHtml? attrs then
-          (s!"<{tag}{attrStr}>{markup}</{tag}>", hs1)
-        -- `<style>`/`<script>` are HTML "raw text" elements: their content is CDATA-like
-        -- (CSS/JS), so escaping `&`/`<` would corrupt it. Emit text children verbatim.
-        else if tag == "style" || tag == "script" then
-          -- raw-text content (CSS/JS) is emitted verbatim, but a `</style`/`</script` inside it
-          -- would close the element early and let following markup execute. Break the closing
-          -- sequence (`</` → `<\/`) so injected data can't escape; literal CSS/JS never needs `</`.
-          let raw := (String.join (children.map fun | .text s => s | _ => "")).replace "</" "<\\/"
-          (s!"<{tag}{attrStr}>{raw}</{tag}>", hs1)
-        else if voidTags.contains tag then
-          (s!"<{tag}{attrStr}>", hs1)   -- void element: no children, no closing tag
-        else
-          let (childStr, hs2) := renderChildren hs1 children
-          (s!"<{tag}{attrStr}>{childStr}</{tag}>", hs2)
-    | .lazy _ sub => renderNode hs sub   -- transparent for the string renderer
-  /-- Render a list of children, threading the handler table. -/
+    | .element tag attrs children => renderElement (fun hs => renderChildren hs children) hs tag attrs children
+    | .lazy _ sub => renderNode hs sub
   def renderChildren (hs : Array msg) : List (Html msg) → String × Array msg
-    | []      => ("", hs)
+    | [] => ("", hs)
     | c :: cs =>
         let (s1, hs1) := renderNode hs c
         let (s2, hs2) := renderChildren hs1 cs
         (s1 ++ s2, hs2)
 end
+
+mutual
+  /-- Runtime renderer: sibling strings accumulate as fragments, then join once. -/
+  def renderNodeTR (hs : Array msg) : Html msg → String × Array msg
+    | .text s => (escapeHtml s, hs)
+    | .element tag attrs children =>
+        renderElement (fun hs => renderChildrenTR hs [] children) hs tag attrs children
+    | .lazy _ sub => renderNodeTR hs sub
+  def renderChildrenTR (hs : Array msg) (rev : List String) : List (Html msg) → String × Array msg
+    | [] => (String.join rev.reverse, hs)
+    | c :: cs =>
+        let (str, hs') := renderNodeTR hs c
+        renderChildrenTR hs' (str :: rev) cs
+end
+
+private theorem join_append (xs ys : List String) :
+    String.join (xs ++ ys) = String.join xs ++ String.join ys := by
+  induction xs with
+  | nil => simp
+  | cons x xs ih => simp [ih, String.append_assoc]
+
+mutual
+  theorem renderNodeTR_eq (hs : Array msg) (h : Html msg) : renderNodeTR hs h = renderNode hs h := by
+    cases h with
+    | text s => rfl
+    | lazy k sub => exact renderNodeTR_eq hs sub
+    | element tag attrs children =>
+        unfold renderNodeTR renderNode
+        congr 1
+        funext table
+        simpa using renderChildrenTR_eq table [] children
+  theorem renderChildrenTR_eq (hs : Array msg) (rev : List String) (cs : List (Html msg)) :
+      renderChildrenTR hs rev cs =
+        (String.join rev.reverse ++ (renderChildren hs cs).1, (renderChildren hs cs).2) := by
+    cases cs with
+    | nil => simp [renderChildrenTR, renderChildren]
+    | cons c cs =>
+        simp only [renderChildrenTR, renderNodeTR_eq, renderChildren]
+        rw [renderChildrenTR_eq]
+        simp [List.reverse_cons, join_append, String.append_assoc]
+end
+
+/-- Compilation uses the tail-recursive traversal; proofs retain the structural equations. -/
+@[csimp] theorem renderNode_eq_renderNodeTR : @renderNode = @renderNodeTR := by
+  funext msg hs h
+  exact (renderNodeTR_eq hs h).symm
+
+def renderChildrenFast (hs : Array msg) (cs : List (Html msg)) : String × Array msg :=
+  renderChildrenTR hs [] cs
+
+@[csimp] theorem renderChildren_eq_renderChildrenFast : @renderChildren = @renderChildrenFast := by
+  funext msg hs cs
+  simpa [renderChildrenFast] using (renderChildrenTR_eq hs [] cs).symm
 
 /-- Render a node to an HTML string (model data escaped). The total renderer: a
     local host renders *empty* (the driver fills it in the browser). Used for native

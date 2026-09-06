@@ -68,14 +68,12 @@ namespace ForEach
 /-- `push` keeps `P` for every element, given it holds of the appended one (the `add` arm). -/
 theorem forall_push {α} {P : α → Prop} {a : Array α} {x : α}
     (h : ∀ y ∈ a, P y) (hx : P x) : ∀ y ∈ a.push x, P y := by
-  intro y hy; rw [Array.mem_push] at hy; rcases hy with hy | rfl
-  · exact h y hy
-  · exact hx
+  simpa only [Array.mem_push, or_imp, forall_and, forall_eq] using And.intro h hx
 
 /-- `filter` keeps `P` for every element, it only drops elements (the `remove` arm). -/
 theorem forall_filter {α} {P : α → Prop} {a : Array α} {f : α → Bool}
     (h : ∀ y ∈ a, P y) : ∀ y ∈ a.filter f, P y := by
-  intro y hy; rw [Array.mem_filter] at hy; exact h y hy.1
+  simpa only [Array.mem_filter, and_imp] using fun y hy _ => h y hy
 
 /-- `map g` keeps `P` for every element when `g` does, elementwise. -/
 theorem forall_map {α} {P : α → Prop} {a : Array α} {g : α → α}

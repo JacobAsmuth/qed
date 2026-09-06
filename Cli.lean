@@ -342,6 +342,9 @@ def cmdStart : IO UInt32 := do
 
 def cmdTest : IO UInt32 := do
   let mut failed := false
+  if (← (FilePath.mk "test" / "dom_equivalence_test.mjs").pathExists) then
+    step "comparing incremental DOM updates with fresh rendering"
+    if (← sh "node" #["test/dom_equivalence_test.mjs"]) != 0 then failed := true
   -- Counter: build the default web entry, then drive it.
   if (← (FilePath.mk "test" / "browser_test.mjs").pathExists) then
     if (← cmdBuild (prod := false)) != 0 then return 1

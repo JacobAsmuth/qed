@@ -64,10 +64,12 @@ structure LocalInstance where
 def registerHandler {α : Type} (tbl : IO.Ref (Array α)) (node : Dom.Node)
     (key : String) (v : α) : IO Unit := do
   let ts ← tbl.get
+  -- Capture the slot before push: the JavaScript runtime may grow this array in place.
+  let next := toString ts.size
   match (← Dom.getAttribute node key).toNat? with
   | some i => if i < ts.size then tbl.set (ts.set! i v)
-              else do tbl.set (ts.push v); Dom.setAttribute node key (toString ts.size)
-  | none   => do tbl.set (ts.push v); Dom.setAttribute node key (toString ts.size)
+              else do tbl.set (ts.push v); Dom.setAttribute node key next
+  | none   => do tbl.set (ts.push v); Dom.setAttribute node key next
 
 /-- Install one attribute on a DOM node, registering event handlers as it goes (idempotent
     per node via `registerHandler`, so re-applying keeps a handler fresh, not duplicated).
@@ -102,7 +104,18 @@ def applyAttr (h : Handlers msg) (node : Dom.Node) : Attr msg → IO Unit
 /-- Apply a (normalized) attribute list, so the live DOM matches what `render`
     would produce — classes merged, duplicate keys collapsed. -/
 def applyAttrs (h : Handlers msg) (node : Dom.Node) (attrs : List (Attr msg)) : IO Unit := do
-  for a in normalizeAttrs attrs do applyAttr h node a
+  let attrs := normalizeAttrs attrs
+  let names := attrs.filterMap fun
+    | .cls _ => some "class"
+    | .attr k _ | .flag k _ => some k
+    | .on e _ => some s!"data-qed-on-{e}"
+    | .onValue e _ => some s!"data-qed-onv-{e}"
+    | .localCell .. => some "data-qed-local"
+    | .signalAttr _ a _ => some a
+    | .signalBind _ => some "data-qed-signal"
+    | _ => none
+  Dom.retainAttributes node (Json.render (.arr (names.map Json.str)))
+  for a in attrs do applyAttr h node a
 
 /-- Re-apply an element's *scope-dependent* template attributes against the new scope:
     a `dynVal` value, and a `bind` (a scope-reading attribute or event). Static attrs were
@@ -111,6 +124,11 @@ def applyAttrs (h : Handlers msg) (node : Dom.Node) (attrs : List (Attr msg)) : 
     growing the table. Shared by the element and keyed-list-container patch paths, so a
     plain element and a list container update by the same rule. -/
 def applyDynAttrs (h : Handlers msg) (node : Dom.Node) (attrs : List (VAttr σ msg)) (s : σ) : IO Unit := do
+  -- A bound Attr can change its name or disappear after normalization. Reconcile the
+  -- complete set in that case; simple value bindings keep the direct update path.
+  if attrs.any (fun | .bind _ => true | _ => false) then
+    applyAttrs h node (attrs.map (VAttr.eval s))
+    return
   for va in attrs do
     match va with
     | .bind f          => applyAttr h node (f s)
@@ -317,11 +335,44 @@ partial def freeCells (cells : CondCells σ msg) : VState σ msg → IO Unit
   | .elem _ ks => ks.forM (freeCells cells)
   | _          => pure ()
 
-/-- key → its index in the list, for the reorder fast path (which relocates a list's existing
-    DOM nodes by key instead of rebuilding them). Mirrors `Qed.keyIndex`, on a key array. -/
+/-- Index a previously validated key array for aligning surviving rows. -/
 def keyPos (keys : Array String) : Std.HashMap String Nat :=
   (keys.foldl (init := ((∅ : Std.HashMap String Nat), 0)) fun (m, i) k =>
     (m.insert k i, i + 1)).1
+
+/-- Fine-grained rows share signal names by key, so positional fallback is insufficient.
+    Reject duplicate identities before seeding signals or moving their DOM nodes. -/
+def checkRowKeys (keys : Array String) : IO Unit := do
+  let mut seen : Std.HashMap String Unit := ∅
+  for k in keys do
+    if seen.contains k then
+      throw (IO.userError s!"Qed: duplicate sibling key {k}")
+    seen := seen.insert k ()
+
+/-- The old row data aligned to the next key order, ready for patching and signal updates. -/
+structure AlignedRows (msg : Type) where
+  rows : Array (Html msg) := #[]
+  marks : Array USize := #[]
+  sigs : Array (Array (String × String)) := #[]
+
+/-- One lookup per key supplies its row, mark, and signals. Render fresh rows only when
+    the first new key appears, and share that result for any other additions. -/
+def alignRows (keys : Array String) (oldPos : Std.HashMap String Nat)
+    (oldRows : Array (Html msg)) (oldMarks : Array USize)
+    (oldSigs : Array (Array (String × String)))
+    (fresh : Unit → Array (Html msg)) : AlignedRows msg := Id.run do
+  let mut aligned : AlignedRows msg := {}
+  let mut freshRows : Option (Array (Html msg)) := none
+  for key in keys do
+    let (row, mark, sig) ← match oldPos[key]? with
+      | some i => pure (oldRows.getD i default, oldMarks.getD i 0, oldSigs.getD i #[])
+      | none => do
+          let rows := match freshRows with | some rows => rows | none => fresh ()
+          freshRows := some rows
+          pure (rows.getD aligned.rows.size default, 0, #[])
+    aligned := { rows := aligned.rows.push row, marks := aligned.marks.push mark,
+                 sigs := aligned.sigs.push sig }
+  return aligned
 
 /-- Collect the leaves of one row whose value moved since last render (`old`), as
     `(prefixed-name, value)` to `setSignal`. Pure + tail-recursive over a row's few signals. -/
@@ -386,14 +437,13 @@ partial def buildView (h : Handlers msg) (cells : CondCells σ msg) (ns : String
         Dom.appendChild node kn
         ks := ks.push kst
       return (node, .elem node ks)
-  -- `showIf` is `ifElse` with an empty else-branch; both build the active branch through `buildCond`.
-  | .showIf cond child, s => buildCond h cells ns cond child (.text "") s
   | .ifElse cond yes no, s => buildCond h cells ns cond yes no s
   | .dynNode get, s => do
       let html := get s
       let n ← buildDom h ns html
       return (n, .dynNode (← IO.mkRef n) (← IO.mkRef html))
   | .keyedList tag attrs keys marks rowSig rowsHtml, s => do
+      checkRowKeys (keys s)
       let node ← Dom.createElement ns tag
       applyAttrs h node (attrs.map (VAttr.eval s))
       -- a per-instance signal namespace (the container's unique node id), so two lists over
@@ -424,7 +474,6 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
       for k in kids do
         patchView h cells node i k s (kstates.getD i.toNat default)
         i := i + 1
-  | .showIf cond child, s, .cond idx => patchCond h cells parent index cond child (.text "") s idx
   | .ifElse cond yes no, s, .cond idx => patchCond h cells parent index cond yes no s idx
   | .dynNode get, s, .dynNode nref last => do
       let newHtml := get s
@@ -448,6 +497,7 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
         let newSigs ← seedRows inst (rowSig s) newMarks (← lastMarks.get) (← lastSigs.get)
         lastSigs.set newSigs; lastMarks.set newMarks
       else
+        checkRowKeys newKeys
         -- STRUCTURAL update — one path for add, remove, reorder, first-fill, and any mix. Align each
         -- new row to its old slot BY KEY: an existing key REUSES its row (and its mark/sig), so a
         -- reorder permutes the rows with no rebuild and a moved-but-unchanged row carries forward; a
@@ -459,16 +509,12 @@ partial def patchView (h : Handlers msg) (cells : CondCells σ msg)
         let oldRows  := oldRowsL.toArray
         let oldMarks ← lastMarks.get
         let oldSigs  ← lastSigs.get
-        let fresh : Array (Html msg) :=
-          if newKeys.all oldPos.contains then #[]                    -- nothing added ⇒ reuse all, never rebuild
-          else ((rowsHtml s).map (Html.prefixSignals inst)).toArray  -- something added ⇒ build, take the new rows
-        let newRows := (newKeys.mapIdx (fun j k => match oldPos[k]? with
-                        | some op => oldRows.getD op default          -- existing key: reuse its row
-                        | none    => fresh.getD j default)).toList    -- new key: freshly built
-        let newSigs ← seedRows inst (rowSig s) newMarks
-          (newKeys.map (fun k => ((oldPos[k]?).map (fun op => oldMarks.getD op 0)).getD 0))
-          (newKeys.map (fun k => ((oldPos[k]?).map (fun op => oldSigs.getD op #[])).getD #[]))
+        let aligned := alignRows newKeys oldPos oldRows oldMarks oldSigs
+          (fun _ => ((rowsHtml s).map (Html.prefixSignals inst)).toArray)
+        let newRows := aligned.rows.toList
+        let newSigs ← seedRows inst (rowSig s) newMarks aligned.marks aligned.sigs
         if oldRowsL.isEmpty then
+          applyDynAttrs h node attrs s
           -- empty → N: every row is new. Build the whole batch into one off-DOM `DocumentFragment`,
           -- then commit it to the (live) container in a single `appendChild`, so the connected tree
           -- is touched once instead of N times.
@@ -543,13 +589,6 @@ partial def hydrateView (h : Handlers msg) (cells : CondCells σ msg) :
         ks := ks.push (← hydrateView h cells k s kn)
         i := i + 1
       return .elem node ks
-  -- `showIf` is `ifElse` with an empty else-branch; both hydrate the active branch over `node`
-  -- (a hidden one is an empty text the parent re-inserted as a placeholder, via `rendersEmpty`).
-  | .showIf cond child, s, node => do
-      let idx ← allocCell cells
-      let cst ← hydrateView h cells (if cond s then child else .text "") s node
-      cells.modify (fun (cs, fr) => (cs.set! idx (cond s, some cst), fr))
-      return .cond idx
   | .ifElse cond yes no, s, node => do
       let idx ← allocCell cells
       let cst ← hydrateView h cells (if cond s then yes else no) s node
@@ -560,6 +599,7 @@ partial def hydrateView (h : Handlers msg) (cells : CondCells σ msg) :
       hydrateDom h html node
       return .dynNode (← IO.mkRef node) (← IO.mkRef html)
   | .keyedList _ attrs keys marks rowSig rowsHtml, s, node => do
+      checkRowKeys (keys s)
       clearHandlerIds node
       applyAttrs h node (attrs.map (VAttr.eval s))
       let inst := s!"§{node}§"

@@ -22,8 +22,16 @@ import Examples.Socket
 #print axioms Chat.streamSafe        -- invariant: effect safety on an effectful transition (`:=` proof)
 #print axioms Qed.diff_apply         -- VDOM diff/patch correctness
 #print axioms Qed.diffChildren_apply -- child reconcile, any matcher (positional + keyed), any lengths
+#print axioms Qed.applyChildrenTR_toList -- optimized child traversal = structural map
+#print axioms Qed.renderNode_eq_renderNodeTR -- compiler rewrite preserves markup and handler table
+#print axioms Qed.renderChildren_eq_renderChildrenFast
 #print axioms Qed.applyValues_render -- View template value-patch = full re-render (stable structure)
 #print axioms Qed.patch_render       -- View template update step = full re-render (any structure)
+#print axioms Qed.View.render_showIf
+#print axioms Qed.View.stable_showIf_hidden
+#print axioms Qed.View.collectShape_showIf
+#print axioms Qed.View.collectDyn_showIf
+#print axioms Qed.View.renderSig_showIf
 #print axioms Qed.parse_depth_le     -- JSON depth bound
 #print axioms Qed.Route.round_trip   -- routing round-trip
 #print axioms Qed.TypedRoute.round_trip  -- routing round-trip with typed Nat/Int params

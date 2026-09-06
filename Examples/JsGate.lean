@@ -78,6 +78,9 @@ def run (probe i : Nat) : String :=
   | 6 => arrP i
   | 7 => routeP i
   | 8 => segP i
+  | 9 => JsProbe.childPatchCase i
+  | 10 => JsProbe.wideRenderCase i
+  | 11 => JsProbe.keyIndexCase i
   | _ => ""
 
 def counts (probe : Nat) : Nat :=
@@ -91,11 +94,15 @@ def counts (probe : Nat) : Nat :=
   | 6 => 12
   | 7 => routes.size
   | 8 => routes.size
+  | 9 => 5
+  | 10 => 5
+  | 11 => 6
   | _ => 0
 
-def probeCount : Nat := 9
+def probeCount : Nat := 12
 
-def names : Array String := #["render", "diff", "arith", "string", "json", "date", "array", "router", "seg"]
+def names : Array String := #["render", "diff", "arith", "string", "json", "date", "array", "router", "seg",
+  "childPatch", "wideRender", "keyIndex"]
 
 /-- A JSON string literal, so outputs containing tabs/newlines survive the line format. -/
 def jsonStr (s : String) : String :=

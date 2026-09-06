@@ -20,6 +20,7 @@ const SVG_NS   = 'http://www.w3.org/2000/svg';
 const XLINK_NS = 'http://www.w3.org/1999/xlink';
 const XML_NS   = 'http://www.w3.org/XML/1998/namespace';
 const attrNS = (k) => k.startsWith('xlink:') ? XLINK_NS : (k.startsWith('xml:') ? XML_NS : null);
+const managedAttrs = new WeakMap();
 
 export const dom = {
   // `ns` is the namespace the parent established for its children (see childNamespace); "" is the
@@ -32,6 +33,22 @@ export const dom = {
   createFragment(w)     { const N = Q().nodes; N.push(document.createDocumentFragment()); return ok(N.length - 1, w); },
   setAttribute(node, k, v, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) { if (el.getAttributeNS(ns, k.slice(k.indexOf(':') + 1)) !== v) el.setAttributeNS(ns, k, v); } else if (el.getAttribute(k) !== v) el.setAttribute(k, v); } return ok(PUnit, w); },
   removeAttribute(node, k, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) el.removeAttributeNS(ns, k.slice(k.indexOf(':') + 1)); else el.removeAttribute(k); } return ok(PUnit, w); },
+  retainAttributes(node, namesJson, w) {
+    const el = Q().nodes[node];
+    if (!el?.attributes) return ok(PUnit, w);
+    const names = new Set(JSON.parse(namesJson));
+    // Track only framework-owned names. Hydration or userland may attach unrelated
+    // attributes (including node-identity sentinels), which reconciliation must preserve.
+    const previous = managedAttrs.get(el) || names;
+    // `value` is normally written as a property and has no corresponding attribute.
+    if (previous.has('value') && !names.has('value')) el.value = '';
+    if (previous.has('checked') && !names.has('checked')) el.checked = false;
+    for (const attr of [...el.attributes]) {
+      if (previous.has(attr.name) && !names.has(attr.name)) el.removeAttributeNS(attr.namespaceURI, attr.localName);
+    }
+    managedAttrs.set(el, names);
+    return ok(PUnit, w);
+  },
   getAttribute(node, k, w)    { const el = Q().nodes[node]; const v = el ? el.getAttribute(k) : null; return ok(v == null ? '' : v, w); },
   appState(w) { const el = document.getElementById('qed-state'); return ok(el ? el.textContent : '', w); },
   clearHandlers(node, w) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # qed installer.  Usage:
-#   curl -sSfL https://raw.githubusercontent.com/JacobAsmuth/qed/main/install.sh | sh
+#   curl -sSfL https://raw.githubusercontent.com/JacobAsmuth/qed/main/install.sh | bash
 #
 # Installs the Lean toolchain (elan) if missing, fetches the qed framework into
 # ~/.qed/qed, builds the qed CLI, and puts a `qed` launcher on PATH. `qed build`

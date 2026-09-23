@@ -21,7 +21,7 @@ No external package deps (`lake-manifest.json` is empty), so there is nothing el
 ## 2. Build the framework — `lake build Qed`
 
 Surfaces core/`Std` API churn in the framework itself. These are ordinary deprecations/renames; the
-error or warning names the fix. From v4.15 → v4.30:
+error or warning often includes a suggested replacement. From v4.15 → v4.30:
 
 - `String.mk` → `String.ofList`, `String.data` → `String.toList` (deprecations).
 - `Array.mkArray` → `Array.replicate`.

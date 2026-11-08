@@ -30,7 +30,7 @@ for (const [f, url] of [
 }
 
 console.log('▸ building Qed bench app (Examples.Bench.AppWeb → .qed/dev)…');
-if (spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.Bench.AppWeb ./qed build --dev`], { stdio: 'inherit' }).status !== 0) {
+if (spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.Bench.AppWeb ./scripts/qed build --dev`], { stdio: 'inherit' }).status !== 0) {
   console.error('build failed'); process.exit(1);
 }
 

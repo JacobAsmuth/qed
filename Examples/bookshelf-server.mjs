@@ -1,6 +1,6 @@
 // Local demo API + generated SSR handler. Books live in memory until restart.
 // From the repo root:
-//   QED_WEB_ROOT=Examples.BookshelfWeb ./qed build --dev
+//   QED_WEB_ROOT=Examples.BookshelfWeb ./scripts/qed build --dev
 //   node Examples/bookshelf-server.mjs
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';

@@ -8,7 +8,7 @@
     page's first paint is the real UI and the client just mounts over it; and
   * a sanity check that a few reachable states produce the markup we expect.
 
-  `lake exe counter` (or `./qed` native build). The static document goes to stdout.
+  `lake exe counter` (or `./scripts/qed` native build). The static document goes to stdout.
 -/
 import Examples.Counter
 

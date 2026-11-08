@@ -15,8 +15,8 @@ const ROOT = new URL('..', import.meta.url).pathname;
 const SERVE = path.join(ROOT, '.qed', 'dev');
 const PORT = 8188;
 
-console.log('▸ building (QED_WEB_ROOT=Examples.BookshelfWeb ./qed build --dev)…');
-if (spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.BookshelfWeb ./qed build --dev`], { stdio: 'inherit' }).status !== 0) {
+console.log('▸ building (QED_WEB_ROOT=Examples.BookshelfWeb ./scripts/qed build --dev)…');
+if (spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.BookshelfWeb ./scripts/qed build --dev`], { stdio: 'inherit' }).status !== 0) {
   console.error('build failed'); process.exit(1);
 }
 

@@ -522,18 +522,22 @@ open Lean Elab Command in
         let pk := pfs.map fun f => Syntax.mkStrLit (toString f.getId)
         let pp ← (pfs.zip pk).mapM fun (f, k) => `(($k, toJson (x.$f:ident)))
         let pd ← (ptys.zip pk).mapM fun (ty, k) => `((FromJsonField.fromField j $k : Except String $ty))
+        let propsToJsonId   := mkIdent (t.getId ++ `Props ++ `instToJson)
+        let propsFromJsonId := mkIdent (t.getId ++ `Props ++ `instFromJson)
         cmds := cmds ++ #[
-          ← `(command| instance : ToJson $propsId := ⟨fun x => Json.obj [$[$pp],*]⟩),
-          ← `(command| instance : FromJson $propsId := ⟨fun j => do
+          ← `(command| instance $propsToJsonId:ident : ToJson $propsId := ⟨fun x => Json.obj [$[$pp],*]⟩),
+          ← `(command| instance $propsFromJsonId:ident : FromJson $propsId := ⟨fun j => do
             $[let $pfs:ident ← $pd:term]*
             return { $[$pfs:ident],* }⟩)]
+      let stateToJsonId   := mkIdent (t.getId ++ `State ++ `instToJson)
+      let stateFromJsonId := mkIdent (t.getId ++ `State ++ `instFromJson)
       cmds := cmds ++ #[
           ← `(command| def $toJsonId (x : $stateId) : Json := Json.obj [$[$pairs],*]),
           ← `(command| def $fromJsonId (j : Json) : Except String $stateId := do
                 $[let $fs:ident ← $decodes:term]*
                 return { $[$fs:ident],* }),
-          ← `(command| instance : ToJson $stateId := ⟨$toJsonId⟩),
-          ← `(command| instance : FromJson $stateId := ⟨$fromJsonId⟩)]
+          ← `(command| instance $stateToJsonId:ident : ToJson $stateId := ⟨$toJsonId⟩),
+          ← `(command| instance $stateFromJsonId:ident : FromJson $stateId := ⟨$fromJsonId⟩)]
       if ds.all (·.isSome) then
         let dsT := ds.filterMap id
         cmds := cmds ++ #[

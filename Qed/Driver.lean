@@ -640,7 +640,10 @@ partial def spawnInstance (ctx : LocalCtx) (fk : String) (ldef : LocalDef) (s0 p
           | none      => pure ()) k c i p b hn }
   let view := (ldef.viewProps.map (fun f => f props)).getD ldef.view
   let tree := view s0
-  Dom.appendChild host (← buildDom lh (← Dom.childNamespace host) tree)
+  if (← Dom.childCount host) > 0 then
+    hydrateDom lh tree (← Dom.childAt host 0)
+  else
+    Dom.appendChild host (← buildDom lh (← Dom.childNamespace host) tree)
   let tRef ← IO.mkRef tree
   ctx.instances.modify (·.insert fk
     { handlers := lh, treeRef := tRef, host := host, view, props, onOutput := onOut })

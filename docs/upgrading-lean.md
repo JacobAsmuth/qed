@@ -83,9 +83,9 @@ instance (e.g. `Array.get!Internal`'s `[Inhabited α]`) takes that instance as a
 ## 6. Validate
 
 ```bash
-./qed check                 # proofs replay, axiom-clean, no sorry — the verification gate
+./scripts/qed check                 # proofs replay, axiom-clean, no sorry — the verification gate
 node test/js_gate_test.mjs  # 96/96 — transpiled JS == native Lean
-./qed test                  # the full browser suite (apps cover HTTP/streaming/ws/timers/SSR)
+./scripts/qed test                  # the full browser suite (apps cover HTTP/streaming/ws/timers/SSR)
 ```
 
 The gate is the contract: it pins the transpiled JavaScript to the native Lean semantics, so a

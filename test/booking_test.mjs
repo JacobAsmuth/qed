@@ -13,7 +13,7 @@ const PORT = 8127;
 const SERVE = `${ROOT}.qed/dev`;
 
 console.log('▸ building booking (Examples.BookingWeb → .qed/dev)…');
-const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.BookingWeb ./qed build --dev`],
+const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.BookingWeb ./scripts/qed build --dev`],
   { stdio: 'inherit' });
 if (build.status !== 0) { console.error('build failed'); process.exit(1); }
 

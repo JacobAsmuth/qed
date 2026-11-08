@@ -18,7 +18,7 @@ const PORT = 8134;
 const SERVE = `${ROOT}.qed/dev`;
 
 console.log('▸ building local-state demo (Examples.LocalWeb → .qed/dev)…');
-const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.LocalWeb ./qed build --dev`],
+const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.LocalWeb ./scripts/qed build --dev`],
   { stdio: 'inherit' });
 if (build.status !== 0) { console.error('build failed'); process.exit(1); }
 

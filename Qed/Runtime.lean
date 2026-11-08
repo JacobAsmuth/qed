@@ -645,7 +645,7 @@ def renderDocument (title : String) (appHtml : String) (script : String := "/qed
     ++ "<title>" ++ escapeHtml title ++ "</title></head>\n"
     ++ "<body><div id=\"app\">" ++ appHtml ++ "</div>\n"
     ++ (if state.isEmpty then ""
-        else "<script id=\"qed-state\" type=\"application/json\">" ++ state.replace "</" "<\\/" ++ "</script>\n")
+        else "<script id=\"qed-state\" type=\"application/json\">" ++ "<\\/".intercalate (state.splitOn "</") ++ "</script>\n")
     ++ "<script type=\"module\" src=\"" ++ script ++ "\"></script>\n</body>\n</html>"
 
 end Qed

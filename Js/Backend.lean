@@ -124,7 +124,9 @@ def ctorVal (i : CtorInfo) (ys : Array Arg) : String :=
   if i.size == 0 && i.usize == 0 && i.ssize == 0 then toString i.cidx
   else
     let fs := String.intercalate ", " (ys.toList.map emitArg)
-    "{t: " ++ toString i.cidx ++ ", f: [" ++ fs ++ "], s: {}, u: {}}"
+    let s := if i.ssize == 0 then "" else ", s: {}"
+    let u := if i.usize == 0 then "" else ", u: {}"
+    s!"\{t: {i.cidx}, f: [{fs}]{s}{u}}"
 
 /-- Byte-offset key for a packed scalar field (mirrors EmitC `emitOffset`). -/
 def soff (n offset : Nat) : String := s!"\"{n}_{offset}\""

@@ -26,7 +26,8 @@ export function app(clo, extra) {
 const W = 0;                                  // the IO world token
 export const PUnit = 0, Unit = 0;
 export const ioVal = (r) => r.f[0];           // value out of an EStateM.Result.ok(v, w)
-export const tc = (a) => ({ __tc: a });        // tail-self-call marker (trampoline; see Js.Backend)
+const _TC = { __tc: null };
+export const tc = (a) => (_TC.__tc = a, _TC); // tail-self-call marker (trampoline; see Js.Backend)
 // A module global: computed once, then SHARED by every reference — so it is persistent. Freeze
 // any array it yields (refcount → ∞) so a mutator always copies it instead of mutating the one
 // shared instance in place (mirrors Lean marking top-level constants persistent). `inc`/`dec`
@@ -35,8 +36,8 @@ export function memo(f) { let v, done = false; return () => { if (!done) { v = f
 // v4.30 erased the IO RealWorld token: an IO result is a single-field `EST.Out` carrying just
 // the value/error (no world). The monad wraps `pure`/return in `EST.Out.ok`; a fallible IO
 // extern returns one of these, a BaseIO extern returns its value directly (see ST.Prim below).
-export const mkOk  = (v) => ({ t: 0, f: [v], s: {}, u: {} });   // EST.Out.ok
-export const mkErr = (e) => ({ t: 1, f: [e], s: {}, u: {} });   // EST.Out.error
+export const mkOk  = (v) => ({ t: 0, f: [v] });                 // EST.Out.ok
+export const mkErr = (e) => ({ t: 1, f: [e] });                 // EST.Out.error
 
 // ---- Int (BigInt) -----------------------------------------------------------
 export const Int_add = (a, b) => a + b;
@@ -100,7 +101,7 @@ export const Char_ofNatAux = (n, _h) => Number(n);
 
 // ---- list <-> array helpers (List.nil = 0, List.cons = {t:1,f:[h,t]}) -------
 const NIL = 0;
-const cons = (h, t) => ({ t: 1, f: [h, t], s: {}, u: {} });
+const cons = (h, t) => ({ t: 1, f: [h, t] });
 export function listToArray(l) { const a = []; while (typeof l === 'object' && l !== null) { a.push(l.f[0]); l = l.f[1]; } return a; }
 export function arrayToList(a) { let l = NIL; for (let i = a.length - 1; i >= 0; i--) l = cons(a[i], l); return l; }
 
@@ -142,49 +143,73 @@ export const Array_set = (a, i, x) => { const b = owned(a) ? a : own(a.slice());
 export const Array_setx33 = (a, i, x) => { const b = owned(a) ? a : own(a.slice()); b[Number(i)] = x; return b; };  // set!
 
 // ---- String (JS string; Pos = UTF-8 byte offset) ----------------------------
-const ENC = new TextEncoder();
-const u8len = (cp) => cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;   // UTF-8 length of a codepoint
+const ENC = new TextEncoder(), DEC = new TextDecoder(), DEC_FATAL = new TextDecoder('utf-8', { fatal: true });
+const _strCache = new Map();
+function getStrInfo(s) {
+  let info = _strCache.get(s);
+  if (info !== undefined) return info;
+  let ascii = true;
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) >= 0x80) { ascii = false; break; }
+  }
+  const bytes = ascii ? null : ENC.encode(s);
+  const len = ascii ? s.length : bytes.length;
+  info = { ascii, bytes, len };
+  if (_strCache.size >= 256) _strCache.clear();
+  _strCache.set(s, info);
+  return info;
+}
 export const String_append = (a, b) => a + b;
-export const String_length = (s) => { let n = 0n; for (const _ of s) n++; return n; };
-export const String_utf8ByteSize = (s) => BigInt(ENC.encode(s).length);
+export const String_length = (s) => {
+  if (getStrInfo(s).ascii) return BigInt(s.length);
+  let n = 0n; for (const _ of s) n++; return n;
+};
+export const String_utf8ByteSize = (s) => BigInt(getStrInfo(s).len);
 export const String_push = (s, c) => s + String.fromCodePoint(c);
 export const String_decEq = (a, b) => a === b ? 1 : 0;
 export const String_decLt = (a, b) => {
-  const x = [...a], y = [...b];
-  for (let i = 0; i < x.length && i < y.length; i++) {
-    const cx = x[i].codePointAt(0), cy = y[i].codePointAt(0);
+  for (let i = 0, j = 0; i < a.length && j < b.length; ) {
+    const cx = a.codePointAt(i), cy = b.codePointAt(j);
     if (cx !== cy) return cx < cy ? 1 : 0;
+    i += cx > 0xFFFF ? 2 : 1;
+    j += cy > 0xFFFF ? 2 : 1;
   }
-  return x.length < y.length ? 1 : 0;
+  return a.length < b.length ? 1 : 0;
 };
 // codepoint at byte offset `pos`; returns [codepoint, utf8len, utf16len]
 function atByte(s, pos) {
-  let b = 0;
-  for (const ch of s) {
-    const cp = ch.codePointAt(0), l = u8len(cp);
-    if (b === pos) return [cp, l, ch.length];
-    b += l;
-  }
-  return [0, 1, 1];   // at/after end: '\0'
+  const info = getStrInfo(s);
+  if (pos >= info.len) return [0, 1, 1];   // at/after end: '\0'
+  if (info.ascii) return [s.charCodeAt(pos), 1, 1];
+  const bytes = info.bytes, b0 = bytes[pos];
+  if (b0 < 0x80) return [b0, 1, 1];
+  if (b0 < 0xE0) return [((b0 & 0x1F) << 6) | (bytes[pos + 1] & 0x3F), 2, 1];
+  if (b0 < 0xF0) return [((b0 & 0x0F) << 12) | ((bytes[pos + 1] & 0x3F) << 6) | (bytes[pos + 2] & 0x3F), 3, 1];
+  return [((b0 & 0x07) << 18) | ((bytes[pos + 1] & 0x3F) << 12) | ((bytes[pos + 2] & 0x3F) << 6) | (bytes[pos + 3] & 0x3F), 4, 2];
 }
 export const String_get = (s, pos) => atByte(s, Number(pos))[0];
 export const String_next = (s, pos) => { const p = Number(pos); return BigInt(p + atByte(s, p)[1]); };
 export const String_prev = (s, pos) => {
-  const target = Number(pos); let b = 0, prev = 0;
-  for (const ch of s) { const l = u8len(ch.codePointAt(0)); if (b >= target) break; prev = b; b += l; }
-  return BigInt(prev);
+  const p = Number(pos), info = getStrInfo(s);
+  if (p <= 0 || info.len === 0) return 0n;
+  let i = Math.min(p, info.len) - 1;
+  if (!info.ascii) while (i > 0 && (info.bytes[i] & 0xC0) === 0x80) i--;
+  return BigInt(i);
 };
-export const String_atEnd = (s, pos) => Number(pos) >= ENC.encode(s).length ? 1 : 0;
+export const String_atEnd = (s, pos) => Number(pos) >= getStrInfo(s).len ? 1 : 0;
 export const String_extract = (s, b, e) => {
-  const bo = Number(b), eo = Number(e); let out = '', off = 0;
-  for (const ch of s) { const l = u8len(ch.codePointAt(0)); if (off >= eo) break; if (off >= bo) out += ch; off += l; }
-  return out;
+  const bo = Number(b), eo = Number(e);
+  if (bo >= eo) return '';
+  const info = getStrInfo(s);
+  if (info.ascii) return s.slice(bo, eo);
+  if (bo === 0 && eo >= info.len) return s;
+  return DEC.decode(info.bytes.subarray(bo, eo));
 };
 export const String_mk = (l) => { let s = ''; for (const c of listToArray(l)) s += String.fromCodePoint(c); return s; };
 export const String_data = (s) => arrayToList([...s].map((ch) => ch.codePointAt(0)));
 export const String_hash = (s) => { let h = 1469598103934665603n; for (let i = 0; i < s.length; i++) { h ^= BigInt(s.charCodeAt(i)); h = (h * 1099511628211n) & M64; } return h; };
 export const String_toUTF8 = (s) => ENC.encode(s);
-export const String_fromUTF8 = (ba, _h) => new TextDecoder().decode(ba);
+export const String_fromUTF8 = (ba, _h) => DEC.decode(ba);
 export const String_validateUTF8 = (_ba) => 1;
 
 // ---- ByteArray (Uint8Array; copy-on-write) ----------------------------------
@@ -198,7 +223,7 @@ export const ByteArray_copySlice = (src, so, dst, dso, len, _ex) => {
   const s = Number(so), d = Number(dso), n = Number(len);
   const r = new Uint8Array(Math.max(dst.length, d + n));
   r.set(dst);
-  for (let i = 0; i < n; i++) r[d + i] = src[s + i];
+  r.set(src.subarray(s, s + n), d);
   return r;
 };
 
@@ -223,7 +248,7 @@ export const UInt32_ofBitVec = (bv) => Number(BigInt(bv) & 0xFFFFFFFFn);
 export const USize_ofNatLT = (n) => Number(n & 0x1FFFFFFFFFFFFFn);
 export const String_ofList = String_mk;                          // was String.mk
 export const String_toList = String_data;                        // was String.data
-export const String_ofByteArray = (ba) => new TextDecoder().decode(ba);
+export const String_ofByteArray = (ba) => DEC.decode(ba);
 export const String_Internal_append = (a, b) => a + b;
 export const String_Pos_Raw_get = String_get;
 export const String_Pos_Raw_next = String_next;
@@ -231,9 +256,9 @@ export const String_Pos_Raw_atEnd = String_atEnd;
 export const String_Pos_Raw_extract = String_extract;
 export const String_Pos_next = String_next;
 export const String_decodeChar = (s, i) => atByte(s, Number(i))[0];
-export const String_getUTF8Byte = (s, p) => ENC.encode(s)[Number(p)];
+export const String_getUTF8Byte = (s, p) => { const info = getStrInfo(s); return info.ascii ? s.charCodeAt(Number(p)) : info.bytes[Number(p)]; };
 export const ByteArray_emptyWithCapacity = (_c) => new Uint8Array(0);
-export const ByteArray_validateUTF8 = (ba) => { try { new TextDecoder('utf-8', { fatal: true }).decode(ba); return 1; } catch { return 0; } };
+export const ByteArray_validateUTF8 = (ba) => { try { DEC_FATAL.decode(ba); return 1; } catch { return 0; } };
 
 // ---- mutable refs + IO plumbing (EStateM.Result.ok protocol) ----------------
 // BaseIO externs return their VALUE directly (the world is erased; no `EST.Out` wrapper).
@@ -247,7 +272,7 @@ export const ST_Prim_Ref_take = (r, _w) => r.v;
 const mkStream = (writeFn) => ctor(0,
   pap((_w) => mkOk(PUnit), 1, []),
   pap((_n, _w) => mkOk(new Uint8Array(0)), 2, []),
-  pap((ba, _w) => (writeFn(new TextDecoder().decode(ba)), mkOk(PUnit)), 2, []),
+  pap((ba, _w) => (writeFn(DEC.decode(ba)), mkOk(PUnit)), 2, []),
   pap((_w) => mkOk(''), 1, []),
   pap((s, _w) => (writeFn(s), mkOk(PUnit)), 2, []),
   pap((_w) => 0, 1, []));

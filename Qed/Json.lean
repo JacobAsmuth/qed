@@ -369,6 +369,107 @@ end
 
 /-- Render a value to a JSON string. -/
 def render (j : Json) : String := String.ofList (renderL j)
+
+def escapeCharStr (c : Char) : String := String.ofList (escapeCharL c)
+
+def escapeCharsTR : List Char → String → String
+  | [], acc      => acc
+  | c :: cs, acc => escapeCharsTR cs (acc ++ escapeCharStr c)
+
+def renderStrFast (s : String) : String :=
+  escapeCharsTR s.toList "\"" ++ "\""
+
+mutual
+  def renderFast : Json → String
+    | .null       => "null"
+    | .bool true  => "true"
+    | .bool false => "false"
+    | .num n      => String.ofList (renderNumL n)
+    | .str s      => renderStrFast s
+    | .arr es     => "[" ++ renderElemsFast es ++ "]"
+    | .obj ms     => "{" ++ renderMembersFast ms ++ "}"
+  def renderElemsFast : List Json → String
+    | []      => ""
+    | e :: es => renderFast e ++ renderElemSepFast es
+  def renderElemSepFast : List Json → String
+    | []      => ""
+    | x :: xs => "," ++ (renderFast x ++ renderElemSepFast xs)
+  def renderMembersFast : List (String × Json) → String
+    | []           => ""
+    | (k, v) :: ms => renderStrFast k ++ ":" ++ (renderFast v ++ renderMemberSepFast ms)
+  def renderMemberSepFast : List (String × Json) → String
+    | []           => ""
+    | (k, v) :: ms => "," ++ (renderStrFast k ++ ":" ++ (renderFast v ++ renderMemberSepFast ms))
+end
+
+private theorem ofList_append (xs ys : List Char) :
+    String.ofList (xs ++ ys) = String.ofList xs ++ String.ofList ys := by
+  ext; simp
+
+private theorem ofList_cons (c : Char) (cs : List Char) :
+    String.ofList (c :: cs) = String.singleton c ++ String.ofList cs := by
+  ext; simp
+
+private theorem escapeCharsTR_eq (cs : List Char) (acc : String) :
+    escapeCharsTR cs acc = acc ++ String.ofList (cs.flatMap escapeCharL) := by
+  induction cs generalizing acc with
+  | nil => simp [escapeCharsTR]
+  | cons c cs ih =>
+    simp only [escapeCharsTR, List.flatMap_cons, ih, ofList_append, escapeCharStr, String.append_assoc]
+
+theorem renderStrFast_eq (s : String) : renderStrFast s = String.ofList (renderStrL s) := by
+  unfold renderStrFast renderStrL
+  rw [escapeCharsTR_eq, ofList_cons, ofList_append, String.append_assoc]; rfl
+
+mutual
+  theorem renderFast_eq (j : Json) : renderFast j = String.ofList (renderL j) := by
+    cases j with
+    | null | num _ => rfl
+    | bool b => cases b <;> rfl
+    | str s => exact renderStrFast_eq s
+    | arr es =>
+        unfold renderFast renderL
+        rw [ofList_cons, ofList_append, renderElemsFast_eq, String.append_assoc]; rfl
+    | obj ms =>
+        unfold renderFast renderL
+        rw [ofList_cons, ofList_append, renderMembersFast_eq, String.append_assoc]; rfl
+  theorem renderElemsFast_eq (es : List Json) :
+      renderElemsFast es = String.ofList (renderElemsL es) := by
+    cases es with
+    | nil => rfl
+    | cons e es =>
+        unfold renderElemsFast renderElemsL
+        rw [ofList_append, renderFast_eq, renderElemSepFast_eq]
+  theorem renderElemSepFast_eq (es : List Json) :
+      renderElemSepFast es = String.ofList (renderElemSep es) := by
+    cases es with
+    | nil => rfl
+    | cons x xs =>
+        unfold renderElemSepFast renderElemSep
+        rw [ofList_cons, ofList_append, renderFast_eq, renderElemSepFast_eq]; rfl
+  theorem renderMembersFast_eq (ms : List (String × Json)) :
+      renderMembersFast ms = String.ofList (renderMembersL ms) := by
+    cases ms with
+    | nil => rfl
+    | cons kv ms =>
+        rcases kv with ⟨k, v⟩
+        unfold renderMembersFast renderMembersL
+        rw [ofList_append, ofList_cons, ofList_append, renderStrFast_eq,
+          renderFast_eq, renderMemberSepFast_eq, String.append_assoc]; rfl
+  theorem renderMemberSepFast_eq (ms : List (String × Json)) :
+      renderMemberSepFast ms = String.ofList (renderMemberSep ms) := by
+    cases ms with
+    | nil => rfl
+    | cons kv ms =>
+        rcases kv with ⟨k, v⟩
+        unfold renderMemberSepFast renderMemberSep
+        rw [ofList_cons, ofList_append, ofList_cons, ofList_append,
+          renderStrFast_eq, renderFast_eq, renderMemberSepFast_eq, String.append_assoc]; rfl
+end
+
+@[csimp] theorem render_eq_renderFast : @Json.render = @Json.renderFast := by
+  funext j; exact (renderFast_eq j).symm
+
 end Json
 
 /-! ### Codec round-trip

@@ -186,4 +186,97 @@ def renderChildrenFast (hs : Array msg) (cs : List (Html msg)) : String × Array
     sanity checks and server-side rendering where local content isn't needed. -/
 def Html.render (h : Html msg) : String := (renderNode #[] h).1
 
+/-- Extract the text of a text-rendering `Html` node (unwrapping `lazy`). -/
+def Html.textOf? : Html msg → Option String
+  | .text s     => some s
+  | .lazy _ sub => Html.textOf? sub
+  | _           => none
+
+/-- Concatenate all remaining text nodes in the current contiguous text run (before the next element). -/
+def restOfTextRun : List (Html msg) → String
+  | []      => ""
+  | c :: cs =>
+      match c.textOf? with
+      | some s => s ++ restOfTextRun cs
+      | none   => ""
+
+/-- Zero-allocation check for whether more non-empty text follows in the current contiguous run. -/
+def hasMoreText : List (Html msg) → Bool
+  | []      => false
+  | c :: cs =>
+      match c.textOf? with
+      | some "" => hasMoreText cs
+      | some _  => true
+      | none    => false
+
+mutual
+  /-- Pure model of how an HTML5 parser coalesces adjacent non-empty text nodes and
+      omits empty `.text ""` nodes when parsing SSR markup into `childNodes`. -/
+  def coalesceTextRun : List (Html msg) → List (Html msg)
+    | []      => []
+    | c :: cs =>
+        match c.textOf? with
+        | some s =>
+            if s == "" then coalesceTextRun cs
+            else .text (s ++ restOfTextRun cs) :: dropCurrentTextRun cs
+        | none => c :: coalesceTextRun cs
+
+  /-- Everything after the current contiguous text run, coalesced. -/
+  def dropCurrentTextRun : List (Html msg) → List (Html msg)
+    | []      => []
+    | c :: cs =>
+        match c.textOf? with
+        | some _ => dropCurrentTextRun cs
+        | none   => c :: coalesceTextRun cs
+end
+
+/-- Pure model of the driver's hydration child loop: given the expected `Html` children,
+    whether we are already inside a browser-coalesced text run (`inTextRun`), and the
+    remaining browser `childNodes`, reconstructs the 1-to-1 live DOM child list. -/
+def hydrateChildrenSpec (inTextRun : Bool) : List (Html msg) → List (Html msg) → List (Html msg)
+  | [],      _   => []
+  | c :: cs, dom =>
+      match c.textOf? with
+      | some s =>
+          if s == "" then
+            c :: hydrateChildrenSpec inTextRun cs dom
+          else if inTextRun then
+            c :: hydrateChildrenSpec true cs dom
+          else
+            match dom with
+            | _ :: domRest => c :: hydrateChildrenSpec true cs domRest
+            | []           => []
+      | none =>
+          match dom with
+          | _ :: domRest => c :: hydrateChildrenSpec false cs domRest
+          | []           => []
+
+theorem hydrateChildrenSpec_roundtrip (cs : List (Html msg)) :
+    hydrateChildrenSpec false cs (coalesceTextRun cs) = cs ∧
+    hydrateChildrenSpec true cs (dropCurrentTextRun cs) = cs := by
+  induction cs with
+  | nil => exact ⟨rfl, rfl⟩
+  | cons c rest ih =>
+      rcases ih with ⟨ihFalse, ihTrue⟩
+      cases h : c.textOf? with
+      | none =>
+          refine ⟨?_, ?_⟩ <;> simpa [hydrateChildrenSpec, coalesceTextRun, dropCurrentTextRun, h] using ihFalse
+      | some s =>
+          cases hs : (s == "") with
+          | true =>
+              refine ⟨?_, ?_⟩
+              · simpa [hydrateChildrenSpec, coalesceTextRun, h, hs] using ihFalse
+              · simpa [hydrateChildrenSpec, dropCurrentTextRun, h, hs] using ihTrue
+          | false =>
+              refine ⟨?_, ?_⟩
+              · simpa [hydrateChildrenSpec, coalesceTextRun, h, hs] using ihTrue
+              · simpa [hydrateChildrenSpec, dropCurrentTextRun, h, hs] using ihTrue
+
+/-- **Hydration Text-Coalescing Round-Trip:** hydrating the browser's coalesced `childNodes`
+    reconstructs the exact 1-to-1 `Html` sibling list for any combination of empty, adjacent,
+    or interleaved text and element children. -/
+theorem hydrate_coalesce (cs : List (Html msg)) :
+    hydrateChildrenSpec false cs (coalesceTextRun cs) = cs :=
+  (hydrateChildrenSpec_roundtrip cs).1
+
 end Qed

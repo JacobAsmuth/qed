@@ -178,12 +178,30 @@ partial def buildDom (h : Handlers msg) (ns : String) : Html msg → IO Dom.Node
           Dom.appendChild node (← buildDom h childNs c)
       return node
 
+/-- Hydrate one text slot at `index` inside `parent`, restoring the 1-to-1 DOM child
+    correspondence that SSR + browser HTML text coalescing collapsed (matching
+    `hydrateChildrenSpec` in `Qed.Render`). -/
+def hydrateTextSlot (parent : Dom.Node) (index : UInt32) (inTextRun : Bool)
+    (s : String) (moreInRun : Unit → Bool) : IO (Dom.Node × Bool) := do
+  if s == "" then
+    let ph ← Dom.createText ""
+    Dom.insertBefore parent index ph
+    return (ph, inTextRun)
+  else if inTextRun then
+    let tn ← Dom.createText s
+    Dom.insertBefore parent index tn
+    return (tn, true)
+  else
+    let tn ← Dom.childAt parent index
+    if moreInRun () then Dom.setText tn s
+    return (tn, true)
+
+mutual
 /-- Hydrate server-rendered DOM in place: walk the `Html` in lockstep with the existing
     nodes, applying each element's attributes — which registers its events into the handler
     tables (in the *same* pre-order `buildDom` uses, so the ids line up), tags the node, and
-    binds signals — *without* creating or replacing anything. So the markup the server sent
-    stays put (no flash, focus/scroll preserved) and becomes live. An empty-text child
-    produced no DOM node, so it consumes no slot; a local host owns its own children. -/
+    binds signals — *without* creating or replacing elements. Empty or coalesced text slots
+    are restored via `hydrateTextSlot`; a local host owns its own children. -/
 partial def hydrateDom (h : Handlers msg) : Html msg → Dom.Node → IO Unit
   | .text _,     _    => pure ()
   | .lazy _ sub, node => hydrateDom h sub node
@@ -191,12 +209,20 @@ partial def hydrateDom (h : Handlers msg) : Html msg → Dom.Node → IO Unit
       clearHandlerIds node             -- drop the server's handler ids; the client owns the tables
       applyAttrs h node attrs
       unless ownsChildren attrs do
-        let mut i : UInt32 := 0
-        for c in children do
-          match c with
-          | .text "" => pure ()          -- rendered to nothing → no DOM node to advance past
-          | .text _  => i := i + 1       -- a text node: present, nothing to wire
-          | _        => hydrateDom h c (← Dom.childAt node i); i := i + 1
+        hydrateDomKids h node 0 false children
+
+partial def hydrateDomKids (h : Handlers msg) (node : Dom.Node) (i : UInt32) (inTextRun : Bool) :
+    List (Html msg) → IO Unit
+  | [] => pure ()
+  | c :: rest => do
+      match c.textOf? with
+      | some s =>
+          let (_, nextRun) ← hydrateTextSlot node i inTextRun s (fun () => hasMoreText rest)
+          hydrateDomKids h node (i + 1) nextRun rest
+      | none =>
+          hydrateDom h c (← Dom.childAt node i)
+          hydrateDomKids h node (i + 1) false rest
+end
 
 mutual
 /-- Execute a patch against the live DOM, reusing nodes where possible. `parent`
@@ -559,17 +585,29 @@ partial def patchCond (h : Handlers msg) (cells : CondCells σ msg)
     cells.modify (fun (cs, free) => (cs.set! idx (now, some st), free))
 end
 
-/-- Does this template node render to nothing (an empty text — a `""` `dyn`, an empty static
-    `text`, or a hidden `showIf`)? `buildView` still makes an empty *placeholder* text node for
-    those (so positions stay stable for patching), but the server's `render` omits them, so the
-    hydrator must re-insert the placeholder to keep the `VState` mirror aligned with the DOM. -/
-def rendersEmpty (v : View σ msg) (s : σ) : Bool :=
-  match View.render v s with | .text "" => true | _ => false
+/-- Extract the text of a text-rendering `View` template without rendering element/list subtrees. -/
+def View.textOf? (s : σ) : View σ msg → Option String
+  | .text str                 => some str
+  | .dyn get                  => some (get s)
+  | .ifElse cond yes no       => if cond s then View.textOf? s yes else View.textOf? s no
+  | .static html              => html.textOf?
+  | .dynNode get              => (get s).textOf?
+  | .element .. | .keyedList .. => none
 
+/-- Zero-allocation check for whether more non-empty text follows in the current `View` sibling run. -/
+def hasMoreViewText (s : σ) : List (View σ msg) → Bool
+  | []      => false
+  | k :: cs =>
+      match k.textOf? s with
+      | some "" => hasMoreViewText s cs
+      | some _  => true
+      | none    => false
+
+mutual
 /-- Hydrate a `View` template against server-rendered DOM: build the `VState` mirror over the
     *existing* nodes (wiring events/signals via `applyAttrs`/`hydrateDom`, never creating real
-    content), re-inserting only the invisible empty-text placeholders the server omitted. The
-    result is the same `VState` `buildView` would return, so `patchView` then drives updates. -/
+    content), restoring empty and browser-coalesced text slots via `hydrateTextSlot` so the
+    `VState` mirror matches `buildView` 1-to-1 and `patchView` then drives updates. -/
 partial def hydrateView (h : Handlers msg) (cells : CondCells σ msg) :
     View σ msg → σ → Dom.Node → IO (VState σ msg)
   | .text _,          _, node => return .text node
@@ -578,16 +616,7 @@ partial def hydrateView (h : Handlers msg) (cells : CondCells σ msg) :
   | .element _ attrs kids, s, node => do
       clearHandlerIds node
       applyAttrs h node (attrs.map (VAttr.eval s))
-      let mut ks : Array (VState σ msg) := #[]
-      let mut i : UInt32 := 0
-      for k in kids do
-        -- pick the DOM node for this child: the server emitted one unless it renders empty,
-        -- in which case re-insert the placeholder buildView would have made.
-        let kn ← if rendersEmpty k s then
-            let ph ← Dom.createText ""; Dom.insertBefore node i ph; pure ph
-          else Dom.childAt node i
-        ks := ks.push (← hydrateView h cells k s kn)
-        i := i + 1
+      let ks ← hydrateViewKids h cells node s 0 false #[] kids
       return .elem node ks
   | .ifElse cond yes no, s, node => do
       let idx ← allocCell cells
@@ -611,6 +640,18 @@ partial def hydrateView (h : Handlers msg) (cells : CondCells σ msg) :
         i := i + 1
       return .list node (← IO.mkRef (keys s)) (← IO.mkRef perRow) (← IO.mkRef rs)
         (← IO.mkRef (marks s)) inst
+
+partial def hydrateViewKids (h : Handlers msg) (cells : CondCells σ msg) (node : Dom.Node)
+    (s : σ) (i : UInt32) (inTextRun : Bool) (acc : Array (VState σ msg)) :
+    List (View σ msg) → IO (Array (VState σ msg))
+  | [] => return acc
+  | k :: rest => do
+      let (kn, nextRun) ← match k.textOf? s with
+        | some str => hydrateTextSlot node i inTextRun str (fun () => hasMoreViewText s rest)
+        | none     => pure (← Dom.childAt node i, false)
+      let kst ← hydrateView h cells k s kn
+      hydrateViewKids h cells node s (i + 1) nextRun (acc.push kst) rest
+end
 
 /-- Everything the local-component runtime threads around: the registry of declared
     components, the keyed store of serialized state, and the live instances. Shared by

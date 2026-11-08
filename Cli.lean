@@ -46,9 +46,12 @@ def env (k : String) : IO (Option String) := IO.getEnv k
 /-- The framework checkout (its `runtime/` JS and `scripts/`). Defaults to the
     current directory for in-repo development. -/
 def frameworkHome : IO FilePath := return (← env "QED_HOME").getD "."
-/-- The project's web-entry module. Apps use `Web`; the framework demo overrides
-    this to `Examples.Web` via `QED_WEB_ROOT`. -/
-def webRoot : IO String := return (← env "QED_WEB_ROOT").getD "Web"
+/-- The project's web-entry module. Apps use `Web`; in-repo defaults to `Examples.Web`. -/
+def webRoot : IO String := do
+  if let some r ← env "QED_WEB_ROOT" then return r
+  if !(← (FilePath.mk "Web.lean").pathExists) && (← (FilePath.mk "Examples" / "Web.lean").pathExists) then
+    return "Examples.Web"
+  return "Web"
 def runtimeFile (name : String) : IO FilePath := return (← frameworkHome) / "runtime" / name
 /-- Per-project axiom manifest gated by `check`/`build` (skipped if absent). -/
 def axiomsManifest : FilePath := "scripts" / "axioms.lean"
@@ -200,9 +203,9 @@ def invariantNote : IO Unit := do
 def verify : IO Bool := do
   step "checking proofs (lake build)"
   if (← sh "lake" #["build"]) != 0 then return false
-  -- Build the example modules too, so their proofs are checked: the `invariant`s (model
-  -- `preserved_by` and styling `holds_in`) are theorems that only fire when their module builds.
-  if (← sh "lake" #["build", "Examples"]) != 0 then return false
+  -- Build the example modules too when in the framework repo, so their proofs are checked.
+  if (← (FilePath.mk "Examples").pathExists) then
+    if (← sh "lake" #["build", "Examples"]) != 0 then return false
   step "verifying (no sorry / axiom-clean / effect coverage)"
   let ok1 ← grepForbidden
   let ok2 ← axiomClean
@@ -222,7 +225,7 @@ def cmdCheck : IO UInt32 := do
 def jsRoot : IO String := do
   match ← env "QED_JS_ROOT" with
   | some r => return r
-  | none   => return (← env "QED_WEB_ROOT").getD "Web"
+  | none   => webRoot
 
 /-- The page that loads the transpiled app. In dev it polls `__build_id` to live-reload.
     Paths are absolute (and `<base href="/">` is set) so deep-link routes like `/users/ada`

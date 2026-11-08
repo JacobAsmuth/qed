@@ -23,7 +23,7 @@ const PORT = 8144;
 const SERVE = `${ROOT}.qed/dev`;
 
 console.log('▸ building bookshelf (Examples.BookshelfWeb → .qed/dev)…');
-const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.BookshelfWeb ./qed build --dev`],
+const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.BookshelfWeb ./scripts/qed build --dev`],
   { stdio: 'inherit' });
 if (build.status !== 0) { console.error('build failed'); process.exit(1); }
 

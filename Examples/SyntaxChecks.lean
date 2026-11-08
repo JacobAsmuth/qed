@@ -82,4 +82,26 @@ component Container where
 #guard (Container.regs.map (·.id)).contains "SyntaxChecks.Counter"
 #guard (Container.app.renderInitial).contains "0</button>"
 
+-- renderWithLocals preserves rawHtml, void elements, and unescaped raw-text <style>.
+def ssrEdgeCases : Html Unit :=
+  <div>
+    <style>{".a > .b { content: \"</style>\"; }"}</style>
+    <br/>
+    <div {Attr.rawHtml "<em>raw</em>"}/>
+    {defaults}
+  </div>
+#guard (Html.renderWith Counter.regs ssrEdgeCases).contains ".a > .b"
+#guard (Html.renderWith Counter.regs ssrEdgeCases).contains "<\\/style>"
+#guard !(Html.renderWith Counter.regs ssrEdgeCases).contains "</br>"
+#guard (Html.renderWith Counter.regs ssrEdgeCases).contains "<em>raw</em>"
+#guard (Html.renderWith Counter.regs ssrEdgeCases).contains "8</button>"
+
+-- Component JSON instances are scoped per component so multi-file namespaces never collide.
+example : ToJson Counter.Props := Counter.Props.instToJson
+example : FromJson Counter.Props := Counter.Props.instFromJson
+example : ToJson Counter.State := Counter.State.instToJson
+example : FromJson Counter.State := Counter.State.instFromJson
+example : ToJson Owned.State := Owned.State.instToJson
+example : FromJson Owned.State := Owned.State.instFromJson
+
 end SyntaxChecks

@@ -17,7 +17,7 @@ const FILE = '/tmp/qed-effects-pick.txt';
 writeFileSync(FILE, 'hello-from-file');
 
 console.log('▸ building effects demo (Examples.EffectsWeb → .qed/dev)…');
-const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.EffectsWeb ./qed build --dev`],
+const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.EffectsWeb ./scripts/qed build --dev`],
   { stdio: 'inherit' });
 if (build.status !== 0) { console.error('build failed'); process.exit(1); }
 

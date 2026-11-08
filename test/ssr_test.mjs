@@ -15,7 +15,7 @@ const PORT = 8155;
 const SERVE = `${ROOT}.qed/dev`;
 
 console.log('▸ building counter (Examples.Web → .qed/dev)…');
-let build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.Web ./qed build --dev`], { stdio: 'inherit' });
+let build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.Web ./scripts/qed build --dev`], { stdio: 'inherit' });
 if (build.status !== 0) { console.error('build failed'); process.exit(1); }
 
 // Server-side render: the #app content from the native build of the SAME app.

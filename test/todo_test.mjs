@@ -14,7 +14,7 @@ const PORT = 8132;
 const SERVE = `${ROOT}.qed/dev`;
 
 console.log('▸ building todo (Examples.TodoWeb → .qed/dev)…');
-const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.TodoWeb ./qed build --dev`],
+const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.TodoWeb ./scripts/qed build --dev`],
   { stdio: 'inherit' });
 if (build.status !== 0) { console.error('build failed'); process.exit(1); }
 

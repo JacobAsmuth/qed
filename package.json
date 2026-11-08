@@ -4,12 +4,12 @@
   "license": "MIT",
   "description": "npm-script aliases for the qed toolchain — for web devs who reach for `npm run dev`.",
   "scripts": {
-    "dev": "./qed dev",
-    "build": "./qed build",
-    "start": "./qed start",
-    "preview": "./qed preview",
-    "test": "./qed test",
-    "check": "./qed check",
-    "clean": "./qed clean"
+    "dev": "./scripts/qed dev",
+    "build": "./scripts/qed build",
+    "start": "./scripts/qed start",
+    "preview": "./scripts/qed preview",
+    "test": "./scripts/qed test",
+    "check": "./scripts/qed check",
+    "clean": "./scripts/qed clean"
   }
 }

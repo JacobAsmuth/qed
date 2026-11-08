@@ -15,7 +15,7 @@ const PORT = 8188;
 const SERVE = `${ROOT}.qed/dev`;
 
 console.log('▸ building template demo (Examples.TemplateWeb → .qed/dev)…');
-if (spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.TemplateWeb ./qed build --dev`], { stdio: 'inherit' }).status !== 0) {
+if (spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.TemplateWeb ./scripts/qed build --dev`], { stdio: 'inherit' }).status !== 0) {
   console.error('build failed'); process.exit(1);
 }
 console.log('▸ rendering #app natively (lake exe template_ssr)…');

@@ -1,12 +1,13 @@
 // Differential gate: run every probe (Examples/JsGate.lean) natively in Lean and
 // transpiled under node; assert identical output. Flushes out emitter/extern bugs.
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, copyFileSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, copyFileSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const gate = path.join(root, 'test', '.gate');
+mkdirSync(gate, { recursive: true });
 const run = (cmd, args) => execFileSync(cmd, args, { cwd: root, encoding: 'utf8', maxBuffer: 64 << 20 });
 
 // 1. Native oracle.

@@ -10,7 +10,7 @@ Run the self-contained component examples from the repository root with the Lean
 and Node.js installed:
 
 ```sh
-QED_WEB_ROOT=Examples.TodoWeb ./qed dev
+QED_WEB_ROOT=Examples.TodoWeb ./scripts/qed dev
 # Open http://localhost:8000. LocalWeb and SignupWeb work the same way.
 ```
 
@@ -20,7 +20,7 @@ Only run one build/dev command at a time: the examples share `.qed/dev`.
 ## Bookshelf
 
 ```bash
-QED_WEB_ROOT=Examples.BookshelfWeb ./qed build --dev
+QED_WEB_ROOT=Examples.BookshelfWeb ./scripts/qed build --dev
 node Examples/bookshelf-server.mjs
 ```
 
@@ -37,7 +37,7 @@ checks, install the test dependencies with `npm ci --prefix test`, then run
 ## Streaming chat
 
 ```bash
-QED_WEB_ROOT=Examples.ChatWeb ./qed build --dev
+QED_WEB_ROOT=Examples.ChatWeb ./scripts/qed build --dev
 python3 test/mock_llm.py 8000 .qed/dev
 ```
 

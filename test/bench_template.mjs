@@ -18,7 +18,7 @@ const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', 
 
 async function measure(root, port) {
   console.log(`▸ building ${root} → .qed/dev …`);
-  if (spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=${root} ./qed build --dev`], { stdio: 'inherit' }).status !== 0) {
+  if (spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=${root} ./scripts/qed build --dev`], { stdio: 'inherit' }).status !== 0) {
     console.error('build failed'); process.exit(1);
   }
   const server = spawn('python3', ['-m', 'http.server', String(port), '--directory', `${ROOT}.qed/dev`], { stdio: 'ignore' });

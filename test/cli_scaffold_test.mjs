@@ -65,9 +65,33 @@ try {
   const broken = run(cli, ['check'], app);
   assert.notEqual(broken.status, 0);
   assert.match(broken.stdout + broken.stderr, /case `decrease` still needs/);
+
+  // Multi-file components in the same namespace must not collide on ToJson/FromJson
+  // instances, and SSR must preserve rawHtml, void tags, raw-text <style>, and local mounts.
+  await writeFile(path.join(app, 'Child.lean'),
+    'import Qed\nopen Qed\nnamespace Site\ncomponent Badge where\n  prop label : String := "ok"\n  state count : Int := 7\n  view => <span class="badge">{label}:{count}</span>\nend Site\n');
+  await writeFile(lakefile, (await readFile(lakefile, 'utf8')).replace(
+    '@[default_target] lean_lib App where',
+    '@[default_target] lean_lib Child where\nlean_lib App where',
+  ));
+  await writeFile(appPath,
+    'import Qed\nimport Child\nopen Qed\nnamespace Site\n' +
+    'component Quantity where\n  state quantity : Int := 1\n' +
+    '  view => <div><style>{".a > .b { color: red; }"}</style><br/><div {Attr.rawHtml "<b>raw</b>"}/><Badge key="b"/><span>{quantity}</span></div>\n' +
+    'end Site\nabbrev Quantity.app := Site.Quantity.app\n');
+  succeeds(run(cli, ['build', '--dev'], app));
+  const multiUrl = pathToFileURL(path.join(app, '.qed/dev/ssr.mjs'));
+  multiUrl.search = '?multi-file';
+  const { default: renderMulti } = await import(multiUrl);
+  const multiHtml = await (await renderMulti(new Request('http://localhost/'))).text();
+  assert.match(multiHtml, /\.a > \.b \{ color: red; \}/);
+  assert.doesNotMatch(multiHtml, /<\/br>/);
+  assert.match(multiHtml, /<b>raw<\/b>/);
+  assert.match(multiHtml, /class="badge">ok:7<\/span>/);
+
   await writeFile(appPath, valid);
   succeeds(run(cli, ['check'], app));
-  console.log('PASS: scaffold toolchain, dependency transpiler, dev/production SSR, SSR reload, broken guard, and recovery.');
+  console.log('PASS: scaffold toolchain, dependency transpiler, dev/production SSR, SSR reload, multi-file components, broken guard, and recovery.');
 } finally {
   await rm(scratch, { recursive: true, force: true });
 }

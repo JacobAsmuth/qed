@@ -17,7 +17,7 @@ const REPLY = 'Hello! I am a mock LLM, streaming this reply token by token.';
 
 // 1. Build the chat app (dev mode, fast) with the chat web entry.
 console.log('▸ building chat (Examples.ChatWeb → .qed/dev)…');
-const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.ChatWeb ./qed build --dev`],
+const build = spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.ChatWeb ./scripts/qed build --dev`],
   { stdio: 'inherit' });
 if (build.status !== 0) { console.error('build failed'); process.exit(1); }
 

@@ -599,15 +599,16 @@ partial def renderWithLocals {m : Type} (locals : List LocalDef) : Html m → St
   | .text s => escapeHtml s
   | .lazy _ sub => renderWithLocals locals sub
   | .element tag attrs children =>
-      let attrStr := (renderAttrs #[] (normalizeAttrs attrs)).1
-      let local?  := attrs.findSome? (fun | .localCell _ comp init p _ => some (comp, init, p) | _ => none)
-      let childStr := match local? with
-        | some (comp, init?, p) =>
-            match locals.find? (fun d : LocalDef => d.id == comp) with
+      let local? := attrs.findSome? (fun | .localCell _ comp init p _ => some (comp, init, p) | _ => none)
+      match local? with
+      | some (comp, init?, p) =>
+          let attrStr := (renderAttrs #[] (normalizeAttrs attrs)).1
+          let childStr := match locals.find? (fun d : LocalDef => d.id == comp) with
             | some ldef => renderWithLocals locals (((ldef.viewProps.map (fun (f : String → String → Html LocalMsg) => f p)).getD ldef.view) (init?.getD ldef.init))
             | none      => ""
-        | none => String.join (children.map (renderWithLocals locals))
-      s!"<{tag}{attrStr}>{childStr}</{tag}>"
+          s!"<{tag}{attrStr}>{childStr}</{tag}>"
+      | none =>
+          (renderElement (fun hs => (String.join (children.map (renderWithLocals locals)), hs)) #[] tag attrs children).1
 
 /-- `Html.render`, but local hosts are filled with their initial view (see
     `renderWithLocals`). Pass the app's `locals`. -/

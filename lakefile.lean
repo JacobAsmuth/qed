@@ -27,7 +27,7 @@ lean_lib Examples where
 lean_exe counter where
   root := `Examples.Native
 
-/-- The `qed` CLI. Drive it via the `./qed` shim, which sets up the environment
+/-- The `qed` CLI. Drive it via the `./scripts/qed` shim, which sets up the environment
     and runs this binary. -/
 lean_exe qed where
   root := `Cli

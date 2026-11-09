@@ -97,6 +97,7 @@ structure Ctx where
       inside join-point bodies, where a `continue` would target the wrong construct. -/
   selfFn     : Option Name := none
   selfParams : Array Param := #[]
+  directLoop : Bool := false
   /-- vars whose defining expr is provably not an array (a ctor/closure/literal/scalar), so
       their `inc`/`dec` are guaranteed no-ops and need not be emitted — only refcounted arrays
       carry a count. Keyed by `VarId.idx`. Cuts both bundle size and per-op call overhead. -/
@@ -201,6 +202,19 @@ partial def hasSelfTail (self : Name) : FnBody → Bool
   | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b => hasSelfTail self b
   | _ => false
 
+/-- Does a tail self-call occur inside a `.jdecl` join-point body? When false, tail self-calls
+    can emit direct parameter reassignment + `continue` inside `while (true)` without a closure
+    trampoline or per-step array allocation. -/
+partial def hasJpSelfTail (self : Name) (inJp : Bool := false) : FnBody → Bool
+  | .vdecl z _ (.fap f _) cont => (inJp && f == self && retsVar z cont) || hasJpSelfTail self inJp cont
+  | .vdecl _ _ _ b    => hasJpSelfTail self inJp b
+  | .jdecl _ _ v b    => hasJpSelfTail self true v || hasJpSelfTail self inJp b
+  | .case _ _ _ alts  => alts.any (fun a => hasJpSelfTail self inJp a.body)
+  | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b => hasJpSelfTail self inJp b
+  | .sset _ _ _ _ _ b => hasJpSelfTail self inJp b
+  | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b => hasJpSelfTail self inJp b
+  | _ => false
+
 /-- Vars whose defining expression is provably not an array — a `ctor`/`reuse` (a tagged record),
     a `pap` (a closure), a literal, or a (un)boxed scalar. Their `inc`/`dec` only ever hit a value
     with no refcount, so emitting them is dead weight; collect them so `emitBody` can drop them. -/
@@ -218,13 +232,22 @@ partial def collectNonArr (acc : Std.HashSet Nat) : FnBody → Std.HashSet Nat
 
 partial def emitBody (c : Ctx) (d : Nat) : FnBody → String
   | .vdecl x ty e b   =>
-      -- A tail self-call `let x = self(args); return x` returns a trampoline marker
-      -- `$.tc([args])`; the marker propagates up (even out of join points) to the loop
-      -- driver wrapping the function, which re-enters with the new args. No JS recursion.
+      -- A tail self-call `let x = self(args); return x` either reassigns params and `continue`s
+      -- directly (when no tail self-call sits inside a join point) or returns a trampoline marker
+      -- `$.tc([args])` that propagates out of join points to the loop driver. No JS recursion.
       match e with
       | .fap f args =>
           if c.selfFn == some f && retsVar x b then
-            s!"{c.ind d}return $.tc([{String.intercalate ", " (args.toList.map emitArg)}]);\n"
+            if c.directLoop then
+              if args.isEmpty then s!"{c.ind d}continue;\n"
+              else
+                let ps := c.selfParams.toList.map (v ·.x)
+                let as := args.toList.map emitArg
+                let tmps := String.intercalate ", " (as.zipIdx.map fun (a, i) => s!"_t{i} = {a}")
+                let assigns := String.intercalate " " (ps.zipIdx.map fun (p, i) => s!"{p} = _t{i};")
+                s!"{c.ind d}\{ let {tmps}; {assigns} continue; }\n"
+            else
+              s!"{c.ind d}return $.tc([{String.intercalate ", " (args.toList.map emitArg)}]);\n"
           else s!"{c.ind d}let {v x} = {emitExpr c ty e};\n" ++ emitBody c d b
       | _ => s!"{c.ind d}let {v x} = {emitExpr c ty e};\n" ++ emitBody c d b
   | .jdecl j xs val b =>
@@ -268,19 +291,25 @@ def emitDecl (c0 : Ctx) : Decl → String
         let ps := String.intercalate ", " (xs.toList.map (v ·.x))
         let note := if c.min then "" else s!"/* {f} */ "
         if hasSelfTail f body then
-          -- trampoline: run the body; if it returns a self-call marker, reassign the
-          -- params and re-run — turning self-tail-recursion into a loop with O(1) stack.
-          let c' := { c with selfFn := some f, selfParams := xs }
-          let bodyStr := emitBody c' 2 body
-          let reasn := s!"[{String.intercalate ", " (xs.toList.map (v ·.x))}] = __r.__tc;"
-          s!"function {c.js f}({ps}) " ++ note ++ "{\n" ++
-            s!"{c.ind 1}const __step = () => " ++ "{\n" ++ bodyStr ++ s!"{c.ind 1}" ++ "};\n" ++
-            s!"{c.ind 1}while (true) " ++ "{\n" ++
-            s!"{c.ind 2}const __r = __step();\n" ++
-            s!"{c.ind 2}if (__r !== null && typeof __r === \"object\" && __r.__tc !== undefined) " ++
-              "{ " ++ reasn ++ " continue; }\n" ++
-            s!"{c.ind 2}return __r;\n" ++
-            s!"{c.ind 1}" ++ "}\n}\n"
+          if !hasJpSelfTail f false body then
+            let c' := { c with selfFn := some f, selfParams := xs, directLoop := true }
+            let bodyStr := emitBody c' 2 body
+            s!"function {c.js f}({ps}) " ++ note ++ "{\n" ++
+              s!"{c.ind 1}while (true) " ++ "{\n" ++ bodyStr ++ s!"{c.ind 1}" ++ "}\n}\n"
+          else
+            -- trampoline: run the body; if it returns a self-call marker, reassign the
+            -- params and re-run — turning self-tail-recursion into a loop with O(1) stack.
+            let c' := { c with selfFn := some f, selfParams := xs }
+            let bodyStr := emitBody c' 2 body
+            let reasn := s!"[{String.intercalate ", " (xs.toList.map (v ·.x))}] = __r.__tc;"
+            s!"function {c.js f}({ps}) " ++ note ++ "{\n" ++
+              s!"{c.ind 1}const __step = () => " ++ "{\n" ++ bodyStr ++ s!"{c.ind 1}" ++ "};\n" ++
+              s!"{c.ind 1}while (true) " ++ "{\n" ++
+              s!"{c.ind 2}const __r = __step();\n" ++
+              s!"{c.ind 2}if (__r !== null && typeof __r === \"object\" && __r.__tc !== undefined) " ++
+                "{ " ++ reasn ++ " continue; }\n" ++
+              s!"{c.ind 2}return __r;\n" ++
+              s!"{c.ind 1}" ++ "}\n}\n"
         else
           s!"function {c.js f}({ps}) " ++ note ++ "{\n" ++ emitBody c 1 body ++ "}\n"
   | .extern .. => ""

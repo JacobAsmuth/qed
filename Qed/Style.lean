@@ -216,16 +216,24 @@ def css {α : Type} [CssBody α] (body : α) : Style :=
 /-- One CSS rule: `.qed-… { <body> }` (the body keeps any `&`-nesting). -/
 private def Style.rule (s : Style) : String := "." ++ s.className ++ " { " ++ s.raw ++ " }"
 
+/-- Render design tokens into a `:root { … }` CSS rule string. -/
+def renderTheme (tokens : List Item) : String :=
+  ":root { " ++ Item.renderList tokens ++ " }"
+
 /-- Emit design tokens as a `:root { … }` stylesheet from a list of `Token.set`s. Drop this once
     near your view root (alongside `styleSheet`); the tokens are then visible to every style. -/
-def theme (tokens : List Item) : Html msg :=
-  el "style" [] [Html.text (":root { " ++ Item.renderList tokens ++ " }")]
+@[inline] def theme (tokens : List Item) : Html msg :=
+  el "style" [] [Html.text (renderTheme tokens)]
+
+/-- Render a list of styles into a single CSS stylesheet string, deduping by class name. -/
+def renderStyleSheet (styles : List Style) : String :=
+  let seen := (styles.foldl
+    (fun acc s => if acc.any (·.className == s.className) then acc else s :: acc) []).reverse
+  String.intercalate "\n" (seen.map Style.rule)
 
 /-- Collect styles into one `<style>` element, deduping by class name. Drop this once in
     your view (e.g. at the top of the root element's children). -/
-def styleSheet (styles : List Style) : Html msg :=
-  let seen := styles.foldl
-    (fun acc s => if acc.any (·.className == s.className) then acc else acc ++ [s]) []
-  el "style" [] [Html.text (String.intercalate "\n" (seen.map Style.rule))]
+@[inline] def styleSheet (styles : List Style) : Html msg :=
+  el "style" [] [Html.text (renderStyleSheet styles)]
 
 end Qed

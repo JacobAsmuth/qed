@@ -38,4 +38,5 @@ import Examples.Socket
 #print axioms Qed.Demo.Signup.canSubmit_iff  -- form submit ⇔ valid
 #print axioms Qed.parse_render     -- JSON codec round-trip (whole grammar)
 #print axioms Qed.Json.render_eq_renderFast -- JSON compiler rewrite preserves spec
+#print axioms Qed.LawfulJson.parse_render_toJson -- LawfulJson + Dehydrate round-trip
 #print axioms Qed.hydrate_coalesce -- SSR hydration text-coalescing round-trip

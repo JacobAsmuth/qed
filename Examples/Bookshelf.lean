@@ -131,29 +131,15 @@ def bookCard (b : Book) : Html Msg :=
       {if b.inPrint then "In print" else "Out of print"}</p>
   </div>
 
-/-- Serialize the route + fetched data into the page, so a deep-linked SSR load starts the
-    client from the same model the server drew, no flash, no refetch. The route rides the URL
-    codec; the catalog/current `Resource`s use their JSON instances; the form draft is left to
-    `init` (it's empty on load). -/
-def dehydrateModel (m : Model) : String :=
-  Json.render (.obj [
-    ("route",   .str (Router.toURL m.route)),
-    ("catalog", ToJson.toJson m.catalog),
-    ("current", ToJson.toJson m.current) ])
-
-def rehydrateModel (s : String) : Option Model :=
-  match Json.parse s with
-  | .ok j =>
-      let res {α} [FromJson α] (key : String) : Resource α :=
-        ((j.get? key).bind (fun v => (FromJson.fromJson v : Except String (Resource α)).toOption)).getD .idle
-      some { init with
-             route   := (((j.get? "route").bind (·.str?)).bind Router.fromURL).getD .catalog
-             catalog := res "catalog"
-             current := res "current" }
-  | _ => none
-
-def appBase : App Model Msg :=
-  ui init transition (onRoute := Msg.routed) fun m =>
+/-- The app, with verified `Dehydrate.slice` wired in (so an SSR deep link hydrates the
+    route and fetched `Resource`s without refetching, and `Dehydrate.round_trip` is proved
+    by the framework). -/
+def app : App Model Msg :=
+  ui init transition (onRoute := Msg.routed)
+    (dehydrate := Dehydrate.slice init
+      (fun m => (m.route, m.catalog, m.current))
+      (fun m (r, cat, cur) => { m with route := r, catalog := cat, current := cur }))
+    fun m =>
     <div {shell} class="app">
       {theme [ brand.set "#06c" ]}
       {styleSheet [shell, topnav, navlink, card]}
@@ -181,8 +167,5 @@ def appBase : App Model Msg :=
              {Book.formView m.draft Msg.edit Msg.submit}
            </div>}
     </div>
-
-/-- The app, with dehydration wired in (so an SSR deep link hydrates without refetching). -/
-def app : App Model Msg := { appBase with dehydrate := dehydrateModel, rehydrate := rehydrateModel }
 
 end Bookshelf

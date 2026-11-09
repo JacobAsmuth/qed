@@ -104,4 +104,48 @@ example : FromJson Counter.State := Counter.State.instFromJson
 example : ToJson Owned.State := Owned.State.instToJson
 example : FromJson Owned.State := Owned.State.instFromJson
 
+-- Issue #11: `route_enum` & `RouteParam` in `router`, `exactlyOneOf`, and `from init` in `invariant`.
+route_enum Section where
+  overview
+  architecture => "arch"
+  benchmarks   => "bench"
+
+router DocRoute where
+  home => ""
+  sec (s : Section) (page : Nat) => "docs"
+
+#guard Router.toURL (DocRoute.sec .architecture 2) == "/docs/arch/2"
+#guard Router.fromURL "/docs/bench/5" == some (DocRoute.sec .benchmarks 5)
+#guard (Router.fromURL "/docs/unknown/5" : Option DocRoute) == none
+
+def navOn  : Style := css [ fontWeight "700" ]
+def navOff : Style := css [ fontWeight "400" ]
+def navView (s : Section) : Html Unit :=
+  <nav>
+    <a role="nav-overview" {if s == .overview then navOn else navOff}>{"Overview"}</a>
+    <a role="nav-arch"     {if s == .architecture then navOn else navOff}>{"Arch"}</a>
+    <a role="nav-bench"    {if s == .benchmarks then navOn else navOff}>{"Bench"}</a>
+  </nav>
+
+invariant navExclusive :
+  exactlyOneOf ["nav-overview", "nav-arch", "nav-bench"] navOn navOff holds_in navView
+
+def stepCount (n : Nat) (d : Nat) : Nat := n + d
+invariant nonNegFromZero : (fun n : Nat => 0 ≤ n) from (0 : Nat) preserved_by stepCount
+
+-- Issue #12: `LawfulJson` + `Dehydrate` round-trip and `(dehydrate := ...)` in `ui`.
+def docDehydrate : Dehydrate (DocRoute × Resource (Array Qed.Demo.Signup)) :=
+  Dehydrate.full
+
+example (x : DocRoute × Resource (Array Qed.Demo.Signup)) :
+    docDehydrate.rehydrate (docDehydrate.dehydrate x) = some x :=
+  docDehydrate.round_trip x
+
+def routedDehydratedApp : App DocRoute DocRoute :=
+  ui DocRoute.home (fun _ r => r) (onRoute := id) (dehydrate := Dehydrate.full) fun r =>
+    <div>{Router.toURL r}</div>
+
+#guard routedDehydratedApp.rehydrate (routedDehydratedApp.dehydrate (.sec .benchmarks 3))
+  == some (.sec .benchmarks 3)
+
 end SyntaxChecks

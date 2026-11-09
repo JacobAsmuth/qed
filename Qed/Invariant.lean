@@ -73,11 +73,11 @@ instance {Model β : Type} : InvTarget (Model × β) Model := ⟨Prod.fst⟩
 @[simp] theorem InvTarget.proj_fst {Model β : Type} (p : Model × β) :
     InvTarget.proj p = p.1 := rfl
 
-/-- `invariant name : pred preserved_by upd`, see the module docs. `using [lemmas]` hands extra
-    simp lemmas to the automatic discharger (for a fact it cannot discover on its own); the
-    optional `:= proof` supplies a full proof for cases automation cannot close. -/
+/-- `invariant name : pred [from init] preserved_by upd`, see the module docs. `using [lemmas]`
+    hands extra simp lemmas to the automatic discharger (for a fact it cannot discover on its own);
+    the optional `:= proof` supplies a full proof for cases automation cannot close. -/
 syntax (name := invariantCmd)
-  "invariant " ident " : " term " preserved_by " ident
+  "invariant " ident " : " term (" from " term)? " preserved_by " ident
     (" using " "[" term,* "]")? (" := " term)? : command
 
 open Lean Elab Tactic
@@ -136,72 +136,105 @@ elab "qedUnfoldPresent" "[" extra:term,* "]" : tactic => do
       catch _ => pure false
     unless ok do return
 
+syntax "qedDischargePreserved " "[" term,* "]" ident ident term:max (" from " term)? : tactic
+
 /-- The discharger behind `invariant … preserved_by`, as a tactic elaborator. After `cases` it
     unfolds the transition and framework wrappers, then unfolds *only the helpers that appear
     under the property* (`qedUnfoldPresent`), with the boundary size lemmas and any `using` lemmas
     (`extra`), and closes each branch. On a goal it can't close it reports which arm, the residual
     (in the developer's vocabulary, since irrelevant helpers were never unfolded), and the helpers
     that case still involves, pinned at the invariant's name. -/
-elab "qedDischargePreserved" "[" extra:term,* "]" upd:ident nm:ident pred:term : tactic => do
-  -- If the property is a *named* predicate (`abbrev Card.Safe …`) unfold it first, so the leaves
-  -- are plain arithmetic the closers can reach. An inline `fun m => …` isn't an identifier, so
-  -- this is skipped and it beta-reduces as before.
-  let predI : Ident := ⟨pred.raw⟩
-  let unfoldPred ← if pred.raw.isIdent
-    then `(tactic| try simp only [$predI:ident] at *)
-    else `(tactic| skip)
-  let toLemma (t : TSyntax `term) : TacticM (TSyntax `Lean.Parser.Tactic.simpLemma) :=
-    `(Lean.Parser.Tactic.simpLemma| $t:term)
-  let usingL := extra.getElems
-  let closerL := (← qedBoundaryLemmas.mapM (fun n => toLemma ⟨(mkIdent n).raw⟩))
-                   ++ (← usingL.mapM toLemma)
-  -- Unfold the transition and wrappers (projecting away fields the property ignores), then unfold
-  -- only the helpers that survived into the goal, split each `if`/`match`, and close every leaf
-  -- all-or-nothing (`<;> done`), wrapped in `try` so an arm it can't close is left as a goal.
-  evalTactic (← `(tactic|
-    (intro m msg h;
-     $unfoldPred:tactic;
-     cases msg <;>
-       (try simp_all only [$upd:ident, Qed.ToStep.toStep_model, Qed.ToStep.toStep_pair,
-                           InvTarget.proj_id, InvTarget.proj_fst]) <;>
-       qedUnfoldPresent [$[$usingL],*] <;>
-       (try ((repeat' split) <;>
-              (first | rfl | omega | assumption
-                     | (simp_all [$[$closerL],*] <;> omega)   -- branch condition / implication, then arith
-                     | (simp_all [$[$closerL],*] <;> done) | trivial))))))
-  let goals ← getUnsolvedGoals
-  unless goals.isEmpty do
-    let mut body : MessageData := m!""
-    for g in goals do
-      body := body ++ (← g.withContext do
-        let tag ← g.getTag
-        -- pretty-print *inside* the goal's context (so its hyps resolve), then drop the `✝`
-        -- daggers Lean marks cleared/inaccessible binders with, noise in a user-facing message.
-        let ty ← instantiateMVars (← g.getType)
-        let tgt := (← Meta.ppExpr ty).pretty.replace "✝" ""
-        -- the same-module helpers this stuck goal still mentions (dev vocabulary, what to give a fact about)
-        let env ← getEnv
-        let present ← (ty.getUsedConstants.filter (qedIsHelper env)).filterM
-          (fun n => return (← getProjectionFnInfo? n).isNone)
-        let involves := if present.isEmpty then m!"" else m!"\n    (still involves: {present.toList})"
-        pure m!"\n  • case `{tag}` still needs:  {tgt}{involves}")
-    throwErrorAt nm m!"invariant `{nm.getId}` isn't preserved by `{upd.getId}`, the automation \
-      couldn't close every message.\n{body}\n\nIf the property is true here, the prover is likely \
-      missing a fact: supply it with `… preserved_by {upd.getId} using [yourLemma]`, or prove the \
-      case with `:= by`. If a branch can actually violate the property, fix that branch of \
-      `{upd.getId}`, or weaken the property to what it guarantees."
+elab_rules : tactic
+  | `(tactic| qedDischargePreserved [$[$usingL],*] $upd $nm $pred $[from $init]?) => do
+    -- If the property is a *named* predicate (`abbrev Card.Safe …`) unfold it first, so the leaves
+    -- are plain arithmetic the closers can reach. An inline `fun m => …` isn't an identifier, so
+    -- this is skipped and it beta-reduces as before.
+    let pred := match pred with | `(($p)) => p | p => p
+    let predI : Ident := ⟨pred.raw⟩
+    let unfoldPred ← if pred.raw.isIdent
+      then `(tactic| try simp only [$predI:ident] at *)
+      else `(tactic| skip)
+    let toLemma (t : TSyntax `term) : TacticM (TSyntax `Lean.Parser.Tactic.simpLemma) :=
+      `(Lean.Parser.Tactic.simpLemma| $t:term)
+    let closerL := (← qedBoundaryLemmas.mapM (fun n => toLemma ⟨(mkIdent n).raw⟩))
+                     ++ (← usingL.mapM toLemma)
+    -- Unfold the transition and wrappers (projecting away fields the property ignores), then unfold
+    -- only the helpers that survived into the goal, split each `if`/`match`, and close every leaf
+    -- all-or-nothing (`<;> done`), wrapped in `try` so an arm it can't close is left as a goal.
+    let stepTac ← `(tactic|
+      (intro m msg h;
+       $unfoldPred:tactic;
+       cases msg <;>
+         (try simp_all only [$upd:ident, Qed.ToStep.toStep_model, Qed.ToStep.toStep_pair,
+                             InvTarget.proj_id, InvTarget.proj_fst]) <;>
+         qedUnfoldPresent [$[$usingL],*] <;>
+         (try ((repeat' split) <;>
+                (first | rfl | omega | assumption
+                       | (simp_all [$[$closerL],*] <;> omega)   -- branch condition / implication, then arith
+                       | (simp_all [$[$closerL],*] <;> done) | trivial)))))
+    match init with
+    | some initT =>
+        let initI : Ident := ⟨initT.raw⟩
+        let unfoldInit ← if initT.raw.isIdent
+          then `(tactic| try simp only [$initI:ident] at *)
+          else `(tactic| skip)
+        evalTactic (← `(tactic|
+          (refine And.intro ?init ?step;
+           case init =>
+             $unfoldPred:tactic
+             $unfoldInit:tactic
+             qedUnfoldPresent [$[$usingL],*]
+             try ((repeat' split) <;>
+                    (first | rfl | decide | omega | assumption
+                           | (simp_all [$[$closerL],*] <;> omega)
+                           | (simp_all [$[$closerL],*] <;> decide)
+                           | (simp_all [$[$closerL],*] <;> done) | trivial));
+           case step => $stepTac:tactic)))
+    | none =>
+        evalTactic stepTac
+    let goals ← getUnsolvedGoals
+    unless goals.isEmpty do
+      let mut body : MessageData := m!""
+      for g in goals do
+        body := body ++ (← g.withContext do
+          let tag ← g.getTag
+          -- pretty-print *inside* the goal's context (so its hyps resolve), then drop the `✝`
+          -- daggers Lean marks cleared/inaccessible binders with, noise in a user-facing message.
+          let ty ← instantiateMVars (← g.getType)
+          let tgt := (← Meta.ppExpr ty).pretty.replace "✝" ""
+          -- the same-module helpers this stuck goal still mentions (dev vocabulary, what to give a fact about)
+          let env ← getEnv
+          let present ← (ty.getUsedConstants.filter (qedIsHelper env)).filterM
+            (fun n => return (← getProjectionFnInfo? n).isNone)
+          let involves := if present.isEmpty then m!"" else m!"\n    (still involves: {present.toList})"
+          pure m!"\n  • case `{tag}` still needs:  {tgt}{involves}")
+      throwErrorAt nm m!"invariant `{nm.getId}` isn't preserved by `{upd.getId}`, the automation \
+        couldn't close every message.\n{body}\n\nIf the property is true here, the prover is likely \
+        missing a fact: supply it with `… preserved_by {upd.getId} using [yourLemma]`, or prove the \
+        case with `:= by`. If a branch can actually violate the property, fix that branch of \
+        `{upd.getId}`, or weaken the property to what it guarantees."
 
 macro_rules
+  | `(invariant $name:ident : $pred from $init preserved_by $upd:ident using [$_ls,*] := $pf:term) =>
+    `(theorem $name:ident : ($pred) ($init) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
+  | `(invariant $name:ident : $pred from $init preserved_by $upd:ident := $pf:term) =>
+    `(theorem $name:ident : ($pred) ($init) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
+  | `(invariant $name:ident : $pred from $init preserved_by $upd:ident using [$ls,*]) =>
+    `(theorem $name:ident : ($pred) ($init) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
+        qedDischargePreserved [$ls,*] $upd $name ($pred) from $init)
+  | `(invariant $name:ident : $pred from $init preserved_by $upd:ident) =>
+    `(theorem $name:ident : ($pred) ($init) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
+        qedDischargePreserved [] $upd $name ($pred) from $init)
   | `(invariant $name:ident : $pred preserved_by $upd:ident using [$_ls,*] := $pf:term) =>
     `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
   | `(invariant $name:ident : $pred preserved_by $upd:ident := $pf:term) =>
     `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
   | `(invariant $name:ident : $pred preserved_by $upd:ident using [$ls,*]) =>
     `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
-        qedDischargePreserved [$ls,*] $upd $name $pred)
+        qedDischargePreserved [$ls,*] $upd $name ($pred))
   | `(invariant $name:ident : $pred preserved_by $upd:ident) =>
     `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
-        qedDischargePreserved [] $upd $name $pred)
+        qedDischargePreserved [] $upd $name ($pred))
 
 /-! ### Styling invariants: the same `invariant`, over the view
 
@@ -284,6 +317,20 @@ def exactlyOne (roleA roleB : String) (on off : Style) : Html msg → Bool :=
   either (both (roleHas roleA on) (roleHas roleB off))
          (both (roleHas roleA off) (roleHas roleB on))
 
+/-- All role-tagged elements in `roles` carry `off`. -/
+def allRolesOff : List String → Style → Html msg → Bool
+  | [],      _,   _ => true
+  | r :: rs, off, h => roleHas r off h && allRolesOff rs off h
+
+/-- Exactly one role in `roles` is styled `on` and all others are styled `off`. -/
+def exactlyOneOf (roles : List String) (on off : Style) (h : Html msg) : Bool :=
+  let rec go (before : List String) : List String → Bool
+    | []      => false
+    | r :: rs =>
+        (allRolesOff before off h && roleHas r on h && allRolesOff rs off h)
+          || go (r :: before) rs
+  go [] roles
+
 /-! ### Lifting a styling contract over a list of children
 
 A parent-owned tag (`<Child state={c} onMsg={…}/>`) renders each child as
@@ -354,6 +401,25 @@ theorem everyElement_through_map {α β} (f : α → β) {Pα : String → List 
     (hP : ∀ t a, Pβ t (a.map (Attr.map f)) = Pα t a) (hc : everyElement Pα h = true) :
     everyElement Pβ (h.map f) = true := by rw [everyElement_map f hP]; exact hc
 
+/-- When a view styles an `N`-ary group with `if x == .a …` per element instead of a single
+    `match x`, `split` produces branches whose hypotheses constrain an enum `x` across its
+    constructors. Case-splitting `x` closes those branches without disturbing real failures. -/
+elab "qedCloseExhaustiveEnum" : tactic => withMainContext do
+  for ldecl in (← getLCtx) do
+    if ldecl.isImplementationDetail then continue
+    let ty ← instantiateMVars ldecl.type
+    let lhs? := match ty with
+      | .app (.app (.app (.const ``Eq _) _) (.app (.app (.app (.const ``BEq.beq _) _) _) lhs)) _ => some lhs
+      | .app (.const ``Not _) (.app (.app (.app (.const ``Eq _) _) (.app (.app (.app (.const ``BEq.beq _) _) _) lhs)) _) => some lhs
+      | .app (.const ``Not _) (.app (.app (.app (.const ``Eq _) _) lhs) _) => some lhs
+      | _ => none
+    if let some lhs := lhs? then
+      try
+        let lhsStx ← PrettyPrinter.delab lhs
+        evalTactic (← `(tactic| (cases $lhsStx:term <;> simp_all; done)))
+        return
+      catch _ => pure ()
+
 /-- Reduce a styling goal `pred (view m) = true`: unfold the view and every `Qed.Notation`
     combinator to `Html`/`Attr` constructors, split each `if`/`match`, and close the static leaves,
     leaving any *dynamic-list* residual (`everyElementL P (cards.map …)`) for the caller. Shared by
@@ -364,7 +430,8 @@ macro_rules
   | `(tactic| qedStyleReduce $view:ident) =>
     `(tactic|
       (simp only [$view:ident, Qed.roleHasOneOf, Qed.tagHasOneOf, Qed.roleHas, Qed.both,
-         Qed.either, Qed.exactlyOne, Qed.hasOneClass,
+         Qed.either, Qed.exactlyOne, Qed.allRolesOff, Qed.exactlyOneOf, Qed.exactlyOneOf.go,
+         Qed.hasOneClass,
          Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
          Qed.text, Qed.lazy, Qed.el, Qed.link, Qed.linkTo, Qed.styleSheet, Qed.theme,
          Qed.cls, Qed.attr, Qed.role, Qed.rawHtml, Qed.on,
@@ -375,8 +442,9 @@ macro_rules
        repeat' split;
        all_goals (first
          | rfl
-         | simp_all [Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
-                     Qed.hasOneClass])))
+         | (simp_all [Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
+                      Qed.hasOneClass];
+            try qedCloseExhaustiveEnum))))
 
 /-- `invariant name : pred holds_in view`, `pred : Html msg → Bool` holds of the view for every
     model. The optional `:= proof` supplies a proof the default discharger can't find. -/

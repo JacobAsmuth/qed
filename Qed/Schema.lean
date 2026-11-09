@@ -120,6 +120,16 @@ def fromJsonField {α} (c : Codec α) [FromJsonField α] (j : Json) (key : Strin
   | .error e => .error e
   | .ok a    => if h : c.valid a then .ok ⟨a, h⟩ else .error s!"{key}: failed validation"
 
+@[simp] theorem fromJsonField_of_field {α : Type} (c : Codec α) [LawfulJson α]
+    (j : Json) (k : String) (f : Field c.valid)
+    (h : j.field k = .ok (toJson f.val)) :
+    c.fromJsonField j k = .ok f := by
+  rcases f with ⟨val, hok⟩
+  simp [Codec.fromJsonField, LawfulJson.fromField_of_field j k val h, hok]
+
+theorem max_le_max {a b c d : Nat} (h1 : a ≤ c) (h2 : b ≤ d) : Nat.max a b ≤ Nat.max c d :=
+  Nat.max_le.2 ⟨Nat.le_trans h1 (Nat.le_max_left c d), Nat.le_trans h2 (Nat.le_max_right c d)⟩
+
 private def toInt? (s : String) : Option Int :=
   match s.toList with
   | '-' :: ds => (String.ofList ds).toNat?.map fun n => -(Int.ofNat n)
@@ -224,7 +234,7 @@ open Lean Elab Term Meta in
     `Codec` is rejected here with a clear message (not a synth cascade). `i` walks the context
     binders, nesting one `withLocalDeclD` each, before elaborating every field under them. -/
 private partial def schemaRefinedAux (cbns : Array Ident) (cbts : Array Term)
-    (inputs : Array Term) (i : Nat) : TermElabM (Array Bool) := do
+    (inputs : Array Term) (i : Nat) : TermElabM (Array (Bool × Bool)) := do
   if i < cbns.size then
     let bt ← elabType cbts[i]!
     withLocalDeclD cbns[i]!.getId bt fun _ => schemaRefinedAux cbns cbts inputs (i + 1)
@@ -237,7 +247,9 @@ private partial def schemaRefinedAux (cbns : Array Ident) (cbts : Array Term)
           let validExpr := mkApp2 (mkConst ``Qed.Codec.valid) α c
           let trueFn := Expr.lam `x α (mkConst ``True) BinderInfo.default
           -- refined ⇔ `valid` is NOT definitionally `fun _ => True`
-          pure (! (← isDefEq validExpr trueFn))
+          let isRef ← pure (! (← isDefEq validExpr trueFn))
+          let isLaw ← pure ((← trySynthInstance (mkApp (mkConst ``Qed.LawfulJson) α)) matches .some _)
+          pure (isRef, isLaw)
       | _ =>
           throwErrorAt inp m!"a schema field must be a `Codec` (e.g. `Codec.text`, \
             `Codec.nat.refine P`, or `Codec.json T` for a nested or list field), but this has \
@@ -245,8 +257,9 @@ private partial def schemaRefinedAux (cbns : Array Ident) (cbts : Array Term)
 
 open Lean Elab Command in
 private def schemaRefinedFlags (cbns : Array Ident) (cbts : Array Term) (inputs : Array Term) :
-    CommandElabM (Array Bool) :=
-  liftTermElabM (schemaRefinedAux cbns cbts inputs 0)
+    CommandElabM (Array Bool × Bool) := do
+  let flags ← liftTermElabM (schemaRefinedAux cbns cbts inputs 0)
+  return (flags.map (·.1), flags.all (·.2))
 
 open Lean Elab Command Term in
 elab_rules : command
@@ -262,7 +275,7 @@ elab_rules : command
       let toJsonId   := mkIdent (t.getId ++ `toJson)
       let fromJsonId := mkIdent (t.getId ++ `fromJson)
       let pairs := fs.zip inputs
-      let refined ← schemaRefinedFlags cbns cbts inputs
+      let (refined, allLawful) ← schemaRefinedFlags cbns cbts inputs
       -- ── Friendly pre-check. Each field's refinement must be decidable, or validity can't be
       -- computed. We probe by elaborating the control in isolation and capturing (then suppressing)
       -- whatever it logs, Lean *logs* a failed instance search rather than throwing it, so a plain
@@ -357,8 +370,8 @@ elab_rules : command
               el "div" [cls "qed-form"] $viewBody) ]
       -- JSON codec. `toJson`/`fromJson`/`decode`/`encode` are generated for EVERY schema, threading
       -- any context binders as leading arguments, so a context-parameterised schema still has a JSON
-      -- codec (e.g. `Appt.decode today s`). Only the `ToJson`/`FromJson` *instances* are restricted to
-      -- non-indexed types, since a class instance can't quantify a runtime binder.
+      -- codec (e.g. `Appt.decode today s`). Only the `ToJson`/`FromJson`/`LawfulJson` *instances* are
+      -- restricted to non-indexed types, since a class instance can't quantify a runtime binder.
       let jsonFnCmds : Array (TSyntax `command) := #[
         ← `(command| def $toJsonId $[($cbns:ident : $cbts:term)]* (x : $tApp) : Json :=
               Json.obj [$[$jsonPairs],*]),
@@ -369,9 +382,28 @@ elab_rules : command
               Except String $tApp := (Json.parse s maxDepth).bind ($fromJsonApp)),
         ← `(command| def $encodeId $[($cbns:ident : $cbts:term)]* (x : $tApp) : String :=
               Json.render ($toJsonApp x)) ]
+      let depthBoundExpr ← inputs.foldrM (init := ← `(term| (0 : Nat))) fun inp acc =>
+        `(term| Nat.max (LawfulJson.depthBound (Codec.Val $inp)) $acc)
+      let depthProofExpr ← jsonReads.foldrM (init := ← `(term| Nat.le_refl 0)) fun rd acc =>
+        `(term| Codec.max_le_max (LawfulJson.depth_toJson $rd) $acc)
+      let fieldEqs ← (pairs.zip refined).mapM fun ((f, inp), r) => do
+        let keyLit := Syntax.mkStrLit (toString f.getId)
+        if r then `(term| Codec.fromJsonField_of_field $inp ($toJsonId x) $keyLit (x.$f) rfl)
+        else `(term| LawfulJson.fromField_of_field ($toJsonId x) $keyLit (x.$f) rfl)
+      let lawfulCmds : Array (TSyntax `command) ← if cbns.isEmpty && allLawful then
+        pure #[← `(command|
+          instance : LawfulJson $t where
+            depthBound := 1 + $depthBoundExpr
+            depth_toJson x := Nat.add_le_add_left $depthProofExpr 1
+            fromJson_toJson x := by
+              have h : $fromJsonId ($toJsonId x) = .ok x := by
+                unfold $fromJsonId
+                simp only [$[$fieldEqs:term],*, bind, Except.bind, pure, Except.pure]
+              exact h)]
+      else pure #[]
       let jsonInstCmds : Array (TSyntax `command) := #[
         ← `(command| instance : ToJson $t := ⟨$toJsonId⟩),
-        ← `(command| instance : FromJson $t := ⟨$fromJsonId⟩) ]
+        ← `(command| instance : FromJson $t := ⟨$fromJsonId⟩) ] ++ lawfulCmds
       let cmds := formCmds ++ jsonFnCmds ++ (if cbns.isEmpty then jsonInstCmds else #[])
       for c in cmds do elabCommand c
 

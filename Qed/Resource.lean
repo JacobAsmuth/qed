@@ -183,4 +183,19 @@ instance [FromJson α] : FromJson (Resource α) := ⟨fun j =>
   | some "failed"  => .ok (.failed (((j.get? "e").bind (·.str?)).getD ""))
   | _              => .error "expected a Resource (tagged object)"⟩
 
+instance [LawfulJson α] : LawfulJson (Resource α) where
+  depthBound := 1 + LawfulJson.depthBound α
+  depth_toJson
+    | .idle | .loading | .failed _ => Nat.le_add_right 1 _
+    | .ok a => Nat.add_le_add_left (Json.maxObj_le_iff.2 (by
+        intro kv hkv; simp only [List.mem_cons, List.not_mem_nil, or_false] at hkv
+        rcases hkv with rfl | rfl
+        · exact Nat.zero_le _
+        · exact LawfulJson.depth_toJson a)) 1
+  fromJson_toJson
+    | .idle | .loading | .failed _ => rfl
+    | .ok a => by
+        change (fromJson (toJson a) : Except String α).map Resource.ok = Except.ok (Resource.ok a)
+        rw [LawfulJson.fromJson_toJson a]; rfl
+
 end Qed

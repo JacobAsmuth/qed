@@ -478,12 +478,55 @@ open Lean Elab Term Meta in
   let value ← instantiateMVars value
   mkAppM ``App.addLocals #[value, ← registrationsIn value]
 
+/-- A verified SSR state serializer: `dehydrate` encodes the relevant slice of `Model`,
+    `rehydrate` rebuilds a model from that string, and `round_trip` guarantees that
+    rehydrating a dehydrated model recovers `project m` (`id` for a full model, or
+    `set init (get m)` for a slice). -/
+structure Dehydrate (Model : Type) where
+  project    : Model → Model := id
+  dehydrate  : Model → String
+  rehydrate  : String → Option Model
+  round_trip : ∀ m, rehydrate (dehydrate m) = some (project m)
+
+namespace Dehydrate
+
+/-- Dehydrate the entire `Model` via its `LawfulJson` codec (`project = id`). -/
+def full {Model : Type} [LawfulJson Model] : Dehydrate Model where
+  project    := id
+  dehydrate  := fun m => Json.render (toJson m)
+  rehydrate  := fun s => ((Json.parse s (max 64 (LawfulJson.depthBound Model))).bind fromJson).toOption
+  round_trip := fun m => by
+    simp [LawfulJson.parse_render_toJson m (Nat.le_max_right 64 _), Except.toOption]
+
+/-- Dehydrate a slice `α` of `Model` via its `LawfulJson` codec, restoring into `init`
+    (`project m = set init (get m)`). -/
+def slice {Model α : Type} [LawfulJson α] (init : Model)
+    (get : Model → α) (set : Model → α → Model) : Dehydrate Model where
+  project    := fun m => set init (get m)
+  dehydrate  := fun m => Json.render (toJson (get m))
+  rehydrate  := fun s => (((Json.parse s (max 64 (LawfulJson.depthBound α))).bind fromJson).toOption).map (set init)
+  round_trip := fun m => by
+    simp [LawfulJson.parse_render_toJson (get m) (Nat.le_max_right 64 _), Except.toOption]
+
+/-- Dehydrate only a `[Router R]` field of `Model`, restoring into `init`. -/
+def route {Model R : Type} [Router R] (init : Model)
+    (get : Model → R) (set : Model → R → Model) : Dehydrate Model :=
+  slice init get set
+
+end Dehydrate
+
+/-- Attach a verified `Dehydrate Model` codec to an app — the `ui (dehydrate := …)` option
+    expands to this. -/
+def App.withDehydrate {Model Msg : Type} (d : Dehydrate Model) (app : App Model Msg) : App Model Msg :=
+  { app with dehydrate := d.dehydrate, rehydrate := d.rehydrate }
+
 open Lean in
 macro_rules
   | `(ui $init $update $[$opts:uiOpt]* fun $m => $body) => do
       let tmpl ← `(view% fun $m => $body)
-      let mut routeE?   : Option (TSyntax `term) := none
-      let mut queriesE? : Option (TSyntax `term) := none
+      let mut routeE?     : Option (TSyntax `term) := none
+      let mut queriesE?   : Option (TSyntax `term) := none
+      let mut dehydrateE? : Option (TSyntax `term) := none
       let mut startE  : TSyntax `term ← `(Qed.Cmd.none)
       let mut localsE : TSyntax `term ← `(([] : List Qed.LocalDef))
       let mut portE   : TSyntax `term ← `(none)
@@ -491,12 +534,13 @@ macro_rules
         match opt with
         | `(uiOpt| ($name:ident := $e)) =>
             match name.getId with
-            | `onRoute => routeE?   := some e
-            | `queries => queriesE? := some e
-            | `start   => startE  := e
-            | `locals  => localsE := e
-            | `onPort  => portE   := e
-            | _ => Macro.throwErrorAt name s!"ui: unknown option '{name.getId}' (expected onRoute/start/locals/onPort/queries)"
+            | `onRoute   => routeE?     := some e
+            | `queries   => queriesE?   := some e
+            | `dehydrate => dehydrateE? := some e
+            | `start     => startE  := e
+            | `locals    => localsE := e
+            | `onPort    => portE   := e
+            | _ => Macro.throwErrorAt name s!"ui: unknown option '{name.getId}' (expected onRoute/start/locals/onPort/queries/dehydrate)"
         | _ => pure ()
       let base ← match routeE? with
         | some route =>
@@ -504,6 +548,9 @@ macro_rules
                 (start := $startE) (locals := $localsE) (onPort := $portE))
         | none =>
             `(Qed.mkApp $init $update $tmpl (start := $startE) (locals := $localsE) (onPort := $portE))
+      let base ← match dehydrateE? with
+        | some d => `(Qed.App.withDehydrate $d $base)
+        | none   => pure base
       -- `queries` (auto-refetch) wraps the finished app's update; absent ⇒ the app unchanged.
       -- `withQueries` lives in `Qed.Resource` (imported by app modules, not by this one), so emit
       -- it with `mkIdent`, a bare quotation would pre-resolve `Qed.App.` as a struct projection

@@ -102,6 +102,9 @@ structure Ctx where
       their `inc`/`dec` are guaranteed no-ops and need not be emitted — only refcounted arrays
       carry a count. Keyed by `VarId.idx`. Cuts both bundle size and per-op call overhead. -/
   nonArr     : Std.HashSet Nat := {}
+  projSrc    : Std.HashMap Nat Nat := {}
+  /-- non-recursive join points lowered as labeled blocks `jN: { ... }` in the enclosing scope. -/
+  inlineJps  : Std.HashMap Nat (Array Param) := {}
 
 def Ctx.js (c : Ctx) (n : Name) : String :=
   match c.names.get? n with
@@ -202,39 +205,70 @@ partial def hasSelfTail (self : Name) : FnBody → Bool
   | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b => hasSelfTail self b
   | _ => false
 
-/-- Does a tail self-call occur inside a `.jdecl` join-point body? When false, tail self-calls
-    can emit direct parameter reassignment + `continue` inside `while (true)` without a closure
-    trampoline or per-step array allocation. -/
-partial def hasJpSelfTail (self : Name) (inJp : Bool := false) : FnBody → Bool
-  | .vdecl z _ (.fap f _) cont => (inJp && f == self && retsVar z cont) || hasJpSelfTail self inJp cont
-  | .vdecl _ _ _ b    => hasJpSelfTail self inJp b
-  | .jdecl _ _ v b    => hasJpSelfTail self true v || hasJpSelfTail self inJp b
-  | .case _ _ _ alts  => alts.any (fun a => hasJpSelfTail self inJp a.body)
-  | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b => hasJpSelfTail self inJp b
-  | .sset _ _ _ _ _ b => hasJpSelfTail self inJp b
-  | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b => hasJpSelfTail self inJp b
+/-- Does `FnBody` contain a `.jmp` targeting `target`? -/
+partial def hasJmpTo (target : JoinPointId) : FnBody → Bool
+  | .jmp j _          => j == target
+  | .vdecl _ _ _ b | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b
+  | .sset _ _ _ _ _ b | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b => hasJmpTo target b
+  | .jdecl _ _ v b    => hasJmpTo target v || hasJmpTo target b
+  | .case _ _ _ alts  => alts.any (fun a => hasJmpTo target a.body)
+  | .ret _ | .unreachable => false
+
+/-- Does a tail self-call occur inside a closure-wrapped `.jdecl` join-point body? Non-recursive
+    join points lower to labeled blocks (`jN: { ... }`), which do not cross a function boundary,
+    so `continue` inside them targets the enclosing `while (true)` loop directly. -/
+partial def hasJpSelfTail (self : Name) (inClosureJp : Bool := false) : FnBody → Bool
+  | .vdecl z _ (.fap f _) cont => (inClosureJp && f == self && retsVar z cont) || hasJpSelfTail self inClosureJp cont
+  | .vdecl _ _ _ b    => hasJpSelfTail self inClosureJp b
+  | .jdecl j _ v b    =>
+      let recJp := hasJmpTo j v
+      hasJpSelfTail self (inClosureJp || recJp) v || hasJpSelfTail self inClosureJp b
+  | .case _ _ _ alts  => alts.any (fun a => hasJpSelfTail self inClosureJp a.body)
+  | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b => hasJpSelfTail self inClosureJp b
+  | .sset _ _ _ _ _ b => hasJpSelfTail self inClosureJp b
+  | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b => hasJpSelfTail self inClosureJp b
   | _ => false
 
-/-- Vars whose defining expression is provably not an array — a `ctor`/`reuse` (a tagged record),
-    a `pap` (a closure), a literal, or a (un)boxed scalar. Their `inc`/`dec` only ever hit a value
-    with no refcount, so emitting them is dead weight; collect them so `emitBody` can drop them. -/
+/-- Vars whose defining expression cannot carry or contain a refcounted array — a `pap` (closure),
+    a literal, or a (un)boxed scalar. Their `inc`/`dec` are guaranteed no-ops; drop them. -/
 partial def collectNonArr (acc : Std.HashSet Nat) : FnBody → Std.HashSet Nat
   | .vdecl x _ e b =>
       let acc := match e with
         | .ctor .. | .reuse .. | .pap .. | .lit .. | .box .. | .unbox .. | .isShared .. => acc.insert x.idx
+        | .proj _ p | .uproj _ p | .sproj _ _ p => acc.insert p.idx
         | _ => acc
       collectNonArr acc b
   | .jdecl _ _ v b => collectNonArr (collectNonArr acc v) b
-  | .case _ _ _ alts => alts.foldl (fun acc alt => collectNonArr acc alt.body) acc
+  | .case _ x _ alts => alts.foldl (fun acc alt => collectNonArr acc alt.body) (acc.insert x.idx)
   | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b | .sset _ _ _ _ _ b
   | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b => collectNonArr acc b
+  | _ => acc
+
+/-- Is constructor `p` dropped (`dec`/`del`) in the contiguous projection+RC sequence starting at `b`? -/
+partial def hasDecOf (p : Nat) : FnBody → Bool
+  | .dec y _ _ _ b => p == y.idx || hasDecOf p b
+  | .del y b       => p == y.idx || hasDecOf p b
+  | .inc _ _ _ _ b => hasDecOf p b
+  | .vdecl _ _ (.proj ..) b | .vdecl _ _ (.uproj ..) b | .vdecl _ _ (.sproj ..) b => hasDecOf p b
+  | _              => false
+
+/-- Map each `.proj` variable `x` whose parent `p` is a call result (`.fap`/`.ap`) to `p`. -/
+partial def collectProjSrc (calls : Std.HashSet Nat) (acc : Std.HashMap Nat Nat) : FnBody → Std.HashMap Nat Nat
+  | .vdecl x _ (.fap ..) b | .vdecl x _ (.ap ..) b => collectProjSrc (calls.insert x.idx) acc b
+  | .vdecl x _ (.proj _ p) b =>
+      collectProjSrc calls (if calls.contains p.idx then acc.insert x.idx p.idx else acc) b
+  | .vdecl _ _ _ b => collectProjSrc calls acc b
+  | .jdecl _ _ v b => collectProjSrc calls (collectProjSrc calls acc v) b
+  | .case _ _ _ alts => alts.foldl (fun acc alt => collectProjSrc calls acc alt.body) acc
+  | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b | .sset _ _ _ _ _ b
+  | .inc _ _ _ _ b | .dec _ _ _ _ b | .del _ b => collectProjSrc calls acc b
   | _ => acc
 
 partial def emitBody (c : Ctx) (d : Nat) : FnBody → String
   | .vdecl x ty e b   =>
       -- A tail self-call `let x = self(args); return x` either reassigns params and `continue`s
-      -- directly (when no tail self-call sits inside a join point) or returns a trampoline marker
-      -- `$.tc([args])` that propagates out of join points to the loop driver. No JS recursion.
+      -- directly (when no tail self-call sits inside a closure join point) or returns a trampoline
+      -- marker `$.tc([args])` that propagates out of closure join points to the loop driver.
       match e with
       | .fap f args =>
           if c.selfFn == some f && retsVar x b then
@@ -251,21 +285,41 @@ partial def emitBody (c : Ctx) (d : Nat) : FnBody → String
           else s!"{c.ind d}let {v x} = {emitExpr c ty e};\n" ++ emitBody c d b
       | _ => s!"{c.ind d}let {v x} = {emitExpr c ty e};\n" ++ emitBody c d b
   | .jdecl j xs val b =>
-      let ps := String.intercalate ", " (xs.toList.map (v ·.x))
-      s!"{c.ind d}const {jp j} = ({ps}) => " ++ "{\n" ++ emitBody c (d+1) val ++ s!"{c.ind d}" ++ "};\n"
-        ++ emitBody c d b
+      if !hasJmpTo j val then
+        let c' := { c with inlineJps := c.inlineJps.insert j.idx xs }
+        let decls := if xs.isEmpty then ""
+          else s!"{c.ind d}let {String.intercalate ", " (xs.toList.zipIdx.map fun (_, i) => s!"_{jp j}_{i}")};\n"
+        let binds := if xs.isEmpty then ""
+          else s!"{c.ind d}let {String.intercalate ", " (xs.toList.zipIdx.map fun (p, i) => s!"{v p.x} = _{jp j}_{i}")};\n"
+        decls ++ s!"{c.ind d}{jp j}: \{\n" ++ emitBody c' (d+1) b ++ s!"{c.ind d}}\n" ++ binds ++ emitBody c d val
+      else
+        let ps := String.intercalate ", " (xs.toList.map (v ·.x))
+        s!"{c.ind d}const {jp j} = ({ps}) => " ++ "{\n" ++ emitBody c (d+1) val ++ s!"{c.ind d}" ++ "};\n"
+          ++ emitBody c d b
   | .set x i y b      => s!"{c.ind d}{v x}.f[{i}] = {emitArg y};\n" ++ emitBody c d b
   | .setTag x cidx b  => s!"{c.ind d}{v x}.t = {cidx};\n" ++ emitBody c d b
   | .uset x i y b     => s!"{c.ind d}{v x}.u[{i}] = {v y};\n" ++ emitBody c d b
   | .sset x n off y _ b => s!"{c.ind d}{v x}.s[{soff n off}] = {v y};\n" ++ emitBody c d b
   -- RC ops: GC reclaims memory, but the counts let array mutators tell a uniquely-owned array
-  -- (mutate in place — O(1)) from a shared one (copy). `$.inc`/`$.dec` only touch refcounted
-  -- arrays; on a var we proved is not an array (`nonArr`) the count is a no-op, so emit nothing.
-  | .inc x n _ _ b    => (if c.nonArr.contains x.idx then "" else s!"{c.ind d}$.inc({v x}, {n});\n") ++ emitBody c d b
+  -- (mutate in place — O(1)) from a shared one (copy). Only `Array`s carry `.r`, so `inc`/`dec`
+  -- on `nonArr` vars are omitted; when a projected field `x = p.f[i]` is `inc`ed right before
+  -- its parent constructor `p` is `dec`ed, 1 reference transfers from `p` to `x` (`n - 1`).
+  | .inc x n _ _ b    =>
+      let n' := match c.projSrc.get? x.idx with
+        | some p => if hasDecOf p b then n - 1 else n
+        | none   => n
+      (if n' == 0 || c.nonArr.contains x.idx then "" else s!"{c.ind d}$.inc({v x}, {n'});\n") ++ emitBody c d b
   | .dec x n _ _ b    => (if c.nonArr.contains x.idx then "" else s!"{c.ind d}$.dec({v x}, {n});\n") ++ emitBody c d b
   | .del x b          => (if c.nonArr.contains x.idx then "" else s!"{c.ind d}$.dec({v x}, 1);\n") ++ emitBody c d b
   | .ret a            => s!"{c.ind d}return {emitArg a};\n"
-  | .jmp j ys         => s!"{c.ind d}return {jp j}({String.intercalate ", " (ys.toList.map emitArg)});\n"
+  | .jmp j ys         =>
+      match c.inlineJps.get? j.idx with
+      | some _ =>
+          let assigns := String.intercalate " " (ys.toList.zipIdx.map fun (a, i) => s!"_{jp j}_{i} = {emitArg a};")
+          let pfx := if assigns.isEmpty then "" else assigns ++ " "
+          s!"{c.ind d}{pfx}break {jp j};\n"
+      | none =>
+          s!"{c.ind d}return {jp j}({String.intercalate ", " (ys.toList.map emitArg)});\n"
   | .unreachable      => s!"{c.ind d}throw new Error('unreachable');\n"
   | .case _ x xType alts =>
       let scrut := if xType.isObj then s!"$.tag({v x})" else v x
@@ -277,7 +331,7 @@ partial def emitBody (c : Ctx) (d : Nat) : FnBody → String
 
 def emitDecl (c0 : Ctx) : Decl → String
   | .fdecl f xs _ body _ =>
-      let c := { c0 with nonArr := collectNonArr {} body }
+      let c := { c0 with nonArr := collectNonArr {} body, projSrc := collectProjSrc {} {} body }
       if xs.isEmpty then
         -- A nullary decl is a module global: computed once, then shared (mirrors the C
         -- backend's `_init_`/`initialize` caching). `$.memo` makes refs created once.

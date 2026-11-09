@@ -21,32 +21,59 @@ const XLINK_NS = 'http://www.w3.org/1999/xlink';
 const XML_NS   = 'http://www.w3.org/XML/1998/namespace';
 const attrNS = (k) => k.startsWith('xlink:') ? XLINK_NS : (k.startsWith('xml:') ? XML_NS : null);
 const managedAttrs = new WeakMap();
+const nodeId = (el) => {
+  if (!el) return 0;
+  const g = Q(), N = g.nodes, id = el.__qedId;
+  if (id !== undefined && N[id] === el) return id;
+  const F = (g.free ||= []);
+  const slot = F.length > 0 ? F.pop() : N.length;
+  N[slot] = el;
+  return (el.__qedId = slot);
+};
+const dropNode = (el) => {
+  if (!el) return;
+  const g = Q(), N = g.nodes, F = (g.free ||= []), q = [el];
+  while (q.length > 0) {
+    const cur = q.pop(), id = cur.__qedId;
+    if (id !== undefined && N[id] === cur) { N[id] = null; cur.__qedId = undefined; F.push(id); }
+    if (cur.childNodes) for (let i = 0; i < cur.childNodes.length; i++) q.push(cur.childNodes[i]);
+  }
+};
 
 export const dom = {
   // `ns` is the namespace the parent established for its children (see childNamespace); "" is the
   // HTML default, except a standalone `svg` tag still enters the SVG namespace.
-  createElement(ns, tag, w) { const N = Q().nodes; const real = ns || (tag === 'svg' ? SVG_NS : ''); N.push(real ? document.createElementNS(real, tag) : document.createElement(tag)); return ok(N.length - 1, w); },
+  createElement(ns, tag, w) { const real = ns || (tag === 'svg' ? SVG_NS : ''); return ok(nodeId(real ? document.createElementNS(real, tag) : document.createElement(tag)), w); },
   // The namespace children of `node` inherit: SVG inside an <svg> subtree, HTML otherwise — and
   // back to HTML inside <foreignObject>, whose content is ordinary HTML.
   childNamespace(node, w) { const el = Q().nodes[node]; const svg = !!el && el.namespaceURI === SVG_NS && el.localName !== 'foreignObject'; return ok(svg ? SVG_NS : '', w); },
-  createText(s, w)      { const N = Q().nodes; N.push(document.createTextNode(s));    return ok(N.length - 1, w); },
-  createFragment(w)     { const N = Q().nodes; N.push(document.createDocumentFragment()); return ok(N.length - 1, w); },
+  createText(s, w)      { return ok(nodeId(document.createTextNode(s)), w); },
+  createFragment(w)     { return ok(nodeId(document.createDocumentFragment()), w); },
   setAttribute(node, k, v, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) { if (el.getAttributeNS(ns, k.slice(k.indexOf(':') + 1)) !== v) el.setAttributeNS(ns, k, v); } else if (el.getAttribute(k) !== v) el.setAttribute(k, v); } return ok(PUnit, w); },
   removeAttribute(node, k, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) el.removeAttributeNS(ns, k.slice(k.indexOf(':') + 1)); else el.removeAttribute(k); } return ok(PUnit, w); },
-  retainAttributes(node, namesJson, w) {
+  retainAttributes(node, namesList, w) {
     const el = Q().nodes[node];
     if (!el?.attributes) return ok(PUnit, w);
-    const names = new Set(JSON.parse(namesJson));
+    const previous = managedAttrs.get(el);
+    if (!previous && !namesList) return ok(PUnit, w);
+    const names = new Set();
+    if (typeof namesList === 'string') {
+      for (const n of JSON.parse(namesList)) names.add(n);
+    } else {
+      for (let cur = namesList; cur && cur.t === 1; cur = cur.f[1]) names.add(cur.f[0]);
+    }
     // Track only framework-owned names. Hydration or userland may attach unrelated
     // attributes (including node-identity sentinels), which reconciliation must preserve.
-    const previous = managedAttrs.get(el) || names;
-    // `value` is normally written as a property and has no corresponding attribute.
-    if (previous.has('value') && !names.has('value')) el.value = '';
-    if (previous.has('checked') && !names.has('checked')) el.checked = false;
-    for (const attr of [...el.attributes]) {
-      if (previous.has(attr.name) && !names.has(attr.name)) el.removeAttributeNS(attr.namespaceURI, attr.localName);
+    if (previous) {
+      // `value` is normally written as a property and has no corresponding attribute.
+      if (previous.has('value') && !names.has('value')) el.value = '';
+      if (previous.has('checked') && !names.has('checked')) el.checked = false;
+      for (const attr of [...el.attributes]) {
+        if (previous.has(attr.name) && !names.has(attr.name)) el.removeAttributeNS(attr.namespaceURI, attr.localName);
+      }
     }
-    managedAttrs.set(el, names);
+    if (names.size > 0) managedAttrs.set(el, names);
+    else if (previous) managedAttrs.delete(el);
     return ok(PUnit, w);
   },
   getAttribute(node, k, w)    { const el = Q().nodes[node]; const v = el ? el.getAttribute(k) : null; return ok(v == null ? '' : v, w); },
@@ -67,14 +94,14 @@ export const dom = {
   httpSend(method, url, body, id, w)  { Q(); if (globalThis.__qed.httpSend) globalThis.__qed.httpSend(method, url, body, id); return ok(PUnit, w); },
   currentPath(w) { return ok(location.pathname, w); },
   pushPath(p, w) { history.pushState({}, '', p); return ok(PUnit, w); },
-  appendChild(parent, child, w) { const N = Q().nodes; if (N[parent] && N[child]) N[parent].appendChild(N[child]); return ok(PUnit, w); },
+  appendChild(parent, child, w) { const N = Q().nodes, p = N[parent], c = N[child]; if (p && c) { const isFrag = c.nodeType === 11 || c.localName === '#fragment'; p.appendChild(c); if (isFrag) dropNode(c); } return ok(PUnit, w); },
   setText(node, s, w) { const el = Q().nodes[node]; if (el && el.textContent !== s) el.textContent = s; return ok(PUnit, w); },
   setInnerHtml(node, html, w) { const el = Q().nodes[node]; if (el && el.innerHTML !== html) el.innerHTML = html; return ok(PUnit, w); },
-  childAt(parent, index, w) { const N = Q().nodes, p = N[parent]; const c = p ? p.childNodes[index] : null; if (!c) return ok(0, w); N.push(c); return ok(N.length - 1, w); },
+  childAt(parent, index, w) { const p = Q().nodes[parent]; return ok(nodeId(p ? p.childNodes[index] : null), w); },
   childCount(parent, w) { const p = Q().nodes[parent]; return ok(p ? p.childNodes.length : 0, w); },
-  appRoot(w) { const N = Q().nodes; const root = document.getElementById('app'); const c = root ? root.firstElementChild : null; if (!c) return ok(0, w); N.push(c); return ok(N.length - 1, w); },
-  removeChild(parent, index, w) { const p = Q().nodes[parent]; if (p && p.childNodes[index]) p.removeChild(p.childNodes[index]); return ok(PUnit, w); },
-  replaceChild(parent, index, newChild, w) { const N = Q().nodes, p = N[parent]; if (p && N[newChild] && p.childNodes[index]) p.replaceChild(N[newChild], p.childNodes[index]); return ok(PUnit, w); },
+  appRoot(w) { const root = document.getElementById('app'); return ok(nodeId(root ? root.firstElementChild : null), w); },
+  removeChild(parent, index, w) { const p = Q().nodes[parent], old = p && p.childNodes[index]; if (old) { p.removeChild(old); dropNode(old); } return ok(PUnit, w); },
+  replaceChild(parent, index, newChild, w) { const N = Q().nodes, p = N[parent], c = N[newChild], old = p && p.childNodes[index]; if (old && c) { p.replaceChild(c, old); if (old !== c) dropNode(old); } return ok(PUnit, w); },
   insertBefore(parent, index, child, w) {
     const N = Q().nodes, p = N[parent], c = N[child];
     if (!p || !c) return ok(PUnit, w);

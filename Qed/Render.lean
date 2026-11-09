@@ -18,16 +18,20 @@ namespace Qed
     reusing a key string never collide. -/
 def localKey (component key : String) : String := component ++ "@" ++ key
 
+@[inline] def isHtmlSpecial (c : Char) : Bool :=
+  c == '&' || c == '<' || c == '>' || c == '"' || c == '\''
+
 /-- Escape text/attribute values so model data cannot break out of the markup. -/
 def escapeHtml (s : String) : String :=
-  s.foldl (init := "") fun acc c =>
-    acc ++ match c with
-      | '&'  => "&amp;"
-      | '<'  => "&lt;"
-      | '>'  => "&gt;"
-      | '"'  => "&quot;"
-      | '\'' => "&#39;"
-      | c    => c.toString
+  if !s.any isHtmlSpecial then s
+  else s.foldl (init := "") fun acc c =>
+    match c with
+    | '&'  => acc ++ "&amp;"
+    | '<'  => acc ++ "&lt;"
+    | '>'  => acc ++ "&gt;"
+    | '"'  => acc ++ "&quot;"
+    | '\'' => "&#39;" |> (acc ++ ·)
+    | c    => acc.push c
 
 /-- The key an attribute occupies, if any (`onClick` occupies none). -/
 def Attr.key? : Attr msg → Option String
@@ -52,11 +56,15 @@ def normalizeAttrs (attrs : List (Attr msg)) : List (Attr msg) :=
   let merged  := if classes.isEmpty then [] else [Attr.cls (String.intercalate " " classes)]
   merged ++ dedupAttrs (attrs.filter (fun | .cls _ => false | _ => true))
 
+@[inline] def isKeyChar (c : Char) : Bool :=
+  c.isAlphanum || c == '-' || c == '_' || c == ':' || c == '.'
+
 /-- Drop characters that could break out of an attribute *name* (quotes, spaces, `<`, `>`,
     `=`, `/`, control chars), keeping only the URL/HTML-safe name characters. Attribute names
     are normally literals; this closes the injection an `attr (userKey) v` would otherwise open. -/
 def sanitizeKey (k : String) : String :=
-  String.ofList (k.toList.filter (fun c => c.isAlphanum || c == '-' || c == '_' || c == ':' || c == '.'))
+  if k.all isKeyChar then k
+  else String.ofList (k.toList.filter isKeyChar)
 
 /-- HTML void elements: rendered with no children and no closing tag (`<input>`, not
     `<input></input>`), so server markup parses and hydrates the way the browser builds it. -/
@@ -129,24 +137,18 @@ mutual
 end
 
 mutual
-  /-- Runtime renderer: sibling strings accumulate as fragments, then join once. -/
+  /-- Runtime renderer: sibling strings accumulate directly into `acc`. -/
   def renderNodeTR (hs : Array msg) : Html msg → String × Array msg
     | .text s => (escapeHtml s, hs)
     | .element tag attrs children =>
-        renderElement (fun hs => renderChildrenTR hs [] children) hs tag attrs children
+        renderElement (fun hs => renderChildrenTR hs "" children) hs tag attrs children
     | .lazy _ sub => renderNodeTR hs sub
-  def renderChildrenTR (hs : Array msg) (rev : List String) : List (Html msg) → String × Array msg
-    | [] => (String.join rev.reverse, hs)
+  def renderChildrenTR (hs : Array msg) (acc : String) : List (Html msg) → String × Array msg
+    | [] => (acc, hs)
     | c :: cs =>
         let (str, hs') := renderNodeTR hs c
-        renderChildrenTR hs' (str :: rev) cs
+        renderChildrenTR hs' (acc ++ str) cs
 end
-
-private theorem join_append (xs ys : List String) :
-    String.join (xs ++ ys) = String.join xs ++ String.join ys := by
-  induction xs with
-  | nil => simp
-  | cons x xs ih => simp [ih, String.append_assoc]
 
 mutual
   theorem renderNodeTR_eq (hs : Array msg) (h : Html msg) : renderNodeTR hs h = renderNode hs h := by
@@ -157,16 +159,16 @@ mutual
         unfold renderNodeTR renderNode
         congr 1
         funext table
-        simpa using renderChildrenTR_eq table [] children
-  theorem renderChildrenTR_eq (hs : Array msg) (rev : List String) (cs : List (Html msg)) :
-      renderChildrenTR hs rev cs =
-        (String.join rev.reverse ++ (renderChildren hs cs).1, (renderChildren hs cs).2) := by
+        simpa using renderChildrenTR_eq table "" children
+  theorem renderChildrenTR_eq (hs : Array msg) (acc : String) (cs : List (Html msg)) :
+      renderChildrenTR hs acc cs =
+        (acc ++ (renderChildren hs cs).1, (renderChildren hs cs).2) := by
     cases cs with
     | nil => simp [renderChildrenTR, renderChildren]
     | cons c cs =>
         simp only [renderChildrenTR, renderNodeTR_eq, renderChildren]
         rw [renderChildrenTR_eq]
-        simp [List.reverse_cons, join_append, String.append_assoc]
+        simp [String.append_assoc]
 end
 
 /-- Compilation uses the tail-recursive traversal; proofs retain the structural equations. -/
@@ -175,11 +177,11 @@ end
   exact (renderNodeTR_eq hs h).symm
 
 def renderChildrenFast (hs : Array msg) (cs : List (Html msg)) : String × Array msg :=
-  renderChildrenTR hs [] cs
+  renderChildrenTR hs "" cs
 
 @[csimp] theorem renderChildren_eq_renderChildrenFast : @renderChildren = @renderChildrenFast := by
   funext msg hs cs
-  simpa [renderChildrenFast] using (renderChildrenTR_eq hs [] cs).symm
+  simpa [renderChildrenFast] using (renderChildrenTR_eq hs "" cs).symm
 
 /-- Render a node to an HTML string (model data escaped). The total renderer: a
     local host renders *empty* (the driver fills it in the browser). Used for native

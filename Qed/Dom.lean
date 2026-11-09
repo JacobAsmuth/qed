@@ -64,9 +64,9 @@ opaque setAttribute (node : Node) (key value : String) : IO Unit
 opaque removeAttribute (node : Node) (key : String) : IO Unit
 
 /-- Remove attributes no longer declared by a full attribute update, including obsolete
-    event slots. Names are JSON encoded; the host also resets removed controlled properties. -/
+    event slots. The host also resets removed controlled properties. -/
 @[extern "qed_dom_retain_attributes"]
-opaque retainAttributes (node : Node) (namesJson : String) : IO Unit
+opaque retainAttributes (node : Node) (names : List String) : IO Unit
 
 /-- Read an attribute's value, or `""` if the node or attribute is absent. The driver
     uses it to find an element's existing handler-table slot, so re-registering an event

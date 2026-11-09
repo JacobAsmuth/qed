@@ -114,7 +114,7 @@ def applyAttrs (h : Handlers msg) (node : Dom.Node) (attrs : List (Attr msg)) : 
     | .signalAttr _ a _ => some a
     | .signalBind _ => some "data-qed-signal"
     | _ => none
-  Dom.retainAttributes node (Json.render (.arr (names.map Json.str)))
+  Dom.retainAttributes node names
   for a in attrs do applyAttr h node a
 
 /-- Re-apply an element's *scope-dependent* template attributes against the new scope:

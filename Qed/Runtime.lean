@@ -608,7 +608,7 @@ partial def renderWithLocals {m : Type} (locals : List LocalDef) : Html m → St
             | none      => ""
           s!"<{tag}{attrStr}>{childStr}</{tag}>"
       | none =>
-          (renderElement (fun hs => (String.join (children.map (renderWithLocals locals)), hs)) #[] tag attrs children).1
+          (renderElement (fun hs => (children.foldl (fun acc c => acc ++ renderWithLocals locals c) "", hs)) #[] tag attrs children).1
 
 /-- `Html.render`, but local hosts are filled with their initial view (see
     `renderWithLocals`). Pass the app's `locals`. -/

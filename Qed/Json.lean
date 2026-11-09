@@ -109,6 +109,39 @@ def parseStrAux (acc : List Char) : List Char → Except String (String × List 
 
 def parseStr (cs : List Char) : Except String (String × List Char) := parseStrAux [] cs
 
+def parseStrFastAux (acc : String) : List Char → Except String (String × List Char)
+  | '"' :: rest => .ok (acc, rest)
+  | '\\' :: 'u' :: a :: b :: c :: d :: rest =>
+      match hex4 a b c d with
+      | some n => parseStrFastAux (acc.push (Char.ofNat n)) rest
+      | none   => .error "invalid \\u escape"
+  | '\\' :: e :: rest =>
+      match unescape e with
+      | some ch => parseStrFastAux (acc.push ch) rest
+      | none    => .error "invalid escape"
+  | c :: rest => parseStrFastAux (acc.push c) rest
+  | []        => .error "unterminated string"
+
+def parseStrFast (cs : List Char) : Except String (String × List Char) := parseStrFastAux "" cs
+
+private theorem push_ofList_rev (acc : List Char) (c : Char) :
+    (String.ofList acc.reverse).push c = String.ofList (c :: acc).reverse := by
+  ext; simp
+
+private theorem parseStrFastAux_eq (acc : List Char) (cs : List Char) :
+    parseStrFastAux (String.ofList acc.reverse) cs = parseStrAux acc cs := by
+  induction acc, cs using parseStrAux.induct with
+  | case1 acc rest => rfl
+  | case2 acc a b c d rest n hn ih => simp only [parseStrFastAux, parseStrAux, hn, push_ofList_rev, ih]
+  | case3 acc a b c d rest hn => simp only [parseStrFastAux, parseStrAux, hn]
+  | case4 acc e rest _ ch hch ih => simp only [parseStrFastAux, parseStrAux, hch, push_ofList_rev, ih]
+  | case5 acc e rest _ hch => simp only [parseStrFastAux, parseStrAux, hch]
+  | case6 acc c rest _ _ _ ih => simp only [parseStrFastAux, parseStrAux, push_ofList_rev, ih]
+  | case7 acc => rfl
+
+@[csimp] theorem parseStr_eq_parseStrFast : @parseStr = @parseStrFast := by
+  funext cs; exact (parseStrFastAux_eq [] cs).symm
+
 /-- Parse a JSON number into a `JsonNumber` (structural; no Json recursion). -/
 def parseNum (cs : List Char) : Except String (JsonNumber × List Char) :=
   let (neg, cs1) := match cs with | '-' :: r => (true, r) | _ => (false, cs)
@@ -370,20 +403,20 @@ end
 /-- Render a value to a JSON string. -/
 def render (j : Json) : String := String.ofList (renderL j)
 
-def escapeCharStr (c : Char) : String :=
+def appendEscaped (acc : String) (c : Char) : String :=
   match c with
-  | '"'  => "\\\"" | '\\' => "\\\\"
-  | '\n' => "\\n"  | '\r' => "\\r" | '\t' => "\\t"
+  | '"'  => acc ++ "\\\"" | '\\' => acc ++ "\\\\"
+  | '\n' => acc ++ "\\n"  | '\r' => acc ++ "\\r" | '\t' => acc ++ "\\t"
   | c =>
       if c.toNat < 0x20 then
         let n := c.toNat
-        String.ofList ['\\', 'u', toHexDigit (n / 4096 % 16), toHexDigit (n / 256 % 16),
-                                  toHexDigit (n / 16 % 16),   toHexDigit (n % 16)]
-      else String.singleton c
+        acc ++ String.ofList ['\\', 'u', toHexDigit (n / 4096 % 16), toHexDigit (n / 256 % 16),
+                                         toHexDigit (n / 16 % 16),   toHexDigit (n % 16)]
+      else acc.push c
 
 def escapeCharsTR : List Char → String → String
   | [], acc      => acc
-  | c :: cs, acc => escapeCharsTR cs (acc ++ escapeCharStr c)
+  | c :: cs, acc => escapeCharsTR cs (appendEscaped acc c)
 
 def renderStrFast (s : String) : String :=
   escapeCharsTR s.toList "\"" ++ "\""
@@ -419,8 +452,9 @@ private theorem ofList_cons (c : Char) (cs : List Char) :
     String.ofList (c :: cs) = String.singleton c ++ String.ofList cs := by
   ext; simp
 
-private theorem escapeCharStr_eq (c : Char) : escapeCharStr c = String.ofList (escapeCharL c) := by
-  unfold escapeCharStr escapeCharL
+private theorem appendEscaped_eq (acc : String) (c : Char) :
+    appendEscaped acc c = acc ++ String.ofList (escapeCharL c) := by
+  unfold appendEscaped escapeCharL
   repeat' split
   all_goals (ext; simp)
 
@@ -429,7 +463,7 @@ private theorem escapeCharsTR_eq (cs : List Char) (acc : String) :
   induction cs generalizing acc with
   | nil => simp [escapeCharsTR]
   | cons c cs ih =>
-    simp only [escapeCharsTR, List.flatMap_cons, ih, ofList_append, escapeCharStr_eq, String.append_assoc]
+    simp only [escapeCharsTR, List.flatMap_cons, ih, ofList_append, appendEscaped_eq, String.append_assoc]
 
 theorem renderStrFast_eq (s : String) : renderStrFast s = String.ofList (renderStrL s) := by
   unfold renderStrFast renderStrL

@@ -145,9 +145,11 @@ export const Array_setx33 = (a, i, x) => { const b = owned(a) ? a : own(a.slice(
 // ---- String (JS string; Pos = UTF-8 byte offset) ----------------------------
 const ENC = new TextEncoder(), DEC = new TextDecoder(), DEC_FATAL = new TextDecoder('utf-8', { fatal: true });
 const _strCache = new Map();
+let _lastStr = null, _lastInfo = null;
 function getStrInfo(s) {
+  if (s === _lastStr) return _lastInfo;
   let info = _strCache.get(s);
-  if (info !== undefined) return info;
+  if (info !== undefined) { _lastStr = s; _lastInfo = info; return info; }
   let ascii = true;
   for (let i = 0; i < s.length; i++) {
     if (s.charCodeAt(i) >= 0x80) { ascii = false; break; }
@@ -157,6 +159,7 @@ function getStrInfo(s) {
   info = { ascii, bytes, len };
   if (_strCache.size >= 256) _strCache.clear();
   _strCache.set(s, info);
+  _lastStr = s; _lastInfo = info;
   return info;
 }
 export const String_append = (a, b) => a + b;
@@ -176,19 +179,24 @@ export const String_decLt = (a, b) => {
   }
   return a.length < b.length ? 1 : 0;
 };
-// codepoint at byte offset `pos`; returns [codepoint, utf8len, utf16len]
-function atByte(s, pos) {
+function codeAtByte(s, pos) {
   const info = getStrInfo(s);
-  if (pos >= info.len) return [0, 1, 1];   // at/after end: '\0'
-  if (info.ascii) return [s.charCodeAt(pos), 1, 1];
+  if (pos >= info.len) return 0;   // at/after end: '\0'
+  if (info.ascii) return s.charCodeAt(pos);
   const bytes = info.bytes, b0 = bytes[pos];
-  if (b0 < 0x80) return [b0, 1, 1];
-  if (b0 < 0xE0) return [((b0 & 0x1F) << 6) | (bytes[pos + 1] & 0x3F), 2, 1];
-  if (b0 < 0xF0) return [((b0 & 0x0F) << 12) | ((bytes[pos + 1] & 0x3F) << 6) | (bytes[pos + 2] & 0x3F), 3, 1];
-  return [((b0 & 0x07) << 18) | ((bytes[pos + 1] & 0x3F) << 12) | ((bytes[pos + 2] & 0x3F) << 6) | (bytes[pos + 3] & 0x3F), 4, 2];
+  if (b0 < 0x80) return b0;
+  if (b0 < 0xE0) return ((b0 & 0x1F) << 6) | (bytes[pos + 1] & 0x3F);
+  if (b0 < 0xF0) return ((b0 & 0x0F) << 12) | ((bytes[pos + 1] & 0x3F) << 6) | (bytes[pos + 2] & 0x3F);
+  return ((b0 & 0x07) << 18) | ((bytes[pos + 1] & 0x3F) << 12) | ((bytes[pos + 2] & 0x3F) << 6) | (bytes[pos + 3] & 0x3F);
 }
-export const String_get = (s, pos) => atByte(s, Number(pos))[0];
-export const String_next = (s, pos) => { const p = Number(pos); return BigInt(p + atByte(s, p)[1]); };
+function stepAtByte(s, pos) {
+  const info = getStrInfo(s);
+  if (pos >= info.len || info.ascii) return 1;
+  const b0 = info.bytes[pos];
+  return b0 < 0x80 ? 1 : b0 < 0xE0 ? 2 : b0 < 0xF0 ? 3 : 4;
+}
+export const String_get = (s, pos) => codeAtByte(s, Number(pos));
+export const String_next = (s, pos) => { const p = Number(pos); return BigInt(p + stepAtByte(s, p)); };
 export const String_prev = (s, pos) => {
   const p = Number(pos), info = getStrInfo(s);
   if (p <= 0 || info.len === 0) return 0n;
@@ -205,8 +213,19 @@ export const String_extract = (s, b, e) => {
   if (bo === 0 && eo >= info.len) return s;
   return DEC.decode(info.bytes.subarray(bo, eo));
 };
-export const String_mk = (l) => { let s = ''; for (const c of listToArray(l)) s += String.fromCodePoint(c); return s; };
-export const String_data = (s) => arrayToList([...s].map((ch) => ch.codePointAt(0)));
+export const String_mk = (l) => { let s = ''; while (typeof l === 'object' && l !== null) { s += String.fromCodePoint(l.f[0]); l = l.f[1]; } return s; };
+export const String_data = (s) => {
+  let l = NIL;
+  for (let i = s.length - 1; i >= 0; i--) {
+    let c = s.charCodeAt(i);
+    if (c >= 0xDC00 && c <= 0xDFFF && i > 0) {
+      const hi = s.charCodeAt(i - 1);
+      if (hi >= 0xD800 && hi <= 0xDBFF) { c = ((hi - 0xD800) << 10) + (c - 0xDC00) + 0x10000; i--; }
+    }
+    l = cons(c, l);
+  }
+  return l;
+};
 export const String_hash = (s) => { let h = 1469598103934665603n; for (let i = 0; i < s.length; i++) { h ^= BigInt(s.charCodeAt(i)); h = (h * 1099511628211n) & M64; } return h; };
 export const String_toUTF8 = (s) => ENC.encode(s);
 export const String_fromUTF8 = (ba, _h) => DEC.decode(ba);
@@ -255,7 +274,7 @@ export const String_Pos_Raw_next = String_next;
 export const String_Pos_Raw_atEnd = String_atEnd;
 export const String_Pos_Raw_extract = String_extract;
 export const String_Pos_next = String_next;
-export const String_decodeChar = (s, i) => atByte(s, Number(i))[0];
+export const String_decodeChar = (s, i) => codeAtByte(s, Number(i));
 export const String_getUTF8Byte = (s, p) => { const info = getStrInfo(s); return info.ascii ? s.charCodeAt(Number(p)) : info.bytes[Number(p)]; };
 export const ByteArray_emptyWithCapacity = (_c) => new Uint8Array(0);
 export const ByteArray_validateUTF8 = (ba) => { try { DEC_FATAL.decode(ba); return 1; } catch { return 0; } };

@@ -370,7 +370,16 @@ end
 /-- Render a value to a JSON string. -/
 def render (j : Json) : String := String.ofList (renderL j)
 
-def escapeCharStr (c : Char) : String := String.ofList (escapeCharL c)
+def escapeCharStr (c : Char) : String :=
+  match c with
+  | '"'  => "\\\"" | '\\' => "\\\\"
+  | '\n' => "\\n"  | '\r' => "\\r" | '\t' => "\\t"
+  | c =>
+      if c.toNat < 0x20 then
+        let n := c.toNat
+        String.ofList ['\\', 'u', toHexDigit (n / 4096 % 16), toHexDigit (n / 256 % 16),
+                                  toHexDigit (n / 16 % 16),   toHexDigit (n % 16)]
+      else String.singleton c
 
 def escapeCharsTR : List Char → String → String
   | [], acc      => acc
@@ -410,12 +419,17 @@ private theorem ofList_cons (c : Char) (cs : List Char) :
     String.ofList (c :: cs) = String.singleton c ++ String.ofList cs := by
   ext; simp
 
+private theorem escapeCharStr_eq (c : Char) : escapeCharStr c = String.ofList (escapeCharL c) := by
+  unfold escapeCharStr escapeCharL
+  repeat' split
+  all_goals (ext; simp)
+
 private theorem escapeCharsTR_eq (cs : List Char) (acc : String) :
     escapeCharsTR cs acc = acc ++ String.ofList (cs.flatMap escapeCharL) := by
   induction cs generalizing acc with
   | nil => simp [escapeCharsTR]
   | cons c cs ih =>
-    simp only [escapeCharsTR, List.flatMap_cons, ih, ofList_append, escapeCharStr, String.append_assoc]
+    simp only [escapeCharsTR, List.flatMap_cons, ih, ofList_append, escapeCharStr_eq, String.append_assoc]
 
 theorem renderStrFast_eq (s : String) : renderStrFast s = String.ofList (renderStrL s) := by
   unfold renderStrFast renderStrL

@@ -110,12 +110,35 @@ def VAttr.eval (s : σ) : VAttr σ msg → Attr msg
   | .bind f          => f s
   | .dynVal attr get => .attr attr (get s)
 
+/-- Contramap the scope of a template attribute (`σ' → σ`). -/
+def VAttr.mapScope (f : σ' → σ) : VAttr σ msg → VAttr σ' msg
+  | .stat a          => .stat a
+  | .bind g          => .bind (fun s' => g (f s'))
+  | .dynVal attr get => .dynVal attr (fun s' => get (f s'))
+
 /-- Attach a reconciliation `key` to a rendered row (a no-op on non-elements, which
     cannot carry one). Keyed-list children render through this so the user writes the
     key *once*, as the list's `key` projection, instead of on every row. -/
 def withKey (k : String) : Html msg → Html msg
   | .element t as cs => .element t (.key k :: as) cs
   | h                => h
+
+mutual
+  /-- Contramap the scope of a `View` template (`σ' → σ`), preserving all fine-grained bindings. -/
+  def View.mapScope (f : σ' → σ) : View σ msg → View σ' msg
+    | .text s                           => .text s
+    | .dyn get                          => .dyn (fun s' => get (f s'))
+    | .element t as ks                  => .element t (as.map (VAttr.mapScope f)) (View.mapScopeEach f ks)
+    | .ifElse cond y n                  => .ifElse (fun s' => cond (f s')) (y.mapScope f) (n.mapScope f)
+    | .keyedList t as keys marks rs rh  =>
+        .keyedList t (as.map (VAttr.mapScope f)) (fun s' => keys (f s'))
+          (fun s' => marks (f s')) (fun s' => rs (f s')) (fun s' => rh (f s'))
+    | .static h                         => .static h
+    | .dynNode get                      => .dynNode (fun s' => get (f s'))
+  def View.mapScopeEach (f : σ' → σ) : List (View σ msg) → List (View σ' msg)
+    | []      => []
+    | k :: ks => k.mapScope f :: View.mapScopeEach f ks
+end
 
 mutual
   /-- The meaning of a template: evaluate it against a scope to an ordinary `Html`.
@@ -134,6 +157,11 @@ mutual
     | [],      _ => []
     | k :: ks, s => View.render k s :: View.renderEach ks s
 end
+
+/-- A `View σ msg` template can be called directly as a `σ → Html msg` function (`subView m.sub`),
+    both in `holds_in` invariants and inside parent `view%` templates (where `child%` lifts it via
+    `View.mapScope` without falling back to `dynNode`). -/
+instance : CoeFun (View σ msg) (fun _ => σ → Html msg) := ⟨View.render⟩
 
 /-- Lift any `σ → Html` view into a template: a single scope-bound `dynNode`, so the whole
     subtree reconciles through the verified `diff` on update (`View.render (.ofHtml f) s = f s`).
@@ -726,8 +754,16 @@ elab "child% " "fun " mb:ident " => " body:term : term <= expectedType => do
         else if bTy.isConstOf ``Nat || bTy.isConstOf ``Int then
           let s ← mkAppM ``toString #[b]
           mkAppOptM ``Qed.View.dyn #[σ, msg, ← mkLambdaFVars #[fv] s]
+        else if bTy.isAppOfArity ``Qed.View 2 then
+          ensureHasType expectedType b
         else
-          let b' ← ensureHasType (← mkAppM ``Qed.Html #[msg]) b
+          let b' ← instantiateMVars (← ensureHasType (← mkAppM ``Qed.Html #[msg]) b)
+          if b'.isAppOfArity ``Qed.View.render 4 then
+            let v   := b'.getArg! 2
+            let arg := b'.getArg! 3
+            if !v.containsFVar fv.fvarId! then
+              if arg == fv then return v
+              else return (← mkAppM ``Qed.View.mapScope #[← mkLambdaFVars #[fv] arg, v])
           mkAppOptM ``Qed.View.dynNode #[σ, msg, ← mkLambdaFVars #[fv] b']
   | _ => throwError "child% expects a `View` expected type"
 
@@ -834,7 +870,8 @@ mutual
         if let some an := stringAttrName? hn then
           if args.size == 1 && viewMentions m.getId args[0]! then
             let nm : Term := ⟨Syntax.mkStrLit an⟩
-            let v  : Term := ⟨args[0]!⟩
+            let rawV : Term := ⟨args[0]!⟩
+            let v  : Term ← if hn == "href" then `(Qed.ToHref.toHref $rawV) else pure rawV
             return some (← `(Qed.V.dynAttr $nm (fun $m => $v)))
         if hn == "attr" && args.size == 2 && viewMentions m.getId args[1]! then
           let k : Term := ⟨args[0]!⟩

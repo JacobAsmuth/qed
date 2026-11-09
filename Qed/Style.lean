@@ -126,6 +126,10 @@ def Align.css : Align → String
   | .start => "flex-start" | .«end» => "flex-end" | .center => "center"
   | .stretch => "stretch" | .baseline => "baseline"
 
+inductive BorderStyle | solid | dashed | dotted | double | none deriving Inhabited
+def BorderStyle.css : BorderStyle → String
+  | .solid => "solid" | .dashed => "dashed" | .dotted => "dotted" | .double => "double" | .none => "none"
+
 /-! ### Properties — each one a typed function, so a typo will not compile. -/
 
 -- Box & sizing (lengths)
@@ -163,9 +167,19 @@ def flexDirection  (f : FlexDirection) : Item := .decl "flex-direction" f.css
 def justifyContent (j : Justify)       : Item := .decl "justify-content" j.css
 def alignItems     (a : Align)         : Item := .decl "align-items" a.css
 
+-- Borders: accept either `(px 1) .solid color` (typed `Len`/`BorderStyle`/`Color`, including `Token`)
+-- or a single coerced `String` (`border "1px solid #ddd"`, `border "none"`).
+private def mkBorder (prop : String) (w : Len) (s : BorderStyle) (c : Color) : Item :=
+  .decl prop (if c.raw.isEmpty then w.raw else s!"{w.raw} {s.css} {c.raw}")
+instance : Coe (BorderStyle → Color → Item) Item := ⟨fun f => f .solid ⟨""⟩⟩
+def border       := mkBorder "border"
+def borderTop    := mkBorder "border-top"
+def borderRight  := mkBorder "border-right"
+def borderBottom := mkBorder "border-bottom"
+def borderLeft   := mkBorder "border-left"
+
 -- Freeform (compound / open-ended values: keep the String)
 def background    (v : String) : Item := .decl "background" v
-def border        (v : String) : Item := .decl "border" v
 def boxShadow     (v : String) : Item := .decl "box-shadow" v
 def transform     (v : String) : Item := .decl "transform" v
 def transition    (v : String) : Item := .decl "transition" v
@@ -216,9 +230,13 @@ def css {α : Type} [CssBody α] (body : α) : Style :=
 /-- One CSS rule: `.qed-… { <body> }` (the body keeps any `&`-nesting). -/
 private def Style.rule (s : Style) : String := "." ++ s.className ++ " { " ++ s.raw ++ " }"
 
-/-- Render design tokens into a `:root { … }` CSS rule string. -/
+/-- Render design tokens into `:root { … }` and any nested reset rules as zero-specificity
+    `:where(sel) { … }` so they never override `.qed-*` classes. -/
 def renderTheme (tokens : List Item) : String :=
-  ":root { " ++ Item.renderList tokens ++ " }"
+  let (decls, rules) := tokens.partition (fun | .decl _ _ => true | .nest _ _ => false)
+  let root := if decls.isEmpty then [] else [":root { " ++ Item.renderList decls ++ " }"]
+  let resets := rules.map fun | .nest s b => s!":where({s}) \{ {Item.renderList b} }" | i => i.render
+  String.intercalate "\n" (root ++ resets)
 
 /-- Emit design tokens as a `:root { … }` stylesheet from a list of `Token.set`s. Drop this once
     near your view root (alongside `styleSheet`); the tokens are then visible to every style. -/

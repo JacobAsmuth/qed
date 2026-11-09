@@ -110,11 +110,15 @@ def decodeSeg (s : String) : String :=
 def Router.toURL {α} [Router α] (a : α) : String :=
   "/" ++ String.intercalate "/" ((Router.print a).map encodeSeg)
 
-/-- Parse a URL path string (`"/users/ada"`) into a route: split on `/`, drop empty
-    segments (so `"/"` is the index, `[]`), percent-decode each, then `parse`. `none` if no
-    route matches. -/
+/-- Strip any `?query` or `#hash` suffix from a URL path before segment parsing. -/
+def stripQueryAndHash (path : String) : String :=
+  (((path.splitOn "#").headD path).splitOn "?").headD ""
+
+/-- Parse a URL path string (`"/users/ada"`) into a route: strip `?query`/`#hash`, split on
+    `/`, drop empty segments (so `"/"` is the index, `[]`), percent-decode each, then `parse`.
+    `none` if no route matches. -/
 def Router.fromURL {α} [Router α] (path : String) : Option α :=
-  Router.parse (((path.splitOn "/").filter (· ≠ "")).map decodeSeg)
+  Router.parse ((((stripQueryAndHash path).splitOn "/").filter (· ≠ "")).map decodeSeg)
 
 /-! ### Finite route-segment enums (`route_enum`)
 

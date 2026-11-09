@@ -1022,6 +1022,7 @@ def run (app : App Model Msg) : IO Unit := do
     | _ => pure ()
   runtimeRef.set (some {
     mount := do
+      if !app.styles.isEmpty then Dom.effect "css.inject" (renderStyleSheet app.styles) "" ""
       -- If the server dehydrated a model into the page, adopt it directly: the client starts
       -- from exactly what the server drew, so the first render equals the SSR markup and no
       -- data is refetched (no re-route). Otherwise: routed apps derive the model from the URL

@@ -333,6 +333,8 @@ structure App (Model : Type) (Msg : Type) where
       to the normal startup. When it returns `some`, the client adopts that model directly and does
       not re-route on mount, so the first client render equals the server's. -/
   rehydrate : String → Option Model := fun _ => none
+  /-- Scoped `Style`s discovered automatically across the app's view and helpers. -/
+  styles : List Style := []
 
 /-- The app's view: its template rendered against the model. Server (SSR) and the fine-grained
     client driver are both checked against this one function, so they cannot drift. -/
@@ -431,20 +433,21 @@ def componentTagName (tag : String) : Lean.Name :=
 syntax uiOpt := "(" ident " := " term ")"
 syntax (name := uiBuilder) "ui " term:max term:max (uiOpt)* " fun " ident " => " term : term
 
-/-- Add discovered registrations once, retaining explicit registrations first. -/
-def App.addLocals (app : App Model Msg) (locals : List LocalDef) : App Model Msg :=
-  { app with locals := LocalDef.dedupe (app.locals ++ locals) }
+/-- Add discovered registrations and scoped styles once, retaining explicit registrations first. -/
+def App.addLocals (app : App Model Msg) (locals : List LocalDef) (styles : List Style := []) : App Model Msg :=
+  { app with locals := LocalDef.dedupe (app.locals ++ locals), styles := app.styles ++ styles }
 
 /-- Discover registrations through elaborated helper definitions, including imported
     helpers. A visited set handles shared and recursive dependencies. -/
 syntax (name := localRegistryTerm) "withLocalRegistry " term:max : term
 
 open Lean Elab Term Meta in
-private def registrationsIn (value : Expr) : TermElabM Expr := do
+private def discoverAssets (value : Expr) : TermElabM (Expr × Expr) := do
   let env ← getEnv
   let mut pending := value.getUsedConstants.toList
   let mut seen : NameSet := {}
   let mut regs : Array Expr := #[]
+  let mut styles : Array Expr := #[]
   while !pending.isEmpty do
     let n := pending.head!
     pending := pending.tail!
@@ -457,11 +460,14 @@ private def registrationsIn (value : Expr) : TermElabM Expr := do
       if isMount && env.contains reg then
         regs := regs.push (Lean.mkConst reg)
       else if let some (.defnInfo d) := env.find? n then
-        pending := d.value.getUsedConstants.toList ++ pending
+        if d.type.isConstOf ``Qed.Style then
+          styles := styles.push (Lean.mkConst n)
+        else
+          pending := d.value.getUsedConstants.toList ++ pending
   let mut locals := Lean.mkApp (Lean.mkConst ``List.nil [Level.zero]) (Lean.mkConst ``LocalDef)
   for reg in regs do
     locals ← mkAppM ``List.append #[locals, reg]
-  mkAppM ``LocalDef.dedupe #[locals]
+  return (← mkAppM ``LocalDef.dedupe #[locals], ← mkListLit (Lean.mkConst ``Qed.Style) styles.toList)
 
 syntax (name := registrationsTerm) "localRegistrations " term:max : term
 
@@ -469,14 +475,15 @@ open Lean Elab Term in
 @[term_elab registrationsTerm] def elabRegistrations : TermElab := fun stx _ => do
   let value ← elabTerm stx[1] none
   synthesizeSyntheticMVarsNoPostponing
-  registrationsIn (← instantiateMVars value)
+  return (← discoverAssets (← instantiateMVars value)).1
 
 open Lean Elab Term Meta in
 @[term_elab localRegistryTerm] def elabLocalRegistry : TermElab := fun stx expected => do
   let value ← elabTerm stx[1] expected
   synthesizeSyntheticMVarsNoPostponing
   let value ← instantiateMVars value
-  mkAppM ``App.addLocals #[value, ← registrationsIn value]
+  let (locals, styles) ← discoverAssets value
+  mkAppM ``App.addLocals #[value, locals, styles]
 
 /-- A verified SSR state serializer: `dehydrate` encodes the relevant slice of `Model`,
     `rehydrate` rebuilds a model from that string, and `round_trip` guarantees that
@@ -512,6 +519,12 @@ def slice {Model α : Type} [LawfulJson α] (init : Model)
 def route {Model R : Type} [Router R] (init : Model)
     (get : Model → R) (set : Model → R → Model) : Dehydrate Model :=
   slice init get set
+
+/-- Dehydrate a `[Router R]` field of `Model` and restore via `(update init (onRoute r)).1`,
+    proving client rehydration reconstructs the exact initial route state `ssrStep` rendered. -/
+def fromRoute {Model Msg R α : Type} [Router R] [ToStep Model Msg α]
+    (init : Model) (update : Model → Msg → α) (onRoute : R → Msg) (get : Model → R) : Dehydrate Model :=
+  slice init get (fun _ r => (ToStep.toStep (update init (onRoute r)) : Model × Cmd Msg).1)
 
 end Dehydrate
 
@@ -686,10 +699,12 @@ def App.renderInitial (app : App Model Msg) : String :=
     from the server's model instead of refetching; `</` is broken so the JSON can't close the
     script early (it stays valid JSON, `\/` is `/`). -/
 def renderDocument (title : String) (appHtml : String) (script : String := "/qed.js")
-    (state : String := "") : String :=
+    (state : String := "") (css : String := "") : String :=
+  let styleTag := if css.isEmpty || appHtml.contains css then ""
+                  else "<style id=\"qed-styles\">" ++ "<\\/".intercalate (css.splitOn "</") ++ "</style>"
   "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
     ++ "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-    ++ "<title>" ++ escapeHtml title ++ "</title></head>\n"
+    ++ "<title>" ++ escapeHtml title ++ "</title>" ++ styleTag ++ "</head>\n"
     ++ "<body><div id=\"app\">" ++ appHtml ++ "</div>\n"
     ++ (if state.isEmpty then ""
         else "<script id=\"qed-state\" type=\"application/json\">" ++ "<\\/".intercalate (state.splitOn "</") ++ "</script>\n")

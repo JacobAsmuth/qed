@@ -470,11 +470,19 @@ open Lean Elab Command in
           `(command| def $viewId (p : $propsId) (s : $stateId) : Html $msgId := $viewBody)
         else `(command| def $viewId (s : $stateId) : Html $msgId := $viewBody)) ]
       if outTy?.isNone then
-        let renderId := mkIdent (t.getId ++ `render)
+        let renderId    := mkIdent (t.getId ++ `render)
+        let renderTagId := mkIdent (t.getId ++ `renderTag)
         let rendered ← if hasProps then `($viewId p s) else `($viewId s)
-        cmds := cmds.push (← `(command| def $renderId {parentMsg : Type}
-          (p : $propsId) (route : $msgId → parentMsg) (s : $stateId) : Html parentMsg :=
-          ($rendered).map route))
+        cmds := cmds.push (← if hasProps then
+          `(command| def $renderId {parentMsg : Type} (p : $propsId) (route : $msgId → parentMsg) (s : $stateId) : Html parentMsg := ($viewId p s).map route)
+        else
+          `(command| def $renderId {parentMsg : Type} (route : $msgId → parentMsg) (s : $stateId) : Html parentMsg := ($viewId s).map route))
+        cmds := cmds.push (← match keyF? with
+        | some kf =>
+          let kfId := mkIdent kf.getId.eraseMacroScopes
+          `(command| def $renderTagId {parentMsg : Type} (p : $propsId) (route : String → $msgId → parentMsg) (s : $stateId) (k : String := toString s.$kfId) : Html parentMsg := ($rendered).map (route k))
+        | none =>
+          `(command| def $renderTagId {parentMsg : Type} (p : $propsId) (route : $msgId → parentMsg) (s : $stateId) : Html parentMsg := ($rendered).map route))
         if hasProps then
           let compId := mkIdent (t.getId ++ `component)
           cmds := cmds.push (← `(command| def $compId (p : $propsId) : Component $stateId $msgId :=

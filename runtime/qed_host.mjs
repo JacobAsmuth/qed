@@ -78,6 +78,7 @@ export function boot() {
       case 'event.listen': ensureEvent(a); break;
       case 'file.download': { const url = URL.createObjectURL(new Blob([c], { type: b || 'text/plain' }));
         const el = document.createElement('a'); el.href = url; el.download = a; el.click(); URL.revokeObjectURL(url); break; }
+      case 'css.inject': { if (a && !document.getElementById('qed-styles')) { const s = document.createElement('style'); s.id = 'qed-styles'; s.textContent = a; document.head.appendChild(s); } break; }
       default: console.warn('qed: unknown effect', kind);
     }
   };
@@ -112,7 +113,15 @@ export function boot() {
     if (attached.has(event)) return; attached.add(event);
     root.addEventListener(event, (e) => {
       const et = e.target; if (!et || !et.closest) return;
-      if (event === 'click') { const a = et.closest('[data-qed-link]'); if (a) { e.preventDefault(); const href = a.getAttribute('href'); history.pushState({}, '', href); urlChanged(href); return; } }
+      if (event === 'click' && e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
+        const a = et.closest('a[href], [data-qed-link]');
+        if (a && !a.target && !a.hasAttribute('download')) {
+          const href = a.getAttribute('href') || '';
+          if (a.hasAttribute('data-qed-link') || (href.startsWith('/') && !href.startsWith('//'))) {
+            e.preventDefault(); history.pushState({}, '', href); urlChanged(href); return;
+          }
+        }
+      }
       const nt = et.closest('[data-qed-on-' + event + ']');
       if (nt) { if (event === 'submit') e.preventDefault(); const id = parseInt(nt.getAttribute('data-qed-on-' + event), 10); if (!Number.isNaN(id)) fire(nt, id); }
       const vt = et.closest('[data-qed-onv-' + event + ']');

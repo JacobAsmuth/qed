@@ -81,7 +81,8 @@ def App.ssrStep (app : App Model Msg) (path title script resultsJson : String) :
   let (m, needs) := ssrDrain app results m1 queue 0 #[]
   if needs.isEmpty then
     Json.render (.obj [("html",
-      .str (renderDocument title (app.renderModel m) script (state := app.dehydrate m)))])
+      .str (renderDocument title (app.renderModel m) script
+        (state := app.dehydrate m) (css := renderStyleSheet app.styles)))])
   else
     Json.render (.obj [("need", .arr (needs.toList.map fun (method, url, body) =>
       .obj [("method", .str method), ("url", .str url), ("body", .str body)]))])

@@ -148,4 +148,94 @@ def routedDehydratedApp : App DocRoute DocRoute :=
 #guard routedDehydratedApp.rehydrate (routedDehydratedApp.dehydrate (.sec .benchmarks 3))
   == some (.sec .benchmarks 3)
 
+-- Issue #13: non-vacuous role checks, exclusive style checks, composite view unfolding, `assuming`, and `for_each` with `from init`.
+/-- error: styling invariant `badVacuousRole` doesn't hold for every model, `roleHasOneOf "nonexistent" [navOn, navOff]` is false for some `navView m`.
+
+Some element the rule constrains isn't carrying one of the required style classes (or no element with that role/tag is rendered). Check that the `role`/tag it matches exists and gets one of the styles passed to `roleHasOneOf`/`tagHasOneOf` in every branch of `navView`. If the view is routed through `App.view`/`View.render` rather than a plain `Model → Html`, prove it with:  invariant badVacuousRole : … holds_in navView := by … -/
+#guard_msgs in
+invariant badVacuousRole : roleHasOneOf "nonexistent" [navOn, navOff] holds_in navView
+
+def bothStylesView (b : Bool) : Html Unit :=
+  <button role="btn" {navOn} {if b then navOff else navOff}>{"x"}</button>
+
+/-- error: styling invariant `badDualStyle` doesn't hold for every model, `roleHasOneOf "btn" [navOn, navOff]` is false for some `bothStylesView m`.
+
+Some element the rule constrains isn't carrying one of the required style classes (or no element with that role/tag is rendered). Check that the `role`/tag it matches exists and gets one of the styles passed to `roleHasOneOf`/`tagHasOneOf` in every branch of `bothStylesView`. If the view is routed through `App.view`/`View.render` rather than a plain `Model → Html`, prove it with:  invariant badDualStyle : … holds_in bothStylesView := by … -/
+#guard_msgs in
+invariant badDualStyle : roleHasOneOf "btn" [navOn, navOff] holds_in bothStylesView
+
+structure AppModel where route : DocRoute deriving DecidableEq
+def activeSection : DocRoute → Section | .home => .overview | .sec s _ => s
+def compositeNav (m : AppModel) : Html Unit := <div>{navView (activeSection m.route)}</div>
+
+invariant compositeNavExclusive :
+  exactlyOneOf ["nav-overview", "nav-arch", "nav-bench"] navOn navOff holds_in compositeNav
+
+def validCountView (n : Nat) : Html Unit :=
+  <span role="pos" {if n > 0 then navOn else navOff}>{toString n}</span>
+
+invariant posStyledFromInv :
+  roleHas "pos" navOn holds_in validCountView assuming (fun n : Nat => n > 0)
+
+component RowItem where
+  state id    : Nat := 0
+  state count : Nat := 0
+  key id
+  action inc => set count (count + 1)
+  view => <span>{count}</span>
+
+invariant rowSafeFromInit :
+  (fun r : RowItem.State => 0 ≤ r.count) from RowItem.init preserved_by RowItem.update
+
+structure RowList where rows : Array RowItem.State
+inductive RowListMsg | row (k : String) (m : RowItem.Msg)
+def updateRowList (m : RowList) : RowListMsg → RowList
+  | .row k cm => { rows := RowItem.updateKeyed m.rows k cm }
+
+invariant listSafeFromInit : rowSafeFromInit for_each rows preserved_by updateRowList
+
+-- Issue #14: `?query`/`#hash` stripping in `Router.fromURL`, typed `ToHref` in JSX, and `Dehydrate.fromRoute`.
+#guard Router.fromURL "/docs/arch/2?tab=api#top" == some (DocRoute.sec .architecture 2)
+#guard Router.fromURL "/?utm=1#hero" == some DocRoute.home
+
+def typedLinkView (r : DocRoute) : View DocRoute DocRoute :=
+  view% fun cur => <a href={r} class={if cur == r then "active" else ""}>{"Go"}</a>
+#guard (Html.render (typedLinkView (.sec .architecture 2) .home)).contains "href=\"/docs/arch/2\""
+
+def routeDehydrate : Dehydrate AppModel :=
+  Dehydrate.fromRoute { route := .home } (fun _ r => ({ route := r } : AppModel)) id (·.route)
+#guard routeDehydrate.rehydrate (routeDehydrate.dehydrate { route := .sec .benchmarks 7 })
+  == some { route := .sec .benchmarks 7 }
+
+-- Issue #15: auto-collected `App.styles`, `:where()` theme resets, typed borders, composable `View`, and singleton `<Comp/>`.
+def autoStyledApp : App AppModel Unit := ui { route := .home } (fun m _ => m) fun m => compositeNav m
+#guard autoStyledApp.styles.length == 2
+#guard (autoStyledApp.ssrStep "T" "/qed.js" "/" "").contains navOn.raw
+
+#guard (renderTheme [nest "*, *::before" [margin (px 0)]]).contains
+  ":where(*, *::before) { margin: 0px; }"
+
+def tokBorder := token "border-subtle"
+def typedBorderStyle : Style :=
+  css [ border (px 1) .solid tokBorder, borderBottom (px 2) .dashed (hex "333"), borderTop "none" ]
+#guard typedBorderStyle.raw ==
+  "border: 1px solid var(--border-subtle); border-bottom: 2px dashed #333; border-top: none;"
+
+def subBanner : View Section DocRoute :=
+  view% fun s => <header><a href={DocRoute.sec s 1}>{Router.toURL (DocRoute.sec s 1)}</a></header>
+def parentPage : View AppModel DocRoute :=
+  view% fun m => <div>{subBanner (activeSection m.route)}</div>
+#guard (Html.render (parentPage { route := .sec .architecture 3 })).contains "/docs/arch/1"
+invariant parentPageHasHeader : hasTag "header" holds_in parentPage
+
+component SingleChild where
+  state count : Nat := 0
+  action bump => set count (count + 1)
+  view => <button onClick={.bump}>{count}</button>
+
+inductive ParentMsg | child (m : SingleChild.Msg)
+def singleChildJsx (s : SingleChild.State) : Html ParentMsg := <SingleChild state={s} onMsg={.child}/>
+def singleChildDirect (s : SingleChild.State) : Html ParentMsg := SingleChild.render ParentMsg.child s
+#guard Html.render (singleChildJsx { count := 5 }) == Html.render (singleChildDirect { count := 5 })
+
 end SyntaxChecks

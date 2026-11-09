@@ -83,23 +83,23 @@ syntax (name := invariantCmd)
 open Lean Elab Tactic
 
 /-- Names the discharger never unfolds: recursors, `match`/`casesOn` auxiliaries, equation
-    lemmas, and other compiler internals. -/
+    lemmas, generated codecs, and other compiler internals. -/
 private def qedLooksGenerated (n : Name) : Bool :=
   n.isInternalDetail ||
   (match n with
    | .str _ s =>
        ["casesOn", "recOn", "rec", "brecOn", "below", "ibelow", "noConfusion",
-        "noConfusionType", "toCtorIdx", "ofNat"].contains s
-         || s.startsWith "match_" || s.startsWith "eq_"
+        "noConfusionType", "toCtorIdx", "ofNat", "print", "parse", "toSeg", "fromSeg",
+        "toJson", "fromJson"].contains s
+         || s.startsWith "match_" || s.startsWith "eq_" || s.startsWith "inst"
    | _ => false)
 
-/-- A name the discharger may unfold: a real definition declared in the *current module*
-    (imported declarations stay opaque), and not compiler-generated. The discharger only ever
-    unfolds such a name when it actually appears in the goal, so helpers feeding fields the
-    property never reads stay folded. -/
+/-- A name the discharger may unfold: a user definition (same module or imported user module,
+    excluding `Init`/`Std`/`Lean`/`Qed` and `Style` constants), and not compiler-generated. -/
 private def qedIsHelper (env : Environment) (n : Name) : Bool :=
-  (env.getModuleIdxFor? n).isNone
-    && (match env.find? n with | some (.defnInfo _) => true | _ => false)
+  let mod := match env.getModuleIdxFor? n with | some i => env.header.moduleNames[i]! | none => n
+  ![`Init, `Std, `Lean, `Qed].contains mod.getRoot
+    && (match env.find? n with | some (.defnInfo d) => !d.type.isConstOf ``Qed.Style | _ => false)
     && !qedLooksGenerated n
 
 /-- Standard size/length lemmas the discharger always offers, so "stays non-empty" and
@@ -279,9 +279,20 @@ def everyElementL (p : String → List (Attr msg) → Bool) : List (Html msg) �
   | h :: t => everyElement p h && everyElementL p t
 end
 
-/-- Does this element carry the class of one of `styles`? -/
+/-- Does `h` contain at least one element carrying `role r`? -/
+def hasRole (r : String) (h : Html msg) : Bool :=
+  !everyElement (fun _ a => !(attrRole a == some r)) h
+
+/-- Does `h` contain at least one `<tag>` element? -/
+def hasTag (tag : String) (h : Html msg) : Bool :=
+  !everyElement (fun t _ => !(t == tag)) h
+
+/-- Does this element carry the class of *exactly* one of `styles`? Filtering the element's classes
+    against `styles` reduces by reflexivity (`s.className == s.className`) without unfolding `Style`
+    hashes, while rejecting elements that carry zero or multiple classes from `styles`. -/
 def hasOneClass (styles : List Style) (a : List (Attr msg)) : Bool :=
-  (attrClasses a).any ((styles.map (·.className)).contains ·)
+  let cs := attrClasses a
+  (cs.filter (fun c => (styles.map (·.className)).contains c)).length == 1
 
 /-- Every element tagged `role r` carries the class of one of `styles`, pair with the `role`
     attribute (`<button role="toggle" …>…</button>`). The predicate for `… holds_in view`. -/
@@ -293,41 +304,41 @@ def tagHasOneOf (tag : String) (styles : List Style) : Html msg → Bool :=
   everyElement (fun t a => !(t == tag) || hasOneClass styles a)
 
 /-! Relational rules, relate the styles of *different* elements. `roleHas` is the single-element
-    query; `both`/`either` combine queries (AND/OR), and `exactlyOne` packages the common "exactly
-    one of two is styled on" case. They are stated over *positive* "this element has this style"
-    facts, which is what lets them prove with ordinary hashed class names: a positive `x == x`
-    membership reduces, whereas a negative "this element does NOT have style Y" would need the two
-    styles' class names to be provably distinct, which a content hash cannot give. So express
-    "A on XOR B on" as `exactlyOne` (or `(A on ∧ B off) ∨ (A off ∧ B on)` by hand), never as a
-    negation. -/
+    query; `both`/`either` combine queries (AND/OR), and `exactlyOne` / `exactlyOneOf` package
+    mutually-exclusive groups. Every role query also requires `hasRole r` (`anyElement`), so a
+    misspelled or missing role fails to compile instead of passing vacuously. -/
 
-/-- The element(s) tagged `role r` carry exactly `style`. The single-element building block. -/
-def roleHas (r : String) (style : Style) : Html msg → Bool :=
-  everyElement (fun _ a => !(attrRole a == some r) || (attrClasses a).contains style.className)
+/-- The element(s) tagged `role r` exist and carry `style`. The single-element building block. -/
+def roleHas (r : String) (style : Style) (h : Html msg) : Bool :=
+  hasRole r h &&
+  everyElement (fun _ a => !(attrRole a == some r) || (attrClasses a).contains style.className) h
+
+/-- The element(s) tagged `role r` exist, carry `chosen`, and do not carry `excluded`. -/
+def roleHasOnly (r : String) (chosen excluded : Style) (h : Html msg) : Bool :=
+  roleHas r chosen h && roleHasOneOf r [chosen, excluded] h
 
 /-- Both view predicates hold (AND): `both (roleHas "a" x) (roleHas "b" y)`. -/
 def both (p q : Html msg → Bool) : Html msg → Bool := fun h => p h && q h
 /-- Either view predicate holds (OR): `either (roleHas "a" x) (roleHas "b" y)`. -/
 def either (p q : Html msg → Bool) : Html msg → Bool := fun h => p h || q h
 
-/-- Exactly one of two role-tagged elements is styled `on`, the other `off`, e.g. "exactly one
-    tab is active". The positive form `(A on ∧ B off) ∨ (A off ∧ B on)`, so it proves without the
-    two styles having to be provably distinct. -/
+/-- Exactly one of two role-tagged elements is styled `on` and the other `off` (and neither carries
+    both styles simultaneously). -/
 def exactlyOne (roleA roleB : String) (on off : Style) : Html msg → Bool :=
-  either (both (roleHas roleA on) (roleHas roleB off))
-         (both (roleHas roleA off) (roleHas roleB on))
+  either (both (roleHasOnly roleA on off) (roleHasOnly roleB off on))
+         (both (roleHasOnly roleA off on) (roleHasOnly roleB on off))
 
-/-- All role-tagged elements in `roles` carry `off`. -/
-def allRolesOff : List String → Style → Html msg → Bool
-  | [],      _,   _ => true
-  | r :: rs, off, h => roleHas r off h && allRolesOff rs off h
+/-- All role-tagged elements in `roles` exist and carry `off` (and not `on`). -/
+def allRolesOff : List String → Style → Style → Html msg → Bool
+  | [],      _,  _,   _ => true
+  | r :: rs, on, off, h => roleHasOnly r off on h && allRolesOff rs on off h
 
 /-- Exactly one role in `roles` is styled `on` and all others are styled `off`. -/
 def exactlyOneOf (roles : List String) (on off : Style) (h : Html msg) : Bool :=
   let rec go (before : List String) : List String → Bool
     | []      => false
     | r :: rs =>
-        (allRolesOff before off h && roleHas r on h && allRolesOff rs off h)
+        (allRolesOff before on off h && roleHasOnly r on off h && allRolesOff rs on off h)
           || go (r :: before) rs
   go [] roles
 
@@ -401,70 +412,96 @@ theorem everyElement_through_map {α β} (f : α → β) {Pα : String → List 
     (hP : ∀ t a, Pβ t (a.map (Attr.map f)) = Pα t a) (hc : everyElement Pα h = true) :
     everyElement Pβ (h.map f) = true := by rw [everyElement_map f hP]; exact hc
 
+/-- Unfold user view helpers that appear in the current styling goal (keeping keyed component
+    `.view` boundaries intact so `for_each … holds_in` can match the child's contract). -/
+elab "qedUnfoldViewHelpers" : tactic => do
+  for _ in [0:6] do
+    if (← getGoals).isEmpty then return
+    let env ← getEnv
+    let present ← ((← instantiateMVars (← getMainTarget)).getUsedConstants.filter fun n =>
+        qedIsHelper env n && !(n.getString! == "view" && env.contains (n.getPrefix ++ `keyOf))).filterM
+      fun n => return (← getProjectionFnInfo? n).isNone
+    if present.isEmpty then return
+    let lemmas ← present.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+    try evalTactic (← `(tactic| simp only [$[$lemmas],*])) catch _ => return
+
 /-- When a view styles an `N`-ary group with `if x == .a …` per element instead of a single
-    `match x`, `split` produces branches whose hypotheses constrain an enum `x` across its
-    constructors. Case-splitting `x` closes those branches without disturbing real failures. -/
+    `match x`, `split` produces branches whose hypotheses constrain an enum `x` (including a
+    helper/projection application like `activeSection m.route`) across its constructors.
+    Generalizing and case-splitting `x` closes those branches without disturbing real failures. -/
 elab "qedCloseExhaustiveEnum" : tactic => withMainContext do
   for ldecl in (← getLCtx) do
     if ldecl.isImplementationDetail then continue
     let ty ← instantiateMVars ldecl.type
-    let lhs? := match ty with
-      | .app (.app (.app (.const ``Eq _) _) (.app (.app (.app (.const ``BEq.beq _) _) _) lhs)) _ => some lhs
-      | .app (.const ``Not _) (.app (.app (.app (.const ``Eq _) _) (.app (.app (.app (.const ``BEq.beq _) _) _) lhs)) _) => some lhs
-      | .app (.const ``Not _) (.app (.app (.app (.const ``Eq _) _) lhs) _) => some lhs
+    let inner := match ty with | .app (.const ``Not _) t => t | t => t
+    let lhs? := match inner with
+      | .app (.app (.app (.const ``Eq _) _) (.app (.app (.app (.app (.const ``BEq.beq _) _) _) lhs) _)) _ => some lhs
+      | .app (.app (.app (.const ``Eq _) _) lhs) _ => some lhs
       | _ => none
     if let some lhs := lhs? then
       try
         let lhsStx ← PrettyPrinter.delab lhs
-        evalTactic (← `(tactic| (cases $lhsStx:term <;> simp_all; done)))
+        evalTactic (← `(tactic| (generalize $lhsStx:term = _qed_enum_x at *; cases _qed_enum_x <;> (simp_all; try decide); done)))
         return
       catch _ => pure ()
 
-/-- Reduce a styling goal `pred (view m) = true`: unfold the view and every `Qed.Notation`
-    combinator to `Html`/`Attr` constructors, split each `if`/`match`, and close the static leaves,
-    leaving any *dynamic-list* residual (`everyElementL P (cards.map …)`) for the caller. Shared by
-    the plain `holds_in` discharger and the `for_each … holds_in` lift. (Maintenance: this mirror of
-    the element/attribute helpers must list any new one.) -/
+/-- Reduce a styling goal `pred (view m) = true`: unfold the view, user view helpers, `View`
+    template combinators, and every `Qed.Notation` combinator to `Html`/`Attr` constructors, split
+    each `if`/`match`, and close the static leaves, leaving any *dynamic-list* residual
+    (`everyElementL P (cards.map …)`) for the caller. -/
 syntax "qedStyleReduce " ident : tactic
 macro_rules
   | `(tactic| qedStyleReduce $view:ident) =>
     `(tactic|
-      (simp only [$view:ident, Qed.roleHasOneOf, Qed.tagHasOneOf, Qed.roleHas, Qed.both,
-         Qed.either, Qed.exactlyOne, Qed.allRolesOff, Qed.exactlyOneOf, Qed.exactlyOneOf.go,
-         Qed.hasOneClass,
+      (try simp only [$view:ident];
+       qedUnfoldViewHelpers;
+       simp only [Qed.roleHasOneOf, Qed.tagHasOneOf, Qed.roleHas, Qed.roleHasOnly,
+         Qed.hasRole, Qed.hasTag, Qed.both, Qed.either, Qed.exactlyOne,
+         Qed.allRolesOff, Qed.exactlyOneOf, Qed.exactlyOneOf.go, Qed.hasOneClass,
          Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
+         Qed.View.render, Qed.View.renderEach, Qed.View.mapScope, Qed.View.mapScopeEach,
+         Qed.VAttr.eval, Qed.VAttr.mapScope, Qed.View.showIf, Qed.View.ofHtml,
+         Qed.V.el, Qed.V.text, Qed.V.dyn, Qed.V.ifElse, Qed.V.showIf, Qed.V.static, Qed.V.dynNode,
          Qed.text, Qed.lazy, Qed.el, Qed.link, Qed.linkTo, Qed.styleSheet, Qed.theme,
          Qed.cls, Qed.attr, Qed.role, Qed.rawHtml, Qed.on,
          Qed.onValue, Qed.onClick, Qed.onInput, Qed.onChange, Qed.onCheck, Qed.onKeydown,
          Qed.onKeyup, Qed.onSubmit, Qed.onBlur, Qed.onFocus, Qed.onDoubleClick, Qed.onMouseDown,
-         Qed.onMouseUp, Qed.key, Qed.value, Qed.placeholder, Qed.name, Qed.href, Qed.src, Qed.alt,
-         Qed.title, Qed.style, Qed.type', Qed.disabled, Qed.required, Qed.checked, Qed.readOnly];
+         Qed.onMouseUp, Qed.key, Qed.value, Qed.placeholder, Qed.name, Qed.href, Qed.ToHref.toHref,
+         Qed.src, Qed.alt, Qed.title, Qed.style, Qed.type', Qed.disabled, Qed.required,
+         Qed.checked, Qed.readOnly];
        repeat' split;
        all_goals (first
          | rfl
-         | (simp_all [Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
-                      Qed.hasOneClass];
+         | decide
+         | (simp_all [Qed.everyElement, Qed.everyElementL,
+                      Qed.attrClasses, Qed.attrRole, Qed.hasOneClass];
+            try decide;
+            try omega;
             try qedCloseExhaustiveEnum))))
 
-/-- `invariant name : pred holds_in view`, `pred : Html msg → Bool` holds of the view for every
-    model. The optional `:= proof` supplies a proof the default discharger can't find. -/
+/-- `invariant name : pred holds_in view (assuming modelInv)?`, `pred : Html msg → Bool` holds of
+    the view for every model (or every model satisfying `modelInv`). -/
 syntax (name := invariantView)
-  "invariant " ident " : " term " holds_in " ident (" := " term)? : command
+  "invariant " ident " : " term " holds_in " ident (" assuming " term:max)? (" := " term)? : command
 
 /-- The discharger behind `invariant … holds_in`, as a tactic elaborator: unfold the view and
-    every `Qed.Notation` combinator down to `Html`/`Attr` constructors, split each `if`/`match`,
-    and close every leaf (a class check reduces by `x == x`, never by hashing). On a leaf it can't
-    reduce it reports the unmet obligation at the invariant's name instead of an `unsolved goals`
-    dump. `view` is the view function; `nm` names the invariant. The success path is the old
-    automation verbatim. (Maintenance: this mirror of the element/attribute helpers must list any
-    new one.) -/
+    every `Qed.Notation` combinator down to `Html`/`Attr` constructors, verify non-vacuity for
+    `roleHasOneOf`/`tagHasOneOf`, split each `if`/`match`, and close every leaf. -/
 elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => do
-  evalTactic (← `(tactic| (intro m; qedStyleReduce $view)))
+  evalTactic (← `(tactic| (intro m; try intro _qed_h_assume)))
+  withMainContext do
+    for ldecl in (← getLCtx) do
+      if ldecl.userName == `_qed_h_assume then
+        if let .const c _ := (← instantiateMVars ldecl.type).getAppFn then
+          try evalTactic (← `(tactic| simp only [$(mkIdent c):ident] at *)) catch _ => pure ()
+    if let some (_, lhs, _) := (← instantiateMVars (← getMainTarget)).eq? then
+      let (fn, args) := (lhs.getAppFn, lhs.getAppArgs)
+      if (fn.isConstOf ``Qed.roleHasOneOf || fn.isConstOf ``Qed.tagHasOneOf) && args.size == 4 then
+        let chk := mkIdent (if fn.isConstOf ``Qed.roleHasOneOf then ``Qed.hasRole else ``Qed.hasTag)
+        evalTactic (← `(tactic| (suffices $chk $(← PrettyPrinter.delab args[1]!) ($view m) = true ∧ _ from this.2; constructor)))
+  evalTactic (← `(tactic| all_goals qedStyleReduce $view))
   let goals ← getUnsolvedGoals
   unless goals.isEmpty do
-    -- The residual goal is usually just `False` (the class check reduced away), which says nothing
-    -- useful, so we quote the *rule the user wrote* instead, and only append a goal line on the
-    -- rare occasion it reduced to something more telling than `False`.
     let mut body : MessageData := m!""
     for g in goals do
       body := body ++ (← g.withContext do
@@ -473,21 +510,37 @@ elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => do
         pure (if s == "False" then m!"" else m!"\n  • the view still has to satisfy:  {s}"))
     throwErrorAt nm m!"styling invariant `{nm.getId}` doesn't hold for every model, \
       `{predLit.getString}` is false for some `{view.getId} m`.{body}\n\nSome element the rule \
-      constrains isn't carrying one of the required style classes. Check that the `role`/tag it \
-      matches really gets one of the styles passed to `roleHasOneOf`/`tagHasOneOf` in every branch \
-      of `{view.getId}`. If the view is routed through `App.view`/`View.render` rather than a plain \
-      `Model → Html`, prove it with:  invariant {nm.getId} : … holds_in {view.getId} := by …"
+      constrains isn't carrying one of the required style classes (or no element with that role/tag \
+      is rendered). Check that the `role`/tag it matches exists and gets one of the styles passed \
+      to `roleHasOneOf`/`tagHasOneOf` in every branch of `{view.getId}`. If the view is routed \
+      through `App.view`/`View.render` rather than a plain `Model → Html`, prove it with:  \
+      invariant {nm.getId} : … holds_in {view.getId} := by …"
 
-open Lean in
-macro_rules
-  | `(invariant $name:ident : $pred holds_in $view:ident := $pf:term) =>
-    `(theorem $name:ident : ∀ m, ($pred) ($view m) = true := $pf)
-  | `(invariant $name:ident : $pred holds_in $view:ident) => do
-    -- carry the rule's source text through to the discharger, so a failure can quote exactly
-    -- what was asked for (the reduced goal alone is just `False`).
+open Lean Elab Command Term Meta Lean.PrettyPrinter in
+/-- Extract the model predicate `P` from a `preserved_by` (or `from init preserved_by`) theorem. -/
+def extractInvPred (id : Ident) : TermElabM (TSyntax `term) := do
+  let cTy := (← getConstInfo (← realizeGlobalConstNoOverload id)).type
+  let stepTy := if cTy.isAppOfArity ``And 2 then cTy.appArg! else cTy
+  forallTelescope stepTy fun args _ => do
+    if args.size < 2 then throwErrorAt id
+      "`{id}` doesn't look like a `… preserved_by …` invariant, so its predicate can't \
+       be inferred, write it explicitly (`<pred> for_each … preserved_by … using {id}`)."
+    delab (← mkLambdaFVars #[args[0]!] (← inferType args[args.size - 1]!)).eta
+
+open Lean Elab Command in
+elab_rules : command
+  | `(invariant $name:ident : $pred holds_in $view:ident $[assuming $assumeT]? $[ := $pf:term]?) => do
     let predStr := ((pred.raw.reprint).getD "this rule").trimmed
-    `(set_option linter.unusedSimpArgs false in
-      theorem $name:ident : ∀ m, ($pred) ($view m) = true := by
-        qedDischargeStyling $view $name $(Syntax.mkStrLit predStr))
+    let prop ← match assumeT with
+      | some a =>
+          let P ← if a.raw.isIdent then try liftTermElabM (extractInvPred ⟨a.raw⟩) catch _ => pure a else pure a
+          `(∀ m, ($P) m → ($pred) ($view m) = true)
+      | none => `(∀ m, ($pred) ($view m) = true)
+    match pf with
+    | some p => elabCommand (← `(theorem $name:ident : $prop := $p))
+    | none   => elabCommand (← `(
+        set_option linter.unusedSimpArgs false in
+        theorem $name:ident : $prop := by
+          qedDischargeStyling $view $name $(Syntax.mkStrLit predStr)))
 
 end Qed

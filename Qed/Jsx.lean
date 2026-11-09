@@ -291,15 +291,14 @@ partial def componentToTerm (stx : Syntax) (tag : String)
           Macro.throwErrorAt stx s!"<{tag} state=\{…}> needs onMsg=\{…}: the parent Msg \
             constructor `(k : String) (msg : {tag}.Msg)` its events route through"
       | some route =>
-          let keyT : Term ← match key? with
-            | some k => `(toString $k)
-            | none   => `($(cId `keyOf) $st)
           -- `Qed.Component`/`Qed.Runtime` are above this module, so their names are
           -- emitted unresolved (`mkIdent`) and bind at the use site, which imports `Qed`
           let fids := props.map fun (_, n, _) => mkIdent (Name.mkSimple n)
           let vals := props.map fun (_, _, v) => v
           let p ← `(({ $[$fids:ident := $vals],* } : $(cId `Props)))
-          `($(cId `render) $p (fun cm => $route $keyT cm) $st)
+          match key? with
+          | some k => `($(cId `renderTag) $p $route $st (toString $k))
+          | none   => `($(cId `renderTag) $p $route $st)
   | none =>
       -- framework-owned: a keyed host element the driver mounts the instance into
       if onMsg?.isSome then

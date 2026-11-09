@@ -89,11 +89,18 @@ def onMouseUp (m : msg) : Attr msg := .on "mouseup" m
     instead of reconciling positionally. Reconciliation-only; never rendered. -/
 def key (k : String) : Attr msg := .key k
 
-/-- Typed string attributes: typos in the key become compile errors. -/
+/-- A target an `href` attribute accepts: a raw `String` URL or any typed `[Router R]` route. -/
+class ToHref (α : Type) where
+  toHref : α → String
+instance : ToHref String := ⟨id⟩
+instance [Router R] : ToHref R := ⟨Router.toURL⟩
+
+/-- Typed string attributes: typos in the key become compile errors. `href` accepts either a
+    `String` or any typed `Router` value (`<a href={Route.about}>`). -/
 def value       (v : String) : Attr msg := .attr "value" v
 def placeholder (v : String) : Attr msg := .attr "placeholder" v
 def name        (v : String) : Attr msg := .attr "name" v
-def href        (v : String) : Attr msg := .attr "href" v
+def href {α} [ToHref α] (v : α) : Attr msg := .attr "href" (ToHref.toHref v)
 def src         (v : String) : Attr msg := .attr "src" v
 def alt         (v : String) : Attr msg := .attr "alt" v
 def title       (v : String) : Attr msg := .attr "title" v

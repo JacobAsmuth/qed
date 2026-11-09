@@ -76,6 +76,7 @@ elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
          | exact Qed.ForEach.forall_filter $h                             -- remove (filter)
          | exact Qed.ForEach.forall_sortBy $h                             -- re-rank (verified sort)
          | exact Qed.ForEach.updateKeyed_forall _ _ $childInv $h          -- keyed child message
+         | exact Qed.ForEach.updateKeyed_forall _ _ ($childInv).2 $h      -- keyed child message (from init)
          | (refine Qed.ForEach.forall_map ?_ <;> intro $y $hy <;>         -- parent updates rows
              have $hP:ident := $h $y $hy <;> ($mapClose:tactic))          --   (props flow, map)
          | (refine Qed.ForEach.forall_push $h ?_ <;> ($elemClose:tactic)) -- add (push)
@@ -221,18 +222,7 @@ syntax (name := invariantForEachStyledSugar)
 open Elab Command Term Meta Lean.PrettyPrinter in
 elab_rules : command
   | `(invariant $name:ident : $childInv:ident for_each $field:ident preserved_by $upd:ident) => do
-      -- `childInv : ∀ m msg, pred m → pred (…)`; recover `pred` as `fun m => (type of the hypothesis)`.
-      let pred ← liftTermElabM do
-        let cn ← realizeGlobalConstNoOverload childInv
-        forallTelescope (← getConstInfo cn).type fun args _ => do
-          if args.size < 2 then throwErrorAt childInv
-            "`{childInv}` doesn't look like a `… preserved_by …` invariant, so its predicate can't \
-             be inferred, write it explicitly (`<pred> for_each … preserved_by … using {childInv}`)."
-          -- `.eta` turns `fun m => Card.Safe m` back into the bare `Card.Safe`, so a *named*
-          -- predicate stays an identifier (the discharger unfolds it); a true inline `fun …` stays
-          -- a lambda (no eta), which is exactly what the discharger wants too.
-          let P ← mkLambdaFVars #[args[0]!] (← inferType args[args.size - 1]!)
-          delab P.eta
+      let pred ← liftTermElabM (extractInvPred childInv)
       elabCommand (← `(invariant $name : $pred for_each $field preserved_by $upd using $childInv))
   | `(invariant $name:ident : $childStyled:ident for_each $field:ident holds_in $view:ident) => do
       -- `childStyled : ∀ m, pred (childView m) = true`; recover `pred` from the equation's LHS head.

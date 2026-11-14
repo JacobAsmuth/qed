@@ -223,5 +223,89 @@ inductive ParentMsg | child (m : SingleChild.Msg)
 def singleChildJsx (s : SingleChild.State) : Html ParentMsg := <SingleChild state={s} onMsg={.child}/>
 def singleChildDirect (s : SingleChild.State) : Html ParentMsg := SingleChild.render ParentMsg.child s
 #guard Html.render (singleChildJsx { count := 5 }) == Html.render (singleChildDirect { count := 5 })
+example : Component SingleChild.State SingleChild.Msg := SingleChild.toComponent
+
+def chipStyle : Style := css [ paddingX (px 6), marginTop (px 2) ]
+
+component ModernCounter where
+  state quantity := 1
+  state draft    := ""
+  state active   := true
+  action increase when quantity < 10 =>
+    let step := 1
+    quantity += step
+  action decrease when 1 < quantity => quantity -= 1
+  invariant 1 ≤ quantity, quantity ≤ 10
+  invariant roleHasOneOf "qty" [chipStyle]
+  view =>
+    <div>
+      <button onClick={.decrease}>−</button>
+      <span role="qty" {chipStyle}>{quantity}</span>
+      <button onClick={.increase}>+</button>
+      <button onClick={quantity := 5, draft := "five"}>Five</button>
+      <input bind={draft}/>
+      <input type="checkbox" bind={active}/>
+    </div>
+
+example : ModernCounter.init.quantity = 1 ∧ ModernCounter.init.draft = "" := ⟨rfl, rfl⟩
+example := ModernCounter.inv
+example := ModernCounter.inv_2
+
+def hostModernApp : App Nat Unit := ui 0 (fun n _ => n) fun n =>
+  <div data-n={n}><ModernCounter key="mc"/></div>
+#guard hostModernApp.styles.any (·.raw == chipStyle.raw)
+
+router RepoRoute where
+  index => "/"
+  blob  => "/orgs/:org/repos/:repo"
+  edit  => "/orgs/:org/repos/:repo/edit"
+  issues (page : Nat) => "/orgs/:org/issues/:page"
+
+#guard Router.toURL (RepoRoute.edit "acme" "qed") == "/orgs/acme/repos/qed/edit"
+#guard Router.fromURL "/orgs/acme/repos/qed/edit" == some (RepoRoute.edit "acme" "qed")
+#guard Router.fromURL "/orgs/acme/repos/qed" == some (RepoRoute.blob "acme" "qed")
+#guard Router.fromURL "/orgs/acme/issues/3" == some (RepoRoute.issues "acme" 3)
+
+schema Ticket where
+  id       : jsonOnly String
+  title    : String where title.length ≥ 3
+  priority : Nat    where 1 ≤ priority, priority ≤ 5
+  urgent   : Bool
+  kind     : select [("bug", "Bug"), ("feat", "Feature")]
+
+def draftRoundTrip : Ticket.Draft := { title := "Fix parser", priority := "2" }
+#guard ((Json.parse (Json.render (toJson draftRoundTrip))).bind fromJson).toOption == some draftRoundTrip
+
+def jsxErgonomicsView (items : Array Nat) (note? : Option String) (highlight : Bool) : Html Unit :=
+  <div {if highlight then chipStyle} data-tag={if highlight then "hi"}>
+    <>
+      <span>Header</span>
+      {if highlight then <em>!</em>}
+      {if let some note := note? then <p>{note}</p>}
+    </>
+    <ul>
+      <li key="head">Top</li>
+      {items.map fun (n : Nat) => <li key={n}>{n}</li>}
+    </ul>
+  </div>
+
+#guard (Html.render (jsxErgonomicsView #[1, 2] (some "ok") true)).contains "<p>ok</p>"
+#guard !(Html.render (jsxErgonomicsView #[] none false)).contains "<em>"
+
+structure SliceModel where
+  a : Nat
+  b : String
+  ephemeral : Nat
+deriving DecidableEq
+
+def sliceInit : SliceModel := { a := 1, b := "hi", ephemeral := 99 }
+def sliceApp : App SliceModel Nat :=
+  ui sliceInit (fun m d => { m with a := m.a + d }) (dehydrate := [a, b]) fun m =>
+    <div>{m.a}{m.b}</div>
+
+#guard sliceApp.rehydrate (sliceApp.dehydrate { a := 7, b := "yo", ephemeral := 0 })
+  == some { a := 7, b := "yo", ephemeral := 99 }
+
+invariant (m) on sliceApp : 1 ≤ m.a
 
 end SyntaxChecks

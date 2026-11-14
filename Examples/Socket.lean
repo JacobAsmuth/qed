@@ -44,8 +44,8 @@ def transition (m : Model) : Msg → Model × Cmd Msg := steps
       if t.isEmpty then m
       else ({ m with draft := "", log := m.log.push s!"→ {t}" }, Cmd.wsSend echo t)
 
-invariant composerOnlyWhenOnline :
-    (fun m => m.draft ≠ "" → m.conn = .online) preserved_by transition
+invariant composerOnlyWhenOnline (m) :
+  m.draft ≠ "" → m.conn = .online preserved_by transition
 
 def logLine (line : String) : Html Msg := <div class="line">{line}</div>
 

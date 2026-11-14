@@ -160,7 +160,7 @@ def run (app : App Model Msg) : IO Unit := do
         let id ← cbNextRef.modifyGet (fun n => (n, n + 1))
         respCbRef.modify (·.insert id onResult)
         Dom.httpSend method url body (UInt32.ofNat id)
-    | .pushUrl path => do
+    | .pushPath path => do
         Dom.pushPath path
         match app.onUrlChange with
         | some f => (← dispatchRef.get) (f path)

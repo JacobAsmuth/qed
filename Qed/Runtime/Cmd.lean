@@ -1,6 +1,6 @@
 import Qed.Html
 import Qed.Date
-import Qed.Json.Basic
+import Qed.Router
 
 namespace Qed
 
@@ -9,7 +9,7 @@ inductive Cmd (msg : Type) where
   | stream (url : String) (body : String) (onChunk : String → msg) (onDone : msg)
   | now (onNow : Date → msg)
   | request (method url body : String) (onResult : Except String String → msg)
-  | pushUrl (path : String)
+  | pushPath (path : String)
   | batch (cmds : List (Cmd msg))
   | port (name payload : String)
   | fx (kind a b c : String)
@@ -17,13 +17,15 @@ inductive Cmd (msg : Type) where
   | socket (key url : String) (onMessage : String → msg)
            (onOpen : Option msg) (onClose : Option msg) (onError : Option (String → msg))
 
+instance : Coe (List (Cmd msg)) (Cmd msg) := ⟨.batch⟩
+
 mutual
 def Cmd.map (f : α → β) : Cmd α → Cmd β
   | .none                      => .none
   | .stream u b onChunk onDone => .stream u b (fun c => f (onChunk c)) (f onDone)
   | .now onNow                 => .now (fun d => f (onNow d))
   | .request m u b onResult    => .request m u b (fun r => f (onResult r))
-  | .pushUrl p                 => .pushUrl p
+  | .pushPath p                => .pushPath p
   | .batch cmds                => .batch (Cmd.mapList f cmds)
   | .port n p                  => .port n p
   | .fx k a b c                => .fx k a b c
@@ -65,7 +67,9 @@ def Cmd.storageGet (key : String) (onValue : Option String → msg) : Cmd msg :=
   .fxResult "storage.get" key "" fun s =>
     onValue (match (Json.parse s).toOption with | some (.str v) => some v | _ => Option.none)
 
-def Cmd.replaceUrl (path : String) : Cmd msg := .fx "history.replace" path "" ""
+def Cmd.pushUrl {α} [ToHref α] (target : α) : Cmd msg := .pushPath (ToHref.toHref target)
+def Cmd.navigate {α} [ToHref α] (target : α) : Cmd msg := .pushPath (ToHref.toHref target)
+def Cmd.replaceUrl {α} [ToHref α] (target : α) : Cmd msg := .fx "history.replace" (ToHref.toHref target) "" ""
 def Cmd.back    : Cmd msg := .fx "history.back" "" "" ""
 def Cmd.forward : Cmd msg := .fx "history.forward" "" "" ""
 

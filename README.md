@@ -32,29 +32,27 @@ import Qed
 open Qed
 
 component Quantity where
-  state quantity : Int := 1
-  action increase when (quantity < 10) => set quantity (quantity + 1)
-  action decrease when (1 < quantity) => set quantity (quantity - 1)
+  state quantity := 1
+  action increase when quantity < 10 => quantity += 1
+  action decrease when 1 < quantity  => quantity -= 1
+  invariant 1 ≤ quantity, quantity ≤ 10
   view =>
     <div>
       <button onClick={.decrease}>−</button>
       <span>{quantity}</span>
       <button onClick={.increase}>+</button>
     </div>
-
-invariant quantityInRange :
-  (fun s => 1 ≤ s.quantity ∧ s.quantity ≤ 10)
-  preserved_by Quantity.update
 ```
 
-Qed generates `Quantity.update` from the component's actions. The invariant is checked
-against every branch of that function, including any actions added later.
+Qed generates `Quantity.init` and `Quantity.update` from the component's state and actions.
+The invariant is checked against the initial state and every branch of `Quantity.update`,
+including any actions added later.
 
 If you removed the lower bound guard from decrease, the compiler would report:
 
 ```text
-invariant `quantityInRange` isn't preserved by `Quantity.update`
-case `decrease` still needs: 1 ≤ m.quantity - 1 ∧ m.quantity - 1 ≤ 10
+invariant `Quantity.inv` isn't preserved by `Quantity.update`
+case `decrease` still needs: 1 ≤ m.quantity - 1
 ```
 
 The proof covers `Quantity.update`. Qed's JavaScript compiler and browser code are tested
@@ -65,9 +63,9 @@ You can write components without invariants and add rules as you need them.
 
 ```lean
 schema Order where
-  name : Codec.text.refine (fun s => s.length ≥ 1)
-  quantity : Codec.nat.refine (fun n => 1 ≤ n ∧ n ≤ 10)
-  acceptTerms : Codec.checkbox.refine (· = true)
+  name        : String where name.length ≥ 1
+  quantity    : Nat    where 1 ≤ quantity, quantity ≤ 10
+  acceptTerms : Bool   where acceptTerms
 ```
 
 Qed generates `Order.Draft` for editable input, including incomplete or invalid values.

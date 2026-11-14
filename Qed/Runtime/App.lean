@@ -23,11 +23,14 @@ class ToStep (Model : Type) (Msg : Type) (α : Type) where
   toStep : α → Model × Cmd Msg
 instance : ToStep Model Msg Model := ⟨fun m => (m, .none)⟩
 instance : ToStep Model Msg (Model × Cmd Msg) := ⟨id⟩
+instance : ToStep Model Msg (Model × List (Cmd Msg)) := ⟨fun (m, cs) => (m, .batch cs)⟩
 
 @[simp] theorem ToStep.toStep_model (m : Model) :
     (ToStep.toStep m : Model × Cmd Msg) = (m, .none) := rfl
 @[simp] theorem ToStep.toStep_pair (p : Model × Cmd Msg) :
     (ToStep.toStep p : Model × Cmd Msg) = p := rfl
+@[simp] theorem ToStep.toStep_listPair (p : Model × List (Cmd Msg)) :
+    (ToStep.toStep p : Model × Cmd Msg) = (p.1, .batch p.2) := rfl
 
 def mkApp [ToStep Model Msg α] (init : Model) (update : Model → Msg → α)
     (template : View Model Msg) (start : Cmd Msg := .none) (locals : List LocalDef := [])
@@ -44,6 +47,23 @@ def mkRoutedApp {R : Type} [Router R] [Inhabited R] [ToStep Model Msg α]
 
 def App.addLocals (app : App Model Msg) (locals : List LocalDef) (styles : List Style := []) : App Model Msg :=
   { app with locals := LocalDef.dedupe (app.locals ++ locals), styles := app.styles ++ styles }
+
+@[simp] theorem mkApp_init [ToStep Model Msg α] (init : Model) (u : Model → Msg → α)
+    (t : View Model Msg) (s l p) :
+    (mkApp init u t s l p).init = (init, s) := rfl
+@[simp] theorem mkApp_update [ToStep Model Msg α] (init : Model) (u : Model → Msg → α)
+    (t : View Model Msg) (s l p) (m : Model) (msg : Msg) :
+    (mkApp init u t s l p).update m msg = ToStep.toStep (u m msg) := rfl
+@[simp] theorem mkRoutedApp_init {R : Type} [Router R] [Inhabited R] [ToStep Model Msg α]
+    (init : Model) (u : Model → Msg → α) (t : View Model Msg) (r : R → Msg) (s l p) :
+    (mkRoutedApp init u t r s l p).init = (init, s) := rfl
+@[simp] theorem mkRoutedApp_update {R : Type} [Router R] [Inhabited R] [ToStep Model Msg α]
+    (init : Model) (u : Model → Msg → α) (t : View Model Msg) (r : R → Msg) (s l p) (m : Model) (msg : Msg) :
+    (mkRoutedApp init u t r s l p).update m msg = ToStep.toStep (u m msg) := rfl
+@[simp] theorem App.addLocals_init (app : App Model Msg) (l s) :
+    (app.addLocals l s).init = app.init := rfl
+@[simp] theorem App.addLocals_update (app : App Model Msg) (l s) :
+    (app.addLocals l s).update = app.update := rfl
 
 structure Dehydrate (Model : Type) where
   project    : Model → Model := id
@@ -80,5 +100,36 @@ end Dehydrate
 
 def App.withDehydrate {Model Msg : Type} (d : Dehydrate Model) (app : App Model Msg) : App Model Msg :=
   { app with dehydrate := d.dehydrate, rehydrate := d.rehydrate }
+
+@[simp] theorem App.withDehydrate_init (d : Dehydrate Model) (app : App Model Msg) :
+    (App.withDehydrate d app).init = app.init := rfl
+@[simp] theorem App.withDehydrate_update (d : Dehydrate Model) (app : App Model Msg) :
+    (App.withDehydrate d app).update = app.update := rfl
+
+open Lean in
+private def mkNestedTuple : List Term → MacroM Term
+  | []      => `(())
+  | [x]     => pure x
+  | x :: xs => do
+      let rest ← mkNestedTuple xs
+      `(($x, $rest))
+
+open Lean in
+macro "Dehydrate.fields " init:term:max " [" fs:ident,* "]" : term => do
+  let fArr := fs.getElems
+  if fArr.isEmpty then
+    Macro.throwError "Dehydrate.fields requires at least one field name"
+  let projs ← fArr.mapM fun f => `(m.$f:ident)
+  let getter ← mkNestedTuple projs.toList
+  let vIds := (List.range fArr.size).toArray.map fun i =>
+    mkIdent (Name.mkSimple s!"_qed_d_{i}")
+  let pat ← mkNestedTuple (vIds.toList.map fun v => (⟨v.raw⟩ : Term))
+  let vTerms : Array Term := vIds.map fun v => ⟨v.raw⟩
+  `(Dehydrate.slice $init (fun m => $getter) (fun m $pat => { m with $[$fArr:ident := $vTerms],* }))
+
+class ToPortOpt (Msg : Type) (α : Type) where
+  toPortOpt : α → Option (String → String → Option Msg)
+instance : ToPortOpt Msg (String → String → Option Msg) := ⟨some⟩
+instance : ToPortOpt Msg (Option (String → String → Option Msg)) := ⟨id⟩
 
 end Qed

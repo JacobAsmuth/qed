@@ -53,7 +53,7 @@ def effects (m : Model) : Msg → Cmd Msg
   | .ping         => echoOut "ping"
   | .pick         => Cmd.pickFile ".txt,text/*" .picked
   | .focusTitle   => Cmd.focus "title-input"
-  | .saveBatch    => Cmd.batch [Cmd.storageSet "count" (toString m.count), Cmd.setTitle "Saved!"]
+  | .saveBatch    => .batch [.storageSet "count" (toString m.count), .setTitle "Saved!"]
   | .typeSearch s => Cmd.afterKeyed "search" 200 (.runSearch s)
   | _             => .none
 
@@ -61,7 +61,7 @@ def transition (m : Model) (msg : Msg) : Model × Cmd Msg :=
   let m' := update m msg; (m', effects m' msg)
 
 def app : App Model Msg :=
-  ui init transition (onPort := some onPort) (start := Cmd.storageGet "count" .loaded) fun m =>
+  ui init transition (onPort := onPort) (start := Cmd.storageGet "count" .loaded) fun m =>
     <div class="app">
       <div class="counter">
         <button class="dec" onClick={.dec}>−</button>

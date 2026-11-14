@@ -3,15 +3,12 @@ open Qed
 
 namespace Signup
 
-abbrev Email (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
-abbrev Adult (n : Nat)    : Prop := n ≥ 18
-
 schema Account where
-  email : Codec.text.refine Email
-  age   : Codec.nat.refine Adult
-  born  : Codec.date
-  agree : Codec.checkbox.refine (· = true)
-  plan  : Codec.select [("free", "Free"), ("pro", "Pro")]
+  email : String where email.contains '@', email.length ≥ 3
+  age   : Nat    where age ≥ 18
+  born  : Date
+  agree : Bool   where agree
+  plan  : select [("free", "Free"), ("pro", "Pro")]
 
 structure Model where
   draft     : Account.Draft
@@ -30,9 +27,8 @@ def app : App Model Msg :=
     <div class="app">
       <h1>Create account</h1>
       {Account.formView m.draft .edit .submit}
-      {match m.submitted with
-       | some acc => <p class="ok">Created account for {text acc.email}</p>
-       | none     => .text ""}
+      {if let some acc := m.submitted then
+        <p class="ok">Created account for {acc.email}</p>}
     </div>
 
 end Signup

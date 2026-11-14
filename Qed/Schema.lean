@@ -112,18 +112,74 @@ def json (α : Type) [ToJson α] [FromJson α] : Codec α where
 
 end Codec
 
+class DefaultCodec (α : Type) where
+  codec : Codec α
+
+@[reducible] instance : DefaultCodec String := ⟨Codec.text⟩
+@[reducible] instance : DefaultCodec Nat    := ⟨Codec.nat⟩
+@[reducible] instance : DefaultCodec Int    := ⟨Codec.int⟩
+@[reducible] instance : DefaultCodec Bool   := ⟨Codec.checkbox⟩
+@[reducible] instance : DefaultCodec Date   := ⟨Codec.date⟩
+@[reducible] instance (priority := low) {α : Type} [ToJson α] [FromJson α] : DefaultCodec α :=
+  ⟨Codec.json α⟩
+
+open Lean in
+syntax schemaField := ident " : " term (" where " sepBy1(term, ","))?
+
 open Lean in
 syntax (name := schemaCmd) "schema " ident ("(" ident " : " term ")")* " where "
-  sepBy1IndentSemicolon(group(ident " : " term)) : command
+  sepBy1IndentSemicolon(schemaField) : command
 
 open Lean Elab Term Meta in
-private partial def schemaRefinedAux (cbns : Array Ident) (cbts : Array Term)
-    (inputs : Array Term) (i : Nat) : TermElabM (Array (Bool × Bool)) := do
+private partial def resolveCodecBase (rawSpec : Term) : TermElabM Term := do
+  match rawSpec with
+  | `($fn:ident $arg:term) =>
+      if fn.getId.eraseMacroScopes == `jsonOnly then
+        let inner ← resolveCodecBase arg
+        return ← `(Qed.Codec.jsonOnly $inner)
+  | _ => pure ()
+  let scopedSpec ← `(open Qed.Codec in $rawSpec)
+  let e ← elabTermAndSynthesize scopedSpec none
+  let ety ← whnf (← instantiateMVars (← inferType e))
+  if ety.isAppOfArity ``Qed.Codec 1 then
+    return scopedSpec
+  else if ety.isSort then
+    let eWhnf ← whnf (← instantiateMVars e)
+    if eWhnf.isConstOf ``String then return ← `(Qed.Codec.text)
+    else if eWhnf.isConstOf ``Nat then return ← `(Qed.Codec.nat)
+    else if eWhnf.isConstOf ``Int then return ← `(Qed.Codec.int)
+    else if eWhnf.isConstOf ``Bool then return ← `(Qed.Codec.checkbox)
+    else if eWhnf.isConstOf ``Qed.Date then return ← `(Qed.Codec.date)
+    else
+      if (← trySynthInstance (← mkAppM ``Qed.DefaultCodec #[e])) matches .some _ then
+        return ← `((Qed.DefaultCodec.codec : Qed.Codec $rawSpec))
+      else
+        throwErrorAt rawSpec m!"schema field type `{rawSpec}` has no default `Codec` or JSON instances"
+  else
+    throwErrorAt rawSpec m!"a schema field must be a type (`String`, `Nat`, `Bool`, `Date`, …) \
+      or a `Codec` (e.g. `select […]`, `textarea`, `jsonOnly String`), but this has \
+      type{indentExpr ety}"
+
+open Lean Elab Term Meta in
+private partial def elabSchemaFieldsAux (cbns : Array Ident) (cbts : Array Term)
+    (fs : Array Ident) (rawSpecs : Array Term) (whereClauses : Array (Array Term)) (i : Nat) :
+    TermElabM (Array (Term × Bool × Bool)) := do
   if i < cbns.size then
     let bt ← elabType cbts[i]!
-    withLocalDeclD cbns[i]!.getId bt fun _ => schemaRefinedAux cbns cbts inputs (i + 1)
+    withLocalDeclD cbns[i]!.getId bt fun _ =>
+      elabSchemaFieldsAux cbns cbts fs rawSpecs whereClauses (i + 1)
   else
-    inputs.mapM fun inp => do
+    ((fs.zip rawSpecs).zip whereClauses).mapM fun ((f, rawSpec), preds) => do
+      let base ← resolveCodecBase rawSpec
+      let inp : Term ←
+        if preds.isEmpty then
+          pure base
+        else do
+          let propTerms ← preds.mapM fun p => `(($p : Prop))
+          let combined ← match propTerms.toList with
+            | []      => `(True)
+            | c :: cs => cs.foldlM (init := c) fun acc x => `($acc ∧ $x)
+          `(Qed.Codec.refine $base (fun $f:ident => $combined))
       let c ← elabTermAndSynthesize inp none
       let cty ← instantiateMVars (← inferType c)
       match cty.getAppFnArgs with
@@ -132,37 +188,57 @@ private partial def schemaRefinedAux (cbns : Array Ident) (cbts : Array Term)
           let trueFn := Expr.lam `x α (mkConst ``True) BinderInfo.default
           let isRef ← pure (! (← isDefEq validExpr trueFn))
           let isLaw ← pure ((← trySynthInstance (mkApp (mkConst ``Qed.LawfulJson) α)) matches .some _)
-          pure (isRef, isLaw)
+          pure (inp, isRef, isLaw)
       | _ =>
-          throwErrorAt inp m!"a schema field must be a `Codec` (e.g. `Codec.text`, \
-            `Codec.nat.refine P`, or `Codec.json T` for a nested or list field), but this has \
-            type{indentExpr cty}"
+          throwErrorAt rawSpec m!"failed to resolve schema field `{f.getId}` to a `Codec`"
 
 open Lean Elab Command in
-private def schemaRefinedFlags (cbns : Array Ident) (cbts : Array Term) (inputs : Array Term) :
-    CommandElabM (Array Bool × Bool) := do
-  let flags ← liftTermElabM (schemaRefinedAux cbns cbts inputs 0)
-  return (flags.map (·.1), flags.all (·.2))
+private def resolveSchemaFields (cbns : Array Ident) (cbts : Array Term)
+    (fs : Array Ident) (rawSpecs : Array Term) (whereClauses : Array (Array Term)) :
+    CommandElabM (Array Term × Array Bool × Bool) := do
+  let res ← liftTermElabM (elabSchemaFieldsAux cbns cbts fs rawSpecs whereClauses 0)
+  return (res.map (·.1), res.map (·.2.1), res.all (·.2.2))
+
+open Lean Elab Command Term Meta in
+private def elabPredProbe (cbns : Array Ident) (cbts : Array Term) (inp : Term) (i : Nat) :
+    TermElabM Unit := do
+  if i < cbns.size then
+    let bt ← elabType cbts[i]!
+    withLocalDeclD cbns[i]!.getId bt fun _ => elabPredProbe cbns cbts inp (i + 1)
+  else
+    discard <| elabTermAndSynthesize inp none
 
 open Lean Elab Command Term in
 elab_rules : command
-  | `(schema $t:ident $[($cbns:ident : $cbts:term)]* where $[$fs:ident : $inputs:term]*) => do
-      let draftId    := mkIdent (t.getId ++ `Draft)
-      let emptyId    := mkIdent (t.getId ++ `Draft ++ `empty)
-      let parseId    := mkIdent (t.getId ++ `parse)
-      let canId      := mkIdent (t.getId ++ `canSubmit)
-      let iffId      := mkIdent (t.getId ++ `canSubmit_iff)
-      let viewId     := mkIdent (t.getId ++ `formView)
-      let decodeId   := mkIdent (t.getId ++ `decode)
-      let encodeId   := mkIdent (t.getId ++ `encode)
-      let toJsonId   := mkIdent (t.getId ++ `toJson)
-      let fromJsonId := mkIdent (t.getId ++ `fromJson)
+  | `(schema $t:ident $[($cbns:ident : $cbts:term)]* where $[$fieldStxs:schemaField]*) => do
+      let mut fs : Array Ident := #[]
+      let mut rawSpecs : Array Term := #[]
+      let mut whereClauses : Array (Array Term) := #[]
+      for fstx in fieldStxs do
+        match fstx with
+        | `(schemaField| $f:ident : $spec:term $[where $[$ps:term],*]?) =>
+            fs := fs.push f
+            rawSpecs := rawSpecs.push spec
+            whereClauses := whereClauses.push (ps.getD #[])
+        | _ => throwUnsupportedSyntax
+      let draftId       := mkIdent (t.getId ++ `Draft)
+      let emptyId       := mkIdent (t.getId ++ `Draft ++ `empty)
+      let draftToJsonId := mkIdent (t.getId ++ `Draft ++ `toJson)
+      let draftFromId   := mkIdent (t.getId ++ `Draft ++ `fromJson)
+      let parseId       := mkIdent (t.getId ++ `parse)
+      let canId         := mkIdent (t.getId ++ `canSubmit)
+      let iffId         := mkIdent (t.getId ++ `canSubmit_iff)
+      let viewId        := mkIdent (t.getId ++ `formView)
+      let decodeId      := mkIdent (t.getId ++ `decode)
+      let encodeId      := mkIdent (t.getId ++ `encode)
+      let toJsonId      := mkIdent (t.getId ++ `toJson)
+      let fromJsonId    := mkIdent (t.getId ++ `fromJson)
+      let (inputs, refined, allLawful) ← resolveSchemaFields cbns cbts fs rawSpecs whereClauses
       let pairs := fs.zip inputs
-      let (refined, allLawful) ← schemaRefinedFlags cbns cbts inputs
       -- Lean logs failed instance synthesis to `messages` rather than throwing; probe in isolation to catch missing `DecidablePred` cleanly.
       for (f, inp) in pairs do
         let before := (← get).messages
-        try liftTermElabM (discard <| elabTermAndSynthesize inp none) catch _ => pure ()
+        try liftTermElabM (elabPredProbe cbns cbts inp 0) catch _ => pure ()
         let probeMsgs := (← get).messages.toList.drop before.toList.length
         modify fun st => { st with messages := before }
         let mut undecidable := false
@@ -171,9 +247,9 @@ elab_rules : command
         if undecidable then
           throwErrorAt inp m!"schema field `{f.getId}` has a refinement that isn't decidable, so \
             validity can't be computed (no `DecidablePred` for it).\n\nThe usual cause is a \
-            predicate written with `def`. Write it as an `abbrev` instead, so Lean sees it reduces \
-            to a decidable check:\n    abbrev MyPredicate (x : …) : Prop := …\nIf it genuinely \
-            can't be decided, give it a `DecidablePred` instance."
+            predicate written with `def`. Write it inline with `where …` or as an `abbrev`, so Lean \
+            sees it reduces to a decidable check:\n    abbrev MyPredicate (x : …) : Prop := …\n\
+            If it genuinely can't be decided, give it a `DecidablePred` instance."
       let cbnsT : Array (TSyntax `term) := cbns.map fun c => ⟨c.raw⟩
       let appTo : TSyntax `term → CommandElabM (TSyntax `term) := fun head =>
         cbnsT.foldlM (init := head) fun acc c => `($acc $c)
@@ -192,9 +268,19 @@ elab_rules : command
         if r then `(($inp).fromJsonField j $keyLit)
         else `((FromJsonField.fromField j $keyLit : Except String (Codec.Val $inp)))
       let jsonReads ← (pairs.zip refined).mapM fun ((f, _), r) =>
-        if r then `((x.$f).val) else `(x.$f)
+        if r then `((x.$f:ident).val) else `(x.$f:ident)
       let jsonPairs ← (fs.zip jsonReads).mapM fun (f, rd) =>
         let keyLit := Syntax.mkStrLit (toString f.getId); `(($keyLit, toJson $rd))
+      let draftJsonPairs ← fs.mapM fun f =>
+        let keyLit := Syntax.mkStrLit (toString f.getId); `(($keyLit, toJson (x.$f:ident)))
+      let draftJsonDecodes ← fs.mapM fun f =>
+        let keyLit := Syntax.mkStrLit (toString f.getId)
+        `((FromJsonField.fromField j $keyLit : Except String String))
+      let draftFieldEqs ← fs.mapM fun f =>
+        let keyLit := Syntax.mkStrLit (toString f.getId)
+        `(term| LawfulJson.fromField_of_field ($draftToJsonId x) $keyLit (x.$f:ident) rfl)
+      let draftDepthProof ← fs.foldrM (init := ← `(term| Nat.le_refl 0)) fun f acc =>
+        `(term| Codec.max_le_max (LawfulJson.depth_toJson (x.$f:ident)) $acc)
       let isSomes ← runCalls.mapM fun rc => `(($rc).isSome)
       let rhs ← match isSomes.toList with
         | []      => `(True)
@@ -216,8 +302,23 @@ elab_rules : command
       let viewBody ← rowGroups.foldrM (init := ← `(term| [$submitBtn])) fun g acc => `(term| $g ++ $acc)
       let formCmds : Array (TSyntax `command) := #[
         ← `(command| structure $draftId where
-              $[$fs:ident : String]*),
+              $[$fs:ident : String := ""]*
+            deriving Inhabited, DecidableEq, Repr),
         ← `(command| def $emptyId : $draftId := { $[$fs:ident := $emptyVals],* }),
+        ← `(command| def $draftToJsonId (x : $draftId) : Json := Json.obj [$[$draftJsonPairs],*]),
+        ← `(command| def $draftFromId (j : Json) : Except String $draftId := do
+              $[let $fs:ident ← $draftJsonDecodes:term]*
+              return { $[$fs:ident],* }),
+        ← `(command| instance : ToJson $draftId := ⟨$draftToJsonId⟩),
+        ← `(command| instance : FromJson $draftId := ⟨$draftFromId⟩),
+        ← `(command| instance : LawfulJson $draftId where
+              depthBound := 1
+              depth_toJson x := Nat.add_le_add_left $draftDepthProof 1
+              fromJson_toJson x := by
+                have h : $draftFromId ($draftToJsonId x) = .ok x := by
+                  unfold $draftFromId
+                  simp only [$[$draftFieldEqs:term],*, bind, Except.bind, pure, Except.pure]
+                exact h),
         ← `(command| structure $t $[($cbns:ident : $cbts:term)]* where
               $[$fs:ident : $structTys]*),
         ← `(command| def $parseId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Option $tApp := do
@@ -267,13 +368,10 @@ elab_rules : command
 
 namespace Demo
 
-abbrev Email (s : String) : Prop := s.contains '@' ∧ s.length ≥ 3
-abbrev Adult (n : Nat) : Prop := n ≥ 18
-
 schema Signup where
-  email : Codec.text.refine Email
-  age   : Codec.nat.refine Adult
-  agree : Codec.checkbox.refine (· = true)
+  email : String where email.contains '@', email.length >= 3
+  age   : Nat    where age >= 18
+  agree : Bool   where agree
 
 end Demo
 

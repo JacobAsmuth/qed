@@ -5,14 +5,13 @@
 ```lean
 component Editor where
   prop label : String
-  state note : String := ""
+  state note := ""
   emits String
-  action edit => set note
   action save => send note
   view =>
     <div>
       <label>{label}</label>
-      <input value={note} onInput={.edit}/>
+      <input bind={note}/>
       <button onClick={.save}>Save</button>
     </div>
 ```
@@ -36,24 +35,38 @@ parent updates during editing, nested components, and state restoration.
 Previously, tag attributes named after state fields seeded state. Move those values into
 `initial`, or declare them as `prop` if they should track the parent.
 
-## Actions
+## Actions and inline invariants
 
 For each `action` declaration, Qed generates a message constructor and a branch in the pure
-update function. Inline `set` handlers still work. Action declarations allow typed parameters
-and an optional guard:
+update function. Inline `{field := …}`, `{field += …}`, `{field -= …}`, `bind={field}`, and
+legacy `set` handlers compile to named message constructors as well. Action declarations allow
+typed parameters, an optional `when` guard, local `let` bindings, and assignment statements
+separated by newlines or commas:
 
 ```lean
-action increment (amount : Nat) when (amount > 0) =>
-  set count (count + amount), set saved count
+action increment (amount : Nat) when amount > 0 =>
+  let next := count + amount
+  count := next
+  saved := count
 ```
 
-Use `.increment 2` in an event handler. All `set` expressions and `send` outputs use the state
-from before the action. In this example, `saved` is assigned the count before the increment.
-When the guard is false, Qed skips the action's updates and output. `action edit => set note`
-accepts an input payload; actions with explicit parameters must supply their set values explicitly.
+Use `.increment 2` in an event handler. Field assignments (`:=`, `+=`, `-=`) and `send` outputs
+apply simultaneously against the pre-action state (plus any preceding `let` bindings), so here
+`saved` receives `count` before the increment while `next` holds the incremented value.
+When the guard is false, Qed skips the action's updates and output. `<input bind={note}/>`
+(or `note := ·`) binds an input payload directly; actions with explicit parameters supply their
+assigned values explicitly.
 
-Actions are `set`/`send` chains. Arbitrary transitions and effects remain available through
-ordinary `Model`, `Msg`, `update`, and `ui`. Generated transitions are still usable in proofs;
+Components can also state invariants inline directly over their state fields or rendered view:
+
+```lean
+invariant 0 ≤ count, saved ≤ count
+invariant roleHasOneOf "save" [primaryStyle, disabledStyle]
+```
+
+For mountable components without props, an inline state invariant checks both `Name.init` and
+preservation across `Name.update`. Arbitrary transitions and effects remain available through
+ordinary `Model`, `Msg`, `update`, and `ui`. Generated transitions are usable in proofs;
 for a component with props, their signature is `update props state message`.
 
 ## Child collections
@@ -64,7 +77,7 @@ uses the `Row` component from [Todo](../Examples/Todo.lean), where `key id` defi
 ```lean
 component Board where
   collection rows : Row
-  action remove (id : Nat) => set rows (rows.filter (·.id != id))
+  action remove (id : Nat) => rows := rows.filter (·.id != id)
   view =>
     <ul>{Row.each rows .rows fun row child =>
       <li>

@@ -4,12 +4,12 @@ open Qed
 namespace Users
 
 router R where
-  home => ""
-  user (name : String) => "users"
+  home => "/"
+  user => "/users/:name"
 
 schema Profile where
-  name : Codec.text
-  bio  : Codec.text
+  name : String
+  bio  : String
 
 structure Model where
   route   : R
@@ -34,23 +34,22 @@ def transition (m : Model) : Msg → Model × Cmd Msg := steps
   | .routed route   => { m with route }
   | .typeQuery s    => { m with query := s }
   | .submit         => if m.query.trimmed.isEmpty then m
-                       else (m, .pushUrl (Router.toURL (R.user m.query.trimmed)))
+                       else (m, .pushUrl (R.user m.query.trimmed))
   | .gotProfile k r => { m with profile := m.profile.put k r (userKey m) }
   | .focus          => { m with focused := true }
   | .blur           => { m with focused := false }
   | .key k          => if k == "Escape" then { m with query := "" } else m
 
 def profileQuery : Query Model Msg :=
-  Resource.query
+  Resource.queryFor profile
     (key := userKey)
     (url := fun name => s!"/api/users/{name}")
     (got := Msg.gotProfile)
-    (get := fun m => m.profile) (set := fun c m => { m with profile := c })
 
 def app : App Model Msg :=
   ui init transition (onRoute := Msg.routed) (queries := [profileQuery]) fun m =>
     <div class="app">
-      <nav>{linkTo R.home [cls "home-link"] "Home"}</nav>
+      <nav><a href={R.home} class="home-link">Home</a></nav>
       {match m.route with
        | .home =>
            <form class="search" onSubmit={.submit}>
@@ -58,7 +57,7 @@ def app : App Model Msg :=
                     placeholder="Find a user…"
                     onInput={.typeQuery} onFocus={.focus} onBlur={.blur} onKeydown={.key}/>
              <button class="go" type="submit">Search</button>
-             <div class="hint">try {linkTo (R.user "ada") [] "ada"} or {linkTo (R.user "alan") [] "alan"}</div>
+             <div class="hint">try <a href={R.user "ada"}>ada</a> or <a href={R.user "alan"}>alan</a></div>
            </form>
        | .user name =>
            <div class="profile">

@@ -1,5 +1,7 @@
 import Qed.Component.Core
 import Qed.Runtime
+import Qed.Jsx
+import Qed.Invariant.View
 import Lean
 
 namespace Qed
@@ -28,32 +30,111 @@ open Lean in
     "`send …` is the component output; it only has meaning inside a `component … view =>` body"
 
 open Lean Parser in
--- `identEq` keeps `component`/`state`/`key`/`view` non-reserved (note: an open-ended `def`/`#check`
--- right before `component` needs a `/-- ... -/` doc comment so Lean's term parser stops at the token);
--- `manyIndent` + `maxPrec` prevent clauses or JSX bodies from swallowing subsequent declarations.
+def compFieldClause : Parser := leading_parser
+  withPosition (
+    (atomic (identEq `state) <|> atomic (identEq `prop) <|> atomic (identEq `collection)) >>
+    ident >>
+    optional (" : " >> termParser) >>
+    optional (" := " >> termParser))
+
+open Lean Parser in
+def compKeyClause : Parser := leading_parser
+  withPosition (atomic (identEq `key) >> ident)
+
+open Lean Parser in
+def compEmitsClause : Parser := leading_parser
+  withPosition (atomic (identEq `emits) >> termParser)
+
+open Lean Parser in
+def actionLetStmt : Parser := leading_parser
+  withPosition ("let " >> ident >> optional (" : " >> termParser) >> " := " >> termParser)
+
+open Lean Parser in
+def actionAssignStmt : Parser := leading_parser
+  withPosition (atomic (ident >> (symbol ":=" <|> symbol "+=" <|> symbol "-=")) >> termParser)
+
+open Lean Parser in
+def actionSetStmt : Parser := leading_parser
+  withPosition (
+    atomic (nonReservedSymbol "set" (includeIdent := true)) >> ident >>
+    optional (checkColGt >> termParser maxPrec))
+
+open Lean Parser in
+def actionSendStmt : Parser := leading_parser
+  withPosition (
+    atomic (nonReservedSymbol "send" (includeIdent := true)) >> checkColGt >> termParser)
+
+open Lean Parser in
+def actionStmt : Parser :=
+  actionLetStmt <|> actionAssignStmt <|> actionSetStmt <|> actionSendStmt
+
+open Lean Parser in
+def compActionClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `action) >> ident >>
+    many (node `Qed.componentActionParam ("(" >> ident >> " : " >> termParser >> ")")) >>
+    optional (atomic (identEq `when) >> termParser) >> " => " >>
+    checkColGt >> actionStmt >>
+    many (atomic (optional "," >> checkColGt >> actionStmt)))
+
+open Lean Parser in
+def compInvName : Parser := leading_parser
+  ident >> " : "
+
+open Lean Parser in
+def compInvariantClause : Parser := leading_parser
+  withPosition (
+    "invariant " >>
+    optional (atomic compInvName) >>
+    sepBy1 termParser "," >>
+    optional (" holds_in " >> identEq `view >> optional (" assuming " >> termParser maxPrec)) >>
+    optional (" using " >> "[" >> sepBy termParser "," >> "]") >>
+    optional (" := " >> termParser))
+
+open Lean Parser in
+def compClause : Parser :=
+  compFieldClause <|> compKeyClause <|> compEmitsClause <|> compActionClause <|> compInvariantClause
+
+open Lean Parser in
 @[command_parser] def componentCmd : Parser := leading_parser
-  optional Command.docComment >> atomic (identEq `component) >> ident >> " where " >>
-  manyIndent (node `Qed.componentStateItem
-    ((atomic (identEq `state) <|> atomic (identEq `prop) <|> atomic (identEq `collection)) >> ident >> " : " >> termParser >>
-     optional (" := " >> termParser maxPrec))) >>
-  optional (node `Qed.componentKey (atomic (identEq `key) >> ident)) >>
-  optional (node `Qed.componentEmits (atomic (identEq `emits) >> termParser maxPrec)) >>
-  manyIndent (node `Qed.componentAction (atomic (identEq `action) >> ident >> many (node `Qed.componentActionParam ("(" >> ident >> " : " >> termParser >> ")")) >> optional (atomic (identEq `when) >> termParser maxPrec) >> " => " >> termParser maxPrec)) >>
-  identEq `view >> " => " >> termParser maxPrec
+  optional Command.docComment >>
+  withPosition (
+    "component " >> ident >> " where " >>
+    many (checkColGt >> compClause) >>
+    checkColGt >> identEq `view >> " => " >> checkColGt >> termParser >>
+    many (checkColGt >> compInvariantClause))
 
 private structure SetSite where
   key     : String
+  lets    : Array (Lean.Ident × Option Lean.Term × Lean.Term) := #[]
   assigns : Array (Lean.Name × Option Lean.Term)
   ctor    : Lean.Name
   send?   : Option Lean.Term
   params  : Array (Lean.Ident × Lean.Term) := #[]
   guard?  : Option Lean.Term := none
 
+private def isCdot (stx : Lean.Syntax) : Bool :=
+  stx.getKind == ``Lean.Parser.Term.cdot || (stx.reprint.getD "").trimmed == "·"
+
+private def atomStr : Lean.Syntax → String
+  | .node _ _ #[.atom _ v] => v
+  | .atom _ v              => v
+  | _                      => ""
+
 private partial def mentionsIdent (stx : Lean.Syntax) (n : Lean.Name) : Bool :=
   match stx with
   | .ident _ _ v _ => n.isPrefixOf v.eraseMacroScopes
   | .node _ _ args => args.any (mentionsIdent · n)
   | _ => false
+
+open Lean Elab Command in
+private def desugarAssign (fname : Name) (op : String) (rhs : Term) : CommandElabM Term := do
+  let fIdent := mkIdent fname
+  match op with
+  | ":=" => pure rhs
+  | "+=" => `($fIdent + ($rhs))
+  | "-=" => `($fIdent - ($rhs))
+  | _    => throwErrorAt rhs s!"unknown assignment operator '{op}'"
 
 open Lean Elab Command in
 private def registerSite (sites : IO.Ref (Array SetSite))
@@ -103,6 +184,45 @@ private partial def replaceSets (fields : Array Name) (msgPath : Name) (hasEmits
   else if stx.getKind == ``sendTerm then
     unless hasEmits do noEmits stx
     return mkIdent (msgPath ++ (← registerSite sites #[] (some ⟨stx[1]⟩)))
+  else if stx.getKind == ``Qed.Jsx.attrValAssign then
+    let mut assigns : Array (Name × Option Term) := #[]
+    let moreItems := stx[4].getArgs.map fun m =>
+      let it := if m.getKind == `Qed.Jsx.jsxAssignItem then m else m[m.getNumArgs - 1]!
+      (it[0], atomStr it[1], (⟨it[2]⟩ : Term))
+    let allItems := #[(stx[1], atomStr stx[2], (⟨stx[3]⟩ : Term))] ++ moreItems
+    for (fId, op, rhs) in allItems do
+      let fname := fId.getId.eraseMacroScopes
+      unless fields.contains fname do
+        throwErrorAt fId "`{fname}`: not a `state` field of this component (fields: {fields.toList})"
+      if assigns.any (·.1 == fname) then
+        throwErrorAt fId "`{fname}`: this handler already updates `{fname}`"
+      if op == ":=" && isCdot rhs.raw then
+        if assigns.any (·.2.isNone) then
+          throwErrorAt fId "`{fname} := ·`: only one `·` placeholder per handler"
+        assigns := assigns.push (fname, none)
+      else
+        let val ← desugarAssign fname op rhs
+        assigns := assigns.push (fname, some val)
+    let send? : Option Term := if stx[5].getNumArgs == 3 then some ⟨stx[5][2]⟩ else none
+    if send?.isSome && !hasEmits then noEmits stx[5]
+    let ctor ← registerSite sites assigns send?
+    return Syntax.node .none ``Qed.Jsx.attrValExpr #[stx[0], mkIdent (msgPath ++ ctor), stx[6]]
+  else if stx.getKind == ``Qed.Jsx.attrNamed && atomStr stx[0] == "bind" &&
+      stx[1].getNumArgs == 2 && stx[1][1].getKind == ``Qed.Jsx.attrValExpr then
+    let inner := stx[1][1]
+    if inner[1].getKind == ``Qed.Jsx.jsxTermExpr && inner[1][0].isIdent then
+      let fId : Ident := ⟨inner[1][0]⟩
+      let fname := fId.getId.eraseMacroScopes
+      unless fields.contains fname do
+        throwErrorAt fId "`bind=\{{fname}}`: not a `state` field of this component (fields: {fields.toList})"
+      let ctor ← registerSite sites #[(fname, none)] none
+      let pairT ← `(($fId, $(mkIdent (msgPath ++ ctor))))
+      let inner' := Syntax.node .none ``Qed.Jsx.attrValExpr #[inner[0], pairT.raw, inner[2]]
+      let valNode' := Syntax.node .none stx[1].getKind #[stx[1][0], inner']
+      return Syntax.node .none stx.getKind #[stx[0], valNode']
+    else
+      let args' ← stx.getArgs.mapM (replaceSets fields msgPath hasEmits sites)
+      return Syntax.node .none stx.getKind args'
   else
     match stx with
     | .node info kind args =>
@@ -113,17 +233,20 @@ open Lean Elab Command in
 private structure ComponentSpec where
   doc?        : Option (TSyntax ``Lean.Parser.Command.docComment)
   t           : Ident
-  collections : Array Syntax
+  collections : Array (Ident × Ident)
   fs          : Array Ident
-  tys         : Array Term
+  optTys      : Array (Option Term)
+  tys         : Array Term := #[]
   ds          : Array (Option Term)
   pfs         : Array Ident
-  ptys        : Array Term
+  optPtys     : Array (Option Term)
+  ptys        : Array Term := #[]
   pds         : Array (Option Term)
   hasProps    : Bool
   keyF?       : Option Ident
   outTy?      : Option Term
   actions     : Array Syntax
+  invariants  : Array Syntax
   body        : Term
   fieldNames  : Array Name
   allNames    : Array Name
@@ -133,27 +256,59 @@ private def parseComponentSpec (stx : Syntax) : CommandElabM ComponentSpec := do
   let doc? : Option (TSyntax ``Lean.Parser.Command.docComment) :=
     if stx[0].getNumArgs == 1 then some ⟨stx[0][0]⟩ else none
   let t : Ident := ⟨stx[2]⟩
-  let allItems := stx[4].getArgs
-  let propItems := allItems.filter (fun it => it[0].getId == `prop)
-  let collections := allItems.filter (fun it => it[0].getId == `collection)
-  let items := allItems.filter (fun it => it[0].getId != `prop)
-  let fs  : Array Ident := items.map fun it => ⟨it[1]⟩
-  let tys : Array Term ← items.mapM fun it =>
-    if it[0].getId == `collection then `(Array $(mkIdent (it[3].getId ++ `State)))
-    else pure ⟨it[3]⟩
-  let ds : Array (Option Term) ← items.mapM fun it =>
-    if it[4].getNumArgs == 2 then pure (some ⟨it[4][1]⟩)
-    else if it[0].getId == `collection then return some (← `(#[]))
-    else pure none
-  let pfs : Array Ident := propItems.map fun it => ⟨it[1]⟩
-  let ptys : Array Term := propItems.map fun it => ⟨it[3]⟩
-  let pds : Array (Option Term) := propItems.map fun it =>
-    if it[4].getNumArgs == 2 then some ⟨it[4][1]⟩ else none
-  let hasProps := !propItems.isEmpty
-  let keyF?  : Option Ident := if stx[5].getNumArgs == 1 then some ⟨stx[5][0][1]⟩ else none
-  let outTy? : Option Term  := if stx[6].getNumArgs == 1 then some ⟨stx[6][0][1]⟩ else none
-  let actions := stx[7].getArgs
-  let body : Term := ⟨stx[10]⟩
+  let clauses := stx[4].getArgs
+  let mut fs          : Array Ident := #[]
+  let mut optTys      : Array (Option Term) := #[]
+  let mut ds          : Array (Option Term) := #[]
+  let mut pfs         : Array Ident := #[]
+  let mut optPtys     : Array (Option Term) := #[]
+  let mut pds         : Array (Option Term) := #[]
+  let mut collections : Array (Ident × Ident) := #[]
+  let mut keyF?       : Option Ident := none
+  let mut outTy?      : Option Term := none
+  let mut actions     : Array Syntax := #[]
+  let mut invariants  : Array Syntax := #[]
+  for cl in clauses do
+    let k := cl.getKind
+    if k == ``compFieldClause then
+      let role := cl[0].getId
+      let fId : Ident := ⟨cl[1]⟩
+      let ty? : Option Term := if cl[2].getNumArgs == 2 then some ⟨cl[2][1]⟩ else none
+      let d?  : Option Term := if cl[3].getNumArgs == 2 then some ⟨cl[3][1]⟩ else none
+      if role == `prop then
+        if ty?.isNone && d?.isNone then
+          throwErrorAt fId s!"`prop {fId.getId}` needs a type (`: Type`), a default (`:= value`), or both"
+        pfs := pfs.push fId
+        optPtys := optPtys.push ty?
+        pds := pds.push d?
+      else if role == `collection then
+        let some colTy := ty? | throwErrorAt fId s!"`collection {fId.getId}` requires `: ChildComponent`"
+        unless colTy.raw.isIdent do
+          throwErrorAt colTy "`collection` target must be a child component name"
+        let childId : Ident := ⟨colTy.raw⟩
+        collections := collections.push (fId, childId)
+        fs := fs.push fId
+        optTys := optTys.push (some (← `(Array $(mkIdent (childId.getId ++ `State)))))
+        ds := ds.push (some (← (match d? with | some d => pure d | none => `(#[]))))
+      else
+        if ty?.isNone && d?.isNone then
+          throwErrorAt fId s!"`state {fId.getId}` needs a type (`: Type`), a default (`:= value`), or both"
+        fs := fs.push fId
+        optTys := optTys.push ty?
+        ds := ds.push d?
+    else if k == ``compKeyClause then
+      if keyF?.isSome then throwErrorAt cl "duplicate `key` clause in component"
+      keyF? := some ⟨cl[1]⟩
+    else if k == ``compEmitsClause then
+      if outTy?.isSome then throwErrorAt cl "duplicate `emits` clause in component"
+      outTy? := some ⟨cl[1]⟩
+    else if k == ``compActionClause then
+      actions := actions.push cl
+    else if k == ``compInvariantClause then
+      invariants := invariants.push cl
+  invariants := invariants ++ stx[8].getArgs
+  let hasProps := !pfs.isEmpty
+  let body : Term := ⟨stx[7]⟩
   let fieldNames := fs.map (·.getId)
   let allNames := fieldNames ++ pfs.map (·.getId)
   if allNames.toList.eraseDups.length != allNames.size then
@@ -164,32 +319,77 @@ private def parseComponentSpec (stx : Syntax) : CommandElabM ComponentSpec := do
     if outTy?.isSome then
       throwErrorAt kf "`key` marks the row identity for parent-owned use (`state=\{…}`), \
         and a parent-owned child's `emits` output would have no receiver; drop one of the two"
-  return { doc?, t, collections, fs, tys, ds, pfs, ptys, pds,
-           hasProps, keyF?, outTy?, actions, body, fieldNames, allNames }
+  return { doc?, t, collections, fs, optTys, ds, pfs, optPtys, pds,
+           hasProps, keyF?, outTy?, actions, invariants, body, fieldNames, allNames }
 
 open Lean Elab Command in
 private def collectSitesAndRewriteBody (spec : ComponentSpec) :
     CommandElabM (Array SetSite × Term) := do
+  let noEmits (ref : Syntax) : CommandElabM Unit :=
+    throwErrorAt ref "`send` bubbles an output, but this component declares no output type; \
+      add `emits T` between the `state` fields and the `view`"
   let sitesRef ← IO.mkRef (#[] : Array SetSite)
   for a in spec.actions do
     let name := a[1].getId
-    if (← sitesRef.get).any (·.ctor == name) || spec.collections.any (·[1].getId == name) then
+    if (← sitesRef.get).any (·.ctor == name) || spec.collections.any (·.1.getId == name) then
       throwErrorAt a[1] "duplicate action name `{name}`"
-    let before ← sitesRef.get
-    let actionRef ← IO.mkRef (#[] : Array SetSite)
-    let _ ← replaceSets spec.fieldNames (spec.t.getId ++ `Msg) spec.outTy?.isSome actionRef a[5]
-    let actionSites ← actionRef.get
-    unless actionSites.size == 1 && (a[5].getKind == ``setTerm || a[5].getKind == ``sendTerm) do
-      throwErrorAt a[5] "an action must be a `set`/`send` chain"
-    let some site := actionSites[0]? | throwErrorAt a "empty action"
     let params : Array (Ident × Term) := a[2].getArgs.map fun p => (⟨p[1]⟩, ⟨p[3]⟩)
-    if !params.isEmpty && site.assigns.any (·.2.isNone) then
-      throwErrorAt a "use an explicit set value in an action with parameters"
-    let names := params.map (·.1.getId)
-    if names.toList.eraseDups.length != names.size || names.any spec.allNames.contains then
+    let pNames := params.map (·.1.getId)
+    if pNames.toList.eraseDups.length != pNames.size || pNames.any spec.allNames.contains then
       throwErrorAt a "action parameters must be distinct and must not shadow fields"
     let guard? : Option Term := if a[3].getNumArgs == 2 then some ⟨a[3][1]⟩ else none
-    sitesRef.set (before.push { site with ctor := name, key := s!"action:{name}", params, guard? })
+    let restStmts := a[6].getArgs.map fun m =>
+      if m.getKind == nullKind then m[m.getNumArgs - 1]! else m
+    let stmts := #[a[5]] ++ restStmts
+    let mut lets : Array (Ident × Option Term × Term) := #[]
+    let mut assigns : Array (Name × Option Term) := #[]
+    let mut send? : Option Term := none
+    for s in stmts do
+      let sk := s.getKind
+      if sk == ``actionLetStmt then
+        let lId : Ident := ⟨s[1]⟩
+        let lTy? : Option Term := if s[2].getNumArgs == 2 then some ⟨s[2][1]⟩ else none
+        let lVal : Term := ⟨s[4]⟩
+        lets := lets.push (lId, lTy?, lVal)
+      else if sk == ``actionAssignStmt then
+        let fId : Ident := ⟨s[0]⟩
+        let fname := fId.getId.eraseMacroScopes
+        unless spec.fieldNames.contains fname do
+          throwErrorAt fId "`{fname}`: not a `state` field of this component (fields: {spec.fieldNames.toList})"
+        if assigns.any (·.1 == fname) then
+          throwErrorAt fId "`{fname}`: this handler already updates `{fname}`"
+        let op := atomStr s[1]
+        if op == ":=" && isCdot s[2] then
+          if assigns.any (·.2.isNone) then
+            throwErrorAt fId "`{fname} := ·`: only one `·` placeholder per handler"
+          assigns := assigns.push (fname, none)
+        else
+          let val ← desugarAssign fname op ⟨s[2]⟩
+          assigns := assigns.push (fname, some val)
+      else if sk == ``actionSetStmt then
+        let fId : Ident := ⟨s[1]⟩
+        let fname := fId.getId.eraseMacroScopes
+        unless spec.fieldNames.contains fname do
+          throwErrorAt fId "`set {fname}`: not a `state` field of this component (fields: {spec.fieldNames.toList})"
+        if assigns.any (·.1 == fname) then
+          throwErrorAt fId "`set {fname}`: this handler already sets `{fname}`"
+        let expr? : Option Term := if s[2].getNumArgs == 1 then some ⟨s[2][0]⟩ else none
+        if expr?.isNone && assigns.any (·.2.isNone) then
+          throwErrorAt fId "`set {fname}`: only one payload-form `set` (no expression) per \
+            handler, there is just one incoming value to store"
+        assigns := assigns.push (fname, expr?)
+      else if sk == ``actionSendStmt then
+        unless spec.outTy?.isSome do noEmits s
+        if send?.isSome then
+          throwErrorAt s "duplicate `send` in action; an action emits at most one output"
+        send? := some ⟨s[1]⟩
+    if assigns.isEmpty && send?.isNone then
+      throwErrorAt a "an action must update state or send an output"
+    if !params.isEmpty && assigns.any (·.2.isNone) then
+      throwErrorAt a "use an explicit set value in an action with parameters"
+    let cur ← sitesRef.get
+    sitesRef.set (cur.push {
+      key := s!"action:{name}", lets, assigns, ctor := name, send?, params, guard? })
   let body' : Term := ⟨← replaceSets spec.fieldNames (spec.t.getId ++ `Msg) spec.outTy?.isSome sitesRef spec.body⟩
   return (← sitesRef.get, body')
 
@@ -215,6 +415,43 @@ private def mkPropsBinders (spec : ComponentSpec) :
   else return #[]
 
 open Lean Elab Command in
+private def mkStructFields (ids : Array Ident) (tys : Array (Option Term)) (ds : Array (Option Term)) :
+    CommandElabM (Array (TSyntax ``Lean.Parser.Command.structExplicitBinder)) :=
+  ((ids.zip tys).zip ds).mapM fun ((f, ty?), d?) =>
+    match ty?, d? with
+    | some ty, some d => `(Lean.Parser.Command.structExplicitBinder| ($f : $ty := $d))
+    | some ty, none   => `(Lean.Parser.Command.structExplicitBinder| ($f : $ty))
+    | none,    some d => `(Lean.Parser.Command.structExplicitBinder| ($f := $d))
+    | none,    none   => throwErrorAt f s!"field `{f.getId}` needs a type or default value"
+
+open Lean Elab Command Meta in
+private def resolveStructFieldTypes (compName structKind : Name)
+    (ids : Array Ident) (optTys : Array (Option Term)) : CommandElabM (Array Term) := do
+  let ns ← getCurrNamespace
+  let env ← getEnv
+  (ids.zip optTys).mapM fun (f, ty?) => do
+    match ty? with
+    | some ty => return ty
+    | none =>
+        let projName := ns ++ compName ++ structKind ++ f.getId
+        let some info := env.find? projName
+          | throwErrorAt f s!"could not infer type of `{f.getId}`; add an explicit `: Type`"
+        liftTermElabM <| forallTelescope info.type fun _ cod =>
+          PrettyPrinter.delab cod
+
+open Lean Elab Command in
+private def elabStructsAndResolveTypes (spec : ComponentSpec) : CommandElabM ComponentSpec := do
+  let propsId := mkIdent (spec.t.getId ++ `Props)
+  let stateId := mkIdent (spec.t.getId ++ `State)
+  let propFields  ← mkStructFields spec.pfs spec.optPtys spec.pds
+  let stateFields ← mkStructFields spec.fs spec.optTys spec.ds
+  elabCommand (← `(command| structure $propsId where $[$propFields:structExplicitBinder]*))
+  elabCommand (← `(command| structure $stateId where $[$stateFields:structExplicitBinder]*))
+  let ptys ← resolveStructFieldTypes spec.t.getId `Props spec.pfs spec.optPtys
+  let tys  ← resolveStructFieldTypes spec.t.getId `State spec.fs spec.optTys
+  return { spec with ptys, tys }
+
+open Lean Elab Command in
 private def mkMsgAndUpdateCmds (spec : ComponentSpec) (sites : Array SetSite) :
     CommandElabM (TSyntax `command × TSyntax `command) := do
   let stateId  := mkIdent (spec.t.getId ++ `State)
@@ -232,9 +469,9 @@ private def mkMsgAndUpdateCmds (spec : ComponentSpec) (sites : Array SetSite) :
       `(Lean.Parser.Command.ctor| | $cId:ident (v : $(spec.tys[idx]!)))
     | none =>
       `(Lean.Parser.Command.ctor| | $cId:ident)
-  for col in spec.collections do
-    let nm := mkIdent col[1].getId
-    let cm := mkIdent (col[3].getId ++ `Msg)
+  for (colField, colChild) in spec.collections do
+    let nm := mkIdent colField.getId
+    let cm := mkIdent (colChild.getId ++ `Msg)
     ctors := ctors.push (← `(Lean.Parser.Command.ctor| | $nm:ident (key : String) (msg : $cm)))
   let msgCmd ← if ctors.isEmpty then `(command| inductive $msgId)
     else `(command| inductive $msgId where $[$ctors:ctor]*)
@@ -251,11 +488,17 @@ private def mkMsgAndUpdateCmds (spec : ComponentSpec) (sites : Array SetSite) :
       | some _ => match site.send? with
         | some o => `(($stateTerm, some $o))
         | none   => `(($stateTerm, none))
-    let mut rhs := rhs0
+    let mut core := rhs0
+    for (lId, lTy?, lVal) in site.lets.reverse do
+      core ← match lTy? with
+        | some ty => `(let $lId:ident : $ty := $lVal; $core)
+        | none    => `(let $lId:ident := $lVal; $core)
+    let mut rhs := core
     if let some guard := site.guard? then
       let unchanged ← if spec.outTy?.isSome then `((s, none)) else `(s)
       rhs ← `(if $guard then $rhs else $unchanged)
     rhs ← bindMentionedFields spec (fun g =>
+      (site.lets.any fun (_, ty?, v) => mentionsIdent v.raw g || ty?.any (mentionsIdent ·.raw g)) ||
       (site.assigns.any fun (_, e?) => e?.any (mentionsIdent ·.raw g)) ||
       (site.send?.any (mentionsIdent ·.raw g)) ||
       (site.guard?.any (mentionsIdent ·.raw g))) rhs
@@ -266,10 +509,10 @@ private def mkMsgAndUpdateCmds (spec : ComponentSpec) (sites : Array SetSite) :
       `(Lean.Parser.Term.matchAltExpr| | $cFull:ident v => $rhs)
     else
       `(Lean.Parser.Term.matchAltExpr| | $cFull:ident => $rhs)
-  for col in spec.collections do
-    let nm := mkIdent col[1].getId
-    let ctor := mkIdent (spec.t.getId ++ `Msg ++ col[1].getId)
-    let upd := mkIdent (col[3].getId ++ `updateKeyed)
+  for (colField, colChild) in spec.collections do
+    let nm := mkIdent colField.getId
+    let ctor := mkIdent (spec.t.getId ++ `Msg ++ colField.getId)
+    let upd := mkIdent (colChild.getId ++ `updateKeyed)
     let next ← `({ s with $nm:ident := $upd s.$nm:ident k msg })
     let rhs ← if spec.outTy?.isSome then `(($next, none)) else pure next
     arms := arms.push (← `(Lean.Parser.Term.matchAltExpr| | $ctor k msg => $rhs))
@@ -283,15 +526,7 @@ private def mkMsgAndUpdateCmds (spec : ComponentSpec) (sites : Array SetSite) :
   return (msgCmd, updateCmd)
 
 open Lean Elab Command in
-private def mkStructFields (ids : Array Ident) (tys : Array Term) (ds : Array (Option Term)) :
-    CommandElabM (Array (TSyntax ``Lean.Parser.Command.structExplicitBinder)) :=
-  ((ids.zip tys).zip ds).mapM fun ((f, ty), d?) =>
-    match d? with
-    | some d => `(Lean.Parser.Command.structExplicitBinder| ($f : $ty := $d))
-    | none   => `(Lean.Parser.Command.structExplicitBinder| ($f : $ty))
-
-open Lean Elab Command in
-private def mkStructAndViewCmds (spec : ComponentSpec) (body' : Term)
+private def mkViewCmds (spec : ComponentSpec) (body' : Term)
     (msgCmd updateCmd : TSyntax `command) : CommandElabM (Array (TSyntax `command)) := do
   let doc?     := spec.doc?
   let propsId  := mkIdent (spec.t.getId ++ `Props)
@@ -300,19 +535,15 @@ private def mkStructAndViewCmds (spec : ComponentSpec) (body' : Term)
   let updateId := mkIdent (spec.t.getId ++ `update)
   let viewId   := mkIdent (spec.t.getId ++ `view)
   let viewBody ← bindMentionedFields spec (mentionsIdent body'.raw) body'
-  let propFields  ← mkStructFields spec.pfs spec.ptys spec.pds
-  let stateFields ← mkStructFields spec.fs spec.tys spec.ds
   let pBinders ← mkPropsBinders spec
   let mut cmds : Array (TSyntax `command) := #[
-    ← `(command| structure $propsId where $[$propFields:structExplicitBinder]*),
-    ← `(command| structure $stateId where $[$stateFields:structExplicitBinder]*),
     msgCmd,
     updateCmd,
     ← `(command| def $viewId $[$pBinders:bracketedBinder]* (s : $stateId) : Html $msgId := $viewBody) ]
   if spec.outTy?.isNone then
     let renderId    := mkIdent (spec.t.getId ++ `render)
     let renderTagId := mkIdent (spec.t.getId ++ `renderTag)
-    let compId      := mkIdent (spec.t.getId ++ `component)
+    let compId      := mkIdent (spec.t.getId ++ `toComponent)
     let rendered ← if spec.hasProps then `($viewId p s) else `($viewId s)
     let updExpr  ← if spec.hasProps then `($updateId p) else `($updateId)
     let viewExpr ← if spec.hasProps then `($viewId p) else `($viewId)
@@ -421,14 +652,125 @@ private def mkCodecAndMountCmds (spec : ComponentSpec) (idLit : StrLit) :
   return cmds
 
 open Lean Elab Command in
+private def freshCompInvIdent (ref : Syntax) (compId : Name) : CommandElabM Ident := do
+  let env ← getEnv
+  let ns ← getCurrNamespace
+  let base := compId ++ `inv
+  if !env.contains (ns ++ base) then
+    return mkIdentFrom ref base
+  let mut idx := 2
+  let mut cand := compId ++ Name.mkSimple s!"inv_{idx}"
+  while env.contains (ns ++ cand) do
+    idx := idx + 1
+    cand := compId ++ Name.mkSimple s!"inv_{idx}"
+  return mkIdentFrom ref cand
+
+open Lean Elab Command Term in
+private def isViewPred (msgId : Ident) (pred : Term) : CommandElabM Bool := do
+  let saved ← get
+  try
+    let ok ← liftTermElabM do
+      let preCount := (← Core.getMessageLog).toList.length
+      let expected ← elabType (← `(Html $msgId → Bool))
+      let _ ← elabTermEnsuringType pred expected
+      synthesizeSyntheticMVarsNoPostponing
+      let newMsgs := (← Core.getMessageLog).toList.drop preCount
+      return newMsgs.all (·.severity != .error)
+    modify fun _ => saved
+    return ok
+  catch _ =>
+    modify fun _ => saved
+    return false
+
+open Lean Elab Command in
+private def elabInlineInvariants (spec : ComponentSpec) : CommandElabM Unit := do
+  let propsId  := mkIdent (spec.t.getId ++ `Props)
+  let stateId  := mkIdent (spec.t.getId ++ `State)
+  let initId   := mkIdent (spec.t.getId ++ `init)
+  let msgId    := mkIdent (spec.t.getId ++ `Msg)
+  let updateId := mkIdent (spec.t.getId ++ `update)
+  let viewId   := mkIdent (spec.t.getId ++ `view)
+  let mountable := spec.ds.all (·.isSome)
+  for invStx in spec.invariants do
+    let invId ← match invStx[1].find? (·.isIdent) with
+      | some idStx => pure (mkIdentFrom idStx (spec.t.getId ++ idStx.getId))
+      | none       => freshCompInvIdent invStx spec.t.getId
+    let clauses : Array Term := invStx[2].getSepArgs.map (⟨·⟩)
+    let hasHoldsIn := invStx[3].getNumArgs > 0
+    let assume? : Option Term :=
+      if hasHoldsIn && invStx[3][2].getNumArgs == 2 then some ⟨invStx[3][2][1]⟩ else none
+    let using? : Option (Array Term) :=
+      if invStx[4].getNumArgs == 4 then some (invStx[4][2].getSepArgs.map (⟨·⟩)) else none
+    let pf? : Option Term :=
+      if invStx[5].getNumArgs == 2 then some ⟨invStx[5][1]⟩ else none
+    let autoView ← if !hasHoldsIn && clauses.size == 1 && using?.isNone &&
+        !spec.allNames.any (mentionsIdent clauses[0]!.raw) then
+      isViewPred msgId clauses[0]!
+    else pure false
+    if hasHoldsIn || autoView then
+      if clauses.size != 1 then
+        throwErrorAt invStx[2] "a view styling invariant takes a single styling rule"
+      let vPred := clauses[0]!
+      if spec.hasProps then
+        let predStr := (vPred.raw.reprint.getD "this rule").trimmed
+        let helperViewId ← freshCompInvIdent invStx (spec.t.getId ++ `viewAt)
+        match pf? with
+        | some pf =>
+            elabCommand (← `(theorem $invId:ident (p : $propsId) : ∀ m, ($vPred) ($viewId p m) = true := $pf))
+        | none =>
+            elabCommand (← `(
+              set_option linter.unusedSimpArgs false in
+              theorem $invId:ident (p : $propsId) : ∀ m, ($vPred) ($viewId p m) = true := by
+                let $helperViewId := $viewId p
+                change ∀ m, ($vPred) ($helperViewId m) = true
+                qedDischargeStyling $helperViewId $invId $(Syntax.mkStrLit predStr)))
+      else
+        let cmd ← match assume?, pf? with
+          | some a, some pf => `(invariant $invId : $vPred holds_in $viewId assuming $a := $pf)
+          | none,   some pf => `(invariant $invId : $vPred holds_in $viewId := $pf)
+          | some a, none    => `(invariant $invId : $vPred holds_in $viewId assuming $a)
+          | none,   none    => `(invariant $invId : $vPred holds_in $viewId)
+        elabCommand cmd
+    else
+      let conj ← mkConjBody clauses
+      let bodyWithFields ← bindMentionedFields spec (mentionsIdent conj.raw) conj
+      let pred ← `(fun (s : $stateId) => $bodyWithFields)
+      if spec.hasProps then
+        let usingL := using?.getD #[]
+        match pf? with
+        | some pf =>
+            elabCommand (← `(theorem $invId:ident (p : $propsId) :
+              ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($updateId p m msg)) := $pf))
+        | none =>
+            elabCommand (← `(theorem $invId:ident (p : $propsId) :
+              ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($updateId p m msg)) := by
+                qedDischargePreserved [$[$usingL],*] ($updateId p) $invId ($pred)))
+      else if mountable then
+        let cmd ← match using?, pf? with
+          | some ls, some pf => `(invariant $invId : $pred from $initId preserved_by $updateId using [$[$ls],*] := $pf)
+          | none,    some pf => `(invariant $invId : $pred from $initId preserved_by $updateId := $pf)
+          | some ls, none    => `(invariant $invId : $pred from $initId preserved_by $updateId using [$[$ls],*])
+          | none,    none    => `(invariant $invId : $pred from $initId preserved_by $updateId)
+        elabCommand cmd
+      else
+        let cmd ← match using?, pf? with
+          | some ls, some pf => `(invariant $invId : $pred preserved_by $updateId using [$[$ls],*] := $pf)
+          | none,    some pf => `(invariant $invId : $pred preserved_by $updateId := $pf)
+          | some ls, none    => `(invariant $invId : $pred preserved_by $updateId using [$[$ls],*])
+          | none,    none    => `(invariant $invId : $pred preserved_by $updateId)
+        elabCommand cmd
+
+open Lean Elab Command in
 @[command_elab componentCmd] def elabComponentCmd : CommandElab := fun stx => do
-  let spec ← parseComponentSpec stx
-  let idLit := Syntax.mkStrLit (((← getCurrNamespace) ++ spec.t.getId).toString)
-  let (sites, body') ← collectSitesAndRewriteBody spec
+  let rawSpec ← parseComponentSpec stx
+  let idLit := Syntax.mkStrLit (((← getCurrNamespace) ++ rawSpec.t.getId).toString)
+  let (sites, body') ← collectSitesAndRewriteBody rawSpec
+  let spec ← elabStructsAndResolveTypes rawSpec
   let (msgCmd, updateCmd) ← mkMsgAndUpdateCmds spec sites
-  let coreCmds ← mkStructAndViewCmds spec body' msgCmd updateCmd
+  let coreCmds ← mkViewCmds spec body' msgCmd updateCmd
   let mountCmds ← mkCodecAndMountCmds spec idLit
   for c in coreCmds ++ mountCmds do
     elabCommand c
+  elabInlineInvariants spec
 
 end Qed

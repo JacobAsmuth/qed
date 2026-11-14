@@ -39,7 +39,7 @@ def update (m : Model) : Msg → Model
   | .startEdit id => { m with todos := m.todos.map fun t => { t with editing := t.id == id } }
   | .editText id s => { m with todos := m.todos.map fun t => if t.id == id then { t with text := s } else t }
 
-invariant idsBelowNext : (fun m => ∀ t ∈ m.todos, t.id < m.nextId)
+invariant idsBelowNext (m) : ∀ t ∈ m.todos, t.id < m.nextId
     preserved_by update := by
   intro m msg h
   cases msg with
@@ -67,25 +67,25 @@ def app : App Model Msg := ui init update fun m =>
       <h1>View template</h1>
       <div class="counter">
         <button onClick={.dec}>−</button>
-        <span class="count">{s!"{m.count}"}</span>
+        <span class="count">{m.count}</span>
         <button onClick={.inc}>+</button>
       </div>
       {if m.count == 0
         then <p class="hint">click + to start</p>
         else <p class="live">{s!"count is {m.count}"}</p>}
       <input value={m.name} onInput={(Msg.setName ·)}/>
-      {if m.name != "" then <p class="greeting">{s!"Hello, {m.name}!"}</p> else text ""}
+      {if m.name != "" then <p class="greeting">{s!"Hello, {m.name}!"}</p>}
       <button onClick={.add}>add todo</button>
       <ul class="todos">{m.todos.map fun t =>
-        <li key={toString t.id} class={if t.done then "done" else ""} onClick={.toggle t.id}>
+        <li key={t.id} class={if t.done then "done" else ""} onClick={.toggle t.id}>
           {t.text}</li>}</ul>
       <ul class="structural">{m.todos.map fun t =>
-        <li key={toString t.id}>
+        <li key={t.id}>
           {if t.done then <p class="is-done">done!</p>
                      else <span class="is-open">{t.text}</span>}
         </li>}</ul>
       <ul class="edit">{m.todos.map fun t =>
-        <li key={toString t.id}>
+        <li key={t.id}>
           {if t.editing
             then <input class="editor" value={t.text} onInput={(Msg.editText t.id ·)}/>
             else <span class="label" onClick={.startEdit t.id}>{t.text}</span>}

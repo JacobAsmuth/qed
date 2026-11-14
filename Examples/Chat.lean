@@ -49,9 +49,6 @@ def transition (m : Model) : Msg → Model × Cmd Msg := steps
   | .chunk raw => { m with turns := appendLast m.turns (deltaOf raw) }
   | .done      => { m with pending := false }
 
-invariant streamSafe : (fun m => m.pending = true → 0 < m.turns.size)
-    preserved_by transition
-
 def bubble (t : Turn) : Html Msg :=
   <div class={if t.user? then "msg user" else "msg bot"}>{t.text}</div>
 
@@ -64,5 +61,7 @@ def chatApp : App Model Msg :=
         <button class="send" disabled={m.pending || m.draft.trimmed.isEmpty} onClick={.send}>Send</button>
       </div>
     </div>
+
+invariant streamSafe (m) on chatApp : m.pending = true → 0 < m.turns.size
 
 end Chat

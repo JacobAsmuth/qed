@@ -56,7 +56,7 @@ try {
   const { default: updated } = await import(updatedUrl);
   assert.match(await (await updated(new Request('http://localhost/'))).text(), />Add<\/button>/);
 
-  await writeFile(appPath, valid.replace('decrease when (1 < quantity)', 'decrease'));
+  await writeFile(appPath, valid.replace('decrease when 1 < quantity', 'decrease'));
   const broken = run(cli, ['check'], app);
   assert.notEqual(broken.status, 0);
   assert.match(broken.stdout + broken.stderr, /case `decrease` still needs/);

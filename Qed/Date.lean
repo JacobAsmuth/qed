@@ -1,3 +1,4 @@
+import Qed.Html
 import Qed.Json.Basic
 
 namespace Qed
@@ -43,6 +44,7 @@ protected def toString (d : Date) : String :=
   padLeft 2 (toString d.day)
 
 instance : ToString Date := ⟨Date.toString⟩
+instance : Coe Date (Html msg) := ⟨fun d => .text (toString d)⟩
 
 def before (a b : Date) : Bool :=
   a.year < b.year ||

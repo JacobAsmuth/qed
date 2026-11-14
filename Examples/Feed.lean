@@ -6,7 +6,6 @@ namespace Feed
 def likeOn  : Style := css [ color "#ff2d55", fontWeight "700" ]
 def likeOff : Style := css [ color "#8a8a8a" ]
 
-/-- Feed card (doc comment ends the preceding open-ended `def` before non-reserved `component`). -/
 component Card where
   state id       : Nat
   state author   : String
@@ -17,17 +16,17 @@ component Card where
   key id
   view =>
     <article role="card" class="feed-card">
-      <progress max={toString duration} value={toString progress}/>
+      <progress max={duration} value={progress}/>
       <strong>{s!"@{author}"}</strong>
       <button role="like"
-        onClick={set liked (!liked), set likes (if liked then likes - 1 else likes + 1)}
+        onClick={liked := !liked, likes := if liked then likes - 1 else likes + 1}
         {if liked then likeOn else likeOff}>{s!"♥ {likes}"}</button>
     </article>
 
-abbrev Card.Safe (c : Card.State) : Prop :=
-  0 ≤ c.likes ∧ c.progress ≤ c.duration ∧ (c.liked → 1 ≤ c.likes)
+invariant cardSafe (c) :
+  0 ≤ c.likes, c.progress ≤ c.duration, c.liked → 1 ≤ c.likes
+  preserved_by Card.update
 
-invariant cardSafe   : Card.Safe preserved_by Card.update
 invariant cardStyled : roleHasOneOf "like" [likeOn, likeOff] holds_in Card.view
 
 structure Model where
@@ -57,7 +56,7 @@ def view (m : Model) : Html Msg :=
     <button class="rank" onClick={.rank}>Most liked</button>
     <button class="more" onClick={.append}>Load more</button>
     <div class="cards">{m.cards.map fun c =>
-      <article key={toString c.id} class="slot">
+      <article key={c.id} class="slot">
         <Card state={c} onMsg={.card}/>
         <button class="dismiss" onClick={.dismiss c.id}>✕</button>
       </article>}</div>

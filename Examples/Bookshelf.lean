@@ -4,20 +4,17 @@ open Qed
 namespace Bookshelf
 
 router R where
-  catalog => ""
-  detail (id : String) => "books"
-  newBook => "new"
-
-abbrev NonEmpty (s : String) : Prop := s.length ≥ 1
-abbrev Year (n : Nat) : Prop := 1 ≤ n ∧ n ≤ 2026
+  catalog => "/"
+  detail  => "/books/:id"
+  newBook => "/new"
 
 schema Book where
-  id      : Codec.text.jsonOnly
-  title   : Codec.text.refine NonEmpty
-  author  : Codec.text.refine NonEmpty
-  year    : Codec.nat.refine Year
-  genre   : Codec.select [("fiction", "Fiction"), ("nonfiction", "Non-fiction"), ("poetry", "Poetry")]
-  inPrint : Codec.checkbox
+  id      : jsonOnly String
+  title   : String where title.length ≥ 1
+  author  : String where author.length ≥ 1
+  year    : Nat    where 1 ≤ year, year ≤ 2026
+  genre   : select [("fiction", "Fiction"), ("nonfiction", "Non-fiction"), ("poetry", "Poetry")]
+  inPrint : Bool
 
 structure Model where
   route   : R
@@ -54,13 +51,12 @@ def transition (m : Model) : Msg → Model × Cmd Msg := steps
   | .edit d       => { m with draft := d }
   | .submit       =>
       match Book.parse m.draft with
-      | some book => (m, Cmd.postJson "/api/books" (Book.encode book)
-                         (fun b => Msg.created (.ok b)) (fun e => Msg.created (.failed e)))
-      | none    => m
+      | some book => (m, Resource.post "/api/books" book Msg.created)
+      | none      => m
   | .created r    =>
       match r with
       | .ok b     => ({ m with current := .ok b, draft := Book.Draft.empty },
-                      Cmd.pushUrl (Router.toURL (R.detail b.id)))
+                      Cmd.pushUrl (R.detail b.id))
       | .failed e => { m with current := .failed e }
       | _         => m
 
@@ -69,7 +65,7 @@ def shell : Style := css [
   maxWidth (rem 40), margin "2rem auto", fontFamily "system-ui, sans-serif", lineHeight "1.5",
   screenMax (px 600) [ margin "1rem", maxWidth (pct 100) ] ]
 def topnav : Style := css [
-  display .flex, gap (rem 1), prop "margin-bottom" "1.5rem" ]
+  display .flex, gap (rem 1), marginBottom "1.5rem" ]
 def navlink : Style := css [
   textDecoration "none", color brand, fontWeight "600" ]
 def card : Style := css [
@@ -78,13 +74,13 @@ def card : Style := css [
 def bookList (books : Array Book) : Html Msg :=
   <ul class="books">{books.map fun b =>
     <li key={b.id}>
-      {link (Router.toURL (R.detail b.id)) [navlink, cls "book-link"] [text b.title]}
+      <a href={R.detail b.id} {navlink} class="book-link">{b.title}</a>
       <span class="byline">{s!" by {b.author}"}</span>
     </li>}</ul>
 
 def bookCard (b : Book) : Html Msg :=
   <div {card} class="book">
-    <h1>{text b.title}</h1>
+    <h1>{b.title}</h1>
     <p class="author">{s!"by {b.author} ({b.year})"}</p>
     <p class="genre">{b.genre}</p>
     <p class={if b.inPrint then "in-print" else "out-of-print"}>
@@ -92,17 +88,12 @@ def bookCard (b : Book) : Html Msg :=
   </div>
 
 def app : App Model Msg :=
-  ui init transition (onRoute := Msg.routed)
-    (dehydrate := Dehydrate.slice init
-      (fun m => (m.route, m.catalog, m.current))
-      (fun m (r, cat, cur) => { m with route := r, catalog := cat, current := cur }))
-    fun m =>
+  ui init transition (onRoute := Msg.routed) (dehydrate := [route, catalog, current]) fun m =>
     <div {shell} class="app">
       {theme [ brand.set "#06c" ]}
-      {styleSheet [shell, topnav, navlink, card]}
       <nav {topnav}>
-        {link "/" [navlink] ["Catalog"]}
-        {link "/new" [navlink] ["Add a book"]}
+        <a href={R.catalog} {navlink}>Catalog</a>
+        <a href={R.newBook} {navlink}>Add a book</a>
       </nav>
       {match m.route with
        | .catalog =>

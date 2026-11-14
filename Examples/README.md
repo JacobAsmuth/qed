@@ -67,7 +67,7 @@ nonempty conversation in the model.
 
 ## The architecture
 
-0. **[Hello](Hello.lean)** · a component with state, a view, and `set` handlers,
+0. **[Hello](Hello.lean)** · a component with inferred state, a view, and two-way `bind={name}`,
    started with `Qed.run Hello.app`.
 1. **[Counter](Counter.lean)** · `Model`, `Msg`, `update`, `view`, and the `ui` builder: the
    app structure that `component` generates, written explicitly. An

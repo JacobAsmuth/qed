@@ -143,16 +143,19 @@ open Lean Lean.Elab Lean.Elab.Term Lean.Meta in
 elab "child% " "fun " mb:ident " => " body:term : term <= expectedType => do
   match_expr (← instantiateMVars expectedType) with
   | Qed.View σ msg =>
+      if (← instantiateMVars σ).isMVar then tryPostpone
       withLocalDeclD mb.getId σ fun fv => do
         let b   ← elabTerm body none
-        let bTy ← whnf (← inferType b)
+        let bTy ← whnf (← instantiateMVars (← inferType b))
         if bTy.isConstOf ``String then
           mkAppOptM ``Qed.View.dyn #[σ, msg, ← mkLambdaFVars #[fv] b]
-        else if bTy.isConstOf ``Nat || bTy.isConstOf ``Int then
-          let s ← mkAppM ``toString #[b]
-          mkAppOptM ``Qed.View.dyn #[σ, msg, ← mkLambdaFVars #[fv] s]
         else if bTy.isAppOfArity ``Qed.View 2 then
           ensureHasType expectedType b
+        else if !bTy.hasMVar && !bTy.isAppOfArity ``Qed.Html 1 && !bTy.isAppOfArity ``Option 1 &&
+                (← whnf (← inferType bTy)) == .sort (Level.succ .zero) &&
+                (← trySynthInstance (mkApp (mkConst ``ToString [Level.zero]) bTy)) matches .some _ then
+          let s ← mkAppM ``toString #[b]
+          mkAppOptM ``Qed.View.dyn #[σ, msg, ← mkLambdaFVars #[fv] s]
         else
           let b' ← instantiateMVars (← ensureHasType (← mkAppM ``Qed.Html #[msg]) b)
           if b'.isAppOfArity ``Qed.View.render 4 then
@@ -230,12 +233,14 @@ mutual
           if args.size == 1 && viewMentions m.getId args[0]! then
             let nm : Term := ⟨Syntax.mkStrLit an⟩
             let rawV : Term := ⟨args[0]!⟩
-            let v : Term ← if hn == "href" then `(Qed.ToHref.toHref $rawV) else pure rawV
+            let v : Term ← if hn == "href" then `(Qed.ToHref.toHref $rawV)
+                           else if hn == "value" then `(toString $rawV)
+                           else pure rawV
             return some (← `(Qed.V.dynAttr $nm (fun $m => $v)))
         if hn == "attr" && args.size == 2 && viewMentions m.getId args[1]! then
           let k : Term := ⟨args[0]!⟩
           let v : Term := ⟨args[1]!⟩
-          return some (← `(Qed.V.dynAttr $k (fun $m => $v)))
+          return some (← `(Qed.V.dynAttr $k (fun $m => toString $v)))
         if let some pn := eventPrime? hn then
           if args.size == 1 && viewMentions m.getId args[0]! then
             let primed := mkIdent ((`Qed.V).append (Name.mkSimple pn))
@@ -265,7 +270,7 @@ mutual
         let rowL : Term := ⟨← viewLift binderId body'⟩
         let pos   := (stx.getPos?.map (·.byteIdx)).getD 0
         let prefT : Term := ⟨Syntax.mkStrLit (toString pos ++ "@")⟩
-        return some (← `(Qed.V.forEach $tagL (fun $m => $xsT) (fun $binderId => $keyV) $rowL (attrs := $attrsL) (sigPrefix := $prefT)))
+        return some (← `(Qed.V.forEach $tagL (fun $m => $xsT) (fun $binderId => toString $keyV) $rowL (attrs := $attrsL) (sigPrefix := $prefT)))
     | _, _ =>
         let rowL : Term := ⟨← viewLift binderId body⟩
         return some (← `(Qed.V.dynNode (fun $m =>

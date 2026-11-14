@@ -14,7 +14,7 @@ def update (m : Model) : Msg → Model
   | .inc     => { m with n := m.n + 1 }
   | .setTo v => { n := max 0 v }
 
-invariant nonNegative : (fun m => 0 ≤ m.n) preserved_by update
+invariant nonNegative (m) : 0 ≤ m.n preserved_by update
 
 def app : App Model Msg :=
   ui { n := 0 } update fun m =>

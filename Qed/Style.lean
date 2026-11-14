@@ -27,6 +27,7 @@ end
 structure Len where raw : String
 deriving Inhabited
 instance : Coe String Len := ⟨Len.mk⟩
+instance : ToString Len := ⟨Len.raw⟩
 
 def px  (n : Int) : Len := ⟨toString n ++ "px"⟩
 def rem (n : Int) : Len := ⟨toString n ++ "rem"⟩
@@ -39,6 +40,7 @@ def fr  (n : Int) : Len := ⟨toString n ++ "fr"⟩
 structure Color where raw : String
 deriving Inhabited
 instance : Coe String Color := ⟨Color.mk⟩
+instance : ToString Color := ⟨Color.raw⟩
 
 def hex  (s : String) : Color := ⟨"#" ++ s⟩
 def rgb  (r g b : Nat) : Color := ⟨s!"rgb({r}, {g}, {b})"⟩
@@ -47,6 +49,7 @@ def rgba (r g b : Nat) (a : String) : Color := ⟨s!"rgba({r}, {g}, {b}, {a})"�
 structure Token where name : String
 deriving Inhabited
 def token (name : String) : Token := ⟨name⟩
+instance : ToString Token := ⟨fun t => s!"var(--{t.name})"⟩
 instance : Coe Token Len   := ⟨fun t => ⟨s!"var(--{t.name})"⟩⟩
 instance : Coe Token Color := ⟨fun t => ⟨s!"var(--{t.name})"⟩⟩
 
@@ -89,7 +92,19 @@ def maxWidth      (l : Len) : Item := .decl "max-width" l.raw
 def minHeight     (l : Len) : Item := .decl "min-height" l.raw
 def maxHeight     (l : Len) : Item := .decl "max-height" l.raw
 def padding       (l : Len) : Item := .decl "padding" l.raw
+def paddingX      (l : Len) : Item := .decl "padding-inline" l.raw
+def paddingY      (l : Len) : Item := .decl "padding-block" l.raw
+def paddingTop    (l : Len) : Item := .decl "padding-top" l.raw
+def paddingRight  (l : Len) : Item := .decl "padding-right" l.raw
+def paddingBottom (l : Len) : Item := .decl "padding-bottom" l.raw
+def paddingLeft   (l : Len) : Item := .decl "padding-left" l.raw
 def margin        (l : Len) : Item := .decl "margin" l.raw
+def marginX       (l : Len) : Item := .decl "margin-inline" l.raw
+def marginY       (l : Len) : Item := .decl "margin-block" l.raw
+def marginTop     (l : Len) : Item := .decl "margin-top" l.raw
+def marginRight   (l : Len) : Item := .decl "margin-right" l.raw
+def marginBottom  (l : Len) : Item := .decl "margin-bottom" l.raw
+def marginLeft    (l : Len) : Item := .decl "margin-left" l.raw
 def top           (l : Len) : Item := .decl "top" l.raw
 def right         (l : Len) : Item := .decl "right" l.raw
 def bottom        (l : Len) : Item := .decl "bottom" l.raw

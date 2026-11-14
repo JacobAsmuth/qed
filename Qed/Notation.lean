@@ -17,7 +17,7 @@ def linkTo {α} [Router α] (route : α)
   link (Router.toURL route) attrs children
 
 def cls (name : String) : Attr msg := .cls name
-def attr (key value : String) : Attr msg := .attr key value
+def attr {α} [ToString α] (key : String) (value : α) : Attr msg := .attr key (toString value)
 def role (name : String) : Attr msg := .attr "data-role" name
 def rawHtml (markup : String) : Attr msg := .rawHtml markup
 def on (event : String) (m : msg) : Attr msg := .on event m
@@ -34,14 +34,9 @@ def onFocus (m : msg) : Attr msg := .on "focus" m
 def onDoubleClick (m : msg) : Attr msg := .on "dblclick" m
 def onMouseDown (m : msg) : Attr msg := .on "mousedown" m
 def onMouseUp (m : msg) : Attr msg := .on "mouseup" m
-def key (k : String) : Attr msg := .key k
+def key {α} [ToString α] (k : α) : Attr msg := .key (toString k)
 
-class ToHref (α : Type) where
-  toHref : α → String
-instance : ToHref String := ⟨id⟩
-instance [Router R] : ToHref R := ⟨Router.toURL⟩
-
-def value       (v : String) : Attr msg := .attr "value" v
+def value {α} [ToString α] (v : α) : Attr msg := .attr "value" (toString v)
 def placeholder (v : String) : Attr msg := .attr "placeholder" v
 def name        (v : String) : Attr msg := .attr "name" v
 def href {α} [ToHref α] (v : α) : Attr msg := .attr "href" (ToHref.toHref v)

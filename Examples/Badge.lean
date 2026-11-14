@@ -29,7 +29,7 @@ def view (m : Model) : Html Msg :=
 
 def app : App Model Msg := ui init update fun m => view m
 
-invariant levelSafe : (fun m => 0 ≤ m.level) preserved_by update
+invariant levelSafe (m) : 0 ≤ m.level preserved_by update
 invariant statusStyled : roleHasOneOf "status" [onStyle, offStyle] holds_in view
 invariant statusAndDotOpposite : exactlyOne "status" "dot" onStyle offStyle holds_in view
 

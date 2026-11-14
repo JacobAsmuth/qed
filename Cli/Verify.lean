@@ -71,19 +71,36 @@ def invariantNote : IO Unit := do
     let mut depth : Nat := 0
     let mut updates : List String := []
     let mut covered : List String := []
+    let mut appUpds : List (String × String) := []
+    let mut pendingDef : Option String := none
     for raw in (← IO.FS.readFile f).splitOn "\n" do
       let inComment := depth > 0
       depth := depth + ((raw.splitOn "/-").length - 1) - ((raw.splitOn "-/").length - 1)
       if inComment then continue
       let ts := tokensOf ((raw.splitOn "--").headD raw)
+      let defName? := match ts with
+        | "def" :: nm :: _ => if isName nm then some nm else none
+        | _                => pendingDef
       match ts.dropWhile (· != "preserved_by") with
       | _ :: name :: _ => covered := name :: covered
       | _              => pure ()
+      if ts.head? == some "invariant" then
+        match ts.dropWhile (· != "on") with
+        | _ :: appName :: ":" :: _ =>
+            covered := appName :: (appUpds.filter (·.1 == appName) |>.map (·.2)) ++ covered
+        | _ => pure ()
       let afterUi := (ts.dropWhile (· != "ui")).drop 1
       if afterUi.contains "fun" then
         match dropTerm afterUi with
-        | upd :: _ => if isName upd then updates := upd :: updates
-        | []       => pure ()
+        | upd :: _ =>
+            if isName upd then
+              updates := upd :: updates
+              if let some dn := defName? then appUpds := (dn, upd) :: appUpds
+        | [] => pure ()
+      pendingDef := match ts with
+        | "def" :: nm :: rest => if isName nm && !rest.contains "ui" then some nm else none
+        | []                  => pendingDef
+        | _                   => none
     for u in updates do
       unless covered.contains u do uncovered := uncovered.push (f, u)
   unless uncovered.isEmpty do

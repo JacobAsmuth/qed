@@ -21,6 +21,14 @@ inductive Html (msg : Type) where
   | element (tag : String) (attrs : List (Attr msg)) (children : List (Html msg))
   | lazy (key : String) (sub : Html msg)
 
+def Attr.empty : Attr msg := .cls ""
+
+def Html.ofOption : Option (Html msg) → Html msg
+  | some h => h
+  | none   => .text ""
+
+@[simp] theorem toString_string (s : String) : toString s = s := rfl
+
 instance : Inhabited (Attr msg) := ⟨.cls ""⟩
 instance : Inhabited (Html msg) := ⟨.text ""⟩
 
@@ -28,6 +36,8 @@ instance : Coe String (Html msg) := ⟨.text⟩
 instance : Coe String (List (Html msg)) := ⟨([·])⟩
 instance : Coe Nat (Html msg) := ⟨fun n => .text (toString n)⟩
 instance : Coe Int (Html msg) := ⟨fun n => .text (toString n)⟩
+instance : Coe Float (Html msg) := ⟨fun n => .text (toString n)⟩
+instance : Coe (Option (Html msg)) (Html msg) := ⟨Html.ofOption⟩
 instance : Coe (Array (Html msg)) (List (Html msg)) := ⟨Array.toList⟩
 
 def Attr.map (f : α → β) : Attr α → Attr β

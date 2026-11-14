@@ -52,6 +52,9 @@ private def discoverAssets (value : Expr) : TermElabM (Expr × Expr) := do
         | _ => false
       if isMount && env.contains reg then
         regs := regs.push (Lean.mkConst reg)
+        let compView := n.getPrefix ++ `view
+        if env.contains compView then
+          pending := compView :: pending
       else if let some (.defnInfo d) := env.find? n then
         if d.type.isConstOf ``Qed.Style then
           styles := styles.push (Lean.mkConst n)
@@ -79,6 +82,13 @@ open Lean Elab Term Meta in
   mkAppM ``App.addLocals #[value, locals, styles]
 
 open Lean in
+private def asIdentList? (t : TSyntax `term) : Option (Array Ident) :=
+  match t with
+  | `([$[$elems:term],*]) =>
+      if elems.all (·.raw.isIdent) then some (elems.map fun e => ⟨e.raw⟩) else none
+  | _ => none
+
+open Lean in
 macro_rules
   | `(ui $init $update $[$opts:uiOpt]* fun $m => $body) => do
       let tmpl ← `(view% fun $m => $body)
@@ -87,17 +97,20 @@ macro_rules
       let mut dehydrateE? : Option (TSyntax `term) := none
       let mut startE  : TSyntax `term ← `(Qed.Cmd.none)
       let mut localsE : TSyntax `term ← `(([] : List Qed.LocalDef))
-      let mut portE   : TSyntax `term ← `(none)
+      let mut portE   : TSyntax `term ← `(Option.none)
       for opt in opts do
         match opt with
         | `(uiOpt| ($name:ident := $e)) =>
             match name.getId with
             | `onRoute   => routeE?     := some e
             | `queries   => queriesE?   := some e
-            | `dehydrate => dehydrateE? := some e
+            | `dehydrate =>
+                match asIdentList? e with
+                | some fs => dehydrateE? := some (← `(Dehydrate.fields $init [$[$fs:ident],*]))
+                | none    => dehydrateE? := some e
             | `start     => startE  := e
             | `locals    => localsE := e
-            | `onPort    => portE   := e
+            | `onPort    => portE   := ← `(Qed.ToPortOpt.toPortOpt $e)
             | _ => Macro.throwErrorAt name s!"ui: unknown option '{name.getId}' (expected onRoute/start/locals/onPort/queries/dehydrate)"
         | _ => pure ()
       let base ← match routeE? with

@@ -4,8 +4,8 @@ open Qed
 namespace Booking
 
 schema Appt (today : Date) where
-  who  : Codec.text.refine (fun s => s.length ≥ 1)
-  when : Codec.date.refine (fun d => today < d)
+  who  : String where who.length ≥ 1
+  when : Date   where today < when
 
 structure Model where
   today  : Option Date
@@ -27,7 +27,7 @@ def update (m : Model) : Msg → Model
                       | some appt => { m with booked := some appt.who.val }
                       | none      => m
 
-invariant bookedNeedsToday : (fun m => m.booked.isSome → m.today.isSome) preserved_by update
+invariant bookedNeedsToday (m) : m.booked.isSome → m.today.isSome preserved_by update
 
 def app : App Model Msg :=
   ui { today := none, draft := Appt.Draft.empty, booked := none } update
@@ -38,9 +38,7 @@ def app : App Model Msg :=
         <div class="app">
           <h1>Book an appointment</h1>
           {Appt.formView today m.draft .edit .submit}
-          {match m.booked with
-           | some who => <p class="ok">Booked for {who}</p>
-           | none     => .text ""}
+          {if let some who := m.booked then <p class="ok">Booked for {who}</p>}
         </div>
 
 end Booking

@@ -5,10 +5,13 @@ for every message, assuming the condition was true before the update. Lean check
 If the condition is also true for the initial state, it is true after any number of updates.
 
 ```lean
-invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
+invariant counterSafe (m) : 0 ≤ m.count preserved_by update
 ```
 
-This expands to a theorem, `∀ m msg, 0 ≤ m.count → 0 ≤ (update m msg).count`. If the
+This expands to a theorem, `∀ m msg, 0 ≤ m.count → 0 ≤ (update m msg).count`. Comma-separated
+clauses (`1 ≤ m.qty, m.qty ≤ 10`) combine with `∧`, `from init` also checks the initial state,
+`invariant name (m) on app : …` checks both `app.init` and `app.update`, and inside a
+`component` block `invariant 1 ≤ qty, qty ≤ 10` binds component fields directly. If the
 automatic proof doesn't succeed, compilation fails. Either an update breaks the rule or
 Qed needs help with the proof. This checks the Lean update function; see
 [how Qed works](architecture.md) for what else the app relies on.
@@ -37,14 +40,14 @@ See `Examples/Local.lean`.
 boolean/`Option` reasoning, `if`/`match` splits, and the `steps` arm normalisation.
 
 ```lean
-invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
+invariant counterSafe (m) : 0 ≤ m.count preserved_by update
 ```
 
-**Effectful transitions** work with the same syntax, the next model is read out of the
-`Model × Cmd Msg` a `transition` returns:
+**Effectful transitions and apps** work with the same syntax; the next model is read out of the
+`Model × Cmd Msg` a `transition` returns, or directly from an `App`:
 
 ```lean
-invariant streamSafe : (fun m => m.pending = true → 0 < m.turns.size) preserved_by transition
+invariant streamSafe (m) on chatApp : m.pending = true → 0 < m.turns.size
 ```
 
 **With a proof (`:=`).** When the property needs a lemma the automation can't guess, usually one
@@ -52,7 +55,7 @@ quantified over your own collections, supply the proof. The goal is the generate
 opens with `intro m msg h`:
 
 ```lean
-invariant idsBelowNext : (fun m => ∀ r ∈ m.rows, r.id < m.nextId)
+invariant idsBelowNext (m) : ∀ r ∈ m.rows, r.id < m.nextId
     preserved_by update := by
   intro m msg h
   cases msg <;> simp_all [update] <;> omega

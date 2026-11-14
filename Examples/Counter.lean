@@ -28,4 +28,4 @@ def app : App Model Msg := ui init update fun m =>
     <input placeholder="type here, focus survives every click"/>
   </div>
 
-invariant counterSafe : (fun m => 0 ≤ m.count) preserved_by update
+invariant counterSafe (m) : 0 ≤ m.count preserved_by update

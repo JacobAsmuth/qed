@@ -14,6 +14,9 @@ namespace Resource
 def fetch [FromJson α] (url : String) (toMsg : Resource α → msg) : Cmd msg :=
   Cmd.getJson url (fun a => toMsg (.ok a)) (fun e => toMsg (.failed e))
 
+def post [ToJson req] [FromJson resp] (url : String) (body : req) (toMsg : Resource resp → msg) : Cmd msg :=
+  Cmd.postJson url (Json.render (toJson body)) (fun a => toMsg (.ok a)) (fun e => toMsg (.failed e))
+
 def view (r : Resource α) (ready : α → Html msg)
     (loading : Html msg := .text "Loading…")
     (failed  : String → Html msg := fun e => .text e)
@@ -91,6 +94,23 @@ def Query.wrap {Model Msg : Type} (qs : List (Query Model Msg))
 def App.withQueries {Model Msg : Type} (qs : List (Query Model Msg))
     (app : App Model Msg) : App Model Msg :=
   { app with update := Query.wrap qs app.update }
+
+@[simp] theorem App.withQueries_init (qs : List (Query Model Msg)) (app : App Model Msg) :
+    (App.withQueries qs app).init = app.init := rfl
+@[simp] theorem App.withQueries_update (qs : List (Query Model Msg)) (app : App Model Msg) :
+    (App.withQueries qs app).update = Query.wrap qs app.update := rfl
+
+open Lean in
+syntax:max (name := queryForTerm) "Resource.queryFor " ident (ppSpace Lean.Parser.Term.argument)* : term
+
+open Lean in
+@[macro queryForTerm] def expandQueryFor : Macro := fun stx => do
+  let field : Ident := ⟨stx[1]⟩
+  let userArgs := stx[2].getArgs
+  let base ← `(Resource.query (get := fun m => m.$field:ident) (set := fun c m => { m with $field:ident := c }))
+  -- Put user-supplied arguments (`key`, `url`, `got`) before `get`/`set` so `Model` is inferred before `m.$field`.
+  let baseArgs := base.raw[1].getArgs
+  return Syntax.node .none ``Lean.Parser.Term.app #[base.raw[0], mkNullNode (userArgs ++ baseArgs)]
 
 #guard (match (({} : Cached Nat).put "a" (.ok 1) "b").state with | .idle => true | _ => false)
 #guard ((({} : Cached Nat).put "a" (.ok 1) "b").lookup "a" == some 1)

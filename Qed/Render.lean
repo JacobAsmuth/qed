@@ -4,19 +4,78 @@ namespace Qed
 
 def localKey (component key : String) : String := component ++ "@" ++ key
 
+@[inline] def isMarkupOrQuote (c : Char) : Bool :=
+  c == '<' || c == '>' || c == '"' || c == '\''
+
 @[inline] def isHtmlSpecial (c : Char) : Bool :=
-  c == '&' || c == '<' || c == '>' || c == '"' || c == '\''
+  c == '&' || isMarkupOrQuote c
+
+def escapeHtmlStep (acc : String) (c : Char) : String :=
+  if c == '&' then acc ++ "&amp;"
+  else if c == '<' then acc ++ "&lt;"
+  else if c == '>' then acc ++ "&gt;"
+  else if c == '"' then acc ++ "&quot;"
+  else if c == '\'' then acc ++ "&#39;"
+  else acc.push c
 
 def escapeHtml (s : String) : String :=
-  if !s.any isHtmlSpecial then s
-  else s.foldl (init := "") fun acc c =>
-    match c with
-    | '&'  => acc ++ "&amp;"
-    | '<'  => acc ++ "&lt;"
-    | '>'  => acc ++ "&gt;"
-    | '"'  => acc ++ "&quot;"
-    | '\'' => "&#39;" |> (acc ++ ·)
-    | c    => acc.push c
+  let cs := s.toList
+  if !cs.any isHtmlSpecial then s
+  else cs.foldl escapeHtmlStep ""
+
+private theorem isMarkupOrQuote_false_of_not_special {c : Char} (h : isHtmlSpecial c = false) :
+    isMarkupOrQuote c = false :=
+  (Bool.or_eq_false_iff.1 h).2
+
+private theorem escapeHtmlStep_safe (acc : String) (c : Char)
+    (hacc : acc.toList.all (!isMarkupOrQuote ·) = true) :
+    (escapeHtmlStep acc c).toList.all (!isMarkupOrQuote ·) = true := by
+  unfold escapeHtmlStep
+  by_cases h1 : c == '&'
+  · rw [if_pos h1, String.toList_append, List.all_append, hacc]; decide
+  · rw [if_neg h1]
+    by_cases h2 : c == '<'
+    · rw [if_pos h2, String.toList_append, List.all_append, hacc]; decide
+    · rw [if_neg h2]
+      by_cases h3 : c == '>'
+      · rw [if_pos h3, String.toList_append, List.all_append, hacc]; decide
+      · rw [if_neg h3]
+        by_cases h4 : c == '"'
+        · rw [if_pos h4, String.toList_append, List.all_append, hacc]; decide
+        · rw [if_neg h4]
+          by_cases h5 : c == '\''
+          · rw [if_pos h5, String.toList_append, List.all_append, hacc]; decide
+          · rw [if_neg h5, String.toList_push, List.all_append, hacc]
+            unfold isMarkupOrQuote
+            simp [Bool.eq_false_iff.2 h2, Bool.eq_false_iff.2 h3,
+                  Bool.eq_false_iff.2 h4, Bool.eq_false_iff.2 h5]
+
+private theorem foldl_escapeHtmlStep_safe :
+    ∀ (cs : List Char) (acc : String),
+      acc.toList.all (!isMarkupOrQuote ·) = true →
+      (cs.foldl escapeHtmlStep acc).toList.all (!isMarkupOrQuote ·) = true
+  | [], _, hacc => hacc
+  | c :: cs, acc, hacc =>
+      foldl_escapeHtmlStep_safe cs (escapeHtmlStep acc c) (escapeHtmlStep_safe acc c hacc)
+
+/-- Every character emitted by `escapeHtml` is free of `<`, `>`, `"`, and `'`,
+    making both HTML tag injection in text nodes and quote breakout in attributes impossible. -/
+theorem escapeHtml_no_markup_or_quote (s : String) :
+    ∀ c ∈ (escapeHtml s).toList, isMarkupOrQuote c = false := by
+  unfold escapeHtml
+  dsimp only
+  by_cases h : s.toList.any isHtmlSpecial = true
+  · simp only [h, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+    have hall := foldl_escapeHtmlStep_safe s.toList "" (by decide)
+    rw [List.all_eq_true] at hall
+    intro c hc
+    simpa using hall c hc
+  · have hf : s.toList.any isHtmlSpecial = false := Bool.eq_false_iff.2 h
+    simp only [hf, Bool.not_false, ↓reduceIte]
+    rw [List.any_eq_false] at hf
+    intro c hc
+    have hns : isHtmlSpecial c = false := Bool.eq_false_iff.2 (hf c hc)
+    exact isMarkupOrQuote_false_of_not_special hns
 
 def Attr.key? : Attr msg → Option String
   | .attr k _ => some k
@@ -35,27 +94,68 @@ def normalizeAttrs (attrs : List (Attr msg)) : List (Attr msg) :=
   let merged  := if classes.isEmpty then [] else [Attr.cls (String.intercalate " " classes)]
   merged ++ dedupAttrs (attrs.filter (fun | .cls _ => false | _ => true))
 
-@[inline] def isKeyChar (c : Char) : Bool :=
-  c.isAlphanum || c == '-' || c == '_' || c == ':' || c == '.'
-
 def sanitizeKey (k : String) : String :=
-  if k.all isKeyChar then k
-  else String.ofList (k.toList.filter isKeyChar)
+  let cs := k.toList
+  if cs.all isKeyChar then k
+  else String.ofList (cs.filter isKeyChar)
 
-def voidTags : List String :=
-  ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]
+/-- Every character in `sanitizeKey k` is strictly alphanumeric or in `{- _ : .}`,
+    preventing whitespace, `=`, quotes, `<`, `>`, or `/` from ever appearing in an attribute name. -/
+theorem sanitizeKey_safe (k : String) :
+    ∀ c ∈ (sanitizeKey k).toList, isKeyChar c = true := by
+  unfold sanitizeKey
+  dsimp only
+  by_cases h : k.toList.all isKeyChar = true
+  · simp only [h, ↓reduceIte]
+    rw [List.all_eq_true] at h
+    exact h
+  · simp only [h, Bool.false_eq_true, ↓reduceIte, String.toList_ofList]
+    intro c hc
+    exact (List.mem_filter.1 hc).2
 
 def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .cls c     => (s!" class=\"{escapeHtml c}\"", hs)
-  | .attr k v  => (s!" {sanitizeKey k}=\"{escapeHtml v}\"", hs)
-  | .flag k present => (if present then s!" {sanitizeKey k}=\"{sanitizeKey k}\"" else "", hs)
+  | .attr k v  =>
+      let sk := sanitizeKey k
+      if !isSafeRenderedKey sk || (isUrlAttrName sk && !isSafeUrl v) then ("", hs)
+      else (s!" {sk}=\"{escapeHtml v}\"", hs)
+  | .flag k present =>
+      let sk := sanitizeKey k
+      if !present || !isSafeRenderedKey sk then ("", hs)
+      else (s!" {sk}=\"{sk}\"", hs)
   | .key _     => ("", hs)
-  | .on event m  => (s!" data-qed-on-{event}=\"{hs.size}\"", hs.push m)
+  | .on event m  =>
+      let ev := sanitizeKey event
+      if ev.isEmpty then ("", hs)
+      else (s!" data-qed-on-{ev}=\"{hs.size}\"", hs.push m)
   | .onValue _ _ => ("", hs)
   | .localCell key comp _ _ _ => (s!" data-qed-local=\"{escapeHtml (localKey comp key)}\"", hs)
   | .signalBind name        => (s!" data-qed-signal=\"{escapeHtml name}\"", hs)
-  | .signalAttr _ attr value => (s!" {sanitizeKey attr}=\"{escapeHtml value}\"", hs)
-  | .rawHtml _ => ("", hs)
+  | .signalAttr _ attr value =>
+      let sk := sanitizeKey attr
+      if !isSafeRenderedKey sk || (isUrlAttrName sk && !isSafeUrl value) then ("", hs)
+      else (s!" {sk}=\"{escapeHtml value}\"", hs)
+
+/-- Defense-in-depth: inline event handler attributes (`on*`) are unconditionally stripped
+    by `renderAttr`, even if constructed programmatically outside JSX. -/
+theorem renderAttr_blocks_inline_handler (hs : Array msg) (k v : String)
+    (hon : hasOnPrefix ((sanitizeKey k).toList.map asciiLowerChar) = true) :
+    (renderAttr hs (.attr k v)).1 = "" := by
+  simp [renderAttr, isSafeRenderedKey, hon]
+
+/-- Defense-in-depth: `srcdoc` attributes (case-insensitive) are unconditionally stripped. -/
+theorem renderAttr_blocks_srcdoc (hs : Array msg) (k v : String)
+    (hsd : asciiLower (sanitizeKey k) = "srcdoc") :
+    (renderAttr hs (.attr k v)).1 = "" := by
+  simp [renderAttr, isSafeRenderedKey, hsd]
+
+/-- Defense-in-depth: URL-bearing attributes (`href`, `src`, `action`, `formaction`, `xlink:href`,
+    `poster`, `data`, `cite`, `srcset`) with unsafe schemes (`javascript:`, `data:`, `vbscript:`,
+    `//`, `/\`, whitespace/control chars) are unconditionally stripped. -/
+theorem renderAttr_blocks_unsafe_url (hs : Array msg) (k v : String)
+    (hurl : isUrlAttrName (sanitizeKey k) = true) (hbad : isSafeUrl v = false) :
+    (renderAttr hs (.attr k v)).1 = "" := by
+  simp [renderAttr, hurl, hbad]
 
 def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg
   | []      => ("", hs)
@@ -64,31 +164,24 @@ def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg
       let (s2, hs2) := renderAttrs hs1 as
       (s1 ++ s2, hs2)
 
-def rawHtml? : List (Attr msg) → Option String
-  | []                   => none
-  | .rawHtml markup :: _ => some markup
-  | _ :: rest            => rawHtml? rest
-
 def renderElement (renderKids : Array msg → String × Array msg) (hs : Array msg)
     (tag : String) (attrs : List (Attr msg)) (children : List (Html msg)) : String × Array msg :=
   let (attrStr, hs1) := renderAttrs hs (normalizeAttrs attrs)
-  if let some markup := rawHtml? attrs then
-    (s!"<{tag}{attrStr}>{markup}</{tag}>", hs1)
-  else if tag == "style" || tag == "script" then
+  if tag == "style" || tag == "script" then
     -- Escape `</` → `<\/` so text inside raw-text elements cannot close `<style>`/`<script>` early.
-    let raw := "<\\/".intercalate ((String.join (children.map fun | .text s => s | _ => "")).splitOn "</")
+    let raw := escapeRawText (String.join (children.map fun | .text s => s | _ => ""))
     (s!"<{tag}{attrStr}>{raw}</{tag}>", hs1)
-  else if voidTags.contains tag then
+  else if isVoidTag tag then
     (s!"<{tag}{attrStr}>", hs1)
   else
     let (childStr, hs2) := renderKids hs1
-    (s!"<{tag}{attrStr}>{childStr}</{tag}>", hs2)
+    let body := if tag == "textarea" && childStr.toList.head? == some '\n' then "\n" ++ childStr else childStr
+    (s!"<{tag}{attrStr}>{body}</{tag}>", hs2)
 
 mutual
   def renderNode (hs : Array msg) : Html msg → String × Array msg
     | .text s => (escapeHtml s, hs)
     | .element tag attrs children => renderElement (fun hs => renderChildren hs children) hs tag attrs children
-    | .lazy _ sub => renderNode hs sub
   def renderChildren (hs : Array msg) : List (Html msg) → String × Array msg
     | [] => ("", hs)
     | c :: cs =>
@@ -102,7 +195,6 @@ mutual
     | .text s => (escapeHtml s, hs)
     | .element tag attrs children =>
         renderElement (fun hs => renderChildrenTR hs "" children) hs tag attrs children
-    | .lazy _ sub => renderNodeTR hs sub
   def renderChildrenTR (hs : Array msg) (acc : String) : List (Html msg) → String × Array msg
     | [] => (acc, hs)
     | c :: cs =>
@@ -114,7 +206,6 @@ mutual
   theorem renderNodeTR_eq (hs : Array msg) (h : Html msg) : renderNodeTR hs h = renderNode hs h := by
     cases h with
     | text s => rfl
-    | lazy k sub => exact renderNodeTR_eq hs sub
     | element tag attrs children =>
         unfold renderNodeTR renderNode
         congr 1
@@ -145,9 +236,8 @@ def renderChildrenFast (hs : Array msg) (cs : List (Html msg)) : String × Array
 def Html.render (h : Html msg) : String := (renderNode #[] h).1
 
 def Html.textOf? : Html msg → Option String
-  | .text s     => some s
-  | .lazy _ sub => Html.textOf? sub
-  | _           => none
+  | .text s => some s
+  | _       => none
 
 def restOfTextRun : List (Html msg) → String
   | []      => ""

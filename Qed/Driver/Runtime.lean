@@ -105,11 +105,22 @@ def qedPortRecv (name payload : String) : IO Unit := do
   | some rt => rt.portRecv name payload
   | none    => pure ()
 
+private def drainPendingQueue {Msg : Type} (pendingRef : IO.Ref (Array Msg))
+    (step : Msg → IO Unit) : Nat → IO Unit
+  | 0 => pure ()
+  | fuel + 1 => do
+      let queued ← pendingRef.get
+      if queued.isEmpty then
+        pure ()
+      else
+        pendingRef.set #[]
+        for qm in queued do step qm
+        drainPendingQueue pendingRef step fuel
+
 def run (app : App Model Msg) : IO Unit := do
   let template  := app.template
   let modelRef  ← IO.mkRef app.init.1
   let vstateRef ← IO.mkRef (none : Option (VState Model Msg))
-  let condCells : CondCells Model Msg ← IO.mkRef (#[], #[])
   let rootRef   ← IO.mkRef (0 : Dom.Node)
   let clickRef  ← IO.mkRef (#[] : Array Msg)
   let inputRef  ← IO.mkRef (#[] : Array (String → Msg))
@@ -139,12 +150,14 @@ def run (app : App Model Msg) : IO Unit := do
     | none => do
         let existing ← Dom.appRoot
         if existing != (0 : Dom.Node) then
-          let vst ← hydrateView h condCells template (← modelRef.get) existing
+          let vst ← hydrateView h template (← modelRef.get) existing
           rootRef.set existing; vstateRef.set (some vst)
         else
-          let (node, vst) ← buildView h condCells "" template (← modelRef.get)
+          let (node, vst) ← buildView h "" template (← modelRef.get)
           Dom.mountRoot node; rootRef.set node; vstateRef.set (some vst)
-    | some vst => patchView h condCells (← rootRef.get) 0 template (← modelRef.get) vst
+    | some vst => do
+        let vst' ← patchView h (← rootRef.get) 0 template (← modelRef.get) vst
+        vstateRef.set (some vst')
     gcLocals
   let performLeaf : Cmd Msg → IO Unit := fun
     | .none => pure ()
@@ -160,10 +173,10 @@ def run (app : App Model Msg) : IO Unit := do
         let id ← cbNextRef.modifyGet (fun n => (n, n + 1))
         respCbRef.modify (·.insert id onResult)
         Dom.httpSend method url body (UInt32.ofNat id)
-    | .pushPath path => do
-        Dom.pushPath path
+    | .pushPath url => do
+        Dom.pushPath url.raw
         match app.onUrlChange with
-        | some f => (← dispatchRef.get) (f path)
+        | some f => (← dispatchRef.get) (f url.raw)
         | none   => pure ()
     | .port name payload => Dom.portSend name payload
     | .socket key url onMessage onOpen onClose onError => do
@@ -190,10 +203,7 @@ def run (app : App Model Msg) : IO Unit := do
       pendingRef.modify (·.push msg)
     else
       perform (← applyOne msg)
-      while !(← pendingRef.get).isEmpty do
-        let queued ← pendingRef.get
-        pendingRef.set #[]
-        for qm in queued do perform (← applyOne qm)
+      drainPendingQueue pendingRef (fun qm => do perform (← applyOne qm)) 1024
   dispatchRef.set dispatchMsg
   let localDispatch : String → UInt32 → IO Unit := fun fullKey id => do
     match (← instancesRef.get)[fullKey]? with

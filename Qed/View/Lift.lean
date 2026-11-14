@@ -32,6 +32,7 @@ private def stringAttrName? : String → Option String
   | "style"       => some "style"
   | "href"        => some "href"
   | "src"         => some "src"
+  | "action"      => some "action"
   | "alt"         => some "alt"
   | "title"       => some "title"
   | "type'"       => some "type"
@@ -164,6 +165,14 @@ elab "child% " "fun " mb:ident " => " body:term : term <= expectedType => do
             if !v.containsFVar fv.fvarId! then
               if arg == fv then return v
               else return (← mkAppM ``Qed.View.mapScope #[← mkLambdaFVars #[fv] arg, v])
+          if b'.isAppOfArity ``Qed.lazy 5 then
+            let α    := b'.getArg! 0
+            let inst := b'.getArg! 2
+            let f    := b'.getArg! 3
+            let a    := b'.getArg! 4
+            if f.containsFVar fv.fvarId! || inst.containsFVar fv.fvarId! || α.containsFVar fv.fvarId! then
+              throwErrorAt body "Qed.lazy function must not capture model variable `{mb.getId}` directly; pass all model dependencies through the `[LawfulKey]` argument so memoization stays sound"
+            return (← mkAppOptM ``Qed.V.memo #[α, σ, msg, inst, f, ← mkLambdaFVars #[fv] a])
           mkAppOptM ``Qed.View.dynNode #[σ, msg, ← mkLambdaFVars #[fv] b']
   | _ => throwError "child% expects a `View` expected type"
 
@@ -233,7 +242,7 @@ mutual
           if args.size == 1 && viewMentions m.getId args[0]! then
             let nm : Term := ⟨Syntax.mkStrLit an⟩
             let rawV : Term := ⟨args[0]!⟩
-            let v : Term ← if hn == "href" then `(Qed.ToHref.toHref $rawV)
+            let v : Term ← if hn == "href" || hn == "src" || hn == "action" then `(Qed.ToHref.toHref $rawV)
                            else if hn == "value" then `(toString $rawV)
                            else pure rawV
             return some (← `(Qed.V.dynAttr $nm (fun $m => $v)))

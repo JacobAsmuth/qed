@@ -1,6 +1,7 @@
 import Qed.Notation
 import Qed.Json
 import Qed.Date
+import Qed.Runtime.Verify
 import Lean
 
 namespace Qed
@@ -13,11 +14,14 @@ instance {α : Type} {p : α → Prop} : CoeOut (Field p) α := ⟨Field.val⟩
 instance {α : Type} {p : α → Prop} [ToString α] : ToString (Field p) := ⟨fun f => toString f.val⟩
 
 structure Codec (α : Type) where
-  parse  : String → Option α
-  render : {msg : Type} → (raw : String) → (set : String → msg) → Html msg
-  valid  : α → Prop
-  dec    : DecidablePred valid
-  inForm : Bool := true
+  parse        : String → Option α
+  render       : {msg : Type} → (raw : String) → (set : String → msg) → Html msg
+  valid        : α → Prop
+  dec          : DecidablePred valid
+  inForm       : Bool := true
+  wrapLabel    : Bool := true
+  render_valid : ∀ {msg : Type} (inForm : Bool) (raw : String) (set : String → msg),
+                   Html.validIn ⟨.normal, false, false, inForm⟩ (render raw set) = true
 
 @[reducible] def Codec.Val {α : Type} (_ : Codec α) : Type := α
 
@@ -67,27 +71,33 @@ private def toInt? (s : String) : Option Int :=
 def text : Codec String where
   parse := some; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "input" [value raw, onInput set]
+  render_valid := fun inForm _ _ => by cases inForm <;> rfl
 
 def textarea : Codec String where
   parse := some; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "textarea" [value raw, onInput set]
+  render_valid := fun inForm _ _ => by cases inForm <;> rfl
 
 def nat : Codec Nat where
   parse := fun s => s.toNat?; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "input" [type' "number", attr "min" "0", value raw, onInput set]
+  render_valid := fun inForm _ _ => by cases inForm <;> rfl
 
 def int : Codec Int where
   parse := toInt?; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "input" [type' "number", value raw, onInput set]
+  render_valid := fun inForm _ _ => by cases inForm <;> rfl
 
 def checkbox : Codec Bool where
   parse := fun s => some (s == "true"); valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set =>
     el "input" [type' "checkbox", checked (raw == "true"), onCheck (fun b => set (toString b))]
+  render_valid := fun inForm _ _ => by cases inForm <;> rfl
 
 def date : Codec Date where
   parse := Date.parse?; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "input" [type' "date", value raw, onInput set]
+  render_valid := fun inForm _ _ => by cases inForm <;> rfl
 
 def select (options : List (String × String)) : Codec String where
   parse := fun s => if options.any (fun o => o.1 == s) then some s else none
@@ -95,20 +105,51 @@ def select (options : List (String × String)) : Codec String where
   render := fun raw set =>
     el "select" [value raw, onChange set]
       (options.map fun (v, lbl) => el "option" [value v] [lbl])
+  render_valid := fun {msg} inForm raw set => by
+    cases inForm <;>
+      simp [el, value, onChange, Html.validIn, Attr.valid, Attr.validKeyValue, Html.validListIn_map]
 
 def radios (group : String) (options : List (String × String)) : Codec String where
   parse := fun s => if options.any (fun o => o.1 == s) then some s else none
   valid := fun _ => True; dec := fun _ => inferInstance
+  wrapLabel := false
   render := fun raw set =>
     el "div" [cls "qed-radios"]
       (options.map fun (v, lbl) =>
         el "label" [] [el "input" [type' "radio", Qed.name group, value v, checked (raw == v), onChange set], lbl])
+  render_valid := fun {msg} inForm raw set => by
+    cases inForm <;>
+      simp [el, cls, type', Qed.name, value, checked, onChange,
+            Html.validIn, Attr.valid, Attr.validKeyValue, Html.validListIn_map]
 
 def json (α : Type) [ToJson α] [FromJson α] : Codec α where
   parse := fun _ => none
   valid := fun _ => True; dec := fun _ => inferInstance
   render := fun _ _ => el "span" [] []
   inForm := false
+  render_valid := fun inForm _ _ => by cases inForm <;> rfl
+
+@[simp] theorem render_valid_simp {α msg : Type} (c : Codec α) (inForm : Bool) (raw : String) (set : String → msg) :
+    Html.validIn ⟨.normal, false, false, inForm⟩ (c.render raw set) = true :=
+  c.render_valid inForm raw set
+
+def formFieldRow {msg : Type} (inForm wrapLabel bad : Bool) (label err : String) (ctrl : Html msg) :
+    List (Html msg) :=
+  if inForm then
+    let tag    := if wrapLabel then "label" else "fieldset"
+    let lblTag := if wrapLabel then "span" else "legend"
+    [el tag [cls "qed-field", attr "aria-invalid" (if bad then "true" else "false")]
+      ([el lblTag [cls "qed-label"] [label], ctrl] ++
+       (if bad then [el "span" [cls "qed-error"] [err]] else []))]
+  else []
+
+@[simp] theorem formFieldRow_validListIn {msg : Type} (ctxInForm inForm wrapLabel bad : Bool)
+    (label err : String) (ctrl : Html msg)
+    (hctrl : Html.validIn ⟨.normal, false, false, ctxInForm⟩ ctrl = true) :
+    Html.validListIn ⟨.normal, false, false, ctxInForm⟩
+      (formFieldRow inForm wrapLabel bad label err ctrl) = true := by
+  cases ctxInForm <;> cases inForm <;> cases wrapLabel <;> cases bad <;>
+    simp [formFieldRow, el, cls, attr, Html.validListIn, Html.validIn, Attr.valid, Attr.validKeyValue, hctrl]
 
 end Codec
 
@@ -229,6 +270,7 @@ elab_rules : command
       let canId         := mkIdent (t.getId ++ `canSubmit)
       let iffId         := mkIdent (t.getId ++ `canSubmit_iff)
       let viewId        := mkIdent (t.getId ++ `formView)
+      let formValidId   := mkIdent (t.getId ++ `formView_validIn)
       let decodeId      := mkIdent (t.getId ++ `decode)
       let encodeId      := mkIdent (t.getId ++ `encode)
       let toJsonId      := mkIdent (t.getId ++ `toJson)
@@ -256,6 +298,7 @@ elab_rules : command
       let tApp        ← appTo ⟨t.raw⟩
       let parseApp    ← appTo ⟨parseId.raw⟩
       let canApp      ← appTo ⟨canId.raw⟩
+      let viewApp     ← appTo ⟨viewId.raw⟩
       let toJsonApp   ← appTo ⟨toJsonId.raw⟩
       let fromJsonApp ← appTo ⟨fromJsonId.raw⟩
       let emptyVals ← fs.mapM fun _ => `(term| "")
@@ -290,14 +333,9 @@ elab_rules : command
       let rowGroups ← (pairs.zip runCalls).mapM fun ((f, inp), rc) => do
         let nameLit := Syntax.mkStrLit (toString f.getId)
         let errLit  := Syntax.mkStrLit ("Please enter a valid " ++ toString f.getId)
-        `(term|
-            (if ($inp).inForm then
-              [(let bad := d.$f:ident != "" && ($rc).isNone
-                el "label" [cls "qed-field", attr "aria-invalid" (if bad then "true" else "false")]
-                  ([ el "span" [cls "qed-label"] [$nameLit],
-                     ($inp).render (d.$f:ident) (fun v => onEdit { d with $f:ident := v }) ]
-                   ++ (if bad then [el "span" [cls "qed-error"] [$errLit]] else [])))]
-             else []))
+        `(term| Codec.formFieldRow ($inp).inForm ($inp).wrapLabel
+                  (d.$f:ident != "" && ($rc).isNone) $nameLit $errLit
+                  (($inp).render (d.$f:ident) (fun v => onEdit { d with $f:ident := v })))
       let submitBtn ← `(term| el "button" [disabled (!($parseApp d).isSome), onClick submit] "Submit")
       let viewBody ← rowGroups.foldrM (init := ← `(term| [$submitBtn])) fun g acc => `(term| $g ++ $acc)
       let formCmds : Array (TSyntax `command) := #[
@@ -330,7 +368,14 @@ elab_rules : command
               $canApp d = true ↔ $rhs := by unfold $canId $parseId; $casesTac),
         ← `(command| def $viewId {msg : Type} $[($cbns:ident : $cbts:term)]* (d : $draftId)
               (onEdit : $draftId → msg) (submit : msg) : Html msg :=
-              el "div" [cls "qed-form"] $viewBody) ]
+              el "div" [cls "qed-form"] $viewBody),
+        ← `(command| @[simp] theorem $formValidId {msg : Type} $[($cbns:ident : $cbts:term)]*
+              (inForm : Bool) (d : $draftId) (onEdit : $draftId → msg) (submit : msg) :
+              Html.validIn ⟨.normal, false, false, inForm⟩ ($viewApp d onEdit submit) = true := by
+              unfold $viewId
+              cases inForm <;>
+                simp [el, cls, disabled, onClick, Html.validIn, Attr.valid,
+                      Html.validListIn_append]) ]
       let jsonFnCmds : Array (TSyntax `command) := #[
         ← `(command| def $toJsonId $[($cbns:ident : $cbts:term)]* (x : $tApp) : Json :=
               Json.obj [$[$jsonPairs],*]),

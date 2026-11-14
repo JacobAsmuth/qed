@@ -18,7 +18,7 @@ def trees : Array (Html Unit) := #[
   e "style" [] [t "a < b { x: 1 } </style>"],
   e "script" [] [t "if (a < b) { x }"],
   e "div" [] [t "unicode: café — naïve — 日本語 — 😀 end"],
-  Html.lazy "lz" (e "p" [Attr.cls "memo"] [t "memo"]),
+  Qed.lazy (fun s : String => e "p" [Attr.cls "memo"] [t s]) "memo",
   e "form" [Attr.attr "x<y" "1", Attr.cls ""] [e "div" [] [t "nested", e "b" [] [t "deep"]]]
 ]
 def renderCase (i : Nat) : String := Html.render (trees.getD i (t ""))
@@ -41,7 +41,7 @@ def childPatchCase (i : Nat) : String :=
   let old := (Array.range n).map fun j => e "span" [] [t (toString j)]
   let steps : List (KeyedStep Unit) :=
     .create (t "new") :: ((List.range n).reverse.map fun j =>
-      .reuse j (.patchElement [Attr.cls "patched"] [.reuse 0 (.lazyPatch "" (.setText (toString j)))])) ++
+      .reuse j (.patchElement [Attr.cls "patched"] [.reuse 0 (.setText (toString j))])) ++
     [.reuse (n + 1) (.patchElement [] [])]
   let patched := applyChildrenTR #[t "prefix"] steps old
   let (length, checksum) := patched.foldl (init := (0, 0)) fun (length, checksum) child =>

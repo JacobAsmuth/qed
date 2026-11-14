@@ -22,7 +22,7 @@ component Board where
     draft := ""
     nextId += 1
   action remove (id : Nat) => rows := rows.filter (·.id != id)
-  action sort => rows := rows.qsort (fun a b => compare a.text b.text == .lt)
+  action sort => rows := rows.sortBy (fun a b => compare a.text b.text == .lt)
   view =>
     <div class="todo">
       <div class="add">

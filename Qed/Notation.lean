@@ -4,22 +4,21 @@ import Qed.Router
 namespace Qed
 
 def text [ToString α] (a : α) : Html msg := .text (toString a)
-def lazy (key : String) (sub : Html msg) : Html msg := .lazy key sub
+def lazy {α msg : Type} [LawfulKey α] (f : α → Html msg) (a : α) : Html msg := f a
 
 def el (tag : String) (attrs : List (Attr msg) := []) (children : List (Html msg) := []) :
     Html msg := .element tag attrs children
 
-def link (path : String) (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg :=
-  el "a" (Attr.attr "href" path :: Attr.attr "data-qed-link" "" :: attrs) children
+def link {α} [ToHref α] (target : α) (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg :=
+  el "a" (Attr.attr "href" (ToHref.toHref target) :: Attr.attr "data-qed-link" "" :: attrs) children
 
 def linkTo {α} [Router α] (route : α)
     (attrs : List (Attr msg) := []) (children : List (Html msg) := []) : Html msg :=
-  link (Router.toURL route) attrs children
+  link route attrs children
 
 def cls (name : String) : Attr msg := .cls name
 def attr {α} [ToString α] (key : String) (value : α) : Attr msg := .attr key (toString value)
 def role (name : String) : Attr msg := .attr "data-role" name
-def rawHtml (markup : String) : Attr msg := .rawHtml markup
 def on (event : String) (m : msg) : Attr msg := .on event m
 def onValue (event : String) (handler : String → msg) : Attr msg := .onValue event handler
 def onClick (m : msg) : Attr msg := .on "click" m
@@ -39,8 +38,9 @@ def key {α} [ToString α] (k : α) : Attr msg := .key (toString k)
 def value {α} [ToString α] (v : α) : Attr msg := .attr "value" (toString v)
 def placeholder (v : String) : Attr msg := .attr "placeholder" v
 def name        (v : String) : Attr msg := .attr "name" v
-def href {α} [ToHref α] (v : α) : Attr msg := .attr "href" (ToHref.toHref v)
-def src         (v : String) : Attr msg := .attr "src" v
+def href {α} [ToHref α] (v : α)   : Attr msg := .attr "href" (ToHref.toHref v)
+def src {α} [ToHref α] (v : α)    : Attr msg := .attr "src" (ToHref.toHref v)
+def action {α} [ToHref α] (v : α) : Attr msg := .attr "action" (ToHref.toHref v)
 def alt         (v : String) : Attr msg := .attr "alt" v
 def title       (v : String) : Attr msg := .attr "title" v
 def style       (v : String) : Attr msg := .attr "style" v

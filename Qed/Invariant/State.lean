@@ -21,22 +21,6 @@ syntax (name := invariantCmd)
 
 open Lean Elab Tactic
 
-private def qedLooksGenerated (n : Name) : Bool :=
-  n.isInternalDetail ||
-  (match n with
-   | .str _ s =>
-       ["casesOn", "recOn", "rec", "brecOn", "below", "ibelow", "noConfusion",
-        "noConfusionType", "toCtorIdx", "ofNat", "print", "parse", "toSeg", "fromSeg",
-        "toJson", "fromJson"].contains s
-         || s.startsWith "match_" || s.startsWith "eq_" || s.startsWith "inst"
-   | _ => false)
-
-def qedIsHelper (env : Environment) (n : Name) : Bool :=
-  let mod := match env.getModuleIdxFor? n with | some i => env.header.moduleNames[i]! | none => n
-  ![`Init, `Std, `Lean, `Qed].contains mod.getRoot
-    && (match env.find? n with | some (.defnInfo d) => !d.type.isConstOf ``Qed.Style | _ => false)
-    && !qedLooksGenerated n
-
 private def qedBoundaryLemmas : Array Name :=
   #[``Array.size_push, ``Array.size_modify, ``Array.size_set, ``Array.size_pop,
     ``Array.size_map, ``Array.size_append,

@@ -9,7 +9,7 @@ inductive Cmd (msg : Type) where
   | stream (url : String) (body : String) (onChunk : String → msg) (onDone : msg)
   | now (onNow : Date → msg)
   | request (method url body : String) (onResult : Except String String → msg)
-  | pushPath (path : String)
+  | pushPath (url : Url)
   | batch (cmds : List (Cmd msg))
   | port (name payload : String)
   | fx (kind a b c : String)
@@ -67,8 +67,8 @@ def Cmd.storageGet (key : String) (onValue : Option String → msg) : Cmd msg :=
   .fxResult "storage.get" key "" fun s =>
     onValue (match (Json.parse s).toOption with | some (.str v) => some v | _ => Option.none)
 
-def Cmd.pushUrl {α} [ToHref α] (target : α) : Cmd msg := .pushPath (ToHref.toHref target)
-def Cmd.navigate {α} [ToHref α] (target : α) : Cmd msg := .pushPath (ToHref.toHref target)
+def Cmd.pushUrl {α} [ToHref α] (target : α) : Cmd msg := .pushPath (ToHref.toUrl target)
+def Cmd.navigate {α} [ToHref α] (target : α) : Cmd msg := .pushPath (ToHref.toUrl target)
 def Cmd.replaceUrl {α} [ToHref α] (target : α) : Cmd msg := .fx "history.replace" (ToHref.toHref target) "" ""
 def Cmd.back    : Cmd msg := .fx "history.back" "" "" ""
 def Cmd.forward : Cmd msg := .fx "history.forward" "" "" ""

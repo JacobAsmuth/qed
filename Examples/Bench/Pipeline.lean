@@ -3,7 +3,7 @@ open Qed
 
 namespace Bench
 
-structure Row where
+schema Row where
   id    : Nat
   label : String
   n     : Nat
@@ -23,7 +23,7 @@ def rowBody (r : Row) : Html Unit :=
   </div>
 
 def rowView     (r : Row) : Html Unit := <li key={toString r.id} class="row">{rowBody r}</li>
-def rowViewLazy (r : Row) : Html Unit := <li key={toString r.id} class="row">{lazy s!"{r.id}-{r.n}" (rowBody r)}</li>
+def rowViewLazy (r : Row) : Html Unit := <li key={toString r.id} class="row">{lazy rowBody r}</li>
 
 def view     (rows : Array Row) : Html Unit := <ul class="list">{rows.map rowView}</ul>
 def viewLazy (rows : Array Row) : Html Unit := <ul class="list">{rows.map rowViewLazy}</ul>
@@ -31,7 +31,6 @@ def viewLazy (rows : Array Row) : Html Unit := <ul class="list">{rows.map rowVie
 mutual
   def treeNodes : Html msg → Nat
     | .text _         => 1
-    | .lazy _ s       => 1 + treeNodes s
     | .element _ _ cs => 1 + listNodes cs
   def listNodes : List (Html msg) → Nat
     | []      => 0
@@ -42,8 +41,6 @@ mutual
   def patchNodes : Patch msg → Nat
     | .replace _            => 1
     | .setText _            => 1
-    | .lazyReuse _ _        => 1
-    | .lazyPatch _ p        => 1 + patchNodes p
     | .patchElement _ steps => 1 + stepNodes steps
   def stepNodes : List (KeyedStep msg) → Nat
     | []                 => 0

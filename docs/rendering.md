@@ -2,8 +2,10 @@
 
 `diff_apply` proves that applying a diff to a pure `Html` tree produces the new tree.
 `applyValues_render` covers stable template structure, and `patch_render` covers the
-general template update. These theorems do not model browser node identity or execute
-the imperative driver.
+general template update. `Qed/Proofs/DomEquiv.lean` extends these pure theorems to the total
+monad-polymorphic `MonadDom` driver (`Qed/Driver/`), proving functional refinement over a pure
+W3C DOM arena (`SpecDom`) for `buildDomM`, W3C `insertBefore` keyed reconciliation, text-run
+hydration, `V.memo` skipping, fine-grained `.dyn` patching, and `App.ssr_rehydrate_equiv`.
 
 The HTML string renderer keeps structural `renderNode`/`renderChildren` definitions for proofs.
 Two `@[csimp]` theorems substitute an equivalent accumulator renderer during compilation,
@@ -27,9 +29,10 @@ The browser implementation needs additional rules:
 - Ordinary keyed reconciliation uses `validatedKeyIndex` to check and index siblings in
   one traversal, reusing the old list's index. Missing or duplicate keys use positional
   reconciliation, avoiding reuse of one node twice.
-- Fine-grained lists reject duplicate reconciliation keys on build, update, and hydration
-  before seeding signals or moving rows. These lists cannot use positional fallback
-  because their signals are addressed by key.
+- Fine-grained `V.forEach` lists deterministically disambiguate duplicate keys via
+  `disambiguateKeys` (kernel-proved collision-free by `forEach_disambiguated_keys_nodup`) on
+  build, update, and hydration, eliminating runtime duplicate-key exceptions while keeping
+  keyed signal addressing unique.
 - Rows containing helper views, conditionals, nested lists, or dynamic attribute handlers
   use ordinary keyed reconciliation. Equal serialized HTML does not imply equal props or
   event behavior. Rows handled entirely by signals retain their direct update path.
@@ -40,9 +43,10 @@ The browser implementation needs additional rules:
 - Full attribute updates remove obsolete attributes and event slots, and reset removed
   controlled `value` and `checked` properties. Bound attributes that change names use
   the same reconciliation; fixed-name value bindings retain their direct update path.
-- `Html.lazy` remains a trusted escape hatch: equal memo keys must imply equal content,
-  including handler behavior. Its browser skip is not justified by `diff_apply`, whose
-  pure `lazyReuse` case simply returns the supplied new subtree.
+- Subtree memoization uses `SoundMemo` (`Qed.lazy` / `V.memo` backed by `LawfulKey`), where
+  injective key serialization guarantees `keyOf s = keyOf s' → eval s = eval s'`. Both pure
+  `applyValues_render` and imperative `patchViewM_memo_hit` prove that skipping DOM updates on
+  equal keys is observationally exact.
 
 Run the browser differential check with:
 
@@ -58,7 +62,8 @@ are compared with `View.render` followed by `Html.render`.
 Snapshots include tree structure, namespaces, attributes, and input properties. Internal
 handler IDs and signal markers are excluded from structural comparison; active click slots
 are checked separately against the expected messages. Dedicated assertions cover surviving
-keyed-node identity, valid memo reuse, and duplicate-key rejection in template lifecycle paths.
+keyed-node identity, `V.memo` identity preservation, and crash-free duplicate-key
+disambiguation in template lifecycle paths.
 
 The fixtures cover additions, removals, reorders, duplicate keys, root/tag changes, attribute
 and handler removal, controlled inputs, SVG attributes, signals, and conditional templates.

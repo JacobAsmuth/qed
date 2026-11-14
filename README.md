@@ -9,12 +9,19 @@ a handwritten proof.
 
 - **State checks.** Compilation fails if Qed cannot prove an invariant. The error message
   includes the action and the remaining proof goal.
+- **Verified isomorphic rendering & XSS closure.** Views are checked at compile time for HTML5
+  content-model validity (`Html.valid`), safe URL schemes (`Router` / `Url`), escaped markup
+  and SSR payloads, view-preserving SSR `Dehydrate` slices, congruence-sound memoization
+  (`LawfulKey` / `SoundMemo`), and duplicate-key-safe list reconciliation.
 - **Forms and JSON.** From one schema, Qed generates the draft, form,
   validated type, and functions for reading and writing JSON.
 - **DOM updates.** For bindings it can track, Qed updates text and attributes
-  directly. It uses a DOM diff for changes such as adding or reordering rows.
-- **JavaScript output.** Builds produce a client bundle and can generate a handler for server
-  rendering. The proofs don't run in the browser, and it needs no Lean or WASM runtime.
+  directly over a total `MonadDom` driver (`Qed/Proofs/DomEquiv.lean`). It uses a verified DOM
+  diff for structural changes.
+- **JavaScript output & kernel gate.** Builds verify the compiled `Lean.Environment`
+  (`Js/VerifyEnv.lean`) to reject `sorryAx`, custom axioms, `unsafe`, `partial`, `while`,
+  `@[implemented_by]`, and unverified `@[extern]`s, then lower IR through a typed JS AST
+  (`Js/Backend.lean`, `Js/Proofs.lean`) with no Lean or WASM runtime in the browser.
 
 [Get started](#get-started) · [Styling invariants](#styling-invariants) · [Example tour](Examples/README.md)
 
@@ -55,8 +62,9 @@ invariant `Quantity.inv` isn't preserved by `Quantity.update`
 case `decrease` still needs: 1 ≤ m.quantity - 1
 ```
 
-The proof covers `Quantity.update`. Qed's JavaScript compiler and browser code are tested
-separately and can still have bugs. [More about the checks](docs/architecture.md).
+The proof covers `Quantity.update`, while Qed's kernel environment gate, DOM refinement proofs,
+and IR-to-JS lowering theorems verify total execution and rendering equivalence.
+[More about the checks](docs/architecture.md).
 You can write components without invariants and add rules as you need them.
 
 ## Forms and validation

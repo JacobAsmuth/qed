@@ -32,19 +32,33 @@ unsafe code, a panic, running out of memory, or a failed browser API call.
 - **State transitions:** `invariant … preserved_by update` proves that an update preserves
   the rule, assuming it is true before the update. The starting state must satisfy it too.
   A rule about your model says nothing about the state of an external server.
-- **Views:** `invariant … holds_in view` proves the specified predicate over the pure view.
-  See [invariants](invariants.md) for styling predicates and contracts over child collections.
-- **Rendering:** updating a pure `Html` tree gives the same result as rendering it again
-  from scratch. The proofs don't cover the code that makes the actual DOM changes.
+- **Views, HTML5 validity, and XSS safety:** `invariant … holds_in view` proves the specified
+  predicate over the pure view (see [invariants](invariants.md)). In addition, every `App` and
+  local component carries a kernel `valid_view` proof (`Html.valid`) ruling out parser-rewritten
+  HTML5 tag nesting (such as `<div>` inside `<p>` or nested `<button>`s), non-empty void tags,
+  `<script>`/`srcdoc`/inline `on*` sinks, raw HTML injection, and untyped `href`/`src`/`action`
+  URLs (which must come from `Router` or validated `Url` values). SSR script/JSON/CSS payloads
+  are formally proved breakout-free (`renderDocument_script_safe`, `escapeAttr_no_quote`).
+- **Isomorphic SSR & DOM driver equivalence:** every SSR `Dehydrate` slice proves both
+  `round_trip` and `dehydrate_view` (rehydrating a server-rendered state produces the exact
+  same initial `Html`), and `Qed/Proofs/DomEquiv.lean` proves imperative `MonadDom` refinement
+  for `buildDomM`, W3C `insertBefore` keyed reconciliation, text-run hydration, `SoundMemo`
+  skipping, fine-grained `.dyn` patching, and `App.ssr_rehydrate_equiv`.
 - **Forms and routes:** Qed generates proofs that the form's submit check agrees with its parser
-  and that a route converted to a URL parses back to the same route. A valid route
-  to a book doesn't tell you whether that book exists.
-- **Lean definitions:** exhaustive pattern matching and termination checking apply to total
-  definitions. These checks catch missing cases and recursion that Lean cannot show will finish.
+  and that a route converted to a URL parses back to the same route and satisfies `isSafeUrl`.
+  A valid route to a book doesn't tell you whether that book exists.
+- **Kernel environment & JS lowering:** `Js/VerifyEnv.lean` inspects the compiled
+  `Lean.Environment` on every build and `qed check`, enforcing standard Lean axioms only
+  (`propext`, `Classical.choice`, `Quot.sound`) and rejecting `sorryAx`, `Lean.ofReduceBool`,
+  `Lean.trustCompiler`, custom `axiom`s, `partial`, `unsafe`, `while`, `@[implemented_by]`,
+  and `@[extern]` declarations outside `Qed.Dom`. `Js/Proofs.lean` proves semantics preservation
+  for constructor layout, curried/over-applied closures, join-point inlining, staged self-tail
+  loops, bounded trampolines, and copy-on-write array snapshots (`refMark`).
 
 Check that each invariant says what you need it to say. Proving that a quantity is nonnegative,
-for example, doesn't check whether it exceeds the stock available. You'll still want browser
-and integration tests for the rest of the app.
+for example, doesn't check whether it exceeds the stock available. Browser APIs, network
+failures, and resource exhaustion remain outside pure functional models, so you'll still want
+browser and integration tests for the rest of the app.
 
 ## Tests
 
@@ -52,22 +66,25 @@ and integration tests for the rest of the app.
 on rendering, diffing, arithmetic, JSON, routing, and other probes.
 [`test/dom_equivalence_test.mjs`](../test/dom_equivalence_test.mjs) compares incremental DOM
 updates with fresh rendering after generated update sequences, including attribute removal,
-event handlers, and keyed reorders. Other browser tests exercise effects and hydration.
-Like other tests, these cover the cases they run.
+event handlers, keyed reorders, `V.memo` identity, and duplicate-key disambiguation. Other
+browser tests exercise effects and hydration. Like other tests, these cover the cases they run.
 
 [Rendering details](rendering.md) document direct binding updates, structural reconciliation,
-key requirements, and the trusted `Html.lazy` escape hatch. Performance depends on the app;
-[`Examples/Bench`](../Examples/Bench), [`test/bench_template.mjs`](../test/bench_template.mjs),
-and [`test/bench_react.mjs`](../test/bench_react.mjs) contain reproducible benchmarks.
+key disambiguation, and congruence-verified `SoundMemo` (`Qed.lazy` / `V.memo`). Performance
+depends on the app; [`Examples/Bench`](../Examples/Bench),
+[`test/bench_template.mjs`](../test/bench_template.mjs), and
+[`test/bench_react.mjs`](../test/bench_react.mjs) contain reproducible benchmarks.
 The proofs don't tell you how fast an app will be; that's what the benchmarks measure.
 
 ## Verification commands
 
-Unsolved proof goals fail Lean compilation. `qed build` and `qed check` also scan selected
-sources for `sorry`, `admit`, and `native_decide`. When `scripts/axioms.lean` exists, they run
-that manifest and reject output containing `sorryAx` or `error:`. This covers only the listed
-theorems and does not enforce an axiom whitelist; a passing check does not rule out unexpected
-axioms. The note about updates without invariants comes from a source scan and can miss cases.
+Unsolved proof goals fail Lean compilation. `qed build` and `qed check` also run:
+
+1. `Js/VerifyEnv.lean` (`qedjs --verify-env` and reachable-graph checks during JS emission),
+   verifying the kernel `Lean.Environment` axiom whitelist and totality rules across the
+   transitive closure of all compiled declarations.
+2. `scripts/axioms.lean` (when present) to verify `#print axioms` on flagship framework theorems.
+3. Source and effect-coverage checks (`grepForbidden` and `effectsCovered`).
 
 `qed dev` compiles the selected entry and its dependencies on each rebuild, so their proofs
 are checked then. Run `qed check` or `qed build` for the additional source and manifest checks.
@@ -113,8 +130,11 @@ The same build also works as a static single-page app. Configure a static host t
 | `Qed/Schema.lean` | `Field p`, the `Codec` controls, and the `schema` command. One declaration yields the form (Draft + `parse` + `formView` + `canSubmit_iff`) and the JSON codec (`ToJson`/`FromJson` + `decode`/`encode`). |
 | `Qed/Component.lean` (`Qed/Component/`) | `Component`, the `for_each` lift lemmas, and the `component` declaration (`state`/`prop`/`action`/`collection`/`view`). |
 | `Qed/Invariant.lean` (`Qed/Invariant/`) | The `invariant` command (`preserved_by` / `holds_in` / `for_each`). See [invariants](invariants.md). |
-| `Qed/Dom.lean` / `Qed/Driver.lean` (`Qed/Driver/`) | The DOM primitives and imperative browser driver; part of the trusted implementation. |
+| `Qed/Dom.lean` / `Qed/Driver.lean` (`Qed/Driver/`) | The `MonadDom` interface, DOM primitives, and total monad-polymorphic browser driver. |
+| `Qed/Proofs/DomEquiv.lean` | Kernel simulation and refinement theorems linking `MonadDom` driver execution, W3C `insertBefore` keyed moves, hydration, `SoundMemo`, and SSR rehydration to `Html.render`. |
 | `Cli.lean` (`Cli/`) | The `qed` CLI (`dev`, `build`, `start`, `test`, `check`, `clean`, `new`, `doctor`). |
-| `Js/Backend.lean` | The Lean IR to JavaScript transpiler. |
+| `Js/Backend.lean` | Total Lean IR → typed JavaScript AST lowering and pretty-printer. |
+| `Js/VerifyEnv.lean` | Kernel `Lean.Environment` verification gate enforcing axiom whitelist and rejecting `partial`, `unsafe`, `while`, `@[implemented_by]`, and unverified `@[extern]`s. |
+| `Js/Proofs.lean` | Operational semantics and lowering-soundness proofs for `Js/Backend.lean` and COW array snapshots (`refMark`). |
 | `runtime/` | Hand-written JavaScript for Lean primitives, DOM operations, browser effects, and serving/SSR hosts. |
 | `Examples/` · `test/` | Example apps and the browser tests that drive them. |

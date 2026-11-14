@@ -22,7 +22,7 @@ def tree (seed : Nat) : Html Nat :=
   if seed % 13 == 12 then .text s!"text root {seed}"
   else .element "section" [] [
     .element "article" [] ((ids seed).map (row seed)),
-    .lazy (toString (seed / 3)) (.element "aside" [] [.text s!"memo {seed / 3}"]),
+    Qed.lazy (fun k : Nat => .element "aside" [] [.text s!"memo {k}"]) (seed / 3),
     .element "svg" [] [.element "use"
       (if seed % 2 == 0 then [.attr "xlink:href" "#icon"] else []) []]]
 
@@ -73,20 +73,19 @@ def structuredRows : View Nat Nat :=
 
 def template : View Nat Nat :=
   .element "section" [] [structuredRows,
+    V.memo (fun k : Nat => .element "aside" [.cls "vmemo"] [.text s!"vmemo {k}"]) (fun seed => seed / 3),
     V.forEach "aside" (fun seed => ((ids seed).eraseDups).toArray.map (fun id => (id, seed)))
       (fun r => toString r.1)
       (.element "p" [.dynVal "title" (fun r => s!"signal {r.2}")]
         [.dyn (fun r => s!"{r.1}:{r.2}")])]
 
 initialize templateState : IO.Ref (Option (VState Nat Nat)) ← IO.mkRef none
-initialize cells : CondCells Nat Nat ← IO.mkRef (#[], #[])
 
 def mountTemplate (seed : Nat) : IO Dom.Node := do
   let h ← handlers
   liveHandlers.set (some h)
-  cells.set (#[], #[])
   let parent ← Dom.createElement "" "main"
-  let (node, state) ← buildView h cells "" template seed
+  let (node, state) ← buildView h "" template seed
   Dom.appendChild parent node
   parentRef.set parent
   templateState.set (some state)
@@ -95,7 +94,8 @@ def mountTemplate (seed : Nat) : IO Dom.Node := do
 def advanceTemplate (seed : Nat) : IO Unit := do
   if let some h ← liveHandlers.get then
     if let some st ← templateState.get then
-      patchView h cells (← parentRef.get) 0 template seed st
+      let st' ← patchView h (← parentRef.get) 0 template seed st
+      templateState.set (some st')
 
 def expectedTemplate (seed : Nat) : String := Html.render (View.render template seed)
 
@@ -103,17 +103,27 @@ def duplicateTemplate : View Nat Nat :=
   V.forEach "div" (fun seed => if seed == 0 then #[0, 1] else #[1, 1])
     toString (.dyn toString)
 
+def expectedDuplicate (seed : Nat) : String := Html.render (View.render duplicateTemplate seed)
+
 def duplicateBuild : IO Dom.Node := do
-  return (← buildView (← handlers) cells "" duplicateTemplate 1).1
+  return (← buildView (← handlers) "" duplicateTemplate 1).1
 
-def duplicateUpdate : IO Unit := do
+def duplicateUpdate : IO Dom.Node := do
   let h ← handlers
-  let (node, state) ← buildView h cells "" duplicateTemplate 0
-  patchView h cells node 0 duplicateTemplate 1 state
+  let parent ← Dom.createElement "" "main"
+  let (node, state) ← buildView h "" duplicateTemplate 0
+  Dom.appendChild parent node
+  let _ ← patchView h parent 0 duplicateTemplate 1 state
+  return (← Dom.childAt parent 0)
 
-def duplicateHydrate : IO Unit := do
+def duplicateHydrate : IO Dom.Node := do
   let h ← handlers
-  let (node, _) ← buildView h cells "" duplicateTemplate 0
-  discard <| hydrateView h cells duplicateTemplate 1 node
+  let parent ← Dom.createElement "" "main"
+  let node ← buildDom h "" (View.render duplicateTemplate 1)
+  Dom.appendChild parent node
+  let st ← hydrateView h duplicateTemplate 1 node
+  let st' ← patchView h parent 0 duplicateTemplate 0 st
+  let _ ← patchView h parent 0 duplicateTemplate 1 st'
+  return (← Dom.childAt parent 0)
 
 end DomProbe

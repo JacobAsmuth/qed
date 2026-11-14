@@ -79,13 +79,11 @@ def ssrEdgeCases : Html Unit :=
   <div>
     <style>{".a > .b { content: \"</style>\"; }"}</style>
     <br/>
-    <div {Attr.rawHtml "<em>raw</em>"}/>
     {defaults}
   </div>
 #guard (Html.renderWith Counter.regs ssrEdgeCases).contains ".a > .b"
 #guard (Html.renderWith Counter.regs ssrEdgeCases).contains "<\\/style>"
 #guard !(Html.renderWith Counter.regs ssrEdgeCases).contains "</br>"
-#guard (Html.renderWith Counter.regs ssrEdgeCases).contains "<em>raw</em>"
 #guard (Html.renderWith Counter.regs ssrEdgeCases).contains "8</button>"
 
 example : ToJson Counter.Props := Counter.Props.instToJson
@@ -307,5 +305,89 @@ def sliceApp : App SliceModel Nat :=
   == some { a := 7, b := "yo", ephemeral := 99 }
 
 invariant (m) on sliceApp : 1 ≤ m.a
+
+-- ── Compile-time rejection checks (#guard_msgs) ─────────────────────────
+
+/-- error: failed to synthesize instance of type class
+  ToHref String
+
+Hint: Type class instance resolution failures can be inspected with the `set_option trace.Meta.synthInstance true` command. -/
+#guard_msgs in
+def badRawHref : Html Unit := <a href="/raw">bad</a>
+
+/-- error: unsafe URL literal `javascript:alert(1)`: URLs must be root-relative (`/path`, not `//`), `#fragment`, `?query`, or explicit `https://`, `http://`, `mailto:`, `tel:` with no whitespace or control characters -/
+#guard_msgs in
+def badJsUrl : Url := url% "javascript:alert(1)"
+
+/-- error: unsafe URL literal `data:text/html,<script>alert(1)</script>`: URLs must be root-relative (`/path`, not `//`), `#fragment`, `?query`, or explicit `https://`, `http://`, `mailto:`, `tel:` with no whitespace or control characters -/
+#guard_msgs in
+def badDataUrl : Url := url% "data:text/html,<script>alert(1)</script>"
+
+/-- error: unsafe URL literal `//evil.example/x`: URLs must be root-relative (`/path`, not `//`), `#fragment`, `?query`, or explicit `https://`, `http://`, `mailto:`, `tel:` with no whitespace or control characters -/
+#guard_msgs in
+def badProtocolRelativeUrl : Url := url% "//evil.example/x"
+
+/-- error: <script> is forbidden in Qed views (untrusted script/plugin execution sink) -/
+#guard_msgs in
+def badScriptTag : Html Unit := <script>{"alert(1)"}</script>
+
+/-- error: inline event attribute `onclick` is forbidden; use Qed's typed event handlers (`onClick`, `onInput`, `on "click" …`, …) -/
+#guard_msgs in
+def badInlineHandler : Html Unit := <div onclick="alert(1)"/>
+
+/-- error: `srcdoc` is forbidden in Qed views (iframe raw-HTML execution sink) -/
+#guard_msgs in
+def badSrcdoc : Html Unit := <iframe srcdoc="<script>alert(1)</script>"/>
+
+/-- error: invalid HTML5 nesting: <div> is not allowed inside <p> (browsers rewrite this tree during HTML parsing, causing hydration mismatch) -/
+#guard_msgs in
+def badNestedParagraph : Html Unit := <p><div>bad</div></p>
+
+/-- error: invalid HTML5 nesting: <button> is not allowed inside <button> (browsers rewrite this tree during HTML parsing, causing hydration mismatch) -/
+#guard_msgs in
+def badNestedInteractive : Html Unit := <button><button>bad</button></button>
+
+/-- error: invalid HTML5 nesting: <span> is not allowed inside <ul> (browsers rewrite this tree during HTML parsing, causing hydration mismatch) -/
+#guard_msgs in
+def badListChild : Html Unit := <ul><span>bad</span></ul>
+
+def goodSafeUrl : Url := url% "/docs/guide"
+def goodLazyView : View Nat Unit :=
+  view% fun m => <div><a href={goodSafeUrl}>Docs</a>{Qed.lazy (fun (k : Nat) => <span>{k}</span>) (m / 2)}</div>
+#guard (Html.render (goodLazyView 7)).contains "href=\"/docs/guide\""
+#guard (Html.render (goodLazyView 7)).contains "<span>3</span>"
+
+def sneakyBlock : Html Unit := <div>bad</div>
+
+/-- error: could not synthesize default value for parameter 'valid_view' using tactics
+---
+error: HTML5 / XSS validity check (`Html.valid`) failed for this view.
+  • unsolved HTML5 / attribute validity obligation: False
+
+Common causes:
+• Invalid HTML5 tag nesting (e.g. `<div>` inside `<p>`, `<button>` inside `<button>`/`<a>`, non-`<li>` inside `<ul>`/`<ol>`, non-`<tr>` inside `<tbody>`, non-`<option>` inside `<select>`)
+• Non-empty children on a void element (`<input>`, `<img>`, `<br>`, …) or local component mount
+• Forbidden tag (`<script>`, `<base>`, `<applet>`, `<object>`, `<embed>`) or raw `on*`/`srcdoc` attribute
+• Dynamic URL-bearing attribute (`href`, `src`, `action`, …) not routed through `Router` or `Url`
+• Unescaped dynamic text inside `<style>` (wrap with `escapeRawText` or `theme`/`styleSheet`) -/
+#guard_msgs in
+def badOpaqueNestingApp : App Unit Unit :=
+  ui () (fun m _ => m) fun u => <p>{sneakyBlock}</p>
+
+/-- error: Qed.lazy function must not capture model variable `m` directly; pass all model dependencies through the `[LawfulKey]` argument so memoization stays sound -/
+#guard_msgs in
+def badLazyCapturesModel : View Nat Unit :=
+  view% fun m => <div>{Qed.lazy (fun (k : Nat) => <span>{k + m}</span>) (m / 2)}</div>
+
+/-- error: could not synthesize default value for parameter 'hview' using tactics
+---
+error: SSR `dehydrate` slice does not preserve the rendered view: rehydrating a model can render different HTML on the client than SSR rendered on the server.
+  • view mismatch after rehydration: "hi" = _qed_m.b
+
+Include every model field read by the view in `(dehydrate := […])`, use `(dehydrate := Dehydrate.full)`, or supply a proof to `App.withDehydrate`. -/
+#guard_msgs in
+def badIncompleteDehydrate : App SliceModel Nat :=
+  ui sliceInit (fun m d => { m with a := m.a + d }) (dehydrate := [a]) fun m =>
+    <div>{m.a}{m.b}</div>
 
 end SyntaxChecks

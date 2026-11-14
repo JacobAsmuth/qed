@@ -85,7 +85,6 @@ export const dom = {
   pushPath(p, w) { history.pushState({}, '', p); return ok(PUnit, w); },
   appendChild(parent, child, w) { const N = Q().nodes, p = N[parent], c = N[child]; if (p && c) { const isFrag = c.nodeType === 11 || c.localName === '#fragment'; p.appendChild(c); if (isFrag) dropNode(c); } return ok(PUnit, w); },
   setText(node, s, w) { const el = Q().nodes[node]; if (el && el.textContent !== s) el.textContent = s; return ok(PUnit, w); },
-  setInnerHtml(node, html, w) { const el = Q().nodes[node]; if (el && el.innerHTML !== html) el.innerHTML = html; return ok(PUnit, w); },
   childAt(parent, index, w) { const p = Q().nodes[parent]; return ok(nodeId(p ? p.childNodes[index] : null), w); },
   childCount(parent, w) { const p = Q().nodes[parent]; return ok(p ? p.childNodes.length : 0, w); },
   appRoot(w) { const root = document.getElementById('app'); return ok(nodeId(root ? root.firstElementChild : null), w); },

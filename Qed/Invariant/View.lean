@@ -46,13 +46,14 @@ macro_rules
          Qed.View.render, Qed.View.renderEach, Qed.View.mapScope, Qed.View.mapScopeEach,
          Qed.VAttr.eval, Qed.VAttr.mapScope, Qed.View.showIf, Qed.View.ofHtml,
          Qed.V.el, Qed.V.text, Qed.V.dyn, Qed.V.ifElse, Qed.V.showIf, Qed.V.static, Qed.V.dynNode,
+         Qed.V.memo, Qed.V.forEach, Qed.View.memo,
          Qed.text, Qed.lazy, Qed.el, Qed.link, Qed.linkTo, Qed.styleSheet, Qed.theme,
-          Qed.Attr.empty, Qed.Html.ofOption, Qed.toString_string,
-         Qed.cls, Qed.attr, Qed.role, Qed.rawHtml, Qed.on,
+         Qed.Attr.empty, Qed.Html.ofOption, Qed.toString_string,
+         Qed.cls, Qed.attr, Qed.role, Qed.on,
          Qed.onValue, Qed.onClick, Qed.onInput, Qed.onChange, Qed.onCheck, Qed.onKeydown,
          Qed.onKeyup, Qed.onSubmit, Qed.onBlur, Qed.onFocus, Qed.onDoubleClick, Qed.onMouseDown,
          Qed.onMouseUp, Qed.key, Qed.value, Qed.placeholder, Qed.name, Qed.href, Qed.ToHref.toHref,
-         Qed.src, Qed.alt, Qed.title, Qed.style, Qed.type', Qed.disabled, Qed.required,
+         Qed.src, Qed.action, Qed.alt, Qed.title, Qed.style, Qed.type', Qed.disabled, Qed.required,
          Qed.checked, Qed.readOnly];
        repeat' split;
        all_goals (first

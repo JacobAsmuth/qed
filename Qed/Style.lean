@@ -180,7 +180,7 @@ def renderTheme (tokens : List Item) : String :=
   String.intercalate "\n" (root ++ resets)
 
 @[inline] def theme (tokens : List Item) : Html msg :=
-  el "style" [] [Html.text (renderTheme tokens)]
+  el "style" [] [Html.text (escapeRawText (renderTheme tokens))]
 
 def renderStyleSheet (styles : List Style) : String :=
   let seen := (styles.foldl
@@ -188,6 +188,6 @@ def renderStyleSheet (styles : List Style) : String :=
   String.intercalate "\n" (seen.map Style.rule)
 
 @[inline] def styleSheet (styles : List Style) : Html msg :=
-  el "style" [] [Html.text (renderStyleSheet styles)]
+  el "style" [] [Html.text (escapeRawText (renderStyleSheet styles))]
 
 end Qed

@@ -3,22 +3,31 @@ import Qed.Json.Basic
 
 namespace Qed
 
-partial def renderWithLocals {m : Type} (locals : List LocalDef) : Html m → String
-  | .text s => escapeHtml s
-  | .lazy _ sub => renderWithLocals locals sub
-  | .element tag attrs children =>
-      let local? := attrs.findSome? (fun | .localCell _ comp init p _ => some (comp, init, p) | _ => none)
-      match local? with
-      | some (comp, init?, p) =>
-          let attrStr := (renderAttrs #[] (normalizeAttrs attrs)).1
-          let childStr := match locals.find? (fun d : LocalDef => d.id == comp) with
-            | some ldef => renderWithLocals locals (((ldef.viewProps.map (fun (f : String → String → Html LocalMsg) => f p)).getD ldef.view) (init?.getD ldef.init))
-            | none      => ""
-          s!"<{tag}{attrStr}>{childStr}</{tag}>"
-      | none =>
-          (renderElement (fun hs => (children.foldl (fun acc c => acc ++ renderWithLocals locals c) "", hs)) #[] tag attrs children).1
+mutual
+  def renderWithLocals {m : Type} (locals : List LocalDef) : Nat → Html m → String
+    | 0, _ => ""
+    | _ + 1, .text s => escapeHtml s
+    | fuel + 1, .element tag attrs children =>
+        let local? := attrs.findSome? (fun | .localCell _ comp init p _ => some (comp, init, p) | _ => none)
+        match local? with
+        | some (comp, init?, p) =>
+            let attrStr := (renderAttrs #[] (normalizeAttrs attrs)).1
+            let childStr := match locals.find? (fun d : LocalDef => d.id == comp) with
+              | some ldef =>
+                  renderWithLocals locals fuel (ldef.viewForProps p (init?.getD ldef.init))
+              | none => ""
+            s!"<{tag}{attrStr}>{childStr}</{tag}>"
+        | none =>
+            (renderElement (fun hs => (renderWithLocalsChildren locals fuel "" children, hs)) #[] tag attrs children).1
 
-def Html.renderWith (locals : List LocalDef) (h : Html msg) : String := renderWithLocals locals h
+  def renderWithLocalsChildren {m : Type} (locals : List LocalDef) (fuel : Nat) (acc : String) :
+      List (Html m) → String
+    | []      => acc
+    | c :: cs => renderWithLocalsChildren locals fuel (acc ++ renderWithLocals locals fuel c) cs
+end
+
+def Html.renderWith (locals : List LocalDef) (h : Html msg) (fuel : Nat := 64) : String :=
+  renderWithLocals locals fuel h
 
 def App.renderModel (app : App Model Msg) (m : Model) : String :=
   Html.renderWith app.locals (app.view m)
@@ -26,18 +35,34 @@ def App.renderModel (app : App Model Msg) (m : Model) : String :=
 def App.renderInitial (app : App Model Msg) : String :=
   app.renderModel app.init.1
 
+def safeScriptSrc (script : String) : String :=
+  if isSafeUrl script then escapeHtml script else "/qed.js"
+
+/-- The `src="..."` payload emitted for `<script type="module">` is unconditionally free of
+    `<`, `>`, `"`, and `'`, and only accepts `isSafeUrl` targets (defaulting to `"/qed.js"`). -/
+theorem safeScriptSrc_no_markup_or_quote (script : String) :
+    ∀ c ∈ (safeScriptSrc script).toList, isMarkupOrQuote c = false := by
+  unfold safeScriptSrc
+  by_cases h : isSafeUrl script = true
+  · simpa [h] using escapeHtml_no_markup_or_quote script
+  · simp only [h, Bool.false_eq_true, ↓reduceIte]
+    have hconst : ("/qed.js".toList.all (!isMarkupOrQuote ·)) = true := by decide
+    rw [List.all_eq_true] at hconst
+    intro c hc
+    simpa using hconst c hc
+
 def renderDocument (title : String) (appHtml : String) (script : String := "/qed.js")
     (state : String := "") (css : String := "") : String :=
   -- Escape `</` → `<\/` (valid JSON/CSS) so embedded payloads cannot close `<script>`/`<style>` early.
   let styleTag := if css.isEmpty || appHtml.contains css then ""
-                  else "<style id=\"qed-styles\">" ++ "<\\/".intercalate (css.splitOn "</") ++ "</style>"
+                  else "<style id=\"qed-styles\">" ++ escapeRawText css ++ "</style>"
   "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
     ++ "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
     ++ "<title>" ++ escapeHtml title ++ "</title>" ++ styleTag ++ "</head>\n"
     ++ "<body><div id=\"app\">" ++ appHtml ++ "</div>\n"
     ++ (if state.isEmpty then ""
-        else "<script id=\"qed-state\" type=\"application/json\">" ++ "<\\/".intercalate (state.splitOn "</") ++ "</script>\n")
-    ++ "<script type=\"module\" src=\"" ++ script ++ "\"></script>\n</body>\n</html>"
+        else "<script id=\"qed-state\" type=\"application/json\">" ++ escapeRawText state ++ "</script>\n")
+    ++ "<script type=\"module\" src=\"" ++ safeScriptSrc script ++ "\"></script>\n</body>\n</html>"
 
 private def ssrDrain (app : App Model Msg) (results : Array (Bool × String)) :
     Model → List (Cmd Msg) → Nat → Array (String × String × String) →

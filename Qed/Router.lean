@@ -1,5 +1,6 @@
 import Std.Data.String.ToNat
 import Std.Data.String.ToInt
+import Qed.Html
 import Qed.Json
 
 namespace Qed
@@ -36,23 +37,111 @@ instance [Router R] : LawfulJson R where
     change (Router.parse (Router.print r)).elim _ _ = _
     rw [Router.round_trip]; rfl
 
+class LawfulKey (α : Type) where
+  toKey     : α → String
+  injective : ∀ a₁ a₂ : α, toKey a₁ = toKey a₂ → a₁ = a₂
+
+instance : LawfulKey String where
+  toKey := id
+  injective _ _ h := h
+
+instance : LawfulKey Nat where
+  toKey := Nat.repr
+  injective a₁ a₂ h := by
+    have := congrArg String.toNat? h
+    simpa [Nat.toNat?_repr] using this
+
+instance : LawfulKey Int where
+  toKey := Int.repr
+  injective a₁ a₂ h := by
+    have := congrArg String.toInt? h
+    simpa [Int.toInt?_repr] using this
+
+instance : LawfulKey Bool where
+  toKey | true => "1" | false => "0"
+  injective a₁ a₂ h := by cases a₁ <;> cases a₂ <;> simp_all
+
+instance (priority := low) {α : Type} [LawfulJson α] : LawfulKey α where
+  toKey a := Json.render (toJson a)
+  injective a₁ a₂ h := by
+    have h₁ := LawfulJson.parse_render_toJson a₁ (maxDepth := LawfulJson.depthBound α) (Nat.le_refl _)
+    have h₂ := LawfulJson.parse_render_toJson a₂ (maxDepth := LawfulJson.depthBound α) (Nat.le_refl _)
+    rw [h] at h₁
+    rw [h₁] at h₂
+    exact Except.ok.inj h₂
+
 private def hexDigit (n : UInt8) : Char :=
-  let d := n.toNat
-  Char.ofNat (if d < 10 then 48 + d else 55 + d)
+  match n.toNat % 16 with
+  | 0 => '0' | 1 => '1' | 2 => '2' | 3 => '3' | 4 => '4'
+  | 5 => '5' | 6 => '6' | 7 => '7' | 8 => '8' | 9 => '9'
+  | 10 => 'A' | 11 => 'B' | 12 => 'C' | 13 => 'D' | 14 => 'E'
+  | _ => 'F'
 
 private def isUnreserved (b : UInt8) : Bool :=
   let c := b.toNat
   (48 ≤ c && c ≤ 57) || (65 ≤ c && c ≤ 90) || (97 ≤ c && c ≤ 122)
     || c == 45 || c == 95 || c == 46 || c == 126
 
-def encodeSeg (s : String) : String := Id.run do
-  let bs := s.toUTF8
-  let mut out := ""
-  for i in [0:bs.size] do
-    let b := bs.get! i
-    if isUnreserved b then out := out.push (Char.ofNat b.toNat)
-    else out := ((out.push '%').push (hexDigit (b >>> 4))).push (hexDigit (b &&& 0x0F))
-  return out
+@[inline] private def isSafePathBodyChar (c : Char) : Bool :=
+  isSafeUrlChar c && c.toNat != 92
+
+private theorem isSafePathBodyChar_hexDigit (n : UInt8) :
+    isSafePathBodyChar (hexDigit n) = true := by
+  unfold hexDigit
+  split <;> rfl
+
+private theorem isSafePathBodyChar_unreserved {b : UInt8} (h : isUnreserved b = true) :
+    isSafePathBodyChar (Char.ofNat b.toNat) = true := by
+  unfold isUnreserved at h
+  have hb : b.toNat ≤ 126 ∧ b.toNat ≥ 45 ∧ b.toNat ≠ 92 := by
+    simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at h
+    omega
+  have hv : b.toNat.isValidChar := by
+    simp [Nat.isValidChar]; omega
+  have htn : (Char.ofNat b.toNat).toNat = b.toNat := by
+    simp [Char.ofNat, hv, Char.ofNatAux, Char.toNat]
+  unfold isSafePathBodyChar isSafeUrlChar
+  rw [htn]
+  simp only [Bool.and_eq_true, decide_eq_true_eq, bne_iff_ne]
+  omega
+
+private def encodeUTF8Loop (bs : ByteArray) (i : Nat) (acc : String) : String :=
+  if h : i < bs.size then
+    let b := bs[i]
+    let next := if isUnreserved b then acc.push (Char.ofNat b.toNat)
+                else ((acc.push '%').push (hexDigit (b >>> 4))).push (hexDigit (b &&& 0x0F))
+    encodeUTF8Loop bs (i + 1) next
+  else acc
+termination_by bs.size - i
+
+private theorem encodeUTF8Loop_safe (bs : ByteArray) :
+    ∀ (i : Nat) (acc : String),
+      acc.toList.all isSafePathBodyChar = true →
+      (encodeUTF8Loop bs i acc).toList.all isSafePathBodyChar = true := by
+  intro i
+  induction hfuel : bs.size - i generalizing i with
+  | zero =>
+      intro acc hacc
+      unfold encodeUTF8Loop
+      have hnot : ¬ i < bs.size := by omega
+      simp [hnot, hacc]
+  | succ k ih =>
+      intro acc hacc
+      unfold encodeUTF8Loop
+      have hlt : i < bs.size := by omega
+      simp only [hlt, ↓reduceDIte]
+      apply ih (i + 1) (by omega)
+      by_cases hu : isUnreserved bs[i]
+      · simp [hu, String.toList_push, hacc, isSafePathBodyChar_unreserved hu]
+      · have hpct : isSafePathBodyChar '%' = true := rfl
+        simp [hu, String.toList_push, hacc, hpct, isSafePathBodyChar_hexDigit]
+
+def encodeSeg (s : String) : String :=
+  encodeUTF8Loop s.toUTF8 0 ""
+
+theorem encodeSeg_safe (s : String) :
+    (encodeSeg s).toList.all isSafePathBodyChar = true :=
+  encodeUTF8Loop_safe s.toUTF8 0 "" rfl
 
 private def unhex (c : Char) : Option UInt8 :=
   let n := c.toNat
@@ -72,8 +161,68 @@ private def decodeBytes : List Char → ByteArray → ByteArray
 def decodeSeg (s : String) : String :=
   (String.fromUTF8? (decodeBytes s.toList .empty)).getD s
 
+private def joinSlash : List String → String
+  | []      => ""
+  | [s]     => s
+  | s :: ss => s ++ "/" ++ joinSlash ss
+
+private theorem joinSlash_safe :
+    ∀ (segs : List String),
+      (∀ s ∈ segs, s.toList.all isSafePathBodyChar = true) →
+      (joinSlash segs).toList.all isSafePathBodyChar = true
+  | [], _ => rfl
+  | [s], hs => hs s (by simp)
+  | s₁ :: s₂ :: rest, hs => by
+      have hslash : isSafePathBodyChar '/' = true := rfl
+      have ih := joinSlash_safe (s₂ :: rest) (fun x hx => hs x (by simp [hx]))
+      simp [joinSlash, String.toList_append, hs s₁ (by simp), hslash, ih]
+
+private theorem dropWhile_slash_safe :
+    ∀ (cs : List Char),
+      cs.all isSafePathBodyChar = true →
+      hasSafeUrlPrefix ('/' :: cs.dropWhile (· == '/')) = true ∧
+      ('/' :: cs.dropWhile (· == '/')).all isSafeUrlChar = true
+  | [], _ => ⟨rfl, rfl⟩
+  | c :: rest, hcs => by
+      simp only [List.all_cons, Bool.and_eq_true] at hcs
+      rcases hcs with ⟨hc, hrest⟩
+      by_cases hslash : (c == '/') = true
+      · simpa [List.dropWhile, hslash] using dropWhile_slash_safe rest hrest
+      · have hcf : (c == '/') = false := Bool.eq_false_iff.2 hslash
+        simp only [List.dropWhile, hcf]
+        unfold isSafePathBodyChar at hc
+        rcases Bool.and_eq_true_iff.1 hc with ⟨hcUrl, hcNot92⟩
+        have hnotBs : (c != '\\') = true := by
+          rw [bne_iff_ne]
+          intro heq; subst heq; simp at hcNot92
+        have hnotSlash : (c != '/') = true := by
+          rw [bne_iff_ne]
+          intro heq; subst heq; simp at hcf
+        have hrestUrl : rest.all isSafeUrlChar = true := by
+          rw [List.all_eq_true] at hrest ⊢
+          intro x hx
+          exact (Bool.and_eq_true_iff.1 (hrest x hx)).1
+        have hslashUrl : isSafeUrlChar '/' = true := rfl
+        exact ⟨by simp [hasSafeUrlPrefix, hnotSlash, hnotBs],
+               by simp [List.all_cons, hslashUrl, hcUrl, hrestUrl]⟩
+
 def Router.toURL {α} [Router α] (a : α) : String :=
-  "/" ++ String.intercalate "/" ((Router.print a).map encodeSeg)
+  String.ofList ('/' :: (joinSlash ((Router.print a).map encodeSeg)).toList.dropWhile (· == '/'))
+
+@[simp] theorem Router.isSafeUrl_toURL {α : Type} [Router α] (a : α) :
+    isSafeUrl (Router.toURL a) = true := by
+  unfold Router.toURL isSafeUrl
+  rw [String.toList_ofList]
+  have hbody : (joinSlash ((Router.print a).map encodeSeg)).toList.all isSafePathBodyChar = true := by
+    apply joinSlash_safe
+    intro s hs
+    rcases List.mem_map.1 hs with ⟨raw, _, rfl⟩
+    exact encodeSeg_safe raw
+  have ⟨hpfx, hall⟩ := dropWhile_slash_safe _ hbody
+  exact Bool.and_eq_true_iff.2 ⟨hpfx, hall⟩
+
+def Router.toUrl {α : Type} [Router α] (a : α) : Url :=
+  ⟨Router.toURL a, Router.isSafeUrl_toURL a⟩
 
 def stripQueryAndHash (path : String) : String :=
   (((path.splitOn "#").headD path).splitOn "?").headD ""
@@ -82,13 +231,19 @@ def Router.fromURL {α} [Router α] (path : String) : Option α :=
   Router.parse ((((stripQueryAndHash path).splitOn "/").filter (· ≠ "")).map decodeSeg)
 
 class ToHref (α : Type) where
-  toHref : α → String
-instance : ToHref String := ⟨id⟩
-instance [Router R] : ToHref R := ⟨Router.toURL⟩
+  toUrl : α → Url
 
-@[simp] theorem ToHref.toHref_string (s : String) : ToHref.toHref s = s := rfl
+def ToHref.toHref {α : Type} [ToHref α] (v : α) : String := (ToHref.toUrl v).raw
+
+instance : ToHref Url := ⟨id⟩
+instance [Router R] : ToHref R := ⟨Router.toUrl⟩
+
+@[simp] theorem ToHref.toUrl_url (u : Url) : ToHref.toUrl u = u := rfl
+@[simp] theorem ToHref.toHref_url (u : Url) : ToHref.toHref u = u.raw := rfl
 @[simp] theorem ToHref.toHref_route {R : Type} [Router R] (r : R) :
     ToHref.toHref r = Router.toURL r := rfl
+@[simp] theorem ToHref.isSafeUrl_toHref {α : Type} [ToHref α] (v : α) :
+    isSafeUrl (ToHref.toHref v) = true := (ToHref.toUrl v).safe
 
 syntax routeEnumAlt := ident (" => " str)?
 syntax (name := routeEnumCmd) "route_enum " ident " where " sepBy1IndentSemicolon(routeEnumAlt) : command

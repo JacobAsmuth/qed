@@ -15,7 +15,8 @@ let browser, srv;
 try {
   run('lake', ['build', 'Examples.DomProbe', 'qedjs']);
   const entries = ['mount', 'advance', 'fresh', 'expected', 'handlerValue',
-    'mountTemplate', 'advanceTemplate', 'expectedTemplate', 'duplicateBuild', 'duplicateUpdate', 'duplicateHydrate'];
+    'mountTemplate', 'advanceTemplate', 'expectedTemplate',
+    'expectedDuplicate', 'duplicateBuild', 'duplicateUpdate', 'duplicateHydrate'];
   run('lake', ['env', join(ROOT, '.lake/build/bin/qedjs'), join(out, 'app.mjs'),
     'Examples.DomProbe', '--', ...entries.map((n) => `DomProbe.${n}:${n}`)]);
   for (const name of ['qed_rt.mjs', 'qed_dom.mjs']) copyFileSync(join(ROOT, 'runtime', name), join(out, name));
@@ -85,15 +86,23 @@ try {
     const memo = parent.querySelector('aside');
     io(P.advance(2n));
     if (parent.querySelector('aside') !== memo) throw new Error('valid memo reuse lost identity');
+    parent = node(io(P.mountTemplate(1n)));
+    document.body.replaceChildren(parent);
+    const vmemo = parent.querySelector('.vmemo');
+    io(P.advanceTemplate(2n));
+    if (parent.querySelector('.vmemo') !== vmemo) throw new Error('V.memo lost DOM node identity when LawfulKey unchanged');
+    io(P.advanceTemplate(3n));
+    equal(parent.querySelector('.vmemo').textContent, 'vmemo 1', 'V.memo updated when LawfulKey changed');
     parent = node(io(P.mountTemplate(0n)));
     document.body.replaceChildren(parent);
     for (const s of sequence) {
       io(P.advanceTemplate(BigInt(s)));
       equal(snapshot(parent.firstChild), snapshot(parse(P.expectedTemplate(BigInt(s)))), `template vs Html.render, seed ${s}`);
     }
+    const expectedDup = snapshot(parse(P.expectedDuplicate(1n)));
     for (const name of ['duplicateBuild', 'duplicateUpdate', 'duplicateHydrate']) {
-      const r = P[name]();
-      if (r.t !== 1 || !JSON.stringify(r).includes('duplicate sibling key')) throw new Error(`${name} should reject duplicate keys`);
+      const h = io(P[name]());
+      equal(snapshot(node(h)), expectedDup, `${name} disambiguated duplicate keys without crash or DOM drift`);
     }
     return { updates: sequence.length * 2, duplicateChecks: 3 };
   });

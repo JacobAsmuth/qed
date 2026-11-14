@@ -88,7 +88,7 @@ def bookCard (b : Book) : Html Msg :=
   </div>
 
 def app : App Model Msg :=
-  ui init transition (onRoute := Msg.routed) (dehydrate := [route, catalog, current]) fun m =>
+  ui init transition (onRoute := Msg.routed) (dehydrate := [route, catalog, current, draft]) fun m =>
     <div {shell} class="app">
       {theme [ brand.set "#06c" ]}
       <nav {topnav}>

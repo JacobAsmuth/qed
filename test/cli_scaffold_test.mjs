@@ -70,7 +70,7 @@ try {
   await writeFile(appPath,
     'import Qed\nimport Child\nopen Qed\nnamespace Site\n' +
     'component Quantity where\n  state quantity : Int := 1\n' +
-    '  view => <div><style>{".a > .b { color: red; }"}</style><br/><div {Attr.rawHtml "<b>raw</b>"}/><Badge key="b"/><span>{quantity}</span></div>\n' +
+    '  view => <div><style>{".a > .b { color: red; }"}</style><br/><a href={url% "/guide"}><b>safe</b></a><Badge key="b"/><span>{quantity}</span></div>\n' +
     'end Site\nabbrev Quantity.app := Site.Quantity.app\n');
   succeeds(run(cli, ['build', '--dev'], app));
   const multiUrl = pathToFileURL(path.join(app, '.qed/dev/ssr.mjs'));
@@ -79,8 +79,18 @@ try {
   const multiHtml = await (await renderMulti(new Request('http://localhost/'))).text();
   assert.match(multiHtml, /\.a > \.b \{ color: red; \}/);
   assert.doesNotMatch(multiHtml, /<\/br>/);
-  assert.match(multiHtml, /<b>raw<\/b>/);
+  assert.match(multiHtml, /href="\/guide"><b>safe<\/b><\/a>/);
   assert.match(multiHtml, /class="badge">ok:7<\/span>/);
+
+  await writeFile(appPath,
+    'import Qed\nopen Qed\ncomponent RawBad where\n  state x : Int := 0\n  view => <div {Attr.rawHtml "<b>raw</b>"}/>\n');
+  const rawRes = run(cli, ['check'], app);
+  assert.notEqual(rawRes.status, 0);
+
+  await writeFile(appPath, valid + '\npartial def spin (n : Nat) : Nat := spin n\n');
+  const partialRes = run(cli, ['check'], app);
+  assert.notEqual(partialRes.status, 0);
+  assert.match(partialRes.stdout + partialRes.stderr, /kernel gate: `partial` or `opaque` declaration `spin`/);
 
   await writeFile(appPath, valid);
   succeeds(run(cli, ['check'], app));

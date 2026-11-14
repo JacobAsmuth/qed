@@ -37,6 +37,16 @@ def map (f : α → β) : Resource α → Resource β
   | .ok a     => .ok (f a)
   | .failed e => .failed e
 
+@[simp] theorem validIn_view {α msg : Type} (ctx : HtmlCtx) (r : Resource α)
+    (ready : α → Html msg) (loading : Html msg) (failed : String → Html msg) (idle : Html msg) :
+    Html.validIn ctx (r.view ready loading failed idle) =
+      match r with
+      | .idle     => Html.validIn ctx idle
+      | .loading  => Html.validIn ctx loading
+      | .ok a     => Html.validIn ctx (ready a)
+      | .failed e => Html.validIn ctx (failed e) := by
+  cases r <;> rfl
+
 end Resource
 
 structure Cached (α : Type) where
@@ -60,6 +70,11 @@ def view (c : Cached α) (ready : α → Html msg)
     (failed  : String → Html msg := fun e => .text e)
     (idle    : Html msg := .text "") : Html msg :=
   c.state.view ready loading failed idle
+
+@[simp] theorem validIn_view {α msg : Type} (ctx : HtmlCtx) (c : Cached α)
+    (ready : α → Html msg) (loading : Html msg) (failed : String → Html msg) (idle : Html msg) :
+    Html.validIn ctx (c.view ready loading failed idle) =
+      Html.validIn ctx (c.state.view ready loading failed idle) := rfl
 
 end Cached
 
@@ -99,6 +114,8 @@ def App.withQueries {Model Msg : Type} (qs : List (Query Model Msg))
     (App.withQueries qs app).init = app.init := rfl
 @[simp] theorem App.withQueries_update (qs : List (Query Model Msg)) (app : App Model Msg) :
     (App.withQueries qs app).update = Query.wrap qs app.update := rfl
+@[simp] theorem App.withQueries_template (qs : List (Query Model Msg)) (app : App Model Msg) :
+    (App.withQueries qs app).template = app.template := rfl
 
 open Lean in
 syntax:max (name := queryForTerm) "Resource.queryFor " ident (ppSpace Lean.Parser.Term.argument)* : term

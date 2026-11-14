@@ -15,7 +15,6 @@ def attrRole : List (Attr msg) → Option String
 mutual
 def everyElement (p : String → List (Attr msg) → Bool) : Html msg → Bool
   | .text _        => true
-  | .lazy _ s      => everyElement p s
   | .element t a k => p t a && everyElementL p k
 def everyElementL (p : String → List (Attr msg) → Bool) : List (Html msg) → Bool
   | []     => true
@@ -86,7 +85,6 @@ theorem everyElement_map {α β} (f : α → β)
     (hp : ∀ t a, pβ t (a.map (Attr.map f)) = pα t a) :
     (h : Html α) → everyElement pβ (h.map f) = everyElement pα h
   | .text _        => rfl
-  | .lazy _ s      => everyElement_map f hp s
   | .element t a k => by simp only [Html.map, everyElement, hp, everyElementL_map f hp k]
 theorem everyElementL_map {α β} (f : α → β)
     {pα : String → List (Attr α) → Bool} {pβ : String → List (Attr β) → Bool}

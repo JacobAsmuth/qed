@@ -5,7 +5,6 @@ namespace Qed
 
 def Html.keyOf : Html msg → Option String
   | .element _ attrs _ => attrs.findSome? (fun a => match a with | .key k => some k | _ => none)
-  | .lazy _ sub        => Html.keyOf sub
   | _                  => none
 
 def validatedKeyIndex (cs : List (Html msg)) : Option (Std.HashMap String Nat) :=
@@ -22,8 +21,6 @@ mutual
     | replace (new : Html msg)
     | setText (content : String)
     | patchElement (attrs : List (Attr msg)) (steps : List (KeyedStep msg))
-    | lazyReuse (key : String) (sub : Html msg)
-    | lazyPatch (key : String) (sub : Patch msg)
   inductive KeyedStep (msg : Type) where
     | reuse (oldIndex : Nat) (p : Patch msg)
     | create (h : Html msg)
@@ -45,8 +42,6 @@ mutual
             | none => positional
           .patchElement a₂ (diffChildrenTR oldArr pick #[] 0 c₂).toList
         else .replace (.element t₂ a₂ c₂)
-    | .lazy k₁ s₁,      .lazy k₂ s₂      =>
-        if k₁ = k₂ then .lazyReuse k₂ s₂ else .lazyPatch k₂ (diff s₁ s₂)
     | _,                b                 => .replace b
   def diffChildrenTR (oldArr : Array (Html msg)) (pick : Nat → Html msg → Option Nat)
       (acc : Array (KeyedStep msg)) : Nat → List (Html msg) → Array (KeyedStep msg)
@@ -78,9 +73,6 @@ mutual
     | .replace new,              _                       => new
     | .setText s,                _                       => .text s
     | .patchElement attrs steps, .element tag _ children => .element tag attrs (applyChildrenTR #[] steps children.toArray).toList
-    | .lazyReuse key sub,        _                       => .lazy key sub
-    | .lazyPatch key p,          .lazy _ s               => .lazy key (applyPatch p s)
-    | .lazyPatch key p,          h                       => .lazy key (applyPatch p h)
     | .patchElement _ _,         h                       => h
   def applyChild (old : Array (Html msg)) : KeyedStep msg → Html msg
     | .reuse i p => applyPatch p (old.getD i default)
@@ -113,9 +105,6 @@ mutual
         simp only [applyPatch, applyChildrenTR_toList, diffChildrenTR_toList, List.nil_append]
         exact congrArg (Html.element t₁ a₂) (diffChildren_apply c₁ _ 0 c₂)
       · rfl
-    case lazy.lazy k₁ s₁ k₂ s₂ =>
-      simp only [diff]
-      split <;> simp [applyPatch, diff_apply s₁ s₂]
   theorem diffChildren_apply (old : List (Html msg)) :
       ∀ (pick : Nat → Html msg → Option Nat) (i : Nat) (news : List (Html msg)),
         applyChildren (diffChildren old.toArray pick i news) old = news

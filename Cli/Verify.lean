@@ -11,8 +11,8 @@ def grepForbidden : IO Bool := do
   let mut clean := true
   for f in files do
     for line in (← IO.FS.readFile f).splitOn "\n" do
-      let isPolicy := (line.splitOn "never emit").length > 1 || (line.splitOn "fails to compile").length > 1
-      if !isPolicy && bad.any (fun w => (line.splitOn w).length > 1) then
+      let isPolicy := line.contains "never emit" || line.contains "fails to compile"
+      if !isPolicy && bad.any (line.contains ·) then
         IO.eprintln (red s!"  forbidden tactic in {f}: {line.trimmed}")
         clean := false
   return clean
@@ -20,7 +20,10 @@ def grepForbidden : IO Bool := do
 def axiomClean : IO Bool := do
   if !(← axiomsManifest.pathExists) then return true
   let (_, out) ← shOut "lake" #["env", "lean", "--root=.", axiomsManifest.toString]
-  let clean := !((out.splitOn "sorryAx").length > 1) && !((out.splitOn "error:").length > 1)
+  let clean := !out.contains "sorryAx"
+    && !out.contains "Lean.ofReduceBool"
+    && !out.contains "Lean.trustCompiler"
+    && !out.contains "error:"
   if !clean then IO.eprint out
   return clean
 
@@ -107,6 +110,22 @@ def invariantNote : IO Unit := do
     IO.println s!"  note: {uncovered.size} update(s) change state with no `invariant … preserved_by`, consider stating one:"
     for (f, u) in uncovered do IO.println s!"    {u}  ({f})"
 
+def kernelEnvClean : IO Bool := do
+  let root ← webRoot
+  if (← (FilePath.mk "Examples").pathExists) then
+    if (← shQuiet "lake" #["build", "qedjs"]) != 0 then return false
+    let mods := #[
+      "Qed", "Qed.Driver", "Qed.Proofs.DomEquiv", "Js.Backend", "Js.Proofs",
+      "Examples.Bookshelf", "Examples.Todo", "Examples.Chat", "Examples.Signup",
+      "Examples.Booking", "Examples.Users", "Examples.Local", "Examples.Effects",
+      "Examples.Template", "Examples.Socket", "Examples.Live", "Examples.DomProbe",
+      "Examples.JsGate", root
+    ]
+    return (← shQuiet "lake" (#["exe", "qedjs", "--verify-env"] ++ mods)) == 0
+  else
+    if (← shQuiet "lake" #["build", root, "qedjs"]) != 0 then return false
+    return (← shQuiet "lake" #["exe", "qedjs", "--verify-env", root]) == 0
+
 def verify : IO Bool := do
   step "verifying proofs & axioms"
   if (← shQuiet "lake" #["build"]) != 0 then return false
@@ -114,8 +133,9 @@ def verify : IO Bool := do
     if (← shQuiet "lake" #["build", "Examples"]) != 0 then return false
   let ok1 ← grepForbidden
   let ok2 ← axiomClean
-  let ok3 ← effectsCovered
-  return ok1 && ok2 && ok3
+  let ok3 ← kernelEnvClean
+  let ok4 ← effectsCovered
+  return ok1 && ok2 && ok3 && ok4
 
 def cmdCheck : IO UInt32 := do
   if (← verify) then

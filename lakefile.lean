@@ -6,6 +6,14 @@ package qed where
 @[default_target]
 lean_lib Qed where
 
+@[default_target]
+lean_lib QedProofs where
+  roots := #[`Qed.Proofs.DomEquiv]
+
+@[default_target]
+lean_lib JsProofs where
+  roots := #[`Js.Proofs]
+
 lean_lib Js where
 
 lean_exe qedjs where

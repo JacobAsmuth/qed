@@ -1,27 +1,12 @@
-/-
-  Qed.Render — the pure `Html` → string renderer.
-
-  Extracted from `Qed.Runtime` so it sits *below* `Qed.View`: `View.render`'s machinery
-  needs `Html.render` (to fingerprint/diff opaque subtrees), and we want `App` (in
-  `Runtime`) to be able to carry a `View` template — which requires `View` not to import
-  `Runtime`. Everything here depends only on `Qed.Html`.
-
-  The renderer threads a handler table `hs : Array msg`: an event attribute emits a
-  `data-qed-*="<id>"` marker whose `<id>` indexes the message the JS delegation dispatches.
-  `<style>`/`<script>` content is emitted verbatim (HTML raw-text elements).
--/
 import Qed.Html
 
 namespace Qed
 
-/-- The DOM key a local-component host occupies, namespaced by component so two components
-    reusing a key string never collide. -/
 def localKey (component key : String) : String := component ++ "@" ++ key
 
 @[inline] def isHtmlSpecial (c : Char) : Bool :=
   c == '&' || c == '<' || c == '>' || c == '"' || c == '\''
 
-/-- Escape text/attribute values so model data cannot break out of the markup. -/
 def escapeHtml (s : String) : String :=
   if !s.any isHtmlSpecial then s
   else s.foldl (init := "") fun acc c =>
@@ -33,14 +18,11 @@ def escapeHtml (s : String) : String :=
     | '\'' => "&#39;" |> (acc ++ ·)
     | c    => acc.push c
 
-/-- The key an attribute occupies, if any (`onClick` occupies none). -/
 def Attr.key? : Attr msg → Option String
   | .attr k _ => some k
   | .flag k _ => some k
   | _         => none
 
-/-- Drop all but the last occurrence of each keyed attribute (last write wins,
-    matching `setAttribute`); keyless attributes (`onClick`) are all kept. -/
 def dedupAttrs : List (Attr msg) → List (Attr msg)
   | []        => []
   | a :: rest =>
@@ -48,9 +30,6 @@ def dedupAttrs : List (Attr msg) → List (Attr msg)
       | none   => a :: dedupAttrs rest
       | some k => if rest.any (·.key? == some k) then dedupAttrs rest else a :: dedupAttrs rest
 
-/-- Collapse an attribute list to a canonical form: every `cls` merged into one
-    `class`, later values winning for duplicate keys. The string renderer and the
-    live DOM driver both apply this, so the markup and the DOM cannot disagree. -/
 def normalizeAttrs (attrs : List (Attr msg)) : List (Attr msg) :=
   let classes := (attrs.filterMap (fun | .cls c => some c | _ => none)).filter (· != "")
   let merged  := if classes.isEmpty then [] else [Attr.cls (String.intercalate " " classes)]
@@ -59,34 +38,25 @@ def normalizeAttrs (attrs : List (Attr msg)) : List (Attr msg) :=
 @[inline] def isKeyChar (c : Char) : Bool :=
   c.isAlphanum || c == '-' || c == '_' || c == ':' || c == '.'
 
-/-- Drop characters that could break out of an attribute *name* (quotes, spaces, `<`, `>`,
-    `=`, `/`, control chars), keeping only the URL/HTML-safe name characters. Attribute names
-    are normally literals; this closes the injection an `attr (userKey) v` would otherwise open. -/
 def sanitizeKey (k : String) : String :=
   if k.all isKeyChar then k
   else String.ofList (k.toList.filter isKeyChar)
 
-/-- HTML void elements: rendered with no children and no closing tag (`<input>`, not
-    `<input></input>`), so server markup parses and hydrates the way the browser builds it. -/
 def voidTags : List String :=
   ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]
 
-/-- Render one attribute, threading the handler table. An `onClick` is emitted as
-    a `data-qed-on-click="<id>"` attribute, where `<id>` indexes the message that the
-    JS delegation listener will dispatch back. -/
 def renderAttr (hs : Array msg) : Attr msg → String × Array msg
   | .cls c     => (s!" class=\"{escapeHtml c}\"", hs)
   | .attr k v  => (s!" {sanitizeKey k}=\"{escapeHtml v}\"", hs)
   | .flag k present => (if present then s!" {sanitizeKey k}=\"{sanitizeKey k}\"" else "", hs)
-  | .key _     => ("", hs)   -- a reconciliation key is virtual-DOM-only; it never renders
-  | .on event m  => (s!" data-qed-on-{event}=\"{hs.size}\"", hs.push m)   -- no-arg handler id, for hydration
-  | .onValue _ _ => ("", hs)   -- value handlers carry no static form; the driver wires them on hydration
-  | .localCell key comp _ _ _ => (s!" data-qed-local=\"{escapeHtml (localKey comp key)}\"", hs)   -- marks the host; the driver fills it
-  | .signalBind name        => (s!" data-qed-signal=\"{escapeHtml name}\"", hs)                 -- driver binds its text to the signal
-  | .signalAttr _ attr value => (s!" {sanitizeKey attr}=\"{escapeHtml value}\"", hs)             -- driver binds this attr to the signal
-  | .rawHtml _ => ("", hs)   -- not an attribute; its markup is emitted as the element's content (see renderNode)
+  | .key _     => ("", hs)
+  | .on event m  => (s!" data-qed-on-{event}=\"{hs.size}\"", hs.push m)
+  | .onValue _ _ => ("", hs)
+  | .localCell key comp _ _ _ => (s!" data-qed-local=\"{escapeHtml (localKey comp key)}\"", hs)
+  | .signalBind name        => (s!" data-qed-signal=\"{escapeHtml name}\"", hs)
+  | .signalAttr _ attr value => (s!" {sanitizeKey attr}=\"{escapeHtml value}\"", hs)
+  | .rawHtml _ => ("", hs)
 
-/-- Render a list of attributes left-to-right, threading the handler table. -/
 def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg
   | []      => ("", hs)
   | a :: as =>
@@ -94,36 +64,27 @@ def renderAttrs (hs : Array msg) : List (Attr msg) → String × Array msg
       let (s2, hs2) := renderAttrs hs1 as
       (s1 ++ s2, hs2)
 
-/-- The `rawHtml` markup on an element, if any — its verbatim inner content. -/
 def rawHtml? : List (Attr msg) → Option String
-  | []                  => none
+  | []                   => none
   | .rawHtml markup :: _ => some markup
-  | _ :: rest           => rawHtml? rest
+  | _ :: rest            => rawHtml? rest
 
-/-- Shared element semantics; the child renderer is supplied by the traversal. -/
 def renderElement (renderKids : Array msg → String × Array msg) (hs : Array msg)
     (tag : String) (attrs : List (Attr msg)) (children : List (Html msg)) : String × Array msg :=
-  let (attrStr,  hs1) := renderAttrs hs (normalizeAttrs attrs)
-  -- A `rawHtml` element emits its markup verbatim as content (the children are ignored),
-  -- so server markup matches what the driver sets via `innerHTML`.
+  let (attrStr, hs1) := renderAttrs hs (normalizeAttrs attrs)
   if let some markup := rawHtml? attrs then
     (s!"<{tag}{attrStr}>{markup}</{tag}>", hs1)
-  -- `<style>`/`<script>` are HTML "raw text" elements: their content is CDATA-like
-  -- (CSS/JS), so escaping `&`/`<` would corrupt it. Emit text children verbatim.
   else if tag == "style" || tag == "script" then
-    -- raw-text content (CSS/JS) is emitted verbatim, but a `</style`/`</script` inside it
-    -- would close the element early and let following markup execute. Break the closing
-    -- sequence (`</` → `<\/`) so injected data can't escape; literal CSS/JS never needs `</`.
+    -- Escape `</` → `<\/` so text inside raw-text elements cannot close `<style>`/`<script>` early.
     let raw := "<\\/".intercalate ((String.join (children.map fun | .text s => s | _ => "")).splitOn "</")
     (s!"<{tag}{attrStr}>{raw}</{tag}>", hs1)
   else if voidTags.contains tag then
-    (s!"<{tag}{attrStr}>", hs1)   -- void element: no children, no closing tag
+    (s!"<{tag}{attrStr}>", hs1)
   else
     let (childStr, hs2) := renderKids hs1
     (s!"<{tag}{attrStr}>{childStr}</{tag}>", hs2)
 
 mutual
-  /-- Structural rendering specification, including the handler table. -/
   def renderNode (hs : Array msg) : Html msg → String × Array msg
     | .text s => (escapeHtml s, hs)
     | .element tag attrs children => renderElement (fun hs => renderChildren hs children) hs tag attrs children
@@ -137,7 +98,6 @@ mutual
 end
 
 mutual
-  /-- Runtime renderer: sibling strings accumulate directly into `acc`. -/
   def renderNodeTR (hs : Array msg) : Html msg → String × Array msg
     | .text s => (escapeHtml s, hs)
     | .element tag attrs children =>
@@ -171,7 +131,6 @@ mutual
         simp [String.append_assoc]
 end
 
-/-- Compilation uses the tail-recursive traversal; proofs retain the structural equations. -/
 @[csimp] theorem renderNode_eq_renderNodeTR : @renderNode = @renderNodeTR := by
   funext msg hs h
   exact (renderNodeTR_eq hs h).symm
@@ -183,18 +142,13 @@ def renderChildrenFast (hs : Array msg) (cs : List (Html msg)) : String × Array
   funext msg hs cs
   simpa [renderChildrenFast] using (renderChildrenTR_eq hs "" cs).symm
 
-/-- Render a node to an HTML string (model data escaped). The total renderer: a
-    local host renders *empty* (the driver fills it in the browser). Used for native
-    sanity checks and server-side rendering where local content isn't needed. -/
 def Html.render (h : Html msg) : String := (renderNode #[] h).1
 
-/-- Extract the text of a text-rendering `Html` node (unwrapping `lazy`). -/
 def Html.textOf? : Html msg → Option String
   | .text s     => some s
   | .lazy _ sub => Html.textOf? sub
   | _           => none
 
-/-- Concatenate all remaining text nodes in the current contiguous text run (before the next element). -/
 def restOfTextRun : List (Html msg) → String
   | []      => ""
   | c :: cs =>
@@ -202,7 +156,6 @@ def restOfTextRun : List (Html msg) → String
       | some s => s ++ restOfTextRun cs
       | none   => ""
 
-/-- Zero-allocation check for whether more non-empty text follows in the current contiguous run. -/
 def hasMoreText : List (Html msg) → Bool
   | []      => false
   | c :: cs =>
@@ -212,8 +165,6 @@ def hasMoreText : List (Html msg) → Bool
       | none    => false
 
 mutual
-  /-- Pure model of how an HTML5 parser coalesces adjacent non-empty text nodes and
-      omits empty `.text ""` nodes when parsing SSR markup into `childNodes`. -/
   def coalesceTextRun : List (Html msg) → List (Html msg)
     | []      => []
     | c :: cs =>
@@ -223,7 +174,6 @@ mutual
             else .text (s ++ restOfTextRun cs) :: dropCurrentTextRun cs
         | none => c :: coalesceTextRun cs
 
-  /-- Everything after the current contiguous text run, coalesced. -/
   def dropCurrentTextRun : List (Html msg) → List (Html msg)
     | []      => []
     | c :: cs =>
@@ -232,9 +182,6 @@ mutual
         | none   => c :: coalesceTextRun cs
 end
 
-/-- Pure model of the driver's hydration child loop: given the expected `Html` children,
-    whether we are already inside a browser-coalesced text run (`inTextRun`), and the
-    remaining browser `childNodes`, reconstructs the 1-to-1 live DOM child list. -/
 def hydrateChildrenSpec (inTextRun : Bool) : List (Html msg) → List (Html msg) → List (Html msg)
   | [],      _   => []
   | c :: cs, dom =>
@@ -274,9 +221,6 @@ theorem hydrateChildrenSpec_roundtrip (cs : List (Html msg)) :
               · simpa [hydrateChildrenSpec, coalesceTextRun, h, hs] using ihTrue
               · simpa [hydrateChildrenSpec, dropCurrentTextRun, h, hs] using ihTrue
 
-/-- **Hydration Text-Coalescing Round-Trip:** hydrating the browser's coalesced `childNodes`
-    reconstructs the exact 1-to-1 `Html` sibling list for any combination of empty, adjacent,
-    or interleaved text and element children. -/
 theorem hydrate_coalesce (cs : List (Html msg)) :
     hydrateChildrenSpec false cs (coalesceTextRun cs) = cs :=
   (hydrateChildrenSpec_roundtrip cs).1

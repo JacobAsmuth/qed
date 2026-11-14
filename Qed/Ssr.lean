@@ -1,38 +1,44 @@
-/-
-  Qed.Ssr: the per-request server step, the framework half of `dist/ssr.mjs`.
-
-  Server-side rendering is not code an app author writes. The app already declares its
-  routes (`onRoute`) and its data needs (`queries := …`), so a server can *run* it for a
-  request: dispatch the route, see which HTTP fetches the update requested, perform them,
-  feed the results back through `update`, and render the settled model with the same
-  verified `view` the browser runs, dehydrated into the page so the client adopts it
-  without refetching.
-
-  `App.ssrStep` is that run as one pure, total, resumable function, so the JS host stays
-  a dumb loop. It replays the boot deterministically: initial model, route dispatch,
-  then the command queue in discovery order. An HTTP `request` leaf consumes the next
-  entry of `resultsJson` (the responses gathered so far, in the same discovery order);
-  the first one with no response stops delivery, and everything still pending is returned
-  as `{"need": [{method, url, body}, …]}`. The host fetches those, appends the responses,
-  and calls again; replay is cheap (a few `update`s) and the round count is the data
-  dependency depth. When nothing is pending the answer is `{"html": <the document>}`.
-
-  Effects that only mean something in a browser (timers, storage, focus, sockets,
-  streams, ports, clipboard, `pushUrl`, `now`) are dropped: the client re-runs nothing on
-  a dehydrated load, and anything long-lived belongs to the live page, not the snapshot.
-
-  Pure and total: termination is by (results left to consume, queue length), every
-  delivery consumes a result. The transpiled export is generic (`Qed.App.ssrStep`); the
-  host passes the app value exported next to it, so no per-app Lean is generated.
--/
-import Qed.Runtime
-import Qed.Json
+import Qed.Runtime.App
+import Qed.Json.Basic
 
 namespace Qed
 
-/-- One round of the SSR replay loop: walk the command queue in discovery order,
-    delivering fetched responses to `request` leaves and collecting the ones that still
-    need fetching. See the module docs for the protocol. -/
+partial def renderWithLocals {m : Type} (locals : List LocalDef) : Html m → String
+  | .text s => escapeHtml s
+  | .lazy _ sub => renderWithLocals locals sub
+  | .element tag attrs children =>
+      let local? := attrs.findSome? (fun | .localCell _ comp init p _ => some (comp, init, p) | _ => none)
+      match local? with
+      | some (comp, init?, p) =>
+          let attrStr := (renderAttrs #[] (normalizeAttrs attrs)).1
+          let childStr := match locals.find? (fun d : LocalDef => d.id == comp) with
+            | some ldef => renderWithLocals locals (((ldef.viewProps.map (fun (f : String → String → Html LocalMsg) => f p)).getD ldef.view) (init?.getD ldef.init))
+            | none      => ""
+          s!"<{tag}{attrStr}>{childStr}</{tag}>"
+      | none =>
+          (renderElement (fun hs => (children.foldl (fun acc c => acc ++ renderWithLocals locals c) "", hs)) #[] tag attrs children).1
+
+def Html.renderWith (locals : List LocalDef) (h : Html msg) : String := renderWithLocals locals h
+
+def App.renderModel (app : App Model Msg) (m : Model) : String :=
+  Html.renderWith app.locals (app.view m)
+
+def App.renderInitial (app : App Model Msg) : String :=
+  app.renderModel app.init.1
+
+def renderDocument (title : String) (appHtml : String) (script : String := "/qed.js")
+    (state : String := "") (css : String := "") : String :=
+  -- Escape `</` → `<\/` (valid JSON/CSS) so embedded payloads cannot close `<script>`/`<style>` early.
+  let styleTag := if css.isEmpty || appHtml.contains css then ""
+                  else "<style id=\"qed-styles\">" ++ "<\\/".intercalate (css.splitOn "</") ++ "</style>"
+  "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
+    ++ "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    ++ "<title>" ++ escapeHtml title ++ "</title>" ++ styleTag ++ "</head>\n"
+    ++ "<body><div id=\"app\">" ++ appHtml ++ "</div>\n"
+    ++ (if state.isEmpty then ""
+        else "<script id=\"qed-state\" type=\"application/json\">" ++ "<\\/".intercalate (state.splitOn "</") ++ "</script>\n")
+    ++ "<script type=\"module\" src=\"" ++ script ++ "\"></script>\n</body>\n</html>"
+
 private def ssrDrain (app : App Model Msg) (results : Array (Bool × String)) :
     Model → List (Cmd Msg) → Nat → Array (String × String × String) →
     Model × Array (String × String × String)
@@ -46,15 +52,10 @@ private def ssrDrain (app : App Model Msg) (results : Array (Bool × String)) :
           ssrDrain app results m' (rest ++ Cmd.flatten c') (i + 1) needs
         else
           ssrDrain app results m rest i (needs.push (method, url, body))
-    -- the queue holds leaves only (every enqueue goes through `Cmd.flatten`), so a
-    -- `batch` cannot appear here; it falls into the drop case with the other non-HTTP
-    -- effects, which is also what keeps the loop's termination measure decreasing
+    -- Queue holds leaves only (via `Cmd.flatten`), so non-request arms drop `.batch` too, keeping `q.length` decreasing.
     | _ => ssrDrain app results m rest i needs
   termination_by _ q i _ => (results.size - i, q.length)
 
-/-- Decode the host's gathered responses: a JSON array of `{ok, body}` in discovery
-    order. Anything malformed reads as an empty list (the step then just reports what it
-    needs). -/
 private def ssrResults (resultsJson : String) : Array (Bool × String) :=
   match Json.parse resultsJson with
   | .ok (.arr es) => es.foldl (fun acc e =>
@@ -67,10 +68,6 @@ private def ssrResults (resultsJson : String) : Array (Bool × String) :=
       | _ => acc) #[]
   | _ => #[]
 
-/-- The per-request step `dist/ssr.mjs` loops: replay the app's boot for `path` with the
-    responses gathered so far, and answer either `{"need": […]}` (fetch these, call
-    again) or `{"html": <full document>}` (the settled model rendered, with the
-    dehydrated state embedded so the client starts from it). -/
 def App.ssrStep (app : App Model Msg) (path title script resultsJson : String) : String :=
   let results := ssrResults resultsJson
   let m0 := app.init.1

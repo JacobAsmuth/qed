@@ -1,55 +1,53 @@
-// Compare the transpiled driver with fresh DOM and the pure Lean renderer after every step.
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, copyFileSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, copyFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { createServer } from 'node:http';
+import { join } from 'node:path';
 import puppeteer from 'puppeteer';
+import { ROOT, serve, send } from './harness.mjs';
 
-const root = fileURLToPath(new URL('..', import.meta.url));
 const out = mkdtempSync(join(tmpdir(), 'qed-dom-'));
-const run = (cmd, args) => execFileSync(cmd, args, { cwd: root, stdio: 'inherit' });
-let browser, server;
+const run = (cmd, args) => {
+  const r = spawnSync(cmd, args, { cwd: ROOT, encoding: 'utf8' });
+  if (r.status !== 0) { process.stderr.write((r.stdout || '') + (r.stderr || '')); process.exit(1); }
+};
+let browser, srv;
 try {
   run('lake', ['build', 'Examples.DomProbe', 'qedjs']);
   const entries = ['mount', 'advance', 'fresh', 'expected', 'handlerValue',
     'mountTemplate', 'advanceTemplate', 'expectedTemplate', 'duplicateBuild', 'duplicateUpdate', 'duplicateHydrate'];
-  run('lake', ['env', join(root, '.lake/build/bin/qedjs'), join(out, 'app.mjs'),
-    'Examples.DomProbe', '--', ...entries.map(n => `DomProbe.${n}:${n}`)]);
-  for (const name of ['qed_rt.mjs', 'qed_dom.mjs']) copyFileSync(join(root, 'runtime', name), join(out, name));
-  server = createServer((req, res) => {
-    if (req.url === '/') return res.end('<!doctype html><body></body>');
-    const path = join(out, req.url.slice(1));
-    if (dirname(path) !== out) { res.writeHead(404); return res.end(); }
-    try { res.setHeader('Content-Type', 'text/javascript'); res.end(readFileSync(path)); }
-    catch { res.writeHead(404); res.end(); }
+  run('lake', ['env', join(ROOT, '.lake/build/bin/qedjs'), join(out, 'app.mjs'),
+    'Examples.DomProbe', '--', ...entries.map((n) => `DomProbe.${n}:${n}`)]);
+  for (const name of ['qed_rt.mjs', 'qed_dom.mjs']) copyFileSync(join(ROOT, 'runtime', name), join(out, name));
+  srv = await serve({
+    dir: out,
+    spa: false,
+    routes: (req, res, url) => {
+      if (url.pathname === '/') { send(res, 200, 'text/html', '<!doctype html><body></body>'); return true; }
+      return false;
+    },
   });
-  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
   const page = await browser.newPage();
-  await page.goto(`http://127.0.0.1:${server.address().port}/`);
+  await page.goto(`${srv.baseUrl}/`);
   const result = await page.evaluate(async () => {
     const P = await import('/app.mjs'), $ = await import('/qed_rt.mjs');
     const { dom } = await import('/qed_dom.mjs');
     $.registerDom(dom);
     $.assertExterns(P.__externs, $);
-    const io = r => { if (r.t !== 0) throw new Error(JSON.stringify(r, (_, v) => typeof v === 'bigint' ? String(v) : v)); return $.ioVal(r); };
-    // Only the effect boundary is supplied here; every tree and patch comes from Lean.
+    const io = (r) => { if (r.t !== 0) throw new Error(JSON.stringify(r, (_, v) => typeof v === 'bigint' ? String(v) : v)); return $.ioVal(r); };
     globalThis.__qed = { effect(kind, name, value) {
       if (kind !== 'signal.set') return;
       this.sigVals.set(name, value);
       const b = this.sig.get(name);
       if (b) { if (b.attr) b.el.setAttribute(b.attr, value); else b.el.textContent = value; }
     }};
-    const node = h => globalThis.__qed.nodes[h];
-    const snapshot = n => {
+    const node = (h) => globalThis.__qed.nodes[h];
+    const snapshot = (n) => {
       if (n.nodeType === Node.TEXT_NODE) return ['text', n.textContent];
-      const attrs = [...n.attributes].filter(a => !a.name.startsWith('data-qed-') && !['value', 'checked'].includes(a.name))
-        .map(a => [a.namespaceURI, a.name, a.value]).sort((a, b) => a[1].localeCompare(b[1]));
-      // Serialization omits empty text slots and the HTML parser coalesces adjacent
-      // text nodes. Compare their content while preserving all element boundaries.
+      const attrs = [...n.attributes].filter((a) => !a.name.startsWith('data-qed-') && !['value', 'checked'].includes(a.name))
+        .map((a) => [a.namespaceURI, a.name, a.value]).sort((a, b) => a[1].localeCompare(b[1]));
+      // HTML serialization omits empty text slots and coalesces adjacent text nodes.
       const children = [];
       for (const c of n.childNodes) {
         const child = snapshot(c);
@@ -60,7 +58,7 @@ try {
       return [n.namespaceURI, n.localName, attrs,
         n instanceof HTMLInputElement ? [n.value, n.checked] : null, children];
     };
-    const parse = html => { const t = document.createElement('template'); t.innerHTML = html; return t.content.firstChild; };
+    const parse = (html) => { const t = document.createElement('template'); t.innerHTML = html; return t.content.firstChild; };
     const equal = (a, b, label) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`${label}\n${JSON.stringify(a)}\n${JSON.stringify(b)}`); };
     const sequence = Array.from({ length: 32 }, (_, i) => i);
     let seed = 0x51ed;
@@ -100,9 +98,9 @@ try {
     return { updates: sequence.length * 2, duplicateChecks: 3 };
   });
   assert.equal(result.updates, 384);
-  console.log(`PASS DOM equivalence: ${result.updates} updates; ${result.duplicateChecks} duplicate-key checks`);
+  console.log(`  ✓ dom-equivalence (${result.updates})`);
 } finally {
   await browser?.close();
-  if (server?.listening) await new Promise(resolve => server.close(resolve));
+  await srv?.close();
   rmSync(out, { recursive: true, force: true });
 }

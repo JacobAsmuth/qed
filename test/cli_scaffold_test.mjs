@@ -1,5 +1,3 @@
-// Exercise the README quickstart as a separate app, with this checkout as its
-// dependency so the regression test needs no GitHub access or second toolchain.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
@@ -12,6 +10,7 @@ const cli = path.join(root, '.lake/build/bin/qed');
 const env = { ...process.env, QED_HOME: root };
 delete env.QED_WEB_ROOT;
 delete env.QED_JS_ROOT;
+delete env.QED_SKIP_VERIFY;
 const run = (command, args, cwd = root) => spawnSync(command, args, {
   cwd, env, encoding: 'utf8', timeout: 120000,
 });
@@ -37,7 +36,6 @@ try {
   succeeds(run(cli, ['build', '--dev'], app));
   succeeds(run(cli, ['build'], app));
 
-  // Both build modes must find the dependency's transpiler and emit working SSR.
   for (const dir of ['.qed/dev', 'dist']) {
     const { default: render } = await import(pathToFileURL(path.join(app, dir, 'ssr.mjs')));
     const response = await render(new Request('http://localhost/'));
@@ -51,8 +49,6 @@ try {
   const appPath = path.join(app, 'App.lean');
   const valid = await readFile(appPath, 'utf8');
 
-  // Reloading the SSR wrapper after a dev build must also reload the app it imports.
-  // Otherwise the browser receives old static markup even though compilation succeeds.
   await writeFile(appPath, valid.replace('>+</button>', '>Add</button>'));
   succeeds(run(cli, ['build', '--dev'], app));
   const updatedUrl = pathToFileURL(path.join(app, '.qed/dev/ssr.mjs'));
@@ -60,14 +56,11 @@ try {
   const { default: updated } = await import(updatedUrl);
   assert.match(await (await updated(new Request('http://localhost/'))).text(), />Add<\/button>/);
 
-  // The README's deliberate mistake must fail with the responsible action named.
   await writeFile(appPath, valid.replace('decrease when (1 < quantity)', 'decrease'));
   const broken = run(cli, ['check'], app);
   assert.notEqual(broken.status, 0);
   assert.match(broken.stdout + broken.stderr, /case `decrease` still needs/);
 
-  // Multi-file components in the same namespace must not collide on ToJson/FromJson
-  // instances, and SSR must preserve rawHtml, void tags, raw-text <style>, and local mounts.
   await writeFile(path.join(app, 'Child.lean'),
     'import Qed\nopen Qed\nnamespace Site\ncomponent Badge where\n  prop label : String := "ok"\n  state count : Int := 7\n  view => <span class="badge">{label}:{count}</span>\nend Site\n');
   await writeFile(lakefile, (await readFile(lakefile, 'utf8')).replace(
@@ -91,7 +84,7 @@ try {
 
   await writeFile(appPath, valid);
   succeeds(run(cli, ['check'], app));
-  console.log('PASS: scaffold toolchain, dependency transpiler, dev/production SSR, SSR reload, multi-file components, broken guard, and recovery.');
+  console.log('  ✓ cli-scaffold');
 } finally {
   await rm(scratch, { recursive: true, force: true });
 }

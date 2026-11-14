@@ -1,21 +1,14 @@
-// qed_dom.mjs — the DOM externs for the transpiled driver, ported from runtime/qed_dom.c.
-// Each method follows the IO protocol: it takes the world token last and returns
-// EStateM.Result.ok(value, world). `Node` is a UInt32 handle into globalThis.__qed.nodes
-// (index 0 = null sentinel).
 import { mkOk, PUnit } from './qed_rt.mjs';
 
 function Q() {
   const g = (globalThis.__qed ||= {});
-  g.nodes ||= [null];                    // index 0 reserved (null sentinel)
-  g.sig ||= new Map();                   // signal name → { el, attr }
-  g.sigVals ||= new Map();               // signal name → value
+  g.nodes ||= [null];
+  g.sig ||= new Map();
+  g.sigVals ||= new Map();
   return g;
 }
 const ok = (v, w) => mkOk(v, w);
 
-// Namespaces. Elements inside an <svg> subtree must be created in the SVG namespace
-// (createElementNS), and xlink:*/xml:* attributes set in their own namespace (setAttributeNS) —
-// `<use xlink:href>` and friends only resolve when the attribute is namespaced.
 const SVG_NS   = 'http://www.w3.org/2000/svg';
 const XLINK_NS = 'http://www.w3.org/1999/xlink';
 const XML_NS   = 'http://www.w3.org/XML/1998/namespace';
@@ -41,11 +34,8 @@ const dropNode = (el) => {
 };
 
 export const dom = {
-  // `ns` is the namespace the parent established for its children (see childNamespace); "" is the
-  // HTML default, except a standalone `svg` tag still enters the SVG namespace.
   createElement(ns, tag, w) { const real = ns || (tag === 'svg' ? SVG_NS : ''); return ok(nodeId(real ? document.createElementNS(real, tag) : document.createElement(tag)), w); },
-  // The namespace children of `node` inherit: SVG inside an <svg> subtree, HTML otherwise — and
-  // back to HTML inside <foreignObject>, whose content is ordinary HTML.
+  // Children inherit SVG namespace inside `<svg>`, except `<foreignObject>` whose content is HTML.
   childNamespace(node, w) { const el = Q().nodes[node]; const svg = !!el && el.namespaceURI === SVG_NS && el.localName !== 'foreignObject'; return ok(svg ? SVG_NS : '', w); },
   createText(s, w)      { return ok(nodeId(document.createTextNode(s)), w); },
   createFragment(w)     { return ok(nodeId(document.createDocumentFragment()), w); },
@@ -62,10 +52,9 @@ export const dom = {
     } else {
       for (let cur = namesList; cur && cur.t === 1; cur = cur.f[1]) names.add(cur.f[0]);
     }
-    // Track only framework-owned names. Hydration or userland may attach unrelated
-    // attributes (including node-identity sentinels), which reconciliation must preserve.
+    // Only remove previously framework-managed attributes (preserving hydration/userland sentinels),
+    // and explicitly reset `value`/`checked` DOM properties that have no backing attribute.
     if (previous) {
-      // `value` is normally written as a property and has no corresponding attribute.
       if (previous.has('value') && !names.has('value')) el.value = '';
       if (previous.has('checked') && !names.has('checked')) el.checked = false;
       for (const attr of [...el.attributes]) {
@@ -118,9 +107,6 @@ export const dom = {
   portSend(name, payload, w) { Q(); const p = globalThis.__qed.ports && globalThis.__qed.ports[name]; if (p) p(payload); return ok(PUnit, w); },
   bindSignal(node, name, w) {
     const g = Q(), el = g.nodes[node]; if (!el) return ok(PUnit, w);
-    // Register by name in `g.sig` (how `setSignal` finds the node on update). The
-    // `data-qed-signal` attribute is an SSR-only marker (emitted by `Render`, read by no client
-    // code), so the live client doesn't write it — that's one fewer DOM mutation per dynamic leaf.
     g.sig.set(name, { el, attr: null });
     const v = g.sigVals.get(name); if (v !== undefined && el.textContent !== v) el.textContent = v;
     return ok(PUnit, w);

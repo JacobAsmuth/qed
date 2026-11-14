@@ -90,7 +90,7 @@ separately; the generated server does not implement `/api` endpoints for you. Yo
 
 With `dehydrate` and `rehydrate` configured on the app, the client restores the server's model
 without repeating startup requests. [Bookshelf](../Examples/Bookshelf.lean) implements both
-hooks; its [hydration test](../test/bookshelf_hydrate_test.mjs) asserts zero client API calls
+hooks; its [SSR + hydration test](../test/bookshelf_ssr_test.mjs) asserts zero client API calls
 on the initial catalog load.
 
 The same build also works as a static single-page app. Configure a static host to serve
@@ -103,17 +103,18 @@ The same build also works as a static single-page app. Configure a static host t
 | `Qed/Html.lean` | The typed virtual DOM every bit of syntax becomes. |
 | `Qed/Jsx.lean` | The JSX view syntax: `<div class="x" onClick={.tap}>…</div>`, expanded to `el "tag" [attrs] [kids]`. |
 | `Qed/Notation.lean` | The attribute and event helpers (`cls`, `onClick`, `value`, …) JSX attributes expand to. |
-| `Qed/View.lean` | The rendering model: `View` (`dyn`/`showIf`/`ifElse`/`forEach`/`dynNode`) and the `view%` lift behind `ui`; built once, then changed bindings patch (`patch_render`/`applyValues_render`). |
-| `Qed/Runtime.lean` | The Elm Architecture: `App`, the `ui` builder, the `Cmd` effects + `port`/`onPort`, local components, and the render primitives. |
-| `Qed/Ssr.lean` | The per-request SSR step `dist/ssr.mjs` loops: route, run the app's queries, render, dehydrate. |
+| `Qed/View.lean` (`Qed/View/`) | The rendering model: `View` (`dyn`/`showIf`/`ifElse`/`forEach`/`dynNode`) and the `view%` lift behind `ui`; built once, then changed bindings patch (`patch_render`/`applyValues_render`). |
+| `Qed/Runtime.lean` (`Qed/Runtime/`) | The Elm Architecture: `App`, the `ui` builder, the `Cmd` effects + `port`/`onPort`, local components, and verified `Dehydrate` codecs. |
+| `Qed/Ssr.lean` | Server-side HTML rendering (`renderWithLocals`, `renderDocument`) and the per-request SSR step `dist/ssr.mjs` loops: route, run the app's queries, render, dehydrate. |
 | `Qed/Steps.lean` | The `steps` builder for effectful transitions: arms are bare models or `(model, cmd)` pairs. |
 | `Qed/Diff.lean` | The reconciler the engine uses internally: one children reconcile shared by positional and keyed, `lazy` memoization, and the `diff_apply` proof. |
-| `Qed/Json.lean` | JSON parser/renderer + the `ToJson`/`FromJson` classes, with the `parse_depth_le`/`parse_render` proofs. |
+| `Qed/Json.lean` (`Qed/Json/`) | JSON parser/renderer + the `ToJson`/`FromJson`/`LawfulJson` classes, with the `parse_depth_le`/`parse_render`/`parse_render_toJson` proofs. |
 | `Qed/Router.lean` | The `Router` class (round-trip law as a field), the `router` command, `toURL`/`fromURL`. |
 | `Qed/Schema.lean` | `Field p`, the `Codec` controls, and the `schema` command. One declaration yields the form (Draft + `parse` + `formView` + `canSubmit_iff`) and the JSON codec (`ToJson`/`FromJson` + `decode`/`encode`). |
-| `Qed/Component.lean` | `Component`, the `for_each` lift lemmas, and the `component` declaration (`state`/`prop`/`action`/`collection`/`view`). |
-| `Qed/Invariant.lean` | The `invariant` command (`preserved_by` / `holds_in` / `for_each`). See [invariants](invariants.md). |
-| `Qed/Dom.lean` / `Qed/Driver.lean` | The DOM primitives and imperative browser driver; part of the trusted implementation. |
+| `Qed/Component.lean` (`Qed/Component/`) | `Component`, the `for_each` lift lemmas, and the `component` declaration (`state`/`prop`/`action`/`collection`/`view`). |
+| `Qed/Invariant.lean` (`Qed/Invariant/`) | The `invariant` command (`preserved_by` / `holds_in` / `for_each`). See [invariants](invariants.md). |
+| `Qed/Dom.lean` / `Qed/Driver.lean` (`Qed/Driver/`) | The DOM primitives and imperative browser driver; part of the trusted implementation. |
+| `Cli.lean` (`Cli/`) | The `qed` CLI (`dev`, `build`, `start`, `test`, `check`, `clean`, `new`, `doctor`). |
 | `Js/Backend.lean` | The Lean IR to JavaScript transpiler. |
 | `runtime/` | Hand-written JavaScript for Lean primitives, DOM operations, browser effects, and serving/SSR hosts. |
 | `Examples/` · `test/` | Example apps and the browser tests that drive them. |

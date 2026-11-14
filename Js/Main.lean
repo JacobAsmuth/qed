@@ -1,11 +1,3 @@
-/-
-  Js.Main — CLI front-end for the Lean-IR → JS transpiler.
-
-  Usage:  qedjs <out.mjs> <module> [<module> …] -- <declName>[:<exportName>] …
-
-  Imports the given modules, transpiles the reachable closure from the entry decls,
-  and writes the JS module.
--/
 import Js.Backend
 open Lean
 
@@ -15,7 +7,6 @@ def parseEntry (s : String) : Name × String :=
   | [d, e] => (d.toName, e)
   | _      => (s.toName, s)
 
-/-- Split a list at the first `"--"` marker. -/
 partial def splitDashes : List String → List String × List String
   | []           => ([], [])
   | "--" :: rest => ([], rest)

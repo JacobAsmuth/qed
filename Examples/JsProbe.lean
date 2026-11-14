@@ -1,9 +1,3 @@
-/-
-  A probe used to differentially test the Lean-IR → JS transpiler against native Lean.
-  Each `*Case` builds a value and renders it to a String; the harness runs the SAME
-  decl natively and (transpiled) under node, and asserts identical output — so JS never
-  hand-constructs Lean values, it calls these transpiled builders.
--/
 import Qed
 open Qed
 
@@ -13,7 +7,6 @@ def t (s : String) : Html Unit := Html.text s
 def e (tag : String) (ats : List (Attr Unit)) (cs : List (Html Unit)) : Html Unit :=
   Html.element tag ats cs
 
-/-- A spread of trees exercising escaping, attrs, void elements, keys, signals, lazy. -/
 def trees : Array (Html Unit) := #[
   t "hello",
   e "div" [Attr.cls "a", Attr.cls "b", Attr.attr "id" "x"] [t "hi & <bye> \"q\" 'a'"],
@@ -31,7 +24,6 @@ def trees : Array (Html Unit) := #[
 def renderCase (i : Nat) : String := Html.render (trees.getD i (t ""))
 def treeCount : Nat := trees.size
 
-/-- Pairs for diffing: `applyPatch (diff a b) a`, which `diff_apply` says equals `b`. -/
 def pairs : Array (Html Unit × Html Unit) := #[
   (e "div" [] [t "a"], e "div" [] [t "b"]),
   (e "div" [Attr.cls "x"] [t "a"], e "div" [Attr.cls "y"] [t "a", t "c"]),
@@ -44,8 +36,6 @@ def diffCase   (i : Nat) : String := let p := pairs.getD i (t "", t ""); Html.re
 def diffExpect (i : Nat) : String := Html.render (pairs.getD i (t "", t "")).2
 def pairCount : Nat := pairs.size
 
-/-- Exercise pure child patching with wide lists, reordering, creation, a nonempty
-    accumulator, and out-of-range reuse (which the pure model defines via its default). -/
 def childPatchCase (i : Nat) : String :=
   let n := (#[0, 1, 32, 1000, 8000] : Array Nat).getD i 0
   let old := (Array.range n).map fun j => e "span" [] [t (toString j)]
@@ -54,16 +44,12 @@ def childPatchCase (i : Nat) : String :=
       .reuse j (.patchElement [Attr.cls "patched"] [.reuse 0 (.lazyPatch "" (.setText (toString j)))])) ++
     [.reuse (n + 1) (.patchElement [] [])]
   let patched := applyChildrenTR #[t "prefix"] steps old
-  -- Render each child separately: this probes the wide patch traversal, without the
-  -- string renderer's recursive sibling walk. Incorporate every character in row order.
   let (length, checksum) := patched.foldl (init := (0, 0)) fun (length, checksum) child =>
     let rendered := Html.render child
     (length + rendered.length,
       rendered.foldl (init := checksum) fun acc c => (acc * 31 + c.toNat) % 1000000007)
   s!"{patched.size}|{length}|{checksum}"
 
-/-- Wide HTML serialization and handler order, including a pre-existing handler slot.
-    The previous recursive sibling renderer overflowed the JavaScript stack here. -/
 def wideRenderCase (i : Nat) : String :=
   let n := (#[0, 1, 32, 8000, 16000] : Array Nat).getD i 0
   let children : List (Html Nat) := (List.range n).map fun j =>

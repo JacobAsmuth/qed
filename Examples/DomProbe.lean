@@ -1,5 +1,3 @@
-/- Browser differential oracle: exercise the real driver with Lean-built trees and templates.
-   The test compares incremental updates with fresh DOM and the pure Html renderer. -/
 import Qed
 import Qed.Driver
 
@@ -60,7 +58,6 @@ def handlerValue (id : Nat) : IO Nat := do
   if let some h ← liveHandlers.get then return (← h.click.get).getD id 999999
   return 999999
 
--- Unique rows exercise the signal path, keyed moves, and conditional structure.
 def structuredRows : View Nat Nat :=
   V.forEach "article" (fun seed => ((ids seed).eraseDups).toArray.map (fun id => (id, seed)))
     (fun r => toString r.1)
@@ -74,7 +71,6 @@ def structuredRows : View Nat Nat :=
       .dyn (fun r => s!"after {r.2}")])
     [.bind (fun seed => if seed % 2 == 0 then .cls "even" else .attr "title" "odd")]
 
--- Exercise both opaque-row reconciliation and the signal-only list fast path.
 def template : View Nat Nat :=
   .element "section" [] [structuredRows,
     V.forEach "aside" (fun seed => ((ids seed).eraseDups).toArray.map (fun id => (id, seed)))

@@ -1,5 +1,3 @@
-/- Tour 06 · Parent-owned child collections. Identity is declared on Row;
-   collection generates the message and update arm, and Row.each keys the wrappers. -/
 import Qed
 open Qed
 

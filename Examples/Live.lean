@@ -1,13 +1,3 @@
-/-
-  Tour 03 · Live handlers and the open event set
-
-  Messages that read the model stay live.
-
-  A handler's message can embed model state, `onClick={.setTo (m.n * 2)}`, not just a
-  constant. The driver keeps such a handler current across updates (it re-registers into the
-  element's existing slot rather than baking the build-time value), so "double" always doubles
-  the number on screen, not the number that was there when the page first rendered.
--/
 import Qed
 open Qed
 
@@ -22,10 +12,8 @@ inductive Msg
 
 def update (m : Model) : Msg → Model
   | .inc     => { m with n := m.n + 1 }
-  | .setTo v => { n := max 0 v }   -- a count, so it never goes below zero
+  | .setTo v => { n := max 0 v }
 
--- The number stays non-negative no matter which (live) handler fired, `inc` only adds, and
--- `setTo` clamps. Proven for every message, so the view never has to guard against `n < 0`.
 invariant nonNegative : (fun m => 0 ≤ m.n) preserved_by update
 
 def app : App Model Msg :=
@@ -33,11 +21,8 @@ def app : App Model Msg :=
     <div class="live">
       <p class="n">{m.n}</p>
       <button class="inc" onClick={.inc}>+1</button>
-      -- these messages embed the *current* model; they must not go stale after an update
       <button class="double" onClick={.setTo (m.n * 2)}>double</button>
       <button class="plus10" onClick={.setTo (m.n + 10)}>+10</button>
-      -- a DOM event with no named-helper history of its own: the event set is open, so
-      -- `onDoubleClick` (= `on "dblclick"`) just works, delegated like any other.
       <button class="reset" onDoubleClick={.setTo 0}>reset (dbl-click)</button>
     </div>
 

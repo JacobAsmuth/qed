@@ -1,19 +1,3 @@
-/-
-  Performance benchmarks for the rebuild + diff pipeline: the cost *upstream* of the
-  DOM patch. For a large keyed list it measures, per edit:
-
-    • rebuild: `view newModel`, allocating the whole `Html` tree afresh
-    • diff: `diff oldTree newTree`, computing the patch
-    • patch-ops: the size of the resulting patch (how much the driver must apply)
-
-  under four edits: update one, remove one, add one, reorder all. It runs each over a
-  plain view and one whose row bodies are wrapped in `Html.lazy` (keyed on the row's
-  mutable field), so unchanged rows skip the body diff entirely.
-
-  Pure Lean, native: `lake exe bench`. Distinct edits are pre-built per benchmark so the
-  optimizer can't hoist a constant `view`/`diff` out of the loop; `treeNodes`/`patchNodes`
-  force full evaluation.
--/
 import Qed
 open Qed
 
@@ -27,7 +11,6 @@ structure Row where
 def mkRows (count : Nat) : Array Row :=
   (Array.range count).map fun i => { id := i, label := s!"item {i}", n := i }
 
--- A non-trivial row body (~12 nodes) so the cost of diffing it is visible.
 def rowBody (r : Row) : Html Unit :=
   <div class="row-body">
     <span class="label">{r.label}</span>
@@ -45,7 +28,6 @@ def rowViewLazy (r : Row) : Html Unit := <li key={toString r.id} class="row">{la
 def view     (rows : Array Row) : Html Unit := <ul class="list">{rows.map rowView}</ul>
 def viewLazy (rows : Array Row) : Html Unit := <ul class="list">{rows.map rowViewLazy}</ul>
 
--- Force a tree / patch to a number, so the work can't be dead-code-eliminated.
 mutual
   def treeNodes : Html msg → Nat
     | .text _         => 1
@@ -70,7 +52,7 @@ mutual
 end
 
 def ms (ns : Nat) : String :=
-  let h := (ns + 5000) / 10000   -- ns → ms·100, rounded
+  let h := (ns + 5000) / 10000
   s!"{h / 100}.{let r := h % 100; if r < 10 then s!"0{r}" else s!"{r}"} ms"
 
 def bench (label : String) (viewFn : Array Row → Html Unit)
@@ -83,10 +65,10 @@ def bench (label : String) (viewFn : Array Row → Html Unit)
   for e in edits do
     let t0 ← IO.monoNanosNow
     let nt := viewFn e
-    let c  := treeNodes nt           -- force the rebuild
+    let c  := treeNodes nt
     let t1 ← IO.monoNanosNow
     let p  := diff oldTree nt
-    let po := patchNodes p           -- force the diff
+    let po := patchNodes p
     let t2 ← IO.monoNanosNow
     rebuild := rebuild + (t1 - t0); diffT := diffT + (t2 - t1); ops := po; warm := warm + c
   let k := max 1 edits.size

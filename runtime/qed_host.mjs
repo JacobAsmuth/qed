@@ -1,14 +1,11 @@
-// qed_host.mjs: boots the transpiled-from-Lean driver:
-// it marshals browser events into the exported qed_* entry points and supplies the
-// native effects. All UI logic — render, diff, the driver loop — is transpiled Lean.
 import * as app from './app.mjs';
 import * as $ from './qed_rt.mjs';
 import { dom } from './qed_dom.mjs';
 
 export function boot() {
-  $.registerDom(dom);                       // wire the DOM externs
-  const W = 0;                              // IO world token
-  // Export wrappers (each entry takes the world token last).
+  $.registerDom(dom);
+  $.assertExterns(app.__externs, $);
+  const W = 0;
   const init        = () => app.qed_init(W);
   const dispatch    = (id) => app.qed_dispatch(id, W);
   const dispatchStr = (id, v) => app.qed_dispatch_str(id, v, W);
@@ -18,7 +15,7 @@ export function boot() {
   const urlChanged  = (path) => app.qed_url_changed(path, W);
   const localDispatch    = (key, id) => app.qed_local_dispatch(key, id, W);
   const localDispatchStr = (key, id, v) => app.qed_local_dispatch_str(key, id, v, W);
-  const localSnapshot = () => $.ioVal(app.qed_local_snapshot(W));   // local state → JSON string
+  const localSnapshot = () => $.ioVal(app.qed_local_snapshot(W));
   const localRestore  = (s) => app.qed_local_restore(s, W);
   const effectDone  = (id, result) => app.qed_effect_done(id, result, W);
   const portRecv    = (name, payload) => app.qed_port_recv(name, payload, W);
@@ -26,7 +23,6 @@ export function boot() {
   const g = (globalThis.__qed ||= {});
   g.nodes ||= [null]; g.sig ||= new Map(); g.sigVals ||= new Map();
 
-  // Streaming POST as SSE, feeding each `data:` payload back to Lean.
   g.fetchStream = (url, body, cid, did) => {
     fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }).then(async (resp) => {
       const reader = resp.body.getReader(); const dec = new TextDecoder(); let buf = '';
@@ -99,7 +95,6 @@ export function boot() {
   g.ports ||= {};
   g.send = (name, payload) => portRecv(name, String(payload));
 
-  // Event delegation (capture phase), identical to host.js.
   const root = document.getElementById('app');
   const fire = (t, id) => { const lh = t.closest('[data-qed-local]'); if (lh) localDispatch(lh.getAttribute('data-qed-local'), id); else dispatch(id); };
   const fireStr = (t, id, v) => { const lh = t.closest('[data-qed-local]'); if (lh) localDispatchStr(lh.getAttribute('data-qed-local'), id, v); else dispatchStr(id, v); };
@@ -132,8 +127,8 @@ export function boot() {
   window.addEventListener('popstate', () => urlChanged(location.pathname));
   window.qed = { init, dispatch, dispatchStr, urlChanged, snapshot: localSnapshot, restore: localRestore };
 
-  app.__main(W);    // Qed.run app — set up the runtime
-  init();           // initial render + startup effects
+  app.__main(W);
+  init();
 }
 
 if (typeof document !== 'undefined') {

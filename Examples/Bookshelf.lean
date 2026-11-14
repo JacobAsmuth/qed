@@ -1,46 +1,16 @@
-/-
-  Tour 15 · Everything together
-
-  Bookshelf: a small catalog that wires the whole stack into one app: routing, a
-  typed remote `Resource` (a list and a single record, fetched and decoded), a
-  validated `schema` whose form POSTs and navigates to the result, and scoped styles.
-
-  Three pages, behind the verified router (`R.round_trip`):
-
-    /              the catalog, fetches `/api/books` into `Resource (Array Book)`
-    /books/<id>    one book, fetches `/api/books/<id>` into `Resource Book`
-    /new           the `schema`-generated form (text/number/select/checkbox, each refined)
-                   that, on a valid submit, POSTs the book and routes to its new detail page
-
-  Navigation goes through `link` / `Cmd.pushUrl`, so it never reloads. This app contains
-  no SSR code, yet it server-renders: `qed build` emits a request handler (`ssr.mjs`)
-  that routes a URL, runs the queries above server-side, and renders with this same
-  view, dehydrated so the browser adopts the markup on load (`test/bookshelf_ssr_test.mjs`
-  and `test/bookshelf_hydrate_test.mjs` drive it). Pure Lean; the browser entry is
-  `BookshelfWeb.lean`.
--/
 import Qed
 open Qed
 
 namespace Bookshelf
 
--- The pages, with a lawful `Router` generated alongside.
 router R where
   catalog => ""
   detail (id : String) => "books"
   newBook => "new"
 
--- Field refinements, shared by the form and the JSON decode. `abbrev` so the `Decidable`
--- instances are inferred.
 abbrev NonEmpty (s : String) : Prop := s.length ≥ 1
 abbrev Year (n : Nat) : Prop := 1 ≤ n ∧ n ≤ 2026
 
--- One book, declared once. `schema` generates the editable draft + validated `Book` (each
--- refined field a proof-carrying `Field`), `parse`, the `canSubmit` gate + its proof, the
--- `formView` widgets, and the JSON codec, decode for the GET responses, encode for the POST
--- body. The refinements guard *both* directions, so an out-of-range API record is rejected at
--- decode exactly as the form rejects it at submit. `id` is server-assigned: it rides the JSON
--- but never appears in the form.
 schema Book where
   id      : Codec.text.jsonOnly
   title   : Codec.text.refine NonEmpty
@@ -51,31 +21,27 @@ schema Book where
 
 structure Model where
   route   : R
-  catalog : Resource (Array Book)   -- the list page
-  current : Resource Book           -- the detail page
-  draft   : Book.Draft              -- the add form
+  catalog : Resource (Array Book)
+  current : Resource Book
+  draft   : Book.Draft
 
 def init : Model :=
   { route := .catalog, catalog := .idle, current := .idle, draft := Book.Draft.empty }
 
 inductive Msg where
-  | routed     (r : R)                    -- startup / link / back / push, parsed to a route
+  | routed     (r : R)
   | gotCatalog (r : Resource (Array Book))
   | gotBook    (r : Resource Book)
-  | edit       (d : Book.Draft)           -- the form hands back the whole draft
+  | edit       (d : Book.Draft)
   | submit
-  | created    (r : Resource Book)        -- the POST resolved (ok with the new book, or failed)
+  | created    (r : Resource Book)
 
--- One combined transition, written with `steps`: an arm is the next model, or
--- `(next model, effect)`. A page that needs data flips its `Resource` to `.loading` and
--- fires the fetch in the same arm that sets the route.
 def transition (m : Model) : Msg → Model × Cmd Msg := steps
   | .routed route =>
       match route with
       | .catalog   => ({ m with route := .catalog, catalog := .loading },
                        Resource.fetch "/api/books" Msg.gotCatalog)
       | .detail id =>
-          -- keep a book we already hold (e.g. one we just created), else fetch it
           match m.current with
           | .ok b => if b.id == id then { m with route := .detail id }
                      else ({ m with route := .detail id, current := .loading },
@@ -87,8 +53,6 @@ def transition (m : Model) : Msg → Model × Cmd Msg := steps
   | .gotBook r    => { m with current := r }
   | .edit d       => { m with draft := d }
   | .submit       =>
-      -- `Book.parse` yields a valid book (empty id; the server assigns one) only when every
-      -- refined field passes, so the POST body is `Book.encode` of that, no separate bridge.
       match Book.parse m.draft with
       | some book => (m, Cmd.postJson "/api/books" (Book.encode book)
                          (fun b => Msg.created (.ok b)) (fun e => Msg.created (.failed e)))
@@ -100,10 +64,6 @@ def transition (m : Model) : Msg → Model × Cmd Msg := steps
       | .failed e => { m with current := .failed e }
       | _         => m
 
-/-! Scoped styles, co-located with the view. Each class name is a content hash; the typed
-    property helpers (`maxWidth`, `display`, `color`, …) make a misspelled property, not just a
-    misspelled reference, a compile error. Raw strings coerce in for compound values, `screenMax`
-    is a responsive block, and `brand` is a design token set once in `theme`. -/
 def brand : Token := token "brand"
 def shell : Style := css [
   maxWidth (rem 40), margin "2rem auto", fontFamily "system-ui, sans-serif", lineHeight "1.5",
@@ -131,9 +91,6 @@ def bookCard (b : Book) : Html Msg :=
       {if b.inPrint then "In print" else "Out of print"}</p>
   </div>
 
-/-- The app, with verified `Dehydrate.slice` wired in (so an SSR deep link hydrates the
-    route and fetched `Resource`s without refetching, and `Dehydrate.round_trip` is proved
-    by the framework). -/
 def app : App Model Msg :=
   ui init transition (onRoute := Msg.routed)
     (dehydrate := Dehydrate.slice init

@@ -1,34 +1,3 @@
-/-
-  Qed.Jsx: the JSX view syntax.
-
-  This is the one way to write an element. `<div class="x" onClick={.tap}>…</div>`
-  is *pure sugar*: every element expands to `Qed.el "tag" [attrs] [children]`, so
-  using it costs nothing in guarantees, and the `view%` lift (see `Qed.View`) sees
-  the expanded form and keeps its fine-grained update paths.
-
-  Shapes:
-    <div class="counter"> … </div>            -- string attribute
-    <button onClick={.increment}>+</button>   -- term attribute (events, anything typed)
-    <input value={m.draft} disabled/>         -- self-closing; bare flag = `true`
-    <span {if on then a else b}>…</span>      -- a spliced `Attr` term
-    <li>{m.count}</li>                        -- a spliced child (value or Html)
-    <ul>{m.rows.map fun r => <li key={r.id}>…</li>}</ul>  -- a keyed list
-
-  A *capitalized* tag is a declared component (the React rule), and its attributes are
-  props, not DOM attributes (see `componentToTerm`):
-    <Stepper key="s"/>                        -- framework-owned instance (`useState`)
-    <Widget key={r.id} note={r.label} onEmit={.reported r.id}/>  -- seeded, with outputs
-    <Row state={r} onMsg={.row}/>             -- parent-owned row (state lifted up)
-
-  Text runs are literal. Whitespace normalizes the JSX way: runs collapse to one
-  space, and a run containing a newline at a text edge disappears (so indentation
-  never renders). `{`, `}` and `<` cannot appear in a text run; splice them
-  (`{"{"}`). An unknown attribute name becomes `attr "name" value`, so any
-  attribute (`data-*`, `aria-*`, SVG geometry) is reachable inline.
-
-  The whole element parses atomically: if `<` does not begin a well-formed
-  element the parser backtracks, so comparisons (`a < b`) are unaffected.
--/
 import Lean
 import Qed.Notation
 import Qed.View
@@ -36,13 +5,6 @@ import Qed.View
 namespace Qed.Jsx
 open Lean Parser PrettyPrinter
 
-/-! ### Token-level parsers
-
-`jsxText` (a raw character run) and `jsxName` (a tag/attribute name, which may be a
-Lean keyword like `section` or contain hyphens like `data-role`) cannot be ordinary
-`ident`/token parsers, so they consume characters directly. -/
-
-/-- A run of literal JSX text: everything up to the next `<`, `{` or `}`. -/
 def jsxTextFn : ParserFn := fun c s =>
   let startPos := s.pos
   let s := takeWhile1Fn (fun ch => ch != '<' && ch != '{' && ch != '}') "JSX text" c s
@@ -56,9 +18,6 @@ def jsxText.formatter : Formatter := Formatter.visitAtom `Qed.Jsx.jsxText
 @[combinator_parenthesizer Qed.Jsx.jsxText]
 def jsxText.parenthesizer : Parenthesizer := Parenthesizer.visitToken
 
-/-- A tag or attribute name: letters, digits, `-`, `_`, `.` (so `section`, `my-widget`,
-    `aria-label` all parse, none of which an `ident` accepts, and a namespaced component
-    tag `<Foo.Bar/>` does too). -/
 def jsxNameFn : ParserFn := fun c s =>
   let startPos := s.pos
   let s := takeWhile1Fn (fun ch => ch.isAlphanum || ch == '-' || ch == '_' || ch == '.')
@@ -73,51 +32,35 @@ def jsxName.formatter : Formatter := Formatter.visitAtom `Qed.Jsx.jsxName
 @[combinator_parenthesizer Qed.Jsx.jsxName]
 def jsxName.parenthesizer : Parenthesizer := Parenthesizer.visitToken
 
-/-! ### Grammar -/
-
 declare_syntax_cat jsxElement
 declare_syntax_cat jsxAttr
 
-/-- An attribute value: a string literal or a spliced term. -/
 syntax jsxAttrVal := str <|> ("{" term "}")
 
 syntax (name := attrNamed)  jsxName ("=" jsxAttrVal)? : jsxAttr
 syntax (name := attrSplice) "{" term "}" : jsxAttr
 
-/-- A child: a text run, a spliced term, or a nested element. An ordered `<|>`
-    (not a syntax category) so the raw text parser is tried without tokenizing
-    first; a category dispatch would choke on text starting with a non-token
-    character (`−`, `•`, …). -/
+-- Ordered `<|>` (not a syntax category) so `jsxText` runs before tokenizing non-token chars like `•`.
 syntax jsxChild := jsxText <|> ("{" term "}") <|> jsxElement
 
 syntax (name := selfClosing)  "<" jsxName jsxAttr* "/>" : jsxElement
 syntax (name := withChildren) "<" jsxName jsxAttr* ">" jsxChild* "</" jsxName ">" : jsxElement
 
-/-- A JSX element is a term. `atomic` so a failed parse backtracks: `a < b`
-    stays a comparison. -/
 syntax:max (name := jsxTerm) atomic(jsxElement) : term
 
-/-! ### Expansion -/
-
-/-- The string under a `jsxText`/`jsxName` token node. -/
 private def tokenVal : Syntax → String
   | .node _ _ #[.atom _ v] => v
   | .atom _ v              => v
   | _                      => ""
 
-/-- The trailing whitespace captured after `stx`'s last token (`""` if none). -/
 private def trailingWs (stx : Syntax) : String :=
   match stx.getTailInfo with
   | .original _ _ trail _ => trail.toString
   | _                     => ""
 
-/-- Collapse a whitespace run: a run containing a newline at the edge of a text node
-    vanishes (indentation never renders); any other run is one space. -/
 private def collapseRun (run : String) (edge : Bool) : String :=
   if run.isEmpty then "" else if edge && run.contains '\n' then "" else " "
 
-/-- Normalize a JSX text run (with `lead`, the whitespace the tokenizer attached to
-    the previous token, restored in front). -/
 private def normalizeText (lead : String) (raw : String) : String :=
   let s := lead ++ raw
   let chars := s.toList
@@ -131,18 +74,14 @@ private def normalizeText (lead : String) (raw : String) : String :=
           go rest (acc ++ sep.toList ++ [ch]) [] false
   String.ofList (go chars [] [] true)
 
-/-- Attribute names that map to a typed helper in `Qed.Notation` (applied to the value). -/
 private def helperAttrs : List String :=
   ["value", "placeholder", "name", "href", "src", "alt", "title", "style", "key",
    "role", "rawHtml", "onClick", "onInput", "onChange", "onCheck", "onKeydown",
    "onKeyup", "onSubmit", "onBlur", "onFocus", "onDoubleClick", "onMouseDown",
    "onMouseUp", "disabled", "required", "checked", "readOnly"]
 
-/-- Boolean-flag helpers: a bare `<input disabled/>` becomes `disabled true`. -/
 private def flagAttrs : List String := ["disabled", "required", "checked", "readOnly"]
 
-/-- The helper a JSX attribute name expands through, if any (`class` → `cls`,
-    `type` → `type'`, helpers by their own name). -/
 private def attrHelper? (n : String) : Option Name :=
   if n == "class" then some (Name.mkStr2 "Qed" "cls")
   else if n == "type" then some (Name.mkStr2 "Qed" "type'")
@@ -151,9 +90,6 @@ private def attrHelper? (n : String) : Option Name :=
 
 mutual
 
-/-- Expand every JSX element inside an arbitrary term (bottom-up), so a spliced
-    `{…}` containing more JSX is fully reduced. Used directly by the `view%`
-    pre-pass; in plain terms the `jsxTerm` macro reaches the same code. -/
 partial def expandJsxIn (stx : Syntax) : MacroM Syntax := do
   if stx.getKind == ``jsxTerm then
     elementToTerm stx[0]
@@ -162,21 +98,17 @@ partial def expandJsxIn (stx : Syntax) : MacroM Syntax := do
     | .node info kind args => return .node info kind (← args.mapM expandJsxIn)
     | other                => return other
 
-/-- One attribute node → an `Attr` term. -/
 partial def attrToTerm (stx : Syntax) : MacroM Term := do
   if stx.getKind == ``attrSplice then
     return ⟨← expandJsxIn stx[1]⟩
-  -- attrNamed: jsxName ("=" jsxAttrVal)?
   let name := tokenVal stx[0]
   let valNode := stx[1]
   if valNode.getNumArgs == 0 then
-    -- bare flag: a known boolean helper gets `true`; anything else is an empty-valued attr
     if flagAttrs.contains name then
       return ⟨← `($(mkCIdent (Name.mkStr2 "Qed" name)) true)⟩
     else
       return ⟨← `(Qed.attr $(Syntax.mkStrLit name) "")⟩
   else
-    -- valNode = null["=", jsxAttrVal]; jsxAttrVal = strLit | group("{" term "}")
     let inner := valNode[1][0]
     let vT : Term ←
       if inner.isOfKind strLitKind then pure ⟨inner⟩
@@ -185,9 +117,6 @@ partial def attrToTerm (stx : Syntax) : MacroM Term := do
     | some h => return ⟨← `($(mkCIdent h) $vT)⟩
     | none   => return ⟨← `(Qed.attr $(Syntax.mkStrLit name) $vT)⟩
 
-/-- Is this an array-producing `xs.map (fun x => …)` or `Row.each …` call? If so a lone
-    spliced child is passed straight through as the children, the shape the
-    `view%` lift turns into a fine-grained keyed list. -/
 partial def isMapCall (stx : Syntax) : Bool :=
   let s := if stx.getKind == ``Lean.Parser.Term.paren && stx.getNumArgs == 3
     then stx[1] else stx
@@ -200,15 +129,10 @@ partial def isMapCall (stx : Syntax) : Bool :=
     | _ => false
   else false
 
-/-- The children of an element → the children argument of `el`. Each child node is
-    `jsxChild[ jsxText | group("{" term "}") | jsxElement ]`. -/
 partial def childrenToTerm (opener : Syntax) (kids : Array Syntax) : MacroM Term := do
   let isText (k : Syntax) : Bool := k[0].getKind == `Qed.Jsx.jsxText
   let isElement (k : Syntax) : Bool :=
     k[0].getKind == ``selfClosing || k[0].getKind == ``withChildren
-  -- A single spliced `.map` child becomes the children list itself (the keyed-list
-  -- shape): `.toList` pins the element type so the row elaborates against the
-  -- parent's `msg`, and the `view%` lift sees through it (`asMap?`).
   if kids.size == 1 && !isText kids[0]! && !isElement kids[0]! then
     let t ← expandJsxIn kids[0]![0][1]
     if isMapCall t then return ⟨← `((($(⟨t⟩)).toList))⟩
@@ -220,8 +144,6 @@ partial def childrenToTerm (opener : Syntax) (kids : Array Syntax) : MacroM Term
       let s := normalizeText (trailingWs prev) (tokenVal k[0])
       if !s.isEmpty then out := out.push ⟨Syntax.mkStrLit s⟩
     else
-      -- whitespace between two non-text children renders as one space, unless it
-      -- contains a newline (the JSX rule: indentation never renders)
       let gap := trailingWs prev
       if !gap.isEmpty && !gap.contains '\n' && (prev == opener || !isText prev) then
         out := out.push ⟨Syntax.mkStrLit " "⟩
@@ -232,19 +154,6 @@ partial def childrenToTerm (opener : Syntax) (kids : Array Syntax) : MacroM Term
     prev := k
   `([$out,*])
 
-/-- A component tag (a *capitalized* tag names a declared `component`): expand to its
-    mount. The attributes are props, not DOM attributes:
-
-    * `key={k}`: the instance key (any `ToString`). A framework-owned singleton may omit
-      it (a stable source-position key is derived); a tag rendered per row must pass one
-      (the React rule), or two rows would share state.
-    * `onEmit={h}`: receive the component's `emits` output as a parent message.
-    * `state={r}`: bind a parent-owned row (`r : C.State`), the parent holds the state
-      and the tag renders it. Requires `onMsg={.ctor}`, the parent `Msg` constructor
-      `(k : String) (msg : C.Msg)` its events route through; the routing key is the
-      component's declared `key` field (`C.keyOf r`) unless `key={…}` overrides it.
-    * `initial={…}`: seed local state once, without resetting it on parent updates.
-    * other `field={v}` attributes: live fields declared with `prop`. A bare field is `true`. -/
 partial def componentToTerm (stx : Syntax) (tag : String)
     (attrStxs : Array Syntax) (kids : Array Syntax) : MacroM Term := do
   let cName := (tag.splitOn ".").foldl Name.str Name.anonymous
@@ -252,12 +161,12 @@ partial def componentToTerm (stx : Syntax) (tag : String)
   unless kids.isEmpty do
     Macro.throwErrorAt stx s!"<{tag}>: a component tag renders the component's own view, \
       so it takes no children; write it self-closing (<{tag} …/>)"
-  let mut props   : Array (Syntax × String × Term) := #[]
-  let mut key?    : Option Term := none
-  let mut state?  : Option Term := none
+  let mut props    : Array (Syntax × String × Term) := #[]
+  let mut key?     : Option Term := none
+  let mut state?   : Option Term := none
   let mut initial? : Option Term := none
-  let mut onMsg?  : Option Term := none
-  let mut onEmit? : Option Term := none
+  let mut onMsg?   : Option Term := none
+  let mut onEmit?  : Option Term := none
   for a in attrStxs do
     if a.getKind == ``attrSplice then
       Macro.throwErrorAt a s!"<{tag}>: a component tag takes props (field=\{…}, key, \
@@ -271,16 +180,14 @@ partial def componentToTerm (stx : Syntax) (tag : String)
         if inner.isOfKind strLitKind then pure ⟨inner⟩
         else pure ⟨← expandJsxIn inner[1]⟩
     match name with
-    | "key"    => key? := some v
-    | "state"  => state? := some v
+    | "key"     => key? := some v
+    | "state"   => state? := some v
     | "initial" => initial? := some v
-    | "onMsg"  => onMsg? := some v
-    | "onEmit" => onEmit? := some v
-    | _        => props := props.push (a[0], name, v)
+    | "onMsg"   => onMsg? := some v
+    | "onEmit"  => onEmit? := some v
+    | _         => props := props.push (a[0], name, v)
   match state? with
   | some st =>
-      -- parent-owned: render the bound row, its messages tagged with the row's key, so
-      -- the parent's update routes them back via the generated `C.updateKeyed`
       if initial?.isSome then
         Macro.throwErrorAt stx "`initial` seeds local state; it cannot accompany `state`"
       if onEmit?.isSome then
@@ -291,8 +198,6 @@ partial def componentToTerm (stx : Syntax) (tag : String)
           Macro.throwErrorAt stx s!"<{tag} state=\{…}> needs onMsg=\{…}: the parent Msg \
             constructor `(k : String) (msg : {tag}.Msg)` its events route through"
       | some route =>
-          -- `Qed.Component`/`Qed.Runtime` are above this module, so their names are
-          -- emitted unresolved (`mkIdent`) and bind at the use site, which imports `Qed`
           let fids := props.map fun (_, n, _) => mkIdent (Name.mkSimple n)
           let vals := props.map fun (_, _, v) => v
           let p ← `(({ $[$fids:ident := $vals],* } : $(cId `Props)))
@@ -300,7 +205,6 @@ partial def componentToTerm (stx : Syntax) (tag : String)
           | some k => `($(cId `renderTag) $p $route $st (toString $k))
           | none   => `($(cId `renderTag) $p $route $st)
   | none =>
-      -- framework-owned: a keyed host element the driver mounts the instance into
       if onMsg?.isSome then
         Macro.throwErrorAt stx s!"<{tag}>: onMsg routes a parent-owned row; bind one with \
           state=\{…}, or receive outputs with onEmit=\{…}"
@@ -310,19 +214,16 @@ partial def componentToTerm (stx : Syntax) (tag : String)
       let mountBase : Term ← match onEmit? with
         | some h => `($(cId `mountWith) $keyT (fun out => $h out))
         | none   => `($(cId `mount) $keyT)
+      -- Unresolved `mkIdent`: `Qed.Component` / `Qed.Runtime` sit above `Qed.Jsx` in the import graph.
       let mountBase ← match initial? with
         | none => pure mountBase
         | some seed => `($(mkIdent `Qed.Attr.localInit) $mountBase ($seed : $(cId `State)))
-      let mountT : Term ←
-        do
-          let fids := props.map fun (_, n, _) => mkIdent (Name.mkSimple n)
-          let vals := props.map fun (_, _, v) => v
-          let values ← `(({ $[$fids:ident := $vals],* } : $(cId `Props)))
-          `($(mkIdent `Qed.Attr.localProps) $mountBase $values)
+      let fids := props.map fun (_, n, _) => mkIdent (Name.mkSimple n)
+      let vals := props.map fun (_, _, v) => v
+      let values ← `(({ $[$fids:ident := $vals],* } : $(cId `Props)))
+      let mountT ← `($(mkIdent `Qed.Attr.localProps) $mountBase $values)
       `(Qed.el "div" [Qed.key $keyT, $mountT] [])
 
-/-- One JSX element → `Qed.el "tag" [attrs] children` (or a component mount, for a
-    capitalized tag). -/
 partial def elementToTerm (stx : Syntax) : MacroM Term := do
   if stx.getKind == ``selfClosing then
     let tag := tokenVal stx[1]
@@ -345,19 +246,14 @@ partial def elementToTerm (stx : Syntax) : MacroM Term := do
 
 end
 
-/-- A JSX element in term position expands in place. -/
 @[macro jsxTerm] def expandJsxTerm : Macro := fun stx => do
   return (← elementToTerm stx[0])
 
-/-- Does this syntax contain any JSX? -/
 private partial def hasJsx : Syntax → Bool
   | .node _ kind args => kind == ``jsxTerm || args.any hasJsx
   | _                 => false
 
-/-- The `view%` pre-pass: expand all JSX in the body *before* the fine-grained lift
-    runs, so the lift sees the `el "tag" [attrs] [kids]` shapes it decomposes into
-    value updates, signals and keyed lists. Declared after `Qed.View`'s rule, so it
-    is tried first; with no JSX present it defers to the original. -/
+-- Declared after `Qed.View`'s `macro_rules` so JSX expands before `view%` lifts the body.
 macro_rules
   | `(view% fun $m:ident => $body) => do
       if !hasJsx body then Macro.throwUnsupported

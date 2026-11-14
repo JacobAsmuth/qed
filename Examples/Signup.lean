@@ -1,16 +1,3 @@
-/-
-  Tour 09 · Schema forms
-
-  A form across HTML input types, with "submit ⇔ valid" by construction.
-
-  `schema Account` generates the editable `Account.Draft` (raw strings), the validated
-  `Account` (each refined field a proof-carrying `Field`), `Account.parse`, the
-  `canSubmit` gate + its `canSubmit_iff` proof, and `Account.formView` (the widgets). The app
-  holds a draft, replaces it on every edit, and on submit stores the parsed
-  `Option Account`, which is `some` only when every field validates. The submit
-  button `formView` renders is disabled unless the draft parses, so it cannot fire
-  on invalid data.
--/
 import Qed
 open Qed
 
@@ -31,7 +18,7 @@ structure Model where
   submitted : Option Account
 
 inductive Msg
-  | edit (d : Account.Draft)   -- the form hands back the whole updated draft
+  | edit (d : Account.Draft)
   | submit
 
 def update (m : Model) : Msg → Model

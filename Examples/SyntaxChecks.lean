@@ -1,4 +1,3 @@
-/- Compile-time regressions for the authored component API. -/
 import Examples.Local
 import Examples.Todo
 open Qed
@@ -14,17 +13,14 @@ component Counter where
     set count (count + step * times), set saved count, send count
   view => <button onClick={.advance 2}>{count}</button>
 
--- Assignments and outputs share the pre-update state. A failed guard emits nothing.
 example : Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 2) =
     ({ count := 10, saved := 4 }, some 4) := rfl
 example : Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 0) =
     ({ count := 4, saved := 0 }, none) := rfl
 
--- Defaults are usable at mount sites, while explicit initial values seed only state.
 def defaults : Html Unit := <Counter initial={{ count := 8 }}/>
 #guard (Html.renderWith Counter.regs defaults).contains "8</button>"
 
--- Registration follows imported helpers and their nested components.
 def importedHelper (r : Local.Row) : Html Local.Msg := Local.widgetView r
 
 def helperApp : App Local.Model Local.Msg := ui Local.init Local.update fun m =>
@@ -34,7 +30,6 @@ def helperApp : App Local.Model Local.Msg := ui Local.init Local.update fun m =>
 #guard (helperApp.locals.map (·.id)).contains "Local.Tag"
 #guard helperApp.locals.length == 2
 
--- Keyed messages address identity after sorting, and become no-ops after deletion.
 def rows : Array Todo.Row.State :=
   #[{ id := 8, text := "Zulu", done := false }, { id := 2, text := "Alpha", done := false }]
 def sorted := Todo.Board.update { rows } .sort
@@ -59,7 +54,6 @@ component DuplicateAction where
   action save => set count 2
   view => <span>{count}</span>
 
-/-- A parent-owned component may receive props without storing them in its state. -/
 component Owned where
   prop caption : String
   state id : Nat
@@ -73,16 +67,14 @@ def ownedView : Html (String × Owned.Msg) :=
 #guard (Html.render ownedView).contains "Live"
 example : (Owned.update { caption := "Live" } { id := 4, count := 2 } .increment).count = 3 := rfl
 
--- A helper inside a component is included even when rendering through Name.regs.
 def counterHelper {msg : Type} : Html msg := <Counter key="helper"/>
-/-- A component whose child is supplied by a helper. -/
+/-- Component whose child is supplied by a helper. -/
 component Container where
   state unused : Nat := 0
   view => <div>{counterHelper}</div>
 #guard (Container.regs.map (·.id)).contains "SyntaxChecks.Counter"
 #guard (Container.app.renderInitial).contains "0</button>"
 
--- renderWithLocals preserves rawHtml, void elements, and unescaped raw-text <style>.
 def ssrEdgeCases : Html Unit :=
   <div>
     <style>{".a > .b { content: \"</style>\"; }"}</style>
@@ -96,7 +88,6 @@ def ssrEdgeCases : Html Unit :=
 #guard (Html.renderWith Counter.regs ssrEdgeCases).contains "<em>raw</em>"
 #guard (Html.renderWith Counter.regs ssrEdgeCases).contains "8</button>"
 
--- Component JSON instances are scoped per component so multi-file namespaces never collide.
 example : ToJson Counter.Props := Counter.Props.instToJson
 example : FromJson Counter.Props := Counter.Props.instFromJson
 example : ToJson Counter.State := Counter.State.instToJson
@@ -104,7 +95,6 @@ example : FromJson Counter.State := Counter.State.instFromJson
 example : ToJson Owned.State := Owned.State.instToJson
 example : FromJson Owned.State := Owned.State.instFromJson
 
--- Issue #11: `route_enum` & `RouteParam` in `router`, `exactlyOneOf`, and `from init` in `invariant`.
 route_enum Section where
   overview
   architecture => "arch"
@@ -133,7 +123,6 @@ invariant navExclusive :
 def stepCount (n : Nat) (d : Nat) : Nat := n + d
 invariant nonNegFromZero : (fun n : Nat => 0 ≤ n) from (0 : Nat) preserved_by stepCount
 
--- Issue #12: `LawfulJson` + `Dehydrate` round-trip and `(dehydrate := ...)` in `ui`.
 def docDehydrate : Dehydrate (DocRoute × Resource (Array Qed.Demo.Signup)) :=
   Dehydrate.full
 
@@ -148,7 +137,6 @@ def routedDehydratedApp : App DocRoute DocRoute :=
 #guard routedDehydratedApp.rehydrate (routedDehydratedApp.dehydrate (.sec .benchmarks 3))
   == some (.sec .benchmarks 3)
 
--- Issue #13: non-vacuous role checks, exclusive style checks, composite view unfolding, `assuming`, and `for_each` with `from init`.
 /-- error: styling invariant `badVacuousRole` doesn't hold for every model, `roleHasOneOf "nonexistent" [navOn, navOff]` is false for some `navView m`.
 
 Some element the rule constrains isn't carrying one of the required style classes (or no element with that role/tag is rendered). Check that the `role`/tag it matches exists and gets one of the styles passed to `roleHasOneOf`/`tagHasOneOf` in every branch of `navView`. If the view is routed through `App.view`/`View.render` rather than a plain `Model → Html`, prove it with:  invariant badVacuousRole : … holds_in navView := by … -/
@@ -194,7 +182,6 @@ def updateRowList (m : RowList) : RowListMsg → RowList
 
 invariant listSafeFromInit : rowSafeFromInit for_each rows preserved_by updateRowList
 
--- Issue #14: `?query`/`#hash` stripping in `Router.fromURL`, typed `ToHref` in JSX, and `Dehydrate.fromRoute`.
 #guard Router.fromURL "/docs/arch/2?tab=api#top" == some (DocRoute.sec .architecture 2)
 #guard Router.fromURL "/?utm=1#hero" == some DocRoute.home
 
@@ -207,7 +194,6 @@ def routeDehydrate : Dehydrate AppModel :=
 #guard routeDehydrate.rehydrate (routeDehydrate.dehydrate { route := .sec .benchmarks 7 })
   == some { route := .sec .benchmarks 7 }
 
--- Issue #15: auto-collected `App.styles`, `:where()` theme resets, typed borders, composable `View`, and singleton `<Comp/>`.
 def autoStyledApp : App AppModel Unit := ui { route := .home } (fun m _ => m) fun m => compositeNav m
 #guard autoStyledApp.styles.length == 2
 #guard (autoStyledApp.ssrStep "T" "/qed.js" "/" "").contains navOn.raw

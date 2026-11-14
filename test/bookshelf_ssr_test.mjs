@@ -1,24 +1,8 @@
-// bookshelf_ssr_test.mjs: server-side rendering through the generated request handler.
-//
-// `qed build` emits ssr.mjs next to the client bundle: a request → HTML handler built
-// from the app itself (route dispatch, the app's own `queries` run server-side, render,
-// dehydrate). The app contains no SSR code. We render a few routes through the handler
-// (data injected via the `fetch` option) and assert the markup is dynamic and complete,
-// then serve one page through a real HTTP server with the API on the same origin, the
-// default-fetch path `qed start` uses.
-import { spawnSync } from 'node:child_process';
-import { createServer } from 'node:http';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { SERVE, buildDev, serve, send, withBrowser, sleep } from './harness.mjs';
 
-const ROOT = new URL('..', import.meta.url).pathname;
-const SERVE = path.join(ROOT, '.qed', 'dev');
-const PORT = 8188;
-
-console.log('▸ building (QED_WEB_ROOT=Examples.BookshelfWeb ./scripts/qed build --dev)…');
-if (spawnSync('bash', ['-lc', `cd '${ROOT}' && QED_WEB_ROOT=Examples.BookshelfWeb ./scripts/qed build --dev`], { stdio: 'inherit' }).status !== 0) {
-  console.error('build failed'); process.exit(1);
-}
+buildDev('Examples.BookshelfWeb');
 
 const books = [
   { id: 'dune',        title: 'Dune',                author: 'Frank Herbert',      year: 1965, genre: 'fiction',    inPrint: true },
@@ -35,57 +19,75 @@ const api = (pathname) => {
 };
 
 const ssrMod = await import(pathToFileURL(path.join(SERVE, 'ssr.mjs')).href);
-
-// A handler with the data source injected: render pages without any HTTP server at all.
 const handler = ssrMod.makeHandler(ssrMod.mod, {
   title: 'Bookshelf', script: '/qed_host.mjs',
   fetch: async (u) => {
     const body = api(new URL(u).pathname);
-    return body !== null ? new Response(body, { status: 200 })
-                         : new Response('{}', { status: 404 });
+    return body !== null ? new Response(body, { status: 200 }) : new Response('{}', { status: 404 });
   },
 });
-const render = async (p) => await (await handler(new Request(`http://localhost:${PORT}${p}`))).text();
+const render = async (p, origin = 'http://127.0.0.1') =>
+  await (await handler(new Request(`${origin}${p}`))).text();
 
-let failures = 0;
-const check = (label, got, want) => {
-  const ok = got === want;
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}: got ${JSON.stringify(got)}${ok ? '' : `, want ${JSON.stringify(want)}`}`);
-  if (!ok) failures++;
-};
-const has = (h, n) => h.includes(n);
+let apiHits = 0;
 
-const home = await render('/');
-const dune = await render('/books/dune');
-const geb  = await render('/books/geb');
-const add  = await render('/new');
+await withBrowser('BOOKSHELF-SSR', {
+  spa: false,
+  routes: async (req, res, url) => {
+    if (url.pathname.startsWith('/api/')) {
+      apiHits++;
+      send(res, 404, 'application/json', '{}');
+      return true;
+    }
+    if (!url.pathname.includes('.')) {
+      send(res, 200, 'text/html', await render(url.pathname, url.origin));
+      return true;
+    }
+    return false;
+  },
+}, async ({ page, check, baseUrl }) => {
+  const home = await render('/');
+  const dune = await render('/books/dune');
+  const geb  = await render('/books/geb');
+  const add  = await render('/new');
 
-check('catalog lists every book server-side',
-  has(home, 'class="books"') && has(home, '>Dune<') && has(home, '>Neuromancer<') && has(home, 'Gödel, Escher, Bach'), true);
-check('a detail page carries that book\'s fields',
-  has(dune, 'Frank Herbert') && has(dune, '1965') && has(dune, 'In print'), true);
-check('out-of-print is rendered from the data', has(geb, 'Out of print'), true);
-check('the add page is the form', has(add, 'class="qed-form"') && has(add, 'type="checkbox"') && has(add, '<select'), true);
-check('rendering is dynamic (pages differ by route)', home !== dune && dune !== geb && geb !== add, true);
-check('each page is a full document that loads the app', has(dune, 'id="app"') && has(dune, '<script'), true);
-check('the page embeds the dehydrated state', has(home, 'id="qed-state"'), true);
+  check('catalog lists every book server-side',
+    home.includes('class="books"') && home.includes('>Dune<') && home.includes('>Neuromancer<') && home.includes('Gödel, Escher, Bach'), true);
+  check("a detail page carries that book's fields",
+    dune.includes('Frank Herbert') && dune.includes('1965') && dune.includes('In print'), true);
+  check('out-of-print is rendered from the data', geb.includes('Out of print'), true);
+  check('the add page is the form', add.includes('class="qed-form"') && add.includes('type="checkbox"') && add.includes('<select'), true);
+  check('rendering is dynamic (pages differ by route)', home !== dune && dune !== geb && geb !== add, true);
+  check('each page is a full document that loads the app', dune.includes('id="app"') && dune.includes('<script'), true);
+  check('the page embeds the dehydrated state', home.includes('id="qed-state"'), true);
 
-// And once through a real server: same-origin /api + the default handler (real fetch).
-const server = createServer(async (req, res) => {
-  const u = new URL(req.url, `http://localhost:${PORT}`);
-  const body = api(u.pathname);
-  if (body !== null) { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(body); return; }
-  const r = await ssrMod.default(new Request(u));
-  res.writeHead(r.status, Object.fromEntries(r.headers.entries()));
-  res.end(await r.text());
+  const apiSrv = await serve({
+    routes: async (req, res, url) => {
+      const body = api(url.pathname);
+      if (body !== null) { send(res, 200, 'application/json', body); return true; }
+      const r = await ssrMod.default(new Request(url));
+      res.writeHead(r.status, Object.fromEntries(r.headers.entries()));
+      res.end(await r.text());
+      return true;
+    },
+  });
+  try {
+    const viaServer = await (await fetch(`${apiSrv.baseUrl}/books/neuromancer`)).text();
+    check('served end-to-end (same-origin API, default fetch)', viaServer.includes('William Gibson'), true);
+  } finally {
+    await apiSrv.close();
+  }
+
+  await page.goto(`${baseUrl}/`, { waitUntil: 'load' });
+  await page.waitForSelector('#app .catalog', { timeout: 20000 });
+  await sleep(150);
+
+  const text = await page.$eval('#app .catalog', (e) => e.textContent);
+  check('catalog rendered the books (from dehydrated state)', text.includes('Dune') && text.includes('Neuromancer'), true);
+  check('no "Loading…", the data was already present', text.includes('Loading'), false);
+  check('the client did NOT refetch the catalog (zero /api hits)', apiHits, 0);
+
+  await page.click('#app nav a');
+  await sleep(50);
+  check('app is live after hydration (nav present)', (await page.$('#app nav')) !== null, true);
 });
-server.listen(PORT);
-try {
-  const viaServer = await (await fetch(`http://localhost:${PORT}/books/neuromancer`)).text();
-  check('served end-to-end (same-origin API, default fetch)', has(viaServer, 'William Gibson'), true);
-} finally {
-  server.close();
-}
-
-console.log(failures === 0 ? '\nALL BOOKSHELF-SSR CHECKS PASSED ✅' : `\n${failures} BOOKSHELF-SSR CHECK(S) FAILED ❌`);
-process.exit(failures === 0 ? 0 : 1);

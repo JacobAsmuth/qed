@@ -32,7 +32,7 @@ reuse it. The demo server connects the generated SSR handler to the API.
 
 The README screenshot shows this app's catalog with the demo seed data. To run the browser
 checks, install the test dependencies with `npm ci --prefix test`, then run
-`node test/bookshelf_test.mjs` and `node test/bookshelf_hydrate_test.mjs` separately.
+`node test/bookshelf_test.mjs` and `node test/bookshelf_ssr_test.mjs` separately.
 
 ## Streaming chat
 

@@ -1,4 +1,3 @@
-/- Browser entry: the plain-Html keyed-list baseline, run through the verified diff path. -/
 import Examples.Bench.ListDiff
 import Qed.Driver
 

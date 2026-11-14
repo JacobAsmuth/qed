@@ -1,7 +1,3 @@
-/-
-  Browser entry point for the React head-to-head benchmark app (`test/bench_react.mjs`).
-  Transpiled to JavaScript by `qed build`.
--/
 import Examples.Bench.App
 import Qed.Driver
 

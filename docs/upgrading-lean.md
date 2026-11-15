@@ -1,93 +1,96 @@
 # Upgrading the Lean toolchain
 
-Qed pins one Lean toolchain for the whole repo (`lean-toolchain`). The pin exists because the
-build-time transpiler (`Js/Backend.lean`) reads `Lean.IR`, which is internal and changes between
-releases. **What you ship is unaffected** — the emitted `.mjs` is plain JavaScript with no Lean at
-runtime — only the *build* is coupled, and the coupling is bounded and fail-loud. A bump is a
-checklist, not an archaeology dig. This file is that checklist, with the v4.15 → v4.30 jump as a
-worked example.
+Qed pins a single Lean version in `lean-toolchain`. Emitted `.mjs` bundles are plain JavaScript
+with zero Lean runtime dependencies, so **deployed apps are unaffected**—only build-time tools
+(`Js/Backend.lean` and `Js/VerifyEnv.lean`) read internal `Lean.IR` and `Lean.Environment` APIs
+that can change across Lean releases.
 
-Do it on a branch. At each step, the failure mode tells you exactly what to fix.
+Upgrading Lean is a bounded, fail-loud checklist: at almost every step, the compiler or test
+gate tells you exactly what changed. Work on a branch and walk through the six steps below
+(illustrated with concrete examples from the `v4.15` → `v4.30` upgrade).
 
-## 1. Bump the toolchain
+## 1. Update `lean-toolchain`
 
 ```bash
 echo "leanprover/lean4:vX.Y.0" > lean-toolchain
 elan toolchain install leanprover/lean4:vX.Y.0
 ```
 
-No external package deps (`lake-manifest.json` is empty), so there is nothing else to co-upgrade.
+Qed has no external Lake package dependencies (`lake-manifest.json` is empty), so there are no
+third-party libraries to co-upgrade.
 
-## 2. Build the framework — `lake build Qed`
+## 2. Build the framework (`lake build Qed`)
 
-Surfaces core/`Std` API churn in the framework itself. These are ordinary deprecations/renames; the
-error or warning often includes a suggested replacement. From v4.15 → v4.30:
+This surfaces standard library (`Init` / `Std`) renames, deprecations, and tactic changes across
+`Qed/`. Compiler errors and deprecation warnings usually suggest the replacement directly.
 
-- `String.mk` → `String.ofList`, `String.data` → `String.toList` (deprecations).
-- `Array.mkArray` → `Array.replicate`.
-- `String` became UTF-8/`ByteArray`-backed: the anonymous constructor `⟨listChar⟩ : String` no
-  longer works (it now resolves to `String.ofByteArray`); use `String.ofList`. Proofs over the old
-  `List Char` representation switch to `String.toList_ofList` and friends.
-- Stdlib lemmas making their explicit args implicit: `List.not_mem_nil`, `List.mem_cons_self`.
-- A stricter `simp`: an `if` in a proof goal is no longer split for free — add `split` (this bit
-  `Examples/Chat.lean`'s invariant).
-- The `unusedSimpArgs` linter flags now-redundant `simp only [...]` args; trim them.
+Examples from `v4.15` → `v4.30`:
 
-## 3. Build the transpiler — `lake build qedjs`
+- **Renames:** `String.mk` → `String.ofList`, `String.data` → `String.toList`, and
+  `Array.mkArray` → `Array.replicate`.
+- **`String` representation:** `String` switched to UTF-8 `ByteArray` backing, so anonymous
+  constructors (`⟨chars⟩ : String`) now resolve to `String.ofByteArray`; use `String.ofList`
+  and `String.toList_ofList` in proofs instead.
+- **Implicit arguments:** stdlib lemmas like `List.not_mem_nil` and `List.mem_cons_self` made
+  previously explicit arguments implicit.
+- **Tactic strictness:** `simp` no longer splits `if` expressions automatically (add `split`),
+  and the `unusedSimpArgs` linter flags redundant entries in `simp only [...]`.
 
-Surfaces `Lean.IR` changes. The dependent surface is enumerated in the header of `Js/Backend.lean`;
-that header is the list to recheck. Failures are loud: a removed/renamed IR constructor breaks an
-exhaustive `match` ("Unknown constant …" / "Missing cases …"), a renamed accessor fails to resolve.
-From v4.15 → v4.30:
+## 3. Build the JS compiler (`lake build qedjs`)
 
-- `Lean.IR.Arg.irrelevant` → `Arg.erased`; `Lean.IR.IRType.isIrrelevant` → `isErased`.
-- `Lean.IR.FnBody.mdata` was removed (drop the match arms).
-- `List.enum` → `List.zipIdx` (the tuple flips from `(i, a)` to `(a, i)`).
-- `Lean.Import` gained fields (`importAll`/`isExported`/`isMeta`); build it with `{ module := … }`
-  and the defaults instead of `Import.mk m false`.
+This surfaces internal changes in `Lean.IR` and `Lean.Environment` across
+[`Js/Backend.lean`](../Js/Backend.lean), [`Js/VerifyEnv.lean`](../Js/VerifyEnv.lean), and
+[`Js/Main.lean`](../Js/Main.lean). Because IR lowering matches exhaustively over `FnBody`,
+`Expr`, and `Arg`, added or removed constructors fail immediately at compile time.
 
-## 4. The runtime IO convention (`runtime/qed_rt.mjs`)
+Examples from `v4.15` → `v4.30`:
 
-This is the one change that isn't a compile error — it is a *semantic* convention. Confirm how the
-target version represents IO by dumping the IR of a small IO function:
+- `Lean.IR.Arg.irrelevant` → `Arg.erased`, and `Lean.IR.IRType.isIrrelevant` → `isErased`.
+- `Lean.IR.FnBody.mdata` was removed (drop the obsolete match arm).
+- `List.enum` → `List.zipIdx` (note the tuple order flipped from `(i, a)` to `(a, i)`).
+- `Lean.Import` gained fields (`importAll`, `isExported`, `isMeta`); construct it with
+  `{ module := … }` so new fields pick up their defaults.
 
-```lean
--- lake env lean --run a file that importModules and `IO.println (toString (format decl))`
-```
+## 4. Verify the runtime `IO` convention (`runtime/qed_rt.mjs`)
 
-What to check: does a `BaseIO` extern's result get used directly (`case x` on the value) or
-`.f[0]`-unwrapped? Is the monad's `pure` a one-field ctor or two? v4.30 **erased the RealWorld
-token** and made IO results single-field `EST.Out.ok`/`.error`, so in `qed_rt.mjs`:
+This is the one step that is **semantic rather than a compile error**, so check it deliberately.
+Inspect the lowered IR of a tiny `IO` function to confirm how the new Lean release represents
+`BaseIO` and `IO` return values:
 
-- `BaseIO` externs return their value directly (`ST.Prim.Ref` get/set/mkRef/take,
-  `getStderr`/`getStdout`), **not** `mkOk(value, world)`.
-- `mkOk`/`mkErr` are single-field.
+- Does a `BaseIO` primitive (`ST.Prim.Ref.get`, `mkRef`, `set`, `take`, `getStdout`) return its
+  value directly, or wrapped in a constructor?
+- Does `EST.Out.ok` / `.error` carry one field (the value/error alone) or two (value + world
+  token)?
 
-If this is wrong the app builds and the gate passes (both are pure) but the live driver silently
-takes a wrong branch on boot — so do this step deliberately.
+In `v4.30`, Lean **erased the `RealWorld` token**, making `EST.Out.ok` and `.error` single-field
+constructors and causing `BaseIO` externs to return raw values directly rather than
+`mkOk(value, world)`. If `runtime/qed_rt.mjs` disagrees with this convention, pure builds and
+pure tests will still pass while the live browser driver misreads `IO` results on boot.
 
-## 5. Discover new/renamed runtime externs
+## 5. Implement any new stdlib externs
 
-The transpiled stdlib will reference externs the runtime doesn't implement yet. They are listed by
-name at boot (the runtime's `assertExterns`) and by the differential gate:
-
-```bash
-node test/js_gate_test.mjs        # lists "missing externs: …" then 96/96 once implemented
-```
-
-Most are renames (`Array.mkArray` → `Array_replicate`) or thin scalars; the substantive batch is
-whatever new String/`ByteArray` byte-API the version introduced. Add them to the
-"v4.x stdlib externs" block in `qed_rt.mjs`. Watch the arity: an extern carrying a type-class
-instance (e.g. `Array.get!Internal`'s `[Inhabited α]`) takes that instance as a real argument.
-
-## 6. Validate
+When Lean's standard library introduces or renames `@[extern]` functions used by reachable code,
+both boot-time `assertExterns` and the JS differential gate print their exact names:
 
 ```bash
-./scripts/qed check                 # proofs replay, axiom-clean, no sorry — the verification gate
-node test/js_gate_test.mjs  # 96/96 — transpiled JS == native Lean
-./scripts/qed test                  # the full browser suite (apps cover HTTP/streaming/ws/timers/SSR)
+node test/js_gate_test.mjs   # reports "missing externs: …" until all are implemented
 ```
 
-The gate is the contract: it pins the transpiled JavaScript to the native Lean semantics, so a
-subtle IR mis-read shows up as a mismatch rather than a silent bug. When all three are green, the
-bump is done.
+Add missing primitives to the stdlib externs section of [`runtime/qed_rt.mjs`](../runtime/qed_rt.mjs).
+Most are simple renames (such as `Array_replicate`) or byte/string helpers (such as
+`ByteArray_get`). Check parameter arity carefully: externs with a typeclass constraint—like
+`Array.get!Internal`'s `[Inhabited α]`—receive that instance as a runtime parameter unless Lean
+erased it.
+
+## 6. Run the full verification suite
+
+```bash
+./scripts/qed check          # Lean proofs, VerifyEnv gate, and axiom manifest
+node test/js_gate_test.mjs   # native Lean vs. transpiled JS differential checks
+./scripts/qed test           # full headless-browser suite (DOM, effects, sockets, SSR)
+```
+
+`js_gate_test.mjs` pins transpiled JavaScript output directly against native Lean evaluation,
+catching subtle IR lowering mismatches immediately, while `./scripts/qed test` exercises the
+live `IO` runtime, DOM driver, effects, and SSR hydration end-to-end. Once all three commands
+pass, the toolchain upgrade is complete.

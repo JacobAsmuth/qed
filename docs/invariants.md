@@ -1,58 +1,68 @@
 # Invariants
 
-An invariant is a condition that should be true after each update. Qed tries to prove this
-for every message, assuming the condition was true before the update. Lean checks the proof.
-If the condition is also true for the initial state, it is true after any number of updates.
+An invariant is a rule that must hold after every state update. When you declare one, Qed
+asks Lean's kernel to prove that every message preserves the rule, assuming it held beforehand.
+If the initial state also satisfies the rule, the rule holds for every state reachable through
+`update`.
 
 ```lean
 invariant counterSafe (m) : 0 ≤ m.count preserved_by update
 ```
 
-This expands to a theorem, `∀ m msg, 0 ≤ m.count → 0 ≤ (update m msg).count`. Comma-separated
-clauses (`1 ≤ m.qty, m.qty ≤ 10`) combine with `∧`, `from init` also checks the initial state,
-`invariant name (m) on app : …` checks both `app.init` and `app.update`, and inside a
-`component` block `invariant 1 ≤ qty, qty ≤ 10` binds component fields directly. If the
-automatic proof doesn't succeed, compilation fails. Either an update breaks the rule or
-Qed needs help with the proof. This checks the Lean update function; see
-[how Qed works](architecture.md) for what else the app relies on.
+This generates and checks the theorem `∀ m msg, 0 ≤ m.count → 0 ≤ (update m msg).count`. If Qed
+cannot prove a branch, compilation fails and reports the exact message constructor and remaining
+goal.
 
-## Why this matters for generated code
+### Syntax quick reference
 
-After a change to a handler, Qed checks its invariants again during compilation. A condition
-such as "the quantity stays in range" specifies the requirement. The proof covers every model
-and message described by the theorem. Check the rule
-itself too: it needs to describe the behavior you actually care about.
+| What you want to check | Syntax |
+|------------------------|--------|
+| One pure `update` or `transition` | `invariant safe (m) : 0 ≤ m.count preserved_by update` |
+| Initial state + `update` | `invariant safe (m) : 0 ≤ m.count from init preserved_by update` |
+| An `App` (`app.init` + `app.update`) | `invariant safe (m) on counterApp : 0 ≤ m.count` |
+| Multiple clauses (`∧`) | `invariant inRange (m) : 1 ≤ m.qty, m.qty ≤ 10 preserved_by update` |
+| Inside a `component` block | `invariant 1 ≤ qty, qty ≤ 10` |
+| Rendered HTML / styles | `invariant styled : roleHasOneOf "save" [on, off] holds_in view` |
 
-`qed check` scans selected sources for `sorry`, `admit`, and `native_decide`. If an axiom
-manifest exists, it rejects output containing `sorryAx` or `error:`. It does **not** enforce
-an axiom whitelist or inspect every theorem. Its note about updates without invariants is
-based on a source scan and can miss cases.
+Invariants check your Lean model and view functions; see [how Qed works](architecture.md) for
+how those connect to the JavaScript runtime and browser.
 
-This is also why a `component` declaration compiles its `set` handlers to a generated `Msg` with
-one named constructor per site, never to a closure: `invariant … preserved_by Name.update` reduces
-over the generated cases exactly as over hand-written ones. The compiler error includes the
-constructor and unresolved goal (``case `set_count_2` still needs: 0 ≤ m.count - 1``).
-See `Examples/Local.lean`.
+## Why compile-time invariants help
 
-## The two forms
+Whenever you add a new action or edit an existing handler, every invariant on that model is
+re-checked automatically. Because `component` compiles inline handlers (like `{count -= 1}`)
+into named `Msg` constructors rather than anonymous closures, generated updates get the exact
+same case-by-case error reporting as hand-written reducers:
 
-**Automatic.** State the property; the discharger handles it. It covers arithmetic (`omega`),
-boolean/`Option` reasoning, `if`/`match` splits, and the `steps` arm normalisation.
+```text
+case `set_count_2` still needs: 0 ≤ m.count - 1
+```
+
+Running `qed check` (or `qed build`) reinforces these proofs by verifying the compiled
+`Lean.Environment` (`Js/VerifyEnv.lean`) against Lean's standard axioms—rejecting `sorry`,
+`admit`, `native_decide`, custom axioms, and `partial`/`unsafe` code. `qed check` also prints a
+heuristic note if it spots stateful update functions without an `invariant`, though you only
+need to add invariants where there is a meaningful rule to enforce.
+
+## Automatic vs. custom proofs
+
+**Automatic.** Most arithmetic (`omega`), boolean, `Option`, and `if`/`match` properties prove
+themselves with no tactic script:
 
 ```lean
 invariant counterSafe (m) : 0 ≤ m.count preserved_by update
 ```
 
-**Effectful transitions and apps** work with the same syntax; the next model is read out of the
-`Model × Cmd Msg` a `transition` returns, or directly from an `App`:
+Effectful `transition` functions (`Model → Msg → Model × Cmd Msg`) and `App` values use the
+exact same syntax—Qed automatically projects the next model out of `(model, cmd)`:
 
 ```lean
 invariant streamSafe (m) on chatApp : m.pending = true → 0 < m.turns.size
 ```
 
-**With a proof (`:=`).** When the property needs a lemma the automation can't guess, usually one
-quantified over your own collections, supply the proof. The goal is the generated theorem, so it
-opens with `intro m msg h`:
+**Custom proof (`:= by`).** When a property quantifies over a collection (`Array` or `List`) or
+relies on a domain lemma that automation cannot guess, attach a Lean tactic proof with `:= by`.
+The proof goal is the generated theorem, starting with `intro m msg h`:
 
 ```lean
 invariant idsBelowNext (m) : ∀ r ∈ m.rows, r.id < m.nextId
@@ -61,180 +71,164 @@ invariant idsBelowNext (m) : ∀ r ∈ m.rows, r.id < m.nextId
   cases msg <;> simp_all [update] <;> omega
 ```
 
-## Lifting a contract over a list of children (`for_each`)
+## Lifting invariants over child collections (`for_each`)
 
-With parent-owned components (rendered with `<Card state={c} onMsg={.card}/>`), the child
-states are elements of an array in the parent's model. With `for_each`, Qed uses the child's
-invariant to check that the parent's updates preserve the rule for every child:
+When a parent stores an array of child states (for example, `cards : Array Card.State`),
+`for_each` lifts a child's invariant across every element in the parent's array:
 
 ```lean
-abbrev Card.Safe (c : Card.State) : Prop :=                 -- the child's contract, written once
+abbrev Card.Safe (c : Card.State) : Prop :=
   0 ≤ c.likes ∧ c.progress ≤ c.duration ∧ (c.liked → 1 ≤ c.likes)
-invariant cardSafe : Card.Safe preserved_by Card.update     -- the card never breaks it
 
-def update : Model → Msg → Model | ...                      -- tap / re-rank / dismiss / add
+invariant cardSafe : Card.Safe preserved_by Card.update
 
 invariant feedSafe : cardSafe for_each cards preserved_by update
--- ⇒ machine-checks: ∀ m msg, (∀ c ∈ m.cards, Card.Safe c) → (∀ c ∈ (update m msg).cards, Card.Safe c)
+-- Checks: ∀ m msg, (∀ c ∈ m.cards, Card.Safe c) → (∀ c ∈ (update m msg).cards, Card.Safe c)
 ```
 
-When the declaration refers to a child invariant such as `cardSafe`, Qed infers the predicate
-from that invariant. The predicate can also be specified explicitly:
-`Card.Safe for_each cards preserved_by update using cardSafe`.
+Qed infers `Card.Safe` directly from `cardSafe` (or you can write the predicate explicitly as
+`Card.Safe for_each cards preserved_by update using cardSafe`). Because `feedSafe` is itself a
+`∀ c ∈ cards, …` theorem, `for_each` composes cleanly across nested collections (e.g., a shell
+owning multiple feeds).
 
-Qed applies a proven lemma for each supported list operation. For a keyed child message,
-it uses `cardSafe`. Filtering preserves the invariant because the remaining elements were
-already valid. Adding an element requires a proof that the new element is valid; updating
-rows with `Array.map` requires a proof for each updated row. Sorting with `Array.sortBy`
-is supported through its membership lemma. `Array.qsort` is not handled automatically.
+### Supported collection operations
 
-Because `feedSafe` is itself a `∀ c ∈ cards, …` fact, it composes: a grandparent that owns several
-feeds can use `invariant shellSafe : feedSafe for_each feeds preserved_by update
-using feedSafe`. Lifts track where your data model nests collections, not render depth.
+- **Keyed child updates:** discharged automatically using `cardSafe`.
+- **`Array.filter`:** preserved automatically since kept items were already valid.
+- **Adding / pushing items:** Qed checks that the newly added item satisfies `Card.Safe`.
+- **`Array.map`:** Qed checks that transforming a valid item produces a valid item.
+- **`Array.sortBy`:** preserved automatically via its permutation membership lemma (`Array.qsort`
+  is *not* handled automatically and requires a custom lemma).
 
-**When an arm can't be lifted** (a `qsort`, a raw `++` of unvalidated data, an `add` whose element
-isn't provably valid), the error message includes the arm, operation, and a proof skeleton.
-The `forEachLift` tactic handles the supported cases; the remaining cases need a supplied proof:
+If one branch uses an unsupported operation (such as `qsort` or concatenating unvalidated
+data), Qed prints a proof skeleton using `forEachLift`, which closes all supported branches so
+you only fill in the remaining case:
 
 ```lean
 invariant feedSafe : Card.Safe for_each cards preserved_by update using cardSafe := by
-  forEachLift update cardSafe Card.Safe     -- closes every arm it can; `m`/`h` are in scope
-  case rank => …                            -- fill only what's left
+  forEachLift update cardSafe Card.Safe
+  case rank => … -- prove only the custom branch
 ```
 
-The `holds_in` form checks a styling rule over the parent's view, using the child's styling
-invariant for each card:
+### Lifting view rules (`for_each … holds_in`)
+
+`for_each` also lifts styling invariants from a child view to a parent view:
 
 ```lean
 invariant cardStyled : roleHasOneOf "like" [likeOn, likeOff] holds_in Card.view
 invariant feedStyled : cardStyled for_each cards holds_in view
--- ⇒ machine-checks: ∀ m, roleHasOneOf "like" […] (view m) = true   (the same theorem `holds_in` gives)
 ```
 
-Qed cannot prove this automatically from `holds_in view` alone. With `for_each`, the list and
-child invariant are explicit. Qed uses `cardStyled` for each card and checks the rest of the
-parent view separately. The `roleHasOneOf_map` lemma establishes that changing a child view's
-message type does not change the styling predicate. Any remaining goals and a
-`forEachStyleLift` proof skeleton appear in the error message.
-
-`Examples/Feed.lean` uses both state and styling invariants over a list of cards.
+Qed applies `cardStyled` to each rendered card (invariant under `Html.map` message wrapping) and
+checks the rest of the parent markup separately. If a branch needs manual help, the error
+message provides a `forEachStyleLift` skeleton. See [`Examples/Feed.lean`](../Examples/Feed.lean)
+for both state and styling lifts in action.
 
 ## Styling invariants (over the view)
 
-Everything above is a property of the **model**, preserved across a transition. A styling rule is a
-property of the **rendered view, for every model**, a different shape, so the same `invariant`
-command takes a different connective, `holds_in`, in place of `preserved_by`:
-
-```lean
-invariant statusStyled : roleHasOneOf "status" [onStyle, offStyle] holds_in view
-```
-
-This expands to `∀ m, roleHasOneOf "status" [onStyle, offStyle] (view m) = true`.
-For every model, elements with the `status` role must have one of the two specified styles.
-The predicate finds elements by their `role` attribute:
+While `preserved_by` checks state transitions, `holds_in` checks a property of the **rendered
+HTML for every model**:
 
 ```lean
 def view (m : Model) : Html Msg :=
   <div><button role="status" {if m.on then onStyle else offStyle}>…</button></div>
+
+invariant statusStyled : roleHasOneOf "status" [onStyle, offStyle] holds_in view
+-- Checks: ∀ m, roleHasOneOf "status" [onStyle, offStyle] (view m) = true
 ```
 
-Ready predicates (all `Html msg → Bool`, all auto-discharging):
+Point `holds_in` at a plain `Model → Html Msg` function (such as `def view`) so Qed can unfold
+the markup, split `if`/`match` branches, and verify every leaf.
 
-| Predicate | Reads as |
-|---|---|
-| `roleHasOneOf "x" [a, b]` | every element tagged `role "x"` carries style `a` or `b` |
-| `tagHasOneOf "button" [a, b]` | every `<button>` carries style `a` or `b` (no marker needed) |
-| `everyElement (fun tag attrs => …)` | a custom per-element rule |
+### Built-in view predicates
 
-**Relating two elements.** `roleHas "x" a` is the single-element query ("the `role "x"` element
-carries `a`); `both`/`either` combine queries, and `exactlyOne` packages the common XOR:
+| Predicate | Meaning |
+|-----------|---------|
+| `roleHasOneOf "x" [a, b]` | Every element with `role="x"` has style `a` or style `b`. |
+| `tagHasOneOf "button" [a, b]` | Every `<button>` has style `a` or style `b` (no `role` attribute needed). |
+| `everyElement (fun tag attrs => …)` | Custom boolean check applied to every element in the tree. |
+
+### Relating multiple elements
+
+Use `roleHas "x" a` to check a single role, combine queries with `both` (AND) or `either` (OR),
+or use `exactlyOne` for mutual exclusion (XOR):
 
 ```lean
 invariant savedXorEditing : exactlyOne "save" "cancel" primary secondary holds_in view
--- ≡ either (both (roleHas "save" primary) (roleHas "cancel" secondary))
+-- Equivalent to:
+--   either (both (roleHas "save" primary) (roleHas "cancel" secondary))
 --          (both (roleHas "save" secondary) (roleHas "cancel" primary))
 ```
 
-The automation supports positive "has style" facts: `both (roleHas …) (roleHas …)` for AND,
-`either …` for OR, and `exactlyOne` for XOR. Class names are content hashes. A positive check
-can reduce to `x == x`, but proving that two hashes differ needs additional reasoning.
-Negative style claims are not handled automatically.
+Style class names are content hashes, so positive checks ("this element carries style `a`")
+reduce cleanly by reflexivity (`x == x`). Proving *negative* claims ("this element does *not*
+carry style `b`") requires showing two hashes differ and is not discharged automatically—prefer
+positive alternatives like `roleHasOneOf` or `exactlyOne`.
 
-The discharger unfolds the view and the `Qed.Notation` combinators, splits the view's `if`/`match`,
-and closes each leaf, a class check reduces by `x == x`, never by hashing the class name. A violated
-rule fails to compile (unsolved goal), exactly like a model invariant; the `:= proof` escape is
-there for a view it can't reduce, e.g. one routed through `App.view`/`View.render` rather than a
-plain `Model → Html`. (So point `holds_in` at a named `def view`.)
+## Reading a failed proof
 
-## When it can't close it
+When an invariant fails, Lean reports an unsolved goal labeled with the offending message case:
 
-A failure is reported as an unsolved goal **labelled with the message constructor that breaks the
-property**, plus the obligation it left open:
-
-```
+```text
 unsolved goals
 case increment
 h : m.count ≤ 0
 ⊢ m.count + 1 ≤ 0
 ```
 
-The remaining goal may require a fix to the transition, a correction to the stated condition,
-or an additional proof step. An invariant that is always `True` does not check the intended
-behavior.
+From here, one of three things is true:
 
-## A menu of properties
+1. **The handler has a bug** (for example, a missing `when` guard or state reset).
+2. **The invariant is too strong or imprecise** (make sure it isn't trivially `True`, either).
+3. **Automation needs a hint** (add `:= by` to supply a collection or domain lemma).
 
-Reach for these shapes first. Each is the kind of claim worth attaching to a state change.
+## Common invariant patterns
 
-| Shape | Example | Reads as |
-|---|---|---|
-| **Bound / non-negativity** | `0 ≤ m.count` | a quantity stays in range |
-| **Precondition for a state** | `m.booked.isSome → m.today.isSome` | you can't reach X without having done Y |
-| **Mutual exclusion** | `¬ (m.editing ∧ m.submitting)` | editing and submitting cannot both be true |
-| **Effect safety** | `m.pending = true → 0 < m.turns.size` | the data an effect needs is present before it runs |
-| **Freshness** | `∀ r ∈ m.rows, r.id < m.nextId` | the next id differs from every existing id; pairwise uniqueness is a separate property |
-| **Derived-field consistency** | `m.total = (m.items.map (·.price)).sum` | a cached value matches its source |
+| Pattern | Example | Meaning |
+|---------|---------|---------|
+| **Bounds** | `0 ≤ m.count` | A counter or quantity stays in range. |
+| **State precondition** | `m.booked.isSome → m.today.isSome` | State X cannot be reached without Y. |
+| **Mutual exclusion** | `¬ (m.editing ∧ m.submitting)` | Two modes are never active at once. |
+| **Effect precondition** | `m.pending = true → 0 < m.turns.size` | Data needed by an in-flight effect is present. |
+| **Fresh IDs** | `∀ r ∈ m.rows, r.id < m.nextId` | Next ID exceeds all existing IDs (distinctness is separate). |
+| **Cached totals** | `m.total = (m.items.map (·.price)).sum` | Derived field stays in sync with its source list. |
 
-The first four usually prove automatically. The last two quantify over a collection and typically
-need a one- or two-line `:=` proof (`cases msg <;> simp_all [update] <;> omega`, plus the relevant
-`Array`/`List` lemma).
+The first four usually prove automatically. The last two quantify over collections and
+typically take a two-line `:= by` proof (`cases msg <;> simp_all [update] <;> omega` plus a
+list/array lemma).
 
-## Not every state change needs one
+## When you don't need an invariant
 
-Don't reach for an invariant where there is no honest claim to make. Common cases:
+Skip invariants when the guarantee already lives somewhere better:
 
-- **The condition is part of the type.** A form's `submitted : Option Account` is either `none`
-  or `some account`. Each refined field in `Account` includes a proof that its value satisfies
-  the field's rule, so a separate invariant for those same rules is unnecessary.
-  (`Examples/Signup.lean`.)
-- **The property is about runtime, not the model.** "Updating a bound value preserves its DOM
-  node" is a fact about the driver, checked by browser tests, not a model invariant.
-  See [rendering](rendering.md).
-- **External data is arbitrary by type.** A `Resource` message can deliver any state, so a claim
-  like "loading ⇒ on a detail route" isn't preserved without narrower message types, a redesign,
-  not an invariant. (`Examples/Users.lean`, `Examples/Bookshelf.lean`.)
-
-A real property can also be out of reach for a mechanical reason. Extending the template's
-id-bound proof to `Examples/Todo.lean` would need to handle `.sort`, which uses `Array.qsort`.
-The collection automation supports `Array.sortBy`; a `qsort` proof needs additional lemmas.
+- **Already encoded in the type:** In [`Examples/Signup.lean`](../Examples/Signup.lean),
+  `submitted : Option Account` holds a schema-validated `Account` whose fields already carry
+  refinement proofs. Re-stating those field rules as a model invariant is redundant.
+- **Framework/driver guarantees:** Properties like "updating a bound value preserves DOM node
+  identity" belong to Qed's driver proofs and browser tests (see [rendering](rendering.md)),
+  not app models.
+- **Unconstrained external messages:** If a message constructor carries arbitrary external data,
+  no transition proof can restrict what arrives unless you narrow the message or model types
+  first (as in [`Examples/Users.lean`](../Examples/Users.lean) and
+  [`Examples/Bookshelf.lean`](../Examples/Bookshelf.lean)).
 
 ## Worked examples in this repo
 
-- `Examples/Counter.lean`, `counterSafe`, a numeric bound, automatic.
-- `Examples/Booking.lean`, `bookedNeedsToday`, an `Option` precondition over nested `match`es,
-  automatic.
-- `Examples/Template.lean`, `idsBelowNext`, fresh-id allocation (`∀ t ∈ todos, t.id < nextId`)
-  over a list edited by `.map`/`.push`, with a `:=` proof. This bound alone does not prove
-  existing ids are pairwise distinct.
-- `Examples/Live.lean`, `nonNegative`, a bound preserved by handlers that read the live model,
-  automatic.
-- `Examples/Local.lean`, `stepperSafe`, a bound on a `component`-generated update (the `set` sites
-  are the cases), automatic.
-- `Examples/Socket.lean`, `composerOnlyWhenOnline` (`draft ≠ "" → conn = .online`), a precondition
-  on an effectful state machine, automatic. The update logic clears a stale draft on disconnect.
-- `Examples/Chat.lean`, `streamSafe`, an effect-safety property on an effectful `transition`,
-  automatic (the discharger uses the helper and array-size facts).
-- `Examples/Badge.lean`, both forms side by side: `levelSafe` (model, `preserved_by update`) and
-  `statusStyled` (styling, `roleHasOneOf … holds_in view`).
-
-See `Qed/Invariant.lean` for the command itself.
+- [`Examples/Counter.lean`](../Examples/Counter.lean) — `counterSafe`: automatic numeric bound.
+- [`Examples/Booking.lean`](../Examples/Booking.lean) — `bookedNeedsToday`: automatic `Option`
+  precondition across nested `match` branches.
+- [`Examples/Live.lean`](../Examples/Live.lean) — `nonNegative`: automatic bound with handlers
+  that read live model values.
+- [`Examples/Local.lean`](../Examples/Local.lean) — `stepperSafe`: automatic bound over
+  `component`-generated actions.
+- [`Examples/Socket.lean`](../Examples/Socket.lean) — `composerOnlyWhenOnline`
+  (`draft ≠ "" → conn = .online`): automatic state-machine precondition where disconnect clears
+  stale drafts.
+- [`Examples/Chat.lean`](../Examples/Chat.lean) — `streamSafe`: automatic effect-safety invariant
+  on a streaming `transition`.
+- [`Examples/Badge.lean`](../Examples/Badge.lean) — `levelSafe` (`preserved_by`) alongside
+  `statusStyled` (`holds_in`).
+- [`Examples/Template.lean`](../Examples/Template.lean) — `idsBelowNext`: custom `:= by` proof
+  for fresh ID allocation over `.map` and `.push`.
+- [`Examples/Feed.lean`](../Examples/Feed.lean) — `feedSafe` and `feedStyled`: `for_each` lifts
+  for both state and styling across a card list.

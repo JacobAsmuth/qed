@@ -1,5 +1,10 @@
 # Components
 
+A `component` bundles props, state, actions, invariants, and a JSX view into a single
+declaration. You can run a component on its own (`Qed.run Name.app`), mount it with isolated
+local state inside a parent view, or manage an array of child components from a parent's
+`collection`.
+
 ## Local state, props, and outputs
 
 ```lean
@@ -16,32 +21,40 @@ component Editor where
     </div>
 ```
 
-Parent usage:
+Mount `Editor` inside a parent view like an ordinary JSX element:
 
 ```lean
 <Editor key={row.id} label={row.title}
   initial={{ note := row.text }} onEmit={Msg.saved row.id}/>
 ```
 
-With a stable `key`, the local instance persists across parent updates. Changes to `row.title`
-update the label. Changes to `row.text` do not reset the note: `initial` is used only on mount.
-Qed maps emitted values to parent messages through `onEmit`. Here, the callback must accept
-the `String` specified by `emits`.
+How these attributes behave across updates:
 
-Props are absent from state snapshots; restoring a snapshot does not replace current props.
-A prop default allows callers to omit that prop. [Local](../Examples/Local.lean) demonstrates
-parent updates during editing, nested components, and state restoration.
+- **`key`** gives the local instance a stable identity so its state survives parent re-renders.
+- **`prop` fields** (like `label`) stay live—when `row.title` changes in the parent, the child
+  updates immediately. Declaring a default value on a `prop` makes that attribute optional.
+- **`initial`** seeds local `state` on first mount only. Later changes to `row.text` will not
+  overwrite an in-progress edit.
+- **`onEmit`** maps emitted child values (`send note`) into parent messages, typed against the
+  component's `emits` declaration.
+- **Snapshots:** state snapshots capture local `state` only, never `prop` values, so restoring a
+  snapshot leaves current props intact.
 
-Previously, tag attributes named after state fields seeded state. Move those values into
-`initial`, or declare them as `prop` if they should track the parent.
+See [`Examples/Local.lean`](../Examples/Local.lean) for live parent updates during editing,
+nested local components, and state snapshot restoration.
 
-## Actions and inline invariants
+> **Migration note:** Older versions seeded state from tag attributes named after state fields.
+> Pass initial state via `initial={{ … }}` instead, or change the field to `prop` if it should
+> track the parent on every render.
 
-For each `action` declaration, Qed generates a message constructor and a branch in the pure
-update function. Inline `{field := …}`, `{field += …}`, `{field -= …}`, `bind={field}`, and
-legacy `set` handlers compile to named message constructors as well. Action declarations allow
-typed parameters, an optional `when` guard, local `let` bindings, and assignment statements
-separated by newlines or commas:
+## Actions
+
+Each `action` generates a typed message constructor and a branch in the component's pure
+`update` function. Inline handlers—such as `{count += 1}`, `{note := ""}`, and `<input bind={note}/>`—also
+compile into named message constructors rather than opaque closures.
+
+Actions can take typed parameters, an optional `when` guard, local `let` bindings, and one or
+more assignments (separated by newlines or commas):
 
 ```lean
 action increment (amount : Nat) when amount > 0 =>
@@ -50,29 +63,40 @@ action increment (amount : Nat) when amount > 0 =>
   saved := count
 ```
 
-Use `.increment 2` in an event handler. Field assignments (`:=`, `+=`, `-=`) and `send` outputs
-apply simultaneously against the pre-action state (plus any preceding `let` bindings), so here
-`saved` receives `count` before the increment while `next` holds the incremented value.
-When the guard is false, Qed skips the action's updates and output. `<input bind={note}/>`
-(or `note := ·`) binds an input payload directly; actions with explicit parameters supply their
-assigned values explicitly.
+Trigger this action from JSX with `onClick={.increment 2}`. Keep three evaluation rules in mind:
 
-Components can also state invariants inline directly over their state fields or rendered view:
+- **Simultaneous updates:** field updates (`:=`, `+=`, `-=`) and `send` outputs read the
+  *pre-action* state (plus any earlier `let` bindings). Above, `next` is `count + amount`, while
+  `saved` receives the old `count`.
+- **Guards:** when a `when` condition is false, the action becomes a no-op and emits nothing.
+- **Input binding:** `<input bind={note}/>` (or `{note := ·}`) wires a string/checkbox input
+  directly to a state field. Actions with explicit parameters receive all arguments from the
+  handler call site.
+
+## Inline invariants
+
+Components can declare state and styling invariants directly inside the `component` block:
 
 ```lean
 invariant 0 ≤ count, saved ≤ count
 invariant roleHasOneOf "save" [primaryStyle, disabledStyle]
 ```
 
-For mountable components without props, an inline state invariant checks both `Name.init` and
-preservation across `Name.update`. Arbitrary transitions and effects remain available through
-ordinary `Model`, `Msg`, `update`, and `ui`. Generated transitions are usable in proofs;
-for a component with props, their signature is `update props state message`.
+- **State invariants** refer to state fields directly. For standalone components (without
+  props), Qed automatically verifies both `Name.init` and every branch of `Name.update`.
+- **View invariants** check rendered output across all component states (see
+  [invariants](invariants.md#styling-invariants-over-the-view)).
+
+Generated transitions are ordinary Lean functions (`Name.update state msg`, or
+`Name.update props state msg` when props exist), so you can also reference them in external
+theorems. When a component needs HTTP, timers, routing, or custom effectful transitions, drop
+down to an explicit `Model`, `Msg`, `transition`, and `ui`.
 
 ## Child collections
 
-For parent-managed state, `collection` generates child-message routing. The following parent
-uses the `Row` component from [Todo](../Examples/Todo.lean), where `key id` defines row identity:
+When a parent needs to read, filter, or sort its children's state, use `collection` instead of
+isolated local state. Here `Board` manages an array of `Row` items (from
+[`Examples/Todo.lean`](../Examples/Todo.lean), where `Row` declares `key id`):
 
 ```lean
 component Board where
@@ -86,23 +110,27 @@ component Board where
       </li>}</ul>
 ```
 
-For each `collection` declaration, Qed generates an array field, a child message constructor,
-and an `updateKeyed` branch. `Row.each` derives wrapper keys from the child's `key` declaration
-and routes messages by that identity. Without a wrapper, it keys the child's root. Sorting
-or deleting rows requires no manual message remapping; messages for removed rows are ignored.
-Keys must remain unique and stable.
+`collection rows : Row` generates:
 
-The shorthand binds children with state-only updates and no `emits` channel. For children
-whose update also needs props, use explicit parent routing and `Row.updateKeyed props`.
-Parent-owned tags accept live props alongside `state={row}` and `onMsg={.row}`.
-See [Todo](../Examples/Todo.lean) for a complete app.
+1. An array state field (`rows : Array Row.State`).
+2. A parent message constructor (`.rows`) that wraps child messages by key.
+3. A keyed update branch (`Row.updateKeyed`) that routes messages to the matching row and
+   safely ignores stale messages for deleted rows.
 
-## Extracting views
+In the view, `Row.each` keys the wrapper element (`<li>`)—or the child's own root when no
+wrapper is added—using the child's declared `key`. Keep keys unique and stable across updates so
+sorting or deleting rows needs no manual index bookkeeping.
 
-Qed registers components used in helper functions, including imported helpers, when compiling
-`ui`, generated component apps, and `Name.regs`. No helper annotation or manual registration
-is required. Extracted `Html` helpers use normal DOM reconciliation; inline templates
-can expose more bindings to the signal optimization.
+`collection` targets state-only children without `emits`. If a child's update depends on parent
+props, route messages explicitly with `Row.updateKeyed props` and render `<Row state={row} onMsg={.row} …/>`.
 
-Explicit `locals := …` remains available for low-level mounts or opaque definitions whose
-implementations cannot be inspected. `mkApp` callers can use `withLocalRegistry (mkApp …)`.
+## Extracting helper views
+
+You can freely extract parts of a view into helper functions (including across modules). When
+Qed compiles `ui`, `Name.app`, or `Name.regs`, it automatically discovers and registers any
+local components mounted inside those helpers—no manual registration list is needed.
+
+Inline JSX inside `ui` gives Qed's template compiler maximum visibility for fine-grained signal
+bindings, whereas extracted `Html` helpers reconcile through standard virtual-DOM diffing. For
+low-level manual mounts or opaque definitions that Qed cannot unfold, you can still pass
+`locals := …` explicitly (or wrap `mkApp` with `withLocalRegistry`).

@@ -5,11 +5,13 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -87,26 +89,52 @@ static inline lean_object *mk_byte_array_copy(const uint8_t *data, size_t len) {
     return ba;
 }
 
-static inline int64_t parse_dec_i64(const char *s, bool *ok) {
-    while (*s == ' ' || *s == '\t') s++;
-    bool neg = false;
-    if (*s == '-') { neg = true; s++; }
-    else if (*s == '+') { s++; }
-    if (*s < '0' || *s > '9') {
-        if (ok) *ok = false;
-        return 0;
-    }
-    uint64_t acc = 0;
-    while (*s >= '0' && *s <= '9') {
-        acc = acc * 10U + (uint64_t)(*s - '0');
-        s++;
-    }
-    if (ok) *ok = true;
-    return neg ? -(int64_t)acc : (int64_t)acc;
+static inline bool is_http_ws(char c) {
+    return c == ' ' || c == '\t';
 }
 
-static inline size_t parse_hex_size(const char *s, bool *ok) {
-    while (*s == ' ' || *s == '\t') s++;
+static inline bool parse_u64_prefix(const char *s, uint64_t max_val, bool require_eof, uint64_t *out) {
+    if (!s) return false;
+    while (is_http_ws(*s)) s++;
+    if (*s < '0' || *s > '9') return false;
+    uint64_t acc = 0;
+    while (*s >= '0' && *s <= '9') {
+        uint64_t d = (uint64_t)(*s - '0');
+        if (acc > (max_val - d) / 10ULL) return false;
+        acc = acc * 10ULL + d;
+        s++;
+    }
+    if (require_eof) {
+        while (is_http_ws(*s)) s++;
+        if (*s != '\0') return false;
+    } else if (*s != '\0' && !is_http_ws(*s)) {
+        return false;
+    }
+    if (out) *out = acc;
+    return true;
+}
+
+static inline bool parse_strict_u64(const char *s, uint64_t *out) {
+    return parse_u64_prefix(s, UINT64_MAX, true, out);
+}
+
+static inline bool parse_port_u16(const char *s, uint16_t *out) {
+    uint64_t v = 0;
+    if (!parse_u64_prefix(s, 65535ULL, true, &v) || v == 0) return false;
+    *out = (uint16_t)v;
+    return true;
+}
+
+static inline bool parse_status_code(const char *s, int *out) {
+    uint64_t v = 0;
+    if (!parse_u64_prefix(s, 999ULL, false, &v) || v < 100) return false;
+    *out = (int)v;
+    return true;
+}
+
+static inline bool parse_hex_size(const char *s, size_t *out) {
+    if (!s) return false;
+    while (is_http_ws(*s)) s++;
     size_t acc = 0;
     bool any = false;
     for (;;) {
@@ -116,12 +144,26 @@ static inline size_t parse_hex_size(const char *s, bool *ok) {
         else if (c >= 'a' && c <= 'f') d = (size_t)(c - 'a' + 10);
         else if (c >= 'A' && c <= 'F') d = (size_t)(c - 'A' + 10);
         else break;
+        if (acc > (SIZE_MAX - d) >> 4) return false;
         acc = (acc << 4) | d;
         any = true;
         s++;
     }
-    if (ok) *ok = any;
-    return acc;
+    if (!any) return false;
+    while (is_http_ws(*s)) s++;
+    if (*s != '\0') return false;
+    if (out) *out = acc;
+    return true;
+}
+
+static void ignore_sigpipe_once_fn(void) {
+    signal(SIGPIPE, SIG_IGN);
+}
+
+static pthread_once_t g_sigpipe_once = PTHREAD_ONCE_INIT;
+
+static inline void ensure_sigpipe_ignored(void) {
+    pthread_once(&g_sigpipe_once, ignore_sigpipe_once_fn);
 }
 
 /* =========================================================================
@@ -219,7 +261,7 @@ LEAN_EXPORT lean_object *qed_server_get_env(b_lean_obj_arg name) {
 LEAN_EXPORT lean_object *qed_server_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+    uint64_t ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec >= 0 ? ts.tv_nsec / 1000000L : 0L);
     return lean_io_result_mk_ok(lean_box_uint64(ms));
 }
 
@@ -259,11 +301,13 @@ LEAN_EXPORT lean_object *qed_server_hmac_sha256(b_lean_obj_arg key, b_lean_obj_a
     size_t k_len = lean_sarray_size(key);
     const uint8_t *m_ptr = lean_sarray_cptr((lean_object *)msg);
     size_t m_len = lean_sarray_size(msg);
+    if (k_len > (size_t)INT_MAX) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("HMAC key too large")));
+    }
     uint8_t digest[32];
     unsigned int digest_len = 0;
-    if (HMAC(EVP_sha256(), k_ptr, (int)k_len, m_ptr, m_len, digest, &digest_len) == NULL) {
-        memset(digest, 0, sizeof(digest));
-        digest_len = 32;
+    if (HMAC(EVP_sha256(), k_ptr, (int)k_len, m_ptr, m_len, digest, &digest_len) == NULL || digest_len != 32) {
+        return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string("OpenSSL HMAC-SHA256 failed")));
     }
     return lean_io_result_mk_ok(mk_byte_array_copy(digest, digest_len));
 }
@@ -278,16 +322,30 @@ typedef struct {
     size_t cap;
 } qed_buf_t;
 
-static void buf_init(qed_buf_t *b, size_t initial_cap) {
+static bool buf_init(qed_buf_t *b, size_t initial_cap) {
+    size_t cap = initial_cap > 0 ? initial_cap : 1024;
     b->len = 0;
-    b->cap = initial_cap > 0 ? initial_cap : 1024;
-    b->data = (uint8_t *)malloc(b->cap);
+    b->data = (uint8_t *)malloc(cap);
+    if (!b->data) {
+        b->cap = 0;
+        return false;
+    }
+    b->cap = cap;
+    return true;
 }
 
 static bool buf_reserve(qed_buf_t *b, size_t extra) {
-    if (b->len + extra <= b->cap) return true;
-    size_t next = b->cap ? b->cap * 2 : 1024;
-    while (next < b->len + extra) next *= 2;
+    if (extra > SIZE_MAX - b->len) return false;
+    size_t needed = b->len + extra;
+    if (b->data != NULL && needed <= b->cap) return true;
+    size_t next = (b->cap > 0) ? b->cap : 1024;
+    while (next < needed) {
+        if (next > SIZE_MAX / 2) {
+            next = needed;
+            break;
+        }
+        next *= 2;
+    }
     uint8_t *p = (uint8_t *)realloc(b->data, next);
     if (!p) return false;
     b->data = p;
@@ -305,6 +363,30 @@ static bool buf_append(qed_buf_t *b, const void *src, size_t n) {
 
 static bool buf_append_cstr(qed_buf_t *b, const char *s) {
     return buf_append(b, s, strlen(s));
+}
+
+static bool buf_append_fmt(qed_buf_t *b, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0 || !buf_reserve(b, (size_t)n + 1)) return false;
+    va_start(ap, fmt);
+    vsnprintf((char *)(b->data + b->len), (size_t)n + 1, fmt, ap);
+    va_end(ap);
+    b->len += (size_t)n;
+    return true;
+}
+
+static void buf_consume(qed_buf_t *b, size_t n) {
+    if (n >= b->len) {
+        b->len = 0;
+        return;
+    }
+    if (n > 0) {
+        memmove(b->data, b->data + n, b->len - n);
+        b->len -= n;
+    }
 }
 
 static void buf_free(qed_buf_t *b) {
@@ -350,32 +432,42 @@ static bool is_blocked_ipv4_host_order(uint32_t ip) {
     return false;
 }
 
+static inline uint32_t ipv4_be32(const uint8_t *b) {
+    return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+           ((uint32_t)b[2] << 8)  | (uint32_t)b[3];
+}
+
+static inline bool is_zero_bytes(const uint8_t *b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (b[i] != 0) return false;
+    }
+    return true;
+}
+
 static bool is_blocked_sockaddr(const struct sockaddr *sa) {
     if (sa->sa_family == AF_INET) {
         const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
-        uint32_t ip = ntohl(sin->sin_addr.s_addr);
-        return is_blocked_ipv4_host_order(ip);
-    } else if (sa->sa_family == AF_INET6) {
-        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
-        const uint8_t *b = sin6->sin6_addr.s6_addr;
-        bool all_zero = true;
-        for (int i = 0; i < 15; i++) {
-            if (b[i] != 0) all_zero = false;
-        }
-        if (all_zero && (b[15] == 0 || b[15] == 1)) return true; /* :: or ::1 */
-        if ((b[0] & 0xFE) == 0xFC) return true; /* fc00::/7 ULA */
-        if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return true; /* fe80::/10 link-local */
-        if (b[0] == 0xFF) return true; /* multicast */
-        /* IPv4-mapped ::ffff:a.b.c.d */
-        bool v4_mapped = true;
-        for (int i = 0; i < 10; i++) if (b[i] != 0) v4_mapped = false;
-        if (v4_mapped && b[10] == 0xFF && b[11] == 0xFF) {
-            uint32_t ip = ((uint32_t)b[12] << 24) | ((uint32_t)b[13] << 16) |
-                          ((uint32_t)b[14] << 8)  | (uint32_t)b[15];
-            return is_blocked_ipv4_host_order(ip);
-        }
+        return is_blocked_ipv4_host_order(ntohl(sin->sin_addr.s_addr));
     }
-    return false;
+    if (sa->sa_family == AF_INET6) {
+        const uint8_t *b = ((const struct sockaddr_in6 *)sa)->sin6_addr.s6_addr;
+        static const uint8_t kNat64Prefix[12] = { 0x00, 0x64, 0xFF, 0x9B, 0, 0, 0, 0, 0, 0, 0, 0 };
+        if (is_zero_bytes(b, 12)) {
+            uint32_t ip = ipv4_be32(b + 12);
+            return ip <= 1 || is_blocked_ipv4_host_order(ip);
+        }
+        if ((b[0] & 0xFE) == 0xFC) return true;
+        if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return true;
+        if (b[0] == 0xFF) return true;
+        if (is_zero_bytes(b, 10) && b[10] == 0xFF && b[11] == 0xFF) {
+            return is_blocked_ipv4_host_order(ipv4_be32(b + 12));
+        }
+        if (memcmp(b, kNat64Prefix, sizeof(kNat64Prefix)) == 0) {
+            return is_blocked_ipv4_host_order(ipv4_be32(b + 12));
+        }
+        return false;
+    }
+    return true;
 }
 
 typedef struct {
@@ -407,8 +499,28 @@ static void close_pool_entry(qed_pool_conn_t *e) {
 static bool socket_is_alive(int fd) {
     char c;
     ssize_t r = recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
-    if (r == 0) return false;
-    if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return false;
+    /* An idle pooled socket must have no unread data (0 = EOF, >0 = unsolicited data or TLS close_notify) */
+    if (r >= 0) return false;
+    if (errno != EAGAIN && errno != EWOULDBLOCK) return false;
+    return true;
+}
+
+static bool has_ctl_or_crlf(const char *s, bool allow_htab) {
+    if (!s) return true;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '\r' || *p == '\n' || *p == 127) return true;
+        if (*p < 32 && !(allow_htab && *p == '\t')) return true;
+    }
+    return false;
+}
+
+static bool is_valid_http_token(const char *s) {
+    if (!s || *s == '\0') return false;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        unsigned char c = *p;
+        if (c <= 32 || c >= 127) return false;
+        if (strchr("()<>@,;:\\\"/[]?={}", (char)c) != NULL) return false;
+    }
     return true;
 }
 
@@ -416,9 +528,16 @@ static bool parse_http_url(
     const char *url,
     bool *is_tls,
     char *host, size_t host_cap,
+    bool *is_ipv6_host,
     uint16_t *port,
     char *path, size_t path_cap)
 {
+    if (!url || has_ctl_or_crlf(url, false)) return false;
+    for (const unsigned char *u = (const unsigned char *)url; *u; u++) {
+        if (*u == ' ') return false;
+    }
+    if (is_ipv6_host) *is_ipv6_host = false;
+
     const char *p = NULL;
     if (strncmp(url, "https://", 8) == 0) {
         *is_tls = true;
@@ -433,9 +552,13 @@ static bool parse_http_url(
     }
     const char *slash = strchr(p, '/');
     const char *qmark = strchr(p, '?');
-    const char * authority_end = slash;
+    const char *frag = strchr(p, '#');
+    const char *authority_end = slash;
     if (qmark != NULL && (authority_end == NULL || qmark < authority_end)) {
         authority_end = qmark;
+    }
+    if (frag != NULL && (authority_end == NULL || frag < authority_end)) {
+        return false;
     }
     size_t auth_len = authority_end ? (size_t)(authority_end - p) : strlen(p);
     if (auth_len == 0 || auth_len >= host_cap) return false;
@@ -444,35 +567,39 @@ static bool parse_http_url(
     if (auth_len >= sizeof(auth)) return false;
     memcpy(auth, p, auth_len);
     auth[auth_len] = '\0';
+    if (strchr(auth, '@') != NULL) return false;
 
     if (auth[0] == '[') {
         char *rb = strchr(auth, ']');
         if (!rb) return false;
         size_t hlen = (size_t)(rb - (auth + 1));
-        if (hlen >= host_cap) return false;
+        if (hlen == 0 || hlen >= host_cap) return false;
         memcpy(host, auth + 1, hlen);
         host[hlen] = '\0';
         if (rb[1] == ':') {
-            int pv = (int)parse_dec_i64(rb + 2, NULL);
-            if (pv <= 0 || pv > 65535) return false;
-            *port = (uint16_t)pv;
+            if (!parse_port_u16(rb + 2, port)) return false;
+        } else if (rb[1] != '\0') {
+            return false;
         }
+        if (is_ipv6_host) *is_ipv6_host = true;
     } else {
         char *colon = strrchr(auth, ':');
         if (colon != NULL) {
             *colon = '\0';
-            int pv = (int)parse_dec_i64(colon + 1, NULL);
-            if (pv <= 0 || pv > 65535) return false;
-            *port = (uint16_t)pv;
+            if (!parse_port_u16(colon + 1, port)) return false;
         }
         if (strlen(auth) == 0 || strlen(auth) >= host_cap) return false;
         strcpy(host, auth);
     }
 
     if (authority_end == NULL) {
-        snprintf(path, path_cap, "/");
+        if (path_cap < 2) return false;
+        strcpy(path, "/");
     } else if (*authority_end == '?') {
-        snprintf(path, path_cap, "/%s", authority_end);
+        size_t qlen = strlen(authority_end);
+        if (qlen + 1 >= path_cap) return false;
+        path[0] = '/';
+        memcpy(path + 1, authority_end, qlen + 1);
     } else {
         if (strlen(authority_end) >= path_cap) return false;
         strcpy(path, authority_end);
@@ -568,10 +695,19 @@ static bool acquire_outbound_conn(
             snprintf(err, err_cap, "SSL_new failed");
             return false;
         }
-        SSL_set_tlsext_host_name(ssl, host);
+        struct in_addr v4tmp;
+        struct in6_addr v6tmp;
+        bool is_ip_literal = (inet_pton(AF_INET, host, &v4tmp) == 1) || (inet_pton(AF_INET6, host, &v6tmp) == 1);
+        if (!is_ip_literal) {
+            SSL_set_tlsext_host_name(ssl, host);
+        }
         X509_VERIFY_PARAM *param = SSL_get0_param(ssl);
         if (param != NULL) {
-            X509_VERIFY_PARAM_set1_host(param, host, 0);
+            if (is_ip_literal) {
+                X509_VERIFY_PARAM_set1_ip_asc(param, host);
+            } else {
+                X509_VERIFY_PARAM_set1_host(param, host, 0);
+            }
         }
         SSL_set_fd(ssl, fd);
         if (SSL_connect(ssl) != 1) {
@@ -626,11 +762,13 @@ static void release_outbound_conn(bool keep_alive, bool is_tls, const char *host
 static bool conn_write_all(int fd, SSL *ssl, const uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
+        size_t rem = len - off;
         ssize_t n;
         if (ssl != NULL) {
-            n = SSL_write(ssl, buf + off, (int)(len - off));
+            int chunk = (rem > (size_t)INT_MAX) ? INT_MAX : (int)rem;
+            n = SSL_write(ssl, buf + off, chunk);
         } else {
-            n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+            n = send(fd, buf + off, rem, MSG_NOSIGNAL);
         }
         if (n <= 0) {
             if (ssl == NULL && errno == EINTR) continue;
@@ -645,7 +783,8 @@ static ssize_t conn_read_some(int fd, SSL *ssl, uint8_t *buf, size_t cap) {
     for (;;) {
         ssize_t n;
         if (ssl != NULL) {
-            n = SSL_read(ssl, buf, (int)cap);
+            int chunk = (cap > (size_t)INT_MAX) ? INT_MAX : (int)cap;
+            n = SSL_read(ssl, buf, chunk);
         } else {
             n = recv(fd, buf, cap, 0);
         }
@@ -717,47 +856,102 @@ static bool conn_read_until(int fd, SSL *ssl, qed_buf_t *b, size_t target_len) {
     return true;
 }
 
+static char *next_crlf_line(char **cursor, char *end, bool *bare_cr_or_lf) {
+    char *p = *cursor;
+    if (p >= end) return NULL;
+    char *s = p;
+    while (p < end) {
+        if (*p == '\r') {
+            if (p + 1 < end && p[1] == '\n') {
+                *p = '\0';
+                *cursor = p + 2;
+                return s;
+            }
+            if (bare_cr_or_lf) *bare_cr_or_lf = true;
+            return NULL;
+        }
+        if (*p == '\n') {
+            if (bare_cr_or_lf) *bare_cr_or_lf = true;
+            return NULL;
+        }
+        p++;
+    }
+    *cursor = end;
+    return s;
+}
+
+static bool read_chunk_crlf_line(
+    int fd, SSL *ssl, qed_buf_t *raw_buf,
+    size_t *cursor, size_t max_bytes, size_t *out_line_len)
+{
+    size_t start = *cursor;
+    for (;;) {
+        for (size_t i = *cursor; i + 1 < raw_buf->len; i++) {
+            if (raw_buf->data[i] == '\r' && raw_buf->data[i + 1] == '\n') {
+                *out_line_len = i - start;
+                *cursor = i + 2;
+                return true;
+            }
+        }
+        if (raw_buf->len - start > max_bytes) return false;
+        uint8_t tmp[4096];
+        ssize_t got = conn_read_some(fd, ssl, tmp, sizeof(tmp));
+        if (got <= 0 || !buf_append(raw_buf, tmp, (size_t)got)) return false;
+    }
+}
+
 static bool decode_chunked_stream(
     int fd, SSL *ssl,
     qed_buf_t *raw_buf, size_t cursor,
-    qed_buf_t *out_body)
+    qed_buf_t *out_body,
+    bool *out_clean_eof)
 {
+    if (out_clean_eof) *out_clean_eof = false;
     for (;;) {
-        ssize_t line_end = -1;
-        for (;;) {
-            for (size_t i = cursor; i + 1 < raw_buf->len; i++) {
-                if (raw_buf->data[i] == '\r' && raw_buf->data[i + 1] == '\n') {
-                    line_end = (ssize_t)i;
-                    break;
-                }
-            }
-            if (line_end >= 0) break;
-            uint8_t tmp[4096];
-            ssize_t got = conn_read_some(fd, ssl, tmp, sizeof(tmp));
-            if (got <= 0 || !buf_append(raw_buf, tmp, (size_t)got)) return false;
-        }
+        size_t line_start = cursor;
+        size_t slen = 0;
+        if (!read_chunk_crlf_line(fd, ssl, raw_buf, &cursor, 16384, &slen)) return false;
 
         char size_line[64];
-        size_t slen = (size_t)line_end - cursor;
-        if (slen >= sizeof(size_line)) slen = sizeof(size_line) - 1;
-        memcpy(size_line, raw_buf->data + cursor, slen);
-        size_line[slen] = '\0';
-        char *semi = strchr(size_line, ';');
-        if (semi) *semi = '\0';
+        const uint8_t *line_ptr = raw_buf->data + line_start;
+        const uint8_t *semi_ptr = (const uint8_t *)memchr(line_ptr, ';', slen);
+        size_t hex_len = semi_ptr ? (size_t)(semi_ptr - line_ptr) : slen;
+        if (hex_len == 0 || hex_len >= sizeof(size_line)) return false;
+        memcpy(size_line, line_ptr, hex_len);
+        size_line[hex_len] = '\0';
 
-        bool hex_ok = false;
-        size_t chunk_sz = parse_hex_size(size_line, &hex_ok);
-        if (!hex_ok) return false;
+        size_t chunk_sz = 0;
+        if (!parse_hex_size(size_line, &chunk_sz)) return false;
 
-        cursor = (size_t)line_end + 2;
         if (chunk_sz == 0) {
-            (void)conn_read_until(fd, ssl, raw_buf, cursor + 2);
-            return true;
+            size_t trailer_bytes = 0;
+            for (;;) {
+                size_t tlen = 0;
+                if (!read_chunk_crlf_line(fd, ssl, raw_buf, &cursor, 65536, &tlen)) return false;
+                trailer_bytes += tlen + 2;
+                if (trailer_bytes > 65536) return false;
+                if (tlen == 0) {
+                    if (out_clean_eof) *out_clean_eof = (raw_buf->len == cursor);
+                    return true;
+                }
+            }
         }
 
-        if (!conn_read_until(fd, ssl, raw_buf, cursor + chunk_sz + 2)) return false;
+        if (chunk_sz > (256ULL * 1024ULL * 1024ULL)) return false;
+        if (cursor > SIZE_MAX - 2 || chunk_sz > SIZE_MAX - cursor - 2) return false;
+
+        size_t need_end = cursor + chunk_sz + 2;
+        if (!conn_read_until(fd, ssl, raw_buf, need_end)) return false;
+        if (raw_buf->data[cursor + chunk_sz] != '\r' || raw_buf->data[cursor + chunk_sz + 1] != '\n') {
+            return false;
+        }
         if (!buf_append(out_body, raw_buf->data + cursor, chunk_sz)) return false;
-        cursor += chunk_sz + 2;
+        cursor = need_end;
+
+        if (cursor >= 65536) {
+            buf_consume(raw_buf, cursor);
+            cursor = 0;
+        }
     }
 }
 
@@ -773,45 +967,64 @@ static bool raw_http_execute(
     char *err,
     size_t err_cap)
 {
+    ensure_sigpipe_ignored();
     memset(out, 0, sizeof(*out));
-    buf_init(&out->body, 1024);
-
-    bool is_tls = false;
-    char host[256];
-    uint16_t port = 80;
-    char path[4096];
-    if (!parse_http_url(url, &is_tls, host, sizeof(host), &port, path, sizeof(path))) {
+    if (!buf_init(&out->body, 1024)) {
+        snprintf(err, err_cap, "out of memory");
+        return false;
+    }
+    if (!is_valid_http_token(method)) {
         buf_free(&out->body);
-        snprintf(err, err_cap, "invalid outbound HTTP URL: %s", url);
+        snprintf(err, err_cap, "invalid outbound HTTP method");
         return false;
     }
 
-    qed_buf_t req_wire;
-    buf_init(&req_wire, 512 + req_body_len);
-    char first_line[4600];
-    bool default_port = (is_tls && port == 443) || (!is_tls && port == 80);
-    if (default_port) {
-        snprintf(first_line, sizeof(first_line),
-                 "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\nContent-Length: %zu\r\n",
-                 method, path, host, req_body_len);
-    } else {
-        snprintf(first_line, sizeof(first_line),
-                 "%s %s HTTP/1.1\r\nHost: %s:%u\r\nConnection: keep-alive\r\nContent-Length: %zu\r\n",
-                 method, path, host, (unsigned)port, req_body_len);
+    bool is_tls = false;
+    bool is_ipv6_host = false;
+    char host[256];
+    uint16_t port = 80;
+    char path[4096];
+    if (!parse_http_url(url, &is_tls, host, sizeof(host), &is_ipv6_host, &port, path, sizeof(path))) {
+        buf_free(&out->body);
+        snprintf(err, err_cap, "invalid outbound HTTP URL: %.200s", url ? url : "");
+        return false;
     }
-    buf_append_cstr(&req_wire, first_line);
     for (size_t i = 0; i < req_hdr_count; i++) {
+        if (!is_valid_http_token(req_hdrs[i].key) || has_ctl_or_crlf(req_hdrs[i].val, true)) {
+            buf_free(&out->body);
+            snprintf(err, err_cap, "invalid outbound HTTP header (CRLF/control chars)");
+            return false;
+        }
+    }
+
+    size_t init_cap = 512 + (req_body_len <= 64 * 1024 * 1024 ? req_body_len : 0);
+    qed_buf_t req_wire;
+    if (!buf_init(&req_wire, init_cap)) {
+        buf_free(&out->body);
+        snprintf(err, err_cap, "out of memory building HTTP request");
+        return false;
+    }
+
+    bool default_port = (is_tls && port == 443) || (!is_tls && port == 80);
+    bool wire_ok = buf_append_fmt(&req_wire, "%s %s HTTP/1.1\r\nHost: %s%s%s",
+                                  method, path, is_ipv6_host ? "[" : "", host, is_ipv6_host ? "]" : "");
+    if (wire_ok && !default_port) wire_ok = buf_append_fmt(&req_wire, ":%u", (unsigned)port);
+    if (wire_ok) wire_ok = buf_append_fmt(&req_wire, "\r\nConnection: keep-alive\r\nContent-Length: %zu\r\n", req_body_len);
+    for (size_t i = 0; wire_ok && i < req_hdr_count; i++) {
         const char *k = req_hdrs[i].key;
         if (strcasecmp(k, "Host") == 0 || strcasecmp(k, "Content-Length") == 0 || strcasecmp(k, "Connection") == 0) {
             continue;
         }
-        buf_append_cstr(&req_wire, k);
-        buf_append_cstr(&req_wire, ": ");
-        buf_append_cstr(&req_wire, req_hdrs[i].val);
-        buf_append_cstr(&req_wire, "\r\n");
+        wire_ok = buf_append_fmt(&req_wire, "%s: %s\r\n", k, req_hdrs[i].val);
     }
-    buf_append_cstr(&req_wire, "\r\n");
-    if (req_body_len > 0) buf_append(&req_wire, req_body, req_body_len);
+    if (wire_ok) wire_ok = buf_append_cstr(&req_wire, "\r\n");
+    if (wire_ok && req_body_len > 0) wire_ok = buf_append(&req_wire, req_body, req_body_len);
+    if (!wire_ok) {
+        buf_free(&req_wire);
+        buf_free(&out->body);
+        snprintf(err, err_cap, "out of memory building HTTP request");
+        return false;
+    }
 
     for (int attempt = 0; attempt < 2; attempt++) {
         int fd = -1;
@@ -833,15 +1046,23 @@ static bool raw_http_execute(
         }
 
         qed_buf_t rx;
-        buf_init(&rx, 4096);
+        if (!buf_init(&rx, 4096)) {
+            release_outbound_conn(false, is_tls, host, port, fd, ssl);
+            buf_free(&req_wire);
+            buf_free(&out->body);
+            snprintf(err, err_cap, "out of memory");
+            return false;
+        }
         ssize_t hdr_end = -1;
         bool read_failed = false;
         while ((hdr_end = find_crlfcrlf(rx.data, rx.len)) < 0) {
             uint8_t tmp[4096];
             ssize_t got = (rx.len > 65536) ? -1 : conn_read_some(fd, ssl, tmp, sizeof(tmp));
-            if (got <= 0 || !buf_append(&rx, tmp, (size_t)got)) { read_failed = true; break; }
+            if (got <= 0 || !buf_append(&rx, tmp, (size_t)got)) {
+                read_failed = true;
+                break;
+            }
         }
-
         if (read_failed) {
             buf_free(&rx);
             release_outbound_conn(false, is_tls, host, port, fd, ssl);
@@ -851,88 +1072,131 @@ static bool raw_http_execute(
             snprintf(err, err_cap, "EOF or malformed response header from %s", host);
             return false;
         }
-
         buf_free(&req_wire);
 
-        rx.data[hdr_end] = '\0';
-        char *saveptr = NULL;
-        char *line = strtok_r((char *)rx.data, "\r\n", &saveptr);
-        if (!line || strncmp(line, "HTTP/", 5) != 0) {
-            buf_free(&rx);
-            release_outbound_conn(false, is_tls, host, port, fd, ssl);
-            buf_free(&out->body);
-            snprintf(err, err_cap, "invalid HTTP status line from %s", host);
-            return false;
+        if (memchr(rx.data, '\0', (size_t)hdr_end) != NULL) {
+            snprintf(err, err_cap, "NUL byte in HTTP response headers from %s", host);
+            goto fail_rx_conn;
         }
-        char *sp = strchr(line, ' ');
-        out->status = sp ? (int)parse_dec_i64(sp + 1, NULL) : 0;
+        rx.data[hdr_end] = '\0';
+
+        char *cursor = (char *)rx.data;
+        char *hdr_limit = (char *)rx.data + hdr_end;
+        bool bare_crlf = false;
+        char *line = next_crlf_line(&cursor, hdr_limit, &bare_crlf);
+        char *sp = line ? strchr(line, ' ') : NULL;
+        int status_val = 0;
+        if (!line || bare_crlf || strncmp(line, "HTTP/", 5) != 0 || !sp || !parse_status_code(sp + 1, &status_val)) {
+            snprintf(err, err_cap, "invalid HTTP status line from %s", host);
+            goto fail_rx_conn;
+        }
+        out->status = status_val;
 
         bool is_chunked = false;
         bool conn_close = false;
-        ssize_t content_len = -1;
+        bool has_content_len = false;
+        bool bad_resp_hdr = false;
+        uint64_t content_len_u64 = 0;
         size_t hdr_cap = 16;
         out->headers = (qed_hdr_pair_t *)calloc(hdr_cap, sizeof(qed_hdr_pair_t));
+        if (!out->headers) {
+            snprintf(err, err_cap, "out of memory allocating headers");
+            goto fail_rx_conn;
+        }
 
         char *val = NULL;
-        while ((line = strtok_r(NULL, "\r\n", &saveptr)) != NULL) {
+        while ((line = next_crlf_line(&cursor, hdr_limit, &bare_crlf)) != NULL) {
             if (!split_header_kv(line, &val)) continue;
             if (strcasecmp(line, "Content-Length") == 0) {
-                content_len = (ssize_t)parse_dec_i64(val, NULL);
+                uint64_t parsed_cl = 0;
+                if (!parse_strict_u64(val, &parsed_cl) || (has_content_len && parsed_cl != content_len_u64)) {
+                    bad_resp_hdr = true;
+                    break;
+                }
+                has_content_len = true;
+                content_len_u64 = parsed_cl;
             } else if (strcasecmp(line, "Transfer-Encoding") == 0 && strcasestr(val, "chunked") != NULL) {
                 is_chunked = true;
             } else if (strcasecmp(line, "Connection") == 0 && strcasestr(val, "close") != NULL) {
                 conn_close = true;
             }
             if (out->header_count == hdr_cap) {
-                hdr_cap *= 2;
-                qed_hdr_pair_t *nh = (qed_hdr_pair_t *)realloc(out->headers, hdr_cap * sizeof(qed_hdr_pair_t));
-                if (nh) out->headers = nh;
+                if (hdr_cap > SIZE_MAX / 2 / sizeof(qed_hdr_pair_t)) { bad_resp_hdr = true; break; }
+                size_t new_cap = hdr_cap * 2;
+                qed_hdr_pair_t *nh = (qed_hdr_pair_t *)realloc(out->headers, new_cap * sizeof(qed_hdr_pair_t));
+                if (!nh) { bad_resp_hdr = true; break; }
+                out->headers = nh;
+                hdr_cap = new_cap;
             }
-            if (out->headers && out->header_count < hdr_cap) {
-                out->headers[out->header_count].key = strdup(line);
-                out->headers[out->header_count].val = strdup(val);
-                out->header_count++;
+            out->headers[out->header_count].key = strdup(line);
+            out->headers[out->header_count].val = strdup(val);
+            if (!out->headers[out->header_count].key || !out->headers[out->header_count].val) {
+                free(out->headers[out->header_count].key);
+                free(out->headers[out->header_count].val);
+                bad_resp_hdr = true;
+                break;
             }
+            out->header_count++;
+        }
+        if (bare_crlf || bad_resp_hdr) {
+            snprintf(err, err_cap, "malformed HTTP response header from %s", host);
+            goto fail_rx_conn;
         }
 
         size_t body_start = (size_t)hdr_end + 4;
         bool can_reuse = !conn_close && !ssrf_guard;
 
         if (strcmp(method, "HEAD") == 0 || out->status == 204 || out->status == 304) {
-            /* Empty body */
+            if (rx.len > body_start) can_reuse = false;
         } else if (is_chunked) {
-            if (!decode_chunked_stream(fd, ssl, &rx, body_start, &out->body)) {
-                buf_free(&rx);
-                release_outbound_conn(false, is_tls, host, port, fd, ssl);
-                free_raw_resp(out);
+            bool clean_eof = false;
+            if (!decode_chunked_stream(fd, ssl, &rx, body_start, &out->body, &clean_eof)) {
                 snprintf(err, err_cap, "failed decoding chunked response from %s", host);
-                return false;
+                goto fail_rx_conn;
             }
-        } else if (content_len >= 0) {
+            if (!clean_eof) can_reuse = false;
+        } else if (has_content_len) {
+            if (content_len_u64 > (uint64_t)(SIZE_MAX / 2)) {
+                snprintf(err, err_cap, "Content-Length too large from %s", host);
+                goto fail_rx_conn;
+            }
+            size_t content_len = (size_t)content_len_u64;
             size_t have = rx.len - body_start;
-            if (have > (size_t)content_len) have = (size_t)content_len;
-            if (have > 0) buf_append(&out->body, rx.data + body_start, have);
-            if (!conn_read_until(fd, ssl, &out->body, (size_t)content_len)) {
-                buf_free(&rx);
-                release_outbound_conn(false, is_tls, host, port, fd, ssl);
-                free_raw_resp(out);
+            if (have > content_len) {
+                have = content_len;
+                can_reuse = false;
+            }
+            if ((have > 0 && !buf_append(&out->body, rx.data + body_start, have)) ||
+                !conn_read_until(fd, ssl, &out->body, content_len)) {
                 snprintf(err, err_cap, "truncated HTTP body from %s", host);
-                return false;
+                goto fail_rx_conn;
             }
         } else {
             can_reuse = false;
-            if (rx.len > body_start) buf_append(&out->body, rx.data + body_start, rx.len - body_start);
+            if (rx.len > body_start && !buf_append(&out->body, rx.data + body_start, rx.len - body_start)) {
+                snprintf(err, err_cap, "out of memory buffering HTTP body");
+                goto fail_rx_conn;
+            }
             for (;;) {
                 uint8_t tmp[8192];
                 ssize_t got = conn_read_some(fd, ssl, tmp, sizeof(tmp));
-                if (got <= 0) break;
-                buf_append(&out->body, tmp, (size_t)got);
+                if (got == 0) break;
+                if (got < 0 || !buf_append(&out->body, tmp, (size_t)got)) {
+                    snprintf(err, err_cap, "error reading close-delimited HTTP body from %s", host);
+                    goto fail_rx_conn;
+                }
             }
         }
 
         buf_free(&rx);
         release_outbound_conn(can_reuse, is_tls, host, port, fd, ssl);
         return true;
+
+    fail_rx_conn:
+        buf_free(&rx);
+        release_outbound_conn(false, is_tls, host, port, fd, ssl);
+        free_raw_resp(out);
+        return false;
     }
 
     buf_free(&req_wire);
@@ -948,8 +1212,12 @@ LEAN_EXPORT lean_object *qed_server_http_call(
     b_lean_obj_arg body,
     uint8_t ssrf_guard)
 {
+    ensure_sigpipe_ignored();
     size_t hdr_n = lean_array_size(headers);
     qed_hdr_pair_t *req_hdrs = hdr_n > 0 ? (qed_hdr_pair_t *)calloc(hdr_n, sizeof(qed_hdr_pair_t)) : NULL;
+    if (hdr_n > 0 && !req_hdrs) {
+        return lean_io_result_mk_ok(mk_except_err_str("out of memory allocating request headers"));
+    }
     for (size_t i = 0; i < hdr_n; i++) {
         lean_object *pair = lean_array_uget_borrowed(headers, i);
         req_hdrs[i].key = (char *)lean_string_cstr(lean_ctor_get(pair, 0));
@@ -976,8 +1244,11 @@ LEAN_EXPORT lean_object *qed_server_http_call(
  * 6. GCP Service Account RS256 JWT Signing & Cached OAuth2 Bearer Exchange
  * ========================================================================= */
 
-static void base64url_encode(const uint8_t *in, size_t in_len, char *out) {
+static bool buf_append_b64url(qed_buf_t *b, const uint8_t *in, size_t in_len) {
     static const char kTbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t enc_len = ((in_len + 2) / 3) * 4;
+    if (!buf_reserve(b, enc_len + 1)) return false;
+    char *out = (char *)(b->data + b->len);
     size_t j = 0, i = 0;
     while (i + 3 <= in_len) {
         uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8) | (uint32_t)in[i + 2];
@@ -987,49 +1258,153 @@ static void base64url_encode(const uint8_t *in, size_t in_len, char *out) {
         out[j++] = kTbl[v & 0x3F];
         i += 3;
     }
-    if (in_len - i == 1) {
-        uint32_t v = ((uint32_t)in[i] << 16);
+    if (in_len - i > 0) {
+        uint32_t v = ((uint32_t)in[i] << 16) | ((in_len - i == 2) ? ((uint32_t)in[i + 1] << 8) : 0U);
         out[j++] = kTbl[(v >> 18) & 0x3F];
         out[j++] = kTbl[(v >> 12) & 0x3F];
-    } else if (in_len - i == 2) {
-        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8);
-        out[j++] = kTbl[(v >> 18) & 0x3F];
-        out[j++] = kTbl[(v >> 12) & 0x3F];
-        out[j++] = kTbl[(v >> 6) & 0x3F];
+        if (in_len - i == 2) out[j++] = kTbl[(v >> 6) & 0x3F];
     }
     out[j] = '\0';
+    b->len += j;
+    return true;
+}
+
+static bool buf_append_json_escaped(qed_buf_t *b, const char *s) {
+    static const char kRaw[] = "\"\\\b\f\n\r\t";
+    static const char kEsc[] = "\"\\bfnrt";
+    if (!s) return true;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        unsigned char c = *p;
+        const char *hit = (c != 0) ? strchr(kRaw, (char)c) : NULL;
+        if (hit) {
+            char pair[2] = { '\\', kEsc[hit - kRaw] };
+            if (!buf_append(b, pair, 2)) return false;
+        } else if (c < 0x20) {
+            if (!buf_append_fmt(b, "\\u%04x", (unsigned)c)) return false;
+        } else {
+            if (!buf_append(b, &c, 1)) return false;
+        }
+    }
+    return true;
 }
 
 static const char *json_find_val(const char *json, const char *key) {
-    char pat[128];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(json, pat);
-    if (!p) return NULL;
-    p += strlen(pat);
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-    if (*p != ':') return NULL;
-    p++;
-    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
-    return p;
+    if (!json || !key) return NULL;
+    size_t key_len = strlen(key);
+    int depth = 0;
+    const char *p = json;
+    while (*p) {
+        char c = *p;
+        if (c == '{' || c == '[') {
+            depth++;
+            p++;
+        } else if (c == '}' || c == ']') {
+            depth--;
+            p++;
+        } else if (c == '"') {
+            const char *str_start = p + 1;
+            p++;
+            bool has_escape = false;
+            while (*p && *p != '"') {
+                if (*p == '\\' && p[1] != '\0') {
+                    has_escape = true;
+                    p += 2;
+                } else {
+                    p++;
+                }
+            }
+            if (*p != '"') return NULL;
+            size_t str_len = (size_t)(p - str_start);
+            p++; /* past closing quote */
+            if (depth == 1 && !has_escape && str_len == key_len && memcmp(str_start, key, key_len) == 0) {
+                const char *q = p;
+                while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+                if (*q == ':') {
+                    q++;
+                    while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+                    return q;
+                }
+            }
+        } else {
+            p++;
+        }
+    }
+    return NULL;
+}
+
+static bool parse_hex4(const char *p, uint32_t *out) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = p[i];
+        uint32_t d;
+        if (c >= '0' && c <= '9') d = (uint32_t)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
+        else return false;
+        v = (v << 4) | d;
+    }
+    *out = v;
+    return true;
+}
+
+static bool append_utf8_cp(char *out, size_t out_cap, size_t *j, uint32_t cp) {
+    if (cp == 0 || cp > 0x10FFFF) return false;
+    char tmp[4];
+    size_t n = 0;
+    if (cp <= 0x7F) {
+        tmp[n++] = (char)cp;
+    } else if (cp <= 0x7FF) {
+        tmp[n++] = (char)(0xC0 | (cp >> 6));
+        tmp[n++] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp <= 0xFFFF) {
+        tmp[n++] = (char)(0xE0 | (cp >> 12));
+        tmp[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        tmp[n++] = (char)(0x80 | (cp & 0x3F));
+    } else {
+        tmp[n++] = (char)(0xF0 | (cp >> 18));
+        tmp[n++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        tmp[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        tmp[n++] = (char)(0x80 | (cp & 0x3F));
+    }
+    if (*j + n >= out_cap) return false;
+    memcpy(out + *j, tmp, n);
+    *j += n;
+    return true;
 }
 
 static bool json_extract_string(const char *json, const char *key, char *out, size_t out_cap) {
+    if (out_cap == 0) return false;
     const char *p = json_find_val(json, key);
     if (!p || *p != '"') return false;
     p++;
     size_t j = 0;
     while (*p && *p != '"') {
-        if (j + 2 >= out_cap) return false;
         if (*p == '\\' && p[1] != '\0') {
             p++;
-            switch (*p) {
-                case 'n': out[j++] = '\n'; break;
-                case 'r': out[j++] = '\r'; break;
-                case 't': out[j++] = '\t'; break;
-                default:  out[j++] = *p;   break;
+            char ch = *p++;
+            if (ch == 'u') {
+                uint32_t cp = 0;
+                if (!parse_hex4(p, &cp)) return false;
+                p += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF && p[0] == '\\' && p[1] == 'u') {
+                    uint32_t low = 0;
+                    if (!parse_hex4(p + 2, &low) || low < 0xDC00 || low > 0xDFFF) return false;
+                    p += 6;
+                    cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00));
+                }
+                if (!append_utf8_cp(out, out_cap, &j, cp)) return false;
+            } else {
+                char mapped = ch;
+                if (ch == 'n') mapped = '\n';
+                else if (ch == 'r') mapped = '\r';
+                else if (ch == 't') mapped = '\t';
+                else if (ch == 'b') mapped = '\b';
+                else if (ch == 'f') mapped = '\f';
+                if (j + 1 >= out_cap) return false;
+                out[j++] = mapped;
             }
-            p++;
         } else {
+            if (j + 1 >= out_cap) return false;
             out[j++] = *p++;
         }
     }
@@ -1040,16 +1415,21 @@ static bool json_extract_string(const char *json, const char *key, char *out, si
 
 static long json_extract_long(const char *json, const char *key, long fallback) {
     const char *p = json_find_val(json, key);
-    if (!p) return fallback;
-    bool num_ok = false;
-    int64_t v = parse_dec_i64(p, &num_ok);
-    return (num_ok && v > 0) ? (long)v : fallback;
+    if (!p || *p < '0' || *p > '9') return fallback;
+    uint64_t acc = 0;
+    while (*p >= '0' && *p <= '9') {
+        uint64_t d = (uint64_t)(*p - '0');
+        if (acc > (86400ULL * 365ULL - d) / 10ULL) return 86400L * 365L;
+        acc = acc * 10ULL + d;
+        p++;
+    }
+    return (acc > 0) ? (long)acc : fallback;
 }
 
 typedef struct {
     bool valid;
     char client_email[256];
-    char scope[512];
+    char scope[2048];
     char token_url[512];
     char access_token[2048];
     time_t expires_at;
@@ -1060,6 +1440,7 @@ static pthread_mutex_t g_gcp_mu = PTHREAD_MUTEX_INITIALIZER;
 static qed_gcp_cache_entry_t g_gcp_cache[QED_GCP_CACHE_SIZE];
 
 LEAN_EXPORT lean_object *qed_server_gcp_bearer_token(b_lean_obj_arg sa_json_obj, b_lean_obj_arg scope_obj) {
+    ensure_sigpipe_ignored();
     const char *sa_json = lean_string_cstr(sa_json_obj);
     const char *scope = lean_string_cstr(scope_obj);
 
@@ -1075,132 +1456,167 @@ LEAN_EXPORT lean_object *qed_server_gcp_bearer_token(b_lean_obj_arg sa_json_obj,
     }
     const char *env_tok_url = getenv("QED_GCP_TOKEN_URL");
     if (env_tok_url != NULL && env_tok_url[0] != '\0') {
+        if (strlen(env_tok_url) >= sizeof(token_uri)) {
+            return lean_io_result_mk_ok(mk_except_err_str("QED_GCP_TOKEN_URL too long"));
+        }
         snprintf(token_uri, sizeof(token_uri), "%s", env_tok_url);
     } else if (!json_extract_string(sa_json, "token_uri", token_uri, sizeof(token_uri))) {
         snprintf(token_uri, sizeof(token_uri), "https://oauth2.googleapis.com/token");
     }
 
     time_t now = time(NULL);
-    pthread_mutex_lock(&g_gcp_mu);
-    for (int i = 0; i < QED_GCP_CACHE_SIZE; i++) {
-        qed_gcp_cache_entry_t *e = &g_gcp_cache[i];
-        if (e->valid && e->expires_at > now + 60 &&
-            strcmp(e->client_email, client_email) == 0 &&
-            strcmp(e->scope, scope) == 0 &&
-            strcmp(e->token_url, token_uri) == 0)
-        {
-            lean_object *tok = lean_mk_string(e->access_token);
-            pthread_mutex_unlock(&g_gcp_mu);
-            return lean_io_result_mk_ok(mk_except_ok(tok));
+    bool can_cache = (strlen(scope) < sizeof(g_gcp_cache[0].scope));
+    if (can_cache) {
+        pthread_mutex_lock(&g_gcp_mu);
+        for (int i = 0; i < QED_GCP_CACHE_SIZE; i++) {
+            qed_gcp_cache_entry_t *e = &g_gcp_cache[i];
+            if (e->valid && e->expires_at > now + 60 &&
+                strcmp(e->client_email, client_email) == 0 &&
+                strcmp(e->scope, scope) == 0 &&
+                strcmp(e->token_url, token_uri) == 0)
+            {
+                lean_object *tok = lean_mk_string(e->access_token);
+                pthread_mutex_unlock(&g_gcp_mu);
+                return lean_io_result_mk_ok(mk_except_ok(tok));
+            }
         }
+        pthread_mutex_unlock(&g_gcp_mu);
     }
-    pthread_mutex_unlock(&g_gcp_mu);
 
-    /* Construct RS256 JWT */
     static const char *kJwtHdr = "{\"alg\":\"RS256\",\"typ\":\"JWT\"}";
-    char claims[2048];
-    snprintf(claims, sizeof(claims),
-             "{\"iss\":\"%s\",\"scope\":\"%s\",\"aud\":\"%s\",\"iat\":%ld,\"exp\":%ld}",
-             client_email, scope, token_uri, (long)now, (long)(now + 3600));
+    static const char *kGrantPrefix = "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=";
+    char err_msg[600] = "OOM building JWT claims";
+    qed_buf_t claims_buf = {0};
+    qed_buf_t jwt_buf = {0};
+    qed_buf_t form_buf = {0};
+    BIO *bio = NULL;
+    EVP_PKEY *pkey = NULL;
+    EVP_MD_CTX *mdctx = NULL;
+    qed_raw_resp_t resp = {0};
+    bool has_resp = false;
 
-    char b64_hdr[128];
-    char b64_claims[3072];
-    base64url_encode((const uint8_t *)kJwtHdr, strlen(kJwtHdr), b64_hdr);
-    base64url_encode((const uint8_t *)claims, strlen(claims), b64_claims);
+    if (!buf_init(&claims_buf, 1024) ||
+        !buf_append_cstr(&claims_buf, "{\"iss\":\"") ||
+        !buf_append_json_escaped(&claims_buf, client_email) ||
+        !buf_append_cstr(&claims_buf, "\",\"scope\":\"") ||
+        !buf_append_json_escaped(&claims_buf, scope) ||
+        !buf_append_cstr(&claims_buf, "\",\"aud\":\"") ||
+        !buf_append_json_escaped(&claims_buf, token_uri) ||
+        !buf_append_fmt(&claims_buf, "\",\"iat\":%ld,\"exp\":%ld}", (long)now, (long)(now + 3600))) {
+        goto fail;
+    }
 
-    char signing_input[3300];
-    int si_len = snprintf(signing_input, sizeof(signing_input), "%s.%s", b64_hdr, b64_claims);
+    if (!buf_init(&jwt_buf, 1024) ||
+        !buf_append_b64url(&jwt_buf, (const uint8_t *)kJwtHdr, strlen(kJwtHdr)) ||
+        !buf_append_cstr(&jwt_buf, ".") ||
+        !buf_append_b64url(&jwt_buf, claims_buf.data, claims_buf.len)) {
+        goto fail;
+    }
+    buf_free(&claims_buf);
 
-    BIO *bio = BIO_new_mem_buf(private_key, -1);
+    bio = BIO_new_mem_buf(private_key, -1);
     if (!bio) {
-        return lean_io_result_mk_ok(mk_except_err_str("BIO_new_mem_buf failed for GCP private_key"));
+        snprintf(err_msg, sizeof(err_msg), "BIO_new_mem_buf failed for GCP private_key");
+        goto fail;
     }
-    EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+    pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
     BIO_free(bio);
+    bio = NULL;
     if (!pkey) {
-        return lean_io_result_mk_ok(mk_except_err_str("PEM_read_bio_PrivateKey failed for GCP private_key"));
+        snprintf(err_msg, sizeof(err_msg), "PEM_read_bio_PrivateKey failed for GCP private_key");
+        goto fail;
     }
 
-    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    mdctx = EVP_MD_CTX_new();
     size_t sig_len = 0;
     uint8_t sig_buf[1024];
-    bool sign_ok = false;
-    if (mdctx != NULL &&
-        EVP_DigestSignInit(mdctx, NULL, EVP_sha256(), NULL, pkey) == 1 &&
-        EVP_DigestSignUpdate(mdctx, signing_input, (size_t)si_len) == 1 &&
-        EVP_DigestSignFinal(mdctx, NULL, &sig_len) == 1 &&
-        sig_len <= sizeof(sig_buf) &&
-        EVP_DigestSignFinal(mdctx, sig_buf, &sig_len) == 1)
-    {
-        sign_ok = true;
+    if (!mdctx ||
+        EVP_DigestSignInit(mdctx, NULL, EVP_sha256(), NULL, pkey) != 1 ||
+        EVP_DigestSignUpdate(mdctx, jwt_buf.data, jwt_buf.len) != 1 ||
+        EVP_DigestSignFinal(mdctx, NULL, &sig_len) != 1 ||
+        sig_len > sizeof(sig_buf) ||
+        EVP_DigestSignFinal(mdctx, sig_buf, &sig_len) != 1) {
+        snprintf(err_msg, sizeof(err_msg), "EVP_DigestSign RS256 failed");
+        goto fail;
     }
-    if (mdctx) EVP_MD_CTX_free(mdctx);
+    EVP_MD_CTX_free(mdctx);
+    mdctx = NULL;
     EVP_PKEY_free(pkey);
+    pkey = NULL;
 
-    if (!sign_ok) {
-        return lean_io_result_mk_ok(mk_except_err_str("EVP_DigestSign RS256 failed"));
+    if (!buf_init(&form_buf, jwt_buf.len + 1600) ||
+        !buf_append_cstr(&form_buf, kGrantPrefix) ||
+        !buf_append(&form_buf, jwt_buf.data, jwt_buf.len) ||
+        !buf_append_cstr(&form_buf, ".") ||
+        !buf_append_b64url(&form_buf, sig_buf, sig_len)) {
+        goto fail;
     }
+    buf_free(&jwt_buf);
 
-    char b64_sig[1500];
-    base64url_encode(sig_buf, sig_len, b64_sig);
-
-    char form_body[5200];
-    int fb_len = snprintf(
-        form_body, sizeof(form_body),
-        "grant_type=urn%%3Aietf%%3Aparams%%3Aoauth%%3Agrant-type%%3Ajwt-bearer&assertion=%s.%s",
-        signing_input, b64_sig);
-
-    qed_hdr_pair_t hdrs[1];
-    hdrs[0].key = "Content-Type";
-    hdrs[0].val = "application/x-www-form-urlencoded";
-
-    qed_raw_resp_t resp;
-    char err_msg[512];
-    if (!raw_http_execute("POST", token_uri, hdrs, 1, (const uint8_t *)form_body, (size_t)fb_len, 0, &resp, err_msg, sizeof(err_msg))) {
-        return lean_io_result_mk_ok(mk_except_err_str(err_msg));
+    qed_hdr_pair_t hdrs[1] = { { "Content-Type", "application/x-www-form-urlencoded" } };
+    if (!raw_http_execute("POST", token_uri, hdrs, 1, form_buf.data, form_buf.len, 0, &resp, err_msg, sizeof(err_msg))) {
+        goto fail;
     }
+    has_resp = true;
+    buf_free(&form_buf);
 
-    if (!buf_append(&resp.body, "", 1)) {
-        free_raw_resp(&resp);
-        return lean_io_result_mk_ok(mk_except_err_str("OOM reading GCP OAuth2 response"));
+    if (memchr(resp.body.data, '\0', resp.body.len) != NULL || !buf_append(&resp.body, "", 1)) {
+        snprintf(err_msg, sizeof(err_msg), "invalid GCP OAuth2 response");
+        goto fail;
     }
-
     if (resp.status < 200 || resp.status >= 300) {
-        char fail_buf[600];
-        snprintf(fail_buf, sizeof(fail_buf), "OAuth2 HTTP %d: %.400s", resp.status, (char *)resp.body.data);
-        free_raw_resp(&resp);
-        return lean_io_result_mk_ok(mk_except_err_str(fail_buf));
+        snprintf(err_msg, sizeof(err_msg), "OAuth2 HTTP %d: %.400s", resp.status, (char *)resp.body.data);
+        goto fail;
     }
 
     char access_token[2048];
     if (!json_extract_string((const char *)resp.body.data, "access_token", access_token, sizeof(access_token))) {
-        free_raw_resp(&resp);
-        return lean_io_result_mk_ok(mk_except_err_str("GCP OAuth2 response missing `access_token`"));
+        snprintf(err_msg, sizeof(err_msg), "GCP OAuth2 response missing `access_token`");
+        goto fail;
     }
     long expires_in = json_extract_long((const char *)resp.body.data, "expires_in", 3600);
     free_raw_resp(&resp);
 
-    pthread_mutex_lock(&g_gcp_mu);
-    int slot = 0;
-    for (int i = 0; i < QED_GCP_CACHE_SIZE; i++) {
-        if (!g_gcp_cache[i].valid) { slot = i; break; }
-        if (g_gcp_cache[i].expires_at < g_gcp_cache[slot].expires_at) slot = i;
+    if (can_cache) {
+        pthread_mutex_lock(&g_gcp_mu);
+        int slot = 0;
+        for (int i = 0; i < QED_GCP_CACHE_SIZE; i++) {
+            if (!g_gcp_cache[i].valid) { slot = i; break; }
+            if (g_gcp_cache[i].expires_at < g_gcp_cache[slot].expires_at) slot = i;
+        }
+        qed_gcp_cache_entry_t *dst = &g_gcp_cache[slot];
+        dst->valid = true;
+        snprintf(dst->client_email, sizeof(dst->client_email), "%s", client_email);
+        snprintf(dst->scope, sizeof(dst->scope), "%s", scope);
+        snprintf(dst->token_url, sizeof(dst->token_url), "%s", token_uri);
+        snprintf(dst->access_token, sizeof(dst->access_token), "%s", access_token);
+        dst->expires_at = time(NULL) + (time_t)expires_in;
+        pthread_mutex_unlock(&g_gcp_mu);
     }
-    qed_gcp_cache_entry_t * dst = &g_gcp_cache[slot];
-    dst->valid = true;
-    snprintf(dst->client_email, sizeof(dst->client_email), "%s", client_email);
-    snprintf(dst->scope, sizeof(dst->scope), "%s", scope);
-    snprintf(dst->token_url, sizeof(dst->token_url), "%s", token_uri);
-    snprintf(dst->access_token, sizeof(dst->access_token), "%s", access_token);
-    dst->expires_at = time(NULL) + expires_in;
-    pthread_mutex_unlock(&g_gcp_mu);
 
     return lean_io_result_mk_ok(mk_except_ok(lean_mk_string(access_token)));
+
+fail:
+    if (mdctx) EVP_MD_CTX_free(mdctx);
+    if (pkey) EVP_PKEY_free(pkey);
+    if (bio) BIO_free(bio);
+    if (has_resp) free_raw_resp(&resp);
+    buf_free(&claims_buf);
+    buf_free(&jwt_buf);
+    buf_free(&form_buf);
+    return lean_io_result_mk_ok(mk_except_err_str(err_msg));
 }
 
 /* =========================================================================
  * 7. Multi-Core `SO_REUSEPORT` + `epoll` / `kqueue` HTTP/1.1 Server
  * ========================================================================= */
+
+#define QED_MAX_REQ_HDR_BYTES 65536U
+#define QED_MAX_REQ_BODY_BYTES (32ULL * 1024ULL * 1024ULL)
+#define QED_MAX_TX_QUEUE_BYTES (64ULL * 1024ULL * 1024ULL)
+#define QED_MAX_STATIC_FILE_BYTES (256ULL * 1024ULL * 1024ULL)
+#define QED_MAX_WORKER_CONNS 4096U
+#define QED_CONN_IDLE_TIMEOUT_SEC 30
 
 static volatile sig_atomic_t g_stop_server = 0;
 
@@ -1223,7 +1639,9 @@ static const char *status_reason(int code) {
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 413: return "Payload Too Large";
+        case 431: return "Request Header Fields Too Large";
         case 500: return "Internal Server Error";
+        case 501: return "Not Implemented";
         default:  return "OK";
     }
 }
@@ -1246,7 +1664,56 @@ static const char *guess_mime_type(const char *path) {
     return NULL;
 }
 
-static bool writev_all(int fd, const char *hdr, size_t hdr_len, const uint8_t *body, size_t body_len) {
+typedef struct qed_client_conn {
+    int fd;
+    int loop_fd;
+    bool has_loop;
+    bool rx_armed;
+    bool tx_armed;
+    bool peer_eof;
+    bool close_after_tx;
+    char ip[64];
+    qed_buf_t rx;
+    qed_buf_t tx;
+    size_t tx_off;
+    time_t last_active;
+    struct qed_client_conn *prev;
+    struct qed_client_conn *next;
+} qed_client_conn_t;
+
+static void update_loop_write_interest(qed_client_conn_t *c, bool want_write) {
+    if (!c->has_loop) return;
+    bool want_read = !c->close_after_tx && !c->peer_eof;
+    if (c->tx_armed == want_write && c->rx_armed == want_read) return;
+#ifdef __linux__
+    struct epoll_event ev;
+    ev.data.ptr = c;
+    ev.events = (want_read ? (uint32_t)(EPOLLIN | EPOLLRDHUP) : 0U) | (want_write ? (uint32_t)EPOLLOUT : 0U);
+    if (epoll_ctl(c->loop_fd, EPOLL_CTL_MOD, c->fd, &ev) == 0) {
+        c->tx_armed = want_write;
+        c->rx_armed = want_read;
+    }
+#elif defined(__APPLE__)
+    struct kevent kev[2];
+    int n = 0;
+    if (c->tx_armed != want_write) {
+        EV_SET(&kev[n++], c->fd, EVFILT_WRITE, want_write ? (EV_ADD | EV_ENABLE) : EV_DELETE, 0, 0, c);
+    }
+    if (c->rx_armed != want_read && !want_read) {
+        EV_SET(&kev[n++], c->fd, EVFILT_READ, EV_DELETE, 0, 0, c);
+    }
+    if (n > 0 && kevent(c->loop_fd, kev, n, NULL, 0, NULL) == 0) {
+        c->tx_armed = want_write;
+        c->rx_armed = want_read;
+    }
+#endif
+}
+
+static bool queue_or_writev(
+    qed_client_conn_t *c,
+    const char *hdr, size_t hdr_len,
+    const uint8_t *body, size_t body_len)
+{
     struct iovec iov[2];
     iov[0].iov_base = (void *)hdr;
     iov[0].iov_len  = hdr_len;
@@ -1254,34 +1721,74 @@ static bool writev_all(int fd, const char *hdr, size_t hdr_len, const uint8_t *b
     iov[1].iov_len  = body_len;
     int iovcnt = (body_len > 0 && body != NULL) ? 2 : 1;
     int idx = 0;
-    while (idx < iovcnt) {
-        ssize_t n = writev(fd, &iov[idx], iovcnt - idx);
+
+    if (c->tx.len == 0) {
+        while (idx < iovcnt) {
+            ssize_t n = writev(c->fd, &iov[idx], iovcnt - idx);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                return false;
+            }
+            c->last_active = time(NULL);
+            size_t rem = (size_t)n;
+            while (idx < iovcnt && rem >= iov[idx].iov_len) {
+                rem -= iov[idx].iov_len;
+                idx++;
+            }
+            if (idx < iovcnt && rem > 0) {
+                iov[idx].iov_base = (uint8_t *)iov[idx].iov_base + rem;
+                iov[idx].iov_len -= rem;
+            }
+        }
+        if (idx == iovcnt) return true;
+        c->tx_off = 0;
+    }
+
+    size_t pending = c->tx.len - c->tx_off;
+    size_t need = 0;
+    for (int k = idx; k < iovcnt; k++) {
+        if (iov[k].iov_len > QED_MAX_TX_QUEUE_BYTES - pending - need) return false;
+        need += iov[k].iov_len;
+    }
+    if (c->tx.data == NULL && !buf_init(&c->tx, need < 4096 ? 4096 : need)) return false;
+    if (c->tx_off > 0 && c->tx_off >= c->tx.len / 2) {
+        buf_consume(&c->tx, c->tx_off);
+        c->tx_off = 0;
+    }
+    for (int k = idx; k < iovcnt; k++) {
+        if (!buf_append(&c->tx, iov[k].iov_base, iov[k].iov_len)) return false;
+    }
+    update_loop_write_interest(c, true);
+    return true;
+}
+
+static bool flush_client_tx(qed_client_conn_t *c) {
+    while (c->tx_off < c->tx.len) {
+        ssize_t n = send(c->fd, c->tx.data + c->tx_off, c->tx.len - c->tx_off, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(500);
-                continue;
-            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
             return false;
         }
-        size_t rem = (size_t)n;
-        while (idx < iovcnt && rem >= iov[idx].iov_len) {
-            rem -= iov[idx].iov_len;
-            idx++;
-        }
-        if (idx < iovcnt && rem > 0) {
-            iov[idx].iov_base = (uint8_t *)iov[idx].iov_base + rem;
-            iov[idx].iov_len -= rem;
-        }
+        if (n == 0) return false;
+        c->tx_off += (size_t)n;
+        c->last_active = time(NULL);
     }
+    c->tx.len = 0;
+    c->tx_off = 0;
+    update_loop_write_interest(c, false);
     return true;
 }
 
 static bool send_http_response(
-    int fd, int status, const char *content_type,
+    qed_client_conn_t *c, int status, const char *content_type,
     const uint8_t *body, size_t body_len,
     bool head_only, bool keep_alive, bool no_store)
 {
+    if (!content_type || has_ctl_or_crlf(content_type, false)) {
+        content_type = "application/octet-stream";
+    }
     char hdr[1024];
     int hlen = snprintf(
         hdr, sizeof(hdr),
@@ -1297,34 +1804,72 @@ static bool send_http_response(
         keep_alive ? "keep-alive" : "close",
         no_store ? "Cache-Control: no-store\r\n" : "");
     if (hlen <= 0 || (size_t)hlen >= sizeof(hdr)) return false;
-    return writev_all(fd, hdr, (size_t)hlen, head_only ? NULL : body, head_only ? 0 : body_len);
+    return queue_or_writev(c, hdr, (size_t)hlen, head_only ? NULL : body, head_only ? 0 : body_len);
 }
 
-static bool read_regular_file(const char *path, bool head_only, uint8_t **out_data, size_t *out_len) {
+static int reject_request(qed_client_conn_t *c, int status, const char *msg) {
+    (void)send_http_response(c, status, "text/plain; charset=utf-8",
+                             (const uint8_t *)msg, strlen(msg),
+                             false, false, true);
+    c->close_after_tx = true;
+    return -1;
+}
+
+static bool read_regular_file_nofollow(const char *path, bool head_only, uint8_t **out_data, size_t *out_len) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
     struct stat st;
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+        (uint64_t)st.st_size > QED_MAX_STATIC_FILE_BYTES) {
+        close(fd);
+        return false;
+    }
     size_t fsize = (size_t)st.st_size;
     *out_data = NULL;
     *out_len = fsize;
     if (!head_only && fsize > 0) {
-        FILE *fp = fopen(path, "rb");
-        if (!fp) return false;
         *out_data = (uint8_t *)malloc(fsize);
-        if (!*out_data) { fclose(fp); return false; }
-        *out_len = fread(*out_data, 1, fsize, fp);
-        fclose(fp);
+        if (!*out_data) { close(fd); return false; }
+        size_t off = 0;
+        while (off < fsize) {
+            ssize_t r = read(fd, *out_data + off, fsize - off);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                free(*out_data);
+                *out_data = NULL;
+                close(fd);
+                return false;
+            }
+            if (r == 0) break;
+            off += (size_t)r;
+        }
+        *out_len = off;
     }
+    close(fd);
     return true;
 }
 
+static bool is_within_static_dir(const char *static_dir, const char *candidate_path) {
+    char real_dir[PATH_MAX];
+    char real_file[PATH_MAX];
+    if (!realpath(static_dir, real_dir)) return false;
+    if (!realpath(candidate_path, real_file)) return false;
+    size_t dlen = strlen(real_dir);
+    if (strncmp(real_file, real_dir, dlen) != 0) return false;
+    if (dlen > 0 && real_dir[dlen - 1] == '/') return real_file[dlen] != '\0';
+    return real_file[dlen] == '/';
+}
+
 static bool try_serve_static_c(
-    int client_fd,
+    qed_client_conn_t *c,
     const char *static_dir,
     uint8_t dev_mode,
     const char *method,
     const char *target,
-    bool keep_alive)
+    bool keep_alive,
+    bool *out_write_ok)
 {
+    *out_write_ok = true;
     bool is_get = (strcmp(method, "GET") == 0);
     bool is_head = (strcmp(method, "HEAD") == 0);
     if (!is_get && !is_head) return false;
@@ -1333,22 +1878,25 @@ static bool try_serve_static_c(
     const char *q = strchr(target, '?');
     size_t plen = q ? (size_t)(q - target) : strlen(target);
     if (plen == 0 || plen >= sizeof(path_only)) return false;
+    if (target[0] != '/') return false;
+    if (memchr(target, '\\', plen) != NULL) return false;
     memcpy(path_only, target, plen);
     path_only[plen] = '\0';
 
     if (strncmp(path_only, "/_qed/", 6) == 0 || strstr(path_only, "..") != NULL) return false;
 
-    char full[4096];
-    snprintf(full, sizeof(full), "%s%s", static_dir, path_only);
+    char full[PATH_MAX];
+    int flen = snprintf(full, sizeof(full), "%s%s", static_dir, path_only);
+    if (flen <= 0 || (size_t)flen >= sizeof(full)) return false;
 
     if (dev_mode && strcmp(path_only, "/__build_id") == 0) {
         uint8_t *data = NULL;
         size_t len = 0;
-        if (read_regular_file(full, is_head, &data, &len)) {
-            send_http_response(client_fd, 200, "text/plain; charset=utf-8", data, len, is_head, keep_alive, true);
+        if (is_within_static_dir(static_dir, full) && read_regular_file_nofollow(full, is_head, &data, &len)) {
+            *out_write_ok = send_http_response(c, 200, "text/plain; charset=utf-8", data, len, is_head, keep_alive, true);
             free(data);
         } else {
-            send_http_response(client_fd, 200, "text/plain; charset=utf-8", (const uint8_t *)"0", 1, is_head, keep_alive, true);
+            *out_write_ok = send_http_response(c, 200, "text/plain; charset=utf-8", (const uint8_t *)"0", 1, is_head, keep_alive, true);
         }
         return true;
     }
@@ -1356,19 +1904,14 @@ static bool try_serve_static_c(
     const char *mime = guess_mime_type(path_only);
     if (!mime) return false;
 
+    if (!is_within_static_dir(static_dir, full)) return false;
     uint8_t *data = NULL;
     size_t fsize = 0;
-    if (!read_regular_file(full, is_head, &data, &fsize)) return false;
-    send_http_response(client_fd, 200, mime, data, fsize, is_head, keep_alive, dev_mode != 0);
+    if (!read_regular_file_nofollow(full, is_head, &data, &fsize)) return false;
+    *out_write_ok = send_http_response(c, 200, mime, data, fsize, is_head, keep_alive, dev_mode != 0);
     free(data);
     return true;
 }
-
-typedef struct qed_client_conn {
-    int fd;
-    char ip[64];
-    qed_buf_t rx;
-} qed_client_conn_t;
 
 static void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -1405,41 +1948,62 @@ static int process_buffered_requests(
 {
     for (;;) {
         ssize_t hdr_end = find_crlfcrlf(c->rx.data, c->rx.len);
-        if (hdr_end < 0) return (c->rx.len > 65536) ? -1 : 0;
+        if (hdr_end < 0) {
+            return (c->rx.len > QED_MAX_REQ_HDR_BYTES) ? reject_request(c, 431, "request headers too large") : 0;
+        }
 
         size_t hdr_bytes = (size_t)hdr_end + 4;
-        char hdr_copy[65540];
-        if (hdr_bytes >= sizeof(hdr_copy)) return -1;
+        if ((size_t)hdr_end > QED_MAX_REQ_HDR_BYTES) return reject_request(c, 431, "request headers too large");
+        if (memchr(c->rx.data, '\0', (size_t)hdr_end) != NULL) return reject_request(c, 400, "invalid NUL byte in headers");
+
+        char hdr_copy[QED_MAX_REQ_HDR_BYTES + 4];
         memcpy(hdr_copy, c->rx.data, (size_t)hdr_end);
         hdr_copy[hdr_end] = '\0';
 
-        char *saveptr = NULL;
-        char *req_line = strtok_r(hdr_copy, "\r\n", &saveptr);
-        if (!req_line) return -1;
+        char *cursor = hdr_copy;
+        char *hdr_limit = hdr_copy + hdr_end;
+        bool bare_crlf = false;
+        char *req_line = next_crlf_line(&cursor, hdr_limit, &bare_crlf);
+        if (!req_line || bare_crlf || *req_line == '\0') return reject_request(c, 400, "malformed request line");
 
         char *sp1 = strchr(req_line, ' ');
-        if (!sp1) return -1;
+        if (!sp1) return reject_request(c, 400, "malformed request line");
         *sp1 = '\0';
         char *method = req_line;
         char *target = sp1 + 1;
         char *sp2 = strchr(target, ' ');
-        if (!sp2) return -1;
+        if (!sp2) return reject_request(c, 400, "malformed request line");
         *sp2 = '\0';
         char *http_ver = sp2 + 1;
+        if (*method == '\0' || *target == '\0' || strchr(http_ver, ' ') != NULL) {
+            return reject_request(c, 400, "malformed request line");
+        }
+        bool is_http_11 = (strcmp(http_ver, "HTTP/1.1") == 0);
+        if (!is_http_11 && strcmp(http_ver, "HTTP/1.0") != 0) {
+            return reject_request(c, 400, "unsupported HTTP version");
+        }
 
-        bool keep_alive = (strstr(http_ver, "1.1") != NULL);
+        bool keep_alive = is_http_11;
+        bool has_content_len = false;
         size_t content_len = 0;
-
         qed_hdr_pair_t parsed_hdrs[96];
         size_t parsed_cnt = 0;
 
         char *hline = NULL, *val = NULL;
-        while ((hline = strtok_r(NULL, "\r\n", &saveptr)) != NULL) {
-            if (!split_header_kv(hline, &val)) continue;
+        while ((hline = next_crlf_line(&cursor, hdr_limit, &bare_crlf)) != NULL) {
+            if (!split_header_kv(hline, &val)) return reject_request(c, 400, "malformed header");
+            if (strcasecmp(hline, "Transfer-Encoding") == 0) {
+                return reject_request(c, 501, "Transfer-Encoding not supported");
+            }
             if (strcasecmp(hline, "Content-Length") == 0) {
-                int64_t cl = parse_dec_i64(val, NULL);
-                if (cl < 0 || cl > (32LL * 1024LL * 1024LL)) return -1;
-                content_len = (size_t)cl;
+                uint64_t cl_u64 = 0;
+                if (!parse_strict_u64(val, &cl_u64)) return reject_request(c, 400, "invalid Content-Length");
+                if (has_content_len && cl_u64 != (uint64_t)content_len) {
+                    return reject_request(c, 400, "conflicting Content-Length headers");
+                }
+                if (cl_u64 > QED_MAX_REQ_BODY_BYTES) return reject_request(c, 413, "payload too large");
+                has_content_len = true;
+                content_len = (size_t)cl_u64;
             } else if (strcasecmp(hline, "Connection") == 0) {
                 if (strcasestr(val, "close") != NULL) keep_alive = false;
                 else if (strcasestr(val, "keep-alive") != NULL) keep_alive = true;
@@ -1450,11 +2014,15 @@ static int process_buffered_requests(
                 parsed_cnt++;
             }
         }
+        if (bare_crlf) return reject_request(c, 400, "bare CR/LF in headers");
 
         size_t total_needed = hdr_bytes + content_len;
         if (c->rx.len < total_needed) return 0;
 
-        if (!try_serve_static_c(c->fd, static_dir, dev_mode, method, target, keep_alive)) {
+        bool static_write_ok = true;
+        if (try_serve_static_c(c, static_dir, dev_mode, method, target, keep_alive, &static_write_ok)) {
+            if (!static_write_ok) return -1;
+        } else {
             lean_inc(handler);
             lean_object *io_res = lean_apply_6(
                 handler,
@@ -1471,25 +2039,24 @@ static int process_buffered_requests(
                 lean_object *tup2 = lean_ctor_get(tup1, 1);
                 const char *ctype = lean_string_cstr(lean_ctor_get(tup2, 0));
                 lean_object *resp_ba = lean_ctor_get(tup2, 1);
+                int status_i = (status >= 100 && status <= 599) ? (int)status : 500;
                 bool sent = send_http_response(
-                    c->fd, (int)status, ctype,
+                    c, status_i, ctype,
                     lean_sarray_cptr(resp_ba), lean_sarray_size(resp_ba),
                     strcmp(method, "HEAD") == 0, keep_alive, false);
                 lean_dec_ref(io_res);
                 if (!sent) return -1;
             } else {
                 lean_dec_ref(io_res);
-                const char *msg = "internal server error";
-                send_http_response(c->fd, 500, "text/plain; charset=utf-8", (const uint8_t *)msg, strlen(msg), false, false, true);
-                return -1;
+                return reject_request(c, 500, "internal server error");
             }
         }
 
-        size_t rem = c->rx.len - total_needed;
-        if (rem > 0) memmove(c->rx.data, c->rx.data + total_needed, rem);
-        c->rx.len = rem;
-
-        if (!keep_alive) return -1;
+        buf_consume(&c->rx, total_needed);
+        if (!keep_alive) {
+            c->close_after_tx = true;
+            return -1;
+        }
         if (c->rx.len == 0) return 1;
     }
 }
@@ -1501,17 +2068,30 @@ typedef struct {
     const char *static_dir;
     uint8_t dev_mode;
     lean_object *handler;
+    pthread_t tid;
+    bool started;
 } qed_worker_arg_t;
 
-static void close_client_conn(int loop_fd, qed_client_conn_t *c) {
+static void close_client_conn(qed_client_conn_t **conn_head, uint32_t *conn_cnt, qed_client_conn_t *c) {
     if (!c) return;
+    if (c->prev) c->prev->next = c->next;
+    else if (conn_head && *conn_head == c) *conn_head = c->next;
+    if (c->next) c->next->prev = c->prev;
+    if (conn_cnt && *conn_cnt > 0) (*conn_cnt)--;
+
+    if (c->has_loop) {
 #ifdef __linux__
-    epoll_ctl(loop_fd, EPOLL_CTL_DEL, c->fd, NULL);
-#else
-    (void)loop_fd;
+        epoll_ctl(c->loop_fd, EPOLL_CTL_DEL, c->fd, NULL);
+#elif defined(__APPLE__)
+        struct kevent kev[2];
+        EV_SET(&kev[0], c->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+        EV_SET(&kev[1], c->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+        kevent(c->loop_fd, kev, 2, NULL, 0, NULL);
 #endif
+    }
     close(c->fd);
     buf_free(&c->rx);
+    buf_free(&c->tx);
     free(c);
 }
 
@@ -1531,32 +2111,135 @@ static qed_client_conn_t *accept_one_client(int listen_fd) {
     qed_client_conn_t *conn = (qed_client_conn_t *)calloc(1, sizeof(qed_client_conn_t));
     if (!conn) { close(cfd); return NULL; }
     conn->fd = cfd;
+    conn->loop_fd = -1;
+    conn->last_active = time(NULL);
     inet_ntop(AF_INET, &cli_addr.sin_addr, conn->ip, sizeof(conn->ip));
-    buf_init(&conn->rx, 2048);
+    if (!buf_init(&conn->rx, 2048)) {
+        close(cfd);
+        free(conn);
+        return NULL;
+    }
     return conn;
 }
 
-static void handle_client_io(int loop_fd, qed_client_conn_t *conn, bool peer_eof, const qed_worker_arg_t *arg) {
-    bool closed = false;
-    for (;;) {
-        uint8_t tmp[8192];
-        ssize_t n = recv(conn->fd, tmp, sizeof(tmp), 0);
-        if (n > 0) {
-            if (!buf_append(&conn->rx, tmp, (size_t)n)) { closed = true; break; }
-        } else if (n == 0) {
-            closed = true;
-            break;
-        } else {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-            closed = true;
-            break;
+static void handle_client_io(
+    qed_client_conn_t **conn_head,
+    uint32_t *conn_cnt,
+    qed_client_conn_t *conn,
+    bool peer_eof,
+    bool fatal_err,
+    const qed_worker_arg_t *arg)
+{
+    if (peer_eof) conn->peer_eof = true;
+    if (fatal_err) {
+        /* Try draining any buffered inbound data first if not yet marked close_after_tx, unless fatal socket error */
+        conn->peer_eof = true;
+    }
+
+    bool read_err = false;
+    if (!conn->close_after_tx) {
+        for (;;) {
+            uint8_t tmp[8192];
+            ssize_t n = recv(conn->fd, tmp, sizeof(tmp), 0);
+            if (n > 0) {
+                conn->last_active = time(NULL);
+                if ((size_t)n > (QED_MAX_REQ_HDR_BYTES + QED_MAX_REQ_BODY_BYTES) - conn->rx.len) {
+                    (void)reject_request(conn, 413, "payload too large");
+                    break;
+                }
+                if (!buf_append(&conn->rx, tmp, (size_t)n)) {
+                    read_err = true;
+                    break;
+                }
+                if (conn->rx.len > QED_MAX_REQ_HDR_BYTES &&
+                    find_crlfcrlf(conn->rx.data, conn->rx.len) < 0) {
+                    (void)reject_request(conn, 431, "request headers too large");
+                    break;
+                }
+            } else if (n == 0) {
+                conn->peer_eof = true;
+                break;
+            } else {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                read_err = true;
+                break;
+            }
         }
     }
-    if (!closed && conn->rx.len > 0) {
-        if (process_buffered_requests(conn, arg->static_dir, arg->dev_mode, arg->handler) < 0) closed = true;
+
+    if (read_err) {
+        close_client_conn(conn_head, conn_cnt, conn);
+        return;
     }
-    if (closed || peer_eof) close_client_conn(loop_fd, conn);
+
+    if (!conn->close_after_tx && conn->rx.len > 0) {
+        if (process_buffered_requests(conn, arg->static_dir, arg->dev_mode, arg->handler) < 0) {
+            conn->close_after_tx = true;
+        }
+    }
+
+    if (conn->close_after_tx || conn->peer_eof) {
+        if (conn->tx.len == 0) {
+            close_client_conn(conn_head, conn_cnt, conn);
+        } else {
+            conn->close_after_tx = true;
+            update_loop_write_interest(conn, true);
+        }
+    }
+}
+
+static void sweep_idle_conns(qed_client_conn_t **conn_head, uint32_t *conn_cnt, time_t *last_sweep) {
+    time_t now = time(NULL);
+    if (now - *last_sweep < 5) return;
+    *last_sweep = now;
+    qed_client_conn_t *c = *conn_head;
+    while (c != NULL) {
+        qed_client_conn_t *nxt = c->next;
+        if (now - c->last_active > QED_CONN_IDLE_TIMEOUT_SEC) {
+            close_client_conn(conn_head, conn_cnt, c);
+        }
+        c = nxt;
+    }
+}
+
+static void register_accepted_conns(int listen_fd, int loop_fd, qed_client_conn_t **conn_head, uint32_t *conn_cnt) {
+    qed_client_conn_t *conn;
+    while ((conn = accept_one_client(listen_fd)) != NULL) {
+        bool added = false;
+        if (*conn_cnt < QED_MAX_WORKER_CONNS) {
+#ifdef __linux__
+            struct epoll_event cev = { .events = EPOLLIN | EPOLLRDHUP, .data.ptr = conn };
+            added = (epoll_ctl(loop_fd, EPOLL_CTL_ADD, conn->fd, &cev) == 0);
+#elif defined(__APPLE__)
+            struct kevent kev;
+            EV_SET(&kev, conn->fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, conn);
+            added = (kevent(loop_fd, &kev, 1, NULL, 0, NULL) == 0);
+#endif
+        }
+        if (!added) {
+            close(conn->fd);
+            buf_free(&conn->rx);
+            free(conn);
+            continue;
+        }
+        conn->loop_fd = loop_fd;
+        conn->has_loop = true;
+        conn->rx_armed = true;
+        conn->next = *conn_head;
+        if (*conn_head) (*conn_head)->prev = conn;
+        *conn_head = conn;
+        (*conn_cnt)++;
+    }
+}
+
+static bool handle_client_writable(qed_client_conn_t **conn_head, uint32_t *conn_cnt, qed_client_conn_t *conn) {
+    if (!flush_client_tx(conn) ||
+        (conn->tx.len == 0 && (conn->close_after_tx || (conn->peer_eof && conn->rx.len == 0)))) {
+        close_client_conn(conn_head, conn_cnt, conn);
+        return false;
+    }
+    return true;
 }
 
 static void *worker_thread_main(void *raw_arg) {
@@ -1569,6 +2252,10 @@ static void *worker_thread_main(void *raw_arg) {
         return NULL;
     }
 
+    qed_client_conn_t *conn_head = NULL;
+    uint32_t conn_cnt = 0;
+    time_t last_sweep = time(NULL);
+
 #ifdef __linux__
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd >= 0) {
@@ -1580,18 +2267,21 @@ static void *worker_thread_main(void *raw_arg) {
             if (nfds < 0) { if (errno == EINTR) continue; break; }
             for (int i = 0; i < nfds; i++) {
                 if (events[i].data.ptr == NULL) {
-                    qed_client_conn_t *conn;
-                    while ((conn = accept_one_client(listen_fd)) != NULL) {
-                        struct epoll_event cev = { .events = EPOLLIN | EPOLLRDHUP, .data.ptr = conn };
-                        epoll_ctl(epfd, EPOLL_CTL_ADD, conn->fd, &cev);
-                    }
+                    register_accepted_conns(listen_fd, epfd, &conn_head, &conn_cnt);
                 } else {
                     qed_client_conn_t *conn = (qed_client_conn_t *)events[i].data.ptr;
-                    if (events[i].events & (EPOLLERR | EPOLLHUP)) close_client_conn(epfd, conn);
-                    else handle_client_io(epfd, conn, (events[i].events & EPOLLRDHUP) != 0, arg);
+                    uint32_t evs = events[i].events;
+                    if ((evs & EPOLLOUT) && !handle_client_writable(&conn_head, &conn_cnt, conn)) continue;
+                    if (evs & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+                        handle_client_io(&conn_head, &conn_cnt, conn,
+                                         (evs & (EPOLLRDHUP | EPOLLHUP)) != 0,
+                                         (evs & EPOLLERR) != 0, arg);
+                    }
                 }
             }
+            sweep_idle_conns(&conn_head, &conn_cnt, &last_sweep);
         }
+        while (conn_head != NULL) close_client_conn(&conn_head, &conn_cnt, conn_head);
         close(epfd);
     }
 #elif defined(__APPLE__)
@@ -1607,16 +2297,21 @@ static void *worker_thread_main(void *raw_arg) {
             if (nfds < 0) { if (errno == EINTR) continue; break; }
             for (int i = 0; i < nfds; i++) {
                 if (events[i].udata == NULL) {
-                    qed_client_conn_t *conn;
-                    while ((conn = accept_one_client(listen_fd)) != NULL) {
-                        EV_SET(&kev, conn->fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, conn);
-                        kevent(kq, &kev, 1, NULL, 0, NULL);
-                    }
+                    register_accepted_conns(listen_fd, kq, &conn_head, &conn_cnt);
                 } else {
-                    handle_client_io(kq, (qed_client_conn_t *)events[i].udata, (events[i].flags & EV_EOF) != 0, arg);
+                    qed_client_conn_t *conn = (qed_client_conn_t *)events[i].udata;
+                    if (events[i].filter == EVFILT_WRITE) {
+                        (void)handle_client_writable(&conn_head, &conn_cnt, conn);
+                    } else if (events[i].filter == EVFILT_READ) {
+                        handle_client_io(&conn_head, &conn_cnt, conn,
+                                         (events[i].flags & EV_EOF) != 0,
+                                         (events[i].flags & EV_ERROR) != 0, arg);
+                    }
                 }
             }
+            sweep_idle_conns(&conn_head, &conn_cnt, &last_sweep);
         }
+        while (conn_head != NULL) close_client_conn(&conn_head, &conn_cnt, conn_head);
         close(kq);
     }
 #endif
@@ -1636,7 +2331,7 @@ LEAN_EXPORT lean_object *qed_server_run(
     uint8_t dev_mode,
     lean_obj_arg handler)
 {
-    signal(SIGPIPE, SIG_IGN);
+    ensure_sigpipe_ignored();
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = handle_stop_signal;
@@ -1660,7 +2355,23 @@ LEAN_EXPORT lean_object *qed_server_run(
         return lean_io_result_mk_ok(lean_box_uint32(1));
     }
 
+    if (port == 0) {
+        struct sockaddr_in bound_addr;
+        socklen_t blen = sizeof(bound_addr);
+        if (getsockname(first_fd, (struct sockaddr *)&bound_addr, &blen) == 0) {
+            port = ntohs(bound_addr.sin_port);
+        }
+    }
+
     char *static_dir_copy = strdup(lean_string_cstr(static_dir_obj));
+    qed_worker_arg_t *args = (qed_worker_arg_t *)calloc(num_workers, sizeof(qed_worker_arg_t));
+    if (!static_dir_copy || !args) {
+        free(args);
+        free(static_dir_copy);
+        close(first_fd);
+        lean_dec(handler);
+        return lean_io_result_mk_ok(lean_box_uint32(1));
+    }
     lean_mark_mt(handler);
     if (num_workers > 1) {
         lean_runtime_mark_multi_threaded();
@@ -1669,9 +2380,6 @@ LEAN_EXPORT lean_object *qed_server_run(
     fprintf(stdout, "▸ qed native server listening on http://127.0.0.1:%u (%u worker%s)\n",
             (unsigned)port, (unsigned)num_workers, num_workers == 1 ? "" : "s");
     fflush(stdout);
-
-    pthread_t *threads = (pthread_t *)calloc(num_workers, sizeof(pthread_t));
-    qed_worker_arg_t *args = (qed_worker_arg_t *)calloc(num_workers, sizeof(qed_worker_arg_t));
 
     for (uint32_t i = 0; i < num_workers; i++) {
         args[i].worker_idx = i;
@@ -1683,15 +2391,16 @@ LEAN_EXPORT lean_object *qed_server_run(
     }
 
     for (uint32_t i = 1; i < num_workers; i++) {
-        pthread_create(&threads[i], NULL, worker_thread_main, &args[i]);
+        if (pthread_create(&args[i].tid, NULL, worker_thread_main, &args[i]) == 0) {
+            args[i].started = true;
+        }
     }
     worker_thread_main(&args[0]);
 
     for (uint32_t i = 1; i < num_workers; i++) {
-        pthread_join(threads[i], NULL);
+        if (args[i].started) pthread_join(args[i].tid, NULL);
     }
 
-    free(threads);
     free(args);
     free(static_dir_copy);
     lean_dec(handler);

@@ -8,9 +8,8 @@ namespace Qed.Server.Prim
 
 opaque StateBoxPointed : NonemptyType.{0}
 
-/-- Thread-safe `pthread_rwlock_t` shared state container preserving `RC == 1` exclusivity
-    for $O(1)$ in-place FBIP `Array` updates under `wrlock` and concurrent multi-core reads
-    under `rdlock`. -/
+/-- Thread-safe `pthread_rwlock_t` shared state container (`lean_mark_mt`-marked) for
+    serialized atomic updates under `wrlock` and concurrent multi-core reads under `rdlock`. -/
 def StateBox (_ : Type) : Type := StateBoxPointed.type
 
 instance {σ : Type} : Nonempty (StateBox σ) := StateBoxPointed.property

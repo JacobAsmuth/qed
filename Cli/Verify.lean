@@ -130,27 +130,27 @@ def kernelEnvClean : IO Bool := do
 def externsCovered : IO Bool := do
   let rtPath ← runtimeFile "qed_rt.mjs"
   unless (← rtPath.pathExists) do return true
-  let checkExterns (mods entries : Array String) : IO Bool := do
-    return (← shQuiet "lake" (#["exe", "qedjs", "--check-externs", rtPath.toString] ++ mods ++ #["--"] ++ entries)) == 0
   let mod ← jsRoot
   let modPath := FilePath.mk ((mod.replace "." "/") ++ ".lean")
+  let hasExamples ← (FilePath.mk "Examples").pathExists
+  let mut mods : Array String := #[]
+  let mut entries : Array String := #[]
   if ← modPath.pathExists then
-    if !(← (FilePath.mk "Examples").pathExists) && mod != (← webRoot) then
+    if !hasExamples && mod != (← webRoot) then
       if (← shQuiet "lake" #["build", mod]) != 0 then return false
     match ← fullstackAppName mod with
     | some fsName =>
-        let drv := driverEntries.filter (!·.startsWith "main:")
-        if !(← checkExterns #[mod, "Qed.Driver"] (#[s!"{fsName}.clientApp"] ++ drv)) then
-          return false
+        mods := #[mod, "Qed.Driver"]
+        entries := #[s!"{fsName}.clientApp"] ++ driverEntries.filter (!·.startsWith "main:")
     | none =>
-        if !(← checkExterns #[mod] driverEntries) then return false
-        if let some appName ← ssrAppName mod then
-          if !(← checkExterns #[mod] #[s!"{appName}:app", "Qed.App.ssrStep:ssrStep"]) then
-            return false
-  if ← (FilePath.mk "Examples").pathExists then
-    if !(← checkExterns #["Examples.JsGate"] #["JsGate.run", "JsGate.counts", "JsGate.probeCount", "JsGate.names"]) then
-      return false
-  return true
+        mods := #[mod]
+        entries := driverEntries ++
+          (match ← ssrAppName mod with | some a => #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"] | none => #[])
+  if hasExamples then
+    mods := mods.push "Examples.JsGate"
+    entries := entries ++ #["JsGate.run", "JsGate.counts", "JsGate.probeCount", "JsGate.names"]
+  if entries.isEmpty then return true
+  return (← shQuiet "lake" (#["exe", "qedjs", "--check-externs", rtPath.toString] ++ mods ++ #["--"] ++ entries)) == 0
 
 def verify : IO Bool := do
   step "verifying proofs & axioms"

@@ -296,16 +296,10 @@ export const String_Slice_Pattern_Internal_memcmpStr = (lhs, rhs, lstart, rstart
   if (n <= 0) return 1;
   const li = getStrInfo(lhs), ri = getStrInfo(rhs);
   if (ls + n > li.len || rs + n > ri.len) return 0;
-  if (li.ascii && ri.ascii) {
-    for (let i = 0; i < n; i++) {
-      if (lhs.charCodeAt(ls + i) !== rhs.charCodeAt(rs + i)) return 0;
-    }
-    return 1;
-  }
-  const lb = li.ascii ? null : li.bytes, rb = ri.ascii ? null : ri.bytes;
+  if (li.ascii && ri.ascii) return lhs.slice(ls, ls + n) === rhs.slice(rs, rs + n) ? 1 : 0;
   for (let i = 0; i < n; i++) {
-    const b1 = lb ? lb[ls + i] : lhs.charCodeAt(ls + i);
-    const b2 = rb ? rb[rs + i] : rhs.charCodeAt(rs + i);
+    const b1 = li.ascii ? lhs.charCodeAt(ls + i) : li.bytes[ls + i];
+    const b2 = ri.ascii ? rhs.charCodeAt(rs + i) : ri.bytes[rs + i];
     if (b1 !== b2) return 0;
   }
   return 1;

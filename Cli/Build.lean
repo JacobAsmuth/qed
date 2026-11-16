@@ -96,21 +96,6 @@ private def minifyBundles (outDir : FilePath) (files : List String) : IO Unit :=
       if (← p.pathExists) then
         discard <| sh "bash" #["-c", s!"esbuild {p} --minify --format=esm --outfile={p}.min && mv {p}.min {p}"]
 
-private def verifyBuiltExterns (outDir : FilePath) (bundles : List String) : IO Bool := do
-  unless (← onPath "node") do return true
-  let existing ← bundles.filterM fun f => (outDir / FilePath.mk f).pathExists
-  if existing.isEmpty then return true
-  let script :=
-    "import path from 'node:path'; import { pathToFileURL } from 'node:url';" ++
-    "const rt = await import(pathToFileURL(path.resolve(process.argv[1])).href);" ++
-    "for (const f of process.argv.slice(2)) {" ++
-    "  const m = await import(pathToFileURL(path.resolve(f)).href);" ++
-    "  rt.assertExterns(m.__externs, rt);" ++
-    "}"
-  let rtArg := (outDir / "qed_rt.mjs").toString
-  let bundleArgs := existing.toArray.map fun f => (outDir / FilePath.mk f).toString
-  return (← sh "node" (#["--input-type=module", "-e", script, rtArg] ++ bundleArgs)) == 0
-
 private def resolveServeCmd (dir : FilePath) (port : String) (dev : Bool) :
     IO (String × Array String × Bool) := do
   let devArg := if dev then #["--dev"] else #[]
@@ -147,7 +132,6 @@ def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool) : IO 
   for stale in ["ssr.mjs", "ssr_app.mjs", "qed_ssr_host.mjs"] do
     removeIfExists (outDir / stale)
   if prod then minifyBundles outDir ["app.mjs", "qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"]
-  if !(← verifyBuiltExterns outDir ["app.mjs"]) then return false
 
   -- 2. Synthesize & compile native multi-core C/Lean server binary → `<outDir>/server`
   let srvLean := genDir / "ServerMain.lean"
@@ -192,7 +176,6 @@ def buildJs (outDir : FilePath) (prod : Bool) : IO Bool := do
       IO.println s!"  note: no `Qed.run <app>` found in {mod}, skipping the SSR handler (ssr.mjs)"
   if prod then
     minifyBundles outDir ["app.mjs", "qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs", "ssr_app.mjs", "qed_ssr_host.mjs"]
-  if !(← verifyBuiltExterns outDir ["app.mjs", "ssr_app.mjs"]) then return false
   return true
 
 def cmdBuild (prod : Bool) (skipVerify : Bool := false) : IO UInt32 := do

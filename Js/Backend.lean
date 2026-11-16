@@ -521,151 +521,107 @@ def emitProgramWithExterns (env : Environment) (entries : List (Name × String))
 def emitProgram (env : Environment) (entries : List (Name × String)) (min : Bool := false) : Except String String :=
   (·.1) <$> emitProgramWithExterns env entries min
 
-private inductive RtTok where
-  | ident (s : String)
-  | punct (c : Char)
-  | other
+private def skipLine : List Char → List Char
+  | [] => []
+  | '\n' :: t => t
+  | _ :: t => skipLine t
 
-private def isJsIdentStart (c : Char) : Bool :=
-  c.isAlpha || c == '_' || c == '$'
-
-private def isJsIdentCont (c : Char) : Bool :=
-  c.isAlphanum || c == '_' || c == '$'
-
-private def skipLineComment : List Char → List Char
-  | []           => []
-  | '\n' :: rest => rest
-  | _ :: rest    => skipLineComment rest
-
-private def skipBlockComment : List Char → List Char
-  | []                => []
-  | '*' :: '/' :: rest => rest
-  | _ :: rest         => skipBlockComment rest
+private def skipBlock : List Char → List Char
+  | [] => []
+  | '*' :: '/' :: t => t
+  | _ :: t => skipBlock t
 
 private def skipQuoted (q : Char) : List Char → List Char
-  | []             => []
+  | [] => []
   | '\\' :: _ :: t => skipQuoted q t
-  | c :: t         => if c == q then t else skipQuoted q t
-
-private def skipRegex (inClass : Bool) : List Char → List Char
-  | []             => []
-  | '\n' :: t      => t
-  | '\\' :: _ :: t => skipRegex inClass t
-  | '[' :: t       => skipRegex true t
-  | ']' :: t       => skipRegex false t
-  | '/' :: t       => if inClass then skipRegex true t else t
-  | _ :: t         => skipRegex inClass t
+  | c :: t => if c == q then t else skipQuoted q t
 
 private def takeJsIdent (acc : String) : List Char → String × List Char
-  | []      => (acc, [])
-  | c :: cs => if isJsIdentCont c then takeJsIdent (acc.push c) cs else (acc, c :: cs)
+  | c :: cs => if c.isAlphanum || c == '_' || c == '$' then takeJsIdent (acc.push c) cs else (acc, c :: cs)
+  | [] => (acc, [])
 
-private def tokenizeRtAux : Nat → Bool → List Char → List RtTok → List RtTok
-  | 0, _, _, acc => acc.reverse
-  | _ + 1, _, [], acc => acc.reverse
-  | fuel + 1, allowRegex, c :: cs, acc =>
-      if c.isWhitespace then
-        tokenizeRtAux fuel allowRegex cs acc
+private def nextRtToken : Nat → List Char → Option (String ⊕ Char) × List Char
+  | 0, _ | _ + 1, [] => (none, [])
+  | fuel + 1, c :: cs =>
+      if c.isWhitespace then nextRtToken fuel cs
       else if c == '/' then
         match cs with
-        | '/' :: rest => tokenizeRtAux fuel allowRegex (skipLineComment rest) acc
-        | '*' :: rest => tokenizeRtAux fuel allowRegex (skipBlockComment rest) acc
-        | _ =>
-            if allowRegex then
-              tokenizeRtAux fuel false (skipRegex false cs) (.other :: acc)
-            else
-              tokenizeRtAux fuel true cs (.other :: acc)
-      else if c == '"' || c == '\'' || c == '`' then
-        tokenizeRtAux fuel false (skipQuoted c cs) (.other :: acc)
-      else if c == '{' || c == '}' || c == '(' || c == ')' || c == '[' || c == ']' ||
-              c == ';' || c == ',' || c == '=' then
-        let nextAllow := c != ')' && c != ']'
-        tokenizeRtAux fuel nextAllow cs (.punct c :: acc)
-      else if isJsIdentStart c then
-        let (name, rest) := takeJsIdent (String.singleton c) cs
-        let nextAllow := name == "return" || name == "case" || name == "throw" ||
-          name == "typeof" || name == "void" || name == "delete" || name == "await"
-        tokenizeRtAux fuel nextAllow rest (.ident name :: acc)
-      else if c.isDigit then
-        let rest := cs.dropWhile fun d => d.isAlphanum || d == '_' || d == '.'
-        tokenizeRtAux fuel false rest (.other :: acc)
-      else
-        let nextAllow := c == ':' || c == '!' || c == '&' || c == '|' || c == '?' ||
-          c == '+' || c == '-' || c == '*' || c == '%' || c == '<' || c == '>' ||
-          c == '^' || c == '~'
-        tokenizeRtAux fuel nextAllow cs (.other :: acc)
+        | '/' :: t => nextRtToken fuel (skipLine t)
+        | '*' :: t => nextRtToken fuel (skipBlock t)
+        | _        => (some (.inr c), cs)
+      else if c == '"' || c == '\'' || c == '`' then nextRtToken fuel (skipQuoted c cs)
+      else if c.isAlpha || c == '_' || c == '$' then
+        let (id, rest) := takeJsIdent (String.singleton c) cs
+        (some (.inl id), rest)
+      else (some (.inr c), cs)
 
 private inductive ExportMode where
-  | none
-  | afterExport
-  | afterAsync
-  | afterFn
-  | inVarDecl (expectName : Bool)
+  | none | afterExport | afterAsync | afterFn
+  | inVar (expectName : Bool)
   | inBrace (expectName : Bool) (pending : Option String)
 
-private def updateBraceDepth (d : Nat) : RtTok → Nat
-  | .punct '(' | .punct '[' | .punct '{' => d + 1
-  | .punct ')' | .punct ']' | .punct '}' => d - 1
+private def stepBraceDepth (d : Nat) : String ⊕ Char → Nat
+  | .inr '(' | .inr '[' | .inr '{' => d + 1
+  | .inr ')' | .inr ']' | .inr '}' => d - 1
   | _ => d
 
-private def walkRtExports (depth : Nat) (mode : ExportMode) :
-    List RtTok → Std.HashSet String → Std.HashSet String
-  | [], acc => acc
-  | tok :: rest, acc =>
-      let insertOpt (a : Std.HashSet String) : Option String → Std.HashSet String
-        | some s => a.insert s
-        | none   => a
-      match mode with
-      | .none =>
-          if depth == 0 && match tok with | .ident "export" => true | _ => false then
-            walkRtExports 0 .afterExport rest acc
-          else
-            walkRtExports (updateBraceDepth depth tok) .none rest acc
-      | .afterExport =>
-          match tok with
-          | .ident "function" => walkRtExports 0 .afterFn rest acc
-          | .ident "async"    => walkRtExports 0 .afterAsync rest acc
-          | .ident "const" | .ident "let" | .ident "var" =>
-              walkRtExports 0 (.inVarDecl true) rest acc
-          | .punct '{' => walkRtExports 1 (.inBrace true none) rest acc
-          | _ => walkRtExports (updateBraceDepth depth tok) .none rest acc
-      | .afterAsync =>
-          match tok with
-          | .ident "function" => walkRtExports 0 .afterFn rest acc
-          | _ => walkRtExports (updateBraceDepth depth tok) .none rest acc
-      | .afterFn =>
-          match tok with
-          | .ident name => walkRtExports 0 .none rest (acc.insert name)
-          | _ => walkRtExports (updateBraceDepth depth tok) .none rest acc
-      | .inVarDecl expectName =>
-          if depth == 0 then
-            match tok with
-            | .punct ';' => walkRtExports 0 .none rest acc
-            | .punct ',' => walkRtExports 0 (.inVarDecl true) rest acc
-            | .ident "export" =>
-                if expectName then walkRtExports 0 (.inVarDecl false) rest (acc.insert "export")
-                else walkRtExports 0 .afterExport rest acc
-            | .ident name =>
-                if expectName then walkRtExports 0 (.inVarDecl false) rest (acc.insert name)
-                else walkRtExports 0 (.inVarDecl false) rest acc
-            | _ => walkRtExports (updateBraceDepth 0 tok) (.inVarDecl expectName) rest acc
-          else
-            walkRtExports (updateBraceDepth depth tok) (.inVarDecl expectName) rest acc
-      | .inBrace expectName pending =>
-          match tok with
-          | .punct '}' => walkRtExports 0 .none rest (insertOpt acc pending)
-          | .punct ',' => walkRtExports depth (.inBrace true none) rest (insertOpt acc pending)
-          | .ident "as" => walkRtExports depth (.inBrace true none) rest acc
-          | .ident name =>
-              if expectName then walkRtExports depth (.inBrace false (some name)) rest acc
-              else walkRtExports depth (.inBrace false pending) rest acc
-          | _ => walkRtExports depth (.inBrace expectName pending) rest acc
+private def walkRtExports (fuel depth : Nat) (mode : ExportMode)
+    (cs : List Char) (acc : Std.HashSet String) : Std.HashSet String :=
+  match fuel with
+  | 0 => acc
+  | fuel + 1 =>
+      match nextRtToken (cs.length + 1) cs with
+      | (none, _) => acc
+      | (some tok, rest) =>
+          let addOpt (a : Std.HashSet String) : Option String → Std.HashSet String
+            | some s => a.insert s
+            | none   => a
+          match mode with
+          | .none =>
+              if depth == 0 && tok == .inl "export" then walkRtExports fuel 0 .afterExport rest acc
+              else walkRtExports fuel (stepBraceDepth depth tok) .none rest acc
+          | .afterExport =>
+              match tok with
+              | .inl "function" => walkRtExports fuel 0 .afterFn rest acc
+              | .inl "async"    => walkRtExports fuel 0 .afterAsync rest acc
+              | .inl "const" | .inl "let" | .inl "var" => walkRtExports fuel 0 (.inVar true) rest acc
+              | .inr '{'        => walkRtExports fuel 1 (.inBrace true none) rest acc
+              | _               => walkRtExports fuel (stepBraceDepth depth tok) .none rest acc
+          | .afterAsync =>
+              match tok with
+              | .inl "function" => walkRtExports fuel 0 .afterFn rest acc
+              | _               => walkRtExports fuel (stepBraceDepth depth tok) .none rest acc
+          | .afterFn =>
+              match tok with
+              | .inl name => walkRtExports fuel 0 .none rest (acc.insert name)
+              | _         => walkRtExports fuel (stepBraceDepth depth tok) .none rest acc
+          | .inVar expectName =>
+              if depth == 0 then
+                match tok with
+                | .inr ';' => walkRtExports fuel 0 .none rest acc
+                | .inr ',' => walkRtExports fuel 0 (.inVar true) rest acc
+                | .inl "export" =>
+                    if expectName then walkRtExports fuel 0 (.inVar false) rest (acc.insert "export")
+                    else walkRtExports fuel 0 .afterExport rest acc
+                | .inl name =>
+                    walkRtExports fuel 0 (.inVar false) rest (if expectName then acc.insert name else acc)
+                | _ => walkRtExports fuel (stepBraceDepth 0 tok) (.inVar expectName) rest acc
+              else
+                walkRtExports fuel (stepBraceDepth depth tok) (.inVar expectName) rest acc
+          | .inBrace expectName pending =>
+              match tok with
+              | .inr '}' => walkRtExports fuel 0 .none rest (addOpt acc pending)
+              | .inr ',' => walkRtExports fuel depth (.inBrace true none) rest (addOpt acc pending)
+              | .inl "as" => walkRtExports fuel depth (.inBrace true none) rest acc
+              | .inl name =>
+                  if expectName then walkRtExports fuel depth (.inBrace false (some name)) rest acc
+                  else walkRtExports fuel depth (.inBrace false pending) rest acc
+              | _ => walkRtExports fuel depth (.inBrace expectName pending) rest acc
 
 /-- Parse named ESM exports (`export const`, `export function`, `export { ... }`) from a JS runtime module. -/
 def rtExports (rtSrc : String) : Std.HashSet String :=
   let cs := rtSrc.toList
-  let toks := tokenizeRtAux (cs.length + 1) true cs []
-  walkRtExports 0 .none toks {}
+  walkRtExports (cs.length + 1) 0 .none cs {}
 
 /-- Verify that every extern name in `externNames` is exported by `rtSrc` (`runtime/qed_rt.mjs`). -/
 def verifyRtExterns (rtSrc : String) (externNames : List String) : Except String Unit := do

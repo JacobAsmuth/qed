@@ -1,154 +1,183 @@
 # How Qed works
 
-Qed components generate a typed message enum, an update function, a fine-grained `View`
-template, and a verified `App`. When an event fires, it dispatches a message; the update function
-computes the next state (plus optional `Cmd` effects); the renderer updates the DOM. Top-level
-apps and reusable sub-components use the exact same `component` syntax, adding `route`, `start`,
-`port`, `query`, and `dehydrate` clauses as needed.
+Qed is a full-stack web language embedded in [Lean 4](https://lean-lang.org). Instead of
+bolting static checks onto template strings or maintaining a separate specification language, Qed
+provides Lean 4 elaborators for `schema`, `router`, `css`, `component`, `external`, `server`,
+`fullstack`, and JSX. These desugar UI views, client state machines, wire protocols, and backend
+handlers into **ordinary Lean 4 definitions and proof obligations**.
 
-## From Lean to the browser
+Lean's typechecker and theorem-proving kernel verify your invariants on the exact same functions
+that compile to browser JavaScript and native server machine code. All proofs live in Lean's
+`Prop` universe and are erased before any executable code is emitted.
+
+## Language building blocks
+
+A Qed program is composed from declarative blocks that share types and proofs end-to-end:
+
+| Construct | What you write | What Qed generates & proves |
+|-----------|----------------|-----------------------------|
+| `schema` | Fields with `where` refinement predicates | Editable `Draft`, proof-carrying `Field` records, `<Schema.Form>`, `canSubmit_iff`, plus `LawfulJson` and `LawfulProto` codecs. |
+| `router` | Named routes and URL patterns | Inductive route type, `Router` instance, proven `round_trip`, and `isSafeUrl` guarantees for links and navigation. |
+| `css` / `token` / `theme` | Typed style rules and design tokens | Scoped content-hashed CSS classes auto-collected into `<style id="qed-styles">`, queryable by view invariants. |
+| `component` | `prop`, `bind`, `slot`, `children`, `state`, `ephemeral`, `collection`, `route`, `start`, `port`, `query`, `action`, `invariant`, and JSX `view` | Typed `Msg`, `init`, `update`, fine-grained `View` template, `App`, `Html.valid` proof, `Dehydrate` SSR codec, and state/styling invariant proofs. |
+| `external` | Base URL, auth schemes, and typed HTTP endpoints | Typed client functions with origin pinning, CRLF-sanitized headers, JSON/Protobuf/Bytes codecs, and SSRF-guarded `Webhook` calls. |
+| `server` | `env`, `state`, `invariant` rules, and `fn` handlers with `requires`, `atomic`, and `await` | Transactional `MonadServer` and `MonadAtomic` handlers, Protobuf RPC dispatchers, and proofs of state preservation, auth checks, and linearizability. |
+| `fullstack` | A `server` paired with a `client` component or `App` | Typed client-to-server binary Protobuf RPCs under `/_qed/rpc/…`, client-leak isolation, and a unified native server + client build. |
+
+For component composition—pure wrappers, hoisted stateful sub-components, keyed `LocalDef` cells,
+and `collection`s—see [Components](components.md). For writing and proving rules over state,
+collections, and views, see [Invariants](invariants.md).
+
+## Two execution targets from one source
+
+Qed compiles client and backend code through separate pipelines while enforcing
+`verifyNoServerLeakInClient`, which forbids server secrets, state boxes, and handlers from
+entering client JavaScript:
 
 ```text
-Lean app: components, reducers, views, and declared invariants
-   │  lake build: Lean's kernel checks all types and proofs
-   ▼
-qedjs: verifies Lean.Environment, then lowers Lean IR → JavaScript
-   ▼
-app.mjs + qed_rt.mjs: compiled app code and Lean primitives
-   ▼
-qed_dom.mjs + qed_host.mjs: DOM updates, event wiring, and browser effects
+Lean app: schemas, routers, components, and optional external/server/fullstack blocks
+   │
+   ├──▶ Client bundle: qedjs lowers Lean.IR → typed JS AST
+   │       └─▶ app.mjs + runtime/qed_rt.mjs, qed_dom.mjs, qed_host.mjs
+   │
+   ├──▶ Node/Edge SSR via `Qed.run <app>`
+   │       └─▶ ssr.mjs: ssr_app.mjs + qed_ssr_host.mjs — async Request => Response
+   │
+   └──▶ Full-stack native server via `fullstack`
+           └─▶ server binary: Lean C backend + c/qed_server.c + OpenSSL
+               • Static assets + /_qed/health
+               • /_qed/rpc/<Server>/<fn> binary Protobuf RPCs
+               • Zero-hop in-memory SSR
 ```
 
-Qed compiles the exact same update, view, and diff functions that your proofs reason about.
-Proofs exist only at compile time and are erased before JavaScript is emitted.
+### Browser rendering & DOM updates
 
-### What is proved vs. trusted
+JSX expressions compile to typed `Html` values and are lifted into `View` templates by
+[`Qed/View/Lift.lean`](../Qed/View/Lift.lean). When state changes, the browser driver updates
+tracked text, attribute, and `value`/`checked` bindings directly through signals and falls back
+to keyed or positional DOM diffing when structural branches or lists change. See
+[Rendering](rendering.md) for how signal templates, `V.memo`, and W3C `insertBefore` reconciliation
+are proved equivalent to fresh `Html.render`.
 
-Lean's kernel checks your app invariants, HTML5 and URL safety, SSR state round-trips, the
-imperative DOM driver logic, and the IR-to-JS lowering rules.
+### Client-only SSR vs. full-stack native server
 
-Every verified system still has a trusted computing base. Qed relies on:
+- **Standalone client + SSR:** When an entry module calls `Qed.run <app>`, `qed build` emits
+  `dist/ssr.mjs` alongside `app.mjs` and `runtime/*.mjs`. On each request,
+  [`runtime/qed_ssr_host.mjs`](../runtime/qed_ssr_host.mjs) matches the URL route and drives
+  `App.ssrStep` in bounded rounds, executing startup HTTP/RPC `Cmd`s via `fetch` and embedding
+  the dehydrated state into `<script id="qed-state">`.
+- **Full-stack native binary:** When a module declares `fullstack`, `qed build` compiles the
+  client to `app.mjs` and links the server through Lean's C backend with
+  [`c/qed_server.c`](../c/qed_server.c) and OpenSSL into `dist/server`. Worker threads run an
+  `SO_REUSEPORT` + `epoll`/`kqueue` HTTP/1.1 loop, share state through a `pthread_rwlock_t`
+  `StateBox`, call `external` APIs over an outbound keep-alive TLS pool, serve binary Protobuf
+  RPCs, and execute SSR directly in memory via `App.ssrRenderNativeBytes` against the server's
+  dispatch table without an HTTP or JSON round-trip.
 
-- Lean's kernel and compiler IR generator working correctly.
-- Pretty-printing the verified JavaScript AST to `.mjs` text (`Js/Backend.lean`).
-- The small hand-written JS runtime (`runtime/`) and the browser's own DOM/Web APIs.
+In both modes, `component` apps synthesize a verified `Dehydrate` codec automatically so the
+browser restores server-rendered state without re-fetching startup data; mark client-only fields
+`ephemeral` to exclude them from serialization.
 
-Because browser APIs, network requests, and out-of-memory errors sit outside pure functional
-models, Qed pairs its compile-time proofs with differential and headless-browser test suites.
+## What is proved vs. trusted
 
-## What Qed checks at compile time
+### Checked by Lean's kernel
 
-- **State transitions:** Component `invariant` declarations prove that if a rule holds before
-  an update, it still holds afterward (and on initial state). See
-  [invariants](invariants.md).
-- **Views, HTML5 validity, and XSS safety:** Inline view `invariant`s (and `invariant … holds_in view`
-  on helper views) check custom view and styling rules. In addition, every `component` carries an
-  automatic `valid_view` proof (`Html.valid`) that rules out browser-rewritten HTML5 nesting (like
-  `<div>` inside `<p>` or nested `<button>`s), children inside void tags, `<script>` / `srcdoc` /
-  inline `on*` attributes, raw HTML injection, and untyped `href` / `src` / `action` URLs.
-  SSR script, JSON, and CSS payloads are also proved breakout-free.
-- **Isomorphic SSR and DOM updates:** Every SSR `Dehydrate` codec proves both `round_trip` and
-  `dehydrate_view` (restoring server state renders the exact same initial HTML). Over in
-  [`Qed/Proofs/DomEquiv.lean`](../Qed/Proofs/DomEquiv.lean), Qed proves that mounting,
-  hydration, W3C `insertBefore` keyed moves, fine-grained signal updates, and `V.memo` skipping
-  match fresh `Html.render` output.
-- **Forms and routes:** `schema` proves that a form's submit button enables if and only if its
-  parser succeeds. `router` proves that formatting a route to a URL and parsing it back returns
-  the original route and produces a safe URL.
-- **Total execution and JS lowering:** [`Js/VerifyEnv.lean`](../Js/VerifyEnv.lean) inspects the
-  compiled `Lean.Environment` on every build, allowing only Lean's three standard axioms
-  (`propext`, `Classical.choice`, `Quot.sound`) and rejecting `sorry`, `native_decide`, custom
-  axioms, `partial`, `unsafe`, `while` loops, user `@[implemented_by]`, and unverified
-  `@[extern]` declarations. [`Js/Proofs.lean`](../Js/Proofs.lean) proves semantics preservation
-  for constructor layouts, curried closures, tail-call loops, trampolines, and copy-on-write
-  array snapshots (`refMark`).
+- **State & concurrency invariants:** Component `invariant`s prove preservation across `init`,
+  every action, and `for_each` child collections. Server `invariant`s prove initial validity,
+  single-step preservation, two-state `old` monotonicity rules, `mutating ... requires ...`
+  authorization policies, read-only non-mutation, and multi-core linearizability via transactional
+  `atomic` blocks with rollback on error.
+- **Views, HTML5 validity, and XSS closure:** Every `component` carries an automatic `valid_view`
+  proof over `Html.valid` banning invalid HTML5 nesting such as `<div>` inside `<p>` or nested
+  `<button>`s, children inside void elements, `<script>`/`<base>`/`<object>`/`<embed>` tags,
+  inline `on*`/`srcdoc` attributes, raw markup injection, `<script>`/`<style>` breakout sequences,
+  and untyped URLs on `href`, `src`, and `action`. Inline and `holds_in` view invariants check
+  custom styling and element predicates.
+- **Isomorphic SSR, DOM driver, and memoization:** Every `Dehydrate` codec proves `round_trip`
+  and `dehydrate_view`. [`Qed/Proofs/DomEquiv.lean`](../Qed/Proofs/DomEquiv.lean) proves against a
+  pure `SpecDom` model that mounting, text-run hydration, W3C `insertBefore` keyed moves,
+  duplicate-key disambiguation, direct signal updates, `LawfulKey`-indexed `V.memo` skipping, and
+  SSR rehydration match `Html.render`.
+- **Schemas, routes, and wire codecs:** `schema` proves submit eligibility matches schema validity
+  via `canSubmit_iff`. `router` proves `Router.round_trip` and `isSafeUrl_toURL`. `LawfulJson` and
+  `LawfulProto` prove JSON and Protobuf round-trips, framing non-smuggling, bounded-depth parsing,
+  binary RPC transparency, and full-stack SSR/RPC equivalence.
+- **Total execution & JS lowering:** [`Js/Proofs.lean`](../Js/Proofs.lean) proves semantics
+  preservation for constructor layouts, curried closures, non-recursive join-point blocks,
+  tail-call loops and trampolines, `$.memo` thunks, and copy-on-write arrays with `refMark`
+  snapshots.
 
 Always check that an invariant states what you actually mean. Proving `0 ≤ quantity` prevents
-underflow, not ordering more items than are in stock. Similarly, a valid book route proves URL
-well-formedness, not that the book exists on your server.
+underflow, not ordering more stock than exists; proving a route valid checks URL well-formedness,
+not that the resource exists on disk or in a database.
 
-## Verification commands
+### Trusted Computing Base
 
-Unsolved proof goals fail normal Lean compilation. Running `qed check` or `qed build` also runs
-three repository-wide gates:
+Qed relies on:
 
-1. **Kernel environment gate (`qedjs --verify-env`):** checks the transitive closure of
-   compiled declarations for standard axioms and totality.
-2. **Axiom manifest (`scripts/axioms.lean`):** runs `#print axioms` on core framework theorems
-   when present.
-3. **Source and effect checks:** rejects forbidden proof-skipping tactics in source files and
-   verifies that every `Cmd` effect emitted in `Qed/` has a matching handler in
-   `runtime/qed_host.mjs`.
+- Lean 4's kernel, macro and elaboration hygiene, compiler IR generator, and C backend.
+- Pretty-printing the typed JS AST to `.mjs` text in [`Js/Backend.lean`](../Js/Backend.lean).
+- The hand-written JS runtime in [`runtime/`](../runtime) and the native C/FFI substrate in
+  [`c/qed_server.c`](../c/qed_server.c) and [`Qed/Server/Prim.lean`](../Qed/Server/Prim.lean).
+- Browser DOM and Web APIs, Node `fetch` for JS SSR, OpenSSL, and the OS kernel.
 
-During development, `qed dev` typechecks and verifies proofs for the active app on each save.
-Run `qed check` or `qed build` before shipping to run the full environment and manifest checks.
+Because real browsers, network I/O, and memory allocation sit outside pure Lean models, Qed pairs
+compile-time proofs with differential and headless Chromium test suites.
 
-## Tests and benchmarks
+## Verification gates, builds, and tests
 
-- [`test/js_gate_test.mjs`](../test/js_gate_test.mjs) compares native Lean output against
-  transpiled JavaScript across rendering, diffing, arithmetic, JSON, routing, and runtime
+Every JS build runs `verifyReachable` and `verifyNoServerLeakInClient` inside
+[`Js/Backend.lean`](../Js/Backend.lean). Running `qed check` or `qed build` without `--dev` runs
+all five verification gates in [`Cli/Verify.lean`](../Cli/Verify.lean):
+
+1. **Forbidden tactics scan:** rejects `sorry`, `admit`, and `native_decide` across Lean sources.
+2. **Axiom manifest:** runs `#print axioms` in [`scripts/axioms.lean`](../scripts/axioms.lean) on
+   core framework, JS-lowering, Protobuf, SSR, and server theorems when present.
+3. **Kernel environment gate:** `qedjs --verify-env` inspects the transitive closure of compiled
+   declarations in [`Js/VerifyEnv.lean`](../Js/VerifyEnv.lean), permitting only `propext`,
+   `Classical.choice`, and `Quot.sound` while rejecting custom axioms, `partial`, `unsafe`,
+   `while`/`Lean.Loop.forIn` loops, user `@[implemented_by]`, and unverified `opaque` or
+   `@[extern]` declarations outside `Qed.Dom` and `Qed.Server.Prim`.
+4. **Effect coverage:** verifies every `Cmd` effect emitted in `Qed/` has a handler in
+   [`runtime/qed_host.mjs`](../runtime/qed_host.mjs).
+5. **Extern coverage:** `qedjs --check-externs` verifies every reachable `@[extern]` symbol has a
+   matching export in [`runtime/qed_rt.mjs`](../runtime/qed_rt.mjs).
+
+During development, `qed dev` watches `.lean` and runtime files, rebuilds `.qed/dev/`, restarts
+the native server when present, and reloads the browser on success. Run `qed check`, `qed build`,
+and `qed start` or `qed preview` for production builds; `qed build` also minifies bundles with
+`esbuild` when available on `PATH`.
+
+`qed test` runs the 21 automated test suites in [`test/`](../test):
+
+- [`test/js_gate_test.mjs`](../test/js_gate_test.mjs) — differential tests comparing native Lean
+  evaluation against transpiled JavaScript across rendering, diffing, JSON, routing, and runtime
   edge cases.
-- [`test/dom_equivalence_test.mjs`](../test/dom_equivalence_test.mjs) runs generated update
-  sequences in Chromium and checks that incremental DOM mutations match a fresh render,
-  covering attributes, event handlers, keyed reorders, `V.memo`, and duplicate keys.
-- Additional browser suites in [`test/`](../test) cover effects, WebSockets, streaming, local
-  components, and SSR hydration.
-
-See [rendering details](rendering.md) for how direct signal bindings, structural reconciliation,
-and memoization work. Proofs guarantee correctness, not speed—reproducible benchmarks live in
-[`Examples/Bench`](../Examples/Bench), [`test/bench_template.mjs`](../test/bench_template.mjs),
-and [`test/bench_react.mjs`](../test/bench_react.mjs).
-
-## Server rendering and deployment
-
-For an entry module with `def main : IO Unit := Qed.run <app>`, `qed build` outputs both the
-client bundle and `dist/ssr.mjs`:
-
-```js
-import render from './dist/ssr.mjs'; // async (Request) => Response
-```
-
-For each incoming request, the SSR handler matches the URL route, runs the app's initial HTTP
-queries (skipping browser-only effects and bounding replay rounds), and renders the HTML
-document.
-
-To deploy with SSR:
-
-1. Serve static client assets from `dist/` and pass page requests to `dist/ssr.mjs` in any
-   runtime with standard `Request`, `Response`, and `fetch` APIs (`qed start` runs this
-   locally).
-2. Host your backend `/api` endpoints separately, or pass a custom `fetch` into
-   `makeHandler(mod, { fetch, title, … })` from `dist/ssr.mjs`.
-3. State restoration is automatic: `component` apps synthesize a verified `Dehydrate`
-   codec by default so the browser restores server state without re-fetching startup data
-   (mark client-only fields `ephemeral` to exclude them from serialization).
-   [Bookshelf](../Examples/Bookshelf.lean) and [`test/bookshelf_ssr_test.mjs`](../test/bookshelf_ssr_test.mjs)
-   demonstrate zero-refetch startup.
-
-The same build output also works as a static single-page app: point client routes at
-`index.html` on any static host.
+- [`test/dom_equivalence_test.mjs`](../test/dom_equivalence_test.mjs) — Chromium equivalence checks
+  asserting incremental DOM updates match fresh `Html.render` output across attributes, events,
+  keyed moves, `V.memo`, and duplicate keys.
+- End-to-end Chromium and native server suites covering forms, routing, effects, WebSockets, SSE
+  streaming, local state, SSR hydration, and `fullstack` binary Protobuf RPCs in
+  [`test/fullstack_rpc_test.mjs`](../test/fullstack_rpc_test.mjs).
+- Benchmarks in [`Examples/Bench`](../Examples/Bench),
+  [`test/bench_template.mjs`](../test/bench_template.mjs), and
+  [`test/bench_react.mjs`](../test/bench_react.mjs).
 
 ## Source map
 
 | Path | Purpose |
 |------|---------|
-| `Qed/Html.lean` | Typed `Html` / `Attr` / `Url` virtual DOM and static HTML5 validity rules (`Html.valid`). |
-| `Qed/Jsx.lean` | JSX syntax (`<div class="x" onClick={.tap}>…</div>`), lowered to typed `Html` builders. |
-| `Qed/Notation.lean` | Attribute, event, link, and `Qed.lazy` helpers used by JSX and plain Lean views. |
-| `Qed/View.lean` (`Qed/View/`) | Fine-grained `View` templates (`dyn`, `showIf`, `ifElse`, `forEach`, `memo`), template lifting, and `patch_render` proofs. |
-| `Qed/Diff.lean` | Pure tree diffing and keyed/positional child reconciliation, plus `diff_apply`. |
-| `Qed/Dom.lean` / `Qed/Driver.lean` (`Qed/Driver/`) | Total `MonadDom` interface and browser driver for mounting, patching, hydration, and local state. |
-| `Qed/Proofs/DomEquiv.lean` | Refinement proofs linking the `MonadDom` driver, keyed moves, hydration, `SoundMemo`, and SSR to `Html.render`. |
-| `Qed/Runtime.lean` (`Qed/Runtime/`) | TEA `App` runtime, `Cmd` effects, typed ports, local components, asset discovery, and `Dehydrate` codecs. |
-| `Qed/Ssr.lean` | Document serialization (`renderDocument`), breakout-safety proofs, and per-request SSR execution. |
-| `Qed/Json.lean` (`Qed/Json/`) | Total JSON parser/renderer and `ToJson` / `FromJson` / `LawfulJson` round-trip proofs. |
-| `Qed/Router.lean` | `Router` / `LawfulKey` classes, the `router` macro, and verified URL formatting/parsing. |
-| `Qed/Schema.lean` | Refined `Field` types, form controls, and the `schema` macro (generates `Draft`, `formView`, `canSubmit_iff`, and JSON codecs). |
-| `Qed/Component.lean` (`Qed/Component/`) | `component` macro (`prop`, `state`, `event`, `port`, `query`, `route`, `action`, `collection`, `invariant`, `view`). |
-| `Qed/Invariant.lean` (`Qed/Invariant/`) | State, `for_each`, and view `invariant` proof automation (`holds_in` for pure helpers). |
-| `Js/Backend.lean` | Total Lean IR to typed JavaScript AST compiler and pretty-printer. |
-| `Js/VerifyEnv.lean` | Kernel `Lean.Environment` gate enforcing standard axioms and total definitions. |
-| `Js/Proofs.lean` | Operational semantics and soundness proofs for JS lowering and copy-on-write arrays. |
-| `Cli.lean` (`Cli/`) | `qed` CLI (`dev`, `build`, `start`, `test`, `check`, `clean`, `new`, `doctor`). |
-| `runtime/` | JavaScript primitives (`qed_rt.mjs`), DOM bindings (`qed_dom.mjs`), effects (`qed_host.mjs`), and server helpers. |
-| `Examples/` · `test/` | Runnable example apps, benchmarks, and differential/browser test suites. |
+| [`Qed.lean`](../Qed.lean) | Public framework umbrella; omits browser-only `Qed.Dom`/`Qed.Driver` and C-linked `Qed.Server.Native` so user modules target both JS and native servers. |
+| [`Qed/Html.lean`](../Qed/Html.lean) · [`Qed/Jsx.lean`](../Qed/Jsx.lean) · [`Qed/Notation.lean`](../Qed/Notation.lean) | Typed `Html` / `Attr` / `Url` virtual DOM, static `Html.valid` HTML5/XSS rules, JSX syntax, and attribute/event helpers. |
+| [`Qed/Style.lean`](../Qed/Style.lean) | Typed `css` rules, `token`s, `theme` overrides, and scoped stylesheet rendering. |
+| [`Qed/View.lean`](../Qed/View.lean) · [`Qed/Render.lean`](../Qed/Render.lean) · [`Qed/Diff.lean`](../Qed/Diff.lean) | Fine-grained `View` templates in `Qed/View/`, template lifting, tail-recursive `@[csimp]` HTML rendering, and keyed/positional diffing via `diff_apply`. |
+| [`Qed/Dom.lean`](../Qed/Dom.lean) · [`Qed/Driver.lean`](../Qed/Driver.lean) · [`Qed/Proofs/DomEquiv.lean`](../Qed/Proofs/DomEquiv.lean) | Total `MonadDom` interface, imperative browser driver in `Qed/Driver/`, and `SpecDom` refinement proofs. |
+| [`Qed/Runtime.lean`](../Qed/Runtime.lean) · [`Qed/Resource.lean`](../Qed/Resource.lean) · [`Qed/Ssr.lean`](../Qed/Ssr.lean) | `App`, `Cmd` effects, `LocalDef` cells in `Qed/Runtime/`, `Resource`/`Cached`/`<Await>`, `Dehydrate` codecs, breakout-safe document serialization, and JS + native in-memory SSR. |
+| [`Qed/Json.lean`](../Qed/Json.lean) · [`Qed/Proto.lean`](../Qed/Proto.lean) | Total JSON and binary Protocol Buffers parsers and encoders under `Qed/Json/` and `Qed/Proto/` with `LawfulJson` and `LawfulProto` proofs. |
+| [`Qed/Date.lean`](../Qed/Date.lean) · [`Qed/Router.lean`](../Qed/Router.lean) · [`Qed/Schema.lean`](../Qed/Schema.lean) | Date utilities, `router` macro + `Router.round_trip`, and `schema` macro under `Qed/Schema/` generating `Field`, `Draft`, `formView`, `canSubmit_iff`, and JSON/Proto codecs. |
+| [`Qed/Component.lean`](../Qed/Component.lean) · [`Qed/ForEach.lean`](../Qed/ForEach.lean) · [`Qed/Invariant.lean`](../Qed/Invariant.lean) | `component` macro under `Qed/Component/`, list iteration helpers, and automated state, `for_each`, and view/styling invariant provers under `Qed/Invariant/`. |
+| [`Qed/Server.lean`](../Qed/Server.lean) · [`c/qed_server.c`](../c/qed_server.c) | `external`, `server`, and `fullstack` DSLs, invariant prover, `Qed.Server.Native` runner in `Qed/Server/`, and the multi-core `epoll`/`kqueue` + OpenSSL C server substrate. |
+| [`Js/Backend.lean`](../Js/Backend.lean) · [`Js/VerifyEnv.lean`](../Js/VerifyEnv.lean) · [`Js/Proofs.lean`](../Js/Proofs.lean) · [`Js/Main.lean`](../Js/Main.lean) | Total Lean IR → typed JS AST compiler, `qedjs` CLI, kernel/client-leak gates, and lowering soundness proofs. |
+| [`Cli.lean`](../Cli.lean) | `qed` CLI under `Cli/`: `dev`, `build`, `start`, `preview`, `test`, `check`, `clean`, `new`, `doctor`. |
+| [`runtime/`](../runtime) | Browser & Node runtime: `qed_rt.mjs`, `qed_dom.mjs`, `qed_host.mjs`, `qed_ssr_host.mjs`, `qed_serve.mjs`. |
+| [`Examples/`](../Examples) · [`test/`](../test) · [`scripts/axioms.lean`](../scripts/axioms.lean) | Guided example apps, benchmarks, differential/Chromium/fullstack test suites, and `#print axioms` manifest. |

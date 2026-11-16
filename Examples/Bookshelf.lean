@@ -25,7 +25,7 @@ def topnav : Style := css [
 def navlink : Style := css [
   textDecoration "none", color brand, fontWeight 600 ]
 def card : Style := css [
-  padding (rem 1) (rem 1.25), border "1px solid #ddd", radius (px 8) ]
+  padding (rem 1) (rem 1.25), border (px 1) .solid (hex "ddd"), borderRadius (px 8) ]
 
 component BookItem where
   prop book : Book

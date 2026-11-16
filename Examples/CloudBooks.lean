@@ -103,10 +103,10 @@ server Catalog
 def shell : Style := css [
   maxWidth (rem 42), margin (rem 2) .auto, fontFamily "system-ui, sans-serif", lineHeight 1.5 ]
 def rowStyle : Style := css [
-  display .flex, gap (rem 1), padding (rem 0.75) (rem 1), border "1px solid #ddd",
-  radius (px 8), marginBottom (rem 0.75) ]
+  display .flex, gap (rem 1), padding (rem 0.75) (rem 1), border (px 1) .solid (hex "ddd"),
+  borderRadius (px 8), marginBottom (rem 0.75) ]
 def btnStyle : Style := css [
-  padding (rem 0.35) (rem 0.75), radius (px 6), border "1px solid #06c" ]
+  padding (rem 0.35) (rem 0.75), borderRadius (px 6), border (px 1) .solid (hex "06c") ]
 
 component BookRow where
   prop book : Book

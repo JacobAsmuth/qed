@@ -10,7 +10,8 @@ structure Todo where
   editing : Bool := false
 deriving Inhabited
 
-def banner : Style := css "padding: 7px; border-radius: 4px; &:hover { opacity: 0.9 }"
+def banner : Style := css [
+  padding (px 7), borderRadius (px 4), nest "&:hover" [ opacity 0.9 ] ]
 
 end TemplateDemo
 

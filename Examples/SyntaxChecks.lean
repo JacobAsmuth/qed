@@ -113,8 +113,8 @@ router DocRoute where
 #guard Router.fromURL "/docs/bench/5" == some (DocRoute.sec .benchmarks 5)
 #guard (Router.fromURL "/docs/unknown/5" : Option DocRoute) == none
 
-def navOn  : Style := css [ fontWeight "700" ]
-def navOff : Style := css [ fontWeight "400" ]
+def navOn  : Style := css [ fontWeight 700 ]
+def navOff : Style := css [ fontWeight 400 ]
 def navView (s : Section) : Html Unit :=
   <nav>
     <a role="nav-overview" {if s == .overview then navOn else navOff}>{"Overview"}</a>
@@ -202,7 +202,7 @@ component AutoStyled where
 
 def tokBorder := token "border-subtle"
 def typedBorderStyle : Style :=
-  css [ border (px 1) .solid tokBorder, borderBottom (px 2) .dashed (hex "333"), borderTop "none" ]
+  css [ border (px 1) .solid tokBorder, borderBottom (px 2) .dashed (hex "333"), borderTop .none ]
 #guard typedBorderStyle.raw ==
   "border: 1px solid var(--border-subtle); border-bottom: 2px dashed #333; border-top: none;"
 
@@ -454,6 +454,79 @@ def fracStyle : Style := css [
 
 #guard fracStyle.raw ==
   "padding: 0.75rem 1.5rem; margin: 2rem auto; gap: 4px 8px; line-height: 1.5; font-weight: 600; opacity: 0.85; z-index: -1;"
+
+def typedUnitStyle : Style := css [
+  textAlign .center, fontSize (rem 0.76), color (hex "787b84"),
+  padding (rem 0.35) 0 (rem 0.5) ]
+
+#guard typedUnitStyle.raw ==
+  "text-align: center; font-size: 0.76rem; color: #787b84; padding: 0.35rem 0 0.5rem;"
+
+/-- error: Application type mismatch: The argument
+  "0.76rem"
+has type
+  String
+but is expected to have type
+  Len
+in the application
+  fontSize "0.76rem" -/
+#guard_msgs in
+def badQuotedFontSize : Style := css [ fontSize "0.76rem" ]
+
+/-- error: Application type mismatch: The argument
+  "0.35rem 0 0.5rem"
+has type
+  String
+but is expected to have type
+  Len
+in the application
+  padding "0.35rem 0 0.5rem" -/
+#guard_msgs in
+def badQuotedPadding : Style := css [ padding "0.35rem 0 0.5rem" ]
+
+/-- error: Application type mismatch: The argument
+  "700"
+has type
+  String
+but is expected to have type
+  CssNum
+in the application
+  fontWeight "700" -/
+#guard_msgs in
+def badQuotedFontWeight : Style := css [ fontWeight "700" ]
+
+/-- error: Application type mismatch: The argument
+  "padding: 7px"
+has type
+  String
+but is expected to have type
+  List Item
+in the application
+  css "padding: 7px" -/
+#guard_msgs in
+def badRawCssString : Style := css "padding: 7px"
+
+/-- error: Application type mismatch: The argument
+  "#787b84"
+has type
+  String
+but is expected to have type
+  Color
+in the application
+  color "#787b84" -/
+#guard_msgs in
+def badQuotedColor : Style := css [ color "#787b84" ]
+
+/-- error: Application type mismatch: The argument
+  px 1
+has type
+  Len
+but is expected to have type
+  CssNum
+in the application
+  lineHeight (px 1) -/
+#guard_msgs in
+def badLenAsCssNum : Style := css [ lineHeight (px 1) ]
 
 #guard (match (Resource.ok (none : Option Nat)).someOr "missing" with | .failed "missing" => true | _ => false)
 #guard (match (Resource.ok (some 42)).someOr "missing" with | .ok 42 => true | _ => false)

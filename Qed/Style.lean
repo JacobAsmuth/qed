@@ -37,7 +37,6 @@ private def ofMantissaExp (m e : Nat) : String :=
 instance (n : Nat) : OfNat CssNum n := ⟨⟨toString n⟩⟩
 instance : Coe Nat CssNum    := ⟨(⟨toString ·⟩)⟩
 instance : Coe Int CssNum    := ⟨(⟨toString ·⟩)⟩
-instance : Coe String CssNum := ⟨CssNum.mk⟩
 instance : ToString CssNum   := ⟨CssNum.raw⟩
 instance : Neg CssNum        := ⟨fun x => ⟨if x.raw.startsWith "-" || x.raw == "0" then x.raw else "-" ++ x.raw⟩⟩
 instance : OfScientific CssNum := ⟨fun m neg e => ⟨if neg then ofMantissaExp m e else toString (m * 10 ^ e)⟩⟩
@@ -45,11 +44,10 @@ end CssNum
 
 structure Len where raw : String
 deriving Inhabited
-instance : Coe String Len := ⟨Len.mk⟩
-instance : Coe Len CssNum := ⟨fun l => ⟨l.raw⟩⟩
 instance : OfNat Len 0 := ⟨⟨"0"⟩⟩
 instance : ToString Len := ⟨Len.raw⟩
 def Len.auto : Len := ⟨"auto"⟩
+def Len.none : Len := ⟨"none"⟩
 
 def px  (n : CssNum) : Len := ⟨n.raw ++ "px"⟩
 def rem (n : CssNum) : Len := ⟨n.raw ++ "rem"⟩
@@ -61,8 +59,10 @@ def fr  (n : CssNum) : Len := ⟨n.raw ++ "fr"⟩
 
 structure Color where raw : String
 deriving Inhabited
-instance : Coe String Color := ⟨Color.mk⟩
 instance : ToString Color := ⟨Color.raw⟩
+def Color.transparent  : Color := ⟨"transparent"⟩
+def Color.currentColor : Color := ⟨"currentColor"⟩
+def Color.inherit      : Color := ⟨"inherit"⟩
 
 def hex  (s : String) : Color := ⟨"#" ++ s⟩
 def rgb  (r g b : Nat) : Color := ⟨s!"rgb({r}, {g}, {b})"⟩
@@ -71,9 +71,10 @@ def rgba (r g b : Nat) (a : CssNum) : Color := ⟨s!"rgba({r}, {g}, {b}, {a.raw}
 structure Token where name : String
 deriving Inhabited
 def token (name : String) : Token := ⟨name⟩
-instance : ToString Token := ⟨fun t => s!"var(--{t.name})"⟩
-instance : Coe Token Len   := ⟨fun t => ⟨s!"var(--{t.name})"⟩⟩
-instance : Coe Token Color := ⟨fun t => ⟨s!"var(--{t.name})"⟩⟩
+instance : ToString Token   := ⟨fun t => s!"var(--{t.name})"⟩
+instance : Coe Token CssNum := ⟨fun t => ⟨s!"var(--{t.name})"⟩⟩
+instance : Coe Token Len    := ⟨fun t => ⟨s!"var(--{t.name})"⟩⟩
+instance : Coe Token Color  := ⟨fun t => ⟨s!"var(--{t.name})"⟩⟩
 
 inductive Display | flex | grid | block | inline | inlineBlock | none | contents deriving Inhabited
 def Display.css : Display → String
@@ -138,7 +139,6 @@ def bottom        (l : Len) : Item := .decl "bottom" l.raw
 def left          (l : Len) : Item := .decl "left" l.raw
 def gap           (l : Len) : Item := .decl "gap" l.raw
 def fontSize      (l : Len) : Item := .decl "font-size" l.raw
-def radius        (l : Len) : Item := .decl "border-radius" l.raw
 def borderRadius  (l : Len) : Item := .decl "border-radius" l.raw
 def borderWidth   (l : Len) : Item := .decl "border-width" l.raw
 def letterSpacing (l : Len) : Item := .decl "letter-spacing" l.raw
@@ -156,7 +156,7 @@ def flexDirection  (f : FlexDirection) : Item := .decl "flex-direction" f.css
 def justifyContent (j : Justify)       : Item := .decl "justify-content" j.css
 def alignItems     (a : Align)         : Item := .decl "align-items" a.css
 
--- Coercing `BorderStyle → Color → Item` with an empty color sentinel allows `border "1px solid #ddd"` alongside `border (px 1) .solid c`.
+-- Coercing `BorderStyle → Color → Item` with an empty color sentinel allows `borderTop .none` / `border 0` alongside `border (px 1) .solid c`.
 private def mkBorder (prop : String) (w : Len) (s : BorderStyle) (c : Color) : Item :=
   .decl prop (if c.raw.isEmpty then w.raw else s!"{w.raw} {s.css} {c.raw}")
 instance : Coe (BorderStyle → Color → Item) Item := ⟨fun f => f .solid ⟨""⟩⟩
@@ -183,19 +183,14 @@ def flex                (v : CssNum) : Item := .decl "flex" v.raw
 def gridTemplateColumns (v : String) : Item := .decl "grid-template-columns" v
 def whiteSpace          (v : String) : Item := .decl "white-space" v
 
-def prop (name value : String) : Item := .decl name value
 def nest (selector : String) (body : List Item) : Item := .nest selector body
 def media (query : String) (body : List Item) : Item := .nest ("@media " ++ query) body
 def screenMax (w : Len) (body : List Item) : Item := media s!"(max-width: {w.raw})" body
 def screenMin (w : Len) (body : List Item) : Item := media s!"(min-width: {w.raw})" body
 def Token.set (t : Token) (value : String) : Item := .decl ("--" ++ t.name) value
 
-class CssBody (α : Type) where toRaw : α → String
-instance : CssBody String := ⟨id⟩
-instance : CssBody (List Item) := ⟨Item.renderList⟩
-
-def css {α : Type} [CssBody α] (body : α) : Style :=
-  let raw := CssBody.toRaw body
+def css (body : List Item) : Style :=
+  let raw := Item.renderList body
   { className := s!"qed-{String.hash raw}", raw := raw }
 
 private def Style.rule (s : Style) : String := "." ++ s.className ++ " { " ++ s.raw ++ " }"

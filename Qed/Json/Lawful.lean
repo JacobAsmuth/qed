@@ -17,6 +17,10 @@ theorem LawfulJson.parse_render_toJson {α : Type} [LawfulJson α] (a : α)
   rw [Qed.parse_render (Nat.le_trans (LawfulJson.depth_toJson a) h)]
   exact LawfulJson.fromJson_toJson a
 
+instance : LawfulJson Unit where
+  depthBound := 1
+  depth_toJson | () => Nat.le_refl 1
+  fromJson_toJson | () => rfl
 instance : LawfulJson JsonNumber where fromJson_toJson _ := rfl
 instance : LawfulJson Bool       where fromJson_toJson _ := rfl
 instance : LawfulJson String     where fromJson_toJson _ := rfl
@@ -54,6 +58,65 @@ instance [LawfulJson α] [LawfulJson β] : LawfulJson (α × β) where
     rcases p with ⟨a, b⟩
     change (do return (← fromJson (toJson a), ← fromJson (toJson b))) = .ok (a, b)
     rw [LawfulJson.fromJson_toJson a, LawfulJson.fromJson_toJson b]; rfl
+
+instance [LawfulJson α] [LawfulJson β] : LawfulJson (Sum α β) where
+  depthBound := 1 + max (LawfulJson.depthBound α) (LawfulJson.depthBound β)
+  depth_toJson s := by
+    cases s <;> refine Nat.add_le_add_left (Json.maxArr_le_iff.2 fun e he => ?_) 1 <;>
+      (simp only [List.mem_cons, List.not_mem_nil, or_false] at he; rcases he with rfl | rfl)
+    · exact Nat.zero_le _
+    · exact Nat.le_trans (LawfulJson.depth_toJson _) (Nat.le_max_left _ _)
+    · exact Nat.zero_le _
+    · exact Nat.le_trans (LawfulJson.depth_toJson _) (Nat.le_max_right _ _)
+  fromJson_toJson
+    | .inl a => by change (fromJson (toJson a) : Except String α).map Sum.inl = _; rw [LawfulJson.fromJson_toJson a]; rfl
+    | .inr b => by change (fromJson (toJson b) : Except String β).map Sum.inr = _; rw [LawfulJson.fromJson_toJson b]; rfl
+
+class NonNullJson (α : Type) [ToJson α] : Prop where
+  toJson_ne_null : ∀ a : α, toJson a ≠ .null
+
+instance                        : NonNullJson Unit       := ⟨fun () => nofun⟩
+instance                        : NonNullJson JsonNumber := ⟨nofun⟩
+instance                        : NonNullJson Bool       := ⟨nofun⟩
+instance                        : NonNullJson String     := ⟨nofun⟩
+instance                        : NonNullJson Int        := ⟨nofun⟩
+instance                        : NonNullJson Nat        := ⟨nofun⟩
+instance [ToJson α]             : NonNullJson (List α)   := ⟨nofun⟩
+instance [ToJson α]             : NonNullJson (Array α)  := ⟨nofun⟩
+instance [ToJson α] [ToJson β]  : NonNullJson (α × β)    := ⟨fun (_, _) => nofun⟩
+instance [ToJson α] [ToJson β]  : NonNullJson (Sum α β)  := ⟨fun | .inl _ | .inr _ => nofun⟩
+
+instance [LawfulJson α] [NonNullJson α] : LawfulJson (Option α) where
+  depthBound := LawfulJson.depthBound α
+  depth_toJson | none => Nat.zero_le _ | some a => LawfulJson.depth_toJson a
+  fromJson_toJson
+    | none   => rfl
+    | some a => by
+        have hne := NonNullJson.toJson_ne_null a
+        have hfa := LawfulJson.fromJson_toJson a
+        change (fromJson (toJson a) : Except String (Option α)) = .ok (some a)
+        unfold fromJson
+        cases hj : toJson a
+        · exact absurd hj hne
+        all_goals rw [hj] at hfa; exact congrArg (Except.map some) hfa
+
+@[reducible] def LawfulJson.iso {α β : Type} (inst : LawfulJson β)
+    (toB : α → β) (fromB : β → α) (left_inv : ∀ a, fromB (toB a) = a) : LawfulJson α where
+  toJson a := @ToJson.toJson β inst.toToJson (toB a)
+  fromJson j := (@FromJson.fromJson β inst.toFromJson j).map fromB
+  depthBound := @LawfulJson.depthBound β inst
+  depth_toJson a := @LawfulJson.depth_toJson β inst (toB a)
+  fromJson_toJson a := by
+    change (@FromJson.fromJson β inst.toFromJson (@ToJson.toJson β inst.toToJson (toB a))).map fromB = .ok a
+    rw [@LawfulJson.fromJson_toJson β inst (toB a)]
+    exact congrArg Except.ok (left_inv a)
+
+theorem NonNullJson.iso {α β : Type} (inst : LawfulJson β)
+    (hnn : @NonNullJson β inst.toToJson)
+    (toB : α → β) (fromB : β → α) (left_inv : ∀ a, fromB (toB a) = a) :
+    @NonNullJson α (LawfulJson.iso inst toB fromB left_inv).toToJson :=
+  @NonNullJson.mk α (LawfulJson.iso inst toB fromB left_inv).toToJson
+    (fun a => @NonNullJson.toJson_ne_null β inst.toToJson hnn (toB a))
 
 @[simp] theorem LawfulJson.fromField_of_field {α : Type} [LawfulJson α] (j : Json) (k : String) (a : α)
     (h : j.field k = .ok (toJson a)) :

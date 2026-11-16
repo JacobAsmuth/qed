@@ -648,7 +648,7 @@ private def mkCodecAndMountCmds (spec : ComponentSpec) (idLit : StrLit) :
     let appId := mkIdent (spec.t.getId ++ `app)
     cmds := cmds.push <|
       ← `(command| $[$doc?:docComment]? def $appId : App $stateId $msgId :=
-            withLocalRegistry (mkApp $initId $updateId (View.ofHtml $viewId) (locals := $regsId)))
+            withLocalRegistry (withAutoDehydrate $initId (mkApp $initId $updateId (View.ofHtml $viewId) (locals := $regsId))))
   return cmds
 
 open Lean Elab Command in

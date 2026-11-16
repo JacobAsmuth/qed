@@ -14,6 +14,20 @@ structure Field {α : Type} (p : α → Prop) where
 instance {α : Type} {p : α → Prop} : CoeOut (Field p) α := ⟨Field.val⟩
 instance {α : Type} {p : α → Prop} [ToString α] : ToString (Field p) := ⟨fun f => toString f.val⟩
 
+instance {α : Type} {p : α → Prop} [ToJson α] : ToJson (Field p) := ⟨fun f => toJson f.val⟩
+instance {α : Type} {p : α → Prop} [DecidablePred p] [FromJson α] : FromJson (Field p) :=
+  ⟨fun j => do let a ← (fromJson j : Except String α); if h : p a then .ok ⟨a, h⟩ else .error "failed field refinement"⟩
+instance {α : Type} {p : α → Prop} [DecidablePred p] [LawfulJson α] : LawfulJson (Field p) where
+  depthBound := LawfulJson.depthBound α
+  depth_toJson f := LawfulJson.depth_toJson f.val
+  fromJson_toJson f := by
+    rcases f with ⟨val, hok⟩
+    change (fromJson (toJson val) : Except String α).bind
+      (fun a => if h : p a then Except.ok (Field.mk a h) else Except.error _) = Except.ok (Field.mk val hok)
+    rw [LawfulJson.fromJson_toJson val]; dsimp only [bind, Except.bind]; rw [dif_pos hok]
+instance {α : Type} {p : α → Prop} [ToJson α] [NonNullJson α] : NonNullJson (Field p) :=
+  ⟨fun f => NonNullJson.toJson_ne_null f.val⟩
+
 instance {α : Type} {p : α → Prop} [ToProto α] : ToProto (Field p) where
   toProtoVal f := ToProto.toProtoVal f.val
 
@@ -493,6 +507,8 @@ elab_rules : command
               return { $[$fs:ident],* }),
         ← `(command| instance : ToJson $draftId := ⟨$draftToJsonId⟩),
         ← `(command| instance : FromJson $draftId := ⟨$draftFromId⟩),
+        ← `(command| instance : NonNullJson $draftId where
+              toJson_ne_null _ := nofun),
         ← `(command| instance : LawfulJson $draftId where
               depthBound := 1
               depth_toJson x := Nat.add_le_add_left $draftDepthProof 1
@@ -551,7 +567,9 @@ elab_rules : command
       else pure #[]
       let jsonInstCmds : Array (TSyntax `command) := #[
         ← `(command| instance : ToJson $t := ⟨$toJsonId⟩),
-        ← `(command| instance : FromJson $t := ⟨$fromJsonId⟩) ] ++ lawfulCmds
+        ← `(command| instance : FromJson $t := ⟨$fromJsonId⟩),
+        ← `(command| instance : NonNullJson $t where
+              toJson_ne_null _ := nofun) ] ++ lawfulCmds
       let draftProtoCmds ← mkDraftProtoCmds t.getId draftId fs
       let protoCmds ← mkSchemaProtoCmds t cbns cbts tApp appTo fs inputs refined jsonReads allProto allLawfulProto
       let cmds := formCmds ++ draftProtoCmds ++ jsonFnCmds ++ (if cbns.isEmpty then jsonInstCmds else #[]) ++ protoCmds

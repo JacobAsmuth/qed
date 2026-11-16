@@ -170,6 +170,9 @@ instance [LawfulJson α] : LawfulJson (Resource α) where
         change (fromJson (toJson a) : Except String α).map Resource.ok = Except.ok (Resource.ok a)
         rw [LawfulJson.fromJson_toJson a]; rfl
 
+instance [ToJson α] : NonNullJson (Resource α) :=
+  ⟨fun | .idle | .loading | .ok _ | .failed _ => nofun⟩
+
 private def encodeResourceFields [ToProto α] : Resource α → List (Nat × Proto.WireVal)
   | .idle     => [(1, .varint 0)]
   | .loading  => [(1, .varint 1)]

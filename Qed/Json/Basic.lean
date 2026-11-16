@@ -423,6 +423,7 @@ class FromJson (α : Type) where fromJson : Json → Except String α
 export ToJson (toJson)
 export FromJson (fromJson)
 
+instance : ToJson Unit := ⟨fun () => .arr []⟩
 instance : ToJson Json := ⟨id⟩
 instance : ToJson JsonNumber := ⟨.num⟩
 instance : ToJson Bool := ⟨.bool⟩
@@ -433,7 +434,11 @@ instance [ToJson α] : ToJson (List α)   := ⟨fun xs => .arr (xs.map toJson)�
 instance [ToJson α] : ToJson (Array α)  := ⟨fun xs => .arr (xs.toList.map toJson)⟩
 instance [ToJson α] : ToJson (Option α) := ⟨fun a => a.elim .null toJson⟩
 instance [ToJson α] [ToJson β] : ToJson (α × β) := ⟨fun (a, b) => .arr [toJson a, toJson b]⟩
+instance [ToJson α] [ToJson β] : ToJson (Sum α β) := ⟨fun
+  | .inl a => .arr [.num ⟨0, 0⟩, toJson a]
+  | .inr b => .arr [.num ⟨1, 0⟩, toJson b]⟩
 
+instance : FromJson Unit := ⟨fun | .arr [] => .ok () | _ => .error "expected []"⟩
 instance : FromJson Json := ⟨.ok⟩
 instance : FromJson JsonNumber := ⟨fun j => j.num?.elim (.error "expected a number") .ok⟩
 instance : FromJson Bool := ⟨fun j => j.bool?.elim (.error "expected a boolean") .ok⟩
@@ -464,6 +469,10 @@ instance [FromJson α] : FromJson (Option α) :=
 instance [FromJson α] [FromJson β] : FromJson (α × β) :=
   ⟨fun | .arr [ja, jb] => do return (← fromJson ja, ← fromJson jb)
        | _             => .error "expected a 2-element array"⟩
+instance [FromJson α] [FromJson β] : FromJson (Sum α β) :=
+  ⟨fun | .arr [.num ⟨0, 0⟩, ja] => (fromJson ja : Except String α).map Sum.inl
+       | .arr [.num ⟨1, 0⟩, jb] => (fromJson jb : Except String β).map Sum.inr
+       | _                      => .error "expected a tagged sum array"⟩
 
 instance : ToJson Float := ⟨fun f => (Json.parse (toString f)).toOption.getD (.num ⟨0, 0⟩)⟩
 instance : FromJson Float :=

@@ -100,6 +100,8 @@ instance : LawfulJson ApiError where
     rw [LawfulJson.fromJson_toJson (c, m)]
     rfl
 
+instance : NonNullJson ApiError := ⟨nofun⟩
+
 instance : ToProto ApiError   := .ofEquiv fun e => (e.code, e.message)
 instance : FromProto ApiError := .ofEquiv fun p : Nat × String => ApiError.mk p.1 p.2
 instance : LawfulProto ApiError := .ofEquiv (fun e => (e.code, e.message)) (fun p => ApiError.mk p.1 p.2) (fun ⟨_, _⟩ => rfl)
@@ -165,6 +167,8 @@ instance : LawfulJson WebhookUrl where
     rw [LawfulJson.fromJson_toJson raw]
     dsimp only [bind, Except.bind]
     rw [dif_pos hv]
+
+instance : NonNullJson WebhookUrl := ⟨nofun⟩
 
 instance : ToProto WebhookUrl where
   toProtoVal u := ToProto.toProtoVal u.raw

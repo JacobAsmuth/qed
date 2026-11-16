@@ -21,6 +21,8 @@ instance : FromJson ByteArray where
 instance : LawfulJson ByteArray where
   fromJson_toJson b := decodeHex_encodeHex b
 
+instance : NonNullJson ByteArray := ⟨nofun⟩
+
 /-! ## Binary Protocol Buffers Typeclasses (`ToProto`, `FromProto`, `LawfulProto`) -/
 
 class ToProto (α : Type) where

@@ -119,10 +119,11 @@ To deploy with SSR:
    locally).
 2. Host your backend `/api` endpoints separately, or pass a custom `fetch` into
    `makeHandler(mod, { fetch, title, … })` from `dist/ssr.mjs`.
-3. Optional: attach a `Dehydrate` codec (`App.withDehydrate`) so the browser restores the
-   server's state without re-fetching startup data. [Bookshelf](../Examples/Bookshelf.lean) and
-   [`test/bookshelf_ssr_test.mjs`](../test/bookshelf_ssr_test.mjs) demonstrate zero-refetch
-   startup.
+3. State restoration is automatic: `ui` and `component` apps synthesize a verified `Dehydrate`
+   codec by default so the browser restores server state without re-fetching startup data
+   (customizable with `(ephemeral := […])`, `(dehydrate := […])`, or `(dehydrate := false)`).
+   [Bookshelf](../Examples/Bookshelf.lean) and [`test/bookshelf_ssr_test.mjs`](../test/bookshelf_ssr_test.mjs)
+   demonstrate zero-refetch startup.
 
 The same build output also works as a static single-page app: point client routes at
 `index.html` on any static host.

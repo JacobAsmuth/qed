@@ -38,6 +38,8 @@ instance [Router R] : LawfulJson R where
     change (Router.parse (Router.print r)).elim _ _ = _
     rw [Router.round_trip]; rfl
 
+instance [Router R] : NonNullJson R := ⟨nofun⟩
+
 instance [Router R] : ToProto R := .ofEquiv Router.print
 
 private def decodeRouteSegs [Router R] (segs : List String) : Except String R :=

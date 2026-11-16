@@ -129,7 +129,7 @@ example (x : DocRoute × Resource (Array Qed.Demo.Signup)) :
   docDehydrate.round_trip x
 
 def routedDehydratedApp : App DocRoute DocRoute :=
-  ui DocRoute.home (fun _ r => r) (onRoute := id) (dehydrate := Dehydrate.full) fun r =>
+  ui DocRoute.home (fun _ r => r) (onRoute := id) fun r =>
     <div>{Router.toURL r}</div>
 
 #guard routedDehydratedApp.rehydrate (routedDehydratedApp.dehydrate (.sec .benchmarks 3))
@@ -306,6 +306,52 @@ def sliceApp : App SliceModel Nat :=
 
 invariant (m) on sliceApp : 1 ≤ m.a
 
+def autoSliceApp : App SliceModel Nat := ui sliceInit (fun m d => { m with a := m.a + d }) fun m => <div>{m.a}{m.b}</div>
+def ephemeralOptApp : App SliceModel Nat := ui sliceInit (fun m d => { m with a := m.a + d }) (ephemeral := [ephemeral]) fun m => <div>{m.a}{m.b}</div>
+def negFieldOptApp : App SliceModel Nat := ui sliceInit (fun m d => { m with a := m.a + d }) (dehydrate := [-ephemeral]) fun m => <div>{m.a}{m.b}</div>
+def optOutApp : App SliceModel Nat := ui sliceInit (fun m d => { m with a := m.a + d }) (dehydrate := false) fun m => <div>{m.a}{m.b}</div>
+def fromRouteShorthandApp : App AppModel DocRoute :=
+  ui ({ route := .home } : AppModel) (fun _ r => ({ route := r } : AppModel)) (onRoute := id) (dehydrate := .fromRoute route) fun m => <div>{Router.toURL m.route}</div>
+
+#guard autoSliceApp.rehydrate (autoSliceApp.dehydrate { a := 7, b := "yo", ephemeral := 0 }) == some { a := 7, b := "yo", ephemeral := 0 }
+#guard ephemeralOptApp.rehydrate (ephemeralOptApp.dehydrate { a := 7, b := "yo", ephemeral := 0 }) == some { a := 7, b := "yo", ephemeral := 99 }
+#guard negFieldOptApp.rehydrate (negFieldOptApp.dehydrate { a := 7, b := "yo", ephemeral := 0 }) == some { a := 7, b := "yo", ephemeral := 99 }
+#guard optOutApp.dehydrate sliceInit == "" && optOutApp.rehydrate "{}" == none
+#guard fromRouteShorthandApp.rehydrate (fromRouteShorthandApp.dehydrate { route := .sec .benchmarks 9 }) == some { route := .sec .benchmarks 9 }
+#guard (ModernCounter.app.rehydrate (ModernCounter.app.dehydrate { quantity := 6, draft := "six", active := false })).map (·.quantity) == some 6
+
+inductive FilterTab | all | tagged (tag : String) deriving DecidableEq
+structure PlainNote where
+  id   : Nat
+  text : String
+deriving DecidableEq
+structure RichModel where
+  tab   : FilterTab
+  notes : Array PlainNote
+  pick  : Option PlainNote
+  cache : Cached String
+  child : SingleChild.State
+
+def richInit : RichModel := { tab := .all, notes := #[], pick := none, cache := {}, child := { count := 0 } }
+def richDehydrate : Dehydrate RichModel := Dehydrate.auto
+def richAutoApp : App RichModel Unit := ui richInit (fun m _ => m) fun m => <div>{m.notes.size}{m.child.count}</div>
+def richSample : RichModel :=
+  { tab := .tagged "lean", notes := #[{ id := 1, text := "hello" }], pick := some { id := 2, text := "pinned" },
+    cache := ({} : Cached String).put "k" (.ok "v") "k", child := { count := 42 } }
+def checkRich : Option RichModel → Bool
+  | some m => m.tab == .tagged "lean" && m.notes == #[{ id := 1, text := "hello" }] &&
+              m.pick == some { id := 2, text := "pinned" } && m.cache.lookup "k" == some "v" && m.child.count == 42
+  | none   => false
+#guard checkRich (richDehydrate.rehydrate (richDehydrate.dehydrate richSample))
+#guard checkRich (richAutoApp.rehydrate (richAutoApp.dehydrate richSample))
+
+structure PartialFnModel where
+  count : Nat
+  fn    : Nat → Nat
+def partialFnApp : App PartialFnModel Nat :=
+  ui { count := 1, fn := (· + 10) } (fun m d => { m with count := m.count + d }) fun m => <div>{m.count}</div>
+#guard ((partialFnApp.rehydrate (partialFnApp.dehydrate { count := 8, fn := (· * 2) })).map fun m => (m.count, m.fn 5)) == some (8, 15)
+
 -- ── Compile-time rejection checks (#guard_msgs) ─────────────────────────
 
 /-- error: failed to synthesize instance of type class
@@ -384,10 +430,27 @@ def badLazyCapturesModel : View Nat Unit :=
 error: SSR `dehydrate` slice does not preserve the rendered view: rehydrating a model can render different HTML on the client than SSR rendered on the server.
   • view mismatch after rehydration: "hi" = _qed_m.b
 
-Include every model field read by the view in `(dehydrate := […])`, use `(dehydrate := Dehydrate.full)`, or supply a proof to `App.withDehydrate`. -/
+Include every model field read by the view in `(dehydrate := […])` (or omit `dehydrate` to dehydrate the full model automatically), or supply a proof to `App.withDehydrate`. -/
 #guard_msgs in
 def badIncompleteDehydrate : App SliceModel Nat :=
   ui sliceInit (fun m d => { m with a := m.a + d }) (dehydrate := [a]) fun m =>
     <div>{m.a}{m.b}</div>
+
+/-- error: could not synthesize default value for parameter 'hview' using tactics
+---
+error: SSR `dehydrate` slice does not preserve the rendered view: rehydrating a model can render different HTML on the client than SSR rendered on the server.
+  • view mismatch after rehydration: "hi" = _qed_m.b
+
+Include every model field read by the view in `(dehydrate := […])` (or omit `dehydrate` to dehydrate the full model automatically), or supply a proof to `App.withDehydrate`. -/
+#guard_msgs in
+def badEphemeralReadByView : App SliceModel Nat :=
+  ui sliceInit (fun m d => { m with a := m.a + d }) (ephemeral := [b]) fun m =>
+    <div>{m.a}{m.b}</div>
+
+/-- error: cannot dehydrate `PartialFnModel`: field(s) [fn] do not have a verified JSON codec (`LawfulJson`) and affect the rendered view -/
+#guard_msgs in
+def badStrictDehydrateFn : App PartialFnModel Nat :=
+  ui { count := 1, fn := (· + 10) } (fun m _ => m) (dehydrate) fun m =>
+    <div>{m.fn m.count}</div>
 
 end SyntaxChecks

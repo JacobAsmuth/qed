@@ -170,7 +170,7 @@ def bookDetail (b : Book) : Html Msg :=
   </article>
 
 def Storefront : App Model Msg :=
-  ui init transition (onRoute := Msg.routed) (dehydrate := [route, books, current, statusMsg]) fun m =>
+  ui init transition (onRoute := Msg.routed) fun m =>
     <div {shell} class="cloudbooks">
       <nav class="topnav">
         <a href={R.catalog} class="home-link">CloudBooks</a>

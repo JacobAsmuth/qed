@@ -227,8 +227,9 @@ elab "qedProveDehydrateView" : tactic => do
   let projLemmas := #[
     `Qed.mkApp_template, `Qed.mkRoutedApp_template, `Qed.App.addLocals_template,
     `Qed.App.withDehydrate_template, `Qed.App.withQueries_template,
-    `Qed.Dehydrate.full_project, `Qed.Dehydrate.slice_project,
+    `Qed.Dehydrate.full_project, `Qed.Dehydrate.slice_project, `Qed.Dehydrate.const_project,
     `Qed.Dehydrate.route_project, `Qed.Dehydrate.fromRoute_project,
+    `Qed.ToStep.toStep_model, `Qed.ToStep.toStep_pair, `Qed.ToStep.toStep_listPair,
     ``View.render, ``View.renderEach, ``VAttr.eval,
     ``V.el, ``V.text, ``V.dyn, ``V.ifElse, ``V.showIf, ``V.static,
     ``V.dynNode, ``V.memo, ``V.forEach, ``View.showIf, ``View.ofHtml
@@ -260,7 +261,7 @@ elab "qedProveDehydrateView" : tactic => do
         pure m!"\n  • view mismatch after rehydration: {fmt.pretty.replace "✝" ""}")
     throwError m!"SSR `dehydrate` slice does not preserve the rendered view: rehydrating a model \
       can render different HTML on the client than SSR rendered on the server.{details}\n\n\
-      Include every model field read by the view in `(dehydrate := […])`, use \
-      `(dehydrate := Dehydrate.full)`, or supply a proof to `App.withDehydrate`."
+      Include every model field read by the view in `(dehydrate := […])` (or omit `dehydrate` to \
+      dehydrate the full model automatically), or supply a proof to `App.withDehydrate`."
 
 end Qed

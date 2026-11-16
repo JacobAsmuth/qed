@@ -3,8 +3,8 @@ open Qed
 
 namespace Feed
 
-def likeOn  : Style := css [ color "#ff2d55", fontWeight "700" ]
-def likeOff : Style := css [ color "#8a8a8a" ]
+def likeOn  : Style := css [ color (hex "ff2d55"), fontWeight 700 ]
+def likeOff : Style := css [ color (hex "8a8a8a") ]
 
 component Card where
   state id       : Nat
@@ -14,6 +14,8 @@ component Card where
   state progress : Nat
   state duration : Nat
   key id
+  invariant cardSafe   : 0 ≤ likes, progress ≤ duration, liked → 1 ≤ likes
+  invariant cardStyled : roleHasOneOf "like" [likeOn, likeOff]
   view =>
     <article role="card" class="feed-card">
       <progress max={duration} value={progress}/>
@@ -23,49 +25,30 @@ component Card where
         {if liked then likeOn else likeOff}>{s!"♥ {likes}"}</button>
     </article>
 
-invariant cardSafe (c) :
-  0 ≤ c.likes, c.progress ≤ c.duration, c.liked → 1 ≤ c.likes
-  preserved_by Card.update
+app FeedApp where
+  collection cards : Card
+  state nextId := 0
+  action rank => cards := cards.sortBy (fun a b => a.likes ≥ b.likes)
+  action tick => cards := cards.map fun c => { c with progress := min (c.progress + 1) c.duration }
+  action dismiss (id : Nat) => cards := cards.filter (·.id != id)
+  action append =>
+    cards := cards.push { id := nextId, author := "new", likes := 0,
+                          liked := false, progress := 0, duration := 30 }
+    nextId += 1
+  view =>
+    <section class="feed">
+      <button class="rank" onClick={.rank}>Most liked</button>
+      <button class="more" onClick={.append}>Load more</button>
+      <div class="cards">{cards.map fun c =>
+        <article key={c.id} class="slot">
+          <Card state={c}/>
+          <button class="dismiss" onClick={.dismiss c.id}>✕</button>
+        </article>}</div>
+    </section>
 
-invariant cardStyled : roleHasOneOf "like" [likeOn, likeOff] holds_in Card.view
+def app := FeedApp.app
 
-structure Model where
-  cards  : Array Card.State
-  nextId : Nat
-
-inductive Msg
-  | card (k : String) (msg : Card.Msg)
-  | rank
-  | tick
-  | dismiss (id : Nat)
-  | append
-
-def update (m : Model) : Msg → Model
-  | .card k msg => { m with cards := Card.updateKeyed m.cards k msg }
-  | .rank       => { m with cards := m.cards.sortBy (fun a b => a.likes ≥ b.likes) }
-  | .tick       => { m with cards := m.cards.map fun c =>
-                              { c with progress := min (c.progress + 1) c.duration } }
-  | .dismiss id => { m with cards := m.cards.filter (·.id != id) }
-  | .append     => { m with cards  := m.cards.push
-                              { id := m.nextId, author := "new", likes := 0,
-                                liked := false, progress := 0, duration := 30 }
-                            nextId := m.nextId + 1 }
-
-def view (m : Model) : Html Msg :=
-  <section class="feed">
-    <button class="rank" onClick={.rank}>Most liked</button>
-    <button class="more" onClick={.append}>Load more</button>
-    <div class="cards">{m.cards.map fun c =>
-      <article key={c.id} class="slot">
-        <Card state={c} onMsg={.card}/>
-        <button class="dismiss" onClick={.dismiss c.id}>✕</button>
-      </article>}</div>
-  </section>
-
-def init : Model := { cards := #[], nextId := 0 }
-def app : App Model Msg := mkApp init update (View.ofHtml view)
-
-invariant feedSafe : cardSafe for_each cards preserved_by update
-invariant feedStyled : cardStyled for_each cards holds_in view
+invariant feedSafe   : Card.cardSafe   for_each cards preserved_by FeedApp.update
+invariant feedStyled : Card.cardStyled for_each cards holds_in FeedApp.view
 
 end Feed

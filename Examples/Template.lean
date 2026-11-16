@@ -73,7 +73,7 @@ def app : App Model Msg := ui init update fun m =>
       {if m.count == 0
         then <p class="hint">click + to start</p>
         else <p class="live">{s!"count is {m.count}"}</p>}
-      <input value={m.name} onInput={(Msg.setName ·)}/>
+      <input bind={(m.name, .setName)}/>
       {if m.name != "" then <p class="greeting">{s!"Hello, {m.name}!"}</p>}
       <button onClick={.add}>add todo</button>
       <ul class="todos">{m.todos.map fun t =>

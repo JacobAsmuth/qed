@@ -12,7 +12,7 @@ component Row where
   view =>
     <span class={if done then "item done" else "item"} onClick={.toggle}>{text}</span>
 
-component Board where
+app Board where
   collection rows : Row
   state draft := ""
   state nextId := 0

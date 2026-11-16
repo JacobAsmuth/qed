@@ -68,7 +68,7 @@ def app : App Model Msg :=
         <span class="count" id="count">{m.count}</span>
         <button class="inc" onClick={.inc}>+</button>
       </div>
-      <input id="title-input" class="title" value={m.title} onInput={.editTitle} placeholder="page title"/>
+      <input id="title-input" class="title" bind={(m.title, .editTitle)} placeholder="page title"/>
       <button class="apply" onClick={.applyTitle}>Set title</button>
       <button class="roll" onClick={.roll}>Roll d6</button>
       <button class="delay" onClick={.delayed}>Delayed</button>
@@ -76,7 +76,7 @@ def app : App Model Msg :=
       <button class="pick" onClick={.pick}>Pick file</button>
       <button class="focus" onClick={.focusTitle}>Focus title</button>
       <button class="save" onClick={.saveBatch}>Save (batch)</button>
-      <input class="search" value={m.query} onInput={.typeSearch} placeholder="debounced search"/>
+      <input class="search" bind={(m.query, .typeSearch)} placeholder="debounced search"/>
       <span class="searches" id="searches">{m.searches}</span>
       <div class="status" id="status">{m.status}</div>
     </div>

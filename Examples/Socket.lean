@@ -11,58 +11,49 @@ def Conn.label : Conn → String
   | .connecting => "connecting…"
   | .online     => "online"
 
-structure Model where
-  conn  : Conn
-  draft : String
-  log   : Array String
-
-inductive Msg
-  | connect
-  | disconnect
-  | opened
-  | closed
-  | errored (reason : String)
-  | received (text : String)
-  | typed (s : String)
-  | send
-
 def echo : String := "echo"
 
-def transition (m : Model) : Msg → Model × Cmd Msg := steps
-  | .connect    =>
-      ({ m with conn := .connecting, draft := "" },
-       Cmd.wsOpen echo "/echo" Msg.received
-          (onOpen := Msg.opened) (onClose := Msg.closed) (onError := Msg.errored))
-  | .disconnect => (m, Cmd.wsClose echo)
-  | .opened     => { m with conn := .online,  log := m.log.push "● connected" }
-  | .closed     => { m with conn := .offline, draft := "", log := m.log.push "○ disconnected" }
-  | .errored r  => { m with conn := .offline, draft := "", log := m.log.push s!"✗ {r}" }
-  | .received t => { m with log := m.log.push s!"← {t}" }
-  | .typed s    => if m.conn = .online then { m with draft := s } else m
-  | .send       =>
-      let t := m.draft.trimmed
-      if t.isEmpty then m
-      else ({ m with draft := "", log := m.log.push s!"→ {t}" }, Cmd.wsSend echo t)
+component LogLine where
+  prop text : String
+  view => <div class="line">{text}</div>
 
-invariant composerOnlyWhenOnline (m) :
-  m.draft ≠ "" → m.conn = .online preserved_by transition
+app EchoSocket where
+  state conn  : Conn         := .offline
+  state draft                := ""
+  state log   : Array String := #[]
 
-def logLine (line : String) : Html Msg := <div class="line">{line}</div>
+  action connect =>
+    conn := .connecting, draft := ""
+    perform (Cmd.wsOpen echo "/echo" .received
+      (onOpen := .opened) (onClose := .closed) (onError := .errored))
+  action disconnect => perform (Cmd.wsClose echo)
+  action opened => conn := .online, log := log.push "● connected"
+  action closed => conn := .offline, draft := "", log := log.push "○ disconnected"
+  action errored (r : String) => conn := .offline, draft := "", log := log.push s!"✗ {r}"
+  action received (t : String) => log := log.push s!"← {t}"
+  action typed (s : String) when conn = .online => draft := s
+  action send when !draft.trimmed.isEmpty =>
+    let t := draft.trimmed
+    draft := "", log := log.push s!"→ {t}"
+    perform (Cmd.wsSend echo t)
 
-def app : App Model Msg :=
-  ui { conn := .offline, draft := "", log := #[] } transition fun m =>
+  invariant composerOnlyWhenOnline : draft ≠ "" → conn = .online
+
+  view =>
     <div class="ws">
       <div class="bar">
-        <span class="status">{m.conn.label}</span>
-        <button class="connect" onClick={.connect} disabled={m.conn != .offline}>Connect</button>
-        <button class="disconnect" onClick={.disconnect} disabled={m.conn == .offline}>Disconnect</button>
+        <span class="status">{conn.label}</span>
+        <button class="connect" onClick={.connect} disabled={conn != .offline}>Connect</button>
+        <button class="disconnect" onClick={.disconnect} disabled={conn == .offline}>Disconnect</button>
       </div>
-      <div class="log">{m.log.map logLine}</div>
+      <div class="log">{log.map fun line => <LogLine text={line}/>}</div>
       <div class="composer">
-        <input class="draft" value={m.draft} placeholder="Echo something…"
-               onInput={.typed} disabled={m.conn != .online}/>
-        <button class="send" onClick={.send} disabled={m.conn != .online}>Send</button>
+        <input class="draft" bind={(draft, .typed)} placeholder="Echo something…"
+               disabled={conn != .online}/>
+        <button class="send" onClick={.send} disabled={conn != .online}>Send</button>
       </div>
     </div>
+
+def app := EchoSocket.app
 
 end Socket

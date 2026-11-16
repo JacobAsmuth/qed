@@ -53,18 +53,20 @@ def app : App Model Msg :=
       {match m.route with
        | .home =>
            <form class="search" onSubmit={.submit}>
-             <input class={if m.focused then "q focused" else "q"} value={m.query}
+             <input class={if m.focused then "q focused" else "q"} bind={(m.query, .typeQuery)}
                     placeholder="Find a user…"
-                    onInput={.typeQuery} onFocus={.focus} onBlur={.blur} onKeydown={.key}/>
+                    onFocus={.focus} onBlur={.blur} onKeydown={.key}/>
              <button class="go" type="submit">Search</button>
              <div class="hint">try <a href={R.user "ada"}>ada</a> or <a href={R.user "alan"}>alan</a></div>
            </form>
        | .user name =>
            <div class="profile">
              <h1>{name}</h1>
-             {m.profile.view (fun prof => <p class="bio">{prof.bio}</p>)
-               (loading := <p class="loading">Loading…</p>)
-               (failed  := fun e => <p class="error">Error: {e}</p>)}
+             <Await of={m.profile} as={prof}
+               loading={<p class="loading">Loading…</p>}
+               failed={fun e => <p class="error">Error: {e}</p>}>
+               <p class="bio">{prof.bio}</p>
+             </Await>
            </div>}
     </div>
 

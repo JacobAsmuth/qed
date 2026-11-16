@@ -75,16 +75,16 @@ nonempty conversation in the model.
 2. **[Native](Native.lean)** · the same `app`, run as a native binary: server-renders the
    initial page to stdout from the same verified view the browser uses. Nothing in an app is
    browser-specific.
-3. **[Live](Live.lean)** · handlers that read the model (`onClick={.setTo (m.n * 2)}`) stay
+3. **[Live](Live.lean)** · handlers that read live state (`onClick={.setTo (n * 2)}`) stay
    current across updates, and the event set is open (`onDoubleClick` works without a named
    helper).
 
 ## Views, styles, and proofs about them
 
-4. **[Badge](Badge.lean)** · scoped styles (`css`, `styleSheet`) and the second kind of
-   invariant: `holds_in view` proves a styling claim ("the badge is always on- or off-styled",
-   "these two elements are never on together") for every reachable state. Proof-only, no
-   browser entry.
+4. **[Badge](Badge.lean)** · scoped styles (`css`) and the second kind of
+   invariant: `holds_in` / inline view invariants prove styling claims ("the badge is always on-
+   or off-styled", "these two elements are never on together") for every reachable state.
+   Proof-only, no browser entry.
 5. **[Template](Template.lean)** · the full view vocabulary in one app: conditionals,
    controlled inputs, keyed and keyless lists, rows that change element by state, inline
    editing. Also the first hand-written invariant proof (`:= by …`) for a claim the automation
@@ -103,8 +103,8 @@ nonempty conversation in the model.
 8. **[Local](Local.lean)** · the same `component` declaration mounted the other way
    (`<Widget key={…}/>`): the framework owns the state, keyed per instance, outside the
    root model. `set`/`send` as the only mutations, each site compiled to a named `Msg` case
-   the invariant machinery can point at (`stepperSafe`). Components bubble typed output
-   (`emits`/`onEmit`), nest (a `Tag` inside each `Widget`), separate live props from
+   the invariant machinery can point at (`stepperSafe`). Components bubble typed events
+   (`event`/`emits`), nest (a `Tag` inside each `Widget`), separate live props from
    `initial` state, register through helper functions, and the local
    store snapshots/restores.
 

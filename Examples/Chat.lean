@@ -49,15 +49,16 @@ def transition (m : Model) : Msg → Model × Cmd Msg := steps
   | .chunk raw => { m with turns := appendLast m.turns (deltaOf raw) }
   | .done      => { m with pending := false }
 
-def bubble (t : Turn) : Html Msg :=
-  <div class={if t.user? then "msg user" else "msg bot"}>{t.text}</div>
+component Bubble where
+  prop turn : Turn
+  view => <div class={if turn.user? then "msg user" else "msg bot"}>{turn.text}</div>
 
 def chatApp : App Model Msg :=
   ui { turns := #[], draft := "", pending := false } transition fun m =>
     <div class="chat">
-      <div class="log">{m.turns.map bubble}</div>
+      <div class="log">{m.turns.map fun t => <Bubble turn={t}/>}</div>
       <div class="composer">
-        <input class="draft" placeholder="Message the model…" value={m.draft} onInput={.typed}/>
+        <input class="draft" placeholder="Message the model…" bind={(m.draft, .typed)}/>
         <button class="send" disabled={m.pending || m.draft.trimmed.isEmpty} onClick={.send}>Send</button>
       </div>
     </div>

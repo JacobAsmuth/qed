@@ -48,7 +48,7 @@ private def discoverAssets (value : Expr) : TermElabM (Expr × Expr) := do
       seen := seen.insert n
       let reg := n.getPrefix ++ `regs
       let isMount := match n with
-        | .str _ s => s == "mount" || s == "mountWith"
+        | .str _ s => s == "mount" || s == "mountWith" || s == "mountWithOpt"
         | _ => false
       if isMount && env.contains reg then
         regs := regs.push (Lean.mkConst reg)

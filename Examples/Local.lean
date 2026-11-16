@@ -9,6 +9,7 @@ component Stepper where
   action decrement => count := if count ≤ 0 then 0 else count - 1
   action increment => count += 1
   action save => saved := count
+  invariant stepperSafe : 0 ≤ count
   view =>
     <div class="stepper">
       <button class="dec" onClick={.decrement}>−</button>
@@ -18,13 +19,11 @@ component Stepper where
       <span class="savedv">{saved}</span>
     </div>
 
-invariant stepperSafe (s) : 0 ≤ s.count preserved_by Stepper.update
-
 component Tag where
   prop label := "Pin"
   state on := false
-  emits Bool
-  action toggle => on := !on, send (!on)
+  event onToggle (pinned : Bool)
+  action toggle => on := !on, send (onToggle (!on))
   view =>
     <button title={label} class={if on then "pin on" else "pin"} onClick={.toggle}>
       {if on then "★ pinned" else "☆ pin"}</button>
@@ -35,7 +34,7 @@ component Widget where
   state count  : Int := 0
   state note   := ""
   state pinned := false
-  emits Int
+  event onReport (count : Int)
   action resetNote => note := label
   view =>
     <div class="widget">
@@ -47,9 +46,9 @@ component Widget where
       </div>
       <input class="note" bind={note} placeholder="a local note…"/>
       <button class="reset-note" onClick={.resetNote}>Reset note</button>
-      <button class="report" onClick={send count}>Report ↑</button>
+      <button class="report" onClick={send (onReport count)}>Report ↑</button>
       <span class="pinned">{if pinned then "pinned" else ""}</span>
-      <Tag key={s!"t{id}"} label={s!"{label}: {note}"} onEmit={pinned := ·}/>
+      <Tag key={s!"t{id}"} label={s!"{label}: {note}"} onToggle={pinned := ·}/>
     </div>
 
 structure Row where
@@ -88,13 +87,13 @@ def update (m : Model) : Msg → Model
 
 def widgetView (r : Row) : Html Msg :=
   <Widget key={r.id} id={r.id} label={r.label}
-    initial={{ note := r.label }} onEmit={Msg.reported r.id}/>
+    initial={{ note := r.label }} onReport={Msg.reported r.id}/>
 
 def app : App Model Msg := ui init update fun m =>
   <div class="app">
     <h1>Local-state rows</h1>
     <div class="add">
-      <input class="new" value={m.draft} onInput={.edit} placeholder="New row label"/>
+      <input class="new" bind={(m.draft, .edit)} placeholder="New row label"/>
       <button class="addbtn" onClick={.add}>Add row</button>
     </div>
     <div class="report">{match m.lastReport with

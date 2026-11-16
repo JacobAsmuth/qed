@@ -8,7 +8,7 @@ private def testSuites : Array String := #[
   "cli_scaffold_test.mjs", "dom_equivalence_test.mjs", "chat_test.mjs", "signup_test.mjs",
   "booking_test.mjs", "todo_test.mjs", "users_test.mjs", "local_test.mjs", "effects_test.mjs",
   "template_test.mjs", "ssr_test.mjs", "ssr_dynamic_test.mjs", "ssr_template_test.mjs",
-  "bookshelf_test.mjs", "bookshelf_ssr_test.mjs", "socket_test.mjs", "live_test.mjs",
+  "bookshelf_test.mjs", "bookshelf_ssr_test.mjs", "fullstack_rpc_test.mjs", "socket_test.mjs", "live_test.mjs",
   "js_gate_test.mjs", "js_driver_browser_test.mjs", "svg_test.mjs"
 ]
 

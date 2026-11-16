@@ -46,7 +46,7 @@ export const Nat_decLt = (a, b) => a < b ? 1 : 0;
 export const Nat_land = (a, b) => a & b;
 export const Nat_lor  = (a, b) => a | b;
 
-const M64 = (1n << 64n) - 1n;
+const M64 = (1n << 64n) - 1n, u64 = (x) => BigInt(x) & M64;
 export const UInt8_ofNat = (n) => Number(n & 0xFFn);
 export const UInt8_toNat = (a) => BigInt(a);
 export const UInt8_land = (a, b) => a & b;
@@ -55,19 +55,26 @@ export const UInt8_shiftLeft  = (a, b) => (a << b) & 0xFF;
 export const UInt8_shiftRight = (a, b) => a >> b;
 export const UInt32_mk = (n) => Number(n) >>> 0;
 export const UInt32_ofNat = (n) => Number(n & 0xFFFFFFFFn);
-export const UInt32_ofNatCore = (n) => Number(n & 0xFFFFFFFFn);
+export const UInt32_ofNatCore = UInt32_ofNat;
 export const UInt32_toNat = (a) => BigInt(a >>> 0);
 export const UInt32_add = (a, b) => (a + b) >>> 0;
 export const UInt32_decEq = (a, b) => a === b ? 1 : 0;
 export const UInt32_decLe = (a, b) => a <= b ? 1 : 0;
 export const UInt32_decLt = (a, b) => a < b ? 1 : 0;
-export const UInt64_ofNat = (n) => BigInt(n) & M64;
-export const UInt64_toNat = (a) => BigInt(a) & M64;
-export const UInt64_xor = (a, b) => (BigInt(a) ^ BigInt(b)) & M64;
-export const UInt64_shiftRight = (a, b) => (BigInt(a) >> BigInt(b)) & M64;
+export const UInt64_ofNat = u64, UInt64_ofNatCore = u64, UInt64_ofBitVec = u64, UInt64_toNat = u64;
+export const UInt64_add = (a, b) => (BigInt(a) + BigInt(b)) & M64;
+export const UInt64_sub = (a, b) => (BigInt(a) - BigInt(b)) & M64;
+export const UInt64_mul = (a, b) => (BigInt(a) * BigInt(b)) & M64;
+export const UInt64_land = (a, b) => (BigInt(a) & BigInt(b)) & M64;
+export const UInt64_lor  = (a, b) => (BigInt(a) | BigInt(b)) & M64;
+export const UInt64_xor  = (a, b) => (BigInt(a) ^ BigInt(b)) & M64;
+export const UInt64_shiftLeft  = (a, b) => (BigInt(a) << (BigInt(b) & 63n)) & M64;
+export const UInt64_shiftRight = (a, b) => (BigInt(a) >> (BigInt(b) & 63n)) & M64;
+export const UInt64_decEq = (a, b) => u64(a) === u64(b) ? 1 : 0;
+export const UInt64_decLe = (a, b) => u64(a) <= u64(b) ? 1 : 0;
+export const UInt64_decLt = (a, b) => u64(a) < u64(b) ? 1 : 0;
 export const UInt64_toUSize = (a) => Number(BigInt(a) & 0x1FFFFFFFFFFFFFn);
-export const USize_ofNat = (n) => Number(n & 0x1FFFFFFFFFFFFFn);
-export const USize_ofNatCore = (n) => Number(n & 0x1FFFFFFFFFFFFFn);
+export const USize_ofNat = (n) => Number(n & 0x1FFFFFFFFFFFFFn), USize_ofNatCore = USize_ofNat;
 export const USize_add = (a, b) => a + b;
 export const USize_sub = (a, b) => a - b;
 export const USize_land = (a, b) => Number(BigInt(a) & BigInt(b));
@@ -196,18 +203,68 @@ export const String_toUTF8 = (s) => ENC.encode(s);
 export const String_fromUTF8 = (ba, _h) => DEC.decode(ba);
 export const String_validateUTF8 = (_ba) => 1;
 
-export const ByteArray_mkEmpty = (_c) => new Uint8Array(0);
-export const ByteArray_push = (ba, b) => { const r = new Uint8Array(ba.length + 1); r.set(ba); r[ba.length] = Number(b); return r; };
+function mkCapBytes(cap, used) {
+  const ab = new ArrayBuffer(Math.max(16, cap));
+  ab.__used = used;
+  return new Uint8Array(ab, 0, used);
+}
+export const ByteArray_mkEmpty = (c) => mkCapBytes(Number(c), 0);
+export const ByteArray_mk = (arr) => {
+  const u = mkCapBytes(arr.length, arr.length);
+  for (let i = 0; i < arr.length; i++) u[i] = Number(arr[i]);
+  return u;
+};
+export const ByteArray_data = (ba) => own(Array.from(ba));
+export const ByteArray_push = (ba, b) => {
+  const len = ba.length, ab = ba.buffer;
+  if (ba.byteOffset === 0 && ab.__used === len && len < ab.byteLength) {
+    new Uint8Array(ab)[len] = Number(b);
+    ab.__used = len + 1;
+    return new Uint8Array(ab, 0, len + 1);
+  }
+  const nab = new ArrayBuffer(Math.max(16, (len + 1) * 2));
+  const full = new Uint8Array(nab);
+  full.set(ba);
+  full[len] = Number(b);
+  nab.__used = len + 1;
+  return new Uint8Array(nab, 0, len + 1);
+};
 export const ByteArray_size = (ba) => BigInt(ba.length);
+export const ByteArray_usize = (ba) => ba.length;
 export const ByteArray_get = (ba, i) => ba[Number(i)];
 export const ByteArray_uget = (ba, i) => ba[Number(i)];
-export const ByteArray_getx33 = (ba, i) => ba[Number(i)];
-export const ByteArray_copySlice = (src, so, dst, dso, len, _ex) => {
-  const s = Number(so), d = Number(dso), n = Number(len);
-  const r = new Uint8Array(Math.max(dst.length, d + n));
-  r.set(dst);
-  r.set(src.subarray(s, s + n), d);
-  return r;
+export const ByteArray_getx33 = (ba, i) => ba[Number(i)] ?? 0;
+export const ByteArray_copySlice = (src, so, dst, dso, len, exact) => {
+  const s = Math.min(Number(so), src.length);
+  const d = Number(dso);
+  const n = Math.min(Number(len), src.length - s);
+  if (n <= 0 && d <= dst.length) return dst;
+  const end = Math.max(dst.length, d + n);
+  const ab = dst.buffer;
+  if (d >= dst.length && dst.byteOffset === 0 && ab.__used === dst.length && end <= ab.byteLength) {
+    const full = new Uint8Array(ab);
+    if (n > 0) full.set(src.subarray(s, s + n), d);
+    ab.__used = end;
+    return new Uint8Array(ab, 0, end);
+  }
+  const cap = exact ? end : Math.max(16, dst.length * 2, end);
+  const nab = new ArrayBuffer(cap);
+  const full = new Uint8Array(nab);
+  full.set(dst);
+  if (n > 0) full.set(src.subarray(s, s + n), d);
+  nab.__used = end;
+  return new Uint8Array(nab, 0, end);
+};
+
+const _f64Buf = new ArrayBuffer(8), _f64View = new DataView(_f64Buf);
+export const Float_toBits = (f) => {
+  if (Number.isNaN(f)) return 0x7ff8000000000000n;
+  _f64View.setFloat64(0, f, true);
+  return _f64View.getBigUint64(0, true);
+};
+export const Float_ofBits = (b) => {
+  _f64View.setBigUint64(0, BigInt(b) & M64, true);
+  return _f64View.getFloat64(0, true);
 };
 
 export const Array_emptyWithCapacity = Array_mkEmpty;
@@ -234,7 +291,7 @@ export const String_Pos_Raw_extract = String_extract;
 export const String_Pos_next = String_next;
 export const String_decodeChar = (s, i) => codeAtByte(s, Number(i));
 export const String_getUTF8Byte = (s, p) => { const info = getStrInfo(s); return info.ascii ? s.charCodeAt(Number(p)) : info.bytes[Number(p)]; };
-export const ByteArray_emptyWithCapacity = (_c) => new Uint8Array(0);
+export const ByteArray_emptyWithCapacity = (c) => mkCapBytes(Number(c), 0);
 export const ByteArray_validateUTF8 = (ba) => { try { DEC_FATAL.decode(ba); return 1; } catch { return 0; } };
 
 export const ST_Prim_mkRef   = (a, _w) => ({ v: a });
@@ -276,6 +333,7 @@ export const Qed_Dom_effectResult = domCall('effectResult');
 export const Qed_Dom_fetchStream = domCall('fetchStream');
 export const Qed_Dom_getAttribute = domCall('getAttribute');
 export const Qed_Dom_httpSend = domCall('httpSend');
+export const Qed_Dom_httpSendBytes = domCall('httpSendBytes');
 export const Qed_Dom_insertBefore = domCall('insertBefore');
 export const Qed_Dom_isConnected = domCall('isConnected');
 export const Qed_Dom_mountRoot = domCall('mountRoot');

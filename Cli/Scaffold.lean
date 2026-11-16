@@ -45,12 +45,12 @@ def cmdNew (dir : String) : IO UInt32 := do
   return 0
 
 def usage : IO UInt32 := do
-  IO.println "qed, a verified web frontend toolchain\n"
+  IO.println "qed, a verified full-stack web toolchain\n"
   IO.println "Usage: qed <command>\n"
   IO.println "  dev            watch + rebuild + serve with live-reload"
-  IO.println "  build          production build → dist/ (optimized, verified)"
-  IO.println "  start|preview  serve the build (server-rendered when ssr.mjs is present)"
-  IO.println "  test           run the browser tests (if present)"
+  IO.println "  build          production build → dist/ (JS client + native server, verified)"
+  IO.println "  start|preview  serve the build (native server, SSR handler, or static)"
+  IO.println "  test           run the browser and full-stack tests (if present)"
   IO.println "  check          verify proofs + no-sorry + axioms"
   IO.println "  clean          remove build outputs"
   IO.println "  new <dir>      scaffold a new app"

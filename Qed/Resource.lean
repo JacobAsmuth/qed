@@ -1,4 +1,5 @@
 import Qed.Runtime
+import Qed.Proto
 
 namespace Qed
 
@@ -16,6 +17,11 @@ def fetch [FromJson α] (url : String) (toMsg : Resource α → msg) : Cmd msg :
 
 def post [ToJson req] [FromJson resp] (url : String) (body : req) (toMsg : Resource resp → msg) : Cmd msg :=
   Cmd.postJson url (Json.render (toJson body)) (fun a => toMsg (.ok a)) (fun e => toMsg (.failed e))
+
+def rpc [ToProto req] [FromProto resp] (url : String) (body : req) (toMsg : Resource resp → msg) : Cmd msg :=
+  Cmd.rpc url body fun
+    | .ok a    => toMsg (.ok a)
+    | .error e => toMsg (.failed e)
 
 def view (r : Resource α) (ready : α → Html msg)
     (loading : Html msg := .text "Loading…")
@@ -163,5 +169,49 @@ instance [LawfulJson α] : LawfulJson (Resource α) where
     | .ok a => by
         change (fromJson (toJson a) : Except String α).map Resource.ok = Except.ok (Resource.ok a)
         rw [LawfulJson.fromJson_toJson a]; rfl
+
+private def encodeResourceFields [ToProto α] : Resource α → List (Nat × Proto.WireVal)
+  | .idle     => [(1, .varint 0)]
+  | .loading  => [(1, .varint 1)]
+  | .ok a     => [(1, .varint 2), (2, ToProto.toProtoVal a)]
+  | .failed e => [(1, .varint 3), (2, ToProto.toProtoVal e)]
+
+private def decodeResourceFields [FromProto α] (fs : List (Nat × Proto.WireVal)) :
+    Except String (Resource α) :=
+  match Proto.lookupField 1 fs with
+  | some (.varint 0) => .ok .idle
+  | some (.varint 1) => .ok .loading
+  | some (.varint 2) =>
+      match Proto.lookupField 2 fs with
+      | some w => (FromProto.fromProtoVal (α := α) w).map .ok
+      | none   => .error "Resource.ok: missing field 2"
+  | some (.varint 3) =>
+      match Proto.lookupField 2 fs with
+      | some w => (FromProto.fromProtoVal (α := String) w).map .failed
+      | none   => .error "Resource.failed: missing field 2"
+  | _ => .error "protobuf: invalid Resource tag"
+
+instance [ToProto α]   : ToProto (Resource α)   := .ofFields encodeResourceFields
+instance [FromProto α] : FromProto (Resource α) := .ofFields decodeResourceFields
+
+instance [LawfulProto α] : LawfulProto (Resource α) :=
+  .ofFields encodeResourceFields decodeResourceFields
+    (by intro r kw h; cases r <;>
+          (simp only [encodeResourceFields, List.mem_cons, List.not_mem_nil, or_false] at h
+           rcases h with rfl | rfl <;> simp))
+    (by intro r; cases r <;> simp [encodeResourceFields, decodeResourceFields, Proto.lookupField, Except.map])
+
+/-- Overloaded callback adapter allowing generated `server` RPC client functions to accept either
+    `Resource α → msg` or `Except String α → msg` with zero wrapper ceremony. -/
+class RpcCallback (α : Type) (msg : outParam Type) (cb : Type) where
+  adapt : cb → Except String α → msg
+
+instance {α msg : Type} : RpcCallback α msg (Resource α → msg) where
+  adapt f
+    | .ok a    => f (.ok a)
+    | .error e => f (.failed e)
+
+instance {α msg : Type} : RpcCallback α msg (Except String α → msg) where
+  adapt f r := f r
 
 end Qed

@@ -17,6 +17,7 @@ structure Runtime where
   streamChunk      : UInt32 → String → IO Unit
   streamDone       : UInt32 → IO Unit
   httpDone         : UInt32 → Bool → String → IO Unit
+  httpBytesDone    : UInt32 → Bool → ByteArray → IO Unit
   urlChanged       : String → IO Unit
   localDispatch    : String → UInt32 → IO Unit
   localDispatchStr : String → UInt32 → String → IO Unit
@@ -61,6 +62,12 @@ def qedStreamDone (did : UInt32) : IO Unit := do
 def qedHttpDone (id : UInt32) (ok : UInt32) (text : String) : IO Unit := do
   match ← runtimeRef.get with
   | some rt => rt.httpDone id (ok != 0) text
+  | none    => pure ()
+
+@[export qed_http_bytes_done]
+def qedHttpBytesDone (id : UInt32) (ok : UInt32) (bytes : ByteArray) : IO Unit := do
+  match ← runtimeRef.get with
+  | some rt => rt.httpBytesDone id (ok != 0) bytes
   | none    => pure ()
 
 @[export qed_url_changed]
@@ -126,8 +133,9 @@ def run (app : App Model Msg) : IO Unit := do
   let inputRef  ← IO.mkRef (#[] : Array (String → Msg))
   let chunkCbRef  ← IO.mkRef (#[] : Array (String → Msg))
   let doneCbRef   ← IO.mkRef (#[] : Array Msg)
-  let respCbRef   ← IO.mkRef (∅ : Std.HashMap Nat (Except String String → Msg))
-  let effectCbRef ← IO.mkRef (∅ : Std.HashMap Nat (String → Msg))
+  let respCbRef      ← IO.mkRef (∅ : Std.HashMap Nat (Except String String → Msg))
+  let respBytesCbRef ← IO.mkRef (∅ : Std.HashMap Nat (Except String ByteArray → Msg))
+  let effectCbRef    ← IO.mkRef (∅ : Std.HashMap Nat (String → Msg))
   let cbNextRef   ← IO.mkRef (0 : Nat)
   let socketCbRef ← IO.mkRef (∅ : Std.HashMap String (SocketHandlers Msg))
   let dispatchRef ← IO.mkRef (fun (_ : Msg) => (pure () : IO Unit))
@@ -173,6 +181,10 @@ def run (app : App Model Msg) : IO Unit := do
         let id ← cbNextRef.modifyGet (fun n => (n, n + 1))
         respCbRef.modify (·.insert id onResult)
         Dom.httpSend method url body (UInt32.ofNat id)
+    | .requestBytes method url body onResult => do
+        let id ← cbNextRef.modifyGet (fun n => (n, n + 1))
+        respBytesCbRef.modify (·.insert id onResult)
+        Dom.httpSendBytes method url body (UInt32.ofNat id)
     | .pushPath url => do
         Dom.pushPath url.raw
         match app.onUrlChange with
@@ -259,12 +271,15 @@ def run (app : App Model Msg) : IO Unit := do
       if !app.styles.isEmpty then Dom.effect "css.inject" (renderStyleSheet app.styles) "" ""
       let st ← Dom.appState
       match (if st.isEmpty then none else app.rehydrate st) with
-      | some m => modelRef.set m; renderModel
-      | none   =>
-        match app.onUrlChange with
-        | some f => do let p ← Dom.currentPath; dispatchMsg (f p)
-        | none   => renderModel
-      perform app.init.2
+      | some m =>
+          modelRef.set m
+          renderModel
+          perform app.init.2.clientOnly
+      | none =>
+          match app.onUrlChange with
+          | some f => do let p ← Dom.currentPath; dispatchMsg (f p)
+          | none   => renderModel
+          perform app.init.2
     dispatch := fun id => do
       match (← clickRef.get)[id.toNat]? with
       | some msg => dispatchMsg msg
@@ -285,6 +300,16 @@ def run (app : App Model Msg) : IO Unit := do
       match (← respCbRef.get)[id.toNat]? with
       | some f => respCbRef.modify (·.erase id.toNat); dispatchMsg (f (if ok then .ok text else .error text))
       | none   => pure ()
+    httpBytesDone := fun id ok bytes => do
+      match (← respBytesCbRef.get)[id.toNat]? with
+      | some f =>
+          respBytesCbRef.modify (·.erase id.toNat)
+          if ok then
+            dispatchMsg (f (.ok bytes))
+          else
+            let msg := (String.fromUTF8? bytes).getD "RPC transport error"
+            dispatchMsg (f (.error msg))
+      | none => pure ()
     urlChanged := fun path => do
       match app.onUrlChange with
       | some f => dispatchMsg (f path)

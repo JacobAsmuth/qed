@@ -54,6 +54,9 @@ opaque fetchStream (url body : String) (chunkId doneId : UInt32) : IO Unit
 @[extern "qed_dom_http_send"]
 opaque httpSend (method url body : String) (id : UInt32) : IO Unit
 
+@[extern "qed_dom_http_send_bytes"]
+opaque httpSendBytes (method url : String) (body : ByteArray) (id : UInt32) : IO Unit
+
 @[extern "qed_dom_current_path"]
 opaque currentPath : IO String
 

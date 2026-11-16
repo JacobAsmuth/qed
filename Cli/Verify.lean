@@ -115,8 +115,9 @@ def kernelEnvClean : IO Bool := do
   if (← (FilePath.mk "Examples").pathExists) then
     if (← shQuiet "lake" #["build", "qedjs"]) != 0 then return false
     let mods := #[
-      "Qed", "Qed.Driver", "Qed.Proofs.DomEquiv", "Js.Backend", "Js.Proofs",
-      "Examples.Bookshelf", "Examples.Todo", "Examples.Chat", "Examples.Signup",
+      "Qed", "Qed.Driver", "Qed.Server.Native", "Qed.Proofs.DomEquiv", "Js.Backend", "Js.Proofs",
+      "Examples.Bookshelf", "Examples.CloudBooks", "Examples.ServerChecks",
+      "Examples.Todo", "Examples.Chat", "Examples.Signup",
       "Examples.Booking", "Examples.Users", "Examples.Local", "Examples.Effects",
       "Examples.Template", "Examples.Socket", "Examples.Live", "Examples.DomProbe",
       "Examples.JsGate", root

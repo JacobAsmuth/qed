@@ -6,6 +6,7 @@ import Qed.Steps
 import Qed.Diff
 import Qed.Invariant
 import Qed.Json
+import Qed.Proto
 import Qed.Router
 import Qed.Date
 import Qed.Schema
@@ -16,4 +17,5 @@ import Qed.Jsx
 import Qed.Resource
 import Qed.Ssr
 import Qed.Style
--- `Qed.Dom` and `Qed.Driver` are omitted so pure app modules link natively for SSR without browser DOM externs.
+import Qed.Server
+-- `Qed.Dom`, `Qed.Driver`, and `Qed.Server.Native` are omitted so pure app modules compile cleanly to both JS and native SSR/RPC targets.

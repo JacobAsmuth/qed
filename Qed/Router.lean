@@ -2,6 +2,7 @@ import Std.Data.String.ToNat
 import Std.Data.String.ToInt
 import Qed.Html
 import Qed.Json
+import Qed.Proto
 
 namespace Qed
 
@@ -36,6 +37,24 @@ instance [Router R] : LawfulJson R where
     rw [LawfulJson.fromJson_toJson (Router.print r)]
     change (Router.parse (Router.print r)).elim _ _ = _
     rw [Router.round_trip]; rfl
+
+instance [Router R] : ToProto R := .ofEquiv Router.print
+
+private def decodeRouteSegs [Router R] (segs : List String) : Except String R :=
+  (Router.parse segs).elim (.error "invalid route") .ok
+
+instance [Router R] : FromProto R where
+  fromProtoMsg fs := (FromProto.fromProtoMsg fs).bind decodeRouteSegs
+  fromProtoVal w  := (FromProto.fromProtoVal w).bind decodeRouteSegs
+
+instance [Router R] : LawfulProto R where
+  msg_tags_pos r := LawfulProto.msg_tags_pos (Router.print r)
+  fromProtoMsg_toProtoMsg r := by
+    change (FromProto.fromProtoMsg (ToProto.toProtoMsg (Router.print r))).bind decodeRouteSegs = .ok r
+    rw [LawfulProto.fromProtoMsg_toProtoMsg (Router.print r)]; simp [decodeRouteSegs, Router.round_trip, Except.bind]
+  fromProtoVal_toProtoVal r := by
+    change (FromProto.fromProtoVal (ToProto.toProtoVal (Router.print r))).bind decodeRouteSegs = .ok r
+    rw [LawfulProto.fromProtoVal_toProtoVal (Router.print r)]; simp [decodeRouteSegs, Router.round_trip, Except.bind]
 
 class LawfulKey (α : Type) where
   toKey     : α → String
@@ -82,28 +101,27 @@ private def isUnreserved (b : UInt8) : Bool :=
   (48 ≤ c && c ≤ 57) || (65 ≤ c && c ≤ 90) || (97 ≤ c && c ≤ 122)
     || c == 45 || c == 95 || c == 46 || c == 126
 
+@[inline] def isPctEncodedChar (c : Char) : Bool :=
+  let n := c.toNat
+  (48 ≤ n && n ≤ 57) || (65 ≤ n && n ≤ 90) || (97 ≤ n && n ≤ 122) ||
+    n == 45 || n == 95 || n == 46 || n == 126 || n == 37
+
 @[inline] private def isSafePathBodyChar (c : Char) : Bool :=
   isSafeUrlChar c && c.toNat != 92
 
-private theorem isSafePathBodyChar_hexDigit (n : UInt8) :
-    isSafePathBodyChar (hexDigit n) = true := by
-  unfold hexDigit
-  split <;> rfl
+private theorem isPctEncodedChar_hexDigit (n : UInt8) :
+    isPctEncodedChar (hexDigit n) = true := by
+  unfold hexDigit; split <;> rfl
 
-private theorem isSafePathBodyChar_unreserved {b : UInt8} (h : isUnreserved b = true) :
-    isSafePathBodyChar (Char.ofNat b.toNat) = true := by
+private theorem isPctEncodedChar_unreserved {b : UInt8} (h : isUnreserved b = true) :
+    isPctEncodedChar (Char.ofNat b.toNat) = true := by
   unfold isUnreserved at h
-  have hb : b.toNat ≤ 126 ∧ b.toNat ≥ 45 ∧ b.toNat ≠ 92 := by
-    simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at h
-    omega
-  have hv : b.toNat.isValidChar := by
-    simp [Nat.isValidChar]; omega
-  have htn : (Char.ofNat b.toNat).toNat = b.toNat := by
-    simp [Char.ofNat, hv, Char.ofNatAux, Char.toNat]
-  unfold isSafePathBodyChar isSafeUrlChar
-  rw [htn]
-  simp only [Bool.and_eq_true, decide_eq_true_eq, bne_iff_ne]
-  omega
+  have hb : b.toNat ≤ 126 ∧ b.toNat ≥ 45 := by
+    simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at h; omega
+  have hv : b.toNat.isValidChar := by simp [Nat.isValidChar]; omega
+  have htn : (Char.ofNat b.toNat).toNat = b.toNat := by simp [Char.ofNat, hv, Char.ofNatAux, Char.toNat]
+  unfold isPctEncodedChar; rw [htn]
+  simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at h ⊢; omega
 
 private def encodeUTF8Loop (bs : ByteArray) (i : Nat) (acc : String) : String :=
   if h : i < bs.size then
@@ -114,34 +132,41 @@ private def encodeUTF8Loop (bs : ByteArray) (i : Nat) (acc : String) : String :=
   else acc
 termination_by bs.size - i
 
-private theorem encodeUTF8Loop_safe (bs : ByteArray) :
+private theorem encodeUTF8Loop_pct (bs : ByteArray) :
     ∀ (i : Nat) (acc : String),
-      acc.toList.all isSafePathBodyChar = true →
-      (encodeUTF8Loop bs i acc).toList.all isSafePathBodyChar = true := by
+      acc.toList.all isPctEncodedChar = true →
+      (encodeUTF8Loop bs i acc).toList.all isPctEncodedChar = true := by
   intro i
   induction hfuel : bs.size - i generalizing i with
   | zero =>
-      intro acc hacc
-      unfold encodeUTF8Loop
+      intro acc hacc; unfold encodeUTF8Loop
       have hnot : ¬ i < bs.size := by omega
       simp [hnot, hacc]
-  | succ k ih =>
-      intro acc hacc
-      unfold encodeUTF8Loop
+  | succ _ ih =>
+      intro acc hacc; unfold encodeUTF8Loop
       have hlt : i < bs.size := by omega
       simp only [hlt, ↓reduceDIte]
       apply ih (i + 1) (by omega)
       by_cases hu : isUnreserved bs[i]
-      · simp [hu, String.toList_push, hacc, isSafePathBodyChar_unreserved hu]
-      · have hpct : isSafePathBodyChar '%' = true := rfl
-        simp [hu, String.toList_push, hacc, hpct, isSafePathBodyChar_hexDigit]
+      · simp [hu, String.toList_push, hacc, isPctEncodedChar_unreserved hu]
+      · have hpct : isPctEncodedChar '%' = true := rfl
+        simp [hu, String.toList_push, hacc, hpct, isPctEncodedChar_hexDigit]
 
 def encodeSeg (s : String) : String :=
   encodeUTF8Loop s.toUTF8 0 ""
 
+theorem encodeSeg_pct (s : String) :
+    (encodeSeg s).toList.all isPctEncodedChar = true :=
+  encodeUTF8Loop_pct s.toUTF8 0 "" rfl
+
 theorem encodeSeg_safe (s : String) :
-    (encodeSeg s).toList.all isSafePathBodyChar = true :=
-  encodeUTF8Loop_safe s.toUTF8 0 "" rfl
+    (encodeSeg s).toList.all isSafePathBodyChar = true := by
+  have h := encodeSeg_pct s
+  rw [List.all_eq_true] at h ⊢
+  intro c hc; specialize h c hc
+  unfold isPctEncodedChar at h; unfold isSafePathBodyChar isSafeUrlChar
+  simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq, bne_iff_ne] at h ⊢
+  omega
 
 private def unhex (c : Char) : Option UInt8 :=
   let n := c.toNat

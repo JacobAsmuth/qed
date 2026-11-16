@@ -69,8 +69,12 @@ def isLegitTotalRecImpl (env : Environment) (declName implName : Name) : Bool :=
       dv.safety == .safe && implName == Name.str declName "_unsafe_rec"
   | _ => false
 
+def isAllowedExternMod (modName : Name) : Bool :=
+  modName == `Qed.Dom || modName == `Qed.Server.Prim
+
 def isLegitOpaque (env : Environment) (modName declName : Name) : Bool :=
-  (modName == `Qed.Dom && Lean.isExtern env declName) ||
+  (isAllowedExternMod modName && Lean.isExtern env declName) ||
+  (modName == `Qed.Server.Prim && declName == `Qed.Server.Prim.StateBoxPointed) ||
   ((Lean.getInitFnNameFor? env declName).isSome && (Compiler.getImplementedBy? env declName).isNone)
 
 /-- True iff `ci` is compile-time macro/elaborator/tactic/compiler infrastructure (never part of
@@ -129,13 +133,34 @@ private def verifyUserDecl (env : Environment) (modName n : Name) (ci? : Option 
     match ci with
     | .opaqueInfo _ =>
         if !isLegitOpaque env modName n then
-          throw s!"kernel gate: `partial` or `opaque` declaration `{n}` in `{modName}` is forbidden outside `Qed.Dom`"
+          throw s!"kernel gate: `partial` or `opaque` declaration `{n}` in `{modName}` is forbidden outside `Qed.Dom` and `Qed.Server.Prim`"
     | .defnInfo dv =>
         if exprMentionsWhileLoop dv.value then
           throw s!"kernel gate: unbounded `while`/`repeat` loop inside `{n}` in `{modName}` is forbidden"
     | _ => pure ()
-  if Lean.isExtern env n && modName != `Qed.Dom then
-    throw s!"kernel gate: unverified `@[extern]` `{n}` in `{modName}` is forbidden outside `Qed.Dom`"
+  if Lean.isExtern env n && !isAllowedExternMod modName then
+    throw s!"kernel gate: unverified `@[extern]` `{n}` in `{modName}` is forbidden outside `Qed.Dom` and `Qed.Server.Prim`"
+
+/-- Verifies that zero server-only primitives, secrets, state boxes, handlers, or dispatchers
+    are reachable from a compiled client JavaScript bundle. -/
+def verifyNoServerLeakInClient (env : Environment) (reachable : Array Name) : Except String Unit := do
+  for n in reachable do
+    let modName := definingModule env n
+    if modName == `Qed.Server.Prim || modName == `Qed.Server.Native then
+      throw s!"client bundle leak gate: server runtime primitive `{n}` (`{modName}`) cannot be bundled into client JavaScript"
+    if n == `Qed.Server.execExternalRaw ||
+       n == `Qed.Server.MonadServer.httpCall ||
+       n == `Qed.Server.MonadServer.readEnv ||
+       n == `Qed.Server.MonadAtomic.runAtomic ||
+       n == `Qed.Server.MonadAtomic.runAtomicRead then
+      throw s!"client bundle leak gate: server I/O or state primitive `{n}` cannot be bundled into client JavaScript"
+    match n with
+    | .str _ "dispatchM" | .str _ "secrets" | .str _ "initState" | .str _ "runServer" =>
+        throw s!"client bundle leak gate: server secret/state/dispatcher `{n}` cannot be bundled into client JavaScript"
+    | .str _ s =>
+        if s.endsWith "_step" || s.endsWith "_handler" then
+          throw s!"client bundle leak gate: server handler `{n}` cannot be bundled into client JavaScript"
+    | _ => pure ()
 
 /-- Strict runtime reachability gate invoked by `Js.emitProgram` on every JS bundle compilation.
     Applies **zero** meta exemptions: every single constant reachable from the compiled entrypoints

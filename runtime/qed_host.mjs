@@ -10,9 +10,10 @@ export function boot() {
   const dispatch    = (id) => app.qed_dispatch(id, W);
   const dispatchStr = (id, v) => app.qed_dispatch_str(id, v, W);
   const streamChunk = (cid, data) => app.qed_stream_chunk(cid, data, W);
-  const streamDone  = (did) => app.qed_stream_done(did, W);
-  const httpDone    = (id, ok, text) => app.qed_http_done(id, ok, text, W);
-  const urlChanged  = (path) => app.qed_url_changed(path, W);
+  const streamDone    = (did) => app.qed_stream_done(did, W);
+  const httpDone      = (id, ok, text) => app.qed_http_done(id, ok, text, W);
+  const httpBytesDone = (id, ok, bytes) => app.qed_http_bytes_done(id, ok, bytes, W);
+  const urlChanged    = (path) => app.qed_url_changed(path, W);
   const localDispatch    = (key, id) => app.qed_local_dispatch(key, id, W);
   const localDispatchStr = (key, id, v) => app.qed_local_dispatch_str(key, id, v, W);
   const localSnapshot = () => $.ioVal(app.qed_local_snapshot(W));
@@ -38,6 +39,14 @@ export function boot() {
     if (method !== 'GET' && method !== 'HEAD') opts.body = body;
     fetch(url, opts).then(async (r) => { const t = await r.text(); httpDone(id, r.ok ? 1 : 0, t); })
       .catch((e) => httpDone(id, 0, String(e)));
+  };
+  g.httpSendBytes = (method, url, body, id) => {
+    const opts = { method, headers: { 'Content-Type': 'application/x-protobuf', 'Accept': 'application/x-protobuf' } };
+    if (method !== 'GET' && method !== 'HEAD') opts.body = body;
+    fetch(url, opts).then(async (r) => {
+      const buf = new Uint8Array(await r.arrayBuffer());
+      httpBytesDone(id, r.ok ? 1 : 0, buf);
+    }).catch((e) => httpBytesDone(id, 0, new TextEncoder().encode(String(e))));
   };
   g.setSignal = (name, v) => {
     const s = String(v); g.sigVals.set(name, s); const b = g.sig.get(name);

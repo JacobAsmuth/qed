@@ -1,5 +1,6 @@
 import Qed.Html
 import Qed.Date
+import Qed.Proto
 import Qed.Router
 
 namespace Qed
@@ -9,6 +10,7 @@ inductive Cmd (msg : Type) where
   | stream (url : String) (body : String) (onChunk : String → msg) (onDone : msg)
   | now (onNow : Date → msg)
   | request (method url body : String) (onResult : Except String String → msg)
+  | requestBytes (method url : String) (body : ByteArray) (onResult : Except String ByteArray → msg)
   | pushPath (url : Url)
   | batch (cmds : List (Cmd msg))
   | port (name payload : String)
@@ -21,15 +23,16 @@ instance : Coe (List (Cmd msg)) (Cmd msg) := ⟨.batch⟩
 
 mutual
 def Cmd.map (f : α → β) : Cmd α → Cmd β
-  | .none                      => .none
-  | .stream u b onChunk onDone => .stream u b (fun c => f (onChunk c)) (f onDone)
-  | .now onNow                 => .now (fun d => f (onNow d))
-  | .request m u b onResult    => .request m u b (fun r => f (onResult r))
-  | .pushPath p                => .pushPath p
-  | .batch cmds                => .batch (Cmd.mapList f cmds)
-  | .port n p                  => .port n p
-  | .fx k a b c                => .fx k a b c
-  | .fxResult k a b onResult   => .fxResult k a b (fun s => f (onResult s))
+  | .none                           => .none
+  | .stream u b onChunk onDone      => .stream u b (fun c => f (onChunk c)) (f onDone)
+  | .now onNow                      => .now (fun d => f (onNow d))
+  | .request m u b onResult         => .request m u b (fun r => f (onResult r))
+  | .requestBytes m u b onResult    => .requestBytes m u b (fun r => f (onResult r))
+  | .pushPath p                     => .pushPath p
+  | .batch cmds                     => .batch (Cmd.mapList f cmds)
+  | .port n p                       => .port n p
+  | .fx k a b c                     => .fx k a b c
+  | .fxResult k a b onResult        => .fxResult k a b (fun s => f (onResult s))
   | .socket key url onMsg onOpen onClose onErr =>
       .socket key url (fun d => f (onMsg d)) (onOpen.map f) (onClose.map f)
               (onErr.map (fun g d => f (g d)))
@@ -47,12 +50,35 @@ def Cmd.flattenList : List (Cmd msg) → List (Cmd msg)
   | c :: cs => Cmd.flatten c ++ Cmd.flattenList cs
 end
 
+mutual
+/-- Strips HTTP/RPC data-loading commands already resolved during SSR while preserving
+    client-only subscriptions (`socket`, `fx`, `fxResult`, `stream`, `now`, `port`). -/
+def Cmd.clientOnly : Cmd msg → Cmd msg
+  | .request ..      => .none
+  | .requestBytes .. => .none
+  | .batch cmds      => .batch (Cmd.clientOnlyList cmds)
+  | c                => c
+def Cmd.clientOnlyList : List (Cmd msg) → List (Cmd msg)
+  | []      => []
+  | c :: cs => Cmd.clientOnly c :: Cmd.clientOnlyList cs
+end
+
 def httpDecode [FromJson α] (onOk : α → msg) (onErr : String → msg) :
     Except String String → msg
   | .error e   => onErr e
   | .ok   body => match (Json.parse body).bind FromJson.fromJson with
                   | .ok a    => onOk a
                   | .error e => onErr e
+
+def protoDecode [FromProto α] (onResult : Except String α → msg) :
+    Except String ByteArray → msg
+  | .error e   => onResult (.error e)
+  | .ok   body => onResult (Proto.decode body)
+
+/-- Binary Protocol Buffers RPC command (`POST` with `application/x-protobuf`). -/
+def Cmd.rpc [ToProto req] [FromProto resp] (url : String) (payload : req)
+    (onResult : Except String resp → msg) : Cmd msg :=
+  .requestBytes "POST" url (Proto.encode payload) (protoDecode onResult)
 
 def Cmd.getJson [FromJson α] (url : String) (onOk : α → msg) (onErr : String → msg) : Cmd msg :=
   .request "GET" url "" (httpDecode onOk onErr)

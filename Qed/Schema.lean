@@ -1,5 +1,6 @@
 import Qed.Notation
 import Qed.Json
+import Qed.Proto
 import Qed.Date
 import Qed.Runtime.Verify
 import Lean
@@ -12,6 +13,21 @@ structure Field {α : Type} (p : α → Prop) where
 
 instance {α : Type} {p : α → Prop} : CoeOut (Field p) α := ⟨Field.val⟩
 instance {α : Type} {p : α → Prop} [ToString α] : ToString (Field p) := ⟨fun f => toString f.val⟩
+
+instance {α : Type} {p : α → Prop} [ToProto α] : ToProto (Field p) where
+  toProtoVal f := ToProto.toProtoVal f.val
+
+instance {α : Type} {p : α → Prop} [DecidablePred p] [FromProto α] : FromProto (Field p) where
+  fromProtoVal w := do
+    let a ← FromProto.fromProtoVal (α := α) w
+    if h : p a then .ok ⟨a, h⟩ else .error "protobuf: failed field refinement"
+
+instance {α : Type} {p : α → Prop} [DecidablePred p] [LawfulProto α] : LawfulProto (Field p) :=
+  .ofScalar fun ⟨val, hok⟩ => by
+    dsimp only [ToProto.toProtoVal, FromProto.fromProtoVal, bind, Except.bind]
+    rw [LawfulProto.fromProtoVal_toProtoVal val]
+    dsimp only
+    rw [dif_pos hok]
 
 structure Codec (α : Type) where
   parse        : String → Option α
@@ -59,6 +75,20 @@ def fromJsonField {α} (c : Codec α) [FromJsonField α] (j : Json) (key : Strin
     c.fromJsonField j k = .ok f := by
   rcases f with ⟨val, hok⟩
   simp [Codec.fromJsonField, LawfulJson.fromField_of_field j k val h, hok]
+
+def fromProtoField {α} (c : Codec α) [FromProtoField α] (k : Nat) (fs : List (Nat × Proto.WireVal)) :
+    Except String (Field c.valid) :=
+  haveI := c.dec
+  match (FromProtoField.decodeProtoField k fs : Except String α) with
+  | .error e => .error e
+  | .ok a    => if h : c.valid a then .ok ⟨a, h⟩ else .error s!"field {k}: failed validation"
+
+theorem fromProtoField_of_field {α : Type} (c : Codec α) [FromProtoField α]
+    (k : Nat) (fs : List (Nat × Proto.WireVal)) (f : Field c.valid)
+    (h : FromProtoField.decodeProtoField k fs = .ok f.val) :
+    c.fromProtoField k fs = .ok f := by
+  rcases f with ⟨val, hok⟩
+  simp [Codec.fromProtoField, h, hok]
 
 theorem max_le_max {a b c d : Nat} (h1 : a ≤ c) (h2 : b ≤ d) : Nat.max a b ≤ Nat.max c d :=
   Nat.max_le.2 ⟨Nat.le_trans h1 (Nat.le_max_left c d), Nat.le_trans h2 (Nat.le_max_right c d)⟩
@@ -204,7 +234,7 @@ private partial def resolveCodecBase (rawSpec : Term) : TermElabM Term := do
 open Lean Elab Term Meta in
 private partial def elabSchemaFieldsAux (cbns : Array Ident) (cbts : Array Term)
     (fs : Array Ident) (rawSpecs : Array Term) (whereClauses : Array (Array Term)) (i : Nat) :
-    TermElabM (Array (Term × Bool × Bool)) := do
+    TermElabM (Array (Term × Bool × Bool × Bool × Bool)) := do
   if i < cbns.size then
     let bt ← elabType cbts[i]!
     withLocalDeclD cbns[i]!.getId bt fun _ =>
@@ -229,16 +259,19 @@ private partial def elabSchemaFieldsAux (cbns : Array Ident) (cbts : Array Term)
           let trueFn := Expr.lam `x α (mkConst ``True) BinderInfo.default
           let isRef ← pure (! (← isDefEq validExpr trueFn))
           let isLaw ← pure ((← trySynthInstance (mkApp (mkConst ``Qed.LawfulJson) α)) matches .some _)
-          pure (inp, isRef, isLaw)
+          let hasToP ← pure ((← trySynthInstance (mkApp (mkConst ``Qed.ToProtoField) α)) matches .some _)
+          let hasFromP ← pure ((← trySynthInstance (mkApp (mkConst ``Qed.FromProtoField) α)) matches .some _)
+          let isLawP ← pure ((← trySynthInstance (mkApp (mkConst ``Qed.LawfulProtoField) α)) matches .some _)
+          pure (inp, isRef, isLaw, hasToP && hasFromP, isLawP)
       | _ =>
           throwErrorAt rawSpec m!"failed to resolve schema field `{f.getId}` to a `Codec`"
 
 open Lean Elab Command in
 private def resolveSchemaFields (cbns : Array Ident) (cbts : Array Term)
     (fs : Array Ident) (rawSpecs : Array Term) (whereClauses : Array (Array Term)) :
-    CommandElabM (Array Term × Array Bool × Bool) := do
+    CommandElabM (Array Term × Array Bool × Bool × Bool × Bool) := do
   let res ← liftTermElabM (elabSchemaFieldsAux cbns cbts fs rawSpecs whereClauses 0)
-  return (res.map (·.1), res.map (·.2.1), res.all (·.2.2))
+  return (res.map (·.1), res.map (·.2.1), res.all (·.2.2.1), res.all (·.2.2.2.1), res.all (·.2.2.2.2))
 
 open Lean Elab Command Term Meta in
 private def elabPredProbe (cbns : Array Ident) (cbts : Array Term) (inp : Term) (i : Nat) :
@@ -248,6 +281,116 @@ private def elabPredProbe (cbns : Array Ident) (cbts : Array Term) (inp : Term) 
     withLocalDeclD cbns[i]!.getId bt fun _ => elabPredProbe cbns cbts inp (i + 1)
   else
     discard <| elabTermAndSynthesize inp none
+
+open Lean Elab Command Term in
+private def mkProtoFieldSkeleton
+    (reads : Array (TSyntax `term))
+    (fieldValTy : Nat → CommandElabM (TSyntax `term))
+    (wrapFieldEq : Nat → TSyntax `term → TSyntax `term → CommandElabM (TSyntax `term)) :
+    CommandElabM (TSyntax `term × TSyntax `term × Array Ident × Array (TSyntax `tactic)) := do
+  let nFields := reads.size
+  let emptyList ← `(term| ([] : List (Nat × Proto.WireVal)))
+  let mut tails : Array (TSyntax `term) := Array.replicate (nFields + 1) emptyList
+  let mut tagsPosPf ← `(term| (fun (_ : Nat × Proto.WireVal) h => False.elim (List.not_mem_nil h)))
+  for revIdx in [0:nFields] do
+    let i := nFields - 1 - revIdx
+    let kLit := Syntax.mkNumLit (toString (i + 1))
+    tails := tails.set! i (← `(term| ToProtoField.encodeProtoField $kLit $(reads[i]!) ++ $(tails[i + 1]!)))
+    tagsPosPf ← `(term| Proto.msg_tags_pos_encodeAppend (by decide : 0 < $kLit) $(reads[i]!) $tagsPosPf)
+  let body := tails[0]!
+  let mut pIdents : Array Ident := #[]
+  let mut pHaveTacs : Array (TSyntax `tactic) := #[]
+  for i in [0:nFields] do
+    let kLit := Syntax.mkNumLit (toString (i + 1))
+    let valTy ← fieldValTy i
+    let mut gtPf ← `(term| Proto.allTagsGt_nil $kLit)
+    for revAfter in [0 : nFields - 1 - i] do
+      let j := nFields - 1 - revAfter
+      let jLit := Syntax.mkNumLit (toString (j + 1))
+      gtPf ← `(term| Proto.allTagsGt_encodeAppend (by decide : $kLit < $jLit) $(reads[j]!) $gtPf)
+    let mut rawEq ← `(term| Proto.decodeProtoField_hit $kLit $(reads[i]!) $(tails[i + 1]!) $gtPf)
+    for revBefore in [0:i] do
+      let j := i - 1 - revBefore
+      let jLit := Syntax.mkNumLit (toString (j + 1))
+      rawEq ← `(term| Eq.trans (Proto.decodeProtoField_skip (α := $valTy) (by decide : $jLit ≠ $kLit) $(reads[j]!) $(tails[j + 1]!)) $rawEq)
+    let fullEq ← wrapFieldEq i body rawEq
+    let hId := mkIdent (Name.mkSimple s!"_hp{i}")
+    pIdents := pIdents.push hId
+    pHaveTacs := pHaveTacs.push (← `(tactic| have $hId:ident := $fullEq))
+  return (body, tagsPosPf, pIdents, pHaveTacs)
+
+open Lean Elab Command Term in
+private def mkDraftProtoCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
+    CommandElabM (Array (TSyntax `command)) := do
+  let toId   := mkIdent (tId ++ `Draft ++ `toProtoFields)
+  let fromId := mkIdent (tId ++ `Draft ++ `fromProtoFields)
+  let reads ← fs.mapM fun f => `(term| x.$f:ident)
+  let decodes ← (List.range fs.size).toArray.mapM fun i => do
+    let kLit := Syntax.mkNumLit (toString (i + 1))
+    `(term| (FromProtoField.decodeProtoField $kLit fs : Except String String))
+  let (body, tagsPosPf, pIdents, pHaveTacs) ← mkProtoFieldSkeleton reads
+    (fun _ => `(term| String)) (fun _ _ eq => pure eq)
+  return #[
+    ← `(command| def $toId (x : $draftId) : List (Nat × Proto.WireVal) := $body),
+    ← `(command| def $fromId (fs : List (Nat × Proto.WireVal)) : Except String $draftId := do
+          $[let $fs:ident ← $decodes:term]*
+          return { $[$fs:ident],* }),
+    ← `(command| instance : ToProto $draftId   := .ofFields $toId),
+    ← `(command| instance : FromProto $draftId := .ofFields $fromId),
+    ← `(command| instance : LawfulProto $draftId :=
+          .ofFields $toId $fromId (fun x => $tagsPosPf) fun x => by
+            $[$pHaveTacs:tactic]*
+            unfold $fromId $toId
+            simp only [$[$pIdents:term],*, bind, Except.bind, pure, Except.pure]) ]
+
+open Lean Elab Command Term in
+private def mkSchemaProtoCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
+    (tApp : TSyntax `term) (appTo : TSyntax `term → CommandElabM (TSyntax `term))
+    (fs : Array Ident) (inputs : Array Term) (refined : Array Bool)
+    (jsonReads : Array (TSyntax `term)) (allProto allLawfulProto : Bool) :
+    CommandElabM (Array (TSyntax `command)) := do
+  if !allProto then return #[]
+  let tId := t.getId
+  let toId          := mkIdent (tId ++ `toProtoFields)
+  let fromId        := mkIdent (tId ++ `fromProtoFields)
+  let encodeBytesId := mkIdent (tId ++ `encodeBytes)
+  let decodeBytesId := mkIdent (tId ++ `decodeBytes)
+  let toApp   ← appTo ⟨toId.raw⟩
+  let fromApp ← appTo ⟨fromId.raw⟩
+  let protoDecodes ← (List.range fs.size).toArray.mapM fun i => do
+    let kLit := Syntax.mkNumLit (toString (i + 1))
+    let inp := inputs[i]!
+    if refined[i]! then `(term| ($inp).fromProtoField $kLit fs)
+    else `(term| (FromProtoField.decodeProtoField $kLit fs : Except String (Codec.Val $inp)))
+  let (protoBody, tagsPosPf, pIdents, pHaveTacs) ← mkProtoFieldSkeleton jsonReads
+    (fun i => `(term| Codec.Val $(inputs[i]!)))
+    (fun i body rawEq =>
+      if refined[i]! then do
+        let kLit := Syntax.mkNumLit (toString (i + 1))
+        let f := fs[i]!
+        `(term| Codec.fromProtoField_of_field $(inputs[i]!) $kLit $body (x.$f:ident) $rawEq)
+      else pure rawEq)
+  let baseCmds : Array (TSyntax `command) := #[
+    ← `(command| def $toId $[($cbns:ident : $cbts:term)]* (x : $tApp) : List (Nat × Proto.WireVal) := $protoBody),
+    ← `(command| def $fromId $[($cbns:ident : $cbts:term)]* (fs : List (Nat × Proto.WireVal)) : Except String $tApp := do
+          $[let $fs:ident ← $protoDecodes:term]*
+          return { $[$fs:ident],* }),
+    ← `(command| def $encodeBytesId $[($cbns:ident : $cbts:term)]* (x : $tApp) : Bytes :=
+          Proto.encodeFieldsSpec ($toApp x)),
+    ← `(command| def $decodeBytesId $[($cbns:ident : $cbts:term)]* (b : Bytes) : Except String $tApp :=
+          (Proto.decodeFieldsSpec b).bind ($fromApp)) ]
+  if !cbns.isEmpty then return baseCmds
+  let instBase : Array (TSyntax `command) := #[
+    ← `(command| instance : ToProto $t   := .ofFields $toId),
+    ← `(command| instance : FromProto $t := .ofFields $fromId) ]
+  if !allLawfulProto then return baseCmds ++ instBase
+  let lawCmds : Array (TSyntax `command) := #[
+    ← `(command| instance : LawfulProto $t :=
+          .ofFields $toId $fromId (fun x => $tagsPosPf) fun x => by
+            $[$pHaveTacs:tactic]*
+            unfold $fromId $toId
+            simp only [$[$pIdents:term],*, bind, Except.bind, pure, Except.pure]) ]
+  return baseCmds ++ instBase ++ lawCmds
 
 open Lean Elab Command Term in
 elab_rules : command
@@ -271,11 +414,12 @@ elab_rules : command
       let iffId         := mkIdent (t.getId ++ `canSubmit_iff)
       let viewId        := mkIdent (t.getId ++ `formView)
       let formValidId   := mkIdent (t.getId ++ `formView_validIn)
-      let decodeId      := mkIdent (t.getId ++ `decode)
-      let encodeId      := mkIdent (t.getId ++ `encode)
-      let toJsonId      := mkIdent (t.getId ++ `toJson)
-      let fromJsonId    := mkIdent (t.getId ++ `fromJson)
-      let (inputs, refined, allLawful) ← resolveSchemaFields cbns cbts fs rawSpecs whereClauses
+      let decodeId   := mkIdent (t.getId ++ `decode)
+      let encodeId   := mkIdent (t.getId ++ `encode)
+      let toJsonId   := mkIdent (t.getId ++ `toJson)
+      let fromJsonId := mkIdent (t.getId ++ `fromJson)
+      let (inputs, refined, allLawful, allProto, allLawfulProto) ←
+        resolveSchemaFields cbns cbts fs rawSpecs whereClauses
       let pairs := fs.zip inputs
       -- Lean logs failed instance synthesis to `messages` rather than throwing; probe in isolation to catch missing `DecidablePred` cleanly.
       for (f, inp) in pairs do
@@ -408,7 +552,9 @@ elab_rules : command
       let jsonInstCmds : Array (TSyntax `command) := #[
         ← `(command| instance : ToJson $t := ⟨$toJsonId⟩),
         ← `(command| instance : FromJson $t := ⟨$fromJsonId⟩) ] ++ lawfulCmds
-      let cmds := formCmds ++ jsonFnCmds ++ (if cbns.isEmpty then jsonInstCmds else #[])
+      let draftProtoCmds ← mkDraftProtoCmds t.getId draftId fs
+      let protoCmds ← mkSchemaProtoCmds t cbns cbts tApp appTo fs inputs refined jsonReads allProto allLawfulProto
+      let cmds := formCmds ++ draftProtoCmds ++ jsonFnCmds ++ (if cbns.isEmpty then jsonInstCmds else #[]) ++ protoCmds
       for c in cmds do elabCommand c
 
 namespace Demo

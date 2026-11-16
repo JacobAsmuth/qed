@@ -49,6 +49,54 @@ def segP (i : Nat) : String :=
   let p := routes.getD i ""
   toString (((p.splitOn "/").filter (· ≠ "")).map decodeSeg)
 
+schema ProtoRec where
+  id  : String where 1 <= id.length, id.length <= 32
+  qty : Nat    where qty <= 500
+  raw : Bytes
+
+private def protoRoundTrip {α : Type} [ToProto α] [FromProto α] (a : α) (eq : α → α → Bool) : String :=
+  let bs := Proto.encode a
+  let ok := match Proto.decode (α := α) bs with
+    | .ok b    => eq a b
+    | .error _ => false
+  s!"{Proto.encodeHex bs}|{ok}"
+
+def protoP (i : Nat) : String :=
+  match i with
+  | 0 => protoRoundTrip () (fun _ _ => true)
+  | 1 => protoRoundTrip (true, false) (· == ·)
+  | 2 => protoRoundTrip #[0, 1, 127, 128, 16384, 1000000007] (· == ·)
+  | 3 => protoRoundTrip #[(0 : Int), -1, 1, -64, 64, -100000, 100000] (· == ·)
+  | 4 => protoRoundTrip ((0xDEADBEEF : UInt32), (0x0102030405060708 : UInt64)) (· == ·)
+  | 5 => protoRoundTrip #["", "héllo", "日本語!"] (· == ·)
+  | 6 =>
+      let grown := (List.range 300).foldl (fun acc n => acc.push (UInt8.ofNat (n % 256))) ByteArray.empty
+      protoRoundTrip grown (fun a b => a.data == b.data)
+  | 7 =>
+      let opts : Array (Option (Array Int)) := #[none, some #[], some #[-42, 0, 999]]
+      protoRoundTrip opts (· == ·)
+  | 8 =>
+      let r1 : Resource (String × Nat) := .idle
+      let r2 : Resource (String × Nat) := .ok ("qed", 42)
+      let r3 : Resource (String × Nat) := .failed "err"
+      let eqR (x y : Resource (String × Nat)) : Bool :=
+        match x, y with
+        | .idle, .idle => true
+        | .loading, .loading => true
+        | .ok a, .ok b => a == b
+        | .failed a, .failed b => a == b
+        | _, _ => false
+      String.intercalate ";" [protoRoundTrip r1 eqR, protoRoundTrip r2 eqR, protoRoundTrip r3 eqR]
+  | 9 =>
+      let recVal : ProtoRec := {
+        id  := ⟨"tpil4", by dsimp [Codec.refine]; decide⟩
+        qty := ⟨12, by dsimp [Codec.refine]; decide⟩
+        raw := ByteArray.mk #[0x89, 0x50, 0x4E, 0x47]
+      }
+      protoRoundTrip recVal (fun a b =>
+        a.id.val == b.id.val && a.qty.val == b.qty.val && a.raw.data == b.raw.data)
+  | _ => ""
+
 def run (probe i : Nat) : String :=
   match probe with
   | 0 => JsProbe.renderCase i
@@ -63,6 +111,7 @@ def run (probe i : Nat) : String :=
   | 9 => JsProbe.childPatchCase i
   | 10 => JsProbe.wideRenderCase i
   | 11 => JsProbe.keyIndexCase i
+  | 12 => protoP i
   | _ => ""
 
 def counts (probe : Nat) : Nat :=
@@ -79,12 +128,13 @@ def counts (probe : Nat) : Nat :=
   | 9 => 5
   | 10 => 5
   | 11 => 6
+  | 12 => 10
   | _ => 0
 
-def probeCount : Nat := 12
+def probeCount : Nat := 13
 
 def names : Array String := #["render", "diff", "arith", "string", "json", "date", "array", "router", "seg",
-  "childPatch", "wideRender", "keyIndex"]
+  "childPatch", "wideRender", "keyIndex", "proto"]
 
 def jsonStr (s : String) : String :=
   "\"" ++ (s.foldl (init := "") fun acc c =>

@@ -481,6 +481,7 @@ def emitProgram (env : Environment) (entries : List (Name × String)) (min : Boo
   let roots := entries.map (·.1)
   let names := reach env roots #[]
   verifyReachable env names
+  verifyNoServerLeakInClient env names
   let mut nm : Std.HashMap Name String := {}
   let mut externs : Std.HashMap Name Decl := {}
   let mut counter := 0

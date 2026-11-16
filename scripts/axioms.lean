@@ -1,4 +1,5 @@
 import Qed
+import Qed.Server.Native
 import Qed.Proofs.DomEquiv
 import Js.Proofs
 import Examples.Counter
@@ -7,6 +8,7 @@ import Examples.Chat
 import Examples.Template
 import Examples.Live
 import Examples.Socket
+import Examples.CloudBooks
 
 #print axioms counterSafe
 #print axioms Booking.bookedNeedsToday
@@ -85,3 +87,29 @@ import Examples.Socket
 #print axioms Js.Proofs.CowHeap.SnapshotValid_refMark
 #print axioms Js.Proofs.CowHeap.refMark_snapshot_sound
 #print axioms Js.Proofs.memo_thunk_obs_equiv
+
+-- Verified Binary Protocol Buffers, Full-Stack SSR/RPC & Multi-Core Server Linearizability
+#print axioms Qed.Proto.decodeFrameList_append
+#print axioms Qed.Proto.cursor_strictly_advances
+#print axioms Qed.Proto.skipUnknown_preserves_lookup_suffix
+#print axioms Qed.Proto.skipUnknown_preserves_repeated_suffix
+#print axioms Qed.Proto.decodeHex_encodeHex
+#print axioms Qed.Proto.decode_encode
+#print axioms Qed.rpc_wire_roundtrip
+#print axioms Qed.fullstack_ssr_rpc_equiv
+#print axioms Qed.Server.header_no_crlf
+#print axioms Qed.Server.external_url_preserves_origin
+#print axioms Qed.Server.readOnly_preserves_state
+#print axioms Qed.Server.concurrent_schedule_preserves_inv
+#print axioms Qed.Server.safeIO_bind_preservesStepRel
+#print axioms CloudBooks.Catalog.inv_init
+#print axioms CloudBooks.Catalog.list_readOnly
+#print axioms CloudBooks.Catalog.findAt_readOnly
+#print axioms CloudBooks.Catalog.cover_inv
+#print axioms CloudBooks.Catalog.order_inv
+#print axioms CloudBooks.Catalog.order_twoInv0
+#print axioms CloudBooks.Catalog.order_mutInv0
+#print axioms CloudBooks.Catalog.addBook_inv
+#print axioms CloudBooks.Catalog.addBook_twoInv0
+#print axioms CloudBooks.Catalog.addBook_mutInv0
+#print axioms CloudBooks.Catalog.concurrent_linearizable

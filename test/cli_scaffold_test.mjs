@@ -69,18 +69,31 @@ try {
   ));
   await writeFile(appPath,
     'import Qed\nimport Child\nopen Qed\nnamespace Site\n' +
+    'def negStyle : Style := css [letterSpacing (em (-0.015)), zIndex (-1)]\n' +
     'component Quantity where\n  state quantity : Int := 1\n' +
-    '  view => <div><style>{".a > .b { color: red; }"}</style><br/><a href={url% "/guide"}><b>safe</b></a><Badge key="b"/><span>{quantity}</span></div>\n' +
+    '  view => <div {negStyle} data-css={negStyle.raw}><style>{".a > .b { color: red; }"}</style><br/><a href={url% "/guide"}><b>{if ("qed".startsWith "q") then "safe" else "no"}</b></a><Badge key="b"/><span>{quantity}</span></div>\n' +
     'end Site\nabbrev Quantity.app := Site.Quantity.app\n');
+  succeeds(run(cli, ['check'], app));
   succeeds(run(cli, ['build', '--dev'], app));
   const multiUrl = pathToFileURL(path.join(app, '.qed/dev/ssr.mjs'));
   multiUrl.search = '?multi-file';
   const { default: renderMulti } = await import(multiUrl);
   const multiHtml = await (await renderMulti(new Request('http://localhost/'))).text();
+  assert.match(multiHtml, /letter-spacing: -0\.015em; z-index: -1;/);
   assert.match(multiHtml, /\.a > \.b \{ color: red; \}/);
   assert.doesNotMatch(multiHtml, /<\/br>/);
   assert.match(multiHtml, /href="\/guide"><b>safe<\/b><\/a>/);
   assert.match(multiHtml, /class="badge">ok:7<\/span>/);
+
+  const strippedRt = path.join(scratch, 'stripped_rt.mjs');
+  const rtSrc = await readFile(path.join(root, 'runtime/qed_rt.mjs'), 'utf8');
+  await writeFile(strippedRt, rtSrc.replace('String_Slice_Pattern_Internal_memcmpStr', 'Removed_memcmpStr'));
+  const missingExternRes = run('lake', [
+    'exe', 'qedjs', '--check-externs', strippedRt, 'Web', '--', 'Quantity.app:app', 'Qed.App.ssrStep:ssrStep',
+  ], app);
+  assert.notEqual(missingExternRes.status, 0);
+  assert.match(missingExternRes.stdout + missingExternRes.stderr,
+    /qed_rt: missing externs: .*String_Slice_Pattern_Internal_memcmpStr/);
 
   await writeFile(appPath,
     'import Qed\nopen Qed\ncomponent RawBad where\n  state x : Int := 0\n  view => <div {Attr.rawHtml "<b>raw</b>"}/>\n');

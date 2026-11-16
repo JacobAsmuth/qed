@@ -291,6 +291,25 @@ export const String_Pos_Raw_extract = String_extract;
 export const String_Pos_next = String_next;
 export const String_decodeChar = (s, i) => codeAtByte(s, Number(i));
 export const String_getUTF8Byte = (s, p) => { const info = getStrInfo(s); return info.ascii ? s.charCodeAt(Number(p)) : info.bytes[Number(p)]; };
+export const String_Slice_Pattern_Internal_memcmpStr = (lhs, rhs, lstart, rstart, len) => {
+  const ls = Number(lstart), rs = Number(rstart), n = Number(len);
+  if (n <= 0) return 1;
+  const li = getStrInfo(lhs), ri = getStrInfo(rhs);
+  if (ls + n > li.len || rs + n > ri.len) return 0;
+  if (li.ascii && ri.ascii) {
+    for (let i = 0; i < n; i++) {
+      if (lhs.charCodeAt(ls + i) !== rhs.charCodeAt(rs + i)) return 0;
+    }
+    return 1;
+  }
+  const lb = li.ascii ? null : li.bytes, rb = ri.ascii ? null : ri.bytes;
+  for (let i = 0; i < n; i++) {
+    const b1 = lb ? lb[ls + i] : lhs.charCodeAt(ls + i);
+    const b2 = rb ? rb[rs + i] : rhs.charCodeAt(rs + i);
+    if (b1 !== b2) return 0;
+  }
+  return 1;
+};
 export const ByteArray_emptyWithCapacity = (c) => mkCapBytes(Number(c), 0);
 export const ByteArray_validateUTF8 = (ba) => { try { DEC_FATAL.decode(ba); return 1; } catch { return 0; } };
 

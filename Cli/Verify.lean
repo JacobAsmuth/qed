@@ -127,6 +127,31 @@ def kernelEnvClean : IO Bool := do
     if (← shQuiet "lake" #["build", root, "qedjs"]) != 0 then return false
     return (← shQuiet "lake" #["exe", "qedjs", "--verify-env", root]) == 0
 
+def externsCovered : IO Bool := do
+  let rtPath ← runtimeFile "qed_rt.mjs"
+  unless (← rtPath.pathExists) do return true
+  let checkExterns (mods entries : Array String) : IO Bool := do
+    return (← shQuiet "lake" (#["exe", "qedjs", "--check-externs", rtPath.toString] ++ mods ++ #["--"] ++ entries)) == 0
+  let mod ← jsRoot
+  let modPath := FilePath.mk ((mod.replace "." "/") ++ ".lean")
+  if ← modPath.pathExists then
+    if !(← (FilePath.mk "Examples").pathExists) && mod != (← webRoot) then
+      if (← shQuiet "lake" #["build", mod]) != 0 then return false
+    match ← fullstackAppName mod with
+    | some fsName =>
+        let drv := driverEntries.filter (!·.startsWith "main:")
+        if !(← checkExterns #[mod, "Qed.Driver"] (#[s!"{fsName}.clientApp"] ++ drv)) then
+          return false
+    | none =>
+        if !(← checkExterns #[mod] driverEntries) then return false
+        if let some appName ← ssrAppName mod then
+          if !(← checkExterns #[mod] #[s!"{appName}:app", "Qed.App.ssrStep:ssrStep"]) then
+            return false
+  if ← (FilePath.mk "Examples").pathExists then
+    if !(← checkExterns #["Examples.JsGate"] #["JsGate.run", "JsGate.counts", "JsGate.probeCount", "JsGate.names"]) then
+      return false
+  return true
+
 def verify : IO Bool := do
   step "verifying proofs & axioms"
   if (← shQuiet "lake" #["build"]) != 0 then return false
@@ -136,7 +161,8 @@ def verify : IO Bool := do
   let ok2 ← axiomClean
   let ok3 ← kernelEnvClean
   let ok4 ← effectsCovered
-  return ok1 && ok2 && ok3 && ok4
+  let ok5 ← if ok3 then externsCovered else pure false
+  return ok1 && ok2 && ok3 && ok4 && ok5
 
 def cmdCheck : IO UInt32 := do
   if (← verify) then

@@ -11,10 +11,16 @@ def arith (i : Nat) : String :=
   let c : Nat := i * i + 5
   s!"{a + b}|{b}|{c - 100}|{c % 7}|{n.natAbs}"
 
-def strs : Array String := #["", "a", "héllo", "日本語!", "a<b&c", "  sp  ", "café", "x\ny\tz"]
+def strs : Array String := #["", "a", "héllo", "日本語!", "a<b&c", "  sp  ", "café", "x\ny\tz", "-0.015"]
 def strop (i : Nat) : String :=
   let s := strs.getD i ""
-  s!"{s.length}|{(s ++ "!?").take 4}|{s.drop 2}|{s.toList.reverse |> String.ofList}|{String.intercalate "," (s.splitOn "<")}"
+  let pfx := s.startsWith "hé"
+  let pfx2 := s.startsWith "-"
+  let pfxEmpty := s.startsWith ""
+  let sfx := s.endsWith "語!"
+  let sfx2 := s.endsWith "é"
+  let sfxLong := s.endsWith "日本語!!"
+  s!"{s.length}|{(s ++ "!?").take 4}|{s.drop 2}|{s.toList.reverse |> String.ofList}|{String.intercalate "," (s.splitOn "<")}|{pfx},{pfx2},{pfxEmpty},{sfx},{sfx2},{sfxLong}"
 
 def jsons : Array String :=
   #["null", "true", "[1,2,3]", "{\"a\":1,\"b\":[true,null]}", "\"x\\ny\"", "123", "[]", "{}",
@@ -97,6 +103,12 @@ def protoP (i : Nat) : String :=
         a.id.val == b.id.val && a.qty.val == b.qty.val && a.raw.data == b.raw.data)
   | _ => ""
 
+def styleP (i : Nat) : String :=
+  match i with
+  | 0 => (css [letterSpacing (em (-0.015)), zIndex (-1)]).raw
+  | 1 => (css [letterSpacing (em (-(-0.015))), zIndex (-0)]).raw
+  | _ => ""
+
 def run (probe i : Nat) : String :=
   match probe with
   | 0 => JsProbe.renderCase i
@@ -112,6 +124,7 @@ def run (probe i : Nat) : String :=
   | 10 => JsProbe.wideRenderCase i
   | 11 => JsProbe.keyIndexCase i
   | 12 => protoP i
+  | 13 => styleP i
   | _ => ""
 
 def counts (probe : Nat) : Nat :=
@@ -129,12 +142,13 @@ def counts (probe : Nat) : Nat :=
   | 10 => 5
   | 11 => 6
   | 12 => 10
+  | 13 => 2
   | _ => 0
 
-def probeCount : Nat := 13
+def probeCount : Nat := 14
 
 def names : Array String := #["render", "diff", "arith", "string", "json", "date", "array", "router", "seg",
-  "childPatch", "wideRender", "keyIndex", "proto"]
+  "childPatch", "wideRender", "keyIndex", "proto", "style"]
 
 def jsonStr (s : String) : String :=
   "\"" ++ (s.foldl (init := "") fun acc c =>

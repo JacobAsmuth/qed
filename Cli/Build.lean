@@ -4,11 +4,6 @@ open System (FilePath)
 
 namespace Qed.Cli
 
-def jsRoot : IO String := do
-  match ← env "QED_JS_ROOT" with
-  | some r => return r
-  | none   => webRoot
-
 def indexHtml (dev : Bool) : String :=
   let reload := if dev then
     "<script>(function(){let v=null;setInterval(async()=>{try{const t=await (await fetch('/__build_id',{cache:'no-store'})).text();if(v&&v!==t)location.reload();v=t;}catch(e){}},700)})()</script>\n"
@@ -17,44 +12,6 @@ def indexHtml (dev : Bool) : String :=
   "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>qed</title></head>\n" ++
   "<body><div id=\"app\">loading…</div>\n" ++ reload ++
   "<script type=\"module\" src=\"/qed_host.mjs\"></script>\n</body>\n</html>\n"
-
-private def takeIdentChars (s : String) : String :=
-  (s.takeWhile fun c => c.isAlphanum || c == '.' || c == '_' || c == '\'').toString
-
-def fullstackAppName (mod : String) : IO (Option String) := do
-  let path := FilePath.mk ((mod.replace "." "/") ++ ".lean")
-  if !(← path.pathExists) then return none
-  let src ← IO.FS.readFile path
-  let mut depth : Nat := 0
-  let mut nsStack : List String := []
-  for raw in src.splitOn "\n" do
-    let inComment := depth > 0
-    depth := depth + ((raw.splitOn "/-").length - 1) - ((raw.splitOn "-/").length - 1)
-    if inComment then continue
-    let code := (raw.splitOn "--").headD raw
-    let toks := ((code.replace "\t" " ").splitOn " ").filter (· != "")
-    match toks with
-    | "namespace" :: ns :: _ =>
-        let cleanNs := takeIdentChars ns
-        if !cleanNs.isEmpty then nsStack := cleanNs :: nsStack
-    | "end" :: _ =>
-        nsStack := nsStack.drop 1
-    | "fullstack" :: rawName :: _ =>
-        let fs := takeIdentChars rawName
-        if !fs.isEmpty then
-          return some (String.intercalate "." (nsStack.reverse ++ [fs]))
-    | _ => pure ()
-  return none
-
-def ssrAppName (mod : String) : IO (Option String) := do
-  let path := FilePath.mk ((mod.replace "." "/") ++ ".lean")
-  if !(← path.pathExists) then return none
-  let src ← IO.FS.readFile path
-  match src.splitOn "Qed.run " with
-  | _ :: rest :: _ =>
-      let name := takeIdentChars (rest.dropWhile (· == ' ')).toString
-      return if name.isEmpty then none else some name
-  | _ => return none
 
 private def isFrameworkOrStdRoot (modName : String) : Bool :=
   let root := (modName.splitOn ".").headD modName
@@ -127,16 +84,6 @@ def ssrWrapper (appName : String) (cacheKey : String := "") : String :=
   "export { makeHandler, mod };\n" ++
   "export default makeHandler(mod, { title: '" ++ title ++ "', script: '/qed_host.mjs' });\n"
 
-def driverEntries : Array String := #[
-  "main:__main",
-  "Qed.qedInit:qed_init", "Qed.qedDispatch:qed_dispatch", "Qed.qedDispatchStr:qed_dispatch_str",
-  "Qed.qedStreamChunk:qed_stream_chunk", "Qed.qedStreamDone:qed_stream_done",
-  "Qed.qedHttpDone:qed_http_done", "Qed.qedHttpBytesDone:qed_http_bytes_done",
-  "Qed.qedUrlChanged:qed_url_changed",
-  "Qed.qedLocalDispatch:qed_local_dispatch", "Qed.qedLocalDispatchStr:qed_local_dispatch_str",
-  "Qed.qedLocalSnapshot:qed_local_snapshot", "Qed.qedLocalRestore:qed_local_restore",
-  "Qed.qedEffectDone:qed_effect_done", "Qed.qedPortRecv:qed_port_recv"]
-
 private def writeClientShell (outDir : FilePath) (prod : Bool) : IO Unit := do
   for f in ["qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"] do
     IO.FS.writeFile (outDir / f) (← IO.FS.readFile (← runtimeFile f))
@@ -148,6 +95,21 @@ private def minifyBundles (outDir : FilePath) (files : List String) : IO Unit :=
       let p := outDir / f
       if (← p.pathExists) then
         discard <| sh "bash" #["-c", s!"esbuild {p} --minify --format=esm --outfile={p}.min && mv {p}.min {p}"]
+
+private def verifyBuiltExterns (outDir : FilePath) (bundles : List String) : IO Bool := do
+  unless (← onPath "node") do return true
+  let existing ← bundles.filterM fun f => (outDir / FilePath.mk f).pathExists
+  if existing.isEmpty then return true
+  let script :=
+    "import path from 'node:path'; import { pathToFileURL } from 'node:url';" ++
+    "const rt = await import(pathToFileURL(path.resolve(process.argv[1])).href);" ++
+    "for (const f of process.argv.slice(2)) {" ++
+    "  const m = await import(pathToFileURL(path.resolve(f)).href);" ++
+    "  rt.assertExterns(m.__externs, rt);" ++
+    "}"
+  let rtArg := (outDir / "qed_rt.mjs").toString
+  let bundleArgs := existing.toArray.map fun f => (outDir / FilePath.mk f).toString
+  return (← sh "node" (#["--input-type=module", "-e", script, rtArg] ++ bundleArgs)) == 0
 
 private def resolveServeCmd (dir : FilePath) (port : String) (dev : Bool) :
     IO (String × Array String × Bool) := do
@@ -165,6 +127,7 @@ def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool) : IO 
   let some qedjsPaths ← lakeQueryPaths #["qed/qedjs"] | return false
   let some qedjsBin := qedjsPaths[0]? | return false
   let some baseLp ← lakeEnvLeanPath | return false
+  let rtPath ← runtimeFile "qed_rt.mjs"
   let genDir : FilePath := ".qed" / "gen"
   IO.FS.createDirAll genDir
   IO.FS.createDirAll outDir
@@ -176,13 +139,15 @@ def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool) : IO 
   if (← sh "lake" #["env", "lean", "-R", genDir.toString, cliLean.toString, "-o", cliOlean.toString]) != 0 then
     return false
   let minArgs := if prod then #["--min"] else #[]
+  let rtArgs := #["--rt", rtPath.toString]
   let lpEnv := #[("LEAN_PATH", some s!"{genDir}:{baseLp}")]
-  if (← sh qedjsBin (minArgs ++ #[(outDir / "app.mjs").toString, "ClientMain", "--"] ++ driverEntries) lpEnv) != 0 then
+  if (← sh qedjsBin (minArgs ++ rtArgs ++ #[(outDir / "app.mjs").toString, "ClientMain", "--"] ++ driverEntries) lpEnv) != 0 then
     return false
   writeClientShell outDir prod
   for stale in ["ssr.mjs", "ssr_app.mjs", "qed_ssr_host.mjs"] do
     removeIfExists (outDir / stale)
   if prod then minifyBundles outDir ["app.mjs", "qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"]
+  if !(← verifyBuiltExterns outDir ["app.mjs"]) then return false
 
   -- 2. Synthesize & compile native multi-core C/Lean server binary → `<outDir>/server`
   let srvLean := genDir / "ServerMain.lean"
@@ -209,14 +174,16 @@ def buildJs (outDir : FilePath) (prod : Bool) : IO Bool := do
   if (← sh "lake" #["build", mod, "qedjs"]) != 0 then return false
   IO.FS.createDirAll outDir
   removeIfExists (outDir / "server")
+  let rtPath ← runtimeFile "qed_rt.mjs"
   let minArgs := if prod then #["--min"] else #[]
-  if (← sh "lake" (#["exe", "qedjs"] ++ minArgs ++ #[(outDir / "app.mjs").toString, mod, "--"] ++ driverEntries)) != 0 then
+  let rtArgs := #["--rt", rtPath.toString]
+  if (← sh "lake" (#["exe", "qedjs"] ++ minArgs ++ rtArgs ++ #[(outDir / "app.mjs").toString, mod, "--"] ++ driverEntries)) != 0 then
     return false
   writeClientShell outDir prod
   match ← ssrAppName mod with
   | some appName =>
       let ssrOut := (outDir / "ssr_app.mjs").toString
-      if (← sh "lake" (#["exe", "qedjs"] ++ minArgs ++ #[ssrOut, mod, "--", s!"{appName}:app", "Qed.App.ssrStep:ssrStep"])) != 0 then
+      if (← sh "lake" (#["exe", "qedjs"] ++ minArgs ++ rtArgs ++ #[ssrOut, mod, "--", s!"{appName}:app", "Qed.App.ssrStep:ssrStep"])) != 0 then
         return false
       IO.FS.writeFile (outDir / "qed_ssr_host.mjs") (← IO.FS.readFile (← runtimeFile "qed_ssr_host.mjs"))
       let cacheKey ← if prod then pure "" else toString <$> IO.monoMsNow
@@ -225,6 +192,7 @@ def buildJs (outDir : FilePath) (prod : Bool) : IO Bool := do
       IO.println s!"  note: no `Qed.run <app>` found in {mod}, skipping the SSR handler (ssr.mjs)"
   if prod then
     minifyBundles outDir ["app.mjs", "qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs", "ssr_app.mjs", "qed_ssr_host.mjs"]
+  if !(← verifyBuiltExterns outDir ["app.mjs", "ssr_app.mjs"]) then return false
   return true
 
 def cmdBuild (prod : Bool) (skipVerify : Bool := false) : IO UInt32 := do

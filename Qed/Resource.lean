@@ -43,6 +43,10 @@ def map (f : α → β) : Resource α → Resource β
   | .ok a     => .ok (f a)
   | .failed e => .failed e
 
+def someOr (err : String := "Not found") : Resource (Option α) → Resource α
+  | .ok (some a) => .ok a | .ok none => .failed err
+  | .idle => .idle | .loading => .loading | .failed e => .failed e
+
 @[simp] theorem validIn_view {α msg : Type} (ctx : HtmlCtx) (r : Resource α)
     (ready : α → Html msg) (loading : Html msg) (failed : String → Html msg) (idle : Html msg) :
     Html.validIn ctx (r.view ready loading failed idle) =
@@ -209,12 +213,23 @@ instance [LawfulProto α] : LawfulProto (Resource α) :=
 class RpcCallback (α : Type) (msg : outParam Type) (cb : Type) where
   adapt : cb → Except String α → msg
 
-instance {α msg : Type} : RpcCallback α msg (Resource α → msg) where
-  adapt f
-    | .ok a    => f (.ok a)
-    | .error e => f (.failed e)
+instance {α msg : Type} : RpcCallback α msg (Resource α → msg) :=
+  ⟨fun f => fun | .ok a => f (.ok a) | .error e => f (.failed e)⟩
 
-instance {α msg : Type} : RpcCallback α msg (Except String α → msg) where
-  adapt f r := f r
+instance (priority := low) {α msg : Type} : RpcCallback (Option α) msg (Resource α → msg) :=
+  ⟨fun f => fun | .ok (some a) => f (.ok a) | .ok none => f (.failed "Not found") | .error e => f (.failed e)⟩
+
+instance {α msg : Type} : RpcCallback α msg (Except String α → msg) := ⟨id⟩
+
+class ToResource (ρ : Type) (α : outParam Type) where
+  toResource : ρ → Resource α
+
+@[reducible] instance {α : Type} : ToResource (Resource α) α := ⟨id⟩
+@[reducible] instance {α : Type} : ToResource (Cached α) α := ⟨Cached.state⟩
+
+@[reducible] def Resource.awaitView {ρ α msg : Type} [ToResource ρ α]
+    (src : ρ) (ready : α → Html msg) (loading : Html msg)
+    (failed : String → Html msg) (idle : Html msg) : Html msg :=
+  (ToResource.toResource src).view ready loading failed idle
 
 end Qed

@@ -1627,10 +1627,14 @@ def elabFullstackCmd : CommandElab := fun stx => do
   let some srvInfo := (srvMap.find? candSrv1).orElse (fun _ => srvMap.find? srvIdent.getId)
     | throwErrorAt srvIdent s!"unknown `server` `{srvIdent.getId}` in `fullstack {fsName}`"
 
-  -- Validate that `client` resolves to a `Qed.App _ _` value
-  let resolvedCli ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo cliIdent
+  -- Validate that `client` resolves to a `Qed.App _ _` value (or a `component`/`app` owning `.app`)
+  let cliTarget : Ident :=
+    if env.contains (currNs ++ cliIdent.getId ++ `app) || env.contains (cliIdent.getId ++ `app) then
+      mkIdentFrom cliIdent (cliIdent.getId ++ `app)
+    else cliIdent
+  let resolvedCli ← liftCoreM <| realizeGlobalConstNoOverloadWithInfo cliTarget
   let appCheckId := mkIdentFrom fsIdent (fsName ++ `clientApp)
-  elabCommand (← `(command| abbrev $appCheckId := $cliIdent))
+  elabCommand (← `(command| abbrev $appCheckId := $cliTarget))
   let pageTitle := title?.getD (fsName.toString)
   let titleId := mkIdentFrom fsIdent (fsName ++ `title)
   elabCommand (← `(command| def $titleId : String := $(Syntax.mkStrLit pageTitle)))

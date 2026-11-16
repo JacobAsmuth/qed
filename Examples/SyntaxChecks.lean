@@ -453,4 +453,134 @@ def badStrictDehydrateFn : App PartialFnModel Nat :=
   ui { count := 1, fn := (· + 10) } (fun m _ => m) (dehydrate) fun m =>
     <div>{m.fn m.count}</div>
 
+-- ── Sub-components, unified `app`, `Field`, `<Await>`, & fractional CSS checks ──
+
+def fracStyle : Style := css [
+  padding (rem 0.75) (rem 1.5),
+  margin (rem 2) .auto,
+  gap (px 4) (px 8),
+  lineHeight 1.5,
+  fontWeight 600,
+  opacity 0.85,
+  zIndex (-1) ]
+
+#guard fracStyle.raw ==
+  "padding: 0.75rem 1.5rem; margin: 2rem auto; gap: 4px 8px; line-height: 1.5; font-weight: 600; opacity: 0.85; z-index: -1;"
+
+#guard (match (Resource.ok (none : Option Nat)).someOr "missing" with | .failed "missing" => true | _ => false)
+#guard (match (Resource.ok (some 42)).someOr "missing" with | .ok 42 => true | _ => false)
+
+component Card where
+  prop title : String
+  slot badge
+  children
+  view =>
+    <div class="card">
+      <header><h3>{title}</h3>{badge}</header>
+      <div class="card-body">{children}</div>
+    </div>
+
+component SearchBar where
+  bind query : String := ""
+  event onClear
+  event onSubmitQuery (q : String)
+  view =>
+    <div class="search-bar">
+      <input bind={query}/>
+      <button class="clear" onClick={onClear}>Clear</button>
+      <button class="go" onClick={onSubmitQuery query}>Go</button>
+    </div>
+
+component ListChip where
+  prop text : String
+  view => <li class="chip">{text}</li>
+
+def cardSample : Html Unit :=
+  <Card title="Docs" badge={<span class="badge">v2</span>}>
+    <p>First</p>
+    <ul><ListChip key="a" text="Alpha"/></ul>
+  </Card>
+
+#guard (Html.render cardSample).contains "<h3>Docs</h3><span class=\"badge\">v2</span>"
+#guard (Html.render cardSample).contains "<li class=\"chip\">Alpha</li>"
+#guard !(Html.render cardSample).contains "data-qed-local"
+
+/-- error: invalid HTML5 nesting: <Card> (root <div>) is not allowed inside <p> (browsers rewrite this tree during HTML parsing, causing hydration mismatch) -/
+#guard_msgs in
+def badCardInParagraph : Html Unit := <p><Card title="Nope"><span>x</span></Card></p>
+
+/-- error: invalid HTML5 nesting: <ListChip> (root <li>) is not allowed inside <div> (browsers rewrite this tree during HTML parsing, causing hydration mismatch) -/
+#guard_msgs in
+def badChipInDiv : Html Unit := <div><ListChip text="Orphan"/></div>
+
+-- Stateful sub-component with `children`, `slot`, `bind:`, and `event` hoisted into a parent `app`
+component Accordion where
+  prop heading : String
+  slot extra
+  state openPanel := false
+  action toggle => openPanel := !openPanel
+  children
+  view =>
+    <section class="accordion">
+      <header>
+        <button class="toggle" onClick={.toggle}>{heading}</button>
+        {extra}
+      </header>
+      {if openPanel then <div class="panel">{children}</div>}
+    </section>
+
+component PickerBox where
+  bind filter : String := ""
+  state highlighted := 0
+  event onPick (choice : String)
+  action next => highlighted += 1
+  view =>
+    <div class="picker">
+      <input bind={filter}/>
+      <button onClick={onPick filter}>Pick</button>
+    </div>
+
+app CompositeDemo where
+  state query     := "init"
+  state picked    := ""
+  state clicks    := 1
+  ephemeral scratch := 99
+  collection rows : RowItem
+
+  action bump => clicks += 1
+
+  invariant clicksPos : 1 ≤ clicks
+
+  view =>
+    <div class="demo">
+      <SearchBar bind:query={query} onClear={query := ""} onSubmitQuery={picked := ·}/>
+      <PickerBox bind:filter={query} onPick={picked := ·}/>
+      <Accordion heading="Details" extra={<span>!</span>}>
+        <button class="inner" onClick={.bump}>{clicks}</button>
+      </Accordion>
+      <div>{rows.map fun r => <RowItem key={r.id} state={r}/>}</div>
+    </div>
+
+-- Verify hoisted stateful sub-component state, two-way `bind:`, and `event` forwarding work synchronously!
+def step1 := CompositeDemo.update CompositeDemo.init (._sub_0 (._emit (.set_filter "lean4")))
+#guard step1.query == "lean4"
+def step2 := CompositeDemo.update step1 (._sub_0 (._emit (.onPick "lean4")))
+#guard step2.picked == "lean4"
+-- Toggling hoisted `<Accordion>` opens its panel and exposes parent-wired `{children}`
+#guard !(Html.render (CompositeDemo.view CompositeDemo.init)).contains "class=\"panel\""
+def step3 := CompositeDemo.update step2 (._sub_1 .toggle)
+#guard (Html.render (CompositeDemo.view step3)).contains "class=\"panel\""
+-- Ephemeral field `scratch` resets to `init` (`99`) across SSR dehydration while `query` and `clicks` round-trip!
+#guard (CompositeDemo.app.rehydrate (CompositeDemo.app.dehydrate { step3 with clicks := 5, scratch := 0 })).map
+  (fun s => (s.query, s.clicks, s.scratch)) == some ("lean4", 5, 99)
+
+-- `<Await>` JSX tag on `Resource` and `Cached` + `.val`-free `Field` rendering
+def awaitSample (r : Resource Ticket) : Html Unit :=
+  <Await of={r} as={t} loading={<p>Wait</p>} failed={fun e => <p class="err">{e}</p>}>
+    <article><h2>{t.title}</h2><span>{t.priority}</span></article>
+  </Await>
+
+#guard (Html.render (awaitSample .loading)).contains "<p>Wait</p>"
+#guard (Html.render (awaitSample (.failed "boom"))).contains "<p class=\"err\">boom</p>"
+
 end SyntaxChecks

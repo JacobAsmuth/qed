@@ -71,7 +71,7 @@ server Catalog
         return fail("book not found")
       if books[idx].stock < qty
         return fail("out of stock")
-      return books[idx].id.val
+      return books[idx].id
     let _ = await CloudflareD1.query(cfAccount, d1Db, D1Query(
       sql = "INSERT INTO orders (book_id, qty) VALUES (?, ?)",
       params = [bookId, toString(qty)])) catch _
@@ -100,95 +100,76 @@ server Catalog
       return nb
     return created
 
-structure Model where
-  route     : R
-  books     : Resource (Array Book)
-  current   : Resource Book
-  statusMsg : String
-
-def init : Model :=
-  { route := .catalog, books := .idle, current := .idle, statusMsg := "" }
-
-inductive Msg where
-  | routed     (r : R)
-  | gotCatalog (r : Resource (Array Book))
-  | gotBook    (r : Resource (Option Book))
-  | orderOne   (idx : Nat)
-  | ordered    (idx : Nat) (r : Resource Book)
-
-def transition (m : Model) : Msg → Model × Cmd Msg := steps
-  | .routed route =>
-      match route with
-      | .catalog =>
-          ({ m with route := .catalog, books := .loading },
-           Catalog.list Msg.gotCatalog)
-      | .detail idx =>
-          ({ m with route := .detail idx, current := .loading },
-           Catalog.findAt idx Msg.gotBook)
-  | .gotCatalog r => { m with books := r }
-  | .gotBook r =>
-      let cur : Resource Book := match r with
-        | .idle        => .idle
-        | .loading     => .loading
-        | .ok (some b) => .ok b
-        | .ok none     => .failed "Book not found"
-        | .failed e    => .failed e
-      { m with current := cur }
-  | .orderOne idx =>
-      ({ m with statusMsg := "Ordering…" },
-       Catalog.order idx 1 (Msg.ordered idx))
-  | .ordered idx r =>
-      match r with
-      | .ok updated =>
-          let nextBooks := m.books.map fun arr =>
-            if h : idx < arr.size then arr.set idx updated else arr
-          { m with books := nextBooks, statusMsg := s!"Ordered {updated.title}" }
-      | .failed err =>
-          { m with statusMsg := s!"Order failed: {err}" }
-      | _ => m
-
 def shell : Style := css [
-  maxWidth (rem 42), margin "2rem auto", fontFamily "system-ui, sans-serif", lineHeight "1.5" ]
+  maxWidth (rem 42), margin (rem 2) .auto, fontFamily "system-ui, sans-serif", lineHeight 1.5 ]
 def rowStyle : Style := css [
-  display .flex, gap (rem 1), padding "0.75rem 1rem", border "1px solid #ddd",
-  radius (px 8), marginBottom "0.75rem" ]
+  display .flex, gap (rem 1), padding (rem 0.75) (rem 1), border "1px solid #ddd",
+  radius (px 8), marginBottom (rem 0.75) ]
 def btnStyle : Style := css [
-  padding "0.35rem 0.75rem", radius (px 6), border "1px solid #06c" ]
+  padding (rem 0.35) (rem 0.75), radius (px 6), border "1px solid #06c" ]
 
-def bookList (books : Array Book) : Html Msg :=
-  <ul class="books">{books.map fun b =>
-    <li key={b.id.val} {rowStyle} class="book-row">
-      <a href={R.detail b.slot.val} class="book-title">{b.title.val}</a>
-      <span class="book-stock">{s!"Stock: {b.stock.val}"}</span>
-      <button {btnStyle} class="order-btn" onClick={Msg.orderOne b.slot.val}>Order copy</button>
-    </li>}</ul>
+component BookRow where
+  prop book : Book
+  event onOrder
+  view =>
+    <li {rowStyle} class="book-row">
+      <a href={R.detail book.slot} class="book-title">{book.title}</a>
+      <span class="book-stock">{s!"Stock: {book.stock}"}</span>
+      <button {btnStyle} class="order-btn" onClick={onOrder}>Order copy</button>
+    </li>
 
-def bookDetail (b : Book) : Html Msg :=
-  <article class="book-detail">
-    <h2>{b.title.val}</h2>
-    <p class="detail-stock">{s!"In stock: {b.stock.val}"}</p>
-  </article>
+component BookDetail where
+  prop book : Book
+  view =>
+    <article class="book-detail">
+      <h2>{book.title}</h2>
+      <p class="detail-stock">{s!"In stock: {book.stock}"}</p>
+    </article>
 
-def Storefront : App Model Msg :=
-  ui init transition (onRoute := Msg.routed) fun m =>
+app Storefront where
+  route route : R := .catalog
+    | .catalog    => books := .loading, perform (Catalog.list (books := ·))
+    | .detail idx => current := .loading, perform (Catalog.findAt idx (current := ·))
+  state books     : Resource (Array Book) := .idle
+  state current   : Resource Book := .idle
+  state statusMsg := ""
+
+  action orderOne (idx : Nat) =>
+    statusMsg := "Ordering…"
+    perform (Catalog.order idx 1 (.ordered idx))
+
+  action ordered (idx : Nat) (r : Resource Book) =>
+    match r with
+    | .ok updated =>
+        books := books.map fun arr => if h : idx < arr.size then arr.set idx updated else arr
+        statusMsg := s!"Ordered {updated.title}"
+    | .failed err => statusMsg := s!"Order failed: {err}"
+    | _ => ()
+
+  view =>
     <div {shell} class="cloudbooks">
       <nav class="topnav">
         <a href={R.catalog} class="home-link">CloudBooks</a>
       </nav>
-      <p class="status">{m.statusMsg}</p>
-      {match m.route with
+      <p class="status">{statusMsg}</p>
+      {match route with
        | .catalog =>
            <section class="catalog">
              <h1>Verified Cloud Bookstore</h1>
-             {m.books.view (fun arr => bookList arr)
-               (loading := <p class="loading">Loading catalog…</p>)
-               (failed  := fun e => <p class="error">{e}</p>)}
+             <Await of={books} as={arr}
+               loading={<p class="loading">Loading catalog…</p>}
+               failed={fun e => <p class="error">{e}</p>}>
+               <ul class="books">{arr.map fun b =>
+                 <BookRow key={b.id} book={b} onOrder={.orderOne b.slot}/>}</ul>
+             </Await>
            </section>
        | .detail _ =>
            <section class="detail">
-             {m.current.view (fun b => bookDetail b)
-               (loading := <p class="loading">Loading book…</p>)
-               (failed  := fun e => <p class="error">{e}</p>)}
+             <Await of={current} as={b}
+               loading={<p class="loading">Loading book…</p>}
+               failed={fun e => <p class="error">{e}</p>}>
+               <BookDetail book={b}/>
+             </Await>
            </section>}
     </div>
 

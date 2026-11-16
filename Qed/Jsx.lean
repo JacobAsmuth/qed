@@ -20,7 +20,7 @@ def jsxText.parenthesizer : Parenthesizer := Parenthesizer.visitToken
 
 def jsxNameFn : ParserFn := fun c s =>
   let startPos := s.pos
-  let s := takeWhile1Fn (fun ch => ch.isAlphanum || ch == '-' || ch == '_' || ch == '.')
+  let s := takeWhile1Fn (fun ch => ch.isAlphanum || ch == '-' || ch == '_' || ch == '.' || ch == ':')
     "tag or attribute name" c s
   if s.hasError then s else mkNodeToken `Qed.Jsx.jsxName startPos true c s
 
@@ -66,7 +66,10 @@ syntax (name := withChildren) "<" jsxName jsxAttr* ">" jsxChild* "</" jsxName ">
 
 syntax:max (name := jsxTerm) atomic(jsxElement) : term
 
-private def tokenVal : Syntax → String
+syntax qedCompProp := str "=" term
+syntax (name := qedCompTerm) "qedComp%" str str num "[" qedCompProp,* "]" term : term
+
+def tokenVal : Syntax → String
   | .node _ _ #[.atom _ v] => v
   | .atom _ v              => v
   | _                      => ""
@@ -106,7 +109,7 @@ private def attrHelper? (n : String) : Option Name :=
   else if helperAttrs.contains n then some (Name.mkStr2 "Qed" n)
   else none
 
-private def childCtxOfRootTag (tag : String) : HtmlCtx :=
+def childCtxOfRootTag (tag : String) : HtmlCtx :=
   match stepHtmlCtx {} tag with
   | some ctx => ctx
   | none =>
@@ -116,6 +119,11 @@ private def childCtxOfRootTag (tag : String) : HtmlCtx :=
       else if tag == "thead" || tag == "tbody" || tag == "tfoot" then { mode := .tableSection }
       else if tag == "tr" then { mode := .tableRow }
       else {}
+
+def ctxOfPath (path : String) : Option (String × HtmlCtx) :=
+  match path.splitOn "/" with
+  | [] | [""] => none
+  | root :: rest => rest.foldlM (fun (_, c) t => (t, ·) <$> stepHtmlCtx c t) (root, childCtxOfRootTag root)
 
 private def checkSafeAttrName (ref : Syntax) (name : String) : MacroM Unit := do
   unless isSafeAttrName name do
@@ -166,48 +174,41 @@ mutual
 
 partial def expandJsxIn (stx : Syntax) : MacroM Syntax := do
   if stx.getKind == ``jsxTerm then
-    elementToTerm none stx[0]
+    elementToTerm "" none stx[0]
   else
     match stx with
     | .node info kind args => return .node info kind (← args.mapM expandJsxIn)
     | other                => return other
 
-partial def expandJsxExpr (parentCtx? : Option (String × HtmlCtx)) (fallback : MacroM Term)
+partial def expandJsxExpr (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (fallback : MacroM Term)
     (stx : Syntax) : MacroM (Term × Bool) := do
   if stx.getKind == ``jsxTermExpr then
     let raw := stx[0]
     if raw.getKind == ``jsxTerm && raw[0].getKind == ``jsxFragment then
-      let listT ← childrenToTerm parentCtx? raw[0][1] raw[0][2].getArgs
+      let listT ← childrenToTerm pPath parentCtx? raw[0][1] raw[0][2].getArgs
       return (listT, true)
     if raw.getKind == ``jsxTerm then
-      return (← elementToTerm parentCtx? raw[0], false)
+      return (← elementToTerm pPath parentCtx? raw[0], false)
     let exp ← expandJsxIn raw
-    return (⟨exp⟩, isMapCall exp)
-  else if stx.getKind == ``jsxIfLet then
-    let pat   : Term := ⟨← expandJsxIn stx[2]⟩
-    let scrut : Term := ⟨← expandJsxIn stx[4]⟩
-    let (tT, isListT) ← expandJsxExpr parentCtx? fallback stx[6]
-    if stx[7].getNumArgs == 2 then
-      let (eT, isListE) ← expandJsxExpr parentCtx? fallback stx[7][1]
-      return (← `(if let $pat := $scrut then $tT else $eT), isListT || isListE)
+    let isChildren := raw.isIdent && raw.getId.eraseMacroScopes == `children
+    return (⟨exp⟩, isMapCall exp || isChildren)
+  else if stx.getKind == ``jsxIfLet || stx.getKind == ``jsxIf then
+    let isLet := stx.getKind == ``jsxIfLet
+    let (tT, isListT) ← expandJsxExpr pPath parentCtx? fallback stx[if isLet then 6 else 4]
+    let elseOpt := stx[if isLet then 7 else 5]
+    let (eT, isListE) ← if elseOpt.getNumArgs == 2 then
+        expandJsxExpr pPath parentCtx? fallback elseOpt[1]
+      else pure (← if isListT then `([]) else fallback, isListT)
+    let res ← if isLet then
+      let pat : Term := ⟨← expandJsxIn stx[2]⟩
+      let scrut : Term := ⟨← expandJsxIn stx[4]⟩
+      `(if let $pat := $scrut then $tT else $eT)
     else
-      let defE ← if isListT then `([]) else fallback
-      return (← `(if let $pat := $scrut then $tT else $defE), isListT)
-  else if stx.getKind == ``jsxIf then
-    let hasH := stx[1].getNumArgs > 0
-    let cond : Term := ⟨← expandJsxIn stx[2]⟩
-    let (tT, isListT) ← expandJsxExpr parentCtx? fallback stx[4]
-    let (eT, isListE) ←
-      if stx[5].getNumArgs == 2 then
-        expandJsxExpr parentCtx? fallback stx[5][1]
-      else do
-        let defE ← if isListT then `([]) else fallback
-        pure (defE, isListT)
-    let res ← if hasH then
-      let hId : Ident := ⟨stx[1][0][0]⟩
-      `(if $hId:ident : $cond then $tT else $eT)
-    else
-      `(if $cond then $tT else $eT)
+      let cond : Term := ⟨← expandJsxIn stx[2]⟩
+      if stx[1].getNumArgs > 0 then
+        let hId : Ident := ⟨stx[1][0][0]⟩
+        `(if $hId:ident : $cond then $tT else $eT)
+      else `(if $cond then $tT else $eT)
     return (res, isListT || isListE)
   else
     let exp ← expandJsxIn stx
@@ -221,7 +222,7 @@ partial def expandAttrVal (valNode : Syntax) (fallback : MacroM Term) : MacroM T
     Macro.throwErrorAt inner
       "`field := …` / `+=` / `-=` mutates component state; it only has meaning inside a `component … view =>` body"
   else if inner.getKind == ``attrValExpr then
-    return (← expandJsxExpr none fallback inner[1]).1
+    return (← expandJsxExpr "" none fallback inner[1]).1
   else
     Macro.throwUnsupported
 
@@ -231,7 +232,7 @@ partial def attrsToTerms (rawAttrs : Array Syntax) (tag : String := "") : MacroM
   let mut out : Array Term := #[]
   for stx in rawAttrs do
     if stx.getKind == ``attrSplice then
-      let (t, _) ← expandJsxExpr none (`(Qed.Attr.empty)) stx[1]
+      let (t, _) ← expandJsxExpr "" none (`(Qed.Attr.empty)) stx[1]
       out := out.push t
     else
       let name := tokenVal stx[0]
@@ -243,21 +244,13 @@ partial def attrsToTerms (rawAttrs : Array Syntax) (tag : String := "") : MacroM
         if vT.raw.isIdent then
           Macro.throwErrorAt vT
             s!"`bind=\{{vT.raw.getId}}` shorthands state binding inside a `component`; in an explicit `ui` view, pass `bind=\{({vT.raw.getId}, .edit)}`"
-        match unpackPair? vT with
-        | some (valE, setE) =>
-            if isCheck then
-              out := out.push (← `(Qed.checked $valE))
-              out := out.push (← `(Qed.onCheck $setE))
-            else
-              out := out.push (← `(Qed.value $valE))
-              out := out.push (← `($(mkCIdent textEvt) $setE))
-        | none =>
-            if isCheck then
-              out := out.push (← `(Qed.checked ($vT).1))
-              out := out.push (← `(Qed.onCheck ($vT).2))
-            else
-              out := out.push (← `(Qed.value ($vT).1))
-              out := out.push (← `($(mkCIdent textEvt) ($vT).2))
+        let (valE, setE) ← match unpackPair? vT with
+          | some p => pure p
+          | none   => pure (← `(($vT).1), ← `(($vT).2))
+        let valHelper := if isCheck then ``Qed.checked else ``Qed.value
+        let evtHelper := if isCheck then ``Qed.onCheck else textEvt
+        out := out.push (← `($(mkCIdent valHelper) $valE))
+        out := out.push (← `($(mkCIdent evtHelper) $setE))
       else if valNode.getNumArgs == 0 then
         if flagAttrs.contains name then
           out := out.push (← `($(mkCIdent (Name.mkStr2 "Qed" name)) true))
@@ -290,7 +283,7 @@ partial def isMapCall (stx : Syntax) : Bool :=
     | _ => false
   else false
 
-partial def collectKidParts (parentCtx? : Option (String × HtmlCtx)) (opener : Syntax)
+partial def collectKidParts (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (opener : Syntax)
     (kids : Array Syntax) : MacroM (Array KidPart) := do
   let mut parts : Array KidPart := #[]
   let mut prev := opener
@@ -314,11 +307,11 @@ partial def collectKidParts (parentCtx? : Option (String × HtmlCtx)) (opener : 
       if isJsxElementKid k then
         let el := k[0]
         if el.getKind == ``jsxFragment then
-          parts := parts ++ (← collectKidParts parentCtx? el[1] el[2].getArgs)
+          parts := parts ++ (← collectKidParts pPath parentCtx? el[1] el[2].getArgs)
         else
-          parts := parts.push (.single (← elementToTerm parentCtx? el))
+          parts := parts.push (.single (← elementToTerm pPath parentCtx? el))
       else
-        let (t, isList) ← expandJsxExpr parentCtx? (`(Qed.Html.text "")) k[0][1]
+        let (t, isList) ← expandJsxExpr pPath parentCtx? (`(Qed.Html.text "")) k[0][1]
         if isMapCall t.raw then
           parts := parts.push (.many (← `(($t).toList)))
         else if isList then
@@ -328,14 +321,14 @@ partial def collectKidParts (parentCtx? : Option (String × HtmlCtx)) (opener : 
     prev := k
   return parts
 
-partial def childrenToTerm (parentCtx? : Option (String × HtmlCtx)) (opener : Syntax)
+partial def childrenToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (opener : Syntax)
     (kids : Array Syntax) : MacroM Term := do
   if kids.size == 1 && !isJsxTextKid kids[0]! && !isJsxElementKid kids[0]! then
-    let (t, isList) ← expandJsxExpr parentCtx? (`(Qed.Html.text "")) kids[0]![0][1]
+    let (t, isList) ← expandJsxExpr pPath parentCtx? (`(Qed.Html.text "")) kids[0]![0][1]
     if isMapCall t.raw then return ⟨← `(($t).toList)⟩
     else if isList then return t
     else return ⟨← `([$t])⟩
-  let parts ← collectKidParts parentCtx? opener kids
+  let parts ← collectKidParts pPath parentCtx? opener kids
   if !parts.any (fun | .many _ => true | .single _ => false) then
     let singles := parts.filterMap fun | .single t => some t | .many _ => none
     return ← `([$singles,*])
@@ -355,79 +348,75 @@ partial def childrenToTerm (parentCtx? : Option (String × HtmlCtx)) (opener : S
   | []      => `([])
   | l :: ls => ls.foldlM (init := l) fun acc x => `($acc ++ $x)
 
-partial def componentToTerm (parentCtx? : Option (String × HtmlCtx)) (stx : Syntax) (tag : String)
-    (attrStxs : Array Syntax) (kids : Array Syntax) : MacroM Term := do
-  let cName := (tag.splitOn ".").foldl Name.str Name.anonymous
-  let cId (sub : Name) : Term := ⟨mkIdent (cName ++ sub)⟩
-  unless kids.isEmpty do
-    Macro.throwErrorAt stx s!"<{tag}>: a component tag renders the component's own view, \
-      so it takes no children; write it self-closing (<{tag} …/>)"
-  let mut props    : Array (Syntax × String × Term) := #[]
-  let mut key?     : Option Term := none
-  let mut state?   : Option Term := none
-  let mut initial? : Option Term := none
-  let mut onMsg?   : Option Term := none
-  let mut onEmit?  : Option Term := none
+partial def expandAwaitTag (pPath : String) (parentCtx? : Option (String × HtmlCtx))
+    (stx opener : Syntax) (attrStxs kids : Array Syntax) : MacroM Term := do
+  let mut of?      : Option Term := none
+  let mut asId?    : Option Ident := none
+  let mut loading? : Option Term := none
+  let mut failed?  : Option Term := none
+  let mut idle?    : Option Term := none
+  for a in attrStxs do
+    if a.getKind == ``attrSplice then
+      Macro.throwErrorAt a "<Await> does not accept spliced HTML attributes"
+    let name := tokenVal a[0]
+    if a[1].getNumArgs == 0 then
+      Macro.throwErrorAt a s!"<Await>: `{name}` requires a value"
+    let v ← expandAttrVal a[1] (`(""))
+    match name with
+    | "of" | "value" => of? := some v
+    | "as"           =>
+        if v.raw.isIdent then asId? := some ⟨v.raw⟩
+        else if let some s := v.raw.isStrLit? then asId? := some (mkIdentFrom v (Name.mkSimple s))
+        else Macro.throwErrorAt v "`as` expects a variable name (`as={val}` or `as=\"val\"`)"
+    | "loading"      => loading? := some v
+    | "failed"       => failed? := some v
+    | "idle"         => idle? := some v
+    | _              => Macro.throwErrorAt a[0] s!"<Await>: unknown attribute `{name}` (expected of, as, loading, failed, idle)"
+  let some ofT := of? | Macro.throwErrorAt stx "<Await> requires `of={resource}`"
+  let parts ← collectKidParts pPath parentCtx? opener kids
+  let singleKid ← match parts with
+    | #[.single t] => pure t
+    | _ => Macro.throwErrorAt stx "<Await> expects a single child element (with `as={val}`) or `{fun val => …}`"
+  let readyT ← match asId? with
+    | some b => `(fun $b:ident => $singleKid)
+    | none   => pure singleKid
+  let loadT ← loading?.getDM `(Qed.Html.text "Loading…")
+  let failT ← match failed? with
+    | none => `((fun (e : String) => Qed.Html.text e))
+    | some f =>
+        let isEl := f.raw.getKind == ``qedCompTerm ||
+          (f.raw.getKind == ``Lean.Parser.Term.app &&
+            (f.raw[0].getId == ``Qed.el || f.raw[0].getKind == ``qedCompTerm))
+        if isEl then `((fun (_ : String) => $f)) else pure f
+  let idleT ← idle?.getDM `(Qed.Html.empty)
+  `($(mkIdent `Qed.Resource.awaitView) $ofT $readyT $loadT $failT $idleT)
+
+partial def componentToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx))
+    (stx opener : Syntax) (tag : String) (attrStxs kids : Array Syntax) : MacroM Term := do
+  if tag == "Await" then
+    return ← expandAwaitTag pPath parentCtx? stx opener attrStxs kids
+  let mut compProps : Array (TSyntax ``qedCompProp) := #[]
   for a in attrStxs do
     if a.getKind == ``attrSplice then
       Macro.throwErrorAt a s!"<{tag}>: a component tag takes props (field=\{…}, key, \
         onEmit, state, onMsg); a spliced attribute belongs on an HTML element"
-    let name := tokenVal a[0]
+    let nameLit := Syntax.mkStrLit (tokenVal a[0]) (info := a[0].getHeadInfo)
     let valNode := a[1]
     let v : Term ←
       if valNode.getNumArgs == 0 then `(Bool.true)
       else expandAttrVal valNode (`(""))
-    match name with
-    | "key"     => key? := some v
-    | "state"   => state? := some v
-    | "initial" => initial? := some v
-    | "onMsg"   => onMsg? := some v
-    | "onEmit"  => onEmit? := some v
-    | _         => props := props.push (a[0], name, v)
-  let fids := props.map fun (_, n, _) => mkIdent (Name.mkSimple n)
-  let vals := props.map fun (_, _, v) => v
-  let propValues ← `(({ $[$fids:ident := $vals],* } : $(cId `Props)))
-  match state? with
-  | some st =>
-      if initial?.isSome then
-        Macro.throwErrorAt stx "`initial` seeds local state; it cannot accompany `state`"
-      if onEmit?.isSome then
-        Macro.throwErrorAt stx s!"<{tag} state=\{…}>: a parent-owned component routes \
-          every event through onMsg, it has no separate emit channel"
-      match onMsg? with
-      | none =>
-          Macro.throwErrorAt stx s!"<{tag} state=\{…}> needs onMsg=\{…}: the parent Msg \
-            constructor `(k : String) (msg : {tag}.Msg)` its events route through"
-      | some route =>
-          match key? with
-          | some k => `($(cId `renderTag) $propValues $route $st (toString $k))
-          | none   => `($(cId `renderTag) $propValues $route $st)
-  | none =>
-      if onMsg?.isSome then
-        Macro.throwErrorAt stx s!"<{tag}>: onMsg routes a parent-owned row; bind one with \
-          state=\{…}, or receive outputs with onEmit=\{…}"
-      -- Local component mounts emit `<div data-qed-local="..."></div>`; validate `div` in parentCtx!
-      discard <| validateHtmlTag stx[1] "div" parentCtx?
-      let keyT : Term ← match key? with
-        | some k => `(toString $k)
-        | none   => pure ⟨Syntax.mkStrLit s!"@{(stx.getPos?.map (·.byteIdx)).getD 0}"⟩
-      let mountBase : Term ← match onEmit? with
-        | some h => `($(cId `mountWith) $keyT (fun out => $h out))
-        | none   => `($(cId `mount) $keyT)
-      -- Unresolved `mkIdent`: `Qed.Component` / `Qed.Runtime` sit above `Qed.Jsx` in the import graph.
-      let mountBase ← match initial? with
-        | none => pure mountBase
-        | some seed => `($(mkIdent `Qed.Attr.localInit) $mountBase ($seed : $(cId `State)))
-      let mountT ← `($(mkIdent `Qed.Attr.localProps) $mountBase $propValues)
-      `(Qed.el "div" [Qed.key $keyT, $mountT] [])
+    compProps := compProps.push (← `(qedCompProp| $nameLit:str = $v))
+  let kidsT ← if kids.isEmpty then `([]) else childrenToTerm "" none opener kids
+  let posLit := Syntax.mkNumLit (toString ((stx.getPos?.map (·.byteIdx)).getD 0))
+  `(qedComp% $(Syntax.mkStrLit tag) $(Syntax.mkStrLit pPath) $posLit [$[$compProps],*] $kidsT)
 
-partial def elementToTerm (parentCtx? : Option (String × HtmlCtx)) (stx : Syntax) : MacroM Term := do
+partial def elementToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx : Syntax) : MacroM Term := do
   if stx.getKind == ``jsxFragment then
-    childrenToTerm parentCtx? stx[1] stx[2].getArgs
+    childrenToTerm pPath parentCtx? stx[1] stx[2].getArgs
   else if stx.getKind == ``selfClosing then
     let tag := tokenVal stx[1]
     if !tag.isEmpty && tag.front.isUpper then
-      return ← componentToTerm parentCtx? stx tag stx[2].getArgs #[]
+      return ← componentToTerm pPath parentCtx? stx stx[1] tag stx[2].getArgs #[]
     discard <| validateHtmlTag stx[1] tag parentCtx?
     let attrs ← attrsToTerms stx[2].getArgs tag
     `(Qed.el $(Syntax.mkStrLit tag) [$attrs,*] [])
@@ -437,12 +426,13 @@ partial def elementToTerm (parentCtx? : Option (String × HtmlCtx)) (stx : Synta
     if tag != closeTag then
       Macro.throwErrorAt stx[6] s!"mismatched closing tag: expected </{tag}>, found </{closeTag}>"
     if !tag.isEmpty && tag.front.isUpper then
-      return ← componentToTerm parentCtx? stx tag stx[2].getArgs stx[4].getArgs
+      return ← componentToTerm pPath parentCtx? stx stx[3] tag stx[2].getArgs stx[4].getArgs
     if isVoidTag tag then
       Macro.throwErrorAt stx s!"<{tag}> is an HTML5 void element and cannot have children; write it self-closing (<{tag} …/>)"
     let childCtx ← validateHtmlTag stx[1] tag parentCtx?
     let attrs ← attrsToTerms stx[2].getArgs tag
-    let kids ← childrenToTerm (some (tag, childCtx)) stx[3] stx[4].getArgs
+    let nextPath := if pPath.isEmpty then tag else pPath ++ "/" ++ tag
+    let kids ← childrenToTerm nextPath (some (tag, childCtx)) stx[3] stx[4].getArgs
     `(Qed.el $(Syntax.mkStrLit tag) [$attrs,*] $kids)
   else
     Macro.throwUnsupported
@@ -450,7 +440,7 @@ partial def elementToTerm (parentCtx? : Option (String × HtmlCtx)) (stx : Synta
 end
 
 @[macro jsxTerm] def expandJsxTerm : Macro := fun stx => do
-  return (← elementToTerm none stx[0])
+  return (← elementToTerm "" none stx[0])
 
 private partial def hasJsx : Syntax → Bool
   | .node _ kind args => kind == ``jsxTerm || args.any hasJsx

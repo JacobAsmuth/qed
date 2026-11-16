@@ -108,6 +108,8 @@ inductive Html (msg : Type) where
 
 def Attr.empty : Attr msg := .cls ""
 
+abbrev Html.empty : Html msg := .text ""
+
 def Html.ofOption : Option (Html msg) → Html msg
   | some h => h
   | none   => .text ""

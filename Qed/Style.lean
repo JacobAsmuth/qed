@@ -24,18 +24,40 @@ mutual
     | i :: is => Item.render i ++ " " ++ Item.renderList is
 end
 
+structure CssNum where raw : String deriving Inhabited
+
+namespace CssNum
+private def ofMantissaExp (m e : Nat) : String :=
+  if e == 0 then toString m else
+  let ds := (toString m).toList
+  let ps := List.replicate (e + 1 - ds.length) '0' ++ ds
+  let fp := ((ps.drop (ps.length - e)).reverse.dropWhile (· == '0')).reverse
+  String.ofList (ps.take (ps.length - e)) ++ if fp.isEmpty then "" else "." ++ String.ofList fp
+
+instance (n : Nat) : OfNat CssNum n := ⟨⟨toString n⟩⟩
+instance : Coe Nat CssNum    := ⟨(⟨toString ·⟩)⟩
+instance : Coe Int CssNum    := ⟨(⟨toString ·⟩)⟩
+instance : Coe String CssNum := ⟨CssNum.mk⟩
+instance : ToString CssNum   := ⟨CssNum.raw⟩
+instance : Neg CssNum        := ⟨fun x => ⟨if x.raw.startsWith "-" || x.raw == "0" then x.raw else "-" ++ x.raw⟩⟩
+instance : OfScientific CssNum := ⟨fun m neg e => ⟨if neg then ofMantissaExp m e else toString (m * 10 ^ e)⟩⟩
+end CssNum
+
 structure Len where raw : String
 deriving Inhabited
 instance : Coe String Len := ⟨Len.mk⟩
+instance : Coe Len CssNum := ⟨fun l => ⟨l.raw⟩⟩
+instance : OfNat Len 0 := ⟨⟨"0"⟩⟩
 instance : ToString Len := ⟨Len.raw⟩
+def Len.auto : Len := ⟨"auto"⟩
 
-def px  (n : Int) : Len := ⟨toString n ++ "px"⟩
-def rem (n : Int) : Len := ⟨toString n ++ "rem"⟩
-def em  (n : Int) : Len := ⟨toString n ++ "em"⟩
-def pct (n : Int) : Len := ⟨toString n ++ "%"⟩
-def vh  (n : Int) : Len := ⟨toString n ++ "vh"⟩
-def vw  (n : Int) : Len := ⟨toString n ++ "vw"⟩
-def fr  (n : Int) : Len := ⟨toString n ++ "fr"⟩
+def px  (n : CssNum) : Len := ⟨n.raw ++ "px"⟩
+def rem (n : CssNum) : Len := ⟨n.raw ++ "rem"⟩
+def em  (n : CssNum) : Len := ⟨n.raw ++ "em"⟩
+def pct (n : CssNum) : Len := ⟨n.raw ++ "%"⟩
+def vh  (n : CssNum) : Len := ⟨n.raw ++ "vh"⟩
+def vw  (n : CssNum) : Len := ⟨n.raw ++ "vw"⟩
+def fr  (n : CssNum) : Len := ⟨n.raw ++ "fr"⟩
 
 structure Color where raw : String
 deriving Inhabited
@@ -44,7 +66,7 @@ instance : ToString Color := ⟨Color.raw⟩
 
 def hex  (s : String) : Color := ⟨"#" ++ s⟩
 def rgb  (r g b : Nat) : Color := ⟨s!"rgb({r}, {g}, {b})"⟩
-def rgba (r g b : Nat) (a : String) : Color := ⟨s!"rgba({r}, {g}, {b}, {a})"⟩
+def rgba (r g b : Nat) (a : CssNum) : Color := ⟨s!"rgba({r}, {g}, {b}, {a.raw})"⟩
 
 structure Token where name : String
 deriving Inhabited
@@ -84,6 +106,11 @@ def Align.css : Align → String
 inductive BorderStyle | solid | dashed | dotted | double | none deriving Inhabited
 def BorderStyle.css : BorderStyle → String
   | .solid => "solid" | .dashed => "dashed" | .dotted => "dotted" | .double => "double" | .none => "none"
+
+instance : CoeFun Item (fun _ => Len → Item) where
+  coe
+    | .decl p v, l => .decl p (if l.raw.isEmpty then v else v ++ " " ++ l.raw)
+    | other,     _ => other
 
 def width         (l : Len) : Item := .decl "width" l.raw
 def height        (l : Len) : Item := .decl "height" l.raw
@@ -145,14 +172,14 @@ def transform           (v : String) : Item := .decl "transform" v
 def transition          (v : String) : Item := .decl "transition" v
 def font                (v : String) : Item := .decl "font" v
 def fontFamily          (v : String) : Item := .decl "font-family" v
-def fontWeight          (v : String) : Item := .decl "font-weight" v
-def lineHeight          (v : String) : Item := .decl "line-height" v
+def fontWeight          (v : CssNum) : Item := .decl "font-weight" v.raw
+def lineHeight          (v : CssNum) : Item := .decl "line-height" v.raw
 def textDecoration      (v : String) : Item := .decl "text-decoration" v
 def cursor              (v : String) : Item := .decl "cursor" v
 def overflow            (v : String) : Item := .decl "overflow" v
-def opacity             (v : String) : Item := .decl "opacity" v
-def zIndex              (v : String) : Item := .decl "z-index" v
-def flex                (v : String) : Item := .decl "flex" v
+def opacity             (v : CssNum) : Item := .decl "opacity" v.raw
+def zIndex              (v : CssNum) : Item := .decl "z-index" v.raw
+def flex                (v : CssNum) : Item := .decl "flex" v.raw
 def gridTemplateColumns (v : String) : Item := .decl "grid-template-columns" v
 def whiteSpace          (v : String) : Item := .decl "white-space" v
 

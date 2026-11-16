@@ -11,8 +11,14 @@ structure Field {α : Type} (p : α → Prop) where
   val : α
   ok  : p val
 
-instance {α : Type} {p : α → Prop} : CoeOut (Field p) α := ⟨Field.val⟩
+@[reducible] instance {msg : Type} : Coe Date (Html msg) := ⟨fun d => .text (toString d)⟩
+@[reducible] instance {α : Type} {p : α → Prop} : CoeOut (Field p) α := ⟨Field.val⟩
+@[reducible] instance {α msg : Type} {p : α → Prop} [Coe α (Html msg)] : CoeHTCT (Field p) (Html msg) := ⟨fun f => (f.val : Html msg)⟩
+@[reducible] instance {α : Type} {p : α → Prop} : CoeHTCT (Option (Field p)) (Option α) := ⟨Option.map Field.val⟩
 instance {α : Type} {p : α → Prop} [ToString α] : ToString (Field p) := ⟨fun f => toString f.val⟩
+instance {α : Type} {p : α → Prop} [BEq α] : BEq (Field p) := ⟨fun a b => a.val == b.val⟩
+instance {α : Type} {p : α → Prop} [DecidableEq α] : DecidableEq (Field p) :=
+  fun ⟨a, _⟩ ⟨b, _⟩ => if h : a = b then isTrue (by cases h; rfl) else isFalse (by intro heq; injection heq; exact h ‹_›)
 
 instance {α : Type} {p : α → Prop} [ToJson α] : ToJson (Field p) := ⟨fun f => toJson f.val⟩
 instance {α : Type} {p : α → Prop} [DecidablePred p] [FromJson α] : FromJson (Field p) :=

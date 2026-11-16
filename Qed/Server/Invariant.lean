@@ -22,6 +22,8 @@ class SrvLiftOpt (α : Type) (Inner : Type) where
   liftOpt : α → Option Inner
 
 @[inline] instance {Inner : Type} : SrvLiftOpt (Option Inner) Inner := ⟨id⟩
+@[inline] instance {Inner : Type} {p : Inner → Prop} : SrvLiftOpt (Qed.Field p) Inner := ⟨fun f => some f.val⟩
+@[inline] instance {Inner : Type} {p : Inner → Prop} : SrvLiftOpt (Option (Qed.Field p)) Inner := ⟨Option.map Qed.Field.val⟩
 @[inline] instance (priority := low) {Inner : Type} : SrvLiftOpt Inner Inner := ⟨Option.some⟩
 
 @[simp] theorem SrvLiftOpt.liftOpt_opt {Inner : Type} (x : Option Inner) :
@@ -194,12 +196,8 @@ private def unfoldSrvHelpersExpr (e : Expr) : MetaM Expr :=
       return .visit (sub.getAppArgs[1]!)
     if fn.isConstOf ``srvGetAt || fn.isConstOf ``SrvVal.val ||
        fn.isConstOf ``SrvIdx.toNat || fn.isConstOf ``SrvLiftOpt.liftOpt then
-      if let some u ← unfoldProjInst? sub then
-        let u' := if u.isAppOfArity ``id 2 then u.getAppArgs[1]! else u
-        return .visit u'
-      if let some u ← unfoldDefinition? sub then
-        let u' := if u.isAppOfArity ``id 2 then u.getAppArgs[1]! else u
-        return .visit u'
+      if let some u ← (do if let some x ← unfoldProjInst? sub then pure (some x) else unfoldDefinition? sub) then
+        return .visit (if u.isAppOfArity ``id 2 then u.getAppArgs[1]! else u)
     return .continue)
 
 open Lean Meta Elab Tactic in
@@ -270,32 +268,40 @@ open Lean Meta Elab Term Tactic in
 @[term_elab srvAutoFieldStx]
 def elabSrvAutoField : TermElab := fun stx expectedType? => do
   let valStx : Term := ⟨stx[1]⟩
-  let some expTy := expectedType?
-    | elabTerm valStx none
-  let expWhnf ← whnf expTy
-  if expWhnf.isAppOfArity ``Qed.Field 2 then
-    let args := expWhnf.getAppArgs
-    let innerTy := args[0]!
-    let predFn := args[1]!
-    let valExpr ← elabTermEnsuringType valStx (some innerTy)
-    synthesizeSyntheticMVarsNoPostponing
-    let valExpr ← instantiateMVars valExpr
-    let goalProp := mkApp predFn valExpr
-    let facts ← collectProofFacts #[valExpr]
-    let prfStx ← `(by
-      try qedUnfoldSrvHelpers
-      qedSimpArrayAndBool
-      qedDsimpCodecs
-      first | decide | omega | assumption | simp_all | (simp_all <;> omega) | (simp_all <;> decide))
-    let prfExpr ← try
-        withPosedFacts facts <| elabTermEnsuringType prfStx (some goalProp)
-      catch _ =>
-        throwErrorAt stx m!"cannot prove schema field refinement `{← ppExpr goalProp}`.\n\
-          Guard this mutation with an `if ...` check or `requires ...` precondition so Lean can verify it cannot violate the schema."
-    mkAppOptM ``Qed.Field.mk #[some innerTy, some predFn, some valExpr, some prfExpr]
-  else
-    try elabTermEnsuringType valStx (some expTy)
-    catch _ => elabTermEnsuringType (← `(Qed.Server.SrvVal.val $valStx)) (some expTy)
+  if let some expTy := expectedType? then
+    let expTy ← instantiateMVars expTy
+    if !expTy.getAppFn.isMVar then
+      let expWhnf ← whnf expTy
+      if expWhnf.isAppOfArity ``Qed.Field 2 then
+        let args := expWhnf.getAppArgs
+        let innerTy := args[0]!
+        let predFn := args[1]!
+        let valExpr ← elabTermEnsuringType valStx (some innerTy)
+        synthesizeSyntheticMVarsNoPostponing
+        let valExpr ← instantiateMVars valExpr
+        let goalProp := mkApp predFn valExpr
+        let facts ← collectProofFacts #[valExpr]
+        let prfStx ← `(by
+          try qedUnfoldSrvHelpers
+          qedSimpArrayAndBool
+          qedDsimpCodecs
+          first | decide | omega | assumption | simp_all | (simp_all <;> omega) | (simp_all <;> decide))
+        let prfExpr ← try
+            withPosedFacts facts <| elabTermEnsuringType prfStx (some goalProp)
+          catch _ =>
+            throwErrorAt stx m!"cannot prove schema field refinement `{← ppExpr goalProp}`.\n\
+              Guard this mutation with an `if ...` check or `requires ...` precondition so Lean can verify it cannot violate the schema."
+        return ← mkAppOptM ``Qed.Field.mk #[some innerTy, some predFn, some valExpr, some prfExpr]
+      else
+        return ← try elabTermEnsuringType valStx (some expTy)
+                 catch _ => elabTermEnsuringType (← `(Qed.Server.SrvVal.val $valStx)) (some expTy)
+  let e ← elabTerm valStx none
+  synthesizeSyntheticMVars (postpone := .yes)
+  let ty ← whnf (← instantiateMVars (← inferType e))
+  let e ← if ty.isAppOfArity ``Qed.Field 2 then mkAppM ``Qed.Field.val #[e] else pure e
+  match expectedType? with
+  | some expTy => ensureHasType expTy e
+  | none       => return e
 
 open Lean Meta Elab Term in
 private def proveBoundsFor (ref : Syntax) (arrExpr idxNatExpr : Expr) : TermElabM Expr := do

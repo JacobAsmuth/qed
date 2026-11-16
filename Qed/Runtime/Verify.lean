@@ -153,7 +153,7 @@ private def viewFrameworkUnfolds (env : Environment) : Array Name :=
     ``View.showIf, ``View.ofHtml, ``View.hasOpaque, ``View.hasOpaqueList,
     ``View.collectDyn, ``View.collectDynList, ``dynValGets,
     ``VAttr.eval, ``V.el, ``V.text, ``V.dyn, ``V.ifElse, ``V.showIf, ``V.static,
-    ``V.dynNode, ``V.memo, ``V.forEach, ``V.bindAttr, ``V.dynAttr,
+    ``V.dynNode, ``V.memo, ``V.render_forEach, ``View.isDyn, ``V.bindAttr, ``V.dynAttr,
     ``V.onClick', ``V.onInput', ``V.onCheck', ``SoundMemo.ofLawful,
     ``Qed.text, ``Qed.lazy, ``Qed.el, ``Qed.link, ``Qed.linkTo, ``Qed.theme,
     ``Qed.cls, ``Qed.attr, ``Qed.role, ``Qed.on, ``Qed.onValue, ``Qed.onClick, ``Qed.onInput,
@@ -170,6 +170,57 @@ private def viewFrameworkUnfolds (env : Environment) : Array Name :=
   ].filter env.contains
   core ++ opt
 
+private def viewValidSimpExtras (env : Environment) : Array Name :=
+  let base := #[
+    ``Qed.Url.isSafe, ``Qed.Url.parse?_isSome, ``Qed.containsCloseSeq_escapeRawText, ``Qed.toString_string,
+    ``Qed.Attr.valid_cls, ``Qed.Attr.valid_attr, ``Qed.Attr.valid_flag, ``Qed.Attr.valid_key,
+    ``Qed.Attr.valid_on, ``Qed.Attr.valid_onValue, ``Qed.Attr.valid_localCell,
+    ``Qed.Attr.valid_signalBind, ``Qed.Attr.valid_signalAttr, ``Qed.Attr.valid_empty, ``Qed.Attr.valid_ite,
+    ``Qed.Attr.validList_nil, ``Qed.Attr.validList_cons, ``Qed.Attr.validList_append,
+    ``Qed.Attr.validList_filter_nonkey, ``Qed.Attr.validList_map_attrMap, ``Qed.Attr.validList_prefixSignal,
+    ``Qed.Attr.valid_map, ``Qed.Attr.valid_prefixSignal,
+    ``Qed.Attr.isLocalCell_cls, ``Qed.Attr.isLocalCell_attr, ``Qed.Attr.isLocalCell_flag,
+    ``Qed.Attr.isLocalCell_key, ``Qed.Attr.isLocalCell_on, ``Qed.Attr.isLocalCell_onValue,
+    ``Qed.Attr.isLocalCell_localCell, ``Qed.Attr.isLocalCell_signalBind, ``Qed.Attr.isLocalCell_signalAttr,
+    ``Qed.Attr.isLocalCell_empty, ``Qed.Attr.isLocalCell_ite,
+    ``Qed.Attr.hasLocalCell_nil, ``Qed.Attr.hasLocalCell_cons, ``Qed.Attr.hasLocalCell_append,
+    ``Qed.Attr.hasLocalCell_filter_nonkey, ``Qed.Attr.hasLocalCell_map_attrMap, ``Qed.Attr.hasLocalCell_prefixSignal,
+    ``Qed.Html.mapChildren_isEmpty, ``Qed.Html.prefixSignalsList_isEmpty,
+    ``Qed.Html.validIn_map, ``Qed.Html.validListIn_mapChildren,
+    ``Qed.Html.validIn_prefixSignals, ``Qed.Html.validListIn_prefixSignalsList,
+    ``Qed.Html.validListIn_nil, ``Qed.Html.validListIn_cons, ``Qed.Html.validListIn_append,
+    ``Qed.Html.validIn_ite, ``Qed.Html.validListIn_ite, ``Qed.Html.validIn_ofOption,
+    ``Qed.Html.validListIn_map, ``Qed.Html.validListIn_toList_map, ``Qed.Html.validIn_withKey,
+    ``Qed.List.all_const_true,
+    ``Qed.validTextIn_normal, ``Qed.validTextIn_option, ``Qed.validTextIn_textarea,
+    ``Qed.validTextIn_svg, ``Qed.validTextIn_rawStyle, ``Qed.validTextIn_empty,
+    ``Qed.VAttr.eval_mapScope, ``Qed.View.render_mapScope, ``Qed.View.renderEach_mapScopeEach,
+    ``Qed.View.renderEach_map, ``Qed.View.render_ite, ``Qed.View.render_showIf,
+    ``Qed.View.collectDyn_showIf, ``Qed.View.renderSig_showIf, ``Qed.View.renderSigList_isEmpty,
+    ``Qed.Attr.validList_renderSigAttrs, ``Qed.Attr.hasLocalCell_renderSigAttrs,
+    ``Qed.V.render_memo, ``Qed.V.render_forEach,
+    ``reduceStepHtmlCtx, ``reduceIsVoidTag, ``reduceIsSafeAttrName, ``reduceIsUrlAttrName,
+    ``reduceIsSafeUrl, ``reduceContainsCloseSeq, ``reduceTagBlocksDirectSpan, ``reduceTagBlocksSpanSubtree,
+    ``Bool.and_eq_true, ``Bool.or_eq_true, ``Bool.not_eq_true',
+    ``Bool.true_and, ``Bool.and_true, ``Bool.false_and, ``Bool.and_false,
+    ``Bool.true_or, ``Bool.or_true, ``Bool.false_or, ``Bool.or_false,
+    ``Bool.not_false, ``Bool.not_true,
+    ``ite_true, ``ite_false, ``dite_true, ``dite_false, ``if_true, ``if_false,
+    ``List.map_cons, ``List.map_nil, ``List.map_append, ``List.map_map,
+    ``List.isEmpty_cons, ``List.isEmpty_nil, ``List.isEmpty_map,
+    ``List.all_cons, ``List.all_nil, ``List.zipIdx_cons, ``List.zipIdx_nil,
+    ``Array.toList_map, ``Array.isEmpty_empty, ``Array.isEmpty_push,
+    ``Option.map_some, ``Option.map_none, ``Option.isSome_some, ``Option.isSome_none,
+    ``Prod.fst, ``Prod.snd, ``Function.comp_apply, ``id_eq, ``eq_self, ``bne_iff_ne, ``beq_iff_eq
+  ]
+  let opt := #[
+    `Qed.Codec.render_valid_simp, `Qed.Codec.formFieldRow_validListIn,
+    `Qed.Attr.valid_localProps, `Qed.Attr.valid_localInit,
+    `Qed.Attr.valid_localMount, `Qed.Attr.valid_localMountWith,
+    `Qed.Router.isSafeUrl_toURL, `Qed.ToHref.isSafeUrl_toHref
+  ].filter env.contains
+  base ++ opt
+
 elab "qedUnfoldForValidHtml" : tactic => do
   for _ in [0:8] do
     if (← getGoals).isEmpty then return
@@ -184,22 +235,33 @@ elab "qedUnfoldForValidHtml" : tactic => do
       catch _ => pure false
     unless ok do return
 
-elab "qedProveValidHtmlCore" : tactic => do
-  evalTactic (← `(tactic| intros))
-  let env ← getEnv
-  let fw ← (viewFrameworkUnfolds env).mapM fun n =>
-    `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
-  for _ in [0:6] do
+private def runHtmlSimpLoop (maxIters : Nat)
+    (lemmas : Array (TSyntax `Lean.Parser.Tactic.simpLemma)) (useOnly : Bool) : TacticM Unit := do
+  for _ in [0:maxIters] do
     if (← getGoals).isEmpty then return
     let before ← (← getGoals).mapM fun g => g.withContext do instantiateMVars (← g.getType)
     evalTactic (← `(tactic| qedUnfoldForValidHtml))
     if (← getGoals).isEmpty then return
-    try evalTactic (← `(tactic| simp [$[$fw],*])) catch _ => pure ()
+    let stepTac ← if useOnly then `(tactic| simp only [$[$lemmas],*]) else `(tactic| simp [$[$lemmas],*])
+    try evalTactic stepTac catch _ => pure ()
     if (← getGoals).isEmpty then return
-    try evalTactic (← `(tactic| (split <;> try simp [$[$fw],*]))) catch _ => pure ()
+    let splitTac ← if useOnly then `(tactic| (split <;> try simp only [$[$lemmas],*]))
+      else `(tactic| (split <;> try simp [$[$lemmas],*]))
+    try evalTactic splitTac catch _ => pure ()
     if (← getGoals).isEmpty then return
     let after ← (← getGoals).mapM fun g => g.withContext do instantiateMVars (← g.getType)
     if before == after then break
+
+elab "qedProveValidHtmlCore" : tactic => do
+  evalTactic (← `(tactic| intros))
+  let env ← getEnv
+  let toLemma (n : Name) : TacticM (TSyntax `Lean.Parser.Tactic.simpLemma) :=
+    `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+  let fw ← (viewFrameworkUnfolds env).mapM toLemma
+  let onlySet ← ((viewFrameworkUnfolds env) ++ (viewValidSimpExtras env)).mapM toLemma
+  runHtmlSimpLoop 6 onlySet true
+  if !(← getGoals).isEmpty then
+    runHtmlSimpLoop 4 fw false
   if !(← getGoals).isEmpty then
     try evalTactic (← `(tactic| all_goals (first | rfl | decide))) catch _ => pure ()
 
@@ -233,7 +295,7 @@ elab "qedProveDehydrateView" : tactic => do
     `Qed.Dehydrate.full_project, `Qed.Dehydrate.slice_project, `Qed.Dehydrate.const_project,
     ``View.render, ``View.renderEach, ``VAttr.eval,
     ``V.el, ``V.text, ``V.dyn, ``V.ifElse, ``V.showIf, ``V.static,
-    ``V.dynNode, ``V.memo, ``V.forEach, ``View.showIf, ``View.ofHtml
+    ``V.dynNode, ``V.memo, ``V.render_forEach, ``View.isDyn, ``View.showIf, ``View.ofHtml
   ].filter env0.contains
   let pL ← projLemmas.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
   try evalTactic (← `(tactic| (simp only [$[$pL],*]; try rfl))) catch _ => pure ()
@@ -251,6 +313,10 @@ elab "qedProveDehydrateView" : tactic => do
         pure true
       catch _ => pure false
     unless ok do break
+  if !(← getGoals).isEmpty then
+    let onlySet ← (projLemmas ++ viewValidSimpExtras env0).mapM fun n =>
+      `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+    try evalTactic (← `(tactic| (simp only [$[$onlySet],*]; try rfl))) catch _ => pure ()
   if !(← getGoals).isEmpty then
     try evalTactic (← `(tactic| (simp; try rfl))) catch _ => pure ()
   let goals ← getUnsolvedGoals

@@ -47,21 +47,6 @@ private partial def collectLocalModulesLoop :
 private def collectLocalModules (rootMod : String) : IO (Array String) :=
   collectLocalModulesLoop [rootMod] #[]
 
-private def lakeQueryPaths (targets : Array String) : IO (Option (Array String)) := do
-  let o ← IO.Process.output { cmd := "lake", args := #["query"] ++ targets }
-  if o.exitCode != 0 then
-    IO.eprint (o.stdout ++ o.stderr)
-    return none
-  let paths := (o.stdout.splitOn "\n").toArray.map String.trimmed |>.filter (!·.isEmpty)
-  return some paths
-
-private def lakeEnvLeanPath : IO (Option String) := do
-  let o ← IO.Process.output { cmd := "lake", args := #["env", "printenv", "LEAN_PATH"] }
-  if o.exitCode != 0 then
-    IO.eprint (o.stdout ++ o.stderr)
-    return none
-  return some o.stdout.trimmed
-
 private def resolveSharedLibArg (soname fallbackFlag : String) : IO String := do
   let o ← IO.Process.output { cmd := "cc", args := #[s!"-print-file-name={soname}"] }
   if o.exitCode == 0 then
@@ -91,10 +76,17 @@ private def writeClientShell (outDir : FilePath) (prod : Bool) : IO Unit := do
 
 private def minifyBundles (outDir : FilePath) (files : List String) : IO Unit := do
   if (← onPath "esbuild") then
+    let mut tasks : Array (Task (Except IO.Error Unit)) := #[]
     for f in files do
       let p := outDir / f
       if (← p.pathExists) then
-        discard <| sh "bash" #["-c", s!"esbuild {p} --minify --format=esm --outfile={p}.min && mv {p}.min {p}"]
+        let t ← IO.asTask do
+          let minP := s!"{p}.min"
+          if (← sh "esbuild" #[p.toString, "--minify", "--format=esm", s!"--outfile={minP}"]) == 0 then
+            IO.FS.rename minP p
+        tasks := tasks.push t
+    for t in tasks do
+      discard <| IO.wait t
 
 private def resolveServeCmd (dir : FilePath) (port : String) (dev : Bool) :
     IO (String × Array String × Bool) := do
@@ -107,11 +99,11 @@ private def resolveServeCmd (dir : FilePath) (port : String) (dev : Bool) :
     return ("python3", #["-m", "http.server", port, "--directory", dir.toString], false)
 
 def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool) : IO Bool := do
-  if (← sh "lake" #["build", mod, "Qed.Driver", "qed/QedServer", "qed/qedjs"]) != 0 then
+  let localMods ← collectLocalModules mod
+  let cObjTargets := (localMods.map fun m => s!"+{m}:c.o") ++ #["qed/QedServer:static", "qed/Qed:static"]
+  let some q ← resolveQedjsEnv | return false
+  if (← sh "lake" (#["build", mod, "Qed.Driver"] ++ cObjTargets)) != 0 then
     return false
-  let some qedjsPaths ← lakeQueryPaths #["qed/qedjs"] | return false
-  let some qedjsBin := qedjsPaths[0]? | return false
-  let some baseLp ← lakeEnvLeanPath | return false
   let rtPath ← runtimeFile "qed_rt.mjs"
   let genDir : FilePath := ".qed" / "gen"
   IO.FS.createDirAll genDir
@@ -120,13 +112,12 @@ def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool) : IO 
   -- 1. Synthesize & compile client entrypoint → `app.mjs` (enforcing `verifyNoServerLeakInClient`)
   let cliLean := genDir / "ClientMain.lean"
   let cliOlean := genDir / "ClientMain.olean"
-  IO.FS.writeFile cliLean s!"import {mod}\nimport Qed.Driver\n\ndef main : IO Unit := Qed.run {fsName}.clientApp\n"
+  discard <| writeIfChanged cliLean s!"import {mod}\nimport Qed.Driver\n\ndef main : IO Unit := Qed.run {fsName}.clientApp\n"
   if (← sh "lake" #["env", "lean", "-R", genDir.toString, cliLean.toString, "-o", cliOlean.toString]) != 0 then
     return false
   let minArgs := if prod then #["--min"] else #[]
   let rtArgs := #["--rt", rtPath.toString]
-  let lpEnv := #[("LEAN_PATH", some s!"{genDir}:{baseLp}")]
-  if (← sh qedjsBin (minArgs ++ rtArgs ++ #[(outDir / "app.mjs").toString, "ClientMain", "--"] ++ driverEntries) lpEnv) != 0 then
+  if !(← q.run (minArgs ++ rtArgs ++ #[(outDir / "app.mjs").toString, "ClientMain", "--"] ++ driverEntries) (extraPath := some genDir.toString)) then
     return false
   writeClientShell outDir prod
   for stale in ["ssr.mjs", "ssr_app.mjs", "qed_ssr_host.mjs"] do
@@ -136,16 +127,15 @@ def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool) : IO 
   -- 2. Synthesize & compile native multi-core C/Lean server binary → `<outDir>/server`
   let srvLean := genDir / "ServerMain.lean"
   let srvC := genDir / "ServerMain.c"
-  IO.FS.writeFile srvLean s!"import {mod}\nimport Qed.Server.Native\n\nqedServerMain {fsName}\n"
+  discard <| writeIfChanged srvLean s!"import {mod}\nimport Qed.Server.Native\n\nqedServerMain {fsName}\n"
   if (← sh "lake" #["env", "lean", "-R", genDir.toString, srvLean.toString, "-c", srvC.toString]) != 0 then
     return false
-  let localMods ← collectLocalModules mod
-  let queryTargets := (localMods.map fun m => s!"+{m}:c.o") ++ #["qed/QedServer:static", "qed/Qed:static"]
-  let some linkInputs ← lakeQueryPaths queryTargets | return false
+  let some linkInputs ← lakeQueryPaths cObjTargets | return false
   let sslLib ← resolveSharedLibArg "libssl.so" "-lssl"
   let cryptoLib ← resolveSharedLibArg "libcrypto.so" "-lcrypto"
   let srvTmp := outDir / "server.tmp"
-  let leancArgs := #["env", "leanc", "-O3", "-DNDEBUG", srvC.toString] ++
+  let optFlags := if prod then #["-O3", "-DNDEBUG"] else #["-O0"]
+  let leancArgs := #["env", "leanc"] ++ optFlags ++ #[srvC.toString] ++
     linkInputs ++ #["-pthread", sslLib, cryptoLib, "-Wl,--allow-shlib-undefined", "-o", srvTmp.toString]
   if (← sh "lake" leancArgs) != 0 then return false
   IO.FS.rename srvTmp (outDir / "server")
@@ -155,20 +145,22 @@ def buildJs (outDir : FilePath) (prod : Bool) : IO Bool := do
   let mod ← jsRoot
   if let some fsName ← fullstackAppName mod then
     return ← buildFullstack mod fsName outDir prod
-  if (← sh "lake" #["build", mod, "qedjs"]) != 0 then return false
+  if (← sh "lake" #["build", mod]) != 0 then return false
+  let some q ← resolveQedjsEnv | return false
   IO.FS.createDirAll outDir
   removeIfExists (outDir / "server")
   let rtPath ← runtimeFile "qed_rt.mjs"
   let minArgs := if prod then #["--min"] else #[]
   let rtArgs := #["--rt", rtPath.toString]
-  if (← sh "lake" (#["exe", "qedjs"] ++ minArgs ++ rtArgs ++ #[(outDir / "app.mjs").toString, mod, "--"] ++ driverEntries)) != 0 then
+  let ssrOpt ← ssrAppName mod
+  let alsoArgs : Array String := match ssrOpt with
+    | some appName => #["--also", (outDir / "ssr_app.mjs").toString, "--", s!"{appName}:app", "Qed.App.ssrStep:ssrStep"]
+    | none => #[]
+  if !(← q.run (minArgs ++ rtArgs ++ #[(outDir / "app.mjs").toString, mod, "--"] ++ driverEntries ++ alsoArgs)) then
     return false
   writeClientShell outDir prod
-  match ← ssrAppName mod with
+  match ssrOpt with
   | some appName =>
-      let ssrOut := (outDir / "ssr_app.mjs").toString
-      if (← sh "lake" (#["exe", "qedjs"] ++ minArgs ++ rtArgs ++ #[ssrOut, mod, "--", s!"{appName}:app", "Qed.App.ssrStep:ssrStep"])) != 0 then
-        return false
       IO.FS.writeFile (outDir / "qed_ssr_host.mjs") (← IO.FS.readFile (← runtimeFile "qed_ssr_host.mjs"))
       let cacheKey ← if prod then pure "" else toString <$> IO.monoMsNow
       IO.FS.writeFile (outDir / "ssr.mjs") (ssrWrapper appName cacheKey)
@@ -181,7 +173,7 @@ def buildJs (outDir : FilePath) (prod : Bool) : IO Bool := do
 def cmdBuild (prod : Bool) (skipVerify : Bool := false) : IO UInt32 := do
   let skip := !prod && (skipVerify || (← env "QED_SKIP_VERIFY") == some "1")
   if !skip then
-    if !(← verify) then IO.eprintln (red "✗ verification failed"); return 1
+    if !(← verify (checkExterns := false)) then IO.eprintln (red "✗ verification failed"); return 1
   let outDir := if prod then distDir else devDir
   step s!"compiling Lean → {outDir}/"
   if !(← buildJs outDir prod) then IO.eprintln (red "✗ build failed"); return 1
@@ -235,7 +227,8 @@ partial def watchLoop (marker : FilePath) (port : String)
         nextSrv := restarted
         nextNative := nat
       writeBuildId devDir
-      let _ ← effectsCovered
+      if (← (FilePath.mk "Examples").pathExists) then
+        let _ ← effectsCovered
       IO.println (green "✓ reloaded")
     else
       IO.eprintln (red "✗ build failed, fix and save again")

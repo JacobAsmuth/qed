@@ -46,7 +46,7 @@ macro_rules
          Qed.View.render, Qed.View.renderEach, Qed.View.mapScope, Qed.View.mapScopeEach,
          Qed.VAttr.eval, Qed.VAttr.mapScope, Qed.View.showIf, Qed.View.ofHtml,
          Qed.V.el, Qed.V.text, Qed.V.dyn, Qed.V.ifElse, Qed.V.showIf, Qed.V.static, Qed.V.dynNode,
-         Qed.V.memo, Qed.V.forEach, Qed.View.memo,
+         Qed.V.memo, Qed.V.render_forEach, Qed.View.isDyn, Qed.View.memo,
          Qed.ForEachItems.toList_array, Qed.ForEachItems.toList_list, Qed.ForEachItems.toArray, Qed.mapList_eq,
          Qed.text, Qed.lazy, Qed.el, Qed.link, Qed.linkTo, Qed.theme,
          Qed.Attr.empty, Qed.Html.ofOption, Qed.toString_string, Qed.withKey,

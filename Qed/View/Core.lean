@@ -489,6 +489,10 @@ theorem View.stable_showIf_hidden (cond : σ → Bool) (child : View σ msg) (s 
       (if cond s then child.renderSig s pre n else (.text "", n + child.collectDyn.length)) := by
   simp [View.showIf, View.renderSig, View.collectDyn]
 
+def View.isDyn : View σ msg → Bool
+  | .dyn _ => true
+  | _      => false
+
 namespace V
 
 instance : Coe (Attr msg) (VAttr σ msg) := ⟨.stat⟩
@@ -523,7 +527,7 @@ def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → S
     (child : View α msg) (attrs : List (VAttr σ msg) := []) (sigPrefix : String := "") : View σ msg :=
   -- `hasOpaque` rows can change props/closures without changing signal leaves, so fall back to `dynNode` diff.
   let directDynBlocked :=
-    (tagBlocksDirectSpan tag && match child with | .dyn _ => true | _ => false) ||
+    (tagBlocksDirectSpan tag && child.isDyn) ||
     (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty)
   if child.hasOpaque || directDynBlocked then
     .dynNode fun s => .element tag (attrs.map (VAttr.eval s))
@@ -544,6 +548,21 @@ def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → S
         (items s).toList.zipIdx.map fun (a, i) =>
           let uk := ks.getD i (key a)
           withKey uk (View.renderSig child a (sigPrefix ++ uk) 0).1)
+
+@[simp] theorem render_forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → String)
+    (child : View α msg) (attrs : List (VAttr σ msg)) (sigPrefix : String) (s : σ) :
+    (forEach tag items key child attrs sigPrefix).render s =
+      .element tag (attrs.map (VAttr.eval s))
+        (if child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
+            (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))
+         then ((items s).map fun a => withKey (key a) (child.render a)).toList
+         else
+           let ks := disambiguateKeys ((items s).map key)
+           (items s).toList.zipIdx.map fun (a, i) =>
+             let uk := ks.getD i (key a)
+             withKey uk (View.renderSig child a (sigPrefix ++ uk) 0).1) := by
+  dsimp only [forEach]
+  split <;> rfl
 
 end V
 

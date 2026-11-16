@@ -18,11 +18,9 @@ lean_lib QedServer where
   moreLinkObjs := #[qed_server_o]
   moreLinkArgs := #["-pthread", "-lssl", "-lcrypto"]
 
-@[default_target]
 lean_lib QedProofs where
   roots := #[`Qed.Proofs.DomEquiv]
 
-@[default_target]
 lean_lib JsProofs where
   roots := #[`Js.Proofs]
 

@@ -214,6 +214,7 @@ class DefaultCodec (α : Type) where
 @[reducible] instance (priority := low) {α : Type} [ToJson α] [FromJson α] : DefaultCodec α :=
   ⟨Codec.json α⟩
 
+
 open Lean in
 syntax schemaField := ident " : " term (" where " sepBy1(term, ","))?
 
@@ -413,6 +414,180 @@ private def mkSchemaProtoCmds (t : Ident) (cbns : Array Ident) (cbts : Array Ter
   return baseCmds ++ instBase ++ lawCmds
 
 open Lean Elab Command Term in
+private def checkSchemaFieldsDecidable (cbns : Array Ident) (cbts : Array Term)
+    (pairs : Array (Ident × Term)) : CommandElabM Unit := do
+  -- Lean logs failed instance synthesis to `messages` rather than throwing; probe in isolation to catch missing `DecidablePred` cleanly.
+  for (f, inp) in pairs do
+    let before := (← get).messages
+    try liftTermElabM (elabPredProbe cbns cbts inp 0) catch _ => pure ()
+    let probeMsgs := (← get).messages.toList.drop before.toList.length
+    modify fun st => { st with messages := before }
+    let mut undecidable := false
+    for msg in probeMsgs do
+      if ((← msg.data.toString).splitOn "DecidablePred").length > 1 then undecidable := true
+    if undecidable then
+      throwErrorAt inp m!"schema field `{f.getId}` has a refinement that isn't decidable, so \
+        validity can't be computed (no `DecidablePred` for it).\n\nThe usual cause is a \
+        predicate written with `def`. Write it inline with `where …` or as an `abbrev`, so Lean \
+        sees it reduces to a decidable check:\n    abbrev MyPredicate (x : …) : Prop := …\n\
+        If it genuinely can't be decided, give it a `DecidablePred` instance."
+
+open Lean Elab Command Term in
+private def mkDraftCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
+    CommandElabM (Array (TSyntax `command)) := do
+  let emptyId       := mkIdent (tId ++ `Draft ++ `empty)
+  let draftToJsonId := mkIdent (tId ++ `Draft ++ `toJson)
+  let draftFromId   := mkIdent (tId ++ `Draft ++ `fromJson)
+  let emptyVals ← fs.mapM fun _ => `(term| "")
+  let draftJsonPairs ← fs.mapM fun f =>
+    let keyLit := Syntax.mkStrLit (toString f.getId); `(($keyLit, toJson (x.$f:ident)))
+  let draftJsonDecodes ← fs.mapM fun f =>
+    let keyLit := Syntax.mkStrLit (toString f.getId)
+    `((FromJsonField.fromField j $keyLit : Except String String))
+  let draftFieldEqs ← fs.mapM fun f =>
+    let keyLit := Syntax.mkStrLit (toString f.getId)
+    `(term| LawfulJson.fromField_of_field ($draftToJsonId x) $keyLit (x.$f:ident) rfl)
+  let draftDepthProof ← fs.foldrM (init := ← `(term| Nat.le_refl 0)) fun f acc =>
+    `(term| Codec.max_le_max (LawfulJson.depth_toJson (x.$f:ident)) $acc)
+  pure #[
+    ← `(command| structure $draftId where
+          $[$fs:ident : String := ""]*
+        deriving Inhabited, DecidableEq, Repr),
+    ← `(command| def $emptyId : $draftId := { $[$fs:ident := $emptyVals],* }),
+    ← `(command| def $draftToJsonId (x : $draftId) : Json := Json.obj [$[$draftJsonPairs],*]),
+    ← `(command| def $draftFromId (j : Json) : Except String $draftId := do
+          $[let $fs:ident ← $draftJsonDecodes:term]*
+          return { $[$fs:ident],* }),
+    ← `(command| instance : ToJson $draftId := ⟨$draftToJsonId⟩),
+    ← `(command| instance : FromJson $draftId := ⟨$draftFromId⟩),
+    ← `(command| instance : NonNullJson $draftId where
+          toJson_ne_null _ := nofun),
+    ← `(command| instance : LawfulJson $draftId where
+          depthBound := 1
+          depth_toJson x := Nat.add_le_add_left $draftDepthProof 1
+          fromJson_toJson x := by
+            have h : $draftFromId ($draftToJsonId x) = .ok x := by
+              unfold $draftFromId
+              simp only [$[$draftFieldEqs:term],*, bind, Except.bind, pure, Except.pure]
+            exact h) ]
+
+open Lean Elab Command Term in
+private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
+    (tApp parseApp canApp viewApp : TSyntax `term) (draftId : Ident)
+    (fs : Array Ident) (inputs : Array Term) (refined : Array Bool) :
+    CommandElabM (Array (TSyntax `command)) := do
+  let tId         := t.getId
+  let parseId     := mkIdent (tId ++ `parse)
+  let canId       := mkIdent (tId ++ `canSubmit)
+  let iffId       := mkIdent (tId ++ `canSubmit_iff)
+  let viewId      := mkIdent (tId ++ `formView)
+  let formValidId := mkIdent (tId ++ `formView_validIn)
+  let pairs := fs.zip inputs
+  let structTys ← (pairs.zip refined).mapM fun ((_, inp), r) =>
+    if r then `(Field ($inp).valid) else `(Codec.Val $inp)
+  let runCalls ← (pairs.zip refined).mapM fun ((f, inp), r) =>
+    if r then `(($inp).run (d.$f:ident)) else `(($inp).parse (d.$f:ident))
+  let isSomes ← runCalls.mapM fun rc => `(($rc).isSome)
+  let rhs ← match isSomes.toList with
+    | []      => `(True)
+    | c :: cs => cs.foldlM (init := c) fun acc x => `($acc ∧ $x)
+  let casesTac ← runCalls.foldrM (init := ← `(tactic|
+    simp only [Option.isSome_some, Option.isSome_none, Bool.false_eq_true,
+      and_true, true_and, and_false, false_and, iff_self, bind, Option.bind, pure, Pure.pure]))
+    fun rc acc => `(tactic| cases $rc:term <;> $acc)
+  let rowGroups ← (pairs.zip runCalls).mapM fun ((f, inp), rc) => do
+    let nameLit := Syntax.mkStrLit (toString f.getId)
+    let errLit  := Syntax.mkStrLit ("Please enter a valid " ++ toString f.getId)
+    `(term| Codec.formFieldRow ($inp).inForm ($inp).wrapLabel
+              (d.$f:ident != "" && ($rc).isNone) $nameLit $errLit
+              (($inp).render (d.$f:ident) (fun v => onEdit { d with $f:ident := v })))
+  let submitBtn ← `(term| el "button" [disabled (!($parseApp d).isSome), onClick submit] "Submit")
+  let viewBody ← rowGroups.foldrM (init := ← `(term| [$submitBtn])) fun g acc => `(term| $g ++ $acc)
+  pure #[
+    ← `(command| structure $t $[($cbns:ident : $cbts:term)]* where
+          $[$fs:ident : $structTys]*),
+    ← `(command| def $parseId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Option $tApp := do
+          $[let $fs:ident ← $runCalls:term]*
+          return { $[$fs:ident],* }),
+    ← `(command| def $canId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Bool :=
+          ($parseApp d).isSome),
+    ← `(command| theorem $iffId $[($cbns:ident : $cbts:term)]* (d : $draftId) :
+          $canApp d = true ↔ $rhs := by unfold $canId $parseId; $casesTac),
+    ← `(command| def $viewId {msg : Type} $[($cbns:ident : $cbts:term)]* (d : $draftId)
+          (onEdit : $draftId → msg) (submit : msg) : Html msg :=
+          el "div" [cls "qed-form"] $viewBody),
+    ← `(command| @[simp] theorem $formValidId {msg : Type} $[($cbns:ident : $cbts:term)]*
+          (inForm : Bool) (d : $draftId) (onEdit : $draftId → msg) (submit : msg) :
+          Html.validIn ⟨.normal, false, false, inForm⟩ ($viewApp d onEdit submit) = true := by
+          unfold $viewId
+          cases inForm <;>
+            simp only [el, cls, disabled, onClick, Html.validIn, Html.validListIn,
+              Attr.valid, Attr.validKeyValue, Attr.valid_cls, Attr.valid_flag, Attr.valid_on,
+              Attr.validList_cons, Attr.validList_nil, Attr.validList_append,
+              Attr.isLocalCell_cls, Attr.isLocalCell_flag, Attr.isLocalCell_on,
+              Attr.hasLocalCell_cons, Attr.hasLocalCell_nil, Attr.hasLocalCell_append,
+              Html.validListIn_append, Html.validListIn_cons, Html.validListIn_nil,
+              Codec.formFieldRow_validListIn, Codec.render_valid_simp, validTextIn_normal,
+              Qed.reduceStepHtmlCtx, Qed.reduceIsVoidTag, Qed.reduceIsSafeAttrName, Qed.reduceIsUrlAttrName,
+              Bool.true_and, Bool.and_true, Bool.true_or, Bool.or_true, Bool.false_or, Bool.or_false, Bool.not_false,
+              List.isEmpty_cons, List.isEmpty_nil]) ]
+
+open Lean Elab Command Term in
+private def mkSchemaJsonCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
+    (tApp toJsonApp fromJsonApp : TSyntax `term)
+    (fs : Array Ident) (inputs : Array Term) (refined : Array Bool)
+    (jsonReads : Array (TSyntax `term)) (allLawful : Bool) :
+    CommandElabM (Array (TSyntax `command)) := do
+  let tId        := t.getId
+  let decodeId   := mkIdent (tId ++ `decode)
+  let encodeId   := mkIdent (tId ++ `encode)
+  let toJsonId   := mkIdent (tId ++ `toJson)
+  let fromJsonId := mkIdent (tId ++ `fromJson)
+  let pairs := fs.zip inputs
+  let jsonDecodes ← (pairs.zip refined).mapM fun ((f, inp), r) => do
+    let keyLit := Syntax.mkStrLit (toString f.getId)
+    if r then `(($inp).fromJsonField j $keyLit)
+    else `((FromJsonField.fromField j $keyLit : Except String (Codec.Val $inp)))
+  let jsonPairs ← (fs.zip jsonReads).mapM fun (f, rd) =>
+    let keyLit := Syntax.mkStrLit (toString f.getId); `(($keyLit, toJson $rd))
+  let jsonFnCmds : Array (TSyntax `command) := #[
+    ← `(command| def $toJsonId $[($cbns:ident : $cbts:term)]* (x : $tApp) : Json :=
+          Json.obj [$[$jsonPairs],*]),
+    ← `(command| def $fromJsonId $[($cbns:ident : $cbts:term)]* (j : Json) : Except String $tApp := do
+          $[let $fs:ident ← $jsonDecodes:term]*
+          return { $[$fs:ident],* }),
+    ← `(command| def $decodeId $[($cbns:ident : $cbts:term)]* (s : String) (maxDepth : Nat := 64) :
+          Except String $tApp := (Json.parse s maxDepth).bind ($fromJsonApp)),
+    ← `(command| def $encodeId $[($cbns:ident : $cbts:term)]* (x : $tApp) : String :=
+          Json.render ($toJsonApp x)) ]
+  if !cbns.isEmpty then return jsonFnCmds
+  let depthBoundExpr ← inputs.foldrM (init := ← `(term| (0 : Nat))) fun inp acc =>
+    `(term| Nat.max (LawfulJson.depthBound (Codec.Val $inp)) $acc)
+  let depthProofExpr ← jsonReads.foldrM (init := ← `(term| Nat.le_refl 0)) fun rd acc =>
+    `(term| Codec.max_le_max (LawfulJson.depth_toJson $rd) $acc)
+  let fieldEqs ← (pairs.zip refined).mapM fun ((f, inp), r) => do
+    let keyLit := Syntax.mkStrLit (toString f.getId)
+    if r then `(term| Codec.fromJsonField_of_field $inp ($toJsonId x) $keyLit (x.$f) rfl)
+    else `(term| LawfulJson.fromField_of_field ($toJsonId x) $keyLit (x.$f) rfl)
+  let lawfulCmds : Array (TSyntax `command) ← if allLawful then
+    pure #[← `(command|
+      instance : LawfulJson $t where
+        depthBound := 1 + $depthBoundExpr
+        depth_toJson x := Nat.add_le_add_left $depthProofExpr 1
+        fromJson_toJson x := by
+          have h : $fromJsonId ($toJsonId x) = .ok x := by
+            unfold $fromJsonId
+            simp only [$[$fieldEqs:term],*, bind, Except.bind, pure, Except.pure]
+          exact h)]
+  else pure #[]
+  let jsonInstCmds : Array (TSyntax `command) := #[
+    ← `(command| instance : ToJson $t := ⟨$toJsonId⟩),
+    ← `(command| instance : FromJson $t := ⟨$fromJsonId⟩),
+    ← `(command| instance : NonNullJson $t where
+          toJson_ne_null _ := nofun) ] ++ lawfulCmds
+  return jsonFnCmds ++ jsonInstCmds
+
+open Lean Elab Command Term in
 elab_rules : command
   | `(schema $t:ident $[($cbns:ident : $cbts:term)]* where $[$fieldStxs:schemaField]*) => do
       let mut fs : Array Ident := #[]
@@ -425,37 +600,17 @@ elab_rules : command
             rawSpecs := rawSpecs.push spec
             whereClauses := whereClauses.push (ps.getD #[])
         | _ => throwUnsupportedSyntax
-      let draftId       := mkIdent (t.getId ++ `Draft)
-      let emptyId       := mkIdent (t.getId ++ `Draft ++ `empty)
-      let draftToJsonId := mkIdent (t.getId ++ `Draft ++ `toJson)
-      let draftFromId   := mkIdent (t.getId ++ `Draft ++ `fromJson)
-      let parseId       := mkIdent (t.getId ++ `parse)
-      let canId         := mkIdent (t.getId ++ `canSubmit)
-      let iffId         := mkIdent (t.getId ++ `canSubmit_iff)
-      let viewId        := mkIdent (t.getId ++ `formView)
-      let formValidId   := mkIdent (t.getId ++ `formView_validIn)
-      let decodeId   := mkIdent (t.getId ++ `decode)
-      let encodeId   := mkIdent (t.getId ++ `encode)
-      let toJsonId   := mkIdent (t.getId ++ `toJson)
-      let fromJsonId := mkIdent (t.getId ++ `fromJson)
+      let tId        := t.getId
+      let draftId    := mkIdent (tId ++ `Draft)
+      let parseId    := mkIdent (tId ++ `parse)
+      let canId      := mkIdent (tId ++ `canSubmit)
+      let viewId     := mkIdent (tId ++ `formView)
+      let toJsonId   := mkIdent (tId ++ `toJson)
+      let fromJsonId := mkIdent (tId ++ `fromJson)
       let (inputs, refined, allLawful, allProto, allLawfulProto) ←
         resolveSchemaFields cbns cbts fs rawSpecs whereClauses
       let pairs := fs.zip inputs
-      -- Lean logs failed instance synthesis to `messages` rather than throwing; probe in isolation to catch missing `DecidablePred` cleanly.
-      for (f, inp) in pairs do
-        let before := (← get).messages
-        try liftTermElabM (elabPredProbe cbns cbts inp 0) catch _ => pure ()
-        let probeMsgs := (← get).messages.toList.drop before.toList.length
-        modify fun st => { st with messages := before }
-        let mut undecidable := false
-        for msg in probeMsgs do
-          if ((← msg.data.toString).splitOn "DecidablePred").length > 1 then undecidable := true
-        if undecidable then
-          throwErrorAt inp m!"schema field `{f.getId}` has a refinement that isn't decidable, so \
-            validity can't be computed (no `DecidablePred` for it).\n\nThe usual cause is a \
-            predicate written with `def`. Write it inline with `where …` or as an `abbrev`, so Lean \
-            sees it reduces to a decidable check:\n    abbrev MyPredicate (x : …) : Prop := …\n\
-            If it genuinely can't be decided, give it a `DecidablePred` instance."
+      checkSchemaFieldsDecidable cbns cbts pairs
       let cbnsT : Array (TSyntax `term) := cbns.map fun c => ⟨c.raw⟩
       let appTo : TSyntax `term → CommandElabM (TSyntax `term) := fun head =>
         cbnsT.foldlM (init := head) fun acc c => `($acc $c)
@@ -465,123 +620,16 @@ elab_rules : command
       let viewApp     ← appTo ⟨viewId.raw⟩
       let toJsonApp   ← appTo ⟨toJsonId.raw⟩
       let fromJsonApp ← appTo ⟨fromJsonId.raw⟩
-      let emptyVals ← fs.mapM fun _ => `(term| "")
-      let structTys ← (pairs.zip refined).mapM fun ((_, inp), r) =>
-        if r then `(Field ($inp).valid) else `(Codec.Val $inp)
-      let runCalls ← (pairs.zip refined).mapM fun ((f, inp), r) =>
-        if r then `(($inp).run (d.$f:ident)) else `(($inp).parse (d.$f:ident))
-      let jsonDecodes ← (pairs.zip refined).mapM fun ((f, inp), r) => do
-        let keyLit := Syntax.mkStrLit (toString f.getId)
-        if r then `(($inp).fromJsonField j $keyLit)
-        else `((FromJsonField.fromField j $keyLit : Except String (Codec.Val $inp)))
       let jsonReads ← (pairs.zip refined).mapM fun ((f, _), r) =>
         if r then `((x.$f:ident).val) else `(x.$f:ident)
-      let jsonPairs ← (fs.zip jsonReads).mapM fun (f, rd) =>
-        let keyLit := Syntax.mkStrLit (toString f.getId); `(($keyLit, toJson $rd))
-      let draftJsonPairs ← fs.mapM fun f =>
-        let keyLit := Syntax.mkStrLit (toString f.getId); `(($keyLit, toJson (x.$f:ident)))
-      let draftJsonDecodes ← fs.mapM fun f =>
-        let keyLit := Syntax.mkStrLit (toString f.getId)
-        `((FromJsonField.fromField j $keyLit : Except String String))
-      let draftFieldEqs ← fs.mapM fun f =>
-        let keyLit := Syntax.mkStrLit (toString f.getId)
-        `(term| LawfulJson.fromField_of_field ($draftToJsonId x) $keyLit (x.$f:ident) rfl)
-      let draftDepthProof ← fs.foldrM (init := ← `(term| Nat.le_refl 0)) fun f acc =>
-        `(term| Codec.max_le_max (LawfulJson.depth_toJson (x.$f:ident)) $acc)
-      let isSomes ← runCalls.mapM fun rc => `(($rc).isSome)
-      let rhs ← match isSomes.toList with
-        | []      => `(True)
-        | c :: cs => cs.foldlM (init := c) fun acc x => `($acc ∧ $x)
-      let casesTac ← runCalls.foldrM (init := ← `(tactic| simp)) fun rc acc =>
-        `(tactic| cases $rc:term <;> $acc)
-      let rowGroups ← (pairs.zip runCalls).mapM fun ((f, inp), rc) => do
-        let nameLit := Syntax.mkStrLit (toString f.getId)
-        let errLit  := Syntax.mkStrLit ("Please enter a valid " ++ toString f.getId)
-        `(term| Codec.formFieldRow ($inp).inForm ($inp).wrapLabel
-                  (d.$f:ident != "" && ($rc).isNone) $nameLit $errLit
-                  (($inp).render (d.$f:ident) (fun v => onEdit { d with $f:ident := v })))
-      let submitBtn ← `(term| el "button" [disabled (!($parseApp d).isSome), onClick submit] "Submit")
-      let viewBody ← rowGroups.foldrM (init := ← `(term| [$submitBtn])) fun g acc => `(term| $g ++ $acc)
-      let formCmds : Array (TSyntax `command) := #[
-        ← `(command| structure $draftId where
-              $[$fs:ident : String := ""]*
-            deriving Inhabited, DecidableEq, Repr),
-        ← `(command| def $emptyId : $draftId := { $[$fs:ident := $emptyVals],* }),
-        ← `(command| def $draftToJsonId (x : $draftId) : Json := Json.obj [$[$draftJsonPairs],*]),
-        ← `(command| def $draftFromId (j : Json) : Except String $draftId := do
-              $[let $fs:ident ← $draftJsonDecodes:term]*
-              return { $[$fs:ident],* }),
-        ← `(command| instance : ToJson $draftId := ⟨$draftToJsonId⟩),
-        ← `(command| instance : FromJson $draftId := ⟨$draftFromId⟩),
-        ← `(command| instance : NonNullJson $draftId where
-              toJson_ne_null _ := nofun),
-        ← `(command| instance : LawfulJson $draftId where
-              depthBound := 1
-              depth_toJson x := Nat.add_le_add_left $draftDepthProof 1
-              fromJson_toJson x := by
-                have h : $draftFromId ($draftToJsonId x) = .ok x := by
-                  unfold $draftFromId
-                  simp only [$[$draftFieldEqs:term],*, bind, Except.bind, pure, Except.pure]
-                exact h),
-        ← `(command| structure $t $[($cbns:ident : $cbts:term)]* where
-              $[$fs:ident : $structTys]*),
-        ← `(command| def $parseId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Option $tApp := do
-              $[let $fs:ident ← $runCalls:term]*
-              return { $[$fs:ident],* }),
-        ← `(command| def $canId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Bool :=
-              ($parseApp d).isSome),
-        ← `(command| theorem $iffId $[($cbns:ident : $cbts:term)]* (d : $draftId) :
-              $canApp d = true ↔ $rhs := by unfold $canId $parseId; $casesTac),
-        ← `(command| def $viewId {msg : Type} $[($cbns:ident : $cbts:term)]* (d : $draftId)
-              (onEdit : $draftId → msg) (submit : msg) : Html msg :=
-              el "div" [cls "qed-form"] $viewBody),
-        ← `(command| @[simp] theorem $formValidId {msg : Type} $[($cbns:ident : $cbts:term)]*
-              (inForm : Bool) (d : $draftId) (onEdit : $draftId → msg) (submit : msg) :
-              Html.validIn ⟨.normal, false, false, inForm⟩ ($viewApp d onEdit submit) = true := by
-              unfold $viewId
-              cases inForm <;>
-                simp [el, cls, disabled, onClick, Html.validIn, Attr.valid,
-                      Html.validListIn_append]) ]
-      let jsonFnCmds : Array (TSyntax `command) := #[
-        ← `(command| def $toJsonId $[($cbns:ident : $cbts:term)]* (x : $tApp) : Json :=
-              Json.obj [$[$jsonPairs],*]),
-        ← `(command| def $fromJsonId $[($cbns:ident : $cbts:term)]* (j : Json) : Except String $tApp := do
-              $[let $fs:ident ← $jsonDecodes:term]*
-              return { $[$fs:ident],* }),
-        ← `(command| def $decodeId $[($cbns:ident : $cbts:term)]* (s : String) (maxDepth : Nat := 64) :
-              Except String $tApp := (Json.parse s maxDepth).bind ($fromJsonApp)),
-        ← `(command| def $encodeId $[($cbns:ident : $cbts:term)]* (x : $tApp) : String :=
-              Json.render ($toJsonApp x)) ]
-      let depthBoundExpr ← inputs.foldrM (init := ← `(term| (0 : Nat))) fun inp acc =>
-        `(term| Nat.max (LawfulJson.depthBound (Codec.Val $inp)) $acc)
-      let depthProofExpr ← jsonReads.foldrM (init := ← `(term| Nat.le_refl 0)) fun rd acc =>
-        `(term| Codec.max_le_max (LawfulJson.depth_toJson $rd) $acc)
-      let fieldEqs ← (pairs.zip refined).mapM fun ((f, inp), r) => do
-        let keyLit := Syntax.mkStrLit (toString f.getId)
-        if r then `(term| Codec.fromJsonField_of_field $inp ($toJsonId x) $keyLit (x.$f) rfl)
-        else `(term| LawfulJson.fromField_of_field ($toJsonId x) $keyLit (x.$f) rfl)
-      let lawfulCmds : Array (TSyntax `command) ← if cbns.isEmpty && allLawful then
-        pure #[← `(command|
-          instance : LawfulJson $t where
-            depthBound := 1 + $depthBoundExpr
-            depth_toJson x := Nat.add_le_add_left $depthProofExpr 1
-            fromJson_toJson x := by
-              have h : $fromJsonId ($toJsonId x) = .ok x := by
-                unfold $fromJsonId
-                simp only [$[$fieldEqs:term],*, bind, Except.bind, pure, Except.pure]
-              exact h)]
-      else pure #[]
-      let jsonInstCmds : Array (TSyntax `command) := #[
-        ← `(command| instance : ToJson $t := ⟨$toJsonId⟩),
-        ← `(command| instance : FromJson $t := ⟨$fromJsonId⟩),
-        ← `(command| instance : NonNullJson $t where
-              toJson_ne_null _ := nofun) ] ++ lawfulCmds
-      let draftProtoCmds ← mkDraftProtoCmds t.getId draftId fs
+      let draftCmds ← mkDraftCmds tId draftId fs
+      let coreCmds ← mkSchemaCoreCmds t cbns cbts tApp parseApp canApp viewApp draftId fs inputs refined
+      let jsonCmds ← mkSchemaJsonCmds t cbns cbts tApp toJsonApp fromJsonApp fs inputs refined jsonReads allLawful
+      let draftProtoCmds ← mkDraftProtoCmds tId draftId fs
       let protoCmds ← mkSchemaProtoCmds t cbns cbts tApp appTo fs inputs refined jsonReads allProto allLawfulProto
-      let cmds := formCmds ++ draftProtoCmds ++ jsonFnCmds ++ (if cbns.isEmpty then jsonInstCmds else #[]) ++ protoCmds
-      for c in cmds do elabCommand c
+      for c in draftCmds ++ coreCmds ++ jsonCmds ++ draftProtoCmds ++ protoCmds do elabCommand c
       let ns ← getCurrNamespace
-      let fullSchema := ns ++ t.getId
+      let fullSchema := ns ++ tId
       let info : SchemaFormInfo := {
         fullName := fullSchema ++ `Form
         formViewName := fullSchema ++ `formView

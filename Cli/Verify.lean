@@ -33,26 +33,29 @@ def effectsCovered : IO Bool := do
   let hostPath := qh / "runtime" / "qed_host.mjs"
   unless (← qedDir.pathExists) && (← hostPath.pathExists) do return true
   let leanFiles ← collect qedDir "lean"
-  let mut qedSrc := ""
-  for f in leanFiles do
-    qedSrc := qedSrc ++ "\n" ++ (← IO.FS.readFile f)
-  let host ← IO.FS.readFile hostPath
   let after (marker close src : String) : List String :=
     match src.splitOn marker with
     | _ :: rest => rest.map (fun c => (c.splitOn close).headD "")
     | []        => []
-  let emitted := (after ".fx \"" "\"" qedSrc) ++ (after ".fxResult \"" "\"" qedSrc)
-              ++ (after "Dom.effect \"" "\"" qedSrc) ++ (after "Dom.effectResult \"" "\"" qedSrc)
+  let mut emitted : List String := []
+  for f in leanFiles do
+    let src ← IO.FS.readFile f
+    for marker in [".fx \"", ".fxResult \"", "Dom.effect \"", "Dom.effectResult \""] do
+      for k in after marker "\"" src do
+        if k != "" && !emitted.contains k then
+          emitted := k :: emitted
+  let host ← IO.FS.readFile hostPath
   let handled := after "case '" "'" host
-  let missing := emitted.filter (fun k => k != "" && !handled.contains k)
+  let missing := emitted.filter (fun k => !handled.contains k)
   for k in missing do
     IO.eprintln (red s!"  effect kind \"{k}\" is emitted by a Cmd but no qed_host.mjs case handles it")
   return missing.isEmpty
 
-def kernelEnvClean : IO Bool := do
+def kernelEnvClean (q? : Option QedjsEnv := none) : IO Bool := do
   let root ← webRoot
-  if (← (FilePath.mk "Examples").pathExists) then
-    if (← shQuiet "lake" #["build", "qedjs"]) != 0 then return false
+  let hasExamples ← (FilePath.mk "Examples").pathExists
+  let some q ← (match q? with | some e => pure (some e) | none => resolveQedjsEnv (needBuild := !hasExamples)) | return false
+  if hasExamples then
     let mods := #[
       "Qed", "Qed.Driver", "Qed.Server.Native", "Qed.Proofs.DomEquiv", "Js.Backend", "Js.Proofs",
       "Examples.Bookshelf", "Examples.CloudBooks", "Examples.ServerChecks",
@@ -61,12 +64,12 @@ def kernelEnvClean : IO Bool := do
       "Examples.Template", "Examples.Socket", "Examples.Live", "Examples.DomProbe",
       "Examples.JsGate", root
     ]
-    return (← shQuiet "lake" (#["exe", "qedjs", "--verify-env"] ++ mods)) == 0
+    q.run (#["--verify-env"] ++ mods) (quiet := true)
   else
-    if (← shQuiet "lake" #["build", root, "qedjs"]) != 0 then return false
-    return (← shQuiet "lake" #["exe", "qedjs", "--verify-env", root]) == 0
+    if (← shQuiet "lake" #["build", root]) != 0 then return false
+    q.run #["--verify-env", "--skip-qed", root] (quiet := true)
 
-def externsCovered : IO Bool := do
+def externsCovered (q? : Option QedjsEnv := none) : IO Bool := do
   let rtPath ← runtimeFile "qed_rt.mjs"
   unless (← rtPath.pathExists) do return true
   let mod ← jsRoot
@@ -89,22 +92,30 @@ def externsCovered : IO Bool := do
     mods := mods.push "Examples.JsGate"
     entries := entries ++ #["JsGate.run", "JsGate.counts", "JsGate.probeCount", "JsGate.names"]
   if entries.isEmpty then return true
-  return (← shQuiet "lake" (#["exe", "qedjs", "--check-externs", rtPath.toString] ++ mods ++ #["--"] ++ entries)) == 0
+  let some q ← (match q? with | some e => pure (some e) | none => resolveQedjsEnv) | return false
+  q.run (#["--check-externs", rtPath.toString] ++ mods ++ #["--"] ++ entries) (quiet := true)
 
-def verify : IO Bool := do
+def verify (checkExterns : Bool := true) : IO Bool := do
   step "verifying proofs & axioms"
-  if (← shQuiet "lake" #["build"]) != 0 then return false
-  if (← (FilePath.mk "Examples").pathExists) then
-    if (← shQuiet "lake" #["build", "Examples"]) != 0 then return false
-  let ok1 ← grepForbidden
-  let ok2 ← axiomClean
-  let ok3 ← kernelEnvClean
-  let ok4 ← effectsCovered
-  let ok5 ← if ok3 then externsCovered else pure false
+  let hasExamples ← (FilePath.mk "Examples").pathExists
+  if hasExamples then
+    if (← shQuiet "lake" #["build", "Qed", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples"]) != 0 then return false
+  else
+    let root ← webRoot
+    if (← shQuiet "lake" #["build", root]) != 0 then return false
+  let tGrep ← IO.asTask grepForbidden
+  let tAxiom ← IO.asTask axiomClean
+  let tEff ← if hasExamples then IO.asTask effectsCovered else IO.asTask (pure true)
+  let q? ← resolveQedjsEnv (needBuild := false)
+  let ok3 ← kernelEnvClean q?
+  let ok5 ← if checkExterns && ok3 then externsCovered q? else pure ok3
+  let ok1 := (← IO.wait tGrep).toOption.getD false
+  let ok2 := (← IO.wait tAxiom).toOption.getD false
+  let ok4 := (← IO.wait tEff).toOption.getD false
   return ok1 && ok2 && ok3 && ok4 && ok5
 
 def cmdCheck : IO UInt32 := do
-  if (← verify) then
+  if (← verify (checkExterns := true)) then
     IO.println (green "✓ verified"); return 0
   else IO.eprintln (red "✗ verification failed"); return 1
 

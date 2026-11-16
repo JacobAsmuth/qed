@@ -428,7 +428,9 @@ macro_rules
           match p with
           $[| $parsePatsAll:term => $parseRhssAll:term]*
         theorem $rtId:ident : ∀ a, $parseId:ident ($printId:ident a) = some a := by
-          intro a; cases a <;> simp [$printId:ident, $parseId:ident, RouteParam.round_trip]
+          intro a; cases a <;>
+            (try simp only [$printId:ident, $parseId:ident, RouteParam.round_trip, RouteParam.toSeg_string]) <;>
+            (try simp [$printId:ident, $parseId:ident, RouteParam.round_trip])
         instance : Router $t:ident := ⟨$printId, $parseId, $rtId⟩)
 
 router Route where

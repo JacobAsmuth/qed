@@ -111,4 +111,60 @@ partial def collect (dir : FilePath) (ext : String) (skipDirs : List String := [
 def writeBuildId (outDir : FilePath) : IO Unit := do
   IO.FS.writeFile (outDir / "__build_id") (toString (← IO.monoMsNow))
 
+def writeIfChanged (path : FilePath) (content : String) : IO Bool := do
+  if (← path.pathExists) then
+    if (← IO.FS.readFile path) == content then
+      return false
+  IO.FS.writeFile path content
+  return true
+
+def lakeEnvLeanPath : IO (Option String) := do
+  let o ← IO.Process.output { cmd := "lake", args := #["env", "printenv", "LEAN_PATH"] }
+  if o.exitCode != 0 then
+    IO.eprint (o.stdout ++ o.stderr)
+    return none
+  return some o.stdout.trimmed
+
+def lakeQueryPaths (targets : Array String) : IO (Option (Array String)) := do
+  let o ← IO.Process.output { cmd := "lake", args := #["query"] ++ targets }
+  if o.exitCode != 0 then
+    IO.eprint (o.stdout ++ o.stderr)
+    return none
+  let paths := (o.stdout.splitOn "\n").toArray.map String.trimmed |>.filter (!·.isEmpty)
+  return some paths
+
+def resolveQedjsBin (needBuild : Bool := true) : IO (Option FilePath) := do
+  let qh ← frameworkHome
+  let prebuilt := qh / ".lake" / "build" / "bin" / "qedjs"
+  let isInRepo ← (FilePath.mk "Examples").pathExists
+  if !isInRepo && (← prebuilt.pathExists) then
+    let tcMatch ← do
+      let appTc : FilePath := "lean-toolchain"
+      let fwTc := qh / "lean-toolchain"
+      if (← appTc.pathExists) && (← fwTc.pathExists) then
+        pure ((← IO.FS.readFile appTc).trimmed == (← IO.FS.readFile fwTc).trimmed)
+      else pure false
+    if tcMatch then return some prebuilt
+  let target := if isInRepo then "qedjs" else "qed/qedjs"
+  if needBuild then
+    if (← shQuiet "lake" #["build", target]) != 0 then return none
+  let some paths ← lakeQueryPaths #[target] | return none
+  return paths[0]?.map FilePath.mk
+
+structure QedjsEnv where
+  bin      : FilePath
+  leanPath : String
+
+def resolveQedjsEnv (needBuild : Bool := true) : IO (Option QedjsEnv) := do
+  let some bin ← resolveQedjsBin needBuild | return none
+  let some leanPath ← lakeEnvLeanPath | return none
+  return some { bin, leanPath }
+
+def QedjsEnv.run (q : QedjsEnv) (args : Array String) (quiet : Bool := false)
+    (extraPath : Option String := none) : IO Bool := do
+  let lp := match extraPath with | some p => s!"{p}:{q.leanPath}" | none => q.leanPath
+  let env := #[("LEAN_PATH", some lp)]
+  let code ← if quiet then shQuiet q.bin.toString args env else sh q.bin.toString args env
+  return code == 0
+
 end Qed.Cli

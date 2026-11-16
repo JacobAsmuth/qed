@@ -1071,20 +1071,68 @@ private def hasNewErrors (log : Lean.MessageLog) (priorRep priorUnrep : Nat) : B
   (log.unreported.toList.drop priorUnrep).any (·.severity == .error)
 
 open Lean Elab Command in
-private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun stx => do
-  let srvIdent : Ident := ⟨stx[1]⟩
-  let srvName := srvIdent.getId
-  let srvShort := srvName.toString
-  let currNs ← getCurrNamespace
-  let fullSrvName := currNs ++ srvName
-  let clauses := stx[2].getArgs
+private def elabServerStateCmds (priorRep priorUnrep : Nat) (stateId initStateId stateInvId invInitId : Ident)
+    (stateDecls : Array ParsedStateDecl) (invs : Array ParsedInv)
+    (stateFieldNames envVarNames : Array String) : CommandElabM Bool := do
+  let mut stFieldIds : Array Ident := #[]
+  let mut stFieldTys : Array Term := #[]
+  let mut stInitVals : Array Term := #[]
+  for sd in stateDecls do
+    let fty ← liftMacroM sd.ty.toPayloadTerm
+    let initCtx : LowerCtx := {
+      fnName := "initState", stateFields := #[], envVars := #[], locals := #[]
+      stateRule := .statelessServer, allowAwait := false, allowUnwrap := false
+      hasFallible := false, isOption := false, innerOptTy? := none
+    }
+    let (initTerm, _) ← (lowerExpr initCtx .val sd.initStx).run {}
+    stFieldIds := stFieldIds.push sd.ident
+    stFieldTys := stFieldTys.push fty
+    stInitVals := stInitVals.push (← `(srvAutoField($initTerm)))
+  elabCommand (← `(command|
+    structure $stateId where
+      $[$stFieldIds:ident : $stFieldTys:term]*))
+  elabCommand (← `(command|
+    def $initStateId : $stateId := { $[$stFieldIds:ident := $stInitVals:term],* }))
+  if hasNewErrors (← get).messages priorRep priorUnrep then return false
 
+  let sParam := mkIdent `_s
+  let sOldDummy := mkIdent `_sOld
+  let mut singleProps : Array Term := #[]
+  for inv in invs do
+    if !inv.isTwoSt then
+      let invCtx : LowerCtx := {
+        fnName := "invariant", stateFields := stateFieldNames, envVars := envVarNames, locals := #[]
+        stateRule := .invariantProp sParam sOldDummy false
+        allowAwait := false, allowUnwrap := false
+        hasFallible := false, isOption := false, innerOptTy? := none
+      }
+      let (pTerm, _) ← (lowerExpr invCtx .propInv inv.exprStx).run {}
+      singleProps := singleProps.push pTerm
+  let invBody ← match singleProps.toList with
+    | []      => `(True)
+    | p :: ps => ps.foldlM (init := p) fun acc q => `($acc ∧ $q)
+  elabCommand (← `(command|
+    def $stateInvId ($sParam:ident : $stateId) : Prop := $invBody))
+  elabCommand (← `(command|
+    theorem $invInitId : $stateInvId $initStateId := by
+      qedSrvProveStep [$stateInvId, $initStateId] "initState" "initial state"))
+  return !hasNewErrors (← get).messages priorRep priorUnrep
+
+private structure ParsedServerBlock where
+  envDecls   : Array ParsedEnvDecl
+  stateDecls : Array ParsedStateDecl
+  mutInvs    : Array ParsedMutInv
+  invs       : Array ParsedInv
+  fnClauses  : Array Lean.Syntax
+
+open Lean Elab Command in
+private def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean.Syntax) :
+    CommandElabM ParsedServerBlock := do
   let mut envDecls   : Array ParsedEnvDecl := #[]
   let mut stateDecls : Array ParsedStateDecl := #[]
   let mut mutInvs    : Array ParsedMutInv := #[]
   let mut invs       : Array ParsedInv := #[]
   let mut fnClauses  : Array Syntax := #[]
-
   for c in clauses do
     let k := c.getKind
     if k == ``srvEnvClause then
@@ -1114,17 +1162,270 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
       fnClauses := fnClauses.push c
     else
       throwErrorAt c "unexpected clause in `server` block"
-
   if fnClauses.isEmpty then
     throwErrorAt srvIdent s!"`server {srvName}` must declare at least one `fn`"
-
   let hasState := !stateDecls.isEmpty
   if !hasState && (!invs.isEmpty || !mutInvs.isEmpty) then
     throwErrorAt srvIdent s!"`server {srvName}` declares `invariant`s but has no `state` fields"
   for mi in mutInvs do
     unless stateDecls.any (·.ident.getId == mi.fieldId.getId) do
       throwErrorAt mi.fieldId s!"`invariant mutating {mi.fieldId.getId}` does not match any `state` field of `{srvName}`"
+  return { envDecls, stateDecls, mutInvs, invs, fnClauses }
 
+open Lean Elab Command in
+private def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : Ident)
+    (srvName fullSrvName : Name) (srvShort : String) (hasState : Bool)
+    (envDecls : Array ParsedEnvDecl) (allExtRoots : Array Name)
+    (methodInfos : Array ServerMethodInfo) (dispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
+    (ctxId reqBytesId : Ident) : CommandElabM Unit := do
+  let srvNm := srvName
+  if hasState then
+    let linThmId := mkIdentFrom srvIdent (srvNm ++ `concurrent_linearizable)
+    elabCommand (← `(command|
+      theorem $linThmId {Out : Type}
+          (st : Qed.Server.MultiCoreState $stateId Out)
+          (hsched : Qed.Server.MultiCoreSchedule $stateInvId ⟨$initStateId, []⟩ st) :
+          $stateInvId st.shared :=
+        Qed.Server.concurrent_schedule_preserves_inv $stateInvId $initStateId st $invInitId hsched))
+
+  let extMap := externalRegistry.getState (← getEnv)
+  let mut reqSecrets : Array String := #[]
+  for ed in envDecls do
+    if ed.default?.isNone && !reqSecrets.contains ed.osKey then
+      reqSecrets := reqSecrets.push ed.osKey
+  let mut usedExts : Array (String × String) := #[]
+  let currNs ← getCurrNamespace
+  for root in allExtRoots do
+    let cand1 := currNs ++ root
+    let info? := (extMap.find? cand1).orElse fun _ => extMap.find? root
+    if let some extInfo := info? then
+      let sStr := root.toString
+      unless usedExts.any (·.1 == sStr) do
+        usedExts := usedExts.push (sStr, extInfo.baseOrigin)
+      for sec in extInfo.secrets do
+        unless reqSecrets.contains sec do
+          reqSecrets := reqSecrets.push sec
+
+  let secretsId := mkIdentFrom srvIdent (srvNm ++ `secrets)
+  let secLits : Array Term := reqSecrets.map (Syntax.mkStrLit ·)
+  elabCommand (← `(command| def $secretsId : Array String := #[$[$secLits],*]))
+
+  let readOnlyId := mkIdentFrom srvIdent (srvNm ++ `readOnlyMethods)
+  let roLits : Array Term := (methodInfos.filter (·.isReadOnly)).map (Syntax.mkStrLit ·.name)
+  elabCommand (← `(command| def $readOnlyId : Array String := #[$[$roLits],*]))
+
+  let methodVar := mkIdent `method
+  let notFoundArm ← `(Lean.Parser.Term.matchAltExpr|
+    | _ => Pure.pure (Except.error (Qed.Server.ApiError.notFound ("unknown RPC method: " ++ $methodVar))))
+  let allArms := dispatchArms.push notFoundArm
+  let matchMethodTerm ← `(match $methodVar:ident with $[$allArms:matchAlt]*)
+  let fullDispatchBody ← envDecls.foldrM (init := matchMethodTerm) fun ed acc => do
+    let eid := ed.ident
+    let keyLit := Syntax.mkStrLit ed.osKey
+    match ed.default? with
+    | some defVal =>
+        let defLit := Syntax.mkStrLit defVal
+        `(Qed.Server.MonadServer.readEnv $keyLit >>= fun _envOpt =>
+            let $eid:ident : String := _envOpt.getD $defLit
+            $acc)
+    | none =>
+        let missingMsg := Syntax.mkStrLit s!"missing required environment variable `{ed.osKey}`"
+        `(Qed.Server.MonadServer.readEnv $keyLit >>= fun _envOpt =>
+            match _envOpt with
+            | some $eid:ident => $acc
+            | none => Pure.pure (Except.error (Qed.Server.ApiError.internal $missingMsg)))
+
+  let dispatchId := mkIdentFrom srvIdent (srvNm ++ `dispatchM)
+  if hasState then
+    elabCommand (← `(command|
+      def $dispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
+          [Qed.Server.MonadAtomic $stateId m]
+          ($ctxId:ident : Qed.Server.RequestCtx) ($methodVar:ident : String) ($reqBytesId:ident : ByteArray) :
+          m (Except Qed.Server.ApiError ByteArray) :=
+        $fullDispatchBody))
+  else
+    elabCommand (← `(command|
+      def $dispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
+          ($ctxId:ident : Qed.Server.RequestCtx) ($methodVar:ident : String) ($reqBytesId:ident : ByteArray) :
+          m (Except Qed.Server.ApiError ByteArray) :=
+        $fullDispatchBody))
+
+  modifyEnv fun env => serverRegistry.addEntry env {
+    serverName := fullSrvName
+    shortName := srvShort
+    hasState
+    secrets := reqSecrets
+    envVars := envDecls.map fun e => (e.ident.getId.toString, e.osKey, e.default?)
+    externalServices := usedExts
+    methods := methodInfos
+  }
+
+open Lean Elab Command in
+private def elabServerFnInvariants (priorRep priorUnrep : Nat) (isAsync : Bool)
+    (srvName : Name) (fnStr : String) (fnIdent stateId stateInvId targetId : Ident)
+    (allBinderIds : Array Ident) (allBinderTys : Array Term) (targetCall : Term)
+    (invs : Array ParsedInv) (mutInvs : Array ParsedMutInv)
+    (stateFieldNames envVarNames : Array String) : CommandElabM Bool := do
+  let fnLit := Syntax.mkStrLit fnStr
+  let sOldId := mkIdent (if isAsync then `_sOld else `_s0)
+  let sNewId := mkIdent `_sNew
+  let emitTwoInv (twoIdx : Nat) (inv : ParsedInv) : CommandElabM Bool := do
+    let twoCtx : LowerCtx := {
+      fnName := "invariant", stateFields := stateFieldNames, envVars := envVarNames, locals := #[]
+      stateRule := .invariantProp sNewId sOldId false
+      allowAwait := false, allowUnwrap := false, hasFallible := false, isOption := false, innerOptTy? := none
+    }
+    let relProp := (← (lowerExpr twoCtx .propInv inv.exprStx).run {}).1
+    let twoThmId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter s!"_twoInv{twoIdx}")
+    let twoLbl := Syntax.mkStrLit inv.label
+    if isAsync then
+      elabCommand (← `(command|
+        theorem $twoThmId $[($allBinderIds:ident : $allBinderTys:term)]* :
+            Qed.Server.ProgPreservesStepRel $stateInvId
+              (fun ($sOldId:ident $sNewId:ident : $stateId) => $relProp)
+              ($targetCall : Qed.Server.ThreadProg $stateId _) := by
+          qedSrvProveAsync $targetId [$stateInvId] $fnLit $twoLbl))
+    else
+      elabCommand (← `(command|
+        theorem $twoThmId ($sOldId:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]*
+            (_hInv : $stateInvId $sOldId) :
+            let $sNewId:ident := ($targetCall).1
+            $relProp := by
+          qedSrvProveStep [$stateInvId, $targetId] $fnLit $twoLbl))
+    return !hasNewErrors (← get).messages priorRep priorUnrep
+
+  let emitMutInv (mutIdx : Nat) (mi : ParsedMutInv) : CommandElabM Bool := do
+    let miCtx : LowerCtx := {
+      fnName := fnStr, stateFields := #[], envVars := envVarNames, locals := #[]
+      stateRule := .statelessServer, allowAwait := false, allowUnwrap := false
+      hasFallible := false, isOption := false, innerOptTy? := none
+    }
+    let miProp := (← (lowerExpr miCtx .propInv mi.condStx).run {}).1
+    let fldId := mi.fieldId
+    let miThmId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter s!"_mutInv{mutIdx}")
+    let miLbl := Syntax.mkStrLit mi.label
+    if isAsync then
+      elabCommand (← `(command|
+        theorem $miThmId $[($allBinderIds:ident : $allBinderTys:term)]* :
+            Qed.Server.ProgPreservesStepRel $stateInvId
+              (fun ($sOldId:ident $sNewId:ident : $stateId) => ($sNewId).$fldId:ident = ($sOldId).$fldId:ident ∨ $miProp)
+              ($targetCall : Qed.Server.ThreadProg $stateId _) := by
+          qedSrvProveAsync $targetId [$stateInvId] $fnLit $miLbl))
+    else
+      elabCommand (← `(command|
+        theorem $miThmId ($sOldId:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]*
+            (_hInv : $stateInvId $sOldId) :
+            (($targetCall).1).$fldId:ident = ($sOldId).$fldId:ident ∨ $miProp := by
+          qedSrvProveStep [$stateInvId, $targetId] $fnLit $miLbl))
+    return !hasNewErrors (← get).messages priorRep priorUnrep
+
+  let mut twoIdx := 0
+  for inv in invs do
+    if inv.isTwoSt then
+      unless (← emitTwoInv twoIdx inv) do return false
+      twoIdx := twoIdx + 1
+  for (mi, mutIdx) in mutInvs.zipIdx do
+    unless (← emitMutInv mutIdx mi) do return false
+  return true
+
+open Lean Elab Command in
+private def elabServerPureFn (priorRep priorUnrep : Nat)
+    (srvName : Name) (fnStr : String) (fnIdent stateId stateInvId : Ident)
+    (allBinderIds : Array Ident) (allBinderTys : Array Term) (callArgs : Array Term)
+    (payloadTerm : Term) (baseCtx : LowerCtx) (bodyStmts : Array Lean.Syntax)
+    (invs : Array ParsedInv) (mutInvs : Array ParsedMutInv)
+    (stateFieldNames envVarNames : Array String) :
+    CommandElabM (Option (Term × Bool × Array Name)) := do
+  let s0Id := mkIdent `_s0
+  let fnLit := Syntax.mkStrLit fnStr
+  let (pureBody, lSt) ← (lowerPureBlock baseCtx (inAtomic := false) s0Id s0Id bodyStmts).run {}
+  let isReadOnly := lSt.mutated.isEmpty
+  let stepId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_step")
+  elabCommand (← `(command|
+    def $stepId ($s0Id:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]* :
+        $stateId × Except Qed.Server.ApiError $payloadTerm :=
+      Qed.Server.srvFinish $s0Id $pureBody))
+  if hasNewErrors (← get).messages priorRep priorUnrep then return none
+
+  let stepCall ← allBinderIds.foldlM (init := ← `($stepId $s0Id)) fun acc id => `($acc $id)
+  if isReadOnly then
+    let roThmId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_readOnly")
+    let roLbl := Syntax.mkStrLit s!"{fnStr} read-only state preservation"
+    elabCommand (← `(command|
+      theorem $roThmId ($s0Id:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]* :
+          ($stepCall).1 = $s0Id := by
+        qedSrvProveStep [$stepId] $fnLit $roLbl))
+    if hasNewErrors (← get).messages priorRep priorUnrep then return none
+  else
+    let invThmId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_inv")
+    elabCommand (← `(command|
+      theorem $invThmId ($s0Id:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]*
+          (_hInv : $stateInvId $s0Id) :
+          $stateInvId ($stepCall).1 := by
+        qedSrvProveStep [$stateInvId, $stepId] $fnLit "StateInv"))
+    if hasNewErrors (← get).messages priorRep priorUnrep then return none
+    unless (← elabServerFnInvariants priorRep priorUnrep false srvName fnStr fnIdent stateId stateInvId
+        stepId allBinderIds allBinderTys stepCall invs mutInvs stateFieldNames envVarNames) do
+      return none
+
+  let snapCall ← callArgs.foldlM (init := ← `($stepId _sSnap)) fun acc a => `($acc $a)
+  let runExpr ← if isReadOnly then
+    `(Qed.Server.MonadAtomic.runAtomicRead (fun (_sSnap : $stateId) => ($snapCall).2))
+  else
+    `(Qed.Server.MonadAtomic.runAtomic (fun (_sSnap : $stateId) => $snapCall))
+  return some (runExpr, isReadOnly, lSt.extRoots)
+
+open Lean Elab Command in
+private def elabServerAsyncFn (priorRep priorUnrep : Nat)
+    (srvName : Name) (fnStr : String) (fnIdent stateId stateInvId : Ident)
+    (allBinderIds : Array Ident) (allBinderTys : Array Term) (callArgs : Array Term)
+    (payloadTerm : Term) (baseCtx : LowerCtx) (bodyStmts : Array Lean.Syntax)
+    (invs : Array ParsedInv) (mutInvs : Array ParsedMutInv)
+    (stateFieldNames envVarNames : Array String) :
+    CommandElabM (Option (Term × Bool × Array Name)) := do
+  let stateTyTerm : Term := ⟨stateId.raw⟩
+  let fnLit := Syntax.mkStrLit fnStr
+  let (asyncBody, lSt) ← (lowerAsyncBlock baseCtx (some stateTyTerm) bodyStmts).run {}
+  let isReadOnly := lSt.mutated.isEmpty
+  let handlerId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_handler")
+  elabCommand (← `(command|
+    def $handlerId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
+        [Qed.Server.MonadAtomic $stateId m]
+        $[($allBinderIds:ident : $allBinderTys:term)]* :
+        m (Except Qed.Server.ApiError $payloadTerm) :=
+      Qed.Server.srvFinishM $asyncBody))
+  if hasNewErrors (← get).messages priorRep priorUnrep then return none
+
+  let hCall ← allBinderIds.foldlM (init := ← `($handlerId)) fun acc id => `($acc $id)
+  let asyncInvId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_inv")
+  elabCommand (← `(command|
+    theorem $asyncInvId $[($allBinderIds:ident : $allBinderTys:term)]* :
+        Qed.Server.ProgPreservesInv $stateInvId
+          ($hCall : Qed.Server.ThreadProg $stateId _) := by
+      qedSrvProveAsync $handlerId [$stateInvId] $fnLit "StateInv"))
+  if hasNewErrors (← get).messages priorRep priorUnrep then return none
+  unless (← elabServerFnInvariants priorRep priorUnrep true srvName fnStr fnIdent stateId stateInvId
+      handlerId allBinderIds allBinderTys hCall invs mutInvs stateFieldNames envVarNames) do
+    return none
+
+  let hApp ← callArgs.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
+  return some (hApp, isReadOnly, lSt.extRoots)
+
+open Lean Elab Command in
+private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun stx => do
+  let srvIdent : Ident := ⟨stx[1]⟩
+  let srvName := srvIdent.getId
+  let srvShort := srvName.toString
+  let currNs ← getCurrNamespace
+  let fullSrvName := currNs ++ srvName
+  let parsed ← parseServerClauses srvIdent srvName stx[2].getArgs
+  let envDecls := parsed.envDecls
+  let stateDecls := parsed.stateDecls
+  let mutInvs := parsed.mutInvs
+  let invs := parsed.invs
+  let fnClauses := parsed.fnClauses
+
+  let hasState := !stateDecls.isEmpty
   let stateFieldNames := stateDecls.map (·.ident.getId.toString)
   let envVarNames := envDecls.map (·.ident.getId.toString)
   let envIdents := envDecls.map (·.ident)
@@ -1138,49 +1439,9 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
   let invInitId := mkIdentFrom srvIdent (srvName ++ `inv_init)
 
   if hasState then
-    let mut stFieldIds : Array Ident := #[]
-    let mut stFieldTys : Array Term := #[]
-    let mut stInitVals : Array Term := #[]
-    for sd in stateDecls do
-      let fty ← liftMacroM sd.ty.toPayloadTerm
-      let initCtx : LowerCtx := {
-        fnName := "initState", stateFields := #[], envVars := #[], locals := #[]
-        stateRule := .statelessServer, allowAwait := false, allowUnwrap := false
-        hasFallible := false, isOption := false, innerOptTy? := none
-      }
-      let (initTerm, _) ← (lowerExpr initCtx .val sd.initStx).run {}
-      stFieldIds := stFieldIds.push sd.ident
-      stFieldTys := stFieldTys.push fty
-      stInitVals := stInitVals.push (← `(srvAutoField($initTerm)))
-    elabCommand (← `(command|
-      structure $stateId where
-        $[$stFieldIds:ident : $stFieldTys:term]*))
-    elabCommand (← `(command|
-      def $initStateId : $stateId := { $[$stFieldIds:ident := $stInitVals:term],* }))
-    if hasNewErrors (← get).messages priorRep priorUnrep then return
-
-    let sParam := mkIdent `_s
-    let sOldDummy := mkIdent `_sOld
-    let mut singleProps : Array Term := #[]
-    for inv in invs do
-      if !inv.isTwoSt then
-        let invCtx : LowerCtx := {
-          fnName := "invariant", stateFields := stateFieldNames, envVars := envVarNames, locals := #[]
-          stateRule := .invariantProp sParam sOldDummy false
-          allowAwait := false, allowUnwrap := false
-          hasFallible := false, isOption := false, innerOptTy? := none
-        }
-        let (pTerm, _) ← (lowerExpr invCtx .propInv inv.exprStx).run {}
-        singleProps := singleProps.push pTerm
-    let invBody ← match singleProps.toList with
-      | []      => `(True)
-      | p :: ps => ps.foldlM (init := p) fun acc q => `($acc ∧ $q)
-    elabCommand (← `(command|
-      def $stateInvId ($sParam:ident : $stateId) : Prop := $invBody))
-    elabCommand (← `(command|
-      theorem $invInitId : $stateInvId $initStateId := by
-        qedSrvProveStep [$stateInvId, $initStateId] "initState" "initial state"))
-    if hasNewErrors (← get).messages priorRep priorUnrep then return
+    unless (← elabServerStateCmds priorRep priorUnrep stateId initStateId stateInvId invInitId
+        stateDecls invs stateFieldNames envVarNames) do
+      return
 
   -- 2. Elaborate each `fn`: step/handler + invariants + client RPC stub + dispatcher arm
   let mut methodInfos : Array ServerMethodInfo := #[]
@@ -1274,22 +1535,6 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
     let callArgs : Array Term := envIdents.map (⟨·.raw⟩) ++ #[⟨ctxId.raw⟩] ++ projs ++ reqHypIds.map (⟨·.raw⟩)
     let fnLit := Syntax.mkStrLit fnStr
 
-    let lowerTwoStProp (sOld sNew : Ident) (inv : ParsedInv) : CommandElabM Term := do
-      let twoCtx : LowerCtx := {
-        fnName := "invariant", stateFields := stateFieldNames, envVars := envVarNames, locals := #[]
-        stateRule := .invariantProp sNew sOld false
-        allowAwait := false, allowUnwrap := false, hasFallible := false, isOption := false, innerOptTy? := none
-      }
-      Prod.fst <$> (lowerExpr twoCtx .propInv inv.exprStx).run {}
-
-    let lowerMutProp (mi : ParsedMutInv) : CommandElabM Term := do
-      let miCtx : LowerCtx := {
-        fnName := fnStr, stateFields := #[], envVars := envVarNames, locals := #[]
-        stateRule := .statelessServer, allowAwait := false, allowUnwrap := false
-        hasFallible := false, isOption := false, innerOptTy? := none
-      }
-      Prod.fst <$> (lowerExpr miCtx .propInv mi.condStx).run {}
-
     let mkDispatchArm (runExpr : Term) : CommandElabM (TSyntax ``Lean.Parser.Term.matchAltExpr) := do
       let mut guardedRun ← `($runExpr >>= fun _fnRes => Pure.pure (_fnRes.map Qed.Proto.encode))
       for revIdx in [0:reqBoolTerms.size] do
@@ -1313,130 +1558,21 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
             | Except.ok $reqVar:ident => $bindProjBody)
 
     if hasState && !hasAwait then
-      let s0Id := mkIdent `_s0
-      let (pureBody, lSt) ← (lowerPureBlock baseCtx (inAtomic := false) s0Id s0Id bodyStmts).run {}
-      allExtRoots := allExtRoots ++ lSt.extRoots.filter (!allExtRoots.contains ·)
-      isReadOnly := lSt.mutated.isEmpty
-      let stepId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_step")
-      elabCommand (← `(command|
-        @[specialize]
-        def $stepId ($s0Id:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]* :
-            $stateId × Except Qed.Server.ApiError $payloadTerm :=
-          Qed.Server.srvFinish $s0Id $pureBody))
-      if hasNewErrors (← get).messages priorRep priorUnrep then return
-
-      let stepCall ← allBinderIds.foldlM (init := ← `($stepId $s0Id)) fun acc id => `($acc $id)
-      if isReadOnly then
-        let roThmId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_readOnly")
-        let roLbl := Syntax.mkStrLit s!"{fnStr} read-only state preservation"
-        elabCommand (← `(command|
-          theorem $roThmId ($s0Id:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]* :
-              ($stepCall).1 = $s0Id := by
-            qedSrvProveStep [$stepId] $fnLit $roLbl))
-        if hasNewErrors (← get).messages priorRep priorUnrep then return
-      else
-        let invThmId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_inv")
-        elabCommand (← `(command|
-          theorem $invThmId ($s0Id:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]*
-              (_hInv : $stateInvId $s0Id) :
-              $stateInvId ($stepCall).1 := by
-            qedSrvProveStep [$stateInvId, $stepId] $fnLit "StateInv"))
-        if hasNewErrors (← get).messages priorRep priorUnrep then return
-        let mut twoIdx := 0
-        for inv in invs do
-          if inv.isTwoSt then
-            let sNewId := mkIdent `_sNew
-            let relProp ← lowerTwoStProp s0Id sNewId inv
-            let twoThmId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter s!"_twoInv{twoIdx}")
-            let twoLbl := Syntax.mkStrLit inv.label
-            elabCommand (← `(command|
-              theorem $twoThmId ($s0Id:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]*
-                  (_hInv : $stateInvId $s0Id) :
-                  let $sNewId:ident := ($stepCall).1
-                  $relProp := by
-                qedSrvProveStep [$stateInvId, $stepId] $fnLit $twoLbl))
-            if hasNewErrors (← get).messages priorRep priorUnrep then return
-            twoIdx := twoIdx + 1
-        let mut mutIdx := 0
-        for mi in mutInvs do
-          let miProp ← lowerMutProp mi
-          let fldId := mi.fieldId
-          let miThmId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter s!"_mutInv{mutIdx}")
-          let miLbl := Syntax.mkStrLit mi.label
-          elabCommand (← `(command|
-            theorem $miThmId ($s0Id:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]*
-                (_hInv : $stateInvId $s0Id) :
-                (($stepCall).1).$fldId:ident = ($s0Id).$fldId:ident ∨ $miProp := by
-              qedSrvProveStep [$stateInvId, $stepId] $fnLit $miLbl))
-          if hasNewErrors (← get).messages priorRep priorUnrep then return
-          mutIdx := mutIdx + 1
-
-      let snapCall ← callArgs.foldlM (init := ← `($stepId _sSnap)) fun acc a => `($acc $a)
-      let runExpr ← if isReadOnly then
-        `(Qed.Server.MonadAtomic.runAtomicRead (fun (_sSnap : $stateId) => ($snapCall).2))
-      else
-        `(Qed.Server.MonadAtomic.runAtomic (fun (_sSnap : $stateId) => $snapCall))
+      let some (runExpr, ro, extRoots) ← elabServerPureFn priorRep priorUnrep
+          srvName fnStr fnIdent stateId stateInvId
+          allBinderIds allBinderTys callArgs payloadTerm baseCtx bodyStmts
+          invs mutInvs stateFieldNames envVarNames | return
+      isReadOnly := ro
+      allExtRoots := allExtRoots ++ extRoots.filter (!allExtRoots.contains ·)
       dispatchArms := dispatchArms.push (← mkDispatchArm runExpr)
 
     else if hasState && hasAwait then
-      let stateTyTerm : Term := ⟨stateId.raw⟩
-      let (asyncBody, lSt) ← (lowerAsyncBlock baseCtx (some stateTyTerm) bodyStmts).run {}
-      allExtRoots := allExtRoots ++ lSt.extRoots.filter (!allExtRoots.contains ·)
-      isReadOnly := lSt.mutated.isEmpty
-      let handlerId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_handler")
-      elabCommand (← `(command|
-        @[specialize]
-        def $handlerId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
-            [Qed.Server.MonadAtomic $stateId m]
-            $[($allBinderIds:ident : $allBinderTys:term)]* :
-            m (Except Qed.Server.ApiError $payloadTerm) :=
-          Qed.Server.srvFinishM $asyncBody))
-      if hasNewErrors (← get).messages priorRep priorUnrep then return
-
-      let hCall ← allBinderIds.foldlM (init := ← `($handlerId)) fun acc id => `($acc $id)
-      let asyncInvId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_inv")
-      elabCommand (← `(command|
-        theorem $asyncInvId $[($allBinderIds:ident : $allBinderTys:term)]* :
-            Qed.Server.ProgPreservesInv $stateInvId
-              ($hCall : Qed.Server.ThreadProg $stateId _) := by
-          qedSrvProveAsync $handlerId [$stateInvId] $fnLit "StateInv"))
-      if hasNewErrors (← get).messages priorRep priorUnrep then return
-
-      let mut twoIdx := 0
-      for inv in invs do
-        if inv.isTwoSt then
-          let sOldId := mkIdent `_sOld
-          let sNewId := mkIdent `_sNew
-          let relProp ← lowerTwoStProp sOldId sNewId inv
-          let twoThmId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter s!"_twoInv{twoIdx}")
-          let twoLbl := Syntax.mkStrLit inv.label
-          elabCommand (← `(command|
-            theorem $twoThmId $[($allBinderIds:ident : $allBinderTys:term)]* :
-                Qed.Server.ProgPreservesStepRel $stateInvId
-                  (fun ($sOldId:ident $sNewId:ident : $stateId) => $relProp)
-                  ($hCall : Qed.Server.ThreadProg $stateId _) := by
-              qedSrvProveAsync $handlerId [$stateInvId] $fnLit $twoLbl))
-          if hasNewErrors (← get).messages priorRep priorUnrep then return
-          twoIdx := twoIdx + 1
-
-      let mut mutIdx := 0
-      for mi in mutInvs do
-        let miProp ← lowerMutProp mi
-        let fldId := mi.fieldId
-        let sOldId := mkIdent `_sOld
-        let sNewId := mkIdent `_sNew
-        let miThmId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter s!"_mutInv{mutIdx}")
-        let miLbl := Syntax.mkStrLit mi.label
-        elabCommand (← `(command|
-          theorem $miThmId $[($allBinderIds:ident : $allBinderTys:term)]* :
-              Qed.Server.ProgPreservesStepRel $stateInvId
-                (fun ($sOldId:ident $sNewId:ident : $stateId) => ($sNewId).$fldId:ident = ($sOldId).$fldId:ident ∨ $miProp)
-                ($hCall : Qed.Server.ThreadProg $stateId _) := by
-            qedSrvProveAsync $handlerId [$stateInvId] $fnLit $miLbl))
-        if hasNewErrors (← get).messages priorRep priorUnrep then return
-        mutIdx := mutIdx + 1
-
-      let hApp ← callArgs.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
+      let some (hApp, ro, extRoots) ← elabServerAsyncFn priorRep priorUnrep
+          srvName fnStr fnIdent stateId stateInvId
+          allBinderIds allBinderTys callArgs payloadTerm baseCtx bodyStmts
+          invs mutInvs stateFieldNames envVarNames | return
+      isReadOnly := ro
+      allExtRoots := allExtRoots ++ extRoots.filter (!allExtRoots.contains ·)
       dispatchArms := dispatchArms.push (← mkDispatchArm hApp)
 
     else
@@ -1444,7 +1580,6 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
       allExtRoots := allExtRoots ++ lSt.extRoots.filter (!allExtRoots.contains ·)
       let handlerId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_handler")
       elabCommand (← `(command|
-        @[specialize]
         def $handlerId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
             $[($allBinderIds:ident : $allBinderTys:term)]* :
             m (Except Qed.Server.ApiError $payloadTerm) :=
@@ -1473,90 +1608,8 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
       isOption := innerOpt?.isSome
     }
 
-  -- 3. Emit `<S>.concurrent_linearizable` theorem if stateful
-  if hasState then
-    let linThmId := mkIdentFrom srvIdent (srvName ++ `concurrent_linearizable)
-    elabCommand (← `(command|
-      theorem $linThmId {Out : Type}
-          (st : Qed.Server.MultiCoreState $stateId Out)
-          (hsched : Qed.Server.MultiCoreSchedule $stateInvId ⟨$initStateId, []⟩ st) :
-          $stateInvId st.shared :=
-        Qed.Server.concurrent_schedule_preserves_inv $stateInvId $initStateId st $invInitId hsched))
-
-  -- 4. Resolve transitive secrets & external service base URLs from `externalRegistry`
-  let extMap := externalRegistry.getState (← getEnv)
-  let mut reqSecrets : Array String := #[]
-  for ed in envDecls do
-    if ed.default?.isNone && !reqSecrets.contains ed.osKey then
-      reqSecrets := reqSecrets.push ed.osKey
-  let mut usedExts : Array (String × String) := #[]
-  for root in allExtRoots do
-    let cand1 := currNs ++ root
-    let info? := (extMap.find? cand1).orElse fun _ => extMap.find? root
-    if let some extInfo := info? then
-      let sStr := root.toString
-      unless usedExts.any (·.1 == sStr) do
-        usedExts := usedExts.push (sStr, extInfo.baseOrigin)
-      for sec in extInfo.secrets do
-        unless reqSecrets.contains sec do
-          reqSecrets := reqSecrets.push sec
-
-  let secretsId := mkIdentFrom srvIdent (srvName ++ `secrets)
-  let secLits : Array Term := reqSecrets.map (Syntax.mkStrLit ·)
-  elabCommand (← `(command| def $secretsId : Array String := #[$[$secLits],*]))
-
-  let readOnlyId := mkIdentFrom srvIdent (srvName ++ `readOnlyMethods)
-  let roLits : Array Term := (methodInfos.filter (·.isReadOnly)).map (Syntax.mkStrLit ·.name)
-  elabCommand (← `(command| def $readOnlyId : Array String := #[$[$roLits],*]))
-
-  -- 5. Emit `<S>.dispatchM`
-  let methodVar := mkIdent `method
-  let notFoundArm ← `(Lean.Parser.Term.matchAltExpr|
-    | _ => Pure.pure (Except.error (Qed.Server.ApiError.notFound ("unknown RPC method: " ++ $methodVar))))
-  let allArms := dispatchArms.push notFoundArm
-  let matchMethodTerm ← `(match $methodVar:ident with $[$allArms:matchAlt]*)
-  let fullDispatchBody ← envDecls.foldrM (init := matchMethodTerm) fun ed acc => do
-    let eid := ed.ident
-    let keyLit := Syntax.mkStrLit ed.osKey
-    match ed.default? with
-    | some defVal =>
-        let defLit := Syntax.mkStrLit defVal
-        `(Qed.Server.MonadServer.readEnv $keyLit >>= fun _envOpt =>
-            let $eid:ident : String := _envOpt.getD $defLit
-            $acc)
-    | none =>
-        let missingMsg := Syntax.mkStrLit s!"missing required environment variable `{ed.osKey}`"
-        `(Qed.Server.MonadServer.readEnv $keyLit >>= fun _envOpt =>
-            match _envOpt with
-            | some $eid:ident => $acc
-            | none => Pure.pure (Except.error (Qed.Server.ApiError.internal $missingMsg)))
-
-  let dispatchId := mkIdentFrom srvIdent (srvName ++ `dispatchM)
-  if hasState then
-    elabCommand (← `(command|
-      @[specialize]
-      def $dispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
-          [Qed.Server.MonadAtomic $stateId m]
-          ($ctxId:ident : Qed.Server.RequestCtx) ($methodVar:ident : String) ($reqBytesId:ident : ByteArray) :
-          m (Except Qed.Server.ApiError ByteArray) :=
-        $fullDispatchBody))
-  else
-    elabCommand (← `(command|
-      @[specialize]
-      def $dispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
-          ($ctxId:ident : Qed.Server.RequestCtx) ($methodVar:ident : String) ($reqBytesId:ident : ByteArray) :
-          m (Except Qed.Server.ApiError ByteArray) :=
-        $fullDispatchBody))
-
-  modifyEnv fun env => serverRegistry.addEntry env {
-    serverName := fullSrvName
-    shortName := srvShort
-    hasState
-    secrets := reqSecrets
-    envVars := envDecls.map fun e => (e.ident.getId.toString, e.osKey, e.default?)
-    externalServices := usedExts
-    methods := methodInfos
-  }
+  elabServerDispatchCmds srvIdent stateId initStateId stateInvId invInitId
+    srvName fullSrvName srvShort hasState envDecls allExtRoots methodInfos dispatchArms ctxId reqBytesId
 
 open Lean Elab Command in
 private def rollbackFailedServer (savedEnv : Environment)

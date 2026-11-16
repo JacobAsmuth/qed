@@ -184,14 +184,19 @@ def verifyReachable (env : Environment) (reachable : Array Name) : Except String
     3. Every non-meta declaration is safe (not `unsafe`), total (no `partial` / `while` /
        `@[implemented_by]`), free of unverified `@[extern]`/`opaque` outside `Qed.Dom`, and
        axiom-clean. -/
-def verifyProjectEnv (env : Environment) : Except String Nat := do
+def isFrameworkModule (modName : Name) : Bool :=
+  let root := modName.getRoot
+  root == `Qed || root == `Js || root == `Cli
+
+def verifyProjectEnv (env : Environment) (skipFramework : Bool := false) : Except String Nat := do
   let mut clean : Std.HashSet Name := {}
   let mut checkedCount : Nat := 0
   let modNames := env.header.moduleNames
   let modData  := env.header.moduleData
   for i in [0:modNames.size] do
     let modName := modNames[i]!
-    if !isToolchainModule modName && i < modData.size then
+    let skip := isToolchainModule modName || (skipFramework && isFrameworkModule modName)
+    if !skip && i < modData.size then
       for n in modData[i]!.constNames do
         if let some ci := env.find? n then
           checkedCount := checkedCount + 1

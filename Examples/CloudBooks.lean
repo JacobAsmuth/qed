@@ -114,7 +114,7 @@ component BookRow where
   view =>
     <li {rowStyle} class="book-row">
       <a href={R.detail book.slot} class="book-title">{book.title}</a>
-      <span class="book-stock">{s!"Stock: {book.stock}"}</span>
+      <span class="book-stock">Stock: {book.stock}</span>
       <button {btnStyle} class="order-btn" onClick={onOrder}>Order copy</button>
     </li>
 
@@ -123,11 +123,11 @@ component BookDetail where
   view =>
     <article class="book-detail">
       <h2>{book.title}</h2>
-      <p class="detail-stock">{s!"In stock: {book.stock}"}</p>
+      <p class="detail-stock">In stock: {book.stock}</p>
     </article>
 
-app Storefront where
-  route route : R := .catalog
+component Storefront where
+  route : R := .catalog
     | .catalog    => books := .loading, perform (Catalog.list (books := ·))
     | .detail idx => current := .loading, perform (Catalog.findAt idx (current := ·))
   state books     : Resource (Array Book) := .idle
@@ -156,18 +156,18 @@ app Storefront where
        | .catalog =>
            <section class="catalog">
              <h1>Verified Cloud Bookstore</h1>
-             <Await of={books} as={arr}
+             <Await of={books} as={arr} err={e}
                loading={<p class="loading">Loading catalog…</p>}
-               failed={fun e => <p class="error">{e}</p>}>
-               <ul class="books">{arr.map fun b =>
+               failed={<p class="error">{e}</p>}>
+               <ul class="books">{for b in arr =>
                  <BookRow key={b.id} book={b} onOrder={.orderOne b.slot}/>}</ul>
              </Await>
            </section>
        | .detail _ =>
            <section class="detail">
-             <Await of={current} as={b}
+             <Await of={current} as={b} err={e}
                loading={<p class="loading">Loading book…</p>}
-               failed={fun e => <p class="error">{e}</p>}>
+               failed={<p class="error">{e}</p>}>
                <BookDetail book={b}/>
              </Await>
            </section>}

@@ -1,74 +1,58 @@
 import Qed
 open Qed
 
-namespace Effects
+component Effects where
+  state count    : Int := 0
+  state title          := ""
+  state query          := ""
+  state searches : Nat := 0
+  state status         := "ready"
 
-structure Model where
-  count    : Int
-  title    : String
-  query    : String
-  searches : Nat
-  status   : String
+  start (Cmd.storageGet "count" .loaded)
 
-def init : Model := { count := 0, title := "", query := "", searches := 0, status := "ready" }
+  port echoOut : String
+  port echoIn (s : String) => status := s!"echo: {s}"
 
-inductive Msg
-  | inc | dec
-  | loaded (v : Option String)
-  | editTitle (s : String) | applyTitle
-  | roll | rolled (n : Int)
-  | delayed | tick
-  | ping | gotEcho (s : String)
-  | pick | picked (r : Except String FilePick)
-  | focusTitle
-  | saveBatch
-  | typeSearch (s : String) | runSearch (s : String)
+  action inc =>
+    let next := count + 1
+    count := next
+    perform (Cmd.storageSet "count" (toString next))
+  action dec =>
+    let next := count - 1
+    count := next
+    perform (Cmd.storageSet "count" (toString next))
+  action loaded (v : Option String) =>
+    count := (v.bind (·.toInt?)).getD count
+  action applyTitle => perform (Cmd.setTitle title)
+  action roll       => perform (Cmd.randomInt 1 6 .rolled)
+  action rolled (n : Int) => status := s!"rolled: {n}"
+  action delayed    => status := "waiting…", perform (Cmd.after 300 .tick)
+  action tick       => status := "delayed!"
+  action ping       => perform (echoOut "ping")
+  action pick       => perform (Cmd.pickFile ".txt,text/*" .picked)
+  action picked (r : Except String FilePick) =>
+    status := match r with
+      | .ok f    => s!"file: {f.name}={f.text}"
+      | .error e => s!"file error: {e}"
+  action focusTitle => perform (Cmd.focus "title-input")
+  action saveBatch  =>
+    status := "saved+titled"
+    perform (.batch [.storageSet "count" (toString count), .setTitle "Saved!"])
+  action typeSearch (s : String) =>
+    query := s
+    perform (Cmd.afterKeyed "search" 200 (.runSearch s))
+  action runSearch (s : String) =>
+    status := s!"searched: {s}"
+    searches += 1
 
-ports where
-  echoOut : String
-  echoIn  : String => .gotEcho
-
-def update (m : Model) : Msg → Model
-  | .inc          => { m with count := m.count + 1 }
-  | .dec          => { m with count := m.count - 1 }
-  | .loaded v     => { m with count := (v.bind (·.toInt?)).getD m.count }
-  | .editTitle s  => { m with title := s }
-  | .rolled n     => { m with status := s!"rolled: {n}" }
-  | .delayed      => { m with status := "waiting…" }
-  | .tick         => { m with status := "delayed!" }
-  | .gotEcho s    => { m with status := s!"echo: {s}" }
-  | .picked r     => { m with status := match r with
-                                        | .ok f    => s!"file: {f.name}={f.text}"
-                                        | .error e => s!"file error: {e}" }
-  | .saveBatch    => { m with status := "saved+titled" }
-  | .typeSearch s => { m with query := s }
-  | .runSearch s  => { m with status := s!"searched: {s}", searches := m.searches + 1 }
-  | _             => m
-
-def effects (m : Model) : Msg → Cmd Msg
-  | .inc | .dec   => Cmd.storageSet "count" (toString m.count)
-  | .applyTitle   => Cmd.setTitle m.title
-  | .roll         => Cmd.randomInt 1 6 .rolled
-  | .delayed      => Cmd.after 300 .tick
-  | .ping         => echoOut "ping"
-  | .pick         => Cmd.pickFile ".txt,text/*" .picked
-  | .focusTitle   => Cmd.focus "title-input"
-  | .saveBatch    => .batch [.storageSet "count" (toString m.count), .setTitle "Saved!"]
-  | .typeSearch s => Cmd.afterKeyed "search" 200 (.runSearch s)
-  | _             => .none
-
-def transition (m : Model) (msg : Msg) : Model × Cmd Msg :=
-  let m' := update m msg; (m', effects m' msg)
-
-def app : App Model Msg :=
-  ui init transition (onPort := onPort) (start := Cmd.storageGet "count" .loaded) fun m =>
+  view =>
     <div class="app">
       <div class="counter">
         <button class="dec" onClick={.dec}>−</button>
-        <span class="count" id="count">{m.count}</span>
+        <span class="count" id="count">{count}</span>
         <button class="inc" onClick={.inc}>+</button>
       </div>
-      <input id="title-input" class="title" bind={(m.title, .editTitle)} placeholder="page title"/>
+      <input id="title-input" class="title" bind={title} placeholder="page title"/>
       <button class="apply" onClick={.applyTitle}>Set title</button>
       <button class="roll" onClick={.roll}>Roll d6</button>
       <button class="delay" onClick={.delayed}>Delayed</button>
@@ -76,9 +60,7 @@ def app : App Model Msg :=
       <button class="pick" onClick={.pick}>Pick file</button>
       <button class="focus" onClick={.focusTitle}>Focus title</button>
       <button class="save" onClick={.saveBatch}>Save (batch)</button>
-      <input class="search" bind={(m.query, .typeSearch)} placeholder="debounced search"/>
-      <span class="searches" id="searches">{m.searches}</span>
-      <div class="status" id="status">{m.status}</div>
+      <input class="search" value={query} onInput={.typeSearch} placeholder="debounced search"/>
+      <span class="searches" id="searches">{searches}</span>
+      <div class="status" id="status">{status}</div>
     </div>
-
-end Effects

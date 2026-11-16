@@ -17,9 +17,11 @@ component LogLine where
   prop text : String
   view => <div class="line">{text}</div>
 
-app EchoSocket where
-  state conn  : Conn         := .offline
-  state draft                := ""
+end Socket
+
+component Socket where
+  state conn  : Conn  := .offline
+  state draft         := ""
   state log   : Array String := #[]
 
   action connect =>
@@ -46,14 +48,10 @@ app EchoSocket where
         <button class="connect" onClick={.connect} disabled={conn != .offline}>Connect</button>
         <button class="disconnect" onClick={.disconnect} disabled={conn == .offline}>Disconnect</button>
       </div>
-      <div class="log">{log.map fun line => <LogLine text={line}/>}</div>
+      <div class="log">{for line in log => <LogLine text={line}/>}</div>
       <div class="composer">
-        <input class="draft" bind={(draft, .typed)} placeholder="Echo something…"
+        <input class="draft" value={draft} onInput={.typed} placeholder="Echo something…"
                disabled={conn != .online}/>
         <button class="send" onClick={.send} disabled={conn != .online}>Send</button>
       </div>
     </div>
-
-def app := EchoSocket.app
-
-end Socket

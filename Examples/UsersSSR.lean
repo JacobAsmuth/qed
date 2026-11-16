@@ -7,7 +7,7 @@ def serverProfiles : List (String × Profile) :=
   [ ("ada",  { name := "Ada",  bio := "Wrote the first algorithm." }),
     ("alan", { name := "Alan", bio := "Asked what machines can decide." }) ]
 
-def modelFor (path : String) : Model :=
+def modelFor (path : String) : State :=
   let route : R := (Router.fromURL path).getD .home
   { init with
     route   := route

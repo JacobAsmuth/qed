@@ -14,7 +14,7 @@ await withBrowser('TEMPLATE-HYDRATION', {
 }, async ({ page, check, baseUrl }) => {
   await page.goto(`${baseUrl}/index.html`, { waitUntil: 'load' });
   await page.waitForSelector('#app .count', { timeout: 15000 });
-  await page.waitForFunction(() => document.querySelector('[data-qed-on-click]') !== null, { timeout: 5000 });
+  await page.waitForFunction(() => Boolean(window.qed), { timeout: 5000 });
 
   const count = () => page.$eval('#app .count', (e) => e.textContent.trim());
   const adopted = () => page.$eval('#app .count', (e) => e.getAttribute('data-server') === '1');

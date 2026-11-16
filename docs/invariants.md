@@ -19,7 +19,6 @@ goal.
 |------------------------|--------|
 | One pure `update` or `transition` | `invariant safe (m) : 0 ≤ m.count preserved_by update` |
 | Initial state + `update` | `invariant safe (m) : 0 ≤ m.count from init preserved_by update` |
-| An `App` (`app.init` + `app.update`) | `invariant safe (m) on counterApp : 0 ≤ m.count` |
 | Multiple clauses (`∧`) | `invariant inRange (m) : 1 ≤ m.qty, m.qty ≤ 10 preserved_by update` |
 | Inside a `component` block | `invariant 1 ≤ qty, qty ≤ 10` |
 | Rendered HTML / styles | `invariant styled : roleHasOneOf "save" [on, off] holds_in view` |
@@ -53,11 +52,11 @@ themselves with no tactic script:
 invariant counterSafe (m) : 0 ≤ m.count preserved_by update
 ```
 
-Effectful `transition` functions (`Model → Msg → Model × Cmd Msg`) and `App` values use the
+Effectful `transition` functions (`Model → Msg → Model × Cmd Msg`) use the
 exact same syntax—Qed automatically projects the next model out of `(model, cmd)`:
 
 ```lean
-invariant streamSafe (m) on chatApp : m.pending = true → 0 < m.turns.size
+invariant streamSafe (m) : m.pending = true → 0 < m.turns.size from init preserved_by transition
 ```
 
 **Custom proof (`:= by`).** When a property quantifies over a collection (`Array` or `List`) or
@@ -70,6 +69,9 @@ invariant idsBelowNext (m) : ∀ r ∈ m.rows, r.id < m.nextId
   intro m msg h
   cases msg <;> simp_all [update] <;> omega
 ```
+
+Inside a `component`, `init` is discharged automatically and `update` is in scope, so a custom
+`invariant … := by …` proof only needs to handle preservation (`intro m msg h`).
 
 ## Lifting invariants over child collections (`for_each`)
 
@@ -120,9 +122,10 @@ invariant feedStyled : cardStyled for_each cards holds_in view
 ```
 
 Qed applies `cardStyled` to each rendered card (invariant under `Html.map` message wrapping) and
-checks the rest of the parent markup separately. If a branch needs manual help, the error
-message provides a `forEachStyleLift` skeleton. See [`Examples/Feed.lean`](../Examples/Feed.lean)
-for both state and styling lifts in action.
+checks the rest of the parent markup separately. If a branch needs manual help, the error message provides a `forEachStyleLift` skeleton.
+Inside a `component`, you can write both lifts directly without `preserved_by` or `holds_in`:
+`invariant feedSafe : Card.cardSafe for_each cards` and `invariant feedStyled : Card.cardStyled for_each cards`
+(see [`Examples/Feed.lean`](../Examples/Feed.lean) for both state and styling lifts in action).
 
 ## Styling invariants (over the view)
 

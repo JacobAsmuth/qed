@@ -16,17 +16,6 @@ def updateKeyed (c : Component Model Msg) (key : Model → String)
     (models : Array Model) (k : String) (msg : Msg) : Array Model :=
   models.map fun r => if key r == k then c.update r msg else r
 
-def each (c : Component Model Msg) (keyOf : Model → String) (rows : Array Model)
-    (route : String → Msg → PMsg)
-    (wrap : Model → Html PMsg → Html PMsg := fun _ child => child) : Array (Html PMsg) :=
-  rows.map fun row =>
-    let k := keyOf row
-    let child := wrap row (render c (route k) row)
-    match child with
-    | .element tag attrs children =>
-        .element tag (.key k :: attrs.filter (fun | .key _ => false | _ => true)) children
-    | other => .element "div" [.key k] [other]
-
 end Component
 
 namespace ForEach

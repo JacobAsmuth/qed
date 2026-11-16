@@ -2,7 +2,6 @@ import Qed.Html
 import Qed.Notation
 import Qed.Render
 import Qed.Runtime
-import Qed.Steps
 import Qed.Diff
 import Qed.Invariant
 import Qed.Json

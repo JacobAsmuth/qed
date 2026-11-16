@@ -141,11 +141,10 @@ The same build output also works as a static single-page app: point client route
 | `Qed/Proofs/DomEquiv.lean` | Refinement proofs linking the `MonadDom` driver, keyed moves, hydration, `SoundMemo`, and SSR to `Html.render`. |
 | `Qed/Runtime.lean` (`Qed/Runtime/`) | TEA `App` and `ui` builders, `Cmd` effects, typed ports, local components, and `Dehydrate` codecs. |
 | `Qed/Ssr.lean` | Document serialization (`renderDocument`), breakout-safety proofs, and per-request SSR execution. |
-| `Qed/Steps.lean` | `steps` macro for effectful transitions where branches return either `model` or `(model, cmd)`. |
 | `Qed/Json.lean` (`Qed/Json/`) | Total JSON parser/renderer and `ToJson` / `FromJson` / `LawfulJson` round-trip proofs. |
 | `Qed/Router.lean` | `Router` / `LawfulKey` classes, the `router` macro, and verified URL formatting/parsing. |
 | `Qed/Schema.lean` | Refined `Field` types, form controls, and the `schema` macro (generates `Draft`, `formView`, `canSubmit_iff`, and JSON codecs). |
-| `Qed/Component.lean` (`Qed/Component/`) | `component` macro (`prop`, `state`, `emits`, `action`, `collection`, `invariant`, `view`). |
+| `Qed/Component.lean` (`Qed/Component/`) | `component` macro (`prop`, `state`, `event`, `port`, `query`, `route`, `action`, `collection`, `invariant`, `view`). |
 | `Qed/Invariant.lean` (`Qed/Invariant/`) | `invariant` command (`preserved_by`, `holds_in`, `for_each`) and proof automation. |
 | `Js/Backend.lean` | Total Lean IR to typed JavaScript AST compiler and pretty-printer. |
 | `Js/VerifyEnv.lean` | Kernel `Lean.Environment` gate enforcing standard axioms and total definitions. |

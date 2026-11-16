@@ -12,7 +12,9 @@ component Row where
   view =>
     <span class={if done then "item done" else "item"} onClick={.toggle}>{text}</span>
 
-app Board where
+end Todo
+
+component Todo where
   collection rows : Row
   state draft := ""
   state nextId := 0
@@ -30,13 +32,9 @@ app Board where
         <button class="addbtn" onClick={.add}>Add</button>
         <button class="sortbtn" onClick={.sort}>Sort</button>
       </div>
-      <ul class="items">{Row.each rows .rows fun r child =>
+      <ul class="items">{for r in rows =>
         <li class="row">
-          {child}
+          <Row state={r}/>
           <button class="rm" onClick={.remove r.id}>✕</button>
         </li>}</ul>
     </div>
-
-def app := Board.app
-
-end Todo

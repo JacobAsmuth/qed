@@ -41,8 +41,12 @@ syntax (name := jsxIfLet)
   atomic("if " "let ") term " := " term " then " jsxExpr (" else " jsxExpr)? : jsxExpr
 syntax (name := jsxIf)
   "if " (atomic(ident " : "))? term " then " jsxExpr (" else " jsxExpr)? : jsxExpr
+syntax (name := jsxFor)
+  atomic("for " ident " in ") term " => " jsxExpr : jsxExpr
 @[jsxExpr_parser] def jsxTermExpr : Parser := leading_parser
-  notFollowedBy (symbol "if") "if" >> termParser
+  notFollowedBy (symbol "if") "if" >>
+  notFollowedBy (atomic (symbol "for" >> ident >> symbol "in")) "for" >>
+  termParser
 
 def jsxAssignOp : Parser := symbol ":=" <|> symbol "+=" <|> symbol "-="
 def jsxAssignItem : Parser := node `Qed.Jsx.jsxAssignItem (ident >> jsxAssignOp >> termParser)
@@ -210,6 +214,15 @@ partial def expandJsxExpr (pPath : String) (parentCtx? : Option (String × HtmlC
         `(if $hId:ident : $cond then $tT else $eT)
       else `(if $cond then $tT else $eT)
     return (res, isListT || isListE)
+  else if stx.getKind == ``jsxFor then
+    let xId : Ident := ⟨stx[1]⟩
+    let xs : Term := ⟨← expandJsxIn stx[3]⟩
+    let (bodyT, isListB) ← expandJsxExpr pPath parentCtx? fallback stx[5]
+    let res ← if isListB then
+      `((Qed.mapList (Qed.ForEachItems.toList $xs) (fun $xId:ident => $bodyT)).flatten)
+    else
+      `(Qed.mapList (Qed.ForEachItems.toList $xs) (fun $xId:ident => $bodyT))
+    return (res, true)
   else
     let exp ← expandJsxIn stx
     return (⟨exp⟩, isMapCall exp)
@@ -278,7 +291,7 @@ partial def isMapCall (stx : Syntax) : Bool :=
     match s[0] with
     | .ident _ _ n _ =>
         match n.eraseMacroScopes with
-        | .str _ name => (name == "map" && s[1].getNumArgs == 1) || name == "each"
+        | .str _ name => name == "map" && s[1].getNumArgs == 1
         | _ => false
     | _ => false
   else false
@@ -352,9 +365,14 @@ partial def expandAwaitTag (pPath : String) (parentCtx? : Option (String × Html
     (stx opener : Syntax) (attrStxs kids : Array Syntax) : MacroM Term := do
   let mut of?      : Option Term := none
   let mut asId?    : Option Ident := none
+  let mut errId?   : Option Ident := none
   let mut loading? : Option Term := none
   let mut failed?  : Option Term := none
   let mut idle?    : Option Term := none
+  let parseVar (attrNm : String) (v : Term) : MacroM Ident := do
+    if v.raw.isIdent then return ⟨v.raw⟩
+    else if let some s := v.raw.isStrLit? then return mkIdentFrom v (Name.mkSimple s)
+    else Macro.throwErrorAt v s!"`{attrNm}` expects a variable name (`{attrNm}=\{val}` or `{attrNm}=\"val\"`)"
   for a in attrStxs do
     if a.getKind == ``attrSplice then
       Macro.throwErrorAt a "<Await> does not accept spliced HTML attributes"
@@ -363,16 +381,16 @@ partial def expandAwaitTag (pPath : String) (parentCtx? : Option (String × Html
       Macro.throwErrorAt a s!"<Await>: `{name}` requires a value"
     let v ← expandAttrVal a[1] (`(""))
     match name with
-    | "of" | "value" => of? := some v
-    | "as"           =>
-        if v.raw.isIdent then asId? := some ⟨v.raw⟩
-        else if let some s := v.raw.isStrLit? then asId? := some (mkIdentFrom v (Name.mkSimple s))
-        else Macro.throwErrorAt v "`as` expects a variable name (`as={val}` or `as=\"val\"`)"
+    | "of"           => of? := some v
+    | "as"           => asId? := some (← parseVar "as" v)
+    | "err"          => errId? := some (← parseVar "err" v)
     | "loading"      => loading? := some v
     | "failed"       => failed? := some v
     | "idle"         => idle? := some v
-    | _              => Macro.throwErrorAt a[0] s!"<Await>: unknown attribute `{name}` (expected of, as, loading, failed, idle)"
+    | _              => Macro.throwErrorAt a[0] s!"<Await>: unknown attribute `{name}` (expected of, as, err, loading, failed, idle)"
   let some ofT := of? | Macro.throwErrorAt stx "<Await> requires `of={resource}`"
+  if errId?.isSome && failed?.isNone then
+    Macro.throwErrorAt stx "<Await>: `err={…}` requires a `failed={…}` view"
   let parts ← collectKidParts pPath parentCtx? opener kids
   let singleKid ← match parts with
     | #[.single t] => pure t
@@ -381,9 +399,10 @@ partial def expandAwaitTag (pPath : String) (parentCtx? : Option (String × Html
     | some b => `(fun $b:ident => $singleKid)
     | none   => pure singleKid
   let loadT ← loading?.getDM `(Qed.Html.text "Loading…")
-  let failT ← match failed? with
-    | none => `((fun (e : String) => Qed.Html.text e))
-    | some f =>
+  let failT ← match failed?, errId? with
+    | none,   _      => `((fun (e : String) => Qed.Html.text e))
+    | some f, some b => `(fun ($b:ident : String) => $f)
+    | some f, none   =>
         let isEl := f.raw.getKind == ``qedCompTerm ||
           (f.raw.getKind == ``Lean.Parser.Term.app &&
             (f.raw[0].getId == ``Qed.el || f.raw[0].getKind == ``qedCompTerm))

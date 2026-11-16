@@ -19,13 +19,15 @@ component Card where
   view =>
     <article role="card" class="feed-card">
       <progress max={duration} value={progress}/>
-      <strong>{s!"@{author}"}</strong>
+      <strong>@{author}</strong>
       <button role="like"
         onClick={liked := !liked, likes := if liked then likes - 1 else likes + 1}
-        {if liked then likeOn else likeOff}>{s!"♥ {likes}"}</button>
+        {if liked then likeOn else likeOff}>♥ {likes}</button>
     </article>
 
-app FeedApp where
+end Feed
+
+component Feed where
   collection cards : Card
   state nextId := 0
   action rank => cards := cards.sortBy (fun a b => a.likes ≥ b.likes)
@@ -35,20 +37,15 @@ app FeedApp where
     cards := cards.push { id := nextId, author := "new", likes := 0,
                           liked := false, progress := 0, duration := 30 }
     nextId += 1
+  invariant feedSafe   : Card.cardSafe   for_each cards
+  invariant feedStyled : Card.cardStyled for_each cards
   view =>
     <section class="feed">
       <button class="rank" onClick={.rank}>Most liked</button>
       <button class="more" onClick={.append}>Load more</button>
-      <div class="cards">{cards.map fun c =>
-        <article key={c.id} class="slot">
+      <div class="cards">{for c in cards =>
+        <article class="slot">
           <Card state={c}/>
           <button class="dismiss" onClick={.dismiss c.id}>✕</button>
         </article>}</div>
     </section>
-
-def app := FeedApp.app
-
-invariant feedSafe   : Card.cardSafe   for_each cards preserved_by FeedApp.update
-invariant feedStyled : Card.cardStyled for_each cards holds_in FeedApp.view
-
-end Feed

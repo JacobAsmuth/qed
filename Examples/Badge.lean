@@ -1,12 +1,10 @@
 import Qed
 open Qed
 
-namespace Badge
-
 def onStyle  : Style := css [ backgroundColor (hex "0a0"), color (hex "fff"), padding (rem 1) ]
 def offStyle : Style := css [ backgroundColor (hex "888"), color (hex "fff"), padding (rem 1) ]
 
-component BadgeApp where
+component Badge where
   state on          := false
   state level : Int := 0
   invariant levelSafe            : 0 ≤ level
@@ -17,9 +15,5 @@ component BadgeApp where
       <button role="status" onClick={on := !on, level += 1} {if on then onStyle else offStyle}>
         {if on then "ON" else "OFF"}</button>
       <span role="dot" {if on then offStyle else onStyle}>●</span>
-      <span>{s!", flipped {level}×"}</span>
+      <span>, flipped {level}×</span>
     </div>
-
-def app := BadgeApp.app
-
-end Badge

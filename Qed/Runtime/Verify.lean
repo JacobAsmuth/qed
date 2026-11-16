@@ -162,7 +162,8 @@ private def viewFrameworkUnfolds (env : Environment) : Array Name :=
     ``Qed.checked, ``Qed.readOnly
   ]
   let opt := #[
-    `Qed.Component.render, `Qed.Component.each,
+    `Qed.Component.render,
+    `Qed.ForEachItems.toList_array, `Qed.ForEachItems.toList_list, `Qed.ForEachItems.toArray, `Qed.mapList_eq,
     `Qed.localMount, `Qed.localMountWith
   ].filter env.contains
   core ++ opt
@@ -263,5 +264,31 @@ elab "qedProveDehydrateView" : tactic => do
       can render different HTML on the client than SSR rendered on the server.{details}\n\n\
       Include every model field read by the view in `(dehydrate := […])` (or omit `dehydrate` to \
       dehydrate the full model automatically), or supply a proof to `App.withDehydrate`."
+
+structure SchemaFormInfo where
+  fullName     : Lean.Name
+  formViewName : Lean.Name
+  ctxBinders   : Array Lean.Name
+deriving Inhabited
+
+initialize schemaFormRegistry :
+    Lean.SimplePersistentEnvExtension SchemaFormInfo (Lean.NameMap SchemaFormInfo) ←
+  Lean.registerSimplePersistentEnvExtension {
+    addImportedFn := fun arrays =>
+      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.fullName info) acc) {}
+    addEntryFn := fun m info => m.insert info.fullName info
+  }
+
+open Lean in
+def lookupSchemaForm? (cName : Name) : CoreM (Option SchemaFormInfo) := do
+  let env ← getEnv
+  let reg := schemaFormRegistry.getState env
+  let ns ← getCurrNamespace
+  if let some info := reg.find? (ns ++ cName) then return some info
+  if let some info := reg.find? cName then return some info
+  if cName.getString! == "Form" then
+    for (fullView, _) in ResolveName.resolveGlobalName env {} ns (← getOpenDecls) (cName.getPrefix ++ `formView) do
+      if let some info := reg.find? (fullView.getPrefix ++ `Form) then return some info
+  return none
 
 end Qed

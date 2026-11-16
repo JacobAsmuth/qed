@@ -11,63 +11,40 @@ schema Profile where
   name : String
   bio  : String
 
-structure Model where
-  route   : R
-  query   : String
-  profile : Cached Profile
-  focused : Bool
+end Users
 
-def init : Model := { route := .home, query := "", profile := {}, focused := false }
+component Users where
+  route : R := .home
+  state query   := ""
+  state focused := false
+  query profile : Profile
+    key := match route with | .user name => name | _ => ""
+    url := fun name => s!"/api/users/{name}"
 
-inductive Msg where
-  | routed (r : R)
-  | typeQuery (s : String)
-  | submit
-  | gotProfile (key : String) (r : Resource Profile)
-  | focus
-  | blur
-  | key (k : String)
+  action submit when !query.trimmed.isEmpty =>
+    perform (Cmd.pushUrl (R.user query.trimmed))
+  action key (k : String) =>
+    if k == "Escape" then query := ""
 
-def userKey (m : Model) : String := match m.route with | .user name => name | _ => ""
-
-def transition (m : Model) : Msg → Model × Cmd Msg := steps
-  | .routed route   => { m with route }
-  | .typeQuery s    => { m with query := s }
-  | .submit         => if m.query.trimmed.isEmpty then m
-                       else (m, .pushUrl (R.user m.query.trimmed))
-  | .gotProfile k r => { m with profile := m.profile.put k r (userKey m) }
-  | .focus          => { m with focused := true }
-  | .blur           => { m with focused := false }
-  | .key k          => if k == "Escape" then { m with query := "" } else m
-
-def profileQuery : Query Model Msg :=
-  Resource.queryFor profile
-    (key := userKey)
-    (url := fun name => s!"/api/users/{name}")
-    (got := Msg.gotProfile)
-
-def app : App Model Msg :=
-  ui init transition (onRoute := Msg.routed) (queries := [profileQuery]) fun m =>
+  view =>
     <div class="app">
       <nav><a href={R.home} class="home-link">Home</a></nav>
-      {match m.route with
+      {match route with
        | .home =>
            <form class="search" onSubmit={.submit}>
-             <input class={if m.focused then "q focused" else "q"} bind={(m.query, .typeQuery)}
+             <input class={if focused then "q focused" else "q"} bind={query}
                     placeholder="Find a user…"
-                    onFocus={.focus} onBlur={.blur} onKeydown={.key}/>
+                    onFocus={focused := true} onBlur={focused := false} onKeydown={.key}/>
              <button class="go" type="submit">Search</button>
              <div class="hint">try <a href={R.user "ada"}>ada</a> or <a href={R.user "alan"}>alan</a></div>
            </form>
        | .user name =>
            <div class="profile">
              <h1>{name}</h1>
-             <Await of={m.profile} as={prof}
+             <Await of={profile} as={prof} err={e}
                loading={<p class="loading">Loading…</p>}
-               failed={fun e => <p class="error">Error: {e}</p>}>
+               failed={<p class="error">Error: {e}</p>}>
                <p class="bio">{prof.bio}</p>
              </Await>
            </div>}
     </div>
-
-end Users

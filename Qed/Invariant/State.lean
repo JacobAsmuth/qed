@@ -180,21 +180,9 @@ def invBinder : Parser := leading_parser
   "(" >> ident >> optional (" : " >> termParser) >> ")"
 
 open Lean Parser in
-def invOptName : Parser := leading_parser
-  notFollowedBy (identEq `on) "on" >> ident
-
-open Lean Parser in
 @[command_parser] def invariantBinderCmd : Parser := leading_parser
   "invariant " >> ident >> invBinder >> " : " >> sepBy1 termParser "," >>
   optional (" from " >> termParser) >> " preserved_by " >> ident >>
-  optional (" using " >> "[" >> sepBy termParser "," >> "]") >>
-  optional (" := " >> termParser)
-
-open Lean Parser in
-@[command_parser] def invariantOnCmd : Parser := leading_parser
-  "invariant " >> optional (atomic invOptName) >> optional invBinder >>
-  atomic (identEq `on) >> termParser maxPrec >> " : " >>
-  sepBy1 termParser "," >>
   optional (" using " >> "[" >> sepBy termParser "," >> "]") >>
   optional (" := " >> termParser)
 
@@ -216,17 +204,6 @@ private def mkBinderPred (bNode : Syntax) (clauses : Array Term) : CommandElabM 
     `(fun $bId => $conj)
 
 open Lean Elab Command in
-private def freshInvIdent (ref : Syntax) (stem : String) : CommandElabM Ident := do
-  let env ← getEnv
-  let ns ← getCurrNamespace
-  let mut idx := 1
-  let mut cand := Name.mkSimple s!"{stem}_inv_{idx}"
-  while env.contains (ns ++ cand) do
-    idx := idx + 1
-    cand := Name.mkSimple s!"{stem}_inv_{idx}"
-  return mkIdentFrom ref cand
-
-open Lean Elab Command in
 @[command_elab invariantBinderCmd] def elabInvariantBinderCmd : CommandElab := fun stx => do
   let name : Ident := ⟨stx[1]⟩
   let clauses : Array Term := stx[4].getSepArgs.map (⟨·⟩)
@@ -246,31 +223,6 @@ open Lean Elab Command in
     | none,   some ls, none    => `(invariant $name : $pred preserved_by $upd using [$[$ls],*])
     | none,   none,    none    => `(invariant $name : $pred preserved_by $upd)
   elabCommand cmd
-
-open Lean Elab Command in
-@[command_elab invariantOnCmd] def elabInvariantOnCmd : CommandElab := fun stx => do
-  let app : Term := ⟨stx[4]⟩
-  let stem := if app.raw.isIdent then app.raw.getId.getString! else "app"
-  let name ← match stx[1].find? (·.isIdent) with
-    | some idStx => pure (⟨idStx⟩ : Ident)
-    | none       => freshInvIdent stx stem
-  let clauses : Array Term := stx[6].getSepArgs.map (⟨·⟩)
-  let pred : Term ←
-    if stx[2].getNumArgs == 1 then
-      mkBinderPred stx[2][0] clauses
-    else if clauses.size == 1 then
-      pure clauses[0]!
-    else
-      throwErrorAt stx[6] "comma-separated invariant clauses need a model binder, e.g. `invariant (m) on app : ...`"
-  let usingL : Array Term :=
-    if stx[7].getNumArgs == 4 then stx[7][2].getSepArgs.map (⟨·⟩) else #[]
-  let pf? : Option Term := if stx[8].getNumArgs == 2 then some ⟨stx[8][1]⟩ else none
-  let prop ← `(($pred) (InvTarget.proj (($app).init)) ∧
-               ∀ m msg, ($pred) m → ($pred) (InvTarget.proj (($app).update m msg)))
-  match pf? with
-  | some pf => elabCommand (← `(theorem $name:ident : $prop := $pf))
-  | none    => elabCommand (← `(theorem $name:ident : $prop := by
-      qedDischargePreserved [$[$usingL],*] (($app).update) $name ($pred) from (InvTarget.proj (($app).init))))
 
 open Lean Elab Command Term Meta Lean.PrettyPrinter in
 def extractInvPred (id : Ident) : TermElabM (TSyntax `term) := do

@@ -580,6 +580,14 @@ elab_rules : command
       let protoCmds ← mkSchemaProtoCmds t cbns cbts tApp appTo fs inputs refined jsonReads allProto allLawfulProto
       let cmds := formCmds ++ draftProtoCmds ++ jsonFnCmds ++ (if cbns.isEmpty then jsonInstCmds else #[]) ++ protoCmds
       for c in cmds do elabCommand c
+      let ns ← getCurrNamespace
+      let fullSchema := ns ++ t.getId
+      let info : SchemaFormInfo := {
+        fullName := fullSchema ++ `Form
+        formViewName := fullSchema ++ `formView
+        ctxBinders := cbns.map (·.getId.eraseMacroScopes)
+      }
+      modifyEnv fun env => schemaFormRegistry.addEntry env info
 
 namespace Demo
 

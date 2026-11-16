@@ -7,17 +7,6 @@ structure Turn where
   user? : Bool
   text  : String
 
-structure Model where
-  turns   : Array Turn
-  draft   : String
-  pending : Bool
-
-inductive Msg
-  | typed (s : String)
-  | send
-  | chunk (data : String)
-  | done
-
 def deltaOf (raw : String) : String :=
   (Json.parse raw).toOption
     |>.bind (·.get? "choices") |>.bind (·.arr?) |>.bind (·.head?)
@@ -36,33 +25,34 @@ def reqBody (turns : Array Turn) : String :=
 def appendLast (turns : Array Turn) (d : String) : Array Turn :=
   turns.modify (turns.size - 1) fun t => { t with text := t.text ++ d }
 
-def transition (m : Model) : Msg → Model × Cmd Msg := steps
-  | .typed s   => { m with draft := s }
-  | .send      =>
-      let draft := m.draft.trimmed
-      if draft.isEmpty then m else
-      let convo := m.turns.push { user? := true, text := draft }
-      ({ turns   := convo.push { user? := false, text := "" }
-         draft   := ""
-         pending := true },
-       .stream "/v1/chat/completions" (reqBody convo) .chunk .done)
-  | .chunk raw => { m with turns := appendLast m.turns (deltaOf raw) }
-  | .done      => { m with pending := false }
-
 component Bubble where
   prop turn : Turn
   view => <div class={if turn.user? then "msg user" else "msg bot"}>{turn.text}</div>
 
-def chatApp : App Model Msg :=
-  ui { turns := #[], draft := "", pending := false } transition fun m =>
+end Chat
+
+component Chat where
+  state turns   : Array Turn := #[]
+  state draft                := ""
+  state pending              := false
+
+  action send when !draft.trimmed.isEmpty =>
+    let text := draft.trimmed
+    let convo := turns.push { user? := true, text }
+    turns   := convo.push { user? := false, text := "" }
+    draft   := ""
+    pending := true
+    perform (Cmd.stream "/v1/chat/completions" (reqBody convo) .chunk .done)
+  action chunk (raw : String) => turns := appendLast turns (deltaOf raw)
+  action done                 => pending := false
+
+  invariant streamSafe : pending = true → 0 < turns.size
+
+  view =>
     <div class="chat">
-      <div class="log">{m.turns.map fun t => <Bubble turn={t}/>}</div>
+      <div class="log">{for t in turns => <Bubble turn={t}/>}</div>
       <div class="composer">
-        <input class="draft" placeholder="Message the model…" bind={(m.draft, .typed)}/>
-        <button class="send" disabled={m.pending || m.draft.trimmed.isEmpty} onClick={.send}>Send</button>
+        <input class="draft" placeholder="Message the model…" bind={draft}/>
+        <button class="send" disabled={pending || draft.trimmed.isEmpty} onClick={.send}>Send</button>
       </div>
     </div>
-
-invariant streamSafe (m) on chatApp : m.pending = true → 0 < m.turns.size
-
-end Chat

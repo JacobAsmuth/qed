@@ -1,9 +1,7 @@
 import Qed
 open Qed
 
-namespace Live
-
-app LiveApp where
+component Live where
   state n : Int := 0
   action setTo (v : Int) => n := max 0 v
   invariant nonNegative : 0 ≤ n
@@ -15,7 +13,3 @@ app LiveApp where
       <button class="plus10" onClick={.setTo (n + 10)}>+10</button>
       <button class="reset" onDoubleClick={.setTo 0}>reset (dbl-click)</button>
     </div>
-
-def app := LiveApp.app
-
-end Live

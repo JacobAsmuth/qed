@@ -4,32 +4,6 @@ import Lean
 
 namespace Qed
 
-syntax portChan := ident " : " term (" => " term)?
-syntax (name := portsCmd) "ports " "where " sepBy1IndentSemicolon(portChan) : command
-
-open Lean in
-macro_rules
-  | `(ports where $[$chans:portChan]*) => do
-      let mut outDefs  : Array (TSyntax `command) := #[]
-      let mut inTuples : Array (TSyntax `term) := #[]
-      for ch in chans do
-        -- `__`-prefixed channel names are reserved for framework channels like `__ws`.
-        if let some nm := (ch.raw.find? (·.isIdent)).map (·.getId.toString) then
-          if nm.startsWith "__" then
-            Macro.throwErrorAt ch s!"ports: channel name '{nm}' is reserved (names starting with `__`)"
-        match ch with
-        | `(portChan| $name:ident : $ty:term => $rhs:term) =>
-            inTuples := inTuples.push (← `(($(quote name.getId.toString),
-              fun p => (((Json.parse p).bind FromJson.fromJson : Except String $ty).toOption).map $rhs)))
-        | `(portChan| $name:ident : $ty:term) =>
-            outDefs := outDefs.push (←
-              `(def $name {m : Type} (x : $ty) : Cmd m :=
-                  Cmd.port $(quote name.getId.toString) (Json.render (ToJson.toJson x))))
-        | _ => Macro.throwErrorAt ch "ports: expected `name : Type` (outbound) or `name : Type => ctor` (inbound)"
-      let onPortDef ← `(def $(mkIdent `onPort) : String → String → Option $(mkIdent `Msg) :=
-        dispatchPorts #[$inTuples,*])
-      return mkNullNode ((outDefs.push onPortDef).map (·.raw))
-
 syntax uiOpt := "(" ident (" := " term)? ")"
 syntax (name := uiBuilder) "ui " term:max term:max (uiOpt)* " fun " ident " => " term : term
 syntax (name := localRegistryTerm) "withLocalRegistry " term:max : term

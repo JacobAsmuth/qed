@@ -88,23 +88,40 @@ private def asElementApp? (stx : Syntax) : Option (String × Array Syntax) :=
   | none => none
 
 open Lean in
-private def asMap? (stx : Syntax) : Option (Syntax × Syntax) :=
-  let stx :=
-    let s := unparen stx
-    if s.getKind == `Lean.Parser.Term.proj && s.getArgs.size == 3
-        && s.getArgs[2]!.getId.eraseMacroScopes == `toList
-    then s.getArgs[0]! else stx
+private def asProj? (stx : Syntax) (field : Name) : Option Syntax :=
+  let s := unparen stx
+  if s.getKind == `Lean.Parser.Term.proj && s.getArgs.size == 3
+      && s.getArgs[2]!.getId.eraseMacroScopes == field
+  then some s.getArgs[0]! else none
+
+open Lean in
+private def unwrapForEachItems (recv : Syntax) : Syntax × Bool :=
+  let r := unparen recv
+  match asApp? r with
+  | some (.ident _ _ rn _, #[xs]) =>
+      if rn.eraseMacroScopes == ``Qed.ForEachItems.toList then (unparen xs, true) else (r, false)
+  | _ => (r, false)
+
+open Lean in
+private def asMap? (stx : Syntax) : Option (Syntax × Syntax × Bool) :=
+  let stx := (asProj? stx `toList).getD stx
   match asApp? (unparen stx) with
-  | some (fn, args) =>
-      if args.size == 1 then
-        match fn with
-        | .ident _ _ n _ =>
-             if lastStr? n.eraseMacroScopes == some "map" then
-              some (mkIdentFrom fn (dropLastComp n.eraseMacroScopes), unparen args[0]!)
-            else none
-        | _ => none
+  | some (.ident _ _ n _, #[recv, fnArg]) =>
+      if n.eraseMacroScopes == ``Qed.mapList then
+        let (xs, isFE) := unwrapForEachItems recv
+        some (xs, unparen fnArg, isFE)
       else none
-  | none => none
+  | some (fn, #[fnArg]) =>
+      match fn with
+      | .ident _ _ n _ =>
+          if lastStr? n.eraseMacroScopes == some "map" then
+            some (mkIdentFrom fn (dropLastComp n.eraseMacroScopes), unparen fnArg, false)
+          else none
+      | _ =>
+          (asProj? fn `map).map fun recv =>
+            let (xs, isFE) := unwrapForEachItems recv
+            (xs, unparen fnArg, isFE)
+  | _ => none
 
 open Lean in
 private def asFun? (stx : Syntax) : Option (Syntax × Syntax) :=
@@ -261,11 +278,12 @@ mutual
   partial def tryForEach (m : Ident) (stx : Syntax) : MacroM (Option Syntax) := do
     let some (tag, pargs) := asElementApp? stx | return none
     if pargs.size != 2 then return none
-    let some (xs, funArg) := asMap? pargs[1]! | return none
+    let some (xs, funArg, isForEachItems) := asMap? pargs[1]! | return none
     let some (binder, body) := asFun? funArg | return none
     let binderId : Ident := ⟨binder⟩
     let attrsL : Term ← (match ← liftAttrList m pargs[0]! with | some a => pure a | none => pure ⟨pargs[0]!⟩)
     let xsT    : Term := ⟨xs⟩
+    let xsArrT : Term ← if isForEachItems then `(Qed.ForEachItems.toArray $xsT) else pure xsT
     let tagL   : Term := ⟨Syntax.mkStrLit tag⟩
     let rowEl? := asElementApp? body
     let keyOpt ← (match rowEl? with
@@ -279,12 +297,15 @@ mutual
         let rowL : Term := ⟨← viewLift binderId body'⟩
         let pos   := (stx.getPos?.map (·.byteIdx)).getD 0
         let prefT : Term := ⟨Syntax.mkStrLit (toString pos ++ "@")⟩
-        return some (← `(Qed.V.forEach $tagL (fun $m => $xsT) (fun $binderId => toString $keyV) $rowL (attrs := $attrsL) (sigPrefix := $prefT)))
+        return some (← `(Qed.V.forEach $tagL (fun $m => $xsArrT) (fun $binderId => toString $keyV) $rowL (attrs := $attrsL) (sigPrefix := $prefT)))
     | _, _ =>
         let rowL : Term := ⟨← viewLift binderId body⟩
+        let rowsTerm ← if isForEachItems then
+          `((Qed.ForEachItems.toList $xsT).map (fun $binderId => Qed.View.render $rowL $binderId))
+        else
+          `((($xsT).map (fun $binderId => Qed.View.render $rowL $binderId)).toList)
         return some (← `(Qed.V.dynNode (fun $m =>
-          Qed.Html.element $tagL (($attrsL).map (Qed.VAttr.eval $m))
-            (($xsT).map (fun $binderId => Qed.View.render $rowL $binderId)).toList)))
+          Qed.Html.element $tagL (($attrsL).map (Qed.VAttr.eval $m)) $rowsTerm)))
 end
 
 open Lean in

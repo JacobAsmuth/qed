@@ -1,8 +1,6 @@
 import Qed
 open Qed
 
-namespace Signup
-
 schema Account where
   email : String where email.contains '@', email.length ≥ 3
   age   : Nat    where age ≥ 18
@@ -10,18 +8,14 @@ schema Account where
   agree : Bool   where agree
   plan  : select [("free", "Free"), ("pro", "Pro")]
 
-app SignupApp where
+component Signup where
   state draft                     := Account.Draft.empty
   state submitted : Option Account := none
   action submit => submitted := Account.parse draft
   view =>
     <div class="app">
       <h1>Create account</h1>
-      {Account.formView draft (draft := ·) .submit}
+      <Account.Form bind={draft} onSubmit={.submit}/>
       {if let some acc := submitted then
         <p class="ok">Created account for {acc.email}</p>}
     </div>
-
-def app := SignupApp.app
-
-end Signup

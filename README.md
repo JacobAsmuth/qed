@@ -27,7 +27,7 @@ a handwritten proof.
 
 ![Bookshelf catalog with links to book details and the add-book form](docs/images/bookshelf.png)
 
-Bookshelf includes a catalog, book detail pages, and an add-book form. [Run instructions](Examples/README.md#bookshelf).
+Bookshelf includes a catalog, book detail pages, and an add-book form. [Run instructions](Examples/README.md#running-the-examples).
 
 ## State rules
 
@@ -80,10 +80,10 @@ Qed generates `Order.Draft` for editable input, including incomplete or invalid 
 `Order.parse` returns `Option Order`; each refined field in a valid `Order` includes a proof
 that its rule is satisfied. The generated JSON decoder applies the same rules.
 
-The generated form uses that draft (`m.draft : Order.Draft`):
+The generated form binds directly to that draft (`draft : Order.Draft`):
 
 ```lean
-{Order.formView m.draft .edit .submit}
+<Order.Form bind={draft} onSubmit={.submit}/>
 ```
 
 Submit is disabled until the schema is valid. A parsed order can be serialized with

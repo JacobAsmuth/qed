@@ -32,7 +32,7 @@ component BookItem where
   view =>
     <li>
       <a href={R.detail book.id} {navlink} class="book-link">{book.title}</a>
-      <span class="byline">{s!" by {book.author}"}</span>
+      <span class="byline"> by {book.author}</span>
     </li>
 
 component BookCard where
@@ -40,21 +40,20 @@ component BookCard where
   view =>
     <div {card} class="book">
       <h1>{book.title}</h1>
-      <p class="author">{s!"by {book.author} ({book.year})"}</p>
+      <p class="author">by {book.author} ({book.year})</p>
       <p class="genre">{book.genre}</p>
       <p class={if book.inPrint then "in-print" else "out-of-print"}>
         {if book.inPrint then "In print" else "Out of print"}</p>
     </div>
 
-app Storefront where
-  route route : R := .catalog
+end Bookshelf
+
+component Bookshelf where
+  route : R := .catalog
     | .catalog => catalog := .loading, perform (Resource.fetch "/api/books" (catalog := ·))
     | .detail id =>
-        match current with
-        | .ok b =>
-            if b.id == id then ()
-            else current := .loading, perform (Resource.fetch s!"/api/books/{id}" (current := ·))
-        | _ => current := .loading, perform (Resource.fetch s!"/api/books/{id}" (current := ·))
+        if let .ok b := current then if b.id == id then return
+        current := .loading, perform (Resource.fetch s!"/api/books/{id}" (current := ·))
     | .newBook => ()
   state catalog : Resource (Array Book) := .idle
   state current : Resource Book := .idle
@@ -81,27 +80,23 @@ app Storefront where
        | .catalog =>
            <div class="catalog">
              <h1>Bookshelf</h1>
-             <Await of={catalog} as={books}
+             <Await of={catalog} as={books} err={e}
                loading={<p class="loading">Loading catalog…</p>}
-               failed={fun e => <p class="error">{"Error: "}{e}</p>}>
-               <ul class="books">{books.map fun b => <BookItem key={b.id} book={b}/>}</ul>
+               failed={<p class="error">Error: {e}</p>}>
+               <ul class="books">{for b in books => <BookItem key={b.id} book={b}/>}</ul>
              </Await>
            </div>
        | .detail _ =>
            <div class="detail">
-             <Await of={current} as={b}
+             <Await of={current} as={b} err={e}
                loading={<p class="loading">Loading…</p>}
-               failed={fun e => <p class="error">{"Error: "}{e}</p>}>
+               failed={<p class="error">Error: {e}</p>}>
                <BookCard book={b}/>
              </Await>
            </div>
        | .newBook =>
            <div class="new">
              <h1>Add a book</h1>
-             {Book.formView draft (draft := ·) .submit}
+             <Book.Form bind={draft} onSubmit={.submit}/>
            </div>}
     </div>
-
-def app : App Storefront.State Storefront.Msg := Storefront.app
-
-end Bookshelf

@@ -547,4 +547,27 @@ def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → S
 
 end V
 
+class ForEachItems (c : Type) (α : outParam Type) where
+  toList  : c → List α
+  toArray : c → Array α
+
+@[reducible] instance : ForEachItems (Array α) α where
+  toList  := Array.toList
+  toArray := id
+
+@[reducible] instance : ForEachItems (List α) α where
+  toList  := id
+  toArray := List.toArray
+
+@[simp] theorem ForEachItems.toList_array {α : Type} (a : Array α) :
+    ForEachItems.toList a = a.toList := rfl
+
+@[simp] theorem ForEachItems.toList_list {α : Type} (l : List α) :
+    ForEachItems.toList l = l := rfl
+
+@[reducible] def mapList {α β : Type} (l : List α) (f : α → β) : List β := l.map f
+
+@[simp] theorem mapList_eq {α β : Type} (l : List α) (f : α → β) :
+    mapList l f = l.map f := rfl
+
 end Qed

@@ -6,5 +6,5 @@ component Hello where
   view =>
     <div class="hello">
       <input class="who" bind={name} placeholder="Your name"/>
-      <h1>{s!"Hello, {name}!"}</h1>
+      <h1>Hello, {name}!</h1>
     </div>

@@ -8,22 +8,26 @@ component Counter where
   prop step : Nat := 1
   state count : Nat := 0
   state saved : Nat := 0
-  emits Nat
+  event emitted (n : Nat)
   action advance (times : Nat) when (times > 0) =>
-    set count (count + step * times), set saved count, send count
+    count := count + step * times
+    saved := count
+    send (.emitted count)
   view => <button onClick={.advance 2}>{count}</button>
 
 example : Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 2) =
-    ({ count := 10, saved := 4 }, some 4) := rfl
+    ({ count := 10, saved := 4 }, some (.emitted 4)) := rfl
 example : Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 0) =
     ({ count := 4, saved := 0 }, none) := rfl
 
 def defaults : Html Unit := <Counter initial={{ count := 8 }}/>
 #guard (Html.renderWith Counter.regs defaults).contains "8</button>"
 
-def importedHelper (r : Local.Row) : Html Local.Msg := Local.widgetView r
+def importedHelper (r : Local.Row) : Html Local.Msg :=
+  <Local.Widget key={r.id} id={r.id} label={r.label}
+    initial={{ note := r.label }} onReport={Local.Msg.reported r.id}/>
 
-def helperApp : App Local.Model Local.Msg := ui Local.init Local.update fun m =>
+def helperApp : App Local.State Local.Msg := ui Local.init (fun m _ => m) fun m =>
   importedHelper { id := 8, label := m.draft }
 
 #guard (helperApp.locals.map (·.id)).contains "Local.Widget"
@@ -32,26 +36,26 @@ def helperApp : App Local.Model Local.Msg := ui Local.init Local.update fun m =>
 
 def rows : Array Todo.Row.State :=
   #[{ id := 8, text := "Zulu", done := false }, { id := 2, text := "Alpha", done := false }]
-def sorted := Todo.Board.update { rows } .sort
-#guard ((Todo.Board.update sorted (.rows "8" .toggle)).rows[1]?.map (·.done)) == some true
-#guard ((Todo.Board.update sorted (.rows "8" .toggle)).rows[0]?.map (·.done)) == some false
-#guard (Todo.Board.update (Todo.Board.update sorted (.remove 8)) (.rows "8" .toggle)).rows.size == 1
-example : (Todo.Board.update { draft := "  " } .add).nextId = 0 := rfl
+def sorted := Todo.update { rows } .sort
+#guard ((Todo.update sorted (.rows "8" .toggle)).rows[1]?.map (·.done)) == some true
+#guard ((Todo.update sorted (.rows "8" .toggle)).rows[0]?.map (·.done)) == some false
+#guard (Todo.update (Todo.update sorted (.remove 8)) (.rows "8" .toggle)).rows.size == 1
+example : (Todo.update { draft := "  " } .add).nextId = 0 := rfl
 
-/-- error: `set label`: not a `state` field of this component (fields: [count]) -/
+/-- error: `label`: not a `state` field of this component (fields: [count]) -/
 #guard_msgs in
 component ReadOnly where
   prop label : String
   state count : Nat := 0
-  action change => set label "changed"
+  action change => label := "changed"
   view => <span>{label}</span>
 
 /-- error: duplicate action name `save` -/
 #guard_msgs in
 component DuplicateAction where
   state count : Nat := 0
-  action save => set count 1
-  action save => set count 2
+  action save => count := 1
+  action save => count := 2
   view => <span>{count}</span>
 
 component Owned where
@@ -59,7 +63,7 @@ component Owned where
   state id : Nat
   state count : Nat
   key id
-  action increment => set count (count + 1)
+  action increment => count := count + 1
   view => <button title={caption} onClick={.increment}>{count}</button>
 
 def ownedView : Html (String × Owned.Msg) :=
@@ -167,7 +171,7 @@ component RowItem where
   state id    : Nat := 0
   state count : Nat := 0
   key id
-  action inc => set count (count + 1)
+  action inc => count := count + 1
   view => <span>{count}</span>
 
 invariant rowSafeFromInit :
@@ -214,7 +218,7 @@ invariant parentPageHasHeader : hasTag "header" holds_in parentPage
 
 component SingleChild where
   state count : Nat := 0
-  action bump => set count (count + 1)
+  action bump => count := count + 1
   view => <button onClick={.bump}>{count}</button>
 
 inductive ParentMsg | child (m : SingleChild.Msg)
@@ -297,14 +301,15 @@ structure SliceModel where
 deriving DecidableEq
 
 def sliceInit : SliceModel := { a := 1, b := "hi", ephemeral := 99 }
+def sliceUpdate (m : SliceModel) (d : Nat) : SliceModel := { m with a := m.a + d }
 def sliceApp : App SliceModel Nat :=
-  ui sliceInit (fun m d => { m with a := m.a + d }) (dehydrate := [a, b]) fun m =>
+  ui sliceInit sliceUpdate (dehydrate := [a, b]) fun m =>
     <div>{m.a}{m.b}</div>
 
 #guard sliceApp.rehydrate (sliceApp.dehydrate { a := 7, b := "yo", ephemeral := 0 })
   == some { a := 7, b := "yo", ephemeral := 99 }
 
-invariant (m) on sliceApp : 1 ≤ m.a
+invariant sliceSafe (m) : 1 ≤ m.a from sliceInit preserved_by sliceUpdate
 
 def autoSliceApp : App SliceModel Nat := ui sliceInit (fun m d => { m with a := m.a + d }) fun m => <div>{m.a}{m.b}</div>
 def ephemeralOptApp : App SliceModel Nat := ui sliceInit (fun m d => { m with a := m.a + d }) (ephemeral := [ephemeral]) fun m => <div>{m.a}{m.b}</div>
@@ -540,7 +545,7 @@ component PickerBox where
       <button onClick={onPick filter}>Pick</button>
     </div>
 
-app CompositeDemo where
+component CompositeDemo where
   state query     := "init"
   state picked    := ""
   state clicks    := 1
@@ -574,13 +579,53 @@ def step3 := CompositeDemo.update step2 (._sub_1 .toggle)
 #guard (CompositeDemo.app.rehydrate (CompositeDemo.app.dehydrate { step3 with clicks := 5, scratch := 0 })).map
   (fun s => (s.query, s.clicks, s.scratch)) == some ("lean4", 5, 99)
 
--- `<Await>` JSX tag on `Resource` and `Cached` + `.val`-free `Field` rendering
+-- `<Await>` JSX tag on `Resource` + `.val`-free `Field` rendering
 def awaitSample (r : Resource Ticket) : Html Unit :=
-  <Await of={r} as={t} loading={<p>Wait</p>} failed={fun e => <p class="err">{e}</p>}>
+  <Await of={r} as={t} err={e} loading={<p>Wait</p>} failed={<p class="err">{e}</p>}>
     <article><h2>{t.title}</h2><span>{t.priority}</span></article>
   </Await>
 
 #guard (Html.render (awaitSample .loading)).contains "<p>Wait</p>"
 #guard (Html.render (awaitSample (.failed "boom"))).contains "<p class=\"err\">boom</p>"
+
+-- `<Schema.Form>` JSX tag, `{for ... => ...}`, inline `for_each`, early `return`, & scoped manual `invariant` proof
+component TicketFormHost where
+  state draft := Ticket.Draft.empty
+  state saved : Option Ticket := none
+  action submit => saved := Ticket.parse draft
+  view =>
+    <div class="host">
+      <Ticket.Form bind={draft} onSubmit={.submit}/>
+    </div>
+
+#guard (Html.render (TicketFormHost.view TicketFormHost.init)).contains "class=\"qed-form\""
+
+def forLoopHtml : Html Unit :=
+  <ul>
+    {for n in (#[1, 2] : Array Nat) => <li key={n}>{n}</li>}
+    {for n in ([3, 4] : List Nat) => <li key={n}>{n}</li>}
+  </ul>
+
+#guard (Html.render forLoopHtml).contains "<li>1</li><li>2</li><li>3</li><li>4</li>"
+
+component InlineForEachParent where
+  collection rows : RowItem
+  invariant rowsSafe : rowSafeFromInit for_each rows
+  view => <ul>{for r in rows => <li><RowItem state={r}/></li>}</ul>
+
+example := InlineForEachParent.rowsSafe
+
+component EarlyReturnCheck where
+  state x : Int := 0
+  action step (n : Int) =>
+    if n ≤ 0 then return
+    x += n
+  view => <span>{x}</span>
+  invariant xPos : 0 ≤ x := by
+    intro m msg h
+    cases msg <;> simp_all [update] <;> split <;> simp_all <;> omega
+
+#guard (EarlyReturnCheck.update { x := 5 } (.step 0)).x == 5
+#guard (EarlyReturnCheck.update { x := 5 } (.step 3)).x == 8
 
 end SyntaxChecks

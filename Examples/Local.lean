@@ -55,58 +55,42 @@ structure Row where
   id    : Nat
   label : String
 
-structure Model where
-  rows       : Array Row
-  draft      : String
-  nextId     : Nat
-  lastReport : Option (Nat × Int)
-
-def init : Model :=
-  { rows := #[{ id := 0, label := "Alpha" }, { id := 1, label := "Beta" }]
-    draft := "", nextId := 2, lastReport := none }
-
-inductive Msg
-  | edit (s : String)
-  | add
-  | remove (id : Nat)
-  | reported (id : Nat) (count : Int)
-  | rename (id : Nat)
-
-def update (m : Model) : Msg → Model
-  | .edit s        => { m with draft := s }
-  | .add           =>
-      let t := m.draft.trimmed
-      if t.isEmpty then m
-      else { m with rows   := m.rows.push { id := m.nextId, label := t }
-                    draft  := ""
-                    nextId := m.nextId + 1 }
-  | .remove id     => { m with rows := m.rows.filter (·.id != id) }
-  | .rename id     => { m with rows := m.rows.map fun r =>
-      if r.id == id then { r with label := r.label ++ "!" } else r }
-  | .reported id c => { m with lastReport := some (id, c) }
-
-def widgetView (r : Row) : Html Msg :=
-  <Widget key={r.id} id={r.id} label={r.label}
-    initial={{ note := r.label }} onReport={Msg.reported r.id}/>
-
-def app : App Model Msg := ui init update fun m =>
-  <div class="app">
-    <h1>Local-state rows</h1>
-    <div class="add">
-      <input class="new" bind={(m.draft, .edit)} placeholder="New row label"/>
-      <button class="addbtn" onClick={.add}>Add row</button>
-    </div>
-    <div class="report">{match m.lastReport with
-      | some (id, c) => s!"last report: row {id} = {c}"
-      | none         => "no reports yet"}</div>
-    <div class="solo"><Stepper key="s"/></div>
-    <ul class="rows">{m.rows.map fun r =>
-      <li key={r.id} class="row">
-        <span class="label">{r.label}</span>
-        {widgetView r}
-        <button class="rename" onClick={.rename r.id}>Rename</button>
-        <button class="rm" onClick={.remove r.id}>✕</button>
-      </li>}</ul>
-  </div>
-
 end Local
+
+component Local where
+  state rows : Array Row := #[{ id := 0, label := "Alpha" }, { id := 1, label := "Beta" }]
+  state draft := ""
+  state nextId := 2
+  state lastReport : Option (Nat × Int) := none
+
+  action remove (id : Nat) => rows := rows.filter (·.id != id)
+  action rename (id : Nat) =>
+    rows := rows.map fun r => if r.id == id then { r with label := r.label ++ "!" } else r
+  action reported (id : Nat) (count : Int) => lastReport := some (id, count)
+  action add =>
+    let t := draft.trimmed
+    if !t.isEmpty then
+      rows := rows.push { id := nextId, label := t }
+      draft := ""
+      nextId += 1
+
+  view =>
+    <div class="app">
+      <h1>Local-state rows</h1>
+      <div class="add">
+        <input class="new" bind={draft} placeholder="New row label"/>
+        <button class="addbtn" onClick={.add}>Add row</button>
+      </div>
+      <div class="report">{match lastReport with
+        | some (id, c) => s!"last report: row {id} = {c}"
+        | none         => "no reports yet"}</div>
+      <div class="solo"><Stepper key="s"/></div>
+      <ul class="rows">{for r in rows =>
+        <li key={r.id} class="row">
+          <span class="label">{r.label}</span>
+          <Widget key={r.id} id={r.id} label={r.label}
+            initial={{ note := r.label }} onReport={.reported r.id}/>
+          <button class="rename" onClick={.rename r.id}>Rename</button>
+          <button class="rm" onClick={.remove r.id}>✕</button>
+        </li>}</ul>
+    </div>

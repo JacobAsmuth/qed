@@ -35,9 +35,6 @@ lean_exe qedjs where
 lean_lib Examples where
   globs := #[.submodules `Examples]
 
-lean_exe counter where
-  root := `Examples.Native
-
 lean_lib Cli where
   globs := #[.submodules `Cli]
 

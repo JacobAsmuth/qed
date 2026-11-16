@@ -1,7 +1,7 @@
 # Components & Apps
 
-A `component` (or top-level `app`) bundles props, slots, `children`, local or routed state,
-effectful actions, invariants, and a JSX view into a single verified declaration.
+A `component` bundles props, slots, `children`, local or routed state,
+effectful actions, ports, queries, invariants, and a JSX view into a single verified declaration.
 
 ## Pure sub-components (`children`, `slot`, `event`, and `bind:`)
 
@@ -44,18 +44,17 @@ Compose them directly inside JSX—including inside `<ul>`, `<tr>`, or `<select>
 ```lean
 <Card title="Catalog" badge={<span>Live</span>}>
   <SearchBar bind:query={filter} onSubmit={.runSearch}/>
-  <ul>{books.map fun b => <BookRow key={b.id} book={b} onOrder={.orderOne b.slot}/>}</ul>
+  <ul>{for b in books => <BookRow key={b.id} book={b} onOrder={.orderOne b.slot}/>}</ul>
 </Card>
 ```
 
-## Unified `app` / effectful `component` (`route`, `start`, `perform`, `ephemeral`)
+## Unified stateful & effectful `component` (`route`, `start`, `perform`, `ephemeral`, `port`, `query`)
 
-Top-level applications and stateful components share the exact same syntax (`app Name where` is an
-alias for `component Name where`):
+Top-level applications and reusable stateful components use the same `component` syntax:
 
 ```lean
-app Storefront where
-  route route : R := .catalog
+component Storefront where
+  route : R := .catalog
     | .catalog    => books := .loading, perform (Catalog.list (books := ·))
     | .detail idx => current := .loading, perform (Catalog.findAt idx (current := ·))
   state books     : Resource (Array Book) := .idle
@@ -72,26 +71,30 @@ app Storefront where
     | _ => ()
 
   view =>
-    <Await of={books} as={arr} loading={<p>Loading…</p>}>
-      <ul>{arr.map fun b => <BookRow key={b.id} book={b} onOrder={.orderOne b.slot}/>}</ul>
+    <Await of={books} as={arr} err={e} loading={<p>Loading…</p>} failed={<p class="error">{e}</p>}>
+      <ul>{for b in arr => <BookRow key={b.id} book={b} onOrder={.orderOne b.slot}/>}</ul>
     </Await>
 ```
 
 - **`(field := ·)`** creates a typed setter callback (`T → Msg`) anywhere inside `perform`,
-  `start`, or `view` (for example `Catalog.list (books := ·)` or `Book.formView draft (draft := ·) .submit`).
-- **`route`** binds the current URL route into state and runs optional match arms on navigation.
+  `start`, or `view` (for example `Catalog.list (books := ·)`), and schemas provide `<Book.Form bind={draft} onSubmit={.submit}/>`.
+- **`route`** binds the current URL route into state (defaulting the field name to `route`) and runs optional match arms on navigation.
 - **`start`** schedules initial commands when the app mounts.
 - **`ephemeral`** excludes client-only fields from SSR dehydration (all other `state` fields
   auto-dehydrate by default).
-- **`<Await of={res} as={val} loading={…} failed={…}>`** renders `Resource α` or `Cached α`
+- **`port`** declares typed JS interop ports (`port name : Arg` outbound, `port name (arg : Arg) => ...` inbound).
+- **`query`** declares cached remote queries (`query items : Array Item` with `key := ...` and `url := ...`).
+- **`<Await of={res} as={val} err={e} loading={…} failed={…}>`** renders `Resource α` or `Cached α`
   declaratively in JSX.
-- **`fullstack`** accepts `client Storefront` directly when `Storefront` is an `app` or `component`.
+- **`fullstack`** accepts `client Storefront` directly for any `component`.
+- **Namespace helpers:** If a namespace with the component's name (such as `namespace Storefront ... end Storefront`)
+  is defined beforehand, its symbols are automatically in scope inside `component Storefront where`.
 
 ## Stateful sub-components: static hoisting vs. keyed `LocalDef`
 
 Qed supports three stateful composition modes:
 
-1. **Static hoisting (automatic inside `component` / `app`):** Mounting a stateful or effectful
+1. **Static hoisting (automatic inside `component`):** Mounting a stateful or effectful
    sub-component without `key=` / `initial=` (or one using `children`, `slot`, `bind:`, or
    `perform`) hoists its state, `Out` events, `bind:` updates, and `Cmd` effects directly into the
    parent component with zero JSON overhead—including interactive `{children}` that dispatch parent
@@ -101,13 +104,13 @@ Qed supports three stateful composition modes:
    (see [`Examples/Local.lean`](../Examples/Local.lean)).
 3. **Parent-owned `collection`s:** When a parent needs to read, filter, or sort child states,
    declare `collection rows : Row` (where `Row` declares `key id`). Inside the parent view,
-   `<Row key={r.id} state={r}/>` automatically infers `onMsg={.rows}` (or use `Row.each rows .rows`
-   to wrap each row).
+   `<Row key={r.id} state={r}/>` automatically infers `onMsg={.rows}`, and `{for r in rows => <Row state={r}/>}`
+   automatically injects the child's key.
 
 ## Actions & inline invariants
 
 Actions support `let` bindings, simultaneous field updates (`:=`, `+=`, `-=`), `when` guards,
-`perform`, `send` / `emit`, `()`, `if … then … else …`, `if let … := … then …`, and `match … with`:
+`perform`, `send`, `()`, `return` (early exit), `if … then … else …`, `if let … := … then …`, and `match … with`:
 
 ```lean
 action advance (times : Nat) when times > 0 =>
@@ -116,6 +119,7 @@ action advance (times : Nat) when times > 0 =>
 
 invariant 0 ≤ count, saved ≤ count
 invariant roleHasOneOf "save" [primaryStyle, disabledStyle]
+invariant feedSafe : Feed.Card.cardSafe for_each cards
 ```
 
 Flat assignment sequences read *pre-action* state simultaneously (`saved` receives the previous

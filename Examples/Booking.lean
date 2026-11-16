@@ -1,13 +1,11 @@
 import Qed
 open Qed
 
-namespace Booking
-
 schema Appt (today : Date) where
   who  : String where who.length ≥ 1
   when : Date   where today < when
 
-app BookingApp where
+component Booking where
   state today  : Option Date := none
   state draft  := Appt.Draft.empty
   state booked : Option String := none
@@ -27,10 +25,6 @@ app BookingApp where
     | some t =>
         <div class="app">
           <h1>Book an appointment</h1>
-          {Appt.formView t draft (draft := ·) .submit}
+          <Appt.Form ctx={t} bind={draft} onSubmit={.submit}/>
           {if let some who := booked then <p class="ok">Booked for {who}</p>}
         </div>
-
-def app : App BookingApp.State BookingApp.Msg := BookingApp.app
-
-end Booking

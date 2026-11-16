@@ -54,7 +54,7 @@ Updating live browser DOM state requires a few guarantees beyond pure HTML seria
   DOM nodes, copy-on-write array marks (`refMark`), and signals in one pass, rendering fresh row
   HTML lazily only when a newly inserted key appears.
 - **Local components:** Updating a parent refreshes a local component's live `prop`s and
-  `onEmit` callback without resetting its persisted local state; `initial` is read only on first
+  event callbacks without resetting its persisted local state; `initial` is read only on first
   mount.
 - **Attribute and property cleanup:** Full attribute reconciliation removes stale attributes and
   event listeners and resets removed controlled `value` and `checked` DOM properties.

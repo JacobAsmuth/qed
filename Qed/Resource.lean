@@ -116,9 +116,11 @@ def Query.wrap {Model Msg : Type} (qs : List (Query Model Msg))
         let (m', c') := q.load kNew mc.1
         (m', .batch [mc.2, c'])) (new, cmd)
 
+namespace Internal
+
 def App.withQueries {Model Msg : Type} (qs : List (Query Model Msg))
     (app : App Model Msg) : App Model Msg :=
-  { app with update := Query.wrap qs app.update }
+  Internal.App.setUpdate app (Query.wrap qs app.update)
 
 @[simp] theorem App.withQueries_init (qs : List (Query Model Msg)) (app : App Model Msg) :
     (App.withQueries qs app).init = app.init := rfl
@@ -126,6 +128,8 @@ def App.withQueries {Model Msg : Type} (qs : List (Query Model Msg))
     (App.withQueries qs app).update = Query.wrap qs app.update := rfl
 @[simp] theorem App.withQueries_template (qs : List (Query Model Msg)) (app : App Model Msg) :
     (App.withQueries qs app).template = app.template := rfl
+
+end Internal
 
 #guard (match (({} : Cached Nat).put "a" (.ok 1) "b").state with | .idle => true | _ => false)
 #guard ((({} : Cached Nat).put "a" (.ok 1) "b").lookup "a" == some 1)

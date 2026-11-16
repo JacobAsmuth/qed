@@ -16,7 +16,7 @@ instance {Model β : Type} : InvTarget (Model × β) Model := ⟨Prod.fst⟩
     InvTarget.proj p = p.1 := rfl
 
 syntax (name := invariantCmd)
-  "invariant " ident " : " term (" from " term)? " preserved_by " ident
+  "qedInternalInvariant " ident " : " term (" from " term)? " preserved_by " ident
     (" using " "[" term,* "]")? (" := " term)? : command
 
 open Lean Elab Tactic
@@ -27,13 +27,11 @@ private def qedBoundaryLemmas : Array Name :=
     ``List.length_cons, ``List.length_append, ``List.length_map]
 
 private def qedAppLemmas (env : Environment) : Array Name :=
-  let base := #[``Qed.ToStep.toStep_model, ``Qed.ToStep.toStep_pair, ``Qed.ToStep.toStep_listPair,
-                ``InvTarget.proj_id, ``InvTarget.proj_fst,
-                ``Qed.mkApp_init, ``Qed.mkApp_update,
-                ``Qed.mkRoutedApp_init, ``Qed.mkRoutedApp_update,
-                ``Qed.App.addLocals_init, ``Qed.App.addLocals_update,
-                ``Qed.App.withDehydrate_init, ``Qed.App.withDehydrate_update]
-  let opt := #[`Qed.App.withQueries_init, `Qed.App.withQueries_update,
+  let base := #[``InvTarget.proj_id, ``InvTarget.proj_fst,
+                ``Qed.Internal.mkApp_init, ``Qed.Internal.mkApp_update,
+                ``Qed.Internal.mkRoutedApp_init, ``Qed.Internal.mkRoutedApp_update,
+                ``Qed.Internal.App.withDehydrate_init, ``Qed.Internal.App.withDehydrate_update]
+  let opt := #[`Qed.Internal.App.withQueries_init, `Qed.Internal.App.withQueries_update,
                `Qed.Query.wrap, `Qed.Resource.query].filter env.contains
   base ++ opt
 
@@ -149,42 +147,31 @@ elab_rules : tactic
         else (upd.raw.reprint.getD (toString upd.raw)).trimmed
       throwErrorAt nm m!"invariant `{nm.getId}` isn't preserved by `{updName}`, the automation \
         couldn't close every message.\n{body}\n\nIf the property is true here, the prover is likely \
-        missing a fact: supply it with `… preserved_by {updName} using [yourLemma]`, or prove the \
+        missing a fact: supply it with `invariant {nm.getId} : … using [yourLemma]`, or prove the \
         case with `:= by`. If a branch can actually violate the property, fix that branch of \
         `{updName}`, or weaken the property to what it guarantees."
 
 macro_rules
-  | `(invariant $name:ident : $pred from $init preserved_by $upd:ident using [$_ls,*] := $pf:term) =>
+  | `(qedInternalInvariant $name:ident : $pred from $init preserved_by $upd:ident using [$_ls,*] := $pf:term) =>
     `(theorem $name:ident : ($pred) ($init) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
-  | `(invariant $name:ident : $pred from $init preserved_by $upd:ident := $pf:term) =>
+  | `(qedInternalInvariant $name:ident : $pred from $init preserved_by $upd:ident := $pf:term) =>
     `(theorem $name:ident : ($pred) ($init) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
-  | `(invariant $name:ident : $pred from $init preserved_by $upd:ident using [$ls,*]) =>
+  | `(qedInternalInvariant $name:ident : $pred from $init preserved_by $upd:ident using [$ls,*]) =>
     `(theorem $name:ident : ($pred) ($init) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
         qedDischargePreserved [$ls,*] $upd $name ($pred) from $init)
-  | `(invariant $name:ident : $pred from $init preserved_by $upd:ident) =>
+  | `(qedInternalInvariant $name:ident : $pred from $init preserved_by $upd:ident) =>
     `(theorem $name:ident : ($pred) ($init) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
         qedDischargePreserved [] $upd $name ($pred) from $init)
-  | `(invariant $name:ident : $pred preserved_by $upd:ident using [$_ls,*] := $pf:term) =>
+  | `(qedInternalInvariant $name:ident : $pred preserved_by $upd:ident using [$_ls,*] := $pf:term) =>
     `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
-  | `(invariant $name:ident : $pred preserved_by $upd:ident := $pf:term) =>
+  | `(qedInternalInvariant $name:ident : $pred preserved_by $upd:ident := $pf:term) =>
     `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
-  | `(invariant $name:ident : $pred preserved_by $upd:ident using [$ls,*]) =>
+  | `(qedInternalInvariant $name:ident : $pred preserved_by $upd:ident using [$ls,*]) =>
     `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
         qedDischargePreserved [$ls,*] $upd $name ($pred))
-  | `(invariant $name:ident : $pred preserved_by $upd:ident) =>
+  | `(qedInternalInvariant $name:ident : $pred preserved_by $upd:ident) =>
     `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
         qedDischargePreserved [] $upd $name ($pred))
-
-open Lean Parser in
-def invBinder : Parser := leading_parser
-  "(" >> ident >> optional (" : " >> termParser) >> ")"
-
-open Lean Parser in
-@[command_parser] def invariantBinderCmd : Parser := leading_parser
-  "invariant " >> ident >> invBinder >> " : " >> sepBy1 termParser "," >>
-  optional (" from " >> termParser) >> " preserved_by " >> ident >>
-  optional (" using " >> "[" >> sepBy termParser "," >> "]") >>
-  optional (" := " >> termParser)
 
 open Lean Elab Command in
 def mkConjBody (clauses : Array Term) : CommandElabM Term := do
@@ -193,45 +180,13 @@ def mkConjBody (clauses : Array Term) : CommandElabM Term := do
   | []      => `(True)
   | p :: ps => ps.foldlM (init := p) fun acc x => `($acc ∧ $x)
 
-open Lean Elab Command in
-private def mkBinderPred (bNode : Syntax) (clauses : Array Term) : CommandElabM Term := do
-  let bId : Ident := ⟨bNode[1]⟩
-  let conj ← mkConjBody clauses
-  if bNode[2].getNumArgs == 2 then
-    let bTy : Term := ⟨bNode[2][1]⟩
-    `(fun ($bId : $bTy) => $conj)
-  else
-    `(fun $bId => $conj)
-
-open Lean Elab Command in
-@[command_elab invariantBinderCmd] def elabInvariantBinderCmd : CommandElab := fun stx => do
-  let name : Ident := ⟨stx[1]⟩
-  let clauses : Array Term := stx[4].getSepArgs.map (⟨·⟩)
-  let pred ← mkBinderPred stx[2] clauses
-  let init? : Option Term := if stx[5].getNumArgs == 2 then some ⟨stx[5][1]⟩ else none
-  let upd : Ident := ⟨stx[7]⟩
-  let using? : Option (Array Term) :=
-    if stx[8].getNumArgs == 4 then some (stx[8][2].getSepArgs.map (⟨·⟩)) else none
-  let pf? : Option Term := if stx[9].getNumArgs == 2 then some ⟨stx[9][1]⟩ else none
-  let cmd ← match init?, using?, pf? with
-    | some i, some ls, some pf => `(invariant $name : $pred from $i preserved_by $upd using [$[$ls],*] := $pf)
-    | some i, none,    some pf => `(invariant $name : $pred from $i preserved_by $upd := $pf)
-    | some i, some ls, none    => `(invariant $name : $pred from $i preserved_by $upd using [$[$ls],*])
-    | some i, none,    none    => `(invariant $name : $pred from $i preserved_by $upd)
-    | none,   some ls, some pf => `(invariant $name : $pred preserved_by $upd using [$[$ls],*] := $pf)
-    | none,   none,    some pf => `(invariant $name : $pred preserved_by $upd := $pf)
-    | none,   some ls, none    => `(invariant $name : $pred preserved_by $upd using [$[$ls],*])
-    | none,   none,    none    => `(invariant $name : $pred preserved_by $upd)
-  elabCommand cmd
-
 open Lean Elab Command Term Meta Lean.PrettyPrinter in
 def extractInvPred (id : Ident) : TermElabM (TSyntax `term) := do
   let cTy := (← getConstInfo (← realizeGlobalConstNoOverload id)).type
   let stepTy := if cTy.isAppOfArity ``And 2 then cTy.appArg! else cTy
   forallTelescope stepTy fun args _ => do
     if args.size < 2 then throwErrorAt id
-      "`{id}` doesn't look like a `… preserved_by …` invariant, so its predicate can't \
-       be inferred, write it explicitly (`<pred> for_each … preserved_by … using {id}`)."
+      "`{id}` doesn't look like a state invariant, so its predicate can't be inferred; write it explicitly (`<pred> for_each … using {id}`)."
     delab (← mkLambdaFVars #[args[0]!] (← inferType args[args.size - 1]!)).eta
 
 end Qed

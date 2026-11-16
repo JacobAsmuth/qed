@@ -8,6 +8,7 @@ import Qed.Runtime.Verify
 namespace Qed
 
 structure App (Model : Type) (Msg : Type) where
+  private mk ::
   init           : Model × Cmd Msg
   update         : Model → Msg → Model × Cmd Msg
   template       : View Model Msg
@@ -28,63 +29,47 @@ theorem App.valid_app_view (app : App Model Msg) (m : Model) :
     Html.valid (app.view m) = true :=
   app.valid_view m
 
-class ToStep (Model : Type) (Msg : Type) (α : Type) where
-  toStep : α → Model × Cmd Msg
-instance : ToStep Model Msg Model := ⟨fun m => (m, .none)⟩
-instance : ToStep Model Msg (Model × Cmd Msg) := ⟨id⟩
-instance : ToStep Model Msg (Model × List (Cmd Msg)) := ⟨fun (m, cs) => (m, .batch cs)⟩
+namespace Internal
 
-@[simp] theorem ToStep.toStep_model (m : Model) :
-    (ToStep.toStep m : Model × Cmd Msg) = (m, .none) := rfl
-@[simp] theorem ToStep.toStep_pair (p : Model × Cmd Msg) :
-    (ToStep.toStep p : Model × Cmd Msg) = p := rfl
-@[simp] theorem ToStep.toStep_listPair (p : Model × List (Cmd Msg)) :
-    (ToStep.toStep p : Model × Cmd Msg) = (p.1, .batch p.2) := rfl
-
-def mkApp [ToStep Model Msg α] (init : Model) (update : Model → Msg → α)
+def mkApp (init : Model) (update : Model → Msg → Model × Cmd Msg)
     (template : View Model Msg) (start : Cmd Msg := .none) (locals : List LocalDef := [])
-    (onPort : Option (String → String → Option Msg) := none)
+    (styles : List Style := []) (onPort : Option (String → String → Option Msg) := none)
     (valid_view : ∀ m, Html.valid (View.render template m) = true := by qedProveValidHtml) :
     App Model Msg :=
-  { init := (init, start), update := fun m msg => ToStep.toStep (update m msg),
-    template, locals, onPort, valid_view }
+  { init := (init, start), update, template, locals, styles, onPort, valid_view }
 
-def mkRoutedApp {R : Type} [Router R] [Inhabited R] [ToStep Model Msg α]
-    (init : Model) (update : Model → Msg → α) (template : View Model Msg)
+def mkRoutedApp {R : Type} [Router R] [Inhabited R]
+    (init : Model) (update : Model → Msg → Model × Cmd Msg) (template : View Model Msg)
     (onRoute : R → Msg) (start : Cmd Msg := .none) (locals : List LocalDef := [])
-    (onPort : Option (String → String → Option Msg) := none)
+    (styles : List Style := []) (onPort : Option (String → String → Option Msg) := none)
     (valid_view : ∀ m, Html.valid (View.render template m) = true := by qedProveValidHtml) :
     App Model Msg :=
-  { mkApp init update template start locals onPort valid_view with
+  { mkApp init update template start locals styles onPort valid_view with
     onUrlChange := some (fun p => onRoute ((Router.fromURL p).getD default)) }
 
-def App.addLocals (app : App Model Msg) (locals : List LocalDef) (styles : List Style := []) : App Model Msg :=
-  { app with locals := LocalDef.dedupe (app.locals ++ locals), styles := app.styles ++ styles }
+def App.setUpdate (app : App Model Msg) (u : Model → Msg → Model × Cmd Msg) : App Model Msg :=
+  { app with update := u }
 
-@[simp] theorem mkApp_init [ToStep Model Msg α] (init : Model) (u : Model → Msg → α)
-    (t : View Model Msg) (s l p hv) :
-    (mkApp init u t s l p hv).init = (init, s) := rfl
-@[simp] theorem mkApp_update [ToStep Model Msg α] (init : Model) (u : Model → Msg → α)
-    (t : View Model Msg) (s l p hv) (m : Model) (msg : Msg) :
-    (mkApp init u t s l p hv).update m msg = ToStep.toStep (u m msg) := rfl
-@[simp] theorem mkApp_template [ToStep Model Msg α] (init : Model) (u : Model → Msg → α)
-    (t : View Model Msg) (s l p hv) :
-    (mkApp init u t s l p hv).template = t := rfl
-@[simp] theorem mkRoutedApp_init {R : Type} [Router R] [Inhabited R] [ToStep Model Msg α]
-    (init : Model) (u : Model → Msg → α) (t : View Model Msg) (r : R → Msg) (s l p hv) :
-    (mkRoutedApp init u t r s l p hv).init = (init, s) := rfl
-@[simp] theorem mkRoutedApp_update {R : Type} [Router R] [Inhabited R] [ToStep Model Msg α]
-    (init : Model) (u : Model → Msg → α) (t : View Model Msg) (r : R → Msg) (s l p hv) (m : Model) (msg : Msg) :
-    (mkRoutedApp init u t r s l p hv).update m msg = ToStep.toStep (u m msg) := rfl
-@[simp] theorem mkRoutedApp_template {R : Type} [Router R] [Inhabited R] [ToStep Model Msg α]
-    (init : Model) (u : Model → Msg → α) (t : View Model Msg) (r : R → Msg) (s l p hv) :
-    (mkRoutedApp init u t r s l p hv).template = t := rfl
-@[simp] theorem App.addLocals_init (app : App Model Msg) (l s) :
-    (app.addLocals l s).init = app.init := rfl
-@[simp] theorem App.addLocals_update (app : App Model Msg) (l s) :
-    (app.addLocals l s).update = app.update := rfl
-@[simp] theorem App.addLocals_template (app : App Model Msg) (l s) :
-    (app.addLocals l s).template = app.template := rfl
+@[simp] theorem mkApp_init (init : Model) (u : Model → Msg → Model × Cmd Msg)
+    (t : View Model Msg) (s l st p hv) :
+    (mkApp init u t s l st p hv).init = (init, s) := rfl
+@[simp] theorem mkApp_update (init : Model) (u : Model → Msg → Model × Cmd Msg)
+    (t : View Model Msg) (s l st p hv) :
+    (mkApp init u t s l st p hv).update = u := rfl
+@[simp] theorem mkApp_template (init : Model) (u : Model → Msg → Model × Cmd Msg)
+    (t : View Model Msg) (s l st p hv) :
+    (mkApp init u t s l st p hv).template = t := rfl
+@[simp] theorem mkRoutedApp_init {R : Type} [Router R] [Inhabited R]
+    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p hv) :
+    (mkRoutedApp init u t r s l st p hv).init = (init, s) := rfl
+@[simp] theorem mkRoutedApp_update {R : Type} [Router R] [Inhabited R]
+    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p hv) :
+    (mkRoutedApp init u t r s l st p hv).update = u := rfl
+@[simp] theorem mkRoutedApp_template {R : Type} [Router R] [Inhabited R]
+    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p hv) :
+    (mkRoutedApp init u t r s l st p hv).template = t := rfl
+
+end Internal
 
 structure Dehydrate (Model : Type) where
   project    : Model → Model := id
@@ -112,14 +97,6 @@ def slice {Model α : Type} [LawfulJson α] (init : Model)
 def const {Model : Type} (init : Model) : Dehydrate Model :=
   slice (α := Unit) init (fun _ => ()) (fun m _ => m)
 
-def route {Model R : Type} [Router R] (init : Model)
-    (get : Model → R) (set : Model → R → Model) : Dehydrate Model :=
-  slice init get set
-
-def fromRoute {Model Msg R α : Type} [Router R] [ToStep Model Msg α]
-    (init : Model) (update : Model → Msg → α) (onRoute : R → Msg) (get : Model → R) : Dehydrate Model :=
-  slice init get (fun _ r => (ToStep.toStep (update init (onRoute r)) : Model × Cmd Msg).1)
-
 @[simp] theorem full_project {Model : Type} [LawfulJson Model] (m : Model) :
     (full : Dehydrate Model).project m = m := rfl
 
@@ -129,15 +106,6 @@ def fromRoute {Model Msg R α : Type} [Router R] [ToStep Model Msg α]
 
 @[simp] theorem const_project {Model : Type} (init m : Model) :
     (const init).project m = init := rfl
-
-@[simp] theorem route_project {Model R : Type} [Router R] (init : Model)
-    (get : Model → R) (set : Model → R → Model) (m : Model) :
-    (route init get set).project m = set init (get m) := rfl
-
-@[simp] theorem fromRoute_project {Model Msg R α : Type} [Router R] [ToStep Model Msg α]
-    (init : Model) (update : Model → Msg → α) (onRoute : R → Msg) (get : Model → R) (m : Model) :
-    (fromRoute init update onRoute get).project m =
-      (ToStep.toStep (update init (onRoute (get m))) : Model × Cmd Msg).1 := rfl
 
 theorem dehydrate_view_of_project {Model Msg : Type}
     (d : Dehydrate Model) (tmpl : View Model Msg)
@@ -151,6 +119,8 @@ theorem dehydrate_view_of_project {Model Msg : Type}
   exact hproj m
 
 end Dehydrate
+
+namespace Internal
 
 def App.withDehydrate {Model Msg : Type} (d : Dehydrate Model) (app : App Model Msg)
     (hview : ∀ m, View.render app.template (d.project m) = View.render app.template m := by
@@ -168,7 +138,9 @@ def App.withDehydrate {Model Msg : Type} (d : Dehydrate Model) (app : App Model 
     (App.withDehydrate d app hv).template = app.template := rfl
 
 @[reducible] def App.withFullDehydrate {Model Msg : Type} [LawfulJson Model] (app : App Model Msg) : App Model Msg :=
-  app.withDehydrate Dehydrate.full (fun _ => rfl)
+  App.withDehydrate Dehydrate.full app (fun _ => rfl)
+
+end Internal
 
 section AutoDehydrate
 open Lean Meta Elab Term
@@ -361,22 +333,6 @@ private def elabInitModel (initStx : Syntax) : TermElabM (Expr × Expr) := do
   let initVal ← instantiateMVars initVal
   return (initVal, ← instantiateMVars (← inferType initVal))
 
-elab "Dehydrate.auto" : term <= expTy => do
-  let expTy ← instantiateMVars (← whnfR expTy)
-  let (fn, args) := expTy.getAppFnArgs
-  unless fn == ``Qed.Dehydrate && args.size == 1 do
-    throwError m!"Dehydrate.auto expected type `Dehydrate Model`, got `{← ppExpr expTy}`"
-  let modelTy ← instantiateMVars args[0]!
-  let some (instModel, _) ← synthLawfulJsonAux 16 modelTy
-    | throwError m!"Dehydrate.auto: could not synthesize a verified JSON codec (`LawfulJson`) for `{← ppExpr modelTy}`"
-  return mkApp2 (Lean.mkConst ``Dehydrate.full) modelTy instModel
-
-elab "Dehydrate.fields " init:term:max " [" fs:ident,* "]" : term => do
-  let fArr := fs.getElems
-  if fArr.isEmpty then throwError "Dehydrate.fields requires at least one field name"
-  let (initVal, modelTy) ← elabInitModel init
-  elabStructFieldsSlice (← getRef) initVal modelTy fArr
-
 elab "Dehydrate.except " init:term:max " [" es:ident,* "]" : term => do
   let exArr := es.getElems
   let (initVal, modelTy) ← elabInitModel init
@@ -391,7 +347,8 @@ elab "Dehydrate.except " init:term:max " [" es:ident,* "]" : term => do
   let ref ← getRef
   elabStructFieldsSlice ref initVal modelTy (allFields.filter (fun f => !exArr.any (·.getId == f)) |>.map (mkIdentFrom ref))
 
-private def elabAutoDehydrateCore (strict : Bool) (stx init app : Syntax) (expectedType : Expr) : TermElabM Expr := do
+elab "qedInternalAutoDehydrate% " init:term:max app:term:max : term <= expectedType => do
+  let stx ← getRef
   let appVal ← elabTerm app (some expectedType)
   synthesizeSyntheticMVarsNoPostponing
   let appVal ← instantiateMVars appVal
@@ -400,25 +357,22 @@ private def elabAutoDehydrateCore (strict : Bool) (stx init app : Syntax) (expec
   let modelTy ← instantiateMVars appArgs[0]!
   let msgTy   ← instantiateMVars appArgs[1]!
   if let some (instModel, _) ← synthLawfulJsonAux 16 modelTy then
-    return mkApp4 (Lean.mkConst ``App.withFullDehydrate) modelTy msgTy instModel appVal
+    return mkApp4 (Lean.mkConst ``Internal.App.withFullDehydrate) modelTy msgTy instModel appVal
   let (fn, _) := (← whnfR modelTy).getAppFnArgs
   let env ← getEnv
-  let mut badFields : Array Name := #[]
   if isStructure env fn then
     let allFields := getStructureFieldsFlattened env fn (includeSubobjectFields := false)
     let initVal ← instantiateMVars (← elabTermEnsuringType init modelTy <* synthesizeSyntheticMVarsNoPostponing)
-    let mut goodFields : Array Ident := #[]
-    for f in allFields do
-      let fOk ← withLocalDeclD `_qed_m modelTy fun m => do
+    let goodFields ← allFields.filterM fun f =>
+      withLocalDeclD `_qed_m modelTy fun m => do
         try return (← synthLawfulJsonAux 16 (← instantiateMVars (← inferType (← mkProjection m f)))).isSome
         catch _ => return false
-      if fOk then goodFields := goodFields.push (mkIdentFrom stx f) else badFields := badFields.push f
     if !goodFields.isEmpty then
       let saved ← saveState
       let preMsgs := (← Core.getMessageLog).toList.length
       let sliceAttempt? ← try
-          let dSlice ← elabStructFieldsSlice stx initVal modelTy goodFields
-          let fn4 := mkApp4 (Lean.mkConst ``Qed.App.withDehydrate) modelTy msgTy dSlice appVal
+          let dSlice ← elabStructFieldsSlice stx initVal modelTy (goodFields.map (mkIdentFrom stx))
+          let fn4 := mkApp4 (Lean.mkConst ``Qed.Internal.App.withDehydrate) modelTy msgTy dSlice appVal
           let pfMVar ← mkFreshExprMVar (← inferType fn4).bindingDomain!
           let unsolved ← Tactic.run pfMVar.mvarId! (Tactic.evalTactic (← `(tactic| qedProveDehydrateView)))
           let pf ← instantiateMVars pfMVar
@@ -428,20 +382,8 @@ private def elabAutoDehydrateCore (strict : Bool) (stx init app : Syntax) (expec
         catch _ => pure none
       if let some wrapped := sliceAttempt? then return wrapped
       restoreState saved
-  if strict then
-    let detail := if badFields.isEmpty then m!"no verified JSON codec (`LawfulJson`) available"
-      else m!"field(s) {badFields.toList} do not have a verified JSON codec (`LawfulJson`) and affect the rendered view"
-    throwErrorAt stx m!"cannot dehydrate `{← ppExpr modelTy}`: {detail}"
   return appVal
 
-elab "withAutoDehydrate " i:term:max a:term:max : term <= t => do elabAutoDehydrateCore false (← getRef) i a t
-elab "withAutoDehydrate! " i:term:max a:term:max : term <= t => do elabAutoDehydrateCore true (← getRef) i a t
-
 end AutoDehydrate
-
-class ToPortOpt (Msg : Type) (α : Type) where
-  toPortOpt : α → Option (String → String → Option Msg)
-instance : ToPortOpt Msg (String → String → Option Msg) := ⟨some⟩
-instance : ToPortOpt Msg (Option (String → String → Option Msg)) := ⟨id⟩
 
 end Qed

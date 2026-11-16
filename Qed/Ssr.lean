@@ -211,7 +211,7 @@ theorem fullstack_ssr_rpc_equiv {Model Msg : Type}
     (dispatchBytes : String → String → ByteArray → Except String ByteArray)
     (dispatchText  : String → String → String → Except String String)
     (fuel : Nat) :
-    let appD := app.withDehydrate d hview
+    let appD := Qed.Internal.App.withDehydrate d app hview
     let m_srv : Model := App.ssrBootM (m := Id) appD path dispatchBytes dispatchText fuel
     let stateJson := appD.dehydrate m_srv
     ∃ m_hyd : Model,

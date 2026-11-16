@@ -214,7 +214,4 @@ def renderStyleSheet (styles : List Style) : String :=
     (fun acc s => if acc.any (·.className == s.className) then acc else s :: acc) []).reverse
   String.intercalate "\n" (seen.map Style.rule)
 
-@[inline] def styleSheet (styles : List Style) : Html msg :=
-  el "style" [] [Html.text (escapeRawText (renderStyleSheet styles))]
-
 end Qed

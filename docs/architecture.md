@@ -1,10 +1,10 @@
 # How Qed works
 
-Qed components generate a typed message enum and a pure update function. When an event fires,
-it dispatches a message; the update function computes the next state; the renderer updates the
-DOM. When an app grows to need routing or side effects, you can write that same architecture
-explicitly with `Model`, `Msg`, `update` (or `transition`), and `ui`—and keep using the same
-components inside it.
+Qed components generate a typed message enum, an update function, a fine-grained `View`
+template, and a verified `App`. When an event fires, it dispatches a message; the update function
+computes the next state (plus optional `Cmd` effects); the renderer updates the DOM. Top-level
+apps and reusable sub-components use the exact same `component` syntax, adding `route`, `start`,
+`port`, `query`, and `dehydrate` clauses as needed.
 
 ## From Lean to the browser
 
@@ -38,12 +38,12 @@ models, Qed pairs its compile-time proofs with differential and headless-browser
 
 ## What Qed checks at compile time
 
-- **State transitions:** `invariant … preserved_by update` proves that if a rule holds before
-  an update, it still holds afterward (and on `init` when requested). See
+- **State transitions:** Component `invariant` declarations prove that if a rule holds before
+  an update, it still holds afterward (and on initial state). See
   [invariants](invariants.md).
-- **Views, HTML5 validity, and XSS safety:** `invariant … holds_in view` checks custom view
-  and styling rules. In addition, every `App` and local component carries an automatic
-  `valid_view` proof (`Html.valid`) that rules out browser-rewritten HTML5 nesting (like
+- **Views, HTML5 validity, and XSS safety:** Inline view `invariant`s (and `invariant … holds_in view`
+  on helper views) check custom view and styling rules. In addition, every `component` carries an
+  automatic `valid_view` proof (`Html.valid`) that rules out browser-rewritten HTML5 nesting (like
   `<div>` inside `<p>` or nested `<button>`s), children inside void tags, `<script>` / `srcdoc` /
   inline `on*` attributes, raw HTML injection, and untyped `href` / `src` / `action` URLs.
   SSR script, JSON, and CSS payloads are also proved breakout-free.
@@ -119,9 +119,9 @@ To deploy with SSR:
    locally).
 2. Host your backend `/api` endpoints separately, or pass a custom `fetch` into
    `makeHandler(mod, { fetch, title, … })` from `dist/ssr.mjs`.
-3. State restoration is automatic: `ui` and `component` apps synthesize a verified `Dehydrate`
+3. State restoration is automatic: `component` apps synthesize a verified `Dehydrate`
    codec by default so the browser restores server state without re-fetching startup data
-   (customizable with `(ephemeral := […])`, `(dehydrate := […])`, or `(dehydrate := false)`).
+   (mark client-only fields `ephemeral` to exclude them from serialization).
    [Bookshelf](../Examples/Bookshelf.lean) and [`test/bookshelf_ssr_test.mjs`](../test/bookshelf_ssr_test.mjs)
    demonstrate zero-refetch startup.
 
@@ -135,17 +135,17 @@ The same build output also works as a static single-page app: point client route
 | `Qed/Html.lean` | Typed `Html` / `Attr` / `Url` virtual DOM and static HTML5 validity rules (`Html.valid`). |
 | `Qed/Jsx.lean` | JSX syntax (`<div class="x" onClick={.tap}>…</div>`), lowered to typed `Html` builders. |
 | `Qed/Notation.lean` | Attribute, event, link, and `Qed.lazy` helpers used by JSX and plain Lean views. |
-| `Qed/View.lean` (`Qed/View/`) | Fine-grained `View` templates (`dyn`, `showIf`, `ifElse`, `forEach`, `memo`), `view%` lifting, and `patch_render` proofs. |
+| `Qed/View.lean` (`Qed/View/`) | Fine-grained `View` templates (`dyn`, `showIf`, `ifElse`, `forEach`, `memo`), template lifting, and `patch_render` proofs. |
 | `Qed/Diff.lean` | Pure tree diffing and keyed/positional child reconciliation, plus `diff_apply`. |
 | `Qed/Dom.lean` / `Qed/Driver.lean` (`Qed/Driver/`) | Total `MonadDom` interface and browser driver for mounting, patching, hydration, and local state. |
 | `Qed/Proofs/DomEquiv.lean` | Refinement proofs linking the `MonadDom` driver, keyed moves, hydration, `SoundMemo`, and SSR to `Html.render`. |
-| `Qed/Runtime.lean` (`Qed/Runtime/`) | TEA `App` and `ui` builders, `Cmd` effects, typed ports, local components, and `Dehydrate` codecs. |
+| `Qed/Runtime.lean` (`Qed/Runtime/`) | TEA `App` runtime, `Cmd` effects, typed ports, local components, asset discovery, and `Dehydrate` codecs. |
 | `Qed/Ssr.lean` | Document serialization (`renderDocument`), breakout-safety proofs, and per-request SSR execution. |
 | `Qed/Json.lean` (`Qed/Json/`) | Total JSON parser/renderer and `ToJson` / `FromJson` / `LawfulJson` round-trip proofs. |
 | `Qed/Router.lean` | `Router` / `LawfulKey` classes, the `router` macro, and verified URL formatting/parsing. |
 | `Qed/Schema.lean` | Refined `Field` types, form controls, and the `schema` macro (generates `Draft`, `formView`, `canSubmit_iff`, and JSON codecs). |
 | `Qed/Component.lean` (`Qed/Component/`) | `component` macro (`prop`, `state`, `event`, `port`, `query`, `route`, `action`, `collection`, `invariant`, `view`). |
-| `Qed/Invariant.lean` (`Qed/Invariant/`) | `invariant` command (`preserved_by`, `holds_in`, `for_each`) and proof automation. |
+| `Qed/Invariant.lean` (`Qed/Invariant/`) | State, `for_each`, and view `invariant` proof automation (`holds_in` for pure helpers). |
 | `Js/Backend.lean` | Total Lean IR to typed JavaScript AST compiler and pretty-printer. |
 | `Js/VerifyEnv.lean` | Kernel `Lean.Environment` gate enforcing standard axioms and total definitions. |
 | `Js/Proofs.lean` | Operational semantics and soundness proofs for JS lowering and copy-on-write arrays. |

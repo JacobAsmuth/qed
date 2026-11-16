@@ -1,5 +1,6 @@
 import Qed
-open Qed (View App mkApp cls onClick)
+open Qed (View App cls onClick)
+open Qed.Internal (mkApp)
 open Qed.V
 
 namespace BenchScalar
@@ -31,6 +32,6 @@ def template : View Model Msg :=
           el "div" [.stat (cls "cell")] [text s!"static cell {i}"])
   ]
 
-def app : App Model Msg := mkApp init update template
+def app : App Model Msg := mkApp init (fun m msg => (update m msg, .none)) template
 
 end BenchScalar

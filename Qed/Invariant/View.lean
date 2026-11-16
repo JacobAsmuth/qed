@@ -48,7 +48,7 @@ macro_rules
          Qed.V.el, Qed.V.text, Qed.V.dyn, Qed.V.ifElse, Qed.V.showIf, Qed.V.static, Qed.V.dynNode,
          Qed.V.memo, Qed.V.forEach, Qed.View.memo,
          Qed.ForEachItems.toList_array, Qed.ForEachItems.toList_list, Qed.ForEachItems.toArray, Qed.mapList_eq,
-         Qed.text, Qed.lazy, Qed.el, Qed.link, Qed.linkTo, Qed.styleSheet, Qed.theme,
+         Qed.text, Qed.lazy, Qed.el, Qed.link, Qed.linkTo, Qed.theme,
          Qed.Attr.empty, Qed.Html.ofOption, Qed.toString_string, Qed.withKey,
          Qed.Html.map, Qed.Html.mapChildren, Qed.Attr.map,
          Qed.cls, Qed.attr, Qed.role, Qed.on,

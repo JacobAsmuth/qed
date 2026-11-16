@@ -17,7 +17,7 @@ await withBrowser('TEMPLATE', { webRoot: 'Examples.TemplateWeb' }, async ({ page
   check('no greeting initially', await greeting(), []);
   check('ifElse shows the hint branch at count 0', await status(), { cls: 'hint', text: 'click + to start' });
   check('two todos, first done', await rows(), [{ text: 'learn Lean', done: true }, { text: 'write a template', done: false }]);
-  check('scoped style applied (padding from styleSheet)',
+  check('scoped style applied (padding from auto-injected css)',
     await page.$eval('#styled-banner', (e) => getComputedStyle(e).padding), '7px');
   check('keyless map renders the items (total fallback)',
     await page.$$eval('.demo ul.keyless li', (ls) => ls.map((l) => l.textContent)),

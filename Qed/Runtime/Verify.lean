@@ -102,14 +102,16 @@ dsimproc [simp] reduceTagBlocksSpanSubtree (tagBlocksSpanSubtree _) := fun e => 
   return .done (toExpr (Qed.tagBlocksSpanSubtree s))
 
 def qedLooksGenerated (n : Name) : Bool :=
-  n.isInternalDetail ||
-  (match n with
-   | .str _ s =>
-       ["casesOn", "recOn", "rec", "brecOn", "below", "ibelow", "noConfusion",
-        "noConfusionType", "toCtorIdx", "ofNat", "print", "parse", "toSeg", "fromSeg",
-        "toJson", "fromJson"].contains s
-         || s.startsWith "match_" || s.startsWith "eq_" || s.startsWith "inst"
-   | _ => false)
+  match n with
+  | .str _ s =>
+      if ["_qed_render", "_qed_renderTag", "_qed_mount", "_qed_mountWithOpt"].contains s then false
+      else
+        n.isInternalDetail ||
+        ["casesOn", "recOn", "rec", "brecOn", "below", "ibelow", "noConfusion",
+         "noConfusionType", "toCtorIdx", "ofNat", "print", "parse", "toSeg", "fromSeg",
+         "toJson", "fromJson"].contains s
+          || s.startsWith "match_" || s.startsWith "eq_" || s.startsWith "inst"
+  | _ => n.isInternalDetail
 
 def qedIsHelper (env : Environment) (n : Name) : Bool :=
   let mod := match env.getModuleIdxFor? n with | some i => env.header.moduleNames[i]! | none => n
@@ -153,7 +155,7 @@ private def viewFrameworkUnfolds (env : Environment) : Array Name :=
     ``VAttr.eval, ``V.el, ``V.text, ``V.dyn, ``V.ifElse, ``V.showIf, ``V.static,
     ``V.dynNode, ``V.memo, ``V.forEach, ``V.bindAttr, ``V.dynAttr,
     ``V.onClick', ``V.onInput', ``V.onCheck', ``SoundMemo.ofLawful,
-    ``Qed.text, ``Qed.lazy, ``Qed.el, ``Qed.link, ``Qed.linkTo, ``Qed.theme, ``Qed.styleSheet,
+    ``Qed.text, ``Qed.lazy, ``Qed.el, ``Qed.link, ``Qed.linkTo, ``Qed.theme,
     ``Qed.cls, ``Qed.attr, ``Qed.role, ``Qed.on, ``Qed.onValue, ``Qed.onClick, ``Qed.onInput,
     ``Qed.onChange, ``Qed.onCheck, ``Qed.onKeydown, ``Qed.onKeyup, ``Qed.onSubmit,
     ``Qed.onBlur, ``Qed.onFocus, ``Qed.onDoubleClick, ``Qed.onMouseDown, ``Qed.onMouseUp,
@@ -217,7 +219,7 @@ elab "qedProveValidHtml" : tactic => do
       • Non-empty children on a void element (`<input>`, `<img>`, `<br>`, …) or local component mount\n\
       • Forbidden tag (`<script>`, `<base>`, `<applet>`, `<object>`, `<embed>`) or raw `on*`/`srcdoc` attribute\n\
       • Dynamic URL-bearing attribute (`href`, `src`, `action`, …) not routed through `Router` or `Url`\n\
-      • Unescaped dynamic text inside `<style>` (wrap with `escapeRawText` or `theme`/`styleSheet`)"
+      • Unescaped dynamic text inside `<style>` (wrap with `escapeRawText` or `theme`)"
 
 elab "qedProveDehydrateView" : tactic => do
   evalTactic (← `(tactic| intro _qed_m))
@@ -226,11 +228,9 @@ elab "qedProveDehydrateView" : tactic => do
   if (← getGoals).isEmpty then return
   let env0 ← getEnv
   let projLemmas := #[
-    `Qed.mkApp_template, `Qed.mkRoutedApp_template, `Qed.App.addLocals_template,
-    `Qed.App.withDehydrate_template, `Qed.App.withQueries_template,
+    `Qed.Internal.mkApp_template, `Qed.Internal.mkRoutedApp_template,
+    `Qed.Internal.App.withDehydrate_template, `Qed.Internal.App.withQueries_template,
     `Qed.Dehydrate.full_project, `Qed.Dehydrate.slice_project, `Qed.Dehydrate.const_project,
-    `Qed.Dehydrate.route_project, `Qed.Dehydrate.fromRoute_project,
-    `Qed.ToStep.toStep_model, `Qed.ToStep.toStep_pair, `Qed.ToStep.toStep_listPair,
     ``View.render, ``View.renderEach, ``VAttr.eval,
     ``V.el, ``V.text, ``V.dyn, ``V.ifElse, ``V.showIf, ``V.static,
     ``V.dynNode, ``V.memo, ``V.forEach, ``View.showIf, ``View.ofHtml
@@ -262,8 +262,7 @@ elab "qedProveDehydrateView" : tactic => do
         pure m!"\n  • view mismatch after rehydration: {fmt.pretty.replace "✝" ""}")
     throwError m!"SSR `dehydrate` slice does not preserve the rendered view: rehydrating a model \
       can render different HTML on the client than SSR rendered on the server.{details}\n\n\
-      Include every model field read by the view in `(dehydrate := […])` (or omit `dehydrate` to \
-      dehydrate the full model automatically), or supply a proof to `App.withDehydrate`."
+      Do not mark model fields read by the view as `ephemeral` (so rehydration preserves the rendered view)."
 
 structure SchemaFormInfo where
   fullName     : Lean.Name

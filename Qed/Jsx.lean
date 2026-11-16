@@ -256,7 +256,7 @@ partial def attrsToTerms (rawAttrs : Array Syntax) (tag : String := "") : MacroM
         let vT ← expandAttrVal valNode (`(""))
         if vT.raw.isIdent then
           Macro.throwErrorAt vT
-            s!"`bind=\{{vT.raw.getId}}` shorthands state binding inside a `component`; in an explicit `ui` view, pass `bind=\{({vT.raw.getId}, .edit)}`"
+            s!"`bind=\{{vT.raw.getId}}` shorthands state binding inside a `component`; outside a `component` view, pass `bind=\{({vT.raw.getId}, onEdit)}`"
         let (valE, setE) ← match unpackPair? vT with
           | some p => pure p
           | none   => pure (← `(($vT).1), ← `(($vT).2))
@@ -418,7 +418,7 @@ partial def componentToTerm (pPath : String) (parentCtx? : Option (String × Htm
   for a in attrStxs do
     if a.getKind == ``attrSplice then
       Macro.throwErrorAt a s!"<{tag}>: a component tag takes props (field=\{…}, key, \
-        onEmit, state, onMsg); a spliced attribute belongs on an HTML element"
+        state, onMsg); a spliced attribute belongs on an HTML element"
     let nameLit := Syntax.mkStrLit (tokenVal a[0]) (info := a[0].getHeadInfo)
     let valNode := a[1]
     let v : Term ←
@@ -460,16 +460,5 @@ end
 
 @[macro jsxTerm] def expandJsxTerm : Macro := fun stx => do
   return (← elementToTerm "" none stx[0])
-
-private partial def hasJsx : Syntax → Bool
-  | .node _ kind args => kind == ``jsxTerm || args.any hasJsx
-  | _                 => false
-
--- Declared after `Qed.View`'s `macro_rules` so JSX expands before `view%` lifts the body.
-macro_rules
-  | `(view% fun $m:ident => $body) => do
-      if !hasJsx body then Macro.throwUnsupported
-      let body' : Term := ⟨← expandJsxIn body⟩
-      `(view% fun $m => $body')
 
 end Qed.Jsx

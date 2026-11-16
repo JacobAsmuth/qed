@@ -51,7 +51,7 @@ Run all proof/environment checks and the 21 automated test suites from the repo 
 4. **[Badge.lean](Badge.lean)** — Proof-only component with scoped `css` classes verified by inline
    view styling invariants alongside arithmetic state invariants.
 5. **[Template.lean](Template.lean)** — Core JSX control flow: conditionals, keyed and keyless
-   `for` loops, structural element switches, inline editing toggles, scoped `styleSheet` rules,
+   `for` loops, structural element switches, inline editing toggles, scoped `css` rules,
    and a custom `invariant ... := by ...` preservation proof.
 
 ## III. Child Components, Collections & Local State

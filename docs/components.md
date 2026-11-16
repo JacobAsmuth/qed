@@ -80,8 +80,7 @@ component Storefront where
   `start`, or `view` (for example `Catalog.list (books := ·)`), and schemas provide `<Book.Form bind={draft} onSubmit={.submit}/>`.
 - **`route`** binds the current URL route into state (defaulting the field name to `route`) and runs optional match arms on navigation.
 - **`start`** schedules initial commands when the app mounts.
-- **`ephemeral`** excludes client-only fields from SSR dehydration (all other `state` fields
-  auto-dehydrate by default).
+- **`ephemeral`** excludes client-only fields from SSR dehydration and resets them to their defaults on hydration (all other `state` fields auto-dehydrate by default).
 - **`port`** declares typed JS interop ports (`port name : Arg` outbound, `port name (arg : Arg) => ...` inbound).
 - **`query`** declares cached remote queries (`query items : Array Item` with `key := ...` and `url := ...`).
 - **`<Await of={res} as={val} err={e} loading={…} failed={…}>`** renders `Resource α` or `Cached α`
@@ -99,7 +98,7 @@ Qed supports three stateful composition modes:
    `perform`) hoists its state, `Out` events, `bind:` updates, and `Cmd` effects directly into the
    parent component with zero JSON overhead—including interactive `{children}` that dispatch parent
    actions.
-2. **Dynamic keyed local cells (`key=` / `initial=`):** Mounting `<Editor key={row.id} initial={{ note := row.text }} onEmit={…}/>`
+2. **Dynamic keyed local cells (`key=` / `initial=`):** Mounting `<Editor key={row.id} initial={{ note := row.text }} onSave={…}/>`
    registers a `LocalDef` cell whose state is keyed per row and survives parent list re-renders
    (see [`Examples/Local.lean`](../Examples/Local.lean)).
 3. **Parent-owned `collection`s:** When a parent needs to read, filter, or sort child states,

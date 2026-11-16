@@ -27,12 +27,15 @@ def importedHelper (r : Local.Row) : Html Local.Msg :=
   <Local.Widget key={r.id} id={r.id} label={r.label}
     initial={{ note := r.label }} onReport={Local.Msg.reported r.id}/>
 
-def helperApp : App Local.State Local.Msg := ui Local.init (fun m _ => m) fun m =>
-  importedHelper { id := 8, label := m.draft }
+component HelperApp where
+  state draft : String := ""
+  action localEvent (m : Local.Msg) => ()
+  view => (importedHelper { id := 8, label := draft }).map .localEvent
 
-#guard (helperApp.locals.map (·.id)).contains "Local.Widget"
-#guard (helperApp.locals.map (·.id)).contains "Local.Tag"
-#guard helperApp.locals.length == 2
+#guard (HelperApp.app.locals.map (·.id)).contains "SyntaxChecks.HelperApp"
+#guard (HelperApp.app.locals.map (·.id)).contains "Local.Widget"
+#guard (HelperApp.app.locals.map (·.id)).contains "Local.Tag"
+#guard HelperApp.app.locals.length == 3
 
 def rows : Array Todo.Row.State :=
   #[{ id := 8, text := "Zulu", done := false }, { id := 2, text := "Alpha", done := false }]
@@ -76,7 +79,7 @@ def counterHelper {msg : Type} : Html msg := <Counter key="helper"/>
 component Container where
   state unused : Nat := 0
   view => <div>{counterHelper}</div>
-#guard (Container.regs.map (·.id)).contains "SyntaxChecks.Counter"
+#guard (Container.app.locals.map (·.id)).contains "SyntaxChecks.Counter"
 #guard (Container.app.renderInitial).contains "0</button>"
 
 def ssrEdgeCases : Html Unit :=
@@ -122,8 +125,11 @@ def navView (s : Section) : Html Unit :=
 invariant navExclusive :
   exactlyOneOf ["nav-overview", "nav-arch", "nav-bench"] navOn navOff holds_in navView
 
-def stepCount (n : Nat) (d : Nat) : Nat := n + d
-invariant nonNegFromZero : (fun n : Nat => 0 ≤ n) from (0 : Nat) preserved_by stepCount
+component StepCount where
+  state n : Nat := 0
+  action step (d : Nat) => n := n + d
+  invariant nonNegFromZero : 0 ≤ n
+  view => <span>{n}</span>
 
 def docDehydrate : Dehydrate (DocRoute × Resource (Array Qed.Demo.Signup)) :=
   Dehydrate.full
@@ -132,11 +138,11 @@ example (x : DocRoute × Resource (Array Qed.Demo.Signup)) :
     docDehydrate.rehydrate (docDehydrate.dehydrate x) = some x :=
   docDehydrate.round_trip x
 
-def routedDehydratedApp : App DocRoute DocRoute :=
-  ui DocRoute.home (fun _ r => r) (onRoute := id) fun r =>
-    <div>{Router.toURL r}</div>
+component RoutedDehydrated where
+  route r : DocRoute := .home
+  view => <div>{Router.toURL r}</div>
 
-#guard routedDehydratedApp.rehydrate (routedDehydratedApp.dehydrate (.sec .benchmarks 3))
+#guard (RoutedDehydrated.app.rehydrate (RoutedDehydrated.app.dehydrate { r := .sec .benchmarks 3 })).map (·.r)
   == some (.sec .benchmarks 3)
 
 /-- error: styling invariant `badVacuousRole` doesn't hold for every model, `roleHasOneOf "nonexistent" [navOn, navOff]` is false for some `navView m`.
@@ -172,33 +178,24 @@ component RowItem where
   state count : Nat := 0
   key id
   action inc => count := count + 1
+  invariant rowSafeFromInit : 0 ≤ count
   view => <span>{count}</span>
-
-invariant rowSafeFromInit :
-  (fun r : RowItem.State => 0 ≤ r.count) from RowItem.init preserved_by RowItem.update
-
-structure RowList where rows : Array RowItem.State
-inductive RowListMsg | row (k : String) (m : RowItem.Msg)
-def updateRowList (m : RowList) : RowListMsg → RowList
-  | .row k cm => { rows := RowItem.updateKeyed m.rows k cm }
-
-invariant listSafeFromInit : rowSafeFromInit for_each rows preserved_by updateRowList
 
 #guard Router.fromURL "/docs/arch/2?tab=api#top" == some (DocRoute.sec .architecture 2)
 #guard Router.fromURL "/?utm=1#hero" == some DocRoute.home
 
-def typedLinkView (r : DocRoute) : View DocRoute DocRoute :=
-  view% fun cur => <a href={r} class={if cur == r then "active" else ""}>{"Go"}</a>
-#guard (Html.render (typedLinkView (.sec .architecture 2) .home)).contains "href=\"/docs/arch/2\""
+component TypedLink where
+  prop target : DocRoute
+  state cur : DocRoute := .home
+  view => <a href={target} class={if cur == target then "active" else ""}>{"Go"}</a>
+#guard (Html.render (TypedLink.view { target := .sec .architecture 2 } { cur := .home })).contains "href=\"/docs/arch/2\""
 
-def routeDehydrate : Dehydrate AppModel :=
-  Dehydrate.fromRoute { route := .home } (fun _ r => ({ route := r } : AppModel)) id (·.route)
-#guard routeDehydrate.rehydrate (routeDehydrate.dehydrate { route := .sec .benchmarks 7 })
-  == some { route := .sec .benchmarks 7 }
-
-def autoStyledApp : App AppModel Unit := ui { route := .home } (fun m _ => m) fun m => compositeNav m
-#guard autoStyledApp.styles.length == 2
-#guard (autoStyledApp.ssrStep "T" "/qed.js" "/" "").contains navOn.raw
+component AutoStyled where
+  state route : DocRoute := .home
+  action noop => ()
+  view => (compositeNav { route }).map (fun _ => .noop)
+#guard AutoStyled.app.styles.length == 2
+#guard (AutoStyled.app.ssrStep "T" "/qed.js" "/" "").contains navOn.raw
 
 #guard (renderTheme [nest "*, *::before" [margin (px 0)]]).contains
   ":where(*, *::before) { margin: 0px; }"
@@ -209,12 +206,15 @@ def typedBorderStyle : Style :=
 #guard typedBorderStyle.raw ==
   "border: 1px solid var(--border-subtle); border-bottom: 2px dashed #333; border-top: none;"
 
-def subBanner : View Section DocRoute :=
-  view% fun s => <header><a href={DocRoute.sec s 1}>{Router.toURL (DocRoute.sec s 1)}</a></header>
-def parentPage : View AppModel DocRoute :=
-  view% fun m => <div>{subBanner (activeSection m.route)}</div>
-#guard (Html.render (parentPage { route := .sec .architecture 3 })).contains "/docs/arch/1"
-invariant parentPageHasHeader : hasTag "header" holds_in parentPage
+component SubBanner where
+  prop sec : Section
+  view => <header><a href={DocRoute.sec sec 1}>{Router.toURL (DocRoute.sec sec 1)}</a></header>
+
+component ParentPage where
+  state route : DocRoute := .home
+  invariant parentPageHasHeader : hasTag "header"
+  view => <div><SubBanner sec={activeSection route}/></div>
+#guard (Html.render (ParentPage.view { route := .sec .architecture 3 })).contains "/docs/arch/1"
 
 component SingleChild where
   state count : Nat := 0
@@ -223,9 +223,7 @@ component SingleChild where
 
 inductive ParentMsg | child (m : SingleChild.Msg)
 def singleChildJsx (s : SingleChild.State) : Html ParentMsg := <SingleChild state={s} onMsg={.child}/>
-def singleChildDirect (s : SingleChild.State) : Html ParentMsg := SingleChild.render ParentMsg.child s
-#guard Html.render (singleChildJsx { count := 5 }) == Html.render (singleChildDirect { count := 5 })
-example : Component SingleChild.State SingleChild.Msg := SingleChild.toComponent
+#guard (Html.render (singleChildJsx { count := 5 })).contains "5</button>"
 
 def chipStyle : Style := css [ paddingX (px 6), marginTop (px 2) ]
 
@@ -253,9 +251,10 @@ example : ModernCounter.init.quantity = 1 ∧ ModernCounter.init.draft = "" := �
 example := ModernCounter.inv
 example := ModernCounter.inv_2
 
-def hostModernApp : App Nat Unit := ui 0 (fun n _ => n) fun n =>
-  <div data-n={n}><ModernCounter key="mc"/></div>
-#guard hostModernApp.styles.any (·.raw == chipStyle.raw)
+component HostModern where
+  state n : Nat := 0
+  view => <div data-n={n}><ModernCounter key="mc"/></div>
+#guard HostModern.app.styles.any (·.raw == chipStyle.raw)
 
 router RepoRoute where
   index => "/"
@@ -287,42 +286,32 @@ def jsxErgonomicsView (items : Array Nat) (note? : Option String) (highlight : B
     </>
     <ul>
       <li key="head">Top</li>
-      {items.map fun (n : Nat) => <li key={n}>{n}</li>}
+      {for n in items => <li key={n}>{n}</li>}
     </ul>
   </div>
 
 #guard (Html.render (jsxErgonomicsView #[1, 2] (some "ok") true)).contains "<p>ok</p>"
 #guard !(Html.render (jsxErgonomicsView #[] none false)).contains "<em>"
 
-structure SliceModel where
-  a : Nat
-  b : String
-  ephemeral : Nat
-deriving DecidableEq
+component AutoSliceComp where
+  state a : Nat := 1
+  state b : String := "hi"
+  state ephemeral : Nat := 99
+  action bump (d : Nat) => a := a + d
+  invariant sliceSafe : 1 ≤ a
+  view => <div>{a}{b}</div>
 
-def sliceInit : SliceModel := { a := 1, b := "hi", ephemeral := 99 }
-def sliceUpdate (m : SliceModel) (d : Nat) : SliceModel := { m with a := m.a + d }
-def sliceApp : App SliceModel Nat :=
-  ui sliceInit sliceUpdate (dehydrate := [a, b]) fun m =>
-    <div>{m.a}{m.b}</div>
+component EphemeralComp where
+  state a : Nat := 1
+  state b : String := "hi"
+  ephemeral ephemeral : Nat := 99
+  action bump (d : Nat) => a := a + d
+  view => <div>{a}{b}</div>
 
-#guard sliceApp.rehydrate (sliceApp.dehydrate { a := 7, b := "yo", ephemeral := 0 })
-  == some { a := 7, b := "yo", ephemeral := 99 }
-
-invariant sliceSafe (m) : 1 ≤ m.a from sliceInit preserved_by sliceUpdate
-
-def autoSliceApp : App SliceModel Nat := ui sliceInit (fun m d => { m with a := m.a + d }) fun m => <div>{m.a}{m.b}</div>
-def ephemeralOptApp : App SliceModel Nat := ui sliceInit (fun m d => { m with a := m.a + d }) (ephemeral := [ephemeral]) fun m => <div>{m.a}{m.b}</div>
-def negFieldOptApp : App SliceModel Nat := ui sliceInit (fun m d => { m with a := m.a + d }) (dehydrate := [-ephemeral]) fun m => <div>{m.a}{m.b}</div>
-def optOutApp : App SliceModel Nat := ui sliceInit (fun m d => { m with a := m.a + d }) (dehydrate := false) fun m => <div>{m.a}{m.b}</div>
-def fromRouteShorthandApp : App AppModel DocRoute :=
-  ui ({ route := .home } : AppModel) (fun _ r => ({ route := r } : AppModel)) (onRoute := id) (dehydrate := .fromRoute route) fun m => <div>{Router.toURL m.route}</div>
-
-#guard autoSliceApp.rehydrate (autoSliceApp.dehydrate { a := 7, b := "yo", ephemeral := 0 }) == some { a := 7, b := "yo", ephemeral := 0 }
-#guard ephemeralOptApp.rehydrate (ephemeralOptApp.dehydrate { a := 7, b := "yo", ephemeral := 0 }) == some { a := 7, b := "yo", ephemeral := 99 }
-#guard negFieldOptApp.rehydrate (negFieldOptApp.dehydrate { a := 7, b := "yo", ephemeral := 0 }) == some { a := 7, b := "yo", ephemeral := 99 }
-#guard optOutApp.dehydrate sliceInit == "" && optOutApp.rehydrate "{}" == none
-#guard fromRouteShorthandApp.rehydrate (fromRouteShorthandApp.dehydrate { route := .sec .benchmarks 9 }) == some { route := .sec .benchmarks 9 }
+#guard (AutoSliceComp.app.rehydrate (AutoSliceComp.app.dehydrate { a := 7, b := "yo", ephemeral := 0 })).map
+  (fun s => (s.a, s.b, s.ephemeral)) == some (7, "yo", 0)
+#guard (EphemeralComp.app.rehydrate (EphemeralComp.app.dehydrate { a := 7, b := "yo", ephemeral := 0 })).map
+  (fun s => (s.a, s.b, s.ephemeral)) == some (7, "yo", 99)
 #guard (ModernCounter.app.rehydrate (ModernCounter.app.dehydrate { quantity := 6, draft := "six", active := false })).map (·.quantity) == some 6
 
 inductive FilterTab | all | tagged (tag : String) deriving DecidableEq
@@ -330,32 +319,27 @@ structure PlainNote where
   id   : Nat
   text : String
 deriving DecidableEq
-structure RichModel where
-  tab   : FilterTab
-  notes : Array PlainNote
-  pick  : Option PlainNote
-  cache : Cached String
-  child : SingleChild.State
 
-def richInit : RichModel := { tab := .all, notes := #[], pick := none, cache := {}, child := { count := 0 } }
-def richDehydrate : Dehydrate RichModel := Dehydrate.auto
-def richAutoApp : App RichModel Unit := ui richInit (fun m _ => m) fun m => <div>{m.notes.size}{m.child.count}</div>
-def richSample : RichModel :=
+component RichAuto where
+  state tab   : FilterTab := .all
+  state notes : Array PlainNote := #[]
+  state pick  : Option PlainNote := none
+  state cache : Cached String := {}
+  state child : SingleChild.State := { count := 0 }
+  view => <div>{notes.size}{child.count}</div>
+
+#guard (RichAuto.app.rehydrate (RichAuto.app.dehydrate
   { tab := .tagged "lean", notes := #[{ id := 1, text := "hello" }], pick := some { id := 2, text := "pinned" },
-    cache := ({} : Cached String).put "k" (.ok "v") "k", child := { count := 42 } }
-def checkRich : Option RichModel → Bool
-  | some m => m.tab == .tagged "lean" && m.notes == #[{ id := 1, text := "hello" }] &&
-              m.pick == some { id := 2, text := "pinned" } && m.cache.lookup "k" == some "v" && m.child.count == 42
-  | none   => false
-#guard checkRich (richDehydrate.rehydrate (richDehydrate.dehydrate richSample))
-#guard checkRich (richAutoApp.rehydrate (richAutoApp.dehydrate richSample))
+    cache := ({} : Cached String).put "k" (.ok "v") "k", child := { count := 42 } })).map
+  (fun m => m.tab == .tagged "lean" && m.notes == #[{ id := 1, text := "hello" }] &&
+            m.pick == some { id := 2, text := "pinned" } && m.cache.lookup "k" == some "v" && m.child.count == 42) == some true
 
-structure PartialFnModel where
-  count : Nat
-  fn    : Nat → Nat
-def partialFnApp : App PartialFnModel Nat :=
-  ui { count := 1, fn := (· + 10) } (fun m d => { m with count := m.count + d }) fun m => <div>{m.count}</div>
-#guard ((partialFnApp.rehydrate (partialFnApp.dehydrate { count := 8, fn := (· * 2) })).map fun m => (m.count, m.fn 5)) == some (8, 15)
+component PartialFn where
+  state count : Nat := 1
+  state fn    : Nat → Nat := (· + 10)
+  action bump (d : Nat) => count := count + d
+  view => <div>{count}</div>
+#guard ((PartialFn.app.rehydrate (PartialFn.app.dehydrate { count := 8, fn := (· * 2) })).map fun m => (m.count, m.fn 5)) == some (8, 15)
 
 -- ── Compile-time rejection checks (#guard_msgs) ─────────────────────────
 
@@ -403,14 +387,15 @@ def badNestedInteractive : Html Unit := <button><button>bad</button></button>
 def badListChild : Html Unit := <ul><span>bad</span></ul>
 
 def goodSafeUrl : Url := url% "/docs/guide"
-def goodLazyView : View Nat Unit :=
-  view% fun m => <div><a href={goodSafeUrl}>Docs</a>{Qed.lazy (fun (k : Nat) => <span>{k}</span>) (m / 2)}</div>
-#guard (Html.render (goodLazyView 7)).contains "href=\"/docs/guide\""
-#guard (Html.render (goodLazyView 7)).contains "<span>3</span>"
+component GoodLazy where
+  state m : Nat := 7
+  view => <div><a href={goodSafeUrl}>Docs</a>{Qed.lazy (fun (k : Nat) => <span>{k}</span>) (m / 2)}</div>
+#guard (Html.render (GoodLazy.app.view { m := 7 })).contains "href=\"/docs/guide\""
+#guard (Html.render (GoodLazy.app.view { m := 7 })).contains "<span>3</span>"
 
-def sneakyBlock : Html Unit := <div>bad</div>
+def sneakyBlock {msg : Type} : Html msg := <div>bad</div>
 
-/-- error: could not synthesize default value for parameter 'valid_view' using tactics
+/-- error: could not synthesize default value for parameter 'hvalid' using tactics
 ---
 error: HTML5 / XSS validity check (`Html.valid`) failed for this view.
   • unsolved HTML5 / attribute validity obligation: False
@@ -420,43 +405,41 @@ Common causes:
 • Non-empty children on a void element (`<input>`, `<img>`, `<br>`, …) or local component mount
 • Forbidden tag (`<script>`, `<base>`, `<applet>`, `<object>`, `<embed>`) or raw `on*`/`srcdoc` attribute
 • Dynamic URL-bearing attribute (`href`, `src`, `action`, …) not routed through `Router` or `Url`
-• Unescaped dynamic text inside `<style>` (wrap with `escapeRawText` or `theme`/`styleSheet`) -/
-#guard_msgs in
-def badOpaqueNestingApp : App Unit Unit :=
-  ui () (fun m _ => m) fun u => <p>{sneakyBlock}</p>
+• Unescaped dynamic text inside `<style>` (wrap with `escapeRawText` or `theme`)
+---
+error: could not synthesize default value for parameter 'valid_view' using tactics
+---
+error: HTML5 / XSS validity check (`Html.valid`) failed for this view.
+  • unsolved HTML5 / attribute validity obligation: False
 
-/-- error: Qed.lazy function must not capture model variable `m` directly; pass all model dependencies through the `[LawfulKey]` argument so memoization stays sound -/
+Common causes:
+• Invalid HTML5 tag nesting (e.g. `<div>` inside `<p>`, `<button>` inside `<button>`/`<a>`, non-`<li>` inside `<ul>`/`<ol>`, non-`<tr>` inside `<tbody>`, non-`<option>` inside `<select>`)
+• Non-empty children on a void element (`<input>`, `<img>`, `<br>`, …) or local component mount
+• Forbidden tag (`<script>`, `<base>`, `<applet>`, `<object>`, `<embed>`) or raw `on*`/`srcdoc` attribute
+• Dynamic URL-bearing attribute (`href`, `src`, `action`, …) not routed through `Router` or `Url`
+• Unescaped dynamic text inside `<style>` (wrap with `escapeRawText` or `theme`) -/
 #guard_msgs in
-def badLazyCapturesModel : View Nat Unit :=
-  view% fun m => <div>{Qed.lazy (fun (k : Nat) => <span>{k + m}</span>) (m / 2)}</div>
+component BadOpaqueNesting where
+  state u : Unit := ()
+  view => <p>{sneakyBlock}</p>
+
+/-- error: Qed.lazy function must not capture state directly; pass all state dependencies through the `[LawfulKey]` argument so memoization stays sound -/
+#guard_msgs in
+component BadLazyCapturesModel where
+  state m : Nat := 1
+  view => <div>{Qed.lazy (fun (k : Nat) => <span>{k + m}</span>) (m / 2)}</div>
 
 /-- error: could not synthesize default value for parameter 'hview' using tactics
 ---
 error: SSR `dehydrate` slice does not preserve the rendered view: rehydrating a model can render different HTML on the client than SSR rendered on the server.
   • view mismatch after rehydration: "hi" = _qed_m.b
 
-Include every model field read by the view in `(dehydrate := […])` (or omit `dehydrate` to dehydrate the full model automatically), or supply a proof to `App.withDehydrate`. -/
+Do not mark model fields read by the view as `ephemeral` (so rehydration preserves the rendered view). -/
 #guard_msgs in
-def badIncompleteDehydrate : App SliceModel Nat :=
-  ui sliceInit (fun m d => { m with a := m.a + d }) (dehydrate := [a]) fun m =>
-    <div>{m.a}{m.b}</div>
-
-/-- error: could not synthesize default value for parameter 'hview' using tactics
----
-error: SSR `dehydrate` slice does not preserve the rendered view: rehydrating a model can render different HTML on the client than SSR rendered on the server.
-  • view mismatch after rehydration: "hi" = _qed_m.b
-
-Include every model field read by the view in `(dehydrate := […])` (or omit `dehydrate` to dehydrate the full model automatically), or supply a proof to `App.withDehydrate`. -/
-#guard_msgs in
-def badEphemeralReadByView : App SliceModel Nat :=
-  ui sliceInit (fun m d => { m with a := m.a + d }) (ephemeral := [b]) fun m =>
-    <div>{m.a}{m.b}</div>
-
-/-- error: cannot dehydrate `PartialFnModel`: field(s) [fn] do not have a verified JSON codec (`LawfulJson`) and affect the rendered view -/
-#guard_msgs in
-def badStrictDehydrateFn : App PartialFnModel Nat :=
-  ui { count := 1, fn := (· + 10) } (fun m _ => m) (dehydrate) fun m =>
-    <div>{m.fn m.count}</div>
+component BadEphemeralReadByView where
+  state a : Nat := 1
+  ephemeral b : String := "hi"
+  view => <div>{a}{b}</div>
 
 -- ── Sub-components, unified `app`, `Field`, `<Await>`, & fractional CSS checks ──
 
@@ -563,7 +546,7 @@ component CompositeDemo where
       <Accordion heading="Details" extra={<span>!</span>}>
         <button class="inner" onClick={.bump}>{clicks}</button>
       </Accordion>
-      <div>{rows.map fun r => <RowItem key={r.id} state={r}/>}</div>
+      <div>{for r in rows => <RowItem state={r}/>}</div>
     </div>
 
 -- Verify hoisted stateful sub-component state, two-way `bind:`, and `event` forwarding work synchronously!
@@ -610,7 +593,7 @@ def forLoopHtml : Html Unit :=
 
 component InlineForEachParent where
   collection rows : RowItem
-  invariant rowsSafe : rowSafeFromInit for_each rows
+  invariant rowsSafe : RowItem.rowSafeFromInit for_each rows
   view => <ul>{for r in rows => <li><RowItem state={r}/></li>}</ul>
 
 example := InlineForEachParent.rowsSafe
@@ -627,5 +610,48 @@ component EarlyReturnCheck where
 
 #guard (EarlyReturnCheck.update { x := 5 } (.step 0)).x == 5
 #guard (EarlyReturnCheck.update { x := 5 } (.step 3)).x == 8
+
+-- Verify `component` emits a fine-grained `View` template (`V.el`, `V.dyn`, `V.ifElse`, `V.memo`, `V.forEach`)
+def lazyBadge {msg : Type} (k : Nat) : Html msg := <span>{k}</span>
+
+component FineGrainedCheck where
+  state count : Nat := 1
+  state items : Array Nat := #[1, 2]
+  action bump => count += 1
+  view =>
+    <div>
+      <span class="c">{count}</span>
+      {if count == 0 then <p>zero</p> else <p>nonzero</p>}
+      {Qed.lazy lazyBadge count}
+      <ul>{for n in items => <li key={n}>{n}</li>}</ul>
+    </div>
+
+#guard match FineGrainedCheck.app.template with
+  | .element "div" _ [.element "span" _ [.dyn _], .ifElse _ _ _, .memo _, .keyedList "ul" _ _ _ _ _] => true
+  | _ => false
+
+/-- error: Unknown identifier `mkApp` -/
+#guard_msgs in
+#check mkApp
+
+/-- error: Unknown identifier `mkRoutedApp` -/
+#guard_msgs in
+#check mkRoutedApp
+
+/-- error: Unknown identifier `ui` -/
+#guard_msgs in
+#check ui
+
+/-- error: Unknown identifier `SingleChild.mount` -/
+#guard_msgs in
+#check SingleChild.mount
+
+/-- error: Unknown identifier `SingleChild.toComponent` -/
+#guard_msgs in
+#check SingleChild.toComponent
+
+/-- error: Unknown identifier `view` -/
+#guard_msgs in
+example : View Nat Unit := view% (fun (n : Nat) => <div>{n}</div>)
 
 end SyntaxChecks

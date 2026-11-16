@@ -6,7 +6,7 @@ namespace Qed
 open Lean Elab Tactic
 
 syntax (name := invariantForEach)
-  "invariant " ident " : " term " for_each " ident " preserved_by " ident " using " ident
+  "qedInternalInvariant " ident " : " term " for_each " ident " preserved_by " ident " using " ident
     (" := " term)? : command
 
 elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
@@ -26,8 +26,7 @@ elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
   evalTactic (← `(tactic|
     (intro $m $msg $h
      cases $msg:ident <;>
-       simp only [$upd:ident, Qed.ToStep.toStep_model, Qed.ToStep.toStep_pair,
-                  InvTarget.proj_id, InvTarget.proj_fst] <;>
+       simp only [$upd:ident, InvTarget.proj_id, InvTarget.proj_fst] <;>
        (first
          | exact $h
          | exact Qed.ForEach.forall_filter $h
@@ -73,15 +72,15 @@ elab "qedDischargeForEach" upd:ident childInv:ident nm:ident pred:term : tactic 
       `{predStr}` holds for each child on its own, but the arm(s) below could break it for the \
       list.\n{body}\n\nEvery other arm was discharged automatically. Finish these by reusing the \
       automation, then filling only what's left:\n\n  invariant {nm.getId} : {predStr} for_each … \
-      preserved_by {upd.getId} using {childInv.getId} := by\n    forEachLift {upd.getId} \
+      using {childInv.getId} := by\n    forEachLift {upd.getId} \
       {childInv.getId} {predStr}\n    case {firstTag} => …"
 
 macro_rules
-  | `(invariant $name:ident : $pred for_each $field:ident preserved_by $upd:ident using $_:ident := $pf:term) =>
+  | `(qedInternalInvariant $name:ident : $pred for_each $field:ident preserved_by $upd:ident using $_:ident := $pf:term) =>
     `(theorem $name:ident :
         ∀ m msg, (∀ c ∈ m.$field, ($pred) c) →
                  (∀ c ∈ (InvTarget.proj ($upd m msg)).$field, ($pred) c) := $pf)
-  | `(invariant $name:ident : $pred for_each $field:ident preserved_by $upd:ident using $childInv:ident) =>
+  | `(qedInternalInvariant $name:ident : $pred for_each $field:ident preserved_by $upd:ident using $childInv:ident) =>
     `(theorem $name:ident :
         ∀ m msg, (∀ c ∈ m.$field, ($pred) c) →
                  (∀ c ∈ (InvTarget.proj ($upd m msg)).$field, ($pred) c) := by
@@ -126,39 +125,39 @@ elab "qedDischargeStyledForEach" view:ident field:ident childStyled:ident nm:ide
       its static chrome plus a `{field.getId}.map (the child view)` list, closing each rendered card \
       with `{childStyled.getId}`. For anything left, finish by hand, `roleHasOneOf_map` / \
       `everyElementL_mapList` are the lemmas, and `forEachStyleLift` closes the parts it can:\n\n  \
-      invariant {nm.getId} : {predStr} for_each {field.getId} holds_in {view.getId} using \
+      invariant {nm.getId} : {predStr} for_each {field.getId} using \
       {childStyled.getId} := by\n    forEachStyleLift {view.getId} {childStyled.getId}\n    <fill the rest>"
 
 syntax (name := invariantForEachStyled)
-  "invariant " ident " : " term " for_each " ident " holds_in " ident " using " ident
+  "qedInternalInvariant " ident " : " term " for_each " ident " holds_in " ident " using " ident
     (" := " term)? : command
 
 macro_rules
-  | `(invariant $name:ident : $pred for_each $_:ident holds_in $view:ident using $_:ident := $pf:term) =>
+  | `(qedInternalInvariant $name:ident : $pred for_each $_:ident holds_in $view:ident using $_:ident := $pf:term) =>
     `(theorem $name:ident : ∀ m, ($pred) ($view m) = true := $pf)
-  | `(invariant $name:ident : $pred for_each $field:ident holds_in $view:ident using $childStyled:ident) =>
+  | `(qedInternalInvariant $name:ident : $pred for_each $field:ident holds_in $view:ident using $childStyled:ident) =>
     `(set_option linter.unusedSimpArgs false in
       theorem $name:ident : ∀ m, ($pred) ($view m) = true := by
         qedDischargeStyledForEach $view $field $childStyled $name $pred)
 
 syntax (name := invariantForEachSugar)
-  "invariant " ident " : " ident " for_each " ident " preserved_by " ident : command
+  "qedInternalInvariant " ident " : " ident " for_each " ident " preserved_by " ident : command
 syntax (name := invariantForEachStyledSugar)
-  "invariant " ident " : " ident " for_each " ident " holds_in " ident : command
+  "qedInternalInvariant " ident " : " ident " for_each " ident " holds_in " ident : command
 
 open Elab Command Term Meta Lean.PrettyPrinter in
 elab_rules : command
-  | `(invariant $name:ident : $childInv:ident for_each $field:ident preserved_by $upd:ident) => do
+  | `(qedInternalInvariant $name:ident : $childInv:ident for_each $field:ident preserved_by $upd:ident) => do
       let pred ← liftTermElabM (extractInvPred childInv)
-      elabCommand (← `(invariant $name : $pred for_each $field preserved_by $upd using $childInv))
-  | `(invariant $name:ident : $childStyled:ident for_each $field:ident holds_in $view:ident) => do
+      elabCommand (← `(qedInternalInvariant $name : $pred for_each $field preserved_by $upd using $childInv))
+  | `(qedInternalInvariant $name:ident : $childStyled:ident for_each $field:ident holds_in $view:ident) => do
       let pred ← liftTermElabM do
         let cn ← realizeGlobalConstNoOverload childStyled
         forallTelescope (← getConstInfo cn).type fun _ body => do
           let some lhs := body.eq?.map (·.2.1) | throwErrorAt childStyled
             "`{childStyled}` doesn't look like a `… holds_in …` invariant, so its predicate can't be \
-             inferred, write it explicitly (`<pred> for_each … holds_in … using {childStyled}`)."
+             inferred, write it explicitly (`<pred> for_each … using {childStyled}`)."
           delab lhs.appFn!
-      elabCommand (← `(invariant $name : $pred for_each $field holds_in $view using $childStyled))
+      elabCommand (← `(qedInternalInvariant $name : $pred for_each $field holds_in $view using $childStyled))
 
 end Qed

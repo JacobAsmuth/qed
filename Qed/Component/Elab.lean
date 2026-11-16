@@ -200,7 +200,6 @@ private structure HoistedSub where
   ctorName  : Name
   info      : ComponentInfo
   dataProps : Array (Ident × Term)
-  onEmit?   : Option Term
   outArms   : Array OutArm
 
 private structure SetSite where
@@ -516,7 +515,6 @@ private partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax
           let subName := Name.mkSimple s!"_sub_{curH.size}"
           let subFieldId := mkIdentFrom stx subName
           let mut dataProps : Array (Ident × Term) := #[]
-          let mut onEmit?   : Option Term := none
           let mut outArms   : Array OutArm := #[]
           let mut keptAttrs : Array Syntax := #[]
           for a in rewrittenAttrs do
@@ -524,9 +522,7 @@ private partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax
               let aname := atomStr a[0]
               let vT : Term ← if a[1].getNumArgs == 0 then `(Bool.true)
                 else liftMacroM <| Qed.Jsx.expandAttrVal a[1] (`(""))
-              if aname == "onEmit" then
-                onEmit? := some vT
-              else if let some ev := cInfo.events.find? (·.name.toString == aname) then
+              if let some ev := cInfo.events.find? (·.name.toString == aname) then
                 outArms := outArms.push { ctor := ev.name, arity := ev.arity, handler := vT }
               else if aname.startsWith "bind:" then
                 let bStr := (aname.drop 5).toString
@@ -541,7 +537,7 @@ private partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax
             else
               keptAttrs := keptAttrs.push a
           ctx.hoisted.set (curH.push {
-            fieldId := subFieldId, ctorName := subName, info := cInfo, dataProps, onEmit?, outArms })
+            fieldId := subFieldId, ctorName := subName, info := cInfo, dataProps, outArms })
           let subRoute ← wrapUnaryMsg ctx.wrapMsg? ⟨mkIdent (ctx.msgPath ++ subName)⟩
           return rebuildJsxEl stx (keptAttrs.push (mkJsxAttrExpr "_hoist" (← `(($subRoute, $subFieldId))))) kids?
     let evList : Array (String × Nat) ← do
@@ -1184,8 +1180,7 @@ private def mkMsgAndUpdateCmds (spec : ComponentSpec) (sites : Array SetSite) :
       | some coE =>
           let outVar := mkIdent `_co
           let mapOutToMsg? : Option Term ←
-            if let some onE := h.onEmit? then some <$> `(some ($onE $outVar:ident))
-            else if !h.outArms.isEmpty then
+            if !h.outArms.isEmpty then
               some <$> (liftMacroM <| mkOutMatchTerm h.info.fullName
                 (h.info.events.size + h.info.bindNames.size) h.outArms outVar)
             else pure none
@@ -1224,7 +1219,7 @@ private def mkViewCmds (spec : ComponentSpec) (body' : Term)
   let msgId    := mkIdent (tId ++ `Msg)
   let updateId := mkIdent (tId ++ `update)
   let viewId   := mkIdent (tId ++ `view)
-  let renderId := mkIdent (tId ++ `render)
+  let renderId := mkIdent (tId ++ `_qed_render)
   let pBinders ← mkPropsBinders spec
   let mut cmds := msgAndUpdateCmds
   if spec.hasSlotsOrKids then
@@ -1244,8 +1239,8 @@ private def mkViewCmds (spec : ComponentSpec) (body' : Term)
   cmds := cmds.push (← `(command| def $renderId {parentMsg : Type} $[$pBinders:bracketedBinder]*
       (route : $msgId → parentMsg) (s : $stateId) : Html parentMsg := ($rendered).map route))
   if spec.outTy?.isNone && !spec.hasEffects then
-    let renderTagId := mkIdent (tId ++ `renderTag)
-    let compId      := mkIdent (tId ++ `toComponent)
+    let renderTagId := mkIdent (tId ++ `_qed_renderTag)
+    let compId      := mkIdent (tId ++ `_qed_toComponent)
     let appOptP (fn : Ident) := if spec.hasProps then `($fn p) else `($fn)
     let compExpr ← appOptP compId
     cmds := cmds ++ #[
@@ -1276,7 +1271,7 @@ private def canSynthJson (fromCls : Name) (tyTerm : Term) : CommandElabM Bool :=
              ((← Meta.trySynthInstance (← Meta.mkAppM fromCls #[ty])) matches .some _)
     catch _ => return false
 
-private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (idLit : StrLit) :
+private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (body' : Term) (idLit : StrLit) :
     CommandElabM (Array (TSyntax `command) × Bool × Bool) := do
   let doc?       := spec.doc?
   let tId        := spec.t.getId
@@ -1362,19 +1357,16 @@ private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (i
           LocalDef.ofSimple $idLit $initId $viewId $updateId)
         else `(command| $[$doc?:docComment]? def $regId : LocalDef :=
           LocalDef.of $idLit $initId $viewId $updateId)),
-      ← `(command| $[$doc?:docComment]? def $(mkIdent (tId ++ `mount)) {msg : Type} (key : String) : Attr msg :=
+      ← `(command| $[$doc?:docComment]? def $(mkIdent (tId ++ `_qed_mount)) {msg : Type} (key : String) : Attr msg :=
             localMount $idLit key) ]
     if let some o := spec.outTy? then
       cmds := cmds ++ #[
-        ← `(command| $[$doc?:docComment]? def $(mkIdent (tId ++ `mountWith)) {msg : Type}
-              (key : String) (onOut : $o → msg) : Attr msg :=
-              localMountWith $idLit key (fun out => some (onOut out))),
-        ← `(command| def $(mkIdent (tId ++ `mountWithOpt)) {msg : Type}
+        ← `(command| def $(mkIdent (tId ++ `_qed_mountWithOpt)) {msg : Type}
               (key : String) (onOut : $o → Option msg) : Attr msg :=
               localMountWith $idLit key onOut) ]
   let own : Term ← if hasLocalDef then `([$regId]) else `(([] : List LocalDef))
   cmds := cmds.push (← `(command| def $regsId : List LocalDef :=
-    LocalDef.dedupe ($own ++ localRegistrations $viewId)))
+    LocalDef.dedupe ($own ++ qedInternalLocalRegistrations% $viewId)))
   if spec.mountable && spec.outTy?.isNone && !spec.hasProps && !spec.hasSlotsOrKids then
     let startArg : Term ← if hasStart then `($startCmdId) else `(Qed.Cmd.none)
     let onPortArg : Term ← if spec.portIns.isEmpty then `(Option.none) else do
@@ -1386,12 +1378,23 @@ private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (i
       cmds := cmds.push (← `(command| def $onPortId : String → String → Option $msgId :=
         dispatchPorts #[$inTuples,*]))
       `(some $onPortId)
+    let expandedBody ← liftMacroM <| Qed.Jsx.expandJsxIn body'.raw
+    let mut templateTerm : Term := ⟨← liftMacroM <|
+      Qed.Internal.liftViewWithFields (mkIdent `_qed_s) (spec.states.map (·.id)) expandedBody⟩
+    for po in spec.portOuts.reverse do
+      if mentionsIdent templateTerm.raw po.id.getId then
+        let poId := mkIdent po.id.getId
+        templateTerm ← `(let $poId:ident := $(mkIdent (tId ++ po.id.getId)); $templateTerm)
+    let appUpdate : Term ← if spec.hasEffects then `($updateId)
+      else `(fun s m => ($updateId s m, Qed.Cmd.none))
     let baseApp : Term ← match spec.route? with
-      | some _ => `(mkRoutedApp $initId $updateId (View.ofHtml $viewId)
-          (onRoute := $(mkIdent (tId ++ `Msg ++ `_onRoute))) (start := $startArg) (locals := $regsId) (onPort := $onPortArg))
-      | none   => `(mkApp $initId $updateId (View.ofHtml $viewId) (start := $startArg) (locals := $regsId) (onPort := $onPortArg))
-    let dehydApp : Term ← if spec.ephemeralFields.isEmpty then `(withAutoDehydrate $initId $baseApp)
-      else `(App.withDehydrate (Dehydrate.except $initId [$[$spec.ephemeralFields:ident],*]) $baseApp)
+      | some _ => `(Qed.Internal.mkRoutedApp $initId $appUpdate $templateTerm
+          (onRoute := $(mkIdent (tId ++ `Msg ++ `_onRoute))) (start := $startArg)
+          (locals := $regsId) (styles := qedInternalStyles% $viewId) (onPort := $onPortArg))
+      | none   => `(Qed.Internal.mkApp $initId $appUpdate $templateTerm (start := $startArg)
+          (locals := $regsId) (styles := qedInternalStyles% $viewId) (onPort := $onPortArg))
+    let dehydApp : Term ← if spec.ephemeralFields.isEmpty then `(qedInternalAutoDehydrate% $initId $baseApp)
+      else `(Qed.Internal.App.withDehydrate (Dehydrate.except $initId [$[$spec.ephemeralFields:ident],*]) $baseApp)
     let finalApp : Term ← if spec.queries.isEmpty then pure dehydApp else do
       let qTerms ← spec.queries.mapM fun q => do
         let qNm := q.id
@@ -1403,9 +1406,9 @@ private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (i
             (got := $qCtor)
             (get := fun (s : $stateId) => s.$qNm:ident)
             (set := fun c (s : $stateId) => { s with $qNm:ident := c }))
-      `(App.withQueries [$[$qTerms],*] $dehydApp)
+      `(Qed.Internal.App.withQueries [$[$qTerms],*] $dehydApp)
     cmds := cmds.push (← `(command| $[$doc?:docComment]? def $(mkIdent (tId ++ `app)) : App $stateId $msgId :=
-      withLocalRegistry $finalApp))
+      $finalApp))
   return (cmds, hasStart, hasLocalDef)
 
 /-! ## Inline Invariant Elaboration -/
@@ -1471,14 +1474,14 @@ private def elabInlineInvariants (spec : ComponentSpec) : CommandElabM Unit := d
               throwErrorAt invStx "specify `using <ChildInvariant>` for an inline `for_each` predicate"
             pure (pred, none)
       match isStyled, usingToEmit? with
-      | true,  some u => elabCommand (← `(invariant $invId : $predToEmit for_each $colField holds_in $viewId using $u $[:= $pf?]?))
+      | true,  some u => elabCommand (← `(qedInternalInvariant $invId : $predToEmit for_each $colField holds_in $viewId using $u $[:= $pf?]?))
       | true,  none   =>
           let pid : Ident := ⟨predToEmit.raw⟩
-          elabCommand (← `(invariant $invId : $pid for_each $colField holds_in $viewId))
-      | false, some u => elabCommand (← `(invariant $invId : $predToEmit for_each $colField preserved_by $updateId using $u $[:= $pf?]?))
+          elabCommand (← `(qedInternalInvariant $invId : $pid for_each $colField holds_in $viewId))
+      | false, some u => elabCommand (← `(qedInternalInvariant $invId : $predToEmit for_each $colField preserved_by $updateId using $u $[:= $pf?]?))
       | false, none   =>
           let pid : Ident := ⟨predToEmit.raw⟩
-          elabCommand (← `(invariant $invId : $pid for_each $colField preserved_by $updateId))
+          elabCommand (← `(qedInternalInvariant $invId : $pid for_each $colField preserved_by $updateId))
       continue
     let invId ← resolveInvIdent invStx tId
     let clauses : Array Term := invStx[2].getSepArgs.map (⟨·⟩)
@@ -1519,7 +1522,7 @@ private def elabInlineInvariants (spec : ComponentSpec) : CommandElabM Unit := d
             `(by exact ⟨by first | rfl | decide | (simp [$initId:ident]; decide) | (simp [$initId:ident]; omega), $pf⟩)
           else pure pf
         let initOpt? : Option Term := if spec.mountable then some initId else none
-        elabCommand (← `(invariant $invId : $pred $[from $initOpt?]? preserved_by $updateId using [$[$usingL],*] $[ := $stepPf?]?))
+        elabCommand (← `(qedInternalInvariant $invId : $pred $[from $initOpt?]? preserved_by $updateId using [$[$usingL],*] $[ := $stepPf?]?))
 
 private def withOpenNs {α : Type} (ns : Name) (k : CommandElabM α) : CommandElabM α := do
   if (← getEnv).isNamespace ns then
@@ -1553,7 +1556,7 @@ private def withOpenNs {α : Type} (ns : Name) (k : CommandElabM α) : CommandEl
     let spec ← elabStructsAndResolveTypes { rawSpec with route? := route'?, queries := queries', hasEffects := ownHasEffects } hoisted
     let coreCmds ← mkViewCmds spec body' (← mkMsgAndUpdateCmds spec sites)
     for c in coreCmds do elabCommand c
-    let (mountCmds, hasStart, hasLocalDef) ← mkCodecAndMountCmds spec starts' idLit
+    let (mountCmds, hasStart, hasLocalDef) ← mkCodecAndMountCmds spec starts' body' idLit
     for c in mountCmds do elabCommand c
     withOpenNs compNs (elabInlineInvariants spec)
     let baseInfo ← mkBaseCompInfo spec .stateful spec.hasProps
@@ -1663,7 +1666,6 @@ open Term in
   let mut state?   : Option Term := none
   let mut initial? : Option Term := none
   let mut onMsg?   : Option Term := none
-  let mut onEmit?  : Option Term := none
   let mut hoist?   : Option Term := none
   for p in propNodes do
     let nm := (⟨p[0]⟩ : TSyntax `str).getString
@@ -1673,7 +1675,6 @@ open Term in
     | "state"   => state?   := some v
     | "initial" => initial? := some v
     | "onMsg"   => onMsg?   := some v
-    | "onEmit"  => onEmit?  := some v
     | "_hoist"  => hoist?   := some v
     | _         => props    := props.push (p[0], nm, v)
 
@@ -1698,7 +1699,7 @@ open Term in
       pure #[← `(Lean.Parser.Term.argument| $propRec:term), wrapA, subSA]
     else pure #[wrapA, subSA]
     let renderCall : Term := ⟨Syntax.node .none ``Lean.Parser.Term.app
-      #[(cId `render).raw, Syntax.node .none nullKind ((baseArgs ++ slotArgs).map (·.raw))]⟩
+      #[(cId `_qed_render).raw, Syntax.node .none nullKind ((baseArgs ++ slotArgs).map (·.raw))]⟩
     return ← finishWithKey key? renderCall
 
   if hasKids then
@@ -1723,32 +1724,30 @@ open Term in
 
   if let some st := state? then
     if initial?.isSome then throwErrorAt stx "`initial` seeds local state; it cannot accompany `state`"
-    if onEmit?.isSome || !evArms.isEmpty then
-      throwErrorAt stx s!"<{tag} state=…>: a parent-owned component routes every event through onMsg, it has no separate emit channel"
+    if !evArms.isEmpty then
+      throwErrorAt stx s!"<{tag} state=…>: a parent-owned component routes every event through onMsg, it has no separate event channel"
     let some route := onMsg?
       | throwErrorAt stx s!"<{tag} state=…> needs onMsg=…: the parent Msg constructor `(k : String) (msg : {tag}.Msg)` its events route through"
     let resT ← match key? with
-      | some k => `(Qed.withKey (toString $k) ($(cId `renderTag) $propValues $route $st (toString $k)))
-      | none   => `($(cId `renderTag) $propValues $route $st)
+      | some k => `(Qed.withKey (toString $k) ($(cId `_qed_renderTag) $propValues $route $st (toString $k)))
+      | none   => `($(cId `_qed_renderTag) $propValues $route $st)
     return ← elabTerm resT expectedType?
 
   if onMsg?.isSome then
-    throwErrorAt stx s!"<{tag}>: onMsg routes a parent-owned row; bind one with state=…, or receive outputs with onEmit=…"
+    throwErrorAt stx s!"<{tag}>: onMsg routes a parent-owned row; bind one with state=…, or pass named event props"
   if let some info := info? then
     if !info.hasLocalDef then
       throwErrorAt stx s!"<{tag}> uses effects, slots, children, or non-JSON props and cannot be mounted via `LocalDef`; mount `<{tag} …/>` directly inside a parent `component` view so Qed hoists it"
   checkParentNesting stx pPath "div" "div"
   let keyT : Term ← match key? with | some k => `(toString $k) | none => pure ⟨Syntax.mkStrLit s!"@{posNum}"⟩
   let mountBase : Term ←
-    if let some h := onEmit? then
-      `($(cId `mountWith) $keyT (fun out => $h out))
-    else if !evArms.isEmpty then
+    if !evArms.isEmpty then
       let outVar := mkIdent `_out
       let totalOutCtors := (info?.map fun i => i.events.size + i.bindNames.size).getD 999
       let mTerm ← liftMacroM <| mkOutMatchTerm baseName totalOutCtors evArms outVar
-      `($(cId `mountWithOpt) $keyT (fun $outVar:ident => $mTerm))
+      `($(cId `_qed_mountWithOpt) $keyT (fun $outVar:ident => $mTerm))
     else
-      `($(cId `mount) $keyT)
+      `($(cId `_qed_mount) $keyT)
   let mountBase ← match initial? with
     | none      => pure mountBase
     | some seed => `(Qed.Attr.localInit $mountBase ($seed : $(cId `State)))

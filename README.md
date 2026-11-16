@@ -100,22 +100,17 @@ def enabledStyle : Style := css
 def disabledStyle : Style := css
   [backgroundColor (hex "e5e7eb"), color (hex "6b7280"), cursor "not-allowed"]
 
-inductive Msg | save
-
-def saveButton (enabled : Bool) : Html Msg :=
+component SaveButton (enabled : Bool) where
+  on Save := fun _ => pure ()
+  invariant tagHasOneOf "button" [enabledStyle, disabledStyle]
   <div>
-    {styleSheet [enabledStyle, disabledStyle]}
     <button disabled={!enabled} onClick={.save}
       {if enabled then enabledStyle else disabledStyle}>Save</button>
   </div>
-
-invariant saveButtonStyled :
-  tagHasOneOf "button" [enabledStyle, disabledStyle]
-  holds_in saveButton
 ```
 
-Each `css` definition produces a scoped class; `styleSheet` includes its CSS in the view.
-The invariant checks that every button rendered by `saveButton` has `enabledStyle` or
+Each `css` definition produces a scoped class; scoped styles used in a component are automatically collected and injected.
+The invariant checks that every button rendered by `SaveButton` has `enabledStyle` or
 `disabledStyle`, for both values of `enabled`. If a branch returned an unstyled button,
 the compiler would report a failed styling invariant.
 

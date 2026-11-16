@@ -157,8 +157,32 @@ private def extractKey (attrsList : Syntax) : MacroM (Option (Term × Term)) := 
   | some v => return some (⟨v⟩, ← `([$kept,*]))
   | none   => return none
 
+open Lean in
+private def viewMentionsAny (m : Name) (fields : Array Ident) (stx : Syntax) : Bool :=
+  viewMentions m stx || fields.any (fun f => viewMentions f.getId stx)
+
+open Lean in
+private def wrapFieldLets (m : Ident) (fields : Array Ident) (body : Term) : MacroM Term := do
+  let mut out := body
+  for f in fields.reverse do
+    if viewMentions f.getId out.raw then
+      out ← `(let $f:ident := $m.$f:ident; $out)
+  return out
+
+open Lean in
+private def mkModelFn (m : Ident) (fields : Array Ident) (body : Term) : MacroM Term := do
+  `(fun $m => $(← wrapFieldLets m fields body))
+
+open Lean in
+private def stripFieldLets (fv : Expr) : Nat → Expr → Expr
+  | 0, e => e
+  | fuel + 1, .letE n ty val body nonDep =>
+      if val.containsFVar fv.fvarId! then stripFieldLets fv fuel (body.instantiate1 val)
+      else .letE n ty val body nonDep
+  | _, e => e
+
 open Lean Lean.Elab Lean.Elab.Term Lean.Meta in
-elab "child% " "fun " mb:ident " => " body:term : term <= expectedType => do
+elab "qedInternalChild% " "fun " mb:ident " => " body:term : term <= expectedType => do
   match_expr (← instantiateMVars expectedType) with
   | Qed.View σ msg =>
       if (← instantiateMVars σ).isMVar then tryPostpone
@@ -176,140 +200,146 @@ elab "child% " "fun " mb:ident " => " body:term : term <= expectedType => do
           mkAppOptM ``Qed.View.dyn #[σ, msg, ← mkLambdaFVars #[fv] s]
         else
           let b' ← instantiateMVars (← ensureHasType (← mkAppM ``Qed.Html #[msg]) b)
-          if b'.isAppOfArity ``Qed.View.render 4 then
-            let v   := b'.getArg! 2
-            let arg := b'.getArg! 3
+          let bCore := stripFieldLets fv 64 b'
+          if bCore.isAppOfArity ``Qed.View.render 4 then
+            let v   := bCore.getArg! 2
+            let arg := bCore.getArg! 3
             if !v.containsFVar fv.fvarId! then
               if arg == fv then return v
               else return (← mkAppM ``Qed.View.mapScope #[← mkLambdaFVars #[fv] arg, v])
-          if b'.isAppOfArity ``Qed.lazy 5 then
-            let α    := b'.getArg! 0
-            let inst := b'.getArg! 2
-            let f    := b'.getArg! 3
-            let a    := b'.getArg! 4
+          if bCore.isAppOfArity ``Qed.lazy 5 then
+            let α    := bCore.getArg! 0
+            let inst := bCore.getArg! 2
+            let f    := bCore.getArg! 3
+            let a    := bCore.getArg! 4
             if f.containsFVar fv.fvarId! || inst.containsFVar fv.fvarId! || α.containsFVar fv.fvarId! then
-              throwErrorAt body "Qed.lazy function must not capture model variable `{mb.getId}` directly; pass all model dependencies through the `[LawfulKey]` argument so memoization stays sound"
+              logErrorAt body "Qed.lazy function must not capture state directly; pass all state dependencies through the `[LawfulKey]` argument so memoization stays sound"
+              return (← mkAppOptM ``Qed.View.text #[σ, msg, mkStrLit ""])
             return (← mkAppOptM ``Qed.V.memo #[α, σ, msg, inst, f, ← mkLambdaFVars #[fv] a])
           mkAppOptM ``Qed.View.dynNode #[σ, msg, ← mkLambdaFVars #[fv] b']
-  | _ => throwError "child% expects a `View` expected type"
+  | _ => throwError "qedInternalChild% expects a `View` expected type"
 
 open Lean in
 mutual
-  partial def viewLift (m : Ident) (stx : Syntax) : MacroM Syntax := do
+  partial def viewLift (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM Syntax := do
     match stx with
     | `(text $e:term) =>
-        if viewMentions m.getId e then return (← `(Qed.V.dyn (fun $m => toString $e)))
+        if viewMentionsAny m.getId fields e then
+          return (← `(Qed.V.dyn $(← mkModelFn m fields (← `(toString $e)))))
         else return (← `(Qed.V.text (toString $e)))
     | `(if $c:term then $t:term else $e:term) =>
-        let t' : Term := ⟨← viewLift m t⟩
-        let e' : Term := ⟨← viewLift m e⟩
-        if viewMentions m.getId c then
-          return (← `(Qed.V.ifElse (fun $m => if $c then true else false) $t' $e'))
+        let t' : Term := ⟨← viewLift m fields t⟩
+        let e' : Term := ⟨← viewLift m fields e⟩
+        if viewMentionsAny m.getId fields c then
+          return (← `(Qed.V.ifElse $(← mkModelFn m fields (← `(if $c then true else false))) $t' $e'))
         else
           return (← `(if $c then $t' else $e'))
     | _ =>
         if stx.isStrLit?.isSome then return stx
-        if stx.getKind == kMatch && viewMentions m.getId stx then
-          let raw : Term := ⟨stx⟩
-          return (← `(Qed.V.dynNode (fun $m => $raw)))
-        if let some out ← tryForEach m stx then return out
-        if let some out ← tryElement m stx then return out
-        catchAll m stx
+        if stx.getKind == kMatch && viewMentionsAny m.getId fields stx then
+          return (← `(Qed.V.dynNode $(← mkModelFn m fields ⟨stx⟩)))
+        if let some out ← tryForEach m fields stx then return out
+        if let some out ← tryElement m fields stx then return out
+        catchAll m fields stx
 
-  partial def tryElement (m : Ident) (stx : Syntax) : MacroM (Option Syntax) := do
+  partial def tryElement (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM (Option Syntax) := do
     let some (tag, args) := asElementApp? stx | return none
     if args.size > 2 then return none
     let empty : Term ← `([])
-    let attrsO ← if args.size ≥ 1 then liftAttrList m args[0]! else pure (some empty)
-    let kidsO  ← if args.size ≥ 2 then liftKidList  m args[1]! else pure (some empty)
+    let attrsO ← if args.size ≥ 1 then liftAttrList m fields args[0]! else pure (some empty)
+    let kidsO  ← if args.size ≥ 2 then liftKidList  m fields args[1]! else pure (some empty)
     match attrsO, kidsO with
     | some attrsL, some kidsL =>
         let tagL : Term := ⟨Syntax.mkStrLit tag⟩
         return some (← `(Qed.V.el $tagL $attrsL $kidsL))
     | _, _ => return none
 
-  partial def liftAttrList (m : Ident) (lst : Syntax) : MacroM (Option Term) := do
+  partial def liftAttrList (m : Ident) (fields : Array Ident) (lst : Syntax) : MacroM (Option Term) := do
     if lst.getKind != kList || lst.getArgs.size != 3 then return none
     let lifted ← lst.getArgs[1]!.getSepArgs.mapM fun a => do
       let aT : Term := ⟨a⟩
-      match ← tryAttr m a with
+      match ← tryAttr m fields a with
       | some a' => pure (⟨a'⟩ : Term)
       | none    =>
-          if viewMentions m.getId a then `(Qed.VAttr.bind (fun $m => $aT))
+          if viewMentionsAny m.getId fields a then `(Qed.VAttr.bind $(← mkModelFn m fields aT))
           -- Explicit `.stat` rather than coercion because `σ` may still be an unresolved metavar.
           else `(Qed.VAttr.stat $aT)
     return some (← `([$lifted,*]))
 
-  partial def liftKidList (m : Ident) (lst : Syntax) : MacroM (Option Term) := do
+  partial def liftKidList (m : Ident) (fields : Array Ident) (lst : Syntax) : MacroM (Option Term) := do
     if lst.getKind != kList || lst.getArgs.size != 3 then return none
-    let lifted ← lst.getArgs[1]!.getSepArgs.mapM fun k => do pure (⟨← viewLift m k⟩ : Term)
+    let lifted ← lst.getArgs[1]!.getSepArgs.mapM fun k => do pure (⟨← viewLift m fields k⟩ : Term)
     return some (← `([$lifted,*]))
 
-  partial def catchAll (m : Ident) (stx : Syntax) : MacroM Syntax := do
+  partial def catchAll (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM Syntax := do
     let e : Term := ⟨stx⟩
-    if viewMentions m.getId stx then return (← `(child% fun $m => $e))
+    if viewMentionsAny m.getId fields stx then
+      return (← `(qedInternalChild% fun $m => $(← wrapFieldLets m fields e)))
     else return (← `(Qed.V.static $e))
 
-  partial def tryAttr (m : Ident) (stx : Syntax) : MacroM (Option Syntax) := do
+  partial def tryAttr (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM (Option Syntax) := do
     let some (fn, args) := asApp? stx | return none
     match fn with
     | .ident _ _ n _ =>
         let hn := (lastStr? n.eraseMacroScopes).getD ""
         if let some an := stringAttrName? hn then
-          if args.size == 1 && viewMentions m.getId args[0]! then
+          if args.size == 1 && viewMentionsAny m.getId fields args[0]! then
             let nm : Term := ⟨Syntax.mkStrLit an⟩
             let rawV : Term := ⟨args[0]!⟩
             let v : Term ← if hn == "href" || hn == "src" || hn == "action" then `(Qed.ToHref.toHref $rawV)
                            else if hn == "value" then `(toString $rawV)
                            else pure rawV
-            return some (← `(Qed.V.dynAttr $nm (fun $m => $v)))
-        if hn == "attr" && args.size == 2 && viewMentions m.getId args[1]! then
+            return some (← `(Qed.V.dynAttr $nm $(← mkModelFn m fields v)))
+        if hn == "attr" && args.size == 2 && viewMentionsAny m.getId fields args[1]! then
           let k : Term := ⟨args[0]!⟩
           let v : Term := ⟨args[1]!⟩
-          return some (← `(Qed.V.dynAttr $k (fun $m => toString $v)))
+          return some (← `(Qed.V.dynAttr $k $(← mkModelFn m fields (← `(toString $v)))))
         if let some pn := eventPrime? hn then
-          if args.size == 1 && viewMentions m.getId args[0]! then
+          if args.size == 1 && viewMentionsAny m.getId fields args[0]! then
             let primed := mkIdent ((`Qed.V).append (Name.mkSimple pn))
-            let v : Term := ⟨args[0]!⟩
-            return some (← `($primed (fun $m => $v)))
+            return some (← `($primed $(← mkModelFn m fields ⟨args[0]!⟩)))
         return none
     | _ => return none
 
-  partial def tryForEach (m : Ident) (stx : Syntax) : MacroM (Option Syntax) := do
+  partial def tryForEach (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM (Option Syntax) := do
     let some (tag, pargs) := asElementApp? stx | return none
     if pargs.size != 2 then return none
     let some (xs, funArg, isForEachItems) := asMap? pargs[1]! | return none
     let some (binder, body) := asFun? funArg | return none
     let binderId : Ident := ⟨binder⟩
-    let attrsL : Term ← (match ← liftAttrList m pargs[0]! with | some a => pure a | none => pure ⟨pargs[0]!⟩)
+    let attrsL : Term ← (match ← liftAttrList m fields pargs[0]! with | some a => pure a | none => pure ⟨pargs[0]!⟩)
     let xsT    : Term := ⟨xs⟩
     let xsArrT : Term ← if isForEachItems then `(Qed.ForEachItems.toArray $xsT) else pure xsT
     let tagL   : Term := ⟨Syntax.mkStrLit tag⟩
+    let outerFields := fields.filter (fun f => f.getId != binderId.getId)
+    let usesOuter := viewMentions m.getId body || outerFields.any (fun f => viewMentions f.getId body)
     let rowEl? := asElementApp? body
     let keyOpt ← (match rowEl? with
                   | some (_, bargs) => if bargs.size ≥ 1 then extractKey bargs[0]! else pure none
                   | none            => pure none)
-    match keyOpt, rowEl? with
-    | some (keyV, newAttrs), some (rowTag, bargs) =>
+    match usesOuter, keyOpt, rowEl? with
+    | false, some (keyV, newAttrs), some (rowTag, bargs) =>
         let rowTagL : Term := ⟨Syntax.mkStrLit rowTag⟩
         let rowKids : Term ← if bargs.size ≥ 2 then pure ⟨bargs[1]!⟩ else `([])
         let body' ← `(Qed.el $rowTagL $newAttrs $rowKids)
-        let rowL : Term := ⟨← viewLift binderId body'⟩
+        let rowL : Term := ⟨← viewLift binderId #[] body'⟩
         let pos   := (stx.getPos?.map (·.byteIdx)).getD 0
         let prefT : Term := ⟨Syntax.mkStrLit (toString pos ++ "@")⟩
-        return some (← `(Qed.V.forEach $tagL (fun $m => $xsArrT) (fun $binderId => toString $keyV) $rowL (attrs := $attrsL) (sigPrefix := $prefT)))
-    | _, _ =>
-        let rowL : Term := ⟨← viewLift binderId body⟩
+        return some (← `(Qed.V.forEach $tagL $(← mkModelFn m fields xsArrT) (fun $binderId => toString $keyV) $rowL (attrs := $attrsL) (sigPrefix := $prefT)))
+    | _, _, _ =>
+        let rowL : Term := ⟨← viewLift binderId #[] body⟩
         let rowsTerm ← if isForEachItems then
           `((Qed.ForEachItems.toList $xsT).map (fun $binderId => Qed.View.render $rowL $binderId))
         else
           `((($xsT).map (fun $binderId => Qed.View.render $rowL $binderId)).toList)
-        return some (← `(Qed.V.dynNode (fun $m =>
-          Qed.Html.element $tagL (($attrsL).map (Qed.VAttr.eval $m)) $rowsTerm)))
+        let dynFn ← mkModelFn m fields (← `(Qed.Html.element $tagL (($attrsL).map (Qed.VAttr.eval $m)) $rowsTerm))
+        return some (← `(Qed.V.dynNode $dynFn))
 end
 
+namespace Internal
 open Lean in
-macro "view% " "fun " m:ident " => " body:term : term => do
-  return ⟨← viewLift m body⟩
+def liftViewWithFields (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM Syntax :=
+  viewLift m fields stx
+end Internal
 
 end Qed

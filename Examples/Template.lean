@@ -52,7 +52,6 @@ component TemplateDemo where
 
   view =>
     <div class="demo">
-      {styleSheet [banner]}
       <div {banner} id="styled-banner">scoped style</div>
       <h1>View template</h1>
       <div class="counter">

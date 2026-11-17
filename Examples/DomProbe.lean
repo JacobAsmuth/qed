@@ -23,8 +23,12 @@ def tree (seed : Nat) : Html Nat :=
   else .element "section" [] [
     .element "article" [] ((ids seed).map (row seed)),
     Qed.lazy (fun k : Nat => .element "aside" [] [.text s!"memo {k}"]) (seed / 3),
-    .element "svg" [] [.element "use"
-      (if seed % 2 == 0 then [.attr "xlink:href" "#icon"] else []) []]]
+    .element "svg" [] [
+      .element "a" [] [.element "title" [] [.text "t"]],
+      .element "foreignObject" [] [.element "div" [] [
+        .element "svg" [] [.element "feSpotLight" [] []]]],
+      .element "use"
+        (if seed % 2 == 0 then [.attr "xlink:href" "#icon"] else []) []]]
 
 def handlers : IO (Handlers Nat) := do
   return { click := (← IO.mkRef #[]), input := (← IO.mkRef #[]),

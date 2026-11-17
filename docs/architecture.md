@@ -94,10 +94,15 @@ browser restores server-rendered state without re-fetching startup data; mark cl
   and untyped URLs on `href`, `src`, and `action`. Inline and `holds_in` view invariants check
   custom styling and element predicates.
 - **Isomorphic SSR, DOM driver, and memoization:** Every `Dehydrate` codec proves `round_trip`
-  and `dehydrate_view`. [`Qed/Proofs/`](../Qed/Proofs) (`DomArena.lean`, `ViewPatch.lean`, `KeyedReconcile.lean`, `Hydration.lean`) proves against a
-  pure `SpecDom` model that mounting, text-run hydration, W3C `insertBefore` keyed moves,
-  duplicate-key disambiguation, direct signal updates, `LawfulKey`-indexed `V.memo` skipping, and
-  SSR rehydration match `Html.render`.
+  and `dehydrate_view`, and every component emits `<Comp>.app_view_eq` (with `canonical_congr_pred`
+  transporting `holds_in` view predicates `<inv>_app` to `App.view`). [`Qed/Proofs/`](../Qed/Proofs)
+  (`DomArena.lean`, `KeyedReconcile.lean`, `ViewPatch.lean`, `Hydration.lean`) proves against a pure
+  `SpecDom` model using unified `CleanDomSubtree`/`VStateValid` invariants that mounting,
+  W3C `insertBefore` keyed/positional patching (`applyToDomM`/`patchHtmlSubtreeM`), full `patchViewM`
+  updates, template row/signal alignment (`alignRows_spec`, `diffRowSigs_sound`, `seedRowsM_spec`,
+  `renderSig_resolved_spec`), local-cell/FIFO runtime specs, `hydrateDomM`/`hydrateViewM` HTML5
+  text-run hydration, `LawfulKey`-indexed `V.memo` skipping, and end-to-end SSR rehydration +
+  patching (`App.ssr_hydrate_patch_equiv`) match `Html.render`.
 - **Schemas, routes, and wire codecs:** `schema` proves submit eligibility matches schema validity
   via `canSubmit_iff`. `router` proves `Router.round_trip` and `isSafeUrl_toURL`. `LawfulJson` and
   `LawfulProto` prove JSON and Protobuf round-trips, framing non-smuggling, bounded-depth parsing,
@@ -148,7 +153,7 @@ the native server when present, and reloads the browser on success. Run `qed che
 and `qed start` or `qed preview` for production builds; `qed build` also minifies bundles with
 `esbuild` when available on `PATH`.
 
-`qed test` runs the 21 automated test suites in [`test/`](../test):
+`qed test` runs the 15 automated test suites in [`test/`](../test):
 
 - [`test/js_gate_test.mjs`](../test/js_gate_test.mjs) — differential tests comparing native Lean
   evaluation against transpiled JavaScript across rendering, diffing, JSON, routing, and runtime

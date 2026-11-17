@@ -19,11 +19,11 @@ def grepForbidden : IO Bool := do
 
 def axiomClean : IO Bool := do
   if !(← axiomsManifest.pathExists) then return true
-  let (_, out) ← shOut "lake" #["env", "lean", "--root=.", axiomsManifest.toString]
-  let clean := !out.contains "sorryAx"
+  let (code, out) ← shOut "lake" #["env", "lean", "--root=.", axiomsManifest.toString]
+  let clean := code == 0
+    && !out.contains "sorryAx"
     && !out.contains "Lean.ofReduceBool"
     && !out.contains "Lean.trustCompiler"
-    && !out.contains "error:"
   if !clean then IO.eprint out
   return clean
 
@@ -104,13 +104,16 @@ def verify (checkExterns : Bool := true) : IO Bool := do
     if (← shQuiet "lake" #["build", "Qed", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples"]) != 0 then return false
   else
     let root ← webRoot
-    if (← shQuiet "lake" #["build", root]) != 0 then return false
+    let jsMod ← jsRoot
+    let targets := if checkExterns && jsMod != root then #[root, jsMod] else #[root]
+    if (← shQuiet "lake" (#["build"] ++ targets)) != 0 then return false
   let tGrep ← IO.asTask grepForbidden
   let tAxiom ← IO.asTask axiomClean
   let tEff ← if hasExamples then IO.asTask effectsCovered else IO.asTask (pure true)
   let q? ← resolveQedjsEnv (needBuild := false)
+  let tExt ← if checkExterns && hasExamples then IO.asTask (externsCovered q?) else IO.asTask (pure true)
   let ok3 ← kernelEnvClean q?
-  let ok5 ← if checkExterns && ok3 then externsCovered q? else pure ok3
+  let ok5 ← if checkExterns && !hasExamples && ok3 then externsCovered q? else pure ((← IO.wait tExt).toOption.getD false)
   let ok1 := (← IO.wait tGrep).toOption.getD false
   let ok2 := (← IO.wait tAxiom).toOption.getD false
   let ok4 := (← IO.wait tEff).toOption.getD false

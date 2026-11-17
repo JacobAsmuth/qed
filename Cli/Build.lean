@@ -98,55 +98,107 @@ private def resolveServeCmd (dir : FilePath) (port : String) (dev : Bool) :
   else
     return ("python3", #["-m", "http.server", port, "--directory", dir.toString], false)
 
-def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool) : IO Bool := do
+initialize fullstackLinkCache :
+    IO.Ref (Option (Array String × Array String × String × String)) ← IO.mkRef none
+
+private def resolveLinkMeta (cObjTargets : Array String) :
+    IO (Option (Array String × String × String)) := do
+  if let some (cachedTargets, cachedInputs, ssl, crypto) ← fullstackLinkCache.get then
+    if cachedTargets == cObjTargets then
+      let mut ok := true
+      for p in cachedInputs do
+        if !(← (FilePath.mk p).pathExists) then ok := false; break
+      if ok then return some (cachedInputs, ssl, crypto)
+  let tSsl ← IO.asTask (resolveSharedLibArg "libssl.so" "-lssl")
+  let tCrypto ← IO.asTask (resolveSharedLibArg "libcrypto.so" "-lcrypto")
+  let some linkInputs ← lakeQueryPaths cObjTargets | return none
+  let sslLib := (← IO.wait tSsl).toOption.getD "-lssl"
+  let cryptoLib := (← IO.wait tCrypto).toOption.getD "-lcrypto"
+  fullstackLinkCache.set (some (cObjTargets, linkInputs, sslLib, cryptoLib))
+  return some (linkInputs, sslLib, cryptoLib)
+
+def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool)
+    (alreadyBuilt : Bool := false) : IO Bool := do
   let localMods ← collectLocalModules mod
   let cObjTargets := (localMods.map fun m => s!"+{m}:c.o") ++ #["qed/QedServer:static", "qed/Qed:static"]
-  let some q ← resolveQedjsEnv | return false
-  if (← sh "lake" (#["build", mod, "Qed.Driver"] ++ cObjTargets)) != 0 then
+  let isInRepo ← (FilePath.mk "Examples").pathExists
+  let prebuilt := (← env "QED_PREBUILT") == some "1"
+  let lakeTargets :=
+    (if alreadyBuilt || prebuilt then #[] else #[mod]) ++
+    #["Qed.Driver"] ++
+    (if isInRepo && !prebuilt then #["qedjs"] else #[]) ++
+    cObjTargets
+  if (← sh "lake" (#["build"] ++ lakeTargets)) != 0 then
     return false
+  let some q ← resolveQedjsEnv (needBuild := !isInRepo && !prebuilt) | return false
   let rtPath ← runtimeFile "qed_rt.mjs"
-  let genDir : FilePath := ".qed" / "gen"
+  let genDir : FilePath := ".qed" / "gen" / mod
   IO.FS.createDirAll genDir
   IO.FS.createDirAll outDir
 
-  -- 1. Synthesize & compile client entrypoint → `app.mjs` (enforcing `verifyNoServerLeakInClient`)
+  let modOlean := FilePath.mk ".lake" / "build" / "lib" / "lean" / ((mod.replace "." "/") ++ ".olean")
+  let fwRoot ← if isInRepo then pure (FilePath.mk ".") else frameworkHome
+  let drvOlean := fwRoot / ".lake" / "build" / "lib" / "lean" / "Qed" / "Driver.olean"
   let cliLean := genDir / "ClientMain.lean"
   let cliOlean := genDir / "ClientMain.olean"
-  discard <| writeIfChanged cliLean s!"import {mod}\nimport Qed.Driver\n\ndef main : IO Unit := Qed.run {fsName}.clientApp\n"
-  if (← sh "lake" #["env", "lean", "-R", genDir.toString, cliLean.toString, "-o", cliOlean.toString]) != 0 then
-    return false
-  let minArgs := if prod then #["--min"] else #[]
-  let rtArgs := #["--rt", rtPath.toString]
-  if !(← q.run (minArgs ++ rtArgs ++ #[(outDir / "app.mjs").toString, "ClientMain", "--"] ++ driverEntries) (extraPath := some genDir.toString)) then
-    return false
-  writeClientShell outDir prod
-  for stale in ["ssr.mjs", "ssr_app.mjs", "qed_ssr_host.mjs"] do
-    removeIfExists (outDir / stale)
-  if prod then minifyBundles outDir ["app.mjs", "qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"]
-
-  -- 2. Synthesize & compile native multi-core C/Lean server binary → `<outDir>/server`
+  let cliChanged ← writeIfChanged cliLean s!"import {mod}\nimport Qed.Driver\n\ndef main : IO Unit := Qed.run {fsName}.clientApp\n"
   let srvLean := genDir / "ServerMain.lean"
   let srvC := genDir / "ServerMain.c"
-  discard <| writeIfChanged srvLean s!"import {mod}\nimport Qed.Server.Native\n\nqedServerMain {fsName}\n"
-  if (← sh "lake" #["env", "lean", "-R", genDir.toString, srvLean.toString, "-c", srvC.toString]) != 0 then
-    return false
-  let some linkInputs ← lakeQueryPaths cObjTargets | return false
-  let sslLib ← resolveSharedLibArg "libssl.so" "-lssl"
-  let cryptoLib ← resolveSharedLibArg "libcrypto.so" "-lcrypto"
-  let srvTmp := outDir / "server.tmp"
-  let optFlags := if prod then #["-O3", "-DNDEBUG"] else #["-O0"]
-  let leancArgs := #["env", "leanc"] ++ optFlags ++ #[srvC.toString] ++
-    linkInputs ++ #["-pthread", sslLib, cryptoLib, "-Wl,--allow-shlib-undefined", "-o", srvTmp.toString]
-  if (← sh "lake" leancArgs) != 0 then return false
-  IO.FS.rename srvTmp (outDir / "server")
-  return true
+  let srvChanged ← writeIfChanged srvLean s!"import {mod}\nimport Qed.Server.Native\n\nqedServerMain {fsName}\n"
 
-def buildJs (outDir : FilePath) (prod : Bool) : IO Bool := do
+  let mut cliDeps : Array FilePath := #[cliLean, modOlean]
+  if ← drvOlean.pathExists then cliDeps := cliDeps.push drvOlean
+  let appMjs := outDir / "app.mjs"
+  let srvBin := outDir / "server"
+
+  -- 1. Synthesize & compile client entrypoint → `app.mjs` (enforcing `verifyNoServerLeakInClient`)
+  let tClient ← IO.asTask do
+    if cliChanged || prod || !(← isUpToDate cliOlean cliDeps) then
+      if (← sh "lake" #["env", "lean", "-R", genDir.toString, cliLean.toString, "-o", cliOlean.toString]) != 0 then
+        return false
+    if prod || !(← isUpToDate appMjs #[cliOlean, q.bin, rtPath, modOlean]) then
+      let minArgs := if prod then #["--min"] else #[]
+      let rtArgs := #["--rt", rtPath.toString]
+      if !(← q.run (minArgs ++ rtArgs ++ #[appMjs.toString, "ClientMain", "--"] ++ driverEntries) (extraPath := some genDir.toString)) then
+        return false
+    writeClientShell outDir prod
+    for stale in ["ssr.mjs", "ssr_app.mjs", "qed_ssr_host.mjs"] do
+      removeIfExists (outDir / stale)
+    if prod then minifyBundles outDir ["app.mjs", "qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"]
+    return true
+
+  -- 2. Synthesize & compile native multi-core C/Lean server binary → `<outDir>/server`
+  let tServer ← IO.asTask do
+    let some (linkInputs, sslLib, cryptoLib) ← resolveLinkMeta cObjTargets | return false
+    let linkFiles := linkInputs.map FilePath.mk
+    let srvCDeps := #[srvLean, modOlean] ++ linkFiles
+    if srvChanged || prod || !(← isUpToDate srvC srvCDeps) then
+      if (← sh "lake" #["env", "lean", "-R", genDir.toString, srvLean.toString, "-c", srvC.toString]) != 0 then
+        return false
+    let linkDeps := #[srvC] ++ linkFiles
+    if prod || !(← isUpToDate srvBin linkDeps) then
+      let srvTmp := outDir / "server.tmp"
+      let optFlags := if prod then #["-O3", "-DNDEBUG"] else #["-O0"]
+      let leancArgs := #["env", "leanc"] ++ optFlags ++ #[srvC.toString] ++
+        linkInputs ++ #["-pthread", sslLib, cryptoLib, "-Wl,--allow-shlib-undefined", "-o", srvTmp.toString]
+      if (← sh "lake" leancArgs) != 0 then return false
+      IO.FS.rename srvTmp srvBin
+    return true
+
+  let cliOk := (← IO.wait tClient).toOption.getD false
+  let srvOk := (← IO.wait tServer).toOption.getD false
+  return cliOk && srvOk
+
+def buildJs (outDir : FilePath) (prod : Bool) (alreadyBuilt : Bool := false) : IO Bool := do
   let mod ← jsRoot
   if let some fsName ← fullstackAppName mod then
-    return ← buildFullstack mod fsName outDir prod
-  if (← sh "lake" #["build", mod]) != 0 then return false
-  let some q ← resolveQedjsEnv | return false
+    return ← buildFullstack mod fsName outDir prod alreadyBuilt
+  let isInRepo ← (FilePath.mk "Examples").pathExists
+  let prebuilt := (← env "QED_PREBUILT") == some "1"
+  if !prebuilt && !alreadyBuilt then
+    let targets := if isInRepo then #[mod, "qedjs"] else #[mod]
+    if (← sh "lake" (#["build"] ++ targets)) != 0 then return false
+  let some q ← resolveQedjsEnv (needBuild := !isInRepo && !prebuilt) | return false
   IO.FS.createDirAll outDir
   removeIfExists (outDir / "server")
   let rtPath ← runtimeFile "qed_rt.mjs"
@@ -174,13 +226,17 @@ def cmdBuild (prod : Bool) (skipVerify : Bool := false) : IO UInt32 := do
   let skip := !prod && (skipVerify || (← env "QED_SKIP_VERIFY") == some "1")
   if !skip then
     if !(← verify (checkExterns := false)) then IO.eprintln (red "✗ verification failed"); return 1
-  let outDir := if prod then distDir else devDir
-  step s!"compiling Lean → {outDir}/"
-  if !(← buildJs outDir prod) then IO.eprintln (red "✗ build failed"); return 1
-  let (_, sz) ← shOut "bash" #["-c",
-    s!"cat {outDir}/app.mjs {outDir}/qed_rt.mjs {outDir}/qed_dom.mjs {outDir}/qed_host.mjs | gzip -c | wc -c"]
-  let srvNote := if (← (outDir / "server").pathExists) then s!" + native binary {outDir}/server" else ""
-  IO.println (green s!"✓ build complete → {outDir}{srvNote}, {sz.trimmed} bytes gzipped to the client")
+  let outOverride ← if prod then pure none else env "QED_OUT_DIR"
+  let outDir := match outOverride with
+    | some d => FilePath.mk d
+    | none   => if prod then distDir else devDir
+  if outOverride.isNone then step s!"compiling Lean → {outDir}/"
+  if !(← buildJs outDir prod (alreadyBuilt := !skip)) then IO.eprintln (red "✗ build failed"); return 1
+  if outOverride.isNone then
+    let (_, sz) ← shOut "bash" #["-c",
+      s!"cat {outDir}/app.mjs {outDir}/qed_rt.mjs {outDir}/qed_dom.mjs {outDir}/qed_host.mjs | gzip -c | wc -c"]
+    let srvNote := if (← (outDir / "server").pathExists) then s!" + native binary {outDir}/server" else ""
+    IO.println (green s!"✓ build complete → {outDir}{srvNote}, {sz.trimmed} bytes gzipped to the client")
   return 0
 
 def serveDir (dir : FilePath) (dev : Bool := false) : IO UInt32 := do
@@ -210,17 +266,20 @@ partial def watchLoop (marker : FilePath) (port : String)
     (curServer : IO.Process.Child ⟨.null, .null, .inherit⟩) (isNative : Bool) : IO Unit := do
   IO.sleep 400
   let qh ← frameworkHome
-  let find := s!"find . -name '*.lean' -newer {marker} -not -path './.lake/*' -not -path './.qed/*' 2>/dev/null | head -1; " ++
-              s!"find {qh}/runtime -newer {marker} 2>/dev/null | head -1"
-  let (_, out) ← shOut "bash" #["-c", find]
+  let leanFind := s!"find . -name '*.lean' -newer {marker} -not -path './.lake/*' -not -path './.qed/*' 2>/dev/null | head -1"
+  let rtFind := s!"find {qh}/runtime -newer {marker} 2>/dev/null | head -1"
+  let (_, leanOut) ← shOut "bash" #["-c", leanFind]
+  let (_, rtOut) ← if leanOut.trimmed.isEmpty then shOut "bash" #["-c", rtFind] else pure (0, "")
   let mut nextSrv := curServer
   let mut nextNative := isNative
-  if out.trimmed != "" then
+  if !leanOut.trimmed.isEmpty then
     let _ ← sh "touch" #[marker.toString]
     step "change detected, rebuilding"
+    let prevSrvMtime ← mtimeNs (devDir / "server")
     if (← buildJs devDir (prod := false)) then
       let nowNative ← (devDir / "server").pathExists
-      if nextNative || nowNative then
+      let newSrvMtime ← mtimeNs (devDir / "server")
+      if (nextNative != nowNative) || (nowNative && prevSrvMtime != newSrvMtime) then
         curServer.kill
         discard <| curServer.wait
         let (restarted, nat) ← spawnDevChild port
@@ -232,6 +291,14 @@ partial def watchLoop (marker : FilePath) (port : String)
       IO.println (green "✓ reloaded")
     else
       IO.eprintln (red "✗ build failed, fix and save again")
+  else if !rtOut.trimmed.isEmpty then
+    let _ ← sh "touch" #[marker.toString]
+    step "runtime change detected, reloading"
+    writeClientShell devDir (prod := false)
+    if (← (devDir / "qed_ssr_host.mjs").pathExists) then
+      IO.FS.writeFile (devDir / "qed_ssr_host.mjs") (← IO.FS.readFile (← runtimeFile "qed_ssr_host.mjs"))
+    writeBuildId devDir
+    IO.println (green "✓ reloaded (runtime)")
   watchLoop marker port nextSrv nextNative
 
 def cmdDev : IO UInt32 := do

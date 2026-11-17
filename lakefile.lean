@@ -41,9 +41,3 @@ lean_exe qed where
 
 lean_exe bench where
   root := `Examples.Bench.Pipeline
-
-lean_exe users_ssr where
-  root := `Examples.UsersSSR
-
-lean_exe template_ssr where
-  root := `Examples.TemplateSSR

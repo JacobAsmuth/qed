@@ -116,6 +116,33 @@ def Html.ofOption : Option (Html msg) → Html msg
 
 @[simp] theorem toString_string (s : String) : toString s = s := rfl
 
+def Attr.isSignalBind : Attr msg → Bool
+  | .signalBind _ => true
+  | _             => false
+
+def Attr.canonical : Attr msg → Option (Attr msg)
+  | .key _            => none
+  | .signalBind _     => none
+  | .signalAttr _ k v => some (.attr k v)
+  | .cls name         => some (.attr "class" name)
+  | a                 => some a
+
+@[simp] theorem Attr.isSignalBind_ite (c : Prop) [Decidable c] (a b : Attr msg) :
+    Attr.isSignalBind (if c then a else b) = if c then Attr.isSignalBind a else Attr.isSignalBind b := by
+  by_cases hc : c <;> simp [hc]
+
+@[simp] theorem Attr.canonical_ite (c : Prop) [Decidable c] (a b : Attr msg) :
+    Attr.canonical (if c then a else b) = if c then Attr.canonical a else Attr.canonical b := by
+  by_cases hc : c <;> simp [hc]
+
+@[simp] theorem Option.ite_some {α : Type _} (c : Prop) [Decidable c] (a b : α) :
+    (if c then some a else some b) = some (if c then a else b) := by
+  by_cases hc : c <;> simp [hc]
+
+@[simp] theorem List.filterMap_ite {α β : Type _} (f : α → Option β) (c : Prop) [Decidable c] (a b : List α) :
+    (if c then a else b).filterMap f = if c then a.filterMap f else b.filterMap f := by
+  by_cases hc : c <;> simp [hc]
+
 instance : Inhabited (Attr msg) := ⟨.cls ""⟩
 instance : Inhabited (Html msg) := ⟨.text ""⟩
 
@@ -549,5 +576,79 @@ end
     validTextIn ctx "" = true := by
   cases ctx with
   | mk mode _ _ _ => cases mode <;> simp [validTextIn, containsCloseSeq, containsCloseSeqLoop]
+
+def onlySignalBind : List (Attr msg) → Bool
+  | [.signalBind _] => true
+  | .key _ :: rest  => onlySignalBind rest
+  | _               => false
+
+def mkCanonicalElem (tag : String) (attrs : List (Attr msg)) (cs : List (Html msg)) : Html msg :=
+  if tag == "span" && onlySignalBind attrs then
+    match cs with
+    | [c] => c
+    | _   => .element tag (attrs.filterMap Attr.canonical) cs
+  else
+    .element tag (attrs.filterMap Attr.canonical) cs
+
+mutual
+  def Html.canonical : Html msg → Html msg
+    | .text s               => .text s
+    | .element tag attrs cs => mkCanonicalElem tag attrs (Html.canonicalList cs)
+
+  def Html.canonicalList : List (Html msg) → List (Html msg)
+    | []      => []
+    | c :: cs => Html.canonical c :: Html.canonicalList cs
+end
+
+@[simp] theorem onlySignalBind_signalBind (sig : String) :
+    onlySignalBind ([.signalBind sig] : List (Attr msg)) = true := rfl
+
+@[simp] theorem onlySignalBind_key (k : String) (rest : List (Attr msg)) :
+    onlySignalBind (.key k :: rest) = onlySignalBind rest := rfl
+
+@[simp] theorem mkCanonicalElem_signalBind (sig : String) (c : Html msg) :
+    mkCanonicalElem "span" [.signalBind sig] [c] = c := rfl
+
+@[simp] theorem mkCanonicalElem_not_signal (tag : String) (attrs : List (Attr msg)) (cs : List (Html msg))
+    (h : (tag == "span" && onlySignalBind attrs) = false) :
+    mkCanonicalElem tag attrs cs = .element tag (attrs.filterMap Attr.canonical) cs := by
+  simp [mkCanonicalElem, h]
+
+@[simp] theorem Html.canonical_text (s : String) :
+    Html.canonical (.text s : Html msg) = .text s := rfl
+
+@[simp] theorem Html.canonical_element (tag : String) (attrs : List (Attr msg)) (cs : List (Html msg)) :
+    Html.canonical (.element tag attrs cs) = mkCanonicalElem tag attrs (Html.canonicalList cs) := rfl
+
+@[simp] theorem Html.canonical_ite (c : Prop) [Decidable c] (a b : Html msg) :
+    Html.canonical (if c then a else b) = if c then Html.canonical a else Html.canonical b := by
+  by_cases hc : c <;> simp [hc]
+
+@[simp] theorem Html.canonical_ofOption (o : Option (Html msg)) :
+    Html.canonical (Html.ofOption o) = match o with | some h => Html.canonical h | none => .text "" := by
+  cases o <;> rfl
+
+@[simp] theorem Html.canonicalList_nil : Html.canonicalList ([] : List (Html msg)) = [] := rfl
+
+@[simp] theorem Html.canonicalList_cons (c : Html msg) (cs : List (Html msg)) :
+    Html.canonicalList (c :: cs) = Html.canonical c :: Html.canonicalList cs := rfl
+
+@[simp] theorem Html.canonicalList_append (xs ys : List (Html msg)) :
+    Html.canonicalList (xs ++ ys) = Html.canonicalList xs ++ Html.canonicalList ys := by
+  induction xs with
+  | nil => rfl
+  | cons x xs ih => simp [ih]
+
+@[simp] theorem Html.canonicalList_map {α : Type _} (xs : List α) (f : α → Html msg) :
+    Html.canonicalList (xs.map f) = xs.map (fun x => Html.canonical (f x)) := by
+  induction xs with
+  | nil => rfl
+  | cons x xs ih => simp [ih]
+
+theorem Html.canonicalList_eq_map (cs : List (Html msg)) :
+    Html.canonicalList cs = cs.map Html.canonical := by
+  induction cs with
+  | nil => rfl
+  | cons c cs ih => simp [ih]
 
 end Qed

@@ -1,2 +1,3 @@
 import Qed.Component.Core
 import Qed.Component.Elab
+import Qed.Component.JsxTerm

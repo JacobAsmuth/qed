@@ -220,12 +220,8 @@ private structure ParsedExtParam where
   ty         : ParsedSrvType
 
 open Lean Elab Command in
-@[command_elab externalCmd]
-def elabExternalCmd : CommandElab := fun stx => do
-  let svcIdent : Ident := ⟨stx[1]⟩
-  let svcName := svcIdent.getId
-  let svcNameStr := svcName.toString
-  let clauses := stx[2].getArgs
+private def parseExternalClauses (svcIdent : Ident) (svcName : Name) (clauses : Array Syntax) :
+    CommandElabM (String × AuthSpec × Array Syntax) := do
   let mut baseOrigin? : Option String := none
   let mut authSpec : AuthSpec := .none
   let mut hasAuth := false
@@ -268,6 +264,139 @@ def elabExternalCmd : CommandElab := fun stx => do
     | throwErrorAt svcIdent s!"`external {svcName}` must declare `base \"https://...\"`"
   if epClauses.isEmpty then
     throwErrorAt svcIdent s!"`external {svcName}` must declare at least one endpoint"
+  return (baseOrigin, authSpec, epClauses)
+
+open Lean Elab Command in
+private def buildExternalCallCmds (fullFnId baseId : Ident) (svcStrLit verbLit : StrLit)
+    (pIdents : Array Ident) (pTyTerms : Array Term) (retPayloadTerm : Term)
+    (pathTerms queryTerms defHdrTerms customHdrTerms : Array Term)
+    (bodyTerm authTerm decodeCall : Term) : CommandElabM Unit := do
+  let fnCmd ← `(command|
+    @[specialize]
+    def $fullFnId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
+        $[($pIdents:ident : $pTyTerms:term)]* : m (Except Qed.Server.ApiError $retPayloadTerm) := do
+      let rawRes ← Qed.Server.execExternalRaw $svcStrLit $baseId $verbLit
+        [$[$pathTerms],*] [$[$queryTerms],*]
+        [$[$defHdrTerms],*] [$[$customHdrTerms],*]
+        $bodyTerm $authTerm
+      return $decodeCall)
+  elabCommand fnCmd
+  let fullFnCall ← pIdents.foldlM (init := ← `($fullFnId))
+    fun acc pid => `($acc $pid)
+  let safeInstCmd ← `(command|
+    instance {_σ : Type} $[($pIdents:ident : $pTyTerms:term)]* :
+        Qed.Server.SafeIO ($fullFnCall : Qed.Server.ThreadProg _σ (Except Qed.Server.ApiError $retPayloadTerm)) where
+      noAtomic := by
+        unfold $fullFnId
+        exact (inferInstance : Qed.Server.SafeIO _).noAtomic)
+  elabCommand safeInstCmd
+
+open Lean Elab Command in
+private def elabExternalEndpoint (svcName : Name) (svcStrLit : StrLit) (baseId : Ident)
+    (authTerm : Term) (methodNames : Array Name) (ep : Syntax) : CommandElabM Name := do
+  let httpVerbRaw := ep[0].getId.toString.toUpper
+  let urlTmpl := (⟨ep[1]⟩ : TSyntax `str).getString
+  let fnIdent : Ident := ⟨ep[2]⟩
+  let fnName := fnIdent.getId
+  if methodNames.contains fnName then
+    throwErrorAt fnIdent s!"duplicate endpoint `{fnName}` in `external {svcName}`"
+  let rawParams := ep[4].getSepArgs
+  let mut parsedParams : Array ParsedExtParam := #[]
+  let mut seenParamNames : Array String := #[]
+  for rp in rawParams do
+    let pk := rp.getKind
+    let (hk?, pid, tyNode) ←
+      if pk == ``extParamHeader then pure (some (⟨rp[2]⟩ : TSyntax `str).getString, (⟨rp[4]⟩ : Ident), rp[6])
+      else if pk == ``extParamPlain then pure (none, (⟨rp[0]⟩ : Ident), rp[2])
+      else throwErrorAt rp "invalid endpoint parameter"
+    let pty ← liftMacroM <| ParsedSrvType.parse tyNode
+    liftMacroM <| pty.validate (allowFallible := false) s!"parameter `{pid.getId}`"
+    let pstr := pid.getId.toString
+    if seenParamNames.contains pstr then throwErrorAt pid s!"duplicate parameter `{pstr}`"
+    seenParamNames := seenParamNames.push pstr
+    parsedParams := parsedParams.push { ref := rp, headerKey? := hk?, ident := pid, ty := pty }
+  let retTy ← liftMacroM <| ParsedSrvType.parse ep[7]
+  liftMacroM <| retTy.validate (allowFallible := false)
+    "external endpoint return types (external calls are automatically fallible at `await`; write `-> T` instead of `-> T!`)"
+  let (segSpecs, querySpecs, placeholders) ← parseUrlTemplate ep[1] urlTmpl
+  for ph in placeholders do
+    unless parsedParams.any (fun p => p.headerKey?.isNone && p.ident.getId.toString == ph) do
+      throwErrorAt ep[1] s!"URL placeholder `:{ph}` has no matching parameter `{ph}` in `{fnName}`"
+  let mut bodyParam? : Option ParsedExtParam := none
+  for p in parsedParams do
+    if p.headerKey?.isNone && !placeholders.contains p.ident.getId.toString then
+      if httpVerbRaw == "GET" || httpVerbRaw == "DELETE" then
+        throwErrorAt p.ref s!"parameter `{p.ident.getId}` on `{httpVerbRaw}` endpoint `{fnName}` is not referenced as `:{p.ident.getId}` in `{urlTmpl}`"
+      if bodyParam?.isSome then
+        throwErrorAt p.ref s!"endpoint `{fnName}` has multiple request body parameters; bundle fields into a `schema` type"
+      bodyParam? := some p
+  let pIdents := parsedParams.map (·.ident)
+  let pTyTerms ← parsedParams.mapM fun p => liftMacroM p.ty.toPayloadTerm
+  let paramSegTerm (pn : String) : CommandElabM Term := do
+    let some p := parsedParams.find? (·.ident.getId.toString == pn)
+      | throwErrorAt ep[1] "internal missing URL param"
+    `(Qed.RouteParam.toSeg $(p.ident))
+  let pathTerms ← segSpecs.mapM fun
+    | .lit s          => `(Qed.Server.PathPart.lit $(Syntax.mkStrLit s))
+    | .singleParam pn => do `(Qed.Server.PathPart.seg $(← paramSegTerm pn))
+    | .multiParam pn  => do `(Qed.Server.PathPart.multiSeg $(← paramSegTerm pn))
+  let queryTerms ← querySpecs.mapM fun (qk, qv) => do
+    let qkLit := Syntax.mkStrLit qk
+    match qv with
+    | .lit s    => `(($qkLit, Qed.Server.QueryVal.lit $(Syntax.mkStrLit s)))
+    | .param pn => do `(($qkLit, Qed.Server.QueryVal.param $(← paramSegTerm pn)))
+  let mut customHdrTerms : Array Term := #[]
+  for p in parsedParams do
+    if let some hk := p.headerKey? then
+      customHdrTerms := customHdrTerms.push
+        (← `(($(Syntax.mkStrLit hk), Qed.RouteParam.toSeg $(p.ident))))
+  let baseRetStr := retTy.baseIdent.getId.toString
+  let acceptHdr : Option (String × String) :=
+    if retTy.isProto then some ("Accept", "application/x-protobuf")
+    else if retTy.mods.isEmpty && (baseRetStr == "Bytes" || baseRetStr == "ByteArray" || baseRetStr == "Unit" || baseRetStr == "String") then none
+    else some ("Accept", "application/json")
+  let (bodyTerm, ctHdr) ← match bodyParam? with
+    | none => pure (← `(ByteArray.empty), (none : Option (String × String)))
+    | some bp =>
+        let bBase := bp.ty.baseIdent.getId.toString
+        if bp.ty.isProto then
+          pure (← `(Qed.Proto.encode $(bp.ident)), some ("Content-Type", "application/x-protobuf"))
+        else if bp.ty.mods.isEmpty && (bBase == "Bytes" || bBase == "ByteArray") then
+          pure (← `(($(bp.ident) : ByteArray)), some ("Content-Type", "application/octet-stream"))
+        else if bp.ty.mods.isEmpty && bBase == "Unit" then
+          pure (← `(ByteArray.empty), none)
+        else
+          pure (← `((Qed.Json.render (Qed.toJson $(bp.ident))).toUTF8), some ("Content-Type", "application/json"))
+  let mut defHdrTerms : Array Term := #[]
+  if let some (k, v) := ctHdr then
+    defHdrTerms := defHdrTerms.push (← `(($(Syntax.mkStrLit k), $(Syntax.mkStrLit v))))
+  if let some (k, v) := acceptHdr then
+    defHdrTerms := defHdrTerms.push (← `(($(Syntax.mkStrLit k), $(Syntax.mkStrLit v))))
+  let retPayloadTerm ← liftMacroM retTy.toPayloadTerm
+  let decodeCall : Term ←
+    if retTy.isProto then
+      `(Qed.Server.decodeRespProto (α := $retPayloadTerm) rawRes)
+    else if retTy.mods.isEmpty && (baseRetStr == "Bytes" || baseRetStr == "ByteArray") then
+      `(Qed.Server.decodeRespBytes rawRes)
+    else if retTy.mods.isEmpty && baseRetStr == "Unit" then
+      `(Qed.Server.decodeRespUnit rawRes)
+    else if retTy.mods.isEmpty && baseRetStr == "String" then
+      `(Qed.Server.decodeRespString rawRes)
+    else
+      `(Qed.Server.decodeRespJson (α := $retPayloadTerm) rawRes)
+  let fullFnId := mkIdentFrom fnIdent (svcName ++ fnName)
+  buildExternalCallCmds fullFnId baseId svcStrLit (Syntax.mkStrLit httpVerbRaw)
+    pIdents pTyTerms retPayloadTerm pathTerms queryTerms defHdrTerms customHdrTerms
+    bodyTerm authTerm decodeCall
+  return fnName
+
+open Lean Elab Command in
+@[command_elab externalCmd]
+def elabExternalCmd : CommandElab := fun stx => do
+  let svcIdent : Ident := ⟨stx[1]⟩
+  let svcName := svcIdent.getId
+  let svcNameStr := svcName.toString
+  let (baseOrigin, authSpec, epClauses) ← parseExternalClauses svcIdent svcName stx[2].getArgs
   let currNs ← getCurrNamespace
   let fullSvcName := currNs ++ svcName
   let secretsList := authSpec.requiredSecrets.toArray
@@ -285,120 +414,7 @@ def elabExternalCmd : CommandElab := fun stx => do
   elabCommand (← `(command| def $secretsId : Array String := #[$[$secretsLits],*]))
   let mut methodNames : Array Name := #[]
   for ep in epClauses do
-    let httpVerbRaw := ep[0].getId.toString.toUpper
-    let urlTmpl := (⟨ep[1]⟩ : TSyntax `str).getString
-    let fnIdent : Ident := ⟨ep[2]⟩
-    let fnName := fnIdent.getId
-    if methodNames.contains fnName then
-      throwErrorAt fnIdent s!"duplicate endpoint `{fnName}` in `external {svcName}`"
-    methodNames := methodNames.push fnName
-    let rawParams := ep[4].getSepArgs
-    let mut parsedParams : Array ParsedExtParam := #[]
-    let mut seenParamNames : Array String := #[]
-    for rp in rawParams do
-      let pk := rp.getKind
-      let (hk?, pid, tyNode) ←
-        if pk == ``extParamHeader then pure (some (⟨rp[2]⟩ : TSyntax `str).getString, (⟨rp[4]⟩ : Ident), rp[6])
-        else if pk == ``extParamPlain then pure (none, (⟨rp[0]⟩ : Ident), rp[2])
-        else throwErrorAt rp "invalid endpoint parameter"
-      let pty ← liftMacroM <| ParsedSrvType.parse tyNode
-      liftMacroM <| pty.validate (allowFallible := false) s!"parameter `{pid.getId}`"
-      let pstr := pid.getId.toString
-      if seenParamNames.contains pstr then throwErrorAt pid s!"duplicate parameter `{pstr}`"
-      seenParamNames := seenParamNames.push pstr
-      parsedParams := parsedParams.push { ref := rp, headerKey? := hk?, ident := pid, ty := pty }
-    let retTy ← liftMacroM <| ParsedSrvType.parse ep[7]
-    liftMacroM <| retTy.validate (allowFallible := false)
-      "external endpoint return types (external calls are automatically fallible at `await`; write `-> T` instead of `-> T!`)"
-    let (segSpecs, querySpecs, placeholders) ← parseUrlTemplate ep[1] urlTmpl
-    for ph in placeholders do
-      unless parsedParams.any (fun p => p.headerKey?.isNone && p.ident.getId.toString == ph) do
-        throwErrorAt ep[1] s!"URL placeholder `:{ph}` has no matching parameter `{ph}` in `{fnName}`"
-    let mut bodyParam? : Option ParsedExtParam := none
-    for p in parsedParams do
-      if p.headerKey?.isNone && !placeholders.contains p.ident.getId.toString then
-        if httpVerbRaw == "GET" || httpVerbRaw == "DELETE" then
-          throwErrorAt p.ref s!"parameter `{p.ident.getId}` on `{httpVerbRaw}` endpoint `{fnName}` is not referenced as `:{p.ident.getId}` in `{urlTmpl}`"
-        if bodyParam?.isSome then
-          throwErrorAt p.ref s!"endpoint `{fnName}` has multiple request body parameters; bundle fields into a `schema` type"
-        bodyParam? := some p
-    let pIdents := parsedParams.map (·.ident)
-    let pTyTerms ← parsedParams.mapM fun p => liftMacroM p.ty.toPayloadTerm
-    let paramSegTerm (pn : String) : CommandElabM Term := do
-      let some p := parsedParams.find? (·.ident.getId.toString == pn)
-        | throwErrorAt ep[1] "internal missing URL param"
-      `(Qed.RouteParam.toSeg $(p.ident))
-    let pathTerms ← segSpecs.mapM fun
-      | .lit s          => `(Qed.Server.PathPart.lit $(Syntax.mkStrLit s))
-      | .singleParam pn => do `(Qed.Server.PathPart.seg $(← paramSegTerm pn))
-      | .multiParam pn  => do `(Qed.Server.PathPart.multiSeg $(← paramSegTerm pn))
-    let queryTerms ← querySpecs.mapM fun (qk, qv) => do
-      let qkLit := Syntax.mkStrLit qk
-      match qv with
-      | .lit s    => `(($qkLit, Qed.Server.QueryVal.lit $(Syntax.mkStrLit s)))
-      | .param pn => do `(($qkLit, Qed.Server.QueryVal.param $(← paramSegTerm pn)))
-    -- Build custom headers
-    let mut customHdrTerms : Array Term := #[]
-    for p in parsedParams do
-      if let some hk := p.headerKey? then
-        customHdrTerms := customHdrTerms.push
-          (← `(($(Syntax.mkStrLit hk), Qed.RouteParam.toSeg $(p.ident))))
-    -- Request body & Content-Type auto-selection
-    let baseRetStr := retTy.baseIdent.getId.toString
-    let acceptHdr : Option (String × String) :=
-      if retTy.isProto then some ("Accept", "application/x-protobuf")
-      else if retTy.mods.isEmpty && (baseRetStr == "Bytes" || baseRetStr == "ByteArray" || baseRetStr == "Unit" || baseRetStr == "String") then none
-      else some ("Accept", "application/json")
-    let (bodyTerm, ctHdr) ← match bodyParam? with
-      | none => pure (← `(ByteArray.empty), (none : Option (String × String)))
-      | some bp =>
-          let bBase := bp.ty.baseIdent.getId.toString
-          if bp.ty.isProto then
-            pure (← `(Qed.Proto.encode $(bp.ident)), some ("Content-Type", "application/x-protobuf"))
-          else if bp.ty.mods.isEmpty && (bBase == "Bytes" || bBase == "ByteArray") then
-            pure (← `(($(bp.ident) : ByteArray)), some ("Content-Type", "application/octet-stream"))
-          else if bp.ty.mods.isEmpty && bBase == "Unit" then
-            pure (← `(ByteArray.empty), none)
-          else
-            pure (← `((Qed.Json.render (Qed.toJson $(bp.ident))).toUTF8), some ("Content-Type", "application/json"))
-    let mut defHdrTerms : Array Term := #[]
-    if let some (k, v) := ctHdr then
-      defHdrTerms := defHdrTerms.push (← `(($(Syntax.mkStrLit k), $(Syntax.mkStrLit v))))
-    if let some (k, v) := acceptHdr then
-      defHdrTerms := defHdrTerms.push (← `(($(Syntax.mkStrLit k), $(Syntax.mkStrLit v))))
-    let retPayloadTerm ← liftMacroM retTy.toPayloadTerm
-    let decodeCall : Term ←
-      if retTy.isProto then
-        `(Qed.Server.decodeRespProto (α := $retPayloadTerm) rawRes)
-      else if retTy.mods.isEmpty && (baseRetStr == "Bytes" || baseRetStr == "ByteArray") then
-        `(Qed.Server.decodeRespBytes rawRes)
-      else if retTy.mods.isEmpty && baseRetStr == "Unit" then
-        `(Qed.Server.decodeRespUnit rawRes)
-      else if retTy.mods.isEmpty && baseRetStr == "String" then
-        `(Qed.Server.decodeRespString rawRes)
-      else
-        `(Qed.Server.decodeRespJson (α := $retPayloadTerm) rawRes)
-    let fullFnId := mkIdentFrom fnIdent (svcName ++ fnName)
-    let verbLit := Syntax.mkStrLit httpVerbRaw
-    let fnCmd ← `(command|
-      @[specialize]
-      def $fullFnId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
-          $[($pIdents:ident : $pTyTerms:term)]* : m (Except Qed.Server.ApiError $retPayloadTerm) := do
-        let rawRes ← Qed.Server.execExternalRaw $svcStrLit $baseId $verbLit
-          [$[$pathTerms],*] [$[$queryTerms],*]
-          [$[$defHdrTerms],*] [$[$customHdrTerms],*]
-          $bodyTerm $authTerm
-        return $decodeCall)
-    elabCommand fnCmd
-    let fullFnCall ← pIdents.foldlM (init := ← `($fullFnId))
-      fun acc pid => `($acc $pid)
-    let safeInstCmd ← `(command|
-      instance {_σ : Type} $[($pIdents:ident : $pTyTerms:term)]* :
-          Qed.Server.SafeIO ($fullFnCall : Qed.Server.ThreadProg _σ (Except Qed.Server.ApiError $retPayloadTerm)) where
-        noAtomic := by
-          unfold $fullFnId
-          exact (inferInstance : Qed.Server.SafeIO _).noAtomic)
-    elabCommand safeInstCmd
+    methodNames := methodNames.push (← elabExternalEndpoint svcName svcStrLit baseId authTerm methodNames ep)
   modifyEnv fun env => externalRegistry.addEntry env {
     serviceName := fullSvcName
     baseOrigin

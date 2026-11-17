@@ -1,5 +1,4 @@
 import Qed.Json.Basic
-import Qed.Json.Proofs
 
 namespace Qed
 
@@ -9,13 +8,6 @@ class LawfulJson (α : Type) extends ToJson α, FromJson α where
   fromJson_toJson : ∀ a : α, fromJson (toJson a) = .ok a
 
 attribute [simp] LawfulJson.fromJson_toJson
-
-theorem LawfulJson.parse_render_toJson {α : Type} [LawfulJson α] (a : α)
-    {maxDepth : Nat} (h : LawfulJson.depthBound α ≤ maxDepth := by omega) :
-    (Json.parse (Json.render (toJson a)) maxDepth).bind fromJson = .ok a := by
-  unfold Json.parse
-  rw [Qed.parse_render (Nat.le_trans (LawfulJson.depth_toJson a) h)]
-  exact LawfulJson.fromJson_toJson a
 
 instance : LawfulJson Unit where
   depthBound := 1

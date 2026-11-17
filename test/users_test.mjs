@@ -1,10 +1,13 @@
-import { withBrowser, send, sleep } from './harness.mjs';
+import { send, withBrowser } from './harness.mjs';
 
 const profiles = {
   ada:  { name: 'Ada',  bio: 'Wrote the first algorithm.' },
   alan: { name: 'Alan', bio: 'Asked what machines can decide.' },
   slow: { name: 'Slow', bio: 'Arrived late.' },
 };
+
+let resolveSlowStarted, releaseSlow;
+const slowStarted = new Promise((r) => { resolveSlowStarted = r; });
 
 await withBrowser('USERS', {
   webRoot: 'Examples.UsersWeb',
@@ -14,8 +17,12 @@ await withBrowser('USERS', {
     const p = profiles[name];
     const respond = () => p ? send(res, 200, 'application/json', JSON.stringify(p))
                             : send(res, 404, 'application/json', JSON.stringify({ error: 'no such user' }));
-    if (name === 'slow') setTimeout(respond, 800);
-    else respond();
+    if (name === 'slow') {
+      resolveSlowStarted();
+      new Promise((r) => { releaseSlow = r; }).then(respond);
+    } else {
+      respond();
+    }
     return true;
   },
 }, async ({ page, check, baseUrl }) => {
@@ -44,34 +51,33 @@ await withBrowser('USERS', {
 
   await page.focus('#app .q');
   await page.waitForFunction(() => document.querySelector('#app .q')?.classList.contains('focused'), { timeout: 4000 });
-  check('input gains a focused class on focus', true, true);
+  check('input gains a focused class on focus',
+    await page.$eval('#app .q', (e) => e.classList.contains('focused')), true);
   await page.type('#app .q', 'zzz');
   await page.keyboard.press('Escape');
-  await sleep(50);
+  await page.waitForFunction(() => document.querySelector('#app .q')?.value === '', { timeout: 4000 });
   check('Escape clears the query (onKeydown)', await page.$eval('#app .q', (e) => e.value), '');
   await page.evaluate(() => document.querySelector('#app .q').blur());
-  await sleep(50);
+  await page.waitForFunction(() => !document.querySelector('#app .q')?.classList.contains('focused'), { timeout: 4000 });
   check('input loses the focused class on blur',
     await page.$eval('#app .q', (e) => e.classList.contains('focused')), false);
 
-  await page.focus('#app .q');
-  await page.type('#app .q', 'ada');
-  await page.keyboard.press('Enter');
-  await page.waitForSelector('#app .profile .bio', { timeout: 5000 });
-  check('Enter submitted the form and navigated', await path(), '/users/ada');
-  check('and fetched the profile', await bio(), 'Wrote the first algorithm.');
-
   const search = async (name) => {
-    await page.focus('#app .q'); await page.keyboard.press('Escape'); await sleep(20);
-    await page.type('#app .q', name); await page.keyboard.press('Enter');
+    await page.focus('#app .q');
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => document.querySelector('#app .q')?.value === '', { timeout: 4000 });
+    await page.type('#app .q', name);
+    await page.keyboard.press('Enter');
   };
-  await page.click('#app .home-link'); await page.waitForSelector('#app .search', { timeout: 5000 });
   await search('slow');
-  await page.waitForSelector('#app .loading', { timeout: 5000 });
+  await Promise.all([page.waitForSelector('#app .loading', { timeout: 5000 }), slowStarted]);
   await page.click('#app .home-link'); await page.waitForSelector('#app .search', { timeout: 5000 });
   await search('ada');
   await page.waitForSelector('#app .profile .bio', { timeout: 5000 });
-  check('fast navigation shows the current user', await bio(), 'Wrote the first algorithm.');
-  await sleep(1000);
+  check('Enter submitted and navigated to current user', [await path(), await bio()], ['/users/ada', 'Wrote the first algorithm.']);
+  const slowDone = page.waitForResponse((r) => r.url().includes('/api/users/slow'));
+  releaseSlow();
+  await slowDone;
+  await page.waitForFunction(() => true);
   check('stale response did NOT overwrite the page (race fixed)', await bio(), 'Wrote the first algorithm.');
 });

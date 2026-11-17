@@ -1,5 +1,5 @@
 import Qed.Html
-import Qed.Json.Basic
+import Qed.Json
 import Qed.Runtime.Verify
 
 namespace Qed

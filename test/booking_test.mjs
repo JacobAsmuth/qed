@@ -7,7 +7,6 @@ const PAST = `${year - 1}-06-15`;
 await withBrowser('BOOKING', { webRoot: 'Examples.BookingWeb' }, async ({ page, check, baseUrl }) => {
   await page.goto(`${baseUrl}/index.html`, { waitUntil: 'load' });
   await page.waitForSelector('#app .qed-form', { timeout: 20000 });
-  check('form rendered after Cmd.now delivered today', true, true);
 
   const WHO = '#app .qed-form > label:nth-child(1) input';
   const WHEN = '#app input[type="date"]';

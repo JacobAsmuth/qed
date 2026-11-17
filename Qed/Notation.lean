@@ -1,5 +1,5 @@
 import Qed.Html
-import Qed.Router
+import Qed.Router.Basic
 
 namespace Qed
 

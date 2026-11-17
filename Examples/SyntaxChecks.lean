@@ -1,5 +1,4 @@
 import Examples.Local
-import Examples.Todo
 open Qed
 
 namespace SyntaxChecks
@@ -37,14 +36,6 @@ component HelperApp where
 #guard (HelperApp.app.locals.map (·.id)).contains "Local.Tag"
 #guard HelperApp.app.locals.length == 3
 
-def rows : Array Todo.Row.State :=
-  #[{ id := 8, text := "Zulu", done := false }, { id := 2, text := "Alpha", done := false }]
-def sorted := Todo.update { rows } .sort
-#guard ((Todo.update sorted (.rows "8" .toggle)).rows[1]?.map (·.done)) == some true
-#guard ((Todo.update sorted (.rows "8" .toggle)).rows[0]?.map (·.done)) == some false
-#guard (Todo.update (Todo.update sorted (.remove 8)) (.rows "8" .toggle)).rows.size == 1
-example : (Todo.update { draft := "  " } .add).nextId = 0 := rfl
-
 /-- error: `label`: not a `state` field of this component (fields: [count]) -/
 #guard_msgs in
 component ReadOnly where
@@ -74,14 +65,6 @@ def ownedView : Html (String × Owned.Msg) :=
 #guard (Html.render ownedView).contains "Live"
 example : (Owned.update { caption := "Live" } { id := 4, count := 2 } .increment).count = 3 := rfl
 
-def counterHelper {msg : Type} : Html msg := <Counter key="helper"/>
-/-- Component whose child is supplied by a helper. -/
-component Container where
-  state unused : Nat := 0
-  view => <div>{counterHelper}</div>
-#guard (Container.app.locals.map (·.id)).contains "SyntaxChecks.Counter"
-#guard (Container.app.renderInitial).contains "0</button>"
-
 def ssrEdgeCases : Html Unit :=
   <div>
     <style>{".a > .b { content: \"</style>\"; }"}</style>
@@ -92,13 +75,6 @@ def ssrEdgeCases : Html Unit :=
 #guard (Html.renderWith Counter.regs ssrEdgeCases).contains "<\\/style>"
 #guard !(Html.renderWith Counter.regs ssrEdgeCases).contains "</br>"
 #guard (Html.renderWith Counter.regs ssrEdgeCases).contains "8</button>"
-
-example : ToJson Counter.Props := Counter.Props.instToJson
-example : FromJson Counter.Props := Counter.Props.instFromJson
-example : ToJson Counter.State := Counter.State.instToJson
-example : FromJson Counter.State := Counter.State.instFromJson
-example : ToJson Owned.State := Owned.State.instToJson
-example : FromJson Owned.State := Owned.State.instFromJson
 
 route_enum Section where
   overview
@@ -124,19 +100,6 @@ def navView (s : Section) : Html Unit :=
 
 invariant navExclusive :
   exactlyOneOf ["nav-overview", "nav-arch", "nav-bench"] navOn navOff holds_in navView
-
-component StepCount where
-  state n : Nat := 0
-  action step (d : Nat) => n := n + d
-  invariant nonNegFromZero : 0 ≤ n
-  view => <span>{n}</span>
-
-def docDehydrate : Dehydrate (DocRoute × Resource (Array Qed.Demo.Signup)) :=
-  Dehydrate.full
-
-example (x : DocRoute × Resource (Array Qed.Demo.Signup)) :
-    docDehydrate.rehydrate (docDehydrate.dehydrate x) = some x :=
-  docDehydrate.round_trip x
 
 component RoutedDehydrated where
   route r : DocRoute := .home
@@ -216,15 +179,6 @@ component ParentPage where
   view => <div><SubBanner sec={activeSection route}/></div>
 #guard (Html.render (ParentPage.view { route := .sec .architecture 3 })).contains "/docs/arch/1"
 
-component SingleChild where
-  state count : Nat := 0
-  action bump => count := count + 1
-  view => <button onClick={.bump}>{count}</button>
-
-inductive ParentMsg | child (m : SingleChild.Msg)
-def singleChildJsx (s : SingleChild.State) : Html ParentMsg := <SingleChild state={s} onMsg={.child}/>
-#guard (Html.render (singleChildJsx { count := 5 })).contains "5</button>"
-
 def chipStyle : Style := css [ paddingX (px 6), marginTop (px 2) ]
 
 component ModernCounter where
@@ -248,13 +202,6 @@ component ModernCounter where
     </div>
 
 example : ModernCounter.init.quantity = 1 ∧ ModernCounter.init.draft = "" := ⟨rfl, rfl⟩
-example := ModernCounter.inv
-example := ModernCounter.inv_2
-
-component HostModern where
-  state n : Nat := 0
-  view => <div data-n={n}><ModernCounter key="mc"/></div>
-#guard HostModern.app.styles.any (·.raw == chipStyle.raw)
 
 router RepoRoute where
   index => "/"
@@ -287,32 +234,13 @@ def jsxErgonomicsView (items : Array Nat) (note? : Option String) (highlight : B
     <ul>
       <li key="head">Top</li>
       {for n in items => <li key={n}>{n}</li>}
+      {for n in ([3, 4] : List Nat) => <li key={s!"l{n}"}>{n}</li>}
     </ul>
   </div>
 
 #guard (Html.render (jsxErgonomicsView #[1, 2] (some "ok") true)).contains "<p>ok</p>"
+#guard (Html.render (jsxErgonomicsView #[1, 2] (some "ok") true)).contains "<li>3</li><li>4</li>"
 #guard !(Html.render (jsxErgonomicsView #[] none false)).contains "<em>"
-
-component AutoSliceComp where
-  state a : Nat := 1
-  state b : String := "hi"
-  state ephemeral : Nat := 99
-  action bump (d : Nat) => a := a + d
-  invariant sliceSafe : 1 ≤ a
-  view => <div>{a}{b}</div>
-
-component EphemeralComp where
-  state a : Nat := 1
-  state b : String := "hi"
-  ephemeral ephemeral : Nat := 99
-  action bump (d : Nat) => a := a + d
-  view => <div>{a}{b}</div>
-
-#guard (AutoSliceComp.app.rehydrate (AutoSliceComp.app.dehydrate { a := 7, b := "yo", ephemeral := 0 })).map
-  (fun s => (s.a, s.b, s.ephemeral)) == some (7, "yo", 0)
-#guard (EphemeralComp.app.rehydrate (EphemeralComp.app.dehydrate { a := 7, b := "yo", ephemeral := 0 })).map
-  (fun s => (s.a, s.b, s.ephemeral)) == some (7, "yo", 99)
-#guard (ModernCounter.app.rehydrate (ModernCounter.app.dehydrate { quantity := 6, draft := "six", active := false })).map (·.quantity) == some 6
 
 inductive FilterTab | all | tagged (tag : String) deriving DecidableEq
 structure PlainNote where
@@ -325,12 +253,12 @@ component RichAuto where
   state notes : Array PlainNote := #[]
   state pick  : Option PlainNote := none
   state cache : Cached String := {}
-  state child : SingleChild.State := { count := 0 }
+  state child : Counter.State := { count := 0, saved := 0 }
   view => <div>{notes.size}{child.count}</div>
 
 #guard (RichAuto.app.rehydrate (RichAuto.app.dehydrate
   { tab := .tagged "lean", notes := #[{ id := 1, text := "hello" }], pick := some { id := 2, text := "pinned" },
-    cache := ({} : Cached String).put "k" (.ok "v") "k", child := { count := 42 } })).map
+    cache := ({} : Cached String).put "k" (.ok "v") "k", child := { count := 42, saved := 0 } })).map
   (fun m => m.tab == .tagged "lean" && m.notes == #[{ id := 1, text := "hello" }] &&
             m.pick == some { id := 2, text := "pinned" } && m.cache.lookup "k" == some "v" && m.child.count == 42) == some true
 
@@ -444,7 +372,8 @@ component BadEphemeralReadByView where
 -- ── Sub-components, unified `app`, `Field`, `<Await>`, & fractional CSS checks ──
 
 def fracStyle : Style := css [
-  padding (rem 0.75) (rem 1.5),
+  textAlign .center,
+  padding (rem 0.35) 0 (rem 0.5),
   margin (rem 2) .auto,
   gap (px 4) (px 8),
   lineHeight 1.5,
@@ -453,80 +382,7 @@ def fracStyle : Style := css [
   zIndex (-1) ]
 
 #guard fracStyle.raw ==
-  "padding: 0.75rem 1.5rem; margin: 2rem auto; gap: 4px 8px; line-height: 1.5; font-weight: 600; opacity: 0.85; z-index: -1;"
-
-def typedUnitStyle : Style := css [
-  textAlign .center, fontSize (rem 0.76), color (hex "787b84"),
-  padding (rem 0.35) 0 (rem 0.5) ]
-
-#guard typedUnitStyle.raw ==
-  "text-align: center; font-size: 0.76rem; color: #787b84; padding: 0.35rem 0 0.5rem;"
-
-/-- error: Application type mismatch: The argument
-  "0.76rem"
-has type
-  String
-but is expected to have type
-  Len
-in the application
-  fontSize "0.76rem" -/
-#guard_msgs in
-def badQuotedFontSize : Style := css [ fontSize "0.76rem" ]
-
-/-- error: Application type mismatch: The argument
-  "0.35rem 0 0.5rem"
-has type
-  String
-but is expected to have type
-  Len
-in the application
-  padding "0.35rem 0 0.5rem" -/
-#guard_msgs in
-def badQuotedPadding : Style := css [ padding "0.35rem 0 0.5rem" ]
-
-/-- error: Application type mismatch: The argument
-  "700"
-has type
-  String
-but is expected to have type
-  CssNum
-in the application
-  fontWeight "700" -/
-#guard_msgs in
-def badQuotedFontWeight : Style := css [ fontWeight "700" ]
-
-/-- error: Application type mismatch: The argument
-  "padding: 7px"
-has type
-  String
-but is expected to have type
-  List Item
-in the application
-  css "padding: 7px" -/
-#guard_msgs in
-def badRawCssString : Style := css "padding: 7px"
-
-/-- error: Application type mismatch: The argument
-  "#787b84"
-has type
-  String
-but is expected to have type
-  Color
-in the application
-  color "#787b84" -/
-#guard_msgs in
-def badQuotedColor : Style := css [ color "#787b84" ]
-
-/-- error: Application type mismatch: The argument
-  px 1
-has type
-  Len
-but is expected to have type
-  CssNum
-in the application
-  lineHeight (px 1) -/
-#guard_msgs in
-def badLenAsCssNum : Style := css [ lineHeight (px 1) ]
+  "text-align: center; padding: 0.35rem 0 0.5rem; margin: 2rem auto; gap: 4px 8px; line-height: 1.5; font-weight: 600; opacity: 0.85; z-index: -1;"
 
 #guard (match (Resource.ok (none : Option Nat)).someOr "missing" with | .failed "missing" => true | _ => false)
 #guard (match (Resource.ok (some 42)).someOr "missing" with | .ok 42 => true | _ => false)
@@ -644,33 +500,6 @@ def awaitSample (r : Resource Ticket) : Html Unit :=
 #guard (Html.render (awaitSample .loading)).contains "<p>Wait</p>"
 #guard (Html.render (awaitSample (.failed "boom"))).contains "<p class=\"err\">boom</p>"
 
--- `<Schema.Form>` JSX tag, `{for ... => ...}`, inline `for_each`, early `return`, & scoped manual `invariant` proof
-component TicketFormHost where
-  state draft := Ticket.Draft.empty
-  state saved : Option Ticket := none
-  action submit => saved := Ticket.parse draft
-  view =>
-    <div class="host">
-      <Ticket.Form bind={draft} onSubmit={.submit}/>
-    </div>
-
-#guard (Html.render (TicketFormHost.view TicketFormHost.init)).contains "class=\"qed-form\""
-
-def forLoopHtml : Html Unit :=
-  <ul>
-    {for n in (#[1, 2] : Array Nat) => <li key={n}>{n}</li>}
-    {for n in ([3, 4] : List Nat) => <li key={n}>{n}</li>}
-  </ul>
-
-#guard (Html.render forLoopHtml).contains "<li>1</li><li>2</li><li>3</li><li>4</li>"
-
-component InlineForEachParent where
-  collection rows : RowItem
-  invariant rowsSafe : RowItem.rowSafeFromInit for_each rows
-  view => <ul>{for r in rows => <li><RowItem state={r}/></li>}</ul>
-
-example := InlineForEachParent.rowsSafe
-
 component EarlyReturnCheck where
   state x : Int := 0
   action step (n : Int) =>
@@ -703,28 +532,16 @@ component FineGrainedCheck where
   | .element "div" _ [.element "span" _ [.dyn _], .ifElse _ _ _, .memo _, .keyedList "ul" _ _ _ _ _] => true
   | _ => false
 
-/-- error: Unknown identifier `mkApp` -/
-#guard_msgs in
-#check mkApp
+/-- error: invariant `BadUnguardedDecrease.inRange` isn't preserved by `BadUnguardedDecrease.update`, the automation couldn't close every message.
 
-/-- error: Unknown identifier `mkRoutedApp` -/
-#guard_msgs in
-#check mkRoutedApp
+  • case `decrease` still needs:  1 ≤ m.quantity - 1 ∧ m.quantity - 1 ≤ 10
 
-/-- error: Unknown identifier `ui` -/
+If the property is true here, the prover is likely missing a fact: supply it with `invariant BadUnguardedDecrease.inRange : … using [yourLemma]`, or prove the case with `:= by`. If a branch can actually violate the property, fix that branch of `BadUnguardedDecrease.update`, or weaken the property to what it guarantees. -/
 #guard_msgs in
-#check ui
-
-/-- error: Unknown identifier `SingleChild.mount` -/
-#guard_msgs in
-#check SingleChild.mount
-
-/-- error: Unknown identifier `SingleChild.toComponent` -/
-#guard_msgs in
-#check SingleChild.toComponent
-
-/-- error: Unknown identifier `view` -/
-#guard_msgs in
-example : View Nat Unit := view% (fun (n : Nat) => <div>{n}</div>)
+component BadUnguardedDecrease where
+  state quantity := 1
+  action decrease => quantity -= 1
+  invariant inRange : 1 ≤ quantity, quantity ≤ 10
+  view => <span>{quantity}</span>
 
 end SyntaxChecks

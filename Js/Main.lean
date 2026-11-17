@@ -51,6 +51,24 @@ private def writeJsBundle (env : Environment) (avail? : Option (Std.HashSet Stri
   IO.FS.writeFile p js
   IO.println s!"wrote {outPath} ({js.length} bytes)"
 
+private def tryImport (mods : List String) : IO (Option Environment) :=
+  (some <$> loadEnv mods) <|> return none
+
+private partial def verifyModBatch (mods : List String) (skipFw : Bool) : IO Nat := do
+  match mods with
+  | []  => return 0
+  | [m] => orThrow (Js.verifyProjectEnv (← loadEnv [m]) skipFw)
+  | _   =>
+      if let some env ← tryImport mods then
+        orThrow (Js.verifyProjectEnv env skipFw)
+      else
+        let mid := mods.length / 2
+        let tL ← IO.asTask (verifyModBatch (mods.take mid) skipFw)
+        let tR ← IO.asTask (verifyModBatch (mods.drop mid) true)
+        let cL ← match ← IO.wait tL with | .ok n => pure n | .error e => throw e
+        let cR ← match ← IO.wait tR with | .ok n => pure n | .error e => throw e
+        return cL + cR
+
 def main (args : List String) : IO Unit := do
   Lean.initSearchPath (← Lean.findSysroot)
   match args with
@@ -59,11 +77,17 @@ def main (args : List String) : IO Unit := do
     let mods := rest.filter (· ≠ "--skip-qed")
     if mods.isEmpty then
       throw (IO.userError "usage: qedjs --verify-env [--skip-qed] <module>…")
-    let tryImport (ms : List String) : IO (Option Environment) :=
-      (some <$> loadEnv ms) <|> return none
     let total ← match ← tryImport mods with
       | some env => orThrow (Js.verifyProjectEnv env skipFw)
-      | none => mods.foldlM (fun sum m => return sum + (← orThrow (Js.verifyProjectEnv (← loadEnv [m]) skipFw))) 0
+      | none =>
+          let (fwMods, userMods) := mods.partition fun m => Js.isFrameworkModule m.toName
+          let tFw ← if skipFw || fwMods.isEmpty then IO.asTask (pure 0)
+            else IO.asTask (verifyModBatch fwMods false)
+          let userSkipFw := skipFw || !fwMods.isEmpty
+          let tUsr ← IO.asTask (verifyModBatch userMods userSkipFw)
+          let fwTotal ← match ← IO.wait tFw with | .ok n => pure n | .error e => throw e
+          let usrTotal ← match ← IO.wait tUsr with | .ok n => pure n | .error e => throw e
+          pure (fwTotal + usrTotal)
     IO.println s!"kernel-verified {total} declarations across {mods.length} root module(s)"
   | "--check-externs" :: rtPath :: rest =>
     let (mods, entryArgs) := splitDashes rest

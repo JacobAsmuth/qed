@@ -118,12 +118,36 @@ def writeIfChanged (path : FilePath) (content : String) : IO Bool := do
   IO.FS.writeFile path content
   return true
 
+initialize leanPathCache : IO.Ref (Option String) ← IO.mkRef none
+
+def mtimeNs (p : FilePath) : IO (Option Int) := do
+  if !(← p.pathExists) then return none
+  try
+    let m ← p.metadata
+    return some (m.modified.sec * 1000000000 + Int.ofNat m.modified.nsec.toNat)
+  catch _ => return none
+
+def isUpToDate (out : FilePath) (deps : Array FilePath) : IO Bool := do
+  let some outT ← mtimeNs out | return false
+  for d in deps do
+    let some dt ← mtimeNs d | return false
+    if dt > outT then return false
+  return true
+
 def lakeEnvLeanPath : IO (Option String) := do
+  if let some lp ← leanPathCache.get then return some lp
+  if let some lp ← env "LEAN_PATH" then
+    let trimmed := lp.trimmed
+    if !trimmed.isEmpty then
+      leanPathCache.set (some trimmed)
+      return some trimmed
   let o ← IO.Process.output { cmd := "lake", args := #["env", "printenv", "LEAN_PATH"] }
   if o.exitCode != 0 then
     IO.eprint (o.stdout ++ o.stderr)
     return none
-  return some o.stdout.trimmed
+  let trimmed := o.stdout.trimmed
+  leanPathCache.set (some trimmed)
+  return some trimmed
 
 def lakeQueryPaths (targets : Array String) : IO (Option (Array String)) := do
   let o ← IO.Process.output { cmd := "lake", args := #["query"] ++ targets }
@@ -137,6 +161,8 @@ def resolveQedjsBin (needBuild : Bool := true) : IO (Option FilePath) := do
   let qh ← frameworkHome
   let prebuilt := qh / ".lake" / "build" / "bin" / "qedjs"
   let isInRepo ← (FilePath.mk "Examples").pathExists
+  if isInRepo && (!needBuild || (← env "QED_PREBUILT") == some "1") && (← prebuilt.pathExists) then
+    return some prebuilt
   if !isInRepo && (← prebuilt.pathExists) then
     let tcMatch ← do
       let appTc : FilePath := "lean-toolchain"
@@ -148,6 +174,8 @@ def resolveQedjsBin (needBuild : Bool := true) : IO (Option FilePath) := do
   let target := if isInRepo then "qedjs" else "qed/qedjs"
   if needBuild then
     if (← shQuiet "lake" #["build", target]) != 0 then return none
+  if isInRepo && (← prebuilt.pathExists) then
+    return some prebuilt
   let some paths ← lakeQueryPaths #[target] | return none
   return paths[0]?.map FilePath.mk
 

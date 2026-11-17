@@ -1,4 +1,4 @@
-import Qed.Notation
+import Qed.Html
 
 namespace Qed
 
@@ -223,7 +223,7 @@ def renderTheme (tokens : List Item) : String :=
   joinLines (root ++ resets)
 
 @[inline] def theme (tokens : List Item) : Html msg :=
-  el "style" [] [Html.text (escapeRawText (renderTheme tokens))]
+  .element "style" [] [Html.text (escapeRawText (renderTheme tokens))]
 
 def renderStyleSheet (styles : List Style) : String :=
   let seen := (styles.foldl

@@ -1,4 +1,4 @@
-import { withBrowser, sleep } from './harness.mjs';
+import { withBrowser } from './harness.mjs';
 
 await withBrowser('LOCAL', { webRoot: 'Examples.LocalWeb' }, async ({ page, check, baseUrl }) => {
   await page.goto(`${baseUrl}/index.html`, { waitUntil: 'load' });
@@ -12,19 +12,14 @@ await withBrowser('LOCAL', { webRoot: 'Examples.LocalWeb' }, async ({ page, chec
   const reportTxt = () => page.$eval('#app .report', (e) => e.textContent);
   const labels    = () => page.$$eval('#app .rows .row .label', (els) => els.map((e) => e.textContent));
   const snapshot  = () => page.evaluate(() => JSON.parse(window.qed.snapshot()));
-  const clickIn = async (row, sel) => {
-    await page.evaluate((row, sel) => document.querySelector(`${row} ${sel}`).click(), row, sel);
-    await sleep(30);
-  };
-  const tag    = (sel, mark) => page.$eval(sel, (el, mark) => { el.dataset.mark = mark; }, mark);
-  const markOf = (sel) => page.$eval(sel, (el) => el.dataset.mark || '');
+  const clickIn   = (row, sel) => page.evaluate((r, s) => document.querySelector(`${r} ${s}`).click(), row, sel);
+  const tag       = (sel, mark) => page.$eval(sel, (el, m) => { el.dataset.mark = m; }, mark);
+  const markOf    = (sel) => page.$eval(sel, (el) => el.dataset.mark || '');
 
   const stepCount = () => page.$eval('#app .solo .stepper .count', (e) => e.textContent);
   const stepSaved = () => page.$eval('#app .solo .stepper .savedv', (e) => e.textContent);
-  const stepClick = async (sel) => {
-    await page.evaluate((s) => document.querySelector(`#app .solo .stepper ${s}`).click(), sel);
-    await sleep(30);
-  };
+  const stepClick = (sel) => page.evaluate((s) => document.querySelector(`#app .solo .stepper ${s}`).click(), sel);
+
   check('stepper starts at its declared default', await stepCount(), '0');
   await stepClick('.dec');
   check('decrement at 0 stays 0 (the clamp stepperSafe is proven on)', await stepCount(), '0');
@@ -67,7 +62,6 @@ await withBrowser('LOCAL', { webRoot: 'Examples.LocalWeb' }, async ({ page, chec
 
   await page.type('#app .new', 'Gamma');
   await page.click('#app .addbtn');
-  await sleep(50);
   check('row added (root re-render)', await labels(), ['Alpha', 'Beta', 'Gamma']);
   check('local count survived the root re-render', await countAt(A), '3');
   check('local note survived the root re-render', await noteAt(A), 'AlphaX');
@@ -82,7 +76,6 @@ await withBrowser('LOCAL', { webRoot: 'Examples.LocalWeb' }, async ({ page, chec
   await page.type(`${A} .widget .note`, 'ZZZ');
   check('local state drifted before restore', await countAt(A), '5');
   await page.evaluate((s) => window.qed.restore(JSON.stringify(s)), snap);
-  await sleep(40);
   check('restore brought the count back', await countAt(A), '3');
   check('restore brought the note back', await noteAt(A), 'AlphaX');
 
@@ -92,7 +85,6 @@ await withBrowser('LOCAL', { webRoot: 'Examples.LocalWeb' }, async ({ page, chec
     const li = [...document.querySelectorAll('#app .rows .row')].find((e) => e.querySelector('.label').textContent === 'Beta');
     li.querySelector('.rm').click();
   });
-  await sleep(50);
   const after = await snapshot();
   check('Beta removed', await labels(), ['Alpha', 'Gamma']);
   check('removed row widget state was GC-ed', after['Local.Widget@1'], undefined);
@@ -114,7 +106,6 @@ await withBrowser('LOCAL', { webRoot: 'Examples.LocalWeb' }, async ({ page, chec
   await clickIn(A, '.reset-note');
   check('named actions read current props', await noteAt(A), 'Alpha!');
   await page.evaluate((s) => window.qed.restore(JSON.stringify(s)), after);
-  await sleep(40);
   check('restoring state keeps current props',
     await page.$eval(`${A} .live-label`, (e) => e.textContent), 'Alpha!');
   check('restoring state restores the note separately', await noteAt(A), 'AlphaX');

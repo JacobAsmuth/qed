@@ -330,6 +330,45 @@ elab "qedProveDehydrateView" : tactic => do
       can render different HTML on the client than SSR rendered on the server.{details}\n\n\
       Do not mark model fields read by the view as `ephemeral` (so rehydration preserves the rendered view)."
 
+@[simp] theorem ite_bool_eq_true (c : Prop) [Decidable c] {α : Sort _} (a b : α) :
+    (if (if c then true else false) = true then a else b) = (if c then a else b) := by
+  by_cases hc : c <;> simp [hc]
+
+open Lean Elab Tactic Meta in
+elab "qedProveViewEquiv" appId:ident viewId:ident : tactic => do
+  let appName ← realizeGlobalConstNoOverloadWithInfo appId
+  let viewName ← realizeGlobalConstNoOverloadWithInfo viewId
+  let env0 ← getEnv
+  let toLemma (n : Name) : TacticM (TSyntax `Lean.Parser.Tactic.simpLemma) :=
+    `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+  let stage1 := #[
+    appName, viewName, `Qed.App.view, `Qed.Internal.App.withFullDehydrate,
+    `Qed.Internal.mkApp_template, `Qed.Internal.mkRoutedApp_template,
+    `Qed.Internal.App.withDehydrate_template, `Qed.Internal.App.withQueries_template
+  ].filter env0.contains
+  let fwNames := (viewFrameworkUnfolds env0).filter (· != ``V.render_forEach) ++ #[
+    ``View.render_mapScope, ``View.renderEach_mapScopeEach,
+    ``V.canonical_render_forEach, ``SoundMemo.eval,
+    ``Html.ofOption, ``List.map_cons, ``List.map_nil, ``List.map_map,
+    ``Function.comp_def, ``Array.toList_map,
+    ``mkCanonicalElem, ``onlySignalBind, ``Attr.canonical
+  ]
+  let s1 ← stage1.mapM toLemma
+  let fw ← (fwNames.filter env0.contains).mapM toLemma
+  try evalTactic (← `(tactic| try simp only [$[$s1],*])) catch _ => pure ()
+  for _ in [0:5] do
+    if (← getGoals).isEmpty then break
+    let before ← (← getGoals).mapM fun g => g.withContext do instantiateMVars (← g.getType)
+    try evalTactic (← `(tactic| (qedUnfoldForValidHtml; try simp [-Qed.V.render_forEach, $[$fw],*]))) catch _ => pure ()
+    if (← getGoals).isEmpty then break
+    let after ← (← getGoals).mapM fun g => g.withContext do instantiateMVars (← g.getType)
+    if before == after then break
+  if !(← getGoals).isEmpty then
+    try evalTactic (← `(tactic| all_goals first
+      | rfl
+      | ((repeat' split) <;> simp_all [Qed.mkCanonicalElem, Qed.onlySignalBind, Qed.Attr.canonical])))
+    catch _ => pure ()
+
 structure SchemaFormInfo where
   fullName     : Lean.Name
   formViewName : Lean.Name

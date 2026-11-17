@@ -264,6 +264,14 @@ macro "qedSimpArrayAndBool" : tactic => `(tactic|
      Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
      beq_iff_eq, bne_iff_ne, decide_eq_true_eq] at *)
 
+open Lean Meta Elab Term in
+private def wrapAuxProof (goalProp prf : Expr) : TermElabM Expr := do
+  let prf ← instantiateMVars prf
+  let goalProp ← instantiateMVars goalProp
+  if prf.hasMVar || goalProp.hasMVar then
+    return prf
+  liftMetaM <| Meta.mkAuxTheorem goalProp prf (zetaDelta := true)
+
 open Lean Meta Elab Term Tactic in
 @[term_elab srvAutoFieldStx]
 def elabSrvAutoField : TermElab := fun stx expectedType? => do
@@ -285,12 +293,15 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
           try qedUnfoldSrvHelpers
           qedSimpArrayAndBool
           qedDsimpCodecs
-          first | decide | omega | assumption | simp_all | (simp_all <;> omega) | (simp_all <;> decide))
+          first | assumption | omega | decide | simp_all | (simp_all <;> omega) | (simp_all <;> decide))
+        let preMsgs := (← Core.getMessageLog).toList.length
         let prfExpr ← try
             withPosedFacts facts <| elabTermEnsuringType prfStx (some goalProp)
           catch _ =>
             throwErrorAt stx m!"cannot prove schema field refinement `{← ppExpr goalProp}`.\n\
               Guard this mutation with an `if ...` check or `requires ...` precondition so Lean can verify it cannot violate the schema."
+        let hasErr := ((← Core.getMessageLog).toList.drop preMsgs).any (·.severity == .error)
+        let prfExpr ← if hasErr then pure prfExpr else wrapAuxProof goalProp prfExpr
         return ← mkAppOptM ``Qed.Field.mk #[some innerTy, some predFn, some valExpr, some prfExpr]
       else
         return ← try elabTermEnsuringType valStx (some expTy)
@@ -310,18 +321,22 @@ private def proveBoundsFor (ref : Syntax) (arrExpr idxNatExpr : Expr) : TermElab
   let facts ← collectProofFacts #[arrExpr, idxNatExpr]
   let prfStx ← `(by
     try qedUnfoldSrvHelpers
+    try dsimp (config := { zetaDelta := true }) only [] at *
     qedSimpArrayAndBool
     first
       | assumption | omega
       | (simp_all (config := { zetaDelta := true }) <;> omega)
       | (repeat' split <;> (try simp (config := { zetaDelta := true }) only [Array.size_set, Array.size_push] at *; omega)))
-  try
-    withPosedFacts facts <| elabTermEnsuringType prfStx (some goalProp)
-  catch _ =>
-    let prettyArr ← ppExpr arrExpr
-    let prettyIdx ← ppExpr idxNatExpr
-    throwErrorAt ref m!"cannot prove array index `{prettyIdx}` is in bounds for `{prettyArr}`.\n\
-      Use `if {prettyIdx} < ({prettyArr}).size` or `if let i = ({prettyArr}).findIndex(...)` before indexing."
+  let preMsgs := (← Core.getMessageLog).toList.length
+  let prfExpr ← try
+      withPosedFacts facts <| elabTermEnsuringType prfStx (some goalProp)
+    catch _ =>
+      let prettyArr ← ppExpr arrExpr
+      let prettyIdx ← ppExpr idxNatExpr
+      throwErrorAt ref m!"cannot prove array index `{prettyIdx}` is in bounds for `{prettyArr}`.\n\
+        Use `if {prettyIdx} < ({prettyArr}).size` or `if let i = ({prettyArr}).findIndex(...)` before indexing."
+  let hasErr := ((← Core.getMessageLog).toList.drop preMsgs).any (·.severity == .error)
+  if hasErr then return prfExpr else wrapAuxProof goalProp prfExpr
 
 open Lean Meta Elab Term in
 private def elabArrAndIdx (arrStx idxStx : Term) (opDesc : String) : TermElabM (Expr × Expr × Expr) := do
@@ -364,7 +379,8 @@ def elabSrvSetElem : TermElab := fun stx expectedType? => do
 /-! ## Automated Server Invariant Prover (`qedSrvProveStep`) -/
 
 open Lean Meta Elab Tactic in
-private def splitAndHyps : TacticM Unit := do
+private def splitAndHyps : TacticM Bool := do
+  let mut didSplit := false
   for _ in [0:32] do
     let g ← getMainGoal
     let lctx ← g.withContext getLCtx
@@ -376,7 +392,9 @@ private def splitAndHyps : TacticM Unit := do
           let subgoals ← g.cases decl.fvarId
           replaceMainGoal (subgoals.toList.map (·.mvarId))
           splitOne := true
+          didSplit := true
     unless splitOne do break
+  return didSplit
 
 syntax "qedSrvFinishAtom" : tactic
 
@@ -443,7 +461,7 @@ syntax "qedSrvSplitHyps" : tactic
 
 open Lean Meta Elab Tactic in
 elab_rules : tactic
-  | `(tactic| qedSrvSplitHyps) => splitAndHyps
+  | `(tactic| qedSrvSplitHyps) => discard splitAndHyps
 
 syntax "qedSimpHypsEach" : tactic
 
@@ -452,23 +470,36 @@ elab_rules : tactic
   | `(tactic| qedSimpHypsEach) => do
       let g ← getMainGoal
       let lctx ← g.withContext getLCtx
-      let mut names : Array Name := #[]
+      let mut hIds : Array Ident := #[]
       for decl in lctx do
         if !decl.isImplementationDetail && !decl.isLet && !decl.userName.hasMacroScopes then
           if (← g.withContext (try isProp decl.type catch _ => pure false)) then
-            names := names.push decl.userName
-      for nm in names do
-        if (← getUnsolvedGoals).isEmpty then return
-        let hId := mkIdent nm
-        evalTactic (← `(tactic|
-          try simp (config := { zetaDelta := true }) only
-            [id_eq, ne_eq, Prod.mk.injEq, Option.some.injEq, Except.ok.injEq, Except.error.injEq, reduceCtorEq,
-             Qed.Server.srvGetAt_eq, Qed.Server.SrvVal.val_field, Qed.Server.SrvVal.val_id,
-             Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
-             Qed.Server.SrvLiftOpt.liftOpt_opt, Qed.Server.SrvLiftOpt.liftOpt_val,
-             Array.size_set, Array.size_push,
-             Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
-             beq_iff_eq, bne_iff_ne, decide_eq_true_eq] at $hId:ident))
+            hIds := hIds.push (mkIdent decl.userName)
+      if !hIds.isEmpty then
+        let batchOk ← try
+            evalTactic (← `(tactic|
+              simp (config := { zetaDelta := true }) only
+                [id_eq, ne_eq, Prod.mk.injEq, Option.some.injEq, Except.ok.injEq, Except.error.injEq, reduceCtorEq,
+                 Qed.Server.srvGetAt_eq, Qed.Server.SrvVal.val_field, Qed.Server.SrvVal.val_id,
+                 Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
+                 Qed.Server.SrvLiftOpt.liftOpt_opt, Qed.Server.SrvLiftOpt.liftOpt_val,
+                 Array.size_set, Array.size_push,
+                 Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
+                 beq_iff_eq, bne_iff_ne, decide_eq_true_eq] at $[$hIds:ident]*))
+            pure true
+          catch _ => pure false
+        unless batchOk do
+          for hId in hIds do
+            if (← getUnsolvedGoals).isEmpty then return
+            evalTactic (← `(tactic|
+              try simp (config := { zetaDelta := true }) only
+                [id_eq, ne_eq, Prod.mk.injEq, Option.some.injEq, Except.ok.injEq, Except.error.injEq, reduceCtorEq,
+                 Qed.Server.srvGetAt_eq, Qed.Server.SrvVal.val_field, Qed.Server.SrvVal.val_id,
+                 Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
+                 Qed.Server.SrvLiftOpt.liftOpt_opt, Qed.Server.SrvLiftOpt.liftOpt_val,
+                 Array.size_set, Array.size_push,
+                 Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
+                 beq_iff_eq, bne_iff_ne, decide_eq_true_eq] at $hId:ident))
       if (← getUnsolvedGoals).isEmpty then return
       evalTactic (← `(tactic|
         try simp (config := { zetaDelta := true }) only
@@ -492,9 +523,11 @@ elab_rules : tactic
         try qedSrvSplitHyps
         try qedSimpHypsEach
         try subst_vars
-        qedDsimpCodecs
-        try qedSrvSplitHyps
-        try qedSimpHypsEach
+        qedDsimpCodecs)))
+      if (← getUnsolvedGoals).isEmpty then return
+      if (← try splitAndHyps catch _ => pure false) then
+        evalTactic (← `(tactic| try qedSimpHypsEach))
+      evalTactic (← `(tactic| (
         try (repeat' (apply And.intro))
         all_goals (
           try (apply Array.forall_set; first | assumption | (simp [*]; done) | (simp_all; done))

@@ -28,7 +28,7 @@ python3 test/mock_llm.py 8000 .qed/dev
 QED_WEB_ROOT=Examples.CloudBooks ./scripts/qed build --dev
 ```
 
-Run all proof/environment checks and the 21 automated test suites from the repo root:
+Run all proof/environment checks and the 15 automated test suites from the repo root:
 
 ```bash
 ./scripts/qed check
@@ -97,11 +97,8 @@ These files support the test suites and benchmarks rather than introducing new a
 
 - **`*Web.lean` / [Web.lean](Web.lean)** — Minimal `Qed.run` browser entrypoints selected with
   `QED_WEB_ROOT`. `Web.lean` defaults to `Counter.app`.
-- **SSR substrates** — [UsersSSR.lean](UsersSSR.lean) and [TemplateSSR.lean](TemplateSSR.lean) are
-  small native binaries used by `test/ssr_dynamic_test.mjs` and `test/ssr_template_test.mjs`.
-  Standard SSR apps use the `ssr.mjs` handler emitted automatically by `qed build`.
 - **Compiler & proof suites** — [SyntaxChecks.lean](SyntaxChecks.lean),
-  [ServerChecks.lean](ServerChecks.lean), [JsGate.lean](JsGate.lean), [JsProbe.lean](JsProbe.lean),
+  [ServerChecks.lean](ServerChecks.lean), [JsGate.lean](JsGate.lean),
   and [DomProbe.lean](DomProbe.lean) check compile-time errors and JS/DOM equivalence.
 - **Benchmarks** — [Bench/](Bench/) contains pipeline and view-layer benchmarks, run via
   `lake exe bench`, `test/bench_react.mjs`, and `test/bench_template.mjs`.

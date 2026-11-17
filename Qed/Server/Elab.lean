@@ -533,6 +533,8 @@ private def readPathTerm (sCur : Ident) (rootField : Ident) (steps : Array LValS
 open Lean Elab Command in
 private def buildUpdatedState (sCur : Ident) (rootField : Ident) (steps : Array LValStep)
     (leafNewTerm : Term) : CommandElabM Term := do
+  if steps.isEmpty then
+    return ← `({ $sCur with $rootField:ident := srvAutoField($leafNewTerm) })
   let rec go (idx : Nat) (container : Term) : CommandElabM Term := do
     if h : idx < steps.size then
       match steps[idx] with
@@ -545,7 +547,7 @@ private def buildUpdatedState (sCur : Ident) (rootField : Ident) (steps : Array 
           let updatedElem ← go (idx + 1) elem
           `(srvSetElem($container, $idxT, $updatedElem))
     else
-      `(srvAutoField($leafNewTerm))
+      pure leafNewTerm
   let rootContainer ← `(($sCur).$rootField:ident)
   let updatedRoot ← go 0 rootContainer
   `({ $sCur with $rootField:ident := $updatedRoot })

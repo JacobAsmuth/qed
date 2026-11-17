@@ -18,11 +18,17 @@ At the pure `Html` and `View` layer:
   their signal indices so sibling bindings stay aligned, and a branch that remains hidden stays
   structurally stable regardless of changes inside it.
 
-In [`Qed/Proofs/`](../Qed/Proofs) (`DomArena.lean`, `ViewPatch.lean`, `KeyedReconcile.lean`, `Hydration.lean`), these theorems are lifted to the
+In [`Qed/Proofs/`](../Qed/Proofs) (`DomArena.lean`, `KeyedReconcile.lean`, `ViewPatch.lean`, `Hydration.lean`), these theorems are lifted to the
 imperative `MonadDom` driver (`Qed/Driver/`). Evaluated against a pure W3C DOM arena
-(`SpecDom`), Qed proves that initial mounts (`buildDomM`), text-run hydration, W3C
-`insertBefore` keyed moves, fine-grained `.dyn` updates, `V.memo` skipping, and SSR rehydration
-(`App.ssr_rehydrate_equiv`) produce the exact DOM tree specified by `Html.render`.
+(`SpecDom`), Qed proves via unified `CleanDomSubtree`/`VStateValid` invariants that initial
+mounts (`buildDomM`/`buildViewM`), positional/keyed tree patching (`applyToDomM`, `patchHtmlSubtreeM`),
+full incremental view patching (`patchViewM`), template row/signal alignment (`alignRows_spec`,
+`diffRowSigs_sound`, `seedRowsM_spec`, `renderSig_resolved_spec`), runtime handler/local-cell/FIFO
+queue specs, text-run hydration (`hydrateDomM`/`hydrateViewM`), `V.memo` skipping, and end-to-end
+SSR rehydration + client patching (`App.ssr_rehydrate_equiv`, `App.ssr_hydrate_patch_equiv`) produce
+the exact DOM tree specified by `Html.render`. Component elaboration (`Qed/Component/Elab.lean`)
+also emits `<Comp>.app_view_eq` via verified template lifting (`Qed/View/Lift.lean`) and
+transports view invariants (`<inv>_app`) onto `App.view` through `canonical_congr_pred`.
 
 ### Tail-recursive compilation (`@[csimp]`)
 

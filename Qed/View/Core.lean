@@ -1,7 +1,7 @@
 import Qed.Render
 import Qed.Diff
 import Qed.Style
-import Qed.Router
+import Qed.Notation
 import Std.Data.HashSet
 
 namespace Qed
@@ -201,6 +201,11 @@ def VAttr.eval (s : σ) : VAttr σ msg → Attr msg
   | .bind f          => f s
   | .dynVal attr get => .attr attr (get s)
 
+@[simp] theorem VAttr.eval_stat (s : σ) (a : Attr msg) : VAttr.eval s (.stat a) = a := rfl
+@[simp] theorem VAttr.eval_bind (s : σ) (f : σ → Attr msg) : VAttr.eval s (.bind f) = f s := rfl
+@[simp] theorem VAttr.eval_dynVal {msg : Type} (s : σ) (k : String) (g : σ → String) :
+    (VAttr.dynVal k g : VAttr σ msg).eval s = .attr k (g s) := rfl
+
 def VAttr.mapScope (f : σ' → σ) : VAttr σ msg → VAttr σ' msg
   | .stat a          => .stat a
   | .bind g          => .bind (fun s' => g (f s'))
@@ -217,6 +222,12 @@ def withKey (k : String) : Html msg → Html msg
 @[simp] theorem Html.validIn_withKey (ctx : HtmlCtx) (k : String) (h : Html msg) :
     Html.validIn ctx (withKey k h) = Html.validIn ctx h := by
   cases h <;> simp [withKey, Html.validIn, Attr.valid]
+
+@[simp] theorem Html.canonical_withKey (k : String) (h : Html msg) :
+    Html.canonical (withKey k h) = Html.canonical h := by
+  cases h with
+  | text _ => rfl
+  | element t as cs => simp [withKey, Html.canonical, mkCanonicalElem, Attr.canonical]
 
 mutual
   def View.mapScope (f : σ' → σ) : View σ msg → View σ' msg
@@ -466,6 +477,72 @@ end
   | [], _, _, _ => rfl
   | _ :: _, _, _, _ => rfl
 
+@[simp] theorem renderSigAttrs_canonical (s : σ) (pre : String) :
+    ∀ (attrs : List (VAttr σ msg)) (n : Nat),
+      (renderSigAttrs s pre attrs n).1.filterMap Attr.canonical =
+        (attrs.map (VAttr.eval s)).filterMap Attr.canonical
+  | [], _ => rfl
+  | va :: rest, n => by
+      cases va with
+      | stat a =>
+          simp only [renderSigAttrs, List.map, VAttr.eval, List.filterMap]
+          cases Attr.canonical a <;> simp [renderSigAttrs_canonical s pre rest n]
+      | bind f =>
+          simp only [renderSigAttrs, List.map, VAttr.eval, List.filterMap]
+          cases Attr.canonical (f s) <;> simp [renderSigAttrs_canonical s pre rest n]
+      | dynVal attr get =>
+          simp [renderSigAttrs, VAttr.eval, Attr.canonical,
+                renderSigAttrs_canonical s pre rest (n + 1)]
+
+@[simp] theorem onlySignalBind_renderSigAttrs (s : σ) (pre : String) :
+    ∀ (attrs : List (VAttr σ msg)) (n : Nat),
+      onlySignalBind (renderSigAttrs s pre attrs n).1 =
+        onlySignalBind (attrs.map (VAttr.eval s))
+  | [], _ => rfl
+  | [va], _ => by cases va <;> simp [renderSigAttrs, VAttr.eval, onlySignalBind]
+  | va1 :: va2 :: rest, n => by
+      cases va1 with
+      | stat a =>
+          simp only [renderSigAttrs, List.map, VAttr.eval]
+          cases a with
+          | key _ => exact onlySignalBind_renderSigAttrs s pre (va2 :: rest) n
+          | _ => rfl
+      | bind f =>
+          simp only [renderSigAttrs, List.map, VAttr.eval]
+          generalize f s = a
+          cases a with
+          | key _ => exact onlySignalBind_renderSigAttrs s pre (va2 :: rest) n
+          | _ => rfl
+      | dynVal _ _ => rfl
+
+mutual
+  @[simp] theorem View.canonical_renderSig :
+      ∀ (v : View σ msg) (s : σ) (pre : String) (n : Nat),
+        Html.canonical (View.renderSig v s pre n).1 = Html.canonical (View.render v s)
+    | .text _, _, _, _ => rfl
+    | .dyn _, _, _, _ => rfl
+    | .element tag attrs kids, s, pre, n => by
+        simp only [View.renderSig, View.render, Html.canonical, mkCanonicalElem,
+              renderSigAttrs_canonical, onlySignalBind_renderSigAttrs,
+              View.canonicalList_renderSigList kids s pre]
+    | .ifElse cond y no, s, pre, n => by
+        by_cases h : cond s = true <;>
+          simp [View.renderSig, View.render, h, View.canonical_renderSig]
+    | .keyedList .., _, _, _ => rfl
+    | .static _, _, _, _ => rfl
+    | .dynNode _, _, _, _ => rfl
+    | .memo _, _, _, _ => rfl
+
+  @[simp] theorem View.canonicalList_renderSigList :
+      ∀ (ks : List (View σ msg)) (s : σ) (pre : String) (n : Nat),
+        Html.canonicalList (View.renderSigList ks s pre n).1 = Html.canonicalList (View.renderEach ks s)
+    | [], _, _, _ => rfl
+    | k :: ks, s, pre, n => by
+        simp [View.renderSigList, View.renderEach,
+              View.canonical_renderSig k s pre n,
+              View.canonicalList_renderSigList ks s pre]
+end
+
 @[simp] theorem View.render_showIf (cond : σ → Bool) (child : View σ msg) (s : σ) :
     (View.showIf cond child).render s = (if cond s then child.render s else .text "") := rfl
 
@@ -564,6 +641,26 @@ def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → S
   dsimp only [forEach]
   split <;> rfl
 
+private theorem zipIdx_map_fst {α β : Type _} (g : α → β) :
+    ∀ (xs : List α) (k : Nat), (xs.zipIdx k).map (fun p => g p.1) = xs.map g
+  | [], _ => rfl
+  | _ :: xs, k => by simp [List.zipIdx, zipIdx_map_fst g xs (k + 1)]
+
+@[simp] theorem canonical_render_forEach {α : Type} (tag : String) (items : σ → Array α)
+    (key : α → String) (child : View α msg) (attrs : List (VAttr σ msg))
+    (sigPrefix : String) (s : σ) :
+    Html.canonical ((forEach tag items key child attrs sigPrefix).render s) =
+      mkCanonicalElem tag (attrs.map (VAttr.eval s))
+        ((items s).toList.map fun a => Html.canonical (child.render a)) := by
+  rw [render_forEach, Html.canonical_element]
+  by_cases h : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
+      (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))) = true
+  · simp [h, Array.toList_map]
+  · have hf : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
+        (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))) = false := Bool.eq_false_iff.2 h
+    simp [hf]
+    rw [zipIdx_map_fst (fun a => (child.render a).canonical) (items s).toList 0]
+
 end V
 
 class ForEachItems (c : Type) (α : outParam Type) where
@@ -583,6 +680,12 @@ class ForEachItems (c : Type) (α : outParam Type) where
 
 @[simp] theorem ForEachItems.toList_list {α : Type} (l : List α) :
     ForEachItems.toList l = l := rfl
+
+@[simp] theorem ForEachItems.toArray_array_toList {α : Type} (a : Array α) :
+    (ForEachItems.toArray a).toList = a.toList := rfl
+
+@[simp] theorem ForEachItems.toArray_list_toList {α : Type} (l : List α) :
+    (ForEachItems.toArray l).toList = l := by simp [ForEachItems.toArray]
 
 @[reducible] def mapList {α β : Type} (l : List α) (f : α → β) : List β := l.map f
 

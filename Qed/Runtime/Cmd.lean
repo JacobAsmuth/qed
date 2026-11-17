@@ -1,7 +1,7 @@
 import Qed.Html
 import Qed.Date
 import Qed.Proto
-import Qed.Router
+import Qed.Router.Basic
 
 namespace Qed
 

@@ -356,9 +356,9 @@ private def mkDraftProtoCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
     ← `(command| def $fromId (fs : List (Nat × Proto.WireVal)) : Except String $draftId := do
           $[let $fs:ident ← $decodes:term]*
           return { $[$fs:ident],* }),
-    ← `(command| instance : ToProto $draftId   := .ofFields $toId),
-    ← `(command| instance : FromProto $draftId := .ofFields $fromId),
-    ← `(command| instance : LawfulProto $draftId :=
+    ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instToProto)):ident : ToProto $draftId := .ofFields $toId),
+    ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instFromProto)):ident : FromProto $draftId := .ofFields $fromId),
+    ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instLawfulProto)):ident : LawfulProto $draftId :=
           .ofFields $toId $fromId (fun x => $tagsPosPf) fun x => by
             $[$pHaveTacs:tactic]*
             unfold $fromId $toId
@@ -402,11 +402,11 @@ private def mkSchemaProtoCmds (t : Ident) (cbns : Array Ident) (cbts : Array Ter
           (Proto.decodeFieldsSpec b).bind ($fromApp)) ]
   if !cbns.isEmpty then return baseCmds
   let instBase : Array (TSyntax `command) := #[
-    ← `(command| instance : ToProto $t   := .ofFields $toId),
-    ← `(command| instance : FromProto $t := .ofFields $fromId) ]
+    ← `(command| instance $(mkIdent (tId ++ `instToProto)):ident : ToProto $t := .ofFields $toId),
+    ← `(command| instance $(mkIdent (tId ++ `instFromProto)):ident : FromProto $t := .ofFields $fromId) ]
   if !allLawfulProto then return baseCmds ++ instBase
   let lawCmds : Array (TSyntax `command) := #[
-    ← `(command| instance : LawfulProto $t :=
+    ← `(command| instance $(mkIdent (tId ++ `instLawfulProto)):ident : LawfulProto $t :=
           .ofFields $toId $fromId (fun x => $tagsPosPf) fun x => by
             $[$pHaveTacs:tactic]*
             unfold $fromId $toId
@@ -458,11 +458,10 @@ private def mkDraftCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
     ← `(command| def $draftFromId (j : Json) : Except String $draftId := do
           $[let $fs:ident ← $draftJsonDecodes:term]*
           return { $[$fs:ident],* }),
-    ← `(command| instance : ToJson $draftId := ⟨$draftToJsonId⟩),
-    ← `(command| instance : FromJson $draftId := ⟨$draftFromId⟩),
-    ← `(command| instance : NonNullJson $draftId where
-          toJson_ne_null _ := nofun),
-    ← `(command| instance : LawfulJson $draftId where
+    ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instToJson)):ident : ToJson $draftId := ⟨$draftToJsonId⟩),
+    ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instFromJson)):ident : FromJson $draftId := ⟨$draftFromId⟩),
+    ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instNonNullJson)):ident : NonNullJson $draftId := ⟨fun _ => nofun⟩),
+    ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instLawfulJson)):ident : LawfulJson $draftId where
           depthBound := 1
           depth_toJson x := Nat.add_le_add_left $draftDepthProof 1
           fromJson_toJson x := by
@@ -571,7 +570,7 @@ private def mkSchemaJsonCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
     else `(term| LawfulJson.fromField_of_field ($toJsonId x) $keyLit (x.$f) rfl)
   let lawfulCmds : Array (TSyntax `command) ← if allLawful then
     pure #[← `(command|
-      instance : LawfulJson $t where
+      instance $(mkIdent (tId ++ `instLawfulJson)):ident : LawfulJson $t where
         depthBound := 1 + $depthBoundExpr
         depth_toJson x := Nat.add_le_add_left $depthProofExpr 1
         fromJson_toJson x := by
@@ -581,10 +580,9 @@ private def mkSchemaJsonCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
           exact h)]
   else pure #[]
   let jsonInstCmds : Array (TSyntax `command) := #[
-    ← `(command| instance : ToJson $t := ⟨$toJsonId⟩),
-    ← `(command| instance : FromJson $t := ⟨$fromJsonId⟩),
-    ← `(command| instance : NonNullJson $t where
-          toJson_ne_null _ := nofun) ] ++ lawfulCmds
+    ← `(command| instance $(mkIdent (tId ++ `instToJson)):ident : ToJson $t := ⟨$toJsonId⟩),
+    ← `(command| instance $(mkIdent (tId ++ `instFromJson)):ident : FromJson $t := ⟨$fromJsonId⟩),
+    ← `(command| instance $(mkIdent (tId ++ `instNonNullJson)):ident : NonNullJson $t := ⟨fun _ => nofun⟩) ] ++ lawfulCmds
   return jsonFnCmds ++ jsonInstCmds
 
 open Lean Elab Command Term in

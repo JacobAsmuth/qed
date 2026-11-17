@@ -1,6 +1,20 @@
-import { withBrowser, sleep } from './harness.mjs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { buildDevAsync, send, withBrowser } from './harness.mjs';
 
-await withBrowser('TEMPLATE', { webRoot: 'Examples.TemplateWeb' }, async ({ page, check, baseUrl }) => {
+const dir = await buildDevAsync('Examples.TemplateWeb');
+const ssrMod = await import(pathToFileURL(path.join(dir, 'ssr.mjs')).href);
+const shell = (await (await ssrMod.default(new Request('http://127.0.0.1/'))).text())
+  .replace('class="count"', 'class="count" data-server="1"');
+if (!shell.includes('data-server')) throw new Error('could not mark server node');
+
+await withBrowser('TEMPLATE', {
+  dir,
+  routes: (req, res, url) => {
+    if (url.pathname === '/ssr') { send(res, 200, 'text/html', shell); return true; }
+    return false;
+  },
+}, async ({ page, check, baseUrl }) => {
   await page.goto(`${baseUrl}/index.html`, { waitUntil: 'load' });
   await page.waitForSelector('#app .demo', { timeout: 20000 });
 
@@ -42,10 +56,7 @@ await withBrowser('TEMPLATE', { webRoot: 'Examples.TemplateWeb' }, async ({ page
   check('input echoes the model', await page.$eval('input', (e) => e.value), 'Ada');
   check('caret kept at end while typing', await page.$eval('input', (e) => e.selectionStart), 3);
   check('showIf revealed the greeting', await greeting(), ['Hello, Ada!']);
-  await page.$eval('input', (e) => { e.value = ''; });
-  await page.type('input', ' ', { delay: 10 });
   await page.$eval('input', (e) => { e.value = ''; e.dispatchEvent(new Event('input', { bubbles: true })); });
-  await sleep(30);
   check('showIf hid the greeting when empty', await greeting(), []);
 
   await page.evaluate(() => [...document.querySelectorAll('.demo ul.todos li')][1].click());
@@ -64,11 +75,10 @@ await withBrowser('TEMPLATE', { webRoot: 'Examples.TemplateWeb' }, async ({ page
 
   const editSel = '.demo ul.edit li:nth-child(1) input.editor';
   await page.evaluate(() => document.querySelector('.demo ul.edit li:nth-child(1) .label').click());
-  await sleep(20);
+  await page.waitForSelector(editSel, { timeout: 4000 });
   check('inline edit: row 0 became a controlled input', (await page.$(editSel)) !== null, true);
   await page.$eval(editSel, (e) => { e.dataset.tag = 'editsentinel'; e.focus(); e.setSelectionRange(e.value.length, e.value.length); });
-  await page.type(editSel, 'ZZ', { delay: 15 });
-  await sleep(20);
+  await page.type(editSel, 'ZZ', { delay: 10 });
   check('inline edit: input node survived typing (NOT rebuilt)',
     await page.$eval(editSel, (e) => e.dataset.tag), 'editsentinel');
   check('inline edit: input still has focus after typing',
@@ -76,4 +86,20 @@ await withBrowser('TEMPLATE', { webRoot: 'Examples.TemplateWeb' }, async ({ page
   check('inline edit: controlled value reflects the typing', await page.$eval(editSel, (e) => e.value), 'learn LeanZZ');
   check('inline edit: model received the edit (other lists show new text)',
     await page.$eval('.demo ul.todos li:nth-child(1)', (e) => e.textContent), 'learn LeanZZ');
+
+  // SSR hydration & server node adoption
+  await page.goto(`${baseUrl}/ssr`, { waitUntil: 'load' });
+  await page.waitForSelector('#app .count', { timeout: 15000 });
+  await page.waitForFunction(() => Boolean(window.qed), { timeout: 5000 });
+  const adopted = () => page.$eval('#app .count', (e) => e.getAttribute('data-server') === '1');
+  const rowDone = (i) => page.$eval(`.demo ul.todos li:nth-child(${i + 1})`, (e) => e.className === 'done');
+
+  check('SSR count starts 0', await count(), '0');
+  check('hydration adopted server node (data-server survived)', await adopted(), true);
+  check('SSR row 0 (done) hydrated with its class', await rowDone(0), true);
+  await clickText('+');
+  check('clicking + after hydration increments', await count(), '1');
+  check('adopted count node survived update', await adopted(), true);
+  await page.evaluate(() => [...document.querySelectorAll('.demo ul.todos li')][1].click());
+  check('toggling a row after hydration flips its class', await rowDone(1), true);
 });

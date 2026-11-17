@@ -1,16 +1,27 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, writeFileSync, copyFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, copyFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const gate = path.join(root, 'test', '.gate');
 mkdirSync(gate, { recursive: true });
-const run = (cmd, args) => execFileSync(cmd, args, { cwd: root, encoding: 'utf8', maxBuffer: 64 << 20 });
+const elanBin = path.join(process.env.HOME || '', '.elan', 'bin');
+const PATH = elanBin && !(process.env.PATH || '').split(':').includes(elanBin)
+  ? `${elanBin}:${process.env.PATH || ''}` : (process.env.PATH || '');
+const run = (cmd, args, env = { ...process.env, PATH }) =>
+  execFileSync(cmd, args, { cwd: root, env, encoding: 'utf8', maxBuffer: 64 << 20 });
+
+const qedjsBin = path.join(root, '.lake/build/bin/qedjs');
+if (process.env.QED_PREBUILT !== '1' || !existsSync(qedjsBin)) {
+  run('lake', ['build', 'Examples.JsGate', 'qedjs']);
+}
+const LEAN_PATH = process.env.LEAN_PATH || run('lake', ['env', 'printenv', 'LEAN_PATH']).trim();
+const gateEnv = { ...process.env, PATH, LEAN_PATH };
 
 const oraclePath = path.join(gate, 'oracle.lean');
 writeFileSync(oraclePath, 'import Examples.JsGate\ndef main : IO Unit := JsGate.emitOracle\n');
-const oracleText = run('lake', ['env', 'lean', '--run', oraclePath]);
+const oracleText = run('lean', ['--run', oraclePath], gateEnv);
 const want = new Map();
 for (const line of oracleText.split('\n')) {
   const t = line.split('\t');
@@ -18,8 +29,8 @@ for (const line of oracleText.split('\n')) {
 }
 
 const appPath = path.join(gate, 'app.mjs');
-run('lake', ['env', path.join(root, '.lake/build/bin/qedjs'), appPath, 'Examples.JsGate', '--',
-  'JsGate.run:run', 'JsGate.counts:counts', 'JsGate.probeCount:probeCount', 'JsGate.names:names']);
+run(qedjsBin, [appPath, 'Examples.JsGate', '--',
+  'JsGate.run:run', 'JsGate.counts:counts', 'JsGate.probeCount:probeCount', 'JsGate.names:names'], gateEnv);
 copyFileSync(path.join(root, 'runtime/qed_rt.mjs'), path.join(gate, 'qed_rt.mjs'));
 
 const P = await import(path.join(gate, 'app.mjs'));

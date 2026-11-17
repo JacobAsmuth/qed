@@ -48,7 +48,7 @@ fi
 
 # 3. Build the CLI (auto-installs the pinned Lean toolchain on first run).
 info "building the qed CLI"
-( cd "${SRC}" && lake build qed )
+( cd "${SRC}" && lake build qed qedjs Qed Qed.Driver QedServer )
 
 # 4. Install the launcher on PATH.
 mkdir -p "${BIN}"

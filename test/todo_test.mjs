@@ -1,4 +1,4 @@
-import { withBrowser, sleep } from './harness.mjs';
+import { withBrowser } from './harness.mjs';
 
 await withBrowser('TODO', { webRoot: 'Examples.TodoWeb' }, async ({ page, check, baseUrl }) => {
   await page.goto(`${baseUrl}/index.html`, { waitUntil: 'load' });
@@ -8,19 +8,15 @@ await withBrowser('TODO', { webRoot: 'Examples.TodoWeb' }, async ({ page, check,
   const texts = () => page.$$eval('#app .todo .row .item', (els) => els.map((e) => e.textContent));
   const dones = () => page.$$eval('#app .todo .row .item', (els) => els.map((e) => e.classList.contains('done')));
   const markAt = (n) => page.$eval(`#app .todo .row:nth-child(${n})`, (el) => el.dataset.mark || '');
-  const addItem = async (t) => { await page.type(NEW, t); await page.click('#app .addbtn'); await sleep(40); };
+  const addItem = async (t) => { await page.type(NEW, t); await page.click('#app .addbtn'); };
   const tagRow = (t, mark) => page.$$eval('#app .todo .row', (els, t, mark) => {
     const li = els.find((e) => e.querySelector('.item').textContent === t);
     if (li) li.dataset.mark = mark;
   }, t, mark);
-  const dispatchChild = async (t, childSel) => {
-    const id = await page.$$eval('#app .todo .row', (els, t, childSel) => {
-      const li = els.find((e) => e.querySelector('.item').textContent === t);
-      return li ? li.querySelector(childSel).getAttribute('data-qed-on-click') : null;
-    }, t, childSel);
-    await page.evaluate((i) => window.qed.dispatch(Number(i)), id);
-    await sleep(50);
-  };
+  const dispatchChild = (t, childSel) => page.evaluate((t, childSel) => {
+    const li = [...document.querySelectorAll('#app .todo .row')].find((e) => e.querySelector('.item').textContent === t);
+    window.qed.dispatch(Number(li.querySelector(childSel).getAttribute('data-qed-on-click')));
+  }, t, childSel);
   const toggle = (t) => dispatchChild(t, '.item');
   const remove = (t) => dispatchChild(t, '.rm');
 
@@ -40,7 +36,7 @@ await withBrowser('TODO', { webRoot: 'Examples.TodoWeb' }, async ({ page, check,
   await addItem('delta');
   await toggle('delta');
   await tagRow('delta', 'delta-node');
-  await page.click('#app .sortbtn'); await sleep(50);
+  await page.click('#app .sortbtn');
   check('sorted alphabetically', await texts(), ['alpha', 'delta', 'gamma']);
   check('moved row kept its DOM node across the sort', await markAt(2), 'delta-node');
   check('moved row kept its component state (still done)', (await dones())[1], true);

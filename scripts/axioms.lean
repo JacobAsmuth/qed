@@ -13,7 +13,7 @@ import Examples.Live
 import Examples.Socket
 import Examples.CloudBooks
 
-#print axioms counterSafe
+#print axioms Counter.counterSafe
 #print axioms Booking.bookedNeedsToday
 #print axioms TemplateDemo.idsBelowNext
 #print axioms Live.nonNegative
@@ -196,3 +196,37 @@ import Examples.CloudBooks
 #print axioms Js.Proofs.ctxJs_fallback_startsWith_dollar
 #print axioms Js.Proofs.mangle_chars_safe
 #print axioms Js.Proofs.assignProgramNames_invariant
+#print axioms Js.Proofs.ident_ne_jsKeyword
+#print axioms Js.Proofs.jsStr_safe
+#print axioms Js.Proofs.reach_closed
+#print axioms Js.Proofs.reach_verifyNoServerLeak_sound
+#print axioms Js.Proofs.noTailCont_of_hasJpSelfTail_false
+#print axioms Js.Proofs.lowerDecl_equiv
+#print axioms Js.Proofs.projTransfer_prefix_equiv
+
+#print axioms Qed.Html.canonicalList_eq_map
+#print axioms Qed.hasTag_canonical
+#print axioms Qed.canonical_congr_pred
+#print axioms Counter.app_view_eq
+#print axioms Booking.app_view_eq
+#print axioms Qed.CleanDomSubtree_equiv
+#print axioms Qed.applyPositionalStepsM_spec
+#print axioms Qed.applyToDomM_spec
+#print axioms Qed.patchHtmlSubtreeM_spec
+#print axioms Qed.applyDynAttrsM_spec
+#print axioms Qed.buildViewM_eq_buildDomM
+#print axioms Qed.buildViewM_vstate_spec
+#print axioms Qed.patchViewM_spec
+#print axioms Qed.patchViewKidsM_spec
+#print axioms Qed.alignRows_spec
+#print axioms Qed.diffRowSigs_sound
+#print axioms Qed.seedRowsM_spec
+#print axioms Qed.renderSig_resolved_spec
+#print axioms Qed.registerHandlerSpec_sound
+#print axioms Qed.localMountSpec_init_vs_rerender
+#print axioms Qed.gcLocalsSpec_frame
+#print axioms Qed.snapshot_restore_locals_roundtrip
+#print axioms Qed.drainPendingQueue_fifo_spec
+#print axioms Qed.hydrateViewM_eq_hydrateDomM
+#print axioms Qed.hydrateViewM_spec
+#print axioms Qed.App.ssr_hydrate_patch_equiv

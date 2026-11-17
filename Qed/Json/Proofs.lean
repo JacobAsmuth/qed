@@ -6,7 +6,7 @@ mutual
   theorem parseVal_depth_le :
       ∀ (fuel budget : Nat) (cs : List Char) (j : Json) (r : List Char),
         parseVal fuel budget cs = .ok (j, r) → j.depth ≤ budget
-    | 0,        _,      _,  _, _, h => by simp [parseVal] at h
+    | 0,        _,      _,  _, _, h => nomatch h
     | fuel + 1, budget, cs, j, r, h => by
         simp only [parseVal] at h
         repeat' split at h
@@ -14,20 +14,18 @@ mutual
           | contradiction
           | (simp only [Except.ok.injEq, Prod.mk.injEq] at h
              obtain ⟨rfl, rfl⟩ := h
+             simp only [Json.depth, Json.maxArr, Json.maxObj]
              first
-               | (simp only [Json.depth, Json.maxArr, Json.maxObj]; omega)
-               | (simp only [Json.depth]
-                  have hb := Json.maxArr_le_iff.mpr
-                    (fun e he => parseElems_depth_le _ _ _ _ _ (by assumption) e he)
-                  omega)
-               | (simp only [Json.depth]
-                  have hb := Json.maxObj_le_iff.mpr
-                    (fun kv hkv => parseMembers_depth_le _ _ _ _ _ (by assumption) kv hkv)
-                  omega))
+               | exact Nat.zero_le _
+               | omega
+               | refine Nat.le_trans (Nat.add_le_add_left (Json.maxArr_le_iff.mpr fun e he =>
+                   parseElems_depth_le _ _ _ _ _ (by assumption) e he) 1) (by omega)
+               | refine Nat.le_trans (Nat.add_le_add_left (Json.maxObj_le_iff.mpr fun kv hkv =>
+                   parseMembers_depth_le _ _ _ _ _ (by assumption) kv hkv) 1) (by omega))
   theorem parseElems_depth_le :
       ∀ (fuel budget : Nat) (cs : List Char) (es : List Json) (r : List Char),
         parseElems fuel budget cs = .ok (es, r) → ∀ e ∈ es, e.depth ≤ budget
-    | 0,        _,      _,  _,  _, h => by simp [parseElems] at h
+    | 0,        _,      _,  _,  _, h => nomatch h
     | fuel + 1, budget, cs, es, r, h => by
         simp only [parseElems] at h
         repeat' split at h
@@ -46,7 +44,7 @@ mutual
   theorem parseMembers_depth_le :
       ∀ (fuel budget : Nat) (cs : List Char) (ms : List (String × Json)) (r : List Char),
         parseMembers fuel budget cs = .ok (ms, r) → ∀ kv ∈ ms, kv.2.depth ≤ budget
-    | 0,        _,      _,  _,  _, h => by simp [parseMembers] at h
+    | 0,        _,      _,  _,  _, h => nomatch h
     | fuel + 1, budget, cs, ms, r, h => by
         simp only [parseMembers] at h
         repeat' split at h

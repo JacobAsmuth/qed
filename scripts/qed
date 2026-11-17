@@ -16,11 +16,14 @@ export PATH="${HOME}/.elan/bin:${PATH}"
 export QED_HOME="${QED_HOME:-${PWD}}"
 export QED_WEB_ROOT="${QED_WEB_ROOT:-Examples.Web}"
 
-# Build the CLI (fast no-op when up to date), then hand off.
-if ! lake build qed >/dev/null 2>&1; then
-  echo "qed: failed to build the CLI" >&2
-  lake build qed   # re-run to show the error
-  exit 1
+# Build the CLI (skip `lake` altogether when `.lake/build/bin/qed` is newer than CLI sources).
+if [ ! -x .lake/build/bin/qed ] || \
+   [ -n "$(find Cli.lean Cli lakefile.lean lean-toolchain -newer .lake/build/bin/qed 2>/dev/null | head -1)" ]; then
+  if ! lake build qed >/dev/null 2>&1; then
+    echo "qed: failed to build the CLI" >&2
+    lake build qed   # re-run to show the error
+    exit 1
+  fi
 fi
 
 exec .lake/build/bin/qed "$@"

@@ -16,7 +16,7 @@ a handwritten proof.
 - **Forms and JSON.** From one schema, Qed generates the draft, form,
   validated type, and functions for reading and writing JSON.
 - **DOM updates.** For bindings it can track, Qed updates text and attributes
-  directly over a total `MonadDom` driver (`Qed/Proofs/DomEquiv.lean`). It uses a verified DOM
+  directly over a total `MonadDom` driver (`Qed/Proofs/`). It uses a verified DOM
   diff for structural changes.
 - **JavaScript output & kernel gate.** Builds verify the compiled `Lean.Environment`
   (`Js/VerifyEnv.lean`) to reject `sorryAx`, custom axioms, `unsafe`, `partial`, `while`,

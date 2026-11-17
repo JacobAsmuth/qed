@@ -14,10 +14,26 @@ inductive Item where
   | nest (selector : String) (body : List Item)
 deriving Inhabited
 
+@[inline] def isSafeCssAtomChar (c : Char) : Bool :=
+  c != '{' && c != '}' && c != ';' && c != '<' && c != '>'
+
+@[inline] def isSafeCssSelectorChar (c : Char) : Bool :=
+  c != '{' && c != '}' && c != ';' && c != '<'
+
+def sanitizeCssAtom (s : String) : String :=
+  let cs := s.toList
+  if cs.all isSafeCssAtomChar then s
+  else String.ofList (cs.filter isSafeCssAtomChar)
+
+def sanitizeCssSelector (s : String) : String :=
+  let cs := s.toList
+  if cs.all isSafeCssSelectorChar then s
+  else String.ofList (cs.filter isSafeCssSelectorChar)
+
 mutual
   def Item.render : Item → String
-    | .decl p v   => p ++ ": " ++ v ++ ";"
-    | .nest sel b => sel ++ " { " ++ Item.renderList b ++ " }"
+    | .decl p v   => sanitizeCssAtom p ++ ": " ++ sanitizeCssAtom v ++ ";"
+    | .nest sel b => sanitizeCssSelector sel ++ " { " ++ Item.renderList b ++ " }"
   def Item.renderList : List Item → String
     | []      => ""
     | [i]     => Item.render i
@@ -195,11 +211,16 @@ def css (body : List Item) : Style :=
 
 private def Style.rule (s : Style) : String := "." ++ s.className ++ " { " ++ s.raw ++ " }"
 
+private def joinLines : List String → String
+  | []      => ""
+  | [s]     => s
+  | s :: ss => s ++ "\n" ++ joinLines ss
+
 def renderTheme (tokens : List Item) : String :=
   let (decls, rules) := tokens.partition (fun | .decl _ _ => true | .nest _ _ => false)
   let root := if decls.isEmpty then [] else [":root { " ++ Item.renderList decls ++ " }"]
-  let resets := rules.map fun | .nest s b => s!":where({s}) \{ {Item.renderList b} }" | i => i.render
-  String.intercalate "\n" (root ++ resets)
+  let resets := rules.map fun | .nest s b => s!":where({sanitizeCssSelector s}) \{ {Item.renderList b} }" | i => i.render
+  joinLines (root ++ resets)
 
 @[inline] def theme (tokens : List Item) : Html msg :=
   el "style" [] [Html.text (escapeRawText (renderTheme tokens))]
@@ -207,6 +228,158 @@ def renderTheme (tokens : List Item) : String :=
 def renderStyleSheet (styles : List Style) : String :=
   let seen := (styles.foldl
     (fun acc s => if acc.any (·.className == s.className) then acc else s :: acc) []).reverse
-  String.intercalate "\n" (seen.map Style.rule)
+  joinLines (seen.map Style.rule)
+
+/-! ## CSS Injection & `<style>` Breakout Safety Proofs -/
+
+theorem sanitizeCssAtom_safe (s : String) :
+    ∀ c ∈ (sanitizeCssAtom s).toList, isSafeCssAtomChar c = true := by
+  unfold sanitizeCssAtom
+  dsimp only
+  by_cases h : s.toList.all isSafeCssAtomChar = true
+  · simp only [h, ↓reduceIte]
+    rw [List.all_eq_true] at h
+    exact h
+  · simp only [h, Bool.false_eq_true, ↓reduceIte, String.toList_ofList]
+    intro c hc
+    exact (List.mem_filter.1 hc).2
+
+theorem sanitizeCssSelector_safe (s : String) :
+    ∀ c ∈ (sanitizeCssSelector s).toList, isSafeCssSelectorChar c = true := by
+  unfold sanitizeCssSelector
+  dsimp only
+  by_cases h : s.toList.all isSafeCssSelectorChar = true
+  · simp only [h, ↓reduceIte]
+    rw [List.all_eq_true] at h
+    exact h
+  · simp only [h, Bool.false_eq_true, ↓reduceIte, String.toList_ofList]
+    intro c hc
+    exact (List.mem_filter.1 hc).2
+
+private theorem no_lt_implies_no_closeSeq :
+    ∀ (cs : List Char), (∀ c ∈ cs, c ≠ '<') → containsCloseSeqLoop false cs = false
+  | [], _ => rfl
+  | c :: rest, hno => by
+      have hc : c ≠ '<' := hno c (List.mem_cons_self ..)
+      have hcb : (c == '<') = false := beq_eq_false_iff_ne.2 hc
+      simpa [containsCloseSeqLoop, hcb] using
+        no_lt_implies_no_closeSeq rest (fun x hx => hno x (List.mem_cons_of_mem c hx))
+
+theorem containsCloseSeq_of_no_lt {s : String} (hno : ∀ c ∈ s.toList, c ≠ '<') :
+    containsCloseSeq s.toList = false :=
+  no_lt_implies_no_closeSeq s.toList hno
+
+private theorem str_append_no_lt {a b : String}
+    (ha : ∀ c ∈ a.toList, c ≠ '<') (hb : ∀ c ∈ b.toList, c ≠ '<') :
+    ∀ c ∈ (a ++ b).toList, c ≠ '<' := by
+  intro c hc
+  rw [String.toList_append, List.mem_append] at hc
+  exact hc.elim (ha c) (hb c)
+
+private theorem lit_no_lt (s : String) (h : s.toList.all (· != '<') = true) :
+    ∀ c ∈ s.toList, c ≠ '<' := by
+  rw [List.all_eq_true] at h
+  intro c hc
+  exact bne_iff_ne.1 (h c hc)
+
+private theorem sanitizeCssAtom_no_lt (s : String) :
+    ∀ c ∈ (sanitizeCssAtom s).toList, c ≠ '<' := by
+  intro c hc
+  have hs := sanitizeCssAtom_safe s c hc
+  simp only [isSafeCssAtomChar, Bool.and_eq_true, bne_iff_ne] at hs
+  exact hs.1.2
+
+private theorem sanitizeCssSelector_no_lt (s : String) :
+    ∀ c ∈ (sanitizeCssSelector s).toList, c ≠ '<' := by
+  intro c hc
+  have hs := sanitizeCssSelector_safe s c hc
+  simp only [isSafeCssSelectorChar, Bool.and_eq_true, bne_iff_ne] at hs
+  exact hs.2
+
+mutual
+  theorem Item.render_no_lt : ∀ (i : Item), ∀ c ∈ (Item.render i).toList, c ≠ '<'
+    | .decl p v => by
+        simp only [Item.render]
+        exact str_append_no_lt
+          (str_append_no_lt
+            (str_append_no_lt (sanitizeCssAtom_no_lt p) (lit_no_lt ": " rfl))
+            (sanitizeCssAtom_no_lt v))
+          (lit_no_lt ";" rfl)
+    | .nest sel b => by
+        simp only [Item.render]
+        exact str_append_no_lt
+          (str_append_no_lt
+            (str_append_no_lt (sanitizeCssSelector_no_lt sel) (lit_no_lt " { " rfl))
+            (Item.renderList_no_lt b))
+          (lit_no_lt " }" rfl)
+
+  theorem Item.renderList_no_lt : ∀ (is : List Item), ∀ c ∈ (Item.renderList is).toList, c ≠ '<'
+    | [] => lit_no_lt "" rfl
+    | [i] => Item.render_no_lt i
+    | i :: j :: rest => by
+        simp only [Item.renderList]
+        exact str_append_no_lt
+          (str_append_no_lt (Item.render_no_lt i) (lit_no_lt " " rfl))
+          (Item.renderList_no_lt (j :: rest))
+end
+
+theorem Item.render_no_closeSeq (i : Item) :
+    containsCloseSeq (Item.render i).toList = false :=
+  containsCloseSeq_of_no_lt (Item.render_no_lt i)
+
+theorem Item.renderList_no_closeSeq (is : List Item) :
+    containsCloseSeq (Item.renderList is).toList = false :=
+  containsCloseSeq_of_no_lt (Item.renderList_no_lt is)
+
+private theorem joinLines_no_lt :
+    ∀ (xs : List String), (∀ s ∈ xs, ∀ c ∈ s.toList, c ≠ '<') →
+      ∀ c ∈ (joinLines xs).toList, c ≠ '<'
+  | [], _ => lit_no_lt "" rfl
+  | [s], hs => hs s (by simp)
+  | s₁ :: s₂ :: rest, hs => by
+      have h1 := hs s₁ (by simp)
+      have h2 := joinLines_no_lt (s₂ :: rest) (fun x hx => hs x (by simp [hx]))
+      simp only [joinLines]
+      exact str_append_no_lt (str_append_no_lt h1 (lit_no_lt "\n" rfl)) h2
+
+theorem renderTheme_no_lt (tokens : List Item) :
+    ∀ c ∈ (renderTheme tokens).toList, c ≠ '<' := by
+  unfold renderTheme
+  dsimp only
+  apply joinLines_no_lt
+  intro s hs
+  rw [List.mem_append] at hs
+  rcases hs with hroot | hreset
+  · split at hroot
+    · nomatch hroot
+    · simp only [List.mem_singleton] at hroot
+      subst hroot
+      exact str_append_no_lt
+        (str_append_no_lt (lit_no_lt ":root { " rfl) (Item.renderList_no_lt _))
+        (lit_no_lt " }" rfl)
+  · rcases List.mem_map.1 hreset with ⟨item, _, rfl⟩
+    cases item with
+    | decl p v => exact Item.render_no_lt (.decl p v)
+    | nest sel b =>
+        change ∀ c ∈ (":where(" ++ sanitizeCssSelector sel ++ ") { " ++ Item.renderList b ++ " }").toList, c ≠ '<'
+        exact str_append_no_lt
+          (str_append_no_lt
+            (str_append_no_lt
+              (str_append_no_lt (lit_no_lt ":where(" rfl) (sanitizeCssSelector_no_lt sel))
+              (lit_no_lt ") { " rfl))
+            (Item.renderList_no_lt b))
+          (lit_no_lt " }" rfl)
+
+theorem renderTheme_no_closeSeq (tokens : List Item) :
+    containsCloseSeq (renderTheme tokens).toList = false :=
+  containsCloseSeq_of_no_lt (renderTheme_no_lt tokens)
+
+theorem css_raw_no_lt (body : List Item) :
+    ∀ c ∈ (css body).raw.toList, c ≠ '<' :=
+  Item.renderList_no_lt body
+
+theorem css_raw_no_closeSeq (body : List Item) :
+    containsCloseSeq (css body).raw.toList = false :=
+  containsCloseSeq_of_no_lt (css_raw_no_lt body)
 
 end Qed

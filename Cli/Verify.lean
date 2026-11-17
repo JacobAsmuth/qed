@@ -57,7 +57,9 @@ def kernelEnvClean (q? : Option QedjsEnv := none) : IO Bool := do
   let some q ← (match q? with | some e => pure (some e) | none => resolveQedjsEnv (needBuild := !hasExamples)) | return false
   if hasExamples then
     let mods := #[
-      "Qed", "Qed.Driver", "Qed.Server.Native", "Qed.Proofs.DomEquiv", "Js.Backend", "Js.Proofs",
+      "Qed", "Qed.Driver", "Qed.Server.Native",
+      "Qed.Proofs.DomArena", "Qed.Proofs.ViewPatch", "Qed.Proofs.KeyedReconcile", "Qed.Proofs.Hydration",
+      "Js.Backend", "Js.Proofs",
       "Examples.Bookshelf", "Examples.CloudBooks", "Examples.ServerChecks",
       "Examples.Todo", "Examples.Chat", "Examples.Signup",
       "Examples.Booking", "Examples.Users", "Examples.Local", "Examples.Effects",

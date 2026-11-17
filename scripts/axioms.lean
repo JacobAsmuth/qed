@@ -1,6 +1,9 @@
 import Qed
 import Qed.Server.Native
-import Qed.Proofs.DomEquiv
+import Qed.Proofs.DomArena
+import Qed.Proofs.ViewPatch
+import Qed.Proofs.KeyedReconcile
+import Qed.Proofs.Hydration
 import Js.Proofs
 import Examples.Counter
 import Examples.Booking
@@ -113,3 +116,83 @@ import Examples.CloudBooks
 #print axioms CloudBooks.Catalog.addBook_twoInv0
 #print axioms CloudBooks.Catalog.addBook_mutInv0
 #print axioms CloudBooks.Catalog.concurrent_linearizable
+
+-- 10 Formal Proof Extensions: Diff, Resource, Router, Style, Render, Local, Ssr, Proofs/*, Js.Proofs
+#print axioms Qed.validatedKeyIndex_spec
+#print axioms Qed.diff_keyed_reuses
+#print axioms Qed.diff_positional_reuses
+
+#print axioms Qed.Cached.put_stale_preserves_state
+#print axioms Qed.Cached.put_matching_updates_state
+#print axioms Qed.Cached.put_non_ok_preserves_seen
+#print axioms Qed.Cached.lookup_put_ok
+#print axioms Qed.Cached.lookup_put_ok_sound
+#print axioms Qed.Cached.put_seen_length_le
+#print axioms Qed.Query.wrap_preserves_inv
+#print axioms Qed.Query.wrap_noop_when_keys_unchanged
+
+#print axioms Qed.decodeSeg_encodeSeg
+#print axioms Qed.Router.fromURL_toURL
+#print axioms Qed.Router.canonical_reparse
+
+#print axioms Qed.sanitizeKey_of_safe
+#print axioms Qed.renderAttr_valid_attr
+#print axioms Qed.renderAttr_valid_flag
+#print axioms Qed.renderAttr_valid_on
+#print axioms Qed.renderAttr_no_angle_brackets
+#print axioms Qed.renderAttrs_no_angle_brackets
+#print axioms Qed.Html.validIn_everyElementSafe
+#print axioms Qed.Html.valid_everyElementSafe
+
+#print axioms Qed.sanitizeCssAtom_safe
+#print axioms Qed.sanitizeCssSelector_safe
+#print axioms Qed.Item.render_no_lt
+#print axioms Qed.Item.renderList_no_lt
+#print axioms Qed.Item.render_no_closeSeq
+#print axioms Qed.Item.renderList_no_closeSeq
+#print axioms Qed.renderTheme_no_lt
+#print axioms Qed.renderTheme_no_closeSeq
+#print axioms Qed.css_raw_no_lt
+#print axioms Qed.css_raw_no_closeSeq
+
+#print axioms Qed.LocalDef.valid_viewForProps
+#print axioms Qed.LocalDef.dedupe_mem
+#print axioms Qed.LocalDef.dedupe_ids_nodup
+#print axioms Qed.LocalDef.decode_toJson_eq
+#print axioms Qed.LocalDef.of_view_roundtrip
+#print axioms Qed.LocalDef.ofProps_view_roundtrip
+
+#print axioms Qed.App.ssrStep_equiv_ssrRenderNativeBytes
+
+#print axioms Qed.snapshotChildrenM_spec
+#print axioms Qed.SubtreeInRange_to_SubtreeInSet
+#print axioms Qed.SubtreeInSet_mono
+#print axioms Qed.SubtreeInSet_frame
+#print axioms Qed.InPlaceChildPatchSpec_setText
+#print axioms Qed.keyed_step_insertBefore_create
+#print axioms Qed.positional_step_reuse_tail
+#print axioms Qed.positional_removeTail_spec
+#print axioms Qed.applyKeyedStepsM_reconcile_spec
+#print axioms Qed.applyKeyedStepsM_with_removeTail_spec
+#print axioms Qed.hydrateTextSlotM_empty_spec
+#print axioms Qed.hydrateTextSlotM_split_spec
+#print axioms Qed.hydrateTextSlotM_head_spec
+#print axioms Qed.hydrateDomM_spec
+#print axioms Qed.hydrateDomKidsM_spec
+
+#print axioms Js.Proofs.collectNonArr_mono
+#print axioms Js.Proofs.collectNonArrAlts_mono
+#print axioms Js.Proofs.collectNonArr_sound
+#print axioms Js.Proofs.collectProjSrc_subset_collectNonArr
+#print axioms Js.Proofs.hasDecOf_sound
+#print axioms Js.Proofs.projRefTransfer_cowHeap_equiv
+#print axioms Js.Proofs.lowerBody_equiv
+#print axioms Js.Proofs.v_inj
+#print axioms Js.Proofs.jp_inj
+#print axioms Js.Proofs.v_ne_jp
+#print axioms Js.Proofs.genGlobalName_inj
+#print axioms Js.Proofs.genGlobalName_disjoint_all
+#print axioms Js.Proofs.inlineJpSlot_inj
+#print axioms Js.Proofs.ctxJs_fallback_startsWith_dollar
+#print axioms Js.Proofs.mangle_chars_safe
+#print axioms Js.Proofs.assignProgramNames_invariant

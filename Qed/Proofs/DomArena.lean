@@ -626,111 +626,104 @@ mutual
           simpa [List.append_assoc, specDomList, hmapInit] using hreadFinal
 end
 
-/-! ## 2. Pure Diff & W3C `insertBefore` Keyed/Positional Reconciler Equivalence -/
 
-/-- For every `old` and `new` `Html` tree, patching `old` with `diff old new` yields a `DomTree`
-    identical to building `new` from scratch. -/
-theorem specDom_applyPatch_diff (ns : String) (old new : Html msg) :
-    specDom ns (applyPatch (diff old new) old) = specDom ns new := by
-  rw [diff_apply]
+theorem uint32_toNat_ofNat_lt (n : Nat) (h : n < UInt32.size) :
+    (UInt32.ofNat n).toNat = n := by
+  simp [Nat.mod_eq_of_lt h]
 
-theorem insertBeforeRef_split {child ref : Dom.Node} :
-    ∀ (pre suf : List Dom.Node),
-      ref ∉ pre →
-      insertBeforeRef child ref (pre ++ ref :: suf) = pre ++ child :: ref :: suf
-  | [], suf, _ => by simp [insertBeforeRef]
-  | x :: xs, suf, href => by
-      have hne : (x == ref) = false := beq_eq_false_iff_ne.2 (fun h => href (by simp [h]))
-      simp [insertBeforeRef, hne, insertBeforeRef_split xs suf (fun h => href (List.mem_cons_of_mem x h))]
+theorem uint32_eq_of_toNat_eq {a b : UInt32} (h : a.toNat = b.toNat) : a = b :=
+  UInt32.toBitVec_inj.1 (BitVec.eq_of_toNat_eq h)
 
-theorem erase_append_right_of_not_mem {α : Type} [BEq α] [LawfulBEq α]
-    (pre suf : List α) {x : α} (hnot : x ∉ pre) :
-    (pre ++ suf).erase x = pre ++ suf.erase x := by
-  induction pre with
-  | nil => rfl
-  | cons a rest ih =>
-      have hne : (a == x) = false := beq_eq_false_iff_ne.2 (fun h => hnot (by simp [h]))
-      simp [hne, ih (fun h => hnot (List.mem_cons_of_mem a h))]
+theorem uint32_ofNat_succ (n : Nat) (h : n + 1 < UInt32.size) :
+    UInt32.ofNat n + 1 = UInt32.ofNat (n + 1) := by
+  apply uint32_eq_of_toNat_eq
+  simp [UInt32.toNat_add, uint32_toNat_ofNat_lt n (by omega)]
 
-private theorem not_mem_left_of_nodup_append {α : Type} {xs ys : List α} {y : α}
-    (hnd : (xs ++ ys).Nodup) (hy : y ∈ ys) : y ∉ xs := by
-  induction xs with
-  | nil => intro h; nomatch h
-  | cons x rest ih =>
-      rcases List.nodup_cons.1 hnd with ⟨hx, hrest⟩
-      intro hm
-      rcases List.mem_cons.1 hm with rfl | htail
-      · exact hx (List.mem_append_right rest hy)
-      · exact ih hrest htail
+/-- Membership predicate for DOM node subtrees inside an arbitrary node-index predicate `S : Nat → Prop`. -/
+def SubtreeInSet {msg : Type} (fuel : Nat) (a : DomArena msg) (S : Nat → Prop) : Dom.Node → Prop :=
+  match fuel with
+  | 0 => fun _ => True
+  | f + 1 => fun n =>
+      S n.toNat ∧
+      match a.get n with
+      | .element _ _ _ _ cs => ∀ c ∈ cs, SubtreeInSet f a S c
+      | _ => True
 
-private theorem nodup_erase {α : Type} [BEq α] [LawfulBEq α] {xs : List α} (x : α)
-    (hnd : xs.Nodup) : (xs.erase x).Nodup := by
-  induction xs with
-  | nil => exact List.Pairwise.nil
-  | cons a rest ih =>
-      rcases List.nodup_cons.1 hnd with ⟨ha, hrest⟩
-      by_cases hax : a == x
-      · simpa [List.erase_cons, hax] using hrest
-      · simp only [List.erase_cons, hax, Bool.false_eq_true, ↓reduceIte]
-        refine List.nodup_cons.2 ⟨fun hm => ha (List.mem_of_mem_erase hm), ih hrest⟩
+theorem SubtreeInRange_to_SubtreeInSet {msg : Type} :
+    ∀ {f : Nat} {a : DomArena msg} {lo hi : Nat} {n : Dom.Node},
+      SubtreeInRange f a lo hi n → SubtreeInSet f a (fun k => lo ≤ k ∧ k < hi) n
+  | 0, _, _, _, _, _ => trivial
+  | f + 1, a, lo, hi, n, h => by
+      dsimp only [SubtreeInRange] at h
+      dsimp only [SubtreeInSet]
+      refine ⟨⟨h.1, h.2.1⟩, ?_⟩
+      cases hg : a.get n with
+      | null => trivial
+      | text _ => trivial
+      | element ns tag st mg cs =>
+          rw [hg] at h
+          intro c hc
+          exact SubtreeInRange_to_SubtreeInSet (h.2.2 c hc)
+      | fragment _ => trivial
 
-private theorem nodup_reinsert {α : Type} [BEq α] [LawfulBEq α] {pre suf : List α} {c : α}
-    (hnd : (pre ++ suf).Nodup) (hc : c ∉ pre) :
-    (pre ++ c :: suf.erase c).Nodup := by
-  induction pre with
-  | nil =>
-      simp only [List.nil_append] at hnd ⊢
-      refine List.nodup_cons.2 ⟨?_, nodup_erase c hnd⟩
-      -- Since `suf.Nodup`, erasing `c` removes the only possible occurrence of `c` in `suf`.
-      clear hc
-      induction suf with
-      | nil => simp
-      | cons s srest ihS =>
-          rcases List.nodup_cons.1 hnd with ⟨hs, hsrest⟩
-          by_cases hsc : s == c
-          · have heq : s = c := eq_of_beq hsc
-            subst heq
-            simpa [List.erase_cons] using hs
-          · simp only [List.erase_cons, hsc, Bool.false_eq_true, ↓reduceIte, List.mem_cons, not_or]
-            refine ⟨fun h => hsc (beq_iff_eq.2 h.symm), ihS hsrest⟩
-  | cons p prest ih =>
-      simp only [List.cons_append] at hnd ⊢
-      rcases List.nodup_cons.1 hnd with ⟨hp, hprest⟩
-      have hcp : c ≠ p := fun h => hc (by simp [h])
-      refine List.nodup_cons.2 ⟨?_, ih hprest (fun h => hc (List.mem_cons_of_mem p h))⟩
-      intro hm
-      rcases List.mem_append.1 hm with h1 | h2
-      · exact hp (List.mem_append_left _ h1)
-      · rcases List.mem_cons.1 h2 with hpeq | her
-        · exact hcp hpeq.symm
-        · exact hp (List.mem_append_right _ (List.mem_of_mem_erase her))
+theorem SubtreeInSet_mono {msg : Type} :
+    ∀ {f : Nat} {a : DomArena msg} {S₁ S₂ : Nat → Prop} {n : Dom.Node},
+      (∀ k, S₁ k → S₂ k) →
+      SubtreeInSet f a S₁ n →
+      SubtreeInSet f a S₂ n
+  | 0, _, _, _, _, _, _ => trivial
+  | f + 1, a, S₁, S₂, n, hsub, hn => by
+      dsimp only [SubtreeInSet] at hn ⊢
+      refine ⟨hsub n.toNat hn.1, ?_⟩
+      cases hg : a.get n with
+      | null => trivial
+      | text _ => trivial
+      | element _ _ _ _ cs =>
+          rw [hg] at hn
+          intro c hc
+          exact SubtreeInSet_mono hsub (hn.2 c hc)
+      | fragment _ => trivial
 
-/-- Unified W3C `insertBefore` step theorem: whether `child` is freshly created (`child ∉ suf`)
-    or reused from `suf` (`child ∈ suf`), as long as `(pre ++ suf).Nodup` and `child ∉ pre`,
-    `w3cInsertBefore (pre ++ suf) pre.length child = pre ++ child :: suf.erase child`. -/
-theorem w3cInsertBefore_step (pre suf : List Dom.Node) (child : Dom.Node)
-    (hnd : (pre ++ suf).Nodup) (hnotPre : child ∉ pre) :
-    w3cInsertBefore (pre ++ suf) pre.length child = pre ++ child :: suf.erase child := by
-  unfold w3cInsertBefore
-  rw [List.drop_left]
-  cases suf with
-  | nil =>
-      simp [List.erase_of_not_mem hnotPre]
-  | cons ref rest =>
-      by_cases hrc : ref == child
-      · have heq : ref = child := eq_of_beq hrc
-        subst heq
-        simp
-      · simp only [hrc, Bool.false_eq_true, ↓reduceIte]
-        rw [erase_append_right_of_not_mem pre (ref :: rest) hnotPre]
-        have hrc' : (ref == child) = false := Bool.eq_false_iff.2 hrc
-        simp only [List.erase_cons, hrc', Bool.false_eq_true, ↓reduceIte]
-        have hrefNotPre : ref ∉ pre := not_mem_left_of_nodup_append hnd (List.mem_cons_self ..)
-        exact insertBeforeRef_split pre (rest.erase child) hrefNotPre
+theorem SubtreeInSet_frame {msg : Type} :
+    ∀ {f : Nat} {a a' : DomArena msg} {S : Nat → Prop} {n : Dom.Node},
+      (∀ m : Dom.Node, S m.toNat → a'.get m = a.get m) →
+      SubtreeInSet f a S n →
+      SubtreeInSet f a' S n ∧ readDomTree f a' n = readDomTree f a n
+  | 0, _, _, _, _, _, _ => ⟨trivial, rfl⟩
+  | f + 1, a, a', S, n, hfr, hn => by
+      dsimp only [SubtreeInSet] at hn
+      have hget : a'.get n = a.get n := hfr n hn.1
+      refine ⟨?_, ?_⟩
+      · dsimp only [SubtreeInSet]
+        refine ⟨hn.1, ?_⟩
+        rw [hget]
+        cases hg : a.get n with
+        | null => trivial
+        | text _ => trivial
+        | element _ _ _ _ cs =>
+            rw [hg] at hn
+            intro c hc
+            exact (SubtreeInSet_frame hfr (hn.2 c hc)).1
+        | fragment _ => trivial
+      · dsimp only [readDomTree]
+        rw [hget]
+        cases hg : a.get n with
+        | null => rfl
+        | text _ => rfl
+        | element ns tag st mg cs =>
+            rw [hg] at hn
+            dsimp only
+            congr 1
+            apply List.map_congr_left
+            intro c hc
+            exact (SubtreeInSet_frame hfr (hn.2 c hc)).2
+        | fragment _ => rfl
 
-def w3cPlaceSeq : List Dom.Node → Nat → List Dom.Node → List Dom.Node
-  | cs, _, [] => cs
-  | cs, j, target :: rest => w3cPlaceSeq (w3cInsertBefore cs j target) (j + 1) rest
+
+theorem getD_append_right {α : Type} (x d : α) :
+    ∀ (pre suf : List α), (pre ++ x :: suf).getD pre.length d = x
+  | [], _ => rfl
+  | _ :: rest, suf => getD_append_right x d rest suf
 
 def removeTailSpec (idx : Nat) : Nat → List α → List α
   | 0, cs => cs
@@ -748,222 +741,17 @@ theorem removeTailSpec_append {α : Type} (pre : List α) :
   | x :: suf => by
       simp [removeTailSpec, listRemoveAt_append_head pre x suf, removeTailSpec_append pre suf]
 
-theorem w3cPlaceSeq_invariant (targets : List Dom.Node) :
-    ∀ (pre suf : List Dom.Node),
-      (pre ++ suf).Nodup →
-      targets.Nodup →
-      (∀ t ∈ targets, t ∉ pre) →
-      ∃ rem,
-        w3cPlaceSeq (pre ++ suf) pre.length targets = pre ++ targets ++ rem := by
-  induction targets with
-  | nil =>
-      intro pre suf _ _ _
-      exact ⟨suf, by simp [w3cPlaceSeq]⟩
-  | cons t rest ih =>
-      intro pre suf hnd htnd hdisj
-      rcases List.nodup_cons.1 htnd with ⟨htRest, hrestNd⟩
-      have htNotPre : t ∉ pre := hdisj t (List.mem_cons_self ..)
-      have hstep := w3cInsertBefore_step pre suf t hnd htNotPre
-      have hnd' : ((pre ++ [t]) ++ suf.erase t).Nodup := by
-        simpa [List.append_assoc] using nodup_reinsert hnd htNotPre
-      have hdisj' : ∀ r ∈ rest, r ∉ pre ++ [t] := by
-        intro r hr hm
-        rcases List.mem_append.1 hm with h1 | h2
-        · exact hdisj r (List.mem_cons_of_mem t hr) h1
-        · simp only [List.mem_singleton] at h2
-          subst h2
-          exact htRest hr
-      have hlen' : (pre ++ [t]).length = pre.length + 1 := by simp
-      rcases ih (pre ++ [t]) (suf.erase t) hnd' hrestNd hdisj' with ⟨rem, heq⟩
-      refine ⟨rem, ?_⟩
-      simp only [w3cPlaceSeq, hstep]
-      have hassoc : pre ++ t :: suf.erase t = (pre ++ [t]) ++ suf.erase t := by simp
-      rw [hassoc, ← hlen', heq]
-      simp [List.append_assoc]
-
-/-- Complete keyed child-order reconciliation theorem: placing any duplicate-free `targets` sequence
-    via W3C `insertBefore` over an existing duplicate-free `live` child list and removing the
-    trailing unused suffix yields `targets` in exact order. -/
-theorem w3cReconcileKeyed_eq (live targets : List Dom.Node)
-    (hlive : live.Nodup) (htargets : targets.Nodup) :
-    let placed := w3cPlaceSeq live 0 targets
-    removeTailSpec targets.length (placed.length - targets.length) placed = targets := by
-  rcases w3cPlaceSeq_invariant targets [] live (by simpa using hlive) htargets
-    (fun _ _ h => nomatch h) with ⟨rem, hplaced⟩
-  dsimp only
-  simp only [List.nil_append, List.length_nil] at hplaced
-  rw [hplaced]
-  have hsub : (targets ++ rem).length - targets.length = rem.length := by simp
-  rw [hsub]
-  exact removeTailSpec_append targets rem
-
-/-! ## 3. HTML5 Text Coalescing & `hydrateTextSlotM` / `hydrateDomM` Equivalence -/
-
-theorem hasMoreText_false_restOfTextRun :
-    ∀ (cs : List (Html msg)), hasMoreText cs = false → restOfTextRun cs = ""
-  | [], _ => rfl
-  | c :: cs, h => by
-      cases hc : c.textOf? with
-      | none => simp [restOfTextRun, hc]
-      | some s =>
-          by_cases hse : s = ""
-          · subst hse
-            simp only [hasMoreText, hc] at h
-            simp [restOfTextRun, hc, hasMoreText_false_restOfTextRun cs h]
-          · simp [hasMoreText, hc] at h
-
-/-- Pure DOM-child specification of `hydrateTextSlotM` + `hydrateDomKidsM`: given the coalesced
-    child texts emitted by an HTML5 parser (`coalesceTextRun cs`), `hydrateTextSlotM` splits merged
-    text runs and inserts `""` placeholder nodes so the hydrated child list matches `cs` 1-for-1. -/
-def hydrateDomTextModel (inTextRun : Bool) : List (Html msg) → List (Html msg) → List (Html msg)
-  | [], _ => []
-  | c :: rest, dom =>
-      match c.textOf? with
-      | some s =>
-          if s == "" then
-            .text "" :: hydrateDomTextModel inTextRun rest dom
-          else if inTextRun then
-            .text s :: hydrateDomTextModel true rest dom
-          else
-            match dom with
-            | .text raw :: domRest =>
-                let fixed := if hasMoreText rest then s else raw
-                .text fixed :: hydrateDomTextModel true rest domRest
-            | _ :: domRest =>
-                .text s :: hydrateDomTextModel true rest domRest
-            | [] => []
-      | none =>
-          match dom with
-          | _ :: domRest => c :: hydrateDomTextModel false rest domRest
-          | [] => []
-
-private theorem textOf_eq_some_iff {h : Html msg} {s : String} :
-    h.textOf? = some s ↔ h = .text s := by
-  cases h <;> simp [Html.textOf?]
-
-theorem hydrateDomTextModel_roundtrip (cs : List (Html msg)) :
-    hydrateDomTextModel false cs (coalesceTextRun cs) = cs ∧
-    hydrateDomTextModel true cs (dropCurrentTextRun cs) = cs := by
-  induction cs with
-  | nil => exact ⟨rfl, rfl⟩
-  | cons c rest ih =>
-      rcases ih with ⟨ihFalse, ihTrue⟩
-      cases hc : c.textOf? with
-      | none =>
-          refine ⟨?_, ?_⟩ <;>
-            simpa [hydrateDomTextModel, coalesceTextRun, dropCurrentTextRun, hc] using ihFalse
-      | some s =>
-          have hce : c = .text s := textOf_eq_some_iff.1 hc
-          subst hce
-          cases hs : (s == "") with
-          | true =>
-              have hse : s = "" := eq_of_beq hs
-              subst hse
-              refine ⟨?_, ?_⟩
-              · simpa [hydrateDomTextModel, coalesceTextRun, Html.textOf?] using ihFalse
-              · simpa [hydrateDomTextModel, dropCurrentTextRun, Html.textOf?] using ihTrue
-          | false =>
-              have hne : s ≠ "" := fun h => by simp [h] at hs
-              refine ⟨?_, ?_⟩
-              · simp only [coalesceTextRun, Html.textOf?, hs, Bool.false_eq_true, ↓reduceIte,
-                           hydrateDomTextModel, ihTrue]
-                cases hm : hasMoreText rest with
-                | true => simp
-                | false =>
-                    simp [hasMoreText_false_restOfTextRun rest hm]
-              · simpa [hydrateDomTextModel, dropCurrentTextRun, Html.textOf?, hne] using ihTrue
-
-/-- Hydrating an HTML5-coalesced child list restores the exact uncoalesced `Html` child list,
-    including preserving existing text nodes untouched when `hasMoreText rest = false`. -/
-theorem hydrateTextRun_equiv (cs : List (Html msg)) :
-    hydrateDomTextModel false cs (coalesceTextRun cs) = cs :=
-  (hydrateDomTextModel_roundtrip cs).1
-
-/-- Imperative `hydrateDomM` on an element node clears stale handler attributes, applies normalized
-    attributes (`evalSpecAttrs attrs`), and hydrates children when `!ownsChildren attrs`. -/
-theorem hydrateDomM_ownsChildren_element (a : DomArena msg) (node : Dom.Node)
-    (ns tag : String) (cs : List Dom.Node) (attrs : List (Attr msg)) (children : List (Html msg))
-    (hown : ownsChildren attrs = true) :
-    ((hydrateDomM (m := StateM (DomArena msg)) (.element tag attrs children) node).run
-      (a.set node (.element ns tag {} [] cs))).2 =
-      a.set node (.element ns tag (evalSpecAttrs attrs) ((normalizeAttrs attrs).filterMap managedAttrName) cs) := by
-  dsimp only [hydrateDomM, StateT.run, bind, StateT.bind, pure, StateT.pure,
-              MonadDom.clearHandlers, DomArena.modifyElemState, DomArena.modify]
-  rw [if_neg (by simp [hown]), DomArena.get_set_self, DomArena.set_set]
-  dsimp only
-  rw [applyAttrsM_fresh_element a node ns tag cs attrs]
-  rfl
-
-/-! ## 4. Congruence-Sound Memoization (`View.memo`) & Duplicate-Key Safety (`V.forEach`) -/
-
-/-- When `sm.keyOf s₂ = sm.keyOf s₁`, `patchViewM` on `.memo sm` performs **zero** DOM mutations
-    (`a' = a`), preserves the exact `node` handle, and by `sm.sound` the existing DOM subtree is
-    guaranteed equal to `specDom ns (View.render (.memo sm) s₂)`. -/
-theorem patchViewM_memo_hit {σ msg : Type} (sm : SoundMemo σ msg)
-    (s₁ s₂ : σ) (parent node : Dom.Node) (idx : UInt32) (a : DomArena msg) (fuel : Nat) (ns : String)
-    (hkey : sm.keyOf s₂ = sm.keyOf s₁)
-    (hdom : readDomTree fuel a node = specDom ns (View.render (.memo sm) s₁)) :
-    let (vst', a') :=
-      (patchViewM (m := StateM (DomArena msg)) parent idx (.memo sm) s₂
-        (.memo node (sm.keyOf s₁) (sm.eval s₁))).run a
-    a' = a ∧
-    vst' = .memo node (sm.keyOf s₁) (sm.eval s₁) ∧
-    readDomTree fuel a' node = specDom ns (View.render (.memo sm) s₂) := by
-  have hbeq : (sm.keyOf s₂ == sm.keyOf s₁) = true := beq_iff_eq.2 hkey
-  have heval : sm.eval s₂ = sm.eval s₁ := sm.sound s₂ s₁ hkey
-  simp [patchViewM, StateT.run, pure, StateT.pure, hbeq, View.render, heval, hdom]
-
-/-- Imperative `patchViewM` on `.dyn get` updates the DOM text node when changed and always
-    leaves `readDomTree` equal to `specDom "" (View.render (.dyn get) s₂)`. -/
-theorem patchViewM_dyn_spec {σ msg : Type} (get : σ → String) (s₁ s₂ : σ)
-    (parent node : Dom.Node) (idx : UInt32) (a : DomArena msg) (fuel : Nat) (hf : 0 < fuel) :
-    let a0 := a.set node (.text (get s₁))
-    let (vst', a') :=
-      (patchViewM (m := StateM (DomArena msg)) parent idx (.dyn get) s₂ (.dyn node (get s₁))).run a0
-    vst' = .dyn node (get s₂) ∧
-    readDomTree fuel a' node = specDom "" (View.render (.dyn get) s₂) := by
-  cases fuel with
-  | zero => omega
-  | succ f =>
-      dsimp only
-      by_cases heq : get s₂ = get s₁
-      · simp [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure,
-              heq, readDomTree, DomArena.get_set_self, specDom, View.render]
-      · simp [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure, heq,
-              MonadDom.setText, DomArena.modify, DomArena.get_set_self,
-              readDomTree, specDom, View.render]
-
-/-- Every keyed list produced by `V.forEach` (or patched/hydrated by `Template.lean`) disambiguates
-    keys so that duplicate sibling keys are impossible (`Nodup` holds unconditionally). -/
-theorem forEach_disambiguated_keys_nodup {α σ : Type} (items : σ → Array α) (key : α → String) (s : σ) :
-    (disambiguateKeys ((items s).map key)).toList.Nodup :=
-  disambiguateKeys_nodup ((items s).map key)
-
-/-! ## 5. End-to-End Isomorphic SSR → Rehydrate → Client Equivalence (`App.ssr_rehydrate_equiv`) -/
-
-/-- Crown-jewel isomorphic rendering theorem for every compiled Qed `App`:
-    1. Every server-rendered view `app.view m` satisfies HTML5 & XSS validity (`Html.valid`).
-    2. Whenever client `app.rehydrate (app.dehydrate m)` succeeds with `m'`, `m'` satisfies
-       `Html.valid (app.view m') = true`, renders the **exact** same `Html` and serialized markup
-       as the server (`app.view m' = app.view m`), and has the **exact** same `DomTree` (`specDom`).
-    3. Every subsequent client message transition `msg : Msg` reconciled via `diff` produces the
-       exact `DomTree` of a fresh render of `(app.update m' msg).1`. -/
-theorem App.ssr_rehydrate_equiv {Model Msg : Type} (app : App Model Msg)
-    (m m' : Model) (hre : app.rehydrate (app.dehydrate m) = some m') :
-    Html.valid (app.view m) = true ∧
-    Html.valid (app.view m') = true ∧
-    app.view m' = app.view m ∧
-    Html.render (app.view m') = Html.render (app.view m) ∧
-    specDom "" (app.view m') = specDom "" (app.view m) ∧
-    (∀ msg : Msg,
-      specDom "" (applyPatch (diff (app.view m') (app.view (app.update m' msg).1)) (app.view m')) =
-        specDom "" (app.view (app.update m' msg).1)) := by
-  have hvalidM  : Html.valid (app.view m) = true := app.valid_view m
-  have hvalidM' : Html.valid (app.view m') = true := app.valid_view m'
-  have hview    : app.view m' = app.view m := app.dehydrate_view m m' hre
-  refine ⟨hvalidM, hvalidM', hview, congrArg Html.render hview, congrArg (specDom "") hview, ?_⟩
-  intro msg
-  exact specDom_applyPatch_diff "" (app.view m') (app.view (app.update m' msg).1)
+theorem removeTailM_spec (a : DomArena msg) (node : Dom.Node) (atIdx : Nat) (k : Nat)
+    (ns tag : String) (st : SpecElemState msg) (mg : List String) (cs : List Dom.Node) :
+    ((removeTailM (m := StateM (DomArena msg)) node (UInt32.ofNat atIdx) k).run
+      (a.set node (.element ns tag st mg cs))).2 =
+      a.set node (.element ns tag st mg (removeTailSpec (UInt32.ofNat atIdx).toNat k cs)) := by
+  induction k generalizing cs with
+  | zero => rfl
+  | succ k ih =>
+      simp only [removeTailM, removeTailSpec, bind, StateT.bind, StateT.run,
+                 DomArena.modifyChildren, DomArena.modify,
+                 DomArena.get_set_self, DomArena.set_set]
+      exact ih (listRemoveAt cs (UInt32.ofNat atIdx).toNat)
 
 end Qed
-

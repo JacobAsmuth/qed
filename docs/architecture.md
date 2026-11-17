@@ -94,7 +94,7 @@ browser restores server-rendered state without re-fetching startup data; mark cl
   and untyped URLs on `href`, `src`, and `action`. Inline and `holds_in` view invariants check
   custom styling and element predicates.
 - **Isomorphic SSR, DOM driver, and memoization:** Every `Dehydrate` codec proves `round_trip`
-  and `dehydrate_view`. [`Qed/Proofs/DomEquiv.lean`](../Qed/Proofs/DomEquiv.lean) proves against a
+  and `dehydrate_view`. [`Qed/Proofs/`](../Qed/Proofs) (`DomArena.lean`, `ViewPatch.lean`, `KeyedReconcile.lean`, `Hydration.lean`) proves against a
   pure `SpecDom` model that mounting, text-run hydration, W3C `insertBefore` keyed moves,
   duplicate-key disambiguation, direct signal updates, `LawfulKey`-indexed `V.memo` skipping, and
   SSR rehydration match `Html.render`.
@@ -171,7 +171,7 @@ and `qed start` or `qed preview` for production builds; `qed build` also minifie
 | [`Qed/Html.lean`](../Qed/Html.lean) · [`Qed/Jsx.lean`](../Qed/Jsx.lean) · [`Qed/Notation.lean`](../Qed/Notation.lean) | Typed `Html` / `Attr` / `Url` virtual DOM, static `Html.valid` HTML5/XSS rules, JSX syntax, and attribute/event helpers. |
 | [`Qed/Style.lean`](../Qed/Style.lean) | Typed `css` rules, `token`s, `theme` overrides, and scoped stylesheet rendering. |
 | [`Qed/View.lean`](../Qed/View.lean) · [`Qed/Render.lean`](../Qed/Render.lean) · [`Qed/Diff.lean`](../Qed/Diff.lean) | Fine-grained `View` templates in `Qed/View/`, template lifting, tail-recursive `@[csimp]` HTML rendering, and keyed/positional diffing via `diff_apply`. |
-| [`Qed/Dom.lean`](../Qed/Dom.lean) · [`Qed/Driver.lean`](../Qed/Driver.lean) · [`Qed/Proofs/DomEquiv.lean`](../Qed/Proofs/DomEquiv.lean) | Total `MonadDom` interface, imperative browser driver in `Qed/Driver/`, and `SpecDom` refinement proofs. |
+| [`Qed/Dom.lean`](../Qed/Dom.lean) · [`Qed/Driver.lean`](../Qed/Driver.lean) · [`Qed/Proofs/`](../Qed/Proofs) | Total `MonadDom` interface, imperative browser driver in `Qed/Driver/`, and `SpecDom` refinement proofs (`DomArena`, `ViewPatch`, `KeyedReconcile`, `Hydration`). |
 | [`Qed/Runtime.lean`](../Qed/Runtime.lean) · [`Qed/Resource.lean`](../Qed/Resource.lean) · [`Qed/Ssr.lean`](../Qed/Ssr.lean) | `App`, `Cmd` effects, `LocalDef` cells in `Qed/Runtime/`, `Resource`/`Cached`/`<Await>`, `Dehydrate` codecs, breakout-safe document serialization, and JS + native in-memory SSR. |
 | [`Qed/Json.lean`](../Qed/Json.lean) · [`Qed/Proto.lean`](../Qed/Proto.lean) | Total JSON and binary Protocol Buffers parsers and encoders under `Qed/Json/` and `Qed/Proto/` with `LawfulJson` and `LawfulProto` proofs. |
 | [`Qed/Date.lean`](../Qed/Date.lean) · [`Qed/Router.lean`](../Qed/Router.lean) · [`Qed/Schema.lean`](../Qed/Schema.lean) | Date utilities, `router` macro + `Router.round_trip`, and `schema` macro under `Qed/Schema/` generating `Field`, `Draft`, `formView`, `canSubmit_iff`, and JSON/Proto codecs. |

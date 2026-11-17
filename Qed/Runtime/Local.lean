@@ -105,4 +105,111 @@ def Attr.localInit {msg S : Type} [ToJson S] (a : Attr msg) (init : S) : Attr ms
     (component key : String) (onOut : O → Option msg) :
     (localMountWith component key onOut).valid = true := rfl
 
+/-! ## `LocalDef` View Validity, Deduplication & `LawfulJson` Round-Trip Theorems -/
+
+theorem LocalDef.valid_viewForProps (ldef : LocalDef) (props s : String) :
+    Html.valid (ldef.viewForProps props s) = true := by
+  unfold LocalDef.viewForProps
+  have ⟨hv, hvp⟩ := ldef.valid_view
+  cases h : ldef.viewProps with
+  | none => simpa [h] using hv s
+  | some f =>
+      simp only [h] at hvp
+      simpa using hvp props s
+
+theorem LocalDef.dedupe_mem {d : LocalDef} {ds : List LocalDef} (hm : d ∈ LocalDef.dedupe ds) :
+    d ∈ ds := by
+  unfold LocalDef.dedupe at hm
+  have hgen : ∀ (xs : List LocalDef) (acc : Array LocalDef),
+      (∀ x ∈ acc.toList, x ∈ ds) →
+      (∀ x ∈ xs, x ∈ ds) →
+      ∀ x ∈ (xs.foldl (fun (acc : Array LocalDef) d =>
+        if acc.any (·.id == d.id) then acc else acc.push d) acc).toList, x ∈ ds := by
+    intro xs
+    induction xs with
+    | nil => intro acc hacc _ x hx; exact hacc x hx
+    | cons y ys ih =>
+        intro acc hacc hys x hx
+        apply ih _ _ (fun z hz => hys z (List.mem_cons_of_mem y hz)) x hx
+        intro z hz
+        dsimp only at hz
+        split at hz
+        · exact hacc z hz
+        · rw [Array.toList_push, List.mem_append] at hz
+          rcases hz with h1 | h2
+          · exact hacc z h1
+          · simp only [List.mem_singleton] at h2
+            subst h2
+            exact hys z (List.mem_cons_self ..)
+  exact hgen ds #[] (fun _ h => nomatch h) (fun _ h => h) d hm
+
+theorem LocalDef.dedupe_ids_nodup (ds : List LocalDef) :
+    ((LocalDef.dedupe ds).map (·.id)).Nodup := by
+  unfold LocalDef.dedupe
+  have hgen : ∀ (xs : List LocalDef) (acc : Array LocalDef),
+      (acc.toList.map (·.id)).Nodup →
+      ((xs.foldl (fun (acc : Array LocalDef) d =>
+        if acc.any (·.id == d.id) then acc else acc.push d) acc).toList.map (·.id)).Nodup := by
+    intro xs
+    induction xs with
+    | nil => intro acc hnd; exact hnd
+    | cons y ys ih =>
+        intro acc hnd
+        apply ih
+        dsimp only
+        by_cases hany : acc.any (·.id == y.id) = true
+        · simp [hany, hnd]
+        · have hanyF : acc.any (·.id == y.id) = false := Bool.eq_false_iff.2 hany
+          simp only [hanyF, Bool.false_eq_true, ↓reduceIte, Array.toList_push, List.map_append,
+            List.map_singleton]
+          have hnotMem : y.id ∉ acc.toList.map (·.id) := by
+            intro hm
+            rcases List.mem_map.1 hm with ⟨d, hd, hid⟩
+            obtain ⟨idx, hidx, hget⟩ := List.getElem_of_mem hd
+            have hidxA : idx < acc.size := by rw [← Array.length_toList]; exact hidx
+            have hanyT : acc.any (·.id == y.id) = true :=
+              Array.any_iff_exists.2 ⟨idx, hidxA, Nat.zero_le _, hidxA, by
+                have hgetA : acc[idx]'hidxA = d := hget
+                simp [hgetA, hid]⟩
+            simp [hanyT] at hanyF
+          rw [List.nodup_iff_pairwise_ne] at hnd ⊢
+          exact List.pairwise_append.2 ⟨hnd, List.pairwise_singleton _ _,
+            fun a ha b hb => by
+              simp only [List.mem_singleton] at hb
+              subst hb
+              intro heq; subst heq; exact hnotMem ha⟩
+  exact hgen ds #[] List.Pairwise.nil
+
+theorem LocalDef.decode_toJson_eq {S : Type} [LawfulJson S] (s init : S)
+    (hdepth : LawfulJson.depthBound S ≤ 64) :
+    ((Json.parse (Json.render (toJson s))).bind FromJson.fromJson).toOption.getD init = s := by
+  rw [LawfulJson.parse_render_toJson s hdepth]
+  rfl
+
+theorem LocalDef.of_view_roundtrip {S M O : Type} [LawfulJson S] [ToJson O]
+    (id : String) (init s : S) (view : S → Html M) (update : S → M → S × Option O)
+    (hvalid : ∀ x, Html.valid (view x) = true)
+    (hdepth : LawfulJson.depthBound S ≤ 64) :
+    (LocalDef.of id init view update hvalid).view (Json.render (toJson s)) =
+      (view s).map (fun m =>
+        { run := fun st =>
+            let (s', o) := update (((Json.parse st).bind FromJson.fromJson).toOption.getD init) m
+            (Json.render (ToJson.toJson s'), o.map fun x => Json.render (ToJson.toJson x)) }) := by
+  simp only [LocalDef.of, LocalDef.decode_toJson_eq s init hdepth]
+
+theorem LocalDef.ofProps_view_roundtrip {P S M O : Type} [LawfulJson P] [LawfulJson S] [ToJson O]
+    (id : String) (init s : S) (p : P) (view : P → S → Html M) (update : P → S → M → S × Option O)
+    (hvalid : ∀ p x, Html.valid (view p x) = true)
+    (hdepthP : LawfulJson.depthBound P ≤ 64)
+    (hdepthS : LawfulJson.depthBound S ≤ 64) :
+    (LocalDef.ofProps id init view update hvalid).viewForProps
+      (Json.render (toJson p)) (Json.render (toJson s)) =
+      (view p s).map (fun m =>
+        { run := fun st =>
+            let (next, out) := update p (((Json.parse st).bind FromJson.fromJson).toOption.getD init) m
+            (Json.render (toJson next), out.map (Json.render ∘ toJson)) }) := by
+  simp only [LocalDef.viewForProps, LocalDef.ofProps, Option.map_some, Option.getD_some]
+  rw [LawfulJson.parse_render_toJson p hdepthP]
+  simp only [LocalDef.decode_toJson_eq s init hdepthS]
+
 end Qed

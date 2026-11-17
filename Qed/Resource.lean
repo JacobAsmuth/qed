@@ -224,4 +224,156 @@ class ToResource (ρ : Type) (α : outParam Type) where
     (failed : String → Html msg) (idle : Html msg) : Html msg :=
   (ToResource.toResource src).view ready loading failed idle
 
+/-! ## Async `Cached` Race-Safety & `Query.wrap` Theorems -/
+
+theorem Cached.put_stale_preserves_state {α : Type} (c : Cached α)
+    (issuedKey currentKey : String) (r : Resource α) (hne : issuedKey ≠ currentKey) :
+    (c.put issuedKey r currentKey).state = c.state := by
+  have hbeq : (issuedKey == currentKey) = false := beq_eq_false_iff_ne.2 hne
+  simp [Cached.put, hbeq]
+
+@[simp] theorem Cached.put_matching_updates_state {α : Type} (c : Cached α)
+    (k : String) (r : Resource α) :
+    (c.put k r k).state = r := by
+  simp [Cached.put]
+
+theorem Cached.put_non_ok_preserves_seen {α : Type} (c : Cached α)
+    (k currentKey : String) (r : Resource α) (hnotOk : ∀ v, r ≠ .ok v) :
+    (c.put k r currentKey).seen = c.seen := by
+  cases r with
+  | idle | loading | failed _ => rfl
+  | ok v => exact False.elim (hnotOk v rfl)
+
+theorem Cached.lookup_put_ok {α : Type} (c : Cached α)
+    (k currentKey : String) (v : α) :
+    (c.put k (.ok v) currentKey).lookup k = some v := by
+  simp [Cached.lookup, Cached.put]
+
+private theorem find_take_mem {α : Type} (p : α → Bool) :
+    ∀ (n : Nat) (xs : List α) (a : α), (xs.take n).find? p = some a → xs.find? p = some a
+  | 0, _, _, h => by simp at h
+  | _ + 1, [], _, h => by simp at h
+  | n + 1, x :: xs, a, h => by
+      simp only [List.take_succ_cons, List.find?] at h ⊢
+      cases hp : p x with
+      | true => simpa [hp] using h
+      | false =>
+          simp only [hp] at h
+          exact find_take_mem p n xs a h
+
+private theorem find_filter_ne {α : Type} (p q : α → Bool) :
+    ∀ (xs : List α) (a : α),
+      (xs.filter q).find? p = some a →
+      (∀ x, p x = true → q x = true) →
+      xs.find? p = some a
+  | [], _, h, _ => by simp at h
+  | x :: xs, a, h, hqp => by
+      simp only [List.filter_cons] at h
+      cases hq : q x with
+      | true =>
+          simp only [hq, ↓reduceIte, List.find?] at h
+          cases hp : p x with
+          | true =>
+              simp only [hp] at h
+              cases h
+              simp [List.find?, hp]
+          | false =>
+              simp only [hp] at h
+              simp only [List.find?, hp]
+              exact find_filter_ne p q xs a h hqp
+      | false =>
+          simp only [hq, Bool.false_eq_true, ↓reduceIte] at h
+          have hpF : p x = false := by
+            cases hp : p x with
+            | false => rfl
+            | true => have := hqp x hp; simp [hq] at this
+          simp only [List.find?, hpF]
+          exact find_filter_ne p q xs a h hqp
+
+theorem Cached.lookup_put_ok_sound {α : Type} (c : Cached α)
+    (k k' currentKey : String) (v v' : α)
+    (h : (c.put k (.ok v) currentKey).lookup k' = some v') :
+    (k' = k ∧ v' = v) ∨ (k' ≠ k ∧ c.lookup k' = some v') := by
+  simp only [Cached.lookup, Cached.put, Option.map_eq_some_iff] at h
+  rcases h with ⟨kv, hfind, rfl⟩
+  have hmem := find_take_mem (fun x => x.1 == k') 32
+    ((k, v) :: c.seen.filter (fun x => x.1 != k)) kv hfind
+  simp only [List.find?] at hmem
+  by_cases heq : k = k'
+  · subst heq
+    simp only [beq_self_eq_true] at hmem
+    cases hmem
+    exact .inl ⟨rfl, rfl⟩
+  · have hbeq : (k == k') = false := beq_eq_false_iff_ne.2 heq
+    simp only [hbeq] at hmem
+    have horig := find_filter_ne (fun x => x.1 == k') (fun x => x.1 != k) c.seen kv hmem
+      (fun x hx => by
+        have hxk : x.1 = k' := eq_of_beq hx
+        subst hxk
+        exact bne_iff_ne.2 (fun h => heq h.symm))
+    refine .inr ⟨fun h => heq h.symm, ?_⟩
+    simp [Cached.lookup, horig]
+
+theorem Cached.put_seen_length_le {α : Type} (c : Cached α) (k currentKey : String) (r : Resource α) :
+    (c.put k r currentKey).seen.length ≤ Nat.max 32 c.seen.length := by
+  cases r with
+  | idle | loading | failed _ => exact Nat.le_max_right _ _
+  | ok _ =>
+      simp only [Cached.put]
+      exact Nat.le_trans (List.length_take_le _ _) (Nat.le_max_left _ _)
+
+theorem Query.wrap_preserves_inv {Model Msg : Type} (Inv : Model → Prop)
+    (qs : List (Query Model Msg)) (upd : Model → Msg → Model × Cmd Msg)
+    (old : Model) (msg : Msg)
+    (hold : Inv old)
+    (hupd : ∀ m, Inv m → Inv (upd m msg).1)
+    (hqs : ∀ q ∈ qs, (∀ m, Inv m → Inv (q.idle m)) ∧ (∀ k m, Inv m → Inv (q.load k m).1)) :
+    Inv (Query.wrap qs upd old msg).1 := by
+  unfold Query.wrap
+  dsimp only
+  let new := (upd old msg).1
+  have h0 : Inv new := hupd old hold
+  suffices hgen : ∀ (qs' : List (Query Model Msg)) (acc : Model × Cmd Msg),
+      Inv acc.1 →
+      (∀ q ∈ qs', (∀ m, Inv m → Inv (q.idle m)) ∧ (∀ k m, Inv m → Inv (q.load k m).1)) →
+      Inv (qs'.foldl (fun (mc : Model × Cmd Msg) q =>
+        let kNew := q.key new
+        if q.key old == kNew then mc
+        else if kNew.isEmpty then (q.idle mc.1, mc.2)
+        else
+          let (m', c') := q.load kNew mc.1
+          (m', .batch [mc.2, c'])) acc).1 by
+    exact hgen qs (upd old msg) h0 hqs
+  intro qs'
+  induction qs' with
+  | nil => intro acc hacc _; exact hacc
+  | cons q rest ih =>
+      intro acc hacc hq
+      rcases hq q (List.mem_cons_self ..) with ⟨hidle, hload⟩
+      have hrest : ∀ q' ∈ rest, (∀ m, Inv m → Inv (q'.idle m)) ∧ (∀ k m, Inv m → Inv (q'.load k m).1) :=
+        fun q' hq' => hq q' (List.mem_cons_of_mem q hq')
+      apply ih _ _ hrest
+      dsimp only
+      split
+      · exact hacc
+      · split
+        · exact hidle acc.1 hacc
+        · exact hload _ acc.1 hacc
+
+theorem Query.wrap_noop_when_keys_unchanged {Model Msg : Type}
+    (qs : List (Query Model Msg)) (upd : Model → Msg → Model × Cmd Msg)
+    (old : Model) (msg : Msg)
+    (hunchanged : ∀ q ∈ qs, q.key (upd old msg).1 = q.key old) :
+    Query.wrap qs upd old msg = upd old msg := by
+  unfold Query.wrap
+  dsimp only
+  induction qs with
+  | nil => rfl
+  | cons q rest ih =>
+      have hq : q.key (upd old msg).1 = q.key old := hunchanged q (List.mem_cons_self ..)
+      have hrest : ∀ q' ∈ rest, q'.key (upd old msg).1 = q'.key old :=
+        fun q' h => hunchanged q' (List.mem_cons_of_mem q h)
+      simp only [List.foldl_cons, hq, beq_self_eq_true, ↓reduceIte]
+      exact ih hrest
+
 end Qed

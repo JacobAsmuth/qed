@@ -179,6 +179,101 @@ def App.ssrRenderNativeBytes {Model Msg : Type} {m : Type → Type} [Monad m]
   return renderDocumentBytes title (app.renderModel mdl) script
     (state := app.dehydrate mdl) (css := renderStyleSheet app.styles)
 
+/-! ## JS SSR (`ssrStep`) ↔ Native In-Memory SSR (`ssrRenderNativeBytes`) Equivalence -/
+
+/-- Specification matching pre-fetched JS SSR response slots `results[i]` against the in-memory
+    server dispatch functions `dispatchBytes` / `dispatchText` along a command queue trace. -/
+inductive SsrResultsMatch {Model Msg : Type} (app : App Model Msg)
+    (results : Array (Bool × Bool × String))
+    (dispatchBytes : String → String → ByteArray → Except String ByteArray)
+    (dispatchText  : String → String → String → Except String String) :
+    Nat → Model → List (Cmd Msg) → Nat → Model → Prop where
+  | nil (fuel : Nat) (m : Model) (i : Nat) :
+      SsrResultsMatch app results dispatchBytes dispatchText i m [] fuel m
+  | reqHit {i : Nat} (hi : i < results.size) (method url body : String)
+      (onResult : Except String String → Msg) (m : Model) (rest : List (Cmd Msg))
+      (fuel : Nat) (mFinal : Model)
+      (hdisp : dispatchText method url body =
+        if results[i].1 then .ok results[i].2.2 else .error results[i].2.2) :
+      SsrResultsMatch app results dispatchBytes dispatchText (i + 1)
+        (app.update m (onResult (if results[i].1 then .ok results[i].2.2 else .error results[i].2.2))).1
+        (rest ++ Cmd.flatten (app.update m (onResult (if results[i].1 then .ok results[i].2.2 else .error results[i].2.2))).2)
+        fuel mFinal →
+      SsrResultsMatch app results dispatchBytes dispatchText i m (.request method url body onResult :: rest) (fuel + 1) mFinal
+  | reqBytesHit {i : Nat} (hi : i < results.size) (method url : String) (body : ByteArray)
+      (onResult : Except String ByteArray → Msg) (m : Model) (rest : List (Cmd Msg))
+      (fuel : Nat) (mFinal : Model)
+      (hdisp : dispatchBytes method url body =
+        if results[i].1 then if results[i].2.1 then Proto.decodeHex results[i].2.2 else .ok results[i].2.2.toUTF8
+        else .error results[i].2.2) :
+      SsrResultsMatch app results dispatchBytes dispatchText (i + 1)
+        (app.update m (onResult (if results[i].1 then if results[i].2.1 then Proto.decodeHex results[i].2.2 else .ok results[i].2.2.toUTF8 else .error results[i].2.2))).1
+        (rest ++ Cmd.flatten (app.update m (onResult (if results[i].1 then if results[i].2.1 then Proto.decodeHex results[i].2.2 else .ok results[i].2.2.toUTF8 else .error results[i].2.2))).2)
+        fuel mFinal →
+      SsrResultsMatch app results dispatchBytes dispatchText i m (.requestBytes method url body onResult :: rest) (fuel + 1) mFinal
+  | skip {i : Nat} (c : Cmd Msg) (hnot : (∀ m u b cb, c ≠ .request m u b cb) ∧ (∀ m u b cb, c ≠ .requestBytes m u b cb))
+      (m : Model) (rest : List (Cmd Msg)) (fuel : Nat) (mFinal : Model) :
+      SsrResultsMatch app results dispatchBytes dispatchText i m rest fuel mFinal →
+      SsrResultsMatch app results dispatchBytes dispatchText i m (c :: rest) (fuel + 1) mFinal
+
+private theorem ssrDrain_eq_ssrDrainQueueM {Model Msg : Type} (app : App Model Msg)
+    (results : Array (Bool × Bool × String))
+    (dispatchBytes : String → String → ByteArray → Except String ByteArray)
+    (dispatchText  : String → String → String → Except String String)
+    {i : Nat} {m mFinal : Model} {q : List (Cmd Msg)} {fuel : Nat}
+    (hmatch : SsrResultsMatch app results dispatchBytes dispatchText i m q fuel mFinal) :
+    ssrDrain app results m q i #[] = (mFinal, #[]) ∧
+    ssrDrainQueueM (m := Id) app dispatchBytes dispatchText fuel m q = mFinal := by
+  induction hmatch with
+  | nil fuel m i =>
+      cases fuel <;> simp [ssrDrain, ssrDrainQueueM, pure]
+  | reqHit hi method url body onResult m rest fuel mFinal hdisp _ ih =>
+      simp only [ssrDrain, Array.isEmpty_empty, hi]
+      simp only [ssrDrainQueueM, hdisp, bind]
+      exact ih
+  | reqBytesHit hi method url body onResult m rest fuel mFinal hdisp _ ih =>
+      simp only [ssrDrain, Array.isEmpty_empty, hi]
+      simp only [ssrDrainQueueM, hdisp, bind]
+      exact ih
+  | @skip _ c hnot m rest fuel mFinal _ ih =>
+      have hDrain : ∀ (j : Nat), ssrDrain app results m (c :: rest) j #[] = ssrDrain app results m rest j #[] := by
+        intro j
+        rcases hnot with ⟨h1, h2⟩
+        cases c with
+        | request m' u b cb => exact absurd rfl (h1 m' u b cb)
+        | requestBytes m' u b cb => exact absurd rfl (h2 m' u b cb)
+        | _ => simp only [ssrDrain]
+      have hQueue : ssrDrainQueueM (m := Id) app dispatchBytes dispatchText (fuel + 1) m (c :: rest) =
+          ssrDrainQueueM (m := Id) app dispatchBytes dispatchText fuel m rest := by
+        rcases hnot with ⟨h1, h2⟩
+        cases c with
+        | request m' u b cb => exact absurd rfl (h1 m' u b cb)
+        | requestBytes m' u b cb => exact absurd rfl (h2 m' u b cb)
+        | _ => rfl
+      rw [hDrain, hQueue]
+      exact ih
+
+/-- Equivalence between Node/Edge JS SSR (`App.ssrStep`) and native in-memory SSR
+    (`App.ssrRenderNativeBytes (m := Id)`): whenever the pre-fetched `resultsJson` matches the
+    in-memory server dispatchers along the boot queue, both produce the **exact** same HTML5
+    document bytes. -/
+theorem App.ssrStep_equiv_ssrRenderNativeBytes {Model Msg : Type} (app : App Model Msg)
+    (path title script resultsJson : String)
+    (dispatchBytes : String → String → ByteArray → Except String ByteArray)
+    (dispatchText  : String → String → String → Except String String)
+    (fuel : Nat) (mFinal : Model)
+    (hmatch : let initQ := app.ssrInitQueue path
+              SsrResultsMatch app (ssrResults resultsJson) dispatchBytes dispatchText 0 initQ.1 initQ.2 fuel mFinal) :
+    let doc := renderDocument title (app.renderModel mFinal) script
+      (state := app.dehydrate mFinal) (css := renderStyleSheet app.styles)
+    app.ssrStep path title script resultsJson = Json.render (.obj [("html", .str doc)]) ∧
+    App.ssrRenderNativeBytes (m := Id) app path title dispatchBytes dispatchText script fuel = doc.toUTF8 := by
+  obtain ⟨hd, hq⟩ := ssrDrain_eq_ssrDrainQueueM app (ssrResults resultsJson) dispatchBytes dispatchText hmatch
+  refine ⟨?_, ?_⟩
+  · simp [App.ssrStep, hd]
+  · simp only [App.ssrRenderNativeBytes, App.ssrBootM, bind, pure, hq]
+    rfl
+
 /-- Server-side binary Protobuf wire adapter around a typed RPC handler `Req → Except String Resp`. -/
 def rpcWireDispatch {Req Resp : Type} [FromProto Req] [ToProto Resp]
     (handler : Req → Except String Resp) (reqBytes : ByteArray) : Except String ByteArray := do

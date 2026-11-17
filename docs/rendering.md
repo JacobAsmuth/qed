@@ -18,7 +18,7 @@ At the pure `Html` and `View` layer:
   their signal indices so sibling bindings stay aligned, and a branch that remains hidden stays
   structurally stable regardless of changes inside it.
 
-In [`Qed/Proofs/DomEquiv.lean`](../Qed/Proofs/DomEquiv.lean), these theorems are lifted to the
+In [`Qed/Proofs/`](../Qed/Proofs) (`DomArena.lean`, `ViewPatch.lean`, `KeyedReconcile.lean`, `Hydration.lean`), these theorems are lifted to the
 imperative `MonadDom` driver (`Qed/Driver/`). Evaluated against a pure W3C DOM arena
 (`SpecDom`), Qed proves that initial mounts (`buildDomM`), text-run hydration, W3C
 `insertBefore` keyed moves, fine-grained `.dyn` updates, `V.memo` skipping, and SSR rehydration

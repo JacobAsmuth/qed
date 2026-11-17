@@ -315,4 +315,239 @@ theorem hydrate_coalesce (cs : List (Html msg)) :
     hydrateChildrenSpec false cs (coalesceTextRun cs) = cs :=
   (hydrateChildrenSpec_roundtrip cs).1
 
+/-! ## End-to-End Serialization & Valid-Attribute Preservation Closure -/
+
+theorem sanitizeKey_of_safe {k : String} (hk : k.toList.all isKeyChar = true) :
+    sanitizeKey k = k := by
+  simp [sanitizeKey, hk]
+
+theorem renderAttr_valid_attr (hs : Array msg) {k v : String}
+    (hv : (Attr.attr k v : Attr msg).valid = true) :
+    renderAttr hs (.attr k v) = (" " ++ k ++ "=\"" ++ escapeHtml v ++ "\"", hs) := by
+  simp only [Attr.valid, Attr.validKeyValue, isSafeAttrName, Bool.and_eq_true, Bool.or_eq_true,
+    Bool.not_eq_true'] at hv
+  rcases hv with ⟨⟨hkc, hsafe⟩, hurl⟩
+  have hsk : sanitizeKey k = k := sanitizeKey_of_safe hkc
+  have hnotBad : (!isSafeRenderedKey k || isUrlAttrName k && !isSafeUrl v) = false := by
+    cases hu : isUrlAttrName k with
+    | false => simp [hsafe]
+    | true =>
+        rcases hurl with huF | hsUrl
+        · simp [hu] at huF
+        · simp [hsafe, hsUrl]
+  simp [renderAttr, hsk, hnotBad]
+
+theorem renderAttr_valid_flag (hs : Array msg) {k : String}
+    (hv : (Attr.flag k true : Attr msg).valid = true) :
+    renderAttr hs (.flag k true) = (" " ++ k ++ "=\"" ++ k ++ "\"", hs) := by
+  simp only [Attr.valid, isSafeAttrName, Bool.and_eq_true] at hv
+  have hsk : sanitizeKey k = k := sanitizeKey_of_safe hv.1
+  simp [renderAttr, hsk, hv.2]
+
+theorem renderAttr_valid_on (hs : Array msg) {ev : String} (m : msg)
+    (hv : (Attr.on ev m).valid = true) (hne : ev ≠ "") :
+    renderAttr hs (.on ev m) = (" data-qed-on-" ++ ev ++ "=\"" ++ toString hs.size ++ "\"", hs.push m) := by
+  simp only [Attr.valid, isSafeAttrName, Bool.and_eq_true] at hv
+  have hsk : sanitizeKey ev = ev := sanitizeKey_of_safe hv.1
+  have hneB : ev.isEmpty = false := by
+    cases he : ev.isEmpty with
+    | false => rfl
+    | true => exact absurd (String.isEmpty_iff.1 he) hne
+  simp [renderAttr, hsk, hneB]
+
+private theorem isKeyChar_no_angle {c : Char} (h : isKeyChar c = true) : c ≠ '<' ∧ c ≠ '>' := by
+  unfold isKeyChar at h
+  simp only [Bool.or_eq_true, beq_iff_eq] at h
+  refine ⟨?_, ?_⟩ <;> intro heq <;> subst heq <;> simp [Char.isAlphanum, Char.isAlpha, Char.isDigit] at h
+
+private theorem digitChar_no_angle (d : Nat) (hd : d < 10) :
+    Nat.digitChar d ≠ '<' ∧ Nat.digitChar d ≠ '>' := by
+  match d, hd with
+  | 0, _ | 1, _ | 2, _ | 3, _ | 4, _ | 5, _ | 6, _ | 7, _ | 8, _ | 9, _ => decide
+  | _ + 10, h => omega
+
+private theorem toDigitsCore_no_angle :
+    ∀ (k m : Nat) (acc : List Char),
+      (∀ c ∈ acc, c ≠ '<' ∧ c ≠ '>') →
+      ∀ c ∈ Nat.toDigitsCore 10 k m acc, c ≠ '<' ∧ c ≠ '>'
+  | 0, m, acc, hacc, c, hc => by
+      rw [Nat.toDigitsCore.eq_1] at hc
+      exact hacc c hc
+  | k + 1, m, acc, hacc, c, hc => by
+      rw [Nat.toDigitsCore.eq_2] at hc
+      split at hc
+      · rcases List.mem_cons.1 hc with rfl | hmem
+        · exact digitChar_no_angle (m % 10) (Nat.mod_lt _ (by decide))
+        · exact hacc c hmem
+      · exact toDigitsCore_no_angle k (m / 10) (Nat.digitChar (m % 10) :: acc)
+          (fun x hx => by
+            rcases List.mem_cons.1 hx with rfl | hmem
+            · exact digitChar_no_angle (m % 10) (Nat.mod_lt _ (by decide))
+            · exact hacc x hmem)
+          c hc
+
+private theorem nat_repr_no_angle (n : Nat) :
+    ∀ c ∈ (toString n).toList, c ≠ '<' ∧ c ≠ '>' := by
+  intro c hc
+  change c ∈ (Nat.repr n).toList at hc
+  unfold Nat.repr Nat.toDigits at hc
+  rw [String.toList_ofList] at hc
+  exact toDigitsCore_no_angle (n + 1) n [] (fun _ h => nomatch h) c hc
+
+private theorem escapeHtml_no_angle (s : String) :
+    ∀ c ∈ (escapeHtml s).toList, c ≠ '<' ∧ c ≠ '>' := by
+  intro c hc
+  have hnm := escapeHtml_no_markup_or_quote s c hc
+  simp only [isMarkupOrQuote, Bool.or_eq_false_iff, beq_eq_false_iff_ne, ne_eq] at hnm
+  exact ⟨hnm.1.1.1, hnm.1.1.2⟩
+
+private theorem str_append_no_angle {a b : String}
+    (ha : ∀ c ∈ a.toList, c ≠ '<' ∧ c ≠ '>')
+    (hb : ∀ c ∈ b.toList, c ≠ '<' ∧ c ≠ '>') :
+    ∀ c ∈ (a ++ b).toList, c ≠ '<' ∧ c ≠ '>' := by
+  intro c hc
+  rw [String.toList_append, List.mem_append] at hc
+  rcases hc with h1 | h2
+  · exact ha c h1
+  · exact hb c h2
+
+private theorem lit_no_angle (s : String) (h : s.toList.all (fun c => c != '<' && c != '>') = true) :
+    ∀ c ∈ s.toList, c ≠ '<' ∧ c ≠ '>' := by
+  rw [List.all_eq_true] at h
+  intro c hc
+  have hb := h c hc
+  simp only [Bool.and_eq_true, bne_iff_ne] at hb
+  exact hb
+
+/-- Defense-in-depth: no rendered attribute string ever contains `<` or `>`, preventing HTML
+    tag breakout from attribute context regardless of attribute values or keys. -/
+theorem renderAttr_no_angle_brackets (hs : Array msg) (a : Attr msg) :
+    ∀ c ∈ (renderAttr hs a).1.toList, c ≠ '<' ∧ c ≠ '>' := by
+  cases a with
+  | cls name =>
+      simp only [renderAttr, toString_string]
+      repeat apply str_append_no_angle
+      · exact lit_no_angle " class=\"" rfl
+      · exact escapeHtml_no_angle name
+      · exact lit_no_angle "\"" rfl
+  | attr k v =>
+      simp only [renderAttr]
+      split
+      · exact lit_no_angle "" rfl
+      · simp only [toString_string]
+        repeat apply str_append_no_angle
+        · exact lit_no_angle " " rfl
+        · exact fun c hc => isKeyChar_no_angle (sanitizeKey_safe k c hc)
+        · exact lit_no_angle "=\"" rfl
+        · exact escapeHtml_no_angle v
+        · exact lit_no_angle "\"" rfl
+  | flag k present =>
+      simp only [renderAttr]
+      split
+      · exact lit_no_angle "" rfl
+      · simp only [toString_string]
+        repeat apply str_append_no_angle
+        · exact lit_no_angle " " rfl
+        · exact fun c hc => isKeyChar_no_angle (sanitizeKey_safe k c hc)
+        · exact lit_no_angle "=\"" rfl
+        · exact fun c hc => isKeyChar_no_angle (sanitizeKey_safe k c hc)
+        · exact lit_no_angle "\"" rfl
+  | key _ => exact lit_no_angle "" rfl
+  | on event m =>
+      simp only [renderAttr]
+      split
+      · exact lit_no_angle "" rfl
+      · simp only [toString_string]
+        repeat apply str_append_no_angle
+        · exact lit_no_angle " data-qed-on-" rfl
+        · exact fun c hc => isKeyChar_no_angle (sanitizeKey_safe event c hc)
+        · exact lit_no_angle "=\"" rfl
+        · exact nat_repr_no_angle hs.size
+        · exact lit_no_angle "\"" rfl
+  | onValue _ _ => exact lit_no_angle "" rfl
+  | localCell key comp _ _ _ =>
+      simp only [renderAttr, toString_string]
+      repeat apply str_append_no_angle
+      · exact lit_no_angle " data-qed-local=\"" rfl
+      · exact escapeHtml_no_angle (localKey comp key)
+      · exact lit_no_angle "\"" rfl
+  | signalBind name =>
+      simp only [renderAttr, toString_string]
+      repeat apply str_append_no_angle
+      · exact lit_no_angle " data-qed-signal=\"" rfl
+      · exact escapeHtml_no_angle name
+      · exact lit_no_angle "\"" rfl
+  | signalAttr _ attr value =>
+      simp only [renderAttr]
+      split
+      · exact lit_no_angle "" rfl
+      · simp only [toString_string]
+        repeat apply str_append_no_angle
+        · exact lit_no_angle " " rfl
+        · exact fun c hc => isKeyChar_no_angle (sanitizeKey_safe attr c hc)
+        · exact lit_no_angle "=\"" rfl
+        · exact escapeHtml_no_angle value
+        · exact lit_no_angle "\"" rfl
+
+theorem renderAttrs_no_angle_brackets (hs : Array msg) :
+    ∀ (attrs : List (Attr msg)), ∀ c ∈ (renderAttrs hs attrs).1.toList, c ≠ '<' ∧ c ≠ '>'
+  | [] => lit_no_angle "" rfl
+  | a :: as => by
+      simp only [renderAttrs]
+      exact str_append_no_angle (renderAttr_no_angle_brackets hs a)
+        (renderAttrs_no_angle_brackets (renderAttr hs a).2 as)
+
+/-- End-to-end HTML safety closure: whenever `Html.validIn ctx h = true`, every element in `h`
+    has a safe, non-forbidden tag (`<script>`/`<base>`/`<object>`/`<embed>`/`<applet>` forbidden),
+    every attribute is `Attr.valid` (no `on*`, `srcdoc`, or unsafe URL schemes), void tags are
+    childless, and rendered `<style>` bodies contain zero `</` close sequences. -/
+def Html.EveryElementSafe : Html msg → Prop
+  | .text _ => True
+  | .element tag attrs children =>
+      isSafeTagName tag = true ∧
+      isForbiddenTag tag = false ∧
+      Attr.validList attrs = true ∧
+      (!isVoidTag tag || children.isEmpty) = true ∧
+      (tag == "style" →
+        containsCloseSeq (escapeRawText (String.join (children.map fun | .text s => s | _ => ""))).toList = false) ∧
+      ∀ c ∈ children, Html.EveryElementSafe c
+
+mutual
+  theorem Html.validIn_everyElementSafe :
+      ∀ (ctx : HtmlCtx) (h : Html msg),
+        Html.validIn ctx h = true → Html.EveryElementSafe h
+    | _, .text _, _ => by simp [Html.EveryElementSafe]
+    | ctx, .element tag attrs children, hv => by
+        simp only [Html.validIn, Bool.and_eq_true] at hv
+        rcases hv with ⟨⟨⟨hattrs, hvoid⟩, _⟩, hrest⟩
+        cases hctx : stepHtmlCtx ctx tag with
+        | none => simp [hctx] at hrest
+        | some childCtx =>
+            simp only [hctx] at hrest
+            unfold stepHtmlCtx at hctx
+            by_cases hbad : (!isSafeTagName tag || isForbiddenTag tag) = true
+            · simp [hbad] at hctx
+            · have hok : isSafeTagName tag = true ∧ isForbiddenTag tag = false := by
+                have hbf := Bool.eq_false_iff.2 hbad
+                simp only [Bool.or_eq_false_iff, Bool.not_eq_false'] at hbf
+                exact hbf
+              simp only [Html.EveryElementSafe]
+              refine ⟨hok.1, hok.2, hattrs, hvoid, fun _ => containsCloseSeq_escapeRawText _, ?_⟩
+              exact Html.validListIn_everyElementSafe childCtx children hrest
+
+  theorem Html.validListIn_everyElementSafe :
+      ∀ (ctx : HtmlCtx) (cs : List (Html msg)),
+        Html.validListIn ctx cs = true → ∀ c ∈ cs, Html.EveryElementSafe c
+    | _, [], _, _, h => nomatch h
+    | ctx, y :: ys, hy, x, hx => by
+        simp only [Html.validListIn, Bool.and_eq_true] at hy
+        rcases List.mem_cons.1 hx with rfl | hx'
+        · exact Html.validIn_everyElementSafe ctx x hy.1
+        · exact Html.validListIn_everyElementSafe ctx ys hy.2 x hx'
+end
+
+theorem Html.valid_everyElementSafe {h : Html msg} (hv : Html.valid h = true) :
+    Html.EveryElementSafe h :=
+  Html.validIn_everyElementSafe {} h hv
+
 end Qed

@@ -19,7 +19,7 @@ lean_lib QedServer where
   moreLinkArgs := #["-pthread", "-lssl", "-lcrypto"]
 
 lean_lib QedProofs where
-  roots := #[`Qed.Proofs.DomEquiv]
+  roots := #[`Qed.Proofs.DomArena, `Qed.Proofs.ViewPatch, `Qed.Proofs.KeyedReconcile, `Qed.Proofs.Hydration]
 
 lean_lib JsProofs where
   roots := #[`Js.Proofs]

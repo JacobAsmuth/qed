@@ -105,7 +105,7 @@ From this single `schema`, Qed generates:
 - `Order.parse`, returning `Option Order` where every field in `Order` carries a compile-time proof of its constraints.
 - JSON and binary Protobuf codecs (`Order.encode` and matching decoders) that enforce the exact same rules on the wire.
 
-See [Signup](Examples/Signup.lean) for a complete form and [Booking](Examples/Booking.lean) for validation rules parameterized by live context (such as today's date).
+See [Signup](Examples/Signup.lean) and [Bookshelf](Examples/Bookshelf.lean) for complete schema-backed forms (schemas also support context parameters like `schema Appt (today : Date)` for rules checked against live state).
 
 ### 4. Full-stack server rules, client–server contracts, and race-free `await`
 
@@ -207,13 +207,13 @@ Inside this repository, `npm run dev`, `npm run build`, and `npm run test` are a
 
 ## Learn more
 
-- **[Example tour](Examples/README.md):** Guided progression from [Hello](Examples/Hello.lean) and [Counter](Examples/Counter.lean) through forms, `for_each` collections, [Effects & typed JS ports](Examples/Effects.lean), streaming, WebSockets, and [CloudBooks](Examples/CloudBooks.lean).
+- **[Example tour](Examples/README.md):** Guided progression through six examples: [Counter](Examples/Counter.lean), [Todo](Examples/Todo.lean) (`for_each` collections & scoped CSS), [Signup](Examples/Signup.lean) (validated forms), [Chat](Examples/Chat.lean) (streaming SSE), [Bookshelf](Examples/Bookshelf.lean) (routing & SSR), and [CloudBooks](Examples/CloudBooks.lean) (full-stack server & RPCs).
 - **[Components & apps](docs/components.md):** Props, `slot`s, `children`, `bind:`, `route`, `query`, `<Await>`, and stateful composition.
 - **[Invariants](docs/invariants.md):** Automatic proofs, `:= by` tactic proofs, `for_each` collection lifts, and view/styling predicates.
 - **[How Qed works](docs/architecture.md):** Compilation pipeline, trusted computing base, verification gates, and source map.
 - **[Rendering & DOM proofs](docs/rendering.md):** Direct signal updates, keyed reconciliation, verified memoization, and browser equivalence tests.
 
-Qed apps are written in Lean 4, including expressions inside JSX. Familiar component concepts help you get started quickly, while writing custom logic or involved invariants means learning Lean syntax and proof basics. JavaScript interop uses [typed ports](Examples/Effects.lean).
+Qed apps are written in Lean 4, including expressions inside JSX. Familiar component concepts help you get started quickly, while writing custom logic or involved invariants means learning Lean syntax and proof basics. JavaScript interop uses [typed ports](docs/components.md).
 
 Questions and issues: [GitHub issues](https://github.com/JacobAsmuth/qed/issues).
 

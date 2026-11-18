@@ -91,5 +91,5 @@ and seeded mutation sequences through the real JavaScript driver in headless Chr
 
 In addition, [`test/js_gate_test.mjs`](../test/js_gate_test.mjs) tests native Lean against
 transpiled JavaScript on pure rendering (including 16,000-sibling wide lists and handler order)
-and key indexing, while feature suites in [`test/`](../test) exercise SSR hydration, local
-components, and browser effects end-to-end.
+and key indexing, while [`test/fullstack_rpc_test.mjs`](../test/fullstack_rpc_test.mjs) exercises
+the native C server, SSR, and binary RPC transport end-to-end.

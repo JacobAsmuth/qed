@@ -22,13 +22,13 @@ function buildEnv(webRoot, outDir) {
   return { ...process.env, PATH, QED_HOME: ROOT, QED_WEB_ROOT: webRoot, ...(outDir !== SERVE ? { QED_OUT_DIR: outDir } : {}) };
 }
 
-export function buildDev(webRoot = 'Examples.Web', outDir = SERVE) {
+export function buildDev(webRoot = 'Examples.Counter', outDir = SERVE) {
   const r = spawnSync(qedBin(), ['build', '--dev'], { cwd: ROOT, env: buildEnv(webRoot, outDir), encoding: 'utf8' });
   if (r.status !== 0) { process.stderr.write((r.stdout || '') + (r.stderr || '')); process.exit(1); }
 }
 
 const buildCache = new Map();
-export function buildDevAsync(webRoot = 'Examples.Web', outDir = path.join(ROOT, '.qed', 'test', webRoot)) {
+export function buildDevAsync(webRoot = 'Examples.Counter', outDir = path.join(ROOT, '.qed', 'test', webRoot)) {
   if (!buildCache.has(outDir)) {
     buildCache.set(outDir, execFileAsync(qedBin(), ['build', '--dev'], { cwd: ROOT, env: buildEnv(webRoot, outDir), maxBuffer: 16 << 20 }).then(() => outDir));
   }
@@ -103,9 +103,7 @@ export async function withBrowser(name, opts, fn) {
 const SUBPROCESS_SUITES = ['cli_scaffold_test.mjs', 'js_gate_test.mjs'];
 const BROWSER_SUITES = [
   'fullstack_rpc_test.mjs',
-  'dom_equivalence_test.mjs', 'chat_test.mjs', 'signup_test.mjs', 'booking_test.mjs',
-  'todo_test.mjs', 'users_test.mjs', 'local_test.mjs', 'effects_test.mjs',
-  'template_test.mjs', 'bookshelf_test.mjs', 'socket_test.mjs', 'live_test.mjs',
+  'dom_equivalence_test.mjs',
 ];
 
 const runSubprocess = (file) => new Promise((resolve) => {
@@ -139,7 +137,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
       }
     }
 
-    try { await Promise.all(Array.from({ length: 4 }, worker)); }
+    try { await Promise.all(Array.from({ length: Math.min(4, BROWSER_SUITES.length) }, worker)); }
     finally { const b = await browserPromise.catch(() => null); if (b) await b.close(); }
     failed += (await subPromise).reduce((a, b) => a + b, 0);
     console[failed ? 'error' : 'log'](failed === 0 ? `\x1b[32m✓ ${total}/${total} test suites passed\x1b[0m` : `\x1b[31m✗ ${failed}/${total} test suite(s) failed\x1b[0m`);

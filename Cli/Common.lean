@@ -16,8 +16,8 @@ def runtimeFile (name : String) : IO FilePath := return (← frameworkHome) / "r
 
 def webRoot : IO String := do
   if let some r ← env "QED_WEB_ROOT" then return r
-  if !(← (FilePath.mk "Web.lean").pathExists) && (← (FilePath.mk "Examples" / "Web.lean").pathExists) then
-    return "Examples.Web"
+  if !(← (FilePath.mk "Web.lean").pathExists) && (← (FilePath.mk "Examples" / "Counter.lean").pathExists) then
+    return "Examples.Counter"
   return "Web"
 
 def jsRoot : IO String := do
@@ -28,12 +28,14 @@ def jsRoot : IO String := do
 def takeIdentChars (s : String) : String :=
   (s.takeWhile fun c => c.isAlphanum || c == '.' || c == '_' || c == '\'').toString
 
-def fullstackAppName (mod : String) : IO (Option String) := do
+private def scanModuleTokens {α : Type} (mod : String) (init : α)
+    (onLine : List String → List String → α → Except α α) : IO α := do
   let path := FilePath.mk ((mod.replace "." "/") ++ ".lean")
-  if !(← path.pathExists) then return none
+  if !(← path.pathExists) then return init
   let src ← IO.FS.readFile path
   let mut depth : Nat := 0
   let mut nsStack : List String := []
+  let mut acc := init
   for raw in src.splitOn "\n" do
     let inComment := depth > 0
     depth := depth + ((raw.splitOn "/-").length - 1) - ((raw.splitOn "-/").length - 1)
@@ -46,12 +48,20 @@ def fullstackAppName (mod : String) : IO (Option String) := do
         if !cleanNs.isEmpty then nsStack := cleanNs :: nsStack
     | "end" :: _ =>
         nsStack := nsStack.drop 1
+    | _ =>
+        match onLine nsStack toks acc with
+        | .error done => return done
+        | .ok next    => acc := next
+  return acc
+
+def fullstackAppName (mod : String) : IO (Option String) :=
+  scanModuleTokens mod none fun nsStack toks _ =>
+    match toks with
     | "fullstack" :: rawName :: _ =>
         let fs := takeIdentChars rawName
-        if !fs.isEmpty then
-          return some (String.intercalate "." (nsStack.reverse ++ [fs]))
-    | _ => pure ()
-  return none
+        if fs.isEmpty then .ok none
+        else .error (some (String.intercalate "." (nsStack.reverse ++ [fs])))
+    | _ => .ok none
 
 def ssrAppName (mod : String) : IO (Option String) := do
   let path := FilePath.mk ((mod.replace "." "/") ++ ".lean")
@@ -62,6 +72,19 @@ def ssrAppName (mod : String) : IO (Option String) := do
       let name := takeIdentChars (rest.dropWhile (· == ' ')).toString
       return if name.isEmpty then none else some name
   | _ => return none
+
+def componentAppName (mod : String) : IO (Option String) := do
+  let (lastTop, lastAny) ← scanModuleTokens mod (none, none) fun nsStack toks (lastTop, lastAny) =>
+    match toks with
+    | "component" :: rawName :: _ =>
+        let cName := takeIdentChars rawName
+        if cName.isEmpty then .ok (lastTop, lastAny)
+        else
+          let top' := if nsStack.isEmpty then some s!"{cName}.app" else lastTop
+          let any' := some (String.intercalate "." (nsStack.reverse ++ [cName, "app"]))
+          .ok (top', any')
+    | _ => .ok (lastTop, lastAny)
+  return lastTop.orElse (fun _ => lastAny)
 
 def driverEntries : Array String := #[
   "main:__main",

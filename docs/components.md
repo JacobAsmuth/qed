@@ -102,8 +102,7 @@ Qed supports three stateful composition modes:
    parent component with zero JSON overhead—including interactive `{children}` that dispatch parent
    actions.
 2. **Dynamic keyed local cells (`key=` / `initial=`):** Mounting `<Editor key={row.id} initial={{ note := row.text }} onSave={…}/>`
-   registers a `LocalDef` cell whose state is keyed per row and survives parent list re-renders
-   (see [`Examples/Local.lean`](../Examples/Local.lean)).
+   registers a `LocalDef` cell whose state is keyed per row and survives parent list re-renders.
 3. **Parent-owned `collection`s:** When a parent needs to read, filter, or sort child states,
    declare `collection rows : Row` (where `Row` declares `key id`). Inside the parent view,
    `<Row key={r.id} state={r}/>` automatically infers `onMsg={.rows}`, and `{for r in rows => <Row state={r}/>}`

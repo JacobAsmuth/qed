@@ -11,10 +11,10 @@ cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 export PATH="${HOME}/.elan/bin:${PATH}"
 # In-repo development: the framework is the current directory, and the demo's
-# web entry is Examples.Web (installed apps default to `Web`). Both are
-# overridable, e.g. `QED_WEB_ROOT=Examples.ChatWeb ./scripts/qed build --dev`.
+# web entry is Examples.Counter (installed apps default to `Web`). Both are
+# overridable, e.g. `QED_WEB_ROOT=Examples.Chat ./scripts/qed build --dev`.
 export QED_HOME="${QED_HOME:-${PWD}}"
-export QED_WEB_ROOT="${QED_WEB_ROOT:-Examples.Web}"
+export QED_WEB_ROOT="${QED_WEB_ROOT:-Examples.Counter}"
 
 # Build the CLI (skip `lake` altogether when `.lake/build/bin/qed` is newer than CLI sources).
 if [ ! -x .lake/build/bin/qed ] || \

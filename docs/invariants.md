@@ -140,7 +140,7 @@ invariant feedStyled : Card.cardStyled for_each cards
 
 Qed applies `Card.cardStyled` to each rendered card (invariant under `Html.map` message wrapping) and
 checks the rest of the parent markup separately. If a branch needs manual help, the error message provides a `forEachStyleLift` skeleton
-(see [`Examples/Feed.lean`](../Examples/Feed.lean) for both state and styling lifts in action).
+(see [`Examples/Todo.lean`](../Examples/Todo.lean) for both state and styling lifts in action).
 
 ## Styling invariants (over the view)
 
@@ -226,26 +226,14 @@ Skip invariants when the guarantee already lives somewhere better:
   not app models.
 - **Unconstrained external messages:** If a message constructor carries arbitrary external data,
   no transition proof can restrict what arrives unless you narrow the message or model types
-  first (as in [`Examples/Users.lean`](../Examples/Users.lean) and
-  [`Examples/Bookshelf.lean`](../Examples/Bookshelf.lean)).
+  first (as in [`Examples/Bookshelf.lean`](../Examples/Bookshelf.lean)).
 
 ## Worked examples in this repo
 
-- [`Examples/Counter.lean`](../Examples/Counter.lean) — `counterSafe`: automatic numeric bound.
-- [`Examples/Booking.lean`](../Examples/Booking.lean) — `bookedNeedsToday`: automatic `Option`
-  precondition across nested `match` branches.
-- [`Examples/Live.lean`](../Examples/Live.lean) — `nonNegative`: automatic bound with handlers
-  that read live model values.
-- [`Examples/Local.lean`](../Examples/Local.lean) — `stepperSafe`: automatic bound over
-  `component`-generated actions.
-- [`Examples/Socket.lean`](../Examples/Socket.lean) — `composerOnlyWhenOnline`
-  (`draft ≠ "" → conn = .online`): automatic state-machine precondition where disconnect clears
-  stale drafts.
+- [`Examples/Counter.lean`](../Examples/Counter.lean) — `counterSafe`: automatic numeric bound (`0 ≤ count`).
+- [`Examples/Todo.lean`](../Examples/Todo.lean) — `Row.rowSafe`, `Row.rowStyled`, `rowsSafe`, and
+  `rowsStyled`: `for_each` lifts for both state and scoped CSS styling across a `collection`.
 - [`Examples/Chat.lean`](../Examples/Chat.lean) — `streamSafe`: automatic effect-safety invariant
-  on a streaming `transition`.
-- [`Examples/Badge.lean`](../Examples/Badge.lean) — `levelSafe` alongside
-  `statusStyled`.
-- [`Examples/Template.lean`](../Examples/Template.lean) — `idsBelowNext`: custom `:= by` proof
-  for fresh ID allocation over `.map` and `.push`.
-- [`Examples/Feed.lean`](../Examples/Feed.lean) — `feedSafe` and `feedStyled`: `for_each` lifts
-  for both state and styling across a card list.
+  (`pending = true → 0 < turns.size`) on a streaming SSE action.
+- [`Examples/CloudBooks.lean`](../Examples/CloudBooks.lean) — server state, monotonicity, and auth
+  invariants paired with RPC `requires`/`ensures` contracts and client `orderedMatchesSlot`.

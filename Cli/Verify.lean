@@ -60,10 +60,9 @@ def kernelEnvClean (q? : Option QedjsEnv := none) : IO Bool := do
       "Qed", "Qed.Driver", "Qed.Server.Native",
       "Qed.Proofs.DomArena", "Qed.Proofs.ViewPatch", "Qed.Proofs.KeyedReconcile", "Qed.Proofs.Hydration",
       "Js.Backend", "Js.Proofs",
-      "Examples.Bookshelf", "Examples.CloudBooks", "Examples.ServerChecks",
-      "Examples.Todo", "Examples.Chat", "Examples.Signup",
-      "Examples.Booking", "Examples.Users", "Examples.Local", "Examples.Effects",
-      "Examples.Template", "Examples.Socket", "Examples.Live", "Examples.DomProbe",
+      "Examples.Counter", "Examples.Todo", "Examples.Signup",
+      "Examples.Chat", "Examples.Bookshelf", "Examples.CloudBooks",
+      "Examples.ServerChecks", "Examples.DomProbe",
       "Examples.JsGate", root
     ]
     q.run (#["--verify-env"] ++ mods) (quiet := true)
@@ -87,9 +86,18 @@ def externsCovered (q? : Option QedjsEnv := none) : IO Bool := do
         mods := #[mod, "Qed.Driver"]
         entries := #[s!"{fsName}.clientApp"] ++ driverEntries.filter (!·.startsWith "main:")
     | none =>
-        mods := #[mod]
-        entries := driverEntries ++
-          (match ← ssrAppName mod with | some a => #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"] | none => #[])
+        match ← ssrAppName mod with
+        | some a =>
+            mods := #[mod]
+            entries := driverEntries ++ #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"]
+        | none =>
+            match ← componentAppName mod with
+            | some a =>
+                mods := #[mod, "Qed.Driver"]
+                entries := driverEntries.filter (!·.startsWith "main:") ++ #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"]
+            | none =>
+                mods := #[mod]
+                entries := driverEntries
   if hasExamples then
     mods := mods.push "Examples.JsGate"
     entries := entries ++ #["JsGate.run", "JsGate.counts", "JsGate.probeCount", "JsGate.names"]
@@ -101,7 +109,7 @@ def verify (checkExterns : Bool := true) : IO Bool := do
   step "verifying proofs & axioms"
   let hasExamples ← (FilePath.mk "Examples").pathExists
   if hasExamples then
-    if (← shQuiet "lake" #["build", "Qed", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples"]) != 0 then return false
+    if (← shQuiet "lake" #["build", "Qed", "Qed.Driver", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples"]) != 0 then return false
   else
     let root ← webRoot
     let jsMod ← jsRoot

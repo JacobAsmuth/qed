@@ -6,18 +6,18 @@ import Qed.Proofs.KeyedReconcile
 import Qed.Proofs.Hydration
 import Js.Proofs
 import Examples.Counter
-import Examples.Booking
+import Examples.Todo
+import Examples.Signup
 import Examples.Chat
-import Examples.Template
-import Examples.Live
-import Examples.Socket
+import Examples.Bookshelf
 import Examples.CloudBooks
 
 #print axioms Counter.counterSafe
-#print axioms Booking.bookedNeedsToday
-#print axioms TemplateDemo.idsBelowNext
-#print axioms Live.nonNegative
-#print axioms Socket.composerOnlyWhenOnline
+#print axioms Todo.Row.rowSafe
+#print axioms Todo.Row.rowStyled
+#print axioms Todo.rowsSafe
+#print axioms Todo.rowsStyled
+#print axioms Account.canSubmit_iff
 #print axioms Chat.streamSafe
 #print axioms Qed.diff_apply
 #print axioms Qed.diffChildren_apply
@@ -208,7 +208,8 @@ import Examples.CloudBooks
 #print axioms Qed.hasTag_canonical
 #print axioms Qed.canonical_congr_pred
 #print axioms Counter.app_view_eq
-#print axioms Booking.app_view_eq
+#print axioms Todo.app_view_eq
+#print axioms Bookshelf.app_view_eq
 #print axioms Qed.CleanDomSubtree_equiv
 #print axioms Qed.applyPositionalStepsM_spec
 #print axioms Qed.applyToDomM_spec

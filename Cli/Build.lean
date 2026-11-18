@@ -117,6 +117,23 @@ private def resolveLinkMeta (cObjTargets : Array String) :
   fullstackLinkCache.set (some (cObjTargets, linkInputs, sslLib, cryptoLib))
   return some (linkInputs, sslLib, cryptoLib)
 
+private def compileClientMain (mod appExpr : String) (isInRepo prod : Bool) :
+    IO (Option (FilePath × FilePath)) := do
+  let fwRoot ← if isInRepo then pure (FilePath.mk ".") else frameworkHome
+  let genDir : FilePath := ".qed" / "gen" / mod
+  IO.FS.createDirAll genDir
+  let modOlean := FilePath.mk ".lake" / "build" / "lib" / "lean" / ((mod.replace "." "/") ++ ".olean")
+  let drvOlean := fwRoot / ".lake" / "build" / "lib" / "lean" / "Qed" / "Driver.olean"
+  let cliLean := genDir / "ClientMain.lean"
+  let cliOlean := genDir / "ClientMain.olean"
+  let cliChanged ← writeIfChanged cliLean s!"import {mod}\nimport Qed.Driver\n\ndef main : IO Unit := Qed.run {appExpr}\n"
+  let mut cliDeps : Array FilePath := #[cliLean, modOlean]
+  if ← drvOlean.pathExists then cliDeps := cliDeps.push drvOlean
+  if cliChanged || prod || !(← isUpToDate cliOlean cliDeps) then
+    if (← sh "lake" #["env", "lean", "-R", genDir.toString, cliLean.toString, "-o", cliOlean.toString]) != 0 then
+      return none
+  return some (genDir, cliOlean)
+
 def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool)
     (alreadyBuilt : Bool := false) : IO Bool := do
   let localMods ← collectLocalModules mod
@@ -137,25 +154,16 @@ def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool)
   IO.FS.createDirAll outDir
 
   let modOlean := FilePath.mk ".lake" / "build" / "lib" / "lean" / ((mod.replace "." "/") ++ ".olean")
-  let fwRoot ← if isInRepo then pure (FilePath.mk ".") else frameworkHome
-  let drvOlean := fwRoot / ".lake" / "build" / "lib" / "lean" / "Qed" / "Driver.olean"
-  let cliLean := genDir / "ClientMain.lean"
-  let cliOlean := genDir / "ClientMain.olean"
-  let cliChanged ← writeIfChanged cliLean s!"import {mod}\nimport Qed.Driver\n\ndef main : IO Unit := Qed.run {fsName}.clientApp\n"
   let srvLean := genDir / "ServerMain.lean"
   let srvC := genDir / "ServerMain.c"
   let srvChanged ← writeIfChanged srvLean s!"import {mod}\nimport Qed.Server.Native\n\nqedServerMain {fsName}\n"
 
-  let mut cliDeps : Array FilePath := #[cliLean, modOlean]
-  if ← drvOlean.pathExists then cliDeps := cliDeps.push drvOlean
   let appMjs := outDir / "app.mjs"
   let srvBin := outDir / "server"
 
   -- 1. Synthesize & compile client entrypoint → `app.mjs` (enforcing `verifyNoServerLeakInClient`)
   let tClient ← IO.asTask do
-    if cliChanged || prod || !(← isUpToDate cliOlean cliDeps) then
-      if (← sh "lake" #["env", "lean", "-R", genDir.toString, cliLean.toString, "-o", cliOlean.toString]) != 0 then
-        return false
+    let some (_, cliOlean) ← compileClientMain mod s!"{fsName}.clientApp" isInRepo prod | return false
     if prod || !(← isUpToDate appMjs #[cliOlean, q.bin, rtPath, modOlean]) then
       let minArgs := if prod then #["--min"] else #[]
       let rtArgs := #["--rt", rtPath.toString]
@@ -195,21 +203,33 @@ def buildJs (outDir : FilePath) (prod : Bool) (alreadyBuilt : Bool := false) : I
     return ← buildFullstack mod fsName outDir prod alreadyBuilt
   let isInRepo ← (FilePath.mk "Examples").pathExists
   let prebuilt := (← env "QED_PREBUILT") == some "1"
+  let explicitSsr ← ssrAppName mod
+  let autoComp ← if explicitSsr.isSome then pure none else componentAppName mod
+  let ssrOpt := explicitSsr.orElse (fun _ => autoComp)
   if !prebuilt && !alreadyBuilt then
-    let targets := if isInRepo then #[mod, "qedjs"] else #[mod]
+    let targets := #[mod] ++ (if autoComp.isSome then #["Qed.Driver"] else #[]) ++ (if isInRepo then #["qedjs"] else #[])
     if (← sh "lake" (#["build"] ++ targets)) != 0 then return false
+  else if autoComp.isSome then
+    let fwRoot ← if isInRepo then pure (FilePath.mk ".") else frameworkHome
+    let drvOlean := fwRoot / ".lake" / "build" / "lib" / "lean" / "Qed" / "Driver.olean"
+    if !(← drvOlean.pathExists) then
+      if (← sh "lake" #["build", "Qed.Driver"]) != 0 then return false
   let some q ← resolveQedjsEnv (needBuild := !isInRepo && !prebuilt) | return false
   IO.FS.createDirAll outDir
   removeIfExists (outDir / "server")
   let rtPath ← runtimeFile "qed_rt.mjs"
   let minArgs := if prod then #["--min"] else #[]
   let rtArgs := #["--rt", rtPath.toString]
-  let ssrOpt ← ssrAppName mod
   let alsoArgs : Array String := match ssrOpt with
     | some appName => #["--also", (outDir / "ssr_app.mjs").toString, "--", s!"{appName}:app", "Qed.App.ssrStep:ssrStep"]
     | none => #[]
-  if !(← q.run (minArgs ++ rtArgs ++ #[(outDir / "app.mjs").toString, mod, "--"] ++ driverEntries ++ alsoArgs)) then
-    return false
+  if let some appName := autoComp then
+    let some (genDir, _) ← compileClientMain mod appName isInRepo prod | return false
+    if !(← q.run (minArgs ++ rtArgs ++ #[(outDir / "app.mjs").toString, "ClientMain", "--"] ++ driverEntries ++ alsoArgs) (extraPath := some genDir.toString)) then
+      return false
+  else
+    if !(← q.run (minArgs ++ rtArgs ++ #[(outDir / "app.mjs").toString, mod, "--"] ++ driverEntries ++ alsoArgs)) then
+      return false
   writeClientShell outDir prod
   match ssrOpt with
   | some appName =>

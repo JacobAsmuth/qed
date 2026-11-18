@@ -163,17 +163,17 @@ the native server when present, and reloads the browser on success. Run `qed che
 and `qed start` or `qed preview` for production builds; `qed build` also minifies bundles with
 `esbuild` when available on `PATH`.
 
-`qed test` runs the 15 automated test suites in [`test/`](../test):
+`qed test` runs the 4 automated TCB test suites in [`test/`](../test) (app behavior is verified at compile time in Lean):
 
+- [`test/cli_scaffold_test.mjs`](../test/cli_scaffold_test.mjs) — `qed new`, build, SSR smoke check, and kernel/extern verification gates.
 - [`test/js_gate_test.mjs`](../test/js_gate_test.mjs) — differential tests comparing native Lean
   evaluation against transpiled JavaScript across rendering, diffing, JSON, routing, and runtime
   edge cases.
 - [`test/dom_equivalence_test.mjs`](../test/dom_equivalence_test.mjs) — Chromium equivalence checks
   asserting incremental DOM updates match fresh `Html.render` output across attributes, events,
   keyed moves, `V.memo`, and duplicate keys.
-- End-to-end Chromium and native server suites covering forms, routing, effects, WebSockets, SSE
-  streaming, local state, SSR hydration, and `fullstack` binary Protobuf RPCs in
-  [`test/fullstack_rpc_test.mjs`](../test/fullstack_rpc_test.mjs).
+- [`test/fullstack_rpc_test.mjs`](../test/fullstack_rpc_test.mjs) — native C server HTTP/1.1 framing,
+  auth/cookies, TLS external calls, and `/_qed/rpc/…` binary Protobuf RPCs.
 - Benchmarks in [`Examples/Bench`](../Examples/Bench),
   [`test/bench_template.mjs`](../test/bench_template.mjs), and
   [`test/bench_react.mjs`](../test/bench_react.mjs).

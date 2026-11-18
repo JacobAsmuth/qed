@@ -1,4 +1,4 @@
-import Examples.Local
+import Qed
 open Qed
 
 namespace SyntaxChecks
@@ -22,18 +22,48 @@ example : Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 0) =
 def defaults : Html Unit := <Counter initial={{ count := 8 }}/>
 #guard (Html.renderWith Counter.regs defaults).contains "8</button>"
 
-def importedHelper (r : Local.Row) : Html Local.Msg :=
-  <Local.Widget key={r.id} id={r.id} label={r.label}
-    initial={{ note := r.label }} onReport={Local.Msg.reported r.id}/>
+namespace LocalNested
+
+component Tag where
+  prop label := "Pin"
+  state on := false
+  event onToggle (pinned : Bool)
+  action toggle => on := !on, send (onToggle (!on))
+  view => <button onClick={.toggle}>{if on then "on" else label}</button>
+
+component Widget where
+  prop id : Nat
+  prop label : String
+  state note := ""
+  state pinned := false
+  event onReport (count : Int)
+  view =>
+    <div>
+      <span>{note}</span>
+      <Tag key={s!"t{id}"} label={label} onToggle={pinned := ·}/>
+    </div>
+
+structure Row where
+  id    : Nat
+  label : String
+
+inductive ParentMsg
+  | reported (id : Nat) (count : Int)
+
+end LocalNested
+
+def importedHelper (r : LocalNested.Row) : Html LocalNested.ParentMsg :=
+  <LocalNested.Widget key={r.id} id={r.id} label={r.label}
+    initial={{ note := r.label }} onReport={LocalNested.ParentMsg.reported r.id}/>
 
 component HelperApp where
   state draft : String := ""
-  action localEvent (m : Local.Msg) => ()
+  action localEvent (m : LocalNested.ParentMsg) => ()
   view => (importedHelper { id := 8, label := draft }).map .localEvent
 
 #guard (HelperApp.app.locals.map (·.id)).contains "SyntaxChecks.HelperApp"
-#guard (HelperApp.app.locals.map (·.id)).contains "Local.Widget"
-#guard (HelperApp.app.locals.map (·.id)).contains "Local.Tag"
+#guard (HelperApp.app.locals.map (·.id)).contains "SyntaxChecks.LocalNested.Widget"
+#guard (HelperApp.app.locals.map (·.id)).contains "SyntaxChecks.LocalNested.Tag"
 #guard HelperApp.app.locals.length == 3
 
 /-- error: `label`: not a `state` field of this component (fields: [count]) -/

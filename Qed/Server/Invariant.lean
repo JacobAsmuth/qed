@@ -143,73 +143,7 @@ def srvFinishM {E : Type} [SrvErr E] {m : Type → Type} [Monad m] {α : Type}
   | some r => return r
   | none   => return .error (SrvErr.ofApi (ApiError.internal "unreachable missing return"))
 
-/-! ## Direct `Prop` Guards & Opaque Equality-Abstracted SSA Stepping (`srvLetEq`) -/
-
-syntax (name := srvEqPropStx) "srvEqProp(" term ", " term ")" : term
-
-open Lean Meta Elab Term in
-@[term_elab srvEqPropStx]
-def elabSrvEqProp : TermElab := fun stx _ => do
-  let aStx : Term := ⟨stx[1]⟩
-  let bStx : Term := ⟨stx[3]⟩
-  let savedMsgs ← Core.getMessageLog
-  Core.resetMessageLog
-  let eqTry? ← try
-      let eqTerm ← `(($aStx = $bStx))
-      let e ← elabTerm eqTerm (some (mkSort Level.zero))
-      let newMsgs ← Core.getMessageLog
-      if newMsgs.hasErrors then
-        Core.setMessageLog savedMsgs
-        pure none
-      else
-        Core.setMessageLog (savedMsgs ++ newMsgs)
-        let decTy ← mkAppM ``Decidable #[e]
-        if (← try synthInstance? decTy catch _ => pure none).isSome then
-          pure (some e)
-        else
-          pure none
-    catch _ =>
-      Core.setMessageLog savedMsgs
-      pure none
-  if let some e := eqTry? then
-    return e
-  elabTerm (← `(($aStx == $bStx) = true)) (some (mkSort Level.zero))
-
-/-- Dependent short-circuit conjunction preserving earlier index bounds hypotheses cleanly in `Prop`. -/
-structure SrvAndProp (P : Prop) (Q : P → Prop) : Prop where
-  fst : P
-  snd : Q fst
-
-instance {P : Prop} {Q : P → Prop} [Decidable P] [∀ h, Decidable (Q h)] :
-    Decidable (SrvAndProp P Q) :=
-  if hp : P then
-    if hq : Q hp then isTrue ⟨hp, hq⟩
-    else isFalse fun ⟨_, hq'⟩ => hq hq'
-  else isFalse fun ⟨hp', _⟩ => hp hp'
-
-@[simp] theorem not_srvAndProp {P : Prop} {Q : P → Prop} :
-    (¬ SrvAndProp P Q) ↔ ∀ h : P, ¬ Q h :=
-  ⟨fun h hp hq => h ⟨hp, hq⟩, fun h ⟨hp, hq⟩ => h hp hq⟩
-
-/-- Dependent short-circuit disjunction in `Prop`. -/
-inductive SrvOrProp (P : Prop) (Q : ¬ P → Prop) : Prop where
-  | inl (h : P) : SrvOrProp P Q
-  | inr (hnp : ¬ P) (hq : Q hnp) : SrvOrProp P Q
-
-instance {P : Prop} {Q : ¬ P → Prop} [Decidable P] [∀ h, Decidable (Q h)] :
-    Decidable (SrvOrProp P Q) :=
-  if hp : P then isTrue (.inl hp)
-  else if hq : Q hp then isTrue (.inr hp hq)
-  else isFalse fun
-    | .inl hp' => hp hp'
-    | .inr _ hq' => hq hq'
-
-@[simp] theorem not_srvOrProp {P : Prop} {Q : ¬ P → Prop} :
-    (¬ SrvOrProp P Q) ↔ ¬ P ∧ ∀ h : ¬ P, ¬ Q h :=
-  ⟨fun h => ⟨fun hp => h (.inl hp), fun hnp hq => h (.inr hnp hq)⟩,
-   fun ⟨hnp, hnq⟩ => fun
-     | .inl hp => hnp hp
-     | .inr hnp' hq => hnq hnp' hq⟩
+/-! ## Opaque Equality-Abstracted SSA Stepping (`srvLetEq`) -/
 
 /-- Continuation-passing equality binder keeping intermediate state updates opaque (`cdecl` + `hx : x = val`)
     so bounds checks and invariant leaves never suffer `zetaDelta` term-size blowup. -/
@@ -367,7 +301,7 @@ private def unfoldSrvHelpersExpr (e : Expr) : MetaM Expr :=
     let fn := sub.getAppFn
     if sub.isAppOfArity ``id 2 then
       return .visit (sub.getAppArgs[1]!)
-    if fn.isConstOf ``srvGetAt || fn.isConstOf ``SrvVal.val ||
+    if fn.isConstOf ``srvGetAt || fn.isConstOf ``Qed.Lang.QedVal.val ||
        fn.isConstOf ``SrvIdx.toNat || fn.isConstOf ``SrvLiftOpt.liftOpt then
       if let some u ← (do if let some x ← unfoldProjInst? sub then pure (some x) else unfoldDefinition? sub) then
         return .visit (if u.isAppOfArity ``id 2 then u.getAppArgs[1]! else u)
@@ -376,7 +310,7 @@ private def unfoldSrvHelpersExpr (e : Expr) : MetaM Expr :=
 open Lean in
 private def hasSrvHelperConst (e : Expr) : Bool :=
   e.getUsedConstants.any fun c =>
-    c == ``srvGetAt || c == ``SrvVal.val || c == ``SrvIdx.toNat ||
+    c == ``srvGetAt || c == ``Qed.Lang.QedVal.val || c == ``SrvIdx.toNat ||
     c == ``SrvLiftOpt.liftOpt || c == ``id
 
 open Lean Meta in
@@ -393,8 +327,9 @@ open Lean Meta Elab Tactic in
 private def unfoldSrvHelpersInGoal : TacticM Unit := do
   let mut g ← getMainGoal
   let lctx0 ← g.withContext getLCtx
-  let tgt0 ← g.withContext (instantiateMVars (← g.getType))
   let mut hIdx : Nat := lctx0.size
+  let mut propFVars : Array FVarId := #[]
+  -- Pass 1: rename macro-scoped Prop hyps (`rename` preserves all FVarIds).
   for decl in lctx0 do
     if !decl.isImplementationDetail && !decl.isLet then
       let uname := decl.userName.toString
@@ -406,16 +341,24 @@ private def unfoldSrvHelpersInGoal : TacticM Unit := do
             let (cand, nxt) ← nextFreshSrvName g "_srvSplitH" hIdx
             hIdx := nxt
             g ← g.rename decl.fvarId cand
-          if hasSrvHelperConst ty then
-            let ty' ← g.withContext (unfoldSrvHelpersExpr ty)
-            if ty' != ty then
-              if tgt0.containsFVar decl.fvarId then
-                let (cand, nxt) ← nextFreshSrvName g "_srvFreeH" hIdx
-                hIdx := nxt
-                let (_, gFree) ← (← g.assert cand ty' (mkFVar decl.fvarId)).intro1P
-                g := gFree
-              if let some g' ← try some <$> g.changeLocalDecl decl.fvarId ty' catch _ => pure none then
-                g := g'
+          propFVars := propFVars.push decl.fvarId
+  -- Pass 2: unfold helpers in reverse order so `changeLocalDecl` never invalidates earlier FVarIds.
+  for revIdx in [0:propFVars.size] do
+    let fv := propFVars[propFVars.size - 1 - revIdx]!
+    let curLctx ← g.withContext getLCtx
+    if let some decl := curLctx.find? fv then
+      let ty ← g.withContext (instantiateMVars decl.type)
+      if hasSrvHelperConst ty then
+        let ty' ← g.withContext (unfoldSrvHelpersExpr ty)
+        if ty' != ty then
+          let curTgt ← g.withContext (instantiateMVars (← g.getType))
+          if curTgt.containsFVar fv then
+            let (cand, nxt) ← nextFreshSrvName g "_srvFreeH" hIdx
+            hIdx := nxt
+            let (_, gFree) ← (← g.assert cand ty' (mkFVar fv)).intro1P
+            g := gFree
+          if let some g' ← try some <$> g.changeLocalDecl fv ty' catch _ => pure none then
+            g := g'
   let tgt ← g.withContext (instantiateMVars (← g.getType))
   if hasSrvHelperConst tgt then
     let tgt' ← g.withContext (unfoldSrvHelpersExpr tgt)
@@ -431,7 +374,7 @@ elab_rules : tactic
 
 macro "qedDsimpCodecs" : tactic => `(tactic|
   try dsimp (config := { zetaDelta := false }) only
-    [Qed.Server.SrvVal.val, Qed.Server.SrvIdx.toNat,
+    [Qed.Lang.QedVal.val, Qed.Server.SrvIdx.toNat,
      Qed.Server.SrvLiftOpt.liftOpt, Qed.Server.srvGetAt,
      Qed.Codec.valid, Qed.Codec.refine, Qed.Codec.jsonOnly,
      Qed.Codec.text, Qed.Codec.textarea, Qed.Codec.nat,
@@ -447,8 +390,8 @@ theorem srvDiteFalse_eq_false {P : Prop} [Decidable P] (t : P → Bool) :
 
 macro "qedSimpArrayAndBool" : tactic => `(tactic|
   try simp (config := { zetaDelta := true }) only
-    [id_eq, ne_eq, Qed.Server.srvGetAt_eq, Qed.Server.SrvVal.val_field,
-     Qed.Server.SrvVal.val_ensured, Qed.Server.SrvVal.val_id,
+    [id_eq, ne_eq, Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
+     Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
      Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
      Array.size_set, Array.size_push, Array.size_modify,
      Array.getElem_set_self,
@@ -498,8 +441,8 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
         let localFactIds : Array Ident := (Array.range localFacts.size).map fun i => mkIdent (Name.mkSimple s!"_srvFact{i}")
         let fastPrfStx ← `(by
           try simp (config := { zetaDelta := false }) only
-            [id_eq, Qed.Server.srvGetAt_eq, Qed.Server.SrvVal.val_field,
-             Qed.Server.SrvVal.val_ensured, Qed.Server.SrvVal.val_id,
+            [id_eq, Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
+             Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
              Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
              Qed.Codec.valid, Qed.Codec.refine, Qed.Codec.jsonOnly,
              Qed.Codec.text, Qed.Codec.textarea, Qed.Codec.nat,
@@ -530,8 +473,8 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
           try qedUnfoldSrvHelpers
           try qedSimpHypsEach
           try simp (config := { zetaDelta := false }) only
-            [id_eq, ne_eq, Qed.Server.srvGetAt_eq, Qed.Server.SrvVal.val_field,
-             Qed.Server.SrvVal.val_ensured, Qed.Server.SrvVal.val_id,
+            [id_eq, ne_eq, Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
+             Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
              Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
              Array.size_set, Array.size_push, Array.getElem_set_self,
              Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
@@ -549,7 +492,7 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
         return ← mkAppOptM ``Qed.Field.mk #[some innerTy, some predFn, some valExpr, some prfExpr]
       else
         return ← try elabTermEnsuringType valStx (some expTy)
-                 catch _ => elabTermEnsuringType (← `(Qed.Server.SrvVal.val $valStx)) (some expTy)
+                 catch _ => elabTermEnsuringType (← `(Qed.Lang.QedVal.val $valStx)) (some expTy)
   let e ← elabTerm valStx none
   synthesizeSyntheticMVars (postpone := .yes)
   let ty ← whnf (← instantiateMVars (← inferType e))
@@ -579,7 +522,7 @@ private def splitAndHyps : TacticM Bool := do
     for decl in lctx do
       if !splitOne && !decl.isImplementationDetail then
         let ty ← g.withContext (whnf decl.type)
-        if ty.isAppOfArity ``And 2 || ty.isAppOfArity ``Exists 2 || ty.isAppOfArity ``SrvAndProp 2 then
+        if ty.isAppOfArity ``And 2 || ty.isAppOfArity ``Exists 2 || ty.isAppOfArity ``Qed.Lang.QedAndProp 2 then
           let subgoals ← g.cases decl.fvarId
           replaceMainGoal (subgoals.toList.map (·.mvarId))
           splitOne := true
@@ -682,13 +625,13 @@ private def proveBoundsFor (ref : Syntax) (arrExpr idxNatExpr : Expr) : TermElab
     try simp only
       [id_eq, ne_eq, Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
        beq_iff_eq, bne_iff_ne, decide_eq_true_eq,
-       Qed.Server.not_srvAndProp, Qed.Server.not_srvOrProp,
-       Qed.Server.SrvVal.val_field, Qed.Server.SrvVal.val_id,
+       Qed.Lang.not_qedAndProp, Qed.Lang.not_qedOrProp,
+       Qed.QedVal.val_field, Qed.Lang.QedVal.val_id,
        Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin] at $[$sizeHIds:ident]*)
   let fastStx ← `(by
     try simp (config := { zetaDelta := true }) only
-      [id_eq, Qed.Server.srvGetAt_eq, Qed.Server.SrvVal.val_field,
-       Qed.Server.SrvVal.val_id, Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
+      [id_eq, Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
+       Qed.Lang.QedVal.val_id, Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
        Array.size_set, Array.size_push, Array.size_modify] at ⊢
     $hypSimpTac:tactic
     first | assumption | omega)
@@ -781,8 +724,8 @@ elab_rules : tactic
       unfoldSrvHelpersInGoal
       evalTactic (← `(tactic| (
         try simp (config := { zetaDelta := false }) only
-          [Qed.Server.srvGetAt_eq, Qed.Server.SrvVal.val_field,
-           Qed.Server.SrvVal.val_ensured, Qed.Server.SrvVal.val_id,
+          [Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
+           Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
            Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
            Qed.Server.SrvLiftOpt.liftOpt_opt, Qed.Server.SrvLiftOpt.liftOpt_val,
            Array.getElem_set_self]
@@ -856,8 +799,8 @@ elab_rules : tactic
           | rfl | decide | omega | assumption | trivial | (intros; trivial)
           | exact Or.inr (by assumption) | exact Or.inl rfl
           | (simp (config := { zetaDelta := false }) only
-               [Qed.Server.srvGetAt_eq, Qed.Server.SrvVal.val_field,
-                Qed.Server.SrvVal.val_ensured, Qed.Server.SrvVal.val_id,
+               [Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
+                Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
                 Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
                 Array.getElem_set_self, Array.size_set, Array.size_push] <;>
              first | rfl | decide | omega | assumption)
@@ -882,9 +825,9 @@ elab_rules : tactic
       if !hIds.isEmpty then
         let hypSimpNames := #[
           ``id_eq, ``ne_eq, ``Prod.mk.injEq, ``Option.some.injEq, ``Except.ok.injEq, ``Except.error.injEq, ``reduceCtorEq,
-          ``Qed.Server.not_srvAndProp, ``Qed.Server.not_srvOrProp,
-          ``Qed.Server.srvGetAt_eq, ``Qed.Server.SrvVal.val_field,
-          ``Qed.Server.SrvVal.val_ensured, ``Qed.Server.SrvVal.val_id,
+          ``Qed.Lang.not_qedAndProp, ``Qed.Lang.not_qedOrProp,
+          ``Qed.Server.srvGetAt_eq, ``Qed.QedVal.val_field,
+          ``Qed.QedVal.val_ensured, ``Qed.Lang.QedVal.val_id,
           ``Qed.Server.SrvIdx.toNat_nat, ``Qed.Server.SrvIdx.toNat_fin,
           ``Qed.Server.SrvLiftOpt.liftOpt_opt, ``Qed.Server.SrvLiftOpt.liftOpt_val,
           ``Qed.Codec.valid, ``Qed.Codec.refine, ``Qed.Codec.jsonOnly,
@@ -909,8 +852,8 @@ elab_rules : tactic
           [id_eq, ne_eq, Qed.Server.srvSeq_none, Qed.Server.srvSeq_some,
            Qed.Server.srvFinish_ok, Qed.Server.srvFinish_err, Qed.Server.srvFinish_none,
            Qed.Server.srvAtomicCommit_none, Qed.Server.srvAtomicCommit_ok, Qed.Server.srvAtomicCommit_err,
-           Qed.Server.srvGetAt_eq, Qed.Server.SrvVal.val_field,
-           Qed.Server.SrvVal.val_ensured, Qed.Server.SrvVal.val_id,
+           Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
+           Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
            Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
            Qed.Server.SrvLiftOpt.liftOpt_opt, Qed.Server.SrvLiftOpt.liftOpt_val,
            Array.forall_push, Array.sumBy_empty, Array.sumBy_push,
@@ -1035,8 +978,8 @@ private def rewriteTargetEqsLinear : TacticM Unit := do
           evalTactic (← `(tactic|
             try simp (config := { zetaDelta := false }) only
               [Qed.Server.srvGetAt_eq, Array.getElem_set_self, Array.size_set, Array.size_push,
-               Array.sumBy_empty, Array.sumBy_push, Qed.Server.SrvVal.val_field,
-               Qed.Server.SrvVal.val_ensured, Qed.Server.SrvVal.val_id,
+               Array.sumBy_empty, Array.sumBy_push, Qed.QedVal.val_field,
+               Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
                Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
                Qed.Server.SrvLiftOpt.liftOpt_opt, Qed.Server.SrvLiftOpt.liftOpt_val]))
       catch _ => pure ()
@@ -1220,7 +1163,7 @@ elab_rules : tactic
         ``Qed.Server.srvEnsPost_ok, ``Qed.Server.srvEnsPost_err, ``Qed.Server.srvEnsPost_srvLetEq,
         ``Qed.Server.srvEnsPostOpt_some, ``Qed.Server.srvEnsPostOpt_none, ``Qed.Server.srvEnsPostOpt_err, ``Qed.Server.srvEnsPostOpt_srvLetEq,
         ``Qed.Server.prod_fst_srvLetEq, ``Qed.Server.prod_snd_srvLetEq,
-        ``Qed.Server.SrvVal.val_field, ``Qed.Server.SrvVal.val_ensured, ``Qed.Server.SrvVal.val_id,
+        ``Qed.QedVal.val_field, ``Qed.QedVal.val_ensured, ``Qed.Lang.QedVal.val_id,
         ``Qed.Server.SrvIdx.toNat_nat, ``Qed.Server.SrvIdx.toNat_fin,
         ``Qed.Server.SrvLiftOpt.liftOpt_opt, ``Qed.Server.SrvLiftOpt.liftOpt_val
       ]
@@ -1330,23 +1273,28 @@ elab_rules : tactic
         let fTy ← g.withContext (inferType fPrf)
         let (_, g') ← (← g.assert (Name.mkSimple s!"_reqFact{idx}") fTy fPrf).intro1P
         replaceMainGoal [g']
+      let env ← getEnv
+      let fixedNames := #[
+        ``Option.isSome_iff_ne_none, ``ne_eq, ``Bool.and_eq_true, ``Bool.or_eq_true,
+        ``Bool.not_eq_true', ``beq_iff_eq, ``bne_iff_ne, ``decide_eq_true_eq,
+        ``Qed.Lang.QedVal.val_id, ``Qed.QedVal.val_field, ``Qed.QedVal.val_ensured,
+        ``Qed.Codec.valid,
+        ``Qed.Codec.refine, ``Qed.Codec.jsonOnly, ``Qed.Codec.text, ``Qed.Codec.textarea,
+        ``Qed.Codec.nat, ``Qed.Codec.int, ``Qed.Codec.checkbox, ``Qed.Codec.date]
+      let allReqSimp ← (fixedNames ++ (#[`Qed.Cached.all, `Qed.Resource.all].filter env.contains)).mapM fun n =>
+        `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
       evalTactic (← `(tactic| (
         try qedUnfoldSrvHelpers
         qedSimpArrayAndBool
-        try simp (config := { zetaDelta := true }) only
-          [Option.isSome_iff_ne_none, ne_eq, Bool.and_eq_true, Bool.or_eq_true,
-           Bool.not_eq_true', beq_iff_eq, bne_iff_ne, decide_eq_true_eq,
-           Qed.Codec.valid, Qed.Codec.refine, Qed.Codec.jsonOnly,
-           Qed.Codec.text, Qed.Codec.textarea, Qed.Codec.nat,
-           Qed.Codec.int, Qed.Codec.checkbox, Qed.Codec.date] at *
+        try simp (config := { zetaDelta := true, zetaHave := true }) only [$[$allReqSimp],*] at *
         qedDsimpCodecs
         try (repeat' (apply And.intro))
         all_goals (
           try qedSrvSplitHyps
           try first
             | trivial | rfl | assumption | decide | omega
-            | (simp_all (config := { zetaDelta := true }) <;> omega)
-            | (simp_all (config := { zetaDelta := true }) <;> decide)))))
+            | (simp_all (config := { zetaDelta := true, zetaHave := true }) <;> omega)
+            | (simp_all (config := { zetaDelta := true, zetaHave := true }) <;> decide)))))
       let rem ← getUnsolvedGoals
       unless rem.isEmpty do
         let msg ← rem[0]!.withContext do ppExpr (← instantiateMVars (← rem[0]!.getType))

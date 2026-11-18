@@ -3,56 +3,44 @@ open Qed
 
 namespace Chat
 
-structure Turn where
-  user? : Bool
-  text  : String
+schema Turn:
+  role    : String
+  content : String
 
-def deltaOf (raw : String) : String :=
-  (Json.parse raw).toOption
-    |>.bind (·.get? "choices") |>.bind (·.arr?) |>.bind (·.head?)
-    |>.bind (·.get? "delta")   |>.bind (·.get? "content") |>.bind (·.str?)
-    |>.getD ""
+schema ChatReq:
+  model    : String
+  stream   : Bool
+  messages : Turn[]
 
-def reqBody (turns : Array Turn) : String :=
-  Json.render (.obj [
-    ("model",    .str "qed-mock"),
-    ("stream",   .bool true),
-    ("messages", .arr (turns.toList.map fun t =>
-      .obj [("role", .str (if t.user? then "user" else "assistant")),
-            ("content", .str t.text)]))
-  ])
-
-def appendLast (turns : Array Turn) (d : String) : Array Turn :=
-  turns.modify (turns.size - 1) fun t => { t with text := t.text ++ d }
-
-component Bubble where
+component Bubble:
   prop turn : Turn
-  view => <div class={if turn.user? then "msg user" else "msg bot"}>{turn.text}</div>
+  view: <div class={"msg user" if turn.role == "user" else "msg bot"}>{turn.content}</div>
 
 end Chat
 
-component Chat where
-  state turns   : Array Turn := #[]
-  state draft                := ""
-  state pending              := false
+component Chat:
+  state turns   : Turn[]
+  state draft   = ""
+  state pending = false
 
-  action send when !draft.trimmed.isEmpty =>
-    let text := draft.trimmed
-    let convo := turns.push { user? := true, text }
-    turns   := convo.push { user? := false, text := "" }
-    draft   := ""
-    pending := true
-    perform (Cmd.stream "/v1/chat/completions" (reqBody convo) .chunk .done)
-  action chunk (raw : String) => turns := appendLast turns (deltaOf raw)
-  action done                 => pending := false
+  action send when not draft.trimmed.isEmpty:
+    let convo = turns.push(Turn(role="user", content=draft.trimmed))
+    turns = convo.push(Turn(role="assistant", content=""))
+    draft = ""
+    pending = true
+    perform Cmd.streamJson("/v1/chat/completions", ChatReq(model="qed-mock", stream=true, messages=convo), .chunk, .done)
+  action chunk(raw: String):
+    let d = Json.pathStr(raw, "choices.0.delta.content")
+    turns = turns.modify(turns.size - 1, t => { t with content = t.content ++ d })
+  action done: pending = false
 
-  invariant streamSafe : pending = true → 0 < turns.size
+  invariant streamSafe: pending -> turns.size > 0
 
-  view =>
+  view:
     <div class="chat">
-      <div class="log">{for t in turns => <Bubble turn={t}/>}</div>
+      <div class="log">{for t in turns: <Bubble turn={t}/>}</div>
       <div class="composer">
         <input class="draft" placeholder="Message the model…" bind={draft}/>
-        <button class="send" disabled={pending || draft.trimmed.isEmpty} onClick={.send}>Send</button>
+        <button class="send" disabled={pending or draft.trimmed.isEmpty} onClick={.send}>Send</button>
       </div>
     </div>

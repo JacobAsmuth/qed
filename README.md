@@ -2,7 +2,7 @@
 
 **A full-stack web framework where the compiler proves your app's behavior, not just its types.**
 
-Qed is a web framework for [Lean 4](https://lean-lang.org) with JSX-style components, typed routing, schemas, scoped CSS, and an optional native full-stack server. Instead of checking types at rest and hoping tests catch logic bugs later, you write the rules your app must obey right inside your components, views, forms, and server handlers. Lean's kernel then proves they hold across *every* possible state transition and input before any code runs.
+Qed is a web framework for [Lean 4](https://lean-lang.org) with a unified Python-esque syntax for JSX components, typed routing, schemas, scoped CSS, and an optional native full-stack server. Instead of checking types at rest and hoping tests catch logic bugs later, you write the rules your app must obey right inside your components, views, forms, and server handlers. Lean's kernel then proves they hold across *every* possible state transition and input before any code runs.
 
 All proofs are erased at compile time. In the browser, Qed runs as plain, dependency-free JavaScript ES modules with **no Lean or WebAssembly runtime required**.
 
@@ -37,12 +37,12 @@ Consider a quantity picker whose `inRange` invariant keeps its value between `1`
 import Qed
 open Qed
 
-component Quantity where
-  state quantity := 1
-  action increase when quantity < 10 => quantity += 1
-  action decrease when 1 < quantity  => quantity -= 1
-  invariant inRange : 1 ≤ quantity, quantity ≤ 10
-  view =>
+component Quantity:
+  state quantity = 1
+  action increase when quantity < 10: quantity += 1
+  action decrease when 1 < quantity:  quantity -= 1
+  invariant inRange: 1 <= quantity <= 10
+  view:
     <div>
       <button onClick={.decrease}>−</button>
       <span>{quantity}</span>
@@ -75,15 +75,15 @@ def enabledStyle : Style := css
 def disabledStyle : Style := css
   [backgroundColor (hex "e5e7eb"), color (hex "6b7280"), cursor "not-allowed"]
 
-component ModeButtons where
-  state editing := false
-  invariant exactlyOne "edit" "save" enabledStyle disabledStyle
-  view =>
+component ModeButtons:
+  state editing = false
+  invariant exactlyOne("edit", "save", enabledStyle, disabledStyle)
+  view:
     <div>
-      <button role="edit" disabled={editing} onClick={editing := true}
-        {if editing then disabledStyle else enabledStyle}>Edit</button>
-      <button role="save" disabled={!editing} onClick={editing := false}
-        {if editing then enabledStyle else disabledStyle}>Save</button>
+      <button role="edit" disabled={editing} onClick={editing = true}
+        {disabledStyle if editing else enabledStyle}>Edit</button>
+      <button role="save" disabled={not editing} onClick={editing = false}
+        {enabledStyle if editing else disabledStyle}>Save</button>
     </div>
 ```
 
@@ -92,31 +92,31 @@ Each `css` value compiles to a scoped class that Qed collects and injects automa
 ### 3. One schema for forms, validation, and wire codecs
 
 ```lean
-schema Order where
-  name        : String where name.length ≥ 1
-  quantity    : Nat    where 1 ≤ quantity, quantity ≤ 10
+schema Order:
+  name        : String where name.length >= 1
+  quantity    : Nat    where 1 <= quantity <= 10
   acceptTerms : Bool   where acceptTerms
 ```
 
 From this single `schema`, Qed generates:
 
 - `Order.Draft` for editable, possibly incomplete UI input.
-- `<Order.Form bind={draft} onSubmit={.submit}/>`, whose submit button is disabled until the draft satisfies every `where` rule.
-- `Order.parse`, returning `Option Order` where every field in `Order` carries a compile-time proof of its constraints.
+- `<Order.Form onSubmit={.submit}/>` (with self-hosted draft state by default, optional `reset`, or explicit `bind={draft}`), whose submit button is disabled until the draft satisfies every `where` rule and passes the validated `Order` directly to `onSubmit`.
+- `Order.parse`, returning `Order?` where every field in `Order` carries a compile-time proof of its constraints.
 - JSON and binary Protobuf codecs (`Order.encode` and matching decoders) that enforce the exact same rules on the wire.
 
-See [Signup](Examples/Signup.lean) and [Bookshelf](Examples/Bookshelf.lean) for complete schema-backed forms (schemas also support context parameters like `schema Appt (today : Date)` for rules checked against live state).
+See [Signup](Examples/Signup.lean) and [Bookshelf](Examples/Bookshelf.lean) for complete schema-backed forms (schemas also support context parameters like `schema Appt(today: Date):` for rules checked against live state).
 
 ### 4. Full-stack server rules, client–server contracts, and race-free `await`
 
-When you build a full-stack app with `server` and `fullstack`, Qed extends those same compile-time guarantees across backend state, external HTTP calls, and binary Protobuf RPCs:
+When you build a full-stack app with `server` and `fullstack`, Qed extends those same compile-time guarantees across backend state, external HTTP calls, and binary Protobuf RPCs—using the exact same Python-esque expression and statement syntax on both client and server:
 
 ```lean
-external PaymentApi
+external PaymentApi:
   base "https://payments.example.com"
   post "/charge" charge(amount: Nat) -> Bool
 
-server Store
+server Store:
   state stock       : Nat = 10
   state totalOrders : Nat = 0
 
@@ -124,39 +124,38 @@ server Store
   invariant totalOrders >= old(totalOrders)
   invariant mutating stock requires ctx.userId != none
 
-  fn placeOrder(qty : Nat) -> Nat!
+  def placeOrder(qty: Nat) -> Nat!:
     requires ctx.userId != none
-    requires 1 <= qty && qty <= 10
+    requires 1 <= qty <= 10
     ensures result <= 10000
-    let _ = await PaymentApi.charge(qty)?
-    let remaining = atomic
-      if stock < qty
-        return fail(.outOfStock)
+    await PaymentApi.charge(qty)?
+    return atomic:
+      ensure stock >= qty else fail(.outOfStock)
       stock -= qty
       totalOrders += 1
       return stock
-    return remaining
 ```
 
 ```lean
-component Checkout where
+component Checkout:
   session user
-  state lastRemaining : Nat := 0
-  state status        := ""
-  invariant validRemaining : lastRemaining ≤ 10000
+  state lastRemaining : Nat = 0
+  state status        = ""
+  invariant validRemaining: lastRemaining <= 10000
 
-  action buy (qty : Nat) when user.isSome ∧ 1 ≤ qty ∧ qty ≤ 10 =>
-    let rem := await Store.placeOrder(qty) catch
-      | .outOfStock => status := "Out of stock"
-      | .failed err => status := err
-    lastRemaining := rem
-    status := s!"Left: {rem}"
+  action buy(qty: Nat) when user.isSome, 1 <= qty <= 10:
+    let rem = await Store.placeOrder(qty) catch:
+      case .outOfStock: status = "Out of stock"
+      case .failed(err): status = err
+    lastRemaining = rem
+    status = f"Left: {rem}"
 ```
 
 - **Authorization & state invariants:** `mutating stock requires ctx.userId != none` rejects any endpoint that could modify `stock` without an authenticated user, while `old(totalOrders)` proves `totalOrders` can never decrease.
-- **Compile-time TOCTOU protection:** If a handler uses `await`, Qed rejects any state read or write outside an `atomic` block, and rejects `await` *inside* `atomic` so locks never span network I/O.
+- **Compile-time TOCTOU protection:** If a handler uses `await`, Qed rejects any state read or write outside an `atomic:` block, and rejects `await` *inside* `atomic:` so locks never span network I/O.
 - **Client–server RPC contracts (`requires` & `ensures`):** Calling `Store.placeOrder(qty)` from a `component` proves both session authentication (`session user`) and parameter `requires` at the client call site, while `ensures result <= 10000` is re-verified zero-trust in `FromProto` (`Ensured`) and feeds client component `invariant`s automatically.
-- **Typed domain errors & endpoint closure:** Inferred `fail(.tag)` variants enforce exhaustive `await ... catch` handling in client actions, and `fullstack` proves every reachable client RPC targets a mounted server method while keeping server secrets and handlers out of client JS.
+- **Reactive server `query` caching:** Declaring `query item = Store.get(id) when let .detail(id) = route` (or `when user.isSome, ...`) enforces read-only server endpoints at compile time, derives collision-free binary Protobuf `Cached` keys with stale-while-revalidate and stale-response race rejection, preloads active queries on SSR with zero-refetch hydration, and propagates `requires`, `session`, and `ensures` (`Cached.all`) across components.
+- **Typed domain errors & endpoint closure:** Inferred `fail(.tag)` variants enforce exhaustive `await ... catch:` handling in client actions, and `fullstack` proves every reachable client RPC targets a mounted server method while keeping server secrets and handlers out of client JS.
 
 See [CloudBooks](Examples/CloudBooks.lean) for a complete full-stack app.
 
@@ -188,7 +187,7 @@ qed dev
 
 Open **http://localhost:8000** to see the `Quantity` app running with live reload. If an invariant fails during `qed dev`, the rebuild stops with the exact proof goal while the dev server keeps serving the last working build.
 
-In a Lean editor (such as VS Code with the `lean4` extension), `\le` inserts `≤` and `\and` inserts `∧` (`<=` also works in place of `≤`).
+All Qed DSL blocks (`component`, `server`, `external`, `schema`, `router`, `invariant`, and JSX `{...}`) use plain ASCII Python-esque syntax (`and`, `or`, `not`, `in`, `not in`, `is`, `is not`, `<=`, `>=`, `==`, `!=`, `1 <= x <= 10`, `f"..."`, `a if cond else b`, `all x in xs: ...`)—no Unicode input required.
 
 ### CLI commands
 
@@ -213,7 +212,7 @@ Inside this repository, `npm run dev`, `npm run build`, and `npm run test` are a
 - **[How Qed works](docs/architecture.md):** Compilation pipeline, trusted computing base, verification gates, and source map.
 - **[Rendering & DOM proofs](docs/rendering.md):** Direct signal updates, keyed reconciliation, verified memoization, and browser equivalence tests.
 
-Qed apps are written in Lean 4, including expressions inside JSX. Familiar component concepts help you get started quickly, while writing custom logic or involved invariants means learning Lean syntax and proof basics. JavaScript interop uses [typed ports](docs/components.md).
+Qed apps live inside Lean 4 files, so you can drop down to full Lean definitions and tactic proofs (`:= by`) whenever you need custom data structures or domain lemmas. JavaScript interop uses [typed ports](docs/components.md).
 
 Questions and issues: [GitHub issues](https://github.com/JacobAsmuth/qed/issues).
 

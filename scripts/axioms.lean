@@ -253,3 +253,8 @@ import Examples.CloudBooks
 #print axioms CloudBooks.Storefront.orderedMatchesSlot
 #print axioms CloudBooks.Main.rpc_endpoints_valid
 #print axioms CloudBooks.Main.ssr_rpc_closure_complete
+#print axioms Qed.rpcQueryKey_injective
+#print axioms Qed.Cached.all_put
+#print axioms Qed.Cached.all_lookup_state
+#print axioms Qed.Query.boot_preserves_inv
+#print axioms Qed.Query.wrap_preserves_inv

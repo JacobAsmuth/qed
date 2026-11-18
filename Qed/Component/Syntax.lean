@@ -1,5 +1,6 @@
 import Qed.Component.Core
 import Qed.Jsx
+import Qed.Lang
 import Lean
 
 namespace Qed
@@ -50,123 +51,100 @@ def lookupComponent? (cName : Name) : CoreM (Option ComponentInfo) := do
     if let some info := reg.find? fullView.getPrefix then return some info
   return none
 
-/-! ## Component & App Surface Syntax -/
-
-declare_syntax_cat compStmt
+/-! ## Component Surface Syntax (Sharing `Qed.Lang` Expressions, Statements & Types) -/
 
 section CompParsers
-open Lean Parser
+open Lean Parser Qed.Lang
 
-private def sendKw : Parser :=
-  nonReservedSymbol "send" (includeIdent := true)
+private def compParam : Parser :=
+  node `Qed.componentParam (ident >> ":" >> categoryParser `qedType 0)
 
-private def actionParam : Parser :=
-  node `Qed.componentActionParam ("(" >> ident >> " : " >> termParser >> ")")
-
-@[term_parser] def sendTerm := leading_parser:maxPrec sendKw >> termParser maxPrec
-
-@[term_parser] def fieldSetterTerm := leading_parser:maxPrec
-  atomic ("(" >> Parser.ident >> " := ") >> symbol "·" >> ")"
-
-@[macro sendTerm] def expandSendTermOutsideComponent : Macro := fun stx =>
-  Macro.throwErrorAt stx "`send …` is the component output; it only has meaning inside a `component … view =>` body"
-@[macro fieldSetterTerm] def expandFieldSetterOutsideComponent : Macro := fun stx =>
-  Macro.throwErrorAt stx "`(field := ·)` is a component field setter; it only has meaning inside a `component` body"
-
-def compStmtSeq : Parser :=
-  node `Qed.compStmtSeq
-    (checkColGt >> categoryParser `compStmt 0 >>
-     many (atomic (optional "," >> checkColGt >> categoryParser `compStmt 0)))
-
-def compMatchAlt : Parser := leading_parser
-  withPosition ("| " >> sepBy1 termParser "," >> " => " >> compStmtSeq)
-
-@[compStmt_parser] def actionNoopStmt : Parser := leading_parser withPosition (atomic ("(" >> ")"))
-@[compStmt_parser] def actionReturnStmt : Parser := leading_parser withPosition (atomic (symbol "return"))
-@[compStmt_parser] def actionLetAwaitStmt : Parser := leading_parser
-  withPosition (
-    atomic ("let " >> ident >> optional (" : " >> termParser) >> " := " >> identEq `await) >>
-    ident >> "(" >> sepBy termParser "," >> ")" >>
-    optional (checkColGe >> symbol "catch" >> many1 (checkColGe >> compMatchAlt)))
-@[compStmt_parser] def actionLetStmt : Parser := leading_parser
-  withPosition ("let " >> ident >> optional (" : " >> termParser) >> " := " >> notFollowedBy (identEq `await) "await" >> termParser)
-@[compStmt_parser] def actionPerformStmt : Parser := leading_parser
-  withPosition (atomic (nonReservedSymbol "perform" (includeIdent := true)) >> checkColGt >> termParser)
-@[compStmt_parser] def actionSendStmt : Parser := leading_parser
-  withPosition (atomic sendKw >> checkColGt >> termParser)
-@[compStmt_parser] def actionIfLetStmt : Parser := leading_parser
-  withPosition (atomic ("if " >> "let ") >> termParser >> " := " >> termParser >> " then " >>
-                compStmtSeq >> optional (atomic (checkColGe >> "else ") >> compStmtSeq))
-@[compStmt_parser] def actionIfStmt : Parser := leading_parser
-  withPosition ("if " >> notFollowedBy (symbol "let") "let" >>
-                optional (atomic (ident >> " : ")) >> termParser >> " then " >>
-                compStmtSeq >> optional (atomic (checkColGe >> "else ") >> compStmtSeq))
-@[compStmt_parser] def actionMatchStmt : Parser := leading_parser
-  withPosition ("match " >> sepBy1 termParser "," >> " with" >> many1 (checkColGe >> compMatchAlt))
-@[compStmt_parser] def actionAssignAwaitStmt : Parser := leading_parser
-  withPosition (atomic (ident >> " := " >> identEq `await) >> ident >> "(" >> sepBy termParser "," >> ")")
-@[compStmt_parser] def actionAssignStmt : Parser := leading_parser
-  withPosition (atomic (ident >> (symbol ":=" <|> symbol "+=" <|> symbol "-=")) >> notFollowedBy (identEq `await) "await" >> termParser)
+private def compParamsOpt : Parser :=
+  optional (checkLineEq >> "(" >> sepBy1 compParam "," >> ")")
 
 def compFieldClause : Parser := leading_parser
   withPosition (
     (atomic (identEq `state) <|> atomic (identEq `ephemeral) <|>
      atomic (identEq `prop) <|> atomic (identEq `bind) <|>
      atomic (identEq `slot) <|> atomic (identEq `collection)) >>
-    ident >> optional (" : " >> termParser) >> optional (" := " >> termParser))
+    ident >> optional (":" >> categoryParser `qedType 0) >> optional ("=" >> categoryParser `qedExpr 0))
+
 def compChildrenClause : Parser := leading_parser withPosition (atomic (identEq `children))
 def compKeyClause      : Parser := leading_parser withPosition (atomic (identEq `key) >> ident)
 def compEventClause    : Parser := leading_parser
-  withPosition (atomic (identEq `event) >> ident >> many actionParam)
+  withPosition (atomic (identEq `event) >> ident >> compParamsOpt)
 def compSessionClause  : Parser := leading_parser
-  withPosition (atomic (identEq `session) >> ident >> optional (" : " >> termParser))
+  withPosition (atomic (identEq `session) >> ident >> optional (":" >> categoryParser `qedType 0))
 def compStartClause    : Parser := leading_parser
-  withPosition (atomic (identEq `start) >> checkColGt >> termParser)
+  withPosition (atomic (identEq `start) >> (checkLineEq <|> checkColGt) >> categoryParser `qedExpr 0)
 def compRouteClause    : Parser := leading_parser
-  withPosition (atomic (identEq `route) >> optional ident >> " : " >> termParser >> " := " >> termParser >>
-                many (checkColGt >> compMatchAlt))
+  withPosition (
+    atomic (identEq `route) >> optional ident >> ":" >> categoryParser `qedType 0 >> "=" >>
+    categoryParser `qedExpr 0 >>
+    optional (":" >> many1 (checkColGt >> qedStmtCase)))
 def compPortOutClause  : Parser := leading_parser
-  withPosition (atomic (identEq `port >> ident >> " : ") >> termParser)
+  withPosition (atomic (identEq `port >> ident >> ":") >> categoryParser `qedType 0)
+
+def compWhenLet : Parser := leading_parser
+  atomic (symbol "let" >> categoryParser `qedPat 0 >> "=") >> categoryParser `qedExpr 0 >>
+  optional ("," >> sepBy1 (categoryParser `qedExpr 0) ",")
+
+def compWhen : Parser := leading_parser
+  atomic (kw "when") >> (compWhenLet <|> sepBy1 (categoryParser `qedExpr 0) ",")
+
 def compPortInClause   : Parser := leading_parser
-  withPosition (atomic (identEq `port >> ident >> "(") >> ident >> " : " >> termParser >> ")" >>
-                optional (atomic (identEq `when) >> termParser) >> " => " >> compStmtSeq)
+  withPosition (
+    atomic (identEq `port >> ident >> "(") >> ident >> ":" >> categoryParser `qedType 0 >> ")" >>
+    optional compWhen >> ":" >> qedSuite)
+
+def compRpcQueryClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `query >> ident >> optional (":" >> categoryParser `qedType 0) >> "=") >>
+    ident >> "(" >> sepBy (categoryParser `qedExpr 0) "," >> ")" >>
+    optional compWhen)
+
 def compQueryClause    : Parser := leading_parser
   withPosition (
-    atomic (identEq `query >> ident >> " : ") >> withPosition termParser >>
+    atomic (identEq `query >> ident >> ":") >> categoryParser `qedType 0 >> ":" >>
     checkColGt >>
-    withPosition (identEq `key >> " := " >> withPosition termParser >>
-                  checkColGe >> identEq `url >> " := " >> withPosition termParser))
+    withPosition (identEq `key >> "=" >> categoryParser `qedExpr 0 >>
+                  checkColGe >> identEq `url >> "=" >> categoryParser `qedExpr 0))
+
 def compActionClause   : Parser := leading_parser
-  withPosition (atomic (identEq `action) >> ident >> many actionParam >>
-                optional (atomic (identEq `when) >> termParser) >> " => " >> compStmtSeq)
-def compInvName : Parser := leading_parser ident >> " : "
+  withPosition (
+    atomic (identEq `action) >> ident >> compParamsOpt >>
+    optional compWhen >> ":" >> qedSuite)
+
+def compInvName : Parser := leading_parser ident >> ":"
+
 def compForEachInvClause : Parser := leading_parser
   withPosition (
-    atomic ("invariant " >> optional (atomic compInvName) >> termParser >> " for_each " >> ident) >>
-    optional (" holds_in " >> identEq `view) >>
-    optional (" using " >> ident) >>
-    optional (" := " >> termParser))
+    atomic ("invariant " >> optional (atomic compInvName) >> categoryParser `qedExpr 0 >> kw "for_each" >> ident) >>
+    optional (kw "holds_in" >> identEq `view) >>
+    optional (kw "using" >> ident) >>
+    optional (":=" >> termParser))
+
 def compInvariantClause : Parser := leading_parser
   withPosition (
-    "invariant " >> optional (atomic compInvName) >> sepBy1 termParser "," >>
-    optional (" holds_in " >> identEq `view >> optional (" assuming " >> termParser maxPrec)) >>
-    optional (" using " >> "[" >> sepBy termParser "," >> "]") >>
-    optional (" := " >> termParser))
+    "invariant " >> optional (atomic compInvName) >> sepBy1 (categoryParser `qedExpr 0) "," >>
+    optional (kw "holds_in" >> identEq `view >> optional (kw "assuming" >> categoryParser `qedExpr 0)) >>
+    optional (kw "using" >> "[" >> sepBy termParser "," >> "]") >>
+    optional (":=" >> termParser))
+
 def compInvAny : Parser := compForEachInvClause <|> compInvariantClause
 
 def compClause : Parser :=
   compSessionClause <|> compFieldClause <|> compChildrenClause <|> compKeyClause <|>
   compEventClause <|> compStartClause <|> compRouteClause <|>
-  compPortOutClause <|> compPortInClause <|> compQueryClause <|>
+  compPortOutClause <|> compPortInClause <|> compRpcQueryClause <|> compQueryClause <|>
   compActionClause <|> compInvAny
 
 @[command_parser] def componentCmd : Parser := leading_parser
   optional Command.docComment >>
   withPosition (
-    "component " >>
-    ident >> " where " >>
+    "component " >> ident >> ":" >>
     many (checkColGt >> compClause) >>
-    checkColGt >> identEq `view >> " => " >> checkColGt >> termParser >>
+    checkColGt >> identEq `view >> ":" >> (checkLineEq <|> checkColGt) >> categoryParser `qedExpr 0 >>
     many (checkColGt >> compInvAny))
 
 end CompParsers
@@ -174,7 +152,7 @@ end CompParsers
 /-! ## Shared Syntax & JSX Helpers -/
 
 section CompElab
-open Lean Elab Command
+open Lean Elab Command Qed.Lang
 
 structure OutArm where
   ctor    : Name
@@ -182,7 +160,8 @@ structure OutArm where
   handler : Term
 
 def isCdot (stx : Syntax) : Bool :=
-  stx.getKind == ``Lean.Parser.Term.cdot || (stx.reprint.getD "").trimmed == "·"
+  let u := unwrapParens1 stx
+  u.getKind == ``qedCdot || u.getKind == ``Lean.Parser.Term.cdot || (u.reprint.getD "").trimmed == "·"
 
 def atomStr : Syntax → String := Qed.Jsx.tokenVal
 def asTerm (s : Syntax) : Term := ⟨s⟩
@@ -194,21 +173,21 @@ partial def mentionsIdent (stx : Syntax) (n : Name) : Bool :=
   | _ => false
 
 def unpackSeq (seqStx : Syntax) : Array Syntax :=
-  if seqStx.getKind == `Qed.compStmtSeq then
-    #[seqStx[0]] ++ seqStx[1].getArgs.map fun m => m[m.getNumArgs - 1]!
-  else #[seqStx]
+  Qed.Lang.suiteStmts seqStx
 
 partial def hasPerformNode (stx : Syntax) : Bool :=
-  stx.getKind == ``actionPerformStmt ||
-  stx.getKind == ``actionLetAwaitStmt ||
-  stx.getKind == ``actionAssignAwaitStmt ||
+  let k := stx.getKind
+  k == ``qedStmtPerform ||
+  (k == ``qedStmtLet && (unwrapParens1 stx[4]).getKind == ``qedAwait) ||
+  (k == ``qedStmtAssign && (unwrapParens1 stx[2]).getKind == ``qedAwait) ||
   stx.getArgs.any hasPerformNode
 
 partial def hasReturnStmt (stx : Syntax) : Bool :=
-  stx.getKind == ``actionReturnStmt || stx.getArgs.any hasReturnStmt
+  let k := stx.getKind
+  k == ``qedStmtReturn || k == ``qedStmtEnsure || stx.getArgs.any hasReturnStmt
 
 def staticRootTag? (body : Syntax) : Option String :=
-  if body.getKind == ``Qed.Jsx.jsxTerm then
+  if body.getKind == ``Qed.Jsx.qedExprJsx || body.getKind == ``Qed.Jsx.jsxTerm then
     let el := body[0]
     if el.getKind == ``Qed.Jsx.selfClosing || el.getKind == ``Qed.Jsx.withChildren then
       let tag := atomStr el[1]
@@ -218,7 +197,7 @@ def staticRootTag? (body : Syntax) : Option String :=
 
 def mkJsxAttrValNode (val : Term) : Syntax :=
   Syntax.node .none ``Qed.Jsx.attrValExpr
-    #[Syntax.atom .none "{", Syntax.node .none ``Qed.Jsx.jsxTermExpr #[val.raw], Syntax.atom .none "}"]
+    #[Syntax.atom .none "{", Qed.Lang.mkRawExpr val, Syntax.atom .none "}"]
 
 def mkJsxAttrExpr (name : String) (val : Term) : Syntax :=
   Syntax.node .none ``Qed.Jsx.attrNamed

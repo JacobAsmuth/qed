@@ -50,8 +50,9 @@ def mkRoutedApp {R : Type} [Router R] [Inhabited R]
   { mkApp init update template start locals styles onPort onSession valid_view with
     onUrlChange := some (fun p => onRoute ((Router.fromURL p).getD default)) }
 
-def App.setUpdate (app : App Model Msg) (u : Model → Msg → Model × Cmd Msg) : App Model Msg :=
-  { app with update := u }
+def App.setInitAndUpdate (app : App Model Msg) (init : Model × Cmd Msg)
+    (u : Model → Msg → Model × Cmd Msg) : App Model Msg :=
+  { app with init := init, update := u }
 
 @[simp] theorem mkApp_init (init : Model) (u : Model → Msg → Model × Cmd Msg)
     (t : View Model Msg) (s l st p os hv) :
@@ -83,10 +84,6 @@ def App.setUpdate (app : App Model Msg) (u : Model → Msg → Model × Cmd Msg)
 @[simp] theorem mkRoutedApp_rehydrate {R : Type} [Router R] [Inhabited R]
     (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) :
     (mkRoutedApp init u t r s l st p os hv).rehydrate = fun _ => none := rfl
-@[simp] theorem App.setUpdate_dehydrate (app : App Model Msg) (u : Model → Msg → Model × Cmd Msg) :
-    (App.setUpdate app u).dehydrate = app.dehydrate := rfl
-@[simp] theorem App.setUpdate_rehydrate (app : App Model Msg) (u : Model → Msg → Model × Cmd Msg) :
-    (App.setUpdate app u).rehydrate = app.rehydrate := rfl
 
 end Internal
 

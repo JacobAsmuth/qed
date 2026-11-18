@@ -27,12 +27,12 @@ def cmdNew (dir : String) : IO UInt32 := do
     "lean_exe web where\n  root := `Web\n"
   IO.FS.writeFile (root / "App.lean") <|
     "import Qed\nopen Qed\n\n" ++
-    "component Quantity where\n" ++
-    "  state quantity := 1\n" ++
-    "  action increase when quantity < 10 => quantity += 1\n" ++
-    "  action decrease when 1 < quantity  => quantity -= 1\n" ++
-    "  invariant 1 ≤ quantity, quantity ≤ 10\n" ++
-    "  view =>\n" ++
+    "component Quantity:\n" ++
+    "  state quantity = 1\n" ++
+    "  action increase when quantity < 10: quantity += 1\n" ++
+    "  action decrease when quantity > 1:  quantity -= 1\n" ++
+    "  invariant 1 <= quantity <= 10\n" ++
+    "  view:\n" ++
     "    <div>\n" ++
     "      <button onClick={.decrease}>−</button>\n" ++
     "      <span>{quantity}</span>\n" ++

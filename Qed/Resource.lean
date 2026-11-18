@@ -48,6 +48,19 @@ def someOr (err : String := "Not found") : Resource (Option α) → Resource α
   | .ok (some a) => .ok a | .ok none => .failed err
   | .idle => .idle | .loading => .loading | .failed e => .failed e
 
+def all {α : Type} (P : α → Prop) : Resource α → Prop
+  | .ok a => P a
+  | _     => True
+
+@[simp] theorem all_idle {α : Type} (P : α → Prop) : Resource.all P .idle := trivial
+@[simp] theorem all_loading {α : Type} (P : α → Prop) : Resource.all P .loading := trivial
+@[simp] theorem all_failed {α : Type} (P : α → Prop) (e : String) : Resource.all P (.failed e) := trivial
+@[simp] theorem all_ok {α : Type} (P : α → Prop) (a : α) : Resource.all P (.ok a) = P a := rfl
+
+instance {α : Type} {P : α → Prop} [DecidablePred P] : DecidablePred (Resource.all P)
+  | .ok a                       => inferInstanceAs (Decidable (P a))
+  | .idle | .loading | .failed _ => isTrue trivial
+
 @[simp] theorem validIn_view {α msg : Type} (ctx : HtmlCtx) (r : Resource α)
     (ready : α → Html msg) (loading : Html msg) (failed : String → Html msg) (idle : Html msg) :
     Html.validIn ctx (r.view ready loading failed idle) =
@@ -76,11 +89,20 @@ def put (c : Cached α) (issuedKey : String) (r : Resource α) (currentKey : Str
     | _     => c.seen
   { state := if issuedKey == currentKey then r else c.state, seen := seen }
 
+def activate (c : Cached α) (k : String) : Cached α :=
+  { c with state := match c.lookup k with | some a => .ok a | none => .loading }
+
 def view (c : Cached α) (ready : α → Html msg)
     (loading : Html msg := .text "Loading…")
     (failed  : String → Html msg := fun e => .text e)
     (idle    : Html msg := .text "") : Html msg :=
   c.state.view ready loading failed idle
+
+def all {α : Type} (P : α → Prop) (c : Cached α) : Prop :=
+  c.state.all P ∧ ∀ kv ∈ c.seen, P kv.2
+
+instance {α : Type} {P : α → Prop} [DecidablePred P] : DecidablePred (Cached.all P) :=
+  fun c => inferInstanceAs (Decidable (c.state.all P ∧ ∀ kv ∈ c.seen, P kv.2))
 
 @[simp] theorem validIn_view {α msg : Type} (ctx : HtmlCtx) (c : Cached α)
     (ready : α → Html msg) (loading : Html msg) (failed : String → Html msg) (idle : Html msg) :
@@ -94,23 +116,65 @@ structure Query (Model : Type) (Msg : Type) where
   load : String → Model → Model × Cmd Msg
   idle : Model → Model
 
+/-- Deterministic, collision-free cache key for a typed RPC request (`LawfulProto`). -/
+def rpcQueryKey {Req : Type} [ToProto Req] : Option Req → String
+  | none     => ""
+  | some req => "q:" ++ Proto.encodeHex (Proto.encode req)
+
+theorem rpcQueryKey_injective {Req : Type} [LawfulProto Req] {a b : Option Req}
+    (h : rpcQueryKey a = rpcQueryKey b) : a = b := by
+  cases a <;> cases b
+  · rfl
+  · have := congrArg String.toList h; simp [rpcQueryKey] at this
+  · have := congrArg String.toList h; simp [rpcQueryKey] at this
+  · rename_i x y
+    have hlist := congrArg String.toList h
+    simp only [rpcQueryKey, String.toList_append] at hlist
+    have hBytes := congrArg Proto.decodeHex (show Proto.encodeHex (Proto.encode x) = _ by
+      simpa [String.ofList_toList] using congrArg String.ofList hlist)
+    simp only [Proto.decodeHex_encodeHex] at hBytes
+    have hDec := congrArg (Proto.decode (α := Req)) (Except.ok.inj hBytes)
+    simp only [Proto.decode_encode] at hDec
+    exact congrArg some (Except.ok.inj hDec)
+
 def Resource.query {Model Msg α : Type} [FromJson α]
     (key : Model → String) (url : String → String)
     (got : String → Resource α → Msg)
     (get : Model → Cached α) (set : Cached α → Model → Model) : Query Model Msg :=
   { key
-    load := fun k m =>
-      let c := get m
-      let state := match c.lookup k with | some a => .ok a | none => .loading
-      (set { c with state := state } m, Resource.fetch (url k) (got k))
+    load := fun k m => (set ((get m).activate k) m, Resource.fetch (url k) (got k))
     idle := fun m => set { get m with state := .idle } m }
+
+/-- Server-backed reactive `Query` using collision-free `rpcQueryKey` and typed binary Protobuf RPCs. -/
+def Resource.rpcQuery {Model Msg Req α ResMsg : Type} [ToProto Req]
+    (params? : Model → Option Req)
+    (fetch   : Model → (String → Resource ResMsg → Msg) → String → Option (Cmd Msg))
+    (got     : String → Resource ResMsg → Msg)
+    (get     : Model → Cached α)
+    (set     : Cached α → Model → Model) : Query Model Msg :=
+  { key  := fun m => rpcQueryKey (params? m)
+    load := fun k m =>
+      match fetch m got k with
+      | some cmd => (set ((get m).activate k) m, cmd)
+      | none     => (set { get m with state := .idle } m, .none)
+    idle := fun m => set { get m with state := .idle } m }
+
+/-- Triggers active queries at initial component boot (`init` / SSR entry). -/
+def Query.boot {Model Msg : Type} (qs : List (Query Model Msg))
+    (ic : Model × Cmd Msg) : Model × Cmd Msg :=
+  qs.foldl (fun (mc : Model × Cmd Msg) q =>
+    let k0 := q.key mc.1
+    if k0.isEmpty then mc
+    else
+      let (m', c') := q.load k0 mc.1
+      (m', .batch [mc.2, c'])) ic
 
 def Query.wrap {Model Msg : Type} (qs : List (Query Model Msg))
     (update : Model → Msg → Model × Cmd Msg) : Model → Msg → Model × Cmd Msg :=
   fun old msg =>
     let (new, cmd) := update old msg
     qs.foldl (fun (mc : Model × Cmd Msg) q =>
-      let kNew := q.key new
+      let kNew := q.key mc.1
       if q.key old == kNew then mc
       else if kNew.isEmpty then (q.idle mc.1, mc.2)
       else
@@ -121,10 +185,10 @@ namespace Internal
 
 def App.withQueries {Model Msg : Type} (qs : List (Query Model Msg))
     (app : App Model Msg) : App Model Msg :=
-  Internal.App.setUpdate app (Query.wrap qs app.update)
+  Internal.App.setInitAndUpdate app (Query.boot qs app.init) (Query.wrap qs app.update)
 
 @[simp] theorem App.withQueries_init (qs : List (Query Model Msg)) (app : App Model Msg) :
-    (App.withQueries qs app).init = app.init := rfl
+    (App.withQueries qs app).init = Query.boot qs app.init := rfl
 @[simp] theorem App.withQueries_update (qs : List (Query Model Msg)) (app : App Model Msg) :
     (App.withQueries qs app).update = Query.wrap qs app.update := rfl
 @[simp] theorem App.withQueries_template (qs : List (Query Model Msg)) (app : App Model Msg) :
@@ -174,6 +238,24 @@ instance [LawfulJson α] : LawfulJson (Resource α) where
 instance [ToJson α] : NonNullJson (Resource α) :=
   ⟨fun | .idle | .loading | .ok _ | .failed _ => nofun⟩
 
+instance [ToJson α] : ToJson (Cached α) :=
+  ⟨fun c => toJson (c.state, c.seen)⟩
+
+instance [FromJson α] : FromJson (Cached α) :=
+  ⟨fun j => (FromJson.fromJson (α := Resource α × List (String × α)) j).map fun p => ⟨p.1, p.2⟩⟩
+
+instance [LawfulJson α] : LawfulJson (Cached α) where
+  depthBound := LawfulJson.depthBound (Resource α × List (String × α))
+  depth_toJson c := LawfulJson.depth_toJson (c.state, c.seen)
+  fromJson_toJson c := by
+    rcases c with ⟨st, sn⟩
+    change (FromJson.fromJson (toJson (st, sn)) : Except String (Resource α × List (String × α))).map
+      (fun p => Cached.mk p.1 p.2) = .ok ⟨st, sn⟩
+    rw [LawfulJson.fromJson_toJson (st, sn)]
+    rfl
+
+instance [ToJson α] : NonNullJson (Cached α) := ⟨nofun⟩
+
 private def encodeResourceFields [ToProto α] : Resource α → List (Nat × Proto.WireVal)
   | .idle     => [(1, .varint 0)]
   | .loading  => [(1, .varint 1)]
@@ -213,6 +295,10 @@ instance [LawfulProto α] : LawfulProto (Resource α) :=
 structure Ensured (α : Type) (p : α → Prop) where
   val : α
   ok  : p val
+
+@[reducible, inline] instance {α : Type} {p : α → Prop} : Qed.Lang.QedVal (Ensured α p) α := ⟨Ensured.val⟩
+@[simp] theorem QedVal.val_ensured {α : Type} {p : α → Prop} (e : Ensured α p) :
+    Qed.Lang.QedVal.val e = e.val := rfl
 
 @[reducible] instance {α : Type} {p : α → Prop} : CoeOut (Ensured α p) α := ⟨Ensured.val⟩
 @[reducible] instance {α msg : Type} {p : α → Prop} [Coe α (Html msg)] : CoeHTCT (Ensured α p) (Html msg) :=
@@ -263,6 +349,13 @@ instance {α : Type} {p : α → Prop} [DecidablePred p] [LawfulProto α] : Lawf
     rw [LawfulProto.fromProtoMsg_toProtoMsg val]
     dsimp only
     rw [dif_pos hok]
+
+def Resource.stripEnsured {α : Type} {p : α → Prop} (r : Resource (Ensured α p)) : Resource α :=
+  r.map (·.val)
+
+theorem Resource.all_stripEnsured_of_imp {α : Type} {P Q : α → Prop}
+    {r : Resource (Ensured α P)} (h : ∀ a, P a → Q a) : (Resource.stripEnsured r).all Q := by
+  cases r with | ok e => exact h e.val e.ok | _ => trivial
 
 @[simp] theorem Proto.encode_ensured {α : Type} {p : α → Prop} [ToProto α] (e : Ensured α p) :
     Proto.encode e = Proto.encode e.val := rfl
@@ -548,6 +641,57 @@ theorem Cached.put_seen_length_le {α : Type} (c : Cached α) (k currentKey : St
       simp only [Cached.put]
       exact Nat.le_trans (List.length_take_le _ _) (Nat.le_max_left _ _)
 
+@[simp] theorem Cached.all_empty {α : Type} (P : α → Prop) : ({} : Cached α).all P :=
+  ⟨trivial, fun _ h => False.elim (List.not_mem_nil h)⟩
+
+theorem Cached.lookup_of_all {α : Type} {P : α → Prop} {c : Cached α} {k : String} {a : α}
+    (hall : c.all P) (hlk : c.lookup k = some a) : P a := by
+  simp only [Cached.lookup, Option.map_eq_some_iff] at hlk
+  rcases hlk with ⟨kv, hfind, rfl⟩
+  exact hall.2 kv (List.mem_of_find?_eq_some hfind)
+
+theorem Cached.all_put {α : Type} {P : α → Prop} {c : Cached α} {k currentKey : String} {r : Resource α}
+    (hall : c.all P) (hr : r.all P) : (c.put k r currentKey).all P := by
+  refine ⟨?_, ?_⟩
+  · cases r <;> simp only [Cached.put] <;> split <;> first | exact hall.1 | exact hr
+  · intro kv hkv
+    cases r with
+    | idle | loading | failed _ => exact hall.2 kv hkv
+    | ok a =>
+        simp only [Cached.put] at hkv
+        have hmem := List.mem_of_mem_take hkv
+        rcases List.mem_cons.1 hmem with rfl | hflt
+        · exact hr
+        · exact hall.2 kv (List.mem_filter.1 hflt).1
+
+theorem Cached.all_lookup_state {α : Type} {P : α → Prop} {c : Cached α} {k : String}
+    (hall : c.all P) : (c.activate k).all P := by
+  refine ⟨?_, hall.2⟩
+  dsimp only [Cached.activate]
+  cases hlk : c.lookup k with
+  | none => trivial
+  | some a =>
+      change P a
+      exact Cached.lookup_of_all hall hlk
+
+theorem Query.boot_preserves_inv {Model Msg : Type} (Inv : Model → Prop)
+    (qs : List (Query Model Msg)) (ic : Model × Cmd Msg)
+    (hinit : Inv ic.1)
+    (hqs : ∀ q ∈ qs, ∀ k m, Inv m → Inv (q.load k m).1) :
+    Inv (Query.boot qs ic).1 := by
+  unfold Query.boot
+  induction qs generalizing ic with
+  | nil => exact hinit
+  | cons q rest ih =>
+      simp only [List.foldl_cons]
+      apply ih
+      · dsimp only
+        split
+        · exact hinit
+        · exact hqs q (List.mem_cons_self ..) _ _ hinit
+      · intro q' hq'
+        exact hqs q' (List.mem_cons_of_mem q hq')
+
 theorem Query.wrap_preserves_inv {Model Msg : Type} (Inv : Model → Prop)
     (qs : List (Query Model Msg)) (upd : Model → Msg → Model × Cmd Msg)
     (old : Model) (msg : Msg)
@@ -557,34 +701,20 @@ theorem Query.wrap_preserves_inv {Model Msg : Type} (Inv : Model → Prop)
     Inv (Query.wrap qs upd old msg).1 := by
   unfold Query.wrap
   dsimp only
-  let new := (upd old msg).1
-  have h0 : Inv new := hupd old hold
-  suffices hgen : ∀ (qs' : List (Query Model Msg)) (acc : Model × Cmd Msg),
-      Inv acc.1 →
-      (∀ q ∈ qs', (∀ m, Inv m → Inv (q.idle m)) ∧ (∀ k m, Inv m → Inv (q.load k m).1)) →
-      Inv (qs'.foldl (fun (mc : Model × Cmd Msg) q =>
-        let kNew := q.key new
-        if q.key old == kNew then mc
-        else if kNew.isEmpty then (q.idle mc.1, mc.2)
-        else
-          let (m', c') := q.load kNew mc.1
-          (m', .batch [mc.2, c'])) acc).1 by
-    exact hgen qs (upd old msg) h0 hqs
-  intro qs'
-  induction qs' with
-  | nil => intro acc hacc _; exact hacc
+  have hacc := hupd old hold
+  generalize upd old msg = acc at hacc ⊢
+  induction qs generalizing acc with
+  | nil => exact hacc
   | cons q rest ih =>
-      intro acc hacc hq
-      rcases hq q (List.mem_cons_self ..) with ⟨hidle, hload⟩
-      have hrest : ∀ q' ∈ rest, (∀ m, Inv m → Inv (q'.idle m)) ∧ (∀ k m, Inv m → Inv (q'.load k m).1) :=
-        fun q' hq' => hq q' (List.mem_cons_of_mem q hq')
-      apply ih _ _ hrest
-      dsimp only
+      rcases hqs q (List.mem_cons_self ..) with ⟨hidle, hload⟩
+      let hrest := fun q' hq' => hqs q' (List.mem_cons_of_mem q hq')
+      simp only [List.foldl_cons]
       split
-      · exact hacc
+      · exact ih hrest acc hacc
       · split
-        · exact hidle acc.1 hacc
-        · exact hload _ acc.1 hacc
+        · exact ih hrest (_, _) (hidle acc.1 hacc)
+        · exact ih hrest ((q.load (q.key acc.1) acc.1).1, Cmd.batch [acc.2, (q.load (q.key acc.1) acc.1).2])
+            (hload (q.key acc.1) acc.1 hacc)
 
 theorem Query.wrap_noop_when_keys_unchanged {Model Msg : Type}
     (qs : List (Query Model Msg)) (upd : Model → Msg → Model × Cmd Msg)

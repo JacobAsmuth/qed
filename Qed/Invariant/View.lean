@@ -57,7 +57,10 @@ macro_rules
          Qed.onKeyup, Qed.onSubmit, Qed.onBlur, Qed.onFocus, Qed.onDoubleClick, Qed.onMouseDown,
          Qed.onMouseUp, Qed.key, Qed.value, Qed.placeholder, Qed.name, Qed.href, Qed.ToHref.toHref,
          Qed.src, Qed.action, Qed.alt, Qed.title, Qed.style, Qed.type', Qed.disabled, Qed.required,
-         Qed.checked, Qed.readOnly];
+         Qed.checked, Qed.readOnly,
+         Qed.Lang.QedVal.val_id, Qed.Lang.QedSeqLit.ofList_array, Qed.Lang.QedSeqLit.ofList_list,
+         Qed.Lang.QedMem.mem_array, Qed.Lang.QedMem.mem_list, Qed.Lang.QedMem.mem_string,
+         Qed.Lang.QedMemProp.memProp_array, Qed.Lang.QedMemProp.memProp_list, Qed.Lang.QedMemProp.memProp_string];
        repeat' split;
        all_goals (first
          | rfl
@@ -69,7 +72,7 @@ macro_rules
          | decide)))
 
 syntax (name := invariantView)
-  "invariant " ident " : " term " holds_in " ident (" assuming " term:max)? (" := " term)? : command
+  "invariant " ident " : " qedExpr,+ " holds_in " ident (" assuming " qedExpr)? (" := " term)? : command
 
 elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => do
   evalTactic (← `(tactic| (intro m; try intro _qed_h_assume)))
@@ -103,11 +106,20 @@ elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => do
 
 open Lean Elab Command in
 elab_rules : command
-  | `(invariant $name:ident : $pred holds_in $view:ident $[assuming $assumeT]? $[ := $pf:term]?) => do
-    let predStr := ((pred.raw.reprint).getD "this rule").trimmed
-    let prop ← match assumeT with
+  | `(invariant $name:ident : $preds:qedExpr,* holds_in $view:ident $[assuming $assumeE:qedExpr]? $[ := $pf:term]?) => do
+    let rawPreds := preds.getElems
+    let loweredPreds ← rawPreds.mapM fun p => liftMacroM (Qed.Lang.lowerSimpleQedExpr .val p)
+    let pred ← match loweredPreds.toList with
+      | [p] => pure p
+      | p :: ps => ps.foldlM (init := p) fun acc q => `(Qed.both $acc $q)
+      | [] => throwErrorAt name "empty view invariant"
+    let predStr := String.intercalate ", " (rawPreds.toList.map fun p => (p.raw.reprint.getD "this rule").trimmed)
+    let prop ← match assumeE with
       | some a =>
-          let P ← if a.raw.isIdent then try liftTermElabM (extractInvPred ⟨a.raw⟩) catch _ => pure a else pure a
+          let uA := Qed.Lang.unwrapParens1 a.raw
+          let aMode := if uA.getKind == ``Qed.Lang.qedLam1 || uA.getKind == ``Qed.Lang.qedLamN then .propInv else .val
+          let aT ← liftMacroM (Qed.Lang.lowerSimpleQedExpr aMode a)
+          let P ← if aT.raw.isIdent then try liftTermElabM (extractInvPred ⟨aT.raw⟩) catch _ => pure aT else pure aT
           `(∀ m, ($P) m → ($pred) ($view m) = true)
       | none => `(∀ m, ($pred) ($view m) = true)
     match pf with

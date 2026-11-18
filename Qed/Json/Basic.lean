@@ -414,9 +414,21 @@ def Json.field (j : Json) (key : String) : Except String Json :=
 
 def Json.get? (j : Json) (key : String) : Option Json := (j.field key).toOption
 
-def Json.path? (j : Json) : List String → Option Json
-  | []      => some j
-  | k :: ks => (j.get? k).bind (fun v => v.path? ks)
+/-- Walks a dot-separated path (object keys and numeric array indices, e.g. `"choices.0.delta.content"`). -/
+def Json.atPath (j : Json) (path : String) : Option Json :=
+  (path.splitOn ".").foldlM (init := j) fun cur seg =>
+    match cur with
+    | .arr es => seg.toNat?.bind (es[·]?)
+    | .obj _  => cur.get? seg
+    | _       => none
+
+/-- Parses a JSON string and extracts the value at a dot-separated path. -/
+def Json.path? (raw : String) (path : String) : Option Json :=
+  (Json.parse raw).toOption.bind (·.atPath path)
+
+/-- Parses a JSON string and extracts a `String` at a dot-separated path (defaulting to `default`). -/
+def Json.pathStr (raw : String) (path : String) (default : String := "") : String :=
+  ((Json.path? raw path).bind (·.str?)).getD default
 
 class ToJson (α : Type) where toJson : α → Json
 class FromJson (α : Type) where fromJson : Json → Except String α

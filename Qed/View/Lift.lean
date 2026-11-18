@@ -234,6 +234,16 @@ mutual
           return (← `(Qed.V.ifElse $(← mkModelFn m fields (← `(if $c then true else false))) $t' $e'))
         else
           return (← `(if $c then $t' else $e'))
+    | `(if $h:ident : $c:term then $t:term else $e:term) =>
+        if !viewMentionsAny h.getId #[] t && !viewMentionsAny h.getId #[] e then
+          let t' : Term := ⟨← viewLift m fields t⟩
+          let e' : Term := ⟨← viewLift m fields e⟩
+          if viewMentionsAny m.getId fields c then
+            return (← `(Qed.V.ifElse $(← mkModelFn m fields (← `(if $h:ident : $c then true else false))) $t' $e'))
+          else
+            return (← `(if $h:ident : $c then $t' else $e'))
+        else
+          catchAll m fields stx
     | _ =>
         if stx.isStrLit?.isSome then return stx
         if stx.getKind == kMatch && viewMentionsAny m.getId fields stx then

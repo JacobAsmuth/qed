@@ -36,12 +36,12 @@ Run all proof/environment checks and the 4 automated TCB test suites from the re
 
 ## Tour
 
-1. **[Counter.lean](Counter.lean)** — Basic component state, explicit `action`s, DOM focus preservation across updates, and an automatic arithmetic `invariant` (`0 ≤ count`).
+1. **[Counter.lean](Counter.lean)** — Basic component state, explicit `action`s, DOM focus preservation across updates, and an automatic arithmetic `invariant` (`0 <= count`).
 2. **[Todo.lean](Todo.lean)** — Child `Row` components inside a parent `collection` (`push`, `filter`, `sortBy`), scoped `css` classes, and `for_each` invariants lifting both child state (`rowsSafe`) and view styling rules (`rowsStyled`).
-3. **[Signup.lean](Signup.lean)** — A `schema` with `where` validation predicates, automatic JSON/Protobuf codecs, and a declarative `<Account.Form>` gated on schema validity.
-4. **[Chat.lean](Chat.lean)** — Streaming Server-Sent Events with `Cmd.stream`, loop rendering, and an effect-safety invariant (`pending = true → 0 < turns.size`).
+3. **[Signup.lean](Signup.lean)** — A `schema` with `where` validation predicates (`'@' in email`), automatic JSON/Protobuf codecs, and a self-hosted `<Account.Form reset onSubmit={...}/>` gated on schema validity.
+4. **[Chat.lean](Chat.lean)** — Streaming Server-Sent Events with `Cmd.stream`, loop rendering, and an effect-safety invariant (`pending -> 0 < turns.size`).
 5. **[Bookshelf.lean](Bookshelf.lean)** — Complete routed SPA + JS SSR app combining `router`, `<Book.Form>`, `token`/`css`/`theme` styling, `Resource` HTTP requests, `<Await>` with error handling, `Cmd.pushUrl`, and SSR hydration (paired with [bookshelf-server.mjs](bookshelf-server.mjs)).
-6. **[CloudBooks.lean](CloudBooks.lean)** — End-to-end verified `fullstack` app pairing typed `external` HTTP APIs and a stateful native `server` (`invariant`s, `requires`/`ensures` contracts, `atomic` blocks, `session` auth) with a `Storefront` client component.
+6. **[CloudBooks.lean](CloudBooks.lean)** — End-to-end verified `fullstack` app pairing typed `external` HTTP APIs and a stateful native `server` (`invariant`s, `requires`/`ensures` contracts, `ensure`, `return atomic:`, `session` auth) with a `Storefront` client component.
 
 ---
 

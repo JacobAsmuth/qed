@@ -1,4 +1,5 @@
 import Lean
+import Qed.Lang
 import Qed.Notation
 import Qed.View
 
@@ -35,34 +36,28 @@ def jsxName.parenthesizer : Parenthesizer := Parenthesizer.visitToken
 declare_syntax_cat jsxElement
 declare_syntax_cat jsxAttr
 declare_syntax_cat jsxAttrVal
-declare_syntax_cat jsxExpr
 
-syntax (name := jsxIfLet)
-  atomic("if " "let ") term " := " term " then " jsxExpr (" else " jsxExpr)? : jsxExpr
-syntax (name := jsxIf)
-  "if " (atomic(ident " : "))? term " then " jsxExpr (" else " jsxExpr)? : jsxExpr
-syntax (name := jsxFor)
-  atomic("for " ident " in ") term " => " jsxExpr : jsxExpr
-@[jsxExpr_parser] def jsxTermExpr : Parser := leading_parser
-  notFollowedBy (symbol "if") "if" >>
-  notFollowedBy (atomic (symbol "for" >> ident >> symbol "in")) "for" >>
-  termParser
+/-- Plug JSX elements directly into the unified `qedExpr` expression grammar. -/
+@[qedExpr_parser] def qedExprJsx : Parser := leading_parser:maxPrec
+  atomic (categoryParser `jsxElement 0)
 
-def jsxAssignOp : Parser := symbol ":=" <|> symbol "+=" <|> symbol "-="
-def jsxAssignItem : Parser := node `Qed.Jsx.jsxAssignItem (ident >> jsxAssignOp >> termParser)
+def jsxAssignOp : Parser :=
+  (symbol "=" >> notFollowedBy (symbol "=") "=") <|> symbol "+=" <|> symbol "-="
+def jsxAssignItem : Parser :=
+  node `Qed.Jsx.jsxAssignItem (ident >> jsxAssignOp >> categoryParser `qedExpr 0)
 
 @[jsxAttrVal_parser] def attrValStr : Parser := leading_parser strLit
 @[jsxAttrVal_parser] def attrValAssign : Parser := leading_parser
-  "{" >> atomic (ident >> jsxAssignOp) >> termParser >>
-  many (atomic (", " >> jsxAssignItem)) >>
-  optional (atomic (", " >> nonReservedSymbol "send" (includeIdent := true)) >> termParser) >> "}"
-@[jsxAttrVal_parser] def attrValExpr : Parser := leading_parser "{" >> categoryParser `jsxExpr 0 >> "}"
+  "{" >> atomic (ident >> jsxAssignOp) >> categoryParser `qedExpr 0 >>
+  many (atomic (";" >> jsxAssignItem)) >>
+  optional (atomic (";" >> Qed.Lang.kw "send") >> categoryParser `qedExpr 0) >> "}"
+@[jsxAttrVal_parser] def attrValExpr : Parser := leading_parser "{" >> categoryParser `qedExpr 0 >> "}"
 
 syntax (name := attrNamed)  jsxName ("=" jsxAttrVal)? : jsxAttr
-syntax (name := attrSplice) "{" jsxExpr "}" : jsxAttr
+syntax (name := attrSplice) "{" qedExpr "}" : jsxAttr
 
 -- Ordered `<|>` (not a syntax category) so `jsxText` runs before tokenizing non-token chars like `•`.
-syntax jsxChild := jsxText <|> ("{" jsxExpr "}") <|> jsxElement
+syntax jsxChild := jsxText <|> ("{" qedExpr "}") <|> jsxElement
 
 syntax (name := jsxFragment)  atomic("<" ">") jsxChild* "</" ">" : jsxElement
 syntax (name := selfClosing)  "<" jsxName jsxAttr* "/>" : jsxElement
@@ -186,37 +181,56 @@ partial def expandJsxIn (stx : Syntax) : MacroM Syntax := do
 
 partial def expandJsxExpr (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (fallback : MacroM Term)
     (stx : Syntax) : MacroM (Term × Bool) := do
-  if stx.getKind == ``jsxTermExpr then
-    let raw := stx[0]
-    if raw.getKind == ``jsxTerm && raw[0].getKind == ``jsxFragment then
-      let listT ← childrenToTerm pPath parentCtx? raw[0][1] raw[0][2].getArgs
-      return (listT, true)
-    if raw.getKind == ``jsxTerm then
-      return (← elementToTerm pPath parentCtx? raw[0], false)
-    let exp ← expandJsxIn raw
-    let isChildren := raw.isIdent && raw.getId.eraseMacroScopes == `children
-    return (⟨exp⟩, isMapCall exp || isChildren)
-  else if stx.getKind == ``jsxIfLet || stx.getKind == ``jsxIf then
-    let isLet := stx.getKind == ``jsxIfLet
-    let (tT, isListT) ← expandJsxExpr pPath parentCtx? fallback stx[if isLet then 6 else 4]
-    let elseOpt := stx[if isLet then 7 else 5]
-    let (eT, isListE) ← if elseOpt.getNumArgs == 2 then
-        expandJsxExpr pPath parentCtx? fallback elseOpt[1]
-      else pure (← if isListT then `([]) else fallback, isListT)
-    let res ← if isLet then
-      let pat : Term := ⟨← expandJsxIn stx[2]⟩
-      let scrut : Term := ⟨← expandJsxIn stx[4]⟩
-      `(if let $pat := $scrut then $tT else $eT)
+  let k := stx.getKind
+  let jsxHook : Syntax → Qed.Lang.ExprMode → MacroM Term := fun j _ => do
+    if j.getKind == ``qedExprJsx then
+      elementToTerm pPath parentCtx? j[0]
     else
-      let cond : Term := ⟨← expandJsxIn stx[2]⟩
-      if stx[1].getNumArgs > 0 then
-        let hId : Ident := ⟨stx[1][0][0]⟩
-        `(if $hId:ident : $cond then $tT else $eT)
-      else `(if $cond then $tT else $eT)
-    return (res, isListT || isListE)
-  else if stx.getKind == ``jsxFor then
+      Macro.throwErrorAt j s!"unsupported JSX expression ({j.getKind})"
+  let expandOptElse (optNode : Syntax) (isListT : Bool) : MacroM (Term × Bool) :=
+    if optNode.getNumArgs == 2 then expandJsxExpr pPath parentCtx? fallback optNode[1]
+    else return (← if isListT then `([]) else fallback, isListT)
+  if k == ``Qed.Lang.qedRawTerm then
+    return (⟨stx[1]⟩, isMapCall stx[1])
+  else if k == ``qedExprJsx then
+    if stx[0].getKind == ``jsxFragment then
+      return (← childrenToTerm pPath parentCtx? stx[0][1] stx[0][2].getArgs, true)
+    else
+      return (← elementToTerm pPath parentCtx? stx[0], false)
+  else if k == ``Qed.Lang.qedParen && stx[1].getSepArgs.size == 1 then
+    expandJsxExpr pPath parentCtx? fallback stx[1].getSepArgs[0]!
+  else if k == ``Qed.Lang.qedIdent then
+    return (⟨stx[0]⟩, stx[0].getId.eraseMacroScopes == `children)
+  else if k == ``Qed.Lang.qedTernary then
+    let (tT, isListT) ← expandJsxExpr pPath parentCtx? fallback stx[0]
+    let condT ← Qed.Lang.lowerSimpleQedExpr .propGuard stx[2] (lowerJsx? := some jsxHook)
+    let (eT, isListE) ← expandOptElse stx[3] isListT
+    return (← `(if _qedIf : $condT then $tT else $eT), isListT || isListE)
+  else if k == ``Qed.Lang.qedExprIf then
+    let condT ← Qed.Lang.lowerSimpleQedExpr .propGuard stx[1] (lowerJsx? := some jsxHook)
+    let (tT, isListT) ← expandJsxExpr pPath parentCtx? fallback stx[3]
+    let (eT, isListE) ← expandOptElse stx[4] isListT
+    return (← `(if _qedIf : $condT then $tT else $eT), isListT || isListE)
+  else if k == ``Qed.Lang.qedExprIfLet then
+    let patT ← Qed.Lang.lowerQedPat stx[2]
+    let scrutT ← Qed.Lang.lowerSimpleQedExpr .val stx[4] (lowerJsx? := some jsxHook)
+    let (tT, isListT) ← expandJsxExpr pPath parentCtx? fallback stx[6]
+    let (eT, isListE) ← expandOptElse stx[7] isListT
+    return (← `(if let $patT := $scrutT then $tT else $eT), isListT || isListE)
+  else if k == ``Qed.Lang.qedExprMatch then
+    let scruts ← stx[1].getSepArgs.mapM fun s =>
+      Qed.Lang.lowerSimpleQedExpr .val s (lowerJsx? := some jsxHook)
+    let mut anyList := false
+    let mut alts : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
+    for c in stx[3].getArgs do
+      let pats ← c[1].getSepArgs.mapM Qed.Lang.lowerQedPat
+      let (rhs, isL) ← expandJsxExpr pPath parentCtx? fallback c[3]
+      if isL then anyList := true
+      alts := alts.push (← `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $rhs))
+    return (← `(match $[$scruts:term],* with $[$alts:matchAlt]*), anyList)
+  else if k == ``Qed.Lang.qedExprFor then
     let xId : Ident := ⟨stx[1]⟩
-    let xs : Term := ⟨← expandJsxIn stx[3]⟩
+    let xs ← Qed.Lang.lowerSimpleQedExpr .val stx[3] (lowerJsx? := some jsxHook)
     let (bodyT, isListB) ← expandJsxExpr pPath parentCtx? fallback stx[5]
     let res ← if isListB then
       `((Qed.mapList (Qed.ForEachItems.toList $xs) (fun $xId:ident => $bodyT)).flatten)
@@ -224,8 +238,9 @@ partial def expandJsxExpr (pPath : String) (parentCtx? : Option (String × HtmlC
       `(Qed.mapList (Qed.ForEachItems.toList $xs) (fun $xId:ident => $bodyT))
     return (res, true)
   else
-    let exp ← expandJsxIn stx
-    return (⟨exp⟩, isMapCall exp)
+    let exp ← Qed.Lang.lowerSimpleQedExpr .val stx (allowOptElse := true)
+      (optElseFallback := fallback) (lowerJsx? := some jsxHook)
+    return (exp, isMapCall exp.raw)
 
 partial def expandAttrVal (valNode : Syntax) (fallback : MacroM Term) : MacroM Term := do
   let inner := valNode[1]
@@ -233,7 +248,7 @@ partial def expandAttrVal (valNode : Syntax) (fallback : MacroM Term) : MacroM T
     return ⟨inner[0]⟩
   else if inner.getKind == ``attrValAssign then
     Macro.throwErrorAt inner
-      "`field := …` / `+=` / `-=` mutates component state; it only has meaning inside a `component … view =>` body"
+      "`field = …` / `+=` / `-=` mutates component state; it only has meaning inside a `component … view:` body"
   else if inner.getKind == ``attrValExpr then
     return (← expandJsxExpr "" none fallback inner[1]).1
   else

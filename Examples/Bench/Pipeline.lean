@@ -3,7 +3,7 @@ open Qed
 
 namespace Bench
 
-schema Row where
+schema Row:
   id    : Nat
   label : String
   n     : Nat
@@ -15,18 +15,18 @@ def rowBody (r : Row) : Html Unit :=
   <div class="row-body">
     <span class="label">{r.label}</span>
     <div class="meta">
-      <span class="id">{toString r.id}</span>
-      <span class="count">{toString r.n}</span>
-      <span class="tag">{if r.n % 2 == 0 then "even" else "odd"}</span>
+      <span class="id">{toString(r.id)}</span>
+      <span class="count">{toString(r.n)}</span>
+      <span class="tag">{"even" if r.n % 2 == 0 else "odd"}</span>
     </div>
     <div class="controls"><span>▲</span><span>▼</span><span>✕</span></div>
   </div>
 
-def rowView     (r : Row) : Html Unit := <li key={toString r.id} class="row">{rowBody r}</li>
-def rowViewLazy (r : Row) : Html Unit := <li key={toString r.id} class="row">{lazy rowBody r}</li>
+def rowView     (r : Row) : Html Unit := <li key={toString(r.id)} class="row">{rowBody(r)}</li>
+def rowViewLazy (r : Row) : Html Unit := <li key={toString(r.id)} class="row">{lazy(rowBody, r)}</li>
 
-def view     (rows : Array Row) : Html Unit := <ul class="list">{rows.map rowView}</ul>
-def viewLazy (rows : Array Row) : Html Unit := <ul class="list">{rows.map rowViewLazy}</ul>
+def view     (rows : Array Row) : Html Unit := <ul class="list">{rows.map(rowView)}</ul>
+def viewLazy (rows : Array Row) : Html Unit := <ul class="list">{rows.map(rowViewLazy)}</ul>
 
 mutual
   def treeNodes : Html msg → Nat

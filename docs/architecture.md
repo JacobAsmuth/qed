@@ -16,7 +16,7 @@ A Qed program is composed from declarative blocks that share types and proofs en
 
 | Construct | What you write | What Qed generates & proves |
 |-----------|----------------|-----------------------------|
-| `schema` | Fields with `where` refinement predicates | Editable `Draft`, proof-carrying `Field` records, `<Schema.Form>`, `canSubmit_iff`, plus `LawfulJson` and `LawfulProto` codecs. |
+| `schema` | Fields with `where` refinement predicates | Editable `Draft`, proof-carrying `Field` records, `<Schema.Form>` (with self-hosted draft, optional `reset` / `bind`, and validated `onSubmit`), `canSubmit_iff`, plus `LawfulJson` and `LawfulProto` codecs. |
 | `router` | Named routes and URL patterns | Inductive route type, `Router` instance, proven `round_trip`, and `isSafeUrl` guarantees for links and navigation. |
 | `css` / `token` / `theme` | Typed style rules and design tokens | Scoped content-hashed CSS classes auto-collected into `<style id="qed-styles">`, queryable by view invariants. |
 | `component` | `session`, `prop`, `bind`, `slot`, `children`, `state`, `ephemeral`, `collection`, `route`, `start`, `port`, `query`, `action`, `await`/`catch`, `invariant`, and JSX `view` | Typed `Msg`, `init`, `update`, fine-grained `View` template, `App`, SSR `session` hydration, client RPC `requires` proofs, exhaustive domain `catch`, `Html.valid` proof, `Dehydrate` SSR codec, and state/styling invariant proofs. |

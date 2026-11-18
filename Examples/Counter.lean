@@ -1,13 +1,15 @@
 import Qed
 open Qed
 
-component Counter where
-  state count : Int := 0
-  action increment => count += 1
-  action decrement => count := if 0 < count then count - 1 else count
-  action reset     => count := 0
-  invariant counterSafe : 0 ≤ count
-  view =>
+component Counter:
+  state count : Int = 0
+  action increment: count += 1
+  action decrement:
+    if count > 0:
+      count -= 1
+  action reset: count = 0
+  invariant counterSafe: count >= 0
+  view:
     <div class="counter">
       <button onClick={.decrement}>−</button>
       <span class="count">{count}</span>

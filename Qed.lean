@@ -1,3 +1,4 @@
+import Qed.Lang
 import Qed.Html
 import Qed.Notation
 import Qed.Render

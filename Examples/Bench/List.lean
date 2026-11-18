@@ -15,14 +15,14 @@ def initRows : Array Row :=
 
 end BenchList
 
-component BenchList where
-  state rows : Array BenchList.Row := BenchList.initRows
-  state tick : Nat := 0
-  action bump =>
-    rows := rows.mapIdx fun i r => if i % 10 == 0 then { r with label := s!"row {r.id} #{tick}" } else r
+component BenchList:
+  state rows : BenchList.Row[] = BenchList.initRows
+  state tick : Nat = 0
+  action bump:
+    rows = rows.mapIdx((i, r) => { r with label = f"row {r.id} #{tick}" } if i % 10 == 0 else r)
     tick += 1
-  view =>
+  view:
     <div>
       <button onClick={.bump}>bump</button>
-      <ul>{for r in rows => <li key={r.id} class="row">{r.label}</li>}</ul>
+      <ul>{for r in rows: <li key={r.id} class="row">{r.label}</li>}</ul>
     </div>

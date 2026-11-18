@@ -248,6 +248,41 @@ try {
     await page.click('.book-row .order-btn');
     await page.waitForFunction(() => document.querySelector('.status')?.textContent?.trim() === 'Order failed: out of stock', { timeout: 5000 });
     check('typed fail(.outOfStock) caught by client `.outOfStock` arm', await page.$eval('.status', (el) => el.textContent.trim()), 'Order failed: out of stock');
+
+    // 10. SPA navigation + reactive server `query` SWR cache & collision-free binary keys
+    const findAtCalls = () => rpcCalls.filter((r) => r.url.endsWith('/_qed/rpc/Catalog/findAt'));
+    check('zero findAt RPCs before visiting detail route', findAtCalls().length, 0);
+
+    await page.evaluate(() => document.querySelectorAll('.book-row a.book-title')[1].click());
+    await page.waitForSelector('.detail-stock', { timeout: 5000 });
+    check('SPA navigation reached /books/1', await page.evaluate(() => location.pathname), '/books/1');
+    check('detail view shows book 1 title', await page.$eval('.book-detail h2', (el) => el.textContent.trim()), 'Functional Programming in Lean');
+    check('detail view shows book 1 stock 8', await page.$eval('.detail-stock', (el) => el.textContent.trim()), 'In stock: 8');
+    check('reactive query sent 1 Protobuf findAt RPC', findAtCalls().length, 1);
+    check('findAt RPC used application/x-protobuf', findAtCalls()[0]?.contentType, 'application/x-protobuf');
+
+    await page.click('a.home-link');
+    await page.waitForFunction(() => document.querySelectorAll('.book-row').length === 3, { timeout: 5000 });
+    await page.evaluate(() => document.querySelectorAll('.book-row .order-btn')[1].click());
+    await page.waitForFunction(() => document.querySelectorAll('.book-row .book-stock')[1]?.textContent?.trim() === 'Stock: 7', { timeout: 5000 });
+
+    const syncCachedStock = await page.evaluate(() => {
+      document.querySelectorAll('.book-row a.book-title')[1].click();
+      return document.querySelector('.detail-stock')?.textContent?.trim() || '';
+    });
+    check('revisiting /books/1 renders cached stock synchronously (zero loading flash)', syncCachedStock, 'In stock: 8');
+    await page.waitForFunction(() => document.querySelector('.detail-stock')?.textContent?.trim() === 'In stock: 7', { timeout: 5000 });
+    check('SWR background RPC refreshed /books/1 stock to 7', await page.$eval('.detail-stock', (el) => el.textContent.trim()), 'In stock: 7');
+    check('findAt called twice for /books/1 across initial + SWR', findAtCalls().length, 2);
+
+    await page.click('a.home-link');
+    await page.waitForFunction(() => document.querySelectorAll('.book-row').length === 3, { timeout: 5000 });
+    await page.click('.book-row a.book-title');
+    await page.waitForSelector('.detail-stock', { timeout: 5000 });
+    check('SPA navigation reached /books/0', await page.evaluate(() => location.pathname), '/books/0');
+    check('detail view shows book 0 title', await page.$eval('.book-detail h2', (el) => el.textContent.trim()), 'Theorem Proving in Lean 4');
+    check('detail view shows book 0 depleted stock 0', await page.$eval('.detail-stock', (el) => el.textContent.trim()), 'In stock: 0');
+    check('findAt used distinct collision-free cache key for /books/0', findAtCalls().length, 3);
   });
 } finally {
   srvProc.kill('SIGTERM');

@@ -957,7 +957,6 @@ private def dehydrateProjLemmas (env0 : Environment) : Array Name :=
     `Qed.Internal.mkApp_template, `Qed.Internal.mkRoutedApp_template,
     `Qed.Internal.mkApp_dehydrate, `Qed.Internal.mkApp_rehydrate,
     `Qed.Internal.mkRoutedApp_dehydrate, `Qed.Internal.mkRoutedApp_rehydrate,
-    `Qed.Internal.App.setUpdate_dehydrate, `Qed.Internal.App.setUpdate_rehydrate,
     `Qed.Internal.App.withDehydrate_template, `Qed.Internal.App.withQueries_template,
     `Qed.Internal.App.withQueries_dehydrate, `Qed.Internal.App.withQueries_rehydrate,
     `Qed.Internal.App.withFullDehydrate, `Qed.Internal.App.withDehydrate_rehydrate_dehydrate,
@@ -1034,6 +1033,9 @@ elab "qedProveDehydrateInv" : tactic => do
         | exact _qed_hinv | rfl | decide | omega
         | (simp_all <;> first | exact _qed_hinv | rfl | decide | omega))))
     catch _ => pure ()
+  if !(← getGoals).isEmpty && env0.contains `Qed.Lang.QedVal.val_id then
+    let valId := mkIdent `Qed.Lang.QedVal.val_id
+    try evalTactic (← `(tactic| all_goals (try simp only [$valId:ident]))) catch _ => pure ()
   let goals ← getUnsolvedGoals
   unless goals.isEmpty do
     let mut details : MessageData := m!""

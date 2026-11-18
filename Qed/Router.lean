@@ -375,15 +375,15 @@ theorem Router.canonical_reparse {α : Type} [Router α] (segs : List String) (a
     Router.parse (Router.print a) = some a :=
   Router.round_trip a
 
-router Route where
-  home => ""
+router Route:
+  home = ""
   about
-  post (slug : String) => "posts"
-  user (name : String) => "users"
+  post(slug: String) = "posts"
+  user(name: String) = "users"
 
-router TypedRoute where
-  page (n : Nat) => "page"
-  delta (i : Int) => "delta"
-  item (slug : String) (n : Nat) => "items"
+router TypedRoute:
+  page(n: Nat) = "page"
+  delta(i: Int) = "delta"
+  item(slug: String, n: Nat) = "items"
 
 end Qed

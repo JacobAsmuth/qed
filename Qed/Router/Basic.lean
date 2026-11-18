@@ -1,6 +1,8 @@
 import Std.Data.String.ToNat
 import Std.Data.String.ToInt
 import Qed.Html
+import Qed.Lang
+import Lean
 
 namespace Qed
 
@@ -236,12 +238,28 @@ instance [Router R] : ToHref R := ⟨Router.toUrl⟩
 @[simp] theorem ToHref.isSafeUrl_toHref {α : Type} [ToHref α] (v : α) :
     isSafeUrl (ToHref.toHref v) = true := (ToHref.toUrl v).safe
 
-syntax routeEnumAlt := ident (" => " str)?
-syntax (name := routeEnumCmd) "route_enum " ident " where " sepBy1IndentSemicolon(routeEnumAlt) : command
+syntax:max (name := qedArrType) term:max noWs "[" "]" : term
+syntax:max (name := qedOptType) term:max noWs "?" : term
+@[macro qedArrType] def expandQedArrType : Lean.Macro := fun stx => `(Array $(⟨stx[0]⟩))
+@[macro qedOptType] def expandQedOptType : Lean.Macro := fun stx => `(Option $(⟨stx[0]⟩))
+
+section RouterParsers
+open Lean Parser
+def routeEnumAltP : Parser := node `Qed.routeEnumAlt (ident >> optional ("=" >> strLit))
+@[command_parser] def routeEnumCmd : Parser := leading_parser withPosition
+  ("route_enum " >> ident >> ":" >> checkColGt "expected indented `route_enum` variants" >> many1Indent routeEnumAltP)
+def routeParamP : Parser := node `Qed.routeParam (ident >> optional (":" >> categoryParser `qedType 0))
+def routeAltP : Parser := node `Qed.routeAlt (withPosition
+  (optional (symbol "*") >> ident >> optional (checkLineEq >> "(" >> sepBy1 routeParamP "," >> ")") >> optional ("=" >> strLit)))
+@[command_parser] def routerCmd : Parser := leading_parser withPosition
+  ("router " >> ident >> ":" >> checkColGt "expected indented `router` routes" >> many1Indent routeAltP)
+end RouterParsers
 
 open Lean in
-macro_rules
-  | `(route_enum $t:ident where $[$alts:routeEnumAlt]*) => do
+@[macro routeEnumCmd] def expandRouteEnumCmd : Macro
+  | stx => do
+      let t : Ident := ⟨stx[1]⟩
+      let alts := stx[3].getArgs
       let toSegId   := mkIdent (t.getId ++ `toSeg)
       let fromSegId := mkIdent (t.getId ++ `fromSeg)
       let rtId      := mkIdent (t.getId ++ `round_trip)
@@ -250,9 +268,8 @@ macro_rules
       let mut slugs : Array (TSyntax `term) := #[]
       let mut parseRhss : Array (TSyntax `term) := #[]
       for alt in alts do
-        let (c, seg) ← match alt with
-          | `(routeEnumAlt| $c:ident $[=> $seg:str]?) => pure (c, seg)
-          | _ => Macro.throwErrorAt alt "route_enum: expected constructor name with optional `=> \"slug\"`"
+        let c : Ident := ⟨alt[0]⟩
+        let seg : Option (TSyntax `str) := if alt[1].getNumArgs == 2 then some ⟨alt[1][1]⟩ else none
         let ctorId := mkIdent (t.getId ++ c.getId)
         let slugLit : TSyntax `term := match seg with
           | some s => ⟨s.raw⟩
@@ -276,16 +293,10 @@ macro_rules
           intro a; cases a <;> rfl
         instance : RouteParam $t:ident := ⟨$toSegId, $fromSegId, $rtId⟩)
 
-syntax routeBinder := "(" ident (" : " term)? ")"
-syntax routeAlt := ("*")? ident (routeBinder)* (" => " str)?
-syntax (name := routerCmd) "router " ident " where " sepBy1IndentSemicolon(routeAlt) : command
-
 open Lean in
-private def parseRouteBinder (b : TSyntax ``routeBinder) : MacroM (TSyntax `ident × TSyntax `term) := do
-  match b with
-  | `(routeBinder| ($id:ident : $ty:term)) => pure (id, ty)
-  | `(routeBinder| ($id:ident))            => pure (id, ← `(String))
-  | _ => Macro.throwErrorAt b "router: expected `(param)` or `(param : Type)`"
+private def parseRouteParam (b : Syntax) : MacroM (TSyntax `ident × TSyntax `term) := do
+  let ty ← if b[1].getNumArgs == 2 then do pure (← Qed.Lang.lowerQedType b[1][1] false).1 else `(String)
+  pure (⟨b[0]⟩, ty)
 
 open Lean in
 private def routePatternsOverlap (p₁ p₂ : Array (Option String)) : Bool :=
@@ -296,8 +307,10 @@ private def routePatternsOverlap (p₁ p₂ : Array (Option String)) : Bool :=
     | _, _           => true
 
 open Lean in
-macro_rules
-  | `(router $t:ident where $[$alts:routeAlt]*) => do
+@[macro routerCmd] def expandRouterCmd : Macro
+  | stx => do
+      let t : Ident := ⟨stx[1]⟩
+      let alts := stx[3].getArgs
       let printId := mkIdent (t.getId ++ `print)
       let parseId := mkIdent (t.getId ++ `parse)
       let rtId    := mkIdent (t.getId ++ `round_trip)
@@ -311,13 +324,11 @@ macro_rules
       let mut patShapes : Array (TSyntax `ident × Array (Option String)) := #[]
       let mut markedCtor : Option (TSyntax `ident) := none
       for alt in alts do
-        let (marked, c, rawBinders, seg) ← (match alt with
-          | `(routeAlt| * $c:ident $[$rbs:routeBinder]* $[=> $seg:str]?) =>
-              pure (true,  c, rbs, seg)
-          | `(routeAlt| $c:ident $[$rbs:routeBinder]* $[=> $seg:str]?) =>
-              pure (false, c, rbs, seg)
-          | _ => Macro.throwErrorAt alt "router: couldn't read this route. Each one is a constructor name, then zero or more params like (slug : String) or (slug), then an optional path like \"/books/:id\"; mark the not-found fallback with a leading *.")
-        let explicitBinders ← rawBinders.mapM parseRouteBinder
+        let marked := alt[0].getNumArgs == 1
+        let c : Ident := ⟨alt[1]⟩
+        let rawBinders := if alt[2].getNumArgs == 3 then alt[2][1].getSepArgs else #[]
+        let seg : Option (TSyntax `str) := if alt[3].getNumArgs == 2 then some ⟨alt[3][1]⟩ else none
+        let explicitBinders ← rawBinders.mapM parseRouteParam
         let rawSegs : Array String := match seg with
           | some s => ((s.getString.splitOn "/").filter (· ≠ "")).toArray
           | none   => #[toString c.getId]

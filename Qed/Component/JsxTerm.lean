@@ -33,36 +33,24 @@ private def elabSchemaFormTag (stx : Syntax) (expectedType? : Option Expr)
   let mut key?    : Option Term := none
   let mut bind?   : Option Term := none
   let mut submit? : Option Term := none
-  let mut ctxVals : Std.HashMap Name Term := {}
-  let mut ctxArg? : Option Term := none
+  let mut ctxProps : Array (Syntax × String × Term) := #[]
   for p in propNodes do
     let nm := (⟨p[0]⟩ : TSyntax `str).getString
     let v : Term := ⟨p[2]⟩
     if nm == "key" then key? := some v
     else if nm == "bind" then bind? := some v
     else if nm == "onSubmit" then submit? := some v
-    else if nm == "ctx" && sInfo.ctxBinders.size == 1 then ctxArg? := some v
+    else if nm == "reset" then
+      throwErrorAt p[0] s!"<{tag}>: `reset` is only supported inside a `component` view"
     else
-      let bName := Name.mkSimple nm
-      if sInfo.ctxBinders.contains bName then
-        ctxVals := ctxVals.insert bName v
-      else
-        throwErrorAt p[0] s!"<{tag}>: unknown attribute `{nm}`"
+      ctxProps := ctxProps.push (p[0], nm, v)
   let some b := bind?
-    | throwErrorAt stx s!"<{tag}> requires `bind=\{draft}`"
+    | throwErrorAt stx s!"<{tag}> requires `bind=\{draft}` when used outside a `component` view"
   let dVal ← `(($b).1)
   let onEditVal ← `(($b).2)
   let some submitVal := submit?
-    | throwErrorAt stx s!"<{tag}> requires `onSubmit=\{.submit}`"
-  let mut ctxArgs : Array Term := #[]
-  for b in sInfo.ctxBinders do
-    if let some v := ctxVals[b]? then
-      ctxArgs := ctxArgs.push v
-    else if let some v := ctxArg? then
-      ctxArgs := ctxArgs.push v
-    else
-      throwErrorAt stx s!"<{tag}> requires context attribute `{b}=\{…}`" ++
-        (if sInfo.ctxBinders.size == 1 then " (or `ctx={…}`)" else "")
+    | throwErrorAt stx s!"<{tag}> requires `onSubmit=\{...}`"
+  let ctxArgs ← liftMacroM <| resolveSchemaCtxArgs stx tag sInfo.ctxBinders ctxProps
   let mut callT : Term := ⟨mkIdentFrom stx sInfo.formViewName⟩
   for ca in ctxArgs do
     callT ← `($callT $ca)

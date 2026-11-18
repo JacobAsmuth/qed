@@ -396,7 +396,7 @@ def elabExternalCmd : CommandElab := fun stx => do
   let svcIdent : Ident := ⟨stx[1]⟩
   let svcName := svcIdent.getId
   let svcNameStr := svcName.toString
-  let (baseOrigin, authSpec, epClauses) ← parseExternalClauses svcIdent svcName stx[2].getArgs
+  let (baseOrigin, authSpec, epClauses) ← parseExternalClauses svcIdent svcName stx[3].getArgs
   let currNs ← getCurrNamespace
   let fullSvcName := currNs ++ svcName
   let secretsList := authSpec.requiredSecrets.toArray

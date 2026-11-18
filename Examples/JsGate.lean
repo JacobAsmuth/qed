@@ -105,9 +105,9 @@ def arrP (i : Nat) : String :=
   let b := a.filter (fun x => x % 3 == 0)
   s!"{a.toList}|{b.size}|{a.foldl (· + ·) 0}|{a.reverse.toList}"
 
-router GateR where
-  home => ""
-  user (name : String) => "users"
+router GateR:
+  home = ""
+  user(name: String) = "users"
 
 def routes : Array String := #["/", "/users/ada", "/users/alan", "/users/a%20b", "/nope/x"]
 def routeP (i : Nat) : String :=
@@ -119,8 +119,8 @@ def segP (i : Nat) : String :=
   let p := routes.getD i ""
   toString (((p.splitOn "/").filter (· ≠ "")).map decodeSeg)
 
-schema ProtoRec where
-  id  : String where 1 <= id.length, id.length <= 32
+schema ProtoRec:
+  id  : String where 1 <= id.length <= 32
   qty : Nat    where qty <= 500
   raw : Bytes
 

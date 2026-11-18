@@ -24,7 +24,11 @@ open Lean Elab Tactic
 private def qedBoundaryLemmas : Array Name :=
   #[``Array.size_push, ``Array.size_modify, ``Array.size_set, ``Array.size_pop,
     ``Array.size_map, ``Array.size_append,
-    ``List.length_cons, ``List.length_append, ``List.length_map]
+    ``List.length_cons, ``List.length_append, ``List.length_map,
+    ``Qed.Lang.QedVal.val_id, ``Qed.Lang.QedSeqLit.ofList_array, ``Qed.Lang.QedSeqLit.ofList_list,
+    ``Qed.Lang.QedMem.mem_array, ``Qed.Lang.QedMem.mem_list, ``Qed.Lang.QedMem.mem_string,
+    ``Qed.Lang.QedMemProp.memProp_array, ``Qed.Lang.QedMemProp.memProp_list, ``Qed.Lang.QedMemProp.memProp_string,
+    ``Qed.Lang.not_qedAndProp, ``Qed.Lang.not_qedOrProp]
 
 private def qedAppLemmas (env : Environment) : Array Name :=
   let base := #[``InvTarget.proj_id, ``InvTarget.proj_fst,
@@ -32,7 +36,8 @@ private def qedAppLemmas (env : Environment) : Array Name :=
                 ``Qed.Internal.mkRoutedApp_init, ``Qed.Internal.mkRoutedApp_update,
                 ``Qed.Internal.App.withDehydrate_init, ``Qed.Internal.App.withDehydrate_update]
   let opt := #[`Qed.Internal.App.withQueries_init, `Qed.Internal.App.withQueries_update,
-               `Qed.Query.wrap, `Qed.Resource.query].filter env.contains
+               `Qed.Query.boot, `Qed.Query.wrap, `Qed.Resource.query, `Qed.Resource.rpcQuery,
+               `Qed.Cached.activate, `Qed.Cached.all_empty].filter env.contains
   base ++ opt
 
 private def stripStepPrefix : Name → Name
@@ -68,6 +73,10 @@ elab "qedUnfoldPresent" "[" extra:term,* "]" : tactic => do
 private def toSimpLemmas (ts : Array Term) : TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) :=
   ts.mapM fun t => `(Lean.Parser.Tactic.simpLemma| $t:term)
 
+private def mkOptResSimpLemmas (env : Environment) :
+    TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) :=
+  toSimpLemmas ((#[`Qed.Cached.all, `Qed.Resource.all].filter env.contains).map fun n => ⟨(mkIdent n).raw⟩)
+
 private def mkCloserLemmas (usingL : Array Term) : TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) := do
   let bL ← toSimpLemmas (qedBoundaryLemmas.map fun n => ⟨(mkIdent n).raw⟩)
   return bL ++ (← toSimpLemmas usingL)
@@ -82,6 +91,7 @@ private def mkPredUnfold (pred : Term) : TacticM (Term × TSyntax `tactic) := do
 private def mkInitTac (usingL : Array Term) (pred initT : Term) : TacticM (TSyntax `tactic) := do
   let (_, unfoldPred) ← mkPredUnfold pred
   let closerL ← mkCloserLemmas usingL
+  let initCloserL := closerL ++ (← mkOptResSimpLemmas (← getEnv))
   let unfoldInit ← if initT.raw.isIdent
     then `(tactic| try simp only [$(⟨initT.raw⟩):ident] at *)
     else `(tactic| skip)
@@ -92,9 +102,9 @@ private def mkInitTac (usingL : Array Term) (pred initT : Term) : TacticM (TSynt
      qedUnfoldPresent [$[$usingL],*];
      try ((repeat' split) <;>
             (first | rfl | decide | omega | assumption
-                   | (simp_all [$[$closerL],*] <;> omega)
-                   | (simp_all [$[$closerL],*] <;> decide)
-                   | (simp_all [$[$closerL],*] <;> done) | trivial))))
+                   | (simp_all [$[$initCloserL],*] <;> omega)
+                   | (simp_all [$[$initCloserL],*] <;> decide)
+                   | (simp_all [$[$initCloserL],*] <;> done) | trivial))))
 
 private def throwUnsolvedInvGoals (nm : Ident) (hdr footer : MessageData) : TacticM Unit := do
   let goals ← getUnsolvedGoals
@@ -124,6 +134,70 @@ elab_rules : tactic
       m!"invariant `{nm.getId}` doesn't hold on initial state `{initName}`, the automation couldn't verify it."
       m!"Ensure initial state `{initName}` satisfies `{nm.getId}`, supply a fact with `invariant {nm.getId} : … using [yourLemma]`, or prove it manually."
 
+elab "qedDestructExistsHyps" : tactic => do
+  for _ in [0:16] do
+    let g :: rem ← getGoals | return
+    let mut splitFv? : Option FVarId := none
+    for decl in (← g.withContext getLCtx) do
+      if splitFv?.isNone && !decl.isImplementationDetail && !decl.isLet then
+        if (← g.withContext (Meta.whnf decl.type)).isAppOfArity ``Exists 2 then
+          splitFv? := some decl.fvarId
+    match splitFv? with
+    | some fv =>
+        let subgoals ← g.cases fv
+        setGoals (subgoals.toList.map (·.mvarId) ++ rem)
+    | none => break
+
+elab "qedCloseCachedPut" "[" extra:term,* "]" : tactic => do
+  unless (← getEnv).contains `Qed.Cached.all_put do return
+  let gs0 ← getGoals
+  let anyCached ← gs0.anyM fun g =>
+    return (← g.withContext (instantiateMVars (← g.getType))).getUsedConstants.contains `Qed.Cached.all
+  unless anyCached do return
+  let extraL := extra.getElems
+  let extraSimpL ← toSimpLemmas extraL
+  for _ in [0:8] do
+    let goals ← getGoals
+    if goals.isEmpty then return
+    let mut progressed := false
+    let mut rem : List MVarId := []
+    for g in goals do
+      setGoals [g]
+      let tgt ← g.withContext (instantiateMVars (← g.getType))
+      if tgt.isAppOfArity ``And 2 && tgt.getUsedConstants.contains `Qed.Cached.all then
+        evalTactic (← `(tactic| apply And.intro))
+        progressed := true
+      else if tgt.isAppOfArity `Qed.Cached.all 3 then
+        let cArg := tgt.getAppArgs[2]!.consumeMData
+        if cArg.isAppOfArity `Qed.Cached.put 5 then
+          let saved ← saveState
+          let allPutId := mkIdent `Qed.Cached.all_put
+          let stripImpId := mkIdent `Qed.Resource.all_stripEnsured_of_imp
+          let ok ← try
+              evalTactic (← `(tactic| apply $allPutId))
+              match ← getGoals with
+              | [gHall, gHr] =>
+                  setGoals [gHall]
+                  evalTactic (← `(tactic| first | assumption | simp_all))
+                  unless (← getUnsolvedGoals).isEmpty do throwError "hall unsolved"
+                  setGoals [gHr]
+                  evalTactic (← `(tactic| (
+                    try (apply $stripImpId; intro _ _hEns; try dsimp only at _hEns; qedDestructExistsHyps);
+                    qedUnfoldPresent [$[$extraL],*];
+                    (try simp_all [$[$extraSimpL],*]);
+                    all_goals (first | rfl | decide | omega | assumption | trivial))))
+                  pure (← getUnsolvedGoals).isEmpty
+              | _ => pure false
+            catch _ => pure false
+          if ok then
+            progressed := true
+            setGoals []
+          else
+            restoreState saved
+      rem := rem ++ (← getGoals)
+    setGoals rem
+    unless progressed do break
+
 syntax "qedDischargePreserved " "[" term,* "]" term:max ident term:max (" from " term)? : tactic
 
 elab_rules : tactic
@@ -139,6 +213,7 @@ elab_rules : tactic
         | `(($fn:ident $_:term*)) => pure (#[← `(Lean.Parser.Tactic.simpLemma| $fn:term)] ++ appL)
         | _ => pure appL
     let closerL ← mkCloserLemmas usingL
+    let finalCloserL := (← mkOptResSimpLemmas env0) ++ closerL
     let stepTac ← `(tactic|
       (intro m msg h;
        $unfoldPred:tactic;
@@ -146,10 +221,14 @@ elab_rules : tactic
        cases msg <;>
          (try simp_all only [$[$updL],*]) <;>
          qedUnfoldPresent [$[$usingL],*] <;>
+         (try qedCloseCachedPut [$[$usingL],*]) <;>
          (try ((repeat' split) <;>
                 (first | rfl | omega | assumption
                        | (simp_all [$[$closerL],*] <;> omega)
-                       | (simp_all [$[$closerL],*] <;> done) | trivial)))))
+                       | (simp_all [$[$closerL],*] <;> decide)
+                       | (simp_all [$[$closerL],*] <;> done) | trivial))) <;>
+         (try (simp_all only [$[$finalCloserL],*] <;>
+               first | omega | decide | done))))
     match init with
     | some initT =>
         let initTac ← mkInitTac usingL pred initT

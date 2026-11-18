@@ -7,9 +7,9 @@ that SSR `Dehydrate` preserves it (`dehydrate_inv`); at runtime, `App.guardRehyd
 untrusted rehydration payloads that violate the invariant (`rehydrate_inv`).
 
 ```lean
-component Counter where
-  state count : Int := 0
-  invariant 0 ≤ count
+component Counter:
+  state count : Int = 0
+  invariant 0 <= count
   ...
 ```
 
@@ -20,13 +20,14 @@ message constructor and remaining goal.
 
 | What you want to check | Syntax (inside `component`) |
 |------------------------|-----------------------------|
-| Single state predicate | `invariant 0 ≤ count` |
-| Named state predicate | `invariant counterSafe : 0 ≤ count` |
-| Multiple clauses (`∧`) | `invariant inRange : 1 ≤ qty, qty ≤ 10` |
-| Custom tactic proof | `invariant idsBelowNext : ∀ r ∈ rows, r.id < nextId := by ...` |
-| Lifted child invariant | `invariant feedSafe : Card.cardSafe for_each cards` |
-| Component view / styles | `invariant roleHasOneOf "save" [on, off]` |
-| Pure helper view (`Html`) | `invariant styled : roleHasOneOf "nav" [a, b] holds_in navView` (top-level) |
+| Single state predicate | `invariant 0 <= count` |
+| Named state predicate | `invariant counterSafe: 0 <= count` |
+| Chained / multi-clause | `invariant inRange: 1 <= qty <= 10` (or `1 <= qty, qty <= 10`) |
+| Quantified property | `invariant all r in rows: r.id < nextId := by ...` |
+| Lifted child invariant | `invariant feedSafe: Card.cardSafe for_each cards` |
+| Component view / styles | `invariant roleHasOneOf("save", [on, off])` |
+| Multiple view rules | `invariant roleLacks("submit", danger), tagLacks("span", danger)` |
+| Pure helper view (`Html`) | `invariant styled : roleHasOneOf("nav", [a, b]) holds_in navView` (top-level) |
 
 Invariants check your component's state transitions and rendered HTML; see
 [how Qed works](architecture.md) for how those connect to the JavaScript runtime and browser.
@@ -54,9 +55,9 @@ need to add invariants where there is a meaningful rule to enforce.
 themselves with no tactic script:
 
 ```lean
-component Counter where
-  state count : Int := 0
-  invariant counterSafe : 0 ≤ count
+component Counter:
+  state count : Int = 0
+  invariant counterSafe: 0 <= count
   ...
 ```
 
@@ -65,10 +66,10 @@ syntax—Qed automatically projects the next model out of `(model, cmd)`.
 
 ## Full-stack client–server invariants (`requires` & `ensures`)
 
-When a client `component` invokes a `server` `fn` via `await`, Qed connects server contracts and component invariants in both directions:
+When a client `component` invokes a `server` `def` via `await` or `query`, Qed connects server contracts and component invariants in both directions:
 
 - **Client `invariant` -> Server `requires`:** Component `invariant`s (as well as literals, `when` guards, `if` branches, and `Field`/`Ensured` values) are automatically available as hypotheses to discharge every server parameter `requires` clause at compile time.
-- **Server `ensures` -> Client `invariant`:** Server postconditions (`ensures expr`) are encoded via zero-trust `Ensured α p` (`FromProto` re-verifies `p` on untrusted bytes) and automatically unpacked into continuation hypotheses across `let x := await Server.fn(...) catch ...`, so client state invariants can rely on server-guaranteed postconditions (see [`Examples/CloudBooks.lean`](../Examples/CloudBooks.lean) and [`Examples/ServerChecks.lean`](../Examples/ServerChecks.lean)).
+- **Server `ensures` -> Client `invariant`:** Server postconditions (`ensures expr`) are encoded via zero-trust `Ensured α p` (`FromProto` re-verifies `p` on untrusted bytes) and automatically unpacked into continuation hypotheses across `let x = await Server.fn(...) catch: ...` and `Cached.all` invariants on reactive `query` fields (see [`Examples/CloudBooks.lean`](../Examples/CloudBooks.lean) and [`Examples/ServerChecks.lean`](../Examples/ServerChecks.lean)).
 
 **Custom proof (`:= by`).** When a property quantifies over a collection (`Array` or `List`) or
 relies on a domain lemma that automation cannot guess, attach a Lean tactic proof with `:= by`.
@@ -76,29 +77,29 @@ Inside a `component`, `init` is discharged automatically and `update` is in scop
 handles preservation starting with `intro m msg h`:
 
 ```lean
-invariant idsBelowNext : ∀ r ∈ rows, r.id < nextId := by
+invariant idsBelowNext: all r in rows: r.id < nextId := by
   intro m msg h
   cases msg <;> simp_all [update] <;> omega
 ```
 
 ## Lifting invariants over child collections (`for_each`)
 
-When a parent `collection` stores an array of child states (or a field holds `Array Card.State`),
+When a parent `collection` stores an array of child states (or a field holds `Card.State[]`),
 `for_each` lifts a child's invariant across every element in the parent's array:
 
 ```lean
-component Card where
-  state likes : Int := 0
-  state duration : Int := 10
-  state progress : Int := 0
-  state liked : Bool := false
-  invariant cardSafe :
-    0 ≤ likes ∧ progress ≤ duration ∧ (liked = true → 1 ≤ likes)
+component Card:
+  state likes : Int = 0
+  state duration : Int = 10
+  state progress : Int = 0
+  state liked : Bool = false
+  invariant cardSafe:
+    0 <= likes and progress <= duration and (liked -> 1 <= likes)
   ...
 
-component Feed where
-  collection cards : Array Card.State := #[]
-  invariant feedSafe : Card.cardSafe for_each cards
+component Feed:
+  state cards : Card.State[]
+  invariant feedSafe: Card.cardSafe for_each cards
   -- Checks both init and that every update preserves (∀ c ∈ cards, Card.cardSafe_pred c)
 ```
 
@@ -121,7 +122,7 @@ data), Qed prints a proof skeleton using `forEachLift`, which closes all support
 you only fill in the remaining case:
 
 ```lean
-invariant feedSafe : Card.cardSafe_pred for_each cards using Card.cardSafe := by
+invariant feedSafe: Card.cardSafe_pred for_each cards using Card.cardSafe := by
   forEachLift update Card.cardSafe Card.cardSafe_pred
   case rank => … -- prove only the custom branch
 ```
@@ -132,10 +133,10 @@ invariant feedSafe : Card.cardSafe_pred for_each cards using Card.cardSafe := by
 
 ```lean
 -- Inside Card:
-invariant cardStyled : roleHasOneOf "like" [likeOn, likeOff]
+invariant cardStyled: roleHasOneOf("like", [likeOn, likeOff])
 
 -- Inside Feed:
-invariant feedStyled : Card.cardStyled for_each cards
+invariant feedStyled: Card.cardStyled for_each cards
 ```
 
 Qed applies `Card.cardStyled` to each rendered card (invariant under `Html.map` message wrapping) and
@@ -145,36 +146,35 @@ checks the rest of the parent markup separately. If a branch needs manual help, 
 ## Styling invariants (over the view)
 
 You can declare a view/styling `invariant` directly inside a `component` (like
-`invariant statusStyled : roleHasOneOf "status" [onStyle, offStyle]`), or use `holds_in` at top
+`invariant statusStyled: roleHasOneOf("status", [onStyle, offStyle])`), or use `holds_in` at top
 level for pure `Html` helper functions (`Model → Html Msg`):
 
 ```lean
 def navView (active : Route) : Html Msg :=
-  <div><a href="/home" {if active == .home then activeStyle else linkStyle}>Home</a></div>
+  <div><a href={Route.home} {activeStyle if active == .home else linkStyle}>Home</a></div>
 
-invariant navStyled : everyElement … holds_in navView
+invariant navStyled : everyElement(…) holds_in navView
 ```
 
 ### Built-in view predicates
 
 | Predicate | Meaning |
 |-----------|---------|
-| `roleHasOneOf "x" [a, b]` | Every element with `role="x"` has style `a` or style `b`. |
-| `tagHasOneOf "button" [a, b]` | Every `<button>` has style `a` or style `b` (no `role` attribute needed). |
-| `roleLacks "x" a` | No element with `role="x"` carries style `a`. |
-| `tagLacks "button" a` | No `<button>` carries style `a` (no `role` attribute needed). |
-| `everyElement (fun tag attrs => …)` | Custom boolean check applied to every element in the tree. |
+| `roleHasOneOf("x", [a, b])` | Every element with `role="x"` has style `a` or style `b`. |
+| `tagHasOneOf("button", [a, b])` | Every `<button>` has style `a` or style `b` (no `role` attribute needed). |
+| `roleLacks("x", a)` | No element with `role="x"` carries style `a`. |
+| `tagLacks("button", a)` | No `<button>` carries style `a` (no `role` attribute needed). |
+| `everyElement((tag, attrs) => …)` | Custom boolean check applied to every element in the tree. |
 
 ### Relating multiple elements
 
-Use `roleHas "x" a` to check a single role, combine queries with `both` (AND) or `either` (OR),
-or use `exactlyOne` for mutual exclusion (XOR):
+Use `roleHas("x", a)` to check a single role, list multiple rules separated by commas (automatically combined with `both`), combine queries with `both` (AND) or `either` (OR), or use `exactlyOne` / `exactlyOneOf` for mutual exclusion (XOR):
 
 ```lean
-invariant savedXorEditing : exactlyOne "save" "cancel" primary secondary holds_in view
+invariant savedXorEditing: exactlyOne("save", "cancel", primary, secondary) holds_in view
 -- Equivalent to:
---   either (both (roleHas "save" primary) (roleHas "cancel" secondary))
---          (both (roleHas "save" secondary) (roleHas "cancel" primary))
+--   either(both(roleHas("save", primary), roleHas("cancel", secondary)),
+--          both(roleHas("save", secondary), roleHas("cancel", primary)))
 ```
 
 Style class names use a pure kernel-reducible UTF-8 FNV-1a hash (`cssHash`), so both positive
@@ -203,12 +203,12 @@ From here, one of three things is true:
 
 | Pattern | Example | Meaning |
 |---------|---------|---------|
-| **Bounds** | `0 ≤ m.count` | A counter or quantity stays in range. |
-| **State precondition** | `m.booked.isSome → m.today.isSome` | State X cannot be reached without Y. |
-| **Mutual exclusion** | `¬ (m.editing ∧ m.submitting)` | Two modes are never active at once. |
-| **Effect precondition** | `m.pending = true → 0 < m.turns.size` | Data needed by an in-flight effect is present. |
-| **Fresh IDs** | `∀ r ∈ m.rows, r.id < m.nextId` | Next ID exceeds all existing IDs (distinctness is separate). |
-| **Cached totals** | `m.total = (m.items.map (·.price)).sum` | Derived field stays in sync with its source list. |
+| **Bounds** | `0 <= count` or `1 <= qty <= 10` | A counter or quantity stays in range. |
+| **State precondition** | `booked.isSome -> today.isSome` | State X cannot be reached without Y. |
+| **Mutual exclusion** | `not (editing and submitting)` | Two modes are never active at once. |
+| **Effect precondition** | `pending -> 0 < turns.size` | Data needed by an in-flight effect is present. |
+| **Fresh IDs** | `all r in rows: r.id < nextId` | Next ID exceeds all existing IDs (distinctness is separate). |
+| **Cached totals** | `total == (items.map(i => i.price)).sum` | Derived field stays in sync with its source list. |
 
 The first four usually prove automatically. The last two quantify over collections and
 typically take a two-line `:= by` proof (`cases msg <;> simp_all [update] <;> omega` plus a
@@ -219,7 +219,7 @@ list/array lemma).
 Skip invariants when the guarantee already lives somewhere better:
 
 - **Already encoded in the type:** In [`Examples/Signup.lean`](../Examples/Signup.lean),
-  `submitted : Option Account` holds a schema-validated `Account` whose fields already carry
+  `submitted : Account?` holds a schema-validated `Account` whose fields already carry
   refinement proofs. Re-stating those field rules as a model invariant is redundant.
 - **Framework/driver guarantees:** Properties like "updating a bound value preserves DOM node
   identity" belong to Qed's driver proofs and browser tests (see [rendering](rendering.md)),
@@ -230,10 +230,10 @@ Skip invariants when the guarantee already lives somewhere better:
 
 ## Worked examples in this repo
 
-- [`Examples/Counter.lean`](../Examples/Counter.lean) — `counterSafe`: automatic numeric bound (`0 ≤ count`).
+- [`Examples/Counter.lean`](../Examples/Counter.lean) — `counterSafe`: automatic numeric bound (`0 <= count`).
 - [`Examples/Todo.lean`](../Examples/Todo.lean) — `Row.rowSafe`, `Row.rowStyled`, `rowsSafe`, and
   `rowsStyled`: `for_each` lifts for both state and scoped CSS styling across a `collection`.
 - [`Examples/Chat.lean`](../Examples/Chat.lean) — `streamSafe`: automatic effect-safety invariant
-  (`pending = true → 0 < turns.size`) on a streaming SSE action.
+  (`pending -> 0 < turns.size`) on a streaming SSE action.
 - [`Examples/CloudBooks.lean`](../Examples/CloudBooks.lean) — server state, monotonicity, and auth
   invariants paired with RPC `requires`/`ensures` contracts and client `orderedMatchesSlot`.

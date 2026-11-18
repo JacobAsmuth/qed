@@ -11,6 +11,10 @@ structure Field {α : Type} (p : α → Prop) where
   val : α
   ok  : p val
 
+@[reducible, inline] instance {α : Type} {p : α → Prop} : Qed.Lang.QedVal (Field p) α := ⟨Field.val⟩
+@[simp] theorem QedVal.val_field {α : Type} {p : α → Prop} (f : Field p) :
+    Qed.Lang.QedVal.val f = f.val := rfl
+
 @[reducible] instance {msg : Type} : Coe Date (Html msg) := ⟨fun d => .text (toString d)⟩
 @[reducible] instance {α : Type} {p : α → Prop} : CoeOut (Field p) α := ⟨Field.val⟩
 @[reducible] instance {α msg : Type} {p : α → Prop} [Coe α (Html msg)] : CoeHTCT (Field p) (Html msg) := ⟨fun f => (f.val : Html msg)⟩
@@ -215,12 +219,35 @@ class DefaultCodec (α : Type) where
   ⟨Codec.json α⟩
 
 
-open Lean in
-syntax schemaField := ident " : " term (" where " sepBy1(term, ","))?
+section SchemaParsers
+open Lean Parser
+def schemaCtxParamP : Parser := node `Qed.schemaCtxParam (ident >> ":" >> categoryParser `qedType 0)
+def schemaFieldJsonOnly : Parser := node `Qed.schemaFieldJsonOnly
+  (atomic (identEq `jsonOnly >> checkNoWsBefore "" >> "(") >> categoryParser `qedType 0 >> ")")
+def schemaFieldCall : Parser := node `Qed.schemaFieldCall
+  (atomic (ident >> checkNoWsBefore "" >> "(") >> sepBy (categoryParser `qedCallArg 0) "," >> ")")
+def schemaFieldSpec : Parser := schemaFieldJsonOnly <|> schemaFieldCall <|> categoryParser `qedType 0
+def schemaFieldP : Parser := node `Qed.schemaField (withPosition
+  (ident >> ":" >> schemaFieldSpec >> optional (checkColGt >> " where " >> sepBy1 (categoryParser `qedExpr 0) ",")))
+@[command_parser] def schemaCmd : Parser := leading_parser withPosition
+  ("schema " >> ident >> optional (checkLineEq >> "(" >> sepBy1 schemaCtxParamP "," >> ")") >> ":" >>
+    checkColGt "expected indented `schema` fields" >> many1Indent schemaFieldP)
+end SchemaParsers
 
 open Lean in
-syntax (name := schemaCmd) "schema " ident ("(" ident " : " term ")")* " where "
-  sepBy1IndentSemicolon(schemaField) : command
+private def lowerSchemaFieldSpec (stx : Syntax) : MacroM Term := do
+  let k := stx.getKind
+  if k == `Qed.schemaFieldJsonOnly then
+    let (innerTy, _) ← Qed.Lang.lowerQedType stx[2] false
+    `(jsonOnly $innerTy)
+  else if k == `Qed.schemaFieldCall then
+    let callee : Term := ⟨stx[0]⟩
+    let args := stx[2].getSepArgs
+    args.foldlM (init := callee) fun acc a => do
+      let aT ← Qed.Lang.lowerSimpleQedExpr .val a[0]
+      `($acc $aT)
+  else
+    return (← Qed.Lang.lowerQedType stx false).1
 
 open Lean Elab Term Meta in
 private partial def resolveCodecBase (rawSpec : Term) : TermElabM Term := do
@@ -500,7 +527,10 @@ private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
     `(term| Codec.formFieldRow ($inp).inForm ($inp).wrapLabel
               (d.$f:ident != "" && ($rc).isNone) $nameLit $errLit
               (($inp).render (d.$f:ident) (fun v => onEdit { d with $f:ident := v })))
-  let submitBtn ← `(term| el "button" [disabled (!($parseApp d).isSome), onClick submit] "Submit")
+  let submitBtn ← `(term|
+    match ($parseApp d) with
+    | some _qedParsed => el "button" [onClick (submit _qedParsed)] "Submit"
+    | none            => el "button" [disabled true] "Submit")
   let viewBody ← rowGroups.foldrM (init := ← `(term| [$submitBtn])) fun g acc => `(term| $g ++ $acc)
   pure #[
     ← `(command| structure $t $[($cbns:ident : $cbts:term)]* where
@@ -513,13 +543,13 @@ private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
     ← `(command| theorem $iffId $[($cbns:ident : $cbts:term)]* (d : $draftId) :
           $canApp d = true ↔ $rhs := by unfold $canId $parseId; $casesTac),
     ← `(command| def $viewId {msg : Type} $[($cbns:ident : $cbts:term)]* (d : $draftId)
-          (onEdit : $draftId → msg) (submit : msg) : Html msg :=
+          (onEdit : $draftId → msg) (submit : $tApp → msg) : Html msg :=
           el "div" [cls "qed-form"] $viewBody),
     ← `(command| @[simp] theorem $formValidId {msg : Type} $[($cbns:ident : $cbts:term)]*
-          (inForm : Bool) (d : $draftId) (onEdit : $draftId → msg) (submit : msg) :
+          (inForm : Bool) (d : $draftId) (onEdit : $draftId → msg) (submit : $tApp → msg) :
           Html.validIn ⟨.normal, false, false, inForm⟩ ($viewApp d onEdit submit) = true := by
           unfold $viewId
-          cases inForm <;>
+          cases _hp : ($parseApp d) <;> cases inForm <;> dsimp only <;>
             simp only [el, cls, disabled, onClick, Html.validIn, Html.validListIn,
               Attr.valid, Attr.validKeyValue, Attr.valid_cls, Attr.valid_flag, Attr.valid_on,
               Attr.validList_cons, Attr.validList_nil, Attr.validList_append,
@@ -585,19 +615,32 @@ private def mkSchemaJsonCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
     ← `(command| instance $(mkIdent (tId ++ `instNonNullJson)):ident : NonNullJson $t := ⟨fun _ => nofun⟩) ] ++ lawfulCmds
   return jsonFnCmds ++ jsonInstCmds
 
+def resolveSchemaCtxArgs (ref : Lean.Syntax) (tag : String) (ctxBinders : Array Lean.Name)
+    (props : Array (Lean.Syntax × String × Lean.Term)) (checkUnknown := true) : Lean.MacroM (Array Lean.Term) := do
+  let mut ctxVals : Std.HashMap Lean.Name Lean.Term := {}
+  let mut ctxArg? : Option Lean.Term := none
+  for (attrRef, nm, v) in props do
+    if nm == "ctx" && ctxBinders.size == 1 then ctxArg? := some v
+    else if ctxBinders.contains (.mkSimple nm) then ctxVals := ctxVals.insert (.mkSimple nm) v
+    else if checkUnknown then Lean.Macro.throwErrorAt attrRef s!"<{tag}>: unknown attribute `{nm}`"
+  ctxBinders.mapM fun b => do
+    if let some v := ctxVals[b]? <|> ctxArg? then pure v
+    else Lean.Macro.throwErrorAt ref s!"<{tag}> requires context attribute `{b}=\{…}`{if ctxBinders.size == 1 then " (or `ctx={…}`)" else ""}"
+
 open Lean Elab Command Term in
-elab_rules : command
-  | `(schema $t:ident $[($cbns:ident : $cbts:term)]* where $[$fieldStxs:schemaField]*) => do
-      let mut fs : Array Ident := #[]
-      let mut rawSpecs : Array Term := #[]
-      let mut whereClauses : Array (Array Term) := #[]
-      for fstx in fieldStxs do
-        match fstx with
-        | `(schemaField| $f:ident : $spec:term $[where $[$ps:term],*]?) =>
-            fs := fs.push f
-            rawSpecs := rawSpecs.push spec
-            whereClauses := whereClauses.push (ps.getD #[])
-        | _ => throwUnsupportedSyntax
+@[command_elab schemaCmd] def elabSchemaCmd : CommandElab
+  | stx => do
+      let t : Ident := ⟨stx[1]⟩
+      let rawCtx := if stx[2].getNumArgs == 3 then stx[2][1].getSepArgs else #[]
+      let cbns : Array Ident := rawCtx.map (⟨·[0]⟩)
+      let cbts ← rawCtx.mapM fun cp => liftMacroM (return (← Qed.Lang.lowerQedType cp[2] false).1)
+      let fStxs := stx[4].getArgs
+      let fs : Array Ident := fStxs.map (⟨·[0]⟩)
+      let rawSpecs ← fStxs.mapM fun f => liftMacroM (lowerSchemaFieldSpec f[2])
+      let whereClauses : Array (Array Term) ← fStxs.mapM fun f => do
+        if f[3].getNumArgs == 2 then
+          f[3][1].getSepArgs.mapM fun w => liftMacroM (Qed.Lang.lowerSimpleQedExpr .propInv w)
+        else pure #[]
       let tId        := t.getId
       let draftId    := mkIdent (tId ++ `Draft)
       let parseId    := mkIdent (tId ++ `parse)
@@ -637,8 +680,8 @@ elab_rules : command
 
 namespace Demo
 
-schema Signup where
-  email : String where email.contains '@', email.length >= 3
+schema Signup:
+  email : String where '@' in email, email.length >= 3
   age   : Nat    where age >= 18
   agree : Bool   where agree
 

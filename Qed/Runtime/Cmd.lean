@@ -86,6 +86,10 @@ def Cmd.getJson [FromJson α] (url : String) (onOk : α → msg) (onErr : String
 def Cmd.postJson [FromJson α] (url body : String) (onOk : α → msg) (onErr : String → msg) : Cmd msg :=
   .request "POST" url body (httpDecode onOk onErr)
 
+/-- Streams SSE chunks from a JSON-encoded request body (`POST` with `ToJson`). -/
+def Cmd.streamJson [ToJson α] (url : String) (body : α) (onChunk : String → msg) (onDone : msg) : Cmd msg :=
+  .stream url (Json.render (toJson body)) onChunk onDone
+
 def Cmd.storageSet    (key value : String) : Cmd msg := .fx "storage.set" key value ""
 def Cmd.storageRemove (key : String)       : Cmd msg := .fx "storage.remove" key "" ""
 def Cmd.storageClear                       : Cmd msg := .fx "storage.clear" "" "" ""

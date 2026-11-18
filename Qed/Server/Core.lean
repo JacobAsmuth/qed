@@ -2,6 +2,7 @@ import Qed.Json
 import Qed.Proto
 import Qed.Router
 import Qed.Schema
+import Qed.Resource
 
 /-! ## Safe Array Indexing, Membership & Conservation Helpers -/
 
@@ -847,5 +848,196 @@ theorem safeIO_bind_preservesStepRel {σ α β : Type} {Inv : σ → Prop} {Rel 
     (hk : ∀ a, ProgPreservesStepRel Inv Rel (k a)) :
     ProgPreservesStepRel Inv Rel (p >>= k) :=
   progPreservesStepRel_bind (safeIO_preservesStepRel p) hk
+
+/-! ## Inferred Domain Errors (`SrvFailure`) & Async Postcondition Proofs (`ProgEnsures`) -/
+
+/-- Server-side failure combining transport/infrastructure `ApiError`s with inferred typed
+    application-level domain failures `fail(.tag)`. -/
+inductive SrvFailure (ε : Type) where
+  | api    (err : ApiError)
+  | domain (tag : ε) (message : String)
+deriving Inhabited, DecidableEq, Repr
+
+/-- Translates internal transactional `Except (SrvFailure ε) α` into wire-level
+    `Except ApiError (Except (RpcDomainError ε) α)`: domain errors serialize inside a `200 OK`
+    Protobuf payload while transport/auth errors remain HTTP error statuses. -/
+def SrvFailure.toWire {ε α : Type} :
+    Except (SrvFailure ε) α → Except ApiError (Except (RpcDomainError ε) α)
+  | .ok a                  => .ok (.ok a)
+  | .error (.domain t msg) => .ok (.error ⟨t, msg⟩)
+  | .error (.api err)      => .error err
+
+/-- Postcondition judgment for an async `ThreadProg`: every `.pure a` return value must satisfy
+    `Post a`, assuming shared server state satisfies `Inv` at each `atomic` boundary. -/
+inductive ProgEnsures {σ α : Type} (Inv : σ → Prop) (Post : α → Prop) : ThreadProg σ α → Prop where
+  | pure (a : α) :
+      Post a → ProgEnsures Inv Post (.pure a)
+  | httpCall (req : OutboundReq) (k : Except ApiError OutboundResp → ThreadProg σ α) :
+      (∀ r, ProgEnsures Inv Post (k r)) → ProgEnsures Inv Post (.httpCall req k)
+  | readEnv (v : String) (k : Option String → ThreadProg σ α) :
+      (∀ r, ProgEnsures Inv Post (k r)) → ProgEnsures Inv Post (.readEnv v k)
+  | nowMs (k : UInt64 → ThreadProg σ α) :
+      (∀ r, ProgEnsures Inv Post (k r)) → ProgEnsures Inv Post (.nowMs k)
+  | randomHex (n : UInt32) (k : String → ThreadProg σ α) :
+      (∀ r, ProgEnsures Inv Post (k r)) → ProgEnsures Inv Post (.randomHex n k)
+  | hmacSha256 (key msg : ByteArray) (k : ByteArray → ThreadProg σ α) :
+      (∀ r, ProgEnsures Inv Post (k r)) → ProgEnsures Inv Post (.hmacSha256 key msg k)
+  | atomic (st : σ → σ) (next : σ → ThreadProg σ α) :
+      (∀ s, Inv s → ProgEnsures Inv Post (next s)) →
+      ProgEnsures Inv Post (.atomic st next)
+
+theorem progEnsures_pure {σ α : Type} {Inv : σ → Prop} {Post : α → Prop}
+    (a : α) (ha : Post a) :
+    ProgEnsures Inv Post (Pure.pure a) :=
+  .pure a ha
+
+theorem progEnsures_bind {σ α β : Type} {Inv : σ → Prop} {Q : α → Prop} {Post : β → Prop}
+    {p : ThreadProg σ α} {k : α → ThreadProg σ β}
+    (hp : ProgEnsures Inv Q p)
+    (hk : ∀ a, Q a → ProgEnsures Inv Post (k a)) :
+    ProgEnsures Inv Post (p >>= k) := by
+  change ProgEnsures Inv Post (ThreadProg.bind p k)
+  induction hp with
+  | pure a ha => exact hk a ha
+  | httpCall _ _ _ ih | readEnv _ _ _ ih | nowMs _ _ ih | randomHex _ _ _ ih | hmacSha256 _ _ _ _ ih =>
+      first | exact .httpCall _ _ ih | exact .readEnv _ _ ih | exact .nowMs _ ih
+            | exact .randomHex _ _ ih | exact .hmacSha256 _ _ _ ih
+  | atomic st _ _ ih => exact .atomic st _ ih
+
+theorem safeIO_ensures_true {σ α : Type} {Inv : σ → Prop}
+    (p : ThreadProg σ α) [hp : SafeIO p] :
+    ProgEnsures Inv (fun _ => True) p := by
+  induction hp.noAtomic with
+  | pure a => exact .pure a trivial
+  | httpCall _ _ _ ih => exact .httpCall _ _ ih
+  | readEnv _ _ _ ih => exact .readEnv _ _ ih
+  | nowMs _ _ ih => exact .nowMs _ ih
+  | randomHex _ _ _ ih => exact .randomHex _ _ ih
+  | hmacSha256 _ _ _ _ ih => exact .hmacSha256 _ _ _ ih
+
+theorem safeIO_bind_ensures {σ α β : Type} {Inv : σ → Prop} {Post : β → Prop}
+    (p : ThreadProg σ α) [SafeIO p] {k : α → ThreadProg σ β}
+    (hk : ∀ a, ProgEnsures Inv Post (k a)) :
+    ProgEnsures Inv Post (p >>= k) :=
+  progEnsures_bind (safeIO_ensures_true p) (fun a _ => hk a)
+
+theorem progEnsures_runAtomic {σ α : Type} {Inv : σ → Prop} {Post : α → Prop}
+    (step : σ → σ × α)
+    (hstep : ∀ s, Inv s → Post (step s).2) :
+    ProgEnsures Inv Post (MonadAtomic.runAtomic (m := ThreadProg σ) step) :=
+  .atomic _ (fun s => .pure (step s).2) (fun s hs => .pure _ (hstep s hs))
+
+theorem progEnsures_runAtomicRead {σ α : Type} {Inv : σ → Prop} {Post : α → Prop}
+    (f : σ → α)
+    (hf : ∀ s, Inv s → Post (f s)) :
+    ProgEnsures Inv Post (MonadAtomic.runAtomicRead (m := ThreadProg σ) f) :=
+  .atomic id (fun s => .pure (f s)) (fun s hs => .pure _ (hf s hs))
+
+theorem runAtomic_bind_ensures {σ α β : Type} {Inv : σ → Prop} {Post : β → Prop}
+    (step : σ → σ × α) {k : α → ThreadProg σ β}
+    (hk : ∀ s, Inv s → ProgEnsures Inv Post (k (step s).2)) :
+    ProgEnsures Inv Post (MonadAtomic.runAtomic (m := ThreadProg σ) step >>= k) :=
+  .atomic (fun s => (step s).1) (fun s => k (step s).2) hk
+
+theorem runAtomicRead_bind_ensures {σ α β : Type} {Inv : σ → Prop} {Post : β → Prop}
+    (f : σ → α) {k : α → ThreadProg σ β}
+    (hk : ∀ s, Inv s → ProgEnsures Inv Post (k (f s))) :
+    ProgEnsures Inv Post (MonadAtomic.runAtomicRead (m := ThreadProg σ) f >>= k) :=
+  .atomic id (fun s => k (f s)) hk
+
+/-- Multi-core scheduler state tracking a target RPC thread alongside arbitrary concurrent
+    `Inv`-preserving background handlers. -/
+structure TrackedMultiCoreState (σ Tgt Out : Type) where
+  shared : σ
+  target : ThreadProg σ Tgt
+  others : List (ThreadProg σ Out)
+
+inductive TrackedMultiCoreStep {σ Tgt Out : Type} (Inv : σ → Prop) :
+    TrackedMultiCoreState σ Tgt Out → TrackedMultiCoreState σ Tgt Out → Prop where
+  | stepOther {s₁ s₂ : σ} {os₁ os₂ : List (ThreadProg σ Out)} (t : ThreadProg σ Tgt) :
+      MultiCoreStep Inv ⟨s₁, os₁⟩ ⟨s₂, os₂⟩ →
+      TrackedMultiCoreStep Inv ⟨s₁, t, os₁⟩ ⟨s₂, t, os₂⟩
+  | stepTargetHttp (s : σ) (os : List (ThreadProg σ Out))
+      (req : OutboundReq) (k : Except ApiError OutboundResp → ThreadProg σ Tgt)
+      (resp : Except ApiError OutboundResp) :
+      TrackedMultiCoreStep Inv ⟨s, .httpCall req k, os⟩ ⟨s, k resp, os⟩
+  | stepTargetEnv (s : σ) (os : List (ThreadProg σ Out))
+      (v : String) (k : Option String → ThreadProg σ Tgt) (val : Option String) :
+      TrackedMultiCoreStep Inv ⟨s, .readEnv v k, os⟩ ⟨s, k val, os⟩
+  | stepTargetNow (s : σ) (os : List (ThreadProg σ Out))
+      (k : UInt64 → ThreadProg σ Tgt) (tm : UInt64) :
+      TrackedMultiCoreStep Inv ⟨s, .nowMs k, os⟩ ⟨s, k tm, os⟩
+  | stepTargetRand (s : σ) (os : List (ThreadProg σ Out))
+      (n : UInt32) (k : String → ThreadProg σ Tgt) (hex : String) :
+      TrackedMultiCoreStep Inv ⟨s, .randomHex n k, os⟩ ⟨s, k hex, os⟩
+  | stepTargetHmac (s : σ) (os : List (ThreadProg σ Out))
+      (key msg : ByteArray) (k : ByteArray → ThreadProg σ Tgt) (mac : ByteArray) :
+      TrackedMultiCoreStep Inv ⟨s, .hmacSha256 key msg k, os⟩ ⟨s, k mac, os⟩
+  | stepTargetAtomic (s : σ) (os : List (ThreadProg σ Out))
+      (st : σ → σ) (next : σ → ThreadProg σ Tgt) :
+      TrackedMultiCoreStep Inv ⟨s, .atomic st next, os⟩ ⟨st s, next s, os⟩
+
+inductive TrackedMultiCoreSchedule {σ Tgt Out : Type} (Inv : σ → Prop) :
+    TrackedMultiCoreState σ Tgt Out → TrackedMultiCoreState σ Tgt Out → Prop where
+  | refl (st : TrackedMultiCoreState σ Tgt Out) :
+      TrackedMultiCoreSchedule Inv st st
+  | step {st₁ st₂ st₃ : TrackedMultiCoreState σ Tgt Out} :
+      TrackedMultiCoreSchedule Inv st₁ st₂ →
+      TrackedMultiCoreStep Inv st₂ st₃ →
+      TrackedMultiCoreSchedule Inv st₁ st₃
+
+private theorem trackedStep_preserves {σ Tgt Out : Type} {Inv : σ → Prop} {Post : Tgt → Prop}
+    {st₁ st₂ : TrackedMultiCoreState σ Tgt Out}
+    (hstep : TrackedMultiCoreStep Inv st₁ st₂)
+    (hinv : Inv st₁.shared)
+    (htinv : ProgPreservesInv Inv st₁.target)
+    (htens : ProgEnsures Inv Post st₁.target)
+    (hopool : ∀ p ∈ st₁.others, ProgPreservesInv Inv p) :
+    Inv st₂.shared ∧ ProgPreservesInv Inv st₂.target ∧ ProgEnsures Inv Post st₂.target ∧
+      (∀ p ∈ st₂.others, ProgPreservesInv Inv p) := by
+  cases hstep with
+  | stepOther t hs =>
+      let ⟨hinv', hopool'⟩ := step_preserves_inv_and_pool hs hinv hopool
+      exact ⟨hinv', htinv, htens, hopool'⟩
+  | stepTargetHttp s os req k resp =>
+      cases htinv with | httpCall _ _ hk1 =>
+      cases htens with | httpCall _ _ hk2 => exact ⟨hinv, hk1 resp, hk2 resp, hopool⟩
+  | stepTargetEnv s os v k val =>
+      cases htinv with | readEnv _ _ hk1 =>
+      cases htens with | readEnv _ _ hk2 => exact ⟨hinv, hk1 val, hk2 val, hopool⟩
+  | stepTargetNow s os k tm =>
+      cases htinv with | nowMs _ hk1 =>
+      cases htens with | nowMs _ hk2 => exact ⟨hinv, hk1 tm, hk2 tm, hopool⟩
+  | stepTargetRand s os n k hex =>
+      cases htinv with | randomHex _ _ hk1 =>
+      cases htens with | randomHex _ _ hk2 => exact ⟨hinv, hk1 hex, hk2 hex, hopool⟩
+  | stepTargetHmac s os key msg k mac =>
+      cases htinv with | hmacSha256 _ _ _ hk1 =>
+      cases htens with | hmacSha256 _ _ _ hk2 => exact ⟨hinv, hk1 mac, hk2 mac, hopool⟩
+  | stepTargetAtomic s os st next =>
+      cases htinv with | atomic _ _ hst hnext1 =>
+      cases htens with | atomic _ _ hnext2 => exact ⟨hst s hinv, hnext1 s hinv, hnext2 s hinv, hopool⟩
+
+/-- Multi-Core Concurrent Postcondition Theorem:
+    If `Inv s₀` holds at server boot, `tgt₀` preserves `Inv` (`ProgPreservesInv Inv tgt₀`) and
+    satisfies `ProgEnsures Inv Post tgt₀`, then whenever `tgt₀` finishes with `.pure out` under
+    **any** interleaving with arbitrarily many concurrent `Inv`-preserving background threads and
+    external API responses, `Inv st.shared` and `Post out` both hold unconditionally. -/
+theorem concurrent_schedule_ensures {σ Tgt Out : Type}
+    (Inv : σ → Prop) (Post : Tgt → Prop) (s₀ : σ) (tgt₀ : ThreadProg σ Tgt)
+    (st : TrackedMultiCoreState σ Tgt Out)
+    (hinit : Inv s₀)
+    (htinv : ProgPreservesInv Inv tgt₀)
+    (htens : ProgEnsures Inv Post tgt₀)
+    (hsched : TrackedMultiCoreSchedule Inv ⟨s₀, tgt₀, []⟩ st) :
+    Inv st.shared ∧ ∀ out, st.target = .pure out → Post out := by
+  suffices h : Inv st.shared ∧ ProgPreservesInv Inv st.target ∧ ProgEnsures Inv Post st.target ∧
+      (∀ p ∈ st.others, ProgPreservesInv Inv p) by
+    refine ⟨h.1, fun out hout => ?_⟩
+    rw [hout] at h
+    cases h.2.2.1 with | pure _ hp => exact hp
+  induction hsched with
+  | refl => exact ⟨hinit, htinv, htens, fun _ hm => False.elim (List.not_mem_nil hm)⟩
+  | step _ hstep ih => exact trackedStep_preserves hstep ih.1 ih.2.1 ih.2.2.1 ih.2.2.2
 
 end Qed.Server

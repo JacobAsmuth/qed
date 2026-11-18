@@ -1,10 +1,27 @@
 import Qed.Component.Rewrite
 import Qed.Runtime
 import Qed.Invariant.ForEach
+import Qed.Server.Invariant
 
 namespace Qed
 section CompElab
 open Lean Elab Command
+
+private structure PendingRpcCheck where
+  callRef      : Syntax
+  srvShort     : String
+  methodName   : String
+  reqConst?    : Option Name
+  reqLabel     : String
+  requiresAuth : Bool
+  argExprs     : Array Expr
+  lctx         : LocalContext
+  localInsts   : LocalInstances
+  mctx         : MetavarContext
+  sessionVar?  : Option Name
+
+private initialize pendingRpcChecks : IO.Ref (Array PendingRpcCheck) ← IO.mkRef #[]
+private initialize currentCompSessionRef : IO.Ref (Option Ident) ← IO.mkRef none
 
 /-! ## Shared Structure, Binder & Codegen Helpers -/
 
@@ -243,7 +260,7 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
             if s[1].getNumArgs > 0 then
               let hId : Ident := ⟨s[1][0]⟩
               `(if $hId:ident : $cond then $tT else $eT)
-            else `(if $cond then $tT else $eT)
+            else `(if $(mkIdent `_qedIf):ident : $cond then $tT else $eT)
           else if sk == ``actionIfLetStmt then
             let pat : Term := ⟨s[2]⟩; let scrut : Term := ⟨s[4]⟩
             `(if let $pat := $scrut then $(← compileBranch (unpackSeq s[6])) else $(← compileOptElse s[7]))
@@ -299,6 +316,8 @@ private def mkMsgInductiveCmds (spec : ComponentSpec) (sites : Array SetSite) :
     | none => `(Lean.Parser.Command.ctor| | $cId:ident)
   if let some rd := spec.route? then
     ctors := ctors.push (← `(Lean.Parser.Command.ctor| | $(mkIdent `_onRoute):ident (_r : $(rd.ty))))
+  if spec.sessionField?.isSome then
+    ctors := ctors.push (← `(Lean.Parser.Command.ctor| | $(mkIdent `_onSession):ident (_u : Option String)))
   if spec.outTy?.isSome then
     ctors := ctors.push (← `(Lean.Parser.Command.ctor| | $(mkIdent `_emit):ident (_o : $(mkIdent (tId ++ `Out)))))
   for (colField, colChild) in spec.collections do
@@ -337,7 +356,7 @@ private def mkOwnUpdateArms (spec : ComponentSpec) (sites : Array SetSite) (unch
           if isPureNoop then throwErrorAt stmts[0]! "an action must update state, perform an effect, or send an output"
           compileStmts spec (← `(s)) #[] none #[] stmts.toList
       | none => do mkUpdateRet spec (← flushAssigns (← `(s)) site.assigns) site.send? #[])
-    if let some guard := site.guard? then rhs ← `(if $guard then $rhs else $unchanged)
+    if let some guard := site.guard? then rhs ← `(if $(mkIdent `_qedWhen):ident : $guard then $rhs else $unchanged)
     rhs ← bindMentionedFields spec (fun g =>
       (site.stmts?.any (·.any (mentionsIdent · g))) ||
       (site.assigns.any fun (_, e?) => e?.any (mentionsIdent ·.raw g)) ||
@@ -362,6 +381,11 @@ private def mkOwnUpdateArms (spec : ComponentSpec) (sites : Array SetSite) (unch
     rhs ← bindMentionedFields spec (fun g => g != rd.field.getId && mentionsIdent rhs.raw g) rhs
     rhs ← `(let $(mkIdent rd.field.getId):ident := $rVal:ident; $rhs)
     ownArms := ownArms.push (← `(Lean.Parser.Term.matchAltExpr| | $cFull:ident $rVal:ident => $rhs))
+  if let some sfId := spec.sessionField? then
+    let cFull := mkIdent (tId ++ `Msg ++ `_onSession)
+    let uVar := mkIdent `_u
+    let next ← `({ s with $sfId:ident := $uVar:ident })
+    ownArms := ownArms.push (← `(Lean.Parser.Term.matchAltExpr| | $cFull:ident $uVar:ident => $(← mkUpdateRet spec next none #[])))
   if spec.outTy?.isSome then
     let oVar := mkIdent `_o
     ownArms := ownArms.push (← `(Lean.Parser.Term.matchAltExpr|
@@ -629,12 +653,15 @@ private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool
       templateTerm ← `(let $poId:ident := $(mkIdent (tId ++ po.id.getId)); $templateTerm)
   let appUpdate : Term ← if spec.hasEffects then `($updateId)
     else `(fun s m => ($updateId s m, Qed.Cmd.none))
+  let onSessionArg : Term ← match spec.sessionField? with
+    | some _ => `(some $(mkIdent (tId ++ `Msg ++ `_onSession)))
+    | none   => `(none)
   let baseApp : Term ← match spec.route? with
     | some _ => `(Qed.Internal.mkRoutedApp $initId $appUpdate $templateTerm
-        (onRoute := $(mkIdent (tId ++ `Msg ++ `_onRoute))) (start := $startArg)
-        (locals := $regsId) (styles := qedInternalStyles% $viewId) (onPort := $onPortArg))
-    | none   => `(Qed.Internal.mkApp $initId $appUpdate $templateTerm (start := $startArg)
-        (locals := $regsId) (styles := qedInternalStyles% $viewId) (onPort := $onPortArg))
+        (onRoute := $(mkIdent (tId ++ `Msg ++ `_onRoute))) (onSession := $onSessionArg)
+        (start := $startArg) (locals := $regsId) (styles := qedInternalStyles% $viewId) (onPort := $onPortArg))
+    | none   => `(Qed.Internal.mkApp $initId $appUpdate $templateTerm (onSession := $onSessionArg)
+        (start := $startArg) (locals := $regsId) (styles := qedInternalStyles% $viewId) (onPort := $onPortArg))
   let dehydApp : Term ← if spec.ephemeralFields.isEmpty then `(qedInternalAutoDehydrate% $initId $baseApp)
     else `(Qed.Internal.App.withDehydrate (Dehydrate.except $initId [$[$spec.ephemeralFields:ident],*]) $baseApp)
   let queriedApp : Term ← if spec.queries.isEmpty then pure dehydApp else do
@@ -914,49 +941,181 @@ private def withOpenNs {α : Type} (ns : Name) (k : CommandElabM α) : CommandEl
     withScope (fun sc => { sc with openDecls := .simple ns [] :: sc.openDecls }) k
   else k
 
+open Lean Elab Term Meta in
+@[term_elab qedCheckRpcCallTerm]
+def elabQedCheckRpcCall : TermElab := fun stx expectedType? => do
+  let srvId : Ident := ⟨stx[1]⟩
+  let methId : Ident := ⟨stx[2]⟩
+  let argTerms : Array Term := stx[4].getSepArgs.map (⟨·⟩)
+  let cbTerm : Term := ⟨stx[6]⟩
+  let srvName := srvId.getId
+  let methStr := methId.getId.toString
+  let env ← getEnv
+  let some srvInfo := (serverRegistry.getState env).find? srvName
+    | throwErrorAt stx s!"internal: unknown server `{srvName}` in RPC check"
+  let some mInfo := srvInfo.methods.find? (·.name == methStr)
+    | throwErrorAt stx s!"internal: unknown method `{methStr}` on `{srvName}` in RPC check"
+  let rawRpcId := mkIdentFrom stx mInfo.rawRpcConst
+  let callApp ← argTerms.foldlM (init := (rawRpcId : Term)) fun acc a => `($acc $a)
+  let fullCall ← `($callApp $cbTerm)
+  let resExpr ← elabTerm fullCall expectedType?
+  let resExpr ← instantiateMVars resExpr
+  let mut argExprs : Array Expr := #[]
+  let fnArgs := resExpr.getAppArgs
+  if resExpr.isAppOf mInfo.rawRpcConst && fnArgs.size ≥ 2 + mInfo.paramCount then
+    for i in [0:mInfo.paramCount] do
+      argExprs := argExprs.push (← instantiateMVars fnArgs[2 + i]!)
+  else
+    for (aT, i) in argTerms.zipIdx do
+      let pTy := Lean.mkConst mInfo.paramTypeConsts[i]!
+      argExprs := argExprs.push (← instantiateMVars (← elabTermEnsuringType aT pTy))
+  if mInfo.hasClientReq || mInfo.requiresAuth then
+    let lctx ← getLCtx
+    let localInsts ← getLocalInstances
+    let mctx ← getMCtx
+    let sessionId? ← currentCompSessionRef.get
+    pendingRpcChecks.modify (·.push {
+      callRef := stx
+      srvShort := srvInfo.shortName
+      methodName := mInfo.name
+      reqConst? := mInfo.clientReqConst
+      reqLabel := mInfo.clientReqLabel
+      requiresAuth := mInfo.requiresAuth
+      argExprs
+      lctx
+      localInsts
+      mctx
+      sessionVar? := sessionId?.map (·.getId)
+    })
+  return resExpr
+
+open Lean Elab Meta in
+private def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
+    CommandElabM Unit := do
+  let checks ← pendingRpcChecks.get
+  if checks.isEmpty then return
+  let stateConstName ← liftCoreM <| realizeGlobalConstNoOverload (mkIdent (spec.t.getId ++ `State))
+  for chk in checks do
+    liftTermElabM do
+      Meta.withMCtx chk.mctx <| withLCtx chk.lctx chk.localInsts do
+        let mut invProps : Array Expr := #[]
+        let mut stateFVar? : Option Expr := none
+        for decl in chk.lctx do
+          if !decl.isImplementationDetail && !decl.isLet then
+            if (← Meta.whnf decl.type).isConstOf stateConstName then
+              if stateFVar?.isNone then stateFVar? := some decl.toExpr
+              let fnTy := Expr.forallE `_ (Lean.mkConst stateConstName) (Expr.sort Level.zero) .default
+              for predT in invPreds do
+                let predExpr ← Term.elabTermEnsuringType predT fnTy
+                invProps := invProps.push ((Expr.app predExpr decl.toExpr).headBeta)
+        let tryDischarge (goalBody : Expr) : TermElabM Bool := do
+          let fullGoal ← invProps.foldrM (init := goalBody) fun hyp acc =>
+            pure (Expr.forallE `_ hyp acc .default)
+          let fullGoal ← instantiateMVars fullGoal
+          let mv ← Meta.mkFreshExprSyntheticOpaqueMVar fullGoal
+          try
+            let unsolved ← Tactic.run mv.mvarId! do
+              Tactic.evalTactic (← `(tactic| intros; qedProveRpcReq))
+            return unsolved.isEmpty
+          catch _ =>
+            return false
+        if chk.requiresAuth then
+          let some sfName := chk.sessionVar?
+            | throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`ctx.userId != none`), but component `{spec.t.getId}` has no `session` state.\nAdd `session user` and guard the call with `when user.isSome =>` or `if user.isSome then ...`."
+          let sfExpr : Expr ←
+            match chk.lctx.findDecl? fun decl =>
+                if !decl.isImplementationDetail && decl.userName.eraseMacroScopes == sfName then some decl.toExpr else none with
+            | some e => pure e
+            | none =>
+                let some sFVar := stateFVar?
+                  | throwErrorAt chk.callRef m!"internal: could not locate component state while checking session auth for `{chk.srvShort}.{chk.methodName}`"
+                Meta.mkProjection sFVar sfName
+          let sfTy ← Meta.whnf (← Meta.inferType sfExpr)
+          let elemTy := if sfTy.isAppOfArity ``Option 1 then sfTy.appArg! else Lean.mkConst ``String
+          let noneExpr ← Meta.mkAppOptM ``Option.none #[some elemTy]
+          let authGoal ← Meta.mkAppM ``Ne #[sfExpr, noneExpr]
+          unless (← tryDischarge authGoal) do
+            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`{sfName} ≠ none`), which could not be proved at this call site.\nGuard this call with `when {sfName}.isSome =>`, `if {sfName}.isSome then ...`, or declare `invariant ... : {sfName}.isSome`."
+        if let some reqConst := chk.reqConst? then
+          let reqGoal := mkAppN (Lean.mkConst reqConst) chk.argExprs
+          unless (← tryDischarge reqGoal) do
+            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` precondition `{chk.reqLabel}` could not be proved at this call site.\nSupply literals, guard with `when`/`if`, pass refined `Field`/`Ensured` values, or declare a component `invariant`."
+
 @[command_elab componentCmd] def elabComponentCmd : CommandElab := fun stx => do
+  let savedEnv ← getEnv
+  let errsInit := (← get).messages.toList.filter (·.severity == .error) |>.length
   let compNs := (← getCurrNamespace) ++ stx[2].getId
-  withOpenNs compNs do
-    let rawSpec ← parseComponentSpec stx
-    if rawSpec.states.isEmpty && rawSpec.actions.isEmpty && rawSpec.keyF?.isNone &&
-        rawSpec.starts.isEmpty &&
-        rawSpec.portOuts.isEmpty && rawSpec.portIns.isEmpty && rawSpec.queries.isEmpty then
-      let sitesRef ← IO.mkRef #[]
-      let hoistedRef ← IO.mkRef #[]
-      let rCtx : RewriteCtx := {
-        stateFields := #[], bindFields := rawSpec.bindNames, isPureComp := true,
-        msgPath := rawSpec.t.getId ++ `Msg, hasOut := false, collections := #[],
-        sites := sitesRef, hoisted := hoistedRef, allowHoist := true }
-      let body' : Term := ⟨← rewriteIn rCtx false rawSpec.body⟩
-      if (← hoistedRef.get).isEmpty then
-        return ← elabPureComponent rawSpec body'
-    let idLit := Syntax.mkStrLit compNs.toString
-    let (sites, route'?, queries', starts', body', hoisted) ← collectSitesAndRewriteStateful rawSpec
-    let ownHasEffects :=
-      !starts'.isEmpty ||
-      !rawSpec.portOuts.isEmpty || !rawSpec.portIns.isEmpty || !queries'.isEmpty ||
-      sites.any (fun s => s.stmts?.any (·.any hasPerformNode)) ||
-      (route'?.any fun rd => rd.alts.any hasPerformNode) ||
-      hoisted.any (·.info.hasEffects)
-    let spec ← elabStructsAndResolveTypes { rawSpec with route? := route'?, queries := queries', hasEffects := ownHasEffects } hoisted
-    let errsBefore := (← get).messages.toList.filter (·.severity == .error) |>.length
-    let coreCmds ← mkViewCmds spec body' (← mkMsgAndUpdateCmds spec sites)
-    for c in coreCmds do elabCommand c
-    let (mountCmds, hasStart, hasLocalDef) ← mkCodecAndMountCmds spec starts' idLit
-    for c in mountCmds do elabCommand c
-    let stateInvPreds ← withOpenNs compNs (elabInlineInvariantsPhase spec false)
-    let errsAfterState := (← get).messages.toList.filter (·.severity == .error) |>.length
-    if spec.mountable && spec.outTy?.isNone && !spec.hasProps && !spec.hasSlotsOrKids then
-      let activePreds := if errsAfterState == errsBefore then stateInvPreds else #[]
-      let (appCmds, eqCmd) ← mkCompAppCmds spec body' hasStart activePreds
-      for c in appCmds do elabCommand c
-      let errsAfterApp := (← get).messages.toList.filter (·.severity == .error) |>.length
-      if errsAfterApp == errsBefore then elabCommand eqCmd
-    let _ ← withOpenNs compNs (elabInlineInvariantsPhase spec true)
-    let baseInfo ← mkBaseCompInfo spec .stateful spec.hasProps
-    modifyEnv fun env => componentRegistry.addEntry env { baseInfo with
-      hasOut := spec.outTy?.isSome, hasEffects := spec.hasEffects,
-      hasStart, mountable := spec.mountable, hasLocalDef }
+  pendingRpcChecks.set #[]
+  currentCompSessionRef.set none
+  let okRef ← IO.mkRef false
+  try
+    withOpenNs compNs do
+      let rawSpec ← parseComponentSpec stx
+      if rawSpec.states.isEmpty && rawSpec.actions.isEmpty && rawSpec.keyF?.isNone &&
+          rawSpec.starts.isEmpty && rawSpec.sessionField?.isNone &&
+          rawSpec.portOuts.isEmpty && rawSpec.portIns.isEmpty && rawSpec.queries.isEmpty then
+        let sitesRef ← IO.mkRef #[]
+        let hoistedRef ← IO.mkRef #[]
+        let usedRpcsRef ← IO.mkRef #[]
+        let contCtrRef ← IO.mkRef 0
+        let rCtx : RewriteCtx := {
+          stateFields := #[], bindFields := rawSpec.bindNames, isPureComp := true,
+          msgPath := rawSpec.t.getId ++ `Msg, hasOut := false, collections := #[],
+          sites := sitesRef, hoisted := hoistedRef, allowHoist := true,
+          usedRpcs := usedRpcsRef, contCounter := contCtrRef }
+        let body' : Term := ⟨← rewriteIn rCtx false rawSpec.body⟩
+        if (← hoistedRef.get).isEmpty then
+          elabPureComponent rawSpec body'
+          okRef.set true
+          return
+      let idLit := Syntax.mkStrLit compNs.toString
+      let (sites, route'?, queries', starts', body', hoisted, ownUsedRpcs) ← collectSitesAndRewriteStateful rawSpec
+      let mut allUsedRpcs := ownUsedRpcs
+      for h in hoisted do
+        for ep in h.info.usedRpcs do
+          unless allUsedRpcs.contains ep do
+            allUsedRpcs := allUsedRpcs.push ep
+      let ownHasEffects :=
+        !starts'.isEmpty ||
+        !rawSpec.portOuts.isEmpty || !rawSpec.portIns.isEmpty || !queries'.isEmpty ||
+        sites.any (fun s => s.stmts?.any (·.any hasPerformNode)) ||
+        (route'?.any fun rd => rd.alts.any hasPerformNode) ||
+        hoisted.any (·.info.hasEffects)
+      let spec ← elabStructsAndResolveTypes {
+        rawSpec with route? := route'?, queries := queries', hasEffects := ownHasEffects, usedRpcs := allUsedRpcs
+      } hoisted
+      currentCompSessionRef.set spec.sessionField?
+      let errsBefore := (← get).messages.toList.filter (·.severity == .error) |>.length
+      let coreCmds ← mkViewCmds spec body' (← mkMsgAndUpdateCmds spec sites)
+      for c in coreCmds do elabCommand c
+      let (mountCmds, hasStart, hasLocalDef) ← mkCodecAndMountCmds spec starts' idLit
+      for c in mountCmds do elabCommand c
+      let stateInvPreds ← withOpenNs compNs (elabInlineInvariantsPhase spec false)
+      let errsAfterInvs := (← get).messages.toList.filter (·.severity == .error) |>.length
+      let activePreds := if errsAfterInvs == errsBefore then stateInvPreds else #[]
+      verifyPendingRpcChecks spec activePreds
+      let errsAfterState := (← get).messages.toList.filter (·.severity == .error) |>.length
+      if spec.mountable && spec.outTy?.isNone && !spec.hasProps && !spec.hasSlotsOrKids then
+        let (appCmds, eqCmd) ← mkCompAppCmds spec body' hasStart activePreds
+        for c in appCmds do elabCommand c
+        let errsAfterApp := (← get).messages.toList.filter (·.severity == .error) |>.length
+        if errsAfterApp == errsBefore then elabCommand eqCmd
+      let _ ← withOpenNs compNs (elabInlineInvariantsPhase spec true)
+      let usedRpcsId := mkIdent (spec.t.getId ++ `usedRpcs)
+      let epTerms ← allUsedRpcs.mapM fun (sStr, mStr) =>
+        `((($(Syntax.mkStrLit sStr), $(Syntax.mkStrLit mStr)) : String × String))
+      elabCommand (← `(command| def $usedRpcsId : List (String × String) := [$[$epTerms],*]))
+      let baseInfo ← mkBaseCompInfo spec .stateful spec.hasProps
+      modifyEnv fun env => componentRegistry.addEntry env { baseInfo with
+        hasOut := spec.outTy?.isSome, hasEffects := spec.hasEffects,
+        hasStart, mountable := spec.mountable, hasLocalDef, usedRpcs := allUsedRpcs }
+      okRef.set true
+  finally
+    pendingRpcChecks.set #[]
+    currentCompSessionRef.set none
+    let errsEnd := (← get).messages.toList.filter (·.severity == .error) |>.length
+    if !(← okRef.get) || errsEnd > errsInit then
+      setEnv savedEnv
 
 end CompElab
 end Qed

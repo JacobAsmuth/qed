@@ -117,12 +117,18 @@ private def ssrResults (resultsJson : String) : Array (Bool × Bool × String) :
       | _ => acc) #[]
   | _ => #[]
 
-private def App.ssrInitQueue (app : App Model Msg) (path : String) : Model × List (Cmd Msg) :=
+private def App.ssrInitQueue (app : App Model Msg) (path : String)
+    (sessionUser : Option String := none) : Model × List (Cmd Msg) :=
   let m0 := app.init.1
+  let (mSess, cSessList) := match app.onSession, sessionUser with
+    | some fs, some uid =>
+        let (m', c') := app.update m0 (fs (some uid))
+        (m', Cmd.flatten c')
+    | _, _ => (m0, [])
   let (m1, cRoute) := match app.onUrlChange with
-    | some f => app.update m0 (f path)
-    | none   => (m0, .none)
-  (m1, Cmd.flatten cRoute ++ Cmd.flatten app.init.2)
+    | some f => app.update mSess (f path)
+    | none   => (mSess, .none)
+  (m1, cSessList ++ Cmd.flatten cRoute ++ Cmd.flatten app.init.2)
 
 def App.ssrStep (app : App Model Msg) (path title script resultsJson : String) : String :=
   let (m1, queue) := app.ssrInitQueue path
@@ -164,8 +170,8 @@ def App.ssrBootM {Model Msg : Type} {m : Type → Type} [Monad m]
     (app : App Model Msg) (path : String)
     (dispatchBytes : String → String → ByteArray → m (Except String ByteArray))
     (dispatchText  : String → String → String → m (Except String String))
-    (fuel : Nat := 32) : m Model :=
-  let (m1, queue) := app.ssrInitQueue path
+    (fuel : Nat := 32) (sessionUser : Option String := none) : m Model :=
+  let (m1, queue) := app.ssrInitQueue path sessionUser
   ssrDrainQueueM app dispatchBytes dispatchText fuel m1 queue
 
 @[specialize]
@@ -174,8 +180,9 @@ def App.ssrRenderNativeBytes {Model Msg : Type} {m : Type → Type} [Monad m]
     (dispatchBytes : String → String → ByteArray → m (Except String ByteArray))
     (dispatchText  : String → String → String → m (Except String String) :=
       fun _ _ _ => pure (.error "no external JSON handler registered for SSR"))
-    (script : String := "/qed_host.mjs") (fuel : Nat := 32) : m ByteArray := do
-  let mdl ← app.ssrBootM path dispatchBytes dispatchText fuel
+    (script : String := "/qed_host.mjs") (fuel : Nat := 32)
+    (sessionUser : Option String := none) : m ByteArray := do
+  let mdl ← app.ssrBootM path dispatchBytes dispatchText fuel sessionUser
   return renderDocumentBytes title (app.renderModel mdl) script
     (state := app.dehydrate mdl) (css := renderStyleSheet app.styles)
 
@@ -319,5 +326,90 @@ theorem fullstack_ssr_rpc_equiv {Model Msg : Type}
   refine ⟨d.project m_srv, d.round_trip m_srv, rfl, appD.valid_view (d.project m_srv), ?_, ?_⟩
   · exact hview m_srv
   · exact congrArg Html.render (hview m_srv)
+
+/-! ## SSR Binary RPC Routing Closure (`ssr_rpc_endpoint_routed`) -/
+
+/-- Pure specification of native SSR binary RPC dispatch routing against a server's
+    `shortName` and `methods` list. -/
+def ssrDispatchRpc (srvShort : String) (methods : List String)
+    (dispatchMethod : String → ByteArray → Except String ByteArray)
+    (reqMethod url : String) (reqBody : ByteArray) : Except String ByteArray :=
+  let rpcPrefix := "/_qed/rpc/" ++ srvShort ++ "/"
+  let uPath := String.ofList (url.toList.takeWhile (· ≠ '?'))
+  if reqMethod == "POST" && uPath.startsWith rpcPrefix then
+    let mName := String.ofList (uPath.toList.drop rpcPrefix.length)
+    if mName ∈ methods then dispatchMethod mName reqBody
+    else .error s!"SSR unknown binary RPC method: {mName}"
+  else
+    .error s!"SSR unknown binary RPC endpoint: {url}"
+
+private theorem takeWhile_ne_append (p : Char → Bool) :
+    ∀ (xs ys : List Char), (∀ c ∈ xs, p c = true) → (∀ c ∈ ys, p c = true) →
+      (xs ++ ys).takeWhile p = xs ++ ys
+  | [], ys, _, hys => by
+      induction ys with
+      | nil => rfl
+      | cons y rest ih =>
+          simp only [List.nil_append, List.takeWhile_cons, hys y (by simp), ↓reduceIte]
+          exact congrArg (y :: ·) (ih (fun c hc => hys c (by simp [hc])))
+  | x :: xs, ys, hxs, hys => by
+      simp only [List.cons_append, List.takeWhile_cons, hxs x (by simp), ↓reduceIte]
+      exact congrArg (x :: ·) (takeWhile_ne_append p xs ys (fun c hc => hxs c (by simp [hc])) hys)
+
+/-- Any binary RPC endpoint targeting `srvShort` and a declared method `m ∈ methods`
+    routes directly to `dispatchMethod m reqBody` during in-memory SSR. -/
+theorem ssr_rpc_endpoint_routed (srvShort : String) (methods : List String)
+    (dispatchMethod : String → ByteArray → Except String ByteArray)
+    (srv m : String) (reqBody : ByteArray)
+    (hsrv : srv = srvShort) (hm : m ∈ methods)
+    (hsrvNoQ : ∀ c ∈ srvShort.toList, c ≠ '?')
+    (hmNoQ : ∀ c ∈ m.toList, c ≠ '?') :
+    ssrDispatchRpc srvShort methods dispatchMethod "POST" ("/_qed/rpc/" ++ srv ++ "/" ++ m) reqBody =
+      dispatchMethod m reqBody := by
+  subst srv
+  have hpfxNoQ : ∀ c ∈ ("/_qed/rpc/" ++ srvShort ++ "/").toList, c ≠ '?' := by
+    intro c hc
+    simp only [String.toList_append, List.mem_append] at hc
+    rcases hc with (h1 | h2) | h3
+    · have hlit : ∀ x ∈ "/_qed/rpc/".toList, x ≠ '?' := by decide
+      exact hlit c h1
+    · exact hsrvNoQ c h2
+    · have hlit : ∀ x ∈ "/".toList, x ≠ '?' := by decide
+      exact hlit c h3
+  have hurl : ("/_qed/rpc/" ++ srvShort ++ "/" ++ m).toList.takeWhile (· ≠ '?') =
+      ("/_qed/rpc/" ++ srvShort ++ "/").toList ++ m.toList := by
+    have h1 : ("/_qed/rpc/" ++ srvShort ++ "/" ++ m).toList =
+        ("/_qed/rpc/" ++ srvShort ++ "/").toList ++ m.toList := by
+      simp [String.toList_append, List.append_assoc]
+    rw [h1]
+    exact takeWhile_ne_append (· ≠ '?') ("/_qed/rpc/" ++ srvShort ++ "/").toList m.toList
+      (fun c hc => decide_eq_true (hpfxNoQ c hc))
+      (fun c hc => decide_eq_true (hmNoQ c hc))
+  have hpath : String.ofList (("/_qed/rpc/" ++ srvShort ++ "/" ++ m).toList.takeWhile (· ≠ '?')) =
+      ("/_qed/rpc/" ++ srvShort ++ "/") ++ m := by
+    rw [hurl, ← String.toList_append, String.ofList_toList]
+  have hdrop : (("/_qed/rpc/" ++ srvShort ++ "/") ++ m).toList.drop ("/_qed/rpc/" ++ srvShort ++ "/").length =
+      m.toList := by
+    rw [String.toList_append, ← String.length_toList (s := "/_qed/rpc/" ++ srvShort ++ "/"), List.drop_left]
+  unfold ssrDispatchRpc
+  dsimp only
+  rw [hpath]
+  have hsw : (("/_qed/rpc/" ++ srvShort ++ "/") ++ m).startsWith ("/_qed/rpc/" ++ srvShort ++ "/") = true := by
+    simp [String.startsWith]
+  simp only [beq_self_eq_true, hsw, Bool.and_self, ↓reduceIte, hdrop, String.ofList_toList, hm]
+
+/-- Full-stack SSR RPC closure theorem: when every client RPC in `usedRpcs` targets `srvShort`
+    and a method in `methods`, SSR never encounters an unknown binary RPC endpoint error. -/
+theorem ssr_rpc_closure_complete (srvShort : String) (methods : List String)
+    (usedRpcs : List (String × String))
+    (hclosed : ∀ ep ∈ usedRpcs, ep.1 = srvShort ∧ ep.2 ∈ methods)
+    (dispatchMethod : String → ByteArray → Except String ByteArray)
+    (hsrvNoQ : ∀ c ∈ srvShort.toList, c ≠ '?')
+    (hmNoQ : ∀ ep ∈ usedRpcs, ∀ c ∈ ep.2.toList, c ≠ '?')
+    (ep : String × String) (hep : ep ∈ usedRpcs) (reqBody : ByteArray) :
+    ssrDispatchRpc srvShort methods dispatchMethod "POST" ("/_qed/rpc/" ++ ep.1 ++ "/" ++ ep.2) reqBody =
+      dispatchMethod ep.2 reqBody :=
+  ssr_rpc_endpoint_routed srvShort methods dispatchMethod ep.1 ep.2 reqBody
+    (hclosed ep hep).1 (hclosed ep hep).2 hsrvNoQ (hmNoQ ep hep)
 
 end Qed

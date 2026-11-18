@@ -51,4 +51,21 @@ def required (present : Bool) : Attr msg := .flag "required" present
 def checked  (present : Bool) : Attr msg := .flag "checked" present
 def readOnly (present : Bool) : Attr msg := .flag "readonly" present
 
+theorem ToHref.valid_attr {msg α : Type} [ToHref α] (k : String) (target : α)
+    (hk : isSafeAttrName k = true) :
+    (Attr.attr k (ToHref.toHref target) : Attr msg).valid = true := by
+  simp [Attr.valid, Attr.validKeyValue, hk, ToHref.isSafeUrl_toHref]
+
+@[simp] theorem Attr.valid_href {msg α : Type} [ToHref α] (v : α) :
+    (Qed.href v : Attr msg).valid = true :=
+  ToHref.valid_attr "href" v rfl
+
+@[simp] theorem Attr.valid_src {msg α : Type} [ToHref α] (v : α) :
+    (Qed.src v : Attr msg).valid = true :=
+  ToHref.valid_attr "src" v rfl
+
+@[simp] theorem Attr.valid_action {msg α : Type} [ToHref α] (v : α) :
+    (Qed.action v : Attr msg).valid = true :=
+  ToHref.valid_attr "action" v rfl
+
 end Qed

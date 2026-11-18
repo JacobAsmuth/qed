@@ -107,9 +107,9 @@ From this single `schema`, Qed generates:
 
 See [Signup](Examples/Signup.lean) for a complete form and [Booking](Examples/Booking.lean) for validation rules parameterized by live context (such as today's date).
 
-### 4. Full-stack server rules and race-free `await`
+### 4. Full-stack server rules, client–server contracts, and race-free `await`
 
-When you build a full-stack app with `server` and `fullstack`, Qed extends those same compile-time guarantees to your backend state, external HTTP calls, and client-server RPCs:
+When you build a full-stack app with `server` and `fullstack`, Qed extends those same compile-time guarantees across backend state, external HTTP calls, and binary Protobuf RPCs:
 
 ```lean
 external PaymentApi
@@ -127,19 +127,36 @@ server Store
   fn placeOrder(qty : Nat) -> Nat!
     requires ctx.userId != none
     requires 1 <= qty && qty <= 10
+    ensures result <= 10000
     let _ = await PaymentApi.charge(qty)?
     let remaining = atomic
       if stock < qty
-        return fail("out of stock")
+        return fail(.outOfStock)
       stock -= qty
       totalOrders += 1
       return stock
     return remaining
 ```
 
+```lean
+component Checkout where
+  session user
+  state lastRemaining : Nat := 0
+  state status        := ""
+  invariant validRemaining : lastRemaining ≤ 10000
+
+  action buy (qty : Nat) when user.isSome ∧ 1 ≤ qty ∧ qty ≤ 10 =>
+    let rem := await Store.placeOrder(qty) catch
+      | .outOfStock => status := "Out of stock"
+      | .failed err => status := err
+    lastRemaining := rem
+    status := s!"Left: {rem}"
+```
+
 - **Authorization & state invariants:** `mutating stock requires ctx.userId != none` rejects any endpoint that could modify `stock` without an authenticated user, while `old(totalOrders)` proves `totalOrders` can never decrease.
 - **Compile-time TOCTOU protection:** If a handler uses `await`, Qed rejects any state read or write outside an `atomic` block, and rejects `await` *inside* `atomic` so locks never span network I/O.
-- **Typed RPCs & leak prevention:** Pairing a `server` with a `component` in a `fullstack` block generates binary Protobuf RPCs automatically and verifies that server secrets, backend state, and server handlers never enter client JavaScript.
+- **Client–server RPC contracts (`requires` & `ensures`):** Calling `Store.placeOrder(qty)` from a `component` proves both session authentication (`session user`) and parameter `requires` at the client call site, while `ensures result <= 10000` is re-verified zero-trust in `FromProto` (`Ensured`) and feeds client component `invariant`s automatically.
+- **Typed domain errors & endpoint closure:** Inferred `fail(.tag)` variants enforce exhaustive `await ... catch` handling in client actions, and `fullstack` proves every reachable client RPC targets a mounted server method while keeping server secrets and handlers out of client JS.
 
 See [CloudBooks](Examples/CloudBooks.lean) for a complete full-stack app.
 

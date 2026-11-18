@@ -185,7 +185,8 @@ private def viewValidSimpExtras (env : Environment) : Array Name :=
     ``Qed.Attr.isLocalCell_empty, ``Qed.Attr.isLocalCell_ite,
     ``Qed.Attr.hasLocalCell_nil, ``Qed.Attr.hasLocalCell_cons, ``Qed.Attr.hasLocalCell_append,
     ``Qed.Attr.hasLocalCell_filter_nonkey, ``Qed.Attr.hasLocalCell_map_attrMap, ``Qed.Attr.hasLocalCell_prefixSignal,
-    ``Qed.Html.mapChildren_isEmpty, ``Qed.Html.prefixSignalsList_isEmpty,
+    ``View.renderEach_isEmpty,
+    ``Html.mapChildren_isEmpty, ``Qed.Html.prefixSignalsList_isEmpty,
     ``Qed.Html.validIn_map, ``Qed.Html.validListIn_mapChildren,
     ``Qed.Html.validIn_prefixSignals, ``Qed.Html.validListIn_prefixSignalsList,
     ``Qed.Html.validListIn_nil, ``Qed.Html.validListIn_cons, ``Qed.Html.validListIn_append,
@@ -252,18 +253,686 @@ private def runHtmlSimpLoop (maxIters : Nat)
     let after ← (← getGoals).mapM fun g => g.withContext do instantiateMVars (← g.getType)
     if before == after then break
 
+private abbrev ProveValidM := StateRefT (Array MVarId) MetaM
+
+private def rflBoolTrue : Expr :=
+  mkApp2 (mkConst ``Eq.refl [Level.one]) (mkConst ``Bool) (mkConst ``Bool.true)
+
+private def rflBoolFalse : Expr :=
+  mkApp2 (mkConst ``Eq.refl [Level.one]) (mkConst ``Bool) (mkConst ``Bool.false)
+
+private def rflSomeHtmlCtx (ctxE : Expr) : Expr :=
+  mkApp2 (mkConst ``Eq.refl [Level.one])
+    (mkApp (mkConst ``Option [Level.zero]) (mkConst ``HtmlCtx))
+    (mkApp2 (mkConst ``Option.some [Level.zero]) (mkConst ``HtmlCtx) ctxE)
+
+private def mkBoolEq (lhs rhs : Expr) : Expr :=
+  mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Bool) lhs rhs
+
+private def mkBoolEqTrue (lhs : Expr) : Expr :=
+  mkBoolEq lhs (mkConst ``Bool.true)
+
+private def defaultHtmlCtx : HtmlCtx := {}
+
+private def defaultHtmlCtxExpr : Expr := htmlCtxExpr defaultHtmlCtx
+
+private def headConst? (e : Expr) : Option Name :=
+  e.consumeMData.getAppFn.constName?
+
+private def emitValidMVar (goalTy : Expr) : ProveValidM Expr := do
+  let m ← Meta.mkFreshExprSyntheticOpaqueMVar goalTy
+  modify fun gs => gs.push m.mvarId!
+  return m
+
+private def isMatcherOrCases (fn : Name) : MetaM Bool := do
+  if (← Meta.isMatcher fn) then return true
+  if let .str _ s := fn then
+    return s == "casesOn" || s == "recOn"
+  return false
+
+private def isSafeKeyLit (k : Expr) : Bool :=
+  match strLitVal? k with
+  | some ks => Qed.isSafeAttrName ks
+  | none    => false
+
+private def isSafeKeyValLit (k v : Expr) : Bool :=
+  match strLitVal? k with
+  | some ks =>
+      Qed.isSafeAttrName ks &&
+      (!Qed.isUrlAttrName ks ||
+        match strLitVal? v with
+        | some vs => Qed.isSafeUrl vs
+        | none    => false)
+  | none => false
+
+private def isFixedSafeNonCellAttrName (n : Name) : Bool :=
+  n == ``Attr.cls || n == ``Qed.cls ||
+  n == ``Attr.key || n == ``Qed.key ||
+  n == ``Attr.empty || n == ``Attr.signalBind ||
+  n == ``Qed.role ||
+  n == ``Qed.onClick || n == ``Qed.onInput || n == ``Qed.onChange ||
+  n == ``Qed.onCheck || n == ``Qed.onKeydown || n == ``Qed.onKeyup ||
+  n == ``Qed.onSubmit || n == ``Qed.onBlur || n == ``Qed.onFocus ||
+  n == ``Qed.onDoubleClick || n == ``Qed.onMouseDown || n == ``Qed.onMouseUp ||
+  n == ``Qed.value || n == ``Qed.placeholder || n == ``Qed.name ||
+  n == ``Qed.alt || n == ``Qed.title || n == ``Qed.style || n == ``Qed.type' ||
+  n == ``Qed.disabled || n == ``Qed.required || n == ``Qed.checked || n == ``Qed.readOnly
+
+private def isVAttrOnCheckEval (fn : Name) (args : Array Expr) : Bool :=
+  fn == ``VAttr.eval && args.size == 4 &&
+    (args[3]!).consumeMData.getAppFn.constName? == some ``V.onCheck'
+
+private def isDefValidAttr (a : Expr) : Bool :=
+  let a := a.consumeMData
+  let args := a.getAppArgs
+  match a.getAppFn.constName? with
+  | some fn =>
+      if isFixedSafeNonCellAttrName fn || fn == ``Attr.localCell ||
+         fn == `Qed.localMount || fn == `Qed.localMountWith || isVAttrOnCheckEval fn args then true
+      else if (fn == ``Attr.flag || fn == ``Attr.on || fn == ``Attr.onValue) && args.size >= 3 then
+        isSafeKeyLit args[1]!
+      else if (fn == ``Attr.attr || fn == ``Attr.signalAttr) && args.size >= 3 then
+        isSafeKeyValLit args[args.size - 2]! args[args.size - 1]!
+      else if fn == ``Qed.attr && args.size == 5 then
+        isSafeKeyValLit args[3]! args[4]!
+      else false
+  | none => false
+
+private def isDefNonLocalCellAttr (a : Expr) : Bool :=
+  let a := a.consumeMData
+  let args := a.getAppArgs
+  match a.getAppFn.constName? with
+  | some fn =>
+      isFixedSafeNonCellAttrName fn || isVAttrOnCheckEval fn args ||
+      fn == ``Qed.href || fn == ``Qed.src || fn == ``Qed.action ||
+      fn == ``Attr.flag || fn == ``Attr.on || fn == ``Attr.onValue ||
+      fn == ``Attr.attr || fn == ``Attr.signalAttr || fn == ``Qed.attr
+  | none => false
+
+private def evalVAttrExpr (sigmaTy msgTy sExpr va : Expr) : Expr :=
+  let va := va.consumeMData
+  let args := va.getAppArgs
+  if va.isAppOfArity ``VAttr.stat 3 then args[2]!
+  else if va.isAppOfArity ``VAttr.bind 3 || va.isAppOfArity ``V.bindAttr 3 then
+    (mkApp args[2]! sExpr).headBeta
+  else if va.isAppOfArity ``VAttr.dynVal 4 || va.isAppOfArity ``V.dynAttr 4 then
+    mkApp3 (mkConst ``Attr.attr) args[1]! args[2]! (mkApp args[3]! sExpr)
+  else if va.isAppOfArity ``V.onClick' 3 then
+    mkApp3 (mkConst ``Attr.on) args[1]! (toExpr "click") (mkApp args[2]! sExpr)
+  else if va.isAppOfArity ``V.onInput' 3 then
+    mkApp3 (mkConst ``Attr.onValue) args[1]! (toExpr "input") (mkApp args[2]! sExpr)
+  else
+    mkApp4 (mkConst ``VAttr.eval) sigmaTy msgTy sExpr va
+
+private def expandVAttrMap (sigmaTy msgTy sExpr : Expr) : Nat → Expr → Expr
+  | 0, vattrs =>
+      mkAppN (mkConst ``List.map [Level.zero, Level.zero])
+        #[mkApp2 (mkConst ``VAttr) sigmaTy msgTy, mkApp (mkConst ``Attr) msgTy,
+          mkApp3 (mkConst ``VAttr.eval) sigmaTy msgTy sExpr, vattrs]
+  | fuel + 1, vattrs =>
+      let vattrs := vattrs.consumeMData.headBeta
+      if vattrs.isAppOfArity ``List.nil 1 then
+        mkApp (mkConst ``List.nil [Level.zero]) (mkApp (mkConst ``Attr) msgTy)
+      else if vattrs.isAppOfArity ``List.cons 3 then
+        let args := vattrs.getAppArgs
+        mkApp3 (mkConst ``List.cons [Level.zero]) (mkApp (mkConst ``Attr) msgTy)
+          (evalVAttrExpr sigmaTy msgTy sExpr args[1]!)
+          (expandVAttrMap sigmaTy msgTy sExpr fuel args[2]!)
+      else
+        mkAppN (mkConst ``List.map [Level.zero, Level.zero])
+          #[mkApp2 (mkConst ``VAttr) sigmaTy msgTy, mkApp (mkConst ``Attr) msgTy,
+            mkApp3 (mkConst ``VAttr.eval) sigmaTy msgTy sExpr, vattrs]
+
+private def normalizeAttrsExpr (attrs : Expr) : Expr :=
+  let attrs := attrs.consumeMData.headBeta
+  if attrs.isAppOfArity ``List.map 4 then
+    let args := attrs.getAppArgs
+    let fn := args[2]!.consumeMData
+    if fn.isAppOfArity ``VAttr.eval 3 then
+      let fArgs := fn.getAppArgs
+      expandVAttrMap fArgs[0]! fArgs[1]! fArgs[2]! 128 args[3]!
+    else attrs
+  else attrs
+
+private def allAttrList (p : Expr → Bool) : Nat → Expr → Bool
+  | 0, _ => false
+  | fuel + 1, attrs =>
+      let attrs := attrs.consumeMData
+      if attrs.isAppOfArity ``List.nil 1 then true
+      else if attrs.isAppOfArity ``List.cons 3 then
+        let args := attrs.getAppArgs
+        p args[1]! && allAttrList p fuel args[2]!
+      else false
+
+private def withHypLam (ty : Expr) (k : Expr → ProveValidM Expr) : ProveValidM Expr :=
+  withLocalDeclD `_qed_h ty fun h => do
+    mkLambdaFVars #[h] (← k h)
+
+private def proveIteBranches (c : Expr) (onT onF : ProveValidM Expr) : ProveValidM (Expr × Expr) :=
+  return (← withHypLam c fun _ => onT, ← withHypLam (mkApp (mkConst ``Not) c) fun _ => onF)
+
+private def proveResBranches (α ready loading failed idle : Expr) (k : Expr → ProveValidM Expr) :
+    ProveValidM (Array Expr) := do
+  let pfIdle ← k idle
+  let pfLoad ← k loading
+  let pfReady ← withHypLam α fun a => k (mkApp ready a)
+  let pfFail ← withHypLam (mkConst ``String) fun e => k (mkApp failed e)
+  return #[pfIdle, pfLoad, pfReady, pfFail]
+
+private def proveAttrValid (env : Environment) (msgTy a : Expr) : Nat → ProveValidM Expr
+  | 0 => emitValidMVar (mkBoolEqTrue (mkApp2 (mkConst ``Attr.valid) msgTy a))
+  | fuel + 1 => do
+      let a := a.consumeMData.headBeta
+      if let .letE _ _ val body _ := a then
+        return ← proveAttrValid env msgTy (body.instantiate1 val) fuel
+      if isDefValidAttr a then
+        return rflBoolTrue
+      let args := a.getAppArgs
+      let aFn? := a.getAppFn.constName?
+      for (ctor, lem) in #[
+          (``Qed.href, ``Qed.Attr.valid_href),
+          (``Qed.src, ``Qed.Attr.valid_src),
+          (``Qed.action, ``Qed.Attr.valid_action)] do
+        if a.isAppOfArity ctor 4 then
+          return mkApp4 (mkConst lem) args[0]! args[1]! args[2]! args[3]!
+      for (ctor, lem) in #[(`Qed.Attr.localProps, `Qed.Attr.valid_localProps_intro),
+                           (`Qed.Attr.localInit, `Qed.Attr.valid_localInit_intro)] do
+        if aFn? == some ctor && args.size == 5 && env.contains lem then
+          let pfInner ← proveAttrValid env msgTy args[3]! fuel
+          return mkAppN (mkConst lem) #[args[0]!, args[1]!, args[2]!, args[3]!, args[4]!, pfInner]
+      if a.isAppOfArity ``Attr.attr 3 then
+        if isSafeKeyLit args[1]! then
+          let val := args[2]!.consumeMData
+          if val.isAppOfArity ``Qed.ToHref.toHref 3 then
+            let tArgs := val.getAppArgs
+            return mkAppN (mkConst ``Qed.ToHref.valid_attr)
+              #[args[0]!, tArgs[0]!, tArgs[1]!, args[1]!, tArgs[2]!, rflBoolTrue]
+      if a.isAppOfArity ``ite 5 then
+        let c := args[1]!; let dec := args[2]!; let tBr := args[3]!; let fBr := args[4]!
+        let (pfT, pfF) ← proveIteBranches c
+          (proveAttrValid env msgTy tBr fuel) (proveAttrValid env msgTy fBr fuel)
+        return mkAppN (mkConst ``Qed.Attr.valid_ite_intro) #[msgTy, c, dec, tBr, fBr, pfT, pfF]
+      if let some fn := aFn? then
+        if (← liftM (isUnfoldableUserDef env true fn)) then
+          if let some aUnf ← Meta.unfoldDefinition? a then
+            return ← proveAttrValid env msgTy aUnf fuel
+      emitValidMVar (mkBoolEqTrue (mkApp2 (mkConst ``Attr.valid) msgTy a))
+
+private def proveAttrValidList (env : Environment) (msgTy attrs : Expr) : Nat → ProveValidM Expr
+  | 0 => emitValidMVar (mkBoolEqTrue (mkApp2 (mkConst ``Attr.validList) msgTy attrs))
+  | fuel + 1 => do
+      let attrs := normalizeAttrsExpr attrs
+      if allAttrList isDefValidAttr 128 attrs || attrs.isAppOfArity ``List.nil 1 then
+        return rflBoolTrue
+      if attrs.isAppOfArity ``List.cons 3 then
+        let args := attrs.getAppArgs
+        let pfA ← proveAttrValid env msgTy args[1]! fuel
+        let pfRest ← proveAttrValidList env msgTy args[2]! fuel
+        return mkAppN (mkConst ``Qed.Attr.validList_cons_intro) #[msgTy, args[1]!, args[2]!, pfA, pfRest]
+      if attrs.isAppOfArity ``HAppend.hAppend 6 then
+        let args := attrs.getAppArgs
+        let xs := args[4]!; let ys := args[5]!
+        let pfXs ← proveAttrValidList env msgTy xs fuel
+        let pfYs ← proveAttrValidList env msgTy ys fuel
+        return mkAppN (mkConst ``Qed.Attr.validList_append_intro) #[msgTy, xs, ys, pfXs, pfYs]
+      emitValidMVar (mkBoolEqTrue (mkApp2 (mkConst ``Attr.validList) msgTy attrs))
+
+private def proveAttrIsLocalCellFalse (msgTy a : Expr) : Nat → Option Expr
+  | 0 => none
+  | fuel + 1 =>
+      let a := a.consumeMData.headBeta
+      if isDefNonLocalCellAttr a then
+        some rflBoolFalse
+      else if a.isAppOfArity ``ite 5 then
+        let args := a.getAppArgs
+        let c := args[1]!; let dec := args[2]!; let tBr := args[3]!; let fBr := args[4]!
+        match proveAttrIsLocalCellFalse msgTy tBr fuel, proveAttrIsLocalCellFalse msgTy fBr fuel with
+        | some pT, some pF =>
+            let lamT := Expr.lam `_qed_h c pT .default
+            let lamF := Expr.lam `_qed_h (mkApp (mkConst ``Not) c) pF .default
+            some (mkAppN (mkConst ``Qed.Attr.isLocalCell_ite_eq_false) #[msgTy, c, dec, tBr, fBr, lamT, lamF])
+        | _, _ => none
+      else none
+
+private def proveAttrHasLocalCellFalse (msgTy attrs : Expr) : Nat → Option Expr
+  | 0 => none
+  | fuel + 1 =>
+      let attrs := normalizeAttrsExpr attrs
+      if allAttrList isDefNonLocalCellAttr 128 attrs || attrs.isAppOfArity ``List.nil 1 then
+        some rflBoolFalse
+      else if attrs.isAppOfArity ``List.cons 3 then
+        let args := attrs.getAppArgs
+        match proveAttrIsLocalCellFalse msgTy args[1]! fuel, proveAttrHasLocalCellFalse msgTy args[2]! fuel with
+        | some pA, some pRest =>
+            some (mkAppN (mkConst ``Qed.Attr.hasLocalCell_cons_eq_false) #[msgTy, args[1]!, args[2]!, pA, pRest])
+        | _, _ => none
+      else if attrs.isAppOfArity ``HAppend.hAppend 6 then
+        let args := attrs.getAppArgs
+        let xs := args[4]!; let ys := args[5]!
+        match proveAttrHasLocalCellFalse msgTy xs fuel, proveAttrHasLocalCellFalse msgTy ys fuel with
+        | some pX, some pY =>
+            some (mkAppN (mkConst ``Qed.Attr.hasLocalCell_append_eq_false) #[msgTy, xs, ys, pX, pY])
+        | _, _ => none
+      else none
+
+private def proveVoidObligation (elemTy tagE kids : Expr) (tagS : String) : ProveValidM Expr := do
+  if !Qed.isVoidTag tagS then
+    return rflBoolTrue
+  if kids.consumeMData.isAppOfArity ``List.nil 1 then
+    return mkApp (mkConst ``Bool.or_true) (mkApp (mkConst ``Bool.not) (mkApp (mkConst ``Qed.isVoidTag) tagE))
+  let lhs := mkApp2 (mkConst ``Bool.or)
+    (mkApp (mkConst ``Bool.not) (mkApp (mkConst ``Qed.isVoidTag) tagE))
+    (mkApp2 (mkConst ``List.isEmpty [Level.zero]) elemTy kids)
+  emitValidMVar (mkBoolEqTrue lhs)
+
+private def proveCellObligation (elemTy msgTy evalAttrs kids : Expr) : ProveValidM Expr := do
+  if allAttrList isDefNonLocalCellAttr 128 evalAttrs then
+    return rflBoolTrue
+  let hasCellE := mkApp2 (mkConst ``Attr.hasLocalCell) msgTy evalAttrs
+  let notCellE := mkApp (mkConst ``Bool.not) hasCellE
+  if kids.consumeMData.isAppOfArity ``List.nil 1 then
+    return mkApp (mkConst ``Bool.or_true) notCellE
+  let isEmptyE := mkApp2 (mkConst ``List.isEmpty [Level.zero]) elemTy kids
+  if let some pFalse := proveAttrHasLocalCellFalse msgTy evalAttrs 128 then
+    return mkApp3 (mkConst ``Qed.Bool.not_false_or) hasCellE isEmptyE pFalse
+  emitValidMVar (mkBoolEqTrue (mkApp2 (mkConst ``Bool.or) notCellE isEmptyE))
+
+mutual
+  private def proveSplitSubgoal (fuel : Nat) (env : Environment) (goalTy : Expr) : ProveValidM Expr := do
+    match fuel with
+    | 0 => emitValidMVar goalTy
+    | fuel + 1 =>
+        let m ← Meta.mkFreshExprSyntheticOpaqueMVar goalTy
+        let split? ← try
+            m.mvarId!.withContext do Meta.splitTarget? m.mvarId!
+          catch _ => pure none
+        match split? with
+        | some subgoals =>
+            for sg in subgoals do
+              proveGoalMVar fuel env sg
+            instantiateMVars m
+        | none =>
+            modify fun gs => gs.push m.mvarId!
+            return m
+
+  private def proveValidIn (fuel : Nat) (env : Environment) (ctxV : HtmlCtx)
+      (ctxE msgTy h : Expr) : ProveValidM Expr := do
+    let goalTy := mkBoolEqTrue (mkApp3 (mkConst ``Html.validIn) msgTy ctxE h)
+    match fuel with
+    | 0 => emitValidMVar goalTy
+    | fuel + 1 =>
+        let h := h.consumeMData.headBeta
+        if let .letE _ _ val body _ := h then
+          return ← proveValidIn fuel env ctxV ctxE msgTy (body.instantiate1 val)
+        let args := h.getAppArgs
+        let hFn? := h.getAppFn.constName?
+        if h.isAppOfArity ``Html.text 2 then
+          let str := args[1]!
+          match ctxV.mode with
+          | .normal | .option | .textarea | .svg => return rflBoolTrue
+          | .rawStyle =>
+              if strLitVal? str == some "" then return rflBoolTrue
+              if str.consumeMData.isAppOfArity ``Qed.escapeRawText 1 then
+                return mkApp4 (mkConst ``Qed.validTextIn_rawStyle_escape)
+                  (toExpr ctxV.inP) (toExpr ctxV.interactive) (toExpr ctxV.inForm) str.consumeMData.appArg!
+              if let some s := strLitVal? str then
+                if !Qed.containsCloseSeq s.toList then
+                  return rflBoolTrue
+              return ← emitValidMVar goalTy
+          | _ =>
+              if strLitVal? str == some "" then return rflBoolTrue
+              return ← emitValidMVar goalTy
+        if h.isAppOfArity ``Qed.text 4 then
+          match ctxV.mode with
+          | .normal | .option | .textarea | .svg => return rflBoolTrue
+          | _ => pure ()
+        if h.isAppOfArity ``Html.element 4 || h.isAppOfArity ``Qed.el 4 then
+          let tagE := args[1]!
+          let attrs := args[2]!
+          let kids := args[3]!
+          if let some tagS := strLitVal? tagE then
+            match Qed.stepHtmlCtx ctxV tagS with
+            | some childCtx =>
+                let childCtxE := htmlCtxExpr childCtx
+                let hstep := rflSomeHtmlCtx childCtxE
+                let hattrs ← proveAttrValidList env msgTy attrs 128
+                let htmlTy := mkApp (mkConst ``Html) msgTy
+                let hvoid ← proveVoidObligation htmlTy tagE kids tagS
+                let hcell ← proveCellObligation htmlTy msgTy attrs kids
+                let hkids ← proveValidListIn fuel env childCtx childCtxE msgTy kids
+                return mkAppN (mkConst ``Qed.Html.validIn_element_intro)
+                  #[msgTy, ctxE, childCtxE, tagE, attrs, kids, hstep, hattrs, hvoid, hcell, hkids]
+            | none =>
+                return ← emitValidMVar goalTy
+          return ← emitValidMVar goalTy
+        if h.isAppOfArity ``Qed.withKey 3 then
+          let pf ← proveValidIn fuel env ctxV ctxE msgTy args[2]!
+          return mkApp4 (mkConst ``Qed.Html.validIn_withKey_intro) msgTy ctxE args[1]! args[2]! |>.app pf
+        if h.isAppOfArity ``Html.map 4 then
+          let α := args[0]!
+          let pf ← proveValidIn fuel env ctxV ctxE α args[3]!
+          return mkAppN (mkConst ``Qed.Html.validIn_map_intro) #[α, args[1]!, ctxE, args[2]!, args[3]!, pf]
+        if h.isAppOfArity ``Html.prefixSignals 3 then
+          let pf ← proveValidIn fuel env ctxV ctxE msgTy args[2]!
+          return mkAppN (mkConst ``Qed.Html.validIn_prefixSignals_intro) #[msgTy, ctxE, args[1]!, args[2]!, pf]
+        if h.isAppOfArity ``Html.ofOption 2 then
+          let opt := args[1]!.consumeMData
+          if opt.isAppOfArity ``Option.none 1 then
+            return mkApp (mkConst ``Qed.validTextIn_empty) ctxE
+          if opt.isAppOfArity ``Option.some 2 then
+            return ← proveValidIn fuel env ctxV ctxE msgTy opt.getAppArgs[1]!
+          return ← proveSplitSubgoal fuel env goalTy
+        if h.isAppOfArity ``View.render 4 then
+          return ← proveViewRender fuel env ctxV ctxE args[0]! args[1]! args[2]! args[3]!
+        if hFn? == some ``Qed.lazy && args.size == 5 then
+          let inner := (mkApp args[3]! args[4]!).headBeta
+          return ← proveValidIn fuel env ctxV ctxE msgTy inner
+        if hFn? == some ``Qed.link || hFn? == some ``Qed.linkTo || hFn? == some ``Qed.theme then
+          if let some hUnf ← Meta.unfoldDefinition? h then
+            return ← proveValidIn fuel env ctxV ctxE msgTy hUnf
+        if hFn? == some `Qed.Resource.awaitView && args.size == 9 && env.contains `Qed.Resource.validIn_awaitView_intro then
+          let pfs ← proveResBranches args[1]! args[5]! args[6]! args[7]! args[8]!
+            (proveValidIn fuel env ctxV ctxE msgTy)
+          return mkAppN (mkConst `Qed.Resource.validIn_awaitView_intro)
+            (#[args[0]!, args[1]!, msgTy, args[3]!, ctxE, args[4]!, args[5]!, args[6]!, args[7]!, args[8]!] ++ pfs)
+        if (hFn? == some `Qed.Resource.view || (hFn? == some `Qed.Cached.view && env.contains `Qed.Cached.state)) &&
+            args.size == 7 && env.contains `Qed.Resource.validIn_view_intro then
+          let r := if hFn? == some `Qed.Cached.view then mkApp2 (mkConst `Qed.Cached.state) args[0]! args[2]! else args[2]!
+          let pfs ← proveResBranches args[0]! args[3]! args[4]! args[5]! args[6]!
+            (proveValidIn fuel env ctxV ctxE msgTy)
+          return mkAppN (mkConst `Qed.Resource.validIn_view_intro)
+            (#[args[0]!, msgTy, ctxE, r, args[3]!, args[4]!, args[5]!, args[6]!] ++ pfs)
+        if h.isAppOfArity ``ite 5 then
+          let c := args[1]!; let dec := args[2]!; let a := args[3]!; let b := args[4]!
+          let (pfT, pfF) ← proveIteBranches c
+            (proveValidIn fuel env ctxV ctxE msgTy a) (proveValidIn fuel env ctxV ctxE msgTy b)
+          return mkAppN (mkConst ``Qed.Html.validIn_ite_intro) #[msgTy, ctxE, c, dec, a, b, pfT, pfF]
+        if h.isAppOfArity ``dite 5 then
+          let c := args[1]!; let dec := args[2]!; let aLam := args[3]!; let bLam := args[4]!
+          let pfT ← withHypLam c fun fv => proveValidIn fuel env ctxV ctxE msgTy (mkApp aLam fv)
+          let pfF ← withHypLam (mkApp (mkConst ``Not) c) fun fv => proveValidIn fuel env ctxV ctxE msgTy (mkApp bLam fv)
+          return mkAppN (mkConst ``Qed.Html.validIn_dite_intro) #[msgTy, ctxE, c, dec, aLam, bLam, pfT, pfF]
+        if let some fn := hFn? then
+          if fn.toString.endsWith ".formView" && args.size >= 4 && ctxV.mode == .normal && !ctxV.inP && !ctxV.interactive then
+            let validLemma := fn.getPrefix ++ `formView_validIn
+            if env.contains validLemma then
+              let splitIdx := args.size - 3
+              let lmArgs := args.extract 0 splitIdx ++ #[toExpr ctxV.inForm] ++ args.extract splitIdx args.size
+              let pf := mkAppN (mkConst validLemma) lmArgs
+              if (← Meta.isTypeCorrect pf) then
+                return pf
+          if (← isMatcherOrCases fn) then
+            return ← proveSplitSubgoal fuel env goalTy
+          if (← liftM (isUnfoldableUserDef env true fn)) then
+            if let some hUnf ← Meta.unfoldDefinition? h then
+              return ← proveValidIn fuel env ctxV ctxE msgTy hUnf
+        emitValidMVar goalTy
+
+  private def proveValidListIn (fuel : Nat) (env : Environment) (ctxV : HtmlCtx)
+      (ctxE msgTy cs : Expr) : ProveValidM Expr := do
+    let goalTy := mkBoolEqTrue (mkApp3 (mkConst ``Html.validListIn) msgTy ctxE cs)
+    match fuel with
+    | 0 => emitValidMVar goalTy
+    | fuel + 1 =>
+        let cs := cs.consumeMData.headBeta
+        if let .letE _ _ val body _ := cs then
+          return ← proveValidListIn fuel env ctxV ctxE msgTy (body.instantiate1 val)
+        let args := cs.getAppArgs
+        let csFn? := cs.getAppFn.constName?
+        if cs.isAppOfArity ``List.nil 1 then
+          return mkApp2 (mkConst ``Qed.Html.validListIn_nil) msgTy ctxE
+        if cs.isAppOfArity ``List.cons 3 then
+          let pfC ← proveValidIn fuel env ctxV ctxE msgTy args[1]!
+          let pfCs ← proveValidListIn fuel env ctxV ctxE msgTy args[2]!
+          return mkAppN (mkConst ``Qed.Html.validListIn_cons_intro) #[msgTy, ctxE, args[1]!, args[2]!, pfC, pfCs]
+        if cs.isAppOfArity ``HAppend.hAppend 6 then
+          let xs := args[4]!; let ys := args[5]!
+          let pfX ← proveValidListIn fuel env ctxV ctxE msgTy xs
+          let pfY ← proveValidListIn fuel env ctxV ctxE msgTy ys
+          return mkAppN (mkConst ``Qed.Html.validListIn_append_intro) #[msgTy, ctxE, xs, ys, pfX, pfY]
+        if cs.isAppOfArity ``Html.mapChildren 4 then
+          let α := args[0]!
+          let pf ← proveValidListIn fuel env ctxV ctxE α args[3]!
+          return mkAppN (mkConst ``Qed.Html.validListIn_mapChildren_intro) #[α, args[1]!, ctxE, args[2]!, args[3]!, pf]
+        if cs.isAppOfArity ``Html.prefixSignalsList 3 then
+          let pf ← proveValidListIn fuel env ctxV ctxE msgTy args[2]!
+          return mkAppN (mkConst ``Qed.Html.validListIn_prefixSignalsList_intro) #[msgTy, ctxE, args[1]!, args[2]!, pf]
+        if cs.isAppOfArity ``View.renderEach 4 then
+          return ← proveViewRenderEach fuel env ctxV ctxE args[0]! args[1]! args[2]! args[3]!
+        if (csFn? == some `Qed.ForEachItems.toList || csFn? == some ``Qed.mapList) then
+          if let some csUnf ← Meta.unfoldDefinition? cs then
+            return ← proveValidListIn fuel env ctxV ctxE msgTy csUnf
+        if cs.isAppOfArity ``List.map 4 then
+          let α := args[0]!; let f := args[2]!; let xs := args[3]!
+          let pfF ← withHypLam α fun a => proveValidIn fuel env ctxV ctxE msgTy (mkApp f a)
+          return mkAppN (mkConst ``Qed.Html.validListIn_map_intro) #[α, msgTy, ctxE, xs, f, pfF]
+        if cs.isAppOfArity ``Array.toList 2 then
+          let inner := args[1]!.consumeMData
+          if inner.isAppOfArity ``Array.map 4 then
+            let mArgs := inner.getAppArgs
+            let α := mArgs[0]!; let f := mArgs[2]!; let xs := mArgs[3]!
+            let pfF ← withHypLam α fun a => proveValidIn fuel env ctxV ctxE msgTy (mkApp f a)
+            return mkAppN (mkConst ``Qed.Html.validListIn_toList_map_intro) #[α, msgTy, ctxE, xs, f, pfF]
+        if csFn? == some `Qed.Codec.formFieldRow && args.size == 7 &&
+            env.contains `Qed.Codec.formFieldRow_validListIn &&
+            ctxV.mode == .normal && !ctxV.inP && !ctxV.interactive then
+          let pfCtrl ← proveValidIn fuel env ctxV ctxE msgTy args[6]!
+          return mkAppN (mkConst `Qed.Codec.formFieldRow_validListIn)
+            #[msgTy, toExpr ctxV.inForm, args[1]!, args[2]!, args[3]!, args[4]!, args[5]!, args[6]!, pfCtrl]
+        if cs.isAppOfArity ``ite 5 then
+          let c := args[1]!; let dec := args[2]!; let a := args[3]!; let b := args[4]!
+          let (pfT, pfF) ← proveIteBranches c
+            (proveValidListIn fuel env ctxV ctxE msgTy a) (proveValidListIn fuel env ctxV ctxE msgTy b)
+          return mkAppN (mkConst ``Qed.Html.validListIn_ite_intro) #[msgTy, ctxE, c, dec, a, b, pfT, pfF]
+        if let some fn := csFn? then
+          if (← isMatcherOrCases fn) then
+            return ← proveSplitSubgoal fuel env goalTy
+          if (← liftM (isUnfoldableUserDef env true fn)) then
+            if let some csUnf ← Meta.unfoldDefinition? cs then
+              return ← proveValidListIn fuel env ctxV ctxE msgTy csUnf
+        emitValidMVar goalTy
+
+  private def proveViewRender (fuel : Nat) (env : Environment) (ctxV : HtmlCtx)
+      (ctxE sigmaTy msgTy v sExpr : Expr) : ProveValidM Expr := do
+    let goalTy := mkBoolEqTrue (mkApp3 (mkConst ``Html.validIn) msgTy ctxE
+      (mkApp4 (mkConst ``View.render) sigmaTy msgTy v sExpr))
+    match fuel with
+    | 0 => emitValidMVar goalTy
+    | fuel + 1 =>
+        let v := v.consumeMData.headBeta
+        if let .letE _ _ val body _ := v then
+          return ← proveViewRender fuel env ctxV ctxE sigmaTy msgTy (body.instantiate1 val) sExpr
+        let args := v.getAppArgs
+        let vFn? := v.getAppFn.constName?
+        if v.isAppOfArity ``View.text 3 || v.isAppOfArity ``V.text 3 then
+          return ← proveValidIn fuel env ctxV ctxE msgTy (mkApp2 (mkConst ``Html.text) msgTy args[2]!)
+        if v.isAppOfArity ``View.dyn 3 || v.isAppOfArity ``V.dyn 3 then
+          return ← proveValidIn fuel env ctxV ctxE msgTy (mkApp2 (mkConst ``Html.text) msgTy (mkApp args[2]! sExpr))
+        if v.isAppOfArity ``View.static 3 || v.isAppOfArity ``V.static 3 then
+          return ← proveValidIn fuel env ctxV ctxE msgTy args[2]!
+        if v.isAppOfArity ``View.dynNode 3 || v.isAppOfArity ``V.dynNode 3 || v.isAppOfArity ``View.ofHtml 3 then
+          return ← proveValidIn fuel env ctxV ctxE msgTy (mkApp args[2]! sExpr)
+        if v.isAppOfArity ``V.memo 6 then
+          return ← proveValidIn fuel env ctxV ctxE msgTy (mkApp args[4]! (mkApp args[5]! sExpr))
+        if v.isAppOfArity ``View.memo 3 then
+          let sm := args[2]!.consumeMData
+          if sm.isAppOfArity ``SoundMemo.ofLawful 6 then
+            let smArgs := sm.getAppArgs
+            return ← proveValidIn fuel env ctxV ctxE msgTy (mkApp smArgs[4]! (mkApp smArgs[5]! sExpr))
+        if v.isAppOfArity ``View.element 5 || v.isAppOfArity ``V.el 5 then
+          let tagE := args[2]!; let attrs := args[3]!; let kids := args[4]!
+          if let some tagS := strLitVal? tagE then
+            match Qed.stepHtmlCtx ctxV tagS with
+            | some childCtx =>
+                let childCtxE := htmlCtxExpr childCtx
+                let hstep := rflSomeHtmlCtx childCtxE
+                let evalAttrs := expandVAttrMap sigmaTy msgTy sExpr 128 attrs
+                let hattrs ← proveAttrValidList env msgTy evalAttrs 128
+                let viewTy := mkApp2 (mkConst ``View) sigmaTy msgTy
+                let hvoid ← proveVoidObligation viewTy tagE kids tagS
+                let hcell ← proveCellObligation viewTy msgTy evalAttrs kids
+                let hkids ← proveViewRenderEach fuel env childCtx childCtxE sigmaTy msgTy kids sExpr
+                return mkAppN (mkConst ``View.validIn_render_element_intro)
+                  #[sigmaTy, msgTy, ctxE, childCtxE, tagE, attrs, kids, sExpr, hstep, hattrs, hvoid, hcell, hkids]
+            | none =>
+                return ← emitValidMVar goalTy
+          return ← emitValidMVar goalTy
+        if v.isAppOfArity ``View.showIf 4 || v.isAppOfArity ``V.showIf 4 then
+          let cond := args[2]!; let child := args[3]!
+          let pfY ← withHypLam (mkBoolEqTrue (mkApp cond sExpr)) fun _ =>
+            proveViewRender fuel env ctxV ctxE sigmaTy msgTy child sExpr
+          return mkAppN (mkConst ``View.validIn_render_showIf) #[sigmaTy, msgTy, ctxE, cond, child, sExpr, pfY]
+        if v.isAppOfArity ``View.ifElse 5 || v.isAppOfArity ``V.ifElse 5 then
+          let cond := args[2]!; let y := args[3]!; let n := args[4]!
+          let pfY ← withHypLam (mkBoolEqTrue (mkApp cond sExpr)) fun _ =>
+            proveViewRender fuel env ctxV ctxE sigmaTy msgTy y sExpr
+          let pfN ← withHypLam (mkBoolEq (mkApp cond sExpr) (mkConst ``Bool.false)) fun _ =>
+            proveViewRender fuel env ctxV ctxE sigmaTy msgTy n sExpr
+          return mkAppN (mkConst ``View.validIn_render_ifElse) #[sigmaTy, msgTy, ctxE, cond, y, n, sExpr, pfY, pfN]
+        if v.isAppOfArity ``V.forEach 9 then
+          let alpha := args[2]!; let tagE := args[3]!; let items := args[4]!
+          let key := args[5]!; let child := args[6]!; let attrs := args[7]!; let sigPrefix := args[8]!
+          if let some tagS := strLitVal? tagE then
+            if !Qed.isVoidTag tagS then
+              if let some childCtx := Qed.stepHtmlCtx ctxV tagS then
+                let childCtxE := htmlCtxExpr childCtx
+                let hstep := rflSomeHtmlCtx childCtxE
+                let hvoid := rflBoolFalse
+                let evalAttrs := expandVAttrMap sigmaTy msgTy sExpr 128 attrs
+                let hcell ← do
+                  if allAttrList isDefNonLocalCellAttr 128 evalAttrs then
+                    pure rflBoolTrue
+                  else if let some pFalse := proveAttrHasLocalCellFalse msgTy evalAttrs 128 then
+                    Meta.mkAppM ``congrArg #[mkConst ``Bool.not, pFalse]
+                  else
+                    emitValidMVar (mkBoolEqTrue (mkApp (mkConst ``Bool.not) (mkApp2 (mkConst ``Attr.hasLocalCell) msgTy evalAttrs)))
+                let hattrs ← proveAttrValidList env msgTy evalAttrs 128
+                let pfChild ← withHypLam alpha fun a =>
+                  proveViewRender fuel env childCtx childCtxE alpha msgTy child a
+                let lemTy ← Meta.inferType (mkAppN (mkConst ``V.validIn_render_forEach)
+                  #[alpha, sigmaTy, msgTy, ctxE, childCtxE, tagE, items, key, child, attrs, sigPrefix, sExpr,
+                    hstep, hvoid, hcell, hattrs, pfChild])
+                let hsigTy := lemTy.bindingDomain!
+                let hsig ←
+                  if (← Meta.isDefEq hsigTy (mkBoolEqTrue (mkConst ``Bool.true))) then
+                    pure rflBoolTrue
+                  else
+                    emitValidMVar hsigTy
+                return mkAppN (mkConst ``V.validIn_render_forEach)
+                  #[alpha, sigmaTy, msgTy, ctxE, childCtxE, tagE, items, key, child, attrs, sigPrefix, sExpr,
+                    hstep, hvoid, hcell, hattrs, pfChild, hsig]
+        if v.isAppOfArity ``View.mapScope 5 then
+          let σInner := args[1]!; let f := args[3]!; let subV := args[4]!
+          let pf ← proveViewRender fuel env ctxV ctxE σInner msgTy subV (mkApp f sExpr)
+          return mkAppN (mkConst ``Qed.View.validIn_render_mapScope_intro)
+            #[sigmaTy, σInner, msgTy, ctxE, f, subV, sExpr, pf]
+        if v.isAppOfArity ``ite 5 then
+          let c := args[1]!; let dec := args[2]!; let a := args[3]!; let b := args[4]!
+          let (pfT, pfF) ← proveIteBranches c
+            (proveViewRender fuel env ctxV ctxE sigmaTy msgTy a sExpr)
+            (proveViewRender fuel env ctxV ctxE sigmaTy msgTy b sExpr)
+          return mkAppN (mkConst ``Qed.View.validIn_render_ite_intro)
+            #[sigmaTy, msgTy, ctxE, c, dec, a, b, sExpr, pfT, pfF]
+        if let some fn := vFn? then
+          if (← isMatcherOrCases fn) then
+            return ← proveSplitSubgoal fuel env goalTy
+          if (← liftM (isUnfoldableUserDef env true fn)) then
+            if let some vUnf ← Meta.unfoldDefinition? v then
+              return ← proveViewRender fuel env ctxV ctxE sigmaTy msgTy vUnf sExpr
+        emitValidMVar goalTy
+
+  private def proveViewRenderEach (fuel : Nat) (env : Environment) (ctxV : HtmlCtx)
+      (ctxE sigmaTy msgTy vs sExpr : Expr) : ProveValidM Expr := do
+    let goalTy := mkBoolEqTrue (mkApp3 (mkConst ``Html.validListIn) msgTy ctxE
+      (mkApp4 (mkConst ``View.renderEach) sigmaTy msgTy vs sExpr))
+    match fuel with
+    | 0 => emitValidMVar goalTy
+    | fuel + 1 =>
+        let vs := vs.consumeMData.headBeta
+        if let .letE _ _ val body _ := vs then
+          return ← proveViewRenderEach fuel env ctxV ctxE sigmaTy msgTy (body.instantiate1 val) sExpr
+        let args := vs.getAppArgs
+        let vsFn? := vs.getAppFn.constName?
+        if vs.isAppOfArity ``List.nil 1 then
+          return mkAppN (mkConst ``Qed.View.validListIn_renderEach_nil) #[sigmaTy, msgTy, ctxE, sExpr]
+        if vs.isAppOfArity ``List.cons 3 then
+          let pfK ← proveViewRender fuel env ctxV ctxE sigmaTy msgTy args[1]! sExpr
+          let pfKs ← proveViewRenderEach fuel env ctxV ctxE sigmaTy msgTy args[2]! sExpr
+          return mkAppN (mkConst ``Qed.View.validListIn_renderEach_cons)
+            #[sigmaTy, msgTy, ctxE, args[1]!, args[2]!, sExpr, pfK, pfKs]
+        if vs.isAppOfArity ``View.mapScopeEach 5 then
+          let σInner := args[1]!; let f := args[3]!; let subVs := args[4]!
+          let pf ← proveViewRenderEach fuel env ctxV ctxE σInner msgTy subVs (mkApp f sExpr)
+          return mkAppN (mkConst ``Qed.View.validListIn_renderEach_mapScopeEach_intro)
+            #[sigmaTy, σInner, msgTy, ctxE, f, subVs, sExpr, pf]
+        if vs.isAppOfArity ``List.map 4 then
+          let α := args[0]!; let f := args[2]!; let xs := args[3]!
+          let pfF ← withHypLam α fun a => proveViewRender fuel env ctxV ctxE sigmaTy msgTy (mkApp f a) sExpr
+          return mkAppN (mkConst ``Qed.View.validListIn_renderEach_map_intro)
+            #[α, sigmaTy, msgTy, ctxE, xs, f, sExpr, pfF]
+        if (vsFn? == some `Qed.ForEachItems.toList || vsFn? == some ``Qed.mapList) then
+          if let some vsUnf ← Meta.unfoldDefinition? vs then
+            return ← proveViewRenderEach fuel env ctxV ctxE sigmaTy msgTy vsUnf sExpr
+        if let some fn := vsFn? then
+          if (← isMatcherOrCases fn) then
+            return ← proveSplitSubgoal fuel env goalTy
+        proveValidListIn fuel env ctxV ctxE msgTy (mkApp4 (mkConst ``View.renderEach) sigmaTy msgTy vs sExpr)
+
+  private def proveGoalMVar (fuel : Nat) (env : Environment) (g : MVarId) : ProveValidM Unit := do
+    if (← g.isAssigned) then return
+    match fuel with
+    | 0 => modify fun gs => gs.push g
+    | fuel + 1 =>
+        let (_, g') ← g.intros
+        g'.withContext do
+          let tgt := (← instantiateMVars (← g'.getType)).consumeMData.headBeta
+          if !tgt.isAppOfArity ``Eq 3 then
+            modify fun gs => gs.push g'
+            return
+          let lhs := (tgt.getAppArgs[1]!).consumeMData.headBeta
+          let rhs := (tgt.getAppArgs[2]!).consumeMData
+          if !rhs.isConstOf ``Bool.true then
+            modify fun gs => gs.push g'
+            return
+          let pf? : Option Expr ←
+            if lhs.isAppOfArity ``Html.valid 2 then
+              let lArgs := lhs.getAppArgs
+              some <$> proveValidIn fuel env defaultHtmlCtx defaultHtmlCtxExpr lArgs[0]! lArgs[1]!
+            else if lhs.isAppOfArity ``Html.validIn 3 then
+              let lArgs := lhs.getAppArgs
+              if let some ctxV ← htmlCtxVal? lArgs[1]! then
+                some <$> proveValidIn fuel env ctxV lArgs[1]! lArgs[0]! lArgs[2]!
+              else pure none
+            else if lhs.isAppOfArity ``Html.validListIn 3 then
+              let lArgs := lhs.getAppArgs
+              if let some ctxV ← htmlCtxVal? lArgs[1]! then
+                some <$> proveValidListIn fuel env ctxV lArgs[1]! lArgs[0]! lArgs[2]!
+              else pure none
+            else pure none
+          match pf? with
+          | some pf => g'.assign pf
+          | none    => modify fun gs => gs.push g'
+end
+
 elab "qedProveValidHtmlCore" : tactic => do
   evalTactic (← `(tactic| intros))
   let env ← getEnv
-  let toLemma (n : Name) : TacticM (TSyntax `Lean.Parser.Tactic.simpLemma) :=
-    `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
-  let fw ← (viewFrameworkUnfolds env).mapM toLemma
-  let onlySet ← ((viewFrameworkUnfolds env) ++ (viewValidSimpExtras env)).mapM toLemma
-  runHtmlSimpLoop 6 onlySet true
+  let goals ← getGoals
+  let mut residuals : Array MVarId := #[]
+  for g in goals do
+    let (_, rem) ← (proveGoalMVar 2048 env g).run #[]
+    residuals := residuals ++ rem
+  setGoals residuals.toList
   if !(← getGoals).isEmpty then
-    runHtmlSimpLoop 4 fw false
-  if !(← getGoals).isEmpty then
-    try evalTactic (← `(tactic| all_goals (first | rfl | decide))) catch _ => pure ()
+    let toLemma (n : Name) : TacticM (TSyntax `Lean.Parser.Tactic.simpLemma) :=
+      `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+    let fw ← (viewFrameworkUnfolds env).mapM toLemma
+    let onlySet ← ((viewFrameworkUnfolds env) ++ (viewValidSimpExtras env)).mapM toLemma
+    runHtmlSimpLoop 4 onlySet true
+    if !(← getGoals).isEmpty then
+      runHtmlSimpLoop 2 fw false
+    if !(← getGoals).isEmpty then
+      try evalTactic (← `(tactic| all_goals (first | rfl | decide | (split <;> simp)))) catch _ => pure ()
 
 elab "qedProveValidHtml" : tactic => do
   evalTactic (← `(tactic| qedProveValidHtmlCore))

@@ -63,6 +63,13 @@ component Counter where
 Both pure updates and effectful handlers (which return `(model, cmd)`) use the exact same
 syntax—Qed automatically projects the next model out of `(model, cmd)`.
 
+## Full-stack client–server invariants (`requires` & `ensures`)
+
+When a client `component` invokes a `server` `fn` via `await`, Qed connects server contracts and component invariants in both directions:
+
+- **Client `invariant` -> Server `requires`:** Component `invariant`s (as well as literals, `when` guards, `if` branches, and `Field`/`Ensured` values) are automatically available as hypotheses to discharge every server parameter `requires` clause at compile time.
+- **Server `ensures` -> Client `invariant`:** Server postconditions (`ensures expr`) are encoded via zero-trust `Ensured α p` (`FromProto` re-verifies `p` on untrusted bytes) and automatically unpacked into continuation hypotheses across `let x := await Server.fn(...) catch ...`, so client state invariants can rely on server-guaranteed postconditions (see [`Examples/CloudBooks.lean`](../Examples/CloudBooks.lean) and [`Examples/ServerChecks.lean`](../Examples/ServerChecks.lean)).
+
 **Custom proof (`:= by`).** When a property quantifies over a collection (`Array` or `List`) or
 relies on a domain lemma that automation cannot guess, attach a Lean tactic proof with `:= by`.
 Inside a `component`, `init` is discharged automatically and `update` is in scope, so the proof

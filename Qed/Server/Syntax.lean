@@ -14,10 +14,14 @@ class SrvVal (α : Type) (β : outParam Type) where
   val : α → β
 
 @[inline] instance {α : Type} {p : α → Prop} : SrvVal (Qed.Field p) α := ⟨Qed.Field.val⟩
+@[inline] instance {α : Type} {p : α → Prop} : SrvVal (Qed.Ensured α p) α := ⟨Qed.Ensured.val⟩
 @[inline] instance (priority := low) {α : Type} : SrvVal α α := ⟨id⟩
 
 @[simp] theorem SrvVal.val_field {α : Type} {p : α → Prop} (f : Qed.Field p) :
     SrvVal.val f = f.val := rfl
+
+@[simp] theorem SrvVal.val_ensured {α : Type} {p : α → Prop} (e : Qed.Ensured α p) :
+    SrvVal.val e = e.val := rfl
 
 @[simp] theorem SrvVal.val_id {α : Type} (x : α) :
     SrvVal.val x = x := rfl
@@ -67,6 +71,7 @@ private def kw (s : String) : Parser :=
   atomic (symbol "s!" >> checkNoWsBefore "") >> interpolatedStr (categoryParser `srvExpr 0)
 @[srvExpr_parser] def srvArrLit  : Parser := leading_parser:maxPrec "[" >> sepBy (categoryParser `srvExpr 0) "," >> "]"
 @[srvExpr_parser] def srvParen   : Parser := leading_parser:maxPrec "(" >> sepBy (categoryParser `srvExpr 0) "," >> ")"
+@[srvExpr_parser] def srvDotIdent : Parser := leading_parser:maxPrec atomic ("." >> checkNoWsBefore "") >> ident
 @[srvExpr_parser] def srvIdent   : Parser := leading_parser:maxPrec ident
 
 -- Postfix operators (`noWs` prevents cross-line ambiguity in indentation blocks!)
@@ -220,13 +225,18 @@ def srvParam : Parser :=
 def srvRequiresLine : Parser :=
   node `Qed.Server.srvRequiresLine (withPosition (atomic (identEq `requires) >> categoryParser `srvExpr 0))
 
+def srvEnsuresLine : Parser :=
+  node `Qed.Server.srvEnsuresLine (withPosition (atomic (identEq `ensures) >> categoryParser `srvExpr 0))
+
+def srvContractLine : Parser := srvRequiresLine <|> srvEnsuresLine
+
 @[srvClause_parser] def srvFnClause : Parser := leading_parser
   withPosition (
     atomic (identEq `fn) >> ident >> checkNoWsBefore "" >> "(" >> sepBy srvParam "," >> ")" >>
     " -> " >> categoryParser `srvType 0 >>
     checkColGt "expected indented function body" >>
     withPosition (
-      many (atomic (checkColGe "requires" >> srvRequiresLine)) >>
+      many (atomic (checkColGe "contract" >> srvContractLine)) >>
       many1 (checkColGe "statement" >> categoryParser `srvStmt 0)))
 
 @[command_parser] def serverCmd : Parser := leading_parser

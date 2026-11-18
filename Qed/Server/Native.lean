@@ -215,7 +215,7 @@ def runFullstackWithDispatch {Model Msg : Type}
             | .error e => return .error e.message
           else
             return .error s!"SSR unknown binary RPC endpoint: {url}"
-      let rawHtml ← app.ssrRenderNativeBytes pathAndQuery title ssrDispatchBytes
+      let rawHtml ← app.ssrRenderNativeBytes pathAndQuery title ssrDispatchBytes (sessionUser := ctx.userId)
       let finalHtml := if devMode then injectDevReload rawHtml else rawHtml
       return (200, "text/html; charset=utf-8", if method == "HEAD" then ByteArray.empty else finalHtml)
     else

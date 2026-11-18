@@ -28,6 +28,7 @@ structure ComponentInfo where
   mountable   : Bool := true
   hasLocalDef : Bool := false
   rootTag?    : Option String
+  usedRpcs    : Array (String × String) := #[]
 deriving Inhabited
 
 initialize componentRegistry :
@@ -82,8 +83,13 @@ def compMatchAlt : Parser := leading_parser
 
 @[compStmt_parser] def actionNoopStmt : Parser := leading_parser withPosition (atomic ("(" >> ")"))
 @[compStmt_parser] def actionReturnStmt : Parser := leading_parser withPosition (atomic (symbol "return"))
+@[compStmt_parser] def actionLetAwaitStmt : Parser := leading_parser
+  withPosition (
+    atomic ("let " >> ident >> optional (" : " >> termParser) >> " := " >> identEq `await) >>
+    ident >> "(" >> sepBy termParser "," >> ")" >>
+    optional (checkColGe >> symbol "catch" >> many1 (checkColGe >> compMatchAlt)))
 @[compStmt_parser] def actionLetStmt : Parser := leading_parser
-  withPosition ("let " >> ident >> optional (" : " >> termParser) >> " := " >> termParser)
+  withPosition ("let " >> ident >> optional (" : " >> termParser) >> " := " >> notFollowedBy (identEq `await) "await" >> termParser)
 @[compStmt_parser] def actionPerformStmt : Parser := leading_parser
   withPosition (atomic (nonReservedSymbol "perform" (includeIdent := true)) >> checkColGt >> termParser)
 @[compStmt_parser] def actionSendStmt : Parser := leading_parser
@@ -97,8 +103,10 @@ def compMatchAlt : Parser := leading_parser
                 compStmtSeq >> optional (atomic (checkColGe >> "else ") >> compStmtSeq))
 @[compStmt_parser] def actionMatchStmt : Parser := leading_parser
   withPosition ("match " >> sepBy1 termParser "," >> " with" >> many1 (checkColGe >> compMatchAlt))
+@[compStmt_parser] def actionAssignAwaitStmt : Parser := leading_parser
+  withPosition (atomic (ident >> " := " >> identEq `await) >> ident >> "(" >> sepBy termParser "," >> ")")
 @[compStmt_parser] def actionAssignStmt : Parser := leading_parser
-  withPosition (atomic (ident >> (symbol ":=" <|> symbol "+=" <|> symbol "-=")) >> termParser)
+  withPosition (atomic (ident >> (symbol ":=" <|> symbol "+=" <|> symbol "-=")) >> notFollowedBy (identEq `await) "await" >> termParser)
 
 def compFieldClause : Parser := leading_parser
   withPosition (
@@ -110,6 +118,8 @@ def compChildrenClause : Parser := leading_parser withPosition (atomic (identEq 
 def compKeyClause      : Parser := leading_parser withPosition (atomic (identEq `key) >> ident)
 def compEventClause    : Parser := leading_parser
   withPosition (atomic (identEq `event) >> ident >> many actionParam)
+def compSessionClause  : Parser := leading_parser
+  withPosition (atomic (identEq `session) >> ident >> optional (" : " >> termParser))
 def compStartClause    : Parser := leading_parser
   withPosition (atomic (identEq `start) >> checkColGt >> termParser)
 def compRouteClause    : Parser := leading_parser
@@ -145,7 +155,7 @@ def compInvariantClause : Parser := leading_parser
 def compInvAny : Parser := compForEachInvClause <|> compInvariantClause
 
 def compClause : Parser :=
-  compFieldClause <|> compChildrenClause <|> compKeyClause <|>
+  compSessionClause <|> compFieldClause <|> compChildrenClause <|> compKeyClause <|>
   compEventClause <|> compStartClause <|> compRouteClause <|>
   compPortOutClause <|> compPortInClause <|> compQueryClause <|>
   compActionClause <|> compInvAny
@@ -189,7 +199,10 @@ def unpackSeq (seqStx : Syntax) : Array Syntax :=
   else #[seqStx]
 
 partial def hasPerformNode (stx : Syntax) : Bool :=
-  stx.getKind == ``actionPerformStmt || stx.getArgs.any hasPerformNode
+  stx.getKind == ``actionPerformStmt ||
+  stx.getKind == ``actionLetAwaitStmt ||
+  stx.getKind == ``actionAssignAwaitStmt ||
+  stx.getArgs.any hasPerformNode
 
 partial def hasReturnStmt (stx : Syntax) : Bool :=
   stx.getKind == ``actionReturnStmt || stx.getArgs.any hasReturnStmt

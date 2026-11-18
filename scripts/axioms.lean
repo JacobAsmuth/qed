@@ -240,3 +240,15 @@ import Examples.CloudBooks
 #print axioms Qed.App.guardRehydrate_complete
 #print axioms Qed.ElemStateEquiv.dispatchInput
 #print axioms Qed.View.DomClean_forEach
+
+-- Client-Server RPC Preconditions, Postconditions (`Ensured`), & Fullstack Endpoint Closure
+#print axioms Qed.Proto.encode_ensured
+#print axioms Qed.ssr_rpc_endpoint_routed
+#print axioms Qed.ssr_rpc_closure_complete
+#print axioms Qed.Server.concurrent_schedule_ensures
+#print axioms CloudBooks.Catalog.findAt_ensures
+#print axioms CloudBooks.Catalog.order_ensures
+#print axioms CloudBooks.Catalog.addBook_ensures
+#print axioms CloudBooks.Storefront.orderedMatchesSlot
+#print axioms CloudBooks.Main.rpc_endpoints_valid
+#print axioms CloudBooks.Main.ssr_rpc_closure_complete

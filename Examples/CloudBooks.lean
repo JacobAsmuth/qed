@@ -56,7 +56,8 @@ server Catalog
     return books
 
   fn findAt(idx: Nat) -> Book?
-    if idx < books.size
+    ensures result.slot == idx
+    if idx < books.size && books[idx].slot == idx
       return books[idx]
     return none
 
@@ -66,11 +67,14 @@ server Catalog
   fn order(idx: Nat, qty: Nat) -> Book!
     requires ctx.userId != none
     requires 1 <= qty && qty <= 50
+    ensures result.slot == idx && result.stock < 10000
     let bookId = atomic
       if idx >= books.size
-        return fail("book not found")
+        return fail(.notFound)
+      if books[idx].slot != idx
+        return fail(.notFound)
       if books[idx].stock < qty
-        return fail("out of stock")
+        return fail(.outOfStock)
       return books[idx].id
     let _ = await CloudflareD1.query(cfAccount, d1Db, D1Query(
       sql = "INSERT INTO orders (book_id, qty) VALUES (?, ?)",
@@ -78,9 +82,11 @@ server Catalog
       D1Result(success = false)
     let updated = atomic
       if idx >= books.size
-        return fail("book not found")
+        return fail(.notFound)
+      if books[idx].slot != idx
+        return fail(.notFound)
       if books[idx].stock < qty
-        return fail("out of stock")
+        return fail(.outOfStock)
       books[idx].stock -= qty
       totalOrders += 1
       return books[idx]
@@ -91,10 +97,11 @@ server Catalog
     requires 1 <= id.length && id.length <= 64
     requires 1 <= title.length && title.length <= 200
     requires stock <= 10000
+    ensures result.id == id && result.stock == stock
     let _ = await GcpStorage.upload(gcsBucket, "covers/" ++ id ++ ".png", coverPng)?
     let created = atomic
       if books.size >= 1000
-        return fail("catalog full")
+        return fail(.catalogFull)
       let nb = Book(slot = books.size, id = id, title = title, stock = stock)
       books.push(nb)
       return nb
@@ -127,29 +134,37 @@ component BookDetail where
     </article>
 
 component Storefront where
+  session user
   route : R := .catalog
-    | .catalog    => books := .loading, perform (Catalog.list (books := ·))
-    | .detail idx => current := .loading, perform (Catalog.findAt idx (current := ·))
-  state books     : Resource (Array Book) := .idle
-  state current   : Resource Book := .idle
-  state statusMsg := ""
+    | .catalog    => books := await Catalog.list()
+    | .detail idx => current := await Catalog.findAt(idx)
+  state books       : Resource (Array Book) := .idle
+  state current     : Resource Book := .idle
+  state lastSlot    : Option Nat := none
+  state lastOrdered : Option Book := none
+  state statusMsg   := ""
 
-  action orderOne (idx : Nat) =>
+  invariant orderedMatchesSlot :
+    ∀ b idx, lastOrdered = some b → lastSlot = some idx → b.slot.val = idx
+
+  action orderOne (idx : Nat) when user.isSome =>
     statusMsg := "Ordering…"
-    perform (Catalog.order idx 1 (.ordered idx))
-
-  action ordered (idx : Nat) (r : Resource Book) =>
-    match r with
-    | .ok updated =>
-        books := books.map fun arr => if h : idx < arr.size then arr.set idx updated else arr
-        statusMsg := s!"Ordered {updated.title}"
-    | .failed err => statusMsg := s!"Order failed: {err}"
-    | _ => ()
+    let updated := await Catalog.order(idx, 1) catch
+      | .outOfStock => statusMsg := "Order failed: out of stock"
+      | .notFound   => statusMsg := "Order failed: book not found"
+      | .failed err => statusMsg := s!"Order failed: {err}"
+    books := books.map fun arr => if h : idx < arr.size then arr.set idx updated else arr
+    lastSlot := some idx
+    lastOrdered := some updated
+    statusMsg := s!"Ordered {updated.title}"
 
   view =>
     <div {shell} class="cloudbooks">
       <nav class="topnav">
         <a href={R.catalog} class="home-link">CloudBooks</a>
+        {match user with
+         | some u => <span class="session-user">{u}</span>
+         | none   => <span class="session-guest">Guest</span>}
       </nav>
       <p class="status">{statusMsg}</p>
       {match route with

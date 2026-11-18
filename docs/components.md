@@ -48,27 +48,29 @@ Compose them directly inside JSX—including inside `<ul>`, `<tr>`, or `<select>
 </Card>
 ```
 
-## Unified stateful & effectful `component` (`route`, `start`, `perform`, `ephemeral`, `port`, `query`)
+## Unified stateful & effectful `component` (`session`, `route`, `start`, `await`, `ephemeral`, `port`, `query`)
 
 Top-level applications and reusable stateful components use the same `component` syntax:
 
 ```lean
 component Storefront where
+  session user
   route : R := .catalog
-    | .catalog    => books := .loading, perform (Catalog.list (books := ·))
-    | .detail idx => current := .loading, perform (Catalog.findAt idx (current := ·))
-  state books     : Resource (Array Book) := .idle
-  state current   : Resource Book := .idle
-  ephemeral hover := false
+    | .catalog    => books := await Catalog.list()
+    | .detail idx => current := await Catalog.findAt(idx)
+  state books       : Resource (Array Book) := .idle
+  state current     : Resource Book := .idle
+  state statusMsg   := ""
+  ephemeral hover   := false
 
-  action orderOne (idx : Nat) =>
-    perform (Catalog.order idx 1 (.ordered idx))
-
-  action ordered (idx : Nat) (r : Resource Book) =>
-    match r with
-    | .ok updated =>
-        books := books.map fun arr => if h : idx < arr.size then arr.set idx updated else arr
-    | _ => ()
+  action orderOne (idx : Nat) when user.isSome =>
+    statusMsg := "Ordering…"
+    let updated := await Catalog.order(idx, 1) catch
+      | .outOfStock => statusMsg := "Order failed: out of stock"
+      | .notFound   => statusMsg := "Order failed: book not found"
+      | .failed err => statusMsg := s!"Order failed: {err}"
+    books := books.map fun arr => if h : idx < arr.size then arr.set idx updated else arr
+    statusMsg := s!"Ordered {updated.title}"
 
   view =>
     <Await of={books} as={arr} err={e} loading={<p>Loading…</p>} failed={<p class="error">{e}</p>}>
@@ -76,8 +78,9 @@ component Storefront where
     </Await>
 ```
 
-- **`(field := ·)`** creates a typed setter callback (`T → Msg`) anywhere inside `perform`,
-  `start`, or `view` (for example `Catalog.list (books := ·)`), and schemas provide `<Book.Form bind={draft} onSubmit={.submit}/>`.
+- **`session user`** declares an `Option String` field hydrated automatically from the verified server session during SSR (`App.onSession`) so actions requiring `ctx.userId != none` can guard with `when user.isSome =>`.
+- **`await` and `catch`** allow direct C-style async RPC calls inside `route` and `action` blocks: `field := await Server.fn(...)` transitions `field : Resource α` to `.loading` and populates it on completion, while `let x := await Server.fn(...) catch | .tag => ... | .failed err => ...` flushes pre-`await` assignments, suspends, enforces exhaustive domain error handling, and resumes in a synthesized continuation message with the server's `ensures` proof in scope.
+- **`(field := ·)` and `perform`** remain available for lower-level `Cmd` composition in `start`, `route`, or `action` (for example `perform (Catalog.list (books := ·))`), and schemas provide `<Book.Form bind={draft} onSubmit={.submit}/>`.
 - **`route`** binds the current URL route into state (defaulting the field name to `route`) and runs optional match arms on navigation.
 - **`start`** schedules initial commands when the app mounts.
 - **`ephemeral`** excludes client-only fields from SSR dehydration and resets them to their defaults on hydration (all other `state` fields auto-dehydrate by default).

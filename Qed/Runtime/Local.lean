@@ -98,6 +98,14 @@ def Attr.localInit {msg S : Type} [ToJson S] (a : Attr msg) (init : S) : Attr ms
     (a.localInit init).valid = a.valid := by
   cases a <;> rfl
 
+theorem Attr.valid_localProps_intro {msg P : Type} [ToJson P] (a : Attr msg) (props : P)
+    (ha : a.valid = true) : (a.localProps props).valid = true := by
+  rw [Attr.valid_localProps]; exact ha
+
+theorem Attr.valid_localInit_intro {msg S : Type} [ToJson S] (a : Attr msg) (init : S)
+    (ha : a.valid = true) : (a.localInit init).valid = true := by
+  rw [Attr.valid_localInit]; exact ha
+
 @[simp] theorem Attr.valid_localMount (component key : String) :
     (localMount component key : Attr msg).valid = true := rfl
 

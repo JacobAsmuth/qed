@@ -229,6 +229,7 @@ try {
     await page.goto(`${srvBase}/`, { waitUntil: 'load' });
     await page.waitForSelector('.book-row', { timeout: 10000 });
     check('zero RPC refetch on initial SSR hydration', rpcCalls.length, 0);
+    check('SSR hydrated authenticated session user', await page.$eval('.session-user', (el) => el.textContent.trim()), 'alice');
     check('hydrated catalog shows 3 books (including plfa)', await page.$$eval('.book-row', (els) => els.length), 3);
     check('hydrated DOM shows Stock: 3', await page.$eval('.book-row .book-stock', (el) => el.textContent.trim()), 'Stock: 3');
 
@@ -237,6 +238,16 @@ try {
     check('browser sent binary Protobuf RPC on click', rpcCalls.length, 1);
     check('browser RPC content-type is application/x-protobuf', rpcCalls[0]?.contentType, 'application/x-protobuf');
     check('live DOM stock updated to Stock: 2', await page.$eval('.book-row .book-stock', (el) => el.textContent.trim()), 'Stock: 2');
+
+    await page.click('.book-row .order-btn');
+    await page.waitForFunction(() => document.querySelector('.book-row .book-stock')?.textContent?.trim() === 'Stock: 1', { timeout: 5000 });
+    await page.click('.book-row .order-btn');
+    await page.waitForFunction(() => document.querySelector('.book-row .book-stock')?.textContent?.trim() === 'Stock: 0', { timeout: 5000 });
+    check('live DOM stock depleted to Stock: 0', await page.$eval('.book-row .book-stock', (el) => el.textContent.trim()), 'Stock: 0');
+
+    await page.click('.book-row .order-btn');
+    await page.waitForFunction(() => document.querySelector('.status')?.textContent?.trim() === 'Order failed: out of stock', { timeout: 5000 });
+    check('typed fail(.outOfStock) caught by client `.outOfStock` arm', await page.$eval('.status', (el) => el.textContent.trim()), 'Order failed: out of stock');
   });
 } finally {
   srvProc.kill('SIGTERM');

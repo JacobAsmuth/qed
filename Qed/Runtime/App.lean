@@ -13,6 +13,7 @@ structure App (Model : Type) (Msg : Type) where
   update         : Model → Msg → Model × Cmd Msg
   template       : View Model Msg
   onUrlChange    : Option (String → Msg) := none
+  onSession      : Option (Option String → Msg) := none
   locals         : List LocalDef := []
   onPort         : Option (String → String → Option Msg) := none
   dehydrate      : Model → String := fun _ => ""
@@ -34,52 +35,54 @@ namespace Internal
 def mkApp (init : Model) (update : Model → Msg → Model × Cmd Msg)
     (template : View Model Msg) (start : Cmd Msg := .none) (locals : List LocalDef := [])
     (styles : List Style := []) (onPort : Option (String → String → Option Msg) := none)
+    (onSession : Option (Option String → Msg) := none)
     (valid_view : ∀ m, Html.valid (View.render template m) = true := by qedProveValidHtml) :
     App Model Msg :=
-  { init := (init, start), update, template, locals, styles, onPort, valid_view }
+  { init := (init, start), update, template, locals, styles, onPort, onSession, valid_view }
 
 def mkRoutedApp {R : Type} [Router R] [Inhabited R]
     (init : Model) (update : Model → Msg → Model × Cmd Msg) (template : View Model Msg)
     (onRoute : R → Msg) (start : Cmd Msg := .none) (locals : List LocalDef := [])
     (styles : List Style := []) (onPort : Option (String → String → Option Msg) := none)
+    (onSession : Option (Option String → Msg) := none)
     (valid_view : ∀ m, Html.valid (View.render template m) = true := by qedProveValidHtml) :
     App Model Msg :=
-  { mkApp init update template start locals styles onPort valid_view with
+  { mkApp init update template start locals styles onPort onSession valid_view with
     onUrlChange := some (fun p => onRoute ((Router.fromURL p).getD default)) }
 
 def App.setUpdate (app : App Model Msg) (u : Model → Msg → Model × Cmd Msg) : App Model Msg :=
   { app with update := u }
 
 @[simp] theorem mkApp_init (init : Model) (u : Model → Msg → Model × Cmd Msg)
-    (t : View Model Msg) (s l st p hv) :
-    (mkApp init u t s l st p hv).init = (init, s) := rfl
+    (t : View Model Msg) (s l st p os hv) :
+    (mkApp init u t s l st p os hv).init = (init, s) := rfl
 @[simp] theorem mkApp_update (init : Model) (u : Model → Msg → Model × Cmd Msg)
-    (t : View Model Msg) (s l st p hv) :
-    (mkApp init u t s l st p hv).update = u := rfl
+    (t : View Model Msg) (s l st p os hv) :
+    (mkApp init u t s l st p os hv).update = u := rfl
 @[simp] theorem mkApp_template (init : Model) (u : Model → Msg → Model × Cmd Msg)
-    (t : View Model Msg) (s l st p hv) :
-    (mkApp init u t s l st p hv).template = t := rfl
+    (t : View Model Msg) (s l st p os hv) :
+    (mkApp init u t s l st p os hv).template = t := rfl
 @[simp] theorem mkApp_dehydrate (init : Model) (u : Model → Msg → Model × Cmd Msg)
-    (t : View Model Msg) (s l st p hv) :
-    (mkApp init u t s l st p hv).dehydrate = fun _ => "" := rfl
+    (t : View Model Msg) (s l st p os hv) :
+    (mkApp init u t s l st p os hv).dehydrate = fun _ => "" := rfl
 @[simp] theorem mkApp_rehydrate (init : Model) (u : Model → Msg → Model × Cmd Msg)
-    (t : View Model Msg) (s l st p hv) :
-    (mkApp init u t s l st p hv).rehydrate = fun _ => none := rfl
+    (t : View Model Msg) (s l st p os hv) :
+    (mkApp init u t s l st p os hv).rehydrate = fun _ => none := rfl
 @[simp] theorem mkRoutedApp_init {R : Type} [Router R] [Inhabited R]
-    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p hv) :
-    (mkRoutedApp init u t r s l st p hv).init = (init, s) := rfl
+    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) :
+    (mkRoutedApp init u t r s l st p os hv).init = (init, s) := rfl
 @[simp] theorem mkRoutedApp_update {R : Type} [Router R] [Inhabited R]
-    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p hv) :
-    (mkRoutedApp init u t r s l st p hv).update = u := rfl
+    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) :
+    (mkRoutedApp init u t r s l st p os hv).update = u := rfl
 @[simp] theorem mkRoutedApp_template {R : Type} [Router R] [Inhabited R]
-    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p hv) :
-    (mkRoutedApp init u t r s l st p hv).template = t := rfl
+    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) :
+    (mkRoutedApp init u t r s l st p os hv).template = t := rfl
 @[simp] theorem mkRoutedApp_dehydrate {R : Type} [Router R] [Inhabited R]
-    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p hv) :
-    (mkRoutedApp init u t r s l st p hv).dehydrate = fun _ => "" := rfl
+    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) :
+    (mkRoutedApp init u t r s l st p os hv).dehydrate = fun _ => "" := rfl
 @[simp] theorem mkRoutedApp_rehydrate {R : Type} [Router R] [Inhabited R]
-    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p hv) :
-    (mkRoutedApp init u t r s l st p hv).rehydrate = fun _ => none := rfl
+    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) :
+    (mkRoutedApp init u t r s l st p os hv).rehydrate = fun _ => none := rfl
 @[simp] theorem App.setUpdate_dehydrate (app : App Model Msg) (u : Model → Msg → Model × Cmd Msg) :
     (App.setUpdate app u).dehydrate = app.dehydrate := rfl
 @[simp] theorem App.setUpdate_rehydrate (app : App Model Msg) (u : Model → Msg → Model × Cmd Msg) :

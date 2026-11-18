@@ -19,10 +19,10 @@ A Qed program is composed from declarative blocks that share types and proofs en
 | `schema` | Fields with `where` refinement predicates | Editable `Draft`, proof-carrying `Field` records, `<Schema.Form>`, `canSubmit_iff`, plus `LawfulJson` and `LawfulProto` codecs. |
 | `router` | Named routes and URL patterns | Inductive route type, `Router` instance, proven `round_trip`, and `isSafeUrl` guarantees for links and navigation. |
 | `css` / `token` / `theme` | Typed style rules and design tokens | Scoped content-hashed CSS classes auto-collected into `<style id="qed-styles">`, queryable by view invariants. |
-| `component` | `prop`, `bind`, `slot`, `children`, `state`, `ephemeral`, `collection`, `route`, `start`, `port`, `query`, `action`, `invariant`, and JSX `view` | Typed `Msg`, `init`, `update`, fine-grained `View` template, `App`, `Html.valid` proof, `Dehydrate` SSR codec, and state/styling invariant proofs. |
+| `component` | `session`, `prop`, `bind`, `slot`, `children`, `state`, `ephemeral`, `collection`, `route`, `start`, `port`, `query`, `action`, `await`/`catch`, `invariant`, and JSX `view` | Typed `Msg`, `init`, `update`, fine-grained `View` template, `App`, SSR `session` hydration, client RPC `requires` proofs, exhaustive domain `catch`, `Html.valid` proof, `Dehydrate` SSR codec, and state/styling invariant proofs. |
 | `external` | Base URL, auth schemes, and typed HTTP endpoints | Typed client functions with origin pinning, CRLF-sanitized headers, JSON/Protobuf/Bytes codecs, and SSRF-guarded `Webhook` calls. |
-| `server` | `env`, `state`, `invariant` rules, and `fn` handlers with `requires`, `atomic`, and `await` | Transactional `MonadServer` and `MonadAtomic` handlers, Protobuf RPC dispatchers, and proofs of state preservation, auth checks, and linearizability. |
-| `fullstack` | A `server` paired with a `client` component or `App` | Typed client-to-server binary Protobuf RPCs under `/_qed/rpc/…`, client-leak isolation, and a unified native server + client build. |
+| `server` | `env`, `state`, `invariant` rules, and `fn` handlers with `requires`, `ensures`, `atomic`, `fail(.tag)`, and `await` | Transactional `MonadServer` and `MonadAtomic` handlers, inferred domain error enums, `ProgEnsures` postconditions, Protobuf RPC dispatchers, and proofs of state preservation, auth checks, and linearizability. |
+| `fullstack` | A `server` paired with a `client` component or `App` | Typed client-to-server binary Protobuf RPCs under `/_qed/rpc/…`, `rpc_endpoints_valid` / `ssr_rpc_closure_complete` closure theorems, client-leak isolation, and a unified native server + client build. |
 
 For component composition—pure wrappers, hoisted stateful sub-components, keyed `LocalDef` cells,
 and `collection`s—see [Components](components.md). For writing and proving rules over state,
@@ -82,13 +82,17 @@ browser restores server-rendered state without re-fetching startup data; mark cl
 
 ### Checked by Lean's kernel
 
-- **State & concurrency invariants:** Component `invariant`s prove preservation across `init`
+- **State, contracts, & concurrency invariants:** Component `invariant`s prove preservation across `init`
   (including mountable components with `prop`s), every action, `for_each` child collections, and
   SSR `Dehydrate` slices (`dehydrate_inv`), while `App.guardRehydrate` enforces the invariant on
-  untrusted client payloads (`rehydrate_inv`). Server `invariant`s prove initial validity,
-  single-step preservation, two-state `old` monotonicity rules, `mutating ... requires ...`
-  authorization policies, read-only non-mutation, and multi-core linearizability via transactional
-  `atomic` blocks with rollback on error.
+  untrusted client payloads (`rehydrate_inv`). Server `invariant`s and `fn` contracts prove initial
+  validity, single-step preservation, two-state `old` monotonicity rules, `mutating ... requires ...`
+  authorization policies, read-only non-mutation, `ensures` postconditions (`ProgEnsures` and
+  `concurrent_schedule_ensures`), and multi-core linearizability via transactional `atomic` blocks
+  with rollback on error. Client RPC calls automatically prove server `requires` preconditions (and
+  SSR-hydrated `session` auth) at every call site, enforce exhaustive `catch` handling of inferred
+  `fail(.tag)` domain errors, and carry zero-trust re-verified `Ensured` postconditions back into
+  client component invariants.
 - **Views, HTML5 validity, and XSS closure:** Every `component` carries an automatic `valid_view`
   proof over `Html.valid` banning invalid HTML5 nesting such as `<div>` inside `<p>` or nested
   `<button>`s, children inside void elements, `<script>`/`<base>`/`<object>`/`<embed>` tags,

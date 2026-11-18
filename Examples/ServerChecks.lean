@@ -146,4 +146,110 @@ server BadMutatingAuthInv
     items.push(x)
     return items.size
 
+-- 11. Rejects false server `ensures` postcondition at compile time
+/--
+error: server postcondition `ensures result > 10` could not be proved for `compute`.
+Remaining proof obligation:
+  5 > 10
+Ensure every successful return path establishes `result > 10`.
+-/
+#guard_msgs in
+server BadServerEnsures
+  fn compute(x: Nat) -> Nat
+    ensures result > 10
+    return 5
+
+-- Valid helper servers for client RPC contract, session auth, domain catch, and closure tests
+server CheckedSrv
+  fn buy(qty: Nat) -> Nat!
+    requires ctx.userId != none
+    requires 1 <= qty && qty <= 50
+    ensures result == qty && 1 <= result && result <= 50
+    if qty == 49
+      return fail(.soldOut)
+    if qty == 50
+      return fail(.limitReached)
+    return qty
+
+server OtherSrv
+  fn ping() -> Nat
+    return 1
+
+-- 12. Rejects client RPC call when server parameter `requires` cannot be proved
+/--
+error: RPC `CheckedSrv.buy` precondition `1 <= qty && qty <= 50` could not be proved at this call site.
+Supply literals, guard with `when`/`if`, pass refined `Field`/`Ensured` values, or declare a component `invariant`.
+-/
+#guard_msgs in
+component BadClientRequiresParam where
+  session user
+  state last : Nat := 0
+  action go when user.isSome =>
+    let n := await CheckedSrv.buy(0) catch
+      | _ => ()
+    last := n
+  view => <span>{last}</span>
+
+-- 13. Rejects client RPC call requiring `ctx.userId != none` without authenticated `session`
+/--
+error: RPC `CheckedSrv.buy` requires an authenticated session (`ctx.userId != none`), but component `BadClientRequiresAuth` has no `session` state.
+Add `session user` and guard the call with `when user.isSome =>` or `if user.isSome then ...`.
+-/
+#guard_msgs in
+component BadClientRequiresAuth where
+  state last : Nat := 0
+  action go =>
+    let n := await CheckedSrv.buy(1) catch
+      | _ => ()
+    last := n
+  view => <span>{last}</span>
+
+-- 14. Rejects non-exhaustive client `await ... catch` missing a typed `fail(.tag)` branch
+/--
+error: `await CheckedSrv.buy(...)` has unhandled domain error(s): .limitReached; handle them with `catch | .tag => ...`
+-/
+#guard_msgs in
+component BadClientNonExhaustiveCatch where
+  session user
+  state last : Nat := 0
+  action go when user.isSome =>
+    let n := await CheckedSrv.buy(1) catch
+      | .soldOut   => ()
+      | .failed _  => ()
+    last := n
+  view => <span>{last}</span>
+
+-- 15. Rejects `fullstack` whose client calls an RPC on an unmounted server
+component CallsOther where
+  state v : Resource Nat := .idle
+  action go =>
+    v := await OtherSrv.ping()
+  view => <span>ok</span>
+
+/--
+error: `fullstack BadFs` mounts `server CheckedSrv`, but client `CallsOther` calls RPC `OtherSrv.ping` on unmounted server `OtherSrv`
+-/
+#guard_msgs in
+fullstack BadFs
+  server CheckedSrv
+  client CallsOther
+  title "Bad"
+
+-- 16. Component `invariant` discharges server parameter `requires`, and server `ensures` flows into client `invariant`
+component InvariantSatisfiesRequires where
+  session user
+  state qty    : Nat := 5
+  state bought : Nat := 0
+  invariant qtyInBounds : 1 ≤ qty, qty ≤ 50
+  invariant boughtValid : bought = 0 ∨ (1 ≤ bought ∧ bought ≤ 50)
+  action setQty (q : Nat) when (1 ≤ q ∧ q ≤ 50) =>
+    qty := q
+  action purchase when user.isSome =>
+    let got := await CheckedSrv.buy(qty) catch
+      | .soldOut      => ()
+      | .limitReached => ()
+      | .failed _     => ()
+    bought := got
+  view => <span>{bought}</span>
+
 end ServerChecks

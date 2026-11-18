@@ -577,6 +577,92 @@ end
   cases ctx with
   | mk mode _ _ _ => cases mode <;> simp [validTextIn, containsCloseSeq, containsCloseSeqLoop]
 
+theorem Attr.validList_cons_intro {msg : Type} (a : Attr msg) (as : List (Attr msg))
+    (ha : a.valid = true) (has : Attr.validList as = true) :
+    Attr.validList (a :: as) = true := by
+  simp [Attr.validList, ha, has]
+
+theorem Attr.validList_append_intro {msg : Type} (xs ys : List (Attr msg))
+    (hx : Attr.validList xs = true) (hy : Attr.validList ys = true) :
+    Attr.validList (xs ++ ys) = true := by
+  simp [Attr.validList_append, hx, hy]
+
+theorem Attr.valid_ite_intro {msg : Type} (c : Prop) [Decidable c] (a b : Attr msg)
+    (ht : c → a.valid = true) (hf : ¬ c → b.valid = true) :
+    Attr.valid (if c then a else b) = true := by
+  by_cases hc : c <;> simp [hc, ht, hf]
+
+theorem Attr.hasLocalCell_cons_eq_false {msg : Type} (a : Attr msg) (as : List (Attr msg))
+    (ha : a.isLocalCell = false) (has : Attr.hasLocalCell as = false) :
+    Attr.hasLocalCell (a :: as) = false := by
+  simp [Attr.hasLocalCell, ha, has]
+
+theorem Attr.hasLocalCell_append_eq_false {msg : Type} (xs ys : List (Attr msg))
+    (hx : Attr.hasLocalCell xs = false) (hy : Attr.hasLocalCell ys = false) :
+    Attr.hasLocalCell (xs ++ ys) = false := by
+  simp [Attr.hasLocalCell_append, hx, hy]
+
+theorem Attr.isLocalCell_ite_eq_false {msg : Type} (c : Prop) [Decidable c] (a b : Attr msg)
+    (ht : c → a.isLocalCell = false) (hf : ¬ c → b.isLocalCell = false) :
+    Attr.isLocalCell (if c then a else b) = false := by
+  by_cases hc : c <;> simp [hc, ht, hf]
+
+theorem Bool.not_false_or (a b : Bool) (ha : a = false) : (!a || b) = true := by
+  simp [ha]
+
+theorem validTextIn_rawStyle_escape (inP inter inForm : Bool) (s : String) :
+    validTextIn ⟨.rawStyle, inP, inter, inForm⟩ (escapeRawText s) = true := by
+  simp [validTextIn, containsCloseSeq_escapeRawText]
+
+theorem Html.validIn_element_intro {msg : Type} (ctx childCtx : HtmlCtx)
+    (tag : String) (attrs : List (Attr msg)) (children : List (Html msg))
+    (hstep : stepHtmlCtx ctx tag = some childCtx)
+    (hattrs : Attr.validList attrs = true)
+    (hvoid : (!isVoidTag tag || children.isEmpty) = true)
+    (hcell : (!Attr.hasLocalCell attrs || children.isEmpty) = true)
+    (hkids : Html.validListIn childCtx children = true) :
+    Html.validIn ctx (.element tag attrs children) = true := by
+  simp [Html.validIn, hstep, hattrs, hvoid, hcell, hkids]
+
+theorem Html.validListIn_cons_intro {msg : Type} (ctx : HtmlCtx) (c : Html msg) (cs : List (Html msg))
+    (hc : Html.validIn ctx c = true) (hcs : Html.validListIn ctx cs = true) :
+    Html.validListIn ctx (c :: cs) = true := by
+  simp [Html.validListIn, hc, hcs]
+
+theorem Html.validListIn_append_intro {msg : Type} (ctx : HtmlCtx) (xs ys : List (Html msg))
+    (hx : Html.validListIn ctx xs = true) (hy : Html.validListIn ctx ys = true) :
+    Html.validListIn ctx (xs ++ ys) = true := by
+  simp [Html.validListIn_append, hx, hy]
+
+theorem Html.validIn_ite_intro {msg : Type} (ctx : HtmlCtx) (c : Prop) [Decidable c] (a b : Html msg)
+    (ht : c → Html.validIn ctx a = true) (hf : ¬ c → Html.validIn ctx b = true) :
+    Html.validIn ctx (if c then a else b) = true := by
+  by_cases hc : c <;> simp [hc, ht, hf]
+
+theorem Html.validIn_dite_intro {msg : Type} (ctx : HtmlCtx) (c : Prop) [Decidable c]
+    (a : c → Html msg) (b : ¬ c → Html msg)
+    (ht : ∀ h : c, Html.validIn ctx (a h) = true) (hf : ∀ h : ¬ c, Html.validIn ctx (b h) = true) :
+    Html.validIn ctx (if h : c then a h else b h) = true := by
+  by_cases hc : c <;> simp [hc, ht, hf]
+
+theorem Html.validListIn_ite_intro {msg : Type} (ctx : HtmlCtx) (c : Prop) [Decidable c]
+    (a b : List (Html msg))
+    (ht : c → Html.validListIn ctx a = true) (hf : ¬ c → Html.validListIn ctx b = true) :
+    Html.validListIn ctx (if c then a else b) = true := by
+  by_cases hc : c <;> simp [hc, ht, hf]
+
+theorem Html.validListIn_map_intro {α msg : Type} (ctx : HtmlCtx) (xs : List α) (f : α → Html msg)
+    (hf : ∀ a, Html.validIn ctx (f a) = true) :
+    Html.validListIn ctx (xs.map f) = true := by
+  simp only [Html.validListIn_map, List.all_eq_true]
+  exact fun a _ => hf a
+
+theorem Html.validListIn_toList_map_intro {α msg : Type} (ctx : HtmlCtx) (xs : Array α) (f : α → Html msg)
+    (hf : ∀ a, Html.validIn ctx (f a) = true) :
+    Html.validListIn ctx (xs.map f).toList = true := by
+  simp only [Html.validListIn_toList_map, List.all_eq_true]
+  exact fun a _ => hf a
+
 def onlySignalBind : List (Attr msg) → Bool
   | [.signalBind _] => true
   | .key _ :: rest  => onlySignalBind rest

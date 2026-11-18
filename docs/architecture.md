@@ -82,8 +82,10 @@ browser restores server-rendered state without re-fetching startup data; mark cl
 
 ### Checked by Lean's kernel
 
-- **State & concurrency invariants:** Component `invariant`s prove preservation across `init`,
-  every action, and `for_each` child collections. Server `invariant`s prove initial validity,
+- **State & concurrency invariants:** Component `invariant`s prove preservation across `init`
+  (including mountable components with `prop`s), every action, `for_each` child collections, and
+  SSR `Dehydrate` slices (`dehydrate_inv`), while `App.guardRehydrate` enforces the invariant on
+  untrusted client payloads (`rehydrate_inv`). Server `invariant`s prove initial validity,
   single-step preservation, two-state `old` monotonicity rules, `mutating ... requires ...`
   authorization policies, read-only non-mutation, and multi-core linearizability via transactional
   `atomic` blocks with rollback on error.
@@ -91,18 +93,22 @@ browser restores server-rendered state without re-fetching startup data; mark cl
   proof over `Html.valid` banning invalid HTML5 nesting such as `<div>` inside `<p>` or nested
   `<button>`s, children inside void elements, `<script>`/`<base>`/`<object>`/`<embed>` tags,
   inline `on*`/`srcdoc` attributes, raw markup injection, `<script>`/`<style>` breakout sequences,
-  and untyped URLs on `href`, `src`, and `action`. Inline and `holds_in` view invariants check
-  custom styling and element predicates.
+  and untyped URLs on `href`, `src`, and `action`. Stylesheets prove pure kernel-reducible
+  `cssHash` scoping and strip comment-open (`/*`) and `<`/`</style` breakout sequences
+  (`sanitizeCssAtom_no_comment`, `renderStyleSheet_no_lt`, `renderStyleSheet_no_closeSeq`). Inline
+  and `holds_in` view invariants check custom positive and negative (`roleLacks`, `tagLacks`)
+  styling predicates.
 - **Isomorphic SSR, DOM driver, and memoization:** Every `Dehydrate` codec proves `round_trip`
   and `dehydrate_view`, and every component emits `<Comp>.app_view_eq` (with `canonical_congr_pred`
   transporting `holds_in` view predicates `<inv>_app` to `App.view`). [`Qed/Proofs/`](../Qed/Proofs)
   (`DomArena.lean`, `KeyedReconcile.lean`, `ViewPatch.lean`, `Hydration.lean`) proves against a pure
   `SpecDom` model using unified `CleanDomSubtree`/`VStateValid` invariants that mounting,
   W3C `insertBefore` keyed/positional patching (`applyToDomM`/`patchHtmlSubtreeM`), full `patchViewM`
-  updates, template row/signal alignment (`alignRows_spec`, `diffRowSigs_sound`, `seedRowsM_spec`,
-  `renderSig_resolved_spec`), local-cell/FIFO runtime specs, `hydrateDomM`/`hydrateViewM` HTML5
-  text-run hydration, `LawfulKey`-indexed `V.memo` skipping, and end-to-end SSR rehydration +
-  patching (`App.ssr_hydrate_patch_equiv`) match `Html.render`.
+  and `hydrateViewM` lifecycles (including `.keyedList` / `V.forEach` lists), template row/signal
+  alignment (`alignRows_spec`, `diffRowSigs_sound`, `seedRowsM_spec`, `renderSig_resolved_spec`),
+  `clicks`/`inputs` handler retention (`ElemStateEquiv.dispatchInput`), local-cell/FIFO runtime specs,
+  `hydrateDomM` HTML5 text-run hydration, `LawfulKey`-indexed `V.memo` skipping, and end-to-end SSR
+  rehydration + patching (`App.ssr_hydrate_patch_equiv`) match `Html.render`.
 - **Schemas, routes, and wire codecs:** `schema` proves submit eligibility matches schema validity
   via `canSubmit_iff`. `router` proves `Router.round_trip` and `isSafeUrl_toURL`. `LawfulJson` and
   `LawfulProto` prove JSON and Protobuf round-trips, framing non-smuggling, bounded-depth parsing,

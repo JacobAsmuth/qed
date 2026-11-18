@@ -1,8 +1,10 @@
 # Invariants
 
 An invariant is a rule that must hold in the initial state and after every state update. When you
-declare one inside a `component`, Qed asks Lean's kernel to prove both that the initial state
-satisfies the rule and that every message preserves it, assuming it held beforehand.
+declare one inside a `component`, Qed asks Lean's kernel to prove that the initial state satisfies
+the rule (including for mountable components with `prop`s), that every message preserves it, and
+that SSR `Dehydrate` preserves it (`dehydrate_inv`); at runtime, `App.guardRehydrate` rejects
+untrusted rehydration payloads that violate the invariant (`rehydrate_inv`).
 
 ```lean
 component Counter where
@@ -152,6 +154,8 @@ invariant navStyled : everyElement … holds_in navView
 |-----------|---------|
 | `roleHasOneOf "x" [a, b]` | Every element with `role="x"` has style `a` or style `b`. |
 | `tagHasOneOf "button" [a, b]` | Every `<button>` has style `a` or style `b` (no `role` attribute needed). |
+| `roleLacks "x" a` | No element with `role="x"` carries style `a`. |
+| `tagLacks "button" a` | No `<button>` carries style `a` (no `role` attribute needed). |
 | `everyElement (fun tag attrs => …)` | Custom boolean check applied to every element in the tree. |
 
 ### Relating multiple elements
@@ -166,10 +170,10 @@ invariant savedXorEditing : exactlyOne "save" "cancel" primary secondary holds_i
 --          (both (roleHas "save" secondary) (roleHas "cancel" primary))
 ```
 
-Style class names are content hashes, so positive checks ("this element carries style `a`")
-reduce cleanly by reflexivity (`x == x`). Proving *negative* claims ("this element does *not*
-carry style `b`") requires showing two hashes differ and is not discharged automatically—prefer
-positive alternatives like `roleHasOneOf` or `exactlyOne`.
+Style class names use a pure kernel-reducible UTF-8 FNV-1a hash (`cssHash`), so both positive
+checks (`roleHas`, `roleHasOneOf`) and negative checks (`roleLacks`, `tagLacks` — "this element does
+*not* carry style `b`") reduce directly inside Lean's kernel for distinct concrete styles. Prefer
+`roleHasOneOf` or `exactlyOne` when expressing positive exclusive choices.
 
 ## Reading a failed proof
 

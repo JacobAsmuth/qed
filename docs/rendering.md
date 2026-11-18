@@ -22,13 +22,14 @@ In [`Qed/Proofs/`](../Qed/Proofs) (`DomArena.lean`, `KeyedReconcile.lean`, `View
 imperative `MonadDom` driver (`Qed/Driver/`). Evaluated against a pure W3C DOM arena
 (`SpecDom`), Qed proves via unified `CleanDomSubtree`/`VStateValid` invariants that initial
 mounts (`buildDomM`/`buildViewM`), positional/keyed tree patching (`applyToDomM`, `patchHtmlSubtreeM`),
-full incremental view patching (`patchViewM`), template row/signal alignment (`alignRows_spec`,
-`diffRowSigs_sound`, `seedRowsM_spec`, `renderSig_resolved_spec`), runtime handler/local-cell/FIFO
-queue specs, text-run hydration (`hydrateDomM`/`hydrateViewM`), `V.memo` skipping, and end-to-end
-SSR rehydration + client patching (`App.ssr_rehydrate_equiv`, `App.ssr_hydrate_patch_equiv`) produce
-the exact DOM tree specified by `Html.render`. Component elaboration (`Qed/Component/Elab.lean`)
-also emits `<Comp>.app_view_eq` via verified template lifting (`Qed/View/Lift.lean`) and
-transports view invariants (`<inv>_app`) onto `App.view` through `canonical_congr_pred`.
+full incremental view patching (`patchViewM`), `.keyedList` (`V.forEach`) template reconciliation and
+hydration (`View.DomClean_forEach`), template row/signal alignment (`alignRows_spec`, `diffRowSigs_sound`,
+`seedRowsM_spec`, `renderSig_resolved_spec`), runtime handler/local-cell/FIFO queue specs, text-run
+hydration (`hydrateDomM`/`hydrateViewM`), `V.memo` skipping, and end-to-end SSR rehydration + client
+patching (`App.ssr_rehydrate_equiv`, `App.ssr_hydrate_patch_equiv`) produce the exact DOM tree specified
+by `Html.render`. Component elaboration (`Qed/Component/Elab.lean`) also emits `<Comp>.app_view_eq`
+via verified template lifting (`Qed/View/Lift.lean`) and transports view invariants (`<inv>_app`) onto
+`App.view` through `canonical_congr_pred`.
 
 ### Tail-recursive compilation (`@[csimp]`)
 
@@ -62,8 +63,9 @@ Updating live browser DOM state requires a few guarantees beyond pure HTML seria
 - **Local components:** Updating a parent refreshes a local component's live `prop`s and
   event callbacks without resetting its persisted local state; `initial` is read only on first
   mount.
-- **Attribute and property cleanup:** Full attribute reconciliation removes stale attributes and
-  event listeners and resets removed controlled `value` and `checked` DOM properties.
+- **Attribute, event handler, and property cleanup:** Full attribute reconciliation removes stale
+  attributes, updates and retains `clicks` and `inputs` event handlers (`ElemStateEquiv.dispatchInput`),
+  and resets removed controlled `value` and `checked` DOM properties.
 - **Verified subtree memoization (`Qed.lazy` / `V.memo`):** Memoized subtrees require a
   `LawfulKey` argument whose serialization is provably injective (`toKey a = toKey b → a = b`).
   When keys match, skipping the subtree is guaranteed exact by both `applyValues_render` and

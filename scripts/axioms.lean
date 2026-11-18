@@ -230,3 +230,13 @@ import Examples.CloudBooks
 #print axioms Qed.hydrateViewM_eq_hydrateDomM
 #print axioms Qed.hydrateViewM_spec
 #print axioms Qed.App.ssr_hydrate_patch_equiv
+#print axioms Qed.sanitizeCssAtom_no_comment
+#print axioms Qed.sanitizeCssSelector_no_comment
+#print axioms Qed.renderStyleSheet_no_lt
+#print axioms Qed.renderStyleSheet_no_closeSeq
+#print axioms Qed.roleLacks_canonical
+#print axioms Qed.tagLacks_canonical
+#print axioms Qed.App.guardRehydrate_sound
+#print axioms Qed.App.guardRehydrate_complete
+#print axioms Qed.ElemStateEquiv.dispatchInput
+#print axioms Qed.View.DomClean_forEach

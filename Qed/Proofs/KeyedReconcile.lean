@@ -333,6 +333,7 @@ mutual
         S n.toNat ∧ ownsChildren attrs = false ∧ attrs.all Attr.DomClean = true ∧
         ∃ st mg domCs, a.get n = .element realNs tag st mg domCs ∧
           ElemClean st mg ∧ ElemStateEquiv st (evalSpecAttrs attrs) ∧
+          (∀ nm ∈ (normalizeAttrs attrs).filterMap managedAttrName, mg.contains nm = true) ∧
           CleanDomChildren f (Dom.childNsOf ns tag) cs a (fun k => S k ∧ k ≠ n.toNat) domCs
 
   def CleanDomChildren {msg : Type} : Nat → String → List (Html msg) → DomArena msg → (Nat → Prop) → List Dom.Node → Prop
@@ -377,8 +378,8 @@ mutual
         (∀ k, S k → S' k) → CleanDomSubtree f ns h a S n → CleanDomSubtree f ns h a S' n
     | 0, _, _, _, _, _, _, _, hc => by simp [CleanDomSubtree] at hc
     | _ + 1, _, .text _, _, _, _, _, hsub, ⟨hn, hg⟩ => ⟨hsub _ hn, hg⟩
-    | f + 1, ns, .element _ _ _, _, _, _, n, hsub, ⟨hn, ho, ha, st, mg, domCs, hg, hcl, heq, hcs⟩ =>
-        ⟨hsub _ hn, ho, ha, st, mg, domCs, hg, hcl, heq, CleanDomChildren_mono (fun _ hk => ⟨hsub _ hk.1, hk.2⟩) hcs⟩
+    | f + 1, ns, .element _ _ _, _, _, _, n, hsub, ⟨hn, ho, ha, st, mg, domCs, hg, hcl, heq, hmg, hcs⟩ =>
+        ⟨hsub _ hn, ho, ha, st, mg, domCs, hg, hcl, heq, hmg, CleanDomChildren_mono (fun _ hk => ⟨hsub _ hk.1, hk.2⟩) hcs⟩
 
   theorem CleanDomChildren_mono {msg : Type} :
       ∀ {f : Nat} {ns : String} {cs : List (Html msg)} {a : DomArena msg} {S S' : Nat → Prop} {ds : List Dom.Node},
@@ -396,8 +397,8 @@ mutual
         (∀ m : Dom.Node, S m.toNat → a'.get m = a.get m) → CleanDomSubtree f ns h a S n → CleanDomSubtree f ns h a' S n
     | 0, _, _, _, _, _, _, _, hc => by simp [CleanDomSubtree] at hc
     | _ + 1, _, .text _, _, _, _, n, hfr, ⟨hn, hg⟩ => ⟨hn, (hfr n hn).trans hg⟩
-    | f + 1, ns, .element _ _ _, _, _, _, n, hfr, ⟨hn, ho, ha, st, mg, domCs, hg, hcl, heq, hcs⟩ =>
-        ⟨hn, ho, ha, st, mg, domCs, (hfr n hn).trans hg, hcl, heq, CleanDomChildren_frame (fun m hm => hfr m hm.1) hcs⟩
+    | f + 1, ns, .element _ _ _, _, _, _, n, hfr, ⟨hn, ho, ha, st, mg, domCs, hg, hcl, heq, hmg, hcs⟩ =>
+        ⟨hn, ho, ha, st, mg, domCs, (hfr n hn).trans hg, hcl, heq, hmg, CleanDomChildren_frame (fun m hm => hfr m hm.1) hcs⟩
 
   theorem CleanDomChildren_frame {msg : Type} :
       ∀ {f : Nat} {ns : String} {cs : List (Html msg)} {a a' : DomArena msg} {S : Nat → Prop} {ds : List Dom.Node},
@@ -417,7 +418,7 @@ mutual
         CleanDomSubtree f ns h a S n → DomTreeAssocEquiv (readDomTree f a n) (specDom ns h)
     | 0, _, _, _, _, _, hc => by simp [CleanDomSubtree] at hc
     | _ + 1, _, .text _, _, _, _, ⟨_, hg⟩ => by simp [readDomTree, hg, specDom, DomTreeAssocEquiv]
-    | f + 1, _, .element _ _ _, _, _, _, ⟨_, ho, _, _, _, _, hg, _, heq, hcs⟩ => by
+    | f + 1, _, .element _ _ _, _, _, _, ⟨_, ho, _, _, _, _, hg, _, heq, _, hcs⟩ => by
         dsimp only [readDomTree, specDom]; rw [hg, ho]; exact ⟨rfl, rfl, heq, CleanDomChildren_equiv hcs⟩
 
   theorem CleanDomChildren_equiv {msg : Type} :
@@ -469,7 +470,7 @@ mutual
         CleanDomSubtree f ns h a S n → h.DomClean = true
     | 0, _, _, _, _, _, hc => by simp [CleanDomSubtree] at hc
     | _ + 1, _, .text _, _, _, _, _ => rfl
-    | _ + 1, _, .element _ _ _, _, _, _, ⟨_, ho, ha, _, _, _, _, _, _, hcs⟩ => by
+    | _ + 1, _, .element _ _ _, _, _, _, ⟨_, ho, ha, _, _, _, _, _, _, _, hcs⟩ => by
         simp [Html.DomClean, ho, ha, CleanDomChildren_DomCleanList hcs]
 
   theorem CleanDomChildren_DomCleanList {msg : Type} :
@@ -481,6 +482,15 @@ mutual
     | _, _, [], _, _, _ :: _, hc => False.elim hc
     | _, _, _ :: _, _, _, [], hc => False.elim hc
 end
+
+theorem CleanDomSubtree_not_fragment {msg : Type} {f : Nat} {ns : String} {h : Html msg}
+    {a : DomArena msg} {S : Nat → Prop} {n : Dom.Node} (hcl : CleanDomSubtree f ns h a S n) :
+    ∀ fcs, a.get n ≠ .fragment fcs := by
+  cases f with
+  | zero => simp [CleanDomSubtree] at hcl
+  | succ _ => cases h with
+    | text _ => intro fcs hf; simp [CleanDomSubtree] at hcl; rw [hcl.2] at hf; cases hf
+    | element _ _ _ => intro fcs hf; rcases hcl with ⟨_, _, _, _, _, _, hg, _⟩; rw [hg] at hf; cases hf
 
 theorem DomArena.set_get_self {msg : Type} (a : DomArena msg) {n : Dom.Node} {e : ArenaEntry msg}
     (h : a.get n = e) : a.set n e = a := by
@@ -576,13 +586,16 @@ mutual
                          StateT.bind (buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) node children) (fun _ => StateT.pure node)
                          else StateT.bind (StateT.pure PUnit.unit) (fun _ => StateT.pure node)) s) = _
               rw [applyAttrsM_fresh_element a1 node realNs tag [] attrs, hownF]; rfl
-            rcases CleanDomChildren_of_buildDomListM (Dom.childNsOf ns tag) children [] a1 node realNs tag st mg [] f
-              (fun _ => False) hKclean (by omega) (by omega) (by omega) (by omega) (fun _ h => h.elim) trivial with ⟨csNew, aBase', ha'Eq, hcleanOut⟩
+            rcases CleanDomChildren_of_buildDomListM (Dom.childNsOf ns tag) children [] a1 node (ArenaEntry.element realNs tag st mg)
+              (.inl ⟨realNs, tag, st, mg, fun _ => rfl⟩) [] f
+              (fun _ => False) hKclean (by omega) (by omega) (by omega) (by omega) (fun _ h => h.elim) trivial with
+              ⟨csNew, aBase', ha'Eq, _, _, _, hcleanOut⟩
             have hmono := buildDomListM_nextId_mono (Dom.childNsOf ns tag) node children aElem
             dsimp only [StateT.run] at hmono ha'Eq hcleanOut ⊢
             rw [hrun]; dsimp only
             refine ⟨by omega, hownF, hAclean, st, mg, csNew, ?_,
-              ElemClean_evalSpecAttrs hAclean, ⟨fun _ => rfl, rfl, rfl⟩, ?_⟩
+              ElemClean_evalSpecAttrs hAclean, ElemStateEquiv.refl st,
+              fun nm hnm => List.contains_iff_mem.2 hnm, ?_⟩
             · rw [ha'Eq, DomArena.get_set_self]; dsimp only [realNs]; simp only [List.nil_append]
             · refine CleanDomChildren_mono (fun k hk => ?_) (by simpa [List.nil_append] using hcleanOut)
               rcases hk with ⟨h1, h2⟩
@@ -590,25 +603,32 @@ mutual
 
   theorem CleanDomChildren_of_buildDomListM {msg : Type} (childNs : String) :
       ∀ (cs hsAcc : List (Html msg)) (aBase : DomArena msg) (parent : Dom.Node)
-        (pns ptag : String) (pst : SpecElemState msg) (pmg : List String) (acc : List Dom.Node) (f : Nat) (Sacc : Nat → Prop),
+        (mkPar : List Dom.Node → ArenaEntry msg),
+        ((∃ pns ptag pst pmg, ∀ ds, mkPar ds = .element pns ptag pst pmg ds) ∨ (∀ ds, mkPar ds = .fragment ds)) →
+        ∀ (acc : List Dom.Node) (f : Nat) (Sacc : Nat → Prop),
         Html.DomCleanList cs = true → parent.toNat < aBase.nextId → 0 < aBase.nextId → aBase.nextId + htmlListNodeCount cs < UInt32.size →
         htmlListDepth cs ≤ f → (∀ k, Sacc k → parent.toNat < k ∧ k < aBase.nextId) →
-        CleanDomChildren f childNs hsAcc (aBase.set parent (.element pns ptag pst pmg acc)) Sacc acc →
-        let aIn := aBase.set parent (.element pns ptag pst pmg acc)
+        CleanDomChildren f childNs hsAcc (aBase.set parent (mkPar acc)) Sacc acc →
+        let aIn := aBase.set parent (mkPar acc)
         let aOut := ((buildDomListM (m := StateM (DomArena msg)) childNs parent cs).run aIn).2
         ∃ (csNew : List Dom.Node) (aBase' : DomArena msg),
-          aOut = aBase'.set parent (.element pns ptag pst pmg (acc ++ csNew)) ∧
+          aOut = aBase'.set parent (mkPar (acc ++ csNew)) ∧
+          aBase.nextId ≤ aOut.nextId ∧
+          aOut.nextId ≤ aBase.nextId + htmlListNodeCount cs ∧
+          (∀ m : Dom.Node, m.toNat < aBase.nextId → m ≠ parent → aOut.get m = aBase.get m) ∧
           CleanDomChildren f childNs (hsAcc ++ cs) aOut (fun k => Sacc k ∨ (aBase.nextId ≤ k ∧ k < aOut.nextId)) (acc ++ csNew)
-    | [], hsAcc, aBase, parent, pns, ptag, pst, pmg, acc, f, Sacc, _, _, _, _, _, _, haccClean => by
-        refine ⟨[], aBase, by simp [buildDomListM, StateT.run, pure, StateT.pure], ?_⟩
+    | [], hsAcc, aBase, parent, mkPar, _, acc, f, Sacc, _, _, _, _, _, _, haccClean => by
+        refine ⟨[], aBase, by simp [buildDomListM, StateT.run, pure, StateT.pure],
+          Nat.le_refl _, by simp [buildDomListM, StateT.run, pure, StateT.pure, htmlListNodeCount],
+          fun m _ hne => by simp [buildDomListM, StateT.run, pure, StateT.pure, DomArena.get_set_ne _ _ hne], ?_⟩
         simpa [buildDomListM, StateT.run, pure, StateT.pure] using CleanDomChildren_mono (fun _ hk => .inl hk) haccClean
-    | c :: rest, hsAcc, aBase, parent, pns, ptag, pst, pmg, acc, f, Sacc,
+    | c :: rest, hsAcc, aBase, parent, mkPar, hmk, acc, f, Sacc,
         hclean, hparLt, hpos, hbound, hdep, hSacc, haccClean => by
         simp only [Html.DomCleanList, Bool.and_eq_true] at hclean
         simp only [htmlListNodeCount] at hbound; simp only [htmlListDepth] at hdep
         have hcDep : htmlDepth c ≤ f := Nat.le_trans (Nat.le_max_left _ _) hdep
         have hrestDep : htmlListDepth rest ≤ f := Nat.le_trans (Nat.le_max_right _ _) hdep
-        let aIn := aBase.set parent (.element pns ptag pst pmg acc)
+        let aIn := aBase.set parent (mkPar acc)
         have haInNext : aIn.nextId = aBase.nextId := rfl
         have hcSpec := buildDomM_spec childNs c aIn f (by omega) (by omega) hcDep
         have hcClean := CleanDomSubtree_of_buildDomM childNs c aIn f hclean.1 (by omega) (by omega) hcDep
@@ -619,19 +639,21 @@ mutual
             rw [hR] at hcSpec hcClean haMidLe; dsimp only at hcSpec hcClean haMidLe
             rcases hcSpec with ⟨hcnGe, hcnLt, haMidBound, haMidFrame, _, _⟩
             rw [haInNext] at hcnGe haMidLe haMidBound
-            have hparInMid : aMid.get parent = .element pns ptag pst pmg acc := by
+            have hparInMid : aMid.get parent = mkPar acc := by
               rw [haMidFrame parent (by omega)]; simp [aIn, DomArena.get_set_self]
             have hcnNotFrag : ∀ fcs, aMid.get cn ≠ .fragment fcs := fun fcs => by
               have hb := buildDomM_not_fragment childNs c aIn f fcs (by omega) (by omega) hcDep
               dsimp only [StateT.run] at hb; rw [hR] at hb; exact hb
             have hcnNotInAcc : cn ∉ acc := fun hmem => by have := hSacc _ (CleanDomChildren_mem haccClean cn hmem); omega
-            let aAfter := aMid.set parent (.element pns ptag pst pmg (acc ++ [cn]))
+            let aAfter := aMid.set parent (mkPar (acc ++ [cn]))
             have haAfterNext : aAfter.nextId = aMid.nextId := rfl
             have happendRun : MonadDom.appendChild (m := StateM (DomArena msg)) parent cn aMid = ((), aAfter) := by
               cases hgetCn : aMid.get cn with
               | fragment fcs => exact False.elim (hcnNotFrag fcs hgetCn)
               | null | text _ | element _ _ _ _ _ =>
-                  simp [MonadDom.appendChild, hgetCn, DomArena.modify, hparInMid, List.erase_of_not_mem hcnNotInAcc, aAfter]
+                  rcases hmk with ⟨pns, ptag, pst, pmg, hme⟩ | hmf
+                  · simp [MonadDom.appendChild, hgetCn, DomArena.modify, hparInMid, hme, List.erase_of_not_mem hcnNotInAcc, aAfter]
+                  · simp [MonadDom.appendChild, hgetCn, DomArena.modify, hparInMid, hmf, List.erase_of_not_mem hcnNotInAcc, aAfter]
             let Sc : Nat → Prop := fun k => aBase.nextId ≤ k ∧ k < aMid.nextId
             have haccMid : CleanDomChildren f childNs hsAcc aAfter Sacc acc :=
               CleanDomChildren_frame (fun m hm => by
@@ -642,10 +664,10 @@ mutual
               CleanDomChildren_append (fun k hk1 hk2 => by have := hSacc k hk1; omega) haccMid
                 (show CleanDomChildren f childNs [c] aAfter Sc [cn] from
                   ⟨Sc, fun _ => False, fun _ h => h, fun _ h => h.elim, fun _ _ h => h.elim, hcAfter, trivial⟩)
-            rcases CleanDomChildren_of_buildDomListM childNs rest (hsAcc ++ [c]) aMid parent pns ptag pst pmg (acc ++ [cn]) f
+            rcases CleanDomChildren_of_buildDomListM childNs rest (hsAcc ++ [c]) aMid parent mkPar hmk (acc ++ [cn]) f
               (fun k => Sacc k ∨ Sc k) hclean.2 (by omega) (by omega) (by omega) hrestDep
               (fun k hk => hk.elim (fun h => let b := hSacc k h; ⟨b.1, by omega⟩) (fun h => ⟨by omega, h.2⟩))
-              hcombClean with ⟨csRest, aBase'', haOutEq, hcleanFinal⟩
+              hcombClean with ⟨csRest, aBase'', haOutEq, haOutGe, haOutBound, haOutFrame, hcleanFinal⟩
             have hstepRun : (buildDomListM (m := StateM (DomArena msg)) childNs parent (c :: rest) aIn).2 =
                 (buildDomListM (m := StateM (DomArena msg)) childNs parent rest aAfter).2 := by
               dsimp only [buildDomListM, bind, StateT.bind]
@@ -657,14 +679,19 @@ mutual
                       | (_, aA') => buildDomListM (m := StateM (DomArena msg)) childNs parent rest aA').2 = _
               rw [happendRun]
             have haRestMono := buildDomListM_nextId_mono childNs parent rest aAfter
-            dsimp only [StateT.run] at hcleanFinal haOutEq haRestMono ⊢
+            dsimp only [StateT.run] at hcleanFinal haOutEq haRestMono haOutGe haOutBound haOutFrame ⊢
             rw [haAfterNext] at haRestMono
-            refine ⟨cn :: csRest, aBase'', by rw [hstepRun]; simpa [List.append_assoc, aAfter] using haOutEq, ?_⟩
-            rw [hstepRun]; refine CleanDomChildren_mono (fun k hk => ?_) (by simpa [List.append_assoc, aAfter] using hcleanFinal)
-            rcases hk with (hS | hSc) | hRest
-            · exact .inl hS
-            · exact .inr ⟨hSc.1, by omega⟩
-            · exact .inr ⟨by omega, hRest.2⟩
+            have hstep' : (buildDomListM (m := StateM (DomArena msg)) childNs parent (c :: rest) aIn).2 =
+                (buildDomListM (m := StateM (DomArena msg)) childNs parent rest (aMid.set parent (mkPar (acc ++ [cn])))).2 := hstepRun
+            refine ⟨cn :: csRest, aBase'', by rw [hstepRun]; simpa [List.append_assoc, aAfter] using haOutEq,
+              by rw [hstep']; omega, by rw [hstep']; simp only [htmlListNodeCount]; omega, fun m hm hne => ?_, ?_⟩
+            · rw [hstep', haOutFrame m (by omega) hne, haMidFrame m (by rw [haInNext]; exact hm)]
+              exact DomArena.get_set_ne _ _ hne
+            · rw [hstepRun]; refine CleanDomChildren_mono (fun k hk => ?_) (by simpa [List.append_assoc, aAfter] using hcleanFinal)
+              rcases hk with (hS | hSc) | hRest
+              · exact .inl hS
+              · exact .inr ⟨hSc.1, by omega⟩
+              · exact .inr ⟨by omega, hRest.2⟩
 end
 
 theorem listReplaceAt_append_middle {α : Type} :
@@ -1451,7 +1478,7 @@ theorem applyToDomM_spec {msg : Type} (fuel : Nat) : @PatchSpecAt msg fuel := by
               | element t₂ a₂ c₂ =>
                   by_cases ht : t₁ = t₂
                   · subst ht
-                    rcases hcleanOld with ⟨hnodeIn, _, _, st, mg, domCs, hnodeGet, hElClean, _, hCleanCs⟩
+                    rcases hcleanOld with ⟨hnodeIn, _, _, st, mg, domCs, hnodeGet, hElClean, _, _, hCleanCs⟩
                     simp only [Html.DomClean, Bool.and_eq_true] at hcleanNew
                     rcases hcleanNew with ⟨⟨hownNewT, ha₂Clean⟩, hc₂Clean⟩
                     have hownNewF : ownsChildren a₂ = false := by simpa using hownNewT
@@ -1465,7 +1492,7 @@ theorem applyToDomM_spec {msg : Type} (fuel : Nat) : @PatchSpecAt msg fuel := by
                     have haSet := DomArena.set_get_self a hnodeGet
                     have hattrs := ElemClean_applyAttrsM a node realNs t₁ st mg domCs a₂ hElClean ha₂Clean
                     rw [haSet] at hattrs
-                    rcases hattrs with ⟨st', ha1Get, ha1Attrs, ha1Val, ha1Chk, hElClean'⟩
+                    rcases hattrs with ⟨st', ha1Get, ha1Equiv, hElClean'⟩
                     let mg' := (normalizeAttrs a₂).filterMap managedAttrName
                     let a1 := (applyAttrsM (m := StateM (DomArena msg)) node a₂ a).2
                     have ha1Next : a1.nextId = a.nextId := by have hnx := applyAttrsM_nextId a node a₂ (.element realNs t₁ st mg domCs); rw [haSet] at hnx; exact hnx
@@ -1501,7 +1528,7 @@ theorem applyToDomM_spec {msg : Type} (fuel : Nat) : @PatchSpecAt msg fuel := by
                       refine ⟨by omega, by simp only [htmlNodeCount]; omega, fun m hmPar hmOut hmLt => ?_, node, .inr rfl, ?_, hnd,
                         fun r hr => Nat.lt_of_lt_of_le (hparNodes r hr) (by omega),
                         .inl hnodeIn, hownNewF, ha₂Clean, st', mg', targetsOut, hnodeOut, hElClean',
-                        ⟨fun k => by rw [ha1Attrs k], ha1Val, ha1Chk⟩, ?_⟩
+                        ha1Equiv, fun nm hnm => List.contains_iff_mem.2 hnm, ?_⟩
                       · have hmNeNode : m ≠ node := fun h => hmOut (h ▸ hnodeIn)
                         rw [hfrOut m hmNeNode (fun h => hmOut h.1) (by omega), ha1Ne m hmNeNode]
                       · rw [hfrOut parent hne.symm (fun h => hparOut h.1) (by omega), ha1Ne parent hne.symm, hpar]
@@ -1523,7 +1550,7 @@ theorem applyToDomM_spec {msg : Type} (fuel : Nat) : @PatchSpecAt msg fuel := by
                       refine ⟨by omega, by simp only [htmlNodeCount]; omega, fun m hmPar hmOut hmLt => ?_, node, .inr rfl, ?_, hnd,
                         fun r hr => Nat.lt_of_lt_of_le (hparNodes r hr) (by omega),
                         .inl hnodeIn, hownNewF, ha₂Clean, st', mg', targetsOut, hnodeOut, hElClean',
-                        ⟨fun k => by rw [ha1Attrs k], ha1Val, ha1Chk⟩, ?_⟩
+                        ha1Equiv, fun nm hnm => List.contains_iff_mem.2 hnm, ?_⟩
                       · have hmNeNode : m ≠ node := fun h => hmOut (h ▸ hnodeIn)
                         rw [hfrOut m hmNeNode (fun h => hmOut h.1) (by omega), ha1Ne m hmNeNode]
                       · rw [hfrOut parent hne.symm (fun h => hparOut h.1) (by omega), ha1Ne parent hne.symm, hpar]

@@ -544,4 +544,60 @@ component BadUnguardedDecrease where
   invariant inRange : 1 ≤ quantity, quantity ≤ 10
   view => <span>{quantity}</span>
 
+def safeBtnStyle : Style := css [backgroundColor (hex "111")]
+def dangerBtnStyle : Style := css [backgroundColor (hex "999")]
+
+component StyleLacksGood where
+  state ok : Bool := true
+  view =>
+    <div>
+      <button role="submit" {safeBtnStyle}>OK</button>
+      <span>safe</span>
+    </div>
+  invariant noDanger : both (roleLacks "submit" dangerBtnStyle) (tagLacks "span" dangerBtnStyle)
+
+#guard !(renderStyleSheet [css [background "red/*evil*/</style"]]).contains "/*"
+#guard !(renderStyleSheet [css [background "red/*evil*/</style"]]).contains "<"
+#guard !(renderStyleSheet [css [background "red/*evil*/</style"]]).contains "</style"
+#guard (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := 5 })).map (·.x) == some 5
+#guard (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := -1 })).isNone
+
+/-- error: styling invariant `BadRoleLacks.noDanger` doesn't hold for every model, `roleLacks "submit" dangerBtnStyle` is false for some `BadRoleLacks.view m`.
+
+Some element the rule constrains isn't carrying one of the required style classes (or no element with that role/tag is rendered). Check that the `role`/tag it matches exists and gets one of the styles passed to `roleHasOneOf`/`tagHasOneOf` in every branch of `BadRoleLacks.view`. If the view is routed through `App.view`/`View.render` rather than a plain `Model → Html`, prove it with:  invariant BadRoleLacks.noDanger : … holds_in BadRoleLacks.view := by … -/
+#guard_msgs in
+component BadRoleLacks where
+  state ok : Bool := true
+  view => <button role="submit" {dangerBtnStyle}>Bad</button>
+  invariant noDanger : roleLacks "submit" dangerBtnStyle
+
+/-- error: invariant `BadPropInit.nonNeg` doesn't hold on initial state `BadPropInit.init`, the automation couldn't verify it.
+
+  • case `init` still needs:  0 ≤ -1
+
+Ensure initial state `BadPropInit.init` satisfies `BadPropInit.nonNeg`, supply a fact with `invariant BadPropInit.nonNeg : … using [yourLemma]`, or prove it manually. -/
+#guard_msgs in
+component BadPropInit where
+  prop offset : Int := 0
+  state count : Int := -1
+  action nop => ()
+  invariant nonNeg : 0 ≤ count
+  view => <span>{count}</span>
+
+/-- error: could not synthesize default value for parameter 'hpres' using tactics
+---
+error: SSR `dehydrate` slice can violate the component's state invariant: rehydrating a model resets `ephemeral` or unserializable fields to `init`, which may break the invariant.
+  • invariant violation after rehydration: 5 ≤ _qed_m.shown + 0
+
+Do not mark fields constrained by a state `invariant` as `ephemeral`, or weaken the invariant. -/
+#guard_msgs (error, drop warning) in
+component BadEphemeralInv where
+  state shown : Int := 5
+  ephemeral cache : Int := 0
+  action shift =>
+    shown := 0
+    cache := 5
+  invariant totalMin : 5 ≤ shown + cache
+  view => <span>{shown}</span>
+
 end SyntaxChecks

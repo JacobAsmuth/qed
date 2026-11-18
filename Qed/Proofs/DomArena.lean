@@ -111,6 +111,9 @@ theorem lookupAssoc_eraseAssoc {α : Type} (k k' : String) :
           simp [hne]
         · simp [hk, lookupAssoc_eraseAssoc k k' rest]
 
+theorem string_append_left_cancel {p a b : String} (h : p ++ a = p ++ b) : a = b :=
+  String.ext (by have := congrArg String.toList h; simp_all)
+
 def stepSpecAttr (st : SpecElemState msg) : Attr msg → SpecElemState msg
   | .cls c                    => { st with attrs := setAssoc "class" c st.attrs }
   | .attr "value" v           => { st with value := v }
@@ -220,6 +223,16 @@ def alloc (a : DomArena msg) (e : ArenaEntry msg) : Dom.Node × DomArena msg :=
     (f : List Dom.Node → List Dom.Node) : DomArena msg :=
   a.modify p fun | .element ns tag st mg cs => .element ns tag st mg (f cs) | .fragment cs => .fragment (f cs) | other => other
 
+def SameDom {msg : Type} (a₁ a₂ : DomArena msg) : Prop :=
+  a₁.nextId = a₂.nextId ∧ a₁.store = a₂.store
+
+theorem SameDom.refl (a : DomArena msg) : a.SameDom a := ⟨rfl, rfl⟩
+theorem SameDom.symm {a₁ a₂ : DomArena msg} (h : a₁.SameDom a₂) : a₂.SameDom a₁ := ⟨h.1.symm, h.2.symm⟩
+theorem SameDom.trans {a₁ a₂ a₃ : DomArena msg} (h1 : a₁.SameDom a₂) (h2 : a₂.SameDom a₃) : a₁.SameDom a₃ :=
+  ⟨h1.1.trans h2.1, h1.2.trans h2.2⟩
+theorem SameDom.get_eq {a₁ a₂ : DomArena msg} (h : a₁.SameDom a₂) (m : Dom.Node) : a₁.get m = a₂.get m :=
+  congrFun h.2 m
+
 end DomArena
 
 instance : MonadDom msg (StateM (DomArena msg)) where
@@ -241,7 +254,11 @@ instance : MonadDom msg (StateM (DomArena msg)) where
           let val' := if prev.contains "value" && !names.contains "value" then "" else st.value
           let chk' := if prev.contains "checked" && !names.contains "checked" then false else st.checked
           let attrs' := st.attrs.filter fun (k, _) => !prev.contains k || names.contains k
-          .element ns tag { st with attrs := attrs', value := val', checked := chk' } names cs
+          let clicks' := st.clicks.filter fun (e, _) =>
+            !prev.contains s!"data-qed-on-{e}" || names.contains s!"data-qed-on-{e}"
+          let inputs' := st.inputs.filter fun (e, _) =>
+            !prev.contains s!"data-qed-onv-{e}" || names.contains s!"data-qed-onv-{e}"
+          .element ns tag { st with attrs := attrs', value := val', checked := chk', clicks := clicks', inputs := inputs' } names cs
       | other => other)
   clearHandlers n         := fun a => ((), a.modifyElemState n fun st => { st with clicks := [], inputs := [] })
   setValue n v            := fun a => ((), a.modifyElemState n fun st => { st with value := v })
@@ -274,6 +291,14 @@ def readDomTree : Nat → DomArena msg → Dom.Node → DomTree msg
       | .text s => .text s
       | .element ns tag st _ cs => .element ns tag st (cs.map (readDomTree fuel a))
       | _ => .text ""
+
+theorem DomArena.SameDom.readDomTree_eq {a₁ a₂ : DomArena msg} (h : a₁.SameDom a₂) :
+    ∀ f n, readDomTree f a₁ n = readDomTree f a₂ n
+  | 0, _ => rfl
+  | f + 1, n => by
+      simp only [readDomTree, h.get_eq n]
+      split <;> try rfl
+      congr 1; exact List.map_congr_left fun c _ => h.readDomTree_eq f c
 
 /-! ## Signal Store Resolution (`emitSignalsM` & `readResolvedDomTree`) -/
 
@@ -398,13 +423,38 @@ theorem applyAttrsM_get_ne (a : DomArena msg) (node : Dom.Node)
   exact ((applyAttrListM_preserves (normalizeAttrs attrs) node _).2 m hne).trans
     (by simp [DomArena.modify, DomArena.get_set_ne _ _ hne])
 
+def ElemStateEquiv {msg : Type} (st₁ st₂ : SpecElemState msg) : Prop :=
+  (∀ k, lookupAssoc k st₁.attrs = lookupAssoc k st₂.attrs) ∧
+  st₁.value = st₂.value ∧ st₁.checked = st₂.checked ∧
+  (∀ e, lookupAssoc e st₁.clicks = lookupAssoc e st₂.clicks) ∧
+  (∀ e, lookupAssoc e st₁.inputs = lookupAssoc e st₂.inputs)
+
+theorem ElemStateEquiv.refl (st : SpecElemState msg) : ElemStateEquiv st st :=
+  ⟨fun _ => rfl, rfl, rfl, fun _ => rfl, fun _ => rfl⟩
+
+theorem ElemStateEquiv.symm {st₁ st₂ : SpecElemState msg} (h : ElemStateEquiv st₁ st₂) : ElemStateEquiv st₂ st₁ :=
+  ⟨fun k => (h.1 k).symm, h.2.1.symm, h.2.2.1.symm, fun e => (h.2.2.2.1 e).symm, fun e => (h.2.2.2.2 e).symm⟩
+
+theorem ElemStateEquiv.trans {st₁ st₂ st₃ : SpecElemState msg}
+    (h1 : ElemStateEquiv st₁ st₂) (h2 : ElemStateEquiv st₂ st₃) : ElemStateEquiv st₁ st₃ :=
+  ⟨fun k => (h1.1 k).trans (h2.1 k), h1.2.1.trans h2.2.1, h1.2.2.1.trans h2.2.2.1,
+   fun e => (h1.2.2.2.1 e).trans (h2.2.2.2.1 e), fun e => (h1.2.2.2.2 e).trans (h2.2.2.2.2 e)⟩
+
+theorem ElemStateEquiv.dispatchInput {st₁ st₂ : SpecElemState msg}
+    (h : ElemStateEquiv st₁ st₂) (e raw : String) :
+    (lookupAssoc e st₁.inputs).map (· raw) = (lookupAssoc e st₂.inputs).map (· raw) := by
+  rw [h.2.2.2.2 e]
+
 def ElemManaged (st : SpecElemState msg) (prev : List String) : Prop :=
   (∀ kv ∈ st.attrs, prev.contains kv.1 = true) ∧
   (st.value ≠ "" → prev.contains "value" = true) ∧
-  (st.checked = true → prev.contains "checked" = true)
+  (st.checked = true → prev.contains "checked" = true) ∧
+  (∀ kv ∈ st.clicks, prev.contains s!"data-qed-on-{kv.1}" = true) ∧
+  (∀ kv ∈ st.inputs, prev.contains s!"data-qed-onv-{kv.1}" = true)
 
 theorem ElemManaged_empty {names : List String} : ElemManaged ({} : SpecElemState msg) names :=
-  ⟨fun _ h => by simp at h, fun h => by simp at h, fun h => by simp at h⟩
+  ⟨fun _ h => by simp at h, fun h => by simp at h, fun h => by simp at h,
+   fun _ h => by simp at h, fun _ h => by simp at h⟩
 
 def attrWritesKey (k : String) : Attr msg → Bool
   | .cls _        => k == "class"
@@ -419,11 +469,14 @@ def AttrsNoShadow {msg : Type} (newAttrs : List (Attr msg)) (st : SpecElemState 
   (((normalizeAttrs newAttrs).filterMap managedAttrName).contains "value" = true →
     (∃ v, .attr "value" v ∈ normalizeAttrs newAttrs) ∨ st.value = "") ∧
   (((normalizeAttrs newAttrs).filterMap managedAttrName).contains "checked" = true →
-    (∃ p, .flag "checked" p ∈ normalizeAttrs newAttrs) ∨ st.checked = false)
+    (∃ p, .flag "checked" p ∈ normalizeAttrs newAttrs) ∨ st.checked = false) ∧
+  (∀ e, ((normalizeAttrs newAttrs).filterMap managedAttrName).contains s!"data-qed-on-{e}" = true →
+    (∃ m, .on e m ∈ normalizeAttrs newAttrs) ∨ lookupAssoc e st.clicks = none) ∧
+  (∀ e, ((normalizeAttrs newAttrs).filterMap managedAttrName).contains s!"data-qed-onv-{e}" = true →
+    (∃ f, .onValue e f ∈ normalizeAttrs newAttrs) ∨ lookupAssoc e st.inputs = none)
 
-private theorem setAssoc_contains {names : List String} {k v : String} (hk : names.contains k = true) :
-    ∀ {xs : List (String × String)},
-      (∀ kv ∈ xs, names.contains kv.1 = true) → ∀ kv ∈ setAssoc k v xs, names.contains kv.1 = true
+private theorem setAssoc_prop {α : Type} {p : String → Bool} {k : String} {v : α} (hk : p k = true) :
+    ∀ {xs : List (String × α)}, (∀ kv ∈ xs, p kv.1 = true) → ∀ kv ∈ setAssoc k v xs, p kv.1 = true
   | [], _, kv, h => by simp [setAssoc] at h; rcases h with ⟨rfl, rfl⟩; exact hk
   | x :: rest, hxs, kv, h => by
       simp only [setAssoc] at h
@@ -431,120 +484,198 @@ private theorem setAssoc_contains {names : List String} {k v : String} (hk : nam
       · exact hk
       · exact hxs kv (List.mem_cons_of_mem x hr)
       · exact hxs x (List.mem_cons_self ..)
-      · exact setAssoc_contains hk (fun q hq => hxs q (List.mem_cons_of_mem x hq)) kv hr
+      · exact setAssoc_prop hk (fun q hq => hxs q (List.mem_cons_of_mem x hq)) kv hr
 
-private theorem eraseAssoc_contains {names : List String} {k : String} :
-    ∀ {xs : List (String × String)},
-      (∀ kv ∈ xs, names.contains kv.1 = true) → ∀ kv ∈ eraseAssoc k xs, names.contains kv.1 = true
+private theorem eraseAssoc_prop {α : Type} {p : String → Bool} {k : String} :
+    ∀ {xs : List (String × α)}, (∀ kv ∈ xs, p kv.1 = true) → ∀ kv ∈ eraseAssoc k xs, p kv.1 = true
   | [], _, _, h => by simp [eraseAssoc] at h
   | x :: rest, hxs, kv, h => by
       simp only [eraseAssoc] at h
       split at h
-      · exact eraseAssoc_contains (fun q hq => hxs q (List.mem_cons_of_mem x hq)) kv h
+      · exact eraseAssoc_prop (fun q hq => hxs q (List.mem_cons_of_mem x hq)) kv h
       · rcases List.mem_cons.1 h with rfl | hr
         · exact hxs x (List.mem_cons_self ..)
-        · exact eraseAssoc_contains (fun q hq => hxs q (List.mem_cons_of_mem x hq)) kv hr
+        · exact eraseAssoc_prop (fun q hq => hxs q (List.mem_cons_of_mem x hq)) kv hr
 
 theorem stepSpecAttr_retains_managed (st : SpecElemState msg) (a : Attr msg) (names : List String)
     (hkeep : match managedAttrName a with | some n => names.contains n = true | none => True)
     (hm : ElemManaged st names) : ElemManaged (stepSpecAttr st a) names := by
-  rcases hm with ⟨ha, hv, hc⟩
+  rcases hm with ⟨ha, hv, hc, hcl, hin⟩
   cases a with
-  | cls _ => exact ⟨setAssoc_contains hkeep ha, hv, hc⟩
+  | cls _ => exact ⟨setAssoc_prop hkeep ha, hv, hc, hcl, hin⟩
   | attr k v =>
       by_cases h : k = "value"
-      · subst h; exact ⟨ha, fun _ => hkeep, hc⟩
-      · exact ⟨fun q hq => by simp [stepSpecAttr] at hq; exact setAssoc_contains hkeep ha q hq,
+      · subst h; exact ⟨ha, fun _ => hkeep, hc, hcl, hin⟩
+      · exact ⟨fun q hq => by simp [stepSpecAttr] at hq; exact setAssoc_prop hkeep ha q hq,
                fun hne => hv (by simpa [stepSpecAttr, h] using hne),
-               fun hch => hc (by simpa [stepSpecAttr, h] using hch)⟩
+               fun hch => hc (by simpa [stepSpecAttr, h] using hch),
+               fun q hq => by simp [stepSpecAttr] at hq; exact hcl q hq,
+               fun q hq => by simp [stepSpecAttr] at hq; exact hin q hq⟩
   | flag k p =>
       by_cases h : k = "checked"
-      · subst h; cases p <;> simp [stepSpecAttr]; exact ⟨ha, hv, fun b => absurd b Bool.false_ne_true⟩; exact ⟨ha, hv, fun _ => hkeep⟩
+      · subst h; cases p <;> simp [stepSpecAttr]
+        · exact ⟨ha, hv, fun b => absurd b Bool.false_ne_true, hcl, hin⟩
+        · exact ⟨ha, hv, fun _ => hkeep, hcl, hin⟩
       · cases p
-        · exact ⟨fun q hq => by simp [stepSpecAttr] at hq; exact eraseAssoc_contains ha q hq,
+        · exact ⟨fun q hq => by simp [stepSpecAttr] at hq; exact eraseAssoc_prop ha q hq,
                  fun hne => hv (by simpa [stepSpecAttr, h] using hne),
-                 fun hch => hc (by simpa [stepSpecAttr, h] using hch)⟩
-        · exact ⟨fun q hq => by simp [stepSpecAttr] at hq; exact setAssoc_contains hkeep ha q hq,
+                 fun hch => hc (by simpa [stepSpecAttr, h] using hch),
+                 fun q hq => by simp [stepSpecAttr] at hq; exact hcl q hq,
+                 fun q hq => by simp [stepSpecAttr] at hq; exact hin q hq⟩
+        · exact ⟨fun q hq => by simp [stepSpecAttr] at hq; exact setAssoc_prop hkeep ha q hq,
                  fun hne => hv (by simpa [stepSpecAttr, h] using hne),
-                 fun hch => hc (by simpa [stepSpecAttr, h] using hch)⟩
-  | localCell _ _ _ _ _ => exact ⟨setAssoc_contains hkeep ha, hv, hc⟩
-  | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ => exact ⟨ha, hv, hc⟩
+                 fun hch => hc (by simpa [stepSpecAttr, h] using hch),
+                 fun q hq => by simp [stepSpecAttr] at hq; exact hcl q hq,
+                 fun q hq => by simp [stepSpecAttr] at hq; exact hin q hq⟩
+  | on _ _ => exact ⟨ha, hv, hc, setAssoc_prop (p := fun q => names.contains s!"data-qed-on-{q}") hkeep hcl, hin⟩
+  | onValue _ _ => exact ⟨ha, hv, hc, hcl, setAssoc_prop (p := fun q => names.contains s!"data-qed-onv-{q}") hkeep hin⟩
+  | localCell _ _ _ _ _ => exact ⟨setAssoc_prop hkeep ha, hv, hc, hcl, hin⟩
+  | key _ | signalBind _ | signalAttr _ _ _ => exact ⟨ha, hv, hc, hcl, hin⟩
 
-theorem stepSpecAttr_preserves_attrs (st₁ st₂ : SpecElemState msg) (a : Attr msg) (k : String)
-    (hw : attrWritesKey k a = true → False) (hcur : lookupAssoc k st₁.attrs = lookupAssoc k st₂.attrs) :
-    lookupAssoc k (stepSpecAttr st₁ a).attrs = lookupAssoc k (stepSpecAttr st₂ a).attrs := by
-  cases a with
-  | cls _ => simp [attrWritesKey] at hw; simp [stepSpecAttr, lookupAssoc_setAssoc, hcur]
-  | attr k' _ =>
-      by_cases hv : k' = "value"
-      · subst hv; exact hcur
-      · have hne : (k' == k) = false := by simp [attrWritesKey, hv] at hw; exact beq_eq_false_iff_ne.2 (fun h => hw h)
-        simp [stepSpecAttr, lookupAssoc_setAssoc, hne, hcur]
-  | flag k' p =>
-      by_cases hc : k' = "checked"
-      · subst hc; exact hcur
-      · have hne : (k' == k) = false := by simp [attrWritesKey, hc] at hw; exact beq_eq_false_iff_ne.2 (fun h => hw h)
-        cases p <;> simp [stepSpecAttr, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, hne, hcur]
-  | localCell _ _ _ _ _ => simp [attrWritesKey] at hw; simp [stepSpecAttr, lookupAssoc_setAssoc, hcur]
-  | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ => exact hcur
+private theorem foldl_stepSpecAttr_eqv {msg : Type} {β : Type} (proj : SpecElemState msg → β)
+    (writes : Attr msg → Bool)
+    (hpres : ∀ s₁ s₂ x, writes x = false → proj s₁ = proj s₂ → proj (stepSpecAttr s₁ x) = proj (stepSpecAttr s₂ x))
+    (hset : ∀ s₁ s₂ x, writes x = true → proj (stepSpecAttr s₁ x) = proj (stepSpecAttr s₂ x)) :
+    ∀ (xs : List (Attr msg)) (s₁ s₂ : SpecElemState msg),
+      ((∃ a ∈ xs, writes a = true) ∨ proj s₁ = proj s₂) →
+      proj (xs.foldl stepSpecAttr s₁) = proj (xs.foldl stepSpecAttr s₂)
+  | [], _, _, .inl ⟨_, h, _⟩ => nomatch h
+  | [], _, _, .inr h => h
+  | x :: rest, s₁, s₂, h => by
+      simp only [List.foldl_cons]
+      apply foldl_stepSpecAttr_eqv proj writes hpres hset rest
+      by_cases hxw : writes x = true
+      · exact .inr (hset s₁ s₂ x hxw)
+      · have hxwF : writes x = false := Bool.eq_false_iff.2 hxw
+        rcases h with ⟨a, ha, hwa⟩ | heq
+        · rcases List.mem_cons.1 ha with rfl | hmem
+          · exact absurd hwa hxw
+          · exact .inl ⟨a, hmem, hwa⟩
+        · exact .inr (hpres s₁ s₂ x hxwF heq)
 
 theorem foldl_stepSpecAttr_attrs (k : String) :
     ∀ (xs : List (Attr msg)) (s₁ s₂ : SpecElemState msg),
       ((∃ a ∈ xs, attrWritesKey k a = true) ∨ lookupAssoc k s₁.attrs = lookupAssoc k s₂.attrs) →
-      lookupAssoc k (xs.foldl stepSpecAttr s₁).attrs = lookupAssoc k (xs.foldl stepSpecAttr s₂).attrs
-  | [], s₁, s₂, .inl ⟨_, h, _⟩ => nomatch h
-  | [], s₁, s₂, .inr h => h
-  | x :: rest, s₁, s₂, h => by
-      simp only [List.foldl_cons]
-      apply foldl_stepSpecAttr_attrs k rest
-      by_cases hxw : attrWritesKey k x = true
-      · right; cases x with
-        | cls _ => simp [attrWritesKey] at hxw; subst hxw; simp [stepSpecAttr, lookupAssoc_setAssoc]
-        | attr k' _ => simp only [attrWritesKey, Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hxw; rcases hxw with ⟨hne, rfl⟩; simp [stepSpecAttr, lookupAssoc_setAssoc]
-        | flag k' p => simp only [attrWritesKey, Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hxw; rcases hxw with ⟨hne, rfl⟩; cases p <;> simp [stepSpecAttr, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc]
-        | localCell _ _ _ _ _ => simp [attrWritesKey] at hxw; subst hxw; simp [stepSpecAttr, lookupAssoc_setAssoc]
-        | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ => simp [attrWritesKey] at hxw
-      · rcases h with ⟨a, ha, hwa⟩ | heq
-        · rcases List.mem_cons.1 ha with rfl | hmem
-          · exact absurd hwa hxw
-          · exact .inl ⟨a, hmem, hwa⟩
-        · exact .inr (stepSpecAttr_preserves_attrs s₁ s₂ x k (fun ht => hxw ht) heq)
+      lookupAssoc k (xs.foldl stepSpecAttr s₁).attrs = lookupAssoc k (xs.foldl stepSpecAttr s₂).attrs :=
+  fun xs s₁ s₂ h => foldl_stepSpecAttr_eqv (fun s => lookupAssoc k s.attrs) (attrWritesKey k)
+    (fun _ _ x hw hcur => by
+      cases x with
+      | cls _ | localCell _ _ _ _ _ => simp [attrWritesKey] at hw; simp [stepSpecAttr, lookupAssoc_setAssoc, hcur]
+      | attr k' _ =>
+          by_cases hv : k' = "value"
+          · subst hv; exact hcur
+          · have hne : (k' == k) = false := by simp [attrWritesKey, hv] at hw; exact beq_eq_false_iff_ne.2 (fun h => hw h)
+            simp [stepSpecAttr, lookupAssoc_setAssoc, hne, hcur]
+      | flag k' p =>
+          by_cases hc : k' = "checked"
+          · subst hc; exact hcur
+          · have hne : (k' == k) = false := by simp [attrWritesKey, hc] at hw; exact beq_eq_false_iff_ne.2 (fun h => hw h)
+            cases p <;> simp [stepSpecAttr, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, hne, hcur]
+      | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ => exact hcur)
+    (fun _ _ x hxw => by
+      cases x with
+      | cls _ | localCell _ _ _ _ _ => simp [attrWritesKey] at hxw; subst hxw; simp [stepSpecAttr, lookupAssoc_setAssoc]
+      | attr k' _ => simp only [attrWritesKey, Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hxw; rcases hxw with ⟨_, rfl⟩; simp [stepSpecAttr, lookupAssoc_setAssoc]
+      | flag k' p => simp only [attrWritesKey, Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hxw; rcases hxw with ⟨_, rfl⟩; cases p <;> simp [stepSpecAttr, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc]
+      | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ => simp [attrWritesKey] at hxw)
+    xs s₁ s₂ h
 
 theorem foldl_stepSpecAttr_val :
     ∀ (xs : List (Attr msg)) (s₁ s₂ : SpecElemState msg),
       (s₁.value = s₂.value ∨ ∃ v, .attr "value" v ∈ xs) →
-      (xs.foldl stepSpecAttr s₁).value = (xs.foldl stepSpecAttr s₂).value
-  | [], _, _, .inl h => h
-  | [], _, _, .inr ⟨_, h⟩ => nomatch h
-  | x :: rest, s₁, s₂, h => by
-      simp only [List.foldl_cons]
-      apply foldl_stepSpecAttr_val rest
-      rcases h with heq | ⟨v, hv⟩
-      · left; cases x with
-        | attr k' _ => by_cases hk : k' = "value" <;> simp [stepSpecAttr, hk, heq]
-        | flag k' _ => by_cases hk : k' = "checked" <;> simp [stepSpecAttr, hk, heq]
-        | _ => exact heq
-      · rcases List.mem_cons.1 hv with rfl | hrest
-        · left; rfl
-        · right; exact ⟨v, hrest⟩
+      (xs.foldl stepSpecAttr s₁).value = (xs.foldl stepSpecAttr s₂).value := fun xs s₁ s₂ h =>
+  foldl_stepSpecAttr_eqv (·.value) (fun | .attr "value" _ => true | _ => false)
+    (fun _ _ x hw heq => by cases x with
+      | attr k' _ => by_cases hk : k' = "value" <;> simp [stepSpecAttr, hk, heq] at hw ⊢
+      | flag k' _ => by_cases hk : k' = "checked" <;> simp [stepSpecAttr, hk, heq]
+      | _ => exact heq)
+    (fun _ _ x hw => by dsimp only at hw; split at hw <;> simp [stepSpecAttr] at hw ⊢)
+    xs s₁ s₂ (by rcases h with heq | ⟨v, hv⟩; exact .inr heq; exact .inl ⟨.attr "value" v, hv, rfl⟩)
 
 theorem foldl_stepSpecAttr_chk :
     ∀ (xs : List (Attr msg)) (s₁ s₂ : SpecElemState msg),
       (s₁.checked = s₂.checked ∨ ∃ p, .flag "checked" p ∈ xs) →
-      (xs.foldl stepSpecAttr s₁).checked = (xs.foldl stepSpecAttr s₂).checked
-  | [], _, _, .inl h => h
-  | [], _, _, .inr ⟨_, h⟩ => nomatch h
-  | x :: rest, s₁, s₂, h => by
-      simp only [List.foldl_cons]
-      apply foldl_stepSpecAttr_chk rest
-      rcases h with heq | ⟨p, hp⟩
-      · left; cases x with
-        | attr k' _ => by_cases hk : k' = "value" <;> simp [stepSpecAttr, hk, heq]
-        | flag k' _ => by_cases hk : k' = "checked" <;> simp [stepSpecAttr, hk, heq]
-        | _ => exact heq
-      · rcases List.mem_cons.1 hp with rfl | hrest
-        · left; rfl
-        · right; exact ⟨p, hrest⟩
+      (xs.foldl stepSpecAttr s₁).checked = (xs.foldl stepSpecAttr s₂).checked := fun xs s₁ s₂ h =>
+  foldl_stepSpecAttr_eqv (·.checked) (fun | .flag "checked" _ => true | _ => false)
+    (fun _ _ x hw heq => by cases x with
+      | attr k' _ => by_cases hk : k' = "value" <;> simp [stepSpecAttr, hk, heq]
+      | flag k' _ => by_cases hk : k' = "checked" <;> simp [stepSpecAttr, hk, heq] at hw ⊢
+      | _ => exact heq)
+    (fun _ _ x hw => by dsimp only at hw; split at hw <;> simp [stepSpecAttr] at hw ⊢)
+    xs s₁ s₂ (by rcases h with heq | ⟨p, hp⟩; exact .inr heq; exact .inl ⟨.flag "checked" p, hp, rfl⟩)
+
+theorem foldl_stepSpecAttr_clicks (e : String) :
+    ∀ (xs : List (Attr msg)) (s₁ s₂ : SpecElemState msg),
+      ((∃ m, .on e m ∈ xs) ∨ lookupAssoc e s₁.clicks = lookupAssoc e s₂.clicks) →
+      lookupAssoc e (xs.foldl stepSpecAttr s₁).clicks = lookupAssoc e (xs.foldl stepSpecAttr s₂).clicks :=
+  fun xs s₁ s₂ h => foldl_stepSpecAttr_eqv (fun s => lookupAssoc e s.clicks)
+    (fun | .on e' _ => e' == e | _ => false)
+    (fun _ _ x hw heq => by cases x with
+      | on e' _ => simp [stepSpecAttr, lookupAssoc_setAssoc, hw, heq]
+      | attr k' _ => by_cases hk : k' = "value" <;> simp [stepSpecAttr, hk, heq]
+      | flag k' _ => by_cases hk : k' = "checked" <;> simp [stepSpecAttr, hk, heq]
+      | _ => exact heq)
+    (fun _ _ x hw => by cases x with
+      | on _ _ => simp [stepSpecAttr, lookupAssoc_setAssoc, hw]
+      | attr _ _ => simp at hw | flag _ _ => simp at hw | _ => simp at hw)
+    xs s₁ s₂ (by rcases h with ⟨m, hm⟩ | heq; exact .inl ⟨.on e m, hm, beq_self_eq_true e⟩; exact .inr heq)
+
+theorem foldl_stepSpecAttr_inputs (e : String) :
+    ∀ (xs : List (Attr msg)) (s₁ s₂ : SpecElemState msg),
+      ((∃ f, .onValue e f ∈ xs) ∨ lookupAssoc e s₁.inputs = lookupAssoc e s₂.inputs) →
+      lookupAssoc e (xs.foldl stepSpecAttr s₁).inputs = lookupAssoc e (xs.foldl stepSpecAttr s₂).inputs :=
+  fun xs s₁ s₂ h => foldl_stepSpecAttr_eqv (fun s => lookupAssoc e s.inputs)
+    (fun | .onValue e' _ => e' == e | _ => false)
+    (fun _ _ x hw heq => by cases x with
+      | onValue e' _ => simp [stepSpecAttr, lookupAssoc_setAssoc, hw, heq]
+      | attr k' _ => by_cases hk : k' = "value" <;> simp [stepSpecAttr, hk, heq]
+      | flag k' _ => by_cases hk : k' = "checked" <;> simp [stepSpecAttr, hk, heq]
+      | _ => exact heq)
+    (fun _ _ x hw => by cases x with
+      | onValue _ _ => simp [stepSpecAttr, lookupAssoc_setAssoc, hw]
+      | attr _ _ => simp at hw | flag _ _ => simp at hw | _ => simp at hw)
+    xs s₁ s₂ (by rcases h with ⟨f, hf⟩ | heq; exact .inl ⟨.onValue e f, hf, beq_self_eq_true e⟩; exact .inr heq)
+
+private theorem filter_managed_prop {α : Type} {prev names : List String} {keyFn : String → String}
+    {xs : List (String × α)} (hxs : ∀ kv ∈ xs, prev.contains (keyFn kv.1) = true) :
+    ∀ kv ∈ (xs.filter fun (k, _) => !prev.contains (keyFn k) || names.contains (keyFn k)),
+      names.contains (keyFn kv.1) = true := by
+  intro ⟨k, v⟩ hkv
+  simp only [List.mem_filter, Bool.or_eq_true, Bool.not_eq_true'] at hkv
+  rcases hkv.2 with hp | hn
+  · exact absurd ((hxs (k, v) hkv.1).symm.trans hp) (fun h => Bool.false_ne_true h.symm)
+  · exact hn
+
+private theorem filter_managed_lookup_none {α : Type} {prev names : List String} {keyFn : String → String}
+    {xs : List (String × α)} (hxs : ∀ kv ∈ xs, prev.contains (keyFn kv.1) = true)
+    (k : String) (hns : names.contains (keyFn k) = true → lookupAssoc k xs = none) :
+    lookupAssoc k (xs.filter fun (k', _) => !prev.contains (keyFn k') || names.contains (keyFn k')) = none := by
+  rw [lookupAssoc_filter (fun k' => !prev.contains (keyFn k') || names.contains (keyFn k'))]
+  by_cases hp : prev.contains (keyFn k) = true
+  · by_cases hn : names.contains (keyFn k) = true
+    · simp only [hp, hn, Bool.not_true, Bool.false_or, ↓reduceIte]; exact hns hn
+    · simp only [hp, Bool.not_true, Bool.false_or, Bool.eq_false_iff.2 hn, Bool.false_eq_true, ↓reduceIte]
+  · cases hl : lookupAssoc k xs with
+    | none => simp only [Bool.eq_false_iff.2 hp, Bool.not_false, Bool.true_or, ↓reduceIte]
+    | some v => exact absurd (hxs (k, v) (lookupAssoc_mem hl)) hp
+
+private theorem ElemManaged_foldl_norm (attrs : List (Attr msg)) (s : SpecElemState msg)
+    (hs : ElemManaged s ((normalizeAttrs attrs).filterMap managedAttrName)) :
+    ElemManaged ((normalizeAttrs attrs).foldl stepSpecAttr s) ((normalizeAttrs attrs).filterMap managedAttrName) := by
+  let names := (normalizeAttrs attrs).filterMap managedAttrName
+  have hpres : ∀ (xs : List (Attr msg)) (cur : SpecElemState msg),
+      (∀ x ∈ xs, match managedAttrName x with | some n => names.contains n = true | none => True) →
+      ElemManaged cur names → ElemManaged (xs.foldl stepSpecAttr cur) names := by
+    intro xs; induction xs with
+    | nil => intro _ _ h; exact h
+    | cons x rest ih =>
+        intro cur hx hcur
+        exact ih _ (fun y hy => hx y (List.mem_cons_of_mem x hy))
+          (stepSpecAttr_retains_managed cur x names (hx x (List.mem_cons_self ..)) hcur)
+  refine hpres (normalizeAttrs attrs) s (fun x hx => ?_) hs
+  cases hmName : managedAttrName x with
+  | none => trivial
+  | some n => exact List.contains_iff_mem.2 (List.mem_filterMap.2 ⟨x, hx, hmName⟩)
 
 theorem applyAttrsM_existing_element (a : DomArena msg) (node : Dom.Node)
     (ns tag : String) (st : SpecElemState msg) (prev : List String) (cs : List Dom.Node)
@@ -553,9 +684,7 @@ theorem applyAttrsM_existing_element (a : DomArena msg) (node : Dom.Node)
     let names := norm.filterMap managedAttrName
     let a' := (applyAttrsM (m := StateM (DomArena msg)) node newAttrs (a.set node (.element ns tag st prev cs))).2
     ∃ st', a'.get node = .element ns tag st' names cs ∧
-      (∀ k, lookupAssoc k st'.attrs = lookupAssoc k (evalSpecAttrs newAttrs).attrs) ∧
-      st'.value = (evalSpecAttrs newAttrs).value ∧
-      st'.checked = (evalSpecAttrs newAttrs).checked ∧
+      ElemStateEquiv st' (evalSpecAttrs newAttrs) ∧
       ElemManaged st' names := by
   dsimp only [applyAttrsM, bind, StateT.bind, MonadDom.retainAttributes, DomArena.modify]
   rw [DomArena.get_set_self, DomArena.set_set]
@@ -564,26 +693,15 @@ theorem applyAttrsM_existing_element (a : DomArena msg) (node : Dom.Node)
   let val' := if prev.contains "value" && !names.contains "value" then "" else st.value
   let chk' := if prev.contains "checked" && !names.contains "checked" then false else st.checked
   let attrs' := st.attrs.filter fun (k, _) => !prev.contains k || names.contains k
-  let st0 : SpecElemState msg := { st with attrs := attrs', value := val', checked := chk' }
+  let clicks' := st.clicks.filter fun (e, _) => !prev.contains s!"data-qed-on-{e}" || names.contains s!"data-qed-on-{e}"
+  let inputs' := st.inputs.filter fun (e, _) => !prev.contains s!"data-qed-onv-{e}" || names.contains s!"data-qed-onv-{e}"
+  let st0 : SpecElemState msg := { st with attrs := attrs', value := val', checked := chk', clicks := clicks', inputs := inputs' }
   rw [applyAttrListM_element norm a node ns tag st0 names cs, DomArena.get_set_self]
-  refine ⟨norm.foldl stepSpecAttr st0, rfl, ?_, ?_, ?_, ?_⟩
-  · intro k
-    apply foldl_stepSpecAttr_attrs k norm st0 {}
+  refine ⟨norm.foldl stepSpecAttr st0, rfl, ⟨?_, ?_, ?_, ?_, ?_⟩, ?_⟩
+  · intro k; apply foldl_stepSpecAttr_attrs k norm st0 {}
     by_cases hw : ∃ x ∈ norm, attrWritesKey k x = true
     · exact .inl hw
-    · right
-      change lookupAssoc k attrs' = none
-      cases hl : lookupAssoc k attrs' with
-      | none => rfl
-      | some v =>
-          exfalso
-          have hmem := lookupAssoc_mem hl
-          simp only [attrs', List.mem_filter] at hmem
-          have hprev := hm.1 (k, v) hmem.1
-          simp only [hprev, Bool.not_true, Bool.false_or] at hmem
-          rcases hNoShadow.1 k hmem.2 with hw' | hnoneSt
-          · exact hw hw'
-          · exact lookupAssoc_mem_ne hmem.1 hnoneSt
+    · exact .inr (filter_managed_lookup_none (keyFn := id) hm.1 k fun hn => (hNoShadow.1 k hn).resolve_left hw)
   · apply foldl_stepSpecAttr_val norm st0 {}
     by_cases hv : ∃ v, .attr "value" v ∈ norm
     · exact .inr hv
@@ -601,19 +719,27 @@ theorem applyAttrsM_existing_element (a : DomArena msg) (node : Dom.Node)
     · exact .inr hc
     · left; change chk' = false; dsimp only [chk']
       by_cases hnc : names.contains "checked" = true
-      · rcases hNoShadow.2.2 hnc with hc' | hst
+      · rcases hNoShadow.2.2.1 hnc with hc' | hst
         · exact False.elim (hc hc')
         · simp only [hnc, Bool.not_true, Bool.and_false]; exact hst
       · have hncF : names.contains "checked" = false := Bool.eq_false_iff.2 hnc
         cases hst : st.checked
         · simp only [hncF, Bool.not_false, Bool.and_true]; cases prev.contains "checked" <;> simp
-        · simp only [hm.2.2 hst, hncF, Bool.not_false, Bool.and_self, ↓reduceIte]
+        · simp only [hm.2.2.1 hst, hncF, Bool.not_false, Bool.and_self, ↓reduceIte]
+  · intro e; apply foldl_stepSpecAttr_clicks e norm st0 {}
+    by_cases hcl : ∃ m, .on e m ∈ norm
+    · exact .inl hcl
+    · exact .inr (filter_managed_lookup_none (keyFn := fun e => s!"data-qed-on-{e}") hm.2.2.2.1 e
+        fun hn => (hNoShadow.2.2.2.1 e hn).resolve_left hcl)
+  · intro e; apply foldl_stepSpecAttr_inputs e norm st0 {}
+    by_cases hin : ∃ f, .onValue e f ∈ norm
+    · exact .inl hin
+    · exact .inr (filter_managed_lookup_none (keyFn := fun e => s!"data-qed-onv-{e}") hm.2.2.2.2 e
+        fun hn => (hNoShadow.2.2.2.2 e hn).resolve_left hin)
   · have hm0 : ElemManaged st0 names := by
-      refine ⟨fun ⟨k, v⟩ hkv => ?_, fun hne => ?_, fun hchk => ?_⟩
-      · simp only [st0, attrs', List.mem_filter] at hkv
-        have hprev := hm.1 (k, v) hkv.1
-        rcases hkv with ⟨_, h2⟩
-        simp only [hprev, Bool.not_true, Bool.false_or] at h2; exact h2
+      refine ⟨filter_managed_prop (keyFn := id) hm.1, fun hne => ?_, fun hchk => ?_,
+        filter_managed_prop (keyFn := fun e => s!"data-qed-on-{e}") hm.2.2.2.1,
+        filter_managed_prop (keyFn := fun e => s!"data-qed-onv-{e}") hm.2.2.2.2⟩
       · by_cases hnv : names.contains "value" = true
         · exact hnv
         · have hnvF : names.contains "value" = false := Bool.eq_false_iff.2 hnv
@@ -626,21 +752,9 @@ theorem applyAttrsM_existing_element (a : DomArena msg) (node : Dom.Node)
         · have hncF : names.contains "checked" = false := Bool.eq_false_iff.2 hnc
           cases hst : st.checked
           · simp only [st0, chk', hst, ite_self, Bool.false_eq_true] at hchk
-          · have hpc := hm.2.2 hst
+          · have hpc := hm.2.2.1 hst
             simp only [st0, chk', hpc, hncF, Bool.not_false, Bool.and_self, ↓reduceIte, Bool.false_eq_true] at hchk
-    have hpres : ∀ (xs : List (Attr msg)) (s : SpecElemState msg),
-        (∀ x ∈ xs, match managedAttrName x with | some n => names.contains n = true | none => True) →
-        ElemManaged s names → ElemManaged (xs.foldl stepSpecAttr s) names := by
-      intro xs; induction xs with
-      | nil => intro _ _ h; exact h
-      | cons x rest ih =>
-          intro s hx hs
-          exact ih _ (fun y hy => hx y (List.mem_cons_of_mem x hy))
-            (stepSpecAttr_retains_managed s x names (hx x (List.mem_cons_self ..)) hs)
-    refine hpres norm st0 (fun x hx => ?_) hm0
-    cases hmName : managedAttrName x with
-    | none => trivial
-    | some n => exact List.contains_iff_mem.2 (List.mem_filterMap.2 ⟨x, hx, hmName⟩)
+    exact ElemManaged_foldl_norm newAttrs st0 hm0
 
 def isSpecialManagedKey (k : String) : Bool :=
   k == "value" || k == "checked" ||
@@ -694,11 +808,19 @@ theorem mem_normalizeAttrs_DomClean {attrs : List (Attr msg)} (hc : attrs.all At
     · simp only [List.mem_singleton] at hm; subst hm; rfl
   · exact hc x (List.mem_filter.1 (mem_dedupAttrs hd)).1
 
+private theorem append_drop11_ne {p e q : String}
+    (hp : ((p ++ e).toList.drop 11).head? ≠ (q.toList.drop 11).head?) : p ++ e ≠ q :=
+  fun h => hp (congrArg (fun s => (s.toList.drop 11).head?) h)
+
+private theorem isSpecialManagedKey_on_contra {p : String} (e : String) (hp : p = "data-qed-on-" ∨ p = "data-qed-onv-")
+    (h1 : (!isSpecialManagedKey (p ++ e)) = true) : False := by
+  rcases hp with rfl | rfl <;> simp [isSpecialManagedKey, String.startsWith] at h1
+
 theorem AttrsNoShadow_of_clean {newAttrs : List (Attr msg)} {st : SpecElemState msg} {prev : List String}
     (hst : ElemClean st prev) (hc : newAttrs.all Attr.DomClean = true) :
     AttrsNoShadow newAttrs st := by
   have hnorm := mem_normalizeAttrs_DomClean hc
-  refine ⟨fun k hk => ?_, fun hval => ?_, fun hchk => ?_⟩
+  refine ⟨fun k hk => ?_, fun hval => ?_, fun hchk => ?_, fun e hev => ?_, fun e hinp => ?_⟩
   · rw [List.contains_iff_mem] at hk
     rcases List.mem_filterMap.1 hk with ⟨x, hxMem, hxName⟩
     have hxc := hnorm x hxMem
@@ -748,6 +870,50 @@ theorem AttrsNoShadow_of_clean {newAttrs : List (Attr msg)} {st : SpecElemState 
     | on _ _ | onValue _ _ =>
         simp only [managedAttrName, Option.some.injEq] at hxName
         have hd := congrArg (·.toList.head?) hxName; simp [String.toList_append] at hd
+  · rw [List.contains_iff_mem] at hev
+    rcases List.mem_filterMap.1 hev with ⟨x, hxMem, hxName⟩
+    have hxc := hnorm x hxMem
+    cases x with
+    | on e' ev =>
+        simp only [managedAttrName, Option.some.injEq] at hxName
+        have heq := string_append_left_cancel hxName; subst heq; exact .inl ⟨ev, hxMem⟩
+    | onValue _ _ | signalBind _ | cls _ | localCell _ _ _ _ _ =>
+        simp only [managedAttrName, Option.some.injEq] at hxName
+        have hd := congrArg (fun s => s.toList.drop 11 |>.head?) hxName; simp [String.toList_append] at hd
+    | key _ => simp [managedAttrName] at hxName
+    | signalAttr _ _ _ => simp [Attr.DomClean] at hxc
+    | attr k' _ =>
+        simp only [managedAttrName, Option.some.injEq] at hxName; subst hxName
+        have hv : ("data-qed-on-" ++ e) ≠ "value" :=
+          append_drop11_ne (by simp [String.toList_append])
+        exact False.elim (isSpecialManagedKey_on_contra e (.inl rfl) (by simpa [Attr.DomClean, hv] using hxc))
+    | flag k' _ =>
+        simp only [managedAttrName, Option.some.injEq] at hxName; subst hxName
+        have hc' : ("data-qed-on-" ++ e) ≠ "checked" :=
+          append_drop11_ne (by simp [String.toList_append])
+        exact False.elim (isSpecialManagedKey_on_contra e (.inl rfl) (by simpa [Attr.DomClean, hc'] using hxc))
+  · rw [List.contains_iff_mem] at hinp
+    rcases List.mem_filterMap.1 hinp with ⟨x, hxMem, hxName⟩
+    have hxc := hnorm x hxMem
+    cases x with
+    | onValue e' f =>
+        simp only [managedAttrName, Option.some.injEq] at hxName
+        have heq := string_append_left_cancel hxName; subst heq; exact .inl ⟨f, hxMem⟩
+    | on _ _ | signalBind _ | cls _ | localCell _ _ _ _ _ =>
+        simp only [managedAttrName, Option.some.injEq] at hxName
+        have hd := congrArg (fun s => s.toList.drop 11 |>.head?) hxName; simp [String.toList_append] at hd
+    | key _ => simp [managedAttrName] at hxName
+    | signalAttr _ _ _ => simp [Attr.DomClean] at hxc
+    | attr k' _ =>
+        simp only [managedAttrName, Option.some.injEq] at hxName; subst hxName
+        have hv : ("data-qed-onv-" ++ e) ≠ "value" :=
+          append_drop11_ne (by simp [String.toList_append])
+        exact False.elim (isSpecialManagedKey_on_contra e (.inr rfl) (by simpa [Attr.DomClean, hv] using hxc))
+    | flag k' _ =>
+        simp only [managedAttrName, Option.some.injEq] at hxName; subst hxName
+        have hc' : ("data-qed-onv-" ++ e) ≠ "checked" :=
+          append_drop11_ne (by simp [String.toList_append])
+        exact False.elim (isSpecialManagedKey_on_contra e (.inr rfl) (by simpa [Attr.DomClean, hc'] using hxc))
 
 theorem stepSpecAttr_preserves_clean (s : SpecElemState msg) (a : Attr msg)
     (hca : a.DomClean = true) (hcs : ∀ k, isSpecialManagedKey k = true → lookupAssoc k s.attrs = none) :
@@ -783,21 +949,9 @@ theorem ElemClean_foldl {xs : List (Attr msg)} {st : SpecElemState msg}
   | cons x rest ih => exact ih (fun y hy => hcxs y (.tail _ hy)) (stepSpecAttr_preserves_clean st x (hcxs x (.head _)) hcst)
 
 theorem ElemClean_evalSpecAttrs {attrs : List (Attr msg)} (hc : attrs.all Attr.DomClean = true) :
-    ElemClean (evalSpecAttrs attrs) ((normalizeAttrs attrs).filterMap managedAttrName) := by
-  refine ⟨?_, ElemClean_foldl (mem_normalizeAttrs_DomClean hc) (fun _ _ => rfl)⟩
-  let names := (normalizeAttrs attrs).filterMap managedAttrName
-  have hp : ∀ (xs : List (Attr msg)) (s : SpecElemState msg),
-      (∀ x ∈ xs, match managedAttrName x with | some n => names.contains n = true | none => True) →
-      ElemManaged s names → ElemManaged (xs.foldl stepSpecAttr s) names := by
-    intro xs; induction xs with
-    | nil => intro _ _ h; exact h
-    | cons x rest ih => intro s hx hs; exact ih _ (fun y hy => hx y (.tail _ hy)) (stepSpecAttr_retains_managed s x names (hx x (.head _)) hs)
-  have hmem : ∀ x ∈ normalizeAttrs attrs,
-      match managedAttrName x with | some n => names.contains n = true | none => True := fun x hx => by
-    cases hm : managedAttrName x with
-    | none => trivial
-    | some n => exact List.contains_iff_mem.2 (List.mem_filterMap.2 ⟨x, hx, hm⟩)
-  exact hp (normalizeAttrs attrs) {} hmem ElemManaged_empty
+    ElemClean (evalSpecAttrs attrs) ((normalizeAttrs attrs).filterMap managedAttrName) :=
+  ⟨ElemManaged_foldl_norm attrs {} ElemManaged_empty,
+   ElemClean_foldl (mem_normalizeAttrs_DomClean hc) (fun _ _ => rfl)⟩
 
 theorem ElemClean_applyAttrsM (a : DomArena msg) (node : Dom.Node)
     (ns tag : String) (st : SpecElemState msg) (prev : List String) (cs : List Dom.Node)
@@ -806,21 +960,15 @@ theorem ElemClean_applyAttrsM (a : DomArena msg) (node : Dom.Node)
     let names := norm.filterMap managedAttrName
     let a' := (applyAttrsM (m := StateM (DomArena msg)) node newAttrs (a.set node (.element ns tag st prev cs))).2
     ∃ st', a'.get node = .element ns tag st' names cs ∧
-      (∀ k, lookupAssoc k st'.attrs = lookupAssoc k (evalSpecAttrs newAttrs).attrs) ∧
-      st'.value = (evalSpecAttrs newAttrs).value ∧
-      st'.checked = (evalSpecAttrs newAttrs).checked ∧
+      ElemStateEquiv st' (evalSpecAttrs newAttrs) ∧
       ElemClean st' names := by
   have he := applyAttrsM_existing_element a node ns tag st prev cs newAttrs hst.1 (AttrsNoShadow_of_clean hst hc)
-  rcases he with ⟨st', hget, hattrs, hval, hchk, hm'⟩
-  refine ⟨st', hget, hattrs, hval, hchk, hm', fun k hk => ?_⟩
-  rw [hattrs k]
+  rcases he with ⟨st', hget, heqv, hm'⟩
+  refine ⟨st', hget, heqv, hm', fun k hk => ?_⟩
+  rw [heqv.1 k]
   exact (ElemClean_evalSpecAttrs hc).2 k hk
 
 /-! ## `DomTreeAssocEquiv` & Bounded Subtree Framing -/
-
-def ElemStateEquiv {msg : Type} (st₁ st₂ : SpecElemState msg) : Prop :=
-  (∀ k, lookupAssoc k st₁.attrs = lookupAssoc k st₂.attrs) ∧
-  st₁.value = st₂.value ∧ st₁.checked = st₂.checked
 
 mutual
   def DomTreeAssocEquiv {msg : Type} : DomTree msg → DomTree msg → Prop
@@ -838,7 +986,7 @@ end
 mutual
   theorem DomTreeAssocEquiv.refl : ∀ t : DomTree msg, DomTreeAssocEquiv t t
     | .text _ => rfl
-    | .element _ _ _ cs => ⟨rfl, rfl, ⟨fun _ => rfl, rfl, rfl⟩, DomTreeListAssocEquiv.refl cs⟩
+    | .element _ _ st cs => ⟨rfl, rfl, ElemStateEquiv.refl st, DomTreeListAssocEquiv.refl cs⟩
 
   theorem DomTreeListAssocEquiv.refl : ∀ cs : List (DomTree msg), DomTreeListAssocEquiv cs cs
     | [] => trivial
@@ -848,8 +996,8 @@ end
 mutual
   theorem DomTreeAssocEquiv.symm : ∀ {t₁ t₂ : DomTree msg}, DomTreeAssocEquiv t₁ t₂ → DomTreeAssocEquiv t₂ t₁
     | .text _, .text _, h => Eq.symm h
-    | .element _ _ _ _, .element _ _ _ _, ⟨h1, h2, ⟨ha, hv, hc⟩, hcs⟩ =>
-        ⟨h1.symm, h2.symm, ⟨fun k => (ha k).symm, hv.symm, hc.symm⟩, DomTreeListAssocEquiv.symm hcs⟩
+    | .element _ _ _ _, .element _ _ _ _, ⟨h1, h2, hst, hcs⟩ =>
+        ⟨h1.symm, h2.symm, hst.symm, DomTreeListAssocEquiv.symm hcs⟩
     | .text _, .element _ _ _ _, h => False.elim h
     | .element _ _ _ _, .text _, h => False.elim h
 
@@ -865,10 +1013,8 @@ mutual
       ∀ {t₁ t₂ t₃ : DomTree msg}, DomTreeAssocEquiv t₁ t₂ → DomTreeAssocEquiv t₂ t₃ → DomTreeAssocEquiv t₁ t₃
     | .text _, .text _, .text _, h1, h2 => Eq.trans h1 h2
     | .element _ _ _ _, .element _ _ _ _, .element _ _ _ _,
-      ⟨hns1, ht1, ⟨ha1, hv1, hc1⟩, hcs1⟩, ⟨hns2, ht2, ⟨ha2, hv2, hc2⟩, hcs2⟩ =>
-        ⟨hns1.trans hns2, ht1.trans ht2,
-         ⟨fun k => (ha1 k).trans (ha2 k), hv1.trans hv2, hc1.trans hc2⟩,
-         DomTreeListAssocEquiv.trans hcs1 hcs2⟩
+      ⟨hns1, ht1, hst1, hcs1⟩, ⟨hns2, ht2, hst2, hcs2⟩ =>
+        ⟨hns1.trans hns2, ht1.trans ht2, hst1.trans hst2, DomTreeListAssocEquiv.trans hcs1 hcs2⟩
     | .text _, .text _, .element _ _ _ _, _, h2 => False.elim h2
     | .text _, .element _ _ _ _, _, h1, _ => False.elim h1
     | .element _ _ _ _, .text _, _, h1, _ => False.elim h1
@@ -1194,5 +1340,134 @@ theorem buildDomM_not_fragment {msg : Type} (ns : String) (h : Html msg) (a : Do
       cases fuel with
       | zero => simp [htmlDepth] at hdep
       | succ _ => intro hf; dsimp only [readDomTree] at hread; rw [hf] at hread; cases hread
+
+theorem applyAttrsM_withSignals {msg : Type} (sigs : List (String × String))
+    (node : Dom.Node) (attrs : List (Attr msg)) (a : DomArena msg) :
+    (applyAttrsM (m := StateM (DomArena msg)) node attrs { a with signals := sigs }).2 =
+      { ((applyAttrsM (m := StateM (DomArena msg)) node attrs).run a).2 with signals := sigs } := by
+  have h1 : ∀ (xs : List (Attr msg)) (s : DomArena msg),
+      (applyAttrListM (m := StateM (DomArena msg)) node xs { s with signals := sigs }).2 =
+        { (applyAttrListM (m := StateM (DomArena msg)) node xs s).2 with signals := sigs } := by
+    intro xs; induction xs with
+    | nil => intro _; rfl
+    | cons x rest ih =>
+        intro s
+        dsimp only [applyAttrListM, bind, StateT.bind]
+        have hx : (applyAttrM (m := StateM (DomArena msg)) node x { s with signals := sigs }) =
+            ((), { (applyAttrM (m := StateM (DomArena msg)) node x s).2 with signals := sigs }) := by
+          cases x with
+          | attr k _ => by_cases hk : k = "value" <;> simp [applyAttrM, hk, MonadDom.setValue, MonadDom.setAttribute, DomArena.modify, DomArena.set, DomArena.get]
+          | flag k p => by_cases hk : k = "checked" <;> cases p <;> simp [applyAttrM, hk, MonadDom.setChecked, MonadDom.setAttribute, MonadDom.removeAttribute, DomArena.modify, DomArena.set, DomArena.get]
+          | key _ => rfl
+          | _ => simp [applyAttrM, MonadDom.setAttribute, MonadDom.onEvent, MonadDom.onValueEvent, MonadDom.mountLocalCell, MonadDom.bindSignal, MonadDom.bindSignalAttr, DomArena.modify, DomArena.set, DomArena.get]
+        have hx1 : (applyAttrM (m := StateM (DomArena msg)) node x { s with signals := sigs }).1 = () := congrArg Prod.fst hx
+        have hx2 : (applyAttrM (m := StateM (DomArena msg)) node x { s with signals := sigs }).2 =
+            { (applyAttrM (m := StateM (DomArena msg)) node x s).2 with signals := sigs } := congrArg Prod.snd hx
+        cases hr1 : applyAttrM (m := StateM (DomArena msg)) node x { s with signals := sigs } with
+        | mk _ s1 =>
+            cases hr2 : applyAttrM (m := StateM (DomArena msg)) node x s with
+            | mk _ s2 =>
+                rw [hr1] at hx2; rw [hr2] at hx2; dsimp only at hx2; rw [hx2]; exact ih s2
+  dsimp only [applyAttrsM, StateT.run, bind, StateT.bind]
+  let a1 := (MonadDom.retainAttributes (m := StateM (DomArena msg)) node ((normalizeAttrs attrs).filterMap managedAttrName) a).2
+  change (applyAttrListM (m := StateM (DomArena msg)) node (normalizeAttrs attrs) { a1 with signals := sigs }).2 =
+    { (applyAttrListM (m := StateM (DomArena msg)) node (normalizeAttrs attrs) a1).2 with signals := sigs }
+  exact h1 (normalizeAttrs attrs) a1
+
+mutual
+  theorem buildDomM_withSignals {msg : Type} (sigs : List (String × String)) (ns : String) :
+      ∀ (h : Html msg) (a : DomArena msg),
+        (buildDomM (m := StateM (DomArena msg)) ns h { a with signals := sigs }).1 =
+          (buildDomM (m := StateM (DomArena msg)) ns h a).1 ∧
+        (buildDomM (m := StateM (DomArena msg)) ns h { a with signals := sigs }).2 =
+          { (buildDomM (m := StateM (DomArena msg)) ns h a).2 with signals := sigs }
+    | .text _, _ => ⟨rfl, rfl⟩
+    | .element tag attrs children, a => by
+        dsimp only [buildDomM, MonadDom.createElement, DomArena.alloc, bind, StateT.bind, pure, StateT.pure]
+        let a0 : DomArena msg := {
+          nextId := a.nextId + 1
+          store := fun m =>
+            if m == UInt32.ofNat a.nextId then
+              .element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag {} [] []
+            else a.store m
+          signals := a.signals }
+        have ha := applyAttrsM_withSignals sigs (UInt32.ofNat a.nextId) attrs a0
+        dsimp only [StateT.run] at ha
+        cases hr1 : applyAttrsM (m := StateM (DomArena msg)) (UInt32.ofNat a.nextId) attrs { a0 with signals := sigs } with
+        | mk _ s1 =>
+            cases hr2 : applyAttrsM (m := StateM (DomArena msg)) (UInt32.ofNat a.nextId) attrs a0 with
+            | mk _ s2 =>
+                have hsEq : s1 = { s2 with signals := sigs } := by
+                  rw [hr1, hr2] at ha; exact ha
+                rw [hsEq]
+                cases ownsChildren attrs with
+                | true => exact ⟨rfl, rfl⟩
+                | false =>
+                    simp only [Bool.not_false, ↓reduceIte, bind, StateT.bind, pure, StateT.pure]
+                    have hk := buildDomListM_withSignals sigs (Dom.childNsOf ns tag) (UInt32.ofNat a.nextId) children s2
+                    cases hb1 : buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) (UInt32.ofNat a.nextId) children { s2 with signals := sigs } with
+                    | mk _ b1 =>
+                        cases hb2 : buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) (UInt32.ofNat a.nextId) children s2 with
+                        | mk _ b2 =>
+                            dsimp only; rw [hb1, hb2] at hk; exact ⟨rfl, hk⟩
+
+  theorem buildDomListM_withSignals {msg : Type} (sigs : List (String × String)) (ns : String) (parent : Dom.Node) :
+      ∀ (cs : List (Html msg)) (a : DomArena msg),
+        (buildDomListM (m := StateM (DomArena msg)) ns parent cs { a with signals := sigs }).2 =
+          { (buildDomListM (m := StateM (DomArena msg)) ns parent cs a).2 with signals := sigs }
+    | [], _ => rfl
+    | c :: rest, a => by
+        have hc := buildDomM_withSignals sigs ns c a
+        dsimp only [buildDomListM, bind, StateT.bind, pure, StateT.pure]
+        cases hb1 : buildDomM (m := StateM (DomArena msg)) ns c { a with signals := sigs } with
+        | mk cn1 a1 =>
+            cases hb2 : buildDomM (m := StateM (DomArena msg)) ns c a with
+            | mk cn2 a2 =>
+                rw [hb1, hb2] at hc; dsimp only at hc
+                rcases hc with ⟨rfl, rfl⟩
+                dsimp only
+                have happ : (MonadDom.appendChild (m := StateM (DomArena msg)) parent cn1 { a2 with signals := sigs }).2 =
+                    { (MonadDom.appendChild (m := StateM (DomArena msg)) parent cn1 a2).2 with signals := sigs } := by
+                  simp only [MonadDom.appendChild, DomArena.get, DomArena.set, DomArena.modifyChildren, DomArena.modify]
+                  cases a2.store cn1 <;> rfl
+                cases ha1 : MonadDom.appendChild (m := StateM (DomArena msg)) parent cn1 { a2 with signals := sigs } with
+                | mk _ s1 =>
+                    cases ha2 : MonadDom.appendChild (m := StateM (DomArena msg)) parent cn1 a2 with
+                    | mk _ s2 =>
+                        dsimp only
+                        rw [ha1, ha2] at happ; dsimp only at happ; rw [happ]
+                        exact buildDomListM_withSignals sigs ns parent rest s2
+end
+
+theorem seedRowsM_sameDom {msg : Type} (inst : String) (rowSig : Nat → Array (String × String))
+    (newMarks oldMarks : Array USize) (oldSigs : Array (Array (String × String))) (a : DomArena msg) :
+    ((seedRowsM (m := StateM (DomArena msg)) inst rowSig newMarks oldMarks oldSigs).run a).2.SameDom a := by
+  dsimp only [seedRowsM, StateT.run, bind, StateT.bind, pure, StateT.pure]
+  cases hd : diffRowSigs rowSig inst newMarks oldMarks oldSigs 0 #[] #[] with
+  | mk _ toEmit =>
+      have he := emitSignalsM_spec toEmit.toList a
+      dsimp only [StateT.run] at he
+      cases hem : emitSignalsM (m := StateM (DomArena msg)) toEmit.toList a with
+      | mk _ a' =>
+          rw [hem] at he
+          rcases Prod.mk.inj he with ⟨_, rfl⟩
+          exact ⟨rfl, rfl⟩
+
+theorem buildDomM_sameDom {msg : Type} (ns : String) (h : Html msg) {a₁ a₂ : DomArena msg}
+    (hs : a₁.SameDom a₂) :
+    (buildDomM (m := StateM (DomArena msg)) ns h a₁).1 = (buildDomM (m := StateM (DomArena msg)) ns h a₂).1 ∧
+    (buildDomM (m := StateM (DomArena msg)) ns h a₁).2.SameDom (buildDomM (m := StateM (DomArena msg)) ns h a₂).2 := by
+  have heq : a₁ = { a₂ with signals := a₁.signals } := DomArena.ext hs.1 hs.2 rfl
+  rw [heq]
+  have hw := buildDomM_withSignals a₁.signals ns h a₂
+  exact ⟨hw.1, by rw [hw.2]; exact ⟨rfl, rfl⟩⟩
+
+theorem buildDomListM_sameDom {msg : Type} (ns : String) (parent : Dom.Node) (cs : List (Html msg))
+    {a₁ a₂ : DomArena msg} (hs : a₁.SameDom a₂) :
+    (buildDomListM (m := StateM (DomArena msg)) ns parent cs a₁).2.SameDom
+      (buildDomListM (m := StateM (DomArena msg)) ns parent cs a₂).2 := by
+  have heq : a₁ = { a₂ with signals := a₁.signals } := DomArena.ext hs.1 hs.2 rfl
+  rw [heq, buildDomListM_withSignals a₁.signals ns parent cs a₂]
+  exact ⟨rfl, rfl⟩
 
 end Qed

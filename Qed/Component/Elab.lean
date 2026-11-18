@@ -582,8 +582,24 @@ private def mkCompLocalDefCmds (spec : ComponentSpec) (idLit : StrLit) :
           localMountWith $idLit key onOut))
   return cmds
 
-private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool) :
-    CommandElabM (Array (TSyntax `command) × TSyntax `command) := do
+private def canSynthDecidablePred (stateId : Ident) (pred : Term) : CommandElabM Bool := do
+  let saved ← get
+  try
+    let ok ← liftTermElabM do
+      let preCount := (← Core.getMessageLog).toList.length
+      let pVal ← Term.elabTermEnsuringType pred (← Term.elabType (← `($stateId → Prop)))
+      Term.synthesizeSyntheticMVarsNoPostponing
+      if ((← Core.getMessageLog).toList.drop preCount).any (·.severity == .error) then return false
+      let expected ← Meta.mkAppM ``DecidablePred #[pVal]
+      return (← Meta.trySynthInstance expected) matches .some _
+    modify fun _ => saved
+    return ok
+  catch _ =>
+    modify fun _ => saved
+    return false
+
+private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool)
+    (stateInvPreds : Array Term) : CommandElabM (Array (TSyntax `command) × TSyntax `command) := do
   let doc?       := spec.doc?
   let tId        := spec.t.getId
   let stateId    := mkIdent (tId ++ `State)
@@ -621,7 +637,7 @@ private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool
         (locals := $regsId) (styles := qedInternalStyles% $viewId) (onPort := $onPortArg))
   let dehydApp : Term ← if spec.ephemeralFields.isEmpty then `(qedInternalAutoDehydrate% $initId $baseApp)
     else `(Qed.Internal.App.withDehydrate (Dehydrate.except $initId [$[$spec.ephemeralFields:ident],*]) $baseApp)
-  let finalApp : Term ← if spec.queries.isEmpty then pure dehydApp else do
+  let queriedApp : Term ← if spec.queries.isEmpty then pure dehydApp else do
     let qTerms ← spec.queries.mapM fun q => do
       let qNm := q.id
       let qCtor := mkIdent (tId ++ `Msg ++ q.ctorName)
@@ -633,18 +649,42 @@ private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool
           (get := fun (s : $stateId) => s.$qNm:ident)
           (set := fun c (s : $stateId) => { s with $qNm:ident := c }))
     `(Qed.Internal.App.withQueries [$[$qTerms],*] $dehydApp)
+  let compInv? : Option Term ← if stateInvPreds.isEmpty then pure none
+    else if stateInvPreds.size == 1 then pure (some (← `(($(stateInvPreds[0]!) : $stateId → Prop))))
+    else do
+      let sVar := mkIdent `_qed_s
+      let checks ← stateInvPreds.mapM fun p => `(($p) $sVar)
+      pure (some (← `(fun ($sVar:ident : $stateId) => $(← mkConjBody checks))))
+  let hasDecInv ← match compInv? with
+    | some inv => canSynthDecidablePred stateId inv
+    | none     => pure false
+  let finalApp : Term ← match compInv?, hasDecInv with
+    | some inv, true => `(Qed.App.guardRehydrate ($inv) $queriedApp)
+    | _, _           => pure queriedApp
   let appIdent := mkIdent (tId ++ `app)
   let viewIdent := mkIdent (tId ++ `view)
   cmds := cmds.push (← `(command| $[$doc?:docComment]? def $appIdent : App $stateId $msgId :=
     $finalApp))
+  match compInv?, hasDecInv with
+  | some inv, true =>
+      cmds := cmds.push (← `(command|
+        theorem $(mkIdent (tId ++ `rehydrate_inv)) (raw : String) (m' : $stateId) :
+            ($appIdent).rehydrate raw = some m' → ($inv) m' :=
+          Qed.App.guardRehydrate_sound _ _ _ raw m'))
+  | some inv, false =>
+      cmds := cmds.push (← `(command|
+        theorem $(mkIdent (tId ++ `dehydrate_inv)) :
+            ∀ m m', ($inv) m → ($appIdent).rehydrate (($appIdent).dehydrate m) = some m' → ($inv) m' := by
+          dsimp only [$appIdent:ident]; qedProveDehydrateInv))
+  | none, _ => pure ()
   let appViewEqCmd ← `(command|
     theorem $(mkIdent (tId ++ `app_view_eq)) (s : $stateId) :
         Qed.Html.canonical (Qed.App.view $appIdent s) = Qed.Html.canonical ($viewIdent s) := by
       qedProveViewEquiv $appIdent $viewIdent)
   return (cmds, appViewEqCmd)
 
-private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (body' : Term) (idLit : StrLit) :
-    CommandElabM (Array (TSyntax `command) × Bool × Bool × Option (TSyntax `command)) := do
+private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (idLit : StrLit) :
+    CommandElabM (Array (TSyntax `command) × Bool × Bool) := do
   let tId        := spec.t.getId
   let fs         := spec.states.map (·.id)
   let stateId    := mkIdent (tId ++ `State)
@@ -655,7 +695,6 @@ private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (b
   let regId      := mkIdent (tId ++ `reg)
   let regsId     := mkIdent (tId ++ `regs)
   let mut cmds : Array (TSyntax `command) := #[]
-  let mut appViewEqCmd? : Option (TSyntax `command) := none
   if spec.mountable then
     let dsT := spec.states.filterMap (·.def?)
     cmds := cmds.push (← `(command| def $initId : $stateId := { $[$fs:ident := $dsT],* }))
@@ -692,11 +731,7 @@ private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (b
   let own : Term ← if hasLocalDef then `([$regId]) else `(([] : List LocalDef))
   cmds := cmds.push (← `(command| def $regsId : List LocalDef :=
     LocalDef.dedupe ($own ++ qedInternalLocalRegistrations% $viewId)))
-  if spec.mountable && spec.outTy?.isNone && !spec.hasProps && !spec.hasSlotsOrKids then
-    let (appCmds, eqCmd) ← mkCompAppCmds spec body' hasStart
-    cmds := cmds ++ appCmds
-    appViewEqCmd? := some eqCmd
-  return (cmds, hasStart, hasLocalDef, appViewEqCmd?)
+  return (cmds, hasStart, hasLocalDef)
 
 /-! ## Inline Invariant Elaboration -/
 
@@ -715,26 +750,28 @@ private def isViewPred (msgId : Ident) (pred : Term) : CommandElabM Bool := do
     modify fun _ => saved
     return false
 
-private def elabForEachInlineInv (spec : ComponentSpec) (invStx : Syntax) : CommandElabM Unit := do
+private def isForEachStyled (invStx : Syntax) : CommandElabM Bool := do
+  let pred : Term := ⟨invStx[2]⟩
+  let hasHoldsIn := invStx[5].getNumArgs > 0
+  let using? : Option Ident := if invStx[6].getNumArgs == 2 then some ⟨invStx[6][1]⟩ else none
+  if hasHoldsIn then return true
+  let some pid := using?.or (if pred.raw.isIdent then some ⟨pred.raw⟩ else none) | return false
+  liftTermElabM do
+    try
+      let cn ← realizeGlobalConstNoOverload pid
+      Meta.forallTelescope (← getConstInfo cn).type fun _ body => return body.eq?.isSome
+    catch _ => return false
+
+private def elabForEachInlineInv (spec : ComponentSpec) (invStx : Syntax) (isStyled : Bool) :
+    CommandElabM (Option Term) := do
   let tId      := spec.t.getId
   let updateId := mkIdent (tId ++ `update)
   let viewId   := mkIdent (tId ++ `view)
   let invId ← resolveInvIdent invStx tId
   let pred : Term := ⟨invStx[2]⟩
   let colField : Ident := ⟨invStx[4]⟩
-  let hasHoldsIn := invStx[5].getNumArgs > 0
   let using? : Option Ident := if invStx[6].getNumArgs == 2 then some ⟨invStx[6][1]⟩ else none
   let pf? : Option Term := if invStx[7].getNumArgs == 2 then some ⟨invStx[7][1]⟩ else none
-  let probeId? := using?.or (if pred.raw.isIdent then some ⟨pred.raw⟩ else none)
-  let isStyled ← if hasHoldsIn then pure true
-    else match probeId? with
-    | some pid =>
-        liftTermElabM do
-          try
-            let cn ← realizeGlobalConstNoOverload pid
-            Meta.forallTelescope (← getConstInfo cn).type fun _ body => return body.eq?.isSome
-          catch _ => return false
-    | none => pure false
   let (predToEmit, usingToEmit?) ← match using?, pf? with
     | some u, _ => pure (pred, some u)
     | none, some _ =>
@@ -763,6 +800,10 @@ private def elabForEachInlineInv (spec : ComponentSpec) (invStx : Syntax) : Comm
   | false, none   =>
       let pid : Ident := ⟨predToEmit.raw⟩
       elabCommand (← `(qedInternalInvariant $invId : $pid for_each $colField preserved_by $updateId))
+  if isStyled then return none
+  try
+    return some (← liftTermElabM (extractInvPred invId))
+  catch _ => return none
 
 private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : Ident)
     (clauses : Array Term) (assume? pf? : Option Term) : CommandElabM Unit := do
@@ -797,21 +838,21 @@ private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : 
               theorem $appInvId : ∀ m, ($P) m → ($vPred) (Qed.App.view $appId m) = true :=
                 fun m ha =>
                   (Qed.canonical_congr_pred ($appViewEqId m)
-                    (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical])
-                    (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical])).trans
+                    (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical, Qed.tagHasOneOf_canonical])
+                    (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical, Qed.tagHasOneOf_canonical])).trans
                     ($invId m ha)))
         | none =>
             elabCommand (← `(command| set_option linter.unusedSimpArgs false in
               theorem $appInvId : ∀ m, ($vPred) (Qed.App.view $appId m) = true :=
                 fun m =>
                   (Qed.canonical_congr_pred ($appViewEqId m)
-                    (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical])
-                    (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical])).trans
+                    (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical, Qed.tagHasOneOf_canonical])
+                    (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical, Qed.tagHasOneOf_canonical])).trans
                     ($invId m)))
       catch _ => set saved
 
 private def elabStateInlineInv (spec : ComponentSpec) (invId : Ident)
-    (clauses : Array Term) (using? : Option (Array Term)) (pf? : Option Term) : CommandElabM Unit := do
+    (clauses : Array Term) (using? : Option (Array Term)) (pf? : Option Term) : CommandElabM Term := do
   let tId      := spec.t.getId
   let propsId  := mkIdent (tId ++ `Props)
   let stateId  := mkIdent (tId ++ `State)
@@ -821,25 +862,33 @@ private def elabStateInlineInv (spec : ComponentSpec) (invId : Ident)
   let pred ← `(fun (s : $stateId) => $(← bindMentionedFields spec (mentionsIdent conj.raw) conj))
   let usingL := using?.getD #[]
   if spec.hasProps then
+    if spec.mountable then
+      let initInvId := mkIdentFrom invId (invId.getId.appendAfter "_init")
+      elabCommand (← `(theorem $initInvId:ident : ($pred) $initId := by
+        qedDischargeInit [$[$usingL],*] $initId $invId ($pred)))
     let rhs ← pf?.getDM `(by qedDischargePreserved [$[$usingL],*] ($updateId p) $invId ($pred))
     elabCommand (← `(theorem $invId:ident (p : $propsId) :
       ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($updateId p m msg)) := $rhs))
   else
     let stepPf? ← pf?.mapM fun pf =>
       if spec.mountable then
-        `(by exact ⟨by first | rfl | decide | (simp [$initId:ident]; decide) | (simp [$initId:ident]; omega), $pf⟩)
+        `(by exact ⟨by qedDischargeInit [$[$usingL],*] $initId $invId ($pred), $pf⟩)
       else pure pf
     let initOpt? : Option Term := if spec.mountable then some initId else none
     elabCommand (← `(qedInternalInvariant $invId : $pred $[from $initOpt?]? preserved_by $updateId using [$[$usingL],*] $[ := $stepPf?]?))
+  return pred
 
-private def elabInlineInvariants (spec : ComponentSpec) : CommandElabM Unit := do
+private def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) : CommandElabM (Array Term) := do
   let tId   := spec.t.getId
   let msgId := mkIdent (tId ++ `Msg)
+  let mut statePreds : Array Term := #[]
   for invStx in spec.invariants do
     if invStx.getKind == ``compForEachInvClause then
-      elabForEachInlineInv spec invStx
+      let isStyled ← isForEachStyled invStx
+      if isStyled == wantView then
+        if let some pred ← elabForEachInlineInv spec invStx isStyled then
+          statePreds := statePreds.push pred
       continue
-    let invId ← resolveInvIdent invStx tId
     let clauses : Array Term := invStx[2].getSepArgs.map (⟨·⟩)
     let hasHoldsIn := invStx[3].getNumArgs > 0
     let assume? : Option Term :=
@@ -851,10 +900,14 @@ private def elabInlineInvariants (spec : ComponentSpec) : CommandElabM Unit := d
         !spec.allNames.any (mentionsIdent clauses[0]!.raw) then
       isViewPred msgId clauses[0]!
     else pure false
-    if hasHoldsIn || autoView then
-      elabViewInlineInv spec invStx invId clauses assume? pf?
-    else
-      elabStateInlineInv spec invId clauses using? pf?
+    let isView := hasHoldsIn || autoView
+    if isView == wantView then
+      let invId ← resolveInvIdent invStx tId
+      if isView then
+        elabViewInlineInv spec invStx invId clauses assume? pf?
+      else
+        statePreds := statePreds.push (← elabStateInlineInv spec invId clauses using? pf?)
+  return statePreds
 
 private def withOpenNs {α : Type} (ns : Name) (k : CommandElabM α) : CommandElabM α := do
   if (← getEnv).isNamespace ns then
@@ -889,12 +942,17 @@ private def withOpenNs {α : Type} (ns : Name) (k : CommandElabM α) : CommandEl
     let errsBefore := (← get).messages.toList.filter (·.severity == .error) |>.length
     let coreCmds ← mkViewCmds spec body' (← mkMsgAndUpdateCmds spec sites)
     for c in coreCmds do elabCommand c
-    let (mountCmds, hasStart, hasLocalDef, appViewEqCmd?) ← mkCodecAndMountCmds spec starts' body' idLit
+    let (mountCmds, hasStart, hasLocalDef) ← mkCodecAndMountCmds spec starts' idLit
     for c in mountCmds do elabCommand c
-    let errsAfter := (← get).messages.toList.filter (·.severity == .error) |>.length
-    if errsAfter == errsBefore then
-      if let some eqCmd := appViewEqCmd? then elabCommand eqCmd
-    withOpenNs compNs (elabInlineInvariants spec)
+    let stateInvPreds ← withOpenNs compNs (elabInlineInvariantsPhase spec false)
+    let errsAfterState := (← get).messages.toList.filter (·.severity == .error) |>.length
+    if spec.mountable && spec.outTy?.isNone && !spec.hasProps && !spec.hasSlotsOrKids then
+      let activePreds := if errsAfterState == errsBefore then stateInvPreds else #[]
+      let (appCmds, eqCmd) ← mkCompAppCmds spec body' hasStart activePreds
+      for c in appCmds do elabCommand c
+      let errsAfterApp := (← get).messages.toList.filter (·.severity == .error) |>.length
+      if errsAfterApp == errsBefore then elabCommand eqCmd
+    let _ ← withOpenNs compNs (elabInlineInvariantsPhase spec true)
     let baseInfo ← mkBaseCompInfo spec .stateful spec.hasProps
     modifyEnv fun env => componentRegistry.addEntry env { baseInfo with
       hasOut := spec.outTy?.isSome, hasEffects := spec.hasEffects,

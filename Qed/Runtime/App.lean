@@ -59,6 +59,12 @@ def App.setUpdate (app : App Model Msg) (u : Model → Msg → Model × Cmd Msg)
 @[simp] theorem mkApp_template (init : Model) (u : Model → Msg → Model × Cmd Msg)
     (t : View Model Msg) (s l st p hv) :
     (mkApp init u t s l st p hv).template = t := rfl
+@[simp] theorem mkApp_dehydrate (init : Model) (u : Model → Msg → Model × Cmd Msg)
+    (t : View Model Msg) (s l st p hv) :
+    (mkApp init u t s l st p hv).dehydrate = fun _ => "" := rfl
+@[simp] theorem mkApp_rehydrate (init : Model) (u : Model → Msg → Model × Cmd Msg)
+    (t : View Model Msg) (s l st p hv) :
+    (mkApp init u t s l st p hv).rehydrate = fun _ => none := rfl
 @[simp] theorem mkRoutedApp_init {R : Type} [Router R] [Inhabited R]
     (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p hv) :
     (mkRoutedApp init u t r s l st p hv).init = (init, s) := rfl
@@ -68,6 +74,16 @@ def App.setUpdate (app : App Model Msg) (u : Model → Msg → Model × Cmd Msg)
 @[simp] theorem mkRoutedApp_template {R : Type} [Router R] [Inhabited R]
     (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p hv) :
     (mkRoutedApp init u t r s l st p hv).template = t := rfl
+@[simp] theorem mkRoutedApp_dehydrate {R : Type} [Router R] [Inhabited R]
+    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p hv) :
+    (mkRoutedApp init u t r s l st p hv).dehydrate = fun _ => "" := rfl
+@[simp] theorem mkRoutedApp_rehydrate {R : Type} [Router R] [Inhabited R]
+    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p hv) :
+    (mkRoutedApp init u t r s l st p hv).rehydrate = fun _ => none := rfl
+@[simp] theorem App.setUpdate_dehydrate (app : App Model Msg) (u : Model → Msg → Model × Cmd Msg) :
+    (App.setUpdate app u).dehydrate = app.dehydrate := rfl
+@[simp] theorem App.setUpdate_rehydrate (app : App Model Msg) (u : Model → Msg → Model × Cmd Msg) :
+    (App.setUpdate app u).rehydrate = app.rehydrate := rfl
 
 end Internal
 
@@ -136,11 +152,71 @@ def App.withDehydrate {Model Msg : Type} (d : Dehydrate Model) (app : App Model 
     (App.withDehydrate d app hv).update = app.update := rfl
 @[simp] theorem App.withDehydrate_template (d : Dehydrate Model) (app : App Model Msg) (hv) :
     (App.withDehydrate d app hv).template = app.template := rfl
+@[simp] theorem App.withDehydrate_dehydrate (d : Dehydrate Model) (app : App Model Msg) (hv) :
+    (App.withDehydrate d app hv).dehydrate = d.dehydrate := rfl
+@[simp] theorem App.withDehydrate_rehydrate (d : Dehydrate Model) (app : App Model Msg) (hv) :
+    (App.withDehydrate d app hv).rehydrate = d.rehydrate := rfl
+@[simp] theorem App.withDehydrate_rehydrate_dehydrate (d : Dehydrate Model) (app : App Model Msg) (hv) (m : Model) :
+    (App.withDehydrate d app hv).rehydrate ((App.withDehydrate d app hv).dehydrate m) = some (d.project m) :=
+  d.round_trip m
 
 @[reducible] def App.withFullDehydrate {Model Msg : Type} [LawfulJson Model] (app : App Model Msg) : App Model Msg :=
   App.withDehydrate Dehydrate.full app (fun _ => rfl)
 
 end Internal
+
+set_option linter.unusedVariables false in
+def App.guardRehydrate {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
+    (app : App Model Msg)
+    (hpres : ∀ m m', Inv m → app.rehydrate (app.dehydrate m) = some m' → Inv m' := by
+      qedProveDehydrateInv) : App Model Msg :=
+  { app with
+    rehydrate := fun s =>
+      match app.rehydrate s with
+      | some m => if decide (Inv m) then some m else none
+      | none   => none
+    dehydrate_view := fun m m' h => by
+      cases hr : app.rehydrate (app.dehydrate m) with
+      | none => simp [hr] at h
+      | some m0 =>
+          simp only [hr] at h
+          split at h <;> simp at h
+          subst h
+          exact app.dehydrate_view m m0 hr }
+
+@[simp] theorem App.guardRehydrate_init {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
+    (app : App Model Msg) (hp) :
+    (App.guardRehydrate Inv app hp).init = app.init := rfl
+@[simp] theorem App.guardRehydrate_update {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
+    (app : App Model Msg) (hp) :
+    (App.guardRehydrate Inv app hp).update = app.update := rfl
+@[simp] theorem App.guardRehydrate_template {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
+    (app : App Model Msg) (hp) :
+    (App.guardRehydrate Inv app hp).template = app.template := rfl
+@[simp] theorem App.guardRehydrate_dehydrate {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
+    (app : App Model Msg) (hp) :
+    (App.guardRehydrate Inv app hp).dehydrate = app.dehydrate := rfl
+
+theorem App.guardRehydrate_sound {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
+    (app : App Model Msg) (hp) (raw : String) (m' : Model)
+    (h : (App.guardRehydrate Inv app hp).rehydrate raw = some m') : Inv m' := by
+  dsimp only [App.guardRehydrate] at h
+  cases hr : app.rehydrate raw with
+  | none => simp [hr] at h
+  | some m =>
+      simp only [hr] at h
+      split at h <;> simp at h
+      subst h
+      exact of_decide_eq_true ‹_›
+
+theorem App.guardRehydrate_complete {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
+    (app : App Model Msg) (hp) (m : Model) (hm : Inv m) :
+    (App.guardRehydrate Inv app hp).rehydrate ((App.guardRehydrate Inv app hp).dehydrate m) =
+      app.rehydrate (app.dehydrate m) := by
+  dsimp only [App.guardRehydrate]
+  cases hr : app.rehydrate (app.dehydrate m) with
+  | none => rfl
+  | some m' => simp [decide_eq_true (hp m m' hm hr)]
 
 section AutoDehydrate
 open Lean Meta Elab Term

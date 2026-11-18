@@ -65,28 +65,80 @@ elab "qedUnfoldPresent" "[" extra:term,* "]" : tactic => do
       catch _ => pure false
     unless ok do return
 
+private def toSimpLemmas (ts : Array Term) : TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) :=
+  ts.mapM fun t => `(Lean.Parser.Tactic.simpLemma| $t:term)
+
+private def mkCloserLemmas (usingL : Array Term) : TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) := do
+  let bL ← toSimpLemmas (qedBoundaryLemmas.map fun n => ⟨(mkIdent n).raw⟩)
+  return bL ++ (← toSimpLemmas usingL)
+
+private def mkPredUnfold (pred : Term) : TacticM (Term × TSyntax `tactic) := do
+  let pred := match pred with | `(($p)) => p | p => p
+  let unfoldPred ← if pred.raw.isIdent
+    then `(tactic| try simp only [$(⟨pred.raw⟩):ident] at *)
+    else `(tactic| skip)
+  return (pred, unfoldPred)
+
+private def mkInitTac (usingL : Array Term) (pred initT : Term) : TacticM (TSyntax `tactic) := do
+  let (_, unfoldPred) ← mkPredUnfold pred
+  let closerL ← mkCloserLemmas usingL
+  let unfoldInit ← if initT.raw.isIdent
+    then `(tactic| try simp only [$(⟨initT.raw⟩):ident] at *)
+    else `(tactic| skip)
+  `(tactic|
+    ($unfoldPred:tactic;
+     try dsimp only at *;
+     $unfoldInit:tactic;
+     qedUnfoldPresent [$[$usingL],*];
+     try ((repeat' split) <;>
+            (first | rfl | decide | omega | assumption
+                   | (simp_all [$[$closerL],*] <;> omega)
+                   | (simp_all [$[$closerL],*] <;> decide)
+                   | (simp_all [$[$closerL],*] <;> done) | trivial))))
+
+private def throwUnsolvedInvGoals (nm : Ident) (hdr footer : MessageData) : TacticM Unit := do
+  let goals ← getUnsolvedGoals
+  unless goals.isEmpty do
+    let mut body : MessageData := m!""
+    for g in goals do
+      body := body ++ (← g.withContext do
+        let tag := stripStepPrefix (← g.getTag)
+        let ty ← instantiateMVars (← g.getType)
+        let tgt := (← Meta.ppExpr ty).pretty.replace "✝" ""
+        let env ← getEnv
+        let present ← (ty.getUsedConstants.filter (qedIsHelper env)).filterM
+          (fun n => return (← getProjectionFnInfo? n).isNone)
+        let involves := if present.isEmpty then m!"" else m!"\n    (still involves: {present.toList})"
+        pure m!"\n  • case `{tag}` still needs:  {tgt}{involves}")
+    throwErrorAt nm m!"{hdr}\n{body}\n\n{footer}"
+
+syntax "qedDischargeInit " "[" term,* "]" term:max ident term:max : tactic
+
+elab_rules : tactic
+  | `(tactic| qedDischargeInit [$[$usingL],*] $initT $nm $pred) => do
+    (← getMainGoal).setTag `init
+    evalTactic (← mkInitTac usingL pred initT)
+    let initName := if initT.raw.isIdent then toString initT.raw.getId
+      else (initT.raw.reprint.getD (toString initT.raw)).trimmed
+    throwUnsolvedInvGoals nm
+      m!"invariant `{nm.getId}` doesn't hold on initial state `{initName}`, the automation couldn't verify it."
+      m!"Ensure initial state `{initName}` satisfies `{nm.getId}`, supply a fact with `invariant {nm.getId} : … using [yourLemma]`, or prove it manually."
+
 syntax "qedDischargePreserved " "[" term,* "]" term:max ident term:max (" from " term)? : tactic
 
 elab_rules : tactic
   | `(tactic| qedDischargePreserved [$[$usingL],*] $upd $nm $pred $[from $init]?) => do
-    let pred := match pred with | `(($p)) => p | p => p
-    let predI : Ident := ⟨pred.raw⟩
-    let unfoldPred ← if pred.raw.isIdent
-      then `(tactic| try simp only [$predI:ident] at *)
-      else `(tactic| skip)
-    let toLemma (t : TSyntax `term) : TacticM (TSyntax `Lean.Parser.Tactic.simpLemma) :=
-      `(Lean.Parser.Tactic.simpLemma| $t:term)
+    let (_, unfoldPred) ← mkPredUnfold pred
     let env0 ← getEnv
-    let appL ← (qedAppLemmas env0).mapM (fun n => toLemma ⟨(mkIdent n).raw⟩)
+    let appL ← toSimpLemmas ((qedAppLemmas env0).map fun n => ⟨(mkIdent n).raw⟩)
     let updL ← if upd.raw.isIdent
-      then pure (#[← toLemma ⟨upd.raw⟩] ++ appL)
+      then pure (#[← `(Lean.Parser.Tactic.simpLemma| $(⟨upd.raw⟩):term)] ++ appL)
       else match upd with
-        | `((($a:ident).update)) => pure (#[← toLemma ⟨a.raw⟩] ++ appL)
-        | `(($a:ident).update)   => pure (#[← toLemma ⟨a.raw⟩] ++ appL)
-        | `(($fn:ident $_:term*)) => pure (#[← toLemma ⟨fn.raw⟩] ++ appL)
+        | `((($a:ident).update)) => pure (#[← `(Lean.Parser.Tactic.simpLemma| $a:term)] ++ appL)
+        | `(($a:ident).update)   => pure (#[← `(Lean.Parser.Tactic.simpLemma| $a:term)] ++ appL)
+        | `(($fn:ident $_:term*)) => pure (#[← `(Lean.Parser.Tactic.simpLemma| $fn:term)] ++ appL)
         | _ => pure appL
-    let closerL := (← qedBoundaryLemmas.mapM (fun n => toLemma ⟨(mkIdent n).raw⟩))
-                     ++ (← usingL.mapM toLemma)
+    let closerL ← mkCloserLemmas usingL
     let stepTac ← `(tactic|
       (intro m msg h;
        $unfoldPred:tactic;
@@ -100,20 +152,7 @@ elab_rules : tactic
                        | (simp_all [$[$closerL],*] <;> done) | trivial)))))
     match init with
     | some initT =>
-        let initI : Ident := ⟨initT.raw⟩
-        let unfoldInit ← if initT.raw.isIdent
-          then `(tactic| try simp only [$initI:ident] at *)
-          else `(tactic| skip)
-        let initTac ← `(tactic|
-          ($unfoldPred:tactic;
-           try dsimp only at *;
-           $unfoldInit:tactic;
-           qedUnfoldPresent [$[$usingL],*];
-           try ((repeat' split) <;>
-                  (first | rfl | decide | omega | assumption
-                         | (simp_all [$[$closerL],*] <;> omega)
-                         | (simp_all [$[$closerL],*] <;> decide)
-                         | (simp_all [$[$closerL],*] <;> done) | trivial))))
+        let initTac ← mkInitTac usingL pred initT
         let g0 ← getMainGoal
         let gs ← g0.apply (mkConst ``And.intro)
         match gs with
@@ -130,26 +169,11 @@ elab_rules : tactic
         | _ => throwError "internal error splitting invariant init/step goals"
     | none =>
         evalTactic stepTac
-    let goals ← getUnsolvedGoals
-    unless goals.isEmpty do
-      let mut body : MessageData := m!""
-      for g in goals do
-        body := body ++ (← g.withContext do
-          let tag := stripStepPrefix (← g.getTag)
-          let ty ← instantiateMVars (← g.getType)
-          let tgt := (← Meta.ppExpr ty).pretty.replace "✝" ""
-          let env ← getEnv
-          let present ← (ty.getUsedConstants.filter (qedIsHelper env)).filterM
-            (fun n => return (← getProjectionFnInfo? n).isNone)
-          let involves := if present.isEmpty then m!"" else m!"\n    (still involves: {present.toList})"
-          pure m!"\n  • case `{tag}` still needs:  {tgt}{involves}")
-      let updName := if upd.raw.isIdent then toString upd.raw.getId
-        else (upd.raw.reprint.getD (toString upd.raw)).trimmed
-      throwErrorAt nm m!"invariant `{nm.getId}` isn't preserved by `{updName}`, the automation \
-        couldn't close every message.\n{body}\n\nIf the property is true here, the prover is likely \
-        missing a fact: supply it with `invariant {nm.getId} : … using [yourLemma]`, or prove the \
-        case with `:= by`. If a branch can actually violate the property, fix that branch of \
-        `{updName}`, or weaken the property to what it guarantees."
+    let updName := if upd.raw.isIdent then toString upd.raw.getId
+      else (upd.raw.reprint.getD (toString upd.raw)).trimmed
+    throwUnsolvedInvGoals nm
+      m!"invariant `{nm.getId}` isn't preserved by `{updName}`, the automation couldn't close every message."
+      m!"If the property is true here, the prover is likely missing a fact: supply it with `invariant {nm.getId} : … using [yourLemma]`, or prove the case with `:= by`. If a branch can actually violate the property, fix that branch of `{updName}`, or weaken the property to what it guarantees."
 
 macro_rules
   | `(qedInternalInvariant $name:ident : $pred from $init preserved_by $upd:ident using [$_ls,*] := $pf:term) =>
@@ -185,8 +209,10 @@ def extractInvPred (id : Ident) : TermElabM (TSyntax `term) := do
   let cTy := (← getConstInfo (← realizeGlobalConstNoOverload id)).type
   let stepTy := if cTy.isAppOfArity ``And 2 then cTy.appArg! else cTy
   forallTelescope stepTy fun args _ => do
-    if args.size < 2 then throwErrorAt id
-      "`{id}` doesn't look like a state invariant, so its predicate can't be inferred; write it explicitly (`<pred> for_each … using {id}`)."
-    delab (← mkLambdaFVars #[args[0]!] (← inferType args[args.size - 1]!)).eta
+    let some hIdx ← (List.range args.size).findM? fun i => do
+      return i ≥ 2 && (← isProp (← inferType args[i]!))
+      | throwErrorAt id
+          "`{id}` doesn't look like a state invariant, so its predicate can't be inferred; write it explicitly (`<pred> for_each … using {id}`)."
+    delab (← mkLambdaFVars #[args[hIdx - 2]!] (← inferType args[hIdx]!)).eta
 
 end Qed

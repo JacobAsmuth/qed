@@ -283,38 +283,58 @@ elab "qedProveValidHtml" : tactic => do
       • Dynamic URL-bearing attribute (`href`, `src`, `action`, …) not routed through `Router` or `Url`\n\
       • Unescaped dynamic text inside `<style>` (wrap with `escapeRawText` or `theme`)"
 
+private def dehydrateProjLemmas (env0 : Environment) : Array Name :=
+  #[
+    `Qed.Internal.mkApp_template, `Qed.Internal.mkRoutedApp_template,
+    `Qed.Internal.mkApp_dehydrate, `Qed.Internal.mkApp_rehydrate,
+    `Qed.Internal.mkRoutedApp_dehydrate, `Qed.Internal.mkRoutedApp_rehydrate,
+    `Qed.Internal.App.setUpdate_dehydrate, `Qed.Internal.App.setUpdate_rehydrate,
+    `Qed.Internal.App.withDehydrate_template, `Qed.Internal.App.withQueries_template,
+    `Qed.Internal.App.withQueries_dehydrate, `Qed.Internal.App.withQueries_rehydrate,
+    `Qed.Internal.App.withFullDehydrate, `Qed.Internal.App.withDehydrate_rehydrate_dehydrate,
+    `Qed.App.guardRehydrate_template, `Qed.App.guardRehydrate_dehydrate,
+    `Qed.Dehydrate.full_project, `Qed.Dehydrate.slice_project, `Qed.Dehydrate.const_project,
+    `Qed.InvTarget.proj_id, `Qed.InvTarget.proj_fst
+  ].filter env0.contains
+
+private def unfoldDehydrateUsers (maxIters : Nat)
+    (extraLemmas : Array (TSyntax `Lean.Parser.Tactic.simpLemma)) (includeLCtx : Bool) : TacticM Unit := do
+  for _ in [0:maxIters] do
+    if (← getGoals).isEmpty then break
+    let env ← getEnv
+    let present ← withMainContext do
+      let mut cs := (← instantiateMVars (← getMainTarget)).getUsedConstants
+      if includeLCtx then
+        for ldecl in (← getLCtx) do
+          if !ldecl.isImplementationDetail then
+            cs := cs ++ (← instantiateMVars ldecl.type).getUsedConstants
+      cs.filterM (fun n => liftM (isUnfoldableUserDef env false n))
+    if present.isEmpty then break
+    let uL ← present.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+    let combined := uL ++ extraLemmas
+    let tac ← if includeLCtx
+      then `(tactic| (simp only [$[$combined],*] at *; try rfl))
+      else `(tactic| (simp only [$[$combined],*]; try rfl))
+    let ok ← try evalTactic tac; pure true catch _ => pure false
+    unless ok do break
+
 elab "qedProveDehydrateView" : tactic => do
   evalTactic (← `(tactic| intro _qed_m))
   -- Fast path: `Dehydrate.full` (`project = id`) and inline record-slice `Dehydrate.fields` close by `rfl`/simp!
   try evalTactic (← `(tactic| rfl)) catch _ => pure ()
   if (← getGoals).isEmpty then return
   let env0 ← getEnv
-  let projLemmas := #[
-    `Qed.Internal.mkApp_template, `Qed.Internal.mkRoutedApp_template,
-    `Qed.Internal.App.withDehydrate_template, `Qed.Internal.App.withQueries_template,
-    `Qed.Dehydrate.full_project, `Qed.Dehydrate.slice_project, `Qed.Dehydrate.const_project,
+  let viewSimpNames := dehydrateProjLemmas env0 ++ #[
     ``View.render, ``View.renderEach, ``VAttr.eval,
     ``V.el, ``V.text, ``V.dyn, ``V.ifElse, ``V.showIf, ``V.static,
     ``V.dynNode, ``V.memo, ``V.render_forEach, ``View.isDyn, ``View.showIf, ``View.ofHtml
   ].filter env0.contains
-  let pL ← projLemmas.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+  let pL ← viewSimpNames.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
   try evalTactic (← `(tactic| (simp only [$[$pL],*]; try rfl))) catch _ => pure ()
   if (← getGoals).isEmpty then return
-  for _ in [0:6] do
-    if (← getGoals).isEmpty then break
-    let env ← getEnv
-    let target ← instantiateMVars (← getMainTarget)
-    let present ← target.getUsedConstants.filterM (fun n => liftM (isUnfoldableUserDef env false n))
-    if present.isEmpty then break
-    let uL ← present.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
-    let combined := uL ++ pL
-    let ok ← try
-        evalTactic (← `(tactic| (simp only [$[$combined],*]; try rfl)))
-        pure true
-      catch _ => pure false
-    unless ok do break
+  unfoldDehydrateUsers 6 pL false
   if !(← getGoals).isEmpty then
-    let onlySet ← (projLemmas ++ viewValidSimpExtras env0).mapM fun n =>
+    let onlySet ← (viewSimpNames ++ viewValidSimpExtras env0).mapM fun n =>
       `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
     try evalTactic (← `(tactic| (simp only [$[$onlySet],*]; try rfl))) catch _ => pure ()
   if !(← getGoals).isEmpty then
@@ -330,6 +350,33 @@ elab "qedProveDehydrateView" : tactic => do
       can render different HTML on the client than SSR rendered on the server.{details}\n\n\
       Do not mark model fields read by the view as `ephemeral` (so rehydration preserves the rendered view)."
 
+elab "qedProveDehydrateInv" : tactic => do
+  evalTactic (← `(tactic| intro _qed_m _qed_m' _qed_hinv _qed_hre))
+  let env0 ← getEnv
+  let pL ← (dehydrateProjLemmas env0).mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+  try evalTactic (← `(tactic| simp only [$[$pL],*] at _qed_hre)) catch _ => pure ()
+  try evalTactic (← `(tactic| cases _qed_hre)) catch _ => pure ()
+  try evalTactic (← `(tactic| exact _qed_hinv)) catch _ => pure ()
+  if (← getGoals).isEmpty then return
+  unfoldDehydrateUsers 6 pL true
+  if !(← getGoals).isEmpty then
+    try evalTactic (← `(tactic|
+      ((repeat' split) <;> first
+        | exact _qed_hinv | rfl | decide | omega
+        | (simp_all <;> first | exact _qed_hinv | rfl | decide | omega))))
+    catch _ => pure ()
+  let goals ← getUnsolvedGoals
+  unless goals.isEmpty do
+    let mut details : MessageData := m!""
+    for g in goals do
+      details := details ++ (← g.withContext do
+        let fmt ← Meta.ppExpr (← instantiateMVars (← g.getType))
+        pure m!"\n  • invariant violation after rehydration: {fmt.pretty.replace "✝" ""}")
+    throwError m!"SSR `dehydrate` slice can violate the component's state invariant: rehydrating a \
+      model resets `ephemeral` or unserializable fields to `init`, which may break the \
+      invariant.{details}\n\nDo not mark fields constrained by a state `invariant` as `ephemeral`, \
+      or weaken the invariant."
+
 @[simp] theorem ite_bool_eq_true (c : Prop) [Decidable c] {α : Sort _} (a b : α) :
     (if (if c then true else false) = true then a else b) = (if c then a else b) := by
   by_cases hc : c <;> simp [hc]
@@ -344,7 +391,8 @@ elab "qedProveViewEquiv" appId:ident viewId:ident : tactic => do
   let stage1 := #[
     appName, viewName, `Qed.App.view, `Qed.Internal.App.withFullDehydrate,
     `Qed.Internal.mkApp_template, `Qed.Internal.mkRoutedApp_template,
-    `Qed.Internal.App.withDehydrate_template, `Qed.Internal.App.withQueries_template
+    `Qed.Internal.App.withDehydrate_template, `Qed.Internal.App.withQueries_template,
+    `Qed.App.guardRehydrate_template
   ].filter env0.contains
   let fwNames := (viewFrameworkUnfolds env0).filter (· != ``V.render_forEach) ++ #[
     ``View.render_mapScope, ``View.renderEach_mapScopeEach,

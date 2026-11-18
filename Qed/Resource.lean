@@ -128,6 +128,10 @@ def App.withQueries {Model Msg : Type} (qs : List (Query Model Msg))
     (App.withQueries qs app).update = Query.wrap qs app.update := rfl
 @[simp] theorem App.withQueries_template (qs : List (Query Model Msg)) (app : App Model Msg) :
     (App.withQueries qs app).template = app.template := rfl
+@[simp] theorem App.withQueries_dehydrate (qs : List (Query Model Msg)) (app : App Model Msg) :
+    (App.withQueries qs app).dehydrate = app.dehydrate := rfl
+@[simp] theorem App.withQueries_rehydrate (qs : List (Query Model Msg)) (app : App Model Msg) :
+    (App.withQueries qs app).rehydrate = app.rehydrate := rfl
 
 end Internal
 

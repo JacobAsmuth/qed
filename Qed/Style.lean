@@ -15,20 +15,40 @@ inductive Item where
 deriving Inhabited
 
 @[inline] def isSafeCssAtomChar (c : Char) : Bool :=
-  c != '{' && c != '}' && c != ';' && c != '<' && c != '>'
+  c.toNat ≥ 32 && c.toNat != 127 &&
+  c != '{' && c != '}' && c != ';' && c != '<' && c != '>' && c != '\\'
 
 @[inline] def isSafeCssSelectorChar (c : Char) : Bool :=
-  c != '{' && c != '}' && c != ';' && c != '<'
+  c.toNat ≥ 32 && c.toNat != 127 &&
+  c != '{' && c != '}' && c != ';' && c != '<' && c != '\\'
 
-def sanitizeCssAtom (s : String) : String :=
-  let cs := s.toList
-  if cs.all isSafeCssAtomChar then s
-  else String.ofList (cs.filter isSafeCssAtomChar)
+def hasCommentOpenLoop (afterSlash : Bool) : List Char → Bool
+  | []      => false
+  | c :: cs => (afterSlash && c == '*') || hasCommentOpenLoop (c == '/') cs
 
-def sanitizeCssSelector (s : String) : String :=
+def hasCommentOpen (cs : List Char) : Bool := hasCommentOpenLoop false cs
+
+def stripCommentOpenLoop (afterSlash : Bool) : List Char → List Char
+  | []      => []
+  | c :: cs =>
+      if afterSlash && c == '*' then stripCommentOpenLoop true cs
+      else c :: stripCommentOpenLoop (c == '/') cs
+
+def stripCommentOpen (cs : List Char) : List Char := stripCommentOpenLoop false cs
+
+def sanitizeWith (p : Char → Bool) (s : String) : String :=
   let cs := s.toList
-  if cs.all isSafeCssSelectorChar then s
-  else String.ofList (cs.filter isSafeCssSelectorChar)
+  if cs.all p then s
+  else String.ofList (cs.filter p)
+
+def sanitizeCssWith (p : Char → Bool) (s : String) : String :=
+  let s1 := sanitizeWith p s
+  let cs := s1.toList
+  if hasCommentOpen cs then String.ofList (stripCommentOpen cs) else s1
+
+def sanitizeCssAtom (s : String) : String := sanitizeCssWith isSafeCssAtomChar s
+
+def sanitizeCssSelector (s : String) : String := sanitizeCssWith isSafeCssSelectorChar s
 
 mutual
   def Item.render : Item → String
@@ -205,11 +225,21 @@ def screenMax (w : Len) (body : List Item) : Item := media s!"(max-width: {w.raw
 def screenMin (w : Len) (body : List Item) : Item := media s!"(min-width: {w.raw})" body
 def Token.set (t : Token) (value : String) : Item := .decl ("--" ++ t.name) value
 
+def cssHashLoop : List UInt8 → UInt64 → UInt64
+  | [], h      => h
+  | b :: bs, h =>
+      let h' := (h ^^^ UInt64.ofNat b.toNat) * 1099511628211
+      if h' == 0 then cssHashLoop bs 0 else cssHashLoop bs h'
+
+def cssHash (s : String) : UInt64 :=
+  cssHashLoop s.toUTF8.data.toList 1469598103934665603
+
 def css (body : List Item) : Style :=
   let raw := Item.renderList body
-  { className := s!"qed-{String.hash raw}", raw := raw }
+  { className := s!"qed-{cssHash raw}", raw := raw }
 
-private def Style.rule (s : Style) : String := "." ++ s.className ++ " { " ++ s.raw ++ " }"
+private def Style.rule (s : Style) : String :=
+  "." ++ sanitizeWith (· != '<') s.className ++ " { " ++ sanitizeWith (· != '<') s.raw ++ " }"
 
 private def joinLines : List String → String
   | []      => ""
@@ -232,11 +262,34 @@ def renderStyleSheet (styles : List Style) : String :=
 
 /-! ## CSS Injection & `<style>` Breakout Safety Proofs -/
 
-theorem sanitizeCssAtom_safe (s : String) :
-    ∀ c ∈ (sanitizeCssAtom s).toList, isSafeCssAtomChar c = true := by
-  unfold sanitizeCssAtom
+theorem hasCommentOpenLoop_stripCommentOpenLoop (cs : List Char) :
+    ∀ (b : Bool), hasCommentOpenLoop b (stripCommentOpenLoop b cs) = false := by
+  induction cs with
+  | nil => intro _; rfl
+  | cons c rest ih =>
+      intro b
+      simp only [stripCommentOpenLoop]
+      cases h : (b && c == '*')
+      · simpa [hasCommentOpenLoop, h] using ih (c == '/')
+      · cases b <;> simp at h
+        simpa [hasCommentOpenLoop] using ih true
+
+private theorem stripCommentOpenLoop_mem :
+    ∀ (cs : List Char) (b : Bool) {c : Char}, c ∈ stripCommentOpenLoop b cs → c ∈ cs
+  | [], _, _, h => nomatch h
+  | x :: xs, b, c, hc => by
+      dsimp only [stripCommentOpenLoop] at hc
+      split at hc
+      · exact List.mem_cons_of_mem x (stripCommentOpenLoop_mem xs true hc)
+      · rcases List.mem_cons.1 hc with rfl | ht
+        · exact List.mem_cons_self ..
+        · exact List.mem_cons_of_mem x (stripCommentOpenLoop_mem xs (x == '/') ht)
+
+private theorem sanitizeWith_safe (p : Char → Bool) (s : String) :
+    ∀ c ∈ (sanitizeWith p s).toList, p c = true := by
+  unfold sanitizeWith
   dsimp only
-  by_cases h : s.toList.all isSafeCssAtomChar = true
+  by_cases h : s.toList.all p = true
   · simp only [h, ↓reduceIte]
     rw [List.all_eq_true] at h
     exact h
@@ -244,17 +297,39 @@ theorem sanitizeCssAtom_safe (s : String) :
     intro c hc
     exact (List.mem_filter.1 hc).2
 
-theorem sanitizeCssSelector_safe (s : String) :
-    ∀ c ∈ (sanitizeCssSelector s).toList, isSafeCssSelectorChar c = true := by
-  unfold sanitizeCssSelector
+private theorem sanitizeCssWith_safe (p : Char → Bool) (s : String) :
+    ∀ c ∈ (sanitizeCssWith p s).toList, p c = true := by
+  unfold sanitizeCssWith
   dsimp only
-  by_cases h : s.toList.all isSafeCssSelectorChar = true
-  · simp only [h, ↓reduceIte]
-    rw [List.all_eq_true] at h
-    exact h
-  · simp only [h, Bool.false_eq_true, ↓reduceIte, String.toList_ofList]
+  split
+  · simp only [String.toList_ofList]
     intro c hc
-    exact (List.mem_filter.1 hc).2
+    exact sanitizeWith_safe p s c (stripCommentOpenLoop_mem _ false hc)
+  · exact sanitizeWith_safe p s
+
+private theorem sanitizeCssWith_no_comment (p : Char → Bool) (s : String) :
+    hasCommentOpen (sanitizeCssWith p s).toList = false := by
+  unfold sanitizeCssWith
+  dsimp only
+  split
+  · simpa [hasCommentOpen, stripCommentOpen] using hasCommentOpenLoop_stripCommentOpenLoop _ false
+  · exact Bool.eq_false_iff.2 ‹_›
+
+theorem sanitizeCssAtom_safe (s : String) :
+    ∀ c ∈ (sanitizeCssAtom s).toList, isSafeCssAtomChar c = true :=
+  sanitizeCssWith_safe isSafeCssAtomChar s
+
+theorem sanitizeCssSelector_safe (s : String) :
+    ∀ c ∈ (sanitizeCssSelector s).toList, isSafeCssSelectorChar c = true :=
+  sanitizeCssWith_safe isSafeCssSelectorChar s
+
+theorem sanitizeCssAtom_no_comment (s : String) :
+    hasCommentOpen (sanitizeCssAtom s).toList = false :=
+  sanitizeCssWith_no_comment isSafeCssAtomChar s
+
+theorem sanitizeCssSelector_no_comment (s : String) :
+    hasCommentOpen (sanitizeCssSelector s).toList = false :=
+  sanitizeCssWith_no_comment isSafeCssSelectorChar s
 
 private theorem no_lt_implies_no_closeSeq :
     ∀ (cs : List Char), (∀ c ∈ cs, c ≠ '<') → containsCloseSeqLoop false cs = false
@@ -287,14 +362,14 @@ private theorem sanitizeCssAtom_no_lt (s : String) :
   intro c hc
   have hs := sanitizeCssAtom_safe s c hc
   simp only [isSafeCssAtomChar, Bool.and_eq_true, bne_iff_ne] at hs
-  exact hs.1.2
+  exact hs.1.1.2
 
 private theorem sanitizeCssSelector_no_lt (s : String) :
     ∀ c ∈ (sanitizeCssSelector s).toList, c ≠ '<' := by
   intro c hc
   have hs := sanitizeCssSelector_safe s c hc
   simp only [isSafeCssSelectorChar, Bool.and_eq_true, bne_iff_ne] at hs
-  exact hs.2
+  exact hs.1.2
 
 mutual
   theorem Item.render_no_lt : ∀ (i : Item), ∀ c ∈ (Item.render i).toList, c ≠ '<'
@@ -381,5 +456,29 @@ theorem css_raw_no_lt (body : List Item) :
 theorem css_raw_no_closeSeq (body : List Item) :
     containsCloseSeq (css body).raw.toList = false :=
   containsCloseSeq_of_no_lt (css_raw_no_lt body)
+
+private theorem Style.rule_no_lt (s : Style) :
+    ∀ c ∈ (Style.rule s).toList, c ≠ '<' := by
+  simp only [Style.rule]
+  exact str_append_no_lt
+    (str_append_no_lt
+      (str_append_no_lt
+        (str_append_no_lt (lit_no_lt "." rfl)
+          (fun c hc => bne_iff_ne.1 (sanitizeWith_safe (· != '<') s.className c hc)))
+        (lit_no_lt " { " rfl))
+      (fun c hc => bne_iff_ne.1 (sanitizeWith_safe (· != '<') s.raw c hc)))
+    (lit_no_lt " }" rfl)
+
+theorem renderStyleSheet_no_lt (styles : List Style) :
+    ∀ c ∈ (renderStyleSheet styles).toList, c ≠ '<' := by
+  unfold renderStyleSheet
+  apply joinLines_no_lt
+  intro r hr
+  rcases List.mem_map.1 hr with ⟨s, _, rfl⟩
+  exact Style.rule_no_lt s
+
+theorem renderStyleSheet_no_closeSeq (styles : List Style) :
+    containsCloseSeq (renderStyleSheet styles).toList = false :=
+  containsCloseSeq_of_no_lt (renderStyleSheet_no_lt styles)
 
 end Qed

@@ -40,6 +40,7 @@ macro_rules
       (try simp only [$view:ident];
        qedUnfoldViewHelpers;
        simp only [Qed.roleHasOneOf, Qed.tagHasOneOf, Qed.roleHas, Qed.roleHasOnly,
+         Qed.roleLacks, Qed.tagLacks,
          Qed.hasRole, Qed.hasTag, Qed.both, Qed.either, Qed.exactlyOne,
          Qed.allRolesOff, Qed.exactlyOneOf, Qed.exactlyOneOf.go, Qed.hasOneClass,
          Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
@@ -60,12 +61,12 @@ macro_rules
        repeat' split;
        all_goals (first
          | rfl
-         | decide
          | (simp_all [Qed.everyElement, Qed.everyElementL,
                       Qed.attrClasses, Qed.attrRole, Qed.hasOneClass];
             try decide;
             try omega;
-            try qedCloseExhaustiveEnum))))
+            try qedCloseExhaustiveEnum)
+         | decide)))
 
 syntax (name := invariantView)
   "invariant " ident " : " term " holds_in " ident (" assuming " term:max)? (" := " term)? : command
@@ -82,7 +83,8 @@ elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => do
       if (fn.isConstOf ``Qed.roleHasOneOf || fn.isConstOf ``Qed.tagHasOneOf) && args.size == 4 then
         let chk := mkIdent (if fn.isConstOf ``Qed.roleHasOneOf then ``Qed.hasRole else ``Qed.hasTag)
         evalTactic (← `(tactic| (suffices $chk $(← PrettyPrinter.delab args[1]!) ($view m) = true ∧ _ from this.2; constructor)))
-  evalTactic (← `(tactic| all_goals qedStyleReduce $view))
+  withOptions (fun o => maxRecDepth.set o (max (maxRecDepth.get o) 16384)) do
+    evalTactic (← `(tactic| all_goals qedStyleReduce $view))
   let goals ← getUnsolvedGoals
   unless goals.isEmpty do
     let mut body : MessageData := m!""

@@ -48,6 +48,12 @@ def roleHas (r : String) (style : Style) (h : Html msg) : Bool :=
 def roleHasOnly (r : String) (chosen excluded : Style) (h : Html msg) : Bool :=
   roleHas r chosen h && roleHasOneOf r [chosen, excluded] h
 
+def roleLacks (r : String) (style : Style) : Html msg → Bool :=
+  everyElement (fun _ a => !(attrRole a == some r) || !(attrClasses a).contains style.className)
+
+def tagLacks (tag : String) (style : Style) : Html msg → Bool :=
+  everyElement (fun t a => !(t == tag) || !(attrClasses a).contains style.className)
+
 def both (p q : Html msg → Bool) : Html msg → Bool := fun h => p h && q h
 def either (p q : Html msg → Bool) : Html msg → Bool := fun h => p h || q h
 
@@ -115,6 +121,14 @@ theorem roleHasOneOf_map {α β} (f : α → β) (r) (styles) (h : Html α) :
     roleHasOneOf r styles (h.map f) = roleHasOneOf r styles h :=
   everyElement_map f (fun _ _ => by simp [attrRole_map, attrClasses_map, hasOneClass]) h
 
+@[simp] theorem roleLacks_map {α β} (f : α → β) (r) (style) (h : Html α) :
+    roleLacks r style (h.map f) = roleLacks r style h :=
+  everyElement_map f (fun _ _ => by simp [attrRole_map, attrClasses_map]) h
+
+@[simp] theorem tagLacks_map {α β} (f : α → β) (tag) (style) (h : Html α) :
+    tagLacks tag style (h.map f) = tagLacks tag style h :=
+  everyElement_map f (fun _ _ => by simp [attrClasses_map]) h
+
 theorem everyElement_through_map {α β} (f : α → β) {Pα : String → List (Attr α) → Bool}
     {Pβ : String → List (Attr β) → Bool} (h : Html α)
     (hP : ∀ t a, Pβ t (a.map (Attr.map f)) = Pα t a) (hc : everyElement Pα h = true) :
@@ -154,6 +168,11 @@ private theorem attrRole_of_onlySignalBind :
     ∀ a : List (Attr msg), onlySignalBind a = true → attrRole a = none
   | [.signalBind _], _ => rfl
   | .key _ :: rest, h => attrRole_of_onlySignalBind rest h
+
+private theorem attrClasses_of_onlySignalBind :
+    ∀ a : List (Attr msg), onlySignalBind a = true → attrClasses a = []
+  | [.signalBind _], _ => rfl
+  | .key _ :: rest, h => attrClasses_of_onlySignalBind rest h
 
 mutual
   theorem everyElement_canonical {p : String → List (Attr msg) → Bool}
@@ -213,6 +232,21 @@ theorem hasTag_canonical (tag : String) (h : Html msg) (ht : tag ≠ "span") :
     roleHasOneOf r styles (Html.canonical h) = roleHasOneOf r styles h :=
   everyElement_canonical (fun _ _ => by simp [hasOneClass])
     (fun a ha => by simp [attrRole_of_onlySignalBind a ha]) h
+
+@[simp] theorem roleLacks_canonical (r : String) (style : Style) (h : Html msg) :
+    roleLacks r style (Html.canonical h) = roleLacks r style h :=
+  everyElement_canonical (fun _ _ => by simp)
+    (fun a ha => by simp [attrRole_of_onlySignalBind a ha]) h
+
+@[simp] theorem tagLacks_canonical (tag : String) (style : Style) (h : Html msg) :
+    tagLacks tag style (Html.canonical h) = tagLacks tag style h :=
+  everyElement_canonical (fun _ _ => by simp)
+    (fun a ha => by simp [attrClasses_of_onlySignalBind a ha]) h
+
+theorem tagHasOneOf_canonical (tag : String) (styles : List Style) (h : Html msg) (ht : tag ≠ "span") :
+    tagHasOneOf tag styles (Html.canonical h) = tagHasOneOf tag styles h := by
+  have hne : ("span" == tag) = false := beq_false_of_ne (Ne.symm ht)
+  exact everyElement_canonical (fun _ _ => by simp [hasOneClass]) (fun _ _ => by simp [hne]) h
 
 @[simp] theorem roleHas_canonical (r : String) (style : Style) (h : Html msg) :
     roleHas r style (Html.canonical h) = roleHas r style h := by

@@ -1,4 +1,5 @@
 import Qed.Style.Syntax
+import Qed.Diag
 import Lean
 import Qed.Lang
 import Qed.Notation
@@ -41,10 +42,6 @@ declare_syntax_cat jsxAttrVal
 /-- Plug JSX elements directly into the unified `qedExpr` expression grammar. -/
 @[qedExpr_parser] def qedExprJsx : Parser := leading_parser:maxPrec
   atomic (categoryParser `jsxElement 0)
-
-/-- Inline scoped CSS inside JSX braces: `<div {css: padding: 1rem; border-radius: 8px}>`. -/
-@[qedExpr_parser] def qedExprCss : Parser := leading_parser:maxPrec
-  atomic (symbol "css:" >> Qed.StyleDsl.inlineCssBody)
 
 def jsxAssignOp : Parser :=
   (symbol "=" >> notFollowedBy (symbol "=") "=") <|> symbol "+=" <|> symbol "-="
@@ -203,8 +200,6 @@ partial def expandJsxExpr (pPath : String) (parentCtx? : Option (String × HtmlC
     if optNode.getNumArgs == 2 then expandJsxExpr pPath parentCtx? fallback (optNode.getArg 1)
     else return (← if isListT then `([]) else fallback, isListT)
   match stx.getKind with
-  | .str (.str (.str .anonymous "Qed") "Jsx") "qedExprCss" =>
-    return (⟨Syntax.node (SourceInfo.fromRef stx) ``Qed.StyleDsl.inlineCssTerm #[(stx.getArg 0), (stx.getArg 1)]⟩, false)
   | .str (.str (.str .anonymous "Qed") "Jsx") "qedExprJsx" =>
     if (stx.getArg 0).getKind == ``jsxFragment then
       return (← childrenToTerm pPath parentCtx? ((stx.getArg 0).getArg 1) ((stx.getArg 0).getArg 2).getArgs, true)
@@ -433,7 +428,9 @@ partial def expandAwaitTag (pPath : String) (parentCtx? : Option (String × Html
     | "loading"      => loading? := some v
     | "failed"       => failed? := some v
     | "idle"         => idle? := some v
-    | _              => Macro.throwErrorAt (a.getArg 0) s!"<Await>: unknown attribute `{name}` (expected of, as, err, loading, failed, idle)"
+    | _              =>
+        let hint := Qed.Diag.didYouMean name ["of", "as", "err", "loading", "failed", "idle"]
+        Macro.throwErrorAt (a.getArg 0) s!"<Await>: unknown attribute `{name}`{hint} (expected: of, as, err, loading, failed, idle)"
   let some ofT := of? | Macro.throwErrorAt stx "<Await> requires `of={resource}`"
   if errId?.isSome && failed?.isNone then
     Macro.throwErrorAt stx "<Await>: `err={…}` requires a `failed={…}` view"

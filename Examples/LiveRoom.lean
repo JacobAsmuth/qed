@@ -146,7 +146,7 @@ component LiveApp:
   invariant allMsgsValidRoom:
     all m in messages: m.roomId <= 100
 
-  subscribe chat = Hub.room(id) when let .room(id) = route, id <= 100, user.isSome:
+  subscribe chat = Hub.room(id) if let .room(id) = route, id <= 100, user.isSome:
     reconnect backoff(80, 1000)
     on_join(snap):
       onlineCount = snap.online
@@ -163,7 +163,7 @@ component LiveApp:
     on_status(_st):
       alertStatusCount += 1
 
-  subscribe ticker = TickerWs.ticks(symbol) when 1 <= symbol.length <= 16:
+  subscribe ticker = TickerWs.ticks(symbol) if 1 <= symbol.length <= 16:
     on_join:
       extJoined += 1
     on_message(t):
@@ -182,9 +182,10 @@ component LiveApp:
   action setDraft(v: String):
     draft = v
 
-  action sendChat when 1 <= draft.length <= 280:
-    send chat(draft)
-    draft = ""
+  action sendChat:
+    if 1 <= draft.length <= 280:
+      send chat(draft)
+      draft = ""
 
   action pingTicker:
     send ticker(PricePing(action="ping"))

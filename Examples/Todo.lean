@@ -3,8 +3,12 @@ open Qed
 
 namespace Todo
 
-def doneStyle : Style := css [ textDecoration "line-through", color (hex "888") ]
-def openStyle : Style := css [ color (hex "111") ]
+style doneStyle:
+  text-decoration: line-through
+  color: #888
+
+style openStyle:
+  color: #111
 
 component Row:
   state id      : Nat

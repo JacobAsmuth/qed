@@ -147,12 +147,7 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
   let cleanGoalExpr (e : Expr) : MetaM String := do
     let e ← instantiateMVars e
     let e ← Meta.zetaReduce e
-    let e ← Meta.transform e (pre := fun sub => do
-      if sub.isAppOfArity ``Qed.Lang.QedVal.val 4 then
-        return .visit (sub.getArg! 3)
-      return .continue)
-    let fmt ← Meta.ppExpr e
-    return (fmt.pretty.replace "✝" "").trimmed
+    Qed.Diag.ppQedExpr e ["m"]
   let tryDischargeWith (invProps : Array Expr) (goalBody : Expr) : TermElabM (Option String) := do
     let fullGoal ← invProps.foldrM (init := goalBody) fun hyp acc =>
       pure (Expr.forallE `_ hyp acc .default)
@@ -179,7 +174,7 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
         let tryDischarge := tryDischargeWith invProps
         if chk.requiresAuth then
           let some sfName := chk.sessionVar?
-            | throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`ctx.userId != none`), but component `{spec.t.getId}` has no `session` state.\nAdd `session user` and guard the call with `when user.isSome:` or `if user.isSome: ...`."
+            | throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`ctx.userId != none`), but `{spec.t.getId}` has no `session` field.\n\nHint: Add `session user` to `{spec.t.getId}` and guard the call with `if user.isSome:`."
           let sfExpr : Expr ←
             match chk.lctx.findDecl? fun decl =>
                 if !decl.isImplementationDetail && decl.userName.eraseMacroScopes == sfName then some decl.toExpr else none with
@@ -193,12 +188,12 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
           let noneExpr ← Meta.mkAppOptM ``Option.none #[some elemTy]
           let authGoal ← Meta.mkAppM ``Ne #[sfExpr, noneExpr]
           if (← tryDischarge authGoal).isSome then
-            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`{sfName} != none`), which could not be proved at this call site.\nGuard this call with `when {sfName}.isSome`, `if {sfName}.isSome: ...`, or declare `invariant ...: {sfName}.isSome`."
+            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`{sfName} != none`), which could not be proved here.\n\nHint: Guard this call with `if {sfName}.isSome:`, `ensure {sfName}.isSome else return`, or `invariant ...: {sfName}.isSome`."
         if let some reqConst := chk.reqConst? then
           let reqGoal := mkAppN (Lean.mkConst reqConst) chk.argExprs
           if let some obl ← tryDischarge reqGoal then
-            let oblLine := if obl.isEmpty then "" else s!"\nRemaining proof obligation:\n  {obl}"
-            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` precondition `{chk.reqLabel}` could not be proved at this call site.{oblLine}\nSupply valid arguments, guard with `when`/`if`, pass refined `Field`/`Ensured` values, or declare a component `invariant`."
+            let oblLine := if obl.isEmpty then "" else s!"\n  • must satisfy:  {obl}"
+            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` precondition `{chk.reqLabel}` could not be proved here:{oblLine}\n\nHint: Pass valid arguments, guard with `if`/`ensure`, or add a component `invariant`."
   let currNs ← getCurrNamespace
   for (chk, idx) in predChecks.zipIdx do
     liftTermElabM do
@@ -248,8 +243,8 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
             let reduced := (← Meta.unfold ensGoal chk.ensConst).expr
             pure (some (← cleanGoalExpr reduced))
         if let some obl := obl? then
-          let oblLine := if obl.isEmpty then "" else s!"\nRemaining proof obligation:\n  {obl}"
-          throwErrorAt chk.callRef m!"predicted response for `{chk.srvShort}.{chk.methodName}` does not satisfy server `ensures` postcondition.{oblLine}\nEnsure the predicted value satisfies the server method's `ensures` clauses (or guard it inside a `predict:` block)."
+          let oblLine := if obl.isEmpty then "" else s!"\n  • must satisfy:  {obl}"
+          throwErrorAt chk.callRef m!"Predicted response for `{chk.srvShort}.{chk.methodName}` does not satisfy server `ensures` postcondition:{oblLine}\n\nHint: Ensure the predicted value satisfies the server method's `ensures` clause (or guard it inside a `predict:` block)."
 
 open Lean Elab Term Meta in
 private def elabAndRecordChanCheck (stx : Syntax) (expectedType? : Option Expr)

@@ -29,8 +29,10 @@ def cmdNew (dir : String) : IO UInt32 := do
     "import Qed\nopen Qed\n\n" ++
     "component Quantity:\n" ++
     "  state quantity = 1\n" ++
-    "  action increase when quantity < 10: quantity += 1\n" ++
-    "  action decrease when quantity > 1:  quantity -= 1\n" ++
+    "  action increase:\n" ++
+    "    if quantity < 10: quantity += 1\n" ++
+    "  action decrease:\n" ++
+    "    if quantity > 1: quantity -= 1\n" ++
     "  invariant 1 <= quantity <= 10\n" ++
     "  view:\n" ++
     "    <div>\n" ++

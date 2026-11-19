@@ -39,18 +39,19 @@ component SpecDemoClient:
 
   invariant validRemaining: remaining <= 10000
 
-  action buy(qty: Nat) when user.isSome, 1 <= qty <= 10, qty <= remaining:
-    clicks += 1
-    let rem = await SpecDemoSrv.placeOrder(qty)
-      predict remaining - qty
-      on_confirm:
-        confirmedCount += 1
-        status = f"Confirmed: {rem}"
-      catch:
-        case .outOfStock:  status = "Out of stock"
-        case .failed(err): status = err
-    remaining = rem
-    status = f"Pending: {rem}"
+  action buy(qty: Nat):
+    if user.isSome and 1 <= qty <= 10 and qty <= remaining:
+      clicks += 1
+      let rem = await SpecDemoSrv.placeOrder(qty)
+        predict remaining - qty
+        on_confirm:
+          confirmedCount += 1
+          status = f"Confirmed: {rem}"
+        catch:
+          case .outOfStock:  status = "Out of stock"
+          case .failed(err): status = err
+      remaining = rem
+      status = f"Pending: {rem}"
 
   action claimItem(id: Nat):
     let _ = await SpecDemoSrv.claim(id)

@@ -8,10 +8,11 @@ component Counter:
   state count : Nat = 0
   state saved : Nat = 0
   event emitted(n: Nat)
-  action advance(times: Nat) when times > 0:
-    count = count + step * times
-    saved = count
-    send(.emitted(count))
+  action advance(times: Nat):
+    if times > 0:
+      count = count + step * times
+      saved = count
+      send(.emitted(count))
   view: <button onClick={.advance(2)}>{count}</button>
 
 example : Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 2) =
@@ -119,8 +120,10 @@ router DocRoute:
 #guard Router.fromURL "/docs/bench/5" == some (DocRoute.sec .benchmarks 5)
 #guard (Router.fromURL "/docs/unknown/5" : Option DocRoute) == none
 
-def navOn  : Style := css [ fontWeight 700 ]
-def navOff : Style := css [ fontWeight 400 ]
+style navOn:
+  font-weight: 700
+style navOff:
+  font-weight: 400
 def navView (s : Section) : Html Unit :=
   <nav>
     <a role="nav-overview" {navOn if s == .overview else navOff}>{"Overview"}</a>
@@ -138,18 +141,20 @@ component RoutedDehydrated:
 #guard (RoutedDehydrated.app.rehydrate (RoutedDehydrated.app.dehydrate { r := .sec .benchmarks 3 })).map (·.r)
   == some (.sec .benchmarks 3)
 
-/-- error: styling invariant `badVacuousRole` doesn't hold for every state: `roleHasOneOf("nonexistent", [navOn, navOff])` is false for some `navView m`.
+/-- error: Styling invariant `badVacuousRole` failed in `navView`:
+  • `roleHasOneOf("nonexistent", [navOn, navOff])` does not hold in every state
 
-Some element the rule constrains isn't carrying one of the required style classes (or no element with that `role`/tag is rendered, or an element carries more than one conflicting style). Check that the matching `role`/tag exists and receives exactly one allowed style in every branch of `navView`. -/
+Hint: Check that the matching `role`/tag is rendered and receives exactly one allowed style in every branch of `navView`. -/
 #guard_msgs in
 invariant badVacuousRole : roleHasOneOf("nonexistent", [navOn, navOff]) holds_in navView
 
 def bothStylesView (b : Bool) : Html Unit :=
   <button role="btn" {navOn} {navOff if b else navOff}>{"x"}</button>
 
-/-- error: styling invariant `badDualStyle` doesn't hold for every state: `roleHasOneOf("btn", [navOn, navOff])` is false for some `bothStylesView m`.
+/-- error: Styling invariant `badDualStyle` failed in `bothStylesView`:
+  • `roleHasOneOf("btn", [navOn, navOff])` does not hold in every state
 
-Some element the rule constrains isn't carrying one of the required style classes (or no element with that `role`/tag is rendered, or an element carries more than one conflicting style). Check that the matching `role`/tag exists and receives exactly one allowed style in every branch of `bothStylesView`. -/
+Hint: Check that the matching `role`/tag is rendered and receives exactly one allowed style in every branch of `bothStylesView`. -/
 #guard_msgs in
 invariant badDualStyle : roleHasOneOf("btn", [navOn, navOff]) holds_in bothStylesView
 
@@ -190,12 +195,17 @@ component AutoStyled:
 #guard AutoStyled.app.styles.length == 2
 #guard (AutoStyled.app.ssrStep "T" "/qed.js" "/" "").contains navOn.raw
 
-#guard (renderTheme [nest "*, *::before" [margin (px 0)]]).contains
-  ":where(*, *::before) { margin: 0px; }"
+theme ResetTheme:
+  color borderSubtle = #ccc
+  reset *, *::before:
+    margin: 0px
 
-def tokBorder := token "border-subtle"
-def typedBorderStyle : Style :=
-  css [ border (px 1) .solid tokBorder, borderBottom (px 2) .dashed (hex "333"), borderTop .none ]
+#guard ResetTheme.style.raw.contains ":where(*, *::before) { margin: 0px; }"
+
+style typedBorderStyle:
+  border: 1px solid ResetTheme.borderSubtle
+  border-bottom: 2px dashed #333
+  border-top: none
 #guard typedBorderStyle.raw ==
   "border: 1px solid var(--border-subtle); border-bottom: 2px dashed #333; border-top: none;"
 
@@ -209,16 +219,20 @@ component ParentPage:
   view: <div><SubBanner sec={activeSection(route)}/></div>
 #guard (Html.render (ParentPage.view { route := .sec .architecture 3 })).contains "/docs/arch/1"
 
-def chipStyle : Style := css [ paddingX (px 6), marginTop (px 2) ]
+style chipStyle:
+  padding-inline: 6px
+  margin-top: 2px
 
 component ModernCounter:
   state quantity = 1
   state draft    = ""
   state active   = true
-  action increase when quantity < 10:
-    let step = 1
-    quantity += step
-  action decrease when 1 < quantity: quantity -= 1
+  action increase:
+    if quantity < 10:
+      let step = 1
+      quantity += step
+  action decrease:
+    if 1 < quantity: quantity -= 1
   invariant 1 <= quantity <= 10
   invariant roleHasOneOf("qty", [chipStyle])
   view:
@@ -353,27 +367,13 @@ def sneakyBlock {msg : Type} : Html msg := <div>bad</div>
 
 /-- error: could not synthesize default value for parameter 'hvalid' using tactics
 ---
-error: HTML5 / XSS validity check (`Html.valid`) failed for this view.
-  • unsolved HTML5 / attribute validity obligation: False
-
-Common causes:
-• Invalid HTML5 tag nesting (e.g. `<div>` inside `<p>`, `<button>` inside `<button>`/`<a>`, non-`<li>` inside `<ul>`/`<ol>`, non-`<tr>` inside `<tbody>`, non-`<option>` inside `<select>`)
-• Non-empty children on a void element (`<input>`, `<img>`, `<br>`, …) or local component mount
-• Forbidden tag (`<script>`, `<base>`, `<applet>`, `<object>`, `<embed>`) or raw `on*`/`srcdoc` attribute
-• Dynamic URL-bearing attribute (`href`, `src`, `action`, …) not routed through `Router` or `Url`
-• Unescaped dynamic text inside `<style>` (wrap with `escapeRawText` or `theme`)
+error: Invalid HTML / XSS check failed for this view:
+  • `<div>` cannot be nested inside `<p>` or a heading (`<h1>`–`<h6>`)
 ---
 error: could not synthesize default value for parameter 'valid_view' using tactics
 ---
-error: HTML5 / XSS validity check (`Html.valid`) failed for this view.
-  • unsolved HTML5 / attribute validity obligation: False
-
-Common causes:
-• Invalid HTML5 tag nesting (e.g. `<div>` inside `<p>`, `<button>` inside `<button>`/`<a>`, non-`<li>` inside `<ul>`/`<ol>`, non-`<tr>` inside `<tbody>`, non-`<option>` inside `<select>`)
-• Non-empty children on a void element (`<input>`, `<img>`, `<br>`, …) or local component mount
-• Forbidden tag (`<script>`, `<base>`, `<applet>`, `<object>`, `<embed>`) or raw `on*`/`srcdoc` attribute
-• Dynamic URL-bearing attribute (`href`, `src`, `action`, …) not routed through `Router` or `Url`
-• Unescaped dynamic text inside `<style>` (wrap with `escapeRawText` or `theme`) -/
+error: Invalid HTML / XSS check failed for this view:
+  • `<div>` cannot be nested inside `<p>` or a heading (`<h1>`–`<h6>`) -/
 #guard_msgs in
 component BadOpaqueNesting:
   state u : Unit = ()
@@ -387,10 +387,10 @@ component BadLazyCapturesModel:
 
 /-- error: could not synthesize default value for parameter 'hview' using tactics
 ---
-error: SSR `dehydrate` slice does not preserve the rendered view: rehydrating a model can render different HTML on the client than SSR rendered on the server.
-  • view mismatch after rehydration: "hi" = _qed_m.b
+error: SSR hydration mismatch: `ephemeral` field affects the rendered view:
+  • view mismatch after rehydration:  "hi" = b
 
-Do not mark model fields read by the view as `ephemeral` (so rehydration preserves the rendered view). -/
+Hint: Do not mark fields read by `view:` as `ephemeral` (rehydration resets them to their initial value). -/
 #guard_msgs in
 component BadEphemeralReadByView:
   state a : Nat = 1
@@ -399,15 +399,15 @@ component BadEphemeralReadByView:
 
 -- ── Sub-components, unified `app`, `Field`, `<Await>`, & fractional CSS checks ──
 
-def fracStyle : Style := css [
-  textAlign .center,
-  padding (rem 0.35) 0 (rem 0.5),
-  margin (rem 2) .auto,
-  gap (px 4) (px 8),
-  lineHeight 1.5,
-  fontWeight 600,
-  opacity 0.85,
-  zIndex (-1) ]
+style fracStyle:
+  text-align: center
+  padding: 0.35rem 0 0.5rem
+  margin: 2rem auto
+  gap: 4px 8px
+  line-height: 1.5
+  font-weight: 600
+  opacity: 0.85
+  z-index: -1
 
 #guard fracStyle.raw ==
   "text-align: center; padding: 0.35rem 0 0.5rem; margin: 2rem auto; gap: 4px 8px; line-height: 1.5; font-weight: 600; opacity: 0.85; z-index: -1;"
@@ -560,11 +560,11 @@ component FineGrainedCheck:
   | .element "div" _ [.element "span" _ [.dyn _], .ifElse _ _ _, .memo _, .keyedList "ul" _ _ _ _ _] => true
   | _ => false
 
-/-- error: invariant `BadUnguardedDecrease.inRange` isn't preserved by `BadUnguardedDecrease.update`, the automation couldn't close every message.
+/-- error: Invariant `BadUnguardedDecrease.inRange` failed in `BadUnguardedDecrease.update`:
+  • action `decrease` must satisfy:  1 <= quantity - 1 and quantity - 1 <= 10
 
-  • case `decrease` still needs:  1 ≤ m.quantity - 1 ∧ m.quantity - 1 ≤ 10
-
-If the property is true here, the prover is likely missing a fact: supply it with `invariant BadUnguardedDecrease.inRange : … using [yourLemma]`, or prove the case with `:= by`. If a branch can actually violate the property, fix that branch of `BadUnguardedDecrease.update`, or weaken the property to what it guarantees. -/
+Hint: Guard the failing branch with `if ...:`, fix the update, or weaken the invariant.
+      If the rule does hold, add `using [lemma]` or a manual `:= by` proof. -/
 #guard_msgs in
 component BadUnguardedDecrease:
   state quantity = 1
@@ -572,8 +572,17 @@ component BadUnguardedDecrease:
   invariant inRange: 1 <= quantity <= 10
   view: <span>{quantity}</span>
 
-def safeBtnStyle : Style := css [backgroundColor (hex "111")]
-def dangerBtnStyle : Style := css [backgroundColor (hex "999")]
+/-- error: `qunatity` is not a `state` field of this component (did you mean `quantity`?) (`state` fields: `quantity`) -/
+#guard_msgs in
+component BadStateFieldTypo:
+  state quantity = 1
+  action inc: qunatity += 1
+  view: <span>{quantity}</span>
+
+style safeBtnStyle:
+  background-color: #111
+style dangerBtnStyle:
+  background-color: #999
 
 component StyleLacksGood:
   state ok : Bool = true
@@ -584,26 +593,26 @@ component StyleLacksGood:
     </div>
   invariant noDanger: roleLacks("submit", dangerBtnStyle), tagLacks("span", dangerBtnStyle)
 
-#guard !(renderStyleSheet [css [background "red/*evil*/</style"]]).contains "/*"
-#guard !(renderStyleSheet [css [background "red/*evil*/</style"]]).contains "<"
-#guard !(renderStyleSheet [css [background "red/*evil*/</style"]]).contains "</style"
+#guard !(renderStyleSheet [{ className := "x", raw := Item.renderList [background "red/*evil*/</style"] }]).contains "/*"
+#guard !(renderStyleSheet [{ className := "x", raw := Item.renderList [background "red/*evil*/</style"] }]).contains "<"
+#guard !(renderStyleSheet [{ className := "x", raw := Item.renderList [background "red/*evil*/</style"] }]).contains "</style"
 #guard (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := 5 })).map (·.x) == some 5
 #guard (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := -1 })).isNone
 
-/-- error: styling invariant `BadRoleLacks.noDanger` doesn't hold for every state: `roleLacks("submit", dangerBtnStyle)` is false for some `BadRoleLacks.view m`.
+/-- error: Styling invariant `BadRoleLacks.noDanger` failed in `BadRoleLacks.view`:
+  • `roleLacks("submit", dangerBtnStyle)` does not hold in every state
 
-A matching element in `BadRoleLacks.view` carries a forbidden style class in some branch. Remove that style from the matching element (or guard it so it cannot apply there). -/
+Hint: A matching element in `BadRoleLacks.view` carries a forbidden style class in some branch. Remove that style from the matching element or guard it so it cannot apply there. -/
 #guard_msgs in
 component BadRoleLacks:
   state ok : Bool = true
   view: <button role="submit" {dangerBtnStyle}>Bad</button>
   invariant noDanger: roleLacks("submit", dangerBtnStyle)
 
-/-- error: invariant `BadPropInit.nonNeg` doesn't hold on initial state `BadPropInit.init`, the automation couldn't verify it.
+/-- error: Invariant `BadPropInit.nonNeg` failed on initial state `BadPropInit.init`:
+  • initial state must satisfy:  0 <= -1
 
-  • case `init` still needs:  0 ≤ -1
-
-Ensure initial state `BadPropInit.init` satisfies `BadPropInit.nonNeg`, supply a fact with `invariant BadPropInit.nonNeg : … using [yourLemma]`, or prove it manually. -/
+Hint: Update the initial `state` values so `BadPropInit.nonNeg` holds, add `using [lemma]`, or supply a `:= by` proof. -/
 #guard_msgs in
 component BadPropInit:
   prop offset : Int = 0
@@ -614,10 +623,10 @@ component BadPropInit:
 
 /-- error: could not synthesize default value for parameter 'hpres' using tactics
 ---
-error: SSR `dehydrate` slice can violate the component's state invariant: rehydrating a model resets `ephemeral` or unserializable fields to `init`, which may break the invariant.
-  • invariant violation after rehydration: 5 ≤ _qed_m.shown + 0
+error: SSR rehydration can violate the component's state invariant:
+  • after rehydration must satisfy:  5 <= shown + 0
 
-Do not mark fields constrained by a state `invariant` as `ephemeral`, or weaken the invariant. -/
+Hint: Rehydration resets `ephemeral` fields to their initial value. Remove `ephemeral` from fields constrained by an `invariant`, or weaken the invariant. -/
 #guard_msgs (error, drop warning) in
 component BadEphemeralInv:
   state shown : Int = 5
@@ -676,29 +685,32 @@ schema BadOptType:
 schema BadJsonOnly:
   id : jsonOnly String
 
--- ── Unified Python-esque ergonomics checks (elif, match/case, when let, in/not in, f-strings, sequential) ──
+-- ── Unified Python-esque ergonomics checks (elif, match/case, if let, in/not in, f-strings, sequential) ──
 component PythonicShowcase:
   state score : Nat = 5
   state tags  : String[] = ["lean"]
   state pick  : Nat? = some(2)
   state label : String = ""
 
-  action classify(n: Nat) when 0 <= n <= 100:
-    if n < 10:
-      label = f"low:{n}"
-    elif n < 50:
-      label = f"mid:{n}"
-    else:
-      label = f"high:{n}"
+  action classify(n: Nat):
+    if 0 <= n <= 100:
+      if n < 10:
+        label = f"low:{n}"
+      elif n < 50:
+        label = f"mid:{n}"
+      else:
+        label = f"high:{n}"
 
   action addTag(t: String):
     ensure t not in tags else return
     tags.push(t)
     label = f"tags:{tags.size}"
 
-  action usePick when let some(v) = pick, v > 0:
-    score = v * 2
-    label = f"score={score}"
+  action usePick:
+    if let some(v) = pick:
+      if v > 0:
+        score = v * 2
+        label = f"score={score}"
 
   action describeTab(tab: FilterTab):
     match tab:

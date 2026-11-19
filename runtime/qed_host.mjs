@@ -28,29 +28,36 @@ export function boot() {
   const g = (globalThis.__qed ||= {});
   g.nodes ||= [null]; g.sig ||= new Map(); g.sigVals ||= new Map();
 
+  const textEnc = new TextEncoder(), textDec = new TextDecoder();
+  // Thin browser AbortController handle table; HTTP timeout policy & single-settlement live in Lean (`Qed.Driver.Runtime`).
+  const aborts = new Map();
+  const trackAbort = (k) => { const c = new AbortController(); aborts.set(k, c); return c.signal; };
+  window.addEventListener('pagehide', () => { for (const c of aborts.values()) c.abort(); });
+
   g.fetchStream = (url, body, cid, did) => {
-    fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }).then(async (resp) => {
+    const k = 's:' + did;
+    fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, signal: trackAbort(k) }).then(async (resp) => {
       if (!resp.ok || !resp.body) { streamDone(did); return; }
       const reader = resp.body.getReader(), dec = new TextDecoder();
       for (;;) { const { done, value } = await reader.read(); if (done) break;
         const t = dec.decode(value, { stream: true }); if (t) streamChunk(cid, t); }
       const tail = dec.decode(); if (tail) streamChunk(cid, tail);
       streamDone(did);
-    }).catch(() => streamDone(did));
+    }).catch(() => streamDone(did)).finally(() => aborts.delete(k));
   };
   g.httpSend = (method, url, body, id) => {
-    const opts = { method, headers: { 'Content-Type': 'application/json' } };
+    const k = String(id), opts = { method, headers: { 'Content-Type': 'application/json' }, signal: trackAbort(k) };
     if (method !== 'GET' && method !== 'HEAD') opts.body = body;
     fetch(url, opts).then(async (r) => { const t = await r.text(); httpDone(id, r.ok ? 1 : 0, t); })
-      .catch((e) => httpDone(id, 0, String(e)));
+      .catch((e) => httpDone(id, 0, String(e))).finally(() => aborts.delete(k));
   };
   g.httpSendBytes = (method, url, body, id) => {
-    const opts = { method, headers: { 'Content-Type': 'application/x-protobuf', 'Accept': 'application/x-protobuf' } };
+    const k = String(id), opts = { method, headers: { 'Content-Type': 'application/x-protobuf', 'Accept': 'application/x-protobuf' }, signal: trackAbort(k) };
     if (method !== 'GET' && method !== 'HEAD') opts.body = body;
     fetch(url, opts).then(async (r) => {
       const buf = new Uint8Array(await r.arrayBuffer());
       httpBytesDone(id, r.ok ? 1 : 0, buf);
-    }).catch((e) => httpBytesDone(id, 0, new TextEncoder().encode(String(e))));
+    }).catch((e) => httpBytesDone(id, 0, textEnc.encode(String(e)))).finally(() => aborts.delete(k));
   };
   g.setSignal = (name, v) => {
     const s = String(v); g.sigVals.set(name, s); const b = g.sig.get(name);
@@ -65,13 +72,14 @@ export function boot() {
   g.effect = (kind, a, b, c) => {
     switch (kind) {
       case 'timer.cancel': if (timers[a]) { clearTimeout(timers[a]); delete timers[a]; } break;
-      case 'storage.set': localStorage.setItem(a, b); break;
-      case 'storage.remove': localStorage.removeItem(a); break;
-      case 'storage.clear': localStorage.clear(); break;
+      case 'http.abort': { const c = aborts.get(a); if (c) c.abort(); break; }
+      case 'storage.set': try { localStorage.setItem(a, b); } catch (_) {} break;
+      case 'storage.remove': try { localStorage.removeItem(a); } catch (_) {} break;
+      case 'storage.clear': try { localStorage.clear(); } catch (_) {} break;
       case 'history.replace': history.replaceState({}, '', a); urlChanged(a); break;
       case 'history.back': history.back(); break;
       case 'history.forward': history.forward(); break;
-      case 'clipboard.write': if (navigator.clipboard) navigator.clipboard.writeText(a); break;
+      case 'clipboard.write': if (navigator.clipboard) navigator.clipboard.writeText(a).catch(() => {}); break;
       case 'dom.focus': { const el = document.getElementById(a); if (el) el.focus(); break; }
       case 'dom.blur': { const el = document.getElementById(a); if (el) el.blur(); break; }
       case 'dom.select': { const el = document.getElementById(a); if (el && el.select) el.select(); break; }
@@ -86,22 +94,24 @@ export function boot() {
       case 'ws.close': { const s = sockets[a]; if (s) s.close(); break; }
       case 'event.listen': ensureEvent(a); break;
       case 'file.download': { const url = URL.createObjectURL(new Blob([c], { type: b || 'text/plain' }));
-        const el = document.createElement('a'); el.href = url; el.download = a; el.click(); URL.revokeObjectURL(url); break; }
+        const el = document.createElement('a'); el.href = url; el.download = a; el.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000); break; }
       case 'css.inject': { if (a && !document.getElementById('qed-styles') && !document.querySelector('link[data-qed-styles]')) { const s = document.createElement('style'); s.id = 'qed-styles'; s.textContent = a; document.head.appendChild(s); } break; }
       default: console.warn('qed: unknown effect', kind);
     }
   };
   g.effectResult = (kind, a, b, id) => {
     switch (kind) {
-      case 'storage.get': effectDone(id, JSON.stringify(localStorage.getItem(a))); break;
+      case 'storage.get': { let v = null; try { v = localStorage.getItem(a); } catch (_) {} effectDone(id, JSON.stringify(v)); break; }
       case 'clipboard.read': (navigator.clipboard ? navigator.clipboard.readText() : Promise.resolve('')).then((t) => effectDone(id, t)).catch(() => effectDone(id, '')); break;
       case 'timer.after': setTimeout(() => effectDone(id, ''), parseInt(a, 10) || 0); break;
       case 'timer.afterKeyed': { if (timers[a]) clearTimeout(timers[a]); timers[a] = setTimeout(() => { delete timers[a]; effectDone(id, ''); }, parseInt(b, 10) || 0); break; }
       case 'random.int': { const lo = parseInt(a, 10) || 0, hi = parseInt(b, 10) || 0; effectDone(id, String(lo + Math.floor(Math.random() * (hi - lo + 1)))); break; }
       case 'file.pick': { const input = document.createElement('input'); input.type = 'file'; if (a) input.accept = a;
-        input.onchange = () => { const f = input.files && input.files[0]; if (!f) { effectDone(id, JSON.stringify({ error: 'cancelled' })); return; }
+        input.addEventListener('cancel', () => effectDone(id, '{"error":"cancelled"}'));
+        input.onchange = () => { const f = input.files && input.files[0]; if (!f) { effectDone(id, '{"error":"cancelled"}'); return; }
           const reader = new FileReader(); reader.onload = () => effectDone(id, JSON.stringify({ name: f.name, mime: f.type, size: f.size, text: String(reader.result) }));
-          reader.onerror = () => effectDone(id, JSON.stringify({ error: 'read failed' })); reader.readAsText(f); }; input.click(); break; }
+          reader.onerror = () => effectDone(id, '{"error":"read failed"}'); reader.readAsText(f); }; input.click(); break; }
       default: console.warn('qed: unknown result effect', kind);
     }
   };
@@ -110,7 +120,6 @@ export function boot() {
 
   // Stateless browser WebSocket transport pipe; mux framing (`Qed.WsMuxFrame`), pool routing,
   // and reconnect policies (`Qed.Reconnect.nextDelayMs`) all execute in verified Lean.
-  const wsEnc = new TextEncoder(), wsDec = new TextDecoder();
   const resolveWsUrl = (u) => u.startsWith('/') ? (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + u : u;
   const wsConns = new Map();
   g.wsOpen = (cid, url, isBinary) => {
@@ -125,9 +134,9 @@ export function boot() {
       if (isBinary) {
         if (e.data instanceof ArrayBuffer) wsBytes(cid, new Uint8Array(e.data));
         else if (e.data instanceof Blob) e.data.arrayBuffer().then((ab) => { if (wsConns.get(cid) === ws) wsBytes(cid, new Uint8Array(ab)); });
-        else wsBytes(cid, wsEnc.encode(String(e.data)));
+        else wsBytes(cid, textEnc.encode(String(e.data)));
       } else {
-        wsText(cid, typeof e.data === 'string' ? e.data : wsDec.decode(new Uint8Array(e.data)));
+        wsText(cid, typeof e.data === 'string' ? e.data : textDec.decode(new Uint8Array(e.data)));
       }
     };
     ws.onerror = () => {};

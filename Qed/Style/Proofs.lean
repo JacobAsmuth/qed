@@ -212,28 +212,6 @@ private theorem renderThemeRule_no_lt (item : Item) :
             (Item.renderList_no_lt b))
           (lit_no_lt " }" rfl)
 
-theorem renderTheme_no_lt (tokens : List Item) :
-    ∀ c ∈ (renderTheme tokens).toList, c ≠ '<' := by
-  unfold renderTheme
-  dsimp only
-  apply cssJoinLines_no_lt
-  intro s hs
-  rw [List.mem_append] at hs
-  rcases hs with hroot | hreset
-  · split at hroot
-    · nomatch hroot
-    · simp only [List.mem_singleton] at hroot
-      subst hroot
-      exact str_append_no_lt
-        (str_append_no_lt (lit_no_lt ":root { " rfl) (Item.renderList_no_lt _))
-        (lit_no_lt " }" rfl)
-  · rcases List.mem_map.1 hreset with ⟨item, _, rfl⟩
-    exact renderThemeRule_no_lt item
-
-theorem renderTheme_no_closeSeq (tokens : List Item) :
-    containsCloseSeq (renderTheme tokens).toList = false :=
-  containsCloseSeq_of_no_lt (renderTheme_no_lt tokens)
-
 theorem Theme.render_no_lt (th : Theme) :
     ∀ c ∈ (Theme.render th).toList, c ≠ '<' := by
   unfold Theme.render
@@ -302,22 +280,6 @@ theorem Keyframes.rule_no_lt (kf : Keyframes) :
 theorem Keyframes.rule_no_closeSeq (kf : Keyframes) :
     containsCloseSeq kf.rule.toList = false :=
   containsCloseSeq_of_no_lt (Keyframes.rule_no_lt kf)
-
-theorem css_raw_no_lt (body : List Item) :
-    ∀ c ∈ (css body).raw.toList, c ≠ '<' :=
-  Item.renderList_no_lt body
-
-theorem css_raw_no_closeSeq (body : List Item) :
-    containsCloseSeq (css body).raw.toList = false :=
-  containsCloseSeq_of_no_lt (css_raw_no_lt body)
-
-theorem Style.extend_raw_no_lt (base : Style) (extra : List Item) (label : String) :
-    ∀ c ∈ (base.extend extra label).raw.toList, c ≠ '<' :=
-  Item.renderList_no_lt _
-
-theorem Style.merge_raw_no_lt (a b : Style) (label : String) :
-    ∀ c ∈ (Style.merge a b label).raw.toList, c ≠ '<' :=
-  Item.renderList_no_lt _
 
 theorem Style.rule_no_lt (s : Style) :
     ∀ c ∈ (Style.rule s).toList, c ≠ '<' := by

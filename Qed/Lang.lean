@@ -164,7 +164,7 @@ def qedLamParam : Parser := node `Qed.Lang.lamParam (qedBinder >> optional (":" 
 private def notReservedExprKw : Parser :=
   notFollowedBy (
     kw "and" <|> kw "or" <|> kw "not" <|> kw "is" <|> kw "pass" <|> kw "elif" <|>
-    kw "case" <|> kw "when" <|> kw "catch" <|> kw "atomic" <|> kw "ensure" <|>
+    kw "case" <|> kw "catch" <|> kw "atomic" <|> kw "ensure" <|>
     symbol "in" <|> symbol "if" <|> symbol "else" <|> symbol "match" <|>
     symbol "for" <|> symbol "return" <|> symbol "let") "expression"
 

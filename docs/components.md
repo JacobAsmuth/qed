@@ -61,19 +61,20 @@ component Storefront:
       books = await Catalog.list()
     case .detail(_):
       pass
-  query current = Catalog.findAt(idx) when let .detail(idx) = route
+  query current = Catalog.findAt(idx) if let .detail(idx) = route
   state books       : Resource Book[]
   state statusMsg   = ""
   ephemeral hover   = false
 
-  action orderOne(idx: Nat) when user.isSome:
-    statusMsg = "Ordering…"
-    let updated = await Catalog.order(idx, 1) catch:
-      case .outOfStock:  statusMsg = "Order failed: out of stock"
-      case .notFound:    statusMsg = "Order failed: book not found"
-      case .failed(err): statusMsg = f"Order failed: {err}"
-    books = books.map(arr => arr.set(idx, updated) if idx < arr.size else arr)
-    statusMsg = f"Ordered {updated.title}"
+  action orderOne(idx: Nat):
+    if user.isSome:
+      statusMsg = "Ordering…"
+      let updated = await Catalog.order(idx, 1) catch:
+        case .outOfStock:  statusMsg = "Order failed: out of stock"
+        case .notFound:    statusMsg = "Order failed: book not found"
+        case .failed(err): statusMsg = f"Order failed: {err}"
+      books = books.map(arr => arr.set(idx, updated) if idx < arr.size else arr)
+      statusMsg = f"Ordered {updated.title}"
 
   view:
     <Await of={books} as={arr} err={e} loading={<p>Loading…</p>} failed={<p class="error">{e}</p>}>
@@ -81,7 +82,7 @@ component Storefront:
     </Await>
 ```
 
-- **`session user`** declares a `String?` field hydrated automatically from the verified server session during SSR (`App.onSession`) so actions requiring `ctx.userId != none` can guard with `when user.isSome:`.
+- **`session user`** declares a `String?` field hydrated automatically from the verified server session during SSR (`App.onSession`) so actions requiring `ctx.userId != none` can guard with `if user.isSome:` or `ensure user.isSome else return`.
 - **`await` and `catch:`** allow direct async RPC calls inside `route` and `action` blocks: `field = await Server.fn(...)` transitions `field : Resource α` to `.loading` and populates it on completion, while `let x = await Server.fn(...) catch: case .tag: ...` flushes pre-`await` assignments, suspends, enforces exhaustive domain error handling, and resumes in a synthesized continuation message with the server's `ensures` proof in scope.
 - **`(field = ·)` and `perform`** remain available for lower-level `Cmd` composition in `start`, `route`, or `action` (for example `perform Catalog.list((books = ·))`), and schemas provide `<Book.Form onSubmit={.submit}/>` (with optional `bind={draft}`, `reset`, and `field = some(·)` shorthand).
 - **`route`** binds the current URL route into state (defaulting the field name to `route`) and runs optional `case` arms on navigation.
@@ -89,7 +90,7 @@ component Storefront:
 - **`ephemeral`** excludes client-only fields from SSR dehydration and resets them to their defaults on hydration (all other `state` fields auto-dehydrate by default; `T[]`, `T?`, `Resource T`, and `Cached T` auto-default to `[]`, `none`, `.idle`, and `{}`).
 - **`port`** declares typed JS interop ports (`port name : Arg` outbound, `port name(arg: Arg): ...` inbound).
 - **`query`** declares cached reactive queries in two forms:
-  - Server-backed: `query current = Catalog.findAt(idx) when let .detail(idx) = route` or `query quote = Store.quote(qty) when user.isSome` (enforces read-only server RPCs, proves `session` auth and parameter `requires` preconditions from `when` + component invariants, keys entries with collision-free binary Protobuf cache keys for stale-while-revalidate + stale-response race rejection, preloads on SSR with zero-refetch hydration, and propagates server `ensures` into `Cached.all` invariants such as `quote.all(v => ...)`).
+  - Server-backed: `query current = Catalog.findAt(idx) if let .detail(idx) = route` or `query quote = Store.quote(qty) if user.isSome` (enforces read-only server RPCs, proves `session` auth and parameter `requires` preconditions from `if` + component invariants, keys entries with collision-free binary Protobuf cache keys for stale-while-revalidate + stale-response race rejection, preloads on SSR with zero-refetch hydration, and propagates server `ensures` into `Cached.all` invariants such as `quote.all(v => ...)`).
   - URL-based: `query items : Item[]:` with `key = ...` and `url = ...`.
 - **`<Await of={res} as={val} err={e} loading={…} failed={…}>`** renders `Resource α` or `Cached α`
   declaratively in JSX.
@@ -103,7 +104,8 @@ Any client `await` on a server RPC can attach a `predict` clause so the UI updat
 and automatically reconciles or rolls back when the server replies:
 
 ```lean
-action orderOne(idx: Nat) when user.isSome:
+action orderOne(idx: Nat):
+  ensure user.isSome else return
   let updated = await Catalog.order(idx, 1)
     predict:
       if let .ok(arr) = books:
@@ -163,12 +165,13 @@ Qed supports three stateful composition modes:
 
 ## Actions & inline invariants
 
-Actions execute **sequentially** (matching `server` functions—each assignment is immediately visible to subsequent lines) and support `let` bindings, field/array updates (`=`, `+=`, `-=`, `arr.push(x)`, `arr[i] = val`), `when` / `when let` guards, `ensure cond else return`, `perform`, `send`, `pass`, `return`, `if`/`elif`/`else`, `if let`, and `match`/`case`:
+Actions execute **sequentially** (matching `server` functions—each assignment is immediately visible to subsequent lines) and support `let` bindings, field/array updates (`=`, `+=`, `-=`, `arr.push(x)`, `arr[i] = val`), `ensure cond else return`, `perform`, `send`, `pass`, `return`, `if`/`elif`/`else`, `if let`, and `match`/`case`:
 
 ```lean
-action advance(times: Nat) when times > 0:
-  count += step * times
-  saved = count
+action advance(times: Nat):
+  if times > 0:
+    count += step * times
+    saved = count
 
 invariant 0 <= count, saved <= count
 invariant roleHasOneOf("save", [primaryStyle, disabledStyle])

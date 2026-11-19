@@ -52,20 +52,21 @@ server CatalogSrv:
 
 -- 1a. Rejects prediction that violates server `ensures` postcondition
 /--
-error: predicted response for `StoreSrv.placeOrder` does not satisfy server `ensures` postcondition.
-Remaining proof obligation:
-  20000 ≤ 10000
-Ensure the predicted value satisfies the server method's `ensures` clauses (or guard it inside a `predict:` block).
+error: Predicted response for `StoreSrv.placeOrder` does not satisfy server `ensures` postcondition:
+  • must satisfy:  20000 <= 10000
+
+Hint: Ensure the predicted value satisfies the server method's `ensures` clause (or guard it inside a `predict:` block).
 -/
 #guard_msgs in
 component BadPredictEnsures:
   session user
   state remaining : Nat = 10
-  action buy when user.isSome:
-    let rem = await StoreSrv.placeOrder(1) predict 20000 catch:
-      case .outOfStock: pass
-      case .failed(_): pass
-    remaining = rem
+  action buy:
+    if user.isSome:
+      let rem = await StoreSrv.placeOrder(1) predict 20000 catch:
+        case .outOfStock: pass
+        case .failed(_): pass
+      remaining = rem
   view: <span>{remaining}</span>
 
 -- 1b. Rejects `perform` inside speculative continuation after `predict`
@@ -78,12 +79,13 @@ component BadSpecPerform:
   port log : String
   state remaining : Nat = 10
   invariant remaining <= 10000
-  action buy when user.isSome, 1 <= remaining:
-    let rem = await StoreSrv.placeOrder(1) predict remaining - 1 catch:
-      case .outOfStock: pass
-      case .failed(_): pass
-    remaining = rem
-    perform log("bought")
+  action buy:
+    if user.isSome and 1 <= remaining:
+      let rem = await StoreSrv.placeOrder(1) predict remaining - 1 catch:
+        case .outOfStock: pass
+        case .failed(_): pass
+      remaining = rem
+      perform log("bought")
   view: <span>{remaining}</span>
 
 -- 1c. Rejects nested `await` inside speculative continuation after `predict`
@@ -95,13 +97,14 @@ component BadSpecNestedAwait:
   session user
   state remaining : Nat = 10
   invariant remaining <= 10000
-  action buy when user.isSome, 1 <= remaining:
-    let rem = await StoreSrv.placeOrder(1) predict remaining - 1 catch:
-      case .outOfStock: pass
-      case .failed(_): pass
-    remaining = rem
-    let _ = await StoreSrv.claim(1) catch:
-      case _: pass
+  action buy:
+    if user.isSome and 1 <= remaining:
+      let rem = await StoreSrv.placeOrder(1) predict remaining - 1 catch:
+        case .outOfStock: pass
+        case .failed(_): pass
+      remaining = rem
+      let _ = await StoreSrv.claim(1) catch:
+        case _: pass
   view: <span>{remaining}</span>
 
 -- 1d. Rejects `on_confirm` without `predict`
@@ -112,13 +115,14 @@ error: `on_confirm` requires a `predict` clause on the same `await`
 component BadOnConfirmWithoutPredict:
   session user
   state remaining : Nat = 10
-  action buy when user.isSome:
-    let rem = await StoreSrv.placeOrder(1)
-      on_confirm: remaining = rem
-      catch:
-        case .outOfStock: pass
-        case .failed(_): pass
-    remaining = rem
+  action buy:
+    if user.isSome:
+      let rem = await StoreSrv.placeOrder(1)
+        on_confirm: remaining = rem
+        catch:
+          case .outOfStock: pass
+          case .failed(_): pass
+      remaining = rem
   view: <span>{remaining}</span>
 
 -- 1e. Rejects `rollback` without `predict`
@@ -129,13 +133,14 @@ error: `rollback` requires a `predict` clause on the same `await`
 component BadRollbackWithoutPredict:
   session user
   state remaining : Nat = 10
-  action buy when user.isSome:
-    let rem = await StoreSrv.placeOrder(1)
-      rollback: remaining = 0
-      catch:
-        case .outOfStock: pass
-        case .failed(_): pass
-    remaining = rem
+  action buy:
+    if user.isSome:
+      let rem = await StoreSrv.placeOrder(1)
+        rollback: remaining = 0
+        catch:
+          case .outOfStock: pass
+          case .failed(_): pass
+      remaining = rem
   view: <span>{remaining}</span>
 
 -- 1f. Rejects `predict` on a non-`await` `let`
@@ -169,15 +174,16 @@ error: `predict:` computes a predicted server response and cannot mutate state o
 component BadMutateInPredict:
   session user
   state remaining : Nat = 10
-  action buy when user.isSome:
-    let rem = await StoreSrv.placeOrder(1)
-      predict:
-        remaining = 0
-        return 0
-      catch:
-        case .outOfStock: pass
-        case .failed(_): pass
-    remaining = rem
+  action buy:
+    if user.isSome:
+      let rem = await StoreSrv.placeOrder(1)
+        predict:
+          remaining = 0
+          return 0
+        catch:
+          case .outOfStock: pass
+          case .failed(_): pass
+      remaining = rem
   view: <span>{remaining}</span>
 
 -- 1i. Rejects `predict` inside a `server` function
@@ -199,9 +205,10 @@ component BadPredictUnhandledDomainErr:
   session user
   state remaining : Nat = 10
   invariant remaining <= 10000
-  action buy when user.isSome, 1 <= remaining:
-    let rem = await StoreSrv.placeOrder(1) predict remaining - 1
-    remaining = rem
+  action buy:
+    if user.isSome and 1 <= remaining:
+      let rem = await StoreSrv.placeOrder(1) predict remaining - 1
+      remaining = rem
   view: <span>{remaining}</span>
 
 -- 1k. Rejects component invariant violation inside `rollback` branch
@@ -210,11 +217,11 @@ local elab "rollback_env " cmd:command : command =>
   Lean.withoutModifyingEnv (Lean.Elab.Command.elabCommand cmd)
 
 /--
-error: invariant `BadRollbackInv.bounded` isn't preserved by `BadRollbackInv.update`, the automation couldn't close every message.
+error: Invariant `BadRollbackInv.bounded` failed in `BadRollbackInv.update`:
+  • `rollback` branch must satisfy:  20000 <= 10000
 
-  • case `_specRollback_0` still needs:  20000 ≤ 10000
-
-If the property is true here, the prover is likely missing a fact: supply it with `invariant BadRollbackInv.bounded : … using [yourLemma]`, or prove the case with `:= by`. If a branch can actually violate the property, fix that branch of `BadRollbackInv.update`, or weaken the property to what it guarantees.
+Hint: Guard the failing branch with `if ...:`, fix the update, or weaken the invariant.
+      If the rule does hold, add `using [lemma]` or a manual `:= by` proof.
 -/
 #guard_msgs in
 rollback_env
@@ -248,7 +255,8 @@ component CheckoutSpec:
   action setNote(s: String):
     note = s
 
-  action buy(qty: Nat) when user.isSome, 1 <= qty <= 10, qty <= remaining:
+  action buy(qty: Nat):
+    ensure user.isSome and 1 <= qty <= 10 and qty <= remaining else return
     clicks += 1
     let rem = await StoreSrv.placeOrder(qty)
       predict remaining - qty
@@ -409,21 +417,22 @@ component CatalogSpec:
   action loadDemo(bs: SpecBook[]):
     books = .ok(bs)
 
-  action orderOne(idx: Nat) when user.isSome:
-    let updated = await CatalogSrv.order(idx, 1)
-      predict:
-        if let .ok(arr) = books:
-          if idx < arr.size and arr[idx].slot == idx and arr[idx].stock >= 1:
-            let b = arr[idx]
-            return SpecBook(slot=b.slot, title=b.title, stock=b.stock - 1)
-      catch:
-        case .outOfStock:  statusMsg = "Out of stock"
-        case .notFound:    statusMsg = "Not found"
-        case .failed(err): statusMsg = err
-    books = books.map(arr => arr.set(idx, updated) if idx < arr.size else arr)
-    lastSlot = some(idx)
-    lastOrdered = some(updated)
-    statusMsg = f"Ordered {updated.title}"
+  action orderOne(idx: Nat):
+    if user.isSome:
+      let updated = await CatalogSrv.order(idx, 1)
+        predict:
+          if let .ok(arr) = books:
+            if idx < arr.size and arr[idx].slot == idx and arr[idx].stock >= 1:
+              let b = arr[idx]
+              return SpecBook(slot=b.slot, title=b.title, stock=b.stock - 1)
+        catch:
+          case .outOfStock:  statusMsg = "Out of stock"
+          case .notFound:    statusMsg = "Not found"
+          case .failed(err): statusMsg = err
+      books = books.map(arr => arr.set(idx, updated) if idx < arr.size else arr)
+      lastSlot = some(idx)
+      lastOrdered = some(updated)
+      statusMsg = f"Ordered {updated.title}"
 
   view: <span>{statusMsg}</span>
 

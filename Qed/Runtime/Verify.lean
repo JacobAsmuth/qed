@@ -1,5 +1,6 @@
 import Qed.View.Core
 import Qed.Runtime.ValidLemmas
+import Qed.Diag
 import Lean
 
 namespace Qed
@@ -140,7 +141,7 @@ private def isUnfoldableUserDef (env : Environment) (viewOnly : Bool) (n : Name)
   if (← getProjectionFnInfo? n).isSome then return false
   match env.find? n with
   | some (.defnInfo d) =>
-      if d.type.isConstOf ``Qed.Token || d.type.isAppOfArity ``Qed.TypedToken 1 ||
+      if d.type.isAppOfArity ``Qed.TypedToken 1 ||
          d.type.isConstOf ``Qed.Theme || d.type.isConstOf ``Qed.Keyframes ||
          d.type.isConstOf ``Qed.Url ||
          d.type.isAppOfArity `Qed.Codec 1 || d.type.isConstOf `Qed.LocalDef ||
@@ -159,7 +160,7 @@ private def viewFrameworkUnfolds (env : Environment) : Array Name :=
     ``VAttr.eval, ``V.el, ``V.text, ``V.dyn, ``V.ifElse, ``V.showIf, ``V.static,
     ``V.dynNode, ``V.memo, ``V.render_forEach, ``View.isDyn, ``V.bindAttr, ``V.dynAttr,
     ``V.onClick', ``V.onInput', ``V.onCheck', ``SoundMemo.ofLawful,
-    ``Qed.text, ``Qed.lazy, ``Qed.el, ``Qed.link, ``Qed.linkTo, ``Qed.theme,
+    ``Qed.text, ``Qed.lazy, ``Qed.el, ``Qed.link, ``Qed.linkTo,
     ``Qed.cls, ``Qed.attr, ``Qed.role, ``Qed.on, ``Qed.onValue, ``Qed.onClick, ``Qed.onInput,
     ``Qed.onChange, ``Qed.onCheck, ``Qed.onKeydown, ``Qed.onKeyup, ``Qed.onSubmit,
     ``Qed.onBlur, ``Qed.onFocus, ``Qed.onDoubleClick, ``Qed.onMouseDown, ``Qed.onMouseUp,
@@ -670,7 +671,7 @@ mutual
         if hFn? == some ``Qed.lazy && args.size == 5 then
           let inner := (mkApp args[3]! args[4]!).headBeta
           return ← proveValidIn fuel env ctxV ctxE msgTy inner
-        if hFn? == some ``Qed.link || hFn? == some ``Qed.linkTo || hFn? == some ``Qed.theme then
+        if hFn? == some ``Qed.link || hFn? == some ``Qed.linkTo then
           if let some hUnf ← Meta.unfoldDefinition? h then
             return ← proveValidIn fuel env ctxV ctxE msgTy hUnf
         if hFn? == some `Qed.Resource.awaitView && args.size == 9 && env.contains `Qed.Resource.validIn_awaitView_intro then
@@ -964,7 +965,101 @@ mutual
           | none    => modify fun gs => gs.push g'
 end
 
-elab "qedProveValidHtmlCore" : tactic => do
+private def diagnoseHtmlStepFailure (ctx : HtmlCtx) (tag : String) : Option String :=
+  if isForbiddenTag tag then
+    some s!"`<{tag}>` is forbidden in Qed views (untrusted script/plugin sink)"
+  else if !isSafeTagName tag then
+    some s!"invalid HTML tag name `<{tag}>`"
+  else match ctx.mode with
+    | .ulOl =>
+        some s!"`<{tag}>` cannot be a direct child of `<ul>` or `<ol>` (expected `<li>`)"
+    | .dl =>
+        some s!"`<{tag}>` cannot be a direct child of `<dl>` (expected `<dt>` or `<dd>`)"
+    | .table =>
+        some s!"`<{tag}>` cannot be a direct child of `<table>` (expected `<thead>`, `<tbody>`, `<tfoot>`, `<caption>`, or `<colgroup>`)"
+    | .colgroup =>
+        some s!"`<{tag}>` cannot be a direct child of `<colgroup>` (expected `<col>`)"
+    | .tableSection =>
+        some s!"`<{tag}>` cannot be a direct child of `<thead>`/`<tbody>`/`<tfoot>` (expected `<tr>`)"
+    | .tableRow =>
+        some s!"`<{tag}>` cannot be a direct child of `<tr>` (expected `<td>` or `<th>`)"
+    | .select =>
+        some s!"`<{tag}>` cannot be a direct child of `<select>` (expected `<option>` or `<optgroup>`)"
+    | .optgroup =>
+        some s!"`<{tag}>` cannot be a direct child of `<optgroup>` (expected `<option>`)"
+    | .option | .textarea | .rawStyle =>
+        some s!"`<{tag}>` cannot be nested inside a text-only element (`<option>`, `<textarea>`, or `<style>`)"
+    | .normal =>
+        if isContextOnlyTag tag then
+          some s!"`<{tag}>` must be placed inside its required parent container (e.g. `<li>` in `<ul>`/`<ol>`, `<tr>` in `<tbody>`, `<td>`/`<th>` in `<tr>`, `<option>` in `<select>`)"
+        else if ctx.inP && closesPTag tag then
+          some s!"`<{tag}>` cannot be nested inside `<p>` or a heading (`<h1>`–`<h6>`)"
+        else if ctx.interactive && (isInteractiveTag tag || tag == "label" || tag == "form") then
+          some s!"`<{tag}>` cannot be nested inside an interactive element (`<a>`, `<button>`, `<details>`, `<summary>`, `<textarea>`, or `<select>`)"
+        else if ctx.inForm && tag == "form" then
+          some "`<form>` cannot be nested inside another `<form>`"
+        else none
+    | .svg => none
+
+private def diagnoseValidGoal (g : MVarId) : MetaM (Option String) := g.withContext do
+  let tgt := (← instantiateMVars (← g.getType)).consumeMData.headBeta
+  let some (_, lhs, rhs) := tgt.eq? | return none
+  let lhs := lhs.consumeMData.headBeta
+  let rhs := rhs.consumeMData
+  unless rhs.isConstOf ``Bool.true do return none
+  if lhs.isAppOfArity ``Html.validIn 3 then
+    let lArgs := lhs.getAppArgs
+    let some ctxV ← htmlCtxVal? lArgs[1]! | return none
+    let node := lArgs[2]!.consumeMData.headBeta
+    if node.isAppOfArity ``Html.element 4 || node.isAppOfArity ``Qed.el 4 then
+      let nArgs := node.getAppArgs
+      if let some tagS := strLitVal? nArgs[1]! then
+        if let some reason := diagnoseHtmlStepFailure ctxV tagS then
+          return some reason
+    else if node.isAppOfArity ``Html.text 2 || node.isAppOfArity ``Qed.text 4 then
+      match ctxV.mode with
+      | .rawStyle =>
+          return some "unescaped dynamic text inside `<style>` (use a `style`/`theme` block or wrap with `escapeRawText`)"
+      | .ulOl => return some "raw text cannot appear directly inside `<ul>`/`<ol>` (wrap it in `<li>`)"
+      | .dl => return some "raw text cannot appear directly inside `<dl>` (wrap it in `<dt>` or `<dd>`)"
+      | .table | .tableSection => return some "raw text cannot appear directly inside `<table>`/`<tbody>` (wrap it in `<tr>`/`<td>`)"
+      | .tableRow => return some "raw text cannot appear directly inside `<tr>` (wrap it in `<td>` or `<th>`)"
+      | .select | .optgroup => return some "raw text cannot appear directly inside `<select>` (wrap it in `<option>`)"
+      | .colgroup => return some "raw text cannot appear directly inside `<colgroup>`"
+      | _ => pure ()
+  if lhs.isAppOfArity ``Attr.validKeyValue 2 then
+    let aArgs := lhs.getAppArgs
+    if let some k := strLitVal? aArgs[0]! then
+      let kl := k.toLower
+      if kl == "srcdoc" || kl.startsWith "on" then
+        return some s!"forbidden attribute `{k}` (inline event handlers and `srcdoc` are disallowed)"
+      else if kl == "href" || kl == "src" || kl == "action" || kl == "formaction" || kl == "poster" || kl == "cite" || kl == "data" then
+        return some s!"URL attribute `{k}` must use a typed `Router` route or `Url` (raw dynamic strings are disallowed)"
+  if lhs.isAppOfArity ``Attr.valid 2 then
+    let attrE := lhs.getAppArgs[1]!.consumeMData.headBeta
+    if attrE.isAppOfArity ``Attr.attr 3 then
+      if let some k := strLitVal? (attrE.getAppArgs[1]!) then
+        let kl := k.toLower
+        if kl == "srcdoc" || kl.startsWith "on" then
+          return some s!"forbidden attribute `{k}` (inline event handlers and `srcdoc` are disallowed)"
+        else if kl == "href" || kl == "src" || kl == "action" || kl == "formaction" || kl == "poster" || kl == "cite" || kl == "data" then
+          return some s!"URL attribute `{k}` must use a typed `Router` route or `Url` (raw dynamic strings are disallowed)"
+  if lhs.isAppOfArity ``Bool.or 2 then
+    let o0 := lhs.getAppArgs[0]!.consumeMData.headBeta
+    if o0.isAppOfArity ``Bool.not 1 then
+      let inner := o0.getAppArgs[0]!.consumeMData.headBeta
+      if inner.isAppOfArity ``Qed.isVoidTag 1 then
+        if let some tagS := strLitVal? (inner.getAppArgs[0]!) then
+          return some s!"`<{tagS}>` is an HTML5 void element and cannot have children — write it self-closing (`<{tagS} .../>`)"
+      if inner.isAppOfArity ``Attr.hasLocalCell 2 then
+        return some "a mounted local component cannot have extra children directly on its mount element"
+  if lhs.getUsedConstants.contains ``Qed.containsCloseSeq then
+    return some "unescaped dynamic text inside `<style>` (use a `style`/`theme` block or wrap with `escapeRawText`)"
+  if lhs.getUsedConstants.contains ``Qed.Url.isSafe then
+    return some "dynamic URL attribute must use a typed `Router` route or `Url` (raw strings are disallowed)"
+  return none
+
+private def runValidHtmlPipeline : TacticM (Array (MVarId × Option String)) := do
   evalTactic (← `(tactic| intros))
   let env ← getEnv
   let goals ← getGoals
@@ -972,6 +1067,9 @@ elab "qedProveValidHtmlCore" : tactic => do
   for g in goals do
     let (_, rem) ← (proveGoalMVar 2048 env g).run #[]
     residuals := residuals ++ rem
+  let mut preDiags : Array (MVarId × Option String) := #[]
+  for r in residuals do
+    preDiags := preDiags.push (r, ← diagnoseValidGoal r)
   setGoals residuals.toList
   if !(← getGoals).isEmpty then
     let toLemma (n : Name) : TacticM (TSyntax `Lean.Parser.Tactic.simpLemma) :=
@@ -983,24 +1081,43 @@ elab "qedProveValidHtmlCore" : tactic => do
       runHtmlSimpLoop 2 fw false
     if !(← getGoals).isEmpty then
       try evalTactic (← `(tactic| all_goals (first | rfl | decide | (split <;> simp)))) catch _ => pure ()
+  return preDiags
+
+elab "qedProveValidHtmlCore" : tactic => do
+  let _ ← runValidHtmlPipeline
 
 elab "qedProveValidHtml" : tactic => do
-  evalTactic (← `(tactic| qedProveValidHtmlCore))
+  let preDiags ← runValidHtmlPipeline
   let goals ← getUnsolvedGoals
   unless goals.isEmpty do
-    let mut details : MessageData := m!""
+    let mut specific : Array String := #[]
+    for (origG, diag?) in preDiags do
+      if (← instantiateMVars (mkMVar origG)).hasExprMVar then
+        if let some d := diag? then
+          unless specific.contains d do
+            specific := specific.push d
+    if !specific.isEmpty then
+      let bullets := String.intercalate "\n" (specific.toList.map (fun s => s!"  • {s}"))
+      throwError m!"Invalid HTML / XSS check failed for this view:\n{bullets}"
+    let mut details : Array String := #[]
     for g in goals do
-      details := details ++ (← g.withContext do
-        let fmt ← Meta.ppExpr (← instantiateMVars (← g.getType))
-        pure m!"\n  • unsolved HTML5 / attribute validity obligation: {fmt.pretty.replace "✝" ""}")
-    throwError m!"HTML5 / XSS validity check (`Html.valid`) failed for this view.{details}\n\n\
+      let line ← match ← diagnoseValidGoal g with
+        | some d => pure d
+        | none =>
+            g.withContext do
+              let pretty ← Qed.Diag.ppQedExpr (← g.getType) ["m"]
+              pure s!"unsolved validity obligation: {pretty}"
+      unless details.contains line do
+        details := details.push line
+    let bullets := String.intercalate "\n" (details.toList.map (fun s => s!"  • {s}"))
+    throwError m!"Invalid HTML / XSS check failed for this view:\n{bullets}\n\n\
       Common causes:\n\
-      • Invalid HTML5 tag nesting (e.g. `<div>` inside `<p>`, `<button>` inside `<button>`/`<a>`, \
+      • Invalid HTML5 tag nesting (e.g. `<div>` inside `<p>`, `<button>` inside `<a>`/`<button>`, \
         non-`<li>` inside `<ul>`/`<ol>`, non-`<tr>` inside `<tbody>`, non-`<option>` inside `<select>`)\n\
       • Non-empty children on a void element (`<input>`, `<img>`, `<br>`, …) or local component mount\n\
       • Forbidden tag (`<script>`, `<base>`, `<applet>`, `<object>`, `<embed>`) or raw `on*`/`srcdoc` attribute\n\
       • Dynamic URL-bearing attribute (`href`, `src`, `action`, …) not routed through `Router` or `Url`\n\
-      • Unescaped dynamic text inside `<style>` (wrap with `escapeRawText` or `theme`)"
+      • Unescaped dynamic text inside `<style>` (use a `style`/`theme` block or wrap with `escapeRawText`)"
 
 private def dehydrateProjLemmas (env0 : Environment) : Array Name :=
   #[
@@ -1063,14 +1180,14 @@ elab "qedProveDehydrateView" : tactic => do
     try evalTactic (← `(tactic| (simp; try rfl))) catch _ => pure ()
   let goals ← getUnsolvedGoals
   unless goals.isEmpty do
-    let mut details : MessageData := m!""
+    let mut details : Array String := #[]
     for g in goals do
-      details := details ++ (← g.withContext do
-        let fmt ← Meta.ppExpr (← instantiateMVars (← g.getType))
-        pure m!"\n  • view mismatch after rehydration: {fmt.pretty.replace "✝" ""}")
-    throwError m!"SSR `dehydrate` slice does not preserve the rendered view: rehydrating a model \
-      can render different HTML on the client than SSR rendered on the server.{details}\n\n\
-      Do not mark model fields read by the view as `ephemeral` (so rehydration preserves the rendered view)."
+      let s ← g.withContext do Qed.Diag.ppQedExpr (← g.getType) ["_qed_m", "m"]
+      let line := s!"  • view mismatch after rehydration:  {s}"
+      unless details.contains line do details := details.push line
+    let body := String.intercalate "\n" details.toList
+    throwError m!"SSR hydration mismatch: `ephemeral` field affects the rendered view:\n{body}\n\n\
+      Hint: Do not mark fields read by `view:` as `ephemeral` (rehydration resets them to their initial value)."
 
 private def tryFastFullDehydrateInv (tgt : Expr) : MetaM (Option Expr) := do
   -- Goal shape: `∀ m m', Inv m → app.rehydrate (app.dehydrate m) = some m' → Inv m'`
@@ -1148,15 +1265,14 @@ elab "qedProveDehydrateInv" : tactic => do
     try evalTactic (← `(tactic| all_goals (try simp only [$valId:ident]))) catch _ => pure ()
   let goals ← getUnsolvedGoals
   unless goals.isEmpty do
-    let mut details : MessageData := m!""
+    let mut details : Array String := #[]
     for g in goals do
-      details := details ++ (← g.withContext do
-        let fmt ← Meta.ppExpr (← instantiateMVars (← g.getType))
-        pure m!"\n  • invariant violation after rehydration: {fmt.pretty.replace "✝" ""}")
-    throwError m!"SSR `dehydrate` slice can violate the component's state invariant: rehydrating a \
-      model resets `ephemeral` or unserializable fields to `init`, which may break the \
-      invariant.{details}\n\nDo not mark fields constrained by a state `invariant` as `ephemeral`, \
-      or weaken the invariant."
+      let s ← g.withContext do Qed.Diag.ppQedExpr (← g.getType) ["_qed_m", "m"]
+      let line := s!"  • after rehydration must satisfy:  {s}"
+      unless details.contains line do details := details.push line
+    let body := String.intercalate "\n" details.toList
+    throwError m!"SSR rehydration can violate the component's state invariant:\n{body}\n\n\
+      Hint: Rehydration resets `ephemeral` fields to their initial value. Remove `ephemeral` from fields constrained by an `invariant`, or weaken the invariant."
 
 @[simp] theorem ite_bool_eq_true (c : Prop) [Decidable c] {α : Sort _} (a b : α) :
     (if (if c then true else false) = true then a else b) = (if c then a else b) := by
@@ -1246,7 +1362,8 @@ def resolveSchemaCtxArgs (ref : Lean.Syntax) (tag : String) (ctxBinders : Array 
     else if checkUnknown then
       let valid := ["bind", "onSubmit", "key", "reset"] ++ ctxBinders.toList.map toString ++
         (if ctxBinders.size == 1 then ["ctx"] else [])
-      Lean.Macro.throwErrorAt attrRef s!"<{tag}>: unknown attribute `{nm}` (valid attributes: {String.intercalate ", " valid})"
+      let hint := Qed.Diag.didYouMean nm valid
+      Lean.Macro.throwErrorAt attrRef s!"<{tag}>: unknown attribute `{nm}`{hint} (valid: {String.intercalate ", " valid})"
   ctxBinders.mapM fun b => do
     if let some v := ctxVals[b]? <|> ctxArg? then pure v
     else Lean.Macro.throwErrorAt ref s!"<{tag}> requires context attribute `{b}=\{…}`{if ctxBinders.size == 1 then " (or `ctx={…}`)" else ""}"

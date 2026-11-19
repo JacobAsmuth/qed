@@ -49,31 +49,20 @@ elab "qedDischargeForEach" upd:ident childInv:ident nm:ident pred:term : tactic 
       if firstTag == `theArm then firstTag := tag
       body := body ++ (← g.withContext do
         let ty ← instantiateMVars (← g.getType)
-        let s := (← Meta.ppExpr ty).pretty.replace "✝" ""
+        let s ← Qed.Diag.ppQedExpr ty ["m"]
+        let tagLabel := Qed.Diag.formatCaseTag tag
         let why :=
           if (s.splitOn "qsort").length > 1 then
-            "sorts with `Array.qsort`, which has no membership lemma in the standard library, so \
-             Qed can't see that reordering keeps every element valid (it does, same elements). \
-             Switch this arm to Qed's verified `Array.sortBy` (a `mergeSort`) and it lifts \
-             automatically; or prove this case."
+            "uses `Array.qsort` (no membership lemma); switch to Qed's verified `sortBy` so it lifts automatically."
           else if (s.splitOn " ++ ").length > 1 then
-            "appends elements (`++`) that aren't known to satisfy the contract. Validate them on the \
-             way in (decode into a type that already carries it) so invalid ones are unrepresentable, \
-             or prove this case."
+            "appends elements (`++`) not known to satisfy the contract; validate them first or prove this case."
           else if ty.isForall then
-            "reshapes the list with an operation Qed has no composition lemma for yet, add one to \
-             `Qed.ForEach`, or prove this case."
+            "transforms the collection with an unverified operation; add a lemma or prove this case."
           else
-            "adds an element that isn't known to satisfy the contract. Build it so the property holds \
-             by construction, or prove this case."
-        pure m!"\n  • case `{tag}` {why}\n        still needs:  {s}")
+            "inserts an element not known to satisfy the contract."
+        pure m!"\n  • {tagLabel}: {why}\n    must satisfy:  {s}")
     let predStr := (pred.raw.reprint.getD "the contract").trimmed
-    throwErrorAt nm m!"invariant `{nm.getId}` doesn't lift to every {upd.getId}-arm: the contract \
-      `{predStr}` holds for each child on its own, but the arm(s) below could break it for the \
-      list.\n{body}\n\nEvery other arm was discharged automatically. Finish these by reusing the \
-      automation, then filling only what's left:\n\n  invariant {nm.getId} : {predStr} for_each … \
-      using {childInv.getId} := by\n    forEachLift {upd.getId} \
-      {childInv.getId} {predStr}\n    case {firstTag} => …"
+    throwErrorAt nm m!"Invariant `{nm.getId}` failed to lift `{predStr}` across `{upd.getId}`:{body}\n\nHint: Ensure newly inserted elements satisfy `{predStr}`, or prove only the remaining branch:\n  invariant {nm.getId} : {predStr} for_each … using {childInv.getId} := by\n    forEachLift {upd.getId} {childInv.getId} {predStr}\n    case {firstTag} => …"
 
 macro_rules
   | `(qedInternalInvariant $name:ident : $pred for_each $field:ident preserved_by $upd:ident using $_:ident := $pf:term) =>
@@ -120,23 +109,15 @@ elab "qedDischargeStyledForEach" view:ident field:ident childStyled:ident nm:ide
     let mut body : MessageData := m!""
     for g in goals do
       body := body ++ (← g.withContext do
-        let s := (← Meta.ppExpr (← instantiateMVars (← g.getType))).pretty.replace "✝" ""
+        let s ← Qed.Diag.ppQedExpr (← g.getType) ["m"]
         let why :=
           if (s.splitOn "everyElementL").length > 1 then
-            "a leftover rendered list, check `" ++ toString childStyled.getId ++ "`'s predicate is \
-             exactly the one here (same role and the same styles)."
+            s!"child list didn't match `{childStyled.getId}` — check that both use the same role and styles."
           else
-            "an element this rule constrains that the lift couldn't place, usually the parent view \
-             has its *own* element with that role (style it), or the view is shaped unusually."
-        pure m!"\n  • {why}\n      still needs:  {s}")
+            "an element outside the collection wasn't covered — check if the parent view also renders that role."
+        pure m!"\n  • {why}\n    must satisfy:  {s}")
     let predStr := (pred.raw.reprint.getD "the rule").trimmed
-    throwErrorAt nm m!"styling lift `{nm.getId}`, `{predStr}` couldn't be lifted over every \
-      `{field.getId}` in `{view.getId}`.\n{body}\n\n`for_each … holds_in` reduces `{view.getId}` to \
-      its static chrome plus a `{field.getId}.map (the child view)` list, closing each rendered card \
-      with `{childStyled.getId}`. For anything left, finish by hand, `roleHasOneOf_map` / \
-      `everyElementL_mapList` are the lemmas, and `forEachStyleLift` closes the parts it can:\n\n  \
-      invariant {nm.getId} : {predStr} for_each {field.getId} using \
-      {childStyled.getId} := by\n    forEachStyleLift {view.getId} {childStyled.getId}\n    <fill the rest>"
+    throwErrorAt nm m!"Styling invariant `{nm.getId}` failed to lift `{predStr}` over `{field.getId}` in `{view.getId}`:{body}\n\nHint: Finish the remaining branch with `forEachStyleLift`:\n  invariant {nm.getId} : {predStr} for_each {field.getId} using {childStyled.getId} := by\n    forEachStyleLift {view.getId} {childStyled.getId}\n    …"
 
 syntax (name := invariantForEachStyled)
   "qedInternalInvariant " ident " : " term " for_each " ident " holds_in " ident " using " ident

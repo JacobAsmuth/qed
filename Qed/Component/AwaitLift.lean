@@ -645,6 +645,11 @@ private partial def liftAwaitStmts (ctx : RewriteCtx)
         let tree := if tailTree.isNormal then .normal else .letBind (st.getArg 1) tyOpt? (st.getArg 4) tailTree
         return (#[st] ++ tail, tree)
 
+      if k == ``qedStmtEnsure && rest.any stmtContainsAwait then
+        let (tLifted, tTree) ← go outerParams localNames preStmts rest
+        let tree := if tTree.isNormal then .normal else .ifBranch (st.getArg 1) tTree .normal
+        return (#[st] ++ tLifted, tree)
+
       if (k == ``qedStmtIf || k == ``qedStmtIfLet || k == ``qedStmtMatch) && stmtContainsAwait st then
         unless rest.isEmpty || hasReturnStmt st do
           throwErrorAt st "statements after an `if`/`match` containing `await` are not supported unless the branch `return`s; move trailing statements inside the branches"
@@ -729,16 +734,10 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
       if spec.allNames.contains pn then
         throwErrorAt pId s!"parameter `{pn}` in action `{name}` shadows a component field; rename the parameter"
       seenP := seenP.push pn
-    let (rawWPat?, rawWGuards) := parseCompWhen (a.getArg 3)
-    let whenPat? ← rawWPat?.mapM fun (p, s) => do
-      let sRw ← rewriteIn baseCtx false s
-      return (← liftMacroM (lowerQedPat p), ← lowerCompExpr .val sRw)
-    let guardsRw ← rawWGuards.mapM (rewriteIn baseCtx false)
-    let guard? ← lowerCompGuards guardsRw
-    let stmtsRaw := suiteStmts (← rewriteIn baseCtx false (a.getArg 5))
+    let stmtsRaw := suiteStmts (← rewriteIn baseCtx false (a.getArg 4))
     let (stmts, dispTree) ← liftAwaitStmts baseCtx params params #[] stmtsRaw
     unless dispTree.isNormal do
-      specDispatchesRef.modify (·.push { ctor := name, params, whenPat?, guard?, tree := dispTree })
+      specDispatchesRef.modify (·.push { ctor := name, params, tree := dispTree })
     let mut dummyAssigns : Array (Name × Option Term) := #[]
     for s in stmts do
       if s.getKind == ``qedStmtAssign && (s.getArg 0).getKind == ``qedIdent && atomStr (s.getArg 1) == "=" && isCdot (s.getArg 2) then
@@ -747,7 +746,7 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
       throwErrorAt a s!"action `{name}` declares explicit parameter(s) and cannot use the `·` placeholder; assign explicitly (e.g. `{dummyAssigns[0]!.1} = {params[0]!.1.getId}`)"
     let cur ← sitesRef.get
     sitesRef.set (cur.push {
-      key := s!"action:{name}", ctor := name, params, whenPat?, guard?, assigns := dummyAssigns, stmts? := some stmts })
+      key := s!"action:{name}", ctor := name, params, assigns := dummyAssigns, stmts? := some stmts })
   for p in spec.portIns do
     let name := p.id.getId
     if (← sitesRef.get).any (·.ctor == name) then
@@ -756,19 +755,14 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
       throwErrorAt p.id s!"port name `{name}` conflicts with `collection {name}`"
     if spec.allNames.contains p.argId.getId then
       throwErrorAt p.argId s!"port parameter `{p.argId.getId}` on `port {name}` shadows a component field; rename the parameter"
-    let whenPat? ← p.whenPat?.mapM fun (pat, s) => do
-      let sRw ← rewriteIn baseCtx false s
-      return (← liftMacroM (lowerQedPat pat), ← lowerCompExpr .val sRw)
-    let guardsRw ← p.guards.mapM (rewriteIn baseCtx false)
-    let guard? ← lowerCompGuards guardsRw
     let stmtsRaw := suiteStmts (← rewriteIn baseCtx false p.body)
     let portParams := #[(p.argId, p.argTy)]
     let (stmts, dispTree) ← liftAwaitStmts baseCtx portParams portParams #[] stmtsRaw
     unless dispTree.isNormal do
-      specDispatchesRef.modify (·.push { ctor := name, params := portParams, whenPat?, guard?, tree := dispTree })
+      specDispatchesRef.modify (·.push { ctor := name, params := portParams, tree := dispTree })
     let cur ← sitesRef.get
     sitesRef.set (cur.push {
-      key := s!"port:{name}", ctor := name, params := portParams, whenPat?, guard?, stmts? := some stmts })
+      key := s!"port:{name}", ctor := name, params := portParams, stmts? := some stmts })
   let route'? ← spec.route?.mapM fun rd => do
     let rParamId := mkIdent `_r
     let rParams := #[(rParamId, rd.ty)]

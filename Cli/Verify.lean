@@ -238,12 +238,12 @@ def verify (checkExterns : Bool := true) : IO Bool := do
   step "verifying proofs & axioms"
   let hasExamples ← (FilePath.mk "Examples").pathExists
   if hasExamples then
-    if (← shQuiet "lake" #["build", "Qed", "Qed.Driver", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples", "Tests"]) != 0 then return false
+    if (← shLakeBuild #["build", "Qed", "Qed.Driver", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples", "Tests"]) != 0 then return false
   else
     let root ← webRoot
     let jsMod ← jsRoot
     let targets := if checkExterns && jsMod != root then #[root, jsMod] else #[root]
-    if (← shQuiet "lake" (#["build"] ++ targets)) != 0 then return false
+    if (← shLakeBuild (#["build"] ++ targets)) != 0 then return false
   let tGrep ← IO.asTask grepForbidden
   let tAxiom ← IO.asTask axiomClean
   let tEff ← if hasExamples then IO.asTask effectsCovered else IO.asTask (pure true)

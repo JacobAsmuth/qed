@@ -106,13 +106,23 @@ import Examples.LiveRoom
 #print axioms Qed.Server.Net.isBlockedIpBytes_loopback_v4
 #print axioms Qed.Server.Net.isBlockedIpBytes_metadata_v4
 #print axioms Qed.Server.Net.isBlockedIpBytes_rfc1918_10
+#print axioms Qed.Server.Net.isBlockedIpBytes_testnet_v4
+#print axioms Qed.Server.Net.isBlockedIpBytes_benchmark_v4
 #print axioms Qed.Server.Net.isBlockedIpBytes_loopback_v6
 #print axioms Qed.Server.Net.isBlockedIpBytes_v4mapped_metadata
 #print axioms Qed.Server.Net.isBlockedIpBytes_nat64_metadata
+#print axioms Qed.Server.Net.isBlockedIpBytes_nat64_local_v6
+#print axioms Qed.Server.Net.isBlockedIpBytes_6to4_v6
+#print axioms Qed.Server.Net.isBlockedIpBytes_teredo_v6
 #print axioms Qed.Server.Net.isBlockedIpBytes_badLen
+#print axioms Qed.Server.Net.parseHttpUrl_no_fragment
 #print axioms Qed.Server.Http.parseRequestHead_rejects_nul
+#print axioms Qed.Server.Http.parseOneHeaderLine_rejects_bad_name
+#print axioms Qed.Server.Http.parseRequestHead_http11_has_host
 #print axioms Qed.Server.Http.parseRequestHead_contentLen_le
 #print axioms Qed.Server.Http.safeContentType_no_crlf
+#print axioms Qed.Server.Http.isContentHashedAsset_hashed
+#print axioms Qed.Server.Http.isContentHashedAsset_plain
 #print axioms Qed.Server.Http.classifyStaticPath_rejects_dotdot
 #print axioms Qed.Server.Http.sha1_size
 #print axioms Qed.Server.Http.base64Encode_rfc6455_accept
@@ -167,10 +177,7 @@ import Examples.LiveRoom
 #print axioms Qed.Item.renderList_no_lt
 #print axioms Qed.Item.render_no_closeSeq
 #print axioms Qed.Item.renderList_no_closeSeq
-#print axioms Qed.renderTheme_no_lt
-#print axioms Qed.renderTheme_no_closeSeq
-#print axioms Qed.css_raw_no_lt
-#print axioms Qed.css_raw_no_closeSeq
+#print axioms Qed.Style.rule_no_lt
 
 #print axioms Qed.LocalDef.valid_viewForProps
 #print axioms Qed.LocalDef.dedupe_mem
@@ -257,8 +264,6 @@ import Examples.LiveRoom
 #print axioms Qed.Theme.render_no_closeSeq
 #print axioms Qed.Keyframes.rule_no_lt
 #print axioms Qed.Keyframes.rule_no_closeSeq
-#print axioms Qed.Style.extend_raw_no_lt
-#print axioms Qed.Style.merge_raw_no_lt
 #print axioms Qed.inlineStyleStr_no_lt
 #print axioms Qed.inlineStyleStr_no_quote
 #print axioms Qed.inlineStyleStr_no_closeSeq

@@ -141,45 +141,6 @@ def cssDeclLine.formatter : PrettyPrinter.Formatter := PrettyPrinter.Formatter.v
 @[combinator_parenthesizer Qed.StyleDsl.cssDeclLine]
 def cssDeclLine.parenthesizer : PrettyPrinter.Parenthesizer := PrettyPrinter.Parenthesizer.visitToken
 
-private def scanInlineCss (input : String) : Nat → String.Pos.Raw → Nat → Bool → Char → String.Pos.Raw
-  | 0, pos, _, _, _ => pos
-  | fuel + 1, pos, depth, inStr, quote =>
-      if pos.atEnd input then pos
-      else
-        let ch := pos.get input
-        if inStr then
-          if ch == quote then scanInlineCss input fuel (pos.next input) depth false quote
-          else scanInlineCss input fuel (pos.next input) depth true quote
-        else if ch == '"' || ch == '\'' then
-          scanInlineCss input fuel (pos.next input) depth true ch
-        else if ch == '{' then
-          scanInlineCss input fuel (pos.next input) (depth + 1) false quote
-        else if ch == '}' then
-          if depth == 0 then pos
-          else scanInlineCss input fuel (pos.next input) (depth - 1) false quote
-        else if ch == ')' && depth == 0 then
-          pos
-        else
-          scanInlineCss input fuel (pos.next input) depth false quote
-
-/-- Scans inline CSS inside `{ css: ... }` up to `}` or newline-delimited end. -/
-private def inlineCssBodyFn : ParserFn := fun c s =>
-  let input := c.inputString
-  let startPos := s.pos
-  let fuel := input.utf8ByteSize - startPos.byteIdx + 1
-  let endPos := scanInlineCss input fuel startPos 0 false '"'
-  let raw := (String.Pos.Raw.extract input startPos endPos).trimmed
-  if raw.isEmpty then s.mkError "inline CSS declarations"
-  else mkNodeToken `Qed.StyleDsl.inlineCssBody startPos true c (s.setPos endPos)
-
-def inlineCssBody : Parser where
-  fn := inlineCssBodyFn
-
-@[combinator_formatter Qed.StyleDsl.inlineCssBody]
-def inlineCssBody.formatter : PrettyPrinter.Formatter := PrettyPrinter.Formatter.visitAtom `Qed.StyleDsl.inlineCssBody
-@[combinator_parenthesizer Qed.StyleDsl.inlineCssBody]
-def inlineCssBody.parenthesizer : PrettyPrinter.Parenthesizer := PrettyPrinter.Parenthesizer.visitToken
-
 private def identEq (kwName : Name) : Parser :=
   leading_parser withFn (fun fn c s =>
     let s' := fn c s
@@ -204,7 +165,7 @@ def styleStrictClause : Parser := leading_parser
 @[command_parser] def styleCmd : Parser := leading_parser
   optional Command.docComment >>
   withPosition (
-    atomic (identEq `style >> notFollowedBy (symbol ":=") "':='") >>
+    "style " >>
     Parser.ident >>
     optional styleExtendsClause >>
     optional styleStrictClause >>
@@ -214,22 +175,19 @@ def styleStrictClause : Parser := leading_parser
 @[command_parser] def keyframesCmd : Parser := leading_parser
   optional Command.docComment >>
   withPosition (
-    atomic (identEq `keyframes) >>
+    "keyframes " >>
     Parser.ident >> ":" >>
     many1 (checkColGt >> categoryParser `cssBlockItem 0))
 
 @[command_parser] def themeCmd : Parser := leading_parser
   optional Command.docComment >>
   withPosition (
-    atomic (identEq `theme) >>
+    "theme " >>
     Parser.ident >> ":" >>
     many1 (checkColGt >> categoryParser `cssBlockItem 0))
 
 @[command_parser] def verifyThemeCmd : Parser := leading_parser
-  atomic (identEq `verify_theme) >> Parser.ident >> symbol "for" >> termParser
-
-/-- Inline scoped CSS term: `css: padding: 1rem; border-radius: 8px` (usable directly in JSX `{css: ...}`). -/
-syntax:max (name := inlineCssTerm) "css:" inlineCssBody : term
+  "verify_theme " >> Parser.ident >> symbol "for" >> termParser
 
 /-! ## CSS Property & Value Validation Engine -/
 
@@ -720,42 +678,30 @@ def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
   let styleReg := styleMetaRegistry.getState env
   let shortLabel := nameId.getId.getString!
   let fullName := currNs ++ nameId.getId
-  -- Check if all `extends` bases are statically known in `styleMetaRegistry` (zero-runtime baking!)
-  let mut allBasesStatic := true
   let mut baseMetas : Array StyleMetaInfo := #[]
   for bId in extendsIds do
-    if let some bm := resolveInRegistry styleReg env currNs openDecls bId.getId.toString then
-      baseMetas := baseMetas.push bm
-    else
-      allBasesStatic := false
-  if allBasesStatic then
-    let mergedItems := baseMetas.foldl (fun acc bm => Qed.Item.mergeItems acc bm.items) []
-    let finalItems  := Qed.Item.mergeItems mergedItems compiled.items
-    let rawCss      := Qed.Item.renderList finalItems
-    let clean       := Qed.sanitizeCssIdent shortLabel
-    let cls         := if clean.isEmpty then s!"qed-{Qed.shortHexHash (Qed.cssHash rawCss)}"
-                       else s!"qed-{clean}-{Qed.shortHexHash (Qed.cssHash rawCss)}"
-    let dedup (xs : List String) := (xs.foldl (fun acc x => if acc.contains x then acc else x :: acc) []).reverse
-    let allToks  := dedup ((baseMetas.foldl (fun acc bm => acc ++ bm.usedTokens) []) ++ compiled.usedTokens ++ Qed.collectItemTokens finalItems)
-    let allExtra := dedup ((baseMetas.foldl (fun acc bm => acc ++ bm.extraRules) []) ++ compiled.extraRules)
-    let allThemes := baseMetas.foldl (fun acc bm => bm.themes.foldl (fun a t => if a.contains t then a else a ++ [t]) acc) compiled.themes
-    let baked : Qed.Style := {
-      className := cls, raw := rawCss, items := finalItems,
-      usedTokens := allToks, extraRules := allExtra, isGlobal := false
-    }
-    let valTerm ← liftMacroM <| quoteStyleLiteral baked
-    elabCommand (← `(command| $[$doc?:docComment]? def $nameId : Qed.Style := $valTerm))
-    modifyEnv fun e => styleMetaRegistry.addEntry e {
-      fullName, items := finalItems, usedTokens := allToks, extraRules := allExtra, themes := allThemes
-    }
-  else
-    -- Fallback for extending legacy `def base := css [...]` values at runtime
-    let itemTerms ← liftMacroM <| compiled.items.toArray.mapM quoteItem
-    let extraList ← liftMacroM <| quoteStringList compiled.extraRules
-    let baseTerms : Array Term := extendsIds.map (⟨·.raw⟩)
-    let mergedTerm ← `(let _s := Qed.Style.mergeMany [$[$baseTerms],*] [$[$itemTerms],*] $(Syntax.mkStrLit shortLabel);
-      { _s with extraRules := _s.extraRules ++ $extraList })
-    elabCommand (← `(command| $[$doc?:docComment]? def $nameId : Qed.Style := $mergedTerm))
+    let some bm := resolveInRegistry styleReg env currNs openDecls bId.getId.toString
+      | throwErrorAt bId s!"unknown style `{bId.getId}` in `extends` (declare it with `style {bId.getId}:`)"
+    baseMetas := baseMetas.push bm
+  let mergedItems := baseMetas.foldl (fun acc bm => Qed.Item.mergeItems acc bm.items) []
+  let finalItems  := Qed.Item.mergeItems mergedItems compiled.items
+  let rawCss      := Qed.Item.renderList finalItems
+  let clean       := Qed.sanitizeCssIdent shortLabel
+  let cls         := if clean.isEmpty then s!"qed-{Qed.shortHexHash (Qed.cssHash rawCss)}"
+                     else s!"qed-{clean}-{Qed.shortHexHash (Qed.cssHash rawCss)}"
+  let dedup (xs : List String) := (xs.foldl (fun acc x => if acc.contains x then acc else x :: acc) []).reverse
+  let allToks  := dedup ((baseMetas.foldl (fun acc bm => acc ++ bm.usedTokens) []) ++ compiled.usedTokens ++ Qed.collectItemTokens finalItems)
+  let allExtra := dedup ((baseMetas.foldl (fun acc bm => acc ++ bm.extraRules) []) ++ compiled.extraRules)
+  let allThemes := baseMetas.foldl (fun acc bm => bm.themes.foldl (fun a t => if a.contains t then a else a ++ [t]) acc) compiled.themes
+  let baked : Qed.Style := {
+    className := cls, raw := rawCss, items := finalItems,
+    usedTokens := allToks, extraRules := allExtra, isGlobal := false
+  }
+  let valTerm ← liftMacroM <| quoteStyleLiteral baked
+  elabCommand (← `(command| $[$doc?:docComment]? def $nameId : Qed.Style := $valTerm))
+  modifyEnv fun e => styleMetaRegistry.addEntry e {
+    fullName, items := finalItems, usedTokens := allToks, extraRules := allExtra, themes := allThemes
+  }
 
 @[command_elab styleCmd] def elabStyleCmd : CommandElab := fun stx => do
   let doc? : Option (TSyntax ``Lean.Parser.Command.docComment) :=
@@ -766,44 +712,6 @@ def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
   let strictTokens := (stx.getArg 4).getNumArgs == 1
   let bodyStxs := (stx.getArg 6).getArgs
   elabStyleDef doc? nameId extendsIds strictTokens bodyStxs
-
-/-! ## Inline `css:` Term Elaborator -/
-
-@[term_elab inlineCssTerm] def elabInlineCssTerm : TermElab := fun stx expectedType? => do
-  let raw := (atomText (stx.getArg 1)).trimmed
-  let env ← getEnv
-  let currNs ← getCurrNamespace
-  let openDecls ← getOpenDecls
-  let declStrs := splitTopLevel ';' raw
-  if declStrs.isEmpty then
-    throwErrorAt stx "empty inline `css:` block"
-  let mut items : List Qed.Item := []
-  let mut toks  : List String := []
-  let mut rules : List String := []
-  for d in declStrs do
-    let some (p, v) := splitFirstColon d
-      | throwErrorAt (stx.getArg 1) s!"expected `property: value` in inline `css:`, got `{d}`"
-    let res ← resolveAndValidateDecl (stx.getArg 1) env currNs openDecls false p v
-    items := items ++ [.decl p.trimmed res.cssText]
-    toks  := toks ++ res.usedTokens
-    rules := rules ++ res.extraRules
-    let thReg := themeMetaRegistry.getState env
-    for thNm in res.themes do
-      if let some thInfo := thReg.find? thNm then
-        unless rules.contains thInfo.renderedRule do
-          rules := rules ++ [thInfo.renderedRule]
-  let dedup (xs : List String) := (xs.foldl (fun acc x => if acc.contains x then acc else x :: acc) []).reverse
-  let rawCss := Qed.Item.renderList items
-  let baked : Qed.Style := {
-    className  := s!"qed-{Qed.shortHexHash (Qed.cssHash rawCss)}"
-    raw        := rawCss
-    items      := items
-    usedTokens := dedup (toks ++ Qed.collectItemTokens items)
-    extraRules := dedup rules
-    isGlobal   := false
-  }
-  let termStx ← liftMacroM <| quoteStyleLiteral baked
-  elabTerm termStx expectedType?
 
 /-! ## `keyframes <name>:` Elaborator -/
 
@@ -1191,141 +1099,5 @@ private def decodeReducedStrList? (e : Expr) : Option (List String) := do
       catch _ => return "(unknown)"
     let targetLabel := (target.raw.reprint.getD "target").trimmed
     throwErrorAt stx s!"theme `{thId.getId}` does not define all CSS tokens used by `{targetLabel}`.\n  Missing tokens: {missingStr}\nAdd them to `theme {thId.getId}:`."
-
-/-! ## Compile-Time Baking for Closed `css [...]` / `cssNamed "..." [...]` Calls -/
-
-private def evalNatExpr? (e : Expr) : MetaM (Option Nat) := do
-  let w ← whnf e
-  if let .lit (.natVal n) := w then return some n
-  return none
-
-private def evalBoolExpr? (e : Expr) : MetaM (Option Bool) := do
-  let w ← whnf e
-  if w.isConstOf ``Bool.true then return some true
-  if w.isConstOf ``Bool.false then return some false
-  return none
-
-private def evalStrExpr? : Nat → Expr → MetaM (Option String)
-  | 0, _ => return none
-  | fuel + 1, e => do
-      let e := e.consumeMData.headBeta
-      if let .lit (.strVal s) := e then return some s
-      let args := e.getAppArgs
-      let fn? := e.getAppFn.constName?
-      -- Handle structure projections (`Color.raw`, `CssNum.raw`) whether applied as const or `.proj`
-      let colorArg? : Option Expr :=
-        if fn? == some ``Qed.Color.raw && args.size == 1 then some args[0]!
-        else match e with | .proj ``Qed.Color 0 c => some c | _ => none
-      if let some c := colorArg? then
-        let c := c.consumeMData.headBeta
-        if c.isAppOfArity ``Qed.hex 1 then
-          if let some s ← evalStrExpr? fuel c.appArg! then return some (Qed.hex s).raw
-        else if c.isAppOfArity ``Qed.rgb 3 then
-          let ca := c.getAppArgs
-          if let (some r, some g, some b) := (← evalNatExpr? ca[0]!, ← evalNatExpr? ca[1]!, ← evalNatExpr? ca[2]!) then
-            return some (Qed.rgb r g b).raw
-      let cssNumArg? : Option Expr :=
-        if fn? == some ``Qed.CssNum.raw && args.size == 1 then some args[0]!
-        else match e with | .proj ``Qed.CssNum 0 c => some c | _ => none
-      if let some cn := cssNumArg? then
-        let cn := cn.consumeMData.headBeta
-        if cn.isAppOfArity ``OfNat.ofNat 3 then
-          if let some n ← evalNatExpr? (cn.getArg! 1) then return some (toString n)
-        else if cn.isAppOfArity ``OfScientific.ofScientific 5 then
-          let ca := cn.getAppArgs
-          if let (some m, some neg, some exp) := (← evalNatExpr? ca[2]!, ← evalBoolExpr? ca[3]!, ← evalNatExpr? ca[4]!) then
-            return some ((OfScientific.ofScientific m neg exp : Qed.CssNum).raw)
-      match fn? with
-      | some ``HAppend.hAppend =>
-          if args.size == 6 then
-            let some a ← evalStrExpr? fuel args[4]! | return none
-            let some b ← evalStrExpr? fuel args[5]! | return none
-            return some (a ++ b)
-      | some ``String.append =>
-          if args.size == 2 then
-            let some a ← evalStrExpr? fuel args[0]! | return none
-            let some b ← evalStrExpr? fuel args[1]! | return none
-            return some (a ++ b)
-      | some ``Nat.repr =>
-          if args.size == 1 then
-            if let some n ← evalNatExpr? args[0]! then return some (toString n)
-      | some ``ToString.toString =>
-          if args.size == 3 then
-            let v ← whnf args[2]!
-            if let .lit (.natVal n) := v then return some (toString n)
-            if let .lit (.strVal s) := v then return some s
-      | _ => pure ()
-      let w ← whnf e
-      if w == e then return none
-      evalStrExpr? fuel w
-
-private def evalItemListExpr? : Nat → Expr → MetaM (Option (List Qed.Item))
-  | 0, _ => return none
-  | fuel + 1, e => do
-      let w ← whnf e
-      if w.isAppOfArity ``List.nil 1 then return some []
-      if w.isAppOfArity ``List.cons 3 then
-        let args := w.getAppArgs
-        let iw ← whnf args[1]!
-        let item? : Option Qed.Item ←
-          if iw.isAppOfArity ``Qed.Item.decl 2 then
-            match ← evalStrExpr? fuel (iw.getArg! 0), ← evalStrExpr? fuel (iw.getArg! 1) with
-            | some p, some v => pure (some (.decl p v))
-            | _, _ => pure none
-          else if iw.isAppOfArity ``Qed.Item.nest 2 then
-            match ← evalStrExpr? fuel (iw.getArg! 0), ← evalItemListExpr? fuel (iw.getArg! 1) with
-            | some sel, some bs => pure (some (.nest sel bs))
-            | _, _ => pure none
-          else pure none
-        let some it := item? | return none
-        let some rest ← evalItemListExpr? fuel args[2]! | return none
-        return some (it :: rest)
-      return none
-
-private def itemToExpr : Qed.Item → Expr
-  | .decl p v => mkApp2 (mkConst ``Qed.Item.decl) (toExpr p) (toExpr v)
-  | .nest s b => mkApp2 (mkConst ``Qed.Item.nest) (toExpr s) (itemListToExpr b)
-where
-  itemListToExpr : List Qed.Item → Expr
-    | [] => mkApp (mkConst ``List.nil [Level.zero]) (mkConst ``Qed.Item)
-    | i :: is => mkApp3 (mkConst ``List.cons [Level.zero]) (mkConst ``Qed.Item) (itemToExpr i) (itemListToExpr is)
-
-private def styleToExpr (s : Qed.Style) : Expr :=
-  mkAppN (mkConst ``Qed.Style.mk)
-    #[toExpr s.className, toExpr s.raw, itemToExpr.itemListToExpr s.items,
-      toExpr s.usedTokens, toExpr s.extraRules, toExpr s.isGlobal]
-
-private def isPlainPosArg (s : Syntax) : Bool :=
-  !s.isOfKind ``Lean.Parser.Term.namedArgument && !s.isOfKind ``Lean.Parser.Term.ellipsis
-
-@[term_elab Lean.Parser.Term.app]
-def elabCssBakeApp : TermElab := fun stx _expectedType? => do
-  let fn := stx.getArg 0
-  if !fn.isIdent then throwUnsupportedSyntax
-  let nm := fn.getId
-  if nm != `css && nm != `Qed.css && nm != `cssNamed && nm != `Qed.cssNamed then
-    throwUnsupportedSyntax
-  if (← getLCtx).findFromUserName? nm |>.isSome then
-    throwUnsupportedSyntax
-  let c ← try resolveGlobalConstNoOverloadCore nm catch _ => throwUnsupportedSyntax
-  let args := (stx.getArg 1).getArgs
-  let listItemTy := mkApp (mkConst ``List [Level.zero]) (mkConst ``Qed.Item)
-  if c == ``Qed.css && args.size == 1 && isPlainPosArg args[0]! then
-    let body ← instantiateMVars (← elabTermEnsuringType args[0]! listItemTy)
-    addTermInfo' fn (mkConst ``Qed.css)
-    if !body.hasFVar && !body.hasMVar then
-      if let some items ← try evalItemListExpr? 64 body catch _ => pure none then
-        return styleToExpr (Qed.css items)
-    return mkApp (mkConst ``Qed.css) body
-  else if c == ``Qed.cssNamed && args.size == 2 && isPlainPosArg args[0]! && isPlainPosArg args[1]! then
-    let lbl ← instantiateMVars (← elabTermEnsuringType args[0]! (mkConst ``String))
-    let body ← instantiateMVars (← elabTermEnsuringType args[1]! listItemTy)
-    addTermInfo' fn (mkConst ``Qed.cssNamed)
-    if !lbl.hasFVar && !lbl.hasMVar && !body.hasFVar && !body.hasMVar then
-      if let (some lblS, some items) ← try pure (← evalStrExpr? 32 lbl, ← evalItemListExpr? 64 body) catch _ => pure (none, none) then
-        return styleToExpr (Qed.cssNamed lblS items)
-    return mkApp2 (mkConst ``Qed.cssNamed) lbl body
-  else
-    throwUnsupportedSyntax
 
 end Qed.StyleDsl

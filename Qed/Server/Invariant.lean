@@ -1,5 +1,6 @@
 import Lean
 import Qed.Field
+import Qed.Diag
 import Qed.Server.Core
 import Qed.Server.Syntax
 import Qed.Server.Registry
@@ -326,10 +327,10 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
                   c := (c.getArg! 1).consumeMData
                 if c.isAppOfArity `Qed.Codec.refine 4 then
                   p := c.getArg! 2
-              let prettyGoal := (← ppExpr ((Expr.app p valExpr).headBeta)).pretty.replace "✝" ""
-              let prettyVal := (← ppExpr valExpr).pretty.replace "✝" ""
-              throwErrorAt stx m!"cannot prove schema field refinement `{prettyGoal}` for value `{prettyVal}`.\n\
-                Guard this value with `if ...:`, `ensure ... else ...`, or a `requires` precondition so the compiler can verify it satisfies the schema's `where` rule."
+              let prettyGoal ← Qed.Diag.ppQedExpr ((Expr.app p valExpr).headBeta)
+              let prettyVal ← Qed.Diag.ppQedExpr valExpr
+              throwErrorAt stx m!"Schema field rule `{prettyGoal}` failed for `{prettyVal}`.\n\n\
+                Hint: Guard this value with `if ...:`, `ensure ... else ...`, or a `requires` precondition so it satisfies the schema's `where` rule."
         let prfExpr ← wrapAuxProof goalProp prfExpr
         return ← mkAppOptM ``Qed.Field.mk #[some innerTy, some predFn, some valExpr, some prfExpr]
       else
@@ -352,9 +353,10 @@ def elabSrvAutoEmit : TermElab := fun stx expectedType? => do
   let facts ← collectProofFacts #[propExpr]
   let some prfExpr ← tryProveWithFacts facts (← mkSrvRefinementProofStx) propExpr
     | do
-        let prettyGoal := (← ppExpr propExpr).pretty.replace "✝" ""
-        throwErrorAt stx m!"cannot prove channel `ensures` postcondition `{prettyGoal}` at `emit`.\n\
-          Ensure the emitted event satisfies the channel's `ensures` clause."
+        let unfolded := (← unfoldDefinition? propExpr).getD propExpr
+        let prettyGoal ← Qed.Diag.ppQedExpr unfolded
+        throwErrorAt stx m!"Channel `ensures` postcondition failed at `emit`:\n  • must satisfy:  {prettyGoal}\n\n\
+          Hint: Ensure the emitted event satisfies the channel's `ensures` clause."
   wrapAuxProof propExpr prfExpr
 
 open Lean Meta Elab Term in
@@ -524,13 +526,10 @@ private def proveBoundsFor (ref : Syntax) (arrExpr idxNatExpr : Expr) : TermElab
   let prfExpr? ← tryProveWithFacts facts prfStx goalProp
   let some prfExpr := prfExpr?
     | do
-        let rawArr := (← ppExpr arrExpr).pretty.replace "✝" ""
-        let prettyArr := if rawArr.startsWith "_s0." then (rawArr.drop 4).toString else rawArr
-        let idxCore := if idxNatExpr.isAppOfArity ``Qed.Server.SrvIdx.toNat 3 then idxNatExpr.getArg! 2 else idxNatExpr
-        let rawIdx := (← ppExpr idxCore).pretty.replace "✝" ""
-        let prettyIdx := if rawIdx.startsWith "_s0." then (rawIdx.drop 4).toString else rawIdx
-        throwErrorAt ref m!"cannot prove array index `{prettyIdx}` is in bounds for `{prettyArr}` (requires `{prettyIdx} < {prettyArr}.size`).\n\
-          Guard this access with `if {prettyIdx} < {prettyArr}.size:` or `ensure {prettyIdx} < {prettyArr}.size else ...` before indexing."
+        let prettyArr ← Qed.Diag.ppQedExpr arrExpr
+        let prettyIdx ← Qed.Diag.ppQedExpr idxNatExpr
+        throwErrorAt ref m!"Array index `{prettyIdx}` could be out of bounds for `{prettyArr}`:\n  • must satisfy:  {prettyIdx} < {prettyArr}.size\n\n\
+          Hint: Guard this access with `if {prettyIdx} < {prettyArr}.size:` or `ensure {prettyIdx} < {prettyArr}.size else ...`."
   wrapAuxProof goalProp prfExpr
 
 open Lean Meta Elab Term in
@@ -1047,27 +1046,27 @@ elab_rules : tactic
       evalTactic runTac
       let rem ← getUnsolvedGoals
       unless rem.isEmpty do
-        let msg := (← rem[0]!.withContext do ppExpr (← instantiateMVars (← rem[0]!.getType))).pretty.replace "✝" ""
-        let moreNote := if rem.length > 1 then s!"\n  (and {rem.length - 1} more obligation(s))" else ""
+        let msg ← rem[0]!.withContext do Qed.Diag.ppQedExpr (← rem[0]!.getType)
+        let moreNote := if rem.length > 1 then s!"\n  • (+ {rem.length - 1} more obligation(s))" else ""
         let lbl := invLabel.getString
         if lbl.startsWith "ensures:" then
           let postStr := (lbl.drop 8).toString.trimAscii.toString
-          throwError m!"server postcondition `ensures {postStr}` could not be proved for `{fnLabel.getString}`.\n\
-            Remaining proof obligation:\n  {msg}{moreNote}\n\
-            Ensure every successful return path establishes `{postStr}`."
+          throwError m!"Server postcondition `ensures {postStr}` failed in `{fnLabel.getString}`:\n\
+            {"  "}• must satisfy:  {msg}{moreNote}\n\n\
+            Hint: Ensure every successful return path establishes `{postStr}`."
         else if lbl.startsWith "init:" then
           let invStr := (lbl.drop 5).toString.trimAscii.toString
-          throwError m!"server invariant `{invStr}` does not hold on the initial state.\n\
-            Remaining proof obligation:\n  {msg}{moreNote}\n\
-            Update the initial `state` values so they satisfy `{invStr}`."
+          throwError m!"Server invariant `{invStr}` failed on initial state:\n\
+            {"  "}• must satisfy:  {msg}{moreNote}\n\n\
+            Hint: Update the initial `state` values so they satisfy `{invStr}`."
         else if lbl.startsWith "mutating " then
-          throwError m!"server invariant `{lbl}` could not be proved for `{fnLabel.getString}`.\n\
-            Remaining proof obligation:\n  {msg}{moreNote}\n\
-            Add a matching `requires` clause or guard mutations of that field with `if ...:` / `ensure ... else ...`."
+          throwError m!"Server invariant `{lbl}` failed in `{fnLabel.getString}`:\n\
+            {"  "}• must satisfy:  {msg}{moreNote}\n\n\
+            Hint: Add a matching `requires` clause or guard mutations of that field with `if ...:` / `ensure ... else ...`."
         else
-          throwError m!"server invariant `{lbl}` could not be proved for `{fnLabel.getString}`.\n\
-            Remaining proof obligation:\n  {msg}{moreNote}\n\
-            Guard state mutations with `if ...:`, `ensure ... else ...`, or `requires ...` so this invariant holds across every branch."
+          throwError m!"Server invariant `{lbl}` failed in `{fnLabel.getString}`:\n\
+            {"  "}• must satisfy:  {msg}{moreNote}\n\n\
+            Hint: Guard state mutations with `if ...:`, `ensure ... else ...`, or `requires ...` so this invariant holds across every branch."
 
 macro "qedNormAsyncCont" : tactic => `(tactic| (
   try dsimp (config := { zetaDelta := false }) only
@@ -1175,8 +1174,8 @@ elab_rules : tactic
             | (simp_all (config := { zetaDelta := true, zetaHave := true }) <;> decide)))))
       let rem ← getUnsolvedGoals
       unless rem.isEmpty do
-        let msg ← rem[0]!.withContext do ppExpr (← instantiateMVars (← rem[0]!.getType))
-        throwError m!"cannot prove server `requires` precondition:\n  {msg}\n\
-          Guard this RPC call with `when ...` or `if ...` so the server precondition is satisfied."
+        let msg ← rem[0]!.withContext do Qed.Diag.ppQedExpr (← rem[0]!.getType)
+        throwError m!"Server `requires` precondition could not be proved:\n  • must satisfy:  {msg}\n\n\
+          Hint: Guard this RPC call with `if ...:` or `ensure ... else return` so the precondition holds."
 
 end Qed.Server

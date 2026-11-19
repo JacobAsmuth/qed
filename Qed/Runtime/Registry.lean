@@ -14,9 +14,7 @@ private def isFrameworkRoot (env : Environment) (n : Name) : Bool :=
 
 open Lean Elab Term Meta in
 private def isStyleConstructorFn (env : Environment) (fn : Name) : Bool :=
-  fn == ``Qed.css || fn == ``Qed.cssNamed || fn == ``Qed.Style.mk ||
-  fn == ``Qed.Style.extend || fn == ``Qed.Style.merge || fn == ``Qed.Style.mergeMany ||
-  fn == ``Qed.Style.withKeyframes || fn == ``Qed.Style.withExtraRule ||
+  fn == ``Qed.Style.mk ||
   fn == ``Qed.Theme.asStyle || fn == ``Qed.Keyframes.asStyle ||
   match env.find? fn with
   | some (.defnInfo d) => d.type.getForallBody.isConstOf ``Qed.Style && !d.type.isConstOf ``Qed.Style

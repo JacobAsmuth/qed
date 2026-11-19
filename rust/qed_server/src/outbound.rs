@@ -38,6 +38,64 @@ impl ServerCertVerifier for NoVerify {
 
 static TLS_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
 
+fn decode_b64_pem_body(body: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(body.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u8 = 0;
+    for b in body.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' | b'\t' => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | (val as u32);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn parse_pem_certs(pem: &str) -> Vec<CertificateDer<'static>> {
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let mut certs = Vec::new();
+    let mut rest = pem;
+    while let Some(start) = rest.find(BEGIN) {
+        let after_begin = &rest[start + BEGIN.len()..];
+        let Some(end) = after_begin.find(END) else { break };
+        if let Some(der) = decode_b64_pem_body(&after_begin[..end]) {
+            certs.push(CertificateDer::from(der));
+        }
+        rest = &after_begin[end + END.len()..];
+    }
+    certs
+}
+
+fn load_extra_ca_certs(roots: &mut RootCertStore) {
+    let path = std::env::var("QED_CA_CERT_FILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("SSL_CERT_FILE").ok().filter(|s| !s.trim().is_empty()));
+    let Some(path) = path else { return };
+    match std::fs::read_to_string(&path) {
+        Ok(pem) => {
+            let certs = parse_pem_certs(&pem);
+            let (added, ignored) = roots.add_parsable_certificates(certs);
+            if added == 0 {
+                eprintln!("warning: no valid CA certificates loaded from `{path}` (ignored: {ignored})");
+            }
+        }
+        Err(e) => eprintln!("warning: failed to read CA bundle `{path}`: {e}"),
+    }
+}
+
 fn tls_config() -> Arc<ClientConfig> {
     TLS_CONFIG.get_or_init(|| {
         let builder = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -48,6 +106,7 @@ fn tls_config() -> Arc<ClientConfig> {
         } else {
             let mut roots = RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            load_extra_ca_certs(&mut roots);
             builder.with_root_certificates(roots).with_no_client_auth()
         };
         Arc::new(cfg)
@@ -91,7 +150,9 @@ thread_local! {
 fn socket_is_alive(fd: libc::c_int) -> bool {
     let mut b: u8 = 0;
     let r = unsafe { libc::recv(fd, &mut b as *mut u8 as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
-    r > 0 || (r < 0 && is_wouldblock(last_errno()))
+    // An idle HTTP/1.1 keep-alive connection must have zero pending bytes (`EAGAIN`/`EWOULDBLOCK`);
+    // `r == 0` is peer EOF and `r > 0` indicates an unread TLS `close_notify` alert or stray data.
+    r < 0 && is_wouldblock(last_errno())
 }
 
 fn pop_pooled(is_tls: bool, host: &str, port: u16) -> Option<OutConn> {

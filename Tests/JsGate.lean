@@ -169,8 +169,8 @@ def protoP (i : Nat) : String :=
 
 def styleP (i : Nat) : String :=
   match i with
-  | 0 => (css [letterSpacing (em (-0.015)), zIndex (-1)]).raw
-  | 1 => (css [letterSpacing (em (-(-0.015))), zIndex (-0)]).raw
+  | 0 => inlineStyleStr [letterSpacing (em (-0.015)), zIndex (-1)]
+  | 1 => inlineStyleStr [letterSpacing (em (-(-0.015))), zIndex (-0)]
   | _ => ""
 
 def wsMuxP (i : Nat) : String :=

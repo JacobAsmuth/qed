@@ -98,10 +98,149 @@ def driverEntries : Array String := #[
   "Qed.qedWsOpen:qed_ws_open", "Qed.qedWsBytes:qed_ws_bytes",
   "Qed.qedWsText:qed_ws_text", "Qed.qedWsClose:qed_ws_close"]
 
-def bold  (s : String) : String := s!"\x1b[1m{s}\x1b[0m"
-def green (s : String) : String := s!"\x1b[32m{s}\x1b[0m"
-def red   (s : String) : String := s!"\x1b[31m{s}\x1b[0m"
-def step  (s : String) : IO Unit := IO.println (bold s!"▸ {s}")
+def bold   (s : String) : String := s!"\x1b[1m{s}\x1b[0m"
+def dim    (s : String) : String := s!"\x1b[2m{s}\x1b[0m"
+def green  (s : String) : String := s!"\x1b[32m{s}\x1b[0m"
+def red    (s : String) : String := s!"\x1b[31m{s}\x1b[0m"
+def yellow (s : String) : String := s!"\x1b[33m{s}\x1b[0m"
+def cyan   (s : String) : String := s!"\x1b[36m{s}\x1b[0m"
+def step   (s : String) : IO Unit := IO.println (bold s!"▸ {s}")
+
+private def useColor : IO Bool := do
+  match ← env "NO_COLOR" with
+  | some v => return v.isEmpty
+  | none   => return true
+
+private def paint (enabled : Bool) (code s : String) : String :=
+  if enabled then s!"\x1b[{code}m{s}\x1b[0m" else s
+
+/-- Parses a Lean diagnostic header line like `error: File.lean:12:4: msg` or
+    `File.lean:12:4: error: msg` into `(severity, path, line, col, msg)`. -/
+private def parseLeanDiagLine (line : String) : Option (String × String × Nat × Nat × String) := do
+  let trySevPrefix (pfx sev : String) : Option (String × String × Nat × Nat × String) := do
+    if !line.startsWith pfx then none
+    else
+      let rest := (line.drop pfx.length).toString.trimmed
+      let parts := rest.splitOn ":"
+      match parts with
+      | path :: lnS :: colS :: msgParts =>
+          let ln ← lnS.trimmed.toNat?
+          let col ← colS.trimmed.toNat?
+          let msg := (String.intercalate ":" msgParts).trimmed
+          some (sev, path.trimmed, ln, col, msg)
+      | _ => none
+  -- Handle `error(lean.xxx): File.lean:12:4: msg`
+  if line.startsWith "error(" then
+    match line.splitOn "): " with
+    | _ :: restParts =>
+        let rest := String.intercalate "): " restParts
+        match rest.splitOn ":" with
+        | path :: lnS :: colS :: msgParts =>
+            let ln ← lnS.trimmed.toNat?
+            let col ← colS.trimmed.toNat?
+            let msg := (String.intercalate ":" msgParts).trimmed
+            return ("error", path.trimmed, ln, col, msg)
+        | _ => failure
+    | _ => failure
+  if let some r := trySevPrefix "error:" "error" then return r
+  if let some r := trySevPrefix "warning:" "warning" then return r
+  -- Handle `File.lean:12:4: error: msg`
+  match line.splitOn ":" with
+  | path :: lnS :: colS :: sevS :: msgParts =>
+      if path.endsWith ".lean" then
+        let ln ← lnS.trimmed.toNat?
+        let col ← colS.trimmed.toNat?
+        let sev := sevS.trimmed
+        if sev == "error" || sev == "warning" then
+          let msg := (String.intercalate ":" msgParts).trimmed
+          return (sev, path.trimmed, ln, col, msg)
+      failure
+  | _ => failure
+
+private def readSourceSnippet (path : String) (ln col : Nat) (color : Bool) : IO String := do
+  let fp : FilePath := path
+  if !(← fp.pathExists) || ln == 0 then return ""
+  try
+    let content ← IO.FS.readFile fp
+    let lines := (content.splitOn "\n").toArray
+    if ln > lines.size then return ""
+    let srcLine := lines[ln - 1]!
+    let prevLine? := if ln >= 2 then some lines[ln - 2]! else none
+    let gutterW := max 3 (toString ln).length
+    let padNum (n : Nat) : String :=
+      let s := toString n
+      String.ofList (List.replicate (gutterW - s.length) ' ') ++ s
+    let blankGutter := String.ofList (List.replicate gutterW ' ')
+    let bar := paint color "2" "|"
+    let caretPad := String.ofList (List.replicate col ' ')
+    let caret := paint color "1;31" "^"
+    let mut out := ""
+    if let some pl := prevLine? then
+      if !pl.trimmed.isEmpty then
+        out := out ++ s!"  {paint color "2" (padNum (ln - 1))} {bar} {paint color "2" pl}\n"
+    out := out ++ s!"  {paint color "1" (padNum ln)} {bar} {srcLine}\n"
+    out := out ++ s!"  {blankGutter} {bar} {caretPad}{caret}\n"
+    return out
+  catch _ => return ""
+
+/-- Formats raw Lake / Lean compiler output into clean, readable terminal diagnostics:
+    strips `trace: .> LEAN_PATH=...` noise and redundant build-failure footers, adds ANSI
+    colors, and displays source snippets with caret pointers for `.lean` errors. -/
+def formatLakeDiagnostics (raw : String) : IO String := do
+  if (← env "QED_VERBOSE") == some "1" then return raw
+  let color ← useColor
+  let lines := raw.splitOn "\n"
+  let mut out : Array String := #[]
+  let mut skipTargetBullets := false
+  let mut hasPrettyDiag := false
+  for line in lines do
+    let t := line.trimmed
+    if t.startsWith "trace: .>" ||
+       t == "error: Lean exited with code 1" ||
+       t == "error: build failed" ||
+       t == "info: stderr:" ||
+       t.startsWith "✔ [" ||
+       t.startsWith "ℹ [" then
+      continue
+    if t == "Some required targets logged failures:" then
+      skipTargetBullets := true
+      continue
+    if skipTargetBullets then
+      if t.startsWith "- " then continue
+      else skipTargetBullets := false
+    if t.startsWith "✖ [" then
+      continue
+    match parseLeanDiagLine line with
+    | some (sev, path, ln, col, msg) =>
+        if msg == "could not synthesize default value for parameter 'hvalid' using tactics" ||
+           msg == "could not synthesize default value for parameter 'valid_view' using tactics" ||
+           msg == "could not synthesize default value for parameter 'hview' using tactics" ||
+           msg == "could not synthesize default value for parameter 'hpres' using tactics" then
+          continue
+        hasPrettyDiag := true
+        let sevTag := if sev == "error" then paint color "1;31" "error" else paint color "1;33" "warning"
+        let locTag := paint color "1" s!"{path}:{ln}:{col}"
+        let snippet ← readSourceSnippet path ln col color
+        if !out.isEmpty then out := out.push ""
+        out := out.push s!"{sevTag}: {locTag}"
+        if !snippet.isEmpty then
+          let trimmedSnip := if snippet.endsWith "\n" then String.ofList snippet.toList.dropLast else snippet
+          out := out.push trimmedSnip
+        if !msg.isEmpty then
+          out := out.push s!"  {msg}"
+    | none =>
+        if t.startsWith "Hint:" then
+          let rest := (t.drop 5).toString
+          out := out.push s!"  {paint color "1;36" "Hint:"}{rest}"
+        else if t.startsWith "• " then
+          let rest := (t.drop 2).toString
+          out := out.push s!"    {paint color "1;31" "•"} {rest}"
+        else if hasPrettyDiag && !t.isEmpty then
+          out := out.push s!"  {line}"
+        else if !t.isEmpty then
+          out := out.push line
+  let formatted := String.intercalate "\n" out.toList
+  if formatted.trimmed.isEmpty then return raw else return formatted ++ "\n"
 
 def sh (cmd : String) (args : Array String) (extraEnv : Array (String × Option String) := #[]) : IO UInt32 := do
   let child ← IO.Process.spawn
@@ -115,6 +254,12 @@ def shOut (cmd : String) (args : Array String) (extraEnv : Array (String × Opti
 def shQuiet (cmd : String) (args : Array String) (extraEnv : Array (String × Option String) := #[]) : IO UInt32 := do
   let (code, out) ← shOut cmd args extraEnv
   if code != 0 then IO.eprint out
+  return code
+
+def shLakeBuild (args : Array String) : IO UInt32 := do
+  let (code, out) ← shOut "lake" args
+  if code != 0 then
+    IO.eprint (← formatLakeDiagnostics out)
   return code
 
 def onPath (cmd : String) : IO Bool := do

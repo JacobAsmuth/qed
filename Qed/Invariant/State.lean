@@ -1,5 +1,6 @@
 import Qed.Runtime.App
 import Qed.Style
+import Qed.Diag
 import Lean
 
 namespace Qed
@@ -180,17 +181,24 @@ private def mkInitTac (usingL : Array Term) (pred initT : Term) : TacticM (TSynt
 private def throwUnsolvedInvGoals (nm : Ident) (hdr footer : MessageData) : TacticM Unit := do
   let goals ← getUnsolvedGoals
   unless goals.isEmpty do
-    let mut body : MessageData := m!""
+    let mut lines : Array String := #[]
     for g in goals do
-      body := body ++ (← g.withContext do
-        let tag := stripStepPrefix (← g.getTag)
+      let line ← g.withContext do
+        let tagLabel := Qed.Diag.formatCaseTag (stripStepPrefix (← g.getTag))
         let ty ← instantiateMVars (← g.getType)
-        let tgt := (← Meta.ppExpr ty).pretty.replace "✝" ""
+        let tgt ← Qed.Diag.ppQedExpr ty ["m"]
         let env ← getEnv
         let present ← (ty.getUsedConstants.filter (qedIsHelper env)).filterM
           (fun n => return (← getProjectionFnInfo? n).isNone)
-        let involves := if present.isEmpty then m!"" else m!"\n    (still involves: {present.toList})"
-        pure m!"\n  • case `{tag}` still needs:  {tgt}{involves}")
+        let involves := if present.isEmpty then ""
+          else s!"\n    (involves helper: {String.intercalate ", " (present.toList.map toString)})"
+        pure s!"  • {tagLabel} must satisfy:  {tgt}{involves}"
+      unless lines.contains line do
+        lines := lines.push line
+    let maxShown := 6
+    let shown := lines.extract 0 (min lines.size maxShown)
+    let extra := if lines.size > maxShown then s!"\n  • (+ {lines.size - maxShown} more failing branch(es))" else ""
+    let body := String.intercalate "\n" shown.toList ++ extra
     throwErrorAt nm m!"{hdr}\n{body}\n\n{footer}"
 
 syntax "qedDischargeInit " "[" term,* "]" term:max ident term:max : tactic
@@ -202,8 +210,8 @@ elab_rules : tactic
     let initName := if initT.raw.isIdent then toString initT.raw.getId
       else (initT.raw.reprint.getD (toString initT.raw)).trimmed
     throwUnsolvedInvGoals nm
-      m!"invariant `{nm.getId}` doesn't hold on initial state `{initName}`, the automation couldn't verify it."
-      m!"Ensure initial state `{initName}` satisfies `{nm.getId}`, supply a fact with `invariant {nm.getId} : … using [yourLemma]`, or prove it manually."
+      m!"Invariant `{nm.getId}` failed on initial state `{initName}`:"
+      m!"Hint: Update the initial `state` values so `{nm.getId}` holds, add `using [lemma]`, or supply a `:= by` proof."
 
 elab "qedDestructExistsHyps" : tactic => do
   for _ in [0:16] do
@@ -327,8 +335,8 @@ elab_rules : tactic
     let updName := if upd.raw.isIdent then toString upd.raw.getId
       else (upd.raw.reprint.getD (toString upd.raw)).trimmed
     throwUnsolvedInvGoals nm
-      m!"invariant `{nm.getId}` isn't preserved by `{updName}`, the automation couldn't close every message."
-      m!"If the property is true here, the prover is likely missing a fact: supply it with `invariant {nm.getId} : … using [yourLemma]`, or prove the case with `:= by`. If a branch can actually violate the property, fix that branch of `{updName}`, or weaken the property to what it guarantees."
+      m!"Invariant `{nm.getId}` failed in `{updName}`:"
+      m!"Hint: Guard the failing branch with `if ...:`, fix the update, or weaken the invariant.\n      If the rule does hold, add `using [lemma]` or a manual `:= by` proof."
 
 macro_rules
   | `(qedInternalInvariant $name:ident : $pred from $init preserved_by $upd:ident using [$_ls,*] := $pf:term) =>

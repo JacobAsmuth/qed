@@ -192,16 +192,17 @@ private def execHttpAttempt (method : String) (u : ParsedUrl) (wireReq : ByteArr
         | .error e => return .error e
       let handle := UInt64.ofNat handleNat
       let wasReused := reusedNat != 0
+      let canRetry := wasReused && isIdempotentHttpMethod method && attemptsLeft > 0
       match ← Prim.outboundWriteAll handle wireReq with
       | .error e =>
           Prim.outboundRelease handle 0
-          if wasReused && attemptsLeft > 0 then execHttpAttempt method u wireReq ssrfGuard attemptsLeft
+          if canRetry then execHttpAttempt method u wireReq ssrfGuard attemptsLeft
           else return .error e
       | .ok () =>
           match ← readUntilCrlfCrlf handle with
           | .error e =>
               Prim.outboundRelease handle 0
-              if wasReused && attemptsLeft > 0 then execHttpAttempt method u wireReq ssrfGuard attemptsLeft
+              if canRetry then execHttpAttempt method u wireReq ssrfGuard attemptsLeft
               else return .error e
           | .ok (rxBuf, hdrEnd) =>
               match parseHttpResponseHead (rxBuf.extract 0 hdrEnd) with
@@ -333,37 +334,87 @@ def fetchGcpBearerToken (cache? : Option (Prim.StateBox (Array GcpTokenCacheEntr
     Prim.atomicModify cache fun cur => (gcpCacheInsert cur entry, ())
   return .ok accessToken
 
-/-! ## Constant-Time HMAC Session & Bearer Token Verification -/
+/-! ## Constant-Time HMAC Session & Bearer Token Verification (Expiring `v1` + Rotation) -/
 
-private def constTimeXorLoop (a b : ByteArray) (i : Nat) (acc : UInt8) : UInt8 :=
-  if h : i < a.size then
-    if hb : i < b.size then
-      constTimeXorLoop a b (i + 1) (acc ||| (a[i] ^^^ b[i]))
-    else 1
-  else acc
-termination_by a.size - i
+/-- Mints an expiring `v1.<expSec>.<userId>.<hmacHex>` session token signed with HMAC-SHA256. -/
+def signUserToken (secret userId : String) (ttlSec : Nat := 86400) : IO String := do
+  let nowSec := ((← Prim.nowMs).toNat) / 1000
+  let expSec := nowSec + ttlSec
+  let payload := s!"v1.{expSec}.{userId}"
+  let mac ← Prim.hmacSha256 secret.toUTF8 payload.toUTF8
+  return s!"{payload}.{Proto.encodeHex mac}"
 
-def constTimeEqBytes (a b : ByteArray) : Bool :=
-  if a.size != b.size then false
-  else constTimeXorLoop a b 0 0 == 0
+private def anySecretVerify (secrets : List String) (payload sigBytes : ByteArray) : IO Bool := do
+  for sec in secrets do
+    if ← Prim.hmacSha256Verify sec.toUTF8 payload sigBytes then
+      return true
+  return false
 
-def signUserToken (secret userId : String) : IO String := do
-  let mac ← Prim.hmacSha256 secret.toUTF8 userId.toUTF8
-  return userId ++ "." ++ Proto.encodeHex mac
-
-def verifyUserToken (secret token : String) : IO (Option String) := do
+/-- Verifies either an expiring `v1.<expSec>.<userId>.<hmacHex>` token or (unless
+    `requireExpiring` is true) a legacy `<userId>.<hmacHex>` token using Rust's constant-time
+    `hmac::Mac::verify_slice` across active + rotated secrets. -/
+def verifyUserTokenWithNow (secrets : List String) (token : String) (nowSec : Nat)
+    (requireExpiring : Bool := false) : IO (Option String) := do
+  if secrets.isEmpty then return none
   match (token.splitOn ".").reverse with
   | [] | [_] => return none
-  | sigHex :: revUidParts =>
-      let uid := String.intercalate "." revUidParts.reverse
-      if uid.isEmpty || sigHex.length != 64 then return none
-      match Proto.decodeHex sigHex with
-      | .error _ => return none
-      | .ok sigBytes =>
-          let expected ← Prim.hmacSha256 secret.toUTF8 uid.toUTF8
-          return if constTimeEqBytes sigBytes expected then some uid else none
+  | sigHex :: revPrefixParts =>
+      if sigHex.length != 64 then return none
+      let sigBytes ← match Proto.decodeHex sigHex with
+        | .error _ => return none
+        | .ok b    => pure b
+      let prefixParts := revPrefixParts.reverse
+      let payload := String.intercalate "." prefixParts
+      match prefixParts with
+      | "v1" :: expStr :: uidParts =>
+          let uid := String.intercalate "." uidParts
+          if uid.isEmpty then return none
+          let some expSec := parseStrictU64 expStr 18446744073709551615 | return none
+          if nowSec >= expSec then return none
+          return if ← anySecretVerify secrets payload.toUTF8 sigBytes then some uid else none
+      | _ =>
+          if requireExpiring || payload.isEmpty then return none
+          return if ← anySecretVerify secrets payload.toUTF8 sigBytes then some payload else none
 
-/-! ## Inbound `RequestCtx` Extraction -/
+def verifyUserToken (secret token : String) (requireExpiring : Bool := false) : IO (Option String) := do
+  if secret.isEmpty then return none
+  let nowSec := ((← Prim.nowMs).toNat) / 1000
+  verifyUserTokenWithNow [secret] token nowSec requireExpiring
+
+/-! ## Startup-Cached Server Config & Inbound `RequestCtx` Extraction -/
+
+structure ServerConfig where
+  authSecrets        : List String := []
+  requireExpiring    : Bool := false
+  rpcAllowedOrigins? : Option String := none
+  wsAllowedOrigins?  : Option String := none
+  bindHost           : String := "0.0.0.0"
+
+private def loadNonEmptyEnv (name : String) : IO (Option String) := do
+  match ← Prim.getEnv name with
+  | some v => let t := trimWs v; return if t.isEmpty then none else some t
+  | none   => return none
+
+def loadServerConfig (devMode : Bool) : IO ServerConfig := do
+  let secCur?  ← Prim.getEnv "QED_AUTH_SECRET"
+  let secPrev? ← Prim.getEnv "QED_AUTH_SECRET_PREV"
+  let secrets  := ([secCur?, secPrev?].filterMap id).filter (!·.isEmpty)
+  let reqExp   := (← loadNonEmptyEnv "QED_AUTH_REQUIRE_EXP") == some "1"
+  let rpcOrig? ← loadNonEmptyEnv "QED_RPC_ALLOWED_ORIGINS"
+  let wsOrig?  ← loadNonEmptyEnv "QED_WS_ALLOWED_ORIGINS"
+  let host?    := (← loadNonEmptyEnv "QED_HOST").orElse (fun _ => none)
+  let bindHost ← match host? with
+    | some h => pure h
+    | none   => match ← loadNonEmptyEnv "HOST" with
+        | some h => pure h
+        | none   => pure (if devMode then "127.0.0.1" else "0.0.0.0")
+  return {
+    authSecrets        := secrets
+    requireExpiring    := reqExp
+    rpcAllowedOrigins? := rpcOrig?
+    wsAllowedOrigins?  := wsOrig?
+    bindHost           := bindHost
+  }
 
 private def parseCookiePairs (raw : String) : List (String × String) :=
   (raw.splitOn ";").foldl (fun acc seg =>
@@ -382,21 +433,19 @@ private def extractBearer (authHdr : String) : Option String :=
     if tok.isEmpty then none else some tok
   else none
 
-def buildRequestCtx (headers : Array (String × String)) (clientIp : String) : IO RequestCtx := do
+def buildRequestCtx (cfg : ServerConfig) (headers : Array (String × String)) (clientIp : String) : IO RequestCtx := do
   let hdrList := headers.toList
   let cookies := hdrList.foldl (fun acc (k, v) =>
     if k.toLower == "cookie" then acc ++ parseCookiePairs v else acc) []
   let bearer? := hdrList.findSome? fun (k, v) =>
     if k.toLower == "authorization" then extractBearer v else none
   let sessionCookie? := (cookies.find? fun (k, _) => k == "qed_session").map Prod.snd
-  let authSecret? ← Prim.getEnv "QED_AUTH_SECRET"
-  let userId? ← match authSecret? with
-    | some sec =>
-        if sec.isEmpty then pure none
-        else match bearer?.orElse (fun _ => sessionCookie?) with
-          | some tok => verifyUserToken sec tok
-          | none     => pure none
-    | none => pure none
+  let userId? ← if cfg.authSecrets.isEmpty then pure none
+    else match bearer?.orElse (fun _ => sessionCookie?) with
+      | some tok =>
+          let nowSec := ((← Prim.nowMs).toNat) / 1000
+          verifyUserTokenWithNow cfg.authSecrets tok nowSec cfg.requireExpiring
+      | none => pure none
   return { headers := hdrList, cookies, bearerToken := bearer?, userId := userId?, clientIp }
 
 /-! ## Native `MonadServer IO` & `MonadAtomic σ IO` Instances -/
@@ -583,6 +632,21 @@ private def stepWsRxLoop
                  fragState := frag', subOps := ops' }
 termination_by rx.size - off
 
+private def loadHostScript (staticDirFd : Prim.StaticDir) (devMode : Bool) : IO String := do
+  if devMode then return "/qed_host.mjs"
+  match ← Prim.readStaticFile staticDirFd "qed_manifest.json" 0 with
+  | none => return "/qed_host.mjs"
+  | some (_, _, bytes) =>
+      match String.fromUTF8? bytes with
+      | none => return "/qed_host.mjs"
+      | some raw =>
+          match Json.parse raw with
+          | .ok j =>
+              match (j.get? "host").bind (·.str?) with
+              | some h => if isSafeUrl h then return h else return "/qed_host.mjs"
+              | none   => return "/qed_host.mjs"
+          | .error _ => return "/qed_host.mjs"
+
 def runFullstackWithDispatch {Model Msg : Type}
     (app : Qed.App Model Msg)
     (title : String)
@@ -596,28 +660,41 @@ def runFullstackWithDispatch {Model Msg : Type}
     (wsDispatchFn? : Option (RequestCtx → UInt8 → String → ByteArray → ByteArray → IO (Except ApiError ByteArray)) := none) : IO UInt32 := do
   if !(← verifyRequiredSecrets requiredSecrets) then
     return 1
+  let cfg ← loadServerConfig devMode
   let staticDirFd ← Prim.openStaticDir staticDir
+  let hostScript ← loadHostScript staticDirFd devMode
   let rpcPrefix := "/_qed/rpc/" ++ serverShortName ++ "/"
   let wsPath := "/_qed/ws/" ++ serverShortName
 
   let dispatchAppReq (req : ParsedReqHead) (body : ByteArray) (clientIp : String) : IO ByteArray := do
     if let some st := classifyStaticPath req.method req.target devMode then
       let headFlag : UInt8 := if st.isHead then 1 else 0
-      if let some (fsize, fbytes) ← Prim.readStaticFile staticDirFd st.relPath headFlag then
-        let head := formatHttpResponseHead 200 st.mime fsize req.keepAlive st.noStore
-        return if st.isHead then head else head ++ fbytes
+      if let some (fsize, mtimeMs, fbytes) ← Prim.readStaticFile staticDirFd st.relPath headFlag then
+        if !st.noStore then
+          let etag := s!"W/\"{fsize}-{mtimeMs}\""
+          if etagMatchesIfNoneMatch req.headers etag then
+            return formatNotModifiedResponse etag req.keepAlive
+          let cacheCtrl :=
+            if isContentHashedAsset st.relPath then "public, max-age=31536000, immutable"
+            else "public, max-age=0, must-revalidate"
+          let head := formatHttpResponseHead 200 st.mime fsize req.keepAlive false (some etag) (some cacheCtrl)
+          return if st.isHead then head else head ++ fbytes
+        else
+          let head := formatHttpResponseHead 200 st.mime fsize req.keepAlive true
+          return if st.isHead then head else head ++ fbytes
       else if st.isBuildId then
         return formatHttpResponse 200 st.mime "0".toUTF8 st.isHead req.keepAlive true
+      else
+        return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 st.isHead req.keepAlive false
     let pathOnly := (req.target.splitOn "?").headD req.target
     let isHead := req.method == "HEAD"
     let (status, ctype, respBody) ←
       if req.method == "GET" && pathOnly == "/_qed/health" then
         pure (200, "application/json", "{\"ok\":true}".toUTF8)
       else do
-        let ctx ← buildRequestCtx req.headers clientIp
+        let ctx ← buildRequestCtx cfg req.headers clientIp
         if req.method == "POST" && pathOnly.startsWith rpcPrefix then
-          let allowedOrigins? ← Prim.getEnv "QED_RPC_ALLOWED_ORIGINS"
-          match checkRpcCsrf ctx.headers allowedOrigins? with
+          match checkRpcCsrf ctx.headers cfg.rpcAllowedOrigins? with
           | .error (code, msg) => pure (code, "text/plain; charset=utf-8", msg.toUTF8)
           | .ok () =>
               let rpcMethod := String.ofList (pathOnly.toList.drop rpcPrefix.length)
@@ -635,7 +712,8 @@ def runFullstackWithDispatch {Model Msg : Type}
                 | .error e => return .error e.message
               else
                 return .error s!"SSR unknown binary RPC endpoint: {url}"
-          let rawHtml ← app.ssrRenderNativeBytes req.target title ssrDispatchBytes (sessionUser := ctx.userId)
+          let rawHtml ← app.ssrRenderNativeBytes req.target title ssrDispatchBytes
+            (script := hostScript) (sessionUser := ctx.userId)
           let finalHtml := if devMode then injectDevReload rawHtml else rawHtml
           pure (200, "text/html; charset=utf-8", finalHtml)
         else
@@ -655,11 +733,10 @@ def runFullstackWithDispatch {Model Msg : Type}
             return .doneClose (formatErrorResponse 400 "invalid WebSocket upgrade headers")
           let some acceptB64 := req.wsKey?.bind wsComputeAccept
             | return .doneClose (formatErrorResponse 400 "invalid Sec-WebSocket-Key")
-          let allowedOrigins? ← Prim.getEnv "QED_WS_ALLOWED_ORIGINS"
-          match checkWsOrigin req.headers.toList allowedOrigins? with
+          match checkWsOrigin req.headers.toList cfg.wsAllowedOrigins? with
           | .error (code, msg) => return .doneClose (formatErrorResponse code msg)
           | .ok () =>
-              let baseCtx ← buildRequestCtx req.headers clientIp
+              let baseCtx ← buildRequestCtx cfg req.headers clientIp
               let cid ← Prim.randomHex 12
               return .wsUpgrade (formatWsUpgradeResponse acceptB64) { baseCtx with connId := "ws-" ++ cid }
         if req.contentLen == 0 then
@@ -678,7 +755,7 @@ def runFullstackWithDispatch {Model Msg : Type}
     if let some wsDispatchFn := wsDispatchFn? then
       discard <| wsDispatchFn ctx 3 ch params ByteArray.empty
 
-  Prim.serveNative port numWorkers ({} : WsFragState) onHead dispatchAppReq onWsBytes onWsLeave
+  Prim.serveNative cfg.bindHost port numWorkers ({} : WsFragState) onHead dispatchAppReq onWsBytes onWsLeave
 
 def runStatefulFullstack {σ Model Msg : Type}
     (app : Qed.App Model Msg) (title serverShortName : String)

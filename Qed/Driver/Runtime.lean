@@ -220,7 +220,12 @@ private def drainPendingQueue {Msg : Type} (pendingRef : IO.Ref (Array Msg))
         for qm in queued do step qm
         drainPendingQueue pendingRef step fuel
 
-def run (app : App Model Msg) : IO Unit := do
+def defaultHttpTimeoutMs : Nat := 30000
+
+private def httpTimerKey (id : Nat) : String :=
+  s!"http:{id}"
+
+def runWithHttpTimeout (app : App Model Msg) (httpTimeoutMs : Nat) : IO Unit := do
   let template  := app.template
   let modelRef  ← IO.mkRef app.init.1
   let vstateRef ← IO.mkRef (none : Option (VState Model Msg))
@@ -232,6 +237,7 @@ def run (app : App Model Msg) : IO Unit := do
   let doneCbRef   ← IO.mkRef (#[] : Array (Nat × Msg))
   let respCbRef      ← IO.mkRef (∅ : Std.HashMap Nat (Except String String → Msg))
   let respBytesCbRef ← IO.mkRef (∅ : Std.HashMap Nat (Except String ByteArray → Msg))
+  let httpTimerRef   ← IO.mkRef (∅ : Std.HashMap Nat Nat)
   let effectCbRef    ← IO.mkRef (∅ : Std.HashMap Nat (String → Msg))
   let wsTimerCbRef   ← IO.mkRef (∅ : Std.HashMap Nat (IO Unit))
   let cbNextRef   ← IO.mkRef (0 : Nat)
@@ -258,6 +264,14 @@ def run (app : App Model Msg) : IO Unit := do
     wsTimerCbRef.modify (·.insert tid act)
     Dom.effectResult "timer.afterKeyed" key (toString delayMs) (UInt32.ofNat tid)
     return tid
+  let cancelHttpTimer (id : Nat) : IO Unit := do
+    if let some tid := (← httpTimerRef.get)[id]? then
+      httpTimerRef.modify (·.erase id)
+      cancelWsTimer (httpTimerKey id) (some tid)
+  let armHttpTimeout (id : Nat) (onTimeout : IO Unit) : IO Unit := do
+    if httpTimeoutMs > 0 then
+      let tid ← scheduleWsTimer (httpTimerKey id) none httpTimeoutMs onTimeout
+      httpTimerRef.modify (·.insert id tid)
   let ensureMuxConn (url : String) : IO Unit := do
     let some pool := (← wsMuxPoolsRef.get)[url]? | return
     if pool.subs.isEmpty || pool.connId.isSome then return
@@ -343,10 +357,22 @@ def run (app : App Model Msg) : IO Unit := do
     | .request method url body onResult => do
         let id ← cbNextRef.modifyGet (fun n => (n, n + 1))
         respCbRef.modify (·.insert id onResult)
+        armHttpTimeout id do
+          if let some f := (← respCbRef.get)[id]? then
+            respCbRef.modify (·.erase id)
+            httpTimerRef.modify (·.erase id)
+            Dom.effect "http.abort" (toString id) "" ""
+            (← dispatchRef.get) (f (.error "request timeout"))
         Dom.httpSend method url body (UInt32.ofNat id)
     | .requestBytes method url body onResult => do
         let id ← cbNextRef.modifyGet (fun n => (n, n + 1))
         respBytesCbRef.modify (·.insert id onResult)
+        armHttpTimeout id do
+          if let some f := (← respBytesCbRef.get)[id]? then
+            respBytesCbRef.modify (·.erase id)
+            httpTimerRef.modify (·.erase id)
+            Dom.effect "http.abort" (toString id) "" ""
+            (← dispatchRef.get) (f (.error "request timeout"))
         Dom.httpSendBytes method url body (UInt32.ofNat id)
     | .pushPath url => do
         Dom.pushPath url.raw
@@ -524,10 +550,12 @@ def run (app : App Model Msg) : IO Unit := do
           dispatchMsg msg
       | none => pure ()
     httpDone := fun id ok text => do
+      cancelHttpTimer id.toNat
       match (← respCbRef.get)[id.toNat]? with
       | some f => respCbRef.modify (·.erase id.toNat); dispatchMsg (f (if ok then .ok text else .error text))
       | none   => pure ()
     httpBytesDone := fun id ok bytes => do
+      cancelHttpTimer id.toNat
       match (← respBytesCbRef.get)[id.toNat]? with
       | some f =>
           respBytesCbRef.modify (·.erase id.toNat)
@@ -665,5 +693,8 @@ def run (app : App Model Msg) : IO Unit := do
               dispatchMsg (entry.handlers.onStatus (.reconnecting attempt'))
       | none => pure ()
   })
+
+def run (app : App Model Msg) : IO Unit :=
+  runWithHttpTimeout app defaultHttpTimeoutMs
 
 end Qed

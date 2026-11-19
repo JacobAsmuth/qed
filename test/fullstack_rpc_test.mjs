@@ -5,7 +5,7 @@ import { createServer } from 'node:http';
 import path from 'node:path';
 import {
   ROOT, buildDevAsync, checkLeakGate, checker, decodeVarintAt, lenField,
-  rawHttpReq, signSessionToken, startNativeServer, varintField, withPage,
+  rawHttpReq, signExpiringSessionToken, signSessionToken, sleep, startNativeServer, varintField, withPage,
 } from './harness.mjs';
 
 const encodeOrderReq = (idx, qty) => Buffer.concat([varintField(1, idx), varintField(2, qty)]);
@@ -53,7 +53,7 @@ const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
   privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
 });
 
-let tokenExchanges = 0, rsaVerified = false, sawUnescapedSlashInDownload = false, failD1 = false;
+let tokenExchanges = 0, rsaVerified = false, sawUnescapedSlashInDownload = false, failD1 = false, d1DelayMs = 0;
 const gcsObjects = new Map();
 const d1Queries = [];
 
@@ -102,6 +102,7 @@ const mockExt = createServer(async (req, res) => {
     if (req.headers.authorization !== 'Bearer test-cf-d1-secret') {
       return res.writeHead(401, { 'Content-Type': 'text/plain' }).end('unauthorized d1');
     }
+    if (d1DelayMs > 0) await sleep(d1DelayMs);
     d1Queries.push(JSON.parse(body.toString('utf8')));
     if (failD1) return res.writeHead(500, { 'Content-Type': 'application/json' }).end(JSON.stringify({ success: false, error: 'simulated D1 outage' }));
     return res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ success: true }));
@@ -115,25 +116,45 @@ const extBase = `http://127.0.0.1:${mockExt.address().port}`;
 const saJson = JSON.stringify({ client_email: 'qed-test@proj.iam.gserviceaccount.com', private_key: privateKey, token_uri: `${extBase}/oauth2/token` });
 
 const authSecret = 'super-secret-hmac-key';
+const prevAuthSecret = 'previous-rotated-hmac-key';
 const validToken = signSessionToken(authSecret, 'alice');
+const validV1Token = signExpiringSessionToken(authSecret, 'alice');
+const rotatedV1Token = signExpiringSessionToken(prevAuthSecret, 'alice');
+const expiredV1Token = signExpiringSessionToken(authSecret, 'alice', 1);
 const srv = await startNativeServer(dir, {
-  QED_WORKERS: '4', QED_AUTH_SECRET: authSecret, CF_D1_TOKEN: 'test-cf-d1-secret', GCP_SA_JSON: saJson,
+  QED_WORKERS: '4', QED_AUTH_SECRET: authSecret, QED_AUTH_SECRET_PREV: prevAuthSecret,
+  CF_D1_TOKEN: 'test-cf-d1-secret', GCP_SA_JSON: saJson,
   QED_GCP_TOKEN_URL: `${extBase}/oauth2/token`, QED_EXT_GCPSTORAGE_BASE: extBase, QED_EXT_CLOUDFLARED1_BASE: extBase,
 });
 
 try {
   check('native server healthy', srv.healthy, true);
 
-  // 4. Path traversal, symlink escape (Rust `openat2`), & RPC CSRF header-forwarding checks
+  // 4. RFC 9112 request smuggling checks, path traversal, symlink escape, & RPC CSRF
+  const noHostResp = await rawHttpReq(srv.port, 'GET /_qed/health HTTP/1.1\r\nConnection: close\r\n\r\n');
+  check('HTTP/1.1 without Host header rejected with 400', noHostResp.startsWith('HTTP/1.1 400 '), true);
+
+  const dupHostResp = await rawHttpReq(srv.port, 'GET /_qed/health HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
+  check('HTTP/1.1 with duplicate Host rejected with 400', dupHostResp.startsWith('HTTP/1.1 400 '), true);
+
+  const badHdrNameResp = await rawHttpReq(srv.port, 'GET /_qed/health HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length : 0\r\nConnection: close\r\n\r\n');
+  check('whitespace before colon header name rejected with 400', badHdrNameResp.startsWith('HTTP/1.1 400 '), true);
+
   const rawTraversalResp = await rawHttpReq(srv.port, 'GET /../lakefile.lean HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n');
   check('path traversal never leaks lakefile.lean', rawTraversalResp.includes('lean_lib Qed'), false);
+
+  const missingAssetResp = await fetch(`${srv.baseUrl}/does-not-exist.js`);
+  check('missing static asset returns 404 (not SSR 200 HTML)', missingAssetResp.status, 404);
+  check('responses include X-Content-Type-Options: nosniff', missingAssetResp.headers.get('x-content-type-options'), 'nosniff');
 
   const escapeLink = path.join(dir, 'escape.txt');
   await rm(escapeLink, { force: true });
   await symlink(path.join(ROOT, 'lakefile.lean'), escapeLink);
   try {
+    const escResp = await fetch(`${srv.baseUrl}/escape.txt`);
+    check('symlink inside staticDir returns 404', escResp.status, 404);
     check('symlink inside staticDir blocked by openat2/O_NOFOLLOW',
-      (await (await fetch(`${srv.baseUrl}/escape.txt`)).text()).includes('lean_lib Qed'), false);
+      (await escResp.text()).includes('lean_lib Qed'), false);
   } finally {
     await rm(escapeLink, { force: true });
   }
@@ -155,10 +176,13 @@ try {
   check('RPC accepts same-origin Origin + Sec-Fetch-Site + application/x-protobuf with 200',
     (await postCookieRpc('list', Buffer.alloc(0), { Origin: srv.baseUrl, 'Sec-Fetch-Site': 'same-origin' })).status, 200);
 
-  // 5. Auth (Rust HMAC FFI) & `requires` precondition enforcement
+  // 5. Auth (Rust constant-time HMAC verify, v1 expiry, key rotation) & `requires` enforcement
   check('unauthenticated order rejected with 401', (await postRpc('order', encodeOrderReq(0, 1))).status, 401);
   check('forged HMAC token rejected with 401', (await postRpc('order', encodeOrderReq(0, 1), `alice.${'0'.repeat(64)}`)).status, 401);
-  check('violated `requires qty <= 50` rejected with 400', (await postRpc('order', encodeOrderReq(0, 99), validToken)).status, 400);
+  check('expired v1 token rejected with 401', (await postRpc('order', encodeOrderReq(0, 1), expiredV1Token)).status, 401);
+  check('violated `requires qty <= 50` rejected with 400', (await postRpc('order', encodeOrderReq(0, 99), validV1Token)).status, 400);
+  check('rotated QED_AUTH_SECRET_PREV v1 token accepted (passes auth, hits requires 400)',
+    (await postRpc('order', encodeOrderReq(0, 99), rotatedV1Token)).status, 400);
 
   // 6. GCP RS256 JWT token exchange (Rust `rsa` + `outbound.rs`) + raw binary `Bytes` + `StateBox` cache
   const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0x42]);
@@ -211,6 +235,45 @@ try {
       rpcCalls.some((r) => r.url.endsWith('/_qed/rpc/Catalog/findAt') && r.contentType === 'application/x-protobuf'), true);
     check('detail view shows book 1 stock 8', await page.$eval('.detail-stock', (el) => el.textContent.trim()), 'In stock: 8');
   });
+
+  // 10. Non-blocking event loop (`QED_WORKERS=1`), prod ETag/304, & `QED_AUTH_REQUIRE_EXP=1`
+  const prodSrv = await startNativeServer(dir, {
+    QED_WORKERS: '1', QED_HOST: '127.0.0.1', QED_AUTH_SECRET: authSecret, QED_AUTH_REQUIRE_EXP: '1',
+    CF_D1_TOKEN: 'test-cf-d1-secret', GCP_SA_JSON: saJson,
+    QED_GCP_TOKEN_URL: `${extBase}/oauth2/token`, QED_EXT_GCPSTORAGE_BASE: extBase, QED_EXT_CLOUDFLARED1_BASE: extBase,
+  }, { dev: false });
+  try {
+    check('prod single-worker server healthy', prodSrv.healthy, true);
+
+    const jsResp1 = await fetch(`${prodSrv.baseUrl}/qed_rt.mjs`);
+    const etag = jsResp1.headers.get('etag');
+    check('prod static asset returns 200 with weak ETag', jsResp1.status === 200 && Boolean(etag?.startsWith('W/"')), true);
+    const jsResp2 = await fetch(`${prodSrv.baseUrl}/qed_rt.mjs`, { headers: { 'If-None-Match': etag } });
+    check('matching If-None-Match returns 304 Not Modified', jsResp2.status, 304);
+
+    const postProdRpc = (method, body, token) => fetch(`${prodSrv.baseUrl}/_qed/rpc/Catalog/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-protobuf', Authorization: `Bearer ${token}` },
+      body,
+    });
+    check('QED_AUTH_REQUIRE_EXP=1 rejects legacy non-expiring token with 401',
+      (await postProdRpc('order', encodeOrderReq(0, 1), validToken)).status, 401);
+
+    // Slow external D1 call (350ms) on a 1-worker server must NOT stall `/_qed/health`
+    d1DelayMs = 350;
+    const slowOrderPromise = postProdRpc('order', encodeOrderReq(0, 1), validV1Token);
+    await sleep(40);
+    const t0 = Date.now();
+    const healthResp = await fetch(`${prodSrv.baseUrl}/_qed/health`);
+    const healthElapsed = Date.now() - t0;
+    const slowOrderResp = await slowOrderPromise;
+    d1DelayMs = 0;
+    check('slow external RPC succeeded on 1-worker server with v1 token', slowOrderResp.status, 200);
+    check('concurrent /_qed/health stayed non-blocking (< 200ms) during 350ms external call',
+      healthResp.status === 200 && healthElapsed < 200, true);
+  } finally {
+    await prodSrv.stop();
+  }
 } finally {
   await srv.stop();
   mockExt.closeAllConnections?.();

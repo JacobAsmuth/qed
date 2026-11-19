@@ -236,7 +236,7 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
             let scrut ← lowerCompExpr .val (s.getArg 4)
             let tT ← compileBranch (suiteStmts (s.getArg 6))
             let eT ← compileBranch (if (s.getArg 7).getNumArgs == 3 then suiteStmts ((s.getArg 7).getArg 2) else #[])
-            `(if let $pat := $scrut then $tT else $eT)
+            `(match $(mkIdent `_qedIfLet):ident : $scrut:term with | $pat:term => $tT | _ => $eT)
           else
             let scruts ← (s.getArg 1).getSepArgs.mapM (lowerCompExpr .val)
             let alts ← (s.getArg 3).getArgs.mapM fun alt => do
@@ -381,15 +381,10 @@ private def mkOwnUpdateArms (spec : ComponentSpec) (sites : Array SetSite) (unch
             throwErrorAt stmts[0]! s!"action `{site.ctor}` has no state update, effect, or `send`; add a state assignment, `perform`, `send`, or `pass`"
           compileStmts spec (← `(s)) #[] none #[] stmts.toList
       | none => do mkUpdateRet spec (← flushAssigns (← `(s)) site.assigns) site.send? #[])
-    if let some guard := site.guard? then rhs ← `(if $(mkIdent `_qedWhen):ident : $guard then $rhs else $unchanged)
-    if let some (pat, scrut) := site.whenPat? then
-      rhs ← `(match $(mkIdent `_qedWhenPat):ident : $scrut:term with | $pat:term => $rhs | _ => $unchanged)
     rhs ← bindMentionedFields spec (fun g =>
       (site.stmts?.any (·.any (mentionsIdent · g))) ||
       (site.assigns.any fun (_, e?) => e?.any (mentionsIdent ·.raw g)) ||
-      (site.send?.any (mentionsIdent ·.raw g)) ||
-      (site.guard?.any (mentionsIdent ·.raw g)) ||
-      (site.whenPat?.any fun (_, sc) => mentionsIdent sc.raw g)) rhs
+      (site.send?.any (mentionsIdent ·.raw g))) rhs
     if !site.params.isEmpty then
       let ids : Array Term := site.params.map (⟨·.1.raw⟩)
       `(Lean.Parser.Term.matchAltExpr| | $cFull:ident $ids* => $rhs)

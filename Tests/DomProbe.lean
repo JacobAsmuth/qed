@@ -130,4 +130,22 @@ def duplicateHydrate : IO Dom.Node := do
   let _ ← patchView h parent 0 duplicateTemplate 1 st'
   return (← Dom.childAt parent 0)
 
+inductive RtProbeMsg
+  | reqDone (r : Except String String)
+  | pickDone (s : String)
+
+def rtProbeApp : App String RtProbeMsg :=
+  Qed.Internal.mkApp "init"
+    (fun s msg => match msg with
+      | .reqDone (.ok v)    => (s ++ "|ok:" ++ v, .none)
+      | .reqDone (.error e) => (s ++ "|err:" ++ e, .none)
+      | .pickDone p         => (s ++ "|pick:" ++ p, .none))
+    (.element "div" [.stat (.cls "rt-probe")] [.dyn id])
+    (start := .batch [
+      .request "GET" "/slow" "" .reqDone,
+      .fxResult "file.pick" ".txt" "" .pickDone
+    ])
+
+def bootRtProbe : IO Unit := Qed.runWithHttpTimeout rtProbeApp 80
+
 end DomProbe

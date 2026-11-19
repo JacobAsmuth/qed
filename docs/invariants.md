@@ -68,7 +68,7 @@ syntax—Qed automatically projects the next model out of `(model, cmd)`.
 
 When a client `component` invokes a `server` `def` via `await` or `query`, Qed connects server contracts and component invariants in both directions:
 
-- **Client `invariant` -> Server `requires`:** Component `invariant`s (as well as literals, `when` guards, `if` branches, and `Field`/`Ensured` values) are automatically available as hypotheses to discharge every server parameter `requires` clause at compile time.
+- **Client `invariant` -> Server `requires`:** Component `invariant`s (as well as literals, `if` / `if let` branches, `ensure` guards, and `Field`/`Ensured` values) are automatically available as hypotheses to discharge every server parameter `requires` clause at compile time.
 - **Server `ensures` -> Client `invariant`:** Server postconditions (`ensures expr`) are encoded via zero-trust `Ensured α p` (`FromProto` re-verifies `p` on untrusted bytes) and automatically unpacked into continuation hypotheses across `let x = await Server.fn(...) catch: ...` and `Cached.all` invariants on reactive `query` fields (see [`Examples/CloudBooks.lean`](../Examples/CloudBooks.lean) and [`Tests/ServerChecks.lean`](../Tests/ServerChecks.lean)).
 
 **Custom proof (`:= by`).** When a property quantifies over a collection (`Array` or `List`) or
@@ -195,7 +195,7 @@ h : m.count ≤ 0
 
 From here, one of three things is true:
 
-1. **The handler has a bug** (for example, a missing `when` guard or state reset).
+1. **The handler has a bug** (for example, a missing `if` guard or state reset).
 2. **The invariant is too strong or imprecise** (make sure it isn't trivially `True`, either).
 3. **Automation needs a hint** (add `:= by` to supply a collection or domain lemma).
 

@@ -94,13 +94,24 @@ server Catalog:
       books.push(nb)
       return nb
 
-def shell : Style := css [
-  maxWidth (rem 42), margin (rem 2) .auto, fontFamily "system-ui, sans-serif", lineHeight 1.5 ]
-def rowStyle : Style := css [
-  display .flex, gap (rem 1), padding (rem 0.75) (rem 1), border (px 1) .solid (hex "ddd"),
-  borderRadius (px 8), marginBottom (rem 0.75) ]
-def btnStyle : Style := css [
-  padding (rem 0.35) (rem 0.75), borderRadius (px 6), border (px 1) .solid (hex "06c") ]
+style shell:
+  max-width: 42rem
+  margin: 2rem auto
+  font-family: system-ui, sans-serif
+  line-height: 1.5
+
+style rowStyle:
+  display: flex
+  gap: 1rem
+  padding: 0.75rem 1rem
+  border: 1px solid #ddd
+  border-radius: 8px
+  margin-bottom: 0.75rem
+
+style btnStyle:
+  padding: 0.35rem 0.75rem
+  border-radius: 6px
+  border: 1px solid #06c
 
 component BookRow:
   prop book : Book
@@ -127,7 +138,7 @@ component Storefront:
       books = await Catalog.list()
     case .detail(_):
       pass
-  query current = Catalog.findAt(idx) when let .detail(idx) = route
+  query current = Catalog.findAt(idx) if let .detail(idx) = route
   state books       : Resource Book[]
   state lastSlot    : Nat?
   state lastOrdered : Book?
@@ -136,16 +147,17 @@ component Storefront:
   invariant orderedMatchesSlot:
     all b, idx: (lastOrdered == some(b) and lastSlot == some(idx)) -> b.slot == idx
 
-  action orderOne(idx: Nat) when user.isSome:
-    statusMsg = "Ordering…"
-    let updated = await Catalog.order(idx, 1) catch:
-      case .outOfStock:  statusMsg = "Order failed: out of stock"
-      case .notFound:    statusMsg = "Order failed: book not found"
-      case .failed(err): statusMsg = f"Order failed: {err}"
-    books = books.map(arr => arr.set(idx, updated) if idx < arr.size else arr)
-    lastSlot = some(idx)
-    lastOrdered = some(updated)
-    statusMsg = f"Ordered {updated.title}"
+  action orderOne(idx: Nat):
+    if user.isSome:
+      statusMsg = "Ordering…"
+      let updated = await Catalog.order(idx, 1) catch:
+        case .outOfStock:  statusMsg = "Order failed: out of stock"
+        case .notFound:    statusMsg = "Order failed: book not found"
+        case .failed(err): statusMsg = f"Order failed: {err}"
+      books = books.map(arr => arr.set(idx, updated) if idx < arr.size else arr)
+      lastSlot = some(idx)
+      lastOrdered = some(updated)
+      statusMsg = f"Ordered {updated.title}"
 
   view:
     <div {shell} class="cloudbooks">

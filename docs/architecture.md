@@ -2,7 +2,7 @@
 
 Qed is a full-stack web language embedded in [Lean 4](https://lean-lang.org). Instead of
 bolting static checks onto template strings or maintaining a separate specification language, Qed
-provides Lean 4 elaborators for `schema`, `router`, `css`, `component`, `external`, `server`,
+provides Lean 4 elaborators for `schema`, `router`, `style`, `theme`, `keyframes`, `component`, `external`, `server`,
 `fullstack`, and JSX. These desugar UI views, client state machines, wire protocols, and backend
 handlers into **ordinary Lean 4 definitions and proof obligations**.
 
@@ -18,7 +18,7 @@ A Qed program is composed from declarative blocks that share types and proofs en
 |-----------|----------------|-----------------------------|
 | `schema` | Fields with `where` refinement predicates | Editable `Draft`, proof-carrying `Field` records, `<Schema.Form>` (with self-hosted draft, optional `reset` / `bind`, and validated `onSubmit`), `canSubmit_iff`, plus `LawfulJson` and `LawfulProto` codecs. |
 | `router` | Named routes and URL patterns | Inductive route type, `Router` instance, proven `round_trip`, and `isSafeUrl` guarantees for links and navigation. |
-| `css` / `token` / `theme` | Typed style rules and design tokens | Scoped content-hashed CSS classes auto-collected into `<style id="qed-styles">`, queryable by view invariants. |
+| `style` / `theme` / `keyframes` | Scoped CSS blocks, typed design tokens, and animations | Zero-runtime compile-time-baked scoped CSS classes, WCAG contrast proofs, and `verify_theme` completeness checks, auto-collected into extracted `styles.css` / `<style id="qed-styles">` and queryable by view invariants. |
 | `component` | `session`, `prop`, `bind`, `slot`, `children`, `state`, `ephemeral`, `collection`, `route`, `start`, `port`, `query`, `action`, `await`/`catch`, `invariant`, and JSX `view` | Typed `Msg`, `init`, `update`, fine-grained `View` template, `App`, SSR `session` hydration, client RPC `requires` proofs, exhaustive domain `catch`, `Html.valid` proof, `Dehydrate` SSR codec, and state/styling invariant proofs. |
 | `external` | Base URL, auth schemes, and typed HTTP endpoints | Typed client functions with origin pinning, CRLF-sanitized headers, JSON/Protobuf/Bytes codecs, and SSRF-guarded `Webhook` calls. |
 | `server` | `env`, `state`, `invariant` rules, and `fn` handlers with `requires`, `ensures`, `atomic`, `fail(.tag)`, and `await` | Transactional `MonadServer` and `MonadAtomic` handlers, inferred domain error enums, `ProgEnsures` postconditions, Protobuf RPC dispatchers, and proofs of state preservation, auth checks, and linearizability. |
@@ -164,20 +164,27 @@ all five verification gates in [`Cli/Verify.lean`](../Cli/Verify.lean):
 
 During development, `qed dev` watches `.lean` and runtime files, rebuilds `.qed/dev/`, restarts
 the native server when present, and reloads the browser on success. Run `qed check`, `qed build`,
-and `qed start` or `qed preview` for production builds; `qed build` also minifies bundles with
-`esbuild` when available on `PATH`.
+and `qed start` or `qed preview` for production builds; `qed build` minifies bundles with
+`esbuild` when available on `PATH` and emits content-hashed immutable client assets
+(`app.<hash>.mjs`, `qed_host.<hash>.mjs`, `styles.<hash>.css`, and `qed_manifest.json`).
 
-`qed test` runs the 4 automated TCB test suites in [`test/`](../test) (app behavior is verified at compile time in Lean):
+`qed test` runs the 6 automated TCB test suites in [`test/`](../test) (app behavior is verified at compile time in Lean):
 
-- [`test/cli_scaffold_test.mjs`](../test/cli_scaffold_test.mjs) — `qed new`, build, SSR smoke check, and kernel/extern verification gates.
+- [`test/cli_scaffold_test.mjs`](../test/cli_scaffold_test.mjs) — `qed new`, production build (content-hashed immutable assets), SSR smoke check, `qed_serve.mjs` traversal guards, and kernel/extern verification gates.
 - [`test/js_gate_test.mjs`](../test/js_gate_test.mjs) — differential tests comparing native Lean
   evaluation against transpiled JavaScript across rendering, diffing, JSON, routing, and runtime
   edge cases.
 - [`test/dom_equivalence_test.mjs`](../test/dom_equivalence_test.mjs) — Chromium equivalence checks
   asserting incremental DOM updates match fresh `Html.render` output across attributes, events,
   keyed moves, `V.memo`, and duplicate keys.
-- [`test/fullstack_rpc_test.mjs`](../test/fullstack_rpc_test.mjs) — native C server HTTP/1.1 framing,
-  auth/cookies, TLS external calls, and `/_qed/rpc/…` binary Protobuf RPCs.
+- [`test/fullstack_rpc_test.mjs`](../test/fullstack_rpc_test.mjs) — native Rust/Lean server
+  RFC 9112 framing, non-blocking handler pool concurrency, auth/expiring tokens/rotation, TLS/HTTP
+  external calls, `ETag`/`304`, and `/_qed/rpc/…` binary Protobuf RPCs.
+- [`test/websocket_test.mjs`](../test/websocket_test.mjs) — RFC 6455 multiplexed server channels,
+  CSWSH origin enforcement, cross-worker broadcasts, transactional `emit` rollback, and 3rd-party
+  WebSocket reconnects.
+- [`test/speculative_test.mjs`](../test/speculative_test.mjs) — 0ms speculative RPC prediction,
+  `on_confirm`, mismatch reconciliation, and error rollback in Chromium.
 - Benchmarks in [`Bench/`](../Bench),
   [`test/bench_template.mjs`](../test/bench_template.mjs), and
   [`test/bench_react.mjs`](../test/bench_react.mjs).
@@ -188,7 +195,7 @@ and `qed start` or `qed preview` for production builds; `qed build` also minifie
 |------|---------|
 | [`Qed.lean`](../Qed.lean) | Public framework umbrella; omits browser-only `Qed.Dom`/`Qed.Driver` and C-linked `Qed.Server.Native` so user modules target both JS and native servers. |
 | [`Qed/Html.lean`](../Qed/Html.lean) · [`Qed/Jsx.lean`](../Qed/Jsx.lean) · [`Qed/Notation.lean`](../Qed/Notation.lean) | Typed `Html` / `Attr` / `Url` virtual DOM, static `Html.valid` HTML5/XSS rules, JSX syntax, and attribute/event helpers. |
-| [`Qed/Style.lean`](../Qed/Style.lean) | Typed `css` rules, `token`s, `theme` overrides, and scoped stylesheet rendering. |
+| [`Qed/Style.lean`](../Qed/Style.lean) | First-class `style`, `theme`, `keyframes`, and `verify_theme` DSLs, WCAG contrast proofs, and scoped stylesheet rendering. |
 | [`Qed/View.lean`](../Qed/View.lean) · [`Qed/Render.lean`](../Qed/Render.lean) · [`Qed/Diff.lean`](../Qed/Diff.lean) | Fine-grained `View` templates in `Qed/View/`, template lifting, tail-recursive `@[csimp]` HTML rendering, and keyed/positional diffing via `diff_apply`. |
 | [`Qed/Dom.lean`](../Qed/Dom.lean) · [`Qed/Driver.lean`](../Qed/Driver.lean) · [`Qed/Proofs/`](../Qed/Proofs) | Total `MonadDom` interface, imperative browser driver in `Qed/Driver/`, and `SpecDom` refinement proofs (`DomArena`, `ViewPatch`, `KeyedReconcile`, `Hydration`). |
 | [`Qed/Runtime.lean`](../Qed/Runtime.lean) · [`Qed/Resource.lean`](../Qed/Resource.lean) · [`Qed/Ssr.lean`](../Qed/Ssr.lean) | `App`, `Cmd` effects, `LocalDef` cells in `Qed/Runtime/`, `Resource`/`Cached`/`<Await>`, `Dehydrate` codecs, breakout-safe document serialization, and JS + native in-memory SSR. |

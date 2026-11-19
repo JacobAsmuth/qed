@@ -29,6 +29,7 @@ const MIME = {
   '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml',
   '.map': 'application/json', '.txt': 'text/plain', '.ico': 'image/x-icon',
 };
+const HASHED_ASSET = /\.[0-9a-f]{8,16}\.(mjs|js|css)$/i;
 
 const reload = "<script>(function(){let v=null;setInterval(async()=>{try{const t=await (await fetch('/__build_id',{cache:'no-store'})).text();if(v&&v!==t)location.reload();v=t;}catch(e){}},700)})()</scr" + "ipt>";
 
@@ -65,7 +66,8 @@ createServer(async (req, res) => {
         }
         res.writeHead(200, {
           'content-type': MIME[path.extname(realFile)] ?? 'application/octet-stream',
-          'cache-control': dev ? 'no-store' : 'no-cache',
+          'cache-control': dev ? 'no-store' : (HASHED_ASSET.test(realFile) ? 'public, max-age=31536000, immutable' : 'no-cache'),
+          'x-content-type-options': 'nosniff',
           'last-modified': lastMod,
         });
         res.end(await readFile(realFile));

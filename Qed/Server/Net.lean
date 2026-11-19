@@ -127,13 +127,20 @@ def splitHeaderKv (line : String) : Option (String × String) :=
 
 /-! ## Formally Verified SSRF IP CIDR Policy (`isBlockedIpBytes`) -/
 
-/-- Blocks non-globally-routable IPv4 CIDRs: `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10` (CGNAT),
-    `127.0.0.0/8` (loopback), `169.254.0.0/16` (link-local & cloud metadata), `172.16.0.0/12`,
-    `192.168.0.0/16`, and `224.0.0.0/3` (multicast & reserved). -/
-def isBlockedIpv4 (b0 b1 _b2 _b3 : UInt8) : Bool :=
+/-- Blocks non-globally-routable IPv4 CIDRs (RFC 6890): `0.0.0.0/8`, `10.0.0.0/8`,
+    `100.64.0.0/10` (CGNAT), `127.0.0.0/8` (loopback), `169.254.0.0/16` (link-local & cloud
+    metadata), `172.16.0.0/12`, `192.0.0.0/24` (IETF protocol assignments), `192.0.2.0/24`
+    (TEST-NET-1), `192.168.0.0/16`, `198.18.0.0/15` (benchmarking), `198.51.100.0/24`
+    (TEST-NET-2), `203.0.113.0/24` (TEST-NET-3), and `224.0.0.0/3` (multicast & reserved). -/
+def isBlockedIpv4 (b0 b1 b2 _b3 : UInt8) : Bool :=
   b0 == 0 || b0 == 10 || (b0 == 100 && (b1 &&& 0xC0) == 64) || b0 == 127 ||
   (b0 == 169 && b1 == 254) || (b0 == 172 && (b1 &&& 0xF0) == 16) ||
-  (b0 == 192 && b1 == 168) || b0 >= 224
+  (b0 == 192 && b1 == 0 && (b2 == 0 || b2 == 2)) ||
+  (b0 == 192 && b1 == 168) ||
+  (b0 == 198 && (b1 &&& 0xFE) == 18) ||
+  (b0 == 198 && b1 == 51 && b2 == 100) ||
+  (b0 == 203 && b1 == 0 && b2 == 113) ||
+  b0 >= 224
 
 private def allZeroRange (data : Array UInt8) (lo : Nat) : Nat → Bool
   | 0 => true
@@ -143,8 +150,10 @@ private def allZeroRange (data : Array UInt8) (lo : Nat) : Nat → Bool
       else false
 
 /-- Total SSRF IP blocklist over raw 4-byte IPv4 or 16-byte IPv6 addresses (fail-closed on any
-    unexpected length). Also blocks IPv4-mapped (`::ffff:0:0/96`), IPv4-compatible (`::/96`),
-    NAT64 (`64:ff9b::/96`), ULA (`fc00::/7`), link-local (`fe80::/10`), and multicast (`ff00::/8`). -/
+    unexpected length). Blocks IPv4-mapped (`::ffff:0:0/96`), IPv4-compatible (`::/96`),
+    NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`), ULA (`fc00::/7`), link-local (`fe80::/10`),
+    deprecated site-local (`fec0::/10`), multicast (`ff00::/8`), discard-only (`100::/64`),
+    documentation (`2001:db8::/32`), Teredo (`2001::/32`), and 6to4 (`2002::/16`). -/
 def isBlockedIpBytes (addr : ByteArray) : Bool :=
   let d := addr.data
   if h4 : d.size = 4 then
@@ -154,6 +163,8 @@ def isBlockedIpBytes (addr : ByteArray) : Bool :=
     let b1  := d[1]'(by omega)
     let b2  := d[2]'(by omega)
     let b3  := d[3]'(by omega)
+    let b4  := d[4]'(by omega)
+    let b5  := d[5]'(by omega)
     let b10 := d[10]'(by omega)
     let b11 := d[11]'(by omega)
     let b12 := d[12]'(by omega)
@@ -164,7 +175,13 @@ def isBlockedIpBytes (addr : ByteArray) : Bool :=
       (b12 == 0 && b13 == 0 && b14 == 0 && b15 <= 1) || isBlockedIpv4 b12 b13 b14 b15
     else if (b0 &&& 0xFE) == 0xFC then true
     else if b0 == 0xFE && (b1 &&& 0xC0) == 0x80 then true
+    else if b0 == 0xFE && (b1 &&& 0xC0) == 0xC0 then true
     else if b0 == 0xFF then true
+    else if b0 == 0x01 && b1 == 0x00 && allZeroRange d 2 6 then true
+    else if b0 == 0x20 && b1 == 0x01 && b2 == 0x0D && b3 == 0xB8 then true
+    else if b0 == 0x20 && b1 == 0x01 && b2 == 0x00 && b3 == 0x00 then true
+    else if b0 == 0x20 && b1 == 0x02 then true
+    else if b0 == 0x00 && b1 == 0x64 && b2 == 0xFF && b3 == 0x9B && b4 == 0x00 && b5 == 0x01 then true
     else if allZeroRange d 0 10 && b10 == 0xFF && b11 == 0xFF then
       isBlockedIpv4 b12 b13 b14 b15
     else if b0 == 0x00 && b1 == 0x64 && b2 == 0xFF && b3 == 0x9B && allZeroRange d 4 8 then
@@ -185,6 +202,14 @@ theorem isBlockedIpBytes_rfc1918_10 (b1 b2 b3 : UInt8) :
     isBlockedIpBytes (ByteArray.mk #[10, b1, b2, b3]) = true := by
   simp [isBlockedIpBytes, isBlockedIpv4]
 
+theorem isBlockedIpBytes_testnet_v4 (b3 : UInt8) :
+    isBlockedIpBytes (ByteArray.mk #[192, 0, 2, b3]) = true := by
+  simp [isBlockedIpBytes, isBlockedIpv4]
+
+theorem isBlockedIpBytes_benchmark_v4 (b2 b3 : UInt8) :
+    isBlockedIpBytes (ByteArray.mk #[198, 18, b2, b3]) = true := by
+  simp [isBlockedIpBytes, isBlockedIpv4]; decide
+
 theorem isBlockedIpBytes_loopback_v6 :
     isBlockedIpBytes (ByteArray.mk #[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]) = true := by
   rfl
@@ -195,6 +220,18 @@ theorem isBlockedIpBytes_v4mapped_metadata :
 
 theorem isBlockedIpBytes_nat64_metadata :
     isBlockedIpBytes (ByteArray.mk #[0, 0x64, 0xFF, 0x9B, 0, 0, 0, 0, 0, 0, 0, 0, 169, 254, 169, 254]) = true := by
+  rfl
+
+theorem isBlockedIpBytes_nat64_local_v6 :
+    isBlockedIpBytes (ByteArray.mk #[0, 0x64, 0xFF, 0x9B, 0, 1, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1]) = true := by
+  rfl
+
+theorem isBlockedIpBytes_6to4_v6 :
+    isBlockedIpBytes (ByteArray.mk #[0x20, 0x02, 169, 254, 169, 254, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]) = true := by
+  rfl
+
+theorem isBlockedIpBytes_teredo_v6 :
+    isBlockedIpBytes (ByteArray.mk #[0x20, 0x01, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]) = true := by
   rfl
 
 theorem isBlockedIpBytes_badLen (addr : ByteArray) (h4 : addr.size ≠ 4) (h16 : addr.size ≠ 16) :
@@ -307,56 +344,131 @@ private def parsePortU16 (s : String) : Option UInt16 := do
   let n ← parseStrictU64 s 65535
   if n == 0 then none else some (UInt16.ofNat n)
 
-private def splitAuthorityAndPath (rest : String) : Option (String × String) :=
-  let cs := rest.toList
-  let rec go (authRev : List Char) : List Char → Option (String × String)
-    | [] => some (String.ofList authRev.reverse, "/")
-    | '#' :: _ => none
-    | '?' :: tail => some (String.ofList authRev.reverse, "/?" ++ String.ofList tail)
-    | '/' :: tail => some (String.ofList authRev.reverse, "/" ++ String.ofList tail)
-    | c :: tail => go (c :: authRev) tail
-  go [] cs
+private def splitAuthorityAndPathGo (authRev : List Char) : List Char → Option (String × String)
+  | [] => some (String.ofList authRev.reverse, "/")
+  | '#' :: _ => none
+  | '?' :: tail => some (String.ofList authRev.reverse, String.ofList ('/' :: '?' :: tail.takeWhile (· != '#')))
+  | '/' :: tail => some (String.ofList authRev.reverse, String.ofList ('/' :: tail.takeWhile (· != '#')))
+  | c :: tail => splitAuthorityAndPathGo (c :: authRev) tail
 
-def parseHttpUrl (url : String) : Except String ParsedUrl := do
-  if hasCtlOrCrlf url false || url.contains ' ' then
-    throw s!"invalid outbound HTTP URL: {url}"
-  let (isTls, defaultPort, rest) ←
-    if url.startsWith "https://" then
-      pure (true, (443 : UInt16), String.ofList (url.toList.drop 8))
-    else if url.startsWith "http://" then
-      pure (false, (80 : UInt16), String.ofList (url.toList.drop 7))
-    else
-      throw s!"unsupported URL scheme: {url}"
-  let some (auth, path) := splitAuthorityAndPath rest
-    | throw s!"invalid URL authority: {url}"
+private def splitAuthorityAndPath (rest : String) : Option (String × String) :=
+  splitAuthorityAndPathGo [] rest.toList
+
+private theorem not_mem_takeWhile_ne_hash (cs : List Char) : '#' ∉ cs.takeWhile (· != '#') := by
+  induction cs with
+  | nil => simp
+  | cons c rest ih =>
+      simp only [List.takeWhile]
+      by_cases h : c = '#'
+      · subst h; simp
+      · have hne : (c != '#') = true := by simp [h]
+        simp only [hne, List.mem_cons, not_or]
+        exact ⟨Ne.symm h, ih⟩
+
+private theorem splitAuthorityAndPathGo_no_hash (authRev cs : List Char) (auth path : String)
+    (h : splitAuthorityAndPathGo authRev cs = some (auth, path)) :
+    '#' ∉ path.toList := by
+  induction cs generalizing authRev with
+  | nil =>
+      simp only [splitAuthorityAndPathGo, Option.some.injEq, Prod.mk.injEq] at h
+      rcases h with ⟨_, rfl⟩; decide
+  | cons c tail ih =>
+      unfold splitAuthorityAndPathGo at h
+      split at h
+      · rename_i heq; cases heq
+      · simp at h
+      · simp only [Option.some.injEq, Prod.mk.injEq] at h
+        rcases h with ⟨_, rfl⟩
+        simp only [String.toList_ofList, List.mem_cons, not_or]
+        exact ⟨by decide, by decide, not_mem_takeWhile_ne_hash _⟩
+      · simp only [Option.some.injEq, Prod.mk.injEq] at h
+        rcases h with ⟨_, rfl⟩
+        simp only [String.toList_ofList, List.mem_cons, not_or]
+        exact ⟨by decide, not_mem_takeWhile_ne_hash _⟩
+      · rename_i c' tail' _ _ _ heq
+        cases heq
+        exact ih _ h
+
+/-- True iff `method` is an RFC 9110 §9.2.2 idempotent HTTP method safe to retry on a stale
+    pooled keep-alive socket. -/
+def isIdempotentHttpMethod (method : String) : Bool :=
+  method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" || method == "OPTIONS"
+
+private def parseHostPort (url auth : String) (defaultPort : UInt16) :
+    Except String (String × Bool × UInt16) :=
   if auth.isEmpty || auth.utf8ByteSize >= 256 || auth.contains '@' then
-    throw s!"invalid URL authority: {url}"
-  if auth.startsWith "[" then
+    .error s!"invalid URL authority: {url}"
+  else if auth.startsWith "[" then
     match auth.splitOn "]" with
     | [left, right] =>
         let host := String.ofList (left.toList.drop 1)
-        if host.isEmpty then throw s!"empty IPv6 host: {url}"
-        let port ←
-          if right.isEmpty then pure defaultPort
-          else if right.startsWith ":" then
-            match parsePortU16 (String.ofList (right.toList.drop 1)) with
-            | some p => pure p
-            | none   => throw s!"invalid URL port: {url}"
-          else throw s!"invalid IPv6 authority: {url}"
-        return { isTls, host, isIpv6 := true, port, pathAndQuery := path }
-    | _ => throw s!"malformed IPv6 authority: {url}"
+        if host.isEmpty then .error s!"empty IPv6 host: {url}"
+        else if right.isEmpty then .ok (host, true, defaultPort)
+        else if right.startsWith ":" then
+          match parsePortU16 (String.ofList (right.toList.drop 1)) with
+          | some p => .ok (host, true, p)
+          | none   => .error s!"invalid URL port: {url}"
+        else .error s!"invalid IPv6 authority: {url}"
+    | _ => .error s!"malformed IPv6 authority: {url}"
   else
-    let parts := auth.splitOn ":"
-    match parts.reverse with
+    match (auth.splitOn ":").reverse with
     | [h] =>
-        if h.isEmpty then throw s!"empty URL host: {url}"
-        return { isTls, host := h, isIpv6 := false, port := defaultPort, pathAndQuery := path }
+        if h.isEmpty then .error s!"empty URL host: {url}"
+        else .ok (h, false, defaultPort)
     | portStr :: hostRev =>
         let host := String.intercalate ":" hostRev.reverse
-        if host.isEmpty then throw s!"empty URL host: {url}"
-        let some p := parsePortU16 portStr | throw s!"invalid URL port: {url}"
-        return { isTls, host, isIpv6 := false, port := p, pathAndQuery := path }
-    | [] => throw s!"empty URL authority: {url}"
+        if host.isEmpty then .error s!"empty URL host: {url}"
+        else match parsePortU16 portStr with
+          | some p => .ok (host, false, p)
+          | none   => .error s!"invalid URL port: {url}"
+    | [] => .error s!"empty URL authority: {url}"
+
+def parseHttpUrl (url : String) : Except String ParsedUrl :=
+  if hasCtlOrCrlf url false || url.contains ' ' then
+    .error s!"invalid outbound HTTP URL: {url}"
+  else if url.startsWith "https://" then
+    match splitAuthorityAndPath (String.ofList (url.toList.drop 8)) with
+    | some (auth, path) =>
+        (parseHostPort url auth 443).map fun (host, isIpv6, port) =>
+          { isTls := true, host, isIpv6, port, pathAndQuery := path }
+    | none => .error s!"invalid URL authority: {url}"
+  else if url.startsWith "http://" then
+    match splitAuthorityAndPath (String.ofList (url.toList.drop 7)) with
+    | some (auth, path) =>
+        (parseHostPort url auth 80).map fun (host, isIpv6, port) =>
+          { isTls := false, host, isIpv6, port, pathAndQuery := path }
+    | none => .error s!"invalid URL authority: {url}"
+  else
+    .error s!"unsupported URL scheme: {url}"
+
+theorem parseHttpUrl_no_fragment (url : String) (u : ParsedUrl)
+    (h : parseHttpUrl url = .ok u) : '#' ∉ u.pathAndQuery.toList := by
+  unfold parseHttpUrl at h
+  split at h
+  · cases h
+  · split at h
+    · cases hsp : splitAuthorityAndPath (String.ofList (url.toList.drop 8)) with
+      | none => simp [hsp] at h
+      | some ap =>
+          simp only [hsp] at h
+          cases hhp : parseHostPort url ap.1 443 with
+          | error e => simp [hhp, Except.map] at h
+          | ok hp =>
+              simp only [hhp, Except.map, Except.ok.injEq] at h
+              subst h
+              exact splitAuthorityAndPathGo_no_hash [] _ ap.1 ap.2 hsp
+    · split at h
+      · cases hsp : splitAuthorityAndPath (String.ofList (url.toList.drop 7)) with
+        | none => simp [hsp] at h
+        | some ap =>
+            simp only [hsp] at h
+            cases hhp : parseHostPort url ap.1 80 with
+            | error e => simp [hhp, Except.map] at h
+            | ok hp =>
+                simp only [hhp, Except.map, Except.ok.injEq] at h
+                subst h
+                exact splitAuthorityAndPathGo_no_hash [] _ ap.1 ap.2 hsp
+      · cases h
 
 /-- Serializes a validated outbound HTTP/1.1 request wire buffer, rejecting invalid method tokens
     and CRLF/control header injection. -/

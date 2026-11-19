@@ -69,6 +69,11 @@ export const rawHttpReq = (port, rawReq) => new Promise((resolve, reject) => {
 export const signSessionToken = (secret, userId) =>
   `${userId}.${crypto.createHmac('sha256', secret).update(userId).digest('hex')}`;
 
+export const signExpiringSessionToken = (secret, userId, expSec = Math.floor(Date.now() / 1000) + 3600) => {
+  const payload = `v1.${expSec}.${userId}`;
+  return `${payload}.${crypto.createHmac('sha256', secret).update(payload).digest('hex')}`;
+};
+
 export async function stopProc(proc, timeoutMs = 1500) {
   if (!proc || proc.exitCode !== null) return;
   proc.kill('SIGTERM');

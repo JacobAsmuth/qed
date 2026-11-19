@@ -16,16 +16,32 @@ schema Book:
   genre   : select([("fiction", "Fiction"), ("nonfiction", "Non-fiction"), ("poetry", "Poetry")])
   inPrint : Bool
 
-def brand : Token := token "brand"
-def shell : Style := css [
-  maxWidth (rem 40), margin (rem 2) .auto, fontFamily "system-ui, sans-serif", lineHeight 1.5,
-  screenMax (px 600) [ margin (rem 1), maxWidth (pct 100) ] ]
-def topnav : Style := css [
-  display .flex, gap (rem 1), marginBottom (rem 1.5) ]
-def navlink : Style := css [
-  textDecoration "none", color brand, fontWeight 600 ]
-def card : Style := css [
-  padding (rem 1) (rem 1.25), border (px 1) .solid (hex "ddd"), borderRadius (px 8) ]
+theme BookshelfTheme:
+  color brand = #06c
+
+style shell:
+  max-width: 40rem
+  margin: 2rem auto
+  font-family: system-ui, sans-serif
+  line-height: 1.5
+  @media (max-width: 600px):
+    margin: 1rem
+    max-width: 100%
+
+style topnav:
+  display: flex
+  gap: 1rem
+  margin-bottom: 1.5rem
+
+style navlink:
+  text-decoration: none
+  color: BookshelfTheme.brand
+  font-weight: 600
+
+style card:
+  padding: 1rem 1.25rem
+  border: 1px solid #ddd
+  border-radius: 8px
 
 component BookItem:
   prop book : Book
@@ -80,7 +96,6 @@ component Bookshelf:
 
   view:
     <div {shell} class="app">
-      {theme([brand.set("#06c")])}
       <nav {topnav}>
         <a href={R.catalog} {navlink}>Catalog</a>
         <a href={R.newBook} {navlink}>Add a book</a>

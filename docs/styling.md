@@ -45,7 +45,7 @@ style primaryBtn extends baseBtn:
     transform: translateY(-1px)
 ```
 
-`extends` (and `Style.extend` / `Style.merge` / `Style.mergeMany`) merges declarations and matching nested selectors recursively into a single scoped class, so later declarations always override earlier ones regardless of import order.
+`extends` merges declarations and matching nested selectors recursively at compile time into a single scoped class, so later declarations always override earlier ones regardless of import order.
 
 ### Component-colocated styles, `theme`, and external `stylesheet`s
 
@@ -65,7 +65,7 @@ component BookCard:
     </article>
 ```
 
-Inline scoped CSS (`{css: padding: 0.5rem; margin-top: 1rem}` and `{css [...]}`) and parameterized style helpers (`def badge (bg : Color) : Style := ...`) are automatically discovered and included in `app.styles`.
+Every `style` block (top-level or colocated inside a `component`) referenced by your app is automatically discovered and included in `app.styles`.
 
 ## 2. Typed `theme` & WCAG contrast proofs
 

@@ -130,11 +130,23 @@ export const Array_set = (a, i, x) => { const b = owned(a) ? (a.__m = undefined,
 export const Array_setx33 = (a, i, x) => { const b = owned(a) ? (a.__m = undefined, a) : own(a.slice()); b[Number(i)] = x; return b; };
 
 const ENC = new TextEncoder(), DEC = new TextDecoder(), DEC_FATAL = new TextDecoder('utf-8', { fatal: true });
+const STR_CACHE_MAX_LEN = 4096;
 const _strCache = new Map();
-let _lastStr = null, _lastInfo = null;
+let _lastStr = null, _lastInfo = null, _evictScheduled = false;
+function scheduleLargeStrEvict() {
+  if (_evictScheduled) return;
+  _evictScheduled = true;
+  queueMicrotask(() => {
+    _evictScheduled = false;
+    if (_lastStr !== null && _lastStr.length > STR_CACHE_MAX_LEN) {
+      _lastStr = null; _lastInfo = null;
+    }
+  });
+}
 function getStrInfo(s) {
   if (s === _lastStr) return _lastInfo;
-  let info = _strCache.get(s);
+  const cacheable = s.length <= STR_CACHE_MAX_LEN;
+  let info = cacheable ? _strCache.get(s) : undefined;
   if (info !== undefined) { _lastStr = s; _lastInfo = info; return info; }
   let ascii = true;
   for (let i = 0; i < s.length; i++) {
@@ -143,8 +155,12 @@ function getStrInfo(s) {
   const bytes = ascii ? null : ENC.encode(s);
   const len = ascii ? s.length : bytes.length;
   info = { ascii, bytes, len };
-  if (_strCache.size >= 256) _strCache.clear();
-  _strCache.set(s, info);
+  if (cacheable) {
+    if (_strCache.size >= 256) _strCache.clear();
+    _strCache.set(s, info);
+  } else {
+    scheduleLargeStrEvict();
+  }
   _lastStr = s; _lastInfo = info;
   return info;
 }

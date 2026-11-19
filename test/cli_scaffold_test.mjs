@@ -32,13 +32,20 @@ try {
   ));
   succeeds(run(cli, ['build'], app));
 
+  const manifest = JSON.parse(await readFile(path.join(app, 'dist', 'qed_manifest.json'), 'utf8'));
+  assert.match(manifest.host, /^\/qed_host\.[0-9a-f]{12}\.mjs$/);
+  assert.match(manifest.app, /^\/app\.[0-9a-f]{12}\.mjs$/);
+  assert.match(manifest.rt, /^\/qed_rt\.[0-9a-f]{12}\.mjs$/);
+  assert.match(manifest.dom, /^\/qed_dom\.[0-9a-f]{12}\.mjs$/);
+  assert.equal(existsSync(path.join(app, 'dist', 'app.mjs')), false);
+
   const { default: render } = await import(pathToFileURL(path.join(app, 'dist', 'ssr.mjs')));
   const response = await render(new Request('http://localhost/'));
   assert.equal(response.status, 200);
   const html = await response.text();
   assert.match(html, /<span[^>]*>1<\/span>/);
-  assert.match(html, /qed_host\.mjs/);
-  assert.match(await readFile(path.join(app, 'dist', 'app.mjs'), 'utf8'), /qed_init/);
+  assert.equal(html.includes(manifest.host), true);
+  assert.match(await readFile(path.join(app, 'dist', manifest.app.slice(1)), 'utf8'), /qed_init/);
 
   const strippedRt = path.join(scratch, 'stripped_rt.mjs');
   const rtSrc = await readFile(path.join(ROOT, 'runtime/qed_rt.mjs'), 'utf8');
@@ -71,17 +78,24 @@ try {
   await mkdir(secretDir, { recursive: true });
   await writeFile(path.join(secretDir, 'leak.txt'), 'TOP_SECRET_SIBLING');
   await symlink(path.join(secretDir, 'leak.txt'), path.join(app, 'dist', 'escape.txt'));
+  const manifest2 = JSON.parse(await readFile(path.join(app, 'dist', 'qed_manifest.json'), 'utf8'));
+  const hashedAppPath = manifest2.app;
   const freePort = await getFreePort();
   const serveProc = spawn(process.execPath, [path.join(ROOT, 'runtime/qed_serve.mjs'), path.join(app, 'dist'), String(freePort)], {
     cwd: app, env, stdio: ['ignore', 'pipe', 'pipe'],
   });
   try {
-    let up = false;
-    for (let i = 0; i < 40 && !up; i++) {
-      try { up = (await fetch(`http://127.0.0.1:${freePort}/app.mjs`)).status === 200; } catch {}
-      if (!up) await sleep(50);
+    let hashedResp = null;
+    for (let i = 0; i < 40 && !hashedResp; i++) {
+      try {
+        const r = await fetch(`http://127.0.0.1:${freePort}${hashedAppPath}`);
+        if (r.status === 200) hashedResp = r;
+      } catch {}
+      if (!hashedResp) await sleep(50);
     }
-    assert.equal(up, true, 'qed_serve.mjs failed to start');
+    assert.equal(Boolean(hashedResp), true, 'qed_serve.mjs failed to start');
+    assert.equal(hashedResp.headers.get('cache-control'), 'public, max-age=31536000, immutable');
+    assert.equal(hashedResp.headers.get('x-content-type-options'), 'nosniff');
     const getRaw = (reqPath) => rawHttpReq(freePort, `GET ${reqPath} HTTP/1.1\r\nHost: 127.0.0.1:${freePort}\r\nConnection: close\r\n\r\n`);
     assert.equal((await getRaw('/../dist-secret/leak.txt')).includes('TOP_SECRET_SIBLING'), false);
     assert.equal((await getRaw('/%2e%2e%2fdist-secret/leak.txt')).includes('TOP_SECRET_SIBLING'), false);

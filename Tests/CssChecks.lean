@@ -162,46 +162,50 @@ style badStrictColor strict_tokens:
 style badStrictLen strict_tokens:
   padding: 12px
 
-/-! ## 4. Typed Enums, Modern Units, Safe Dynamic Inline Styles & `renderTheme` At-Rules -/
+/-! ## 4. Modern CSS Features, Safe Dynamic Inline Styles & `Theme.render` At-Rules -/
 
-def modernCombinatorStyle : Style := css [
-  boxSizing .borderBox,
-  display .inlineFlex,
-  flexWrap .wrap,
-  cursor .pointer,
-  overflow .hidden,
-  textDecoration .underline,
-  whiteSpace .nowrap,
-  minHeight (dvh 100),
-  maxWidth (ch 65),
-  width (clamp (rem 20) (vw 50) (rem 45)),
-  color (oklch 0.6 0.15 250),
-  backgroundColor (rgb8 255 255 255),
-  hover [ opacity 0.85 ],
-  focusVisible [ outline (px 2) .solid AppTheme.brand ],
-  dark [ backgroundColor (hex "111827") ]
-]
+style modernStyle:
+  box-sizing: border-box
+  display: inline-flex
+  flex-wrap: wrap
+  cursor: pointer
+  overflow: hidden
+  text-decoration: underline
+  white-space: nowrap
+  min-height: 100dvh
+  max-width: 65ch
+  width: clamp(20rem, 50vw, 45rem)
+  color: oklch(0.6 0.15 250)
+  background-color: rgb(255, 255, 255)
+  &:hover:
+    opacity: 0.85
+  &:focus-visible:
+    outline: 2px solid AppTheme.brand
+  @media (prefers-color-scheme: dark):
+    background-color: #111827
 
-#guard modernCombinatorStyle.raw.contains "box-sizing: border-box;"
-#guard modernCombinatorStyle.raw.contains "min-height: 100dvh;"
-#guard modernCombinatorStyle.raw.contains "clamp(20rem, 50vw, 45rem)"
-#guard modernCombinatorStyle.raw.contains "&:hover { opacity: 0.85; }"
-#guard modernCombinatorStyle.raw.contains "@media (prefers-color-scheme: dark)"
+#guard modernStyle.raw.contains "box-sizing: border-box;"
+#guard modernStyle.raw.contains "min-height: 100dvh;"
+#guard modernStyle.raw.contains "clamp(20rem, 50vw, 45rem)"
+#guard modernStyle.raw.contains "&:hover { opacity: 0.85; }"
+#guard modernStyle.raw.contains "@media (prefers-color-scheme: dark)"
 
--- `renderTheme` no longer wraps `@media` / `@keyframes` in `:where(...)`
-#guard !(renderTheme [media "(prefers-color-scheme: dark)" [color (hex "fff")]]).contains ":where("
-#guard (renderTheme [media "(prefers-color-scheme: dark)" [color (hex "fff")]]).contains "@media (prefers-color-scheme: dark)"
+-- Extending an undeclared style fails at compile time
+/-- error: unknown style `noSuchStyle` in `extends` (declare it with `style noSuchStyle:`) -/
+#guard_msgs in
+style badExtends extends noSuchStyle:
+  color: #ffffff
+
+-- `renderThemeRule` does not wrap `@media` / `@keyframes` in `:where(...)`
+#guard !(renderThemeRule (.nest "@media (prefers-color-scheme: dark)" [color (hex "fff")])).contains ":where("
+#guard (renderThemeRule (.nest "@media (prefers-color-scheme: dark)" [color (hex "fff")])).contains "@media (prefers-color-scheme: dark)"
 
 -- Safe dynamic inline styles sanitize `<`, `>`, quotes, and `/*`
 #guard !(inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]).contains "<"
 #guard !(inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]).contains "\""
 #guard !(inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]).contains "/*"
 
--- Parameterized style helper (now discovered by `Registry.lean`!)
-def badgeStyle (bg : Color) : Style :=
-  cssNamed "badge" [ backgroundColor bg, color .white, padding (px 2) (px 8), borderRadius (px 999) ]
-
-/-! ## 5. Component-Colocated `style`, `stylesheet`, Inline `css:`, Discovery & Invariants -/
+/-! ## 5. Component-Colocated `style`, `stylesheet`, Discovery & Invariants -/
 
 component StyledCard:
   prop title : String
@@ -233,6 +237,10 @@ component StyledShowcase:
     background-color: AppTheme.brand
     color: #ffffff
 
+  style progressBox:
+    padding: 0.5rem
+    margin-top: 1rem
+
   action toggle: active = not active
 
   invariant activeValid: roleHasOneOf("toggle", [pillActive, pill])
@@ -242,16 +250,14 @@ component StyledShowcase:
     <div {shell}>
       <StyledCard title="Verified CSS"/>
       <button role="toggle" {pillActive if active else pill} onClick={.toggle}>Toggle</button>
-      <span {badgeStyle(hex("0055aa"))}>Parameterized</span>
-      <div {css: padding: 0.5rem; margin-top: 1rem}
+      <div {progressBox}
            {inlineStyle([width(pct(progress))])}
            {styleVars([cssVar(AppTheme.brand, hex("0055aa"))])}>
         Progress: {progress}%
       </div>
     </div>
 
--- Verify auto-discovery collected: AppTheme.style, StyledCard.wrapper, shell, pill, pillActive,
--- parameterized `badgeStyle (hex "0055aa")`, AND inline `{css: padding: 0.5rem; margin-top: 1rem}`!
+-- Verify auto-discovery collected: AppTheme.style, StyledCard.wrapper, shell, pill, pillActive, progressBox
 #guard (renderStyleSheet StyledShowcase.app.styles).contains ":root {"
 #guard (renderStyleSheet StyledShowcase.app.styles).contains "@media (prefers-color-scheme: dark)"
 #guard (renderStyleSheet StyledShowcase.app.styles).contains StyledCard.wrapper.className
@@ -269,8 +275,11 @@ component StyledShowcase:
 verify_theme AppTheme for StyledShowcase.app
 
 -- Missing token fails `verify_theme` with the exact missing token name!
-def orphanTok : Token := token "does-not-exist"
-def orphanStyle : Style := css [ color orphanTok ]
+theme OtherTheme:
+  color doesNotExist = #123456
+
+style orphanStyle:
+  color: OtherTheme.doesNotExist
 
 /-- error: theme `AppTheme` does not define all CSS tokens used by `[orphanStyle]`.
   Missing tokens: ["does-not-exist"]

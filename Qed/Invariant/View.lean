@@ -135,7 +135,7 @@ macro_rules
              Qed.V.el, Qed.V.text, Qed.V.dyn, Qed.V.ifElse, Qed.V.showIf, Qed.V.static, Qed.V.dynNode,
              Qed.V.memo, Qed.V.render_forEach, Qed.View.isDyn, Qed.View.memo,
              Qed.ForEachItems.toList_array, Qed.ForEachItems.toList_list, Qed.ForEachItems.toArray, Qed.mapList_eq,
-             Qed.text, Qed.lazy, Qed.el, Qed.link, Qed.linkTo, Qed.theme,
+             Qed.text, Qed.lazy, Qed.el, Qed.link, Qed.linkTo,
              Qed.Attr.empty, Qed.Html.ofOption, Qed.toString_string, Qed.withKey,
              Qed.Html.map, Qed.Html.mapChildren, Qed.Attr.map,
              Qed.cls, Qed.attr, Qed.role, Qed.on,
@@ -185,25 +185,27 @@ elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => do
     evalTactic (← `(tactic| all_goals qedStyleReduce $view))
   let goals ← getUnsolvedGoals
   unless goals.isEmpty do
-    let mut body : MessageData := m!""
+    let mut details : Array String := #[]
     for g in goals do
-      body := body ++ (← g.withContext do
-        let fmt ← Meta.ppExpr (← instantiateMVars (← g.getType))
-        let s := (fmt.pretty.replace "✝" "").trimmed
-        pure (if s == "False" then m!"" else m!"\n  • the view still has to satisfy:  {s}"))
+      let line ← g.withContext do
+        let s ← Qed.Diag.ppQedExpr (← g.getType) ["m"]
+        pure (if s == "False" || s == "false = true" then "" else s!"  • view must satisfy:  {s}")
+      if !line.isEmpty && !details.contains line then
+        details := details.push line
+    let extraBody := if details.isEmpty then "" else "\n" ++ String.intercalate "\n" details.toList
     let predStr := predLit.getString
     let vName := view.getId
     let diagnosis :=
       if predStr.contains "roleLacks" || predStr.contains "tagLacks" then
-        s!"A matching element in `{vName}` carries a forbidden style class in some branch. Remove that style from the matching element (or guard it so it cannot apply there)."
+        s!"A matching element in `{vName}` carries a forbidden style class in some branch. Remove that style from the matching element or guard it so it cannot apply there."
       else if predStr.contains "exactlyOne" then
         s!"In some branch of `{vName}`, either none or more than one of the listed roles carries the active style, a role is missing the inactive style, or one of the roles is not rendered."
       else if (predStr.contains "hasRole" || predStr.contains "hasTag") &&
               !(predStr.contains "roleHas" || predStr.contains "tagHas") then
         s!"No element with the required `role`/tag is rendered in some branch of `{vName}`. Check every conditional branch of `{vName}`."
       else
-        s!"Some element the rule constrains isn't carrying one of the required style classes (or no element with that `role`/tag is rendered, or an element carries more than one conflicting style). Check that the matching `role`/tag exists and receives exactly one allowed style in every branch of `{vName}`."
-    throwErrorAt nm m!"styling invariant `{nm.getId}` doesn't hold for every state: `{predStr}` is false for some `{vName} m`.{body}\n\n{diagnosis}"
+        s!"Check that the matching `role`/tag is rendered and receives exactly one allowed style in every branch of `{vName}`."
+    throwErrorAt nm m!"Styling invariant `{nm.getId}` failed in `{vName}`:\n  • `{predStr}` does not hold in every state{extraBody}\n\nHint: {diagnosis}"
 
 open Lean Elab Command in
 elab_rules : command

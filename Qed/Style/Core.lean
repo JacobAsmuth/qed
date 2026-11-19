@@ -283,15 +283,6 @@ instance : CssValue Time   := ⟨Time.raw⟩
 instance : CssValue Angle  := ⟨Angle.raw⟩
 instance : CssValue String := ⟨id⟩
 
-/-- Untyped legacy token kept for full backward compatibility. -/
-structure Token where name : String
-deriving Inhabited, BEq, Repr
-def token (name : String) : Token := ⟨name⟩
-instance : ToString Token   := ⟨fun t => s!"var(--{t.name})"⟩
-instance : Coe Token CssNum := ⟨fun t => ⟨s!"var(--{t.name})"⟩⟩
-instance : Coe Token Len    := ⟨fun t => ⟨s!"var(--{t.name})"⟩⟩
-instance : Coe Token Color  := ⟨fun t => ⟨s!"var(--{t.name})", none⟩⟩
-
 /-- Type-safe design token parameterized by its CSS value type `α`.
     A `TypedToken Color` can only be used where a `Color` is expected, and a `TypedToken Len`
     only where a `Len` is expected. Carries optional light/dark values for compile-time proofs. -/
@@ -590,37 +581,6 @@ def appearance          (v : String) : Item := .decl "appearance" v
 def verticalAlign       (v : String) : Item := .decl "vertical-align" v
 def content             (v : String) : Item := .decl "content" v
 
-/-! ## Typed Pseudo-Classes, Pseudo-Elements & At-Rules -/
-
-def nest          (selector : String) (body : List Item) : Item := .nest selector body
-def media         (query : String) (body : List Item) : Item := .nest ("@media " ++ query) body
-def screenMax     (w : Len) (body : List Item) : Item := media s!"(max-width: {w.raw})" body
-def screenMin     (w : Len) (body : List Item) : Item := media s!"(min-width: {w.raw})" body
-def container     (query : String) (body : List Item) : Item := .nest ("@container " ++ query) body
-def supports      (query : String) (body : List Item) : Item := .nest ("@supports " ++ query) body
-def layer         (name : String) (body : List Item) : Item := .nest ("@layer " ++ name) body
-
-def hover         (body : List Item) : Item := .nest "&:hover" body
-def focus         (body : List Item) : Item := .nest "&:focus" body
-def focusVisible  (body : List Item) : Item := .nest "&:focus-visible" body
-def focusWithin   (body : List Item) : Item := .nest "&:focus-within" body
-def active        (body : List Item) : Item := .nest "&:active" body
-def whenDisabled  (body : List Item) : Item := .nest "&:disabled" body
-def whenChecked   (body : List Item) : Item := .nest "&:checked" body
-def whenEmpty     (body : List Item) : Item := .nest "&:empty" body
-def firstChild    (body : List Item) : Item := .nest "&:first-child" body
-def lastChild     (body : List Item) : Item := .nest "&:last-child" body
-def nthChild      (expr : String) (body : List Item) : Item := .nest s!"&:nth-child({expr})" body
-def before        (body : List Item) : Item := .nest "&::before" body
-def after         (body : List Item) : Item := .nest "&::after" body
-def placeholderEl (body : List Item) : Item := .nest "&::placeholder" body
-def selection     (body : List Item) : Item := .nest "&::selection" body
-def dark          (body : List Item) : Item := media "(prefers-color-scheme: dark)" body
-def light         (body : List Item) : Item := media "(prefers-color-scheme: light)" body
-def reducedMotion (body : List Item) : Item := media "(prefers-reduced-motion: reduce)" body
-
-def Token.set (t : Token) (value : String) : Item := .decl ("--" ++ t.name) value
-
 /-! ## Hashing & Scoped `Style` Structure -/
 
 def cssHashLoop : List UInt8 → UInt64 → UInt64
@@ -657,57 +617,6 @@ deriving Inhabited
 
 instance : Coe Style (Attr msg) := ⟨fun s => .cls s.className⟩
 
-def css (body : List Item) : Style :=
-  let raw := Item.renderList body
-  { className  := s!"qed-{cssHash raw}"
-    raw        := raw
-    items      := body
-    usedTokens := collectItemTokens body }
-
-def cssNamed (label : String) (body : List Item) : Style :=
-  let raw := Item.renderList body
-  let clean := sanitizeCssIdent label
-  let cls := if clean.isEmpty then s!"qed-{shortHexHash (cssHash raw)}"
-             else s!"qed-{clean}-{shortHexHash (cssHash raw)}"
-  { className  := cls
-    raw        := raw
-    items      := body
-    usedTokens := collectItemTokens body }
-
-/-- Option A deterministic composition: merges `base`'s declarations with `extra` (later declarations
-    override earlier ones, matching nested selectors merge recursively) into a single scoped `Style`. -/
-def Style.extend (base : Style) (extra : List Item) (label : String := "") : Style :=
-  let merged := Item.mergeItems base.items extra
-  let raw := Item.renderList merged
-  let clean := sanitizeCssIdent label
-  let cls := if clean.isEmpty then s!"qed-{cssHash raw}"
-             else s!"qed-{clean}-{shortHexHash (cssHash raw)}"
-  { className  := cls
-    raw        := raw
-    items      := merged
-    usedTokens := dedupStrings (base.usedTokens ++ collectItemTokens merged)
-    extraRules := dedupStrings base.extraRules }
-
-def Style.merge (a b : Style) (label : String := "") : Style :=
-  let s := a.extend b.items label
-  { s with
-    usedTokens := dedupStrings (s.usedTokens ++ b.usedTokens)
-    extraRules := dedupStrings (s.extraRules ++ b.extraRules) }
-
-def Style.mergeMany (bases : List Style) (extra : List Item) (label : String := "") : Style :=
-  let baseItems := bases.foldl (fun acc b => Item.mergeItems acc b.items) []
-  let merged := Item.mergeItems baseItems extra
-  let raw := Item.renderList merged
-  let clean := sanitizeCssIdent label
-  let cls := if clean.isEmpty then s!"qed-{cssHash raw}"
-             else s!"qed-{clean}-{shortHexHash (cssHash raw)}"
-  let toks := dedupStrings ((bases.foldl (fun acc b => acc ++ b.usedTokens) []) ++ collectItemTokens merged)
-  let extras := dedupStrings (bases.foldl (fun acc b => acc ++ b.extraRules) [])
-  { className := cls, raw := raw, items := merged, usedTokens := toks, extraRules := extras }
-
-def Style.withExtraRule (s : Style) (rule : String) : Style :=
-  { s with extraRules := dedupStrings (s.extraRules ++ [rule]) }
-
 /-! ## Keyframes -/
 
 structure Keyframes where
@@ -732,12 +641,6 @@ def Keyframes.asStyle (kf : Keyframes) : Style :=
     raw       := kf.rule
     isGlobal  := true }
 
-def Style.withKeyframes (s : Style) (kf : Keyframes) : Style :=
-  s.withExtraRule kf.rule
-
-def animationOf (kf : Keyframes) (duration : Time) (extra : String := "ease") : Item :=
-  .decl "animation" s!"{sanitizeCssIdent kf.name} {duration.raw} {extra}"
-
 /-! ## Themes & Stylesheet Rendering -/
 
 def cssJoinLines : List String → String
@@ -751,15 +654,6 @@ def renderThemeRule : Item → String
       if isAtRuleSelector clean then clean ++ " { " ++ Item.renderList b ++ " }"
       else ":where(" ++ clean ++ ") { " ++ Item.renderList b ++ " }"
   | i => i.render
-
-def renderTheme (tokens : List Item) : String :=
-  let (decls, rules) := tokens.partition (fun | .decl _ _ => true | .nest _ _ => false)
-  let root := if decls.isEmpty then [] else [":root { " ++ Item.renderList decls ++ " }"]
-  let resets := rules.map renderThemeRule
-  cssJoinLines (root ++ resets)
-
-@[inline] def theme (tokens : List Item) : Html msg :=
-  .element "style" [] [Html.text (escapeRawText (renderTheme tokens))]
 
 structure Theme where
   name          : String

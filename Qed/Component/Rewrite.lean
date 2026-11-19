@@ -51,26 +51,22 @@ structure ResetFormSub where
   handler    : Term
 
 structure SetSite where
-  key      : String
-  ctor     : Name
-  params   : Array (Ident × Term) := #[]
-  whenPat? : Option (Term × Term) := none
-  guard?   : Option Term := none
-  assigns  : Array (Name × Option Term) := #[]
-  send?    : Option Term := none
-  stmts?   : Option (Array Syntax) := none
+  key     : String
+  ctor    : Name
+  params  : Array (Ident × Term) := #[]
+  assigns : Array (Name × Option Term) := #[]
+  send?   : Option Term := none
+  stmts?  : Option (Array Syntax) := none
 
 structure PortOutDecl where
   id : Ident
   ty : Term
 
 structure PortInDecl where
-  id       : Ident
-  argId    : Ident
-  argTy    : Term
-  whenPat? : Option (Syntax × Syntax) := none
-  guards   : Array Syntax := #[]
-  body     : Syntax
+  id    : Ident
+  argId : Ident
+  argTy : Term
+  body  : Syntax
 
 structure RpcQuerySpec where
   rpcRef        : Ident
@@ -103,21 +99,14 @@ def lowerCompExpr (mode : Qed.Lang.ExprMode) (stx : Syntax) : CommandElabM Term 
   else
     liftMacroM (Qed.Lang.lowerSimpleQedExpr mode stx)
 
-def lowerCompGuards (guards : Array Syntax) : CommandElabM (Option Term) := do
-  if guards.isEmpty then return none
-  let ts ← guards.mapM (lowerCompExpr .propGuard)
-  match ts.toList with
-  | []      => return none
-  | c :: cs => some <$> cs.foldlM (init := c) fun acc x => `($acc ∧ $x)
-
-def parseCompWhen (optWhen : Syntax) : Option (Syntax × Syntax) × Array Syntax :=
-  if optWhen.getNumArgs == 1 then
-    let wBody := ((optWhen.getArg 0).getArg 1)
-    if wBody.getKind == ``compWhenLet then
-      let gs := if (wBody.getArg 4).getNumArgs == 2 then ((wBody.getArg 4).getArg 1).getSepArgs else #[]
-      (some ((wBody.getArg 1), (wBody.getArg 3)), gs)
+def parseCompIfCond (optCond : Syntax) : Option (Syntax × Syntax) × Array Syntax :=
+  if optCond.getNumArgs == 1 then
+    let cBody := ((optCond.getArg 0).getArg 1)
+    if cBody.getKind == ``compIfLet then
+      let gs := if (cBody.getArg 4).getNumArgs == 2 then ((cBody.getArg 4).getArg 1).getSepArgs else #[]
+      (some ((cBody.getArg 1), (cBody.getArg 3)), gs)
     else
-      (none, wBody.getSepArgs)
+      (none, cBody.getSepArgs)
   else
     (none, #[])
 
@@ -213,11 +202,9 @@ def ClassifyTree.isNormal : ClassifyTree → Bool
   | _       => false
 
 structure SpecDispatchArm where
-  ctor     : Name
-  params   : Array (Ident × Term) := #[]
-  whenPat? : Option (Term × Term) := none
-  guard?   : Option Term := none
-  tree     : ClassifyTree
+  ctor   : Name
+  params : Array (Ident × Term) := #[]
+  tree   : ClassifyTree
 
 structure ComponentSpec where
   doc?            : Option (TSyntax ``Lean.Parser.Command.docComment)
@@ -384,7 +371,8 @@ def throwNotMutableStateField (ref : Syntax) (prefixMsg : String) (fname : Name)
   if propNames.contains fname then
     throwErrorAt ref s!"{lead} is a read-only `prop` and cannot be assigned ({formatStateFieldList stateFields})"
   else
-    throwErrorAt ref s!"{lead} is not a `state` field of this component ({formatStateFieldList stateFields})"
+    let hint := Qed.Diag.didYouMean fname.toString (stateFields.toList.map toString)
+    throwErrorAt ref s!"{lead} is not a `state` field of this component{hint} ({formatStateFieldList stateFields})"
 
 def checkMutableField (ctx : RewriteCtx) (ref : Syntax) (prefixMsg : String) (fname : Name) :
     CommandElabM Unit := do
@@ -739,7 +727,7 @@ private def parseRpcQueryClause (acc : SpecParseAcc) (cl : Syntax) : CommandElab
   let explicitTy? : Option Term ← if (cl.getArg 2).getNumArgs == 2 then some <$> liftMacroM (return (← lowerQedType ((cl.getArg 2).getArg 1) false).1) else pure none
   let rpcId : Ident := ⟨(cl.getArg 4)⟩
   let rawArgs : Array Term ← (cl.getArg 6).getSepArgs.mapM (lowerCompExpr .val)
-  let (rawPat?, rawGuards) := parseCompWhen (cl.getArg 8)
+  let (rawPat?, rawGuards) := parseCompIfCond (cl.getArg 8)
   let whenPat? ← rawPat?.mapM fun (p, s) => do
     return (← liftMacroM (lowerQedPat p), ← lowerCompExpr .val s, collectQedPatIds p)
   let whenGuards ← rawGuards.mapM (lowerCompExpr .propGuard)
@@ -779,7 +767,7 @@ private def parseSubscribeClause (acc : SpecParseAcc) (cl : Syntax) : CommandEla
   let subId : Ident := ⟨(cl.getArg 1)⟩
   let chanId : Ident := ⟨(cl.getArg 3)⟩
   let rawArgs : Array Term ← (cl.getArg 5).getSepArgs.mapM (lowerCompExpr .val)
-  let (rawPat?, rawGuards) := parseCompWhen (cl.getArg 7)
+  let (rawPat?, rawGuards) := parseCompIfCond (cl.getArg 7)
   let whenPat? ← rawPat?.mapM fun (p, s) => do
     return (← liftMacroM (lowerQedPat p), ← lowerCompExpr .val s, collectQedPatIds p)
   let whenGuards ← rawGuards.mapM (lowerCompExpr .propGuard)
@@ -904,11 +892,10 @@ private def parseCompClause (acc : SpecParseAcc) (cl : Syntax) : CommandElabM Sp
       if s == "compPortOutClause" then
         return { acc with portOuts := acc.portOuts.push { id := pId, ty := ← liftMacroM (return (← lowerQedType (cl.getArg 3) false).1) } }
       else
-        let (wPat?, wGuards) := parseCompWhen (cl.getArg 7)
         return { acc with portIns := acc.portIns.push {
           id := pId, argId := ⟨(cl.getArg 3)⟩,
           argTy := ← liftMacroM (return (← lowerQedType (cl.getArg 5) false).1),
-          whenPat? := wPat?, guards := wGuards, body := (cl.getArg 9) } }
+          body := (cl.getArg 8) } }
     | "compRpcQueryClause" => parseRpcQueryClause acc cl
     | "compQueryClause" =>
       let qId : Ident := ⟨(cl.getArg 1)⟩

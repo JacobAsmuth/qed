@@ -161,15 +161,23 @@ pub unsafe extern "C" fn qed_server_read_static_file(
         return qed_lean_io_mk_ok(qed_lean_mk_opt_none());
     }
     let fsize = meta.len() as usize;
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0usize, |d| d.as_millis().min(usize::MAX as u128) as usize);
     if head_only != 0 {
-        let pair = qed_lean_mk_prod(qed_lean_usize_to_nat(fsize), mk_ba(&[]));
-        return qed_lean_io_mk_ok(qed_lean_mk_opt_some(pair));
+        let inner = qed_lean_mk_prod(qed_lean_usize_to_nat(mtime_ms), mk_ba(&[]));
+        let triple = qed_lean_mk_prod(qed_lean_usize_to_nat(fsize), inner);
+        return qed_lean_io_mk_ok(qed_lean_mk_opt_some(triple));
     }
     let mut buf = Vec::with_capacity(fsize);
     if file.read_to_end(&mut buf).is_err() || (buf.len() as u64) > MAX_STATIC_FILE_BYTES {
         return qed_lean_io_mk_ok(qed_lean_mk_opt_none());
     }
-    qed_lean_io_mk_ok(qed_lean_mk_opt_some(qed_lean_mk_prod(qed_lean_usize_to_nat(buf.len()), mk_ba(&buf))))
+    let inner = qed_lean_mk_prod(qed_lean_usize_to_nat(mtime_ms), mk_ba(&buf));
+    let triple = qed_lean_mk_prod(qed_lean_usize_to_nat(buf.len()), inner);
+    qed_lean_io_mk_ok(qed_lean_mk_opt_some(triple))
 }
 
 // ---- Environment, Clock, CSPRNG, HMAC-SHA256 & RS256 ----
@@ -210,6 +218,18 @@ pub unsafe extern "C" fn qed_server_hmac_sha256(key_obj: *mut LeanObj, msg_obj: 
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(ba_slice(key_obj)).expect("HMAC key");
     mac.update(ba_slice(msg_obj));
     qed_lean_io_mk_ok(mk_ba(&mac.finalize().into_bytes()))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_hmac_sha256_verify(
+    key_obj: *mut LeanObj,
+    msg_obj: *mut LeanObj,
+    sig_obj: *mut LeanObj,
+) -> *mut LeanObj {
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(ba_slice(key_obj)).expect("HMAC key");
+    mac.update(ba_slice(msg_obj));
+    let ok: usize = if mac.verify_slice(ba_slice(sig_obj)).is_ok() { 1 } else { 0 };
+    qed_lean_io_mk_ok(qed_lean_box(ok))
 }
 
 #[no_mangle]

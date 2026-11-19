@@ -33,8 +33,16 @@ if ! command -v lake >/dev/null 2>&1 && [ ! -x "${HOME}/.elan/bin/lake" ]; then
   "${tmp}/elan-init" -y --default-toolchain none >/dev/null
   rm -rf "${tmp}"
 fi
-export PATH="${HOME}/.elan/bin:${PATH}"
+export PATH="${HOME}/.elan/bin:${HOME}/.cargo/bin:${PATH}"
 command -v lake >/dev/null 2>&1 || err "lake not found after installing elan"
+
+# 1b. Rust toolchain (cargo) for the native full-stack server shim (`rust/qed_server`).
+if ! command -v cargo >/dev/null 2>&1; then
+  info "installing Rust toolchain (rustup minimal profile for native server builds)"
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path >/dev/null
+  export PATH="${HOME}/.cargo/bin:${PATH}"
+fi
+command -v cargo >/dev/null 2>&1 || err "cargo not found after installing rustup; install Rust from https://rustup.rs"
 
 # 2. Fetch / update the framework.
 if [ -d "${SRC}/.git" ]; then
@@ -54,7 +62,7 @@ info "building the qed CLI"
 mkdir -p "${BIN}"
 cat > "${BIN}/qed" <<'LAUNCH'
 #!/usr/bin/env bash
-export PATH="${HOME}/.elan/bin:${PATH}"
+export PATH="${HOME}/.elan/bin:${HOME}/.cargo/bin:${PATH}"
 export QED_HOME="${HOME}/.qed/qed"
 exec "${HOME}/.qed/qed/.lake/build/bin/qed" "$@"
 LAUNCH

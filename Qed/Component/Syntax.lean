@@ -86,23 +86,23 @@ def compRouteClause    : Parser := leading_parser
 def compPortOutClause  : Parser := leading_parser
   withPosition (atomic (identEq `port >> ident >> ":") >> categoryParser `qedType 0)
 
-def compWhenLet : Parser := leading_parser
+def compIfLet : Parser := leading_parser
   atomic (symbol "let" >> categoryParser `qedPat 0 >> "=") >> categoryParser `qedExpr 0 >>
   optional ("," >> sepBy1 (categoryParser `qedExpr 0) ",")
 
-def compWhen : Parser := leading_parser
-  atomic (kw "when") >> (compWhenLet <|> sepBy1 (categoryParser `qedExpr 0) ",")
+def compIfCond : Parser := leading_parser
+  atomic (symbol "if") >> (compIfLet <|> sepBy1 (categoryParser `qedExpr 0) ",")
 
 def compPortInClause   : Parser := leading_parser
   withPosition (
     atomic (identEq `port >> ident >> "(") >> ident >> ":" >> categoryParser `qedType 0 >> ")" >>
-    optional compWhen >> ":" >> qedSuite)
+    ":" >> qedSuite)
 
 def compRpcQueryClause : Parser := leading_parser
   withPosition (
     atomic (identEq `query >> ident >> optional (":" >> categoryParser `qedType 0) >> "=") >>
     ident >> "(" >> sepBy (categoryParser `qedExpr 0) "," >> ")" >>
-    optional compWhen)
+    optional compIfCond)
 
 def compQueryClause    : Parser := leading_parser
   withPosition (
@@ -130,13 +130,12 @@ def compSubscribeClause : Parser := leading_parser
   withPosition (
     atomic (identEq `subscribe >> ident >> "=") >>
     ident >> "(" >> sepBy (categoryParser `qedExpr 0) "," >> ")" >>
-    optional compWhen >>
+    optional compIfCond >>
     optional (":" >> checkColGt "expected indented `subscribe` handlers" >> many1Indent compSubHandler))
 
 def compActionClause   : Parser := leading_parser
   withPosition (
-    atomic (identEq `action) >> ident >> compParamsOpt >>
-    optional compWhen >> ":" >> qedSuite)
+    atomic (identEq `action) >> ident >> compParamsOpt >> ":" >> qedSuite)
 
 def compInvName : Parser := leading_parser ident >> ":"
 
@@ -156,7 +155,7 @@ def compInvariantClause : Parser := leading_parser
 
 def compStyleClause : Parser := leading_parser
   withPosition (
-    atomic (identEq `style >> notFollowedBy (symbol ":=") "':='") >>
+    "style " >>
     ident >>
     optional Qed.StyleDsl.styleExtendsClause >>
     optional Qed.StyleDsl.styleStrictClause >>
@@ -167,7 +166,7 @@ def compStylesheetClause : Parser := leading_parser
   withPosition (atomic (identEq `stylesheet) >> strLit)
 
 def compThemeClause : Parser := leading_parser
-  withPosition (atomic (identEq `theme) >> ident)
+  withPosition ("theme " >> ident)
 
 def compInvAny : Parser := compForEachInvClause <|> compInvariantClause
 

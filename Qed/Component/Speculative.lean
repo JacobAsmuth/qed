@@ -65,7 +65,7 @@ private partial def lowerPredictStmts (wrapVal : Term → CommandElabM Term) :
             let scrut ← lowerPredictExpr (st.getArg 4)
             let tT ← lowerPredictStmts wrapVal (suiteStmts (st.getArg 6)).toList
             let eT ← lowerPredictStmts wrapVal (if (st.getArg 7).getNumArgs == 3 then (suiteStmts ((st.getArg 7).getArg 2)).toList else [])
-            `(if let $pat := $scrut then $tT else $eT)
+            `(match $(mkIdent `_qedIfLet):ident : $scrut:term with | $pat:term => $tT | _ => $eT)
           else
             let scruts ← (st.getArg 1).getSepArgs.mapM lowerPredictExpr
             let alts ← (st.getArg 3).getArgs.mapM fun alt => do
@@ -130,7 +130,7 @@ private partial def compileClassifyTree (spec : ComponentSpec) : ClassifyTree �
       let scrut ← lowerCompExpr .val scrutStx
       let tT ← compileClassifyTree spec thenT
       let eT ← compileClassifyTree spec elseT
-      `(if let $pat := $scrut then $tT else $eT)
+      `(match $(mkIdent `_qedIfLet):ident : $scrut:term with | $pat:term => $tT | _ => $eT)
   | .matchBr scruts cases => do
       let scrutTs ← scruts.mapM (lowerCompExpr .val)
       let alts ← cases.mapM fun (ps, tr) => do
@@ -225,10 +225,6 @@ def mkSpecClassifyCmds (spec : ComponentSpec) : CommandElabM (Array (TSyntax `co
     let cFull := mkIdent (tId ++ `Msg ++ da.ctor)
     let paramNames := da.params.map (·.1.getId.eraseMacroScopes)
     let mut rhs ← compileClassifyTree spec da.tree
-    if let some guard := da.guard? then
-      rhs ← `(if $(mkIdent `_qedWhen):ident : $guard then $rhs else Qed.SpecAction.normal)
-    if let some (pat, scrut) := da.whenPat? then
-      rhs ← `(match $(mkIdent `_qedWhenPat):ident : $scrut:term with | $pat:term => $rhs | _ => Qed.SpecAction.normal)
     rhs ← bindMentionedFields spec (fun g => !paramNames.contains g && mentionsIdent rhs.raw g) rhs
     if !da.params.isEmpty then
       let ids : Array Term := da.params.map (⟨·.1.raw⟩)

@@ -1,4 +1,4 @@
-import Examples.Bench.List
+import Bench.List
 open Qed
 
 namespace BenchListDiff

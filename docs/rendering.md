@@ -80,7 +80,7 @@ and Chromium behave the same way. Run the browser equivalence suite directly wit
 node test/dom_equivalence_test.mjs
 ```
 
-This suite compiles [`Examples/DomProbe.lean`](../Examples/DomProbe.lean) and runs deterministic
+This suite compiles [`Tests/DomProbe.lean`](../Tests/DomProbe.lean) and runs deterministic
 and seeded mutation sequences through the real JavaScript driver in headless Chromium:
 
 - After every update, it asserts that the live DOM matches both a fresh `buildDom` mount and

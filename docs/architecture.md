@@ -174,7 +174,7 @@ and `qed start` or `qed preview` for production builds; `qed build` also minifie
   keyed moves, `V.memo`, and duplicate keys.
 - [`test/fullstack_rpc_test.mjs`](../test/fullstack_rpc_test.mjs) — native C server HTTP/1.1 framing,
   auth/cookies, TLS external calls, and `/_qed/rpc/…` binary Protobuf RPCs.
-- Benchmarks in [`Examples/Bench`](../Examples/Bench),
+- Benchmarks in [`Bench/`](../Bench),
   [`test/bench_template.mjs`](../test/bench_template.mjs), and
   [`test/bench_react.mjs`](../test/bench_react.mjs).
 

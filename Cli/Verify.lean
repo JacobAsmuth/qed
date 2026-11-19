@@ -61,9 +61,8 @@ def kernelEnvClean (q? : Option QedjsEnv := none) : IO Bool := do
       "Qed.Proofs.DomArena", "Qed.Proofs.ViewPatch", "Qed.Proofs.KeyedReconcile", "Qed.Proofs.Hydration",
       "Js.Backend", "Js.Proofs",
       "Examples.Counter", "Examples.Todo", "Examples.Signup",
-      "Examples.Chat", "Examples.Bookshelf", "Examples.CloudBooks",
-      "Examples.ServerChecks", "Examples.DomProbe",
-      "Examples.JsGate", root
+      "Examples.Chat", "Examples.Bookshelf", "Examples.CloudBooks", "Examples.LiveRoom",
+      "Tests.ServerChecks", "Tests.DomProbe", "Tests.JsGate", root
     ]
     q.run (#["--verify-env"] ++ mods) (quiet := true)
   else
@@ -99,7 +98,7 @@ def externsCovered (q? : Option QedjsEnv := none) : IO Bool := do
                 mods := #[mod]
                 entries := driverEntries
   if hasExamples then
-    mods := mods.push "Examples.JsGate"
+    mods := mods.push "Tests.JsGate"
     entries := entries ++ #["JsGate.run", "JsGate.counts", "JsGate.probeCount", "JsGate.names"]
   if entries.isEmpty then return true
   let some q ← (match q? with | some e => pure (some e) | none => resolveQedjsEnv) | return false
@@ -109,7 +108,7 @@ def verify (checkExterns : Bool := true) : IO Bool := do
   step "verifying proofs & axioms"
   let hasExamples ← (FilePath.mk "Examples").pathExists
   if hasExamples then
-    if (← shQuiet "lake" #["build", "Qed", "Qed.Driver", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples"]) != 0 then return false
+    if (← shQuiet "lake" #["build", "Qed", "Qed.Driver", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples", "Tests"]) != 0 then return false
   else
     let root ← webRoot
     let jsMod ← jsRoot

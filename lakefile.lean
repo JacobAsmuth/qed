@@ -33,6 +33,12 @@ lean_exe qedjs where
 lean_lib Examples where
   globs := #[.submodules `Examples]
 
+lean_lib Tests where
+  globs := #[.submodules `Tests]
+
+lean_lib Bench where
+  globs := #[.submodules `Bench]
+
 lean_lib Cli where
   globs := #[.submodules `Cli]
 
@@ -40,4 +46,4 @@ lean_exe qed where
   root := `Cli
 
 lean_exe bench where
-  root := `Examples.Bench.Pipeline
+  root := `Bench.Pipeline

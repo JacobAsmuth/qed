@@ -11,13 +11,13 @@ const run = (cmd, args, env = process.env) =>
 
 try {
   if (process.env.QED_PREBUILT !== '1' || !existsSync(qedjsBin)) {
-    run('lake', ['build', 'Examples.DomProbe', 'qedjs']);
+    run('lake', ['build', 'Tests.DomProbe', 'qedjs']);
   }
   const LEAN_PATH = process.env.LEAN_PATH || run('lake', ['env', 'printenv', 'LEAN_PATH']).trim();
   const entries = ['mount', 'advance', 'fresh', 'expected', 'handlerValue',
     'mountTemplate', 'advanceTemplate', 'expectedTemplate',
     'expectedDuplicate', 'duplicateBuild', 'duplicateUpdate', 'duplicateHydrate'];
-  run(qedjsBin, [join(out, 'app.mjs'), 'Examples.DomProbe', '--', ...entries.map((n) => `DomProbe.${n}:${n}`)],
+  run(qedjsBin, [join(out, 'app.mjs'), 'Tests.DomProbe', '--', ...entries.map((n) => `DomProbe.${n}:${n}`)],
     { ...process.env, LEAN_PATH });
   for (const name of ['qed_rt.mjs', 'qed_dom.mjs']) copyFileSync(join(ROOT, 'runtime', name), join(out, name));
 

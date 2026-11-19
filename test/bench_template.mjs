@@ -27,10 +27,10 @@ async function measure(webRoot) {
 }
 
 try {
-  const sTempl = await measure('Examples.Bench.ScalarWeb');
-  const sDiff  = await measure('Examples.Bench.ScalarDiffWeb');
-  const lTempl = await measure('Examples.Bench.ListWeb');
-  const lDiff  = await measure('Examples.Bench.ListDiffWeb');
+  const sTempl = await measure('Bench.ScalarWeb');
+  const sDiff  = await measure('Bench.ScalarDiffWeb');
+  const lTempl = await measure('Bench.ListWeb');
+  const lDiff  = await measure('Bench.ListDiffWeb');
 
   console.log(`\n  median of ${REPS} updates (ms)\n`);
   console.log('  scalar — 2000 bound values, 1 changed per update');

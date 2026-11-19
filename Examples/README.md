@@ -1,6 +1,6 @@
 # Qed Examples
 
-Six focused examples walking through every layer of Qed: components and invariants, `for_each` collections and scoped CSS, validated forms, streaming effects, routed SSR, and a verified full-stack server + client app.
+Seven focused examples walking through every layer of Qed: components and invariants, `for_each` collections and scoped CSS, validated forms, streaming effects, routed SSR, full-stack RPCs, and multiplexed/3rd-party WebSockets.
 
 ## Running the examples
 
@@ -10,7 +10,7 @@ Any example runs directly via `QED_WEB_ROOT` (`./scripts/qed dev` defaults to `E
 QED_WEB_ROOT=Examples.Todo ./scripts/qed dev
 ```
 
-Open http://localhost:8000 to view the app. Examples backed by HTTP or SSE pair a `--dev` build with a local server:
+Open http://localhost:8000 to view the app. Examples backed by HTTP, SSE, or WebSockets pair a `--dev` build with a local server:
 
 ```bash
 # Bookshelf REST API and generated SSR handler
@@ -23,9 +23,12 @@ python3 test/mock_llm.py 8000 .qed/dev
 
 # CloudBooks full-stack client and native server build
 QED_WEB_ROOT=Examples.CloudBooks ./scripts/qed dev
+
+# LiveRoom full-stack multiplexed & 3rd-party WebSocket app
+QED_WEB_ROOT=Examples.LiveRoom ./scripts/qed dev
 ```
 
-Run all proof/environment checks and the 4 automated TCB test suites from the repo root:
+Run all proof/environment checks and the 5 automated test suites from the repo root:
 
 ```bash
 ./scripts/qed check
@@ -42,12 +45,10 @@ Run all proof/environment checks and the 4 automated TCB test suites from the re
 4. **[Chat.lean](Chat.lean)** — Streaming Server-Sent Events with `Cmd.stream`, loop rendering, and an effect-safety invariant (`pending -> 0 < turns.size`).
 5. **[Bookshelf.lean](Bookshelf.lean)** — Complete routed SPA + JS SSR app combining `router`, `<Book.Form>`, `token`/`css`/`theme` styling, `Resource` HTTP requests, `<Await>` with error handling, `Cmd.pushUrl`, and SSR hydration (paired with [bookshelf-server.mjs](bookshelf-server.mjs)).
 6. **[CloudBooks.lean](CloudBooks.lean)** — End-to-end verified `fullstack` app pairing typed `external` HTTP APIs and a stateful native `server` (`invariant`s, `requires`/`ensures` contracts, `ensure`, `return atomic:`, `session` auth) with a `Storefront` client component.
+7. **[LiveRoom.lean](LiveRoom.lean)** — End-to-end verified `fullstack` WebSocket app combining multiplexed binary server `channel`s (`on_join`, `on_send`, `on_leave`, transactional `emit`, `ctx.connId`) and 3rd-party `external` `ws` feeds (JSON, raw text, binary `Proto(T)`) with configurable per-subscription `reconnect` policies.
 
 ---
 
-## Appendix: Compiler Gates & Benchmarks
+## Compiler Gates & Benchmarks
 
-These files support the test suites and benchmarks rather than serving as user-facing app examples:
-
-- **Compiler & runtime gates** — [SyntaxChecks.lean](SyntaxChecks.lean), [ServerChecks.lean](ServerChecks.lean), [JsGate.lean](JsGate.lean), and [DomProbe.lean](DomProbe.lean) check compile-time diagnostics and Lean/JS/DOM equivalence.
-- **Benchmarks** — [Bench/](Bench/) contains pipeline and view-layer benchmarks, run via `lake exe bench`, `test/bench_react.mjs`, and `test/bench_template.mjs`.
+Compiler/runtime test modules live in [../Tests/](../Tests/) (`SyntaxChecks`, `ServerChecks`, `CssChecks`, `JsGate`, `DomProbe`), and pipeline/view benchmarks live in [../Bench/](../Bench/) (`lake exe bench`, `test/bench_react.mjs`, `test/bench_template.mjs`).

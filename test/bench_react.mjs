@@ -18,7 +18,7 @@ for (const [f, url] of [
   }
 }
 
-buildDev('Examples.Bench.AppWeb');
+buildDev('Bench.AppWeb');
 const qSrv = await serve();
 const rSrv = await serve({ dir: path.join(ROOT, 'test'), spa: false });
 const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });

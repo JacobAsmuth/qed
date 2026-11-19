@@ -14,13 +14,13 @@ const run = (cmd, args, env = { ...process.env, PATH }) =>
 
 const qedjsBin = path.join(root, '.lake/build/bin/qedjs');
 if (process.env.QED_PREBUILT !== '1' || !existsSync(qedjsBin)) {
-  run('lake', ['build', 'Examples.JsGate', 'qedjs']);
+  run('lake', ['build', 'Tests.JsGate', 'qedjs']);
 }
 const LEAN_PATH = process.env.LEAN_PATH || run('lake', ['env', 'printenv', 'LEAN_PATH']).trim();
 const gateEnv = { ...process.env, PATH, LEAN_PATH };
 
 const oraclePath = path.join(gate, 'oracle.lean');
-writeFileSync(oraclePath, 'import Examples.JsGate\ndef main : IO Unit := JsGate.emitOracle\n');
+writeFileSync(oraclePath, 'import Tests.JsGate\ndef main : IO Unit := JsGate.emitOracle\n');
 const oracleText = run('lean', ['--run', oraclePath], gateEnv);
 const want = new Map();
 for (const line of oracleText.split('\n')) {
@@ -29,7 +29,7 @@ for (const line of oracleText.split('\n')) {
 }
 
 const appPath = path.join(gate, 'app.mjs');
-run(qedjsBin, [appPath, 'Examples.JsGate', '--',
+run(qedjsBin, [appPath, 'Tests.JsGate', '--',
   'JsGate.run:run', 'JsGate.counts:counts', 'JsGate.probeCount:probeCount', 'JsGate.names:names'], gateEnv);
 copyFileSync(path.join(root, 'runtime/qed_rt.mjs'), path.join(gate, 'qed_rt.mjs'));
 

@@ -1192,4 +1192,140 @@ private def decodeReducedStrList? (e : Expr) : Option (List String) := do
     let targetLabel := (target.raw.reprint.getD "target").trimmed
     throwErrorAt stx s!"theme `{thId.getId}` does not define all CSS tokens used by `{targetLabel}`.\n  Missing tokens: {missingStr}\nAdd them to `theme {thId.getId}:`."
 
+/-! ## Compile-Time Baking for Closed `css [...]` / `cssNamed "..." [...]` Calls -/
+
+private def evalNatExpr? (e : Expr) : MetaM (Option Nat) := do
+  let w ← whnf e
+  if let .lit (.natVal n) := w then return some n
+  return none
+
+private def evalBoolExpr? (e : Expr) : MetaM (Option Bool) := do
+  let w ← whnf e
+  if w.isConstOf ``Bool.true then return some true
+  if w.isConstOf ``Bool.false then return some false
+  return none
+
+private def evalStrExpr? : Nat → Expr → MetaM (Option String)
+  | 0, _ => return none
+  | fuel + 1, e => do
+      let e := e.consumeMData.headBeta
+      if let .lit (.strVal s) := e then return some s
+      let args := e.getAppArgs
+      let fn? := e.getAppFn.constName?
+      -- Handle structure projections (`Color.raw`, `CssNum.raw`) whether applied as const or `.proj`
+      let colorArg? : Option Expr :=
+        if fn? == some ``Qed.Color.raw && args.size == 1 then some args[0]!
+        else match e with | .proj ``Qed.Color 0 c => some c | _ => none
+      if let some c := colorArg? then
+        let c := c.consumeMData.headBeta
+        if c.isAppOfArity ``Qed.hex 1 then
+          if let some s ← evalStrExpr? fuel c.appArg! then return some (Qed.hex s).raw
+        else if c.isAppOfArity ``Qed.rgb 3 then
+          let ca := c.getAppArgs
+          if let (some r, some g, some b) := (← evalNatExpr? ca[0]!, ← evalNatExpr? ca[1]!, ← evalNatExpr? ca[2]!) then
+            return some (Qed.rgb r g b).raw
+      let cssNumArg? : Option Expr :=
+        if fn? == some ``Qed.CssNum.raw && args.size == 1 then some args[0]!
+        else match e with | .proj ``Qed.CssNum 0 c => some c | _ => none
+      if let some cn := cssNumArg? then
+        let cn := cn.consumeMData.headBeta
+        if cn.isAppOfArity ``OfNat.ofNat 3 then
+          if let some n ← evalNatExpr? (cn.getArg! 1) then return some (toString n)
+        else if cn.isAppOfArity ``OfScientific.ofScientific 5 then
+          let ca := cn.getAppArgs
+          if let (some m, some neg, some exp) := (← evalNatExpr? ca[2]!, ← evalBoolExpr? ca[3]!, ← evalNatExpr? ca[4]!) then
+            return some ((OfScientific.ofScientific m neg exp : Qed.CssNum).raw)
+      match fn? with
+      | some ``HAppend.hAppend =>
+          if args.size == 6 then
+            let some a ← evalStrExpr? fuel args[4]! | return none
+            let some b ← evalStrExpr? fuel args[5]! | return none
+            return some (a ++ b)
+      | some ``String.append =>
+          if args.size == 2 then
+            let some a ← evalStrExpr? fuel args[0]! | return none
+            let some b ← evalStrExpr? fuel args[1]! | return none
+            return some (a ++ b)
+      | some ``Nat.repr =>
+          if args.size == 1 then
+            if let some n ← evalNatExpr? args[0]! then return some (toString n)
+      | some ``ToString.toString =>
+          if args.size == 3 then
+            let v ← whnf args[2]!
+            if let .lit (.natVal n) := v then return some (toString n)
+            if let .lit (.strVal s) := v then return some s
+      | _ => pure ()
+      let w ← whnf e
+      if w == e then return none
+      evalStrExpr? fuel w
+
+private def evalItemListExpr? : Nat → Expr → MetaM (Option (List Qed.Item))
+  | 0, _ => return none
+  | fuel + 1, e => do
+      let w ← whnf e
+      if w.isAppOfArity ``List.nil 1 then return some []
+      if w.isAppOfArity ``List.cons 3 then
+        let args := w.getAppArgs
+        let iw ← whnf args[1]!
+        let item? : Option Qed.Item ←
+          if iw.isAppOfArity ``Qed.Item.decl 2 then
+            match ← evalStrExpr? fuel (iw.getArg! 0), ← evalStrExpr? fuel (iw.getArg! 1) with
+            | some p, some v => pure (some (.decl p v))
+            | _, _ => pure none
+          else if iw.isAppOfArity ``Qed.Item.nest 2 then
+            match ← evalStrExpr? fuel (iw.getArg! 0), ← evalItemListExpr? fuel (iw.getArg! 1) with
+            | some sel, some bs => pure (some (.nest sel bs))
+            | _, _ => pure none
+          else pure none
+        let some it := item? | return none
+        let some rest ← evalItemListExpr? fuel args[2]! | return none
+        return some (it :: rest)
+      return none
+
+private def itemToExpr : Qed.Item → Expr
+  | .decl p v => mkApp2 (mkConst ``Qed.Item.decl) (toExpr p) (toExpr v)
+  | .nest s b => mkApp2 (mkConst ``Qed.Item.nest) (toExpr s) (itemListToExpr b)
+where
+  itemListToExpr : List Qed.Item → Expr
+    | [] => mkApp (mkConst ``List.nil [Level.zero]) (mkConst ``Qed.Item)
+    | i :: is => mkApp3 (mkConst ``List.cons [Level.zero]) (mkConst ``Qed.Item) (itemToExpr i) (itemListToExpr is)
+
+private def styleToExpr (s : Qed.Style) : Expr :=
+  mkAppN (mkConst ``Qed.Style.mk)
+    #[toExpr s.className, toExpr s.raw, itemToExpr.itemListToExpr s.items,
+      toExpr s.usedTokens, toExpr s.extraRules, toExpr s.isGlobal]
+
+private def isPlainPosArg (s : Syntax) : Bool :=
+  !s.isOfKind ``Lean.Parser.Term.namedArgument && !s.isOfKind ``Lean.Parser.Term.ellipsis
+
+@[term_elab Lean.Parser.Term.app]
+def elabCssBakeApp : TermElab := fun stx _expectedType? => do
+  let fn := stx.getArg 0
+  if !fn.isIdent then throwUnsupportedSyntax
+  let nm := fn.getId
+  if nm != `css && nm != `Qed.css && nm != `cssNamed && nm != `Qed.cssNamed then
+    throwUnsupportedSyntax
+  if (← getLCtx).findFromUserName? nm |>.isSome then
+    throwUnsupportedSyntax
+  let c ← try resolveGlobalConstNoOverloadCore nm catch _ => throwUnsupportedSyntax
+  let args := (stx.getArg 1).getArgs
+  let listItemTy := mkApp (mkConst ``List [Level.zero]) (mkConst ``Qed.Item)
+  if c == ``Qed.css && args.size == 1 && isPlainPosArg args[0]! then
+    let body ← instantiateMVars (← elabTermEnsuringType args[0]! listItemTy)
+    addTermInfo' fn (mkConst ``Qed.css)
+    if !body.hasFVar && !body.hasMVar then
+      if let some items ← try evalItemListExpr? 64 body catch _ => pure none then
+        return styleToExpr (Qed.css items)
+    return mkApp (mkConst ``Qed.css) body
+  else if c == ``Qed.cssNamed && args.size == 2 && isPlainPosArg args[0]! && isPlainPosArg args[1]! then
+    let lbl ← instantiateMVars (← elabTermEnsuringType args[0]! (mkConst ``String))
+    let body ← instantiateMVars (← elabTermEnsuringType args[1]! listItemTy)
+    addTermInfo' fn (mkConst ``Qed.cssNamed)
+    if !lbl.hasFVar && !lbl.hasMVar && !body.hasFVar && !body.hasMVar then
+      if let (some lblS, some items) ← try pure (← evalStrExpr? 32 lbl, ← evalItemListExpr? 64 body) catch _ => pure (none, none) then
+        return styleToExpr (Qed.cssNamed lblS items)
+    return mkApp2 (mkConst ``Qed.cssNamed) lbl body
+  else
+    throwUnsupportedSyntax
+
 end Qed.StyleDsl

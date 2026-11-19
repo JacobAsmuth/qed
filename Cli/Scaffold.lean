@@ -8,7 +8,7 @@ def cmdDoctor : IO UInt32 := do
   IO.println "qed doctor:"
   let report (label : String) (ok : Bool) : IO Unit :=
     IO.println s!"  {if ok then green "✓" else red "✗"} {label}"
-  for c in ["lean", "lake", "node", "python3"] do
+  for c in ["lean", "lake", "cargo", "node", "python3"] do
     report c (← onPath c)
   return 0
 

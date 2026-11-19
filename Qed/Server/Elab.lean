@@ -106,6 +106,7 @@ private def elabServerFnClause (priorRep priorUnrep : Nat)
     (stateFieldNames envVarNames : Array String)
     (invs : Array ParsedInv) (mutInvs : Array ParsedMutInv)
     (chanSigs : Array SrvChanSig) (existingMethods : Array ServerMethodInfo)
+    (deferredProofs : IO.Ref (Array (CommandElabM Bool)))
     (fc : Syntax) :
     CommandElabM (Option (ServerMethodInfo × TSyntax ``Lean.Parser.Term.matchAltExpr × Array Name)) := do
   let fnIdent : Ident := ⟨(fc.getArg 1)⟩
@@ -271,12 +272,12 @@ private def elabServerFnClause (priorRep priorUnrep : Nat)
     if hasState && !hasAwait then
       let some r ← elabServerPureFn priorRep priorUnrep srvName fnStr fnIdent stateId stateInvId
           allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
-          invs mutInvs stateFieldNames envVarNames ensSpec? | return none
+          invs mutInvs stateFieldNames envVarNames ensSpec? deferredProofs | return none
       pure r
     else if hasState && hasAwait then
       let some r ← elabServerAsyncFn priorRep priorUnrep srvName fnStr fnIdent stateId stateInvId
           allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
-          invs mutInvs stateFieldNames envVarNames ensSpec? | return none
+          invs mutInvs stateFieldNames envVarNames ensSpec? deferredProofs | return none
       pure r
     else
       let (statelessBody, lSt) ← (lowerAsyncBlock baseCtx none bodyStmts).run {}
@@ -289,10 +290,12 @@ private def elabServerFnClause (priorRep priorUnrep : Nat)
       if hasNewErrors (← get).messages priorRep priorUnrep then return none
       let hCall ← allBinderIds.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
       if let some ensSpec := ensSpec? then
-        unless (← elabAsyncEnsuresThm priorRep priorUnrep srvName fnStr fnIdent handlerId
-            (← `(fun _ : Unit => True)) (← `(Unit)) payloadTerm errTyTerm
-            allBinderIds allBinderTys hCall #[] ensSpec) do
-          return none
+        let unitInv ← `(fun _ : Unit => True)
+        let unitTy ← `(Unit)
+        deferredProofs.modify (·.push do
+          elabAsyncEnsuresThm priorRep priorUnrep srvName fnStr fnIdent handlerId
+            unitInv unitTy payloadTerm errTyTerm
+            allBinderIds allBinderTys hCall #[] ensSpec)
       let hApp ← callArgs.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
       pure (hApp, true, lSt.extRoots)
 
@@ -355,6 +358,7 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
     chanNames := chanNames.push hdr.chStr
     allExtRoots := allExtRoots ++ er.filter (!allExtRoots.contains ·)
 
+  let deferredProofs ← IO.mkRef (#[] : Array (CommandElabM Bool))
   let mut methodInfos : Array ServerMethodInfo := #[]
   let mut dispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
   let ctxId := mkIdent `ctx
@@ -363,7 +367,7 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
   for fc in parsed.fnClauses do
     let some (info, arm, er) ← elabServerFnClause priorRep priorUnrep srvName fullSrvName srvShort
         hasState stateId stateInvId ctxId reqBytesId envIdents envTypes stateFieldNames envVarNames
-        parsed.invs parsed.mutInvs chanSigs methodInfos fc | return
+        parsed.invs parsed.mutInvs chanSigs methodInfos deferredProofs fc | return
     methodInfos := methodInfos.push info
     dispatchArms := dispatchArms.push arm
     allExtRoots := allExtRoots ++ er.filter (!allExtRoots.contains ·)
@@ -372,13 +376,17 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
   for hdr in chanHeaders do
     let some (chArms, er) ← elabServerChannelBody priorRep priorUnrep
         srvName fullSrvName srvShort hasState stateId stateInvId ctxId
-        envIdents envTypes stateFieldNames envVarNames parsed.invs parsed.mutInvs chanSigs hdr | return
+        envIdents envTypes stateFieldNames envVarNames parsed.invs parsed.mutInvs chanSigs hdr deferredProofs | return
     wsDispatchArms := wsDispatchArms ++ chArms
     allExtRoots := allExtRoots ++ er.filter (!allExtRoots.contains ·)
 
   elabServerDispatchCmds srvIdent stateId initStateId stateInvId invInitId
     srvName fullSrvName srvShort hasState parsed.envDecls allExtRoots methodInfos dispatchArms
     chanNames wsDispatchArms ctxId reqBytesId
+
+  -- Launch all method & channel proof theorems together in one parallel wave after all inductives/defs.
+  for runProof in (← deferredProofs.get) do
+    unless (← runProof) do return
 
 open Lean Elab Command in
 private def rollbackFailedServer (savedEnv : Environment)
@@ -393,6 +401,13 @@ private def rollbackFailedServer (savedEnv : Environment)
       } }
 
 open Lean Elab Command in
+private def snapshotTreeHasErrors : Nat → Language.SnapshotTree → Bool
+  | 0, tree => tree.element.diagnostics.msgLog.hasErrors
+  | fuel + 1, tree =>
+      tree.element.diagnostics.msgLog.hasErrors ||
+      tree.children.any fun t => snapshotTreeHasErrors fuel t.get
+
+open Lean Elab Command in
 @[command_elab serverCmd]
 def elabServerCmd : CommandElab := fun stx => do
   let savedEnv ← getEnv
@@ -400,13 +415,15 @@ def elabServerCmd : CommandElab := fun stx => do
   let priorRep := priorLog.reported.size
   let priorUnrep := priorLog.unreported.size
   let priorKinds := priorLog.loggedKinds
+  let priorTasks := (← get).snapshotTasks.size
   try
-    withScope (fun sc => { sc with opts := Elab.async.set sc.opts false }) do
-      elabServerCmdCore priorRep priorUnrep stx
+    elabServerCmdCore priorRep priorUnrep stx
   catch ex =>
     rollbackFailedServer savedEnv priorRep priorUnrep priorKinds
     throw ex
-  if hasNewErrors (← get).messages priorRep priorUnrep then
+  let newTasks := (← get).snapshotTasks.extract priorTasks (← get).snapshotTasks.size
+  let asyncErr := newTasks.any fun t => snapshotTreeHasErrors 64 t.get
+  if hasNewErrors (← get).messages priorRep priorUnrep || asyncErr then
     rollbackFailedServer savedEnv priorRep priorUnrep priorKinds
 
 

@@ -211,9 +211,10 @@ def calleesAlts : List Alt → Array Name → Array Name
   | .ctor _ b :: rest, acc | .default b :: rest, acc => calleesAlts rest (callees b acc)
 end
 
-def reachAux (env : Environment) : Nat → List Name → Array Name → Std.HashSet Name → Array Name
-  | 0, _, seen, _ => seen
-  | _ + 1, [], seen, _ => seen
+def reachAux (env : Environment) :
+    Nat → List Name → Array Name → Std.HashSet Name → Except String (Array Name)
+  | _, [], seen, _ => .ok seen
+  | 0, n :: _, _, _ => .error s!"JS reachability gate: exceeded fuel limit while inspecting `{n}`"
   | fuel + 1, n :: rest, seen, visited =>
       if visited.contains n then
         reachAux env fuel rest seen visited
@@ -227,7 +228,8 @@ def reachAux (env : Environment) : Nat → List Name → Array Name → Std.Hash
         | _ =>
             reachAux env fuel rest seen visited
 
-def reach (env : Environment) (roots : List Name) (seen : Array Name := #[]) : Array Name :=
+def reach (env : Environment) (roots : List Name) (seen : Array Name := #[]) :
+    Except String (Array Name) :=
   let initVisited := seen.foldl (fun s n => s.insert n) ({} : Std.HashSet Name)
   reachAux env 1000000 roots seen initVisited
 
@@ -479,7 +481,7 @@ def emitDecl (c0 : Ctx) (d : Decl) : String :=
 
 def collectProgramExterns (env : Environment) (roots : List Name) :
     Except String (Array Name × Std.HashMap Name Decl × List String) := do
-  let names := reach env roots #[]
+  let names ← reach env roots #[]
   verifyReachable env names
   verifyNoServerLeakInClient env names
   let mut externs : Std.HashMap Name Decl := {}
@@ -492,9 +494,9 @@ def collectProgramExterns (env : Environment) (roots : List Name) :
   return (names, externs, externNames)
 
 private def joinChunksAux (xs : Array String) (lo hi : Nat) : String :=
-  if h : lo ≥ hi then ""
-  else if h1 : lo + 1 == hi then xs[lo]!
-  else if h2 : lo + 2 == hi then xs[lo]! ++ xs[lo + 1]!
+  if _ : lo ≥ hi then ""
+  else if _ : lo + 1 == hi then xs[lo]!
+  else if _ : lo + 2 == hi then xs[lo]! ++ xs[lo + 1]!
   else
     let mid := (lo + hi) / 2
     joinChunksAux xs lo mid ++ joinChunksAux xs mid hi

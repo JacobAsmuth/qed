@@ -150,6 +150,15 @@ macro_rules
            repeat' split;
            all_goals (first
              | rfl
+             | (simp_all only [Qed.everyElement, Qed.everyElementL,
+                               Qed.attrClasses, Qed.attrRole, Qed.hasOneClass,
+                               Bool.true_and, Bool.and_true, Bool.false_and, Bool.and_false,
+                               Bool.true_or, Bool.or_true, Bool.false_or, Bool.or_false,
+                               Bool.not_true, Bool.not_false, Bool.and_eq_true, Bool.or_eq_true,
+                               Bool.false_eq_true, ite_true, ite_false, dite_true, dite_false,
+                               List.all_cons, List.all_nil, List.any_cons, List.any_nil,
+                               beq_self_eq_true, eq_self, decide_true, decide_false];
+                (try rfl); done)
              | (simp_all [Qed.everyElement, Qed.everyElementL,
                           Qed.attrClasses, Qed.attrRole, Qed.hasOneClass];
                 try decide;

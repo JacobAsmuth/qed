@@ -188,55 +188,55 @@ theorem assignProgramNames_invariant (steps : List (Name × Bool)) (entryMap : S
 
 def reachEdges (env : Environment) (n : Name) : List Name :=
   match findEnvDecl env n with | some (.fdecl (body := b) ..) => (callees b #[]).toList ++ (getInitFnNameFor? env n).toList | _ => []
-def reachAuxDone (env : Environment) : Nat → List Name → Std.HashSet Name → Bool
-  | 0, _, _ => false | _ + 1, [], _ => true
-  | fuel + 1, n :: rest, visited => if visited.contains n then reachAuxDone env fuel rest visited else reachAuxDone env fuel (rest ++ reachEdges env n) (visited.insert n)
 
 theorem reachAux_mono (env : Environment) :
-    ∀ (fuel : Nat) (rest : List Name) (seen : Array Name) (visited : Std.HashSet Name), ∀ x ∈ seen.toList, x ∈ (reachAux env fuel rest seen visited).toList
-  | 0, _, _, _, _, hx | _ + 1, [], _, _, _, hx => hx
-  | f + 1, _ :: rest, seen, visited, x, hx => by dsimp only [reachAux]; split; exact reachAux_mono env f rest seen visited x hx; split <;> exact reachAux_mono env f _ _ _ x (by simp [Array.toList_push, hx])
+    ∀ (fuel : Nat) (rest : List Name) (seen : Array Name) (visited : Std.HashSet Name) (out : Array Name),
+      reachAux env fuel rest seen visited = .ok out → ∀ x ∈ seen.toList, x ∈ out.toList
+  | _, [], _, _, _, hok, _, hx => by simp only [reachAux] at hok; cases hok; exact hx
+  | 0, _ :: _, _, _, _, hok, _, _ => by simp only [reachAux] at hok; nomatch hok
+  | f + 1, _ :: rest, seen, visited, out, hok, x, hx => by
+      dsimp only [reachAux] at hok; split at hok
+      · exact reachAux_mono env f rest seen visited out hok x hx
+      · split at hok <;> exact reachAux_mono env f _ _ _ out hok x (by simp [Array.toList_push, hx])
 
 private theorem reachAux_closed_aux (env : Environment) :
-    ∀ (fuel : Nat) (rest : List Name) (seen : Array Name) (visited : Std.HashSet Name),
+    ∀ (fuel : Nat) (rest : List Name) (seen : Array Name) (visited : Std.HashSet Name) (out : Array Name),
       (∀ x, x ∈ visited ↔ x ∈ seen.toList) → (∀ x ∈ seen.toList, ∀ y ∈ reachEdges env x, y ∈ seen.toList ∨ y ∈ rest) →
-      reachAuxDone env fuel rest visited = true → let out := (reachAux env fuel rest seen visited).toList; (∀ r ∈ rest, r ∈ out) ∧ (∀ x ∈ out, ∀ y ∈ reachEdges env x, y ∈ out)
-  | 0, _, _, _, _, _, hdone => by simp [reachAuxDone] at hdone
-  | _ + 1, [], _, _, _, hclosed, _ => by dsimp only; exact ⟨(fun _ hr => nomatch hr), fun x hx y hy => (hclosed x hx y hy).elim id (fun h => nomatch h)⟩
-  | f + 1, n :: rest, seen, visited, hiff, hclosed, hdone => by
-      dsimp only [reachAux, reachAuxDone] at hdone ⊢; by_cases hcon : visited.contains n = true
-      · simp only [hcon, ↓reduceIte] at hdone ⊢; have hnSeen := (hiff n).1 (Std.HashSet.contains_iff_mem.1 hcon)
-        obtain ⟨ihR, ihC⟩ := reachAux_closed_aux env f rest seen visited hiff (fun x hx y hy => (hclosed x hx y hy).elim .inl fun hr => (List.mem_cons.1 hr).elim (· ▸ .inl hnSeen) .inr) hdone
-        exact ⟨fun r hr => (List.mem_cons.1 hr).elim (· ▸ reachAux_mono env f rest seen visited _ hnSeen) (ihR r), ihC⟩
-      · have hconF : visited.contains n = false := Bool.eq_false_iff.2 hcon; simp only [hconF, Bool.false_eq_true, ↓reduceIte] at hdone ⊢
+      reachAux env fuel rest seen visited = .ok out → (∀ r ∈ rest, r ∈ out.toList) ∧ (∀ x ∈ out.toList, ∀ y ∈ reachEdges env x, y ∈ out.toList)
+  | _, [], _, _, _, _, hclosed, hok => by simp only [reachAux] at hok; cases hok; exact ⟨(fun _ hr => nomatch hr), fun x hx y hy => (hclosed x hx y hy).elim id (fun h => nomatch h)⟩
+  | 0, _ :: _, _, _, _, _, _, hok => by simp only [reachAux] at hok; nomatch hok
+  | f + 1, n :: rest, seen, visited, out, hiff, hclosed, hok => by
+      dsimp only [reachAux] at hok; by_cases hcon : visited.contains n = true
+      · simp only [hcon, ↓reduceIte] at hok; have hnSeen := (hiff n).1 (Std.HashSet.contains_iff_mem.1 hcon)
+        obtain ⟨ihR, ihC⟩ := reachAux_closed_aux env f rest seen visited out hiff (fun x hx y hy => (hclosed x hx y hy).elim .inl fun hr => (List.mem_cons.1 hr).elim (· ▸ .inl hnSeen) .inr) hok
+        exact ⟨fun r hr => (List.mem_cons.1 hr).elim (· ▸ reachAux_mono env f rest seen visited out hok _ hnSeen) (ihR r), ihC⟩
+      · have hconF : visited.contains n = false := Bool.eq_false_iff.2 hcon; simp only [hconF, Bool.false_eq_true, ↓reduceIte] at hok
         have hiff' : ∀ x, x ∈ visited.insert n ↔ x ∈ (seen.push n).toList := fun x => by rw [Std.HashSet.mem_insert, beq_iff_eq, Array.toList_push, List.mem_append, List.mem_singleton, hiff x]; exact ⟨fun h => h.elim (fun he => .inr he.symm) .inl, fun h => h.elim .inr (fun he => .inl he.symm)⟩
         have hclosed' : ∀ x ∈ (seen.push n).toList, ∀ y ∈ reachEdges env x, y ∈ (seen.push n).toList ∨ y ∈ rest ++ reachEdges env n := fun x hx y hy => by
           rw [Array.toList_push, List.mem_append, List.mem_singleton] at hx ⊢
           rcases hx with hxSeen | rfl; exact (hclosed x hxSeen y hy).elim (fun ys => .inl (.inl ys)) fun yr => (List.mem_cons.1 yr).elim (· ▸ .inl (.inr rfl)) (fun yr' => .inr (List.mem_append_left _ yr')); exact .inr (List.mem_append_right _ hy)
-        have hEmpty : reachEdges env n = [] → reachAux env f rest (seen.push n) (visited.insert n) = reachAux env f rest (seen.push n) (visited.insert n) →
-            let out := (reachAux env f rest (seen.push n) (visited.insert n)).toList; (∀ r ∈ n :: rest, r ∈ out) ∧ (∀ x ∈ out, ∀ y ∈ reachEdges env x, y ∈ out) := fun hed _ => by
-          simp only [hed, List.append_nil] at hdone hclosed'; obtain ⟨ihR, ihC⟩ := reachAux_closed_aux env f rest (seen.push n) (visited.insert n) hiff' hclosed' hdone
-          exact ⟨fun r hr => (List.mem_cons.1 hr).elim (fun e => by subst e; exact reachAux_mono env f rest (seen.push r) (visited.insert r) r (by simp [Array.toList_push])) (ihR r), ihC⟩
+        have hEmpty : reachEdges env n = [] → reachAux env f rest (seen.push n) (visited.insert n) = .ok out →
+            (∀ r ∈ n :: rest, r ∈ out.toList) ∧ (∀ x ∈ out.toList, ∀ y ∈ reachEdges env x, y ∈ out.toList) := fun hed hok' => by
+          simp only [hed, List.append_nil] at hclosed'; obtain ⟨ihR, ihC⟩ := reachAux_closed_aux env f rest (seen.push n) (visited.insert n) out hiff' hclosed' hok'
+          exact ⟨fun r hr => (List.mem_cons.1 hr).elim (fun e => by subst e; exact reachAux_mono env f rest (seen.push r) (visited.insert r) out hok' r (by simp [Array.toList_push])) (ihR r), ihC⟩
         cases hfd : findEnvDecl env n with
-        | none => exact hEmpty (by simp [reachEdges, hfd]) rfl
+        | none => rw [hfd] at hok; exact hEmpty (by simp [reachEdges, hfd]) hok
         | some d => cases d with
-          | extern _ _ _ _ => exact hEmpty (by simp [reachEdges, hfd]) rfl
+          | extern _ _ _ _ => rw [hfd] at hok; exact hEmpty (by simp [reachEdges, hfd]) hok
           | fdecl _ _ _ b _ =>
+              rw [hfd] at hok
               have hed : reachEdges env n = (callees b #[]).toList ++ (getInitFnNameFor? env n).toList := by simp [reachEdges, hfd]
-              rw [hed] at hdone hclosed'; obtain ⟨ihR, ihC⟩ := reachAux_closed_aux env f (rest ++ ((callees b #[]).toList ++ (getInitFnNameFor? env n).toList)) (seen.push n) (visited.insert n) hiff' hclosed' hdone
-              exact ⟨fun r hr => (List.mem_cons.1 hr).elim (fun e => by subst e; exact reachAux_mono env f _ (seen.push r) (visited.insert r) r (by simp [Array.toList_push])) (fun hr' => ihR r (List.mem_append_left _ hr')), ihC⟩
+              rw [hed] at hclosed'; obtain ⟨ihR, ihC⟩ := reachAux_closed_aux env f (rest ++ ((callees b #[]).toList ++ (getInitFnNameFor? env n).toList)) (seen.push n) (visited.insert n) out hiff' hclosed' hok
+              exact ⟨fun r hr => (List.mem_cons.1 hr).elim (fun e => by subst e; exact reachAux_mono env f _ (seen.push r) (visited.insert r) out hok r (by simp [Array.toList_push])) (fun hr' => ihR r (List.mem_append_left _ hr')), ihC⟩
 
-theorem reach_closed (env : Environment) (roots : List Name) (hdone : reachAuxDone env 1000000 roots ∅ = true) :
-    let out := (reach env roots #[]).toList; (∀ r ∈ roots, r ∈ out) ∧ (∀ x ∈ out, ∀ y ∈ reachEdges env x, y ∈ out) :=
-  reachAux_closed_aux env 1000000 roots #[] ∅ (fun _ => by simp) (fun _ h => by simp at h) hdone
+theorem reach_closed (env : Environment) (roots : List Name) (out : Array Name)
+    (hreach : reach env roots #[] = .ok out) :
+    (∀ r ∈ roots, r ∈ out.toList) ∧ (∀ x ∈ out.toList, ∀ y ∈ reachEdges env x, y ∈ out.toList) :=
+  reachAux_closed_aux env 1000000 roots #[] ∅ out (fun _ => by simp) (fun _ h => by simp at h) hreach
 
 def isClientSafeDecl (env : Environment) (n : Name) : Bool :=
-  let modName := definingModule env n
-  modName != `Qed.Server.Prim && modName != `Qed.Server.Native && n != `Qed.Server.execExternalRaw &&
-  n != `Qed.Server.MonadServer.httpCall && n != `Qed.Server.MonadServer.readEnv &&
-  n != `Qed.Server.MonadServer.wsBroadcast && n != `Qed.Server.flushWsEmits &&
-  n != `Qed.Server.MonadAtomic.runAtomic && n != `Qed.Server.MonadAtomic.runAtomicRead &&
-  match n with | .str _ "dispatchM" | .str _ "wsDispatchM" | .str _ "secrets" | .str _ "initState" | .str _ "runServer" => false | .str _ s => !s.endsWith "_step" && !s.endsWith "_handler" | _ => true
+  (clientLeakReason? env n).isNone
+
 inductive ReachPath (env : Environment) : Name → List Name → Prop where
   | nil (a : Name) : ReachPath env a [] | cons {a b : Name} {rest : List Name} : b ∈ reachEdges env a → ReachPath env b rest → ReachPath env a (b :: rest)
 
@@ -254,26 +254,19 @@ private theorem forIn_verifyNoServerLeak_implies (env : Environment) (xs : Array
     fun ls step hd => by cases hf : forIn ls PUnit.unit step with | error _ => rw [hf] at hd; simp [bind, Except.bind] at hd | ok _ => rfl
   refine forIn_list_unit_all _ (fun x => isClientSafeDecl env x = true) (fun n hn => ?_) (fun n u hn => ?_) xs.toList (hret _ _ h)
   · dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw, isClientSafeDecl] at hn ⊢
-    by_cases h1 : (definingModule env n == `Qed.Server.Prim || definingModule env n == `Qed.Server.Native) = true; simp [h1] at hn
-    simp only [h1, Bool.false_eq_true, ↓reduceIte] at hn
-    by_cases h2 : (n == `Qed.Server.execExternalRaw || n == `Qed.Server.MonadServer.httpCall || n == `Qed.Server.MonadServer.readEnv || n == `Qed.Server.MonadServer.wsBroadcast || n == `Qed.Server.flushWsEmits || n == `Qed.Server.MonadAtomic.runAtomic || n == `Qed.Server.MonadAtomic.runAtomicRead) = true; simp [h2] at hn
-    simp only [h2, Bool.false_eq_true, ↓reduceIte] at hn
-    have h12 : (definingModule env n != `Qed.Server.Prim && definingModule env n != `Qed.Server.Native && n != `Qed.Server.execExternalRaw && n != `Qed.Server.MonadServer.httpCall && n != `Qed.Server.MonadServer.readEnv && n != `Qed.Server.MonadServer.wsBroadcast && n != `Qed.Server.flushWsEmits && n != `Qed.Server.MonadAtomic.runAtomic && n != `Qed.Server.MonadAtomic.runAtomicRead) = true := by
-      simp only [Bool.or_eq_true, beq_iff_eq, not_or] at h1 h2; simp [bne_iff_ne, h1, h2]
-    simp only [h12, Bool.true_and]
-    cases n with
-    | str _ s =>
-        by_cases h3 : s = "dispatchM" ∨ s = "wsDispatchM" ∨ s = "secrets" ∨ s = "initState" ∨ s = "runServer"; rcases h3 with rfl | rfl | rfl | rfl | rfl <;> simp at hn
-        rcases not_or.1 h3 with ⟨hs1, h3'⟩; rcases not_or.1 h3' with ⟨hs1b, h3''⟩; rcases not_or.1 h3'' with ⟨hs2, h3'''⟩; rcases not_or.1 h3''' with ⟨hs3, hs4⟩
-        by_cases h4 : (s.endsWith "_step" || s.endsWith "_handler") = true; simp [h4] at hn; simp only [Bool.or_eq_true, not_or] at h4; simp [h4]
-    | _ => simp
-  · dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at hn; repeat (split at hn <;> try contradiction); all_goals (try simp at hn)
+    cases hc : clientLeakReason? env n with
+    | none => rfl
+    | some err => simp [hc] at hn
+  · dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at hn
+    cases hc : clientLeakReason? env n <;> simp [hc] at hn
 
-/-- End-to-end client-leak isolation: if `reach` completes and `verifyNoServerLeakInClient` passes, every reachable declaration along any `ReachPath` is client-safe. -/
-theorem reach_verifyNoServerLeak_sound (env : Environment) (roots : List Name) (hdone : reachAuxDone env 1000000 roots ∅ = true)
-    (hgate : verifyNoServerLeakInClient env (reach env roots #[]) = .ok ()) : ∀ (path : List Name) (r : Name), r ∈ roots → ReachPath env r path → ∀ x ∈ r :: path, isClientSafeDecl env x = true := by
-  obtain ⟨hroots, hclosed⟩ := reach_closed env roots hdone; have hsafeOut := forIn_verifyNoServerLeak_implies env (reach env roots #[]) hgate
-  have gen : ∀ (p : List Name) (cur : Name), cur ∈ (reach env roots #[]).toList → ReachPath env cur p → ∀ x ∈ cur :: p, isClientSafeDecl env x = true := fun p => by
+/-- End-to-end client-leak isolation: whenever `reach` succeeds (fails closed on fuel exhaustion) and
+    `verifyNoServerLeakInClient` passes, every declaration along any `ReachPath` from `roots` is client-safe. -/
+theorem reach_verifyNoServerLeak_sound (env : Environment) (roots : List Name) (out : Array Name)
+    (hreach : reach env roots #[] = .ok out)
+    (hgate : verifyNoServerLeakInClient env out = .ok ()) : ∀ (path : List Name) (r : Name), r ∈ roots → ReachPath env r path → ∀ x ∈ r :: path, isClientSafeDecl env x = true := by
+  obtain ⟨hroots, hclosed⟩ := reach_closed env roots out hreach; have hsafeOut := forIn_verifyNoServerLeak_implies env out hgate
+  have gen : ∀ (p : List Name) (cur : Name), cur ∈ out.toList → ReachPath env cur p → ∀ x ∈ cur :: p, isClientSafeDecl env x = true := fun p => by
     induction p with | nil => exact fun cur hc _ x hx => (List.mem_singleton.1 hx) ▸ hsafeOut _ hc | cons nxt _ ih =>
       intro cur hc hch x hx; cases hch with | cons hadj hrest => exact (List.mem_cons.1 hx).elim (· ▸ hsafeOut _ hc) (ih nxt (hclosed cur hc nxt hadj) hrest x)
   exact fun path r hr hchain => gen path r (hroots r hr) hchain

@@ -161,6 +161,31 @@ def formFieldRow {msg : Type} (inForm wrapLabel bad : Bool) (label err : String)
   cases ctxInForm <;> cases inForm <;> cases wrapLabel <;> cases bad <;>
     simp [formFieldRow, el, cls, attr, Html.validListIn, Html.validIn, Attr.valid, Attr.validKeyValue, hctrl]
 
+theorem formDiv_validIn {msg : Type} (inForm : Bool) (kids : List (Html msg))
+    (hk : Html.validListIn ⟨.normal, false, false, inForm⟩ kids = true) :
+    Html.validIn ⟨.normal, false, false, inForm⟩ (el "div" [cls "qed-form"] kids) = true := by
+  cases inForm <;>
+    simp [el, cls, Html.validIn, Attr.valid, Attr.validList_cons, Attr.validList_nil,
+      Attr.hasLocalCell_cons, Attr.hasLocalCell_nil, Attr.isLocalCell_cls,
+      Qed.reduceStepHtmlCtx, Qed.reduceIsVoidTag, hk]
+
+theorem formRowCons_validIn {msg : Type} (ctxInForm inForm wrapLabel bad : Bool)
+    (label err : String) (ctrl : Html msg) (rest : List (Html msg))
+    (hctrl : Html.validIn ⟨.normal, false, false, ctxInForm⟩ ctrl = true)
+    (hrest : Html.validListIn ⟨.normal, false, false, ctxInForm⟩ rest = true) :
+    Html.validListIn ⟨.normal, false, false, ctxInForm⟩
+      (formFieldRow inForm wrapLabel bad label err ctrl ++ rest) = true := by
+  rw [Html.validListIn_append, formFieldRow_validListIn ctxInForm inForm wrapLabel bad label err ctrl hctrl, hrest]; rfl
+
+def submitBtn {msg α : Type} (o : Option α) (submit : α → msg) : Html msg :=
+  match o with
+  | some p => el "button" [onClick (submit p)] "Submit"
+  | none   => el "button" [disabled true] "Submit"
+
+theorem submitBtn_validIn {msg α : Type} (inForm : Bool) (o : Option α) (submit : α → msg) :
+    Html.validListIn ⟨.normal, false, false, inForm⟩ [submitBtn o submit] = true := by
+  cases o <;> cases inForm <;> rfl
+
 end Codec
 
 class DefaultCodec (α : Type) where
@@ -304,9 +329,10 @@ private def mkProtoFieldSkeleton
   let mut tagsPosPf ← `(term| (fun (_ : Nat × Proto.WireVal) h => False.elim (List.not_mem_nil h)))
   for revIdx in [0:nFields] do
     let i := nFields - 1 - revIdx
+    let iLit := Syntax.mkNumLit (toString i)
     let kLit := Syntax.mkNumLit (toString (i + 1))
     tails := tails.set! i (← `(term| ToProtoField.encodeProtoField $kLit $(reads[i]!) ++ $(tails[i + 1]!)))
-    tagsPosPf ← `(term| Proto.msg_tags_pos_encodeAppend (by decide : 0 < $kLit) $(reads[i]!) $tagsPosPf)
+    tagsPosPf ← `(term| Proto.msg_tags_pos_encodeAppend (Nat.zero_lt_succ $iLit) $(reads[i]!) $tagsPosPf)
   let body := tails[0]!
   let mut pIdents : Array Ident := #[]
   let mut pHaveTacs : Array (TSyntax `tactic) := #[]
@@ -317,12 +343,14 @@ private def mkProtoFieldSkeleton
     for revAfter in [0 : nFields - 1 - i] do
       let j := nFields - 1 - revAfter
       let jLit := Syntax.mkNumLit (toString (j + 1))
-      gtPf ← `(term| Proto.allTagsGt_encodeAppend (by decide : $kLit < $jLit) $(reads[j]!) $gtPf)
+      let diffPredLit := Syntax.mkNumLit (toString (j - i - 1))
+      gtPf ← `(term| Proto.allTagsGt_encodeAppend (Nat.lt_of_sub_eq_succ (rfl : $jLit - $kLit = Nat.succ $diffPredLit)) $(reads[j]!) $gtPf)
     let mut rawEq ← `(term| Proto.decodeProtoField_hit $kLit $(reads[i]!) $(tails[i + 1]!) $gtPf)
     for revBefore in [0:i] do
       let j := i - 1 - revBefore
       let jLit := Syntax.mkNumLit (toString (j + 1))
-      rawEq ← `(term| Eq.trans (Proto.decodeProtoField_skip (α := $valTy) (by decide : $jLit ≠ $kLit) $(reads[j]!) $(tails[j + 1]!)) $rawEq)
+      let diffPredLit := Syntax.mkNumLit (toString (i - j - 1))
+      rawEq ← `(term| Eq.trans (Proto.decodeProtoField_skip (α := $valTy) (Nat.ne_of_lt (Nat.lt_of_sub_eq_succ (rfl : $kLit - $jLit = Nat.succ $diffPredLit))) $(reads[j]!) $(tails[j + 1]!)) $rawEq)
     let fullEq ← wrapFieldEq i body rawEq
     let hId := mkIdent (Name.mkSimple s!"_hp{i}")
     pIdents := pIdents.push hId
@@ -334,6 +362,7 @@ private def mkDraftProtoCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
     CommandElabM (Array (TSyntax `command)) := do
   let toId   := mkIdent (tId ++ `Draft ++ `toProtoFields)
   let fromId := mkIdent (tId ++ `Draft ++ `fromProtoFields)
+  let fromProtoThmId := mkIdent (tId ++ `Draft ++ `_fromProto_toProto)
   let reads ← fs.mapM fun f => `(term| x.$f:ident)
   let decodes ← (List.range fs.size).toArray.mapM fun i => do
     let kLit := Syntax.mkNumLit (toString (i + 1))
@@ -347,11 +376,12 @@ private def mkDraftProtoCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
           return { $[$fs:ident],* }),
     ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instToProto)):ident : ToProto $draftId := .ofFields $toId),
     ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instFromProto)):ident : FromProto $draftId := .ofFields $fromId),
+    ← `(command| private theorem $fromProtoThmId (x : $draftId) : $fromId ($toId x) = Except.ok x := by
+          $[$pHaveTacs:tactic]*
+          unfold $fromId $toId
+          simp only [$[$pIdents:term],*, bind, Except.bind, pure, Except.pure]),
     ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instLawfulProto)):ident : LawfulProto $draftId :=
-          .ofFields $toId $fromId (fun x => $tagsPosPf) fun x => by
-            $[$pHaveTacs:tactic]*
-            unfold $fromId $toId
-            simp only [$[$pIdents:term],*, bind, Except.bind, pure, Except.pure]) ]
+          .ofFields $toId $fromId (fun x => $tagsPosPf) $fromProtoThmId) ]
 
 open Lean Elab Command Term in
 private def mkSchemaProtoCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
@@ -394,19 +424,22 @@ private def mkSchemaProtoCmds (t : Ident) (cbns : Array Ident) (cbts : Array Ter
     ← `(command| instance $(mkIdent (tId ++ `instToProto)):ident : ToProto $t := .ofFields $toId),
     ← `(command| instance $(mkIdent (tId ++ `instFromProto)):ident : FromProto $t := .ofFields $fromId) ]
   if !allLawfulProto then return baseCmds ++ instBase
+  let fromProtoThmId := mkIdent (tId ++ `_fromProto_toProto)
   let lawCmds : Array (TSyntax `command) := #[
+    ← `(command| private theorem $fromProtoThmId (x : $t) : $fromId ($toId x) = Except.ok x := by
+          $[$pHaveTacs:tactic]*
+          unfold $fromId $toId
+          simp only [$[$pIdents:term],*, bind, Except.bind, pure, Except.pure]),
     ← `(command| instance $(mkIdent (tId ++ `instLawfulProto)):ident : LawfulProto $t :=
-          .ofFields $toId $fromId (fun x => $tagsPosPf) fun x => by
-            $[$pHaveTacs:tactic]*
-            unfold $fromId $toId
-            simp only [$[$pIdents:term],*, bind, Except.bind, pure, Except.pure]) ]
+          .ofFields $toId $fromId (fun x => $tagsPosPf) $fromProtoThmId) ]
   return baseCmds ++ instBase ++ lawCmds
 
 open Lean Elab Command Term in
 private def checkSchemaFieldsDecidable (cbns : Array Ident) (cbts : Array Term)
-    (pairs : Array (Ident × Term)) : CommandElabM Unit := do
+    (pairs : Array (Ident × Term)) (refined : Array Bool) : CommandElabM Unit := do
   -- Lean logs failed instance synthesis to `messages` rather than throwing; probe in isolation to catch missing `DecidablePred` cleanly.
-  for (f, inp) in pairs do
+  for ((f, inp), r) in pairs.zip refined do
+    unless r do continue
     let before := (← get).messages
     try liftTermElabM (elabPredProbe cbns cbts inp 0) catch _ => pure ()
     let probeMsgs := (← get).messages.toList.drop before.toList.length
@@ -423,10 +456,11 @@ private def checkSchemaFieldsDecidable (cbns : Array Ident) (cbts : Array Term)
 
 open Lean Elab Command Term in
 private def mkDraftCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
-    CommandElabM (Array (TSyntax `command)) := do
-  let emptyId       := mkIdent (tId ++ `Draft ++ `empty)
-  let draftToJsonId := mkIdent (tId ++ `Draft ++ `toJson)
-  let draftFromId   := mkIdent (tId ++ `Draft ++ `fromJson)
+    CommandElabM (TSyntax `command × Array (TSyntax `command)) := do
+  let emptyId        := mkIdent (tId ++ `Draft ++ `empty)
+  let draftToJsonId  := mkIdent (tId ++ `Draft ++ `toJson)
+  let draftFromId    := mkIdent (tId ++ `Draft ++ `fromJson)
+  let draftFromThmId := mkIdent (tId ++ `Draft ++ `_fromJson_toJson)
   let emptyVals ← fs.mapM fun _ => `(term| "")
   let draftJsonPairs ← fs.mapM fun f =>
     let keyLit := Syntax.mkStrLit (toString f.getId); `(($keyLit, toJson (x.$f:ident)))
@@ -438,10 +472,10 @@ private def mkDraftCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
     `(term| LawfulJson.fromField_of_field ($draftToJsonId x) $keyLit (x.$f:ident) rfl)
   let draftDepthProof ← fs.foldrM (init := ← `(term| Nat.le_refl 0)) fun f acc =>
     `(term| Codec.max_le_max (LawfulJson.depth_toJson (x.$f:ident)) $acc)
-  pure #[
-    ← `(command| structure $draftId where
+  let structCmd ← `(command| structure $draftId where
           $[$fs:ident : String := ""]*
-        deriving Inhabited, DecidableEq, Repr),
+        deriving Inhabited, DecidableEq, Repr)
+  let restCmds : Array (TSyntax `command) := #[
     ← `(command| def $emptyId : $draftId := { $[$fs:ident := $emptyVals],* }),
     ← `(command| def $draftToJsonId (x : $draftId) : Json := Json.obj [$[$draftJsonPairs],*]),
     ← `(command| def $draftFromId (j : Json) : Except String $draftId := do
@@ -450,20 +484,21 @@ private def mkDraftCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
     ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instToJson)):ident : ToJson $draftId := ⟨$draftToJsonId⟩),
     ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instFromJson)):ident : FromJson $draftId := ⟨$draftFromId⟩),
     ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instNonNullJson)):ident : NonNullJson $draftId := ⟨fun _ => nofun⟩),
+    ← `(command| private theorem $draftFromThmId (x : $draftId) :
+          $draftFromId ($draftToJsonId x) = .ok x := by
+          unfold $draftFromId
+          simp only [$[$draftFieldEqs:term],*, bind, Except.bind, pure, Except.pure]),
     ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instLawfulJson)):ident : LawfulJson $draftId where
           depthBound := 1
           depth_toJson x := Nat.add_le_add_left $draftDepthProof 1
-          fromJson_toJson x := by
-            have h : $draftFromId ($draftToJsonId x) = .ok x := by
-              unfold $draftFromId
-              simp only [$[$draftFieldEqs:term],*, bind, Except.bind, pure, Except.pure]
-            exact h) ]
+          fromJson_toJson := $draftFromThmId) ]
+  pure (structCmd, restCmds)
 
 open Lean Elab Command Term in
 private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
     (tApp beqApp parseApp canApp viewApp : TSyntax `term) (draftId : Ident)
     (fs : Array Ident) (inputs : Array Term) (refined : Array Bool) (allLawfulBEq : Bool) :
-    CommandElabM (Array (TSyntax `command)) := do
+    CommandElabM (TSyntax `command × Array (TSyntax `command)) := do
   let tId         := t.getId
   let parseId     := mkIdent (tId ++ `parse)
   let canId       := mkIdent (tId ++ `canSubmit)
@@ -483,41 +518,49 @@ private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
   let casesTac ← runCalls.foldrM (init := ← `(tactic|
     simp only [Option.isSome_some, Option.isSome_none, Bool.false_eq_true,
       and_true, true_and, and_false, false_and, iff_self, bind, Option.bind, pure, Pure.pure]))
-    fun rc acc => `(tactic| cases $rc:term <;> $acc)
+    fun rc acc => `(tactic|
+      cases $rc:term with
+      | none => simp only [Option.isSome_none, Bool.false_eq_true, false_and, and_false, iff_self, bind, Option.bind]
+      | some _ => ($acc:tactic))
   let rowGroups ← (pairs.zip runCalls).mapM fun ((f, inp), rc) => do
     let nameLit := Syntax.mkStrLit (toString f.getId)
     let errLit  := Syntax.mkStrLit ("Please enter a valid " ++ toString f.getId)
     `(term| Codec.formFieldRow ($inp).inForm ($inp).wrapLabel
               (d.$f:ident != "" && ($rc).isNone) $nameLit $errLit
               (($inp).render (d.$f:ident) (fun v => onEdit { d with $f:ident := v })))
-  let submitBtn ← `(term|
-    match ($parseApp d) with
-    | some _qedParsed => el "button" [onClick (submit _qedParsed)] "Submit"
-    | none            => el "button" [disabled true] "Submit")
-  let viewBody ← rowGroups.foldrM (init := ← `(term| [$submitBtn])) fun g acc => `(term| $g ++ $acc)
+  let viewBody ← rowGroups.foldrM (init := ← `(term| [Codec.submitBtn ($parseApp d) submit])) fun g acc => `(term| $g ++ $acc)
+  let validBodyPf ← inputs.foldrM (init := ← `(term| Codec.submitBtn_validIn inForm ($parseApp d) submit))
+    fun inp acc => `(term| Codec.formRowCons_validIn inForm _ _ _ _ _ _ _ (($inp).render_valid inForm _ _) $acc)
   let beqExpr ← match fs.toList with
     | []      => `(true)
     | f :: rest =>
         rest.foldlM (init := ← `(a.$f:ident == b.$f:ident)) fun acc fi => `($acc && (a.$fi:ident == b.$fi:ident))
+  let beqEqThmId := mkIdent (tId ++ `_eq_of_beq)
+  let beqRflThmId := mkIdent (tId ++ `_beq_rfl)
   let lawfulBeqCmds : Array (TSyntax `command) ←
     if allLawfulBEq then
-      pure #[← `(command|
-        instance $(mkIdent (tId ++ `instLawfulBEq)):ident $[($cbns:ident : $cbts:term)]* : LawfulBEq $tApp where
-          eq_of_beq {a b} h := by
+      pure #[
+        ← `(command|
+          private theorem $beqEqThmId $[($cbns:ident : $cbts:term)]* {a b : $tApp}
+              (h : $beqApp a b = true) : a = b := by
             cases a; cases b
-            change $beqApp _ _ = true at h
             dsimp only [$beqFnId:ident] at h
             simp only [Bool.and_eq_true, beq_iff_eq] at h
-            simp_all
-          rfl {a} := by
+            simp_all only),
+        ← `(command|
+          private theorem $beqRflThmId $[($cbns:ident : $cbts:term)]* {a : $tApp} :
+              $beqApp a a = true := by
             cases a
-            change $beqApp _ _ = true
             dsimp only [$beqFnId:ident]
-            simp only [beq_self_eq_true, Bool.and_self])]
+            simp only [beq_self_eq_true, Bool.and_self]),
+        ← `(command|
+          instance $(mkIdent (tId ++ `instLawfulBEq)):ident $[($cbns:ident : $cbts:term)]* : LawfulBEq $tApp where
+            eq_of_beq := $beqEqThmId
+            rfl := $beqRflThmId)]
     else pure #[]
-  pure (#[
-    ← `(command| structure $t $[($cbns:ident : $cbts:term)]* where
-          $[$fs:ident : $structTys]*),
+  let structCmd ← `(command| structure $t $[($cbns:ident : $cbts:term)]* where
+          $[$fs:ident : $structTys]*)
+  let restCmds : Array (TSyntax `command) := #[
     ← `(command| def $beqFnId $[($cbns:ident : $cbts:term)]* (a b : $tApp) : Bool := $beqExpr),
     ← `(command| instance $(mkIdent (tId ++ `instBEq)):ident $[($cbns:ident : $cbts:term)]* : BEq $tApp :=
           ⟨$beqApp⟩)] ++ lawfulBeqCmds ++ #[
@@ -533,19 +576,9 @@ private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
           el "div" [cls "qed-form"] $viewBody),
     ← `(command| @[simp] theorem $formValidId {msg : Type} $[($cbns:ident : $cbts:term)]*
           (inForm : Bool) (d : $draftId) (onEdit : $draftId → msg) (submit : $tApp → msg) :
-          Html.validIn ⟨.normal, false, false, inForm⟩ ($viewApp d onEdit submit) = true := by
-          unfold $viewId
-          cases _hp : ($parseApp d) <;> cases inForm <;> dsimp only <;>
-            simp only [el, cls, disabled, onClick, Html.validIn, Html.validListIn,
-              Attr.valid, Attr.validKeyValue, Attr.valid_cls, Attr.valid_flag, Attr.valid_on,
-              Attr.validList_cons, Attr.validList_nil, Attr.validList_append,
-              Attr.isLocalCell_cls, Attr.isLocalCell_flag, Attr.isLocalCell_on,
-              Attr.hasLocalCell_cons, Attr.hasLocalCell_nil, Attr.hasLocalCell_append,
-              Html.validListIn_append, Html.validListIn_cons, Html.validListIn_nil,
-              Codec.formFieldRow_validListIn, Codec.render_valid_simp, validTextIn_normal,
-              Qed.reduceStepHtmlCtx, Qed.reduceIsVoidTag, Qed.reduceIsSafeAttrName, Qed.reduceIsUrlAttrName,
-              Bool.true_and, Bool.and_true, Bool.true_or, Bool.or_true, Bool.false_or, Bool.or_false, Bool.not_false,
-              List.isEmpty_cons, List.isEmpty_nil]) ])
+          Html.validIn ⟨.normal, false, false, inForm⟩ ($viewApp d onEdit submit) = true :=
+          Codec.formDiv_validIn inForm _ $validBodyPf) ]
+  pure (structCmd, restCmds)
 
 open Lean Elab Command Term in
 private def mkSchemaJsonCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
@@ -584,16 +617,18 @@ private def mkSchemaJsonCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
     let keyLit := Syntax.mkStrLit (toString f.getId)
     if r then `(term| Codec.fromJsonField_of_field $inp ($toJsonId x) $keyLit (x.$f) rfl)
     else `(term| LawfulJson.fromField_of_field ($toJsonId x) $keyLit (x.$f) rfl)
+  let fromJsonThmId := mkIdent (tId ++ `_fromJson_toJson)
   let lawfulCmds : Array (TSyntax `command) ← if allLawful then
-    pure #[← `(command|
-      instance $(mkIdent (tId ++ `instLawfulJson)):ident : LawfulJson $t where
-        depthBound := 1 + $depthBoundExpr
-        depth_toJson x := Nat.add_le_add_left $depthProofExpr 1
-        fromJson_toJson x := by
-          have h : $fromJsonId ($toJsonId x) = .ok x := by
-            unfold $fromJsonId
-            simp only [$[$fieldEqs:term],*, bind, Except.bind, pure, Except.pure]
-          exact h)]
+    pure #[
+      ← `(command|
+        private theorem $fromJsonThmId (x : $t) : $fromJsonId ($toJsonId x) = .ok x := by
+          unfold $fromJsonId
+          simp only [$[$fieldEqs:term],*, bind, Except.bind, pure, Except.pure]),
+      ← `(command|
+        instance $(mkIdent (tId ++ `instLawfulJson)):ident : LawfulJson $t where
+          depthBound := 1 + $depthBoundExpr
+          depth_toJson x := Nat.add_le_add_left $depthProofExpr 1
+          fromJson_toJson := $fromJsonThmId)]
   else pure #[]
   let jsonInstCmds : Array (TSyntax `command) := #[
     ← `(command| instance $(mkIdent (tId ++ `instToJson)):ident : ToJson $t := ⟨$toJsonId⟩),
@@ -626,7 +661,7 @@ open Lean Elab Command Term in
       let (inputs, refined, allLawful, allProto, allLawfulProto, allLawfulBEq) ←
         resolveSchemaFields cbns cbts fs rawSpecs whereClauses
       let pairs := fs.zip inputs
-      checkSchemaFieldsDecidable cbns cbts pairs
+      checkSchemaFieldsDecidable cbns cbts pairs refined
       let cbnsT : Array (TSyntax `term) := cbns.map fun c => ⟨c.raw⟩
       let appTo : TSyntax `term → CommandElabM (TSyntax `term) := fun head =>
         cbnsT.foldlM (init := head) fun acc c => `($acc $c)
@@ -639,12 +674,13 @@ open Lean Elab Command Term in
       let fromJsonApp ← appTo ⟨fromJsonId.raw⟩
       let jsonReads ← (pairs.zip refined).mapM fun ((f, _), r) =>
         if r then `((x.$f:ident).val) else `(x.$f:ident)
-      let draftCmds ← mkDraftCmds tId draftId fs
-      let coreCmds ← mkSchemaCoreCmds t cbns cbts tApp beqApp parseApp canApp viewApp draftId fs inputs refined allLawfulBEq
+      let (draftStructCmd, draftCmds) ← mkDraftCmds tId draftId fs
+      let (coreStructCmd, coreCmds) ← mkSchemaCoreCmds t cbns cbts tApp beqApp parseApp canApp viewApp draftId fs inputs refined allLawfulBEq
       let jsonCmds ← mkSchemaJsonCmds t cbns cbts tApp toJsonApp fromJsonApp fs inputs refined jsonReads allLawful
       let draftProtoCmds ← mkDraftProtoCmds tId draftId fs
       let protoCmds ← mkSchemaProtoCmds t cbns cbts tApp appTo fs inputs refined jsonReads allProto allLawfulProto
-      for c in draftCmds ++ coreCmds ++ jsonCmds ++ draftProtoCmds ++ protoCmds do elabCommand c
+      for c in #[draftStructCmd, coreStructCmd] ++ draftCmds ++ coreCmds ++ jsonCmds ++ draftProtoCmds ++ protoCmds do
+        elabCommand c
       let ns ← getCurrNamespace
       let fullSchema := ns ++ tId
       let info : SchemaFormInfo := {

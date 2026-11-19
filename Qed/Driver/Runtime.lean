@@ -21,6 +21,41 @@ structure WsExtHandlers (msg : Type) where
   onBytes   : ByteArray → msg
   onStatus  : SocketStatus → msg
 
+private structure WsMuxSubEntry (msg : Type) where
+  subId        : UInt32
+  channel      : String
+  params       : ByteArray
+  reconnect    : Reconnect
+  attempt      : Nat := 0
+  pendingRetry : Bool := false
+  nextAtMs     : Nat := 0
+  handlers     : WsMuxHandlers msg
+
+private structure WsMuxPool (msg : Type) where
+  url      : String
+  connId   : Option UInt32 := none
+  isOpen   : Bool := false
+  timerKey : String
+  timerId  : Option Nat := none
+  subs     : Std.HashMap UInt32 (WsMuxSubEntry msg) := ∅
+
+private structure WsExtConnEntry (msg : Type) where
+  subId     : UInt32
+  url       : String
+  isBinary  : Bool
+  reconnect : Reconnect
+  attempt   : Nat := 0
+  connId    : Option UInt32 := none
+  isOpen    : Bool := false
+  closed    : Bool := false
+  timerKey  : String
+  timerId   : Option Nat := none
+  handlers  : WsExtHandlers msg
+
+private inductive WsConnOwner where
+  | mux (url : String)
+  | ext (subId : UInt32)
+
 structure Runtime where
   mount            : IO Unit
   dispatch         : UInt32 → IO Unit
@@ -36,10 +71,10 @@ structure Runtime where
   restore          : String → IO Unit
   effectDone       : UInt32 → String → IO Unit
   portRecv         : String → String → IO Unit
-  wsJoin           : UInt32 → ByteArray → IO Unit
-  wsMsgBytes       : UInt32 → ByteArray → IO Unit
-  wsMsgText        : UInt32 → String → IO Unit
-  wsStatus         : UInt32 → UInt32 → UInt32 → String → IO Unit
+  wsOpen           : UInt32 → IO Unit
+  wsBytes          : UInt32 → ByteArray → IO Unit
+  wsText           : UInt32 → String → IO Unit
+  wsClose          : UInt32 → String → Nat → IO Unit
 
 initialize runtimeRef : IO.Ref (Option Runtime) ← IO.mkRef none
 
@@ -127,37 +162,51 @@ def qedPortRecv (name payload : String) : IO Unit := do
   | some rt => rt.portRecv name payload
   | none    => pure ()
 
-@[export qed_ws_join]
-def qedWsJoin (subId : UInt32) (bytes : ByteArray) : IO Unit := do
+@[export qed_ws_open]
+def qedWsOpen (connId : UInt32) : IO Unit := do
   match ← runtimeRef.get with
-  | some rt => rt.wsJoin subId bytes
+  | some rt => rt.wsOpen connId
   | none    => pure ()
 
-@[export qed_ws_msg_bytes]
-def qedWsMsgBytes (subId : UInt32) (bytes : ByteArray) : IO Unit := do
+@[export qed_ws_bytes]
+def qedWsBytes (connId : UInt32) (bytes : ByteArray) : IO Unit := do
   match ← runtimeRef.get with
-  | some rt => rt.wsMsgBytes subId bytes
+  | some rt => rt.wsBytes connId bytes
   | none    => pure ()
 
-@[export qed_ws_msg_text]
-def qedWsMsgText (subId : UInt32) (text : String) : IO Unit := do
+@[export qed_ws_text]
+def qedWsText (connId : UInt32) (text : String) : IO Unit := do
   match ← runtimeRef.get with
-  | some rt => rt.wsMsgText subId text
+  | some rt => rt.wsText connId text
   | none    => pure ()
 
-@[export qed_ws_status]
-def qedWsStatus (subId code arg : UInt32) (err : String) : IO Unit := do
+@[export qed_ws_close]
+def qedWsClose (connId : UInt32) (err : String) (nowMs : Nat) : IO Unit := do
   match ← runtimeRef.get with
-  | some rt => rt.wsStatus subId code arg err
+  | some rt => rt.wsClose connId err nowMs
   | none    => pure ()
 
-private def decodeWsStatus (code arg : UInt32) (err : String) : SocketStatus :=
-  match code with
-  | 0 => .disconnected
-  | 1 => .connecting
-  | 2 => .connected
-  | 3 => .reconnecting arg.toNat
-  | _ => .failed err
+private def trimAsciiWs (s : String) : String :=
+  String.ofList (((s.toList.dropWhile Char.isWhitespace).reverse.dropWhile Char.isWhitespace).reverse)
+
+/-- Parses complete `\n`-terminated SSE `data:` lines out of `buf`, returning `(events, remainder)`. -/
+private def parseSseBuffer (buf : String) : Array String × String :=
+  let rec go (acc : Array String) : List String → Array String × String
+    | []      => (acc, "")
+    | [rem]   => (acc, rem)
+    | l :: ls =>
+        let t := trimAsciiWs l
+        let acc' :=
+          if t.startsWith "data:" then
+            let p := trimAsciiWs (String.ofList (t.toList.drop 5))
+            if !p.isEmpty && p != "[DONE]" then acc.push p else acc
+          else acc
+        go acc' ls
+  go #[] (buf.splitOn "\n")
+
+private def wsClosedStatus : Reconnect → SocketStatus
+  | .off => .disconnected
+  | _    => .failed "disconnected"
 
 private def drainPendingQueue {Msg : Type} (pendingRef : IO.Ref (Array Msg))
     (step : Msg → IO Unit) : Nat → IO Unit
@@ -179,37 +228,79 @@ def run (app : App Model Msg) : IO Unit := do
   let clickRef  ← IO.mkRef (#[] : Array Msg)
   let inputRef  ← IO.mkRef (#[] : Array (String → Msg))
   let chunkCbRef  ← IO.mkRef (#[] : Array (String → Msg))
-  let doneCbRef   ← IO.mkRef (#[] : Array Msg)
+  let streamBufRef ← IO.mkRef (∅ : Std.HashMap Nat String)
+  let doneCbRef   ← IO.mkRef (#[] : Array (Nat × Msg))
   let respCbRef      ← IO.mkRef (∅ : Std.HashMap Nat (Except String String → Msg))
   let respBytesCbRef ← IO.mkRef (∅ : Std.HashMap Nat (Except String ByteArray → Msg))
   let effectCbRef    ← IO.mkRef (∅ : Std.HashMap Nat (String → Msg))
+  let wsTimerCbRef   ← IO.mkRef (∅ : Std.HashMap Nat (IO Unit))
   let cbNextRef   ← IO.mkRef (0 : Nat)
   let socketCbRef ← IO.mkRef (∅ : Std.HashMap String (SocketHandlers Msg))
-  let wsNextIdRef ← IO.mkRef (1 : UInt32)
-  let wsBootedRef ← IO.mkRef false
-  let wsMuxSlotRef ← IO.mkRef (∅ : Std.HashMap String UInt32)
-  let wsExtSlotRef ← IO.mkRef (∅ : Std.HashMap String UInt32)
-  let wsMuxCbRef   ← IO.mkRef (∅ : Std.HashMap UInt32 (WsMuxHandlers Msg))
-  let wsExtCbRef   ← IO.mkRef (∅ : Std.HashMap UInt32 (WsExtHandlers Msg))
-  let nextSubId : IO UInt32 := do
+  let wsNextIdRef    ← IO.mkRef (1 : UInt32)
+  let wsBootedRef    ← IO.mkRef false
+  let wsConnOwnerRef ← IO.mkRef (∅ : Std.HashMap UInt32 WsConnOwner)
+  let wsMuxSlotRef   ← IO.mkRef (∅ : Std.HashMap String UInt32)
+  let wsMuxSubUrlRef ← IO.mkRef (∅ : Std.HashMap UInt32 String)
+  let wsMuxPoolsRef  ← IO.mkRef (∅ : Std.HashMap String (WsMuxPool Msg))
+  let wsExtSlotRef   ← IO.mkRef (∅ : Std.HashMap String UInt32)
+  let wsExtEntriesRef ← IO.mkRef (∅ : Std.HashMap UInt32 (WsExtConnEntry Msg))
+  let nextWsId : IO UInt32 := do
     let n ← wsNextIdRef.get
     let nxt := if n + 1 == 0 then 1 else n + 1
     wsNextIdRef.set nxt
     return n
-  let closeWsSlot {H : Type} (slotRef : IO.Ref (Std.HashMap String UInt32))
-      (cbRef : IO.Ref (Std.HashMap UInt32 H)) (closeFn : UInt32 → IO Unit) (slot : String) : IO Unit := do
-    if let some oldId := (← slotRef.get)[slot]? then
-      slotRef.modify (·.erase slot)
-      cbRef.modify (·.erase oldId)
-      closeFn oldId
-  let openWsSlot {H : Type} (slotRef : IO.Ref (Std.HashMap String UInt32))
-      (cbRef : IO.Ref (Std.HashMap UInt32 H)) (closeFn : UInt32 → IO Unit)
-      (slot : String) (cb : H) : IO UInt32 := do
-    closeWsSlot slotRef cbRef closeFn slot
-    let sid ← nextSubId
-    slotRef.modify (·.insert slot sid)
-    cbRef.modify (·.insert sid cb)
-    return sid
+  let cancelWsTimer (key : String) (tid? : Option Nat) : IO Unit := do
+    if let some tid := tid? then wsTimerCbRef.modify (·.erase tid)
+    Dom.effect "timer.cancel" key "" ""
+  let scheduleWsTimer (key : String) (oldTid? : Option Nat) (delayMs : Nat) (act : IO Unit) : IO Nat := do
+    if let some oldTid := oldTid? then wsTimerCbRef.modify (·.erase oldTid)
+    let tid ← cbNextRef.modifyGet (fun n => (n, n + 1))
+    wsTimerCbRef.modify (·.insert tid act)
+    Dom.effectResult "timer.afterKeyed" key (toString delayMs) (UInt32.ofNat tid)
+    return tid
+  let ensureMuxConn (url : String) : IO Unit := do
+    let some pool := (← wsMuxPoolsRef.get)[url]? | return
+    if pool.subs.isEmpty || pool.connId.isSome then return
+    cancelWsTimer pool.timerKey pool.timerId
+    let cid ← nextWsId
+    wsMuxPoolsRef.modify (·.insert url { pool with connId := some cid, isOpen := false, timerId := none })
+    wsConnOwnerRef.modify (·.insert cid (.mux url))
+    Dom.wsOpen cid url true
+  let openExtConn (subId : UInt32) : IO Unit := do
+    let some entry := (← wsExtEntriesRef.get)[subId]? | return
+    if entry.closed || entry.connId.isSome then return
+    cancelWsTimer entry.timerKey entry.timerId
+    let cid ← nextWsId
+    wsExtEntriesRef.modify (·.insert subId { entry with connId := some cid, isOpen := false, timerId := none })
+    wsConnOwnerRef.modify (·.insert cid (.ext subId))
+    Dom.wsOpen cid entry.url entry.isBinary
+  let closeMuxSlot (slot : String) : IO Unit := do
+    let some sid := (← wsMuxSlotRef.get)[slot]? | return
+    wsMuxSlotRef.modify (·.erase slot)
+    let some url := (← wsMuxSubUrlRef.get)[sid]? | return
+    wsMuxSubUrlRef.modify (·.erase sid)
+    let some pool := (← wsMuxPoolsRef.get)[url]? | return
+    let subs' := pool.subs.erase sid
+    if pool.isOpen then
+      if let some cid := pool.connId then
+        Dom.wsSendBytes cid (WsMuxFrame.encode (.unsub sid))
+    if subs'.isEmpty then
+      cancelWsTimer pool.timerKey pool.timerId
+      wsMuxPoolsRef.modify (·.erase url)
+      if let some cid := pool.connId then
+        wsConnOwnerRef.modify (·.erase cid)
+        Dom.wsClose cid
+    else
+      wsMuxPoolsRef.modify (·.insert url { pool with subs := subs' })
+  let closeExtSlot (slot : String) : IO Unit := do
+    let some sid := (← wsExtSlotRef.get)[slot]? | return
+    wsExtSlotRef.modify (·.erase slot)
+    let some entry := (← wsExtEntriesRef.get)[sid]? | return
+    wsExtEntriesRef.modify (·.erase sid)
+    cancelWsTimer entry.timerKey entry.timerId
+    if let some cid := entry.connId then
+      wsConnOwnerRef.modify (·.erase cid)
+      Dom.wsClose cid
   let dispatchRef ← IO.mkRef (fun (_ : Msg) => (pure () : IO Unit))
   let registry : Std.HashMap String LocalDef :=
     app.locals.foldl (fun m d => m.insert d.id d) ∅
@@ -243,7 +334,7 @@ def run (app : App Model Msg) : IO Unit := do
     | .none => pure ()
     | .stream url body onChunk onDone => do
         let cs ← chunkCbRef.get; chunkCbRef.set (cs.push onChunk)
-        let ds ← doneCbRef.get;  doneCbRef.set (ds.push onDone)
+        let ds ← doneCbRef.get;  doneCbRef.set (ds.push (cs.size, onDone))
         Dom.fetchStream url body (UInt32.ofNat cs.size) (UInt32.ofNat ds.size)
     | .now onNow => do
         match Qed.Date.parse? (← Dom.today) with
@@ -268,24 +359,58 @@ def run (app : App Model Msg) : IO Unit := do
         Dom.effect "ws.open" key url ""
     | .wsMuxSub slot url channel params rec onJoin onMessage onStatus => do
         if !(← wsBootedRef.get) then return
-        let sid ← openWsSlot wsMuxSlotRef wsMuxCbRef Dom.wsMuxUnsub slot { onJoin, onMessage, onStatus }
-        let (rm, ri, rmax, rlim) := rec.toFfi
-        Dom.wsMuxSub sid url channel params rm ri rmax rlim
+        closeMuxSlot slot
+        let sid ← nextWsId
+        wsMuxSlotRef.modify (·.insert slot sid)
+        wsMuxSubUrlRef.modify (·.insert sid url)
+        let pool := match (← wsMuxPoolsRef.get)[url]? with
+          | some p => p
+          | none   => { url, timerKey := "ws-mux:" ++ url }
+        let sub : WsMuxSubEntry Msg := {
+          subId := sid, channel, params, reconnect := rec, handlers := { onJoin, onMessage, onStatus }
+        }
+        wsMuxPoolsRef.modify (·.insert url { pool with subs := pool.subs.insert sid sub })
+        (← dispatchRef.get) (onStatus .connecting)
+        if let some pool' := (← wsMuxPoolsRef.get)[url]? then
+          if pool'.subs.contains sid then
+            if pool'.isOpen then
+              if let some cid := pool'.connId then
+                Dom.wsSendBytes cid (WsMuxFrame.encode (.sub sid channel params))
+            else if pool'.connId.isNone then
+              ensureMuxConn url
     | .wsMuxSend slot payload => do
-        if let some sid := (← wsMuxSlotRef.get)[slot]? then Dom.wsMuxSend sid payload
+        let some sid := (← wsMuxSlotRef.get)[slot]? | return
+        let some url := (← wsMuxSubUrlRef.get)[sid]? | return
+        let some pool := (← wsMuxPoolsRef.get)[url]? | return
+        if pool.isOpen then
+          if let some cid := pool.connId then
+            Dom.wsSendBytes cid (WsMuxFrame.encode (.send sid payload))
     | .wsMuxUnsub slot => do
-        if (← wsBootedRef.get) then closeWsSlot wsMuxSlotRef wsMuxCbRef Dom.wsMuxUnsub slot
+        if (← wsBootedRef.get) then closeMuxSlot slot
     | .wsExtOpen slot url isBinary rec onJoin onText onBytes onStatus => do
         if !(← wsBootedRef.get) then return
-        let sid ← openWsSlot wsExtSlotRef wsExtCbRef Dom.wsExtClose slot { onJoin, onText, onBytes, onStatus }
-        let (rm, ri, rmax, rlim) := rec.toFfi
-        Dom.wsExtOpen sid url isBinary rm ri rmax rlim
+        closeExtSlot slot
+        let sid ← nextWsId
+        wsExtSlotRef.modify (·.insert slot sid)
+        let entry : WsExtConnEntry Msg := {
+          subId := sid, url, isBinary, reconnect := rec, timerKey := s!"ws-ext:{sid}",
+          handlers := { onJoin, onText, onBytes, onStatus }
+        }
+        wsExtEntriesRef.modify (·.insert sid entry)
+        (← dispatchRef.get) (onStatus .connecting)
+        openExtConn sid
     | .wsExtSendText slot text => do
-        if let some sid := (← wsExtSlotRef.get)[slot]? then Dom.wsExtSendText sid text
+        let some sid := (← wsExtSlotRef.get)[slot]? | return
+        let some entry := (← wsExtEntriesRef.get)[sid]? | return
+        if entry.isOpen then
+          if let some cid := entry.connId then Dom.wsSendText cid text
     | .wsExtSendBytes slot payload => do
-        if let some sid := (← wsExtSlotRef.get)[slot]? then Dom.wsExtSendBytes sid payload
+        let some sid := (← wsExtSlotRef.get)[slot]? | return
+        let some entry := (← wsExtEntriesRef.get)[sid]? | return
+        if entry.isOpen then
+          if let some cid := entry.connId then Dom.wsSendBytes cid payload
     | .wsExtClose slot => do
-        if (← wsBootedRef.get) then closeWsSlot wsExtSlotRef wsExtCbRef Dom.wsExtClose slot
+        if (← wsBootedRef.get) then closeExtSlot slot
     | .fx kind a b c => Dom.effect kind a b c
     | .fxResult kind a b onResult => do
         let id ← cbNextRef.modifyGet (fun n => (n, n + 1))
@@ -322,9 +447,12 @@ def run (app : App Model Msg) : IO Unit := do
                    | none   => pure ()
     | none      => pure ()
   let effectDone : UInt32 → String → IO Unit := fun id result => do
-    match (← effectCbRef.get)[id.toNat]? with
-    | some onResult => effectCbRef.modify (·.erase id.toNat); dispatchMsg (onResult result)
-    | none          => pure ()
+    match (← wsTimerCbRef.get)[id.toNat]? with
+    | some act => wsTimerCbRef.modify (·.erase id.toNat); act
+    | none =>
+        match (← effectCbRef.get)[id.toNat]? with
+        | some onResult => effectCbRef.modify (·.erase id.toNat); dispatchMsg (onResult result)
+        | none          => pure ()
   let portRecv : String → String → IO Unit := fun name payload => do
     if name == "__ws" then
       match Json.parse payload with
@@ -383,14 +511,18 @@ def run (app : App Model Msg) : IO Unit := do
       match (← inputRef.get)[id.toNat]? with
       | some f => dispatchMsg (f s)
       | none   => pure ()
-    streamChunk := fun cid c => do
-      match (← chunkCbRef.get)[cid.toNat]? with
-      | some f => dispatchMsg (f c)
-      | none   => pure ()
+    streamChunk := fun cid rawChunk => do
+      let prev := (← streamBufRef.get).getD cid.toNat ""
+      let (events, rem) := parseSseBuffer (prev ++ rawChunk)
+      streamBufRef.modify (·.insert cid.toNat rem)
+      if let some f := (← chunkCbRef.get)[cid.toNat]? then
+        for ev in events do dispatchMsg (f ev)
     streamDone := fun did => do
       match (← doneCbRef.get)[did.toNat]? with
-      | some msg => dispatchMsg msg
-      | none     => pure ()
+      | some (cid, msg) =>
+          streamBufRef.modify (·.erase cid)
+          dispatchMsg msg
+      | none => pure ()
     httpDone := fun id ok text => do
       match (← respCbRef.get)[id.toNat]? with
       | some f => respCbRef.modify (·.erase id.toNat); dispatchMsg (f (if ok then .ok text else .error text))
@@ -415,32 +547,123 @@ def run (app : App Model Msg) : IO Unit := do
     restore  := restoreLocals
     effectDone
     portRecv
-    wsJoin := fun sid bytes => do
-      match (← wsMuxCbRef.get)[sid]? with
-      | some cb => dispatchMsg (cb.onJoin bytes)
-      | none    =>
-          match (← wsExtCbRef.get)[sid]? with
-          | some cb => dispatchMsg (cb.onJoin ())
-          | none    => pure ()
-    wsMsgBytes := fun sid bytes => do
-      match (← wsMuxCbRef.get)[sid]? with
-      | some cb => dispatchMsg (cb.onMessage bytes)
-      | none    =>
-          match (← wsExtCbRef.get)[sid]? with
-          | some cb => dispatchMsg (cb.onBytes bytes)
-          | none    => pure ()
-    wsMsgText := fun sid text => do
-      match (← wsExtCbRef.get)[sid]? with
-      | some cb => dispatchMsg (cb.onText text)
-      | none    => pure ()
-    wsStatus := fun sid code arg err => do
-      let st := decodeWsStatus code arg err
-      match (← wsMuxCbRef.get)[sid]? with
-      | some cb => dispatchMsg (cb.onStatus st)
-      | none    =>
-          match (← wsExtCbRef.get)[sid]? with
-          | some cb => dispatchMsg (cb.onStatus st)
-          | none    => pure ()
+    wsOpen := fun cid => do
+      match (← wsConnOwnerRef.get)[cid]? with
+      | some (.mux url) =>
+          let some pool := (← wsMuxPoolsRef.get)[url]? | return
+          if pool.connId != some cid then return
+          let resetSubs := pool.subs.fold (init := (∅ : Std.HashMap UInt32 (WsMuxSubEntry Msg)))
+            fun acc sid sub => acc.insert sid { sub with attempt := 0, pendingRetry := false, nextAtMs := 0 }
+          wsMuxPoolsRef.modify (·.insert url { pool with isOpen := true, subs := resetSubs })
+          for (_, sub) in resetSubs.toList do
+            Dom.wsSendBytes cid (WsMuxFrame.encode (.sub sub.subId sub.channel sub.params))
+      | some (.ext subId) =>
+          let some entry := (← wsExtEntriesRef.get)[subId]? | return
+          if entry.closed || entry.connId != some cid then return
+          wsExtEntriesRef.modify (·.insert subId { entry with attempt := 0, isOpen := true })
+          dispatchMsg (entry.handlers.onStatus .connected)
+          dispatchMsg (entry.handlers.onJoin ())
+      | none => pure ()
+    wsBytes := fun cid bytes => do
+      match (← wsConnOwnerRef.get)[cid]? with
+      | some (.mux url) =>
+          let some pool := (← wsMuxPoolsRef.get)[url]? | return
+          if pool.connId != some cid then return
+          match WsMuxFrame.decode bytes with
+          | .ok (.joinOk sid snap) =>
+              let some sub := pool.subs[sid]? | return
+              let sub' := { sub with attempt := 0, pendingRetry := false, nextAtMs := 0 }
+              wsMuxPoolsRef.modify (·.insert url { pool with subs := pool.subs.insert sid sub' })
+              dispatchMsg (sub.handlers.onStatus .connected)
+              dispatchMsg (sub.handlers.onJoin snap)
+          | .ok (.event sid payload) =>
+              if let some sub := pool.subs[sid]? then
+                dispatchMsg (sub.handlers.onMessage payload)
+          | .ok (.err sid msg) =>
+              let some sub := pool.subs[sid]? | return
+              wsMuxSubUrlRef.modify (·.erase sid)
+              wsMuxPoolsRef.modify (·.insert url { pool with subs := pool.subs.erase sid })
+              dispatchMsg (sub.handlers.onStatus (.failed msg))
+          | .ok (.closed sid _) =>
+              let some sub := pool.subs[sid]? | return
+              wsMuxSubUrlRef.modify (·.erase sid)
+              wsMuxPoolsRef.modify (·.insert url { pool with subs := pool.subs.erase sid })
+              dispatchMsg (sub.handlers.onStatus .disconnected)
+          | _ => pure ()
+      | some (.ext subId) =>
+          let some entry := (← wsExtEntriesRef.get)[subId]? | return
+          if entry.closed || entry.connId != some cid then return
+          dispatchMsg (entry.handlers.onBytes bytes)
+      | none => pure ()
+    wsText := fun cid text => do
+      match (← wsConnOwnerRef.get)[cid]? with
+      | some (.ext subId) =>
+          let some entry := (← wsExtEntriesRef.get)[subId]? | return
+          if entry.closed || entry.connId != some cid then return
+          dispatchMsg (entry.handlers.onText text)
+      | _ => pure ()
+    wsClose := fun cid err nowMs => do
+      let owner? := (← wsConnOwnerRef.get)[cid]?
+      wsConnOwnerRef.modify (·.erase cid)
+      match owner? with
+      | some (.mux url) =>
+          let some pool := (← wsMuxPoolsRef.get)[url]? | return
+          if pool.connId != some cid then return
+          if !err.isEmpty then
+            cancelWsTimer pool.timerKey pool.timerId
+            wsMuxPoolsRef.modify (·.erase url)
+            for (sid, _) in pool.subs.toList do wsMuxSubUrlRef.modify (·.erase sid)
+            for (_, sub) in pool.subs.toList do dispatchMsg (sub.handlers.onStatus (.failed err))
+            return
+          if pool.subs.isEmpty then
+            cancelWsTimer pool.timerKey pool.timerId
+            wsMuxPoolsRef.modify (·.erase url)
+            return
+          let mut keptSubs : Std.HashMap UInt32 (WsMuxSubEntry Msg) := ∅
+          let mut statusMsgs : Array Msg := #[]
+          let mut minDelay? : Option Nat := none
+          for (sid, sub) in pool.subs.toList do
+            if sub.pendingRetry && nowMs < sub.nextAtMs then
+              let rem := sub.nextAtMs - nowMs
+              keptSubs := keptSubs.insert sid sub
+              minDelay? := some (match minDelay? with | some m => min m rem | none => rem)
+            else
+              match sub.reconnect.nextDelayMs sub.attempt with
+              | none =>
+                  wsMuxSubUrlRef.modify (·.erase sid)
+                  statusMsgs := statusMsgs.push (sub.handlers.onStatus (wsClosedStatus sub.reconnect))
+              | some d =>
+                  let sub' := { sub with attempt := sub.attempt + 1, pendingRetry := true, nextAtMs := nowMs + d }
+                  keptSubs := keptSubs.insert sid sub'
+                  minDelay? := some (match minDelay? with | some m => min m d | none => d)
+                  statusMsgs := statusMsgs.push (sub.handlers.onStatus (.reconnecting sub'.attempt))
+          if keptSubs.isEmpty then
+            cancelWsTimer pool.timerKey pool.timerId
+            wsMuxPoolsRef.modify (·.erase url)
+          else
+            let delayMs := minDelay?.getD 0
+            let tid ← scheduleWsTimer pool.timerKey pool.timerId delayMs (ensureMuxConn url)
+            wsMuxPoolsRef.modify (·.insert url { pool with connId := none, isOpen := false, timerId := some tid, subs := keptSubs })
+          for m in statusMsgs do dispatchMsg m
+      | some (.ext subId) =>
+          let some entry := (← wsExtEntriesRef.get)[subId]? | return
+          if entry.closed || entry.connId != some cid then return
+          if !err.isEmpty then
+            cancelWsTimer entry.timerKey entry.timerId
+            wsExtEntriesRef.modify (·.erase subId)
+            dispatchMsg (entry.handlers.onStatus (.failed err))
+            return
+          match entry.reconnect.nextDelayMs entry.attempt with
+          | none =>
+              cancelWsTimer entry.timerKey entry.timerId
+              wsExtEntriesRef.modify (·.erase subId)
+              dispatchMsg (entry.handlers.onStatus (wsClosedStatus entry.reconnect))
+          | some d =>
+              let attempt' := entry.attempt + 1
+              let tid ← scheduleWsTimer entry.timerKey entry.timerId d (openExtConn subId)
+              wsExtEntriesRef.modify (·.insert subId { entry with attempt := attempt', connId := none, isOpen := false, timerId := some tid })
+              dispatchMsg (entry.handlers.onStatus (.reconnecting attempt'))
+      | none => pure ()
   })
 
 end Qed

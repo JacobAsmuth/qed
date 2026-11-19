@@ -1,23 +1,18 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, copyFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { ROOT, leanEnv, withElanPath } from './harness.mjs';
 
-const root = fileURLToPath(new URL('..', import.meta.url));
-const gate = path.join(root, 'test', '.gate');
+const gate = path.join(ROOT, 'test', '.gate');
 mkdirSync(gate, { recursive: true });
-const elanBin = path.join(process.env.HOME || '', '.elan', 'bin');
-const PATH = elanBin && !(process.env.PATH || '').split(':').includes(elanBin)
-  ? `${elanBin}:${process.env.PATH || ''}` : (process.env.PATH || '');
-const run = (cmd, args, env = { ...process.env, PATH }) =>
-  execFileSync(cmd, args, { cwd: root, env, encoding: 'utf8', maxBuffer: 64 << 20 });
+const run = (cmd, args, env = withElanPath()) =>
+  execFileSync(cmd, args, { cwd: ROOT, env, encoding: 'utf8', maxBuffer: 64 << 20 });
 
-const qedjsBin = path.join(root, '.lake/build/bin/qedjs');
+const qedjsBin = path.join(ROOT, '.lake/build/bin/qedjs');
 if (process.env.QED_PREBUILT !== '1' || !existsSync(qedjsBin)) {
   run('lake', ['build', 'Tests.JsGate', 'qedjs']);
 }
-const LEAN_PATH = process.env.LEAN_PATH || run('lake', ['env', 'printenv', 'LEAN_PATH']).trim();
-const gateEnv = { ...process.env, PATH, LEAN_PATH };
+const gateEnv = leanEnv();
 
 const oraclePath = path.join(gate, 'oracle.lean');
 writeFileSync(oraclePath, 'import Tests.JsGate\ndef main : IO Unit := JsGate.emitOracle\n');
@@ -31,11 +26,24 @@ for (const line of oracleText.split('\n')) {
 const appPath = path.join(gate, 'app.mjs');
 run(qedjsBin, [appPath, 'Tests.JsGate', '--',
   'JsGate.run:run', 'JsGate.counts:counts', 'JsGate.probeCount:probeCount', 'JsGate.names:names'], gateEnv);
-copyFileSync(path.join(root, 'runtime/qed_rt.mjs'), path.join(gate, 'qed_rt.mjs'));
+copyFileSync(path.join(ROOT, 'runtime/qed_rt.mjs'), path.join(gate, 'qed_rt.mjs'));
 
 const P = await import(path.join(gate, 'app.mjs'));
 const $ = await import(path.join(gate, 'qed_rt.mjs'));
 $.assertExterns(P.__externs, $);
+for (const [label, bytes, expected] of [
+  ['valid ASCII', new TextEncoder().encode('hello'), 1],
+  ['valid UTF-8 CJK+emoji', new TextEncoder().encode('日本語😀'), 1],
+  ['invalid 0xFF 0xFE', new Uint8Array([0xff, 0xfe]), 0],
+  ['overlong 0xC0 0xAF', new Uint8Array([0xc0, 0xaf]), 0],
+  ['lone surrogate 0xED 0xA0 0x80', new Uint8Array([0xed, 0xa0, 0x80]), 0],
+  ['truncated 0xE2 0x82', new Uint8Array([0xe2, 0x82]), 0],
+]) {
+  if ($.String_validateUTF8(bytes) !== expected || $.ByteArray_validateUTF8(bytes) !== expected) {
+    console.error(`  FAIL String_validateUTF8 (${label}): got ${$.String_validateUTF8(bytes)}, want ${expected}`);
+    process.exit(1);
+  }
+}
 const names = P.names();
 let total = 0, fail = 0;
 const byProbe = {};

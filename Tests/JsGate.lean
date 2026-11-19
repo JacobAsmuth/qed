@@ -173,6 +173,35 @@ def styleP (i : Nat) : String :=
   | 1 => (css [letterSpacing (em (-(-0.015))), zIndex (-0)]).raw
   | _ => ""
 
+def wsMuxP (i : Nat) : String :=
+  let frames : Array WsMuxFrame := #[
+    .sub 1 "room" (ByteArray.mk #[0x08, 0x01]),
+    .sub 0xDEADBEEF "chat/日本語" (ByteArray.mk #[0x00, 0xFF, 0x7F]),
+    .unsub 0x80000001,
+    .send 42 ("hello".toUTF8),
+    .joinOk 7 (ByteArray.mk #[1, 2, 3]),
+    .event 0xFFFFFFFF (ByteArray.mk #[9, 8, 7]),
+    .err 9 "unauthorized",
+    .closed 10 "bye"
+  ]
+  if h : i < frames.size then
+    let f := frames[i]
+    let enc := WsMuxFrame.encode f
+    match WsMuxFrame.decode enc with
+    | .ok d => s!"{Proto.encodeHex enc}|{decide (d == f)}"
+    | .error e => s!"ERR:{e}"
+  else
+    let recPols : Array (Reconnect × Nat) := #[
+      (.off, 0),
+      (.fixed 120 (some 3), 2),
+      (.fixed 120 (some 3), 3),
+      (.backoff 80 1000 none, 0),
+      (.backoff 80 1000 none, 5)
+    ]
+    match recPols[i - frames.size]? with
+    | some (p, att) => toString (p.nextDelayMs att)
+    | none => ""
+
 def run (probe i : Nat) : String :=
   match probe with
   | 0 => renderCase i
@@ -189,6 +218,7 @@ def run (probe i : Nat) : String :=
   | 11 => keyIndexCase i
   | 12 => protoP i
   | 13 => styleP i
+  | 14 => wsMuxP i
   | _ => ""
 
 def counts (probe : Nat) : Nat :=
@@ -207,12 +237,13 @@ def counts (probe : Nat) : Nat :=
   | 11 => 6
   | 12 => 10
   | 13 => 2
+  | 14 => 13
   | _ => 0
 
-def probeCount : Nat := 14
+def probeCount : Nat := 15
 
 def names : Array String := #["render", "diff", "arith", "string", "json", "date", "array", "router", "seg",
-  "childPatch", "wideRender", "keyIndex", "proto", "style"]
+  "childPatch", "wideRender", "keyIndex", "proto", "style", "wsMux"]
 
 def jsonStr (s : String) : String :=
   "\"" ++ (s.foldl (init := "") fun acc c =>

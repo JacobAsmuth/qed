@@ -168,17 +168,6 @@ theorem nextDelayMs_backoff_le_max (initialMs maxMs : Nat) (maxRetries : Option 
         exact Nat.min_le_left _ _
       · contradiction
 
-/-- Compact FFI tuple `(mode, initialMs, maxMs, maxRetriesEnc)` where `maxRetriesEnc = 0` means
-    unlimited and `n + 1` means at most `n` retries (`mode`: 0 = off, 1 = fixed, 2 = backoff). -/
-def toFfi : Reconnect → UInt32 × UInt32 × UInt32 × UInt32
-  | .off => (0, 0, 0, 0)
-  | .fixed delayMs maxRetries =>
-      let lim := match maxRetries with | none => 0 | some n => n + 1
-      (1, UInt32.ofNat delayMs, UInt32.ofNat delayMs, UInt32.ofNat lim)
-  | .backoff initialMs maxMs maxRetries =>
-      let lim := match maxRetries with | none => 0 | some n => n + 1
-      (2, UInt32.ofNat initialMs, UInt32.ofNat maxMs, UInt32.ofNat lim)
-
 end Reconnect
 
 /-! ## Multiplexed Binary Wire Frame Codec (`WsMuxFrame`) & Round-Trip Proof -/

@@ -33,6 +33,17 @@ const dropNode = (el) => {
   }
 };
 
+const fwd = (k) => (...a) => { const w = a.pop(), g = Q(); if (g[k]) g[k](...a); return ok(PUnit, w); };
+const bindSig = (node, name, attr, w) => {
+  const g = Q(), el = g.nodes[node]; if (!el) return ok(PUnit, w);
+  g.sig.set(name, { el, attr }); const v = g.sigVals.get(name);
+  if (v !== undefined) {
+    if (attr) { if (el.getAttribute(attr) !== v) el.setAttribute(attr, v); }
+    else if (el.textContent !== v) el.textContent = v;
+  }
+  return ok(PUnit, w);
+};
+
 export const dom = {
   createElement(ns, tag, w) { const real = ns || (tag === 'svg' ? SVG_NS : ''); return ok(nodeId(real ? document.createElementNS(real, tag) : document.createElement(tag)), w); },
   // Children inherit SVG namespace inside `<svg>`, except `<foreignObject>` whose content is HTML.
@@ -79,10 +90,10 @@ export const dom = {
   setValue(node, v, w)  { const el = Q().nodes[node]; if (el && el.value !== v) el.value = v; return ok(PUnit, w); },
   setChecked(node, on, w) { const el = Q().nodes[node]; if (el) el.checked = !!on; return ok(PUnit, w); },
   today(w) { const d = new Date(), p = (n) => (n < 10 ? '0' : '') + n; return ok(`${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`, w); },
-  fetchStream(url, body, cid, did, w) { Q(); if (globalThis.__qed.fetchStream) globalThis.__qed.fetchStream(url, body, cid, did); return ok(PUnit, w); },
-  httpSend(method, url, body, id, w)      { Q(); if (globalThis.__qed.httpSend) globalThis.__qed.httpSend(method, url, body, id); return ok(PUnit, w); },
-  httpSendBytes(method, url, body, id, w) { Q(); if (globalThis.__qed.httpSendBytes) globalThis.__qed.httpSendBytes(method, url, body, id); return ok(PUnit, w); },
-  currentPath(w) { return ok(location.pathname, w); },
+  fetchStream: fwd('fetchStream'),
+  httpSend: fwd('httpSend'),
+  httpSendBytes: fwd('httpSendBytes'),
+  currentPath(w) { return ok(location.pathname + location.search, w); },
   pushPath(p, w) { history.pushState({}, '', p); return ok(PUnit, w); },
   appendChild(parent, child, w) { const N = Q().nodes, p = N[parent], c = N[child]; if (p && c) { const isFrag = c.nodeType === 11 || c.localName === '#fragment'; p.appendChild(c); if (isFrag) dropNode(c); } return ok(PUnit, w); },
   setText(node, s, w) { const el = Q().nodes[node]; if (el && el.textContent !== s) el.textContent = s; return ok(PUnit, w); },
@@ -102,26 +113,13 @@ export const dom = {
   },
   mountRoot(node, w) { const root = document.getElementById('app'), el = Q().nodes[node]; if (root && el) root.replaceChildren(el); return ok(PUnit, w); },
   isConnected(node, w) { const el = Q().nodes[node]; return ok((el && el.isConnected) ? 1 : 0, w); },
-  effect(kind, a, b, c, w)       { Q(); if (globalThis.__qed.effect) globalThis.__qed.effect(kind, a, b, c); return ok(PUnit, w); },
-  effectResult(kind, a, b, id, w){ Q(); if (globalThis.__qed.effectResult) globalThis.__qed.effectResult(kind, a, b, id); return ok(PUnit, w); },
+  effect: fwd('effect'),
+  effectResult: fwd('effectResult'),
   portSend(name, payload, w) { Q(); const p = globalThis.__qed.ports && globalThis.__qed.ports[name]; if (p) p(payload); return ok(PUnit, w); },
-  bindSignal(node, name, w) {
-    const g = Q(), el = g.nodes[node]; if (!el) return ok(PUnit, w);
-    g.sig.set(name, { el, attr: null });
-    const v = g.sigVals.get(name); if (v !== undefined && el.textContent !== v) el.textContent = v;
-    return ok(PUnit, w);
-  },
-  bindSignalAttr(node, name, attr, w) {
-    const g = Q(), el = g.nodes[node]; if (!el) return ok(PUnit, w);
-    g.sig.set(name, { el, attr }); const v = g.sigVals.get(name);
-    if (v !== undefined && el.getAttribute(attr) !== v) el.setAttribute(attr, v);
-    return ok(PUnit, w);
-  },
-  wsMuxSub(subId, url, ch, params, rm, ri, rmax, rlim, w) { Q(); if (globalThis.__qed.wsMuxSub) globalThis.__qed.wsMuxSub(subId, url, ch, params, rm, ri, rmax, rlim); return ok(PUnit, w); },
-  wsMuxSend(subId, payload, w) { Q(); if (globalThis.__qed.wsMuxSend) globalThis.__qed.wsMuxSend(subId, payload); return ok(PUnit, w); },
-  wsMuxUnsub(subId, w) { Q(); if (globalThis.__qed.wsMuxUnsub) globalThis.__qed.wsMuxUnsub(subId); return ok(PUnit, w); },
-  wsExtOpen(subId, url, isBin, rm, ri, rmax, rlim, w) { Q(); if (globalThis.__qed.wsExtOpen) globalThis.__qed.wsExtOpen(subId, url, !!isBin, rm, ri, rmax, rlim); return ok(PUnit, w); },
-  wsExtSendText(subId, text, w) { Q(); if (globalThis.__qed.wsExtSendText) globalThis.__qed.wsExtSendText(subId, text); return ok(PUnit, w); },
-  wsExtSendBytes(subId, payload, w) { Q(); if (globalThis.__qed.wsExtSendBytes) globalThis.__qed.wsExtSendBytes(subId, payload); return ok(PUnit, w); },
-  wsExtClose(subId, w) { Q(); if (globalThis.__qed.wsExtClose) globalThis.__qed.wsExtClose(subId); return ok(PUnit, w); },
+  bindSignal(node, name, w) { return bindSig(node, name, null, w); },
+  bindSignalAttr: bindSig,
+  wsOpen(connId, url, isBin, w) { const fn = Q().wsOpen; if (fn) fn(connId, url, !!isBin); return ok(PUnit, w); },
+  wsSendBytes: fwd('wsSendBytes'),
+  wsSendText: fwd('wsSendText'),
+  wsClose: fwd('wsClose'),
 };

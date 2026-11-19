@@ -12,3 +12,4 @@
 *.olean
 test/vendor/
 /test/.gate/
+/rust/qed_server/target/

@@ -4,17 +4,147 @@ open System (FilePath)
 
 namespace Qed.Cli
 
+private def isLeanIdentStart (c : Char) : Bool :=
+  c.isAlpha || c == '_'
+
+private def isLeanIdentCont (c : Char) : Bool :=
+  c.isAlphanum || c == '_' || c == '\''
+
+private def forbiddenTokens : List String :=
+  ["sorry", "admit", "native_decide", "sorryAx"]
+
+/-- Lexically scan a Lean source file for forbidden proof-bypass tokens (`sorry`, `admit`,
+    `native_decide`, `sorryAx`), skipping line/nested-block comments, char literals, and plain
+    string literals while still scanning `{...}` code expressions inside `s!"..."`, `m!"..."`,
+    and `f"..."` interpolated strings. -/
+def findForbiddenTokens (src : String) : Array (Nat × String) := Id.run do
+  let cs := src.toList.toArray
+  let n := cs.size
+  let mut i := 0
+  let mut line := 1
+  let mut inInterpStr := false
+  let mut interpBraces : Array Nat := #[]
+  let mut hits : Array (Nat × String) := #[]
+  while i < n do
+    if inInterpStr then
+      let c := cs[i]!
+      if c == '\\' then
+        if i + 1 < n then
+          if cs[i + 1]! == '\n' then line := line + 1
+          i := i + 2
+        else
+          i := i + 1
+      else if c == '"' then
+        inInterpStr := false
+        i := i + 1
+      else if c == '{' then
+        if i + 1 < n && cs[i + 1]! == '{' then
+          i := i + 2
+        else
+          interpBraces := interpBraces.push 0
+          inInterpStr := false
+          i := i + 1
+      else
+        if c == '\n' then line := line + 1
+        i := i + 1
+    else
+      let c := cs[i]!
+      if c == '\n' then
+        line := line + 1
+        i := i + 1
+      else if c == '-' && i + 1 < n && cs[i + 1]! == '-' then
+        i := i + 2
+        while i < n && cs[i]! != '\n' do
+          i := i + 1
+      else if c == '/' && i + 1 < n && cs[i + 1]! == '-' then
+        let mut depth := 1
+        i := i + 2
+        while i < n && depth > 0 do
+          let ch := cs[i]!
+          if ch == '\n' then
+            line := line + 1
+            i := i + 1
+          else if ch == '/' && i + 1 < n && cs[i + 1]! == '-' then
+            depth := depth + 1
+            i := i + 2
+          else if ch == '-' && i + 1 < n && cs[i + 1]! == '/' then
+            depth := depth - 1
+            i := i + 2
+          else
+            i := i + 1
+      else if c == '{' && !interpBraces.isEmpty then
+        let top := interpBraces.back!
+        interpBraces := interpBraces.pop.push (top + 1)
+        i := i + 1
+      else if c == '}' && !interpBraces.isEmpty then
+        let top := interpBraces.back!
+        if top == 0 then
+          interpBraces := interpBraces.pop
+          inInterpStr := true
+        else
+          interpBraces := interpBraces.pop.push (top - 1)
+        i := i + 1
+      else if c == '"' then
+        let isBangInterp :=
+          i >= 2 && cs[i - 1]! == '!' &&
+          (cs[i - 2]! == 's' || cs[i - 2]! == 'm') &&
+          (i == 2 || !isLeanIdentCont cs[i - 3]!)
+        let isFInterp :=
+          i >= 1 && cs[i - 1]! == 'f' &&
+          (i == 1 || !isLeanIdentCont cs[i - 2]!)
+        if isBangInterp || isFInterp then
+          inInterpStr := true
+          i := i + 1
+        else
+          i := i + 1
+          while i < n do
+            let ch := cs[i]!
+            if ch == '\\' then
+              if i + 1 < n then
+                if cs[i + 1]! == '\n' then line := line + 1
+                i := i + 2
+              else
+                i := i + 1
+            else if ch == '"' then
+              i := i + 1
+              break
+            else
+              if ch == '\n' then line := line + 1
+              i := i + 1
+      else if c == '\'' && (i == 0 || !isLeanIdentCont cs[i - 1]!) then
+        let mut j := i + 1
+        let mut closed := false
+        if j < n && cs[j]! == '\\' then
+          j := j + 2
+          while j < n && j < i + 10 && cs[j]! != '\n' do
+            if cs[j]! == '\'' then closed := true; j := j + 1; break
+            j := j + 1
+        else if j + 1 < n && cs[j]! != '\n' && cs[j + 1]! == '\'' then
+          closed := true
+          j := j + 2
+        i := if closed then j else i + 1
+      else if isLeanIdentStart c then
+        let start := i
+        let tokLine := line
+        i := i + 1
+        while i < n && isLeanIdentCont cs[i]! do
+          i := i + 1
+        let tok := String.ofList (cs.extract start i).toList
+        if forbiddenTokens.contains tok then
+          hits := hits.push (tokLine, tok)
+      else
+        i := i + 1
+  return hits
+
 def grepForbidden : IO Bool := do
   let all ← collect "." "lean" [".lake", ".qed", "dist", "toolchains", "node_modules", ".git", "scripts", "Cli"]
   let files := all.filter (fun p => p.fileName != some "Cli.lean")
-  let bad := ["sorry", "admit", "native_decide"]
   let mut clean := true
   for f in files do
-    for line in (← IO.FS.readFile f).splitOn "\n" do
-      let isPolicy := line.contains "never emit" || line.contains "fails to compile"
-      if !isPolicy && bad.any (line.contains ·) then
-        IO.eprintln (red s!"  forbidden tactic in {f}: {line.trimmed}")
-        clean := false
+    let hits := findForbiddenTokens (← IO.FS.readFile f)
+    for (ln, tok) in hits do
+      IO.eprintln (red s!"  forbidden token `{tok}` in {f}:{ln}")
+      clean := false
   return clean
 
 def axiomClean : IO Bool := do
@@ -83,7 +213,7 @@ def externsCovered (q? : Option QedjsEnv := none) : IO Bool := do
     match ← fullstackAppName mod with
     | some fsName =>
         mods := #[mod, "Qed.Driver"]
-        entries := #[s!"{fsName}.clientApp"] ++ driverEntries.filter (!·.startsWith "main:")
+        entries := #[s!"{fsName}.clientApp", "Qed.run"] ++ driverEntries.filter (!·.startsWith "main:")
     | none =>
         match ← ssrAppName mod with
         | some a =>
@@ -93,7 +223,7 @@ def externsCovered (q? : Option QedjsEnv := none) : IO Bool := do
             match ← componentAppName mod with
             | some a =>
                 mods := #[mod, "Qed.Driver"]
-                entries := driverEntries.filter (!·.startsWith "main:") ++ #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"]
+                entries := #["Qed.run"] ++ driverEntries.filter (!·.startsWith "main:") ++ #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"]
             | none =>
                 mods := #[mod]
                 entries := driverEntries

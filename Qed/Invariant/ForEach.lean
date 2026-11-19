@@ -94,12 +94,22 @@ macro "forEachStyleLift " view:ident childStyled:ident : tactic =>
                      intro c _
                      first
                        | (refine Qed.everyElement_through_map _ _ ?_ ($childStyled c) <;>
-                            (intro t a; simp [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done))
+                            (intro t a;
+                             first
+                               | (simp only [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done)
+                               | (simp [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done)))
                        | (simp only [Qed.everyElement, Qed.everyElementL, Bool.and_eq_true]
                           repeat' apply And.intro
                           all_goals (first
                             | (refine Qed.everyElement_through_map _ _ ?_ ($childStyled c) <;>
-                                 (intro t a; simp [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done))
+                                 (intro t a;
+                                  first
+                                    | (simp only [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done)
+                                    | (simp [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done)))
+                            | (simp only [Qed.attrRole, Qed.attrClasses, Qed.hasOneClass,
+                                          Bool.true_and, Bool.and_true, Bool.false_and, Bool.and_false,
+                                          Bool.true_or, Bool.or_true, Bool.false_or, Bool.or_false,
+                                          ite_true, ite_false, beq_self_eq_true, eq_self]; (try rfl); done)
                             | (simp [Qed.attrRole, Qed.attrClasses, Qed.hasOneClass]; done)
                             | rfl))))))
 

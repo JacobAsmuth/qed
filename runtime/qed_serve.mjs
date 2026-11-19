@@ -1,11 +1,14 @@
 import { createServer } from 'node:http';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const [dirArg = 'dist', port = '8000', devFlag] = process.argv.slice(2);
 const dev = devFlag === '--dev';
 const dir = path.resolve(dirArg);
+const dirPrefix = dir.endsWith(path.sep) ? dir : dir + path.sep;
+const realDir = await realpath(dir).catch(() => dir);
+const realDirPrefix = realDir.endsWith(path.sep) ? realDir : realDir + path.sep;
 const ssrPath = path.join(dir, 'ssr.mjs');
 
 let cached = { mtime: 0, handler: null };
@@ -32,10 +35,26 @@ const reload = "<script>(function(){let v=null;setInterval(async()=>{try{const t
 createServer(async (req, res) => {
   try {
     const u = new URL(req.url, `http://${req.headers.host ?? `localhost:${port}`}`);
-    const file = path.join(dir, path.normalize(u.pathname));
-    if (file.startsWith(dir)) {
+    let decodedPath;
+    try { decodedPath = decodeURIComponent(u.pathname); } catch {
+      res.writeHead(400, { 'content-type': 'text/plain' });
+      res.end('bad request');
+      return;
+    }
+    if (decodedPath.includes('\0') || decodedPath.includes('\\')) {
+      res.writeHead(400, { 'content-type': 'text/plain' });
+      res.end('bad request');
+      return;
+    }
+    const hasDotDot = decodedPath.split('/').includes('..');
+    const file = path.resolve(dir, '.' + decodedPath);
+    if (!hasDotDot && file.startsWith(dirPrefix)) {
       let st = null;
-      try { st = await stat(file); } catch {}
+      let realFile = null;
+      try {
+        realFile = await realpath(file);
+        if (realFile.startsWith(realDirPrefix)) st = await stat(realFile);
+      } catch {}
       if (st?.isFile()) {
         const lastMod = new Date(st.mtime).toUTCString();
         const ims = req.headers['if-modified-since'];
@@ -45,11 +64,11 @@ createServer(async (req, res) => {
           return;
         }
         res.writeHead(200, {
-          'content-type': MIME[path.extname(file)] ?? 'application/octet-stream',
+          'content-type': MIME[path.extname(realFile)] ?? 'application/octet-stream',
           'cache-control': dev ? 'no-store' : 'no-cache',
           'last-modified': lastMod,
         });
-        res.end(await readFile(file));
+        res.end(await readFile(realFile));
         return;
       }
     }

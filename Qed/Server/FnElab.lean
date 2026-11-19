@@ -370,6 +370,9 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
   let secLits : Array Term := reqSecrets.map (Syntax.mkStrLit ·)
   elabCommand (← `(command| def $secretsId : Array String := #[$[$secLits],*]))
 
+  let markerId := mkIdentFrom srvIdent (srvNm ++ `_qed_server_marker)
+  elabCommand (← `(command| theorem $markerId : True := True.intro))
+
   let readOnlyId := mkIdentFrom srvIdent (srvNm ++ `readOnlyMethods)
   let roLits : Array Term := (methodInfos.filter (·.isReadOnly)).map (Syntax.mkStrLit ·.name)
   elabCommand (← `(command| def $readOnlyId : Array String := #[$[$roLits],*]))
@@ -541,7 +544,8 @@ def elabServerPureFn (priorRep priorUnrep : Nat)
     (payloadTerm errTyTerm : Term) (baseCtx : LowerCtx) (bodyStmts : Array Lean.Syntax)
     (invs : Array ParsedInv) (mutInvs : Array ParsedMutInv)
     (stateFieldNames envVarNames : Array String)
-    (ensSpec? : Option FnEnsSpec) :
+    (ensSpec? : Option FnEnsSpec)
+    (deferredProofs : IO.Ref (Array (CommandElabM Bool))) :
     CommandElabM (Option (Term × Bool × Array Name)) := do
   let s0Id := mkIdent `_s0
   let fnLit := Syntax.mkStrLit fnStr
@@ -569,25 +573,26 @@ def elabServerPureFn (priorRep priorUnrep : Nat)
   if isReadOnly then
     let roThmId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_readOnly")
     let roLbl := Syntax.mkStrLit s!"{fnStr} read-only state preservation"
-    elabCommand (← `(command|
+    let cmd ← `(command|
       theorem $roThmId ($s0Id:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]* :
           ($stepCall).1 = $s0Id := by
-        qedSrvProveStep [$stepId] $fnLit $roLbl))
-    if hasNewErrors (← get).messages priorRep priorUnrep then return none
+        qedSrvProveStep [$stepId] $fnLit $roLbl)
+    deferredProofs.modify (·.push do elabCommand cmd; return !hasNewErrors (← get).messages priorRep priorUnrep)
   else
     let invThmId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_inv")
     let singleInvLbl := Syntax.mkStrLit <|
       let ss := (invs.filter (!·.isTwoSt)).toList.map (·.label)
       if ss.isEmpty then "StateInv" else String.intercalate ", " ss
-    elabCommand (← `(command|
+    let invCmd ← `(command|
       theorem $invThmId ($s0Id:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]*
           (_hInv : $stateInvId $s0Id) :
           $stateInvId ($stepCall).1 := by
-        qedSrvProveStep [$stateInvId, $stepId] $fnLit $singleInvLbl))
-    if hasNewErrors (← get).messages priorRep priorUnrep then return none
-    unless (← elabServerFnInvariants priorRep priorUnrep false srvName fnStr fnIdent stateId stateInvId
-        stepId allBinderIds allBinderTys stepCall invs mutInvs stateFieldNames envVarNames) do
-      return none
+        qedSrvProveStep [$stateInvId, $stepId] $fnLit $singleInvLbl)
+    deferredProofs.modify (·.push do
+      elabCommand invCmd
+      if hasNewErrors (← get).messages priorRep priorUnrep then return false
+      elabServerFnInvariants priorRep priorUnrep false srvName fnStr fnIdent stateId stateInvId
+        stepId allBinderIds allBinderTys stepCall invs mutInvs stateFieldNames envVarNames)
 
   if let some ensSpec := ensSpec? then
     let ensId := ensSpec.ensId
@@ -595,12 +600,12 @@ def elabServerPureFn (priorRep priorUnrep : Nat)
     let outProj ← if hasEmit then `(($stepCall).2.1) else `(($stepCall).2)
     let postGoal ← ensSpec.postFn outProj
     let ensLbl := Syntax.mkStrLit s!"ensures: {ensSpec.labelStr}"
-    elabCommand (← `(command|
+    let ensCmd ← `(command|
       theorem $ensThmId ($s0Id:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]*
           (_hInv : $stateInvId $s0Id) :
           $postGoal := by
-        qedSrvProveStep [$stateInvId, $stepId, $ensId] $fnLit $ensLbl))
-    if hasNewErrors (← get).messages priorRep priorUnrep then return none
+        qedSrvProveStep [$stateInvId, $stepId, $ensId] $fnLit $ensLbl)
+    deferredProofs.modify (·.push do elabCommand ensCmd; return !hasNewErrors (← get).messages priorRep priorUnrep)
 
   let snapCall ← callArgs.foldlM (init := ← `($stepId _sSnap)) fun acc a => `($acc $a)
   let rawRun ← if isReadOnly then
@@ -641,7 +646,8 @@ def elabServerAsyncFn (priorRep priorUnrep : Nat)
     (payloadTerm errTyTerm : Term) (baseCtx : LowerCtx) (bodyStmts : Array Lean.Syntax)
     (invs : Array ParsedInv) (mutInvs : Array ParsedMutInv)
     (stateFieldNames envVarNames : Array String)
-    (ensSpec? : Option FnEnsSpec) :
+    (ensSpec? : Option FnEnsSpec)
+    (deferredProofs : IO.Ref (Array (CommandElabM Bool))) :
     CommandElabM (Option (Term × Bool × Array Name)) := do
   let stateTyTerm : Term := ⟨stateId.raw⟩
   let fnLit := Syntax.mkStrLit fnStr
@@ -661,20 +667,21 @@ def elabServerAsyncFn (priorRep priorUnrep : Nat)
   let singleInvLbl := Syntax.mkStrLit <|
     let ss := (invs.filter (!·.isTwoSt)).toList.map (·.label)
     if ss.isEmpty then "StateInv" else String.intercalate ", " ss
-  elabCommand (← `(command|
+  let invCmd ← `(command|
     theorem $asyncInvId $[($allBinderIds:ident : $allBinderTys:term)]* :
         Qed.Server.ProgPreservesInv $stateInvId
           ($hCall : Qed.Server.ThreadProg $stateId _) := by
-      qedSrvProveAsync $handlerId [$stateInvId] $fnLit $singleInvLbl))
-  if hasNewErrors (← get).messages priorRep priorUnrep then return none
-  unless (← elabServerFnInvariants priorRep priorUnrep true srvName fnStr fnIdent stateId stateInvId
-      handlerId allBinderIds allBinderTys hCall invs mutInvs stateFieldNames envVarNames) do
-    return none
+      qedSrvProveAsync $handlerId [$stateInvId] $fnLit $singleInvLbl)
+  deferredProofs.modify (·.push do
+    elabCommand invCmd
+    if hasNewErrors (← get).messages priorRep priorUnrep then return false
+    elabServerFnInvariants priorRep priorUnrep true srvName fnStr fnIdent stateId stateInvId
+      handlerId allBinderIds allBinderTys hCall invs mutInvs stateFieldNames envVarNames)
 
   if let some ensSpec := ensSpec? then
-    unless (← elabAsyncEnsuresThm priorRep priorUnrep srvName fnStr fnIdent handlerId
-        stateInvId stateId payloadTerm errTyTerm allBinderIds allBinderTys hCall #[stateInvId] ensSpec) do
-      return none
+    deferredProofs.modify (·.push do
+      elabAsyncEnsuresThm priorRep priorUnrep srvName fnStr fnIdent handlerId
+        stateInvId stateId payloadTerm errTyTerm allBinderIds allBinderTys hCall #[stateInvId] ensSpec)
 
   let hApp ← callArgs.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
   return some (hApp, isReadOnly, lSt.extRoots)

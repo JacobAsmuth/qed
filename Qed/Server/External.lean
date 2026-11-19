@@ -653,6 +653,8 @@ def elabExternalCmd : CommandElab := fun stx => do
     | .gcpServiceAccount v sc => `(Qed.Server.AuthSpec.gcpServiceAccount $(Syntax.mkStrLit v) $(Syntax.mkStrLit sc))
   elabCommand (← `(command| def $baseId : String := $baseLit))
   elabCommand (← `(command| def $secretsId : Array String := #[$[$secretsLits],*]))
+  let markerId := mkIdentFrom svcIdent (svcName ++ `_qed_external_marker)
+  elabCommand (← `(command| theorem $markerId : True := True.intro))
   let mut methodNames : Array Name := #[]
   for ep in epClauses do
     methodNames := methodNames.push (← elabExternalEndpoint svcName svcStrLit baseId authTerm methodNames ep)

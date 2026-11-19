@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, copyFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ROOT, withBrowser, send } from './harness.mjs';
+import { ROOT, leanEnv, withBrowser, send } from './harness.mjs';
 
 const out = mkdtempSync(join(tmpdir(), 'qed-dom-'));
 const qedjsBin = join(ROOT, '.lake/build/bin/qedjs');
@@ -13,12 +13,10 @@ try {
   if (process.env.QED_PREBUILT !== '1' || !existsSync(qedjsBin)) {
     run('lake', ['build', 'Tests.DomProbe', 'qedjs']);
   }
-  const LEAN_PATH = process.env.LEAN_PATH || run('lake', ['env', 'printenv', 'LEAN_PATH']).trim();
   const entries = ['mount', 'advance', 'fresh', 'expected', 'handlerValue',
     'mountTemplate', 'advanceTemplate', 'expectedTemplate',
     'expectedDuplicate', 'duplicateBuild', 'duplicateUpdate', 'duplicateHydrate'];
-  run(qedjsBin, [join(out, 'app.mjs'), 'Tests.DomProbe', '--', ...entries.map((n) => `DomProbe.${n}:${n}`)],
-    { ...process.env, LEAN_PATH });
+  run(qedjsBin, [join(out, 'app.mjs'), 'Tests.DomProbe', '--', ...entries.map((n) => `DomProbe.${n}:${n}`)], leanEnv());
   for (const name of ['qed_rt.mjs', 'qed_dom.mjs']) copyFileSync(join(ROOT, 'runtime', name), join(out, name));
 
   await withBrowser('DOM-EQUIVALENCE', {
@@ -103,6 +101,8 @@ try {
         const h = io(P[name]());
         equal(snapshot(node(h)), expectedDup, `${name} disambiguated duplicate keys without crash or DOM drift`);
       }
+      history.pushState({}, '', '/books/0?tab=reviews&sort=asc');
+      equal(io(dom.currentPath(0)), '/books/0?tab=reviews&sort=asc', 'currentPath preserves query string');
       return { updates: sequence.length * 2, duplicateChecks: 3 };
     });
     check('160 incremental/template DOM equivalence updates', result.updates, 160);

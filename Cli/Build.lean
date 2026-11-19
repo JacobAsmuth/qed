@@ -51,14 +51,6 @@ private partial def collectLocalModulesLoop :
 private def collectLocalModules (rootMod : String) : IO (Array String) :=
   collectLocalModulesLoop [rootMod] #[]
 
-private def resolveSharedLibArg (soname fallbackFlag : String) : IO String := do
-  let o ← IO.Process.output { cmd := "cc", args := #[s!"-print-file-name={soname}"] }
-  if o.exitCode == 0 then
-    let p := o.stdout.trimmed
-    if !p.isEmpty && p != soname && (← (FilePath.mk p).pathExists) then
-      return p
-  return fallbackFlag
-
 private def removeIfExists (p : FilePath) : IO Unit := do
   if ← p.pathExists then
     try IO.FS.removeFile p catch _ => pure ()
@@ -136,23 +128,19 @@ private def resolveServeCmd (dir : FilePath) (port : String) (dev : Bool) :
     return ("python3", #["-m", "http.server", port, "--directory", dir.toString], false)
 
 initialize fullstackLinkCache :
-    IO.Ref (Option (Array String × Array String × String × String)) ← IO.mkRef none
+    IO.Ref (Option (Array String × Array String)) ← IO.mkRef none
 
 private def resolveLinkMeta (cObjTargets : Array String) :
-    IO (Option (Array String × String × String)) := do
-  if let some (cachedTargets, cachedInputs, ssl, crypto) ← fullstackLinkCache.get then
+    IO (Option (Array String)) := do
+  if let some (cachedTargets, cachedInputs) ← fullstackLinkCache.get then
     if cachedTargets == cObjTargets then
       let mut ok := true
       for p in cachedInputs do
         if !(← (FilePath.mk p).pathExists) then ok := false; break
-      if ok then return some (cachedInputs, ssl, crypto)
-  let tSsl ← IO.asTask (resolveSharedLibArg "libssl.so" "-lssl")
-  let tCrypto ← IO.asTask (resolveSharedLibArg "libcrypto.so" "-lcrypto")
+      if ok then return some cachedInputs
   let some linkInputs ← lakeQueryPaths cObjTargets | return none
-  let sslLib := (← IO.wait tSsl).toOption.getD "-lssl"
-  let cryptoLib := (← IO.wait tCrypto).toOption.getD "-lcrypto"
-  fullstackLinkCache.set (some (cObjTargets, linkInputs, sslLib, cryptoLib))
-  return some (linkInputs, sslLib, cryptoLib)
+  fullstackLinkCache.set (some (cObjTargets, linkInputs))
+  return some linkInputs
 
 private def compileClientMain (mod appExpr : String) (isInRepo prod : Bool) :
     IO (Option (FilePath × FilePath)) := do
@@ -174,7 +162,8 @@ private def compileClientMain (mod appExpr : String) (isInRepo prod : Bool) :
 def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool)
     (alreadyBuilt : Bool := false) : IO Bool := do
   let localMods ← collectLocalModules mod
-  let cObjTargets := (localMods.map fun m => s!"+{m}:c.o") ++ #["qed/QedServer:static", "qed/Qed:static"]
+  let cObjTargets := (localMods.map fun m => s!"+{m}:c.o") ++
+    #["qed/QedServer:static", "qed/Qed:static", "qed/libqed_server"]
   let isInRepo ← (FilePath.mk "Examples").pathExists
   let prebuilt := (← env "QED_PREBUILT") == some "1"
   let lakeTargets :=
@@ -213,9 +202,9 @@ def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool)
     if prod then minifyBundles outDir ["app.mjs", "qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"]
     return true
 
-  -- 2. Synthesize & compile native multi-core C/Lean server binary → `<outDir>/server`
+  -- 2. Synthesize & compile native multi-core Rust/Lean server binary → `<outDir>/server`
   let tServer ← IO.asTask do
-    let some (linkInputs, sslLib, cryptoLib) ← resolveLinkMeta cObjTargets | return false
+    let some linkInputs ← resolveLinkMeta cObjTargets | return false
     let linkFiles := linkInputs.map FilePath.mk
     let srvCDeps := #[srvLean, modOlean] ++ linkFiles
     if srvChanged || prod || !(← isUpToDate srvC srvCDeps) then
@@ -225,8 +214,11 @@ def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool)
     if prod || !(← isUpToDate srvBin linkDeps) then
       let srvTmp := outDir / "server.tmp"
       let optFlags := if prod then #["-O3", "-DNDEBUG"] else #["-O0"]
+      let linkerPlatformFlags : Array String :=
+        if System.Platform.isOSX then #["-Wl,-undefined,dynamic_lookup"]
+        else #["-Wl,--allow-shlib-undefined"]
       let leancArgs := #["env", "leanc"] ++ optFlags ++ #[srvC.toString] ++
-        linkInputs ++ #["-pthread", sslLib, cryptoLib, "-Wl,--allow-shlib-undefined", "-o", srvTmp.toString]
+        linkInputs ++ #["-pthread"] ++ linkerPlatformFlags ++ #["-o", srvTmp.toString]
       if (← sh "lake" leancArgs) != 0 then return false
       IO.FS.rename srvTmp srvBin
     return true

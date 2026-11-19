@@ -44,9 +44,10 @@ Lean app: schemas, routers, components, and optional external/server/fullstack b
    │       └─▶ ssr.mjs: ssr_app.mjs + qed_ssr_host.mjs — async Request => Response
    │
    └──▶ Full-stack native server via `fullstack`
-           └─▶ server binary: Lean C backend + c/qed_server.c + OpenSSL
+           └─▶ server binary: Lean C backend + rust/qed_server (rustls + openat2)
                • Static assets + /_qed/health
                • /_qed/rpc/<Server>/<fn> binary Protobuf RPCs
+               • /_qed/ws/<Server> multiplexed RFC 6455 WebSockets
                • Zero-hop in-memory SSR
 ```
 
@@ -67,12 +68,15 @@ are proved equivalent to fresh `Html.render`.
   `App.ssrStep` in bounded rounds, executing startup HTTP/RPC `Cmd`s via `fetch` and embedding
   the dehydrated state into `<script id="qed-state">`.
 - **Full-stack native binary:** When a module declares `fullstack`, `qed build` compiles the
-  client to `app.mjs` and links the server through Lean's C backend with
-  [`c/qed_server.c`](../c/qed_server.c) and OpenSSL into `dist/server`. Worker threads run an
-  `SO_REUSEPORT` + `epoll`/`kqueue` HTTP/1.1 loop, share state through a `pthread_rwlock_t`
-  `StateBox`, call `external` APIs over an outbound keep-alive TLS pool, serve binary Protobuf
-  RPCs, and execute SSR directly in memory via `App.ssrRenderNativeBytes` against the server's
-  dispatch table without an HTTP or JSON round-trip.
+  client to `app.mjs` and links the server through Lean's C backend with the minimal Rust I/O &
+  crypto shim [`rust/qed_server/`](../rust/qed_server) (`rustls` + `webpki-roots` + `openat2`)
+  into `dist/server`. HTTP/1.1 request/response parsing and formatting, static path/MIME policy,
+  CSRF/CSWSH origin checks, SSRF IP CIDR policy, RFC 6455 WebSocket SHA-1/framing/reassembly, and
+  GCP RS256 OAuth2 all execute in total, verified Lean (`Qed/Server/{Net,Http,Native}.lean`).
+  Worker threads run an `SO_REUSEPORT` + `epoll`/`kqueue` socket loop, share state through an
+  `RwLock` `StateBox`, call `external` APIs over an outbound keep-alive `rustls` pool, serve
+  binary Protobuf RPCs and multiplexed WebSockets, and execute SSR directly in memory via
+  `App.ssrRenderNativeBytes` without an HTTP or JSON round-trip.
 
 In both modes, `component` apps synthesize a verified `Dehydrate` codec automatically so the
 browser restores server-rendered state without re-fetching startup data; mark client-only fields
@@ -132,9 +136,9 @@ Qed relies on:
 
 - Lean 4's kernel, macro and elaboration hygiene, compiler IR generator, and C backend.
 - Pretty-printing the typed JS AST to `.mjs` text in [`Js/Backend.lean`](../Js/Backend.lean).
-- The hand-written JS runtime in [`runtime/`](../runtime) and the native C/FFI substrate in
-  [`c/qed_server.c`](../c/qed_server.c) and [`Qed/Server/Prim.lean`](../Qed/Server/Prim.lean).
-- Browser DOM and Web APIs, Node `fetch` for JS SSR, OpenSSL, and the OS kernel.
+- The hand-written JS runtime in [`runtime/`](../runtime) and the minimal native Rust I/O & crypto
+  shim in [`rust/qed_server/`](../rust/qed_server) and [`Qed/Server/Prim.lean`](../Qed/Server/Prim.lean).
+- Browser DOM and Web APIs, Node `fetch` for JS SSR, `rustls`/`ring`/`rsa`, and the OS kernel.
 
 Because real browsers, network I/O, and memory allocation sit outside pure Lean models, Qed pairs
 compile-time proofs with differential and headless Chromium test suites.
@@ -191,7 +195,7 @@ and `qed start` or `qed preview` for production builds; `qed build` also minifie
 | [`Qed/Json.lean`](../Qed/Json.lean) · [`Qed/Proto.lean`](../Qed/Proto.lean) | Total JSON and binary Protocol Buffers parsers and encoders under `Qed/Json/` and `Qed/Proto/` with `LawfulJson` and `LawfulProto` proofs. |
 | [`Qed/Date.lean`](../Qed/Date.lean) · [`Qed/Router.lean`](../Qed/Router.lean) · [`Qed/Schema.lean`](../Qed/Schema.lean) | Date utilities, `router` macro + `Router.round_trip`, and `schema` macro under `Qed/Schema/` generating `Field`, `Draft`, `formView`, `canSubmit_iff`, and JSON/Proto codecs. |
 | [`Qed/Component.lean`](../Qed/Component.lean) · [`Qed/ForEach.lean`](../Qed/ForEach.lean) · [`Qed/Invariant.lean`](../Qed/Invariant.lean) | `component` macro under `Qed/Component/`, list iteration helpers, and automated state, `for_each`, and view/styling invariant provers under `Qed/Invariant/`. |
-| [`Qed/Server.lean`](../Qed/Server.lean) · [`c/qed_server.c`](../c/qed_server.c) | `external`, `server`, and `fullstack` DSLs, invariant prover, `Qed.Server.Native` runner in `Qed/Server/`, and the multi-core `epoll`/`kqueue` + OpenSSL C server substrate. |
+| [`Qed/Server.lean`](../Qed/Server.lean) · [`rust/qed_server/`](../rust/qed_server) | `external`, `server`, and `fullstack` DSLs, invariant prover, verified HTTP/1.1 + WS + SSRF/CSRF stack in `Qed/Server/{Net,Http,Native}.lean`, and the minimal Rust `epoll`/`kqueue` + `rustls` + `openat2` shim. |
 | [`Js/Backend.lean`](../Js/Backend.lean) · [`Js/VerifyEnv.lean`](../Js/VerifyEnv.lean) · [`Js/Proofs.lean`](../Js/Proofs.lean) · [`Js/Main.lean`](../Js/Main.lean) | Total Lean IR → typed JS AST compiler, `qedjs` CLI, kernel/client-leak gates, and lowering soundness proofs. |
 | [`Cli.lean`](../Cli.lean) | `qed` CLI under `Cli/`: `dev`, `build`, `start`, `preview`, `test`, `check`, `clean`, `new`, `doctor`. |
 | [`runtime/`](../runtime) | Browser & Node runtime: `qed_rt.mjs`, `qed_dom.mjs`, `qed_host.mjs`, `qed_ssr_host.mjs`, `qed_serve.mjs`. |

@@ -2,14 +2,14 @@ namespace Qed.Server.Prim
 
 /-! ## Trusted Native Server FFI Boundary (`Qed.Server.Prim`)
     Mirrors `Qed.Dom` on the client: this is the **sole** server module permitted by
-    `Js.VerifyEnv` to declare `@[extern]` C bindings (implemented in `c/qed_server.c`),
+    `Js.VerifyEnv` to declare `@[extern]` native bindings (implemented in `rust/qed_server`),
     and `Js.VerifyEnv.verifyNoServerLeakInClient` guarantees none of these symbols can
     ever be linked into a client JavaScript bundle. -/
 
 opaque StateBoxPointed : NonemptyType.{0}
 
-/-- Thread-safe `pthread_rwlock_t` shared state container (`lean_mark_mt`-marked) for
-    serialized atomic updates under `wrlock` and concurrent multi-core reads under `rdlock`. -/
+/-- Thread-safe `RwLock` shared state container (`lean_mark_mt`-marked) for
+    serialized atomic updates under write-lock and concurrent multi-core reads. -/
 def StateBox (_ : Type) : Type := StateBoxPointed.type
 
 instance {σ : Type} : Nonempty (StateBox σ) := StateBoxPointed.property
@@ -23,22 +23,22 @@ opaque atomicRead {σ α : Type} (box : @& StateBox σ) (f : σ → α) : IO α
 @[extern "qed_server_state_modify"]
 opaque atomicModify {σ α : Type} (box : @& StateBox σ) (f : σ → σ × α) : IO α
 
-/-- Executes an outbound HTTP/1.1 or HTTPS (OpenSSL TLS) request using the worker's
-    keep-alive connection pool. When `ssrfGuard == 1`, resolves DNS and blocks loopback,
-    RFC1918 private, link-local, and cloud-metadata IPv4/IPv6 addresses prior to `connect`. -/
-@[extern "qed_server_http_call"]
-opaque httpCall
-    (method : @& String)
-    (url : @& String)
-    (headers : @& Array (String × String))
-    (body : @& ByteArray)
-    (ssrfGuard : UInt8) :
-    IO (Except String (Nat × ByteArray × Array (String × String)))
+opaque StaticDirPointed : NonemptyType.{0}
 
-/-- Mints an RS256-signed JWT from a GCP Service Account JSON credential and exchanges
-    (and caches until 60s before expiry) an OAuth2 Bearer access token for `scope`. -/
-@[extern "qed_server_gcp_bearer_token"]
-opaque gcpBearerToken (saJson : @& String) (scope : @& String) : IO (Except String String)
+/-- Directory descriptor (`dirfd`) anchored at startup for symlink-free `openat2`/`openat` static reads. -/
+def StaticDir : Type := StaticDirPointed.type
+
+instance : Nonempty StaticDir := StaticDirPointed.property
+
+@[extern "qed_server_open_static_dir"]
+opaque openStaticDir (path : @& String) : IO StaticDir
+
+/-- Reads a regular file beneath `dir` using `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`
+    on Linux (or `openat` + `O_NOFOLLOW` segment walk on macOS). Returns `some (fileSize, bytes)`,
+    where `bytes` is empty when `headOnly != 0`. -/
+@[extern "qed_server_read_static_file"]
+opaque readStaticFile (dir : @& StaticDir) (relPath : @& String) (headOnly : UInt8) :
+    IO (Option (Nat × ByteArray))
 
 /-- Reads an OS environment variable (`none` if unset). -/
 @[extern "qed_server_get_env"]
@@ -48,43 +48,78 @@ opaque getEnv (name : @& String) : IO (Option String)
 @[extern "qed_server_now_ms"]
 opaque nowMs : IO UInt64
 
-/-- Generates `2 * numBytes` lowercase hex characters from OpenSSL `RAND_bytes` CSPRNG. -/
+/-- Generates `2 * numBytes` lowercase hex characters from OS CSPRNG (`getrandom`). -/
 @[extern "qed_server_random_hex"]
 opaque randomHex (numBytes : UInt32) : IO String
 
-/-- Computes a 32-byte HMAC-SHA256 digest via OpenSSL `HMAC(EVP_sha256(), ...)`. -/
+/-- Computes a 32-byte HMAC-SHA256 digest. -/
 @[extern "qed_server_hmac_sha256"]
 opaque hmacSha256 (key : @& ByteArray) (msg : @& ByteArray) : IO ByteArray
 
-/-- Starts the multi-core `SO_REUSEPORT` + `epoll`/`kqueue` HTTP/1.1 server loop.
-    Serves static assets from `staticDir` directly in C and dispatches RPC & SSR requests
-    to `handler (method, pathAndQuery, headers, body, clientIp) → (status, contentType, respBody)`. -/
-@[extern "qed_server_run"]
-opaque serveNative
+/-- Signs `msg` using RSASSA-PKCS1-v1_5 SHA-256 (`RS256`) with a PEM-encoded RSA private key. -/
+@[extern "qed_server_rsa_sha256_sign"]
+opaque rsaSha256Sign (pemPrivateKey : @& String) (msg : @& ByteArray) : IO (Except String ByteArray)
+
+/-- Acquires a pooled or fresh TCP/TLS (`rustls`) outbound stream. When `ssrfGuard != 0`,
+    validates every DNS-resolved IP against Lean's verified `isBlockedIp` before `connect`.
+    Returns `(handleId, wasReusedFlag)`. -/
+@[extern "qed_server_outbound_acquire"]
+opaque outboundAcquire
+    (isTls : UInt8)
+    (host : @& String)
     (port : UInt16)
-    (numWorkers : UInt32)
-    (staticDir : @& String)
-    (devMode : UInt8)
-    (handler : String → String → Array (String × String) → ByteArray → String → IO (Nat × String × ByteArray)) :
-    IO UInt32
+    (ssrfGuard : UInt8)
+    (isBlockedIp : @& (ByteArray → Bool)) :
+    IO (Except String (Nat × Nat))
+
+@[extern "qed_server_outbound_write_all"]
+opaque outboundWriteAll (handle : UInt64) (data : @& ByteArray) : IO (Except String Unit)
+
+@[extern "qed_server_outbound_read_some"]
+opaque outboundReadSome (handle : UInt64) (maxBytes : UInt32) : IO (Except String ByteArray)
+
+@[extern "qed_server_outbound_release"]
+opaque outboundRelease (handle : UInt64) (keepAlive : UInt8) : IO Unit
 
 /-- Broadcasts a pre-encoded Protobuf event payload across all multi-core worker threads to
-    every WebSocket subscription matching `topicKey` (`<channel>:<hex(params)>`), zero-copy. -/
+    every WebSocket subscription matching `topicKey` (`<channel>:<hex(params)>`). -/
 @[extern "qed_server_ws_broadcast"]
 opaque wsBroadcast (topicKey : @& String) (payload : @& ByteArray) : IO Unit
 
-/-- Starts the multi-core `SO_REUSEPORT` + `epoll`/`kqueue` HTTP/1.1 + RFC 6455 multiplexed
-    WebSocket server loop with cross-worker broadcast fan-out. -/
-@[extern "qed_server_run_ws"]
-opaque serveNativeWs {Ctx : Type}
+/-- Decision returned by Lean's verified HTTP/1.1 head handler to the Rust socket loop.
+    All constructor fields are object-typed so the FFI never relies on scalar field layout. -/
+inductive HttpHeadAction (Req Ctx : Type) where
+  | doneClose     (respWire : ByteArray)
+  | doneKeepAlive (respWire : ByteArray)
+  | needBodyClose (contentLen : Nat) (req : Req)
+  | needBodyKeep  (contentLen : Nat) (req : Req)
+  | wsUpgrade     (respWire : ByteArray) (wsCtx : Ctx)
+
+/-- Subscription table mutation emitted by Lean's verified WebSocket frame/mux handler. -/
+inductive WsSubOp where
+  | addSub    (subId : Nat) (topic channel : String) (params : ByteArray)
+  | removeSub (subId : Nat)
+
+/-- Result of processing buffered WebSocket bytes in Lean. All fields are object-typed. -/
+structure WsStepOut (Frag : Type) where
+  consumed  : Nat
+  outWire   : ByteArray
+  closeFlag : Nat
+  fragState : Frag
+  subOps    : Array WsSubOp
+
+/-- Starts the multi-core `SO_REUSEPORT` + `epoll`/`kqueue` socket loop in Rust.
+    All HTTP/1.1 parsing/formatting, static path/MIME policy, CSRF/CSWSH checks, RFC 6455
+    WebSocket framing/SHA-1/reassembly, and mux routing execute in Lean via the 4 callbacks. -/
+@[extern "qed_server_run"]
+opaque serveNative {Req Ctx Frag : Type}
     (port : UInt16)
     (numWorkers : UInt32)
-    (staticDir : @& String)
-    (devMode : UInt8)
-    (handler : String → String → Array (String × String) → ByteArray → String → IO (Nat × String × ByteArray))
-    (wsPath : @& String)
-    (wsUpgrade : Array (String × String) → String → IO Ctx)
-    (wsAction : Ctx → UInt8 → String → ByteArray → ByteArray → IO (Except String ByteArray)) :
+    (initFrag : Frag)
+    (onHead : ByteArray → String → IO (HttpHeadAction Req Ctx))
+    (onBody : Req → ByteArray → String → IO ByteArray)
+    (onWsBytes : Ctx → ByteArray → Frag → Array (Nat × String × ByteArray) → IO (WsStepOut Frag))
+    (onWsLeave : Ctx → String → ByteArray → IO Unit) :
     IO UInt32
 
 end Qed.Server.Prim

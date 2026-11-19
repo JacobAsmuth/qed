@@ -224,7 +224,8 @@ def elabServerChannelBody (priorRep priorUnrep : Nat)
     (envIdents : Array Ident) (envTypes : Array Term)
     (stateFieldNames envVarNames : Array String)
     (invs : Array ParsedInv) (mutInvs : Array ParsedMutInv)
-    (chanSigs : Array SrvChanSig) (hdr : ParsedChanHeader) :
+    (chanSigs : Array SrvChanSig) (hdr : ParsedChanHeader)
+    (deferredProofs : IO.Ref (Array (CommandElabM Bool))) :
     CommandElabM (Option (Array (TSyntax ``Lean.Parser.Term.matchAltExpr) × Array Name)) := do
   let chIdent := hdr.chIdent
   let chName := hdr.chName
@@ -285,14 +286,14 @@ def elabServerChannelBody (priorRep priorUnrep : Nat)
       let some (runExpr, _, er) ← elabServerPureFn priorRep priorUnrep
           srvName subFnStr subFnIdent stateId stateInvId
           allBinderIds allBinderTys callArgs retTyTerm errTyTerm baseCtx bodyStmts
-          invs mutInvs stateFieldNames envVarNames none | return none
+          invs mutInvs stateFieldNames envVarNames none deferredProofs | return none
       extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
       return some runExpr
     else if hasState && hasAwait then
       let some (hApp, _, er) ← elabServerAsyncFn priorRep priorUnrep
           srvName subFnStr subFnIdent stateId stateInvId
           allBinderIds allBinderTys callArgs retTyTerm errTyTerm baseCtx bodyStmts
-          invs mutInvs stateFieldNames envVarNames none | return none
+          invs mutInvs stateFieldNames envVarNames none deferredProofs | return none
       extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
       return some hApp
     else

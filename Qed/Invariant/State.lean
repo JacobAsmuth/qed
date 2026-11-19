@@ -106,7 +106,7 @@ elab "qedAddFieldFacts" : tactic => do
     let seenRef ← IO.mkRef (#[] : Array Expr)
     for e in scan do
       e.forEach fun sub => do
-        if !sub.hasLooseBVars then
+        if !sub.hasLooseBVars && (sub.isFVar || sub.isProj || sub.isApp) then
           let ty? ← try some <$> Meta.whnf (← Meta.inferType sub) catch _ => pure none
           if let some ty := ty? then
             if ty.isAppOfArity `Qed.Field 2 && env.contains `Qed.Field.ok then
@@ -126,6 +126,29 @@ elab "qedAddFieldFacts" : tactic => do
     let fTy ← g.withContext (Meta.inferType fPrf)
     let (_, g') ← (← g.assert (Name.mkSimple s!"_qedFld{idx}") fTy fPrf).intro1P
     replaceMainGoal [g']
+
+elab "qedFastClose" : tactic => withMainContext do
+  let g ← getMainGoal
+  let tgt ← instantiateMVars (← g.getType)
+  if tgt.isConstOf ``True then
+    g.assign (mkConst ``True.intro)
+    replaceMainGoal []
+    return
+  let closed ← Meta.withTransparency .reducible do
+    if let some (_, lhs, rhs) := tgt.eq? then
+      if (← Meta.isDefEq lhs rhs) then
+        g.assign (← Meta.mkEqRefl lhs)
+        return true
+    for decl in (← getLCtx) do
+      if !decl.isImplementationDetail then
+        if (← Meta.isDefEq decl.type tgt) then
+          g.assign (mkFVar decl.fvarId)
+          return true
+    return false
+  if closed then
+    replaceMainGoal []
+  else
+    throwError "qedFastClose: not trivially closed"
 
 private def mkCloserLemmas (usingL : Array Term) : TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) := do
   let bL ← toSimpLemmas (qedBoundaryLemmas.map fun n => ⟨(mkIdent n).raw⟩)
@@ -151,10 +174,8 @@ private def mkInitTac (usingL : Array Term) (pred initT : Term) : TacticM (TSynt
      $unfoldInit:tactic;
      qedUnfoldPresent [$[$usingL],*];
      try ((repeat' split) <;>
-            (first | rfl | decide | omega | assumption
-                   | (simp_all [$[$initCloserL],*] <;> omega)
-                   | (simp_all [$[$initCloserL],*] <;> decide)
-                   | (simp_all [$[$initCloserL],*] <;> done) | trivial))))
+            (first | qedFastClose | omega | decide
+                   | (simp_all [$[$initCloserL],*] <;> first | qedFastClose | omega | decide | assumption | rfl | done)))))
 
 private def throwUnsolvedInvGoals (nm : Ident) (hdr footer : MessageData) : TacticM Unit := do
   let goals ← getUnsolvedGoals
@@ -272,21 +293,18 @@ elab_rules : tactic
          (try simp_all only [$[$updL],*]) <;>
          qedUnfoldPresent [$[$usingL],*] <;>
          (try qedCloseCachedPut [$[$usingL],*]) <;>
-         (try ((repeat' split) <;>
-                (first | rfl | omega | assumption
-                       | (simp_all [$[$closerL],*] <;> omega)
-                       | (simp_all [$[$closerL],*] <;> decide)
-                       | (simp_all [$[$closerL],*] <;> done) | trivial))) <;>
-         (try (intros; (try (repeat' split)) <;> (
-               try dsimp only at *;
-               qedAddFieldFacts;
-               (try qedDestructExistsHyps);
-               qedUnfoldPresent [$[$usingL],*];
-               (try simp_all only [$[$finalCloserL],*]);
-               first | rfl | omega | decide | assumption | trivial
-                     | (simp_all [$[$finalCloserL],*] <;> omega)
-                     | (simp_all [$[$finalCloserL],*] <;> decide)
-                     | (simp_all [$[$finalCloserL],*] <;> done) | done)))))
+         (try repeat' split) <;>
+         (first | qedFastClose | omega | skip) <;>
+         intros <;>
+         (try repeat' split) <;>
+         (try dsimp only at *) <;>
+         qedAddFieldFacts <;>
+         (try qedDestructExistsHyps) <;>
+         qedUnfoldPresent [$[$usingL],*] <;>
+         (try simp_all only [$[$finalCloserL],*]) <;>
+         (first | qedFastClose | omega | decide
+                | (simp_all [$[$finalCloserL],*] <;> first | qedFastClose | omega | decide | assumption | rfl | done)
+                | skip)))
     match init with
     | some initT =>
         let initTac ← mkInitTac usingL pred initT

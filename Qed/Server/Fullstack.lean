@@ -14,9 +14,9 @@ private def modRootOf (env : Lean.Environment) (n : Lean.Name) : Lean.Name :=
   | none     => Lean.Name.anonymous
 
 private def collectReachableDefns (env : Lean.Environment) :
-    Nat → List Lean.Name → Std.HashSet Lean.Name → Std.HashSet Lean.Name
-  | 0, _, seen => seen
-  | _ + 1, [], seen => seen
+    Nat → List Lean.Name → Std.HashSet Lean.Name → Except Lean.Name (Std.HashSet Lean.Name)
+  | _, [], seen => .ok seen
+  | 0, n :: _, _ => .error n
   | fuel + 1, n :: rest, seen =>
       if seen.contains n then
         collectReachableDefns env fuel rest seen
@@ -42,7 +42,10 @@ private def verifyFullstackRpcClosure (env : Environment) (fsName : Name) (srvIn
       if mInfo.rawRpcConst != .anonymous then
         rpcConstMap := rpcConstMap.insert mInfo.rawRpcConst (otherSrv, mInfo)
       rpcConstMap := rpcConstMap.insert (otherSrv.serverName ++ Name.mkSimple mInfo.name) (otherSrv, mInfo)
-  let visited := collectReachableDefns env 300000 [resolvedCli] {}
+  let visited ← match collectReachableDefns env 300000 [resolvedCli] {} with
+    | .ok s => pure s
+    | .error pending =>
+        throwErrorAt cliIdent s!"`fullstack {fsName}`: RPC endpoint closure analysis exceeded fuel limit while inspecting `{pending}`"
   let chMap := Qed.channelRegistry.getState env
   let mut fsChanConstMap : NameMap Qed.ChannelInfo := {}
   for (_, chInfo) in chMap do

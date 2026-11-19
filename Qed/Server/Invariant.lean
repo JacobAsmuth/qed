@@ -13,6 +13,22 @@ namespace Qed.Server
 
 syntax "qedSimpHypsEach" : tactic
 
+open Lean Meta Simp in
+private def mkCharListExpr (s : String) : Expr :=
+  let charTy := mkConst ``Char
+  let nilE := mkApp (mkConst ``List.nil [Level.zero]) charTy
+  let consC := mkApp (mkConst ``List.cons [Level.zero]) charTy
+  s.toList.foldr (init := nilE) fun c acc =>
+    mkApp2 consC (mkApp (mkConst ``Char.ofNat) (mkNatLit c.toNat)) acc
+
+open Lean Meta Simp in
+simproc_decl qedReduceStrLen (String.length _) := fun e => do
+  let some (Expr.lit (Literal.strVal s)) := e.getAppArgs[0]? | return .continue
+  let cs := mkCharListExpr s
+  let nExpr := mkNatLit s.length
+  let prf ← mkEqTrans (mkApp (mkConst ``String.length_ofList) cs) (← mkEqRefl nExpr)
+  return .done { expr := nExpr, proof? := some prf }
+
 open Lean Meta Elab Term Tactic in
 private def inspectFieldOrFin (sub : Expr) (addFact : Expr → MetaM Unit) : MetaM Unit := do
   if !sub.hasLooseBVars then
@@ -230,12 +246,13 @@ private def mkSrvRefinementProofStx : TermElabM Term :=
        Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
        Array.size_set, Array.size_push, Array.getElem_set_self,
        Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
-       beq_iff_eq, bne_iff_ne, decide_eq_true_eq]
+       beq_iff_eq, bne_iff_ne, decide_eq_true_eq, Qed.Server.qedReduceStrLen]
     qedDsimpCodecs
+    try simp (config := { zetaDelta := false }) only [Qed.Server.qedReduceStrLen]
     first
-      | rfl | assumption | omega | decide
-      | (simp_all [Qed.QedVal.val_field, Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id] <;>
-          first | rfl | omega | decide | done))
+      | assumption | omega | decide | rfl
+      | (simp_all [Qed.QedVal.val_field, Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id, Qed.Server.qedReduceStrLen] <;>
+          first | omega | decide | rfl | done))
 
 open Lean Meta Elab Term Tactic in
 @[term_elab srvAutoFieldStx]
@@ -261,14 +278,24 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
         let localFacts ← localFactsRef.get
         let localFactIds : Array Ident := (Array.range localFacts.size).map fun i => mkIdent (Name.mkSimple s!"_srvFact{i}")
         let codecLems ← mkOptCodecSimpLems
-        let fastPrfStx ← `(by
-          try simp (config := { zetaDelta := false }) only
-            [id_eq, Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
-             Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
-             Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
-             $[$codecLems],*] at $[$localFactIds:ident]* ⊢
-          qedDsimpCodecs
-          first | rfl | decide | assumption | omega)
+        let fastPrfStx ←
+          if valExpr.isLit && localFacts.isEmpty then
+            `(by
+              qedDsimpCodecs
+              try simp (config := { zetaDelta := false }) only
+                [id_eq, Qed.Lang.QedVal.val_id, Qed.Server.qedReduceStrLen, $[$codecLems],*]
+              first | omega | decide | rfl)
+          else
+            `(by
+              try simp (config := { zetaDelta := false }) only
+                [id_eq, Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
+                 Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
+                 Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
+                 Qed.Server.qedReduceStrLen,
+                 $[$codecLems],*] at $[$localFactIds:ident]* ⊢
+              qedDsimpCodecs
+              try simp (config := { zetaDelta := false }) only [Qed.Server.qedReduceStrLen]
+              first | assumption | omega | decide | rfl)
         let savedMsgs ← Core.getMessageLog
         Core.resetMessageLog
         let fastPrf? : Option Expr ← try
@@ -1011,7 +1038,7 @@ elab_rules : tactic
         try simp (config := { zetaDelta := false }) only [$[$allStepLemmas],*] at *;
         try (repeat' (
           first
-            | (qedElimSrvLetEq; try simp (config := { zetaDelta := false }) only [$[$stepFloatLemmas],*] at ⊢)
+            | (qedElimSrvLetEq; repeat' qedElimSrvLetEq; try simp (config := { zetaDelta := false }) only [$[$stepFloatLemmas],*] at ⊢)
             | (split <;>
                 try simp (config := { zetaDelta := false }) only [$[$stepFloatLemmas],*] at ⊢)
             | (qedSplitEqHyp <;>
@@ -1044,7 +1071,7 @@ elab_rules : tactic
 
 macro "qedNormAsyncCont" : tactic => `(tactic| (
   try dsimp (config := { zetaDelta := false }) only
-    [Qed.Server.srvSeqM, Qed.Server.SrvUnwrap.unwrap, Qed.Server.SrvErr.ofApi, Qed.Server.SrvUnwrapOpt.unwrapOpt] at *
+    [Qed.Server.srvSeqM, Qed.Server.SrvUnwrap.unwrap, Qed.Server.SrvErr.ofApi, Qed.Server.SrvUnwrapOpt.unwrapOpt] at ⊢
   try simp (config := { zetaDelta := false }) only
     [Qed.Server.srvFinish_ok, Qed.Server.srvFinish_err, Qed.Server.srvFinish_none, Qed.Server.srvFinish_srvLetEq,
      Qed.Server.srvFinishEmit_ok, Qed.Server.srvFinishEmit_err, Qed.Server.srvFinishEmit_none, Qed.Server.srvFinishEmit_srvLetEq,
@@ -1053,12 +1080,12 @@ macro "qedNormAsyncCont" : tactic => `(tactic| (
      Qed.Server.srvEnsPost_ok, Qed.Server.srvEnsPost_err, Qed.Server.srvEnsPost_srvLetEq,
      Qed.Server.srvEnsPostOpt_some, Qed.Server.srvEnsPostOpt_none, Qed.Server.srvEnsPostOpt_err, Qed.Server.srvEnsPostOpt_srvLetEq,
      Qed.Server.prod_fst_srvLetEq, Qed.Server.prod_snd_srvLetEq,
-     Qed.Server.threadProg_pure_bind, Qed.Server.threadProg_pure_bind', Qed.Server.threadProg_bind_assoc] at *))
+     Qed.Server.threadProg_pure_bind, Qed.Server.threadProg_pure_bind', Qed.Server.threadProg_bind_assoc] at ⊢))
 
 macro "qedAsyncInit " handlerId:ident : tactic => `(tactic| (
   intros;
   unfold $handlerId:ident;
-  try dsimp (config := { zetaDelta := false }) only [Qed.Server.srvFinishM, Qed.Server.srvSeqM] at *;
+  try dsimp (config := { zetaDelta := false }) only [Qed.Server.srvFinishM, Qed.Server.srvSeqM] at ⊢;
   try simp (config := { zetaDelta := false }) only
     [Qed.Server.srvFinishM, Qed.Server.srvSeqM,
      Qed.Server.srvFinish_srvLetEq, Qed.Server.srvFinishEmit_srvLetEq,
@@ -1066,7 +1093,7 @@ macro "qedAsyncInit " handlerId:ident : tactic => `(tactic| (
      Qed.Server.srvEnsPost_ok, Qed.Server.srvEnsPost_err, Qed.Server.srvEnsPost_srvLetEq,
      Qed.Server.srvEnsPostOpt_some, Qed.Server.srvEnsPostOpt_none, Qed.Server.srvEnsPostOpt_err, Qed.Server.srvEnsPostOpt_srvLetEq,
      Qed.Server.prod_fst_srvLetEq, Qed.Server.prod_snd_srvLetEq,
-     Qed.Server.threadProg_pure_bind, Qed.Server.threadProg_pure_bind', Qed.Server.threadProg_bind_assoc] at *))
+     Qed.Server.threadProg_pure_bind, Qed.Server.threadProg_pure_bind', Qed.Server.threadProg_bind_assoc] at ⊢))
 
 syntax "qedSrvProveAsync " ident "[" ident,* "]" str str : tactic
 

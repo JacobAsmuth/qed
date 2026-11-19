@@ -49,16 +49,29 @@ export const Nat_lor  = (a, b) => a | b;
 const M64 = (1n << 64n) - 1n, u64 = (x) => BigInt(x) & M64;
 export const UInt8_ofNat = (n) => Number(n & 0xFFn);
 export const UInt8_toNat = (a) => BigInt(a);
+export const UInt8_toUInt16 = (a) => a & 0xFF;
+export const UInt8_toUInt32 = (a) => a >>> 0;
 export const UInt8_land = (a, b) => a & b;
 export const UInt8_lor  = (a, b) => a | b;
-export const UInt8_shiftLeft  = (a, b) => (a << b) & 0xFF;
-export const UInt8_shiftRight = (a, b) => a >> b;
+export const UInt8_shiftLeft  = (a, b) => (a << (b & 7)) & 0xFF;
+export const UInt8_shiftRight = (a, b) => (a & 0xFF) >>> (b & 7);
+export const UInt16_ofNat = (n) => Number(n & 0xFFFFn);
+export const UInt16_toNat = (a) => BigInt(a & 0xFFFF);
+export const UInt16_toUInt8 = (a) => a & 0xFF;
+export const UInt16_add = (a, b) => (a + b) & 0xFFFF;
+export const UInt16_mul = (a, b) => Math.imul(a, b) & 0xFFFF;
+export const UInt16_shiftLeft  = (a, b) => (a << (b & 15)) & 0xFFFF;
+export const UInt16_shiftRight = (a, b) => (a & 0xFFFF) >>> (b & 15);
 export const UInt32_mk = (n) => Number(n) >>> 0;
 export const UInt32_ofNat = (n) => Number(n & 0xFFFFFFFFn);
 export const UInt32_ofNatCore = UInt32_ofNat;
 export const UInt32_toNat = (a) => BigInt(a >>> 0);
+export const UInt32_toUInt8 = (a) => a & 0xFF;
 export const UInt32_toUInt64 = (a) => BigInt(a >>> 0);
 export const UInt32_add = (a, b) => (a + b) >>> 0;
+export const UInt32_mul = (a, b) => Math.imul(a, b) >>> 0;
+export const UInt32_shiftLeft  = (a, b) => (a << (b & 31)) >>> 0;
+export const UInt32_shiftRight = (a, b) => (a >>> (b & 31)) >>> 0;
 export const UInt32_decEq = (a, b) => a === b ? 1 : 0;
 export const UInt32_decLe = (a, b) => a <= b ? 1 : 0;
 export const UInt32_decLt = (a, b) => a < b ? 1 : 0;
@@ -202,7 +215,7 @@ export const String_data = (s) => {
 export const String_hash = (s) => { let h = 1469598103934665603n; for (let i = 0; i < s.length; i++) { h ^= BigInt(s.charCodeAt(i)); h = (h * 1099511628211n) & M64; } return h; };
 export const String_toUTF8 = (s) => ENC.encode(s);
 export const String_fromUTF8 = (ba, _h) => DEC.decode(ba);
-export const String_validateUTF8 = (_ba) => 1;
+export const String_validateUTF8 = (ba) => { try { DEC_FATAL.decode(ba); return 1; } catch { return 0; } };
 
 function mkCapBytes(cap, used) {
   const ab = new ArrayBuffer(Math.max(16, cap));
@@ -285,6 +298,8 @@ export const String_ofList = String_mk;
 export const String_toList = String_data;
 export const String_ofByteArray = (ba) => DEC.decode(ba);
 export const String_Internal_append = (a, b) => a + b;
+export const String_Internal_isPrefixOf = (p, s) => s.startsWith(p) ? 1 : 0;
+export const String_Internal_any = (s, f) => { for (const ch of s) { if (app(f, [ch.codePointAt(0)])) return 1; } return 0; };
 export const String_Pos_Raw_get = String_get;
 export const String_Pos_Raw_next = String_next;
 export const String_Pos_Raw_atEnd = String_atEnd;
@@ -306,7 +321,7 @@ export const String_Slice_Pattern_Internal_memcmpStr = (lhs, rhs, lstart, rstart
   return 1;
 };
 export const ByteArray_emptyWithCapacity = (c) => mkCapBytes(Number(c), 0);
-export const ByteArray_validateUTF8 = (ba) => { try { DEC_FATAL.decode(ba); return 1; } catch { return 0; } };
+export const ByteArray_validateUTF8 = String_validateUTF8;
 
 export const ST_Prim_mkRef   = (a, _w) => ({ v: a });
 export const ST_Prim_Ref_get = (r, _w) => r.v;
@@ -362,13 +377,10 @@ export const Qed_Dom_retainAttributes = domCall('retainAttributes');
 export const Qed_Dom_setText = domCall('setText');
 export const Qed_Dom_setValue = domCall('setValue');
 export const Qed_Dom_today = domCall('today');
-export const Qed_Dom_wsMuxSub = domCall('wsMuxSub');
-export const Qed_Dom_wsMuxSend = domCall('wsMuxSend');
-export const Qed_Dom_wsMuxUnsub = domCall('wsMuxUnsub');
-export const Qed_Dom_wsExtOpen = domCall('wsExtOpen');
-export const Qed_Dom_wsExtSendText = domCall('wsExtSendText');
-export const Qed_Dom_wsExtSendBytes = domCall('wsExtSendBytes');
-export const Qed_Dom_wsExtClose = domCall('wsExtClose');
+export const Qed_Dom_wsOpen = domCall('wsOpen');
+export const Qed_Dom_wsSendBytes = domCall('wsSendBytes');
+export const Qed_Dom_wsSendText = domCall('wsSendText');
+export const Qed_Dom_wsClose = domCall('wsClose');
 
 export function assertExterns(required, ns) {
   const missing = required.filter((n) => typeof ns[n] !== 'function' && !(n in ns));

@@ -221,6 +221,16 @@ def App.withDehydrate {Model Msg : Type} (d : Dehydrate Model) (app : App Model 
 @[reducible] def App.withFullDehydrate {Model Msg : Type} [LawfulJson Model] (app : App Model Msg) : App Model Msg :=
   App.withDehydrate Dehydrate.full app (fun _ => rfl)
 
+theorem App.dehydrate_preserves_of_project {Model Msg : Type} (Inv : Model → Prop)
+    (app : App Model Msg) (proj : Model → Model)
+    (hrt : ∀ m, app.rehydrate (app.dehydrate m) = some (proj m))
+    (hproj : ∀ m, Inv m → Inv (proj m)) :
+    ∀ m m', Inv m → app.rehydrate (app.dehydrate m) = some m' → Inv m' := by
+  intro m m' hm hr
+  rw [hrt m] at hr
+  cases hr
+  exact hproj m hm
+
 end Internal
 
 set_option linter.unusedVariables false in

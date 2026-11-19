@@ -74,7 +74,8 @@ def isAllowedExternMod (modName : Name) : Bool :=
 
 def isLegitOpaque (env : Environment) (modName declName : Name) : Bool :=
   (isAllowedExternMod modName && Lean.isExtern env declName) ||
-  (modName == `Qed.Server.Prim && declName == `Qed.Server.Prim.StateBoxPointed) ||
+  (modName == `Qed.Server.Prim &&
+    (declName == `Qed.Server.Prim.StateBoxPointed || declName == `Qed.Server.Prim.StaticDirPointed)) ||
   ((Lean.getInitFnNameFor? env declName).isSome && (Compiler.getImplementedBy? env declName).isNone)
 
 /-- True iff `ci` is compile-time macro/elaborator/tactic/compiler infrastructure (never part of
@@ -94,10 +95,14 @@ def isCompileTimeMetaDecl (env : Environment) (declName : Name) (ci : ConstantIn
       else
         nameStr.contains "_regBuiltin"
 
+private inductive AxiomCheckErr where
+  | disallowed (ax : Name)
+  | fuelExhausted (pending : Name)
+
 private def checkAxiomStep (env : Environment) :
-    Nat → List Name → Std.HashSet Name → Std.HashSet Name → Except Name (Std.HashSet Name)
-  | 0, _, clean, _ => .ok clean
-  | _ + 1, [], clean, visiting => .ok (visiting.fold (fun acc n => acc.insert n) clean)
+    Nat → List Name → Std.HashSet Name → Std.HashSet Name → Except AxiomCheckErr (Std.HashSet Name)
+  | _, [], clean, visiting => .ok (visiting.fold (fun acc n => acc.insert n) clean)
+  | 0, n :: _, _, _ => .error (.fuelExhausted n)
   | fuel + 1, n :: rest, clean, visiting =>
       if clean.contains n || visiting.contains n then
         checkAxiomStep env fuel rest clean visiting
@@ -108,19 +113,22 @@ private def checkAxiomStep (env : Environment) :
             if allowedKernelAxioms.contains ax.name && !ax.isUnsafe then
               checkAxiomStep env fuel rest (clean.insert n) visiting
             else
-              .error ax.name
+              .error (.disallowed ax.name)
         | some ci =>
             let deps := ci.getUsedConstantsAsSet.toList
             checkAxiomStep env fuel (deps ++ rest) clean (visiting.insert n)
 
 /-- Verify that `declName`'s transitive kernel expression dependencies only use axioms in
-    `{propext, Classical.choice, Quot.sound}`, reusing `clean` across calls for O(E) performance. -/
+    `{propext, Classical.choice, Quot.sound}`, reusing `clean` across calls for O(E) performance.
+    Fails closed if traversal exceeds fuel. -/
 def verifyConstAxioms (env : Environment) (declName : Name)
     (clean : Std.HashSet Name) : Except String (Std.HashSet Name) :=
   match checkAxiomStep env 2000000 [declName] clean {} with
   | .ok clean' => .ok clean'
-  | .error badAx =>
+  | .error (.disallowed badAx) =>
       .error s!"kernel gate: `{declName}` depends on disallowed axiom `{badAx}` (only {allowedKernelAxioms} are permitted)"
+  | .error (.fuelExhausted pending) =>
+      .error s!"kernel gate: axiom check for `{declName}` exceeded fuel limit while inspecting `{pending}`"
 
 private def verifyUserDecl (env : Environment) (modName n : Name) (ci? : Option ConstantInfo) :
     Except String Unit := do
@@ -141,28 +149,62 @@ private def verifyUserDecl (env : Environment) (modName n : Name) (ci? : Option 
   if Lean.isExtern env n && !isAllowedExternMod modName then
     throw s!"kernel gate: unverified `@[extern]` `{n}` in `{modName}` is forbidden outside `Qed.Dom` and `Qed.Server.Prim`"
 
+/-- True iff `owner` is a `server` namespace (marked by `_qed_server_marker` emitted by
+    `server` elaboration, or carrying a `dispatchM` taking `Qed.Server.RequestCtx`). -/
+def isServerOwner (env : Environment) (owner : Name) : Bool :=
+  if owner.isAnonymous then false
+  else if env.contains (owner ++ `_qed_server_marker) then true
+  else match env.find? (owner ++ `dispatchM) with
+    | some ci => ci.type.getUsedConstants.any (· == `Qed.Server.RequestCtx)
+    | none    => false
+
+/-- True iff `owner` is an `external` service namespace (marked by `_qed_external_marker`). -/
+def isExternalOwner (env : Environment) (owner : Name) : Bool :=
+  !owner.isAnonymous && env.contains (owner ++ `_qed_external_marker)
+
+/-- True iff `n` (or an enclosing non-`_closed_` declaration prefix, e.g. `match_*` / `_unsafe_rec`
+    auxiliaries) is a server-only declaration owned by a `server` or `external` block.
+    Module-wide CSE `_closed_*` thunks (such as a shared empty `Array.mkEmpty 0`) are excluded
+    because Lean's closed-term extractor reuses them across unrelated declarations in the same file. -/
+def isServerOnlyDeclName (env : Environment) : Name → Bool
+  | .anonymous => false
+  | .num p _   => isServerOnlyDeclName env p
+  | .str owner s =>
+      if s.startsWith "_closed_" then
+        false
+      else if (s == "dispatchM" || s == "wsDispatchM" || s == "initState" || s == "runServer" ||
+          s.endsWith "_step" || s.endsWith "_handler") && isServerOwner env owner then
+        true
+      else if s == "secrets" && (isServerOwner env owner || isExternalOwner env owner) then
+        true
+      else
+        isServerOnlyDeclName env owner
+
+/-- Returns an error message iff `n` is a server-only primitive, secret, state initializer,
+    handler, or dispatcher that must never be bundled into client JavaScript. -/
+def clientLeakReason? (env : Environment) (n : Name) : Option String :=
+  let modName := definingModule env n
+  if modName == `Qed.Server.Prim || modName == `Qed.Server.Native then
+    some s!"client bundle leak gate: server runtime primitive `{n}` (`{modName}`) cannot be bundled into client JavaScript"
+  else if n == `Qed.Server.execExternalRaw ||
+          n == `Qed.Server.MonadServer.httpCall ||
+          n == `Qed.Server.MonadServer.readEnv ||
+          n == `Qed.Server.MonadServer.wsBroadcast ||
+          n == `Qed.Server.flushWsEmits ||
+          n == `Qed.Server.MonadAtomic.runAtomic ||
+          n == `Qed.Server.MonadAtomic.runAtomicRead then
+    some s!"client bundle leak gate: server I/O or state primitive `{n}` cannot be bundled into client JavaScript"
+  else if isServerOnlyDeclName env n then
+    some s!"client bundle leak gate: server secret/state/handler `{n}` cannot be bundled into client JavaScript"
+  else
+    none
+
 /-- Verifies that zero server-only primitives, secrets, state boxes, handlers, or dispatchers
     are reachable from a compiled client JavaScript bundle. -/
 def verifyNoServerLeakInClient (env : Environment) (reachable : Array Name) : Except String Unit := do
   for n in reachable do
-    let modName := definingModule env n
-    if modName == `Qed.Server.Prim || modName == `Qed.Server.Native then
-      throw s!"client bundle leak gate: server runtime primitive `{n}` (`{modName}`) cannot be bundled into client JavaScript"
-    if n == `Qed.Server.execExternalRaw ||
-       n == `Qed.Server.MonadServer.httpCall ||
-       n == `Qed.Server.MonadServer.readEnv ||
-       n == `Qed.Server.MonadServer.wsBroadcast ||
-       n == `Qed.Server.flushWsEmits ||
-       n == `Qed.Server.MonadAtomic.runAtomic ||
-       n == `Qed.Server.MonadAtomic.runAtomicRead then
-      throw s!"client bundle leak gate: server I/O or state primitive `{n}` cannot be bundled into client JavaScript"
-    match n with
-    | .str _ "dispatchM" | .str _ "wsDispatchM" | .str _ "secrets" | .str _ "initState" | .str _ "runServer" =>
-        throw s!"client bundle leak gate: server secret/state/dispatcher `{n}` cannot be bundled into client JavaScript"
-    | .str _ s =>
-        if s.endsWith "_step" || s.endsWith "_handler" then
-          throw s!"client bundle leak gate: server handler `{n}` cannot be bundled into client JavaScript"
-    | _ => pure ()
+    if let some err := clientLeakReason? env n then
+      throw err
 
 /-- Strict runtime reachability gate invoked by `Js.emitProgram` on every JS bundle compilation.
     Applies **zero** meta exemptions: every single constant reachable from the compiled entrypoints

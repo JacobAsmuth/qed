@@ -117,6 +117,7 @@ structure RequestCtx where
   bearerToken : Option String := none
   userId      : Option String := none
   clientIp    : String := "127.0.0.1"
+  connId      : String := ""
 deriving Inhabited, DecidableEq, Repr
 
 namespace RequestCtx
@@ -345,6 +346,19 @@ def isValidBaseOrigin (base : String) : Bool :=
     isSafeUrlChar c && c != '?' && c != '#' && c != '\\' && c != '@' &&
     decide (32 < c.toNat ∧ c.toNat ≠ 127))
 
+def isValidWsBaseOrigin (base : String) : Bool :=
+  (base.startsWith "wss://" || base.startsWith "ws://" ||
+   base.startsWith "https://" || base.startsWith "http://") &&
+  !base.endsWith "/" &&
+  base.toList.all (fun c =>
+    isSafeUrlChar c && c != '?' && c != '#' && c != '\\' && c != '@' &&
+    decide (32 < c.toNat ∧ c.toNat ≠ 127))
+
+def toWsOrigin (base : String) : String :=
+  if base.startsWith "https://" then "wss://" ++ String.ofList (base.toList.drop 8)
+  else if base.startsWith "http://" then "ws://" ++ String.ofList (base.toList.drop 7)
+  else base
+
 private def renderPathParts : List PathPart → Except ApiError (List String)
   | [] => .ok []
   | .lit s :: rest =>
@@ -503,6 +517,21 @@ theorem external_url_preserves_origin
       intro c hc
       exact isSafeExtSuffixChar_no_smuggle (hsfx c hc)
 
+/-- Builds an SSRF/origin-pinned WebSocket URL `toWsOrigin base ++ "/" ++ suffix` for a 3rd-party `external` `ws` channel. -/
+def buildExternalWsUrl (base : String) (parts : List PathPart) (query : List (String × QueryVal)) :
+    Except ApiError String :=
+  buildExternalUrl (toWsOrigin base) parts query
+
+/-- 3rd-Party WebSocket Origin-Pinning & Path-Traversal Closure Theorem. -/
+theorem external_ws_url_preserves_origin
+    (base : String) (parts : List PathPart) (query : List (String × QueryVal)) (url : String)
+    (h : buildExternalWsUrl base parts query = .ok url) :
+    url.startsWith (toWsOrigin base ++ "/") = true ∧
+    ∃ sfx : String,
+      url = (toWsOrigin base ++ "/") ++ sfx ∧
+      (∀ c ∈ sfx.toList, c ≠ '#' ∧ c ≠ '\\' ∧ c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' ∧ c ≠ '@') :=
+  external_url_preserves_origin (toWsOrigin base) parts query url h
+
 /-! ## External Auth Specs, Outbound HTTP & `MonadServer` / `MonadAtomic` -/
 
 inductive AuthSpec where
@@ -540,11 +569,24 @@ structure OutboundResp where
 deriving Inhabited
 
 class MonadServer (m : Type → Type) where
-  httpCall   : OutboundReq → m (Except ApiError OutboundResp)
-  readEnv    : String → m (Option String)
-  nowMs      : m UInt64
-  randomHex  : UInt32 → m String
-  hmacSha256 : ByteArray → ByteArray → m ByteArray
+  httpCall    : OutboundReq → m (Except ApiError OutboundResp)
+  readEnv     : String → m (Option String)
+  nowMs       : m UInt64
+  randomHex   : UInt32 → m String
+  hmacSha256  : ByteArray → ByteArray → m ByteArray
+  wsBroadcast : String → ByteArray → m Unit
+
+structure WsEmit where
+  topic   : String
+  payload : ByteArray
+deriving Inhabited, DecidableEq
+
+@[specialize]
+def flushWsEmits {m : Type → Type} [Monad m] [MonadServer m] : List WsEmit → m Unit
+  | []      => pure ()
+  | e :: es => do
+      MonadServer.wsBroadcast e.topic e.payload
+      flushWsEmits es
 
 class MonadAtomic (σ : Type) (m : Type → Type) where
   runAtomic     : {α : Type} → (σ → σ × α) → m α
@@ -563,15 +605,16 @@ class MonadAtomic (σ : Type) (m : Type → Type) where
 
 /-- Effect tree of a server handler thread executing non-blocking external I/O interleaved with
     single-step `atomic` shared-state transitions on `σ`. Notice `σ` is unreachable during
-    `httpCall`, `readEnv`, `nowMs`, `randomHex`, and `hmacSha256` steps. -/
+    `httpCall`, `readEnv`, `nowMs`, `randomHex`, `hmacSha256`, and `wsBroadcast` steps. -/
 inductive ThreadProg (σ : Type) (α : Type) : Type where
-  | pure       : α → ThreadProg σ α
-  | httpCall   : OutboundReq → (Except ApiError OutboundResp → ThreadProg σ α) → ThreadProg σ α
-  | readEnv    : String → (Option String → ThreadProg σ α) → ThreadProg σ α
-  | nowMs      : (UInt64 → ThreadProg σ α) → ThreadProg σ α
-  | randomHex  : UInt32 → (String → ThreadProg σ α) → ThreadProg σ α
-  | hmacSha256 : ByteArray → ByteArray → (ByteArray → ThreadProg σ α) → ThreadProg σ α
-  | atomic     : (σ → σ) → (σ → ThreadProg σ α) → ThreadProg σ α
+  | pure        : α → ThreadProg σ α
+  | httpCall    : OutboundReq → (Except ApiError OutboundResp → ThreadProg σ α) → ThreadProg σ α
+  | readEnv     : String → (Option String → ThreadProg σ α) → ThreadProg σ α
+  | nowMs       : (UInt64 → ThreadProg σ α) → ThreadProg σ α
+  | randomHex   : UInt32 → (String → ThreadProg σ α) → ThreadProg σ α
+  | hmacSha256  : ByteArray → ByteArray → (ByteArray → ThreadProg σ α) → ThreadProg σ α
+  | wsBroadcast : String → ByteArray → (Unit → ThreadProg σ α) → ThreadProg σ α
+  | atomic      : (σ → σ) → (σ → ThreadProg σ α) → ThreadProg σ α
 
 namespace ThreadProg
 
@@ -582,6 +625,7 @@ def bind {σ α β : Type} : ThreadProg σ α → (α → ThreadProg σ β) → 
   | .nowMs f,            k => .nowMs (fun r => bind (f r) k)
   | .randomHex n f,      k => .randomHex n (fun r => bind (f r) k)
   | .hmacSha256 key m f, k => .hmacSha256 key m (fun r => bind (f r) k)
+  | .wsBroadcast t p f,  k => .wsBroadcast t p (fun r => bind (f r) k)
   | .atomic st next,     k => .atomic st (fun s => bind (next s) k)
 
 instance {σ : Type} : Monad (ThreadProg σ) where
@@ -594,6 +638,7 @@ instance {σ : Type} : MonadServer (ThreadProg σ) where
   nowMs              := .nowMs .pure
   randomHex n        := .randomHex n .pure
   hmacSha256 key msg := .hmacSha256 key msg .pure
+  wsBroadcast t p    := .wsBroadcast t p .pure
 
 instance {σ : Type} : MonadAtomic σ (ThreadProg σ) where
   runAtomic f     := .atomic (fun s => (f s).1) (fun s => .pure (f s).2)
@@ -618,6 +663,7 @@ end ThreadProg
   | nowMs _ ih => exact congrArg _ (funext ih)
   | randomHex _ _ ih => exact congrArg _ (funext ih)
   | hmacSha256 _ _ _ ih => exact congrArg _ (funext ih)
+  | wsBroadcast _ _ _ ih => exact congrArg _ (funext ih)
   | atomic _ _ ih => exact congrArg _ (funext ih)
 
 /-- General two-state transition invariant across an async `ThreadProg`: every `atomic` step `s ↦ st s`
@@ -637,6 +683,8 @@ inductive ProgPreservesStepRel {σ α : Type} (Inv : σ → Prop) (Rel : σ → 
       (∀ r, ProgPreservesStepRel Inv Rel (k r)) → ProgPreservesStepRel Inv Rel (.randomHex n k)
   | hmacSha256 (key msg : ByteArray) (k : ByteArray → ThreadProg σ α) :
       (∀ r, ProgPreservesStepRel Inv Rel (k r)) → ProgPreservesStepRel Inv Rel (.hmacSha256 key msg k)
+  | wsBroadcast (t : String) (p : ByteArray) (k : Unit → ThreadProg σ α) :
+      (∀ r, ProgPreservesStepRel Inv Rel (k r)) → ProgPreservesStepRel Inv Rel (.wsBroadcast t p k)
   | atomic (st : σ → σ) (next : σ → ThreadProg σ α) :
       (∀ s, Inv s → Rel s (st s)) →
       (∀ s, Inv s → ProgPreservesStepRel Inv Rel (next s)) →
@@ -657,9 +705,10 @@ theorem progPreservesStepRel_bind {σ α β : Type} {Inv : σ → Prop} {Rel : �
   change ProgPreservesStepRel Inv Rel (ThreadProg.bind p k)
   induction hp with
   | pure a => exact hk a
-  | httpCall _ _ _ ih | readEnv _ _ _ ih | nowMs _ _ ih | randomHex _ _ _ ih | hmacSha256 _ _ _ _ ih =>
+  | httpCall _ _ _ ih | readEnv _ _ _ ih | nowMs _ _ ih | randomHex _ _ _ ih
+  | hmacSha256 _ _ _ _ ih | wsBroadcast _ _ _ _ ih =>
       first | exact .httpCall _ _ ih | exact .readEnv _ _ ih | exact .nowMs _ ih
-            | exact .randomHex _ _ ih | exact .hmacSha256 _ _ _ ih
+            | exact .randomHex _ _ ih | exact .hmacSha256 _ _ _ ih | exact .wsBroadcast _ _ _ ih
   | atomic st _ hst _ ih => exact .atomic st _ hst ih
 
 theorem progPreservesStepRel_runAtomic {σ α : Type} {Inv : σ → Prop} {Rel : σ → σ → Prop}
@@ -718,6 +767,9 @@ inductive MultiCoreStep {σ Out : Type} (Inv : σ → Prop) :
   | stepHmac (s : σ) (pre post : List (ThreadProg σ Out))
       (key msg : ByteArray) (k : ByteArray → ThreadProg σ Out) (mac : ByteArray) :
       MultiCoreStep Inv ⟨s, pre ++ .hmacSha256 key msg k :: post⟩ ⟨s, pre ++ k mac :: post⟩
+  | stepWsBroadcast (s : σ) (pre post : List (ThreadProg σ Out))
+      (t : String) (p : ByteArray) (k : Unit → ThreadProg σ Out) :
+      MultiCoreStep Inv ⟨s, pre ++ .wsBroadcast t p k :: post⟩ ⟨s, pre ++ k () :: post⟩
   | stepAtomic (s : σ) (pre post : List (ThreadProg σ Out))
       (st : σ → σ) (next : σ → ThreadProg σ Out) :
       MultiCoreStep Inv ⟨s, pre ++ .atomic st next :: post⟩
@@ -769,6 +821,8 @@ private theorem step_preserves_inv_and_pool {σ Out : Type} {Inv : σ → Prop}
       cases mid hpool with | randomHex _ _ hk => exact ⟨hinv, pool_replace_mid hpool (hk hex)⟩
   | stepHmac s pre post key msg k mac =>
       cases mid hpool with | hmacSha256 _ _ _ hk => exact ⟨hinv, pool_replace_mid hpool (hk mac)⟩
+  | stepWsBroadcast s pre post t p k =>
+      cases mid hpool with | wsBroadcast _ _ _ hk => exact ⟨hinv, pool_replace_mid hpool (hk ())⟩
   | stepAtomic s pre post st next =>
       cases mid hpool with | atomic _ _ hst hnext => exact ⟨hst s hinv, pool_replace_mid hpool (hnext s hinv)⟩
 
@@ -800,6 +854,8 @@ inductive NoAtomic {σ α : Type} : ThreadProg σ α → Prop where
       (∀ r, NoAtomic (k r)) → NoAtomic (.randomHex n k)
   | hmacSha256 (key msg : ByteArray) (k : ByteArray → ThreadProg σ α) :
       (∀ r, NoAtomic (k r)) → NoAtomic (.hmacSha256 key msg k)
+  | wsBroadcast (t : String) (p : ByteArray) (k : Unit → ThreadProg σ α) :
+      (∀ r, NoAtomic (k r)) → NoAtomic (.wsBroadcast t p k)
 
 class SafeIO {σ α : Type} (p : ThreadProg σ α) : Prop where
   noAtomic : NoAtomic p
@@ -816,6 +872,8 @@ instance {σ : Type} (n : UInt32) : SafeIO (MonadServer.randomHex (m := ThreadPr
   ⟨.randomHex n _ (fun r => .pure r)⟩
 instance {σ : Type} (key msg : ByteArray) : SafeIO (MonadServer.hmacSha256 (m := ThreadProg σ) key msg) :=
   ⟨.hmacSha256 key msg _ (fun r => .pure r)⟩
+instance {σ : Type} (t : String) (p : ByteArray) : SafeIO (MonadServer.wsBroadcast (m := ThreadProg σ) t p) :=
+  ⟨.wsBroadcast t p _ (fun r => .pure r)⟩
 
 theorem noAtomic_bind {σ α β : Type} {p : ThreadProg σ α} {k : α → ThreadProg σ β}
     (hp : NoAtomic p) (hk : ∀ a, NoAtomic (k a)) : NoAtomic (p >>= k) := by
@@ -827,10 +885,18 @@ theorem noAtomic_bind {σ α β : Type} {p : ThreadProg σ α} {k : α → Threa
   | nowMs _ _ ih => exact .nowMs _ ih
   | randomHex _ _ _ ih => exact .randomHex _ _ ih
   | hmacSha256 _ _ _ _ ih => exact .hmacSha256 _ _ _ ih
+  | wsBroadcast _ _ _ _ ih => exact .wsBroadcast _ _ _ ih
 
 instance {σ α β : Type} (p : ThreadProg σ α) (k : α → ThreadProg σ β)
     [hp : SafeIO p] [hk : ∀ a, SafeIO (k a)] : SafeIO (p >>= k) where
   noAtomic := noAtomic_bind hp.noAtomic (fun a => (hk a).noAtomic)
+
+theorem noAtomic_flushWsEmits {σ : Type} : ∀ es : List WsEmit, NoAtomic (flushWsEmits (m := ThreadProg σ) es)
+  | [] => .pure ()
+  | e :: es => noAtomic_bind (.wsBroadcast e.topic e.payload _ (fun _ => .pure ())) (fun _ => noAtomic_flushWsEmits es)
+
+instance {σ : Type} (es : List WsEmit) : SafeIO (flushWsEmits (m := ThreadProg σ) es) :=
+  ⟨noAtomic_flushWsEmits es⟩
 
 theorem safeIO_preservesStepRel {σ α : Type} {Inv : σ → Prop} {Rel : σ → σ → Prop}
     (p : ThreadProg σ α) [hp : SafeIO p] :
@@ -842,6 +908,7 @@ theorem safeIO_preservesStepRel {σ α : Type} {Inv : σ → Prop} {Rel : σ →
   | nowMs _ _ ih => exact .nowMs _ ih
   | randomHex _ _ _ ih => exact .randomHex _ _ ih
   | hmacSha256 _ _ _ _ ih => exact .hmacSha256 _ _ _ ih
+  | wsBroadcast _ _ _ _ ih => exact .wsBroadcast _ _ _ ih
 
 theorem safeIO_bind_preservesStepRel {σ α β : Type} {Inv : σ → Prop} {Rel : σ → σ → Prop}
     (p : ThreadProg σ α) [SafeIO p] {k : α → ThreadProg σ β}
@@ -882,6 +949,8 @@ inductive ProgEnsures {σ α : Type} (Inv : σ → Prop) (Post : α → Prop) : 
       (∀ r, ProgEnsures Inv Post (k r)) → ProgEnsures Inv Post (.randomHex n k)
   | hmacSha256 (key msg : ByteArray) (k : ByteArray → ThreadProg σ α) :
       (∀ r, ProgEnsures Inv Post (k r)) → ProgEnsures Inv Post (.hmacSha256 key msg k)
+  | wsBroadcast (t : String) (p : ByteArray) (k : Unit → ThreadProg σ α) :
+      (∀ r, ProgEnsures Inv Post (k r)) → ProgEnsures Inv Post (.wsBroadcast t p k)
   | atomic (st : σ → σ) (next : σ → ThreadProg σ α) :
       (∀ s, Inv s → ProgEnsures Inv Post (next s)) →
       ProgEnsures Inv Post (.atomic st next)
@@ -899,9 +968,10 @@ theorem progEnsures_bind {σ α β : Type} {Inv : σ → Prop} {Q : α → Prop}
   change ProgEnsures Inv Post (ThreadProg.bind p k)
   induction hp with
   | pure a ha => exact hk a ha
-  | httpCall _ _ _ ih | readEnv _ _ _ ih | nowMs _ _ ih | randomHex _ _ _ ih | hmacSha256 _ _ _ _ ih =>
+  | httpCall _ _ _ ih | readEnv _ _ _ ih | nowMs _ _ ih | randomHex _ _ _ ih
+  | hmacSha256 _ _ _ _ ih | wsBroadcast _ _ _ _ ih =>
       first | exact .httpCall _ _ ih | exact .readEnv _ _ ih | exact .nowMs _ ih
-            | exact .randomHex _ _ ih | exact .hmacSha256 _ _ _ ih
+            | exact .randomHex _ _ ih | exact .hmacSha256 _ _ _ ih | exact .wsBroadcast _ _ _ ih
   | atomic st _ _ ih => exact .atomic st _ ih
 
 theorem safeIO_ensures_true {σ α : Type} {Inv : σ → Prop}
@@ -914,6 +984,7 @@ theorem safeIO_ensures_true {σ α : Type} {Inv : σ → Prop}
   | nowMs _ _ ih => exact .nowMs _ ih
   | randomHex _ _ _ ih => exact .randomHex _ _ ih
   | hmacSha256 _ _ _ _ ih => exact .hmacSha256 _ _ _ ih
+  | wsBroadcast _ _ _ _ ih => exact .wsBroadcast _ _ _ ih
 
 theorem safeIO_bind_ensures {σ α β : Type} {Inv : σ → Prop} {Post : β → Prop}
     (p : ThreadProg σ α) [SafeIO p] {k : α → ThreadProg σ β}
@@ -973,6 +1044,9 @@ inductive TrackedMultiCoreStep {σ Tgt Out : Type} (Inv : σ → Prop) :
   | stepTargetHmac (s : σ) (os : List (ThreadProg σ Out))
       (key msg : ByteArray) (k : ByteArray → ThreadProg σ Tgt) (mac : ByteArray) :
       TrackedMultiCoreStep Inv ⟨s, .hmacSha256 key msg k, os⟩ ⟨s, k mac, os⟩
+  | stepTargetWsBroadcast (s : σ) (os : List (ThreadProg σ Out))
+      (t : String) (p : ByteArray) (k : Unit → ThreadProg σ Tgt) :
+      TrackedMultiCoreStep Inv ⟨s, .wsBroadcast t p k, os⟩ ⟨s, k (), os⟩
   | stepTargetAtomic (s : σ) (os : List (ThreadProg σ Out))
       (st : σ → σ) (next : σ → ThreadProg σ Tgt) :
       TrackedMultiCoreStep Inv ⟨s, .atomic st next, os⟩ ⟨st s, next s, os⟩
@@ -1014,6 +1088,9 @@ private theorem trackedStep_preserves {σ Tgt Out : Type} {Inv : σ → Prop} {P
   | stepTargetHmac s os key msg k mac =>
       cases htinv with | hmacSha256 _ _ _ hk1 =>
       cases htens with | hmacSha256 _ _ _ hk2 => exact ⟨hinv, hk1 mac, hk2 mac, hopool⟩
+  | stepTargetWsBroadcast s os t p k =>
+      cases htinv with | wsBroadcast _ _ _ hk1 =>
+      cases htens with | wsBroadcast _ _ _ hk2 => exact ⟨hinv, hk1 (), hk2 (), hopool⟩
   | stepTargetAtomic s os st next =>
       cases htinv with | atomic _ _ hst hnext1 =>
       cases htens with | atomic _ _ hnext2 => exact ⟨hst s hinv, hnext1 s hinv, hnext2 s hinv, hopool⟩

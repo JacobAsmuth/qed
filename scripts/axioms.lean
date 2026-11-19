@@ -11,6 +11,7 @@ import Examples.Signup
 import Examples.Chat
 import Examples.Bookshelf
 import Examples.CloudBooks
+import Examples.LiveRoom
 
 #print axioms Counter.counterSafe
 #print axioms Todo.Row.rowSafe
@@ -233,10 +234,28 @@ import Examples.CloudBooks
 #print axioms Qed.App.ssr_hydrate_patch_equiv
 #print axioms Qed.sanitizeCssAtom_no_comment
 #print axioms Qed.sanitizeCssSelector_no_comment
+#print axioms Qed.sanitizeInlineCssAtom_no_comment
 #print axioms Qed.renderStyleSheet_no_lt
 #print axioms Qed.renderStyleSheet_no_closeSeq
+#print axioms Qed.Theme.render_no_lt
+#print axioms Qed.Theme.render_no_closeSeq
+#print axioms Qed.Keyframes.rule_no_lt
+#print axioms Qed.Keyframes.rule_no_closeSeq
+#print axioms Qed.Style.extend_raw_no_lt
+#print axioms Qed.Style.merge_raw_no_lt
+#print axioms Qed.inlineStyleStr_no_lt
+#print axioms Qed.inlineStyleStr_no_quote
+#print axioms Qed.inlineStyleStr_no_closeSeq
+#print axioms Qed.Attr.valid_inlineStyle
+#print axioms Qed.Color.contrastX100_symm
+#print axioms Qed.Color.contrastX100_self
+#print axioms Qed.wcagAAA_implies_wcagAA
+#print axioms Qed.wcagAA_implies_wcagAALarge
 #print axioms Qed.roleLacks_canonical
 #print axioms Qed.tagLacks_canonical
+#print axioms Qed.roleHasAll_canonical
+#print axioms Qed.tagHas_canonical
+#print axioms Qed.noConflictingStyles_canonical
 #print axioms Qed.App.guardRehydrate_sound
 #print axioms Qed.App.guardRehydrate_complete
 #print axioms Qed.ElemStateEquiv.dispatchInput
@@ -258,3 +277,31 @@ import Examples.CloudBooks
 #print axioms Qed.Cached.all_lookup_state
 #print axioms Qed.Query.boot_preserves_inv
 #print axioms Qed.Query.wrap_preserves_inv
+
+-- Verified Multiplexed & 3rd-Party WebSockets (Framing, Reconnect, Transactional Emit, Subscriptions & Closure)
+#print axioms Qed.Reconnect.nextDelayMs_off
+#print axioms Qed.Reconnect.nextDelayMs_exhausted_fixed
+#print axioms Qed.Reconnect.nextDelayMs_exhausted_backoff
+#print axioms Qed.Reconnect.nextDelayMs_backoff_le_max
+#print axioms Qed.WsMuxFrame.decode_encode_unsub
+#print axioms Qed.WsMuxFrame.decode_encode_send
+#print axioms Qed.WsMuxFrame.decode_encode_joinOk
+#print axioms Qed.WsMuxFrame.decode_encode_event
+#print axioms Qed.wsTopicKey_injective
+#print axioms Qed.Subscription.boot_preserves_inv
+#print axioms Qed.Subscription.wrap_preserves_inv
+#print axioms Qed.Subscription.wrap_noop_when_keys_unchanged
+#print axioms Qed.fullstack_ws_closure_sound
+#print axioms Qed.Server.external_ws_url_preserves_origin
+#print axioms Qed.Server.srvFinishEmit_err_no_emits
+#print axioms Qed.Server.srvAtomicCommitEmit_err_no_emits
+#print axioms LiveRoom.Hub.inv_init
+#print axioms LiveRoom.Hub.announce_inv
+#print axioms LiveRoom.Hub.announce_ensures
+#print axioms LiveRoom.Hub.room_onJoin_inv
+#print axioms LiveRoom.Hub.room_onSend_inv
+#print axioms LiveRoom.Hub.room_onLeave_inv
+#print axioms LiveRoom.Hub.concurrent_linearizable
+#print axioms LiveRoom.LiveApp.allMsgsValidRoom
+#print axioms LiveRoom.LiveApp.app_view_eq
+#print axioms LiveRoom.App.ws_endpoints_valid

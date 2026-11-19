@@ -75,11 +75,8 @@ server BadUnhandledError:
 
 -- 6. Rejects unproven array indexing `items[idx]` without bounds guard
 /--
-error: unsolved goals
-_s0 : State
-ctx : Server.RequestCtx
-idx : Nat
-⊢ idx < _s0.items.size
+error: cannot prove array index `idx` is in bounds for `items` (requires `idx < items.size`).
+Guard this access with `if idx < items.size:` or `ensure idx < items.size else ...` before indexing.
 -/
 #guard_msgs in
 server BadArrayBounds:
@@ -89,12 +86,8 @@ server BadArrayBounds:
 
 -- 7. Rejects invalid `schema` `Field` refinement at compile time
 /--
-error: unsolved goals
-m✝ : Type → Type
-inst✝¹ : Monad m✝
-inst✝ : Server.MonadServer m✝
-ctx : Server.RequestCtx
-⊢ False
+error: cannot prove schema field refinement `1 ≤ "".length ∧ "".length ≤ 32` for value `""`.
+Guard this value with `if ...:`, `ensure ... else ...`, or a `requires` precondition so the compiler can verify it satisfies the schema's `where` rule.
 -/
 #guard_msgs in
 server BadFieldRefinement:
@@ -103,10 +96,10 @@ server BadFieldRefinement:
 
 -- 8. Rejects mutation that can violate a single-state `invariant`
 /--
-error: server invariant `StateInv` could not be proved for `overflow`.
+error: server invariant `stock <= 100` could not be proved for `overflow`.
 Remaining proof obligation:
   _s0.stock + 50 ≤ 100
-Guard state mutations with `if ...` or `requires ...` so this invariant holds across every branch.
+Guard state mutations with `if ...:`, `ensure ... else ...`, or `requires ...` so this invariant holds across every branch.
 -/
 #guard_msgs in
 server BadSingleStateInv:
@@ -121,7 +114,7 @@ server BadSingleStateInv:
 error: server invariant `orders >= old(orders)` could not be proved for `resetOrders`.
 Remaining proof obligation:
   0 ≥ _s0.orders
-Guard state mutations with `if ...` or `requires ...` so this invariant holds across every branch.
+Guard state mutations with `if ...:`, `ensure ... else ...`, or `requires ...` so this invariant holds across every branch.
 -/
 #guard_msgs in
 server BadTwoStateInv:
@@ -136,7 +129,7 @@ server BadTwoStateInv:
 error: server invariant `mutating items requires ctx.userId != none` could not be proved for `unauthenticatedPush`.
 Remaining proof obligation:
   _s0.items.push x = _s0.items ∨ ¬ctx.userId = none
-Guard state mutations with `if ...` or `requires ...` so this invariant holds across every branch.
+Add a matching `requires` clause or guard mutations of that field with `if ...:` / `ensure ... else ...`.
 -/
 #guard_msgs in
 server BadMutatingAuthInv:
@@ -178,7 +171,9 @@ server OtherSrv:
 -- 12. Rejects client RPC call when server parameter `requires` cannot be proved
 /--
 error: RPC `CheckedSrv.buy` precondition `1 <= qty <= 50` could not be proved at this call site.
-Supply literals, guard with `when`/`if`, pass refined `Field`/`Ensured` values, or declare a component `invariant`.
+Remaining proof obligation:
+  1 ≤ 0 ∧ 0 ≤ 50
+Supply valid arguments, guard with `when`/`if`, pass refined `Field`/`Ensured` values, or declare a component `invariant`.
 -/
 #guard_msgs in
 component BadClientRequiresParam:
@@ -206,7 +201,7 @@ component BadClientRequiresAuth:
 
 -- 14. Rejects non-exhaustive client `await ... catch` missing a typed `fail(.tag)` branch
 /--
-error: `await CheckedSrv.buy(...)` has unhandled domain error(s): .limitReached; handle them with `catch: case .tag: ...`
+error: `await CheckedSrv.buy(...)` has unhandled domain error(s): .limitReached; handle them with `catch: case .limitReached: ...`
 -/
 #guard_msgs in
 component BadClientNonExhaustiveCatch:
@@ -275,7 +270,9 @@ component BadMutatingQuery:
 -- 18. Rejects reactive `query` when server parameter `requires` cannot be proved
 /--
 error: RPC `QuerySrv.quote` precondition `1 <= qty <= 50` could not be proved at this call site.
-Supply literals, guard with `when`/`if`, pass refined `Field`/`Ensured` values, or declare a component `invariant`.
+Remaining proof obligation:
+  1 ≤ 0 ∧ 0 ≤ 50
+Supply valid arguments, guard with `when`/`if`, pass refined `Field`/`Ensured` values, or declare a component `invariant`.
 -/
 #guard_msgs in
 component BadQueryRequiresParam:
@@ -285,8 +282,8 @@ component BadQueryRequiresParam:
 
 -- 19. Rejects reactive `query` requiring `ctx.userId != none` without an active session guard
 /--
-error: RPC `QuerySrv.quote` requires an authenticated session (`user ≠ none`), which could not be proved at this call site.
-Guard this call with `when user.isSome:`, `if user.isSome: ...`, or declare `invariant ...: user.isSome`.
+error: RPC `QuerySrv.quote` requires an authenticated session (`user != none`), which could not be proved at this call site.
+Guard this call with `when user.isSome`, `if user.isSome: ...`, or declare `invariant ...: user.isSome`.
 -/
 #guard_msgs in
 component BadQueryRequiresAuth:
@@ -310,5 +307,118 @@ component VerifiedQueryFlow:
       <Await of={quote} as={v}><span>{f"{v}"}</span></Await>
       <Await of={echoed} as={e}><span>{f"{e}"}</span></Await>
     </div>
+
+-- 21. Rejects 3rd-party `external` combining client-usable `ws` channels with server `auth` secrets
+/--
+error: `external BadAuthWs` declares client-usable `ws` channels and cannot attach server `auth` secrets; split server-authenticated HTTP endpoints into a separate `external` block
+-/
+#guard_msgs in
+external BadAuthWs:
+  base "wss://ws.example.com"
+  auth bearer(secret("WS_SECRET"))
+  ws "/stream"
+    feed() -> String
+
+-- 22. Rejects `emit` violating channel `ensures` at compile time
+/--
+error: cannot prove channel `ensures` postcondition `bounded_ens 99` at `emit`.
+Ensure the emitted event satisfies the channel's `ensures` clause.
+-/
+#guard_msgs in
+server BadEmitSrv:
+  channel bounded() -> Nat:
+    ensures event <= 50
+    on_join:
+      pass
+  def pushBad() -> Unit:
+    emit bounded(99)
+    return ()
+
+server WsCheckSrv:
+  channel gauge(room: Nat) -> Nat:
+    requires ctx.userId != none
+    requires room <= 10
+    ensures event <= 50
+    on_join:
+      pass
+    on_send(v: Nat):
+      requires v <= 50
+      emit gauge(room, v)
+    on_leave:
+      pass
+
+-- 23. Rejects `subscribe` requiring `ctx.userId != none` without session guard
+/--
+error: RPC `WsCheckSrv.gauge` requires an authenticated session (`user != none`), which could not be proved at this call site.
+Guard this call with `when user.isSome`, `if user.isSome: ...`, or declare `invariant ...: user.isSome`.
+-/
+#guard_msgs in
+component BadSubNoAuth:
+  session user
+  subscribe g = WsCheckSrv.gauge(1):
+    on_message(v):
+      pass
+  view: <span>ok</span>
+
+-- 24. Rejects `subscribe` violating channel parameter `requires`
+/--
+error: RPC `WsCheckSrv.gauge` precondition `room <= 10` could not be proved at this call site.
+Remaining proof obligation:
+  99 ≤ 10
+Supply valid arguments, guard with `when`/`if`, pass refined `Field`/`Ensured` values, or declare a component `invariant`.
+-/
+#guard_msgs in
+component BadSubBadParam:
+  session user
+  subscribe g = WsCheckSrv.gauge(99) when user.isSome:
+    on_message(v):
+      pass
+  view: <span>ok</span>
+
+-- 25. Rejects `send` violating channel `on_send` `requires`
+/--
+error: RPC `WsCheckSrv.gauge.send` precondition `v <= 50` could not be proved at this call site.
+Remaining proof obligation:
+  77 ≤ 50
+Supply valid arguments, guard with `when`/`if`, pass refined `Field`/`Ensured` values, or declare a component `invariant`.
+-/
+#guard_msgs in
+component BadSendParam:
+  session user
+  subscribe g = WsCheckSrv.gauge(1) when user.isSome:
+    on_message(v):
+      pass
+  action go:
+    send g(77)
+  view: <span>ok</span>
+
+-- 26. Rejects `fullstack` mounting a server when client subscribes to a different server's channel
+component SubOtherWs:
+  session user
+  subscribe g = WsCheckSrv.gauge(1) when user.isSome:
+    on_message(_):
+      pass
+  view: <span>ok</span>
+
+/--
+error: `fullstack BadWsFs` mounts `server CheckedSrv`, but client `SubOtherWs` subscribes to WebSocket channel `WsCheckSrv.gauge` on unmounted server `WsCheckSrv`
+-/
+#guard_msgs in
+fullstack BadWsFs:
+  server CheckedSrv
+  client SubOtherWs
+  title "BadWs"
+
+-- 27. Positive: channel `ensures event <= 50` flows automatically into client component `invariant`
+component VerifiedWsEnsures:
+  session user
+  state lastVal : Nat = 0
+  invariant lastBounded: lastVal <= 50
+  subscribe g = WsCheckSrv.gauge(1) when user.isSome:
+    on_message(v):
+      lastVal = v
+  action sendOk(n: Nat) when n <= 50:
+    send g(n)
+  view: <span>{lastVal}</span>
 
 end ServerChecks

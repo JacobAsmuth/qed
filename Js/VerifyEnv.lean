@@ -151,11 +151,13 @@ def verifyNoServerLeakInClient (env : Environment) (reachable : Array Name) : Ex
     if n == `Qed.Server.execExternalRaw ||
        n == `Qed.Server.MonadServer.httpCall ||
        n == `Qed.Server.MonadServer.readEnv ||
+       n == `Qed.Server.MonadServer.wsBroadcast ||
+       n == `Qed.Server.flushWsEmits ||
        n == `Qed.Server.MonadAtomic.runAtomic ||
        n == `Qed.Server.MonadAtomic.runAtomicRead then
       throw s!"client bundle leak gate: server I/O or state primitive `{n}` cannot be bundled into client JavaScript"
     match n with
-    | .str _ "dispatchM" | .str _ "secrets" | .str _ "initState" | .str _ "runServer" =>
+    | .str _ "dispatchM" | .str _ "wsDispatchM" | .str _ "secrets" | .str _ "initState" | .str _ "runServer" =>
         throw s!"client bundle leak gate: server secret/state/dispatcher `{n}` cannot be bundled into client JavaScript"
     | .str _ s =>
         if s.endsWith "_step" || s.endsWith "_handler" then

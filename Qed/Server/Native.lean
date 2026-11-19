@@ -152,6 +152,7 @@ instance : MonadServer IO where
   nowMs := Prim.nowMs
   randomHex := Prim.randomHex
   hmacSha256 := Prim.hmacSha256
+  wsBroadcast := Prim.wsBroadcast
 
 @[implicit_reducible]
 def withStateBox {σ : Type} (box : Prim.StateBox σ) : MonadAtomic σ IO where
@@ -187,7 +188,8 @@ def runFullstackWithDispatch {Model Msg : Type}
     (port : UInt16)
     (staticDir : String)
     (devMode : Bool := false)
-    (numWorkers : UInt32 := 0) : IO UInt32 := do
+    (numWorkers : UInt32 := 0)
+    (wsDispatchFn? : Option (RequestCtx → UInt8 → String → ByteArray → ByteArray → IO (Except ApiError ByteArray)) := none) : IO UInt32 := do
   if !(← verifyRequiredSecrets requiredSecrets) then
     return 1
   let rpcPrefix := "/_qed/rpc/" ++ serverShortName ++ "/"
@@ -220,40 +222,76 @@ def runFullstackWithDispatch {Model Msg : Type}
       return (200, "text/html; charset=utf-8", if method == "HEAD" then ByteArray.empty else finalHtml)
     else
       return (404, "text/plain; charset=utf-8", "not found".toUTF8)
-  Prim.serveNative port numWorkers staticDir (if devMode then 1 else 0) handler
+  match wsDispatchFn? with
+  | some wsDispatchFn =>
+      let wsPath := "/_qed/ws/" ++ serverShortName
+      let buildWsCtx : Array (String × String) → String → IO RequestCtx := fun hdrs ip => do
+        let baseCtx ← buildRequestCtx hdrs ip
+        let cid ← Prim.randomHex 12
+        return { baseCtx with connId := "ws-" ++ cid }
+      let wsAction : RequestCtx → UInt8 → String → ByteArray → ByteArray → IO (Except String ByteArray) :=
+        fun ctx kind channel params payload => do
+          match ← wsDispatchFn ctx kind channel params payload with
+          | .ok bs   => return .ok bs
+          | .error e => return .error e.message
+      Prim.serveNativeWs port numWorkers staticDir (if devMode then 1 else 0) handler wsPath buildWsCtx wsAction
+  | none =>
+      Prim.serveNative port numWorkers staticDir (if devMode then 1 else 0) handler
 
-def runStatefulFullstack {σ Model Msg : Type}
-    (app : Qed.App Model Msg)
-    (title : String)
-    (serverShortName : String)
-    (initState : σ)
-    (requiredSecrets : Array String)
+private def runStatefulFullstackCore {σ Model Msg : Type}
+    (app : Qed.App Model Msg) (title serverShortName : String)
+    (initState : σ) (requiredSecrets : Array String)
     (dispatchM : {m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
         RequestCtx → String → ByteArray → m (Except ApiError ByteArray))
-    (port : UInt16)
-    (staticDir : String)
-    (devMode : Bool := false)
-    (numWorkers : UInt32 := 0) : IO UInt32 := do
+    (wsDispatchM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
+        RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)))
+    (port : UInt16) (staticDir : String) (devMode : Bool) (numWorkers : UInt32) : IO UInt32 := do
   let box ← Prim.mkStateBox initState
   let atomicInst : MonadAtomic σ IO := withStateBox box
   let dispatchIO : RequestCtx → String → ByteArray → IO (Except ApiError ByteArray) :=
     fun ctx mName reqBytes => @dispatchM IO _ inferInstance atomicInst ctx mName reqBytes
-  runFullstackWithDispatch app title serverShortName requiredSecrets dispatchIO port staticDir devMode numWorkers
+  let wsDispatchIO? := wsDispatchM?.map fun wsM ctx kind ch params payload =>
+    @wsM IO _ inferInstance atomicInst ctx kind ch params payload
+  runFullstackWithDispatch app title serverShortName requiredSecrets dispatchIO port staticDir devMode numWorkers wsDispatchIO?
+
+def runStatefulFullstack {σ Model Msg : Type}
+    (app : Qed.App Model Msg) (title serverShortName : String)
+    (initState : σ) (requiredSecrets : Array String)
+    (dispatchM : {m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
+        RequestCtx → String → ByteArray → m (Except ApiError ByteArray))
+    (port : UInt16) (staticDir : String) (devMode : Bool := false) (numWorkers : UInt32 := 0) : IO UInt32 :=
+  runStatefulFullstackCore app title serverShortName initState requiredSecrets dispatchM none port staticDir devMode numWorkers
+
+def runStatefulFullstackWs {σ Model Msg : Type}
+    (app : Qed.App Model Msg) (title serverShortName : String)
+    (initState : σ) (requiredSecrets : Array String)
+    (dispatchM : {m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
+        RequestCtx → String → ByteArray → m (Except ApiError ByteArray))
+    (wsDispatchM : {m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
+        RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray))
+    (port : UInt16) (staticDir : String) (devMode : Bool := false) (numWorkers : UInt32 := 0) : IO UInt32 :=
+  runStatefulFullstackCore app title serverShortName initState requiredSecrets dispatchM (some wsDispatchM) port staticDir devMode numWorkers
 
 def runStatelessFullstack {Model Msg : Type}
-    (app : Qed.App Model Msg)
-    (title : String)
-    (serverShortName : String)
+    (app : Qed.App Model Msg) (title serverShortName : String)
     (requiredSecrets : Array String)
     (dispatchM : {m : Type → Type} → [Monad m] → [MonadServer m] →
         RequestCtx → String → ByteArray → m (Except ApiError ByteArray))
-    (port : UInt16)
-    (staticDir : String)
-    (devMode : Bool := false)
-    (numWorkers : UInt32 := 0) : IO UInt32 :=
-  let dispatchIO : RequestCtx → String → ByteArray → IO (Except ApiError ByteArray) :=
-    fun ctx mName reqBytes => @dispatchM IO _ inferInstance ctx mName reqBytes
-  runFullstackWithDispatch app title serverShortName requiredSecrets dispatchIO port staticDir devMode numWorkers
+    (port : UInt16) (staticDir : String) (devMode : Bool := false) (numWorkers : UInt32 := 0) : IO UInt32 :=
+  runFullstackWithDispatch app title serverShortName requiredSecrets
+    (fun ctx mName reqBytes => @dispatchM IO _ inferInstance ctx mName reqBytes) port staticDir devMode numWorkers
+
+def runStatelessFullstackWs {Model Msg : Type}
+    (app : Qed.App Model Msg) (title serverShortName : String)
+    (requiredSecrets : Array String)
+    (dispatchM : {m : Type → Type} → [Monad m] → [MonadServer m] →
+        RequestCtx → String → ByteArray → m (Except ApiError ByteArray))
+    (wsDispatchM : {m : Type → Type} → [Monad m] → [MonadServer m] →
+        RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray))
+    (port : UInt16) (staticDir : String) (devMode : Bool := false) (numWorkers : UInt32 := 0) : IO UInt32 :=
+  runFullstackWithDispatch app title serverShortName requiredSecrets
+    (fun ctx mName reqBytes => @dispatchM IO _ inferInstance ctx mName reqBytes) port staticDir devMode numWorkers
+    (some fun ctx kind ch params payload => @wsDispatchM IO _ inferInstance ctx kind ch params payload)
 
 /-! ## `qedServerMain <FullstackName>` Entrypoint Generator -/
 
@@ -279,18 +317,34 @@ def elabQedServerMain : CommandElab := fun stx => do
   let shortLit := Syntax.mkStrLit srvInfo.shortName
   let secretsId := mkIdentFrom fsIdent (srvInfo.serverName ++ `secrets)
   let dispatchId := mkIdentFrom fsIdent (srvInfo.serverName ++ `dispatchM)
+  let wsDispatchId := mkIdentFrom fsIdent (srvInfo.serverName ++ `wsDispatchM)
+  let hasWs := !srvInfo.channels.isEmpty
   let mainId := mkIdent `main
   let runnerCall ← if srvInfo.hasState then
     let initStateId := mkIdentFrom fsIdent (srvInfo.serverName ++ `initState)
-    `(Qed.Server.Native.runStatefulFullstack
-        $cliAppId $titleLit $shortLit $initStateId $secretsId
-        (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $dispatchId)
-        port staticDir devMode numWorkers)
+    if hasWs then
+      `(Qed.Server.Native.runStatefulFullstackWs
+          $cliAppId $titleLit $shortLit $initStateId $secretsId
+          (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $dispatchId)
+          (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $wsDispatchId)
+          port staticDir devMode numWorkers)
+    else
+      `(Qed.Server.Native.runStatefulFullstack
+          $cliAppId $titleLit $shortLit $initStateId $secretsId
+          (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $dispatchId)
+          port staticDir devMode numWorkers)
   else
-    `(Qed.Server.Native.runStatelessFullstack
-        $cliAppId $titleLit $shortLit $secretsId
-        (fun {m} [Monad m] [Qed.Server.MonadServer m] => $dispatchId)
-        port staticDir devMode numWorkers)
+    if hasWs then
+      `(Qed.Server.Native.runStatelessFullstackWs
+          $cliAppId $titleLit $shortLit $secretsId
+          (fun {m} [Monad m] [Qed.Server.MonadServer m] => $dispatchId)
+          (fun {m} [Monad m] [Qed.Server.MonadServer m] => $wsDispatchId)
+          port staticDir devMode numWorkers)
+    else
+      `(Qed.Server.Native.runStatelessFullstack
+          $cliAppId $titleLit $shortLit $secretsId
+          (fun {m} [Monad m] [Qed.Server.MonadServer m] => $dispatchId)
+          port staticDir devMode numWorkers)
   elabCommand (← `(command|
     def $mainId:ident (args : List String) : IO UInt32 := do
       let staticDir := args[0]?.getD "dist"

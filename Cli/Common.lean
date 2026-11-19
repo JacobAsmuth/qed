@@ -94,7 +94,9 @@ def driverEntries : Array String := #[
   "Qed.qedUrlChanged:qed_url_changed",
   "Qed.qedLocalDispatch:qed_local_dispatch", "Qed.qedLocalDispatchStr:qed_local_dispatch_str",
   "Qed.qedLocalSnapshot:qed_local_snapshot", "Qed.qedLocalRestore:qed_local_restore",
-  "Qed.qedEffectDone:qed_effect_done", "Qed.qedPortRecv:qed_port_recv"]
+  "Qed.qedEffectDone:qed_effect_done", "Qed.qedPortRecv:qed_port_recv",
+  "Qed.qedWsJoin:qed_ws_join", "Qed.qedWsMsgBytes:qed_ws_msg_bytes",
+  "Qed.qedWsMsgText:qed_ws_msg_text", "Qed.qedWsStatus:qed_ws_status"]
 
 def bold  (s : String) : String := s!"\x1b[1m{s}\x1b[0m"
 def green (s : String) : String := s!"\x1b[32m{s}\x1b[0m"

@@ -335,15 +335,16 @@ open Lean in
         let hasPlaceholders := rawSegs.any (·.startsWith ":")
         let mut bs     : Array (TSyntax `ident) := #[]
         let mut btsArr : Array (TSyntax `term)  := #[]
+        let pathDesc := match seg with | some s => s!"`{s.getString}`" | none => s!"`/{c.getId}`"
         if hasPlaceholders then
           let mut seenPlaceholders : Array String := #[]
           for rs in rawSegs do
             if rs.startsWith ":" then
               let pname := String.ofList (rs.toList.drop 1)
               if pname.isEmpty then
-                Macro.throwErrorAt alt "router: empty `:` parameter in route path"
+                Macro.throwErrorAt alt s!"router `{t.getId}`: route `{c.getId}` has an empty `:` parameter in path {pathDesc}"
               if seenPlaceholders.contains pname then
-                Macro.throwErrorAt alt s!"router: duplicate `:{pname}` parameter in route path"
+                Macro.throwErrorAt alt s!"router `{t.getId}`: route `{c.getId}` has duplicate `:{pname}` parameter in path {pathDesc}"
               seenPlaceholders := seenPlaceholders.push pname
               match explicitBinders.find? (fun (b, _) => toString b.getId == pname) with
               | some (b, bt) =>
@@ -354,7 +355,7 @@ open Lean in
                   btsArr := btsArr.push (← `(String))
           for (b, _) in explicitBinders do
             unless seenPlaceholders.contains (toString b.getId) do
-              Macro.throwErrorAt b s!"router: parameter `{b.getId}` is not referenced as `:{b.getId}` in the route path"
+              Macro.throwErrorAt b s!"router `{t.getId}`: parameter `{b.getId}` on route `{c.getId}` is not referenced as `:{b.getId}` in path {pathDesc}"
         else
           bs     := explicitBinders.map (·.1)
           btsArr := explicitBinders.map (·.2)
@@ -367,7 +368,7 @@ open Lean in
         for (prevC, prevPat) in patShapes do
           if routePatternsOverlap prevPat patShape then
             Macro.throwErrorAt c
-              s!"router: route `{c.getId}` overlaps with earlier route `{prevC.getId}` (both match {patShape.size}-segment paths)"
+              s!"router `{t.getId}`: route `{c.getId}` overlaps with earlier route `{prevC.getId}` (both match {patShape.size}-segment paths)"
         patShapes := patShapes.push (c, patShape)
         let (printSeg, parseSeg) ← if hasPlaceholders then do
           let mut pr : Array (TSyntax `term) := #[]
@@ -396,8 +397,10 @@ open Lean in
           let bt := btsArr[i]!
           parseBody ← `(match (RouteParam.fromSeg $bTerm : Option $bt) with | some $bTerm => $parseBody | none => none)
         if marked then
+          if let some prevC := markedCtor then
+            Macro.throwErrorAt c s!"router `{t.getId}`: duplicate fallback route `*` on `{c.getId}` (already marked on `{prevC.getId}`)"
           if bs.size != 0 then
-            Macro.throwErrorAt c "router: the not-found route (marked `*`) must take no arguments. It is the fallback for any unmatched URL, so there's nothing to parse into it."
+            Macro.throwErrorAt c s!"router `{t.getId}`: fallback route `{c.getId}` (marked `*`) must take no arguments because it handles arbitrary unmatched URLs"
           markedCtor := some c
         ctorNames := ctorNames.push c
         ctorBs    := ctorBs.push bs

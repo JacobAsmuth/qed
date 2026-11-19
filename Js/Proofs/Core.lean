@@ -233,8 +233,10 @@ theorem reach_closed (env : Environment) (roots : List Name) (hdone : reachAuxDo
 def isClientSafeDecl (env : Environment) (n : Name) : Bool :=
   let modName := definingModule env n
   modName != `Qed.Server.Prim && modName != `Qed.Server.Native && n != `Qed.Server.execExternalRaw &&
-  n != `Qed.Server.MonadServer.httpCall && n != `Qed.Server.MonadServer.readEnv && n != `Qed.Server.MonadAtomic.runAtomic && n != `Qed.Server.MonadAtomic.runAtomicRead &&
-  match n with | .str _ "dispatchM" | .str _ "secrets" | .str _ "initState" | .str _ "runServer" => false | .str _ s => !s.endsWith "_step" && !s.endsWith "_handler" | _ => true
+  n != `Qed.Server.MonadServer.httpCall && n != `Qed.Server.MonadServer.readEnv &&
+  n != `Qed.Server.MonadServer.wsBroadcast && n != `Qed.Server.flushWsEmits &&
+  n != `Qed.Server.MonadAtomic.runAtomic && n != `Qed.Server.MonadAtomic.runAtomicRead &&
+  match n with | .str _ "dispatchM" | .str _ "wsDispatchM" | .str _ "secrets" | .str _ "initState" | .str _ "runServer" => false | .str _ s => !s.endsWith "_step" && !s.endsWith "_handler" | _ => true
 inductive ReachPath (env : Environment) : Name → List Name → Prop where
   | nil (a : Name) : ReachPath env a [] | cons {a b : Name} {rest : List Name} : b ∈ reachEdges env a → ReachPath env b rest → ReachPath env a (b :: rest)
 
@@ -254,15 +256,15 @@ private theorem forIn_verifyNoServerLeak_implies (env : Environment) (xs : Array
   · dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw, isClientSafeDecl] at hn ⊢
     by_cases h1 : (definingModule env n == `Qed.Server.Prim || definingModule env n == `Qed.Server.Native) = true; simp [h1] at hn
     simp only [h1, Bool.false_eq_true, ↓reduceIte] at hn
-    by_cases h2 : (n == `Qed.Server.execExternalRaw || n == `Qed.Server.MonadServer.httpCall || n == `Qed.Server.MonadServer.readEnv || n == `Qed.Server.MonadAtomic.runAtomic || n == `Qed.Server.MonadAtomic.runAtomicRead) = true; simp [h2] at hn
+    by_cases h2 : (n == `Qed.Server.execExternalRaw || n == `Qed.Server.MonadServer.httpCall || n == `Qed.Server.MonadServer.readEnv || n == `Qed.Server.MonadServer.wsBroadcast || n == `Qed.Server.flushWsEmits || n == `Qed.Server.MonadAtomic.runAtomic || n == `Qed.Server.MonadAtomic.runAtomicRead) = true; simp [h2] at hn
     simp only [h2, Bool.false_eq_true, ↓reduceIte] at hn
-    have h12 : (definingModule env n != `Qed.Server.Prim && definingModule env n != `Qed.Server.Native && n != `Qed.Server.execExternalRaw && n != `Qed.Server.MonadServer.httpCall && n != `Qed.Server.MonadServer.readEnv && n != `Qed.Server.MonadAtomic.runAtomic && n != `Qed.Server.MonadAtomic.runAtomicRead) = true := by
+    have h12 : (definingModule env n != `Qed.Server.Prim && definingModule env n != `Qed.Server.Native && n != `Qed.Server.execExternalRaw && n != `Qed.Server.MonadServer.httpCall && n != `Qed.Server.MonadServer.readEnv && n != `Qed.Server.MonadServer.wsBroadcast && n != `Qed.Server.flushWsEmits && n != `Qed.Server.MonadAtomic.runAtomic && n != `Qed.Server.MonadAtomic.runAtomicRead) = true := by
       simp only [Bool.or_eq_true, beq_iff_eq, not_or] at h1 h2; simp [bne_iff_ne, h1, h2]
     simp only [h12, Bool.true_and]
     cases n with
     | str _ s =>
-        by_cases h3 : s = "dispatchM" ∨ s = "secrets" ∨ s = "initState" ∨ s = "runServer"; rcases h3 with rfl | rfl | rfl | rfl <;> simp at hn
-        rcases not_or.1 h3 with ⟨hs1, h3'⟩; rcases not_or.1 h3' with ⟨hs2, h3''⟩; rcases not_or.1 h3'' with ⟨hs3, hs4⟩
+        by_cases h3 : s = "dispatchM" ∨ s = "wsDispatchM" ∨ s = "secrets" ∨ s = "initState" ∨ s = "runServer"; rcases h3 with rfl | rfl | rfl | rfl | rfl <;> simp at hn
+        rcases not_or.1 h3 with ⟨hs1, h3'⟩; rcases not_or.1 h3' with ⟨hs1b, h3''⟩; rcases not_or.1 h3'' with ⟨hs2, h3'''⟩; rcases not_or.1 h3''' with ⟨hs3, hs4⟩
         by_cases h4 : (s.endsWith "_step" || s.endsWith "_handler") = true; simp [h4] at hn; simp only [Bool.or_eq_true, not_or] at h4; simp [h4]
     | _ => simp
   · dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at hn; repeat (split at hn <;> try contradiction); all_goals (try simp at hn)

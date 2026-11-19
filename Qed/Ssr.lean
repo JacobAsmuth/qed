@@ -51,14 +51,21 @@ theorem safeScriptSrc_no_markup_or_quote (script : String) :
     intro c hc
     simpa using hconst c hc
 
+def renderStylesheetLinks : List String → String
+  | [] => ""
+  | s :: rest =>
+      let tag := if isSafeUrl s then "<link rel=\"stylesheet\" href=\"" ++ escapeHtml s ++ "\">" else ""
+      tag ++ renderStylesheetLinks rest
+
 def renderDocument (title : String) (appHtml : String) (script : String := "/qed.js")
-    (state : String := "") (css : String := "") : String :=
+    (state : String := "") (css : String := "") (stylesheets : List String := []) : String :=
   -- Escape `</` → `<\/` (valid JSON/CSS) so embedded payloads cannot close `<script>`/`<style>` early.
+  let linkTags := renderStylesheetLinks stylesheets
   let styleTag := if css.isEmpty || appHtml.contains css then ""
                   else "<style id=\"qed-styles\">" ++ escapeRawText css ++ "</style>"
   "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
     ++ "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-    ++ "<title>" ++ escapeHtml title ++ "</title>" ++ styleTag ++ "</head>\n"
+    ++ "<title>" ++ escapeHtml title ++ "</title>" ++ linkTags ++ styleTag ++ "</head>\n"
     ++ "<body><div id=\"app\">" ++ appHtml ++ "</div>\n"
     ++ (if state.isEmpty then ""
         else "<script id=\"qed-state\" type=\"application/json\">" ++ escapeRawText state ++ "</script>\n")
@@ -66,8 +73,8 @@ def renderDocument (title : String) (appHtml : String) (script : String := "/qed
 
 /-- Render a complete SSR HTML5 document directly into a UTF-8 `ByteArray` for zero-copy native serving. -/
 def renderDocumentBytes (title : String) (appHtml : String) (script : String := "/qed_host.mjs")
-    (state : String := "") (css : String := "") : ByteArray :=
-  (renderDocument title appHtml script state css).toUTF8
+    (state : String := "") (css : String := "") (stylesheets : List String := []) : ByteArray :=
+  (renderDocument title appHtml script state css stylesheets).toUTF8
 
 private structure SsrNeed where
   method : String
@@ -136,7 +143,7 @@ def App.ssrStep (app : App Model Msg) (path title script resultsJson : String) :
   if needs.isEmpty then
     Json.render (.obj [("html",
       .str (renderDocument title (app.renderModel m) script
-        (state := app.dehydrate m) (css := renderStyleSheet app.styles)))])
+        (state := app.dehydrate m) (css := renderStyleSheet app.styles) (stylesheets := app.stylesheets)))])
   else
     Json.render (.obj [("need", .arr (needs.toList.map fun n =>
       let base := [("method", .str n.method), ("url", .str n.url), ("body", .str n.body)]
@@ -184,7 +191,7 @@ def App.ssrRenderNativeBytes {Model Msg : Type} {m : Type → Type} [Monad m]
     (sessionUser : Option String := none) : m ByteArray := do
   let mdl ← app.ssrBootM path dispatchBytes dispatchText fuel sessionUser
   return renderDocumentBytes title (app.renderModel mdl) script
-    (state := app.dehydrate mdl) (css := renderStyleSheet app.styles)
+    (state := app.dehydrate mdl) (css := renderStyleSheet app.styles) (stylesheets := app.stylesheets)
 
 /-! ## JS SSR (`ssrStep`) ↔ Native In-Memory SSR (`ssrRenderNativeBytes`) Equivalence -/
 
@@ -272,7 +279,7 @@ theorem App.ssrStep_equiv_ssrRenderNativeBytes {Model Msg : Type} (app : App Mod
     (hmatch : let initQ := app.ssrInitQueue path
               SsrResultsMatch app (ssrResults resultsJson) dispatchBytes dispatchText 0 initQ.1 initQ.2 fuel mFinal) :
     let doc := renderDocument title (app.renderModel mFinal) script
-      (state := app.dehydrate mFinal) (css := renderStyleSheet app.styles)
+      (state := app.dehydrate mFinal) (css := renderStyleSheet app.styles) (stylesheets := app.stylesheets)
     app.ssrStep path title script resultsJson = Json.render (.obj [("html", .str doc)]) ∧
     App.ssrRenderNativeBytes (m := Id) app path title dispatchBytes dispatchText script fuel = doc.toUTF8 := by
   obtain ⟨hd, hq⟩ := ssrDrain_eq_ssrDrainQueueM app (ssrResults resultsJson) dispatchBytes dispatchText hmatch

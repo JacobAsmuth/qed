@@ -131,21 +131,23 @@ private def elabStatefulCompTag (stx : Syntax) (expectedType? : Option Expr) (in
   let propValues ← `(({ $[$fids:ident := $vals],* } : $(cId `Props)))
 
   if let some st := state? then
-    if initial?.isSome then throwErrorAt stx "`initial` seeds local state; it cannot accompany `state`"
+    if initial?.isSome then
+      throwErrorAt stx s!"<{tag}>: `initial` seeds local state and cannot be combined with parent-owned `state=\{...}`"
     if !evArms.isEmpty then
-      throwErrorAt stx s!"<{tag} state=…>: a parent-owned component routes every event through onMsg, it has no separate event channel"
+      let evNames := String.intercalate ", " (evArms.toList.map fun a => s!"`{a.ctor}`")
+      throwErrorAt stx s!"<{tag} state=…>: a parent-owned component routes every event through `onMsg` (cannot also pass event props {evNames})"
     let some route := onMsg?
-      | throwErrorAt stx s!"<{tag} state=…> needs onMsg=…: the parent Msg constructor `(k : String) (msg : {tag}.Msg)` its events route through"
+      | throwErrorAt stx s!"<{tag} state=…> requires `onMsg=\{...}`: pass the parent message constructor `(k : String) (msg : {tag}.Msg)` (or declare `collection <field> : {tag}` so Qed wires `onMsg` automatically)"
     let resT ← match key? with
       | some k => `(Qed.withKey (toString $k) ($(cId `_qed_renderTag) $propValues $route $st (toString $k)))
       | none   => `($(cId `_qed_renderTag) $propValues $route $st)
     return ← elabTerm resT expectedType?
 
   if onMsg?.isSome then
-    throwErrorAt stx s!"<{tag}>: onMsg routes a parent-owned row; bind one with state=…, or pass named event props"
+    throwErrorAt stx s!"<{tag}>: `onMsg` routes a parent-owned row; pass `state=\{...}` alongside `onMsg`, or remove `onMsg` and pass named event props"
   if let some info := info? then
     if !info.hasLocalDef then
-      throwErrorAt stx s!"<{tag}> uses effects, slots, children, or non-JSON props and cannot be mounted via `LocalDef`; mount `<{tag} …/>` directly inside a parent `component` view so Qed hoists it"
+      throwErrorAt stx s!"<{tag}> uses effects, slots, children, or non-JSON props and cannot be mounted dynamically via `LocalDef`; mount `<{tag} …/>` directly inside a parent `component` view so Qed hoists its state"
   checkParentNesting stx pPath "div" "div"
   let keyT : Term ← match key? with | some k => `(toString $k) | none => pure ⟨Syntax.mkStrLit s!"@{posNum}"⟩
   let mountBase : Term ←
@@ -177,6 +179,14 @@ private def elabStatefulCompTag (stx : Syntax) (expectedType? : Option Expr) (in
   if info?.isNone && tag.endsWith ".Form" then
     if let some res ← elabSchemaFormTag stx expectedType? tag pPath cName propNodes hasKids then
       return res
+    let schemaNm := String.ofList (tag.toList.take (tag.length - 5))
+    throwErrorAt stx s!"unknown schema form `<{tag}>`; check that `schema {schemaNm}:` is defined and imported"
+
+  if info?.isNone then
+    let env ← getEnv
+    unless env.contains (baseName ++ `_qed_mount) || env.contains (baseName ++ `_qed_renderTag) do
+      let lowerHint := if !tag.contains '.' then s!" (HTML elements must be lowercase, e.g. `<{tag.toLower}>`)" else ""
+      throwErrorAt stx s!"unknown component `<{tag}>`; check the spelling or import the module defining `component {tag}:`{lowerHint}"
 
   if let some info := info? then
     if info.kind == .pureView then

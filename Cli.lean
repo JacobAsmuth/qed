@@ -17,5 +17,6 @@ def main (args : List String) : IO UInt32 := do
   | ["clean"]                           => cmdClean
   | ["doctor"]                          => cmdDoctor
   | ["new", dir]                        => cmdNew dir
+  | ["new"]                             => IO.eprintln "missing project directory: usage: qed new <dir>"; return 1
   | [] | ["help"] | ["--help"] | ["-h"] => usage
-  | _ => IO.eprintln s!"unknown command: {" ".intercalate args}"; usage
+  | _ => IO.eprintln s!"unknown command: {" ".intercalate args}"; let _ ← usage; return 1

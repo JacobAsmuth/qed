@@ -475,6 +475,7 @@ structure ServerInfo where
   envVars          : Array (String × String × Option String)
   externalServices : Array (String × String)
   methods          : Array ServerMethodInfo
+  channels         : Array String := #[]
 deriving Inhabited
 
 initialize serverRegistry :

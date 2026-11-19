@@ -54,6 +54,19 @@ def roleLacks (r : String) (style : Style) : Html msg → Bool :=
 def tagLacks (tag : String) (style : Style) : Html msg → Bool :=
   everyElement (fun t a => !(t == tag) || !(attrClasses a).contains style.className)
 
+def roleHasAll (r : String) (styles : List Style) (h : Html msg) : Bool :=
+  hasRole r h &&
+  everyElement (fun _ a => !(attrRole a == some r) || styles.all (fun s => (attrClasses a).contains s.className)) h
+
+def tagHas (tag : String) (style : Style) (h : Html msg) : Bool :=
+  hasTag tag h &&
+  everyElement (fun t a => !(t == tag) || (attrClasses a).contains style.className) h
+
+def noConflictingStyles (styles : List Style) : Html msg → Bool :=
+  everyElement (fun _ a =>
+    let cs := attrClasses a
+    (cs.filter (fun c => (styles.map (·.className)).contains c)).length ≤ 1)
+
 def both (p q : Html msg → Bool) : Html msg → Bool := fun h => p h && q h
 def either (p q : Html msg → Bool) : Html msg → Bool := fun h => p h || q h
 
@@ -240,6 +253,24 @@ theorem hasTag_canonical (tag : String) (h : Html msg) (ht : tag ≠ "span") :
 
 @[simp] theorem tagLacks_canonical (tag : String) (style : Style) (h : Html msg) :
     tagLacks tag style (Html.canonical h) = tagLacks tag style h :=
+  everyElement_canonical (fun _ _ => by simp)
+    (fun a ha => by simp [attrClasses_of_onlySignalBind a ha]) h
+
+@[simp] theorem roleHasAll_canonical (r : String) (styles : List Style) (h : Html msg) :
+    roleHasAll r styles (Html.canonical h) = roleHasAll r styles h := by
+  unfold roleHasAll
+  rw [hasRole_canonical, everyElement_canonical (fun _ _ => by simp)
+    (fun a ha => by simp [attrRole_of_onlySignalBind a ha])]
+
+theorem tagHas_canonical (tag : String) (style : Style) (h : Html msg) (ht : tag ≠ "span") :
+    tagHas tag style (Html.canonical h) = tagHas tag style h := by
+  have hne : ("span" == tag) = false := beq_false_of_ne (Ne.symm ht)
+  unfold tagHas
+  rw [hasTag_canonical tag h ht, everyElement_canonical (fun _ _ => by simp)
+    (fun _ _ => by simp [hne])]
+
+@[simp] theorem noConflictingStyles_canonical (styles : List Style) (h : Html msg) :
+    noConflictingStyles styles (Html.canonical h) = noConflictingStyles styles h :=
   everyElement_canonical (fun _ _ => by simp)
     (fun a ha => by simp [attrClasses_of_onlySignalBind a ha]) h
 

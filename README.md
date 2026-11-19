@@ -208,6 +208,7 @@ Inside this repository, `npm run dev`, `npm run build`, and `npm run test` are a
 
 - **[Example tour](Examples/README.md):** Guided progression through six examples: [Counter](Examples/Counter.lean), [Todo](Examples/Todo.lean) (`for_each` collections & scoped CSS), [Signup](Examples/Signup.lean) (validated forms), [Chat](Examples/Chat.lean) (streaming SSE), [Bookshelf](Examples/Bookshelf.lean) (routing & SSR), and [CloudBooks](Examples/CloudBooks.lean) (full-stack server & RPCs).
 - **[Components & apps](docs/components.md):** Props, `slot`s, `children`, `bind:`, `route`, `query`, `<Await>`, and stateful composition.
+- **[Styling & verified CSS](docs/styling.md):** First-class `style` blocks, deterministic `extends`, typed `theme`s with WCAG contrast proofs, `keyframes`, `strict_tokens`, `verify_theme`, and build-time CSS extraction.
 - **[Invariants](docs/invariants.md):** Automatic proofs, `:= by` tactic proofs, `for_each` collection lifts, and view/styling predicates.
 - **[How Qed works](docs/architecture.md):** Compilation pipeline, trusted computing base, verification gates, and source map.
 - **[Rendering & DOM proofs](docs/rendering.md):** Direct signal updates, keyed reconciliation, verified memoization, and browser equivalence tests.

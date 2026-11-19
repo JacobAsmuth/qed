@@ -57,6 +57,7 @@ export const UInt32_mk = (n) => Number(n) >>> 0;
 export const UInt32_ofNat = (n) => Number(n & 0xFFFFFFFFn);
 export const UInt32_ofNatCore = UInt32_ofNat;
 export const UInt32_toNat = (a) => BigInt(a >>> 0);
+export const UInt32_toUInt64 = (a) => BigInt(a >>> 0);
 export const UInt32_add = (a, b) => (a + b) >>> 0;
 export const UInt32_decEq = (a, b) => a === b ? 1 : 0;
 export const UInt32_decLe = (a, b) => a <= b ? 1 : 0;
@@ -361,6 +362,13 @@ export const Qed_Dom_retainAttributes = domCall('retainAttributes');
 export const Qed_Dom_setText = domCall('setText');
 export const Qed_Dom_setValue = domCall('setValue');
 export const Qed_Dom_today = domCall('today');
+export const Qed_Dom_wsMuxSub = domCall('wsMuxSub');
+export const Qed_Dom_wsMuxSend = domCall('wsMuxSend');
+export const Qed_Dom_wsMuxUnsub = domCall('wsMuxUnsub');
+export const Qed_Dom_wsExtOpen = domCall('wsExtOpen');
+export const Qed_Dom_wsExtSendText = domCall('wsExtSendText');
+export const Qed_Dom_wsExtSendBytes = domCall('wsExtSendBytes');
+export const Qed_Dom_wsExtClose = domCall('wsExtClose');
 
 export function assertExterns(required, ns) {
   const missing = required.filter((n) => typeof ns[n] !== 'function' && !(n in ns));

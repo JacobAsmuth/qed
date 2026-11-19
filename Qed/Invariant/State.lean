@@ -36,7 +36,11 @@ private def qedAppLemmas (env : Environment) : Array Name :=
                 ``Qed.Internal.mkRoutedApp_init, ``Qed.Internal.mkRoutedApp_update,
                 ``Qed.Internal.App.withDehydrate_init, ``Qed.Internal.App.withDehydrate_update]
   let opt := #[`Qed.Internal.App.withQueries_init, `Qed.Internal.App.withQueries_update,
+               `Qed.Internal.App.withSubscriptions_init, `Qed.Internal.App.withSubscriptions_update,
+               `Qed.Internal.App.withStylesheets_init, `Qed.Internal.App.withStylesheets_update,
+               `Qed.Internal.App.withExtraStyles_init, `Qed.Internal.App.withExtraStyles_update,
                `Qed.Query.boot, `Qed.Query.wrap, `Qed.Resource.query, `Qed.Resource.rpcQuery,
+               `Qed.Subscription.boot, `Qed.Subscription.wrap, `Qed.Subscription.boot_state_eq,
                `Qed.Cached.activate, `Qed.Cached.all_empty].filter env.contains
   base ++ opt
 
@@ -75,7 +79,47 @@ private def toSimpLemmas (ts : Array Term) : TacticM (Array (TSyntax `Lean.Parse
 
 private def mkOptResSimpLemmas (env : Environment) :
     TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) :=
-  toSimpLemmas ((#[`Qed.Cached.all, `Qed.Resource.all].filter env.contains).map fun n => ⟨(mkIdent n).raw⟩)
+  toSimpLemmas ((#[`Qed.Cached.all, `Qed.Resource.all,
+                   `Qed.QedVal.val_field, `Qed.QedVal.val_ensured,
+                   `Qed.Codec.valid, `Qed.Codec.refine, `Qed.Codec.jsonOnly,
+                   `Qed.Codec.text, `Qed.Codec.textarea, `Qed.Codec.nat,
+                   `Qed.Codec.int, `Qed.Codec.checkbox, `Qed.Codec.date].filter env.contains).map
+    fun n => ⟨(mkIdent n).raw⟩)
+
+elab "qedAddFieldFacts" : tactic => do
+  let env ← getEnv
+  unless env.contains `Qed.Field.ok || env.contains `Qed.Ensured.ok do return
+  let g ← getMainGoal
+  let facts ← g.withContext do
+    let tgt ← instantiateMVars (← g.getType)
+    let mut scan : Array Expr := #[tgt]
+    for decl in (← getLCtx) do
+      if !decl.isImplementationDetail then
+        scan := scan.push (← instantiateMVars decl.type)
+    let factsRef ← IO.mkRef (#[] : Array Expr)
+    let seenRef ← IO.mkRef (#[] : Array Expr)
+    for e in scan do
+      e.forEach fun sub => do
+        if !sub.hasLooseBVars then
+          let ty? ← try some <$> Meta.whnf (← Meta.inferType sub) catch _ => pure none
+          if let some ty := ty? then
+            if ty.isAppOfArity `Qed.Field 2 && env.contains `Qed.Field.ok then
+              if !(← seenRef.get).contains sub then
+                seenRef.modify (·.push sub)
+                if let some okP ← try some <$> Meta.mkAppM `Qed.Field.ok #[sub] catch _ => pure none then
+                  factsRef.modify (·.push okP)
+            else if ty.isAppOfArity `Qed.Ensured 2 && env.contains `Qed.Ensured.ok then
+              if !(← seenRef.get).contains sub then
+                seenRef.modify (·.push sub)
+                if let some okP ← try some <$> Meta.mkAppM `Qed.Ensured.ok #[sub] catch _ => pure none then
+                  factsRef.modify (·.push okP)
+    factsRef.get
+  for idx in [0:facts.size] do
+    let fPrf := facts[idx]!
+    let g ← getMainGoal
+    let fTy ← g.withContext (Meta.inferType fPrf)
+    let (_, g') ← (← g.assert (Name.mkSimple s!"_qedFld{idx}") fTy fPrf).intro1P
+    replaceMainGoal [g']
 
 private def mkCloserLemmas (usingL : Array Term) : TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) := do
   let bL ← toSimpLemmas (qedBoundaryLemmas.map fun n => ⟨(mkIdent n).raw⟩)
@@ -227,8 +271,13 @@ elab_rules : tactic
                        | (simp_all [$[$closerL],*] <;> omega)
                        | (simp_all [$[$closerL],*] <;> decide)
                        | (simp_all [$[$closerL],*] <;> done) | trivial))) <;>
-         (try (simp_all only [$[$finalCloserL],*] <;>
-               first | omega | decide | done))))
+         (try (intros; (try (repeat' split)) <;> (
+               try dsimp only at *;
+               qedAddFieldFacts;
+               (try qedDestructExistsHyps);
+               qedUnfoldPresent [$[$usingL],*];
+               (try simp_all only [$[$finalCloserL],*]);
+               first | rfl | omega | decide | assumption | trivial | done)))))
     match init with
     | some initT =>
         let initTac ← mkInitTac usingL pred initT

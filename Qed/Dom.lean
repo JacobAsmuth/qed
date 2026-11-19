@@ -108,4 +108,27 @@ opaque bindSignal (node : Node) (name : String) : IO Unit
 @[extern "qed_dom_bind_signal_attr"]
 opaque bindSignalAttr (node : Node) (name attr : String) : IO Unit
 
+@[extern "qed_dom_ws_mux_sub"]
+opaque wsMuxSub (subId : UInt32) (url channel : String) (params : ByteArray)
+    (recMode recInitMs recMaxMs recMaxRetries : UInt32) : IO Unit
+
+@[extern "qed_dom_ws_mux_send"]
+opaque wsMuxSend (subId : UInt32) (payload : ByteArray) : IO Unit
+
+@[extern "qed_dom_ws_mux_unsub"]
+opaque wsMuxUnsub (subId : UInt32) : IO Unit
+
+@[extern "qed_dom_ws_ext_open"]
+opaque wsExtOpen (subId : UInt32) (url : String) (isBinary : Bool)
+    (recMode recInitMs recMaxMs recMaxRetries : UInt32) : IO Unit
+
+@[extern "qed_dom_ws_ext_send_text"]
+opaque wsExtSendText (subId : UInt32) (text : String) : IO Unit
+
+@[extern "qed_dom_ws_ext_send_bytes"]
+opaque wsExtSendBytes (subId : UInt32) (payload : ByteArray) : IO Unit
+
+@[extern "qed_dom_ws_ext_close"]
+opaque wsExtClose (subId : UInt32) : IO Unit
+
 end Qed.Dom

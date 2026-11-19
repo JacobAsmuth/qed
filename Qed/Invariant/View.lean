@@ -40,7 +40,7 @@ macro_rules
       (try simp only [$view:ident];
        qedUnfoldViewHelpers;
        simp only [Qed.roleHasOneOf, Qed.tagHasOneOf, Qed.roleHas, Qed.roleHasOnly,
-         Qed.roleLacks, Qed.tagLacks,
+         Qed.roleLacks, Qed.tagLacks, Qed.roleHasAll, Qed.tagHas, Qed.noConflictingStyles,
          Qed.hasRole, Qed.hasTag, Qed.both, Qed.either, Qed.exactlyOne,
          Qed.allRolesOff, Qed.exactlyOneOf, Qed.exactlyOneOf.go, Qed.hasOneClass,
          Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
@@ -56,7 +56,7 @@ macro_rules
          Qed.onValue, Qed.onClick, Qed.onInput, Qed.onChange, Qed.onCheck, Qed.onKeydown,
          Qed.onKeyup, Qed.onSubmit, Qed.onBlur, Qed.onFocus, Qed.onDoubleClick, Qed.onMouseDown,
          Qed.onMouseUp, Qed.key, Qed.value, Qed.placeholder, Qed.name, Qed.href, Qed.ToHref.toHref,
-         Qed.src, Qed.action, Qed.alt, Qed.title, Qed.style, Qed.type', Qed.disabled, Qed.required,
+         Qed.src, Qed.action, Qed.alt, Qed.title, Qed.style, Qed.inlineStyle, Qed.styleVars, Qed.type', Qed.disabled, Qed.required,
          Qed.checked, Qed.readOnly,
          Qed.Lang.QedVal.val_id, Qed.Lang.QedSeqLit.ofList_array, Qed.Lang.QedSeqLit.ofList_list,
          Qed.Lang.QedMem.mem_array, Qed.Lang.QedMem.mem_list, Qed.Lang.QedMem.mem_string,
@@ -96,13 +96,19 @@ elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => do
         let fmt ← Meta.ppExpr (← instantiateMVars (← g.getType))
         let s := (fmt.pretty.replace "✝" "").trimmed
         pure (if s == "False" then m!"" else m!"\n  • the view still has to satisfy:  {s}"))
-    throwErrorAt nm m!"styling invariant `{nm.getId}` doesn't hold for every model, \
-      `{predLit.getString}` is false for some `{view.getId} m`.{body}\n\nSome element the rule \
-      constrains isn't carrying one of the required style classes (or no element with that role/tag \
-      is rendered). Check that the `role`/tag it matches exists and gets one of the styles passed \
-      to `roleHasOneOf`/`tagHasOneOf` in every branch of `{view.getId}`. If the view is routed \
-      through `App.view`/`View.render` rather than a plain `Model → Html`, prove it with:  \
-      invariant {nm.getId} : … holds_in {view.getId} := by …"
+    let predStr := predLit.getString
+    let vName := view.getId
+    let diagnosis :=
+      if predStr.contains "roleLacks" || predStr.contains "tagLacks" then
+        s!"A matching element in `{vName}` carries a forbidden style class in some branch. Remove that style from the matching element (or guard it so it cannot apply there)."
+      else if predStr.contains "exactlyOne" then
+        s!"In some branch of `{vName}`, either none or more than one of the listed roles carries the active style, a role is missing the inactive style, or one of the roles is not rendered."
+      else if (predStr.contains "hasRole" || predStr.contains "hasTag") &&
+              !(predStr.contains "roleHas" || predStr.contains "tagHas") then
+        s!"No element with the required `role`/tag is rendered in some branch of `{vName}`. Check every conditional branch of `{vName}`."
+      else
+        s!"Some element the rule constrains isn't carrying one of the required style classes (or no element with that `role`/tag is rendered, or an element carries more than one conflicting style). Check that the matching `role`/tag exists and receives exactly one allowed style in every branch of `{vName}`."
+    throwErrorAt nm m!"styling invariant `{nm.getId}` doesn't hold for every state: `{predStr}` is false for some `{vName} m`.{body}\n\n{diagnosis}"
 
 open Lean Elab Command in
 elab_rules : command

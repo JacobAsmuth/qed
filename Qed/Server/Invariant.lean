@@ -128,6 +128,71 @@ def srvAtomicCommit {E σ α : Type} (s₀ : σ) (res : σ × Option (Except E �
 @[simp] theorem srvAtomicCommit_err {E σ α : Type} (s₀ s' : σ) (e : E) :
     srvAtomicCommit (E := E) (α := α) s₀ (s', some (Except.error e)) = (s₀, some (Except.error e)) := rfl
 
+/-! ## Transactional WebSocket Emit Combinators & No-Phantom-Broadcast Theorems -/
+
+/-- Pure statement sequencing carrying an outbound WebSocket emit buffer alongside state `σ`. -/
+@[inline]
+def srvEmitSeq {σ ρ : Type} (first : σ × List WsEmit × Option ρ)
+    (next : σ → List WsEmit → σ × List WsEmit × Option ρ) : σ × List WsEmit × Option ρ :=
+  match first with
+  | (s', es, none)   => next s' es
+  | (s', es, some r) => (s', es, some r)
+
+@[simp] theorem srvEmitSeq_none {σ ρ : Type} (s : σ) (es : List WsEmit)
+    (next : σ → List WsEmit → σ × List WsEmit × Option ρ) :
+    srvEmitSeq (s, es, none) next = next s es := rfl
+
+@[simp] theorem srvEmitSeq_some {σ ρ : Type} (s : σ) (es : List WsEmit) (r : ρ)
+    (next : σ → List WsEmit → σ × List WsEmit × Option ρ) :
+    srvEmitSeq (s, es, some r) next = (s, es, some r) := rfl
+
+/-- Transactional finalizer for emit-bearing pure server handlers:
+    commits `(s', es)` on `.ok`, and rolls back BOTH state (`s₀`) AND emits (`[]`) on `.error`. -/
+@[inline]
+def srvFinishEmit {E σ α : Type} [SrvErr E] (s₀ : σ)
+    (res : σ × List WsEmit × Option (Except E α)) : σ × (Except E α × List WsEmit) :=
+  match res with
+  | (s', es, some (.ok v))    => (s', .ok v, es)
+  | (_,  _,  some (.error e)) => (s₀, .error e, [])
+  | (_,  _,  none)            => (s₀, .error (SrvErr.ofApi (ApiError.internal "unreachable missing return")), [])
+
+@[simp] theorem srvFinishEmit_ok {E σ α : Type} [SrvErr E] (s₀ s' : σ) (es : List WsEmit) (v : α) :
+    srvFinishEmit (E := E) s₀ (s', es, some (.ok v)) = (s', .ok v, es) := rfl
+
+@[simp] theorem srvFinishEmit_err {E σ α : Type} [SrvErr E] (s₀ s' : σ) (es : List WsEmit) (e : E) :
+    srvFinishEmit (E := E) (α := α) s₀ (s', es, some (.error e)) = (s₀, .error e, []) := rfl
+
+@[simp] theorem srvFinishEmit_none {E σ α : Type} [SrvErr E] (s₀ s' : σ) (es : List WsEmit) :
+    srvFinishEmit (E := E) s₀ (s', es, (none : Option (Except E α))) =
+      (s₀, .error (SrvErr.ofApi (ApiError.internal "unreachable missing return")), []) := rfl
+
+/-- No-Phantom-Broadcast Theorem: any rolled-back transaction emits strictly zero WebSocket events. -/
+theorem srvFinishEmit_err_no_emits {E σ α : Type} [SrvErr E] (s₀ s' : σ) (es : List WsEmit) (e : E) :
+    (srvFinishEmit (E := E) (α := α) s₀ (s', es, some (.error e))).2.2 = [] := rfl
+
+/-- Transactional finalizer for emit-bearing `atomic:` blocks inside async handlers:
+    discards both state mutations and accumulated emits on `.error`. -/
+@[inline]
+def srvAtomicCommitEmit {E σ α : Type} (s₀ : σ)
+    (res : σ × List WsEmit × Option (Except E α)) : σ × (Option (Except E α) × List WsEmit) :=
+  match res with
+  | (s', es, none)                  => (s', none, es)
+  | (s', es, some (Except.ok v))    => (s', some (Except.ok v), es)
+  | (_,  _,  some (Except.error e)) => (s₀, some (Except.error e), [])
+
+@[simp] theorem srvAtomicCommitEmit_none {E σ α : Type} (s₀ s' : σ) (es : List WsEmit) :
+    srvAtomicCommitEmit (E := E) (α := α) s₀ (s', es, none) = (s', none, es) := rfl
+
+@[simp] theorem srvAtomicCommitEmit_ok {E σ α : Type} (s₀ s' : σ) (es : List WsEmit) (v : α) :
+    srvAtomicCommitEmit (E := E) s₀ (s', es, some (Except.ok v)) = (s', some (Except.ok v), es) := rfl
+
+@[simp] theorem srvAtomicCommitEmit_err {E σ α : Type} (s₀ s' : σ) (es : List WsEmit) (e : E) :
+    srvAtomicCommitEmit (E := E) (α := α) s₀ (s', es, some (Except.error e)) = (s₀, some (Except.error e), []) := rfl
+
+/-- No-Phantom-Broadcast Theorem for `atomic:` blocks inside async handlers. -/
+theorem srvAtomicCommitEmit_err_no_emits {E σ α : Type} (s₀ s' : σ) (es : List WsEmit) (e : E) :
+    (srvAtomicCommitEmit (E := E) (α := α) s₀ (s', es, some (Except.error e))).2.2 = [] := rfl
+
 /-- Effectful statement sequencing for `await`-containing handlers. -/
 @[inline, specialize]
 def srvSeqM {m : Type → Type} [Monad m] {ρ : Type}
@@ -166,6 +231,19 @@ theorem srvLetEq_elim {α β : Type} (P : β → Prop) (val : α) (k : (x : α) 
 @[simp] theorem srvSeq_srvLetEq {σ ρ γ : Type} (val : γ)
     (k : (x : γ) → x = val → σ × Option ρ) (next : σ → σ × Option ρ) :
     srvSeq (srvLetEq val k) next = srvLetEq val (fun x hx => srvSeq (k x hx) next) := rfl
+
+@[simp] theorem srvFinishEmit_srvLetEq {E σ α γ : Type} [SrvErr E] (s₀ : σ) (val : γ)
+    (k : (x : γ) → x = val → σ × List WsEmit × Option (Except E α)) :
+    srvFinishEmit s₀ (srvLetEq val k) = srvLetEq val (fun x hx => srvFinishEmit s₀ (k x hx)) := rfl
+
+@[simp] theorem srvAtomicCommitEmit_srvLetEq {E σ α γ : Type} (s₀ : σ) (val : γ)
+    (k : (x : γ) → x = val → σ × List WsEmit × Option (Except E α)) :
+    srvAtomicCommitEmit s₀ (srvLetEq val k) = srvLetEq val (fun x hx => srvAtomicCommitEmit s₀ (k x hx)) := rfl
+
+@[simp] theorem srvEmitSeq_srvLetEq {σ ρ γ : Type} (val : γ)
+    (k : (x : γ) → x = val → σ × List WsEmit × Option ρ)
+    (next : σ → List WsEmit → σ × List WsEmit × Option ρ) :
+    srvEmitSeq (srvLetEq val k) next = srvLetEq val (fun x hx => srvEmitSeq (k x hx) next) := rfl
 
 @[simp] theorem prod_fst_srvLetEq {α β γ : Type} (val : γ)
     (k : (x : γ) → x = val → α × β) :
@@ -240,6 +318,7 @@ theorem srvGetAt_congr_arr {α : Type} {xs ys : Array α} {j : Nat}
 syntax "qedSimpHypsEach" : tactic
 
 syntax (name := srvAutoFieldStx) "srvAutoField(" term ")" : term
+syntax (name := srvAutoEmitStx)  "srvAutoEmit(" term ")" : term
 syntax (name := srvTypedAsStx)   "srvTypedAs(" term ", " term ")" : term
 syntax (name := srvGetElemStx)   "srvGetElem(" term ", " term ")" : term
 syntax (name := srvSetElemStx)   "srvSetElem(" term ", " term ", " term ")" : term
@@ -416,6 +495,44 @@ private def wrapAuxProof (goalProp prf : Expr) : TermElabM Expr := do
     return prf
   liftMetaM <| Meta.mkAuxTheorem goalProp prf (zetaDelta := false)
 
+open Lean Meta Elab Term in
+private def tryProveWithFacts (facts : Array Expr) (prfStx : Term) (goalProp : Expr) :
+    TermElabM (Option Expr) := do
+  let savedMsgs ← Core.getMessageLog
+  Core.resetMessageLog
+  try
+    let prf ← withPosedFacts facts <| elabTermEnsuringType prfStx (some goalProp)
+    synthesizeSyntheticMVarsNoPostponing
+    let prf ← instantiateMVars prf
+    let newMsgs ← Core.getMessageLog
+    if !newMsgs.hasErrors && !prf.hasMVar then
+      Core.setMessageLog (savedMsgs ++ newMsgs)
+      pure (some prf)
+    else
+      Core.setMessageLog savedMsgs
+      pure none
+  catch _ =>
+    Core.setMessageLog savedMsgs
+    pure none
+
+open Lean Meta Elab Term in
+private def mkSrvRefinementProofStx : TermElabM Term :=
+  `(by
+    try qedUnfoldSrvHelpers
+    try qedSimpHypsEach
+    try simp (config := { zetaDelta := false }) only
+      [id_eq, ne_eq, Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
+       Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
+       Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
+       Array.size_set, Array.size_push, Array.getElem_set_self,
+       Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
+       beq_iff_eq, bne_iff_ne, decide_eq_true_eq]
+    qedDsimpCodecs
+    first
+      | rfl | assumption | omega | decide
+      | (simp_all [Qed.QedVal.val_field, Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id] <;>
+          first | rfl | omega | decide | done))
+
 open Lean Meta Elab Term Tactic in
 @[term_elab srvAutoFieldStx]
 def elabSrvAutoField : TermElab := fun stx expectedType? => do
@@ -469,26 +586,21 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
           let fastPrf ← wrapAuxProof goalProp fastPrf
           return ← mkAppOptM ``Qed.Field.mk #[some innerTy, some predFn, some valExpr, some fastPrf]
         let facts ← collectProofFacts #[valExpr]
-        let prfStx ← `(by
-          try qedUnfoldSrvHelpers
-          try qedSimpHypsEach
-          try simp (config := { zetaDelta := false }) only
-            [id_eq, ne_eq, Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
-             Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
-             Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
-             Array.size_set, Array.size_push, Array.getElem_set_self,
-             Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
-             beq_iff_eq, bne_iff_ne, decide_eq_true_eq]
-          qedDsimpCodecs
-          first | assumption | omega | decide | simp_all | (simp_all <;> omega) | (simp_all <;> decide))
-        let preMsgs := (← Core.getMessageLog).toList.length
-        let prfExpr ← try
-            withPosedFacts facts <| elabTermEnsuringType prfStx (some goalProp)
-          catch _ =>
-            throwErrorAt stx m!"cannot prove schema field refinement `{← ppExpr goalProp}`.\n\
-              Guard this mutation with an `if ...` check or `requires ...` precondition so Lean can verify it cannot violate the schema."
-        let hasErr := ((← Core.getMessageLog).toList.drop preMsgs).any (·.severity == .error)
-        let prfExpr ← if hasErr then pure prfExpr else wrapAuxProof goalProp prfExpr
+        let prfExpr? ← tryProveWithFacts facts (← mkSrvRefinementProofStx) goalProp
+        let some prfExpr := prfExpr?
+          | do
+              let mut p := predFn.consumeMData
+              if p.isAppOfArity ``Qed.Codec.valid 2 then
+                let mut c := (p.getArg! 1).consumeMData
+                while c.isAppOfArity ``Qed.Codec.jsonOnly 2 do
+                  c := (c.getArg! 1).consumeMData
+                if c.isAppOfArity ``Qed.Codec.refine 4 then
+                  p := c.getArg! 2
+              let prettyGoal := (← ppExpr ((Expr.app p valExpr).headBeta)).pretty.replace "✝" ""
+              let prettyVal := (← ppExpr valExpr).pretty.replace "✝" ""
+              throwErrorAt stx m!"cannot prove schema field refinement `{prettyGoal}` for value `{prettyVal}`.\n\
+                Guard this value with `if ...:`, `ensure ... else ...`, or a `requires` precondition so the compiler can verify it satisfies the schema's `where` rule."
+        let prfExpr ← wrapAuxProof goalProp prfExpr
         return ← mkAppOptM ``Qed.Field.mk #[some innerTy, some predFn, some valExpr, some prfExpr]
       else
         return ← try elabTermEnsuringType valStx (some expTy)
@@ -500,6 +612,20 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
   match expectedType? with
   | some expTy => ensureHasType expTy e
   | none       => return e
+
+open Lean Meta Elab Term in
+@[term_elab srvAutoEmitStx]
+def elabSrvAutoEmit : TermElab := fun stx expectedType? => do
+  let propExpr ← match expectedType? with
+    | some expTy => instantiateMVars expTy
+    | none       => elabTerm stx[1] (some (mkSort Level.zero))
+  let facts ← collectProofFacts #[propExpr]
+  let some prfExpr ← tryProveWithFacts facts (← mkSrvRefinementProofStx) propExpr
+    | do
+        let prettyGoal := (← ppExpr propExpr).pretty.replace "✝" ""
+        throwErrorAt stx m!"cannot prove channel `ensures` postcondition `{prettyGoal}` at `emit`.\n\
+          Ensure the emitted event satisfies the channel's `ensures` clause."
+  wrapAuxProof propExpr prfExpr
 
 open Lean Meta Elab Term in
 @[term_elab srvTypedAsStx]
@@ -665,16 +791,17 @@ private def proveBoundsFor (ref : Syntax) (arrExpr idxNatExpr : Expr) : TermElab
       | assumption | omega
       | (simp_all (config := { zetaDelta := true }) <;> omega)
       | (repeat' split <;> (try simp (config := { zetaDelta := true }) only [Array.size_set, Array.size_push] at *; omega)))
-  let preMsgs := (← Core.getMessageLog).toList.length
-  let prfExpr ← try
-      withPosedFacts facts <| elabTermEnsuringType prfStx (some goalProp)
-    catch _ =>
-      let prettyArr ← ppExpr arrExpr
-      let prettyIdx ← ppExpr idxNatExpr
-      throwErrorAt ref m!"cannot prove array index `{prettyIdx}` is in bounds for `{prettyArr}`.\n\
-        Use `if {prettyIdx} < ({prettyArr}).size` or `if let i = ({prettyArr}).findIndex(...)` before indexing."
-  let hasErr := ((← Core.getMessageLog).toList.drop preMsgs).any (·.severity == .error)
-  if hasErr then return prfExpr else wrapAuxProof goalProp prfExpr
+  let prfExpr? ← tryProveWithFacts facts prfStx goalProp
+  let some prfExpr := prfExpr?
+    | do
+        let rawArr := (← ppExpr arrExpr).pretty.replace "✝" ""
+        let prettyArr := if rawArr.startsWith "_s0." then (rawArr.drop 4).toString else rawArr
+        let idxCore := if idxNatExpr.isAppOfArity ``Qed.Server.SrvIdx.toNat 3 then idxNatExpr.getArg! 2 else idxNatExpr
+        let rawIdx := (← ppExpr idxCore).pretty.replace "✝" ""
+        let prettyIdx := if rawIdx.startsWith "_s0." then (rawIdx.drop 4).toString else rawIdx
+        throwErrorAt ref m!"cannot prove array index `{prettyIdx}` is in bounds for `{prettyArr}` (requires `{prettyIdx} < {prettyArr}.size`).\n\
+          Guard this access with `if {prettyIdx} < {prettyArr}.size:` or `ensure {prettyIdx} < {prettyArr}.size else ...` before indexing."
+  wrapAuxProof goalProp prfExpr
 
 open Lean Meta Elab Term in
 private def elabArrAndIdx (arrStx idxStx : Term) (opDesc : String) : TermElabM (Expr × Expr × Expr) := do
@@ -850,8 +977,11 @@ elab_rules : tactic
       evalTactic (← `(tactic|
         try simp (config := { zetaDelta := false }) only
           [id_eq, ne_eq, Qed.Server.srvSeq_none, Qed.Server.srvSeq_some,
+           Qed.Server.srvEmitSeq_none, Qed.Server.srvEmitSeq_some,
            Qed.Server.srvFinish_ok, Qed.Server.srvFinish_err, Qed.Server.srvFinish_none,
+           Qed.Server.srvFinishEmit_ok, Qed.Server.srvFinishEmit_err, Qed.Server.srvFinishEmit_none,
            Qed.Server.srvAtomicCommit_none, Qed.Server.srvAtomicCommit_ok, Qed.Server.srvAtomicCommit_err,
+           Qed.Server.srvAtomicCommitEmit_none, Qed.Server.srvAtomicCommitEmit_ok, Qed.Server.srvAtomicCommitEmit_err,
            Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
            Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
            Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
@@ -1157,8 +1287,11 @@ elab_rules : tactic
       let userLemmas ← unfoldIds.mapM fun id => `(Lean.Parser.Tactic.simpLemma| $id:ident)
       let fixedNames := #[
         ``Qed.Server.srvSeq_none, ``Qed.Server.srvSeq_some, ``Qed.Server.srvSeq_srvLetEq,
+        ``Qed.Server.srvEmitSeq_none, ``Qed.Server.srvEmitSeq_some, ``Qed.Server.srvEmitSeq_srvLetEq,
         ``Qed.Server.srvFinish_ok, ``Qed.Server.srvFinish_err, ``Qed.Server.srvFinish_none, ``Qed.Server.srvFinish_srvLetEq,
+        ``Qed.Server.srvFinishEmit_ok, ``Qed.Server.srvFinishEmit_err, ``Qed.Server.srvFinishEmit_none, ``Qed.Server.srvFinishEmit_srvLetEq,
         ``Qed.Server.srvAtomicCommit_none, ``Qed.Server.srvAtomicCommit_ok, ``Qed.Server.srvAtomicCommit_err, ``Qed.Server.srvAtomicCommit_srvLetEq,
+        ``Qed.Server.srvAtomicCommitEmit_none, ``Qed.Server.srvAtomicCommitEmit_ok, ``Qed.Server.srvAtomicCommitEmit_err, ``Qed.Server.srvAtomicCommitEmit_srvLetEq,
         ``Qed.Server.srvWithNewState_srvLetEq,
         ``Qed.Server.srvEnsPost_ok, ``Qed.Server.srvEnsPost_err, ``Qed.Server.srvEnsPost_srvLetEq,
         ``Qed.Server.srvEnsPostOpt_some, ``Qed.Server.srvEnsPostOpt_none, ``Qed.Server.srvEnsPostOpt_err, ``Qed.Server.srvEnsPostOpt_srvLetEq,
@@ -1184,24 +1317,36 @@ elab_rules : tactic
       evalTactic runTac
       let rem ← getUnsolvedGoals
       unless rem.isEmpty do
-        let msg ← rem[0]!.withContext do ppExpr (← instantiateMVars (← rem[0]!.getType))
+        let msg := (← rem[0]!.withContext do ppExpr (← instantiateMVars (← rem[0]!.getType))).pretty.replace "✝" ""
+        let moreNote := if rem.length > 1 then s!"\n  (and {rem.length - 1} more obligation(s))" else ""
         let lbl := invLabel.getString
         if lbl.startsWith "ensures:" then
           let postStr := (lbl.drop 8).toString.trimAscii.toString
           throwError m!"server postcondition `ensures {postStr}` could not be proved for `{fnLabel.getString}`.\n\
-            Remaining proof obligation:\n  {msg}\n\
+            Remaining proof obligation:\n  {msg}{moreNote}\n\
             Ensure every successful return path establishes `{postStr}`."
+        else if lbl.startsWith "init:" then
+          let invStr := (lbl.drop 5).toString.trimAscii.toString
+          throwError m!"server invariant `{invStr}` does not hold on the initial state.\n\
+            Remaining proof obligation:\n  {msg}{moreNote}\n\
+            Update the initial `state` values so they satisfy `{invStr}`."
+        else if lbl.startsWith "mutating " then
+          throwError m!"server invariant `{lbl}` could not be proved for `{fnLabel.getString}`.\n\
+            Remaining proof obligation:\n  {msg}{moreNote}\n\
+            Add a matching `requires` clause or guard mutations of that field with `if ...:` / `ensure ... else ...`."
         else
           throwError m!"server invariant `{lbl}` could not be proved for `{fnLabel.getString}`.\n\
-            Remaining proof obligation:\n  {msg}\n\
-            Guard state mutations with `if ...` or `requires ...` so this invariant holds across every branch."
+            Remaining proof obligation:\n  {msg}{moreNote}\n\
+            Guard state mutations with `if ...:`, `ensure ... else ...`, or `requires ...` so this invariant holds across every branch."
 
 macro "qedNormAsyncCont" : tactic => `(tactic| (
   try dsimp (config := { zetaDelta := false }) only
     [Qed.Server.srvSeqM, Qed.Server.SrvUnwrap.unwrap, Qed.Server.SrvErr.ofApi, Qed.Server.SrvUnwrapOpt.unwrapOpt] at *
   try simp (config := { zetaDelta := false }) only
     [Qed.Server.srvFinish_ok, Qed.Server.srvFinish_err, Qed.Server.srvFinish_none, Qed.Server.srvFinish_srvLetEq,
+     Qed.Server.srvFinishEmit_ok, Qed.Server.srvFinishEmit_err, Qed.Server.srvFinishEmit_none, Qed.Server.srvFinishEmit_srvLetEq,
      Qed.Server.srvAtomicCommit_none, Qed.Server.srvAtomicCommit_ok, Qed.Server.srvAtomicCommit_err, Qed.Server.srvAtomicCommit_srvLetEq,
+     Qed.Server.srvAtomicCommitEmit_none, Qed.Server.srvAtomicCommitEmit_ok, Qed.Server.srvAtomicCommitEmit_err, Qed.Server.srvAtomicCommitEmit_srvLetEq,
      Qed.Server.srvEnsPost_ok, Qed.Server.srvEnsPost_err, Qed.Server.srvEnsPost_srvLetEq,
      Qed.Server.srvEnsPostOpt_some, Qed.Server.srvEnsPostOpt_none, Qed.Server.srvEnsPostOpt_err, Qed.Server.srvEnsPostOpt_srvLetEq,
      Qed.Server.prod_fst_srvLetEq, Qed.Server.prod_snd_srvLetEq,
@@ -1213,7 +1358,8 @@ macro "qedAsyncInit " handlerId:ident : tactic => `(tactic| (
   try dsimp (config := { zetaDelta := false }) only [Qed.Server.srvFinishM, Qed.Server.srvSeqM] at *;
   try simp (config := { zetaDelta := false }) only
     [Qed.Server.srvFinishM, Qed.Server.srvSeqM,
-     Qed.Server.srvFinish_srvLetEq, Qed.Server.srvAtomicCommit_srvLetEq,
+     Qed.Server.srvFinish_srvLetEq, Qed.Server.srvFinishEmit_srvLetEq,
+     Qed.Server.srvAtomicCommit_srvLetEq, Qed.Server.srvAtomicCommitEmit_srvLetEq,
      Qed.Server.srvEnsPost_ok, Qed.Server.srvEnsPost_err, Qed.Server.srvEnsPost_srvLetEq,
      Qed.Server.srvEnsPostOpt_some, Qed.Server.srvEnsPostOpt_none, Qed.Server.srvEnsPostOpt_err, Qed.Server.srvEnsPostOpt_srvLetEq,
      Qed.Server.prod_fst_srvLetEq, Qed.Server.prod_snd_srvLetEq,

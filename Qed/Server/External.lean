@@ -1,4 +1,5 @@
 import Lean
+import Qed.Socket
 import Qed.Server.Core
 import Qed.Server.Syntax
 
@@ -221,11 +222,12 @@ private structure ParsedExtParam where
 
 open Lean Elab Command in
 private def parseExternalClauses (svcIdent : Ident) (svcName : Name) (clauses : Array Syntax) :
-    CommandElabM (String × AuthSpec × Array Syntax) := do
-  let mut baseOrigin? : Option String := none
+    CommandElabM (String × AuthSpec × Array Syntax × Array Syntax) := do
+  let mut baseOrigin? : Option (Syntax × String) := none
   let mut authSpec : AuthSpec := .none
   let mut hasAuth := false
   let mut epClauses : Array Syntax := #[]
+  let mut wsClauses : Array Syntax := #[]
   for c in clauses do
     let k := c.getKind
     if k == ``extBaseClause then
@@ -236,15 +238,16 @@ private def parseExternalClauses (svcIdent : Ident) (svcName : Name) (clauses : 
       let trimmed := if rawBase.endsWith "/" then
         String.ofList (rawBase.toList.take (rawBase.length - 1))
       else rawBase
-      unless isValidBaseOrigin trimmed do
-        throwErrorAt c s!"invalid `base` URL `{rawBase}`: expected pinned `https://host...` or `http://host...` without `?`, `#`, `@`, or `\\`"
-      baseOrigin? := some trimmed
+      unless isValidWsBaseOrigin trimmed do
+        throwErrorAt c s!"invalid `base` URL `{rawBase}`: expected pinned `https://`, `http://`, `wss://`, or `ws://` origin without `?`, `#`, `@`, or `\\`"
+      baseOrigin? := some (c, trimmed)
     else if k == ``extAuthBearer || k == ``extAuthHeader || k == ``extAuthGcp then
       if hasAuth then throwErrorAt c s!"duplicate `auth` clause in `external {svcName}`"
       hasAuth := true
       let checkEnv (stx : Syntax) : CommandElabM String := do
         let v := (⟨stx⟩ : TSyntax `str).getString
-        unless isValidEnvVarName v do throwErrorAt stx s!"invalid secret environment variable name `{v}`"
+        unless isValidEnvVarName v do
+          throwErrorAt stx s!"invalid secret environment variable name `{v}`: must be non-empty and contain only ASCII letters, digits, or `_`"
         return v
       if k == ``extAuthBearer then
         authSpec := .bearerSecret (← checkEnv c[5])
@@ -258,13 +261,19 @@ private def parseExternalClauses (svcIdent : Ident) (svcName : Name) (clauses : 
         authSpec := .gcpServiceAccount (← checkEnv c[5]) scope
     else if k == ``extEndpointClause then
       epClauses := epClauses.push c
+    else if k == ``extWsClause then
+      wsClauses := wsClauses.push c
     else
       throwErrorAt c "unexpected clause in `external` block"
-  let some baseOrigin := baseOrigin?
-    | throwErrorAt svcIdent s!"`external {svcName}` must declare `base \"https://...\"`"
-  if epClauses.isEmpty then
-    throwErrorAt svcIdent s!"`external {svcName}` must declare at least one endpoint"
-  return (baseOrigin, authSpec, epClauses)
+  let some (baseRef, baseOrigin) := baseOrigin?
+    | throwErrorAt svcIdent s!"`external {svcName}` must declare `base \"https://...\"` or `base \"wss://...\"`"
+  if epClauses.isEmpty && wsClauses.isEmpty then
+    throwErrorAt svcIdent s!"`external {svcName}` must declare at least one HTTP endpoint or `ws` channel"
+  if !epClauses.isEmpty && !isValidBaseOrigin baseOrigin then
+    throwErrorAt baseRef s!"`external {svcName}` declares HTTP endpoints, so `base` must use `https://` or `http://` (got `{baseOrigin}`)"
+  if !wsClauses.isEmpty && hasAuth then
+    throwErrorAt svcIdent s!"`external {svcName}` declares client-usable `ws` channels and cannot attach server `auth` secrets; split server-authenticated HTTP endpoints into a separate `external` block"
+  return (baseOrigin, authSpec, epClauses, wsClauses)
 
 open Lean Elab Command in
 private def buildExternalCallCmds (fullFnId baseId : Ident) (svcStrLit verbLit : StrLit)
@@ -292,6 +301,25 @@ private def buildExternalCallCmds (fullFnId baseId : Ident) (svcStrLit verbLit :
   elabCommand safeInstCmd
 
 open Lean Elab Command in
+private def lowerUrlParts (ref : Syntax) (segSpecs : Array UrlSegSpec)
+    (querySpecs : Array (String × QueryValSpec)) (paramIdents : Array Ident) :
+    CommandElabM (Array Term × Array Term) := do
+  let paramSegTerm (pn : String) : CommandElabM Term := do
+    let some pid := paramIdents.find? (·.getId.toString == pn)
+      | throwErrorAt ref "internal missing URL param"
+    `(Qed.RouteParam.toSeg $pid)
+  let pathTerms ← segSpecs.mapM fun
+    | .lit s          => `(Qed.Server.PathPart.lit $(Syntax.mkStrLit s))
+    | .singleParam pn => do `(Qed.Server.PathPart.seg $(← paramSegTerm pn))
+    | .multiParam pn  => do `(Qed.Server.PathPart.multiSeg $(← paramSegTerm pn))
+  let queryTerms ← querySpecs.mapM fun (qk, qv) => do
+    let qkLit := Syntax.mkStrLit qk
+    match qv with
+    | .lit s    => `(($qkLit, Qed.Server.QueryVal.lit $(Syntax.mkStrLit s)))
+    | .param pn => do `(($qkLit, Qed.Server.QueryVal.param $(← paramSegTerm pn)))
+  return (pathTerms, queryTerms)
+
+open Lean Elab Command in
 private def elabExternalEndpoint (svcName : Name) (svcStrLit : StrLit) (baseId : Ident)
     (authTerm : Term) (methodNames : Array Name) (ep : Syntax) : CommandElabM Name := do
   let httpVerbRaw := ep[0].getId.toString.toUpper
@@ -312,7 +340,7 @@ private def elabExternalEndpoint (svcName : Name) (svcStrLit : StrLit) (baseId :
     let pty ← liftMacroM <| ParsedSrvType.parse tyNode
     liftMacroM <| pty.validate (allowFallible := false) s!"parameter `{pid.getId}`"
     let pstr := pid.getId.toString
-    if seenParamNames.contains pstr then throwErrorAt pid s!"duplicate parameter `{pstr}`"
+    if seenParamNames.contains pstr then throwErrorAt pid s!"duplicate parameter `{pstr}` in endpoint `{fnName}`"
     seenParamNames := seenParamNames.push pstr
     parsedParams := parsedParams.push { ref := rp, headerKey? := hk?, ident := pid, ty := pty }
   let retTy ← liftMacroM <| ParsedSrvType.parse ep[7]
@@ -327,24 +355,13 @@ private def elabExternalEndpoint (svcName : Name) (svcStrLit : StrLit) (baseId :
     if p.headerKey?.isNone && !placeholders.contains p.ident.getId.toString then
       if httpVerbRaw == "GET" || httpVerbRaw == "DELETE" then
         throwErrorAt p.ref s!"parameter `{p.ident.getId}` on `{httpVerbRaw}` endpoint `{fnName}` is not referenced as `:{p.ident.getId}` in `{urlTmpl}`"
-      if bodyParam?.isSome then
-        throwErrorAt p.ref s!"endpoint `{fnName}` has multiple request body parameters; bundle fields into a `schema` type"
+      if let some prev := bodyParam? then
+        throwErrorAt p.ref s!"endpoint `{fnName}` has multiple request body parameters (`{prev.ident.getId}` and `{p.ident.getId}`); bundle them into a `schema` type"
       bodyParam? := some p
   let pIdents := parsedParams.map (·.ident)
   let pTyTerms ← parsedParams.mapM fun p => liftMacroM p.ty.toPayloadTerm
-  let paramSegTerm (pn : String) : CommandElabM Term := do
-    let some p := parsedParams.find? (·.ident.getId.toString == pn)
-      | throwErrorAt ep[1] "internal missing URL param"
-    `(Qed.RouteParam.toSeg $(p.ident))
-  let pathTerms ← segSpecs.mapM fun
-    | .lit s          => `(Qed.Server.PathPart.lit $(Syntax.mkStrLit s))
-    | .singleParam pn => do `(Qed.Server.PathPart.seg $(← paramSegTerm pn))
-    | .multiParam pn  => do `(Qed.Server.PathPart.multiSeg $(← paramSegTerm pn))
-  let queryTerms ← querySpecs.mapM fun (qk, qv) => do
-    let qkLit := Syntax.mkStrLit qk
-    match qv with
-    | .lit s    => `(($qkLit, Qed.Server.QueryVal.lit $(Syntax.mkStrLit s)))
-    | .param pn => do `(($qkLit, Qed.Server.QueryVal.param $(← paramSegTerm pn)))
+  let urlParamIdents := (parsedParams.filter (·.headerKey?.isNone)).map (·.ident)
+  let (pathTerms, queryTerms) ← lowerUrlParts ep[1] segSpecs querySpecs urlParamIdents
   let mut customHdrTerms : Array Term := #[]
   for p in parsedParams do
     if let some hk := p.headerKey? then
@@ -391,12 +408,235 @@ private def elabExternalEndpoint (svcName : Name) (svcStrLit : StrLit) (baseId :
   return fnName
 
 open Lean Elab Command in
+private def classifyExtWsCodec (ty : ParsedSrvType) : Qed.ExtWsCodec :=
+  if ty.isProto then .proto
+  else
+    let b := ty.baseIdent.getId.toString
+    if ty.mods.isEmpty && (b == "Bytes" || b == "ByteArray") then .bytes
+    else if ty.mods.isEmpty && b == "String" then .text
+    else .json
+
+open Lean Elab Command in
+private def buildExtPropConj (ps : Array Term) : CommandElabM Term := do
+  match ps.toList with
+  | [] => `(True)
+  | [p] => pure p
+  | p :: rest => rest.foldlM (init := p) fun acc q => `($acc ∧ $q)
+
+open Lean Elab Command in
+private def elabExternalWsChannel (svcName fullSvcName : Name) (svcNameStr : String) (baseId : Ident)
+    (existingNames : Array Name) (wsStx : Syntax) : CommandElabM Name := do
+  let urlTmpl := (⟨wsStx[1]⟩ : TSyntax `str).getString
+  let chIdent : Ident := ⟨wsStx[2]⟩
+  let chName := chIdent.getId
+  let chStr := chName.toString
+  if existingNames.contains chName then
+    throwErrorAt chIdent s!"duplicate channel/endpoint `{chName}` in `external {svcName}`"
+  let rawParams := wsStx[4].getSepArgs
+  let mut pIdents : Array Ident := #[]
+  let mut pTyTerms : Array Term := #[]
+  let mut seenP : Array String := #[]
+  for rp in rawParams do
+    let pid : Ident := ⟨rp[0]⟩
+    let pstr := pid.getId.toString
+    if seenP.contains pstr then throwErrorAt pid s!"duplicate parameter `{pstr}` in `ws {chName}`"
+    seenP := seenP.push pstr
+    let pty ← liftMacroM <| ParsedSrvType.parse rp[2]
+    liftMacroM <| pty.validate (allowFallible := false) s!"parameter `{pstr}`"
+    pIdents := pIdents.push pid
+    pTyTerms := pTyTerms.push (← liftMacroM pty.toPayloadTerm)
+
+  let evTy ← liftMacroM <| ParsedSrvType.parse wsStx[7]
+  liftMacroM <| evTy.validate (allowFallible := false) s!"event type of `ws {chName}`"
+  let evTyTerm ← liftMacroM evTy.toPayloadTerm
+  let evCodec := classifyExtWsCodec evTy
+  let isBinary := evCodec == .proto || evCodec == .bytes
+
+  let (segSpecs, querySpecs, placeholders) ← parseUrlTemplate wsStx[1] urlTmpl
+  for ph in placeholders do
+    unless seenP.contains ph do
+      throwErrorAt wsStx[1] s!"WebSocket URL placeholder `:{ph}` has no matching parameter `{ph}` in `{chName}`"
+  for p in pIdents do
+    unless placeholders.contains p.getId.toString do
+      throwErrorAt p s!"parameter `{p.getId}` on `ws {chName}` is not referenced as `:{p.getId}` in `{urlTmpl}`"
+
+  let mut reqExprs : Array Syntax := #[]
+  let mut sendParams : Array (Ident × ParsedSrvType × Term) := #[]
+  let mut sendReqExprs : Array Syntax := #[]
+  let mut hasSend := false
+  let mut recPolicy : Qed.Reconnect := .defaultPolicy
+  let mut hasRec := false
+
+  if wsStx[8].getNumArgs == 2 then
+    for sub in wsStx[8][1].getArgs do
+      let sk := sub.getKind
+      if sk == ``extWsReqClause then
+        reqExprs := reqExprs ++ sub[0][1].getSepArgs
+      else if sk == ``extWsReconnectClause then
+        if hasRec then throwErrorAt sub s!"duplicate `reconnect` clause in `ws {chName}`"
+        hasRec := true
+        recPolicy ← liftMacroM <| Qed.parseReconnectExpr sub[1]
+      else if sk == ``extWsSendClause then
+        if hasSend then throwErrorAt sub s!"duplicate `send` clause in `ws {chName}`"
+        hasSend := true
+        let mut seenSp : Array String := #[]
+        for srp in sub[2].getSepArgs do
+          let spid : Ident := ⟨srp[0]⟩
+          let spstr := spid.getId.toString
+          if seenSp.contains spstr then throwErrorAt spid s!"duplicate send parameter `{spstr}` in `ws {chName}`"
+          seenSp := seenSp.push spstr
+          let spty ← liftMacroM <| ParsedSrvType.parse srp[2]
+          liftMacroM <| spty.validate (allowFallible := false) s!"send parameter `{spstr}`"
+          sendParams := sendParams.push (spid, spty, ← liftMacroM spty.toPayloadTerm)
+        if sub[4].getNumArgs == 2 then
+          for srl in sub[4][1].getArgs do
+            sendReqExprs := sendReqExprs ++ srl[1].getSepArgs
+      else
+        throwErrorAt sub s!"unexpected clause in `ws {chName}`"
+
+  if hasSend && sendParams.size != 1 then
+    throwErrorAt chIdent s!"3rd-party `ws {chName}` `send(...)` expects a single payload parameter (bundle multiple fields into a `schema`)"
+
+  let (pathTerms, queryTerms) ← lowerUrlParts wsStx[1] segSpecs querySpecs pIdents
+
+  -- Emit `<Svc>.<ch>_Event` & param type aliases
+  let evAbbrevId := mkIdentFrom chIdent (svcName ++ chName.appendAfter "_Event")
+  elabCommand (← `(command| abbrev $evAbbrevId : Type := $evTyTerm))
+  let mut paramTypeConsts : Array Name := #[]
+  for (pTy, i) in pTyTerms.zipIdx do
+    let pTyId := mkIdentFrom chIdent (svcName ++ chName.appendAfter s!"_Param_{i}")
+    elabCommand (← `(command| abbrev $pTyId : Type := $pTy))
+    paramTypeConsts := paramTypeConsts.push (fullSvcName ++ chName.appendAfter s!"_Param_{i}")
+
+  -- Emit `<Svc>.<ch>_req` if `requires` present
+  let mut reqConst? : Option Name := none
+  let mut reqLabel := ""
+  if !reqExprs.isEmpty then
+    let reqProps ← reqExprs.mapM fun e => liftMacroM <| Qed.Lang.lowerSimpleQedExpr .propInv e
+    let reqConj ← buildExtPropConj reqProps
+    let reqId := mkIdentFrom chIdent (svcName ++ chName.appendAfter "_req")
+    elabCommand (← `(command|
+      set_option linter.unusedVariables false in
+      @[simp] abbrev $reqId $[($pIdents:ident : $pTyTerms:term)]* : Prop := $reqConj))
+    reqConst? := some (fullSvcName ++ chName.appendAfter "_req")
+    reqLabel := String.intercalate " && " (reqExprs.toList.map fun e => (e.reprint.getD "requires").trimAscii.toString)
+
+  -- Emit `<Svc>.<ch>_key` (origin-pinned WS URL)
+  let keyId := mkIdentFrom chIdent (svcName ++ chName.appendAfter "_key")
+  elabCommand (← `(command|
+    def $keyId $[($pIdents:ident : $pTyTerms:term)]* : String :=
+      (Qed.Server.buildExternalWsUrl $baseId [$[$pathTerms],*] [$[$queryTerms],*]).toOption.getD ""))
+
+  -- Emit `<Svc>.<ch>_sub`
+  let subId := mkIdentFrom chIdent (svcName ++ chName.appendAfter "_sub")
+  let slotId := mkIdent `slot
+  let recId := mkIdent `rec
+  let onJoinId := mkIdent `onJoin
+  let onMsgId := mkIdent `onMsg
+  let onStatusId := mkIdent `onStatus
+  let keyApp ← pIdents.foldlM (init := (keyId : Term)) fun acc p => `($acc $p)
+  let isBinTerm : Term ← if isBinary then `(true) else `(false)
+  let (onTextTerm, onBytesTerm) ← match evCodec with
+    | .text  => pure (← `($onMsgId), ← `(fun _ => $onStatusId (Qed.SocketStatus.failed "unexpected binary WebSocket frame")))
+    | .json  => pure (
+        ← `(fun raw =>
+              match (Qed.Json.parse raw 128).bind (Qed.FromJson.fromJson (α := $evTyTerm)) with
+              | Except.ok v    => $onMsgId v
+              | Except.error e => $onStatusId (Qed.SocketStatus.failed e)),
+        ← `(fun _ => $onStatusId (Qed.SocketStatus.failed "unexpected binary WebSocket frame")))
+    | .bytes => pure (← `(fun _ => $onStatusId (Qed.SocketStatus.failed "unexpected text WebSocket frame")), ← `($onMsgId))
+    | .proto => pure (
+        ← `(fun _ => $onStatusId (Qed.SocketStatus.failed "unexpected text WebSocket frame")),
+        ← `(fun bs =>
+              match Qed.Proto.decode (α := $evTyTerm) bs with
+              | Except.ok v    => $onMsgId v
+              | Except.error e => $onStatusId (Qed.SocketStatus.failed e)))
+  elabCommand (← `(command|
+    set_option linter.unusedVariables false in
+    def $subId {msg : Type} ($slotId:ident : String) $[($pIdents:ident : $pTyTerms:term)]*
+        ($recId:ident : Qed.Reconnect) ($onJoinId:ident : Unit → msg) ($onMsgId:ident : $evTyTerm → msg)
+        ($onStatusId:ident : Qed.SocketStatus → msg) : Qed.Cmd msg :=
+      let url := $keyApp
+      if url.isEmpty then Qed.Cmd.none
+      else Qed.Cmd.wsExtOpen $slotId url $isBinTerm $recId $onJoinId $onTextTerm $onBytesTerm $onStatusId))
+
+  -- Emit `<Svc>.<ch>_unsub`
+  let unsubId := mkIdentFrom chIdent (svcName ++ chName.appendAfter "_unsub")
+  elabCommand (← `(command|
+    def $unsubId {msg : Type} ($slotId:ident : String) : Qed.Cmd msg :=
+      Qed.Cmd.wsExtClose $slotId))
+
+  -- Emit `<Svc>.<ch>_send` & `_send_req` if `send(...)` declared
+  let mut sendCodec : Qed.ExtWsCodec := .json
+  let mut sendParamNames : Array Name := #[]
+  let mut sendParamTypeConsts : Array Name := #[]
+  let mut sendReqConst? : Option Name := none
+  let mut sendReqLabel := ""
+  let mut sendHelperConst : Name := .anonymous
+  if let some (spId, spTy, spTyTerm) := sendParams[0]? then
+    sendCodec := classifyExtWsCodec spTy
+    sendParamNames := #[spId.getId]
+    let spAbbrevId := mkIdentFrom chIdent (svcName ++ chName.appendAfter "_SendParam_0")
+    elabCommand (← `(command| abbrev $spAbbrevId : Type := $spTyTerm))
+    sendParamTypeConsts := #[fullSvcName ++ chName.appendAfter "_SendParam_0"]
+    if !sendReqExprs.isEmpty then
+      let sProps ← sendReqExprs.mapM fun e => liftMacroM <| Qed.Lang.lowerSimpleQedExpr .propInv e
+      let sConj ← buildExtPropConj sProps
+      let sReqId := mkIdentFrom chIdent (svcName ++ chName.appendAfter "_send_req")
+      elabCommand (← `(command|
+        set_option linter.unusedVariables false in
+        @[simp] abbrev $sReqId ($spId:ident : $spTyTerm) : Prop := $sConj))
+      sendReqConst? := some (fullSvcName ++ chName.appendAfter "_send_req")
+      sendReqLabel := String.intercalate " && " (sendReqExprs.toList.map fun e => (e.reprint.getD "requires").trimAscii.toString)
+    let sendId := mkIdentFrom chIdent (svcName ++ chName.appendAfter "_send")
+    let sendBody : Term ← match sendCodec with
+      | .text  => `(Qed.Cmd.wsExtSendText $slotId $spId)
+      | .json  => `(Qed.Cmd.wsExtSendText $slotId (Qed.Json.render (Qed.toJson $spId)))
+      | .bytes => `(Qed.Cmd.wsExtSendBytes $slotId $spId)
+      | .proto => `(Qed.Cmd.wsExtSendBytes $slotId (Qed.Proto.encode $spId))
+    elabCommand (← `(command|
+      def $sendId {msg : Type} ($slotId:ident : String) ($spId:ident : $spTyTerm) : Qed.Cmd msg :=
+        $sendBody))
+    sendHelperConst := fullSvcName ++ chName.appendAfter "_send"
+
+  modifyEnv fun env => Qed.channelRegistry.addEntry env {
+    fullName := fullSvcName ++ chName
+    ownerName := fullSvcName
+    ownerShort := svcNameStr
+    channelName := chStr
+    kind := .external fullSvcName isBinary evCodec sendCodec
+    paramNames := pIdents.map (·.getId)
+    paramCount := pIdents.size
+    paramTypeConsts
+    eventTypeConst := fullSvcName ++ chName.appendAfter "_Event"
+    hasJoinSnapshot := false
+    joinTypeConst := .anonymous
+    hasSend
+    sendParamNames
+    sendParamCount := sendParams.size
+    sendParamTypeConsts
+    sendReqConst := sendReqConst?
+    sendReqLabel
+    requiresAuth := false
+    clientReqConst := reqConst?
+    clientReqLabel := reqLabel
+    hasEnsures := false
+    ensPredConst := none
+    defaultReconnect := recPolicy
+    keyHelperConst := fullSvcName ++ chName.appendAfter "_key"
+    subHelperConst := fullSvcName ++ chName.appendAfter "_sub"
+    sendHelperConst
+    unsubHelperConst := fullSvcName ++ chName.appendAfter "_unsub"
+  }
+  return chName
+
+open Lean Elab Command in
 @[command_elab externalCmd]
 def elabExternalCmd : CommandElab := fun stx => do
   let svcIdent : Ident := ⟨stx[1]⟩
   let svcName := svcIdent.getId
   let svcNameStr := svcName.toString
-  let (baseOrigin, authSpec, epClauses) ← parseExternalClauses svcIdent svcName stx[3].getArgs
+  let (baseOrigin, authSpec, epClauses, wsClauses) ← parseExternalClauses svcIdent svcName stx[3].getArgs
   let currNs ← getCurrNamespace
   let fullSvcName := currNs ++ svcName
   let secretsList := authSpec.requiredSecrets.toArray
@@ -415,6 +655,8 @@ def elabExternalCmd : CommandElab := fun stx => do
   let mut methodNames : Array Name := #[]
   for ep in epClauses do
     methodNames := methodNames.push (← elabExternalEndpoint svcName svcStrLit baseId authTerm methodNames ep)
+  for ws in wsClauses do
+    methodNames := methodNames.push (← elabExternalWsChannel svcName fullSvcName svcNameStr baseId methodNames ws)
   modifyEnv fun env => externalRegistry.addEntry env {
     serviceName := fullSvcName
     baseOrigin

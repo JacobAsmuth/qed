@@ -13,11 +13,26 @@ deriving Inhabited, DecidableEq, Repr
 
 declare_syntax_cat extClause
 declare_syntax_cat extParam
+declare_syntax_cat extWsSubClause
 declare_syntax_cat srvClause
+declare_syntax_cat srvChanSubClause
 declare_syntax_cat fullstackClause
 
 section SrvParsers
 open Lean Parser Qed.Lang
+
+def srvParam : Parser :=
+  node `Qed.Server.srvParam (ident >> ":" >> categoryParser `qedType 0)
+
+def srvRequiresLine : Parser :=
+  node `Qed.Server.srvRequiresLine
+    (withPosition (atomic (identEq `requires) >> sepBy1 (categoryParser `qedExpr 0) ","))
+
+def srvEnsuresLine : Parser :=
+  node `Qed.Server.srvEnsuresLine
+    (withPosition (atomic (identEq `ensures) >> sepBy1 (categoryParser `qedExpr 0) ","))
+
+def srvContractLine : Parser := srvRequiresLine <|> srvEnsuresLine
 
 -- `external` clauses & command
 @[extParam_parser] def extParamHeader : Parser := leading_parser
@@ -55,6 +70,23 @@ def extHttpMethod : Parser :=
     ident >> checkNoWsBefore "" >> "(" >> sepBy (categoryParser `extParam 0) "," >> ")" >>
     " -> " >> categoryParser `qedType 0)
 
+@[extWsSubClause_parser] def extWsReqClause : Parser := leading_parser srvRequiresLine
+@[extWsSubClause_parser] def extWsReconnectClause : Parser := leading_parser
+  withPosition (atomic (kw "reconnect") >> categoryParser `qedExpr 0)
+@[extWsSubClause_parser] def extWsSendClause : Parser := leading_parser
+  withPosition (
+    atomic (kw "send" >> checkNoWsBefore "" >> "(") >> sepBy1 srvParam "," >> ")" >>
+    optional (":" >> checkColGt "expected indented `requires` clauses" >> many1Indent srvRequiresLine))
+
+@[extClause_parser] def extWsClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `ws) >> strLit >>
+    checkColGt "expected WebSocket channel signature" >>
+    ident >> checkNoWsBefore "" >> "(" >> sepBy srvParam "," >> ")" >>
+    " -> " >> categoryParser `qedType 0 >>
+    optional (":" >> checkColGt "expected indented `ws` channel clauses" >>
+      many1Indent (categoryParser `extWsSubClause 0)))
+
 @[command_parser] def externalCmd : Parser := leading_parser
   withPosition (
     "external " >> ident >> ":" >>
@@ -62,9 +94,6 @@ def extHttpMethod : Parser :=
     many1Indent (categoryParser `extClause 0))
 
 -- `server` & `fullstack` clauses & commands
-def srvParam : Parser :=
-  node `Qed.Server.srvParam (ident >> ":" >> categoryParser `qedType 0)
-
 @[srvClause_parser] def srvEnvClause : Parser := leading_parser
   withPosition (atomic (identEq `env) >> ident >> "=" >> strLit >> optional (" ?? " >> strLit))
 
@@ -80,15 +109,35 @@ def srvParam : Parser :=
 @[srvClause_parser] def srvInvClause : Parser := leading_parser
   withPosition ("invariant " >> sepBy1 (categoryParser `qedExpr 0) ",")
 
-def srvRequiresLine : Parser :=
-  node `Qed.Server.srvRequiresLine
-    (withPosition (atomic (identEq `requires) >> sepBy1 (categoryParser `qedExpr 0) ","))
+@[srvChanSubClause_parser] def srvChanReqClause : Parser := leading_parser srvRequiresLine
+@[srvChanSubClause_parser] def srvChanEnsClause : Parser := leading_parser srvEnsuresLine
+@[srvChanSubClause_parser] def srvChanReconnectClause : Parser := leading_parser
+  withPosition (atomic (kw "reconnect") >> categoryParser `qedExpr 0)
 
-def srvEnsuresLine : Parser :=
-  node `Qed.Server.srvEnsuresLine
-    (withPosition (atomic (identEq `ensures) >> sepBy1 (categoryParser `qedExpr 0) ","))
+@[srvChanSubClause_parser] def srvChanOnJoinClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `on_join) >>
+    optional (" -> " >> categoryParser `qedType 0) >> ":" >>
+    qedSuite)
 
-def srvContractLine : Parser := srvRequiresLine <|> srvEnsuresLine
+@[srvChanSubClause_parser] def srvChanOnSendClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `on_send >> checkNoWsBefore "" >> "(") >> sepBy1 srvParam "," >> ")" >> ":" >>
+    checkColGt "expected indented `on_send` body" >>
+    withPosition (
+      many (atomic (checkColEq "requires" >> srvRequiresLine)) >>
+      many1 (checkColEq "statement" >> categoryParser `qedStmt 0)))
+
+@[srvChanSubClause_parser] def srvChanOnLeaveClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `on_leave) >> ":" >> qedSuite)
+
+@[srvClause_parser] def srvChannelClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `channel) >> ident >> checkNoWsBefore "" >> "(" >> sepBy srvParam "," >> ")" >>
+    " -> " >> categoryParser `qedType 0 >>
+    optional (":" >> checkColGt "expected indented `channel` clauses" >>
+      many1Indent (categoryParser `srvChanSubClause 0)))
 
 @[srvClause_parser] def srvFnClause : Parser := leading_parser
   withPosition (
@@ -144,8 +193,19 @@ def parse (stx : Lean.Syntax) : Lean.MacroM ParsedSrvType := do
     let (baseId, initMods) ← Qed.Lang.splitIdentMods ⟨stx[0]⟩
     return { ref := stx, baseIdent := baseId, isProto := false,
              mods := initMods ++ (← stx[1].getArgs.mapM Qed.Lang.parseTypeModNode) }
+  else if k == ``Qed.Lang.qedTypeApp && stx[0].getKind == ``Qed.Lang.qedTypeAtom && stx[0][1].getArgs.isEmpty then
+    let fnName := stx[0][0].getId.eraseMacroScopes
+    let argStr := let s := Qed.Lang.stxSnippet stx[1]; if s.isEmpty then "T" else s
+    if fnName == `Array || fnName == `Option then
+      Lean.Macro.throwErrorAt stx s!"use `{argStr}{if fnName == `Array then "[]" else "?"}` instead of `{fnName} {argStr}`"
+    else
+      let sn := Qed.Lang.stxSnippet stx
+      let what := if sn.isEmpty then "" else s!" `{sn}`"
+      Lean.Macro.throwErrorAt stx s!"invalid server type{what}; expected `T`, `T[]`, `T?`, `T!`, or `Proto(T)`"
   else
-    Lean.Macro.throwErrorAt stx "expected a type (`T`, `T[]`, `T?`, `T!`, or `Proto(T)`)"
+    let sn := Qed.Lang.stxSnippet stx
+    let what := if sn.isEmpty then "" else s!" `{sn}`"
+    Lean.Macro.throwErrorAt stx s!"invalid server type{what}; expected `T`, `T[]`, `T?`, `T!`, or `Proto(T)`"
 
 def hasFallible (t : ParsedSrvType) : Bool := t.mods.contains .fallible
 def isOuterOption (t : ParsedSrvType) : Bool := t.mods.back? == some .option

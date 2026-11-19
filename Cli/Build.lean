@@ -4,12 +4,16 @@ open System (FilePath)
 
 namespace Qed.Cli
 
-def indexHtml (dev : Bool) : String :=
+def indexHtml (dev : Bool) (hasStylesCss : Bool := false) (stylesheets : List String := []) : String :=
   let reload := if dev then
     "<script>(function(){let v=null;setInterval(async()=>{try{const t=await (await fetch('/__build_id',{cache:'no-store'})).text();if(v&&v!==t)location.reload();v=t;}catch(e){}},700)})()</script>\n"
   else ""
+  let extLinks := String.join (stylesheets.map fun href =>
+    s!"<link rel=\"stylesheet\" href=\"{href}\">")
+  let styleLink := if hasStylesCss then "<link rel=\"stylesheet\" data-qed-styles href=\"/styles.css\">" else ""
   "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><base href=\"/\">" ++
-  "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>qed</title></head>\n" ++
+  "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>qed</title>" ++
+  extLinks ++ styleLink ++ "</head>\n" ++
   "<body><div id=\"app\">loading…</div>\n" ++ reload ++
   "<script type=\"module\" src=\"/qed_host.mjs\"></script>\n</body>\n</html>\n"
 
@@ -69,10 +73,43 @@ def ssrWrapper (appName : String) (cacheKey : String := "") : String :=
   "export { makeHandler, mod };\n" ++
   "export default makeHandler(mod, { title: '" ++ title ++ "', script: '/qed_host.mjs' });\n"
 
-private def writeClientShell (outDir : FilePath) (prod : Bool) : IO Unit := do
+private def copyLocalStylesheets (outDir : FilePath) (sheets : List String) : IO Unit := do
+  for href in sheets do
+    if href.startsWith "/" && !href.startsWith "//" then
+      let rel := String.ofList (href.toList.drop 1)
+      let candidates : List FilePath := [FilePath.mk rel, FilePath.mk "public" / rel, FilePath.mk "assets" / rel]
+      for src in candidates do
+        if ← src.pathExists then
+          let dst := outDir / rel
+          if let some p := dst.parent then IO.FS.createDirAll p
+          IO.FS.writeBinFile dst (← IO.FS.readBinFile src)
+          break
+
+private def extractAppCss (q : QedjsEnv) (outDir : FilePath) (mods : Array String)
+    (appDecl : String) (extraPath? : Option String := none) : IO (Bool × List String) := do
+  let cssPath := (outDir / "styles.css").toString
+  let lp := match extraPath? with
+    | some ep => s!"{ep}:{q.leanPath}"
+    | none    => q.leanPath
+  let (code, out) ← shOut q.bin.toString (#["--emit-css", cssPath] ++ mods ++ #["--", appDecl]) #[("LEAN_PATH", some lp)]
+  if code != 0 then
+    return (false, [])
+  let mut hasCss := false
+  let mut sheets : List String := []
+  for line in out.splitOn "\n" do
+    let t := line.trimmed
+    if t == "HAS_CSS:1" then hasCss := true
+    else if t.startsWith "STYLESHEET:" then
+      let s := (String.ofList (t.toList.drop 11)).trimmed
+      if !s.isEmpty then sheets := sheets ++ [s]
+  copyLocalStylesheets outDir sheets
+  return (hasCss, sheets)
+
+private def writeClientShell (outDir : FilePath) (prod : Bool)
+    (hasStylesCss : Bool := false) (stylesheets : List String := []) : IO Unit := do
   for f in ["qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"] do
     IO.FS.writeFile (outDir / f) (← IO.FS.readFile (← runtimeFile f))
-  IO.FS.writeFile (outDir / "index.html") (indexHtml (dev := !prod))
+  IO.FS.writeFile (outDir / "index.html") (indexHtml (dev := !prod) hasStylesCss stylesheets)
 
 private def minifyBundles (outDir : FilePath) (files : List String) : IO Unit := do
   if (← onPath "esbuild") then
@@ -169,7 +206,8 @@ def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool)
       let rtArgs := #["--rt", rtPath.toString]
       if !(← q.run (minArgs ++ rtArgs ++ #[appMjs.toString, "ClientMain", "--"] ++ driverEntries) (extraPath := some genDir.toString)) then
         return false
-    writeClientShell outDir prod
+    let (hasCss, sheets) ← extractAppCss q outDir #[mod] s!"{fsName}.clientApp"
+    writeClientShell outDir prod hasCss sheets
     for stale in ["ssr.mjs", "ssr_app.mjs", "qed_ssr_host.mjs"] do
       removeIfExists (outDir / stale)
     if prod then minifyBundles outDir ["app.mjs", "qed_rt.mjs", "qed_dom.mjs", "qed_host.mjs"]
@@ -230,7 +268,10 @@ def buildJs (outDir : FilePath) (prod : Bool) (alreadyBuilt : Bool := false) : I
   else
     if !(← q.run (minArgs ++ rtArgs ++ #[(outDir / "app.mjs").toString, mod, "--"] ++ driverEntries ++ alsoArgs)) then
       return false
-  writeClientShell outDir prod
+  let (hasCss, sheets) ← match ssrOpt with
+    | some appName => extractAppCss q outDir #[mod] appName
+    | none         => pure (false, [])
+  writeClientShell outDir prod hasCss sheets
   match ssrOpt with
   | some appName =>
       IO.FS.writeFile (outDir / "qed_ssr_host.mjs") (← IO.FS.readFile (← runtimeFile "qed_ssr_host.mjs"))

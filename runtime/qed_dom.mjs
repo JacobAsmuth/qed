@@ -117,4 +117,11 @@ export const dom = {
     if (v !== undefined && el.getAttribute(attr) !== v) el.setAttribute(attr, v);
     return ok(PUnit, w);
   },
+  wsMuxSub(subId, url, ch, params, rm, ri, rmax, rlim, w) { Q(); if (globalThis.__qed.wsMuxSub) globalThis.__qed.wsMuxSub(subId, url, ch, params, rm, ri, rmax, rlim); return ok(PUnit, w); },
+  wsMuxSend(subId, payload, w) { Q(); if (globalThis.__qed.wsMuxSend) globalThis.__qed.wsMuxSend(subId, payload); return ok(PUnit, w); },
+  wsMuxUnsub(subId, w) { Q(); if (globalThis.__qed.wsMuxUnsub) globalThis.__qed.wsMuxUnsub(subId); return ok(PUnit, w); },
+  wsExtOpen(subId, url, isBin, rm, ri, rmax, rlim, w) { Q(); if (globalThis.__qed.wsExtOpen) globalThis.__qed.wsExtOpen(subId, url, !!isBin, rm, ri, rmax, rlim); return ok(PUnit, w); },
+  wsExtSendText(subId, text, w) { Q(); if (globalThis.__qed.wsExtSendText) globalThis.__qed.wsExtSendText(subId, text); return ok(PUnit, w); },
+  wsExtSendBytes(subId, payload, w) { Q(); if (globalThis.__qed.wsExtSendBytes) globalThis.__qed.wsExtSendBytes(subId, payload); return ok(PUnit, w); },
+  wsExtClose(subId, w) { Q(); if (globalThis.__qed.wsExtClose) globalThis.__qed.wsExtClose(subId); return ok(PUnit, w); },
 };

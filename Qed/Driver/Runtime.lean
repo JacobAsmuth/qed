@@ -10,6 +10,17 @@ structure SocketHandlers (msg : Type) where
   onClose   : Option msg
   onError   : Option (String → msg)
 
+structure WsMuxHandlers (msg : Type) where
+  onJoin    : ByteArray → msg
+  onMessage : ByteArray → msg
+  onStatus  : SocketStatus → msg
+
+structure WsExtHandlers (msg : Type) where
+  onJoin    : Unit → msg
+  onText    : String → msg
+  onBytes   : ByteArray → msg
+  onStatus  : SocketStatus → msg
+
 structure Runtime where
   mount            : IO Unit
   dispatch         : UInt32 → IO Unit
@@ -25,6 +36,10 @@ structure Runtime where
   restore          : String → IO Unit
   effectDone       : UInt32 → String → IO Unit
   portRecv         : String → String → IO Unit
+  wsJoin           : UInt32 → ByteArray → IO Unit
+  wsMsgBytes       : UInt32 → ByteArray → IO Unit
+  wsMsgText        : UInt32 → String → IO Unit
+  wsStatus         : UInt32 → UInt32 → UInt32 → String → IO Unit
 
 initialize runtimeRef : IO.Ref (Option Runtime) ← IO.mkRef none
 
@@ -112,6 +127,38 @@ def qedPortRecv (name payload : String) : IO Unit := do
   | some rt => rt.portRecv name payload
   | none    => pure ()
 
+@[export qed_ws_join]
+def qedWsJoin (subId : UInt32) (bytes : ByteArray) : IO Unit := do
+  match ← runtimeRef.get with
+  | some rt => rt.wsJoin subId bytes
+  | none    => pure ()
+
+@[export qed_ws_msg_bytes]
+def qedWsMsgBytes (subId : UInt32) (bytes : ByteArray) : IO Unit := do
+  match ← runtimeRef.get with
+  | some rt => rt.wsMsgBytes subId bytes
+  | none    => pure ()
+
+@[export qed_ws_msg_text]
+def qedWsMsgText (subId : UInt32) (text : String) : IO Unit := do
+  match ← runtimeRef.get with
+  | some rt => rt.wsMsgText subId text
+  | none    => pure ()
+
+@[export qed_ws_status]
+def qedWsStatus (subId code arg : UInt32) (err : String) : IO Unit := do
+  match ← runtimeRef.get with
+  | some rt => rt.wsStatus subId code arg err
+  | none    => pure ()
+
+private def decodeWsStatus (code arg : UInt32) (err : String) : SocketStatus :=
+  match code with
+  | 0 => .disconnected
+  | 1 => .connecting
+  | 2 => .connected
+  | 3 => .reconnecting arg.toNat
+  | _ => .failed err
+
 private def drainPendingQueue {Msg : Type} (pendingRef : IO.Ref (Array Msg))
     (step : Msg → IO Unit) : Nat → IO Unit
   | 0 => pure ()
@@ -138,6 +185,31 @@ def run (app : App Model Msg) : IO Unit := do
   let effectCbRef    ← IO.mkRef (∅ : Std.HashMap Nat (String → Msg))
   let cbNextRef   ← IO.mkRef (0 : Nat)
   let socketCbRef ← IO.mkRef (∅ : Std.HashMap String (SocketHandlers Msg))
+  let wsNextIdRef ← IO.mkRef (1 : UInt32)
+  let wsBootedRef ← IO.mkRef false
+  let wsMuxSlotRef ← IO.mkRef (∅ : Std.HashMap String UInt32)
+  let wsExtSlotRef ← IO.mkRef (∅ : Std.HashMap String UInt32)
+  let wsMuxCbRef   ← IO.mkRef (∅ : Std.HashMap UInt32 (WsMuxHandlers Msg))
+  let wsExtCbRef   ← IO.mkRef (∅ : Std.HashMap UInt32 (WsExtHandlers Msg))
+  let nextSubId : IO UInt32 := do
+    let n ← wsNextIdRef.get
+    let nxt := if n + 1 == 0 then 1 else n + 1
+    wsNextIdRef.set nxt
+    return n
+  let closeWsSlot {H : Type} (slotRef : IO.Ref (Std.HashMap String UInt32))
+      (cbRef : IO.Ref (Std.HashMap UInt32 H)) (closeFn : UInt32 → IO Unit) (slot : String) : IO Unit := do
+    if let some oldId := (← slotRef.get)[slot]? then
+      slotRef.modify (·.erase slot)
+      cbRef.modify (·.erase oldId)
+      closeFn oldId
+  let openWsSlot {H : Type} (slotRef : IO.Ref (Std.HashMap String UInt32))
+      (cbRef : IO.Ref (Std.HashMap UInt32 H)) (closeFn : UInt32 → IO Unit)
+      (slot : String) (cb : H) : IO UInt32 := do
+    closeWsSlot slotRef cbRef closeFn slot
+    let sid ← nextSubId
+    slotRef.modify (·.insert slot sid)
+    cbRef.modify (·.insert sid cb)
+    return sid
   let dispatchRef ← IO.mkRef (fun (_ : Msg) => (pure () : IO Unit))
   let registry : Std.HashMap String LocalDef :=
     app.locals.foldl (fun m d => m.insert d.id d) ∅
@@ -194,6 +266,26 @@ def run (app : App Model Msg) : IO Unit := do
     | .socket key url onMessage onOpen onClose onError => do
         socketCbRef.modify (·.insert key { onMessage, onOpen, onClose, onError })
         Dom.effect "ws.open" key url ""
+    | .wsMuxSub slot url channel params rec onJoin onMessage onStatus => do
+        if !(← wsBootedRef.get) then return
+        let sid ← openWsSlot wsMuxSlotRef wsMuxCbRef Dom.wsMuxUnsub slot { onJoin, onMessage, onStatus }
+        let (rm, ri, rmax, rlim) := rec.toFfi
+        Dom.wsMuxSub sid url channel params rm ri rmax rlim
+    | .wsMuxSend slot payload => do
+        if let some sid := (← wsMuxSlotRef.get)[slot]? then Dom.wsMuxSend sid payload
+    | .wsMuxUnsub slot => do
+        if (← wsBootedRef.get) then closeWsSlot wsMuxSlotRef wsMuxCbRef Dom.wsMuxUnsub slot
+    | .wsExtOpen slot url isBinary rec onJoin onText onBytes onStatus => do
+        if !(← wsBootedRef.get) then return
+        let sid ← openWsSlot wsExtSlotRef wsExtCbRef Dom.wsExtClose slot { onJoin, onText, onBytes, onStatus }
+        let (rm, ri, rmax, rlim) := rec.toFfi
+        Dom.wsExtOpen sid url isBinary rm ri rmax rlim
+    | .wsExtSendText slot text => do
+        if let some sid := (← wsExtSlotRef.get)[slot]? then Dom.wsExtSendText sid text
+    | .wsExtSendBytes slot payload => do
+        if let some sid := (← wsExtSlotRef.get)[slot]? then Dom.wsExtSendBytes sid payload
+    | .wsExtClose slot => do
+        if (← wsBootedRef.get) then closeWsSlot wsExtSlotRef wsExtCbRef Dom.wsExtClose slot
     | .fx kind a b c => Dom.effect kind a b c
     | .fxResult kind a b onResult => do
         let id ← cbNextRef.modifyGet (fun n => (n, n + 1))
@@ -274,12 +366,15 @@ def run (app : App Model Msg) : IO Unit := do
       | some m =>
           modelRef.set m
           renderModel
-          perform app.init.2.clientOnly
+          wsBootedRef.set true
+          perform (.batch [app.init.2.clientOnly, app.onHydrate m])
       | none =>
           match app.onUrlChange with
           | some f => do let p ← Dom.currentPath; dispatchMsg (f p)
           | none   => renderModel
           perform app.init.2
+          wsBootedRef.set true
+          perform (app.onHydrate (← modelRef.get))
     dispatch := fun id => do
       match (← clickRef.get)[id.toNat]? with
       | some msg => dispatchMsg msg
@@ -320,6 +415,32 @@ def run (app : App Model Msg) : IO Unit := do
     restore  := restoreLocals
     effectDone
     portRecv
+    wsJoin := fun sid bytes => do
+      match (← wsMuxCbRef.get)[sid]? with
+      | some cb => dispatchMsg (cb.onJoin bytes)
+      | none    =>
+          match (← wsExtCbRef.get)[sid]? with
+          | some cb => dispatchMsg (cb.onJoin ())
+          | none    => pure ()
+    wsMsgBytes := fun sid bytes => do
+      match (← wsMuxCbRef.get)[sid]? with
+      | some cb => dispatchMsg (cb.onMessage bytes)
+      | none    =>
+          match (← wsExtCbRef.get)[sid]? with
+          | some cb => dispatchMsg (cb.onBytes bytes)
+          | none    => pure ()
+    wsMsgText := fun sid text => do
+      match (← wsExtCbRef.get)[sid]? with
+      | some cb => dispatchMsg (cb.onText text)
+      | none    => pure ()
+    wsStatus := fun sid code arg err => do
+      let st := decodeWsStatus code arg err
+      match (← wsMuxCbRef.get)[sid]? with
+      | some cb => dispatchMsg (cb.onStatus st)
+      | none    =>
+          match (← wsExtCbRef.get)[sid]? with
+          | some cb => dispatchMsg (cb.onStatus st)
+          | none    => pure ()
   })
 
 end Qed

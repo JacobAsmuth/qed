@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -27,6 +28,7 @@
 
 #ifdef __linux__
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #elif defined(__APPLE__)
 #include <sys/event.h>
 #endif
@@ -1617,6 +1619,11 @@ fail:
 #define QED_MAX_STATIC_FILE_BYTES (256ULL * 1024ULL * 1024ULL)
 #define QED_MAX_WORKER_CONNS 4096U
 #define QED_CONN_IDLE_TIMEOUT_SEC 30
+#define QED_MAX_WS_MSG_BYTES (4ULL * 1024ULL * 1024ULL)
+#define QED_MAX_WS_SUBS_PER_CONN 64U
+#define QED_WS_PING_INTERVAL_SEC 25
+#define QED_WS_DEAD_TIMEOUT_SEC 65
+#define QED_TOPIC_BUCKETS 256U
 
 static volatile sig_atomic_t g_stop_server = 0;
 
@@ -1664,6 +1671,15 @@ static const char *guess_mime_type(const char *path) {
     return NULL;
 }
 
+typedef struct {
+    uint32_t sub_id;
+    char    *channel;
+    uint8_t *params;
+    size_t   params_len;
+    char    *topic;
+    size_t   topic_len;
+} qed_ws_sub_t;
+
 typedef struct qed_client_conn {
     int fd;
     int loop_fd;
@@ -1672,6 +1688,15 @@ typedef struct qed_client_conn {
     bool tx_armed;
     bool peer_eof;
     bool close_after_tx;
+    bool is_ws;
+    bool ws_in_frag;
+    uint8_t ws_frag_op;
+    lean_object *ws_ctx;
+    qed_buf_t ws_frag;
+    qed_ws_sub_t *subs;
+    size_t sub_cnt;
+    size_t sub_cap;
+    time_t last_ping_sent;
     char ip[64];
     qed_buf_t rx;
     qed_buf_t tx;
@@ -1939,14 +1964,582 @@ static int create_reuseport_listener(uint16_t port, bool allow_reuseport) {
     return fd;
 }
 
+/* =========================================================================
+ * 7b. Multiplexed RFC 6455 WebSockets & Zero-Copy Cross-Worker Broadcast Hub
+ * ========================================================================= */
+
+typedef struct {
+    char *topic;
+    size_t topic_len;
+    uint8_t *payload;
+    size_t payload_len;
+    _Atomic uint32_t refcnt;
+} qed_ws_bcast_msg_t;
+
+typedef struct qed_ws_bcast_node {
+    qed_ws_bcast_msg_t *msg;
+    struct qed_ws_bcast_node *next;
+} qed_ws_bcast_node_t;
+
+typedef struct {
+    pthread_mutex_t mu;
+    qed_ws_bcast_node_t *head;
+    qed_ws_bcast_node_t *tail;
+    int wake_fd;
+    int loop_fd;
+} qed_worker_inbox_t;
+
+static pthread_mutex_t g_bcast_mu = PTHREAD_MUTEX_INITIALIZER;
+static qed_worker_inbox_t *g_inboxes = NULL;
+static uint32_t g_num_inboxes = 0;
+
+static void bcast_msg_unref(qed_ws_bcast_msg_t *m) {
+    if (!m) return;
+    if (atomic_fetch_sub_explicit(&m->refcnt, 1, memory_order_acq_rel) == 1) {
+        free(m->topic);
+        free(m->payload);
+        free(m);
+    }
+}
+
+LEAN_EXPORT lean_object *qed_server_ws_broadcast(b_lean_obj_arg topic_obj, b_lean_obj_arg payload_obj) {
+    const char *topic_str = lean_string_cstr(topic_obj);
+    size_t topic_len = strlen(topic_str);
+    const uint8_t *pay_ptr = lean_sarray_cptr((lean_object *)payload_obj);
+    size_t pay_len = lean_sarray_size(payload_obj);
+
+    pthread_mutex_lock(&g_bcast_mu);
+    uint32_t nworkers = g_num_inboxes;
+    qed_worker_inbox_t *inboxes = g_inboxes;
+    if (nworkers == 0 || inboxes == NULL) {
+        pthread_mutex_unlock(&g_bcast_mu);
+        return lean_io_result_mk_ok(lean_box(0));
+    }
+
+    qed_ws_bcast_msg_t *msg = (qed_ws_bcast_msg_t *)calloc(1, sizeof(qed_ws_bcast_msg_t));
+    if (!msg) {
+        pthread_mutex_unlock(&g_bcast_mu);
+        return lean_io_result_mk_ok(lean_box(0));
+    }
+    msg->topic = (char *)malloc(topic_len + 1);
+    msg->payload = pay_len > 0 ? (uint8_t *)malloc(pay_len) : NULL;
+    if (!msg->topic || (pay_len > 0 && !msg->payload)) {
+        free(msg->topic);
+        free(msg->payload);
+        free(msg);
+        pthread_mutex_unlock(&g_bcast_mu);
+        return lean_io_result_mk_ok(lean_box(0));
+    }
+    memcpy(msg->topic, topic_str, topic_len + 1);
+    msg->topic_len = topic_len;
+    if (pay_len > 0) memcpy(msg->payload, pay_ptr, pay_len);
+    msg->payload_len = pay_len;
+    atomic_init(&msg->refcnt, nworkers);
+
+    for (uint32_t i = 0; i < nworkers; i++) {
+        qed_ws_bcast_node_t *node = (qed_ws_bcast_node_t *)malloc(sizeof(qed_ws_bcast_node_t));
+        if (!node) {
+            bcast_msg_unref(msg);
+            continue;
+        }
+        node->msg = msg;
+        node->next = NULL;
+        pthread_mutex_lock(&inboxes[i].mu);
+        bool was_empty = (inboxes[i].head == NULL);
+        if (inboxes[i].tail) inboxes[i].tail->next = node;
+        else inboxes[i].head = node;
+        inboxes[i].tail = node;
+        int wfd = inboxes[i].wake_fd;
+        int lfd = inboxes[i].loop_fd;
+        (void)wfd;
+        (void)lfd;
+        pthread_mutex_unlock(&inboxes[i].mu);
+
+        if (was_empty) {
+#ifdef __linux__
+            if (wfd >= 0) {
+                uint64_t one = 1;
+                ssize_t _w = write(wfd, &one, sizeof(one));
+                (void)_w;
+            }
+#elif defined(__APPLE__)
+            if (lfd >= 0) {
+                struct kevent kev;
+                EV_SET(&kev, 1, EVFILT_USER, 0, NOTE_TRIGGER, 0, (void *)(uintptr_t)1);
+                kevent(lfd, &kev, 1, NULL, 0, NULL);
+            }
+            (void)wfd;
+#else
+            (void)wfd; (void)lfd;
+#endif
+        }
+    }
+    pthread_mutex_unlock(&g_bcast_mu);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+typedef struct qed_topic_entry {
+    qed_client_conn_t *conn;
+    uint32_t sub_id;
+    char *topic;
+    size_t topic_len;
+    uint64_t hash;
+    struct qed_topic_entry *next;
+} qed_topic_entry_t;
+
+typedef struct {
+    qed_topic_entry_t *buckets[QED_TOPIC_BUCKETS];
+} qed_topic_table_t;
+
+static inline uint64_t fnv1a_hash(const char *s, size_t len) {
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static bool topic_table_add(qed_topic_table_t *tbl, qed_client_conn_t *conn,
+                            uint32_t sub_id, const char *topic, size_t topic_len) {
+    uint64_t h = fnv1a_hash(topic, topic_len);
+    size_t b = (size_t)(h & (QED_TOPIC_BUCKETS - 1));
+    qed_topic_entry_t *e = (qed_topic_entry_t *)malloc(sizeof(qed_topic_entry_t));
+    if (!e) return false;
+    e->topic = (char *)malloc(topic_len + 1);
+    if (!e->topic) { free(e); return false; }
+    memcpy(e->topic, topic, topic_len + 1);
+    e->conn = conn;
+    e->sub_id = sub_id;
+    e->topic_len = topic_len;
+    e->hash = h;
+    e->next = tbl->buckets[b];
+    tbl->buckets[b] = e;
+    return true;
+}
+
+static void topic_table_remove_sub(qed_topic_table_t *tbl, qed_client_conn_t *conn,
+                                   uint32_t sub_id, const char *topic, size_t topic_len) {
+    uint64_t h = fnv1a_hash(topic, topic_len);
+    size_t b = (size_t)(h & (QED_TOPIC_BUCKETS - 1));
+    qed_topic_entry_t **pp = &tbl->buckets[b];
+    while (*pp) {
+        qed_topic_entry_t *cur = *pp;
+        if (cur->conn == conn && cur->sub_id == sub_id &&
+            cur->hash == h && cur->topic_len == topic_len &&
+            memcmp(cur->topic, topic, topic_len) == 0) {
+            *pp = cur->next;
+            free(cur->topic);
+            free(cur);
+            return;
+        }
+        pp = &cur->next;
+    }
+}
+
+static void topic_table_free(qed_topic_table_t *tbl) {
+    for (size_t b = 0; b < QED_TOPIC_BUCKETS; b++) {
+        qed_topic_entry_t *cur = tbl->buckets[b];
+        while (cur) {
+            qed_topic_entry_t *nxt = cur->next;
+            free(cur->topic);
+            free(cur);
+            cur = nxt;
+        }
+        tbl->buckets[b] = NULL;
+    }
+}
+
+static bool ws_send_raw_frame(
+    qed_client_conn_t *c, uint8_t opcode,
+    const uint8_t *extra, size_t extra_len,
+    const uint8_t *payload, size_t payload_len)
+{
+    uint64_t total_len = (uint64_t)extra_len + (uint64_t)payload_len;
+    uint8_t hdr[24];
+    size_t hlen = 0;
+    hdr[hlen++] = (uint8_t)(0x80U | (opcode & 0x0FU));
+    if (total_len <= 125ULL) {
+        hdr[hlen++] = (uint8_t)total_len;
+    } else if (total_len <= 65535ULL) {
+        hdr[hlen++] = 126;
+        hdr[hlen++] = (uint8_t)((total_len >> 8) & 0xFFU);
+        hdr[hlen++] = (uint8_t)(total_len & 0xFFU);
+    } else {
+        hdr[hlen++] = 127;
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            hdr[hlen++] = (uint8_t)((total_len >> shift) & 0xFFU);
+        }
+    }
+    if (extra_len > 0 && extra != NULL) {
+        if (hlen + extra_len > sizeof(hdr)) return false;
+        memcpy(hdr + hlen, extra, extra_len);
+        hlen += extra_len;
+    }
+    return queue_or_writev(c, (const char *)hdr, hlen, payload, payload_len);
+}
+
+static bool ws_send_mux_frame(
+    qed_client_conn_t *c, uint8_t mux_op, uint32_t sub_id,
+    const uint8_t *payload, size_t payload_len)
+{
+    uint8_t mh[5];
+    mh[0] = mux_op;
+    mh[1] = (uint8_t)((sub_id >> 24) & 0xFFU);
+    mh[2] = (uint8_t)((sub_id >> 16) & 0xFFU);
+    mh[3] = (uint8_t)((sub_id >> 8) & 0xFFU);
+    mh[4] = (uint8_t)(sub_id & 0xFFU);
+    return ws_send_raw_frame(c, 0x02, mh, 5, payload, payload_len);
+}
+
+static void ws_send_close(qed_client_conn_t *c, uint16_t code) {
+    uint8_t body[2];
+    body[0] = (uint8_t)((code >> 8) & 0xFFU);
+    body[1] = (uint8_t)(code & 0xFFU);
+    (void)ws_send_raw_frame(c, 0x08, body, 2, NULL, 0);
+    c->close_after_tx = true;
+}
+
+static void topic_table_broadcast(qed_topic_table_t *tbl, const qed_ws_bcast_msg_t *msg) {
+    uint64_t h = fnv1a_hash(msg->topic, msg->topic_len);
+    size_t b = (size_t)(h & (QED_TOPIC_BUCKETS - 1));
+    for (qed_topic_entry_t *e = tbl->buckets[b]; e != NULL; e = e->next) {
+        if (e->hash == h && e->topic_len == msg->topic_len &&
+            memcmp(e->topic, msg->topic, msg->topic_len) == 0) {
+            if (!e->conn->close_after_tx && e->conn->is_ws) {
+                if (!ws_send_mux_frame(e->conn, 0x12, e->sub_id, msg->payload, msg->payload_len)) {
+                    e->conn->close_after_tx = true;
+                    update_loop_write_interest(e->conn, true);
+                }
+            }
+        }
+    }
+}
+
+static char *ws_build_topic_key(const char *channel, const uint8_t *params, size_t params_len, size_t *out_len) {
+    size_t ch_len = strlen(channel);
+    size_t total = ch_len + 1 + params_len * 2;
+    char *buf = (char *)malloc(total + 1);
+    if (!buf) return NULL;
+    memcpy(buf, channel, ch_len);
+    buf[ch_len] = ':';
+    static const char kHex[] = "0123456789abcdef";
+    for (size_t i = 0; i < params_len; i++) {
+        buf[ch_len + 1 + 2 * i]     = kHex[(params[i] >> 4) & 0x0F];
+        buf[ch_len + 1 + 2 * i + 1] = kHex[params[i] & 0x0F];
+    }
+    buf[total] = '\0';
+    if (out_len) *out_len = total;
+    return buf;
+}
+
+static void ws_free_sub(qed_ws_sub_t *s) {
+    free(s->channel);
+    free(s->params);
+    free(s->topic);
+    s->channel = NULL;
+    s->params = NULL;
+    s->topic = NULL;
+}
+
+static bool ws_origin_allowed(const char *origin, const char *host) {
+    if (!origin || *origin == '\0') return true;
+    const char *allowed = getenv("QED_WS_ALLOWED_ORIGINS");
+    if (allowed && *allowed != '\0') {
+        if (strcmp(allowed, "*") == 0) return true;
+        const char *p = allowed;
+        size_t olen = strlen(origin);
+        while (*p) {
+            while (*p == ' ' || *p == ',') p++;
+            const char *start = p;
+            while (*p && *p != ',') p++;
+            const char *end = p;
+            while (end > start && end[-1] == ' ') end--;
+            if ((size_t)(end - start) == olen && strncasecmp(start, origin, olen) == 0) return true;
+        }
+        return false;
+    }
+    if (!host || *host == '\0') return false;
+    const char *o_host = NULL;
+    if (strncasecmp(origin, "http://", 7) == 0) o_host = origin + 7;
+    else if (strncasecmp(origin, "https://", 8) == 0) o_host = origin + 8;
+    else return false;
+    size_t o_len = strlen(o_host);
+    while (o_len > 0 && o_host[o_len - 1] == '/') o_len--;
+    if (o_len == 0 || memchr(o_host, '/', o_len) != NULL) return false;
+    return strlen(host) == o_len && strncasecmp(o_host, host, o_len) == 0;
+}
+
+static bool ws_compute_accept(const char *sec_key, char out_b64[36]) {
+    static const char kGuid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    size_t klen = strlen(sec_key);
+    if (klen == 0 || klen > 64) return false;
+    char combined[128];
+    memcpy(combined, sec_key, klen);
+    memcpy(combined + klen, kGuid, sizeof(kGuid) - 1);
+    uint8_t digest[20];
+    unsigned int dlen = 0;
+    if (EVP_Digest(combined, klen + sizeof(kGuid) - 1, digest, &dlen, EVP_sha1(), NULL) != 1 || dlen != 20) {
+        return false;
+    }
+    int n = EVP_EncodeBlock((unsigned char *)out_b64, digest, 20);
+    if (n <= 0 || n >= 36) return false;
+    out_b64[n] = '\0';
+    return true;
+}
+
+typedef struct {
+    uint32_t worker_idx;
+    uint16_t port;
+    int initial_listen_fd;
+    const char *static_dir;
+    uint8_t dev_mode;
+    lean_object *handler;
+    const char *ws_path;
+    lean_object *ws_upgrade;
+    lean_object *ws_action;
+    qed_worker_inbox_t *inbox;
+    pthread_t tid;
+    bool started;
+} qed_worker_arg_t;
+
+static void ws_send_mux_err(qed_client_conn_t *c, uint32_t sub_id, const char *msg) {
+    (void)ws_send_mux_frame(c, 0x13, sub_id, (const uint8_t *)msg, strlen(msg));
+}
+
+static lean_object *ws_call_action(
+    const qed_worker_arg_t *arg, qed_client_conn_t *c, uint8_t kind,
+    const char *channel, const uint8_t *params, size_t params_len,
+    const uint8_t *payload, size_t payload_len)
+{
+    lean_inc(arg->ws_action);
+    lean_inc(c->ws_ctx);
+    return lean_apply_6(
+        arg->ws_action,
+        c->ws_ctx,
+        lean_box(kind),
+        lean_mk_string(channel),
+        mk_byte_array_copy(params, params_len),
+        mk_byte_array_copy(payload, payload_len),
+        lean_box(0));
+}
+
+static void ws_invoke_leave(const qed_worker_arg_t *arg, qed_client_conn_t *c, const qed_ws_sub_t *sub) {
+    if (!arg || !arg->ws_action || !c->ws_ctx || !sub->channel) return;
+    lean_dec_ref(ws_call_action(arg, c, 3, sub->channel, sub->params, sub->params_len, NULL, 0));
+}
+
+static void ws_unsub_by_id(qed_client_conn_t *c, uint32_t sub_id,
+                           const qed_worker_arg_t *arg, qed_topic_table_t *tbl) {
+    for (size_t i = 0; i < c->sub_cnt; i++) {
+        if (c->subs[i].sub_id == sub_id) {
+            qed_ws_sub_t sub = c->subs[i];
+            c->subs[i] = c->subs[c->sub_cnt - 1];
+            c->sub_cnt--;
+            topic_table_remove_sub(tbl, c, sub.sub_id, sub.topic, sub.topic_len);
+            ws_invoke_leave(arg, c, &sub);
+            ws_free_sub(&sub);
+            return;
+        }
+    }
+}
+
+static void handle_ws_mux_msg(
+    qed_client_conn_t *c, const uint8_t *data, size_t len,
+    const qed_worker_arg_t *arg, qed_topic_table_t *tbl)
+{
+    if (len < 5 || !arg->ws_action || !c->ws_ctx) return;
+    uint8_t op = data[0];
+    uint32_t sid = ((uint32_t)data[1] << 24) | ((uint32_t)data[2] << 16) |
+                   ((uint32_t)data[3] << 8)  | (uint32_t)data[4];
+    const uint8_t *rest = data + 5;
+    size_t rest_len = len - 5;
+
+    if (op == 0x01) { /* SUB */
+        if (rest_len < 2) { ws_send_mux_err(c, sid, "malformed subscribe frame"); return; }
+        uint16_t ch_len = (uint16_t)(((uint16_t)rest[0] << 8) | (uint16_t)rest[1]);
+        if ((size_t)ch_len + 2 > rest_len || ch_len == 0 || ch_len > 256) {
+            ws_send_mux_err(c, sid, "invalid channel name length");
+            return;
+        }
+        char ch_buf[260];
+        memcpy(ch_buf, rest + 2, ch_len);
+        ch_buf[ch_len] = '\0';
+        const uint8_t *params = rest + 2 + ch_len;
+        size_t params_len = rest_len - 2 - ch_len;
+
+        ws_unsub_by_id(c, sid, arg, tbl);
+        if (c->sub_cnt >= QED_MAX_WS_SUBS_PER_CONN) {
+            ws_send_mux_err(c, sid, "too many subscriptions on connection");
+            return;
+        }
+
+        lean_object *io_res = ws_call_action(arg, c, 1, ch_buf, params, params_len, NULL, 0);
+        if (lean_io_result_is_ok(io_res)) {
+            lean_object *exc = lean_io_result_get_value(io_res);
+            if (lean_obj_tag(exc) == 1) { /* Except.ok snapshotBytes */
+                lean_object *snap_ba = lean_ctor_get(exc, 0);
+                size_t tlen = 0;
+                char *topic = ws_build_topic_key(ch_buf, params, params_len, &tlen);
+                if (!topic) {
+                    lean_dec_ref(io_res);
+                    ws_send_mux_err(c, sid, "out of memory");
+                    return;
+                }
+                if (c->sub_cnt == c->sub_cap) {
+                    size_t ncap = c->sub_cap ? c->sub_cap * 2 : 4;
+                    qed_ws_sub_t *ns = (qed_ws_sub_t *)realloc(c->subs, ncap * sizeof(qed_ws_sub_t));
+                    if (!ns) { free(topic); lean_dec_ref(io_res); return; }
+                    c->subs = ns;
+                    c->sub_cap = ncap;
+                }
+                qed_ws_sub_t *sub = &c->subs[c->sub_cnt];
+                memset(sub, 0, sizeof(*sub));
+                sub->sub_id = sid;
+                sub->channel = strdup(ch_buf);
+                sub->params = params_len > 0 ? (uint8_t *)malloc(params_len) : NULL;
+                if (params_len > 0 && sub->params) memcpy(sub->params, params, params_len);
+                sub->params_len = params_len;
+                sub->topic = topic;
+                sub->topic_len = tlen;
+                if (!sub->channel || (params_len > 0 && !sub->params) ||
+                    !topic_table_add(tbl, c, sid, topic, tlen)) {
+                    ws_free_sub(sub);
+                    lean_dec_ref(io_res);
+                    return;
+                }
+                c->sub_cnt++;
+                (void)ws_send_mux_frame(c, 0x11, sid, lean_sarray_cptr(snap_ba), lean_sarray_size(snap_ba));
+            } else { /* Except.error errMsg */
+                ws_send_mux_err(c, sid, lean_string_cstr(lean_ctor_get(exc, 0)));
+            }
+        }
+        lean_dec_ref(io_res);
+    } else if (op == 0x02) { /* UNSUB */
+        ws_unsub_by_id(c, sid, arg, tbl);
+    } else if (op == 0x03) { /* SEND */
+        for (size_t i = 0; i < c->sub_cnt; i++) {
+            if (c->subs[i].sub_id == sid) {
+                lean_dec_ref(ws_call_action(arg, c, 2, c->subs[i].channel,
+                    c->subs[i].params, c->subs[i].params_len, rest, rest_len));
+                return;
+            }
+        }
+    }
+}
+
+/* Returns: 1 = ok, 0 = need more bytes, -1 = close connection */
+static int process_ws_frames(qed_client_conn_t *c, const qed_worker_arg_t *arg, qed_topic_table_t *tbl) {
+    for (;;) {
+        if (c->close_after_tx) return -1;
+        if (c->rx.len < 2) return 0;
+        const uint8_t *p = c->rx.data;
+        uint8_t b0 = p[0], b1 = p[1];
+        bool fin = (b0 & 0x80U) != 0;
+        uint8_t rsv = (b0 >> 4) & 0x07U;
+        uint8_t opcode = b0 & 0x0FU;
+        bool masked = (b1 & 0x80U) != 0;
+        uint64_t plen = (uint64_t)(b1 & 0x7FU);
+        if (rsv != 0 || !masked) {
+            ws_send_close(c, 1002);
+            return -1;
+        }
+        size_t off = 2;
+        if (plen == 126) {
+            if (c->rx.len < 4) return 0;
+            plen = ((uint64_t)p[2] << 8) | (uint64_t)p[3];
+            off = 4;
+        } else if (plen == 127) {
+            if (c->rx.len < 10) return 0;
+            if ((p[2] & 0x80U) != 0) { ws_send_close(c, 1002); return -1; }
+            plen = 0;
+            for (int i = 0; i < 8; i++) plen = (plen << 8) | (uint64_t)p[2 + i];
+            off = 10;
+        }
+        if ((opcode >= 0x08 && (plen > 125 || !fin)) || plen > QED_MAX_WS_MSG_BYTES) {
+            ws_send_close(c, plen > QED_MAX_WS_MSG_BYTES ? 1009 : 1002);
+            return -1;
+        }
+        size_t frame_total = off + 4 + (size_t)plen;
+        if (c->rx.len < frame_total) return 0;
+
+        uint8_t mask[4];
+        memcpy(mask, p + off, 4);
+        uint8_t *payload = c->rx.data + off + 4;
+        for (size_t i = 0; i < (size_t)plen; i++) payload[i] ^= mask[i & 3U];
+        c->last_active = time(NULL);
+
+        if (opcode == 0x08) { /* Close */
+            ws_send_close(c, 1000);
+            buf_consume(&c->rx, frame_total);
+            return -1;
+        } else if (opcode == 0x09) { /* Ping -> Pong */
+            (void)ws_send_raw_frame(c, 0x0A, NULL, 0, payload, (size_t)plen);
+        } else if (opcode == 0x0A) { /* Pong */
+            /* last_active already updated */
+        } else if (opcode == 0x01 || opcode == 0x02) {
+            if (c->ws_in_frag) { ws_send_close(c, 1002); return -1; }
+            if (fin) {
+                if (opcode == 0x02) handle_ws_mux_msg(c, payload, (size_t)plen, arg, tbl);
+            } else {
+                c->ws_in_frag = true;
+                c->ws_frag_op = opcode;
+                c->ws_frag.len = 0;
+                if (!buf_append(&c->ws_frag, payload, (size_t)plen)) { ws_send_close(c, 1011); return -1; }
+            }
+        } else if (opcode == 0x00) { /* Continuation */
+            if (!c->ws_in_frag) { ws_send_close(c, 1002); return -1; }
+            if (c->ws_frag.len + (size_t)plen > QED_MAX_WS_MSG_BYTES) { ws_send_close(c, 1009); return -1; }
+            if (!buf_append(&c->ws_frag, payload, (size_t)plen)) { ws_send_close(c, 1011); return -1; }
+            if (fin) {
+                c->ws_in_frag = false;
+                if (c->ws_frag_op == 0x02) {
+                    handle_ws_mux_msg(c, c->ws_frag.data, c->ws_frag.len, arg, tbl);
+                }
+                c->ws_frag.len = 0;
+            }
+        } else {
+            ws_send_close(c, 1002);
+            return -1;
+        }
+
+        buf_consume(&c->rx, frame_total);
+        if (c->rx.len == 0) return 1;
+    }
+}
+
+static void drain_worker_inbox(qed_worker_inbox_t *inbox, qed_topic_table_t *tbl) {
+    if (!inbox) return;
+#ifdef __linux__
+    if (inbox->wake_fd >= 0) {
+        uint64_t val = 0;
+        while (read(inbox->wake_fd, &val, sizeof(val)) > 0) {}
+    }
+#endif
+    pthread_mutex_lock(&inbox->mu);
+    qed_ws_bcast_node_t *list = inbox->head;
+    inbox->head = NULL;
+    inbox->tail = NULL;
+    pthread_mutex_unlock(&inbox->mu);
+
+    while (list) {
+        qed_ws_bcast_node_t *nxt = list->next;
+        if (tbl) topic_table_broadcast(tbl, list->msg);
+        bcast_msg_unref(list->msg);
+        free(list);
+        list = nxt;
+    }
+}
+
 /* Returns: 1 = continue keep-alive, 0 = need more bytes, -1 = close connection */
 static int process_buffered_requests(
     qed_client_conn_t *c,
-    const char *static_dir,
-    uint8_t dev_mode,
-    lean_object *handler)
+    const qed_worker_arg_t *arg,
+    qed_topic_table_t *tbl)
 {
     for (;;) {
+        if (c->is_ws) return process_ws_frames(c, arg, tbl);
+
         ssize_t hdr_end = find_crlfcrlf(c->rx.data, c->rx.len);
         if (hdr_end < 0) {
             return (c->rx.len > QED_MAX_REQ_HDR_BYTES) ? reject_request(c, 431, "request headers too large") : 0;
@@ -1988,6 +2581,12 @@ static int process_buffered_requests(
         size_t content_len = 0;
         qed_hdr_pair_t parsed_hdrs[96];
         size_t parsed_cnt = 0;
+        const char *hdr_upgrade = NULL;
+        const char *hdr_conn = NULL;
+        const char *hdr_ws_key = NULL;
+        const char *hdr_ws_ver = NULL;
+        const char *hdr_origin = NULL;
+        const char *hdr_host = NULL;
 
         char *hline = NULL, *val = NULL;
         while ((hline = next_crlf_line(&cursor, hdr_limit, &bare_crlf)) != NULL) {
@@ -2005,8 +2604,19 @@ static int process_buffered_requests(
                 has_content_len = true;
                 content_len = (size_t)cl_u64;
             } else if (strcasecmp(hline, "Connection") == 0) {
+                hdr_conn = val;
                 if (strcasestr(val, "close") != NULL) keep_alive = false;
                 else if (strcasestr(val, "keep-alive") != NULL) keep_alive = true;
+            } else if (strcasecmp(hline, "Upgrade") == 0) {
+                hdr_upgrade = val;
+            } else if (strcasecmp(hline, "Sec-WebSocket-Key") == 0) {
+                hdr_ws_key = val;
+            } else if (strcasecmp(hline, "Sec-WebSocket-Version") == 0) {
+                hdr_ws_ver = val;
+            } else if (strcasecmp(hline, "Origin") == 0) {
+                hdr_origin = val;
+            } else if (strcasecmp(hline, "Host") == 0) {
+                hdr_host = val;
             }
             if (parsed_cnt < 96) {
                 parsed_hdrs[parsed_cnt].key = hline;
@@ -2016,16 +2626,70 @@ static int process_buffered_requests(
         }
         if (bare_crlf) return reject_request(c, 400, "bare CR/LF in headers");
 
+        /* RFC 6455 WebSocket Upgrade on `/_qed/ws/<Server>` */
+        if (arg->ws_path && arg->ws_path[0] != '\0' && arg->ws_upgrade && arg->ws_action &&
+            strcmp(method, "GET") == 0 && hdr_upgrade && strcasecmp(hdr_upgrade, "websocket") == 0) {
+            const char *q = strchr(target, '?');
+            size_t tlen = q ? (size_t)(q - target) : strlen(target);
+            if (strlen(arg->ws_path) == tlen && memcmp(target, arg->ws_path, tlen) == 0) {
+                if (!is_http_11 || !hdr_conn || strcasestr(hdr_conn, "upgrade") == NULL ||
+                    !hdr_ws_ver || strcmp(hdr_ws_ver, "13") != 0 || !hdr_ws_key) {
+                    return reject_request(c, 400, "invalid WebSocket upgrade headers");
+                }
+                if (!ws_origin_allowed(hdr_origin, hdr_host)) {
+                    return reject_request(c, 403, "cross-origin WebSocket upgrade rejected");
+                }
+                char accept_b64[36];
+                if (!ws_compute_accept(hdr_ws_key, accept_b64)) {
+                    return reject_request(c, 400, "invalid Sec-WebSocket-Key");
+                }
+                lean_inc(arg->ws_upgrade);
+                lean_object *ctx_res = lean_apply_3(
+                    arg->ws_upgrade,
+                    mk_lean_headers(parsed_hdrs, parsed_cnt),
+                    lean_mk_string(c->ip),
+                    lean_box(0));
+                if (!lean_io_result_is_ok(ctx_res)) {
+                    lean_dec_ref(ctx_res);
+                    return reject_request(c, 500, "WebSocket auth context error");
+                }
+                lean_object *ws_ctx = lean_io_result_get_value(ctx_res);
+                lean_inc(ws_ctx);
+                lean_dec_ref(ctx_res);
+
+                char up_hdr[256];
+                int ulen = snprintf(
+                    up_hdr, sizeof(up_hdr),
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Accept: %s\r\n\r\n",
+                    accept_b64);
+                if (ulen <= 0 || (size_t)ulen >= sizeof(up_hdr) ||
+                    !queue_or_writev(c, up_hdr, (size_t)ulen, NULL, 0)) {
+                    lean_dec(ws_ctx);
+                    return -1;
+                }
+                c->ws_ctx = ws_ctx;
+                c->is_ws = true;
+                c->last_active = time(NULL);
+                c->last_ping_sent = c->last_active;
+                buf_consume(&c->rx, hdr_bytes);
+                if (c->rx.len == 0) return 1;
+                continue;
+            }
+        }
+
         size_t total_needed = hdr_bytes + content_len;
         if (c->rx.len < total_needed) return 0;
 
         bool static_write_ok = true;
-        if (try_serve_static_c(c, static_dir, dev_mode, method, target, keep_alive, &static_write_ok)) {
+        if (try_serve_static_c(c, arg->static_dir, arg->dev_mode, method, target, keep_alive, &static_write_ok)) {
             if (!static_write_ok) return -1;
         } else {
-            lean_inc(handler);
+            lean_inc(arg->handler);
             lean_object *io_res = lean_apply_6(
-                handler,
+                arg->handler,
                 lean_mk_string(method),
                 lean_mk_string(target),
                 mk_lean_headers(parsed_hdrs, parsed_cnt),
@@ -2061,19 +2725,29 @@ static int process_buffered_requests(
     }
 }
 
-typedef struct {
-    uint32_t worker_idx;
-    uint16_t port;
-    int initial_listen_fd;
-    const char *static_dir;
-    uint8_t dev_mode;
-    lean_object *handler;
-    pthread_t tid;
-    bool started;
-} qed_worker_arg_t;
-
-static void close_client_conn(qed_client_conn_t **conn_head, uint32_t *conn_cnt, qed_client_conn_t *c) {
+static void close_client_conn(
+    qed_client_conn_t **conn_head, uint32_t *conn_cnt,
+    qed_client_conn_t *c, const qed_worker_arg_t *arg, qed_topic_table_t *tbl)
+{
     if (!c) return;
+    if (c->is_ws) {
+        for (size_t i = 0; i < c->sub_cnt; i++) {
+            if (tbl && c->subs[i].topic) {
+                topic_table_remove_sub(tbl, c, c->subs[i].sub_id, c->subs[i].topic, c->subs[i].topic_len);
+            }
+            ws_invoke_leave(arg, c, &c->subs[i]);
+            ws_free_sub(&c->subs[i]);
+        }
+        free(c->subs);
+        c->subs = NULL;
+        c->sub_cnt = 0;
+        c->sub_cap = 0;
+        buf_free(&c->ws_frag);
+        if (c->ws_ctx) {
+            lean_dec(c->ws_ctx);
+            c->ws_ctx = NULL;
+        }
+    }
     if (c->prev) c->prev->next = c->next;
     else if (conn_head && *conn_head == c) *conn_head = c->next;
     if (c->next) c->next->prev = c->prev;
@@ -2128,13 +2802,11 @@ static void handle_client_io(
     qed_client_conn_t *conn,
     bool peer_eof,
     bool fatal_err,
-    const qed_worker_arg_t *arg)
+    const qed_worker_arg_t *arg,
+    qed_topic_table_t *tbl)
 {
     if (peer_eof) conn->peer_eof = true;
-    if (fatal_err) {
-        /* Try draining any buffered inbound data first if not yet marked close_after_tx, unless fatal socket error */
-        conn->peer_eof = true;
-    }
+    if (fatal_err) conn->peer_eof = true;
 
     bool read_err = false;
     if (!conn->close_after_tx) {
@@ -2143,15 +2815,19 @@ static void handle_client_io(
             ssize_t n = recv(conn->fd, tmp, sizeof(tmp), 0);
             if (n > 0) {
                 conn->last_active = time(NULL);
-                if ((size_t)n > (QED_MAX_REQ_HDR_BYTES + QED_MAX_REQ_BODY_BYTES) - conn->rx.len) {
-                    (void)reject_request(conn, 413, "payload too large");
+                size_t rx_cap_limit = conn->is_ws
+                    ? (QED_MAX_WS_MSG_BYTES + 65536U)
+                    : (QED_MAX_REQ_HDR_BYTES + QED_MAX_REQ_BODY_BYTES);
+                if ((size_t)n > rx_cap_limit - conn->rx.len) {
+                    if (conn->is_ws) ws_send_close(conn, 1009);
+                    else (void)reject_request(conn, 413, "payload too large");
                     break;
                 }
                 if (!buf_append(&conn->rx, tmp, (size_t)n)) {
                     read_err = true;
                     break;
                 }
-                if (conn->rx.len > QED_MAX_REQ_HDR_BYTES &&
+                if (!conn->is_ws && conn->rx.len > QED_MAX_REQ_HDR_BYTES &&
                     find_crlfcrlf(conn->rx.data, conn->rx.len) < 0) {
                     (void)reject_request(conn, 431, "request headers too large");
                     break;
@@ -2169,19 +2845,19 @@ static void handle_client_io(
     }
 
     if (read_err) {
-        close_client_conn(conn_head, conn_cnt, conn);
+        close_client_conn(conn_head, conn_cnt, conn, arg, tbl);
         return;
     }
 
     if (!conn->close_after_tx && conn->rx.len > 0) {
-        if (process_buffered_requests(conn, arg->static_dir, arg->dev_mode, arg->handler) < 0) {
+        if (process_buffered_requests(conn, arg, tbl) < 0) {
             conn->close_after_tx = true;
         }
     }
 
     if (conn->close_after_tx || conn->peer_eof) {
         if (conn->tx.len == 0) {
-            close_client_conn(conn_head, conn_cnt, conn);
+            close_client_conn(conn_head, conn_cnt, conn, arg, tbl);
         } else {
             conn->close_after_tx = true;
             update_loop_write_interest(conn, true);
@@ -2189,15 +2865,27 @@ static void handle_client_io(
     }
 }
 
-static void sweep_idle_conns(qed_client_conn_t **conn_head, uint32_t *conn_cnt, time_t *last_sweep) {
+static void sweep_idle_conns(
+    qed_client_conn_t **conn_head, uint32_t *conn_cnt,
+    time_t *last_sweep, const qed_worker_arg_t *arg, qed_topic_table_t *tbl)
+{
     time_t now = time(NULL);
     if (now - *last_sweep < 5) return;
     *last_sweep = now;
     qed_client_conn_t *c = *conn_head;
     while (c != NULL) {
         qed_client_conn_t *nxt = c->next;
-        if (now - c->last_active > QED_CONN_IDLE_TIMEOUT_SEC) {
-            close_client_conn(conn_head, conn_cnt, c);
+        if (c->is_ws) {
+            if (now - c->last_active > QED_WS_DEAD_TIMEOUT_SEC) {
+                close_client_conn(conn_head, conn_cnt, c, arg, tbl);
+            } else if (now - c->last_ping_sent >= QED_WS_PING_INTERVAL_SEC && !c->close_after_tx) {
+                c->last_ping_sent = now;
+                if (!ws_send_raw_frame(c, 0x09, NULL, 0, NULL, 0)) {
+                    close_client_conn(conn_head, conn_cnt, c, arg, tbl);
+                }
+            }
+        } else if (now - c->last_active > QED_CONN_IDLE_TIMEOUT_SEC) {
+            close_client_conn(conn_head, conn_cnt, c, arg, tbl);
         }
         c = nxt;
     }
@@ -2233,10 +2921,13 @@ static void register_accepted_conns(int listen_fd, int loop_fd, qed_client_conn_
     }
 }
 
-static bool handle_client_writable(qed_client_conn_t **conn_head, uint32_t *conn_cnt, qed_client_conn_t *conn) {
+static bool handle_client_writable(
+    qed_client_conn_t **conn_head, uint32_t *conn_cnt,
+    qed_client_conn_t *conn, const qed_worker_arg_t *arg, qed_topic_table_t *tbl)
+{
     if (!flush_client_tx(conn) ||
         (conn->tx.len == 0 && (conn->close_after_tx || (conn->peer_eof && conn->rx.len == 0)))) {
-        close_client_conn(conn_head, conn_cnt, conn);
+        close_client_conn(conn_head, conn_cnt, conn, arg, tbl);
         return false;
     }
     return true;
@@ -2255,10 +2946,22 @@ static void *worker_thread_main(void *raw_arg) {
     qed_client_conn_t *conn_head = NULL;
     uint32_t conn_cnt = 0;
     time_t last_sweep = time(NULL);
+    qed_topic_table_t topic_tbl;
+    memset(&topic_tbl, 0, sizeof(topic_tbl));
 
 #ifdef __linux__
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd >= 0) {
+        if (arg->inbox) {
+            pthread_mutex_lock(&arg->inbox->mu);
+            arg->inbox->loop_fd = epfd;
+            int wfd = arg->inbox->wake_fd;
+            pthread_mutex_unlock(&arg->inbox->mu);
+            if (wfd >= 0) {
+                struct epoll_event wev = { .events = EPOLLIN, .data.ptr = (void *)(uintptr_t)1 };
+                epoll_ctl(epfd, EPOLL_CTL_ADD, wfd, &wev);
+            }
+        }
         struct epoll_event ev = { .events = EPOLLIN, .data.ptr = NULL };
         epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev);
         struct epoll_event events[128];
@@ -2268,25 +2971,37 @@ static void *worker_thread_main(void *raw_arg) {
             for (int i = 0; i < nfds; i++) {
                 if (events[i].data.ptr == NULL) {
                     register_accepted_conns(listen_fd, epfd, &conn_head, &conn_cnt);
+                } else if (events[i].data.ptr == (void *)(uintptr_t)1) {
+                    drain_worker_inbox(arg->inbox, &topic_tbl);
                 } else {
                     qed_client_conn_t *conn = (qed_client_conn_t *)events[i].data.ptr;
                     uint32_t evs = events[i].events;
-                    if ((evs & EPOLLOUT) && !handle_client_writable(&conn_head, &conn_cnt, conn)) continue;
+                    if ((evs & EPOLLOUT) && !handle_client_writable(&conn_head, &conn_cnt, conn, arg, &topic_tbl)) continue;
                     if (evs & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
                         handle_client_io(&conn_head, &conn_cnt, conn,
                                          (evs & (EPOLLRDHUP | EPOLLHUP)) != 0,
-                                         (evs & EPOLLERR) != 0, arg);
+                                         (evs & EPOLLERR) != 0, arg, &topic_tbl);
                     }
                 }
             }
-            sweep_idle_conns(&conn_head, &conn_cnt, &last_sweep);
+            drain_worker_inbox(arg->inbox, &topic_tbl);
+            sweep_idle_conns(&conn_head, &conn_cnt, &last_sweep, arg, &topic_tbl);
         }
-        while (conn_head != NULL) close_client_conn(&conn_head, &conn_cnt, conn_head);
+        while (conn_head != NULL) close_client_conn(&conn_head, &conn_cnt, conn_head, arg, &topic_tbl);
+        drain_worker_inbox(arg->inbox, NULL);
         close(epfd);
     }
 #elif defined(__APPLE__)
     int kq = kqueue();
     if (kq >= 0) {
+        if (arg->inbox) {
+            pthread_mutex_lock(&arg->inbox->mu);
+            arg->inbox->loop_fd = kq;
+            pthread_mutex_unlock(&arg->inbox->mu);
+            struct kevent uev;
+            EV_SET(&uev, 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, (void *)(uintptr_t)1);
+            kevent(kq, &uev, 1, NULL, 0, NULL);
+        }
         struct kevent kev;
         EV_SET(&kev, listen_fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
         kevent(kq, &kev, 1, NULL, 0, NULL);
@@ -2298,24 +3013,29 @@ static void *worker_thread_main(void *raw_arg) {
             for (int i = 0; i < nfds; i++) {
                 if (events[i].udata == NULL) {
                     register_accepted_conns(listen_fd, kq, &conn_head, &conn_cnt);
+                } else if (events[i].udata == (void *)(uintptr_t)1) {
+                    drain_worker_inbox(arg->inbox, &topic_tbl);
                 } else {
                     qed_client_conn_t *conn = (qed_client_conn_t *)events[i].udata;
                     if (events[i].filter == EVFILT_WRITE) {
-                        (void)handle_client_writable(&conn_head, &conn_cnt, conn);
+                        (void)handle_client_writable(&conn_head, &conn_cnt, conn, arg, &topic_tbl);
                     } else if (events[i].filter == EVFILT_READ) {
                         handle_client_io(&conn_head, &conn_cnt, conn,
                                          (events[i].flags & EV_EOF) != 0,
-                                         (events[i].flags & EV_ERROR) != 0, arg);
+                                         (events[i].flags & EV_ERROR) != 0, arg, &topic_tbl);
                     }
                 }
             }
-            sweep_idle_conns(&conn_head, &conn_cnt, &last_sweep);
+            drain_worker_inbox(arg->inbox, &topic_tbl);
+            sweep_idle_conns(&conn_head, &conn_cnt, &last_sweep, arg, &topic_tbl);
         }
-        while (conn_head != NULL) close_client_conn(&conn_head, &conn_cnt, conn_head);
+        while (conn_head != NULL) close_client_conn(&conn_head, &conn_cnt, conn_head, arg, &topic_tbl);
+        drain_worker_inbox(arg->inbox, NULL);
         close(kq);
     }
 #endif
 
+    topic_table_free(&topic_tbl);
     for (int i = 0; i < QED_POOL_SIZE; i++) {
         if (tls_pool[i].in_use) close_pool_entry(&tls_pool[i]);
     }
@@ -2324,12 +3044,15 @@ static void *worker_thread_main(void *raw_arg) {
     return NULL;
 }
 
-LEAN_EXPORT lean_object *qed_server_run(
+static lean_object *qed_server_run_impl(
     uint16_t port,
     uint32_t num_workers,
     b_lean_obj_arg static_dir_obj,
     uint8_t dev_mode,
-    lean_obj_arg handler)
+    lean_obj_arg handler,
+    const char *ws_path_in,
+    lean_obj_arg ws_upgrade,
+    lean_obj_arg ws_action)
 {
     ensure_sigpipe_ignored();
     struct sigaction sa;
@@ -2351,6 +3074,8 @@ LEAN_EXPORT lean_object *qed_server_run(
     int first_fd = create_reuseport_listener(port, num_workers > 1);
     if (first_fd < 0) {
         lean_dec(handler);
+        if (ws_upgrade) lean_dec(ws_upgrade);
+        if (ws_action) lean_dec(ws_action);
         fprintf(stderr, "✗ failed to bind port %u: %s\n", (unsigned)port, strerror(errno));
         return lean_io_result_mk_ok(lean_box_uint32(1));
     }
@@ -2364,15 +3089,38 @@ LEAN_EXPORT lean_object *qed_server_run(
     }
 
     char *static_dir_copy = strdup(lean_string_cstr(static_dir_obj));
+    char *ws_path_copy = strdup(ws_path_in ? ws_path_in : "");
     qed_worker_arg_t *args = (qed_worker_arg_t *)calloc(num_workers, sizeof(qed_worker_arg_t));
-    if (!static_dir_copy || !args) {
+    qed_worker_inbox_t *inboxes = (qed_worker_inbox_t *)calloc(num_workers, sizeof(qed_worker_inbox_t));
+    if (!static_dir_copy || !ws_path_copy || !args || !inboxes) {
+        free(inboxes);
         free(args);
+        free(ws_path_copy);
         free(static_dir_copy);
         close(first_fd);
         lean_dec(handler);
+        if (ws_upgrade) lean_dec(ws_upgrade);
+        if (ws_action) lean_dec(ws_action);
         return lean_io_result_mk_ok(lean_box_uint32(1));
     }
+
+    for (uint32_t i = 0; i < num_workers; i++) {
+        pthread_mutex_init(&inboxes[i].mu, NULL);
+        inboxes[i].loop_fd = -1;
+#ifdef __linux__
+        inboxes[i].wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+#else
+        inboxes[i].wake_fd = -1;
+#endif
+    }
+    pthread_mutex_lock(&g_bcast_mu);
+    g_inboxes = inboxes;
+    g_num_inboxes = num_workers;
+    pthread_mutex_unlock(&g_bcast_mu);
+
     lean_mark_mt(handler);
+    if (ws_upgrade) lean_mark_mt(ws_upgrade);
+    if (ws_action) lean_mark_mt(ws_action);
     if (num_workers > 1) {
         lean_runtime_mark_multi_threaded();
     }
@@ -2388,6 +3136,10 @@ LEAN_EXPORT lean_object *qed_server_run(
         args[i].static_dir = static_dir_copy;
         args[i].dev_mode = dev_mode;
         args[i].handler = handler;
+        args[i].ws_path = ws_path_copy;
+        args[i].ws_upgrade = ws_upgrade;
+        args[i].ws_action = ws_action;
+        args[i].inbox = &inboxes[i];
     }
 
     for (uint32_t i = 1; i < num_workers; i++) {
@@ -2401,8 +3153,48 @@ LEAN_EXPORT lean_object *qed_server_run(
         if (args[i].started) pthread_join(args[i].tid, NULL);
     }
 
+    pthread_mutex_lock(&g_bcast_mu);
+    g_inboxes = NULL;
+    g_num_inboxes = 0;
+    pthread_mutex_unlock(&g_bcast_mu);
+
+    for (uint32_t i = 0; i < num_workers; i++) {
+        drain_worker_inbox(&inboxes[i], NULL);
+        if (inboxes[i].wake_fd >= 0) close(inboxes[i].wake_fd);
+        pthread_mutex_destroy(&inboxes[i].mu);
+    }
+
+    free(inboxes);
     free(args);
+    free(ws_path_copy);
     free(static_dir_copy);
     lean_dec(handler);
+    if (ws_upgrade) lean_dec(ws_upgrade);
+    if (ws_action) lean_dec(ws_action);
     return lean_io_result_mk_ok(lean_box_uint32(0));
+}
+
+LEAN_EXPORT lean_object *qed_server_run(
+    uint16_t port,
+    uint32_t num_workers,
+    b_lean_obj_arg static_dir_obj,
+    uint8_t dev_mode,
+    lean_obj_arg handler)
+{
+    return qed_server_run_impl(port, num_workers, static_dir_obj, dev_mode, handler, "", NULL, NULL);
+}
+
+LEAN_EXPORT lean_object *qed_server_run_ws(
+    uint16_t port,
+    uint32_t num_workers,
+    b_lean_obj_arg static_dir_obj,
+    uint8_t dev_mode,
+    lean_obj_arg handler,
+    b_lean_obj_arg ws_path_obj,
+    lean_obj_arg ws_upgrade,
+    lean_obj_arg ws_action)
+{
+    return qed_server_run_impl(
+        port, num_workers, static_dir_obj, dev_mode, handler,
+        lean_string_cstr(ws_path_obj), ws_upgrade, ws_action);
 }

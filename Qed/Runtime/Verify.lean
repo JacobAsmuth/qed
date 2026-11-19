@@ -110,7 +110,8 @@ def qedLooksGenerated (n : Name) : Bool :=
         ["casesOn", "recOn", "rec", "brecOn", "below", "ibelow", "noConfusion",
          "noConfusionType", "toCtorIdx", "ofNat", "print", "parse", "toSeg", "fromSeg",
          "toJson", "fromJson"].contains s
-          || s.startsWith "match_" || s.startsWith "eq_" || s.startsWith "inst"
+          || s.startsWith "match_" || s.startsWith "eq_" || s.startsWith "inst" || s.startsWith "_wsKey_"
+          || s.endsWith "_key" || s.endsWith "_sub" || s.endsWith "_unsub" || s.endsWith "_send"
   | _ => n.isInternalDetail
 
 def qedIsHelper (env : Environment) (n : Name) : Bool :=
@@ -123,7 +124,7 @@ private def looksGeneratedForView (n : Name) : Bool :=
   qedLooksGenerated n ||
   (match n with
    | .str _ s =>
-       ["formView", "keyOf", "update", "updateKeyed", "regs", "reg", "init"].contains s
+       ["formView", "keyOf", "update", "updateKeyed", "regs", "reg", "init", "subscriptions"].contains s
    | _ => false)
 
 private def mentionsViewType (ty : Expr) : Bool :=
@@ -138,7 +139,9 @@ private def isUnfoldableUserDef (env : Environment) (viewOnly : Bool) (n : Name)
   if (← getProjectionFnInfo? n).isSome then return false
   match env.find? n with
   | some (.defnInfo d) =>
-      if d.type.isConstOf ``Qed.Token || d.type.isConstOf ``Qed.Url ||
+      if d.type.isConstOf ``Qed.Token || d.type.isAppOfArity ``Qed.TypedToken 1 ||
+         d.type.isConstOf ``Qed.Theme || d.type.isConstOf ``Qed.Keyframes ||
+         d.type.isConstOf ``Qed.Url ||
          d.type.isAppOfArity `Qed.Codec 1 || d.type.isConstOf `Qed.LocalDef ||
          d.type.isAppOfArity `Qed.App 2 || d.type.isAppOfArity `Qed.Dehydrate 1 then
         return false
@@ -160,7 +163,7 @@ private def viewFrameworkUnfolds (env : Environment) : Array Name :=
     ``Qed.onChange, ``Qed.onCheck, ``Qed.onKeydown, ``Qed.onKeyup, ``Qed.onSubmit,
     ``Qed.onBlur, ``Qed.onFocus, ``Qed.onDoubleClick, ``Qed.onMouseDown, ``Qed.onMouseUp,
     ``Qed.key, ``Qed.value, ``Qed.placeholder, ``Qed.name, ``Qed.href, ``Qed.src, ``Qed.action,
-    ``Qed.alt, ``Qed.title, ``Qed.style, ``Qed.type', ``Qed.disabled, ``Qed.required,
+    ``Qed.alt, ``Qed.title, ``Qed.style, ``Qed.inlineStyle, ``Qed.styleVars, ``Qed.type', ``Qed.disabled, ``Qed.required,
     ``Qed.checked, ``Qed.readOnly
   ]
   let opt := #[
@@ -959,6 +962,10 @@ private def dehydrateProjLemmas (env0 : Environment) : Array Name :=
     `Qed.Internal.mkRoutedApp_dehydrate, `Qed.Internal.mkRoutedApp_rehydrate,
     `Qed.Internal.App.withDehydrate_template, `Qed.Internal.App.withQueries_template,
     `Qed.Internal.App.withQueries_dehydrate, `Qed.Internal.App.withQueries_rehydrate,
+    `Qed.Internal.App.withSubscriptions_template,
+    `Qed.Internal.App.withSubscriptions_dehydrate, `Qed.Internal.App.withSubscriptions_rehydrate,
+    `Qed.Internal.App.withStylesheets_template, `Qed.Internal.App.withStylesheets_dehydrate, `Qed.Internal.App.withStylesheets_rehydrate,
+    `Qed.Internal.App.withExtraStyles_template, `Qed.Internal.App.withExtraStyles_dehydrate, `Qed.Internal.App.withExtraStyles_rehydrate,
     `Qed.Internal.App.withFullDehydrate, `Qed.Internal.App.withDehydrate_rehydrate_dehydrate,
     `Qed.App.guardRehydrate_template, `Qed.App.guardRehydrate_dehydrate,
     `Qed.Dehydrate.full_project, `Qed.Dehydrate.slice_project, `Qed.Dehydrate.const_project,
@@ -1063,6 +1070,8 @@ elab "qedProveViewEquiv" appId:ident viewId:ident : tactic => do
     appName, viewName, `Qed.App.view, `Qed.Internal.App.withFullDehydrate,
     `Qed.Internal.mkApp_template, `Qed.Internal.mkRoutedApp_template,
     `Qed.Internal.App.withDehydrate_template, `Qed.Internal.App.withQueries_template,
+    `Qed.Internal.App.withSubscriptions_template,
+    `Qed.Internal.App.withStylesheets_template, `Qed.Internal.App.withExtraStyles_template,
     `Qed.App.guardRehydrate_template
   ].filter env0.contains
   let fwNames := (viewFrameworkUnfolds env0).filter (· != ``V.render_forEach) ++ #[
@@ -1075,6 +1084,7 @@ elab "qedProveViewEquiv" appId:ident viewId:ident : tactic => do
   let s1 ← stage1.mapM toLemma
   let fw ← (fwNames.filter env0.contains).mapM toLemma
   try evalTactic (← `(tactic| try simp only [$[$s1],*])) catch _ => pure ()
+  try evalTactic (← `(tactic| try simp [-Qed.V.render_forEach, $[$fw],*])) catch _ => pure ()
   for _ in [0:5] do
     if (← getGoals).isEmpty then break
     let before ← (← getGoals).mapM fun g => g.withContext do instantiateMVars (← g.getType)

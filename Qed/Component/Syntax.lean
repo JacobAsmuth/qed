@@ -27,9 +27,10 @@ structure ComponentInfo where
   hasEffects  : Bool := false
   hasStart    : Bool := false
   mountable   : Bool := true
-  hasLocalDef : Bool := false
-  rootTag?    : Option String
-  usedRpcs    : Array (String × String) := #[]
+  hasLocalDef  : Bool := false
+  rootTag?     : Option String
+  usedRpcs     : Array (String × String) := #[]
+  usedChannels : Array (String × String) := #[]
 deriving Inhabited
 
 initialize componentRegistry :
@@ -110,6 +111,28 @@ def compQueryClause    : Parser := leading_parser
     withPosition (identEq `key >> "=" >> categoryParser `qedExpr 0 >>
                   checkColGe >> identEq `url >> "=" >> categoryParser `qedExpr 0))
 
+def compSubReconnect : Parser :=
+  node `Qed.compSubReconnect (withPosition (atomic (kw "reconnect") >> categoryParser `qedExpr 0))
+
+def compSubOnJoin : Parser :=
+  node `Qed.compSubOnJoin (withPosition (atomic (identEq `on_join) >> optional (checkLineEq >> "(" >> qedBinder >> ")") >> ":" >> qedSuite))
+
+def compSubOnMsg : Parser :=
+  node `Qed.compSubOnMsg (withPosition (atomic (identEq `on_message) >> "(" >> qedBinder >> ")" >> ":" >> qedSuite))
+
+def compSubOnStatus : Parser :=
+  node `Qed.compSubOnStatus (withPosition (atomic (identEq `on_status) >> "(" >> qedBinder >> ")" >> ":" >> qedSuite))
+
+def compSubHandler : Parser :=
+  compSubReconnect <|> compSubOnJoin <|> compSubOnMsg <|> compSubOnStatus
+
+def compSubscribeClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `subscribe >> ident >> "=") >>
+    ident >> "(" >> sepBy (categoryParser `qedExpr 0) "," >> ")" >>
+    optional compWhen >>
+    optional (":" >> checkColGt "expected indented `subscribe` handlers" >> many1Indent compSubHandler))
+
 def compActionClause   : Parser := leading_parser
   withPosition (
     atomic (identEq `action) >> ident >> compParamsOpt >>
@@ -131,12 +154,28 @@ def compInvariantClause : Parser := leading_parser
     optional (kw "using" >> "[" >> sepBy termParser "," >> "]") >>
     optional (":=" >> termParser))
 
+def compStyleClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `style >> notFollowedBy (symbol ":=") "':='") >>
+    ident >>
+    optional Qed.StyleDsl.styleExtendsClause >>
+    optional Qed.StyleDsl.styleStrictClause >>
+    ":" >>
+    many1 (checkColGt >> categoryParser `cssBlockItem 0))
+
+def compStylesheetClause : Parser := leading_parser
+  withPosition (atomic (identEq `stylesheet) >> strLit)
+
+def compThemeClause : Parser := leading_parser
+  withPosition (atomic (identEq `theme) >> ident)
+
 def compInvAny : Parser := compForEachInvClause <|> compInvariantClause
 
 def compClause : Parser :=
   compSessionClause <|> compFieldClause <|> compChildrenClause <|> compKeyClause <|>
   compEventClause <|> compStartClause <|> compRouteClause <|>
   compPortOutClause <|> compPortInClause <|> compRpcQueryClause <|> compQueryClause <|>
+  compSubscribeClause <|> compStyleClause <|> compStylesheetClause <|> compThemeClause <|>
   compActionClause <|> compInvAny
 
 @[command_parser] def componentCmd : Parser := leading_parser

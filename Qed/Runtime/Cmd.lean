@@ -2,6 +2,7 @@ import Qed.Html
 import Qed.Date
 import Qed.Proto
 import Qed.Router.Basic
+import Qed.Socket.Basic
 
 namespace Qed
 
@@ -18,6 +19,16 @@ inductive Cmd (msg : Type) where
   | fxResult (kind a b : String) (onResult : String → msg)
   | socket (key url : String) (onMessage : String → msg)
            (onOpen : Option msg) (onClose : Option msg) (onError : Option (String → msg))
+  | wsMuxSub (slot url channel : String) (params : ByteArray) (reconnect : Reconnect)
+             (onJoin : ByteArray → msg) (onMessage : ByteArray → msg) (onStatus : SocketStatus → msg)
+  | wsMuxSend (slot : String) (payload : ByteArray)
+  | wsMuxUnsub (slot : String)
+  | wsExtOpen (slot url : String) (isBinary : Bool) (reconnect : Reconnect)
+              (onJoin : Unit → msg) (onText : String → msg) (onBytes : ByteArray → msg)
+              (onStatus : SocketStatus → msg)
+  | wsExtSendText (slot text : String)
+  | wsExtSendBytes (slot : String) (payload : ByteArray)
+  | wsExtClose (slot : String)
 
 instance : Coe (List (Cmd msg)) (Cmd msg) := ⟨.batch⟩
 
@@ -36,6 +47,15 @@ def Cmd.map (f : α → β) : Cmd α → Cmd β
   | .socket key url onMsg onOpen onClose onErr =>
       .socket key url (fun d => f (onMsg d)) (onOpen.map f) (onClose.map f)
               (onErr.map (fun g d => f (g d)))
+  | .wsMuxSub slot url ch params rec onJoin onMsg onStatus =>
+      .wsMuxSub slot url ch params rec (fun b => f (onJoin b)) (fun b => f (onMsg b)) (fun s => f (onStatus s))
+  | .wsMuxSend slot payload => .wsMuxSend slot payload
+  | .wsMuxUnsub slot => .wsMuxUnsub slot
+  | .wsExtOpen slot url isBin rec onJoin onTxt onBin onStatus =>
+      .wsExtOpen slot url isBin rec (fun u => f (onJoin u)) (fun s => f (onTxt s)) (fun b => f (onBin b)) (fun s => f (onStatus s))
+  | .wsExtSendText slot text => .wsExtSendText slot text
+  | .wsExtSendBytes slot payload => .wsExtSendBytes slot payload
+  | .wsExtClose slot => .wsExtClose slot
 def Cmd.mapList (f : α → β) : List (Cmd α) → List (Cmd β)
   | []      => []
   | c :: cs => Cmd.map f c :: Cmd.mapList f cs
@@ -56,6 +76,8 @@ mutual
 def Cmd.clientOnly : Cmd msg → Cmd msg
   | .request ..      => .none
   | .requestBytes .. => .none
+  | .wsMuxSub ..     => .none
+  | .wsExtOpen ..    => .none
   | .batch cmds      => .batch (Cmd.clientOnlyList cmds)
   | c                => c
 def Cmd.clientOnlyList : List (Cmd msg) → List (Cmd msg)

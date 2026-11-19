@@ -1,5 +1,6 @@
 import Qed.Component.Syntax
 import Qed.Resource
+import Qed.Socket
 import Qed.Schema
 
 namespace Qed
@@ -7,6 +8,8 @@ section CompElab
 open Lean Elab Command Qed.Lang
 
 syntax (name := qedCheckRpcCallTerm) "qedCheckRpcCall% " ident ident "[" term,* "]" term : term
+syntax (name := qedCheckChanSubTerm) "qedCheckChanSub% " ident "[" term,* "]" str "(" term "," term "," term "," term ")" : term
+syntax (name := qedCheckChanSendTerm) "qedCheckChanSend% " ident "[" term,* "]" str : term
 
 /-! ## Component Spec Structures & Rewriting -/
 
@@ -139,6 +142,24 @@ def inferAwaitBinderTy? (mInfo : ServerMethodInfo) (hasCatchNone : Bool) :
     modify fun s => { s with messages := savedMsgs }
     return none
 
+structure SubDecl where
+  id           : Ident
+  chanRef      : Ident
+  chInfo       : Qed.ChannelInfo
+  args         : Array Term
+  whenPat?     : Option (Term × Term × Array Name) := none
+  whenGuards   : Array Term := #[]
+  reconnect    : Qed.Reconnect
+  onJoin?      : Option (Option Syntax × Array Syntax) := none
+  onMsg?       : Option (Syntax × Array Syntax) := none
+  onStatus?    : Option (Syntax × Array Syntax) := none
+  msgEvTy      : Term
+  hasMsgEnsured: Bool := false
+
+def SubDecl.joinCtor   (s : SubDecl) : Name := Name.mkSimple s!"_wsJoin_{s.id.getId}"
+def SubDecl.msgCtor    (s : SubDecl) : Name := Name.mkSimple s!"_wsMsg_{s.id.getId}"
+def SubDecl.statusCtor (s : SubDecl) : Name := Name.mkSimple s!"_wsStatus_{s.id.getId}"
+
 structure ComponentSpec where
   doc?            : Option (TSyntax ``Lean.Parser.Command.docComment)
   t               : Ident
@@ -158,6 +179,7 @@ structure ComponentSpec where
   portOuts        : Array PortOutDecl := #[]
   portIns         : Array PortInDecl := #[]
   queries         : Array QueryDecl := #[]
+  subscriptions   : Array SubDecl := #[]
   actions         : Array Syntax
   invariants      : Array Syntax
   body            : Syntax
@@ -166,6 +188,10 @@ structure ComponentSpec where
   hasEffects      : Bool := false
   sessionField?   : Option Ident := none
   usedRpcs        : Array (String × String) := #[]
+  usedChannels    : Array (String × String) := #[]
+  styles          : Array Syntax := #[]
+  stylesheets     : Array String := #[]
+  themes          : Array Ident := #[]
 
 def ComponentSpec.fieldNames (s : ComponentSpec) : Array Name := s.states.map (·.id.getId)
 def ComponentSpec.propNames  (s : ComponentSpec) : Array Name := s.props.map (·.id.getId)
@@ -215,6 +241,7 @@ def registerSite (sites : IO.Ref (Array SetSite))
 structure RewriteCtx where
   stateFields : Array Name
   bindFields  : Array Name
+  propNames   : Array Name := #[]
   actionNames : Array Name := #[]
   inPerform   : Bool := false
   isPureComp  : Bool
@@ -282,10 +309,22 @@ def mkSiteExpr (ctx : RewriteCtx) (assigns : Array (Name × Option Term))
   if stAssigns.any (·.2.isNone) then wrapUnaryMsg ctx.wrapMsg? cid
   else match ctx.wrapMsg? with | some w => `($w $cid) | none => pure cid
 
+def formatStateFieldList (fields : Array Name) : String :=
+  if fields.isEmpty then "this component has no `state` fields"
+  else s!"`state` fields: {String.intercalate ", " (fields.toList.map fun n => s!"`{n}`")}"
+
+def throwNotMutableStateField (ref : Syntax) (prefixMsg : String) (fname : Name)
+    (stateFields propNames : Array Name) : CommandElabM Unit := do
+  let lead := if prefixMsg == s!"`{fname}`" then s!"`{fname}`" else s!"{prefixMsg}: `{fname}`"
+  if propNames.contains fname then
+    throwErrorAt ref s!"{lead} is a read-only `prop` and cannot be assigned ({formatStateFieldList stateFields})"
+  else
+    throwErrorAt ref s!"{lead} is not a `state` field of this component ({formatStateFieldList stateFields})"
+
 def checkMutableField (ctx : RewriteCtx) (ref : Syntax) (prefixMsg : String) (fname : Name) :
     CommandElabM Unit := do
   unless (ctx.stateFields ++ ctx.bindFields).contains fname do
-    throwErrorAt ref "{prefixMsg}: not a `state` field of this component (fields: {ctx.stateFields.toList})"
+    throwNotMutableStateField ref prefixMsg fname ctx.stateFields ctx.propNames
 
 def pushHandlerAssign (ctx : RewriteCtx) (assigns : Array (Name × Option Term))
     (fId : Syntax) (expr? : Option Term) :
@@ -617,10 +656,14 @@ private structure SpecParseAcc where
   portOuts        : Array PortOutDecl := #[]
   portIns         : Array PortInDecl := #[]
   queries         : Array QueryDecl := #[]
+  subscriptions   : Array SubDecl := #[]
   actions         : Array Syntax := #[]
   invariants      : Array Syntax := #[]
   sessionField?   : Option Ident := none
   rawStateTys     : Array (Ident × Option Syntax) := #[]
+  styles          : Array Syntax := #[]
+  stylesheets     : Array String := #[]
+  themes          : Array Ident := #[]
 
 private def requireTyOrDef (role : Name) (fId : Ident) (ty? d? : Option Term) : CommandElabM Unit := do
   if ty?.isNone && d?.isNone then
@@ -753,6 +796,76 @@ private def parseCompClause (acc : SpecParseAcc) (cl : Syntax) : CommandElabM Sp
       states := acc.states.push { id := qId, ty? := some qStateTy, def? := some qStateDef }
       rawStateTys := acc.rawStateTys.push (qId, none)
       queries := acc.queries.push { id := qId, ty := qTy, msgTy := qTy, source := .url keyE urlE } }
+  else if k == ``compSubscribeClause then
+    let subId : Ident := ⟨cl[1]⟩
+    let chanId : Ident := ⟨cl[3]⟩
+    let rawArgs : Array Term ← cl[5].getSepArgs.mapM (lowerCompExpr .val)
+    let (rawPat?, rawGuards) := parseCompWhen cl[7]
+    let whenPat? ← rawPat?.mapM fun (p, s) => do
+      return (← liftMacroM (lowerQedPat p), ← lowerCompExpr .val s, collectQedPatIds p)
+    let whenGuards ← rawGuards.mapM (lowerCompExpr .propGuard)
+    let env ← getEnv
+    let some chInfo := Qed.lookupChannel? env (← getCurrNamespace) (← getScope).openDecls chanId.getId
+      | throwErrorAt chanId s!"unknown WebSocket channel `{chanId.getId}` in `subscribe`"
+    if rawArgs.size != chInfo.paramCount then
+      throwErrorAt chanId s!"channel `{chanId.getId}` expects {chInfo.paramCount} argument(s), got {rawArgs.size}"
+    let mut recPolicy := chInfo.defaultReconnect
+    let mut hasRec := false
+    let mut onJoin? : Option (Option Syntax × Array Syntax) := none
+    let mut onMsg? : Option (Syntax × Array Syntax) := none
+    let mut onStatus? : Option (Syntax × Array Syntax) := none
+    if cl[8].getNumArgs == 2 then
+      for h in cl[8][1].getArgs do
+        let hk := h.getKind
+        if hk == `Qed.compSubReconnect then
+          if hasRec then throwErrorAt h s!"duplicate `reconnect` in `subscribe {subId.getId}`"
+          hasRec := true
+          recPolicy ← liftMacroM <| Qed.parseReconnectExpr h[1]
+        else if hk == `Qed.compSubOnJoin then
+          if onJoin?.isSome then throwErrorAt h s!"duplicate `on_join` in `subscribe {subId.getId}`"
+          let binder? := if h[1].getNumArgs == 3 then some h[1][1] else none
+          if binder?.isSome && !chInfo.hasJoinSnapshot then
+            throwErrorAt h s!"channel `{chanId.getId}` does not return an `on_join` snapshot; write `on_join:` without a parameter"
+          onJoin? := some (binder?, suiteStmts h[3])
+        else if hk == `Qed.compSubOnMsg then
+          if onMsg?.isSome then throwErrorAt h s!"duplicate `on_message` in `subscribe {subId.getId}`"
+          onMsg? := some (h[2], suiteStmts h[5])
+        else if hk == `Qed.compSubOnStatus then
+          if onStatus?.isSome then throwErrorAt h s!"duplicate `on_status` in `subscribe {subId.getId}`"
+          onStatus? := some (h[2], suiteStmts h[5])
+        else
+          throwErrorAt h s!"unexpected handler in `subscribe {subId.getId}`"
+    let evTyTerm : Term := mkIdentFrom chanId chInfo.eventTypeConst
+    let (msgEvTy, hasMsgEnsured) ← match chInfo.ensPredConst with
+      | some ensConst =>
+          let ev := mkIdent `_ws_ev
+          let qpIds := (Array.range chInfo.paramCount).map fun i => mkIdent (.mkSimple s!"_wp_{i}")
+          let ensApp ← (qpIds.push ev).foldlM (init := (mkIdent ensConst : Term)) fun acc x => `($acc $x)
+          let exBody ← (qpIds.zip chInfo.paramTypeConsts).foldrM (init := ensApp) fun (pId, pTy) acc =>
+            `(∃ ($pId:ident : $(mkIdent pTy)), $acc)
+          pure (← `(Qed.Ensured $evTyTerm (fun ($ev:ident : $evTyTerm) => $exBody)), true)
+      | none => pure (evTyTerm, false)
+    let statusTy ← `(Qed.SocketStatus)
+    let statusDef ← `(Qed.SocketStatus.disconnected)
+    return { acc with
+      states := acc.states.push { id := subId, ty? := some statusTy, def? := some statusDef }
+      rawStateTys := acc.rawStateTys.push (subId, none)
+      subscriptions := acc.subscriptions.push {
+        id := subId, chanRef := chanId, chInfo, args := rawArgs,
+        whenPat?, whenGuards, reconnect := recPolicy,
+        onJoin?, onMsg?, onStatus?, msgEvTy, hasMsgEnsured
+      } }
+  else if k == ``compStyleClause then
+    return { acc with styles := acc.styles.push cl }
+  else if k == ``compStylesheetClause then
+    let rawPath := (⟨cl[1]⟩ : TSyntax `str).getString
+    let normPath := if rawPath.startsWith "/" || rawPath.startsWith "http://" || rawPath.startsWith "https://"
+                    then rawPath else "/" ++ rawPath
+    unless isSafeUrl normPath do
+      throwErrorAt cl[1] s!"unsafe stylesheet URL `{rawPath}`: must be a root-relative path (e.g. `\"/app.css\"` or `\"app.css\"`) or `https://`/`http://` URL"
+    return { acc with stylesheets := acc.stylesheets.push normPath }
+  else if k == ``compThemeClause then
+    return { acc with themes := acc.themes.push ⟨cl[1]⟩ }
   else if k == ``compActionClause then
     return { acc with actions := acc.actions.push cl }
   else if k == ``compInvariantClause || k == ``compForEachInvClause then
@@ -778,18 +891,33 @@ def parseComponentSpec (stx : Syntax) : CommandElabM ComponentSpec := do
   let fieldNames := resolvedStates.map (·.id.getId)
   let allDeclNames := fieldNames ++ acc.props.map (·.id.getId) ++ acc.binds.map (·.id.getId) ++
     acc.slots.map (·.id.getId) ++ acc.events.map (·.id.getId) ++ acc.portOuts.map (·.id.getId)
-  if allDeclNames.toList.eraseDups.length != allDeclNames.size then
-    throwErrorAt t "component fields and events must have distinct names"
+  let mut seenDecls : Array Name := #[]
+  for dn in allDeclNames do
+    if seenDecls.contains dn then
+      throwErrorAt t s!"duplicate declaration name `{dn}` in component `{t.getId}`; state fields, props, binds, slots, events, and ports must have distinct names"
+    seenDecls := seenDecls.push dn
   let outTy? : Option Term :=
     if !acc.events.isEmpty || !acc.binds.isEmpty then some (mkIdent (t.getId ++ `Out)) else none
   if let some kf := acc.keyF? then
     unless fieldNames.contains kf.getId.eraseMacroScopes do
-      throwErrorAt kf "`key {kf.getId}`: not a `state` field of this component (fields: {fieldNames.toList})"
+      throwErrorAt kf s!"`key {kf.getId}`: `{kf.getId}` is not a `state` field of `{t.getId}` ({formatStateFieldList fieldNames})"
     if outTy?.isSome then
       throwErrorAt kf "`key` marks the row identity for parent-owned use, and a parent-owned child's `event` output would have no receiver; drop one of the two"
-  if !acc.queries.isEmpty && (!acc.props.isEmpty || !acc.binds.isEmpty || !acc.slots.isEmpty ||
-      acc.hasChildren || !acc.events.isEmpty || resolvedStates.any (·.def?.isNone)) then
-    throwErrorAt acc.queries[0]!.id "reactive `query` is only supported on top-level mountable application components"
+  if !acc.queries.isEmpty || !acc.subscriptions.isEmpty then
+    let mut blockers : Array String := #[]
+    if !acc.props.isEmpty then blockers := blockers.push "`prop`"
+    if !acc.binds.isEmpty then blockers := blockers.push "`bind`"
+    if !acc.slots.isEmpty then blockers := blockers.push "`slot`"
+    if acc.hasChildren then blockers := blockers.push "`children`"
+    if !acc.events.isEmpty then blockers := blockers.push "`event`"
+    let uninit := resolvedStates.filter (·.def?.isNone)
+    if !uninit.isEmpty then
+      blockers := blockers.push s!"uninitialized `state` ({String.intercalate ", " (uninit.toList.map fun f => s!"`{f.id.getId}`")})"
+    if !blockers.isEmpty then
+      if let some q0 := acc.queries[0]? then
+        throwErrorAt q0.id s!"reactive `query {q0.id.getId}` is only supported on top-level mountable components, but `{t.getId}` declares {String.intercalate ", " blockers.toList}"
+      else if let some s0 := acc.subscriptions[0]? then
+        throwErrorAt s0.id s!"reactive `subscribe {s0.id.getId}` is only supported on top-level mountable components, but `{t.getId}` declares {String.intercalate ", " blockers.toList}"
   return {
     doc?, t,
     collections := acc.collections, states := resolvedStates, ephemeralFields := acc.ephemeralFields,
@@ -797,8 +925,10 @@ def parseComponentSpec (stx : Syntax) : CommandElabM ComponentSpec := do
     events := acc.events, hasProps := !acc.props.isEmpty || !acc.binds.isEmpty,
     keyF? := acc.keyF?, outTy?, route? := acc.route?, starts := acc.starts,
     portOuts := acc.portOuts, portIns := acc.portIns, queries := acc.queries,
+    subscriptions := acc.subscriptions,
     actions := acc.actions, invariants, body := stx[7],
-    sessionField? := acc.sessionField?
+    sessionField? := acc.sessionField?,
+    styles := acc.styles, stylesheets := acc.stylesheets, themes := acc.themes
   }
 
 /-! ## Continuation-Lifting for Client `await` / `catch` -/
@@ -846,8 +976,8 @@ private def classifyCatchCase (validTags : Array String) (isOption : Bool) (cStx
         throwErrorAt tagRef "`.none` takes no error message argument"
       return (.dotTag "none" none, body)
     unless validTags.contains tag do
-      let validStr := if validTags.isEmpty then ".failed" else
-        String.intercalate ", " (validTags.toList.map (s!".{·}") ++ [".failed"])
+      let validList := validTags.toList.map (s!".{·}") ++ (if isOption then [".none"] else []) ++ [".failed"]
+      let validStr := String.intercalate ", " validList
       throwErrorAt tagRef s!"unknown error tag `.{tag}` in `catch` (valid patterns: {validStr})"
     return (.dotTag tag binder?, body)
   if pat.getKind == ``qedPatDot then
@@ -884,11 +1014,13 @@ private def resolveRpcForAwait (ctx : RewriteCtx) (rpcId : Ident) (argCount : Na
 private def unpackAwaitCall (ref : Syntax) (awaitExpr : Syntax) : CommandElabM (Ident × Array Syntax) := do
   let inner := unwrapParens1 awaitExpr[1]
   unless inner.getKind == ``qedCall && inner[0].getKind == ``qedIdent do
-    throwErrorAt ref "`await` expects a server RPC call `Server.method(args...)`"
+    let sn := stxSnippet inner
+    let got := if sn.isEmpty then "" else s!", got `{sn}`"
+    throwErrorAt ref s!"`await` expects a server RPC call `Server.method(args...)`{got}"
   let rawArgs := inner[2].getSepArgs
   let argExprs ← rawArgs.mapM fun a => do
     unless a.getKind == ``qedCallArgPos do
-      throwErrorAt a "RPC `await` calls take positional arguments"
+      throwErrorAt a "RPC `await` calls take positional arguments (not named `field=value` arguments)"
     pure a[0]
   return (⟨inner[0][0]⟩, argExprs)
 
@@ -908,8 +1040,13 @@ where
       let k := st.getKind
 
       if k == ``qedStmtAssign && (unwrapParens1 st[2]).getKind == ``qedAwait then
-        unless st[0].getKind == ``qedIdent && atomStr st[1] == "=" do
-          throwErrorAt st "`field = await ...` requires a simple state field on the left-hand side"
+        let op := atomStr st[1]
+        if op != "=" then
+          throwErrorAt st[1] s!"`await` assignment requires `=`, not `{op}` (use `let v = await ...` then update the field)"
+        unless st[0].getKind == ``qedIdent do
+          let lhsStr := stxSnippet st[0]
+          let got := if lhsStr.isEmpty then "" else s!", got `{lhsStr}`"
+          throwErrorAt st[0] s!"`field = await ...` requires a simple `Resource` state field on the left-hand side{got}"
         let fId : Ident := ⟨st[0][0]⟩
         let fname := fId.getId.eraseMacroScopes
         checkMutableField ctx fId s!"`{fname} = await ...`" fname
@@ -948,7 +1085,7 @@ where
           let missing := mInfo.domainErrTags.filter (!hasTag ·)
           unless missing.isEmpty do
             let missStr := String.intercalate ", " (missing.toList.map (s!".{·}"))
-            throwErrorAt st s!"`await {rpcId.getId}(...)` has unhandled domain error(s): {missStr}; handle them with `catch: case .tag: ...`"
+            throwErrorAt st s!"`await {rpcId.getId}(...)` has unhandled domain error(s): {missStr}; handle them with `catch: case .{missing[0]!}: ...`"
 
         let restArr := rest.toArray
         let capturedOuter := outerParams.filter fun (pId, _) =>
@@ -1138,7 +1275,7 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
   let usedRpcsRef   ← IO.mkRef (#[] : Array (String × String))
   let contCtrRef    ← IO.mkRef (0 : Nat)
   let baseCtx : RewriteCtx := {
-    stateFields := spec.fieldNames, bindFields := spec.bindNames,
+    stateFields := spec.fieldNames, bindFields := spec.bindNames, propNames := spec.propNames,
     actionNames := spec.actions.map (·[1].getId) ++ spec.portIns.map (·.id.getId),
     isPureComp := false, msgPath := spec.t.getId ++ `Msg, hasOut := spec.outTy?.isSome,
     collections := spec.collections, sites := sitesRef, hoisted := hoistedRef,
@@ -1147,14 +1284,21 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
   }
   for a in spec.actions do
     let name := a[1].getId
-    if (← sitesRef.get).any (·.ctor == name) || spec.collections.any (·.1.getId == name) then
-      throwErrorAt a[1] "duplicate action name `{name}`"
+    if (← sitesRef.get).any (·.ctor == name) then
+      throwErrorAt a[1] s!"duplicate action name `{name}`"
+    if spec.collections.any (·.1.getId == name) then
+      throwErrorAt a[1] s!"action name `{name}` conflicts with `collection {name}`"
     let rawParams := if a[2].getNumArgs == 3 then a[2][1].getSepArgs else #[]
     let params : Array (Ident × Term) ← rawParams.mapM fun p =>
       return (⟨p[0]⟩, ← liftMacroM (return (← lowerQedType p[2] false).1))
-    let pNames := params.map (·.1.getId)
-    if pNames.toList.eraseDups.length != pNames.size || pNames.any spec.allNames.contains then
-      throwErrorAt a "action parameters must be distinct and must not shadow fields"
+    let mut seenP : Array Name := #[]
+    for (pId, _) in params do
+      let pn := pId.getId
+      if seenP.contains pn then
+        throwErrorAt pId s!"duplicate parameter `{pn}` in action `{name}`"
+      if spec.allNames.contains pn then
+        throwErrorAt pId s!"parameter `{pn}` in action `{name}` shadows a component field; rename the parameter"
+      seenP := seenP.push pn
     let (rawWPat?, rawWGuards) := parseCompWhen a[3]
     let whenPat? ← rawWPat?.mapM fun (p, s) => do
       let sRw ← rewriteIn baseCtx false s
@@ -1168,16 +1312,18 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
       if s.getKind == ``qedStmtAssign && s[0].getKind == ``qedIdent && atomStr s[1] == "=" && isCdot s[2] then
         dummyAssigns ← pushHandlerAssign baseCtx dummyAssigns s[0][0] none
     if !params.isEmpty && !dummyAssigns.isEmpty then
-      throwErrorAt a "use an explicit set value in an action with parameters"
+      throwErrorAt a s!"action `{name}` declares explicit parameter(s) and cannot use the `·` placeholder; assign explicitly (e.g. `{dummyAssigns[0]!.1} = {params[0]!.1.getId}`)"
     let cur ← sitesRef.get
     sitesRef.set (cur.push {
       key := s!"action:{name}", ctor := name, params, whenPat?, guard?, assigns := dummyAssigns, stmts? := some stmts })
   for p in spec.portIns do
     let name := p.id.getId
-    if (← sitesRef.get).any (·.ctor == name) || spec.collections.any (·.1.getId == name) then
-      throwErrorAt p.id "duplicate port/action name `{name}`"
+    if (← sitesRef.get).any (·.ctor == name) then
+      throwErrorAt p.id s!"duplicate port/action name `{name}`"
+    if spec.collections.any (·.1.getId == name) then
+      throwErrorAt p.id s!"port name `{name}` conflicts with `collection {name}`"
     if spec.allNames.contains p.argId.getId then
-      throwErrorAt p.argId "port parameter must not shadow fields"
+      throwErrorAt p.argId s!"port parameter `{p.argId.getId}` on `port {name}` shadows a component field; rename the parameter"
     let whenPat? ← p.whenPat?.mapM fun (pat, s) => do
       let sRw ← rewriteIn baseCtx false s
       return (← liftMacroM (lowerQedPat pat), ← lowerCompExpr .val sRw)

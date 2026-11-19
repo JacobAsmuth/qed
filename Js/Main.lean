@@ -69,9 +69,49 @@ private partial def verifyModBatch (mods : List String) (skipFw : Bool) : IO Nat
         let cR ← match ← IO.wait tR with | .ok n => pure n | .error e => throw e
         return cL + cR
 
+private unsafe def evalCssForAppUnsafe (env : Environment) (appName : Name) : IO (String × List String) := do
+  let m : MetaM (String × List String) := do
+    let appExpr := Lean.mkConst appName
+    let stylesProj ← Meta.mkProjection appExpr `styles
+    let cssExpr ← Meta.mkAppM `Qed.renderStyleSheet #[stylesProj]
+    let cssStr ← Meta.evalExpr String (Lean.mkConst ``String) cssExpr
+    let sheets ← try
+        let shProj ← Meta.mkProjection appExpr `stylesheets
+        let listStrTy := Lean.mkApp (Lean.mkConst ``List [Level.zero]) (Lean.mkConst ``String)
+        Meta.evalExpr (List String) listStrTy shProj
+      catch _ => pure []
+    return (cssStr, sheets)
+  let (res, _) ← m.toIO { fileName := "<qedjs>", fileMap := default } { env }
+  return res
+
+@[implemented_by evalCssForAppUnsafe]
+private opaque evalCssForApp (env : Environment) (appName : Name) : IO (String × List String)
+
+private def emitCssForApp (env : Environment) (outPath : String) (appName : Name) : IO Unit := do
+  let (cssStr, sheets) ← evalCssForApp env appName
+  let p : System.FilePath := outPath
+  if !cssStr.isEmpty then
+    if let some dir := p.parent then IO.FS.createDirAll dir
+    IO.FS.writeFile p cssStr
+    IO.println s!"HAS_CSS:1"
+  else
+    if ← p.pathExists then try IO.FS.removeFile p catch _ => pure ()
+    IO.println s!"HAS_CSS:0"
+  for s in sheets do
+    let t := s.trimAscii.toString
+    if !t.isEmpty then
+      IO.println s!"STYLESHEET:{t}"
+
 def main (args : List String) : IO Unit := do
   Lean.initSearchPath (← Lean.findSysroot)
   match args with
+  | "--emit-css" :: outCss :: rest =>
+    let (mods, entryArgs) := splitDashes rest
+    if mods.isEmpty || entryArgs.isEmpty then
+      throw (IO.userError "usage: qedjs --emit-css <out.css> <module>… -- <appDecl>")
+    let env ← loadEnv mods
+    let appName := (parseEntry entryArgs.head!).1
+    emitCssForApp env outCss appName
   | "--verify-env" :: rest =>
     let skipFw := rest.contains "--skip-qed"
     let mods := rest.filter (· ≠ "--skip-qed")

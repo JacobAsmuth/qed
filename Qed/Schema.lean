@@ -250,11 +250,11 @@ private def lowerSchemaFieldSpec (stx : Syntax) : MacroM Term := do
     return (← Qed.Lang.lowerQedType stx false).1
 
 open Lean Elab Term Meta in
-private partial def resolveCodecBase (rawSpec : Term) : TermElabM Term := do
+private partial def resolveCodecBase (fieldName : Name) (rawSpec : Term) : TermElabM Term := do
   match rawSpec with
   | `($fn:ident $arg:term) =>
       if fn.getId.eraseMacroScopes == `jsonOnly then
-        let inner ← resolveCodecBase arg
+        let inner ← resolveCodecBase fieldName arg
         return ← `(Qed.Codec.jsonOnly $inner)
   | _ => pure ()
   let scopedSpec ← `(open Qed.Codec in $rawSpec)
@@ -273,10 +273,10 @@ private partial def resolveCodecBase (rawSpec : Term) : TermElabM Term := do
       if (← trySynthInstance (← mkAppM ``Qed.DefaultCodec #[e])) matches .some _ then
         return ← `((Qed.DefaultCodec.codec : Qed.Codec $rawSpec))
       else
-        throwErrorAt rawSpec m!"schema field type `{rawSpec}` has no default `Codec` or JSON instances"
+        throwErrorAt rawSpec m!"schema field `{fieldName}` has type `{rawSpec}`, which has no default `Codec` or JSON (`ToJson`/`FromJson`) instances.\nProvide a `DefaultCodec` or JSON instances for `{rawSpec}`, or use a supported field type (`String`, `Nat`, `Int`, `Bool`, `Date`, `select([...])`, `textarea`, `jsonOnly(...)`)."
   else
-    throwErrorAt rawSpec m!"a schema field must be a type (`String`, `Nat`, `Bool`, `Date`, …) \
-      or a `Codec` (e.g. `select […]`, `textarea`, `jsonOnly String`), but this has \
+    throwErrorAt rawSpec m!"schema field `{fieldName}` must be a type (`String`, `Nat`, `Int`, `Bool`, `Date`, …) \
+      or a `Codec` (e.g. `select([...])`, `textarea`, `jsonOnly(String)`), but this has \
       type{indentExpr ety}"
 
 open Lean Elab Term Meta in
@@ -289,7 +289,7 @@ private partial def elabSchemaFieldsAux (cbns : Array Ident) (cbts : Array Term)
       elabSchemaFieldsAux cbns cbts fs rawSpecs whereClauses (i + 1)
   else
     ((fs.zip rawSpecs).zip whereClauses).mapM fun ((f, rawSpec), preds) => do
-      let base ← resolveCodecBase rawSpec
+      let base ← resolveCodecBase f.getId rawSpec
       let inp : Term ←
         if preds.isEmpty then
           pure base
@@ -622,7 +622,10 @@ def resolveSchemaCtxArgs (ref : Lean.Syntax) (tag : String) (ctxBinders : Array 
   for (attrRef, nm, v) in props do
     if nm == "ctx" && ctxBinders.size == 1 then ctxArg? := some v
     else if ctxBinders.contains (.mkSimple nm) then ctxVals := ctxVals.insert (.mkSimple nm) v
-    else if checkUnknown then Lean.Macro.throwErrorAt attrRef s!"<{tag}>: unknown attribute `{nm}`"
+    else if checkUnknown then
+      let valid := ["bind", "onSubmit", "key", "reset"] ++ ctxBinders.toList.map toString ++
+        (if ctxBinders.size == 1 then ["ctx"] else [])
+      Lean.Macro.throwErrorAt attrRef s!"<{tag}>: unknown attribute `{nm}` (valid attributes: {String.intercalate ", " valid})"
   ctxBinders.mapM fun b => do
     if let some v := ctxVals[b]? <|> ctxArg? then pure v
     else Lean.Macro.throwErrorAt ref s!"<{tag}> requires context attribute `{b}=\{…}`{if ctxBinders.size == 1 then " (or `ctx={…}`)" else ""}"

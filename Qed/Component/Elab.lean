@@ -248,12 +248,13 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
             if op == "=" && isCdot s[2] then `(v)
             else desugarAssign fname op (← lowerCompExpr .val s[2])
           if spec.bindNames.contains fname then
-            if out?.isSome then throwErrorAt s "duplicate output in action"
+            if out?.isSome then
+              throwErrorAt s s!"cannot assign `bind` field `{fname}` here: this action already emits an output event (an action emits at most one output)"
             let outCtor := mkIdent (spec.t.getId ++ `Out ++ Name.mkSimple s!"set_{fname}")
             let oTerm ← `($outCtor $valTerm)
             return ← compileStmts spec sBase mutated (some oTerm) cmds rest
           unless spec.fieldNames.contains fname do
-            throwErrorAt fId "`{fname}`: not a `state` field of this component (fields: {spec.fieldNames.toList})"
+            throwNotMutableStateField fId s!"`{fname}`" fname spec.fieldNames spec.propNames
           let cont ← compileStmts spec sBase (mutated.push fname) out? cmds rest
           let fIdent := mkIdent fname
           `(let $fIdent:ident := $valTerm; $cont)
@@ -261,36 +262,68 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
           let fId : Ident := ⟨s[0][0][0]⟩
           let fname := fId.getId.eraseMacroScopes
           unless spec.fieldNames.contains fname do
-            throwErrorAt fId "`{fname}`: not a `state` field of this component (fields: {spec.fieldNames.toList})"
+            throwNotMutableStateField fId s!"`{fname}`" fname spec.fieldNames spec.propNames
           let idxT ← lowerCompExpr .val s[0][2]
           let rhsT ← lowerCompExpr .val s[2]
           let fIdent := mkIdent fname
           let cont ← compileStmts spec sBase (mutated.push fname) out? cmds rest
           `(let $fIdent:ident := ($fIdent).set $idxT $rhsT (by first | get_elem_tactic | (simp (config := { zetaDelta := false }) only [$fIdent:ident, Array.size_set, Array.size_push] <;> omega)); $cont)
         else
-          throwErrorAt s "unsupported assignment target in component action"
+          let lhsStr := stxSnippet s[0]
+          let what := if lhsStr.isEmpty then "" else s!" `{lhsStr} {op} ...`"
+          throwErrorAt s s!"unsupported assignment{what} in component action; expected `field = val`, `field += val`, `field -= val`, or `arr[i] = val`"
       else if sk == ``qedStmtExpr then
         if let some (targetStx, elemStx) := matchPushCall? s[0] then
           unless targetStx.getKind == ``qedIdent do
-            throwErrorAt targetStx "array `.push(...)` in component actions requires a simple state field"
+            let tgtStr := stxSnippet targetStx
+            let got := if tgtStr.isEmpty then "" else s!", got `{tgtStr}.push(...)`"
+            throwErrorAt targetStx s!"array `.push(...)` in component actions requires a simple `state` field (e.g. `items.push(x)`){got}"
           let fId : Ident := ⟨targetStx[0]⟩
           let fname := fId.getId.eraseMacroScopes
           unless spec.fieldNames.contains fname do
-            throwErrorAt fId "`{fname}`: not a `state` field of this component (fields: {spec.fieldNames.toList})"
+            throwNotMutableStateField fId s!"`{fname}`" fname spec.fieldNames spec.propNames
           let elemT ← lowerCompExpr .val elemStx
           let fIdent := mkIdent fname
           let cont ← compileStmts spec sBase (mutated.push fname) out? cmds rest
           `(let $fIdent:ident := ($fIdent).push $elemT; $cont)
         else
-          throwErrorAt s "an action statement must assign state, push to an array, perform an effect, or send an output"
+          let sn := stxSnippet s[0]
+          let what := if sn.isEmpty then "" else s!" `{sn}`"
+          throwErrorAt s s!"bare expression{what} has no effect in a component action; assign a `state` field (`field = ...`), call `arr.push(...)`, `perform ...`, or `send ...`"
       else if sk == ``qedStmtSend then
-        unless spec.outTy?.isSome do noEmitsErr s
-        if out?.isSome then throwErrorAt s "duplicate `send` in action; an action emits at most one output"
-        let sendT ← lowerCompExpr .val s[1]
-        compileStmts spec sBase mutated (some sendT) cmds rest
+        let callStx := unwrapParens1 s[1]
+        let matchedSub? : Option SubDecl :=
+          if callStx.getKind == ``qedCall && callStx[0].getKind == ``qedIdent then
+            let cname := callStx[0][0].getId.eraseMacroScopes
+            spec.subscriptions.find? (·.id.getId.eraseMacroScopes == cname)
+          else none
+        match matchedSub? with
+        | some sub =>
+            unless sub.chInfo.hasSend do
+              throwErrorAt s s!"channel `{sub.chInfo.ownerShort}.{sub.chInfo.channelName}` does not declare `on_send` / `send`"
+            let rawArgs := callStx[2].getSepArgs
+            if rawArgs.size != sub.chInfo.sendParamCount then
+              throwErrorAt callStx s!"`send {sub.id.getId}(...)` expects {sub.chInfo.sendParamCount} argument(s), got {rawArgs.size}"
+            let argTerms ← rawArgs.mapM fun ra => do
+              unless ra.getKind == ``qedCallArgPos do
+                throwErrorAt ra s!"named arguments are not supported in `send {sub.id.getId}(...)`"
+              lowerCompExpr .val ra[0]
+            let chFullId := mkIdentFrom s sub.chInfo.fullName
+            let slotLit := Syntax.mkStrLit sub.id.getId.toString
+            let sendCmd ← withRef s `(qedCheckChanSend% $chFullId:ident [$[$argTerms:term],*] $slotLit:str)
+            let cmdId := mkIdent (Name.mkSimple s!"_wsSendCmd_{cmds.size}")
+            let cont ← compileStmts spec sBase mutated out? (cmds.push (cmdId : Term)) rest
+            `(let $cmdId:ident := $sendCmd; $cont)
+        | none =>
+            unless spec.outTy?.isSome do noEmitsErr s
+            if out?.isSome then throwErrorAt s "duplicate `send` in action; an action emits at most one output"
+            let sendT ← lowerCompExpr .val s[1]
+            compileStmts spec sBase mutated (some sendT) cmds rest
       else if sk == ``qedStmtPerform then
         let perfT ← lowerCompExpr .val s[1]
-        compileStmts spec sBase mutated out? (cmds.push perfT) rest
+        let cmdId := mkIdent (Name.mkSimple s!"_perfCmd_{cmds.size}")
+        let cont ← compileStmts spec sBase mutated out? (cmds.push (cmdId : Term)) rest
+        `(let $cmdId:ident := $perfT; $cont)
       else if sk == ``qedStmtIf || sk == ``qedStmtIfLet || sk == ``qedStmtMatch then
         let passTail := !rest.isEmpty && hasReturnStmt s
         let sFlushed ← flushMutated sBase mutated
@@ -332,32 +365,57 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
             rebound ← `(let $fId:ident := ($sNext).$fId:ident; $rebound)
         `(let $brId:ident := $branchTerm; $rebound)
       else
-        throwErrorAt s "unsupported statement in component action"
+        let sn := stxSnippet s
+        let what := if sn.isEmpty then "" else s!" `{sn}`"
+        throwErrorAt s s!"unsupported statement{what} in component action"
 
 private def mkRightTuple (unit : CommandElabM Term) (pair : Term → Term → CommandElabM Term) :
     List Term → CommandElabM Term
   | [] => unit | [t] => pure t | t :: ts => do pair t (← mkRightTuple unit pair ts)
 
-private def mkRpcQueryBranches (spec : ComponentSpec) (rspec : RpcQuerySpec)
-    (leafFn : Array Ident → CommandElabM Term) : CommandElabM Term := do
-  let qaIds : Array Ident := (Array.range rspec.args.size).map fun i => mkIdent (Name.mkSimple s!"_qa_{i}")
-  let mut body ← (qaIds.zip (rspec.mInfo.paramTypeConsts.zip rspec.args)).foldrM
+private def mkGuardedBranches (spec : ComponentSpec) (pfx : String)
+    (paramTypeConsts : Array Name) (args : Array Term)
+    (whenPat? : Option (Term × Term × Array Name)) (whenGuards : Array Term)
+    (elseTerm : Term) (depMatch : Bool) (leafFn : Array Ident → CommandElabM Term) :
+    CommandElabM Term := do
+  let qaIds : Array Ident := (Array.range args.size).map fun i => mkIdent (Name.mkSimple s!"{pfx}_{i}")
+  let mut body ← (qaIds.zip (paramTypeConsts.zip args)).foldrM
     (init := ← leafFn qaIds) fun (qaId, pTy, arg) acc =>
       `(let $qaId:ident : $(mkIdent pTy) := $arg; $acc)
-  if !rspec.whenGuards.isEmpty then
-    let guardProp ← mkConjBody rspec.whenGuards
-    body ← `(if $(mkIdent `_hQWhen):ident : $guardProp then $body else none)
-  let patIds := rspec.whenPat?.map (·.2.2) |>.getD #[]
-  if let some (pat, scrut, _) := rspec.whenPat? then
-    body ← `(match $(mkIdent `_hQPat):ident : $scrut:term with | $pat:term => $body | _ => none)
+  if !whenGuards.isEmpty then
+    let guardProp ← mkConjBody whenGuards
+    body ← if depMatch then `(if $(mkIdent (Name.mkSimple s!"_h{pfx}When")):ident : $guardProp then $body else $elseTerm)
+           else `(if $guardProp then $body else $elseTerm)
+  let patIds := whenPat?.map (·.2.2) |>.getD #[]
+  if let some (pat, scrut, _) := whenPat? then
+    body ← if depMatch then `(match $(mkIdent (Name.mkSimple s!"_h{pfx}Pat")):ident : $scrut:term with | $pat:term => $body | _ => $elseTerm)
+           else `(match $scrut:term with | $pat:term => $body | _ => $elseTerm)
   bindMentionedFields spec (fun g =>
-    (rspec.whenPat?.any fun (_, scrut, _) => mentionsIdent scrut.raw g) ||
+    (whenPat?.any fun (_, scrut, _) => mentionsIdent scrut.raw g) ||
     (!patIds.contains g &&
-      (rspec.args.any (mentionsIdent ·.raw g) || rspec.whenGuards.any (mentionsIdent ·.raw g)))) body
+      (args.any (mentionsIdent ·.raw g) || whenGuards.any (mentionsIdent ·.raw g)))) body
+
+private def mkRpcQueryBranches (spec : ComponentSpec) (rspec : RpcQuerySpec)
+    (leafFn : Array Ident → CommandElabM Term) : CommandElabM Term := do
+  mkGuardedBranches spec "_qa" rspec.mInfo.paramTypeConsts rspec.args
+    rspec.whenPat? rspec.whenGuards (← `(none)) true leafFn
 
 private def mkRpcQueryParamsBody (spec : ComponentSpec) (rspec : RpcQuerySpec) : CommandElabM Term :=
   mkRpcQueryBranches spec rspec fun qaIds => do
     `(some $(← mkRightTuple (`(())) (fun a b => `(($a, $b))) (qaIds.toList.map (⟨·.raw⟩))))
+
+private def mkSubBranches (spec : ComponentSpec) (sub : SubDecl) (elseTerm : Term)
+    (depMatch : Bool) (leafFn : Array Ident → CommandElabM Term) : CommandElabM Term :=
+  mkGuardedBranches spec "_sa" sub.chInfo.paramTypeConsts sub.args
+    sub.whenPat? sub.whenGuards elseTerm depMatch leafFn
+
+private def mkSubKeyExpr (spec : ComponentSpec) (sub : SubDecl) : CommandElabM Term := do
+  let keyFnId := mkIdentFrom sub.chanRef sub.chInfo.keyHelperConst
+  mkSubBranches spec sub (← `("")) false fun qaIds =>
+    qaIds.foldlM (init := (keyFnId : Term)) fun acc a => `($acc $a)
+
+private def subKeyFnName (tId : Name) (sub : SubDecl) : Name :=
+  tId ++ Name.mkSimple s!"_wsKey_{sub.id.getId}"
 
 private def mkMsgInductiveCmds (spec : ComponentSpec) (sites : Array SetSite) :
     CommandElabM (Array (TSyntax `command)) := do
@@ -387,6 +445,14 @@ private def mkMsgInductiveCmds (spec : ComponentSpec) (sites : Array SetSite) :
     let qCtor := mkIdent q.ctorName
     ctors := ctors.push (← `(Lean.Parser.Command.ctor|
       | $qCtor:ident (key : String) (res : Resource $(q.msgTy))))
+  for sub in spec.subscriptions do
+    let joinTy : Term ← if sub.chInfo.hasJoinSnapshot then pure (mkIdent sub.chInfo.joinTypeConst : Term) else `(Unit)
+    ctors := ctors.push (← `(Lean.Parser.Command.ctor|
+      | $(mkIdent sub.joinCtor):ident (key : String) (snap : $joinTy)))
+    ctors := ctors.push (← `(Lean.Parser.Command.ctor|
+      | $(mkIdent sub.msgCtor):ident (key : String) (ev : $(sub.msgEvTy))))
+    ctors := ctors.push (← `(Lean.Parser.Command.ctor|
+      | $(mkIdent sub.statusCtor):ident (key : String) (st : Qed.SocketStatus)))
   for h in spec.hoisted do
     ctors := ctors.push (← `(Lean.Parser.Command.ctor|
       | $(mkIdent h.ctorName):ident (msg : $(mkIdent (h.info.fullName ++ `Msg)))))
@@ -415,7 +481,8 @@ private def mkOwnUpdateArms (spec : ComponentSpec) (sites : Array SetSite) (unch
           let isPureNoop := stmts.all fun st =>
             ![``qedStmtAssign, ``qedStmtExpr, ``qedStmtSend, ``qedStmtPerform,
               ``qedStmtIf, ``qedStmtIfLet, ``qedStmtMatch, ``qedStmtPass, ``qedStmtEnsure].contains st.getKind
-          if isPureNoop then throwErrorAt stmts[0]! "an action must update state, perform an effect, or send an output"
+          if isPureNoop then
+            throwErrorAt stmts[0]! s!"action `{site.ctor}` has no state update, effect, or `send`; add a state assignment, `perform`, `send`, or `pass`"
           compileStmts spec (← `(s)) #[] none #[] stmts.toList
       | none => do mkUpdateRet spec (← flushAssigns (← `(s)) site.assigns) site.send? #[])
     if let some guard := site.guard? then rhs ← `(if $(mkIdent `_qedWhen):ident : $guard then $rhs else $unchanged)
@@ -473,6 +540,63 @@ private def mkOwnUpdateArms (spec : ComponentSpec) (sites : Array SetSite) (unch
     let next ← `({ s with $qNm:ident := (s.$qNm:ident).put _qk $plainRes $keyBound })
     ownArms := ownArms.push (← `(Lean.Parser.Term.matchAltExpr|
       | $qCtor:ident _qk _qr => $(← mkUpdateRet spec next none #[])))
+  for sub in spec.subscriptions do
+    let subNm := sub.id
+    let wsKeyId := mkIdent (subKeyFnName tId sub)
+    let joinCtor := mkIdent (tId ++ `Msg ++ sub.joinCtor)
+    let msgCtor := mkIdent (tId ++ `Msg ++ sub.msgCtor)
+    let stCtor := mkIdent (tId ++ `Msg ++ sub.statusCtor)
+    -- `_wsJoin`
+    let joinBody ← match sub.onJoin? with
+      | some (binder?, stmts) =>
+          let mut b ← compileStmts spec (← `(s)) #[] none #[] stmts.toList
+          b ← bindMentionedFields spec (fun g => stmts.any (mentionsIdent · g)) b
+          match binder? with
+          | some bStx =>
+              if bStx.isIdent then
+                let bId : Ident := ⟨bStx⟩
+                `(let $bId:ident := _wsnap; $b)
+              else pure b
+          | none => pure b
+      | none => pure unchanged
+    let joinGuarded ← `(if $wsKeyId s == _wk then $joinBody else $unchanged)
+    ownArms := ownArms.push (← `(Lean.Parser.Term.matchAltExpr|
+      | $joinCtor:ident _wk _wsnap => $joinGuarded))
+    -- `_wsMsg`
+    let msgBody ← match sub.onMsg? with
+      | some (bStx, stmts) =>
+          let mut b ← compileStmts spec (← `(s)) #[] none #[] stmts.toList
+          b ← bindMentionedFields spec (fun g => stmts.any (mentionsIdent · g)) b
+          if sub.hasMsgEnsured then
+            if bStx.isIdent then
+              let bId : Ident := ⟨bStx⟩
+              `(let $bId:ident := (_wev).val; have _hWsEns := (_wev).ok; $b)
+            else
+              `(have _hWsEns := (_wev).ok; $b)
+          else
+            if bStx.isIdent then
+              let bId : Ident := ⟨bStx⟩
+              `(let $bId:ident := _wev; $b)
+            else pure b
+      | none => pure unchanged
+    let msgGuarded ← `(if $wsKeyId s == _wk then $msgBody else $unchanged)
+    ownArms := ownArms.push (← `(Lean.Parser.Term.matchAltExpr|
+      | $msgCtor:ident _wk _wev => $msgGuarded))
+    -- `_wsStatus`
+    let sWithSt ← `({ s with $subNm:ident := _wst })
+    let stBody ← match sub.onStatus? with
+      | some (bStx, stmts) =>
+          let mut b ← compileStmts spec sWithSt #[] none #[] stmts.toList
+          b ← bindMentionedFields spec (fun g => g != subNm.getId && stmts.any (mentionsIdent · g)) b
+          b ← `(let $(mkIdent subNm.getId):ident := _wst; $b)
+          if bStx.isIdent then
+            let bId : Ident := ⟨bStx⟩
+            `(let $bId:ident := _wst; $b)
+          else pure b
+      | none => mkUpdateRet spec sWithSt none #[]
+    let stGuarded ← `(if $wsKeyId s == _wk then $stBody else $unchanged)
+    ownArms := ownArms.push (← `(Lean.Parser.Term.matchAltExpr|
+      | $stCtor:ident _wk _wst => $stGuarded))
   return ownArms
 
 private def mkHoistedUpdateCmds (spec : ComponentSpec)
@@ -555,7 +679,13 @@ private def mkMsgAndUpdateCmds (spec : ComponentSpec) (sites : Array SetSite) :
   let stateId  := mkIdent (tId ++ `State)
   let msgId    := mkIdent (tId ++ `Msg)
   let updateId := mkIdent (tId ++ `update)
-  let outCmds ← mkMsgInductiveCmds spec sites
+  let mut outCmds ← mkMsgInductiveCmds spec sites
+  for sub in spec.subscriptions do
+    let wsKeyId := mkIdent (subKeyFnName tId sub)
+    let keyBody ← mkSubKeyExpr spec sub
+    outCmds := outCmds.push (← `(command|
+      set_option linter.unusedVariables false in
+      def $wsKeyId (s : $stateId) : String := $keyBody))
   let unchanged ← mkUpdateRet spec (← `(s)) none #[]
   let ownArms ← mkOwnUpdateArms spec sites unchanged
   let retTy : Term ← match spec.outTy?, spec.hasEffects with
@@ -752,6 +882,46 @@ private def mkCompQueriesCmd? (spec : ComponentSpec) : CommandElabM (Option (TSy
     set_option linter.unusedVariables false in
     def $(mkIdent (tId ++ `queries)) : List (Query $stateId $msgId) := [$[$qTerms],*]))
 
+private def mkCompSubscriptionsCmd? (spec : ComponentSpec) : CommandElabM (Option (TSyntax `command)) := do
+  if spec.subscriptions.isEmpty then return none
+  let tId := spec.t.getId
+  let stateId := mkIdent (tId ++ `State)
+  let msgId := mkIdent (tId ++ `Msg)
+  let subTerms ← spec.subscriptions.mapM fun sub => do
+    let subNm := sub.id
+    let slotLit := Syntax.mkStrLit subNm.getId.toString
+    let wsKeyId := mkIdent (subKeyFnName tId sub)
+    let joinCtor := mkIdent (tId ++ `Msg ++ sub.joinCtor)
+    let msgCtor := mkIdent (tId ++ `Msg ++ sub.msgCtor)
+    let stCtor := mkIdent (tId ++ `Msg ++ sub.statusCtor)
+    let recTerm ← liftMacroM <| sub.reconnect.toSyntaxTerm
+    let unsubFnId := mkIdentFrom sub.chanRef sub.chInfo.unsubHelperConst
+    let chFullId := mkIdentFrom sub.chanRef sub.chInfo.fullName
+    let openBody ← mkSubBranches spec sub (← `(none)) true fun qaIds => do
+      let onJoinCb ← `($joinCtor _wk)
+      let onStCb ← `($stCtor _wk)
+      let onMsgCb ← if !sub.hasMsgEnsured then
+          `($msgCtor _wk)
+        else
+          let some ensConst := sub.chInfo.ensPredConst
+            | throwErrorAt sub.chanRef "internal: missing channel `ensures` predicate in `subscribe`"
+          let evTyId := mkIdentFrom sub.chanRef sub.chInfo.eventTypeConst
+          let ensApp ← qaIds.foldlM (init := (mkIdent ensConst : Term)) fun acc a => `($acc $a)
+          let exPrf ← qaIds.foldrM (init := ← `(_we.ok)) fun qa acc => `(Exists.intro $qa $acc)
+          `(fun (_we : Qed.Ensured $evTyId ($ensApp)) => $msgCtor _wk ⟨_we.val, $exPrf⟩)
+      let qaTerms : Array Term := qaIds.map (⟨·.raw⟩)
+      let subCmd ← withRef sub.chanRef `(qedCheckChanSub% $chFullId:ident [$[$qaTerms:term],*] $slotLit:str ($recTerm, $onJoinCb, $onMsgCb, $onStCb))
+      `(some $subCmd)
+    `(Qed.Subscription.mk
+        $slotLit
+        $wsKeyId
+        (fun _wk (s : $stateId) => $openBody)
+        ($unsubFnId $slotLit)
+        (fun (s : $stateId) => { s with $subNm:ident := Qed.SocketStatus.disconnected }))
+  return some (← `(command|
+    set_option linter.unusedVariables false in
+    def $(mkIdent (tId ++ `subscriptions)) : List (Qed.Subscription $stateId $msgId) := [$[$subTerms],*]))
+
 private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool)
     (stateInvPreds : Array Term) : CommandElabM (Array (TSyntax `command) × TSyntax `command) := do
   let doc?       := spec.doc?
@@ -786,16 +956,35 @@ private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool
   let onSessionArg : Term ← match spec.sessionField? with
     | some _ => `(some $(mkIdent (tId ++ `Msg ++ `_onSession)))
     | none   => `(none)
-  let baseApp : Term ← match spec.route? with
+  let baseApp0 : Term ← match spec.route? with
     | some _ => `(Qed.Internal.mkRoutedApp $initId $appUpdate $templateTerm
         (onRoute := $(mkIdent (tId ++ `Msg ++ `_onRoute))) (onSession := $onSessionArg)
         (start := $startArg) (locals := $regsId) (styles := qedInternalStyles% $viewId) (onPort := $onPortArg))
     | none   => `(Qed.Internal.mkApp $initId $appUpdate $templateTerm (onSession := $onSessionArg)
         (start := $startArg) (locals := $regsId) (styles := qedInternalStyles% $viewId) (onPort := $onPortArg))
+  let baseApp1 : Term ← if spec.themes.isEmpty then pure baseApp0 else do
+    let env ← getEnv; let currNs ← getCurrNamespace; let openDecls := (← getScope).openDecls
+    let thReg := Qed.StyleDsl.themeMetaRegistry.getState env
+    let mut thStyleTerms : Array Term := #[]
+    for thId in spec.themes do
+      let nm := thId.getId
+      let thInfo? := (thReg.find? (currNs ++ nm)).orElse (fun _ => thReg.find? nm) |>.orElse fun _ =>
+        openDecls.findSome? fun
+          | .simple ns _ => thReg.find? (ns ++ nm)
+          | .explicit id declName => if id == nm then thReg.find? declName else none
+      let some thInfo := thInfo?
+        | throwErrorAt thId s!"unknown `theme` `{nm}`"
+      thStyleTerms := thStyleTerms.push (mkIdentFrom thId thInfo.styleConst)
+    `(Qed.Internal.App.withExtraStyles [$[$thStyleTerms],*] $baseApp0)
+  let baseApp : Term ← if spec.stylesheets.isEmpty then pure baseApp1 else do
+    let shLits := spec.stylesheets.map Syntax.mkStrLit
+    `(Qed.Internal.App.withStylesheets [$[$shLits:str],*] $baseApp1)
   let dehydApp : Term ← if spec.ephemeralFields.isEmpty then `(qedInternalAutoDehydrate% $initId $baseApp)
     else `(Qed.Internal.App.withDehydrate (Dehydrate.except $initId [$[$spec.ephemeralFields:ident],*]) $baseApp)
   let queriedApp : Term ← if spec.queries.isEmpty then pure dehydApp else
     `(Qed.Internal.App.withQueries $(mkIdent (tId ++ `queries)) $dehydApp)
+  let subbedApp : Term ← if spec.subscriptions.isEmpty then pure queriedApp else
+    `(Qed.Internal.App.withSubscriptions $(mkIdent (tId ++ `subscriptions)) $queriedApp)
   let compInv? : Option Term ← if stateInvPreds.isEmpty then pure none
     else if stateInvPreds.size == 1 then pure (some (← `(($(stateInvPreds[0]!) : $stateId → Prop))))
     else do
@@ -806,8 +995,8 @@ private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool
     | some inv => canSynthDecidablePred stateId inv
     | none     => pure false
   let finalApp : Term ← match compInv?, hasDecInv with
-    | some inv, true => `(Qed.App.guardRehydrate ($inv) $queriedApp)
-    | _, _           => pure queriedApp
+    | some inv, true => `(Qed.App.guardRehydrate ($inv) $subbedApp)
+    | _, _           => pure subbedApp
   let appIdent := mkIdent (tId ++ `app)
   let viewIdent := mkIdent (tId ++ `view)
   cmds := cmds.push (← `(command| $[$doc?:docComment]? def $appIdent : App $stateId $msgId :=
@@ -1159,7 +1348,16 @@ private def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term
                 Term.synthesizeSyntheticMVarsNoPostponing
                 let predExpr ← instantiateMVars predExpr
                 invProps := invProps.push ((Expr.app predExpr decl.toExpr).headBeta)
-        let tryDischarge (goalBody : Expr) : TermElabM Bool := do
+        let cleanGoalExpr (e : Expr) : MetaM String := do
+          let e ← instantiateMVars e
+          let e ← Meta.zetaReduce e
+          let e ← Meta.transform e (pre := fun sub => do
+            if sub.isAppOfArity ``Qed.Lang.QedVal.val 4 then
+              return .visit (sub.getArg! 3)
+            return .continue)
+          let fmt ← Meta.ppExpr e
+          return (fmt.pretty.replace "✝" "").trimmed
+        let tryDischarge (goalBody : Expr) : TermElabM (Option String) := do
           let fullGoal ← invProps.foldrM (init := goalBody) fun hyp acc =>
             pure (Expr.forallE `_ hyp acc .default)
           let fullGoal ← instantiateMVars fullGoal
@@ -1167,9 +1365,12 @@ private def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term
           try
             let unsolved ← Tactic.run mv.mvarId! do
               Tactic.evalTactic (← `(tactic| intros; qedProveRpcReq))
-            return unsolved.isEmpty
+            if unsolved.isEmpty then return none
+            let msg ← unsolved[0]!.withContext do cleanGoalExpr (← unsolved[0]!.getType)
+            return some msg
           catch _ =>
-            return false
+            let reduced := (← Meta.unfoldDefinition? goalBody).getD goalBody
+            return some (← cleanGoalExpr reduced)
         if chk.requiresAuth then
           let some sfName := chk.sessionVar?
             | throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`ctx.userId != none`), but component `{spec.t.getId}` has no `session` state.\nAdd `session user` and guard the call with `when user.isSome:` or `if user.isSome: ...`."
@@ -1185,12 +1386,63 @@ private def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term
           let elemTy := if sfTy.isAppOfArity ``Option 1 then sfTy.appArg! else Lean.mkConst ``String
           let noneExpr ← Meta.mkAppOptM ``Option.none #[some elemTy]
           let authGoal ← Meta.mkAppM ``Ne #[sfExpr, noneExpr]
-          unless (← tryDischarge authGoal) do
-            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`{sfName} ≠ none`), which could not be proved at this call site.\nGuard this call with `when {sfName}.isSome:`, `if {sfName}.isSome: ...`, or declare `invariant ...: {sfName}.isSome`."
+          if (← tryDischarge authGoal).isSome then
+            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`{sfName} != none`), which could not be proved at this call site.\nGuard this call with `when {sfName}.isSome`, `if {sfName}.isSome: ...`, or declare `invariant ...: {sfName}.isSome`."
         if let some reqConst := chk.reqConst? then
           let reqGoal := mkAppN (Lean.mkConst reqConst) chk.argExprs
-          unless (← tryDischarge reqGoal) do
-            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` precondition `{chk.reqLabel}` could not be proved at this call site.\nSupply literals, guard with `when`/`if`, pass refined `Field`/`Ensured` values, or declare a component `invariant`."
+          if let some obl ← tryDischarge reqGoal then
+            let oblLine := if obl.isEmpty then "" else s!"\nRemaining proof obligation:\n  {obl}"
+            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` precondition `{chk.reqLabel}` could not be proved at this call site.{oblLine}\nSupply valid arguments, guard with `when`/`if`, pass refined `Field`/`Ensured` values, or declare a component `invariant`."
+
+open Lean Elab Term Meta in
+private def elabAndRecordChanCheck (stx : Syntax) (expectedType? : Option Expr)
+    (argTerms : Array Term) (slotLit : TSyntax `str)
+    (helperConst : Name) (paramCount : Nat) (paramTypeConsts : Array Name)
+    (trailingArgs : Array Term) (srvShort methodName : String)
+    (reqConst? : Option Name) (reqLabel : String) (requiresAuth : Bool) : TermElabM Expr := do
+  let fnId := mkIdentFrom stx helperConst
+  let mut fullCall : Term ← `($fnId $slotLit)
+  for a in argTerms do
+    fullCall ← `($fullCall ($a))
+  for t in trailingArgs do
+    fullCall ← `($fullCall ($t))
+  let resExpr ← instantiateMVars (← elabTerm fullCall expectedType?)
+  let mut argExprs : Array Expr := #[]
+  let fnArgs := resExpr.getAppArgs
+  if resExpr.isAppOf helperConst && fnArgs.size ≥ 2 + paramCount then
+    for i in [0:paramCount] do
+      argExprs := argExprs.push (← instantiateMVars fnArgs[2 + i]!)
+  else
+    for (aT, i) in argTerms.zipIdx do
+      argExprs := argExprs.push (← instantiateMVars (← elabTermEnsuringType aT (Lean.mkConst paramTypeConsts[i]!)))
+  if reqConst?.isSome || requiresAuth then
+    pendingRpcChecks.modify (·.push {
+      callRef := stx, srvShort, methodName, reqConst?, reqLabel, requiresAuth, argExprs,
+      lctx := ← getLCtx, localInsts := ← getLocalInstances, mctx := ← getMCtx,
+      sessionVar? := (← currentCompSessionRef.get).map (·.getId)
+    })
+  return resExpr
+
+open Lean Elab Term Meta in
+@[term_elab qedCheckChanSubTerm]
+def elabCheckChanSub : TermElab := fun stx expectedType? => do
+  let chFullName := stx[1].getId
+  let some chInfo := (Qed.channelRegistry.getState (← getEnv)).find? chFullName
+    | throwErrorAt stx s!"internal: unknown channel `{chFullName}` in subscription check"
+  elabAndRecordChanCheck stx expectedType? (stx[3].getSepArgs.map (⟨·⟩)) ⟨stx[5]⟩
+    chInfo.subHelperConst chInfo.paramCount chInfo.paramTypeConsts
+    #[⟨stx[7]⟩, ⟨stx[9]⟩, ⟨stx[11]⟩, ⟨stx[13]⟩]
+    chInfo.ownerShort chInfo.channelName chInfo.clientReqConst chInfo.clientReqLabel chInfo.requiresAuth
+
+open Lean Elab Term Meta in
+@[term_elab qedCheckChanSendTerm]
+def elabCheckChanSend : TermElab := fun stx expectedType? => do
+  let chFullName := stx[1].getId
+  let some chInfo := (Qed.channelRegistry.getState (← getEnv)).find? chFullName
+    | throwErrorAt stx s!"internal: unknown channel `{chFullName}` in send check"
+  elabAndRecordChanCheck stx expectedType? (stx[3].getSepArgs.map (⟨·⟩)) ⟨stx[5]⟩
+    chInfo.sendHelperConst chInfo.sendParamCount chInfo.sendParamTypeConsts #[]
+    chInfo.ownerShort s!"{chInfo.channelName}.send" chInfo.sendReqConst chInfo.sendReqLabel false
 
 @[command_elab componentCmd] def elabComponentCmd : CommandElab := fun stx => do
   let savedEnv ← getEnv
@@ -1200,11 +1452,22 @@ private def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term
   currentCompSessionRef.set none
   let okRef ← IO.mkRef false
   try
+    let rawSpec ← withOpenNs compNs (parseComponentSpec stx)
+    -- Elaborate component-colocated `style` clauses into `<Comp>.<styleName>` before opening `compNs`
+    for stCl in rawSpec.styles do
+      withOpenNs compNs do
+        let sNameId : Ident := ⟨stCl[1]⟩
+        let qualifiedId := mkIdentFrom sNameId (rawSpec.t.getId ++ sNameId.getId)
+        let extendsIds : Array Ident :=
+          if stCl[2].getNumArgs == 1 then stCl[2][0][1].getSepArgs.map (⟨·⟩) else #[]
+        let strictTokens := stCl[3].getNumArgs == 1
+        let bodyStxs := stCl[5].getArgs
+        Qed.StyleDsl.elabStyleDef none qualifiedId extendsIds strictTokens bodyStxs
     withOpenNs compNs do
-      let rawSpec ← parseComponentSpec stx
       if rawSpec.states.isEmpty && rawSpec.actions.isEmpty && rawSpec.keyF?.isNone &&
           rawSpec.starts.isEmpty && rawSpec.sessionField?.isNone &&
-          rawSpec.portOuts.isEmpty && rawSpec.portIns.isEmpty && rawSpec.queries.isEmpty then
+          rawSpec.portOuts.isEmpty && rawSpec.portIns.isEmpty && rawSpec.queries.isEmpty &&
+          rawSpec.subscriptions.isEmpty then
         let sitesRef ← IO.mkRef #[]
         let hoistedRef ← IO.mkRef #[]
         let formDraftsRef ← IO.mkRef #[]
@@ -1212,7 +1475,8 @@ private def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term
         let usedRpcsRef ← IO.mkRef #[]
         let contCtrRef ← IO.mkRef 0
         let rCtx : RewriteCtx := {
-          stateFields := #[], bindFields := rawSpec.bindNames, isPureComp := true,
+          stateFields := #[], bindFields := rawSpec.bindNames, propNames := rawSpec.propNames,
+          isPureComp := true,
           msgPath := rawSpec.t.getId ++ `Msg, hasOut := false, collections := #[],
           sites := sitesRef, hoisted := hoistedRef,
           formDrafts := formDraftsRef, resetForms := resetFormsRef,
@@ -1226,18 +1490,31 @@ private def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term
       let (sites, route'?, queries', starts', body', hoisted, formDrafts, resetForms, ownUsedRpcs) ←
         collectSitesAndRewriteStateful rawSpec
       let mut allUsedRpcs := ownUsedRpcs
+      let mut allUsedChannels : Array (String × String) := #[]
+      for sub in rawSpec.subscriptions do
+        match sub.chInfo.kind with
+        | .fullstack _ srvShort _ =>
+            let pair := (srvShort, sub.chInfo.channelName)
+            unless allUsedChannels.contains pair do
+              allUsedChannels := allUsedChannels.push pair
+        | .external .. => pure ()
       for h in hoisted do
         for ep in h.info.usedRpcs do
           unless allUsedRpcs.contains ep do
             allUsedRpcs := allUsedRpcs.push ep
+        for ch in h.info.usedChannels do
+          unless allUsedChannels.contains ch do
+            allUsedChannels := allUsedChannels.push ch
       let ownHasEffects :=
         !starts'.isEmpty ||
         !rawSpec.portOuts.isEmpty || !rawSpec.portIns.isEmpty || !queries'.isEmpty ||
+        !rawSpec.subscriptions.isEmpty ||
         sites.any (fun s => s.stmts?.any (·.any hasPerformNode)) ||
         (route'?.any fun rd => rd.alts.any hasPerformNode) ||
         hoisted.any (·.info.hasEffects)
       let spec ← elabStructsAndResolveTypes {
-        rawSpec with route? := route'?, queries := queries', hasEffects := ownHasEffects, usedRpcs := allUsedRpcs
+        rawSpec with route? := route'?, queries := queries', hasEffects := ownHasEffects,
+                     usedRpcs := allUsedRpcs, usedChannels := allUsedChannels
       } hoisted formDrafts resetForms
       currentCompSessionRef.set spec.sessionField?
       let errsBefore := (← get).messages.toList.filter (·.severity == .error) |>.length
@@ -1247,6 +1524,7 @@ private def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term
       for c in mountCmds do elabCommand c
       if spec.mountable && spec.outTy?.isNone && !spec.hasProps && !spec.hasSlotsOrKids then
         if let some qCmd ← mkCompQueriesCmd? spec then elabCommand qCmd
+        if let some sCmd ← mkCompSubscriptionsCmd? spec then elabCommand sCmd
       let stateInvPreds ← withOpenNs compNs (elabInlineInvariantsPhase spec false)
       let errsAfterInvs := (← get).messages.toList.filter (·.severity == .error) |>.length
       let activePreds := if errsAfterInvs == errsBefore then stateInvPreds else #[]
@@ -1262,10 +1540,15 @@ private def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term
       let epTerms ← allUsedRpcs.mapM fun (sStr, mStr) =>
         `((($(Syntax.mkStrLit sStr), $(Syntax.mkStrLit mStr)) : String × String))
       elabCommand (← `(command| def $usedRpcsId : List (String × String) := [$[$epTerms],*]))
+      let usedChsId := mkIdent (spec.t.getId ++ `usedChannels)
+      let chTerms ← allUsedChannels.mapM fun (sStr, cStr) =>
+        `((($(Syntax.mkStrLit sStr), $(Syntax.mkStrLit cStr)) : String × String))
+      elabCommand (← `(command| def $usedChsId : List (String × String) := [$[$chTerms],*]))
       let baseInfo ← mkBaseCompInfo spec .stateful spec.hasProps
       modifyEnv fun env => componentRegistry.addEntry env { baseInfo with
         hasOut := spec.outTy?.isSome, hasEffects := spec.hasEffects,
-        hasStart, mountable := spec.mountable, hasLocalDef, usedRpcs := allUsedRpcs }
+        hasStart, mountable := spec.mountable, hasLocalDef,
+        usedRpcs := allUsedRpcs, usedChannels := allUsedChannels }
       okRef.set true
   finally
     pendingRpcChecks.set #[]

@@ -103,6 +103,7 @@ export async function withBrowser(name, opts, fn) {
 const SUBPROCESS_SUITES = ['cli_scaffold_test.mjs', 'js_gate_test.mjs'];
 const BROWSER_SUITES = [
   'fullstack_rpc_test.mjs',
+  'websocket_test.mjs',
   'dom_equivalence_test.mjs',
 ];
 

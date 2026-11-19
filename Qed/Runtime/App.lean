@@ -14,11 +14,13 @@ structure App (Model : Type) (Msg : Type) where
   template       : View Model Msg
   onUrlChange    : Option (String → Msg) := none
   onSession      : Option (Option String → Msg) := none
+  onHydrate      : Model → Cmd Msg := fun _ => .none
   locals         : List LocalDef := []
   onPort         : Option (String → String → Option Msg) := none
   dehydrate      : Model → String := fun _ => ""
   rehydrate      : String → Option Model := fun _ => none
   styles         : List Style := []
+  stylesheets    : List String := []
   valid_view     : ∀ m, Html.valid (View.render template m) = true
   dehydrate_view : ∀ m m', rehydrate (dehydrate m) = some m' →
                      View.render template m' = View.render template m := by
@@ -53,6 +55,38 @@ def mkRoutedApp {R : Type} [Router R] [Inhabited R]
 def App.setInitAndUpdate (app : App Model Msg) (init : Model × Cmd Msg)
     (u : Model → Msg → Model × Cmd Msg) : App Model Msg :=
   { app with init := init, update := u }
+
+def App.setInitUpdateHydrate (app : App Model Msg) (init : Model × Cmd Msg)
+    (u : Model → Msg → Model × Cmd Msg) (onHydrate : Model → Cmd Msg) : App Model Msg :=
+  { app with init := init, update := u, onHydrate := onHydrate }
+
+def App.withStylesheets (sheets : List String) (app : App Model Msg) : App Model Msg :=
+  { app with stylesheets := app.stylesheets ++ sheets }
+
+def App.withExtraStyles (extra : List Style) (app : App Model Msg) : App Model Msg :=
+  { app with styles := extra ++ app.styles }
+
+@[simp] theorem App.withStylesheets_init (sheets : List String) (app : App Model Msg) :
+    (App.withStylesheets sheets app).init = app.init := rfl
+@[simp] theorem App.withStylesheets_update (sheets : List String) (app : App Model Msg) :
+    (App.withStylesheets sheets app).update = app.update := rfl
+@[simp] theorem App.withStylesheets_template (sheets : List String) (app : App Model Msg) :
+    (App.withStylesheets sheets app).template = app.template := rfl
+@[simp] theorem App.withStylesheets_dehydrate (sheets : List String) (app : App Model Msg) :
+    (App.withStylesheets sheets app).dehydrate = app.dehydrate := rfl
+@[simp] theorem App.withStylesheets_rehydrate (sheets : List String) (app : App Model Msg) :
+    (App.withStylesheets sheets app).rehydrate = app.rehydrate := rfl
+
+@[simp] theorem App.withExtraStyles_init (extra : List Style) (app : App Model Msg) :
+    (App.withExtraStyles extra app).init = app.init := rfl
+@[simp] theorem App.withExtraStyles_update (extra : List Style) (app : App Model Msg) :
+    (App.withExtraStyles extra app).update = app.update := rfl
+@[simp] theorem App.withExtraStyles_template (extra : List Style) (app : App Model Msg) :
+    (App.withExtraStyles extra app).template = app.template := rfl
+@[simp] theorem App.withExtraStyles_dehydrate (extra : List Style) (app : App Model Msg) :
+    (App.withExtraStyles extra app).dehydrate = app.dehydrate := rfl
+@[simp] theorem App.withExtraStyles_rehydrate (extra : List Style) (app : App Model Msg) :
+    (App.withExtraStyles extra app).rehydrate = app.rehydrate := rfl
 
 @[simp] theorem mkApp_init (init : Model) (u : Model → Msg → Model × Cmd Msg)
     (t : View Model Msg) (s l st p os hv) :
@@ -400,7 +434,21 @@ def elabStructFieldsSlice (ref : Syntax) (initVal modelTy : Expr) (fArr : Array 
     (← mkArrow modelTy (← mkArrow alphaTy modelTy))
   synthesizeSyntheticMVarsNoPostponing
   let some (instAlpha, _) ← synthLawfulJsonAux 16 alphaTy
-    | throwErrorAt ref m!"could not synthesize a verified JSON codec (`LawfulJson`) for dehydrated field slice `{← ppExpr alphaTy}`"
+    | do
+        let mut badFields : Array MessageData := #[]
+        for f in fArr do
+          let fTy? ← withLocalDeclD `_qed_m modelTy fun m => do
+            try
+              let fTy ← instantiateMVars (← inferType (← mkProjection m f.getId))
+              if (← synthLawfulJsonAux 16 fTy).isNone then return some fTy else return none
+            catch _ => return none
+          if let some fTy := fTy? then
+            badFields := badFields.push m!"`{f.getId} : {← ppExpr fTy}`"
+        if !badFields.isEmpty then
+          let listMd := MessageData.joinSep badFields.toList ", "
+          throwErrorAt ref m!"cannot serialize dehydrated state field(s) {listMd} for SSR (missing `LawfulJson` instance).\nMark non-serializable fields as `ephemeral` (if not rendered by the view or constrained by an invariant), or define `LawfulJson` for their type."
+        else
+          throwErrorAt ref m!"could not synthesize a verified JSON codec (`LawfulJson`) for dehydrated field slice `{← ppExpr alphaTy}`"
   return mkApp6 (Lean.mkConst ``Dehydrate.slice) modelTy alphaTy instAlpha initVal getterVal setterVal
 
 private def elabInitModel (initStx : Syntax) : TermElabM (Expr × Expr) := do

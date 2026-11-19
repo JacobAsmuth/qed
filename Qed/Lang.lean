@@ -261,6 +261,7 @@ def qedLetCatch   : Parser := node `Qed.Lang.letCatch (checkColGe >> kw "catch" 
     notFollowedBy (atomic (kw "atomic" >> ":")) "atomic" >> categoryParser `qedExpr 0 >> optional qedLetCatch)
 @[qedStmt_parser] def qedStmtPerform      : Parser := leading_parser withPosition (atomic (kw "perform") >> categoryParser `qedExpr 0)
 @[qedStmt_parser] def qedStmtSend         : Parser := leading_parser withPosition (atomic (kw "send") >> categoryParser `qedExpr 0)
+@[qedStmt_parser] def qedStmtEmit         : Parser := leading_parser withPosition (atomic (kw "emit") >> categoryParser `qedExpr 0)
 @[qedStmt_parser] def qedStmtIfLet        : Parser := leading_parser
   withPosition (atomic (symbol "if" >> symbol "let") >> categoryParser `qedPat 0 >> "=" >> categoryParser `qedExpr 0 >> ":" >>
     qedSuite >> optional (atomic (checkColEq >> symbol "else" >> ":") >> qedSuite))
@@ -275,7 +276,7 @@ def qedLetCatch   : Parser := node `Qed.Lang.letCatch (checkColGe >> kw "catch" 
 @[qedStmt_parser] def qedStmtExpr         : Parser := leading_parser
   withPosition (notFollowedBy (
     symbol "if" <|> symbol "match" <|> symbol "return" <|> symbol "let" <|>
-    kw "atomic" <|> kw "ensure" <|> kw "pass" <|> kw "perform" <|> kw "send") "statement" >> categoryParser `qedExpr 0)
+    kw "atomic" <|> kw "ensure" <|> kw "pass" <|> kw "perform" <|> kw "send" <|> kw "emit") "statement" >> categoryParser `qedExpr 0)
 
 end Parsers
 
@@ -327,6 +328,14 @@ def matchPushCall? (stx : Syntax) : Option (Syntax × Syntax) := do
   else failure
 
 inductive TypeMod where | array | option | fallible deriving Inhabited, DecidableEq, Repr
+
+/-- Pretty source snippet of a syntax node without trailing comments/newlines. -/
+def stxSnippet (stx : Syntax) : String :=
+  let raw := (stx.unsetTrailing.reprint.getD "").trimAscii.toString
+  match raw.splitOn "\n" with
+  | []      => ""
+  | [single] => single.trimAscii.toString
+  | first :: _ => first.trimAscii.toString ++ " ..."
 
 def splitIdentMods (id : Ident) : MacroM (Ident × Array TypeMod) := do
   let raw := id.getId.toString
@@ -386,15 +395,18 @@ partial def lowerQedType (stx : Syntax) (allowFallible := false) : MacroM (Term 
   else if k == ``qedTypeApp then
     if stx[0].getKind == ``qedTypeAtom && stx[0][1].getArgs.isEmpty then
       let fnName := stx[0][0].getId.eraseMacroScopes
+      let argStr := let s := stxSnippet stx[1]; if s.isEmpty then "T" else s
       if fnName == `Array || fnName == `Option then
-        Macro.throwErrorAt stx s!"use `{if fnName == `Array then "T[]" else "T?"}` instead of `{fnName} T`"
+        Macro.throwErrorAt stx s!"use `{argStr}{if fnName == `Array then "[]" else "?"}` instead of `{fnName} {argStr}`"
       if fnName == `jsonOnly then
-        Macro.throwErrorAt stx "use `jsonOnly(T)` with parentheses instead of `jsonOnly T`"
+        Macro.throwErrorAt stx s!"use `jsonOnly({argStr})` with parentheses instead of `jsonOnly {argStr}`"
     return (← `($((← lowerQedType stx[0] false).1) $((← lowerQedType stx[1] false).1)), false)
   else if k == ``qedTypeArrow then
     return (← `($((← lowerQedType stx[0] false).1) → $((← lowerQedType stx[2] false).1)), false)
   else
-    Macro.throwErrorAt stx "expected a Qed type (`T`, `T[]`, `T?`, `T!`, `Resource T`, `A -> B`, ...)"
+    let sn := stxSnippet stx
+    let what := if sn.isEmpty then "" else s!" `{sn}`"
+    Macro.throwErrorAt stx s!"invalid Qed type{what}; expected a type such as `T`, `T[]`, `T?`, `T!`, `Resource T`, or `A -> B`"
 
 /-- Infers automatic defaults for `qedType` state fields (`T[]` → `#[]`, `T?` → `none`, `Resource T` → `.idle`, `Cached T` → `{}`). -/
 partial def inferQedTypeDefault? (stx : Syntax) : MacroM (Option Term) := do
@@ -431,7 +443,10 @@ partial def lowerQedPat (stx : Syntax) : MacroM Term := do
     let argsNode := if k == ``qedPatDot then stx[2] else stx[1]
     if argsNode.getNumArgs == 3 then `($headT $(← argsNode[1].getSepArgs.mapM lowerQedPat)*)
     else return headT
-  else Macro.throwErrorAt stx "unsupported pattern syntax"
+  else
+    let sn := stxSnippet stx
+    let what := if sn.isEmpty then "" else s!" `{sn}`"
+    Macro.throwErrorAt stx s!"unsupported pattern{what}; expected `_`, a literal, an identifier, `.ctor(a, b)`, or a tuple `(a, b)`"
 
 /-- Collects bound variable names introduced by a `qedPat`. -/
 partial def collectQedPatIds (stx : Syntax) : Array Name :=
@@ -569,7 +584,9 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
       if let some custom ← hooks.lowerCall stx calleeStx rawArgs mode go then return custom
       if !rawArgs.isEmpty && rawArgs.any (·.getKind == ``qedCallArgNamed) then
         unless rawArgs.all (·.getKind == ``qedCallArgNamed) do
-          return ← hooks.throwErr stx "cannot mix named (`field=val`) and positional arguments in the same call"
+          let calleeStr := stxSnippet calleeStx
+          let inCall := if calleeStr.isEmpty then "the same call" else s!"call `{calleeStr}(...)`"
+          return ← hooks.throwErr stx s!"cannot mix named (`field=val`) and positional arguments in {inCall}"
         let tyTerm ← go .val calleeStx
         let fIds : Array Ident := rawArgs.map (⟨·[0]⟩)
         let fVals ← rawArgs.mapM fun a => do hooks.wrapNamedField (← go .val a[2])
@@ -677,7 +694,7 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
         if isPropMode then `(∃ $bId:ident ∈ $arrT, $bodyT) else `(($arrT).any (fun $bId:ident => $bodyT))
     else if k == ``qedAllVars then
       unless mode == .propInv || mode == .propGuard do
-        return ← hooks.throwErr stx "`all x, y: ...` without `in` is only valid in invariants and logical propositions"
+        return ← hooks.throwErr stx "`all x, y: ...` without `in` is only valid in invariants and logical propositions; for a runtime check over a collection, write `all x in items: ...`"
       let vIds : Array Ident := stx[1].getSepArgs.map (⟨·⟩)
       let bodyT ← hooks.withLocals (vIds.map (·.getId.toString)) (go mode stx[3])
       vIds.foldrM (init := bodyT) fun vid acc => `(∀ $vid:ident, $acc)
@@ -710,11 +727,19 @@ def lowerSimpleQedExpr (mode : ExprMode) (stx : Syntax)
     lowerProj := fun _ obj fld m => do finishTermMode m (← `(($obj).$fld:ident))
     lowerIndex := fun _ arr idx m => do finishTermMode m (← `($arr[$idx]))
     lowerCall := fun _ _ _ _ _ => pure none
-    lowerUnwrap := fun ref _ _ => Macro.throwErrorAt ref "operator `?` is only supported inside `server` functions"
+    lowerUnwrap := fun ref _ _ => Macro.throwErrorAt ref "operator `?` is only supported inside `server` functions with a fallible (`T!`) or optional (`T?`) return type"
     lowerAwait := fun ref _ _ => Macro.throwErrorAt ref "`await` is only supported in statements (`let x = await ...` or `field = await ...`)"
     lowerSend := fun ref e m => match lowerSend? with | some f => f ref e m | none => Macro.throwErrorAt ref "`send ...` only has meaning inside a `component`"
-    lowerFieldSetter := fun ref fid => match lowerFieldSetter? with | some f => f ref fid | none => Macro.throwErrorAt ref "`(field = ·)` is a component field setter; it only has meaning inside a `component`"
-    lowerJsx := fun ref m => match lowerJsx? with | some f => f ref m | none => Macro.throwErrorAt ref s!"unsupported Qed expression ({ref.getKind})"
+    lowerFieldSetter := fun ref fid => match lowerFieldSetter? with | some f => f ref fid | none => Macro.throwErrorAt ref s!"`({fid.getId} = ·)` is a component field setter and can only be used inside a `component`"
+    lowerJsx := fun ref m => match lowerJsx? with
+      | some f => f ref m
+      | none =>
+          if ref.getKind.toString.contains "Jsx" then
+            Macro.throwErrorAt ref "JSX elements are only allowed inside view expressions"
+          else
+            let sn := stxSnippet ref
+            let what := if sn.isEmpty then s!"({ref.getKind})" else s!" `{sn}`"
+            Macro.throwErrorAt ref s!"unsupported Qed expression{what}"
     lowerArrElem := pure, wrapNamedField := pure
     lowerType := fun t => return (← lowerQedType t false).1
     lowerPat := lowerQedPat, withLocals := fun _ k => k

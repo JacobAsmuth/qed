@@ -41,6 +41,10 @@ declare_syntax_cat jsxAttrVal
 @[qedExpr_parser] def qedExprJsx : Parser := leading_parser:maxPrec
   atomic (categoryParser `jsxElement 0)
 
+/-- Inline scoped CSS inside JSX braces: `<div {css: padding: 1rem; border-radius: 8px}>`. -/
+@[qedExpr_parser] def qedExprCss : Parser := leading_parser:maxPrec
+  atomic (symbol "css:" >> Qed.StyleDsl.inlineCssBody)
+
 def jsxAssignOp : Parser :=
   (symbol "=" >> notFollowedBy (symbol "=") "=") <|> symbol "+=" <|> symbol "-="
 def jsxAssignItem : Parser :=
@@ -67,6 +71,20 @@ syntax:max (name := jsxTerm) atomic(jsxElement) : term
 
 syntax qedCompProp := str "=" term
 syntax (name := qedCompTerm) "qedComp%" str str num "[" qedCompProp,* "]" term : term
+syntax (name := qedCheckUrlValTerm) "qedCheckUrlVal%" str term:max : term
+
+open Lean Meta Elab Term in
+@[term_elab qedCheckUrlValTerm]
+def elabQedCheckUrlVal : TermElab := fun stx expectedType? => do
+  let attrName := (⟨stx[1]⟩ : TSyntax `str).getString
+  let e ← elabTerm stx[2] expectedType?
+  synthesizeSyntheticMVars (postpone := .yes)
+  let ty ← instantiateMVars (← inferType e)
+  unless ty.hasMVar do
+    let instTy ← mkAppM ``Qed.ToHref #[ty]
+    if (← trySynthInstance instTy) matches .none then
+      throwErrorAt stx[2] m!"URL attribute `{attrName}` requires a typed `Router` route or `Url`, got `{← Meta.ppExpr ty}` (raw strings are disallowed to prevent XSS).\nPass a route value (e.g. `{attrName}=\{Route.home}`), a validated literal (`{attrName}=\{url% \"/path\"}`), or parse dynamic strings with `Url.parse?`."
+  return e
 
 def tokenVal : Syntax → String
   | .node _ _ #[.atom _ v] => v
@@ -132,7 +150,7 @@ private def checkSafeAttrName (ref : Syntax) (name : String) : MacroM Unit := do
     else if asciiLower name == "srcdoc" then
       Macro.throwErrorAt ref "`srcdoc` is forbidden in Qed views (iframe raw-HTML execution sink)"
     else
-      Macro.throwErrorAt ref s!"invalid HTML attribute name `{name}`"
+      Macro.throwErrorAt ref s!"invalid HTML attribute name `{name}`: attribute names must be non-empty ASCII without whitespace, quotes, `<`, `>`, `/`, or `=`"
 
 private def isJsxTextKid (k : Syntax) : Bool := k[0].getKind == `Qed.Jsx.jsxText
 
@@ -142,7 +160,7 @@ private def isJsxElementKid (k : Syntax) : Bool :=
 private def validateHtmlTag (ref : Syntax) (tag : String) (parentCtx? : Option (String × HtmlCtx)) :
     MacroM HtmlCtx := do
   if !isSafeTagName tag then
-    Macro.throwErrorAt ref s!"invalid HTML tag name `<{tag}>`"
+    Macro.throwErrorAt ref s!"invalid HTML tag name `<{tag}>`: HTML tags must start with a lowercase ASCII letter and contain only letters, digits, or `-`"
   if isForbiddenTag tag then
     Macro.throwErrorAt ref s!"<{tag}> is forbidden in Qed views (untrusted script/plugin execution sink)"
   match parentCtx? with
@@ -186,12 +204,16 @@ partial def expandJsxExpr (pPath : String) (parentCtx? : Option (String × HtmlC
     if j.getKind == ``qedExprJsx then
       elementToTerm pPath parentCtx? j[0]
     else
-      Macro.throwErrorAt j s!"unsupported JSX expression ({j.getKind})"
+      let sn := Qed.Lang.stxSnippet j
+      let what := if sn.isEmpty then s!"({j.getKind})" else s!" `{sn}`"
+      Macro.throwErrorAt j s!"unsupported JSX expression{what}"
   let expandOptElse (optNode : Syntax) (isListT : Bool) : MacroM (Term × Bool) :=
     if optNode.getNumArgs == 2 then expandJsxExpr pPath parentCtx? fallback optNode[1]
     else return (← if isListT then `([]) else fallback, isListT)
   if k == ``Qed.Lang.qedRawTerm then
     return (⟨stx[1]⟩, isMapCall stx[1])
+  else if k == ``qedExprCss then
+    return (⟨Syntax.node (SourceInfo.fromRef stx) ``Qed.StyleDsl.inlineCssTerm #[stx[0], stx[1]]⟩, false)
   else if k == ``qedExprJsx then
     if stx[0].getKind == ``jsxFragment then
       return (← childrenToTerm pPath parentCtx? stx[0][1] stx[0][2].getArgs, true)
@@ -285,16 +307,21 @@ partial def attrsToTerms (rawAttrs : Array Syntax) (tag : String := "") : MacroM
         else
           checkSafeAttrName stx[0] name
           if isUrlAttrName name then
-            Macro.throwErrorAt stx[0] s!"URL attribute `{name}` requires a typed `Router` or `Url` value"
+            Macro.throwErrorAt stx[0] s!"URL attribute `{name}` requires a value (a `Router` route or `Url`, e.g. `{name}=\{Route.home}` or `{name}=\{url% \"/path\"}`)"
           out := out.push (← `(Qed.attr $(Syntax.mkStrLit name) ""))
       else
+        if isUrlAttrName name && valNode[1].getKind == ``attrValStr then
+          let raw := (⟨valNode[1][0]⟩ : TSyntax `str).getString
+          Macro.throwErrorAt valNode[1][0]
+            s!"URL attribute `{name}` cannot take raw string literal `\"{raw}\"` (raw strings are disallowed to prevent XSS and broken links).\nPass a typed `Router` route or a compile-time checked literal: `{name}=\{url% \"{raw}\"}`."
         let vT ← expandAttrVal valNode (`(""))
+        let vChecked ← if isUrlAttrName name then `(qedCheckUrlVal% $(Syntax.mkStrLit name) ($vT)) else pure vT
         match attrHelper? name with
-        | some h => out := out.push (← `($(mkCIdent h) $vT))
+        | some h => out := out.push (← `($(mkCIdent h) $vChecked))
         | none   =>
             checkSafeAttrName stx[0] name
             if isUrlAttrName name then
-              out := out.push (← `(Qed.attr $(Syntax.mkStrLit name) (Qed.ToHref.toHref $vT)))
+              out := out.push (← `(Qed.attr $(Syntax.mkStrLit name) (Qed.ToHref.toHref $vChecked)))
             else
               out := out.push (← `(Qed.attr $(Syntax.mkStrLit name) $vT))
   return out
@@ -322,7 +349,7 @@ partial def collectKidParts (pPath : String) (parentCtx? : Option (String × Htm
         if let some (ptag, pctx) := parentCtx? then
           if !validTextIn pctx s then
             Macro.throwErrorAt k[0]
-              s!"invalid HTML5 text content inside <{ptag}>"
+              s!"invalid HTML5 text content `\"{s}\"` inside <{ptag}>: <{ptag}> does not allow raw text children (browsers hoist text outside <{ptag}> during HTML parsing, causing hydration mismatch)"
         parts := parts.push (.single ⟨Syntax.mkStrLit s⟩)
     else
       let gap := trailingWs prev
@@ -409,7 +436,7 @@ partial def expandAwaitTag (pPath : String) (parentCtx? : Option (String × Html
   let parts ← collectKidParts pPath parentCtx? opener kids
   let singleKid ← match parts with
     | #[.single t] => pure t
-    | _ => Macro.throwErrorAt stx "<Await> expects a single child element (with `as={val}`) or `{fun val => …}`"
+    | _ => Macro.throwErrorAt stx "<Await> expects a single child element (with `as={val}`) or a lambda `{val => ...}`"
   let readyT ← match asId? with
     | some b => `(fun $b:ident => $singleKid)
     | none   => pure singleKid
@@ -432,8 +459,7 @@ partial def componentToTerm (pPath : String) (parentCtx? : Option (String × Htm
   let mut compProps : Array (TSyntax ``qedCompProp) := #[]
   for a in attrStxs do
     if a.getKind == ``attrSplice then
-      Macro.throwErrorAt a s!"<{tag}>: a component tag takes props (field=\{…}, key, \
-        state, onMsg); a spliced attribute belongs on an HTML element"
+      Macro.throwErrorAt a s!"<{tag}>: component tags do not accept spliced attributes (`\{...}`); pass named props (`prop=\{...}`) instead, or apply styles/attributes on an HTML element inside `{tag}`"
     let nameLit := Syntax.mkStrLit (tokenVal a[0]) (info := a[0].getHeadInfo)
     let valNode := a[1]
     let v : Term ←

@@ -66,7 +66,7 @@ component HelperApp:
 #guard (HelperApp.app.locals.map (·.id)).contains "SyntaxChecks.LocalNested.Tag"
 #guard HelperApp.app.locals.length == 3
 
-/-- error: `label`: not a `state` field of this component (fields: [count]) -/
+/-- error: `label` is a read-only `prop` and cannot be assigned (`state` fields: `count`) -/
 #guard_msgs in
 component ReadOnly:
   prop label : String
@@ -138,18 +138,18 @@ component RoutedDehydrated:
 #guard (RoutedDehydrated.app.rehydrate (RoutedDehydrated.app.dehydrate { r := .sec .benchmarks 3 })).map (·.r)
   == some (.sec .benchmarks 3)
 
-/-- error: styling invariant `badVacuousRole` doesn't hold for every model, `roleHasOneOf("nonexistent", [navOn, navOff])` is false for some `navView m`.
+/-- error: styling invariant `badVacuousRole` doesn't hold for every state: `roleHasOneOf("nonexistent", [navOn, navOff])` is false for some `navView m`.
 
-Some element the rule constrains isn't carrying one of the required style classes (or no element with that role/tag is rendered). Check that the `role`/tag it matches exists and gets one of the styles passed to `roleHasOneOf`/`tagHasOneOf` in every branch of `navView`. If the view is routed through `App.view`/`View.render` rather than a plain `Model → Html`, prove it with:  invariant badVacuousRole : … holds_in navView := by … -/
+Some element the rule constrains isn't carrying one of the required style classes (or no element with that `role`/tag is rendered, or an element carries more than one conflicting style). Check that the matching `role`/tag exists and receives exactly one allowed style in every branch of `navView`. -/
 #guard_msgs in
 invariant badVacuousRole : roleHasOneOf("nonexistent", [navOn, navOff]) holds_in navView
 
 def bothStylesView (b : Bool) : Html Unit :=
   <button role="btn" {navOn} {navOff if b else navOff}>{"x"}</button>
 
-/-- error: styling invariant `badDualStyle` doesn't hold for every model, `roleHasOneOf("btn", [navOn, navOff])` is false for some `bothStylesView m`.
+/-- error: styling invariant `badDualStyle` doesn't hold for every state: `roleHasOneOf("btn", [navOn, navOff])` is false for some `bothStylesView m`.
 
-Some element the rule constrains isn't carrying one of the required style classes (or no element with that role/tag is rendered). Check that the `role`/tag it matches exists and gets one of the styles passed to `roleHasOneOf`/`tagHasOneOf` in every branch of `bothStylesView`. If the view is routed through `App.view`/`View.render` rather than a plain `Model → Html`, prove it with:  invariant badDualStyle : … holds_in bothStylesView := by … -/
+Some element the rule constrains isn't carrying one of the required style classes (or no element with that `role`/tag is rendered, or an element carries more than one conflicting style). Check that the matching `role`/tag exists and receives exactly one allowed style in every branch of `bothStylesView`. -/
 #guard_msgs in
 invariant badDualStyle : roleHasOneOf("btn", [navOn, navOff]) holds_in bothStylesView
 
@@ -301,10 +301,8 @@ component PartialFn:
 
 -- ── Compile-time rejection checks (#guard_msgs) ─────────────────────────
 
-/-- error: failed to synthesize instance of type class
-  ToHref String
-
-Hint: Type class instance resolution failures can be inspected with the `set_option trace.Meta.synthInstance true` command. -/
+/-- error: URL attribute `href` cannot take raw string literal `"/raw"` (raw strings are disallowed to prevent XSS and broken links).
+Pass a typed `Router` route or a compile-time checked literal: `href={url% "/raw"}`. -/
 #guard_msgs in
 def badRawHref : Html Unit := <a href="/raw">bad</a>
 
@@ -592,9 +590,9 @@ component StyleLacksGood:
 #guard (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := 5 })).map (·.x) == some 5
 #guard (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := -1 })).isNone
 
-/-- error: styling invariant `BadRoleLacks.noDanger` doesn't hold for every model, `roleLacks("submit", dangerBtnStyle)` is false for some `BadRoleLacks.view m`.
+/-- error: styling invariant `BadRoleLacks.noDanger` doesn't hold for every state: `roleLacks("submit", dangerBtnStyle)` is false for some `BadRoleLacks.view m`.
 
-Some element the rule constrains isn't carrying one of the required style classes (or no element with that role/tag is rendered). Check that the `role`/tag it matches exists and gets one of the styles passed to `roleHasOneOf`/`tagHasOneOf` in every branch of `BadRoleLacks.view`. If the view is routed through `App.view`/`View.render` rather than a plain `Model → Html`, prove it with:  invariant BadRoleLacks.noDanger : … holds_in BadRoleLacks.view := by … -/
+A matching element in `BadRoleLacks.view` carries a forbidden style class in some branch. Remove that style from the matching element (or guard it so it cannot apply there). -/
 #guard_msgs in
 component BadRoleLacks:
   state ok : Bool = true
@@ -664,16 +662,16 @@ component MultiParamAndAutoDefaults:
 example : MultiParamAndAutoDefaults.update MultiParamAndAutoDefaults.init (.pushBoth 4 "hi") =
     ({ xs := #[4], x := some 4 }, some (.emitted 4 "hi")) := rfl
 
-/-- error: use `T[]` instead of `Array T` -/
+/-- error: use `Nat[]` instead of `Array Nat` -/
 #guard_msgs in
 component BadArrayType:
   state xs : Array Nat = []
   view: <span>{xs.size}</span>
-/-- error: use `T?` instead of `Option T` -/
+/-- error: use `Nat?` instead of `Option Nat` -/
 #guard_msgs in
 schema BadOptType:
   val : Option Nat
-/-- error: use `jsonOnly(T)` with parentheses instead of `jsonOnly T` -/
+/-- error: use `jsonOnly(String)` with parentheses instead of `jsonOnly String` -/
 #guard_msgs in
 schema BadJsonOnly:
   id : jsonOnly String

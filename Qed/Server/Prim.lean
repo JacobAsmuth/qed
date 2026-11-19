@@ -68,4 +68,23 @@ opaque serveNative
     (handler : String → String → Array (String × String) → ByteArray → String → IO (Nat × String × ByteArray)) :
     IO UInt32
 
+/-- Broadcasts a pre-encoded Protobuf event payload across all multi-core worker threads to
+    every WebSocket subscription matching `topicKey` (`<channel>:<hex(params)>`), zero-copy. -/
+@[extern "qed_server_ws_broadcast"]
+opaque wsBroadcast (topicKey : @& String) (payload : @& ByteArray) : IO Unit
+
+/-- Starts the multi-core `SO_REUSEPORT` + `epoll`/`kqueue` HTTP/1.1 + RFC 6455 multiplexed
+    WebSocket server loop with cross-worker broadcast fan-out. -/
+@[extern "qed_server_run_ws"]
+opaque serveNativeWs {Ctx : Type}
+    (port : UInt16)
+    (numWorkers : UInt32)
+    (staticDir : @& String)
+    (devMode : UInt8)
+    (handler : String → String → Array (String × String) → ByteArray → String → IO (Nat × String × ByteArray))
+    (wsPath : @& String)
+    (wsUpgrade : Array (String × String) → String → IO Ctx)
+    (wsAction : Ctx → UInt8 → String → ByteArray → ByteArray → IO (Except String ByteArray)) :
+    IO UInt32
+
 end Qed.Server.Prim

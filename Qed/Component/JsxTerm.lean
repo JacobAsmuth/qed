@@ -1,6 +1,5 @@
 import Qed.Component.Syntax
 import Qed.Runtime
-import Qed.Schema
 
 namespace Qed
 section CompElab
@@ -35,15 +34,15 @@ private def elabSchemaFormTag (stx : Syntax) (expectedType? : Option Expr)
   let mut submit? : Option Term := none
   let mut ctxProps : Array (Syntax × String × Term) := #[]
   for p in propNodes do
-    let nm := (⟨p[0]⟩ : TSyntax `str).getString
-    let v : Term := ⟨p[2]⟩
+    let nm := (⟨(p.getArg 0)⟩ : TSyntax `str).getString
+    let v : Term := ⟨(p.getArg 2)⟩
     if nm == "key" then key? := some v
     else if nm == "bind" then bind? := some v
     else if nm == "onSubmit" then submit? := some v
     else if nm == "reset" then
-      throwErrorAt p[0] s!"<{tag}>: `reset` is only supported inside a `component` view"
+      throwErrorAt (p.getArg 0) s!"<{tag}>: `reset` is only supported inside a `component` view"
     else
-      ctxProps := ctxProps.push (p[0], nm, v)
+      ctxProps := ctxProps.push ((p.getArg 0), nm, v)
   let some b := bind?
     | throwErrorAt stx s!"<{tag}> requires `bind=\{draft}` when used outside a `component` view"
   let dVal ← `(($b).1)
@@ -65,17 +64,17 @@ private def elabPureCompTag (stx : Syntax) (expectedType? : Option Expr) (info :
   let mut fids : Array Ident := #[]
   let mut vals : Array Term  := #[]
   for p in propNodes do
-    let nm := (⟨p[0]⟩ : TSyntax `str).getString
-    let v : Term := ⟨p[2]⟩
+    let nm := (⟨(p.getArg 0)⟩ : TSyntax `str).getString
+    let v : Term := ⟨(p.getArg 2)⟩
     if nm == "key" then key? := some v
     else if nm.startsWith "bind:" then
       let bStr := (nm.drop 5).toString
-      fids := fids.push (mkIdentFrom p[0] (Name.mkSimple bStr))
+      fids := fids.push (mkIdentFrom (p.getArg 0) (Name.mkSimple bStr))
       vals := vals.push (← `(($v).1))
-      fids := fids.push (mkIdentFrom p[0] (Name.mkSimple s!"set_{bStr}"))
+      fids := fids.push (mkIdentFrom (p.getArg 0) (Name.mkSimple s!"set_{bStr}"))
       vals := vals.push (← `(($v).2))
     else
-      fids := fids.push (mkIdentFrom p[0] (Name.mkSimple nm))
+      fids := fids.push (mkIdentFrom (p.getArg 0) (Name.mkSimple nm))
       vals := vals.push v
   if hasKids then fids := fids.push (mkIdentFrom stx `children); vals := vals.push kidsT
   let callT ← if info.hasProps then
@@ -165,12 +164,12 @@ private def elabStatefulCompTag (stx : Syntax) (expectedType? : Option Expr) (in
   elabTerm (← `(Qed.el "div" [Qed.key $keyT, $mountT] [])) expectedType?
 
 @[term_elab Qed.Jsx.qedCompTerm] def elabQedCompTerm : TermElab := fun stx expectedType? => do
-  let tag := (⟨stx[1]⟩ : TSyntax `str).getString
-  let pPath := (⟨stx[2]⟩ : TSyntax `str).getString
-  let posNum := (⟨stx[3]⟩ : TSyntax `num).getNat
-  let propNodes := stx[5].getSepArgs
-  let kidsT : Term := ⟨stx[7]⟩
-  let hasKids := !(kidsT.raw.getKind == `«term[_]» && kidsT.raw[1].getArgs.isEmpty)
+  let tag := (⟨(stx.getArg 1)⟩ : TSyntax `str).getString
+  let pPath := (⟨(stx.getArg 2)⟩ : TSyntax `str).getString
+  let posNum := (⟨(stx.getArg 3)⟩ : TSyntax `num).getNat
+  let propNodes := (stx.getArg 5).getSepArgs
+  let kidsT : Term := ⟨(stx.getArg 7)⟩
+  let hasKids := !(kidsT.raw.getKind == `«term[_]» && (kidsT.raw.getArg 1).getArgs.isEmpty)
   let cName := (tag.splitOn ".").foldl Name.str Name.anonymous
   let info? ← lookupComponent? cName
   let baseName := match info? with | some info => info.fullName | none => cName
@@ -199,15 +198,15 @@ private def elabStatefulCompTag (stx : Syntax) (expectedType? : Option Expr) (in
   let mut onMsg?   : Option Term := none
   let mut hoist?   : Option Term := none
   for p in propNodes do
-    let nm := (⟨p[0]⟩ : TSyntax `str).getString
-    let v : Term := ⟨p[2]⟩
+    let nm := (⟨(p.getArg 0)⟩ : TSyntax `str).getString
+    let v : Term := ⟨(p.getArg 2)⟩
     match nm with
     | "key"     => key?     := some v
     | "state"   => state?   := some v
     | "initial" => initial? := some v
     | "onMsg"   => onMsg?   := some v
     | "_hoist"  => hoist?   := some v
-    | _         => props    := props.push (p[0], nm, v)
+    | _         => props    := props.push ((p.getArg 0), nm, v)
 
   if let some hPair := hoist? then
     return ← elabHoistedCompTag stx expectedType? info? tag pPath hasKids cId props kidsT hPair key?

@@ -97,6 +97,54 @@ component Storefront:
 - **Namespace helpers:** If a namespace with the component's name (such as `namespace Storefront ... end Storefront`)
   is defined beforehand, its symbols are automatically in scope inside `component Storefront:`.
 
+## Optimistic UI (`predict`, `on_confirm:`, `rollback:`)
+
+Any client `await` on a server RPC can attach a `predict` clause so the UI updates at 0 ms latency
+and automatically reconciles or rolls back when the server replies:
+
+```lean
+action orderOne(idx: Nat) when user.isSome:
+  let updated = await Catalog.order(idx, 1)
+    predict:
+      if let .ok(arr) = books:
+        if idx < arr.size:
+          let b = arr[idx]
+          if 1 <= b.stock:
+            return Book(id=b.id, slot=b.slot, title=b.title, stock=b.stock - 1)
+    on_confirm:
+      statusMsg = f"Confirmed order for {updated.title}"
+    catch:
+      case .outOfStock:  statusMsg = "Order failed: out of stock"
+      case .notFound:    statusMsg = "Order failed: book not found"
+      case .failed(err): statusMsg = f"Order failed: {err}"
+  books = books.map(arr => arr.set(idx, updated) if idx < arr.size else arr)
+  statusMsg = f"Ordered {updated.title}"
+```
+
+- **Inline or conditional prediction:** Use `predict <expr>` for an always-on prediction, or
+  `predict: <suite>` (returning via `return <expr>`) to fall back to a regular blocking `await`
+  when a branch doesn't return. Resource fields also support the shorthand
+  `items = await Store.add(item) predict nextItems`.
+- **Event-sourced transactional rollback:** Speculative updates run inside a verified speculative
+  journal (`Qed.Speculative`). When the server responds:
+  - **Exact match (`SpecEq`):** the pending entry confirms in place with zero UI flicker, and
+    `on_confirm:` runs once.
+  - **Mismatch (default):** the speculative continuation is rolled back, re-applied with the
+    server's `actual` value, `on_confirm:` runs, and any concurrent local edits (such as typing in
+    an `<input>`) are replayed cleanly on top without losing user input.
+  - **Custom `rollback:` / `rollback(actual):`:** overrides the default mismatch reconciliation by
+    dropping the speculative continuation and running the rollback block instead (skipping
+    `on_confirm:`).
+  - **Server error (`catch:`):** rolls back the speculative continuation, runs the matching `catch:`
+    arm, and replays subsequent concurrent local edits on top.
+- **Compile-time guarantees:**
+  - The speculative continuation must be pure state updates (no `perform`, `send`, nested `await`,
+    or `bind` writes—put side effects in `on_confirm:`).
+  - The predicted value is statically proved to satisfy the server method's `ensures` postconditions
+    (as well as any `schema` `Field` refinements).
+  - Declared component `invariant`s are automatically proved across the speculative continuation,
+    `on_confirm:`, `rollback:`, `catch:`, and journal replay (via `SpecEngine.step_preserves_inv`).
+
 ## Stateful sub-components: static hoisting vs. keyed `LocalDef`
 
 Qed supports three stateful composition modes:

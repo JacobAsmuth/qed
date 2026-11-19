@@ -1124,4 +1124,19 @@ def lookupSchemaForm? (cName : Name) : CoreM (Option SchemaFormInfo) := do
       if let some info := reg.find? (fullView.getPrefix ++ `Form) then return some info
   return none
 
+def resolveSchemaCtxArgs (ref : Lean.Syntax) (tag : String) (ctxBinders : Array Lean.Name)
+    (props : Array (Lean.Syntax × String × Lean.Term)) (checkUnknown := true) : Lean.MacroM (Array Lean.Term) := do
+  let mut ctxVals : Std.HashMap Lean.Name Lean.Term := {}
+  let mut ctxArg? : Option Lean.Term := none
+  for (attrRef, nm, v) in props do
+    if nm == "ctx" && ctxBinders.size == 1 then ctxArg? := some v
+    else if ctxBinders.contains (.mkSimple nm) then ctxVals := ctxVals.insert (.mkSimple nm) v
+    else if checkUnknown then
+      let valid := ["bind", "onSubmit", "key", "reset"] ++ ctxBinders.toList.map toString ++
+        (if ctxBinders.size == 1 then ["ctx"] else [])
+      Lean.Macro.throwErrorAt attrRef s!"<{tag}>: unknown attribute `{nm}` (valid attributes: {String.intercalate ", " valid})"
+  ctxBinders.mapM fun b => do
+    if let some v := ctxVals[b]? <|> ctxArg? then pure v
+    else Lean.Macro.throwErrorAt ref s!"<{tag}> requires context attribute `{b}=\{…}`{if ctxBinders.size == 1 then " (or `ctx={…}`)" else ""}"
+
 end Qed

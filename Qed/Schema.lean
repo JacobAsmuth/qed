@@ -1,4 +1,6 @@
 import Qed.Notation
+import Qed.Lang
+import Qed.Field
 import Qed.Json
 import Qed.Proto
 import Qed.Date
@@ -6,52 +8,6 @@ import Qed.Runtime.Verify
 import Lean
 
 namespace Qed
-
-structure Field {α : Type} (p : α → Prop) where
-  val : α
-  ok  : p val
-
-@[reducible, inline] instance {α : Type} {p : α → Prop} : Qed.Lang.QedVal (Field p) α := ⟨Field.val⟩
-@[simp] theorem QedVal.val_field {α : Type} {p : α → Prop} (f : Field p) :
-    Qed.Lang.QedVal.val f = f.val := rfl
-
-@[reducible] instance {msg : Type} : Coe Date (Html msg) := ⟨fun d => .text (toString d)⟩
-@[reducible] instance {α : Type} {p : α → Prop} : CoeOut (Field p) α := ⟨Field.val⟩
-@[reducible] instance {α msg : Type} {p : α → Prop} [Coe α (Html msg)] : CoeHTCT (Field p) (Html msg) := ⟨fun f => (f.val : Html msg)⟩
-@[reducible] instance {α : Type} {p : α → Prop} : CoeHTCT (Option (Field p)) (Option α) := ⟨Option.map Field.val⟩
-instance {α : Type} {p : α → Prop} [ToString α] : ToString (Field p) := ⟨fun f => toString f.val⟩
-instance {α : Type} {p : α → Prop} [BEq α] : BEq (Field p) := ⟨fun a b => a.val == b.val⟩
-instance {α : Type} {p : α → Prop} [DecidableEq α] : DecidableEq (Field p) :=
-  fun ⟨a, _⟩ ⟨b, _⟩ => if h : a = b then isTrue (by cases h; rfl) else isFalse (by intro heq; injection heq; exact h ‹_›)
-
-instance {α : Type} {p : α → Prop} [ToJson α] : ToJson (Field p) := ⟨fun f => toJson f.val⟩
-instance {α : Type} {p : α → Prop} [DecidablePred p] [FromJson α] : FromJson (Field p) :=
-  ⟨fun j => do let a ← (fromJson j : Except String α); if h : p a then .ok ⟨a, h⟩ else .error "failed field refinement"⟩
-instance {α : Type} {p : α → Prop} [DecidablePred p] [LawfulJson α] : LawfulJson (Field p) where
-  depthBound := LawfulJson.depthBound α
-  depth_toJson f := LawfulJson.depth_toJson f.val
-  fromJson_toJson f := by
-    rcases f with ⟨val, hok⟩
-    change (fromJson (toJson val) : Except String α).bind
-      (fun a => if h : p a then Except.ok (Field.mk a h) else Except.error _) = Except.ok (Field.mk val hok)
-    rw [LawfulJson.fromJson_toJson val]; dsimp only [bind, Except.bind]; rw [dif_pos hok]
-instance {α : Type} {p : α → Prop} [ToJson α] [NonNullJson α] : NonNullJson (Field p) :=
-  ⟨fun f => NonNullJson.toJson_ne_null f.val⟩
-
-instance {α : Type} {p : α → Prop} [ToProto α] : ToProto (Field p) where
-  toProtoVal f := ToProto.toProtoVal f.val
-
-instance {α : Type} {p : α → Prop} [DecidablePred p] [FromProto α] : FromProto (Field p) where
-  fromProtoVal w := do
-    let a ← FromProto.fromProtoVal (α := α) w
-    if h : p a then .ok ⟨a, h⟩ else .error "protobuf: failed field refinement"
-
-instance {α : Type} {p : α → Prop} [DecidablePred p] [LawfulProto α] : LawfulProto (Field p) :=
-  .ofScalar fun ⟨val, hok⟩ => by
-    dsimp only [ToProto.toProtoVal, FromProto.fromProtoVal, bind, Except.bind]
-    rw [LawfulProto.fromProtoVal_toProtoVal val]
-    dsimp only
-    rw [dif_pos hok]
 
 structure Codec (α : Type) where
   parse        : String → Option α
@@ -238,13 +194,13 @@ open Lean in
 private def lowerSchemaFieldSpec (stx : Syntax) : MacroM Term := do
   let k := stx.getKind
   if k == `Qed.schemaFieldJsonOnly then
-    let (innerTy, _) ← Qed.Lang.lowerQedType stx[2] false
+    let (innerTy, _) ← Qed.Lang.lowerQedType (stx.getArg 2) false
     `(jsonOnly $innerTy)
   else if k == `Qed.schemaFieldCall then
-    let callee : Term := ⟨stx[0]⟩
-    let args := stx[2].getSepArgs
+    let callee : Term := ⟨(stx.getArg 0)⟩
+    let args := (stx.getArg 2).getSepArgs
     args.foldlM (init := callee) fun acc a => do
-      let aT ← Qed.Lang.lowerSimpleQedExpr .val a[0]
+      let aT ← Qed.Lang.lowerSimpleQedExpr .val (a.getArg 0)
       `($acc $aT)
   else
     return (← Qed.Lang.lowerQedType stx false).1
@@ -282,7 +238,7 @@ private partial def resolveCodecBase (fieldName : Name) (rawSpec : Term) : TermE
 open Lean Elab Term Meta in
 private partial def elabSchemaFieldsAux (cbns : Array Ident) (cbts : Array Term)
     (fs : Array Ident) (rawSpecs : Array Term) (whereClauses : Array (Array Term)) (i : Nat) :
-    TermElabM (Array (Term × Bool × Bool × Bool × Bool)) := do
+    TermElabM (Array (Term × Bool × Bool × Bool × Bool × Bool)) := do
   if i < cbns.size then
     let bt ← elabType cbts[i]!
     withLocalDeclD cbns[i]!.getId bt fun _ =>
@@ -310,16 +266,22 @@ private partial def elabSchemaFieldsAux (cbns : Array Ident) (cbts : Array Term)
           let hasToP ← pure ((← trySynthInstance (mkApp (mkConst ``Qed.ToProtoField) α)) matches .some _)
           let hasFromP ← pure ((← trySynthInstance (mkApp (mkConst ``Qed.FromProtoField) α)) matches .some _)
           let isLawP ← pure ((← trySynthInstance (mkApp (mkConst ``Qed.LawfulProtoField) α)) matches .some _)
-          pure (inp, isRef, isLaw, hasToP && hasFromP, isLawP)
+          let isLawBEq ←
+            match ← trySynthInstance (mkApp (mkConst ``BEq [Level.zero]) α) with
+            | .some beqInst =>
+                pure ((← trySynthInstance (mkApp2 (mkConst ``LawfulBEq [Level.zero]) α beqInst)) matches .some _)
+            | _ => pure false
+          pure (inp, isRef, isLaw, hasToP && hasFromP, isLawP, isLawBEq)
       | _ =>
           throwErrorAt rawSpec m!"failed to resolve schema field `{f.getId}` to a `Codec`"
 
 open Lean Elab Command in
 private def resolveSchemaFields (cbns : Array Ident) (cbts : Array Term)
     (fs : Array Ident) (rawSpecs : Array Term) (whereClauses : Array (Array Term)) :
-    CommandElabM (Array Term × Array Bool × Bool × Bool × Bool) := do
+    CommandElabM (Array Term × Array Bool × Bool × Bool × Bool × Bool) := do
   let res ← liftTermElabM (elabSchemaFieldsAux cbns cbts fs rawSpecs whereClauses 0)
-  return (res.map (·.1), res.map (·.2.1), res.all (·.2.2.1), res.all (·.2.2.2.1), res.all (·.2.2.2.2))
+  return (res.map (·.1), res.map (·.2.1), res.all (·.2.2.1), res.all (·.2.2.2.1),
+    res.all (·.2.2.2.2.1), res.all (·.2.2.2.2.2))
 
 open Lean Elab Command Term Meta in
 private def elabPredProbe (cbns : Array Ident) (cbts : Array Term) (inp : Term) (i : Nat) :
@@ -499,8 +461,8 @@ private def mkDraftCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
 
 open Lean Elab Command Term in
 private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
-    (tApp parseApp canApp viewApp : TSyntax `term) (draftId : Ident)
-    (fs : Array Ident) (inputs : Array Term) (refined : Array Bool) :
+    (tApp beqApp parseApp canApp viewApp : TSyntax `term) (draftId : Ident)
+    (fs : Array Ident) (inputs : Array Term) (refined : Array Bool) (allLawfulBEq : Bool) :
     CommandElabM (Array (TSyntax `command)) := do
   let tId         := t.getId
   let parseId     := mkIdent (tId ++ `parse)
@@ -508,6 +470,7 @@ private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
   let iffId       := mkIdent (tId ++ `canSubmit_iff)
   let viewId      := mkIdent (tId ++ `formView)
   let formValidId := mkIdent (tId ++ `formView_validIn)
+  let beqFnId     := mkIdent (tId ++ `beq)
   let pairs := fs.zip inputs
   let structTys ← (pairs.zip refined).mapM fun ((_, inp), r) =>
     if r then `(Field ($inp).valid) else `(Codec.Val $inp)
@@ -532,9 +495,32 @@ private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
     | some _qedParsed => el "button" [onClick (submit _qedParsed)] "Submit"
     | none            => el "button" [disabled true] "Submit")
   let viewBody ← rowGroups.foldrM (init := ← `(term| [$submitBtn])) fun g acc => `(term| $g ++ $acc)
-  pure #[
+  let beqExpr ← match fs.toList with
+    | []      => `(true)
+    | f :: rest =>
+        rest.foldlM (init := ← `(a.$f:ident == b.$f:ident)) fun acc fi => `($acc && (a.$fi:ident == b.$fi:ident))
+  let lawfulBeqCmds : Array (TSyntax `command) ←
+    if allLawfulBEq then
+      pure #[← `(command|
+        instance $(mkIdent (tId ++ `instLawfulBEq)):ident $[($cbns:ident : $cbts:term)]* : LawfulBEq $tApp where
+          eq_of_beq {a b} h := by
+            cases a; cases b
+            change $beqApp _ _ = true at h
+            dsimp only [$beqFnId:ident] at h
+            simp only [Bool.and_eq_true, beq_iff_eq] at h
+            simp_all
+          rfl {a} := by
+            cases a
+            change $beqApp _ _ = true
+            dsimp only [$beqFnId:ident]
+            simp only [beq_self_eq_true, Bool.and_self])]
+    else pure #[]
+  pure (#[
     ← `(command| structure $t $[($cbns:ident : $cbts:term)]* where
           $[$fs:ident : $structTys]*),
+    ← `(command| def $beqFnId $[($cbns:ident : $cbts:term)]* (a b : $tApp) : Bool := $beqExpr),
+    ← `(command| instance $(mkIdent (tId ++ `instBEq)):ident $[($cbns:ident : $cbts:term)]* : BEq $tApp :=
+          ⟨$beqApp⟩)] ++ lawfulBeqCmds ++ #[
     ← `(command| def $parseId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Option $tApp := do
           $[let $fs:ident ← $runCalls:term]*
           return { $[$fs:ident],* }),
@@ -559,7 +545,7 @@ private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
               Codec.formFieldRow_validListIn, Codec.render_valid_simp, validTextIn_normal,
               Qed.reduceStepHtmlCtx, Qed.reduceIsVoidTag, Qed.reduceIsSafeAttrName, Qed.reduceIsUrlAttrName,
               Bool.true_and, Bool.and_true, Bool.true_or, Bool.or_true, Bool.false_or, Bool.or_false, Bool.not_false,
-              List.isEmpty_cons, List.isEmpty_nil]) ]
+              List.isEmpty_cons, List.isEmpty_nil]) ])
 
 open Lean Elab Command Term in
 private def mkSchemaJsonCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
@@ -615,43 +601,29 @@ private def mkSchemaJsonCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
     ← `(command| instance $(mkIdent (tId ++ `instNonNullJson)):ident : NonNullJson $t := ⟨fun _ => nofun⟩) ] ++ lawfulCmds
   return jsonFnCmds ++ jsonInstCmds
 
-def resolveSchemaCtxArgs (ref : Lean.Syntax) (tag : String) (ctxBinders : Array Lean.Name)
-    (props : Array (Lean.Syntax × String × Lean.Term)) (checkUnknown := true) : Lean.MacroM (Array Lean.Term) := do
-  let mut ctxVals : Std.HashMap Lean.Name Lean.Term := {}
-  let mut ctxArg? : Option Lean.Term := none
-  for (attrRef, nm, v) in props do
-    if nm == "ctx" && ctxBinders.size == 1 then ctxArg? := some v
-    else if ctxBinders.contains (.mkSimple nm) then ctxVals := ctxVals.insert (.mkSimple nm) v
-    else if checkUnknown then
-      let valid := ["bind", "onSubmit", "key", "reset"] ++ ctxBinders.toList.map toString ++
-        (if ctxBinders.size == 1 then ["ctx"] else [])
-      Lean.Macro.throwErrorAt attrRef s!"<{tag}>: unknown attribute `{nm}` (valid attributes: {String.intercalate ", " valid})"
-  ctxBinders.mapM fun b => do
-    if let some v := ctxVals[b]? <|> ctxArg? then pure v
-    else Lean.Macro.throwErrorAt ref s!"<{tag}> requires context attribute `{b}=\{…}`{if ctxBinders.size == 1 then " (or `ctx={…}`)" else ""}"
-
 open Lean Elab Command Term in
 @[command_elab schemaCmd] def elabSchemaCmd : CommandElab
   | stx => do
-      let t : Ident := ⟨stx[1]⟩
-      let rawCtx := if stx[2].getNumArgs == 3 then stx[2][1].getSepArgs else #[]
-      let cbns : Array Ident := rawCtx.map (⟨·[0]⟩)
-      let cbts ← rawCtx.mapM fun cp => liftMacroM (return (← Qed.Lang.lowerQedType cp[2] false).1)
-      let fStxs := stx[4].getArgs
+      let t : Ident := ⟨(stx.getArg 1)⟩
+      let rawCtx := if (stx.getArg 2).getNumArgs == 3 then ((stx.getArg 2).getArg 1).getSepArgs else #[]
+      let cbns : Array Ident := rawCtx.map (⟨·.getArg 0⟩)
+      let cbts ← rawCtx.mapM fun cp => liftMacroM (return (← Qed.Lang.lowerQedType (cp.getArg 2) false).1)
+      let fStxs := (stx.getArg 4).getArgs
       let fs : Array Ident := fStxs.map (⟨·[0]⟩)
-      let rawSpecs ← fStxs.mapM fun f => liftMacroM (lowerSchemaFieldSpec f[2])
+      let rawSpecs ← fStxs.mapM fun f => liftMacroM (lowerSchemaFieldSpec (f.getArg 2))
       let whereClauses : Array (Array Term) ← fStxs.mapM fun f => do
-        if f[3].getNumArgs == 2 then
-          f[3][1].getSepArgs.mapM fun w => liftMacroM (Qed.Lang.lowerSimpleQedExpr .propInv w)
+        if (f.getArg 3).getNumArgs == 2 then
+          ((f.getArg 3).getArg 1).getSepArgs.mapM fun w => liftMacroM (Qed.Lang.lowerSimpleQedExpr .propInv w)
         else pure #[]
       let tId        := t.getId
       let draftId    := mkIdent (tId ++ `Draft)
+      let beqFnId    := mkIdent (tId ++ `beq)
       let parseId    := mkIdent (tId ++ `parse)
       let canId      := mkIdent (tId ++ `canSubmit)
       let viewId     := mkIdent (tId ++ `formView)
       let toJsonId   := mkIdent (tId ++ `toJson)
       let fromJsonId := mkIdent (tId ++ `fromJson)
-      let (inputs, refined, allLawful, allProto, allLawfulProto) ←
+      let (inputs, refined, allLawful, allProto, allLawfulProto, allLawfulBEq) ←
         resolveSchemaFields cbns cbts fs rawSpecs whereClauses
       let pairs := fs.zip inputs
       checkSchemaFieldsDecidable cbns cbts pairs
@@ -659,6 +631,7 @@ open Lean Elab Command Term in
       let appTo : TSyntax `term → CommandElabM (TSyntax `term) := fun head =>
         cbnsT.foldlM (init := head) fun acc c => `($acc $c)
       let tApp        ← appTo ⟨t.raw⟩
+      let beqApp      ← appTo ⟨beqFnId.raw⟩
       let parseApp    ← appTo ⟨parseId.raw⟩
       let canApp      ← appTo ⟨canId.raw⟩
       let viewApp     ← appTo ⟨viewId.raw⟩
@@ -667,7 +640,7 @@ open Lean Elab Command Term in
       let jsonReads ← (pairs.zip refined).mapM fun ((f, _), r) =>
         if r then `((x.$f:ident).val) else `(x.$f:ident)
       let draftCmds ← mkDraftCmds tId draftId fs
-      let coreCmds ← mkSchemaCoreCmds t cbns cbts tApp parseApp canApp viewApp draftId fs inputs refined
+      let coreCmds ← mkSchemaCoreCmds t cbns cbts tApp beqApp parseApp canApp viewApp draftId fs inputs refined allLawfulBEq
       let jsonCmds ← mkSchemaJsonCmds t cbns cbts tApp toJsonApp fromJsonApp fs inputs refined jsonReads allLawful
       let draftProtoCmds ← mkDraftProtoCmds tId draftId fs
       let protoCmds ← mkSchemaProtoCmds t cbns cbts tApp appTo fs inputs refined jsonReads allProto allLawfulProto

@@ -1,15 +1,9 @@
+import Qed.Resource.Basic
 import Qed.Runtime
 import Qed.Proto
-import Lean
+import Qed.Server.Registry
 
 namespace Qed
-
-inductive Resource (α : Type) where
-  | idle
-  | loading
-  | ok (val : α)
-  | failed (err : String)
-deriving Inhabited, Repr
 
 namespace Resource
 
@@ -72,11 +66,6 @@ instance {α : Type} {P : α → Prop} [DecidablePred P] : DecidablePred (Resour
   cases r <;> rfl
 
 end Resource
-
-structure Cached (α : Type) where
-  state : Resource α := .idle
-  seen  : List (String × α) := []
-deriving Inhabited
 
 namespace Cached
 
@@ -289,129 +278,12 @@ instance [LawfulProto α] : LawfulProto (Resource α) :=
 
 /-! ## Proof-Carrying RPC Responses (`Ensured`) & Typed Domain Outcomes -/
 
-/-- Value paired with an erased proof of a server `ensures` postcondition `p val`.
-    Encodes identically on the Protobuf wire to `α` (`Proto.encode e = Proto.encode e.val`),
-    while `FromProto` re-verifies `p` on untrusted bytes so `LawfulProto` holds zero-trust. -/
-structure Ensured (α : Type) (p : α → Prop) where
-  val : α
-  ok  : p val
-
-@[reducible, inline] instance {α : Type} {p : α → Prop} : Qed.Lang.QedVal (Ensured α p) α := ⟨Ensured.val⟩
-@[simp] theorem QedVal.val_ensured {α : Type} {p : α → Prop} (e : Ensured α p) :
-    Qed.Lang.QedVal.val e = e.val := rfl
-
-@[reducible] instance {α : Type} {p : α → Prop} : CoeOut (Ensured α p) α := ⟨Ensured.val⟩
-@[reducible] instance {α msg : Type} {p : α → Prop} [Coe α (Html msg)] : CoeHTCT (Ensured α p) (Html msg) :=
-  ⟨fun e => (e.val : Html msg)⟩
-@[reducible] instance {α : Type} {p : α → Prop} : CoeHTCT (Option (Ensured α p)) (Option α) :=
-  ⟨Option.map Ensured.val⟩
-instance {α : Type} {p : α → Prop} [ToString α] : ToString (Ensured α p) := ⟨fun e => toString e.val⟩
-instance {α : Type} {p : α → Prop} [BEq α] : BEq (Ensured α p) := ⟨fun a b => a.val == b.val⟩
-instance {α : Type} {p : α → Prop} [Repr α] : Repr (Ensured α p) := ⟨fun e n => reprPrec e.val n⟩
-instance {α : Type} {p : α → Prop} [DecidableEq α] : DecidableEq (Ensured α p) :=
-  fun ⟨a, _⟩ ⟨b, _⟩ => if h : a = b then isTrue (by cases h; rfl) else isFalse (by intro heq; injection heq; exact h ‹_›)
-
-instance {α : Type} {p : α → Prop} [ToJson α] : ToJson (Ensured α p) := ⟨fun e => toJson e.val⟩
-instance {α : Type} {p : α → Prop} [DecidablePred p] [FromJson α] : FromJson (Ensured α p) :=
-  ⟨fun j => do let a ← (fromJson j : Except String α); if h : p a then .ok ⟨a, h⟩ else .error "failed RPC ensures postcondition"⟩
-instance {α : Type} {p : α → Prop} [DecidablePred p] [LawfulJson α] : LawfulJson (Ensured α p) where
-  depthBound := LawfulJson.depthBound α
-  depth_toJson e := LawfulJson.depth_toJson e.val
-  fromJson_toJson e := by
-    rcases e with ⟨val, hok⟩
-    change (fromJson (toJson val) : Except String α).bind
-      (fun a => if h : p a then Except.ok (Ensured.mk a h) else Except.error _) = Except.ok (Ensured.mk val hok)
-    rw [LawfulJson.fromJson_toJson val]; dsimp only [bind, Except.bind]; rw [dif_pos hok]
-instance {α : Type} {p : α → Prop} [ToJson α] [NonNullJson α] : NonNullJson (Ensured α p) :=
-  ⟨fun e => NonNullJson.toJson_ne_null e.val⟩
-
-instance {α : Type} {p : α → Prop} [ToProto α] : ToProto (Ensured α p) where
-  toProtoVal e := ToProto.toProtoVal e.val
-  toProtoMsg e := ToProto.toProtoMsg e.val
-
-instance {α : Type} {p : α → Prop} [DecidablePred p] [FromProto α] : FromProto (Ensured α p) where
-  fromProtoVal w := do
-    let a ← FromProto.fromProtoVal (α := α) w
-    if h : p a then .ok ⟨a, h⟩ else .error "protobuf: failed RPC ensures postcondition"
-  fromProtoMsg fs := do
-    let a ← FromProto.fromProtoMsg (α := α) fs
-    if h : p a then .ok ⟨a, h⟩ else .error "protobuf: failed RPC ensures postcondition"
-
-instance {α : Type} {p : α → Prop} [DecidablePred p] [LawfulProto α] : LawfulProto (Ensured α p) where
-  msg_tags_pos e := LawfulProto.msg_tags_pos e.val
-  fromProtoVal_toProtoVal := fun ⟨val, hok⟩ => by
-    dsimp only [ToProto.toProtoVal, FromProto.fromProtoVal, bind, Except.bind]
-    rw [LawfulProto.fromProtoVal_toProtoVal val]
-    dsimp only
-    rw [dif_pos hok]
-  fromProtoMsg_toProtoMsg := fun ⟨val, hok⟩ => by
-    dsimp only [ToProto.toProtoMsg, FromProto.fromProtoMsg, bind, Except.bind]
-    rw [LawfulProto.fromProtoMsg_toProtoMsg val]
-    dsimp only
-    rw [dif_pos hok]
-
 def Resource.stripEnsured {α : Type} {p : α → Prop} (r : Resource (Ensured α p)) : Resource α :=
   r.map (·.val)
 
 theorem Resource.all_stripEnsured_of_imp {α : Type} {P Q : α → Prop}
     {r : Resource (Ensured α P)} (h : ∀ a, P a → Q a) : (Resource.stripEnsured r).all Q := by
   cases r with | ok e => exact h e.val e.ok | _ => trivial
-
-@[simp] theorem Proto.encode_ensured {α : Type} {p : α → Prop} [ToProto α] (e : Ensured α p) :
-    Proto.encode e = Proto.encode e.val := rfl
-
-/-- Typed application-level RPC failure transmitted cleanly inside binary Protobuf responses. -/
-structure RpcDomainError (ε : Type) where
-  tag     : ε
-  message : String
-deriving Inhabited, DecidableEq, Repr
-
-instance {ε : Type} [ToJson ε] : ToJson (RpcDomainError ε) where
-  toJson e := toJson (e.tag, e.message)
-
-instance {ε : Type} [FromJson ε] : FromJson (RpcDomainError ε) where
-  fromJson j := (FromJson.fromJson (α := ε × String) j).map fun p => RpcDomainError.mk p.1 p.2
-
-instance {ε : Type} [LawfulJson ε] : LawfulJson (RpcDomainError ε) where
-  depthBound := LawfulJson.depthBound (ε × String)
-  depth_toJson e := LawfulJson.depth_toJson (e.tag, e.message)
-  fromJson_toJson e := by
-    rcases e with ⟨t, m⟩
-    change (FromJson.fromJson (toJson (t, m)) : Except String (ε × String)).map
-      (fun p => RpcDomainError.mk p.1 p.2) = .ok (RpcDomainError.mk t m)
-    rw [LawfulJson.fromJson_toJson (t, m)]
-    rfl
-
-instance {ε : Type} [ToJson ε] : NonNullJson (RpcDomainError ε) := ⟨nofun⟩
-
-instance {ε : Type} [ToProto ε]   : ToProto (RpcDomainError ε)   := .ofEquiv fun e => (e.tag, e.message)
-instance {ε : Type} [FromProto ε] : FromProto (RpcDomainError ε) := .ofEquiv fun p : ε × String => RpcDomainError.mk p.1 p.2
-instance {ε : Type} [LawfulProto ε] : LawfulProto (RpcDomainError ε) :=
-  .ofEquiv (fun e => (e.tag, e.message)) (fun p => RpcDomainError.mk p.1 p.2) (fun ⟨_, _⟩ => rfl)
-
-/-- Outcome of an RPC declared with typed `fail(.tag)` domain errors. -/
-inductive RpcOutcome (ε : Type) (α : Type) where
-  | ok     (val : α)
-  | err    (tag : ε) (message : String)
-  | failed (message : String)
-deriving Inhabited, DecidableEq, Repr
-
-/-- Outcome of an RPC without typed domain error tags. -/
-inductive RpcSimpleOutcome (α : Type) where
-  | ok     (val : α)
-  | failed (message : String)
-deriving Inhabited, DecidableEq, Repr
-
-/-- Overloaded callback adapter allowing generated `server` RPC client functions to accept
-    `Resource α → msg`, `RpcOutcome ε α → msg`, `RpcSimpleOutcome α → msg`, or `Except String α → msg`. -/
-class RpcCallback (α : Type) (msg : outParam Type) (cb : Type) where
-  adapt : cb → Except String α → msg
-
-instance {α msg : Type} : RpcCallback α msg (Resource α → msg) :=
-  ⟨fun f => fun | .ok a => f (.ok a) | .error e => f (.failed e)⟩
-
-instance (priority := low) {α msg : Type} : RpcCallback (Option α) msg (Resource α → msg) :=
-  ⟨fun f => fun | .ok (some a) => f (.ok a) | .ok none => f (.failed "Not found") | .error e => f (.failed e)⟩
 
 instance (priority := low) {α : Type} {p : α → Prop} {msg : Type} :
     RpcCallback (Ensured α p) msg (Resource α → msg) :=
@@ -424,92 +296,6 @@ instance (priority := low) {α : Type} {p : α → Prop} {msg : Type} :
 instance (priority := low) {α : Type} {p : α → Prop} {msg : Type} :
     RpcCallback (Option (Ensured α p)) msg (Resource (Option α) → msg) :=
   ⟨fun f => fun | .ok opt => f (.ok (opt.map Ensured.val)) | .error s => f (.failed s)⟩
-
-instance {ε α msg : Type} :
-    RpcCallback (Except (RpcDomainError ε) α) msg (RpcOutcome ε α → msg) :=
-  ⟨fun f => fun
-    | .ok (.ok a)    => f (.ok a)
-    | .ok (.error d) => f (.err d.tag d.message)
-    | .error s       => f (.failed s)⟩
-
-instance {α msg : Type} : RpcCallback α msg (RpcSimpleOutcome α → msg) :=
-  ⟨fun f => fun | .ok a => f (.ok a) | .error s => f (.failed s)⟩
-
-instance (priority := low) {ε α β msg : Type} [RpcCallback α msg (Resource β → msg)] :
-    RpcCallback (Except (RpcDomainError ε) α) msg (Resource β → msg) :=
-  ⟨fun f => fun
-    | .ok (.ok a)    => RpcCallback.adapt (α := α) f (.ok a)
-    | .ok (.error d) => f (.failed d.message)
-    | .error s       => f (.failed s)⟩
-
-instance {α msg : Type} : RpcCallback α msg (Except String α → msg) := ⟨id⟩
-
-/-! ## Persistent Server RPC Metadata Registry (`serverRegistry`) -/
-
-structure ServerMethodInfo where
-  name            : String
-  paramNames      : Array Lean.Name := #[]
-  paramCount      : Nat
-  isReadOnly      : Bool
-  isAsync         : Bool
-  isFallible      : Bool
-  isOption        : Bool
-  hasClientReq    : Bool := false
-  requiresAuth    : Bool := false
-  clientReqConst  : Option Lean.Name := none
-  clientReqLabel  : String := ""
-  hasEnsures      : Bool := false
-  ensPredConst    : Option Lean.Name := none
-  domainErrTags   : Array String := #[]
-  errTypeConst    : Option Lean.Name := none
-  rawRpcConst     : Lean.Name := .anonymous
-  outcomeConst    : Lean.Name := .anonymous
-  paramTypeConsts : Array Lean.Name := #[]
-deriving Inhabited, Repr
-
-structure ServerInfo where
-  serverName       : Lean.Name
-  shortName        : String
-  hasState         : Bool
-  secrets          : Array String
-  envVars          : Array (String × String × Option String)
-  externalServices : Array (String × String)
-  methods          : Array ServerMethodInfo
-  channels         : Array String := #[]
-deriving Inhabited
-
-initialize serverRegistry :
-    Lean.SimplePersistentEnvExtension ServerInfo (Lean.NameMap ServerInfo) ←
-  Lean.registerSimplePersistentEnvExtension {
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.serverName info) acc) {}
-    addEntryFn := fun m info => m.insert info.serverName info
-  }
-
-/-- Resolves a `Server.fn` reference from a component (`Catalog.order`, `CloudBooks.Catalog.order`,
-    or an `open Catalog` method name) against `serverRegistry`. -/
-def lookupServerMethod? (env : Lean.Environment) (currNs : Lean.Name)
-    (openDecls : List Lean.OpenDecl) (callName : Lean.Name) :
-    Option (ServerInfo × ServerMethodInfo) :=
-  let reg := serverRegistry.getState env
-  let resolved := Lean.ResolveName.resolveGlobalName env {} currNs openDecls callName
-  let byResolved := resolved.findSome? fun (fullConst, _) =>
-    reg.toList.findSome? fun (_, srvInfo) =>
-      srvInfo.methods.findSome? fun mInfo =>
-        let pubConst := srvInfo.serverName ++ Lean.Name.mkSimple mInfo.name
-        if fullConst == pubConst || fullConst == mInfo.rawRpcConst then some (srvInfo, mInfo)
-        else none
-  byResolved.orElse fun _ =>
-    match callName with
-    | .str srvPart mStr =>
-        let srvClean := srvPart.eraseMacroScopes
-        let cand1 := currNs ++ srvClean
-        let srv? := (reg.find? cand1).orElse (fun _ => reg.find? srvClean)
-          |>.orElse (fun _ => reg.toList.findSome? fun (_, info) =>
-            if info.shortName == srvClean.toString then some info else none)
-        srv?.bind fun srvInfo =>
-          (srvInfo.methods.find? (·.name == mStr)).map (srvInfo, ·)
-    | _ => none
 
 class ToResource (ρ : Type) (α : outParam Type) where
   toResource : ρ → Resource α

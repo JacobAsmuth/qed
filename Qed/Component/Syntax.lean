@@ -217,8 +217,8 @@ def unpackSeq (seqStx : Syntax) : Array Syntax :=
 partial def hasPerformNode (stx : Syntax) : Bool :=
   let k := stx.getKind
   k == ``qedStmtPerform ||
-  (k == ``qedStmtLet && (unwrapParens1 stx[4]).getKind == ``qedAwait) ||
-  (k == ``qedStmtAssign && (unwrapParens1 stx[2]).getKind == ``qedAwait) ||
+  (k == ``qedStmtLet && (unwrapParens1 (stx.getArg 4)).getKind == ``qedAwait) ||
+  (k == ``qedStmtAssign && (unwrapParens1 (stx.getArg 2)).getKind == ``qedAwait) ||
   stx.getArgs.any hasPerformNode
 
 partial def hasReturnStmt (stx : Syntax) : Bool :=
@@ -227,9 +227,9 @@ partial def hasReturnStmt (stx : Syntax) : Bool :=
 
 def staticRootTag? (body : Syntax) : Option String :=
   if body.getKind == ``Qed.Jsx.qedExprJsx || body.getKind == ``Qed.Jsx.jsxTerm then
-    let el := body[0]
+    let el := (body.getArg 0)
     if el.getKind == ``Qed.Jsx.selfClosing || el.getKind == ``Qed.Jsx.withChildren then
-      let tag := atomStr el[1]
+      let tag := atomStr (el.getArg 1)
       if !tag.isEmpty && !tag.front.isUpper then some tag else none
     else none
   else none
@@ -246,8 +246,8 @@ def mkJsxAttrExpr (name : String) (val : Term) : Syntax :=
 def rebuildJsxEl (stx : Syntax) (attrs : Array Syntax) (kids? : Option Syntax) : Syntax :=
   let aNode := Syntax.node .none nullKind attrs
   match kids? with
-  | none    => Syntax.node .none stx.getKind #[stx[0], stx[1], aNode, stx[3]]
-  | some kn => Syntax.node .none stx.getKind #[stx[0], stx[1], aNode, stx[3], kn, stx[5], stx[6]]
+  | none    => Syntax.node .none stx.getKind #[(stx.getArg 0), (stx.getArg 1), aNode, (stx.getArg 3)]
+  | some kn => Syntax.node .none stx.getKind #[(stx.getArg 0), (stx.getArg 1), aNode, (stx.getArg 3), kn, (stx.getArg 5), (stx.getArg 6)]
 
 def mkOutMatchTerm (baseName : Name) (totalCtors : Nat) (arms : Array OutArm) (outVar : Ident) :
     MacroM Term := do

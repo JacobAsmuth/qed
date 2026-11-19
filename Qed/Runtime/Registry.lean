@@ -1,3 +1,4 @@
+import Qed.Style
 import Qed.Runtime.App
 import Lean
 

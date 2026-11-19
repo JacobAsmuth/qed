@@ -186,16 +186,16 @@ namespace ParsedSrvType
 def parse (stx : Lean.Syntax) : Lean.MacroM ParsedSrvType := do
   let k := stx.getKind
   if k == ``Qed.Lang.qedTypeProto then
-    let (baseId, initMods) ← Qed.Lang.splitIdentMods ⟨stx[2]⟩
+    let (baseId, initMods) ← Qed.Lang.splitIdentMods ⟨(stx.getArg 2)⟩
     return { ref := stx, baseIdent := baseId, isProto := true,
-             mods := initMods ++ (← stx[4].getArgs.mapM Qed.Lang.parseTypeModNode) }
+             mods := initMods ++ (← (stx.getArg 4).getArgs.mapM Qed.Lang.parseTypeModNode) }
   else if k == ``Qed.Lang.qedTypeAtom then
-    let (baseId, initMods) ← Qed.Lang.splitIdentMods ⟨stx[0]⟩
+    let (baseId, initMods) ← Qed.Lang.splitIdentMods ⟨(stx.getArg 0)⟩
     return { ref := stx, baseIdent := baseId, isProto := false,
-             mods := initMods ++ (← stx[1].getArgs.mapM Qed.Lang.parseTypeModNode) }
-  else if k == ``Qed.Lang.qedTypeApp && stx[0].getKind == ``Qed.Lang.qedTypeAtom && stx[0][1].getArgs.isEmpty then
-    let fnName := stx[0][0].getId.eraseMacroScopes
-    let argStr := let s := Qed.Lang.stxSnippet stx[1]; if s.isEmpty then "T" else s
+             mods := initMods ++ (← (stx.getArg 1).getArgs.mapM Qed.Lang.parseTypeModNode) }
+  else if k == ``Qed.Lang.qedTypeApp && (stx.getArg 0).getKind == ``Qed.Lang.qedTypeAtom && ((stx.getArg 0).getArg 1).getArgs.isEmpty then
+    let fnName := ((stx.getArg 0).getArg 0).getId.eraseMacroScopes
+    let argStr := let s := Qed.Lang.stxSnippet (stx.getArg 1); if s.isEmpty then "T" else s
     if fnName == `Array || fnName == `Option then
       Lean.Macro.throwErrorAt stx s!"use `{argStr}{if fnName == `Array then "[]" else "?"}` instead of `{fnName} {argStr}`"
     else
@@ -228,5 +228,11 @@ def toFullTerm (t : ParsedSrvType) : Lean.MacroM Lean.Term := do
   if t.hasFallible then `(Except Qed.Server.ApiError $payload) else return payload
 
 end ParsedSrvType
+
+syntax (name := srvAutoFieldStx) "srvAutoField(" term ")" : term
+syntax (name := srvAutoEmitStx)  "srvAutoEmit(" term ")" : term
+syntax (name := srvTypedAsStx)   "srvTypedAs(" term ", " term ")" : term
+syntax (name := srvGetElemStx)   "srvGetElem(" term ", " term ")" : term
+syntax (name := srvSetElemStx)   "srvSetElem(" term ", " term ", " term ")" : term
 
 end Qed.Server

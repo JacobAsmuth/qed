@@ -1,327 +1,17 @@
 import Lean
-import Qed.Schema
+import Qed.Field
 import Qed.Server.Core
 import Qed.Server.Syntax
+import Qed.Server.Registry
 
 namespace Qed.Server
 
-/-! ## Control-Flow Combinators & Auto-Lifting Helpers (`@[reducible]` for Zero-Cost Proofs & C Codegen) -/
-
-/-- Index conversion allowing both `Nat` and `Fin n` to index `Array`s uniformly across mutations. -/
-class SrvIdx (ι : Type) where
-  toNat : ι → Nat
-
-@[inline] instance : SrvIdx Nat := ⟨id⟩
-@[inline] instance {n : Nat} : SrvIdx (Fin n) := ⟨Fin.val⟩
-
-@[simp] theorem SrvIdx.toNat_nat (i : Nat) : SrvIdx.toNat i = i := rfl
-@[simp] theorem SrvIdx.toNat_fin {n : Nat} (i : Fin n) : SrvIdx.toNat i = i.val := rfl
-
-/-- Auto-lifts plain values `v : T` to `some v` in `T?` functions while keeping `Option T` un-nested. -/
-class SrvLiftOpt (α : Type) (Inner : Type) where
-  liftOpt : α → Option Inner
-
-@[inline] instance {Inner : Type} : SrvLiftOpt (Option Inner) Inner := ⟨id⟩
 @[inline] instance {Inner : Type} {p : Inner → Prop} : SrvLiftOpt (Qed.Field p) Inner := ⟨fun f => some f.val⟩
 @[inline] instance {Inner : Type} {p : Inner → Prop} : SrvLiftOpt (Option (Qed.Field p)) Inner := ⟨Option.map Qed.Field.val⟩
-@[inline] instance (priority := low) {Inner : Type} : SrvLiftOpt Inner Inner := ⟨Option.some⟩
-
-@[simp] theorem SrvLiftOpt.liftOpt_opt {Inner : Type} (x : Option Inner) :
-    SrvLiftOpt.liftOpt x = x := rfl
-@[simp] theorem SrvLiftOpt.liftOpt_val {Inner : Type} (x : Inner) :
-    SrvLiftOpt.liftOpt (Inner := Inner) x = some x := rfl
-
-/-- Overloaded `fail(...)` builder supporting `fail("msg")`, `fail(code, "msg")`, and `fail(.tag, "msg")`. -/
-def mkFail1 (msg : String) : ApiError := ApiError.badRequest msg
-def mkFail2 (code : Nat) (msg : String) : ApiError := { code, message := msg }
-def mkFailDom {ε : Type} (tag : ε) (msg : String) : SrvFailure ε := .domain tag msg
-
-/-- Uniform API-error lifting for `ApiError` and inferred `SrvFailure ε`. -/
-class SrvErr (E : Type) where
-  ofApi : ApiError → E
-
-@[reducible] instance : SrvErr ApiError := ⟨id⟩
-@[reducible] instance {ε : Type} : SrvErr (SrvFailure ε) := ⟨SrvFailure.api⟩
-
-/-- Unwraps `Except (SrvFailure ε)`, `Except ApiError`, `Except String`, or `Option` for `?` and `catch`. -/
-class SrvUnwrap (E : Type) (W : Type) (Val : outParam Type) where
-  unwrap : W → Except E Val
-
-@[reducible] instance {E α : Type} : SrvUnwrap E (Except E α) α where
-  unwrap := id
-
-@[reducible] instance {ε α : Type} : SrvUnwrap (SrvFailure ε) (Except ApiError α) α where
-  unwrap
-    | .ok a    => .ok a
-    | .error e => .error (.api e)
-
-@[reducible] instance {E α : Type} [SrvErr E] : SrvUnwrap E (Except String α) α where
-  unwrap
-    | .ok a    => .ok a
-    | .error e => .error (SrvErr.ofApi (ApiError.badRequest e))
-
-@[reducible] instance {E α : Type} [SrvErr E] : SrvUnwrap E (Option α) α where
-  unwrap
-    | some a => .ok a
-    | none   => .error (SrvErr.ofApi (ApiError.notFound "optional value was empty"))
-
-/-- Unwraps `Option α` or `Except ApiError α` inside `T?` functions (`none` exits cleanly as `.ok none`). -/
-class SrvUnwrapOpt (W : Type) (Inner : Type) (Val : outParam Type) where
-  unwrapOpt : W → Except (Except ApiError (Option Inner)) Val
-
-@[reducible] instance {Inner α : Type} : SrvUnwrapOpt (Option α) Inner α where
-  unwrapOpt
-    | some a => .ok a
-    | none   => .error (.ok none)
-
-@[reducible] instance {Inner α : Type} : SrvUnwrapOpt (Except ApiError α) Inner α where
-  unwrapOpt
-    | .ok a    => .ok a
-    | .error e => .error (.error e)
-
-/-- Pure statement sequencing with early `return` short-circuiting. -/
-@[inline]
-def srvSeq {σ ρ : Type} (first : σ × Option ρ) (next : σ → σ × Option ρ) : σ × Option ρ :=
-  match first with
-  | (s', none)   => next s'
-  | (s', some r) => (s', some r)
-
-@[simp] theorem srvSeq_none {σ ρ : Type} (s : σ) (next : σ → σ × Option ρ) :
-    srvSeq (s, none) next = next s := rfl
-
-@[simp] theorem srvSeq_some {σ ρ : Type} (s : σ) (r : ρ) (next : σ → σ × Option ρ) :
-    srvSeq (s, some r) next = (s, some r) := rfl
-
-/-- Transactional finalizer: commits `s'` on `.ok`, rolls back to entry state `s₀` on `.error`. -/
-@[inline]
-def srvFinish {E σ α : Type} [SrvErr E] (s₀ : σ) (res : σ × Option (Except E α)) : σ × Except E α :=
-  match res with
-  | (s', some (.ok v))    => (s', .ok v)
-  | (_,  some (.error e)) => (s₀, .error e)
-  | (_,  none)            => (s₀, .error (SrvErr.ofApi (ApiError.internal "unreachable missing return")))
-
-@[simp] theorem srvFinish_ok {E σ α : Type} [SrvErr E] (s₀ s' : σ) (v : α) :
-    srvFinish (E := E) s₀ (s', some (.ok v)) = (s', .ok v) := rfl
-
-@[simp] theorem srvFinish_err {E σ α : Type} [SrvErr E] (s₀ s' : σ) (e : E) :
-    srvFinish (E := E) (α := α) s₀ (s', some (.error e)) = (s₀, .error e) := rfl
-
-@[simp] theorem srvFinish_none {E σ α : Type} [SrvErr E] (s₀ s' : σ) :
-    srvFinish (E := E) s₀ (s', (none : Option (Except E α))) =
-      (s₀, .error (SrvErr.ofApi (ApiError.internal "unreachable missing return"))) := rfl
-
-/-- Transactional finalizer for `atomic` statement blocks: commits `s'` on `none`/`some (.ok v)`, rolls back to `s₀` on `some (.error e)`. -/
-@[inline]
-def srvAtomicCommit {E σ α : Type} (s₀ : σ) (res : σ × Option (Except E α)) :
-    σ × Option (Except E α) :=
-  match res with
-  | (s', none)                  => (s', none)
-  | (s', some (Except.ok v))    => (s', some (Except.ok v))
-  | (_,  some (Except.error e)) => (s₀, some (Except.error e))
-
-@[simp] theorem srvAtomicCommit_none {E σ α : Type} (s₀ s' : σ) :
-    srvAtomicCommit (E := E) (α := α) s₀ (s', none) = (s', none) := rfl
-
-@[simp] theorem srvAtomicCommit_ok {E σ α : Type} (s₀ s' : σ) (v : α) :
-    srvAtomicCommit (E := E) s₀ (s', some (Except.ok v)) = (s', some (Except.ok v)) := rfl
-
-@[simp] theorem srvAtomicCommit_err {E σ α : Type} (s₀ s' : σ) (e : E) :
-    srvAtomicCommit (E := E) (α := α) s₀ (s', some (Except.error e)) = (s₀, some (Except.error e)) := rfl
-
-/-! ## Transactional WebSocket Emit Combinators & No-Phantom-Broadcast Theorems -/
-
-/-- Pure statement sequencing carrying an outbound WebSocket emit buffer alongside state `σ`. -/
-@[inline]
-def srvEmitSeq {σ ρ : Type} (first : σ × List WsEmit × Option ρ)
-    (next : σ → List WsEmit → σ × List WsEmit × Option ρ) : σ × List WsEmit × Option ρ :=
-  match first with
-  | (s', es, none)   => next s' es
-  | (s', es, some r) => (s', es, some r)
-
-@[simp] theorem srvEmitSeq_none {σ ρ : Type} (s : σ) (es : List WsEmit)
-    (next : σ → List WsEmit → σ × List WsEmit × Option ρ) :
-    srvEmitSeq (s, es, none) next = next s es := rfl
-
-@[simp] theorem srvEmitSeq_some {σ ρ : Type} (s : σ) (es : List WsEmit) (r : ρ)
-    (next : σ → List WsEmit → σ × List WsEmit × Option ρ) :
-    srvEmitSeq (s, es, some r) next = (s, es, some r) := rfl
-
-/-- Transactional finalizer for emit-bearing pure server handlers:
-    commits `(s', es)` on `.ok`, and rolls back BOTH state (`s₀`) AND emits (`[]`) on `.error`. -/
-@[inline]
-def srvFinishEmit {E σ α : Type} [SrvErr E] (s₀ : σ)
-    (res : σ × List WsEmit × Option (Except E α)) : σ × (Except E α × List WsEmit) :=
-  match res with
-  | (s', es, some (.ok v))    => (s', .ok v, es)
-  | (_,  _,  some (.error e)) => (s₀, .error e, [])
-  | (_,  _,  none)            => (s₀, .error (SrvErr.ofApi (ApiError.internal "unreachable missing return")), [])
-
-@[simp] theorem srvFinishEmit_ok {E σ α : Type} [SrvErr E] (s₀ s' : σ) (es : List WsEmit) (v : α) :
-    srvFinishEmit (E := E) s₀ (s', es, some (.ok v)) = (s', .ok v, es) := rfl
-
-@[simp] theorem srvFinishEmit_err {E σ α : Type} [SrvErr E] (s₀ s' : σ) (es : List WsEmit) (e : E) :
-    srvFinishEmit (E := E) (α := α) s₀ (s', es, some (.error e)) = (s₀, .error e, []) := rfl
-
-@[simp] theorem srvFinishEmit_none {E σ α : Type} [SrvErr E] (s₀ s' : σ) (es : List WsEmit) :
-    srvFinishEmit (E := E) s₀ (s', es, (none : Option (Except E α))) =
-      (s₀, .error (SrvErr.ofApi (ApiError.internal "unreachable missing return")), []) := rfl
-
-/-- No-Phantom-Broadcast Theorem: any rolled-back transaction emits strictly zero WebSocket events. -/
-theorem srvFinishEmit_err_no_emits {E σ α : Type} [SrvErr E] (s₀ s' : σ) (es : List WsEmit) (e : E) :
-    (srvFinishEmit (E := E) (α := α) s₀ (s', es, some (.error e))).2.2 = [] := rfl
-
-/-- Transactional finalizer for emit-bearing `atomic:` blocks inside async handlers:
-    discards both state mutations and accumulated emits on `.error`. -/
-@[inline]
-def srvAtomicCommitEmit {E σ α : Type} (s₀ : σ)
-    (res : σ × List WsEmit × Option (Except E α)) : σ × (Option (Except E α) × List WsEmit) :=
-  match res with
-  | (s', es, none)                  => (s', none, es)
-  | (s', es, some (Except.ok v))    => (s', some (Except.ok v), es)
-  | (_,  _,  some (Except.error e)) => (s₀, some (Except.error e), [])
-
-@[simp] theorem srvAtomicCommitEmit_none {E σ α : Type} (s₀ s' : σ) (es : List WsEmit) :
-    srvAtomicCommitEmit (E := E) (α := α) s₀ (s', es, none) = (s', none, es) := rfl
-
-@[simp] theorem srvAtomicCommitEmit_ok {E σ α : Type} (s₀ s' : σ) (es : List WsEmit) (v : α) :
-    srvAtomicCommitEmit (E := E) s₀ (s', es, some (Except.ok v)) = (s', some (Except.ok v), es) := rfl
-
-@[simp] theorem srvAtomicCommitEmit_err {E σ α : Type} (s₀ s' : σ) (es : List WsEmit) (e : E) :
-    srvAtomicCommitEmit (E := E) (α := α) s₀ (s', es, some (Except.error e)) = (s₀, some (Except.error e), []) := rfl
-
-/-- No-Phantom-Broadcast Theorem for `atomic:` blocks inside async handlers. -/
-theorem srvAtomicCommitEmit_err_no_emits {E σ α : Type} (s₀ s' : σ) (es : List WsEmit) (e : E) :
-    (srvAtomicCommitEmit (E := E) (α := α) s₀ (s', es, some (Except.error e))).2.2 = [] := rfl
-
-/-- Effectful statement sequencing for `await`-containing handlers. -/
-@[inline, specialize]
-def srvSeqM {m : Type → Type} [Monad m] {ρ : Type}
-    (first : m (Option ρ)) (next : Unit → m (Option ρ)) : m (Option ρ) := do
-  match ← first with
-  | some r => return some r
-  | none   => next ()
-
-@[inline, specialize]
-def srvFinishM {E : Type} [SrvErr E] {m : Type → Type} [Monad m] {α : Type}
-    (res : m (Option (Except E α))) : m (Except E α) := do
-  match ← res with
-  | some r => return r
-  | none   => return .error (SrvErr.ofApi (ApiError.internal "unreachable missing return"))
-
-/-! ## Opaque Equality-Abstracted SSA Stepping (`srvLetEq`) -/
-
-/-- Continuation-passing equality binder keeping intermediate state updates opaque (`cdecl` + `hx : x = val`)
-    so bounds checks and invariant leaves never suffer `zetaDelta` term-size blowup. -/
-@[inline]
-def srvLetEq {α β : Type} (val : α) (k : (x : α) → x = val → β) : β :=
-  k val rfl
-
-theorem srvLetEq_elim {α β : Type} (P : β → Prop) (val : α) (k : (x : α) → x = val → β)
-    (hk : ∀ (x : α) (hx : x = val), P (k x hx)) : P (srvLetEq val k) :=
-  hk val rfl
-
-@[simp] theorem srvFinish_srvLetEq {E σ α γ : Type} [SrvErr E] (s₀ : σ) (val : γ)
-    (k : (x : γ) → x = val → σ × Option (Except E α)) :
-    srvFinish s₀ (srvLetEq val k) = srvLetEq val (fun x hx => srvFinish s₀ (k x hx)) := rfl
-
-@[simp] theorem srvAtomicCommit_srvLetEq {E σ α γ : Type} (s₀ : σ) (val : γ)
-    (k : (x : γ) → x = val → σ × Option (Except E α)) :
-    srvAtomicCommit s₀ (srvLetEq val k) = srvLetEq val (fun x hx => srvAtomicCommit s₀ (k x hx)) := rfl
-
-@[simp] theorem srvSeq_srvLetEq {σ ρ γ : Type} (val : γ)
-    (k : (x : γ) → x = val → σ × Option ρ) (next : σ → σ × Option ρ) :
-    srvSeq (srvLetEq val k) next = srvLetEq val (fun x hx => srvSeq (k x hx) next) := rfl
-
-@[simp] theorem srvFinishEmit_srvLetEq {E σ α γ : Type} [SrvErr E] (s₀ : σ) (val : γ)
-    (k : (x : γ) → x = val → σ × List WsEmit × Option (Except E α)) :
-    srvFinishEmit s₀ (srvLetEq val k) = srvLetEq val (fun x hx => srvFinishEmit s₀ (k x hx)) := rfl
-
-@[simp] theorem srvAtomicCommitEmit_srvLetEq {E σ α γ : Type} (s₀ : σ) (val : γ)
-    (k : (x : γ) → x = val → σ × List WsEmit × Option (Except E α)) :
-    srvAtomicCommitEmit s₀ (srvLetEq val k) = srvLetEq val (fun x hx => srvAtomicCommitEmit s₀ (k x hx)) := rfl
-
-@[simp] theorem srvEmitSeq_srvLetEq {σ ρ γ : Type} (val : γ)
-    (k : (x : γ) → x = val → σ × List WsEmit × Option ρ)
-    (next : σ → List WsEmit → σ × List WsEmit × Option ρ) :
-    srvEmitSeq (srvLetEq val k) next = srvLetEq val (fun x hx => srvEmitSeq (k x hx) next) := rfl
-
-@[simp] theorem prod_fst_srvLetEq {α β γ : Type} (val : γ)
-    (k : (x : γ) → x = val → α × β) :
-    (srvLetEq val k).1 = srvLetEq val (fun x hx => (k x hx).1) := rfl
-
-@[simp] theorem prod_snd_srvLetEq {α β γ : Type} (val : γ)
-    (k : (x : γ) → x = val → α × β) :
-    (srvLetEq val k).2 = srvLetEq val (fun x hx => (k x hx).2) := rfl
 
 /-! ## Custom Term Elaborators for Proven Bounds (`srvGetElem`, `srvSetElem`) & `Field` Refinements (`srvAutoField`) -/
 
-@[reducible, inline]
-def srvGetAt {α : Type} (xs : Array α) (i : Nat) (h : i < xs.size) : α :=
-  xs[i]'h
-
-@[simp] theorem srvGetAt_eq {α : Type} (xs : Array α) (i : Nat) (h : i < xs.size) :
-    srvGetAt xs i h = xs[i]'h := rfl
-
-@[inline]
-def srvWithNewState {σ : Type} (sNew : σ) (P : σ → Prop) : Prop := P sNew
-
-@[simp] theorem srvWithNewState_srvLetEq {σ γ : Type} (val : γ)
-    (k : (x : γ) → x = val → σ) (P : σ → Prop) :
-    srvWithNewState (srvLetEq val k) P = srvLetEq val (fun x hx => srvWithNewState (k x hx) P) := rfl
-
-theorem srvWithNewState_apply {σ : Type} (s : σ) (P : σ → Prop) :
-    srvWithNewState s P = P s := rfl
-
-@[inline]
-def srvEnsPost {ε α : Type} (P : α → Prop) : Except ε α → Prop
-  | .ok r    => P r
-  | .error _ => True
-
-@[simp] theorem srvEnsPost_ok {ε α : Type} (P : α → Prop) (r : α) :
-    srvEnsPost (ε := ε) P (.ok r) = P r := rfl
-
-@[simp] theorem srvEnsPost_err {ε α : Type} (P : α → Prop) (e : ε) :
-    srvEnsPost P (.error e) = True := rfl
-
-@[simp] theorem srvEnsPost_srvLetEq {ε α γ : Type} (P : α → Prop) (val : γ)
-    (k : (x : γ) → x = val → Except ε α) :
-    srvEnsPost P (srvLetEq val k) = srvLetEq val (fun x hx => srvEnsPost P (k x hx)) := rfl
-
-@[inline]
-def srvEnsPostOpt {ε α : Type} (P : α → Prop) : Except ε (Option α) → Prop
-  | .ok (some r) => P r
-  | _            => True
-
-@[simp] theorem srvEnsPostOpt_some {ε α : Type} (P : α → Prop) (r : α) :
-    srvEnsPostOpt (ε := ε) P (.ok (some r)) = P r := rfl
-
-@[simp] theorem srvEnsPostOpt_none {ε α : Type} (P : α → Prop) :
-    srvEnsPostOpt (ε := ε) P (.ok none) = True := rfl
-
-@[simp] theorem srvEnsPostOpt_err {ε α : Type} (P : α → Prop) (e : ε) :
-    srvEnsPostOpt P (.error e) = True := rfl
-
-@[simp] theorem srvEnsPostOpt_srvLetEq {ε α γ : Type} (P : α → Prop) (val : γ)
-    (k : (x : γ) → x = val → Except ε (Option α)) :
-    srvEnsPostOpt P (srvLetEq val k) = srvLetEq val (fun x hx => srvEnsPostOpt P (k x hx)) := rfl
-
-theorem getElem_congr_arr {α : Type} {xs ys : Array α} {j : Nat}
-    (heq : ys = xs) (hj : j < ys.size) :
-    ys[j]'hj = xs[j]'(heq ▸ hj) := by
-  cases heq; rfl
-
-theorem srvGetAt_congr_arr {α : Type} {xs ys : Array α} {j : Nat}
-    (heq : ys = xs) (hj : j < ys.size) :
-    srvGetAt ys j hj = xs[j]'(heq ▸ hj) := by
-  cases heq; rfl
-
 syntax "qedSimpHypsEach" : tactic
-
-syntax (name := srvAutoFieldStx) "srvAutoField(" term ")" : term
-syntax (name := srvAutoEmitStx)  "srvAutoEmit(" term ")" : term
-syntax (name := srvTypedAsStx)   "srvTypedAs(" term ", " term ")" : term
-syntax (name := srvGetElemStx)   "srvGetElem(" term ", " term ")" : term
-syntax (name := srvSetElemStx)   "srvSetElem(" term ", " term ", " term ")" : term
 
 open Lean Meta Elab Term Tactic in
 private def inspectFieldOrFin (sub : Expr) (addFact : Expr → MetaM Unit) : MetaM Unit := do
@@ -451,13 +141,27 @@ open Lean Meta Elab Tactic in
 elab_rules : tactic
   | `(tactic| qedUnfoldSrvHelpers) => unfoldSrvHelpersInGoal
 
-macro "qedDsimpCodecs" : tactic => `(tactic|
-  try dsimp (config := { zetaDelta := false }) only
-    [Qed.Lang.QedVal.val, Qed.Server.SrvIdx.toNat,
-     Qed.Server.SrvLiftOpt.liftOpt, Qed.Server.srvGetAt,
-     Qed.Codec.valid, Qed.Codec.refine, Qed.Codec.jsonOnly,
-     Qed.Codec.text, Qed.Codec.textarea, Qed.Codec.nat,
-     Qed.Codec.int, Qed.Codec.checkbox, Qed.Codec.date] at ⊢)
+private def optCodecSimpNames : Array Lean.Name := #[
+  `Qed.Codec.valid, `Qed.Codec.refine, `Qed.Codec.jsonOnly,
+  `Qed.Codec.text, `Qed.Codec.textarea, `Qed.Codec.nat,
+  `Qed.Codec.int, `Qed.Codec.checkbox, `Qed.Codec.date]
+
+open Lean in
+private def mkOptCodecSimpLems {m : Type → Type} [Monad m] [MonadEnv m] [MonadQuotation m] :
+    m (Array (TSyntax ``Lean.Parser.Tactic.simpLemma)) := do
+  let env ← getEnv
+  (optCodecSimpNames.filter env.contains).mapM fun n =>
+    `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+
+syntax "qedDsimpCodecs" : tactic
+
+open Lean Meta Elab Tactic in
+elab_rules : tactic
+  | `(tactic| qedDsimpCodecs) => do
+      let codecLems ← mkOptCodecSimpLems
+      evalTactic (← `(tactic| try dsimp (config := { zetaDelta := false }) only
+        [Qed.Lang.QedVal.val, Qed.Server.SrvIdx.toNat,
+         Qed.Server.SrvLiftOpt.liftOpt, Qed.Server.srvGetAt, $[$codecLems],*] at ⊢))
 
 theorem srvDiteFalse_eq_true {P : Prop} [Decidable P] (t : P → Bool) :
     ((if h : P then t h else false) = true) ↔ ∃ h : P, t h = true := by
@@ -536,7 +240,7 @@ private def mkSrvRefinementProofStx : TermElabM Term :=
 open Lean Meta Elab Term Tactic in
 @[term_elab srvAutoFieldStx]
 def elabSrvAutoField : TermElab := fun stx expectedType? => do
-  let valStx : Term := ⟨stx[1]⟩
+  let valStx : Term := ⟨(stx.getArg 1)⟩
   if let some expTy := expectedType? then
     let expTy ← instantiateMVars expTy
     if !expTy.getAppFn.isMVar then
@@ -556,14 +260,13 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
         valExpr.forEach fun sub => inspectFieldOrFin sub addLocalFact
         let localFacts ← localFactsRef.get
         let localFactIds : Array Ident := (Array.range localFacts.size).map fun i => mkIdent (Name.mkSimple s!"_srvFact{i}")
+        let codecLems ← mkOptCodecSimpLems
         let fastPrfStx ← `(by
           try simp (config := { zetaDelta := false }) only
             [id_eq, Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
              Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
              Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
-             Qed.Codec.valid, Qed.Codec.refine, Qed.Codec.jsonOnly,
-             Qed.Codec.text, Qed.Codec.textarea, Qed.Codec.nat,
-             Qed.Codec.int, Qed.Codec.checkbox, Qed.Codec.date] at $[$localFactIds:ident]* ⊢
+             $[$codecLems],*] at $[$localFactIds:ident]* ⊢
           qedDsimpCodecs
           first | rfl | decide | assumption | omega)
         let savedMsgs ← Core.getMessageLog
@@ -590,11 +293,11 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
         let some prfExpr := prfExpr?
           | do
               let mut p := predFn.consumeMData
-              if p.isAppOfArity ``Qed.Codec.valid 2 then
+              if p.isAppOfArity `Qed.Codec.valid 2 then
                 let mut c := (p.getArg! 1).consumeMData
-                while c.isAppOfArity ``Qed.Codec.jsonOnly 2 do
+                while c.isAppOfArity `Qed.Codec.jsonOnly 2 do
                   c := (c.getArg! 1).consumeMData
-                if c.isAppOfArity ``Qed.Codec.refine 4 then
+                if c.isAppOfArity `Qed.Codec.refine 4 then
                   p := c.getArg! 2
               let prettyGoal := (← ppExpr ((Expr.app p valExpr).headBeta)).pretty.replace "✝" ""
               let prettyVal := (← ppExpr valExpr).pretty.replace "✝" ""
@@ -618,7 +321,7 @@ open Lean Meta Elab Term in
 def elabSrvAutoEmit : TermElab := fun stx expectedType? => do
   let propExpr ← match expectedType? with
     | some expTy => instantiateMVars expTy
-    | none       => elabTerm stx[1] (some (mkSort Level.zero))
+    | none       => elabTerm (stx.getArg 1) (some (mkSort Level.zero))
   let facts ← collectProofFacts #[propExpr]
   let some prfExpr ← tryProveWithFacts facts (← mkSrvRefinementProofStx) propExpr
     | do
@@ -630,10 +333,10 @@ def elabSrvAutoEmit : TermElab := fun stx expectedType? => do
 open Lean Meta Elab Term in
 @[term_elab srvTypedAsStx]
 def elabSrvTypedAs : TermElab := fun stx expectedType? => do
-  let tplExpr ← elabTerm stx[1] none
+  let tplExpr ← elabTerm (stx.getArg 1) none
   synthesizeSyntheticMVarsNoPostponing
   let tplTy ← instantiateMVars (← inferType tplExpr)
-  let valExpr ← elabTermEnsuringType stx[3] (some tplTy)
+  let valExpr ← elabTermEnsuringType (stx.getArg 3) (some tplTy)
   match expectedType? with
   | some expTy => ensureHasType expTy valExpr
   | none       => return valExpr
@@ -818,7 +521,7 @@ private def elabArrAndIdx (arrStx idxStx : Term) (opDesc : String) : TermElabM (
 open Lean Meta Elab Term in
 @[term_elab srvGetElemStx]
 def elabSrvGetElem : TermElab := fun stx expectedType? => do
-  let (arrExpr, idxNatExpr, elemTy) ← elabArrAndIdx ⟨stx[1]⟩ ⟨stx[3]⟩ "indexing"
+  let (arrExpr, idxNatExpr, elemTy) ← elabArrAndIdx ⟨(stx.getArg 1)⟩ ⟨(stx.getArg 3)⟩ "indexing"
   let ltPrf ← proveBoundsFor stx arrExpr idxNatExpr
   let elemExpr ← mkAppOptM ``srvGetAt #[some elemTy, some arrExpr, some idxNatExpr, some ltPrf]
   match expectedType? with
@@ -828,8 +531,8 @@ def elabSrvGetElem : TermElab := fun stx expectedType? => do
 open Lean Meta Elab Term in
 @[term_elab srvSetElemStx]
 def elabSrvSetElem : TermElab := fun stx expectedType? => do
-  let valStx : Term := ⟨stx[5]⟩
-  let (arrExpr, idxNatExpr, elemTy) ← elabArrAndIdx ⟨stx[1]⟩ ⟨stx[3]⟩ "indexed assignment"
+  let valStx : Term := ⟨(stx.getArg 5)⟩
+  let (arrExpr, idxNatExpr, elemTy) ← elabArrAndIdx ⟨(stx.getArg 1)⟩ ⟨(stx.getArg 3)⟩ "indexed assignment"
   let valExpr ← elabTermEnsuringType (← `(srvAutoField($valStx))) (some elemTy)
   synthesizeSyntheticMVarsNoPostponing
   let arrExpr ← instantiateMVars arrExpr
@@ -915,11 +618,9 @@ elab_rules : tactic
           ids := ids.push (mkIdent fname)
         return ids
       unless invFactIds.isEmpty do
+        let codecLems ← mkOptCodecSimpLems
         evalTactic (← `(tactic|
-          try dsimp (config := { zetaDelta := false }) only
-            [Qed.Codec.valid, Qed.Codec.refine, Qed.Codec.jsonOnly,
-             Qed.Codec.text, Qed.Codec.textarea, Qed.Codec.nat,
-             Qed.Codec.int, Qed.Codec.checkbox, Qed.Codec.date] at $[$invFactIds:ident]*))
+          try dsimp (config := { zetaDelta := false }) only [$[$codecLems],*] at $[$invFactIds:ident]*))
       evalTactic (← `(tactic| (
         qedDsimpCodecs
         first
@@ -957,14 +658,16 @@ elab_rules : tactic
           ``Qed.QedVal.val_ensured, ``Qed.Lang.QedVal.val_id,
           ``Qed.Server.SrvIdx.toNat_nat, ``Qed.Server.SrvIdx.toNat_fin,
           ``Qed.Server.SrvLiftOpt.liftOpt_opt, ``Qed.Server.SrvLiftOpt.liftOpt_val,
-          ``Qed.Codec.valid, ``Qed.Codec.refine, ``Qed.Codec.jsonOnly,
-          ``Qed.Codec.text, ``Qed.Codec.textarea, ``Qed.Codec.nat,
-          ``Qed.Codec.int, ``Qed.Codec.checkbox, ``Qed.Codec.date,
+          `Qed.Codec.valid, `Qed.Codec.refine, `Qed.Codec.jsonOnly,
+          `Qed.Codec.text, `Qed.Codec.textarea, `Qed.Codec.nat,
+          `Qed.Codec.int, `Qed.Codec.checkbox, `Qed.Codec.date,
           ``Array.size_set, ``Array.size_push, ``Array.getElem_set_self,
           ``Qed.Server.srvDiteFalse_eq_true, ``Qed.Server.srvDiteFalse_eq_false,
           ``Bool.and_eq_true, ``Bool.or_eq_true, ``Bool.not_eq_true',
           ``beq_iff_eq, ``bne_iff_ne, ``decide_eq_true_eq]
-        let hypLems ← hypSimpNames.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
+        let env ← getEnv
+        let hypLems ← (hypSimpNames.filter env.contains).mapM fun n =>
+          `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
         let batchOk ← try
             evalTactic (← `(tactic| simp (config := { zetaDelta := false }) only [$[$hypLems],*] at $[$hIds:ident]*))
             pure true
@@ -1410,6 +1113,7 @@ syntax "qedProveRpcReq" : tactic
 open Lean Meta Elab Tactic in
 elab_rules : tactic
   | `(tactic| qedProveRpcReq) => do
+      evalTactic (← `(tactic| (try qedSrvSplitHyps; try qedUnfoldSrvHelpers; try dsimp only at *)))
       let facts ← withMainContext do
         let tgt ← instantiateMVars (← getMainTarget)
         collectProofFacts #[tgt]
@@ -1424,10 +1128,11 @@ elab_rules : tactic
         ``Option.isSome_iff_ne_none, ``ne_eq, ``Bool.and_eq_true, ``Bool.or_eq_true,
         ``Bool.not_eq_true', ``beq_iff_eq, ``bne_iff_ne, ``decide_eq_true_eq,
         ``Qed.Lang.QedVal.val_id, ``Qed.QedVal.val_field, ``Qed.QedVal.val_ensured,
-        ``Qed.Codec.valid,
-        ``Qed.Codec.refine, ``Qed.Codec.jsonOnly, ``Qed.Codec.text, ``Qed.Codec.textarea,
-        ``Qed.Codec.nat, ``Qed.Codec.int, ``Qed.Codec.checkbox, ``Qed.Codec.date]
-      let allReqSimp ← (fixedNames ++ (#[`Qed.Cached.all, `Qed.Resource.all].filter env.contains)).mapM fun n =>
+        ``Qed.Server.srvGetAt_eq, ``Qed.Server.SrvIdx.toNat_nat, ``Qed.Server.SrvIdx.toNat_fin,
+        `Qed.Codec.valid,
+        `Qed.Codec.refine, `Qed.Codec.jsonOnly, `Qed.Codec.text, `Qed.Codec.textarea,
+        `Qed.Codec.nat, `Qed.Codec.int, `Qed.Codec.checkbox, `Qed.Codec.date]
+      let allReqSimp ← ((fixedNames ++ #[`Qed.Cached.all, `Qed.Resource.all]).filter env.contains).mapM fun n =>
         `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
       evalTactic (← `(tactic| (
         try qedUnfoldSrvHelpers

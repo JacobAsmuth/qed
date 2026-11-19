@@ -664,19 +664,19 @@ private partial def compileCssBlockItems (env : Environment) (currNs : Name)
   let mut thms  : List Name := []
   for stx in stxs do
     if stx.getKind == ``cssNestedBlock then
-      let rawHdr := (atomText stx[0]).trimmed
+      let rawHdr := (atomText (stx.getArg 0)).trimmed
       let sel := (String.ofList rawHdr.toList.dropLast).trimmed
-      if sel.isEmpty then throwErrorAt stx[0] "empty nested CSS selector"
-      let sub ← compileCssBlockItems env currNs openDecls strictTokens stx[1].getArgs
+      if sel.isEmpty then throwErrorAt (stx.getArg 0) "empty nested CSS selector"
+      let sub ← compileCssBlockItems env currNs openDecls strictTokens (stx.getArg 1).getArgs
       items := items ++ [.nest sel sub.items]
       toks  := toks ++ sub.usedTokens
       rules := rules ++ sub.extraRules
       for t in sub.themes do unless thms.contains t do thms := thms ++ [t]
     else if stx.getKind == ``cssSimpleDecl then
-      let line := (atomText stx[0]).trimmed
+      let line := (atomText (stx.getArg 0)).trimmed
       let some (p, v) := splitFirstColon line
-        | throwErrorAt stx[0] s!"expected CSS declaration `property: value`, got `{line}`"
-      let res ← resolveAndValidateDecl stx[0] env currNs openDecls strictTokens p v
+        | throwErrorAt (stx.getArg 0) s!"expected CSS declaration `property: value`, got `{line}`"
+      let res ← resolveAndValidateDecl (stx.getArg 0) env currNs openDecls strictTokens p v
       items := items ++ [.decl p.trimmed res.cssText]
       toks  := toks ++ res.usedTokens
       rules := rules ++ res.extraRules
@@ -759,18 +759,18 @@ def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
 
 @[command_elab styleCmd] def elabStyleCmd : CommandElab := fun stx => do
   let doc? : Option (TSyntax ``Lean.Parser.Command.docComment) :=
-    if stx[0].getNumArgs == 1 then some ⟨stx[0][0]⟩ else none
-  let nameId : Ident := ⟨stx[2]⟩
+    if (stx.getArg 0).getNumArgs == 1 then some ⟨((stx.getArg 0).getArg 0)⟩ else none
+  let nameId : Ident := ⟨(stx.getArg 2)⟩
   let extendsIds : Array Ident :=
-    if stx[3].getNumArgs == 1 then stx[3][0][1].getSepArgs.map (⟨·⟩) else #[]
-  let strictTokens := stx[4].getNumArgs == 1
-  let bodyStxs := stx[6].getArgs
+    if (stx.getArg 3).getNumArgs == 1 then (((stx.getArg 3).getArg 0).getArg 1).getSepArgs.map (⟨·⟩) else #[]
+  let strictTokens := (stx.getArg 4).getNumArgs == 1
+  let bodyStxs := (stx.getArg 6).getArgs
   elabStyleDef doc? nameId extendsIds strictTokens bodyStxs
 
 /-! ## Inline `css:` Term Elaborator -/
 
 @[term_elab inlineCssTerm] def elabInlineCssTerm : TermElab := fun stx expectedType? => do
-  let raw := (atomText stx[1]).trimmed
+  let raw := (atomText (stx.getArg 1)).trimmed
   let env ← getEnv
   let currNs ← getCurrNamespace
   let openDecls ← getOpenDecls
@@ -782,8 +782,8 @@ def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
   let mut rules : List String := []
   for d in declStrs do
     let some (p, v) := splitFirstColon d
-      | throwErrorAt stx[1] s!"expected `property: value` in inline `css:`, got `{d}`"
-    let res ← resolveAndValidateDecl stx[1] env currNs openDecls false p v
+      | throwErrorAt (stx.getArg 1) s!"expected `property: value` in inline `css:`, got `{d}`"
+    let res ← resolveAndValidateDecl (stx.getArg 1) env currNs openDecls false p v
     items := items ++ [.decl p.trimmed res.cssText]
     toks  := toks ++ res.usedTokens
     rules := rules ++ res.extraRules
@@ -809,19 +809,19 @@ def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
 
 @[command_elab keyframesCmd] def elabKeyframesCmd : CommandElab := fun stx => do
   let doc? : Option (TSyntax ``Lean.Parser.Command.docComment) :=
-    if stx[0].getNumArgs == 1 then some ⟨stx[0][0]⟩ else none
-  let nameId : Ident := ⟨stx[2]⟩
+    if (stx.getArg 0).getNumArgs == 1 then some ⟨((stx.getArg 0).getArg 0)⟩ else none
+  let nameId : Ident := ⟨(stx.getArg 2)⟩
   let kfName := Qed.sanitizeCssIdent nameId.getId.getString!
   let env ← getEnv
   let currNs ← getCurrNamespace
   let openDecls := (← getScope).openDecls
   let mut steps : List (String × List Qed.Item) := []
-  for stepStx in stx[4].getArgs do
+  for stepStx in (stx.getArg 4).getArgs do
     unless stepStx.getKind == ``cssNestedBlock do
       throwErrorAt stepStx "expected keyframe stop (`from:`, `to:`, or `50%:`)"
-    let rawHdr := (atomText stepStx[0]).trimmed
+    let rawHdr := (atomText (stepStx.getArg 0)).trimmed
     let stopSel := (String.ofList rawHdr.toList.dropLast).trimmed
-    let compiled ← liftCoreM <| compileCssBlockItems env currNs openDecls false stepStx[1].getArgs
+    let compiled ← liftCoreM <| compileCssBlockItems env currNs openDecls false (stepStx.getArg 1).getArgs
     steps := steps ++ [(stopSel, compiled.items)]
   let kf : Qed.Keyframes := { name := kfName, steps }
   let stepTerms ← liftMacroM <| steps.toArray.mapM fun (sel, body) => do
@@ -958,10 +958,63 @@ private def quoteOptColor (cssStr : String) (rgb? : Option (Nat × Nat × Nat)) 
   | none =>
       `(some ({ raw := $(Syntax.mkStrLit cssStr), rgb? := none } : Qed.Color))
 
+private def emitThemeTokens (themeNm fullThemeName : Name) (thStyleRaw : String)
+    (entries : Array ThemeTokEntry) : CommandElabM Unit := do
+  for e in entries do
+    let tokId := mkIdentFrom e.ref (themeNm ++ Name.mkSimple e.ident)
+    let cssLit := Syntax.mkStrLit e.cssName
+    let mkOptRaw (ty : Term) (val? : Option String) : MacroM Term := match val? with
+      | some s => `(some ({ raw := $(Syntax.mkStrLit s) } : $ty))
+      | none   => `(none)
+    let (tyTerm, lTerm, dTerm) ← match e.kind with
+      | "color" =>
+          let l ← liftMacroM <| quoteOptColor e.lightCss e.lightRgb
+          let d ← match e.darkCss? with
+            | some dc => liftMacroM <| quoteOptColor dc e.darkRgb?
+            | none    => `(none)
+          pure (← `(Qed.Color), l, d)
+      | "len" | "num" | "time" =>
+          let ty ← match e.kind with
+            | "len" => `(Qed.Len) | "num" => `(Qed.CssNum) | _ => `(Qed.Time)
+          pure (ty, ← liftMacroM <| mkOptRaw ty (some e.lightCss), ← liftMacroM <| mkOptRaw ty e.darkCss?)
+      | _ =>
+          let d ← match e.darkCss? with | some dc => `(some $(Syntax.mkStrLit dc)) | none => `(none)
+          pure (← `(String), ← `(some $(Syntax.mkStrLit e.lightCss)), d)
+    elabCommand (← `(command| def $tokId : Qed.TypedToken $tyTerm :=
+      { name := $cssLit, lightVal := $lTerm, darkVal := $dTerm }))
+    modifyEnv fun env' => tokenMetaRegistry.addEntry env' {
+      fullName := fullThemeName ++ Name.mkSimple e.ident, cssName := e.cssName
+      kind := e.kind, themeName? := some fullThemeName, themeRule? := some thStyleRaw
+    }
+
+private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntry)
+    (invs : Array ThemeContrastInv) : CommandElabM Unit := do
+  for inv in invs do
+    let some fgE := entries.find? (·.ident == inv.fgName)
+      | throwErrorAt inv.ref s!"unknown token `{inv.fgName}` in contrast invariant `{inv.invName}`"
+    let some bgE := entries.find? (·.ident == inv.bgName)
+      | throwErrorAt inv.ref s!"unknown token `{inv.bgName}` in contrast invariant `{inv.invName}`"
+    unless fgE.kind == "color" && bgE.kind == "color" do
+      throwErrorAt inv.ref s!"`contrast({inv.fgName}, {inv.bgName})` requires two `color` tokens"
+    let lightRatio := Qed.Color.contrastX100 ⟨fgE.lightCss, fgE.lightRgb⟩ ⟨bgE.lightCss, bgE.lightRgb⟩
+    if lightRatio < inv.minX100 then
+      throwErrorAt inv.ref s!"WCAG contrast invariant `{inv.invName}` failed in light mode: contrast({inv.fgName}={fgE.lightCss}, {inv.bgName}={bgE.lightCss}) is {Qed.formatContrastX100 lightRatio}, required >= {Qed.formatContrastX100 inv.minX100}"
+    if fgE.darkCss?.isSome || bgE.darkCss?.isSome then
+      let darkFg : Qed.Color := ⟨fgE.darkCss?.getD fgE.lightCss, fgE.darkRgb?.orElse (fun _ => fgE.lightRgb)⟩
+      let darkBg : Qed.Color := ⟨bgE.darkCss?.getD bgE.lightCss, bgE.darkRgb?.orElse (fun _ => bgE.lightRgb)⟩
+      let darkRatio := Qed.Color.contrastX100 darkFg darkBg
+      if darkRatio < inv.minX100 then
+        throwErrorAt inv.ref s!"WCAG contrast invariant `{inv.invName}` failed in dark mode: contrast({inv.fgName}={darkFg.raw}, {inv.bgName}={darkBg.raw}) is {Qed.formatContrastX100 darkRatio}, required >= {Qed.formatContrastX100 inv.minX100}"
+    let invId := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple inv.invName)
+    let fgId  := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple inv.fgName)
+    let bgId  := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple inv.bgName)
+    elabCommand (← `(command|
+      theorem $invId : Qed.TypedToken.wcagCheck $fgId $bgId $(Syntax.mkNumLit (toString inv.minX100)) = true := by decide))
+
 @[command_elab themeCmd] def elabThemeCmd : CommandElab := fun stx => do
   let doc? : Option (TSyntax ``Lean.Parser.Command.docComment) :=
-    if stx[0].getNumArgs == 1 then some ⟨stx[0][0]⟩ else none
-  let themeId : Ident := ⟨stx[2]⟩
+    if (stx.getArg 0).getNumArgs == 1 then some ⟨((stx.getArg 0).getArg 0)⟩ else none
+  let themeId : Ident := ⟨(stx.getArg 2)⟩
   let themeNm := themeId.getId
   let env ← getEnv
   let currNs ← getCurrNamespace
@@ -969,43 +1022,41 @@ private def quoteOptColor (cssStr : String) (rgb? : Option (Nat × Nat × Nat)) 
   let mut entries : Array ThemeTokEntry := #[]
   let mut resets  : List Qed.Item := []
   let mut invs    : Array ThemeContrastInv := #[]
-  for itemStx in stx[4].getArgs do
+  for itemStx in (stx.getArg 4).getArgs do
     if itemStx.getKind == ``cssSimpleDecl then
-      let line := (atomText itemStx[0]).trimmed
+      let line := (atomText (itemStx.getArg 0)).trimmed
       if line.startsWith "invariant " then
-        invs := invs.push (← liftCoreM <| parseContrastInvLine itemStx[0] line)
+        invs := invs.push (← liftCoreM <| parseContrastInvLine (itemStx.getArg 0) line)
       else
-        let (kind, nm, rawVal) ← liftCoreM <| parseTokenLine itemStx[0] line
+        let (kind, nm, rawVal) ← liftCoreM <| parseTokenLine (itemStx.getArg 0) line
         if entries.any (·.ident == nm) then
-          throwErrorAt itemStx[0] s!"duplicate token `{nm}` in theme `{themeNm}`"
-        let (cleanVal, rgb?) ← liftCoreM <| validateThemeVal itemStx[0] kind rawVal
+          throwErrorAt (itemStx.getArg 0) s!"duplicate token `{nm}` in theme `{themeNm}`"
+        let (cleanVal, rgb?) ← liftCoreM <| validateThemeVal (itemStx.getArg 0) kind rawVal
         entries := entries.push {
-          ref := itemStx[0], ident := nm, cssName := toKebabCase nm,
+          ref := (itemStx.getArg 0), ident := nm, cssName := toKebabCase nm,
           kind, lightCss := cleanVal, lightRgb := rgb?
         }
     else if itemStx.getKind == ``cssNestedBlock then
-      let rawHdr := (atomText itemStx[0]).trimmed
+      let rawHdr := (atomText (itemStx.getArg 0)).trimmed
       let hdr := (String.ofList rawHdr.toList.dropLast).trimmed
       if hdr == "dark" then
-        for dStx in itemStx[1].getArgs do
+        for dStx in (itemStx.getArg 1).getArgs do
           unless dStx.getKind == ``cssSimpleDecl do
             throwErrorAt dStx "expected `<kind> <name> = <value>` inside `dark:`"
-          let dLine := (atomText dStx[0]).trimmed
-          let (kind, nm, rawVal) ← liftCoreM <| parseTokenLine dStx[0] dLine
+          let (kind, nm, rawVal) ← liftCoreM <| parseTokenLine (dStx.getArg 0) (atomText (dStx.getArg 0)).trimmed
           let some idx := entries.findIdx? (·.ident == nm)
-            | throwErrorAt dStx[0] s!"dark override for unknown token `{nm}` (declare it in light mode first)"
+            | throwErrorAt (dStx.getArg 0) s!"dark override for unknown token `{nm}` (declare it in light mode first)"
           let prev := entries[idx]!
           unless prev.kind == kind do
-            throwErrorAt dStx[0] s!"dark override kind mismatch for `{nm}`: declared as `{prev.kind}`, overridden as `{kind}`"
-          let (cleanVal, rgb?) ← liftCoreM <| validateThemeVal dStx[0] kind rawVal
+            throwErrorAt (dStx.getArg 0) s!"dark override kind mismatch for `{nm}`: declared as `{prev.kind}`, overridden as `{kind}`"
+          let (cleanVal, rgb?) ← liftCoreM <| validateThemeVal (dStx.getArg 0) kind rawVal
           entries := entries.set! idx { prev with darkCss? := some cleanVal, darkRgb? := rgb? }
       else if hdr.startsWith "reset " then
         let sel := (String.ofList (hdr.toList.drop 6)).trimmed
-        let compiled ← liftCoreM <| compileCssBlockItems env currNs openDecls false itemStx[1].getArgs
+        let compiled ← liftCoreM <| compileCssBlockItems env currNs openDecls false (itemStx.getArg 1).getArgs
         resets := resets ++ [.nest sel compiled.items]
       else
-        throwErrorAt itemStx[0] s!"unknown section `{hdr}:` in `theme` (expected `dark:` or `reset <selector>:`)"
-  -- Build Theme & Style values
+        throwErrorAt (itemStx.getArg 0) s!"unknown section `{hdr}:` in `theme` (expected `dark:` or `reset <selector>:`)"
   let lightDecls : List Qed.Item := entries.toList.map fun e => .decl ("--" ++ e.cssName) e.lightCss
   let darkEntries := entries.toList.filter (·.darkCss?.isSome)
   let darkDecls : List Qed.Item := darkEntries.map fun e => .decl ("--" ++ e.cssName) (e.darkCss?.getD "")
@@ -1017,55 +1068,7 @@ private def quoteOptColor (cssStr : String) (rgb? : Option (Nat × Nat × Nat)) 
   }
   let thStyle := thVal.asStyle
   let fullThemeName := currNs ++ themeNm
-  -- Emit `Theme.<tok>` typed tokens
-  for e in entries do
-    let tokId := mkIdentFrom e.ref (themeNm ++ Name.mkSimple e.ident)
-    let cssLit := Syntax.mkStrLit e.cssName
-    let cmd ← match e.kind with
-      | "color" =>
-          let lTerm ← liftMacroM <| quoteOptColor e.lightCss e.lightRgb
-          let dTerm ← match e.darkCss? with
-            | some dc => liftMacroM <| quoteOptColor dc e.darkRgb?
-            | none    => `(none)
-          `(command| def $tokId : Qed.TypedToken Qed.Color :=
-              { name := $cssLit, lightVal := $lTerm, darkVal := $dTerm })
-      | "len" =>
-          let lTerm ← `(some ({ raw := $(Syntax.mkStrLit e.lightCss) } : Qed.Len))
-          let dTerm ← match e.darkCss? with
-            | some dc => `(some ({ raw := $(Syntax.mkStrLit dc) } : Qed.Len))
-            | none    => `(none)
-          `(command| def $tokId : Qed.TypedToken Qed.Len :=
-              { name := $cssLit, lightVal := $lTerm, darkVal := $dTerm })
-      | "num" =>
-          let lTerm ← `(some ({ raw := $(Syntax.mkStrLit e.lightCss) } : Qed.CssNum))
-          let dTerm ← match e.darkCss? with
-            | some dc => `(some ({ raw := $(Syntax.mkStrLit dc) } : Qed.CssNum))
-            | none    => `(none)
-          `(command| def $tokId : Qed.TypedToken Qed.CssNum :=
-              { name := $cssLit, lightVal := $lTerm, darkVal := $dTerm })
-      | "time" =>
-          let lTerm ← `(some ({ raw := $(Syntax.mkStrLit e.lightCss) } : Qed.Time))
-          let dTerm ← match e.darkCss? with
-            | some dc => `(some ({ raw := $(Syntax.mkStrLit dc) } : Qed.Time))
-            | none    => `(none)
-          `(command| def $tokId : Qed.TypedToken Qed.Time :=
-              { name := $cssLit, lightVal := $lTerm, darkVal := $dTerm })
-      | _ =>
-          let lTerm ← `(some $(Syntax.mkStrLit e.lightCss))
-          let dTerm ← match e.darkCss? with
-            | some dc => `(some $(Syntax.mkStrLit dc))
-            | none    => `(none)
-          `(command| def $tokId : Qed.TypedToken String :=
-              { name := $cssLit, lightVal := $lTerm, darkVal := $dTerm })
-    elabCommand cmd
-    modifyEnv fun env' => tokenMetaRegistry.addEntry env' {
-      fullName   := fullThemeName ++ Name.mkSimple e.ident
-      cssName    := e.cssName
-      kind       := e.kind
-      themeName? := some fullThemeName
-      themeRule? := some thStyle.raw
-    }
-  -- Emit `Theme.theme : Qed.Theme` and `Theme.style : Qed.Style`
+  emitThemeTokens themeNm fullThemeName thStyle.raw entries
   let lDeclTerms ← liftMacroM <| lightDecls.toArray.mapM quoteItem
   let dDeclTerms ← liftMacroM <| darkDecls.toArray.mapM quoteItem
   let rTerms     ← liftMacroM <| resets.toArray.mapM quoteItem
@@ -1082,39 +1085,11 @@ private def quoteOptColor (cssStr : String) (rgb? : Option (Nat × Nat × Nat)) 
       darkTokens    := $drkTokList }))
   let styleLit ← liftMacroM <| quoteStyleLiteral thStyle
   elabCommand (← `(command| def $styleConstId : Qed.Style := $styleLit))
-  -- Emit kernel-verified WCAG contrast invariants!
-  for inv in invs do
-    let some fgE := entries.find? (·.ident == inv.fgName)
-      | throwErrorAt inv.ref s!"unknown token `{inv.fgName}` in contrast invariant `{inv.invName}`"
-    let some bgE := entries.find? (·.ident == inv.bgName)
-      | throwErrorAt inv.ref s!"unknown token `{inv.bgName}` in contrast invariant `{inv.invName}`"
-    unless fgE.kind == "color" && bgE.kind == "color" do
-      throwErrorAt inv.ref s!"`contrast({inv.fgName}, {inv.bgName})` requires two `color` tokens"
-    -- Pre-check with rich diagnostics before invoking Lean's kernel `decide`
-    let lightFg : Qed.Color := ⟨fgE.lightCss, fgE.lightRgb⟩
-    let lightBg : Qed.Color := ⟨bgE.lightCss, bgE.lightRgb⟩
-    let lightRatio := Qed.Color.contrastX100 lightFg lightBg
-    if lightRatio < inv.minX100 then
-      throwErrorAt inv.ref s!"WCAG contrast invariant `{inv.invName}` failed in light mode: contrast({inv.fgName}={fgE.lightCss}, {inv.bgName}={bgE.lightCss}) is {Qed.formatContrastX100 lightRatio}, required >= {Qed.formatContrastX100 inv.minX100}"
-    if fgE.darkCss?.isSome || bgE.darkCss?.isSome then
-      let darkFg : Qed.Color := ⟨fgE.darkCss?.getD fgE.lightCss, fgE.darkRgb?.orElse (fun _ => fgE.lightRgb)⟩
-      let darkBg : Qed.Color := ⟨bgE.darkCss?.getD bgE.lightCss, bgE.darkRgb?.orElse (fun _ => bgE.lightRgb)⟩
-      let darkRatio := Qed.Color.contrastX100 darkFg darkBg
-      if darkRatio < inv.minX100 then
-        throwErrorAt inv.ref s!"WCAG contrast invariant `{inv.invName}` failed in dark mode: contrast({inv.fgName}={darkFg.raw}, {inv.bgName}={darkBg.raw}) is {Qed.formatContrastX100 darkRatio}, required >= {Qed.formatContrastX100 inv.minX100}"
-    let invId := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple inv.invName)
-    let fgId  := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple inv.fgName)
-    let bgId  := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple inv.bgName)
-    let minLit := Syntax.mkNumLit (toString inv.minX100)
-    elabCommand (← `(command|
-      theorem $invId : Qed.TypedToken.wcagCheck $fgId $bgId $minLit = true := by decide))
+  emitThemeContrastInvs themeNm entries invs
   modifyEnv fun env' => themeMetaRegistry.addEntry env' {
-    fullName      := fullThemeName
-    styleConst    := fullThemeName ++ `style
-    themeConst    := fullThemeName ++ `theme
-    renderedRule  := thStyle.raw
-    definedTokens := defToks
-    darkTokens    := darkToks
+    fullName := fullThemeName, styleConst := fullThemeName ++ `style
+    themeConst := fullThemeName ++ `theme, renderedRule := thStyle.raw
+    definedTokens := defToks, darkTokens := darkToks
   }
 
 /-! ## `verify_theme <Theme> for <app>` Command (Kernel Proof of Token Completeness) -/
@@ -1176,8 +1151,8 @@ private def decodeReducedStrList? (e : Expr) : Option (List String) := do
   elems.mapM (decodeReducedStr? 64)
 
 @[command_elab verifyThemeCmd] def elabVerifyThemeCmd : CommandElab := fun stx => do
-  let thId : Ident := ⟨stx[1]⟩
-  let target : Term := ⟨stx[3]⟩
+  let thId : Ident := ⟨(stx.getArg 1)⟩
+  let target : Term := ⟨(stx.getArg 3)⟩
   let env ← getEnv
   let currNs ← getCurrNamespace
   let openDecls := (← getScope).openDecls

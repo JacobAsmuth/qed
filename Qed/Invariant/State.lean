@@ -61,7 +61,13 @@ elab "qedUnfoldPresent" "[" extra:term,* "]" : tactic => do
     if (← getGoals).isEmpty then return
     let env ← getEnv
     let goal ← instantiateMVars (← getMainTarget)
-    let present ← (goal.getUsedConstants.filter (qedIsHelper env)).filterM
+    let mut usedConsts : Array Name := goal.getUsedConstants
+    for decl in (← getLCtx) do
+      if !decl.isImplementationDetail then
+        let dTy ← instantiateMVars decl.type
+        for c in dTy.getUsedConstants do
+          if !usedConsts.contains c then usedConsts := usedConsts.push c
+    let present ← (usedConsts.filter (qedIsHelper env)).filterM
       (fun n => return (← getProjectionFnInfo? n).isNone)
     if present.isEmpty then
       let _ ← try evalTactic (← `(tactic| simp_all only [$[$fixedL],*])) catch _ => pure ()
@@ -277,7 +283,10 @@ elab_rules : tactic
                (try qedDestructExistsHyps);
                qedUnfoldPresent [$[$usingL],*];
                (try simp_all only [$[$finalCloserL],*]);
-               first | rfl | omega | decide | assumption | trivial | done)))))
+               first | rfl | omega | decide | assumption | trivial
+                     | (simp_all [$[$finalCloserL],*] <;> omega)
+                     | (simp_all [$[$finalCloserL],*] <;> decide)
+                     | (simp_all [$[$finalCloserL],*] <;> done) | done)))))
     match init with
     | some initT =>
         let initTac ← mkInitTac usingL pred initT

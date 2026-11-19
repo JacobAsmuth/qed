@@ -15,6 +15,7 @@ import Qed.ForEach
 import Qed.View
 import Qed.Jsx
 import Qed.Resource
+import Qed.Speculative
 import Qed.Socket
 import Qed.Ssr
 import Qed.Style

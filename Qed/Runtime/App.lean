@@ -60,6 +60,30 @@ def App.setInitUpdateHydrate (app : App Model Msg) (init : Model × Cmd Msg)
     (u : Model → Msg → Model × Cmd Msg) (onHydrate : Model → Cmd Msg) : App Model Msg :=
   { app with init := init, update := u, onHydrate := onHydrate }
 
+def App.liftModel {Model Model' Msg : Type}
+    (embed : Model → Model') (proj : Model' → Model)
+    (hproj : ∀ m, proj (embed m) = m)
+    (u : Model' → Msg → Model' × Cmd Msg)
+    (app : App Model Msg) : App Model' Msg where
+  init           := (embed app.init.1, app.init.2)
+  update         := u
+  template       := app.template.mapScope proj
+  onUrlChange    := app.onUrlChange
+  onSession      := app.onSession
+  onHydrate      := fun st => app.onHydrate (proj st)
+  locals         := app.locals
+  onPort         := app.onPort
+  dehydrate      := fun st => app.dehydrate (proj st)
+  rehydrate      := fun raw => (app.rehydrate raw).map embed
+  styles         := app.styles
+  stylesheets    := app.stylesheets
+  valid_view     := fun st => by rw [View.render_mapScope]; exact app.valid_view (proj st)
+  dehydrate_view := fun st st' h => by
+    simp only [Option.map_eq_some_iff] at h
+    rcases h with ⟨m', hm', rfl⟩
+    simp only [View.render_mapScope, hproj]
+    exact app.dehydrate_view (proj st) m' hm'
+
 def App.withStylesheets (sheets : List String) (app : App Model Msg) : App Model Msg :=
   { app with stylesheets := app.stylesheets ++ sheets }
 

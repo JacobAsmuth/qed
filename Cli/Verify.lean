@@ -62,7 +62,7 @@ def kernelEnvClean (q? : Option QedjsEnv := none) : IO Bool := do
       "Js.Backend", "Js.Proofs",
       "Examples.Counter", "Examples.Todo", "Examples.Signup",
       "Examples.Chat", "Examples.Bookshelf", "Examples.CloudBooks", "Examples.LiveRoom",
-      "Tests.ServerChecks", "Tests.DomProbe", "Tests.JsGate", root
+      "Tests.ServerChecks", "Tests.SpeculativeChecks", "Tests.SpeculativeApp", "Tests.DomProbe", "Tests.JsGate", root
     ]
     q.run (#["--verify-env"] ++ mods) (quiet := true)
   else

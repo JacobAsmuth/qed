@@ -305,3 +305,28 @@ import Examples.LiveRoom
 #print axioms LiveRoom.LiveApp.allMsgsValidRoom
 #print axioms LiveRoom.LiveApp.app_view_eq
 #print axioms LiveRoom.App.ws_endpoints_valid
+
+-- Client-Side Prediction & Transactional Rollback (`SpecEngine`, `App.withSpeculative`)
+#print axioms Qed.Demo.Signup.instLawfulBEq
+#print axioms Qed.SpecEngine.replay_preserves_inv
+#print axioms Qed.SpecEngine.drainConfirmed_preserves_inv
+#print axioms Qed.SpecEngine.step_preserves_inv
+#print axioms Qed.SpecEngine.step_preserves_coherent
+#print axioms Qed.SpecEngine.step_preserves_wellFormedIds
+#print axioms Qed.SpecEngine.resolve_hit_preserves_visible
+#print axioms Qed.SpecEngine.resolve_hit_sound
+#print axioms Qed.SpecEngine.resolve_rollback_reverts_single
+#print axioms Qed.SpecEngine.resolve_unknown_noop
+#print axioms Qed.SpecEngine.replacePending_split
+#print axioms Qed.SpecEngine.resolve_general_linearizable
+#print axioms Qed.SpecEngine.step_resolve_clears_when_last
+#print axioms Qed.SpecEngine.resolve_all_drains_log
+#print axioms Qed.SpecEngine.dispatch_never_fires_specMsg_cmd
+#print axioms Qed.Internal.App.withSpeculative_init_inv
+#print axioms Qed.Internal.App.withSpeculative_step_inv
+#print axioms Qed.Internal.App.withSpeculative_init_coherent
+#print axioms Qed.Internal.App.withSpeculative_step_coherent
+#print axioms Qed.Internal.App.withSpeculative_init_wellFormedIds
+#print axioms Qed.Internal.App.withSpeculative_step_wellFormedIds
+#print axioms Qed.Internal.App.withSpeculative_rehydrate_sound
+#print axioms Qed.Internal.App.withSpeculative_dehydrate_inv

@@ -1,8 +1,6 @@
 import Qed.Json
 import Qed.Proto
-import Qed.Router
-import Qed.Schema
-import Qed.Resource
+import Qed.Router.Basic
 
 /-! ## Safe Array Indexing, Membership & Conservation Helpers -/
 
@@ -1116,5 +1114,311 @@ theorem concurrent_schedule_ensures {σ Tgt Out : Type}
   induction hsched with
   | refl => exact ⟨hinit, htinv, htens, fun _ hm => False.elim (List.not_mem_nil hm)⟩
   | step _ hstep ih => exact trackedStep_preserves hstep ih.1 ih.2.1 ih.2.2.1 ih.2.2.2
+
+/-! ## Control-Flow Combinators & Auto-Lifting Helpers (`@[reducible]` for Zero-Cost Proofs & C Codegen) -/
+
+/-- Index conversion allowing both `Nat` and `Fin n` to index `Array`s uniformly across mutations. -/
+class SrvIdx (ι : Type) where
+  toNat : ι → Nat
+
+@[inline] instance : SrvIdx Nat := ⟨id⟩
+@[inline] instance {n : Nat} : SrvIdx (Fin n) := ⟨Fin.val⟩
+
+@[simp] theorem SrvIdx.toNat_nat (i : Nat) : SrvIdx.toNat i = i := rfl
+@[simp] theorem SrvIdx.toNat_fin {n : Nat} (i : Fin n) : SrvIdx.toNat i = i.val := rfl
+
+/-- Auto-lifts plain values `v : T` to `some v` in `T?` functions while keeping `Option T` un-nested. -/
+class SrvLiftOpt (α : Type) (Inner : Type) where
+  liftOpt : α → Option Inner
+
+@[inline] instance {Inner : Type} : SrvLiftOpt (Option Inner) Inner := ⟨id⟩
+@[inline] instance (priority := low) {Inner : Type} : SrvLiftOpt Inner Inner := ⟨Option.some⟩
+
+@[simp] theorem SrvLiftOpt.liftOpt_opt {Inner : Type} (x : Option Inner) :
+    SrvLiftOpt.liftOpt x = x := rfl
+@[simp] theorem SrvLiftOpt.liftOpt_val {Inner : Type} (x : Inner) :
+    SrvLiftOpt.liftOpt (Inner := Inner) x = some x := rfl
+
+/-- Overloaded `fail(...)` builder supporting `fail("msg")`, `fail(code, "msg")`, and `fail(.tag, "msg")`. -/
+def mkFail1 (msg : String) : ApiError := ApiError.badRequest msg
+def mkFail2 (code : Nat) (msg : String) : ApiError := { code, message := msg }
+def mkFailDom {ε : Type} (tag : ε) (msg : String) : SrvFailure ε := .domain tag msg
+
+/-- Uniform API-error lifting for `ApiError` and inferred `SrvFailure ε`. -/
+class SrvErr (E : Type) where
+  ofApi : ApiError → E
+
+@[reducible] instance : SrvErr ApiError := ⟨id⟩
+@[reducible] instance {ε : Type} : SrvErr (SrvFailure ε) := ⟨SrvFailure.api⟩
+
+/-- Unwraps `Except (SrvFailure ε)`, `Except ApiError`, `Except String`, or `Option` for `?` and `catch`. -/
+class SrvUnwrap (E : Type) (W : Type) (Val : outParam Type) where
+  unwrap : W → Except E Val
+
+@[reducible] instance {E α : Type} : SrvUnwrap E (Except E α) α where
+  unwrap := id
+
+@[reducible] instance {ε α : Type} : SrvUnwrap (SrvFailure ε) (Except ApiError α) α where
+  unwrap
+    | .ok a    => .ok a
+    | .error e => .error (.api e)
+
+@[reducible] instance {E α : Type} [SrvErr E] : SrvUnwrap E (Except String α) α where
+  unwrap
+    | .ok a    => .ok a
+    | .error e => .error (SrvErr.ofApi (ApiError.badRequest e))
+
+@[reducible] instance {E α : Type} [SrvErr E] : SrvUnwrap E (Option α) α where
+  unwrap
+    | some a => .ok a
+    | none   => .error (SrvErr.ofApi (ApiError.notFound "optional value was empty"))
+
+/-- Unwraps `Option α` or `Except ApiError α` inside `T?` functions (`none` exits cleanly as `.ok none`). -/
+class SrvUnwrapOpt (W : Type) (Inner : Type) (Val : outParam Type) where
+  unwrapOpt : W → Except (Except ApiError (Option Inner)) Val
+
+@[reducible] instance {Inner α : Type} : SrvUnwrapOpt (Option α) Inner α where
+  unwrapOpt
+    | some a => .ok a
+    | none   => .error (.ok none)
+
+@[reducible] instance {Inner α : Type} : SrvUnwrapOpt (Except ApiError α) Inner α where
+  unwrapOpt
+    | .ok a    => .ok a
+    | .error e => .error (.error e)
+
+/-- Pure statement sequencing with early `return` short-circuiting. -/
+@[inline]
+def srvSeq {σ ρ : Type} (first : σ × Option ρ) (next : σ → σ × Option ρ) : σ × Option ρ :=
+  match first with
+  | (s', none)   => next s'
+  | (s', some r) => (s', some r)
+
+@[simp] theorem srvSeq_none {σ ρ : Type} (s : σ) (next : σ → σ × Option ρ) :
+    srvSeq (s, none) next = next s := rfl
+
+@[simp] theorem srvSeq_some {σ ρ : Type} (s : σ) (r : ρ) (next : σ → σ × Option ρ) :
+    srvSeq (s, some r) next = (s, some r) := rfl
+
+/-- Transactional finalizer: commits `s'` on `.ok`, rolls back to entry state `s₀` on `.error`. -/
+@[inline]
+def srvFinish {E σ α : Type} [SrvErr E] (s₀ : σ) (res : σ × Option (Except E α)) : σ × Except E α :=
+  match res with
+  | (s', some (.ok v))    => (s', .ok v)
+  | (_,  some (.error e)) => (s₀, .error e)
+  | (_,  none)            => (s₀, .error (SrvErr.ofApi (ApiError.internal "unreachable missing return")))
+
+@[simp] theorem srvFinish_ok {E σ α : Type} [SrvErr E] (s₀ s' : σ) (v : α) :
+    srvFinish (E := E) s₀ (s', some (.ok v)) = (s', .ok v) := rfl
+
+@[simp] theorem srvFinish_err {E σ α : Type} [SrvErr E] (s₀ s' : σ) (e : E) :
+    srvFinish (E := E) (α := α) s₀ (s', some (.error e)) = (s₀, .error e) := rfl
+
+@[simp] theorem srvFinish_none {E σ α : Type} [SrvErr E] (s₀ s' : σ) :
+    srvFinish (E := E) s₀ (s', (none : Option (Except E α))) =
+      (s₀, .error (SrvErr.ofApi (ApiError.internal "unreachable missing return"))) := rfl
+
+/-- Transactional finalizer for `atomic` statement blocks: commits `s'` on `none`/`some (.ok v)`, rolls back to `s₀` on `some (.error e)`. -/
+@[inline]
+def srvAtomicCommit {E σ α : Type} (s₀ : σ) (res : σ × Option (Except E α)) :
+    σ × Option (Except E α) :=
+  match res with
+  | (s', none)                  => (s', none)
+  | (s', some (Except.ok v))    => (s', some (Except.ok v))
+  | (_,  some (Except.error e)) => (s₀, some (Except.error e))
+
+@[simp] theorem srvAtomicCommit_none {E σ α : Type} (s₀ s' : σ) :
+    srvAtomicCommit (E := E) (α := α) s₀ (s', none) = (s', none) := rfl
+
+@[simp] theorem srvAtomicCommit_ok {E σ α : Type} (s₀ s' : σ) (v : α) :
+    srvAtomicCommit (E := E) s₀ (s', some (Except.ok v)) = (s', some (Except.ok v)) := rfl
+
+@[simp] theorem srvAtomicCommit_err {E σ α : Type} (s₀ s' : σ) (e : E) :
+    srvAtomicCommit (E := E) (α := α) s₀ (s', some (Except.error e)) = (s₀, some (Except.error e)) := rfl
+
+/-! ## Transactional WebSocket Emit Combinators & No-Phantom-Broadcast Theorems -/
+
+/-- Pure statement sequencing carrying an outbound WebSocket emit buffer alongside state `σ`. -/
+@[inline]
+def srvEmitSeq {σ ρ : Type} (first : σ × List WsEmit × Option ρ)
+    (next : σ → List WsEmit → σ × List WsEmit × Option ρ) : σ × List WsEmit × Option ρ :=
+  match first with
+  | (s', es, none)   => next s' es
+  | (s', es, some r) => (s', es, some r)
+
+@[simp] theorem srvEmitSeq_none {σ ρ : Type} (s : σ) (es : List WsEmit)
+    (next : σ → List WsEmit → σ × List WsEmit × Option ρ) :
+    srvEmitSeq (s, es, none) next = next s es := rfl
+
+@[simp] theorem srvEmitSeq_some {σ ρ : Type} (s : σ) (es : List WsEmit) (r : ρ)
+    (next : σ → List WsEmit → σ × List WsEmit × Option ρ) :
+    srvEmitSeq (s, es, some r) next = (s, es, some r) := rfl
+
+/-- Transactional finalizer for emit-bearing pure server handlers:
+    commits `(s', es)` on `.ok`, and rolls back BOTH state (`s₀`) AND emits (`[]`) on `.error`. -/
+@[inline]
+def srvFinishEmit {E σ α : Type} [SrvErr E] (s₀ : σ)
+    (res : σ × List WsEmit × Option (Except E α)) : σ × (Except E α × List WsEmit) :=
+  match res with
+  | (s', es, some (.ok v))    => (s', .ok v, es)
+  | (_,  _,  some (.error e)) => (s₀, .error e, [])
+  | (_,  _,  none)            => (s₀, .error (SrvErr.ofApi (ApiError.internal "unreachable missing return")), [])
+
+@[simp] theorem srvFinishEmit_ok {E σ α : Type} [SrvErr E] (s₀ s' : σ) (es : List WsEmit) (v : α) :
+    srvFinishEmit (E := E) s₀ (s', es, some (.ok v)) = (s', .ok v, es) := rfl
+
+@[simp] theorem srvFinishEmit_err {E σ α : Type} [SrvErr E] (s₀ s' : σ) (es : List WsEmit) (e : E) :
+    srvFinishEmit (E := E) (α := α) s₀ (s', es, some (.error e)) = (s₀, .error e, []) := rfl
+
+@[simp] theorem srvFinishEmit_none {E σ α : Type} [SrvErr E] (s₀ s' : σ) (es : List WsEmit) :
+    srvFinishEmit (E := E) s₀ (s', es, (none : Option (Except E α))) =
+      (s₀, .error (SrvErr.ofApi (ApiError.internal "unreachable missing return")), []) := rfl
+
+/-- No-Phantom-Broadcast Theorem: any rolled-back transaction emits strictly zero WebSocket events. -/
+theorem srvFinishEmit_err_no_emits {E σ α : Type} [SrvErr E] (s₀ s' : σ) (es : List WsEmit) (e : E) :
+    (srvFinishEmit (E := E) (α := α) s₀ (s', es, some (.error e))).2.2 = [] := rfl
+
+/-- Transactional finalizer for emit-bearing `atomic:` blocks inside async handlers:
+    discards both state mutations and accumulated emits on `.error`. -/
+@[inline]
+def srvAtomicCommitEmit {E σ α : Type} (s₀ : σ)
+    (res : σ × List WsEmit × Option (Except E α)) : σ × (Option (Except E α) × List WsEmit) :=
+  match res with
+  | (s', es, none)                  => (s', none, es)
+  | (s', es, some (Except.ok v))    => (s', some (Except.ok v), es)
+  | (_,  _,  some (Except.error e)) => (s₀, some (Except.error e), [])
+
+@[simp] theorem srvAtomicCommitEmit_none {E σ α : Type} (s₀ s' : σ) (es : List WsEmit) :
+    srvAtomicCommitEmit (E := E) (α := α) s₀ (s', es, none) = (s', none, es) := rfl
+
+@[simp] theorem srvAtomicCommitEmit_ok {E σ α : Type} (s₀ s' : σ) (es : List WsEmit) (v : α) :
+    srvAtomicCommitEmit (E := E) s₀ (s', es, some (Except.ok v)) = (s', some (Except.ok v), es) := rfl
+
+@[simp] theorem srvAtomicCommitEmit_err {E σ α : Type} (s₀ s' : σ) (es : List WsEmit) (e : E) :
+    srvAtomicCommitEmit (E := E) (α := α) s₀ (s', es, some (Except.error e)) = (s₀, some (Except.error e), []) := rfl
+
+/-- No-Phantom-Broadcast Theorem for `atomic:` blocks inside async handlers. -/
+theorem srvAtomicCommitEmit_err_no_emits {E σ α : Type} (s₀ s' : σ) (es : List WsEmit) (e : E) :
+    (srvAtomicCommitEmit (E := E) (α := α) s₀ (s', es, some (Except.error e))).2.2 = [] := rfl
+
+/-- Effectful statement sequencing for `await`-containing handlers. -/
+@[inline, specialize]
+def srvSeqM {m : Type → Type} [Monad m] {ρ : Type}
+    (first : m (Option ρ)) (next : Unit → m (Option ρ)) : m (Option ρ) := do
+  match ← first with
+  | some r => return some r
+  | none   => next ()
+
+@[inline, specialize]
+def srvFinishM {E : Type} [SrvErr E] {m : Type → Type} [Monad m] {α : Type}
+    (res : m (Option (Except E α))) : m (Except E α) := do
+  match ← res with
+  | some r => return r
+  | none   => return .error (SrvErr.ofApi (ApiError.internal "unreachable missing return"))
+
+/-! ## Opaque Equality-Abstracted SSA Stepping (`srvLetEq`) -/
+
+/-- Continuation-passing equality binder keeping intermediate state updates opaque (`cdecl` + `hx : x = val`)
+    so bounds checks and invariant leaves never suffer `zetaDelta` term-size blowup. -/
+@[inline]
+def srvLetEq {α β : Type} (val : α) (k : (x : α) → x = val → β) : β :=
+  k val rfl
+
+theorem srvLetEq_elim {α β : Type} (P : β → Prop) (val : α) (k : (x : α) → x = val → β)
+    (hk : ∀ (x : α) (hx : x = val), P (k x hx)) : P (srvLetEq val k) :=
+  hk val rfl
+
+@[simp] theorem srvFinish_srvLetEq {E σ α γ : Type} [SrvErr E] (s₀ : σ) (val : γ)
+    (k : (x : γ) → x = val → σ × Option (Except E α)) :
+    srvFinish s₀ (srvLetEq val k) = srvLetEq val (fun x hx => srvFinish s₀ (k x hx)) := rfl
+
+@[simp] theorem srvAtomicCommit_srvLetEq {E σ α γ : Type} (s₀ : σ) (val : γ)
+    (k : (x : γ) → x = val → σ × Option (Except E α)) :
+    srvAtomicCommit s₀ (srvLetEq val k) = srvLetEq val (fun x hx => srvAtomicCommit s₀ (k x hx)) := rfl
+
+@[simp] theorem srvSeq_srvLetEq {σ ρ γ : Type} (val : γ)
+    (k : (x : γ) → x = val → σ × Option ρ) (next : σ → σ × Option ρ) :
+    srvSeq (srvLetEq val k) next = srvLetEq val (fun x hx => srvSeq (k x hx) next) := rfl
+
+@[simp] theorem srvFinishEmit_srvLetEq {E σ α γ : Type} [SrvErr E] (s₀ : σ) (val : γ)
+    (k : (x : γ) → x = val → σ × List WsEmit × Option (Except E α)) :
+    srvFinishEmit s₀ (srvLetEq val k) = srvLetEq val (fun x hx => srvFinishEmit s₀ (k x hx)) := rfl
+
+@[simp] theorem srvAtomicCommitEmit_srvLetEq {E σ α γ : Type} (s₀ : σ) (val : γ)
+    (k : (x : γ) → x = val → σ × List WsEmit × Option (Except E α)) :
+    srvAtomicCommitEmit s₀ (srvLetEq val k) = srvLetEq val (fun x hx => srvAtomicCommitEmit s₀ (k x hx)) := rfl
+
+@[simp] theorem srvEmitSeq_srvLetEq {σ ρ γ : Type} (val : γ)
+    (k : (x : γ) → x = val → σ × List WsEmit × Option ρ)
+    (next : σ → List WsEmit → σ × List WsEmit × Option ρ) :
+    srvEmitSeq (srvLetEq val k) next = srvLetEq val (fun x hx => srvEmitSeq (k x hx) next) := rfl
+
+@[simp] theorem prod_fst_srvLetEq {α β γ : Type} (val : γ)
+    (k : (x : γ) → x = val → α × β) :
+    (srvLetEq val k).1 = srvLetEq val (fun x hx => (k x hx).1) := rfl
+
+@[simp] theorem prod_snd_srvLetEq {α β γ : Type} (val : γ)
+    (k : (x : γ) → x = val → α × β) :
+    (srvLetEq val k).2 = srvLetEq val (fun x hx => (k x hx).2) := rfl
+
+@[reducible, inline]
+def srvGetAt {α : Type} (xs : Array α) (i : Nat) (h : i < xs.size) : α :=
+  xs[i]'h
+
+@[simp] theorem srvGetAt_eq {α : Type} (xs : Array α) (i : Nat) (h : i < xs.size) :
+    srvGetAt xs i h = xs[i]'h := rfl
+
+@[inline]
+def srvWithNewState {σ : Type} (sNew : σ) (P : σ → Prop) : Prop := P sNew
+
+@[simp] theorem srvWithNewState_srvLetEq {σ γ : Type} (val : γ)
+    (k : (x : γ) → x = val → σ) (P : σ → Prop) :
+    srvWithNewState (srvLetEq val k) P = srvLetEq val (fun x hx => srvWithNewState (k x hx) P) := rfl
+
+theorem srvWithNewState_apply {σ : Type} (s : σ) (P : σ → Prop) :
+    srvWithNewState s P = P s := rfl
+
+@[inline]
+def srvEnsPost {ε α : Type} (P : α → Prop) : Except ε α → Prop
+  | .ok r    => P r
+  | .error _ => True
+
+@[simp] theorem srvEnsPost_ok {ε α : Type} (P : α → Prop) (r : α) :
+    srvEnsPost (ε := ε) P (.ok r) = P r := rfl
+
+@[simp] theorem srvEnsPost_err {ε α : Type} (P : α → Prop) (e : ε) :
+    srvEnsPost P (.error e) = True := rfl
+
+@[simp] theorem srvEnsPost_srvLetEq {ε α γ : Type} (P : α → Prop) (val : γ)
+    (k : (x : γ) → x = val → Except ε α) :
+    srvEnsPost P (srvLetEq val k) = srvLetEq val (fun x hx => srvEnsPost P (k x hx)) := rfl
+
+@[inline]
+def srvEnsPostOpt {ε α : Type} (P : α → Prop) : Except ε (Option α) → Prop
+  | .ok (some r) => P r
+  | _            => True
+
+@[simp] theorem srvEnsPostOpt_some {ε α : Type} (P : α → Prop) (r : α) :
+    srvEnsPostOpt (ε := ε) P (.ok (some r)) = P r := rfl
+
+@[simp] theorem srvEnsPostOpt_none {ε α : Type} (P : α → Prop) :
+    srvEnsPostOpt (ε := ε) P (.ok none) = True := rfl
+
+@[simp] theorem srvEnsPostOpt_err {ε α : Type} (P : α → Prop) (e : ε) :
+    srvEnsPostOpt P (.error e) = True := rfl
+
+@[simp] theorem srvEnsPostOpt_srvLetEq {ε α γ : Type} (P : α → Prop) (val : γ)
+    (k : (x : γ) → x = val → Except ε (Option α)) :
+    srvEnsPostOpt P (srvLetEq val k) = srvLetEq val (fun x hx => srvEnsPostOpt P (k x hx)) := rfl
+
+theorem getElem_congr_arr {α : Type} {xs ys : Array α} {j : Nat}
+    (heq : ys = xs) (hj : j < ys.size) :
+    ys[j]'hj = xs[j]'(heq ▸ hj) := by
+  cases heq; rfl
+
+theorem srvGetAt_congr_arr {α : Type} {xs ys : Array α} {j : Nat}
+    (heq : ys = xs) (hj : j < ys.size) :
+    srvGetAt ys j hj = xs[j]'(heq ▸ hj) := by
+  cases heq; rfl
 
 end Qed.Server

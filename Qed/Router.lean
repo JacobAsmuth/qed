@@ -1,4 +1,5 @@
 import Qed.Router.Basic
+import Qed.Router.Macro
 import Qed.Json
 import Qed.Proto
 

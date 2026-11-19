@@ -1,6 +1,6 @@
 import Qed.Render
 import Qed.Diff
-import Qed.Style
+import Qed.Style.Core
 import Qed.Notation
 import Std.Data.HashSet
 

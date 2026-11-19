@@ -53,6 +53,18 @@ def before (a b : Date) : Bool :=
 
 end Date
 
+instance : BEq Date := ⟨fun a b => a.year == b.year && a.month == b.month && a.day == b.day⟩
+instance : LawfulBEq Date where
+  eq_of_beq {a b} h := by
+    cases a; cases b
+    change (_ == _ && _ == _ && _ == _) = true at h
+    simp only [Bool.and_eq_true, beq_iff_eq] at h
+    rcases h with ⟨⟨hy, hm⟩, hd⟩
+    subst hy; subst hm; subst hd; rfl
+  rfl {a} := by
+    cases a
+    change (_ == _ && _ == _ && _ == _) = true
+    simp only [beq_self_eq_true, Bool.and_self]
 instance : LT Date := ⟨fun a b => a.before b = true⟩
 instance : LE Date := ⟨fun a b => b.before a = false⟩
 instance (a b : Date) : Decidable (a < b) := inferInstanceAs (Decidable (a.before b = true))

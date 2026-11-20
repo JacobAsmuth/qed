@@ -14,19 +14,28 @@ def splitDashes : List String → List String × List String
 
 private def loadEnv (mods : List String) : IO Environment := do
   let imports := mods.map fun m => ({ module := m.toName } : Import)
-  importModules imports.toArray {} (trustLevel := 1024)
+  importModules imports.toArray {} (trustLevel := 1024) (leakEnv := true)
 
 private def orThrow {α : Type} : Except String α → IO α
   | .ok v    => pure v
   | .error e => throw (IO.userError e)
 
-private def parseRtFlag : List String → Except String (Option String × List String)
-  | [] => .ok (none, [])
-  | ["--rt"] => .error "missing argument for `--rt`"
-  | "--rt" :: path :: rest => return (some path, (← parseRtFlag rest).2)
-  | a :: rest => do
-      let (rt, rem) ← parseRtFlag rest
-      return (rt, a :: rem)
+private structure JsCliFlags where
+  min : Bool := false
+  rt? : Option String := none
+  css? : Option (String × String) := none
+
+private def parseJsFlags : List String → JsCliFlags → Except String (JsCliFlags × List String)
+  | [], f => .ok (f, [])
+  | "--min" :: rest, f => parseJsFlags rest { f with min := true }
+  | ["--rt"], _ => .error "missing argument for `--rt`"
+  | "--rt" :: path :: rest, f => parseJsFlags rest { f with rt? := some path }
+  | ["--css"], _ => .error "missing arguments for `--css <out.css> <appDecl>`"
+  | ["--css", _], _ => .error "missing arguments for `--css <out.css> <appDecl>`"
+  | "--css" :: cssPath :: appDecl :: rest, f => parseJsFlags rest { f with css? := some (cssPath, appDecl) }
+  | a :: rest, f => do
+      let (f', rem) ← parseJsFlags rest f
+      return (f', a :: rem)
 
 private def splitAlso : List String → List String × Option (String × List String)
   | [] => ([], none)
@@ -132,15 +141,19 @@ def main (args : List String) : IO Unit := do
     let avail := Js.rtExports (← IO.FS.readFile rtPath)
     orThrow (Js.checkRtExterns avail externs)
   | _ =>
-    let min := args.contains "--min"
-    let (rt?, cleanArgs) ← orThrow (parseRtFlag (args.filter (· ≠ "--min")))
+    let (flags, cleanArgs) ← orThrow (parseJsFlags args {})
     let (head, restWithAlso) := splitDashes cleanArgs
     let (rest, also?) := splitAlso restWithAlso
     match head with
     | out :: mods =>
       let env ← loadEnv mods
-      let avail? ← rt?.mapM fun rtPath => return Js.rtExports (← IO.FS.readFile rtPath)
-      writeJsBundle env avail? out rest min
+      let avail? ← flags.rt?.mapM fun rtPath => return Js.rtExports (← IO.FS.readFile rtPath)
+      writeJsBundle env avail? out rest flags.min
       if let some (out2, entries2) := also? then
-        writeJsBundle env avail? out2 entries2 min
-    | [] => throw (IO.userError "usage: qedjs [--min] [--rt <rt.mjs>] <out.mjs> <module>… -- <decl>[:<export>]… [--also <out2.mjs> -- <decl>…]")
+        writeJsBundle env avail? out2 entries2 flags.min
+      if let some (cssOut, appDecl) := flags.css? then
+        try
+          emitCssForApp env cssOut (parseEntry appDecl).1
+        catch _ =>
+          IO.println "HAS_CSS:0"
+    | [] => throw (IO.userError "usage: qedjs [--min] [--rt <rt.mjs>] [--css <out.css> <appDecl>] <out.mjs> <module>… -- <decl>[:<export>]… [--also <out2.mjs> -- <decl>…]")

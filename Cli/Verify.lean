@@ -147,9 +147,11 @@ def grepForbidden : IO Bool := do
       clean := false
   return clean
 
-def axiomClean : IO Bool := do
+def axiomClean (leanPath? : Option String := none) : IO Bool := do
   if !(← axiomsManifest.pathExists) then return true
-  let (code, out) ← shOut "lake" #["env", "lean", "--root=.", axiomsManifest.toString]
+  let (code, out) ← match leanPath? with
+    | some lp => shOut "lean" #["--root=.", axiomsManifest.toString] #[("LEAN_PATH", some lp)]
+    | none    => shOut "lake" #["env", "lean", "--root=.", axiomsManifest.toString]
   let clean := code == 0
     && !out.contains "sorryAx"
     && !out.contains "Lean.ofReduceBool"
@@ -232,23 +234,36 @@ def externsCovered (q? : Option QedjsEnv := none) (alreadyBuilt : Bool := false)
   let some q ← (match q? with | some e => pure (some e) | none => resolveQedjsEnv) | return false
   q.run (#["--check-externs", rtPath.toString] ++ mods ++ #["--"] ++ entries) (quiet := true)
 
-def verify (checkExterns : Bool := true) : IO Bool := do
+def verify (checkExterns : Bool := true) (extraLakeTargets : Array String := #[]) : IO Bool := do
   step "verifying proofs & axioms"
   let hasExamples ← (FilePath.mk "Examples").pathExists
-  if hasExamples then
-    if (← shLakeBuild #["build", "Qed", "Qed.Driver", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples", "Tests"]) != 0 then return false
+  -- Start source-only checks and LEAN_PATH lookup in parallel with `lake build`.
+  let tGrep ← IO.asTask grepForbidden
+  let tEff ← if hasExamples then IO.asTask effectsCovered else IO.asTask (pure true)
+  let tLp ← IO.asTask lakeEnvLeanPath
+  let lakeOk ← if hasExamples then
+    let base := #["Qed", "Qed.Driver", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples", "Tests"]
+    let extra := extraLakeTargets.filter (!base.contains ·)
+    pure ((← shLakeBuild (#["build"] ++ base ++ extra)) == 0)
   else
     let root ← webRoot
     let jsMod ← jsRoot
-    let targets := if checkExterns && jsMod != root then #[root, jsMod] else #[root]
-    if (← shLakeBuild (#["build"] ++ targets)) != 0 then return false
-  let tGrep ← IO.asTask grepForbidden
-  let tAxiom ← IO.asTask axiomClean
-  let tEff ← if hasExamples then IO.asTask effectsCovered else IO.asTask (pure true)
-  let q? ← resolveQedjsEnv (needBuild := false)
-  let tExt ← if checkExterns && hasExamples then IO.asTask (externsCovered q? (alreadyBuilt := true)) else IO.asTask (pure true)
+    let base := if checkExterns && jsMod != root then #[root, jsMod] else #[root]
+    let extra := extraLakeTargets.filter (!base.contains ·)
+    pure ((← shLakeBuild (#["build"] ++ base ++ extra)) == 0)
+  if !lakeOk then
+    discard <| IO.wait tGrep
+    discard <| IO.wait tEff
+    discard <| IO.wait tLp
+    return false
+  let lp? := (← IO.wait tLp).toOption.join
+  let q? ← match ← resolveQedjsBin (needBuild := false), lp? with
+    | some bin, some leanPath => pure (some { bin, leanPath : QedjsEnv })
+    | _, _ => resolveQedjsEnv (needBuild := false)
+  let tAxiom ← IO.asTask (axiomClean (q?.map (·.leanPath)))
+  let tExt ← if checkExterns then IO.asTask (externsCovered q? (alreadyBuilt := true)) else IO.asTask (pure true)
   let ok3 ← kernelEnvClean q? (alreadyBuilt := true)
-  let ok5 ← if checkExterns && !hasExamples && ok3 then externsCovered q? (alreadyBuilt := true) else pure ((← IO.wait tExt).toOption.getD false)
+  let ok5 := (← IO.wait tExt).toOption.getD false
   let ok1 := (← IO.wait tGrep).toOption.getD false
   let ok2 := (← IO.wait tAxiom).toOption.getD false
   let ok4 := (← IO.wait tEff).toOption.getD false

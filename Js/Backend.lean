@@ -345,8 +345,9 @@ end
 -- require falling back to `$.tc`.
 mutual
 def hasSelfTailAux (self : Name) (onlyRecJp active : Bool) : FnBody → Bool
-  | .vdecl z _ (.fap f _) cont => (active && f == self && retsVar z cont) || hasSelfTailAux self onlyRecJp active cont
-  | .vdecl _ _ _ b    => hasSelfTailAux self onlyRecJp active b
+  | .vdecl z _ e cont =>
+      (match e with | .fap f _ => active && f == self && retsVar z cont | _ => false) ||
+      hasSelfTailAux self onlyRecJp active cont
   | .jdecl j _ v b    =>
       let activeV := if onlyRecJp then active || hasJmpTo j v else active
       hasSelfTailAux self onlyRecJp activeV v || hasSelfTailAux self onlyRecJp active b
@@ -388,15 +389,18 @@ def hasDecOf (p : Nat) : FnBody → Bool
   | .dec y _ _ _ b => p == y.idx || hasDecOf p b
   | .del y b       => p == y.idx || hasDecOf p b
   | .inc _ _ _ _ b => hasDecOf p b
-  | .vdecl _ _ (.proj ..) b | .vdecl _ _ (.uproj ..) b | .vdecl _ _ (.sproj ..) b => hasDecOf p b
+  | .vdecl _ _ e b => match e with
+      | .proj .. | .uproj .. | .sproj .. => hasDecOf p b
+      | _ => false
   | _              => false
 
 mutual
 def collectProjSrc (calls : Std.HashSet Nat) (acc : Std.HashMap Nat Nat) : FnBody → Std.HashMap Nat Nat
-  | .vdecl x _ (.fap ..) b | .vdecl x _ (.ap ..) b => collectProjSrc (calls.insert x.idx) acc b
-  | .vdecl x _ (.proj _ p) b =>
-      collectProjSrc calls (if calls.contains p.idx then acc.insert x.idx p.idx else acc) b
-  | .vdecl _ _ _ b => collectProjSrc calls acc b
+  | .vdecl x _ e b => match e with
+      | .fap .. | .ap .. => collectProjSrc (calls.insert x.idx) acc b
+      | .proj _ p =>
+          collectProjSrc calls (if calls.contains p.idx then acc.insert x.idx p.idx else acc) b
+      | _ => collectProjSrc calls acc b
   | .jdecl _ _ v b => collectProjSrc calls (collectProjSrc calls acc v) b
   | .case _ _ _ alts => collectProjSrcAlts calls acc alts.toList
   | .set _ _ _ b | .setTag _ _ b | .uset _ _ _ b | .sset _ _ _ _ _ b

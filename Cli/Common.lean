@@ -311,6 +311,17 @@ def lakeEnvLeanPath : IO (Option String) := do
     if !trimmed.isEmpty then
       leanPathCache.set (some trimmed)
       return some trimmed
+  let isInRepo ← (FilePath.mk "Examples").pathExists
+  let hasPkgs ← (FilePath.mk ".lake" / "packages").pathExists
+  if isInRepo && !hasPkgs then
+    let o ← IO.Process.output { cmd := "lean", args := #["--print-libdir"] }
+    if o.exitCode == 0 then
+      let sysLib := o.stdout.trimmed
+      if !sysLib.isEmpty then
+        let cwd ← IO.currentDir
+        let lp := s!"{cwd / ".lake" / "build" / "lib" / "lean"}:{sysLib}"
+        leanPathCache.set (some lp)
+        return some lp
   let o ← IO.Process.output { cmd := "lake", args := #["env", "printenv", "LEAN_PATH"] }
   if o.exitCode != 0 then
     IO.eprint (o.stdout ++ o.stderr)
@@ -364,5 +375,18 @@ def QedjsEnv.run (q : QedjsEnv) (args : Array String) (quiet : Bool := false)
   let env := #[("LEAN_PATH", some lp)]
   let code ← if quiet then shQuiet q.bin.toString args env else sh q.bin.toString args env
   return code == 0
+
+def QedjsEnv.runOut (q : QedjsEnv) (args : Array String) (quiet : Bool := false)
+    (extraPath : Option String := none) : IO (Bool × String) := do
+  let lp := match extraPath with | some p => s!"{p}:{q.leanPath}" | none => q.leanPath
+  let (code, out) ← shOut q.bin.toString args #[("LEAN_PATH", some lp)]
+  if code != 0 then
+    IO.eprint out
+  else if !quiet then
+    for line in out.splitOn "\n" do
+      let t := line.trimmed
+      if !t.isEmpty && !t.startsWith "HAS_CSS:" && !t.startsWith "STYLESHEET:" then
+        IO.println line
+  return (code == 0, out)
 
 end Qed.Cli

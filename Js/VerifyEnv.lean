@@ -18,24 +18,48 @@ def definingModule (env : Environment) (declName : Name) : Name :=
   | some idx => env.header.moduleNames.getD idx.toNat Name.anonymous
   | none     => Name.anonymous
 
+private def isAllowedKernelAxiom (n : Name) : Bool :=
+  n == ``propext || n == ``Classical.choice || n == ``Quot.sound
+
+private def rootTwoAux : Name → Option String → Option (String × Option String)
+  | .str .anonymous r, second => some (r, second)
+  | .str p s, _               => rootTwoAux p (some s)
+  | .num p _, _               => rootTwoAux p none
+  | .anonymous, _             => none
+
 private def isMetaNamespaceConst (n : Name) : Bool :=
-  let s := n.toString
-  s.startsWith "Lean.Syntax" ||
-  s.startsWith "Lean.TSyntax" ||
-  s.startsWith "Lean.Macro" ||
-  s.startsWith "Lean.Elab" ||
-  s.startsWith "Lean.Meta" ||
-  s.startsWith "Lean.Parser" ||
-  s.startsWith "Lean.PrettyPrinter" ||
-  s.startsWith "Lean.Environment" ||
-  s.startsWith "Lean.IR" ||
-  s.startsWith "Qq."
+  match rootTwoAux n none with
+  | some ("Lean", some s) =>
+      s.startsWith "Syntax" ||
+      s.startsWith "TSyntax" ||
+      s.startsWith "Macro" ||
+      s.startsWith "Elab" ||
+      s.startsWith "Meta" ||
+      s.startsWith "Parser" ||
+      s.startsWith "PrettyPrinter" ||
+      s.startsWith "Environment" ||
+      s.startsWith "IR"
+  | some ("Qq", _) => n != `Qq
+  | _ => false
 
 private def exprMentionsMeta (e : Expr) : Bool :=
-  e.getUsedConstants.any isMetaNamespaceConst
+  e.foldConsts false fun c acc => acc || isMetaNamespaceConst c
+
+private def isWhileLoopConst : Name → Bool
+  | .str (.str (.str p r) "Loop") s =>
+      if r.endsWith "Lean" && s.startsWith "forIn" then true
+      else isWhileLoopConst (.str (.str p r) "Loop")
+  | .str p s => (s.length >= 15 && s.contains "Lean.Loop.forIn") || isWhileLoopConst p
+  | .num p _ => isWhileLoopConst p
+  | .anonymous => false
 
 private def exprMentionsWhileLoop (e : Expr) : Bool :=
-  e.getUsedConstants.any fun c => c.toString.contains "Lean.Loop.forIn"
+  e.foldConsts false fun c acc => acc || isWhileLoopConst c
+
+private def hasRegBuiltin : Name → Bool
+  | .str p s => s.contains "_regBuiltin" || hasRegBuiltin p
+  | .num p _ => hasRegBuiltin p
+  | .anonymous => false
 
 /-- Find the root declaration of a compiler-synthesized `_unsafe_rec` / stage auxiliary, if any. -/
 private def stripCompilerRecSuffix : Name → Option Name
@@ -82,7 +106,6 @@ def isLegitOpaque (env : Environment) (modName declName : Name) : Bool :=
     any Qed web or SSR runtime bundle; runtime bundles are additionally checked with zero meta
     exemptions by `verifyReachable`). -/
 def isCompileTimeMetaDecl (env : Environment) (declName : Name) (ci : ConstantInfo) : Bool :=
-  let nameStr := declName.toString
   if exprMentionsMeta ci.type then true
   else match ci.value? with
   | some v => exprMentionsMeta v
@@ -93,37 +116,71 @@ def isCompileTimeMetaDecl (env : Environment) (declName : Name) (ci : ConstantIn
         | some pci => exprMentionsMeta pci.type || (pci.value?.any exprMentionsMeta)
         | none     => false
       else
-        nameStr.contains "_regBuiltin"
+        hasRegBuiltin declName
 
 private inductive AxiomCheckErr where
   | disallowed (ax : Name)
   | fuelExhausted (pending : Name)
 
-private def checkAxiomStep (env : Environment) :
-    Nat → List Name → Std.HashSet Name → Std.HashSet Name → Except AxiomCheckErr (Std.HashSet Name)
-  | _, [], clean, visiting => .ok (visiting.fold (fun acc n => acc.insert n) clean)
-  | 0, n :: _, _, _ => .error (.fuelExhausted n)
-  | fuel + 1, n :: rest, clean, visiting =>
-      if clean.contains n || visiting.contains n then
-        checkAxiomStep env fuel rest clean visiting
+private def pushExprDeps (e : Expr) (clean : Std.HashSet Name) (stack : Array Name) : Array Name :=
+  e.foldConsts stack fun c acc => if clean.contains c then acc else acc.push c
+
+private def pushConstDeps (ci : ConstantInfo) (clean : Std.HashSet Name) (stack : Array Name) : Array Name :=
+  let stack := pushExprDeps ci.type clean stack
+  match ci with
+  | .defnInfo val   => pushExprDeps val.value clean stack
+  | .thmInfo val    => pushExprDeps val.value clean stack
+  | .opaqueInfo val => pushExprDeps val.value clean stack
+  | .inductInfo val => val.ctors.foldl (fun acc c => if clean.contains c then acc else acc.push c) stack
+  | .ctorInfo val   => if clean.contains val.name then stack else stack.push val.name
+  | .recInfo val    => val.all.foldl (fun acc c => if clean.contains c then acc else acc.push c) stack
+  | _ => stack
+
+private def checkAxiomLoop (env : Environment) (declName : Name) (initCi? : Option ConstantInfo)
+    (clean : Std.HashSet Name) : Except AxiomCheckErr (Std.HashSet Name) := Id.run do
+  if clean.contains declName then return .ok clean
+  let mut clean := clean
+  let mut stack : Array Name := #[]
+  let mut fuel : Nat := 2000000
+  match initCi? with
+  | some (.axiomInfo ax) =>
+      if isAllowedKernelAxiom ax.name && !ax.isUnsafe then
+        return .ok (clean.insert declName)
       else
-        match env.find? n with
-        | none => checkAxiomStep env fuel rest clean (visiting.insert n)
-        | some (.axiomInfo ax) =>
-            if allowedKernelAxioms.contains ax.name && !ax.isUnsafe then
-              checkAxiomStep env fuel rest (clean.insert n) visiting
-            else
-              .error (.disallowed ax.name)
-        | some ci =>
-            let deps := ci.getUsedConstantsAsSet.toList
-            checkAxiomStep env fuel (deps ++ rest) clean (visiting.insert n)
+        return .error (.disallowed ax.name)
+  | some ci =>
+      fuel := fuel - 1
+      clean := clean.insert declName
+      stack := pushConstDeps ci clean stack
+  | none =>
+      stack := stack.push declName
+  while !stack.isEmpty do
+    let n := stack.back!
+    stack := stack.pop
+    if clean.contains n then
+      continue
+    if fuel == 0 then
+      return .error (.fuelExhausted n)
+    fuel := fuel - 1
+    match env.find? n with
+    | none =>
+        clean := clean.insert n
+    | some (.axiomInfo ax) =>
+        if isAllowedKernelAxiom ax.name && !ax.isUnsafe then
+          clean := clean.insert n
+        else
+          return .error (.disallowed ax.name)
+    | some ci =>
+        clean := clean.insert n
+        stack := pushConstDeps ci clean stack
+  return .ok clean
 
 /-- Verify that `declName`'s transitive kernel expression dependencies only use axioms in
     `{propext, Classical.choice, Quot.sound}`, reusing `clean` across calls for O(E) performance.
     Fails closed if traversal exceeds fuel. -/
 def verifyConstAxioms (env : Environment) (declName : Name)
-    (clean : Std.HashSet Name) : Except String (Std.HashSet Name) :=
-  match checkAxiomStep env 2000000 [declName] clean {} with
+    (clean : Std.HashSet Name) (initCi? : Option ConstantInfo := none) : Except String (Std.HashSet Name) :=
+  match checkAxiomLoop env declName initCi? clean with
   | .ok clean' => .ok clean'
   | .error (.disallowed badAx) =>
       .error s!"kernel gate: `{declName}` depends on disallowed axiom `{badAx}` (only {allowedKernelAxioms} are permitted)"
@@ -155,7 +212,7 @@ def isServerOwner (env : Environment) (owner : Name) : Bool :=
   if owner.isAnonymous then false
   else if env.contains (owner ++ `_qed_server_marker) then true
   else match env.find? (owner ++ `dispatchM) with
-    | some ci => ci.type.getUsedConstants.any (· == `Qed.Server.RequestCtx)
+    | some ci => ci.type.foldConsts false fun c acc => acc || c == `Qed.Server.RequestCtx
     | none    => false
 
 /-- True iff `owner` is an `external` service namespace (marked by `_qed_external_marker`). -/
@@ -211,9 +268,9 @@ def verifyNoServerLeakInClient (env : Environment) (reachable : Array Name) : Ex
     must be total, safe, free of `@[implemented_by]` / `partial` / `while` (`Lean.Loop.forIn`),
     free of unverified `@[extern]`s, and proved solely from standard Lean axioms. -/
 def verifyReachable (env : Environment) (reachable : Array Name) : Except String Unit := do
-  let mut clean : Std.HashSet Name := {}
+  let mut clean : Std.HashSet Name := Std.HashSet.emptyWithCapacity 4096
   for n in reachable do
-    if n.toString.contains "Lean.Loop.forIn" then
+    if isWhileLoopConst n then
       throw s!"kernel gate: unbounded `while`/`repeat` loop (`{n}`) is reachable at runtime"
     if !isTotalCompilerAux env n then
       clean ← verifyConstAxioms env n clean
@@ -232,28 +289,64 @@ def isFrameworkModule (modName : Name) : Bool :=
   let root := modName.getRoot
   root == `Qed || root == `Js || root == `Cli
 
-def verifyProjectEnv (env : Environment) (skipFramework : Bool := false) : Except String Nat := do
-  let mut clean : Std.HashSet Name := {}
+private def verifyModuleIndices (env : Environment) (idxs : Array Nat) (initCap : Nat) : Except String Nat := do
+  let mut clean : Std.HashSet Name := Std.HashSet.emptyWithCapacity initCap
   let mut checkedCount : Nat := 0
   let modNames := env.header.moduleNames
   let modData  := env.header.moduleData
+  for i in idxs do
+    let modName := modNames[i]!
+    let consts := modData[i]!.constants
+    checkedCount := checkedCount + consts.size
+    for ci in consts do
+      let n := ci.name
+      match ci with
+      | .axiomInfo _ =>
+          throw s!"kernel gate: custom `axiom {n}` declared in `{modName}` is forbidden"
+      | .thmInfo _ =>
+          clean ← verifyConstAxioms env n clean (some ci)
+      | _ =>
+          if !isCompileTimeMetaDecl env n ci then
+            verifyUserDecl env modName n (some ci)
+            if !isTotalCompilerAux env n then
+              clean ← verifyConstAxioms env n clean (some ci)
+  return checkedCount
+
+def verifyProjectEnv (env : Environment) (skipFramework : Bool := false) : Except String Nat := do
+  let modNames := env.header.moduleNames
+  let modData  := env.header.moduleData
+  let mut active : Array (Nat × Nat) := #[]
+  let mut totalDecls : Nat := 0
   for i in [0:modNames.size] do
     let modName := modNames[i]!
     let skip := isToolchainModule modName || (skipFramework && isFrameworkModule modName)
     if !skip && i < modData.size then
-      for n in modData[i]!.constNames do
-        if let some ci := env.find? n then
-          checkedCount := checkedCount + 1
-          match ci with
-          | .axiomInfo _ =>
-              throw s!"kernel gate: custom `axiom {n}` declared in `{modName}` is forbidden"
-          | .thmInfo _ =>
-              clean ← verifyConstAxioms env n clean
-          | _ =>
-              if !isCompileTimeMetaDecl env n ci then
-                verifyUserDecl env modName n (some ci)
-                if !isTotalCompilerAux env n then
-                  clean ← verifyConstAxioms env n clean
+      let sz := modData[i]!.constants.size
+      if sz > 0 then
+        active := active.push (i, sz)
+        totalDecls := totalDecls + sz
+  if totalDecls < 4000 || active.size < 4 then
+    return ← verifyModuleIndices env (active.map Prod.fst) (max 4096 (totalDecls * 2))
+  -- Greedy longest-processing-time partition across up to 8 workers for balanced parallel checking.
+  let sorted := active.qsort fun a b => a.2 > b.2
+  let nWorkers := min 8 active.size
+  let mut buckets : Array (Array Nat) := Array.replicate nWorkers #[]
+  let mut loads : Array Nat := Array.replicate nWorkers 0
+  for (idx, sz) in sorted do
+    let mut bestW := 0
+    let mut bestLoad := loads[0]!
+    for w in [1:nWorkers] do
+      let l := loads[w]!
+      if l < bestLoad then
+        bestW := w
+        bestLoad := l
+    buckets := buckets.set! bestW (buckets[bestW]!.push idx)
+    loads := loads.set! bestW (bestLoad + sz)
+  let tasks := buckets.map fun b =>
+    Task.spawn fun _ => verifyModuleIndices env b 16384
+  let mut checkedCount : Nat := 0
+  for t in tasks do
+    checkedCount := checkedCount + (← t.get)
   return checkedCount
 
 end Js

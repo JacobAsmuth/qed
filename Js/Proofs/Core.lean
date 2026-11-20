@@ -88,23 +88,48 @@ def jsReservedWords : List String :=
    "yield", "await", "implements", "interface", "package", "private", "protected", "public", "static",
    "__step", "__r", "__externs", "Error", "Object", "Array"]
 private def hasInternalIdentShape (s : String) : Bool :=
-  match s.toList with | '$' :: '.' :: _ | '_' :: 'j' :: _ => true | 'x' :: ds | 'j' :: ds | '_' :: 'g' :: ds => !ds.isEmpty && ds.all Char.isDigit | _ => false
-private theorem digits_nonempty_isDigit (n : Nat) : !(toString n).toList.isEmpty && (toString n).toList.all Char.isDigit = true := by
-  have hne : (toString n).toList ≠ [] := by cases n with | zero => decide | succ k => intro h; have hf := fromDigits_toString (k + 1); rw [h] at hf; simp [fromDigits] at hf
-  cases hcs : (toString n).toList with | nil => exact absurd hcs hne | cons _ _ =>
-    simp only [List.isEmpty_cons, Bool.not_false, Bool.true_and, List.all_eq_true, decide_eq_true_eq]; exact fun ch hch => nat_toString_digits n ch (by rw [hcs]; exact hch)
+  match s.toByteArray.data.toList with
+  | 120 :: _ | 106 :: _ | 36 :: _ | 95 :: 103 :: _ | 95 :: 106 :: _ => true
+  | _ => false
+
+private def noInternalIdentShapes : List String → Bool
+  | [] => true
+  | w :: ws => !hasInternalIdentShape w && noInternalIdentShapes ws
+
+private theorem noInternalIdentShapes_mem : ∀ {ws : List String}, noInternalIdentShapes ws = true → ∀ w ∈ ws, hasInternalIdentShape w = false
+  | [], _, _, h => nomatch h
+  | w :: ws, hall, x, hx => by
+      dsimp only [noInternalIdentShapes] at hall
+      have ⟨h1, h2⟩ := Bool.and_eq_true_iff.1 hall
+      have hw : hasInternalIdentShape w = false := by cases h : hasInternalIdentShape w <;> simp [h] at h1; rfl
+      exact (List.mem_cons.1 hx).elim (fun e => e ▸ hw) (noInternalIdentShapes_mem h2 x)
+
+private theorem toByteArray_toList_append (a b : String) : (a ++ b).toByteArray.data.toList = a.toByteArray.data.toList ++ b.toByteArray.data.toList := by
+  rw [String.toByteArray_append, ByteArray.data_append, Array.toList_append]
+
+private theorem hasInternalIdentShape_b1 (p t : String) (b : UInt8) (hp : p.toByteArray.data.toList = [b]) (hb : b = 120 ∨ b = 106 ∨ b = 36) :
+    hasInternalIdentShape (p ++ t) = true := by
+  unfold hasInternalIdentShape; rw [toByteArray_toList_append, hp]; rcases hb with rfl | rfl | rfl <;> rfl
+
+private theorem hasInternalIdentShape_b2 (p t : String) (b0 b1 : UInt8) (hp : p.toByteArray.data.toList = [b0, b1]) (hb : (b0 = 95 ∧ b1 = 103) ∨ (b0 = 95 ∧ b1 = 106) ∨ b0 = 36) :
+    hasInternalIdentShape (p ++ t) = true := by
+  unfold hasInternalIdentShape; rw [toByteArray_toList_append, hp]; rcases hb with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | rfl <;> rfl
 
 /-- Every compiler-generated JS identifier (`v`, `jp`, `genGlobalName`, `inlineJpSlot`, `"$." ++ ext`) is disjoint from all ECMAScript reserved words. -/
 theorem ident_ne_jsKeyword (x : VarId) (j : JoinPointId) (k i : Nat) (ext : String) :
     v x ∉ jsReservedWords ∧ jp j ∉ jsReservedWords ∧ genGlobalName k ∉ jsReservedWords ∧ inlineJpSlot j i ∉ jsReservedWords ∧ ("$." ++ ext) ∉ jsReservedWords := by
-  have hres : ∀ w ∈ jsReservedWords, hasInternalIdentShape w = false := by decide
-  have noRes {s : String} (hs : hasInternalIdentShape s = true) : s ∉ jsReservedWords := fun hm => by have := hres s hm; rw [hs] at this; contradiction
-  refine ⟨noRes ?_, noRes ?_, noRes ?_, noRes ?_, noRes ?_⟩
-  · simpa [hasInternalIdentShape, v, String.toList_append] using digits_nonempty_isDigit x.idx
-  · simpa [hasInternalIdentShape, jp, String.toList_append] using digits_nonempty_isDigit j.idx
-  · simpa [hasInternalIdentShape, genGlobalName, String.toList_append] using digits_nonempty_isDigit k
-  · simp [hasInternalIdentShape, inlineJpSlot, jp, String.toList_append]
-  · simp [hasInternalIdentShape]
+  have hall : noInternalIdentShapes jsReservedWords = true := rfl
+  have noRes {s : String} (hs : hasInternalIdentShape s = true) : s ∉ jsReservedWords := fun hm => by
+    have := noInternalIdentShapes_mem hall s hm; rw [hs] at this; exact nomatch this
+  refine ⟨noRes (hasInternalIdentShape_b1 "x" _ 120 rfl (.inl rfl)),
+          noRes (hasInternalIdentShape_b1 "j" _ 106 rfl (.inr (.inl rfl))),
+          noRes (hasInternalIdentShape_b2 "_g" _ 95 103 rfl (.inl ⟨rfl, rfl⟩)),
+          noRes ?_,
+          noRes (hasInternalIdentShape_b2 "$." ext 36 46 rfl (.inr (.inr rfl)))⟩
+  change hasInternalIdentShape ("_" ++ ("j" ++ toString j.idx) ++ "_" ++ toString i) = true
+  rw [show "_" ++ ("j" ++ toString j.idx) ++ "_" ++ toString i = "_j" ++ (toString j.idx ++ "_" ++ toString i) by
+    simp only [String.append_assoc]; rfl]
+  exact hasInternalIdentShape_b2 "_j" _ 95 106 rfl (.inr (.inl ⟨rfl, rfl⟩))
 
 private def mangleStep (s : String) (c : Char) : String :=
   if c.isAlphanum then s.push c else if c == '.' || c == '_' then s.push '_' else s ++ s!"x{c.toNat}"
@@ -138,16 +163,24 @@ inductive ValidJsStrBody : List Char → Prop where
   | esc {c : Char} {cs : List Char} : 32 ≤ c.toNat → ValidJsStrBody cs → ValidJsStrBody ('\\' :: c :: cs)
 private theorem ValidJsStrBody.append {xs ys : List Char} (hx : ValidJsStrBody xs) (hy : ValidJsStrBody ys) : ValidJsStrBody (xs ++ ys) := by
   induction hx with | nil => exact hy | plain h1 h2 h3 _ ih => exact .plain h1 h2 h3 ih | esc h1 _ ih => exact .esc h1 ih
-private theorem hexDigits_valid (cs : List Char) (h : ∀ c ∈ cs, c ∈ ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f']) : ValidJsStrBody cs := by
-  have hall : ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'].all (fun c => decide (32 ≤ c.toNat) && (c != '"') && (c != '\\')) = true := by decide
-  rw [List.all_eq_true] at hall; induction cs with | nil => exact .nil | cons c _ ih => have hp := hall c (h c (.head _)); simp only [Bool.and_eq_true, decide_eq_true_eq, bne_iff_ne] at hp; exact .plain hp.1.1 hp.1.2 hp.2 (ih fun x hx => h x (.tail _ hx))
-private theorem hex_toDigitsCore_chars (n fuel : Nat) (ds : List Char) (hds : ∀ c ∈ ds, c ∈ ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f']) :
-    ∀ c ∈ Nat.toDigitsCore 16 fuel n ds, c ∈ ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'] := by
-  have hd16 : ∀ d, d < 16 → Nat.digitChar d ∈ ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'] := fun d hd => by match d with | 0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15 => decide | _ + 16 => omega
-  induction fuel generalizing n ds with | zero => exact hds | succ _ ih =>
-    simp only [Nat.toDigitsCore]; split <;> first
-      | exact fun c hc => (List.mem_cons.1 hc).elim (· ▸ hd16 _ (Nat.mod_lt _ (by omega))) (hds c)
-      | exact ih (n / 16) _ fun c hc => (List.mem_cons.1 hc).elim (· ▸ hd16 _ (Nat.mod_lt _ (by omega))) (hds c)
+private theorem digitChar16_valid (d : Nat) (hd : d < 16) :
+    32 ≤ (Nat.digitChar d).toNat ∧ Nat.digitChar d ≠ '"' ∧ Nat.digitChar d ≠ '\\' := by
+  match d, hd with
+  | 0,_|1,_|2,_|3,_|4,_|5,_|6,_|7,_|8,_|9,_|10,_|11,_|12,_|13,_|14,_|15,_ =>
+      exact ⟨by decide, by decide, by decide⟩
+  | _ + 16, hd => omega
+
+private theorem hex_toDigitsCore_valid (n fuel : Nat) (ds : List Char) (hds : ValidJsStrBody ds) :
+    ValidJsStrBody (Nat.toDigitsCore 16 fuel n ds) := by
+  induction fuel generalizing n ds with
+  | zero => exact hds
+  | succ _ ih =>
+    dsimp only [Nat.toDigitsCore]
+    have hd := digitChar16_valid (n % 16) (Nat.mod_lt _ (by omega))
+    have hcons : ValidJsStrBody (Nat.digitChar (n % 16) :: ds) := .plain hd.1 hd.2.1 hd.2.2 hds
+    split
+    · exact hcons
+    · exact ih (n / 16) _ hcons
 
 /-- Every string produced by `Js.jsStr s` has the form `"\"" ++ body ++ "\""` where `body` satisfies `ValidJsStrBody`. -/
 theorem jsStr_safe (s : String) : ∃ body : String, jsStr s = "\"" ++ body ++ "\"" ∧ ValidJsStrBody body.toList := by
@@ -156,12 +189,18 @@ theorem jsStr_safe (s : String) : ∃ body : String, jsStr s = "\"" ++ body ++ "
     | c => if c.toNat < 32 then let h := Nat.toDigits 16 c.toNat; "\\x" ++ String.ofList (if h.length == 1 then '0' :: h else h) else String.singleton c)
   have hstep : ∀ acc c, ValidJsStrBody acc.toList → ValidJsStrBody (step acc c).toList := fun acc c hacc => by
     dsimp only [step]; rw [String.toList_append]; apply ValidJsStrBody.append hacc
-    by_cases h1 : c = '\\'; subst h1; exact .esc (by decide) .nil; by_cases h2 : c = '"'; subst h2; exact .esc (by decide) .nil
-    by_cases h3 : c = '\n'; subst h3; exact .esc (by decide) .nil; by_cases h4 : c = '\r'; subst h4; exact .esc (by decide) .nil
-    by_cases h5 : c = '\t'; subst h5; exact .esc (by decide) .nil; split <;> try contradiction
+    by_cases h1 : c = '\\'; · subst h1; exact .esc (by decide) .nil
+    by_cases h2 : c = '"'; · subst h2; exact .esc (by decide) .nil
+    by_cases h3 : c = '\n'; · subst h3; exact .esc (by decide) .nil
+    by_cases h4 : c = '\r'; · subst h4; exact .esc (by decide) .nil
+    by_cases h5 : c = '\t'; · subst h5; exact .esc (by decide) .nil
+    split <;> try contradiction
     split
-    · have hd := hex_toDigitsCore_chars c.toNat (c.toNat + 1) [] (fun _ h => nomatch h)
-      simpa [String.toList_append] using ValidJsStrBody.esc (c := 'x') (by decide) (by split; exact .plain (by decide) (by decide) (by decide) (hexDigits_valid _ hd); exact hexDigits_valid _ hd)
+    · rw [String.toList_append]
+      have hd : ValidJsStrBody (Nat.toDigits 16 c.toNat) := hex_toDigitsCore_valid c.toNat (c.toNat + 1) [] .nil
+      have hbody : ValidJsStrBody (if (Nat.toDigits 16 c.toNat).length == 1 then '0' :: Nat.toDigits 16 c.toNat else Nat.toDigits 16 c.toNat) := by
+        split; exact .plain (c := '0') (by decide) (by decide) (by decide) hd; exact hd
+      simpa only [String.toList_ofList, show "\\x".toList = ['\\', 'x'] from rfl, List.cons_append, List.nil_append] using ValidJsStrBody.esc (c := 'x') (by decide) hbody
     · rw [String.toList_singleton]; exact .plain (by omega) h2 h1 .nil
   have hfold : ∀ (cs : List Char) (acc : String), ValidJsStrBody acc.toList → ValidJsStrBody (cs.foldl step acc).toList := fun cs => by
     induction cs with | nil => exact fun _ ha => ha | cons c _ ih => exact fun acc ha => ih _ (hstep acc c ha)
@@ -291,19 +330,20 @@ def evalJsExpr (env : String → JsVal) : JsExpr → JsVal
   | .sProj obj n off => match evalJsExpr env obj with | .ctorObj _ _ _ _ _ s => assocGet (n, off) s | _ => .num 0
   | .pap fn ar args => .pap fn ar (evalJsExprList env args)
   | .tc args => .tc (evalJsExprList env args)
-  | .call "$.tag" [e] => .num (jsTag (evalJsExpr env e))
-  | _ => .num 0
+  | .call fn args => if fn == "$.tag" then match args with | [e] => .num (jsTag (evalJsExpr env e)) | _ => .num 0 else .num 0
+  | .app _ _ => .num 0
 def evalJsExprList (env : String → JsVal) : List JsExpr → List JsVal | [] => [] | e :: es => evalJsExpr env e :: evalJsExprList env es
 end
 
 @[simp] theorem evalJsExprList_map (env : String → JsVal) : ∀ (xs : List α) (f : α → JsExpr), evalJsExprList env (xs.map f) = xs.map (fun x => evalJsExpr env (f x))
-  | [], _ => rfl | x :: xs, f => by simp [evalJsExprList, evalJsExprList_map env xs f]
-theorem jsTag_lowerCtor (env : String → JsVal) (info : CtorInfo) (ys : Array Arg) : jsTag (evalJsExpr env (lowerCtor info ys)) = info.cidx := by unfold lowerCtor; split <;> simp [evalJsExpr, jsTag]
+  | [], _ => rfl | x :: xs, f => by dsimp only [List.map, evalJsExprList]; rw [evalJsExprList_map env xs f]
+theorem jsTag_lowerCtor (env : String → JsVal) (info : CtorInfo) (ys : Array Arg) : jsTag (evalJsExpr env (lowerCtor info ys)) = info.cidx := by
+  unfold lowerCtor; split <;> rfl
 theorem fieldProj_lowerCtor (c : Ctx) (ty : IRType) (env : String → JsVal) (x : VarId) (info : CtorInfo) (ys : Array Arg) (idx : Nat)
     (hboxed : ¬(info.size == 0 && info.usize == 0 && info.ssize == 0) = true) (hidx : idx < ys.toList.length) (hx : env (v x) = evalJsExpr env (lowerCtor info ys)) :
     evalJsExpr env (lowerExpr c ty (.proj idx x)) = evalJsExpr env (lowerArg (ys.toList.getD idx .erased)) := by
-  simp only [lowerExpr, evalJsExpr, hx, lowerCtor, Bool.eq_false_iff.2 hboxed, Bool.false_eq_true, ↓reduceIte, evalJsExprList_map]
-  generalize ys.toList = args at hidx ⊢; induction args generalizing idx with | nil => simp at hidx | cons _ _ ih => cases idx with | zero => rfl | succ k => exact ih k (by simp at hidx; exact hidx)
+  dsimp only [lowerExpr, evalJsExpr]; rw [hx]; dsimp only [lowerCtor]; rw [if_neg hboxed]; dsimp only [evalJsExpr]; rw [evalJsExprList_map]
+  generalize ys.toList = args at hidx ⊢; induction args generalizing idx with | nil => nomatch hidx | cons _ _ ih => cases idx with | zero => rfl | succ k => exact ih k (Nat.lt_of_succ_lt_succ hidx)
 
 /-- Semantic domain of `qed_rt.mjs` values supporting curried higher-order closures (`pap`/`app`). -/
 inductive RtFnVal (α : Type) where | ground (v : α) | pap (fn : List α → RtFnVal α) (arity : Nat) (acc : List α)
@@ -462,7 +502,12 @@ private theorem collectProjSrcAlts_eq_foldl (calls : Std.HashSet Nat) (acc : Std
 
 theorem collectNonArr_mono (b : FnBody) (acc : Std.HashSet Nat) (k : Nat) (hk : k ∈ acc) : k ∈ collectNonArr acc b := by
   revert acc; refine fnBody_ind (fun b => ∀ acc, k ∈ acc → k ∈ collectNonArr acc b) (fun b hb acc hk => ?_) b; cases b with
-  | vdecl _ _ e _ => apply hb; cases e <;> first | exact hk | exact collectNonArr_insert_mono acc k _ hk
+  | vdecl x _ e _ =>
+      refine hb _ ?_
+      cases e with
+      | fap _ _ | ap _ _ | reset _ _ => exact hk
+      | ctor _ _ | reuse _ _ _ _ | pap _ _ | lit _ | box _ _ | unbox _ | isShared _ => exact collectNonArr_insert_mono acc k x.idx hk
+      | proj _ p | uproj _ p | sproj _ _ p => exact collectNonArr_insert_mono acc k p.idx hk
   | jdecl _ _ _ _ => exact hb.2 _ (hb.1 acc hk)
   | case _ x _ alts => exact collectAlts_fold_mem collectNonArr collectNonArrAlts collectNonArrAlts_eq_foldl (k ∈ ·) alts.toList (acc.insert x.idx) hb (collectNonArr_insert_mono acc k x.idx hk)
   | set _ _ _ _ | setTag _ _ _ | uset _ _ _ _ | sset _ _ _ _ _ _ | inc _ _ _ _ _ | dec _ _ _ _ _ | del _ _ => exact hb acc hk
@@ -492,30 +537,37 @@ theorem collectNonArr_sound (body : FnBody) (ρ : Nat → RcVal) (hcon : NonArrC
     ∀ x : VarId, (collectNonArr {} body).contains x.idx = true → ∀ (h : CowHeap α) (n : Nat), h.rcInc (ρ x.idx) n = h ∧ h.rcDec (ρ x.idx) n = h := by
   have hgen : ∀ acc, NonArrSetSound acc ρ → NonArrConsistent ρ body → NonArrSetSound (collectNonArr acc body) ρ := by
     refine fnBody_ind (fun b => ∀ acc, NonArrSetSound acc ρ → NonArrConsistent ρ b → NonArrSetSound (collectNonArr acc b) ρ) (fun b hb acc ha hc => ?_) body; cases b with
-    | vdecl x _ e _ => rcases hc with ⟨hx, hp, hcont⟩; apply hb _ _ hcont; cases e with
-      | ctor _ _ | reuse _ _ _ _ | pap _ _ | lit _ | box _ _ | unbox _ | isShared _ => exact NonArrSetSound_insert ha (hx rfl).choose_spec
-      | proj _ p | uproj _ p | sproj _ _ p => exact NonArrSetSound_insert ha (hp p.idx rfl).choose_spec
-      | _ => exact ha
+    | vdecl x _ e _ =>
+        rcases hc with ⟨hx, hp, hcont⟩
+        refine hb _ ?_ hcont
+        cases e with
+        | ctor _ _ | reuse _ _ _ _ | pap _ _ | lit _ | box _ _ | unbox _ | isShared _ => exact NonArrSetSound_insert ha (hx rfl).choose_spec
+        | proj _ p | uproj _ p | sproj _ _ p => exact NonArrSetSound_insert ha (hp p.idx rfl).choose_spec
+        | fap _ _ | ap _ _ | reset _ _ => exact ha
     | jdecl _ _ _ _ => exact hb.2 _ (hb.1 acc ha hc.1) hc.2
     | case _ x _ alts => exact collectAlts_fold_mem collectNonArr collectNonArrAlts collectNonArrAlts_eq_foldl (NonArrSetSound · ρ) alts.toList (acc.insert x.idx) (fun arm harm a ha' => hb arm harm a ha' (nonArrConsistentAlts_mem hc.2 arm harm)) (NonArrSetSound_insert ha hc.1.choose_spec)
-    | set _ _ _ _ | setTag _ _ _ | uset _ _ _ _ | sset _ _ _ _ _ _ | inc _ _ _ _ _ | dec _ _ _ _ _ | del _ _ => exact hb acc ha (by simpa [NonArrConsistent] using hc)
+    | set _ _ _ _ | setTag _ _ _ | uset _ _ _ _ | sset _ _ _ _ _ _ | inc _ _ _ _ _ | dec _ _ _ _ _ | del _ _ => exact hb acc ha hc
     | ret _ | jmp _ _ | unreachable => exact ha
-  intro x hx h n; rcases hgen {} (fun _ hk => False.elim (Std.HashSet.not_mem_empty hk)) hcon x.idx (by simpa using hx) with ⟨v, hv⟩; simp [hv]
+  intro x hx h n; rcases hgen {} (fun _ hk => False.elim (Std.HashSet.not_mem_empty hk)) hcon x.idx (Std.HashSet.contains_iff_mem.1 hx) with ⟨v, hv⟩; rw [hv]; exact ⟨rfl, rfl⟩
 
 theorem collectProjSrc_subset_collectNonArr (body : FnBody) (x p : Nat) (hsrc : (collectProjSrc {} {} body).get? x = some p) : (collectNonArr {} body).contains p = true := by
   have hgen : ∀ calls acc na, (∀ k q, acc.get? k = some q → q ∈ na) → ∀ k q, (collectProjSrc calls acc body).get? k = some q → q ∈ collectNonArr na body := by
     refine fnBody_ind (fun b => ∀ calls acc na, (∀ k q, acc.get? k = some q → q ∈ na) → ∀ k q, (collectProjSrc calls acc b).get? k = some q → q ∈ collectNonArr na b) (fun b hb calls acc na hinv k q hres => ?_) body; cases b with
-    | vdecl xv _ e _ => cases e with
-      | fap _ _ | ap _ _ | reset _ _ => exact hb _ acc na hinv k q hres
-      | proj _ src =>
-          apply hb calls _ (na.insert src.idx) _ k q hres; intro k' q' hkq; split at hkq
-          · rw [Std.HashMap.get?_insert] at hkq; split at hkq; (cases hkq; exact Std.HashSet.mem_insert.mpr (.inl (beq_self_eq_true _))); exact collectNonArr_insert_mono na q' src.idx (hinv k' q' hkq)
-          · exact collectNonArr_insert_mono na q' src.idx (hinv k' q' hkq)
-      | uproj _ src | sproj _ _ src => exact hb calls acc (na.insert src.idx) (fun k' q' hkq => collectNonArr_insert_mono na q' src.idx (hinv k' q' hkq)) k q hres
-      | ctor _ _ | reuse _ _ _ _ | pap _ _ | lit _ | box _ _ | unbox _ | isShared _ => exact hb calls acc (na.insert xv.idx) (fun k' q' hkq => collectNonArr_insert_mono na q' xv.idx (hinv k' q' hkq)) k q hres
+    | vdecl xv _ e _ =>
+        have hins (m : Nat) : ∀ k' q', acc.get? k' = some q' → q' ∈ na.insert m := fun k' q' hkq => collectNonArr_insert_mono na q' m (hinv k' q' hkq)
+        cases e with
+        | fap _ _ | ap _ _ => exact hb (calls.insert xv.idx) acc na hinv k q hres
+        | reset _ _ => exact hb calls acc na hinv k q hres
+        | proj _ src =>
+            refine hb calls _ (na.insert src.idx) (fun k' q' hkq => ?_) k q hres
+            split at hkq
+            · rw [Std.HashMap.get?_insert] at hkq; split at hkq; (cases hkq; exact Std.HashSet.mem_insert.mpr (.inl (beq_self_eq_true _))); exact hins src.idx k' q' hkq
+            · exact hins src.idx k' q' hkq
+        | uproj _ src | sproj _ _ src => exact hb calls acc (na.insert src.idx) (hins src.idx) k q hres
+        | ctor _ _ | reuse _ _ _ _ | pap _ _ | lit _ | box _ _ | unbox _ | isShared _ => exact hb calls acc (na.insert xv.idx) (hins xv.idx) k q hres
     | jdecl _ _ _ _ => exact hb.2 calls _ _ (hb.1 calls acc na hinv) k q hres
     | case _ scr _ alts =>
-        simp only [collectProjSrc, collectNonArr] at hres ⊢; rw [collectProjSrcAlts_eq_foldl] at hres; rw [collectNonArrAlts_eq_foldl]
+        dsimp only [collectProjSrc, collectNonArr] at hres ⊢; rw [collectProjSrcAlts_eq_foldl] at hres; rw [collectNonArrAlts_eq_foldl]
         have hstep : ∀ (ls : List Alt) (a : Std.HashMap Nat Nat) (n : Std.HashSet Nat), (∀ arm ∈ ls, ∀ c a' n', (∀ k q, a'.get? k = some q → q ∈ n') → ∀ k q, (collectProjSrc c a' (altBody arm)).get? k = some q → q ∈ collectNonArr n' (altBody arm)) →
             (∀ k q, a.get? k = some q → q ∈ n) → ∀ k q, (ls.foldl (fun a arm => collectProjSrc calls a (altBody arm)) a).get? k = some q → q ∈ ls.foldl (fun n arm => collectNonArr n (altBody arm)) n := fun ls => by
           induction ls with | nil => exact fun _ _ _ ha k q h => ha k q h | cons arm _ ih => exact fun _ _ hst ha => ih _ _ (fun y hy => hst y (.tail _ hy)) (hst arm (.head _) calls _ _ ha)
@@ -535,15 +587,19 @@ inductive DropsVar (p : Nat) : FnBody → Prop where
   | sproj_skip (x : VarId) (ty : IRType) (n off : Nat) (src : VarId) (cont : FnBody) (h : DropsVar p cont) : DropsVar p (.vdecl x ty (.sproj n off src) cont)
 
 theorem hasDecOf_sound (p : Nat) : ∀ b : FnBody, hasDecOf p b = true → DropsVar p b
-  | .dec y n c bf cont, h => by simp only [hasDecOf, Bool.or_eq_true, beq_iff_eq] at h; exact h.elim (DropsVar.dec y n c bf cont ·.symm) (DropsVar.dec_skip y n c bf cont <| hasDecOf_sound p cont ·)
-  | .del y cont, h => by simp only [hasDecOf, Bool.or_eq_true, beq_iff_eq] at h; exact h.elim (DropsVar.del y cont ·.symm) (DropsVar.del_skip y cont <| hasDecOf_sound p cont ·)
-  | .inc y n c bf cont, h => DropsVar.inc_skip y n c bf cont (hasDecOf_sound p cont (by simpa [hasDecOf] using h))
+  | .dec y n c bf cont, h => by
+      dsimp only [hasDecOf] at h
+      exact (Bool.or_eq_true_iff.1 h).elim (fun h1 => DropsVar.dec y n c bf cont (eq_of_beq h1).symm) (DropsVar.dec_skip y n c bf cont <| hasDecOf_sound p cont ·)
+  | .del y cont, h => by
+      dsimp only [hasDecOf] at h
+      exact (Bool.or_eq_true_iff.1 h).elim (fun h1 => DropsVar.del y cont (eq_of_beq h1).symm) (DropsVar.del_skip y cont <| hasDecOf_sound p cont ·)
+  | .inc y n c bf cont, h => DropsVar.inc_skip y n c bf cont (hasDecOf_sound p cont h)
   | .vdecl x ty e cont, h => by cases e with
-    | proj _ _ => exact DropsVar.proj_skip x ty _ _ cont (hasDecOf_sound p cont (by simpa [hasDecOf] using h))
-    | uproj _ _ => exact DropsVar.uproj_skip x ty _ _ cont (hasDecOf_sound p cont (by simpa [hasDecOf] using h))
-    | sproj _ _ _ => exact DropsVar.sproj_skip x ty _ _ _ cont (hasDecOf_sound p cont (by simpa [hasDecOf] using h))
-    | _ => simp [hasDecOf] at h
-  | .jdecl _ _ _ _, h | .case _ _ _ _, h | .set _ _ _ _, h | .setTag _ _ _, h | .uset _ _ _ _, h | .sset _ _ _ _ _ _, h | .ret _, h | .jmp _ _, h | .unreachable, h => by simp [hasDecOf] at h
+    | proj _ _ => exact DropsVar.proj_skip x ty _ _ cont (hasDecOf_sound p cont h)
+    | uproj _ _ => exact DropsVar.uproj_skip x ty _ _ cont (hasDecOf_sound p cont h)
+    | sproj _ _ _ => exact DropsVar.sproj_skip x ty _ _ _ cont (hasDecOf_sound p cont h)
+    | _ => exact nomatch h
+  | .jdecl _ _ _ _, h | .case _ _ _ _, h | .set _ _ _ _, h | .setTag _ _ _, h | .uset _ _ _ _, h | .sset _ _ _ _ _ _, h | .ret _, h | .jmp _ _, h | .unreachable, h => nomatch h
 
 def CowHeap.jsTransferInc (h : CowHeap α) (id n : Nat) : CowHeap α := let n' := n - 1; if n' == 0 then h else h.rcInc (.arr id) n'
 theorem projRefTransfer_cowHeap_equiv (h : CowHeap α) (id n : Nat) (hn : n ≥ 1) : ∀ k : Nat, (h.jsTransferInc id n).get k = ((h.rcInc (.arr id) n).rcDec (.arr id) 1).get k := fun k => by
@@ -569,40 +625,69 @@ private theorem hasSelfTailAltsAux_mem {f : Name} {onlyRec active : Bool} : ∀ 
   | [], _, _, h => nomatch h | arm :: _, h, a, ha => have h' : hasSelfTailAux f onlyRec active (altBody arm) = false ∧ hasSelfTailAltsAux f onlyRec active _ = false := by cases arm <;> simpa [hasSelfTailAltsAux, Bool.or_eq_false_iff, altBody] using h
       (List.mem_cons.1 ha).elim (fun e => e ▸ h'.1) (hasSelfTailAltsAux_mem h'.2 a)
 
+private theorem lowerBody_vdecl_nonFap (c : Ctx) (x : VarId) (ty : IRType) (e : IR.Expr) (cont : FnBody) (f : Name)
+    (hne : ∀ g ys, e ≠ .fap g ys) :
+    lowerBody c (.vdecl x ty e cont) = .letVar (v x) (lowerExpr c ty e) :: lowerBody c cont ∧
+    (∀ a, hasSelfTailAux f true a (.vdecl x ty e cont) = hasSelfTailAux f true a cont) := by
+  cases e with | fap g ys => exact absurd rfl (hne g ys) | _ => exact ⟨rfl, fun _ => rfl⟩
+
 /-- Soundness of `hasJpSelfTail`: whenever `hasJpSelfTail f b = false`, no `.constArrow` closure generated by `lowerBody c b` ever contains an illegal `.tailContinue`. -/
 theorem noTailCont_of_hasJpSelfTail_false (f : Name) (b : FnBody) (c : Ctx) (hself : c.selfFn = none ∨ c.selfFn = some f) :
     (hasSelfTailAux f true true b = false → stmtsTailSafe false (lowerBody c b)) ∧ (hasSelfTailAux f true false b = false → stmtsTailSafe true (lowerBody c b)) := by
   revert c; refine fnBody_ind (fun b => ∀ c, c.selfFn = none ∨ c.selfFn = some f → (hasSelfTailAux f true true b = false → stmtsTailSafe false (lowerBody c b)) ∧ (hasSelfTailAux f true false b = false → stmtsTailSafe true (lowerBody c b))) (fun b hb c hself => ?_) b; cases b with
   | vdecl x ty e cont =>
-      refine ⟨fun h => ?_, fun h => ?_⟩
-      · cases e with
-        | fap g ys =>
-            simp only [hasSelfTailAux, Bool.true_and, Bool.or_eq_false_iff] at h
-            have hnotSelf : ¬(c.selfFn == some g && retsVar x cont) = true := fun hc => by simp only [Bool.and_eq_true, beq_iff_eq] at hc; rcases hself with hsn | hsf; rw [hsn] at hc; cases hc.1; rw [hsf] at hc; cases hc.1; rw [hc.2] at h; simp at h
-            rw [show lowerBody c (.vdecl x ty (.fap g ys) cont) = .letVar (v x) (lowerExpr c ty (.fap g ys)) :: lowerBody c cont by simp [lowerBody, hnotSelf]]; exact ⟨trivial, (hb c hself).1 h.2⟩
-        | _ => exact ⟨trivial, (hb c hself).1 (by simpa [hasSelfTailAux] using h)⟩
-      · cases e with
-        | fap _ _ => simp only [lowerBody]; split; (split <;> simp [stmtTailSafe]); exact ⟨trivial, (hb c hself).2 (by simp only [hasSelfTailAux, Bool.false_and, Bool.false_or] at h; exact h)⟩
-        | _ => exact ⟨trivial, (hb c hself).2 (by simpa [hasSelfTailAux] using h)⟩
+      by_cases hfap : ∃ g ys, e = .fap g ys
+      · rcases hfap with ⟨g, ys, rfl⟩
+        refine ⟨fun h => ?_, fun h => ?_⟩
+        · dsimp only [hasSelfTailAux] at h
+          have ⟨h1, h2⟩ := Bool.or_eq_false_iff.1 h
+          have hnotSelf : ¬(c.selfFn == some g && retsVar x cont) = true := fun hc => by
+            have ⟨hc1, hc2⟩ := Bool.and_eq_true_iff.1 hc
+            rcases hself with hsn | hsf
+            · rw [hsn] at hc1; exact nomatch hc1
+            · rw [hsf] at hc1
+              have hgf : g = f := Option.some.inj (eq_of_beq hc1).symm
+              subst hgf; rw [beq_self_eq_true, hc2] at h1; exact nomatch h1
+          dsimp only [lowerBody]; rw [if_neg hnotSelf]; exact ⟨trivial, (hb c hself).1 h2⟩
+        · dsimp only [hasSelfTailAux, Bool.false_and, Bool.false_or] at h
+          dsimp only [lowerBody]; split; (split; exact ⟨rfl, trivial⟩; exact ⟨trivial, trivial⟩); exact ⟨trivial, (hb c hself).2 h⟩
+      · have ⟨hlow, hst⟩ := lowerBody_vdecl_nonFap c x ty e cont f fun g ys he => hfap ⟨g, ys, he⟩
+        rw [hlow, hst true, hst false]
+        exact ⟨fun h => ⟨trivial, (hb c hself).1 h⟩, fun h => ⟨trivial, (hb c hself).2 h⟩⟩
   | jdecl j xs val _ =>
       have hself' : ({ c with inlineJps := c.inlineJps.insert j.idx xs } : Ctx).selfFn = none ∨ ({ c with inlineJps := c.inlineJps.insert j.idx xs } : Ctx).selfFn = some f := hself
+      have hinline : ∀ a (s1 s2 : List JsStmt), stmtsTailSafe a s1 → stmtsTailSafe a s2 →
+          stmtsTailSafe a ((if xs.isEmpty then [] else [JsStmt.letDecls (xs.toList.zipIdx.map fun (_, i) => s!"_{jp j}_{i}")]) ++ [.labeledBlock (jp j) s1] ++
+            (if xs.isEmpty then [] else [JsStmt.letBinds (xs.toList.zipIdx.map fun (p, i) => (v p.x, JsExpr.var s!"_{jp j}_{i}"))]) ++ s2) := fun a s1 s2 h1 h2 => by
+        cases xs.isEmpty <;> simp only [↓reduceIte, Bool.false_eq_true, stmtsTailSafe_append_iff, stmtsTailSafe_nil, stmtsTailSafe_cons_iff, stmtTailSafe, and_true, h1, h2]
       refine ⟨fun h => ?_, fun h => ?_⟩
-      · simp only [hasSelfTailAux, Bool.or_eq_false_iff] at h; by_cases hj : hasJmpTo j val = true <;> simp only [lowerBody, hj, Bool.not_true, Bool.not_false, ↓reduceIte]
-        · exact ⟨(hb.1 c hself).1 h.1, (hb.2 c hself).1 h.2⟩
-        · have hv := (hb.1 c hself).1 h.1; have hc := (hb.2 _ hself').1 h.2; by_cases hemp : xs.isEmpty = true <;> simp [hemp, stmtTailSafe, hv, hc]
-      · simp only [hasSelfTailAux, Bool.or_eq_false_iff] at h; by_cases hj : hasJmpTo j val = true
-        · simp only [hj, Bool.false_or, ite_true] at h; simp only [lowerBody, hj, Bool.not_true, Bool.false_eq_true, ↓reduceIte]; exact ⟨(hb.1 c hself).1 h.1, (hb.2 c hself).2 h.2⟩
-        · have hjF := Bool.eq_false_iff.2 hj; simp only [hjF, Bool.false_or, ite_true] at h; simp only [lowerBody, hjF, Bool.not_false, ↓reduceIte]
-          have hv := (hb.1 c hself).2 h.1; have hc := (hb.2 _ hself').2 h.2; by_cases hemp : xs.isEmpty = true <;> simp [hemp, stmtTailSafe, hv, hc]
+      · dsimp only [hasSelfTailAux] at h; have h := Bool.or_eq_false_iff.1 h
+        by_cases hj : hasJmpTo j val = true
+        · dsimp only [lowerBody]; rw [hj, if_neg (by decide)]; exact ⟨(hb.1 c hself).1 h.1, (hb.2 c hself).1 h.2⟩
+        · have hjF := Bool.eq_false_iff.2 hj
+          dsimp only [lowerBody]; rw [hjF, if_pos (by decide)]
+          exact hinline false _ _ ((hb.2 _ hself').1 h.2) ((hb.1 c hself).1 h.1)
+      · dsimp only [hasSelfTailAux] at h; have h := Bool.or_eq_false_iff.1 h
+        by_cases hj : hasJmpTo j val = true
+        · rw [hj] at h; dsimp only [lowerBody]; rw [hj, if_neg (by decide)]; exact ⟨(hb.1 c hself).1 h.1, (hb.2 c hself).2 h.2⟩
+        · have hjF := Bool.eq_false_iff.2 hj; rw [hjF] at h
+          dsimp only [lowerBody]; rw [hjF, if_pos (by decide)]
+          exact hinline true _ _ ((hb.2 _ hself').2 h.2) ((hb.1 c hself).2 h.1)
   | case _ _ _ alts =>
       have mkArms : ∀ a (ls : List Alt), (∀ arm ∈ ls, stmtsTailSafe a (lowerBody c (altBody arm))) → armsTailSafe a (lowerAlts c ls) := fun a ls hls => by induction ls with | nil => trivial | cons arm _ ih => cases arm <;> exact ⟨hls _ (.head _), ih fun x hx => hls x (.tail _ hx)⟩
-      exact ⟨fun h => by simp only [lowerBody, stmtsTailSafe, stmtTailSafe, and_true]; exact mkArms false alts.toList fun arm harm => (hb arm harm c hself).1 (hasSelfTailAltsAux_mem h arm harm),
-             fun h => by simp only [lowerBody, stmtsTailSafe, stmtTailSafe, and_true]; exact mkArms true alts.toList fun arm harm => (hb arm harm c hself).2 (hasSelfTailAltsAux_mem h arm harm)⟩
+      exact ⟨fun h => ⟨mkArms false alts.toList fun arm harm => (hb arm harm c hself).1 (hasSelfTailAltsAux_mem h arm harm), trivial⟩,
+             fun h => ⟨mkArms true alts.toList fun arm harm => (hb arm harm c hself).2 (hasSelfTailAltsAux_mem h arm harm), trivial⟩⟩
   | inc x _ _ _ _ =>
-      have hite : ∀ {a} {m : Nat} {ss : List JsStmt}, stmtsTailSafe a ss → stmtsTailSafe a (if (m == 0 || c.nonArr.contains x.idx) = true then ss else .incRef (v x) m :: ss) := fun hs => by split <;> simp [stmtTailSafe, hs]
+      have hite : ∀ {a} {m : Nat} {ss : List JsStmt}, stmtsTailSafe a ss → stmtsTailSafe a (if (m == 0 || c.nonArr.contains x.idx) = true then ss else .incRef (v x) m :: ss) := fun hs => by split; exact hs; exact ⟨trivial, hs⟩
       exact ⟨fun h => hite ((hb c hself).1 h), fun h => hite ((hb c hself).2 h)⟩
-  | dec _ _ _ _ _ | del _ _ => refine ⟨fun h => ?_, fun h => ?_⟩ <;> simp only [lowerBody] <;> split <;> first | exact (hb c hself).1 h | exact ⟨trivial, (hb c hself).1 h⟩ | exact (hb c hself).2 h | exact ⟨trivial, (hb c hself).2 h⟩
+  | dec _ _ _ _ _ | del _ _ =>
+      refine ⟨fun h => ?_, fun h => ?_⟩ <;> dsimp only [lowerBody] <;> split <;>
+        first | exact (hb c hself).1 h | exact ⟨trivial, (hb c hself).1 h⟩ | exact (hb c hself).2 h | exact ⟨trivial, (hb c hself).2 h⟩
   | set _ _ _ _ | setTag _ _ _ | uset _ _ _ _ | sset _ _ _ _ _ _ => exact ⟨fun h => ⟨trivial, (hb c hself).1 h⟩, fun h => ⟨trivial, (hb c hself).2 h⟩⟩
-  | ret _ | jmp _ _ | unreachable => constructor <;> intro _ <;> (try simp [lowerBody]; try split) <;> simp [stmtTailSafe]
+  | ret _ | unreachable => exact ⟨fun _ => ⟨trivial, trivial⟩, fun _ => ⟨trivial, trivial⟩⟩
+  | jmp j ys =>
+      have hj : ∀ a, stmtsTailSafe a (lowerBody c (.jmp j ys)) := fun a => by
+        dsimp only [lowerBody]; cases c.inlineJps.get? j.idx <;> exact ⟨trivial, trivial⟩
+      exact ⟨fun _ => hj false, fun _ => hj true⟩
 
 end Js.Proofs

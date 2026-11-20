@@ -268,7 +268,7 @@ theorem hydrateTextSlotM_empty_spec (a : DomArena msg) (parent : Dom.Node) (inTe
     exact w3cInsertBefore_fresh_append pre suf (UInt32.ofNat a.nextId) hnot hdisj
   have hallocPar : (DomArena.mk (a.nextId + 1)
       (fun m => if m == UInt32.ofNat a.nextId then .text "" else a.store m)
-      a.signals).get parent = .element pns ptag pst pmg (pre ++ suf) := by
+      a.signals a.sigEvents a.tmpls a.rowEvs).get parent = .element pns ptag pst pmg (pre ++ suf) := by
     simp [DomArena.get, hparNe]; exact hpar
   dsimp only [hydrateTextSlotM]
   rw [if_pos (beq_self_eq_true "")]
@@ -306,7 +306,7 @@ theorem hydrateTextSlotM_split_spec (a : DomArena msg) (parent : Dom.Node) (s : 
     exact w3cInsertBefore_fresh_append pre suf (UInt32.ofNat a.nextId) hnot hdisj
   have hallocPar : (DomArena.mk (a.nextId + 1)
       (fun m => if m == UInt32.ofNat a.nextId then .text s else a.store m)
-      a.signals).get parent = .element pns ptag pst pmg (pre ++ suf) := by
+      a.signals a.sigEvents a.tmpls a.rowEvs).get parent = .element pns ptag pst pmg (pre ++ suf) := by
     simp [DomArena.get, hparNe]; exact hpar
   dsimp only [hydrateTextSlotM]
   rw [if_neg (by simp [hne]), if_pos rfl]
@@ -1106,16 +1106,18 @@ theorem hydrateViewM_of_textOf? {σ msg : Type} :
   | .element .., _, _, h, _, _ | .keyedList .., _, _, h, _, _ => by simp [View.textOf?] at h
 
 private theorem DomArena.modify_withSignals {msg : Type} (nxt : Nat)
-    (st : Dom.Node → ArenaEntry msg) (s₁ s₂ : List (String × String))
+    (st : Dom.Node → ArenaEntry msg) (s₁ s₂ : List (String × String)) (e₁ e₂ : List (String × msg))
+    (t₁ t₂ : Array (ArenaTmpl msg)) (r₁ r₂ : Array (Nat → Nat → Option msg))
     (n : Dom.Node) (f : ArenaEntry msg → ArenaEntry msg) :
-    DomArena.modify ⟨nxt, st, s₁⟩ n f = { DomArena.modify ⟨nxt, st, s₂⟩ n f with signals := s₁ } := by
+    DomArena.modify ⟨nxt, st, s₁, e₁, t₁, r₁⟩ n f = { DomArena.modify ⟨nxt, st, s₂, e₂, t₂, r₂⟩ n f with signals := s₁, sigEvents := e₁, tmpls := t₁, rowEvs := r₁ } := by
   simp only [DomArena.modify, DomArena.get, DomArena.set]
 
-private theorem hydrateTextSlotM_withSignals {msg : Type} (sigs : List (String × String))
+private theorem hydrateTextSlotM_withSignals {msg : Type} (sigs : List (String × String)) (evs : List (String × msg))
+    (tmpls : Array (ArenaTmpl msg)) (rowEvs : Array (Nat → Nat → Option msg))
     (parent : Dom.Node) (index : UInt32) (inRun : Bool) (s : String) (more : Unit → Bool) (a : DomArena msg) :
-    hydrateTextSlotM (m := StateM (DomArena msg)) parent index inRun s more { a with signals := sigs } =
+    hydrateTextSlotM (m := StateM (DomArena msg)) parent index inRun s more { a with signals := sigs, sigEvents := evs, tmpls, rowEvs } =
       ((hydrateTextSlotM (m := StateM (DomArena msg)) parent index inRun s more a).1,
-       { (hydrateTextSlotM (m := StateM (DomArena msg)) parent index inRun s more a).2 with signals := sigs }) := by
+       { (hydrateTextSlotM (m := StateM (DomArena msg)) parent index inRun s more a).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs }) := by
   dsimp only [hydrateTextSlotM]
   split
   · simp only [bind, StateT.bind, pure, StateT.pure, DomArena.alloc, DomArena.modifyChildren]
@@ -1124,7 +1126,7 @@ private theorem hydrateTextSlotM_withSignals {msg : Type} (sigs : List (String �
     · simp only [bind, StateT.bind, pure, StateT.pure, DomArena.alloc, DomArena.modifyChildren]
       refine Prod.ext rfl ?_; dsimp only; apply DomArena.modify_withSignals
     · simp only [bind, StateT.bind, pure]
-      have hg : DomArena.get { a with signals := sigs } parent = DomArena.get a parent := rfl
+      have hg : DomArena.get { a with signals := sigs, sigEvents := evs, tmpls, rowEvs } parent = DomArena.get a parent := rfl
       rw [hg]
       cases more ()
       · rfl
@@ -1132,80 +1134,84 @@ private theorem hydrateTextSlotM_withSignals {msg : Type} (sigs : List (String �
         refine Prod.ext rfl ?_; dsimp only; apply DomArena.modify_withSignals
 
 mutual
-  theorem hydrateDomM_withSignals {msg : Type} (sigs : List (String × String)) :
+  theorem hydrateDomM_withSignals {msg : Type} (sigs : List (String × String)) (evs : List (String × msg))
+      (tmpls : Array (ArenaTmpl msg)) (rowEvs : Array (Nat → Nat → Option msg)) :
       ∀ (h : Html msg) (node : Dom.Node) (a : DomArena msg),
-        (hydrateDomM (m := StateM (DomArena msg)) h node { a with signals := sigs }).2 =
-          { (hydrateDomM (m := StateM (DomArena msg)) h node a).2 with signals := sigs }
+        (hydrateDomM (m := StateM (DomArena msg)) h node { a with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
+          { (hydrateDomM (m := StateM (DomArena msg)) h node a).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs }
     | .text _, _, _ => rfl
     | .element _ attrs cs, node, a => by
         dsimp only [hydrateDomM, bind, StateT.bind, pure, StateT.pure, DomArena.modifyElemState,
           DomArena.modify, DomArena.get, DomArena.set]
         have hstep : ∀ (nxt : Nat) (st : Dom.Node → ArenaEntry msg),
-            (match applyAttrsM (m := StateM (DomArena msg)) node attrs ⟨nxt, st, sigs⟩ with
+            (match applyAttrsM (m := StateM (DomArena msg)) node attrs ⟨nxt, st, sigs, evs, tmpls, rowEvs⟩ with
             | (_, s) => (if (!ownsChildren attrs) = true then hydrateDomKidsM (m := StateM (DomArena msg)) node 0 false cs else StateT.pure PUnit.unit) s).snd =
-            { (match applyAttrsM (m := StateM (DomArena msg)) node attrs ⟨nxt, st, a.signals⟩ with
-              | (_, s) => (if (!ownsChildren attrs) = true then hydrateDomKidsM (m := StateM (DomArena msg)) node 0 false cs else StateT.pure PUnit.unit) s).snd with signals := sigs } := by
+            { (match applyAttrsM (m := StateM (DomArena msg)) node attrs ⟨nxt, st, a.signals, a.sigEvents, a.tmpls, a.rowEvs⟩ with
+              | (_, s) => (if (!ownsChildren attrs) = true then hydrateDomKidsM (m := StateM (DomArena msg)) node 0 false cs else StateT.pure PUnit.unit) s).snd with signals := sigs, sigEvents := evs, tmpls, rowEvs } := by
           intro nxt st
-          have ha := applyAttrsM_withSignals sigs node attrs ⟨nxt, st, a.signals⟩
+          have ha := applyAttrsM_withSignals sigs evs tmpls rowEvs node attrs ⟨nxt, st, a.signals, a.sigEvents, a.tmpls, a.rowEvs⟩
           dsimp only [StateT.run] at ha
-          cases ha1 : applyAttrsM (m := StateM (DomArena msg)) node attrs ⟨nxt, st, sigs⟩ with
+          cases ha1 : applyAttrsM (m := StateM (DomArena msg)) node attrs ⟨nxt, st, sigs, evs, tmpls, rowEvs⟩ with
           | mk _ s1 =>
-              cases ha2 : applyAttrsM (m := StateM (DomArena msg)) node attrs ⟨nxt, st, a.signals⟩ with
+              cases ha2 : applyAttrsM (m := StateM (DomArena msg)) node attrs ⟨nxt, st, a.signals, a.sigEvents, a.tmpls, a.rowEvs⟩ with
               | mk _ s2 =>
                   rw [ha1, ha2] at ha; dsimp only at ha; rw [ha]
                   cases ownsChildren attrs
-                  · exact hydrateDomKidsM_withSignals sigs node 0 false cs s2
+                  · exact hydrateDomKidsM_withSignals sigs evs tmpls rowEvs node 0 false cs s2
                   · rfl
         apply hstep
 
-  theorem hydrateDomKidsM_withSignals {msg : Type} (sigs : List (String × String))
+  theorem hydrateDomKidsM_withSignals {msg : Type} (sigs : List (String × String)) (evs : List (String × msg))
+      (tmpls : Array (ArenaTmpl msg)) (rowEvs : Array (Nat → Nat → Option msg))
       (node : Dom.Node) : ∀ (i : UInt32) (inRun : Bool) (cs : List (Html msg)) (a : DomArena msg),
-        (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs { a with signals := sigs }).2 =
-          { (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs a).2 with signals := sigs }
+        (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs { a with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
+          { (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs a).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs }
     | _, _, [], _ => rfl
     | i, inRun, c :: rest, a => by
         dsimp only [hydrateDomKidsM, bind, StateT.bind, pure, StateT.pure]
         cases hc : c.textOf? with
         | none =>
           dsimp only [bind, StateT.bind, pure, StateT.pure]
-          have hg : ({ nextId := a.nextId, store := a.store, signals := sigs } : DomArena msg).get node = a.get node := rfl
+          have hg : ({ nextId := a.nextId, store := a.store, signals := sigs, sigEvents := evs, tmpls, rowEvs } : DomArena msg).get node = a.get node := rfl
           rw [hg]
           have hchild : ∀ cn : Dom.Node,
-              (match hydrateDomM (m := StateM (DomArena msg)) c cn { a with signals := sigs } with
+              (match hydrateDomM (m := StateM (DomArena msg)) c cn { a with signals := sigs, sigEvents := evs, tmpls, rowEvs } with
               | (_, s) => hydrateDomKidsM (m := StateM (DomArena msg)) node (i + 1) false rest s).snd =
               { (match hydrateDomM (m := StateM (DomArena msg)) c cn a with
-                | (_, s) => hydrateDomKidsM (m := StateM (DomArena msg)) node (i + 1) false rest s).snd with signals := sigs } := by
+                | (_, s) => hydrateDomKidsM (m := StateM (DomArena msg)) node (i + 1) false rest s).snd with signals := sigs, sigEvents := evs, tmpls, rowEvs } := by
             intro cn
-            have hd := hydrateDomM_withSignals sigs c cn a
-            cases hd1 : hydrateDomM (m := StateM (DomArena msg)) c cn { a with signals := sigs } with
+            have hd := hydrateDomM_withSignals sigs evs tmpls rowEvs c cn a
+            cases hd1 : hydrateDomM (m := StateM (DomArena msg)) c cn { a with signals := sigs, sigEvents := evs, tmpls, rowEvs } with
             | mk _ a1 => cases hd2 : hydrateDomM (m := StateM (DomArena msg)) c cn a with
-              | mk _ a2 => rw [hd1, hd2] at hd; dsimp only at hd; rw [hd]; exact hydrateDomKidsM_withSignals sigs node (i + 1) false rest a2
+              | mk _ a2 => rw [hd1, hd2] at hd; dsimp only at hd; rw [hd]; exact hydrateDomKidsM_withSignals sigs evs tmpls rowEvs node (i + 1) false rest a2
           cases a.get node <;> dsimp only <;> exact hchild _
         | some str =>
           dsimp only [bind, StateT.bind, pure, StateT.pure]
-          have hs := hydrateTextSlotM_withSignals sigs node i inRun str (fun () => hasMoreText rest) a
-          cases hs1 : hydrateTextSlotM (m := StateM (DomArena msg)) node i inRun str (fun () => hasMoreText rest) { a with signals := sigs } with
+          have hs := hydrateTextSlotM_withSignals sigs evs tmpls rowEvs node i inRun str (fun () => hasMoreText rest) a
+          cases hs1 : hydrateTextSlotM (m := StateM (DomArena msg)) node i inRun str (fun () => hasMoreText rest) { a with signals := sigs, sigEvents := evs, tmpls, rowEvs } with
           | mk r1 a1 =>
               cases hs2 : hydrateTextSlotM (m := StateM (DomArena msg)) node i inRun str (fun () => hasMoreText rest) a with
               | mk r2 a2 =>
                   rw [hs1, hs2] at hs; dsimp only at hs
                   rcases Prod.mk.inj hs with ⟨hreq, haeq⟩
                   rw [hreq, haeq]
-                  exact hydrateDomKidsM_withSignals sigs node (i + 1) r2.2 rest a2
+                  exact hydrateDomKidsM_withSignals sigs evs tmpls rowEvs node (i + 1) r2.2 rest a2
 end
 
 theorem hydrateDomM_sameDom {msg : Type} (h : Html msg) (node : Dom.Node) {a₁ a₂ : DomArena msg}
     (hs : a₁.SameDom a₂) :
     (hydrateDomM (m := StateM (DomArena msg)) h node a₁).2.SameDom
       (hydrateDomM (m := StateM (DomArena msg)) h node a₂).2 := by
-  have heq : a₁ = { a₂ with signals := a₁.signals } := DomArena.ext hs.1 hs.2 rfl
+  have heq : a₁ = { a₂ with signals := a₁.signals, sigEvents := a₁.sigEvents, tmpls := a₁.tmpls, rowEvs := a₁.rowEvs } :=
+    DomArena.ext hs.1 hs.2 rfl rfl rfl rfl
   rw [heq, hydrateDomM_withSignals]; exact ⟨rfl, rfl⟩
 
 theorem hydrateDomKidsM_sameDom {msg : Type} (node : Dom.Node) (i : UInt32) (inRun : Bool)
     (cs : List (Html msg)) {a₁ a₂ : DomArena msg} (hs : a₁.SameDom a₂) :
     (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs a₁).2.SameDom
       (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs a₂).2 := by
-  have heq : a₁ = { a₂ with signals := a₁.signals } := DomArena.ext hs.1 hs.2 rfl
+  have heq : a₁ = { a₂ with signals := a₁.signals, sigEvents := a₁.sigEvents, tmpls := a₁.tmpls, rowEvs := a₁.rowEvs } :=
+    DomArena.ext hs.1 hs.2 rfl rfl rfl rfl
   rw [heq, hydrateDomKidsM_withSignals]; exact ⟨rfl, rfl⟩
 
 theorem hydrateListRowsM_eq_hydrateDomKidsM {msg : Type} (node : Dom.Node) :
@@ -1255,18 +1261,19 @@ mutual
             have h := hydrateViewKidsM_eq_hydrateDomKidsM hks node s 0 false a1
             dsimp only [StateT.run] at h
             cases hydrateViewKidsM (m := StateM (DomArena msg)) node s 0 false kids a1; exact h
-    | .keyedList tag attrs keys marks rowSig rowsHtml, ⟨ha, hrows⟩, s, node, a => by
+    | .keyedList _ _ _ _ _ _ _ (some _), h, _, _, _ => False.elim h
+    | .keyedList tag attrs keys marks rowSig rowEv rowsHtml none, ⟨ha, hrows⟩, s, node, a => by
         dsimp only [hydrateViewM, View.render, hydrateDomM, StateT.run, bind, StateT.bind, pure, StateT.pure]
         rw [ha.1 s, Bool.not_false, if_pos rfl]
         cases applyAttrsM (m := StateM (DomArena msg)) node (attrs.map (VAttr.eval s))
             (a.modifyElemState node fun st => { st with clicks := [], inputs := [] }) with
         | mk _ a1 =>
             dsimp only
-            cases hseed : seedRowsM (m := StateM (DomArena msg)) s!"§{node}§" (rowSig s) (marks s) #[] #[] a1 with
+            cases hseed : seedRowsM (m := StateM (DomArena msg)) s!"§{node}§" (rowSig s (disambiguateKeys (keys s))) (rowEv s (disambiguateKeys (keys s))) (marks s) #[] #[] a1 with
             | mk _ a2 =>
                 dsimp only
                 have hsd : a2.SameDom a1 := by
-                  have h := seedRowsM_sameDom s!"§{node}§" (rowSig s) (marks s) #[] #[] a1
+                  have h := seedRowsM_sameDom s!"§{node}§" (rowSig s (disambiguateKeys (keys s))) (rowEv s (disambiguateKeys (keys s))) (marks s) #[] #[] a1
                   dsimp only [StateT.run] at h; rw [hseed] at h; exact h
                 rw [Html.map_prefixSignals_of_DomCleanList _ (hrows.2.1 s)]
                 have hlist := hydrateListRowsM_eq_hydrateDomKidsM node 0 (rowsHtml s) (hrows.2.2.1 s) a2
@@ -1651,16 +1658,17 @@ private theorem hydrateViewM_spec_view {msg : Type} (f : Nat)
       (∀ m : Dom.Node, (m.toNat < lo ∨ hi ≤ m.toNat) → m.toNat < a.nextId → aOut.get m = a.get m) ∧
       VStateValid (f + 1) ns v s aOut (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) vst ∧
       DomTreeAssocEquiv (readDomTree (f + 1) aOut root) (specDom ns (View.render v s))
-  | .keyedList tag attrs keys marks rowSig rowsHtml, s, root, a, lo, hi, ⟨haCl, hrowsCl⟩, hbound, hdep, hdom => by
-      have hdomSpec := hydrateDomM_spec ns f (View.render (.keyedList tag attrs keys marks rowSig rowsHtml) s) root a lo hi hbound hdep hdom
-      have hviewEq := hydrateViewM_eq_hydrateDomM (v := .keyedList tag attrs keys marks rowSig rowsHtml) ⟨haCl, hrowsCl⟩ s root a
+  | .keyedList _ _ _ _ _ _ _ (some _), _, _, _, _, _, h, _, _, _ => False.elim h
+  | .keyedList tag attrs keys marks rowSig rowEv rowsHtml none, s, root, a, lo, hi, ⟨haCl, hrowsCl⟩, hbound, hdep, hdom => by
+      have hdomSpec := hydrateDomM_spec ns f (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s) root a lo hi hbound hdep hdom
+      have hviewEq := hydrateViewM_eq_hydrateDomM (v := .keyedList tag attrs keys marks rowSig rowEv rowsHtml) ⟨haCl, hrowsCl⟩ s root a
       dsimp only [StateT.run] at hdomSpec hviewEq
       dsimp only [hydrateViewM, StateT.run, bind, StateT.bind, pure, StateT.pure] at hviewEq ⊢
       cases ha1 : applyAttrsM (m := StateM (DomArena msg)) root (attrs.map (VAttr.eval s))
           (a.modifyElemState root fun st => { st with clicks := [], inputs := [] }) with
       | mk _ a1 =>
           rw [ha1] at hviewEq; dsimp only at hviewEq ⊢
-          cases hs1 : seedRowsM (m := StateM (DomArena msg)) s!"§{root}§" (rowSig s) (marks s) #[] #[] a1 with
+          cases hs1 : seedRowsM (m := StateM (DomArena msg)) s!"§{root}§" (rowSig s (disambiguateKeys (keys s))) (rowEv s (disambiguateKeys (keys s))) (marks s) #[] #[] a1 with
           | mk perRow a2 =>
               rw [hs1] at hviewEq
               rw [Html.map_prefixSignals_of_DomCleanList _ (hrowsCl.2.1 s)] at hviewEq ⊢
@@ -1669,11 +1677,11 @@ private theorem hydrateViewM_spec_view {msg : Type} (f : Nat)
               | mk _ aOut =>
                   rw [hl1] at hviewEq; dsimp only at hviewEq ⊢
                   cases hdomRun : hydrateDomM (m := StateM (DomArena msg))
-                      (View.render (.keyedList tag attrs keys marks rowSig rowsHtml) s) root a with
+                      (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s) root a with
                   | mk _ aDom =>
                       rw [hdomRun] at hviewEq hdomSpec; dsimp only at hviewEq hdomSpec
                       rcases hdomSpec with ⟨h1, h2, _, h4, h5, h6⟩
-                      have hcleanDom := h6 (View.DomClean_render (v := .keyedList tag attrs keys marks rowSig rowsHtml) ⟨haCl, hrowsCl⟩ s)
+                      have hcleanDom := h6 (View.DomClean_render (v := .keyedList tag attrs keys marks rowSig rowEv rowsHtml) ⟨haCl, hrowsCl⟩ s)
                       refine ⟨rfl, by rw [hviewEq.1]; exact h1, by rw [hviewEq.1]; exact h2,
                         fun m hmOut hmLt => (hviewEq.get_eq m).trans (h4 m hmOut hmLt),
                         ⟨CleanDomSubtree_frame (fun m _ => hviewEq.get_eq m) (by rw [hviewEq.1]; exact hcleanDom),

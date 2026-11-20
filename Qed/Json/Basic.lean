@@ -1,3 +1,5 @@
+import Qed.Html
+
 namespace Qed
 
 structure JsonNumber where
@@ -291,35 +293,60 @@ def appendEscaped (acc : String) (c : Char) : String :=
                                          toHexDigit (n / 16 % 16),   toHexDigit (n % 16)]
       else acc.push c
 
-def escapeCharsTR : List Char → String → String
-  | [], acc      => acc
-  | c :: cs, acc => escapeCharsTR cs (appendEscaped acc c)
+@[inline] def needsJsonEscape (c : Char) : Bool :=
+  c == '"' || c == '\\' || c.toNat < 0x20
 
-def renderStrFast (s : String) : String :=
-  escapeCharsTR s.toList "\"" ++ "\""
+@[inline] private def needsJsonEscapeByte (b : UInt8) : Bool :=
+  b < 32 || b == 34 || b == 92
+
+def renderStrAcc (s : String) (acc : String) : String :=
+  let acc1 := acc.push '"'
+  let acc2 := if !hasAsciiByte s needsJsonEscapeByte then acc1 ++ s else s.foldl appendEscaped acc1
+  acc2.push '"'
+
+def pushChars (acc : String) : List Char → String
+  | []      => acc
+  | c :: cs => pushChars (acc.push c) cs
+
+private def pushNatAcc (n : Nat) (acc : String) : String :=
+  if n < 10 then
+    acc.push (Char.ofNat ('0'.toNat + n))
+  else if n < 100 then
+    (acc.push (Char.ofNat ('0'.toNat + n / 10))).push (Char.ofNat ('0'.toNat + n % 10))
+  else
+    pushChars acc (natDigitsAux n [])
+
+def pushIntAcc (i : Int) (acc : String) : String :=
+  pushNatAcc i.natAbs (if i < 0 then acc.push '-' else acc)
+
+def renderNumAcc (n : JsonNumber) (acc : String) : String :=
+  let acc1 := pushIntAcc n.mantissa acc
+  if n.exponent == 0 then acc1 else pushIntAcc n.exponent (acc1.push 'e')
 
 mutual
-  def renderFast : Json → String
-    | .null       => "null"
-    | .bool true  => "true"
-    | .bool false => "false"
-    | .num n      => String.ofList (renderNumL n)
-    | .str s      => renderStrFast s
-    | .arr es     => "[" ++ renderElemsFast es ++ "]"
-    | .obj ms     => "{" ++ renderMembersFast ms ++ "}"
-  def renderElemsFast : List Json → String
-    | []      => ""
-    | e :: es => renderFast e ++ renderElemSepFast es
-  def renderElemSepFast : List Json → String
-    | []      => ""
-    | x :: xs => "," ++ (renderFast x ++ renderElemSepFast xs)
-  def renderMembersFast : List (String × Json) → String
-    | []           => ""
-    | (k, v) :: ms => renderStrFast k ++ ":" ++ (renderFast v ++ renderMemberSepFast ms)
-  def renderMemberSepFast : List (String × Json) → String
-    | []           => ""
-    | (k, v) :: ms => "," ++ (renderStrFast k ++ ":" ++ (renderFast v ++ renderMemberSepFast ms))
+  def renderAcc (acc : String) : Json → String
+    | .null       => acc ++ "null"
+    | .bool true  => acc ++ "true"
+    | .bool false => acc ++ "false"
+    | .num n      => renderNumAcc n acc
+    | .str s      => renderStrAcc s acc
+    | .arr es     => (renderElemsAcc (acc.push '[') es).push ']'
+    | .obj ms     => (renderMembersAcc (acc.push '{') ms).push '}'
+  def renderElemsAcc (acc : String) : List Json → String
+    | []      => acc
+    | e :: es => renderElemSepAcc (renderAcc acc e) es
+  def renderElemSepAcc (acc : String) : List Json → String
+    | []      => acc
+    | x :: xs => renderElemSepAcc (renderAcc (acc.push ',') x) xs
+  def renderMembersAcc (acc : String) : List (String × Json) → String
+    | []           => acc
+    | (k, v) :: ms => renderMemberSepAcc (renderAcc ((renderStrAcc k acc).push ':') v) ms
+  def renderMemberSepAcc (acc : String) : List (String × Json) → String
+    | []           => acc
+    | (k, v) :: ms => renderMemberSepAcc (renderAcc ((renderStrAcc k (acc.push ',')).push ':') v) ms
 end
+
+def renderFast (j : Json) : String := renderAcc "" j
 
 private theorem ofList_append (xs ys : List Char) :
     String.ofList (xs ++ ys) = String.ofList xs ++ String.ofList ys := by
@@ -329,68 +356,159 @@ private theorem ofList_cons (c : Char) (cs : List Char) :
     String.ofList (c :: cs) = String.singleton c ++ String.ofList cs := by
   ext; simp
 
+private theorem push_eq_append (acc : String) (c : Char) :
+    acc.push c = acc ++ String.singleton c := by
+  ext; simp
+
+private theorem pushChars_eq (acc : String) (cs : List Char) :
+    pushChars acc cs = acc ++ String.ofList cs := by
+  induction cs generalizing acc with
+  | nil => simp [pushChars]
+  | cons c cs ih =>
+      simp only [pushChars, ih, push_eq_append, ofList_cons, String.append_assoc]
+
 private theorem appendEscaped_eq (acc : String) (c : Char) :
     appendEscaped acc c = acc ++ String.ofList (escapeCharL c) := by
   unfold appendEscaped escapeCharL
   repeat' split
   all_goals (ext; simp)
 
-private theorem escapeCharsTR_eq (cs : List Char) (acc : String) :
-    escapeCharsTR cs acc = acc ++ String.ofList (cs.flatMap escapeCharL) := by
+private theorem foldl_appendEscaped_eq (cs : List Char) (acc : String) :
+    cs.foldl appendEscaped acc = acc ++ String.ofList (cs.flatMap escapeCharL) := by
   induction cs generalizing acc with
-  | nil => simp [escapeCharsTR]
+  | nil => simp
   | cons c cs ih =>
-    simp only [escapeCharsTR, List.flatMap_cons, ih, ofList_append, appendEscaped_eq, String.append_assoc]
+      simp only [List.foldl_cons, List.flatMap_cons, ih, ofList_append, appendEscaped_eq, String.append_assoc]
 
-theorem renderStrFast_eq (s : String) : renderStrFast s = String.ofList (renderStrL s) := by
-  unfold renderStrFast renderStrL
-  rw [escapeCharsTR_eq, ofList_cons, ofList_append, String.append_assoc]; rfl
+private theorem escapeCharL_of_not_needs {c : Char} (h : needsJsonEscape c = false) :
+    escapeCharL c = [c] := by
+  simp only [needsJsonEscape, Bool.or_eq_false_iff, beq_eq_false_iff_ne, decide_eq_false_iff_not] at h
+  unfold escapeCharL
+  split <;> first | exact absurd rfl h.1.1 | exact absurd rfl h.1.2 | (exfalso; apply h.2; decide) | simp [h.2]
+
+private theorem flatMap_escapeCharL_of_none : ∀ (cs : List Char),
+    cs.any needsJsonEscape = false → cs.flatMap escapeCharL = cs
+  | [], _ => rfl
+  | c :: cs, h => by
+      simp only [List.any_cons, Bool.or_eq_false_iff] at h
+      simp [List.flatMap_cons, escapeCharL_of_not_needs h.1, flatMap_escapeCharL_of_none cs h.2]
+
+private theorem hasJsonEscapeByte_eq (s : String) :
+    hasAsciiByte s needsJsonEscapeByte = s.toList.any needsJsonEscape := by
+  apply hasAsciiByte_eq_any
+  · intro b hb
+    unfold needsJsonEscapeByte
+    have h1 : decide (b < 32) = false := by rw [decide_eq_false_iff_not]; change ¬(b.toNat < 32); omega
+    have h2 : (b == 34) = false := by rw [beq_eq_false_iff_ne]; intro h; subst h; exact absurd hb (by decide)
+    have h3 : (b == 92) = false := by rw [beq_eq_false_iff_ne]; intro h; subst h; exact absurd hb (by decide)
+    simp [h1, h2, h3]
+  · intro c hc
+    unfold needsJsonEscapeByte needsJsonEscape
+    have hlt : (UInt8.ofNat c.toNat).toNat = c.toNat := by change c.toNat % 256 = c.toNat; omega
+    have hlt32 : decide (UInt8.ofNat c.toNat < 32) = decide (c.toNat < 0x20) := by
+      by_cases h32 : c.toNat < 0x20
+      · simp [h32, show UInt8.ofNat c.toNat < 32 from (by omega : (UInt8.ofNat c.toNat).toNat < 32)]
+      · simp [h32, show ¬(UInt8.ofNat c.toNat < 32) from (by omega : ¬((UInt8.ofNat c.toNat).toNat < 32))]
+    change (decide (UInt8.ofNat c.toNat < 32) || (UInt8.ofNat c.toNat == UInt8.ofNat '"'.toNat) ||
+      (UInt8.ofNat c.toNat == UInt8.ofNat '\\'.toNat)) = _
+    rw [hlt32, asciiByte_beq_char c hc '"' (by decide), asciiByte_beq_char c hc '\\' (by decide)]
+    cases (c == '"') <;> cases (c == '\\') <;> cases decide (c.toNat < 0x20) <;> rfl
+  · intro c hgt
+    unfold needsJsonEscape
+    have h1 : (c == '"') = false := by rw [beq_eq_false_iff_ne]; intro h; subst h; exact absurd hgt (by decide)
+    have h2 : (c == '\\') = false := by rw [beq_eq_false_iff_ne]; intro h; subst h; exact absurd hgt (by decide)
+    have h3 : decide (c.toNat < 0x20) = false := by rw [decide_eq_false_iff_not]; omega
+    simp [h1, h2, h3]
+
+theorem renderStrAcc_eq (s acc : String) :
+    renderStrAcc s acc = acc ++ String.ofList (renderStrL s) := by
+  unfold renderStrAcc renderStrL
+  have hfold : s.foldl appendEscaped (acc.push '"') = s.toList.foldl appendEscaped (acc.push '"') := by simp
+  dsimp only; rw [hfold, hasJsonEscapeByte_eq]
+  cases ha : s.toList.any needsJsonEscape with
+  | false =>
+      simp only [Bool.not_false, ↓reduceIte, flatMap_escapeCharL_of_none s.toList ha,
+        push_eq_append, ofList_cons, ofList_append, String.ofList_toList, String.append_assoc]; rfl
+  | true =>
+      simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, foldl_appendEscaped_eq,
+        push_eq_append, ofList_cons, ofList_append, String.append_assoc]; rfl
+
+private theorem pushNatAcc_eq (n : Nat) (acc : String) :
+    pushNatAcc n acc = acc ++ String.ofList (natDigitsAux n []) := by
+  unfold pushNatAcc
+  split
+  · rename_i h10
+    rw [natDigitsAux, if_pos h10, show n % 10 = n from Nat.mod_eq_of_lt h10]
+    ext; simp
+  · rename_i hge10
+    split
+    · rename_i h100
+      have hd : n / 10 < 10 := by omega
+      rw [natDigitsAux, if_neg hge10, natDigitsAux, if_pos hd, show (n / 10) % 10 = n / 10 from Nat.mod_eq_of_lt hd]
+      ext; simp [List.append_assoc]
+    · exact pushChars_eq acc (natDigitsAux n [])
+
+private theorem pushIntAcc_eq (i : Int) (acc : String) :
+    pushIntAcc i acc = acc ++ String.ofList (intCharsL i) := by
+  unfold pushIntAcc intCharsL
+  split <;> simp [pushNatAcc_eq, push_eq_append, String.append_assoc]
+
+private theorem renderNumAcc_eq (n : JsonNumber) (acc : String) :
+    renderNumAcc n acc = acc ++ String.ofList (renderNumL n) := by
+  unfold renderNumAcc renderNumL
+  split <;> simp [pushIntAcc_eq, push_eq_append, String.append_assoc]
 
 mutual
-  theorem renderFast_eq (j : Json) : renderFast j = String.ofList (renderL j) := by
+  theorem renderAcc_eq (acc : String) (j : Json) :
+      renderAcc acc j = acc ++ String.ofList (renderL j) := by
     cases j with
-    | null | num _ => rfl
+    | null => rfl
     | bool b => cases b <;> rfl
-    | str s => exact renderStrFast_eq s
+    | num n => exact renderNumAcc_eq n acc
+    | str s => exact renderStrAcc_eq s acc
     | arr es =>
-        unfold renderFast renderL
-        rw [ofList_cons, ofList_append, renderElemsFast_eq, String.append_assoc]; rfl
+        unfold renderAcc renderL
+        rw [renderElemsAcc_eq, push_eq_append, push_eq_append, ofList_cons, ofList_append, String.append_assoc, String.append_assoc]; rfl
     | obj ms =>
-        unfold renderFast renderL
-        rw [ofList_cons, ofList_append, renderMembersFast_eq, String.append_assoc]; rfl
-  theorem renderElemsFast_eq (es : List Json) :
-       renderElemsFast es = String.ofList (renderElemsL es) := by
+        unfold renderAcc renderL
+        rw [renderMembersAcc_eq, push_eq_append, push_eq_append, ofList_cons, ofList_append, String.append_assoc, String.append_assoc]; rfl
+  theorem renderElemsAcc_eq (acc : String) (es : List Json) :
+      renderElemsAcc acc es = acc ++ String.ofList (renderElemsL es) := by
     cases es with
-    | nil => rfl
+    | nil => simp [renderElemsAcc, renderElemsL]
     | cons e es =>
-        unfold renderElemsFast renderElemsL
-        rw [ofList_append, renderFast_eq, renderElemSepFast_eq]
-  theorem renderElemSepFast_eq (es : List Json) :
-      renderElemSepFast es = String.ofList (renderElemSep es) := by
+        unfold renderElemsAcc renderElemsL
+        rw [renderElemSepAcc_eq, renderAcc_eq, ofList_append, String.append_assoc]
+  theorem renderElemSepAcc_eq (acc : String) (es : List Json) :
+      renderElemSepAcc acc es = acc ++ String.ofList (renderElemSep es) := by
     cases es with
-    | nil => rfl
+    | nil => simp [renderElemSepAcc, renderElemSep]
     | cons x xs =>
-        unfold renderElemSepFast renderElemSep
-        rw [ofList_cons, ofList_append, renderFast_eq, renderElemSepFast_eq]; rfl
-  theorem renderMembersFast_eq (ms : List (String × Json)) :
-      renderMembersFast ms = String.ofList (renderMembersL ms) := by
+        unfold renderElemSepAcc renderElemSep
+        rw [renderElemSepAcc_eq, renderAcc_eq, push_eq_append, ofList_cons, ofList_append, String.append_assoc, String.append_assoc]
+  theorem renderMembersAcc_eq (acc : String) (ms : List (String × Json)) :
+      renderMembersAcc acc ms = acc ++ String.ofList (renderMembersL ms) := by
     cases ms with
-    | nil => rfl
+    | nil => simp [renderMembersAcc, renderMembersL]
     | cons kv ms =>
         rcases kv with ⟨k, v⟩
-        unfold renderMembersFast renderMembersL
-        rw [ofList_append, ofList_cons, ofList_append, renderStrFast_eq,
-          renderFast_eq, renderMemberSepFast_eq, String.append_assoc]; rfl
-  theorem renderMemberSepFast_eq (ms : List (String × Json)) :
-      renderMemberSepFast ms = String.ofList (renderMemberSep ms) := by
+        unfold renderMembersAcc renderMembersL
+        rw [renderMemberSepAcc_eq, renderAcc_eq, push_eq_append, renderStrAcc_eq,
+          ofList_append, ofList_cons, ofList_append, String.append_assoc, String.append_assoc, String.append_assoc]
+  theorem renderMemberSepAcc_eq (acc : String) (ms : List (String × Json)) :
+      renderMemberSepAcc acc ms = acc ++ String.ofList (renderMemberSep ms) := by
     cases ms with
-    | nil => rfl
+    | nil => simp [renderMemberSepAcc, renderMemberSep]
     | cons kv ms =>
         rcases kv with ⟨k, v⟩
-        unfold renderMemberSepFast renderMemberSep
-        rw [ofList_cons, ofList_append, ofList_cons, ofList_append,
-          renderStrFast_eq, renderFast_eq, renderMemberSepFast_eq, String.append_assoc]; rfl
+        unfold renderMemberSepAcc renderMemberSep
+        rw [renderMemberSepAcc_eq, renderAcc_eq, push_eq_append, renderStrAcc_eq, push_eq_append,
+          ofList_cons, ofList_append, ofList_cons, ofList_append,
+          String.append_assoc, String.append_assoc, String.append_assoc, String.append_assoc]
 end
+
+theorem renderFast_eq (j : Json) : renderFast j = String.ofList (renderL j) := by
+  unfold renderFast; rw [renderAcc_eq]; simp
 
 @[csimp] theorem render_eq_renderFast : @Json.render = @Json.renderFast := by
   funext j; exact (renderFast_eq j).symm

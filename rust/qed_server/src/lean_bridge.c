@@ -64,11 +64,9 @@ void qed_lean_inc(lean_object *o) { lean_inc(o); }
 void qed_lean_dec(lean_object *o) { lean_dec(o); }
 void qed_lean_dec_ref(lean_object *o) { lean_dec_ref(o); }
 void qed_lean_mark_mt(lean_object *o) { lean_mark_mt(o); }
+void qed_lean_mark_persistent(lean_object *o) { lean_mark_persistent(o); }
 
 lean_object *qed_lean_apply_1(lean_object *f, lean_object *a) { return lean_apply_1(f, a); }
-lean_object *qed_lean_apply_3(lean_object *f, lean_object *a, lean_object *b, lean_object *c) {
-    return lean_apply_3(f, a, b, c);
-}
 lean_object *qed_lean_apply_4(lean_object *f, lean_object *a, lean_object *b, lean_object *c, lean_object *d) {
     return lean_apply_4(f, a, b, c, d);
 }

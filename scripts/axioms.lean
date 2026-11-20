@@ -23,8 +23,11 @@ import Examples.LiveRoom
 #print axioms Qed.diff_apply
 #print axioms Qed.diffChildren_apply
 #print axioms Qed.applyChildrenTR_toList
-#print axioms Qed.renderNode_eq_renderNodeTR
+#print axioms Qed.renderNode_eq_renderNodeFast
 #print axioms Qed.renderChildren_eq_renderChildrenFast
+#print axioms Qed.escapeHtml_eq_escapeHtmlFast
+#print axioms Qed.sanitizeKey_eq_sanitizeKeyFast
+#print axioms Qed.disambiguateKeys_eq_fast
 #print axioms Qed.applyValues_render
 #print axioms Qed.patch_render
 #print axioms Qed.View.render_showIf
@@ -44,6 +47,8 @@ import Examples.LiveRoom
 -- XSS, URL Scheme & HTML5 Serialization Closure (#3b)
 #print axioms Qed.Url.isSafe
 #print axioms Qed.containsCloseSeq_escapeRawText
+#print axioms Qed.escapeRawText_eq_fast
+#print axioms Qed.isVoidTag_eq_fast
 #print axioms Qed.encodeSeg_safe
 #print axioms Qed.Router.isSafeUrl_toURL
 #print axioms Qed.ToHref.isSafeUrl_toHref
@@ -68,6 +73,12 @@ import Examples.LiveRoom
 #print axioms Qed.patchViewM_memo_hit
 #print axioms Qed.patchViewM_dyn_spec
 #print axioms Qed.forEach_disambiguated_keys_nodup
+#print axioms Qed.prefixMatchLen_bound
+#print axioms Qed.prefixMatchLen_sound
+#print axioms Qed.suffixMatchLen_sound
+#print axioms Qed.collectChangedMarksLoop_sound
+#print axioms Qed.patchNodeSlotAt_nextId
+#print axioms Qed.patchNodeSlotAt_text_root
 #print axioms Qed.App.ssr_rehydrate_equiv
 
 -- Typed JS Backend & Runtime Semantics Preservation (#3c)
@@ -243,7 +254,8 @@ import Examples.LiveRoom
 #print axioms Qed.buildViewM_vstate_spec
 #print axioms Qed.patchViewM_spec
 #print axioms Qed.patchViewKidsM_spec
-#print axioms Qed.alignRows_spec
+#print axioms Qed.buildKeyIndex_spec
+#print axioms Qed.verifiedLisFlags_spec
 #print axioms Qed.diffRowSigs_sound
 #print axioms Qed.seedRowsM_spec
 #print axioms Qed.renderSig_resolved_spec

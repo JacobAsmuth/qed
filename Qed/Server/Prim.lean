@@ -98,6 +98,7 @@ inductive HttpHeadAction (Req Ctx : Type) where
   | needBodyClose (contentLen : Nat) (req : Req)
   | needBodyKeep  (contentLen : Nat) (req : Req)
   | wsUpgrade     (respWire : ByteArray) (wsCtx : Ctx)
+  | deferHead
 
 /-- Subscription table mutation emitted by Lean's verified WebSocket frame/mux handler. -/
 inductive WsSubOp where
@@ -121,7 +122,7 @@ opaque serveNative {Req Ctx Frag : Type}
     (port : UInt16)
     (numWorkers : UInt32)
     (initFrag : Frag)
-    (onHead : ByteArray → String → IO (HttpHeadAction Req Ctx))
+    (onHead : ByteArray → String → Nat → IO (HttpHeadAction Req Ctx))
     (onBody : Req → ByteArray → String → IO ByteArray)
     (onWsBytes : Ctx → ByteArray → Frag → Array (Nat × String × ByteArray) → IO (WsStepOut Frag))
     (onWsLeave : Ctx → String → ByteArray → IO Unit) :

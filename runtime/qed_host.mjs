@@ -185,6 +185,22 @@ export function boot() {
       }
       const nt = et.closest('[data-qed-on-' + event + ']');
       if (nt) { if (event === 'submit') e.preventDefault(); const id = parseInt(nt.getAttribute('data-qed-on-' + event), 10); if (!Number.isNaN(id)) fire(nt, id); }
+      const rt = et.closest('[data-qed-row-on-' + event + ']');
+      if (rt) {
+        if (event === 'submit') e.preventDefault();
+        const evIdx = rt.getAttribute('data-qed-row-on-' + event);
+        const list = rt.closest('[data-qed-list]');
+        if (evIdx !== null && list) {
+          const listId = parseInt(list.getAttribute('data-qed-list'), 10);
+          let row = rt;
+          while (row && row.parentNode !== list) row = row.parentNode;
+          if (row && !Number.isNaN(listId)) {
+            let rowIdx = 0;
+            for (let p = row.previousSibling; p; p = p.previousSibling) rowIdx++;
+            fireStr(rt, listId, evIdx + ':' + rowIdx);
+          }
+        }
+      }
       const vt = et.closest('[data-qed-onv-' + event + ']');
       if (vt) { const id = parseInt(vt.getAttribute('data-qed-onv-' + event), 10); if (!Number.isNaN(id)) fireStr(vt, id, payloadFor(event, vt, e)); }
     }, true);

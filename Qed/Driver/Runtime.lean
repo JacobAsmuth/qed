@@ -321,8 +321,9 @@ def runWithHttpTimeout (app : App Model Msg) (httpTimeoutMs : Nat) : IO Unit := 
   let storeRef     ← IO.mkRef (∅ : Std.HashMap String String)
   let instancesRef ← IO.mkRef (∅ : Std.HashMap String LocalInstance)
   let ctx : LocalCtx := { registry, store := storeRef, instances := instancesRef }
+  let rowEvRef     ← IO.mkRef (#[] : Array (Nat → Nat → Option Msg))
   let h : Handlers Msg :=
-    { click := clickRef, input := inputRef,
+    { click := clickRef, input := inputRef, rowEv := rowEvRef,
       mountLocal := fun k c i p b hn => localMountRoot ctx (fun m => do (← dispatchRef.get) m) k c i p b hn }
   let gcLocals : IO Unit := do
     let mut dead : Array String := #[]
@@ -468,9 +469,7 @@ def runWithHttpTimeout (app : App Model Msg) (httpTimeoutMs : Nat) : IO Unit := 
     | none      => pure ()
   let localDispatchStr : String → UInt32 → String → IO Unit := fun fullKey id s => do
     match (← instancesRef.get)[fullKey]? with
-    | some inst => match (← inst.handlers.input.get)[id.toNat]? with
-                   | some f => localRun ctx fullKey inst (f s)
-                   | none   => pure ()
+    | some inst => dispatchStrWithRows inst.handlers.input inst.handlers.rowEv (localRun ctx fullKey inst) id s
     | none      => pure ()
   let effectDone : UInt32 → String → IO Unit := fun id result => do
     match (← wsTimerCbRef.get)[id.toNat]? with
@@ -533,10 +532,8 @@ def runWithHttpTimeout (app : App Model Msg) (httpTimeoutMs : Nat) : IO Unit := 
       match (← clickRef.get)[id.toNat]? with
       | some msg => dispatchMsg msg
       | none     => IO.eprintln s!"qed: unknown click id {id}"
-    dispatchStr := fun id s => do
-      match (← inputRef.get)[id.toNat]? with
-      | some f => dispatchMsg (f s)
-      | none   => pure ()
+    dispatchStr := fun id s =>
+      dispatchStrWithRows inputRef rowEvRef dispatchMsg id s
     streamChunk := fun cid rawChunk => do
       let prev := (← streamBufRef.get).getD cid.toNat ""
       let (events, rem) := parseSseBuffer (prev ++ rawChunk)

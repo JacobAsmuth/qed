@@ -154,6 +154,190 @@ theorem disambiguateKeys_of_nodup {keys : Array String} (hnd : keys.toList.Nodup
   simpa [disambiguateKeys] using
     disambiguateKeysTR_of_nodup keys.toList ∅ 0 #[] (fun _ _ hm => by simp at hm) hnd
 
+def nextPow2Ge (target cur : Nat) : Nat → Nat
+  | 0 => cur
+  | fuel' + 1 => if cur ≥ target then cur else nextPow2Ge target (cur * 2) fuel'
+
+theorem nextPow2Ge_pos (target cur fuel : Nat) (hcur : 0 < cur) :
+    0 < nextPow2Ge target cur fuel := by
+  induction fuel generalizing cur with
+  | zero => exact hcur
+  | succ f ih => unfold nextPow2Ge; split; exact hcur; exact ih (cur * 2) (by omega)
+
+@[inline] def strBucketIdx (k : String) (mask : USize) (sz : Nat) : Nat :=
+  let idx := ((hash k).toUSize &&& mask).toNat
+  if idx < sz then idx else 0
+
+theorem strBucketIdx_lt (k : String) (mask : USize) (sz : Nat) (hsz : 0 < sz) :
+    strBucketIdx k mask sz < sz := by
+  unfold strBucketIdx; dsimp only; split <;> assumption
+
+@[inline] private def bucketContains (buckets : @& Array (List String)) (mask : USize) (k : String) : Bool :=
+  if h : 0 < buckets.size then
+    (buckets[strBucketIdx k mask buckets.size]'(strBucketIdx_lt k mask buckets.size h)).contains k
+  else false
+
+private def pickFreshKeyLoopFast (k : String) (buckets : @& Array (List String)) (mask : USize)
+    (maxLen : Nat) : Nat → Nat → String
+  | _, 0 => k ++ String.ofList (List.replicate (maxLen + 1) '~')
+  | i, fuel + 1 =>
+      let cand := k ++ "~~dup" ++ Nat.repr i
+      if !bucketContains buckets mask cand then cand
+      else pickFreshKeyLoopFast k buckets mask maxLen (i + 1) fuel
+
+private def pickFreshKeyFast (k : String) (buckets : @& Array (List String)) (mask : USize)
+    (maxLen seenSize : Nat) : String :=
+  if !bucketContains buckets mask k then k
+  else pickFreshKeyLoopFast k buckets mask maxLen 1 seenSize
+
+private def disambiguateKeysFastLoop (keys : @& Array String) (i : Nat)
+    (buckets : Array (List String)) (mask : USize) (maxLen : Nat) (acc : Array String) :
+    Array String :=
+  if h : i < keys.size then
+    let k := keys[i]
+    let k' := pickFreshKeyFast k buckets mask maxLen i
+    let buckets' :=
+      if hb : 0 < buckets.size then
+        let bi := strBucketIdx k' mask buckets.size
+        have hbi : bi < buckets.size := strBucketIdx_lt k' mask buckets.size hb
+        let cur := buckets[bi]
+        buckets.set bi (k' :: cur) hbi
+      else buckets
+    disambiguateKeysFastLoop keys (i + 1) buckets' mask (Nat.max maxLen k'.length) (acc.push k')
+  else acc
+termination_by keys.size - i
+
+/-- Bare-array `O(N)` key disambiguator (`@[csimp]` replacement for `disambiguateKeys`).
+    Passing `buckets : Array (List String)` directly (not wrapped in a struct) keeps its
+    refcount exclusive (`r = 1`) in both native Lean and JS, guaranteeing `O(1)` in-place updates. -/
+def disambiguateKeysFast (keys : Array String) : Array String :=
+  let cap := nextPow2Ge (keys.size * 2) 16 30
+  let mask := USize.ofNat (cap - 1)
+  let buckets : Array (List String) := Array.replicate cap []
+  disambiguateKeysFastLoop keys 0 buckets mask 0 (Array.emptyWithCapacity keys.size)
+
+private def BucketsMatch (buckets : Array (List String)) (mask : USize) (seen : Std.HashSet String) : Prop :=
+  0 < buckets.size ∧ ∀ s : String, bucketContains buckets mask s = seen.contains s
+
+private theorem pickFreshKeyLoopFast_eq (k : String) (buckets : Array (List String)) (mask : USize)
+    (seen : Std.HashSet String) (maxLen : Nat) (hm : BucketsMatch buckets mask seen) :
+    ∀ i fuel, pickFreshKeyLoopFast k buckets mask maxLen i fuel = pickFreshKeyLoop k seen maxLen i fuel
+  | _, 0 => rfl
+  | i, fuel + 1 => by
+      simp only [pickFreshKeyLoopFast, pickFreshKeyLoop, hm.2]
+      split
+      · rfl
+      · exact pickFreshKeyLoopFast_eq k buckets mask seen maxLen hm (i + 1) fuel
+
+private theorem pickFreshKeyFast_eq (k : String) (buckets : Array (List String)) (mask : USize)
+    (seen : Std.HashSet String) (maxLen seenSize : Nat)
+    (hm : BucketsMatch buckets mask seen) (hsz : seenSize = seen.size) :
+    pickFreshKeyFast k buckets mask maxLen seenSize = pickFreshKey k seen maxLen := by
+  simp only [pickFreshKeyFast, pickFreshKey, hm.2, hsz]
+  split
+  · rfl
+  · exact pickFreshKeyLoopFast_eq k buckets mask seen maxLen hm 1 seen.size
+
+private theorem bucketsMatch_insert {buckets : Array (List String)} {mask : USize}
+    {seen : Std.HashSet String} (hm : BucketsMatch buckets mask seen) (k' : String) :
+    let bi := strBucketIdx k' mask buckets.size
+    let hbi : bi < buckets.size := strBucketIdx_lt k' mask buckets.size hm.1
+    BucketsMatch (buckets.set bi (k' :: buckets[bi]) hbi) mask (seen.insert k') := by
+  intro bi hbi
+  refine ⟨by simp [hm.1], fun s => ?_⟩
+  have hpos' : 0 < (buckets.set bi (k' :: buckets[bi]) hbi).size := by simp [hm.1]
+  have hsz' : (buckets.set bi (k' :: buckets[bi]) hbi).size = buckets.size := Array.size_set ..
+  unfold bucketContains
+  simp only [hpos', ↓reduceDIte]
+  have hidxEq : strBucketIdx s mask (buckets.set bi (k' :: buckets[bi]) hbi).size =
+      strBucketIdx s mask buckets.size := by rw [hsz']
+  have hprev : (buckets[strBucketIdx s mask buckets.size]'(strBucketIdx_lt s mask buckets.size hm.1)).contains s =
+      seen.contains s := by
+    have := hm.2 s
+    unfold bucketContains at this
+    simpa [hm.1] using this
+  have hset : (buckets.set bi (k' :: buckets[bi]) hbi)[strBucketIdx s mask (buckets.set bi (k' :: buckets[bi]) hbi).size]'(strBucketIdx_lt s mask _ hpos') =
+      if bi = strBucketIdx s mask buckets.size then k' :: buckets[bi]
+      else buckets[strBucketIdx s mask buckets.size]'(strBucketIdx_lt s mask buckets.size hm.1) := by
+    simp only [hidxEq, Array.getElem_set]
+  rw [hset]
+  by_cases hbiS : bi = strBucketIdx s mask buckets.size
+  · simp only [hbiS, ↓reduceIte, List.contains_cons, Std.HashSet.contains_insert, hprev]
+    cases hsk : (s == k') with
+    | true =>
+        have heq : s = k' := eq_of_beq hsk; subst heq; simp
+    | false =>
+        have hks : (k' == s) = false := beq_eq_false_iff_ne.2 fun h => by
+          subst h; simp at hsk
+        simp [hks]
+  · simp only [hbiS, ↓reduceIte, hprev, Std.HashSet.contains_insert]
+    have hne : (k' == s) = false := by
+      cases hbeq : (k' == s) with
+      | false => rfl
+      | true =>
+          have heq : k' = s := eq_of_beq hbeq
+          subst heq
+          exact False.elim (hbiS rfl)
+    simp [hne]
+
+private theorem disambiguateKeysFastLoop_eq (keys : Array String) (mask : USize) :
+    ∀ (i : Nat) (buckets : Array (List String)) (seen : Std.HashSet String)
+      (maxLen : Nat) (acc : Array String),
+      i ≤ keys.size →
+      BucketsMatch buckets mask seen →
+      (∀ s, s ∈ seen → s.length ≤ maxLen) →
+      seen.size = i →
+      disambiguateKeysFastLoop keys i buckets mask maxLen acc =
+        disambiguateKeysTR seen maxLen acc (keys.toList.drop i) := by
+  intro i
+  induction hrem : keys.size - i generalizing i with
+  | zero =>
+      intro buckets seen maxLen acc hle _ _ _
+      have hi : i = keys.size := by omega
+      subst hi
+      unfold disambiguateKeysFastLoop
+      have hdrop : keys.toList.drop keys.size = [] := List.drop_of_length_le (by simp)
+      simp [hdrop, disambiguateKeysTR]
+  | succ r ih =>
+      intro buckets seen maxLen acc hle hm hmax hsz
+      have hlt : i < keys.size := by omega
+      have hdrop : keys.toList.drop i = keys[i] :: keys.toList.drop (i + 1) := by
+        rw [List.drop_eq_getElem_cons (by simpa using hlt)]
+        rfl
+      rw [hdrop]
+      unfold disambiguateKeysFastLoop
+      simp only [hlt, ↓reduceDIte, hm.1, disambiguateKeysTR]
+      have hpk : pickFreshKeyFast keys[i] buckets mask maxLen i =
+          pickFreshKey keys[i] seen maxLen :=
+        pickFreshKeyFast_eq keys[i] buckets mask seen maxLen i hm hsz.symm
+      simp only [hpk]
+      let k' := pickFreshKey keys[i] seen maxLen
+      have hnot : k' ∉ seen := pickFreshKey_not_mem keys[i] seen maxLen hmax
+      have hsz' : (seen.insert k').size = i + 1 := by
+        simp [Std.HashSet.size_insert, hnot, hsz]
+      have hmax' : ∀ s, s ∈ seen.insert k' → s.length ≤ Nat.max maxLen k'.length := by
+        intro s hs
+        rcases Std.HashSet.mem_insert.1 hs with heq | hmem
+        · have : k' = s := eq_of_beq heq
+          subst this; exact Nat.le_max_right _ _
+        · exact Nat.le_trans (hmax s hmem) (Nat.le_max_left _ _)
+      exact ih (i + 1) (by omega) _ (seen.insert k') (Nat.max maxLen k'.length) (acc.push k')
+        (by omega) (bucketsMatch_insert hm k') hmax' hsz'
+
+@[csimp] theorem disambiguateKeys_eq_fast : @disambiguateKeys = @disambiguateKeysFast := by
+  funext keys
+  unfold disambiguateKeys disambiguateKeysFast
+  have hcap : 0 < nextPow2Ge (keys.size * 2) 16 30 := nextPow2Ge_pos _ 16 30 (by omega)
+  have hm0 : BucketsMatch (Array.replicate (nextPow2Ge (keys.size * 2) 16 30) [])
+      (USize.ofNat (nextPow2Ge (keys.size * 2) 16 30 - 1)) (∅ : Std.HashSet String) := by
+    refine ⟨by simp [hcap], fun s => ?_⟩
+    unfold bucketContains
+    simp [hcap]
+  have heq := disambiguateKeysFastLoop_eq keys (USize.ofNat (nextPow2Ge (keys.size * 2) 16 30 - 1))
+    0 (Array.replicate (nextPow2Ge (keys.size * 2) 16 30) []) ∅ 0 (Array.emptyWithCapacity keys.size)
+    (Nat.zero_le _) hm0 (fun _ h => by simp at h) (by simp)
+  simpa using heq.symm
+
 /-- A congruence-verified memoized HTML fragment: whenever two projections produce
     equal string keys, they are kernel-proven to produce identical `Html` trees. -/
 structure SoundMemo (σ : Type) (msg : Type) where
@@ -176,6 +360,54 @@ inductive VAttr (σ : Type) (msg : Type) where
   | stat (a : Attr msg)
   | bind (get : σ → Attr msg)
   | dynVal (attr : String) (get : σ → String)
+  | dynOn (event : String) (get : σ → msg)
+
+structure RowTmpl (σ msg : Type) where
+  proto     : Html msg
+  slotPaths : Array (Array UInt32)
+  slotAttrs : Array String
+  evPaths   : Array (Array UInt32)
+  evNames   : Array String
+  rowKey    : σ → Nat → String
+  rowVals   : σ → Nat → Array String
+  rowEvAt   : σ → Nat → Nat → Option msg
+
+def RowTmpl.mapScope (f : σ' → σ) (t : RowTmpl σ msg) : RowTmpl σ' msg where
+  proto     := t.proto
+  slotPaths := t.slotPaths
+  slotAttrs := t.slotAttrs
+  evPaths   := t.evPaths
+  evNames   := t.evNames
+  rowKey    := fun s' i => t.rowKey (f s') i
+  rowVals   := fun s' i => t.rowVals (f s') i
+  rowEvAt   := fun s' i j => t.rowEvAt (f s') i j
+
+def applyHtmlSlotAt {msg : Type} (path : List Nat) (attrName val : String) : Html msg → Html msg
+  | .text s => if path.isEmpty && attrName.isEmpty then .text val else .text s
+  | .element tag attrs kids =>
+      match path with
+      | [] =>
+          let attrs' := attrs.map fun a =>
+            match a with
+            | .attr k _ => if k == attrName then .attr k val else a
+            | other => other
+          .element tag attrs' kids
+      | i :: rest =>
+          .element tag attrs (kids.modify i (applyHtmlSlotAt rest attrName val))
+
+def applyRowSlotsLoop {msg : Type} (slotPaths : Array (Array UInt32)) (slotAttrs vals : Array String)
+    (i : Nat) (h : Html msg) : Html msg :=
+  if hi : i < slotPaths.size then
+    let p := (slotPaths[i].toList).map UInt32.toNat
+    let a := slotAttrs.getD i ""
+    let v := vals.getD i ""
+    applyRowSlotsLoop slotPaths slotAttrs vals (i + 1) (applyHtmlSlotAt p a v h)
+  else h
+termination_by slotPaths.size - i
+
+def applyRowSlots {msg : Type} (proto : Html msg) (slotPaths : Array (Array UInt32))
+    (slotAttrs vals : Array String) : Html msg :=
+  applyRowSlotsLoop slotPaths slotAttrs vals 0 proto
 
 inductive View (σ : Type) (msg : Type) where
   | text (s : String)
@@ -184,8 +416,10 @@ inductive View (σ : Type) (msg : Type) where
   | ifElse (cond : σ → Bool) (yes no : View σ msg)
   | keyedList (tag : String) (attrs : List (VAttr σ msg))
       (keys : σ → Array String)
-      (marks : σ → Array USize) (rowSig : σ → Nat → Array (String × String))
+      (marks : σ → Array USize) (rowSig : σ → Array String → Nat → Array (String × String))
+      (rowEv : σ → Array String → Nat → Array (String × msg))
       (rowsHtml : σ → List (Html msg))
+      (tmpl? : Option (RowTmpl σ msg) := none)
   | static (html : Html msg)
   | dynNode (get : σ → Html msg)
   | memo (sm : SoundMemo σ msg)
@@ -200,16 +434,20 @@ def VAttr.eval (s : σ) : VAttr σ msg → Attr msg
   | .stat a          => a
   | .bind f          => f s
   | .dynVal attr get => .attr attr (get s)
+  | .dynOn ev get    => .on ev (get s)
 
 @[simp] theorem VAttr.eval_stat (s : σ) (a : Attr msg) : VAttr.eval s (.stat a) = a := rfl
 @[simp] theorem VAttr.eval_bind (s : σ) (f : σ → Attr msg) : VAttr.eval s (.bind f) = f s := rfl
 @[simp] theorem VAttr.eval_dynVal {msg : Type} (s : σ) (k : String) (g : σ → String) :
     (VAttr.dynVal k g : VAttr σ msg).eval s = .attr k (g s) := rfl
+@[simp] theorem VAttr.eval_dynOn {msg : Type} (s : σ) (e : String) (g : σ → msg) :
+    (VAttr.dynOn e g : VAttr σ msg).eval s = .on e (g s) := rfl
 
 def VAttr.mapScope (f : σ' → σ) : VAttr σ msg → VAttr σ' msg
   | .stat a          => .stat a
   | .bind g          => .bind (fun s' => g (f s'))
   | .dynVal attr get => .dynVal attr (fun s' => get (f s'))
+  | .dynOn ev get    => .dynOn ev (fun s' => get (f s'))
 
 @[simp] theorem VAttr.eval_mapScope (f : σ' → σ) (s' : σ') (va : VAttr σ msg) :
     VAttr.eval s' (va.mapScope f) = VAttr.eval (f s') va := by
@@ -235,9 +473,10 @@ mutual
     | .dyn get                         => .dyn (fun s' => get (f s'))
     | .element t as ks                 => .element t (as.map (VAttr.mapScope f)) (View.mapScopeEach f ks)
     | .ifElse cond y n                 => .ifElse (fun s' => cond (f s')) (y.mapScope f) (n.mapScope f)
-    | .keyedList t as keys marks rs rh =>
+    | .keyedList t as keys marks rs re rh tmpl? =>
         .keyedList t (as.map (VAttr.mapScope f)) (fun s' => keys (f s'))
-          (fun s' => marks (f s')) (fun s' => rs (f s')) (fun s' => rh (f s'))
+          (fun s' => marks (f s')) (fun s' => rs (f s')) (fun s' => re (f s')) (fun s' => rh (f s'))
+          (tmpl?.map (RowTmpl.mapScope f))
     | .static h                        => .static h
     | .dynNode get                     => .dynNode (fun s' => get (f s'))
     | .memo sm                         => .memo (sm.mapScope f)
@@ -252,7 +491,7 @@ mutual
     | .dyn get,         s => .text (get s)
     | .element t as ks, s => .element t (as.map (VAttr.eval s)) (View.renderEach ks s)
     | .ifElse cond y n, s => if cond s then View.render y s else View.render n s
-    | .keyedList tag as _ _ _ rowsHtml, s => .element tag (as.map (VAttr.eval s)) (rowsHtml s)
+    | .keyedList tag as _ _ _ _ rowsHtml _, s => .element tag (as.map (VAttr.eval s)) (rowsHtml s)
     | .static h,        _ => h
     | .dynNode get,     s => get s
     | .memo sm,         s => sm.eval s
@@ -276,7 +515,7 @@ mutual
         simp [View.mapScope, View.render, List.map_map, Function.comp_def, View.renderEach_mapScopeEach f ks s']
     | ifElse cond y n =>
         simp [View.mapScope, View.render, View.render_mapScope f y s', View.render_mapScope f n s']
-    | keyedList t as _ _ _ rh =>
+    | keyedList t as _ _ _ _ rh _ =>
         simp [View.mapScope, View.render, List.map_map, Function.comp_def]
     | static _ => rfl
     | dynNode _ => rfl
@@ -457,6 +696,9 @@ theorem patch_render (t : View σ msg) (s s' : σ) :
 def dynValGets (attrs : List (VAttr σ msg)) : List (σ → String) :=
   attrs.filterMap fun | .dynVal _ get => some get | _ => none
 
+def dynOnGets (attrs : List (VAttr σ msg)) : List (σ → msg) :=
+  attrs.filterMap fun | .dynOn _ get => some get | _ => none
+
 mutual
   def View.collectDyn : View σ msg → List (σ → String)
     | .text _               => []
@@ -470,6 +712,16 @@ mutual
   def View.collectDynList : List (View σ msg) → List (σ → String)
     | []      => []
     | k :: ks => View.collectDyn k ++ View.collectDynList ks
+end
+
+mutual
+  def View.collectDynOn : View σ msg → List (σ → msg)
+    | .text _ | .dyn _ | .keyedList .. | .static _ | .dynNode _ | .memo _ => []
+    | .element _ attrs kids => dynOnGets attrs ++ View.collectDynOnList kids
+    | .ifElse _ y no        => View.collectDynOn y ++ View.collectDynOn no
+  def View.collectDynOnList : List (View σ msg) → List (σ → msg)
+    | []      => []
+    | k :: ks => View.collectDynOn k ++ View.collectDynOnList ks
 end
 
 def tagBlocksDirectSpan (tag : String) : Bool :=
@@ -506,7 +758,7 @@ mutual
     | .element _ _ kids, s => View.collectShapeList kids s
     | .ifElse cond y no, s =>
         if cond s then "1" ++ View.collectShape y s else "0" ++ View.collectShape no s
-    | .keyedList tag as _ _ _ rowsHtml, s =>
+    | .keyedList tag as _ _ _ _ rowsHtml _, s =>
         "{" ++ Html.render (.element tag (as.map (VAttr.eval s)) (rowsHtml s)) ++ "}"
     | .static _,        _ => ""
     | .dynNode get,     s => "<" ++ Html.render (get s) ++ ">"
@@ -516,127 +768,132 @@ mutual
     | k :: ks, s => View.collectShape k s ++ View.collectShapeList ks s
 end
 
-def renderSigAttrs (s : σ) (pre : String) : List (VAttr σ msg) → Nat → List (Attr msg) × Nat
-  | [],        n => ([], n)
-  | va :: rest, n =>
-      let (a, n1) := match va with
-        | .dynVal attr get => (Attr.signalAttr s!"{pre}#{n}" attr (get s), n + 1)
-        | other            => (VAttr.eval s other, n)
-      let (as, n2) := renderSigAttrs s pre rest n1
-      (a :: as, n2)
+def renderSigAttrs (s : σ) (pre : String) : List (VAttr σ msg) → Nat → Nat → List (Attr msg) × Nat × Nat
+  | [],        n, en => ([], n, en)
+  | va :: rest, n, en =>
+      let (a, n1, en1) := match va with
+        | .dynVal attr get => (Attr.signalAttr s!"{pre}#{n}" attr (get s), n + 1, en)
+        | .dynOn ev get    => (Attr.signalOn s!"{pre}#e{en}" ev (get s), n, en + 1)
+        | other            => (VAttr.eval s other, n, en)
+      let (as, n2, en2) := renderSigAttrs s pre rest n1 en1
+      (a :: as, n2, en2)
 
 @[simp] theorem Attr.validList_renderSigAttrs (s : σ) (pre : String) :
-    ∀ (attrs : List (VAttr σ msg)) (n : Nat),
-      Attr.validList (renderSigAttrs s pre attrs n).1 = Attr.validList (attrs.map (VAttr.eval s))
-  | [], _ => rfl
-  | va :: rest, n => by
+    ∀ (attrs : List (VAttr σ msg)) (n en : Nat),
+      Attr.validList (renderSigAttrs s pre attrs n en).1 = Attr.validList (attrs.map (VAttr.eval s))
+  | [], _, _ => rfl
+  | va :: rest, n, en => by
       cases va <;> simp [renderSigAttrs, VAttr.eval, Attr.valid, Attr.validList_renderSigAttrs s pre rest]
 
 @[simp] theorem Attr.hasLocalCell_renderSigAttrs (s : σ) (pre : String) :
-    ∀ (attrs : List (VAttr σ msg)) (n : Nat),
-      Attr.hasLocalCell (renderSigAttrs s pre attrs n).1 = Attr.hasLocalCell (attrs.map (VAttr.eval s))
-  | [], _ => rfl
-  | va :: rest, n => by
+    ∀ (attrs : List (VAttr σ msg)) (n en : Nat),
+      Attr.hasLocalCell (renderSigAttrs s pre attrs n en).1 = Attr.hasLocalCell (attrs.map (VAttr.eval s))
+  | [], _, _ => rfl
+  | va :: rest, n, en => by
       cases va <;> simp [renderSigAttrs, VAttr.eval, Attr.hasLocalCell_renderSigAttrs s pre rest]
 
 mutual
-  def View.renderSig : View σ msg → σ → String → Nat → Html msg × Nat
-    | .text s,          _, _,   n => (.text s, n)
-    | .dyn get,         s, pre, n => (.element "span" [.signalBind s!"{pre}#{n}"] [.text (get s)], n + 1)
-    | .element tag attrs kids, s, pre, n =>
-        let (attrs', n1) := renderSigAttrs s pre attrs n
-        let (cs, n2) := View.renderSigList kids s pre n1
-        (.element tag attrs' cs, n2)
-    | .ifElse cond y no, s, pre, n =>
-        -- Reserve inactive branch's signal indices so leaf names stay aligned with `collectDyn` across flips.
+  def View.renderSig : View σ msg → σ → String → Nat → (en : Nat := 0) → Html msg × Nat × Nat
+    | .text s,          _, _,   n, en => (.text s, n, en)
+    | .dyn get,         s, pre, n, en => (.element "span" [.signalBind s!"{pre}#{n}"] [.text (get s)], n + 1, en)
+    | .element tag attrs kids, s, pre, n, en =>
+        let (attrs', n1, en1) := renderSigAttrs s pre attrs n en
+        let (cs, n2, en2) := View.renderSigList kids s pre n1 en1
+        (.element tag attrs' cs, n2, en2)
+    | .ifElse cond y no, s, pre, n, en =>
+        -- Reserve inactive branch's signal indices so leaf names stay aligned with `collectDyn`/`collectDynOn` across flips.
         if cond s then
-          let (h, n1) := View.renderSig y s pre n
-          (h, n1 + (View.collectDyn no).length)
+          let (h, n1, en1) := View.renderSig y s pre n en
+          (h, n1 + (View.collectDyn no).length, en1 + (View.collectDynOn no).length)
         else
-          let (h, n2) := View.renderSig no s pre (n + (View.collectDyn y).length)
-          (h, n2)
-    | .keyedList tag as _ _ _ rowsHtml, s, _, n =>
-        (.element tag (as.map (VAttr.eval s)) (rowsHtml s), n)
-    | .static h,        _, _,   n => (h, n)
-    | .dynNode get,     s, _,   n => (get s, n)
-    | .memo sm,         s, _,   n => (sm.eval s, n)
-  def View.renderSigList : List (View σ msg) → σ → String → Nat → List (Html msg) × Nat
-    | [],      _, _,   n => ([], n)
-    | k :: ks, s, pre, n =>
-        let (h,  n')  := View.renderSig k s pre n
-        let (hs, n'') := View.renderSigList ks s pre n'
-        (h :: hs, n'')
+          let (h, n2, en2) := View.renderSig no s pre (n + (View.collectDyn y).length) (en + (View.collectDynOn y).length)
+          (h, n2, en2)
+    | .keyedList tag as _ _ _ _ rowsHtml _, s, _, n, en =>
+        (.element tag (as.map (VAttr.eval s)) (rowsHtml s), n, en)
+    | .static h,        _, _,   n, en => (h, n, en)
+    | .dynNode get,     s, _,   n, en => (get s, n, en)
+    | .memo sm,         s, _,   n, en => (sm.eval s, n, en)
+  def View.renderSigList : List (View σ msg) → σ → String → Nat → (en : Nat := 0) → List (Html msg) × Nat × Nat
+    | [],      _, _,   n, en => ([], n, en)
+    | k :: ks, s, pre, n, en =>
+        let (h,  n', en')   := View.renderSig k s pre n en
+        let (hs, n'', en'') := View.renderSigList ks s pre n' en'
+        (h :: hs, n'', en'')
 end
 
 @[simp] theorem View.renderSigList_isEmpty :
-    ∀ (ks : List (View σ msg)) (s : σ) (pre : String) (n : Nat),
-      (View.renderSigList ks s pre n).1.isEmpty = ks.isEmpty
-  | [], _, _, _ => rfl
-  | _ :: _, _, _, _ => rfl
+    ∀ (ks : List (View σ msg)) (s : σ) (pre : String) (n en : Nat),
+      (View.renderSigList ks s pre n en).1.isEmpty = ks.isEmpty
+  | [], _, _, _, _ => rfl
+  | _ :: _, _, _, _, _ => rfl
 
 @[simp] theorem renderSigAttrs_canonical (s : σ) (pre : String) :
-    ∀ (attrs : List (VAttr σ msg)) (n : Nat),
-      (renderSigAttrs s pre attrs n).1.filterMap Attr.canonical =
+    ∀ (attrs : List (VAttr σ msg)) (n en : Nat),
+      (renderSigAttrs s pre attrs n en).1.filterMap Attr.canonical =
         (attrs.map (VAttr.eval s)).filterMap Attr.canonical
-  | [], _ => rfl
-  | va :: rest, n => by
+  | [], _, _ => rfl
+  | va :: rest, n, en => by
       cases va with
       | stat a =>
           simp only [renderSigAttrs, List.map, VAttr.eval, List.filterMap]
-          cases Attr.canonical a <;> simp [renderSigAttrs_canonical s pre rest n]
+          cases Attr.canonical a <;> simp [renderSigAttrs_canonical s pre rest n en]
       | bind f =>
           simp only [renderSigAttrs, List.map, VAttr.eval, List.filterMap]
-          cases Attr.canonical (f s) <;> simp [renderSigAttrs_canonical s pre rest n]
+          cases Attr.canonical (f s) <;> simp [renderSigAttrs_canonical s pre rest n en]
       | dynVal attr get =>
           simp [renderSigAttrs, VAttr.eval, Attr.canonical,
-                renderSigAttrs_canonical s pre rest (n + 1)]
+                renderSigAttrs_canonical s pre rest (n + 1) en]
+      | dynOn ev get =>
+          simp [renderSigAttrs, VAttr.eval, Attr.canonical,
+                renderSigAttrs_canonical s pre rest n (en + 1)]
 
 @[simp] theorem onlySignalBind_renderSigAttrs (s : σ) (pre : String) :
-    ∀ (attrs : List (VAttr σ msg)) (n : Nat),
-      onlySignalBind (renderSigAttrs s pre attrs n).1 =
+    ∀ (attrs : List (VAttr σ msg)) (n en : Nat),
+      onlySignalBind (renderSigAttrs s pre attrs n en).1 =
         onlySignalBind (attrs.map (VAttr.eval s))
-  | [], _ => rfl
-  | [va], _ => by cases va <;> simp [renderSigAttrs, VAttr.eval, onlySignalBind]
-  | va1 :: va2 :: rest, n => by
+  | [], _, _ => rfl
+  | [va], _, _ => by cases va <;> simp [renderSigAttrs, VAttr.eval, onlySignalBind]
+  | va1 :: va2 :: rest, n, en => by
       cases va1 with
       | stat a =>
           simp only [renderSigAttrs, List.map, VAttr.eval]
           cases a with
-          | key _ => exact onlySignalBind_renderSigAttrs s pre (va2 :: rest) n
+          | key _ => exact onlySignalBind_renderSigAttrs s pre (va2 :: rest) n en
           | _ => rfl
       | bind f =>
           simp only [renderSigAttrs, List.map, VAttr.eval]
           generalize f s = a
           cases a with
-          | key _ => exact onlySignalBind_renderSigAttrs s pre (va2 :: rest) n
+          | key _ => exact onlySignalBind_renderSigAttrs s pre (va2 :: rest) n en
           | _ => rfl
       | dynVal _ _ => rfl
+      | dynOn _ _ => rfl
 
 mutual
   @[simp] theorem View.canonical_renderSig :
-      ∀ (v : View σ msg) (s : σ) (pre : String) (n : Nat),
-        Html.canonical (View.renderSig v s pre n).1 = Html.canonical (View.render v s)
-    | .text _, _, _, _ => rfl
-    | .dyn _, _, _, _ => rfl
-    | .element tag attrs kids, s, pre, n => by
+      ∀ (v : View σ msg) (s : σ) (pre : String) (n en : Nat),
+        Html.canonical (View.renderSig v s pre n en).1 = Html.canonical (View.render v s)
+    | .text _, _, _, _, _ => rfl
+    | .dyn _, _, _, _, _ => rfl
+    | .element tag attrs kids, s, pre, n, en => by
         simp only [View.renderSig, View.render, Html.canonical, mkCanonicalElem,
               renderSigAttrs_canonical, onlySignalBind_renderSigAttrs,
               View.canonicalList_renderSigList kids s pre]
-    | .ifElse cond y no, s, pre, n => by
+    | .ifElse cond y no, s, pre, n, en => by
         by_cases h : cond s = true <;>
           simp [View.renderSig, View.render, h, View.canonical_renderSig]
-    | .keyedList .., _, _, _ => rfl
-    | .static _, _, _, _ => rfl
-    | .dynNode _, _, _, _ => rfl
-    | .memo _, _, _, _ => rfl
+    | .keyedList .., _, _, _, _ => rfl
+    | .static _, _, _, _, _ => rfl
+    | .dynNode _, _, _, _, _ => rfl
+    | .memo _, _, _, _, _ => rfl
 
   @[simp] theorem View.canonicalList_renderSigList :
-      ∀ (ks : List (View σ msg)) (s : σ) (pre : String) (n : Nat),
-        Html.canonicalList (View.renderSigList ks s pre n).1 = Html.canonicalList (View.renderEach ks s)
-    | [], _, _, _ => rfl
-    | k :: ks, s, pre, n => by
+      ∀ (ks : List (View σ msg)) (s : σ) (pre : String) (n en : Nat),
+        Html.canonicalList (View.renderSigList ks s pre n en).1 = Html.canonicalList (View.renderEach ks s)
+    | [], _, _, _, _ => rfl
+    | k :: ks, s, pre, n, en => by
         simp [View.renderSigList, View.renderEach,
-              View.canonical_renderSig k s pre n,
+              View.canonical_renderSig k s pre n en,
               View.canonicalList_renderSigList ks s pre]
 end
 
@@ -658,10 +915,11 @@ theorem View.stable_showIf_hidden (cond : σ → Bool) (child : View σ msg) (s 
   simp [View.showIf, View.collectDyn]
 
 @[simp] theorem View.renderSig_showIf (cond : σ → Bool) (child : View σ msg)
-    (s : σ) (pre : String) (n : Nat) :
-    (View.showIf cond child).renderSig s pre n =
-      (if cond s then child.renderSig s pre n else (.text "", n + child.collectDyn.length)) := by
-  simp [View.showIf, View.renderSig, View.collectDyn]
+    (s : σ) (pre : String) (n en : Nat) :
+    (View.showIf cond child).renderSig s pre n en =
+      (if cond s then child.renderSig s pre n en
+       else (.text "", n + child.collectDyn.length, en + child.collectDynOn.length)) := by
+  simp [View.showIf, View.renderSig, View.collectDyn, View.collectDynOn]
 
 def View.isDyn : View σ msg → Bool
   | .dyn _ => true
@@ -678,7 +936,7 @@ def text (s : String) : View σ msg := .text s
 def dyn (get : σ → String) : View σ msg := .dyn get
 def bindAttr (get : σ → Attr msg) : VAttr σ msg := .bind get
 def dynAttr (name : String) (get : σ → String) : VAttr σ msg := .dynVal name get
-def onClick' (get : σ → msg) : VAttr σ msg := .bind (fun s => .on "click" (get s))
+def onClick' (get : σ → msg) : VAttr σ msg := .dynOn "click" get
 def onInput' (get : σ → String → msg) : VAttr σ msg := .bind (fun s => .onValue "input" (get s))
 def onCheck' (get : σ → Bool → msg) : VAttr σ msg :=
   .bind (fun s => .onValue "change" (fun str => get s (str == "true")))
@@ -697,6 +955,159 @@ def memo {α σ msg : Type} [LawfulKey α] (f : α → Html msg) (proj : σ → 
 @[simp] theorem render_memo {α σ msg : Type} [LawfulKey α] (f : α → Html msg) (proj : σ → α) (s : σ) :
     (memo f proj : View σ msg).render s = f (proj s) := rfl
 
+private def vattrDirectKey? : VAttr α msg → Option String
+  | .stat (.cls _)     => some "class"
+  | .stat (.attr k _)  => some k
+  | .stat (.flag k _)  => some k
+  | .dynVal k _        => some k
+  | _                  => none
+
+private def isDirectTmplAttr : VAttr α msg → Bool
+  | .stat a =>
+      match a with
+      | .cls _ | .attr _ _ | .flag _ _ | .key _ => true
+      | _ => false
+  | .dynVal k _ => k != "checked"
+  | .dynOn _ _  => true
+  | .bind _     => false
+
+private def directTmplAttrsOk (attrs : List (VAttr α msg)) : Bool :=
+  attrs.all isDirectTmplAttr &&
+  let dynKeys := attrs.filterMap fun | .dynVal k _ => some k | _ => none
+  let allKeys := attrs.filterMap vattrDirectKey?
+  dynKeys.all (fun k => (allKeys.filter (· == k)).length == 1) &&
+  let evNames := attrs.filterMap fun | .dynOn e _ => some e | _ => none
+  evNames.all (fun e => (evNames.filter (· == e)).length == 1)
+
+mutual
+  private def isDirectTmplStatic : Html msg → Bool
+    | .text s => !s.isEmpty
+    | .element _ attrs kids =>
+        attrs.all (fun
+          | .cls _ | .attr _ _ | .flag _ _ | .key _ => true
+          | _ => false) &&
+        isDirectTmplStaticList kids
+  private def isDirectTmplStaticList : List (Html msg) → Bool
+    | [] => true
+    | k :: ks => isDirectTmplStatic k && isDirectTmplStaticList ks
+end
+
+mutual
+  private def isDirectTmplBody : View α msg → Bool
+    | .text s => !s.isEmpty
+    | .dyn _ => false
+    | .static h => isDirectTmplStatic h
+    | .element _ attrs kids =>
+        directTmplAttrsOk attrs &&
+        match kids with
+        | [.dyn _] => true
+        | _ => isDirectTmplList kids
+    | .ifElse .. | .keyedList .. | .dynNode .. | .memo .. => false
+
+  private def isDirectTmplList : List (View α msg) → Bool
+    | [] => true
+    | k :: ks => isDirectTmplBody k && isDirectTmplList ks
+end
+
+/-- True when a `V.forEach` row body has a static element skeleton with at least one dynamic
+    slot or event handler, suitable for compile-once `cloneNode(true)` templates with direct
+    slot paths and delegated row events. -/
+def isDirectTmpl : View α msg → Bool
+  | v@(.element _ attrs kids) =>
+      (!(View.collectDyn v).isEmpty || !(View.collectDynOn v).isEmpty) &&
+      directTmplAttrsOk attrs &&
+      match kids with
+      | [.dyn _] => true
+      | _ => isDirectTmplList kids
+  | _ => false
+
+private structure CompiledTmpl (α msg : Type) where
+  proto     : Html msg
+  slotPaths : Array (Array UInt32)
+  slotAttrs : Array String
+  slotFns   : Array (α → String)
+  evPaths   : Array (Array UInt32)
+  evNames   : Array String
+  evFns     : Array (α → msg)
+
+private def compileTmplAttrs (path : Array UInt32) :
+    List (VAttr α msg) →
+    Array (Array UInt32) → Array String → Array (α → String) →
+    Array (Array UInt32) → Array String → Array (α → msg) →
+    List (Attr msg) × Array (Array UInt32) × Array String × Array (α → String) ×
+    Array (Array UInt32) × Array String × Array (α → msg)
+  | [], sp, sa, sf, ep, en, ef => ([], sp, sa, sf, ep, en, ef)
+  | va :: rest, sp, sa, sf, ep, en, ef =>
+      match va with
+      | .stat a =>
+          let (as, sp', sa', sf', ep', en', ef') := compileTmplAttrs path rest sp sa sf ep en ef
+          (a :: as, sp', sa', sf', ep', en', ef')
+      | .dynVal k get =>
+          let (as, sp', sa', sf', ep', en', ef') :=
+            compileTmplAttrs path rest (sp.push path) (sa.push k) (sf.push get) ep en ef
+          (.attr k "" :: as, sp', sa', sf', ep', en', ef')
+      | .dynOn ev get =>
+          compileTmplAttrs path rest sp sa sf (ep.push path) (en.push ev) (ef.push get)
+      | .bind _ =>
+          compileTmplAttrs path rest sp sa sf ep en ef
+
+mutual
+  private def compileTmplNode (path : Array UInt32) :
+      View α msg →
+      Array (Array UInt32) → Array String → Array (α → String) →
+      Array (Array UInt32) → Array String → Array (α → msg) →
+      Html msg × Array (Array UInt32) × Array String × Array (α → String) ×
+      Array (Array UInt32) × Array String × Array (α → msg)
+    | .text s, sp, sa, sf, ep, en, ef => (.text s, sp, sa, sf, ep, en, ef)
+    | .dyn get, sp, sa, sf, ep, en, ef => (.text "", sp.push path, sa.push "", sf.push get, ep, en, ef)
+    | .static h, sp, sa, sf, ep, en, ef => (h, sp, sa, sf, ep, en, ef)
+    | .element tag attrs kids, sp, sa, sf, ep, en, ef =>
+        let (pAttrs, sp1, sa1, sf1, ep1, en1, ef1) := compileTmplAttrs path attrs sp sa sf ep en ef
+        let (pKids, sp2, sa2, sf2, ep2, en2, ef2) := compileTmplKids path 0 kids sp1 sa1 sf1 ep1 en1 ef1
+        (.element tag pAttrs pKids, sp2, sa2, sf2, ep2, en2, ef2)
+    | _, sp, sa, sf, ep, en, ef => (.text "", sp, sa, sf, ep, en, ef)
+
+  private def compileTmplKids (parentPath : Array UInt32) (idx : Nat) :
+      List (View α msg) →
+      Array (Array UInt32) → Array String → Array (α → String) →
+      Array (Array UInt32) → Array String → Array (α → msg) →
+      List (Html msg) × Array (Array UInt32) × Array String × Array (α → String) ×
+      Array (Array UInt32) × Array String × Array (α → msg)
+    | [], sp, sa, sf, ep, en, ef => ([], sp, sa, sf, ep, en, ef)
+    | k :: ks, sp, sa, sf, ep, en, ef =>
+        let (ph, sp1, sa1, sf1, ep1, en1, ef1) :=
+          compileTmplNode (parentPath.push (UInt32.ofNat idx)) k sp sa sf ep en ef
+        let (phs, sp2, sa2, sf2, ep2, en2, ef2) :=
+          compileTmplKids parentPath (idx + 1) ks sp1 sa1 sf1 ep1 en1 ef1
+        (ph :: phs, sp2, sa2, sf2, ep2, en2, ef2)
+end
+
+private def compileRowTmpl (child : View α msg) : CompiledTmpl α msg :=
+  let (proto, sp, sa, sf, ep, en, ef) := compileTmplNode #[] child #[] #[] #[] #[] #[] #[]
+  { proto, slotPaths := sp, slotAttrs := sa, slotFns := sf, evPaths := ep, evNames := en, evFns := ef }
+
+private def CompiledTmpl.toRowTmpl {α σ msg : Type} (c : CompiledTmpl α msg)
+    (items : σ → Array α) (key : α → String) : RowTmpl σ msg :=
+  let evalRow : α → Array String :=
+    match c.slotFns.toList with
+    | []                 => fun _ => #[]
+    | [f0]               => fun a => #[f0 a]
+    | [f0, f1]           => fun a => #[f0 a, f1 a]
+    | [f0, f1, f2]       => fun a => #[f0 a, f1 a, f2 a]
+    | [f0, f1, f2, f3]   => fun a => #[f0 a, f1 a, f2 a, f3 a]
+    | _                  => fun a => c.slotFns.map (· a)
+  { proto     := c.proto
+    slotPaths := c.slotPaths
+    slotAttrs := c.slotAttrs
+    evPaths   := c.evPaths
+    evNames   := c.evNames
+    rowKey    := fun s i => match (items s)[i]? with | some a => key a | none => ""
+    rowVals   := fun s i => match (items s)[i]? with | some a => evalRow a | none => #[]
+    rowEvAt   := fun s i j =>
+      match (items s)[i]?, c.evFns[j]? with
+      | some a, some f => some (f a)
+      | _, _ => none }
+
 def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → String)
     (child : View α msg) (attrs : List (VAttr σ msg) := []) (sigPrefix : String := "") : View σ msg :=
   -- `hasOpaque` rows can change props/closures without changing signal leaves, so fall back to `dynNode` diff.
@@ -706,29 +1117,46 @@ def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → S
   if child.hasOpaque || directDynBlocked then
     .dynNode fun s => .element tag (attrs.map (VAttr.eval s))
       (((items s).map fun a => withKey (key a) (child.render a)).toList)
+  else if isDirectTmpl child then
+    let c := compileRowTmpl child
+    let rawKeys : σ → Array String := fun s => (items s).map key
+    .keyedList tag attrs
+      rawKeys
+      (fun s => (items s).map (fun a => Qed.refMark a))
+      (fun _ _ _ => #[])
+      (fun _ _ _ => #[])
+      (fun s => ((items s).map fun a => withKey (key a) (child.render a)).toList)
+      (some (c.toRowTmpl items key))
   else
     let projs := View.collectDyn child
-    let uKeys : σ → Array String := fun s => disambiguateKeys ((items s).map key)
+    let evProjs := View.collectDynOn child
+    let rawKeys : σ → Array String := fun s => (items s).map key
     .keyedList tag attrs
-      uKeys
+      rawKeys
       (fun s => (items s).map (fun a => Qed.refMark a))
-      (fun s i => match (items s)[i]? with
+      (fun s uKeys i => match (items s)[i]? with
         | some a =>
-            let sk := sigPrefix ++ (uKeys s).getD i (key a)
+            let sk := sigPrefix ++ uKeys.getD i (key a)
             (projs.mapIdx fun j p => (s!"{sk}#{j}", p a)).toArray
         | none => #[])
+      (fun s uKeys i => match (items s)[i]? with
+        | some a =>
+            let sk := sigPrefix ++ uKeys.getD i (key a)
+            (evProjs.mapIdx fun j p => (s!"{sk}#e{j}", p a)).toArray
+        | none => #[])
       (fun s =>
-        let ks := uKeys s
+        let ks := disambiguateKeys (rawKeys s)
         (items s).toList.zipIdx.map fun (a, i) =>
           let uk := ks.getD i (key a)
           withKey uk (View.renderSig child a (sigPrefix ++ uk) 0).1)
+      none
 
 @[simp] theorem render_forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → String)
     (child : View α msg) (attrs : List (VAttr σ msg)) (sigPrefix : String) (s : σ) :
     (forEach tag items key child attrs sigPrefix).render s =
       .element tag (attrs.map (VAttr.eval s))
         (if child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
-            (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))
+            (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty)) || isDirectTmpl child
          then ((items s).map fun a => withKey (key a) (child.render a)).toList
          else
            let ks := disambiguateKeys ((items s).map key)
@@ -736,7 +1164,15 @@ def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → S
              let uk := ks.getD i (key a)
              withKey uk (View.renderSig child a (sigPrefix ++ uk) 0).1) := by
   dsimp only [forEach]
-  split <;> rfl
+  by_cases h1 : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
+      (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))) = true
+  · simp [h1, View.render]
+  · have hf1 : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
+        (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))) = false := Bool.eq_false_iff.2 h1
+    by_cases h2 : isDirectTmpl child = true
+    · simp [hf1, h2, View.render]
+    · have hf2 : isDirectTmpl child = false := Bool.eq_false_iff.2 h2
+      simp [hf1, hf2, View.render]
 
 private theorem zipIdx_map_fst {α β : Type _} (g : α → β) :
     ∀ (xs : List α) (k : Nat), (xs.zipIdx k).map (fun p => g p.1) = xs.map g
@@ -751,10 +1187,10 @@ private theorem zipIdx_map_fst {α β : Type _} (g : α → β) :
         ((items s).toList.map fun a => Html.canonical (child.render a)) := by
   rw [render_forEach, Html.canonical_element]
   by_cases h : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
-      (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))) = true
+      (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty)) || isDirectTmpl child) = true
   · simp [h, Array.toList_map]
   · have hf : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
-        (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))) = false := Bool.eq_false_iff.2 h
+        (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty)) || isDirectTmpl child) = false := Bool.eq_false_iff.2 h
     simp [hf]
     rw [zipIdx_map_fst (fun a => (child.render a).canonical) (items s).toList 0]
 
@@ -790,18 +1226,18 @@ private theorem validTextIn_of_mode {ctx : HtmlCtx}
 
 mutual
   theorem View.validIn_renderSig_of_sigSafe {σ msg : Type} (ctx : HtmlCtx) :
-      ∀ (v : View σ msg) (s : σ) (pre : String) (n : Nat),
+      ∀ (v : View σ msg) (s : σ) (pre : String) (n en : Nat),
         View.sigSafeIn ctx v = true →
         Html.validIn ctx (View.render v s) = true →
-        Html.validIn ctx (View.renderSig v s pre n).1 = true
-    | .text _, _, _, _, _, hvalid => hvalid
-    | .dyn _, _, _, _, hsafe, _ => by
+        Html.validIn ctx (View.renderSig v s pre n en).1 = true
+    | .text _, _, _, _, _, _, hvalid => hvalid
+    | .dyn _, _, _, _, _, hsafe, _ => by
         simp only [View.sigSafeIn] at hsafe
         simp only [View.renderSig, Html.validIn, Attr.validList, Attr.valid,
                    Attr.hasLocalCell, Attr.isLocalCell, List.isEmpty, isVoidTag, voidTags]
         rw [stepHtmlCtx_span_of_mode hsafe]
         simp [Html.validListIn, Html.validIn, validTextIn_of_mode hsafe]
-    | .element tag attrs kids, s, pre, n, hsafe, hvalid => by
+    | .element tag attrs kids, s, pre, n, en, hsafe, hvalid => by
         simp only [View.sigSafeIn] at hsafe
         simp only [View.render, Html.validIn, View.renderEach_isEmpty] at hvalid
         simp only [View.renderSig, Html.validIn, Attr.validList_renderSigAttrs,
@@ -814,25 +1250,25 @@ mutual
             rw [hstep] at hsafe hvalid
             simp only [Bool.and_eq_true] at hvalid
             rcases hvalid with ⟨⟨⟨hattrs, hvoid⟩, hcell⟩, hkids⟩
-            simp only [hattrs, hvoid, hcell, Bool.true_and, View.validListIn_renderSigList_of_sigSafe childCtx kids s pre _ hsafe hkids]
-    | .static _, _, _, _, _, hvalid => hvalid
-    | .ifElse .., _, _, _, hsafe, _ => by simp [View.sigSafeIn] at hsafe
-    | .keyedList .., _, _, _, hsafe, _ => by simp [View.sigSafeIn] at hsafe
-    | .dynNode .., _, _, _, hsafe, _ => by simp [View.sigSafeIn] at hsafe
-    | .memo .., _, _, _, hsafe, _ => by simp [View.sigSafeIn] at hsafe
+            simp only [hattrs, hvoid, hcell, Bool.true_and, View.validListIn_renderSigList_of_sigSafe childCtx kids s pre _ _ hsafe hkids]
+    | .static _, _, _, _, _, _, hvalid => hvalid
+    | .ifElse .., _, _, _, _, hsafe, _ => by simp [View.sigSafeIn] at hsafe
+    | .keyedList .., _, _, _, _, hsafe, _ => by simp [View.sigSafeIn] at hsafe
+    | .dynNode .., _, _, _, _, hsafe, _ => by simp [View.sigSafeIn] at hsafe
+    | .memo .., _, _, _, _, hsafe, _ => by simp [View.sigSafeIn] at hsafe
 
   theorem View.validListIn_renderSigList_of_sigSafe {σ msg : Type} (ctx : HtmlCtx) :
-      ∀ (ks : List (View σ msg)) (s : σ) (pre : String) (n : Nat),
+      ∀ (ks : List (View σ msg)) (s : σ) (pre : String) (n en : Nat),
         View.sigSafeListIn ctx ks = true →
         Html.validListIn ctx (View.renderEach ks s) = true →
-        Html.validListIn ctx (View.renderSigList ks s pre n).1 = true
-    | [], _, _, _, _, _ => rfl
-    | k :: ks, s, pre, n, hsafe, hvalid => by
+        Html.validListIn ctx (View.renderSigList ks s pre n en).1 = true
+    | [], _, _, _, _, _, _ => rfl
+    | k :: ks, s, pre, n, en, hsafe, hvalid => by
         simp only [View.sigSafeListIn, Bool.and_eq_true] at hsafe
         simp only [View.renderEach, Html.validListIn, Bool.and_eq_true] at hvalid
         simp only [View.renderSigList, Html.validListIn, Bool.and_eq_true]
-        exact ⟨View.validIn_renderSig_of_sigSafe ctx k s pre n hsafe.1 hvalid.1,
-               View.validListIn_renderSigList_of_sigSafe ctx ks s pre _ hsafe.2 hvalid.2⟩
+        exact ⟨View.validIn_renderSig_of_sigSafe ctx k s pre n en hsafe.1 hvalid.1,
+               View.validListIn_renderSigList_of_sigSafe ctx ks s pre _ _ hsafe.2 hvalid.2⟩
 end
 
 theorem validIn_render_forEach {α σ msg : Type} (ctx childCtx : HtmlCtx) (tag : String)
@@ -851,20 +1287,23 @@ theorem validIn_render_forEach {α σ msg : Type} (ctx childCtx : HtmlCtx) (tag 
   rw [render_forEach]
   simp only [Html.validIn, hstep, hattrs, hvoid, hcell, Bool.not_false, Bool.true_or, Bool.true_and]
   by_cases hc : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
-      (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))) = true
+      (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty)) || isDirectTmpl child) = true
   · simp only [hc, ↓reduceIte, Html.validListIn_toList_map, List.all_eq_true]
     intro a _
     rw [Html.validIn_withKey]
     exact hchild a
   · have hfalse : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
-        (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))) = false := Bool.eq_false_iff.2 hc
+        (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty)) || isDirectTmpl child) = false := Bool.eq_false_iff.2 hc
+    have hfalse0 : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
+        (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))) = false := by
+      simpa [Bool.or_eq_false_iff] using (Bool.or_eq_false_iff.1 hfalse).1
     have hsafe : View.sigSafeIn childCtx child = true := by
-      simpa [hfalse] using hsig
+      simpa [hfalse0] using hsig
     simp only [hfalse, Bool.false_eq_true, ↓reduceIte, Html.validListIn_map, List.all_eq_true]
     rintro ⟨a, i⟩ _
     dsimp only
     rw [Html.validIn_withKey]
-    exact View.validIn_renderSig_of_sigSafe childCtx child a _ 0 hsafe (hchild a)
+    exact View.validIn_renderSig_of_sigSafe childCtx child a _ 0 0 hsafe (hchild a)
 
 end V
 

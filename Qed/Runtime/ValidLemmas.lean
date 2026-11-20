@@ -25,6 +25,9 @@ theorem flag_safe {msg : Type} (k : String) (p : Bool) (h : isSafeAttrName k = t
 theorem on_safe {msg : Type} (e : String) (m : msg) (h : isSafeAttrName e = true) :
     (Attr.on e m).valid = true := h
 
+theorem signalOn_safe {msg : Type} (n e : String) (m : msg) (h : isSafeAttrName e = true) :
+    (Attr.signalOn n e m).valid = true := h
+
 theorem onValue_safe {msg : Type} (e : String) (f : String → msg) (h : isSafeAttrName e = true) :
     (Attr.onValue e f).valid = true := h
 
@@ -511,6 +514,9 @@ def fastAttrValidProof? (msgTy a : Expr) : Option Expr :=
       else if fn == ``Attr.on && args.size == 3 then
         (strLit? args[1]! >>= (safeAttrMap[·]?)).map fun lem =>
           mkApp4 (mkConst ``on_safe) msgTy args[1]! args[2]! (mkConst lem)
+      else if fn == ``Attr.signalOn && args.size == 4 then
+        (strLit? args[2]! >>= (safeAttrMap[·]?)).map fun lem =>
+          mkAppN (mkConst ``signalOn_safe) #[msgTy, args[1]!, args[2]!, args[3]!, mkConst lem]
       else if fn == ``Attr.onValue && args.size == 3 then
         (strLit? args[1]! >>= (safeAttrMap[·]?)).map fun lem =>
           mkApp4 (mkConst ``onValue_safe) msgTy args[1]! args[2]! (mkConst lem)

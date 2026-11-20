@@ -23,6 +23,75 @@ def escapeHtml (s : String) : String :=
   if !cs.any isHtmlSpecial then s
   else cs.foldl escapeHtmlStep ""
 
+@[inline] private def isHtmlSpecialByte (b : UInt8) : Bool :=
+  b <= 62 && (b == 38 || b == 60 || b == 62 || b == 34 || b == 39)
+
+def escapeHtmlAcc (acc s : String) : String :=
+  if !hasAsciiByte s isHtmlSpecialByte then acc ++ s
+  else s.foldl escapeHtmlStep acc
+
+def escapeHtmlFast (s : String) : String := escapeHtmlAcc "" s
+
+private theorem isHtmlSpecialByte_eq (c : Char) (hc : c.toNat ≤ 127) :
+    isHtmlSpecialByte (UInt8.ofNat c.toNat) = isHtmlSpecial c := by
+  unfold isHtmlSpecialByte isHtmlSpecial isMarkupOrQuote
+  have hlt : (UInt8.ofNat c.toNat).toNat = c.toNat := by change c.toNat % 256 = c.toNat; omega
+  change (decide (UInt8.ofNat c.toNat ≤ 62) &&
+    ((UInt8.ofNat c.toNat == UInt8.ofNat '&'.toNat) ||
+     (UInt8.ofNat c.toNat == UInt8.ofNat '<'.toNat) ||
+     (UInt8.ofNat c.toNat == UInt8.ofNat '>'.toNat) ||
+     (UInt8.ofNat c.toNat == UInt8.ofNat '"'.toNat) ||
+     (UInt8.ofNat c.toNat == UInt8.ofNat '\''.toNat))) = _
+  rw [asciiByte_beq_char c hc '&' (by decide), asciiByte_beq_char c hc '<' (by decide),
+      asciiByte_beq_char c hc '>' (by decide), asciiByte_beq_char c hc '"' (by decide),
+      asciiByte_beq_char c hc '\'' (by decide)]
+  by_cases hle : c.toNat ≤ 62
+  · have hle' : decide (UInt8.ofNat c.toNat ≤ 62) = true := by
+      rw [decide_eq_true_iff]; change (UInt8.ofNat c.toNat).toNat ≤ 62; omega
+    simp [hle', Bool.or_assoc]
+  · have hle' : decide (UInt8.ofNat c.toNat ≤ 62) = false := by
+      rw [decide_eq_false_iff_not]; change ¬((UInt8.ofNat c.toNat).toNat ≤ 62); omega
+    have hne : ∀ t : Char, t.toNat ≤ 62 → (c == t) = false := by
+      intro t ht; rw [beq_eq_false_iff_ne]; intro heq; subst heq; omega
+    simp [hle', hne '&' (by decide), hne '<' (by decide), hne '>' (by decide),
+      hne '"' (by decide), hne '\'' (by decide)]
+
+private theorem foldl_escapeHtmlStep_append (cs : List Char) (acc : String) :
+    cs.foldl escapeHtmlStep acc = acc ++ cs.foldl escapeHtmlStep "" := by
+  have hstep : ∀ (a b : String) (c : Char), escapeHtmlStep (a ++ b) c = a ++ escapeHtmlStep b c := by
+    intro a b c; unfold escapeHtmlStep
+    repeat' split
+    all_goals (ext; simp [String.append_assoc])
+  have hgen : ∀ (cs : List Char) (a b : String), cs.foldl escapeHtmlStep (a ++ b) = a ++ cs.foldl escapeHtmlStep b := by
+    intro cs; induction cs with
+    | nil => intro _ _; rfl
+    | cons c cs ih => intro a b; simp only [List.foldl_cons, hstep, ih]
+  simpa using hgen cs acc ""
+
+private theorem escapeHtmlAcc_eq (acc s : String) : escapeHtmlAcc acc s = acc ++ escapeHtml s := by
+  unfold escapeHtmlAcc escapeHtml; dsimp only
+  have h1 : hasAsciiByte s isHtmlSpecialByte = s.toList.any isHtmlSpecial := by
+    apply hasAsciiByte_eq_any
+    · intro b hb
+      unfold isHtmlSpecialByte
+      have : decide (b ≤ 62) = false := by rw [decide_eq_false_iff_not]; change ¬(b.toNat ≤ 62); omega
+      simp [this]
+    · exact isHtmlSpecialByte_eq
+    · intro c hgt
+      unfold isHtmlSpecial isMarkupOrQuote
+      have hne : ∀ t : Char, t.toNat ≤ 127 → (c == t) = false := by
+        intro t ht; rw [beq_eq_false_iff_ne]; intro heq; subst heq; omega
+      simp [hne '&' (by decide), hne '<' (by decide), hne '>' (by decide),
+        hne '"' (by decide), hne '\'' (by decide)]
+  have h2 : s.foldl escapeHtmlStep acc = s.toList.foldl escapeHtmlStep acc := by simp
+  rw [h1, h2]
+  cases ha : s.toList.any isHtmlSpecial with
+  | false => simp
+  | true => simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]; exact foldl_escapeHtmlStep_append s.toList acc
+
+@[csimp] theorem escapeHtml_eq_escapeHtmlFast : @escapeHtml = @escapeHtmlFast := by
+  funext s; simpa [escapeHtmlFast] using (escapeHtmlAcc_eq "" s).symm
+
 private theorem isMarkupOrQuote_false_of_not_special {c : Char} (h : isHtmlSpecial c = false) :
     isMarkupOrQuote c = false :=
   (Bool.or_eq_false_iff.1 h).2
@@ -99,6 +168,42 @@ def sanitizeKey (k : String) : String :=
   if cs.all isKeyChar then k
   else String.ofList (cs.filter isKeyChar)
 
+def sanitizeKeyFast (k : String) : String :=
+  if k.foldl (fun b c => b && isKeyChar c) true then k
+  else k.foldl (fun acc c => if isKeyChar c then acc.push c else acc) ""
+
+private theorem foldl_and_eq_all_r (p : Char → Bool) (cs : List Char) (init : Bool) :
+    cs.foldl (fun b c => b && p c) init = (init && cs.all p) := by
+  induction cs generalizing init with
+  | nil => simp
+  | cons c cs ih => simp [ih, Bool.and_assoc]
+
+private theorem foldl_filterPush_eq (p : Char → Bool) (cs : List Char) (acc : String) :
+    cs.foldl (fun a c => if p c then a.push c else a) acc = acc ++ String.ofList (cs.filter p) := by
+  induction cs generalizing acc with
+  | nil => simp
+  | cons c cs ih =>
+      simp only [List.foldl_cons, List.filter_cons]
+      cases hp : p c with
+      | false => simpa using ih acc
+      | true =>
+          simp only [↓reduceIte, ih]
+          ext; simp
+
+@[csimp] theorem sanitizeKey_eq_sanitizeKeyFast : @sanitizeKey = @sanitizeKeyFast := by
+  funext k
+  unfold sanitizeKey sanitizeKeyFast
+  have h1 : k.foldl (fun b c => b && isKeyChar c) true = k.toList.all isKeyChar := by
+    have hf : k.foldl (fun b c => b && isKeyChar c) true =
+        k.toList.foldl (fun b c => b && isKeyChar c) true := by simp
+    rw [hf, foldl_and_eq_all_r, Bool.true_and]
+  have h2 : k.foldl (fun acc c => if isKeyChar c then acc.push c else acc) "" =
+      String.ofList (k.toList.filter isKeyChar) := by
+    have hf : k.foldl (fun acc c => if isKeyChar c then acc.push c else acc) "" =
+        k.toList.foldl (fun acc c => if isKeyChar c then acc.push c else acc) "" := by simp
+    rw [hf, foldl_filterPush_eq]; simp
+  rw [h1, h2]
+
 /-- Every character in `sanitizeKey k` is strictly alphanumeric or in `{- _ : .}`,
     preventing whitespace, `=`, quotes, `<`, `>`, or `/` from ever appearing in an attribute name. -/
 theorem sanitizeKey_safe (k : String) :
@@ -124,7 +229,7 @@ def renderAttr (hs : Array msg) : Attr msg → String × Array msg
       if !present || !isSafeRenderedKey sk then ("", hs)
       else (s!" {sk}=\"{sk}\"", hs)
   | .key _     => ("", hs)
-  | .on event m  =>
+  | .on event m | .signalOn _ event m =>
       let ev := sanitizeKey event
       if ev.isEmpty then ("", hs)
       else (s!" data-qed-on-{ev}=\"{hs.size}\"", hs.push m)
@@ -175,7 +280,7 @@ def renderElement (renderKids : Array msg → String × Array msg) (hs : Array m
     (s!"<{tag}{attrStr}>", hs1)
   else
     let (childStr, hs2) := renderKids hs1
-    let body := if tag == "textarea" && childStr.toList.head? == some '\n' then "\n" ++ childStr else childStr
+    let body := if tag == "textarea" && childStr.front? == some '\n' then "\n" ++ childStr else childStr
     (s!"<{tag}{attrStr}>{body}</{tag}>", hs2)
 
 mutual
@@ -190,48 +295,138 @@ mutual
         (s1 ++ s2, hs2)
 end
 
+private def renderSafeAttrAcc (acc k v : String) : String :=
+  let sk := sanitizeKey k
+  if !isSafeRenderedKey sk || (isUrlAttrName sk && !isSafeUrl v) then acc
+  else (escapeHtmlAcc (((acc.push ' ') ++ sk) ++ "=\"") v).push '"'
+
+def renderAttrAcc (hs : Array msg) (acc : String) : Attr msg → String × Array msg
+  | .cls c => ((escapeHtmlAcc (acc ++ " class=\"") c).push '"', hs)
+  | .attr k v | .signalAttr _ k v => (renderSafeAttrAcc acc k v, hs)
+  | .flag k present =>
+      let sk := sanitizeKey k
+      if !present || !isSafeRenderedKey sk then (acc, hs)
+      else (((((acc.push ' ') ++ sk) ++ "=\"") ++ sk).push '"', hs)
+  | .key _ | .onValue _ _ => (acc, hs)
+  | .on event m | .signalOn _ event m =>
+      let ev := sanitizeKey event
+      if ev.isEmpty then (acc, hs)
+      else (((((acc ++ " data-qed-on-") ++ ev) ++ "=\"") ++ toString hs.size).push '"', hs.push m)
+  | .localCell key comp _ _ _ => ((escapeHtmlAcc (acc ++ " data-qed-local=\"") (localKey comp key)).push '"', hs)
+  | .signalBind name => ((escapeHtmlAcc (acc ++ " data-qed-signal=\"") name).push '"', hs)
+
+private theorem push_eq_append_r (a : String) (c : Char) : a.push c = a ++ String.singleton c := by
+  ext; simp
+
+private theorem renderAttrAcc_eq (hs : Array msg) (acc : String) (a : Attr msg) :
+    renderAttrAcc hs acc a = (acc ++ (renderAttr hs a).1, (renderAttr hs a).2) := by
+  cases a <;> unfold renderAttrAcc renderAttr <;> dsimp only [renderSafeAttrAcc]
+  all_goals first
+    | (simp; done)
+    | (simp only [escapeHtmlAcc_eq, push_eq_append_r, String.append_assoc]; rfl)
+    | (split <;> first | (simp; done) | (simp only [escapeHtmlAcc_eq, push_eq_append_r, String.append_assoc]; rfl))
+
+def renderAttrsAcc (hs : Array msg) (acc : String) : List (Attr msg) → String × Array msg
+  | []      => (acc, hs)
+  | a :: as =>
+      let (acc1, hs1) := renderAttrAcc hs acc a
+      renderAttrsAcc hs1 acc1 as
+
+private theorem renderAttrsAcc_eq (hs : Array msg) (acc : String) (as : List (Attr msg)) :
+    renderAttrsAcc hs acc as = (acc ++ (renderAttrs hs as).1, (renderAttrs hs as).2) := by
+  induction as generalizing hs acc with
+  | nil => simp [renderAttrsAcc, renderAttrs]
+  | cons a as ih =>
+      simp only [renderAttrsAcc, renderAttrAcc_eq, renderAttrs]
+      rw [ih, String.append_assoc]
+
+@[inline] private def renderElemAttrsAcc (hs : Array msg) (acc : String) : List (Attr msg) → String × Array msg
+  | []        => (acc, hs)
+  | [.key _]  => (acc, hs)
+  | attrs     => renderAttrsAcc hs acc (normalizeAttrs attrs)
+
+private theorem renderElemAttrsAcc_eq (hs : Array msg) (acc : String) (attrs : List (Attr msg)) :
+    renderElemAttrsAcc hs acc attrs =
+      (acc ++ (renderAttrs hs (normalizeAttrs attrs)).1, (renderAttrs hs (normalizeAttrs attrs)).2) := by
+  cases attrs with
+  | nil => simp [renderElemAttrsAcc, normalizeAttrs, dedupAttrs, renderAttrs]
+  | cons a rest =>
+      cases a with
+      | key k =>
+          cases rest with
+          | nil => simp [renderElemAttrsAcc, normalizeAttrs, dedupAttrs, Attr.key?, renderAttrs, renderAttr]
+          | cons b rest' => exact renderAttrsAcc_eq hs acc (normalizeAttrs (.key k :: b :: rest'))
+      | _ => exact renderAttrsAcc_eq hs acc (normalizeAttrs (_ :: rest))
+
 mutual
-  def renderNodeTR (hs : Array msg) : Html msg → String × Array msg
-    | .text s => (escapeHtml s, hs)
+  def renderNodeAcc (hs : Array msg) (acc : String) : Html msg → String × Array msg
+    | .text s => (escapeHtmlAcc acc s, hs)
     | .element tag attrs children =>
-        renderElement (fun hs => renderChildrenTR hs "" children) hs tag attrs children
-  def renderChildrenTR (hs : Array msg) (acc : String) : List (Html msg) → String × Array msg
+        let (acc1, hs1) := renderElemAttrsAcc hs ((acc.push '<') ++ tag) attrs
+        if tag == "style" || tag == "script" then
+          let raw := escapeRawText (String.join (children.map fun | .text s => s | _ => ""))
+          (((((acc1.push '>') ++ raw) ++ "</") ++ tag).push '>', hs1)
+        else if isVoidTag tag then
+          (acc1.push '>', hs1)
+        else if tag == "textarea" then
+          let (childStr, hs2) := renderChildrenAcc hs1 "" children
+          let acc2 := if childStr.front? == some '\n' then (acc1.push '>').push '\n' else acc1.push '>'
+          ((((acc2 ++ childStr) ++ "</") ++ tag).push '>', hs2)
+        else
+          let (acc2, hs2) := renderChildrenAcc hs1 (acc1.push '>') children
+          (((acc2 ++ "</") ++ tag).push '>', hs2)
+  def renderChildrenAcc (hs : Array msg) (acc : String) : List (Html msg) → String × Array msg
     | [] => (acc, hs)
     | c :: cs =>
-        let (str, hs') := renderNodeTR hs c
-        renderChildrenTR hs' (acc ++ str) cs
+        let (acc', hs') := renderNodeAcc hs acc c
+        renderChildrenAcc hs' acc' cs
 end
 
 mutual
-  theorem renderNodeTR_eq (hs : Array msg) (h : Html msg) : renderNodeTR hs h = renderNode hs h := by
+  theorem renderNodeAcc_eq (hs : Array msg) (acc : String) (h : Html msg) :
+      renderNodeAcc hs acc h = (acc ++ (renderNode hs h).1, (renderNode hs h).2) := by
     cases h with
-    | text s => rfl
+    | text s => simp [renderNodeAcc, renderNode, escapeHtmlAcc_eq]
     | element tag attrs children =>
-        unfold renderNodeTR renderNode
-        congr 1
-        funext table
-        simpa using renderChildrenTR_eq table "" children
-  theorem renderChildrenTR_eq (hs : Array msg) (acc : String) (cs : List (Html msg)) :
-      renderChildrenTR hs acc cs =
+        unfold renderNodeAcc renderNode renderElement
+        rw [renderElemAttrsAcc_eq]
+        by_cases hraw : (tag == "style" || tag == "script") = true
+        · simp only [hraw, ↓reduceIte, push_eq_append_r, String.append_assoc]; rfl
+        · have hrawF : (tag == "style" || tag == "script") = false := Bool.eq_false_iff.2 hraw
+          simp only [hrawF, Bool.false_eq_true, ↓reduceIte]
+          by_cases hvoid : isVoidTag tag = true
+          · simp only [hvoid, ↓reduceIte, push_eq_append_r, String.append_assoc]; rfl
+          · have hvoidF : isVoidTag tag = false := Bool.eq_false_iff.2 hvoid
+            simp only [hvoidF, Bool.false_eq_true, ↓reduceIte]
+            by_cases hta : (tag == "textarea") = true
+            · simp only [hta, ↓reduceIte, renderChildrenAcc_eq, String.empty_append, Bool.true_and]
+              split <;> (simp only [push_eq_append_r, String.append_assoc]; rfl)
+            · have htaF : (tag == "textarea") = false := Bool.eq_false_iff.2 hta
+              simp only [htaF, Bool.false_eq_true, ↓reduceIte, Bool.false_and,
+                renderChildrenAcc_eq, push_eq_append_r, String.append_assoc]; rfl
+  theorem renderChildrenAcc_eq (hs : Array msg) (acc : String) (cs : List (Html msg)) :
+      renderChildrenAcc hs acc cs =
         (acc ++ (renderChildren hs cs).1, (renderChildren hs cs).2) := by
     cases cs with
-    | nil => simp [renderChildrenTR, renderChildren]
+    | nil => simp [renderChildrenAcc, renderChildren]
     | cons c cs =>
-        simp only [renderChildrenTR, renderNodeTR_eq, renderChildren]
-        rw [renderChildrenTR_eq]
-        simp [String.append_assoc]
+        simp only [renderChildrenAcc, renderNodeAcc_eq, renderChildren]
+        rw [renderChildrenAcc_eq, String.append_assoc]
 end
 
-@[csimp] theorem renderNode_eq_renderNodeTR : @renderNode = @renderNodeTR := by
+def renderNodeFast (hs : Array msg) (h : Html msg) : String × Array msg :=
+  renderNodeAcc hs "" h
+
+@[csimp] theorem renderNode_eq_renderNodeFast : @renderNode = @renderNodeFast := by
   funext msg hs h
-  exact (renderNodeTR_eq hs h).symm
+  simpa [renderNodeFast] using (renderNodeAcc_eq hs "" h).symm
 
 def renderChildrenFast (hs : Array msg) (cs : List (Html msg)) : String × Array msg :=
-  renderChildrenTR hs "" cs
+  renderChildrenAcc hs "" cs
 
 @[csimp] theorem renderChildren_eq_renderChildrenFast : @renderChildren = @renderChildrenFast := by
   funext msg hs cs
-  simpa [renderChildrenFast] using (renderChildrenTR_eq hs "" cs).symm
+  simpa [renderChildrenFast] using (renderChildrenAcc_eq hs "" cs).symm
 
 def Html.render (h : Html msg) : String := (renderNode #[] h).1
 
@@ -453,7 +648,7 @@ theorem renderAttr_no_angle_brackets (hs : Array msg) (a : Attr msg) :
         · exact fun c hc => isKeyChar_no_angle (sanitizeKey_safe k c hc)
         · exact lit_no_angle "\"" rfl
   | key _ => exact lit_no_angle "" rfl
-  | on event m =>
+  | on event m | signalOn _ event m =>
       simp only [renderAttr]
       split
       · exact lit_no_angle "" rfl

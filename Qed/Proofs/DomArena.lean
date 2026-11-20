@@ -20,8 +20,9 @@ structure SpecElemState (msg : Type) where
   checked : Bool := false
   clicks  : List (String × msg) := []
   inputs  : List (String × (String → msg)) := []
-  sigBind : Option String := none
-  sigAttr : List (String × String) := []
+  sigBind   : Option String := none
+  sigAttr   : List (String × String) := []
+  sigClicks : List (String × String) := []
 
 def setAssoc {α : Type} (k : String) (v : α) : List (String × α) → List (String × α)
   | [] => [(k, v)]
@@ -127,6 +128,7 @@ def stepSpecAttr (st : SpecElemState msg) : Attr msg → SpecElemState msg
   | .localCell key comp _ _ _ => { st with attrs := setAssoc "data-qed-local" (localKey comp key) st.attrs }
   | .signalBind name          => { st with sigBind := some name }
   | .signalAttr name attr _   => { st with sigAttr := setAssoc attr name st.sigAttr }
+  | .signalOn name event _    => { st with sigClicks := setAssoc event name st.sigClicks }
 
 def evalSpecAttrs (attrs : List (Attr msg)) : SpecElemState msg :=
   (normalizeAttrs attrs).foldl stepSpecAttr {}
@@ -171,6 +173,11 @@ def w3cInsertBefore (children : List Dom.Node) (idx : Nat) (child : Dom.Node) : 
   | []       => (children.erase child) ++ [child]
   | ref :: _ => if ref == child then children else insertBeforeRef child ref (children.erase child)
 
+def w3cInsertBeforeRef (children : List Dom.Node) (ref? : Option Dom.Node) (child : Dom.Node) : List Dom.Node :=
+  match ref? with
+  | none     => (children.erase child) ++ [child]
+  | some ref => if ref == child then children else insertBeforeRef child ref (children.erase child)
+
 def listRemoveAt {α : Type} : List α → Nat → List α
   | [], _          => []
   | _ :: xs, 0     => xs
@@ -181,11 +188,22 @@ def listReplaceAt {α : Type} : List α → Nat → α → List α
   | _ :: xs, 0, v     => v :: xs
   | x :: xs, i + 1, v => x :: listReplaceAt xs i v
 
+structure ArenaTmpl (msg : Type) where
+  ns        : String
+  proto     : Html msg
+  slotPaths : Array (Array UInt32)
+  slotAttrs : Array String
+  evPaths   : Array (Array UInt32)
+  evNames   : Array String
+
 @[ext]
 structure DomArena (msg : Type) where
-  nextId  : Nat := 1
-  store   : Dom.Node → ArenaEntry msg := fun _ => .null
-  signals : List (String × String) := []
+  nextId    : Nat := 1
+  store     : Dom.Node → ArenaEntry msg := fun _ => .null
+  signals   : List (String × String) := []
+  sigEvents : List (String × msg) := []
+  tmpls     : Array (ArenaTmpl msg) := #[]
+  rowEvs    : Array (Nat → Nat → Option msg) := #[]
 
 namespace DomArena
 
@@ -199,7 +217,7 @@ def modify (a : DomArena msg) (n : Dom.Node) (f : ArenaEntry msg → ArenaEntry 
 
 def alloc (a : DomArena msg) (e : ArenaEntry msg) : Dom.Node × DomArena msg :=
   let h := UInt32.ofNat a.nextId
-  (h, { nextId := a.nextId + 1, store := fun m => if m == h then e else a.store m, signals := a.signals })
+  (h, { a with nextId := a.nextId + 1, store := fun m => if m == h then e else a.store m })
 
 @[simp] theorem get_set_self (a : DomArena msg) (n : Dom.Node) (e : ArenaEntry msg) :
     (a.set n e).get n = e := by simp [get, set]
@@ -234,6 +252,55 @@ theorem SameDom.get_eq {a₁ a₂ : DomArena msg} (h : a₁.SameDom a₂) (m : D
   congrFun h.2 m
 
 end DomArena
+
+mutual
+  def arenaBuildHtml (ns : String) : Html msg → DomArena msg → Dom.Node × DomArena msg
+    | .text s, a => a.alloc (.text s)
+    | .element tag attrs children, a =>
+        let realNs := if ns == "" && tag == "svg" then Dom.svgNs else ns
+        let st := evalSpecAttrs attrs
+        let mg := (normalizeAttrs attrs).filterMap managedAttrName
+        let (node, a1) := a.alloc (.element realNs tag st mg [])
+        if ownsChildren attrs then
+          (node, a1)
+        else
+          let (cs, a2) := arenaBuildHtmlList (Dom.childNsOf ns tag) children a1
+          (node, a2.set node (.element realNs tag st mg cs))
+
+  def arenaBuildHtmlList (ns : String) : List (Html msg) → DomArena msg → List Dom.Node × DomArena msg
+    | [], a => ([], a)
+    | c :: cs, a =>
+        let (cn, a1) := arenaBuildHtml ns c a
+        let (cns, a2) := arenaBuildHtmlList ns cs a1
+        (cn :: cns, a2)
+end
+
+def patchNodeSlotAt (a : DomArena msg) (n : Dom.Node) (path : List Nat) (attrName val : String) : DomArena msg :=
+  match path with
+  | [] =>
+      if attrName == "" then
+        a.modify n fun | .text _ => .text val | other => other
+      else if attrName == "value" then
+        a.modifyElemState n fun st => { st with value := val }
+      else
+        a.modifyElemState n fun st => { st with attrs := setAssoc attrName val st.attrs }
+  | idx :: rest =>
+      match a.get n with
+      | .element _ _ _ _ cs =>
+          match cs[idx]? with
+          | some child => patchNodeSlotAt a child rest attrName val
+          | none => a
+      | _ => a
+
+def patchNodeSlotsLoop (slotPaths : Array (Array UInt32)) (slotAttrs newVals : Array String)
+    (n : Dom.Node) (i : Nat) (a : DomArena msg) : DomArena msg :=
+  if hi : i < slotPaths.size then
+    let p := (slotPaths[i].toList).map UInt32.toNat
+    let attr := slotAttrs.getD i ""
+    let v := newVals.getD i ""
+    patchNodeSlotsLoop slotPaths slotAttrs newVals n (i + 1) (patchNodeSlotAt a n p attr v)
+  else a
+termination_by slotPaths.size - i
 
 instance : MonadDom msg (StateM (DomArena msg)) where
   createElement ns tag := fun a =>
@@ -276,13 +343,39 @@ instance : MonadDom msg (StateM (DomArena msg)) where
   removeChild p i          := fun a => ((), a.modifyChildren p fun cs => listRemoveAt cs i.toNat)
   replaceChild p i newChild := fun a => ((), a.modifyChildren p fun cs => listReplaceAt cs i.toNat newChild)
   insertBeforeNode p i ch  := fun a => ((), a.modifyChildren p fun cs => w3cInsertBefore cs i.toNat ch)
+  insertBeforeRef p r ch   := fun a => ((), a.modifyChildren p fun cs => w3cInsertBeforeRef cs r ch)
+  removeNode p ch          := fun a => ((), a.modifyChildren p fun cs => cs.erase ch)
+  clearChildren p          := fun a => ((), a.modifyChildren p fun _ => [])
   bindSignal n name        := fun a => ((), a.modifyElemState n fun st => { st with sigBind := some name })
   bindSignalAttr n nm attr := fun a => ((), a.modifyElemState n fun st => { st with sigAttr := setAssoc attr nm st.sigAttr })
   setSignal name val       := fun a => ((), { a with signals := setAssoc name val a.signals })
+  bindSignalOn n nm ev _   := fun a => ((), a.modifyElemState n fun st => { st with sigClicks := setAssoc ev nm st.sigClicks })
+  setSignalOn name evMsg   := fun a => ((), { a with sigEvents := setAssoc name evMsg a.sigEvents })
   onEvent n event evMsg    := fun a => ((), a.modifyElemState n fun st => { st with clicks := setAssoc event evMsg st.clicks })
   onValueEvent n event f   := fun a => ((), a.modifyElemState n fun st => { st with inputs := setAssoc event f st.inputs })
   mountLocalCell n key comp _ _ _ := fun a =>
     ((), a.modifyElemState n fun st => { st with attrs := setAssoc "data-qed-local" (localKey comp key) st.attrs })
+  compileRowTmpl ns proto slotPaths slotAttrs evPaths evNames := fun a =>
+    (UInt32.ofNat a.tmpls.size, { a with tmpls := a.tmpls.push ⟨ns, proto, slotPaths, slotAttrs, evPaths, evNames⟩ })
+  allocRowEvSlot _ fn := fun a =>
+    (UInt32.ofNat a.rowEvs.size, { a with rowEvs := a.rowEvs.push fn })
+  setRowEvSlot slot fn := fun a =>
+    ((), if h : slot.toNat < a.rowEvs.size then { a with rowEvs := a.rowEvs.set slot.toNat fn h } else a)
+  mountTmplRow tmplId vals := fun a =>
+    match a.tmpls[tmplId.toNat]? with
+    | some t => arenaBuildHtml t.ns (applyRowSlots t.proto t.slotPaths t.slotAttrs vals) a
+    | none => (0, a)
+  mountTmplRows parent tmplId valsPerRow := fun a =>
+    match a.tmpls[tmplId.toNat]? with
+    | some t =>
+        let (cs, a1) := arenaBuildHtmlList t.ns (valsPerRow.toList.map (applyRowSlots t.proto t.slotPaths t.slotAttrs)) a
+        (cs.toArray, a1.modifyChildren parent (· ++ cs))
+    | none => (#[], a)
+  patchTmplRow node tmplId newVals _ := fun a =>
+    match a.tmpls[tmplId.toNat]? with
+    | some t => ((), patchNodeSlotsLoop t.slotPaths t.slotAttrs newVals node 0 a)
+    | none => ((), a)
+  hydrateTmplRow _ _ := fun a => ((), a)
 
 def readDomTree : Nat → DomArena msg → Dom.Node → DomTree msg
   | 0, _, _ => .text ""
@@ -307,11 +400,16 @@ def applySignalAttr (st : SpecElemState msg) : String → String → SpecElemSta
   | "checked", v => { st with checked := v != "" && v != "false" }
   | k, v         => { st with attrs := setAssoc k v st.attrs }
 
-def resolveElemSignals (signals : List (String × String)) (st : SpecElemState msg) : SpecElemState msg :=
-  st.sigAttr.foldl (fun cur (k, sig) =>
+def resolveElemSignals (signals : List (String × String)) (sigEvents : List (String × msg))
+    (st : SpecElemState msg) : SpecElemState msg :=
+  let st1 := st.sigAttr.foldl (fun cur (k, sig) =>
     match lookupAssoc sig signals with
     | some v => applySignalAttr cur k v
     | none   => cur) st
+  st1.sigClicks.foldl (fun cur (ev, sig) =>
+    match lookupAssoc sig sigEvents with
+    | some m => { cur with clicks := setAssoc ev m cur.clicks }
+    | none   => cur) st1
 
 def readResolvedDomTree : Nat → DomArena msg → Dom.Node → DomTree msg
   | 0, _, _ => .text ""
@@ -321,7 +419,7 @@ def readResolvedDomTree : Nat → DomArena msg → Dom.Node → DomTree msg
       | .element ns tag st _ cs =>
           match st.sigBind with
           | some sig => .text ((lookupAssoc sig a.signals).getD "")
-          | none     => .element ns tag (resolveElemSignals a.signals st) (cs.map (readResolvedDomTree fuel a))
+          | none     => .element ns tag (resolveElemSignals a.signals a.sigEvents st) (cs.map (readResolvedDomTree fuel a))
       | _ => .text ""
 
 theorem emitSignalsM_spec (pairs : List (String × String)) (a : DomArena msg) :
@@ -332,6 +430,15 @@ theorem emitSignalsM_spec (pairs : List (String × String)) (a : DomArena msg) :
   | cons p rest ih =>
       dsimp only [emitSignalsM, StateT.run, bind, StateT.bind, MonadDom.setSignal]
       simpa [List.foldl_cons] using ih { a with signals := setAssoc p.1 p.2 a.signals }
+
+theorem emitSignalOnsM_spec (pairs : List (String × msg)) (a : DomArena msg) :
+    (emitSignalOnsM (m := StateM (DomArena msg)) pairs).run a =
+      ((), { a with sigEvents := pairs.foldl (fun acc (nm, m) => setAssoc nm m acc) a.sigEvents }) := by
+  induction pairs generalizing a with
+  | nil => rfl
+  | cons p rest ih =>
+      dsimp only [emitSignalOnsM, StateT.run, bind, StateT.bind, MonadDom.setSignalOn]
+      simpa [List.foldl_cons] using ih { a with sigEvents := setAssoc p.1 p.2 a.sigEvents }
 
 /-! ## Attribute Retention, Equivalence & Clean-DOM Invariant -/
 
@@ -355,6 +462,7 @@ theorem applyAttrM_element (a : DomArena msg) (node : Dom.Node)
   | localCell _ _ _ _ _ => simp [applyAttrM, MonadDom.mountLocalCell, DomArena.modify, stepSpecAttr]
   | signalBind _ => simp [applyAttrM, MonadDom.bindSignal, DomArena.modify, stepSpecAttr]
   | signalAttr _ _ _ => simp [applyAttrM, MonadDom.bindSignalAttr, DomArena.modify, stepSpecAttr]
+  | signalOn _ _ _ => simp [applyAttrM, MonadDom.bindSignalOn, DomArena.modify, stepSpecAttr]
 
 theorem applyAttrListM_element :
     ∀ (attrs : List (Attr msg)) (a : DomArena msg) (node : Dom.Node) (ns tag : String)
@@ -390,11 +498,11 @@ private theorem applyAttrM_preserves (x : Attr msg) (node : Dom.Node) (s : DomAr
       · cases p <;> exact ⟨by simp [applyAttrM, StateT.run, MonadDom.setAttribute, MonadDom.removeAttribute, DomArena.modify],
                            fun m hne => by simp [applyAttrM, StateT.run, MonadDom.setAttribute, MonadDom.removeAttribute, DomArena.modify, DomArena.get_set_ne _ _ hne]⟩
   | key _ => exact ⟨rfl, fun _ _ => rfl⟩
-  | cls _ | on _ _ | onValue _ _ | localCell _ _ _ _ _ | signalBind _ | signalAttr _ _ _ =>
+  | cls _ | on _ _ | onValue _ _ | localCell _ _ _ _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ =>
       exact ⟨by simp [applyAttrM, StateT.run, MonadDom.setAttribute, MonadDom.onEvent, MonadDom.onValueEvent,
-                      MonadDom.mountLocalCell, MonadDom.bindSignal, MonadDom.bindSignalAttr, DomArena.modify],
+                      MonadDom.mountLocalCell, MonadDom.bindSignal, MonadDom.bindSignalAttr, MonadDom.bindSignalOn, DomArena.modify],
              fun m hne => by simp [applyAttrM, StateT.run, MonadDom.setAttribute, MonadDom.onEvent, MonadDom.onValueEvent,
-                                   MonadDom.mountLocalCell, MonadDom.bindSignal, MonadDom.bindSignalAttr, DomArena.modify, DomArena.get_set_ne _ _ hne]⟩
+                                   MonadDom.mountLocalCell, MonadDom.bindSignal, MonadDom.bindSignalAttr, MonadDom.bindSignalOn, DomArena.modify, DomArena.get_set_ne _ _ hne]⟩
 
 private theorem applyAttrListM_preserves (l : List (Attr msg)) (node : Dom.Node) (s : DomArena msg) :
     let s' := (applyAttrListM (m := StateM (DomArena msg)) node l).run s |>.2
@@ -530,7 +638,7 @@ theorem stepSpecAttr_retains_managed (st : SpecElemState msg) (a : Attr msg) (na
   | on _ _ => exact ⟨ha, hv, hc, setAssoc_prop (p := fun q => names.contains s!"data-qed-on-{q}") hkeep hcl, hin⟩
   | onValue _ _ => exact ⟨ha, hv, hc, hcl, setAssoc_prop (p := fun q => names.contains s!"data-qed-onv-{q}") hkeep hin⟩
   | localCell _ _ _ _ _ => exact ⟨setAssoc_prop hkeep ha, hv, hc, hcl, hin⟩
-  | key _ | signalBind _ | signalAttr _ _ _ => exact ⟨ha, hv, hc, hcl, hin⟩
+  | key _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ => exact ⟨ha, hv, hc, hcl, hin⟩
 
 private theorem foldl_stepSpecAttr_eqv {msg : Type} {β : Type} (proj : SpecElemState msg → β)
     (writes : Attr msg → Bool)
@@ -571,13 +679,13 @@ theorem foldl_stepSpecAttr_attrs (k : String) :
           · subst hc; exact hcur
           · have hne : (k' == k) = false := by simp [attrWritesKey, hc] at hw; exact beq_eq_false_iff_ne.2 (fun h => hw h)
             cases p <;> simp [stepSpecAttr, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, hne, hcur]
-      | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ => exact hcur)
+      | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ => exact hcur)
     (fun _ _ x hxw => by
       cases x with
       | cls _ | localCell _ _ _ _ _ => simp [attrWritesKey] at hxw; subst hxw; simp [stepSpecAttr, lookupAssoc_setAssoc]
       | attr k' _ => simp only [attrWritesKey, Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hxw; rcases hxw with ⟨_, rfl⟩; simp [stepSpecAttr, lookupAssoc_setAssoc]
       | flag k' p => simp only [attrWritesKey, Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hxw; rcases hxw with ⟨_, rfl⟩; cases p <;> simp [stepSpecAttr, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc]
-      | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ => simp [attrWritesKey] at hxw)
+      | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ => simp [attrWritesKey] at hxw)
     xs s₁ s₂ h
 
 theorem foldl_stepSpecAttr_val :
@@ -766,6 +874,7 @@ def Attr.DomClean : Attr msg → Bool
   | .attr k _         => !isSpecialManagedKey k
   | .flag k _         => !isSpecialManagedKey k
   | .signalAttr ..    => false
+  | .signalOn ..      => false
   | _                 => true
 
 mutual
@@ -838,7 +947,7 @@ theorem AttrsNoShadow_of_clean {newAttrs : List (Attr msg)} {st : SpecElemState 
         · exact .inl ⟨.flag k' p, hxMem, by simp [attrWritesKey, hc']⟩
     | localCell _ _ _ _ _ => simp [managedAttrName] at hxName; rcases hxName with rfl; exact .inl ⟨_, hxMem, rfl⟩
     | key _ => simp [managedAttrName] at hxName
-    | signalAttr _ _ _ => simp [Attr.DomClean] at hxc
+    | signalAttr _ _ _ | signalOn _ _ _ => simp [Attr.DomClean] at hxc
     | on _ _ =>
         simp only [managedAttrName, Option.some.injEq] at hxName; rcases hxName with rfl
         exact .inr (hst.2 _ (by simp [isSpecialManagedKey, String.startsWith]))
@@ -855,7 +964,7 @@ theorem AttrsNoShadow_of_clean {newAttrs : List (Attr msg)} {st : SpecElemState 
     | attr _ v => simp only [managedAttrName, Option.some.injEq] at hxName; subst hxName; exact .inl ⟨v, hxMem⟩
     | flag _ _ => simp only [managedAttrName, Option.some.injEq] at hxName; subst hxName; simp [Attr.DomClean, isSpecialManagedKey] at hxc
     | cls _ | key _ | localCell _ _ _ _ _ | signalBind _ => simp [managedAttrName] at hxName
-    | signalAttr _ _ _ => simp [Attr.DomClean] at hxc
+    | signalAttr _ _ _ | signalOn _ _ _ => simp [Attr.DomClean] at hxc
     | on _ _ | onValue _ _ =>
         simp only [managedAttrName, Option.some.injEq] at hxName
         have hd := congrArg (·.toList.head?) hxName; simp [String.toList_append] at hd
@@ -866,7 +975,7 @@ theorem AttrsNoShadow_of_clean {newAttrs : List (Attr msg)} {st : SpecElemState 
     | flag _ p => simp only [managedAttrName, Option.some.injEq] at hxName; subst hxName; exact .inl ⟨p, hxMem⟩
     | attr _ _ => simp only [managedAttrName, Option.some.injEq] at hxName; subst hxName; simp [Attr.DomClean, isSpecialManagedKey] at hxc
     | cls _ | key _ | localCell _ _ _ _ _ | signalBind _ => simp [managedAttrName] at hxName
-    | signalAttr _ _ _ => simp [Attr.DomClean] at hxc
+    | signalAttr _ _ _ | signalOn _ _ _ => simp [Attr.DomClean] at hxc
     | on _ _ | onValue _ _ =>
         simp only [managedAttrName, Option.some.injEq] at hxName
         have hd := congrArg (·.toList.head?) hxName; simp [String.toList_append] at hd
@@ -881,7 +990,7 @@ theorem AttrsNoShadow_of_clean {newAttrs : List (Attr msg)} {st : SpecElemState 
         simp only [managedAttrName, Option.some.injEq] at hxName
         have hd := congrArg (fun s => s.toList.drop 11 |>.head?) hxName; simp [String.toList_append] at hd
     | key _ => simp [managedAttrName] at hxName
-    | signalAttr _ _ _ => simp [Attr.DomClean] at hxc
+    | signalAttr _ _ _ | signalOn _ _ _ => simp [Attr.DomClean] at hxc
     | attr k' _ =>
         simp only [managedAttrName, Option.some.injEq] at hxName; subst hxName
         have hv : ("data-qed-on-" ++ e) ≠ "value" :=
@@ -903,7 +1012,7 @@ theorem AttrsNoShadow_of_clean {newAttrs : List (Attr msg)} {st : SpecElemState 
         simp only [managedAttrName, Option.some.injEq] at hxName
         have hd := congrArg (fun s => s.toList.drop 11 |>.head?) hxName; simp [String.toList_append] at hd
     | key _ => simp [managedAttrName] at hxName
-    | signalAttr _ _ _ => simp [Attr.DomClean] at hxc
+    | signalAttr _ _ _ | signalOn _ _ _ => simp [Attr.DomClean] at hxc
     | attr k' _ =>
         simp only [managedAttrName, Option.some.injEq] at hxName; subst hxName
         have hv : ("data-qed-onv-" ++ e) ≠ "value" :=
@@ -938,7 +1047,7 @@ theorem stepSpecAttr_preserves_clean (s : SpecElemState msg) (a : Attr msg)
         subst h; simp [isSpecialManagedKey, String.startsWith] at hk
       simp [stepSpecAttr, lookupAssoc_setAssoc, hne, hcs k hk]
   | key _ | on _ _ | onValue _ _ | signalBind _ => exact hcs k hk
-  | signalAttr _ _ _ => simp [Attr.DomClean] at hca
+  | signalAttr _ _ _ | signalOn _ _ _ => simp [Attr.DomClean] at hca
 
 theorem ElemClean_foldl {xs : List (Attr msg)} {st : SpecElemState msg}
     (hcxs : ∀ x ∈ xs, x.DomClean = true)
@@ -1178,7 +1287,7 @@ mutual
             let realNs := if ns == "" && tag == "svg" then Dom.svgNs else ns
             let st := evalSpecAttrs attrs
             let mg := (normalizeAttrs attrs).filterMap managedAttrName
-            let a1 : DomArena msg := { nextId := a.nextId + 1, store := a.store, signals := a.signals }
+            let a1 : DomArena msg := { a with nextId := a.nextId + 1 }
             let aElem := a1.set node (.element realNs tag st mg [])
             have ha1Next : a1.nextId = a.nextId + 1 := rfl
             have haElemNext : aElem.nextId = a.nextId + 1 := rfl
@@ -1341,133 +1450,138 @@ theorem buildDomM_not_fragment {msg : Type} (ns : String) (h : Html msg) (a : Do
       | zero => simp [htmlDepth] at hdep
       | succ _ => intro hf; dsimp only [readDomTree] at hread; rw [hf] at hread; cases hread
 
-theorem applyAttrsM_withSignals {msg : Type} (sigs : List (String × String))
+theorem applyAttrsM_withSignals {msg : Type} (sigs : List (String × String)) (evs : List (String × msg))
+    (tmpls : Array (ArenaTmpl msg)) (rowEvs : Array (Nat → Nat → Option msg))
     (node : Dom.Node) (attrs : List (Attr msg)) (a : DomArena msg) :
-    (applyAttrsM (m := StateM (DomArena msg)) node attrs { a with signals := sigs }).2 =
-      { ((applyAttrsM (m := StateM (DomArena msg)) node attrs).run a).2 with signals := sigs } := by
+    (applyAttrsM (m := StateM (DomArena msg)) node attrs { a with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
+      { ((applyAttrsM (m := StateM (DomArena msg)) node attrs).run a).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs } := by
   have h1 : ∀ (xs : List (Attr msg)) (s : DomArena msg),
-      (applyAttrListM (m := StateM (DomArena msg)) node xs { s with signals := sigs }).2 =
-        { (applyAttrListM (m := StateM (DomArena msg)) node xs s).2 with signals := sigs } := by
+      (applyAttrListM (m := StateM (DomArena msg)) node xs { s with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
+        { (applyAttrListM (m := StateM (DomArena msg)) node xs s).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs } := by
     intro xs; induction xs with
     | nil => intro _; rfl
     | cons x rest ih =>
         intro s
         dsimp only [applyAttrListM, bind, StateT.bind]
-        have hx : (applyAttrM (m := StateM (DomArena msg)) node x { s with signals := sigs }) =
-            ((), { (applyAttrM (m := StateM (DomArena msg)) node x s).2 with signals := sigs }) := by
+        have hx : (applyAttrM (m := StateM (DomArena msg)) node x { s with signals := sigs, sigEvents := evs, tmpls, rowEvs }) =
+            ((), { (applyAttrM (m := StateM (DomArena msg)) node x s).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs }) := by
           cases x with
           | attr k _ => by_cases hk : k = "value" <;> simp [applyAttrM, hk, MonadDom.setValue, MonadDom.setAttribute, DomArena.modify, DomArena.set, DomArena.get]
           | flag k p => by_cases hk : k = "checked" <;> cases p <;> simp [applyAttrM, hk, MonadDom.setChecked, MonadDom.setAttribute, MonadDom.removeAttribute, DomArena.modify, DomArena.set, DomArena.get]
           | key _ => rfl
-          | _ => simp [applyAttrM, MonadDom.setAttribute, MonadDom.onEvent, MonadDom.onValueEvent, MonadDom.mountLocalCell, MonadDom.bindSignal, MonadDom.bindSignalAttr, DomArena.modify, DomArena.set, DomArena.get]
-        have hx1 : (applyAttrM (m := StateM (DomArena msg)) node x { s with signals := sigs }).1 = () := congrArg Prod.fst hx
-        have hx2 : (applyAttrM (m := StateM (DomArena msg)) node x { s with signals := sigs }).2 =
-            { (applyAttrM (m := StateM (DomArena msg)) node x s).2 with signals := sigs } := congrArg Prod.snd hx
-        cases hr1 : applyAttrM (m := StateM (DomArena msg)) node x { s with signals := sigs } with
+          | _ => simp [applyAttrM, MonadDom.setAttribute, MonadDom.onEvent, MonadDom.onValueEvent, MonadDom.mountLocalCell, MonadDom.bindSignal, MonadDom.bindSignalAttr, MonadDom.bindSignalOn, DomArena.modify, DomArena.set, DomArena.get]
+        have hx2 : (applyAttrM (m := StateM (DomArena msg)) node x { s with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
+            { (applyAttrM (m := StateM (DomArena msg)) node x s).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs } := congrArg Prod.snd hx
+        cases hr1 : applyAttrM (m := StateM (DomArena msg)) node x { s with signals := sigs, sigEvents := evs, tmpls, rowEvs } with
         | mk _ s1 =>
             cases hr2 : applyAttrM (m := StateM (DomArena msg)) node x s with
             | mk _ s2 =>
                 rw [hr1] at hx2; rw [hr2] at hx2; dsimp only at hx2; rw [hx2]; exact ih s2
   dsimp only [applyAttrsM, StateT.run, bind, StateT.bind]
   let a1 := (MonadDom.retainAttributes (m := StateM (DomArena msg)) node ((normalizeAttrs attrs).filterMap managedAttrName) a).2
-  change (applyAttrListM (m := StateM (DomArena msg)) node (normalizeAttrs attrs) { a1 with signals := sigs }).2 =
-    { (applyAttrListM (m := StateM (DomArena msg)) node (normalizeAttrs attrs) a1).2 with signals := sigs }
+  change (applyAttrListM (m := StateM (DomArena msg)) node (normalizeAttrs attrs) { a1 with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
+    { (applyAttrListM (m := StateM (DomArena msg)) node (normalizeAttrs attrs) a1).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs }
   exact h1 (normalizeAttrs attrs) a1
 
 mutual
-  theorem buildDomM_withSignals {msg : Type} (sigs : List (String × String)) (ns : String) :
+  theorem buildDomM_withSignals {msg : Type} (sigs : List (String × String)) (evs : List (String × msg))
+      (tmpls : Array (ArenaTmpl msg)) (rowEvs : Array (Nat → Nat → Option msg)) (ns : String) :
       ∀ (h : Html msg) (a : DomArena msg),
-        (buildDomM (m := StateM (DomArena msg)) ns h { a with signals := sigs }).1 =
+        (buildDomM (m := StateM (DomArena msg)) ns h { a with signals := sigs, sigEvents := evs, tmpls, rowEvs }).1 =
           (buildDomM (m := StateM (DomArena msg)) ns h a).1 ∧
-        (buildDomM (m := StateM (DomArena msg)) ns h { a with signals := sigs }).2 =
-          { (buildDomM (m := StateM (DomArena msg)) ns h a).2 with signals := sigs }
+        (buildDomM (m := StateM (DomArena msg)) ns h { a with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
+          { (buildDomM (m := StateM (DomArena msg)) ns h a).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs }
     | .text _, _ => ⟨rfl, rfl⟩
     | .element tag attrs children, a => by
         dsimp only [buildDomM, MonadDom.createElement, DomArena.alloc, bind, StateT.bind, pure, StateT.pure]
-        let a0 : DomArena msg := {
+        let a0 : DomArena msg := { a with
           nextId := a.nextId + 1
           store := fun m =>
             if m == UInt32.ofNat a.nextId then
               .element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag {} [] []
-            else a.store m
-          signals := a.signals }
-        have ha := applyAttrsM_withSignals sigs (UInt32.ofNat a.nextId) attrs a0
+            else a.store m }
+        have ha := applyAttrsM_withSignals sigs evs tmpls rowEvs (UInt32.ofNat a.nextId) attrs a0
         dsimp only [StateT.run] at ha
-        cases hr1 : applyAttrsM (m := StateM (DomArena msg)) (UInt32.ofNat a.nextId) attrs { a0 with signals := sigs } with
+        cases hr1 : applyAttrsM (m := StateM (DomArena msg)) (UInt32.ofNat a.nextId) attrs { a0 with signals := sigs, sigEvents := evs, tmpls, rowEvs } with
         | mk _ s1 =>
             cases hr2 : applyAttrsM (m := StateM (DomArena msg)) (UInt32.ofNat a.nextId) attrs a0 with
             | mk _ s2 =>
-                have hsEq : s1 = { s2 with signals := sigs } := by
+                have hsEq : s1 = { s2 with signals := sigs, sigEvents := evs, tmpls, rowEvs } := by
                   rw [hr1, hr2] at ha; exact ha
                 rw [hsEq]
                 cases ownsChildren attrs with
                 | true => exact ⟨rfl, rfl⟩
                 | false =>
                     simp only [Bool.not_false, ↓reduceIte, bind, StateT.bind, pure, StateT.pure]
-                    have hk := buildDomListM_withSignals sigs (Dom.childNsOf ns tag) (UInt32.ofNat a.nextId) children s2
-                    cases hb1 : buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) (UInt32.ofNat a.nextId) children { s2 with signals := sigs } with
+                    have hk := buildDomListM_withSignals sigs evs tmpls rowEvs (Dom.childNsOf ns tag) (UInt32.ofNat a.nextId) children s2
+                    cases hb1 : buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) (UInt32.ofNat a.nextId) children { s2 with signals := sigs, sigEvents := evs, tmpls, rowEvs } with
                     | mk _ b1 =>
                         cases hb2 : buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) (UInt32.ofNat a.nextId) children s2 with
                         | mk _ b2 =>
                             dsimp only; rw [hb1, hb2] at hk; exact ⟨rfl, hk⟩
 
-  theorem buildDomListM_withSignals {msg : Type} (sigs : List (String × String)) (ns : String) (parent : Dom.Node) :
+  theorem buildDomListM_withSignals {msg : Type} (sigs : List (String × String)) (evs : List (String × msg))
+      (tmpls : Array (ArenaTmpl msg)) (rowEvs : Array (Nat → Nat → Option msg)) (ns : String) (parent : Dom.Node) :
       ∀ (cs : List (Html msg)) (a : DomArena msg),
-        (buildDomListM (m := StateM (DomArena msg)) ns parent cs { a with signals := sigs }).2 =
-          { (buildDomListM (m := StateM (DomArena msg)) ns parent cs a).2 with signals := sigs }
+        (buildDomListM (m := StateM (DomArena msg)) ns parent cs { a with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
+          { (buildDomListM (m := StateM (DomArena msg)) ns parent cs a).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs }
     | [], _ => rfl
     | c :: rest, a => by
-        have hc := buildDomM_withSignals sigs ns c a
+        have hc := buildDomM_withSignals sigs evs tmpls rowEvs ns c a
         dsimp only [buildDomListM, bind, StateT.bind, pure, StateT.pure]
-        cases hb1 : buildDomM (m := StateM (DomArena msg)) ns c { a with signals := sigs } with
+        cases hb1 : buildDomM (m := StateM (DomArena msg)) ns c { a with signals := sigs, sigEvents := evs, tmpls, rowEvs } with
         | mk cn1 a1 =>
             cases hb2 : buildDomM (m := StateM (DomArena msg)) ns c a with
             | mk cn2 a2 =>
                 rw [hb1, hb2] at hc; dsimp only at hc
                 rcases hc with ⟨rfl, rfl⟩
                 dsimp only
-                have happ : (MonadDom.appendChild (m := StateM (DomArena msg)) parent cn1 { a2 with signals := sigs }).2 =
-                    { (MonadDom.appendChild (m := StateM (DomArena msg)) parent cn1 a2).2 with signals := sigs } := by
+                have happ : (MonadDom.appendChild (m := StateM (DomArena msg)) parent cn1 { a2 with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
+                    { (MonadDom.appendChild (m := StateM (DomArena msg)) parent cn1 a2).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs } := by
                   simp only [MonadDom.appendChild, DomArena.get, DomArena.set, DomArena.modifyChildren, DomArena.modify]
                   cases a2.store cn1 <;> rfl
-                cases ha1 : MonadDom.appendChild (m := StateM (DomArena msg)) parent cn1 { a2 with signals := sigs } with
+                cases ha1 : MonadDom.appendChild (m := StateM (DomArena msg)) parent cn1 { a2 with signals := sigs, sigEvents := evs, tmpls, rowEvs } with
                 | mk _ s1 =>
                     cases ha2 : MonadDom.appendChild (m := StateM (DomArena msg)) parent cn1 a2 with
                     | mk _ s2 =>
                         dsimp only
                         rw [ha1, ha2] at happ; dsimp only at happ; rw [happ]
-                        exact buildDomListM_withSignals sigs ns parent rest s2
+                        exact buildDomListM_withSignals sigs evs tmpls rowEvs ns parent rest s2
 end
 
 theorem seedRowsM_sameDom {msg : Type} (inst : String) (rowSig : Nat → Array (String × String))
+    (rowEv : Nat → Array (String × msg))
     (newMarks oldMarks : Array USize) (oldSigs : Array (Array (String × String))) (a : DomArena msg) :
-    ((seedRowsM (m := StateM (DomArena msg)) inst rowSig newMarks oldMarks oldSigs).run a).2.SameDom a := by
+    ((seedRowsM (m := StateM (DomArena msg)) inst rowSig rowEv newMarks oldMarks oldSigs).run a).2.SameDom a := by
   dsimp only [seedRowsM, StateT.run, bind, StateT.bind, pure, StateT.pure]
-  cases hd : diffRowSigs rowSig inst newMarks oldMarks oldSigs 0 #[] #[] with
-  | mk _ toEmit =>
+  cases hd : diffRowSigs rowSig rowEv inst newMarks oldMarks oldSigs 0 #[] #[] #[] with
+  | mk _ rest =>
+      rcases rest with ⟨toEmit, toEv⟩
+      dsimp only
       have he := emitSignalsM_spec toEmit.toList a
       dsimp only [StateT.run] at he
-      cases hem : emitSignalsM (m := StateM (DomArena msg)) toEmit.toList a with
-      | mk _ a' =>
-          rw [hem] at he
-          rcases Prod.mk.inj he with ⟨_, rfl⟩
-          exact ⟨rfl, rfl⟩
+      rw [he]; dsimp only
+      have hev := emitSignalOnsM_spec toEv.toList { a with signals := toEmit.toList.foldl (fun acc (nm, v) => setAssoc nm v acc) a.signals }
+      dsimp only [StateT.run] at hev
+      rw [hev]; exact ⟨rfl, rfl⟩
 
 theorem buildDomM_sameDom {msg : Type} (ns : String) (h : Html msg) {a₁ a₂ : DomArena msg}
     (hs : a₁.SameDom a₂) :
     (buildDomM (m := StateM (DomArena msg)) ns h a₁).1 = (buildDomM (m := StateM (DomArena msg)) ns h a₂).1 ∧
     (buildDomM (m := StateM (DomArena msg)) ns h a₁).2.SameDom (buildDomM (m := StateM (DomArena msg)) ns h a₂).2 := by
-  have heq : a₁ = { a₂ with signals := a₁.signals } := DomArena.ext hs.1 hs.2 rfl
+  have heq : a₁ = { a₂ with signals := a₁.signals, sigEvents := a₁.sigEvents, tmpls := a₁.tmpls, rowEvs := a₁.rowEvs } :=
+    DomArena.ext hs.1 hs.2 rfl rfl rfl rfl
   rw [heq]
-  have hw := buildDomM_withSignals a₁.signals ns h a₂
+  have hw := buildDomM_withSignals a₁.signals a₁.sigEvents a₁.tmpls a₁.rowEvs ns h a₂
   exact ⟨hw.1, by rw [hw.2]; exact ⟨rfl, rfl⟩⟩
 
 theorem buildDomListM_sameDom {msg : Type} (ns : String) (parent : Dom.Node) (cs : List (Html msg))
     {a₁ a₂ : DomArena msg} (hs : a₁.SameDom a₂) :
     (buildDomListM (m := StateM (DomArena msg)) ns parent cs a₁).2.SameDom
       (buildDomListM (m := StateM (DomArena msg)) ns parent cs a₂).2 := by
-  have heq : a₁ = { a₂ with signals := a₁.signals } := DomArena.ext hs.1 hs.2 rfl
-  rw [heq, buildDomListM_withSignals a₁.signals ns parent cs a₂]
+  have heq : a₁ = { a₂ with signals := a₁.signals, sigEvents := a₁.sigEvents, tmpls := a₁.tmpls, rowEvs := a₁.rowEvs } :=
+    DomArena.ext hs.1 hs.2 rfl rfl rfl rfl
+  rw [heq, buildDomListM_withSignals a₁.signals a₁.sigEvents a₁.tmpls a₁.rowEvs ns parent cs a₂]
   exact ⟨rfl, rfl⟩
 
 end Qed

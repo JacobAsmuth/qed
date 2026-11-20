@@ -87,6 +87,15 @@ opaque replaceChild (parent : Node) (index : UInt32) (newChild : Node) : IO Unit
 @[extern "qed_dom_insert_before"]
 opaque insertBefore (parent : Node) (index : UInt32) (child : Node) : IO Unit
 
+@[extern "qed_dom_insert_before_ref"]
+opaque insertBeforeRef (parent ref child : Node) : IO Unit
+
+@[extern "qed_dom_remove_node"]
+opaque removeNode (parent child : Node) : IO Unit
+
+@[extern "qed_dom_clear_children"]
+opaque clearChildren (parent : Node) : IO Unit
+
 @[extern "qed_dom_mount_root"]
 opaque mountRoot (node : Node) : IO Unit
 
@@ -107,6 +116,28 @@ opaque bindSignal (node : Node) (name : String) : IO Unit
 
 @[extern "qed_dom_bind_signal_attr"]
 opaque bindSignalAttr (node : Node) (name attr : String) : IO Unit
+
+@[extern "qed_dom_get_sig_slot"]
+opaque getSigSlot (name : String) : IO UInt32
+
+@[extern "qed_dom_set_sig_slot"]
+opaque setSigSlot (name : String) (slot : UInt32) : IO Unit
+
+@[extern "qed_dom_compile_row_tmpl"]
+opaque compileRowTmpl (proto : Node) (slotPaths : Array (Array UInt32)) (slotAttrs : Array String)
+    (evPaths : Array (Array UInt32)) (evNames : Array String) : IO UInt32
+
+@[extern "qed_dom_mount_tmpl_row"]
+opaque mountTmplRow (tmplId : UInt32) (vals : Array String) : IO Node
+
+@[extern "qed_dom_mount_tmpl_rows"]
+opaque mountTmplRows (parent : Node) (tmplId : UInt32) (valsPerRow : Array (Array String)) : IO (Array Node)
+
+@[extern "qed_dom_patch_tmpl_row"]
+opaque patchTmplRow (node : Node) (tmplId : UInt32) (newVals oldVals : Array String) : IO Unit
+
+@[extern "qed_dom_hydrate_tmpl_row"]
+opaque hydrateTmplRow (node : Node) (tmplId : UInt32) : IO Unit
 
 @[extern "qed_dom_ws_open"]
 opaque wsOpen (connId : UInt32) (url : String) (isBinary : Bool) : IO Unit

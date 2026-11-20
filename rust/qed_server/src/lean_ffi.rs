@@ -42,8 +42,8 @@ extern "C" {
     pub fn qed_lean_dec(o: *mut LeanObj);
     pub fn qed_lean_dec_ref(o: *mut LeanObj);
     pub fn qed_lean_mark_mt(o: *mut LeanObj);
+    pub fn qed_lean_mark_persistent(o: *mut LeanObj);
     pub fn qed_lean_apply_1(f: *mut LeanObj, a: *mut LeanObj) -> *mut LeanObj;
-    pub fn qed_lean_apply_3(f: *mut LeanObj, a: *mut LeanObj, b: *mut LeanObj, c: *mut LeanObj) -> *mut LeanObj;
     pub fn qed_lean_apply_4(f: *mut LeanObj, a: *mut LeanObj, b: *mut LeanObj, c: *mut LeanObj, d: *mut LeanObj) -> *mut LeanObj;
     pub fn qed_lean_apply_5(f: *mut LeanObj, a: *mut LeanObj, b: *mut LeanObj, c: *mut LeanObj, d: *mut LeanObj, e: *mut LeanObj) -> *mut LeanObj;
     pub fn qed_lean_register_ext(fin: FinalizeProc, fe: ForeachProc) -> *mut LeanExtClass;
@@ -88,9 +88,26 @@ unsafe impl Sync for LeanRef {}
 
 impl LeanRef {
     #[inline]
-    pub unsafe fn new_mt(ptr: *mut LeanObj) -> Self { qed_lean_mark_mt(ptr); Self(ptr) }
+    pub unsafe fn new_persistent(ptr: *mut LeanObj) -> Self { qed_lean_mark_persistent(ptr); Self(ptr) }
     #[inline]
     pub unsafe fn clone_ptr(&self) -> *mut LeanObj { qed_lean_inc(self.0); self.0 }
+}
+
+/// Zero-copy owned view of a Lean `ByteArray` passed between handler threads and I/O workers.
+pub struct WireBytes(pub LeanRef);
+
+impl WireBytes {
+    #[inline]
+    pub unsafe fn from_borrowed(ba: *mut LeanObj) -> Self {
+        qed_lean_inc(ba);
+        qed_lean_mark_mt(ba);
+        Self(LeanRef(ba))
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { ba_slice(self.0 .0) }
+    }
 }
 
 impl Clone for LeanRef {

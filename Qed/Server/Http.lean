@@ -14,26 +14,113 @@ def maxWsMsgBytes   : Nat := 4 * 1024 * 1024
 /-! ## Inbound HTTP/1.1 Request Head Parser -/
 
 structure ParsedReqHead where
-  method     : String
-  target     : String
-  isHttp11   : Bool
-  keepAlive  : Bool
-  contentLen : Nat
-  headers    : Array (String × String)
-  upgrade?   : Option String
-  conn?      : Option String
-  wsKey?     : Option String
-  wsVer?     : Option String
+  method         : String
+  target         : String
+  isHttp11       : Bool
+  keepAlive      : Bool
+  contentLen     : Nat
+  headers        : Array (String × String)
+  upgrade?       : Option String
+  conn?          : Option String
+  wsKey?         : Option String
+  wsVer?         : Option String
+  host?          : Option String := none
+  origin?        : Option String := none
+  dupOrigin      : Bool := false
+  secFetchSite?  : Option String := none
+  dupSfs         : Bool := false
+  contentType?   : Option String := none
+  dupCt          : Bool := false
+  hasCookie      : Bool := false
+  auth?          : Option String := none
+  hasIfNoneMatch : Bool := false
 
 private structure HdrFoldState where
-  keepAlive   : Bool
-  contentLen? : Option Nat
-  hostCount   : Nat
-  headers     : Array (String × String)
-  upgrade?    : Option String
-  conn?       : Option String
-  wsKey?      : Option String
-  wsVer?      : Option String
+  keepAlive      : Bool
+  contentLen?    : Option Nat
+  hostCount      : Nat
+  headers        : Array (String × String)
+  upgrade?       : Option String
+  conn?          : Option String
+  wsKey?         : Option String
+  wsVer?         : Option String
+  host?          : Option String := none
+  origin?        : Option String := none
+  dupOrigin      : Bool := false
+  secFetchSite?  : Option String := none
+  dupSfs         : Bool := false
+  contentType?   : Option String := none
+  dupCt          : Bool := false
+  hasCookie      : Bool := false
+  auth?          : Option String := none
+  hasIfNoneMatch : Bool := false
+
+@[inline] private def isHostHeader (k : String) : Bool :=
+  k.utf8ByteSize == 4 && (k == "Host" || k == "host" || k.toLower == "host")
+
+private theorem isHostHeader_imp_toLower (k : String) (h : isHostHeader k = true) :
+    (k.toLower == "host") = true := by
+  unfold isHostHeader at h
+  simp only [Bool.and_eq_true, Bool.or_eq_true] at h
+  rcases h.2 with (h1 | h2) | h3
+  · rw [beq_iff_eq.1 h1]
+    have : "Host".toLower = "host" := by
+      unfold String.toLower; apply String.ext; simp [Char.toLower]; decide
+    simp [this]
+  · rw [beq_iff_eq.1 h2]
+    have : "host".toLower = "host" := by
+      unfold String.toLower; apply String.ext; simp [Char.toLower]
+    simp [this]
+  · exact h3
+
+private def parseOtherHeader (k v : String) (st : HdrFoldState) : HdrFoldState :=
+  let headers := st.headers.push (k, v)
+  match k.utf8ByteSize with
+  | 6 =>
+      if eqCI k "origin" then
+        if st.origin?.isSome then { st with headers, dupOrigin := true }
+        else { st with headers, origin? := some v }
+      else if eqCI k "cookie" then { st with headers, hasCookie := true }
+      else { st with headers }
+  | 7 =>
+      if eqCI k "upgrade" then { st with headers, upgrade? := some v } else { st with headers }
+  | 10 =>
+      if eqCI k "connection" then
+        let keepAlive :=
+          if containsCI v "close" then false
+          else if containsCI v "keep-alive" then true
+          else st.keepAlive
+        { st with headers, keepAlive, conn? := some v }
+      else { st with headers }
+  | 12 =>
+      if eqCI k "content-type" then
+        if st.contentType?.isSome then { st with headers, dupCt := true }
+        else { st with headers, contentType? := some v }
+      else { st with headers }
+  | 13 =>
+      if eqCI k "authorization" then
+        if st.auth?.isNone then { st with headers, auth? := some v } else { st with headers }
+      else if eqCI k "if-none-match" then { st with headers, hasIfNoneMatch := true }
+      else { st with headers }
+  | 14 =>
+      if eqCI k "sec-fetch-site" then
+        if st.secFetchSite?.isSome then { st with headers, dupSfs := true }
+        else { st with headers, secFetchSite? := some v }
+      else { st with headers }
+  | 17 =>
+      if eqCI k "sec-websocket-key" then { st with headers, wsKey? := some v } else { st with headers }
+  | 21 =>
+      if eqCI k "sec-websocket-version" then { st with headers, wsVer? := some v } else { st with headers }
+  | _ => { st with headers }
+
+private theorem parseOtherHeader_invariants (k v : String) (st : HdrFoldState) :
+    (parseOtherHeader k v st).contentLen? = st.contentLen? ∧
+    (parseOtherHeader k v st).hostCount = st.hostCount ∧
+    (parseOtherHeader k v st).headers = st.headers.push (k, v) := by
+  unfold parseOtherHeader
+  dsimp only
+  split <;> repeat' split
+  all_goals exact ⟨rfl, rfl, rfl⟩
 
 def parseOneHeaderLine (line : String) (st : HdrFoldState) :
     Except (Nat × String) HdrFoldState :=
@@ -42,46 +129,31 @@ def parseOneHeaderLine (line : String) (st : HdrFoldState) :
   | some (k, v) =>
       if !isValidHttpToken k then
         .error (400, "invalid header name")
-      else
-        let kl := k.toLower
-        if kl == "transfer-encoding" then
-          .error (501, "Transfer-Encoding not supported")
-        else if st.headers.size >= maxReqHeaders then
-          .error (431, "too many headers")
-        else if kl == "host" then
-          if v.isEmpty || hasCtlOrCrlf v false then
-            .error (400, "invalid Host header")
-          else if st.hostCount >= 1 then
-            .error (400, "duplicate Host header")
-          else
-            .ok { st with hostCount := st.hostCount + 1, headers := st.headers.push (k, v) }
-        else if kl == "content-length" then
-          match parseStrictU64 v 18446744073709551615 with
-          | none => .error (400, "invalid Content-Length")
-          | some cl =>
-              match st.contentLen? with
-              | some prev =>
-                  if prev ≠ cl then .error (400, "conflicting Content-Length headers")
-                  else if cl > maxReqBodyBytes then .error (413, "payload too large")
-                  else .ok { st with headers := st.headers.push (k, v) }
-              | none =>
-                  if cl > maxReqBodyBytes then .error (413, "payload too large")
-                  else .ok { st with contentLen? := some cl, headers := st.headers.push (k, v) }
+      else if eqCI k "transfer-encoding" then
+        .error (501, "Transfer-Encoding not supported")
+      else if st.headers.size >= maxReqHeaders then
+        .error (431, "too many headers")
+      else if isHostHeader k then
+        if v.isEmpty || hasCtlOrCrlf v false then
+          .error (400, "invalid Host header")
+        else if st.hostCount >= 1 then
+          .error (400, "duplicate Host header")
         else
-          let keepAlive' :=
-            if kl == "connection" then
-              if containsCI v "close" then false
-              else if containsCI v "keep-alive" then true
-              else st.keepAlive
-            else st.keepAlive
-          .ok { st with
-            keepAlive := keepAlive'
-            headers   := st.headers.push (k, v)
-            conn?     := if kl == "connection" then some v else st.conn?
-            upgrade?  := if kl == "upgrade" then some v else st.upgrade?
-            wsKey?    := if kl == "sec-websocket-key" then some v else st.wsKey?
-            wsVer?    := if kl == "sec-websocket-version" then some v else st.wsVer?
-          }
+          .ok { st with hostCount := st.hostCount + 1, host? := some v, headers := st.headers.push (k, v) }
+      else if eqCI k "content-length" then
+        match parseStrictU64 v 18446744073709551615 with
+        | none => .error (400, "invalid Content-Length")
+        | some cl =>
+            match st.contentLen? with
+            | some prev =>
+                if prev ≠ cl then .error (400, "conflicting Content-Length headers")
+                else if cl > maxReqBodyBytes then .error (413, "payload too large")
+                else .ok { st with headers := st.headers.push (k, v) }
+            | none =>
+                if cl > maxReqBodyBytes then .error (413, "payload too large")
+                else .ok { st with contentLen? := some cl, headers := st.headers.push (k, v) }
+      else
+        .ok (parseOtherHeader k v st)
 
 private def parseHdrLines (lines : Array String) (idx : Nat) (st : HdrFoldState) :
     Except (Nat × String) HdrFoldState :=
@@ -93,15 +165,42 @@ private def parseHdrLines (lines : Array String) (idx : Nat) (st : HdrFoldState)
     .ok st
 termination_by lines.size - idx
 
+@[inline] private def eqBytesAt (s : String) (off : Nat) (lit : String) : Bool :=
+  if off + lit.utf8ByteSize > s.utf8ByteSize then false
+  else
+    let rec go (k : Nat) : Bool :=
+      if hk : k < lit.utf8ByteSize then
+        if hs : off + k < s.utf8ByteSize then
+          if s.getUTF8Byte ⟨off + k⟩ hs == lit.getUTF8Byte ⟨k⟩ hk then go (k + 1) else false
+        else false
+      else true
+    termination_by lit.utf8ByteSize - k
+    go 0
+
 private def parseReqLine (line : String) : Except (Nat × String) (String × String × Bool) :=
-  match line.splitOn " " with
-  | [method, target, httpVer] =>
-      if method.isEmpty || !isValidHttpToken method || target.isEmpty then .error (400, "malformed request line")
-      else
-        let isHttp11 := httpVer == "HTTP/1.1"
-        if !isHttp11 && httpVer != "HTTP/1.0" then .error (400, "unsupported HTTP version")
-        else .ok (method, target, isHttp11)
-  | _ => .error (400, "malformed request line")
+  match findByte line 0 32 with
+  | none => .error (400, "malformed request line")
+  | some sp1 =>
+      match findByte line (sp1 + 1) 32 with
+      | none => .error (400, "malformed request line")
+      | some sp2 =>
+          if (findByte line (sp2 + 1) 32).isSome then .error (400, "malformed request line")
+          else
+            let verStart := sp2 + 1
+            let isHttp11 := line.utf8ByteSize - verStart == 8 && eqBytesAt line verStart "HTTP/1.1"
+            let isHttp10 := !isHttp11 && line.utf8ByteSize - verStart == 8 && eqBytesAt line verStart "HTTP/1.0"
+            if !isHttp11 && !isHttp10 then .error (400, "unsupported HTTP version")
+            else if sp1 == 0 || sp2 <= sp1 + 1 then .error (400, "malformed request line")
+            else
+              let target :=
+                if sp2 == sp1 + 2 && eqBytesAt line (sp1 + 1) "/" then "/"
+                else String.Pos.Raw.extract line ⟨sp1 + 1⟩ ⟨sp2⟩
+              if sp1 == 3 && eqBytesAt line 0 "GET" then .ok ("GET", target, isHttp11)
+              else if sp1 == 4 && eqBytesAt line 0 "POST" then .ok ("POST", target, isHttp11)
+              else
+                let method := String.Pos.Raw.extract line ⟨0⟩ ⟨sp1⟩
+                if !isValidHttpToken method then .error (400, "malformed request line")
+                else .ok (method, target, isHttp11)
 
 /-- Strict RFC 9112 inbound HTTP/1.1 request header parser (bytes before `\r\n\r\n`).
     Rejects NUL bytes, bare CR/LF, invalid UTF-8, invalid header token names (whitespace before
@@ -121,7 +220,7 @@ def parseRequestHead (headBytes : ByteArray) : Except (Nat × String) ParsedReqH
           | .error e => .error e
           | .ok (method, target, isHttp11) =>
               let initSt : HdrFoldState := {
-                keepAlive := isHttp11, contentLen? := none, hostCount := 0, headers := #[],
+                keepAlive := isHttp11, contentLen? := none, hostCount := 0, headers := Array.mkEmpty 12,
                 upgrade? := none, conn? := none, wsKey? := none, wsVer? := none
               }
               match parseHdrLines lines 1 initSt with
@@ -132,13 +231,23 @@ def parseRequestHead (headBytes : ByteArray) : Except (Nat × String) ParsedReqH
                   else
                     .ok {
                       method, target, isHttp11
-                      keepAlive  := st.keepAlive
-                      contentLen := st.contentLen?.getD 0
-                      headers    := st.headers
-                      upgrade?   := st.upgrade?
-                      conn?      := st.conn?
-                      wsKey?     := st.wsKey?
-                      wsVer?     := st.wsVer?
+                      keepAlive      := st.keepAlive
+                      contentLen     := st.contentLen?.getD 0
+                      headers        := st.headers
+                      upgrade?       := st.upgrade?
+                      conn?          := st.conn?
+                      wsKey?         := st.wsKey?
+                      wsVer?         := st.wsVer?
+                      host?          := st.host?
+                      origin?        := st.origin?
+                      dupOrigin      := st.dupOrigin
+                      secFetchSite?  := st.secFetchSite?
+                      dupSfs         := st.dupSfs
+                      contentType?   := st.contentType?
+                      dupCt          := st.dupCt
+                      hasCookie      := st.hasCookie
+                      auth?          := st.auth?
+                      hasIfNoneMatch := st.hasIfNoneMatch
                     }
 
 theorem parseRequestHead_rejects_nul (headBytes : ByteArray)
@@ -147,9 +256,8 @@ theorem parseRequestHead_rejects_nul (headBytes : ByteArray)
   unfold parseRequestHead
   by_cases hsz : headBytes.size > maxReqHdrBytes
   · exact ⟨(431, "request headers too large"), by simp [hsz]⟩
-  · have hsplit : splitCrlfLines headBytes = .error "invalid NUL byte in headers" := by
-      unfold splitCrlfLines; simp [hnul]
-    exact ⟨(400, "invalid NUL byte in headers"), by simp [hsz, hsplit]⟩
+  · rcases splitCrlfLines_rejects_nul headBytes hnul with ⟨errMsg, hsplit⟩
+    exact ⟨(400, errMsg), by simp [hsz, hsplit]⟩
 
 theorem parseOneHeaderLine_rejects_bad_name (line k v : String) (st : HdrFoldState)
     (hkv : splitHeaderKv line = some (k, v)) (hbad : isValidHttpToken k = false) :
@@ -168,18 +276,18 @@ private theorem parseOneHeaderLine_contentLen_le (line : String) (st st' : HdrFo
       simp only [hs] at hok
       by_cases htok : isValidHttpToken kv.1
       · simp only [htok, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hok
-        by_cases hte : kv.1.toLower == "transfer-encoding"
+        by_cases hte : eqCI kv.1 "transfer-encoding"
         · simp [hte] at hok
         · by_cases hmax : st.headers.size >= maxReqHeaders
           · simp [hte, hmax] at hok
-          · by_cases hhost : kv.1.toLower == "host"
+          · by_cases hhost : isHostHeader kv.1
             · simp only [hte, hmax, hhost, ↓reduceIte, Bool.false_eq_true] at hok
               split at hok
               · cases hok
               · split at hok
                 · cases hok
                 · simp only [Except.ok.injEq] at hok; subst hok; exact hinit
-            · by_cases hcl : kv.1.toLower == "content-length"
+            · by_cases hcl : eqCI kv.1 "content-length"
               · simp only [hte, hmax, hhost, hcl, ↓reduceIte, Bool.false_eq_true] at hok
                 cases hp : parseStrictU64 kv.2 18446744073709551615 with
                 | none => simp [hp] at hok
@@ -204,7 +312,9 @@ private theorem parseOneHeaderLine_contentLen_le (line : String) (st st' : HdrFo
                           subst hok
                           intro c hc; simp only [Option.some.injEq] at hc; omega
               · simp only [hte, hmax, hhost, hcl, ↓reduceIte, Bool.false_eq_true, Except.ok.injEq] at hok
-                subst hok; exact hinit
+                subst hok
+                rw [(parseOtherHeader_invariants kv.1 kv.2 st).1]
+                exact hinit
       · simp [htok] at hok
 
 private theorem parseHdrLines_contentLen_le (lines : Array String) (idx : Nat) (st st' : HdrFoldState)
@@ -234,11 +344,11 @@ private theorem parseOneHeaderLine_hostCount_step (line : String) (st st' : HdrF
       simp only [hs] at hok
       by_cases htok : isValidHttpToken kv.1
       · simp only [htok, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hok
-        by_cases hte : kv.1.toLower == "transfer-encoding"
+        by_cases hte : eqCI kv.1 "transfer-encoding"
         · simp [hte] at hok
         · by_cases hmax : st.headers.size >= maxReqHeaders
           · simp [hte, hmax] at hok
-          · by_cases hhost : kv.1.toLower == "host"
+          · by_cases hhost : isHostHeader kv.1
             · simp only [hte, hmax, hhost, ↓reduceIte, Bool.false_eq_true] at hok
               split at hok
               · cases hok
@@ -246,9 +356,9 @@ private theorem parseOneHeaderLine_hostCount_step (line : String) (st st' : HdrF
                 · cases hok
                 · simp only [Except.ok.injEq] at hok; subst hok
                   right
-                  refine ⟨rfl, kv.1, kv.2, ?_, hhost⟩
+                  refine ⟨rfl, kv.1, kv.2, ?_, isHostHeader_imp_toLower kv.1 hhost⟩
                   simp [Array.toList_push]
-            · by_cases hcl : kv.1.toLower == "content-length"
+            · by_cases hcl : eqCI kv.1 "content-length"
               · simp only [hte, hmax, hhost, hcl, ↓reduceIte, Bool.false_eq_true] at hok
                 cases hp : parseStrictU64 kv.2 18446744073709551615 with
                 | none => simp [hp] at hok
@@ -268,7 +378,7 @@ private theorem parseOneHeaderLine_hostCount_step (line : String) (st st' : HdrF
                         · cases hok
                         · simp only [Except.ok.injEq] at hok; subst hok; left; rfl
               · simp only [hte, hmax, hhost, hcl, ↓reduceIte, Bool.false_eq_true, Except.ok.injEq] at hok
-                subst hok; left; rfl
+                subst hok; left; exact (parseOtherHeader_invariants kv.1 kv.2 st).2.1
       · simp [htok] at hok
 
 private theorem parseOneHeaderLine_headers_mono (line : String) (st st' : HdrFoldState)
@@ -281,11 +391,11 @@ private theorem parseOneHeaderLine_headers_mono (line : String) (st st' : HdrFol
       simp only [hs] at hok
       by_cases htok : isValidHttpToken kv.1
       · simp only [htok, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hok
-        by_cases hte : kv.1.toLower == "transfer-encoding"
+        by_cases hte : eqCI kv.1 "transfer-encoding"
         · simp [hte] at hok
         · by_cases hmax : st.headers.size >= maxReqHeaders
           · simp [hte, hmax] at hok
-          · by_cases hhost : kv.1.toLower == "host"
+          · by_cases hhost : isHostHeader kv.1
             · simp only [hte, hmax, hhost, ↓reduceIte, Bool.false_eq_true] at hok
               split at hok
               · cases hok
@@ -293,7 +403,7 @@ private theorem parseOneHeaderLine_headers_mono (line : String) (st st' : HdrFol
                 · cases hok
                 · simp only [Except.ok.injEq] at hok; subst hok
                   intro p hp; simp [Array.toList_push, hp]
-            · by_cases hcl : kv.1.toLower == "content-length"
+            · by_cases hcl : eqCI kv.1 "content-length"
               · simp only [hte, hmax, hhost, hcl, ↓reduceIte, Bool.false_eq_true] at hok
                 cases hp : parseStrictU64 kv.2 18446744073709551615 with
                 | none => simp [hp] at hok
@@ -315,7 +425,9 @@ private theorem parseOneHeaderLine_headers_mono (line : String) (st st' : HdrFol
                         · simp only [Except.ok.injEq] at hok; subst hok
                           intro p hp; simp [Array.toList_push, hp]
               · simp only [hte, hmax, hhost, hcl, ↓reduceIte, Bool.false_eq_true, Except.ok.injEq] at hok
-                subst hok; intro p hp; simp [Array.toList_push, hp]
+                subst hok
+                rw [(parseOtherHeader_invariants kv.1 kv.2 st).2.2]
+                intro p hp; simp [Array.toList_push, hp]
       · simp [htok] at hok
 
 private theorem parseHdrLines_host_of_pos (lines : Array String) (idx : Nat) (st st' : HdrFoldState)
@@ -360,11 +472,11 @@ theorem parseRequestHead_http11_has_host (headBytes : ByteArray) (req : ParsedRe
               rcases mti with ⟨m, t, is11⟩
               simp only [hreq] at hok
               let initSt : HdrFoldState := {
-                keepAlive := is11, contentLen? := none, hostCount := 0, headers := #[],
+                keepAlive := is11, contentLen? := none, hostCount := 0, headers := Array.mkEmpty 12,
                 upgrade? := none, conn? := none, wsKey? := none, wsVer? := none
               }
               cases hfold : parseHdrLines lines 1 initSt with
-              | error e => simp [initSt, hfold] at hok
+              | error e => simp only [initSt, hfold] at hok; cases hok
               | ok st =>
                   simp only [initSt, hfold] at hok
                   by_cases hmiss : (is11 && st.hostCount != 1) = true
@@ -397,11 +509,11 @@ theorem parseRequestHead_contentLen_le (headBytes : ByteArray) (req : ParsedReqH
               rcases mti with ⟨m, t, is11⟩
               simp only [hreq] at hok
               let initSt : HdrFoldState := {
-                keepAlive := is11, contentLen? := none, hostCount := 0, headers := #[],
+                keepAlive := is11, contentLen? := none, hostCount := 0, headers := Array.mkEmpty 12,
                 upgrade? := none, conn? := none, wsKey? := none, wsVer? := none
               }
               cases hfold : parseHdrLines lines 1 initSt with
-              | error e => simp [initSt, hfold] at hok
+              | error e => simp only [initSt, hfold] at hok; cases hok
               | ok st =>
                   simp only [initSt, hfold] at hok
                   by_cases hmiss : (is11 && st.hostCount != 1) = true
@@ -443,7 +555,7 @@ theorem safeContentType_no_crlf (ct : String) :
     hasCtlOrCrlf (safeContentType ct) false = false := by
   unfold safeContentType
   split
-  · rfl
+  · decide
   · rename_i h; simpa using h
 
 def formatHttpResponseHead (status : Nat) (contentType : String) (contentLen : Nat)
@@ -494,6 +606,49 @@ def formatHttpResponse (status : Nat) (contentType : String) (body : ByteArray)
     (cacheControl? : Option String := none) : ByteArray :=
   let head := formatHttpResponseHead status contentType body.size keepAlive noStore etag? cacheControl?
   if headOnly then head else head ++ body
+
+private def okProtoHeadPrefix : ByteArray :=
+  "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: ".toUTF8
+
+private def okHtmlHeadPrefix : ByteArray :=
+  "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ".toUTF8
+
+private def okHeadTailKA : ByteArray :=
+  "\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n".toUTF8
+
+private def okHeadTailClose : ByteArray :=
+  "\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n".toUTF8
+
+@[inline] private def appendByteSlice (dst src : ByteArray) : ByteArray :=
+  src.copySlice 0 dst dst.size src.size false
+
+private def pushNatAsciiBytes (buf : ByteArray) (n : Nat) : ByteArray :=
+  if n < 10 then buf.push (UInt8.ofNat (48 + n))
+  else if n < 100 then
+    (buf.push (UInt8.ofNat (48 + n / 10))).push (UInt8.ofNat (48 + n % 10))
+  else if n < 1000 then
+    ((buf.push (UInt8.ofNat (48 + n / 100))).push (UInt8.ofNat (48 + (n / 10) % 10))).push (UInt8.ofNat (48 + n % 10))
+  else if n < 10000 then
+    (((buf.push (UInt8.ofNat (48 + n / 1000))).push (UInt8.ofNat (48 + (n / 100) % 10))).push
+      (UInt8.ofNat (48 + (n / 10) % 10))).push (UInt8.ofNat (48 + n % 10))
+  else
+    appendByteSlice buf (toString n).toUTF8
+
+/-- Single-allocation HTTP/1.1 `200 OK` response builder for pre-validated static content types. -/
+private def formatFast200 (headPrefix body : ByteArray) (headOnly keepAlive : Bool) : ByteArray :=
+  let tail := if keepAlive then okHeadTailKA else okHeadTailClose
+  let cap := headPrefix.size + 10 + tail.size + (if headOnly then 0 else body.size)
+  let out := ByteArray.emptyWithCapacity cap
+  let out := appendByteSlice out headPrefix
+  let out := pushNatAsciiBytes out body.size
+  let out := appendByteSlice out tail
+  if headOnly then out else appendByteSlice out body
+
+def formatOkProtoResponse (body : ByteArray) (headOnly keepAlive : Bool) : ByteArray :=
+  formatFast200 okProtoHeadPrefix body headOnly keepAlive
+
+def formatOkHtmlResponse (body : ByteArray) (headOnly keepAlive : Bool) : ByteArray :=
+  formatFast200 okHtmlHeadPrefix body headOnly keepAlive
 
 def formatErrorResponse (status : Nat) (msg : String) : ByteArray :=
   formatHttpResponse status "text/plain; charset=utf-8" msg.toUTF8 false false false

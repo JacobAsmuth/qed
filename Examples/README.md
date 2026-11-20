@@ -51,4 +51,4 @@ Run all proof/environment checks and the 6 automated test suites from the repo r
 
 ## Compiler Gates & Benchmarks
 
-Compiler/runtime test modules live in [../Tests/](../Tests/) (`SyntaxChecks`, `ServerChecks`, `CssChecks`, `JsGate`, `DomProbe`, `SpeculativeChecks`, `SpeculativeApp`), and pipeline/view benchmarks live in [../Bench/](../Bench/) (`lake exe bench`, `test/bench_react.mjs`, `test/bench_template.mjs`).
+Compiler/runtime test modules live in [../Tests/](../Tests/) (`SyntaxChecks`, `ServerChecks`, `CssChecks`, `JsGate`, `DomProbe`, `SpeculativeChecks`, `SpeculativeApp`), and benchmarks live in [../Bench/](../Bench/) (`lake exe bench`, `test/bench_js_framework.mjs`, `test/bench_server.mjs`, `test/bench_template.mjs`).

@@ -31,7 +31,7 @@ def tree (seed : Nat) : Html Nat :=
         (if seed % 2 == 0 then [.attr "xlink:href" "#icon"] else []) []]]
 
 def handlers : IO (Handlers Nat) := do
-  return { click := (← IO.mkRef #[]), input := (← IO.mkRef #[]),
+  return { click := (← IO.mkRef #[]), input := (← IO.mkRef #[]), rowEv := (← IO.mkRef #[]),
            mountLocal := fun _ _ _ _ _ _ => pure () }
 
 initialize liveHandlers : IO.Ref (Option (Handlers Nat)) ← IO.mkRef none

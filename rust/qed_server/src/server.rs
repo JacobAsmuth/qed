@@ -2,8 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,7 @@ const RESP_503_WIRE: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 19\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nserver overloaded\r\n";
 
 static STOP: AtomicBool = AtomicBool::new(false);
-static INBOXES: Mutex<Vec<Arc<WorkerInbox>>> = Mutex::new(Vec::new());
+static INBOXES: RwLock<Vec<Arc<WorkerInbox>>> = RwLock::new(Vec::new());
 
 extern "C" fn handle_stop_signal(_sig: libc::c_int) { STOP.store(true, Ordering::SeqCst); }
 
@@ -82,21 +82,22 @@ struct BcastMsg { topic: String, payload: Vec<u8> }
 enum SubOp { Add(u32, String, String, Vec<u8>), Remove(u32) }
 
 enum HeadOutcome {
-    SendAndClose(Vec<u8>),
-    SendKeepAlive(Vec<u8>),
-    NeedBody { content_len: usize, keep_alive: bool, req: LeanRef },
-    WsUpgrade { resp: Vec<u8>, ws_ctx: LeanRef },
+    SendAndClose(WireBytes, usize),
+    SendKeepAlive(WireBytes, usize),
+    NeedBody { content_len: usize, keep_alive: bool, req: LeanRef, inline: bool },
+    WsUpgrade { resp: WireBytes, ws_ctx: LeanRef },
+    Defer,
     Fatal,
 }
 
 enum DoneEvent {
     Head { token: u64, outcome: HeadOutcome },
-    Body { token: u64, resp: Option<Vec<u8>>, keep_alive: bool },
+    Body { token: u64, resp: Option<WireBytes>, keep_alive: bool },
     WsStep {
         token: u64,
         ws_ctx: LeanRef,
         consumed: usize,
-        out_wire: Vec<u8>,
+        out_wire: WireBytes,
         close: bool,
         new_frag: Option<LeanRef>,
         ops: Vec<SubOp>,
@@ -108,6 +109,8 @@ struct WorkerInbox {
     bcast_queue: Mutex<VecDeque<Arc<BcastMsg>>>,
     wake_rfd: libc::c_int,
     wake_wfd: libc::c_int,
+    wake_pending: AtomicBool,
+    ws_subs: AtomicUsize,
 }
 
 impl WorkerInbox {
@@ -126,6 +129,8 @@ impl WorkerInbox {
             bcast_queue: Mutex::new(VecDeque::new()),
             wake_rfd: rfd,
             wake_wfd: wfd,
+            wake_pending: AtomicBool::new(false),
+            ws_subs: AtomicUsize::new(0),
         }
     }
 
@@ -145,6 +150,12 @@ impl WorkerInbox {
     }
 
     fn wake(&self) {
+        if !self.wake_pending.swap(true, Ordering::SeqCst) {
+            self.force_wake();
+        }
+    }
+
+    fn force_wake(&self) {
         if self.wake_wfd >= 0 {
             let v: u64 = 1;
             let _ = unsafe { libc::write(self.wake_wfd, &v as *const u64 as *const libc::c_void, 8) };
@@ -156,6 +167,7 @@ impl WorkerInbox {
             let mut buf = [0u8; 64];
             while unsafe { libc::read(self.wake_rfd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) } > 0 {}
         }
+        self.wake_pending.store(false, Ordering::SeqCst);
     }
 }
 
@@ -168,9 +180,19 @@ impl Drop for WorkerInbox {
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_ws_broadcast(topic_obj: *mut LeanObj, payload_obj: *mut LeanObj) -> *mut LeanObj {
-    let msg = Arc::new(BcastMsg { topic: str_slice(topic_obj).to_owned(), payload: ba_slice(payload_obj).to_vec() });
-    for inbox in lock_unpoison(&INBOXES).clone() {
-        inbox.push_bcast(msg.clone());
+    let inboxes = INBOXES.read().unwrap_or_else(|e| e.into_inner());
+    let mut msg: Option<Arc<BcastMsg>> = None;
+    for inbox in inboxes.iter() {
+        if inbox.ws_subs.load(Ordering::Acquire) == 0 {
+            continue;
+        }
+        let m = msg.get_or_insert_with(|| {
+            Arc::new(BcastMsg {
+                topic: str_slice(topic_obj).to_owned(),
+                payload: ba_slice(payload_obj).to_vec(),
+            })
+        });
+        inbox.push_bcast(m.clone());
     }
     qed_lean_io_mk_ok(qed_lean_box(0))
 }
@@ -189,6 +211,7 @@ enum PoolJob {
     Head {
         token: u64,
         head_bytes: Vec<u8>,
+        trailing: Vec<u8>,
         ip: String,
         inbox: Arc<WorkerInbox>,
     },
@@ -291,63 +314,82 @@ impl BlockingPool {
     }
 }
 
+fn eval_body(cbs: &Callbacks, req_ptr: *mut LeanObj, body: &[u8], ip: &str) -> Option<WireBytes> {
+    unsafe {
+        let res = qed_lean_apply_4(
+            cbs.on_body.clone_ptr(),
+            req_ptr,
+            mk_ba(body),
+            mk_str(ip),
+            qed_lean_box(0),
+        );
+        let out = if qed_lean_io_is_ok(res) != 0 {
+            Some(WireBytes::from_borrowed(qed_lean_io_val(res)))
+        } else {
+            None
+        };
+        qed_lean_dec_ref(res);
+        out
+    }
+}
+
+fn eval_head(cbs: &Callbacks, head_bytes: &[u8], trailing: &[u8], ip: &str, inline: bool) -> HeadOutcome {
+    unsafe {
+        let res = qed_lean_apply_4(
+            cbs.on_head.clone_ptr(),
+            mk_ba(head_bytes),
+            mk_str(ip),
+            qed_lean_box(if inline { 1 } else { 0 }),
+            qed_lean_box(0),
+        );
+        if qed_lean_io_is_ok(res) == 0 {
+            qed_lean_dec_ref(res);
+            return HeadOutcome::Fatal;
+        }
+        let act = qed_lean_io_val(res);
+        let out = match qed_lean_obj_tag(act) {
+            0 => HeadOutcome::SendAndClose(WireBytes::from_borrowed(qed_lean_ctor_get(act, 0)), 0),
+            1 => HeadOutcome::SendKeepAlive(WireBytes::from_borrowed(qed_lean_ctor_get(act, 0)), 0),
+            t @ (2 | 3) => {
+                let cl = qed_lean_usize_of_nat(qed_lean_ctor_get(act, 0));
+                let req_ptr = qed_lean_ctor_get(act, 1);
+                let keep_alive = t == 3;
+                if trailing.len() >= cl {
+                    qed_lean_inc(req_ptr);
+                    match eval_body(cbs, req_ptr, &trailing[..cl], ip) {
+                        Some(w) if keep_alive => HeadOutcome::SendKeepAlive(w, cl),
+                        Some(w) => HeadOutcome::SendAndClose(w, cl),
+                        None => HeadOutcome::Fatal,
+                    }
+                } else {
+                    qed_lean_inc(req_ptr);
+                    if !inline { qed_lean_mark_mt(req_ptr); }
+                    HeadOutcome::NeedBody { content_len: cl, keep_alive, req: LeanRef(req_ptr), inline }
+                }
+            }
+            4 => {
+                let resp = WireBytes::from_borrowed(qed_lean_ctor_get(act, 0));
+                let ctx_ptr = qed_lean_ctor_get(act, 1);
+                qed_lean_inc(ctx_ptr);
+                qed_lean_mark_mt(ctx_ptr);
+                HeadOutcome::WsUpgrade { resp, ws_ctx: LeanRef(ctx_ptr) }
+            }
+            5 => HeadOutcome::Defer,
+            _ => HeadOutcome::Fatal,
+        };
+        qed_lean_dec_ref(res);
+        out
+    }
+}
+
 fn exec_pool_job(cbs: &Callbacks, job: PoolJob) {
     match job {
-        PoolJob::Head { token, head_bytes, ip, inbox } => {
-            let outcome = unsafe {
-                let res = qed_lean_apply_3(
-                    cbs.on_head.clone_ptr(),
-                    mk_ba(&head_bytes),
-                    mk_str(&ip),
-                    qed_lean_box(0),
-                );
-                if qed_lean_io_is_ok(res) == 0 {
-                    qed_lean_dec_ref(res);
-                    HeadOutcome::Fatal
-                } else {
-                    let act = qed_lean_io_val(res);
-                    let out = match qed_lean_obj_tag(act) {
-                        0 => HeadOutcome::SendAndClose(ba_slice(qed_lean_ctor_get(act, 0)).to_vec()),
-                        1 => HeadOutcome::SendKeepAlive(ba_slice(qed_lean_ctor_get(act, 0)).to_vec()),
-                        t @ (2 | 3) => {
-                            let cl = qed_lean_usize_of_nat(qed_lean_ctor_get(act, 0));
-                            let req_ptr = qed_lean_ctor_get(act, 1);
-                            qed_lean_inc(req_ptr);
-                            qed_lean_mark_mt(req_ptr);
-                            HeadOutcome::NeedBody { content_len: cl, keep_alive: t == 3, req: LeanRef(req_ptr) }
-                        }
-                        4 => {
-                            let resp = ba_slice(qed_lean_ctor_get(act, 0)).to_vec();
-                            let ctx_ptr = qed_lean_ctor_get(act, 1);
-                            qed_lean_inc(ctx_ptr);
-                            qed_lean_mark_mt(ctx_ptr);
-                            HeadOutcome::WsUpgrade { resp, ws_ctx: LeanRef(ctx_ptr) }
-                        }
-                        _ => HeadOutcome::Fatal,
-                    };
-                    qed_lean_dec_ref(res);
-                    out
-                }
-            };
+        PoolJob::Head { token, head_bytes, trailing, ip, inbox } => {
+            let outcome = eval_head(cbs, &head_bytes, &trailing, &ip, false);
             inbox.push_done(DoneEvent::Head { token, outcome });
         }
         PoolJob::Body { token, req, body, ip, keep_alive, inbox } => {
-            let resp = unsafe {
-                let res = qed_lean_apply_4(
-                    cbs.on_body.clone_ptr(),
-                    req.clone_ptr(),
-                    mk_ba(&body),
-                    mk_str(&ip),
-                    qed_lean_box(0),
-                );
-                let out = if qed_lean_io_is_ok(res) != 0 {
-                    Some(ba_slice(qed_lean_io_val(res)).to_vec())
-                } else {
-                    None
-                };
-                qed_lean_dec_ref(res);
-                out
-            };
+            let resp = eval_body(cbs, unsafe { req.clone_ptr() }, &body, &ip);
             inbox.push_done(DoneEvent::Body { token, resp, keep_alive });
         }
         PoolJob::WsStep { token, ws_ctx, rx_bytes, frag, subs, inbox } => {
@@ -374,7 +416,7 @@ fn exec_pool_job(cbs: &Callbacks, job: PoolJob) {
                         token,
                         ws_ctx,
                         consumed: rx_bytes.len(),
-                        out_wire: Vec::new(),
+                        out_wire: WireBytes(LeanRef(mk_ba(&[]))),
                         close: true,
                         new_frag: None,
                         ops: Vec::new(),
@@ -382,7 +424,7 @@ fn exec_pool_job(cbs: &Callbacks, job: PoolJob) {
                 } else {
                     let out = qed_lean_io_val(res);
                     let consumed = qed_lean_usize_of_nat(qed_lean_ctor_get(out, 0)).min(rx_bytes.len());
-                    let out_wire = ba_slice(qed_lean_ctor_get(out, 1)).to_vec();
+                    let out_wire = WireBytes::from_borrowed(qed_lean_ctor_get(out, 1));
                     let close_flag = qed_lean_usize_of_nat(qed_lean_ctor_get(out, 2));
                     let new_frag_ptr = qed_lean_ctor_get(out, 3);
                     qed_lean_inc(new_frag_ptr);
@@ -628,10 +670,25 @@ fn send_nonblock(fd: libc::c_int, data: &[u8]) -> isize {
     unsafe { libc::send(fd, data.as_ptr() as *const libc::c_void, data.len(), flags) }
 }
 
+fn send_two_nonblock(fd: libc::c_int, a: &[u8], b: &[u8]) -> isize {
+    let iovs = [
+        libc::iovec { iov_base: a.as_ptr() as *mut libc::c_void, iov_len: a.len() },
+        libc::iovec { iov_base: b.as_ptr() as *mut libc::c_void, iov_len: b.len() },
+    ];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = iovs.as_ptr() as *mut libc::iovec;
+    msg.msg_iovlen = 2 as _;
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_NOSIGNAL;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    unsafe { libc::sendmsg(fd, &msg, flags) }
+}
+
 // ---- Per-Connection & Per-Worker State ----
 
 struct WsSub { sub_id: u32, topic: String, channel: String, params: Vec<u8> }
-struct PendingBody { content_len: usize, keep_alive: bool, req: LeanRef }
+struct PendingBody { content_len: usize, keep_alive: bool, req: LeanRef, inline: bool }
 
 struct Conn {
     token: u64,
@@ -653,28 +710,39 @@ struct Conn {
 }
 
 impl Conn {
-    fn queue_bytes(&mut self, poller: &Poller, data: &[u8]) -> bool {
-        if data.is_empty() { return true; }
-        let mut rem = data;
-        if self.tx.is_empty() {
-            let n = send_nonblock(self.fd, rem);
-            if n > 0 {
-                rem = &rem[n as usize..];
-                if rem.is_empty() { return true; }
-            } else if n < 0 {
-                let e = last_errno();
-                if !is_wouldblock(e) && e != libc::EINTR { return false; }
-            }
-        }
-        if self.tx.len().saturating_add(rem.len()) > MAX_TX_BUF_BYTES {
+    fn buffer_tx(&mut self, poller: &Poller, a: &[u8], b: &[u8]) -> bool {
+        if self.tx.len().saturating_add(a.len().saturating_add(b.len())) > MAX_TX_BUF_BYTES {
             return false;
         }
-        self.tx.extend_from_slice(rem);
+        if !a.is_empty() { self.tx.extend_from_slice(a); }
+        if !b.is_empty() { self.tx.extend_from_slice(b); }
         if !self.tx_armed {
             poller.set_write(self.fd, self.token, true);
             self.tx_armed = true;
         }
         true
+    }
+
+    fn queue_bytes(&mut self, poller: &Poller, data: &[u8]) -> bool {
+        if data.is_empty() { return true; }
+        let mut rem = data;
+        if self.tx.is_empty() {
+            while !rem.is_empty() {
+                let n = send_nonblock(self.fd, rem);
+                if n > 0 {
+                    rem = &rem[n as usize..];
+                } else if n < 0 {
+                    let e = last_errno();
+                    if e == libc::EINTR { continue; }
+                    if is_wouldblock(e) { break; }
+                    return false;
+                } else {
+                    return false;
+                }
+            }
+            if rem.is_empty() { return true; }
+        }
+        self.buffer_tx(poller, rem, &[])
     }
 
     fn flush_tx(&mut self, poller: &Poller) -> bool {
@@ -698,6 +766,29 @@ impl Conn {
         true
     }
 
+    fn queue_two(&mut self, poller: &Poller, a: &[u8], b: &[u8]) -> bool {
+        if a.is_empty() { return self.queue_bytes(poller, b); }
+        if b.is_empty() { return self.queue_bytes(poller, a); }
+        let (mut rem_a, mut rem_b) = (a, b);
+        if self.tx.is_empty() {
+            let n = send_two_nonblock(self.fd, rem_a, rem_b);
+            if n > 0 {
+                let sent = n as usize;
+                if sent >= rem_a.len() + rem_b.len() { return true; }
+                if sent >= rem_a.len() {
+                    rem_b = &rem_b[sent - rem_a.len()..];
+                    rem_a = &[];
+                } else {
+                    rem_a = &rem_a[sent..];
+                }
+            } else if n < 0 {
+                let e = last_errno();
+                if !is_wouldblock(e) && e != libc::EINTR { return false; }
+            }
+        }
+        self.buffer_tx(poller, rem_a, rem_b)
+    }
+
     fn queue_ws_event(&mut self, poller: &Poller, sub_id: u32, payload: &[u8]) -> bool {
         let total = 5 + payload.len();
         let mut hdr = [0u8; 15];
@@ -716,11 +807,41 @@ impl Conn {
         };
         hdr[hlen] = 0x12;
         hdr[hlen + 1..hlen + 5].copy_from_slice(&sub_id.to_be_bytes());
-        self.queue_bytes(poller, &hdr[..hlen + 5]) && self.queue_bytes(poller, payload)
+        self.queue_two(poller, &hdr[..hlen + 5], payload)
     }
 
     fn ready_to_close(&self) -> bool {
         !self.in_flight && self.tx.is_empty() && (self.close_after_tx || (self.peer_eof && (self.rx.is_empty() || self.is_ws)))
+    }
+}
+
+#[derive(Default)]
+struct TopicSubs {
+    entries: Vec<(u64, u32)>,
+    index: HashMap<(u64, u32), usize>,
+}
+
+impl TopicSubs {
+    fn insert(&mut self, key: (u64, u32)) -> bool {
+        if self.index.contains_key(&key) { return false; }
+        let idx = self.entries.len();
+        self.entries.push(key);
+        self.index.insert(key, idx);
+        true
+    }
+
+    fn remove(&mut self, key: (u64, u32)) -> bool {
+        let Some(idx) = self.index.remove(&key) else { return false };
+        let last = self.entries.pop().unwrap();
+        if idx < self.entries.len() {
+            self.entries[idx] = last;
+            self.index.insert(last, idx);
+        }
+        true
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -729,17 +850,84 @@ struct Worker {
     listen_fd: libc::c_int,
     inbox: Arc<WorkerInbox>,
     pool: Arc<BlockingPool>,
+    cbs: Arc<Callbacks>,
     init_frag: LeanRef,
     next_token: u64,
     conns: HashMap<u64, Conn>,
-    topics: HashMap<String, Vec<(u64, u32)>>,
+    topics: HashMap<String, TopicSubs>,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ConnStep { Continue, Done, Close }
+
+impl Conn {
+    fn apply_body_outcome(&mut self, poller: &Poller, resp: Option<WireBytes>, keep_alive: bool) -> ConnStep {
+        let sent = resp.as_ref().is_some_and(|w| self.queue_bytes(poller, w.as_slice()));
+        if !sent || !keep_alive {
+            self.close_after_tx = true;
+            if !sent || self.tx.is_empty() { ConnStep::Close } else { ConnStep::Done }
+        } else if self.ready_to_close() {
+            ConnStep::Close
+        } else if self.rx.is_empty() {
+            ConnStep::Done
+        } else {
+            ConnStep::Continue
+        }
+    }
+
+    fn apply_head_outcome(&mut self, poller: &Poller, init_frag: &LeanRef, consume_head: usize, outcome: HeadOutcome) -> ConnStep {
+        match outcome {
+            HeadOutcome::SendKeepAlive(wire, body_consumed) => {
+                if consume_head + body_consumed > 0 { self.rx.consume(consume_head + body_consumed); }
+                self.apply_body_outcome(poller, Some(wire), true)
+            }
+            HeadOutcome::SendAndClose(wire, body_consumed) => {
+                if consume_head + body_consumed > 0 { self.rx.consume(consume_head + body_consumed); }
+                self.apply_body_outcome(poller, Some(wire), false)
+            }
+            HeadOutcome::NeedBody { content_len, keep_alive, req, inline } => {
+                if consume_head > 0 { self.rx.consume(consume_head); }
+                self.pending_body = Some(PendingBody { content_len, keep_alive, req, inline });
+                if self.rx.len() >= content_len { ConnStep::Continue }
+                else if self.peer_eof { ConnStep::Close }
+                else { ConnStep::Done }
+            }
+            HeadOutcome::WsUpgrade { resp, ws_ctx } => {
+                if consume_head > 0 { self.rx.consume(consume_head); }
+                if !self.queue_bytes(poller, resp.as_slice()) {
+                    self.close_after_tx = true;
+                    return ConnStep::Close;
+                }
+                let now = Instant::now();
+                self.is_ws = true;
+                self.ws_ctx = Some(ws_ctx);
+                self.frag = Some(init_frag.clone());
+                self.last_active = now;
+                self.last_ping = now;
+                if self.rx.is_empty() { ConnStep::Done } else { ConnStep::Continue }
+            }
+            HeadOutcome::Defer | HeadOutcome::Fatal => {
+                if consume_head > 0 { self.rx.consume(consume_head); }
+                self.close_after_tx = true;
+                if self.tx.is_empty() { ConnStep::Close } else { ConnStep::Done }
+            }
+        }
+    }
 }
 
 impl Worker {
+    fn topic_add(&mut self, topic: String, token: u64, sub_id: u32) {
+        if self.topics.entry(topic).or_default().insert((token, sub_id)) {
+            self.inbox.ws_subs.fetch_add(1, Ordering::Release);
+        }
+    }
+
     fn topic_remove(&mut self, topic: &str, token: u64, sub_id: u32) {
-        if let Some(v) = self.topics.get_mut(topic) {
-            v.retain(|&(t, s)| !(t == token && s == sub_id));
-            if v.is_empty() { self.topics.remove(topic); }
+        if let Some(subs) = self.topics.get_mut(topic) {
+            if subs.remove((token, sub_id)) {
+                self.inbox.ws_subs.fetch_sub(1, Ordering::Release);
+            }
+            if subs.is_empty() { self.topics.remove(topic); }
         }
     }
 
@@ -792,13 +980,16 @@ impl Worker {
 
         let bcast_msgs = std::mem::take(&mut *lock_unpoison(&self.inbox.bcast_queue));
         let mut to_close = Vec::new();
-        for msg in bcast_msgs {
-            let Some(targets) = self.topics.get(&msg.topic).cloned() else { continue };
-            for (token, sub_id) in targets {
-                if let Some(c) = self.conns.get_mut(&token) {
-                    if c.is_ws && !c.close_after_tx {
-                        if !c.queue_ws_event(&self.poller, sub_id, &msg.payload) {
-                            to_close.push(token);
+        {
+            let Worker { conns, topics, poller, .. } = self;
+            for msg in bcast_msgs {
+                let Some(targets) = topics.get(&msg.topic) else { continue };
+                for &(token, sub_id) in &targets.entries {
+                    if let Some(c) = conns.get_mut(&token) {
+                        if c.is_ws && !c.close_after_tx {
+                            if !c.queue_ws_event(poller, sub_id, &msg.payload) {
+                                to_close.push(token);
+                            }
                         }
                     }
                 }
@@ -807,75 +998,31 @@ impl Worker {
         for t in to_close { self.close_conn(t); }
     }
 
+    fn finish_step(&mut self, token: u64, step: ConnStep) {
+        match step {
+            ConnStep::Close => self.close_conn(token),
+            ConnStep::Continue => self.process_rx(token),
+            ConnStep::Done => {}
+        }
+    }
+
     fn handle_done_event(&mut self, ev: DoneEvent) {
         match ev {
             DoneEvent::Head { token, outcome } => {
-                let mut resume = false;
-                let mut close_now = false;
-                if let Some(conn) = self.conns.get_mut(&token) {
+                let step = if let Some(conn) = self.conns.get_mut(&token) {
                     conn.in_flight = false;
                     conn.last_active = Instant::now();
-                    match outcome {
-                        HeadOutcome::SendAndClose(wire) => {
-                            let sent = conn.queue_bytes(&self.poller, &wire);
-                            conn.close_after_tx = true;
-                            if !sent || conn.tx.is_empty() { close_now = true; }
-                        }
-                        HeadOutcome::SendKeepAlive(wire) => {
-                            if !conn.queue_bytes(&self.poller, &wire) {
-                                conn.close_after_tx = true;
-                                close_now = true;
-                            } else if conn.ready_to_close() {
-                                close_now = true;
-                            } else {
-                                resume = true;
-                            }
-                        }
-                        HeadOutcome::NeedBody { content_len, keep_alive, req } => {
-                            conn.pending_body = Some(PendingBody { content_len, keep_alive, req });
-                            resume = true;
-                        }
-                        HeadOutcome::WsUpgrade { resp, ws_ctx } => {
-                            if !conn.queue_bytes(&self.poller, &resp) {
-                                conn.close_after_tx = true;
-                                close_now = true;
-                            } else {
-                                let now = Instant::now();
-                                conn.is_ws = true;
-                                conn.ws_ctx = Some(ws_ctx);
-                                conn.frag = Some(self.init_frag.clone());
-                                conn.last_active = now;
-                                conn.last_ping = now;
-                                resume = true;
-                            }
-                        }
-                        HeadOutcome::Fatal => {
-                            conn.close_after_tx = true;
-                            if conn.tx.is_empty() { close_now = true; }
-                        }
-                    }
-                }
-                if close_now { self.close_conn(token); }
-                else if resume { self.process_rx(token); }
+                    conn.apply_head_outcome(&self.poller, &self.init_frag, 0, outcome)
+                } else { ConnStep::Done };
+                self.finish_step(token, step);
             }
             DoneEvent::Body { token, resp, keep_alive } => {
-                let mut resume = false;
-                let mut close_now = false;
-                if let Some(conn) = self.conns.get_mut(&token) {
+                let step = if let Some(conn) = self.conns.get_mut(&token) {
                     conn.in_flight = false;
                     conn.last_active = Instant::now();
-                    let sent = resp.as_deref().is_some_and(|w| conn.queue_bytes(&self.poller, w));
-                    if !sent || !keep_alive {
-                        conn.close_after_tx = true;
-                        if !sent || conn.tx.is_empty() { close_now = true; }
-                    } else if conn.ready_to_close() {
-                        close_now = true;
-                    } else {
-                        resume = true;
-                    }
-                }
-                if close_now { self.close_conn(token); }
-                else if resume { self.process_rx(token); }
+                    conn.apply_body_outcome(&self.poller, resp, keep_alive)
+                } else { ConnStep::Done };
+                self.finish_step(token, step);
             }
             DoneEvent::WsStep { token, ws_ctx, consumed, out_wire, close, new_frag, ops } => {
                 if !self.conns.contains_key(&token) {
@@ -901,7 +1048,7 @@ impl Worker {
                         if let Some(c) = self.conns.get_mut(&token) {
                             c.subs.push(WsSub { sub_id: sid, topic: topic.clone(), channel, params });
                         }
-                        self.topics.entry(topic).or_default().push((token, sid));
+                        self.topic_add(topic, token, sid);
                     }
                 }
                 let mut resume = false;
@@ -913,7 +1060,7 @@ impl Worker {
                         conn.last_active = Instant::now();
                     }
                     if let Some(f) = new_frag { conn.frag = Some(f); }
-                    let sent = conn.queue_bytes(&self.poller, &out_wire);
+                    let sent = conn.queue_bytes(&self.poller, out_wire.as_slice());
                     if !sent || close {
                         conn.close_after_tx = true;
                         if !sent || conn.tx.is_empty() { close_now = true; }
@@ -948,93 +1095,132 @@ impl Worker {
     }
 
     fn process_rx(&mut self, token: u64) {
-        let Some(conn) = self.conns.get_mut(&token) else { return };
-        if conn.close_after_tx || conn.in_flight { return; }
+        loop {
+            let Some(conn) = self.conns.get_mut(&token) else { return };
+            if conn.close_after_tx || conn.in_flight { return; }
 
-        if conn.is_ws {
-            if conn.rx.is_empty() { return; }
-            let (Some(ws_ctx), Some(frag)) = (conn.ws_ctx.clone(), conn.frag.clone()) else {
-                self.close_conn(token);
+            if conn.is_ws {
+                if conn.rx.is_empty() { return; }
+                let (Some(ws_ctx), Some(frag)) = (conn.ws_ctx.clone(), conn.frag.clone()) else {
+                    self.close_conn(token);
+                    return;
+                };
+                let rx_bytes = conn.rx.as_slice().to_vec();
+                let subs = conn.subs.iter().map(|s| (s.sub_id, s.channel.clone(), s.params.clone())).collect();
+                conn.in_flight = true;
+                if !self.pool.try_submit(PoolJob::WsStep {
+                    token,
+                    ws_ctx,
+                    rx_bytes,
+                    frag,
+                    subs,
+                    inbox: self.inbox.clone(),
+                }) {
+                    conn.in_flight = false;
+                    self.close_conn(token);
+                }
                 return;
+            }
+
+            if let Some(pb) = &conn.pending_body {
+                if conn.rx.len() < pb.content_len {
+                    if conn.peer_eof { self.close_conn(token); }
+                    return;
+                }
+                let pb = conn.pending_body.take().unwrap();
+                if pb.inline {
+                    let resp = eval_body(
+                        &self.cbs,
+                        unsafe { pb.req.clone_ptr() },
+                        &conn.rx.as_slice()[..pb.content_len],
+                        &conn.ip,
+                    );
+                    conn.rx.consume(pb.content_len);
+                    match conn.apply_body_outcome(&self.poller, resp, pb.keep_alive) {
+                        ConnStep::Continue => continue,
+                        ConnStep::Done => return,
+                        ConnStep::Close => { self.close_conn(token); return; }
+                    }
+                }
+                let body = conn.rx.as_slice()[..pb.content_len].to_vec();
+                conn.rx.consume(pb.content_len);
+                let ip = conn.ip.clone();
+                conn.in_flight = true;
+                if !self.pool.try_submit(PoolJob::Body {
+                    token,
+                    req: pb.req,
+                    body,
+                    ip,
+                    keep_alive: pb.keep_alive,
+                    inbox: self.inbox.clone(),
+                }) {
+                    conn.in_flight = false;
+                    let sent = conn.queue_bytes(&self.poller, RESP_503_WIRE);
+                    conn.close_after_tx = true;
+                    if !sent || conn.tx.is_empty() { self.close_conn(token); }
+                }
+                return;
+            }
+
+            let slice = conn.rx.as_slice();
+            let (head_end, consume_len) = match slice.windows(4).position(|w| w == b"\r\n\r\n") {
+                Some(pos) => (pos, pos + 4),
+                None if slice.len() > MAX_REQ_HDR_BYTES => (MAX_REQ_HDR_BYTES + 1, slice.len()),
+                None => {
+                    if conn.peer_eof { self.close_conn(token); }
+                    return;
+                }
             };
-            let rx_bytes = conn.rx.as_slice().to_vec();
-            let subs = conn.subs.iter().map(|s| (s.sub_id, s.channel.clone(), s.params.clone())).collect();
-            conn.in_flight = true;
-            if !self.pool.try_submit(PoolJob::WsStep {
-                token,
-                ws_ctx,
-                rx_bytes,
-                frag,
-                subs,
-                inbox: self.inbox.clone(),
-            }) {
-                conn.in_flight = false;
-                self.close_conn(token);
+            let trailing_slice = if consume_len < slice.len() && slice.len() - consume_len <= 65536 {
+                &slice[consume_len..]
+            } else {
+                &[]
+            };
+            // Fast inline execution on the I/O worker for non-blocking endpoints (health, cached
+            // static assets, and pure in-memory RPC/SSR). Blocking disk/network endpoints return
+            // `HeadOutcome::Defer` and offload cleanly to the per-worker `BlockingPool`.
+            match eval_head(&self.cbs, &slice[..head_end], trailing_slice, &conn.ip, true) {
+                HeadOutcome::Defer => {
+                    let head_bytes = slice[..head_end].to_vec();
+                    conn.rx.consume(consume_len);
+                    let trailing = if !conn.rx.is_empty() && conn.rx.len() <= 65536 {
+                        conn.rx.as_slice().to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    let ip = conn.ip.clone();
+                    conn.in_flight = true;
+                    if !self.pool.try_submit(PoolJob::Head {
+                        token,
+                        head_bytes,
+                        trailing,
+                        ip,
+                        inbox: self.inbox.clone(),
+                    }) {
+                        conn.in_flight = false;
+                        let sent = conn.queue_bytes(&self.poller, RESP_503_WIRE);
+                        conn.close_after_tx = true;
+                        if !sent || conn.tx.is_empty() { self.close_conn(token); }
+                    }
+                    return;
+                }
+                outcome => match conn.apply_head_outcome(&self.poller, &self.init_frag, consume_len, outcome) {
+                    ConnStep::Continue => continue,
+                    ConnStep::Done => return,
+                    ConnStep::Close => { self.close_conn(token); return; }
+                },
             }
-            return;
-        }
-
-        if let Some(pb) = &conn.pending_body {
-            if conn.rx.len() < pb.content_len {
-                if conn.peer_eof { self.close_conn(token); }
-                return;
-            }
-            let pb = conn.pending_body.take().unwrap();
-            let body = conn.rx.as_slice()[..pb.content_len].to_vec();
-            conn.rx.consume(pb.content_len);
-            let ip = conn.ip.clone();
-            conn.in_flight = true;
-            if !self.pool.try_submit(PoolJob::Body {
-                token,
-                req: pb.req,
-                body,
-                ip,
-                keep_alive: pb.keep_alive,
-                inbox: self.inbox.clone(),
-            }) {
-                conn.in_flight = false;
-                let sent = conn.queue_bytes(&self.poller, RESP_503_WIRE);
-                conn.close_after_tx = true;
-                if !sent || conn.tx.is_empty() { self.close_conn(token); }
-            }
-            return;
-        }
-
-        let slice = conn.rx.as_slice();
-        let (head_end, consume_len) = match slice.windows(4).position(|w| w == b"\r\n\r\n") {
-            Some(pos) => (pos, pos + 4),
-            None if slice.len() > MAX_REQ_HDR_BYTES => (MAX_REQ_HDR_BYTES + 1, slice.len()),
-            None => {
-                if conn.peer_eof { self.close_conn(token); }
-                return;
-            }
-        };
-        let head_bytes = slice[..head_end].to_vec();
-        conn.rx.consume(consume_len);
-        let ip = conn.ip.clone();
-        conn.in_flight = true;
-        if !self.pool.try_submit(PoolJob::Head {
-            token,
-            head_bytes,
-            ip,
-            inbox: self.inbox.clone(),
-        }) {
-            conn.in_flight = false;
-            let sent = conn.queue_bytes(&self.poller, RESP_503_WIRE);
-            conn.close_after_tx = true;
-            if !sent || conn.tx.is_empty() { self.close_conn(token); }
         }
     }
 
     fn handle_readable(&mut self, token: u64, hangup: bool) {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; 16384];
         let (mut closed, mut got_bytes) = (false, false);
         if let Some(c) = self.conns.get_mut(&token) {
             loop {
                 let n = unsafe { libc::read(c.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
                 if n > 0 {
                     c.rx.extend_from_slice(&buf[..n as usize]);
-                    c.last_active = Instant::now();
                     got_bytes = true;
                     if c.rx.len() >= MAX_RX_BUF_BYTES { closed = true; break; }
                 } else if n == 0 {
@@ -1048,6 +1234,7 @@ impl Worker {
                     break;
                 }
             }
+            if got_bytes { c.last_active = Instant::now(); }
         } else { return; }
         if closed { self.close_conn(token); return; }
         if got_bytes { self.process_rx(token); }
@@ -1123,22 +1310,26 @@ pub unsafe extern "C" fn qed_server_run(
         }
     };
 
+    // Mark long-lived server closures persistent (`m_rc = 0`) so multi-core handler threads
+    // avoid atomic MT refcount cache-line bouncing on every request.
     let cbs = Arc::new(Callbacks {
-        init_frag: LeanRef::new_mt(init_frag),
-        on_head: LeanRef::new_mt(on_head),
-        on_body: LeanRef::new_mt(on_body),
-        on_ws_bytes: LeanRef::new_mt(on_ws_bytes),
-        on_ws_leave: LeanRef::new_mt(on_ws_leave),
+        init_frag: LeanRef::new_persistent(init_frag),
+        on_head: LeanRef::new_persistent(on_head),
+        on_body: LeanRef::new_persistent(on_body),
+        on_ws_bytes: LeanRef::new_persistent(on_ws_bytes),
+        on_ws_leave: LeanRef::new_persistent(on_ws_leave),
     });
     let num_workers = if num_workers_in == 0 {
         thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 16) as u32
     } else { num_workers_in };
 
-    let pool_threads: usize = std::env::var("QED_BLOCKING_THREADS")
+    let default_per_worker: usize = if num_workers <= 2 { 4 } else { 2 };
+    let per_worker_threads: usize = std::env::var("QED_BLOCKING_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.clamp(1, 256))
-        .unwrap_or_else(|| ((num_workers as usize) * 4).clamp(8, 64));
+        .map(|n| n.clamp(1, 256).div_ceil(num_workers as usize).max(1))
+        .unwrap_or(default_per_worker);
+    let pool_threads = per_worker_threads * (num_workers as usize);
 
     #[cfg(target_os = "linux")]
     let use_reuseport = num_workers > 1;
@@ -1154,8 +1345,11 @@ pub unsafe extern "C" fn qed_server_run(
     };
     let port = if port_in == 0 { bound_port(first_fd) } else { port_in };
     let inboxes: Vec<Arc<WorkerInbox>> = (0..num_workers).map(|_| Arc::new(WorkerInbox::new())).collect();
-    *lock_unpoison(&INBOXES) = inboxes.clone();
-    let pool = BlockingPool::new(pool_threads, cbs.clone());
+    *INBOXES.write().unwrap_or_else(|e| e.into_inner()) = inboxes.clone();
+    // Dedicated handler pool per I/O worker eliminates cross-worker `PoolQueue` mutex contention.
+    let pools: Vec<Arc<BlockingPool>> = (0..num_workers)
+        .map(|_| BlockingPool::new(per_worker_threads, cbs.clone()))
+        .collect();
 
     let display_host = match bind_ip {
         IpAddr::V4(v4) => v4.to_string(),
@@ -1167,7 +1361,7 @@ pub unsafe extern "C" fn qed_server_run(
     );
     let _ = io::stdout().flush();
 
-    let run_worker = |lfd: libc::c_int, inbox: Arc<WorkerInbox>, pool_c: Arc<BlockingPool>, init_frag_c: LeanRef| {
+    let run_worker = |lfd: libc::c_int, inbox: Arc<WorkerInbox>, pool_c: Arc<BlockingPool>, cbs_c: Arc<Callbacks>, init_frag_c: LeanRef| {
         let Ok(poller) = Poller::new() else {
             eprintln!("✗ failed to initialize poller");
             unsafe { libc::close(lfd) };
@@ -1180,6 +1374,7 @@ pub unsafe extern "C" fn qed_server_run(
             listen_fd: lfd,
             inbox,
             pool: pool_c,
+            cbs: cbs_c,
             init_frag: init_frag_c,
             next_token: 16,
             conns: HashMap::new(),
@@ -1188,20 +1383,20 @@ pub unsafe extern "C" fn qed_server_run(
     };
 
     let handles: Vec<_> = (1..num_workers).map(|i| {
-        let (inbox, pool_c, init_frag_c) = (inboxes[i as usize].clone(), pool.clone(), cbs.init_frag.clone());
+        let (inbox, pool_c, cbs_c, init_frag_c) = (inboxes[i as usize].clone(), pools[i as usize].clone(), cbs.clone(), cbs.init_frag.clone());
         #[cfg(not(target_os = "linux"))]
         let shared_fd = libc::dup(first_fd);
         thread::spawn(move || {
             unsafe { lean_initialize_thread() };
             #[cfg(target_os = "linux")]
             match create_listener(bind_ip, port, true) {
-                Ok(lfd) => run_worker(lfd, inbox, pool_c, init_frag_c),
+                Ok(lfd) => run_worker(lfd, inbox, pool_c, cbs_c, init_frag_c),
                 Err(e) => eprintln!("✗ worker {i} failed to bind {bind_ip}:{port}: {e}"),
             }
             #[cfg(not(target_os = "linux"))]
             {
                 if shared_fd >= 0 {
-                    run_worker(shared_fd, inbox, pool_c, init_frag_c);
+                    run_worker(shared_fd, inbox, pool_c, cbs_c, init_frag_c);
                 } else {
                     eprintln!("✗ worker {i} failed to dup listener socket");
                 }
@@ -1210,11 +1405,11 @@ pub unsafe extern "C" fn qed_server_run(
         })
     }).collect();
 
-    run_worker(first_fd, inboxes[0].clone(), pool.clone(), cbs.init_frag.clone());
+    run_worker(first_fd, inboxes[0].clone(), pools[0].clone(), cbs.clone(), cbs.init_frag.clone());
     STOP.store(true, Ordering::SeqCst);
-    for inbox in &inboxes { inbox.wake(); }
+    for inbox in &inboxes { inbox.force_wake(); }
     for h in handles { let _ = h.join(); }
-    pool.shutdown();
-    lock_unpoison(&INBOXES).clear();
+    for p in &pools { p.shutdown(); }
+    INBOXES.write().unwrap_or_else(|e| e.into_inner()).clear();
     qed_lean_io_mk_ok(qed_lean_box_u32(0))
 }

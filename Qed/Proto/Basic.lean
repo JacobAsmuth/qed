@@ -202,17 +202,10 @@ def writeFixed64 (buf : ByteArray) (v : UInt64) : ByteArray :=
       (UInt8.ofNat ((n / 281474976710656) % 256))).push
       (UInt8.ofNat ((n / 72057594037927936) % 256))
 
-def writeBytesLoop (src : @& ByteArray) (i : Nat) (buf : ByteArray) : ByteArray :=
-  if h : i < src.size then
-    writeBytesLoop src (i + 1) (buf.push src[i])
-  else
-    buf
-termination_by src.size - i
-
 def writePayload (buf : ByteArray) : WireVal → ByteArray
   | .varint n  => writeVarint buf n
   | .fixed64 v => writeFixed64 buf v
-  | .bytes b   => writeBytesLoop b 0 (writeVarint buf b.size)
+  | .bytes b   => (writeVarint buf b.size) ++ b
   | .fixed32 v => writeFixed32 buf v
 
 def writeField (buf : ByteArray) (fieldNum : Nat) (w : WireVal) : ByteArray :=
@@ -271,13 +264,6 @@ def readFixed64At (buf : @& ByteArray) (pos limit : Nat) : Except String (UInt64
   else
     .error "protobuf: truncated fixed64"
 
-def sliceBytesLoop (buf : @& ByteArray) (pos endPos : Nat) (out : ByteArray) : ByteArray :=
-  if h : pos < endPos ∧ endPos ≤ buf.size then
-    sliceBytesLoop buf (pos + 1) endPos (out.push (buf[pos]'(by omega)))
-  else
-    out
-termination_by endPos - pos
-
 def readPayloadAt (wireType : Nat) (buf : @& ByteArray) (pos limit : Nat) :
     Except String (WireVal × Nat) :=
   match wireType with
@@ -290,7 +276,7 @@ def readPayloadAt (wireType : Nat) (buf : @& ByteArray) (pos limit : Nat) :
   | 2 => do
       let (len, afterLen) ← readVarintAt buf pos limit
       if afterLen + len ≤ limit ∧ limit ≤ buf.size then
-        let chunk := sliceBytesLoop buf afterLen (afterLen + len) (ByteArray.emptyWithCapacity len)
+        let chunk := buf.extract afterLen (afterLen + len)
         .ok (.bytes chunk, afterLen + len)
       else
         .error "protobuf: truncated length-delimited field"
@@ -315,9 +301,30 @@ def readFieldsLoop (fuel : Nat) (buf : @& ByteArray) (pos limit : Nat)
     .ok acc.reverse
   else match fuel with
     | 0 => .error "protobuf: field budget exhausted"
-    | fuel' + 1 => do
-        let (fw, pos') ← readFieldAt buf pos limit
-        readFieldsLoop fuel' buf pos' limit (fw :: acc)
+    | fuel' + 1 =>
+        if h2 : pos + 1 < limit ∧ limit ≤ buf.size then
+          let tagB := buf[pos]'(by omega)
+          let b1 := buf[pos + 1]'(by omega)
+          if tagB.toNat < 128 && b1.toNat < 128 then
+            let tag := tagB.toNat
+            let fn := tag / 8
+            let wt := tag % 8
+            if fn != 0 && wt == 0 then
+              readFieldsLoop fuel' buf (pos + 2) limit ((fn, .varint b1.toNat) :: acc)
+            else if fn != 0 && wt == 2 then
+              let endPos := pos + 2 + b1.toNat
+              if endPos ≤ limit then
+                readFieldsLoop fuel' buf endPos limit ((fn, .bytes (buf.extract (pos + 2) endPos)) :: acc)
+              else .error "protobuf: truncated length-delimited field"
+            else match readFieldAt buf pos limit with
+              | .error e => .error e
+              | .ok (fw, pos') => readFieldsLoop fuel' buf pos' limit (fw :: acc)
+          else match readFieldAt buf pos limit with
+            | .error e => .error e
+            | .ok (fw, pos') => readFieldsLoop fuel' buf pos' limit (fw :: acc)
+        else match readFieldAt buf pos limit with
+          | .error e => .error e
+          | .ok (fw, pos') => readFieldsLoop fuel' buf pos' limit (fw :: acc)
 
 def decodeFieldsFast (buf : ByteArray) : Except String (List (Nat × WireVal)) :=
   readFieldsLoop buf.size buf 0 buf.size []

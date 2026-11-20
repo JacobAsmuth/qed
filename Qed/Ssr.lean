@@ -30,7 +30,8 @@ def Html.renderWith (locals : List LocalDef) (h : Html msg) (fuel : Nat := 64) :
   renderWithLocals locals fuel h
 
 def App.renderModel (app : App Model Msg) (m : Model) : String :=
-  Html.renderWith app.locals (app.view m)
+  if app.locals.isEmpty then Html.render (app.view m)
+  else Html.renderWith app.locals (app.view m)
 
 def App.renderInitial (app : App Model Msg) : String :=
   app.renderModel app.init.1
@@ -180,6 +181,62 @@ def App.ssrBootM {Model Msg : Type} {m : Type → Type} [Monad m]
     (fuel : Nat := 32) (sessionUser : Option String := none) : m Model :=
   let (m1, queue) := app.ssrInitQueue path sessionUser
   ssrDrainQueueM app dispatchBytes dispatchText fuel m1 queue
+
+/-- Pre-rendered static SSR HTML5 shell computed once at server startup so per-request SSR
+    only interpolates `appHtml` and `state` into a single pre-sized UTF-8 `ByteArray`. -/
+structure PrebuiltDocShell where
+  css              : String
+  headWithCssBytes : ByteArray
+  headNoCssBytes   : ByteArray
+  afterAppBytes    : ByteArray
+  afterStateBytes  : ByteArray
+  noStateTailBytes : ByteArray
+
+def mkPrebuiltDocShell (title : String) (script : String := "/qed_host.mjs")
+    (css : String := "") (stylesheets : List String := []) : PrebuiltDocShell :=
+  let linkTags := renderStylesheetLinks stylesheets
+  let baseHead :=
+    "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
+      ++ "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+      ++ "<title>" ++ escapeHtml title ++ "</title>" ++ linkTags
+  let styleTag := if css.isEmpty then "" else "<style id=\"qed-styles\">" ++ escapeRawText css ++ "</style>"
+  let scriptTag := "<script type=\"module\" src=\"" ++ safeScriptSrc script ++ "\"></script>\n</body>\n</html>"
+  { css
+    headWithCssBytes := (baseHead ++ styleTag ++ "</head>\n<body><div id=\"app\">").toUTF8
+    headNoCssBytes   := (baseHead ++ "</head>\n<body><div id=\"app\">").toUTF8
+    afterAppBytes    := "</div>\n<script id=\"qed-state\" type=\"application/json\">".toUTF8
+    afterStateBytes  := ("</script>\n" ++ scriptTag).toUTF8
+    noStateTailBytes := ("</div>\n" ++ scriptTag).toUTF8 }
+
+@[inline] private def appendSlice (dst src : ByteArray) : ByteArray :=
+  src.copySlice 0 dst dst.size src.size false
+
+def PrebuiltDocShell.renderBytes (sh : PrebuiltDocShell) (appHtml state : String) : ByteArray :=
+  let headB := if sh.css.isEmpty || appHtml.contains sh.css then sh.headNoCssBytes else sh.headWithCssBytes
+  let appB := appHtml.toUTF8
+  if state.isEmpty then
+    let out := ByteArray.emptyWithCapacity (headB.size + appB.size + sh.noStateTailBytes.size)
+    let out := appendSlice out headB
+    let out := appendSlice out appB
+    appendSlice out sh.noStateTailBytes
+  else
+    let cap := headB.size + appB.size + sh.afterAppBytes.size + state.utf8ByteSize + sh.afterStateBytes.size + 16
+    let out := ByteArray.emptyWithCapacity cap
+    let out := appendSlice out headB
+    let out := appendSlice out appB
+    let out := appendSlice out sh.afterAppBytes
+    let out := escapeRawTextBytesInto out state
+    appendSlice out sh.afterStateBytes
+
+@[specialize]
+def App.ssrRenderNativeBytesWithShell {Model Msg : Type} {m : Type → Type} [Monad m]
+    (app : App Model Msg) (sh : PrebuiltDocShell) (path : String)
+    (dispatchBytes : String → String → ByteArray → m (Except String ByteArray))
+    (dispatchText  : String → String → String → m (Except String String) :=
+      fun _ _ _ => pure (.error "no external JSON handler registered for SSR"))
+    (fuel : Nat := 32) (sessionUser : Option String := none) : m ByteArray := do
+  let mdl ← app.ssrBootM path dispatchBytes dispatchText fuel sessionUser
+  return sh.renderBytes (app.renderModel mdl) (app.dehydrate mdl)
 
 @[specialize]
 def App.ssrRenderNativeBytes {Model Msg : Type} {m : Type → Type} [Monad m]

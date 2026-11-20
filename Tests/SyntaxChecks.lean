@@ -555,7 +555,7 @@ component FineGrainedCheck:
     </div>
 
 #guard match FineGrainedCheck.app.template with
-  | .element "div" _ [.element "span" _ [.dyn _], .ifElse _ _ _, .memo _, .keyedList "ul" _ _ _ _ _] => true
+  | .element "div" _ [.element "span" _ [.dyn _], .ifElse _ _ _, .memo _, .keyedList "ul" _ _ _ _ _ _ (some _)] => true
   | _ => false
 
 /-- error: Invariant `BadUnguardedDecrease.inRange` failed in `BadUnguardedDecrease.update`:

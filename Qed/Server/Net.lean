@@ -4,19 +4,108 @@ namespace Qed.Server.Net
 
 /-! ## Shared Byte, ASCII & HTTP/1.1 Framing Primitives -/
 
-private def trimBy (p : Char → Bool) (s : String) : String :=
-  String.ofList (((s.toList.dropWhile p).reverse.dropWhile p).reverse)
+@[inline] private def isOwsByte (b : UInt8) : Bool := b == 32 || b == 9
+@[inline] private def isAsciiWsByte (b : UInt8) : Bool := b == 32 || b == 9 || b == 10 || b == 13
 
-def trimWs (s : String) : String := trimBy Char.isWhitespace s
+@[inline] private def trimRangeBytes (p : UInt8 → Bool) (s : String) (lo0 hi0 : Nat) : Nat × Nat :=
+  let hiCap := min hi0 s.utf8ByteSize
+  let rec scanLo (i : Nat) : Nat :=
+    if h : i < hiCap then
+      if p (s.getUTF8Byte ⟨i⟩ (Nat.lt_of_lt_of_le h (Nat.min_le_right _ _))) then scanLo (i + 1) else i
+    else i
+  termination_by min hi0 s.utf8ByteSize - i
+  let lo := scanLo lo0
+  let rec scanHi (j : Nat) (hj : j ≤ s.utf8ByteSize) : Nat :=
+    if h : lo < j then
+      if p (s.getUTF8Byte ⟨j - 1⟩ (show j - 1 < s.utf8ByteSize by omega)) then scanHi (j - 1) (by omega) else j
+    else j
+  termination_by j
+  (lo, scanHi hiCap (Nat.min_le_right _ _))
 
-def trimOws (s : String) : String := trimBy (fun c => c == ' ' || c == '\t') s
+def trimWs (s : String) : String :=
+  let (lo, hi) := trimRangeBytes isAsciiWsByte s 0 s.utf8ByteSize
+  if lo == 0 && hi == s.utf8ByteSize then s
+  else String.Pos.Raw.extract s ⟨lo⟩ ⟨hi⟩
+
+def trimOws (s : String) : String :=
+  let (lo, hi) := trimRangeBytes isOwsByte s 0 s.utf8ByteSize
+  if lo == 0 && hi == s.utf8ByteSize then s
+  else String.Pos.Raw.extract s ⟨lo⟩ ⟨hi⟩
 
 def stripTrailingSlashes (s : String) : String :=
-  String.ofList ((s.toList.reverse.dropWhile (· == '/')).reverse)
+  let rec scanHi (j : Nat) (hj : j ≤ s.utf8ByteSize) : Nat :=
+    if h : 0 < j then
+      if s.getUTF8Byte ⟨j - 1⟩ (show j - 1 < s.utf8ByteSize by omega) == 47 then scanHi (j - 1) (by omega) else j
+    else 0
+  termination_by j
+  let hi := scanHi s.utf8ByteSize (Nat.le_refl _)
+  if hi == s.utf8ByteSize then s else String.Pos.Raw.extract s ⟨0⟩ ⟨hi⟩
+
+@[inline] def asciiLowerByte (b : UInt8) : UInt8 :=
+  if b >= 65 && b <= 90 then b + 32 else b
+
+/-- Zero-allocation ASCII case-insensitive byte-range equality (`a[aLo..aHi]` vs `b[bLo..bHi]`). -/
+@[inline] def eqCIRange (a : String) (aLo aHi : Nat) (b : String) (bLo bHi : Nat) : Bool :=
+  let len := aHi - aLo
+  if aLo > aHi || bLo > bHi || len != bHi - bLo then false
+  else
+    let rec go (k : Nat) : Bool :=
+      if hk : k < len then
+        if ha : aLo + k < a.utf8ByteSize then
+          if hb : bLo + k < b.utf8ByteSize then
+            if asciiLowerByte (a.getUTF8Byte ⟨aLo + k⟩ ha) == asciiLowerByte (b.getUTF8Byte ⟨bLo + k⟩ hb) then
+              go (k + 1)
+            else false
+          else false
+        else false
+      else true
+    termination_by len - k
+    go 0
+
+/-- Zero-allocation ASCII case-insensitive string equality. -/
+@[inline] def eqCI (a b : String) : Bool :=
+  a.utf8ByteSize == b.utf8ByteSize && eqCIRange a 0 a.utf8ByteSize b 0 b.utf8ByteSize
+
+/-- Zero-allocation ASCII case-insensitive prefix test. -/
+@[inline] def startsWithCI (s pfx : String) : Bool :=
+  s.utf8ByteSize ≥ pfx.utf8ByteSize && eqCIRange s 0 pfx.utf8ByteSize pfx 0 pfx.utf8ByteSize
+
+/-- Zero-allocation first index of byte `target` in `s[start..hi)`. -/
+@[inline] def findByteInRange (s : String) (start hi : Nat) (target : UInt8) : Option Nat :=
+  let rec go (i : Nat) : Option Nat :=
+    if h : i < hi then
+      if hs : i < s.utf8ByteSize then
+        if s.getUTF8Byte ⟨i⟩ hs == target then some i else go (i + 1)
+      else none
+    else none
+  termination_by hi - i
+  go start
+
+@[inline] def findByte (s : String) (start : Nat) (target : UInt8) : Option Nat :=
+  findByteInRange s start s.utf8ByteSize target
+
+/-- Zero-allocation check whether byte `target` occurs in `s[lo..hi)`. -/
+@[inline] def hasByteInRange (s : String) (lo hi : Nat) (target : UInt8) : Bool :=
+  (findByteInRange s lo hi target).isSome
 
 def containsCI (haystack needle : String) : Bool :=
-  let n := needle.toLower
-  !n.isEmpty && (haystack.toLower.splitOn n).length > 1
+  if needle.utf8ByteSize == 0 || haystack.utf8ByteSize < needle.utf8ByteSize then false
+  else
+    let rec matchAt (base j : Nat) : Bool :=
+      if hj : j < needle.utf8ByteSize then
+        if hb : base + j < haystack.utf8ByteSize then
+          if asciiLowerByte (haystack.getUTF8Byte ⟨base + j⟩ hb) == asciiLowerByte (needle.getUTF8Byte ⟨j⟩ hj) then
+            matchAt base (j + 1)
+          else false
+        else false
+      else true
+    termination_by needle.utf8ByteSize - j
+    let rec go (i : Nat) : Bool :=
+      if h : i + needle.utf8ByteSize ≤ haystack.utf8ByteSize ∧ i < haystack.utf8ByteSize then
+        if matchAt i 0 then true else go (i + 1)
+      else false
+    termination_by haystack.utf8ByteSize - i
+    go 0
 
 def byteArrayContains (ba : ByteArray) (target : UInt8) : Bool :=
   let rec go (i : Nat) : Bool :=
@@ -43,30 +132,52 @@ def findCrlfCrlf (ba : ByteArray) (start : Nat := 0) : Option Nat :=
   termination_by ba.size - i
   go start
 
+private def hasCtlOrCrlfLoop (s : String) (allowTab : Bool) (i : Nat) : Nat → Bool
+  | 0 => false
+  | fuel + 1 =>
+      if h : i < s.utf8ByteSize then
+        let b := s.getUTF8Byte ⟨i⟩ h
+        if b == 13 || b == 10 || b == 127 || (b < 32 && !(allowTab && b == 9)) then true
+        else hasCtlOrCrlfLoop s allowTab (i + 1) fuel
+      else false
+
 def hasCtlOrCrlf (s : String) (allowTab : Bool) : Bool :=
-  s.toList.any fun c =>
-    let n := c.toNat
-    n == 13 || n == 10 || n == 127 || (n < 32 && !(allowTab && n == 9))
+  hasCtlOrCrlfLoop s allowTab 0 s.utf8ByteSize
+
+@[inline] private def isTokenByte (b : UInt8) : Bool :=
+  b > 32 && b < 127 &&
+  b != 40 && b != 41 && b != 60 && b != 62 && b != 64 &&
+  b != 44 && b != 59 && b != 58 && b != 92 && b != 34 &&
+  b != 47 && b != 91 && b != 93 && b != 63 && b != 61 &&
+  b != 123 && b != 125
 
 def isValidHttpToken (s : String) : Bool :=
-  let cs := s.toList
-  !cs.isEmpty && cs.all fun c =>
-    let n := c.toNat
-    n > 32 && n < 127 && !("()<>@,;:\\\"/[]?={}".contains c)
-
-def parseStrictU64 (s : String) (maxVal : Nat) : Option Nat :=
-  let cs := (trimOws s).toList
-  if cs.isEmpty then none
+  if s.utf8ByteSize == 0 then false
   else
-    let rec go (acc : Nat) : List Char → Option Nat
-      | [] => some acc
-      | c :: rest =>
-          if '0' ≤ c && c ≤ '9' then
-            let d := c.toNat - '0'.toNat
+    let rec go (i : Nat) : Bool :=
+      if h : i < s.utf8ByteSize then
+        if isTokenByte (s.getUTF8Byte ⟨i⟩ h) then go (i + 1) else false
+      else true
+    termination_by s.utf8ByteSize - i
+    go 0
+
+def parseStrictU64 (s : String) (maxVal : UInt64) : Option Nat :=
+  let (lo, hi) := trimRangeBytes isOwsByte s 0 s.utf8ByteSize
+  if lo >= hi then none
+  else
+    let rec go (i : Nat) (acc : UInt64) : Option Nat :=
+      if h : i < hi then
+        if hb : i < s.utf8ByteSize then
+          let b := s.getUTF8Byte ⟨i⟩ hb
+          if b >= 48 && b <= 57 then
+            let d : UInt64 := (b - 48).toUInt64
             if acc > (maxVal - d) / 10 then none
-            else go (acc * 10 + d) rest
+            else go (i + 1) (acc * 10 + d)
           else none
-    go 0 cs
+        else none
+      else some acc.toNat
+    termination_by hi - i
+    go lo 0
 
 def parseHexSize (s : String) (maxVal : Nat := 268435456) : Option Nat :=
   let raw := match s.splitOn ";" with | h :: _ => h | [] => ""
@@ -88,42 +199,97 @@ def parseHexSize (s : String) (maxVal : Nat := 268435456) : Option Nat :=
               else go (acc * 16 + d) rest
     go 0 cs
 
-/-- Splits an HTTP header block (bytes before `\r\n\r\n`) into strict CRLF-delimited lines,
-    rejecting NUL bytes, bare CR, bare LF, and invalid UTF-8. -/
-def splitCrlfLines (ba : ByteArray) : Except String (Array String) :=
-  if byteArrayContains ba 0 then
-    .error "invalid NUL byte in headers"
+private def splitCrlfLinesGo (s : String) (i lineStart : Nat) (acc : Array String) :
+    Except String (Array String) :=
+  if h : i < s.utf8ByteSize then
+    let b := s.getUTF8Byte ⟨i⟩ h
+    if b == 0 then
+      .error "invalid NUL byte in headers"
+    else if b == 10 then
+      .error "bare LF in headers"
+    else if b == 13 then
+      if h2 : i + 1 < s.utf8ByteSize then
+        if s.getUTF8Byte ⟨i + 1⟩ h2 == 10 then
+          splitCrlfLinesGo s (i + 2) (i + 2) (acc.push (String.Pos.Raw.extract s ⟨lineStart⟩ ⟨i⟩))
+        else .error "bare CR in headers"
+      else .error "bare CR in headers"
+    else
+      splitCrlfLinesGo s (i + 1) lineStart acc
   else
-    let rec go (i lineStart : Nat) (acc : Array String) : Except String (Array String) :=
-      if h : i < ba.size then
-        let b := ba[i]
-        if b == 10 then
-          .error "bare LF in headers"
-        else if b == 13 then
-          if h2 : i + 1 < ba.size then
-            if ba[i + 1] == 10 then
-              match String.fromUTF8? (ba.extract lineStart i) with
-              | some line => go (i + 2) (i + 2) (acc.push line)
-              | none      => .error "invalid UTF-8 in headers"
-            else .error "bare CR in headers"
-          else .error "bare CR in headers"
-        else
-          go (i + 1) lineStart acc
-      else
-        if lineStart < ba.size then
-          match String.fromUTF8? (ba.extract lineStart ba.size) with
-          | some line => .ok (acc.push line)
-          | none      => .error "invalid UTF-8 in headers"
-        else .ok acc
-    termination_by ba.size - i
-    go 0 0 #[]
+    if lineStart < s.utf8ByteSize then
+      .ok (acc.push (String.Pos.Raw.extract s ⟨lineStart⟩ ⟨s.utf8ByteSize⟩))
+    else .ok acc
+termination_by s.utf8ByteSize - i
+
+/-- Splits an HTTP header block (bytes before `\r\n\r\n`) into strict CRLF-delimited lines,
+    rejecting NUL bytes, bare CR, bare LF, and invalid UTF-8 in a single UTF-8 validation pass. -/
+def splitCrlfLines (ba : ByteArray) : Except String (Array String) :=
+  match String.fromUTF8? ba with
+  | none => .error "invalid UTF-8 in headers"
+  | some s => splitCrlfLinesGo s 0 0 (Array.mkEmpty 12)
+
+private theorem byteArrayContains_go_eq (ba : ByteArray) (target : UInt8) (i : Nat) :
+    byteArrayContains.go ba target i = true → ∃ k, i ≤ k ∧ ∃ (hk : k < ba.size), ba[k]'hk = target := by
+  fun_induction byteArrayContains.go ba target i with
+  | case1 i h hhit => intro _; exact ⟨i, Nat.le_refl _, h, beq_iff_eq.1 hhit⟩
+  | case2 i h _ ih =>
+      intro ht
+      rcases ih ht with ⟨k, hle, hk, heq⟩
+      exact ⟨k, by omega, hk, heq⟩
+  | case3 i _ => intro h; cases h
+
+private theorem splitCrlfLinesGo_rejects_nul (s : String) (i lineStart : Nat) (acc : Array String)
+    (k : Nat) (hle : i ≤ k) (hk : k < s.utf8ByteSize) (hz : s.getUTF8Byte ⟨k⟩ hk = 0) :
+    ∃ e, splitCrlfLinesGo s i lineStart acc = .error e := by
+  fun_induction splitCrlfLinesGo s i lineStart acc with
+  | case1 i lineStart acc h b hb0 => exact ⟨_, rfl⟩
+  | case2 i lineStart acc h b _ hb10 => exact ⟨_, rfl⟩
+  | case3 i lineStart acc h b hb0 hb10 hb13 h2 hb10' ih =>
+      have hne0 : k ≠ i := by
+        intro heq; subst heq
+        have : s.getUTF8Byte ⟨k⟩ h = 0 := hz
+        exact hb0 (by simp [b, this])
+      have hne1 : k ≠ i + 1 := by
+        intro heq; subst heq
+        have h10 : s.getUTF8Byte ⟨i + 1⟩ h2 = 10 := beq_iff_eq.1 hb10'
+        have : (10 : UInt8) = 0 := h10.symm.trans hz
+        exact absurd this (by decide)
+      exact ih (by omega)
+  | case4 i lineStart acc h b _ _ _ _ _ => exact ⟨_, rfl⟩
+  | case5 i lineStart acc h b _ _ _ _ => exact ⟨_, rfl⟩
+  | case6 i lineStart acc h b hb0 _ _ ih =>
+      have hne0 : k ≠ i := by
+        intro heq; subst heq
+        exact hb0 (by simp [b, hz])
+      exact ih (by omega)
+  | case7 i lineStart acc hge _ => exact absurd (Nat.lt_of_le_of_lt hle hk) hge
+  | case8 i lineStart acc hge _ => exact absurd (Nat.lt_of_le_of_lt hle hk) hge
+
+theorem splitCrlfLines_rejects_nul (ba : ByteArray) (hnul : byteArrayContains ba 0 = true) :
+    ∃ e, splitCrlfLines ba = .error e := by
+  unfold splitCrlfLines
+  cases hf : String.fromUTF8? ba with
+  | none => exact ⟨_, rfl⟩
+  | some s =>
+      have hba : s.toByteArray = ba := by
+        unfold String.fromUTF8? at hf
+        split at hf
+        · cases hf; rfl
+        · cases hf
+      rcases byteArrayContains_go_eq ba 0 0 hnul with ⟨k, _, hk, hz⟩
+      have hk' : k < s.utf8ByteSize := by rw [← String.size_toByteArray, hba]; exact hk
+      have hz' : s.getUTF8Byte ⟨k⟩ hk' = 0 := by
+        change s.toByteArray[k] = 0
+        subst hba; exact hz
+      exact splitCrlfLinesGo_rejects_nul s 0 0 _ k (Nat.zero_le _) hk' hz'
 
 def splitHeaderKv (line : String) : Option (String × String) :=
-  match line.splitOn ":" with
-  | [] | [_] => none
-  | k :: rest =>
-      let v := String.intercalate ":" rest
-      some (k, trimOws v)
+  match findByte line 0 58 with
+  | none => none
+  | some cIdx =>
+      let k := String.Pos.Raw.extract line ⟨0⟩ ⟨cIdx⟩
+      let (lo, hi) := trimRangeBytes isOwsByte line (cIdx + 1) line.utf8ByteSize
+      some (k, String.Pos.Raw.extract line ⟨lo⟩ ⟨hi⟩)
 
 /-! ## Formally Verified SSRF IP CIDR Policy (`isBlockedIpBytes`) -/
 

@@ -494,12 +494,11 @@ theorem CleanDomSubtree_not_fragment {msg : Type} {f : Nat} {ns : String} {h : H
 
 theorem DomArena.set_get_self {msg : Type} (a : DomArena msg) {n : Dom.Node} {e : ArenaEntry msg}
     (h : a.get n = e) : a.set n e = a := by
-  ext m
-  · rfl
-  · by_cases hm : m = n
-    · subst hm; simp [DomArena.set, ← h, DomArena.get]
-    · simp [DomArena.set, hm]
-  · rfl
+  refine DomArena.ext rfl ?_ rfl rfl rfl rfl
+  funext m
+  by_cases hm : m = n
+  · subst hm; simp [DomArena.set, ← h, DomArena.get]
+  · simp [DomArena.set, hm]
 
 private theorem appendChild_nextId {msg : Type} (p c : Dom.Node) (a : DomArena msg) :
     ((MonadDom.appendChild (m := StateM (DomArena msg)) p c).run a).2.nextId = a.nextId := by
@@ -512,7 +511,7 @@ mutual
     | .element tag attrs cs, a => by
         let node := UInt32.ofNat a.nextId
         let realNs := if ns == "" && tag == "svg" then Dom.svgNs else ns
-        let a1 : DomArena msg := { nextId := a.nextId + 1, store := a.store, signals := a.signals }
+        let a1 : DomArena msg := { a with nextId := a.nextId + 1 }
         have hnx := applyAttrsM_nextId a1 node attrs (.element realNs tag {} [] [])
         dsimp only [StateT.run] at hnx
         dsimp only [buildDomM, MonadDom.createElement, DomArena.alloc, StateT.run, bind, StateT.bind, pure, StateT.pure]
@@ -574,7 +573,7 @@ mutual
             have hnodeNat : node.toNat = a.nextId := uint32_toNat_ofNat_lt _ (by omega)
             let realNs := if ns == "" && tag == "svg" then Dom.svgNs else ns
             let st := evalSpecAttrs attrs; let mg := (normalizeAttrs attrs).filterMap managedAttrName
-            let a1 : DomArena msg := { nextId := a.nextId + 1, store := a.store, signals := a.signals }
+            let a1 : DomArena msg := { a with nextId := a.nextId + 1 }
             have ha1Next : a1.nextId = a.nextId + 1 := rfl
             let aElem := a1.set node (.element realNs tag st mg [])
             have haElemNext : aElem.nextId = a.nextId + 1 := rfl

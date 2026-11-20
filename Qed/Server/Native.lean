@@ -27,16 +27,22 @@ def isOriginMatchingHost (origin host : String) : Bool :=
   if h.isEmpty then false
   else
     let o := trimWs origin
-    let oLow := o.toLower
-    let afterScheme? : Option String :=
-      if oLow.startsWith "http://" then some (String.ofList (o.toList.drop 7))
-      else if oLow.startsWith "https://" then some (String.ofList (o.toList.drop 8))
-      else none
-    match afterScheme? with
-    | none => false
-    | some rest =>
-        let auth := stripTrailingSlashes rest
-        !auth.isEmpty && !auth.contains '/' && auth.toLower == h.toLower
+    let authStart : Nat :=
+      if startsWithCI o "http://" then 7
+      else if startsWithCI o "https://" then 8
+      else 0
+    if authStart == 0 then false
+    else
+      let rec scanEnd (j : Nat) (hj : j ≤ o.utf8ByteSize) : Nat :=
+        if _ : authStart < j then
+          if o.getUTF8Byte ⟨j - 1⟩ (show j - 1 < o.utf8ByteSize by omega) == 47 then
+            scanEnd (j - 1) (by omega)
+          else j
+        else authStart
+      termination_by j
+      let authEnd := scanEnd o.utf8ByteSize (Nat.le_refl _)
+      authStart < authEnd && !hasByteInRange o authStart authEnd 47 &&
+        eqCIRange o authStart authEnd h 0 h.utf8ByteSize
 
 /-- True iff `origin` matches `*` or an entry in the comma-separated allowlist `allowed`. -/
 def isOriginExplicitlyAllowed (allowed origin : String) : Bool :=
@@ -47,33 +53,37 @@ def isOriginExplicitlyAllowed (allowed origin : String) : Bool :=
     let o := (trimWs origin).toLower
     !o.isEmpty && (a.splitOn ",").any fun entry => (trimWs entry).toLower == o
 
-private def checkOriginAndFetchSite (headers : List (String × String))
-    (allowedOrigins? : Option String) (allowEmptyOrigin : Bool) (label : String) :
+private def checkOriginAndFetchSiteParsed (origin? host? secFetchSite? : Option String)
+    (dupAny : Bool) (allowedOrigins? : Option String) (allowEmptyOrigin : Bool) (label : String) :
     Except (Nat × String) Unit := do
-  let origins := headers.filterMap fun (k, v) => if k.toLower == "origin" then some v else none
-  let hosts   := headers.filterMap fun (k, v) => if k.toLower == "host" then some v else none
-  let sfsList := headers.filterMap fun (k, v) => if k.toLower == "sec-fetch-site" then some v else none
-  if origins.length > 1 || hosts.length > 1 || sfsList.length > 1 then
+  if dupAny then
     throw (400, "duplicate origin or fetch-metadata header")
-  let allowed? := allowedOrigins?.bind fun s => let t := trimWs s; if t.isEmpty then none else some t
-  let originExplicitOk := match origins, allowed? with
-    | [orig], some allow => isOriginExplicitlyAllowed allow orig
-    | _, _               => false
-  match origins with
-  | [orig] =>
+  if origin?.isSome || secFetchSite?.isSome then
+    let allowed? := allowedOrigins?.bind fun s => let t := trimWs s; if t.isEmpty then none else some t
+    let originExplicitOk := match origin?, allowed? with
+      | some orig, some allow => isOriginExplicitlyAllowed allow orig
+      | _, _                  => false
+    if let some orig := origin? then
       let origTrim := trimWs orig
       if !(allowEmptyOrigin && origTrim.isEmpty) then
         let ok := match allowed? with
           | some allow => isOriginExplicitlyAllowed allow origTrim
-          | none       => match hosts with | [h] => isOriginMatchingHost origTrim h | _ => false
+          | none       => match host? with | some h => isOriginMatchingHost origTrim h | none => false
         if !ok then throw (403, s!"cross-origin {label} rejected")
-  | _ => pure ()
-  match sfsList with
-  | [sfs] =>
-      let s := (trimWs sfs).toLower
-      if s != "same-origin" && s != "none" && !originExplicitOk then
+    if let some sfs := secFetchSite? then
+      let s := trimWs sfs
+      if !eqCI s "same-origin" && !eqCI s "none" && !originExplicitOk then
         throw (403, s!"cross-site {label} rejected")
-  | _ => pure ()
+
+private def checkOriginAndFetchSite (headers : List (String × String))
+    (allowedOrigins? : Option String) (allowEmptyOrigin : Bool) (label : String) :
+    Except (Nat × String) Unit :=
+  let origins := headers.filterMap fun (k, v) => if eqCI k "origin" then some v else none
+  let hosts   := headers.filterMap fun (k, v) => if eqCI k "host" then some v else none
+  let sfsList := headers.filterMap fun (k, v) => if eqCI k "sec-fetch-site" then some v else none
+  checkOriginAndFetchSiteParsed origins.head? hosts.head? sfsList.head?
+    (origins.length > 1 || hosts.length > 1 || sfsList.length > 1)
+    allowedOrigins? allowEmptyOrigin label
 
 /-- CSRF defense-in-depth for `POST /_qed/rpc/...`:
     1. Rejects duplicate `Origin`, `Host`, or `Sec-Fetch-Site` headers (400).
@@ -133,51 +143,59 @@ private def readUntilEof (handle : UInt64) (buf : ByteArray) : IO (Except String
     (fun b => if b.size > maxRespBodyBytes then .error "HTTP response body too large" else .ok none)
     .ok buf 65536
 
-private def readCrlfLine (handle : UInt64) (buf : ByteArray) : IO (Except String (String × ByteArray)) :=
+private def compactRx (buf : ByteArray) (off : Nat) : ByteArray × Nat :=
+  if off >= buf.size then (ByteArray.empty, 0)
+  else if off >= 65536 then (buf.extract off buf.size, 0)
+  else (buf, off)
+
+private def readCrlfLineAt (handle : UInt64) (buf : ByteArray) (off : Nat) :
+    IO (Except String (String × ByteArray × Nat)) :=
   readLoop handle 4096
     (fun b =>
-      if let some pos := findCrlf b 0 then
-        match String.fromUTF8? (b.extract 0 pos) with
-        | some line => .ok (some (line, b.extract (pos + 2) b.size))
+      if let some pos := findCrlf b off then
+        match String.fromUTF8? (b.extract off pos) with
+        | some line => .ok (some (line, b, pos + 2))
         | none      => .error "invalid UTF-8 in chunked framing"
-      else if b.size > 4096 then .error "chunked header line too long"
+      else if b.size - off > 4096 then .error "chunked header line too long"
       else .ok none)
     (fun _ => .error "unexpected EOF in chunked framing")
     buf 256
 
-private def drainChunkTrailers (handle : UInt64) (rx : ByteArray) :
+private def drainChunkTrailers (handle : UInt64) (rx : ByteArray) (off : Nat) :
     Nat → IO (Except String Bool)
   | 0 => return .error "too many chunked trailers"
   | fuel + 1 => do
-      match ← readCrlfLine handle rx with
+      match ← readCrlfLineAt handle rx off with
       | .error e => return .error e
-      | .ok (line, rest) =>
-          if line.isEmpty then return .ok rest.isEmpty
-          else drainChunkTrailers handle rest fuel
+      | .ok (line, rx1, off1) =>
+          if line.isEmpty then return .ok (off1 >= rx1.size)
+          else drainChunkTrailers handle rx1 off1 fuel
 
-private def readChunkedBody (handle : UInt64) (rx out : ByteArray) :
+private def readChunkedBody (handle : UInt64) (rx : ByteArray) (off : Nat) (out : ByteArray) :
     Nat → IO (Except String (ByteArray × Bool))
   | 0 => return .error "chunked response exceeded max chunks"
   | fuel + 1 => do
-      match ← readCrlfLine handle rx with
+      let (rx0, off0) := compactRx rx off
+      match ← readCrlfLineAt handle rx0 off0 with
       | .error e => return .error e
-      | .ok (szLine, afterLine) =>
+      | .ok (szLine, rx1, off1) =>
           let some sz := parseHexSize szLine maxRespBodyBytes
             | return .error "invalid chunk size"
           if sz == 0 then
-            match ← drainChunkTrailers handle afterLine 256 with
+            match ← drainChunkTrailers handle rx1 off1 256 with
             | .error e  => return .error e
             | .ok clean => return .ok (out, clean)
           else if out.size + sz > maxRespBodyBytes then
             return .error "chunked HTTP response body too large"
           else
-            match ← readAtLeast handle afterLine (sz + 2) with
+            match ← readAtLeast handle rx1 (off1 + sz + 2) with
             | .error e => return .error e
             | .ok full =>
-                if h : sz + 1 < full.size then
-                  if full[sz]'(by omega) != 13 || full[sz + 1] != 10 then
+                if h : off1 + sz + 1 < full.size then
+                  if full[off1 + sz]'(by omega) != 13 || full[off1 + sz + 1] != 10 then
                     return .error "missing CRLF after chunk data"
-                  readChunkedBody handle (full.extract (sz + 2) full.size) (out ++ full.extract 0 sz) fuel
+                  let out' := full.copySlice off1 out out.size sz
+                  readChunkedBody handle full (off1 + sz + 2) out' fuel
                 else
                   return .error "truncated chunk data"
 
@@ -216,7 +234,7 @@ private def execHttpAttempt (method : String) (u : ParsedUrl) (wireReq : ByteArr
                     if method == "HEAD" || head.status == 204 || head.status == 304 then
                       pure (Except.ok (ByteArray.empty, baseReuse && initBody.isEmpty))
                     else if head.isChunked then
-                      (·.map fun (b, clean) => (b, baseReuse && clean)) <$> readChunkedBody handle initBody ByteArray.empty 65536
+                      (·.map fun (b, clean) => (b, baseReuse && clean)) <$> readChunkedBody handle initBody 0 ByteArray.empty 65536
                     else if let some cl := head.contentLen then
                       if cl > maxRespBodyBytes then pure (Except.error "Content-Length too large")
                       else (·.map fun full => (full.extract 0 cl, baseReuse && full.size == cl)) <$> readAtLeast handle initBody cl
@@ -433,19 +451,23 @@ private def extractBearer (authHdr : String) : Option String :=
     if tok.isEmpty then none else some tok
   else none
 
+private def resolveUserId (cfg : ServerConfig) (bearer? : Option String)
+    (cookies : List (String × String)) : IO (Option String) := do
+  if cfg.authSecrets.isEmpty then return none
+  let sessionCookie? := if cookies.isEmpty then none else (cookies.find? fun (k, _) => k == "qed_session").map Prod.snd
+  match bearer?.orElse (fun _ => sessionCookie?) with
+  | some tok =>
+      let nowSec := ((← Prim.nowMs).toNat) / 1000
+      verifyUserTokenWithNow cfg.authSecrets tok nowSec cfg.requireExpiring
+  | none => return none
+
 def buildRequestCtx (cfg : ServerConfig) (headers : Array (String × String)) (clientIp : String) : IO RequestCtx := do
   let hdrList := headers.toList
   let cookies := hdrList.foldl (fun acc (k, v) =>
-    if k.toLower == "cookie" then acc ++ parseCookiePairs v else acc) []
+    if eqCI k "cookie" then acc ++ parseCookiePairs v else acc) []
   let bearer? := hdrList.findSome? fun (k, v) =>
-    if k.toLower == "authorization" then extractBearer v else none
-  let sessionCookie? := (cookies.find? fun (k, _) => k == "qed_session").map Prod.snd
-  let userId? ← if cfg.authSecrets.isEmpty then pure none
-    else match bearer?.orElse (fun _ => sessionCookie?) with
-      | some tok =>
-          let nowSec := ((← Prim.nowMs).toNat) / 1000
-          verifyUserTokenWithNow cfg.authSecrets tok nowSec cfg.requireExpiring
-      | none => pure none
+    if eqCI k "authorization" then extractBearer v else none
+  let userId? ← resolveUserId cfg bearer? cookies
   return { headers := hdrList, cookies, bearerToken := bearer?, userId := userId?, clientIp }
 
 /-! ## Native `MonadServer IO` & `MonadAtomic σ IO` Instances -/
@@ -647,6 +669,50 @@ private def loadHostScript (staticDirFd : Prim.StaticDir) (devMode : Bool) : IO 
               | none   => return "/qed_host.mjs"
           | .error _ => return "/qed_host.mjs"
 
+private def stripQuery (target : String) : String :=
+  match findByte target 0 63 with
+  | some q => String.Pos.Raw.extract target ⟨0⟩ ⟨q⟩
+  | none   => target
+
+private def dropPrefixBytes (s : String) (byteLen : Nat) : String :=
+  if byteLen >= s.utf8ByteSize then "" else String.Pos.Raw.extract s ⟨byteLen⟩ ⟨s.utf8ByteSize⟩
+
+private def isProtobufMediaType (v : String) : Bool :=
+  let head := match findByte v 0 59 with
+    | some semi => String.Pos.Raw.extract v ⟨0⟩ ⟨semi⟩
+    | none      => v
+  eqCI (trimWs head) "application/x-protobuf"
+
+private def checkRpcCsrfReq (req : ParsedReqHead) (allowedOrigins? : Option String) :
+    Except (Nat × String) Unit := do
+  checkOriginAndFetchSiteParsed req.origin? req.host? req.secFetchSite?
+    (req.dupOrigin || req.dupSfs) allowedOrigins? false "RPC"
+  if req.dupCt || !req.contentType?.any isProtobufMediaType then
+    throw (415, "RPC requires Content-Type: application/x-protobuf")
+
+private def buildRequestCtxReq (cfg : ServerConfig) (req : ParsedReqHead) (clientIp : String) : IO RequestCtx := do
+  let hdrList := req.headers.toList
+  let cookies :=
+    if !req.hasCookie then []
+    else hdrList.foldl (fun acc (k, v) =>
+      if eqCI k "cookie" then acc ++ parseCookiePairs v else acc) []
+  let bearer? := req.auth?.bind extractBearer
+  let userId? ← resolveUserId cfg bearer? cookies
+  return { headers := hdrList, cookies, bearerToken := bearer?, userId := userId?, clientIp }
+
+private structure CachedStaticAsset where
+  etag      : String
+  headKA    : ByteArray
+  headClose : ByteArray
+  fullKA    : ByteArray
+  fullClose : ByteArray
+
+private def CachedStaticAsset.serve (c : CachedStaticAsset) (req : ParsedReqHead)
+    (isHead keepAlive : Bool) : ByteArray :=
+  if req.hasIfNoneMatch && etagMatchesIfNoneMatch req.headers c.etag then formatNotModifiedResponse c.etag keepAlive
+  else if isHead then (if keepAlive then c.headKA else c.headClose)
+  else if keepAlive then c.fullKA else c.fullClose
+
 def runFullstackWithDispatch {Model Msg : Type}
     (app : Qed.App Model Msg)
     (title : String)
@@ -657,26 +723,45 @@ def runFullstackWithDispatch {Model Msg : Type}
     (staticDir : String)
     (devMode : Bool := false)
     (numWorkers : UInt32 := 0)
-    (wsDispatchFn? : Option (RequestCtx → UInt8 → String → ByteArray → ByteArray → IO (Except ApiError ByteArray)) := none) : IO UInt32 := do
+    (wsDispatchFn? : Option (RequestCtx → UInt8 → String → ByteArray → ByteArray → IO (Except ApiError ByteArray)) := none)
+    (blockingMethods? : Option (Array String) := none) : IO UInt32 := do
   if !(← verifyRequiredSecrets requiredSecrets) then
     return 1
   let cfg ← loadServerConfig devMode
   let staticDirFd ← Prim.openStaticDir staticDir
   let hostScript ← loadHostScript staticDirFd devMode
   let rpcPrefix := "/_qed/rpc/" ++ serverShortName ++ "/"
+  let rpcPrefixBytes := rpcPrefix.utf8ByteSize
   let wsPath := "/_qed/ws/" ++ serverShortName
+  let assetCache ← Prim.mkStateBox (∅ : Std.HashMap String CachedStaticAsset)
+  let healthKA := formatHttpResponse 200 "application/json" "{\"ok\":true}".toUTF8 false true false
+  let healthClose := formatHttpResponse 200 "application/json" "{\"ok\":true}".toUTF8 false false false
+  let docShell := mkPrebuiltDocShell title hostScript (renderStyleSheet app.styles) app.stylesheets
 
   let dispatchAppReq (req : ParsedReqHead) (body : ByteArray) (clientIp : String) : IO ByteArray := do
     if let some st := classifyStaticPath req.method req.target devMode then
-      let headFlag : UInt8 := if st.isHead then 1 else 0
+      let cacheable := !devMode && !st.noStore && isContentHashedAsset st.relPath
+      if cacheable then
+        if let some hit ← Prim.atomicRead assetCache (fun m => m[st.relPath]?) then
+          return hit.serve req st.isHead req.keepAlive
+      let headFlag : UInt8 := if st.isHead && !cacheable then 1 else 0
       if let some (fsize, mtimeMs, fbytes) ← Prim.readStaticFile staticDirFd st.relPath headFlag then
         if !st.noStore then
           let etag := s!"W/\"{fsize}-{mtimeMs}\""
-          if etagMatchesIfNoneMatch req.headers etag then
-            return formatNotModifiedResponse etag req.keepAlive
           let cacheCtrl :=
             if isContentHashedAsset st.relPath then "public, max-age=31536000, immutable"
             else "public, max-age=0, must-revalidate"
+          if cacheable && fsize <= 2 * 1024 * 1024 then
+            let headKA := formatHttpResponseHead 200 st.mime fsize true false (some etag) (some cacheCtrl)
+            let headClose := formatHttpResponseHead 200 st.mime fsize false false (some etag) (some cacheCtrl)
+            let entry : CachedStaticAsset := {
+              etag, headKA, headClose, fullKA := headKA ++ fbytes, fullClose := headClose ++ fbytes
+            }
+            Prim.atomicModify assetCache fun m =>
+              ((if m.size < 64 then m.insert st.relPath entry else m), ())
+            return entry.serve req st.isHead req.keepAlive
+          if req.hasIfNoneMatch && etagMatchesIfNoneMatch req.headers etag then
+            return formatNotModifiedResponse etag req.keepAlive
           let head := formatHttpResponseHead 200 st.mime fsize req.keepAlive false (some etag) (some cacheCtrl)
           return if st.isHead then head else head ++ fbytes
         else
@@ -686,59 +771,86 @@ def runFullstackWithDispatch {Model Msg : Type}
         return formatHttpResponse 200 st.mime "0".toUTF8 st.isHead req.keepAlive true
       else
         return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 st.isHead req.keepAlive false
-    let pathOnly := (req.target.splitOn "?").headD req.target
+    let pathOnly := stripQuery req.target
     let isHead := req.method == "HEAD"
-    let (status, ctype, respBody) ←
-      if req.method == "GET" && pathOnly == "/_qed/health" then
-        pure (200, "application/json", "{\"ok\":true}".toUTF8)
-      else do
-        let ctx ← buildRequestCtx cfg req.headers clientIp
-        if req.method == "POST" && pathOnly.startsWith rpcPrefix then
-          match checkRpcCsrf ctx.headers cfg.rpcAllowedOrigins? with
-          | .error (code, msg) => pure (code, "text/plain; charset=utf-8", msg.toUTF8)
-          | .ok () =>
-              let rpcMethod := String.ofList (pathOnly.toList.drop rpcPrefix.length)
-              match ← dispatchFn ctx rpcMethod body with
-              | .ok respBytes => pure (200, "application/x-protobuf", respBytes)
-              | .error apiErr => pure (apiErr.httpStatus.toNat, "text/plain; charset=utf-8", apiErr.message.toUTF8)
-        else if (req.method == "GET" || isHead) && !pathOnly.startsWith "/_qed/" then
-          let ssrDispatchBytes : String → String → ByteArray → IO (Except String ByteArray) :=
-            fun reqMethod url reqBody => do
-              let uPath := (url.splitOn "?").headD url
-              if reqMethod == "POST" && uPath.startsWith rpcPrefix then
-                let mName := String.ofList (uPath.toList.drop rpcPrefix.length)
-                match ← dispatchFn ctx mName reqBody with
-                | .ok bs   => return .ok bs
-                | .error e => return .error e.message
-              else
-                return .error s!"SSR unknown binary RPC endpoint: {url}"
-          let rawHtml ← app.ssrRenderNativeBytes req.target title ssrDispatchBytes
-            (script := hostScript) (sessionUser := ctx.userId)
-          let finalHtml := if devMode then injectDevReload rawHtml else rawHtml
-          pure (200, "text/html; charset=utf-8", finalHtml)
-        else
-          pure (404, "text/plain; charset=utf-8", "not found".toUTF8)
-    return formatHttpResponse status ctype respBody isHead req.keepAlive false
+    if req.method == "GET" && pathOnly == "/_qed/health" then
+      return if req.keepAlive then healthKA else healthClose
+    let ctx ← buildRequestCtxReq cfg req clientIp
+    if req.method == "POST" && pathOnly.startsWith rpcPrefix then
+      match checkRpcCsrfReq req cfg.rpcAllowedOrigins? with
+      | .error (code, msg) =>
+          return formatHttpResponse code "text/plain; charset=utf-8" msg.toUTF8 isHead req.keepAlive false
+      | .ok () =>
+          let rpcMethod := dropPrefixBytes pathOnly rpcPrefixBytes
+          match ← dispatchFn ctx rpcMethod body with
+          | .ok respBytes =>
+              return formatOkProtoResponse respBytes isHead req.keepAlive
+          | .error apiErr =>
+              return formatHttpResponse apiErr.httpStatus.toNat "text/plain; charset=utf-8" apiErr.message.toUTF8 isHead req.keepAlive false
+    else if (req.method == "GET" || isHead) && !pathOnly.startsWith "/_qed/" then
+      let ssrDispatchBytes : String → String → ByteArray → IO (Except String ByteArray) :=
+        fun reqMethod url reqBody => do
+          let uPath := stripQuery url
+          if reqMethod == "POST" && uPath.startsWith rpcPrefix then
+            let mName := dropPrefixBytes uPath rpcPrefixBytes
+            match ← dispatchFn ctx mName reqBody with
+            | .ok bs   => return .ok bs
+            | .error e => return .error e.message
+          else
+            return .error s!"SSR unknown binary RPC endpoint: {url}"
+      let rawHtml ← app.ssrRenderNativeBytesWithShell docShell req.target ssrDispatchBytes
+        (sessionUser := ctx.userId)
+      let finalHtml := if devMode then injectDevReload rawHtml else rawHtml
+      return formatOkHtmlResponse finalHtml isHead req.keepAlive
+    else
+      return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 isHead req.keepAlive false
 
-  let onHead (headBytes : ByteArray) (clientIp : String) : IO (Prim.HttpHeadAction ParsedReqHead RequestCtx) := do
+  let hasBlockingMethods : Bool :=
+    match blockingMethods? with
+    | none => true
+    | some ms => !ms.isEmpty
+
+  let methodMayBlock (rpcMethod : String) : Bool :=
+    match blockingMethods? with
+    | none => true
+    | some ms => ms.contains rpcMethod
+
+  let onHead (headBytes : ByteArray) (clientIp : String) (inline : Nat) : IO (Prim.HttpHeadAction ParsedReqHead RequestCtx) := do
     match parseRequestHead headBytes with
     | .error (code, msg) =>
         return .doneClose (formatErrorResponse code msg)
     | .ok req =>
-        let pathOnly := (req.target.splitOn "?").headD req.target
+        let pathOnly := stripQuery req.target
+        if req.method == "GET" && pathOnly == "/_qed/health" && req.contentLen == 0 then
+          return if req.keepAlive then .doneKeepAlive healthKA else .doneClose healthClose
         if wsDispatchFn?.isSome && req.method == "GET" && pathOnly == wsPath &&
-           (req.upgrade?.map String.toLower == some "websocket") then
+           req.upgrade?.any (eqCI · "websocket") then
           if !req.isHttp11 || (req.conn?.map (containsCI · "upgrade") != some true) ||
              req.wsVer? != some "13" then
             return .doneClose (formatErrorResponse 400 "invalid WebSocket upgrade headers")
           let some acceptB64 := req.wsKey?.bind wsComputeAccept
             | return .doneClose (formatErrorResponse 400 "invalid Sec-WebSocket-Key")
-          match checkWsOrigin req.headers.toList cfg.wsAllowedOrigins? with
+          match checkOriginAndFetchSiteParsed req.origin? req.host? req.secFetchSite?
+              (req.dupOrigin || req.dupSfs) cfg.wsAllowedOrigins? true "WebSocket upgrade" with
           | .error (code, msg) => return .doneClose (formatErrorResponse code msg)
           | .ok () =>
-              let baseCtx ← buildRequestCtx cfg req.headers clientIp
+              let baseCtx ← buildRequestCtxReq cfg req clientIp
               let cid ← Prim.randomHex 12
               return .wsUpgrade (formatWsUpgradeResponse acceptB64) { baseCtx with connId := "ws-" ++ cid }
+        if inline != 0 then
+          if (req.method == "GET" || req.method == "HEAD") then
+            if let some st := classifyStaticPath req.method req.target devMode then
+              if !devMode && !st.noStore && isContentHashedAsset st.relPath then
+                if let some hit ← Prim.atomicRead assetCache (fun m => m[st.relPath]?) then
+                  let wire := hit.serve req st.isHead req.keepAlive
+                  return if req.keepAlive then .doneKeepAlive wire else .doneClose wire
+              return .deferHead
+          if hasBlockingMethods then
+            if req.method == "POST" && pathOnly.startsWith rpcPrefix then
+              if methodMayBlock (dropPrefixBytes pathOnly rpcPrefixBytes) then
+                return .deferHead
+            else if (req.method == "GET" || req.method == "HEAD") && !pathOnly.startsWith "/_qed/" then
+              return .deferHead
         if req.contentLen == 0 then
           let wire ← dispatchAppReq req ByteArray.empty clientIp
           return if req.keepAlive then .doneKeepAlive wire else .doneClose wire
@@ -764,7 +876,8 @@ def runStatefulFullstack {σ Model Msg : Type}
         RequestCtx → String → ByteArray → m (Except ApiError ByteArray))
     (port : UInt16) (staticDir : String) (devMode : Bool := false) (numWorkers : UInt32 := 0)
     (wsDispatchM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
-        RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)) := none) : IO UInt32 := do
+        RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)) := none)
+    (blockingMethods? : Option (Array String) := none) : IO UInt32 := do
   let box ← Prim.mkStateBox initState
   let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
   let srvInst : MonadServer IO := mkNativeServerInst (some gcpCache)
@@ -773,6 +886,7 @@ def runStatefulFullstack {σ Model Msg : Type}
     (fun ctx mName reqBytes => @dispatchM IO _ srvInst atomicInst ctx mName reqBytes)
     port staticDir devMode numWorkers
     (wsDispatchM?.map fun wsM ctx kind ch params payload => @wsM IO _ srvInst atomicInst ctx kind ch params payload)
+    blockingMethods?
 
 def runStatelessFullstack {Model Msg : Type}
     (app : Qed.App Model Msg) (title serverShortName : String)
@@ -781,13 +895,15 @@ def runStatelessFullstack {Model Msg : Type}
         RequestCtx → String → ByteArray → m (Except ApiError ByteArray))
     (port : UInt16) (staticDir : String) (devMode : Bool := false) (numWorkers : UInt32 := 0)
     (wsDispatchM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] →
-        RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)) := none) : IO UInt32 := do
+        RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)) := none)
+    (blockingMethods? : Option (Array String) := none) : IO UInt32 := do
   let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
   let srvInst : MonadServer IO := mkNativeServerInst (some gcpCache)
   runFullstackWithDispatch app title serverShortName requiredSecrets
     (fun ctx mName reqBytes => @dispatchM IO _ srvInst ctx mName reqBytes)
     port staticDir devMode numWorkers
     (wsDispatchM?.map fun wsM ctx kind ch params payload => @wsM IO _ srvInst ctx kind ch params payload)
+    blockingMethods?
 
 /-! ## `qedServerMain <FullstackName>` Entrypoint Generator -/
 
@@ -815,6 +931,9 @@ def elabQedServerMain : CommandElab := fun stx => do
   let dispatchId := mkIdentFrom fsIdent (srvInfo.serverName ++ `dispatchM)
   let wsDispatchId := mkIdentFrom fsIdent (srvInfo.serverName ++ `wsDispatchM)
   let hasWs := !srvInfo.channels.isEmpty
+  let asyncNames : Array Term := srvInfo.methods.filterMap fun m =>
+    if m.isAsync then some (Syntax.mkStrLit m.name) else none
+  let blockingArg ← `(some #[$asyncNames,*])
   let mainId := mkIdent `main
   let runnerCall ← if srvInfo.hasState then
     let initStateId := mkIdentFrom fsIdent (srvInfo.serverName ++ `initState)
@@ -824,7 +943,7 @@ def elabQedServerMain : CommandElab := fun stx => do
     `(Qed.Server.Native.runStatefulFullstack
         $cliAppId $titleLit $shortLit $initStateId $secretsId
         (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $dispatchId)
-        port staticDir devMode numWorkers $wsArg)
+        port staticDir devMode numWorkers $wsArg $blockingArg)
   else
     let wsArg ← if hasWs then
       `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] => $wsDispatchId))
@@ -832,7 +951,7 @@ def elabQedServerMain : CommandElab := fun stx => do
     `(Qed.Server.Native.runStatelessFullstack
         $cliAppId $titleLit $shortLit $secretsId
         (fun {m} [Monad m] [Qed.Server.MonadServer m] => $dispatchId)
-        port staticDir devMode numWorkers $wsArg)
+        port staticDir devMode numWorkers $wsArg $blockingArg)
   elabCommand (← `(command|
     def $mainId:ident (args : List String) : IO UInt32 := do
       let staticDir := args[0]?.getD "dist"

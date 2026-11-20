@@ -69,6 +69,7 @@ export const UInt32_toNat = (a) => BigInt(a >>> 0);
 export const UInt32_toUInt8 = (a) => a & 0xFF;
 export const UInt32_toUInt64 = (a) => BigInt(a >>> 0);
 export const UInt32_add = (a, b) => (a + b) >>> 0;
+export const UInt32_sub = (a, b) => (a - b) >>> 0;
 export const UInt32_mul = (a, b) => Math.imul(a, b) >>> 0;
 export const UInt32_shiftLeft  = (a, b) => (a << (b & 31)) >>> 0;
 export const UInt32_shiftRight = (a, b) => (a >>> (b & 31)) >>> 0;
@@ -89,9 +90,10 @@ export const UInt64_decLe = (a, b) => u64(a) <= u64(b) ? 1 : 0;
 export const UInt64_decLt = (a, b) => u64(a) < u64(b) ? 1 : 0;
 export const UInt64_toUSize = (a) => Number(BigInt(a) & 0x1FFFFFFFFFFFFFn);
 export const USize_ofNat = (n) => Number(n & 0x1FFFFFFFFFFFFFn), USize_ofNatCore = USize_ofNat;
+export const USize_toNat = (a) => BigInt(a);
 export const USize_add = (a, b) => a + b;
 export const USize_sub = (a, b) => a - b;
-export const USize_land = (a, b) => Number(BigInt(a) & BigInt(b));
+export const USize_land = (a, b) => (a <= 0x7FFFFFFF && b <= 0x7FFFFFFF) ? ((a & b) >>> 0) : Number(BigInt(a) & BigInt(b));
 export const USize_decEq = (a, b) => a === b ? 1 : 0;
 export const USize_decLt = (a, b) => a < b ? 1 : 0;
 export const USize_repr = (a) => String(a);
@@ -156,7 +158,7 @@ function getStrInfo(s) {
   const len = ascii ? s.length : bytes.length;
   info = { ascii, bytes, len };
   if (cacheable) {
-    if (_strCache.size >= 256) _strCache.clear();
+    if (_strCache.size >= 4096) _strCache.clear();
     _strCache.set(s, info);
   } else {
     scheduleLargeStrEvict();
@@ -166,8 +168,15 @@ function getStrInfo(s) {
 }
 export const String_append = (a, b) => a + b;
 export const String_length = (s) => {
-  if (getStrInfo(s).ascii) return BigInt(s.length);
-  let n = 0n; for (const _ of s) n++; return n;
+  let n = s.length;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
+      const lo = s.charCodeAt(i + 1);
+      if (lo >= 0xDC00 && lo <= 0xDFFF) { n--; i++; }
+    }
+  }
+  return BigInt(n);
 };
 export const String_utf8ByteSize = (s) => BigInt(getStrInfo(s).len);
 export const String_push = (s, c) => s + String.fromCodePoint(c);
@@ -228,7 +237,15 @@ export const String_data = (s) => {
   }
   return l;
 };
-export const String_hash = (s) => { let h = 1469598103934665603n; for (let i = 0; i < s.length; i++) { h ^= BigInt(s.charCodeAt(i)); h = (h * 1099511628211n) & M64; } return h; };
+export const String_hash = (s) => {
+  let h1 = 0x811c9dc5, h2 = 0x01000193;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ (c + i), 0x85ebca6b);
+  }
+  return (BigInt(h2 >>> 0) << 32n) | BigInt(h1 >>> 0);
+};
 export const String_toUTF8 = (s) => ENC.encode(s);
 export const String_fromUTF8 = (ba, _h) => DEC.decode(ba);
 export const String_validateUTF8 = (ba) => { try { DEC_FATAL.decode(ba); return 1; } catch { return 0; } };
@@ -236,6 +253,7 @@ export const String_validateUTF8 = (ba) => { try { DEC_FATAL.decode(ba); return 
 function mkCapBytes(cap, used) {
   const ab = new ArrayBuffer(Math.max(16, cap));
   ab.__used = used;
+  ab.__view = new Uint8Array(ab);
   return new Uint8Array(ab, 0, used);
 }
 export const ByteArray_mkEmpty = (c) => mkCapBytes(Number(c), 0);
@@ -248,7 +266,7 @@ export const ByteArray_data = (ba) => own(Array.from(ba));
 export const ByteArray_push = (ba, b) => {
   const len = ba.length, ab = ba.buffer;
   if (ba.byteOffset === 0 && ab.__used === len && len < ab.byteLength) {
-    new Uint8Array(ab)[len] = Number(b);
+    (ab.__view || (ab.__view = new Uint8Array(ab)))[len] = Number(b);
     ab.__used = len + 1;
     return new Uint8Array(ab, 0, len + 1);
   }
@@ -257,6 +275,7 @@ export const ByteArray_push = (ba, b) => {
   full.set(ba);
   full[len] = Number(b);
   nab.__used = len + 1;
+  nab.__view = full;
   return new Uint8Array(nab, 0, len + 1);
 };
 export const ByteArray_size = (ba) => BigInt(ba.length);
@@ -272,7 +291,7 @@ export const ByteArray_copySlice = (src, so, dst, dso, len, exact) => {
   const end = Math.max(dst.length, d + n);
   const ab = dst.buffer;
   if (d >= dst.length && dst.byteOffset === 0 && ab.__used === dst.length && end <= ab.byteLength) {
-    const full = new Uint8Array(ab);
+    const full = ab.__view || (ab.__view = new Uint8Array(ab));
     if (n > 0) full.set(src.subarray(s, s + n), d);
     ab.__used = end;
     return new Uint8Array(ab, 0, end);
@@ -283,6 +302,7 @@ export const ByteArray_copySlice = (src, so, dst, dso, len, exact) => {
   full.set(dst);
   if (n > 0) full.set(src.subarray(s, s + n), d);
   nab.__used = end;
+  nab.__view = full;
   return new Uint8Array(nab, 0, end);
 };
 
@@ -308,6 +328,8 @@ export const Nat_ble = (a, b) => a <= b ? 1 : 0;
 export const String_decidableLT = String_decLt;
 export const Nat_shiftRight = (a, b) => a >> b;
 export const UInt8_decEq = (a, b) => a === b ? 1 : 0;
+export const UInt8_decLt = (a, b) => a < b ? 1 : 0;
+export const UInt8_decLe = (a, b) => a <= b ? 1 : 0;
 export const UInt32_ofBitVec = (bv) => Number(BigInt(bv) & 0xFFFFFFFFn);
 export const USize_ofNatLT = (n) => Number(n & 0x1FFFFFFFFFFFFFn);
 export const String_ofList = String_mk;
@@ -365,6 +387,13 @@ export const Qed_Dom_appState = domCall('appState');
 export const Qed_Dom_appendChild = domCall('appendChild');
 export const Qed_Dom_bindSignal = domCall('bindSignal');
 export const Qed_Dom_bindSignalAttr = domCall('bindSignalAttr');
+export const Qed_Dom_getSigSlot = domCall('getSigSlot');
+export const Qed_Dom_setSigSlot = domCall('setSigSlot');
+export const Qed_Dom_compileRowTmpl = domCall('compileRowTmpl');
+export const Qed_Dom_mountTmplRow = domCall('mountTmplRow');
+export const Qed_Dom_mountTmplRows = domCall('mountTmplRows');
+export const Qed_Dom_patchTmplRow = domCall('patchTmplRow');
+export const Qed_Dom_hydrateTmplRow = domCall('hydrateTmplRow');
 export const Qed_Dom_childAt = domCall('childAt');
 export const Qed_Dom_childCount = domCall('childCount');
 export const Qed_Dom_childNamespace = domCall('childNamespace');
@@ -380,6 +409,9 @@ export const Qed_Dom_getAttribute = domCall('getAttribute');
 export const Qed_Dom_httpSend = domCall('httpSend');
 export const Qed_Dom_httpSendBytes = domCall('httpSendBytes');
 export const Qed_Dom_insertBefore = domCall('insertBefore');
+export const Qed_Dom_insertBeforeRef = domCall('insertBeforeRef');
+export const Qed_Dom_removeNode = domCall('removeNode');
+export const Qed_Dom_clearChildren = domCall('clearChildren');
 export const Qed_Dom_isConnected = domCall('isConnected');
 export const Qed_Dom_mountRoot = domCall('mountRoot');
 export const Qed_Dom_portSend = domCall('portSend');

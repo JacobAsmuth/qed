@@ -180,13 +180,13 @@ private def viewValidSimpExtras (env : Environment) : Array Name :=
     ``Qed.Url.isSafe, ``Qed.Url.parse?_isSome, ``Qed.containsCloseSeq_escapeRawText, ``Qed.toString_string,
     ``Qed.Attr.valid_cls, ``Qed.Attr.valid_attr, ``Qed.Attr.valid_flag, ``Qed.Attr.valid_key,
     ``Qed.Attr.valid_on, ``Qed.Attr.valid_onValue, ``Qed.Attr.valid_localCell,
-    ``Qed.Attr.valid_signalBind, ``Qed.Attr.valid_signalAttr, ``Qed.Attr.valid_empty, ``Qed.Attr.valid_ite,
+    ``Qed.Attr.valid_signalBind, ``Qed.Attr.valid_signalAttr, ``Qed.Attr.valid_signalOn, ``Qed.Attr.valid_empty, ``Qed.Attr.valid_ite,
     ``Qed.Attr.validList_nil, ``Qed.Attr.validList_cons, ``Qed.Attr.validList_append,
     ``Qed.Attr.validList_filter_nonkey, ``Qed.Attr.validList_map_attrMap, ``Qed.Attr.validList_prefixSignal,
     ``Qed.Attr.valid_map, ``Qed.Attr.valid_prefixSignal,
     ``Qed.Attr.isLocalCell_cls, ``Qed.Attr.isLocalCell_attr, ``Qed.Attr.isLocalCell_flag,
     ``Qed.Attr.isLocalCell_key, ``Qed.Attr.isLocalCell_on, ``Qed.Attr.isLocalCell_onValue,
-    ``Qed.Attr.isLocalCell_localCell, ``Qed.Attr.isLocalCell_signalBind, ``Qed.Attr.isLocalCell_signalAttr,
+    ``Qed.Attr.isLocalCell_localCell, ``Qed.Attr.isLocalCell_signalBind, ``Qed.Attr.isLocalCell_signalAttr, ``Qed.Attr.isLocalCell_signalOn,
     ``Qed.Attr.isLocalCell_empty, ``Qed.Attr.isLocalCell_ite,
     ``Qed.Attr.hasLocalCell_nil, ``Qed.Attr.hasLocalCell_cons, ``Qed.Attr.hasLocalCell_append,
     ``Qed.Attr.hasLocalCell_filter_nonkey, ``Qed.Attr.hasLocalCell_map_attrMap, ``Qed.Attr.hasLocalCell_prefixSignal,
@@ -365,6 +365,8 @@ private def evalVAttrExpr (sigmaTy msgTy sExpr va : Expr) : Expr :=
     (mkApp args[2]! sExpr).headBeta
   else if va.isAppOfArity ``VAttr.dynVal 4 || va.isAppOfArity ``V.dynAttr 4 then
     mkApp3 (mkConst ``Attr.attr) args[1]! args[2]! (mkApp args[3]! sExpr)
+  else if va.isAppOfArity ``VAttr.dynOn 4 then
+    mkApp3 (mkConst ``Attr.on) args[1]! args[2]! (mkApp args[3]! sExpr)
   else if va.isAppOfArity ``V.onClick' 3 then
     mkApp3 (mkConst ``Attr.on) args[1]! (toExpr "click") (mkApp args[2]! sExpr)
   else if va.isAppOfArity ``V.onInput' 3 then

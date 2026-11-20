@@ -5,18 +5,9 @@ namespace Qed
 section CompElab
 open Lean Elab Command Qed.Lang
 
-private def freshCompInvIdent (ref : Syntax) (compId : Name) : CommandElabM Ident := do
-  let env ← getEnv; let ns ← getCurrNamespace
-  let base := compId ++ `inv
-  if !env.contains (ns ++ base) then return mkIdentFrom ref base
-  let mut idx := 2
-  while env.contains (ns ++ compId ++ Name.mkSimple s!"inv_{idx}") do idx := idx + 1
-  return mkIdentFrom ref (compId ++ Name.mkSimple s!"inv_{idx}")
-
-def resolveInvIdent (invStx : Syntax) (compId : Name) : CommandElabM Ident :=
-  match (invStx.getArg 1).find? (·.isIdent) with
-  | some idStx => pure (mkIdentFrom idStx (compId ++ idStx.getId))
-  | none       => freshCompInvIdent invStx compId
+def resolveInvIdent (invStx : Syntax) (compId : Name) : Ident :=
+  let idStx := (invStx.getArg 1).getArg 0
+  mkIdentFrom idStx (compId ++ idStx.getId)
 
 
 /-! ## Inline Invariant Elaboration -/
@@ -53,7 +44,7 @@ private def elabForEachInlineInv (spec : ComponentSpec) (invStx : Syntax) (isSty
   let tId      := spec.t.getId
   let updateId := mkIdent (tId ++ `update)
   let viewId   := mkIdent (tId ++ `view)
-  let invId ← resolveInvIdent invStx tId
+  let invId := resolveInvIdent invStx tId
   let pred ← lowerCompExpr .val (invStx.getArg 2)
   let colField : Ident := ⟨(invStx.getArg 4)⟩
   let using? : Option Ident := if (invStx.getArg 6).getNumArgs == 2 then some ⟨((invStx.getArg 6).getArg 1)⟩ else none
@@ -206,7 +197,7 @@ def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) :
       | none => pure false
     let isView := hasHoldsIn || autoView
     if isView == wantView then
-      let invId ← resolveInvIdent invStx tId
+      let invId := resolveInvIdent invStx tId
       if isView then
         let valClauses ← match valClauses? with
           | some vc => pure vc

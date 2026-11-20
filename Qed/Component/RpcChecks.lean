@@ -189,12 +189,12 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
           let noneExpr ← Meta.mkAppOptM ``Option.none #[some elemTy]
           let authGoal ← Meta.mkAppM ``Ne #[sfExpr, noneExpr]
           if (← tryDischarge authGoal).isSome then
-            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`{sfName} != none`), which could not be proved here.\n\nHint: Guard this call with `if {sfName}.isSome:`, `ensure {sfName}.isSome else return`, or `invariant ...: {sfName}.isSome`."
+            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`{sfName} != none`), which could not be proved here.\n\nHint: Guard this call with `if {sfName}.isSome:` or `invariant ...: {sfName}.isSome`."
         if let some reqConst := chk.reqConst? then
           let reqGoal := mkAppN (Lean.mkConst reqConst) chk.argExprs
           if let some obl ← tryDischarge reqGoal then
             let oblLine := if obl.isEmpty then "" else s!"\n  • must satisfy:  {obl}"
-            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` precondition `{chk.reqLabel}` could not be proved here:{oblLine}\n\nHint: Pass valid arguments, guard with `if`/`ensure`, or add a component `invariant`."
+            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` precondition `{chk.reqLabel}` could not be proved here:{oblLine}\n\nHint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`."
   let currNs ← getCurrNamespace
   for (chk, idx) in predChecks.zipIdx do
     liftTermElabM do

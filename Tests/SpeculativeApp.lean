@@ -5,13 +5,13 @@ namespace SpeculativeApp
 
 server SpecDemoSrv:
   state stock : Nat = 10
-  invariant stock <= 10000
+  invariant maxStock: stock <= 10000
 
   def placeOrder(qty: Nat) -> Nat!:
     requires ctx.userId != none
     requires 1 <= qty <= 10
     ensures result <= 10000
-    ensure stock >= qty else fail(.outOfStock)
+    if stock < qty: return fail(.outOfStock)
     stock -= qty
     return stock
 

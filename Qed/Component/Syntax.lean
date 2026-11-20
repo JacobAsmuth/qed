@@ -67,10 +67,9 @@ def compFieldClause : Parser := leading_parser
   withPosition (
     (atomic (identEq `state) <|> atomic (identEq `ephemeral) <|>
      atomic (identEq `prop) <|> atomic (identEq `bind) <|>
-     atomic (identEq `slot) <|> atomic (identEq `collection)) >>
+     atomic (identEq `collection)) >>
     ident >> optional (":" >> categoryParser `qedType 0) >> optional ("=" >> categoryParser `qedExpr 0))
 
-def compChildrenClause : Parser := leading_parser withPosition (atomic (identEq `children))
 def compKeyClause      : Parser := leading_parser withPosition (atomic (identEq `key) >> ident)
 def compEventClause    : Parser := leading_parser
   withPosition (atomic (identEq `event) >> ident >> compParamsOpt)
@@ -104,13 +103,6 @@ def compRpcQueryClause : Parser := leading_parser
     ident >> "(" >> sepBy (categoryParser `qedExpr 0) "," >> ")" >>
     optional compIfCond)
 
-def compQueryClause    : Parser := leading_parser
-  withPosition (
-    atomic (identEq `query >> ident >> ":") >> categoryParser `qedType 0 >> ":" >>
-    checkColGt >>
-    withPosition (identEq `key >> "=" >> categoryParser `qedExpr 0 >>
-                  checkColGe >> identEq `url >> "=" >> categoryParser `qedExpr 0))
-
 def compSubReconnect : Parser :=
   node `Qed.compSubReconnect (withPosition (atomic (kw "reconnect") >> categoryParser `qedExpr 0))
 
@@ -141,14 +133,14 @@ def compInvName : Parser := leading_parser ident >> ":"
 
 def compForEachInvClause : Parser := leading_parser
   withPosition (
-    atomic ("invariant " >> optional (atomic compInvName) >> categoryParser `qedExpr 0 >> kw "for_each" >> ident) >>
+    atomic ("invariant " >> compInvName >> categoryParser `qedExpr 0 >> kw "for_each" >> ident) >>
     optional (kw "holds_in" >> identEq `view) >>
     optional (kw "using" >> ident) >>
     optional (":=" >> termParser))
 
 def compInvariantClause : Parser := leading_parser
   withPosition (
-    "invariant " >> optional (atomic compInvName) >> sepBy1 (categoryParser `qedExpr 0) "," >>
+    "invariant " >> compInvName >> sepBy1 (categoryParser `qedExpr 0) "," >>
     optional (kw "holds_in" >> identEq `view >> optional (kw "assuming" >> categoryParser `qedExpr 0)) >>
     optional (kw "using" >> "[" >> sepBy termParser "," >> "]") >>
     optional (":=" >> termParser))
@@ -171,9 +163,9 @@ def compThemeClause : Parser := leading_parser
 def compInvAny : Parser := compForEachInvClause <|> compInvariantClause
 
 def compClause : Parser :=
-  compSessionClause <|> compFieldClause <|> compChildrenClause <|> compKeyClause <|>
+  compSessionClause <|> compFieldClause <|> compKeyClause <|>
   compEventClause <|> compStartClause <|> compRouteClause <|>
-  compPortOutClause <|> compPortInClause <|> compRpcQueryClause <|> compQueryClause <|>
+  compPortOutClause <|> compPortInClause <|> compRpcQueryClause <|>
   compSubscribeClause <|> compStyleClause <|> compStylesheetClause <|> compThemeClause <|>
   compActionClause <|> compInvAny
 
@@ -197,9 +189,9 @@ structure OutArm where
   arity   : Nat
   handler : Term
 
-def isCdot (stx : Syntax) : Bool :=
+def isPlaceholder (stx : Syntax) : Bool :=
   let u := unwrapParens1 stx
-  u.getKind == ``qedCdot || u.getKind == ``Lean.Parser.Term.cdot || (u.reprint.getD "").trimmed == "·"
+  u.getKind == ``qedPlaceholder || (u.reprint.getD "").trimmed == "_"
 
 def atomStr : Syntax → String := Qed.Jsx.tokenVal
 def asTerm (s : Syntax) : Term := ⟨s⟩
@@ -210,19 +202,51 @@ partial def mentionsIdent (stx : Syntax) (n : Name) : Bool :=
   | .node _ _ args => args.any (mentionsIdent · n)
   | _ => false
 
+/-- True when `target` appears as a free identifier (or root of `target.field`) in `stx`,
+    ignoring field projections (`x.target`), named-arg/record keys, JSX attribute names, and local binders. -/
+partial def hasFreeIdent (target : Name) (stx : Syntax) : Bool :=
+  let k := stx.getKind
+  if k == ``qedIdent then
+    target.isPrefixOf (stx.getArg 0).getId.eraseMacroScopes
+  else if k == ``qedProj then
+    hasFreeIdent target (stx.getArg 0)
+  else if k == `Qed.Lang.recField || k == ``qedCallArgNamed then
+    hasFreeIdent target (stx.getArg 2)
+  else if k == ``qedLam1 then
+    let b := stx.getArg 0
+    if b.isIdent && b.getId.eraseMacroScopes == target then false
+    else hasFreeIdent target (stx.getArg 2)
+  else if k == ``qedLamN then
+    let ps := (stx.getArg 1).getSepArgs
+    let bound := ps.any fun p => let b := p.getArg 0; b.isIdent && b.getId.eraseMacroScopes == target
+    if bound then false else hasFreeIdent target (stx.getArg 4)
+  else if k == ``qedExprFor then
+    let b := stx.getArg 1
+    hasFreeIdent target (stx.getArg 3) ||
+      (!(b.isIdent && b.getId.eraseMacroScopes == target) && hasFreeIdent target (stx.getArg 5))
+  else if k == ``Qed.Jsx.attrNamed then
+    hasFreeIdent target (stx.getArg 1)
+  else
+    stx.getArgs.any (hasFreeIdent target)
+
 def unpackSeq (seqStx : Syntax) : Array Syntax :=
   Qed.Lang.suiteStmts seqStx
 
-partial def hasPerformNode (stx : Syntax) : Bool :=
+def isEventEmitExpr (eventNames : Array Name) (exprStx : Syntax) : Bool :=
+  match matchIdentMethodCall? exprStx with
+  | some (id, "emit", _) => eventNames.contains id.getId.eraseMacroScopes
+  | _ => false
+
+partial def hasEffectStmt (eventNames : Array Name) (stx : Syntax) : Bool :=
   let k := stx.getKind
-  k == ``qedStmtPerform ||
+  (k == ``qedStmtExpr && (matchPushCall? (stx.getArg 0)).isNone && !isEventEmitExpr eventNames (stx.getArg 0)) ||
   (k == ``qedStmtLet && (unwrapParens1 (stx.getArg 4)).getKind == ``qedAwait) ||
   (k == ``qedStmtAssign && (unwrapParens1 (stx.getArg 2)).getKind == ``qedAwait) ||
-  stx.getArgs.any hasPerformNode
+  stx.getArgs.any (hasEffectStmt eventNames)
 
 partial def hasReturnStmt (stx : Syntax) : Bool :=
   let k := stx.getKind
-  k == ``qedStmtReturn || k == ``qedStmtEnsure || stx.getArgs.any hasReturnStmt
+  k == ``qedStmtReturn || stx.getArgs.any hasReturnStmt
 
 def staticRootTag? (body : Syntax) : Option String :=
   if body.getKind == ``Qed.Jsx.qedExprJsx || body.getKind == ``Qed.Jsx.jsxTerm then

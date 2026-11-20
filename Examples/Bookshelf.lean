@@ -68,12 +68,12 @@ component Bookshelf:
   route : R = .catalog:
     case .catalog:
       catalog = .loading
-      perform Resource.fetch("/api/books", (catalog = ·))
+      Resource.fetch("/api/books", (catalog = _))
     case .detail(id):
       if let .ok(b) = current:
         if b.id == id: return
       current = .loading
-      perform Resource.fetch(f"/api/books/{id}", (current = ·))
+      Resource.fetch(f"/api/books/{id}", (current = _))
     case .newBook:
       pass
   state catalog : Resource Book[] = .idle
@@ -81,14 +81,14 @@ component Bookshelf:
   state draft   = Book.Draft.empty
 
   action submit(book: Book):
-    perform Resource.post("/api/books", book, .created)
+    Resource.post("/api/books", book, .created)
 
   action created(r: Resource Book):
     match r:
       case .ok(b):
         current = .ok(b)
         draft = Book.Draft.empty
-        perform Cmd.pushUrl(R.detail(b.id))
+        Cmd.pushUrl(R.detail(b.id))
       case .failed(e):
         current = .failed(e)
       case _:

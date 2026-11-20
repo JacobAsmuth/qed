@@ -21,15 +21,21 @@ structure ParsedStateDecl where
 
 structure ParsedMutInv where
   ref      : Lean.Syntax
+  name     : Lean.Ident
   fieldId  : Lean.Ident
   condStx  : Lean.Syntax
   label    : String
 
 structure ParsedInv where
   ref      : Lean.Syntax
+  name     : Lean.Ident
   exprStx  : Lean.Syntax
   isTwoSt  : Bool
   label    : String
+
+private def singleInvLabelStr (invs : Array ParsedInv) : String :=
+  let ss := ((invs.filter (!·.isTwoSt)).toList.map (·.label)).eraseDups
+  if ss.isEmpty then "StateInv" else String.intercalate ", " ss
 
 structure ParsedFnParam where
   ident    : Lean.Ident
@@ -126,9 +132,7 @@ def elabServerStateCmds (priorRep priorUnrep : Nat) (stateId initStateId stateIn
   let invBody ← match singleProps.toList with
     | []      => `(True)
     | p :: ps => ps.foldlM (init := p) fun acc q => `($acc ∧ $q)
-  let singleInvStr :=
-    let ss := (invs.filter (!·.isTwoSt)).toList.map (·.label)
-    if ss.isEmpty then "StateInv" else String.intercalate ", " ss
+  let singleInvStr := singleInvLabelStr invs
   let initInvLbl := Syntax.mkStrLit ("init: " ++ singleInvStr)
   elabCommand (← `(command|
     def $stateInvId ($sParam:ident : $stateId) : Prop := $invBody))
@@ -152,6 +156,7 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
   let mut stateDecls  : Array ParsedStateDecl := #[]
   let mut mutInvs     : Array ParsedMutInv := #[]
   let mut invs        : Array ParsedInv := #[]
+  let mut seenInvNames : Array Name := #[]
   let mut fnClauses   : Array Syntax := #[]
   let mut chanClauses : Array Syntax := #[]
   for c in clauses do
@@ -181,14 +186,21 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
           throwErrorAt id s!"state field `{id.getId}` requires an initial value `= ...`"
       stateDecls := stateDecls.push { ref := c, ident := id, ty, initStx }
     else if k == ``srvInvMutatingClause then
-      let fid : Ident := ⟨(c.getArg 2)⟩
-      let cond := (c.getArg 4)
-      let lbl := s!"mutating {fid.getId} requires {(cond.reprint.getD "").trimAscii.toString}"
-      mutInvs := mutInvs.push { ref := c, fieldId := fid, condStx := cond, label := lbl }
+      let nameId : Ident := ⟨(c.getArg 1)⟩
+      if seenInvNames.contains nameId.getId then
+        throwErrorAt nameId s!"duplicate invariant `{nameId.getId}` in `server {srvName}`"
+      seenInvNames := seenInvNames.push nameId.getId
+      let fid : Ident := ⟨(c.getArg 4)⟩
+      let cond := (c.getArg 6)
+      let lbl := s!"mutating:{nameId.getId}"
+      mutInvs := mutInvs.push { ref := c, name := nameId, fieldId := fid, condStx := cond, label := lbl }
     else if k == ``srvInvClause then
-      for e in (c.getArg 1).getSepArgs do
-        let lbl := (e.reprint.getD "invariant").trimAscii.toString
-        invs := invs.push { ref := c, exprStx := e, isTwoSt := exprCallsOld e, label := lbl }
+      let nameId : Ident := ⟨(c.getArg 1)⟩
+      if seenInvNames.contains nameId.getId then
+        throwErrorAt nameId s!"duplicate invariant `{nameId.getId}` in `server {srvName}`"
+      seenInvNames := seenInvNames.push nameId.getId
+      for e in (c.getArg 3).getSepArgs do
+        invs := invs.push { ref := c, name := nameId, exprStx := e, isTwoSt := exprCallsOld e, label := nameId.getId.toString }
     else if k == ``srvFnClause then
       fnClauses := fnClauses.push c
     else if k == ``srvChannelClause then
@@ -580,9 +592,7 @@ def elabServerPureFn (priorRep priorUnrep : Nat)
     deferredProofs.modify (·.push do elabCommand cmd; return !hasNewErrors (← get).messages priorRep priorUnrep)
   else
     let invThmId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_inv")
-    let singleInvLbl := Syntax.mkStrLit <|
-      let ss := (invs.filter (!·.isTwoSt)).toList.map (·.label)
-      if ss.isEmpty then "StateInv" else String.intercalate ", " ss
+    let singleInvLbl := Syntax.mkStrLit (singleInvLabelStr invs)
     let invCmd ← `(command|
       theorem $invThmId ($s0Id:ident : $stateId) $[($allBinderIds:ident : $allBinderTys:term)]*
           (_hInv : $stateInvId $s0Id) :
@@ -664,9 +674,7 @@ def elabServerAsyncFn (priorRep priorUnrep : Nat)
 
   let hCall ← allBinderIds.foldlM (init := ← `($handlerId)) fun acc id => `($acc $id)
   let asyncInvId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_inv")
-  let singleInvLbl := Syntax.mkStrLit <|
-    let ss := (invs.filter (!·.isTwoSt)).toList.map (·.label)
-    if ss.isEmpty then "StateInv" else String.intercalate ", " ss
+  let singleInvLbl := Syntax.mkStrLit (singleInvLabelStr invs)
   let invCmd ← `(command|
     theorem $asyncInvId $[($allBinderIds:ident : $allBinderTys:term)]* :
         Qed.Server.ProgPreservesInv $stateInvId

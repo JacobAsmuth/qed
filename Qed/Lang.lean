@@ -164,7 +164,7 @@ def qedLamParam : Parser := node `Qed.Lang.lamParam (qedBinder >> optional (":" 
 private def notReservedExprKw : Parser :=
   notFollowedBy (
     kw "and" <|> kw "or" <|> kw "not" <|> kw "is" <|> kw "pass" <|> kw "elif" <|>
-    kw "case" <|> kw "catch" <|> kw "atomic" <|> kw "ensure" <|>
+    kw "case" <|> kw "catch" <|> kw "atomic" <|>
     symbol "in" <|> symbol "if" <|> symbol "else" <|> symbol "match" <|>
     symbol "for" <|> symbol "return" <|> symbol "let") "expression"
 
@@ -176,10 +176,10 @@ private def notReservedExprKw : Parser :=
 @[qedExpr_parser] def qedFStr        : Parser := leading_parser:maxPrec atomic (kw "f" >> checkNoWsBefore "") >> interpolatedStr (categoryParser `qedExpr 0)
 @[qedExpr_parser] def qedArrLit      : Parser := leading_parser:maxPrec "[" >> sepBy (categoryParser `qedExpr 0) "," >> "]"
 @[qedExpr_parser] def qedRecLit      : Parser := leading_parser:maxPrec "{" >> optional (atomic (categoryParser `qedExpr 0 >> symbol "with")) >> sepBy qedRecField "," >> "}"
-@[qedExpr_parser] def qedFieldSetter : Parser := leading_parser:maxPrec atomic ("(" >> ident >> "=" >> symbol "·" >> ")")
+@[qedExpr_parser] def qedFieldSetter : Parser := leading_parser:maxPrec atomic ("(" >> ident >> "=" >> symbol "_" >> ")")
 @[qedExpr_parser] def qedTypeAscr    : Parser := leading_parser:maxPrec atomic ("(" >> categoryParser `qedExpr 0 >> ":" >> categoryParser `qedType 0 >> ")")
 @[qedExpr_parser] def qedParen       : Parser := leading_parser:maxPrec "(" >> sepBy (categoryParser `qedExpr 0) "," >> ")"
-@[qedExpr_parser] def qedCdot        : Parser := leading_parser:maxPrec symbol "·"
+@[qedExpr_parser] def qedPlaceholder : Parser := leading_parser:maxPrec symbol "_"
 @[qedExpr_parser] def qedDotIdent    : Parser := leading_parser:maxPrec atomic ("." >> checkNoWsBefore "") >> ident
 @[qedExpr_parser] def qedIdent       : Parser := leading_parser:maxPrec notReservedExprKw >> ident
 
@@ -192,7 +192,6 @@ private def notReservedExprKw : Parser :=
 -- Prefix unary, arithmetic, comparisons, logic, ternary, lambdas, quantifiers, expression control flow
 @[qedExpr_parser 80] def qedNeg      : Parser := leading_parser:80 "-" >> categoryParser `qedExpr 80
 @[qedExpr_parser 75] def qedAwait    : Parser := leading_parser:75 atomic (kw "await") >> categoryParser `qedExpr 75
-@[qedExpr_parser 75] def qedSendExpr : Parser := leading_parser:75 atomic (kw "send") >> categoryParser `qedExpr 75
 
 @[qedExpr_parser 70] def qedMul : TrailingParser := trailing_parser:70 symbol "*"  >> categoryParser `qedExpr 71
 @[qedExpr_parser 70] def qedDiv : TrailingParser := trailing_parser:70 symbol "/"  >> categoryParser `qedExpr 71
@@ -261,20 +260,12 @@ def qedLetRollback     : Parser := node `Qed.Lang.letRollback
 def qedLetClause       : Parser := qedLetPredict <|> qedLetOnConfirm <|> qedLetRollback <|> qedLetCatch
 
 @[qedStmt_parser] def qedStmtPass         : Parser := leading_parser withPosition (atomic (kw "pass"))
-@[qedStmt_parser] def qedStmtReturnAtomic : Parser := leading_parser withPosition (atomic (symbol "return" >> kw "atomic" >> ":") >> qedSuite)
 @[qedStmt_parser] def qedStmtReturn       : Parser := leading_parser
-  withPosition (symbol "return" >> notFollowedBy (atomic (kw "atomic" >> ":")) "atomic" >> optional (checkLineEq >> categoryParser `qedExpr 0))
-@[qedStmt_parser] def qedStmtEnsure       : Parser := leading_parser
-  withPosition (atomic (kw "ensure") >> categoryParser `qedExpr 0 >> symbol "else" >>
-    ((atomic (symbol "return") >> optional (checkLineEq >> categoryParser `qedExpr 0)) <|> categoryParser `qedExpr 0))
+  withPosition (symbol "return" >> optional (checkLineEq >> categoryParser `qedExpr 0))
 @[qedStmt_parser] def qedStmtAtomic       : Parser := leading_parser withPosition (atomic (kw "atomic" >> ":") >> qedSuite)
-@[qedStmt_parser] def qedStmtLetAtomic    : Parser := leading_parser withPosition (atomic (symbol "let" >> ident >> "=" >> kw "atomic" >> ":") >> qedSuite)
 @[qedStmt_parser] def qedStmtLet          : Parser := leading_parser
   withPosition (symbol "let" >> qedBinder >> optional (":" >> categoryParser `qedType 0) >> "=" >>
-    notFollowedBy (atomic (kw "atomic" >> ":")) "atomic" >> categoryParser `qedExpr 0 >> many qedLetClause)
-@[qedStmt_parser] def qedStmtPerform      : Parser := leading_parser withPosition (atomic (kw "perform") >> categoryParser `qedExpr 0)
-@[qedStmt_parser] def qedStmtSend         : Parser := leading_parser withPosition (atomic (kw "send") >> categoryParser `qedExpr 0)
-@[qedStmt_parser] def qedStmtEmit         : Parser := leading_parser withPosition (atomic (kw "emit") >> categoryParser `qedExpr 0)
+    categoryParser `qedExpr 0 >> many qedLetClause)
 @[qedStmt_parser] def qedStmtIfLet        : Parser := leading_parser
   withPosition (atomic (symbol "if" >> symbol "let") >> categoryParser `qedPat 0 >> "=" >> categoryParser `qedExpr 0 >> ":" >>
     qedSuite >> optional (atomic (checkColEq >> symbol "else" >> ":") >> qedSuite))
@@ -289,7 +280,7 @@ def qedLetClause       : Parser := qedLetPredict <|> qedLetOnConfirm <|> qedLetR
 @[qedStmt_parser] def qedStmtExpr         : Parser := leading_parser
   withPosition (notFollowedBy (
     symbol "if" <|> symbol "match" <|> symbol "return" <|> symbol "let" <|>
-    kw "atomic" <|> kw "ensure" <|> kw "pass" <|> kw "perform" <|> kw "send" <|> kw "emit") "statement" >> categoryParser `qedExpr 0)
+    kw "atomic" <|> kw "pass") "statement" >> categoryParser `qedExpr 0)
 
 end Parsers
 
@@ -323,22 +314,37 @@ def desugarElifs (elifs : Array Syntax) (optElse : Syntax) : Option (Array Synta
       #[Syntax.atom info "if", (first.getArg 1), (first.getArg 2), (first.getArg 3),
         Syntax.node info nullKind (elifs.extract 1 elifs.size), optElse]]
 
-/-- Matches a standalone `target.push(elem)` call expression, returning `(targetExpr, elemExpr)`. -/
-def matchPushCall? (stx : Syntax) : Option (Syntax × Syntax) := do
-  guard (stx.getKind == ``qedCall)
-  let rawArgs := (stx.getArg 2).getSepArgs
-  guard (rawArgs.size == 1 && rawArgs[0]!.getKind == ``qedCallArgPos)
-  let elemStx := rawArgs[0]![0]
-  let callee := (stx.getArg 0)
-  if callee.getKind == ``qedProj && (callee.getArg 2).getId == `push then
-    return ((callee.getArg 0), elemStx)
+/-- Matches a method call `target.method(args...)`, returning `(targetExpr, methodName, rawCallArgs)`. -/
+def matchMethodCall? (stx : Syntax) : Option (Syntax × String × Array Syntax) := do
+  let u := unwrapParens1 stx
+  guard (u.getKind == ``qedCall)
+  let rawArgs := (u.getArg 2).getSepArgs
+  let callee := (u.getArg 0)
+  if callee.getKind == ``qedProj then
+    return ((callee.getArg 0), (callee.getArg 2).getId.toString, rawArgs)
   else if callee.getKind == ``qedIdent then
     let parts := (callee.getArg 0).getId.toString.splitOn "."
-    guard (parts.length >= 2 && parts.getLast! == "push")
+    guard (parts.length >= 2)
+    let meth := parts.getLast!
     let baseName := (parts.take (parts.length - 1)).foldl (fun acc seg => Name.str acc seg) .anonymous
     let info := SourceInfo.fromRef (callee.getArg 0)
-    return (Syntax.node info ``qedIdent #[mkIdentFrom (callee.getArg 0) baseName], elemStx)
+    return (Syntax.node info ``qedIdent #[mkIdentFrom (callee.getArg 0) baseName], meth, rawArgs)
   else failure
+
+/-- Matches a single-segment `ident.method(args...)` call, returning `(targetIdent, methodName, rawCallArgs)`. -/
+def matchIdentMethodCall? (stx : Syntax) : Option (Ident × String × Array Syntax) := do
+  let (target, meth, rawArgs) ← matchMethodCall? stx
+  guard (target.getKind == ``qedIdent)
+  let id : Ident := ⟨(target.getArg 0)⟩
+  match id.getId.eraseMacroScopes with
+  | .str .anonymous _ => return (id, meth, rawArgs)
+  | _ => failure
+
+/-- Matches a standalone `target.push(elem)` call expression, returning `(targetExpr, elemExpr)`. -/
+def matchPushCall? (stx : Syntax) : Option (Syntax × Syntax) := do
+  let (target, meth, rawArgs) ← matchMethodCall? stx
+  guard (meth == "push" && rawArgs.size == 1 && rawArgs[0]!.getKind == ``qedCallArgPos)
+  return (target, rawArgs[0]![0])
 
 inductive TypeMod where | array | option | fallible deriving Inhabited, DecidableEq, Repr
 
@@ -518,7 +524,6 @@ structure LowerHooks (m : Type → Type) where
   lowerCall        : Syntax → Syntax → Array Syntax → ExprMode → (ExprMode → Syntax → m Term) → m (Option Term)
   lowerUnwrap      : Syntax → Syntax → ExprMode → m Term
   lowerAwait       : Syntax → Syntax → ExprMode → m Term
-  lowerSend        : Syntax → Syntax → ExprMode → m Term
   lowerFieldSetter : Syntax → Ident → m Term
   lowerJsx         : Syntax → ExprMode → m Term
   lowerArrElem     : Term → m Term
@@ -586,18 +591,22 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
         else
           let vs ← elems.mapM (go .val)
           vs.foldrM (init := vs.back!) (start := vs.size - 1) fun a acc => `(($a, $acc))
-      | "qedCdot" => `(·)
+      | "qedPlaceholder" => `(_)
       | "qedDotIdent" =>
         finish ⟨Syntax.node (.fromRef stx) ``Lean.Parser.Term.dotIdent #[Syntax.atom (.fromRef stx) ".", (stx.getArg 1)]⟩
       | "qedIdent" => hooks.lowerIdent stx ⟨(stx.getArg 0)⟩ mode
       | "qedUnwrap" => hooks.lowerUnwrap stx (stx.getArg 0) mode
       | "qedAwait" => hooks.lowerAwait stx (stx.getArg 1) mode
-      | "qedSendExpr" => hooks.lowerSend stx (stx.getArg 1) mode
       | "qedIndex" => hooks.lowerIndex stx (← go .val (stx.getArg 0)) (← go .val (stx.getArg 2)) mode
       | "qedProj" => hooks.lowerProj stx (← go .val (stx.getArg 0)) ⟨(stx.getArg 2)⟩ mode
       | "qedCall" =>
         let (calleeStx, rawArgs) := ((stx.getArg 0), (stx.getArg 2).getSepArgs)
         if let some custom ← hooks.lowerCall stx calleeStx rawArgs mode go then return custom
+        if calleeStx.getKind == ``qedIdent && (calleeStx.getArg 0).getId.eraseMacroScopes == `url &&
+            rawArgs.size == 1 && rawArgs[0]!.getKind == ``qedCallArgPos && (rawArgs[0]!.getArg 0).getKind == ``qedLitStr then
+          let info := SourceInfo.fromRef stx
+          let strLit := (rawArgs[0]!.getArg 0).getArg 0
+          return ← finish ⟨Syntax.node info `Qed.Jsx.qedUrlLit #[calleeStx.getArg 0, Syntax.atom info "(", strLit, Syntax.atom info ")"]⟩
         if !rawArgs.isEmpty && rawArgs.any (·.getKind == ``qedCallArgNamed) then
           unless rawArgs.all (·.getKind == ``qedCallArgNamed) do
             let calleeStr := stxSnippet calleeStx
@@ -739,7 +748,6 @@ def lowerSimpleQedExpr (mode : ExprMode) (stx : Syntax)
     (allowOptElse := false) (optElseFallback : MacroM Term := `(()))
     (lowerJsx? : Option (Syntax → ExprMode → MacroM Term) := none)
     (lowerFieldSetter? : Option (Syntax → Ident → MacroM Term) := none)
-    (lowerSend? : Option (Syntax → Syntax → ExprMode → MacroM Term) := none)
     (wrapNamedField : Term → MacroM Term := pure)
     (lowerIndex? : Option (Syntax → Term → Term → ExprMode → MacroM Term) := none) : MacroM Term :=
   lowerQedExpr {
@@ -751,8 +759,7 @@ def lowerSimpleQedExpr (mode : ExprMode) (stx : Syntax)
     lowerCall := fun _ _ _ _ _ => pure none
     lowerUnwrap := fun ref _ _ => Macro.throwErrorAt ref "operator `?` is only supported inside `server` functions with a fallible (`T!`) or optional (`T?`) return type"
     lowerAwait := fun ref _ _ => Macro.throwErrorAt ref "`await` is only supported in statements (`let x = await ...` or `field = await ...`)"
-    lowerSend := fun ref e m => match lowerSend? with | some f => f ref e m | none => Macro.throwErrorAt ref "`send ...` only has meaning inside a `component`"
-    lowerFieldSetter := fun ref fid => match lowerFieldSetter? with | some f => f ref fid | none => Macro.throwErrorAt ref s!"`({fid.getId} = ·)` is a component field setter and can only be used inside a `component`"
+    lowerFieldSetter := fun ref fid => match lowerFieldSetter? with | some f => f ref fid | none => Macro.throwErrorAt ref s!"`({fid.getId} = _)` is a component field setter and can only be used inside a `component`"
     lowerJsx := fun ref m => match lowerJsx? with
       | some f => f ref m
       | none =>

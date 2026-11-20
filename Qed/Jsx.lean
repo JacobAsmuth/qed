@@ -52,7 +52,7 @@ def jsxAssignItem : Parser :=
 @[jsxAttrVal_parser] def attrValAssign : Parser := leading_parser
   "{" >> atomic (ident >> jsxAssignOp) >> categoryParser `qedExpr 0 >>
   many (atomic (";" >> jsxAssignItem)) >>
-  optional (atomic (";" >> Qed.Lang.kw "send") >> categoryParser `qedExpr 0) >> "}"
+  optional (atomic (";" >> categoryParser `qedExpr 0)) >> "}"
 @[jsxAttrVal_parser] def attrValExpr : Parser := leading_parser "{" >> categoryParser `qedExpr 0 >> "}"
 
 syntax (name := attrNamed)  jsxName ("=" jsxAttrVal)? : jsxAttr
@@ -81,7 +81,7 @@ def elabQedCheckUrlVal : TermElab := fun stx expectedType? => do
   unless ty.hasMVar do
     let instTy ← mkAppM ``Qed.ToHref #[ty]
     if (← trySynthInstance instTy) matches .none then
-      throwErrorAt (stx.getArg 2) m!"URL attribute `{attrName}` requires a typed `Router` route or `Url`, got `{← Meta.ppExpr ty}` (raw strings are disallowed to prevent XSS).\nPass a route value (e.g. `{attrName}=\{Route.home}`), a validated literal (`{attrName}=\{url% \"/path\"}`), or parse dynamic strings with `Url.parse?`."
+      throwErrorAt (stx.getArg 2) m!"URL attribute `{attrName}` requires a typed `Router` route or `Url`, got `{← Meta.ppExpr ty}` (raw strings are disallowed to prevent XSS).\nPass a route value (e.g. `{attrName}=\{Route.home}`), a validated literal (`{attrName}=\{url(\"/path\")}`), or parse dynamic strings with `Url.parse?`."
   return e
 
 def tokenVal : Syntax → String
@@ -306,13 +306,13 @@ partial def attrsToTerms (rawAttrs : Array Syntax) (tag : String := "") : MacroM
         else
           checkSafeAttrName (stx.getArg 0) name
           if isUrlAttrName name then
-            Macro.throwErrorAt (stx.getArg 0) s!"URL attribute `{name}` requires a value (a `Router` route or `Url`, e.g. `{name}=\{Route.home}` or `{name}=\{url% \"/path\"}`)"
+            Macro.throwErrorAt (stx.getArg 0) s!"URL attribute `{name}` requires a value (a `Router` route or `Url`, e.g. `{name}=\{Route.home}` or `{name}=\{url(\"/path\")}`)"
           out := out.push (← `(Qed.attr $(Syntax.mkStrLit name) ""))
       else
         if isUrlAttrName name && (valNode.getArg 1).getKind == ``attrValStr then
           let raw := (⟨((valNode.getArg 1).getArg 0)⟩ : TSyntax `str).getString
           Macro.throwErrorAt ((valNode.getArg 1).getArg 0)
-            s!"URL attribute `{name}` cannot take raw string literal `\"{raw}\"` (raw strings are disallowed to prevent XSS and broken links).\nPass a typed `Router` route or a compile-time checked literal: `{name}=\{url% \"{raw}\"}`."
+            s!"URL attribute `{name}` cannot take raw string literal `\"{raw}\"` (raw strings are disallowed to prevent XSS and broken links).\nPass a typed `Router` route or a compile-time checked literal: `{name}=\{url(\"{raw}\")}`."
         let vT ← expandAttrVal valNode (`(""))
         let vChecked ← if isUrlAttrName name then `(qedCheckUrlVal% $(Syntax.mkStrLit name) ($vT)) else pure vT
         match attrHelper? name with
@@ -510,5 +510,16 @@ partial def expandJsxIn (stx : Syntax) : MacroM Syntax := do
 
 @[macro jsxTerm] def expandJsxTerm : Macro := fun stx => do
   return (← elementToTerm "" none (stx.getArg 0))
+
+@[term_parser] def qedUrlLit : Parser := leading_parser:maxPrec
+  atomic (Qed.Lang.kw "url" >> checkNoWsBefore "" >> "(") >> strLit >> ")"
+
+@[macro qedUrlLit] def expandQedUrlLit : Macro := fun stx => do
+  let s : TSyntax `str := ⟨stx.getArg 2⟩
+  let raw := s.getString
+  if !Qed.isSafeUrl raw then
+    Macro.throwErrorAt s
+      s!"unsafe URL literal `{raw}`: URLs must be root-relative (`/path`, not `//`), `#fragment`, `?query`, or explicit `https://`, `http://`, `mailto:`, `tel:` with no whitespace or control characters"
+  `(Qed.Url.mk $s (by decide))
 
 end Qed.Jsx

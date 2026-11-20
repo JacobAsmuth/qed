@@ -25,22 +25,12 @@ private partial def lowerPredictStmts (wrapVal : Term → CommandElabM Term) :
       if k == ``qedStmtPass then
         lowerPredictStmts wrapVal rest
       else if k == ``qedStmtReturn then
-        let valT ← lowerPredictExpr ((st.getArg 1).getArg 0)
-        let checked ← wrapVal valT
-        `(Option.some ($checked))
-      else if k == ``qedStmtEnsure then
-        let cond ← lowerCompExpr .propGuard (st.getArg 1)
-        let tT ← lowerPredictStmts wrapVal rest
-        let elseNode := (st.getArg 3)
-        let eT ← if elseNode.getKind == nullKind && elseNode.getNumArgs == 2 && elseNode[0]!.isAtom then
-            if (elseNode.getArg 1).getNumArgs == 1 then
-              let v ← wrapVal (← lowerPredictExpr ((elseNode.getArg 1).getArg 0))
-              `(Option.some ($v))
-            else `(Option.none)
-          else
-            let v ← wrapVal (← lowerPredictExpr elseNode)
-            `(Option.some ($v))
-        `(if $(mkIdent `_qedIf):ident : $cond then $tT else $eT)
+        if (st.getArg 1).getNumArgs == 0 then
+          `(Option.none)
+        else
+          let valT ← lowerPredictExpr ((st.getArg 1).getArg 0)
+          let checked ← wrapVal valT
+          `(Option.some ($checked))
       else if k == ``qedStmtLet then
         let rhsT ← lowerPredictExpr (st.getArg 4)
         let cont ← lowerPredictStmts wrapVal rest
@@ -54,31 +44,34 @@ private partial def lowerPredictStmts (wrapVal : Term → CommandElabM Term) :
         else
           `(let _ := $rhsT; $cont)
       else if k == ``qedStmtIf || k == ``qedStmtIfLet || k == ``qedStmtMatch then
+        let passTail := !rest.isEmpty && hasReturnStmt st
+        let tailStmts := if passTail then rest else []
+        let lowerBr (seq : Array Syntax) := lowerPredictStmts wrapVal (seq.toList ++ tailStmts)
         let brTerm ←
           if k == ``qedStmtIf then
             let cond ← lowerCompExpr .propGuard (st.getArg 1)
-            let tT ← lowerPredictStmts wrapVal (suiteStmts (st.getArg 3)).toList
-            let eT ← lowerPredictStmts wrapVal ((desugarElifs (st.getArg 4).getArgs (st.getArg 5)).getD #[]).toList
+            let tT ← lowerBr (suiteStmts (st.getArg 3))
+            let eT ← lowerBr ((desugarElifs (st.getArg 4).getArgs (st.getArg 5)).getD #[])
             `(if $(mkIdent `_qedIf):ident : $cond then $tT else $eT)
           else if k == ``qedStmtIfLet then
             let pat ← liftMacroM (lowerQedPat (st.getArg 2))
             let scrut ← lowerPredictExpr (st.getArg 4)
-            let tT ← lowerPredictStmts wrapVal (suiteStmts (st.getArg 6)).toList
-            let eT ← lowerPredictStmts wrapVal (if (st.getArg 7).getNumArgs == 3 then (suiteStmts ((st.getArg 7).getArg 2)).toList else [])
+            let tT ← lowerBr (suiteStmts (st.getArg 6))
+            let eT ← lowerBr (if (st.getArg 7).getNumArgs == 3 then suiteStmts ((st.getArg 7).getArg 2) else #[])
             `(match $(mkIdent `_qedIfLet):ident : $scrut:term with | $pat:term => $tT | _ => $eT)
           else
             let scruts ← (st.getArg 1).getSepArgs.mapM lowerPredictExpr
             let alts ← (st.getArg 3).getArgs.mapM fun alt => do
               let pats ← (alt.getArg 1).getSepArgs.mapM fun p => liftMacroM (lowerQedPat p)
-              `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $(← lowerPredictStmts wrapVal (suiteStmts (alt.getArg 3)).toList))
+              `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $(← lowerBr (suiteStmts (alt.getArg 3))))
             `(match $[$scruts:term],* with $[$alts:matchAlt]*)
-        if rest.isEmpty then
+        if passTail || rest.isEmpty then
           return brTerm
         else
           let restT ← lowerPredictStmts wrapVal rest
           `(match $brTerm:term with | Option.some _pv => Option.some _pv | Option.none => $restT)
       else
-        throwErrorAt st "`predict:` only supports pure `let`, `if`, `if let`, `match`, `ensure`, `pass`, and `return <expr>`"
+        throwErrorAt st "`predict:` only supports pure `let`, `if`, `if let`, `match`, `pass`, and `return`"
 
 private partial def compileClassifyTree (spec : ComponentSpec) : ClassifyTree → CommandElabM Term
   | .normal => `(Qed.SpecAction.normal)

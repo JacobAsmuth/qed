@@ -33,7 +33,7 @@ def cmdNew (dir : String) : IO UInt32 := do
     "    if quantity < 10: quantity += 1\n" ++
     "  action decrease:\n" ++
     "    if quantity > 1: quantity -= 1\n" ++
-    "  invariant 1 <= quantity <= 10\n" ++
+    "  invariant inRange: 1 <= quantity <= 10\n" ++
     "  view:\n" ++
     "    <div>\n" ++
     "      <button onClick={.decrease}>−</button>\n" ++

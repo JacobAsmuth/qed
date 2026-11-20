@@ -48,9 +48,9 @@ server Catalog:
   ]
   state totalOrders: Nat = 0
 
-  invariant all b in books: b.stock <= 10000
-  invariant totalOrders >= old(totalOrders)
-  invariant mutating books requires ctx.userId != none
+  invariant booksBounded: all b in books: b.stock <= 10000
+  invariant ordersMonotonic: totalOrders >= old(totalOrders)
+  invariant authBooks: mutating books requires ctx.userId != none
 
   def list() -> Book[]:
     return books
@@ -68,17 +68,19 @@ server Catalog:
     requires ctx.userId != none
     requires 1 <= qty <= 50
     ensures result.slot == idx, result.stock < 10000
-    let bookId = atomic:
-      ensure idx < books.size and books[idx].slot == idx else fail(.notFound)
-      ensure books[idx].stock >= qty else fail(.outOfStock)
-      return books[idx].id
+    atomic:
+      if idx >= books.size: return fail(.notFound)
+      if books[idx].slot != idx: return fail(.notFound)
+      if books[idx].stock < qty: return fail(.outOfStock)
+      let bookId = books[idx].id
     let _ = await CloudflareD1.query(cfAccount, d1Db, D1Query(
       sql="INSERT INTO orders (book_id, qty) VALUES (?, ?)",
       params=[bookId, toString(qty)])) catch _:
       D1Result(success=false)
-    return atomic:
-      ensure idx < books.size and books[idx].slot == idx else fail(.notFound)
-      ensure books[idx].stock >= qty else fail(.outOfStock)
+    atomic:
+      if idx >= books.size: return fail(.notFound)
+      if books[idx].slot != idx: return fail(.notFound)
+      if books[idx].stock < qty: return fail(.outOfStock)
       books[idx].stock -= qty
       totalOrders += 1
       return books[idx]
@@ -88,8 +90,8 @@ server Catalog:
     requires 1 <= id.length <= 64, 1 <= title.length <= 200, stock <= 10000
     ensures result.id == id, result.stock == stock
     await GcpStorage.upload(gcsBucket, f"covers/{id}.png", coverPng)?
-    return atomic:
-      ensure books.size < 1000 else fail(.catalogFull)
+    atomic:
+      if books.size >= 1000: return fail(.catalogFull)
       let nb = Book(slot=books.size, id=id, title=title, stock=stock)
       books.push(nb)
       return nb

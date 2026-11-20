@@ -12,13 +12,13 @@ schema SpecBook:
 
 server StoreSrv:
   state stock : Nat = 10
-  invariant stock <= 10000
+  invariant maxStock: stock <= 10000
 
   def placeOrder(qty: Nat) -> Nat!:
     requires ctx.userId != none
     requires 1 <= qty <= 10
     ensures result <= 10000
-    ensure stock >= qty else fail(.outOfStock)
+    if stock < qty: return fail(.outOfStock)
     stock -= qty
     return stock
 
@@ -43,8 +43,9 @@ server CatalogSrv:
     requires ctx.userId != none
     requires 1 <= qty <= 10
     ensures result.slot == idx, result.stock < 10000
-    ensure idx < books.size and books[idx].slot == idx else fail(.notFound)
-    ensure books[idx].stock >= qty else fail(.outOfStock)
+    if idx >= books.size: return fail(.notFound)
+    if books[idx].slot != idx: return fail(.notFound)
+    if books[idx].stock < qty: return fail(.outOfStock)
     books[idx].stock -= qty
     return books[idx]
 
@@ -69,23 +70,23 @@ component BadPredictEnsures:
       remaining = rem
   view: <span>{remaining}</span>
 
--- 1b. Rejects `perform` inside speculative continuation after `predict`
+-- 1b. Rejects side effects inside speculative continuation after `predict`
 /--
-error: cannot use `perform` inside a speculative continuation after `predict` (side effects cannot be rolled back); move it into `on_confirm:`
+error: cannot run side effects or emit events inside a speculative continuation after `predict` (side effects cannot be rolled back); move it into `on_confirm:`
 -/
 #guard_msgs in
 component BadSpecPerform:
   session user
   port log : String
   state remaining : Nat = 10
-  invariant remaining <= 10000
+  invariant validRemaining: remaining <= 10000
   action buy:
     if user.isSome and 1 <= remaining:
       let rem = await StoreSrv.placeOrder(1) predict remaining - 1 catch:
         case .outOfStock: pass
         case .failed(_): pass
       remaining = rem
-      perform log("bought")
+      log.send("bought")
   view: <span>{remaining}</span>
 
 -- 1c. Rejects nested `await` inside speculative continuation after `predict`
@@ -96,7 +97,7 @@ error: cannot `await` inside a speculative continuation after `predict`; move se
 component BadSpecNestedAwait:
   session user
   state remaining : Nat = 10
-  invariant remaining <= 10000
+  invariant validRemaining: remaining <= 10000
   action buy:
     if user.isSome and 1 <= remaining:
       let rem = await StoreSrv.placeOrder(1) predict remaining - 1 catch:
@@ -204,7 +205,7 @@ error: `await StoreSrv.placeOrder(...)` has unhandled domain error(s): .outOfSto
 component BadPredictUnhandledDomainErr:
   session user
   state remaining : Nat = 10
-  invariant remaining <= 10000
+  invariant validRemaining: remaining <= 10000
   action buy:
     if user.isSome and 1 <= remaining:
       let rem = await StoreSrv.placeOrder(1) predict remaining - 1
@@ -256,7 +257,7 @@ component CheckoutSpec:
     note = s
 
   action buy(qty: Nat):
-    ensure user.isSome and 1 <= qty <= 10 and qty <= remaining else return
+    if not (user.isSome and 1 <= qty <= 10 and qty <= remaining): return
     clicks += 1
     let rem = await StoreSrv.placeOrder(qty)
       predict remaining - qty

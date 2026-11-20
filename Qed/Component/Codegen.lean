@@ -120,11 +120,6 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
         compileStmts spec sBase mutated out? cmds rest
       else if sk == ``qedStmtReturn then
         mkUpdateRet spec (← flushMutated sBase mutated) out? cmds
-      else if sk == ``qedStmtEnsure then
-        let cond ← lowerCompExpr .propGuard (s.getArg 1)
-        let tT ← compileStmts spec sBase mutated out? cmds rest
-        let eT ← mkUpdateRet spec (← flushMutated sBase mutated) out? cmds
-        `(if $(mkIdent `_qedIf):ident : $cond then $tT else $eT)
       else if sk == ``qedStmtLet then
         let lVal ← lowerCompExpr .val (s.getArg 4)
         let cont ← compileStmts spec sBase mutated out? cmds rest
@@ -141,7 +136,7 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
           let fId : Ident := ⟨((s.getArg 0).getArg 0)⟩
           let fname := fId.getId.eraseMacroScopes
           let valTerm ←
-            if op == "=" && isCdot (s.getArg 2) then `(v)
+            if op == "=" && isPlaceholder (s.getArg 2) then `(v)
             else desugarAssign fname op (← lowerCompExpr .val (s.getArg 2))
           if spec.bindNames.contains fname then
             if out?.isSome then
@@ -169,7 +164,13 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
           let what := if lhsStr.isEmpty then "" else s!" `{lhsStr} {op} ...`"
           throwErrorAt s s!"unsupported assignment{what} in component action; expected `field = val`, `field += val`, `field -= val`, or `arr[i] = val`"
       else if sk == ``qedStmtExpr then
-        if let some (targetStx, elemStx) := matchPushCall? (s.getArg 0) then
+        let exprStx := s.getArg 0
+        let compileCmd : CommandElabM Term := do
+          let cmdT ← lowerCompExpr .val exprStx
+          let cmdId := mkIdent (Name.mkSimple s!"_cmd_{cmds.size}")
+          let cont ← compileStmts spec sBase mutated out? (cmds.push (cmdId : Term)) rest
+          `(let $cmdId:ident := ($cmdT : Qed.Cmd $(mkIdent (spec.t.getId ++ `Msg))); $cont)
+        if let some (targetStx, elemStx) := matchPushCall? exprStx then
           unless targetStx.getKind == ``qedIdent do
             let tgtStr := stxSnippet targetStx
             let got := if tgtStr.isEmpty then "" else s!", got `{tgtStr}.push(...)`"
@@ -182,27 +183,30 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
           let fIdent := mkIdent fname
           let cont ← compileStmts spec sBase (mutated.push fname) out? cmds rest
           `(let $fIdent:ident := ($fIdent).push $elemT; $cont)
-        else
-          let sn := stxSnippet (s.getArg 0)
-          let what := if sn.isEmpty then "" else s!" `{sn}`"
-          throwErrorAt s s!"bare expression{what} has no effect in a component action; assign a `state` field (`field = ...`), call `arr.push(...)`, `perform ...`, or `send ...`"
-      else if sk == ``qedStmtSend then
-        let callStx := unwrapParens1 (s.getArg 1)
-        let matchedSub? : Option SubDecl :=
-          if callStx.getKind == ``qedCall && (callStx.getArg 0).getKind == ``qedIdent then
-            let cname := ((callStx.getArg 0).getArg 0).getId.eraseMacroScopes
-            spec.subscriptions.find? (·.id.getId.eraseMacroScopes == cname)
-          else none
-        match matchedSub? with
-        | some sub =>
-            unless sub.chInfo.hasSend do
-              throwErrorAt s s!"channel `{sub.chInfo.ownerShort}.{sub.chInfo.channelName}` does not declare `on_send` / `send`"
-            let rawArgs := (callStx.getArg 2).getSepArgs
-            if rawArgs.size != sub.chInfo.sendParamCount then
-              throwErrorAt callStx s!"`send {sub.id.getId}(...)` expects {sub.chInfo.sendParamCount} argument(s), got {rawArgs.size}"
+        else if let some (targetId, meth, rawArgs) := matchIdentMethodCall? exprStx then
+          let tname := targetId.getId.eraseMacroScopes
+          if meth == "emit" && spec.events.any (·.id.getId.eraseMacroScopes == tname) then
+            let some ev := spec.events.find? (·.id.getId.eraseMacroScopes == tname) | unreachable!
+            if out?.isSome then
+              throwErrorAt s "duplicate `.emit(...)` in action; an action emits at most one output"
+            if rawArgs.size != ev.params.size then
+              throwErrorAt exprStx s!"`{tname}.emit(...)` expects {ev.params.size} argument(s), got {rawArgs.size}"
             let argTerms ← rawArgs.mapM fun ra => do
               unless ra.getKind == ``qedCallArgPos do
-                throwErrorAt ra s!"named arguments are not supported in `send {sub.id.getId}(...)`"
+                throwErrorAt ra s!"named arguments are not supported in `{tname}.emit(...)`"
+              lowerCompExpr .val (ra.getArg 0)
+            let outCtor := mkIdentFrom targetId (spec.t.getId ++ `Out ++ ev.id.getId)
+            let outTerm ← argTerms.foldlM (init := (outCtor : Term)) fun acc a => `($acc $a)
+            compileStmts spec sBase mutated (some outTerm) cmds rest
+          else if meth == "send" && spec.subscriptions.any (·.id.getId.eraseMacroScopes == tname) then
+            let some sub := spec.subscriptions.find? (·.id.getId.eraseMacroScopes == tname) | unreachable!
+            unless sub.chInfo.hasSend do
+              throwErrorAt s s!"channel `{sub.chInfo.ownerShort}.{sub.chInfo.channelName}` does not declare `on_send` / `send`"
+            if rawArgs.size != sub.chInfo.sendParamCount then
+              throwErrorAt exprStx s!"`{sub.id.getId}.send(...)` expects {sub.chInfo.sendParamCount} argument(s), got {rawArgs.size}"
+            let argTerms ← rawArgs.mapM fun ra => do
+              unless ra.getKind == ``qedCallArgPos do
+                throwErrorAt ra s!"named arguments are not supported in `{sub.id.getId}.send(...)`"
               lowerCompExpr .val (ra.getArg 0)
             let chFullId := mkIdentFrom s sub.chInfo.fullName
             let slotLit := Syntax.mkStrLit sub.id.getId.toString
@@ -210,16 +214,26 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
             let cmdId := mkIdent (Name.mkSimple s!"_wsSendCmd_{cmds.size}")
             let cont ← compileStmts spec sBase mutated out? (cmds.push (cmdId : Term)) rest
             `(let $cmdId:ident := $sendCmd; $cont)
-        | none =>
+          else if meth == "send" && spec.portOuts.any (·.id.getId.eraseMacroScopes == tname) then
+            let some po := spec.portOuts.find? (·.id.getId.eraseMacroScopes == tname) | unreachable!
+            if rawArgs.size != 1 then
+              throwErrorAt exprStx s!"`{po.id.getId}.send(...)` expects 1 argument, got {rawArgs.size}"
+            unless rawArgs[0]!.getKind == ``qedCallArgPos do
+              throwErrorAt rawArgs[0]! s!"named arguments are not supported in `{po.id.getId}.send(...)`"
+            let argT ← lowerCompExpr .val (rawArgs[0]!.getArg 0)
+            let poFn := mkIdentFrom targetId (spec.t.getId ++ po.id.getId)
+            let cmdId := mkIdent (Name.mkSimple s!"_portCmd_{cmds.size}")
+            let cont ← compileStmts spec sBase mutated out? (cmds.push (cmdId : Term)) rest
+            `(let $cmdId:ident := $poFn $argT; $cont)
+          else if meth == "emit" then
             unless spec.outTy?.isSome do noEmitsErr s
-            if out?.isSome then throwErrorAt s "duplicate `send` in action; an action emits at most one output"
-            let sendT ← lowerCompExpr .val (s.getArg 1)
-            compileStmts spec sBase mutated (some sendT) cmds rest
-      else if sk == ``qedStmtPerform then
-        let perfT ← lowerCompExpr .val (s.getArg 1)
-        let cmdId := mkIdent (Name.mkSimple s!"_perfCmd_{cmds.size}")
-        let cont ← compileStmts spec sBase mutated out? (cmds.push (cmdId : Term)) rest
-        `(let $cmdId:ident := $perfT; $cont)
+            throwErrorAt targetId s!"unknown `event` `{tname}` in `{tname}.emit(...)`"
+          else if meth == "send" then
+            throwErrorAt targetId s!"unknown `subscribe` channel or outbound `port` `{tname}` in `{tname}.send(...)`"
+          else
+            compileCmd
+        else
+          compileCmd
       else if sk == ``qedStmtIf || sk == ``qedStmtIfLet || sk == ``qedStmtMatch then
         let passTail := !rest.isEmpty && hasReturnStmt s
         let sFlushed ← flushMutated sBase mutated
@@ -375,16 +389,13 @@ private def mkOwnUpdateArms (spec : ComponentSpec) (sites : Array SetSite) (unch
     let mut rhs ← (match site.stmts? with
       | some stmts => do
           let isPureNoop := stmts.all fun st =>
-            ![``qedStmtAssign, ``qedStmtExpr, ``qedStmtSend, ``qedStmtPerform,
-              ``qedStmtIf, ``qedStmtIfLet, ``qedStmtMatch, ``qedStmtPass, ``qedStmtEnsure].contains st.getKind
+            ![``qedStmtAssign, ``qedStmtExpr,
+              ``qedStmtIf, ``qedStmtIfLet, ``qedStmtMatch, ``qedStmtPass].contains st.getKind
           if isPureNoop then
-            throwErrorAt stmts[0]! s!"action `{site.ctor}` has no state update, effect, or `send`; add a state assignment, `perform`, `send`, or `pass`"
+            throwErrorAt stmts[0]! s!"action `{site.ctor}` has no state update or effect; add a state assignment, effect, or `pass`"
           compileStmts spec (← `(s)) #[] none #[] stmts.toList
       | none => do mkUpdateRet spec (← flushAssigns (← `(s)) site.assigns) site.send? #[])
-    rhs ← bindMentionedFields spec (fun g =>
-      (site.stmts?.any (·.any (mentionsIdent · g))) ||
-      (site.assigns.any fun (_, e?) => e?.any (mentionsIdent ·.raw g)) ||
-      (site.send?.any (mentionsIdent ·.raw g))) rhs
+    rhs ← bindMentionedFields spec (mentionsIdent rhs.raw) rhs
     if !site.params.isEmpty then
       let ids : Array Term := site.params.map (⟨·.1.raw⟩)
       `(Lean.Parser.Term.matchAltExpr| | $cFull:ident $ids* => $rhs)
@@ -421,13 +432,9 @@ private def mkOwnUpdateArms (spec : ComponentSpec) (sites : Array SetSite) (unch
   for q in spec.queries do
     let qNm := q.id
     let qCtor := mkIdent (tId ++ `Msg ++ q.ctorName)
-    let (keyBound, plainRes) ← match q.source with
-      | .url keyExpr _ =>
-          pure (← bindMentionedFields spec (mentionsIdent keyExpr.raw) keyExpr, (⟨(mkIdent `_qr).raw⟩ : Term))
-      | .rpc rspec =>
-          let kb ← `(Qed.rpcQueryKey $(← mkRpcQueryParamsBody spec rspec))
-          let pr ← if rspec.hasMsgEnsured then `(Qed.Resource.stripEnsured _qr) else `(_qr)
-          pure (kb, pr)
+    let rspec := q.rpc
+    let keyBound ← `(Qed.rpcQueryKey $(← mkRpcQueryParamsBody spec rspec))
+    let plainRes ← if rspec.hasMsgEnsured then `(Qed.Resource.stripEnsured _qr) else `(_qr)
     let next ← `({ s with $qNm:ident := (s.$qNm:ident).put _qk $plainRes $keyBound })
     ownArms := ownArms.push (← `(Lean.Parser.Term.matchAltExpr|
       | $qCtor:ident _qk _qr => $(← mkUpdateRet spec next none #[])))
@@ -441,7 +448,7 @@ private def mkOwnUpdateArms (spec : ComponentSpec) (sites : Array SetSite) (unch
     let joinBody ← match sub.onJoin? with
       | some (binder?, stmts) =>
           let mut b ← compileStmts spec (← `(s)) #[] none #[] stmts.toList
-          b ← bindMentionedFields spec (fun g => stmts.any (mentionsIdent · g)) b
+          b ← bindMentionedFields spec (mentionsIdent b.raw) b
           match binder? with
           | some bStx =>
               if bStx.isIdent then
@@ -457,7 +464,7 @@ private def mkOwnUpdateArms (spec : ComponentSpec) (sites : Array SetSite) (unch
     let msgBody ← match sub.onMsg? with
       | some (bStx, stmts) =>
           let mut b ← compileStmts spec (← `(s)) #[] none #[] stmts.toList
-          b ← bindMentionedFields spec (fun g => stmts.any (mentionsIdent · g)) b
+          b ← bindMentionedFields spec (mentionsIdent b.raw) b
           if sub.hasMsgEnsured then
             if bStx.isIdent then
               let bId : Ident := ⟨bStx⟩
@@ -478,7 +485,7 @@ private def mkOwnUpdateArms (spec : ComponentSpec) (sites : Array SetSite) (unch
     let stBody ← match sub.onStatus? with
       | some (bStx, stmts) =>
           let mut b ← compileStmts spec sWithSt #[] none #[] stmts.toList
-          b ← bindMentionedFields spec (fun g => g != subNm.getId && stmts.any (mentionsIdent · g)) b
+          b ← bindMentionedFields spec (fun g => g != subNm.getId && mentionsIdent b.raw g) b
           b ← `(let $(mkIdent subNm.getId):ident := _wst; $b)
           if bStx.isIdent then
             let bId : Ident := ⟨bStx⟩

@@ -63,17 +63,17 @@ server Store:
   state stock       : Nat = 10
   state totalOrders : Nat = 0
 
-  invariant stock <= 10000
-  invariant totalOrders >= old(totalOrders)
-  invariant mutating stock requires ctx.userId != none
+  invariant maxStock: stock <= 10000
+  invariant ordersMonotonic: totalOrders >= old(totalOrders)
+  invariant authStock: mutating stock requires ctx.userId != none
 
   def placeOrder(qty: Nat) -> Nat!:
     requires ctx.userId != none
     requires 1 <= qty <= 10
     ensures result <= 10000
     await PaymentApi.charge(qty)?
-    return atomic:
-      ensure stock >= qty else fail(.outOfStock)
+    atomic:
+      if stock < qty: return fail(.outOfStock)
       stock -= qty
       totalOrders += 1
       return stock
@@ -143,7 +143,7 @@ style disabledStyle:
 
 component ModeButtons:
   state editing = false
-  invariant exactlyOne("edit", "save", enabledStyle, disabledStyle)
+  invariant modeExclusive: exactlyOne("edit", "save", enabledStyle, disabledStyle)
   view:
     <div>
       <button role="edit" disabled={editing} onClick={editing = true}

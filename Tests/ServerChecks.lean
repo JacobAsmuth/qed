@@ -78,7 +78,7 @@ server BadUnhandledError:
 error: Array index `idx` could be out of bounds for `items`:
   • must satisfy:  idx < items.size
 
-Hint: Guard this access with `if idx < items.size:` or `ensure idx < items.size else ...`.
+Hint: Guard this access with `if idx < items.size:`.
 -/
 #guard_msgs in
 server BadArrayBounds:
@@ -90,7 +90,7 @@ server BadArrayBounds:
 /--
 error: Schema field rule `1 <= "".length and "".length <= 32` failed for `""`.
 
-Hint: Guard this value with `if ...:`, `ensure ... else ...`, or a `requires` precondition so it satisfies the schema's `where` rule.
+Hint: Guard this value with `if ...:` or a `requires` precondition so it satisfies the schema's `where` rule.
 -/
 #guard_msgs in
 server BadFieldRefinement:
@@ -99,45 +99,45 @@ server BadFieldRefinement:
 
 -- 8. Rejects mutation that can violate a single-state `invariant`
 /--
-error: Server invariant `stock <= 100` failed in `overflow`:
+error: Server invariant `maxStock` failed in `overflow`:
   • must satisfy:  stock + 50 <= 100
 
-Hint: Guard state mutations with `if ...:`, `ensure ... else ...`, or `requires ...` so this invariant holds across every branch.
+Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant holds across every branch.
 -/
 #guard_msgs in
 server BadSingleStateInv:
   state stock: Nat = 10
-  invariant stock <= 100
+  invariant maxStock: stock <= 100
   def overflow() -> Nat:
     stock += 50
     return stock
 
 -- 9. Rejects mutation that violates a two-state `old(...)` monotonicity `invariant`
 /--
-error: Server invariant `orders >= old(orders)` failed in `resetOrders`:
+error: Server invariant `ordersMonotonic` failed in `resetOrders`:
   • must satisfy:  0 >= orders
 
-Hint: Guard state mutations with `if ...:`, `ensure ... else ...`, or `requires ...` so this invariant holds across every branch.
+Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant holds across every branch.
 -/
 #guard_msgs in
 server BadTwoStateInv:
   state orders: Nat = 5
-  invariant orders >= old(orders)
+  invariant ordersMonotonic: orders >= old(orders)
   def resetOrders() -> Nat:
     orders = 0
     return orders
 
--- 10. Rejects mutation that violates `invariant mutating <field> requires <cond>`
+-- 10. Rejects mutation that violates `invariant <name>: mutating <field> requires <cond>`
 /--
-error: Server invariant `mutating items requires ctx.userId != none` failed in `unauthenticatedPush`:
+error: Server invariant `authItems` failed in `unauthenticatedPush`:
   • must satisfy:  items.push x = items or ctx.userId != none
 
-Hint: Add a matching `requires` clause or guard mutations of that field with `if ...:` / `ensure ... else ...`.
+Hint: Add a matching `requires` clause or guard mutations of that field with `if ...:`.
 -/
 #guard_msgs in
 server BadMutatingAuthInv:
   state items: Nat[] = [1]
-  invariant mutating items requires ctx.userId != none
+  invariant authItems: mutating items requires ctx.userId != none
   def unauthenticatedPush(x: Nat) -> Nat:
     items.push(x)
     return items.size
@@ -176,7 +176,7 @@ server OtherSrv:
 error: RPC `CheckedSrv.buy` precondition `1 <= qty <= 50` could not be proved here:
   • must satisfy:  1 <= 0 and 0 <= 50
 
-Hint: Pass valid arguments, guard with `if`/`ensure`, or add a component `invariant`.
+Hint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`.
 -/
 #guard_msgs in
 component BadClientRequiresParam:
@@ -247,7 +247,7 @@ component InvariantSatisfiesRequires:
     if 1 <= q <= 50:
       qty = q
   action purchase:
-    ensure user.isSome else return
+    if not user.isSome: return
     let got = await CheckedSrv.buy(qty) catch:
       case .soldOut:      pass
       case .limitReached: pass
@@ -280,7 +280,7 @@ component BadMutatingQuery:
 error: RPC `QuerySrv.quote` precondition `1 <= qty <= 50` could not be proved here:
   • must satisfy:  1 <= 0 and 0 <= 50
 
-Hint: Pass valid arguments, guard with `if`/`ensure`, or add a component `invariant`.
+Hint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`.
 -/
 #guard_msgs in
 component BadQueryRequiresParam:
@@ -292,7 +292,7 @@ component BadQueryRequiresParam:
 /--
 error: RPC `QuerySrv.quote` requires an authenticated session (`user != none`), which could not be proved here.
 
-Hint: Guard this call with `if user.isSome:`, `ensure user.isSome else return`, or `invariant ...: user.isSome`.
+Hint: Guard this call with `if user.isSome:` or `invariant ...: user.isSome`.
 -/
 #guard_msgs in
 component BadQueryRequiresAuth:
@@ -343,7 +343,7 @@ server BadEmitSrv:
     on_join:
       pass
   def pushBad() -> Unit:
-    emit bounded(99)
+    bounded.emit(99)
     return ()
 
 server WsCheckSrv:
@@ -355,7 +355,7 @@ server WsCheckSrv:
       pass
     on_send(v: Nat):
       requires v <= 50
-      emit gauge(room, v)
+      gauge.emit(room, v)
     on_leave:
       pass
 
@@ -363,7 +363,7 @@ server WsCheckSrv:
 /--
 error: RPC `WsCheckSrv.gauge` requires an authenticated session (`user != none`), which could not be proved here.
 
-Hint: Guard this call with `if user.isSome:`, `ensure user.isSome else return`, or `invariant ...: user.isSome`.
+Hint: Guard this call with `if user.isSome:` or `invariant ...: user.isSome`.
 -/
 #guard_msgs in
 component BadSubNoAuth:
@@ -378,7 +378,7 @@ component BadSubNoAuth:
 error: RPC `WsCheckSrv.gauge` precondition `room <= 10` could not be proved here:
   • must satisfy:  99 <= 10
 
-Hint: Pass valid arguments, guard with `if`/`ensure`, or add a component `invariant`.
+Hint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`.
 -/
 #guard_msgs in
 component BadSubBadParam:
@@ -393,7 +393,7 @@ component BadSubBadParam:
 error: RPC `WsCheckSrv.gauge.send` precondition `v <= 50` could not be proved here:
   • must satisfy:  77 <= 50
 
-Hint: Pass valid arguments, guard with `if`/`ensure`, or add a component `invariant`.
+Hint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`.
 -/
 #guard_msgs in
 component BadSendParam:
@@ -402,7 +402,7 @@ component BadSendParam:
     on_message(v):
       pass
   action go:
-    send g(77)
+    g.send(77)
   view: <span>ok</span>
 
 -- 26. Rejects `fullstack` mounting a server when client subscribes to a different server's channel
@@ -432,7 +432,7 @@ component VerifiedWsEnsures:
       lastVal = v
   action sendOk(n: Nat):
     if n <= 50:
-      send g(n)
+      g.send(n)
   view: <span>{lastVal}</span>
 
 end ServerChecks

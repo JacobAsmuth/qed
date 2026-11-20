@@ -50,7 +50,7 @@ private def elabPureComponent (spec : ComponentSpec) (body' : Term) : CommandEla
   for invStx in spec.invariants do
     if invStx.getKind == ``compForEachInvClause then
       throwErrorAt invStx "a pure component has no local state; `for_each` applies to stateful components"
-    let invId ← resolveInvIdent invStx tId
+    let invId := resolveInvIdent invStx tId
     let rawClauses := (invStx.getArg 2).getSepArgs
     let loweredClauses ← rawClauses.mapM (lowerCompExpr .val)
     let vPred ← match loweredClauses.toList with
@@ -163,38 +163,29 @@ private def mkCompQueriesCmd? (spec : ComponentSpec) : CommandElabM (Option (TSy
   let qTerms ← spec.queries.mapM fun q => do
     let qNm := q.id
     let qCtor := mkIdent (tId ++ `Msg ++ q.ctorName)
-    match q.source with
-    | .url keyExpr urlExpr =>
-        let keyBound ← bindMentionedFields spec (mentionsIdent keyExpr.raw) keyExpr
-        `(Resource.query
-            (key := fun (s : $stateId) => $keyBound)
-            (url := $urlExpr)
-            (got := $qCtor)
-            (get := fun (s : $stateId) => s.$qNm:ident)
-            (set := fun c (s : $stateId) => { s with $qNm:ident := c }))
-    | .rpc rspec =>
-        let reqTupleTy ← mkRightTuple (`(Unit)) (fun a b => `($a × $b))
-          (rspec.mInfo.paramTypeConsts.toList.map fun n => (mkIdent n : Term))
-        let paramsBody ← mkRpcQueryParamsBody spec rspec
-        let fetchBody ← mkRpcQueryBranches spec rspec fun qaIds => do
-          let cbTerm : Term ← if !rspec.hasMsgEnsured then
-              `(_qgot _qk)
-            else
-              let some ensConst := rspec.mInfo.ensPredConst
-                | throwErrorAt rspec.rpcRef "internal: missing server `ensures` predicate in `query`"
-              let ensApp ← qaIds.foldlM (init := (mkIdent ensConst : Term)) fun acc a => `($acc $a)
-              let exPrf ← qaIds.foldrM (init := ← `(_qe.ok)) fun qa acc => `(Exists.intro $qa $acc)
-              `(fun (_qr : Qed.Resource (Qed.Ensured $(q.ty) ($ensApp))) => _qgot _qk (_qr.map fun _qe => ⟨_qe.val, $exPrf⟩))
-          let qaTerms : Array Term := qaIds.map (⟨·.raw⟩)
-          let srvId := mkIdentFrom rspec.rpcRef rspec.srvInfo.serverName
-          let methId := mkIdentFrom rspec.rpcRef (Name.mkSimple rspec.mInfo.name)
-          `(some $(← withRef rspec.rpcRef `(qedCheckRpcCall% $srvId:ident $methId:ident [$[$qaTerms:term],*] $cbTerm)))
-        `(Qed.Resource.rpcQuery (Req := $reqTupleTy)
-            (params? := fun (s : $stateId) => $paramsBody)
-            (fetch := fun (s : $stateId) _qgot _qk => $fetchBody)
-            (got := $qCtor)
-            (get := fun (s : $stateId) => s.$qNm:ident)
-            (set := fun c (s : $stateId) => { s with $qNm:ident := c }))
+    let rspec := q.rpc
+    let reqTupleTy ← mkRightTuple (`(Unit)) (fun a b => `($a × $b))
+      (rspec.mInfo.paramTypeConsts.toList.map fun n => (mkIdent n : Term))
+    let paramsBody ← mkRpcQueryParamsBody spec rspec
+    let fetchBody ← mkRpcQueryBranches spec rspec fun qaIds => do
+      let cbTerm : Term ← if !rspec.hasMsgEnsured then
+          `(_qgot _qk)
+        else
+          let some ensConst := rspec.mInfo.ensPredConst
+            | throwErrorAt rspec.rpcRef "internal: missing server `ensures` predicate in `query`"
+          let ensApp ← qaIds.foldlM (init := (mkIdent ensConst : Term)) fun acc a => `($acc $a)
+          let exPrf ← qaIds.foldrM (init := ← `(_qe.ok)) fun qa acc => `(Exists.intro $qa $acc)
+          `(fun (_qr : Qed.Resource (Qed.Ensured $(q.ty) ($ensApp))) => _qgot _qk (_qr.map fun _qe => ⟨_qe.val, $exPrf⟩))
+      let qaTerms : Array Term := qaIds.map (⟨·.raw⟩)
+      let srvId := mkIdentFrom rspec.rpcRef rspec.srvInfo.serverName
+      let methId := mkIdentFrom rspec.rpcRef (Name.mkSimple rspec.mInfo.name)
+      `(some $(← withRef rspec.rpcRef `(qedCheckRpcCall% $srvId:ident $methId:ident [$[$qaTerms:term],*] $cbTerm)))
+    `(Qed.Resource.rpcQuery (Req := $reqTupleTy)
+        (params? := fun (s : $stateId) => $paramsBody)
+        (fetch := fun (s : $stateId) _qgot _qk => $fetchBody)
+        (got := $qCtor)
+        (get := fun (s : $stateId) => s.$qNm:ident)
+        (set := fun c (s : $stateId) => { s with $qNm:ident := c }))
   return some (← `(command|
     set_option linter.unusedVariables false in
     def $(mkIdent (tId ++ `queries)) : List (Query $stateId $msgId) := [$[$qTerms],*]))
@@ -562,13 +553,14 @@ private def withOpenNs {α : Type} (ns : Name) (k : CommandElabM α) : CommandEl
         for ch in h.info.usedChannels do
           unless allUsedChannels.contains ch do
             allUsedChannels := allUsedChannels.push ch
+      let eventNames := rawSpec.events.map (·.id.getId)
       let ownHasEffects :=
         !starts'.isEmpty ||
         !rawSpec.portOuts.isEmpty || !rawSpec.portIns.isEmpty || !queries'.isEmpty ||
         !rawSpec.subscriptions.isEmpty ||
         !specResolves.isEmpty ||
-        sites.any (fun s => s.stmts?.any (·.any hasPerformNode)) ||
-        (route'?.any fun rd => rd.alts.any hasPerformNode) ||
+        sites.any (fun s => s.stmts?.any (·.any (hasEffectStmt eventNames))) ||
+        (route'?.any fun rd => rd.alts.any (hasEffectStmt eventNames)) ||
         hoisted.any (·.info.hasEffects)
       let spec ← elabStructsAndResolveTypes {
         rawSpec with route? := route'?, queries := queries', hasEffects := ownHasEffects,

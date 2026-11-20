@@ -128,7 +128,7 @@ def elabFullstackCmd : CommandElab := fun stx => do
       liftCoreM <| realizeGlobalConstNoOverloadWithInfo cliTarget
     catch _ =>
       if let some _ ← liftCoreM (Qed.lookupComponent? cliIdent.getId) then
-        throwErrorAt cliIdent s!"component `{cliIdent.getId}` in `fullstack {fsName}` is not a top-level mountable app (remove `prop`, `bind`, `slot`, `children`, `event`, and uninitialized `state` fields)"
+        throwErrorAt cliIdent s!"component `{cliIdent.getId}` in `fullstack {fsName}` is not a top-level mountable app (remove `prop`, `bind`, `children`, `event`, and uninitialized `state` fields)"
       else
         throwErrorAt cliIdent s!"unknown `client` `{cliIdent.getId}` in `fullstack {fsName}`; specify a top-level `component` or `Qed.App` value"
   let appCheckId := mkIdentFrom fsIdent (fsName ++ `clientApp)

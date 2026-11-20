@@ -29,7 +29,7 @@ component Chat:
       turns = convo.push(Turn(role="assistant", content=""))
       draft = ""
       pending = true
-      perform Cmd.streamJson("/v1/chat/completions", ChatReq(model="qed-mock", stream=true, messages=convo), .chunk, .done)
+      Cmd.streamJson("/v1/chat/completions", ChatReq(model="qed-mock", stream=true, messages=convo), .chunk, .done)
   action chunk(raw: String):
     let d = Json.pathStr(raw, "choices.0.delta.content")
     turns = turns.modify(turns.size - 1, t => { t with content = t.content ++ d })

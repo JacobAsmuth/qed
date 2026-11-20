@@ -156,10 +156,8 @@ private def forEachControlSubSuite (st : Syntax) (f : Array Syntax → CommandEl
 private partial def checkPureSpecCont (ctx : RewriteCtx) (stmts : Array Syntax) : CommandElabM Unit := do
   for st in stmts do
     let k := st.getKind
-    if k == ``qedStmtPerform then
-      throwErrorAt st "cannot use `perform` inside a speculative continuation after `predict` (side effects cannot be rolled back); move it into `on_confirm:`"
-    else if k == ``qedStmtSend then
-      throwErrorAt st "cannot use `send` inside a speculative continuation after `predict` (side effects cannot be rolled back); move it into `on_confirm:`"
+    if k == ``qedStmtExpr && (matchPushCall? (st.getArg 0)).isNone then
+      throwErrorAt st "cannot run side effects or emit events inside a speculative continuation after `predict` (side effects cannot be rolled back); move it into `on_confirm:`"
     else if (k == ``qedStmtLet && (unwrapParens1 (st.getArg 4)).getKind == ``qedAwait) ||
             (k == ``qedStmtAssign && (unwrapParens1 (st.getArg 2)).getKind == ``qedAwait) then
       throwErrorAt st "cannot `await` inside a speculative continuation after `predict`; move sequential `await` calls into `on_confirm:`"
@@ -173,11 +171,16 @@ private partial def checkPureSpecCont (ctx : RewriteCtx) (stmts : Array Syntax) 
 private partial def checkPurePredictBlock (stmts : Array Syntax) : CommandElabM Unit := do
   for st in stmts do
     let k := st.getKind
-    if k == ``qedStmtAssign || k == ``qedStmtPerform || k == ``qedStmtSend || k == ``qedStmtEmit then
+    if k == ``qedStmtAssign then
       throwErrorAt st "`predict:` computes a predicted server response and cannot mutate state or perform side effects"
     else if k == ``qedStmtExpr then
       if (matchPushCall? (st.getArg 0)).isSome then
         throwErrorAt st "`predict:` computes a predicted server response and cannot mutate state with `.push(...)`"
+      else if let some (_, meth, _) := matchIdentMethodCall? (st.getArg 0) then
+        if meth == "send" || meth == "emit" then
+          throwErrorAt st "`predict:` computes a predicted server response and cannot mutate state or perform side effects"
+        else
+          throwErrorAt st "unexpected bare expression in `predict:`; use `return <expr>` to return a predicted response"
       else
         throwErrorAt st "unexpected bare expression in `predict:`; use `return <expr>` to return a predicted response"
     else if k == ``qedStmtLet then
@@ -193,8 +196,7 @@ private partial def checkPurePredictBlock (stmts : Array Syntax) : CommandElabM 
 
 private def stmtHasStateMutation (st : Syntax) : Bool :=
   let k := st.getKind
-  k == ``qedStmtAssign || k == ``qedStmtPerform || k == ``qedStmtSend ||
-  (k == ``qedStmtExpr && (matchPushCall? (st.getArg 0)).isSome) ||
+  k == ``qedStmtAssign || k == ``qedStmtExpr ||
   k == ``qedStmtIf || k == ``qedStmtIfLet || k == ``qedStmtMatch
 
 private def mkLetRawSt (info : SourceInfo) (id : Ident) (ty? : Option Term) (rhsExpr : Syntax) : Syntax :=
@@ -295,7 +297,7 @@ private def mkRpcPerformStmt (ctx : RewriteCtx) (st : Syntax) (rpcId : Ident)
   let srvId := mkIdentFrom rpcId srvInfo.serverName
   let methId := mkIdentFrom rpcId (Name.mkSimple mInfo.name)
   let callTerm ← `(qedCheckRpcCall% $srvId:ident $methId:ident [$[$rpcCallArgs:term],*] $cbTerm)
-  return Syntax.node info ``qedStmtPerform #[Syntax.atom info "perform", mkRawExpr callTerm]
+  return Syntax.node info ``qedStmtExpr #[mkRawExpr callTerm]
 
 private abbrev LiftRecFn :=
   Array (Ident × Term) → Array (Ident × Term) → Array Name → Array Syntax →
@@ -645,12 +647,11 @@ private partial def liftAwaitStmts (ctx : RewriteCtx)
         let tree := if tailTree.isNormal then .normal else .letBind (st.getArg 1) tyOpt? (st.getArg 4) tailTree
         return (#[st] ++ tail, tree)
 
-      if k == ``qedStmtEnsure && rest.any stmtContainsAwait then
-        let (tLifted, tTree) ← go outerParams localNames preStmts rest
-        let tree := if tTree.isNormal then .normal else .ifBranch (st.getArg 1) tTree .normal
-        return (#[st] ++ tLifted, tree)
+      if k == ``qedStmtReturn then
+        return (#[st], .normal)
 
-      if (k == ``qedStmtIf || k == ``qedStmtIfLet || k == ``qedStmtMatch) && stmtContainsAwait st then
+      if (k == ``qedStmtIf || k == ``qedStmtIfLet || k == ``qedStmtMatch) &&
+          (stmtContainsAwait st || (hasReturnStmt st && rest.any stmtContainsAwait)) then
         unless rest.isEmpty || hasReturnStmt st do
           throwErrorAt st "statements after an `if`/`match` containing `await` are not supported unless the branch `return`s; move trailing statements inside the branches"
         let tailIfReturn := if hasReturnStmt st then rest else []
@@ -658,6 +659,9 @@ private partial def liftAwaitStmts (ctx : RewriteCtx)
           if eNode.getNumArgs == 3 then
             let (eLifted, eTree) ← go outerParams localNames preStmts ((suiteStmts (eNode.getArg 2)).toList ++ tailIfReturn)
             pure (Syntax.node eNode.getHeadInfo eNode.getKind #[(eNode.getArg 0), (eNode.getArg 1), packSuite st eLifted], eTree)
+          else if !tailIfReturn.isEmpty then
+            let (eLifted, eTree) ← go outerParams localNames preStmts tailIfReturn
+            pure (Syntax.node info nullKind #[Syntax.atom info "else", Syntax.atom info ":", packSuite st eLifted], eTree)
           else
             pure (eNode, .normal)
         if k == ``qedStmtIf then
@@ -709,7 +713,11 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
   let specDispatchesRef ← IO.mkRef (#[] : Array SpecDispatchArm)
   let specResolvesRef   ← IO.mkRef (#[] : Array SpecResolveSite)
   let baseCtx : RewriteCtx := {
+    compName := spec.t.getId,
     stateFields := spec.fieldNames, bindFields := spec.bindNames, propNames := spec.propNames,
+    eventNames := spec.events.map (·.id.getId),
+    subNames := spec.subscriptions.map (·.id.getId),
+    portOutNames := spec.portOuts.map (·.id.getId),
     actionNames := spec.actions.map (·[1].getId) ++ spec.portIns.map (·.id.getId),
     isPureComp := false, msgPath := spec.t.getId ++ `Msg, hasOut := spec.outTy?.isSome,
     collections := spec.collections, sites := sitesRef, hoisted := hoistedRef,
@@ -740,10 +748,10 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
       specDispatchesRef.modify (·.push { ctor := name, params, tree := dispTree })
     let mut dummyAssigns : Array (Name × Option Term) := #[]
     for s in stmts do
-      if s.getKind == ``qedStmtAssign && (s.getArg 0).getKind == ``qedIdent && atomStr (s.getArg 1) == "=" && isCdot (s.getArg 2) then
+      if s.getKind == ``qedStmtAssign && (s.getArg 0).getKind == ``qedIdent && atomStr (s.getArg 1) == "=" && isPlaceholder (s.getArg 2) then
         dummyAssigns ← pushHandlerAssign baseCtx dummyAssigns ((s.getArg 0).getArg 0) none
     if !params.isEmpty && !dummyAssigns.isEmpty then
-      throwErrorAt a s!"action `{name}` declares explicit parameter(s) and cannot use the `·` placeholder; assign explicitly (e.g. `{dummyAssigns[0]!.1} = {params[0]!.1.getId}`)"
+      throwErrorAt a s!"action `{name}` declares explicit parameter(s) and cannot use the `_` placeholder; assign explicitly (e.g. `{dummyAssigns[0]!.1} = {params[0]!.1.getId}`)"
     let cur ← sitesRef.get
     sitesRef.set (cur.push {
       key := s!"action:{name}", ctor := name, params, assigns := dummyAssigns, stmts? := some stmts })
@@ -786,12 +794,8 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
       })
     pure { rd with alts := alts' }
   let queries' ← spec.queries.mapM fun q => do
-    match q.source with
-    | .url k u =>
-        pure { q with source := .url k u }
-    | .rpc rspec =>
-        recordUsedRpc usedRpcsRef rspec.srvInfo.shortName rspec.mInfo.name
-        pure { q with source := .rpc rspec }
+    recordUsedRpc usedRpcsRef q.rpc.srvInfo.shortName q.rpc.mInfo.name
+    pure q
   let starts' ← spec.starts.mapM fun st => do
     let rw ← rewriteIn { baseCtx with inPerform := true } false st
     lowerCompExpr .val rw

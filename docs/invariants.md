@@ -9,7 +9,7 @@ untrusted rehydration payloads that violate the invariant (`rehydrate_inv`).
 ```lean
 component Counter:
   state count : Int = 0
-  invariant 0 <= count
+  invariant countNonNeg: 0 <= count
   ...
 ```
 
@@ -20,14 +20,13 @@ message constructor and remaining goal.
 
 | What you want to check | Syntax (inside `component`) |
 |------------------------|-----------------------------|
-| Single state predicate | `invariant 0 <= count` |
-| Named state predicate | `invariant counterSafe: 0 <= count` |
+| Single state predicate | `invariant counterSafe: 0 <= count` |
 | Chained / multi-clause | `invariant inRange: 1 <= qty <= 10` (or `1 <= qty, qty <= 10`) |
-| Quantified property | `invariant all r in rows: r.id < nextId` |
-| Collection queries | `invariant rows.uniqueBy(r => r.id)` · `rows.sumBy(r => r.price) == total` · `rows.countWhere(r => r.done) == n` · `events.isSortedBy(e => e.ts)` |
+| Quantified property | `invariant idsFresh: all r in rows: r.id < nextId` |
+| Collection queries | `invariant uniqueIds: rows.uniqueBy(r => r.id)` · `rows.sumBy(r => r.price) == total` · `rows.countWhere(r => r.done) == n` · `events.isSortedBy(e => e.ts)` |
 | Lifted child invariant | `invariant feedSafe: Card.cardSafe for_each cards` |
-| Component view / styles | `invariant roleHasOneOf("save", [on, off])` |
-| Multiple view rules | `invariant roleLacks("submit", danger), tagLacks("span", danger)` |
+| Component view / styles | `invariant saveStyled: roleHasOneOf("save", [on, off])` |
+| Multiple view rules | `invariant noDanger: roleLacks("submit", danger), tagLacks("span", danger)` |
 | Pure helper view (`Html`) | `invariant styled : roleHasOneOf("nav", [a, b]) holds_in navView` (top-level) |
 
 Invariants check your component's state transitions and rendered HTML; see
@@ -78,7 +77,7 @@ syntax—Qed automatically projects the next model out of `(model, cmd)`.
 
 When a client `component` invokes a `server` `def` via `await` or `query`, Qed connects server contracts and component invariants in both directions:
 
-- **Client `invariant` -> Server `requires`:** Component `invariant`s (as well as literals, `if` / `if let` branches, `ensure` guards, and `Field`/`Ensured` values) are automatically available as hypotheses to discharge every server parameter `requires` clause at compile time.
+- **Client `invariant` -> Server `requires`:** Component `invariant`s (as well as literals, `if` / `if let` branches, and `Field`/`Ensured` values) are automatically available as hypotheses to discharge every server parameter `requires` clause at compile time.
 - **Server `ensures` -> Client `invariant`:** Server postconditions (`ensures expr`) are encoded via zero-trust `Ensured α p` (`FromProto` re-verifies `p` on untrusted bytes) and automatically unpacked into continuation hypotheses across `let x = await Server.fn(...) catch: ...` and `Cached.all` invariants on reactive `query` fields (see [`Examples/CloudBooks.lean`](../Examples/CloudBooks.lean) and [`Tests/ServerChecks.lean`](../Tests/ServerChecks.lean)).
 
 **Custom proof (`using [lemma]` or `:= by`).** When a property depends on a custom recursive domain function or an unverified helper that automation cannot guess, pass a lemma with `using [myLemma]` or attach a Lean tactic proof with `:= by`. Inside a `component`, `init` is discharged automatically and `update` is in scope, so the proof handles preservation starting with `intro m msg h`:

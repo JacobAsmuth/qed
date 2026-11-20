@@ -17,7 +17,7 @@ private def checkInlineComp (stx : Syntax) (pPath tag : String) (hasKids : Bool)
     TermElabM Unit := do
   if let some rtag := info.rootTag? then checkParentNesting stx pPath tag rtag
   if hasKids && !info.hasChildren then
-    throwErrorAt stx s!"<{tag}> does not declare `children`; add `children` to `component {tag}` or write `<{tag} …/>`"
+    throwErrorAt stx s!"<{tag}> does not render `\{children}` in its `view:`; write `<{tag} …/>` or render `\{children}` in `{tag}`"
 
 private def finishWithKey (expectedType? : Option Expr) (key? : Option Term) (call : Term) : TermElabM Expr := do
   elabTerm (← match key? with | some k => `(Qed.withKey (toString $k) $call) | none => pure call) expectedType?
@@ -146,7 +146,7 @@ private def elabStatefulCompTag (stx : Syntax) (expectedType? : Option Expr) (in
     throwErrorAt stx s!"<{tag}>: `onMsg` routes a parent-owned row; pass `state=\{...}` alongside `onMsg`, or remove `onMsg` and pass named event props"
   if let some info := info? then
     if !info.hasLocalDef then
-      throwErrorAt stx s!"<{tag}> uses effects, slots, children, or non-JSON props and cannot be mounted dynamically via `LocalDef`; mount `<{tag} …/>` directly inside a parent `component` view so Qed hoists its state"
+      throwErrorAt stx s!"<{tag}> uses effects, `Html` props, `children`, or non-JSON props and cannot be mounted dynamically via `LocalDef`; mount `<{tag} …/>` directly inside a parent `component` view so Qed hoists its state"
   checkParentNesting stx pPath "div" "div"
   let keyT : Term ← match key? with | some k => `(toString $k) | none => pure ⟨Syntax.mkStrLit s!"@{posNum}"⟩
   let mountBase : Term ←
@@ -212,7 +212,7 @@ private def elabStatefulCompTag (stx : Syntax) (expectedType? : Option Expr) (in
     return ← elabHoistedCompTag stx expectedType? info? tag pPath hasKids cId props kidsT hPair key?
 
   if hasKids then
-    throwErrorAt stx s!"<{tag}>: a component tag renders the component's own view, so it takes no children; write it self-closing (<{tag} …/>) or declare `children` on `{tag}`"
+    throwErrorAt stx s!"<{tag}> does not render `\{children}` in its `view:`; write it self-closing (`<{tag} …/>`) or render `\{children}` in `{tag}`"
 
   elabStatefulCompTag stx expectedType? info? baseName cId tag pPath posNum props key? state? initial? onMsg?
 

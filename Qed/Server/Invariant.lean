@@ -330,7 +330,7 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
               let prettyGoal ← Qed.Diag.ppQedExpr ((Expr.app p valExpr).headBeta)
               let prettyVal ← Qed.Diag.ppQedExpr valExpr
               throwErrorAt stx m!"Schema field rule `{prettyGoal}` failed for `{prettyVal}`.\n\n\
-                Hint: Guard this value with `if ...:`, `ensure ... else ...`, or a `requires` precondition so it satisfies the schema's `where` rule."
+                Hint: Guard this value with `if ...:` or a `requires` precondition so it satisfies the schema's `where` rule."
         let prfExpr ← wrapAuxProof goalProp prfExpr
         return ← mkAppOptM ``Qed.Field.mk #[some innerTy, some predFn, some valExpr, some prfExpr]
       else
@@ -529,7 +529,7 @@ private def proveBoundsFor (ref : Syntax) (arrExpr idxNatExpr : Expr) : TermElab
         let prettyArr ← Qed.Diag.ppQedExpr arrExpr
         let prettyIdx ← Qed.Diag.ppQedExpr idxNatExpr
         throwErrorAt ref m!"Array index `{prettyIdx}` could be out of bounds for `{prettyArr}`:\n  • must satisfy:  {prettyIdx} < {prettyArr}.size\n\n\
-          Hint: Guard this access with `if {prettyIdx} < {prettyArr}.size:` or `ensure {prettyIdx} < {prettyArr}.size else ...`."
+          Hint: Guard this access with `if {prettyIdx} < {prettyArr}.size:`."
   wrapAuxProof goalProp prfExpr
 
 open Lean Meta Elab Term in
@@ -1061,14 +1061,15 @@ elab_rules : tactic
           throwError m!"Server invariant `{invStr}` failed on initial state:\n\
             {"  "}• must satisfy:  {msg}{moreNote}\n\n\
             Hint: Update the initial `state` values so they satisfy `{invStr}`."
-        else if lbl.startsWith "mutating " then
-          throwError m!"Server invariant `{lbl}` failed in `{fnLabel.getString}`:\n\
+        else if lbl.startsWith "mutating:" then
+          let invName := (lbl.drop 9).toString.trimAscii.toString
+          throwError m!"Server invariant `{invName}` failed in `{fnLabel.getString}`:\n\
             {"  "}• must satisfy:  {msg}{moreNote}\n\n\
-            Hint: Add a matching `requires` clause or guard mutations of that field with `if ...:` / `ensure ... else ...`."
+            Hint: Add a matching `requires` clause or guard mutations of that field with `if ...:`."
         else
           throwError m!"Server invariant `{lbl}` failed in `{fnLabel.getString}`:\n\
             {"  "}• must satisfy:  {msg}{moreNote}\n\n\
-            Hint: Guard state mutations with `if ...:`, `ensure ... else ...`, or `requires ...` so this invariant holds across every branch."
+            Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant holds across every branch."
 
 macro "qedNormAsyncCont" : tactic => `(tactic| (
   try dsimp (config := { zetaDelta := false }) only
@@ -1180,6 +1181,6 @@ elab_rules : tactic
       unless rem.isEmpty do
         let msg ← rem[0]!.withContext do Qed.Diag.ppQedExpr (← rem[0]!.getType)
         throwError m!"Server `requires` precondition could not be proved:\n  • must satisfy:  {msg}\n\n\
-          Hint: Guard this RPC call with `if ...:` or `ensure ... else return` so the precondition holds."
+          Hint: Guard this RPC call with `if ...:` so the precondition holds."
 
 end Qed.Server

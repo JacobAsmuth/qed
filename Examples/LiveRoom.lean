@@ -56,8 +56,8 @@ server Hub:
   state recent      : ChatMsg[] = []
   state activeConns : String[]  = []
 
-  invariant totalMsgs >= old(totalMsgs)
-  invariant all m in recent: m.roomId <= 100
+  invariant msgsMonotonic: totalMsgs >= old(totalMsgs)
+  invariant roomsValid: all m in recent: m.roomId <= 100
 
   def onlineCount() -> Nat:
     return online
@@ -70,16 +70,16 @@ server Hub:
     requires roomId <= 100, 1 <= text.length <= 280
     ensures result.roomId == roomId
     let who = ctx.userId.getD("system")
-    ensure 1 <= who.length <= 64 else fail(.invalidAuthor)
+    if not (1 <= who.length <= 64): return fail(.invalidAuthor)
     let m = ChatMsg(roomId=roomId, author=who, body=text)
-    emit room(roomId, m)
-    ensure text != "ROLLBACK" else fail(.rejected)
+    room.emit(roomId, m)
+    if text == "ROLLBACK": return fail(.rejected)
     recent.push(m)
     totalMsgs += 1
     return m
 
   def broadcastAlert(text: String) -> Unit:
-    emit alerts(text)
+    alerts.emit(text)
     return ()
 
   channel room(id: Nat) -> ChatMsg:
@@ -100,7 +100,7 @@ server Hub:
         let m = ChatMsg(roomId=id, author=who, body=body)
         recent.push(m)
         totalMsgs += 1
-        emit room(id, m)
+        room.emit(id, m)
 
     on_leave:
       if online > 0:
@@ -184,17 +184,17 @@ component LiveApp:
 
   action sendChat:
     if 1 <= draft.length <= 280:
-      send chat(draft)
+      chat.send(draft)
       draft = ""
 
   action pingTicker:
-    send ticker(PricePing(action="ping"))
+    ticker.send(PricePing(action="ping"))
 
   action pingRaw:
-    send rawFeed("raw-hello")
+    rawFeed.send("raw-hello")
 
   action pingProto:
-    send protoFeed(PricePing(action="proto-ping"))
+    protoFeed.send(PricePing(action="proto-ping"))
 
   view:
     <div class="live-room">

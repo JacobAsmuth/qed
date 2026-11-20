@@ -12,7 +12,7 @@ component Counter:
     if times > 0:
       count = count + step * times
       saved = count
-      send(.emitted(count))
+      emitted.emit(count)
   view: <button onClick={.advance(2)}>{count}</button>
 
 example : Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 2) =
@@ -29,7 +29,7 @@ component Tag:
   prop label = "Pin"
   state on = false
   event onToggle(pinned: Bool)
-  action toggle: on = not on; send(onToggle(on))
+  action toggle: on = not on; onToggle.emit(on)
   view: <button onClick={.toggle}>{"on" if on else label}</button>
 
 component Widget:
@@ -41,7 +41,7 @@ component Widget:
   view:
     <div>
       <span>{note}</span>
-      <Tag key={f"t{id}"} label={label} onToggle={pinned = ·}/>
+      <Tag key={f"t{id}"} label={label} onToggle={pinned = _}/>
     </div>
 
 structure Row where
@@ -233,8 +233,8 @@ component ModernCounter:
       quantity += step
   action decrease:
     if 1 < quantity: quantity -= 1
-  invariant 1 <= quantity <= 10
-  invariant roleHasOneOf("qty", [chipStyle])
+  invariant inRange: 1 <= quantity <= 10
+  invariant qtyStyled: roleHasOneOf("qty", [chipStyle])
   view:
     <div>
       <button onClick={.decrease}>−</button>
@@ -316,21 +316,21 @@ component PartialFn:
 -- ── Compile-time rejection checks (#guard_msgs) ─────────────────────────
 
 /-- error: URL attribute `href` cannot take raw string literal `"/raw"` (raw strings are disallowed to prevent XSS and broken links).
-Pass a typed `Router` route or a compile-time checked literal: `href={url% "/raw"}`. -/
+Pass a typed `Router` route or a compile-time checked literal: `href={url("/raw")}`. -/
 #guard_msgs in
 def badRawHref : Html Unit := <a href="/raw">bad</a>
 
 /-- error: unsafe URL literal `javascript:alert(1)`: URLs must be root-relative (`/path`, not `//`), `#fragment`, `?query`, or explicit `https://`, `http://`, `mailto:`, `tel:` with no whitespace or control characters -/
 #guard_msgs in
-def badJsUrl : Url := url% "javascript:alert(1)"
+def badJsUrl : Url := url("javascript:alert(1)")
 
 /-- error: unsafe URL literal `data:text/html,<script>alert(1)</script>`: URLs must be root-relative (`/path`, not `//`), `#fragment`, `?query`, or explicit `https://`, `http://`, `mailto:`, `tel:` with no whitespace or control characters -/
 #guard_msgs in
-def badDataUrl : Url := url% "data:text/html,<script>alert(1)</script>"
+def badDataUrl : Url := url("data:text/html,<script>alert(1)</script>")
 
 /-- error: unsafe URL literal `//evil.example/x`: URLs must be root-relative (`/path`, not `//`), `#fragment`, `?query`, or explicit `https://`, `http://`, `mailto:`, `tel:` with no whitespace or control characters -/
 #guard_msgs in
-def badProtocolRelativeUrl : Url := url% "//evil.example/x"
+def badProtocolRelativeUrl : Url := url("//evil.example/x")
 
 /-- error: <script> is forbidden in Qed views (untrusted script/plugin execution sink) -/
 #guard_msgs in
@@ -356,10 +356,10 @@ def badNestedInteractive : Html Unit := <button><button>bad</button></button>
 #guard_msgs in
 def badListChild : Html Unit := <ul><span>bad</span></ul>
 
-def goodSafeUrl : Url := url% "/docs/guide"
+def goodSafeUrl : Url := url("/docs/guide")
 component GoodLazy:
   state m : Nat = 7
-  view: <div><a href={goodSafeUrl}>Docs</a>{Qed.lazy((k: Nat) => <span>{k}</span>, m / 2)}</div>
+  view: <div><a href={goodSafeUrl}>Docs</a><a href={url("/about")}>About</a>{Qed.lazy((k: Nat) => <span>{k}</span>, m / 2)}</div>
 #guard (Html.render (GoodLazy.app.view { m := 7 })).contains "href=\"/docs/guide\""
 #guard (Html.render (GoodLazy.app.view { m := 7 })).contains "<span>3</span>"
 
@@ -417,8 +417,7 @@ style fracStyle:
 
 component Card:
   prop title : String
-  slot badge
-  children
+  prop badge : Html
   view:
     <div class="card">
       <header><h3>{title}</h3>{badge}</header>
@@ -458,13 +457,12 @@ def badCardInParagraph : Html Unit := <p><Card title="Nope"><span>x</span></Card
 #guard_msgs in
 def badChipInDiv : Html Unit := <div><ListChip text="Orphan"/></div>
 
--- Stateful sub-component with `children`, `slot`, `bind:`, and `event` hoisted into a parent `app`
+-- Stateful sub-component with implicit `{children}`, `Html` prop, `bind:`, and `event` hoisted into a parent `app`
 component Accordion:
   prop heading : String
-  slot extra
+  prop extra   : Html
   state openPanel = false
   action toggle: openPanel = not openPanel
-  children
   view:
     <section class="accordion">
       <header>
@@ -498,8 +496,8 @@ component CompositeDemo:
 
   view:
     <div class="demo">
-      <SearchBar bind:query={query} onClear={query = ""} onSubmitQuery={picked = ·}/>
-      <PickerBox bind:filter={query} onPick={picked = ·}/>
+      <SearchBar bind:query={query} onClear={query = ""} onSubmitQuery={picked = _}/>
+      <PickerBox bind:filter={query} onPick={picked = _}/>
       <Accordion heading="Details" extra={<span>!</span>}>
         <button class="inner" onClick={.bump}>{clicks}</button>
       </Accordion>
@@ -531,7 +529,7 @@ def awaitSample (r : Resource Ticket) : Html Unit :=
 component EarlyReturnCheck:
   state x : Int = 0
   action step(n: Int):
-    ensure n > 0 else return
+    if n <= 0: return
     x += n
   view: <span>{x}</span>
   invariant xPos: 0 <= x := by
@@ -640,11 +638,11 @@ component BadEphemeralInv:
 -- ── Unified syntax & self-hosted `<Schema.Form>` checks ──
 component SelfHostedFormKeep:
   state picked : Ticket?
-  view: <Ticket.Form onSubmit={picked = some(·)}/>
+  view: <Ticket.Form onSubmit={picked = some(_)}/>
 
 component SelfHostedFormReset:
   state picked : Ticket?
-  view: <Ticket.Form reset onSubmit={picked = some(·)}/>
+  view: <Ticket.Form reset onSubmit={picked = some(_)}/>
 
 def validTicketDraft : Ticket.Draft := { title := "Fix bug", priority := "3", kind := "bug" }
 #guard SelfHostedFormKeep.init.picked.isNone && SelfHostedFormKeep.init._form_0 == Ticket.Draft.empty
@@ -665,7 +663,7 @@ component MultiParamAndAutoDefaults:
   action pushBoth(a: Nat, b: String):
     xs.push(a)
     x = some(a)
-    send(.emitted(a, b))
+    emitted.emit(a, b)
   view: <button onClick={.pushBoth(4, "hi")}>{xs.size}</button>
 #guard MultiParamAndAutoDefaults.init.xs == #[] && MultiParamAndAutoDefaults.init.x.isNone
 example : MultiParamAndAutoDefaults.update MultiParamAndAutoDefaults.init (.pushBoth 4 "hi") =
@@ -702,7 +700,7 @@ component PythonicShowcase:
         label = f"high:{n}"
 
   action addTag(t: String):
-    ensure t not in tags else return
+    if t in tags: return
     tags.push(t)
     label = f"tags:{tags.size}"
 

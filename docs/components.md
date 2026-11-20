@@ -1,20 +1,19 @@
 # Components & Apps
 
-A `component` bundles props, slots, `children`, local or routed state,
+A `component` bundles props (including `Html` props and implicit `{children}`), local or routed state,
 effectful actions, ports, queries, invariants, and a JSX view into a single verified declaration.
-All Qed DSL blocks (`component`, `server`, `external`, `schema`, `router`, `invariant`, and JSX `{...}`) share one unified Python-esque grammar (`:` headers, `=` assignment, `==` equality, `and`/`or`/`not`/`in`/`is`, `1 <= x <= 10`, `f"..."`, `a if cond else b`, `elif`, `match`/`case`, `ensure`, and `pass`).
+All Qed DSL blocks (`component`, `server`, `external`, `schema`, `router`, `invariant`, and JSX `{...}`) share one unified Python-esque grammar (`:` headers, `=` assignment, `==` equality, `and`/`or`/`not`/`in`/`is`, `1 <= x <= 10`, `f"..."`, `a if cond else b`, `elif`, `match`/`case`, `return`, and `pass`).
 
-## Pure sub-components (`children`, `slot`, `event`, and `bind:`)
+## Pure sub-components (`prop`, `{children}`, `event`, and `bind:`)
 
 Stateless components compile to zero-overhead polymorphic view functions (`Props msg → Html msg`)
 with no wrapper `<div>` and no JSON serialization, while preserving full cross-component HTML5 tag
-nesting and attribute validation:
+nesting and attribute validation (`{children}` is automatically available whenever referenced in `view:`):
 
 ```lean
 component Card:
   prop title : String
-  slot badge
-  children
+  prop badge : Html
   view:
     <div class="card">
       <header><h3>{title}</h3>{badge}</header>
@@ -82,16 +81,14 @@ component Storefront:
     </Await>
 ```
 
-- **`session user`** declares a `String?` field hydrated automatically from the verified server session during SSR (`App.onSession`) so actions requiring `ctx.userId != none` can guard with `if user.isSome:` or `ensure user.isSome else return`.
+- **`session user`** declares a `String?` field hydrated automatically from the verified server session during SSR (`App.onSession`) so actions requiring `ctx.userId != none` can guard with `if user.isSome:` or `if not user.isSome: return`.
 - **`await` and `catch:`** allow direct async RPC calls inside `route` and `action` blocks: `field = await Server.fn(...)` transitions `field : Resource α` to `.loading` and populates it on completion, while `let x = await Server.fn(...) catch: case .tag: ...` flushes pre-`await` assignments, suspends, enforces exhaustive domain error handling, and resumes in a synthesized continuation message with the server's `ensures` proof in scope.
-- **`(field = ·)` and `perform`** remain available for lower-level `Cmd` composition in `start`, `route`, or `action` (for example `perform Catalog.list((books = ·))`), and schemas provide `<Book.Form onSubmit={.submit}/>` (with optional `bind={draft}`, `reset`, and `field = some(·)` shorthand).
+- **`(field = _)` and bare `Cmd` calls** remain available for lower-level `Cmd` composition in `start`, `route`, or `action` (for example `Catalog.list((books = _))` or `Cmd.pushUrl(...)`), and schemas provide `<Book.Form onSubmit={.submit}/>` (with optional `bind={draft}`, `reset`, and `field = some(_)` shorthand).
 - **`route`** binds the current URL route into state (defaulting the field name to `route`) and runs optional `case` arms on navigation.
 - **`start`** schedules initial commands when the app mounts.
 - **`ephemeral`** excludes client-only fields from SSR dehydration and resets them to their defaults on hydration (all other `state` fields auto-dehydrate by default; `T[]`, `T?`, `Resource T`, and `Cached T` auto-default to `[]`, `none`, `.idle`, and `{}`).
 - **`port`** declares typed JS interop ports (`port name : Arg` outbound, `port name(arg: Arg): ...` inbound).
-- **`query`** declares cached reactive queries in two forms:
-  - Server-backed: `query current = Catalog.findAt(idx) if let .detail(idx) = route` or `query quote = Store.quote(qty) if user.isSome` (enforces read-only server RPCs, proves `session` auth and parameter `requires` preconditions from `if` + component invariants, keys entries with collision-free binary Protobuf cache keys for stale-while-revalidate + stale-response race rejection, preloads on SSR with zero-refetch hydration, and propagates server `ensures` into `Cached.all` invariants such as `quote.all(v => ...)`).
-  - URL-based: `query items : Item[]:` with `key = ...` and `url = ...`.
+- **`query`** declares cached reactive server queries: `query current = Catalog.findAt(idx) if let .detail(idx) = route` or `query quote = Store.quote(qty) if user.isSome` (enforces read-only server RPCs, proves `session` auth and parameter `requires` preconditions from `if` + component invariants, keys entries with collision-free binary Protobuf cache keys for stale-while-revalidate + stale-response race rejection, preloads on SSR with zero-refetch hydration, and propagates server `ensures` into `Cached.all` invariants such as `quote.all(v => ...)`).
 - **`<Await of={res} as={val} err={e} loading={…} failed={…}>`** renders `Resource α` or `Cached α`
   declaratively in JSX.
 - **`fullstack`** accepts `client Storefront` directly for any `component`.
@@ -105,7 +102,7 @@ and automatically reconciles or rolls back when the server replies:
 
 ```lean
 action orderOne(idx: Nat):
-  ensure user.isSome else return
+  if not user.isSome: return
   let updated = await Catalog.order(idx, 1)
     predict:
       if let .ok(arr) = books:
@@ -140,7 +137,7 @@ action orderOne(idx: Nat):
   - **Server error (`catch:`):** rolls back the speculative continuation, runs the matching `catch:`
     arm, and replays subsequent concurrent local edits on top.
 - **Compile-time guarantees:**
-  - The speculative continuation must be pure state updates (no `perform`, `send`, nested `await`,
+  - The speculative continuation must be pure state updates (no `Cmd` calls, `.emit(...)`, `.send(...)`, nested `await`,
     or `bind` writes—put side effects in `on_confirm:`).
   - The predicted value is statically proved to satisfy the server method's `ensures` postconditions
     (as well as any `schema` `Field` refinements).
@@ -152,8 +149,8 @@ action orderOne(idx: Nat):
 Qed supports three stateful composition modes:
 
 1. **Static hoisting (automatic inside `component`):** Mounting a stateful or effectful
-   sub-component without `key=` / `initial=` (or one using `children`, `slot`, `bind:`, or
-   `perform`) hoists its state, `Out` events, `bind:` updates, and `Cmd` effects directly into the
+   sub-component without `key=` / `initial=` (or one using `{children}`, `Html` props, `bind:`, or
+   `Cmd` effects) hoists its state, `Out` events, `bind:` updates, and `Cmd` effects directly into the
    parent component with zero JSON overhead—including interactive `{children}` that dispatch parent
    actions.
 2. **Dynamic keyed local cells (`key=` / `initial=`):** Mounting `<Editor key={row.id} initial={{ note = row.text }} onSave={…}/>`
@@ -165,7 +162,7 @@ Qed supports three stateful composition modes:
 
 ## Actions & inline invariants
 
-Actions execute **sequentially** (matching `server` functions—each assignment is immediately visible to subsequent lines) and support `let` bindings, field/array updates (`=`, `+=`, `-=`, `arr.push(x)`, `arr[i] = val`), `ensure cond else return`, `perform`, `send`, `pass`, `return`, `if`/`elif`/`else`, `if let`, and `match`/`case`:
+Actions execute **sequentially** (matching `server` functions—each assignment is immediately visible to subsequent lines) and support `let` bindings, field/array updates (`=`, `+=`, `-=`, `arr.push(x)`, `arr[i] = val`), handle calls (`ev.emit(...)`, `chan.send(...)`, `port.send(...)`), bare `Cmd` calls (`Cmd.pushUrl(...)`, `Resource.fetch(...)`), `pass`, `return`, `if`/`elif`/`else`, `if let`, and `match`/`case`:
 
 ```lean
 action advance(times: Nat):
@@ -173,8 +170,8 @@ action advance(times: Nat):
     count += step * times
     saved = count
 
-invariant 0 <= count, saved <= count
-invariant roleHasOneOf("save", [primaryStyle, disabledStyle])
+invariant countBounds: 0 <= count, saved <= count
+invariant saveStyled: roleHasOneOf("save", [primaryStyle, disabledStyle])
 invariant feedSafe: Feed.Card.cardSafe for_each cards
 ```
 

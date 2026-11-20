@@ -103,11 +103,13 @@ def extHttpMethod : Parser :=
 
 @[srvClause_parser] def srvInvMutatingClause : Parser := leading_parser
   withPosition (
-    atomic ("invariant " >> identEq `mutating) >>
+    atomic ("invariant " >> ident >> ":" >> identEq `mutating) >>
     ident >> kw "requires" >> categoryParser `qedExpr 0)
 
 @[srvClause_parser] def srvInvClause : Parser := leading_parser
-  withPosition ("invariant " >> sepBy1 (categoryParser `qedExpr 0) ",")
+  withPosition (
+    "invariant " >> ident >> ":" >> notFollowedBy (identEq `mutating) "mutating" >>
+    sepBy1 (categoryParser `qedExpr 0) ",")
 
 @[srvChanSubClause_parser] def srvChanReqClause : Parser := leading_parser srvRequiresLine
 @[srvChanSubClause_parser] def srvChanEnsClause : Parser := leading_parser srvEnsuresLine

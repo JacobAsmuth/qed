@@ -45,16 +45,6 @@ def parse? (s : String) : Option Url :=
 
 end Url
 
-syntax (name := urlLitTerm) "url% " str : term
-
-macro_rules
-  | `(url% $s:str) => do
-      let raw := s.getString
-      if !isSafeUrl raw then
-        Lean.Macro.throwErrorAt s
-          s!"unsafe URL literal `{raw}`: URLs must be root-relative (`/path`, not `//`), `#fragment`, `?query`, or explicit `https://`, `http://`, `mailto:`, `tel:` with no whitespace or control characters"
-      `(Qed.Url.mk $s (by decide))
-
 def containsCloseSeqLoop (afterLt : Bool) : List Char → Bool
   | []      => false
   | c :: cs => (afterLt && c == '/') || containsCloseSeqLoop (c == '<') cs

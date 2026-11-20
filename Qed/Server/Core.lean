@@ -621,6 +621,14 @@ inductive ProgPreservesStepRel {σ α : Type} (Inv : σ → Prop) (Rel : σ → 
 abbrev ProgPreservesInv {σ α : Type} (Inv : σ → Prop) (p : ThreadProg σ α) : Prop :=
   ProgPreservesStepRel Inv (fun _ s' => Inv s') p
 
+theorem progPreservesStepRel_of_const {σ α : Type} {Inv : σ → Prop} {Rel : σ → σ → Prop}
+    (p : ThreadProg σ α) (h : ∀ s s', Rel s s') :
+    ProgPreservesStepRel Inv Rel p := by
+  induction p with
+  | pure a => exact .pure a
+  | io _ _ ih => exact .io _ _ ih
+  | atomic _ _ ih => exact .atomic _ _ (fun s _ => h s _) (fun s _ => ih s)
+
 theorem progPreservesStepRel_bind {σ α β : Type} {Inv : σ → Prop} {Rel : σ → σ → Prop}
     {p : ThreadProg σ α} {k : α → ThreadProg σ β}
     (hp : ProgPreservesStepRel Inv Rel p)

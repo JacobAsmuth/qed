@@ -251,4 +251,42 @@ def Reconnect.toSyntaxTerm (r : Reconnect) : MacroM Term := do
 
 end ReconnectParser
 
+namespace Server
+
+/-! ## Persistent `external` Service Registry & Shared Command Helpers -/
+
+structure ExternalServiceInfo where
+  serviceName : Lean.Name
+  baseOrigin  : String
+  secrets     : Array String
+  methods     : Array Lean.Name
+deriving Inhabited
+
+initialize externalRegistry :
+    Lean.SimplePersistentEnvExtension ExternalServiceInfo (Lean.NameMap ExternalServiceInfo) ←
+  Lean.registerSimplePersistentEnvExtension {
+    addImportedFn := fun arrays =>
+      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.serviceName info) acc) {}
+    addEntryFn := fun m info => m.insert info.serviceName info
+  }
+
+open Lean Elab Command in
+def buildPropConj (ps : Array Term) : CommandElabM Term := do
+  match ps.toList with
+  | [] => `(True)
+  | p :: rest => rest.foldlM (init := p) fun acc q => `($acc ∧ $q)
+
+open Lean Elab Command in
+def elabParamTypeAbbrevs (refIdent : Ident) (ownerName fullOwnerName itemName : Name)
+    (suffix : String) (tyTerms : Array Term) : CommandElabM (Array Name) := do
+  let mut consts : Array Name := #[]
+  for (pTy, i) in tyTerms.zipIdx do
+    let leaf := itemName.appendAfter s!"{suffix}{i}"
+    let pTyId := mkIdentFrom refIdent (ownerName ++ leaf)
+    elabCommand (← `(command| abbrev $pTyId : Type := $pTy))
+    consts := consts.push (fullOwnerName ++ leaf)
+  return consts
+
+end Server
+
 end Qed

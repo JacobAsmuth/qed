@@ -225,4 +225,9 @@ syntax (name := srvTypedAsStx)   "srvTypedAs(" term ", " term ")" : term
 syntax (name := srvGetElemStx)   "srvGetElem(" term ", " term ")" : term
 syntax (name := srvSetElemStx)   "srvSetElem(" term ", " term ", " term ")" : term
 
+syntax "qedSrvProveStep " "[" ident,* "]" str str : tactic
+syntax "qedSrvProveAsync " ident "[" ident,* "]" str str : tactic
+syntax "qedSrvProveAsyncEnsures " ident "[" ident,* "]" str str : tactic
+syntax "qedProveRpcReq" : tactic
+
 end Qed.Server

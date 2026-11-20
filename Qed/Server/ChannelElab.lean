@@ -168,183 +168,190 @@ def ensureUnitReturn (ref : Syntax) (stmts : Array Syntax) : Array Syntax :=
     let info := SourceInfo.fromRef ref
     stmts.push (Syntax.node info ``qedStmtReturn #[Syntax.atom info "return", Syntax.node info nullKind #[]])
 
+private structure ChanBodyCtx where
+  priorRep        : Nat
+  priorUnrep      : Nat
+  srvName         : Lean.Name
+  fullSrvName     : Lean.Name
+  srvShort        : String
+  hasState        : Bool
+  stateId         : Lean.Ident
+  stateInvId      : Lean.Ident
+  ctxId           : Lean.Ident
+  envIdents       : Array Lean.Ident
+  envTypes        : Array Lean.Term
+  stateFieldNames : Array String
+  envVarNames     : Array String
+  invs            : Array ParsedInv
+  mutInvs         : Array ParsedMutInv
+  chanSigs        : Array SrvChanSig
+  hdr             : ParsedChanHeader
+  ctxTyTerm       : Lean.Term
+  errTyTerm       : Lean.Term
+  paramTupleTy    : Lean.Term
+  pProjs          : Array Lean.Term
+  extRootsRef     : IO.Ref (Array Lean.Name)
+  deferredProofs  : IO.Ref (Array (Lean.Elab.Command.CommandElabM Bool))
+
 open Lean Elab Command in
-def elabServerChannelBody (priorRep priorUnrep : Nat)
-    (srvName fullSrvName : Name) (srvShort : String) (hasState : Bool)
-    (stateId stateInvId ctxId : Ident)
-    (envIdents : Array Ident) (envTypes : Array Term)
-    (stateFieldNames envVarNames : Array String)
-    (invs : Array ParsedInv) (mutInvs : Array ParsedMutInv)
-    (chanSigs : Array SrvChanSig) (hdr : ParsedChanHeader)
-    (deferredProofs : IO.Ref (Array (CommandElabM Bool))) :
-    CommandElabM (Option (Array (TSyntax ``Lean.Parser.Term.matchAltExpr) × Array Name)) := do
-  let chIdent := hdr.chIdent
-  let chName := hdr.chName
-  let chStr := hdr.chStr
-  let chLit := Syntax.mkStrLit chStr
-  let pIdents := hdr.pIdents
-  let pTyTerms := hdr.pTyTerms
-  let ctxTyTerm ← `(Qed.Server.RequestCtx)
-  let errTyTerm ← `(Qed.Server.ApiError)
-  let paramTupleTy ← buildTupleType pTyTerms
+private def runChanSubHandler (c : ChanBodyCtx) (subSuffix : String)
+    (extraIds : Array Ident) (extraTys : Array Term) (extraProjs : Array Term)
+    (extraReqIds : Array Ident) (extraReqTys : Array Term)
+    (retTyTerm : Term) (isUnitRet : Bool) (rawStmts : Array Syntax) :
+    CommandElabM (Option Term) := do
+  let hdr := c.hdr
+  let normStmts := unwrapOptionalOuterAtomic rawStmts
+  let bodyStmts := if isUnitRet then ensureUnitReturn hdr.chIdent normStmts else normStmts
+  if !isUnitRet && !blockAlwaysReturns bodyStmts then
+    throwErrorAt hdr.chIdent s!"missing `return` on fallthrough path of `{hdr.chStr}.{subSuffix}`"
+  let subFnStr := s!"{hdr.chStr}_{subSuffix}"
+  let subFnIdent := mkIdentFrom hdr.chIdent (hdr.chName.appendAfter s!"_{subSuffix}")
+  let hasAwait := blockHasAwait bodyStmts
+  let allBinderIds := c.envIdents ++ #[c.ctxId] ++ hdr.pIdents ++ extraIds ++ hdr.reqHypIds ++ extraReqIds
+  let allBinderTys := c.envTypes ++ #[c.ctxTyTerm] ++ hdr.pTyTerms ++ extraTys ++ hdr.reqHypTys ++ extraReqTys
+  let callArgs : Array Term :=
+    c.envIdents.map (⟨·.raw⟩) ++ #[⟨c.ctxId.raw⟩] ++ c.pProjs ++ extraProjs ++
+    hdr.reqHypIds.map (⟨·.raw⟩) ++ extraReqIds.map (⟨·.raw⟩)
+  let baseCtx : LowerCtx := {
+    fnName := subFnStr, stateFields := c.stateFieldNames, envVars := c.envVarNames,
+    locals := hdr.paramNames ++ extraIds.map (·.getId.toString),
+    stateRule := if c.hasState then .pureStep (mkIdent `_s0) else .statelessServer,
+    allowAwait := hasAwait, allowUnwrap := true, hasFallible := true,
+    isOption := false, innerOptTy? := none, channels := c.chanSigs
+  }
+  if c.hasState && !hasAwait then
+    let some (runExpr, _, er) ← elabServerPureFn c.priorRep c.priorUnrep
+        c.srvName subFnStr subFnIdent c.stateId c.stateInvId
+        allBinderIds allBinderTys callArgs retTyTerm c.errTyTerm baseCtx bodyStmts
+        c.invs c.mutInvs c.stateFieldNames c.envVarNames none c.deferredProofs | return none
+    c.extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
+    return some runExpr
+  else if c.hasState && hasAwait then
+    let some (hApp, _, er) ← elabServerAsyncFn c.priorRep c.priorUnrep
+        c.srvName subFnStr subFnIdent c.stateId c.stateInvId
+        allBinderIds allBinderTys callArgs retTyTerm c.errTyTerm baseCtx bodyStmts
+        c.invs c.mutInvs c.stateFieldNames c.envVarNames none c.deferredProofs | return none
+    c.extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
+    return some hApp
+  else
+    let some (_, _, hApp, er) ← elabStatelessHandler c.priorRep c.priorUnrep hdr.chIdent c.srvName subFnIdent.getId
+        allBinderIds allBinderTys callArgs retTyTerm c.errTyTerm baseCtx bodyStmts | return none
+    c.extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
+    return some hApp
+
+open Lean Elab Command in
+private def mkChanDispatchArm (c : ChanBodyCtx) (kindLit : TSyntax `num) (bodyInParams : Term) :
+    CommandElabM (TSyntax ``Lean.Parser.Term.matchAltExpr) := do
+  let chLit := Syntax.mkStrLit c.hdr.chStr
   let paramsBytesVar := mkIdent `wsParams
-  let payloadBytesVar := mkIdent `wsPayload
   let pTupleVar := mkIdent `_chParams
-  let pProjs ← extractTupleProjections pTupleVar pTyTerms.size
-  let extRootsRef ← IO.mkRef (#[] : Array Name)
-  let mut arms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
+  let bound ← (c.hdr.pIdents.zip c.pProjs).foldrM (init := bodyInParams) fun (pid, prj) acc =>
+    `(let $pid:ident := $prj; $acc)
+  `(Lean.Parser.Term.matchAltExpr|
+    | $kindLit:num, $chLit =>
+        match Qed.Proto.decode (α := $(c.paramTupleTy)) $paramsBytesVar with
+        | Except.error _e => Pure.pure (Except.error (Qed.Server.ApiError.badRequest _e))
+        | Except.ok $pTupleVar:ident => $bound)
 
-  let runSubHandler (subSuffix : String) (extraIds : Array Ident) (extraTys : Array Term)
-      (extraProjs : Array Term) (extraReqIds : Array Ident)
-      (extraReqTys : Array Term) (retTyTerm : Term) (isUnitRet : Bool) (rawStmts : Array Syntax) :
-      CommandElabM (Option Term) := do
-    let normStmts := unwrapOptionalOuterAtomic rawStmts
-    let bodyStmts := if isUnitRet then ensureUnitReturn chIdent normStmts else normStmts
-    if !isUnitRet && !blockAlwaysReturns bodyStmts then
-      throwErrorAt chIdent s!"missing `return` on fallthrough path of `{chStr}.{subSuffix}`"
-    let subFnStr := s!"{chStr}_{subSuffix}"
-    let subFnIdent := mkIdentFrom chIdent (chName.appendAfter s!"_{subSuffix}")
-    let hasAwait := blockHasAwait bodyStmts
-    let allBinderIds := envIdents ++ #[ctxId] ++ pIdents ++ extraIds ++ hdr.reqHypIds ++ extraReqIds
-    let allBinderTys := envTypes ++ #[ctxTyTerm] ++ pTyTerms ++ extraTys ++ hdr.reqHypTys ++ extraReqTys
-    let callArgs : Array Term :=
-      envIdents.map (⟨·.raw⟩) ++ #[⟨ctxId.raw⟩] ++ pProjs ++ extraProjs ++
-      hdr.reqHypIds.map (⟨·.raw⟩) ++ extraReqIds.map (⟨·.raw⟩)
-    let baseCtx : LowerCtx := {
-      fnName := subFnStr, stateFields := stateFieldNames, envVars := envVarNames,
-      locals := hdr.paramNames ++ extraIds.map (·.getId.toString),
-      stateRule := if hasState then .pureStep (mkIdent `_s0) else .statelessServer,
-      allowAwait := hasAwait, allowUnwrap := true, hasFallible := true,
-      isOption := false, innerOptTy? := none, channels := chanSigs
-    }
-    if hasState && !hasAwait then
-      let some (runExpr, _, er) ← elabServerPureFn priorRep priorUnrep
-          srvName subFnStr subFnIdent stateId stateInvId
-          allBinderIds allBinderTys callArgs retTyTerm errTyTerm baseCtx bodyStmts
-          invs mutInvs stateFieldNames envVarNames none deferredProofs | return none
-      extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
-      return some runExpr
-    else if hasState && hasAwait then
-      let some (hApp, _, er) ← elabServerAsyncFn priorRep priorUnrep
-          srvName subFnStr subFnIdent stateId stateInvId
-          allBinderIds allBinderTys callArgs retTyTerm errTyTerm baseCtx bodyStmts
-          invs mutInvs stateFieldNames envVarNames none deferredProofs | return none
-      extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
-      return some hApp
-    else
-      let some (_, _, hApp, er) ← elabStatelessHandler priorRep priorUnrep chIdent srvName subFnIdent.getId
-          allBinderIds allBinderTys callArgs retTyTerm errTyTerm baseCtx bodyStmts | return none
-      extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
-      return some hApp
-
-  let mkChanArm (kindLit : TSyntax `num) (bodyInParams : Term) :
-      CommandElabM (TSyntax ``Lean.Parser.Term.matchAltExpr) := do
-    let bound ← (pIdents.zip pProjs).foldrM (init := bodyInParams) fun (pid, prj) acc =>
-      `(let $pid:ident := $prj; $acc)
-    `(Lean.Parser.Term.matchAltExpr|
-      | $kindLit:num, $chLit =>
-          match Qed.Proto.decode (α := $paramTupleTy) $paramsBytesVar with
-          | Except.error _e => Pure.pure (Except.error (Qed.Server.ApiError.badRequest _e))
-          | Except.ok $pTupleVar:ident => $bound)
-
-  -- 1. `on_join` (kind = 1)
-  let mut hasJoinSnapshot := false
-  let mut joinTyTerm : Term ← `(Unit)
-  let joinRunTerm ← match hdr.onJoin? with
+open Lean Elab Command in
+private def elabChanOnJoin (c : ChanBodyCtx) :
+    CommandElabM (Option (Bool × Term × TSyntax ``Lean.Parser.Term.matchAltExpr)) := do
+  let hdr := c.hdr
+  let (hasJoinSnapshot, joinTyTerm, joinRunTerm) ← match hdr.onJoin? with
     | some (some snapTyStx, stmts) =>
-        hasJoinSnapshot := true
         let jty ← liftMacroM <| ParsedSrvType.parse snapTyStx
-        liftMacroM <| jty.validate (allowFallible := false) s!"`on_join` return type of `channel {chStr}`"
-        joinTyTerm ← liftMacroM jty.toPayloadTerm
-        let some r ← runSubHandler "onJoin" #[] #[] #[] #[] #[] joinTyTerm false stmts | return none
-        `($r >>= fun _jRes => Pure.pure (_jRes.map Qed.Proto.encode))
+        liftMacroM <| jty.validate (allowFallible := false) s!"`on_join` return type of `channel {hdr.chStr}`"
+        let jt ← liftMacroM jty.toPayloadTerm
+        let some r ← runChanSubHandler c "onJoin" #[] #[] #[] #[] #[] jt false stmts | return none
+        pure (true, jt, ← `($r >>= fun _jRes => Pure.pure (_jRes.map Qed.Proto.encode)))
     | some (none, stmts) =>
-        let some r ← runSubHandler "onJoin" #[] #[] #[] #[] #[] joinTyTerm true stmts | return none
-        `($r >>= fun _jRes => Pure.pure (_jRes.map fun _ => ByteArray.empty))
+        let jt ← `(Unit)
+        let some r ← runChanSubHandler c "onJoin" #[] #[] #[] #[] #[] jt true stmts | return none
+        pure (false, jt, ← `($r >>= fun _jRes => Pure.pure (_jRes.map fun _ => ByteArray.empty)))
     | none =>
-        `(Pure.pure (Except.ok ByteArray.empty))
+        pure (false, ← `(Unit), ← `(Pure.pure (Except.ok ByteArray.empty)))
+  let arm ← mkChanDispatchArm c (Syntax.mkNumLit "1")
+    (← wrapReqs hdr.reqPropTerms hdr.reqHypIds hdr.reqLabels joinRunTerm)
+  return some (hasJoinSnapshot, joinTyTerm, arm)
 
-  arms := arms.push (← mkChanArm (Syntax.mkNumLit "1")
-    (← wrapReqs hdr.reqPropTerms hdr.reqHypIds hdr.reqLabels joinRunTerm))
+private structure ChanSendInfo where
+  hasSend             : Bool := false
+  spIdents            : Array Lean.Ident := #[]
+  spTyTerms           : Array Lean.Term := #[]
+  sendParamTypeConsts : Array Lean.Name := #[]
+  sendReqConst?       : Option Lean.Name := none
+  sendReqLabel        : String := ""
+  arm?                : Option (Lean.TSyntax ``Lean.Parser.Term.matchAltExpr) := none
 
-  -- 2. `on_send` (kind = 2)
-  let mut hasSend := false
+open Lean Elab Command in
+private def elabChanOnSend (c : ChanBodyCtx) : CommandElabM (Option ChanSendInfo) := do
+  let hdr := c.hdr
+  let some (rawSParams, rawSReqs, sBody) := hdr.onSend? | return some {}
   let mut spIdents : Array Ident := #[]
   let mut spTyTerms : Array Term := #[]
-  let mut sendParamTypeConsts : Array Name := #[]
-  let mut sendReqConst? : Option Name := none
-  let mut sendReqLabel := ""
-  if let some (rawSParams, rawSReqs, sBody) := hdr.onSend? then
-    hasSend := true
-    let mut spNames : Array String := #[]
-    for srp in rawSParams do
-      let spid : Ident := ⟨(srp.getArg 0)⟩
-      let spstr := spid.getId.toString
-      if spstr == "ctx" || hdr.paramNames.contains spstr || spNames.contains spstr ||
-         envVarNames.contains spstr || stateFieldNames.contains spstr then
-        throwErrorAt spid s!"`on_send` parameter `{spstr}` shadows an existing binding in `channel {chStr}`"
-      let spty ← liftMacroM <| ParsedSrvType.parse (srp.getArg 2)
-      liftMacroM <| spty.validate (allowFallible := false) s!"`on_send` parameter `{spstr}`"
-      spIdents := spIdents.push spid
-      spTyTerms := spTyTerms.push (← liftMacroM spty.toPayloadTerm)
-      spNames := spNames.push spstr
-    sendParamTypeConsts ← elabParamTypeAbbrevs chIdent srvName fullSrvName chName "_SendParam_" spTyTerms
+  let mut spNames : Array String := #[]
+  for srp in rawSParams do
+    let spid : Ident := ⟨(srp.getArg 0)⟩
+    let spstr := spid.getId.toString
+    if spstr == "ctx" || hdr.paramNames.contains spstr || spNames.contains spstr ||
+       c.envVarNames.contains spstr || c.stateFieldNames.contains spstr then
+      throwErrorAt spid s!"`on_send` parameter `{spstr}` shadows an existing binding in `channel {hdr.chStr}`"
+    let spty ← liftMacroM <| ParsedSrvType.parse (srp.getArg 2)
+    liftMacroM <| spty.validate (allowFallible := false) s!"`on_send` parameter `{spstr}`"
+    spIdents := spIdents.push spid
+    spTyTerms := spTyTerms.push (← liftMacroM spty.toPayloadTerm)
+    spNames := spNames.push spstr
+  let sendParamTypeConsts ← elabParamTypeAbbrevs hdr.chIdent c.srvName c.fullSrvName hdr.chName "_SendParam_" spTyTerms
+  let sReqs ← elabRequiresClauses hdr.chIdent c.srvName c.fullSrvName hdr.chName s!"{hdr.chStr}.on_send" "_hSReq" "_send_req"
+    c.stateFieldNames c.envVarNames (hdr.paramNames ++ spNames) spNames spIdents spTyTerms rawSReqs
+    (excludedClientVars := hdr.paramNames) (trackAuth := false)
+  c.extRootsRef.modify fun acc => acc ++ sReqs.extRoots.filter (!acc.contains ·)
+  let sendTupleTy ← buildTupleType spTyTerms
+  let sTupleVar := mkIdent `_chSendVal
+  let payloadBytesVar := mkIdent `wsPayload
+  let sProjs ← extractTupleProjections sTupleVar spTyTerms.size
+  let unitTy ← `(Unit)
+  let some sendRun ← runChanSubHandler c "onSend" spIdents spTyTerms sProjs sReqs.reqHypIds sReqs.reqHypTys unitTy true sBody | return none
+  let sendOut ← `($sendRun >>= fun _sRes => Pure.pure (_sRes.map fun _ => ByteArray.empty))
+  let sendGuarded ← wrapReqs (hdr.reqPropTerms ++ sReqs.reqPropTerms) (hdr.reqHypIds ++ sReqs.reqHypIds) (hdr.reqLabels ++ sReqs.reqLabels) sendOut
+  let sendBound ← (spIdents.zip sProjs).foldrM (init := sendGuarded) fun (spid, sprj) acc =>
+    `(let $spid:ident := $sprj; $acc)
+  let sendDecode ← `(match Qed.Proto.decode (α := $sendTupleTy) $payloadBytesVar with
+    | Except.error _e2 => Pure.pure (Except.error (Qed.Server.ApiError.badRequest _e2))
+    | Except.ok $sTupleVar:ident => $sendBound)
+  let arm ← mkChanDispatchArm c (Syntax.mkNumLit "2") sendDecode
+  return some {
+    hasSend := true, spIdents, spTyTerms, sendParamTypeConsts,
+    sendReqConst? := sReqs.clientReqConst?, sendReqLabel := sReqs.clientReqLabel,
+    arm? := some arm
+  }
 
-    let sReqs ← elabRequiresClauses chIdent srvName fullSrvName chName s!"{chStr}.on_send" "_hSReq" "_send_req"
-      stateFieldNames envVarNames (hdr.paramNames ++ spNames) spNames spIdents spTyTerms rawSReqs
-      (excludedClientVars := hdr.paramNames) (trackAuth := false)
-    extRootsRef.modify fun acc => acc ++ sReqs.extRoots.filter (!acc.contains ·)
-    sendReqConst? := sReqs.clientReqConst?
-    sendReqLabel := sReqs.clientReqLabel
-
-    let sendTupleTy ← buildTupleType spTyTerms
-    let sTupleVar := mkIdent `_chSendVal
-    let sProjs ← extractTupleProjections sTupleVar spTyTerms.size
-    let unitTy ← `(Unit)
-    let some sendRun ← runSubHandler "onSend" spIdents spTyTerms sProjs sReqs.reqHypIds sReqs.reqHypTys unitTy true sBody | return none
-    let sendOut ← `($sendRun >>= fun _sRes => Pure.pure (_sRes.map fun _ => ByteArray.empty))
-    let sendGuarded ← wrapReqs (hdr.reqPropTerms ++ sReqs.reqPropTerms) (hdr.reqHypIds ++ sReqs.reqHypIds) (hdr.reqLabels ++ sReqs.reqLabels) sendOut
-    let sendBound ← (spIdents.zip sProjs).foldrM (init := sendGuarded) fun (spid, sprj) acc =>
-      `(let $spid:ident := $sprj; $acc)
-    let sendDecode ← `(match Qed.Proto.decode (α := $sendTupleTy) $payloadBytesVar with
-      | Except.error _e2 => Pure.pure (Except.error (Qed.Server.ApiError.badRequest _e2))
-      | Except.ok $sTupleVar:ident => $sendBound)
-    arms := arms.push (← mkChanArm (Syntax.mkNumLit "2") sendDecode)
-
-  -- 3. `on_leave` (kind = 3)
-  let leaveRunTerm ← match hdr.onLeave? with
-    | some stmts =>
-        let unitTy ← `(Unit)
-        let some r ← runSubHandler "onLeave" #[] #[] #[] #[] #[] unitTy true stmts | return none
-        `($r >>= fun _lRes => Pure.pure (_lRes.map fun _ => ByteArray.empty))
-    | none =>
-        `(Pure.pure (Except.ok ByteArray.empty))
-  arms := arms.push (← mkChanArm (Syntax.mkNumLit "3")
-    (← wrapReqs hdr.reqPropTerms hdr.reqHypIds hdr.reqLabels leaveRunTerm))
-
-  -- 4. Emit client-safe channel helpers (`_Join`, `_key`, `_sub`, `_send`, `_unsub`) & register in `channelRegistry`
-  let joinAbbrevId := mkIdentFrom chIdent (srvName ++ chName.appendAfter "_Join")
+open Lean Elab Command in
+private def emitChanClientHelpers (c : ChanBodyCtx) (hasJoinSnapshot : Bool) (joinTyTerm : Term)
+    (sendInfo : ChanSendInfo) : CommandElabM (String × Name) := do
+  let hdr := c.hdr
+  let pIdents := hdr.pIdents
+  let pTyTerms := hdr.pTyTerms
+  let chLit := Syntax.mkStrLit hdr.chStr
+  let joinAbbrevId := mkIdentFrom hdr.chIdent (c.srvName ++ hdr.chName.appendAfter "_Join")
   elabCommand (← `(command| abbrev $joinAbbrevId : Type := $joinTyTerm))
-
-  let keyId := mkIdentFrom chIdent (srvName ++ chName.appendAfter "_key")
+  let keyId := mkIdentFrom hdr.chIdent (c.srvName ++ hdr.chName.appendAfter "_key")
   let paramTupleVal ← liftMacroM <| buildTupleVal (pIdents.map (⟨·.raw⟩))
   elabCommand (← `(command|
     def $keyId $[($pIdents:ident : $pTyTerms:term)]* : String :=
       Qed.wsTopicKey $chLit $paramTupleVal))
-
   let wireEvTerm : Term ← match hdr.ensId? with
     | some eid =>
         let ensApp ← pIdents.foldlM (init := (eid : Term)) fun acc p => `($acc $p)
         `(Qed.Ensured $(hdr.evTyTerm) ($ensApp))
     | none => pure hdr.evTyTerm
-
-  let subId := mkIdentFrom chIdent (srvName ++ chName.appendAfter "_sub")
+  let subId := mkIdentFrom hdr.chIdent (c.srvName ++ hdr.chName.appendAfter "_sub")
   let slotId := mkIdent `slot
   let recId := mkIdent `rec
   let onJoinId := mkIdent `onJoin
   let onMsgId := mkIdent `onMsg
   let onStatusId := mkIdent `onStatus
-  let wsPathStr := s!"/_qed/ws/{srvShort}"
+  let wsPathStr := s!"/_qed/ws/{c.srvShort}"
   let wsPathLit := Syntax.mkStrLit wsPathStr
   let onJoinDecTerm : Term ←
     if hasJoinSnapshot then
@@ -366,51 +373,86 @@ def elabServerChannelBody (priorRep priorUnrep : Nat)
           | Except.ok v    => $onMsgId v
           | Except.error e => $onStatusId (Qed.SocketStatus.failed e))
         $onStatusId))
-
-  let unsubId := mkIdentFrom chIdent (srvName ++ chName.appendAfter "_unsub")
+  let unsubId := mkIdentFrom hdr.chIdent (c.srvName ++ hdr.chName.appendAfter "_unsub")
   elabCommand (← `(command|
     def $unsubId {msg : Type} ($slotId:ident : String) : Qed.Cmd msg :=
       Qed.Cmd.wsMuxUnsub $slotId))
+  let sendHelperConst ←
+    if sendInfo.hasSend then
+      let sendId := mkIdentFrom hdr.chIdent (c.srvName ++ hdr.chName.appendAfter "_send")
+      let spIdents := sendInfo.spIdents
+      let spTyTerms := sendInfo.spTyTerms
+      let sendTupleVal ← liftMacroM <| buildTupleVal (spIdents.map (⟨·.raw⟩))
+      elabCommand (← `(command|
+        def $sendId {msg : Type} ($slotId:ident : String) $[($spIdents:ident : $spTyTerms:term)]* : Qed.Cmd msg :=
+          Qed.Cmd.wsMuxSend $slotId (Qed.Proto.encode $sendTupleVal)))
+      pure (c.fullSrvName ++ hdr.chName.appendAfter "_send")
+    else pure .anonymous
+  return (wsPathStr, sendHelperConst)
 
-  let mut sendHelperConst : Name := .anonymous
-  if hasSend then
-    let sendId := mkIdentFrom chIdent (srvName ++ chName.appendAfter "_send")
-    let sendTupleVal ← liftMacroM <| buildTupleVal (spIdents.map (⟨·.raw⟩))
-    elabCommand (← `(command|
-      def $sendId {msg : Type} ($slotId:ident : String) $[($spIdents:ident : $spTyTerms:term)]* : Qed.Cmd msg :=
-        Qed.Cmd.wsMuxSend $slotId (Qed.Proto.encode $sendTupleVal)))
-    sendHelperConst := fullSrvName ++ chName.appendAfter "_send"
-
+open Lean Elab Command in
+def elabServerChannelBody (priorRep priorUnrep : Nat)
+    (srvName fullSrvName : Name) (srvShort : String) (hasState : Bool)
+    (stateId stateInvId ctxId : Ident)
+    (envIdents : Array Ident) (envTypes : Array Term)
+    (stateFieldNames envVarNames : Array String)
+    (invs : Array ParsedInv) (mutInvs : Array ParsedMutInv)
+    (chanSigs : Array SrvChanSig) (hdr : ParsedChanHeader)
+    (deferredProofs : IO.Ref (Array (CommandElabM Bool))) :
+    CommandElabM (Option (Array (TSyntax ``Lean.Parser.Term.matchAltExpr) × Array Name)) := do
+  let ctxTyTerm ← `(Qed.Server.RequestCtx)
+  let errTyTerm ← `(Qed.Server.ApiError)
+  let paramTupleTy ← buildTupleType hdr.pTyTerms
+  let pProjs ← extractTupleProjections (mkIdent `_chParams) hdr.pTyTerms.size
+  let extRootsRef ← IO.mkRef (#[] : Array Name)
+  let c : ChanBodyCtx := {
+    priorRep, priorUnrep, srvName, fullSrvName, srvShort, hasState,
+    stateId, stateInvId, ctxId, envIdents, envTypes, stateFieldNames, envVarNames,
+    invs, mutInvs, chanSigs, hdr, ctxTyTerm, errTyTerm, paramTupleTy, pProjs,
+    extRootsRef, deferredProofs
+  }
+  let some (hasJoinSnapshot, joinTyTerm, joinArm) ← elabChanOnJoin c | return none
+  let some sendInfo ← elabChanOnSend c | return none
+  let leaveRunTerm ← match hdr.onLeave? with
+    | some stmts =>
+        let unitTy ← `(Unit)
+        let some r ← runChanSubHandler c "onLeave" #[] #[] #[] #[] #[] unitTy true stmts | return none
+        `($r >>= fun _lRes => Pure.pure (_lRes.map fun _ => ByteArray.empty))
+    | none =>
+        `(Pure.pure (Except.ok ByteArray.empty))
+  let leaveArm ← mkChanDispatchArm c (Syntax.mkNumLit "3")
+    (← wrapReqs hdr.reqPropTerms hdr.reqHypIds hdr.reqLabels leaveRunTerm)
+  let arms := #[joinArm] ++ (match sendInfo.arm? with | some a => #[a] | none => #[]) ++ #[leaveArm]
+  let (wsPathStr, sendHelperConst) ← emitChanClientHelpers c hasJoinSnapshot joinTyTerm sendInfo
   if hasNewErrors (← get).messages priorRep priorUnrep then return none
-
   modifyEnv fun env => Qed.channelRegistry.addEntry env {
-    fullName := fullSrvName ++ chName
+    fullName := fullSrvName ++ hdr.chName
     ownerName := fullSrvName
     ownerShort := srvShort
-    channelName := chStr
+    channelName := hdr.chStr
     kind := .fullstack fullSrvName srvShort wsPathStr
-    paramNames := pIdents.map (·.getId)
-    paramCount := pIdents.size
+    paramNames := hdr.pIdents.map (·.getId)
+    paramCount := hdr.pIdents.size
     paramTypeConsts := hdr.paramTypeConsts
-    eventTypeConst := fullSrvName ++ chName.appendAfter "_Event"
+    eventTypeConst := fullSrvName ++ hdr.chName.appendAfter "_Event"
     hasJoinSnapshot
-    joinTypeConst := fullSrvName ++ chName.appendAfter "_Join"
-    hasSend
-    sendParamNames := spIdents.map (·.getId)
-    sendParamCount := spIdents.size
-    sendParamTypeConsts
-    sendReqConst := sendReqConst?
-    sendReqLabel
+    joinTypeConst := fullSrvName ++ hdr.chName.appendAfter "_Join"
+    hasSend := sendInfo.hasSend
+    sendParamNames := sendInfo.spIdents.map (·.getId)
+    sendParamCount := sendInfo.spIdents.size
+    sendParamTypeConsts := sendInfo.sendParamTypeConsts
+    sendReqConst := sendInfo.sendReqConst?
+    sendReqLabel := sendInfo.sendReqLabel
     requiresAuth := hdr.requiresAuth
     clientReqConst := hdr.clientReqConst
     clientReqLabel := hdr.clientReqLabel
     hasEnsures := hdr.ensConst?.isSome
     ensPredConst := hdr.ensConst?
     defaultReconnect := hdr.recPolicy
-    keyHelperConst := fullSrvName ++ chName.appendAfter "_key"
-    subHelperConst := fullSrvName ++ chName.appendAfter "_sub"
+    keyHelperConst := fullSrvName ++ hdr.chName.appendAfter "_key"
+    subHelperConst := fullSrvName ++ hdr.chName.appendAfter "_sub"
     sendHelperConst
-    unsubHelperConst := fullSrvName ++ chName.appendAfter "_unsub"
+    unsubHelperConst := fullSrvName ++ hdr.chName.appendAfter "_unsub"
   }
   return some (arms, ← extRootsRef.get)
 

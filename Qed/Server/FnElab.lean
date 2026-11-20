@@ -1,6 +1,4 @@
 import Qed.Server.Lower
-import Qed.Server.External
-import Qed.Server.Invariant
 
 namespace Qed.Server
 open Qed.Lang
@@ -401,33 +399,17 @@ def scanBodyFailTags (stmts : Array Syntax) : CommandElabM (Array Ident × Bool)
     tags := t'; hasPlain := p'
   return (tags, hasPlain)
 
-def elabDomainErrorType (srvName : Name) (fnIdent : Ident) (tagIdents : Array Ident) :
-    CommandElabM Ident := do
-  let errTypeId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId ++ `Error)
-  let mkDotTerm (tid : Ident) : Term :=
-    ⟨Syntax.node (.fromRef tid) ``Lean.Parser.Term.dotIdent #[Syntax.atom (.fromRef tid) ".", tid]⟩
-  let ctors ← tagIdents.mapM fun tid =>
-    `(Lean.Parser.Command.ctor| | $tid:ident)
-  elabCommand (← `(command|
-    inductive $errTypeId where
-      $[$ctors:ctor]*
-    deriving Inhabited, DecidableEq, Repr))
+private def mkErrDotTerm (tid : Ident) : Term :=
+  ⟨Syntax.node (.fromRef tid) ``Lean.Parser.Term.dotIdent #[Syntax.atom (.fromRef tid) ".", tid]⟩
+
+private def elabDomainErrorJsonInsts (errTypeId : Ident) (tagIdents : Array Ident) : CommandElabM Unit := do
   let toStrAlts ← tagIdents.mapM fun tid => do
     let tLit := Syntax.mkStrLit tid.getId.toString
-    `(Lean.Parser.Term.matchAltExpr| | $(mkDotTerm tid) => $tLit)
+    `(Lean.Parser.Term.matchAltExpr| | $(mkErrDotTerm tid) => $tLit)
   let fromJsonAlts ← tagIdents.mapM fun tid => do
     let tLit := Syntax.mkStrLit tid.getId.toString
-    `(Lean.Parser.Term.matchAltExpr| | Qed.Json.str $tLit => Except.ok $(mkDotTerm tid))
-  let fromJsonFail ← `(Lean.Parser.Term.matchAltExpr| | _ => Except.error "invalid RPC error tag")
-  let fromJsonAltsAll := fromJsonAlts.push fromJsonFail
-  let toProtoAlts ← tagIdents.zipIdx.mapM fun (tid, i) => do
-    let iLit := Syntax.mkNumLit (toString i)
-    `(Lean.Parser.Term.matchAltExpr| | $(mkDotTerm tid) => Qed.Proto.WireVal.varint $iLit)
-  let fromProtoAlts ← tagIdents.zipIdx.mapM fun (tid, i) => do
-    let iLit := Syntax.mkNumLit (toString i)
-    `(Lean.Parser.Term.matchAltExpr| | Qed.Proto.WireVal.varint $iLit => Except.ok $(mkDotTerm tid))
-  let fromProtoFail ← `(Lean.Parser.Term.matchAltExpr| | _ => Except.error "protobuf: invalid RPC error tag")
-  let fromProtoAltsAll := fromProtoAlts.push fromProtoFail
+    `(Lean.Parser.Term.matchAltExpr| | Qed.Json.str $tLit => Except.ok $(mkErrDotTerm tid))
+  let fromJsonAltsAll := fromJsonAlts.push (← `(Lean.Parser.Term.matchAltExpr| | _ => Except.error "invalid RPC error tag"))
   elabCommand (← `(command| instance : ToString $errTypeId where toString e := match e with $[$toStrAlts:matchAlt]*))
   elabCommand (← `(command| instance : Qed.ToJson $errTypeId := ⟨fun e => Qed.Json.str (toString e)⟩))
   elabCommand (← `(command| instance : Qed.FromJson $errTypeId where fromJson j := match j with $[$fromJsonAltsAll:matchAlt]*))
@@ -437,30 +419,37 @@ def elabDomainErrorType (srvName : Name) (fnIdent : Ident) (tagIdents : Array Id
       depth_toJson _ := Nat.le_refl 0
       fromJson_toJson e := by cases e <;> rfl))
   elabCommand (← `(command| instance : Qed.NonNullJson $errTypeId := ⟨nofun⟩))
+
+private def elabDomainErrorProtoInsts (errTypeId : Ident) (tagIdents : Array Ident) : CommandElabM Unit := do
+  let toProtoAlts ← tagIdents.zipIdx.mapM fun (tid, i) => do
+    let iLit := Syntax.mkNumLit (toString i)
+    `(Lean.Parser.Term.matchAltExpr| | $(mkErrDotTerm tid) => Qed.Proto.WireVal.varint $iLit)
+  let fromProtoAlts ← tagIdents.zipIdx.mapM fun (tid, i) => do
+    let iLit := Syntax.mkNumLit (toString i)
+    `(Lean.Parser.Term.matchAltExpr| | Qed.Proto.WireVal.varint $iLit => Except.ok $(mkErrDotTerm tid))
+  let fromProtoAltsAll := fromProtoAlts.push (← `(Lean.Parser.Term.matchAltExpr| | _ => Except.error "protobuf: invalid RPC error tag"))
   elabCommand (← `(command| instance : Qed.ToProto $errTypeId where toProtoVal e := match e with $[$toProtoAlts:matchAlt]*))
   elabCommand (← `(command| instance : Qed.FromProto $errTypeId where fromProtoVal w := match w with $[$fromProtoAltsAll:matchAlt]*))
   elabCommand (← `(command| instance : Qed.LawfulProto $errTypeId := Qed.LawfulProto.ofScalar (by intro e; cases e <;> rfl)))
+
+def elabDomainErrorType (srvName : Name) (fnIdent : Ident) (tagIdents : Array Ident) :
+    CommandElabM Ident := do
+  let errTypeId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId ++ `Error)
+  let ctors ← tagIdents.mapM fun tid =>
+    `(Lean.Parser.Command.ctor| | $tid:ident)
+  elabCommand (← `(command|
+    inductive $errTypeId where
+      $[$ctors:ctor]*
+    deriving Inhabited, DecidableEq, Repr))
+  elabDomainErrorJsonInsts errTypeId tagIdents
+  elabDomainErrorProtoInsts errTypeId tagIdents
   return errTypeId
 
 end
 
 open Lean Elab Command in
-def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : Ident)
-    (srvName fullSrvName : Name) (srvShort : String) (hasState : Bool)
-    (envDecls : Array ParsedEnvDecl) (allExtRoots : Array Name)
-    (methodInfos : Array ServerMethodInfo) (dispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
-    (chanNames : Array String) (wsDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
-    (ctxId reqBytesId : Ident) : CommandElabM Unit := do
-  let srvNm := srvName
-  if hasState then
-    let linThmId := mkIdentFrom srvIdent (srvNm ++ `concurrent_linearizable)
-    elabCommand (← `(command|
-      theorem $linThmId {Out : Type}
-          (st : Qed.Server.MultiCoreState $stateId Out)
-          (hsched : Qed.Server.MultiCoreSchedule $stateInvId ⟨$initStateId, []⟩ st) :
-          $stateInvId st.shared :=
-        Qed.Server.concurrent_schedule_preserves_inv $stateInvId $initStateId st $invInitId hsched))
-
+private def collectServerSecretsAndExts (envDecls : Array ParsedEnvDecl) (allExtRoots : Array Name) :
+    CommandElabM (Array String × Array (String × String)) := do
   let extMap := externalRegistry.getState (← getEnv)
   let mut reqSecrets : Array String := #[]
   for ed in envDecls do
@@ -478,55 +467,99 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
       for sec in extInfo.secrets do
         unless reqSecrets.contains sec do
           reqSecrets := reqSecrets.push sec
+  return (reqSecrets, usedExts)
 
-  let secretsId := mkIdentFrom srvIdent (srvNm ++ `secrets)
+open Lean Elab Command in
+private def wrapDispatchWithEnvDecls (envDecls : Array ParsedEnvDecl) (innerTerm : Term) :
+    CommandElabM Term :=
+  envDecls.foldrM (init := innerTerm) fun ed acc => do
+    let eid := ed.ident
+    let keyLit := Syntax.mkStrLit ed.osKey
+    match ed.default? with
+    | some defVal =>
+        let defLit := Syntax.mkStrLit defVal
+        `(Qed.Server.MonadServer.readEnv $keyLit >>= fun _envOpt =>
+            let $eid:ident : String := _envOpt.getD $defLit
+            $acc)
+    | none =>
+        let missingMsg := Syntax.mkStrLit s!"missing required environment variable `{ed.osKey}`"
+        `(Qed.Server.MonadServer.readEnv $keyLit >>= fun _envOpt =>
+            match _envOpt with
+            | some $eid:ident => $acc
+            | none => Pure.pure (Except.error (Qed.Server.ApiError.internal $missingMsg)))
+
+open Lean Elab Command in
+private def elabServerWsDispatchCmd (srvIdent ctxId : Ident) (srvName : Name)
+    (envDecls : Array ParsedEnvDecl) (atomicBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder))
+    (wsDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr)) : CommandElabM Unit := do
+  let wsKindVar := mkIdent `wsKind
+  let wsChanVar := mkIdent `wsChannel
+  let wsParamsVar := mkIdent `wsParams
+  let wsPayloadVar := mkIdent `wsPayload
+  let wsNotFoundArm ← `(Lean.Parser.Term.matchAltExpr|
+    | _, _ => Pure.pure (Except.error (Qed.Server.ApiError.notFound ("unknown WebSocket channel: " ++ $wsChanVar))))
+  let allWsArms := wsDispatchArms.push wsNotFoundArm
+  let wsMatchTerm ← `(match $wsKindVar:ident, $wsChanVar:ident with $[$allWsArms:matchAlt]*)
+  let fullWsBody ← wrapDispatchWithEnvDecls envDecls wsMatchTerm
+  let wsDispatchId := mkIdentFrom srvIdent (srvName ++ `wsDispatchM)
+  elabCommand (← `(command|
+    set_option linter.unusedVariables false in
+    def $wsDispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
+        $[$atomicBinders:bracketedBinder]*
+        ($ctxId:ident : Qed.Server.RequestCtx) ($wsKindVar:ident : UInt8) ($wsChanVar:ident : String)
+        ($wsParamsVar:ident : ByteArray) ($wsPayloadVar:ident : ByteArray) :
+        m (Except Qed.Server.ApiError ByteArray) :=
+      $fullWsBody))
+
+open Lean Elab Command in
+def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : Ident)
+    (srvName fullSrvName : Name) (srvShort : String) (hasState : Bool)
+    (envDecls : Array ParsedEnvDecl) (allExtRoots : Array Name)
+    (methodInfos : Array ServerMethodInfo) (dispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
+    (chanNames : Array String) (wsDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
+    (ctxId reqBytesId : Ident) : CommandElabM Unit := do
+  if hasState then
+    let linThmId := mkIdentFrom srvIdent (srvName ++ `concurrent_linearizable)
+    elabCommand (← `(command|
+      theorem $linThmId {Out : Type}
+          (st : Qed.Server.MultiCoreState $stateId Out)
+          (hsched : Qed.Server.MultiCoreSchedule $stateInvId ⟨$initStateId, []⟩ st) :
+          $stateInvId st.shared :=
+        Qed.Server.concurrent_schedule_preserves_inv $stateInvId $initStateId st $invInitId hsched))
+
+  let (reqSecrets, usedExts) ← collectServerSecretsAndExts envDecls allExtRoots
+
+  let secretsId := mkIdentFrom srvIdent (srvName ++ `secrets)
   let secLits : Array Term := reqSecrets.map (Syntax.mkStrLit ·)
   elabCommand (← `(command| def $secretsId : Array String := #[$[$secLits],*]))
 
-  let markerId := mkIdentFrom srvIdent (srvNm ++ `_qed_server_marker)
+  let markerId := mkIdentFrom srvIdent (srvName ++ `_qed_server_marker)
   elabCommand (← `(command| theorem $markerId : True := True.intro))
 
-  let readOnlyId := mkIdentFrom srvIdent (srvNm ++ `readOnlyMethods)
+  let readOnlyId := mkIdentFrom srvIdent (srvName ++ `readOnlyMethods)
   let roLits : Array Term := (methodInfos.filter (·.isReadOnly)).map (Syntax.mkStrLit ·.name)
   elabCommand (← `(command| def $readOnlyId : Array String := #[$[$roLits],*]))
 
-  let methodsId := mkIdentFrom srvIdent (srvNm ++ `methods)
+  let methodsId := mkIdentFrom srvIdent (srvName ++ `methods)
   let mLits : Array Term := methodInfos.map (Syntax.mkStrLit ·.name)
   elabCommand (← `(command| def $methodsId : List String := [$[$mLits],*]))
 
-  let channelsId := mkIdentFrom srvIdent (srvNm ++ `channels)
+  let channelsId := mkIdentFrom srvIdent (srvName ++ `channels)
   let chLits : Array Term := chanNames.map (Syntax.mkStrLit ·)
   elabCommand (← `(command| def $channelsId : List String := [$[$chLits],*]))
-
-  let wrapWithEnvDecls (innerTerm : Term) : CommandElabM Term :=
-    envDecls.foldrM (init := innerTerm) fun ed acc => do
-      let eid := ed.ident
-      let keyLit := Syntax.mkStrLit ed.osKey
-      match ed.default? with
-      | some defVal =>
-          let defLit := Syntax.mkStrLit defVal
-          `(Qed.Server.MonadServer.readEnv $keyLit >>= fun _envOpt =>
-              let $eid:ident : String := _envOpt.getD $defLit
-              $acc)
-      | none =>
-          let missingMsg := Syntax.mkStrLit s!"missing required environment variable `{ed.osKey}`"
-          `(Qed.Server.MonadServer.readEnv $keyLit >>= fun _envOpt =>
-              match _envOpt with
-              | some $eid:ident => $acc
-              | none => Pure.pure (Except.error (Qed.Server.ApiError.internal $missingMsg)))
 
   let methodVar := mkIdent `method
   let notFoundArm ← `(Lean.Parser.Term.matchAltExpr|
     | _ => Pure.pure (Except.error (Qed.Server.ApiError.notFound ("unknown RPC method: " ++ $methodVar))))
   let allArms := dispatchArms.push notFoundArm
   let matchMethodTerm ← `(match $methodVar:ident with $[$allArms:matchAlt]*)
-  let fullDispatchBody ← wrapWithEnvDecls matchMethodTerm
+  let fullDispatchBody ← wrapDispatchWithEnvDecls envDecls matchMethodTerm
 
   let atomicBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) ←
     if hasState then pure #[← `(bracketedBinder| [Qed.Server.MonadAtomic $stateId m])]
     else pure #[]
 
-  let dispatchId := mkIdentFrom srvIdent (srvNm ++ `dispatchM)
+  let dispatchId := mkIdentFrom srvIdent (srvName ++ `dispatchM)
   elabCommand (← `(command|
     def $dispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
         $[$atomicBinders:bracketedBinder]*
@@ -535,24 +568,7 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
       $fullDispatchBody))
 
   if !chanNames.isEmpty then
-    let wsKindVar := mkIdent `wsKind
-    let wsChanVar := mkIdent `wsChannel
-    let wsParamsVar := mkIdent `wsParams
-    let wsPayloadVar := mkIdent `wsPayload
-    let wsNotFoundArm ← `(Lean.Parser.Term.matchAltExpr|
-      | _, _ => Pure.pure (Except.error (Qed.Server.ApiError.notFound ("unknown WebSocket channel: " ++ $wsChanVar))))
-    let allWsArms := wsDispatchArms.push wsNotFoundArm
-    let wsMatchTerm ← `(match $wsKindVar:ident, $wsChanVar:ident with $[$allWsArms:matchAlt]*)
-    let fullWsBody ← wrapWithEnvDecls wsMatchTerm
-    let wsDispatchId := mkIdentFrom srvIdent (srvNm ++ `wsDispatchM)
-    elabCommand (← `(command|
-      set_option linter.unusedVariables false in
-      def $wsDispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
-          $[$atomicBinders:bracketedBinder]*
-          ($ctxId:ident : Qed.Server.RequestCtx) ($wsKindVar:ident : UInt8) ($wsChanVar:ident : String)
-          ($wsParamsVar:ident : ByteArray) ($wsPayloadVar:ident : ByteArray) :
-          m (Except Qed.Server.ApiError ByteArray) :=
-        $fullWsBody))
+    elabServerWsDispatchCmd srvIdent ctxId srvName envDecls atomicBinders wsDispatchArms
 
   modifyEnv fun env => serverRegistry.addEntry env {
     serverName := fullSrvName
@@ -754,6 +770,7 @@ def elabServerAsyncFn (priorRep priorUnrep : Nat)
   let isReadOnly := lSt.mutated.isEmpty
   let handlerId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_handler")
   elabCommand (← `(command|
+    set_option linter.unusedVariables false in
     def $handlerId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
         [Qed.Server.MonadAtomic $stateId m]
         $[($allBinderIds:ident : $allBinderTys:term)]* :

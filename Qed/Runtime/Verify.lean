@@ -225,9 +225,11 @@ private def viewValidSimpExtras (env : Environment) : Array Name :=
   ].filter env.contains
   base ++ opt
 
-private def qedUnfoldHelpers (maxIters : Nat) (allowView : Bool)
+def qedUnfoldHelperLoop (maxIters : Nat)
+    (keep : Environment → Name → MetaM Bool)
     (extraLemmas : Array (TSyntax `Lean.Parser.Tactic.simpLemma) := #[])
-    (includeLCtx : Bool := false) (tryRfl : Bool := false) : TacticM Unit := do
+    (includeLCtx : Bool := false) (useSimpAll : Bool := false)
+    (tryRfl : Bool := false) : TacticM Unit := do
   for _ in [0:maxIters] do
     if (← getGoals).isEmpty then break
     let env ← getEnv
@@ -236,18 +238,29 @@ private def qedUnfoldHelpers (maxIters : Nat) (allowView : Bool)
       if includeLCtx then
         for ldecl in (← getLCtx) do
           if !ldecl.isImplementationDetail then
-            cs := cs ++ (← instantiateMVars ldecl.type).getUsedConstants
-      cs.filterM (fun n => liftM (isUnfoldableUserDef env allowView n))
-    if present.isEmpty then break
+            for c in (← instantiateMVars ldecl.type).getUsedConstants do
+              if !cs.contains c then cs := cs.push c
+      cs.filterM (fun n => liftM (keep env n))
+    if present.isEmpty then
+      if useSimpAll && !extraLemmas.isEmpty then
+        try evalTactic (← `(tactic| simp_all only [$[$extraLemmas],*])) catch _ => pure ()
+      break
     let uL ← present.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
     let combined := uL ++ extraLemmas
-    let tac ← match includeLCtx, tryRfl with
-      | true,  true  => `(tactic| (simp only [$[$combined],*] at *; try rfl))
-      | true,  false => `(tactic| simp only [$[$combined],*] at *)
-      | false, true  => `(tactic| (simp only [$[$combined],*]; try rfl))
-      | false, false => `(tactic| simp only [$[$combined],*])
+    let tac ← match useSimpAll, includeLCtx, tryRfl with
+      | true,  _,     _     => `(tactic| simp_all only [$[$combined],*])
+      | false, true,  true  => `(tactic| (simp only [$[$combined],*] at *; try rfl))
+      | false, true,  false => `(tactic| simp only [$[$combined],*] at *)
+      | false, false, true  => `(tactic| (simp only [$[$combined],*]; try rfl))
+      | false, false, false => `(tactic| simp only [$[$combined],*])
     let ok ← try evalTactic tac; pure true catch _ => pure false
     unless ok do break
+
+private def qedUnfoldHelpers (maxIters : Nat) (allowView : Bool)
+    (extraLemmas : Array (TSyntax `Lean.Parser.Tactic.simpLemma) := #[])
+    (includeLCtx : Bool := false) (tryRfl : Bool := false) : TacticM Unit :=
+  qedUnfoldHelperLoop maxIters (fun env n => isUnfoldableUserDef env allowView n)
+    extraLemmas (includeLCtx := includeLCtx) (tryRfl := tryRfl)
 
 elab "qedUnfoldForValidHtml" : tactic => qedUnfoldHelpers 8 true
 

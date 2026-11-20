@@ -1,5 +1,5 @@
 import Qed.Driver.Template
-import Qed.Runtime.App
+import Qed.Runtime.AppCore
 import Qed.Ssr
 
 namespace Qed

@@ -67,28 +67,9 @@ elab "qedUnfoldPresent" "[" extra:term,* "]" : tactic => do
   let env0 ← getEnv
   let fixedNames := qedAppLemmas env0 ++ qedBoundaryLemmas
   let fixedL := (← fixedNames.mapM (fun n => toLemma ⟨(mkIdent n).raw⟩)) ++ (← extra.getElems.mapM toLemma)
-  for _ in [0:12] do
-    if (← getGoals).isEmpty then return
-    let env ← getEnv
-    let goal ← instantiateMVars (← getMainTarget)
-    let mut usedConsts : Array Name := goal.getUsedConstants
-    for decl in (← getLCtx) do
-      if !decl.isImplementationDetail then
-        let dTy ← instantiateMVars decl.type
-        for c in dTy.getUsedConstants do
-          if !usedConsts.contains c then usedConsts := usedConsts.push c
-    let present ← (usedConsts.filter (qedIsHelper env)).filterM
-      (fun n => return (← getProjectionFnInfo? n).isNone)
-    if present.isEmpty then
-      let _ ← try evalTactic (← `(tactic| simp_all only [$[$fixedL],*])) catch _ => pure ()
-      return
-    -- Splice a single combined array; comma-separated `$[…],*` splices fail when one is empty.
-    let lemmas := (← present.mapM (fun n => toLemma ⟨(mkIdent n).raw⟩)) ++ fixedL
-    let ok ← try
-        evalTactic (← `(tactic| simp_all only [$[$lemmas],*]))
-        pure true
-      catch _ => pure false
-    unless ok do return
+  qedUnfoldHelperLoop 12
+    (fun env n => return qedIsHelper env n && (← getProjectionFnInfo? n).isNone)
+    fixedL (includeLCtx := true) (useSimpAll := true)
 
 private def toSimpLemmas (ts : Array Term) : TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) :=
   ts.mapM fun t => `(Lean.Parser.Tactic.simpLemma| $t:term)

@@ -1,4 +1,4 @@
-import Qed.Runtime.App
+import Qed.Runtime.AppCore
 
 namespace Qed
 

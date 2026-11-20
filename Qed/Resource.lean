@@ -1,6 +1,6 @@
 import Qed.Resource.Basic
 import Qed.Runtime.AppCore
-import Qed.Server.Registry
+import Qed.Server.Ensured
 
 namespace Qed
 

@@ -5,17 +5,12 @@ namespace Qed
 
 open Lean Elab Tactic
 
-elab "qedUnfoldViewHelpers" : tactic => do
-  for _ in [0:6] do
-    if (← getGoals).isEmpty then return
-    let env ← getEnv
-    -- Leave keyed component `.view` intact so `for_each … holds_in` can match the child contract.
-    let present ← ((← instantiateMVars (← getMainTarget)).getUsedConstants.filter fun n =>
-        qedIsHelper env n && !(n.getString! == "view" && env.contains (n.getPrefix ++ `keyOf))).filterM
-      fun n => return (← getProjectionFnInfo? n).isNone
-    if present.isEmpty then return
-    let lemmas ← present.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
-    try evalTactic (← `(tactic| simp only [$[$lemmas],*])) catch _ => return
+elab "qedUnfoldViewHelpers" : tactic =>
+  -- Leave keyed component `.view` intact so `for_each … holds_in` can match the child contract.
+  qedUnfoldHelperLoop 6 fun env n =>
+    return qedIsHelper env n &&
+      !(n.getString! == "view" && env.contains (n.getPrefix ++ `keyOf)) &&
+      (← getProjectionFnInfo? n).isNone
 
 elab "qedCloseExhaustiveEnum" : tactic => withMainContext do
   for ldecl in (← getLCtx) do

@@ -1,61 +1,25 @@
 /**
  * Standardized HTTP, JSON, RPC, Fortunes SSR, Static Asset, and WebSocket
- * Pub/Sub Fanout throughput harness comparing Qed's native Rust/Lean server
- * (single-worker & multi-worker) against Node.js 22 (single-worker & cluster).
+ * Pub/Sub Fanout throughput harness for Qed's native Rust/Lean server
+ * (single-worker & multi-worker).
  *
  * Uses a zero-dependency compiled Rust HTTP/1.1 keep-alive load generator
  * (`test/loadgen.rs`) so the client never becomes the bottleneck.
  *
  * Usage:
  *   node test/bench_server.mjs
+ *   node test/bench_server.mjs --save-baseline
  *   DURATION_MS=3000 CONNS=64 node test/bench_server.mjs
  */
-import cluster from 'node:cluster';
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { createServer } from 'node:http';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { getFreePort, lenField, ROOT, startNativeServer, stopProc, waitHealth, withElanPath } from './harness.mjs';
-
-const THIS_FILE = fileURLToPath(import.meta.url);
-
-// ---- Classic 12 TechEmpower Fortunes rows (identical to Bench/Server.lean) ----
-const BASE_FORTUNES = [
-  { id: 1,  message: 'fortune: No such file or directory' },
-  { id: 2,  message: "A computer scientist is someone who fixes things that aren't broken." },
-  { id: 3,  message: 'After enough decimal places, nobody gives a damn.' },
-  { id: 4,  message: 'A bad random number generator: 1, 1, 1, 1, 1, 4.33e+67, 1, 1, 1' },
-  { id: 5,  message: 'A computer program does what you tell it to do, not what you want it to do.' },
-  { id: 6,  message: 'Emacs is a nice operating system, but I prefer UNIX. — Tom Christaensen' },
-  { id: 7,  message: 'Any program that runs right is obsolete.' },
-  { id: 8,  message: 'A list is only as strong as its weakest link. — Donald Knuth' },
-  { id: 9,  message: 'Feature: A bug with seniority.' },
-  { id: 10, message: 'Computers make very fast, very accurate mistakes.' },
-  { id: 11, message: '<script>alert("This should not be displayed in a browser alert box.");</script>' },
-  { id: 12, message: 'フレームワークのベンチマーク' },
-];
-
-const escHtml = (s) =>
-  s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-
-function renderFortunesHtml() {
-  const rows = BASE_FORTUNES.concat([{ id: 0, message: 'Additional fortune added at request time.' }]);
-  rows.sort((a, b) => (a.message < b.message ? -1 : a.message > b.message ? 1 : 0));
-  let body = '<!doctype html><html><head><meta charset="utf-8"><title>Fortunes</title></head><body><div><h1>Fortunes</h1><table><thead><tr><th>id</th><th>message</th></tr></thead><tbody>';
-  for (let i = 0; i < rows.length; i++) {
-    body += `<tr><td>${rows[i].id}</td><td>${escHtml(rows[i].message)}</td></tr>`;
-  }
-  body += '</tbody></table></div></body></html>';
-  return Buffer.from(body, 'utf8');
-}
+import { lenField, ROOT, startNativeServer, withElanPath } from './harness.mjs';
 
 // ---- Minimal RFC 6455 WebSocket helpers ----
-const wsAccept = (key) => crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
-
 function encodeWsFrame(opcode, payload, masked) {
   const data = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
   const len = data.length;
@@ -97,88 +61,6 @@ function makeWsFrameParser(onFrame) {
   };
 }
 
-// ---- Embedded Node.js 22 baseline server (invoked via `--node-baseline`) ----
-if (process.argv.includes('--node-baseline')) {
-  const port = Number(process.argv[process.argv.indexOf('--port') + 1]);
-  const workers = Number(process.argv[process.argv.indexOf('--workers') + 1] || 1);
-  const staticPath = process.argv[process.argv.indexOf('--static-file') + 1];
-  const staticUrl = process.argv[process.argv.indexOf('--static-url') + 1];
-  const staticBuf = readFileSync(staticPath);
-
-  if (workers > 1 && cluster.isPrimary) {
-    for (let i = 0; i < workers; i++) cluster.fork();
-    process.on('SIGTERM', () => { for (const w of Object.values(cluster.workers)) w.kill(); process.exit(0); });
-  } else {
-    const healthBuf = Buffer.from('{"ok":true}');
-    const wsSubs = new Set();
-    const srv = createServer((req, res) => {
-      if (req.method === 'GET' && req.url === '/_qed/health') {
-        res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': healthBuf.length });
-        res.end(healthBuf);
-      } else if (req.method === 'GET' && req.url === '/') {
-        const html = renderFortunesHtml();
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': html.length });
-        res.end(html);
-      } else if (req.method === 'GET' && req.url === staticUrl) {
-        res.writeHead(200, {
-          'Content-Type': 'text/javascript; charset=utf-8',
-          'Cache-Control': 'public, max-age=31536000, immutable',
-          'Content-Length': staticBuf.length,
-        });
-        res.end(staticBuf);
-      } else if (req.method === 'POST' && req.url === '/_qed/rpc/BenchSrv/ping') {
-        const chunks = [];
-        req.on('data', (c) => chunks.push(c));
-        req.on('end', () => {
-          const body = Buffer.concat(chunks);
-          res.writeHead(200, { 'Content-Type': 'application/x-protobuf', 'Content-Length': body.length });
-          res.end(body);
-        });
-      } else {
-        res.writeHead(404, { 'Content-Length': 9 });
-        res.end('not found');
-      }
-    });
-    srv.keepAliveTimeout = 60000;
-    srv.on('upgrade', (req, sock) => {
-      const key = req.headers['sec-websocket-key'];
-      if (!key) { sock.destroy(); return; }
-      sock.setNoDelay(true);
-      sock.write(
-        'HTTP/1.1 101 Switching Protocols\r\n' +
-        'Upgrade: websocket\r\nConnection: Upgrade\r\n' +
-        `Sec-WebSocket-Accept: ${wsAccept(key)}\r\n\r\n`
-      );
-      wsSubs.add(sock);
-      const parse = makeWsFrameParser((opcode, payload) => {
-        if (opcode === 0x08) { wsSubs.delete(sock); sock.end(); return; }
-        if (opcode === 0x02 && payload.length >= 5) {
-          const op = payload[0];
-          const subId = payload.readUInt32BE(1);
-          if (op === 0x01) {
-            // JOIN_OK (op 0x11)
-            const ack = Buffer.allocUnsafe(5);
-            ack[0] = 0x11; ack.writeUInt32BE(subId, 1);
-            sock.write(encodeWsFrame(0x02, ack, false));
-          } else if (op === 0x03) {
-            // Broadcast EVENT (op 0x12) to all subscribers
-            const evt = Buffer.allocUnsafe(payload.length);
-            evt[0] = 0x12; evt.writeUInt32BE(subId, 1);
-            payload.copy(evt, 5, 5);
-            const frame = encodeWsFrame(0x02, evt, false);
-            for (const s of wsSubs) s.write(frame);
-          }
-        }
-      });
-      sock.on('data', parse);
-      sock.on('close', () => wsSubs.delete(sock));
-      sock.on('error', () => wsSubs.delete(sock));
-    });
-    srv.listen(port, '127.0.0.1');
-  }
-  await new Promise(() => {});
-}
-
 // ---- Orchestrator ----
 const CONNS = Math.max(4, Number(process.env.CONNS || 64));
 const DURATION_MS = Math.max(500, Number(process.env.DURATION_MS || 2500));
@@ -189,6 +71,14 @@ const WS_MSGS = Number(process.env.WS_MSGS || 200);
 const DIST = path.join(ROOT, 'dist');
 const BENCH_DIR = path.join(ROOT, '.qed', 'bench');
 mkdirSync(BENCH_DIR, { recursive: true });
+
+const argVal = (flag) => {
+  const i = process.argv.indexOf(flag);
+  return i >= 0 && process.argv[i + 1] && !process.argv[i + 1].startsWith('--') ? process.argv[i + 1] : null;
+};
+const SAVE_BASELINE = process.argv.includes('--save-baseline') || process.env.SAVE_BASELINE === '1';
+const BASELINE_PATH = argVal('--baseline') || argVal('--save-baseline') || path.join(BENCH_DIR, 'server_baseline.json');
+const baseline = existsSync(BASELINE_PATH) ? JSON.parse(readFileSync(BASELINE_PATH, 'utf8')) : null;
 
 // 1. Compile zero-dep Rust loadgen (cached by mtime)
 const loadgenSrc = path.join(ROOT, 'test', 'loadgen.rs');
@@ -221,21 +111,6 @@ const staticSizeKb = (statSync(staticFile).size / 1024).toFixed(1);
 
 // Protobuf body for BenchSrv.ping("hello-world-benchmark-payload")
 const pingProtoHex = lenField(1, Buffer.from('hello-world-benchmark-payload', 'utf8')).toString('hex');
-
-async function startNodeBaseline(workers) {
-  const port = await getFreePort();
-  const baseUrl = `http://127.0.0.1:${port}`;
-  const proc = spawn(process.execPath, [
-    THIS_FILE, '--node-baseline',
-    '--port', String(port),
-    '--workers', String(workers),
-    '--static-file', staticFile,
-    '--static-url', staticUrl,
-  ], { stdio: ['ignore', 'pipe', 'pipe'] });
-  const healthy = await waitHealth(baseUrl, 5000);
-  if (!healthy) { await stopProc(proc); throw new Error(`node baseline (${workers}w) failed to start`); }
-  return { port, baseUrl, stop: () => stopProc(proc) };
-}
 
 function runLoadgen(port, method, urlPath, ctype = '', bodyHex = '') {
   const args = [`127.0.0.1:${port}`, String(CONNS), String(DURATION_MS), String(WARMUP_MS), method, urlPath];
@@ -376,10 +251,8 @@ async function benchWsFanout(port, wsPath) {
 }
 
 const TARGETS = [
-  { key: 'qed-1w',  label: 'Qed (1w)',            start: () => startNativeServer(DIST, { QED_WORKERS: '1' }, { dev: false }), ws: true },
-  { key: 'qed-mw',  label: `Qed (${MULTI_WORKERS}w)`, start: () => startNativeServer(DIST, { QED_WORKERS: String(MULTI_WORKERS) }, { dev: false }), ws: true },
-  { key: 'node-1w', label: 'Node 22 (1w)',        start: () => startNodeBaseline(1), ws: true },
-  { key: 'node-mw', label: `Node 22 (${MULTI_WORKERS}w)`, start: () => startNodeBaseline(MULTI_WORKERS), ws: false },
+  { key: 'qed-1w', label: 'Qed (1w)',               start: () => startNativeServer(DIST, { QED_WORKERS: '1' }, { dev: false }), ws: true },
+  { key: 'qed-mw', label: `Qed (${MULTI_WORKERS}w)`, start: () => startNativeServer(DIST, { QED_WORKERS: String(MULTI_WORKERS) }, { dev: false }), ws: true },
 ];
 
 const SCENARIOS = [
@@ -413,18 +286,25 @@ try {
 
 const fmtRps = (n) => Math.round(n).toLocaleString('en-US');
 const fmtUs = (u) => (u >= 1000 ? `${(u / 1000).toFixed(2)}ms` : `${u}us`);
+const fmtDelta = (curr, prev) => {
+  if (!prev || prev <= 0) return '';
+  const pct = ((curr - prev) / prev) * 100;
+  return ` (${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%)`;
+};
 
-console.log(`\n  Server Throughput Benchmark — ${CONNS} keep-alive conns, ${DURATION_MS}ms/test (${os.cpus().length} CPU cores)\n`);
-console.log('  endpoint'.padEnd(36) + TARGETS.map((t) => t.label.padStart(20)).join(''));
-console.log('  ' + '-'.repeat(34 + TARGETS.length * 20));
+const COL = baseline ? 28 : 22;
+console.log(`\n  Server Throughput Benchmark — ${CONNS} keep-alive conns, ${DURATION_MS}ms/test (${os.cpus().length} CPU cores)${baseline ? ` [vs ${path.relative(ROOT, BASELINE_PATH)}]` : ''}\n`);
+console.log('  endpoint'.padEnd(36) + TARGETS.map((t) => t.label.padStart(COL)).join(''));
+console.log('  ' + '-'.repeat(34 + TARGETS.length * COL));
 for (const sc of SCENARIOS) {
   const row = TARGETS.map((t) => {
     const r = results[t.key][sc.key];
-    return `${fmtRps(r.rps)} r/s`.padStart(20);
+    const d = fmtDelta(r.rps, baseline?.[t.key]?.[sc.key]?.rps);
+    return `${fmtRps(r.rps)} r/s${d}`.padStart(COL);
   }).join('');
   const lats = TARGETS.map((t) => {
     const r = results[t.key][sc.key];
-    return `p50 ${fmtUs(r.p50_us)} p99 ${fmtUs(r.p99_us)}`.padStart(20);
+    return `p50 ${fmtUs(r.p50_us)} p99 ${fmtUs(r.p99_us)}`.padStart(COL);
   }).join('');
   console.log('  ' + sc.label.padEnd(34) + row);
   console.log('  ' + ''.padEnd(34) + lats);
@@ -433,9 +313,17 @@ for (const sc of SCENARIOS) {
 console.log(`\n  WebSocket Pub/Sub Fanout — ${WS_SUBS} subscribers × ${WS_MSGS} broadcasts (${(WS_SUBS * WS_MSGS).toLocaleString()} delivered frames)\n`);
 for (const t of TARGETS.filter((x) => x.ws)) {
   const w = results[t.key].ws_fanout;
+  const d = fmtDelta(w.deliveries_per_sec, baseline?.[t.key]?.ws_fanout?.deliveries_per_sec);
   console.log(
-    `  ${t.label.padEnd(18)} ${fmtRps(w.deliveries_per_sec).padStart(10)} msgs/s  ` +
+    `  ${t.label.padEnd(14)} ${fmtRps(w.deliveries_per_sec).padStart(10)} msgs/s${d.padEnd(baseline ? 10 : 0)}  ` +
     `(${fmtRps(w.broadcasts_per_sec).padStart(6)} bcast/s)  p50 ${fmtUs(w.p50_us).padStart(7)}  p99 ${fmtUs(w.p99_us).padStart(7)}`
   );
+}
+
+if (SAVE_BASELINE) {
+  writeFileSync(BASELINE_PATH, JSON.stringify(results, null, 2) + '\n');
+  console.log(`\n  Saved baseline to ${path.relative(ROOT, BASELINE_PATH)}`);
+} else if (!baseline) {
+  console.log('\n  Tip: run with --save-baseline to save a baseline for relative diffs.');
 }
 console.log('\n' + JSON.stringify(results));

@@ -186,6 +186,7 @@ and `qed start` or `qed preview` for production builds; `qed build` minifies bun
 - [`test/speculative_test.mjs`](../test/speculative_test.mjs) — 0ms speculative RPC prediction,
   `on_confirm`, mismatch reconciliation, and error rollback in Chromium.
 - Benchmarks in [`Bench/`](../Bench),
+  [`test/bench_build.mjs`](../test/bench_build.mjs),
   [`test/bench_js_framework.mjs`](../test/bench_js_framework.mjs),
   [`test/bench_server.mjs`](../test/bench_server.mjs), and
   [`test/bench_template.mjs`](../test/bench_template.mjs).

@@ -1,4 +1,3 @@
-import Qed.Lang
 import Qed.Html
 import Qed.Json.Lawful
 import Qed.Proto.Lawful
@@ -11,10 +10,6 @@ namespace Qed
 structure Ensured (α : Type) (p : α → Prop) where
   val : α
   ok  : p val
-
-@[reducible, inline] instance {α : Type} {p : α → Prop} : Qed.Lang.QedVal (Ensured α p) α := ⟨Ensured.val⟩
-@[simp] theorem QedVal.val_ensured {α : Type} {p : α → Prop} (e : Ensured α p) :
-    Qed.Lang.QedVal.val e = e.val := rfl
 
 @[reducible] instance {α : Type} {p : α → Prop} : CoeOut (Ensured α p) α := ⟨Ensured.val⟩
 @[reducible] instance {α msg : Type} {p : α → Prop} [Coe α (Html msg)] : CoeHTCT (Ensured α p) (Html msg) :=

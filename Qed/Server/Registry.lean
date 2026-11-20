@@ -5,6 +5,14 @@ import Qed.Socket.Basic
 
 namespace Qed
 
+@[reducible, inline] instance {α : Type} {p : α → Prop} : Qed.Lang.QedVal (Ensured α p) α := ⟨Ensured.val⟩
+@[simp] theorem QedVal.val_ensured {α : Type} {p : α → Prop} (e : Ensured α p) :
+    Qed.Lang.QedVal.val e = e.val := rfl
+
+end Qed
+
+namespace Qed
+
 /-! ## Persistent Server RPC Metadata Registry (`serverRegistry`) -/
 
 structure ServerMethodInfo where

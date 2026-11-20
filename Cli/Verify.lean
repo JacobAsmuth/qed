@@ -1,4 +1,6 @@
 import Cli.Common
+import Std.Data.HashMap
+import Std.Data.HashSet
 
 open System (FilePath)
 
@@ -183,6 +185,101 @@ def effectsCovered : IO Bool := do
     IO.eprintln (red s!"  effect kind \"{k}\" is emitted by a Cmd but no qed_host.mjs case handles it")
   return missing.isEmpty
 
+/-- Parse top-level `import Mod` lines from a Lean source file. -/
+private def parseLeanImports (src : String) : Array String := Id.run do
+  let mut imps : Array String := #[]
+  for rawLine in src.splitOn "\n" do
+    let line := rawLine.trimAscii.toString
+    if line.startsWith "import " then
+      let rest := (line.drop 7).trimAscii.toString
+      let mod := (rest.splitOn " ").headD ""
+      let mod := (mod.splitOn "--").headD ""
+      if !mod.isEmpty then
+        imps := imps.push mod
+  return imps
+
+private def pathToModule (base : FilePath) (p : FilePath) : Option String :=
+  let s := p.toString
+  let pref := base.toString ++ "/"
+  let rel := if s.startsWith pref then (s.drop pref.length).toString else s
+  if rel.endsWith ".lean" then
+    some (((rel.dropEnd 5).toString).replace "/" ".")
+  else none
+
+/-- Fast (~15ms), zero-jitter structural build-time guardrails for the QED repo:
+    prevents accidental `Lean` meta leaks into pure modules, critical-path/proof
+    import regressions, and Rust `Cargo.lock` crate bloat. -/
+def buildGraphClean : IO Bool := do
+  let qh ← frameworkHome
+  let qedDir := qh / "Qed"
+  unless (← qedDir.pathExists) do return true
+  let mut files ← collect qedDir "lean"
+  let qedRoot := qh / "Qed.lean"
+  if ← qedRoot.pathExists then files := files.push qedRoot
+  let mut adj : Std.HashMap String (Array String) := {}
+  for f in files do
+    if let some mod := pathToModule qh f then
+      adj := adj.insert mod (parseLeanImports (← IO.FS.readFile f))
+  let reaches (start target : String) : Bool := Id.run do
+    let mut visited : Std.HashSet String := {}
+    let mut stack : Array String := #[start]
+    while !stack.isEmpty do
+      let cur := stack.back!
+      stack := stack.pop
+      if !visited.contains cur then
+        visited := visited.insert cur
+        for dep in adj.getD cur #[] do
+          if dep == target || (target == "Lean" && dep.startsWith "Lean.") then
+            return true
+          if !visited.contains dep && adj.contains dep then
+            stack := stack.push dep
+    return false
+  let mut ok := true
+  -- 1. Pure non-meta modules must never transitively import `Lean` (~185ms/file tax).
+  let purePrefixes := #["Qed.Driver.", "Qed.Socket.", "Qed.Speculative.", "Qed.Proofs."]
+  let pureExact := #[
+    "Qed.Html", "Qed.Render", "Qed.View.Core", "Qed.Ssr", "Qed.Resource",
+    "Qed.Socket", "Qed.Driver", "Qed.Speculative",
+    "Qed.Runtime.AppCore", "Qed.Runtime.LocalCore", "Qed.Runtime.Cmd",
+    "Qed.Server.Core", "Qed.Server.Http", "Qed.Server.Net", "Qed.Server.Prim",
+    "Qed.Server.Native", "Qed.Server.Ensured"
+  ]
+  for (mod, _) in adj.toList do
+    let isPure := pureExact.contains mod || purePrefixes.any (mod.startsWith ·)
+    if isPure && reaches mod "Lean" then
+      IO.eprintln (red s!"  build-graph regression: pure module `{mod}` transitively imports `Lean`")
+      ok := false
+  -- 2. Critical-path & proof-separation boundaries (direct or transitive).
+  let forbiddenEdges : Array (String × String) := #[
+    ("Qed.Style.Syntax",          "Qed.Style.Proofs"),
+    ("Qed.Component.Speculative", "Qed.Speculative.Proofs"),
+    ("Qed.Server.Core",           "Qed.Json.Proofs"),
+    ("Qed.Socket.Basic",          "Qed.Json.Proofs"),
+    ("Qed.Server.Syntax",         "Qed.Server.Core"),
+    ("Qed.Server.FnElab",         "Qed.Server.Invariant"),
+    ("Qed.Server.FnElab",         "Qed.Server.External"),
+    ("Qed.Invariant.State",       "Qed.Runtime.App"),
+    ("Qed.Invariant.View",        "Qed.Runtime.App"),
+    ("Qed.Invariant.ForEach",     "Qed.Runtime.App"),
+    ("Qed.Invariant.View",        "Qed.Invariant.State"),
+    ("Qed.Schema",                "Qed.Runtime.Verify"),
+    ("Qed.Component.Rewrite",     "Qed.Runtime.Verify")
+  ]
+  for (src, dst) in forbiddenEdges do
+    if adj.contains src && reaches src dst then
+      IO.eprintln (red s!"  build-graph regression: `{src}` reaches forbidden dependency `{dst}`")
+      ok := false
+  -- 3. Rust `Cargo.lock` crate-count cap (baseline: 28 after `ring` unification).
+  let lockPath := qh / "rust" / "qed_server" / "Cargo.lock"
+  if ← lockPath.pathExists then
+    let lockSrc ← IO.FS.readFile lockPath
+    let pkgCount := (lockSrc.splitOn "\n[[package]]\n").length - 1 +
+      (if lockSrc.startsWith "[[package]]\n" then 1 else 0)
+    if pkgCount > 30 then
+      IO.eprintln (red s!"  build-graph regression: rust/qed_server/Cargo.lock has {pkgCount} packages (budget ≤ 30)")
+      ok := false
+  return ok
+
 def kernelEnvClean (q? : Option QedjsEnv := none) (alreadyBuilt : Bool := false) : IO Bool := do
   let root ← webRoot
   let hasExamples ← (FilePath.mk "Examples").pathExists
@@ -240,6 +337,7 @@ def verify (checkExterns : Bool := true) (extraLakeTargets : Array String := #[]
   -- Start source-only checks and LEAN_PATH lookup in parallel with `lake build`.
   let tGrep ← IO.asTask grepForbidden
   let tEff ← if hasExamples then IO.asTask effectsCovered else IO.asTask (pure true)
+  let tGraph ← if hasExamples then IO.asTask buildGraphClean else IO.asTask (pure true)
   let tLp ← IO.asTask lakeEnvLeanPath
   let lakeOk ← if hasExamples then
     let base := #["Qed", "Qed.Driver", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples", "Tests"]
@@ -254,6 +352,7 @@ def verify (checkExterns : Bool := true) (extraLakeTargets : Array String := #[]
   if !lakeOk then
     discard <| IO.wait tGrep
     discard <| IO.wait tEff
+    discard <| IO.wait tGraph
     discard <| IO.wait tLp
     return false
   let lp? := (← IO.wait tLp).toOption.join
@@ -267,7 +366,8 @@ def verify (checkExterns : Bool := true) (extraLakeTargets : Array String := #[]
   let ok1 := (← IO.wait tGrep).toOption.getD false
   let ok2 := (← IO.wait tAxiom).toOption.getD false
   let ok4 := (← IO.wait tEff).toOption.getD false
-  return ok1 && ok2 && ok3 && ok4 && ok5
+  let ok6 := (← IO.wait tGraph).toOption.getD false
+  return ok1 && ok2 && ok3 && ok4 && ok5 && ok6
 
 def cmdCheck : IO UInt32 := do
   if (← verify (checkExterns := true)) then

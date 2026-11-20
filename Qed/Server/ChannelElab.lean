@@ -95,62 +95,12 @@ def elabServerChannelHeader (priorRep priorUnrep : Nat)
       else
         throwErrorAt sub s!"unexpected clause in `channel {chStr}`"
 
-  let mut reqPropTerms : Array Term := #[]
-  let mut reqHypIds : Array Ident := #[]
-  let mut reqHypTys : Array Term := #[]
-  let mut reqLabels : Array String := #[]
-  let mut clientReqProps : Array Term := #[]
-  let mut clientReqLabels : Array String := #[]
-  let mut requiresAuth := false
-  let mut extRoots : Array Name := #[]
-
-  for idx in [0:reqExprs.size] do
-    let rExpr := reqExprs[idx]!
-    if exprHasAwait rExpr then
-      throwErrorAt rExpr "`requires` precondition cannot contain `await`"
-    let reqCtx : LowerCtx := {
-      fnName := chStr, stateFields := stateFieldNames, envVars := envVarNames, locals := paramNames
-      stateRule := .forbidInRequires, allowAwait := false, allowUnwrap := false
-      hasFallible := false, isOption := false, innerOptTy? := none
-    }
-    let (pTerm, rSt) ← (lowerExpr reqCtx .propGuard rExpr).run {}
-    extRoots := extRoots ++ rSt.extRoots.filter (!extRoots.contains ·)
-    let hId := mkIdent (Name.mkSimple s!"_hChReq{idx}")
-    reqPropTerms := reqPropTerms.push pTerm
-    reqHypIds := reqHypIds.push hId
-    reqHypTys := reqHypTys.push pTerm
-    reqLabels := reqLabels.push ((rExpr.reprint.getD "requires").trimAscii.toString)
-    for conj in splitSrvAnd rExpr do
-      let (mentionsCtx, mentionsEnv) := scanCtxEnv envVarNames paramNames conj
-      if mentionsCtx && !mentionsEnv && isAuthReqExpr conj then
-        requiresAuth := true
-      else if !mentionsCtx && !mentionsEnv then
-        let cliReqCtx : LowerCtx := {
-          fnName := chStr, stateFields := stateFieldNames, envVars := #[], locals := paramNames
-          stateRule := .forbidInRequires, allowAwait := false, allowUnwrap := false
-          hasFallible := false, isOption := false, innerOptTy? := none, forbidCtxEnv := true
-        }
-        let (cpTerm, _) ← (lowerExpr cliReqCtx .propInv conj).run {}
-        clientReqProps := clientReqProps.push cpTerm
-        clientReqLabels := clientReqLabels.push ((conj.reprint.getD "requires").trimAscii.toString)
-
   let evAbbrevId := mkIdentFrom chIdent (srvName ++ chName.appendAfter "_Event")
   elabCommand (← `(command| abbrev $evAbbrevId : Type := $evTyTerm))
-  let mut paramTypeConsts : Array Name := #[]
-  for (pTy, i) in pTyTerms.zipIdx do
-    let pTyId := mkIdentFrom chIdent (srvName ++ chName.appendAfter s!"_Param_{i}")
-    elabCommand (← `(command| abbrev $pTyId : Type := $pTy))
-    paramTypeConsts := paramTypeConsts.push (fullSrvName ++ chName.appendAfter s!"_Param_{i}")
+  let paramTypeConsts ← elabParamTypeAbbrevs chIdent srvName fullSrvName chName "_Param_" pTyTerms
 
-  let clientReqConst : Option Name ←
-    if clientReqProps.isEmpty then pure none
-    else
-      let cid := mkIdentFrom chIdent (srvName ++ chName.appendAfter "_req")
-      let reqConj ← buildPropConj clientReqProps
-      elabCommand (← `(command|
-        set_option linter.unusedVariables false in
-        @[simp] abbrev $cid $[($pIdents:ident : $pTyTerms:term)]* : Prop := $reqConj))
-      pure (some (fullSrvName ++ chName.appendAfter "_req"))
+  let reqs ← elabRequiresClauses chIdent srvName fullSrvName chName chStr "_hChReq" "_req"
+    stateFieldNames envVarNames paramNames paramNames pIdents pTyTerms reqExprs
 
   let mut ensProps : Array Term := #[]
   for eExpr in ensExprs do
@@ -199,10 +149,11 @@ def elabServerChannelHeader (priorRep priorUnrep : Nat)
   let sig : SrvChanSig := { name := chStr, mkEmitId, paramCount := pIdents.size, hasEnsures := ensId?.isSome }
   return some ({
     chIdent, chName, chStr, pIdents, pTyTerms, paramNames, paramTypeConsts, evTyTerm,
-    reqPropTerms, reqHypIds, reqHypTys, reqLabels, requiresAuth,
-    clientReqConst, clientReqLabel := String.intercalate " && " clientReqLabels.toList,
+    reqPropTerms := reqs.reqPropTerms, reqHypIds := reqs.reqHypIds, reqHypTys := reqs.reqHypTys,
+    reqLabels := reqs.reqLabels, requiresAuth := reqs.requiresAuth,
+    clientReqConst := reqs.clientReqConst?, clientReqLabel := reqs.clientReqLabel,
     ensId?, ensConst?, recPolicy, onJoin?, onSend?, onLeave?, sig
-  }, extRoots)
+  }, reqs.extRoots)
 
 open Lean Elab Command in
 private def unwrapOptionalOuterAtomic (stmts : Array Syntax) : Array Syntax :=
@@ -243,24 +194,8 @@ def elabServerChannelBody (priorRep priorUnrep : Nat)
   let extRootsRef ← IO.mkRef (#[] : Array Name)
   let mut arms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
 
-  let wrapReqs (reqProps : Array Term) (reqHIds : Array Ident) (reqLbls : Array String) (inner : Term) : CommandElabM Term := do
-    let mut g := inner
-    for revIdx in [0:reqProps.size] do
-      let ri := reqProps.size - 1 - revIdx
-      let rCond := reqProps[ri]!
-      let rHyp := reqHIds[ri]!
-      let rLbl := reqLbls[ri]!
-      let rMsg := Syntax.mkStrLit s!"precondition failed: {rLbl}"
-      let errCtor : Term ←
-        if rLbl.contains "ctx.userId" || rLbl.contains "ctx.bearerToken" || rLbl.contains "ctx.isAuthenticated" then
-          `(Qed.Server.ApiError.unauthorized $rMsg)
-        else
-          `(Qed.Server.ApiError.badRequest $rMsg)
-      g ← `(if $rHyp:ident : $rCond then $g else Pure.pure (Except.error $errCtor))
-    return g
-
   let runSubHandler (subSuffix : String) (extraIds : Array Ident) (extraTys : Array Term)
-      (extraProjs : Array Term) (_extraReqProps : Array Term) (extraReqIds : Array Ident)
+      (extraProjs : Array Term) (extraReqIds : Array Ident)
       (extraReqTys : Array Term) (retTyTerm : Term) (isUnitRet : Bool) (rawStmts : Array Syntax) :
       CommandElabM (Option Term) := do
     let normStmts := unwrapOptionalOuterAtomic rawStmts
@@ -297,16 +232,9 @@ def elabServerChannelBody (priorRep priorUnrep : Nat)
       extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
       return some hApp
     else
-      let (statelessBody, lSt) ← (lowerAsyncBlock baseCtx none bodyStmts).run {}
-      extRootsRef.modify fun acc => acc ++ lSt.extRoots.filter (!acc.contains ·)
-      let handlerId := mkIdentFrom chIdent (srvName ++ subFnIdent.getId.appendAfter "_handler")
-      elabCommand (← `(command|
-        def $handlerId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
-            $[($allBinderIds:ident : $allBinderTys:term)]* :
-            m (Except $errTyTerm $retTyTerm) :=
-          Qed.Server.srvFinishM $statelessBody))
-      if hasNewErrors (← get).messages priorRep priorUnrep then return none
-      let hApp ← callArgs.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
+      let some (_, _, hApp, er) ← elabStatelessHandler priorRep priorUnrep chIdent srvName subFnIdent.getId
+          allBinderIds allBinderTys callArgs retTyTerm errTyTerm baseCtx bodyStmts | return none
+      extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
       return some hApp
 
   let mkChanArm (kindLit : TSyntax `num) (bodyInParams : Term) :
@@ -328,10 +256,10 @@ def elabServerChannelBody (priorRep priorUnrep : Nat)
         let jty ← liftMacroM <| ParsedSrvType.parse snapTyStx
         liftMacroM <| jty.validate (allowFallible := false) s!"`on_join` return type of `channel {chStr}`"
         joinTyTerm ← liftMacroM jty.toPayloadTerm
-        let some r ← runSubHandler "onJoin" #[] #[] #[] #[] #[] #[] joinTyTerm false stmts | return none
+        let some r ← runSubHandler "onJoin" #[] #[] #[] #[] #[] joinTyTerm false stmts | return none
         `($r >>= fun _jRes => Pure.pure (_jRes.map Qed.Proto.encode))
     | some (none, stmts) =>
-        let some r ← runSubHandler "onJoin" #[] #[] #[] #[] #[] #[] joinTyTerm true stmts | return none
+        let some r ← runSubHandler "onJoin" #[] #[] #[] #[] #[] joinTyTerm true stmts | return none
         `($r >>= fun _jRes => Pure.pure (_jRes.map fun _ => ByteArray.empty))
     | none =>
         `(Pure.pure (Except.ok ByteArray.empty))
@@ -360,61 +288,22 @@ def elabServerChannelBody (priorRep priorUnrep : Nat)
       spIdents := spIdents.push spid
       spTyTerms := spTyTerms.push (← liftMacroM spty.toPayloadTerm)
       spNames := spNames.push spstr
-    for (sTy, i) in spTyTerms.zipIdx do
-      let sTyId := mkIdentFrom chIdent (srvName ++ chName.appendAfter s!"_SendParam_{i}")
-      elabCommand (← `(command| abbrev $sTyId : Type := $sTy))
-      sendParamTypeConsts := sendParamTypeConsts.push (fullSrvName ++ chName.appendAfter s!"_SendParam_{i}")
+    sendParamTypeConsts ← elabParamTypeAbbrevs chIdent srvName fullSrvName chName "_SendParam_" spTyTerms
 
-    let mut sReqProps : Array Term := #[]
-    let mut sReqIds : Array Ident := #[]
-    let mut sReqTys : Array Term := #[]
-    let mut sReqLbls : Array String := #[]
-    let mut sCliReqProps : Array Term := #[]
-    let mut sCliReqLbls : Array String := #[]
-    for idx in [0:rawSReqs.size] do
-      let re := rawSReqs[idx]!
-      let rCtx : LowerCtx := {
-        fnName := s!"{chStr}.on_send", stateFields := stateFieldNames, envVars := envVarNames,
-        locals := hdr.paramNames ++ spNames, stateRule := .forbidInRequires,
-        allowAwait := false, allowUnwrap := false, hasFallible := false, isOption := false, innerOptTy? := none
-      }
-      let (pt, rSt) ← (lowerExpr rCtx .propGuard re).run {}
-      extRootsRef.modify fun acc => acc ++ rSt.extRoots.filter (!acc.contains ·)
-      let hid := mkIdent (Name.mkSimple s!"_hSReq{idx}")
-      sReqProps := sReqProps.push pt
-      sReqIds := sReqIds.push hid
-      sReqTys := sReqTys.push pt
-      sReqLbls := sReqLbls.push ((re.reprint.getD "requires").trimAscii.toString)
-      for conj in splitSrvAnd re do
-        let (mCtx, mEnv) := scanCtxEnv envVarNames (hdr.paramNames ++ spNames) conj
-        -- Client send `requires` checks expressions referencing only `on_send` parameters
-        let (_, mChP) := scanCtxEnv hdr.paramNames spNames conj
-        if !mCtx && !mEnv && !mChP then
-          let cCtx : LowerCtx := {
-            fnName := s!"{chStr}.on_send", stateFields := stateFieldNames, envVars := #[],
-            locals := spNames, stateRule := .forbidInRequires, allowAwait := false, allowUnwrap := false,
-            hasFallible := false, isOption := false, innerOptTy? := none, forbidCtxEnv := true
-          }
-          let (cpt, _) ← (lowerExpr cCtx .propInv conj).run {}
-          sCliReqProps := sCliReqProps.push cpt
-          sCliReqLbls := sCliReqLbls.push ((conj.reprint.getD "requires").trimAscii.toString)
-
-    if !sCliReqProps.isEmpty then
-      let srId := mkIdentFrom chIdent (srvName ++ chName.appendAfter "_send_req")
-      let srConj ← buildPropConj sCliReqProps
-      elabCommand (← `(command|
-        set_option linter.unusedVariables false in
-        @[simp] abbrev $srId $[($spIdents:ident : $spTyTerms:term)]* : Prop := $srConj))
-      sendReqConst? := some (fullSrvName ++ chName.appendAfter "_send_req")
-      sendReqLabel := String.intercalate " && " sCliReqLbls.toList
+    let sReqs ← elabRequiresClauses chIdent srvName fullSrvName chName s!"{chStr}.on_send" "_hSReq" "_send_req"
+      stateFieldNames envVarNames (hdr.paramNames ++ spNames) spNames spIdents spTyTerms rawSReqs
+      (excludedClientVars := hdr.paramNames) (trackAuth := false)
+    extRootsRef.modify fun acc => acc ++ sReqs.extRoots.filter (!acc.contains ·)
+    sendReqConst? := sReqs.clientReqConst?
+    sendReqLabel := sReqs.clientReqLabel
 
     let sendTupleTy ← buildTupleType spTyTerms
     let sTupleVar := mkIdent `_chSendVal
     let sProjs ← extractTupleProjections sTupleVar spTyTerms.size
     let unitTy ← `(Unit)
-    let some sendRun ← runSubHandler "onSend" spIdents spTyTerms sProjs sReqProps sReqIds sReqTys unitTy true sBody | return none
+    let some sendRun ← runSubHandler "onSend" spIdents spTyTerms sProjs sReqs.reqHypIds sReqs.reqHypTys unitTy true sBody | return none
     let sendOut ← `($sendRun >>= fun _sRes => Pure.pure (_sRes.map fun _ => ByteArray.empty))
-    let sendGuarded ← wrapReqs (hdr.reqPropTerms ++ sReqProps) (hdr.reqHypIds ++ sReqIds) (hdr.reqLabels ++ sReqLbls) sendOut
+    let sendGuarded ← wrapReqs (hdr.reqPropTerms ++ sReqs.reqPropTerms) (hdr.reqHypIds ++ sReqs.reqHypIds) (hdr.reqLabels ++ sReqs.reqLabels) sendOut
     let sendBound ← (spIdents.zip sProjs).foldrM (init := sendGuarded) fun (spid, sprj) acc =>
       `(let $spid:ident := $sprj; $acc)
     let sendDecode ← `(match Qed.Proto.decode (α := $sendTupleTy) $payloadBytesVar with
@@ -426,7 +315,7 @@ def elabServerChannelBody (priorRep priorUnrep : Nat)
   let leaveRunTerm ← match hdr.onLeave? with
     | some stmts =>
         let unitTy ← `(Unit)
-        let some r ← runSubHandler "onLeave" #[] #[] #[] #[] #[] #[] unitTy true stmts | return none
+        let some r ← runSubHandler "onLeave" #[] #[] #[] #[] #[] unitTy true stmts | return none
         `($r >>= fun _lRes => Pure.pure (_lRes.map fun _ => ByteArray.empty))
     | none =>
         `(Pure.pure (Except.ok ByteArray.empty))

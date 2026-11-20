@@ -1,7 +1,5 @@
-import Lean
 import Qed.Ssr
 import Qed.Server.Core
-import Qed.Server.Elab
 import Qed.Server.Net
 import Qed.Server.Http
 import Qed.Server.Prim
@@ -12,13 +10,6 @@ open Qed.Server.Net
 open Qed.Server.Http
 
 /-! ## Unified CSRF & CSWSH Origin / Fetch-Metadata Verification -/
-
-/-- True iff `headers` carries a single `Content-Type` header whose media type is
-    `application/x-protobuf` (ignoring optional parameters such as `; charset=...`). -/
-def isProtobufContentType (headers : List (String × String)) : Bool :=
-  match headers.filter fun (k, _) => k.toLower == "content-type" with
-  | [(_, v)] => (trimWs ((v.splitOn ";").headD "")).toLower == "application/x-protobuf"
-  | _ => false
 
 /-- True iff `origin` has an `http://` or `https://` scheme and its authority matches `host`
     (case-insensitive, rejecting `null`, paths, and empty hosts). -/
@@ -74,32 +65,6 @@ private def checkOriginAndFetchSiteParsed (origin? host? secFetchSite? : Option 
       let s := trimWs sfs
       if !eqCI s "same-origin" && !eqCI s "none" && !originExplicitOk then
         throw (403, s!"cross-site {label} rejected")
-
-private def checkOriginAndFetchSite (headers : List (String × String))
-    (allowedOrigins? : Option String) (allowEmptyOrigin : Bool) (label : String) :
-    Except (Nat × String) Unit :=
-  let origins := headers.filterMap fun (k, v) => if eqCI k "origin" then some v else none
-  let hosts   := headers.filterMap fun (k, v) => if eqCI k "host" then some v else none
-  let sfsList := headers.filterMap fun (k, v) => if eqCI k "sec-fetch-site" then some v else none
-  checkOriginAndFetchSiteParsed origins.head? hosts.head? sfsList.head?
-    (origins.length > 1 || hosts.length > 1 || sfsList.length > 1)
-    allowedOrigins? allowEmptyOrigin label
-
-/-- CSRF defense-in-depth for `POST /_qed/rpc/...`:
-    1. Rejects duplicate `Origin`, `Host`, or `Sec-Fetch-Site` headers (400).
-    2. Requires same-origin match with `Host` (or `QED_RPC_ALLOWED_ORIGINS`) when `Origin` is present (403).
-    3. Rejects cross-site `Sec-Fetch-Site` unless explicitly allowed (403).
-    4. Requires `Content-Type: application/x-protobuf` (415). -/
-def checkRpcCsrf (headers : List (String × String)) (allowedOrigins? : Option String) :
-    Except (Nat × String) Unit := do
-  checkOriginAndFetchSite headers allowedOrigins? false "RPC"
-  if !isProtobufContentType headers then
-    throw (415, "RPC requires Content-Type: application/x-protobuf")
-
-/-- CSWSH defense for RFC 6455 WebSocket upgrades on `/_qed/ws/<Server>`. -/
-def checkWsOrigin (headers : List (String × String)) (allowedOrigins? : Option String) :
-    Except (Nat × String) Unit :=
-  checkOriginAndFetchSite headers allowedOrigins? true "WebSocket upgrade"
 
 /-! ## Total Outbound HTTP/1.1 Client (Verified URL, Wire Formatting, Parsing, Chunked & SSRF) -/
 
@@ -420,7 +385,7 @@ def loadServerConfig (devMode : Bool) : IO ServerConfig := do
   let reqExp   := (← loadNonEmptyEnv "QED_AUTH_REQUIRE_EXP") == some "1"
   let rpcOrig? ← loadNonEmptyEnv "QED_RPC_ALLOWED_ORIGINS"
   let wsOrig?  ← loadNonEmptyEnv "QED_WS_ALLOWED_ORIGINS"
-  let host?    := (← loadNonEmptyEnv "QED_HOST").orElse (fun _ => none)
+  let host?    ← loadNonEmptyEnv "QED_HOST"
   let bindHost ← match host? with
     | some h => pure h
     | none   => match ← loadNonEmptyEnv "HOST" with
@@ -460,15 +425,6 @@ private def resolveUserId (cfg : ServerConfig) (bearer? : Option String)
       let nowSec := ((← Prim.nowMs).toNat) / 1000
       verifyUserTokenWithNow cfg.authSecrets tok nowSec cfg.requireExpiring
   | none => return none
-
-def buildRequestCtx (cfg : ServerConfig) (headers : Array (String × String)) (clientIp : String) : IO RequestCtx := do
-  let hdrList := headers.toList
-  let cookies := hdrList.foldl (fun acc (k, v) =>
-    if eqCI k "cookie" then acc ++ parseCookiePairs v else acc) []
-  let bearer? := hdrList.findSome? fun (k, v) =>
-    if eqCI k "authorization" then extractBearer v else none
-  let userId? ← resolveUserId cfg bearer? cookies
-  return { headers := hdrList, cookies, bearerToken := bearer?, userId := userId?, clientIp }
 
 /-! ## Native `MonadServer IO` & `MonadAtomic σ IO` Instances -/
 
@@ -738,8 +694,9 @@ def runFullstackWithDispatch {Model Msg : Type}
   let healthClose := formatHttpResponse 200 "application/json" "{\"ok\":true}".toUTF8 false false false
   let docShell := mkPrebuiltDocShell title hostScript (renderStyleSheet app.styles) app.stylesheets
 
-  let dispatchAppReq (req : ParsedReqHead) (body : ByteArray) (clientIp : String) : IO ByteArray := do
-    if let some st := classifyStaticPath req.method req.target devMode then
+  let dispatchAppReqWith (req : ParsedReqHead) (body : ByteArray) (clientIp pathOnly : String)
+      (staticTarget? : Option StaticTarget) : IO ByteArray := do
+    if let some st := staticTarget? then
       let cacheable := !devMode && !st.noStore && isContentHashedAsset st.relPath
       if cacheable then
         if let some hit ← Prim.atomicRead assetCache (fun m => m[st.relPath]?) then
@@ -771,7 +728,6 @@ def runFullstackWithDispatch {Model Msg : Type}
         return formatHttpResponse 200 st.mime "0".toUTF8 st.isHead req.keepAlive true
       else
         return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 st.isHead req.keepAlive false
-    let pathOnly := stripQuery req.target
     let isHead := req.method == "HEAD"
     if req.method == "GET" && pathOnly == "/_qed/health" then
       return if req.keepAlive then healthKA else healthClose
@@ -805,6 +761,12 @@ def runFullstackWithDispatch {Model Msg : Type}
     else
       return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 isHead req.keepAlive false
 
+  let dispatchAppReq (req : ParsedReqHead) (body : ByteArray) (clientIp : String) : IO ByteArray :=
+    let staticTarget? :=
+      if req.method == "GET" || req.method == "HEAD" then classifyStaticPath req.method req.target devMode
+      else none
+    dispatchAppReqWith req body clientIp (stripQuery req.target) staticTarget?
+
   let hasBlockingMethods : Bool :=
     match blockingMethods? with
     | none => true
@@ -837,22 +799,24 @@ def runFullstackWithDispatch {Model Msg : Type}
               let baseCtx ← buildRequestCtxReq cfg req clientIp
               let cid ← Prim.randomHex 12
               return .wsUpgrade (formatWsUpgradeResponse acceptB64) { baseCtx with connId := "ws-" ++ cid }
+        let isGetOrHead := req.method == "GET" || req.method == "HEAD"
+        let staticTarget? :=
+          if isGetOrHead then classifyStaticPath req.method req.target devMode else none
         if inline != 0 then
-          if (req.method == "GET" || req.method == "HEAD") then
-            if let some st := classifyStaticPath req.method req.target devMode then
-              if !devMode && !st.noStore && isContentHashedAsset st.relPath then
-                if let some hit ← Prim.atomicRead assetCache (fun m => m[st.relPath]?) then
-                  let wire := hit.serve req st.isHead req.keepAlive
-                  return if req.keepAlive then .doneKeepAlive wire else .doneClose wire
-              return .deferHead
+          if let some st := staticTarget? then
+            if !devMode && !st.noStore && isContentHashedAsset st.relPath then
+              if let some hit ← Prim.atomicRead assetCache (fun m => m[st.relPath]?) then
+                let wire := hit.serve req st.isHead req.keepAlive
+                return if req.keepAlive then .doneKeepAlive wire else .doneClose wire
+            return .deferHead
           if hasBlockingMethods then
             if req.method == "POST" && pathOnly.startsWith rpcPrefix then
               if methodMayBlock (dropPrefixBytes pathOnly rpcPrefixBytes) then
                 return .deferHead
-            else if (req.method == "GET" || req.method == "HEAD") && !pathOnly.startsWith "/_qed/" then
+            else if isGetOrHead && !pathOnly.startsWith "/_qed/" then
               return .deferHead
         if req.contentLen == 0 then
-          let wire ← dispatchAppReq req ByteArray.empty clientIp
+          let wire ← dispatchAppReqWith req ByteArray.empty clientIp pathOnly staticTarget?
           return if req.keepAlive then .doneKeepAlive wire else .doneClose wire
         else
           return if req.keepAlive then .needBodyKeep req.contentLen req else .needBodyClose req.contentLen req
@@ -904,61 +868,5 @@ def runStatelessFullstack {Model Msg : Type}
     port staticDir devMode numWorkers
     (wsDispatchM?.map fun wsM ctx kind ch params payload => @wsM IO _ srvInst ctx kind ch params payload)
     blockingMethods?
-
-/-! ## `qedServerMain <FullstackName>` Entrypoint Generator -/
-
-syntax (name := qedServerMainCmd) "qedServerMain " ident : command
-
-open Lean Elab Command in
-@[command_elab qedServerMainCmd]
-def elabQedServerMain : CommandElab := fun stx => do
-  let fsIdent : Ident := ⟨stx[1]⟩
-  let env ← getEnv
-  let currNs ← getCurrNamespace
-  let fsMap := fullstackRegistry.getState env
-  let cand1 := currNs ++ fsIdent.getId
-  let some fsInfo := (fsMap.find? cand1).orElse (fun _ =>
-      fsMap.toList.findSome? fun (k, v) =>
-        if k == fsIdent.getId || k.getString! == fsIdent.getId.toString then some v else none)
-    | throwErrorAt fsIdent s!"unknown `fullstack` declaration `{fsIdent.getId}`"
-  let srvMap := serverRegistry.getState env
-  let some srvInfo := srvMap.find? fsInfo.serverName
-    | throwErrorAt fsIdent s!"internal error: `server` `{fsInfo.serverName}` not found in registry"
-  let cliAppId := mkIdentFrom fsIdent (fsInfo.fullstackName ++ `clientApp)
-  let titleLit := Syntax.mkStrLit fsInfo.title
-  let shortLit := Syntax.mkStrLit srvInfo.shortName
-  let secretsId := mkIdentFrom fsIdent (srvInfo.serverName ++ `secrets)
-  let dispatchId := mkIdentFrom fsIdent (srvInfo.serverName ++ `dispatchM)
-  let wsDispatchId := mkIdentFrom fsIdent (srvInfo.serverName ++ `wsDispatchM)
-  let hasWs := !srvInfo.channels.isEmpty
-  let asyncNames : Array Term := srvInfo.methods.filterMap fun m =>
-    if m.isAsync then some (Syntax.mkStrLit m.name) else none
-  let blockingArg ← `(some #[$asyncNames,*])
-  let mainId := mkIdent `main
-  let runnerCall ← if srvInfo.hasState then
-    let initStateId := mkIdentFrom fsIdent (srvInfo.serverName ++ `initState)
-    let wsArg ← if hasWs then
-      `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $wsDispatchId))
-    else `(none)
-    `(Qed.Server.Native.runStatefulFullstack
-        $cliAppId $titleLit $shortLit $initStateId $secretsId
-        (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $dispatchId)
-        port staticDir devMode numWorkers $wsArg $blockingArg)
-  else
-    let wsArg ← if hasWs then
-      `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] => $wsDispatchId))
-    else `(none)
-    `(Qed.Server.Native.runStatelessFullstack
-        $cliAppId $titleLit $shortLit $secretsId
-        (fun {m} [Monad m] [Qed.Server.MonadServer m] => $dispatchId)
-        port staticDir devMode numWorkers $wsArg $blockingArg)
-  elabCommand (← `(command|
-    def $mainId:ident (args : List String) : IO UInt32 := do
-      let staticDir := args[0]?.getD "dist"
-      let envPort ← Qed.Server.Prim.getEnv "PORT"
-      let port := ((args[1]?.getD (envPort.getD "8000")).toNat?.getD 8000).toUInt16
-      let devMode := args.contains "--dev"
-      let numWorkers := (((← Qed.Server.Prim.getEnv "QED_WORKERS").bind String.toNat?).getD 0).toUInt32
-      $runnerCall:term))
 
 end Qed.Server.Native

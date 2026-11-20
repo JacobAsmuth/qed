@@ -179,4 +179,63 @@ def elabFullstackCmd : CommandElab := fun stx => do
     title := pageTitle
   }
 
+/-! ## `qedServerMain <FullstackName>` Entrypoint Generator -/
+
+syntax (name := qedServerMainCmd) "qedServerMain " ident : command
+
+open Lean Elab Command in
+@[command_elab qedServerMainCmd]
+def elabQedServerMain : CommandElab := fun stx => do
+  let fsIdent : Ident := ⟨stx[1]⟩
+  let env ← getEnv
+  let currNs ← getCurrNamespace
+  let fsMap := fullstackRegistry.getState env
+  let cand1 := currNs ++ fsIdent.getId
+  let some fsInfo := (fsMap.find? cand1).orElse (fun _ =>
+      fsMap.toList.findSome? fun (k, v) =>
+        if k == fsIdent.getId || k.getString! == fsIdent.getId.toString then some v else none)
+    | throwErrorAt fsIdent s!"unknown `fullstack` declaration `{fsIdent.getId}`"
+  let srvMap := serverRegistry.getState env
+  let some srvInfo := srvMap.find? fsInfo.serverName
+    | throwErrorAt fsIdent s!"internal error: `server` `{fsInfo.serverName}` not found in registry"
+  let cliAppId := mkIdentFrom fsIdent (fsInfo.fullstackName ++ `clientApp)
+  let titleLit := Syntax.mkStrLit fsInfo.title
+  let shortLit := Syntax.mkStrLit srvInfo.shortName
+  let secretsId := mkIdentFrom fsIdent (srvInfo.serverName ++ `secrets)
+  let dispatchId := mkIdentFrom fsIdent (srvInfo.serverName ++ `dispatchM)
+  let wsDispatchId := mkIdentFrom fsIdent (srvInfo.serverName ++ `wsDispatchM)
+  let hasWs := !srvInfo.channels.isEmpty
+  let asyncNames : Array Term := srvInfo.methods.filterMap fun m =>
+    if m.isAsync then some (Syntax.mkStrLit m.name) else none
+  let blockingArg ← `(some #[$asyncNames,*])
+  let mainId := mkIdent `main
+  let getEnvId := mkIdent `Qed.Server.Prim.getEnv
+  let runnerCall ← if srvInfo.hasState then
+    let runFnId := mkIdent `Qed.Server.Native.runStatefulFullstack
+    let initStateId := mkIdentFrom fsIdent (srvInfo.serverName ++ `initState)
+    let wsArg ← if hasWs then
+      `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $wsDispatchId))
+    else `(none)
+    `($runFnId
+        $cliAppId $titleLit $shortLit $initStateId $secretsId
+        (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $dispatchId)
+        port staticDir devMode numWorkers $wsArg $blockingArg)
+  else
+    let runFnId := mkIdent `Qed.Server.Native.runStatelessFullstack
+    let wsArg ← if hasWs then
+      `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] => $wsDispatchId))
+    else `(none)
+    `($runFnId
+        $cliAppId $titleLit $shortLit $secretsId
+        (fun {m} [Monad m] [Qed.Server.MonadServer m] => $dispatchId)
+        port staticDir devMode numWorkers $wsArg $blockingArg)
+  elabCommand (← `(command|
+    def $mainId:ident (args : List String) : IO UInt32 := do
+      let staticDir := args[0]?.getD "dist"
+      let envPort ← ($getEnvId:ident "PORT")
+      let port := ((args[1]?.getD (envPort.getD "8000")).toNat?.getD 8000).toUInt16
+      let devMode := args.contains "--dev"
+      let numWorkers := (((← ($getEnvId:ident "QED_WORKERS")).bind String.toNat?).getD 0).toUInt32
+      $runnerCall:term))
+
 end Qed.Server

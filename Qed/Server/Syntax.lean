@@ -1,13 +1,7 @@
 import Lean
 import Qed.Lang
-import Qed.Server.Core
 
 namespace Qed.Server
-
-/-- Marker wrapper for binary Protocol Buffers request/response bodies on `external` endpoints. -/
-structure ProtoBody (α : Type) where
-  val : α
-deriving Inhabited, DecidableEq, Repr
 
 /-! ## Server, External & Fullstack Surface Syntax (Sharing `Qed.Lang` Expressions, Statements & Types) -/
 
@@ -210,7 +204,6 @@ def parse (stx : Lean.Syntax) : Lean.MacroM ParsedSrvType := do
     Lean.Macro.throwErrorAt stx s!"invalid server type{what}; expected `T`, `T[]`, `T?`, `T!`, or `Proto(T)`"
 
 def hasFallible (t : ParsedSrvType) : Bool := t.mods.contains .fallible
-def isOuterOption (t : ParsedSrvType) : Bool := t.mods.back? == some .option
 
 /-- Validates that `!` only appears at the outermost position when permitted. -/
 def validate (t : ParsedSrvType) (allowFallible : Bool) (ctxDesc : String) : Lean.MacroM Unit := do
@@ -223,11 +216,6 @@ def validate (t : ParsedSrvType) (allowFallible : Bool) (ctxDesc : String) : Lea
 /-- Lowers the non-`!` payload type (e.g. `Book[]!` → `Array Book`, `Book?` → `Option Book`). -/
 def toPayloadTerm (t : ParsedSrvType) : Lean.MacroM Lean.Term :=
   return (← Qed.Lang.applyTypeMods (Qed.Lang.resolveBaseTypeTerm t.baseIdent) t.mods true t.ref).1
-
-/-- Lowers the full return type including `Except ApiError` if `!` is present. -/
-def toFullTerm (t : ParsedSrvType) : Lean.MacroM Lean.Term := do
-  let payload ← t.toPayloadTerm
-  if t.hasFallible then `(Except Qed.Server.ApiError $payload) else return payload
 
 end ParsedSrvType
 

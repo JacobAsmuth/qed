@@ -10,11 +10,7 @@ private def emitClientRpcStubs (srvName fullSrvName : Name) (srvShort fnStr : St
     (payloadTerm reqTupleTy : Term) (innerOpt? : Option Term)
     (errTypeId? : Option Ident) (clientReqId? : Option Ident) (ensSpec? : Option FnEnsSpec) :
     CommandElabM (Array Name) := do
-  let mut paramTypeConsts : Array Name := #[]
-  for (pTy, i) in pTyTerms.zipIdx do
-    let pTyId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter s!"_Param_{i}")
-    elabCommand (← `(command| abbrev $pTyId : Type := $pTy))
-    paramTypeConsts := paramTypeConsts.push (fullSrvName ++ fnIdent.getId.appendAfter s!"_Param_{i}")
+  let paramTypeConsts ← elabParamTypeAbbrevs fnIdent srvName fullSrvName fnIdent.getId "_Param_" pTyTerms
 
   let ensPayloadTerm : Term ← match ensSpec?, innerOpt? with
     | some ensSpec, some innerTy =>
@@ -77,19 +73,7 @@ private def mkFnDispatchArm (fnStr : String) (reqBytesId reqVar : Ident)
       `($runExpr >>= fun _fnRes => Pure.pure ((Qed.Server.SrvFailure.toWire _fnRes).map Qed.Proto.encode))
     else
       `($runExpr >>= fun _fnRes => Pure.pure (_fnRes.map Qed.Proto.encode))
-  let mut guardedRun := initGuarded
-  for revIdx in [0:reqPropTerms.size] do
-    let ri := reqPropTerms.size - 1 - revIdx
-    let rCond := reqPropTerms[ri]!
-    let rHyp := reqHypIds[ri]!
-    let rLbl := reqLabels[ri]!
-    let rMsg := Syntax.mkStrLit s!"precondition failed: {rLbl}"
-    let errCtor : Term ←
-      if rLbl.contains "ctx.userId" || rLbl.contains "ctx.bearerToken" || rLbl.contains "ctx.isAuthenticated" then
-        `(Qed.Server.ApiError.unauthorized $rMsg)
-      else
-        `(Qed.Server.ApiError.badRequest $rMsg)
-    guardedRun ← `(if $rHyp:ident : $rCond then $guardedRun else Pure.pure (Except.error $errCtor))
+  let guardedRun ← wrapReqs reqPropTerms reqHypIds reqLabels initGuarded
   let bindProjBody ← (pIdents.zip projs).foldrM (init := guardedRun) fun (pid, prj) acc =>
     `(let $pid:ident := $prj; $acc)
   `(Lean.Parser.Term.matchAltExpr|
@@ -171,54 +155,15 @@ private def elabServerFnClause (priorRep priorUnrep : Nat)
   let pIdents := fnParams.map (·.ident)
   let pTyTerms := fnParams.map (·.tyTerm)
 
-  let mut extRoots : Array Name := #[]
-  let mut reqPropTerms : Array Term := #[]
-  let mut reqHypIds    : Array Ident := #[]
-  let mut reqHypTys    : Array Term := #[]
-  let mut reqLabels    : Array String := #[]
-  let mut clientReqProps : Array Term := #[]
-  let mut clientReqLabels : Array String := #[]
-  let mut requiresAuth : Bool := false
-  for idx in [0:reqExprs.size] do
-    let rExpr := reqExprs[idx]!
-    if exprHasAwait rExpr then
-      throwErrorAt rExpr "`requires` precondition cannot contain `await`"
-    let reqCtx : LowerCtx := {
-      fnName := fnStr, stateFields := stateFieldNames, envVars := envVarNames, locals := paramNames
-      stateRule := .forbidInRequires, allowAwait := false, allowUnwrap := false
-      hasFallible := false, isOption := false, innerOptTy? := none
-    }
-    let (pTerm, rSt) ← (lowerExpr reqCtx .propGuard rExpr).run {}
-    extRoots := extRoots ++ rSt.extRoots.filter (!extRoots.contains ·)
-    let hId := mkIdent (Name.mkSimple s!"_hReq{idx}")
-    reqPropTerms := reqPropTerms.push pTerm
-    reqHypIds := reqHypIds.push hId
-    reqHypTys := reqHypTys.push pTerm
-    reqLabels := reqLabels.push ((rExpr.reprint.getD "requires").trimAscii.toString)
-
-    for conj in splitSrvAnd rExpr do
-      let (mentionsCtx, mentionsEnv) := scanCtxEnv envVarNames paramNames conj
-      if mentionsCtx && !mentionsEnv && isAuthReqExpr conj then
-        requiresAuth := true
-      else if !mentionsCtx && !mentionsEnv then
-        let cliReqCtx : LowerCtx := {
-          fnName := fnStr, stateFields := stateFieldNames, envVars := #[], locals := paramNames
-          stateRule := .forbidInRequires, allowAwait := false, allowUnwrap := false
-          hasFallible := false, isOption := false, innerOptTy? := none, forbidCtxEnv := true
-        }
-        let (pTerm, _) ← (lowerExpr cliReqCtx .propInv conj).run {}
-        clientReqProps := clientReqProps.push pTerm
-        clientReqLabels := clientReqLabels.push ((conj.reprint.getD "requires").trimAscii.toString)
-
-  let clientReqId? : Option Ident ←
-    if clientReqProps.isEmpty then pure none
-    else
-      let cid := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_req")
-      let reqConj ← buildPropConj clientReqProps
-      elabCommand (← `(command|
-        set_option linter.unusedVariables false in
-        @[simp] abbrev $cid $[($pIdents:ident : $pTyTerms:term)]* : Prop := $reqConj))
-      pure (some cid)
+  let reqs ← elabRequiresClauses fnIdent srvName fullSrvName fnIdent.getId fnStr "_hReq" "_req"
+    stateFieldNames envVarNames paramNames paramNames pIdents pTyTerms reqExprs
+  let mut extRoots := reqs.extRoots
+  let reqPropTerms := reqs.reqPropTerms
+  let reqHypIds := reqs.reqHypIds
+  let reqHypTys := reqs.reqHypTys
+  let reqLabels := reqs.reqLabels
+  let requiresAuth := reqs.requiresAuth
+  let clientReqId? := reqs.clientReqId?
 
   let mut ensProps : Array Term := #[]
   let mut ensLabels : Array String := #[]
@@ -280,15 +225,8 @@ private def elabServerFnClause (priorRep priorUnrep : Nat)
           invs mutInvs stateFieldNames envVarNames ensSpec? deferredProofs | return none
       pure r
     else
-      let (statelessBody, lSt) ← (lowerAsyncBlock baseCtx none bodyStmts).run {}
-      let handlerId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_handler")
-      elabCommand (← `(command|
-        def $handlerId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
-            $[($allBinderIds:ident : $allBinderTys:term)]* :
-            m (Except $errTyTerm $payloadTerm) :=
-          Qed.Server.srvFinishM $statelessBody))
-      if hasNewErrors (← get).messages priorRep priorUnrep then return none
-      let hCall ← allBinderIds.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
+      let some (handlerId, hCall, hApp, er) ← elabStatelessHandler priorRep priorUnrep fnIdent srvName fnIdent.getId
+          allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts | return none
       if let some ensSpec := ensSpec? then
         let unitInv ← `(fun _ : Unit => True)
         let unitTy ← `(Unit)
@@ -296,8 +234,7 @@ private def elabServerFnClause (priorRep priorUnrep : Nat)
           elabAsyncEnsuresThm priorRep priorUnrep srvName fnStr fnIdent handlerId
             unitInv unitTy payloadTerm errTyTerm
             allBinderIds allBinderTys hCall #[] ensSpec)
-      let hApp ← callArgs.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
-      pure (hApp, true, lSt.extRoots)
+      pure (hApp, true, er)
 
   extRoots := extRoots ++ bodyExtRoots.filter (!extRoots.contains ·)
   let arm ← mkFnDispatchArm fnStr reqBytesId reqVar reqTupleTy pIdents projs
@@ -311,8 +248,8 @@ private def elabServerFnClause (priorRep priorUnrep : Nat)
     paramCount := fnParams.size
     isReadOnly, isAsync := hasAwait, isFallible := retTy.hasFallible, isOption := innerOpt?.isSome
     hasClientReq := clientReqId?.isSome, requiresAuth
-    clientReqConst := clientReqId?.map fun _ => fullSrvName ++ fnIdent.getId.appendAfter "_req"
-    clientReqLabel := String.intercalate " && " clientReqLabels.toList
+    clientReqConst := reqs.clientReqConst?
+    clientReqLabel := reqs.clientReqLabel
     hasEnsures := ensSpec?.isSome
     ensPredConst := ensSpec?.map fun _ => fullSrvName ++ fnIdent.getId.appendAfter "_ens"
     domainErrTags := domainTagIdents.map (·.getId.toString)

@@ -129,9 +129,7 @@ def elabServerStateCmds (priorRep priorUnrep : Nat) (stateId initStateId stateIn
       }
       let (pTerm, _) ← (lowerExpr invCtx .propInv inv.exprStx).run {}
       singleProps := singleProps.push pTerm
-  let invBody ← match singleProps.toList with
-    | []      => `(True)
-    | p :: ps => ps.foldlM (init := p) fun acc q => `($acc ∧ $q)
+  let invBody ← buildPropConj singleProps
   let singleInvStr := singleInvLabelStr invs
   let initInvLbl := Syntax.mkStrLit ("init: " ++ singleInvStr)
   elabCommand (← `(command|
@@ -221,11 +219,6 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
 section
 open Lean Elab Command
 
-def buildPropConj (props : Array Term) : CommandElabM Term := do
-  match props.toList with
-  | []      => `(True)
-  | p :: ps => ps.foldlM (init := p) fun acc q => `($acc ∧ $q)
-
 partial def splitSrvAnd (stx : Syntax) : Array Syntax :=
   let u := unwrapParens1 stx
   if u.getKind == ``qedAnd then splitSrvAnd (u.getArg 0) ++ splitSrvAnd (u.getArg 2)
@@ -262,9 +255,117 @@ partial def scanCtxEnv (envVars : Array String) (locals : Array String) (stx : S
       let (c, e) := scanCtxEnv envVars locals ch
       (ac || c, ae || e)) (false, false)
 
-def isAuthReqExpr (stx : Syntax) : Bool :=
-  let s := stx.reprint.getD ""
+def isAuthReqLabel (s : String) : Bool :=
   s.contains "ctx.userId" || s.contains "ctx.isAuthenticated" || s.contains "ctx.bearerToken"
+
+def isAuthReqExpr (stx : Syntax) : Bool :=
+  isAuthReqLabel (stx.reprint.getD "")
+
+def wrapReqs (reqProps : Array Term) (reqHIds : Array Ident) (reqLbls : Array String) (inner : Term) :
+    CommandElabM Term := do
+  let mut g := inner
+  for revIdx in [0:reqProps.size] do
+    let ri := reqProps.size - 1 - revIdx
+    let rCond := reqProps[ri]!
+    let rHyp := reqHIds[ri]!
+    let rLbl := reqLbls[ri]!
+    let rMsg := Syntax.mkStrLit s!"precondition failed: {rLbl}"
+    let errCtor : Term ←
+      if isAuthReqLabel rLbl then
+        `(Qed.Server.ApiError.unauthorized $rMsg)
+      else
+        `(Qed.Server.ApiError.badRequest $rMsg)
+    g ← `(if $rHyp:ident : $rCond then $g else Pure.pure (Except.error $errCtor))
+  return g
+
+structure LoweredRequires where
+  reqPropTerms    : Array Term
+  reqHypIds       : Array Ident
+  reqHypTys       : Array Term
+  reqLabels       : Array String
+  requiresAuth    : Bool
+  clientReqId?    : Option Ident
+  clientReqConst? : Option Name
+  clientReqLabel  : String
+  extRoots        : Array Name
+
+def elabRequiresClauses (refIdent : Ident) (srvName fullSrvName itemName : Name)
+    (fnLabel hypPrefix reqSuffix : String)
+    (stateFieldNames envVarNames serverLocals clientLocals : Array String)
+    (clientBindIds : Array Ident) (clientBindTys : Array Term)
+    (reqExprs : Array Syntax) (excludedClientVars : Array String := #[])
+    (trackAuth : Bool := true) : CommandElabM LoweredRequires := do
+  let mut reqPropTerms : Array Term := #[]
+  let mut reqHypIds : Array Ident := #[]
+  let mut reqHypTys : Array Term := #[]
+  let mut reqLabels : Array String := #[]
+  let mut clientReqProps : Array Term := #[]
+  let mut clientReqLabels : Array String := #[]
+  let mut requiresAuth := false
+  let mut extRoots : Array Name := #[]
+  for idx in [0:reqExprs.size] do
+    let rExpr := reqExprs[idx]!
+    if exprHasAwait rExpr then
+      throwErrorAt rExpr "`requires` precondition cannot contain `await`"
+    let reqCtx : LowerCtx := {
+      fnName := fnLabel, stateFields := stateFieldNames, envVars := envVarNames, locals := serverLocals
+      stateRule := .forbidInRequires, allowAwait := false, allowUnwrap := false
+      hasFallible := false, isOption := false, innerOptTy? := none
+    }
+    let (pTerm, rSt) ← (lowerExpr reqCtx .propGuard rExpr).run {}
+    extRoots := extRoots ++ rSt.extRoots.filter (!extRoots.contains ·)
+    let hId := mkIdent (Name.mkSimple s!"{hypPrefix}{idx}")
+    reqPropTerms := reqPropTerms.push pTerm
+    reqHypIds := reqHypIds.push hId
+    reqHypTys := reqHypTys.push pTerm
+    reqLabels := reqLabels.push ((rExpr.reprint.getD "requires").trimAscii.toString)
+    for conj in splitSrvAnd rExpr do
+      let (mentionsCtx, mentionsEnv) := scanCtxEnv envVarNames serverLocals conj
+      if trackAuth && mentionsCtx && !mentionsEnv && isAuthReqExpr conj then
+        requiresAuth := true
+      else if !mentionsCtx && !mentionsEnv then
+        let mentionsExcl := !excludedClientVars.isEmpty && (scanCtxEnv excludedClientVars clientLocals conj).2
+        if !mentionsExcl then
+          let cliReqCtx : LowerCtx := {
+            fnName := fnLabel, stateFields := stateFieldNames, envVars := #[], locals := clientLocals
+            stateRule := .forbidInRequires, allowAwait := false, allowUnwrap := false
+            hasFallible := false, isOption := false, innerOptTy? := none, forbidCtxEnv := true
+          }
+          let (cpTerm, _) ← (lowerExpr cliReqCtx .propInv conj).run {}
+          clientReqProps := clientReqProps.push cpTerm
+          clientReqLabels := clientReqLabels.push ((conj.reprint.getD "requires").trimAscii.toString)
+  let (clientReqId?, clientReqConst?) ←
+    if clientReqProps.isEmpty then pure (none, none)
+    else
+      let leaf := itemName.appendAfter reqSuffix
+      let cid := mkIdentFrom refIdent (srvName ++ leaf)
+      let reqConj ← buildPropConj clientReqProps
+      elabCommand (← `(command|
+        set_option linter.unusedVariables false in
+        @[simp] abbrev $cid $[($clientBindIds:ident : $clientBindTys:term)]* : Prop := $reqConj))
+      pure (some cid, some (fullSrvName ++ leaf))
+  return {
+    reqPropTerms, reqHypIds, reqHypTys, reqLabels, requiresAuth,
+    clientReqId?, clientReqConst?,
+    clientReqLabel := String.intercalate " && " clientReqLabels.toList,
+    extRoots
+  }
+
+def elabStatelessHandler (priorRep priorUnrep : Nat) (refIdent : Ident)
+    (srvName handlerLeaf : Name) (allBinderIds : Array Ident) (allBinderTys : Array Term)
+    (callArgs : Array Term) (retTyTerm errTyTerm : Term) (baseCtx : LowerCtx)
+    (bodyStmts : Array Syntax) : CommandElabM (Option (Ident × Term × Term × Array Name)) := do
+  let (statelessBody, lSt) ← (lowerAsyncBlock baseCtx none bodyStmts).run {}
+  let handlerId := mkIdentFrom refIdent (srvName ++ handlerLeaf.appendAfter "_handler")
+  elabCommand (← `(command|
+    def $handlerId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
+        $[($allBinderIds:ident : $allBinderTys:term)]* :
+        m (Except $errTyTerm $retTyTerm) :=
+      Qed.Server.srvFinishM $statelessBody))
+  if hasNewErrors (← get).messages priorRep priorUnrep then return none
+  let hCall ← allBinderIds.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
+  let hApp ← callArgs.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
+  return some (handlerId, hCall, hApp, lSt.extRoots)
 
 private partial def scanFailCallsAux (stx : Syntax) (tags : Array Ident) (hasPlain : Bool) :
     CommandElabM (Array Ident × Bool) := do
@@ -421,20 +522,17 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
   let matchMethodTerm ← `(match $methodVar:ident with $[$allArms:matchAlt]*)
   let fullDispatchBody ← wrapWithEnvDecls matchMethodTerm
 
+  let atomicBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) ←
+    if hasState then pure #[← `(bracketedBinder| [Qed.Server.MonadAtomic $stateId m])]
+    else pure #[]
+
   let dispatchId := mkIdentFrom srvIdent (srvNm ++ `dispatchM)
-  if hasState then
-    elabCommand (← `(command|
-      def $dispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
-          [Qed.Server.MonadAtomic $stateId m]
-          ($ctxId:ident : Qed.Server.RequestCtx) ($methodVar:ident : String) ($reqBytesId:ident : ByteArray) :
-          m (Except Qed.Server.ApiError ByteArray) :=
-        $fullDispatchBody))
-  else
-    elabCommand (← `(command|
-      def $dispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
-          ($ctxId:ident : Qed.Server.RequestCtx) ($methodVar:ident : String) ($reqBytesId:ident : ByteArray) :
-          m (Except Qed.Server.ApiError ByteArray) :=
-        $fullDispatchBody))
+  elabCommand (← `(command|
+    def $dispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
+        $[$atomicBinders:bracketedBinder]*
+        ($ctxId:ident : Qed.Server.RequestCtx) ($methodVar:ident : String) ($reqBytesId:ident : ByteArray) :
+        m (Except Qed.Server.ApiError ByteArray) :=
+      $fullDispatchBody))
 
   if !chanNames.isEmpty then
     let wsKindVar := mkIdent `wsKind
@@ -447,23 +545,14 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
     let wsMatchTerm ← `(match $wsKindVar:ident, $wsChanVar:ident with $[$allWsArms:matchAlt]*)
     let fullWsBody ← wrapWithEnvDecls wsMatchTerm
     let wsDispatchId := mkIdentFrom srvIdent (srvNm ++ `wsDispatchM)
-    if hasState then
-      elabCommand (← `(command|
-        set_option linter.unusedVariables false in
-        def $wsDispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
-            [Qed.Server.MonadAtomic $stateId m]
-            ($ctxId:ident : Qed.Server.RequestCtx) ($wsKindVar:ident : UInt8) ($wsChanVar:ident : String)
-            ($wsParamsVar:ident : ByteArray) ($wsPayloadVar:ident : ByteArray) :
-            m (Except Qed.Server.ApiError ByteArray) :=
-          $fullWsBody))
-    else
-      elabCommand (← `(command|
-        set_option linter.unusedVariables false in
-        def $wsDispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
-            ($ctxId:ident : Qed.Server.RequestCtx) ($wsKindVar:ident : UInt8) ($wsChanVar:ident : String)
-            ($wsParamsVar:ident : ByteArray) ($wsPayloadVar:ident : ByteArray) :
-            m (Except Qed.Server.ApiError ByteArray) :=
-          $fullWsBody))
+    elabCommand (← `(command|
+      set_option linter.unusedVariables false in
+      def $wsDispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
+          $[$atomicBinders:bracketedBinder]*
+          ($ctxId:ident : Qed.Server.RequestCtx) ($wsKindVar:ident : UInt8) ($wsChanVar:ident : String)
+          ($wsParamsVar:ident : ByteArray) ($wsPayloadVar:ident : ByteArray) :
+          m (Except Qed.Server.ApiError ByteArray) :=
+        $fullWsBody))
 
   modifyEnv fun env => serverRegistry.addEntry env {
     serverName := fullSrvName

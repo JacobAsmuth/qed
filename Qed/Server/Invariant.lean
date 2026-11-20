@@ -44,6 +44,12 @@ private def inspectFieldOrFin (sub : Expr) (addFact : Expr → MetaM Unit) : Met
         if let some ltPrf ← try some <$> mkAppM ``Fin.isLt #[sub] catch _ => pure none then
           addFact ltPrf
 
+open Lean in
+private def isSrvEqDecl (decl : LocalDecl) : Bool :=
+  !decl.userName.hasMacroScopes &&
+    let u := decl.userName.toString
+    u.startsWith "_srvEq" || u.startsWith "_hLet"
+
 open Lean Meta Elab Term Tactic in
 /-- Collects all closed subterms of type `Qed.Field _` or `Fin _` from `e` and local hypotheses so
     `omega` automatically sees `.ok` field refinements and `.isLt` index bounds. -/
@@ -55,12 +61,10 @@ def collectProofFacts (extraExprs : Array Expr) : TermElabM (Array Expr) := do
   let lctx ← getLCtx
   for decl in lctx do
     if !decl.isImplementationDetail then
-      let uname := decl.userName.toString
-      let isSrvEq := !decl.userName.hasMacroScopes && (uname.startsWith "_srvEq" || uname.startsWith "_hLet")
       if !decl.isLet && decl.userName.hasMacroScopes then
         if (← try isProp decl.type catch _ => pure false) then
           liftMetaM <| addFact decl.toExpr
-      unless isSrvEq do
+      unless isSrvEqDecl decl do
         liftMetaM <| inspectFieldOrFin decl.toExpr addFact
         if let some val := decl.value? then
           val.forEach fun sub => inspectFieldOrFin sub addFact
@@ -118,9 +122,7 @@ private def unfoldSrvHelpersInGoal : TacticM Unit := do
   -- Pass 1: rename macro-scoped Prop hyps (`rename` preserves all FVarIds).
   for decl in lctx0 do
     if !decl.isImplementationDetail && !decl.isLet then
-      let uname := decl.userName.toString
-      let isSrvEq := !decl.userName.hasMacroScopes && (uname.startsWith "_srvEq" || uname.startsWith "_hLet")
-      unless isSrvEq do
+      unless isSrvEqDecl decl do
         let ty ← g.withContext (instantiateMVars decl.type)
         if (← g.withContext (try isProp ty catch _ => pure false)) then
           if decl.userName.hasMacroScopes then
@@ -163,6 +165,106 @@ private def optCodecSimpNames : Array Lean.Name := #[
   `Qed.Codec.text, `Qed.Codec.textarea, `Qed.Codec.nat,
   `Qed.Codec.int, `Qed.Codec.checkbox, `Qed.Codec.date]
 
+private def valUnwrapSimpNames : Array Lean.Name := #[
+  ``Qed.Server.srvGetAt_eq, ``Qed.QedVal.val_field,
+  ``Qed.QedVal.val_ensured, ``Qed.Lang.QedVal.val_id,
+  ``Qed.Server.SrvIdx.toNat_nat, ``Qed.Server.SrvIdx.toNat_fin]
+
+private def liftOptSimpNames : Array Lean.Name := #[
+  ``Qed.Server.SrvLiftOpt.liftOpt_opt, ``Qed.Server.SrvLiftOpt.liftOpt_val]
+
+private def boolSimpNames : Array Lean.Name := #[
+  ``Bool.and_eq_true, ``Bool.or_eq_true, ``Bool.not_eq_true',
+  ``beq_iff_eq, ``bne_iff_ne, ``decide_eq_true_eq]
+
+private def arrayCoreSimpNames : Array Lean.Name := #[
+  ``Array.size_set, ``Array.size_push, ``Array.getElem_set_self]
+
+private def stepCombSimpNames : Array Lean.Name := #[
+  ``Qed.Server.srvSeq_none, ``Qed.Server.srvSeq_some,
+  ``Qed.Server.srvEmitSeq_none, ``Qed.Server.srvEmitSeq_some,
+  ``Qed.Server.srvFinish_ok, ``Qed.Server.srvFinish_err, ``Qed.Server.srvFinish_none,
+  ``Qed.Server.srvFinishEmit_ok, ``Qed.Server.srvFinishEmit_err, ``Qed.Server.srvFinishEmit_none,
+  ``Qed.Server.srvAtomicCommit_none, ``Qed.Server.srvAtomicCommit_ok, ``Qed.Server.srvAtomicCommit_err,
+  ``Qed.Server.srvAtomicCommitEmit_none, ``Qed.Server.srvAtomicCommitEmit_ok, ``Qed.Server.srvAtomicCommitEmit_err]
+
+private def stepLetEqSimpNames : Array Lean.Name := #[
+  ``Qed.Server.srvSeq_srvLetEq, ``Qed.Server.srvEmitSeq_srvLetEq,
+  ``Qed.Server.srvFinish_srvLetEq, ``Qed.Server.srvFinishEmit_srvLetEq,
+  ``Qed.Server.srvAtomicCommit_srvLetEq, ``Qed.Server.srvAtomicCommitEmit_srvLetEq,
+  ``Qed.Server.srvWithNewState_srvLetEq,
+  ``Qed.Server.prod_fst_srvLetEq, ``Qed.Server.prod_snd_srvLetEq]
+
+private def ensPostSimpNames : Array Lean.Name := #[
+  ``Qed.Server.srvEnsPost_ok, ``Qed.Server.srvEnsPost_err, ``Qed.Server.srvEnsPost_srvLetEq,
+  ``Qed.Server.srvEnsPostOpt_some, ``Qed.Server.srvEnsPostOpt_none, ``Qed.Server.srvEnsPostOpt_err,
+  ``Qed.Server.srvEnsPostOpt_srvLetEq]
+
+private def threadProgBindSimpNames : Array Lean.Name := #[
+  ``Qed.Server.threadProg_pure_bind, ``Qed.Server.threadProg_pure_bind', ``Qed.Server.threadProg_bind_assoc]
+
+private def dsimpCodecUnfoldNames : Array Lean.Name :=
+  #[``Qed.Lang.QedVal.val, ``Qed.Server.SrvIdx.toNat,
+    ``Qed.Server.SrvLiftOpt.liftOpt, ``Qed.Server.srvGetAt] ++ optCodecSimpNames
+
+open Lean Meta in
+private def addSimpNames (st : SimpTheorems) (names : Array Name) (dsimpOnly : Bool := false) :
+    MetaM SimpTheorems := do
+  let env ← getEnv
+  let mut st := st
+  for n in names do
+    if let some ci := env.find? n then
+      match ci with
+      | .thmInfo _ =>
+          unless dsimpOnly do
+            st ← st.addConst n
+      | _ =>
+          st ← st.addDeclToUnfold n
+          unless dsimpOnly do
+            if let some eqns ← getEqnsFor? n then
+              for eq in eqns do
+                st ← st.addConst eq
+  return st
+
+open Lean Meta in
+private def mkSrvSimpCtx (names : Array Name) (cfg : Simp.Config := { zetaDelta := false })
+    (simprocNames : Array Name := #[]) (dsimpOnly : Bool := false) :
+    MetaM (Simp.Context × Simp.SimprocsArray) := do
+  let st ← addSimpNames {} names dsimpOnly
+  let ctx ← Simp.mkContext { cfg with failIfUnchanged := false } #[st] (← getSimpCongrTheorems)
+  let simprocs ← if simprocNames.isEmpty then pure #[] else do
+    let mut sp : Simp.Simprocs := {}
+    for s in simprocNames do
+      sp ← sp.add s true
+    pure #[sp]
+  return (ctx, simprocs)
+
+open Lean Meta Elab Tactic in
+private def runSrvSimp (ctx : Simp.Context) (simprocs : Simp.SimprocsArray := #[])
+    (fvarIds : Array FVarId := #[]) (simplifyTarget : Bool := true) (dsimpOnly : Bool := false) :
+    TacticM Unit := do
+  let g :: rest ← getGoals | return
+  if dsimpOnly then
+    let (res?, _) ← dsimpGoal g ctx simprocs simplifyTarget fvarIds
+    match res? with
+    | none    => setGoals rest
+    | some g' => setGoals (g' :: rest)
+  else
+    let (res?, _) ← simpGoal g ctx simprocs none simplifyTarget fvarIds
+    match res? with
+    | none         => setGoals rest
+    | some (_, g') => setGoals (g' :: rest)
+
+open Lean Meta Elab Tactic in
+private def runSrvSimpAll (ctx : Simp.Context) (simprocs : Simp.SimprocsArray := #[]) : TacticM Unit := do
+  let g :: _ ← getGoals | return
+  let fvs ← g.withContext do
+    let mut arr : Array FVarId := #[]
+    for d in (← getLCtx) do
+      if !d.isImplementationDetail then arr := arr.push d.fvarId
+    return arr
+  try runSrvSimp ctx simprocs fvs true false catch _ => pure ()
+
 open Lean in
 private def mkOptCodecSimpLems {m : Type → Type} [Monad m] [MonadEnv m] [MonadQuotation m] :
     m (Array (TSyntax ``Lean.Parser.Tactic.simpLemma)) := do
@@ -175,10 +277,8 @@ syntax "qedDsimpCodecs" : tactic
 open Lean Meta Elab Tactic in
 elab_rules : tactic
   | `(tactic| qedDsimpCodecs) => do
-      let codecLems ← mkOptCodecSimpLems
-      evalTactic (← `(tactic| try dsimp (config := { zetaDelta := false }) only
-        [Qed.Lang.QedVal.val, Qed.Server.SrvIdx.toNat,
-         Qed.Server.SrvLiftOpt.liftOpt, Qed.Server.srvGetAt, $[$codecLems],*] at ⊢))
+      let (ctx, _) ← mkSrvSimpCtx dsimpCodecUnfoldNames { zetaDelta := false } #[] true
+      try runSrvSimp ctx #[] #[] true true catch _ => pure ()
 
 theorem srvDiteFalse_eq_true {P : Prop} [Decidable P] (t : P → Bool) :
     ((if h : P then t h else false) = true) ↔ ∃ h : P, t h = true := by
@@ -188,16 +288,17 @@ theorem srvDiteFalse_eq_false {P : Prop} [Decidable P] (t : P → Bool) :
     ((if h : P then t h else false) = false) ↔ ∀ h : P, t h = false := by
   by_cases hP : P <;> simp [hP]
 
-macro "qedSimpArrayAndBool" : tactic => `(tactic|
-  try simp (config := { zetaDelta := true }) only
-    [id_eq, ne_eq, Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
-     Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
-     Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
-     Array.size_set, Array.size_push, Array.size_modify,
-     Array.getElem_set_self,
-     Qed.Server.srvDiteFalse_eq_true, Qed.Server.srvDiteFalse_eq_false,
-     Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
-     beq_iff_eq, bne_iff_ne, decide_eq_true_eq] at *)
+private def arrayAndBoolSimpNames : Array Lean.Name :=
+  #[``id_eq, ``ne_eq, ``Array.size_modify, ``Qed.Server.srvDiteFalse_eq_true, ``Qed.Server.srvDiteFalse_eq_false] ++
+  valUnwrapSimpNames ++ arrayCoreSimpNames ++ boolSimpNames
+
+syntax "qedSimpArrayAndBool" : tactic
+
+open Lean Meta Elab Tactic in
+elab_rules : tactic
+  | `(tactic| qedSimpArrayAndBool) => do
+      let (ctx, _) ← mkSrvSimpCtx arrayAndBoolSimpNames { zetaDelta := true }
+      runSrvSimpAll ctx
 
 open Lean Meta Elab Term in
 private def exprHasLetFVar (lctx : LocalContext) (e : Expr) : Bool :=
@@ -297,23 +398,7 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
               qedDsimpCodecs
               try simp (config := { zetaDelta := false }) only [Qed.Server.qedReduceStrLen]
               first | assumption | omega | decide | rfl)
-        let savedMsgs ← Core.getMessageLog
-        Core.resetMessageLog
-        let fastPrf? : Option Expr ← try
-            let prf ← withPosedFacts localFacts <| elabTermEnsuringType fastPrfStx (some goalProp)
-            synthesizeSyntheticMVarsNoPostponing
-            let prf ← instantiateMVars prf
-            let newMsgs ← Core.getMessageLog
-            if !newMsgs.hasErrors && !prf.hasMVar then
-              Core.setMessageLog (savedMsgs ++ newMsgs)
-              pure (some prf)
-            else
-              Core.setMessageLog savedMsgs
-              pure none
-          catch _ =>
-            Core.setMessageLog savedMsgs
-            pure none
-        if let some fastPrf := fastPrf? then
+        if let some fastPrf ← tryProveWithFacts localFacts fastPrfStx goalProp then
           let fastPrf ← wrapAuxProof goalProp fastPrf
           return ← mkAppOptM ``Qed.Field.mk #[some innerTy, some predFn, some valExpr, some fastPrf]
         let facts ← collectProofFacts #[valExpr]
@@ -493,25 +578,10 @@ private def proveBoundsFor (ref : Syntax) (arrExpr idxNatExpr : Expr) : TermElab
        Array.size_set, Array.size_push, Array.size_modify] at ⊢
     $hypSimpTac:tactic
     first | assumption | omega)
-  let savedMsgs ← Core.getMessageLog
-  Core.resetMessageLog
-  let fastAttempt? : Option Expr ← try
-      let basePrf ← elabTermEnsuringType fastStx (some baseGoalProp)
-      synthesizeSyntheticMVarsNoPostponing
-      let basePrf ← instantiateMVars basePrf
-      let newMsgs ← Core.getMessageLog
-      if !newMsgs.hasErrors && !basePrf.hasMVar then
-        Core.setMessageLog (savedMsgs ++ newMsgs)
-        match sizeEqOpt? with
-        | none       => pure (some basePrf)
-        | some eqPrf => pure (some (← mkAppM ``Nat.lt_of_lt_of_eq #[basePrf, eqPrf]))
-      else
-        Core.setMessageLog savedMsgs
-        pure none
-    catch _ =>
-      Core.setMessageLog savedMsgs
-      pure none
-  if let some prfExpr := fastAttempt? then
+  if let some basePrf ← tryProveWithFacts #[] fastStx baseGoalProp then
+    let prfExpr ← match sizeEqOpt? with
+      | none       => pure basePrf
+      | some eqPrf => mkAppM ``Nat.lt_of_lt_of_eq #[basePrf, eqPrf]
     return ← wrapAuxProof goalProp prfExpr
   let facts ← collectProofFacts #[arrExpr, idxNatExpr]
   let prfStx ← `(by
@@ -574,20 +644,36 @@ def elabSrvSetElem : TermElab := fun stx expectedType? => do
 
 syntax "qedSrvFinishAtom" : tactic
 
+private def finishAtomPreSimpNames : Array Lean.Name :=
+  valUnwrapSimpNames ++ liftOptSimpNames ++ #[``Array.getElem_set_self]
+
+private def finishAtomFallbackSimpNames : Array Lean.Name :=
+  valUnwrapSimpNames ++ arrayCoreSimpNames
+
+private def hypSimpEachNames : Array Lean.Name :=
+  #[``id_eq, ``ne_eq, ``Prod.mk.injEq, ``Option.some.injEq, ``Except.ok.injEq, ``Except.error.injEq,
+    ``reduceCtorEq, ``Qed.Lang.not_qedAndProp, ``Qed.Lang.not_qedOrProp,
+    ``Qed.Server.srvDiteFalse_eq_true, ``Qed.Server.srvDiteFalse_eq_false] ++
+  valUnwrapSimpNames ++ liftOptSimpNames ++ optCodecSimpNames ++ arrayCoreSimpNames ++ boolSimpNames
+
+private def tgtSimpEachNames : Array Lean.Name :=
+  #[``id_eq, ``ne_eq, ``Array.forall_push, ``Array.sumBy_empty, ``Array.sumBy_push] ++
+  stepCombSimpNames ++ valUnwrapSimpNames ++ liftOptSimpNames ++ arrayCoreSimpNames ++ boolSimpNames
+
 open Lean Meta Elab Tactic in
 elab_rules : tactic
   | `(tactic| qedSrvFinishAtom) => do
       unfoldSrvHelpersInGoal
-      evalTactic (← `(tactic| (
-        try simp (config := { zetaDelta := false }) only
-          [Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
-           Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
-           Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
-           Qed.Server.SrvLiftOpt.liftOpt_opt, Qed.Server.SrvLiftOpt.liftOpt_val,
-           Array.getElem_set_self]
-        qedDsimpCodecs)))
+      let (preCtx, _) ← mkSrvSimpCtx finishAtomPreSimpNames
+      try runSrvSimp preCtx catch _ => pure ()
+      let (dsimpCtx, _) ← mkSrvSimpCtx dsimpCodecUnfoldNames { zetaDelta := false } #[] true
+      try runSrvSimp dsimpCtx #[] #[] true true catch _ => pure ()
       if (← getUnsolvedGoals).isEmpty then return
-      let invFactIds ← withMainContext do
+      -- Fast path: discharge trivial / linear goals before scanning the entire LocalContext.
+      evalTactic (← `(tactic|
+        try first | rfl | assumption | trivial | exact Or.inl rfl | exact Or.inr (by assumption) | omega))
+      if (← getUnsolvedGoals).isEmpty then return
+      let invFactFVars ← withMainContext do
         let goalTy ← instantiateMVars (← getMainTarget)
         let lctx ← getLCtx
         let mut scanExprs : Array Expr := #[goalTy]
@@ -595,9 +681,7 @@ elab_rules : tactic
         for decl in lctx do
           if !decl.isImplementationDetail then
             let dty ← instantiateMVars decl.type
-            let uname := decl.userName.toString
-            let isSrvEq := !decl.userName.hasMacroScopes && (uname.startsWith "_srvEq" || uname.startsWith "_hLet")
-            if !isSrvEq then
+            if !isSrvEqDecl decl then
               scanExprs := scanExprs.push dty
             else if let some (_, _, rhs) := dty.eq? then
               if !(rhs.getUsedConstants.any fun c => c == ``Array.set || c == ``Array.push) then
@@ -633,31 +717,32 @@ elab_rules : tactic
                 inspectFieldOrFin sub addFact
           scanExprs ← nextScanRef.get
         let facts ← factsRef.get
-        let mut ids : Array Ident := #[]
+        let mut fvs : Array FVarId := #[]
         for idx in [0:facts.size] do
           let fPrf := facts[idx]!
           let g ← getMainGoal
           let fTy ← g.withContext (inferType fPrf)
           let fname := Name.mkSimple s!"_invFact{idx}"
-          let (_, g') ← (← g.assert fname fTy fPrf).intro1P
+          let (fv, g') ← (← g.assert fname fTy fPrf).intro1P
           replaceMainGoal [g']
-          ids := ids.push (mkIdent fname)
-        return ids
-      unless invFactIds.isEmpty do
-        let codecLems ← mkOptCodecSimpLems
-        evalTactic (← `(tactic|
-          try dsimp (config := { zetaDelta := false }) only [$[$codecLems],*] at $[$invFactIds:ident]*))
-      evalTactic (← `(tactic| (
-        qedDsimpCodecs
-        first
+          fvs := fvs.push fv
+        return fvs
+      unless invFactFVars.isEmpty do
+        let (codecCtx, _) ← mkSrvSimpCtx optCodecSimpNames { zetaDelta := false } #[] true
+        try runSrvSimp codecCtx #[] invFactFVars false true catch _ => pure ()
+      try runSrvSimp dsimpCtx #[] #[] true true catch _ => pure ()
+      if (← getUnsolvedGoals).isEmpty then return
+      evalTactic (← `(tactic|
+        try first
           | rfl | decide | omega | assumption | trivial | (intros; trivial)
-          | exact Or.inr (by assumption) | exact Or.inl rfl
-          | (simp (config := { zetaDelta := false }) only
-               [Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
-                Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
-                Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
-                Array.getElem_set_self, Array.size_set, Array.size_push] <;>
-             first | rfl | decide | omega | assumption)
+          | exact Or.inr (by assumption) | exact Or.inl rfl))
+      if (← getUnsolvedGoals).isEmpty then return
+      let (fbCtx, _) ← mkSrvSimpCtx finishAtomFallbackSimpNames
+      try runSrvSimp fbCtx catch _ => pure ()
+      if (← getUnsolvedGoals).isEmpty then return
+      evalTactic (← `(tactic| (
+        first
+          | rfl | decide | omega | assumption
           | (simp (config := { zetaDelta := false }) [*] <;> done)
           | (simp (config := { zetaDelta := false }) [*] <;> omega)
           | (simp_all (config := { zetaDelta := false }) <;> omega)
@@ -671,56 +756,25 @@ elab_rules : tactic
   | `(tactic| qedSimpHypsEach) => do
       let g ← getMainGoal
       let lctx ← g.withContext getLCtx
-      let mut hIds : Array Ident := #[]
+      let mut hFVars : Array FVarId := #[]
       for decl in lctx do
         if !decl.isImplementationDetail && !decl.isLet && !decl.userName.hasMacroScopes then
-          let uname := decl.userName.toString
-          unless uname.startsWith "_srvEq" || uname.startsWith "_hLet" do
+          unless isSrvEqDecl decl do
             if (← g.withContext (try isProp decl.type catch _ => pure false)) then
-              hIds := hIds.push (mkIdent decl.userName)
-      if !hIds.isEmpty then
-        let hypSimpNames := #[
-          ``id_eq, ``ne_eq, ``Prod.mk.injEq, ``Option.some.injEq, ``Except.ok.injEq, ``Except.error.injEq, ``reduceCtorEq,
-          ``Qed.Lang.not_qedAndProp, ``Qed.Lang.not_qedOrProp,
-          ``Qed.Server.srvGetAt_eq, ``Qed.QedVal.val_field,
-          ``Qed.QedVal.val_ensured, ``Qed.Lang.QedVal.val_id,
-          ``Qed.Server.SrvIdx.toNat_nat, ``Qed.Server.SrvIdx.toNat_fin,
-          ``Qed.Server.SrvLiftOpt.liftOpt_opt, ``Qed.Server.SrvLiftOpt.liftOpt_val,
-          `Qed.Codec.valid, `Qed.Codec.refine, `Qed.Codec.jsonOnly,
-          `Qed.Codec.text, `Qed.Codec.textarea, `Qed.Codec.nat,
-          `Qed.Codec.int, `Qed.Codec.checkbox, `Qed.Codec.date,
-          ``Array.size_set, ``Array.size_push, ``Array.getElem_set_self,
-          ``Qed.Server.srvDiteFalse_eq_true, ``Qed.Server.srvDiteFalse_eq_false,
-          ``Bool.and_eq_true, ``Bool.or_eq_true, ``Bool.not_eq_true',
-          ``beq_iff_eq, ``bne_iff_ne, ``decide_eq_true_eq]
-        let env ← getEnv
-        let hypLems ← (hypSimpNames.filter env.contains).mapM fun n =>
-          `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
+              hFVars := hFVars.push decl.fvarId
+      if !hFVars.isEmpty then
+        let (hypCtx, _) ← mkSrvSimpCtx hypSimpEachNames
         let batchOk ← try
-            evalTactic (← `(tactic| simp (config := { zetaDelta := false }) only [$[$hypLems],*] at $[$hIds:ident]*))
+            runSrvSimp hypCtx #[] hFVars false false
             pure true
           catch _ => pure false
         unless batchOk do
-          for hId in hIds do
+          for fv in hFVars do
             if (← getUnsolvedGoals).isEmpty then return
-            evalTactic (← `(tactic| try simp (config := { zetaDelta := false }) only [$[$hypLems],*] at $hId:ident))
+            try runSrvSimp hypCtx #[] #[fv] false false catch _ => pure ()
       if (← getUnsolvedGoals).isEmpty then return
-      evalTactic (← `(tactic|
-        try simp (config := { zetaDelta := false }) only
-          [id_eq, ne_eq, Qed.Server.srvSeq_none, Qed.Server.srvSeq_some,
-           Qed.Server.srvEmitSeq_none, Qed.Server.srvEmitSeq_some,
-           Qed.Server.srvFinish_ok, Qed.Server.srvFinish_err, Qed.Server.srvFinish_none,
-           Qed.Server.srvFinishEmit_ok, Qed.Server.srvFinishEmit_err, Qed.Server.srvFinishEmit_none,
-           Qed.Server.srvAtomicCommit_none, Qed.Server.srvAtomicCommit_ok, Qed.Server.srvAtomicCommit_err,
-           Qed.Server.srvAtomicCommitEmit_none, Qed.Server.srvAtomicCommitEmit_ok, Qed.Server.srvAtomicCommitEmit_err,
-           Qed.Server.srvGetAt_eq, Qed.QedVal.val_field,
-           Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
-           Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
-           Qed.Server.SrvLiftOpt.liftOpt_opt, Qed.Server.SrvLiftOpt.liftOpt_val,
-           Array.forall_push, Array.sumBy_empty, Array.sumBy_push,
-           Array.size_set, Array.size_push, Array.getElem_set_self,
-           Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
-           beq_iff_eq, bne_iff_ne, decide_eq_true_eq]))
+      let (tgtCtx, _) ← mkSrvSimpCtx tgtSimpEachNames
+      try runSrvSimp tgtCtx catch _ => pure ()
 
 open Lean Meta in
 private def collectReadySrvLetEqs (e : Expr) : Nat → MetaM (Array Expr)
@@ -802,22 +856,24 @@ elab_rules : tactic
         else pure g3
       replaceMainGoal [g4]
 
+private def postRwSimpNames : Array Lean.Name :=
+  #[``Array.sumBy_empty, ``Array.sumBy_push] ++ arrayCoreSimpNames ++ valUnwrapSimpNames ++ liftOptSimpNames
+
 open Lean Meta Elab Tactic in
 private def rewriteTargetEqsLinear : TacticM Unit := do
   let g :: rest ← getGoals | return
   setGoals [g]
   let mut eqDecls : Array (FVarId × Bool × Ident) := #[]
   for decl in (← g.withContext getLCtx) do
-    if !decl.isImplementationDetail && !decl.isLet && !decl.userName.hasMacroScopes then
-      let uname := decl.userName.toString
-      if uname.startsWith "_srvEq" || uname.startsWith "_hLet" then
-        let dty ← g.withContext (instantiateMVars decl.type)
-        if let some (eqTy, lhs, rhs) := dty.eq? then
-          if let .fvar fv := lhs.consumeMData then
-            if !rhs.containsFVar fv then
-              let isArr ← g.withContext do
-                return (← whnf eqTy).isAppOfArity ``Array 1
-              eqDecls := eqDecls.push (fv, isArr, mkIdent decl.userName)
+    if !decl.isImplementationDetail && !decl.isLet && isSrvEqDecl decl then
+      let dty ← g.withContext (instantiateMVars decl.type)
+      if let some (eqTy, lhs, rhs) := dty.eq? then
+        if let .fvar fv := lhs.consumeMData then
+          if !rhs.containsFVar fv then
+            let isArr ← g.withContext do
+              return (← whnf eqTy).isAppOfArity ``Array 1
+            eqDecls := eqDecls.push (fv, isArr, mkIdent decl.userName)
+  let (postRwCtx, _) ← mkSrvSimpCtx postRwSimpNames
   for revIdx in [0:eqDecls.size] do
     if (← getGoals).isEmpty then break
     let (fv, isArr, hId) := eqDecls[eqDecls.size - 1 - revIdx]!
@@ -836,13 +892,7 @@ private def rewriteTargetEqsLinear : TacticM Unit := do
         else
           evalTactic (← `(tactic| rw [$hId:ident]))
         if !(← getGoals).isEmpty then
-          evalTactic (← `(tactic|
-            try simp (config := { zetaDelta := false }) only
-              [Qed.Server.srvGetAt_eq, Array.getElem_set_self, Array.size_set, Array.size_push,
-               Array.sumBy_empty, Array.sumBy_push, Qed.QedVal.val_field,
-               Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
-               Qed.Server.SrvIdx.toNat_nat, Qed.Server.SrvIdx.toNat_fin,
-               Qed.Server.SrvLiftOpt.liftOpt_opt, Qed.Server.SrvLiftOpt.liftOpt_val]))
+          runSrvSimp postRwCtx
       catch _ => pure ()
   let rem ← getGoals
   setGoals (rem ++ rest)
@@ -861,31 +911,7 @@ private def peelArrayForall : TacticM Unit := do
           | setGoals (g :: rest); return
         unless memTy.consumeMData.isAppOfArity ``Membership.mem 5 do
           setGoals (g :: rest); return
-        let arrExpr := (memTy.consumeMData.getAppArgs[3]!).consumeMData
-        if arrExpr.isAppOfArity ``Array.set 5 then
-          let ok ← try
-              evalTactic (← `(tactic| apply Array.forall_set))
-              pure true
-            catch _ => pure false
-          if ok then
-            let subgoals ← getGoals
-            if subgoals.length == 2 then
-              let [gPrev, gElem] := subgoals | setGoals (subgoals ++ rest); return
-              setGoals [gElem]
-              try evalTactic (← `(tactic| dsimp only at ⊢)) catch _ => pure ()
-              unless (← getGoals).isEmpty do
-                rewriteTargetEqsLinear
-                unless (← getGoals).isEmpty do
-                  try evalTactic (← `(tactic| qedSrvFinishAtom)) catch _ => pure ()
-              let elemRem ← getGoals
-              setGoals [gPrev]
-              loop fuel
-              let prevRem ← getGoals
-              setGoals (prevRem ++ elemRem ++ rest)
-              return
-        if arrExpr.isAppOfArity ``Array.push 3 then
-          evalTactic (← `(tactic| rw [Array.forall_push]; apply And.intro))
-          let [gPrev, gElem] ← getGoals | setGoals ((← getGoals) ++ rest); return
+        let closeElemAndRecurse (gPrev gElem : MVarId) : TacticM Unit := do
           setGoals [gElem]
           try evalTactic (← `(tactic| dsimp only at ⊢)) catch _ => pure ()
           unless (← getGoals).isEmpty do
@@ -897,6 +923,22 @@ private def peelArrayForall : TacticM Unit := do
           loop fuel
           let prevRem ← getGoals
           setGoals (prevRem ++ elemRem ++ rest)
+        let arrExpr := (memTy.consumeMData.getAppArgs[3]!).consumeMData
+        if arrExpr.isAppOfArity ``Array.set 5 then
+          let ok ← try
+              evalTactic (← `(tactic| apply Array.forall_set))
+              pure true
+            catch _ => pure false
+          if ok then
+            let subgoals ← getGoals
+            if subgoals.length == 2 then
+              let [gPrev, gElem] := subgoals | setGoals (subgoals ++ rest); return
+              closeElemAndRecurse gPrev gElem
+              return
+        if arrExpr.isAppOfArity ``Array.push 3 then
+          evalTactic (← `(tactic| rw [Array.forall_push]; apply And.intro))
+          let [gPrev, gElem] ← getGoals | setGoals ((← getGoals) ++ rest); return
+          closeElemAndRecurse gPrev gElem
           return
         if let .fvar fv := arrExpr then
           let lctx ← g.withContext getLCtx
@@ -1010,42 +1052,80 @@ elab_rules : tactic
           return
       throwError "qedSplitEqHyp: nothing to split"
 
+private def stepFixedSimpNames : Array Lean.Name :=
+  stepCombSimpNames ++ stepLetEqSimpNames ++ ensPostSimpNames ++ valUnwrapSimpNames ++ liftOptSimpNames
+
+private def asyncDsimpNames : Array Lean.Name :=
+  #[``Qed.Server.srvSeqM, ``Qed.Server.SrvUnwrap.unwrap, ``Qed.Server.SrvErr.ofApi, ``Qed.Server.SrvUnwrapOpt.unwrapOpt]
+
+private def asyncNormSimpNames : Array Lean.Name :=
+  stepCombSimpNames ++ stepLetEqSimpNames ++ ensPostSimpNames ++ threadProgBindSimpNames
+
+private def rpcReqSimpNames : Array Lean.Name :=
+  #[``Option.isSome_iff_ne_none, ``ne_eq, `Qed.Cached.all, `Qed.Resource.all] ++
+  boolSimpNames ++ valUnwrapSimpNames ++ optCodecSimpNames
+
 syntax "qedSrvProveStep " "[" ident,* "]" str str : tactic
 
 open Lean Meta Elab Tactic in
 elab_rules : tactic
   | `(tactic| qedSrvProveStep [$[$unfoldIds:ident],*] $fnLabel:str $invLabel:str) => do
-      let userLemmas ← unfoldIds.mapM fun id => `(Lean.Parser.Tactic.simpLemma| $id:ident)
-      let fixedNames := #[
-        ``Qed.Server.srvSeq_none, ``Qed.Server.srvSeq_some, ``Qed.Server.srvSeq_srvLetEq,
-        ``Qed.Server.srvEmitSeq_none, ``Qed.Server.srvEmitSeq_some, ``Qed.Server.srvEmitSeq_srvLetEq,
-        ``Qed.Server.srvFinish_ok, ``Qed.Server.srvFinish_err, ``Qed.Server.srvFinish_none, ``Qed.Server.srvFinish_srvLetEq,
-        ``Qed.Server.srvFinishEmit_ok, ``Qed.Server.srvFinishEmit_err, ``Qed.Server.srvFinishEmit_none, ``Qed.Server.srvFinishEmit_srvLetEq,
-        ``Qed.Server.srvAtomicCommit_none, ``Qed.Server.srvAtomicCommit_ok, ``Qed.Server.srvAtomicCommit_err, ``Qed.Server.srvAtomicCommit_srvLetEq,
-        ``Qed.Server.srvAtomicCommitEmit_none, ``Qed.Server.srvAtomicCommitEmit_ok, ``Qed.Server.srvAtomicCommitEmit_err, ``Qed.Server.srvAtomicCommitEmit_srvLetEq,
-        ``Qed.Server.srvWithNewState_srvLetEq,
-        ``Qed.Server.srvEnsPost_ok, ``Qed.Server.srvEnsPost_err, ``Qed.Server.srvEnsPost_srvLetEq,
-        ``Qed.Server.srvEnsPostOpt_some, ``Qed.Server.srvEnsPostOpt_none, ``Qed.Server.srvEnsPostOpt_err, ``Qed.Server.srvEnsPostOpt_srvLetEq,
-        ``Qed.Server.prod_fst_srvLetEq, ``Qed.Server.prod_snd_srvLetEq,
-        ``Qed.QedVal.val_field, ``Qed.QedVal.val_ensured, ``Qed.Lang.QedVal.val_id,
-        ``Qed.Server.SrvIdx.toNat_nat, ``Qed.Server.SrvIdx.toNat_fin,
-        ``Qed.Server.SrvLiftOpt.liftOpt_opt, ``Qed.Server.SrvLiftOpt.liftOpt_val
-      ]
-      let fixedLemmas ← fixedNames.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):ident)
-      let allStepLemmas := userLemmas ++ fixedLemmas
-      let stepFloatLemmas := fixedLemmas
-      let runTac ← `(tactic| (
-        intros;
-        try simp (config := { zetaDelta := false }) only [$[$allStepLemmas],*] at *;
-        try (repeat' (
-          first
-            | (qedElimSrvLetEq; repeat' qedElimSrvLetEq; try simp (config := { zetaDelta := false }) only [$[$stepFloatLemmas],*] at ⊢)
-            | (split <;>
-                try simp (config := { zetaDelta := false }) only [$[$stepFloatLemmas],*] at ⊢)
-            | (qedSplitEqHyp <;>
-                try simp (config := { zetaDelta := false }) only [$[$stepFloatLemmas],*] at *)));
-        all_goals (try qedSrvCloseLeaf)))
-      evalTactic runTac
+      let userNames ← unfoldIds.mapM fun id => resolveGlobalConstNoOverload id
+      let (allStepCtx, _) ← mkSrvSimpCtx (userNames ++ stepFixedSimpNames)
+      let (stepFloatCtx, _) ← mkSrvSimpCtx stepFixedSimpNames
+      evalTactic (← `(tactic| intros))
+      runSrvSimpAll allStepCtx
+      let stepOnce : TacticM Bool := do
+        if (← getGoals).isEmpty then return false
+        let didLet ← try
+            evalTactic (← `(tactic| (qedElimSrvLetEq; repeat' qedElimSrvLetEq)))
+            pure true
+          catch _ => pure false
+        if didLet then
+          try runSrvSimp stepFloatCtx catch _ => pure ()
+          return true
+        let didSplit ← try
+            evalTactic (← `(tactic| split))
+            pure true
+          catch _ => pure false
+        if didSplit then
+          let gs ← getGoals
+          let mut out : List MVarId := []
+          for sg in gs do
+            setGoals [sg]
+            try runSrvSimp stepFloatCtx catch _ => pure ()
+            out := out ++ (← getGoals)
+          setGoals out
+          return true
+        let didEqSplit ← try
+            evalTactic (← `(tactic| qedSplitEqHyp))
+            pure true
+          catch _ => pure false
+        if didEqSplit then
+          let gs ← getGoals
+          let mut out : List MVarId := []
+          for sg in gs do
+            setGoals [sg]
+            runSrvSimpAll stepFloatCtx
+            out := out ++ (← getGoals)
+          setGoals out
+          return true
+        return false
+      let rec loop : Nat → TacticM Unit
+        | 0 => pure ()
+        | fuel + 1 => do
+            let gs ← getGoals
+            if gs.isEmpty then return
+            let mut progressed := false
+            let mut nextGoals : List MVarId := []
+            for sg in gs do
+              setGoals [sg]
+              if (← stepOnce) then progressed := true
+              nextGoals := nextGoals ++ (← getGoals)
+            setGoals nextGoals
+            if progressed then loop fuel
+      loop 256
+      evalTactic (← `(tactic| all_goals (try qedSrvCloseLeaf)))
       let rem ← getUnsolvedGoals
       unless rem.isEmpty do
         let msg ← rem[0]!.withContext do Qed.Diag.ppQedExpr (← rem[0]!.getType)
@@ -1071,31 +1151,22 @@ elab_rules : tactic
             {"  "}• must satisfy:  {msg}{moreNote}\n\n\
             Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant holds across every branch."
 
-macro "qedNormAsyncCont" : tactic => `(tactic| (
-  try dsimp (config := { zetaDelta := false }) only
-    [Qed.Server.srvSeqM, Qed.Server.SrvUnwrap.unwrap, Qed.Server.SrvErr.ofApi, Qed.Server.SrvUnwrapOpt.unwrapOpt] at ⊢
-  try simp (config := { zetaDelta := false }) only
-    [Qed.Server.srvFinish_ok, Qed.Server.srvFinish_err, Qed.Server.srvFinish_none, Qed.Server.srvFinish_srvLetEq,
-     Qed.Server.srvFinishEmit_ok, Qed.Server.srvFinishEmit_err, Qed.Server.srvFinishEmit_none, Qed.Server.srvFinishEmit_srvLetEq,
-     Qed.Server.srvAtomicCommit_none, Qed.Server.srvAtomicCommit_ok, Qed.Server.srvAtomicCommit_err, Qed.Server.srvAtomicCommit_srvLetEq,
-     Qed.Server.srvAtomicCommitEmit_none, Qed.Server.srvAtomicCommitEmit_ok, Qed.Server.srvAtomicCommitEmit_err, Qed.Server.srvAtomicCommitEmit_srvLetEq,
-     Qed.Server.srvEnsPost_ok, Qed.Server.srvEnsPost_err, Qed.Server.srvEnsPost_srvLetEq,
-     Qed.Server.srvEnsPostOpt_some, Qed.Server.srvEnsPostOpt_none, Qed.Server.srvEnsPostOpt_err, Qed.Server.srvEnsPostOpt_srvLetEq,
-     Qed.Server.prod_fst_srvLetEq, Qed.Server.prod_snd_srvLetEq,
-     Qed.Server.threadProg_pure_bind, Qed.Server.threadProg_pure_bind', Qed.Server.threadProg_bind_assoc] at ⊢))
+syntax "qedNormAsyncCont" : tactic
+
+open Lean Meta Elab Tactic in
+elab_rules : tactic
+  | `(tactic| qedNormAsyncCont) => do
+      let (dCtx, _) ← mkSrvSimpCtx asyncDsimpNames { zetaDelta := false } #[] true
+      try runSrvSimp dCtx #[] #[] true true catch _ => pure ()
+      let (sCtx, _) ← mkSrvSimpCtx asyncNormSimpNames
+      try runSrvSimp sCtx catch _ => pure ()
 
 macro "qedAsyncInit " handlerId:ident : tactic => `(tactic| (
   intros;
   unfold $handlerId:ident;
   try dsimp (config := { zetaDelta := false }) only [Qed.Server.srvFinishM, Qed.Server.srvSeqM] at ⊢;
-  try simp (config := { zetaDelta := false }) only
-    [Qed.Server.srvFinishM, Qed.Server.srvSeqM,
-     Qed.Server.srvFinish_srvLetEq, Qed.Server.srvFinishEmit_srvLetEq,
-     Qed.Server.srvAtomicCommit_srvLetEq, Qed.Server.srvAtomicCommitEmit_srvLetEq,
-     Qed.Server.srvEnsPost_ok, Qed.Server.srvEnsPost_err, Qed.Server.srvEnsPost_srvLetEq,
-     Qed.Server.srvEnsPostOpt_some, Qed.Server.srvEnsPostOpt_none, Qed.Server.srvEnsPostOpt_err, Qed.Server.srvEnsPostOpt_srvLetEq,
-     Qed.Server.prod_fst_srvLetEq, Qed.Server.prod_snd_srvLetEq,
-     Qed.Server.threadProg_pure_bind, Qed.Server.threadProg_pure_bind', Qed.Server.threadProg_bind_assoc] at ⊢))
+  try simp (config := { zetaDelta := false }) only [Qed.Server.srvFinishM, Qed.Server.srvSeqM] at ⊢;
+  qedNormAsyncCont))
 
 syntax "qedSrvProveAsync " ident "[" ident,* "]" str str : tactic
 
@@ -1152,21 +1223,12 @@ elab_rules : tactic
         let fTy ← g.withContext (inferType fPrf)
         let (_, g') ← (← g.assert (Name.mkSimple s!"_reqFact{idx}") fTy fPrf).intro1P
         replaceMainGoal [g']
-      let env ← getEnv
-      let fixedNames := #[
-        ``Option.isSome_iff_ne_none, ``ne_eq, ``Bool.and_eq_true, ``Bool.or_eq_true,
-        ``Bool.not_eq_true', ``beq_iff_eq, ``bne_iff_ne, ``decide_eq_true_eq,
-        ``Qed.Lang.QedVal.val_id, ``Qed.QedVal.val_field, ``Qed.QedVal.val_ensured,
-        ``Qed.Server.srvGetAt_eq, ``Qed.Server.SrvIdx.toNat_nat, ``Qed.Server.SrvIdx.toNat_fin,
-        `Qed.Codec.valid,
-        `Qed.Codec.refine, `Qed.Codec.jsonOnly, `Qed.Codec.text, `Qed.Codec.textarea,
-        `Qed.Codec.nat, `Qed.Codec.int, `Qed.Codec.checkbox, `Qed.Codec.date]
-      let allReqSimp ← ((fixedNames ++ #[`Qed.Cached.all, `Qed.Resource.all]).filter env.contains).mapM fun n =>
-        `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+      let (reqCtx, _) ← mkSrvSimpCtx rpcReqSimpNames { zetaDelta := true, zetaHave := true }
       evalTactic (← `(tactic| (
         try qedUnfoldSrvHelpers
-        qedSimpArrayAndBool
-        try simp (config := { zetaDelta := true, zetaHave := true }) only [$[$allReqSimp],*] at *
+        qedSimpArrayAndBool)))
+      runSrvSimpAll reqCtx
+      evalTactic (← `(tactic| (
         qedDsimpCodecs
         try (repeat' (apply And.intro))
         all_goals (

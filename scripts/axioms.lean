@@ -324,7 +324,6 @@ import Examples.LiveRoom
 #print axioms Qed.Subscription.boot_preserves_inv
 #print axioms Qed.Subscription.wrap_preserves_inv
 #print axioms Qed.Subscription.wrap_noop_when_keys_unchanged
-#print axioms Qed.fullstack_ws_closure_sound
 #print axioms Qed.Server.external_ws_url_preserves_origin
 #print axioms Qed.Server.srvFinishEmit_err_no_emits
 #print axioms Qed.Server.srvAtomicCommitEmit_err_no_emits

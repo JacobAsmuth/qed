@@ -97,7 +97,7 @@ enum DoneEvent {
         token: u64,
         ws_ctx: LeanRef,
         consumed: usize,
-        out_wire: WireBytes,
+        out_wire: Option<WireBytes>,
         close: bool,
         new_frag: Option<LeanRef>,
         ops: Vec<SubOp>,
@@ -416,7 +416,7 @@ fn exec_pool_job(cbs: &Callbacks, job: PoolJob) {
                         token,
                         ws_ctx,
                         consumed: rx_bytes.len(),
-                        out_wire: WireBytes(LeanRef(mk_ba(&[]))),
+                        out_wire: None,
                         close: true,
                         new_frag: None,
                         ops: Vec::new(),
@@ -450,7 +450,7 @@ fn exec_pool_job(cbs: &Callbacks, job: PoolJob) {
                         token,
                         ws_ctx,
                         consumed,
-                        out_wire,
+                        out_wire: Some(out_wire),
                         close: close_flag != 0,
                         new_frag: Some(LeanRef(new_frag_ptr)),
                         ops,
@@ -662,12 +662,13 @@ fn peer_ip_string(storage: &libc::sockaddr_storage) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
+const SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+#[cfg(not(target_os = "linux"))]
+const SEND_FLAGS: libc::c_int = 0;
+
 fn send_nonblock(fd: libc::c_int, data: &[u8]) -> isize {
-    #[cfg(target_os = "linux")]
-    let flags = libc::MSG_NOSIGNAL;
-    #[cfg(not(target_os = "linux"))]
-    let flags = 0;
-    unsafe { libc::send(fd, data.as_ptr() as *const libc::c_void, data.len(), flags) }
+    unsafe { libc::send(fd, data.as_ptr() as *const libc::c_void, data.len(), SEND_FLAGS) }
 }
 
 fn send_two_nonblock(fd: libc::c_int, a: &[u8], b: &[u8]) -> isize {
@@ -678,11 +679,7 @@ fn send_two_nonblock(fd: libc::c_int, a: &[u8], b: &[u8]) -> isize {
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = iovs.as_ptr() as *mut libc::iovec;
     msg.msg_iovlen = 2 as _;
-    #[cfg(target_os = "linux")]
-    let flags = libc::MSG_NOSIGNAL;
-    #[cfg(not(target_os = "linux"))]
-    let flags = 0;
-    unsafe { libc::sendmsg(fd, &msg, flags) }
+    unsafe { libc::sendmsg(fd, &msg, SEND_FLAGS) }
 }
 
 // ---- Per-Connection & Per-Worker State ----
@@ -851,7 +848,6 @@ struct Worker {
     inbox: Arc<WorkerInbox>,
     pool: Arc<BlockingPool>,
     cbs: Arc<Callbacks>,
-    init_frag: LeanRef,
     next_token: u64,
     conns: HashMap<u64, Conn>,
     topics: HashMap<String, TopicSubs>,
@@ -915,20 +911,18 @@ impl Conn {
     }
 }
 
-impl Worker {
-    fn topic_add(&mut self, topic: String, token: u64, sub_id: u32) {
-        if self.topics.entry(topic).or_default().insert((token, sub_id)) {
-            self.inbox.ws_subs.fetch_add(1, Ordering::Release);
+fn topic_remove_from(topics: &mut HashMap<String, TopicSubs>, inbox: &WorkerInbox, topic: &str, token: u64, sub_id: u32) {
+    if let Some(subs) = topics.get_mut(topic) {
+        if subs.remove((token, sub_id)) {
+            inbox.ws_subs.fetch_sub(1, Ordering::Release);
         }
+        if subs.is_empty() { topics.remove(topic); }
     }
+}
 
+impl Worker {
     fn topic_remove(&mut self, topic: &str, token: u64, sub_id: u32) {
-        if let Some(subs) = self.topics.get_mut(topic) {
-            if subs.remove((token, sub_id)) {
-                self.inbox.ws_subs.fetch_sub(1, Ordering::Release);
-            }
-            if subs.is_empty() { self.topics.remove(topic); }
-        }
+        topic_remove_from(&mut self.topics, &self.inbox, topic, token, sub_id);
     }
 
     fn accept_all(&mut self) {
@@ -1012,7 +1006,7 @@ impl Worker {
                 let step = if let Some(conn) = self.conns.get_mut(&token) {
                     conn.in_flight = false;
                     conn.last_active = Instant::now();
-                    conn.apply_head_outcome(&self.poller, &self.init_frag, 0, outcome)
+                    conn.apply_head_outcome(&self.poller, &self.cbs.init_frag, 0, outcome)
                 } else { ConnStep::Done };
                 self.finish_step(token, step);
             }
@@ -1025,53 +1019,53 @@ impl Worker {
                 self.finish_step(token, step);
             }
             DoneEvent::WsStep { token, ws_ctx, consumed, out_wire, close, new_frag, ops } => {
-                if !self.conns.contains_key(&token) {
-                    // Connection closed while step was in flight: clean up any newly joined channels.
+                let step = {
+                    let Worker { conns, topics, inbox, poller, pool, .. } = self;
+                    let Some(conn) = conns.get_mut(&token) else {
+                        // Connection closed while step was in flight: clean up any newly joined channels.
+                        for op in ops {
+                            if let SubOp::Add(_, _, channel, params) = op {
+                                pool.submit_leave(PoolJob::WsLeave {
+                                    ws_ctx: ws_ctx.clone(),
+                                    channel,
+                                    params,
+                                });
+                            }
+                        }
+                        return;
+                    };
                     for op in ops {
-                        if let SubOp::Add(_, _, channel, params) = op {
-                            self.pool.submit_leave(PoolJob::WsLeave {
-                                ws_ctx: ws_ctx.clone(),
-                                channel,
-                                params,
-                            });
+                        let sid = match &op { SubOp::Add(s, ..) | SubOp::Remove(s) => *s };
+                        if let Some(i) = conn.subs.iter().position(|s| s.sub_id == sid) {
+                            let ot = conn.subs.swap_remove(i).topic;
+                            topic_remove_from(topics, inbox, &ot, token, sid);
+                        }
+                        if let SubOp::Add(sid, topic, channel, params) = op {
+                            conn.subs.push(WsSub { sub_id: sid, topic: topic.clone(), channel, params });
+                            if topics.entry(topic).or_default().insert((token, sid)) {
+                                inbox.ws_subs.fetch_add(1, Ordering::Release);
+                            }
                         }
                     }
-                    return;
-                }
-                for op in ops {
-                    let sid = match &op { SubOp::Add(s, ..) | SubOp::Remove(s) => *s };
-                    let old = self.conns.get_mut(&token).and_then(|c| {
-                        c.subs.iter().position(|s| s.sub_id == sid).map(|i| c.subs.swap_remove(i).topic)
-                    });
-                    if let Some(ot) = old { self.topic_remove(&ot, token, sid); }
-                    if let SubOp::Add(sid, topic, channel, params) = op {
-                        if let Some(c) = self.conns.get_mut(&token) {
-                            c.subs.push(WsSub { sub_id: sid, topic: topic.clone(), channel, params });
-                        }
-                        self.topic_add(topic, token, sid);
-                    }
-                }
-                let mut resume = false;
-                let mut close_now = false;
-                if let Some(conn) = self.conns.get_mut(&token) {
                     conn.in_flight = false;
                     if consumed > 0 {
                         conn.rx.consume(consumed);
                         conn.last_active = Instant::now();
                     }
                     if let Some(f) = new_frag { conn.frag = Some(f); }
-                    let sent = conn.queue_bytes(&self.poller, out_wire.as_slice());
+                    let sent = out_wire.as_ref().map_or(true, |w| conn.queue_bytes(poller, w.as_slice()));
                     if !sent || close {
                         conn.close_after_tx = true;
-                        if !sent || conn.tx.is_empty() { close_now = true; }
+                        if !sent || conn.tx.is_empty() { ConnStep::Close } else { ConnStep::Done }
                     } else if conn.ready_to_close() {
-                        close_now = true;
+                        ConnStep::Close
                     } else if !conn.rx.is_empty() && consumed > 0 {
-                        resume = true;
+                        ConnStep::Continue
+                    } else {
+                        ConnStep::Done
                     }
-                }
-                if close_now { self.close_conn(token); }
-                else if resume { self.process_rx(token); }
+                };
+                self.finish_step(token, step);
             }
         }
     }
@@ -1092,6 +1086,16 @@ impl Worker {
             }
         }
         for t in to_close { self.close_conn(t); }
+    }
+
+    fn reject_overloaded(&mut self, token: u64) {
+        let close = self.conns.get_mut(&token).is_some_and(|conn| {
+            conn.in_flight = false;
+            let sent = conn.queue_bytes(&self.poller, RESP_503_WIRE);
+            conn.close_after_tx = true;
+            !sent || conn.tx.is_empty()
+        });
+        if close { self.close_conn(token); }
     }
 
     fn process_rx(&mut self, token: u64) {
@@ -1154,10 +1158,7 @@ impl Worker {
                     keep_alive: pb.keep_alive,
                     inbox: self.inbox.clone(),
                 }) {
-                    conn.in_flight = false;
-                    let sent = conn.queue_bytes(&self.poller, RESP_503_WIRE);
-                    conn.close_after_tx = true;
-                    if !sent || conn.tx.is_empty() { self.close_conn(token); }
+                    self.reject_overloaded(token);
                 }
                 return;
             }
@@ -1197,14 +1198,11 @@ impl Worker {
                         ip,
                         inbox: self.inbox.clone(),
                     }) {
-                        conn.in_flight = false;
-                        let sent = conn.queue_bytes(&self.poller, RESP_503_WIRE);
-                        conn.close_after_tx = true;
-                        if !sent || conn.tx.is_empty() { self.close_conn(token); }
+                        self.reject_overloaded(token);
                     }
                     return;
                 }
-                outcome => match conn.apply_head_outcome(&self.poller, &self.init_frag, consume_len, outcome) {
+                outcome => match conn.apply_head_outcome(&self.poller, &self.cbs.init_frag, consume_len, outcome) {
                     ConnStep::Continue => continue,
                     ConnStep::Done => return,
                     ConnStep::Close => { self.close_conn(token); return; }
@@ -1361,7 +1359,7 @@ pub unsafe extern "C" fn qed_server_run(
     );
     let _ = io::stdout().flush();
 
-    let run_worker = |lfd: libc::c_int, inbox: Arc<WorkerInbox>, pool_c: Arc<BlockingPool>, cbs_c: Arc<Callbacks>, init_frag_c: LeanRef| {
+    let run_worker = |lfd: libc::c_int, inbox: Arc<WorkerInbox>, pool_c: Arc<BlockingPool>, cbs_c: Arc<Callbacks>| {
         let Ok(poller) = Poller::new() else {
             eprintln!("✗ failed to initialize poller");
             unsafe { libc::close(lfd) };
@@ -1375,7 +1373,6 @@ pub unsafe extern "C" fn qed_server_run(
             inbox,
             pool: pool_c,
             cbs: cbs_c,
-            init_frag: init_frag_c,
             next_token: 16,
             conns: HashMap::new(),
             topics: HashMap::new(),
@@ -1383,20 +1380,20 @@ pub unsafe extern "C" fn qed_server_run(
     };
 
     let handles: Vec<_> = (1..num_workers).map(|i| {
-        let (inbox, pool_c, cbs_c, init_frag_c) = (inboxes[i as usize].clone(), pools[i as usize].clone(), cbs.clone(), cbs.init_frag.clone());
+        let (inbox, pool_c, cbs_c) = (inboxes[i as usize].clone(), pools[i as usize].clone(), cbs.clone());
         #[cfg(not(target_os = "linux"))]
         let shared_fd = libc::dup(first_fd);
         thread::spawn(move || {
             unsafe { lean_initialize_thread() };
             #[cfg(target_os = "linux")]
             match create_listener(bind_ip, port, true) {
-                Ok(lfd) => run_worker(lfd, inbox, pool_c, cbs_c, init_frag_c),
+                Ok(lfd) => run_worker(lfd, inbox, pool_c, cbs_c),
                 Err(e) => eprintln!("✗ worker {i} failed to bind {bind_ip}:{port}: {e}"),
             }
             #[cfg(not(target_os = "linux"))]
             {
                 if shared_fd >= 0 {
-                    run_worker(shared_fd, inbox, pool_c, cbs_c, init_frag_c);
+                    run_worker(shared_fd, inbox, pool_c, cbs_c);
                 } else {
                     eprintln!("✗ worker {i} failed to dup listener socket");
                 }
@@ -1405,7 +1402,7 @@ pub unsafe extern "C" fn qed_server_run(
         })
     }).collect();
 
-    run_worker(first_fd, inboxes[0].clone(), pools[0].clone(), cbs.clone(), cbs.init_frag.clone());
+    run_worker(first_fd, inboxes[0].clone(), pools[0].clone(), cbs.clone());
     STOP.store(true, Ordering::SeqCst);
     for inbox in &inboxes { inbox.force_wake(); }
     for h in handles { let _ = h.join(); }

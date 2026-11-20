@@ -592,49 +592,39 @@ private def parseHostPort (url auth : String) (defaultPort : UInt16) :
 def parseHttpUrl (url : String) : Except String ParsedUrl :=
   if hasCtlOrCrlf url false || url.contains ' ' then
     .error s!"invalid outbound HTTP URL: {url}"
-  else if url.startsWith "https://" then
-    match splitAuthorityAndPath (String.ofList (url.toList.drop 8)) with
-    | some (auth, path) =>
-        (parseHostPort url auth 443).map fun (host, isIpv6, port) =>
-          { isTls := true, host, isIpv6, port, pathAndQuery := path }
-    | none => .error s!"invalid URL authority: {url}"
-  else if url.startsWith "http://" then
-    match splitAuthorityAndPath (String.ofList (url.toList.drop 7)) with
-    | some (auth, path) =>
-        (parseHostPort url auth 80).map fun (host, isIpv6, port) =>
-          { isTls := false, host, isIpv6, port, pathAndQuery := path }
-    | none => .error s!"invalid URL authority: {url}"
   else
-    .error s!"unsupported URL scheme: {url}"
+    let scheme? : Option (Bool × UInt16 × Nat) :=
+      if url.startsWith "https://" then some (true, 443, 8)
+      else if url.startsWith "http://" then some (false, 80, 7)
+      else none
+    match scheme? with
+    | none => .error s!"unsupported URL scheme: {url}"
+    | some (isTls, defPort, dropLen) =>
+        match splitAuthorityAndPath (String.ofList (url.toList.drop dropLen)) with
+        | some (auth, path) =>
+            (parseHostPort url auth defPort).map fun (host, isIpv6, port) =>
+              { isTls, host, isIpv6, port, pathAndQuery := path }
+        | none => .error s!"invalid URL authority: {url}"
 
 theorem parseHttpUrl_no_fragment (url : String) (u : ParsedUrl)
     (h : parseHttpUrl url = .ok u) : '#' ∉ u.pathAndQuery.toList := by
   unfold parseHttpUrl at h
   split at h
   · cases h
-  · split at h
-    · cases hsp : splitAuthorityAndPath (String.ofList (url.toList.drop 8)) with
+  · dsimp only at h
+    split at h
+    · cases h
+    · rename_i isTls defPort dropLen _
+      cases hsp : splitAuthorityAndPath (String.ofList (url.toList.drop dropLen)) with
       | none => simp [hsp] at h
       | some ap =>
           simp only [hsp] at h
-          cases hhp : parseHostPort url ap.1 443 with
+          cases hhp : parseHostPort url ap.1 defPort with
           | error e => simp [hhp, Except.map] at h
           | ok hp =>
               simp only [hhp, Except.map, Except.ok.injEq] at h
               subst h
               exact splitAuthorityAndPathGo_no_hash [] _ ap.1 ap.2 hsp
-    · split at h
-      · cases hsp : splitAuthorityAndPath (String.ofList (url.toList.drop 7)) with
-        | none => simp [hsp] at h
-        | some ap =>
-            simp only [hsp] at h
-            cases hhp : parseHostPort url ap.1 80 with
-            | error e => simp [hhp, Except.map] at h
-            | ok hp =>
-                simp only [hhp, Except.map, Except.ok.injEq] at h
-                subst h
-                exact splitAuthorityAndPathGo_no_hash [] _ ap.1 ap.2 hsp
-      · cases h
 
 /-- Serializes a validated outbound HTTP/1.1 request wire buffer, rejecting invalid method tokens
     and CRLF/control header injection. -/

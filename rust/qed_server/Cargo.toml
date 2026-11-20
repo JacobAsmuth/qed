@@ -7,12 +7,9 @@ edition = "2021"
 crate-type = ["staticlib"]
 
 [dependencies]
-getrandom = "0.2"
-hmac = "0.12"
 libc = "0.2"
-rsa = { version = "0.9", features = ["sha2"] }
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-sha2 = "0.10"
 webpki-roots = "0.26"
 
 [build-dependencies]

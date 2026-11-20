@@ -4,13 +4,11 @@ use std::os::fd::FromRawFd;
 use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hmac::{Hmac, Mac};
-use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::{Pkcs1v15Sign, RsaPrivateKey};
-use sha2::{Digest, Sha256};
+use ring::hmac;
+use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 
-use crate::last_errno;
+use crate::{last_errno, parse_pem_blocks};
 use crate::lean_ffi::*;
 
 const MAX_STATIC_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -201,7 +199,7 @@ pub unsafe extern "C" fn qed_server_now_ms() -> *mut LeanObj {
 pub unsafe extern "C" fn qed_server_random_hex(num_bytes: u32) -> *mut LeanObj {
     if num_bytes == 0 { return qed_lean_io_mk_ok(mk_str("")); }
     let mut raw = vec![0u8; (num_bytes as usize).min(65536)];
-    if getrandom::getrandom(&mut raw).is_err() {
+    if SystemRandom::new().fill(&mut raw).is_err() {
         return qed_lean_io_mk_err(c"CSPRNG failure".as_ptr());
     }
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -215,9 +213,9 @@ pub unsafe extern "C" fn qed_server_random_hex(num_bytes: u32) -> *mut LeanObj {
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_hmac_sha256(key_obj: *mut LeanObj, msg_obj: *mut LeanObj) -> *mut LeanObj {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(ba_slice(key_obj)).expect("HMAC key");
-    mac.update(ba_slice(msg_obj));
-    qed_lean_io_mk_ok(mk_ba(&mac.finalize().into_bytes()))
+    let key = hmac::Key::new(hmac::HMAC_SHA256, ba_slice(key_obj));
+    let tag = hmac::sign(&key, ba_slice(msg_obj));
+    qed_lean_io_mk_ok(mk_ba(tag.as_ref()))
 }
 
 #[no_mangle]
@@ -226,20 +224,31 @@ pub unsafe extern "C" fn qed_server_hmac_sha256_verify(
     msg_obj: *mut LeanObj,
     sig_obj: *mut LeanObj,
 ) -> *mut LeanObj {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(ba_slice(key_obj)).expect("HMAC key");
-    mac.update(ba_slice(msg_obj));
-    let ok: usize = if mac.verify_slice(ba_slice(sig_obj)).is_ok() { 1 } else { 0 };
+    let key = hmac::Key::new(hmac::HMAC_SHA256, ba_slice(key_obj));
+    let ok: usize = if hmac::verify(&key, ba_slice(msg_obj), ba_slice(sig_obj)).is_ok() { 1 } else { 0 };
     qed_lean_io_mk_ok(qed_lean_box(ok))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_rsa_sha256_sign(pem_obj: *mut LeanObj, msg_obj: *mut LeanObj) -> *mut LeanObj {
     let pem = str_slice(pem_obj);
-    let Ok(key) = RsaPrivateKey::from_pkcs8_pem(pem).or_else(|_| RsaPrivateKey::from_pkcs1_pem(pem)) else {
+    let key_pair = parse_pem_blocks(pem, "PRIVATE KEY")
+        .into_iter()
+        .next()
+        .and_then(|der| RsaKeyPair::from_pkcs8(&der).ok())
+        .or_else(|| {
+            parse_pem_blocks(pem, "RSA PRIVATE KEY")
+                .into_iter()
+                .next()
+                .and_then(|der| RsaKeyPair::from_der(&der).ok())
+        });
+    let Some(key_pair) = key_pair else {
         return mk_io_except_err("failed to parse RSA private key PEM");
     };
-    match key.sign(Pkcs1v15Sign::new::<Sha256>(), &Sha256::digest(ba_slice(msg_obj))) {
-        Ok(sig) => mk_io_except_ok(mk_ba(&sig)),
-        Err(e) => mk_io_except_err(&format!("RSA-SHA256 signing failed: {e}")),
+    let rng = SystemRandom::new();
+    let mut sig = vec![0u8; key_pair.public().modulus_len()];
+    match key_pair.sign(&RSA_PKCS1_SHA256, &rng, ba_slice(msg_obj), &mut sig) {
+        Ok(()) => mk_io_except_ok(mk_ba(&sig)),
+        Err(_) => mk_io_except_err("RSA-SHA256 signing failed"),
     }
 }

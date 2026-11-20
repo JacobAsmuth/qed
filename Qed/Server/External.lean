@@ -50,7 +50,7 @@ instance {σ : Type} (svc base method : String) (parts : List PathPart) (query :
     unfold execExternalRaw
     cases buildExternalSuffix parts query with
     | error e => exact .pure (Except.error e)
-    | ok sfx  => exact .httpCall _ _ fun res => .pure (res.bind checkHttpOk)
+    | ok sfx  => exact .io (.httpCall _) _ fun res => .pure (res.bind checkHttpOk)
 
 @[specialize]
 def decodeRespBytes (res : Except ApiError OutboundResp) : Except ApiError Bytes :=
@@ -122,11 +122,11 @@ def postBytes {m : Type → Type} [Monad m] [MonadServer m]
 instance {σ Payload Resp : Type} [ToJson Payload] [FromJson Resp]
     (url : WebhookUrl) (payload : Payload) :
     SafeIO (postJson (Payload := Payload) (Resp := Resp) (m := ThreadProg σ) url payload) where
-  noAtomic := by unfold postJson postRaw; exact .httpCall _ _ fun res => .pure (decodeRespJson (res.bind checkHttpOk))
+  noAtomic := by unfold postJson postRaw; exact .io (.httpCall _) _ fun res => .pure (decodeRespJson (res.bind checkHttpOk))
 
 instance {σ : Type} (url : WebhookUrl) (mime : String) (body : Bytes) :
     SafeIO (postBytes (m := ThreadProg σ) url mime body) where
-  noAtomic := by unfold postBytes postRaw; exact .httpCall _ _ fun res => .pure (decodeRespBytes (res.bind checkHttpOk))
+  noAtomic := by unfold postBytes postRaw; exact .io (.httpCall _) _ fun res => .pure (decodeRespBytes (res.bind checkHttpOk))
 
 end Webhook
 
@@ -418,11 +418,21 @@ private def classifyExtWsCodec (ty : ParsedSrvType) : Qed.ExtWsCodec :=
     else .json
 
 open Lean Elab Command in
-private def buildExtPropConj (ps : Array Term) : CommandElabM Term := do
+def buildPropConj (ps : Array Term) : CommandElabM Term := do
   match ps.toList with
   | [] => `(True)
-  | [p] => pure p
   | p :: rest => rest.foldlM (init := p) fun acc q => `($acc ∧ $q)
+
+open Lean Elab Command in
+def elabParamTypeAbbrevs (refIdent : Ident) (ownerName fullOwnerName itemName : Name)
+    (suffix : String) (tyTerms : Array Term) : CommandElabM (Array Name) := do
+  let mut consts : Array Name := #[]
+  for (pTy, i) in tyTerms.zipIdx do
+    let leaf := itemName.appendAfter s!"{suffix}{i}"
+    let pTyId := mkIdentFrom refIdent (ownerName ++ leaf)
+    elabCommand (← `(command| abbrev $pTyId : Type := $pTy))
+    consts := consts.push (fullOwnerName ++ leaf)
+  return consts
 
 open Lean Elab Command in
 private def elabExternalWsChannel (svcName fullSvcName : Name) (svcNameStr : String) (baseId : Ident)
@@ -503,18 +513,14 @@ private def elabExternalWsChannel (svcName fullSvcName : Name) (svcNameStr : Str
   -- Emit `<Svc>.<ch>_Event` & param type aliases
   let evAbbrevId := mkIdentFrom chIdent (svcName ++ chName.appendAfter "_Event")
   elabCommand (← `(command| abbrev $evAbbrevId : Type := $evTyTerm))
-  let mut paramTypeConsts : Array Name := #[]
-  for (pTy, i) in pTyTerms.zipIdx do
-    let pTyId := mkIdentFrom chIdent (svcName ++ chName.appendAfter s!"_Param_{i}")
-    elabCommand (← `(command| abbrev $pTyId : Type := $pTy))
-    paramTypeConsts := paramTypeConsts.push (fullSvcName ++ chName.appendAfter s!"_Param_{i}")
+  let paramTypeConsts ← elabParamTypeAbbrevs chIdent svcName fullSvcName chName "_Param_" pTyTerms
 
   -- Emit `<Svc>.<ch>_req` if `requires` present
   let mut reqConst? : Option Name := none
   let mut reqLabel := ""
   if !reqExprs.isEmpty then
     let reqProps ← reqExprs.mapM fun e => liftMacroM <| Qed.Lang.lowerSimpleQedExpr .propInv e
-    let reqConj ← buildExtPropConj reqProps
+    let reqConj ← buildPropConj reqProps
     let reqId := mkIdentFrom chIdent (svcName ++ chName.appendAfter "_req")
     elabCommand (← `(command|
       set_option linter.unusedVariables false in
@@ -582,7 +588,7 @@ private def elabExternalWsChannel (svcName fullSvcName : Name) (svcNameStr : Str
     sendParamTypeConsts := #[fullSvcName ++ chName.appendAfter "_SendParam_0"]
     if !sendReqExprs.isEmpty then
       let sProps ← sendReqExprs.mapM fun e => liftMacroM <| Qed.Lang.lowerSimpleQedExpr .propInv e
-      let sConj ← buildExtPropConj sProps
+      let sConj ← buildPropConj sProps
       let sReqId := mkIdentFrom chIdent (svcName ++ chName.appendAfter "_send_req")
       elabCommand (← `(command|
         set_option linter.unusedVariables false in

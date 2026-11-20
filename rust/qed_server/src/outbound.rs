@@ -38,46 +38,6 @@ impl ServerCertVerifier for NoVerify {
 
 static TLS_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
 
-fn decode_b64_pem_body(body: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(body.len() * 3 / 4);
-    let mut buf: u32 = 0;
-    let mut bits: u8 = 0;
-    for b in body.bytes() {
-        let val = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' | b'\r' | b'\n' | b' ' | b'\t' => continue,
-            _ => return None,
-        };
-        buf = (buf << 6) | (val as u32);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((buf >> bits) & 0xFF) as u8);
-        }
-    }
-    if out.is_empty() { None } else { Some(out) }
-}
-
-fn parse_pem_certs(pem: &str) -> Vec<CertificateDer<'static>> {
-    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
-    const END: &str = "-----END CERTIFICATE-----";
-    let mut certs = Vec::new();
-    let mut rest = pem;
-    while let Some(start) = rest.find(BEGIN) {
-        let after_begin = &rest[start + BEGIN.len()..];
-        let Some(end) = after_begin.find(END) else { break };
-        if let Some(der) = decode_b64_pem_body(&after_begin[..end]) {
-            certs.push(CertificateDer::from(der));
-        }
-        rest = &after_begin[end + END.len()..];
-    }
-    certs
-}
-
 fn load_extra_ca_certs(roots: &mut RootCertStore) {
     let path = std::env::var("QED_CA_CERT_FILE")
         .ok()
@@ -86,7 +46,10 @@ fn load_extra_ca_certs(roots: &mut RootCertStore) {
     let Some(path) = path else { return };
     match std::fs::read_to_string(&path) {
         Ok(pem) => {
-            let certs = parse_pem_certs(&pem);
+            let certs: Vec<CertificateDer<'static>> = crate::parse_pem_blocks(&pem, "CERTIFICATE")
+                .into_iter()
+                .map(CertificateDer::from)
+                .collect();
             let (added, ignored) = roots.add_parsable_certificates(certs);
             if added == 0 {
                 eprintln!("warning: no valid CA certificates loaded from `{path}` (ignored: {ignored})");

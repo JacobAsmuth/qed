@@ -15,7 +15,7 @@ function toHex(buf) {
 export function makeHandler(mod, opts = {}) {
   const app = mod.app();
   const title = opts.title ?? 'app';
-  const script = opts.script ?? '/qed.js';
+  const script = opts.script ?? '/qed_host.mjs';
   const maxRounds = opts.maxRounds ?? 8;
   const doFetch = opts.fetch ?? ((...args) => fetch(...args));
 

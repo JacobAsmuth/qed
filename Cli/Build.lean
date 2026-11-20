@@ -146,39 +146,30 @@ private def cleanStaleHashedAssets (outDir : FilePath) : IO Unit := do
       if isHashedManagedAsset entry.fileName then
         removeIfExists entry.path
 
+private def hashAsset (outDir : FilePath) (stem : String)
+    (rewrites : List (String × String) := []) : IO String := do
+  let orig := outDir / s!"{stem}.mjs"
+  let raw ← IO.FS.readFile orig
+  let rewritten := rewrites.foldl (fun acc (oldSpec, newSpec) => replaceJsImport acc oldSpec newSpec) raw
+  let hashed := s!"{stem}.{shortContentHash rewritten.toUTF8}.mjs"
+  IO.FS.writeFile (outDir / hashed) rewritten
+  removeIfExists orig
+  return hashed
+
 /-- Emits content-hashed immutable production client assets (`<name>.<12-hex>.(mjs|css)`),
     rewrites ESM import specifiers bottom-up, updates `index.html` and `ssr.mjs`, and writes
     `qed_manifest.json` so native servers and tooling resolve the hashed entrypoints. -/
 private def finalizeProdAssets (outDir : FilePath) (hasStylesCss : Bool) (stylesheets : List String)
     (ssrAppName? : Option String) : IO Unit := do
   cleanStaleHashedAssets outDir
-  let rtRaw ← IO.FS.readFile (outDir / "qed_rt.mjs")
-  let rtFile := s!"qed_rt.{shortContentHash rtRaw.toUTF8}.mjs"
-  IO.FS.writeFile (outDir / rtFile) rtRaw
-  removeIfExists (outDir / "qed_rt.mjs")
-
-  let domRaw ← IO.FS.readFile (outDir / "qed_dom.mjs")
-  let domRewritten := replaceJsImport domRaw "./qed_rt.mjs" s!"./{rtFile}"
-  let domFile := s!"qed_dom.{shortContentHash domRewritten.toUTF8}.mjs"
-  IO.FS.writeFile (outDir / domFile) domRewritten
-  removeIfExists (outDir / "qed_dom.mjs")
-
-  let appRaw ← IO.FS.readFile (outDir / "app.mjs")
-  let appRewritten := replaceJsImport appRaw "./qed_rt.mjs" s!"./{rtFile}"
-  let appFile := s!"app.{shortContentHash appRewritten.toUTF8}.mjs"
-  IO.FS.writeFile (outDir / appFile) appRewritten
-  removeIfExists (outDir / "app.mjs")
-
-  let hostRaw ← IO.FS.readFile (outDir / "qed_host.mjs")
-  let hostRewritten :=
-    replaceJsImport
-      (replaceJsImport
-        (replaceJsImport hostRaw "./app.mjs" s!"./{appFile}")
-        "./qed_rt.mjs" s!"./{rtFile}")
-      "./qed_dom.mjs" s!"./{domFile}"
-  let hostFile := s!"qed_host.{shortContentHash hostRewritten.toUTF8}.mjs"
-  IO.FS.writeFile (outDir / hostFile) hostRewritten
-  removeIfExists (outDir / "qed_host.mjs")
+  let rtFile ← hashAsset outDir "qed_rt"
+  let domFile ← hashAsset outDir "qed_dom" [("./qed_rt.mjs", s!"./{rtFile}")]
+  let appFile ← hashAsset outDir "app" [("./qed_rt.mjs", s!"./{rtFile}")]
+  let hostFile ← hashAsset outDir "qed_host" [
+    ("./app.mjs", s!"./{appFile}"),
+    ("./qed_rt.mjs", s!"./{rtFile}"),
+    ("./qed_dom.mjs", s!"./{domFile}")
+  ]
 
   let mut stylesHref := "/styles.css"
   let mut stylesEntry := ""
@@ -236,7 +227,7 @@ private def resolveLinkMeta (cObjTargets : Array String) :
   fullstackLinkCache.set (some (cObjTargets, linkInputs))
   return some linkInputs
 
-private def compileClientMain (mod appExpr : String) (isInRepo prod : Bool) :
+private def compileClientMain (leanPath mod appExpr : String) (isInRepo prod : Bool) :
     IO (Option (FilePath × FilePath)) := do
   let fwRoot ← if isInRepo then pure (FilePath.mk ".") else frameworkHome
   let genDir : FilePath := ".qed" / "gen" / mod
@@ -249,7 +240,7 @@ private def compileClientMain (mod appExpr : String) (isInRepo prod : Bool) :
   let mut cliDeps : Array FilePath := #[cliLean, modOlean]
   if ← drvOlean.pathExists then cliDeps := cliDeps.push drvOlean
   if cliChanged || prod || !(← isUpToDate cliOlean cliDeps) then
-    if (← shLakeBuild #["env", "lean", "-R", genDir.toString, cliLean.toString, "-o", cliOlean.toString]) != 0 then
+    if (← shLean leanPath #["-R", genDir.toString, cliLean.toString, "-o", cliOlean.toString]) != 0 then
       return none
   return some (genDir, cliOlean)
 
@@ -283,7 +274,7 @@ def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool)
 
   -- 1. Synthesize & compile client entrypoint → `app.mjs` (enforcing `verifyNoServerLeakInClient`)
   let tClient ← IO.asTask do
-    let some (_, cliOlean) ← compileClientMain mod s!"{fsName}.clientApp" isInRepo prod | return false
+    let some (_, cliOlean) ← compileClientMain q.leanPath mod s!"{fsName}.clientApp" isInRepo prod | return false
     if prod || !(← isUpToDate appMjs #[cliOlean, q.bin, rtPath, modOlean]) then
       let minArgs := if prod then #["--min"] else #[]
       let rtArgs := #["--rt", rtPath.toString]
@@ -306,7 +297,7 @@ def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool)
     let linkFiles := linkInputs.map FilePath.mk
     let srvCDeps := #[srvLean, modOlean] ++ linkFiles
     if srvChanged || prod || !(← isUpToDate srvC srvCDeps) then
-      if (← shLakeBuild #["env", "lean", "-R", genDir.toString, srvLean.toString, "-c", srvC.toString]) != 0 then
+      if (← shLean q.leanPath #["-R", genDir.toString, srvLean.toString, "-c", srvC.toString]) != 0 then
         return false
     let linkDeps := #[srvC] ++ linkFiles
     if prod || !(← isUpToDate srvBin linkDeps) then
@@ -327,13 +318,15 @@ def buildFullstack (mod fsName : String) (outDir : FilePath) (prod : Bool)
 
 def buildJs (outDir : FilePath) (prod : Bool) (alreadyBuilt : Bool := false) : IO Bool := do
   let mod ← jsRoot
-  if let some fsName ← fullstackAppName mod then
+  let mode ← resolveAppMode mod
+  if let .fullstack fsName := mode then
     return ← buildFullstack mod fsName outDir prod alreadyBuilt
   let isInRepo ← (FilePath.mk "Examples").pathExists
   let prebuilt := (← env "QED_PREBUILT") == some "1"
-  let explicitSsr ← ssrAppName mod
-  let autoComp ← if explicitSsr.isSome then pure none else componentAppName mod
-  let ssrOpt := explicitSsr.orElse (fun _ => autoComp)
+  let (autoComp, ssrOpt) : Option String × Option String := match mode with
+    | .ssr appName       => (none, some appName)
+    | .component appName => (some appName, some appName)
+    | _                  => (none, none)
   if !prebuilt && !alreadyBuilt then
     let targets := #[mod] ++ (if autoComp.isSome then #["Qed.Driver"] else #[]) ++ (if isInRepo then #["qedjs"] else #[])
     if (← shLakeBuild (#["build"] ++ targets)) != 0 then return false
@@ -352,7 +345,7 @@ def buildJs (outDir : FilePath) (prod : Bool) (alreadyBuilt : Bool := false) : I
     | some appName => #["--also", (outDir / "ssr_app.mjs").toString, "--", s!"{appName}:app", "Qed.App.ssrStep:ssrStep"]
     | none => #[]
   if let some appName := autoComp then
-    let some (genDir, _) ← compileClientMain mod appName isInRepo prod | return false
+    let some (genDir, _) ← compileClientMain q.leanPath mod appName isInRepo prod | return false
     if !(← q.run (minArgs ++ rtArgs ++ #[(outDir / "app.mjs").toString, "ClientMain", "--"] ++ driverEntries ++ alsoArgs) (extraPath := some genDir.toString)) then
       return false
   else

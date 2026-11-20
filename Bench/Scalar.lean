@@ -1,5 +1,5 @@
 import Qed
-open Qed (View App cls onClick)
+open Qed (View Html App cls onClick)
 open Qed.Internal (mkApp)
 open Qed.V
 
@@ -33,5 +33,19 @@ def template : View Model Msg :=
   ]
 
 def app : App Model Msg := mkApp init (fun m msg => (update m msg, .none)) template
+
+def viewDiff (m : Model) : Html Msg :=
+  Html.element "div" [] [
+    Html.element "button" [onClick .bump] [Html.text "bump"],
+    Html.element "div" [cls "grid"]
+      ((List.range n).map fun i =>
+        if i % 20 == 0 then
+          Html.element "div" [cls "cell"] [Html.text (toString (m.vals.getD i 0))]
+        else
+          Html.element "div" [cls "cell"] [Html.text s!"static cell {i}"])
+  ]
+
+def diffApp : App Model Msg :=
+  mkApp init (fun m msg => (update m msg, .none)) (View.ofHtml viewDiff)
 
 end BenchScalar

@@ -299,8 +299,6 @@ end
 @[simp] theorem evalJsExprList_map (env : String → JsVal) : ∀ (xs : List α) (f : α → JsExpr), evalJsExprList env (xs.map f) = xs.map (fun x => evalJsExpr env (f x))
   | [], _ => rfl | x :: xs, f => by simp [evalJsExprList, evalJsExprList_map env xs f]
 theorem jsTag_lowerCtor (env : String → JsVal) (info : CtorInfo) (ys : Array Arg) : jsTag (evalJsExpr env (lowerCtor info ys)) = info.cidx := by unfold lowerCtor; split <;> simp [evalJsExpr, jsTag]
-theorem eval_case_scrut_lowerCtor (env : String → JsVal) (x : VarId) (info : CtorInfo) (ys : Array Arg) (hx : env (v x) = evalJsExpr env (lowerCtor info ys)) :
-    evalJsExpr env (.call "$.tag" [.var (v x)]) = .num info.cidx := by simp [evalJsExpr, hx, jsTag_lowerCtor]
 theorem fieldProj_lowerCtor (c : Ctx) (ty : IRType) (env : String → JsVal) (x : VarId) (info : CtorInfo) (ys : Array Arg) (idx : Nat)
     (hboxed : ¬(info.size == 0 && info.usize == 0 && info.ssize == 0) = true) (hidx : idx < ys.toList.length) (hx : env (v x) = evalJsExpr env (lowerCtor info ys)) :
     evalJsExpr env (lowerExpr c ty (.proj idx x)) = evalJsExpr env (lowerArg (ys.toList.getD idx .erased)) := by

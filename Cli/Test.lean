@@ -1,4 +1,4 @@
-import Cli.Build
+import Cli.Verify
 
 namespace Qed.Cli
 

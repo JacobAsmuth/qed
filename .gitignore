@@ -6,9 +6,6 @@
 /toolchains/
 /test/node_modules/
 /test/screenshots/
-/runtime/qed.js
-/runtime/qed.wasm
-/runtime/__build_id
 *.olean
 test/vendor/
 /test/.gate/

@@ -8,6 +8,7 @@ extern_lib libqed_server pkg := do
   let crateDir := pkg.dir / "rust" / "qed_server"
   let srcJobs := Job.collectArray #[
     ← inputTextFile (crateDir / "Cargo.toml"),
+    ← inputTextFile (crateDir / "Cargo.lock"),
     ← inputTextFile (crateDir / "build.rs"),
     ← inputTextFile (crateDir / "src" / "lean_bridge.c"),
     ← inputTextFile (crateDir / "src" / "lib.rs"),
@@ -30,7 +31,6 @@ extern_lib libqed_server pkg := do
 @[default_target]
 lean_lib Qed where
 
-@[default_target]
 lean_lib QedServer where
   roots := #[`Qed.Server.Net, `Qed.Server.Http, `Qed.Server.Prim, `Qed.Server.Native]
   moreLinkArgs := #["-pthread"]
@@ -42,6 +42,7 @@ lean_lib JsProofs where
   roots := #[`Js.Proofs]
 
 lean_lib Js where
+  roots := #[`Js.Backend, `Js.VerifyEnv]
 
 lean_exe qedjs where
   root := `Js.Main

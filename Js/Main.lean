@@ -28,11 +28,6 @@ private def parseRtFlag : List String → Except String (Option String × List S
       let (rt, rem) ← parseRtFlag rest
       return (rt, a :: rem)
 
-private def checkExternsAgainstRt (avail : Std.HashSet String) (externs : List String) : IO Unit := do
-  let missing := externs.filter (!avail.contains ·)
-  if !missing.isEmpty then
-    throw (IO.userError s!"qed_rt: missing externs: {String.intercalate ", " missing}")
-
 private def splitAlso : List String → List String × Option (String × List String)
   | [] => ([], none)
   | "--also" :: out2 :: "--" :: entries2 => ([], some (out2, entries2))
@@ -45,7 +40,7 @@ private def writeJsBundle (env : Environment) (avail? : Option (Std.HashSet Stri
   let entries := entryArgs.map parseEntry
   if entries.isEmpty then throw (IO.userError "no entry decls given (after `--`)")
   let (js, externs) ← orThrow (Js.emitProgramWithExterns env entries min)
-  if let some avail := avail? then checkExternsAgainstRt avail externs
+  if let some avail := avail? then orThrow (Js.checkRtExterns avail externs)
   let p : System.FilePath := outPath
   if let some dir := p.parent then IO.FS.createDirAll dir
   IO.FS.writeFile p js
@@ -133,9 +128,9 @@ def main (args : List String) : IO Unit := do
     let (mods, entryArgs) := splitDashes rest
     if mods.isEmpty || entryArgs.isEmpty then
       throw (IO.userError "usage: qedjs --check-externs <rt.mjs> <module>… -- <decl>[:<export>]…")
-    let (_, _, externs) ← orThrow (Js.collectProgramExterns (← loadEnv mods) (entryArgs.map (parseEntry · |>.1)))
+    let (_, externs) ← orThrow (Js.collectProgramExterns (← loadEnv mods) (entryArgs.map (parseEntry · |>.1)))
     let avail := Js.rtExports (← IO.FS.readFile rtPath)
-    checkExternsAgainstRt avail externs
+    orThrow (Js.checkRtExterns avail externs)
   | _ =>
     let min := args.contains "--min"
     let (rt?, cleanArgs) ← orThrow (parseRtFlag (args.filter (· ≠ "--min")))

@@ -1,6 +1,5 @@
 export const tag = (o) => (typeof o === 'object' && o !== null) ? o.t : o;
-export const ctor = (t, ...f) => ({ t, f, s: {}, u: {} });
-export const box = (v) => v, unbox = (v) => v;
+const ctor = (t, ...f) => ({ t, f, s: {}, u: {} });
 
 export function pap(fn, arity, args) { return { fn, arity, args }; }
 export function app(clo, extra) {
@@ -11,14 +10,13 @@ export function app(clo, extra) {
   return app(head, args.slice(clo.arity));
 }
 
-export const PUnit = 0, Unit = 0;
+export const PUnit = 0;
 export const ioVal = (r) => r.f[0];
 const _TC = { __tc: null };
 export const tc = (a) => (_TC.__tc = a, _TC);
 // Freeze module-global arrays (`v.r = Infinity`) so copy-on-write mutators never mutate shared constants.
 export function memo(f) { let v, done = false; return () => { if (!done) { v = f(); done = true; if (v !== null && typeof v === 'object' && v.r !== undefined) v.r = Infinity; } return v; }; }
 export const mkOk  = (v) => ({ t: 0, f: [v] });
-export const mkErr = (e) => ({ t: 1, f: [e] });
 
 export const Int_add = (a, b) => a + b;
 export const Int_sub = (a, b) => a - b;
@@ -103,8 +101,8 @@ export const Char_ofNatAux = (n, _h) => Number(n);
 
 const NIL = 0;
 const cons = (h, t) => ({ t: 1, f: [h, t] });
-export function listToArray(l) { const a = []; while (typeof l === 'object' && l !== null) { a.push(l.f[0]); l = l.f[1]; } return a; }
-export function arrayToList(a) { let l = NIL; for (let i = a.length - 1; i >= 0; i--) l = cons(a[i], l); return l; }
+function listToArray(l) { const a = []; while (typeof l === 'object' && l !== null) { a.push(l.f[0]); l = l.f[1]; } return a; }
+function arrayToList(a) { let l = NIL; for (let i = a.length - 1; i >= 0; i--) l = cons(a[i], l); return l; }
 
 export const inc = (x, n = 1) => { if (x !== null && typeof x === 'object' && x.r !== undefined) x.r += Number(n); };
 export const dec = (x, n = 1) => { if (x !== null && typeof x === 'object' && x.r !== undefined) x.r -= Number(n); };
@@ -129,7 +127,7 @@ export const Array_pop = (a) => owned(a) ? (a.__m = undefined, a.pop(), a) : own
 export const Array_uset = (a, i, x) => { const b = owned(a) ? (a.__m = undefined, a) : own(a.slice()); b[i] = x; return b; };
 export const Array_swap = (a, i, j) => { const b = owned(a) ? (a.__m = undefined, a) : own(a.slice()); const t = b[Number(i)]; b[Number(i)] = b[Number(j)]; b[Number(j)] = t; return b; };
 export const Array_set = (a, i, x) => { const b = owned(a) ? (a.__m = undefined, a) : own(a.slice()); b[Number(i)] = x; return b; };
-export const Array_setx33 = (a, i, x) => { const b = owned(a) ? (a.__m = undefined, a) : own(a.slice()); b[Number(i)] = x; return b; };
+export const Array_setx33 = Array_set;
 
 const ENC = new TextEncoder(), DEC = new TextDecoder(), DEC_FATAL = new TextDecoder('utf-8', { fatal: true });
 const STR_CACHE_MAX_LEN = 4096;
@@ -281,7 +279,7 @@ export const ByteArray_push = (ba, b) => {
 export const ByteArray_size = (ba) => BigInt(ba.length);
 export const ByteArray_usize = (ba) => ba.length;
 export const ByteArray_get = (ba, i) => ba[Number(i)];
-export const ByteArray_uget = (ba, i) => ba[Number(i)];
+export const ByteArray_uget = ByteArray_get;
 export const ByteArray_getx33 = (ba, i) => ba[Number(i)] ?? 0;
 export const ByteArray_copySlice = (src, so, dst, dso, len, exact) => {
   const s = Math.min(Number(so), src.length);
@@ -321,7 +319,7 @@ export const Array_emptyWithCapacity = Array_mkEmpty;
 export const Array_replicate = Array_mkArray;
 export const Array_getInternal = Array_get;
 export const Array_getInternalBorrowed = (a, i) => a[Number(i)];
-export const Array_ugetBorrowed = (a, i) => a[Number(i)];
+export const Array_ugetBorrowed = Array_getInternalBorrowed;
 export const Array_getx33Internal = (_inst, a, i) => { const x = a[Number(i)]; inc(x); return x; };
 export const Array_getx33InternalBorrowed = (_inst, a, i) => a[Number(i)];
 export const Nat_ble = (a, b) => a <= b ? 1 : 0;
@@ -334,8 +332,8 @@ export const UInt32_ofBitVec = (bv) => Number(BigInt(bv) & 0xFFFFFFFFn);
 export const USize_ofNatLT = (n) => Number(n & 0x1FFFFFFFFFFFFFn);
 export const String_ofList = String_mk;
 export const String_toList = String_data;
-export const String_ofByteArray = (ba) => DEC.decode(ba);
-export const String_Internal_append = (a, b) => a + b;
+export const String_ofByteArray = String_fromUTF8;
+export const String_Internal_append = String_append;
 export const String_Internal_isPrefixOf = (p, s) => s.startsWith(p) ? 1 : 0;
 export const String_Internal_any = (s, f) => { for (const ch of s) { if (app(f, [ch.codePointAt(0)])) return 1; } return 0; };
 export const String_Pos_Raw_get = String_get;
@@ -358,7 +356,7 @@ export const String_Slice_Pattern_Internal_memcmpStr = (lhs, rhs, lstart, rstart
   }
   return 1;
 };
-export const ByteArray_emptyWithCapacity = (c) => mkCapBytes(Number(c), 0);
+export const ByteArray_emptyWithCapacity = ByteArray_mkEmpty;
 export const ByteArray_validateUTF8 = String_validateUTF8;
 
 export const ST_Prim_mkRef   = (a, _w) => ({ v: a });

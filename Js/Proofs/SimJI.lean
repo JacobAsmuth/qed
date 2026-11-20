@@ -20,51 +20,23 @@ private theorem eval_sim_ji_body_step (prog : IrProg) (c0 : Ctx) (jsProg : JsPro
       simp [lowerBody, evalJsStmts, evalJsStmt, evalJsExprM_lowerArg jsProg fSub jsSt irSt.env hsm.env_eq a] at hev; obtain ⟨rfl, rfl⟩ := hev
       have hnt := evalIrArg_noTc hsm.env_noTc a; cases heq : evalIrArg irSt.env a with | tc _ => rw [heq] at hnt; exact False.elim hnt | _ => exact ⟨0, irSt, by simp [evalIrBody, heq], by rw [← heq]; exact hnt, hsm.heap_eq, hsm.memos_eq, hsm.memos_noTc⟩
   | unreachable => simp [lowerBody, evalJsStmts, evalJsStmt] at hev
-  | set x i y cont =>
-      rw [BodyWf] at hwf; simp [lowerBody, evalJsStmts, evalJsStmt, evalJsExprM_lowerArg jsProg fSub jsSt irSt.env hsm.env_eq y, ← hsm.env_eq x] at hev
-      exact ExitMatchJI.rwBody (hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwf (hsm.updVar x (noTc_setField (hsm.env_noTc x.idx) (evalIrArg_noTc hsm.env_noTc y)) fun hm => isNonArr_setField (hsm.nonArr_ok _ hm)) hev) fun _ => by simp only [evalIrBody]
-  | setTag x cidx cont =>
-      rw [BodyWf] at hwf; simp [lowerBody, evalJsStmts, evalJsStmt, ← hsm.env_eq x] at hev
-      exact ExitMatchJI.rwBody (hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwf (hsm.updVar x (noTc_setTag (hsm.env_noTc x.idx)) fun _ => isNonArr_setTag) hev) fun _ => by simp only [evalIrBody]
-  | uset x i y cont =>
-      rw [BodyWf] at hwf; simp [lowerBody, evalJsStmts, evalJsStmt, evalJsExprM, ← hsm.env_eq y, ← hsm.env_eq x] at hev
-      exact ExitMatchJI.rwBody (hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwf (hsm.updVar x (noTc_setU (hsm.env_noTc x.idx) (hsm.env_noTc y.idx)) fun hm => isNonArr_setU (hsm.nonArr_ok _ hm)) hev) fun _ => by simp only [evalIrBody]
-  | sset x n off y _ cont =>
-      rw [BodyWf] at hwf; simp [lowerBody, evalJsStmts, evalJsStmt, evalJsExprM, ← hsm.env_eq y, ← hsm.env_eq x] at hev
-      exact ExitMatchJI.rwBody (hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwf (hsm.updVar x (noTc_setS (hsm.env_noTc x.idx) (hsm.env_noTc y.idx)) fun hm => isNonArr_setS (hsm.nonArr_ok _ hm)) hev) fun _ => by simp only [evalIrBody]
-  | dec x n cf bf cont =>
-      rw [BodyWf] at hwf; exact eval_sim_ji_rcDec x n (.dec x n cf bf cont) cont hsm rfl (fun _ => by simp [evalIrBody]) (fun _ _ hsm' hev' => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwf hsm' hev') hev
-  | del x cont =>
-      rw [BodyWf] at hwf; exact eval_sim_ji_rcDec x 1 (.del x cont) cont hsm rfl (fun _ => by simp [evalIrBody]) (fun _ _ hsm' hev' => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwf hsm' hev') hev
-  | inc x n _ _ cont =>
-      rw [BodyWf] at hwf; rcases hwf with ⟨hwfc, hsrc⟩; by_cases hna : c.nonArr.contains x.idx = true
-      · rw [show ∀ cf bf, lowerBody c (.inc x n cf bf cont) = lowerBody c cont from fun _ _ => by dsimp [lowerBody]; simp [hna]] at hev
-        exact ExitMatchJI.rwBody (hb c inlineJps recJps allowTailCont irSt jsSt ex jsSt1 hnames hmin henv hselfNodup hwfc hsm hev) fun _ => by simp [evalIrBody, rcInc_nonArr_noop_isNonArr irSt.heap (irSt.env x.idx) n (hsm.nonArr_ok _ hna)]
-      · have hnaF : c.nonArr.contains x.idx = false := Bool.eq_false_iff.2 hna; rcases hsrc with hcont | hnt; exact absurd hcont hna
-        have hl : ∀ cf bf, lowerBody c (.inc x n cf bf cont) = if n == 0 then lowerBody c cont else [.incRef (v x) n] ++ lowerBody c cont := fun _ _ => by
-          dsimp only [lowerBody]; cases hp : c.projSrc.get? x.idx with
-          | none => simp [hnaF] | some p => simp only [hp] at hnt; simp [hnaF, (by cases h : hasDecOf p cont <;> simp [h] at hnt; rfl : hasDecOf p cont = false)]
-        rw [hl] at hev; by_cases hn0 : n = 0
-        · subst hn0; simp only [beq_self_eq_true, ↓reduceIte] at hev
-          exact ExitMatchJI.rwBody (hb c inlineJps recJps allowTailCont irSt jsSt ex jsSt1 hnames hmin henv hselfNodup hwfc hsm hev) fun _ => by simp [evalIrBody, CowHeap.rcInc_zero]
-        · simp only [beq_false_of_ne hn0, Bool.false_eq_true, ↓reduceIte, List.cons_append, List.nil_append, evalJsStmts, evalJsStmt] at hev
-          exact ExitMatchJI.rwBody (hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwfc (hsm.updHeap (h1 := irSt.heap.rcInc (irSt.env x.idx).toRcVal n) (by rw [hsm.heap_eq, hsm.env_eq x])) hev) fun _ => by simp only [evalIrBody]
-  | case _ x xType alts =>
+  | set x i y cont => rw [BodyWf] at hwf; exact ExitMatchJI.ofLockstep (lockstep_set x i y cont hsm) (fun _ _ => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwf) hev
+  | setTag x cidx cont => rw [BodyWf] at hwf; exact ExitMatchJI.ofLockstep (lockstep_setTag x cidx cont hsm) (fun _ _ => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwf) hev
+  | uset x i y cont => rw [BodyWf] at hwf; exact ExitMatchJI.ofLockstep (lockstep_uset x i y cont hsm) (fun _ _ => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwf) hev
+  | sset x n off y ty cont => rw [BodyWf] at hwf; exact ExitMatchJI.ofLockstep (lockstep_sset x n off y ty cont hsm) (fun _ _ => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwf) hev
+  | dec x n cf bf cont => rw [BodyWf] at hwf; exact ExitMatchJI.ofLockstep (lockstep_rcDec x n (.dec x n cf bf cont) cont hsm rfl fun _ => by simp only [evalIrBody]) (fun _ _ => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwf) hev
+  | del x cont => rw [BodyWf] at hwf; exact ExitMatchJI.ofLockstep (lockstep_rcDec x 1 (.del x cont) cont hsm rfl fun _ => by simp only [evalIrBody]) (fun _ _ => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwf) hev
+  | inc x n cf bf cont => rw [BodyWf] at hwf; exact ExitMatchJI.ofLockstep (lockstep_inc x n cf bf cont hsm hwf.2) (fun _ _ => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwf.1) hev
+  | case tid x xType alts =>
       rw [BodyWf] at hwf
-      have hscr : evalJsExprM jsProg fSub jsSt (if xType.isObj then .call "$.tag" [.var (v x)] else .var (v x)) = some (if xType.isObj then .num (jsTag (jsSt.env (v x))) else jsSt.env (v x), jsSt) := by split <;> simp [evalJsExprM, evalJsExprListM]
-      have htag : jsTag (if xType.isObj then .num (jsTag (jsSt.env (v x))) else jsSt.env (v x)) = jsTag (irSt.env x.idx) := by split <;> simp [jsTag, hsm.env_eq x]
-      simp only [lowerBody, evalJsStmts, evalJsStmt, hscr, htag, match_next_idem] at hev
+      rw [caseScrut_eq jsProg c tid x xType alts hsm.env_eq fSub] at hev
       have hres := evalJsArms_sim_ji (x := x) alts.toList hwf (fun arm hm hwfa ha => hb arm hm c inlineJps recJps allowTailCont irSt jsSt ex jsSt1 hnames hmin henv hselfNodup hwfa hsm ha) hev
       exact ExitMatchJI.rwBody hres fun _ => by simp [evalIrBody]
   | jmp j ys =>
       rw [BodyWf] at hwf; rcases hwf with hin | hrec
-      · obtain ⟨xs, hxs, _⟩ := hsm.inline_sub j.idx ys.size hin; have hnotInM : j.idx ∈ inlineJps.map Prod.fst := List.mem_map.2 ⟨(j.idx, ys.size), hin, rfl⟩
-        have hzz := evalJsAssigns_jmp_inline jsProg fSub jsSt irSt.env j hsm.env_eq ys.toList 0; dsimp only [lowerBody] at hev; rw [show c.inlineJps.get? j.idx = some xs from hxs] at hev
-        simp [evalJsStmts, evalJsStmt, hzz] at hev; obtain ⟨rfl, rfl⟩ := hev
-        refine ⟨0, j, ys.toList.map (evalIrArg irSt.env), irSt, rfl, evalIrBody_jmp_inline _ _ _ _ 0 _ _ _ hnotInM, by simpa using hin, fun i hi => ?_, fun a ha => ?_,
-          { hsm with env_eq := fun w => (by rw [hsm.env_eq w]; symm; exact bindMany_lookup_not_mem _ jsSt.env (v w) (fun p hp heq => by rcases List.mem_map.1 hp with ⟨⟨_, k⟩, _, rfl⟩; exact list_take_ne_x_append_digits w.idx j.idx k heq.symm)) }⟩
-        · simpa using bindMany_lookup_nodup _ jsSt.env (nodup_jmpSlots irSt.env j ys.toList 0) _ _ (mem_jmpSlots_getElem irSt.env j ys.toList 0 i (by simpa using hi))
-        · rcases List.mem_map.1 ha with ⟨a', _, rfl⟩; exact evalIrArg_noTc hsm.env_noTc a'
+      · obtain ⟨hnotInM, hjsStep, hok⟩ := inlineJmp_step (jsProg := jsProg) hsm hin
+        rw [hjsStep fSub, Option.some.injEq, Prod.mk.injEq] at hev; obtain ⟨rfl, rfl⟩ := hev
+        exact ⟨0, j, ys.toList.map (evalIrArg irSt.env), irSt, rfl, evalIrBody_jmp_inline _ _ _ _ 0 _ _ _ hnotInM, hok⟩
       · have hnone : c.inlineJps.get? j.idx = none := hsm.rec_disj (j.idx, ys.size) hrec
         have hnotIn : j.idx ∉ inlineJps.map Prod.fst := fun hm => by rcases List.mem_map.1 hm with ⟨p, hp, hpe⟩; obtain ⟨xs, hxs, _⟩ := hsm.inline_sub p.1 p.2 hp; rw [hpe, hnone] at hxs; contradiction
         have hjJsNone : jsProg (jp j) = none := by cases hpj : jsProg (jp j) with | none => rfl | some _ => obtain ⟨f', hf'⟩ := hprog.jsProg_dom (jp j) (by rw [hpj]; simp); exact absurd rfl ((hprog.fn_disjoint (jp j) f' hf').1 j)
@@ -109,29 +81,19 @@ private theorem eval_sim_ji_body_step (prog : IrProg) (c0 : Ctx) (jsProg : JsPro
               rw [← evalJsStmts_append, evalJsStmts_inlineJp_post jsProg fSub jsStC j j' hj'eq args xs hlen hslots] at hev
               exact ExitMatchJI.rwStep (f₁ := fIrC) (hb.1 c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hrec.2 (hsm1.bindInlineJp hsm.rec_disj hsm.inline_sub xs args hnd hlen hargsNoTc (fun k hk => hprog.nonArr_param c.nonArr xs args irStC.env k hk hsm1.nonArr_ok)) hev)
                 (fun _ _ _ hirV => by simp only [evalIrBody, hjmp, ↓reduceIte]; rw [evalIrBody_mono (Nat.le_max_left _ _) hirC]; simp only [hj'beq, ↓reduceIte]; exact evalIrBody_mono (Nat.le_max_right _ _) hirV)
-            · have hj'ne : j' ≠ j := fun h => hj'j (congrArg JoinPointId.idx h)
-              have hjpNe : (jp j' == jp j) = false := beq_false_of_ne fun hje => hj'ne (by have := jp_inj hje; cases j'; cases j; simp_all)
+            · have hjpNe : (jp j' == jp j) = false := beq_false_of_ne fun hje => hj'j (jp_inj hje)
               simp only [hjpNe, Bool.false_eq_true, ↓reduceIte, Option.some.injEq, Prod.mk.injEq] at hev; obtain ⟨rfl, rfl⟩ := hev
-              refine ⟨fIrC, j', args, irStC, rfl, ?_, (List.mem_cons.1 hin').elim (fun h => absurd (Prod.mk.inj h).1 fun hi => hj'ne (by cases j'; cases j; simp_all)) id, hslots, hargsNoTc, hsm1.withCtx rfl rfl rfl rfl rfl hsm.rec_disj hsm.inline_sub⟩
+              refine ⟨fIrC, j', args, irStC, rfl, ?_, (List.mem_cons.1 hin').elim (fun h => absurd (Prod.mk.inj h).1 hj'j) id, hslots, hargsNoTc, hsm1.withCtx rfl rfl rfl rfl rfl hsm.rec_disj hsm.inline_sub⟩
               have hneJ : (j' == j) = false := by change (j'.idx == j.idx) = false; exact beq_false_of_ne hj'j
               simp only [evalIrBody, hjmp, ↓reduceIte]; rw [hirC]; simp [hneJ]
       · have hjmpF : (!hasJmpTo j val) = false := Bool.eq_false_iff.2 hjmp; simp only [hjmpF, Bool.false_eq_true, ↓reduceIte] at hrec
-        simp only [lowerBody, hjmpF, Bool.false_eq_true, ↓reduceIte, evalJsStmts, evalJsStmt] at hev
-        exact ExitMatchJI.rwBody (ExitMatchJI.dropRecHead hnotRec (hb.2 c inlineJps ((j.idx, xs.size) :: recJps) allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hrec.2 (hsm.pushRecJp hnames hmin henv j xs val hnd hnotRec hcNone hrec.1) hev)) fun _ => by simp [evalIrBody, hjmpF]
+        exact ExitMatchJI.dropRecHead hnotRec (ExitMatchJI.ofLockstep (lockstep_rec_jdecl hnames hmin henv j xs val cont hjmpF hnd hnotRec hcNone hrec.1 hsm) (fun _ _ => hb.2 c inlineJps ((j.idx, xs.size) :: recJps) allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hrec.2) hev)
   | vdecl x ty e cont =>
       rw [BodyWf] at hwf; rcases hwf with ⟨hwfc, hwe⟩; dsimp only [ExprWf] at hwe; cases e with
       | fap f ys =>
           by_cases href : f = `Qed.refMark
           · subst href; simp only [beq_self_eq_true, ↓reduceIte] at hwe
-            have hnotSelf : (c.selfFn == some `Qed.refMark && retsVar x cont) = false := by by_cases hc : c.selfFn == some `Qed.refMark; exact absurd (eq_of_beq hc) hwe; simp [Bool.eq_false_iff.2 hc]
-            simp only [lowerBody, hnotSelf, Bool.false_eq_true, ↓reduceIte, beq_self_eq_true, lowerExpr, lowerApp, evalJsStmts, evalJsStmt, evalJsExprM] at hev
-            rw [evalJsExprListM_refMark jsProg fSub jsSt irSt.env hsm.env_eq _ (fun a => by cases a <;> rfl)] at hev; dsimp only at hev
-            generalize hvs : ys.toList.filterMap (refMarkArg irSt.env) = vs at hev
-            have hev' : evalJsStmts jsProg fSub { jsSt with env := bindEnv jsSt.env (v x) (refMarkPair jsSt.heap vs).1, heap := (refMarkPair jsSt.heap vs).2 } (lowerBody c cont) = some (ex, jsSt1) := by
-              cases vs with | nil => simpa [refMarkPair] using hev | cons v0 rest => cases v0 with | arr _ => cases rest <;> simpa [refMarkPair] using hev | _ => simpa [refMarkPair] using hev
-            exact ExitMatchJI.rwBody (hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwfc (hsm.updRefMark x vs) hev') fun _ => by
-              simp only [evalIrBody, beq_self_eq_true, ↓reduceIte, hvs]
-              cases vs with | nil => rfl | cons v0 rest => cases v0 <;> first | rfl | (cases rest <;> rfl)
+            exact ExitMatchJI.ofLockstep (lockstep_refMark x ty ys cont hsm hwe) (fun _ _ => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwfc) hev
           · have hrefF : (f == `Qed.refMark) = false := beq_false_of_ne href; simp only [hrefF, Bool.false_eq_true, ↓reduceIte] at hwe
             rcases hwe with ⟨⟨_, _, _, _, hfd⟩, htail⟩; have hlow := findEnv_fap_args c c0 f ys hnames henv (hprog.findEnv_ok f _ hfd).1 href
             obtain ⟨hne1, hne2, hne3⟩ := (hprog.fn_disjoint (c0.js f) f (hprog.rev_ok f _ hfd)).2
@@ -162,12 +124,10 @@ private theorem eval_sim_ji_body_step (prog : IrProg) (c0 : Ctx) (jsProg : JsPro
           exact ExitMatchJI.rwStep (f₁ := fIr1) (hb c inlineJps recJps allowTailCont _ { jsStC with env := bindEnv jsStC.env (v x) vjs } ex jsSt1 hnames hmin henv hselfNodup hwfc
               (hsm.updCall x hvnt (fun hm => (hprog.nonArr_call c.nonArr fIr1 irSt.heap irSt.memos default _ vjs h' m' x.idx hm).2 (irSt.env y.idx) hirc) hhp' hme1 hmfns1 hmeq1 hmno1) hev)
             (fun _ _ _ hir2 => by simp only [evalIrBody]; rw [evalIrApp_mono (Nat.le_max_left _ _) hirc]; exact evalIrBody_mono (Nat.le_max_right _ _) hir2)
-      | isShared y =>
-          simp only [lowerBody, lowerExpr, evalJsStmts, evalJsStmt, evalJsExprM, evalJsExprListM] at hev
-          exact ExitMatchJI.rwBody (hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwfc (hsm.updVar x (val := .num (if isSharedVal jsSt.heap (jsSt.env (v y)) then 1 else 0)) trivial (fun _ => rfl)) hev) fun _ => by simp [evalIrBody, hsm.env_eq y, hsm.heap_eq]
-      | pap _ _ => exact eval_sim_ji_pure_vdecl hprog hnames henv hsm _ trivial (fun f' ys' he => by injection he with hf _; exact hf ▸ hwe) (fun _ => evalIrPure_ctor_isNonArr c0 ty irSt.env _ trivial) (fun hsm' hev' => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwfc hsm' hev') hev
-      | ctor _ _ | reuse _ _ _ _ | reset _ _ | lit _ => exact eval_sim_ji_pure_vdecl hprog hnames henv hsm _ trivial (fun _ _ he => nomatch he) (fun _ => evalIrPure_ctor_isNonArr c0 ty irSt.env _ trivial) (fun hsm' hev' => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwfc hsm' hev') hev
-      | proj _ _ | uproj _ _ | sproj _ _ _ | box _ _ | unbox _ => exact eval_sim_ji_pure_vdecl hprog hnames henv hsm _ trivial (fun _ _ he => nomatch he) (fun hx => hprog.nonArr_pure c.nonArr irSt.env ty x _ hx hsm.nonArr_ok) (fun hsm' hev' => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwfc hsm' hev') hev
+      | isShared y => exact ExitMatchJI.ofLockstep (lockstep_isShared x ty y cont hsm) (fun _ _ => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwfc) hev
+      | pap _ _ => exact ExitMatchJI.ofLockstep (lockstep_pure_vdecl hprog hnames henv hsm _ trivial (fun f' ys' he => by injection he with hf _; exact hf ▸ hwe) (fun _ => evalIrPure_ctor_isNonArr c0 ty irSt.env _ trivial)) (fun _ _ => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwfc) hev
+      | ctor _ _ | reuse _ _ _ _ | reset _ _ | lit _ => exact ExitMatchJI.ofLockstep (lockstep_pure_vdecl hprog hnames henv hsm _ trivial (fun _ _ he => nomatch he) (fun _ => evalIrPure_ctor_isNonArr c0 ty irSt.env _ trivial)) (fun _ _ => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwfc) hev
+      | proj _ _ | uproj _ _ | sproj _ _ _ | box _ _ | unbox _ => exact ExitMatchJI.ofLockstep (lockstep_pure_vdecl hprog hnames henv hsm _ trivial (fun _ _ he => nomatch he) (fun hx => hprog.nonArr_pure c.nonArr irSt.env ty x _ hx hsm.nonArr_ok)) (fun _ _ => hb c inlineJps recJps allowTailCont _ _ ex jsSt1 hnames hmin henv hselfNodup hwfc) hev
 
 private theorem eval_sim_ji_call_step (prog : IrProg) (c0 : Ctx) (jsProg : JsProg) (revName : String → Option Name)
     (hprog : ProgLowered prog c0 jsProg revName) (f' : Nat) (ihCall : CallSimJI prog c0 jsProg revName f') (ihBody : BodySimJI prog c0 jsProg revName f') :
@@ -177,7 +137,7 @@ private theorem eval_sim_ji_call_step (prog : IrProg) (c0 : Ctx) (jsProg : JsPro
   | extern _ _ _ _ => exact False.elim (hprog.findEnv_ok f _ hpf).2.1
   | fdecl fnm xs ty b info =>
       have hfnm := hprog.fdecl_name f fnm xs ty b info hpf; subst fnm
-      have hfnsNone : jsSt.fns (c0.js f) = none := by cases hfn : jsSt.fns (c0.js f) with | none => rfl | some _ => obtain ⟨j, hj⟩ := hfns _ (by rw [hfn]; simp); exact absurd hj ((hprog.fn_disjoint _ f (hprog.rev_ok f _ hpf)).1 j)
+      have hfnsNone := fdecl_fns_none hprog hpf hfns
       have hjsD := hprog.js_at_fdecl f xs ty b info hpf; have hdwf := hprog.decl_wf f xs ty b info hpf; dsimp only at hdwf
       have hjsCtx : ∀ na ps g, ({ c0 with nonArr := na, projSrc := ps } : Ctx).js g = c0.js g := fun _ _ _ => rfl
       by_cases hemp : xs.isEmpty = true
@@ -204,19 +164,14 @@ private theorem eval_sim_ji_call_step (prog : IrProg) (c0 : Ctx) (jsProg : JsPro
               obtain ⟨fIrB, irSt1, hirB, hvnt, hh1, hm1Eq, hm1No⟩ := hex.of_false_ret; dsimp only [stIr0, List.map] at hirB
               exact ⟨fIrB + 1, irSt1.heap, fun k => if k == f then { ok := true, val := some rv } else irSt1.memos k, by simp [evalIrCall, hpf, hemp, hmokIr, hini, hirB], rfl, hvnt, hh1, rfl, rfl, memoUpdate_eq hprog.rev_ok hm1Eq hf rv, fun g => by dsimp only; split; exact hvnt; exact hm1No g⟩
       · have hempF : xs.isEmpty = false := Bool.eq_false_iff.2 hemp; simp only [hempF, Bool.false_eq_true, ↓reduceIte] at hdwf; rcases hdwf with ⟨hnd, hwfBody⟩
-        have hxsPos : xs.size > 0 := Nat.pos_of_ne_zero (fun h0 => hemp (by simp [Array.isEmpty, h0]))
         let stIr0 : IrState := { env := bindIrParams xs args (fun _ => .num 0), heap := h, memos := mIr }; let stJs0 : JsState := { env := bindMany ((xs.toList.map (v ·.x)).zip args) (fun _ => .num 0), heap := jsSt.heap, memos := jsSt.memos }
         by_cases hst : hasSelfTail f b = true
-        · simp only [hst, ↓reduceIte] at hwfBody
-          let dl := !hasJpSelfTail f b
+        · let dl := !hasJpSelfTail f b
           let cL := { c0 with nonArr := collectNonArr {} b, projSrc := collectProjSrc {} {} b, selfFn := some f, selfParams := xs, directLoop := dl }
-          have hcdl0 := hprog.c0_clean.2.2.1
-          have hcLwf : BodyWf cL prog [] [] true b := by cases hjp : !hasJpSelfTail f b <;> simp only [dl, cL, hjp, ↓reduceIte, Bool.false_eq_true] at hwfBody ⊢ <;> cases c0 <;> simp_all
-          have hjsL : jsProg (c0.js f) = some (if dl then .fnDirectLoop (c0.js f) f (xs.toList.map (v ·.x)) (lowerBody cL b) else .fnTrampoline (c0.js f) f (xs.toList.map (v ·.x)) (lowerBody cL b)) := by
-            rw [hjsD]; cases hjp : !hasJpSelfTail f b <;> simp_all [dl, cL, lowerDecl]
-          obtain ⟨ex, jsSt1, hjsB, hinv⟩ := evalJsCall_selfTail_inv dl jsProg c0 f (xs.toList.map (v ·.x)) (lowerBody cL b) jsSt args f' v2 st2 hfnsNone hjsL hjsc
+          obtain ⟨hxsPos, _, hcLwf, hjsL⟩ := fdecl_selfTail_setup hprog hpf hempF hst
+          obtain ⟨ex, jsSt1, hjsB, hinv⟩ := evalJsCall_selfTail_inv (hdecl := hjsL) (hfns := hfnsNone) (hjsc := hjsc)
           have hex := ihBody cL [] [] true b stIr0 stJs0 ex jsSt1 rfl rfl rfl (fun _ hs => by cases hs; exact ⟨hf, hxsPos, hnd⟩) hcLwf
-            (StatesMatch.initCall prog cL c0 true jsSt h mIr xs args hhp hmEq hmNo hnd hargs fun k hk => hprog.nonArr_param _ xs args _ k hk fun _ _ => rfl) hjsB
+            (fdecl_initCall hprog cL true jsSt h mIr xs args hhp hmEq hmNo hnd hargs) hjsB
           have hrecCase : ∀ na, evalJsCall jsProg f' { jsSt with heap := jsSt1.heap, memos := jsSt1.memos } (c0.js f) na = some (v2, st2) → TailContCont prog cL c0 revName ([] : List Nat) stIr0 b jsSt1 na →
               ∃ fIr h1 m1, evalIrCall prog c0 revName fIr h mIr f args = some (v2, h1, m1) ∧ CallPost prog c0 v2 v2 h1 m1 jsSt st2 := fun na hrcCall hk => by
             rcases hk with ⟨hnaNT, sf, m0, hsf, hm0Eq, hm0No, hcont⟩; cases hsf
@@ -224,12 +179,12 @@ private theorem eval_sim_ji_call_step (prog : IrProg) (c0 : Ctx) (jsProg : JsPro
             obtain ⟨fIrB, irSt1, hirB, hvnt, hh1, hm1Eq, hm1No⟩ := hcont fIrRec v2 h' m' hrc; dsimp only [stIr0] at hirB
             exact ⟨fIrB + 1, irSt1.heap, irSt1.memos, by simp [evalIrCall, hpf, hempF, hirB], rfl, hvnt, hh1.trans hh2, he2, hf2, fun g hg => by rw [hm1Eq g hg, hm2Eq g hg], hm1No⟩
           rcases hinv with ⟨na, hexEq, hrcCall⟩ | ⟨rv, hexEq, hntc, rfl, rfl⟩
-          · rw [hexEq] at hex; cases hdl : dl <;> (simp only [hdl, Bool.false_eq_true, ↓reduceIte] at hex; exact hrecCase na hrcCall hex.2.2)
+          · rw [hexEq] at hex; cases hdl : !hasJpSelfTail f b <;> (simp only [hdl, Bool.false_eq_true, ↓reduceIte] at hex; exact hrecCase na hrcCall hex.2.2)
           · rw [hexEq] at hex
             have hexRet := hex.of_ret_nonTc fun _ hvEq hdlF => by
               subst hvEq
               rcases hntc with hdlT | hne
-              · exact Bool.false_ne_true (hdlF.symm.trans (by simp [cL, hdlT]))
+              · exact Bool.false_ne_true (hdlF.symm.trans (by simpa [cL, dl] using hdlT))
               · exact hne _ rfl
             rcases hexRet with ⟨fIrB, irSt1, hirB, hvnt, hh1, hm1Eq, hm1No⟩
             dsimp only [stIr0, List.map] at hirB
@@ -240,7 +195,7 @@ private theorem eval_sim_ji_call_step (prog : IrProg) (c0 : Ctx) (jsProg : JsPro
           rcases jsR with ⟨ex, jsSt1⟩; rw [hjsB] at hjsc; cases ex with | next | tailCont _ | jumped _ => cases hjsc | returned rv =>
           simp only [Option.some.injEq, Prod.mk.injEq] at hjsc; obtain ⟨rfl, rfl⟩ := hjsc
           have hex := ihBody cP [] [] false b stIr0 stJs0 (.returned rv) jsSt1 rfl rfl rfl (fun _ h => by simp [cP, hprog.c0_clean.1] at h) hwfBody
-            (StatesMatch.initCall prog cP c0 false jsSt h mIr xs args hhp hmEq hmNo hnd hargs fun k hk => hprog.nonArr_param _ xs args _ k hk fun _ _ => rfl) hjsB
+            (fdecl_initCall hprog cP false jsSt h mIr xs args hhp hmEq hmNo hnd hargs) hjsB
           obtain ⟨fIrB, irSt1, hirB, hvnt, hh1, hm1Eq, hm1No⟩ := hex.of_false_ret; dsimp only [stIr0, List.map] at hirB
           exact ⟨fIrB + 1, irSt1.heap, irSt1.memos, by simp [evalIrCall, hpf, hempF, hirB], rfl, hvnt, hh1, rfl, rfl, hm1Eq, hm1No⟩
 

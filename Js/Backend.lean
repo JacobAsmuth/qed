@@ -33,6 +33,19 @@ def jsStr (s : String) : String :=
 def indStr (min : Bool) (d : Nat) : String :=
   if min then "" else String.ofList (List.replicate (2 * d) ' ')
 
+private def joinChunksAux (xs : Array String) (lo hi : Nat) : String :=
+  if _ : lo ≥ hi then ""
+  else if _ : lo + 1 == hi then xs[lo]!
+  else if _ : lo + 2 == hi then xs[lo]! ++ xs[lo + 1]!
+  else
+    let mid := (lo + hi) / 2
+    joinChunksAux xs lo mid ++ joinChunksAux xs mid hi
+termination_by hi - lo
+decreasing_by all_goals (simp_all; omega)
+
+private def joinChunks (xs : Array String) : String :=
+  joinChunksAux xs 0 xs.size
+
 /-! ## Typed JavaScript Target AST (`JsExpr`, `JsStmt`, `JsDecl`) -/
 
 inductive JsExpr where
@@ -56,24 +69,27 @@ def JsExpr.render : JsExpr → String
   | .numLit n         => toString n
   | .bigIntLit n      => s!"{n}n"
   | .strLit s         => jsStr s
-  | .arrLit elems     => s!"[{JsExpr.renderList elems}]"
+  | .arrLit elems     => s!"[{joinChunks (JsExpr.renderListAux #[] elems)}]"
   | .ctorObj cidx fields hasS hasU =>
       let s := if hasS then ", s: {}" else ""
       let u := if hasU then ", u: {}" else ""
-      s!"\{t: {cidx}, f: [{JsExpr.renderList fields}]{s}{u}}"
+      s!"\{t: {cidx}, f: [{joinChunks (JsExpr.renderListAux #[] fields)}]{s}{u}}"
   | .fieldProj obj i  => s!"{obj.render}.f[{i}]"
   | .uProj obj i      => s!"{obj.render}.u[{i}]"
   | .sProj obj n off  => s!"{obj.render}.s[{soff n off}]"
-  | .call fn args     => s!"{fn}({JsExpr.renderList args})"
-  | .pap fn ar args   => s!"$.pap({fn}, {ar}, [{JsExpr.renderList args}])"
-  | .app fn args      => s!"$.app({fn.render}, [{JsExpr.renderList args}])"
-  | .tc args          => s!"$.tc([{JsExpr.renderList args}])"
+  | .call fn args     => s!"{fn}({joinChunks (JsExpr.renderListAux #[] args)})"
+  | .pap fn ar args   => s!"$.pap({fn}, {ar}, [{joinChunks (JsExpr.renderListAux #[] args)}])"
+  | .app fn args      => s!"$.app({fn.render}, [{joinChunks (JsExpr.renderListAux #[] args)}])"
+  | .tc args          => s!"$.tc([{joinChunks (JsExpr.renderListAux #[] args)}])"
 
-def JsExpr.renderList : List JsExpr → String
-  | []      => ""
-  | [e]     => e.render
-  | e :: es => e.render ++ ", " ++ JsExpr.renderList es
+def JsExpr.renderListAux (acc : Array String) : List JsExpr → Array String
+  | []      => acc
+  | [e]     => acc.push e.render
+  | e :: es => JsExpr.renderListAux ((acc.push e.render).push ", ") es
 end
+
+def JsExpr.renderList (es : List JsExpr) : String :=
+  joinChunks (JsExpr.renderListAux #[] es)
 
 mutual
 inductive JsStmt where
@@ -110,10 +126,10 @@ def JsStmt.render (min : Bool) (d : Nat) : JsStmt → String
       if binds.isEmpty then ""
       else s!"{indStr min d}let {String.intercalate ", " (binds.map fun (k, e) => s!"{k} = {e.render}")};\n"
   | .labeledBlock lbl body =>
-      s!"{indStr min d}{lbl}: \{\n" ++ JsStmt.renderList min (d + 1) body ++ s!"{indStr min d}}\n"
+      s!"{indStr min d}{lbl}: \{\n" ++ joinChunks (JsStmt.renderListAux min (d + 1) #[] body) ++ s!"{indStr min d}}\n"
   | .constArrow name params body =>
       s!"{indStr min d}const {name} = ({String.intercalate ", " params}) => \{\n" ++
-        JsStmt.renderList min (d + 1) body ++ s!"{indStr min d}};\n"
+        joinChunks (JsStmt.renderListAux min (d + 1) #[] body) ++ s!"{indStr min d}};\n"
   | .setField x i val =>
       s!"{indStr min d}{x}.f[{i}] = {val.render};\n"
   | .setTag x cidx =>
@@ -142,22 +158,28 @@ def JsStmt.render (min : Bool) (d : Nat) : JsStmt → String
       s!"{indStr min d}throw new Error('unreachable');\n"
   | .switchStmt scrut arms =>
       s!"{indStr min d}switch ({scrut.render}) \{\n" ++
-        JsSwitchArm.renderList min (d + 1) arms ++ s!"{indStr min d}}\n"
+        joinChunks (JsSwitchArm.renderListAux min (d + 1) #[] arms) ++ s!"{indStr min d}}\n"
 
-def JsStmt.renderList (min : Bool) (d : Nat) : List JsStmt → String
-  | []      => ""
-  | s :: ss => s.render min d ++ JsStmt.renderList min d ss
+def JsStmt.renderListAux (min : Bool) (d : Nat) (acc : Array String) : List JsStmt → Array String
+  | []      => acc
+  | s :: ss => JsStmt.renderListAux min d (acc.push (s.render min d)) ss
 
 def JsSwitchArm.render (min : Bool) (d : Nat) : JsSwitchArm → String
   | .caseArm cidx body =>
-      s!"{indStr min d}case {cidx}: \{\n" ++ JsStmt.renderList min (d + 1) body ++ s!"{indStr min d}}\n"
+      s!"{indStr min d}case {cidx}: \{\n" ++ joinChunks (JsStmt.renderListAux min (d + 1) #[] body) ++ s!"{indStr min d}}\n"
   | .defaultArm body =>
-      s!"{indStr min d}default: \{\n" ++ JsStmt.renderList min (d + 1) body ++ s!"{indStr min d}}\n"
+      s!"{indStr min d}default: \{\n" ++ joinChunks (JsStmt.renderListAux min (d + 1) #[] body) ++ s!"{indStr min d}}\n"
 
-def JsSwitchArm.renderList (min : Bool) (d : Nat) : List JsSwitchArm → String
-  | []      => ""
-  | a :: as => a.render min d ++ JsSwitchArm.renderList min d as
+def JsSwitchArm.renderListAux (min : Bool) (d : Nat) (acc : Array String) : List JsSwitchArm → Array String
+  | []      => acc
+  | a :: as => JsSwitchArm.renderListAux min d (acc.push (a.render min d)) as
 end
+
+def JsStmt.renderList (min : Bool) (d : Nat) (ss : List JsStmt) : String :=
+  joinChunks (JsStmt.renderListAux min d #[] ss)
+
+def JsSwitchArm.renderList (min : Bool) (d : Nat) (as : List JsSwitchArm) : String :=
+  joinChunks (JsSwitchArm.renderListAux min d #[] as)
 
 inductive JsDecl where
   | memoInit     (name : String) (initFn : String)
@@ -236,7 +258,6 @@ def reach (env : Environment) (roots : List Name) (seen : Array Name := #[]) :
 structure Ctx where
   env        : Environment
   names      : Std.HashMap Name String
-  externs    : Std.HashMap Name Decl
   min        : Bool := false
   selfFn     : Option Name := none
   selfParams : Array Param := #[]
@@ -480,36 +501,23 @@ def emitDecl (c0 : Ctx) (d : Decl) : String :=
   | none    => ""
 
 def collectProgramExterns (env : Environment) (roots : List Name) :
-    Except String (Array Name × Std.HashMap Name Decl × List String) := do
+    Except String (Array Name × List String) := do
   let names ← reach env roots #[]
   verifyReachable env names
   verifyNoServerLeakInClient env names
-  let mut externs : Std.HashMap Name Decl := {}
+  let mut externSet : Std.HashSet String := {}
   for n in names do
     match findEnvDecl env n with
     | some (.fdecl ..) => pure ()
-    | some d@(.extern ..) => externs := externs.insert n d
+    | some (.extern ..) => externSet := externSet.insert (mangle n)
     | none => throw s!"no IR for `{n}` (not compiled?)"
-  let externNames := (externs.toList.map (mangle ·.1)).mergeSort (· < ·)
-  return (names, externs, externNames)
-
-private def joinChunksAux (xs : Array String) (lo hi : Nat) : String :=
-  if _ : lo ≥ hi then ""
-  else if _ : lo + 1 == hi then xs[lo]!
-  else if _ : lo + 2 == hi then xs[lo]! ++ xs[lo + 1]!
-  else
-    let mid := (lo + hi) / 2
-    joinChunksAux xs lo mid ++ joinChunksAux xs mid hi
-termination_by hi - lo
-decreasing_by all_goals (simp_all; omega)
-
-private def joinChunks (xs : Array String) : String :=
-  joinChunksAux xs 0 xs.size
+  let externNames := externSet.toList.mergeSort (· < ·)
+  return (names, externNames)
 
 def emitProgramWithExterns (env : Environment) (entries : List (Name × String)) (min : Bool := false) :
     Except String (String × List String) := do
   let roots := entries.map (·.1)
-  let (names, externs, externNames) ← collectProgramExterns env roots
+  let (names, externNames) ← collectProgramExterns env roots
   let mut nm : Std.HashMap Name String := {}
   let mut counter := 0
   let entryMap : Std.HashMap Name String := entries.foldl (fun m e => m.insert e.1 e.2) {}
@@ -520,7 +528,7 @@ def emitProgramWithExterns (env : Environment) (entries : List (Name × String))
         | some s => nm := nm.insert n s
         | none   => nm := nm.insert n s!"_g{counter}"; counter := counter + 1
     | _ => pure ()
-  let c : Ctx := { env, names := nm, externs, min }
+  let c : Ctx := { env, names := nm, min }
   let mut chunks : Array String := #[
     if min then "" else "// GENERATED by Js.Backend (Lean-IR → JS). Do not edit.\n",
     "import * as $ from './qed_rt.mjs';\n"
@@ -536,9 +544,6 @@ def emitProgramWithExterns (env : Environment) (entries : List (Name × String))
   chunks := chunks.push ("export const __externs = [" ++
     String.intercalate ", " (externNames.map (s!"\"{·}\"")) ++ "];\n")
   return (joinChunks chunks, externNames)
-
-def emitProgram (env : Environment) (entries : List (Name × String)) (min : Bool := false) : Except String String :=
-  (·.1) <$> emitProgramWithExterns env entries min
 
 private def skipLine : List Char → List Char
   | [] => []
@@ -589,7 +594,7 @@ private def walkRtExports (fuel depth : Nat) (mode : ExportMode)
   match fuel with
   | 0 => acc
   | fuel + 1 =>
-      match nextRtToken (cs.length + 1) cs with
+      match nextRtToken (fuel + 1) cs with
       | (none, _) => acc
       | (some tok, rest) =>
           let addOpt (a : Std.HashSet String) : Option String → Std.HashSet String
@@ -642,9 +647,8 @@ def rtExports (rtSrc : String) : Std.HashSet String :=
   let cs := rtSrc.toList
   walkRtExports (cs.length + 1) 0 .none cs {}
 
-/-- Verify that every extern name in `externNames` is exported by `rtSrc` (`runtime/qed_rt.mjs`). -/
-def verifyRtExterns (rtSrc : String) (externNames : List String) : Except String Unit := do
-  let avail := rtExports rtSrc
+/-- Verify that every extern name in `externNames` is present in `avail` (parsed from `runtime/qed_rt.mjs`). -/
+def checkRtExterns (avail : Std.HashSet String) (externNames : List String) : Except String Unit := do
   let missing := externNames.filter (!avail.contains ·)
   if !missing.isEmpty then
     throw s!"qed_rt: missing externs: {String.intercalate ", " missing}"

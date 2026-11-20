@@ -137,7 +137,7 @@ def findForbiddenTokens (src : String) : Array (Nat × String) := Id.run do
   return hits
 
 def grepForbidden : IO Bool := do
-  let all ← collect "." "lean" [".lake", ".qed", "dist", "toolchains", "node_modules", ".git", "scripts", "Cli"]
+  let all ← collect "." "lean" [".lake", ".qed", "dist", "scratch", "toolchains", "node_modules", ".git", "scripts", "Cli"]
   let files := all.filter (fun p => p.fileName != some "Cli.lean")
   let mut clean := true
   for f in files do
@@ -181,25 +181,27 @@ def effectsCovered : IO Bool := do
     IO.eprintln (red s!"  effect kind \"{k}\" is emitted by a Cmd but no qed_host.mjs case handles it")
   return missing.isEmpty
 
-def kernelEnvClean (q? : Option QedjsEnv := none) : IO Bool := do
+def kernelEnvClean (q? : Option QedjsEnv := none) (alreadyBuilt : Bool := false) : IO Bool := do
   let root ← webRoot
   let hasExamples ← (FilePath.mk "Examples").pathExists
   let some q ← (match q? with | some e => pure (some e) | none => resolveQedjsEnv (needBuild := !hasExamples)) | return false
   if hasExamples then
-    let mods := #[
+    let baseMods := #[
       "Qed", "Qed.Driver", "Qed.Server.Native",
       "Qed.Proofs.DomArena", "Qed.Proofs.ViewPatch", "Qed.Proofs.KeyedReconcile", "Qed.Proofs.Hydration",
       "Js.Backend", "Js.Proofs",
       "Examples.Counter", "Examples.Todo", "Examples.Signup",
       "Examples.Chat", "Examples.Bookshelf", "Examples.CloudBooks", "Examples.LiveRoom",
-      "Tests.ServerChecks", "Tests.SpeculativeChecks", "Tests.SpeculativeApp", "Tests.DomProbe", "Tests.JsGate", root
+      "Tests.ServerChecks", "Tests.SpeculativeChecks", "Tests.SpeculativeApp", "Tests.DomProbe", "Tests.JsGate"
     ]
+    let mods := if baseMods.contains root then baseMods else baseMods.push root
     q.run (#["--verify-env"] ++ mods) (quiet := true)
   else
-    if (← shQuiet "lake" #["build", root]) != 0 then return false
+    if !alreadyBuilt then
+      if (← shQuiet "lake" #["build", root]) != 0 then return false
     q.run #["--verify-env", "--skip-qed", root] (quiet := true)
 
-def externsCovered (q? : Option QedjsEnv := none) : IO Bool := do
+def externsCovered (q? : Option QedjsEnv := none) (alreadyBuilt : Bool := false) : IO Bool := do
   let rtPath ← runtimeFile "qed_rt.mjs"
   unless (← rtPath.pathExists) do return true
   let mod ← jsRoot
@@ -208,25 +210,21 @@ def externsCovered (q? : Option QedjsEnv := none) : IO Bool := do
   let mut mods : Array String := #[]
   let mut entries : Array String := #[]
   if ← modPath.pathExists then
-    if !hasExamples && mod != (← webRoot) then
+    if !alreadyBuilt && !hasExamples && mod != (← webRoot) then
       if (← shQuiet "lake" #["build", mod]) != 0 then return false
-    match ← fullstackAppName mod with
-    | some fsName =>
+    match ← resolveAppMode mod with
+    | .fullstack fsName =>
         mods := #[mod, "Qed.Driver"]
         entries := #[s!"{fsName}.clientApp", "Qed.run"] ++ driverEntries.filter (!·.startsWith "main:")
-    | none =>
-        match ← ssrAppName mod with
-        | some a =>
-            mods := #[mod]
-            entries := driverEntries ++ #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"]
-        | none =>
-            match ← componentAppName mod with
-            | some a =>
-                mods := #[mod, "Qed.Driver"]
-                entries := #["Qed.run"] ++ driverEntries.filter (!·.startsWith "main:") ++ #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"]
-            | none =>
-                mods := #[mod]
-                entries := driverEntries
+    | .ssr a =>
+        mods := #[mod]
+        entries := driverEntries ++ #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"]
+    | .component a =>
+        mods := #[mod, "Qed.Driver"]
+        entries := #["Qed.run"] ++ driverEntries.filter (!·.startsWith "main:") ++ #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"]
+    | .raw =>
+        mods := #[mod]
+        entries := driverEntries
   if hasExamples then
     mods := mods.push "Tests.JsGate"
     entries := entries ++ #["JsGate.run", "JsGate.counts", "JsGate.probeCount", "JsGate.names"]
@@ -248,9 +246,9 @@ def verify (checkExterns : Bool := true) : IO Bool := do
   let tAxiom ← IO.asTask axiomClean
   let tEff ← if hasExamples then IO.asTask effectsCovered else IO.asTask (pure true)
   let q? ← resolveQedjsEnv (needBuild := false)
-  let tExt ← if checkExterns && hasExamples then IO.asTask (externsCovered q?) else IO.asTask (pure true)
-  let ok3 ← kernelEnvClean q?
-  let ok5 ← if checkExterns && !hasExamples && ok3 then externsCovered q? else pure ((← IO.wait tExt).toOption.getD false)
+  let tExt ← if checkExterns && hasExamples then IO.asTask (externsCovered q? (alreadyBuilt := true)) else IO.asTask (pure true)
+  let ok3 ← kernelEnvClean q? (alreadyBuilt := true)
+  let ok5 ← if checkExterns && !hasExamples && ok3 then externsCovered q? (alreadyBuilt := true) else pure ((← IO.wait tExt).toOption.getD false)
   let ok1 := (← IO.wait tGrep).toOption.getD false
   let ok2 := (← IO.wait tAxiom).toOption.getD false
   let ok4 := (← IO.wait tEff).toOption.getD false

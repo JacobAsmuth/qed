@@ -1,7 +1,7 @@
 open System (FilePath)
 
 def String.trimmed (s : String) : String :=
-  String.ofList (((s.toList.dropWhile Char.isWhitespace).reverse.dropWhile Char.isWhitespace).reverse)
+  s.trimAscii.toString
 
 namespace Qed.Cli
 
@@ -86,6 +86,18 @@ def componentAppName (mod : String) : IO (Option String) := do
     | _ => .ok (lastTop, lastAny)
   return lastTop.orElse (fun _ => lastAny)
 
+inductive AppMode where
+  | fullstack (fsName : String)
+  | ssr (appName : String)
+  | component (appName : String)
+  | raw
+
+def resolveAppMode (mod : String) : IO AppMode := do
+  if let some fsName ← fullstackAppName mod then return .fullstack fsName
+  if let some appName ← ssrAppName mod then return .ssr appName
+  if let some appName ← componentAppName mod then return .component appName
+  return .raw
+
 def driverEntries : Array String := #[
   "main:__main",
   "Qed.qedInit:qed_init", "Qed.qedDispatch:qed_dispatch", "Qed.qedDispatchStr:qed_dispatch_str",
@@ -99,11 +111,8 @@ def driverEntries : Array String := #[
   "Qed.qedWsText:qed_ws_text", "Qed.qedWsClose:qed_ws_close"]
 
 def bold   (s : String) : String := s!"\x1b[1m{s}\x1b[0m"
-def dim    (s : String) : String := s!"\x1b[2m{s}\x1b[0m"
 def green  (s : String) : String := s!"\x1b[32m{s}\x1b[0m"
 def red    (s : String) : String := s!"\x1b[31m{s}\x1b[0m"
-def yellow (s : String) : String := s!"\x1b[33m{s}\x1b[0m"
-def cyan   (s : String) : String := s!"\x1b[36m{s}\x1b[0m"
 def step   (s : String) : IO Unit := IO.println (bold s!"▸ {s}")
 
 private def useColor : IO Bool := do
@@ -117,43 +126,28 @@ private def paint (enabled : Bool) (code s : String) : String :=
 /-- Parses a Lean diagnostic header line like `error: File.lean:12:4: msg` or
     `File.lean:12:4: error: msg` into `(severity, path, line, col, msg)`. -/
 private def parseLeanDiagLine (line : String) : Option (String × String × Nat × Nat × String) := do
-  let trySevPrefix (pfx sev : String) : Option (String × String × Nat × Nat × String) := do
-    if !line.startsWith pfx then none
-    else
-      let rest := (line.drop pfx.length).toString.trimmed
-      let parts := rest.splitOn ":"
-      match parts with
-      | path :: lnS :: colS :: msgParts =>
-          let ln ← lnS.trimmed.toNat?
-          let col ← colS.trimmed.toNat?
-          let msg := (String.intercalate ":" msgParts).trimmed
-          some (sev, path.trimmed, ln, col, msg)
-      | _ => none
+  let parseLocMsg (sev rest : String) : Option (String × String × Nat × Nat × String) := do
+    match rest.splitOn ":" with
+    | path :: lnS :: colS :: msgParts =>
+        let ln ← lnS.trimmed.toNat?
+        let col ← colS.trimmed.toNat?
+        some (sev, path.trimmed, ln, col, (String.intercalate ":" msgParts).trimmed)
+    | _ => none
   -- Handle `error(lean.xxx): File.lean:12:4: msg`
   if line.startsWith "error(" then
     match line.splitOn "): " with
-    | _ :: restParts =>
-        let rest := String.intercalate "): " restParts
-        match rest.splitOn ":" with
-        | path :: lnS :: colS :: msgParts =>
-            let ln ← lnS.trimmed.toNat?
-            let col ← colS.trimmed.toNat?
-            let msg := (String.intercalate ":" msgParts).trimmed
-            return ("error", path.trimmed, ln, col, msg)
-        | _ => failure
+    | _ :: restParts => return ← parseLocMsg "error" (String.intercalate "): " restParts)
     | _ => failure
-  if let some r := trySevPrefix "error:" "error" then return r
-  if let some r := trySevPrefix "warning:" "warning" then return r
+  for (pfx, sev) in [("error:", "error"), ("warning:", "warning")] do
+    if line.startsWith pfx then
+      if let some r := parseLocMsg sev (line.drop pfx.length).toString.trimmed then return r
   -- Handle `File.lean:12:4: error: msg`
   match line.splitOn ":" with
   | path :: lnS :: colS :: sevS :: msgParts =>
       if path.endsWith ".lean" then
-        let ln ← lnS.trimmed.toNat?
-        let col ← colS.trimmed.toNat?
         let sev := sevS.trimmed
         if sev == "error" || sev == "warning" then
-          let msg := (String.intercalate ":" msgParts).trimmed
-          return (sev, path.trimmed, ln, col, msg)
+          return ← parseLocMsg sev (String.intercalate ":" (path :: lnS :: colS :: msgParts))
       failure
   | _ => failure
 
@@ -258,6 +252,12 @@ def shQuiet (cmd : String) (args : Array String) (extraEnv : Array (String × Op
 
 def shLakeBuild (args : Array String) : IO UInt32 := do
   let (code, out) ← shOut "lake" args
+  if code != 0 then
+    IO.eprint (← formatLakeDiagnostics out)
+  return code
+
+def shLean (leanPath : String) (args : Array String) : IO UInt32 := do
+  let (code, out) ← shOut "lean" args #[("LEAN_PATH", some leanPath)]
   if code != 0 then
     IO.eprint (← formatLakeDiagnostics out)
   return code

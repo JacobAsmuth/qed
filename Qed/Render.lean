@@ -56,17 +56,39 @@ private theorem isHtmlSpecialByte_eq (c : Char) (hc : c.toNat ≤ 127) :
     simp [hle', hne '&' (by decide), hne '<' (by decide), hne '>' (by decide),
       hne '"' (by decide), hne '\'' (by decide)]
 
+private theorem push_eq_append_r (a : String) (c : Char) : a.push c = a ++ String.singleton c := by
+  ext; simp
+
+private theorem push_append_r (a b : String) (c : Char) : (a ++ b).push c = a ++ b.push c := by
+  rw [push_eq_append_r, push_eq_append_r, String.append_assoc]
+
+private theorem escapeHtmlStep_append (a b : String) (c : Char) :
+    escapeHtmlStep (a ++ b) c = a ++ escapeHtmlStep b c := by
+  unfold escapeHtmlStep
+  cases c == '&'
+  · cases c == '<'
+    · cases c == '>'
+      · cases c == '"'
+        · cases c == '\''
+          · exact push_append_r a b c
+          · exact String.append_assoc
+        · exact String.append_assoc
+      · exact String.append_assoc
+    · exact String.append_assoc
+  · exact String.append_assoc
+
+private theorem foldl_escapeHtmlStep_append_aux :
+    ∀ (cs : List Char) (a b : String), cs.foldl escapeHtmlStep (a ++ b) = a ++ cs.foldl escapeHtmlStep b
+  | [], _, _ => rfl
+  | c :: cs, a, b => by
+      simp only [List.foldl_cons, escapeHtmlStep_append]
+      exact foldl_escapeHtmlStep_append_aux cs a (escapeHtmlStep b c)
+
 private theorem foldl_escapeHtmlStep_append (cs : List Char) (acc : String) :
     cs.foldl escapeHtmlStep acc = acc ++ cs.foldl escapeHtmlStep "" := by
-  have hstep : ∀ (a b : String) (c : Char), escapeHtmlStep (a ++ b) c = a ++ escapeHtmlStep b c := by
-    intro a b c; unfold escapeHtmlStep
-    repeat' split
-    all_goals (ext; simp [String.append_assoc])
-  have hgen : ∀ (cs : List Char) (a b : String), cs.foldl escapeHtmlStep (a ++ b) = a ++ cs.foldl escapeHtmlStep b := by
-    intro cs; induction cs with
-    | nil => intro _ _; rfl
-    | cons c cs ih => intro a b; simp only [List.foldl_cons, hstep, ih]
-  simpa using hgen cs acc ""
+  have h := foldl_escapeHtmlStep_append_aux cs acc ""
+  rw [String.append_empty] at h
+  exact h
 
 private theorem escapeHtmlAcc_eq (acc s : String) : escapeHtmlAcc acc s = acc ++ escapeHtml s := by
   unfold escapeHtmlAcc escapeHtml; dsimp only
@@ -315,16 +337,35 @@ def renderAttrAcc (hs : Array msg) (acc : String) : Attr msg → String × Array
   | .localCell key comp _ _ _ => ((escapeHtmlAcc (acc ++ " data-qed-local=\"") (localKey comp key)).push '"', hs)
   | .signalBind name => ((escapeHtmlAcc (acc ++ " data-qed-signal=\"") name).push '"', hs)
 
-private theorem push_eq_append_r (a : String) (c : Char) : a.push c = a ++ String.singleton c := by
-  ext; simp
+private theorem singleton_quote : String.singleton '"' = "\"" := rfl
+private theorem singleton_space : String.singleton ' ' = " " := rfl
+private theorem singleton_lt : String.singleton '<' = "<" := rfl
+private theorem singleton_gt : String.singleton '>' = ">" := rfl
+private theorem singleton_nl : String.singleton '\n' = "\n" := rfl
 
 private theorem renderAttrAcc_eq (hs : Array msg) (acc : String) (a : Attr msg) :
     renderAttrAcc hs acc a = (acc ++ (renderAttr hs a).1, (renderAttr hs a).2) := by
   cases a <;> unfold renderAttrAcc renderAttr <;> dsimp only [renderSafeAttrAcc]
-  all_goals first
-    | (simp; done)
-    | (simp only [escapeHtmlAcc_eq, push_eq_append_r, String.append_assoc]; rfl)
-    | (split <;> first | (simp; done) | (simp only [escapeHtmlAcc_eq, push_eq_append_r, String.append_assoc]; rfl))
+  · simp only [escapeHtmlAcc_eq, push_eq_append_r, singleton_quote, toString_string, String.append_assoc]
+  · split
+    · simp only [String.append_empty]
+    · simp only [escapeHtmlAcc_eq, push_eq_append_r, singleton_quote, singleton_space, toString_string, String.append_assoc]
+  · split
+    · simp only [String.append_empty]
+    · simp only [push_eq_append_r, singleton_quote, singleton_space, toString_string, String.append_assoc]
+  · simp only [String.append_empty]
+  · split
+    · simp only [String.append_empty]
+    · simp only [push_eq_append_r, singleton_quote, toString_string, String.append_assoc]
+  · simp only [String.append_empty]
+  · simp only [escapeHtmlAcc_eq, push_eq_append_r, singleton_quote, toString_string, String.append_assoc]
+  · simp only [escapeHtmlAcc_eq, push_eq_append_r, singleton_quote, toString_string, String.append_assoc]
+  · split
+    · simp only [String.append_empty]
+    · simp only [escapeHtmlAcc_eq, push_eq_append_r, singleton_quote, singleton_space, toString_string, String.append_assoc]
+  · split
+    · simp only [String.append_empty]
+    · simp only [push_eq_append_r, singleton_quote, toString_string, String.append_assoc]
 
 def renderAttrsAcc (hs : Array msg) (acc : String) : List (Attr msg) → String × Array msg
   | []      => (acc, hs)
@@ -349,12 +390,16 @@ private theorem renderElemAttrsAcc_eq (hs : Array msg) (acc : String) (attrs : L
     renderElemAttrsAcc hs acc attrs =
       (acc ++ (renderAttrs hs (normalizeAttrs attrs)).1, (renderAttrs hs (normalizeAttrs attrs)).2) := by
   cases attrs with
-  | nil => simp [renderElemAttrsAcc, normalizeAttrs, dedupAttrs, renderAttrs]
+  | nil =>
+      change (acc, hs) = (acc ++ "", hs)
+      rw [String.append_empty]
   | cons a rest =>
       cases a with
       | key k =>
           cases rest with
-          | nil => simp [renderElemAttrsAcc, normalizeAttrs, dedupAttrs, Attr.key?, renderAttrs, renderAttr]
+          | nil =>
+              change (acc, hs) = (acc ++ ("" ++ ""), hs)
+              rw [String.append_empty, String.append_empty]
           | cons b rest' => exact renderAttrsAcc_eq hs acc (normalizeAttrs (.key k :: b :: rest'))
       | _ => exact renderAttrsAcc_eq hs acc (normalizeAttrs (_ :: rest))
 
@@ -391,19 +436,23 @@ mutual
         unfold renderNodeAcc renderNode renderElement
         rw [renderElemAttrsAcc_eq]
         by_cases hraw : (tag == "style" || tag == "script") = true
-        · simp only [hraw, ↓reduceIte, push_eq_append_r, String.append_assoc]; rfl
+        · simp only [hraw, ↓reduceIte, push_eq_append_r, singleton_lt, singleton_gt, toString_string,
+            String.append_assoc]
         · have hrawF : (tag == "style" || tag == "script") = false := Bool.eq_false_iff.2 hraw
           simp only [hrawF, Bool.false_eq_true, ↓reduceIte]
           by_cases hvoid : isVoidTag tag = true
-          · simp only [hvoid, ↓reduceIte, push_eq_append_r, String.append_assoc]; rfl
+          · simp only [hvoid, ↓reduceIte, push_eq_append_r, singleton_lt, singleton_gt, toString_string,
+              String.append_assoc]
           · have hvoidF : isVoidTag tag = false := Bool.eq_false_iff.2 hvoid
             simp only [hvoidF, Bool.false_eq_true, ↓reduceIte]
             by_cases hta : (tag == "textarea") = true
             · simp only [hta, ↓reduceIte, renderChildrenAcc_eq, String.empty_append, Bool.true_and]
-              split <;> (simp only [push_eq_append_r, String.append_assoc]; rfl)
+              split <;> simp only [push_eq_append_r, singleton_lt, singleton_gt, singleton_nl,
+                toString_string, String.append_assoc]
             · have htaF : (tag == "textarea") = false := Bool.eq_false_iff.2 hta
               simp only [htaF, Bool.false_eq_true, ↓reduceIte, Bool.false_and,
-                renderChildrenAcc_eq, push_eq_append_r, String.append_assoc]; rfl
+                renderChildrenAcc_eq, push_eq_append_r, singleton_lt, singleton_gt, toString_string,
+                String.append_assoc]
   theorem renderChildrenAcc_eq (hs : Array msg) (acc : String) (cs : List (Html msg)) :
       renderChildrenAcc hs acc cs =
         (acc ++ (renderChildren hs cs).1, (renderChildren hs cs).2) := by
@@ -614,83 +663,21 @@ private theorem lit_no_angle (s : String) (h : s.toList.all (fun c => c != '<' &
   simp only [Bool.and_eq_true, bne_iff_ne] at hb
   exact hb
 
-/-- Defense-in-depth: no rendered attribute string ever contains `<` or `>`, preventing HTML
-    tag breakout from attribute context regardless of attribute values or keys. -/
-theorem renderAttr_no_angle_brackets (hs : Array msg) (a : Attr msg) :
-    ∀ c ∈ (renderAttr hs a).1.toList, c ≠ '<' ∧ c ≠ '>' := by
-  cases a with
-  | cls name =>
-      simp only [renderAttr, toString_string]
-      repeat apply str_append_no_angle
-      · exact lit_no_angle " class=\"" rfl
-      · exact escapeHtml_no_angle name
-      · exact lit_no_angle "\"" rfl
-  | attr k v =>
-      simp only [renderAttr]
-      split
-      · exact lit_no_angle "" rfl
-      · simp only [toString_string]
-        repeat apply str_append_no_angle
-        · exact lit_no_angle " " rfl
-        · exact fun c hc => isKeyChar_no_angle (sanitizeKey_safe k c hc)
-        · exact lit_no_angle "=\"" rfl
-        · exact escapeHtml_no_angle v
-        · exact lit_no_angle "\"" rfl
-  | flag k present =>
-      simp only [renderAttr]
-      split
-      · exact lit_no_angle "" rfl
-      · simp only [toString_string]
-        repeat apply str_append_no_angle
-        · exact lit_no_angle " " rfl
-        · exact fun c hc => isKeyChar_no_angle (sanitizeKey_safe k c hc)
-        · exact lit_no_angle "=\"" rfl
-        · exact fun c hc => isKeyChar_no_angle (sanitizeKey_safe k c hc)
-        · exact lit_no_angle "\"" rfl
-  | key _ => exact lit_no_angle "" rfl
-  | on event m | signalOn _ event m =>
-      simp only [renderAttr]
-      split
-      · exact lit_no_angle "" rfl
-      · simp only [toString_string]
-        repeat apply str_append_no_angle
-        · exact lit_no_angle " data-qed-on-" rfl
-        · exact fun c hc => isKeyChar_no_angle (sanitizeKey_safe event c hc)
-        · exact lit_no_angle "=\"" rfl
-        · exact nat_repr_no_angle hs.size
-        · exact lit_no_angle "\"" rfl
-  | onValue _ _ => exact lit_no_angle "" rfl
-  | localCell key comp _ _ _ =>
-      simp only [renderAttr, toString_string]
-      repeat apply str_append_no_angle
-      · exact lit_no_angle " data-qed-local=\"" rfl
-      · exact escapeHtml_no_angle (localKey comp key)
-      · exact lit_no_angle "\"" rfl
-  | signalBind name =>
-      simp only [renderAttr, toString_string]
-      repeat apply str_append_no_angle
-      · exact lit_no_angle " data-qed-signal=\"" rfl
-      · exact escapeHtml_no_angle name
-      · exact lit_no_angle "\"" rfl
-  | signalAttr _ attr value =>
-      simp only [renderAttr]
-      split
-      · exact lit_no_angle "" rfl
-      · simp only [toString_string]
-        repeat apply str_append_no_angle
-        · exact lit_no_angle " " rfl
-        · exact fun c hc => isKeyChar_no_angle (sanitizeKey_safe attr c hc)
-        · exact lit_no_angle "=\"" rfl
-        · exact escapeHtml_no_angle value
-        · exact lit_no_angle "\"" rfl
+private theorem str_append3_no_angle {a b c : String}
+    (ha : ∀ x ∈ a.toList, x ≠ '<' ∧ x ≠ '>')
+    (hb : ∀ x ∈ b.toList, x ≠ '<' ∧ x ≠ '>')
+    (hc : ∀ x ∈ c.toList, x ≠ '<' ∧ x ≠ '>') :
+    ∀ x ∈ (a ++ b ++ c).toList, x ≠ '<' ∧ x ≠ '>' :=
+  str_append_no_angle (str_append_no_angle ha hb) hc
 
-theorem renderAttrs_no_angle_brackets (hs : Array msg) :
-    ∀ (attrs : List (Attr msg)), ∀ c ∈ (renderAttrs hs attrs).1.toList, c ≠ '<' ∧ c ≠ '>'
-  | [] => lit_no_angle "" rfl
-  | a :: as => by
-      simp only [renderAttrs]
-      exact str_append_no_angle (renderAttr_no_angle_brackets hs a)
-        (renderAttrs_no_angle_brackets (renderAttr hs a).2 as)
+private theorem str_append5_no_angle {a b c d e : String}
+    (ha : ∀ x ∈ a.toList, x ≠ '<' ∧ x ≠ '>')
+    (hb : ∀ x ∈ b.toList, x ≠ '<' ∧ x ≠ '>')
+    (hc : ∀ x ∈ c.toList, x ≠ '<' ∧ x ≠ '>')
+    (hd : ∀ x ∈ d.toList, x ≠ '<' ∧ x ≠ '>')
+    (he : ∀ x ∈ e.toList, x ≠ '<' ∧ x ≠ '>') :
+    ∀ x ∈ (a ++ b ++ c ++ d ++ e).toList, x ≠ '<' ∧ x ≠ '>' :=
+  str_append_no_angle (str_append_no_angle (str_append_no_angle (str_append_no_angle ha hb) hc) hd) he
 
 /-- End-to-end HTML safety closure: whenever `Html.validIn ctx h = true`, every element in `h`
     has a safe, non-forbidden tag (`<script>`/`<base>`/`<object>`/`<embed>`/`<applet>` forbidden),
@@ -708,11 +695,10 @@ def Html.EveryElementSafe : Html msg → Prop
       ∀ c ∈ children, Html.EveryElementSafe c
 
 mutual
-  theorem Html.validIn_everyElementSafe :
-      ∀ (ctx : HtmlCtx) (h : Html msg),
-        Html.validIn ctx h = true → Html.EveryElementSafe h
-    | _, .text _, _ => by simp [Html.EveryElementSafe]
-    | ctx, .element tag attrs children, hv => by
+  theorem Html.validIn_everyElementSafe (ctx : HtmlCtx) :
+      (h : Html msg) → Html.validIn ctx h = true → Html.EveryElementSafe h
+    | .text _, _ => by simp only [Html.EveryElementSafe]
+    | .element tag attrs children, hv => by
         simp only [Html.validIn, Bool.and_eq_true] at hv
         rcases hv with ⟨⟨⟨hattrs, hvoid⟩, _⟩, hrest⟩
         cases hctx : stepHtmlCtx ctx tag with
@@ -730,19 +716,79 @@ mutual
               refine ⟨hok.1, hok.2, hattrs, hvoid, fun _ => containsCloseSeq_escapeRawText _, ?_⟩
               exact Html.validListIn_everyElementSafe childCtx children hrest
 
-  theorem Html.validListIn_everyElementSafe :
-      ∀ (ctx : HtmlCtx) (cs : List (Html msg)),
-        Html.validListIn ctx cs = true → ∀ c ∈ cs, Html.EveryElementSafe c
-    | _, [], _, _, h => nomatch h
-    | ctx, y :: ys, hy, x, hx => by
+  theorem Html.validListIn_everyElementSafe (ctx : HtmlCtx) :
+      (cs : List (Html msg)) → Html.validListIn ctx cs = true → ∀ c ∈ cs, Html.EveryElementSafe c
+    | [], _, _, h => nomatch h
+    | y :: ys, hy, x, hx => by
         simp only [Html.validListIn, Bool.and_eq_true] at hy
-        rcases List.mem_cons.1 hx with rfl | hx'
-        · exact Html.validIn_everyElementSafe ctx x hy.1
+        rcases List.mem_cons.1 hx with hxy | hx'
+        · rw [hxy]; exact Html.validIn_everyElementSafe ctx y hy.1
         · exact Html.validListIn_everyElementSafe ctx ys hy.2 x hx'
 end
 
 theorem Html.valid_everyElementSafe {h : Html msg} (hv : Html.valid h = true) :
     Html.EveryElementSafe h :=
   Html.validIn_everyElementSafe {} h hv
+
+private theorem empty_no_angle : ∀ c ∈ ("").toList, c ≠ '<' ∧ c ≠ '>' := fun _ h => nomatch h
+private theorem quote_no_angle : ∀ c ∈ ("\"").toList, c ≠ '<' ∧ c ≠ '>' := lit_no_angle "\"" rfl
+private theorem space_no_angle : ∀ c ∈ (" ").toList, c ≠ '<' ∧ c ≠ '>' := lit_no_angle " " rfl
+private theorem eq_quote_no_angle : ∀ c ∈ ("=\"").toList, c ≠ '<' ∧ c ≠ '>' := lit_no_angle "=\"" rfl
+
+/-- Defense-in-depth: no rendered attribute string ever contains `<` or `>`, preventing HTML
+    tag breakout from attribute context regardless of attribute values or keys. -/
+theorem renderAttr_no_angle_brackets (hs : Array msg) (a : Attr msg) :
+    ∀ c ∈ (renderAttr hs a).1.toList, c ≠ '<' ∧ c ≠ '>' := by
+  cases a with
+  | cls name =>
+      simp only [renderAttr, toString_string]
+      exact str_append3_no_angle (lit_no_angle " class=\"" rfl) (escapeHtml_no_angle name) quote_no_angle
+  | attr k v =>
+      simp only [renderAttr]
+      split
+      · exact empty_no_angle
+      · simp only [toString_string]
+        exact str_append5_no_angle space_no_angle (fun c hc => isKeyChar_no_angle (sanitizeKey_safe k c hc))
+          eq_quote_no_angle (escapeHtml_no_angle v) quote_no_angle
+  | flag k present =>
+      simp only [renderAttr]
+      split
+      · exact empty_no_angle
+      · simp only [toString_string]
+        exact str_append5_no_angle space_no_angle (fun c hc => isKeyChar_no_angle (sanitizeKey_safe k c hc))
+          eq_quote_no_angle (fun c hc => isKeyChar_no_angle (sanitizeKey_safe k c hc)) quote_no_angle
+  | key _ => exact empty_no_angle
+  | on event m | signalOn _ event m =>
+      simp only [renderAttr]
+      split
+      · exact empty_no_angle
+      · simp only [toString_string]
+        exact str_append5_no_angle (lit_no_angle " data-qed-on-" rfl)
+          (fun c hc => isKeyChar_no_angle (sanitizeKey_safe event c hc))
+          eq_quote_no_angle (nat_repr_no_angle hs.size) quote_no_angle
+  | onValue _ _ => exact empty_no_angle
+  | localCell key comp _ _ _ =>
+      simp only [renderAttr, toString_string]
+      exact str_append3_no_angle (lit_no_angle " data-qed-local=\"" rfl)
+        (escapeHtml_no_angle (localKey comp key)) quote_no_angle
+  | signalBind name =>
+      simp only [renderAttr, toString_string]
+      exact str_append3_no_angle (lit_no_angle " data-qed-signal=\"" rfl)
+        (escapeHtml_no_angle name) quote_no_angle
+  | signalAttr _ attr value =>
+      simp only [renderAttr]
+      split
+      · exact empty_no_angle
+      · simp only [toString_string]
+        exact str_append5_no_angle space_no_angle (fun c hc => isKeyChar_no_angle (sanitizeKey_safe attr c hc))
+          eq_quote_no_angle (escapeHtml_no_angle value) quote_no_angle
+
+theorem renderAttrs_no_angle_brackets (hs : Array msg) :
+    ∀ (attrs : List (Attr msg)), ∀ c ∈ (renderAttrs hs attrs).1.toList, c ≠ '<' ∧ c ≠ '>'
+  | [] => empty_no_angle
+  | a :: as => by
+      simp only [renderAttrs]
+      exact str_append_no_angle (renderAttr_no_angle_brackets hs a)
+        (renderAttrs_no_angle_brackets (renderAttr hs a).2 as)
 
 end Qed

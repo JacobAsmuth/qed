@@ -63,120 +63,15 @@ def escapeRawText (s : String) : String :=
   if !containsCloseSeq s.toList then s
   else String.ofList (escapeCloseSeqLoop false s.toList)
 
-theorem containsCloseSeqLoop_escapeCloseSeqLoop (cs : List Char) :
-    ∀ (b : Bool), containsCloseSeqLoop b (escapeCloseSeqLoop b cs) = false := by
-  induction cs with
-  | nil => intro _; rfl
-  | cons c rest ih =>
-      intro b
-      simp only [escapeCloseSeqLoop]
-      cases h : (b && c == '/')
-      · simpa [containsCloseSeqLoop, h] using ih (c == '<')
-      · simpa [containsCloseSeqLoop] using ih false
-
-@[simp] theorem containsCloseSeq_escapeRawText (s : String) :
-    containsCloseSeq (escapeRawText s).toList = false := by
-  unfold escapeRawText containsCloseSeq
-  by_cases h : containsCloseSeqLoop false s.toList
-  · simp [h, containsCloseSeqLoop_escapeCloseSeqLoop]
-  · simp [h]
-
 @[specialize 2] def hasAsciiByteLoop (s : String) (p : UInt8 → Bool) (sz : Nat) (hsz : sz = s.utf8ByteSize) (i : Nat) : Bool :=
   if h : i < sz then
-    if p (s.getUTF8Byte ⟨i⟩ (show i < s.utf8ByteSize by omega)) then true else hasAsciiByteLoop s p sz hsz (i + 1)
+    if p (s.getUTF8Byte ⟨i⟩ (show i < s.utf8ByteSize from hsz ▸ h)) then true else hasAsciiByteLoop s p sz hsz (i + 1)
   else false
 termination_by sz - i
+decreasing_by exact Nat.sub_succ_lt_self sz i h
 
 @[inline] def hasAsciiByte (s : String) (p : UInt8 → Bool) : Bool :=
   hasAsciiByteLoop s p s.utf8ByteSize rfl 0
-
-private theorem list_toByteArray_loop_data (bs : List UInt8) (acc : ByteArray) :
-    (List.toByteArray.loop bs acc).data.toList = acc.data.toList ++ bs := by
-  induction bs generalizing acc with
-  | nil => simp [List.toByteArray.loop]
-  | cons b bs ih => simp only [List.toByteArray.loop, ih]; simp [ByteArray.push, List.append_assoc]
-
-private theorem list_toByteArray_data (bs : List UInt8) : bs.toByteArray.data.toList = bs := by
-  have h := list_toByteArray_loop_data bs ByteArray.empty
-  have hem : ByteArray.empty.data.toList = [] := rfl
-  rw [hem, List.nil_append] at h; exact h
-
-private theorem string_toByteArray_data (s : String) :
-    s.toByteArray.data.toList = s.toList.flatMap String.utf8EncodeChar := by
-  have h1 : s.toByteArray = s.toList.utf8Encode := by
-    rw [← String.toByteArray_ofList, String.ofList_toList]
-  rw [h1, List.utf8Encode, list_toByteArray_data]
-
-private theorem utf8EncodeChar_le_127 (c : Char) (hc : c.toNat ≤ 127) :
-    String.utf8EncodeChar c = [UInt8.ofNat c.toNat] := by
-  unfold String.utf8EncodeChar
-  have hc' : c.val.toNat ≤ 127 := hc
-  simp only [hc', ↓reduceIte]; rfl
-
-private theorem utf8EncodeChar_gt_127 (c : Char) (h : c.toNat > 127) :
-    ∀ b ∈ String.utf8EncodeChar c, b.toNat ≥ 128 := by
-  unfold String.utf8EncodeChar
-  have h1 : ¬(c.val.toNat ≤ 127) := by change ¬(c.toNat ≤ 127); omega
-  simp only [h1, ↓reduceIte]
-  split
-  · intro b hb; simp only [List.mem_cons, List.not_mem_nil, or_false] at hb
-    rcases hb with rfl | rfl <;> (change (_ % 256) ≥ 128; omega)
-  · split
-    · intro b hb; simp only [List.mem_cons, List.not_mem_nil, or_false] at hb
-      rcases hb with rfl | rfl | rfl <;> (change (_ % 256) ≥ 128; omega)
-    · intro b hb; simp only [List.mem_cons, List.not_mem_nil, or_false] at hb
-      rcases hb with rfl | rfl | rfl | rfl <;> (change (_ % 256) ≥ 128; omega)
-
-private theorem utf8EncodeChar_ne_nil (c : Char) : String.utf8EncodeChar c ≠ [] := by
-  unfold String.utf8EncodeChar; dsimp only
-  split
-  · simp
-  · split
-    · simp
-    · split <;> simp
-
-private theorem hasAsciiByteLoop_eq (s : String) (p : UInt8 → Bool) (i : Nat) :
-    hasAsciiByteLoop s p s.utf8ByteSize rfl i = (s.toByteArray.data.toList.drop i).any p := by
-  fun_induction hasAsciiByteLoop s p s.utf8ByteSize rfl i with
-  | case1 i h hp =>
-      have hlt : i < s.toByteArray.data.toList.length := by
-        rw [Array.length_toList]; change i < s.toByteArray.size; rw [String.size_toByteArray]; exact h
-      rw [List.drop_eq_getElem_cons hlt, List.any_cons]
-      have hget : s.toByteArray.data.toList[i] = s.getUTF8Byte ⟨i⟩ h := rfl
-      rw [hget, hp]; rfl
-  | case2 i h hp ih =>
-      have hlt : i < s.toByteArray.data.toList.length := by
-        rw [Array.length_toList]; change i < s.toByteArray.size; rw [String.size_toByteArray]; exact h
-      rw [List.drop_eq_getElem_cons hlt, List.any_cons]
-      have hget : s.toByteArray.data.toList[i] = s.getUTF8Byte ⟨i⟩ h := rfl
-      have hpf : p (s.getUTF8Byte ⟨i⟩ h) = false := Bool.eq_false_iff.2 hp
-      rw [hget, hpf, Bool.false_or, ih]
-  | case3 i h =>
-      have hge : s.toByteArray.data.toList.length ≤ i := by
-        rw [Array.length_toList]
-        have h' : ¬(i < s.toByteArray.size) := by rw [String.size_toByteArray]; exact h
-        exact Nat.le_of_not_lt h'
-      rw [List.drop_eq_nil_of_le hge]; rfl
-
-theorem hasAsciiByte_eq_any (s : String) (p : UInt8 → Bool) (q : Char → Bool)
-    (hhi : ∀ b : UInt8, b.toNat ≥ 128 → p b = false)
-    (hlo : ∀ c : Char, c.toNat ≤ 127 → p (UInt8.ofNat c.toNat) = q c)
-    (hqhi : ∀ c : Char, c.toNat > 127 → q c = false) :
-    hasAsciiByte s p = s.toList.any q := by
-  have hgo : hasAsciiByte s p = s.toByteArray.data.toList.any p := by
-    simpa [hasAsciiByte] using hasAsciiByteLoop_eq s p 0
-  rw [hgo, string_toByteArray_data, List.any_flatMap]
-  congr 1
-  funext c
-  by_cases hc : c.toNat ≤ 127
-  · rw [utf8EncodeChar_le_127 c hc]
-    simp only [List.any_cons, List.any_nil, Bool.or_false]
-    exact hlo c hc
-  · have hgt : c.toNat > 127 := by omega
-    rw [hqhi c hgt]
-    rw [List.any_eq_false]
-    intro b hb
-    simp [hhi b (utf8EncodeChar_gt_127 c hgt b hb)]
 
 private def escapeCloseSeqBytesSpec (afterLt : Bool) : List UInt8 → List UInt8
   | []      => []
@@ -184,91 +79,8 @@ private def escapeCloseSeqBytesSpec (afterLt : Bool) : List UInt8 → List UInt8
       if afterLt && b == 47 then 92 :: 47 :: escapeCloseSeqBytesSpec false bs
       else b :: escapeCloseSeqBytesSpec (b == 60) bs
 
-theorem asciiByte_beq_char (c : Char) (hc : c.toNat ≤ 127) (target : Char) (ht : target.toNat ≤ 127) :
-    (UInt8.ofNat c.toNat == UInt8.ofNat target.toNat) = (c == target) := by
-  cases heq : (c == target)
-  · rw [beq_eq_false_iff_ne] at heq ⊢
-    intro h; apply heq
-    have hnat : c.toNat = target.toNat := by
-      have h1 : (UInt8.ofNat c.toNat).toNat = (UInt8.ofNat target.toNat).toNat := congrArg UInt8.toNat h
-      change c.toNat % 256 = target.toNat % 256 at h1
-      omega
-    exact Char.ext (UInt32.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq hnat))
-  · rw [beq_iff_eq] at heq; subst heq; simp
-
-private theorem escapeCloseSeqBytes_hi (xs ys : List UInt8) (hhi : ∀ b ∈ xs, b.toNat ≥ 128) (hne : xs ≠ []) :
-    ∀ afterLt, escapeCloseSeqBytesSpec afterLt (xs ++ ys) = xs ++ escapeCloseSeqBytesSpec false ys := by
-  induction xs with
-  | nil => exact absurd rfl hne
-  | cons b bs ih =>
-      intro afterLt
-      have hb : b.toNat ≥ 128 := hhi b (by simp)
-      have hb47 : (b == 47) = false := by
-        rw [beq_eq_false_iff_ne]; intro heq; subst heq; exact absurd hb (by decide)
-      have hb60 : (b == 60) = false := by
-        rw [beq_eq_false_iff_ne]; intro heq; subst heq; exact absurd hb (by decide)
-      simp only [List.cons_append, escapeCloseSeqBytesSpec, hb47, hb60, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
-      cases bs with
-      | nil => rfl
-      | cons b' bs' => rw [ih (fun x hx => hhi x (by simp [hx])) (by simp) false]
-
-private theorem escapeCloseSeqBytes_flatMap (cs : List Char) :
-    ∀ afterLt, escapeCloseSeqBytesSpec afterLt (cs.flatMap String.utf8EncodeChar) =
-      (escapeCloseSeqLoop afterLt cs).flatMap String.utf8EncodeChar := by
-  induction cs with
-  | nil => intro _; rfl
-  | cons c cs ih =>
-      intro afterLt
-      simp only [List.flatMap_cons, escapeCloseSeqLoop]
-      by_cases hc : c.toNat ≤ 127
-      · have h1 := utf8EncodeChar_le_127 c hc
-        have h47 : (UInt8.ofNat c.toNat == 47) = (c == '/') := asciiByte_beq_char c hc '/' (by decide)
-        have h60 : (UInt8.ofNat c.toNat == 60) = (c == '<') := asciiByte_beq_char c hc '<' (by decide)
-        rw [h1, List.singleton_append, escapeCloseSeqBytesSpec, h47, h60]
-        split
-        · simp [List.flatMap_cons, ih]; rfl
-        · simp [List.flatMap_cons, h1, ih]
-      · have hgt : c.toNat > 127 := by omega
-        have hc47 : (c == '/') = false := by
-          rw [beq_eq_false_iff_ne]; intro h; subst h; exact absurd hgt (by decide)
-        have hc60 : (c == '<') = false := by
-          rw [beq_eq_false_iff_ne]; intro h; subst h; exact absurd hgt (by decide)
-        rw [escapeCloseSeqBytes_hi _ _ (utf8EncodeChar_gt_127 c hgt) (utf8EncodeChar_ne_nil c) afterLt]
-        simp [hc47, hc60, List.flatMap_cons, ih]
-
-private theorem escapeCloseSeqLoop_noop (cs : List Char) (afterLt : Bool)
-    (h : containsCloseSeqLoop afterLt cs = false) :
-    escapeCloseSeqLoop afterLt cs = cs := by
-  induction cs generalizing afterLt with
-  | nil => rfl
-  | cons c cs ih =>
-      simp only [containsCloseSeqLoop, Bool.or_eq_false_iff] at h
-      simp only [escapeCloseSeqLoop, h.1, Bool.false_eq_true, ↓reduceIte]
-      rw [ih (c == '<') h.2]
-
-private theorem escapeRawText_eq_always (s : String) :
-    escapeRawText s = String.ofList (escapeCloseSeqLoop false s.toList) := by
-  unfold escapeRawText containsCloseSeq
-  cases h : containsCloseSeqLoop false s.toList
-  · simp [escapeCloseSeqLoop_noop s.toList false h]
-  · simp
-
 @[inline] private def copySliceAppend (src : ByteArray) (segStart stop : Nat) (acc : ByteArray) : ByteArray :=
   src.copySlice segStart acc acc.size (stop - segStart) false
-
-private theorem copySliceAppend_data (src : ByteArray) (segStart stop : Nat) (acc : ByteArray)
-    (hle : segStart ≤ stop) :
-    (copySliceAppend src segStart stop acc).data.toList =
-      acc.data.toList ++ (src.data.toList.drop segStart).take (stop - segStart) := by
-  unfold copySliceAppend ByteArray.copySlice
-  simp only [Array.toList_append, Array.toList_extract, List.extract_eq_take_drop]
-  have hlen : acc.size = acc.data.toList.length := Array.length_toList.symm
-  have h1 : (acc.data.toList.drop 0).take (acc.size - 0) = acc.data.toList := by
-    rw [List.drop_zero, Nat.sub_zero, hlen, List.take_length]
-  have h2 : acc.data.toList.drop (acc.size + min (stop - segStart) (src.data.size - segStart)) = [] :=
-    List.drop_eq_nil_of_le (by rw [← hlen]; omega)
-  have h3 : segStart + (stop - segStart) - segStart = stop - segStart := by omega
-  rw [h1, h2, h3, List.take_nil, List.append_nil]
 
 private def hasCloseSeqStrLoop (s : String) (i : Nat) (afterLt : Bool) : Bool :=
   if h : i < s.utf8ByteSize then
@@ -277,24 +89,7 @@ private def hasCloseSeqStrLoop (s : String) (i : Nat) (afterLt : Bool) : Bool :=
     else hasCloseSeqStrLoop s (i + 1) (b == 60)
   else false
 termination_by s.utf8ByteSize - i
-
-private theorem hasCloseSeqStrLoop_false_eq (s : String) (i : Nat) (afterLt : Bool)
-    (hfalse : hasCloseSeqStrLoop s i afterLt = false) :
-    escapeCloseSeqBytesSpec afterLt (s.toByteArray.data.toList.drop i) = s.toByteArray.data.toList.drop i := by
-  fun_induction hasCloseSeqStrLoop s i afterLt with
-  | case1 i afterLt hi b hhit => cases hfalse
-  | case2 i afterLt hi b hmiss ih =>
-      have hlt : i < s.toByteArray.data.toList.length := by
-        rw [Array.length_toList]; change i < s.toByteArray.size; rw [String.size_toByteArray]; exact hi
-      rw [List.drop_eq_getElem_cons hlt, escapeCloseSeqBytesSpec]
-      have hget : s.toByteArray.data.toList[i] = b := rfl
-      rw [hget, if_neg hmiss, ih hfalse]
-  | case3 i afterLt hge =>
-      have : s.toByteArray.data.toList.length ≤ i := by
-        rw [Array.length_toList]
-        have h' : ¬(i < s.toByteArray.size) := by rw [String.size_toByteArray]; exact hge
-        exact Nat.le_of_not_lt h'
-      rw [List.drop_eq_nil_of_le this]; rfl
+decreasing_by exact Nat.sub_succ_lt_self s.utf8ByteSize i h
 
 private def escapeRawBytesLoop (ba : ByteArray) (segStart i : Nat) (afterLt : Bool) (acc : ByteArray) : ByteArray :=
   if h : i < ba.size then
@@ -307,80 +102,7 @@ private def escapeRawBytesLoop (ba : ByteArray) (segStart i : Nat) (afterLt : Bo
   else
     copySliceAppend ba segStart ba.size acc
 termination_by ba.size - i
-
-private theorem escapeRawBytesLoop_data (ba : ByteArray) (segStart i : Nat) (afterLt : Bool) (acc : ByteArray)
-    (hle : segStart ≤ i) (hi : i ≤ ba.size) :
-    (escapeRawBytesLoop ba segStart i afterLt acc).data.toList =
-      acc.data.toList ++ (ba.data.toList.drop segStart).take (i - segStart) ++
-      escapeCloseSeqBytesSpec afterLt (ba.data.toList.drop i) := by
-  fun_induction escapeRawBytesLoop ba segStart i afterLt acc with
-  | case1 segStart i afterLt acc hlt b hhit acc' ih =>
-      have hi_lt : i < ba.data.toList.length := by rw [Array.length_toList]; exact hlt
-      have hget : ba.data.toList[i] = b := rfl
-      have h47 : b = 47 := beq_iff_eq.1 ((Bool.and_eq_true _ _).mp hhit).2
-      rw [ih (by omega) (by omega)]
-      simp only [acc', ByteArray.push, Array.toList_push]
-      rw [copySliceAppend_data ba segStart i acc hle]
-      rw [List.drop_eq_getElem_cons hi_lt, hget]
-      rw [escapeCloseSeqBytesSpec, if_pos hhit]
-      have htake1 : (b :: ba.data.toList.drop (i + 1)).take (i + 1 - i) = [47] := by
-        rw [show i + 1 - i = 1 by omega, h47]; rfl
-      rw [htake1]
-      simp [List.append_assoc]
-  | case2 segStart i afterLt acc hlt b hmiss ih =>
-      have hi_lt : i < ba.data.toList.length := by rw [Array.length_toList]; exact hlt
-      have hget : ba.data.toList[i] = b := rfl
-      rw [ih (by omega) (by omega)]
-      rw [List.drop_eq_getElem_cons hi_lt, hget, escapeCloseSeqBytesSpec, if_neg hmiss]
-      have hlen : i - segStart < (ba.data.toList.drop segStart).length := by
-        rw [List.length_drop, Array.length_toList]; change i - segStart < ba.size - segStart; omega
-      have htake : (ba.data.toList.drop segStart).take (i + 1 - segStart) =
-          (ba.data.toList.drop segStart).take (i - segStart) ++ [b] := by
-        rw [show i + 1 - segStart = (i - segStart) + 1 by omega, List.take_succ_eq_append_getElem hlen]
-        simp [List.getElem_drop, show segStart + (i - segStart) = i by omega]; rfl
-      rw [htake]
-      simp [List.append_assoc]
-  | case3 segStart i afterLt acc hge =>
-      have heq : i = ba.size := by omega
-      subst heq
-      rw [copySliceAppend_data ba segStart ba.size acc hle]
-      have hnil : ba.data.toList.drop ba.size = [] := by
-        apply List.drop_eq_nil_of_le; rw [Array.length_toList]; exact Nat.le_refl _
-      rw [hnil]; simp [escapeCloseSeqBytesSpec]
-
-private theorem escapeRawBytes_eq_spec (s : String) :
-    escapeRawBytesLoop s.toUTF8 0 0 false (ByteArray.emptyWithCapacity (s.utf8ByteSize + 8)) =
-      (String.ofList (escapeCloseSeqLoop false s.toList)).toByteArray := by
-  apply ByteArray.ext; apply Array.ext'
-  unfold String.toUTF8
-  rw [escapeRawBytesLoop_data s.toByteArray 0 0 false _ (Nat.le_refl _) (Nat.zero_le _)]
-  have hem : (ByteArray.emptyWithCapacity (s.utf8ByteSize + 8)).data.toList = [] := rfl
-  rw [hem, String.toByteArray_ofList, List.utf8Encode, list_toByteArray_data,
-      ← escapeCloseSeqBytes_flatMap, ← string_toByteArray_data]
-  simp
-
-private def escapeRawTextFast (s : String) : String :=
-  if !hasCloseSeqStrLoop s 0 false then s
-  else
-    String.fromUTF8
-      (escapeRawBytesLoop s.toUTF8 0 0 false (ByteArray.emptyWithCapacity (s.utf8ByteSize + 8)))
-      (by rw [escapeRawBytes_eq_spec]; exact (String.ofList (escapeCloseSeqLoop false s.toList)).isValidUTF8)
-
-@[csimp] theorem escapeRawText_eq_fast : @escapeRawText = @escapeRawTextFast := by
-  funext s
-  rw [escapeRawText_eq_always]
-  unfold escapeRawTextFast
-  cases h : hasCloseSeqStrLoop s 0 false
-  · simp only [Bool.not_false, ↓reduceIte]
-    have h1 := hasCloseSeqStrLoop_false_eq s 0 false h
-    simp only [List.drop_zero] at h1
-    apply (String.toByteArray_inj).1
-    apply ByteArray.ext; apply Array.ext'
-    rw [String.toByteArray_ofList, List.utf8Encode, list_toByteArray_data,
-        ← escapeCloseSeqBytes_flatMap, ← string_toByteArray_data, h1]
-  · simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-    apply (String.toByteArray_inj).1
-    exact (escapeRawBytes_eq_spec s).symm
+decreasing_by all_goals exact Nat.sub_succ_lt_self ba.size i h
 
 private def escapeRawBytesLoopU (ba : ByteArray) (sz : USize) (hsz : sz.toNat ≤ ba.size)
     (segStart i : USize) (afterLt : Bool) (acc : ByteArray) : ByteArray :=
@@ -400,7 +122,8 @@ decreasing_by
     have hlt2 : i.toNat + 1 < 2 ^ System.Platform.numBits := Nat.lt_of_le_of_lt (Nat.succ_le_of_lt hlt) sz.toBitVec.isLt
     have hadd : (i + 1).toNat = i.toNat + 1 := by
       rw [USize.toNat_add, USize.toNat_one]; exact Nat.mod_eq_of_lt hlt2
-    omega
+    rw [hadd]
+    exact Nat.sub_succ_lt_self sz.toNat i.toNat hlt
 
 /-- Appends the UTF-8 bytes of `escapeRawText s` directly into `acc` in a single unboxed `USize`
     pass without intermediate `String` allocations or UTF-8 re-validation. -/
@@ -608,30 +331,6 @@ private def isVoidTagFast (tag : String) : Bool :=
   | 6 => tag == "source"
   | _ => false
 
-@[csimp] theorem isVoidTag_eq_fast : @isVoidTag = @isVoidTagFast := by
-  funext tag
-  unfold isVoidTag voidTags isVoidTagFast
-  simp only [List.contains, List.elem]
-  by_cases h1 : tag == "area"; · rw [beq_iff_eq.1 h1]; rfl
-  by_cases h2 : tag == "base"; · rw [beq_iff_eq.1 h2]; rfl
-  by_cases h3 : tag == "br"; · rw [beq_iff_eq.1 h3]; rfl
-  by_cases h4 : tag == "col"; · rw [beq_iff_eq.1 h4]; rfl
-  by_cases h5 : tag == "embed"; · rw [beq_iff_eq.1 h5]; rfl
-  by_cases h6 : tag == "hr"; · rw [beq_iff_eq.1 h6]; rfl
-  by_cases h7 : tag == "img"; · rw [beq_iff_eq.1 h7]; rfl
-  by_cases h8 : tag == "input"; · rw [beq_iff_eq.1 h8]; rfl
-  by_cases h9 : tag == "link"; · rw [beq_iff_eq.1 h9]; rfl
-  by_cases h10 : tag == "meta"; · rw [beq_iff_eq.1 h10]; rfl
-  by_cases h11 : tag == "source"; · rw [beq_iff_eq.1 h11]; rfl
-  by_cases h12 : tag == "track"; · rw [beq_iff_eq.1 h12]; rfl
-  by_cases h13 : tag == "wbr"; · rw [beq_iff_eq.1 h13]; rfl
-  simp only [Bool.eq_false_iff.2 h1, Bool.eq_false_iff.2 h2, Bool.eq_false_iff.2 h3,
-    Bool.eq_false_iff.2 h4, Bool.eq_false_iff.2 h5, Bool.eq_false_iff.2 h6,
-    Bool.eq_false_iff.2 h7, Bool.eq_false_iff.2 h8, Bool.eq_false_iff.2 h9,
-    Bool.eq_false_iff.2 h10, Bool.eq_false_iff.2 h11, Bool.eq_false_iff.2 h12,
-    Bool.eq_false_iff.2 h13, Bool.false_or]
-  split <;> rfl
-
 def isSafeTagName (tag : String) : Bool :=
   let cs := tag.toList
   !cs.isEmpty && cs.all (fun c => c.isAlphanum || c == '-')
@@ -738,6 +437,31 @@ def validTextIn (ctx : HtmlCtx) (s : String) : Bool :=
   | .rawStyle => !containsCloseSeq s.toList
   | .ulOl | .dl | .table | .colgroup | .tableSection | .tableRow | .select | .optgroup => s == ""
 
+@[csimp] theorem isVoidTag_eq_fast : @isVoidTag = @isVoidTagFast := by
+  funext tag
+  apply Bool.eq_iff_iff.2
+  constructor
+  · intro h
+    have hm : tag ∈ voidTags := List.contains_iff_mem.1 h
+    unfold voidTags at hm
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hm
+    rcases hm with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> rfl
+  · intro h
+    unfold isVoidTagFast at h
+    unfold isVoidTag
+    rw [List.contains_iff_mem]
+    split at h
+    · simp only [Bool.or_eq_true, beq_iff_eq] at h
+      rcases h with rfl | rfl <;> simp only [voidTags, List.mem_cons, true_or, or_true]
+    · simp only [Bool.or_eq_true, beq_iff_eq] at h
+      rcases h with (rfl | rfl) | rfl <;> simp only [voidTags, List.mem_cons, true_or, or_true]
+    · simp only [Bool.or_eq_true, beq_iff_eq] at h
+      rcases h with ((rfl | rfl) | rfl) | rfl <;> simp only [voidTags, List.mem_cons, true_or, or_true]
+    · simp only [Bool.or_eq_true, beq_iff_eq] at h
+      rcases h with (rfl | rfl) | rfl <;> simp only [voidTags, List.mem_cons, true_or, or_true]
+    · simp only [beq_iff_eq] at h; subst h; simp only [voidTags, List.mem_cons, true_or, or_true]
+    · exact absurd h (by decide)
+
 mutual
   def Html.validIn (ctx : HtmlCtx) : Html msg → Bool
     | .text s => validTextIn ctx s
@@ -777,7 +501,7 @@ def Html.valid (h : Html msg) : Bool := Html.validIn {} h
   induction xs with
   | nil => rfl
   | cons a rest ih =>
-      cases a <;> simp [Attr.validList, Attr.valid, ih]
+      cases a <;> simp only [List.filter_cons, ↓reduceIte, Bool.false_eq_true, Attr.validList, Attr.valid, ih, Bool.true_and]
 
 @[simp] theorem Attr.hasLocalCell_nil : Attr.hasLocalCell ([] : List (Attr msg)) = false := rfl
 @[simp] theorem Attr.hasLocalCell_cons (a : Attr msg) (as : List (Attr msg)) :
@@ -792,14 +516,15 @@ def Html.valid (h : Html msg) : Bool := Html.validIn {} h
 @[simp] theorem Attr.hasLocalCell_append (xs ys : List (Attr msg)) :
     Attr.hasLocalCell (xs ++ ys) = (Attr.hasLocalCell xs || Attr.hasLocalCell ys) := by
   induction xs with
-  | nil => simp [Attr.hasLocalCell]
-  | cons a rest ih => cases a <;> simp [Attr.hasLocalCell, ih]
+  | nil => rfl
+  | cons a rest ih => simp only [List.cons_append, Attr.hasLocalCell, ih, Bool.or_assoc]
 
 @[simp] theorem Attr.hasLocalCell_filter_nonkey (xs : List (Attr msg)) :
     Attr.hasLocalCell (xs.filter (fun | .key _ => false | _ => true)) = Attr.hasLocalCell xs := by
   induction xs with
   | nil => rfl
-  | cons a rest ih => cases a <;> simp [Attr.hasLocalCell, ih]
+  | cons a rest ih =>
+      cases a <;> simp only [List.filter_cons, ↓reduceIte, Bool.false_eq_true, Attr.hasLocalCell, Attr.isLocalCell, ih, Bool.false_or]
 
 @[simp] theorem Attr.valid_map {α β : Type} (f : α → β) (a : Attr α) :
     (a.map f).valid = a.valid := by
@@ -809,13 +534,17 @@ def Html.valid (h : Html msg) : Bool := Html.validIn {} h
     Attr.validList (as.map (Attr.map f)) = Attr.validList as := by
   induction as with
   | nil => rfl
-  | cons a rest ih => simp [Attr.validList, ih]
+  | cons a rest ih => simp only [List.map_cons, Attr.validList, Attr.valid_map, ih]
+
+@[simp] theorem Attr.isLocalCell_map {α β : Type} (f : α → β) (a : Attr α) :
+    (a.map f).isLocalCell = a.isLocalCell := by
+  cases a <;> rfl
 
 @[simp] theorem Attr.hasLocalCell_map_attrMap {α β : Type} (f : α → β) (as : List (Attr α)) :
     Attr.hasLocalCell (as.map (Attr.map f)) = Attr.hasLocalCell as := by
   induction as with
   | nil => rfl
-  | cons a rest ih => cases a <;> simp [Attr.hasLocalCell, Attr.map, ih]
+  | cons a rest ih => simp only [List.map_cons, Attr.hasLocalCell, Attr.isLocalCell_map, ih]
 
 @[simp] theorem Attr.valid_prefixSignal (pfx : String) (a : Attr msg) :
     (a.prefixSignal pfx).valid = a.valid := by
@@ -825,13 +554,17 @@ def Html.valid (h : Html msg) : Bool := Html.validIn {} h
     Attr.validList (as.map (Attr.prefixSignal pfx)) = Attr.validList as := by
   induction as with
   | nil => rfl
-  | cons a rest ih => simp [Attr.validList, ih]
+  | cons a rest ih => simp only [List.map_cons, Attr.validList, Attr.valid_prefixSignal, ih]
+
+@[simp] theorem Attr.isLocalCell_prefixSignal (pfx : String) (a : Attr msg) :
+    (a.prefixSignal pfx).isLocalCell = a.isLocalCell := by
+  cases a <;> rfl
 
 @[simp] theorem Attr.hasLocalCell_prefixSignal (pfx : String) (as : List (Attr msg)) :
     Attr.hasLocalCell (as.map (Attr.prefixSignal pfx)) = Attr.hasLocalCell as := by
   induction as with
   | nil => rfl
-  | cons a rest ih => cases a <;> simp [Attr.hasLocalCell, Attr.prefixSignal, ih]
+  | cons a rest ih => simp only [List.map_cons, Attr.hasLocalCell, Attr.isLocalCell_prefixSignal, ih]
 
 @[simp] theorem Html.mapChildren_isEmpty {α β : Type} (f : α → β) (cs : List (Html α)) :
     (Html.mapChildren f cs).isEmpty = cs.isEmpty := by
@@ -850,14 +583,14 @@ mutual
                    Attr.hasLocalCell_map_attrMap, Html.mapChildren_isEmpty]
         cases stepHtmlCtx ctx tag with
         | none => rfl
-        | some childCtx => simp [Html.validListIn_mapChildren childCtx f children]
+        | some childCtx => exact congrArg (_ && ·) (Html.validListIn_mapChildren childCtx f children)
 
   @[simp] theorem Html.validListIn_mapChildren {α β : Type} (ctx : HtmlCtx) (f : α → β) :
       (cs : List (Html α)) → Html.validListIn ctx (Html.mapChildren f cs) = Html.validListIn ctx cs
     | [] => rfl
     | c :: cs => by
-        simp [Html.mapChildren, Html.validListIn, Html.validIn_map ctx f c,
-              Html.validListIn_mapChildren ctx f cs]
+        simp only [Html.mapChildren, Html.validListIn, Html.validIn_map ctx f c,
+                   Html.validListIn_mapChildren ctx f cs]
 end
 
 mutual
@@ -869,14 +602,14 @@ mutual
                    Attr.hasLocalCell_prefixSignal, Html.prefixSignalsList_isEmpty]
         cases stepHtmlCtx ctx tag with
         | none => rfl
-        | some childCtx => simp [Html.validListIn_prefixSignalsList childCtx pfx children]
+        | some childCtx => exact congrArg (_ && ·) (Html.validListIn_prefixSignalsList childCtx pfx children)
 
   @[simp] theorem Html.validListIn_prefixSignalsList (ctx : HtmlCtx) (pfx : String) :
       (cs : List (Html msg)) → Html.validListIn ctx (Html.prefixSignalsList pfx cs) = Html.validListIn ctx cs
     | [] => rfl
     | c :: cs => by
-        simp [Html.prefixSignalsList, Html.validListIn, Html.validIn_prefixSignals ctx pfx c,
-              Html.validListIn_prefixSignalsList ctx pfx cs]
+        simp only [Html.prefixSignalsList, Html.validListIn, Html.validIn_prefixSignals ctx pfx c,
+                   Html.validListIn_prefixSignalsList ctx pfx cs]
 end
 
 @[simp] theorem Html.validListIn_nil (ctx : HtmlCtx) :
@@ -972,6 +705,24 @@ theorem Attr.isLocalCell_ite_eq_false {msg : Type} (c : Prop) [Decidable c] (a b
 
 theorem Bool.not_false_or (a b : Bool) (ha : a = false) : (!a || b) = true := by
   simp [ha]
+
+theorem containsCloseSeqLoop_escapeCloseSeqLoop (cs : List Char) :
+    ∀ (b : Bool), containsCloseSeqLoop b (escapeCloseSeqLoop b cs) = false := by
+  induction cs with
+  | nil => intro _; rfl
+  | cons c rest ih =>
+      intro b
+      simp only [escapeCloseSeqLoop]
+      cases h : (b && c == '/')
+      · simpa [containsCloseSeqLoop, h] using ih (c == '<')
+      · simpa [containsCloseSeqLoop] using ih false
+
+@[simp] theorem containsCloseSeq_escapeRawText (s : String) :
+    containsCloseSeq (escapeRawText s).toList = false := by
+  unfold escapeRawText containsCloseSeq
+  by_cases h : containsCloseSeqLoop false s.toList
+  · simp [h, containsCloseSeqLoop_escapeCloseSeqLoop]
+  · simp [h]
 
 theorem validTextIn_rawStyle_escape (inP inter inForm : Bool) (s : String) :
     validTextIn ⟨.rawStyle, inP, inter, inForm⟩ (escapeRawText s) = true := by
@@ -1099,5 +850,285 @@ theorem Html.canonicalList_eq_map (cs : List (Html msg)) :
   induction cs with
   | nil => rfl
   | cons c cs ih => simp [ih]
+
+/-! ## Fast-Path `@[csimp]` Equivalences & ASCII Byte Helpers -/
+
+private theorem list_toByteArray_loop_data (bs : List UInt8) (acc : ByteArray) :
+    (List.toByteArray.loop bs acc).data.toList = acc.data.toList ++ bs := by
+  induction bs generalizing acc with
+  | nil => simp [List.toByteArray.loop]
+  | cons b bs ih => simp only [List.toByteArray.loop, ih]; simp [ByteArray.push, List.append_assoc]
+
+private theorem list_toByteArray_data (bs : List UInt8) : bs.toByteArray.data.toList = bs := by
+  have h := list_toByteArray_loop_data bs ByteArray.empty
+  have hem : ByteArray.empty.data.toList = [] := rfl
+  rw [hem, List.nil_append] at h; exact h
+
+private theorem string_toByteArray_data (s : String) :
+    s.toByteArray.data.toList = s.toList.flatMap String.utf8EncodeChar := by
+  have h1 : s.toByteArray = s.toList.utf8Encode := by
+    rw [← String.toByteArray_ofList, String.ofList_toList]
+  rw [h1, List.utf8Encode, list_toByteArray_data]
+
+private theorem utf8EncodeChar_le_127 (c : Char) (hc : c.toNat ≤ 127) :
+    String.utf8EncodeChar c = [UInt8.ofNat c.toNat] := by
+  unfold String.utf8EncodeChar
+  have hc' : c.val.toNat ≤ 127 := hc
+  simp only [hc', ↓reduceIte]; rfl
+
+private theorem uint8_ofNat_mod_add_ge_128 {x m base : Nat} (hm : 0 < m) (hb : 128 ≤ base) (hlt : m + base ≤ 256) :
+    (UInt8.ofNat (x % m + base)).toNat ≥ 128 := by
+  change (x % m + base) % 256 ≥ 128
+  rw [Nat.mod_eq_of_lt (Nat.lt_of_lt_of_le (Nat.add_lt_add_right (Nat.mod_lt x hm) base) hlt)]
+  exact Nat.le_trans hb (Nat.le_add_left base (x % m))
+
+private theorem utf8EncodeChar_gt_127 (c : Char) (h : c.toNat > 127) :
+    ∀ b ∈ String.utf8EncodeChar c, b.toNat ≥ 128 := by
+  unfold String.utf8EncodeChar
+  have h1 : ¬(c.val.toNat ≤ 127) := Nat.not_le_of_gt h
+  simp only [h1, ↓reduceIte]
+  split
+  · intro b hb; simp only [List.mem_cons, List.not_mem_nil, or_false] at hb
+    rcases hb with rfl | rfl
+    · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
+    · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
+  · split
+    · intro b hb; simp only [List.mem_cons, List.not_mem_nil, or_false] at hb
+      rcases hb with rfl | rfl | rfl
+      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
+      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
+      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
+    · intro b hb; simp only [List.mem_cons, List.not_mem_nil, or_false] at hb
+      rcases hb with rfl | rfl | rfl | rfl
+      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
+      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
+      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
+      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
+
+private theorem utf8EncodeChar_ne_nil (c : Char) : String.utf8EncodeChar c ≠ [] := by
+  unfold String.utf8EncodeChar; dsimp only
+  split
+  · simp
+  · split
+    · simp
+    · split <;> simp
+
+private theorem hasAsciiByteLoop_eq (s : String) (p : UInt8 → Bool) (i : Nat) :
+    hasAsciiByteLoop s p s.utf8ByteSize rfl i = (s.toByteArray.data.toList.drop i).any p := by
+  fun_induction hasAsciiByteLoop s p s.utf8ByteSize rfl i with
+  | case1 i h hp =>
+      have hlt : i < s.toByteArray.data.toList.length := by
+        rw [Array.length_toList]; change i < s.toByteArray.size; rw [String.size_toByteArray]; exact h
+      rw [List.drop_eq_getElem_cons hlt, List.any_cons]
+      have hget : s.toByteArray.data.toList[i] = s.getUTF8Byte ⟨i⟩ h := rfl
+      rw [hget, hp]; rfl
+  | case2 i h hp ih =>
+      have hlt : i < s.toByteArray.data.toList.length := by
+        rw [Array.length_toList]; change i < s.toByteArray.size; rw [String.size_toByteArray]; exact h
+      rw [List.drop_eq_getElem_cons hlt, List.any_cons]
+      have hget : s.toByteArray.data.toList[i] = s.getUTF8Byte ⟨i⟩ h := rfl
+      have hpf : p (s.getUTF8Byte ⟨i⟩ h) = false := Bool.eq_false_iff.2 hp
+      rw [hget, hpf, Bool.false_or, ih]
+  | case3 i h =>
+      have hge : s.toByteArray.data.toList.length ≤ i := by
+        rw [Array.length_toList]
+        have h' : ¬(i < s.toByteArray.size) := by rw [String.size_toByteArray]; exact h
+        exact Nat.le_of_not_lt h'
+      rw [List.drop_eq_nil_of_le hge]; rfl
+
+theorem hasAsciiByte_eq_any (s : String) (p : UInt8 → Bool) (q : Char → Bool)
+    (hhi : ∀ b : UInt8, b.toNat ≥ 128 → p b = false)
+    (hlo : ∀ c : Char, c.toNat ≤ 127 → p (UInt8.ofNat c.toNat) = q c)
+    (hqhi : ∀ c : Char, c.toNat > 127 → q c = false) :
+    hasAsciiByte s p = s.toList.any q := by
+  have hgo : hasAsciiByte s p = s.toByteArray.data.toList.any p := by
+    simpa [hasAsciiByte] using hasAsciiByteLoop_eq s p 0
+  rw [hgo, string_toByteArray_data, List.any_flatMap]
+  congr 1
+  funext c
+  by_cases hc : c.toNat ≤ 127
+  · rw [utf8EncodeChar_le_127 c hc]
+    simp only [List.any_cons, List.any_nil, Bool.or_false]
+    exact hlo c hc
+  · have hgt : c.toNat > 127 := by omega
+    rw [hqhi c hgt]
+    rw [List.any_eq_false]
+    intro b hb
+    simp [hhi b (utf8EncodeChar_gt_127 c hgt b hb)]
+
+theorem asciiByte_beq_char (c : Char) (hc : c.toNat ≤ 127) (target : Char) (ht : target.toNat ≤ 127) :
+    (UInt8.ofNat c.toNat == UInt8.ofNat target.toNat) = (c == target) := by
+  cases heq : (c == target)
+  · rw [beq_eq_false_iff_ne] at heq ⊢
+    intro h; apply heq
+    have hnat : c.toNat = target.toNat := by
+      have h1 : (UInt8.ofNat c.toNat).toNat = (UInt8.ofNat target.toNat).toNat := congrArg UInt8.toNat h
+      change c.toNat % 256 = target.toNat % 256 at h1
+      omega
+    exact Char.ext (UInt32.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq hnat))
+  · rw [beq_iff_eq] at heq; subst heq; simp
+
+private theorem escapeCloseSeqBytes_hi (xs ys : List UInt8) (hhi : ∀ b ∈ xs, b.toNat ≥ 128) (hne : xs ≠ []) :
+    ∀ afterLt, escapeCloseSeqBytesSpec afterLt (xs ++ ys) = xs ++ escapeCloseSeqBytesSpec false ys := by
+  induction xs with
+  | nil => exact absurd rfl hne
+  | cons b bs ih =>
+      intro afterLt
+      have hb : b.toNat ≥ 128 := hhi b (by simp)
+      have hb47 : (b == 47) = false := by
+        rw [beq_eq_false_iff_ne]; intro heq; subst heq; exact absurd hb (by decide)
+      have hb60 : (b == 60) = false := by
+        rw [beq_eq_false_iff_ne]; intro heq; subst heq; exact absurd hb (by decide)
+      simp only [List.cons_append, escapeCloseSeqBytesSpec, hb47, hb60, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
+      cases bs with
+      | nil => rfl
+      | cons b' bs' => rw [ih (fun x hx => hhi x (by simp [hx])) (by simp) false]
+
+private theorem escapeCloseSeqBytes_flatMap (cs : List Char) :
+    ∀ afterLt, escapeCloseSeqBytesSpec afterLt (cs.flatMap String.utf8EncodeChar) =
+      (escapeCloseSeqLoop afterLt cs).flatMap String.utf8EncodeChar := by
+  induction cs with
+  | nil => intro _; rfl
+  | cons c cs ih =>
+      intro afterLt
+      simp only [List.flatMap_cons, escapeCloseSeqLoop]
+      by_cases hc : c.toNat ≤ 127
+      · have h1 := utf8EncodeChar_le_127 c hc
+        have h47 : (UInt8.ofNat c.toNat == 47) = (c == '/') := asciiByte_beq_char c hc '/' (by decide)
+        have h60 : (UInt8.ofNat c.toNat == 60) = (c == '<') := asciiByte_beq_char c hc '<' (by decide)
+        rw [h1, List.singleton_append, escapeCloseSeqBytesSpec, h47, h60]
+        split
+        · simp [List.flatMap_cons, ih]; rfl
+        · simp [List.flatMap_cons, h1, ih]
+      · have hgt : c.toNat > 127 := by omega
+        have hc47 : (c == '/') = false := by
+          rw [beq_eq_false_iff_ne]; intro h; subst h; exact absurd hgt (by decide)
+        have hc60 : (c == '<') = false := by
+          rw [beq_eq_false_iff_ne]; intro h; subst h; exact absurd hgt (by decide)
+        rw [escapeCloseSeqBytes_hi _ _ (utf8EncodeChar_gt_127 c hgt) (utf8EncodeChar_ne_nil c) afterLt]
+        simp [hc47, hc60, List.flatMap_cons, ih]
+
+private theorem escapeCloseSeqLoop_noop (cs : List Char) (afterLt : Bool)
+    (h : containsCloseSeqLoop afterLt cs = false) :
+    escapeCloseSeqLoop afterLt cs = cs := by
+  induction cs generalizing afterLt with
+  | nil => rfl
+  | cons c cs ih =>
+      simp only [containsCloseSeqLoop, Bool.or_eq_false_iff] at h
+      simp only [escapeCloseSeqLoop, h.1, Bool.false_eq_true, ↓reduceIte]
+      rw [ih (c == '<') h.2]
+
+private theorem escapeRawText_eq_always (s : String) :
+    escapeRawText s = String.ofList (escapeCloseSeqLoop false s.toList) := by
+  unfold escapeRawText containsCloseSeq
+  cases h : containsCloseSeqLoop false s.toList
+  · simp [escapeCloseSeqLoop_noop s.toList false h]
+  · simp
+
+private theorem copySliceAppend_data (src : ByteArray) (segStart stop : Nat) (acc : ByteArray)
+    (hle : segStart ≤ stop) :
+    (copySliceAppend src segStart stop acc).data.toList =
+      acc.data.toList ++ (src.data.toList.drop segStart).take (stop - segStart) := by
+  unfold copySliceAppend ByteArray.copySlice
+  simp only [Array.toList_append, Array.toList_extract, List.extract_eq_take_drop]
+  have hlen : acc.size = acc.data.toList.length := Array.length_toList.symm
+  have h1 : (acc.data.toList.drop 0).take (acc.size - 0) = acc.data.toList := by
+    rw [List.drop_zero, Nat.sub_zero, hlen, List.take_length]
+  have h2 : acc.data.toList.drop (acc.size + min (stop - segStart) (src.data.size - segStart)) = [] :=
+    List.drop_eq_nil_of_le (by rw [← hlen]; omega)
+  have h3 : segStart + (stop - segStart) - segStart = stop - segStart := by omega
+  rw [h1, h2, h3, List.take_nil, List.append_nil]
+
+private theorem hasCloseSeqStrLoop_false_eq (s : String) (i : Nat) (afterLt : Bool)
+    (hfalse : hasCloseSeqStrLoop s i afterLt = false) :
+    escapeCloseSeqBytesSpec afterLt (s.toByteArray.data.toList.drop i) = s.toByteArray.data.toList.drop i := by
+  fun_induction hasCloseSeqStrLoop s i afterLt with
+  | case1 i afterLt hi b hhit => cases hfalse
+  | case2 i afterLt hi b hmiss ih =>
+      have hlt : i < s.toByteArray.data.toList.length := by
+        rw [Array.length_toList]; change i < s.toByteArray.size; rw [String.size_toByteArray]; exact hi
+      rw [List.drop_eq_getElem_cons hlt, escapeCloseSeqBytesSpec]
+      have hget : s.toByteArray.data.toList[i] = b := rfl
+      rw [hget, if_neg hmiss, ih hfalse]
+  | case3 i afterLt hge =>
+      have : s.toByteArray.data.toList.length ≤ i := by
+        rw [Array.length_toList]
+        have h' : ¬(i < s.toByteArray.size) := by rw [String.size_toByteArray]; exact hge
+        exact Nat.le_of_not_lt h'
+      rw [List.drop_eq_nil_of_le this]; rfl
+
+private theorem escapeRawBytesLoop_data (ba : ByteArray) (segStart i : Nat) (afterLt : Bool) (acc : ByteArray)
+    (hle : segStart ≤ i) (hi : i ≤ ba.size) :
+    (escapeRawBytesLoop ba segStart i afterLt acc).data.toList =
+      acc.data.toList ++ (ba.data.toList.drop segStart).take (i - segStart) ++
+      escapeCloseSeqBytesSpec afterLt (ba.data.toList.drop i) := by
+  fun_induction escapeRawBytesLoop ba segStart i afterLt acc with
+  | case1 segStart i afterLt acc hlt b hhit acc' ih =>
+      have hi_lt : i < ba.data.toList.length := by rw [Array.length_toList]; exact hlt
+      have hget : ba.data.toList[i] = b := rfl
+      have h47 : b = 47 := beq_iff_eq.1 ((Bool.and_eq_true _ _).mp hhit).2
+      rw [ih (by omega) (by omega)]
+      simp only [acc', ByteArray.push, Array.toList_push]
+      rw [copySliceAppend_data ba segStart i acc hle]
+      rw [List.drop_eq_getElem_cons hi_lt, hget]
+      rw [escapeCloseSeqBytesSpec, if_pos hhit]
+      have htake1 : (b :: ba.data.toList.drop (i + 1)).take (i + 1 - i) = [47] := by
+        rw [show i + 1 - i = 1 by omega, h47]; rfl
+      rw [htake1]
+      simp [List.append_assoc]
+  | case2 segStart i afterLt acc hlt b hmiss ih =>
+      have hi_lt : i < ba.data.toList.length := by rw [Array.length_toList]; exact hlt
+      have hget : ba.data.toList[i] = b := rfl
+      rw [ih (by omega) (by omega)]
+      rw [List.drop_eq_getElem_cons hi_lt, hget, escapeCloseSeqBytesSpec, if_neg hmiss]
+      have hlen : i - segStart < (ba.data.toList.drop segStart).length := by
+        rw [List.length_drop, Array.length_toList]; change i - segStart < ba.size - segStart; omega
+      have htake : (ba.data.toList.drop segStart).take (i + 1 - segStart) =
+          (ba.data.toList.drop segStart).take (i - segStart) ++ [b] := by
+        rw [show i + 1 - segStart = (i - segStart) + 1 by omega, List.take_succ_eq_append_getElem hlen]
+        simp [List.getElem_drop, show segStart + (i - segStart) = i by omega]; rfl
+      rw [htake]
+      simp [List.append_assoc]
+  | case3 segStart i afterLt acc hge =>
+      have heq : i = ba.size := by omega
+      subst heq
+      rw [copySliceAppend_data ba segStart ba.size acc hle]
+      have hnil : ba.data.toList.drop ba.size = [] := by
+        apply List.drop_eq_nil_of_le; rw [Array.length_toList]; exact Nat.le_refl _
+      rw [hnil]; simp [escapeCloseSeqBytesSpec]
+
+private theorem escapeRawBytes_eq_spec (s : String) :
+    escapeRawBytesLoop s.toUTF8 0 0 false (ByteArray.emptyWithCapacity (s.utf8ByteSize + 8)) =
+      (String.ofList (escapeCloseSeqLoop false s.toList)).toByteArray := by
+  apply ByteArray.ext; apply Array.ext'
+  unfold String.toUTF8
+  rw [escapeRawBytesLoop_data s.toByteArray 0 0 false _ (Nat.le_refl _) (Nat.zero_le _)]
+  have hem : (ByteArray.emptyWithCapacity (s.utf8ByteSize + 8)).data.toList = [] := rfl
+  rw [hem, String.toByteArray_ofList, List.utf8Encode, list_toByteArray_data,
+      ← escapeCloseSeqBytes_flatMap, ← string_toByteArray_data]
+  simp
+
+private def escapeRawTextFast (s : String) : String :=
+  if !hasCloseSeqStrLoop s 0 false then s
+  else
+    String.fromUTF8
+      (escapeRawBytesLoop s.toUTF8 0 0 false (ByteArray.emptyWithCapacity (s.utf8ByteSize + 8)))
+      (by rw [escapeRawBytes_eq_spec]; exact (String.ofList (escapeCloseSeqLoop false s.toList)).isValidUTF8)
+
+@[csimp] theorem escapeRawText_eq_fast : @escapeRawText = @escapeRawTextFast := by
+  funext s
+  rw [escapeRawText_eq_always]
+  unfold escapeRawTextFast
+  cases h : hasCloseSeqStrLoop s 0 false
+  · simp only [Bool.not_false, ↓reduceIte]
+    have h1 := hasCloseSeqStrLoop_false_eq s 0 false h
+    simp only [List.drop_zero] at h1
+    apply (String.toByteArray_inj).1
+    apply ByteArray.ext; apply Array.ext'
+    rw [String.toByteArray_ofList, List.utf8Encode, list_toByteArray_data,
+        ← escapeCloseSeqBytes_flatMap, ← string_toByteArray_data, h1]
+  · simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+    apply (String.toByteArray_inj).1
+    exact (escapeRawBytes_eq_spec s).symm
 
 end Qed

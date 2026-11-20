@@ -44,6 +44,7 @@ def buildKeyIndexLoop (keys : @& Array String) (i : Nat)
     buildKeyIndexLoop keys (i + 1) buckets' mask
   else buckets
 termination_by keys.size - i
+decreasing_by exact Nat.sub_succ_lt_self keys.size i h
 
 def buildKeyIndex (keys : Array String) : Array (List (String × Nat)) × USize :=
   let cap := nextPow2Ge (keys.size * 2) 16 30
@@ -75,6 +76,20 @@ def planKeyedLoop (newKeys : @& Array String)
           (rows.push (fArr.getD i default)) (marks.push 0) (sigs.push #[])
   else (sources, used, rows, marks, sigs)
 termination_by newKeys.size - i
+decreasing_by all_goals exact Nat.sub_succ_lt_self newKeys.size i h
+
+private theorem lisLowerBound_dec1 {lo hi : Nat} (h : lo < hi) :
+    hi - (lo + (hi - lo) / 2 + 1) < hi - lo := by
+  have h1 : (hi - lo) / 2 < hi - lo := Nat.div_lt_self (Nat.sub_pos_of_lt h) (by decide)
+  have h2 : lo + (hi - lo) / 2 < hi := by
+    have := Nat.add_lt_add_left h1 lo
+    rwa [Nat.add_sub_of_le (Nat.le_of_lt h)] at this
+  exact Nat.sub_lt_sub_left h (Nat.lt_succ_of_le (Nat.le_add_right lo _))
+
+private theorem lisLowerBound_dec2 {lo hi : Nat} (h : lo < hi) :
+    lo + (hi - lo) / 2 - lo < hi - lo := by
+  rw [Nat.add_sub_cancel_left]
+  exact Nat.div_lt_self (Nat.sub_pos_of_lt h) (by decide)
 
 private def lisLowerBound (tails : @& Array Nat) (x : Nat) (lo hi : Nat) : Nat :=
   if h : lo < hi then
@@ -85,6 +100,9 @@ private def lisLowerBound (tails : @& Array Nat) (x : Nat) (lo hi : Nat) : Nat :
       lisLowerBound tails x lo mid
   else lo
 termination_by hi - lo
+decreasing_by
+  · exact lisLowerBound_dec1 h
+  · exact lisLowerBound_dec2 h
 
 private def lisBuildLoop (sources : @& Array (Option Nat)) (i : Nat)
     (tails : Array Nat) (tailPos : Array Nat) (prev : Array Nat) :
@@ -104,6 +122,7 @@ private def lisBuildLoop (sources : @& Array (Option Nat)) (i : Nat)
           lisBuildLoop sources (i + 1) (tails.push oi) (tailPos.push i) prev'
   else (tails, tailPos, prev)
 termination_by sources.size - i
+decreasing_by all_goals exact Nat.sub_succ_lt_self sources.size i h
 
 private def lisTraceLoop (prev : @& Array Nat) (sentinel : Nat) (cur : Nat)
     (flags : Array Bool) : Nat → Array Bool
@@ -121,7 +140,7 @@ def computeLisRaw (sources : Array (Option Nat)) : Array Bool :=
     lisBuildLoop sources 0 (Array.emptyWithCapacity n) (Array.emptyWithCapacity n) (Array.replicate n n)
   let initFlags := Array.replicate n false
   if h : 0 < tailPos.size then
-    lisTraceLoop prev n (tailPos[tailPos.size - 1]'(by omega)) initFlags n
+    lisTraceLoop prev n (tailPos[tailPos.size - 1]'(Nat.sub_lt h Nat.zero_lt_one)) initFlags n
   else initFlags
 
 def isValidLisLoop (sources : @& Array (Option Nat)) (flags : @& Array Bool)
@@ -138,6 +157,7 @@ def isValidLisLoop (sources : @& Array (Option Nat)) (flags : @& Array Bool)
       isValidLisLoop sources flags (i + 1) last?
   else true
 termination_by sources.size - i
+decreasing_by all_goals exact Nat.sub_succ_lt_self sources.size i h
 
 def verifiedLisFlags (sources : Array (Option Nat)) : Array Bool :=
   let raw := computeLisRaw sources
@@ -154,6 +174,7 @@ def removeUnusedM [MonadDom msg m] (node : Dom.Node) (live : Array Dom.Node)
       removeUnusedM node live used (i + 1)
   else pure ()
 termination_by live.size - i
+decreasing_by all_goals exact Nat.sub_succ_lt_self live.size i h
 
 def reconcileLisBackM [MonadDom msg m] (node : Dom.Node) (childNs : String)
     (live : Array Dom.Node) (sources : Array (Option Nat))
@@ -182,6 +203,7 @@ def collectChanged (inst : String) (old new : Array (String × String)) (j : Nat
     collectChanged inst old new (j + 1) acc
   else acc
 termination_by new.size - j
+decreasing_by exact Nat.sub_succ_lt_self new.size j h
 
 def collectEvs {msg : Type} (inst : String) (evs : Array (String × msg)) (j : Nat)
     (acc : Array (String × msg)) : Array (String × msg) :=
@@ -190,6 +212,7 @@ def collectEvs {msg : Type} (inst : String) (evs : Array (String × msg)) (j : N
     collectEvs inst evs (j + 1) (acc.push (inst ++ nm, m))
   else acc
 termination_by evs.size - j
+decreasing_by exact Nat.sub_succ_lt_self evs.size j h
 
 -- Pure tail recursion so the JS backend trampolines it instead of overflowing the stack on 10k-row `IO` binds.
 def diffRowSigs {msg : Type} (rowSig : Nat → Array (String × String))
@@ -209,6 +232,7 @@ def diffRowSigs {msg : Type} (rowSig : Nat → Array (String × String))
       diffRowSigs rowSig rowEv inst newMarks oldMarks oldSigs (i + 1) (accSigs.push rsig) accEmit accEv
   else (accSigs, accEmit, accEv)
 termination_by newMarks.size - i
+decreasing_by all_goals exact Nat.sub_succ_lt_self newMarks.size i h
 
 def emitSignalsM [MonadDom msg m] : List (String × String) → m Unit
   | []            => pure ()
@@ -253,6 +277,7 @@ def collectChangedMarksLoop (oldMarks newMarks : @& Array USize) (i : Nat)
     collectChangedMarksLoop oldMarks newMarks (i + 1) acc'
   else acc
 termination_by newMarks.size - i
+decreasing_by exact Nat.sub_succ_lt_self newMarks.size i h
 
 def allChangedKeysMatch (rowKey : Nat → String) (oldKeys : @& Array String)
     (changed : @& Array Nat) (k : Nat) : Bool :=
@@ -263,6 +288,7 @@ def allChangedKeysMatch (rowKey : Nat → String) (oldKeys : @& Array String)
     else false
   else true
 termination_by changed.size - k
+decreasing_by exact Nat.sub_succ_lt_self changed.size k h
 
 def prefixMatchLen (oldMarks newMarks : @& Array USize) (i : Nat) : Nat :=
   if h : i < oldMarks.size ∧ i < newMarks.size then
@@ -270,17 +296,22 @@ def prefixMatchLen (oldMarks newMarks : @& Array USize) (i : Nat) : Nat :=
     if m != 0 && oldMarks[i]'h.1 == m then prefixMatchLen oldMarks newMarks (i + 1) else i
   else i
 termination_by oldMarks.size - i
+decreasing_by exact Nat.sub_succ_lt_self oldMarks.size i h.1
+
+private theorem sub_one_sub_lt {n p q : Nat} (h : p + q < n) : n - 1 - q < n :=
+  Nat.lt_of_le_of_lt (Nat.sub_le _ _) (Nat.sub_lt (Nat.lt_of_le_of_lt (Nat.zero_le _) h) Nat.zero_lt_one)
 
 def suffixMatchLen (oldMarks newMarks : @& Array USize) (p q : Nat) : Nat :=
   if h : p + q < oldMarks.size ∧ p + q < newMarks.size then
     let oi := oldMarks.size - 1 - q
     let ni := newMarks.size - 1 - q
-    let m := newMarks[ni]'(by omega)
-    if m != 0 && oldMarks[oi]'(by omega) == m then
+    let m := newMarks[ni]'(sub_one_sub_lt h.2)
+    if m != 0 && oldMarks[oi]'(sub_one_sub_lt h.1) == m then
       suffixMatchLen oldMarks newMarks p (q + 1)
     else q
   else q
 termination_by oldMarks.size - (p + q)
+decreasing_by exact Nat.sub_succ_lt_self oldMarks.size (p + q) h.1
 
 def planTmplLoop (newKeys : @& Array String) (oldBuckets : @& Array (List (String × Nat)))
     (mask : USize) (i : Nat) (sources : Array (Option Nat)) (used : Array Bool) :
@@ -294,6 +325,7 @@ def planTmplLoop (newKeys : @& Array String) (oldBuckets : @& Array (List (Strin
         planTmplLoop newKeys oldBuckets mask (i + 1) (sources.push none) used
   else (sources, used)
 termination_by newKeys.size - i
+decreasing_by all_goals exact Nat.sub_succ_lt_self newKeys.size i h
 
 def patchChangedRowsM [MonadDom msg m] (tmplId : UInt32) (live : Array Dom.Node)
     (rowVals : Nat → Array String) (changed : Array Nat) (k : Nat)
@@ -307,6 +339,7 @@ def patchChangedRowsM [MonadDom msg m] (tmplId : UInt32) (live : Array Dom.Node)
     patchChangedRowsM tmplId live rowVals changed (k + 1) vals'
   else return vals
 termination_by changed.size - k
+decreasing_by exact Nat.sub_succ_lt_self changed.size k hk
 
 def patchDirtyRowsM [MonadDom msg m] (tmplId : UInt32) (live : Array Dom.Node)
     (oldMarks newMarks : Array USize) (rowVals : Nat → Array String)
@@ -322,6 +355,7 @@ def patchDirtyRowsM [MonadDom msg m] (tmplId : UInt32) (live : Array Dom.Node)
       patchDirtyRowsM tmplId live oldMarks newMarks rowVals (i + 1) vals'
   else return vals
 termination_by newMarks.size - i
+decreasing_by all_goals exact Nat.sub_succ_lt_self newMarks.size i hi
 
 def removeRangeM [MonadDom msg m] (node : Dom.Node) (live : Array Dom.Node)
     (i stop : Nat) : m Unit := do
@@ -329,6 +363,7 @@ def removeRangeM [MonadDom msg m] (node : Dom.Node) (live : Array Dom.Node)
     MonadDom.removeNode node (live.getD i 0)
     removeRangeM node live (i + 1) stop
 termination_by stop - i
+decreasing_by exact Nat.sub_succ_lt_self stop i h
 
 def reconcileTmplBackM [MonadDom msg m] (node : Dom.Node) (tmplId : UInt32)
     (oldLive : Array Dom.Node) (oldVals : Array (Array String)) (oldMarks : Array USize)
@@ -433,8 +468,8 @@ def patchTmplListM [MonadDom msg m] (node : Dom.Node) (attrs : List (VAttr σ ms
       let vals' ← patchChangedRowsM tmplId oldLive (tmpl.rowVals s) changed 0 oldVals
       return .tlist node tmplId evSlot oldKeys false oldLive vals' newMarks
     else if h2 : changed.size = 2 then
-      let a := changed[0]'(by omega)
-      let b := changed[1]'(by omega)
+      let a := changed[0]'(h2 ▸ Nat.zero_lt_two)
+      let b := changed[1]'(h2 ▸ Nat.one_lt_two)
       let ka := tmpl.rowKey s a
       let kb := tmpl.rowKey s b
       if ka == oldKeys.getD b "" && kb == oldKeys.getD a "" then

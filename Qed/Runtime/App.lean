@@ -1,36 +1,9 @@
-import Qed.Runtime.Cmd
+import Qed.Runtime.AppCore
 import Qed.Runtime.Local
-import Qed.Render
-import Qed.View.Core
-import Qed.Router
 import Qed.Runtime.Verify
+import Qed.Lang
 
 namespace Qed
-
-structure App (Model : Type) (Msg : Type) where
-  private mk ::
-  init           : Model × Cmd Msg
-  update         : Model → Msg → Model × Cmd Msg
-  template       : View Model Msg
-  onUrlChange    : Option (String → Msg) := none
-  onSession      : Option (Option String → Msg) := none
-  onHydrate      : Model → Cmd Msg := fun _ => .none
-  locals         : List LocalDef := []
-  onPort         : Option (String → String → Option Msg) := none
-  dehydrate      : Model → String := fun _ => ""
-  rehydrate      : String → Option Model := fun _ => none
-  styles         : List Style := []
-  stylesheets    : List String := []
-  valid_view     : ∀ m, Html.valid (View.render template m) = true
-  dehydrate_view : ∀ m m', rehydrate (dehydrate m) = some m' →
-                     View.render template m' = View.render template m := by
-                     intro _ _ h; cases h
-
-def App.view (app : App Model Msg) (m : Model) : Html Msg := View.render app.template m
-
-theorem App.valid_app_view (app : App Model Msg) (m : Model) :
-    Html.valid (app.view m) = true :=
-  app.valid_view m
 
 namespace Internal
 
@@ -40,7 +13,7 @@ def mkApp (init : Model) (update : Model → Msg → Model × Cmd Msg)
     (onSession : Option (Option String → Msg) := none)
     (valid_view : ∀ m, Html.valid (View.render template m) = true := by qedProveValidHtml) :
     App Model Msg :=
-  { init := (init, start), update, template, locals, styles, onPort, onSession, valid_view }
+  mkAppCore init update template start locals styles onPort onSession valid_view
 
 def mkRoutedApp {R : Type} [Router R] [Inhabited R]
     (init : Model) (update : Model → Msg → Model × Cmd Msg) (template : View Model Msg)
@@ -49,68 +22,7 @@ def mkRoutedApp {R : Type} [Router R] [Inhabited R]
     (onSession : Option (Option String → Msg) := none)
     (valid_view : ∀ m, Html.valid (View.render template m) = true := by qedProveValidHtml) :
     App Model Msg :=
-  { mkApp init update template start locals styles onPort onSession valid_view with
-    onUrlChange := some (fun p => onRoute ((Router.fromURL p).getD default)) }
-
-def App.setInitAndUpdate (app : App Model Msg) (init : Model × Cmd Msg)
-    (u : Model → Msg → Model × Cmd Msg) : App Model Msg :=
-  { app with init := init, update := u }
-
-def App.setInitUpdateHydrate (app : App Model Msg) (init : Model × Cmd Msg)
-    (u : Model → Msg → Model × Cmd Msg) (onHydrate : Model → Cmd Msg) : App Model Msg :=
-  { app with init := init, update := u, onHydrate := onHydrate }
-
-def App.liftModel {Model Model' Msg : Type}
-    (embed : Model → Model') (proj : Model' → Model)
-    (hproj : ∀ m, proj (embed m) = m)
-    (u : Model' → Msg → Model' × Cmd Msg)
-    (app : App Model Msg) : App Model' Msg where
-  init           := (embed app.init.1, app.init.2)
-  update         := u
-  template       := app.template.mapScope proj
-  onUrlChange    := app.onUrlChange
-  onSession      := app.onSession
-  onHydrate      := fun st => app.onHydrate (proj st)
-  locals         := app.locals
-  onPort         := app.onPort
-  dehydrate      := fun st => app.dehydrate (proj st)
-  rehydrate      := fun raw => (app.rehydrate raw).map embed
-  styles         := app.styles
-  stylesheets    := app.stylesheets
-  valid_view     := fun st => by rw [View.render_mapScope]; exact app.valid_view (proj st)
-  dehydrate_view := fun st st' h => by
-    simp only [Option.map_eq_some_iff] at h
-    rcases h with ⟨m', hm', rfl⟩
-    simp only [View.render_mapScope, hproj]
-    exact app.dehydrate_view (proj st) m' hm'
-
-def App.withStylesheets (sheets : List String) (app : App Model Msg) : App Model Msg :=
-  { app with stylesheets := app.stylesheets ++ sheets }
-
-def App.withExtraStyles (extra : List Style) (app : App Model Msg) : App Model Msg :=
-  { app with styles := extra ++ app.styles }
-
-@[simp] theorem App.withStylesheets_init (sheets : List String) (app : App Model Msg) :
-    (App.withStylesheets sheets app).init = app.init := rfl
-@[simp] theorem App.withStylesheets_update (sheets : List String) (app : App Model Msg) :
-    (App.withStylesheets sheets app).update = app.update := rfl
-@[simp] theorem App.withStylesheets_template (sheets : List String) (app : App Model Msg) :
-    (App.withStylesheets sheets app).template = app.template := rfl
-@[simp] theorem App.withStylesheets_dehydrate (sheets : List String) (app : App Model Msg) :
-    (App.withStylesheets sheets app).dehydrate = app.dehydrate := rfl
-@[simp] theorem App.withStylesheets_rehydrate (sheets : List String) (app : App Model Msg) :
-    (App.withStylesheets sheets app).rehydrate = app.rehydrate := rfl
-
-@[simp] theorem App.withExtraStyles_init (extra : List Style) (app : App Model Msg) :
-    (App.withExtraStyles extra app).init = app.init := rfl
-@[simp] theorem App.withExtraStyles_update (extra : List Style) (app : App Model Msg) :
-    (App.withExtraStyles extra app).update = app.update := rfl
-@[simp] theorem App.withExtraStyles_template (extra : List Style) (app : App Model Msg) :
-    (App.withExtraStyles extra app).template = app.template := rfl
-@[simp] theorem App.withExtraStyles_dehydrate (extra : List Style) (app : App Model Msg) :
-    (App.withExtraStyles extra app).dehydrate = app.dehydrate := rfl
-@[simp] theorem App.withExtraStyles_rehydrate (extra : List Style) (app : App Model Msg) :
-    (App.withExtraStyles extra app).rehydrate = app.rehydrate := rfl
+  mkRoutedAppCore init update template onRoute start locals styles onPort onSession valid_view
 
 @[simp] theorem mkApp_init (init : Model) (u : Model → Msg → Model × Cmd Msg)
     (t : View Model Msg) (s l st p os hv) :
@@ -143,66 +55,10 @@ def App.withExtraStyles (extra : List Style) (app : App Model Msg) : App Model M
     (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) :
     (mkRoutedApp init u t r s l st p os hv).rehydrate = fun _ => none := rfl
 
-end Internal
-
-structure Dehydrate (Model : Type) where
-  project    : Model → Model := id
-  dehydrate  : Model → String
-  rehydrate  : String → Option Model
-  round_trip : ∀ m, rehydrate (dehydrate m) = some (project m)
-
-namespace Dehydrate
-
-def full {Model : Type} [LawfulJson Model] : Dehydrate Model where
-  project    := id
-  dehydrate  := fun m => Json.render (toJson m)
-  rehydrate  := fun s => ((Json.parse s (max 64 (LawfulJson.depthBound Model))).bind fromJson).toOption
-  round_trip := fun m => by
-    simp [LawfulJson.parse_render_toJson m (Nat.le_max_right 64 _), Except.toOption]
-
-def slice {Model α : Type} [LawfulJson α] (init : Model)
-    (get : Model → α) (set : Model → α → Model) : Dehydrate Model where
-  project    := fun m => set init (get m)
-  dehydrate  := fun m => Json.render (toJson (get m))
-  rehydrate  := fun s => (((Json.parse s (max 64 (LawfulJson.depthBound α))).bind fromJson).toOption).map (set init)
-  round_trip := fun m => by
-    simp [LawfulJson.parse_render_toJson (get m) (Nat.le_max_right 64 _), Except.toOption]
-
-def const {Model : Type} (init : Model) : Dehydrate Model :=
-  slice (α := Unit) init (fun _ => ()) (fun m _ => m)
-
-@[simp] theorem full_project {Model : Type} [LawfulJson Model] (m : Model) :
-    (full : Dehydrate Model).project m = m := rfl
-
-@[simp] theorem slice_project {Model α : Type} [LawfulJson α] (init : Model)
-    (get : Model → α) (set : Model → α → Model) (m : Model) :
-    (slice init get set).project m = set init (get m) := rfl
-
-@[simp] theorem const_project {Model : Type} (init m : Model) :
-    (const init).project m = init := rfl
-
-theorem dehydrate_view_of_project {Model Msg : Type}
-    (d : Dehydrate Model) (tmpl : View Model Msg)
-    (hproj : ∀ m, View.render tmpl (d.project m) = View.render tmpl m) :
-    ∀ m m', d.rehydrate (d.dehydrate m) = some m' →
-      View.render tmpl m' = View.render tmpl m := by
-  intro m m' h
-  have hrt := d.round_trip m
-  rw [hrt] at h
-  cases h
-  exact hproj m
-
-end Dehydrate
-
-namespace Internal
-
-def App.withDehydrate {Model Msg : Type} (d : Dehydrate Model) (app : App Model Msg)
+@[reducible] def App.withDehydrate {Model Msg : Type} (d : Dehydrate Model) (app : App Model Msg)
     (hview : ∀ m, View.render app.template (d.project m) = View.render app.template m := by
       qedProveDehydrateView) : App Model Msg :=
-  { app with
-    dehydrate      := d.dehydrate
-    rehydrate      := d.rehydrate
-    dehydrate_view := Dehydrate.dehydrate_view_of_project d app.template hview }
+  App.withDehydrateCore d app hview
 
 @[simp] theorem App.withDehydrate_init (d : Dehydrate Model) (app : App Model Msg) (hv) :
     (App.withDehydrate d app hv).init = app.init := rfl
@@ -221,16 +77,6 @@ def App.withDehydrate {Model Msg : Type} (d : Dehydrate Model) (app : App Model 
 @[reducible] def App.withFullDehydrate {Model Msg : Type} [LawfulJson Model] (app : App Model Msg) : App Model Msg :=
   App.withDehydrate Dehydrate.full app (fun _ => rfl)
 
-theorem App.dehydrate_preserves_of_project {Model Msg : Type} (Inv : Model → Prop)
-    (app : App Model Msg) (proj : Model → Model)
-    (hrt : ∀ m, app.rehydrate (app.dehydrate m) = some (proj m))
-    (hproj : ∀ m, Inv m → Inv (proj m)) :
-    ∀ m m', Inv m → app.rehydrate (app.dehydrate m) = some m' → Inv m' := by
-  intro m m' hm hr
-  rw [hrt m] at hr
-  cases hr
-  exact hproj m hm
-
 end Internal
 
 set_option linter.unusedVariables false in
@@ -238,19 +84,7 @@ def App.guardRehydrate {Model Msg : Type} (Inv : Model → Prop) [DecidablePred 
     (app : App Model Msg)
     (hpres : ∀ m m', Inv m → app.rehydrate (app.dehydrate m) = some m' → Inv m' := by
       qedProveDehydrateInv) : App Model Msg :=
-  { app with
-    rehydrate := fun s =>
-      match app.rehydrate s with
-      | some m => if decide (Inv m) then some m else none
-      | none   => none
-    dehydrate_view := fun m m' h => by
-      cases hr : app.rehydrate (app.dehydrate m) with
-      | none => simp [hr] at h
-      | some m0 =>
-          simp only [hr] at h
-          split at h <;> simp at h
-          subst h
-          exact app.dehydrate_view m m0 hr }
+  App.guardRehydrateCore Inv app hpres
 
 @[simp] theorem App.guardRehydrate_init {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
     (app : App Model Msg) (hp) :
@@ -268,7 +102,7 @@ def App.guardRehydrate {Model Msg : Type} (Inv : Model → Prop) [DecidablePred 
 theorem App.guardRehydrate_sound {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
     (app : App Model Msg) (hp) (raw : String) (m' : Model)
     (h : (App.guardRehydrate Inv app hp).rehydrate raw = some m') : Inv m' := by
-  dsimp only [App.guardRehydrate] at h
+  dsimp only [App.guardRehydrate, App.guardRehydrateCore] at h
   cases hr : app.rehydrate raw with
   | none => simp [hr] at h
   | some m =>
@@ -281,7 +115,7 @@ theorem App.guardRehydrate_complete {Model Msg : Type} (Inv : Model → Prop) [D
     (app : App Model Msg) (hp) (m : Model) (hm : Inv m) :
     (App.guardRehydrate Inv app hp).rehydrate ((App.guardRehydrate Inv app hp).dehydrate m) =
       app.rehydrate (app.dehydrate m) := by
-  dsimp only [App.guardRehydrate]
+  dsimp only [App.guardRehydrate, App.guardRehydrateCore]
   cases hr : app.rehydrate (app.dehydrate m) with
   | none => rfl
   | some m' => simp [decide_eq_true (hp m m' hm hr)]

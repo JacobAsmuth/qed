@@ -1,14 +1,8 @@
 import Qed.Driver.Template
 import Qed.Driver.Local
-import Qed.Runtime.App
+import Qed.Runtime.AppCore
 
 namespace Qed
-
-structure SocketHandlers (msg : Type) where
-  onMessage : String → msg
-  onOpen    : Option msg
-  onClose   : Option msg
-  onError   : Option (String → msg)
 
 structure WsMuxHandlers (msg : Type) where
   onJoin    : ByteArray → msg
@@ -186,19 +180,16 @@ def qedWsClose (connId : UInt32) (err : String) (nowMs : Nat) : IO Unit := do
   | some rt => rt.wsClose connId err nowMs
   | none    => pure ()
 
-private def trimAsciiWs (s : String) : String :=
-  String.ofList (((s.toList.dropWhile Char.isWhitespace).reverse.dropWhile Char.isWhitespace).reverse)
-
 /-- Parses complete `\n`-terminated SSE `data:` lines out of `buf`, returning `(events, remainder)`. -/
 private def parseSseBuffer (buf : String) : Array String × String :=
   let rec go (acc : Array String) : List String → Array String × String
     | []      => (acc, "")
     | [rem]   => (acc, rem)
     | l :: ls =>
-        let t := trimAsciiWs l
+        let t := l.trimmed
         let acc' :=
           if t.startsWith "data:" then
-            let p := trimAsciiWs (String.ofList (t.toList.drop 5))
+            let p := (String.ofList (t.toList.drop 5)).trimmed
             if !p.isEmpty && p != "[DONE]" then acc.push p else acc
           else acc
         go acc' ls
@@ -241,7 +232,6 @@ def runWithHttpTimeout (app : App Model Msg) (httpTimeoutMs : Nat) : IO Unit := 
   let effectCbRef    ← IO.mkRef (∅ : Std.HashMap Nat (String → Msg))
   let wsTimerCbRef   ← IO.mkRef (∅ : Std.HashMap Nat (IO Unit))
   let cbNextRef   ← IO.mkRef (0 : Nat)
-  let socketCbRef ← IO.mkRef (∅ : Std.HashMap String (SocketHandlers Msg))
   let wsNextIdRef    ← IO.mkRef (1 : UInt32)
   let wsBootedRef    ← IO.mkRef false
   let wsConnOwnerRef ← IO.mkRef (∅ : Std.HashMap UInt32 WsConnOwner)
@@ -381,9 +371,6 @@ def runWithHttpTimeout (app : App Model Msg) (httpTimeoutMs : Nat) : IO Unit := 
         | some f => (← dispatchRef.get) (f url.raw)
         | none   => pure ()
     | .port name payload => Dom.portSend name payload
-    | .socket key url onMessage onOpen onClose onError => do
-        socketCbRef.modify (·.insert key { onMessage, onOpen, onClose, onError })
-        Dom.effect "ws.open" key url ""
     | .wsMuxSub slot url channel params rec onJoin onMessage onStatus => do
         if !(← wsBootedRef.get) then return
         closeMuxSlot slot
@@ -479,26 +466,9 @@ def runWithHttpTimeout (app : App Model Msg) (httpTimeoutMs : Nat) : IO Unit := 
         | some onResult => effectCbRef.modify (·.erase id.toNat); dispatchMsg (onResult result)
         | none          => pure ()
   let portRecv : String → String → IO Unit := fun name payload => do
-    if name == "__ws" then
-      match Json.parse payload with
-      | .ok j =>
-          let str (k : String) : String := ((j.get? k).bind (·.str?)).getD ""
-          let key := str "key"
-          match (← socketCbRef.get)[key]? with
-          | some h =>
-              match str "event" with
-              | "message" => dispatchMsg (h.onMessage (str "data"))
-              | "open"    => match h.onOpen with | some m => dispatchMsg m | none => pure ()
-              | "error"   => match h.onError with | some f => dispatchMsg (f (str "data")) | none => pure ()
-              | "close"   =>
-                  socketCbRef.modify (·.erase key)
-                  match h.onClose with | some m => dispatchMsg m | none => pure ()
-              | _         => pure ()
-          | none => pure ()
-      | .error _ => pure ()
-    else match app.onPort with
-      | some f => match f name payload with | some m => dispatchMsg m | none => pure ()
-      | none   => pure ()
+    match app.onPort with
+    | some f => match f name payload with | some m => dispatchMsg m | none => pure ()
+    | none   => pure ()
   let snapshotLocals : IO String := do
     let members := (← storeRef.get).toList.map (fun (k, v) => (k, Json.str v))
     return Json.render (Json.obj members)

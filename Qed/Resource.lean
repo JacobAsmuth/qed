@@ -1,6 +1,5 @@
 import Qed.Resource.Basic
-import Qed.Runtime
-import Qed.Proto
+import Qed.Runtime.AppCore
 import Qed.Server.Registry
 
 namespace Qed
@@ -12,11 +11,6 @@ def fetch [FromJson α] (url : String) (toMsg : Resource α → msg) : Cmd msg :
 
 def post [ToJson req] [FromJson resp] (url : String) (body : req) (toMsg : Resource resp → msg) : Cmd msg :=
   Cmd.postJson url (Json.render (toJson body)) (fun a => toMsg (.ok a)) (fun e => toMsg (.failed e))
-
-def rpc [ToProto req] [FromProto resp] (url : String) (body : req) (toMsg : Resource resp → msg) : Cmd msg :=
-  Cmd.rpc url body fun
-    | .ok a    => toMsg (.ok a)
-    | .error e => toMsg (.failed e)
 
 def view (r : Resource α) (ready : α → Html msg)
     (loading : Html msg := .text "Loading…")
@@ -188,10 +182,6 @@ def App.withQueries {Model Msg : Type} (qs : List (Query Model Msg))
     (App.withQueries qs app).rehydrate = app.rehydrate := rfl
 
 end Internal
-
-#guard (match (({} : Cached Nat).put "a" (.ok 1) "b").state with | .idle => true | _ => false)
-#guard ((({} : Cached Nat).put "a" (.ok 1) "b").lookup "a" == some 1)
-#guard (match (({} : Cached Nat).put "a" (.ok 7) "a").state with | .ok 7 => true | _ => false)
 
 instance [ToJson α] : ToJson (Resource α) := ⟨fun
   | .idle     => .obj [("t", .str "idle")]

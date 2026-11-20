@@ -1,5 +1,5 @@
 import Qed.Component.AwaitLift
-import Qed.Speculative
+import Qed.Speculative.Core
 import Qed.Server.Invariant
 
 namespace Qed
@@ -32,39 +32,12 @@ private partial def lowerPredictStmts (wrapVal : Term → CommandElabM Term) :
           let checked ← wrapVal valT
           `(Option.some ($checked))
       else if k == ``qedStmtLet then
-        let rhsT ← lowerPredictExpr (st.getArg 4)
-        let cont ← lowerPredictStmts wrapVal rest
-        if (st.getArg 1).isIdent then
-          let lId : Ident := ⟨(st.getArg 1)⟩
-          if (st.getArg 2).getNumArgs == 2 then
-            let lTy ← liftMacroM (return (← lowerQedType ((st.getArg 2).getArg 1) false).1)
-            `(let $lId:ident : $lTy := $rhsT; $cont)
-          else
-            `(let $lId:ident := $rhsT; $cont)
-        else
-          `(let _ := $rhsT; $cont)
+        lowerLetStmt st lowerPredictExpr (← lowerPredictStmts wrapVal rest)
       else if k == ``qedStmtIf || k == ``qedStmtIfLet || k == ``qedStmtMatch then
         let passTail := !rest.isEmpty && hasReturnStmt st
         let tailStmts := if passTail then rest else []
-        let lowerBr (seq : Array Syntax) := lowerPredictStmts wrapVal (seq.toList ++ tailStmts)
-        let brTerm ←
-          if k == ``qedStmtIf then
-            let cond ← lowerCompExpr .propGuard (st.getArg 1)
-            let tT ← lowerBr (suiteStmts (st.getArg 3))
-            let eT ← lowerBr ((desugarElifs (st.getArg 4).getArgs (st.getArg 5)).getD #[])
-            `(if $(mkIdent `_qedIf):ident : $cond then $tT else $eT)
-          else if k == ``qedStmtIfLet then
-            let pat ← liftMacroM (lowerQedPat (st.getArg 2))
-            let scrut ← lowerPredictExpr (st.getArg 4)
-            let tT ← lowerBr (suiteStmts (st.getArg 6))
-            let eT ← lowerBr (if (st.getArg 7).getNumArgs == 3 then suiteStmts ((st.getArg 7).getArg 2) else #[])
-            `(match $(mkIdent `_qedIfLet):ident : $scrut:term with | $pat:term => $tT | _ => $eT)
-          else
-            let scruts ← (st.getArg 1).getSepArgs.mapM lowerPredictExpr
-            let alts ← (st.getArg 3).getArgs.mapM fun alt => do
-              let pats ← (alt.getArg 1).getSepArgs.mapM fun p => liftMacroM (lowerQedPat p)
-              `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $(← lowerBr (suiteStmts (alt.getArg 3))))
-            `(match $[$scruts:term],* with $[$alts:matchAlt]*)
+        let brTerm ← lowerControlFlowStmt st lowerPredictExpr fun seq =>
+          lowerPredictStmts wrapVal (seq.toList ++ tailStmts)
         if passTail || rest.isEmpty then
           return brTerm
         else
@@ -100,8 +73,7 @@ private partial def compileClassifyTree (spec : ComponentSpec) : ClassifyTree �
           let fname := (((st.getArg 0).getArg 0).getArg 0).getId.eraseMacroScopes
           let idxT ← lowerCompExpr .val ((st.getArg 0).getArg 2)
           let rhsT ← lowerCompExpr .val (st.getArg 2)
-          let fIdent := mkIdent fname
-          `(let $fIdent:ident := ($fIdent).set $idxT $rhsT (by first | get_elem_tactic | (simp (config := { zetaDelta := false }) only [$fIdent:ident, Array.size_set, Array.size_push] <;> omega)); $bodyT)
+          lowerArraySetExpr (mkIdent fname) idxT rhsT bodyT
         else pure bodyT
       else if sk == ``qedStmtExpr then
         if let some (targetStx, elemStx) := matchPushCall? (st.getArg 0) then

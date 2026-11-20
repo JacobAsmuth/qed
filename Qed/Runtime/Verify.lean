@@ -1,7 +1,5 @@
-import Qed.View.Core
 import Qed.Runtime.ValidLemmas
 import Qed.Diag
-import Lean
 
 namespace Qed
 
@@ -227,19 +225,31 @@ private def viewValidSimpExtras (env : Environment) : Array Name :=
   ].filter env.contains
   base ++ opt
 
-elab "qedUnfoldForValidHtml" : tactic => do
-  for _ in [0:8] do
-    if (← getGoals).isEmpty then return
+private def qedUnfoldHelpers (maxIters : Nat) (allowView : Bool)
+    (extraLemmas : Array (TSyntax `Lean.Parser.Tactic.simpLemma) := #[])
+    (includeLCtx : Bool := false) (tryRfl : Bool := false) : TacticM Unit := do
+  for _ in [0:maxIters] do
+    if (← getGoals).isEmpty then break
     let env ← getEnv
-    let target ← instantiateMVars (← getMainTarget)
-    let present ← target.getUsedConstants.filterM (fun n => liftM (isUnfoldableUserDef env true n))
-    if present.isEmpty then return
-    let lemmas ← present.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
-    let ok ← try
-        evalTactic (← `(tactic| simp only [$[$lemmas],*]))
-        pure true
-      catch _ => pure false
-    unless ok do return
+    let present ← withMainContext do
+      let mut cs := (← instantiateMVars (← getMainTarget)).getUsedConstants
+      if includeLCtx then
+        for ldecl in (← getLCtx) do
+          if !ldecl.isImplementationDetail then
+            cs := cs ++ (← instantiateMVars ldecl.type).getUsedConstants
+      cs.filterM (fun n => liftM (isUnfoldableUserDef env allowView n))
+    if present.isEmpty then break
+    let uL ← present.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+    let combined := uL ++ extraLemmas
+    let tac ← match includeLCtx, tryRfl with
+      | true,  true  => `(tactic| (simp only [$[$combined],*] at *; try rfl))
+      | true,  false => `(tactic| simp only [$[$combined],*] at *)
+      | false, true  => `(tactic| (simp only [$[$combined],*]; try rfl))
+      | false, false => `(tactic| simp only [$[$combined],*])
+    let ok ← try evalTactic tac; pure true catch _ => pure false
+    unless ok do break
+
+elab "qedUnfoldForValidHtml" : tactic => qedUnfoldHelpers 8 true
 
 private def runHtmlSimpLoop (maxIters : Nat)
     (lemmas : Array (TSyntax `Lean.Parser.Tactic.simpLemma)) (useOnly : Bool) : TacticM Unit := do
@@ -275,9 +285,6 @@ private def mkBoolEqTrue (lhs : Expr) : Expr :=
 private def defaultHtmlCtx : HtmlCtx := {}
 
 private def defaultHtmlCtxExpr : Expr := htmlCtxExpr defaultHtmlCtx
-
-private def headConst? (e : Expr) : Option Name :=
-  e.consumeMData.getAppFn.constName?
 
 private def emitValidMVar (goalTy : Expr) : ProveValidM Expr := do
   let m ← Meta.mkFreshExprSyntheticOpaqueMVar goalTy
@@ -1003,6 +1010,14 @@ private def diagnoseHtmlStepFailure (ctx : HtmlCtx) (tag : String) : Option Stri
         else none
     | .svg => none
 
+private def diagnoseAttrKey (k : String) : Option String :=
+  let kl := k.toLower
+  if kl == "srcdoc" || kl.startsWith "on" then
+    some s!"forbidden attribute `{k}` (inline event handlers and `srcdoc` are disallowed)"
+  else if kl == "href" || kl == "src" || kl == "action" || kl == "formaction" || kl == "poster" || kl == "cite" || kl == "data" then
+    some s!"URL attribute `{k}` must use a typed `Router` route or `Url` (raw dynamic strings are disallowed)"
+  else none
+
 private def diagnoseValidGoal (g : MVarId) : MetaM (Option String) := g.withContext do
   let tgt := (← instantiateMVars (← g.getType)).consumeMData.headBeta
   let some (_, lhs, rhs) := tgt.eq? | return none
@@ -1030,22 +1045,13 @@ private def diagnoseValidGoal (g : MVarId) : MetaM (Option String) := g.withCont
       | .colgroup => return some "raw text cannot appear directly inside `<colgroup>`"
       | _ => pure ()
   if lhs.isAppOfArity ``Attr.validKeyValue 2 then
-    let aArgs := lhs.getAppArgs
-    if let some k := strLitVal? aArgs[0]! then
-      let kl := k.toLower
-      if kl == "srcdoc" || kl.startsWith "on" then
-        return some s!"forbidden attribute `{k}` (inline event handlers and `srcdoc` are disallowed)"
-      else if kl == "href" || kl == "src" || kl == "action" || kl == "formaction" || kl == "poster" || kl == "cite" || kl == "data" then
-        return some s!"URL attribute `{k}` must use a typed `Router` route or `Url` (raw dynamic strings are disallowed)"
+    if let some k := strLitVal? (lhs.getAppArgs[0]!) then
+      if let some msg := diagnoseAttrKey k then return some msg
   if lhs.isAppOfArity ``Attr.valid 2 then
     let attrE := lhs.getAppArgs[1]!.consumeMData.headBeta
     if attrE.isAppOfArity ``Attr.attr 3 then
       if let some k := strLitVal? (attrE.getAppArgs[1]!) then
-        let kl := k.toLower
-        if kl == "srcdoc" || kl.startsWith "on" then
-          return some s!"forbidden attribute `{k}` (inline event handlers and `srcdoc` are disallowed)"
-        else if kl == "href" || kl == "src" || kl == "action" || kl == "formaction" || kl == "poster" || kl == "cite" || kl == "data" then
-          return some s!"URL attribute `{k}` must use a typed `Router` route or `Url` (raw dynamic strings are disallowed)"
+        if let some msg := diagnoseAttrKey k then return some msg
   if lhs.isAppOfArity ``Bool.or 2 then
     let o0 := lhs.getAppArgs[0]!.consumeMData.headBeta
     if o0.isAppOfArity ``Bool.not 1 then
@@ -1138,27 +1144,6 @@ private def dehydrateProjLemmas (env0 : Environment) : Array Name :=
     `Qed.InvTarget.proj_id, `Qed.InvTarget.proj_fst
   ].filter env0.contains
 
-private def unfoldDehydrateUsers (maxIters : Nat)
-    (extraLemmas : Array (TSyntax `Lean.Parser.Tactic.simpLemma)) (includeLCtx : Bool) : TacticM Unit := do
-  for _ in [0:maxIters] do
-    if (← getGoals).isEmpty then break
-    let env ← getEnv
-    let present ← withMainContext do
-      let mut cs := (← instantiateMVars (← getMainTarget)).getUsedConstants
-      if includeLCtx then
-        for ldecl in (← getLCtx) do
-          if !ldecl.isImplementationDetail then
-            cs := cs ++ (← instantiateMVars ldecl.type).getUsedConstants
-      cs.filterM (fun n => liftM (isUnfoldableUserDef env false n))
-    if present.isEmpty then break
-    let uL ← present.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
-    let combined := uL ++ extraLemmas
-    let tac ← if includeLCtx
-      then `(tactic| (simp only [$[$combined],*] at *; try rfl))
-      else `(tactic| (simp only [$[$combined],*]; try rfl))
-    let ok ← try evalTactic tac; pure true catch _ => pure false
-    unless ok do break
-
 elab "qedProveDehydrateView" : tactic => do
   evalTactic (← `(tactic| intro _qed_m))
   -- Fast path: `Dehydrate.full` (`project = id`) and inline record-slice `Dehydrate.fields` close by `rfl`/simp!
@@ -1173,7 +1158,7 @@ elab "qedProveDehydrateView" : tactic => do
   let pL ← viewSimpNames.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
   try evalTactic (← `(tactic| (simp only [$[$pL],*]; try rfl))) catch _ => pure ()
   if (← getGoals).isEmpty then return
-  unfoldDehydrateUsers 6 pL false
+  qedUnfoldHelpers 6 false pL false true
   if !(← getGoals).isEmpty then
     let onlySet ← (viewSimpNames ++ viewValidSimpExtras env0).mapM fun n =>
       `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
@@ -1255,7 +1240,7 @@ elab "qedProveDehydrateInv" : tactic => do
   try evalTactic (← `(tactic| cases _qed_hre)) catch _ => pure ()
   try evalTactic (← `(tactic| exact _qed_hinv)) catch _ => pure ()
   if (← getGoals).isEmpty then return
-  unfoldDehydrateUsers 6 pL true
+  qedUnfoldHelpers 6 false pL true true
   if !(← getGoals).isEmpty then
     try evalTactic (← `(tactic|
       ((repeat' split) <;> first
@@ -1327,47 +1312,5 @@ elab "qedProveViewEquiv" appId:ident viewId:ident : tactic => do
       | rfl
       | ((repeat' split) <;> simp_all [Qed.mkCanonicalElem, Qed.onlySignalBind, Qed.Attr.canonical])))
     catch _ => pure ()
-
-structure SchemaFormInfo where
-  fullName     : Lean.Name
-  formViewName : Lean.Name
-  ctxBinders   : Array Lean.Name
-deriving Inhabited
-
-initialize schemaFormRegistry :
-    Lean.SimplePersistentEnvExtension SchemaFormInfo (Lean.NameMap SchemaFormInfo) ←
-  Lean.registerSimplePersistentEnvExtension {
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.fullName info) acc) {}
-    addEntryFn := fun m info => m.insert info.fullName info
-  }
-
-open Lean in
-def lookupSchemaForm? (cName : Name) : CoreM (Option SchemaFormInfo) := do
-  let env ← getEnv
-  let reg := schemaFormRegistry.getState env
-  let ns ← getCurrNamespace
-  if let some info := reg.find? (ns ++ cName) then return some info
-  if let some info := reg.find? cName then return some info
-  if cName.getString! == "Form" then
-    for (fullView, _) in ResolveName.resolveGlobalName env {} ns (← getOpenDecls) (cName.getPrefix ++ `formView) do
-      if let some info := reg.find? (fullView.getPrefix ++ `Form) then return some info
-  return none
-
-def resolveSchemaCtxArgs (ref : Lean.Syntax) (tag : String) (ctxBinders : Array Lean.Name)
-    (props : Array (Lean.Syntax × String × Lean.Term)) (checkUnknown := true) : Lean.MacroM (Array Lean.Term) := do
-  let mut ctxVals : Std.HashMap Lean.Name Lean.Term := {}
-  let mut ctxArg? : Option Lean.Term := none
-  for (attrRef, nm, v) in props do
-    if nm == "ctx" && ctxBinders.size == 1 then ctxArg? := some v
-    else if ctxBinders.contains (.mkSimple nm) then ctxVals := ctxVals.insert (.mkSimple nm) v
-    else if checkUnknown then
-      let valid := ["bind", "onSubmit", "key", "reset"] ++ ctxBinders.toList.map toString ++
-        (if ctxBinders.size == 1 then ["ctx"] else [])
-      let hint := Qed.Diag.didYouMean nm valid
-      Lean.Macro.throwErrorAt attrRef s!"<{tag}>: unknown attribute `{nm}`{hint} (valid: {String.intercalate ", " valid})"
-  ctxBinders.mapM fun b => do
-    if let some v := ctxVals[b]? <|> ctxArg? then pure v
-    else Lean.Macro.throwErrorAt ref s!"<{tag}> requires context attribute `{b}=\{…}`{if ctxBinders.size == 1 then " (or `ctx={…}`)" else ""}"
 
 end Qed

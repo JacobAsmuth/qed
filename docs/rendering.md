@@ -10,13 +10,10 @@ At the pure `Html` and `View` layer:
 
 - **`diff_apply`** (`Qed/Diff.lean`) proves that diffing an old `Html` tree against a new one
   and applying the resulting patch yields the exact new `Html` tree.
-- **`applyValues_render` and `patch_render`** (`Qed/View/Core.lean`) prove that updating dynamic
-  bindings in place when a template's structure is stable—and falling back to a tree diff when
-  branches flip—always matches `View.render`.
 - **Conditionals (`showIf` / `ifElse`):** `showIf` lowers to `ifElse` with an empty text branch
   so rendering, patching, and hydration share a single conditional path. Hidden branches reserve
-  their signal indices so sibling bindings stay aligned, and a branch that remains hidden stays
-  structurally stable regardless of changes inside it.
+  their signal indices so sibling bindings stay aligned, and `patchViewM` skips unchanged hidden
+  branches in place.
 
 In [`Qed/Proofs/`](../Qed/Proofs) (`DomArena.lean`, `KeyedReconcile.lean`, `ViewPatch.lean`, `Hydration.lean`), these theorems are lifted to the
 imperative `MonadDom` driver (`Qed/Driver/`). Evaluated against a pure W3C DOM arena
@@ -68,8 +65,7 @@ Updating live browser DOM state requires a few guarantees beyond pure HTML seria
   and resets removed controlled `value` and `checked` DOM properties.
 - **Verified subtree memoization (`Qed.lazy` / `V.memo`):** Memoized subtrees require a
   `LawfulKey` argument whose serialization is provably injective (`toKey a = toKey b → a = b`).
-  When keys match, skipping the subtree is guaranteed exact by both `applyValues_render` and
-  `patchViewM_memo_hit`.
+  When keys match, skipping the subtree is guaranteed exact by `patchViewM_memo_hit`.
 
 ## Differential and browser tests
 

@@ -1,5 +1,4 @@
-import Qed.Runtime.App
-import Qed.Json.Basic
+import Qed.Runtime.AppCore
 
 namespace Qed
 
@@ -377,7 +376,7 @@ theorem fullstack_ssr_rpc_equiv {Model Msg : Type}
     (dispatchBytes : String → String → ByteArray → Except String ByteArray)
     (dispatchText  : String → String → String → Except String String)
     (fuel : Nat) :
-    let appD := Qed.Internal.App.withDehydrate d app hview
+    let appD := Qed.Internal.App.withDehydrateCore d app hview
     let m_srv : Model := App.ssrBootM (m := Id) appD path dispatchBytes dispatchText fuel
     let stateJson := appD.dehydrate m_srv
     ∃ m_hyd : Model,

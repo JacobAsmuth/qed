@@ -1,4 +1,4 @@
-import Qed.Json
+import Qed.Json.Lawful
 import Qed.Proto
 
 namespace Qed
@@ -345,47 +345,47 @@ theorem decode_encode_unsub (sid : UInt32) :
     simp [mkMuxHdr_size]
   simp [hrest, pure, Except.pure]
 
-theorem decode_encode_send (sid : UInt32) (payload : ByteArray) :
-    decode (encode (.send sid payload)) = .ok (.send sid payload) := by
-  unfold decode encode
-  have hhdr := mkMuxHdr_size 0x03 sid
-  have h5 : 5 ≤ (mkMuxHdr 0x03 sid ++ payload).size := by
+private theorem decode_encode_payload (op : UInt8) (sid : UInt32) (payload : ByteArray)
+    (frame : WsMuxFrame)
+    (henc : encode frame = mkMuxHdr op sid ++ payload)
+    (hdec : (match op with
+      | 0x03 => (Except.ok (.send sid payload) : Except String WsMuxFrame)
+      | 0x11 => .ok (.joinOk sid payload)
+      | 0x12 => .ok (.event sid payload)
+      | _    => .error s!"unknown ws mux op {op.toNat}") = .ok frame) :
+    decode (encode frame) = .ok frame := by
+  rw [henc]
+  unfold decode
+  have hhdr := mkMuxHdr_size op sid
+  have h5 : 5 ≤ (mkMuxHdr op sid ++ payload).size := by
     rw [ByteArray.size_append, hhdr]; omega
   rw [dif_pos h5, readU32BE_mkMuxHdr]
   dsimp only
   rw [mkMuxHdr_get0]
-  have hrest := byteArray_extract_append_right (mkMuxHdr 0x03 sid) payload
+  have hrest := byteArray_extract_append_right (mkMuxHdr op sid) payload
   rw [hhdr] at hrest
   rw [hrest]
-  rfl
+  have hop : op = 0x03 ∨ op = 0x11 ∨ op = 0x12 := by
+    by_cases h3 : op = 0x03
+    · exact Or.inl h3
+    · by_cases h11 : op = 0x11
+      · exact Or.inr (Or.inl h11)
+      · by_cases h12 : op = 0x12
+        · exact Or.inr (Or.inr h12)
+        · simp at hdec
+  rcases hop with rfl | rfl | rfl <;> simpa [pure, Except.pure] using hdec
+
+theorem decode_encode_send (sid : UInt32) (payload : ByteArray) :
+    decode (encode (.send sid payload)) = .ok (.send sid payload) :=
+  decode_encode_payload 0x03 sid payload (.send sid payload) rfl rfl
 
 theorem decode_encode_joinOk (sid : UInt32) (snap : ByteArray) :
-    decode (encode (.joinOk sid snap)) = .ok (.joinOk sid snap) := by
-  unfold decode encode
-  have hhdr := mkMuxHdr_size 0x11 sid
-  have h5 : 5 ≤ (mkMuxHdr 0x11 sid ++ snap).size := by
-    rw [ByteArray.size_append, hhdr]; omega
-  rw [dif_pos h5, readU32BE_mkMuxHdr]
-  dsimp only
-  rw [mkMuxHdr_get0]
-  have hrest := byteArray_extract_append_right (mkMuxHdr 0x11 sid) snap
-  rw [hhdr] at hrest
-  rw [hrest]
-  rfl
+    decode (encode (.joinOk sid snap)) = .ok (.joinOk sid snap) :=
+  decode_encode_payload 0x11 sid snap (.joinOk sid snap) rfl rfl
 
 theorem decode_encode_event (sid : UInt32) (payload : ByteArray) :
-    decode (encode (.event sid payload)) = .ok (.event sid payload) := by
-  unfold decode encode
-  have hhdr := mkMuxHdr_size 0x12 sid
-  have h5 : 5 ≤ (mkMuxHdr 0x12 sid ++ payload).size := by
-    rw [ByteArray.size_append, hhdr]; omega
-  rw [dif_pos h5, readU32BE_mkMuxHdr]
-  dsimp only
-  rw [mkMuxHdr_get0]
-  have hrest := byteArray_extract_append_right (mkMuxHdr 0x12 sid) payload
-  rw [hhdr] at hrest
-  rw [hrest]
-  rfl
+    decode (encode (.event sid payload)) = .ok (.event sid payload) :=
+  decode_encode_payload 0x12 sid payload (.event sid payload) rfl rfl
 
 end WsMuxFrame
 

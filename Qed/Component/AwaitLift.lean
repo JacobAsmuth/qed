@@ -704,27 +704,14 @@ private partial def liftAwaitStmts (ctx : RewriteCtx)
 
 def collectSitesAndRewriteStateful (spec : ComponentSpec) :
     CommandElabM (Array SetSite × Option RouteDecl × Array QueryDecl × Array Term × Term × Array HoistedSub × Array FieldDecl × Array ResetFormSub × Array (String × String) × Array SpecDispatchArm × Array SpecResolveSite) := do
-  let sitesRef          ← IO.mkRef (#[] : Array SetSite)
-  let hoistedRef        ← IO.mkRef (#[] : Array HoistedSub)
-  let formDraftsRef     ← IO.mkRef (#[] : Array FieldDecl)
-  let resetFormsRef     ← IO.mkRef (#[] : Array ResetFormSub)
-  let usedRpcsRef       ← IO.mkRef (#[] : Array (String × String))
-  let contCtrRef        ← IO.mkRef (0 : Nat)
-  let specDispatchesRef ← IO.mkRef (#[] : Array SpecDispatchArm)
-  let specResolvesRef   ← IO.mkRef (#[] : Array SpecResolveSite)
-  let baseCtx : RewriteCtx := {
-    compName := spec.t.getId,
-    stateFields := spec.fieldNames, bindFields := spec.bindNames, propNames := spec.propNames,
-    eventNames := spec.events.map (·.id.getId),
-    subNames := spec.subscriptions.map (·.id.getId),
-    portOutNames := spec.portOuts.map (·.id.getId),
-    actionNames := spec.actions.map (·[1].getId) ++ spec.portIns.map (·.id.getId),
-    isPureComp := false, msgPath := spec.t.getId ++ `Msg, hasOut := spec.outTy?.isSome,
-    collections := spec.collections, sites := sitesRef, hoisted := hoistedRef,
-    formDrafts := formDraftsRef, resetForms := resetFormsRef,
-    usedRpcs := usedRpcsRef, contCounter := contCtrRef,
-    specDispatches := specDispatchesRef, specResolves := specResolvesRef
-  }
+  let baseCtx ← mkRewriteCtx spec false
+  let sitesRef          := baseCtx.sites
+  let hoistedRef        := baseCtx.hoisted
+  let formDraftsRef     := baseCtx.formDrafts
+  let resetFormsRef     := baseCtx.resetForms
+  let usedRpcsRef       := baseCtx.usedRpcs
+  let specDispatchesRef := baseCtx.specDispatches
+  let specResolvesRef   := baseCtx.specResolves
   for a in spec.actions do
     let name := (a.getArg 1).getId
     if (← sitesRef.get).any (·.ctor == name) then

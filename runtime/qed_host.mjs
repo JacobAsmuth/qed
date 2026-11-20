@@ -67,8 +67,7 @@ export function boot() {
     else if (b.attr) { if (b.el.getAttribute(b.attr) !== s) b.el.setAttribute(b.attr, s); }
     else if (b.el.textContent !== s) b.el.textContent = s;
   };
-  const timers = {}, sockets = {};
-  const wsEvent = (key, event, data) => g.send('__ws', JSON.stringify({ key, event, data: data || '' }));
+  const timers = {};
   g.effect = (kind, a, b, c) => {
     switch (kind) {
       case 'timer.cancel': if (timers[a]) { clearTimeout(timers[a]); delete timers[a]; } break;
@@ -86,12 +85,6 @@ export function boot() {
       case 'dom.scrollIntoView': { const el = document.getElementById(a); if (el) el.scrollIntoView({ behavior: 'smooth' }); break; }
       case 'document.title': document.title = a; break;
       case 'signal.set': g.setSignal(a, b); break;
-      case 'ws.open': { let url = b; if (url.startsWith('/')) url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + url;
-        try { const s = new WebSocket(url); sockets[a] = s; s.onopen = () => wsEvent(a, 'open'); s.onmessage = (e) => wsEvent(a, 'message', String(e.data));
-          s.onerror = () => wsEvent(a, 'error', 'socket error'); s.onclose = () => { delete sockets[a]; wsEvent(a, 'close'); }; }
-        catch (err) { wsEvent(a, 'error', String(err)); } break; }
-      case 'ws.send': { const s = sockets[a]; if (s && s.readyState === 1) s.send(b); break; }
-      case 'ws.close': { const s = sockets[a]; if (s) s.close(); break; }
       case 'event.listen': ensureEvent(a); break;
       case 'file.download': { const url = URL.createObjectURL(new Blob([c], { type: b || 'text/plain' }));
         const el = document.createElement('a'); el.href = url; el.download = a; el.click();

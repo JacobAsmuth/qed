@@ -2,7 +2,7 @@ import Qed.Component.Syntax
 import Qed.Resource.Basic
 import Qed.Socket.Basic
 import Qed.Server.Registry
-import Qed.Runtime.Verify
+import Qed.Schema.Registry
 
 namespace Qed
 section CompElab
@@ -307,6 +307,76 @@ structure RewriteCtx where
   contCounter    : IO.Ref Nat
   specDispatches : IO.Ref (Array SpecDispatchArm)
   specResolves   : IO.Ref (Array SpecResolveSite)
+
+def mkRewriteCtx (spec : ComponentSpec) (isPureComp : Bool) (allowHoist : Bool := false) :
+    CommandElabM RewriteCtx := do
+  return {
+    compName       := if isPureComp then .anonymous else spec.t.getId
+    stateFields    := if isPureComp then #[] else spec.fieldNames
+    bindFields     := spec.bindNames
+    propNames      := spec.propNames
+    eventNames     := if isPureComp then #[] else spec.events.map (·.id.getId)
+    subNames       := if isPureComp then #[] else spec.subscriptions.map (·.id.getId)
+    portOutNames   := if isPureComp then #[] else spec.portOuts.map (·.id.getId)
+    actionNames    := if isPureComp then #[] else spec.actions.map (·[1].getId) ++ spec.portIns.map (·.id.getId)
+    isPureComp
+    msgPath        := spec.t.getId ++ `Msg
+    hasOut         := if isPureComp then false else spec.outTy?.isSome
+    collections    := if isPureComp then #[] else spec.collections
+    allowHoist
+    sites          := ← IO.mkRef #[]
+    hoisted        := ← IO.mkRef #[]
+    formDrafts     := ← IO.mkRef #[]
+    resetForms     := ← IO.mkRef #[]
+    usedRpcs       := ← IO.mkRef #[]
+    contCounter    := ← IO.mkRef 0
+    specDispatches := ← IO.mkRef #[]
+    specResolves   := ← IO.mkRef #[]
+  }
+
+def lowerLetStmt (st : Syntax) (lowerVal : Syntax → CommandElabM Term) (cont : Term) :
+    CommandElabM Term := do
+  let rhsT ← lowerVal (st.getArg 4)
+  if (st.getArg 1).isIdent then
+    let lId : Ident := ⟨(st.getArg 1)⟩
+    if (st.getArg 2).getNumArgs == 2 then
+      let lTy ← liftMacroM (return (← lowerQedType ((st.getArg 2).getArg 1) false).1)
+      `(let $lId:ident : $lTy := $rhsT; $cont)
+    else `(let $lId:ident := $rhsT; $cont)
+  else `(let _ := $rhsT; $cont)
+
+def lowerArraySetExpr (fIdent : Ident) (idxT rhsT cont : Term) : CommandElabM Term :=
+  `(let $fIdent:ident := ($fIdent).set $idxT $rhsT (by first | get_elem_tactic | (simp (config := { zetaDelta := false }) only [$fIdent:ident, Array.size_set, Array.size_push] <;> omega)); $cont)
+
+def lowerControlFlowStmt (st : Syntax) (lowerVal : Syntax → CommandElabM Term)
+    (lowerBranch : Array Syntax → CommandElabM Term) : CommandElabM Term := do
+  let k := st.getKind
+  if k == ``qedStmtIf then
+    let cond ← lowerCompExpr .propGuard (st.getArg 1)
+    let tT ← lowerBranch (suiteStmts (st.getArg 3))
+    let eT ← lowerBranch ((desugarElifs (st.getArg 4).getArgs (st.getArg 5)).getD #[])
+    `(if $(mkIdent `_qedIf):ident : $cond then $tT else $eT)
+  else if k == ``qedStmtIfLet then
+    let pat ← liftMacroM (lowerQedPat (st.getArg 2))
+    let scrut ← lowerVal (st.getArg 4)
+    let tT ← lowerBranch (suiteStmts (st.getArg 6))
+    let eT ← lowerBranch (if (st.getArg 7).getNumArgs == 3 then suiteStmts ((st.getArg 7).getArg 2) else #[])
+    `(match $(mkIdent `_qedIfLet):ident : $scrut:term with | $pat:term => $tT | _ => $eT)
+  else
+    let scruts ← (st.getArg 1).getSepArgs.mapM lowerVal
+    let alts ← (st.getArg 3).getArgs.mapM fun alt => do
+      let pats ← (alt.getArg 1).getSepArgs.mapM fun p => liftMacroM (lowerQedPat p)
+      `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $(← lowerBranch (suiteStmts (alt.getArg 3))))
+    `(match $[$scruts:term],* with $[$alts:matchAlt]*)
+
+private def mkEnsuredExistentialTy (valTy : Term) (ensConst : Name) (paramCount : Nat)
+    (paramTypeConsts : Array Name) (valVar : Name) (paramPfx : String) : CommandElabM Term := do
+  let vId := mkIdent valVar
+  let pIds := (Array.range paramCount).map fun i => mkIdent (.mkSimple s!"{paramPfx}{i}")
+  let ensApp ← (pIds.push vId).foldlM (init := (mkIdent ensConst : Term)) fun acc x => `($acc $x)
+  let exBody ← (pIds.zip paramTypeConsts).foldrM (init := ensApp) fun (pId, pTy) acc =>
+    `(∃ ($pId:ident : $(mkIdent pTy)), $acc)
+  `(Qed.Ensured $valTy (fun ($vId:ident : $valTy) => $exBody))
 
 def recordUsedRpc (ref : IO.Ref (Array (String × String))) (srv : String) (m : String) : IO Unit := do
   let cur ← ref.get
@@ -781,12 +851,7 @@ private def parseRpcQueryClause (acc : SpecParseAcc) (cl : Syntax) : CommandElab
         pure ty
   let (msgTy, hasMsgEnsured) ← match if explicitTy?.isNone then mInfo.ensPredConst else none with
     | some ensConst =>
-        let qv := mkIdent `_qr_v
-        let qpIds := (Array.range mInfo.paramCount).map fun i => mkIdent (.mkSimple s!"_qp_{i}")
-        let ensApp ← (qpIds.push qv).foldlM (init := (mkIdent ensConst : Term)) fun acc x => `($acc $x)
-        let exBody ← (qpIds.zip mInfo.paramTypeConsts).foldrM (init := ensApp) fun (pId, pTy) acc =>
-          `(∃ ($pId:ident : $(mkIdent pTy)), $acc)
-        pure (← `(Qed.Ensured $qTy (fun ($qv:ident : $qTy) => $exBody)), true)
+        pure (← mkEnsuredExistentialTy qTy ensConst mInfo.paramCount mInfo.paramTypeConsts `_qr_v "_qp_", true)
     | none => pure (qTy, false)
   let qStateTy ← `(Cached $qTy)
   let qStateDef ← `({})
@@ -839,12 +904,7 @@ private def parseSubscribeClause (acc : SpecParseAcc) (cl : Syntax) : CommandEla
   let evTyTerm : Term := mkIdentFrom chanId chInfo.eventTypeConst
   let (msgEvTy, hasMsgEnsured) ← match chInfo.ensPredConst with
     | some ensConst =>
-        let ev := mkIdent `_ws_ev
-        let qpIds := (Array.range chInfo.paramCount).map fun i => mkIdent (.mkSimple s!"_wp_{i}")
-        let ensApp ← (qpIds.push ev).foldlM (init := (mkIdent ensConst : Term)) fun acc x => `($acc $x)
-        let exBody ← (qpIds.zip chInfo.paramTypeConsts).foldrM (init := ensApp) fun (pId, pTy) acc =>
-          `(∃ ($pId:ident : $(mkIdent pTy)), $acc)
-        pure (← `(Qed.Ensured $evTyTerm (fun ($ev:ident : $evTyTerm) => $exBody)), true)
+        pure (← mkEnsuredExistentialTy evTyTerm ensConst chInfo.paramCount chInfo.paramTypeConsts `_ws_ev "_wp_", true)
     | none => pure (evTyTerm, false)
   let statusTy ← `(Qed.SocketStatus)
   let statusDef ← `(Qed.SocketStatus.disconnected)

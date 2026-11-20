@@ -50,7 +50,7 @@ private def htmlTags : List String :=
    "header", "footer", "section", "article", "button", "label", "table", "thead", "tbody",
    "tfoot", "tr", "td", "th", "strong", "em", "select", "option", "input", "textarea",
    "img", "br", "hr", "small", "pre", "code", "b", "i", "main", "aside", "figure",
-   "figcaption", "blockquote", "ol", "fieldset", "legend", "datalist", "progress", "meter"]
+   "figcaption", "blockquote", "fieldset", "legend", "datalist", "progress", "meter"]
 
 private def elementTag? (n : Lean.Name) : Option String :=
   match lastStr? n.eraseMacroScopes with

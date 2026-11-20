@@ -86,7 +86,7 @@ where
 def extractVarNames (s : String) : List String :=
   takeVarName.extractVarNamesLoop s.toList
 
-private def dedupStrings (xs : List String) : List String :=
+def dedupStrings (xs : List String) : List String :=
   (xs.foldl (fun acc x => if acc.contains x then acc else x :: acc) []).reverse
 
 mutual
@@ -153,45 +153,16 @@ structure Len where raw : String
 deriving Inhabited, BEq, Repr
 instance : OfNat Len 0 := ⟨⟨"0"⟩⟩
 instance : ToString Len := ⟨Len.raw⟩
-def Len.auto       : Len := ⟨"auto"⟩
-def Len.none       : Len := ⟨"none"⟩
-def Len.fitContent : Len := ⟨"fit-content"⟩
-def Len.minContent : Len := ⟨"min-content"⟩
-def Len.maxContent : Len := ⟨"max-content"⟩
+def Len.auto : Len := ⟨"auto"⟩
 
-def px   (n : CssNum) : Len := ⟨n.raw ++ "px"⟩
-def rem  (n : CssNum) : Len := ⟨n.raw ++ "rem"⟩
-def em   (n : CssNum) : Len := ⟨n.raw ++ "em"⟩
-def pct  (n : CssNum) : Len := ⟨n.raw ++ "%"⟩
-def vh   (n : CssNum) : Len := ⟨n.raw ++ "vh"⟩
-def vw   (n : CssNum) : Len := ⟨n.raw ++ "vw"⟩
-def dvh  (n : CssNum) : Len := ⟨n.raw ++ "dvh"⟩
-def svh  (n : CssNum) : Len := ⟨n.raw ++ "svh"⟩
-def lvh  (n : CssNum) : Len := ⟨n.raw ++ "lvh"⟩
-def dvw  (n : CssNum) : Len := ⟨n.raw ++ "dvw"⟩
-def fr   (n : CssNum) : Len := ⟨n.raw ++ "fr"⟩
-def ch   (n : CssNum) : Len := ⟨n.raw ++ "ch"⟩
-def ex   (n : CssNum) : Len := ⟨n.raw ++ "ex"⟩
-def vmin (n : CssNum) : Len := ⟨n.raw ++ "vmin"⟩
-def vmax (n : CssNum) : Len := ⟨n.raw ++ "vmax"⟩
-
-def cssCalc (expr : String) : Len := ⟨s!"calc({expr})"⟩
-def clamp   (lo pref hi : Len) : Len := ⟨s!"clamp({lo.raw}, {pref.raw}, {hi.raw})"⟩
-def minLen (a b : Len) : Len := ⟨s!"min({a.raw}, {b.raw})"⟩
-def maxLen (a b : Len) : Len := ⟨s!"max({a.raw}, {b.raw})"⟩
+def px  (n : CssNum) : Len := ⟨n.raw ++ "px"⟩
+def rem (n : CssNum) : Len := ⟨n.raw ++ "rem"⟩
+def em  (n : CssNum) : Len := ⟨n.raw ++ "em"⟩
+def pct (n : CssNum) : Len := ⟨n.raw ++ "%"⟩
 
 structure Time where raw : String
 deriving Inhabited, BEq, Repr
 instance : ToString Time := ⟨Time.raw⟩
-def ms  (n : CssNum) : Time := ⟨n.raw ++ "ms"⟩
-def sec (n : CssNum) : Time := ⟨n.raw ++ "s"⟩
-
-structure Angle where raw : String
-deriving Inhabited, BEq, Repr
-instance : ToString Angle := ⟨Angle.raw⟩
-def deg  (n : CssNum) : Angle := ⟨n.raw ++ "deg"⟩
-def turn (n : CssNum) : Angle := ⟨n.raw ++ "turn"⟩
-def rad  (n : CssNum) : Angle := ⟨n.raw ++ "rad"⟩
 
 /-! ## Colors & Hex Parsing -/
 
@@ -245,31 +216,12 @@ def Color.inherit      : Color := ⟨"inherit", none⟩
 def Color.white        : Color := ⟨"#ffffff", some (255, 255, 255)⟩
 def Color.black        : Color := ⟨"#000000", some (0, 0, 0)⟩
 
-def hex  (s : String) : Color :=
+def hex (s : String) : Color :=
   let clean := String.ofList (stripHashChars s)
   ⟨"#" ++ clean, parseHexRgb? clean⟩
 
 def rgb (r g b : Nat) : Color :=
   ⟨s!"rgb({r}, {g}, {b})", if r ≤ 255 && g ≤ 255 && b ≤ 255 then some (r, g, b) else none⟩
-
-def rgb8 (r g b : UInt8) : Color :=
-  ⟨s!"rgb({r.toNat}, {g.toNat}, {b.toNat})", some (r.toNat, g.toNat, b.toNat)⟩
-
-def rgba (r g b : Nat) (a : CssNum) : Color :=
-  ⟨s!"rgba({r}, {g}, {b}, {a.raw})",
-    if r ≤ 255 && g ≤ 255 && b ≤ 255 && (a.raw == "1" || a.raw == "1.0") then some (r, g, b) else none⟩
-
-def hsl (h : CssNum) (s l : CssNum) : Color :=
-  ⟨s!"hsl({h.raw}, {s.raw}%, {l.raw}%)", none⟩
-
-def hsla (h s l a : CssNum) : Color :=
-  ⟨s!"hsla({h.raw}, {s.raw}%, {l.raw}%, {a.raw})", none⟩
-
-def oklch (l c h : CssNum) : Color :=
-  ⟨s!"oklch({l.raw} {c.raw} {h.raw})", none⟩
-
-def colorMix (space : String) (c1 : Color) (p1 : CssNum) (c2 : Color) : Color :=
-  ⟨s!"color-mix(in {space}, {c1.raw} {p1.raw}%, {c2.raw})", none⟩
 
 /-! ## `CssValue` Typeclass & Typed Design Tokens (`TypedToken α`) -/
 
@@ -280,7 +232,6 @@ instance : CssValue Color  := ⟨Color.raw⟩
 instance : CssValue Len    := ⟨Len.raw⟩
 instance : CssValue CssNum := ⟨CssNum.raw⟩
 instance : CssValue Time   := ⟨Time.raw⟩
-instance : CssValue Angle  := ⟨Angle.raw⟩
 instance : CssValue String := ⟨id⟩
 
 /-- Type-safe design token parameterized by its CSS value type `α`.
@@ -291,18 +242,6 @@ structure TypedToken (α : Type) where
   lightVal : Option α := none
   darkVal  : Option α := none
 deriving Inhabited, BEq, Repr
-
-def colorToken (name : String) (light? : Option Color := none) (dark? : Option Color := none) : TypedToken Color :=
-  ⟨name, light?, dark?⟩
-
-def lenToken (name : String) (light? : Option Len := none) (dark? : Option Len := none) : TypedToken Len :=
-  ⟨name, light?, dark?⟩
-
-def numToken (name : String) (light? : Option CssNum := none) (dark? : Option CssNum := none) : TypedToken CssNum :=
-  ⟨name, light?, dark?⟩
-
-def fontToken (name : String) (light? : Option String := none) (dark? : Option String := none) : TypedToken String :=
-  ⟨name, light?, dark?⟩
 
 instance {α : Type} : ToString (TypedToken α) := ⟨fun t => s!"var(--{t.name})"⟩
 instance : Coe (TypedToken Color)  Color  := ⟨fun t => ⟨s!"var(--{t.name})", t.lightVal.bind Color.rgb?⟩⟩
@@ -317,269 +256,31 @@ def TypedToken.set {α : Type} [CssValue α] (t : TypedToken α) (value : α) : 
 def cssVar {α : Type} [CssValue α] (t : TypedToken α) (value : α) : Item :=
   t.set value
 
-/-! ## Typed CSS Keyword Enums -/
+/-! ## Dynamic Inline CSS Property Builders -/
 
-inductive Display | flex | inlineFlex | grid | inlineGrid | block | inline | inlineBlock | table | flowRoot | none | contents
-deriving Inhabited, BEq, Repr
-def Display.css : Display → String
-  | .flex => "flex" | .inlineFlex => "inline-flex" | .grid => "grid" | .inlineGrid => "inline-grid"
-  | .block => "block" | .inline => "inline" | .inlineBlock => "inline-block"
-  | .table => "table" | .flowRoot => "flow-root" | .none => "none" | .contents => "contents"
-
-inductive Position | static | relative | absolute | fixed | sticky
-deriving Inhabited, BEq, Repr
-def Position.css : Position → String
-  | .static => "static" | .relative => "relative" | .absolute => "absolute"
-  | .fixed => "fixed" | .sticky => "sticky"
-
-inductive TextAlign | left | right | center | justify | start | «end»
-deriving Inhabited, BEq, Repr
-def TextAlign.css : TextAlign → String
-  | .left => "left" | .right => "right" | .center => "center" | .justify => "justify"
-  | .start => "start" | .«end» => "end"
-
-inductive FlexDirection | row | column | rowReverse | columnReverse
-deriving Inhabited, BEq, Repr
-def FlexDirection.css : FlexDirection → String
-  | .row => "row" | .column => "column" | .rowReverse => "row-reverse" | .columnReverse => "column-reverse"
-
-inductive Justify | start | «end» | center | spaceBetween | spaceAround | spaceEvenly
-deriving Inhabited, BEq, Repr
-def Justify.css : Justify → String
-  | .start => "flex-start" | .«end» => "flex-end" | .center => "center"
-  | .spaceBetween => "space-between" | .spaceAround => "space-around" | .spaceEvenly => "space-evenly"
-
-inductive Align | start | «end» | center | stretch | baseline
-deriving Inhabited, BEq, Repr
-def Align.css : Align → String
-  | .start => "flex-start" | .«end» => "flex-end" | .center => "center"
-  | .stretch => "stretch" | .baseline => "baseline"
-
-inductive BorderStyle | solid | dashed | dotted | double | none
-deriving Inhabited, BEq, Repr
-def BorderStyle.css : BorderStyle → String
-  | .solid => "solid" | .dashed => "dashed" | .dotted => "dotted" | .double => "double" | .none => "none"
-
-inductive Cursor
-  | auto | default | pointer | notAllowed | text | move | grab | grabbing
-  | wait | progress | help | crosshair | zoomIn | zoomOut | colResize | rowResize | none
-  | custom (raw : String)
-deriving Inhabited, BEq, Repr
-def Cursor.css : Cursor → String
-  | .auto => "auto" | .default => "default" | .pointer => "pointer" | .notAllowed => "not-allowed"
-  | .text => "text" | .move => "move" | .grab => "grab" | .grabbing => "grabbing"
-  | .wait => "wait" | .progress => "progress" | .help => "help" | .crosshair => "crosshair"
-  | .zoomIn => "zoom-in" | .zoomOut => "zoom-out" | .colResize => "col-resize" | .rowResize => "row-resize"
-  | .none => "none" | .custom s => s
-instance : Coe String Cursor := ⟨Cursor.custom⟩
-
-inductive Overflow | visible | hidden | clip | scroll | auto | custom (raw : String)
-deriving Inhabited, BEq, Repr
-def Overflow.css : Overflow → String
-  | .visible => "visible" | .hidden => "hidden" | .clip => "clip" | .scroll => "scroll"
-  | .auto => "auto" | .custom s => s
-instance : Coe String Overflow := ⟨Overflow.custom⟩
-
-inductive TextDecoration | none | underline | overline | lineThrough | custom (raw : String)
-deriving Inhabited, BEq, Repr
-def TextDecoration.css : TextDecoration → String
-  | .none => "none" | .underline => "underline" | .overline => "overline"
-  | .lineThrough => "line-through" | .custom s => s
-instance : Coe String TextDecoration := ⟨TextDecoration.custom⟩
-
-inductive WhiteSpace | normal | nowrap | pre | preWrap | preLine | breakSpaces | custom (raw : String)
-deriving Inhabited, BEq, Repr
-def WhiteSpace.css : WhiteSpace → String
-  | .normal => "normal" | .nowrap => "nowrap" | .pre => "pre" | .preWrap => "pre-wrap"
-  | .preLine => "pre-line" | .breakSpaces => "break-spaces" | .custom s => s
-instance : Coe String WhiteSpace := ⟨WhiteSpace.custom⟩
-
-inductive BoxSizing | contentBox | borderBox
-deriving Inhabited, BEq, Repr
-def BoxSizing.css : BoxSizing → String
-  | .contentBox => "content-box" | .borderBox => "border-box"
-
-inductive FlexWrap | nowrap | wrap | wrapReverse
-deriving Inhabited, BEq, Repr
-def FlexWrap.css : FlexWrap → String
-  | .nowrap => "nowrap" | .wrap => "wrap" | .wrapReverse => "wrap-reverse"
-
-inductive AlignSelf | auto | start | «end» | center | stretch | baseline
-deriving Inhabited, BEq, Repr
-def AlignSelf.css : AlignSelf → String
-  | .auto => "auto" | .start => "flex-start" | .«end» => "flex-end"
-  | .center => "center" | .stretch => "stretch" | .baseline => "baseline"
-
-inductive JustifySelf | auto | start | «end» | center | stretch
-deriving Inhabited, BEq, Repr
-def JustifySelf.css : JustifySelf → String
-  | .auto => "auto" | .start => "start" | .«end» => "end" | .center => "center" | .stretch => "stretch"
-
-inductive ObjectFit | fill | contain | cover | none | scaleDown
-deriving Inhabited, BEq, Repr
-def ObjectFit.css : ObjectFit → String
-  | .fill => "fill" | .contain => "contain" | .cover => "cover" | .none => "none" | .scaleDown => "scale-down"
-
-inductive PointerEvents | auto | none
-deriving Inhabited, BEq, Repr
-def PointerEvents.css : PointerEvents → String
-  | .auto => "auto" | .none => "none"
-
-inductive UserSelect | auto | none | text | all
-deriving Inhabited, BEq, Repr
-def UserSelect.css : UserSelect → String
-  | .auto => "auto" | .none => "none" | .text => "text" | .all => "all"
-
-inductive Visibility | visible | hidden | collapse
-deriving Inhabited, BEq, Repr
-def Visibility.css : Visibility → String
-  | .visible => "visible" | .hidden => "hidden" | .collapse => "collapse"
-
-inductive FontStyle | normal | italic | oblique
-deriving Inhabited, BEq, Repr
-def FontStyle.css : FontStyle → String
-  | .normal => "normal" | .italic => "italic" | .oblique => "oblique"
-
-inductive TextTransform | none | capitalize | uppercase | lowercase
-deriving Inhabited, BEq, Repr
-def TextTransform.css : TextTransform → String
-  | .none => "none" | .capitalize => "capitalize" | .uppercase => "uppercase" | .lowercase => "lowercase"
-
-inductive TextOverflow | clip | ellipsis
-deriving Inhabited, BEq, Repr
-def TextOverflow.css : TextOverflow → String
-  | .clip => "clip" | .ellipsis => "ellipsis"
-
-inductive WordBreak | normal | breakAll | keepAll | breakWord
-deriving Inhabited, BEq, Repr
-def WordBreak.css : WordBreak → String
-  | .normal => "normal" | .breakAll => "break-all" | .keepAll => "keep-all" | .breakWord => "break-word"
-
-inductive ScrollBehavior | auto | smooth
-deriving Inhabited, BEq, Repr
-def ScrollBehavior.css : ScrollBehavior → String
-  | .auto => "auto" | .smooth => "smooth"
-
-/-! ## CSS Property Builders -/
-
-instance : CoeFun Item (fun _ => Len → Item) where
-  coe
-    | .decl p v, l => .decl p (if l.raw.isEmpty then v else v ++ " " ++ l.raw)
-    | other,     _ => other
-
-def width         (l : Len) : Item := .decl "width" l.raw
-def height        (l : Len) : Item := .decl "height" l.raw
-def minWidth      (l : Len) : Item := .decl "min-width" l.raw
-def maxWidth      (l : Len) : Item := .decl "max-width" l.raw
-def minHeight     (l : Len) : Item := .decl "min-height" l.raw
-def maxHeight     (l : Len) : Item := .decl "max-height" l.raw
-def padding       (l : Len) : Item := .decl "padding" l.raw
-def paddingX      (l : Len) : Item := .decl "padding-inline" l.raw
-def paddingY      (l : Len) : Item := .decl "padding-block" l.raw
-def paddingTop    (l : Len) : Item := .decl "padding-top" l.raw
-def paddingRight  (l : Len) : Item := .decl "padding-right" l.raw
-def paddingBottom (l : Len) : Item := .decl "padding-bottom" l.raw
-def paddingLeft   (l : Len) : Item := .decl "padding-left" l.raw
-def margin        (l : Len) : Item := .decl "margin" l.raw
-def marginX       (l : Len) : Item := .decl "margin-inline" l.raw
-def marginY       (l : Len) : Item := .decl "margin-block" l.raw
-def marginTop     (l : Len) : Item := .decl "margin-top" l.raw
-def marginRight   (l : Len) : Item := .decl "margin-right" l.raw
-def marginBottom  (l : Len) : Item := .decl "margin-bottom" l.raw
-def marginLeft    (l : Len) : Item := .decl "margin-left" l.raw
-def inset         (l : Len) : Item := .decl "inset" l.raw
-def top           (l : Len) : Item := .decl "top" l.raw
-def right         (l : Len) : Item := .decl "right" l.raw
-def bottom        (l : Len) : Item := .decl "bottom" l.raw
-def left          (l : Len) : Item := .decl "left" l.raw
-def gap           (l : Len) : Item := .decl "gap" l.raw
-def rowGap        (l : Len) : Item := .decl "row-gap" l.raw
-def columnGap     (l : Len) : Item := .decl "column-gap" l.raw
-def fontSize      (l : Len) : Item := .decl "font-size" l.raw
-def borderRadius  (l : Len) : Item := .decl "border-radius" l.raw
-def borderWidth   (l : Len) : Item := .decl "border-width" l.raw
-def outlineOffset (l : Len) : Item := .decl "outline-offset" l.raw
-def letterSpacing (l : Len) : Item := .decl "letter-spacing" l.raw
-def flexBasis     (l : Len) : Item := .decl "flex-basis" l.raw
-
-def color           (c : Color) : Item := .decl "color" c.raw
-def backgroundColor (c : Color) : Item := .decl "background-color" c.raw
-def borderColor     (c : Color) : Item := .decl "border-color" c.raw
-def fill            (c : Color) : Item := .decl "fill" c.raw
-def stroke          (c : Color) : Item := .decl "stroke" c.raw
-def accentColor     (c : Color) : Item := .decl "accent-color" c.raw
-def caretColor      (c : Color) : Item := .decl "caret-color" c.raw
-
-def display        (d : Display)        : Item := .decl "display" d.css
-def position       (p : Position)       : Item := .decl "position" p.css
-def textAlign      (t : TextAlign)      : Item := .decl "text-align" t.css
-def flexDirection  (f : FlexDirection)  : Item := .decl "flex-direction" f.css
-def justifyContent (j : Justify)        : Item := .decl "justify-content" j.css
-def alignItems     (a : Align)          : Item := .decl "align-items" a.css
-def cursor         (c : Cursor)         : Item := .decl "cursor" c.css
-def overflow       (o : Overflow)       : Item := .decl "overflow" o.css
-def overflowX      (o : Overflow)       : Item := .decl "overflow-x" o.css
-def overflowY      (o : Overflow)       : Item := .decl "overflow-y" o.css
-def textDecoration (t : TextDecoration) : Item := .decl "text-decoration" t.css
-def whiteSpace     (w : WhiteSpace)     : Item := .decl "white-space" w.css
-def boxSizing      (b : BoxSizing)      : Item := .decl "box-sizing" b.css
-def flexWrap       (w : FlexWrap)       : Item := .decl "flex-wrap" w.css
-def alignSelf      (a : AlignSelf)      : Item := .decl "align-self" a.css
-def justifySelf    (j : JustifySelf)    : Item := .decl "justify-self" j.css
-def objectFit      (o : ObjectFit)      : Item := .decl "object-fit" o.css
-def pointerEvents  (p : PointerEvents)  : Item := .decl "pointer-events" p.css
-def userSelect     (u : UserSelect)     : Item := .decl "user-select" u.css
-def visibility     (v : Visibility)     : Item := .decl "visibility" v.css
-def fontStyle      (f : FontStyle)      : Item := .decl "font-style" f.css
-def textTransform  (t : TextTransform)  : Item := .decl "text-transform" t.css
-def textOverflow   (t : TextOverflow)   : Item := .decl "text-overflow" t.css
-def wordBreak      (w : WordBreak)      : Item := .decl "word-break" w.css
-def scrollBehavior (s : ScrollBehavior) : Item := .decl "scroll-behavior" s.css
-
--- Coercing `BorderStyle → Color → Item` with an empty color sentinel allows `borderTop .none` / `border 0` alongside `border (px 1) .solid c`.
-private def mkBorder (prop : String) (w : Len) (s : BorderStyle) (c : Color) : Item :=
-  .decl prop (if c.raw.isEmpty then w.raw else s!"{w.raw} {s.css} {c.raw}")
-instance : Coe (BorderStyle → Color → Item) Item := ⟨fun f => f .solid ⟨"", none⟩⟩
-def border       := mkBorder "border"
-def borderTop    := mkBorder "border-top"
-def borderRight  := mkBorder "border-right"
-def borderBottom := mkBorder "border-bottom"
-def borderLeft   := mkBorder "border-left"
-def outline      := mkBorder "outline"
-
-def background          (v : String) : Item := .decl "background" v
-def boxShadow           (v : String) : Item := .decl "box-shadow" v
-def transform           (v : String) : Item := .decl "transform" v
-def transition          (v : String) : Item := .decl "transition" v
-def font                (v : String) : Item := .decl "font" v
-def fontFamily          (v : String) : Item := .decl "font-family" v
-def fontWeight          (v : CssNum) : Item := .decl "font-weight" v.raw
-def lineHeight          (v : CssNum) : Item := .decl "line-height" v.raw
-def opacity             (v : CssNum) : Item := .decl "opacity" v.raw
-def zIndex              (v : CssNum) : Item := .decl "z-index" v.raw
-def flex                (v : CssNum) : Item := .decl "flex" v.raw
-def flexGrow            (v : CssNum) : Item := .decl "flex-grow" v.raw
-def flexShrink          (v : CssNum) : Item := .decl "flex-shrink" v.raw
-def gridTemplateColumns (v : String) : Item := .decl "grid-template-columns" v
-def gridTemplateRows    (v : String) : Item := .decl "grid-template-rows" v
-def gridColumn          (v : String) : Item := .decl "grid-column" v
-def gridRow             (v : String) : Item := .decl "grid-row" v
-def gridArea            (v : String) : Item := .decl "grid-area" v
-def placeItems          (v : String) : Item := .decl "place-items" v
-def placeContent        (v : String) : Item := .decl "place-content" v
-def justifyItems        (v : String) : Item := .decl "justify-items" v
-def aspectRatio         (v : String) : Item := .decl "aspect-ratio" v
-def animation           (v : String) : Item := .decl "animation" v
-def animationDuration   (t : Time)   : Item := .decl "animation-duration" t.raw
-def willChange          (v : String) : Item := .decl "will-change" v
-def backdropFilter      (v : String) : Item := .decl "backdrop-filter" v
-def filter              (v : String) : Item := .decl "filter" v
-def clipPath            (v : String) : Item := .decl "clip-path" v
-def listStyle           (v : String) : Item := .decl "list-style" v
-def resize              (v : String) : Item := .decl "resize" v
-def appearance          (v : String) : Item := .decl "appearance" v
-def verticalAlign       (v : String) : Item := .decl "vertical-align" v
-def content             (v : String) : Item := .decl "content" v
+def width           (l : Len)    : Item := .decl "width" l.raw
+def height          (l : Len)    : Item := .decl "height" l.raw
+def padding         (l : Len)    : Item := .decl "padding" l.raw
+def paddingX        (l : Len)    : Item := .decl "padding-inline" l.raw
+def paddingY        (l : Len)    : Item := .decl "padding-block" l.raw
+def paddingTop      (l : Len)    : Item := .decl "padding-top" l.raw
+def paddingRight    (l : Len)    : Item := .decl "padding-right" l.raw
+def paddingBottom   (l : Len)    : Item := .decl "padding-bottom" l.raw
+def paddingLeft     (l : Len)    : Item := .decl "padding-left" l.raw
+def margin          (l : Len)    : Item := .decl "margin" l.raw
+def marginX         (l : Len)    : Item := .decl "margin-inline" l.raw
+def marginY         (l : Len)    : Item := .decl "margin-block" l.raw
+def marginTop       (l : Len)    : Item := .decl "margin-top" l.raw
+def marginRight     (l : Len)    : Item := .decl "margin-right" l.raw
+def marginBottom    (l : Len)    : Item := .decl "margin-bottom" l.raw
+def marginLeft      (l : Len)    : Item := .decl "margin-left" l.raw
+def letterSpacing   (l : Len)    : Item := .decl "letter-spacing" l.raw
+def color           (c : Color)  : Item := .decl "color" c.raw
+def backgroundColor (c : Color)  : Item := .decl "background-color" c.raw
+def background      (v : String) : Item := .decl "background" v
+def transform       (v : String) : Item := .decl "transform" v
+def opacity         (v : CssNum) : Item := .decl "opacity" v.raw
+def zIndex          (v : CssNum) : Item := .decl "z-index" v.raw
 
 /-! ## Hashing & Scoped `Style` Structure -/
 

@@ -1,5 +1,5 @@
 import Qed.Driver.Vdom
-import Qed.Runtime.Local
+import Qed.Runtime.LocalCore
 import Std.Data.HashMap
 
 namespace Qed

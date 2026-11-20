@@ -21,12 +21,6 @@ def resolveBindTy (bd : FieldDecl) : CommandElabM Term := do
   | none, some d => `(type_of% $d)
   | none, none => throwErrorAt bd.id s!"`bind {bd.id.getId}` needs a type or default"
 
-
-/-! ## Pure View Component Elaboration (`CompMountKind.pureView`) -/
-
-/-! ## Stateful & Effectful Component Elaboration (`CompMountKind.stateful`) -/
-
-
 def mkPropsBinders (spec : ComponentSpec) :
     CommandElabM (Array (TSyntax `Lean.Parser.Term.bracketedBinder)) := do
   if spec.hasProps then return #[← `(bracketedBinder| (p : $(mkIdent (spec.t.getId ++ `Props))))]
@@ -121,15 +115,7 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
       else if sk == ``qedStmtReturn then
         mkUpdateRet spec (← flushMutated sBase mutated) out? cmds
       else if sk == ``qedStmtLet then
-        let lVal ← lowerCompExpr .val (s.getArg 4)
-        let cont ← compileStmts spec sBase mutated out? cmds rest
-        if (s.getArg 1).isIdent then
-          let lId : Ident := ⟨(s.getArg 1)⟩
-          if (s.getArg 2).getNumArgs == 2 then
-            let lTy ← liftMacroM (return (← lowerQedType ((s.getArg 2).getArg 1) false).1)
-            `(let $lId:ident : $lTy := $lVal; $cont)
-          else `(let $lId:ident := $lVal; $cont)
-        else `(let _ := $lVal; $cont)
+        lowerLetStmt s (lowerCompExpr .val) (← compileStmts spec sBase mutated out? cmds rest)
       else if sk == ``qedStmtAssign then
         let op := atomStr (s.getArg 1)
         if (s.getArg 0).getKind == ``qedIdent then
@@ -158,7 +144,7 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
           let rhsT ← lowerCompExpr .val (s.getArg 2)
           let fIdent := mkIdent fname
           let cont ← compileStmts spec sBase (mutated.push fname) out? cmds rest
-          `(let $fIdent:ident := ($fIdent).set $idxT $rhsT (by first | get_elem_tactic | (simp (config := { zetaDelta := false }) only [$fIdent:ident, Array.size_set, Array.size_push] <;> omega)); $cont)
+          lowerArraySetExpr fIdent idxT rhsT cont
         else
           let lhsStr := stxSnippet (s.getArg 0)
           let what := if lhsStr.isEmpty then "" else s!" `{lhsStr} {op} ...`"
@@ -238,25 +224,8 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
         let passTail := !rest.isEmpty && hasReturnStmt s
         let sFlushed ← flushMutated sBase mutated
         let tailStmts := if passTail then rest else []
-        let compileBranch (seq : Array Syntax) := compileStmts spec sFlushed #[] out? cmds (seq.toList ++ tailStmts)
-        let branchTerm ←
-          if sk == ``qedStmtIf then
-            let cond ← lowerCompExpr .propGuard (s.getArg 1)
-            let tT ← compileBranch (suiteStmts (s.getArg 3))
-            let eT ← compileBranch ((desugarElifs (s.getArg 4).getArgs (s.getArg 5)).getD #[])
-            `(if $(mkIdent `_qedIf):ident : $cond then $tT else $eT)
-          else if sk == ``qedStmtIfLet then
-            let pat ← liftMacroM (lowerQedPat (s.getArg 2))
-            let scrut ← lowerCompExpr .val (s.getArg 4)
-            let tT ← compileBranch (suiteStmts (s.getArg 6))
-            let eT ← compileBranch (if (s.getArg 7).getNumArgs == 3 then suiteStmts ((s.getArg 7).getArg 2) else #[])
-            `(match $(mkIdent `_qedIfLet):ident : $scrut:term with | $pat:term => $tT | _ => $eT)
-          else
-            let scruts ← (s.getArg 1).getSepArgs.mapM (lowerCompExpr .val)
-            let alts ← (s.getArg 3).getArgs.mapM fun alt => do
-              let pats ← (alt.getArg 1).getSepArgs.mapM fun p => liftMacroM (lowerQedPat p)
-              `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $(← compileBranch (suiteStmts (alt.getArg 3))))
-            `(match $[$scruts:term],* with $[$alts:matchAlt]*)
+        let branchTerm ← lowerControlFlowStmt s (lowerCompExpr .val) fun seq =>
+          compileStmts spec sFlushed #[] out? cmds (seq.toList ++ tailStmts)
         if passTail || rest.isEmpty then return branchTerm
         let brId := mkIdent `_qedBr
         let (sNext, oNext, cOpt) ← unpackRetTuple spec.outTy?.isSome spec.hasEffects brId

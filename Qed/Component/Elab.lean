@@ -3,6 +3,8 @@ import Qed.Component.AwaitLift
 import Qed.Component.Speculative
 import Qed.Component.Invariants
 import Qed.Component.RpcChecks
+import Qed.Speculative
+import Qed.View.Lift
 import Qed.Runtime
 import Qed.Resource
 import Qed.Socket
@@ -155,6 +157,12 @@ private def canSynthDecidablePred (stateId : Ident) (pred : Term) : CommandElabM
     modify fun _ => saved
     return false
 
+private def mkEnsuredExistentialWrap (ensConst : Name) (qaIds : Array Ident)
+    (elemVar : Ident) : CommandElabM (Term × Term) := do
+  let ensApp ← qaIds.foldlM (init := (mkIdent ensConst : Term)) fun acc a => `($acc $a)
+  let exPrf ← qaIds.foldrM (init := ← `(($elemVar:ident).ok)) fun qa acc => `(Exists.intro $qa $acc)
+  return (ensApp, exPrf)
+
 private def mkCompQueriesCmd? (spec : ComponentSpec) : CommandElabM (Option (TSyntax `command)) := do
   if spec.queries.isEmpty then return none
   let tId := spec.t.getId
@@ -173,9 +181,9 @@ private def mkCompQueriesCmd? (spec : ComponentSpec) : CommandElabM (Option (TSy
         else
           let some ensConst := rspec.mInfo.ensPredConst
             | throwErrorAt rspec.rpcRef "internal: missing server `ensures` predicate in `query`"
-          let ensApp ← qaIds.foldlM (init := (mkIdent ensConst : Term)) fun acc a => `($acc $a)
-          let exPrf ← qaIds.foldrM (init := ← `(_qe.ok)) fun qa acc => `(Exists.intro $qa $acc)
-          `(fun (_qr : Qed.Resource (Qed.Ensured $(q.ty) ($ensApp))) => _qgot _qk (_qr.map fun _qe => ⟨_qe.val, $exPrf⟩))
+          let qeId := mkIdent `_qe
+          let (ensApp, exPrf) ← mkEnsuredExistentialWrap ensConst qaIds qeId
+          `(fun (_qr : Qed.Resource (Qed.Ensured $(q.ty) ($ensApp))) => _qgot _qk (_qr.map fun $qeId => ⟨($qeId:ident).val, $exPrf⟩))
       let qaTerms : Array Term := qaIds.map (⟨·.raw⟩)
       let srvId := mkIdentFrom rspec.rpcRef rspec.srvInfo.serverName
       let methId := mkIdentFrom rspec.rpcRef (Name.mkSimple rspec.mInfo.name)
@@ -214,9 +222,9 @@ private def mkCompSubscriptionsCmd? (spec : ComponentSpec) : CommandElabM (Optio
           let some ensConst := sub.chInfo.ensPredConst
             | throwErrorAt sub.chanRef "internal: missing channel `ensures` predicate in `subscribe`"
           let evTyId := mkIdentFrom sub.chanRef sub.chInfo.eventTypeConst
-          let ensApp ← qaIds.foldlM (init := (mkIdent ensConst : Term)) fun acc a => `($acc $a)
-          let exPrf ← qaIds.foldrM (init := ← `(_we.ok)) fun qa acc => `(Exists.intro $qa $acc)
-          `(fun (_we : Qed.Ensured $evTyId ($ensApp)) => $msgCtor _wk ⟨_we.val, $exPrf⟩)
+          let weId := mkIdent `_we
+          let (ensApp, exPrf) ← mkEnsuredExistentialWrap ensConst qaIds weId
+          `(fun ($weId : Qed.Ensured $evTyId ($ensApp)) => $msgCtor _wk ⟨($weId:ident).val, $exPrf⟩)
       let qaTerms : Array Term := qaIds.map (⟨·.raw⟩)
       let subCmd ← withRef sub.chanRef `(qedCheckChanSub% $chFullId:ident [$[$qaTerms:term],*] $slotLit:str ($recTerm, $onJoinCb, $onMsgCb, $onStCb))
       `(some $subCmd)
@@ -507,24 +515,9 @@ private def withOpenNs {α : Type} (ns : Name) (k : CommandElabM α) : CommandEl
           rawSpec.starts.isEmpty && rawSpec.sessionField?.isNone &&
           rawSpec.portOuts.isEmpty && rawSpec.portIns.isEmpty && rawSpec.queries.isEmpty &&
           rawSpec.subscriptions.isEmpty then
-        let sitesRef ← IO.mkRef #[]
-        let hoistedRef ← IO.mkRef #[]
-        let formDraftsRef ← IO.mkRef #[]
-        let resetFormsRef ← IO.mkRef #[]
-        let usedRpcsRef ← IO.mkRef #[]
-        let contCtrRef ← IO.mkRef 0
-        let specDispatchesRef ← IO.mkRef #[]
-        let specResolvesRef ← IO.mkRef #[]
-        let rCtx : RewriteCtx := {
-          stateFields := #[], bindFields := rawSpec.bindNames, propNames := rawSpec.propNames,
-          isPureComp := true,
-          msgPath := rawSpec.t.getId ++ `Msg, hasOut := false, collections := #[],
-          sites := sitesRef, hoisted := hoistedRef,
-          formDrafts := formDraftsRef, resetForms := resetFormsRef,
-          allowHoist := true, usedRpcs := usedRpcsRef, contCounter := contCtrRef,
-          specDispatches := specDispatchesRef, specResolves := specResolvesRef }
+        let rCtx ← mkRewriteCtx rawSpec true (allowHoist := true)
         let body' ← lowerCompExpr .val (← rewriteIn rCtx false rawSpec.body)
-        if (← hoistedRef.get).isEmpty && (← formDraftsRef.get).isEmpty && (← resetFormsRef.get).isEmpty then
+        if (← rCtx.hoisted.get).isEmpty && (← rCtx.formDrafts.get).isEmpty && (← rCtx.resetForms.get).isEmpty then
           elabPureComponent rawSpec body'
           okRef.set true
           return

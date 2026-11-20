@@ -1,5 +1,6 @@
 import Qed.Component.Syntax
-import Qed.Runtime
+import Qed.Schema.Registry
+import Qed.Runtime.LocalCore
 
 namespace Qed
 section CompElab

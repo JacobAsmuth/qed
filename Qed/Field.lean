@@ -14,7 +14,6 @@ structure Field {α : Type} (p : α → Prop) where
 @[simp] theorem QedVal.val_field {α : Type} {p : α → Prop} (f : Field p) :
     Qed.Lang.QedVal.val f = f.val := rfl
 
-@[reducible] instance {msg : Type} : Coe Date (Html msg) := ⟨fun d => .text (toString d)⟩
 @[reducible] instance {α : Type} {p : α → Prop} : CoeOut (Field p) α := ⟨Field.val⟩
 @[reducible] instance {α msg : Type} {p : α → Prop} [Coe α (Html msg)] : CoeHTCT (Field p) (Html msg) := ⟨fun f => (f.val : Html msg)⟩
 @[reducible] instance {α : Type} {p : α → Prop} : CoeHTCT (Option (Field p)) (Option α) := ⟨Option.map Field.val⟩

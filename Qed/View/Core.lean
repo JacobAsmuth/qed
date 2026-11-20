@@ -1,5 +1,4 @@
 import Qed.Render
-import Qed.Diff
 import Qed.Style.Core
 import Qed.Notation
 import Std.Data.HashSet
@@ -635,64 +634,6 @@ theorem Html.validListIn_prefixSignalsList_intro {msg : Type} (ctx : HtmlCtx) (p
 
 def View.ofHtml (f : σ → Html msg) : View σ msg := .dynNode f
 
-mutual
-  def applyValues : View σ msg → σ → Html msg → Html msg
-    | .dyn get,              s', _                      => .text (get s')
-    | .element _ attrs kids, s', .element tag _ oldKids =>
-        .element tag (attrs.map (VAttr.eval s')) (applyValuesList kids s' oldKids)
-    | .ifElse cond y n,      s', old                    => if cond s' then applyValues y s' old else applyValues n s' old
-    | _,                     _,  old                    => old
-  def applyValuesList : List (View σ msg) → σ → List (Html msg) → List (Html msg)
-    | k :: ks, s', o :: os => applyValues k s' o :: applyValuesList ks s' os
-    | _,       _,  _       => []
-end
-
-mutual
-  def stable : View σ msg → σ → σ → Bool
-    | .element _ _ kids, s, s' => stableList kids s s'
-    | .ifElse cond y n,  s, s' => (cond s == cond s') && (if cond s then stable y s s' else stable n s s')
-    | .keyedList ..,     _, _  => false
-    | .dynNode _,        _, _  => false
-    | .memo sm,          s, s' => sm.keyOf s == sm.keyOf s'
-    | _,                 _, _  => true
-  def stableList : List (View σ msg) → σ → σ → Bool
-    | k :: ks, s, s' => stable k s s' && stableList ks s s'
-    | [],      _, _  => true
-end
-
-mutual
-  theorem applyValues_render (t : View σ msg) (s s' : σ) :
-      stable t s s' = true → applyValues t s' (View.render t s) = View.render t s' := by
-    intro h
-    cases t with
-    | element tag attrs kids =>
-        simp only [View.render, applyValues]
-        rw [applyValuesList_render kids s s' (by simpa [stable] using h)]
-    | ifElse cond y no =>
-        cases h₁ : cond s <;> cases h₂ : cond s' <;>
-          simp_all [stable, View.render, applyValues, applyValues_render y s s', applyValues_render no s s']
-    | memo sm =>
-        simp only [stable, beq_iff_eq] at h
-        simpa [View.render, applyValues] using sm.sound s s' h
-    | _ => simp_all [stable, View.render, applyValues]
-  theorem applyValuesList_render (ts : List (View σ msg)) (s s' : σ) :
-      stableList ts s s' = true → applyValuesList ts s' (View.renderEach ts s) = View.renderEach ts s' := by
-    cases ts with
-    | nil => simp [View.renderEach, applyValuesList]
-    | cons k ks =>
-        simp only [stableList, Bool.and_eq_true, View.renderEach, applyValuesList]
-        rintro ⟨hk, hks⟩
-        rw [applyValues_render k s s' hk, applyValuesList_render ks s s' hks]
-end
-
-def patch (t : View σ msg) (s s' : σ) (old : Html msg) : Html msg :=
-  if stable t s s' then applyValues t s' old else applyPatch (diff old (View.render t s')) old
-
-theorem patch_render (t : View σ msg) (s s' : σ) :
-    patch t s s' (View.render t s) = View.render t s' := by
-  simp only [patch]
-  split <;> simp_all [applyValues_render, diff_apply]
-
 def dynValGets (attrs : List (VAttr σ msg)) : List (σ → String) :=
   attrs.filterMap fun | .dynVal _ get => some get | _ => none
 
@@ -749,23 +690,6 @@ mutual
   def View.hasOpaqueList : List (View σ msg) → Bool
     | []      => false
     | k :: ks => k.hasOpaque || View.hasOpaqueList ks
-end
-
-mutual
-  def View.collectShape : View σ msg → σ → String
-    | .text _,          _ => ""
-    | .dyn _,           _ => ""
-    | .element _ _ kids, s => View.collectShapeList kids s
-    | .ifElse cond y no, s =>
-        if cond s then "1" ++ View.collectShape y s else "0" ++ View.collectShape no s
-    | .keyedList tag as _ _ _ _ rowsHtml _, s =>
-        "{" ++ Html.render (.element tag (as.map (VAttr.eval s)) (rowsHtml s)) ++ "}"
-    | .static _,        _ => ""
-    | .dynNode get,     s => "<" ++ Html.render (get s) ++ ">"
-    | .memo sm,         s => "<" ++ Html.render (sm.eval s) ++ ">"
-  def View.collectShapeList : List (View σ msg) → σ → String
-    | [],      _ => ""
-    | k :: ks, s => View.collectShape k s ++ View.collectShapeList ks s
 end
 
 def renderSigAttrs (s : σ) (pre : String) : List (VAttr σ msg) → Nat → Nat → List (Attr msg) × Nat × Nat
@@ -899,16 +823,6 @@ end
 
 @[simp] theorem View.render_showIf (cond : σ → Bool) (child : View σ msg) (s : σ) :
     (View.showIf cond child).render s = (if cond s then child.render s else .text "") := rfl
-
-theorem View.stable_showIf_hidden (cond : σ → Bool) (child : View σ msg) (s s' : σ)
-    (h : cond s = false) (h' : cond s' = false) :
-    stable (View.showIf cond child) s s' = true := by
-  simp [View.showIf, stable, h, h']
-
-@[simp] theorem View.collectShape_showIf (cond : σ → Bool) (child : View σ msg) (s : σ) :
-    (View.showIf cond child).collectShape s =
-      (if cond s then "1" ++ child.collectShape s else "0") := by
-  simp [View.showIf, View.collectShape]
 
 @[simp] theorem View.collectDyn_showIf (cond : σ → Bool) (child : View σ msg) :
     (View.showIf cond child).collectDyn = child.collectDyn := by

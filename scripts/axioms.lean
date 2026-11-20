@@ -5,6 +5,7 @@ import Qed.Proofs.ViewPatch
 import Qed.Proofs.KeyedReconcile
 import Qed.Proofs.Hydration
 import Js.Proofs
+import Tests.AxiomFixtures
 import Examples.Counter
 import Examples.Todo
 import Examples.Signup
@@ -28,11 +29,7 @@ import Examples.LiveRoom
 #print axioms Qed.escapeHtml_eq_escapeHtmlFast
 #print axioms Qed.sanitizeKey_eq_sanitizeKeyFast
 #print axioms Qed.disambiguateKeys_eq_fast
-#print axioms Qed.applyValues_render
-#print axioms Qed.patch_render
 #print axioms Qed.View.render_showIf
-#print axioms Qed.View.stable_showIf_hidden
-#print axioms Qed.View.collectShape_showIf
 #print axioms Qed.View.collectDyn_showIf
 #print axioms Qed.View.renderSig_showIf
 #print axioms Qed.parse_depth_le

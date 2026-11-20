@@ -17,8 +17,6 @@ inductive Cmd (msg : Type) where
   | port (name payload : String)
   | fx (kind a b c : String)
   | fxResult (kind a b : String) (onResult : String → msg)
-  | socket (key url : String) (onMessage : String → msg)
-           (onOpen : Option msg) (onClose : Option msg) (onError : Option (String → msg))
   | wsMuxSub (slot url channel : String) (params : ByteArray) (reconnect : Reconnect)
              (onJoin : ByteArray → msg) (onMessage : ByteArray → msg) (onStatus : SocketStatus → msg)
   | wsMuxSend (slot : String) (payload : ByteArray)
@@ -44,9 +42,6 @@ def Cmd.map (f : α → β) : Cmd α → Cmd β
   | .port n p                       => .port n p
   | .fx k a b c                     => .fx k a b c
   | .fxResult k a b onResult        => .fxResult k a b (fun s => f (onResult s))
-  | .socket key url onMsg onOpen onClose onErr =>
-      .socket key url (fun d => f (onMsg d)) (onOpen.map f) (onClose.map f)
-              (onErr.map (fun g d => f (g d)))
   | .wsMuxSub slot url ch params rec onJoin onMsg onStatus =>
       .wsMuxSub slot url ch params rec (fun b => f (onJoin b)) (fun b => f (onMsg b)) (fun s => f (onStatus s))
   | .wsMuxSend slot payload => .wsMuxSend slot payload
@@ -72,7 +67,7 @@ end
 
 mutual
 /-- Strips HTTP/RPC data-loading commands already resolved during SSR while preserving
-    client-only subscriptions (`socket`, `fx`, `fxResult`, `stream`, `now`, `port`). -/
+    client-only subscriptions (`fx`, `fxResult`, `stream`, `now`, `port`). -/
 def Cmd.clientOnly : Cmd msg → Cmd msg
   | .request ..      => .none
   | .requestBytes .. => .none
@@ -142,14 +137,6 @@ def Cmd.setTitle (title : String) : Cmd msg := .fx "document.title" title "" ""
 
 def Cmd.randomInt (lo hi : Int) (onInt : Int → msg) : Cmd msg :=
   .fxResult "random.int" (toString lo) (toString hi) fun s => onInt ((s.toInt?).getD lo)
-
-def Cmd.wsOpen (key url : String) (onMessage : String → msg)
-    (onOpen : Option msg := Option.none) (onClose : Option msg := Option.none)
-    (onError : Option (String → msg) := Option.none) : Cmd msg :=
-  .socket key url onMessage onOpen onClose onError
-
-def Cmd.wsSend (key data : String) : Cmd msg := .fx "ws.send" key data ""
-def Cmd.wsClose (key : String) : Cmd msg := .fx "ws.close" key "" ""
 
 def Cmd.download (filename mime content : String) : Cmd msg := .fx "file.download" filename mime content
 

@@ -1,4 +1,5 @@
 import Qed.Component.Core
+import Qed.Style.Syntax
 import Qed.Jsx
 import Qed.Lang
 import Lean

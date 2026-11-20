@@ -1,5 +1,5 @@
-import Qed.Style
-import Qed.Runtime.App
+import Qed.Style.Syntax
+import Qed.Runtime.LocalCore
 import Lean
 
 namespace Qed.Internal
@@ -52,15 +52,44 @@ private partial def collectInlineStylesFromExpr (env : Environment) (e : Expr)
   | .proj _ _ b      => collectInlineStylesFromExpr env b acc
   | _                => return acc
 
+private def isLocalMountConst : Lean.Name → Bool
+  | .str _ s => s == "_qed_mount" || s == "_qed_mountWithOpt"
+  | _        => false
+
 open Lean Elab Term Meta in
-private def discoverAssets (value : Expr) : TermElabM (Expr × Expr) := do
+private def discoverRegistrations (value : Expr) : TermElabM Expr := do
+  let env ← getEnv
+  let mut pending := value.getUsedConstants.toList
+  let mut seen : NameSet := {}
+  let mut regs : Array Expr := #[]
+  while !pending.isEmpty do
+    let n := pending.head!
+    pending := pending.tail!
+    unless seen.contains n do
+      seen := seen.insert n
+      let reg := n.getPrefix ++ `regs
+      if isLocalMountConst n && env.contains reg then
+        regs := regs.push (Lean.mkConst reg)
+        let compView := n.getPrefix ++ `view
+        if env.contains compView then
+          pending := compView :: pending
+      else if let some (.defnInfo d) := env.find? n then
+        if !d.type.isConstOf ``Qed.Style && !d.type.isConstOf ``Qed.Theme &&
+           !d.type.isConstOf ``Qed.Keyframes && !isFrameworkRoot env n then
+          pending := d.value.getUsedConstants.toList ++ pending
+  let mut locals := Lean.mkApp (Lean.mkConst ``List.nil [Level.zero]) (Lean.mkConst ``LocalDef)
+  for reg in regs do
+    locals ← mkAppM ``List.append #[locals, reg]
+  mkAppM ``LocalDef.dedupe #[locals]
+
+open Lean Elab Term Meta in
+private def discoverStyles (value : Expr) : TermElabM Expr := do
   let env ← getEnv
   let styleMetaMap := Qed.StyleDsl.styleMetaRegistry.getState env
   let tokMetaMap   := Qed.StyleDsl.tokenMetaRegistry.getState env
   let themeMetaMap := Qed.StyleDsl.themeMetaRegistry.getState env
   let mut pending := value.getUsedConstants.toList
   let mut seen : NameSet := {}
-  let mut regs : Array Expr := #[]
   let mut styles : Array Expr := #[]
   let mut themeStyles : Array Expr := #[]
   let mut seenThemes : NameSet := {}
@@ -80,11 +109,7 @@ private def discoverAssets (value : Expr) : TermElabM (Expr × Expr) := do
     unless seen.contains n do
       seen := seen.insert n
       let reg := n.getPrefix ++ `regs
-      let isMount := match n with
-        | .str _ s => s == "_qed_mount" || s == "_qed_mountWithOpt"
-        | _ => false
-      if isMount && env.contains reg then
-        regs := regs.push (Lean.mkConst reg)
+      if isLocalMountConst n && env.contains reg then
         let compView := n.getPrefix ++ `view
         if env.contains compView then
           pending := compView :: pending
@@ -116,10 +141,7 @@ private def discoverAssets (value : Expr) : TermElabM (Expr × Expr) := do
     unless allStyles.contains s do allStyles := allStyles.push s
   for s in inlineStyles do
     unless allStyles.contains s do allStyles := allStyles.push s
-  let mut locals := Lean.mkApp (Lean.mkConst ``List.nil [Level.zero]) (Lean.mkConst ``LocalDef)
-  for reg in regs do
-    locals ← mkAppM ``List.append #[locals, reg]
-  return (← mkAppM ``LocalDef.dedupe #[locals], ← mkListLit (Lean.mkConst ``Qed.Style) allStyles.toList)
+  mkListLit (Lean.mkConst ``Qed.Style) allStyles.toList
 
 syntax (name := registrationsTerm) "qedInternalLocalRegistrations% " term:max : term
 syntax (name := stylesTerm) "qedInternalStyles% " term:max : term
@@ -128,12 +150,12 @@ open Lean Elab Term in
 @[term_elab registrationsTerm] def elabRegistrations : TermElab := fun stx _ => do
   let value ← elabTerm stx[1] none
   synthesizeSyntheticMVarsNoPostponing
-  return (← discoverAssets (← instantiateMVars value)).1
+  discoverRegistrations (← instantiateMVars value)
 
 open Lean Elab Term in
 @[term_elab stylesTerm] def elabStyles : TermElab := fun stx _ => do
   let value ← elabTerm stx[1] none
   synthesizeSyntheticMVarsNoPostponing
-  return (← discoverAssets (← instantiateMVars value)).2
+  discoverStyles (← instantiateMVars value)
 
 end Qed.Internal

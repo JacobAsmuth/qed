@@ -1,12 +1,21 @@
 import Lean
 import Qed.Style.Core
 import Qed.Style.Contrast
-import Qed.Style.Proofs
 
 namespace Qed.StyleDsl
 open Lean Parser Elab Command Term Meta
 
 /-! ## Persistent Compile-Time CSS Registries -/
+
+private def registerNameMapExt {α : Type} [Inhabited α] (keyOf : α → Name)
+    (name : Name := by exact decl_name%) :
+    IO (SimplePersistentEnvExtension α (NameMap α)) :=
+  registerSimplePersistentEnvExtension {
+    name := name
+    addImportedFn := fun arrays =>
+      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert (keyOf info) info) acc) {}
+    addEntryFn := fun m info => m.insert (keyOf info) info
+  }
 
 structure StyleMetaInfo where
   fullName   : Name
@@ -18,11 +27,7 @@ deriving Inhabited
 
 initialize styleMetaRegistry :
     SimplePersistentEnvExtension StyleMetaInfo (NameMap StyleMetaInfo) ←
-  registerSimplePersistentEnvExtension {
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.fullName info) acc) {}
-    addEntryFn := fun m info => m.insert info.fullName info
-  }
+  registerNameMapExt (·.fullName)
 
 structure TokenMetaInfo where
   fullName   : Name
@@ -34,11 +39,7 @@ deriving Inhabited
 
 initialize tokenMetaRegistry :
     SimplePersistentEnvExtension TokenMetaInfo (NameMap TokenMetaInfo) ←
-  registerSimplePersistentEnvExtension {
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.fullName info) acc) {}
-    addEntryFn := fun m info => m.insert info.fullName info
-  }
+  registerNameMapExt (·.fullName)
 
 structure KeyframesMetaInfo where
   fullName : Name
@@ -48,11 +49,7 @@ deriving Inhabited
 
 initialize keyframesMetaRegistry :
     SimplePersistentEnvExtension KeyframesMetaInfo (NameMap KeyframesMetaInfo) ←
-  registerSimplePersistentEnvExtension {
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.fullName info) acc) {}
-    addEntryFn := fun m info => m.insert info.fullName info
-  }
+  registerNameMapExt (·.fullName)
 
 structure ThemeMetaInfo where
   fullName      : Name
@@ -65,11 +62,7 @@ deriving Inhabited
 
 initialize themeMetaRegistry :
     SimplePersistentEnvExtension ThemeMetaInfo (NameMap ThemeMetaInfo) ←
-  registerSimplePersistentEnvExtension {
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.fullName info) acc) {}
-    addEntryFn := fun m info => m.insert info.fullName info
-  }
+  registerNameMapExt (·.fullName)
 
 /-! ## Custom Non-Polluting CSS Line Parsers -/
 
@@ -641,8 +634,7 @@ private partial def compileCssBlockItems (env : Environment) (currNs : Name)
       for t in res.themes do unless thms.contains t do thms := thms ++ [t]
     else
       throwErrorAt stx s!"unexpected syntax in CSS block ({stx.getKind})"
-  let dedup (xs : List String) := (xs.foldl (fun acc x => if acc.contains x then acc else x :: acc) []).reverse
-  return { items, usedTokens := dedup toks, extraRules := dedup rules, themes := thms }
+  return { items, usedTokens := Qed.dedupStrings toks, extraRules := Qed.dedupStrings rules, themes := thms }
 
 private partial def quoteItem : Qed.Item → MacroM Term
   | .decl p v => `(Qed.Item.decl $(Syntax.mkStrLit p) $(Syntax.mkStrLit v))
@@ -689,9 +681,8 @@ def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
   let clean       := Qed.sanitizeCssIdent shortLabel
   let cls         := if clean.isEmpty then s!"qed-{Qed.shortHexHash (Qed.cssHash rawCss)}"
                      else s!"qed-{clean}-{Qed.shortHexHash (Qed.cssHash rawCss)}"
-  let dedup (xs : List String) := (xs.foldl (fun acc x => if acc.contains x then acc else x :: acc) []).reverse
-  let allToks  := dedup ((baseMetas.foldl (fun acc bm => acc ++ bm.usedTokens) []) ++ compiled.usedTokens ++ Qed.collectItemTokens finalItems)
-  let allExtra := dedup ((baseMetas.foldl (fun acc bm => acc ++ bm.extraRules) []) ++ compiled.extraRules)
+  let allToks  := Qed.dedupStrings ((baseMetas.foldl (fun acc bm => acc ++ bm.usedTokens) []) ++ compiled.usedTokens ++ Qed.collectItemTokens finalItems)
+  let allExtra := Qed.dedupStrings ((baseMetas.foldl (fun acc bm => acc ++ bm.extraRules) []) ++ compiled.extraRules)
   let allThemes := baseMetas.foldl (fun acc bm => bm.themes.foldl (fun a t => if a.contains t then a else a ++ [t]) acc) compiled.themes
   let baked : Qed.Style := {
     className := cls, raw := rawCss, items := finalItems,

@@ -414,6 +414,9 @@ style fracStyle:
 
 #guard (match (Resource.ok (none : Option Nat)).someOr "missing" with | .failed "missing" => true | _ => false)
 #guard (match (Resource.ok (some 42)).someOr "missing" with | .ok 42 => true | _ => false)
+#guard (match (({} : Cached Nat).put "a" (.ok 1) "b").state with | .idle => true | _ => false)
+#guard ((({} : Cached Nat).put "a" (.ok 1) "b").lookup "a" == some 1)
+#guard (match (({} : Cached Nat).put "a" (.ok 7) "a").state with | .ok 7 => true | _ => false)
 
 component Card:
   prop title : String

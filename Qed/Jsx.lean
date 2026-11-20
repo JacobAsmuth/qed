@@ -1,9 +1,8 @@
-import Qed.Style.Syntax
 import Qed.Diag
 import Lean
 import Qed.Lang
 import Qed.Notation
-import Qed.View
+import Qed.View.Core
 
 namespace Qed.Jsx
 open Lean Parser PrettyPrinter

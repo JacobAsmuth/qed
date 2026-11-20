@@ -4,7 +4,7 @@ import Qed.Field
 import Qed.Json
 import Qed.Proto
 import Qed.Date
-import Qed.Runtime.Verify
+import Qed.Schema.Registry
 import Lean
 
 namespace Qed
@@ -116,8 +116,15 @@ def select (options : List (String × String)) : Codec String where
     el "select" [value raw, onChange set]
       (options.map fun (v, lbl) => el "option" [value v] [lbl])
   render_valid := fun {msg} inForm raw set => by
-    cases inForm <;>
-      simp [el, value, onChange, Html.validIn, Attr.valid, Attr.validKeyValue, Html.validListIn_map]
+    have hsVal : isSafeAttrName "value" = true := rfl
+    have huVal : isUrlAttrName "value" = false := rfl
+    have hsInp : isSafeAttrName "input" = true := rfl
+    have hvSel : isVoidTag "select" = false := rfl
+    have hvOpt : isVoidTag "option" = false := rfl
+    have hSel  : stepHtmlCtx ⟨.normal, false, false, inForm⟩ "select" = some ⟨.select, false, true, inForm⟩ := by cases inForm <;> rfl
+    have hOpt  : stepHtmlCtx ⟨.select, false, true, inForm⟩ "option" = some ⟨.option, false, true, inForm⟩ := by cases inForm <;> rfl
+    simp [el, value, onChange, Html.validIn, Attr.valid, Attr.validKeyValue, Html.validListIn_map,
+      hsVal, huVal, hsInp, hvSel, hvOpt, hSel, hOpt, validTextIn]
 
 def radios (group : String) (options : List (String × String)) : Codec String where
   parse := fun s => if options.any (fun o => o.1 == s) then some s else none
@@ -128,9 +135,22 @@ def radios (group : String) (options : List (String × String)) : Codec String w
       (options.map fun (v, lbl) =>
         el "label" [] [el "input" [type' "radio", Qed.name group, value v, checked (raw == v), onChange set], lbl])
   render_valid := fun {msg} inForm raw set => by
-    cases inForm <;>
-      simp [el, cls, type', Qed.name, value, checked, onChange,
-            Html.validIn, Attr.valid, Attr.validKeyValue, Html.validListIn_map]
+    have hsTyp : isSafeAttrName "type" = true := rfl
+    have huTyp : isUrlAttrName "type" = false := rfl
+    have hsNam : isSafeAttrName "name" = true := rfl
+    have huNam : isUrlAttrName "name" = false := rfl
+    have hsVal : isSafeAttrName "value" = true := rfl
+    have huVal : isUrlAttrName "value" = false := rfl
+    have hsChk : isSafeAttrName "checked" = true := rfl
+    have hsInp : isSafeAttrName "input" = true := rfl
+    have hvDiv : isVoidTag "div" = false := rfl
+    have hvLbl : isVoidTag "label" = false := rfl
+    have hDiv  : stepHtmlCtx ⟨.normal, false, false, inForm⟩ "div" = some ⟨.normal, false, false, inForm⟩ := by cases inForm <;> decide
+    have hLbl  : stepHtmlCtx ⟨.normal, false, false, inForm⟩ "label" = some ⟨.normal, false, false, inForm⟩ := by cases inForm <;> decide
+    have hInp  : stepHtmlCtx ⟨.normal, false, false, inForm⟩ "input" = some ⟨.normal, false, false, inForm⟩ := by cases inForm <;> decide
+    simp [el, cls, type', Qed.name, value, checked, onChange,
+      Html.validIn, Attr.valid, Attr.validKeyValue, Html.validListIn_map,
+      hsTyp, huTyp, hsNam, huNam, hsVal, huVal, hsChk, hsInp, hvDiv, hvLbl, hDiv, hLbl, hInp, validTextIn]
 
 def json (α : Type) [ToJson α] [FromJson α] : Codec α where
   parse := fun _ => none
@@ -158,16 +178,26 @@ def formFieldRow {msg : Type} (inForm wrapLabel bad : Bool) (label err : String)
     (hctrl : Html.validIn ⟨.normal, false, false, ctxInForm⟩ ctrl = true) :
     Html.validListIn ⟨.normal, false, false, ctxInForm⟩
       (formFieldRow inForm wrapLabel bad label err ctrl) = true := by
-  cases ctxInForm <;> cases inForm <;> cases wrapLabel <;> cases bad <;>
-    simp [formFieldRow, el, cls, attr, Html.validListIn, Html.validIn, Attr.valid, Attr.validKeyValue, hctrl]
+  have hsAria : isSafeAttrName "aria-invalid" = true := rfl
+  have huAria : isUrlAttrName "aria-invalid" = false := rfl
+  have hvFs   : isVoidTag "fieldset" = false := rfl
+  have hvLeg  : isVoidTag "legend" = false := rfl
+  have hvLbl  : isVoidTag "label" = false := rfl
+  have hvSpn  : isVoidTag "span" = false := rfl
+  have hFs    : stepHtmlCtx ⟨.normal, false, false, ctxInForm⟩ "fieldset" = some ⟨.normal, false, false, ctxInForm⟩ := by cases ctxInForm <;> decide
+  have hLeg   : stepHtmlCtx ⟨.normal, false, false, ctxInForm⟩ "legend" = some ⟨.normal, false, false, ctxInForm⟩ := by cases ctxInForm <;> decide
+  have hLbl   : stepHtmlCtx ⟨.normal, false, false, ctxInForm⟩ "label" = some ⟨.normal, false, false, ctxInForm⟩ := by cases ctxInForm <;> decide
+  have hSpn   : stepHtmlCtx ⟨.normal, false, false, ctxInForm⟩ "span" = some ⟨.normal, false, false, ctxInForm⟩ := by cases ctxInForm <;> decide
+  cases inForm <;> cases wrapLabel <;> cases bad <;>
+    simp [formFieldRow, el, cls, attr, Html.validListIn, Html.validIn, Attr.valid, Attr.validKeyValue,
+      hsAria, huAria, hvFs, hvLeg, hvLbl, hvSpn, hFs, hLeg, hLbl, hSpn, validTextIn, hctrl]
 
 theorem formDiv_validIn {msg : Type} (inForm : Bool) (kids : List (Html msg))
     (hk : Html.validListIn ⟨.normal, false, false, inForm⟩ kids = true) :
     Html.validIn ⟨.normal, false, false, inForm⟩ (el "div" [cls "qed-form"] kids) = true := by
-  cases inForm <;>
-    simp [el, cls, Html.validIn, Attr.valid, Attr.validList_cons, Attr.validList_nil,
-      Attr.hasLocalCell_cons, Attr.hasLocalCell_nil, Attr.isLocalCell_cls,
-      Qed.reduceStepHtmlCtx, Qed.reduceIsVoidTag, hk]
+  have hDiv  : stepHtmlCtx ⟨.normal, false, false, inForm⟩ "div" = some ⟨.normal, false, false, inForm⟩ := by cases inForm <;> decide
+  have hvDiv : isVoidTag "div" = false := rfl
+  simp [el, cls, Html.validIn, Attr.validList, Attr.valid, Attr.hasLocalCell, Attr.isLocalCell, hDiv, hvDiv, hk]
 
 theorem formRowCons_validIn {msg : Type} (ctxInForm inForm wrapLabel bad : Bool)
     (label err : String) (ctrl : Html msg) (rest : List (Html msg))
@@ -356,32 +386,6 @@ private def mkProtoFieldSkeleton
     pIdents := pIdents.push hId
     pHaveTacs := pHaveTacs.push (← `(tactic| have $hId:ident := $fullEq))
   return (body, tagsPosPf, pIdents, pHaveTacs)
-
-open Lean Elab Command Term in
-private def mkDraftProtoCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
-    CommandElabM (Array (TSyntax `command)) := do
-  let toId   := mkIdent (tId ++ `Draft ++ `toProtoFields)
-  let fromId := mkIdent (tId ++ `Draft ++ `fromProtoFields)
-  let fromProtoThmId := mkIdent (tId ++ `Draft ++ `_fromProto_toProto)
-  let reads ← fs.mapM fun f => `(term| x.$f:ident)
-  let decodes ← (List.range fs.size).toArray.mapM fun i => do
-    let kLit := Syntax.mkNumLit (toString (i + 1))
-    `(term| (FromProtoField.decodeProtoField $kLit fs : Except String String))
-  let (body, tagsPosPf, pIdents, pHaveTacs) ← mkProtoFieldSkeleton reads
-    (fun _ => `(term| String)) (fun _ _ eq => pure eq)
-  return #[
-    ← `(command| def $toId (x : $draftId) : List (Nat × Proto.WireVal) := $body),
-    ← `(command| def $fromId (fs : List (Nat × Proto.WireVal)) : Except String $draftId := do
-          $[let $fs:ident ← $decodes:term]*
-          return { $[$fs:ident],* }),
-    ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instToProto)):ident : ToProto $draftId := .ofFields $toId),
-    ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instFromProto)):ident : FromProto $draftId := .ofFields $fromId),
-    ← `(command| private theorem $fromProtoThmId (x : $draftId) : $fromId ($toId x) = Except.ok x := by
-          $[$pHaveTacs:tactic]*
-          unfold $fromId $toId
-          simp only [$[$pIdents:term],*, bind, Except.bind, pure, Except.pure]),
-    ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instLawfulProto)):ident : LawfulProto $draftId :=
-          .ofFields $toId $fromId (fun x => $tagsPosPf) $fromProtoThmId) ]
 
 open Lean Elab Command Term in
 private def mkSchemaProtoCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
@@ -677,9 +681,8 @@ open Lean Elab Command Term in
       let (draftStructCmd, draftCmds) ← mkDraftCmds tId draftId fs
       let (coreStructCmd, coreCmds) ← mkSchemaCoreCmds t cbns cbts tApp beqApp parseApp canApp viewApp draftId fs inputs refined allLawfulBEq
       let jsonCmds ← mkSchemaJsonCmds t cbns cbts tApp toJsonApp fromJsonApp fs inputs refined jsonReads allLawful
-      let draftProtoCmds ← mkDraftProtoCmds tId draftId fs
       let protoCmds ← mkSchemaProtoCmds t cbns cbts tApp appTo fs inputs refined jsonReads allProto allLawfulProto
-      for c in #[draftStructCmd, coreStructCmd] ++ draftCmds ++ coreCmds ++ jsonCmds ++ draftProtoCmds ++ protoCmds do
+      for c in #[draftStructCmd, coreStructCmd] ++ draftCmds ++ coreCmds ++ jsonCmds ++ protoCmds do
         elabCommand c
       let ns ← getCurrNamespace
       let fullSchema := ns ++ tId
@@ -689,14 +692,5 @@ open Lean Elab Command Term in
         ctxBinders := cbns.map (·.getId.eraseMacroScopes)
       }
       modifyEnv fun env => schemaFormRegistry.addEntry env info
-
-namespace Demo
-
-schema Signup:
-  email : String where '@' in email, email.length >= 3
-  age   : Nat    where age >= 18
-  agree : Bool   where agree
-
-end Demo
 
 end Qed

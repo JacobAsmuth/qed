@@ -1,4 +1,4 @@
-import Qed.Style
+import Qed.Style.Core
 
 namespace Qed
 

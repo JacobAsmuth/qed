@@ -78,36 +78,146 @@ private def toInt? (s : String) : Option Int :=
   | '-' :: ds => (String.ofList ds).toNat?.map fun n => -(Int.ofNat n)
   | _         => s.toNat?.map Int.ofNat
 
+private theorem step_input (inForm : Bool) :
+    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "input" = some ⟨.normal, false, false, inForm⟩ := by
+  cases inForm <;> rfl
+private theorem step_textarea (inForm : Bool) :
+    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "textarea" = some ⟨.textarea, false, true, inForm⟩ := by
+  cases inForm <;> rfl
+private theorem step_select (inForm : Bool) :
+    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "select" = some ⟨.select, false, true, inForm⟩ := by
+  cases inForm <;> rfl
+private theorem step_option (inForm : Bool) :
+    stepHtmlCtx ⟨.select, false, true, inForm⟩ "option" = some ⟨.option, false, true, inForm⟩ := rfl
+private theorem step_div (inForm : Bool) :
+    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "div" = some ⟨.normal, false, false, inForm⟩ := by
+  cases inForm <;> rfl
+private theorem step_label (inForm : Bool) :
+    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "label" = some ⟨.normal, false, false, inForm⟩ := by
+  cases inForm <;> rfl
+private theorem step_span (inForm : Bool) :
+    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "span" = some ⟨.normal, false, false, inForm⟩ := by
+  cases inForm <;> rfl
+private theorem step_fieldset (inForm : Bool) :
+    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "fieldset" = some ⟨.normal, false, false, inForm⟩ := by
+  cases inForm <;> rfl
+private theorem step_legend (inForm : Bool) :
+    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "legend" = some ⟨.normal, false, false, inForm⟩ := by
+  cases inForm <;> rfl
+private theorem step_button (inForm : Bool) :
+    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "button" = some ⟨.normal, false, true, inForm⟩ := by
+  cases inForm <;> rfl
+
+private theorem isVoid_input    : isVoidTag "input" = true := rfl
+private theorem isVoid_textarea : isVoidTag "textarea" = false := rfl
+private theorem isVoid_select   : isVoidTag "select" = false := rfl
+private theorem isVoid_option   : isVoidTag "option" = false := rfl
+private theorem isVoid_div      : isVoidTag "div" = false := rfl
+private theorem isVoid_label    : isVoidTag "label" = false := rfl
+private theorem isVoid_span     : isVoidTag "span" = false := rfl
+private theorem isVoid_fieldset : isVoidTag "fieldset" = false := rfl
+private theorem isVoid_legend   : isVoidTag "legend" = false := rfl
+private theorem isVoid_button   : isVoidTag "button" = false := rfl
+
+private theorem safe_value   : isSafeAttrName "value" = true := rfl
+private theorem url_value    : isUrlAttrName "value" = false := rfl
+private theorem safe_type    : isSafeAttrName "type" = true := rfl
+private theorem url_type     : isUrlAttrName "type" = false := rfl
+private theorem safe_min     : isSafeAttrName "min" = true := rfl
+private theorem url_min      : isUrlAttrName "min" = false := rfl
+private theorem safe_name    : isSafeAttrName "name" = true := rfl
+private theorem url_name     : isUrlAttrName "name" = false := rfl
+private theorem safe_checked : isSafeAttrName "checked" = true := rfl
+private theorem safe_inputEv : isSafeAttrName "input" = true := rfl
+private theorem safe_changeEv : isSafeAttrName "change" = true := rfl
+private theorem safe_clickEv : isSafeAttrName "click" = true := rfl
+private theorem safe_dis     : isSafeAttrName "disabled" = true := rfl
+private theorem safe_ariaInv : isSafeAttrName "aria-invalid" = true := rfl
+private theorem url_ariaInv  : isUrlAttrName "aria-invalid" = false := rfl
+
+private theorem attr_valid_value {msg : Type} (v : String) :
+    Attr.valid (msg := msg) (value v) = true := by
+  simp only [value, Attr.valid, Attr.validKeyValue, safe_value, url_value, Bool.not_false, Bool.true_or, Bool.and_self]
+private theorem attr_valid_onInput {msg : Type} (f : String → msg) :
+    Attr.valid (onInput f) = true := by
+  simp only [onInput, Attr.valid, safe_inputEv]
+private theorem attr_valid_onChange {msg : Type} (f : String → msg) :
+    Attr.valid (onChange f) = true := by
+  simp only [onChange, Attr.valid, safe_inputEv]
+private theorem attr_valid_onCheck {msg : Type} (f : Bool → msg) :
+    Attr.valid (onCheck f) = true := by
+  simp only [onCheck, Attr.valid, safe_changeEv]
+private theorem attr_valid_onClick {msg : Type} (m : msg) :
+    Attr.valid (onClick m) = true := by
+  simp only [onClick, Attr.valid, safe_clickEv]
+private theorem attr_valid_type {msg : Type} (v : String) :
+    Attr.valid (msg := msg) (type' v) = true := by
+  simp only [type', Attr.valid, Attr.validKeyValue, safe_type, url_type, Bool.not_false, Bool.true_or, Bool.and_self]
+private theorem attr_valid_name {msg : Type} (v : String) :
+    Attr.valid (msg := msg) (Qed.name v) = true := by
+  simp only [Qed.name, Attr.valid, Attr.validKeyValue, safe_name, url_name, Bool.not_false, Bool.true_or, Bool.and_self]
+private theorem attr_valid_min {msg : Type} (v : String) :
+    Attr.valid (msg := msg) (attr "min" v) = true := by
+  simp only [attr, Attr.valid, Attr.validKeyValue, safe_min, url_min, Bool.not_false, Bool.true_or, Bool.and_self]
+private theorem attr_valid_checked {msg : Type} (b : Bool) :
+    Attr.valid (msg := msg) (checked b) = true := by
+  simp only [checked, Attr.valid, safe_checked]
+private theorem attr_valid_disabled {msg : Type} (b : Bool) :
+    Attr.valid (msg := msg) (disabled b) = true := by
+  simp only [disabled, Attr.valid, safe_dis]
+private theorem attr_valid_ariaInvalid {msg : Type} (v : String) :
+    Attr.valid (msg := msg) (attr "aria-invalid" v) = true := by
+  simp only [attr, Attr.valid, Attr.validKeyValue, safe_ariaInv, url_ariaInv, Bool.not_false, Bool.true_or, Bool.and_self]
+
+private theorem attr_valid_cls {msg : Type} (v : String) :
+    Attr.valid (msg := msg) (cls v) = true := rfl
+
+private theorem validIn_input {msg : Type} (inForm : Bool) (attrs : List (Attr msg))
+    (hv : Attr.validList attrs = true) (hl : Attr.hasLocalCell attrs = false) :
+    Html.validIn ⟨.normal, false, false, inForm⟩ (el "input" attrs) = true := by
+  simp only [el, Html.validIn, Html.validListIn, step_input, isVoid_input, hv, hl,
+    Bool.not_false, Bool.or_true, Bool.and_self, List.isEmpty_nil]
+
 def text : Codec String where
   parse := some; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "input" [value raw, onInput set]
-  render_valid := fun inForm _ _ => by cases inForm <;> rfl
+  render_valid := fun inForm raw set => validIn_input inForm _
+    (by simp only [Attr.validList, attr_valid_value, attr_valid_onInput, Bool.and_self]) rfl
 
 def textarea : Codec String where
   parse := some; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "textarea" [value raw, onInput set]
-  render_valid := fun inForm _ _ => by cases inForm <;> rfl
+  render_valid := fun inForm raw set => by
+    have hv : Attr.validList [value (msg := _) raw, onInput set] = true := by
+      simp only [Attr.validList, attr_valid_value, attr_valid_onInput, Bool.and_self]
+    have hl : Attr.hasLocalCell [value (msg := _) raw, onInput set] = false := rfl
+    simp only [el, Html.validIn, Html.validListIn, step_textarea, isVoid_textarea, hv, hl,
+      Bool.not_false, Bool.true_or, Bool.and_self]
 
 def nat : Codec Nat where
   parse := fun s => s.toNat?; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "input" [type' "number", attr "min" "0", value raw, onInput set]
-  render_valid := fun inForm _ _ => by cases inForm <;> rfl
+  render_valid := fun inForm raw set => validIn_input inForm _
+    (by simp only [Attr.validList, attr_valid_type, attr_valid_min, attr_valid_value, attr_valid_onInput, Bool.and_self]) rfl
 
 def int : Codec Int where
   parse := toInt?; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "input" [type' "number", value raw, onInput set]
-  render_valid := fun inForm _ _ => by cases inForm <;> rfl
+  render_valid := fun inForm raw set => validIn_input inForm _
+    (by simp only [Attr.validList, attr_valid_type, attr_valid_value, attr_valid_onInput, Bool.and_self]) rfl
 
 def checkbox : Codec Bool where
   parse := fun s => some (s == "true"); valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set =>
     el "input" [type' "checkbox", checked (raw == "true"), onCheck (fun b => set (toString b))]
-  render_valid := fun inForm _ _ => by cases inForm <;> rfl
+  render_valid := fun inForm raw set => validIn_input inForm _
+    (by simp only [Attr.validList, attr_valid_type, attr_valid_checked, attr_valid_onCheck, Bool.and_self]) rfl
 
 def date : Codec Date where
   parse := Date.parse?; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "input" [type' "date", value raw, onInput set]
-  render_valid := fun inForm _ _ => by cases inForm <;> rfl
+  render_valid := fun inForm raw set => validIn_input inForm _
+    (by simp only [Attr.validList, attr_valid_type, attr_valid_value, attr_valid_onInput, Bool.and_self]) rfl
 
 def select (options : List (String × String)) : Codec String where
   parse := fun s => if options.any (fun o => o.1 == s) then some s else none
@@ -116,15 +226,16 @@ def select (options : List (String × String)) : Codec String where
     el "select" [value raw, onChange set]
       (options.map fun (v, lbl) => el "option" [value v] [lbl])
   render_valid := fun {msg} inForm raw set => by
-    have hsVal : isSafeAttrName "value" = true := rfl
-    have huVal : isUrlAttrName "value" = false := rfl
-    have hsInp : isSafeAttrName "input" = true := rfl
-    have hvSel : isVoidTag "select" = false := rfl
-    have hvOpt : isVoidTag "option" = false := rfl
-    have hSel  : stepHtmlCtx ⟨.normal, false, false, inForm⟩ "select" = some ⟨.select, false, true, inForm⟩ := by cases inForm <;> rfl
-    have hOpt  : stepHtmlCtx ⟨.select, false, true, inForm⟩ "option" = some ⟨.option, false, true, inForm⟩ := by cases inForm <;> rfl
-    simp [el, value, onChange, Html.validIn, Attr.valid, Attr.validKeyValue, Html.validListIn_map,
-      hsVal, huVal, hsInp, hvSel, hvOpt, hSel, hOpt, validTextIn]
+    have hvSel : Attr.validList [value (msg := msg) raw, onChange set] = true := by
+      simp only [Attr.validList, attr_valid_value, attr_valid_onChange, Bool.and_self]
+    have hlSel : Attr.hasLocalCell [value (msg := msg) raw, onChange set] = false := rfl
+    have hvOpt : ∀ v : String, Attr.validList [value (msg := msg) v] = true := fun v => by
+      simp only [Attr.validList, attr_valid_value, Bool.and_self]
+    have hlOpt : ∀ v : String, Attr.hasLocalCell [value (msg := msg) v] = false := fun _ => rfl
+    simp only [el, Html.validIn, Html.validListIn, Html.validListIn_map,
+      step_select, step_option, isVoid_select, isVoid_option, validTextIn,
+      hvSel, hlSel, hvOpt, hlOpt, Bool.not_false, Bool.true_or, Bool.and_self,
+      Qed.List.all_const_true]
 
 def radios (group : String) (options : List (String × String)) : Codec String where
   parse := fun s => if options.any (fun o => o.1 == s) then some s else none
@@ -135,29 +246,35 @@ def radios (group : String) (options : List (String × String)) : Codec String w
       (options.map fun (v, lbl) =>
         el "label" [] [el "input" [type' "radio", Qed.name group, value v, checked (raw == v), onChange set], lbl])
   render_valid := fun {msg} inForm raw set => by
-    have hsTyp : isSafeAttrName "type" = true := rfl
-    have huTyp : isUrlAttrName "type" = false := rfl
-    have hsNam : isSafeAttrName "name" = true := rfl
-    have huNam : isUrlAttrName "name" = false := rfl
-    have hsVal : isSafeAttrName "value" = true := rfl
-    have huVal : isUrlAttrName "value" = false := rfl
-    have hsChk : isSafeAttrName "checked" = true := rfl
-    have hsInp : isSafeAttrName "input" = true := rfl
-    have hvDiv : isVoidTag "div" = false := rfl
-    have hvLbl : isVoidTag "label" = false := rfl
-    have hDiv  : stepHtmlCtx ⟨.normal, false, false, inForm⟩ "div" = some ⟨.normal, false, false, inForm⟩ := by cases inForm <;> decide
-    have hLbl  : stepHtmlCtx ⟨.normal, false, false, inForm⟩ "label" = some ⟨.normal, false, false, inForm⟩ := by cases inForm <;> decide
-    have hInp  : stepHtmlCtx ⟨.normal, false, false, inForm⟩ "input" = some ⟨.normal, false, false, inForm⟩ := by cases inForm <;> decide
-    simp [el, cls, type', Qed.name, value, checked, onChange,
-      Html.validIn, Attr.valid, Attr.validKeyValue, Html.validListIn_map,
-      hsTyp, huTyp, hsNam, huNam, hsVal, huVal, hsChk, hsInp, hvDiv, hvLbl, hDiv, hLbl, hInp, validTextIn]
+    have hvDiv : Attr.validList [cls (msg := msg) "qed-radios"] = true := rfl
+    have hlDiv : Attr.hasLocalCell [cls (msg := msg) "qed-radios"] = false := rfl
+    have hvNil : Attr.validList ([] : List (Attr msg)) = true := rfl
+    have hlNil : Attr.hasLocalCell ([] : List (Attr msg)) = false := rfl
+    have hInp : ∀ v : String, Html.validIn ⟨.normal, false, false, inForm⟩
+        (el "input" [type' "radio", Qed.name group, value v, checked (raw == v), onChange set]) = true := fun v =>
+      validIn_input inForm _
+        (by simp only [Attr.validList, attr_valid_type, attr_valid_name, attr_valid_value, attr_valid_checked, attr_valid_onChange, Bool.and_self])
+        rfl
+    have hLbl : ∀ p : String × String, Html.validIn ⟨.normal, false, false, inForm⟩
+        (el "label" [] [el "input" [type' "radio", Qed.name group, value p.1, checked (raw == p.1), onChange set], p.2]) = true := fun (v, lbl) => by
+      simp only [el, Html.validIn, Html.validListIn, step_label, isVoid_label, validTextIn,
+        hvNil, hlNil, Bool.not_false, Bool.true_or, Bool.and_self, Bool.and_true, Bool.true_and]
+      exact hInp v
+    change Html.validIn ⟨.normal, false, false, inForm⟩
+      (Html.element "div" [cls "qed-radios"] (options.map fun p =>
+        el "label" [] [el "input" [type' "radio", Qed.name group, value p.1, checked (raw == p.1), onChange set], p.2])) = true
+    rw [Html.validIn]
+    simp only [step_div, isVoid_div, hvDiv, hlDiv, Html.validListIn_map, hLbl,
+      Bool.not_false, Bool.true_or, Bool.and_self, Qed.List.all_const_true]
 
 def json (α : Type) [ToJson α] [FromJson α] : Codec α where
   parse := fun _ => none
   valid := fun _ => True; dec := fun _ => inferInstance
   render := fun _ _ => el "span" [] []
   inForm := false
-  render_valid := fun inForm _ _ => by cases inForm <;> rfl
+  render_valid := fun inForm _ _ => by
+    simp only [el, Html.validIn, Html.validListIn, step_span, isVoid_span,
+      Attr.validList, Attr.hasLocalCell, Bool.not_false, Bool.true_or, Bool.and_self]
 
 @[simp] theorem render_valid_simp {α msg : Type} (c : Codec α) (inForm : Bool) (raw : String) (set : String → msg) :
     Html.validIn ⟨.normal, false, false, inForm⟩ (c.render raw set) = true :=
@@ -178,26 +295,48 @@ def formFieldRow {msg : Type} (inForm wrapLabel bad : Bool) (label err : String)
     (hctrl : Html.validIn ⟨.normal, false, false, ctxInForm⟩ ctrl = true) :
     Html.validListIn ⟨.normal, false, false, ctxInForm⟩
       (formFieldRow inForm wrapLabel bad label err ctrl) = true := by
-  have hsAria : isSafeAttrName "aria-invalid" = true := rfl
-  have huAria : isUrlAttrName "aria-invalid" = false := rfl
-  have hvFs   : isVoidTag "fieldset" = false := rfl
-  have hvLeg  : isVoidTag "legend" = false := rfl
-  have hvLbl  : isVoidTag "label" = false := rfl
-  have hvSpn  : isVoidTag "span" = false := rfl
-  have hFs    : stepHtmlCtx ⟨.normal, false, false, ctxInForm⟩ "fieldset" = some ⟨.normal, false, false, ctxInForm⟩ := by cases ctxInForm <;> decide
-  have hLeg   : stepHtmlCtx ⟨.normal, false, false, ctxInForm⟩ "legend" = some ⟨.normal, false, false, ctxInForm⟩ := by cases ctxInForm <;> decide
-  have hLbl   : stepHtmlCtx ⟨.normal, false, false, ctxInForm⟩ "label" = some ⟨.normal, false, false, ctxInForm⟩ := by cases ctxInForm <;> decide
-  have hSpn   : stepHtmlCtx ⟨.normal, false, false, ctxInForm⟩ "span" = some ⟨.normal, false, false, ctxInForm⟩ := by cases ctxInForm <;> decide
-  cases inForm <;> cases wrapLabel <;> cases bad <;>
-    simp [formFieldRow, el, cls, attr, Html.validListIn, Html.validIn, Attr.valid, Attr.validKeyValue,
-      hsAria, huAria, hvFs, hvLeg, hvLbl, hvSpn, hFs, hLeg, hLbl, hSpn, validTextIn, hctrl]
+  have hvRow : ∀ v : String, Attr.validList [cls (msg := msg) "qed-field", attr "aria-invalid" v] = true := fun v => by
+    simp only [Attr.validList, attr_valid_cls, attr_valid_ariaInvalid, Bool.and_self]
+  have hlRow : ∀ v : String, Attr.hasLocalCell [cls (msg := msg) "qed-field", attr "aria-invalid" v] = false := fun _ => rfl
+  have hvCls : ∀ s : String, Attr.validList [cls (msg := msg) s] = true := fun _ => rfl
+  have hlCls : ∀ s : String, Attr.hasLocalCell [cls (msg := msg) s] = false := fun _ => rfl
+  cases inForm with
+  | false => rfl
+  | true =>
+    cases wrapLabel with
+    | true =>
+      cases bad with
+      | true =>
+        dsimp only [formFieldRow]
+        simp only [ite_true, List.cons_append, List.nil_append,
+          el, Html.validListIn, Html.validIn, step_label, step_span, isVoid_label, isVoid_span,
+          hvRow, hlRow, hvCls, hlCls, validTextIn, hctrl, Bool.not_false, Bool.true_or, Bool.and_self]
+      | false =>
+        dsimp only [formFieldRow]
+        simp only [Bool.false_eq_true, ite_true, ite_false, List.cons_append, List.nil_append,
+          el, Html.validListIn, Html.validIn, step_label, step_span, isVoid_label, isVoid_span,
+          hvRow, hlRow, hvCls, hlCls, validTextIn, hctrl, Bool.not_false, Bool.true_or, Bool.and_self]
+    | false =>
+      cases bad with
+      | true =>
+        dsimp only [formFieldRow]
+        simp only [Bool.false_eq_true, ite_true, ite_false, List.cons_append, List.nil_append,
+          el, Html.validListIn, Html.validIn, step_fieldset, step_legend, step_span,
+          isVoid_fieldset, isVoid_legend, isVoid_span,
+          hvRow, hlRow, hvCls, hlCls, validTextIn, hctrl, Bool.not_false, Bool.true_or, Bool.and_self]
+      | false =>
+        dsimp only [formFieldRow]
+        simp only [Bool.false_eq_true, ite_true, ite_false, List.cons_append, List.nil_append,
+          el, Html.validListIn, Html.validIn, step_fieldset, step_legend,
+          isVoid_fieldset, isVoid_legend,
+          hvRow, hlRow, hvCls, hlCls, validTextIn, hctrl, Bool.not_false, Bool.true_or, Bool.and_self]
 
 theorem formDiv_validIn {msg : Type} (inForm : Bool) (kids : List (Html msg))
     (hk : Html.validListIn ⟨.normal, false, false, inForm⟩ kids = true) :
     Html.validIn ⟨.normal, false, false, inForm⟩ (el "div" [cls "qed-form"] kids) = true := by
-  have hDiv  : stepHtmlCtx ⟨.normal, false, false, inForm⟩ "div" = some ⟨.normal, false, false, inForm⟩ := by cases inForm <;> decide
-  have hvDiv : isVoidTag "div" = false := rfl
-  simp [el, cls, Html.validIn, Attr.validList, Attr.valid, Attr.hasLocalCell, Attr.isLocalCell, hDiv, hvDiv, hk]
+  have hv : Attr.validList [cls (msg := msg) "qed-form"] = true := rfl
+  have hl : Attr.hasLocalCell [cls (msg := msg) "qed-form"] = false := rfl
+  simp only [el, Html.validIn, step_div, isVoid_div, hv, hl, hk, Bool.not_false, Bool.true_or, Bool.and_self]
 
 theorem formRowCons_validIn {msg : Type} (ctxInForm inForm wrapLabel bad : Bool)
     (label err : String) (ctrl : Html msg) (rest : List (Html msg))
@@ -214,7 +353,19 @@ def submitBtn {msg α : Type} (o : Option α) (submit : α → msg) : Html msg :
 
 theorem submitBtn_validIn {msg α : Type} (inForm : Bool) (o : Option α) (submit : α → msg) :
     Html.validListIn ⟨.normal, false, false, inForm⟩ [submitBtn o submit] = true := by
-  cases o <;> cases inForm <;> rfl
+  cases o with
+  | some p =>
+    have hv : Attr.validList [onClick (submit p)] = true := by
+      simp only [Attr.validList, attr_valid_onClick, Bool.and_self]
+    have hl : Attr.hasLocalCell [onClick (submit p)] = false := rfl
+    simp only [submitBtn, el, Html.validListIn, Html.validIn, step_button, isVoid_button,
+      hv, hl, validTextIn, Bool.not_false, Bool.true_or, Bool.and_self]
+  | none =>
+    have hv : Attr.validList [disabled (msg := msg) true] = true := by
+      simp only [Attr.validList, attr_valid_disabled, Bool.and_self]
+    have hl : Attr.hasLocalCell [disabled (msg := msg) true] = false := rfl
+    simp only [submitBtn, el, Html.validListIn, Html.validIn, step_button, isVoid_button,
+      hv, hl, validTextIn, Bool.not_false, Bool.true_or, Bool.and_self]
 
 end Codec
 
@@ -339,7 +490,7 @@ private def resolveSchemaFields (cbns : Array Ident) (cbts : Array Term)
     res.all (·.2.2.2.2.1), res.all (·.2.2.2.2.2))
 
 open Lean Elab Command Term Meta in
-private def elabPredProbe (cbns : Array Ident) (cbts : Array Term) (inp : Term) (i : Nat) :
+private partial def elabPredProbe (cbns : Array Ident) (cbts : Array Term) (inp : Term) (i : Nat) :
     TermElabM Unit := do
   if i < cbns.size then
     let bt ← elabType cbts[i]!
@@ -388,6 +539,25 @@ private def mkProtoFieldSkeleton
   return (body, tagsPosPf, pIdents, pHaveTacs)
 
 open Lean Elab Command Term in
+private def mkSchemaProtoInsts (t : Ident) (toId fromId : Ident)
+    (tagsPosPf : TSyntax `term) (pIdents : Array Ident) (pHaveTacs : Array (TSyntax `tactic))
+    (allLawfulProto : Bool) : CommandElabM (Array (TSyntax `command)) := do
+  let tId := t.getId
+  let instBase : Array (TSyntax `command) := #[
+    ← `(command| instance $(mkIdent (tId ++ `instToProto)):ident : ToProto $t := .ofFields $toId),
+    ← `(command| instance $(mkIdent (tId ++ `instFromProto)):ident : FromProto $t := .ofFields $fromId) ]
+  if !allLawfulProto then return instBase
+  let fromProtoThmId := mkIdent (tId ++ `_fromProto_toProto)
+  let lawCmds : Array (TSyntax `command) := #[
+    ← `(command| private theorem $fromProtoThmId (x : $t) : $fromId ($toId x) = Except.ok x := by
+          $[$pHaveTacs:tactic]*
+          unfold $fromId $toId
+          simp only [$[$pIdents:term],*, bind, Except.bind, pure, Except.pure]),
+    ← `(command| instance $(mkIdent (tId ++ `instLawfulProto)):ident : LawfulProto $t :=
+          .ofFields $toId $fromId (fun x => $tagsPosPf) $fromProtoThmId) ]
+  return instBase ++ lawCmds
+
+open Lean Elab Command Term in
 private def mkSchemaProtoCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
     (tApp : TSyntax `term) (appTo : TSyntax `term → CommandElabM (TSyntax `term))
     (fs : Array Ident) (inputs : Array Term) (refined : Array Bool)
@@ -424,19 +594,8 @@ private def mkSchemaProtoCmds (t : Ident) (cbns : Array Ident) (cbts : Array Ter
     ← `(command| def $decodeBytesId $[($cbns:ident : $cbts:term)]* (b : Bytes) : Except String $tApp :=
           (Proto.decodeFieldsSpec b).bind ($fromApp)) ]
   if !cbns.isEmpty then return baseCmds
-  let instBase : Array (TSyntax `command) := #[
-    ← `(command| instance $(mkIdent (tId ++ `instToProto)):ident : ToProto $t := .ofFields $toId),
-    ← `(command| instance $(mkIdent (tId ++ `instFromProto)):ident : FromProto $t := .ofFields $fromId) ]
-  if !allLawfulProto then return baseCmds ++ instBase
-  let fromProtoThmId := mkIdent (tId ++ `_fromProto_toProto)
-  let lawCmds : Array (TSyntax `command) := #[
-    ← `(command| private theorem $fromProtoThmId (x : $t) : $fromId ($toId x) = Except.ok x := by
-          $[$pHaveTacs:tactic]*
-          unfold $fromId $toId
-          simp only [$[$pIdents:term],*, bind, Except.bind, pure, Except.pure]),
-    ← `(command| instance $(mkIdent (tId ++ `instLawfulProto)):ident : LawfulProto $t :=
-          .ofFields $toId $fromId (fun x => $tagsPosPf) $fromProtoThmId) ]
-  return baseCmds ++ instBase ++ lawCmds
+  let instCmds ← mkSchemaProtoInsts t toId fromId tagsPosPf pIdents pHaveTacs allLawfulProto
+  return baseCmds ++ instCmds
 
 open Lean Elab Command Term in
 private def checkSchemaFieldsDecidable (cbns : Array Ident) (cbts : Array Term)
@@ -459,32 +618,15 @@ private def checkSchemaFieldsDecidable (cbns : Array Ident) (cbts : Array Term)
         If it genuinely can't be decided, give it a `DecidablePred` instance."
 
 open Lean Elab Command Term in
-private def mkDraftCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
-    CommandElabM (TSyntax `command × Array (TSyntax `command)) := do
-  let emptyId        := mkIdent (tId ++ `Draft ++ `empty)
-  let draftToJsonId  := mkIdent (tId ++ `Draft ++ `toJson)
-  let draftFromId    := mkIdent (tId ++ `Draft ++ `fromJson)
+private def mkDraftInstCmds (tId : Name) (draftId draftToJsonId draftFromId : Ident)
+    (fs : Array Ident) : CommandElabM (Array (TSyntax `command)) := do
   let draftFromThmId := mkIdent (tId ++ `Draft ++ `_fromJson_toJson)
-  let emptyVals ← fs.mapM fun _ => `(term| "")
-  let draftJsonPairs ← fs.mapM fun f =>
-    let keyLit := Syntax.mkStrLit (toString f.getId); `(($keyLit, toJson (x.$f:ident)))
-  let draftJsonDecodes ← fs.mapM fun f =>
-    let keyLit := Syntax.mkStrLit (toString f.getId)
-    `((FromJsonField.fromField j $keyLit : Except String String))
   let draftFieldEqs ← fs.mapM fun f =>
     let keyLit := Syntax.mkStrLit (toString f.getId)
     `(term| LawfulJson.fromField_of_field ($draftToJsonId x) $keyLit (x.$f:ident) rfl)
   let draftDepthProof ← fs.foldrM (init := ← `(term| Nat.le_refl 0)) fun f acc =>
     `(term| Codec.max_le_max (LawfulJson.depth_toJson (x.$f:ident)) $acc)
-  let structCmd ← `(command| structure $draftId where
-          $[$fs:ident : String := ""]*
-        deriving Inhabited, DecidableEq, Repr)
-  let restCmds : Array (TSyntax `command) := #[
-    ← `(command| def $emptyId : $draftId := { $[$fs:ident := $emptyVals],* }),
-    ← `(command| def $draftToJsonId (x : $draftId) : Json := Json.obj [$[$draftJsonPairs],*]),
-    ← `(command| def $draftFromId (j : Json) : Except String $draftId := do
-          $[let $fs:ident ← $draftJsonDecodes:term]*
-          return { $[$fs:ident],* }),
+  pure #[
     ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instToJson)):ident : ToJson $draftId := ⟨$draftToJsonId⟩),
     ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instFromJson)):ident : FromJson $draftId := ⟨$draftFromId⟩),
     ← `(command| instance $(mkIdent (tId ++ `Draft ++ `instNonNullJson)):ident : NonNullJson $draftId := ⟨fun _ => nofun⟩),
@@ -496,25 +638,74 @@ private def mkDraftCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
           depthBound := 1
           depth_toJson x := Nat.add_le_add_left $draftDepthProof 1
           fromJson_toJson := $draftFromThmId) ]
-  pure (structCmd, restCmds)
 
 open Lean Elab Command Term in
-private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
-    (tApp beqApp parseApp canApp viewApp : TSyntax `term) (draftId : Ident)
-    (fs : Array Ident) (inputs : Array Term) (refined : Array Bool) (allLawfulBEq : Bool) :
+private def mkDraftCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
     CommandElabM (TSyntax `command × Array (TSyntax `command)) := do
-  let tId         := t.getId
-  let parseId     := mkIdent (tId ++ `parse)
-  let canId       := mkIdent (tId ++ `canSubmit)
-  let iffId       := mkIdent (tId ++ `canSubmit_iff)
-  let viewId      := mkIdent (tId ++ `formView)
-  let formValidId := mkIdent (tId ++ `formView_validIn)
-  let beqFnId     := mkIdent (tId ++ `beq)
-  let pairs := fs.zip inputs
-  let structTys ← (pairs.zip refined).mapM fun ((_, inp), r) =>
-    if r then `(Field ($inp).valid) else `(Codec.Val $inp)
-  let runCalls ← (pairs.zip refined).mapM fun ((f, inp), r) =>
-    if r then `(($inp).run (d.$f:ident)) else `(($inp).parse (d.$f:ident))
+  let emptyId       := mkIdent (tId ++ `Draft ++ `empty)
+  let draftToJsonId := mkIdent (tId ++ `Draft ++ `toJson)
+  let draftFromId   := mkIdent (tId ++ `Draft ++ `fromJson)
+  let emptyVals ← fs.mapM fun _ => `(term| "")
+  let draftJsonPairs ← fs.mapM fun f =>
+    let keyLit := Syntax.mkStrLit (toString f.getId); `(($keyLit, toJson (x.$f:ident)))
+  let draftJsonDecodes ← fs.mapM fun f =>
+    let keyLit := Syntax.mkStrLit (toString f.getId)
+    `((FromJsonField.fromField j $keyLit : Except String String))
+  let structCmd ← `(command| structure $draftId where
+          $[$fs:ident : String := ""]*
+        deriving Inhabited, DecidableEq, Repr)
+  let fnCmds : Array (TSyntax `command) := #[
+    ← `(command| def $emptyId : $draftId := { $[$fs:ident := $emptyVals],* }),
+    ← `(command| def $draftToJsonId (x : $draftId) : Json := Json.obj [$[$draftJsonPairs],*]),
+    ← `(command| def $draftFromId (j : Json) : Except String $draftId := do
+          $[let $fs:ident ← $draftJsonDecodes:term]*
+          return { $[$fs:ident],* }) ]
+  let instCmds ← mkDraftInstCmds tId draftId draftToJsonId draftFromId fs
+  pure (structCmd, fnCmds ++ instCmds)
+
+open Lean Elab Command Term in
+private def mkSchemaBeqCmds (tId : Name) (cbns : Array Ident) (cbts : Array Term)
+    (tApp beqApp : TSyntax `term) (fs : Array Ident) (allLawfulBEq : Bool) :
+    CommandElabM (Array (TSyntax `command)) := do
+  let beqFnId := mkIdent (tId ++ `beq)
+  let beqExpr ← match fs.toList with
+    | []      => `(true)
+    | f :: rest =>
+        rest.foldlM (init := ← `(a.$f:ident == b.$f:ident)) fun acc fi => `($acc && (a.$fi:ident == b.$fi:ident))
+  let base : Array (TSyntax `command) := #[
+    ← `(command| def $beqFnId $[($cbns:ident : $cbts:term)]* (a b : $tApp) : Bool := $beqExpr),
+    ← `(command| instance $(mkIdent (tId ++ `instBEq)):ident $[($cbns:ident : $cbts:term)]* : BEq $tApp :=
+          ⟨$beqApp⟩) ]
+  if !allLawfulBEq then return base
+  let beqEqThmId := mkIdent (tId ++ `_eq_of_beq)
+  let beqRflThmId := mkIdent (tId ++ `_beq_rfl)
+  return base ++ #[
+    ← `(command|
+      private theorem $beqEqThmId $[($cbns:ident : $cbts:term)]* {a b : $tApp}
+          (h : $beqApp a b = true) : a = b := by
+        cases a; cases b
+        dsimp only [$beqFnId:ident] at h
+        simp only [Bool.and_eq_true, beq_iff_eq] at h
+        simp_all only),
+    ← `(command|
+      private theorem $beqRflThmId $[($cbns:ident : $cbts:term)]* {a : $tApp} :
+          $beqApp a a = true := by
+        cases a
+        dsimp only [$beqFnId:ident]
+        simp only [beq_self_eq_true, Bool.and_self]),
+    ← `(command|
+      instance $(mkIdent (tId ++ `instLawfulBEq)):ident $[($cbns:ident : $cbts:term)]* : LawfulBEq $tApp where
+        eq_of_beq := $beqEqThmId
+        rfl := $beqRflThmId) ]
+
+open Lean Elab Command Term in
+private def mkSchemaParseCmds (tId : Name) (cbns : Array Ident) (cbts : Array Term)
+    (tApp parseApp canApp : TSyntax `term) (draftId : Ident)
+    (fs : Array Ident) (runCalls : Array (TSyntax `term)) :
+    CommandElabM (Array (TSyntax `command)) := do
+  let parseId := mkIdent (tId ++ `parse)
+  let canId   := mkIdent (tId ++ `canSubmit)
+  let iffId   := mkIdent (tId ++ `canSubmit_iff)
   let isSomes ← runCalls.mapM fun rc => `(($rc).isSome)
   let rhs ← match isSomes.toList with
     | []      => `(True)
@@ -526,7 +717,23 @@ private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
       cases $rc:term with
       | none => simp only [Option.isSome_none, Bool.false_eq_true, false_and, and_false, iff_self, bind, Option.bind]
       | some _ => ($acc:tactic))
-  let rowGroups ← (pairs.zip runCalls).mapM fun ((f, inp), rc) => do
+  pure #[
+    ← `(command| def $parseId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Option $tApp := do
+          $[let $fs:ident ← $runCalls:term]*
+          return { $[$fs:ident],* }),
+    ← `(command| def $canId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Bool :=
+          ($parseApp d).isSome),
+    ← `(command| theorem $iffId $[($cbns:ident : $cbts:term)]* (d : $draftId) :
+          $canApp d = true ↔ $rhs := by unfold $canId $parseId; $casesTac) ]
+
+open Lean Elab Command Term in
+private def mkSchemaFormViewCmds (tId : Name) (cbns : Array Ident) (cbts : Array Term)
+    (tApp parseApp viewApp : TSyntax `term) (draftId : Ident)
+    (fs : Array Ident) (inputs : Array Term) (runCalls : Array (TSyntax `term)) :
+    CommandElabM (Array (TSyntax `command)) := do
+  let viewId      := mkIdent (tId ++ `formView)
+  let formValidId := mkIdent (tId ++ `formView_validIn)
+  let rowGroups ← ((fs.zip inputs).zip runCalls).mapM fun ((f, inp), rc) => do
     let nameLit := Syntax.mkStrLit (toString f.getId)
     let errLit  := Syntax.mkStrLit ("Please enter a valid " ++ toString f.getId)
     `(term| Codec.formFieldRow ($inp).inForm ($inp).wrapLabel
@@ -535,46 +742,7 @@ private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
   let viewBody ← rowGroups.foldrM (init := ← `(term| [Codec.submitBtn ($parseApp d) submit])) fun g acc => `(term| $g ++ $acc)
   let validBodyPf ← inputs.foldrM (init := ← `(term| Codec.submitBtn_validIn inForm ($parseApp d) submit))
     fun inp acc => `(term| Codec.formRowCons_validIn inForm _ _ _ _ _ _ _ (($inp).render_valid inForm _ _) $acc)
-  let beqExpr ← match fs.toList with
-    | []      => `(true)
-    | f :: rest =>
-        rest.foldlM (init := ← `(a.$f:ident == b.$f:ident)) fun acc fi => `($acc && (a.$fi:ident == b.$fi:ident))
-  let beqEqThmId := mkIdent (tId ++ `_eq_of_beq)
-  let beqRflThmId := mkIdent (tId ++ `_beq_rfl)
-  let lawfulBeqCmds : Array (TSyntax `command) ←
-    if allLawfulBEq then
-      pure #[
-        ← `(command|
-          private theorem $beqEqThmId $[($cbns:ident : $cbts:term)]* {a b : $tApp}
-              (h : $beqApp a b = true) : a = b := by
-            cases a; cases b
-            dsimp only [$beqFnId:ident] at h
-            simp only [Bool.and_eq_true, beq_iff_eq] at h
-            simp_all only),
-        ← `(command|
-          private theorem $beqRflThmId $[($cbns:ident : $cbts:term)]* {a : $tApp} :
-              $beqApp a a = true := by
-            cases a
-            dsimp only [$beqFnId:ident]
-            simp only [beq_self_eq_true, Bool.and_self]),
-        ← `(command|
-          instance $(mkIdent (tId ++ `instLawfulBEq)):ident $[($cbns:ident : $cbts:term)]* : LawfulBEq $tApp where
-            eq_of_beq := $beqEqThmId
-            rfl := $beqRflThmId)]
-    else pure #[]
-  let structCmd ← `(command| structure $t $[($cbns:ident : $cbts:term)]* where
-          $[$fs:ident : $structTys]*)
-  let restCmds : Array (TSyntax `command) := #[
-    ← `(command| def $beqFnId $[($cbns:ident : $cbts:term)]* (a b : $tApp) : Bool := $beqExpr),
-    ← `(command| instance $(mkIdent (tId ++ `instBEq)):ident $[($cbns:ident : $cbts:term)]* : BEq $tApp :=
-          ⟨$beqApp⟩)] ++ lawfulBeqCmds ++ #[
-    ← `(command| def $parseId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Option $tApp := do
-          $[let $fs:ident ← $runCalls:term]*
-          return { $[$fs:ident],* }),
-    ← `(command| def $canId $[($cbns:ident : $cbts:term)]* (d : $draftId) : Bool :=
-          ($parseApp d).isSome),
-    ← `(command| theorem $iffId $[($cbns:ident : $cbts:term)]* (d : $draftId) :
-          $canApp d = true ↔ $rhs := by unfold $canId $parseId; $casesTac),
+  pure #[
     ← `(command| def $viewId {msg : Type} $[($cbns:ident : $cbts:term)]* (d : $draftId)
           (onEdit : $draftId → msg) (submit : $tApp → msg) : Html msg :=
           el "div" [cls "qed-form"] $viewBody),
@@ -582,7 +750,55 @@ private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
           (inForm : Bool) (d : $draftId) (onEdit : $draftId → msg) (submit : $tApp → msg) :
           Html.validIn ⟨.normal, false, false, inForm⟩ ($viewApp d onEdit submit) = true :=
           Codec.formDiv_validIn inForm _ $validBodyPf) ]
-  pure (structCmd, restCmds)
+
+open Lean Elab Command Term in
+private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
+    (tApp beqApp parseApp canApp viewApp : TSyntax `term) (draftId : Ident)
+    (fs : Array Ident) (inputs : Array Term) (refined : Array Bool) (allLawfulBEq : Bool) :
+    CommandElabM (TSyntax `command × Array (TSyntax `command)) := do
+  let tId := t.getId
+  let pairs := fs.zip inputs
+  let structTys ← (pairs.zip refined).mapM fun ((_, inp), r) =>
+    if r then `(Field ($inp).valid) else `(Codec.Val $inp)
+  let runCalls ← (pairs.zip refined).mapM fun ((f, inp), r) =>
+    if r then `(($inp).run (d.$f:ident)) else `(($inp).parse (d.$f:ident))
+  let structCmd ← `(command| structure $t $[($cbns:ident : $cbts:term)]* where
+          $[$fs:ident : $structTys]*)
+  let beqCmds   ← mkSchemaBeqCmds tId cbns cbts tApp beqApp fs allLawfulBEq
+  let parseCmds ← mkSchemaParseCmds tId cbns cbts tApp parseApp canApp draftId fs runCalls
+  let viewCmds  ← mkSchemaFormViewCmds tId cbns cbts tApp parseApp viewApp draftId fs inputs runCalls
+  pure (structCmd, beqCmds ++ parseCmds ++ viewCmds)
+
+open Lean Elab Command Term in
+private def mkSchemaJsonInstCmds (t : Ident) (toJsonId fromJsonId : Ident)
+    (fs : Array Ident) (inputs : Array Term) (refined : Array Bool)
+    (jsonReads : Array (TSyntax `term)) (allLawful : Bool) :
+    CommandElabM (Array (TSyntax `command)) := do
+  let tId := t.getId
+  let base : Array (TSyntax `command) := #[
+    ← `(command| instance $(mkIdent (tId ++ `instToJson)):ident : ToJson $t := ⟨$toJsonId⟩),
+    ← `(command| instance $(mkIdent (tId ++ `instFromJson)):ident : FromJson $t := ⟨$fromJsonId⟩),
+    ← `(command| instance $(mkIdent (tId ++ `instNonNullJson)):ident : NonNullJson $t := ⟨fun _ => nofun⟩) ]
+  if !allLawful then return base
+  let depthBoundExpr ← inputs.foldrM (init := ← `(term| (0 : Nat))) fun inp acc =>
+    `(term| Nat.max (LawfulJson.depthBound (Codec.Val $inp)) $acc)
+  let depthProofExpr ← jsonReads.foldrM (init := ← `(term| Nat.le_refl 0)) fun rd acc =>
+    `(term| Codec.max_le_max (LawfulJson.depth_toJson $rd) $acc)
+  let fieldEqs ← ((fs.zip inputs).zip refined).mapM fun ((f, inp), r) => do
+    let keyLit := Syntax.mkStrLit (toString f.getId)
+    if r then `(term| Codec.fromJsonField_of_field $inp ($toJsonId x) $keyLit (x.$f) rfl)
+    else `(term| LawfulJson.fromField_of_field ($toJsonId x) $keyLit (x.$f) rfl)
+  let fromJsonThmId := mkIdent (tId ++ `_fromJson_toJson)
+  return base ++ #[
+    ← `(command|
+      private theorem $fromJsonThmId (x : $t) : $fromJsonId ($toJsonId x) = .ok x := by
+        unfold $fromJsonId
+        simp only [$[$fieldEqs:term],*, bind, Except.bind, pure, Except.pure]),
+    ← `(command|
+      instance $(mkIdent (tId ++ `instLawfulJson)):ident : LawfulJson $t where
+        depthBound := 1 + $depthBoundExpr
+        depth_toJson x := Nat.add_le_add_left $depthProofExpr 1
+        fromJson_toJson := $fromJsonThmId) ]
 
 open Lean Elab Command Term in
 private def mkSchemaJsonCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
@@ -595,8 +811,7 @@ private def mkSchemaJsonCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
   let encodeId   := mkIdent (tId ++ `encode)
   let toJsonId   := mkIdent (tId ++ `toJson)
   let fromJsonId := mkIdent (tId ++ `fromJson)
-  let pairs := fs.zip inputs
-  let jsonDecodes ← (pairs.zip refined).mapM fun ((f, inp), r) => do
+  let jsonDecodes ← ((fs.zip inputs).zip refined).mapM fun ((f, inp), r) => do
     let keyLit := Syntax.mkStrLit (toString f.getId)
     if r then `(($inp).fromJsonField j $keyLit)
     else `((FromJsonField.fromField j $keyLit : Except String (Codec.Val $inp)))
@@ -613,32 +828,8 @@ private def mkSchemaJsonCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
     ← `(command| def $encodeId $[($cbns:ident : $cbts:term)]* (x : $tApp) : String :=
           Json.render ($toJsonApp x)) ]
   if !cbns.isEmpty then return jsonFnCmds
-  let depthBoundExpr ← inputs.foldrM (init := ← `(term| (0 : Nat))) fun inp acc =>
-    `(term| Nat.max (LawfulJson.depthBound (Codec.Val $inp)) $acc)
-  let depthProofExpr ← jsonReads.foldrM (init := ← `(term| Nat.le_refl 0)) fun rd acc =>
-    `(term| Codec.max_le_max (LawfulJson.depth_toJson $rd) $acc)
-  let fieldEqs ← (pairs.zip refined).mapM fun ((f, inp), r) => do
-    let keyLit := Syntax.mkStrLit (toString f.getId)
-    if r then `(term| Codec.fromJsonField_of_field $inp ($toJsonId x) $keyLit (x.$f) rfl)
-    else `(term| LawfulJson.fromField_of_field ($toJsonId x) $keyLit (x.$f) rfl)
-  let fromJsonThmId := mkIdent (tId ++ `_fromJson_toJson)
-  let lawfulCmds : Array (TSyntax `command) ← if allLawful then
-    pure #[
-      ← `(command|
-        private theorem $fromJsonThmId (x : $t) : $fromJsonId ($toJsonId x) = .ok x := by
-          unfold $fromJsonId
-          simp only [$[$fieldEqs:term],*, bind, Except.bind, pure, Except.pure]),
-      ← `(command|
-        instance $(mkIdent (tId ++ `instLawfulJson)):ident : LawfulJson $t where
-          depthBound := 1 + $depthBoundExpr
-          depth_toJson x := Nat.add_le_add_left $depthProofExpr 1
-          fromJson_toJson := $fromJsonThmId)]
-  else pure #[]
-  let jsonInstCmds : Array (TSyntax `command) := #[
-    ← `(command| instance $(mkIdent (tId ++ `instToJson)):ident : ToJson $t := ⟨$toJsonId⟩),
-    ← `(command| instance $(mkIdent (tId ++ `instFromJson)):ident : FromJson $t := ⟨$fromJsonId⟩),
-    ← `(command| instance $(mkIdent (tId ++ `instNonNullJson)):ident : NonNullJson $t := ⟨fun _ => nofun⟩) ] ++ lawfulCmds
-  return jsonFnCmds ++ jsonInstCmds
+  let instCmds ← mkSchemaJsonInstCmds t toJsonId fromJsonId fs inputs refined jsonReads allLawful
+  return jsonFnCmds ++ instCmds
 
 open Lean Elab Command Term in
 @[command_elab schemaCmd] def elabSchemaCmd : CommandElab

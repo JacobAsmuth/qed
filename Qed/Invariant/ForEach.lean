@@ -1,4 +1,5 @@
 import Qed.Component.Core
+import Qed.Invariant.State
 import Qed.Invariant.View
 
 namespace Qed
@@ -8,6 +9,97 @@ syntax (name := invariantForEach)
   "qedInternalInvariant " ident " : " term " for_each " ident " preserved_by " ident " using " ident
     (" := " term)? : command
 
+/-- Extract the collection expression `xs` from a goal of shape `∀ c ∈ xs, P c`. -/
+private def extractForEachColl? (tgt : Expr) : Option Expr :=
+  match tgt.consumeMData with
+  | .forallE _ _ (.forallE _ memTy _ _) _ =>
+      let memTy := memTy.consumeMData
+      if memTy.isAppOfArity ``Membership.mem 5 then
+        some memTy.getAppArgs[3]!.consumeMData
+      else none
+  | _ => none
+
+private def stripHeadLets : Nat → Expr → Expr
+  | 0, e => e.consumeMData.headBeta
+  | n + 1, e =>
+      let e := e.consumeMData.headBeta
+      match e with
+      | .letE _ _ val body _ => stripHeadLets n (body.instantiate1 val)
+      | _ => e
+
+private def forEachDirectLemma? : Name → Option Name
+  | ``Array.filter           => some ``Qed.ForEach.forall_filter
+  | ``Array.sortBy           => some ``Qed.ForEach.forall_sortBy
+  | ``Array.pop              => some ``Qed.ForEach.forall_pop
+  | ``Array.reverse          => some ``Qed.ForEach.forall_reverse
+  | ``Array.extract          => some ``Qed.ForEach.forall_extract
+  | ``Array.eraseIdx         => some ``Qed.ForEach.forall_eraseIdx
+  | ``Array.eraseIdxIfInBounds => some ``Qed.ForEach.forall_eraseIdxIfInBounds
+  | ``Array.swap             => some ``Qed.ForEach.forall_swap
+  | ``Array.swapIfInBounds   => some ``Qed.ForEach.forall_swapIfInBounds
+  | _                        => none
+
+private def forEachElemLemma? : Name → Option Name
+  | ``Array.push          => some ``Qed.ForEach.forall_push
+  | ``Array.set           => some ``Qed.ForEach.forall_set
+  | ``Array.setIfInBounds => some ``Qed.ForEach.forall_setIfInBounds
+  | ``HAppend.hAppend
+  | ``Array.append        => some ``Qed.ForEach.forall_append
+  | _                     => none
+
+private def runForEachArm (childInv : Ident) (pred : Term)
+    (elemClose mapClose : TSyntax `tactic) : TacticM Unit := do
+  let h := mkIdent `h; let y := mkIdent `y; let hy := mkIdent `hy; let hP := mkIdent `hP
+  let fastTac? : Option (TSyntax `tactic) ← withMainContext do
+    let tgt ← instantiateMVars (← getMainTarget)
+    let some collRaw := extractForEachColl? tgt | return none
+    let coll := stripHeadLets 16 collRaw
+    let some nm := coll.getAppFn.constName? | return some (← `(tactic| exact $h))
+    if let some lem := forEachDirectLemma? nm then
+      let lemId := mkIdent lem
+      return some (← `(tactic| exact $lemId:ident $h))
+    if let some lem := forEachElemLemma? nm then
+      let lemId := mkIdent lem
+      return some (← `(tactic| (refine $lemId:ident $h ?_ <;> ($elemClose:tactic))))
+    if nm == ``Array.map then
+      return some (← `(tactic| (refine Qed.ForEach.forall_map ?_ <;> intro $y $hy <;> have $hP:ident := $h $y $hy <;> ($mapClose:tactic))))
+    if nm == ``Array.modify then
+      return some (← `(tactic| (refine Qed.ForEach.forall_modify $h ?_ <;> intro $y $hy $hP <;> ($mapClose:tactic))))
+    if nm == ``Qed.Component.updateKeyed || nm.getString! == "updateKeyed" then
+      return some (← `(tactic| first
+        | exact Qed.ForEach.updateKeyed_forall _ _ $childInv $h
+        | exact Qed.ForEach.updateKeyed_forall _ _ ($childInv).2 $h))
+    return some (← `(tactic| exact $h))
+  if let some tac := fastTac? then
+    let saved ← saveState
+    let ok ← try evalTactic tac; pure true catch _ => pure false
+    if ok then return
+    restoreState saved
+  let _ := pred
+  evalTactic (← `(tactic|
+    first
+      | exact $h
+      | exact Qed.ForEach.forall_filter $h
+      | exact Qed.ForEach.forall_sortBy $h
+      | exact Qed.ForEach.forall_pop $h
+      | exact Qed.ForEach.forall_reverse $h
+      | exact Qed.ForEach.forall_extract $h
+      | exact Qed.ForEach.forall_eraseIdx $h
+      | exact Qed.ForEach.forall_eraseIdxIfInBounds $h
+      | exact Qed.ForEach.forall_swap $h
+      | exact Qed.ForEach.forall_swapIfInBounds $h
+      | exact Qed.ForEach.updateKeyed_forall _ _ $childInv $h
+      | exact Qed.ForEach.updateKeyed_forall _ _ ($childInv).2 $h
+      | (refine Qed.ForEach.forall_map ?_ <;> intro $y $hy <;>
+          have $hP:ident := $h $y $hy <;> ($mapClose:tactic))
+      | (refine Qed.ForEach.forall_modify $h ?_ <;> intro $y $hy $hP <;> ($mapClose:tactic))
+      | (refine Qed.ForEach.forall_push $h ?_ <;> ($elemClose:tactic))
+      | (refine Qed.ForEach.forall_set $h ?_ <;> ($elemClose:tactic))
+      | (refine Qed.ForEach.forall_setIfInBounds $h ?_ <;> ($elemClose:tactic))
+      | (refine Qed.ForEach.forall_append $h ?_ <;> ($elemClose:tactic))
+      | grind
+      | skip))
+
 elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
   let predLem ← if pred.raw.isIdent
     then pure #[← `(Lean.Parser.Tactic.simpLemma| $(⟨pred.raw⟩):ident),
@@ -15,42 +107,26 @@ elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
     else pure #[← `(Lean.Parser.Tactic.simpLemma| Qed.Lang.QedVal.val_id)]
   let elemClose ← if pred.raw.isIdent
     then `(tactic| (try dsimp only) <;> (try simp only [$[$predLem],*]) <;>
-                   (try (first | omega | simp_all | decide | trivial | qedAutoClose)))
+                   (try (first | omega | decide | trivial | simp_all | qedAutoClose)))
     else `(tactic| (try dsimp only) <;> (try simp only [$[$predLem],*]) <;>
-                   (try (first | omega | simp | simp_all | decide | trivial | qedAutoClose)))
+                   (try (first | omega | decide | trivial | simp | simp_all | qedAutoClose)))
   -- Unhygienic binder names so manual `case … =>` proofs can reference `m`, `h`, `y`, `hP`.
   let m := mkIdent `m; let msg := mkIdent `msg; let h := mkIdent `h
-  let y := mkIdent `y; let hy := mkIdent `hy; let hP := mkIdent `hP
+  let hP := mkIdent `hP
   let mapClose ← `(tactic|
     ((try dsimp only at $hP:ident ⊢) <;> (try simp only [$[$predLem],*] at $hP:ident ⊢) <;>
-     (try (first | omega | (simp_all <;> omega) | (simp_all <;> done)
-                 | decide | trivial | qedAutoClose))))
+     (try (first | omega | decide | trivial | (simp_all <;> omega) | (simp_all <;> done) | qedAutoClose))))
   evalTactic (← `(tactic|
     (intro $m $msg $h
      cases $msg:ident <;>
-       simp only [$upd:ident, InvTarget.proj_id, InvTarget.proj_fst] <;>
-       (first
-         | exact $h
-         | exact Qed.ForEach.forall_filter $h
-         | exact Qed.ForEach.forall_sortBy $h
-         | exact Qed.ForEach.forall_pop $h
-         | exact Qed.ForEach.forall_reverse $h
-         | exact Qed.ForEach.forall_extract $h
-         | exact Qed.ForEach.forall_eraseIdx $h
-         | exact Qed.ForEach.forall_eraseIdxIfInBounds $h
-         | exact Qed.ForEach.forall_swap $h
-         | exact Qed.ForEach.forall_swapIfInBounds $h
-         | exact Qed.ForEach.updateKeyed_forall _ _ $childInv $h
-         | exact Qed.ForEach.updateKeyed_forall _ _ ($childInv).2 $h
-         | (refine Qed.ForEach.forall_map ?_ <;> intro $y $hy <;>
-             have $hP:ident := $h $y $hy <;> ($mapClose:tactic))
-         | (refine Qed.ForEach.forall_modify $h ?_ <;> intro $y $hy $hP <;> ($mapClose:tactic))
-         | (refine Qed.ForEach.forall_push $h ?_ <;> ($elemClose:tactic))
-         | (refine Qed.ForEach.forall_set $h ?_ <;> ($elemClose:tactic))
-         | (refine Qed.ForEach.forall_setIfInBounds $h ?_ <;> ($elemClose:tactic))
-         | (refine Qed.ForEach.forall_append $h ?_ <;> ($elemClose:tactic))
-         | grind
-         | skip))))
+       simp only [$upd:ident, InvTarget.proj_id, InvTarget.proj_fst])))
+  let goals ← getGoals
+  let mut rem : List MVarId := []
+  for g in goals do
+    setGoals [g]
+    runForEachArm childInv pred elemClose mapClose
+    rem := rem ++ (← getGoals)
+  setGoals rem
 
 elab "qedDischargeForEach" upd:ident childInv:ident nm:ident pred:term : tactic => do
   evalTactic (← `(tactic| forEachLift $upd $childInv $pred))

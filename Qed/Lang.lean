@@ -545,6 +545,112 @@ def buildTupleVal (vals : Array Term) : MacroM Term :=
   else if vals.size == 1 then return vals[0]!
   else vals.foldrM (init := vals.back!) (start := vals.size - 1) fun a acc => `(($a, $acc))
 
+private def lowerCallExpr {m : Type → Type} [Monad m] [MonadQuotation m]
+    (hooks : LowerHooks m) (go : ExprMode → Syntax → m Term) (finish : Term → m Term)
+    (mode : ExprMode) (stx : Syntax) : m Term := do
+  let (calleeStx, rawArgs) := ((stx.getArg 0), (stx.getArg 2).getSepArgs)
+  if let some custom ← hooks.lowerCall stx calleeStx rawArgs mode go then return custom
+  if calleeStx.getKind == ``qedIdent && (calleeStx.getArg 0).getId.eraseMacroScopes == `url &&
+      rawArgs.size == 1 && rawArgs[0]!.getKind == ``qedCallArgPos && (rawArgs[0]!.getArg 0).getKind == ``qedLitStr then
+    let info := SourceInfo.fromRef stx
+    let strLit := (rawArgs[0]!.getArg 0).getArg 0
+    return ← finish ⟨Syntax.node info `Qed.Jsx.qedUrlLit #[calleeStx.getArg 0, Syntax.atom info "(", strLit, Syntax.atom info ")"]⟩
+  if !rawArgs.isEmpty && rawArgs.any (·.getKind == ``qedCallArgNamed) then
+    unless rawArgs.all (·.getKind == ``qedCallArgNamed) do
+      let calleeStr := stxSnippet calleeStx
+      let inCall := if calleeStr.isEmpty then "the same call" else s!"call `{calleeStr}(...)`"
+      return ← hooks.throwErr stx s!"cannot mix named (`field=val`) and positional arguments in {inCall}"
+    let tyTerm ← go .val calleeStx
+    let fIds : Array Ident := rawArgs.map (⟨·[0]⟩)
+    let fVals ← rawArgs.mapM fun a => do hooks.wrapNamedField (← go .val (a.getArg 2))
+    return ← `(({ $[$fIds:ident := $fVals:term],* } : $tyTerm))
+  let calleeTerm ← go .val calleeStx
+  let isPropAllCall := (mode == .propInv || mode == .propGuard) &&
+    ((calleeStx.getKind == ``qedProj && ((calleeStx.getArg 2).getId == `all || (calleeStx.getArg 2).getId == `any)) ||
+     (calleeStx.getKind == ``qedIdent &&
+       match (calleeStx.getArg 0).getId with | .str _ "all" | .str _ "any" => true | _ => false))
+  let argTerms ← rawArgs.mapM fun a => do
+    let uArg := unwrapParens1 (a.getArg 0)
+    let argMode := if isPropAllCall && (uArg.getKind == ``qedLam1 || uArg.getKind == ``qedLamN) then .propInv else .val
+    go argMode (a.getArg 0)
+  let callRes ← if argTerms.isEmpty then pure calleeTerm else `($calleeTerm $argTerms*)
+  finish callRes
+
+private def lowerCmpExpr {m : Type → Type} [Monad m] [MonadQuotation m]
+    (hooks : LowerHooks m) (lowerValOp : Syntax → m Term)
+    (mode : ExprMode) (stx : Syntax) : m Term := do
+  let isPropMode := mode == .propInv || mode == .propGuard
+  let lowerSingleCmp (lhsStx : Syntax) (opStr : String) (rhsStx : Syntax) : m Term := do
+    if opStr == "==" || opStr == "!=" || opStr == "is" || opStr == "is not" then
+      let isEq := opStr == "==" || opStr == "is"
+      let (lS, rS) := if isNoneExpr lhsStx && !isNoneExpr rhsStx then (rhsStx, lhsStx) else (lhsStx, rhsStx)
+      let (a, b) := (← lowerValOp lS, ← lowerValOp rS)
+      match isEq, mode with
+      | true,  .propInv   => `(($a) = ($b))
+      | true,  .propGuard => `(qedEqProp($a, $b))
+      | true,  _          => `(($a) == ($b))
+      | false, .propInv   => `(($a) ≠ ($b))
+      | false, .propGuard => `(¬ qedEqProp($a, $b))
+      | false, _          => `(($a) != ($b))
+    else if opStr == "in" || opStr == "not in" then
+      let (a, b, isIn) := (← lowerValOp lhsStx, ← lowerValOp rhsStx, opStr == "in")
+      if isPropMode then if isIn then `(Qed.Lang.QedMemProp.memProp ($a) ($b)) else `(¬ Qed.Lang.QedMemProp.memProp ($a) ($b))
+      else if isIn then `(Qed.Lang.QedMem.mem ($a) ($b)) else `(!(Qed.Lang.QedMem.mem ($a) ($b)))
+    else
+      let (a, b) := (← lowerValOp lhsStx, ← lowerValOp rhsStx)
+      let p ← match opStr with
+        | "<=" => `(($a) ≤ ($b)) | ">=" => `(($a) ≥ ($b))
+        | "<"  => `(($a) < ($b)) | _    => `(($a) > ($b))
+      if isPropMode then return p else `(decide ($p))
+  let mut prev := (stx.getArg 0)
+  let mut terms : Array Term := #[]
+  for lk in (stx.getArg 1).getArgs do
+    terms := terms.push (← lowerSingleCmp prev (cmpOpKind (lk.getArg 0)) (lk.getArg 1))
+    prev := (lk.getArg 1)
+  match terms.toList with
+  | []      => hooks.throwErr stx "empty comparison"
+  | t :: ts => ts.foldlM (init := t) fun acc x => if isPropMode then `($acc ∧ $x) else `($acc && $x)
+
+private def lowerAndOrExpr {m : Type → Type} [Monad m] [MonadQuotation m]
+    (hooks : LowerHooks m) (go : ExprMode → Syntax → m Term)
+    (isAnd : Bool) (mode : ExprMode) (stx : Syntax) : m Term := do
+  match mode with
+  | .propInv =>
+      let (a, b) := (← go .propInv (stx.getArg 0), ← go .propInv (stx.getArg 2))
+      if isAnd then `($a ∧ $b) else `($a ∨ $b)
+  | .propGuard =>
+      let (a, b) := (← go .propGuard (stx.getArg 0), ← go .propGuard (stx.getArg 2))
+      if exprHasIndex (stx.getArg 2) then
+        let h ← hooks.freshIdent (if isAnd then "_qedAnd" else "_qedOr")
+        if isAnd then `(Qed.Lang.QedAndProp ($a) (fun ($h:ident : $a) => $b))
+        else `(Qed.Lang.QedOrProp ($a) (fun ($h:ident : ¬ ($a)) => $b))
+      else if isAnd then `($a ∧ $b) else `($a ∨ $b)
+  | _ =>
+      let (a, b) := (← go .boolCond (stx.getArg 0), ← go .boolCond (stx.getArg 2))
+      if isAnd && exprHasIndex (stx.getArg 2) then
+        let h ← hooks.freshIdent "_qedAnd"
+        `(if $h:ident : ($a) = true then $b else false)
+      else if isAnd then `($a && $b) else `($a || $b)
+
+private def lowerLamExpr {m : Type → Type} [Monad m] [MonadQuotation m]
+    (hooks : LowerHooks m) (go : ExprMode → Syntax → m Term)
+    (isLam1 : Bool) (mode : ExprMode) (stx : Syntax) : m Term := do
+  let pEntries : Array (Syntax × Option Syntax) :=
+    if isLam1 then #[((stx.getArg 0), none)]
+    else (stx.getArg 1).getSepArgs.map fun p => ((p.getArg 0), if (p.getArg 1).getNumArgs == 2 then some ((p.getArg 1).getArg 1) else none)
+  let bodyStx := if isLam1 then (stx.getArg 2) else (stx.getArg 4)
+  let pNames := pEntries.filterMap fun (b, _) => if b.isIdent then some b.getId.toString else none
+  let body ← hooks.withLocals pNames (go (if mode == .propInv then .propInv else .val) bodyStx)
+  pEntries.foldrM (init := body) fun (b, tyOpt?) acc => do
+    match tyOpt? with
+    | some tyStx =>
+        let tyT ← hooks.lowerType tyStx
+        if b.isIdent then let bid : Ident := ⟨b⟩; `(fun ($bid:ident : $tyT) => $acc)
+        else `(fun (_ : $tyT) => $acc)
+    | none =>
+        if b.isIdent then let bid : Ident := ⟨b⟩; `(fun $bid:ident => $acc)
+        else `(fun _ => $acc)
+
 /-- Unified lowerer for all `qedExpr` nodes across `server`, `component`, `schema`, `invariant`, and JSX. -/
 @[noinline, nospecialize]
 partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
@@ -599,34 +705,7 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
       | "qedAwait" => hooks.lowerAwait stx (stx.getArg 1) mode
       | "qedIndex" => hooks.lowerIndex stx (← go .val (stx.getArg 0)) (← go .val (stx.getArg 2)) mode
       | "qedProj" => hooks.lowerProj stx (← go .val (stx.getArg 0)) ⟨(stx.getArg 2)⟩ mode
-      | "qedCall" =>
-        let (calleeStx, rawArgs) := ((stx.getArg 0), (stx.getArg 2).getSepArgs)
-        if let some custom ← hooks.lowerCall stx calleeStx rawArgs mode go then return custom
-        if calleeStx.getKind == ``qedIdent && (calleeStx.getArg 0).getId.eraseMacroScopes == `url &&
-            rawArgs.size == 1 && rawArgs[0]!.getKind == ``qedCallArgPos && (rawArgs[0]!.getArg 0).getKind == ``qedLitStr then
-          let info := SourceInfo.fromRef stx
-          let strLit := (rawArgs[0]!.getArg 0).getArg 0
-          return ← finish ⟨Syntax.node info `Qed.Jsx.qedUrlLit #[calleeStx.getArg 0, Syntax.atom info "(", strLit, Syntax.atom info ")"]⟩
-        if !rawArgs.isEmpty && rawArgs.any (·.getKind == ``qedCallArgNamed) then
-          unless rawArgs.all (·.getKind == ``qedCallArgNamed) do
-            let calleeStr := stxSnippet calleeStx
-            let inCall := if calleeStr.isEmpty then "the same call" else s!"call `{calleeStr}(...)`"
-            return ← hooks.throwErr stx s!"cannot mix named (`field=val`) and positional arguments in {inCall}"
-          let tyTerm ← go .val calleeStx
-          let fIds : Array Ident := rawArgs.map (⟨·[0]⟩)
-          let fVals ← rawArgs.mapM fun a => do hooks.wrapNamedField (← go .val (a.getArg 2))
-          return ← `(({ $[$fIds:ident := $fVals:term],* } : $tyTerm))
-        let calleeTerm ← go .val calleeStx
-        let isPropAllCall := (mode == .propInv || mode == .propGuard) &&
-          ((calleeStx.getKind == ``qedProj && ((calleeStx.getArg 2).getId == `all || (calleeStx.getArg 2).getId == `any)) ||
-           (calleeStx.getKind == ``qedIdent &&
-             match (calleeStx.getArg 0).getId with | .str _ "all" | .str _ "any" => true | _ => false))
-        let argTerms ← rawArgs.mapM fun a => do
-          let uArg := unwrapParens1 (a.getArg 0)
-          let argMode := if isPropAllCall && (uArg.getKind == ``qedLam1 || uArg.getKind == ``qedLamN) then .propInv else .val
-          go argMode (a.getArg 0)
-        let callRes ← if argTerms.isEmpty then pure calleeTerm else `($calleeTerm $argTerms*)
-        finish callRes
+      | "qedCall" => lowerCallExpr hooks go finish mode stx
       | "qedNeg" => `(-($(← lowerValOp (stx.getArg 1))))
       | "qedMul" | "qedDiv" | "qedMod" | "qedAdd" | "qedSub" | "qedCat" =>
         let (a, b) := (← lowerValOp (stx.getArg 0), ← lowerValOp (stx.getArg 2))
@@ -634,59 +713,10 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
         | "qedMul" => `(($a) * ($b)) | "qedDiv" => `(($a) / ($b))
         | "qedMod" => `(($a) % ($b)) | "qedAdd" => `(($a) + ($b))
         | "qedSub" => `(($a) - ($b)) | _        => `(($a) ++ ($b))
-      | "qedCmp" =>
-        let isPropMode := mode == .propInv || mode == .propGuard
-        let lowerSingleCmp (lhsStx : Syntax) (opStr : String) (rhsStx : Syntax) : m Term := do
-          if opStr == "==" || opStr == "!=" || opStr == "is" || opStr == "is not" then
-            let isEq := opStr == "==" || opStr == "is"
-            let (lS, rS) := if isNoneExpr lhsStx && !isNoneExpr rhsStx then (rhsStx, lhsStx) else (lhsStx, rhsStx)
-            let (a, b) := (← lowerValOp lS, ← lowerValOp rS)
-            match isEq, mode with
-            | true,  .propInv   => `(($a) = ($b))
-            | true,  .propGuard => `(qedEqProp($a, $b))
-            | true,  _          => `(($a) == ($b))
-            | false, .propInv   => `(($a) ≠ ($b))
-            | false, .propGuard => `(¬ qedEqProp($a, $b))
-            | false, _          => `(($a) != ($b))
-          else if opStr == "in" || opStr == "not in" then
-            let (a, b, isIn) := (← lowerValOp lhsStx, ← lowerValOp rhsStx, opStr == "in")
-            if isPropMode then if isIn then `(Qed.Lang.QedMemProp.memProp ($a) ($b)) else `(¬ Qed.Lang.QedMemProp.memProp ($a) ($b))
-            else if isIn then `(Qed.Lang.QedMem.mem ($a) ($b)) else `(!(Qed.Lang.QedMem.mem ($a) ($b)))
-          else
-            let (a, b) := (← lowerValOp lhsStx, ← lowerValOp rhsStx)
-            let p ← match opStr with
-              | "<=" => `(($a) ≤ ($b)) | ">=" => `(($a) ≥ ($b))
-              | "<"  => `(($a) < ($b)) | _    => `(($a) > ($b))
-            if isPropMode then return p else `(decide ($p))
-        let mut prev := (stx.getArg 0)
-        let mut terms : Array Term := #[]
-        for lk in (stx.getArg 1).getArgs do
-          terms := terms.push (← lowerSingleCmp prev (cmpOpKind (lk.getArg 0)) (lk.getArg 1))
-          prev := (lk.getArg 1)
-        match terms.toList with
-        | []      => hooks.throwErr stx "empty comparison"
-        | t :: ts => ts.foldlM (init := t) fun acc x => if isPropMode then `($acc ∧ $x) else `($acc && $x)
+      | "qedCmp" => lowerCmpExpr hooks lowerValOp mode stx
       | "qedNot" =>
         if mode == .propInv || mode == .propGuard then `(¬ ($(← go mode (stx.getArg 1)))) else `(!($(← go .boolCond (stx.getArg 1))))
-      | "qedAnd" | "qedOr" =>
-        let isAnd := k == "qedAnd"
-        match mode with
-        | .propInv =>
-            let (a, b) := (← go .propInv (stx.getArg 0), ← go .propInv (stx.getArg 2))
-            if isAnd then `($a ∧ $b) else `($a ∨ $b)
-        | .propGuard =>
-            let (a, b) := (← go .propGuard (stx.getArg 0), ← go .propGuard (stx.getArg 2))
-            if exprHasIndex (stx.getArg 2) then
-              let h ← hooks.freshIdent (if isAnd then "_qedAnd" else "_qedOr")
-              if isAnd then `(Qed.Lang.QedAndProp ($a) (fun ($h:ident : $a) => $b))
-              else `(Qed.Lang.QedOrProp ($a) (fun ($h:ident : ¬ ($a)) => $b))
-            else if isAnd then `($a ∧ $b) else `($a ∨ $b)
-        | _ =>
-            let (a, b) := (← go .boolCond (stx.getArg 0), ← go .boolCond (stx.getArg 2))
-            if isAnd && exprHasIndex (stx.getArg 2) then
-              let h ← hooks.freshIdent "_qedAnd"
-              `(if $h:ident : ($a) = true then $b else false)
-            else if isAnd then `($a && $b) else `($a || $b)
+      | "qedAnd" | "qedOr" => lowerAndOrExpr hooks go (k == "qedAnd") mode stx
       | "qedImp" =>
         if mode == .propInv || mode == .propGuard then `($(← go mode (stx.getArg 0)) → $(← go mode (stx.getArg 2)))
         else `(!$(← go .boolCond (stx.getArg 0)) || $(← go .boolCond (stx.getArg 2)))
@@ -694,22 +724,7 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
         let (hIf, condT, thenT) := (← hooks.freshIdent "_qedIf", ← go .propGuard (stx.getArg 2), ← go mode (stx.getArg 0))
         let elseT ← lowerOptElse stx (stx.getArg 3) "conditional expression `a if cond else b` requires an `else` branch here"
         `(if $hIf:ident : $condT then $thenT else $elseT)
-      | "qedLam1" | "qedLamN" =>
-        let pEntries : Array (Syntax × Option Syntax) :=
-          if k == "qedLam1" then #[((stx.getArg 0), none)]
-          else (stx.getArg 1).getSepArgs.map fun p => ((p.getArg 0), if (p.getArg 1).getNumArgs == 2 then some ((p.getArg 1).getArg 1) else none)
-        let bodyStx := if k == "qedLam1" then (stx.getArg 2) else (stx.getArg 4)
-        let pNames := pEntries.filterMap fun (b, _) => if b.isIdent then some b.getId.toString else none
-        let body ← hooks.withLocals pNames (go (if mode == .propInv then .propInv else .val) bodyStx)
-        pEntries.foldrM (init := body) fun (b, tyOpt?) acc => do
-          match tyOpt? with
-          | some tyStx =>
-              let tyT ← hooks.lowerType tyStx
-              if b.isIdent then let bid : Ident := ⟨b⟩; `(fun ($bid:ident : $tyT) => $acc)
-              else `(fun (_ : $tyT) => $acc)
-          | none =>
-              if b.isIdent then let bid : Ident := ⟨b⟩; `(fun $bid:ident => $acc)
-              else `(fun _ => $acc)
+      | "qedLam1" | "qedLamN" => lowerLamExpr hooks go (k == "qedLam1") mode stx
       | "qedAllIn" | "qedAnyIn" =>
         let (bId, arrT) : Ident × Term := (⟨(stx.getArg 1)⟩, ← go .val (stx.getArg 3))
         let isPropMode := mode == .propInv || mode == .propGuard
@@ -778,3 +793,74 @@ def lowerSimpleQedExpr (mode : ExprMode) (stx : Syntax)
   } mode stx
 
 end Qed.Lang
+
+namespace Qed
+open Lean Meta Elab Tactic Command Term PrettyPrinter
+
+def qedLooksGenerated (n : Name) : Bool :=
+  match n with
+  | .str _ s =>
+      if ["_qed_render", "_qed_renderTag", "_qed_mount", "_qed_mountWithOpt"].contains s then false
+      else
+        n.isInternalDetail ||
+        ["casesOn", "recOn", "rec", "brecOn", "below", "ibelow", "noConfusion",
+         "noConfusionType", "toCtorIdx", "ofNat", "print", "parse", "toSeg", "fromSeg",
+         "toJson", "fromJson"].contains s
+          || s.startsWith "match_" || s.startsWith "eq_" || s.startsWith "inst" || s.startsWith "_wsKey_"
+          || s.endsWith "_key" || s.endsWith "_sub" || s.endsWith "_unsub" || s.endsWith "_send"
+  | _ => n.isInternalDetail
+
+def qedIsHelper (env : Environment) (n : Name) : Bool :=
+  let mod := match env.getModuleIdxFor? n with | some i => env.header.moduleNames[i]! | none => n
+  ![`Init, `Std, `Lean, `Qed].contains mod.getRoot
+    && (match env.find? n with | some (.defnInfo d) => !d.type.isConstOf `Qed.Style | _ => false)
+    && !qedLooksGenerated n
+
+def qedUnfoldHelperLoop (maxIters : Nat)
+    (keep : Environment → Name → MetaM Bool)
+    (extraLemmas : Array (TSyntax `Lean.Parser.Tactic.simpLemma) := #[])
+    (includeLCtx : Bool := false) (useSimpAll : Bool := false)
+    (tryRfl : Bool := false) : TacticM Unit := do
+  for _ in [0:maxIters] do
+    if (← getGoals).isEmpty then break
+    let env ← getEnv
+    let present ← withMainContext do
+      let mut cs := (← instantiateMVars (← getMainTarget)).getUsedConstants
+      if includeLCtx then
+        for ldecl in (← getLCtx) do
+          if !ldecl.isImplementationDetail then
+            for c in (← instantiateMVars ldecl.type).getUsedConstants do
+              if !cs.contains c then cs := cs.push c
+      cs.filterM (fun n => liftM (keep env n))
+    if present.isEmpty then
+      if useSimpAll && !extraLemmas.isEmpty then
+        try evalTactic (← `(tactic| simp_all only [$[$extraLemmas],*])) catch _ => pure ()
+      break
+    let uL ← present.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+    let combined := uL ++ extraLemmas
+    let tac ← match useSimpAll, includeLCtx, tryRfl with
+      | true,  _,     _     => `(tactic| simp_all only [$[$combined],*])
+      | false, true,  true  => `(tactic| (simp only [$[$combined],*] at *; try rfl))
+      | false, true,  false => `(tactic| simp only [$[$combined],*] at *)
+      | false, false, true  => `(tactic| (simp only [$[$combined],*]; try rfl))
+      | false, false, false => `(tactic| simp only [$[$combined],*])
+    let ok ← try evalTactic tac; pure true catch _ => pure false
+    unless ok do break
+
+def mkConjBody (clauses : Array Term) : CommandElabM Term := do
+  let props ← clauses.mapM fun c => `(($c : Prop))
+  match props.toList with
+  | []      => `(True)
+  | p :: ps => ps.foldlM (init := p) fun acc x => `($acc ∧ $x)
+
+def extractInvPred (id : Ident) : TermElabM (TSyntax `term) := do
+  let cTy := (← getConstInfo (← realizeGlobalConstNoOverload id)).type
+  let stepTy := if cTy.isAppOfArity ``And 2 then cTy.appArg! else cTy
+  forallTelescope stepTy fun args _ => do
+    let some hIdx ← (List.range args.size).findM? fun i => do
+      return i ≥ 2 && (← isProp (← inferType args[i]!))
+      | throwErrorAt id
+          "`{id}` doesn't look like a state invariant, so its predicate can't be inferred; write it explicitly (`<pred> for_each … using {id}`)."
+    delab (← mkLambdaFVars #[args[hIdx - 2]!] (← inferType args[hIdx]!)).eta
+
+end Qed

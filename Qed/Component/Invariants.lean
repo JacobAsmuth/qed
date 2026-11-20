@@ -124,15 +124,16 @@ private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : 
         let congr ← `(Qed.canonical_congr_pred ($appViewEqId m)
           (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical, Qed.tagHasOneOf_canonical])
           (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical, Qed.tagHasOneOf_canonical]))
+        let appViewFn := mkIdent `Qed.App.view
         match assume? with
         | some a =>
             let P ← if a.raw.isIdent then try liftTermElabM (extractInvPred ⟨a.raw⟩) catch _ => pure a else pure a
             elabCommand (← `(command| set_option linter.unusedSimpArgs false in
-              theorem $appInvId : ∀ m, ($P) $stateOfM → ($vPred) (Qed.App.view $appId m) = true :=
+              theorem $appInvId : ∀ m, ($P) $stateOfM → ($vPred) ($appViewFn $appId m) = true :=
                 fun m ha => ($congr).trans ($invId $stateOfM ha)))
         | none =>
             elabCommand (← `(command| set_option linter.unusedSimpArgs false in
-              theorem $appInvId : ∀ m, ($vPred) (Qed.App.view $appId m) = true :=
+              theorem $appInvId : ∀ m, ($vPred) ($appViewFn $appId m) = true :=
                 fun m => ($congr).trans ($invId $stateOfM)))
       catch _ => set saved
 

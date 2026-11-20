@@ -522,6 +522,111 @@ private def isSomePlaceholder (stx : Syntax) : Bool :=
   (u.getArg 2).getSepArgs.size == 1 && (u.getArg 2).getSepArgs[0]!.getKind == ``qedCallArgPos &&
   isPlaceholder (u.getArg 2).getSepArgs[0]![0]
 
+private def rewriteHoistedChild (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax)
+    (tag : String) (cInfo : ComponentInfo) (attrNames : Array String)
+    (rewrittenAttrs : Array Syntax) (kids? : Option Syntax) : CommandElabM (Option Syntax) := do
+  let mustHoist := !cInfo.hasLocalDef || attrNames.any (·.startsWith "bind:") ||
+    cInfo.hasChildren || !cInfo.slotNames.isEmpty
+  unless cInfo.kind == .stateful && cInfo.mountable &&
+      (mustHoist || (!inLambda && !attrNames.contains "key" && !attrNames.contains "initial")) do
+    return none
+  if inLambda && mustHoist then
+    throwErrorAt stx s!"<{tag}> uses effects, `Html` props, `children`, or `bind:` and cannot be dynamically mounted inside a loop lambda; hoist its state into the parent or use `collection`"
+  let curH ← ctx.hoisted.get
+  let subName := Name.mkSimple s!"_sub_{curH.size}"
+  let subFieldId := mkIdentFrom stx subName
+  let mut dataProps : Array (Ident × Term) := #[]
+  let mut outArms   : Array OutArm := #[]
+  let mut keptAttrs : Array Syntax := #[]
+  for a in rewrittenAttrs do
+    if a.getKind == ``Qed.Jsx.attrNamed then
+      let aname := atomStr (a.getArg 0)
+      let vT : Term ← if (a.getArg 1).getNumArgs == 0 then `(Bool.true)
+        else liftMacroM <| Qed.Jsx.expandAttrVal (a.getArg 1) (`(""))
+      if let some ev := cInfo.events.find? (·.name.toString == aname) then
+        outArms := outArms.push { ctor := ev.name, arity := ev.arity, handler := vT }
+      else if aname.startsWith "bind:" then
+        let bStr := (aname.drop 5).toString
+        let valPart ← `(($vT).1)
+        dataProps := dataProps.push (mkIdentFrom (a.getArg 0) (Name.mkSimple bStr), valPart)
+        outArms := outArms.push { ctor := Name.mkSimple s!"set_{bStr}", arity := 1, handler := ← `(($vT).2) }
+        keptAttrs := keptAttrs.push (mkJsxAttrExpr bStr valPart)
+      else
+        let pId := mkIdentFrom (a.getArg 0) (Name.mkSimple aname)
+        if cInfo.propNames.contains pId.getId then dataProps := dataProps.push (pId, vT)
+        keptAttrs := keptAttrs.push a
+    else
+      keptAttrs := keptAttrs.push a
+  ctx.hoisted.set (curH.push {
+    fieldId := subFieldId, ctorName := subName, info := cInfo, dataProps, outArms })
+  let subRoute ← wrapUnaryMsg ctx.wrapMsg? ⟨mkIdent (ctx.msgPath ++ subName)⟩
+  return some (rebuildJsxEl stx (keptAttrs.push (mkJsxAttrExpr "_hoist" (← `(($subRoute, $subFieldId))))) kids?)
+
+private def rewriteSchemaFormElement (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax)
+    (tag : String) (sInfo : SchemaFormInfo) (attrNames : Array String)
+    (rewrittenPairs : Array (Bool × Syntax)) (kids? : Option Syntax)
+    (origBindField? : Option Ident) : CommandElabM (Sum Syntax (Array (Bool × Syntax))) := do
+  let schemaFull := sInfo.fullName.getPrefix
+  let hasBind := attrNames.contains "bind"
+  let mut pairs := rewrittenPairs
+  let mut draftField? := origBindField?
+  if !hasBind then
+    unless ctx.allowHoist do
+      throwErrorAt stx s!"<{tag}> requires `bind=\{draft}` here"
+    if inLambda then
+      throwErrorAt stx s!"<{tag}> without `bind=` hoists internal draft state and cannot be mounted inside a loop lambda; declare `state draft = ...` and pass `bind=\{draft}`"
+    let curFD ← ctx.formDrafts.get
+    let fName := Name.mkSimple s!"_form_{curFD.size}"
+    let fId := mkIdentFrom stx fName
+    let draftTy := mkIdentFrom stx (`_root_ ++ schemaFull ++ `Draft)
+    let draftEmpty := mkIdentFrom stx (`_root_ ++ schemaFull ++ `Draft ++ `empty)
+    ctx.formDrafts.set (curFD.push { id := fId, ty? := some draftTy, def? := some draftEmpty, ty := draftTy })
+    let editCtor ← registerSite ctx.sites #[(fName, none)] none
+    let editFn ← wrapUnaryMsg ctx.wrapMsg? ⟨mkIdent (ctx.msgPath ++ editCtor)⟩
+    pairs := pairs.push (false, mkJsxAttrExpr "bind" (← `(($fId, $editFn))))
+    draftField? := some fId
+  if let some (_, resetAttr) := pairs.find? fun (_, a) => a.getKind == ``Qed.Jsx.attrNamed && atomStr (a.getArg 0) == "reset" then
+    unless ctx.allowHoist do
+      throwErrorAt resetAttr s!"<{tag}>: `reset` is only supported inside a `component` view"
+    if inLambda then
+      throwErrorAt stx s!"<{tag}> with `reset` cannot be mounted inside a loop lambda"
+    let some dfId := draftField?
+      | throwErrorAt stx s!"<{tag} reset>: `reset` requires either omitted `bind` or `bind=\{stateField}`"
+    if hasBind && !ctx.stateFields.contains dfId.getId.eraseMacroScopes then
+      throwErrorAt stx s!"<{tag} reset>: `reset` requires `bind=\{stateField}` to refer to a `state` field"
+    let resetCond : Term ←
+      if (resetAttr.getArg 1).getNumArgs == 0 then `(Bool.true)
+      else liftMacroM <| Qed.Jsx.expandAttrVal (resetAttr.getArg 1) (`(Bool.true))
+    let some (_, subAttr) := pairs.find? fun (_, a) => a.getKind == ``Qed.Jsx.attrNamed && atomStr (a.getArg 0) == "onSubmit"
+      | throwErrorAt stx s!"<{tag}> requires `onSubmit=\{...}`"
+    unless (subAttr.getArg 1).getNumArgs == 2 do
+      throwErrorAt subAttr s!"<{tag}>: `onSubmit` requires a value"
+    let subVal ← liftMacroM <| Qed.Jsx.expandAttrVal (subAttr.getArg 1) (`(""))
+    let handler ← `(($subVal : _ → $(mkIdent ctx.msgPath)))
+    let mut ctxProps : Array (Syntax × String × Term) := #[]
+    for (_, a) in pairs do
+      if a.getKind == ``Qed.Jsx.attrNamed && (a.getArg 1).getNumArgs == 2 then
+        let nm := atomStr (a.getArg 0)
+        if !["key", "bind", "reset", "onSubmit"].contains nm then
+          ctxProps := ctxProps.push ((a.getArg 0), nm, ← liftMacroM <| Qed.Jsx.expandAttrVal (a.getArg 1) (`("")))
+    let ctxArgs ← liftMacroM <| resolveSchemaCtxArgs stx tag sInfo.ctxBinders ctxProps (checkUnknown := false)
+    let parseCall ← ctxArgs.foldlM (init := (mkIdent (`_root_ ++ schemaFull ++ `parse) : Term)) fun acc ca => `($acc $ca)
+    let curRF ← ctx.resetForms.get
+    let ctorName := Name.mkSimple s!"_form_reset_{curRF.size}"
+    ctx.resetForms.set (curRF.push { ctorName, draftField := dfId, schemaName := schemaFull, parseCall, resetCond, handler })
+    let cid : Term := ⟨mkIdent (ctx.msgPath ++ ctorName)⟩
+    let resetMsg ← match ctx.wrapMsg? with | some w => `($w $cid) | none => pure cid
+    let resetSub ← `(fun _ => $resetMsg)
+    let finalAttrs := pairs.filterMap fun (_, a) =>
+      if a.getKind == ``Qed.Jsx.attrNamed then
+        let nm := atomStr (a.getArg 0)
+        if nm == "reset" then none
+        else if nm == "onSubmit" then some (mkJsxAttrExpr "onSubmit" resetSub)
+        else some a
+      else some a
+    return .inl (rebuildJsxEl stx finalAttrs kids?)
+  return .inr pairs
+
 private def rewriteUpperElement (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax)
     (tag : String) (rewrittenPairs : Array (Bool × Syntax)) (kids? : Option Syntax)
     (origBindField? : Option Ident := none) : CommandElabM Syntax := do
@@ -543,102 +648,14 @@ private def rewriteUpperElement (ctx : RewriteCtx) (inLambda : Bool) (stx : Synt
       return rebuildJsxEl stx (rewrittenAttrs.push (mkJsxAttrExpr "onMsg" routeExpr)) kids?
   if ctx.allowHoist && !hasState then
     if let some cInfo ← liftCoreM (lookupComponent? cName) then
-      let mustHoist := !cInfo.hasLocalDef || attrNames.any (·.startsWith "bind:") ||
-        cInfo.hasChildren || !cInfo.slotNames.isEmpty
-      if cInfo.kind == .stateful && cInfo.mountable &&
-          (mustHoist || (!inLambda && !attrNames.contains "key" && !attrNames.contains "initial")) then
-        if inLambda && mustHoist then
-          throwErrorAt stx s!"<{tag}> uses effects, `Html` props, `children`, or `bind:` and cannot be dynamically mounted inside a loop lambda; hoist its state into the parent or use `collection`"
-        let curH ← ctx.hoisted.get
-        let subName := Name.mkSimple s!"_sub_{curH.size}"
-        let subFieldId := mkIdentFrom stx subName
-        let mut dataProps : Array (Ident × Term) := #[]
-        let mut outArms   : Array OutArm := #[]
-        let mut keptAttrs : Array Syntax := #[]
-        for a in rewrittenAttrs do
-          if a.getKind == ``Qed.Jsx.attrNamed then
-            let aname := atomStr (a.getArg 0)
-            let vT : Term ← if (a.getArg 1).getNumArgs == 0 then `(Bool.true)
-              else liftMacroM <| Qed.Jsx.expandAttrVal (a.getArg 1) (`(""))
-            if let some ev := cInfo.events.find? (·.name.toString == aname) then
-              outArms := outArms.push { ctor := ev.name, arity := ev.arity, handler := vT }
-            else if aname.startsWith "bind:" then
-              let bStr := (aname.drop 5).toString
-              let valPart ← `(($vT).1)
-              dataProps := dataProps.push (mkIdentFrom (a.getArg 0) (Name.mkSimple bStr), valPart)
-              outArms := outArms.push { ctor := Name.mkSimple s!"set_{bStr}", arity := 1, handler := ← `(($vT).2) }
-              keptAttrs := keptAttrs.push (mkJsxAttrExpr bStr valPart)
-            else
-              let pId := mkIdentFrom (a.getArg 0) (Name.mkSimple aname)
-              if cInfo.propNames.contains pId.getId then dataProps := dataProps.push (pId, vT)
-              keptAttrs := keptAttrs.push a
-          else
-            keptAttrs := keptAttrs.push a
-        ctx.hoisted.set (curH.push {
-          fieldId := subFieldId, ctorName := subName, info := cInfo, dataProps, outArms })
-        let subRoute ← wrapUnaryMsg ctx.wrapMsg? ⟨mkIdent (ctx.msgPath ++ subName)⟩
-        return rebuildJsxEl stx (keptAttrs.push (mkJsxAttrExpr "_hoist" (← `(($subRoute, $subFieldId))))) kids?
+      if let some hoistedStx ← rewriteHoistedChild ctx inLambda stx tag cInfo attrNames rewrittenAttrs kids? then
+        return hoistedStx
   let mut pairs := rewrittenPairs
   if tag.endsWith ".Form" then
     if let some sInfo ← liftCoreM (lookupSchemaForm? cName) then
-      let schemaFull := sInfo.fullName.getPrefix
-      let hasBind := attrNames.contains "bind"
-      let mut draftField? := origBindField?
-      if !hasBind then
-        unless ctx.allowHoist do
-          throwErrorAt stx s!"<{tag}> requires `bind=\{draft}` here"
-        if inLambda then
-          throwErrorAt stx s!"<{tag}> without `bind=` hoists internal draft state and cannot be mounted inside a loop lambda; declare `state draft = ...` and pass `bind=\{draft}`"
-        let curFD ← ctx.formDrafts.get
-        let fName := Name.mkSimple s!"_form_{curFD.size}"
-        let fId := mkIdentFrom stx fName
-        let draftTy := mkIdentFrom stx (`_root_ ++ schemaFull ++ `Draft)
-        let draftEmpty := mkIdentFrom stx (`_root_ ++ schemaFull ++ `Draft ++ `empty)
-        ctx.formDrafts.set (curFD.push { id := fId, ty? := some draftTy, def? := some draftEmpty, ty := draftTy })
-        let editCtor ← registerSite ctx.sites #[(fName, none)] none
-        let editFn ← wrapUnaryMsg ctx.wrapMsg? ⟨mkIdent (ctx.msgPath ++ editCtor)⟩
-        pairs := pairs.push (false, mkJsxAttrExpr "bind" (← `(($fId, $editFn))))
-        draftField? := some fId
-      if let some (_, resetAttr) := pairs.find? fun (_, a) => a.getKind == ``Qed.Jsx.attrNamed && atomStr (a.getArg 0) == "reset" then
-        unless ctx.allowHoist do
-          throwErrorAt resetAttr s!"<{tag}>: `reset` is only supported inside a `component` view"
-        if inLambda then
-          throwErrorAt stx s!"<{tag}> with `reset` cannot be mounted inside a loop lambda"
-        let some dfId := draftField?
-          | throwErrorAt stx s!"<{tag} reset>: `reset` requires either omitted `bind` or `bind=\{stateField}`"
-        if hasBind && !ctx.stateFields.contains dfId.getId.eraseMacroScopes then
-          throwErrorAt stx s!"<{tag} reset>: `reset` requires `bind=\{stateField}` to refer to a `state` field"
-        let resetCond : Term ←
-          if (resetAttr.getArg 1).getNumArgs == 0 then `(Bool.true)
-          else liftMacroM <| Qed.Jsx.expandAttrVal (resetAttr.getArg 1) (`(Bool.true))
-        let some (_, subAttr) := pairs.find? fun (_, a) => a.getKind == ``Qed.Jsx.attrNamed && atomStr (a.getArg 0) == "onSubmit"
-          | throwErrorAt stx s!"<{tag}> requires `onSubmit=\{...}`"
-        unless (subAttr.getArg 1).getNumArgs == 2 do
-          throwErrorAt subAttr s!"<{tag}>: `onSubmit` requires a value"
-        let subVal ← liftMacroM <| Qed.Jsx.expandAttrVal (subAttr.getArg 1) (`(""))
-        let handler ← `(($subVal : _ → $(mkIdent ctx.msgPath)))
-        let mut ctxProps : Array (Syntax × String × Term) := #[]
-        for (_, a) in pairs do
-          if a.getKind == ``Qed.Jsx.attrNamed && (a.getArg 1).getNumArgs == 2 then
-            let nm := atomStr (a.getArg 0)
-            if !["key", "bind", "reset", "onSubmit"].contains nm then
-              ctxProps := ctxProps.push ((a.getArg 0), nm, ← liftMacroM <| Qed.Jsx.expandAttrVal (a.getArg 1) (`("")))
-        let ctxArgs ← liftMacroM <| resolveSchemaCtxArgs stx tag sInfo.ctxBinders ctxProps (checkUnknown := false)
-        let parseCall ← ctxArgs.foldlM (init := (mkIdent (`_root_ ++ schemaFull ++ `parse) : Term)) fun acc ca => `($acc $ca)
-        let curRF ← ctx.resetForms.get
-        let ctorName := Name.mkSimple s!"_form_reset_{curRF.size}"
-        ctx.resetForms.set (curRF.push { ctorName, draftField := dfId, schemaName := schemaFull, parseCall, resetCond, handler })
-        let cid : Term := ⟨mkIdent (ctx.msgPath ++ ctorName)⟩
-        let resetMsg ← match ctx.wrapMsg? with | some w => `($w $cid) | none => pure cid
-        let resetSub ← `(fun _ => $resetMsg)
-        let finalAttrs := pairs.filterMap fun (_, a) =>
-          if a.getKind == ``Qed.Jsx.attrNamed then
-            let nm := atomStr (a.getArg 0)
-            if nm == "reset" then none
-            else if nm == "onSubmit" then some (mkJsxAttrExpr "onSubmit" resetSub)
-            else some a
-          else some a
-        return rebuildJsxEl stx finalAttrs kids?
+      match ← rewriteSchemaFormElement ctx inLambda stx tag sInfo attrNames pairs kids? origBindField? with
+      | .inl doneStx => return doneStx
+      | .inr pairs'  => pairs := pairs'
   let evList : Array (String × Nat) ← do
     if let some cInfo ← liftCoreM (lookupComponent? cName) then
       pure (cInfo.events.map fun sig => (sig.name.toString, sig.arity))

@@ -424,14 +424,15 @@ private def editDistLe2 (a b : String) : Bool :=
   let as := a.toList; let bs := b.toList
   if as.length + 2 < bs.length || bs.length + 2 < as.length then false
   else
-    let rec go : List Char → List Char → Nat → Bool
-      | [], ys, k => ys.length ≤ k
-      | xs, [], k => xs.length ≤ k
-      | x :: xs, y :: ys, 0 => x == y && go xs ys 0
-      | x :: xs, y :: ys, k + 1 =>
-          if x == y then go xs ys (k + 1)
-          else go xs ys k || go (x :: xs) ys k || go xs (y :: ys) k
-    go as bs 2
+    let rec go : Nat → List Char → List Char → Nat → Bool
+      | 0, _, _, _ => false
+      | _, [], ys, k => ys.length ≤ k
+      | _, xs, [], k => xs.length ≤ k
+      | f + 1, x :: xs, y :: ys, 0 => x == y && go f xs ys 0
+      | f + 1, x :: xs, y :: ys, k + 1 =>
+          if x == y then go f xs ys (k + 1)
+          else go f xs ys k || go f (x :: xs) ys k || go f xs (y :: ys) k
+    go (as.length + bs.length + 1) as bs 2
 
 private def suggestProp (bad : String) : Option String :=
   knownCssProps.find? (editDistLe2 bad ·)
@@ -476,6 +477,66 @@ private def checkTokenKindForProp (ref : Syntax) (prop : String) (tokInfo : Toke
   if prop == "animation-duration" && tokInfo.kind != "time" then
     throwErrorAt ref s!"type mismatch in CSS `{prop}`: token `{tokInfo.fullName}` has kind `{tokInfo.kind}`, expected `time`"
 
+private def checkStrictTokensForProp (ref : Syntax) (p : String) (resolvedAtoms : List String) : CoreM Unit := do
+  for a in resolvedAtoms do
+    if colorProps.contains p then
+      let allowed := a.startsWith "var(" || a == "transparent" || a == "currentColor" ||
+                     a == "currentcolor" || commonGlobalKw.contains a
+      unless allowed do
+        throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw color `{a}` is disallowed; use a `theme` color token instead"
+    if lengthProps.contains p then
+      let allowed := a.startsWith "var(" || a == "0" || a == "auto" || a == "none" ||
+                     a == "100%" || commonGlobalKw.contains a
+      unless allowed do
+        throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw length `{a}` is disallowed; use a `theme` length token instead"
+    if borderShorthandProps.contains p then
+      if a.startsWith "#" || a.startsWith "rgb(" || a.startsWith "rgba(" || a.startsWith "hsl(" || a.startsWith "oklch(" then
+        throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw color `{a}` is disallowed; use a `theme` color token instead"
+
+private def validatePropValue (ref : Syntax) (p resolvedVal : String) (resolvedAtoms : List String) : CoreM Unit := do
+  if let some allowed := enumPropValues p then
+    for a in resolvedAtoms do
+      unless allowed.contains a || commonGlobalKw.contains a || a.startsWith "var(" do
+        throwErrorAt ref s!"invalid value `{a}` for CSS property `{p}` (expected one of: {String.intercalate ", " allowed})"
+  else if colorProps.contains p then
+    if resolvedAtoms.length != 1 then
+      throwErrorAt ref s!"CSS color property `{p}` expects a single color value, got `{resolvedVal}`"
+    match validateColorLiteral resolvedAtoms.head! with
+    | .ok _ => pure ()
+    | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
+  else if lengthProps.contains p then
+    for a in resolvedAtoms do
+      unless isValidLenAtom a do
+        throwErrorAt ref s!"invalid length `{a}` for CSS property `{p}` (use a unit like `px`, `rem`, `em`, `%`, `vh`, `vw`, `0`, `auto`, `calc(...)`, or a `len` token)"
+  else if borderShorthandProps.contains p then
+    if resolvedAtoms == ["none"] || resolvedAtoms == ["0"] || resolvedAtoms.all (fun a => commonGlobalKw.contains a || a.startsWith "var(") then
+      pure ()
+    else if resolvedAtoms.length == 3 then
+      let w := resolvedAtoms[0]!; let s := resolvedAtoms[1]!; let c := resolvedAtoms[2]!
+      unless isValidLenAtom w do
+        throwErrorAt ref s!"in `{p}`: invalid border width `{w}`"
+      unless ["solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset", "none", "hidden"].contains s || s.startsWith "var(" do
+        throwErrorAt ref s!"in `{p}`: invalid border style `{s}`"
+      match validateColorLiteral c with
+      | .ok _ => pure ()
+      | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
+    else
+      throwErrorAt ref s!"`{p}` expects `none`, `0`, or `<width> <style> <color>` (e.g. `1px solid #ddd`), got `{resolvedVal}`"
+  else if p == "animation-duration" || p == "transition-duration" then
+    for a in resolvedAtoms do
+      unless isValidTimeAtom a do
+        throwErrorAt ref s!"invalid duration `{a}` for `{p}` (expected e.g. `200ms` or `0.3s`)"
+  else
+    -- Still validate any inline `#hex` or `rgb(...)` embedded in shorthand properties like `box-shadow` or `background`
+    for a in resolvedAtoms do
+      if a.startsWith "#" && !Qed.isValidHexColor a then
+        throwErrorAt ref s!"in `{p}`: invalid hex color `{a}`"
+      if let some (fn, args) := parseFuncCall? a then
+        if fn == "rgb" || fn == "rgba" then
+          match validateRgbArgs fn args with
+          | .ok _ => pure ()
+          | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
+
 private def resolveAndValidateDecl (ref : Syntax) (env : Environment) (currNs : Name)
     (openDecls : List OpenDecl) (strictTokens : Bool) (prop rawVal : String) :
     CoreM ResolvedCssValue := do
@@ -517,66 +578,10 @@ private def resolveAndValidateDecl (ref : Syntax) (env : Environment) (currNs : 
       outAtoms := outAtoms.push a
   let resolvedVal := String.intercalate " " outAtoms.toList
   let resolvedAtoms := outAtoms.toList
-  -- Strict token mode check (forbids raw colors and raw non-zero lengths)
   if strictTokens && !isCustomProp then
-    for a in resolvedAtoms do
-      if colorProps.contains p then
-        let allowed := a.startsWith "var(" || a == "transparent" || a == "currentColor" ||
-                       a == "currentcolor" || commonGlobalKw.contains a
-        unless allowed do
-          throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw color `{a}` is disallowed; use a `theme` color token instead"
-      if lengthProps.contains p then
-        let allowed := a.startsWith "var(" || a == "0" || a == "auto" || a == "none" ||
-                       a == "100%" || commonGlobalKw.contains a
-        unless allowed do
-          throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw length `{a}` is disallowed; use a `theme` length token instead"
-      if borderShorthandProps.contains p then
-        if a.startsWith "#" || a.startsWith "rgb(" || a.startsWith "rgba(" || a.startsWith "hsl(" || a.startsWith "oklch(" then
-          throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw color `{a}` is disallowed; use a `theme` color token instead"
-  -- Validate property values by category
+    checkStrictTokensForProp ref p resolvedAtoms
   if !isCustomProp then
-    if let some allowed := enumPropValues p then
-      for a in resolvedAtoms do
-        unless allowed.contains a || commonGlobalKw.contains a || a.startsWith "var(" do
-          throwErrorAt ref s!"invalid value `{a}` for CSS property `{p}` (expected one of: {String.intercalate ", " allowed})"
-    else if colorProps.contains p then
-      if resolvedAtoms.length != 1 then
-        throwErrorAt ref s!"CSS color property `{p}` expects a single color value, got `{resolvedVal}`"
-      match validateColorLiteral resolvedAtoms.head! with
-      | .ok _ => pure ()
-      | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
-    else if lengthProps.contains p then
-      for a in resolvedAtoms do
-        unless isValidLenAtom a do
-          throwErrorAt ref s!"invalid length `{a}` for CSS property `{p}` (use a unit like `px`, `rem`, `em`, `%`, `vh`, `vw`, `0`, `auto`, `calc(...)`, or a `len` token)"
-    else if borderShorthandProps.contains p then
-      if resolvedAtoms == ["none"] || resolvedAtoms == ["0"] || resolvedAtoms.all (fun a => commonGlobalKw.contains a || a.startsWith "var(") then
-        pure ()
-      else if resolvedAtoms.length == 3 then
-        let w := resolvedAtoms[0]!; let s := resolvedAtoms[1]!; let c := resolvedAtoms[2]!
-        unless isValidLenAtom w do
-          throwErrorAt ref s!"in `{p}`: invalid border width `{w}`"
-        unless ["solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset", "none", "hidden"].contains s || s.startsWith "var(" do
-          throwErrorAt ref s!"in `{p}`: invalid border style `{s}`"
-        match validateColorLiteral c with
-        | .ok _ => pure ()
-        | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
-      else
-        throwErrorAt ref s!"`{p}` expects `none`, `0`, or `<width> <style> <color>` (e.g. `1px solid #ddd`), got `{resolvedVal}`"
-    else if p == "animation-duration" || p == "transition-duration" then
-      for a in resolvedAtoms do
-        unless isValidTimeAtom a do
-          throwErrorAt ref s!"invalid duration `{a}` for `{p}` (expected e.g. `200ms` or `0.3s`)"
-    else
-      -- Still validate any inline `#hex` or `rgb(...)` embedded in shorthand properties like `box-shadow` or `background`
-      for a in resolvedAtoms do
-        if a.startsWith "#" && !Qed.isValidHexColor a then
-          throwErrorAt ref s!"in `{p}`: invalid hex color `{a}`"
-        if let some (fn, args) := parseFuncCall? a then
-          if fn == "rgb" || fn == "rgba" then
-            match validateRgbArgs fn args with
-            | .ok _ => pure ()
-            | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
+    validatePropValue ref p resolvedVal resolvedAtoms
   let extraTokens := Qed.extractVarNames resolvedVal
   return {
     cssText    := resolvedVal

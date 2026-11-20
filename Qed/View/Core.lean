@@ -511,11 +511,21 @@ mutual
     | text _ => rfl
     | dyn _ => rfl
     | element t as ks =>
-        simp [View.mapScope, View.render, List.map_map, Function.comp_def, View.renderEach_mapScopeEach f ks s']
+        show Html.element t ((as.map (VAttr.mapScope f)).map (VAttr.eval s'))
+          (View.renderEach (View.mapScopeEach f ks) s') = _
+        rw [List.map_map, View.renderEach_mapScopeEach f ks s']
+        have h : ((VAttr.eval s' : VAttr σ' msg → Attr msg) ∘ VAttr.mapScope f) = VAttr.eval (f s') :=
+          funext fun va => VAttr.eval_mapScope f s' va
+        rw [h]; rfl
     | ifElse cond y n =>
-        simp [View.mapScope, View.render, View.render_mapScope f y s', View.render_mapScope f n s']
+        show (if cond (f s') then View.render (y.mapScope f) s' else View.render (n.mapScope f) s') = _
+        rw [View.render_mapScope f y s', View.render_mapScope f n s']; rfl
     | keyedList t as _ _ _ _ rh _ =>
-        simp [View.mapScope, View.render, List.map_map, Function.comp_def]
+        show Html.element t ((as.map (VAttr.mapScope f)).map (VAttr.eval s')) (rh (f s')) = _
+        rw [List.map_map]
+        have h : ((VAttr.eval s' : VAttr σ' msg → Attr msg) ∘ VAttr.mapScope f) = VAttr.eval (f s') :=
+          funext fun va => VAttr.eval_mapScope f s' va
+        rw [h]; rfl
     | static _ => rfl
     | dynNode _ => rfl
     | memo _ => rfl
@@ -525,7 +535,8 @@ mutual
     cases vs with
     | nil => rfl
     | cons k ks =>
-        simp [View.mapScopeEach, View.renderEach, View.render_mapScope f k s', View.renderEach_mapScopeEach f ks s']
+        show View.render (k.mapScope f) s' :: View.renderEach (View.mapScopeEach f ks) s' = _
+        rw [View.render_mapScope f k s', View.renderEach_mapScopeEach f ks s']; rfl
 end
 
 instance : CoeFun (View σ msg) (fun _ => σ → Html msg) := ⟨View.render⟩
@@ -707,14 +718,14 @@ def renderSigAttrs (s : σ) (pre : String) : List (VAttr σ msg) → Nat → Nat
       Attr.validList (renderSigAttrs s pre attrs n en).1 = Attr.validList (attrs.map (VAttr.eval s))
   | [], _, _ => rfl
   | va :: rest, n, en => by
-      cases va <;> simp [renderSigAttrs, VAttr.eval, Attr.valid, Attr.validList_renderSigAttrs s pre rest]
+      cases va <;> exact congrArg (_ && ·) (Attr.validList_renderSigAttrs s pre rest _ _)
 
 @[simp] theorem Attr.hasLocalCell_renderSigAttrs (s : σ) (pre : String) :
     ∀ (attrs : List (VAttr σ msg)) (n en : Nat),
       Attr.hasLocalCell (renderSigAttrs s pre attrs n en).1 = Attr.hasLocalCell (attrs.map (VAttr.eval s))
   | [], _, _ => rfl
   | va :: rest, n, en => by
-      cases va <;> simp [renderSigAttrs, VAttr.eval, Attr.hasLocalCell_renderSigAttrs s pre rest]
+      cases va <;> exact congrArg (_ || ·) (Attr.hasLocalCell_renderSigAttrs s pre rest _ _)
 
 mutual
   def View.renderSig : View σ msg → σ → String → Nat → (en : Nat := 0) → Html msg × Nat × Nat
@@ -759,33 +770,33 @@ end
   | va :: rest, n, en => by
       cases va with
       | stat a =>
-          simp only [renderSigAttrs, List.map, VAttr.eval, List.filterMap]
-          cases Attr.canonical a <;> simp [renderSigAttrs_canonical s pre rest n en]
+          dsimp only [renderSigAttrs, List.map, VAttr.eval, List.filterMap]
+          cases Attr.canonical a <;>
+            simp only [renderSigAttrs_canonical s pre rest n en]
       | bind f =>
-          simp only [renderSigAttrs, List.map, VAttr.eval, List.filterMap]
-          cases Attr.canonical (f s) <;> simp [renderSigAttrs_canonical s pre rest n en]
+          dsimp only [renderSigAttrs, List.map, VAttr.eval, List.filterMap]
+          cases Attr.canonical (f s) <;>
+            simp only [renderSigAttrs_canonical s pre rest n en]
       | dynVal attr get =>
-          simp [renderSigAttrs, VAttr.eval, Attr.canonical,
-                renderSigAttrs_canonical s pre rest (n + 1) en]
+          exact congrArg (Attr.attr attr (get s) :: ·) (renderSigAttrs_canonical s pre rest (n + 1) en)
       | dynOn ev get =>
-          simp [renderSigAttrs, VAttr.eval, Attr.canonical,
-                renderSigAttrs_canonical s pre rest n (en + 1)]
+          exact congrArg (Attr.on ev (get s) :: ·) (renderSigAttrs_canonical s pre rest n (en + 1))
 
 @[simp] theorem onlySignalBind_renderSigAttrs (s : σ) (pre : String) :
     ∀ (attrs : List (VAttr σ msg)) (n en : Nat),
       onlySignalBind (renderSigAttrs s pre attrs n en).1 =
         onlySignalBind (attrs.map (VAttr.eval s))
   | [], _, _ => rfl
-  | [va], _, _ => by cases va <;> simp [renderSigAttrs, VAttr.eval, onlySignalBind]
+  | [va], _, _ => by cases va <;> rfl
   | va1 :: va2 :: rest, n, en => by
       cases va1 with
       | stat a =>
-          simp only [renderSigAttrs, List.map, VAttr.eval]
           cases a with
           | key _ => exact onlySignalBind_renderSigAttrs s pre (va2 :: rest) n en
           | _ => rfl
       | bind f =>
-          simp only [renderSigAttrs, List.map, VAttr.eval]
+          show onlySignalBind (f s :: (renderSigAttrs s pre (va2 :: rest) n en).1) =
+               onlySignalBind (f s :: (va2 :: rest).map (VAttr.eval s))
           generalize f s = a
           cases a with
           | key _ => exact onlySignalBind_renderSigAttrs s pre (va2 :: rest) n en
@@ -800,12 +811,20 @@ mutual
     | .text _, _, _, _, _ => rfl
     | .dyn _, _, _, _, _ => rfl
     | .element tag attrs kids, s, pre, n, en => by
-        simp only [View.renderSig, View.render, Html.canonical, mkCanonicalElem,
-              renderSigAttrs_canonical, onlySignalBind_renderSigAttrs,
-              View.canonicalList_renderSigList kids s pre]
+        show mkCanonicalElem tag (renderSigAttrs s pre attrs n en).1
+            (Html.canonicalList (View.renderSigList kids s pre _ _).1) =
+          mkCanonicalElem tag (attrs.map (VAttr.eval s)) (Html.canonicalList (View.renderEach kids s))
+        unfold mkCanonicalElem
+        rw [onlySignalBind_renderSigAttrs, renderSigAttrs_canonical, View.canonicalList_renderSigList kids s pre]
     | .ifElse cond y no, s, pre, n, en => by
-        by_cases h : cond s = true <;>
-          simp [View.renderSig, View.render, h, View.canonical_renderSig]
+        dsimp only [View.renderSig, View.render]
+        cases h : cond s with
+        | true =>
+            simp only [↓reduceIte]
+            exact View.canonical_renderSig y s pre n en
+        | false =>
+            simp only [Bool.false_eq_true, ↓reduceIte]
+            exact View.canonical_renderSig no s pre _ _
     | .keyedList .., _, _, _, _ => rfl
     | .static _, _, _, _, _ => rfl
     | .dynNode _, _, _, _, _ => rfl
@@ -816,24 +835,30 @@ mutual
         Html.canonicalList (View.renderSigList ks s pre n en).1 = Html.canonicalList (View.renderEach ks s)
     | [], _, _, _, _ => rfl
     | k :: ks, s, pre, n, en => by
-        simp [View.renderSigList, View.renderEach,
-              View.canonical_renderSig k s pre n en,
-              View.canonicalList_renderSigList ks s pre]
+        show Html.canonical (View.renderSig k s pre n en).1 ::
+            Html.canonicalList (View.renderSigList ks s pre _ _).1 =
+          Html.canonical (View.render k s) :: Html.canonicalList (View.renderEach ks s)
+        rw [View.canonical_renderSig k s pre n en, View.canonicalList_renderSigList ks s pre]
 end
 
 @[simp] theorem View.render_showIf (cond : σ → Bool) (child : View σ msg) (s : σ) :
     (View.showIf cond child).render s = (if cond s then child.render s else .text "") := rfl
 
 @[simp] theorem View.collectDyn_showIf (cond : σ → Bool) (child : View σ msg) :
-    (View.showIf cond child).collectDyn = child.collectDyn := by
-  simp [View.showIf, View.collectDyn]
+    (View.showIf cond child).collectDyn = child.collectDyn :=
+  List.append_nil child.collectDyn
 
 @[simp] theorem View.renderSig_showIf (cond : σ → Bool) (child : View σ msg)
     (s : σ) (pre : String) (n en : Nat) :
     (View.showIf cond child).renderSig s pre n en =
       (if cond s then child.renderSig s pre n en
        else (.text "", n + child.collectDyn.length, en + child.collectDynOn.length)) := by
-  simp [View.showIf, View.renderSig, View.collectDyn, View.collectDynOn]
+  dsimp only [View.showIf, View.renderSig, View.collectDyn, View.collectDynOn, List.length]
+  cases cond s with
+  | true =>
+      simp only [↓reduceIte, Nat.add_zero]
+  | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte]
 
 def View.isDyn : View σ msg → Bool
   | .dyn _ => true
@@ -1117,7 +1142,10 @@ mutual
         | some childCtx => View.sigSafeListIn childCtx kids
         | none          => false
     | .static _           => true
-    | _                   => false
+    | .ifElse ..          => false
+    | .keyedList ..       => false
+    | .dynNode ..         => false
+    | .memo ..            => false
 
   def View.sigSafeListIn {σ msg : Type} (ctx : HtmlCtx) : List (View σ msg) → Bool
     | []      => true
@@ -1146,30 +1174,49 @@ mutual
         Html.validIn ctx (View.renderSig v s pre n en).1 = true
     | .text _, _, _, _, _, _, hvalid => hvalid
     | .dyn _, _, _, _, _, hsafe, _ => by
-        simp only [View.sigSafeIn] at hsafe
-        simp only [View.renderSig, Html.validIn, Attr.validList, Attr.valid,
-                   Attr.hasLocalCell, Attr.isLocalCell, List.isEmpty, isVoidTag, voidTags]
+        show (true && (!isVoidTag "span" || false) && true &&
+          match stepHtmlCtx ctx "span" with
+          | some childCtx => validTextIn childCtx _ && true
+          | none => false) = true
         rw [stepHtmlCtx_span_of_mode hsafe]
-        simp [Html.validListIn, Html.validIn, validTextIn_of_mode hsafe]
+        dsimp only
+        rw [validTextIn_of_mode hsafe]
+        have hv : isVoidTag "span" = false := rfl
+        rw [hv]; rfl
     | .element tag attrs kids, s, pre, n, en, hsafe, hvalid => by
-        simp only [View.sigSafeIn] at hsafe
-        simp only [View.render, Html.validIn, View.renderEach_isEmpty] at hvalid
-        simp only [View.renderSig, Html.validIn, Attr.validList_renderSigAttrs,
-                   Attr.hasLocalCell_renderSigAttrs, View.renderSigList_isEmpty]
+        change (match stepHtmlCtx ctx tag with | some childCtx => View.sigSafeListIn childCtx kids | none => false) = true at hsafe
+        change (Attr.validList (attrs.map (VAttr.eval s)) &&
+          (!isVoidTag tag || (View.renderEach kids s).isEmpty) &&
+          (!Attr.hasLocalCell (attrs.map (VAttr.eval s)) || (View.renderEach kids s).isEmpty) &&
+          match stepHtmlCtx ctx tag with
+          | some childCtx => Html.validListIn childCtx (View.renderEach kids s)
+          | none => false) = true at hvalid
+        change (Attr.validList (renderSigAttrs s pre attrs n en).1 &&
+          (!isVoidTag tag || (View.renderSigList kids s pre _ _).1.isEmpty) &&
+          (!Attr.hasLocalCell (renderSigAttrs s pre attrs n en).1 || (View.renderSigList kids s pre _ _).1.isEmpty) &&
+          match stepHtmlCtx ctx tag with
+          | some childCtx => Html.validListIn childCtx (View.renderSigList kids s pre _ _).1
+          | none => false) = true
+        rw [View.renderEach_isEmpty] at hvalid
+        rw [Attr.validList_renderSigAttrs, Attr.hasLocalCell_renderSigAttrs, View.renderSigList_isEmpty]
         cases hstep : stepHtmlCtx ctx tag with
         | none =>
-            rw [hstep] at hvalid
-            simp at hvalid
+            rw [hstep] at hsafe
+            exact Bool.noConfusion hsafe
         | some childCtx =>
             rw [hstep] at hsafe hvalid
-            simp only [Bool.and_eq_true] at hvalid
-            rcases hvalid with ⟨⟨⟨hattrs, hvoid⟩, hcell⟩, hkids⟩
-            simp only [hattrs, hvoid, hcell, Bool.true_and, View.validListIn_renderSigList_of_sigSafe childCtx kids s pre _ _ hsafe hkids]
+            dsimp only at hsafe hvalid ⊢
+            have h14 := Bool.and_eq_true_iff.1 hvalid
+            have h23 := Bool.and_eq_true_iff.1 h14.1
+            have h12 := Bool.and_eq_true_iff.1 h23.1
+            rw [h12.1, h12.2, h23.2,
+                View.validListIn_renderSigList_of_sigSafe childCtx kids s pre _ _ hsafe h14.2]
+            rfl
     | .static _, _, _, _, _, _, hvalid => hvalid
-    | .ifElse .., _, _, _, _, hsafe, _ => by simp [View.sigSafeIn] at hsafe
-    | .keyedList .., _, _, _, _, hsafe, _ => by simp [View.sigSafeIn] at hsafe
-    | .dynNode .., _, _, _, _, hsafe, _ => by simp [View.sigSafeIn] at hsafe
-    | .memo .., _, _, _, _, hsafe, _ => by simp [View.sigSafeIn] at hsafe
+    | .ifElse .., _, _, _, _, hsafe, _ => Bool.noConfusion hsafe
+    | .keyedList .., _, _, _, _, hsafe, _ => Bool.noConfusion hsafe
+    | .dynNode .., _, _, _, _, hsafe, _ => Bool.noConfusion hsafe
+    | .memo .., _, _, _, _, hsafe, _ => Bool.noConfusion hsafe
 
   theorem View.validListIn_renderSigList_of_sigSafe {σ msg : Type} (ctx : HtmlCtx) :
       ∀ (ks : List (View σ msg)) (s : σ) (pre : String) (n en : Nat),
@@ -1178,11 +1225,11 @@ mutual
         Html.validListIn ctx (View.renderSigList ks s pre n en).1 = true
     | [], _, _, _, _, _, _ => rfl
     | k :: ks, s, pre, n, en, hsafe, hvalid => by
-        simp only [View.sigSafeListIn, Bool.and_eq_true] at hsafe
-        simp only [View.renderEach, Html.validListIn, Bool.and_eq_true] at hvalid
-        simp only [View.renderSigList, Html.validListIn, Bool.and_eq_true]
-        exact ⟨View.validIn_renderSig_of_sigSafe ctx k s pre n en hsafe.1 hvalid.1,
-               View.validListIn_renderSigList_of_sigSafe ctx ks s pre _ _ hsafe.2 hvalid.2⟩
+        have hs := Bool.and_eq_true_iff.1 hsafe
+        have hv := Bool.and_eq_true_iff.1 hvalid
+        exact Bool.and_eq_true_iff.2
+          ⟨View.validIn_renderSig_of_sigSafe ctx k s pre n en hs.1 hv.1,
+           View.validListIn_renderSigList_of_sigSafe ctx ks s pre _ _ hs.2 hv.2⟩
 end
 
 theorem validIn_render_forEach {α σ msg : Type} (ctx childCtx : HtmlCtx) (tag : String)

@@ -1,18 +1,19 @@
 import Qed.Invariant.Predicates
-import Qed.Invariant.State
+import Qed.Lang
+import Qed.Diag
 
 namespace Qed
 
 open Lean Elab Tactic
 
-elab "qedUnfoldViewHelpers" : tactic =>
+private def runUnfoldViewHelpers : TacticM Unit :=
   -- Leave keyed component `.view` intact so `for_each … holds_in` can match the child contract.
   qedUnfoldHelperLoop 6 fun env n =>
     return qedIsHelper env n &&
       !(n.getString! == "view" && env.contains (n.getPrefix ++ `keyOf)) &&
       (← getProjectionFnInfo? n).isNone
 
-elab "qedCloseExhaustiveEnum" : tactic => withMainContext do
+private def runCloseExhaustiveEnum : TacticM Unit := withMainContext do
   for ldecl in (← getLCtx) do
     if ldecl.isImplementationDetail then continue
     let ty ← instantiateMVars ldecl.type
@@ -55,116 +56,188 @@ private partial def findFiniteEnumExpr (env : Environment) (e : Expr) : MetaM (O
     if !b.hasLooseBVars then findFiniteEnumExpr env b else return none
   | _ => return none
 
-elab "qedSplitFiniteEnums" : tactic => do
+/-- Evaluates a ground `Bool` equality `lhs = true` ONCE via `Meta.whnf`, closing if `true`
+    or replacing the goal with `False` if `false` so subsequent tactics skip immediately. -/
+private def evalGroundBoolGoal (g : MVarId) (tgt : Expr) : TacticM (Option (List MVarId)) :=
+  g.withContext do
+    if let some (_, lhs, rhs) := tgt.eq? then
+      if rhs.isConstOf ``Bool.true then
+        let v ← try Meta.whnf lhs catch _ => pure lhs
+        if v.isConstOf ``Bool.true then
+          g.assign (← Meta.mkEqRefl (mkConst ``Bool.true))
+          return some []
+        if v.isConstOf ``Bool.false then
+          let gf ← Meta.mkFreshExprSyntheticOpaqueMVar (mkConst ``False)
+          g.assign (mkApp2 (mkConst ``False.elim [Level.zero]) tgt gf)
+          return some [gf.mvarId!]
+        return none
+    try
+      setGoals [g]
+      evalTactic (← `(tactic| rfl))
+      return some (← getGoals)
+    catch _ => return none
+
+private def runSplitFiniteEnums : TacticM Unit := do
+  let mut checkedGround : Std.HashSet MVarId := {}
   for _ in [0:2] do
     let gs ← getGoals
     if gs.isEmpty then return
     let mut progress := false
     let mut nextGoals : List MVarId := []
     for g in gs do
-      let res ← g.withContext do
-        let tgt ← instantiateMVars (← g.getType)
-        if !tgt.hasFVar then
-          try
-            setGoals [g]
-            evalTactic (← `(tactic| rfl))
-            return some (← getGoals)
-          catch _ => pure ()
+      let tgt ← g.withContext do instantiateMVars (← g.getType)
+      if tgt.isFalse then
+        nextGoals := nextGoals ++ [g]
+        continue
+      if !tgt.hasFVar && !checkedGround.contains g then
+        checkedGround := checkedGround.insert g
+        if let some gs' ← evalGroundBoolGoal g tgt then
+          progress := true
+          nextGoals := nextGoals ++ gs'
+          continue
+      let splitRes? ← g.withContext do
         if let some e ← findFiniteEnumExpr (← getEnv) tgt then
           try
-            setGoals [g]
             if e.isFVar then
-              evalTactic (← `(tactic| cases $(mkIdent (← e.fvarId!.getDecl).userName):ident))
+              let subgoals ← g.cases e.fvarId!
+              return some (subgoals.toList.map (·.mvarId))
             else
+              setGoals [g]
               let stx ← PrettyPrinter.delab e
               evalTactic (← `(tactic| (generalize $stx:term = _qed_enum_x at *; cases _qed_enum_x)))
-            return some (← getGoals)
+              return some (← getGoals)
           catch _ => pure ()
         return none
-      match res with
+      match splitRes? with
       | some gs' => progress := true; nextGoals := nextGoals ++ gs'
       | none     => nextGoals := nextGoals ++ [g]
     setGoals nextGoals
     if !progress then break
-  -- Close any newly-ground goals by `rfl` (or immediately reduce false ground Bool goals to `False`).
+  -- Close or falsify any newly-ground goals created by the last split.
   let mut rem : List MVarId := []
   for g in (← getGoals) do
-    let gs' ← g.withContext do
-      let tgt ← instantiateMVars (← g.getType)
-      if !tgt.hasFVar then
-        try setGoals [g]; evalTactic (← `(tactic| rfl)); return (← getGoals) catch _ => pure ()
-        if let some (_, lhs, rhs) := tgt.eq? then
-          if rhs.isConstOf ``Bool.true then
-            try
-              let lhsStx ← PrettyPrinter.delab lhs
-              setGoals [g]
-              evalTactic (← `(tactic| (have _qed_gf : $lhsStx = false := rfl; rw [_qed_gf]; simp only [Bool.false_eq_true])))
-              return (← getGoals)
-            catch _ => pure ()
-      return [g]
-    rem := rem ++ gs'
+    let tgt ← g.withContext do instantiateMVars (← g.getType)
+    if !tgt.isFalse && !tgt.hasFVar && !checkedGround.contains g then
+      if let some gs' ← evalGroundBoolGoal g tgt then
+        rem := rem ++ gs'
+        continue
+    rem := rem ++ [g]
   setGoals rem
 
-elab "qedSkipIfFalse" tac:tactic : tactic => do
-  let tgt ← instantiateMVars (← getMainTarget)
-  if tgt.isFalse then return
-  evalTactic tac
+private def styleReduceCoreNames : Array Name := #[
+  ``Qed.roleHasOneOf, ``Qed.tagHasOneOf, ``Qed.roleHas, ``Qed.roleHasOnly,
+  ``Qed.roleLacks, ``Qed.tagLacks, ``Qed.roleHasAll, ``Qed.tagHas, ``Qed.noConflictingStyles,
+  ``Qed.hasRole, ``Qed.hasTag, ``Qed.both, ``Qed.either, ``Qed.exactlyOne,
+  ``Qed.allRolesOff, ``Qed.exactlyOneOf, ``Qed.exactlyOneOf.go, ``Qed.hasOneClass,
+  ``Qed.everyElement, ``Qed.everyElementL, ``Qed.attrClasses, ``Qed.attrRole,
+  ``Qed.Html.map, ``Qed.Html.mapChildren, ``Qed.Attr.map,
+  ``Qed.Lang.QedVal.val_id, ``Qed.Lang.QedSeqLit.ofList_array, ``Qed.Lang.QedSeqLit.ofList_list,
+  ``Qed.Lang.QedMem.mem_array, ``Qed.Lang.QedMem.mem_list, ``Qed.Lang.QedMem.mem_string,
+  ``Qed.Lang.QedMemProp.memProp_array, ``Qed.Lang.QedMemProp.memProp_list, ``Qed.Lang.QedMemProp.memProp_string
+]
 
-syntax "qedStyleReduce " ident : tactic
-macro_rules
-  | `(tactic| qedStyleReduce $view:ident) =>
-    `(tactic|
-      (qedSplitFiniteEnums;
-       all_goals qedSkipIfFalse (
-         try simp only [$view:ident];
-         qedSplitFiniteEnums;
-         all_goals qedSkipIfFalse (
-           qedUnfoldViewHelpers;
-           simp only [Qed.roleHasOneOf, Qed.tagHasOneOf, Qed.roleHas, Qed.roleHasOnly,
-             Qed.roleLacks, Qed.tagLacks, Qed.roleHasAll, Qed.tagHas, Qed.noConflictingStyles,
-             Qed.hasRole, Qed.hasTag, Qed.both, Qed.either, Qed.exactlyOne,
-             Qed.allRolesOff, Qed.exactlyOneOf, Qed.exactlyOneOf.go, Qed.hasOneClass,
-             Qed.everyElement, Qed.everyElementL, Qed.attrClasses, Qed.attrRole,
-             Qed.View.render, Qed.View.renderEach, Qed.View.mapScope, Qed.View.mapScopeEach,
-             Qed.VAttr.eval, Qed.VAttr.mapScope, Qed.View.showIf, Qed.View.ofHtml,
-             Qed.V.el, Qed.V.text, Qed.V.dyn, Qed.V.ifElse, Qed.V.showIf, Qed.V.static, Qed.V.dynNode,
-             Qed.V.memo, Qed.V.render_forEach, Qed.View.isDyn, Qed.View.memo,
-             Qed.ForEachItems.toList_array, Qed.ForEachItems.toList_list, Qed.ForEachItems.toArray, Qed.mapList_eq,
-             Qed.text, Qed.lazy, Qed.el, Qed.link, Qed.linkTo,
-             Qed.Attr.empty, Qed.Html.ofOption, Qed.toString_string, Qed.withKey,
-             Qed.Html.map, Qed.Html.mapChildren, Qed.Attr.map,
-             Qed.cls, Qed.attr, Qed.role, Qed.on,
-             Qed.onValue, Qed.onClick, Qed.onInput, Qed.onChange, Qed.onCheck, Qed.onKeydown,
-             Qed.onKeyup, Qed.onSubmit, Qed.onBlur, Qed.onFocus, Qed.onDoubleClick, Qed.onMouseDown,
-             Qed.onMouseUp, Qed.key, Qed.value, Qed.placeholder, Qed.name, Qed.href, Qed.ToHref.toHref,
-             Qed.src, Qed.action, Qed.alt, Qed.title, Qed.style, Qed.inlineStyle, Qed.styleVars, Qed.type', Qed.disabled, Qed.required,
-             Qed.checked, Qed.readOnly,
-             Qed.Lang.QedVal.val_id, Qed.Lang.QedSeqLit.ofList_array, Qed.Lang.QedSeqLit.ofList_list,
-             Qed.Lang.QedMem.mem_array, Qed.Lang.QedMem.mem_list, Qed.Lang.QedMem.mem_string,
-             Qed.Lang.QedMemProp.memProp_array, Qed.Lang.QedMemProp.memProp_list, Qed.Lang.QedMemProp.memProp_string];
-           repeat' split;
-           all_goals (first
-             | rfl
-             | (simp_all only [Qed.everyElement, Qed.everyElementL,
-                               Qed.attrClasses, Qed.attrRole, Qed.hasOneClass,
-                               Bool.true_and, Bool.and_true, Bool.false_and, Bool.and_false,
-                               Bool.true_or, Bool.or_true, Bool.false_or, Bool.or_false,
-                               Bool.not_true, Bool.not_false, Bool.and_eq_true, Bool.or_eq_true,
-                               Bool.false_eq_true, ite_true, ite_false, dite_true, dite_false,
-                               List.all_cons, List.all_nil, List.any_cons, List.any_nil,
-                               beq_self_eq_true, eq_self, decide_true, decide_false];
-                (try rfl); done)
-             | (simp_all [Qed.everyElement, Qed.everyElementL,
-                          Qed.attrClasses, Qed.attrRole, Qed.hasOneClass];
-                try decide;
-                try omega;
-                try qedCloseExhaustiveEnum)
-             | decide)))))
+private def styleReduceOptNames : Array Name := #[
+  `Qed.View.render, `Qed.View.renderEach, `Qed.View.mapScope, `Qed.View.mapScopeEach,
+  `Qed.VAttr.eval, `Qed.VAttr.mapScope, `Qed.View.showIf, `Qed.View.ofHtml,
+  `Qed.V.el, `Qed.V.text, `Qed.V.dyn, `Qed.V.ifElse, `Qed.V.showIf, `Qed.V.static, `Qed.V.dynNode,
+  `Qed.V.memo, `Qed.V.render_forEach, `Qed.View.isDyn, `Qed.View.memo,
+  `Qed.ForEachItems.toList_array, `Qed.ForEachItems.toList_list, `Qed.ForEachItems.toArray, `Qed.mapList_eq,
+  `Qed.text, `Qed.lazy, `Qed.el, `Qed.link, `Qed.linkTo,
+  `Qed.Attr.empty, `Qed.Html.ofOption, `Qed.toString_string, `Qed.withKey,
+  `Qed.cls, `Qed.attr, `Qed.role, `Qed.on,
+  `Qed.onValue, `Qed.onClick, `Qed.onInput, `Qed.onChange, `Qed.onCheck, `Qed.onKeydown,
+  `Qed.onKeyup, `Qed.onSubmit, `Qed.onBlur, `Qed.onFocus, `Qed.onDoubleClick, `Qed.onMouseDown,
+  `Qed.onMouseUp, `Qed.key, `Qed.value, `Qed.placeholder, `Qed.name, `Qed.href, `Qed.ToHref.toHref,
+  `Qed.src, `Qed.action, `Qed.alt, `Qed.title, `Qed.style, `Qed.inlineStyle, `Qed.styleVars, `Qed.type',
+  `Qed.disabled, `Qed.required, `Qed.checked, `Qed.readOnly
+]
 
-syntax (name := invariantView)
-  "invariant " ident " : " qedExpr,+ " holds_in " ident (" assuming " qedExpr)? (" := " term)? : command
+private def runStyleSimpPass : TacticM Unit := do
+  if (← getGoals).isEmpty then return
+  let env ← getEnv
+  let used ← withMainContext do
+    let mut s : Std.HashSet Name := {}
+    for c in (← instantiateMVars (← getMainTarget)).getUsedConstants do
+      s := s.insert c
+    return s
+  let optPresent := styleReduceOptNames.filter fun n => env.contains n && used.contains n
+  let allNames := styleReduceCoreNames ++ optPresent
+  let lems ← allNames.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+  evalTactic (← `(tactic| simp only [$[$lems],*]))
 
-elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => do
+private def isUnprovableFalseGoal (g : MVarId) : MetaM Bool := g.withContext do
+  let tgt := (← instantiateMVars (← g.getType)).consumeMData
+  let isFalseEq :=
+    tgt.isFalse ||
+    match tgt.eq? with
+    | some (_, lhs, rhs) => lhs.consumeMData.isConstOf ``Bool.false && rhs.consumeMData.isConstOf ``Bool.true
+    | none => false
+  if !isFalseEq then return false
+  for decl in (← getLCtx) do
+    if !decl.isImplementationDetail then
+      if (← Meta.isProp decl.type) then return false
+  return true
+
+private def runStyleLeafClose (g : MVarId) : TacticM (List MVarId) := do
+  setGoals [g]
+  try evalTactic (← `(tactic| rfl)) catch _ => pure ()
+  if (← getGoals).isEmpty then return []
+  try evalTactic (← `(tactic|
+    (simp_all only [Qed.everyElement, Qed.everyElementL,
+                    Qed.attrClasses, Qed.attrRole, Qed.hasOneClass,
+                    Bool.true_and, Bool.and_true, Bool.false_and, Bool.and_false,
+                    Bool.true_or, Bool.or_true, Bool.false_or, Bool.or_false,
+                    Bool.not_true, Bool.not_false, Bool.and_eq_true, Bool.or_eq_true,
+                    Bool.false_eq_true, ite_true, ite_false, dite_true, dite_false,
+                    List.all_cons, List.all_nil, List.any_cons, List.any_nil,
+                    beq_self_eq_true, eq_self, decide_true, decide_false];
+     try rfl))) catch _ => pure ()
+  let gs1 ← getGoals
+  if gs1.isEmpty then return []
+  let mut rem : List MVarId := []
+  for g1 in gs1 do
+    if (← isUnprovableFalseGoal g1) then
+      rem := rem ++ [g1]
+      continue
+    setGoals [g1]
+    try evalTactic (← `(tactic|
+      (simp_all [Qed.everyElement, Qed.everyElementL,
+                 Qed.attrClasses, Qed.attrRole, Qed.hasOneClass];
+       try decide;
+       try omega))) catch _ => pure ()
+    for g2 in (← getGoals) do
+      setGoals [g2]
+      try runCloseExhaustiveEnum catch _ => pure ()
+      if !(← getGoals).isEmpty then
+        try evalTactic (← `(tactic| decide)) catch _ => pure ()
+      rem := rem ++ (← getGoals)
+  return rem
+
+private def runStyleReduce (view : Ident) : TacticM Unit := do
+  runSplitFiniteEnums
+  let gs0 ← getGoals
+  let mut rem : List MVarId := []
+  for g0 in gs0 do
+    if (← g0.withContext (instantiateMVars (← g0.getType))).isFalse then
+      rem := rem ++ [g0]
+      continue
+    setGoals [g0]
+    try evalTactic (← `(tactic| simp only [$view:ident])) catch _ => pure ()
+    runSplitFiniteEnums
+    for g1 in (← getGoals) do
+      if (← g1.withContext (instantiateMVars (← g1.getType))).isFalse then
+        rem := rem ++ [g1]
+        continue
+      setGoals [g1]
+      runUnfoldViewHelpers
+      try runStyleSimpPass catch _ => pure ()
+      if (← getGoals).isEmpty then continue
+      try evalTactic (← `(tactic| repeat' split)) catch _ => pure ()
+      for g2 in (← getGoals) do
+        rem := rem ++ (← runStyleLeafClose g2)
+  setGoals rem
+
+private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM Unit := do
   evalTactic (← `(tactic| (intro m; try intro _qed_h_assume)))
   withMainContext do
     for ldecl in (← getLCtx) do
@@ -177,7 +250,13 @@ elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => do
         let chk := mkIdent (if fn.isConstOf ``Qed.roleHasOneOf then ``Qed.hasRole else ``Qed.hasTag)
         evalTactic (← `(tactic| (suffices $chk $(← PrettyPrinter.delab args[1]!) ($view m) = true ∧ _ from this.2; constructor)))
   withOptions (fun o => maxRecDepth.set o (max (maxRecDepth.get o) 16384)) do
-    evalTactic (← `(tactic| all_goals qedStyleReduce $view))
+    let gs ← getGoals
+    let mut rem : List MVarId := []
+    for g in gs do
+      setGoals [g]
+      runStyleReduce view
+      rem := rem ++ (← getGoals)
+    setGoals rem
   let goals ← getUnsolvedGoals
   unless goals.isEmpty do
     let mut details : Array String := #[]
@@ -201,6 +280,21 @@ elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic => do
       else
         s!"Check that the matching `role`/tag is rendered and receives exactly one allowed style in every branch of `{vName}`."
     throwErrorAt nm m!"Styling invariant `{nm.getId}` failed in `{vName}`:\n  • `{predStr}` does not hold in every state{extraBody}\n\nHint: {diagnosis}"
+
+elab "qedUnfoldViewHelpers" : tactic => runUnfoldViewHelpers
+elab "qedCloseExhaustiveEnum" : tactic => runCloseExhaustiveEnum
+elab "qedSplitFiniteEnums" : tactic => runSplitFiniteEnums
+elab "qedSkipIfFalse" tac:tactic : tactic => do
+  let tgt ← instantiateMVars (← getMainTarget)
+  if tgt.isFalse then return
+  evalTactic tac
+elab "qedStyleSimpPass" : tactic => runStyleSimpPass
+elab "qedStyleReduce " view:ident : tactic => runStyleReduce view
+elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic =>
+  runDischargeStyling view nm predLit
+
+syntax (name := invariantView)
+  "invariant " ident " : " qedExpr,+ " holds_in " ident (" assuming " qedExpr)? (" := " term)? : command
 
 open Lean Elab Command in
 elab_rules : command

@@ -620,62 +620,71 @@ private theorem readFieldAt_fast_step (buf : ByteArray) (pos limit : Nat)
   · simp [readFieldAt, hv1, hfn0, hwt, readPayloadAt, hv2, bind, Except.bind, pure, Except.pure]
   · split <;> simp [readFieldAt, readPayloadAt, h2.2, *, bind, Except.bind, pure, Except.pure]
 
-private theorem readFieldsLoop_eq_spec (buf : ByteArray) :
-    ∀ (fuel pos limit : Nat) (acc : List (Nat × WireVal)),
-      pos ≤ limit →
-      limit ≤ buf.size →
-      readFieldsLoop fuel buf pos limit acc = decodeFieldsAux fuel (sliceList buf pos limit) acc
-  | fuel, pos, limit, acc, hp, hlim => by
+private theorem readFieldsLoop_eq_spec (buf : ByteArray)
+    (fuel pos limit : Nat) (acc : List (Nat × WireVal))
+    (hp : pos ≤ limit) (hlim : limit ≤ buf.size) :
+    readFieldsLoop fuel buf pos limit acc = decodeFieldsAux fuel (sliceList buf pos limit) acc := by
+  induction fuel generalizing pos acc with
+  | zero =>
       by_cases heq : (pos == limit) = true
       · have hp' : pos = limit := beq_iff_eq.1 heq
         subst hp'
         unfold readFieldsLoop
         rw [if_pos heq, sliceList_eq_nil (Nat.le_refl pos)]
-        cases fuel <;> rfl
+        rfl
+      · have hne : pos ≠ limit := beq_eq_false_iff_ne.1 (Bool.eq_false_iff.2 heq)
+        unfold readFieldsLoop
+        rw [if_neg heq, sliceList_cons ⟨by omega, hlim⟩]
+        rfl
+  | succ f' ih =>
+      by_cases heq : (pos == limit) = true
+      · have hp' : pos = limit := beq_iff_eq.1 heq
+        subst hp'
+        unfold readFieldsLoop
+        rw [if_pos heq, sliceList_eq_nil (Nat.le_refl pos)]
+        rfl
       · have hlt : pos < limit := by
           have hne : pos ≠ limit := beq_eq_false_iff_ne.1 (Bool.eq_false_iff.2 heq)
           omega
-        cases fuel with
-        | zero =>
-            unfold readFieldsLoop
-            rw [if_neg heq, sliceList_cons ⟨hlt, hlim⟩]
-            rfl
-        | succ f' =>
-            have hstep := readFieldAt_eq_spec buf pos limit hlim
-            rw [sliceList_cons ⟨hlt, hlim⟩] at hstep
-            have hfallback :
-                (match readFieldAt buf pos limit with
-                  | .error e => .error e
-                  | .ok (fw, pos') => readFieldsLoop f' buf pos' limit (fw :: acc)) =
-                decodeFieldsAux (f' + 1) (sliceList buf pos limit) acc := by
-              rw [sliceList_cons ⟨hlt, hlim⟩]
-              unfold decodeFieldsAux
-              dsimp only [bind, Except.bind]
-              rw [← hstep]
-              cases hrf : readFieldAt buf pos limit with
-              | error _ => rfl
-              | ok fwp =>
-                  have hadv := cursor_strictly_advances buf pos limit hrf
-                  exact readFieldsLoop_eq_spec buf f' fwp.2 limit (fwp.1 :: acc) (by omega) hlim
-            unfold readFieldsLoop
-            rw [if_neg heq]; dsimp only
+        have hstep := readFieldAt_eq_spec buf pos limit hlim
+        rw [sliceList_cons ⟨hlt, hlim⟩] at hstep
+        have hfallback :
+            (match readFieldAt buf pos limit with
+              | .error e => .error e
+              | .ok (fw, pos') => readFieldsLoop f' buf pos' limit (fw :: acc)) =
+            decodeFieldsAux (f' + 1) (sliceList buf pos limit) acc := by
+          rw [sliceList_cons ⟨hlt, hlim⟩]
+          unfold decodeFieldsAux
+          dsimp only [bind, Except.bind]
+          rw [← hstep]
+          cases hrf : readFieldAt buf pos limit with
+          | error _ => rfl
+          | ok fwp =>
+              have hadv := cursor_strictly_advances buf pos limit hrf
+              exact ih fwp.2 (fwp.1 :: acc) (by omega)
+        unfold readFieldsLoop
+        rw [if_neg heq]; dsimp only
+        split
+        · rename_i h2
+          split
+          · rename_i hlt128
+            simp only [Bool.and_eq_true, decide_eq_true_eq] at hlt128
             split
-            · rename_i h2
-              split
-              · rename_i hlt128
-                simp only [Bool.and_eq_true, decide_eq_true_eq] at hlt128
+            · rename_i hfw0
+              simp only [Bool.and_eq_true] at hfw0
+              rw [← hfallback, (readFieldAt_fast_step buf pos limit h2 hlt128.1 hlt128.2 hfw0.1).1 (beq_iff_eq.1 hfw0.2)]
+            · split
+              · rename_i _ hfw2
+                simp only [Bool.and_eq_true] at hfw2
+                have hrf := (readFieldAt_fast_step buf pos limit h2 hlt128.1 hlt128.2 hfw2.1).2 (beq_iff_eq.1 hfw2.2)
                 split
-                · rename_i hfw0
-                  simp only [Bool.and_eq_true] at hfw0
-                  rw [← hfallback, (readFieldAt_fast_step buf pos limit h2 hlt128.1 hlt128.2 hfw0.1).1 (beq_iff_eq.1 hfw0.2)]
-                · split
-                  · rename_i _ hfw2
-                    simp only [Bool.and_eq_true] at hfw2
-                    have hrf := (readFieldAt_fast_step buf pos limit h2 hlt128.1 hlt128.2 hfw2.1).2 (beq_iff_eq.1 hfw2.2)
-                    split <;> (rw [← hfallback, hrf]; simp [*])
-                  · exact hfallback
+                · rename_i hle
+                  rw [← hfallback, hrf, if_pos hle]
+                · rename_i hle
+                  rw [← hfallback, hrf, if_neg hle]
               · exact hfallback
-            · exact hfallback
+          · exact hfallback
+        · exact hfallback
 
 @[csimp] theorem decodeFieldsSpec_eq_fast : @decodeFieldsSpec = @decodeFieldsFast := by
   funext buf

@@ -110,11 +110,29 @@ private theorem str_append_no_lt {a b : String}
     ∀ c ∈ (a ++ b).toList, c ≠ '<' :=
   str_append_prop ha hb
 
-private theorem lit_no_lt (s : String) (h : s.toList.all (· != '<') = true) :
+private theorem lit_no_lt {s : String} (cs : List Char)
+    (heq : String.ofList cs = s) (h : cs.all (· != '<') = true) :
     ∀ c ∈ s.toList, c ≠ '<' := by
+  subst heq
+  rw [String.toList_ofList]
   rw [List.all_eq_true] at h
   intro c hc
   exact bne_iff_ne.1 (h c hc)
+
+private theorem lit_empty_no_lt : ∀ c ∈ ("").toList, c ≠ '<' :=
+  lit_no_lt [] rfl rfl
+
+private theorem lit_space_no_lt : ∀ c ∈ (" ").toList, c ≠ '<' :=
+  lit_no_lt [' '] rfl rfl
+
+private theorem lit_nl_no_lt : ∀ c ∈ ("\n").toList, c ≠ '<' :=
+  lit_no_lt ['\n'] rfl rfl
+
+private theorem lit_open_brace_no_lt : ∀ c ∈ (" { ").toList, c ≠ '<' :=
+  lit_no_lt [' ', '{', ' '] rfl rfl
+
+private theorem lit_close_brace_no_lt : ∀ c ∈ (" }").toList, c ≠ '<' :=
+  lit_no_lt [' ', '}'] rfl rfl
 
 private theorem sanitizeCssAtom_no_lt (s : String) :
     ∀ c ∈ (sanitizeCssAtom s).toList, c ≠ '<' := by
@@ -151,24 +169,24 @@ mutual
         simp only [Item.render]
         exact str_append_no_lt
           (str_append_no_lt
-            (str_append_no_lt (sanitizeCssAtom_no_lt p) (lit_no_lt ": " rfl))
+            (str_append_no_lt (sanitizeCssAtom_no_lt p) (lit_no_lt [':', ' '] rfl rfl))
             (sanitizeCssAtom_no_lt v))
-          (lit_no_lt ";" rfl)
+          (lit_no_lt [';'] rfl rfl)
     | .nest sel b => by
         simp only [Item.render]
         exact str_append_no_lt
           (str_append_no_lt
-            (str_append_no_lt (sanitizeCssSelector_no_lt sel) (lit_no_lt " { " rfl))
+            (str_append_no_lt (sanitizeCssSelector_no_lt sel) lit_open_brace_no_lt)
             (Item.renderList_no_lt b))
-          (lit_no_lt " }" rfl)
+          lit_close_brace_no_lt
 
   theorem Item.renderList_no_lt : ∀ (is : List Item), ∀ c ∈ (Item.renderList is).toList, c ≠ '<'
-    | [] => lit_no_lt "" rfl
+    | [] => lit_empty_no_lt
     | [i] => Item.render_no_lt i
     | i :: j :: rest => by
         simp only [Item.renderList]
         exact str_append_no_lt
-          (str_append_no_lt (Item.render_no_lt i) (lit_no_lt " " rfl))
+          (str_append_no_lt (Item.render_no_lt i) lit_space_no_lt)
           (Item.renderList_no_lt (j :: rest))
 end
 
@@ -183,13 +201,13 @@ theorem Item.renderList_no_closeSeq (is : List Item) :
 private theorem cssJoinLines_no_lt :
     ∀ (xs : List String), (∀ s ∈ xs, ∀ c ∈ s.toList, c ≠ '<') →
       ∀ c ∈ (cssJoinLines xs).toList, c ≠ '<'
-  | [], _ => lit_no_lt "" rfl
-  | [s], hs => hs s (by simp)
+  | [], _ => lit_empty_no_lt
+  | [s], hs => hs s (List.mem_cons_self ..)
   | s₁ :: s₂ :: rest, hs => by
-      have h1 := hs s₁ (by simp)
-      have h2 := cssJoinLines_no_lt (s₂ :: rest) (fun x hx => hs x (by simp [hx]))
+      have h1 := hs s₁ (List.mem_cons_self ..)
+      have h2 := cssJoinLines_no_lt (s₂ :: rest) (fun x hx => hs x (List.mem_cons_of_mem _ hx))
       simp only [cssJoinLines]
-      exact str_append_no_lt (str_append_no_lt h1 (lit_no_lt "\n" rfl)) h2
+      exact str_append_no_lt (str_append_no_lt h1 lit_nl_no_lt) h2
 
 private theorem renderThemeRule_no_lt (item : Item) :
     ∀ c ∈ (renderThemeRule item).toList, c ≠ '<' := by
@@ -200,16 +218,16 @@ private theorem renderThemeRule_no_lt (item : Item) :
       split
       · exact str_append_no_lt
           (str_append_no_lt
-            (str_append_no_lt (sanitizeCssSelector_no_lt sel) (lit_no_lt " { " rfl))
+            (str_append_no_lt (sanitizeCssSelector_no_lt sel) lit_open_brace_no_lt)
             (Item.renderList_no_lt b))
-          (lit_no_lt " }" rfl)
+          lit_close_brace_no_lt
       · exact str_append_no_lt
           (str_append_no_lt
             (str_append_no_lt
-              (str_append_no_lt (lit_no_lt ":where(" rfl) (sanitizeCssSelector_no_lt sel))
-              (lit_no_lt ") { " rfl))
+              (str_append_no_lt (lit_no_lt [':', 'w', 'h', 'e', 'r', 'e', '('] rfl rfl) (sanitizeCssSelector_no_lt sel))
+              (lit_no_lt [')', ' ', '{', ' '] rfl rfl))
             (Item.renderList_no_lt b))
-          (lit_no_lt " }" rfl)
+          lit_close_brace_no_lt
 
 theorem Theme.render_no_lt (th : Theme) :
     ∀ c ∈ (Theme.render th).toList, c ≠ '<' := by
@@ -226,18 +244,25 @@ theorem Theme.render_no_lt (th : Theme) :
       · simp only [List.mem_singleton] at hlight
         subst hlight
         exact str_append_no_lt
-          (str_append_no_lt (lit_no_lt ":root { " rfl) (Item.renderList_no_lt _))
-          (lit_no_lt " }" rfl)
+          (str_append_no_lt (lit_no_lt [':', 'r', 'o', 'o', 't', ' ', '{', ' '] rfl rfl) (Item.renderList_no_lt _))
+          lit_close_brace_no_lt
     · split at hdark
       · nomatch hdark
       · simp only [List.mem_cons, List.not_mem_nil, or_false] at hdark
         rcases hdark with rfl | rfl
         · exact str_append_no_lt
-            (str_append_no_lt (lit_no_lt "@media (prefers-color-scheme: dark) { :root { " rfl) (Item.renderList_no_lt _))
-            (lit_no_lt " } }" rfl)
+            (str_append_no_lt
+              (lit_no_lt ['@', 'm', 'e', 'd', 'i', 'a', ' ', '(', 'p', 'r', 'e', 'f', 'e', 'r', 's', '-',
+                'c', 'o', 'l', 'o', 'r', '-', 's', 'c', 'h', 'e', 'm', 'e', ':', ' ', 'd', 'a', 'r', 'k', ')',
+                ' ', '{', ' ', ':', 'r', 'o', 'o', 't', ' ', '{', ' '] rfl rfl)
+              (Item.renderList_no_lt _))
+            (lit_no_lt [' ', '}', ' ', '}'] rfl rfl)
         · exact str_append_no_lt
-            (str_append_no_lt (lit_no_lt "[data-theme=\"dark\"] { " rfl) (Item.renderList_no_lt _))
-            (lit_no_lt " }" rfl)
+            (str_append_no_lt
+              (lit_no_lt ['[', 'd', 'a', 't', 'a', '-', 't', 'h', 'e', 'm', 'e', '=', '"', 'd', 'a', 'r', 'k', '"',
+                ']', ' ', '{', ' '] rfl rfl)
+              (Item.renderList_no_lt _))
+            lit_close_brace_no_lt
   · rcases List.mem_map.1 hreset with ⟨item, _, rfl⟩
     exact renderThemeRule_no_lt item
 
@@ -247,20 +272,20 @@ theorem Theme.render_no_closeSeq (th : Theme) :
 
 theorem Keyframes.renderSteps_no_lt :
     ∀ (steps : List (String × List Item)), ∀ c ∈ (Keyframes.renderSteps steps).toList, c ≠ '<'
-  | [] => lit_no_lt "" rfl
+  | [] => lit_empty_no_lt
   | [(sel, body)] =>
       str_append_no_lt
         (str_append_no_lt
-          (str_append_no_lt (sanitizeCssSelector_no_lt sel) (lit_no_lt " { " rfl))
+          (str_append_no_lt (sanitizeCssSelector_no_lt sel) lit_open_brace_no_lt)
           (Item.renderList_no_lt body))
-        (lit_no_lt " }" rfl)
+        lit_close_brace_no_lt
   | (sel, body) :: s2 :: rest =>
       str_append_no_lt
         (str_append_no_lt
           (str_append_no_lt
-            (str_append_no_lt (sanitizeCssSelector_no_lt sel) (lit_no_lt " { " rfl))
+            (str_append_no_lt (sanitizeCssSelector_no_lt sel) lit_open_brace_no_lt)
             (Item.renderList_no_lt body))
-          (lit_no_lt " } " rfl))
+          (lit_no_lt [' ', '}', ' '] rfl rfl))
         (Keyframes.renderSteps_no_lt (s2 :: rest))
 
 theorem Keyframes.rule_no_lt (kf : Keyframes) :
@@ -269,10 +294,12 @@ theorem Keyframes.rule_no_lt (kf : Keyframes) :
   exact str_append_no_lt
     (str_append_no_lt
       (str_append_no_lt
-        (str_append_no_lt (lit_no_lt "@keyframes " rfl) (sanitizeCssIdent_no_lt kf.name))
-        (lit_no_lt " { " rfl))
+        (str_append_no_lt
+          (lit_no_lt ['@', 'k', 'e', 'y', 'f', 'r', 'a', 'm', 'e', 's', ' '] rfl rfl)
+          (sanitizeCssIdent_no_lt kf.name))
+        lit_open_brace_no_lt)
       (Keyframes.renderSteps_no_lt kf.steps))
-    (lit_no_lt " }" rfl)
+    lit_close_brace_no_lt
 
 theorem Keyframes.rule_no_closeSeq (kf : Keyframes) :
     containsCloseSeq kf.rule.toList = false :=
@@ -287,11 +314,11 @@ theorem Style.rule_no_lt (s : Style) :
   · exact str_append_no_lt
       (str_append_no_lt
         (str_append_no_lt
-          (str_append_no_lt (lit_no_lt "." rfl)
+          (str_append_no_lt (lit_no_lt ['.'] rfl rfl)
             (fun c hc => bne_iff_ne.1 (sanitizeWith_safe (· != '<') s.className c hc)))
-          (lit_no_lt " { " rfl))
+          lit_open_brace_no_lt)
         (fun c hc => bne_iff_ne.1 (sanitizeWith_safe (· != '<') s.raw c hc)))
-      (lit_no_lt " }" rfl)
+      lit_close_brace_no_lt
 
 theorem renderStyleSheet_no_lt (styles : List Style) :
     ∀ c ∈ (renderStyleSheet styles).toList, c ≠ '<' := by
@@ -317,9 +344,12 @@ theorem renderStyleSheet_no_closeSeq (styles : List Style) :
 
 /-! ## Safe Dynamic Inline Style Proofs -/
 
-private theorem lit_safe_inline (s : String)
-    (h : s.toList.all (fun c => c != '<' && c != '>' && c != '"' && c != '\'') = true) :
+private theorem lit_safe_inline {s : String} (cs : List Char)
+    (heq : String.ofList cs = s)
+    (h : cs.all (fun c => c != '<' && c != '>' && c != '"' && c != '\'') = true) :
     ∀ c ∈ s.toList, c ≠ '<' ∧ c ≠ '>' ∧ c ≠ '"' ∧ c ≠ '\'' := by
+  subst heq
+  rw [String.toList_ofList]
   rw [List.all_eq_true] at h
   intro c hc
   have h1 := h c hc
@@ -333,15 +363,15 @@ theorem inlineStyleItem_safe (i : Item) :
       simp only [inlineStyleItem]
       exact str_append_prop
         (str_append_prop
-          (str_append_prop (sanitizeInlineCssAtom_no_lt_or_quote p) (lit_safe_inline ": " rfl))
+          (str_append_prop (sanitizeInlineCssAtom_no_lt_or_quote p) (lit_safe_inline [':', ' '] rfl rfl))
           (sanitizeInlineCssAtom_no_lt_or_quote v))
-        (lit_safe_inline ";" rfl)
+        (lit_safe_inline [';'] rfl rfl)
   | nest _ _ =>
-      exact lit_safe_inline "" rfl
+      exact lit_safe_inline [] rfl rfl
 
 theorem inlineStyleStr_safe :
     ∀ (items : List Item), ∀ c ∈ (inlineStyleStr items).toList, c ≠ '<' ∧ c ≠ '>' ∧ c ≠ '"' ∧ c ≠ '\''
-  | [] => lit_safe_inline "" rfl
+  | [] => lit_safe_inline [] rfl rfl
   | [i] => inlineStyleItem_safe i
   | i :: j :: rest => by
       simp only [inlineStyleStr]
@@ -350,7 +380,7 @@ theorem inlineStyleStr_safe :
       · split
         · exact inlineStyleItem_safe i
         · exact str_append_prop
-            (str_append_prop (inlineStyleItem_safe i) (lit_safe_inline " " rfl))
+            (str_append_prop (inlineStyleItem_safe i) (lit_safe_inline [' '] rfl rfl))
             (inlineStyleStr_safe (j :: rest))
 
 theorem inlineStyleStr_no_lt (items : List Item) :

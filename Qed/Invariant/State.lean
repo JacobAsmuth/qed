@@ -1,6 +1,7 @@
 import Qed.Runtime.App
 import Qed.Style
 import Qed.Diag
+import Qed.Collection
 import Lean
 
 namespace Qed
@@ -24,7 +25,16 @@ open Lean Elab Tactic
 
 private def qedBoundaryLemmas : Array Name :=
   #[``Array.size_push, ``Array.size_modify, ``Array.size_set, ``Array.size_pop,
-    ``Array.size_map, ``Array.size_append,
+    ``Array.size_map, ``Array.size_append, ``Array.size_eraseIdx, ``Array.size_reverse,
+    ``Array.size_extract, ``Array.size_swap, ``Array.size_mergeSort,
+    ``Array.sumBy_empty, ``Array.sumBy_push, ``Array.sumBy_append, ``Array.sumBy_map,
+    ``Array.sumBy_reverse, ``Array.sumBy_mergeSort,
+    ``Array.sumByInt_empty, ``Array.sumByInt_push, ``Array.sumByInt_append,
+    ``Array.sumByInt_map, ``Array.sumByInt_mergeSort,
+    ``Array.countWhere_empty, ``Array.countWhere_push, ``Array.countWhere_append,
+    ``Array.countWhere_reverse, ``Array.countWhere_mergeSort,
+    ``Array.uniqueBy_empty, ``Array.uniqueBy_push_iff,
+    ``Array.isSortedBy_empty, ``Array.isSortedBy_singleton, ``Array.isSortedBy_push_iff,
     ``List.length_cons, ``List.length_append, ``List.length_map,
     ``Qed.Lang.QedVal.val_id, ``Qed.Lang.QedSeqLit.ofList_array, ``Qed.Lang.QedSeqLit.ofList_list,
     ``Qed.Lang.QedMem.mem_array, ``Qed.Lang.QedMem.mem_list, ``Qed.Lang.QedMem.mem_string,
@@ -151,6 +161,19 @@ elab "qedFastClose" : tactic => withMainContext do
   else
     throwError "qedFastClose: not trivially closed"
 
+/-- General single-goal closer escalating from fast linear/decidable checks to nonlinear
+    monotonicity and Lean 4's `grind` (quantified collections, congruence closure, ring).
+    Always fails (leaving state untouched for `first` backtracking) if any goal remains. -/
+macro "qedAutoClose" : tactic => `(tactic|
+  (first
+    | qedFastClose
+    | omega
+    | decide
+    | assumption
+    | rfl
+    | qedNonlinearClose
+    | (try (repeat' (apply And.intro)); all_goals (first | qedFastClose | omega | decide | qedNonlinearClose | grind); done)))
+
 private def mkCloserLemmas (usingL : Array Term) : TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) := do
   let bL ← toSimpLemmas (qedBoundaryLemmas.map fun n => ⟨(mkIdent n).raw⟩)
   return bL ++ (← toSimpLemmas usingL)
@@ -175,8 +198,9 @@ private def mkInitTac (usingL : Array Term) (pred initT : Term) : TacticM (TSynt
      $unfoldInit:tactic;
      qedUnfoldPresent [$[$usingL],*];
      try ((repeat' split) <;>
-            (first | qedFastClose | omega | decide
-                   | (simp_all [$[$initCloserL],*] <;> first | qedFastClose | omega | decide | assumption | rfl | done)))))
+            (first | qedFastClose | omega | decide | qedNonlinearClose
+                   | (simp_all [$[$initCloserL],*] <;> qedAutoClose; done)
+                   | qedAutoClose))))
 
 private def throwUnsolvedInvGoals (nm : Ident) (hdr footer : MessageData) : TacticM Unit := do
   let goals ← getUnsolvedGoals
@@ -310,8 +334,9 @@ elab_rules : tactic
          (try qedDestructExistsHyps) <;>
          qedUnfoldPresent [$[$usingL],*] <;>
          (try simp_all only [$[$finalCloserL],*]) <;>
-         (first | qedFastClose | omega | decide
-                | (simp_all [$[$finalCloserL],*] <;> first | qedFastClose | omega | decide | assumption | rfl | done)
+         (first | qedFastClose | omega | decide | qedNonlinearClose
+                | (simp_all [$[$finalCloserL],*] <;> qedAutoClose; done)
+                | qedAutoClose
                 | skip)))
     match init with
     | some initT =>

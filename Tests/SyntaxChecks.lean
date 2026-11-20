@@ -736,4 +736,130 @@ component PythonicShowcase:
 #guard Json.pathStr "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}" "choices.0.delta.content" == "hi"
 #guard Json.pathStr "{\"choices\":[]}" "choices.0.delta.content" == ""
 
+-- ── Automated Quantified, Collection-Query, Nonlinear & Extended `for_each` Invariants ──
+
+schema LineItem:
+  id    : Nat
+  price : Nat
+  done  : Bool
+  ts    : Nat
+
+-- 1 & 2. Quantified IDs, uniqueBy, sumBy, countWhere, and isSortedBy — all proved WITHOUT `:= by`!
+component SmartLedger:
+  state rows       : LineItem[] = []
+  state nextId     : Nat = 0
+  state lastTs     : Nat = 0
+  state totalCents : Nat = 0
+  state doneCount  : Nat = 0
+
+  action addItem(price: Nat, done: Bool):
+    let ts = lastTs + 1
+    rows.push(LineItem(id=nextId, price=price, done=done, ts=ts))
+    nextId += 1
+    lastTs = ts
+    totalCents += price
+    if done:
+      doneCount += 1
+
+  action reverseView:
+    rows = rows.reverse
+
+  action sortByPrice:
+    rows = rows.sortBy((a, b) => a.price <= b.price)
+
+  invariant idsAndUnique:
+    (all r in rows: r.id < nextId) and rows.uniqueBy(r => r.id)
+  invariant totalSynced:
+    rows.sumBy(r => r.price) == totalCents
+  invariant doneSynced:
+    rows.countWhere(r => r.done) == doneCount and doneCount <= rows.size
+
+  view:
+    <div>
+      <span>{totalCents}</span>
+      <span>{doneCount}</span>
+    </div>
+
+component SortedTimeline:
+  state events : LineItem[] = []
+  state lastTs : Nat = 0
+
+  action append(price: Nat):
+    let ts = lastTs + 1
+    events.push(LineItem(id=ts, price=price, done=false, ts=ts))
+    lastTs = ts
+
+  action dropLast:
+    events = events.pop
+
+  action keepExpensive(minPrice: Nat):
+    events = events.filter(e => e.price >= minPrice)
+
+  action sortByTs:
+    events = events.sortBy((a, b) => decide(a.ts <= b.ts))
+
+  invariant ordered:
+    (all e in events: e.ts <= lastTs) and events.isSortedBy(e => e.ts)
+
+  view: <span>{events.size}</span>
+
+-- 3. Nonlinear arithmetic invariants (monotonic mul/div + ring) — proved WITHOUT `:= by`!
+component BudgetCalc:
+  state price    : Nat = 10
+  state qty      : Nat = 2
+  state maxPrice : Nat = 100
+  state maxQty   : Nat = 50
+  state total    : Nat = 200
+
+  action setPrice(p: Nat):
+    if p <= maxPrice:
+      price = p
+
+  action setQty(q: Nat):
+    if q <= maxQty:
+      qty = q
+
+  action addTotal(delta: Nat):
+    if total + delta <= 1000:
+      total += delta
+
+  invariant bounds:
+    price <= maxPrice and qty <= maxQty and total <= 1000 and
+    price * qty <= maxPrice * maxQty and
+    total / 10 <= 100 and
+    (qty + 1) * price == qty * price + price
+
+  view: <span>{price * qty}</span>
+
+-- 4. Extended `for_each` array ops (pop, reverse, extract, eraseIdxIfInBounds, swapIfInBounds, setIfInBounds, modify)
+component PositiveCard:
+  state id    : Nat = 0
+  state score : Nat = 1
+  key id
+  action bump: score += 1
+  invariant positive: 1 <= score
+  view: <span>{score}</span>
+
+component ExtendedDeck:
+  collection cards : PositiveCard
+  action addCard(nid: Nat):
+    cards.push(PositiveCard.State(id=nid, score=1))
+  action popCard:
+    cards = cards.pop
+  action flipDeck:
+    cards = cards.reverse
+  action sliceTop:
+    cards = cards.extract(0, 5)
+  action dropAt(i: Nat):
+    cards = cards.eraseIdxIfInBounds(i)
+  action swapCards(i: Nat, j: Nat):
+    cards = cards.swapIfInBounds(i, j)
+  action replaceAt(i: Nat, nid: Nat):
+    cards = cards.setIfInBounds(i, PositiveCard.State(id=nid, score=5))
+  action boostAt(i: Nat):
+    cards = cards.modify(i, c => PositiveCard.State(id=c.id, score=c.score + 1))
+  invariant deckSafe: PositiveCard.positive for_each cards
+  view:
+    <div>{for c in cards: <PositiveCard state={c}/>}</div>
+
 end SyntaxChecks

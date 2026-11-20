@@ -12,17 +12,18 @@ syntax (name := invariantForEach)
 elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
   let predI : Ident := ⟨pred.raw⟩
   let elemClose ← if pred.raw.isIdent
-    then `(tactic| (try simp only [$predI:ident]) <;> (try (first | omega | simp_all | decide | trivial)))
-    else `(tactic| (try (first | omega | simp | simp_all | decide | trivial)))
+    then `(tactic| (try dsimp only) <;> (try simp only [$predI:ident, Qed.Lang.QedVal.val_id]) <;> (try (first | omega | simp_all | decide | trivial | qedAutoClose)))
+    else `(tactic| (try dsimp only) <;> (try simp only [Qed.Lang.QedVal.val_id]) <;> (try (first | omega | simp | simp_all | decide | trivial | qedAutoClose)))
   -- Unhygienic binder names so manual `case … =>` proofs can reference `m`, `h`, `y`, `hP`.
   let m := mkIdent `m; let msg := mkIdent `msg; let h := mkIdent `h
   let y := mkIdent `y; let hy := mkIdent `hy; let hP := mkIdent `hP
   let mapClose ← if pred.raw.isIdent
-    then `(tactic| ((try simp only [$predI:ident] at $hP:ident ⊢) <;>
+    then `(tactic| ((try dsimp only at $hP:ident ⊢) <;> (try simp only [$predI:ident, Qed.Lang.QedVal.val_id] at $hP:ident ⊢) <;>
                     (try (first | omega | (simp_all <;> omega) | (simp_all <;> done)
-                                | decide | trivial))))
-    else `(tactic| (try (first | omega | (simp_all <;> omega) | (simp_all <;> done)
-                               | decide | trivial)))
+                                | decide | trivial | qedAutoClose))))
+    else `(tactic| ((try dsimp only at $hP:ident ⊢) <;> (try simp only [Qed.Lang.QedVal.val_id] at $hP:ident ⊢) <;>
+                    (try (first | omega | (simp_all <;> omega) | (simp_all <;> done)
+                                | decide | trivial | qedAutoClose))))
   evalTactic (← `(tactic|
     (intro $m $msg $h
      cases $msg:ident <;>
@@ -31,11 +32,23 @@ elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
          | exact $h
          | exact Qed.ForEach.forall_filter $h
          | exact Qed.ForEach.forall_sortBy $h
+         | exact Qed.ForEach.forall_pop $h
+         | exact Qed.ForEach.forall_reverse $h
+         | exact Qed.ForEach.forall_extract $h
+         | exact Qed.ForEach.forall_eraseIdx $h
+         | exact Qed.ForEach.forall_eraseIdxIfInBounds $h
+         | exact Qed.ForEach.forall_swap $h
+         | exact Qed.ForEach.forall_swapIfInBounds $h
          | exact Qed.ForEach.updateKeyed_forall _ _ $childInv $h
          | exact Qed.ForEach.updateKeyed_forall _ _ ($childInv).2 $h
          | (refine Qed.ForEach.forall_map ?_ <;> intro $y $hy <;>
              have $hP:ident := $h $y $hy <;> ($mapClose:tactic))
+         | (refine Qed.ForEach.forall_modify $h ?_ <;> intro $y $hy $hP <;> ($mapClose:tactic))
          | (refine Qed.ForEach.forall_push $h ?_ <;> ($elemClose:tactic))
+         | (refine Qed.ForEach.forall_set $h ?_ <;> ($elemClose:tactic))
+         | (refine Qed.ForEach.forall_setIfInBounds $h ?_ <;> ($elemClose:tactic))
+         | (refine Qed.ForEach.forall_append $h ?_ <;> ($elemClose:tactic))
+         | grind
          | skip))))
 
 elab "qedDischargeForEach" upd:ident childInv:ident nm:ident pred:term : tactic => do

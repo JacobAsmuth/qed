@@ -23,7 +23,8 @@ message constructor and remaining goal.
 | Single state predicate | `invariant 0 <= count` |
 | Named state predicate | `invariant counterSafe: 0 <= count` |
 | Chained / multi-clause | `invariant inRange: 1 <= qty <= 10` (or `1 <= qty, qty <= 10`) |
-| Quantified property | `invariant all r in rows: r.id < nextId := by ...` |
+| Quantified property | `invariant all r in rows: r.id < nextId` |
+| Collection queries | `invariant rows.uniqueBy(r => r.id)` · `rows.sumBy(r => r.price) == total` · `rows.countWhere(r => r.done) == n` · `events.isSortedBy(e => e.ts)` |
 | Lifted child invariant | `invariant feedSafe: Card.cardSafe for_each cards` |
 | Component view / styles | `invariant roleHasOneOf("save", [on, off])` |
 | Multiple view rules | `invariant roleLacks("submit", danger), tagLacks("span", danger)` |
@@ -40,7 +41,8 @@ into named `Msg` constructors rather than anonymous closures, generated updates 
 same case-by-case error reporting as hand-written reducers:
 
 ```text
-case `set_count_2` still needs: 0 ≤ m.count - 1
+Invariant `Counter.counterSafe` failed in `Counter.update`:
+  • handler updating `count` must satisfy:  0 <= count - 1
 ```
 
 Running `qed check` (or `qed build`) reinforces these proofs by verifying the compiled
@@ -51,13 +53,21 @@ need to add invariants where there is a meaningful rule to enforce.
 
 ## Automatic vs. custom proofs
 
-**Automatic.** Most arithmetic (`omega`), boolean, `Option`, and `if`/`match` properties prove
-themselves with no tactic script:
+**Automatic.** Most invariants prove themselves with no tactic script—including linear arithmetic (`omega`), common nonlinear monotonicity (`price * qty <= maxPrice * maxQty`, `total / k <= maxAvg`, ring identities), booleans, `Option`, `if`/`match`, quantified collection bounds (`all r in rows: r.id < nextId`), and Qed's verified collection queries (`sumBy`, `sumByInt`, `countWhere`, `uniqueBy`, `isSortedBy`) backed by Lean 4's `grind` solver:
 
 ```lean
-component Counter:
-  state count : Int = 0
-  invariant counterSafe: 0 <= count
+component SmartLedger:
+  state rows       : LineItem[] = []
+  state nextId     : Nat = 0
+  state totalCents : Nat = 0
+  state doneCount  : Nat = 0
+
+  invariant idsAndUnique:
+    (all r in rows: r.id < nextId) and rows.uniqueBy(r => r.id)
+  invariant totalSynced:
+    rows.sumBy(r => r.price) == totalCents
+  invariant doneSynced:
+    rows.countWhere(r => r.done) == doneCount and doneCount <= rows.size
   ...
 ```
 
@@ -71,15 +81,12 @@ When a client `component` invokes a `server` `def` via `await` or `query`, Qed c
 - **Client `invariant` -> Server `requires`:** Component `invariant`s (as well as literals, `if` / `if let` branches, `ensure` guards, and `Field`/`Ensured` values) are automatically available as hypotheses to discharge every server parameter `requires` clause at compile time.
 - **Server `ensures` -> Client `invariant`:** Server postconditions (`ensures expr`) are encoded via zero-trust `Ensured α p` (`FromProto` re-verifies `p` on untrusted bytes) and automatically unpacked into continuation hypotheses across `let x = await Server.fn(...) catch: ...` and `Cached.all` invariants on reactive `query` fields (see [`Examples/CloudBooks.lean`](../Examples/CloudBooks.lean) and [`Tests/ServerChecks.lean`](../Tests/ServerChecks.lean)).
 
-**Custom proof (`:= by`).** When a property quantifies over a collection (`Array` or `List`) or
-relies on a domain lemma that automation cannot guess, attach a Lean tactic proof with `:= by`.
-Inside a `component`, `init` is discharged automatically and `update` is in scope, so the proof
-handles preservation starting with `intro m msg h`:
+**Custom proof (`using [lemma]` or `:= by`).** When a property depends on a custom recursive domain function or an unverified helper that automation cannot guess, pass a lemma with `using [myLemma]` or attach a Lean tactic proof with `:= by`. Inside a `component`, `init` is discharged automatically and `update` is in scope, so the proof handles preservation starting with `intro m msg h`:
 
 ```lean
-invariant idsBelowNext: all r in rows: r.id < nextId := by
+invariant customGraphAcyclic: isAcyclic(nodes) := by
   intro m msg h
-  cases msg <;> simp_all [update] <;> omega
+  cases msg <;> simp_all [update, isAcyclic_addEdge]
 ```
 
 ## Lifting invariants over child collections (`for_each`)
@@ -111,11 +118,8 @@ owning multiple feeds).
 ### Supported collection operations
 
 - **Keyed child updates:** discharged automatically using `Card.cardSafe`.
-- **`Array.filter`:** preserved automatically since kept items were already valid.
-- **Adding / pushing items:** Qed checks that the newly added item satisfies the child predicate.
-- **`Array.map`:** Qed checks that transforming a valid item produces a valid item.
-- **`Array.sortBy`:** preserved automatically via its permutation membership lemma (`Array.qsort`
-  is *not* handled automatically and requires a custom lemma).
+- **Element-preserving rearrangements & subsets:** `filter`, `sortBy` (verified `mergeSort`; `Array.qsort` has no membership lemma), `pop`, `reverse`, `extract`, `eraseIdx` / `eraseIdxIfInBounds`, and `swap` / `swapIfInBounds` lift automatically.
+- **Adding, replacing & transforming items:** `push`, `set` / `setIfInBounds`, `append` (`++`), `map`, and `modify` check that the new or transformed element satisfies the child predicate (using `omega`, `simp_all`, nonlinear closers, and `grind`).
 
 If one branch uses an unsupported operation (such as `qsort` or concatenating unvalidated
 data), Qed prints a proof skeleton using `forEachLift`, which closes all supported branches so

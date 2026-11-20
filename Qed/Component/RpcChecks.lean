@@ -164,7 +164,8 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
       return some (← cleanGoalExpr reduced)
   let mkProofLctx (lctx : LocalContext) : LocalContext :=
     lctx.foldl (init := {}) fun acc decl =>
-      match decl with
+      if decl.isAuxDecl then acc
+      else match decl with
       | .ldecl _ fv nm ty val _ k => acc.mkLetDecl fv nm ty val (nondep := false) (kind := k)
       | .cdecl _ fv nm ty bi k    => acc.mkLocalDecl fv nm ty bi (kind := k)
   for chk in checks do

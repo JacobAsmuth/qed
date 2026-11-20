@@ -11,6 +11,7 @@ import Qed.Router
 import Qed.Date
 import Qed.Schema
 import Qed.Component
+import Qed.Collection
 import Qed.ForEach
 import Qed.View
 import Qed.Jsx

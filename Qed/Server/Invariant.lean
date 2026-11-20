@@ -662,7 +662,9 @@ elab_rules : tactic
           | (simp (config := { zetaDelta := false }) [*] <;> omega)
           | (simp_all (config := { zetaDelta := false }) <;> omega)
           | (simp_all (config := { zetaDelta := false }) <;> decide)
-          | (simp_all (config := { zetaDelta := false }) <;> done))))
+          | (simp_all (config := { zetaDelta := false }) <;> done)
+          | qedNonlinearClose
+          | grind)))
 
 open Lean Meta Elab Tactic in
 elab_rules : tactic
@@ -1171,7 +1173,9 @@ elab_rules : tactic
           try first
             | trivial | rfl | assumption | decide | omega
             | (simp_all (config := { zetaDelta := true, zetaHave := true }) <;> omega)
-            | (simp_all (config := { zetaDelta := true, zetaHave := true }) <;> decide)))))
+            | (simp_all (config := { zetaDelta := true, zetaHave := true }) <;> decide)
+            | qedNonlinearClose
+            | grind))))
       let rem ← getUnsolvedGoals
       unless rem.isEmpty do
         let msg ← rem[0]!.withContext do Qed.Diag.ppQedExpr (← rem[0]!.getType)

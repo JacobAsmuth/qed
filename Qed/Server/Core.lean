@@ -1,65 +1,7 @@
 import Qed.Json
 import Qed.Proto
 import Qed.Router.Basic
-
-/-! ## Safe Array Indexing, Membership & Conservation Helpers -/
-
-def Array.findIndex {α : Type} (xs : Array α) (p : α → Bool) : Option (Fin xs.size) :=
-  Array.findFinIdx? p xs
-
-def Array.sumBy {α : Type} (xs : Array α) (f : α → Nat) : Nat :=
-  (xs.toList.map f).sum
-
-@[simp] theorem Array.sumBy_empty {α : Type} (f : α → Nat) :
-    (#[ ] : Array α).sumBy f = 0 := rfl
-
-@[simp] theorem Array.sumBy_push {α : Type} (xs : Array α) (f : α → Nat) (v : α) :
-    (xs.push v).sumBy f = xs.sumBy f + f v := by
-  unfold Array.sumBy
-  simp
-
-private theorem list_sum_map_set {α : Type} (f : α → Nat) :
-    ∀ (l : List α) (i : Nat) (v : α) (h : i < l.length),
-      ((l.set i v).map f).sum + f l[i] = (l.map f).sum + f v
-  | [], _, _, h => absurd h (Nat.not_lt_zero _)
-  | _ :: _, 0, _, _ => by
-      simp [List.set]
-      omega
-  | _ :: xs, i + 1, v, h => by
-      have hi : i < xs.length := Nat.lt_of_succ_lt_succ h
-      have ih := list_sum_map_set f xs i v hi
-      simp only [List.set, List.map_cons, List.sum_cons, List.getElem_cons_succ]
-      omega
-
-theorem Array.sumBy_set {α : Type} (xs : Array α) (f : α → Nat) (i : Nat) (v : α) (h : i < xs.size) :
-    (xs.set i v h).sumBy f + f xs[i] = xs.sumBy f + f v := by
-  unfold Array.sumBy
-  rw [Array.toList_set]
-  exact list_sum_map_set f xs.toList i v h
-
-@[simp] theorem Array.forall_push {α : Type} {P : α → Prop} {xs : Array α} {v : α} :
-    (∀ x ∈ xs.push v, P x) ↔ (∀ x ∈ xs, P x) ∧ P v := by
-  constructor
-  · intro h
-    exact ⟨fun x hx => h x (Array.mem_push.2 (.inl hx)),
-           h v (Array.mem_push.2 (.inr rfl))⟩
-  · rintro ⟨hxs, hv⟩ x hx
-    rcases Array.mem_push.1 hx with hmem | rfl
-    · exact hxs x hmem
-    · exact hv
-
-theorem Array.forall_set {α : Type} {P : α → Prop} {xs : Array α} {i : Nat} {v : α}
-    (h : i < xs.size) (hxs : ∀ x ∈ xs, P x) (hv : P v) :
-    ∀ x ∈ xs.set i v h, P x := by
-  intro x hx
-  rw [Array.mem_def, Array.toList_set] at hx
-  rcases List.mem_or_eq_of_mem_set hx with hmem | rfl
-  · exact hxs x (Array.mem_def.2 hmem)
-  · exact hv
-
-theorem Array.forall_elem {α : Type} {P : α → Prop} {xs : Array α} {i : Nat}
-    (h : i < xs.size) (hxs : ∀ x ∈ xs, P x) : P xs[i] :=
-  hxs xs[i] (Array.getElem_mem h)
+import Qed.Collection
 
 namespace Qed.Server
 

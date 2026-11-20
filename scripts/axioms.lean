@@ -351,3 +351,30 @@ import Examples.LiveRoom
 #print axioms Qed.Internal.App.withSpeculative_step_wellFormedIds
 #print axioms Qed.Internal.App.withSpeculative_rehydrate_sound
 #print axioms Qed.Internal.App.withSpeculative_dehydrate_inv
+
+-- Verified Collection Queries (`Qed.Collection`) & Extended `ForEach` Lifts
+#print axioms Array.sumBy_push
+#print axioms Array.sumBy_append
+#print axioms Array.sumBy_mergeSort
+#print axioms Array.sumBy_set
+#print axioms Array.sumBy_eraseIdx
+#print axioms Array.sumBy_filter_le
+#print axioms Array.sumBy_pop_le
+#print axioms Array.sumByInt_push
+#print axioms Array.sumByInt_set
+#print axioms Array.countWhere_push
+#print axioms Array.countWhere_le_size
+#print axioms Array.uniqueBy_push_iff
+#print axioms Array.uniqueBy_filter
+#print axioms Array.uniqueBy_mergeSort
+#print axioms Array.isSortedBy_push_iff
+#print axioms Array.isSortedBy_filter
+#print axioms Array.isSortedBy_mergeSort_le
+#print axioms Qed.ForEach.forall_append
+#print axioms Qed.ForEach.forall_pop
+#print axioms Qed.ForEach.forall_reverse
+#print axioms Qed.ForEach.forall_extract
+#print axioms Qed.ForEach.forall_eraseIdx
+#print axioms Qed.ForEach.forall_set
+#print axioms Qed.ForEach.forall_swap
+#print axioms Qed.ForEach.forall_modify

@@ -130,10 +130,6 @@ theorem everyElementL_mapList {α β} (p) (g : β → Html α) (l : List β) :
   | nil => simp [everyElementL]
   | cons x xs ih => simp [List.map, everyElementL, ih, Bool.and_eq_true]
 
-theorem roleHasOneOf_map {α β} (f : α → β) (r) (styles) (h : Html α) :
-    roleHasOneOf r styles (h.map f) = roleHasOneOf r styles h :=
-  everyElement_map f (fun _ _ => by simp [attrRole_map, attrClasses_map, hasOneClass]) h
-
 @[simp] theorem roleLacks_map {α β} (f : α → β) (r) (s) (h : Html α) :
     roleLacks r s (h.map f) = roleLacks r s h :=
   everyElement_map f (fun _ _ => by simp [attrRole_map, attrClasses_map]) h

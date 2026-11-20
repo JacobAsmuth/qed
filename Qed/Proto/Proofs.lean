@@ -37,6 +37,26 @@ private theorem uint32_ext {a b : UInt32} (h : a.toNat = b.toNat) : a = b :=
 private theorem uint64_ext {a b : UInt64} (h : a.toNat = b.toNat) : a = b :=
   UInt64.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq h)
 
+private theorem base_decomp (a b n : Nat) :
+    n % a + a * (n / a % b) = n % (a * b) := by
+  have h1 := Nat.mod_mul_right_div_self n a b
+  have h2 := Nat.mod_add_div (n % (a * b)) a
+  rw [Nat.mod_mod_of_dvd n (Nat.dvd_mul_right a b), h1] at h2
+  exact h2
+
+private theorem base256_4 (n : Nat) :
+    n % 256 + 256 * (n / 256 % 256)
+      + 65536 * (n / 65536 % 256)
+      + 16777216 * (n / 16777216 % 256) = n % 4294967296 := by
+  have hlo : n % 256 + 256 * (n / 256 % 256) = n % 65536 := base_decomp 256 256 n
+  have hhi : n / 65536 % 256 + 256 * (n / 16777216 % 256) = n / 65536 % 65536 := by
+    have h := base_decomp 256 256 (n / 65536)
+    rwa [Nat.div_div_eq_div_mul] at h
+  have hcomb : n % 65536 + 65536 * (n / 65536 % 65536) = n % 4294967296 :=
+    base_decomp 65536 65536 n
+  have h16 : (16777216 : Nat) = 65536 * 256 := rfl
+  rw [hlo, Nat.add_assoc, h16, Nat.mul_assoc 65536 256, ← Nat.mul_add 65536, hhi, hcomb]
+
 theorem decodeFixed32List_append (v : UInt32) (rest : List UInt8) :
     decodeFixed32List (encodeFixed32List v ++ rest) = .ok (v, rest) := by
   have hn' : v.toNat < 4294967296 := v.toBitVec.isLt
@@ -49,7 +69,8 @@ theorem decodeFixed32List_append (v : UInt32) (rest : List UInt8) :
       + 256 * (v.toNat / 256 % 256 % 256)
       + 65536 * (v.toNat / 65536 % 256 % 256)
       + 16777216 * (v.toNat / 16777216 % 256 % 256)) % 4294967296 = v.toNat
-    omega
+    simp only [Nat.mod_mod]
+    rw [base256_4, Nat.mod_mod, Nat.mod_eq_of_lt hn']
   · rfl
 
 theorem decodeFixed64List_append (v : UInt64) (rest : List UInt8) :
@@ -68,7 +89,34 @@ theorem decodeFixed64List_append (v : UInt64) (rest : List UInt8) :
       + 1099511627776 * (v.toNat / 1099511627776 % 256 % 256)
       + 281474976710656 * (v.toNat / 281474976710656 % 256 % 256)
       + 72057594037927936 * (v.toNat / 72057594037927936 % 256 % 256)) % 18446744073709551616 = v.toNat
-    omega
+    simp only [Nat.mod_mod]
+    have hhi :
+        v.toNat / 4294967296 % 256
+        + 256 * (v.toNat / 1099511627776 % 256)
+        + 65536 * (v.toNat / 281474976710656 % 256)
+        + 16777216 * (v.toNat / 72057594037927936 % 256) = v.toNat / 4294967296 % 4294967296 := by
+      have h := base256_4 (v.toNat / 4294967296)
+      simpa only [Nat.div_div_eq_div_mul] using h
+    have hcomb : v.toNat % 4294967296 + 4294967296 * (v.toNat / 4294967296 % 4294967296) =
+        v.toNat % 18446744073709551616 :=
+      base_decomp 4294967296 4294967296 v.toNat
+    rw [base256_4]
+    have hfact :
+        v.toNat % 4294967296
+          + 4294967296 * (v.toNat / 4294967296 % 256)
+          + 1099511627776 * (v.toNat / 1099511627776 % 256)
+          + 281474976710656 * (v.toNat / 281474976710656 % 256)
+          + 72057594037927936 * (v.toNat / 72057594037927936 % 256) =
+        v.toNat % 4294967296 + 4294967296 * (v.toNat / 4294967296 % 256
+          + 256 * (v.toNat / 1099511627776 % 256)
+          + 65536 * (v.toNat / 281474976710656 % 256)
+          + 16777216 * (v.toNat / 72057594037927936 % 256)) := by
+      have c1 : (1099511627776 : Nat) = 4294967296 * 256 := rfl
+      have c2 : (281474976710656 : Nat) = 4294967296 * 65536 := rfl
+      have c3 : (72057594037927936 : Nat) = 4294967296 * 16777216 := rfl
+      rw [c1, c2, c3]
+      simp only [Nat.mul_add, ← Nat.mul_assoc, Nat.add_assoc]
+    rw [hfact, hhi, hcomb, Nat.mod_mod, Nat.mod_eq_of_lt hn']
   · rfl
 
 theorem splitExact_append :

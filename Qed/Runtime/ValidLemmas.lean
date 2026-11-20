@@ -120,49 +120,55 @@ qed_sa sa_hidden    "hidden"
 private theorem mk_plainBlock (tag : String)
     (hs : isSafeTagName tag = true) (hf : isForbiddenTag tag = false)
     (hc : isContextOnlyTag tag = false) (hi : isInteractiveTag tag = false) (hh : isHeadingTag tag = false)
-    (ho : (tag == "svg" || tag == "style" || tag == "textarea" || tag == "select" ||
-           tag == "ul" || tag == "ol" || tag == "dl" || tag == "table" ||
-           tag == "p" || tag == "a" || tag == "button" || tag == "details" ||
-           tag == "summary" || tag == "label" || tag == "form") = false)
+    (ho : (tag == "svg" || tag == "style" || tag == "ul" || tag == "ol" || tag == "dl" ||
+           tag == "table" || tag == "p" || tag == "label" || tag == "form") = false)
     (interactive inForm : Bool) :
     stepHtmlCtx { mode := .normal, inP := false, interactive, inForm } tag =
       some { mode := .normal, inP := false, interactive, inForm } := by
+  have hi' := hi
+  simp only [isInteractiveTag, Bool.or_eq_false_iff] at hi'
+  rcases hi' with ⟨⟨⟨⟨⟨⟨ha, hbtn⟩, _⟩, hsel⟩, hta⟩, hdet⟩, hsum⟩
   simp only [Bool.or_eq_false_iff] at ho
-  rcases ho with ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1,h2⟩,h3⟩,h4⟩,h5⟩,h6⟩,h7⟩,h8⟩,h9⟩,h10⟩,h11⟩,h12⟩,h13⟩,h14⟩,h15⟩
-  cases interactive <;> cases inForm <;>
-    simp [stepHtmlCtx, hs, hf, hc, hi, hh, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15]
+  rcases ho with ⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h14⟩, h15⟩
+  simp only [stepHtmlCtx, hs, hf, hc, hi, hh, ha, hbtn, hsel, hta, hdet, hsum,
+    h1, h2, h5, h6, h7, h8, h9, h14, h15, Bool.not_true, Bool.or_false,
+    Bool.false_and, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
 
 private theorem mk_plainInline (tag : String)
     (hs : isSafeTagName tag = true) (hf : isForbiddenTag tag = false)
     (hc : isContextOnlyTag tag = false) (hcp : closesPTag tag = false)
     (hi : isInteractiveTag tag = false) (hh : isHeadingTag tag = false)
-    (ho : (tag == "svg" || tag == "style" || tag == "textarea" || tag == "select" ||
-           tag == "ul" || tag == "ol" || tag == "dl" || tag == "table" ||
-           tag == "p" || tag == "a" || tag == "button" || tag == "details" ||
-           tag == "summary" || tag == "label" || tag == "form") = false)
+    (ho : (tag == "svg" || tag == "style" || tag == "ul" || tag == "ol" || tag == "dl" ||
+           tag == "table" || tag == "p" || tag == "label" || tag == "form") = false)
     (inP interactive inForm : Bool) :
     stepHtmlCtx { mode := .normal, inP, interactive, inForm } tag =
       some { mode := .normal, inP, interactive, inForm } := by
+  have hi' := hi
+  simp only [isInteractiveTag, Bool.or_eq_false_iff] at hi'
+  rcases hi' with ⟨⟨⟨⟨⟨⟨ha, hbtn⟩, _⟩, hsel⟩, hta⟩, hdet⟩, hsum⟩
   simp only [Bool.or_eq_false_iff] at ho
-  rcases ho with ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1,h2⟩,h3⟩,h4⟩,h5⟩,h6⟩,h7⟩,h8⟩,h9⟩,h10⟩,h11⟩,h12⟩,h13⟩,h14⟩,h15⟩
-  cases inP <;> cases interactive <;> cases inForm <;>
-    simp [stepHtmlCtx, hs, hf, hc, hcp, hi, hh, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15]
+  rcases ho with ⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h14⟩, h15⟩
+  simp only [stepHtmlCtx, hs, hf, hc, hcp, hi, hh, ha, hbtn, hsel, hta, hdet, hsum,
+    h1, h2, h5, h6, h7, h8, h9, h14, h15, Bool.not_true, Bool.or_false,
+    Bool.and_false, Bool.false_eq_true, ↓reduceIte]
 
 private theorem mk_heading (tag : String)
     (hs : isSafeTagName tag = true) (hf : isForbiddenTag tag = false)
     (hc : isContextOnlyTag tag = false) (hi : isInteractiveTag tag = false)
     (hp : (tag == "p" || isHeadingTag tag) = true)
-    (ho : (tag == "svg" || tag == "style" || tag == "textarea" || tag == "select" ||
-           tag == "ul" || tag == "ol" || tag == "dl" || tag == "table" ||
-           tag == "a" || tag == "button" || tag == "details" ||
-           tag == "summary" || tag == "label" || tag == "form") = false)
+    (ho : (tag == "svg" || tag == "style" || tag == "ul" || tag == "ol" || tag == "dl" ||
+           tag == "table" || tag == "label" || tag == "form") = false)
     (interactive inForm : Bool) :
     stepHtmlCtx { mode := .normal, inP := false, interactive, inForm } tag =
       some { mode := .normal, inP := true, interactive, inForm } := by
+  have hi' := hi
+  simp only [isInteractiveTag, Bool.or_eq_false_iff] at hi'
+  rcases hi' with ⟨⟨⟨⟨⟨⟨ha, hbtn⟩, _⟩, hsel⟩, hta⟩, hdet⟩, hsum⟩
   simp only [Bool.or_eq_false_iff] at ho
-  rcases ho with ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1,h2⟩,h3⟩,h4⟩,h5⟩,h6⟩,h7⟩,h8⟩,h9⟩,h10⟩,h11⟩,h12⟩,h13⟩,h14⟩
-  cases interactive <;> cases inForm <;>
-    simp [stepHtmlCtx, hs, hf, hc, hi, hp, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14]
+  rcases ho with ⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h5⟩, h6⟩, h7⟩, h8⟩, h14⟩, h15⟩
+  simp only [stepHtmlCtx, hs, hf, hc, hi, hp, ha, hbtn, hsel, hta, hdet, hsum,
+    h1, h2, h5, h6, h7, h8, h14, h15, Bool.not_true, Bool.false_or, Bool.or_false,
+    Bool.false_and, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
 
 private theorem mk_interactive (tag : String)
     (hs : isSafeTagName tag = true) (hf : isForbiddenTag tag = false)
@@ -175,9 +181,12 @@ private theorem mk_interactive (tag : String)
     stepHtmlCtx { mode := .normal, inP, interactive := false, inForm } tag =
       some { mode := .normal, inP, interactive := true, inForm } := by
   simp only [Bool.or_eq_false_iff] at ho
-  rcases ho with ⟨⟨⟨⟨⟨⟨⟨⟨⟨h1,h2⟩,h3⟩,h4⟩,h5⟩,h6⟩,h7⟩,h8⟩,h9⟩,h10⟩
-  cases inP <;> cases inForm <;>
-    simpa [stepHtmlCtx, hs, hf, hc, hcp, hh, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10] using hint
+  rcases ho with ⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h10⟩
+  simp only [stepHtmlCtx, hs, hf, hc, hcp, hh, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10,
+    Bool.not_true, Bool.false_or, Bool.or_false, Bool.false_and, Bool.and_false,
+    Bool.false_eq_true, ↓reduceIte, Bool.or_assoc]
+  rw [show (tag == "a" || (tag == "button" || (tag == "details" || tag == "summary"))) = true by
+    simpa [Bool.or_assoc] using hint]
 
 private theorem mk_inputLike (tag : String)
     (hs : isSafeTagName tag = true) (hf : isForbiddenTag tag = false)
@@ -190,9 +199,97 @@ private theorem mk_inputLike (tag : String)
     stepHtmlCtx { mode := .normal, inP, interactive := false, inForm } tag =
       some { mode := .normal, inP, interactive := false, inForm } := by
   simp only [Bool.or_eq_false_iff] at ho
-  rcases ho with ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1,h2⟩,h3⟩,h4⟩,h5⟩,h6⟩,h7⟩,h8⟩,h9⟩,h10⟩,h11⟩,h12⟩,h13⟩,h14⟩
-  cases inP <;> cases inForm <;>
-    simp [stepHtmlCtx, hs, hf, hc, hcp, hh, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14]
+  rcases ho with ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h10⟩, h11⟩, h12⟩, h13⟩, h14⟩
+  simp only [stepHtmlCtx, hs, hf, hc, hcp, hh, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14,
+    Bool.not_true, Bool.or_false, Bool.false_and, Bool.and_false,
+    Bool.false_eq_true, ↓reduceIte]
+
+private theorem mk_normalModeChange (tag : String) (m2 : TagMode)
+    (hs : isSafeTagName tag = true) (hf : isForbiddenTag tag = false)
+    (hc : isContextOnlyTag tag = false) (hi : isInteractiveTag tag = false)
+    (ho : (tag == "svg" || tag == "style" || tag == "label" || tag == "form") = false)
+    (hstep : (if tag == "ul" || tag == "ol" then some TagMode.ulOl
+              else if tag == "dl" then some TagMode.dl
+              else if tag == "table" then some TagMode.table
+              else none) = some m2)
+    (interactive inForm : Bool) :
+    stepHtmlCtx { mode := .normal, inP := false, interactive, inForm } tag =
+      some { mode := m2, inP := false, interactive, inForm } := by
+  have hi' := hi
+  simp only [isInteractiveTag, Bool.or_eq_false_iff] at hi'
+  rcases hi' with ⟨⟨⟨⟨⟨⟨_, _⟩, _⟩, hsel⟩, hta⟩, _⟩, _⟩
+  simp only [Bool.or_eq_false_iff] at ho
+  rcases ho with ⟨⟨⟨hsvg, hsty⟩, hlab⟩, hfrm⟩
+  simp only [stepHtmlCtx, hs, hf, hc, hi, hsel, hta, hsvg, hsty, hlab, hfrm,
+    Bool.not_true, Bool.or_false, Bool.false_and, Bool.and_false,
+    Bool.false_eq_true, ↓reduceIte]
+  by_cases h1 : (tag == "ul" || tag == "ol") = true
+  · rw [if_pos h1] at hstep ⊢; cases hstep; rfl
+  · rw [if_neg h1] at hstep ⊢
+    by_cases h2 : (tag == "dl") = true
+    · rw [if_pos h2] at hstep ⊢; cases hstep; rfl
+    · rw [if_neg h2] at hstep ⊢
+      by_cases h3 : (tag == "table") = true
+      · rw [if_pos h3] at hstep ⊢; cases hstep; rfl
+      · rw [if_neg h3] at hstep; cases hstep
+
+private theorem mk_interModeChange (tag : String) (m2 : TagMode)
+    (hs : isSafeTagName tag = true) (hf : isForbiddenTag tag = false)
+    (hc : isContextOnlyTag tag = false) (hcp : closesPTag tag = false)
+    (ho : (tag == "svg" || tag == "style" || tag == "form") = false)
+    (hstep : (if tag == "textarea" then some TagMode.textarea
+              else if tag == "select" then some TagMode.select
+              else none) = some m2)
+    (inP inForm : Bool) :
+    stepHtmlCtx { mode := .normal, inP, interactive := false, inForm } tag =
+      some { mode := m2, inP, interactive := true, inForm } := by
+  simp only [Bool.or_eq_false_iff] at ho
+  rcases ho with ⟨⟨hsvg, hsty⟩, hfrm⟩
+  simp only [stepHtmlCtx, hs, hf, hc, hcp, hsvg, hsty, hfrm,
+    Bool.not_true, Bool.or_false, Bool.false_and, Bool.and_false,
+    Bool.false_eq_true, ↓reduceIte]
+  by_cases h1 : (tag == "textarea") = true
+  · rw [if_pos h1] at hstep ⊢; cases hstep; rfl
+  · rw [if_neg h1] at hstep ⊢
+    by_cases h2 : (tag == "select") = true
+    · rw [if_pos h2] at hstep ⊢; cases hstep; rfl
+    · rw [if_neg h2] at hstep; cases hstep
+
+private theorem mk_modeStep (m1 m2 : TagMode) (tag : String)
+    (hs : isSafeTagName tag = true) (hf : isForbiddenTag tag = false)
+    (hstep : (match m1 with
+      | .ulOl => if tag == "li" then some TagMode.normal else none
+      | .table => if tag == "caption" then some TagMode.normal
+                  else if tag == "colgroup" then some TagMode.colgroup
+                  else if tag == "thead" || tag == "tbody" || tag == "tfoot" then some TagMode.tableSection
+                  else none
+      | .tableSection => if tag == "tr" then some TagMode.tableRow else none
+      | .tableRow => if tag == "td" || tag == "th" then some TagMode.normal else none
+      | _ => none) = some m2)
+    (p i f : Bool) :
+    stepHtmlCtx { mode := m1, inP := p, interactive := i, inForm := f } tag =
+      some { mode := m2, inP := false, interactive := i, inForm := f } := by
+  cases m1 <;>
+    simp only [stepHtmlCtx, hs, hf, Bool.not_true, Bool.or_false, Bool.false_eq_true, ↓reduceIte] at hstep ⊢ <;>
+    try cases hstep
+  · by_cases h : (tag == "li") = true
+    · rw [if_pos h] at hstep ⊢; cases hstep; rfl
+    · rw [if_neg h] at hstep; cases hstep
+  · by_cases h1 : (tag == "caption") = true
+    · rw [if_pos h1] at hstep ⊢; cases hstep; rfl
+    · rw [if_neg h1] at hstep ⊢
+      by_cases h2 : (tag == "colgroup") = true
+      · rw [if_pos h2] at hstep ⊢; cases hstep; rfl
+      · rw [if_neg h2] at hstep ⊢
+        by_cases h3 : (tag == "thead" || tag == "tbody" || tag == "tfoot") = true
+        · rw [if_pos h3] at hstep ⊢; cases hstep; rfl
+        · rw [if_neg h3] at hstep; cases hstep
+  · by_cases h : (tag == "tr") = true
+    · rw [if_pos h] at hstep ⊢; cases hstep; rfl
+    · rw [if_neg h] at hstep; cases hstep
+  · by_cases h : (tag == "td" || tag == "th") = true
+    · rw [if_pos h] at hstep ⊢; cases hstep; rfl
+    · rw [if_neg h] at hstep; cases hstep
 
 local macro "qed_step_block " id:ident tag:str : command =>
   `(theorem $id (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } $tag =
@@ -216,9 +313,8 @@ local macro "qed_step_input " id:ident tag:str : command =>
     mk_inputLike $tag rfl rfl rfl rfl rfl rfl p f)
 local macro "qed_step_mode " id:ident m1:ident m2:ident tag:str : command =>
   `(theorem $id (p i f : Bool) : stepHtmlCtx { mode := .$m1, inP := p, interactive := i, inForm := f } $tag =
-      some { mode := .$m2, inP := false, interactive := i, inForm := f } := by
-    have h1 : isSafeTagName $tag = true := rfl; have h2 : isForbiddenTag $tag = false := rfl
-    simp [stepHtmlCtx, h1, h2])
+      some { mode := .$m2, inP := false, interactive := i, inForm := f } :=
+    mk_modeStep .$m1 .$m2 $tag rfl rfl rfl p i f)
 
 qed_step_block step_div "div"
 qed_step_block step_section "section"
@@ -271,38 +367,28 @@ theorem step_form :
 
 theorem step_textarea (inP inForm : Bool) :
     stepHtmlCtx { mode := .normal, inP, interactive := false, inForm } "textarea" =
-      some { mode := .textarea, inP, interactive := true, inForm } := by
-  have h1 : isSafeTagName "textarea" = true := rfl; have h2 : isForbiddenTag "textarea" = false := rfl
-  have h3 : isContextOnlyTag "textarea" = false := rfl; have h4 : closesPTag "textarea" = false := rfl
-  cases inP <;> cases inForm <;> simp [stepHtmlCtx, h1, h2, h3, h4]
+      some { mode := .textarea, inP, interactive := true, inForm } :=
+  mk_interModeChange "textarea" .textarea rfl rfl rfl rfl rfl rfl inP inForm
 
 theorem step_select (inP inForm : Bool) :
     stepHtmlCtx { mode := .normal, inP, interactive := false, inForm } "select" =
-      some { mode := .select, inP, interactive := true, inForm } := by
-  have h1 : isSafeTagName "select" = true := rfl; have h2 : isForbiddenTag "select" = false := rfl
-  have h3 : isContextOnlyTag "select" = false := rfl; have h4 : closesPTag "select" = false := rfl
-  cases inP <;> cases inForm <;> simp [stepHtmlCtx, h1, h2, h3, h4]
+      some { mode := .select, inP, interactive := true, inForm } :=
+  mk_interModeChange "select" .select rfl rfl rfl rfl rfl rfl inP inForm
 
 theorem step_ul (interactive inForm : Bool) :
     stepHtmlCtx { mode := .normal, inP := false, interactive, inForm } "ul" =
-      some { mode := .ulOl, inP := false, interactive, inForm } := by
-  have h1 : isSafeTagName "ul" = true := rfl; have h2 : isForbiddenTag "ul" = false := rfl
-  have h3 : isContextOnlyTag "ul" = false := rfl; have h4 : isInteractiveTag "ul" = false := rfl
-  cases interactive <;> cases inForm <;> simp [stepHtmlCtx, h1, h2, h3, h4]
+      some { mode := .ulOl, inP := false, interactive, inForm } :=
+  mk_normalModeChange "ul" .ulOl rfl rfl rfl rfl rfl rfl interactive inForm
 
 theorem step_ol (interactive inForm : Bool) :
     stepHtmlCtx { mode := .normal, inP := false, interactive, inForm } "ol" =
-      some { mode := .ulOl, inP := false, interactive, inForm } := by
-  have h1 : isSafeTagName "ol" = true := rfl; have h2 : isForbiddenTag "ol" = false := rfl
-  have h3 : isContextOnlyTag "ol" = false := rfl; have h4 : isInteractiveTag "ol" = false := rfl
-  cases interactive <;> cases inForm <;> simp [stepHtmlCtx, h1, h2, h3, h4]
+      some { mode := .ulOl, inP := false, interactive, inForm } :=
+  mk_normalModeChange "ol" .ulOl rfl rfl rfl rfl rfl rfl interactive inForm
 
 theorem step_table (interactive inForm : Bool) :
     stepHtmlCtx { mode := .normal, inP := false, interactive, inForm } "table" =
-      some { mode := .table, inP := false, interactive, inForm } := by
-  have h1 : isSafeTagName "table" = true := rfl; have h2 : isForbiddenTag "table" = false := rfl
-  have h3 : isContextOnlyTag "table" = false := rfl; have h4 : isInteractiveTag "table" = false := rfl
-  cases interactive <;> cases inForm <;> simp [stepHtmlCtx, h1, h2, h3, h4]
+      some { mode := .table, inP := false, interactive, inForm } :=
+  mk_normalModeChange "table" .table rfl rfl rfl rfl rfl rfl interactive inForm
 
 qed_step_mode step_li ulOl normal "li"
 qed_step_mode step_thead table tableSection "thead"

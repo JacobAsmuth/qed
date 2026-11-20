@@ -1,5 +1,4 @@
 import Qed.Runtime.App
-import Qed.Style
 import Qed.Diag
 import Qed.Collection
 import Lean

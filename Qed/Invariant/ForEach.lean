@@ -1,6 +1,5 @@
 import Qed.Component.Core
 import Qed.Invariant.View
-import Lean
 
 namespace Qed
 open Lean Elab Tactic
@@ -10,20 +9,22 @@ syntax (name := invariantForEach)
     (" := " term)? : command
 
 elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
-  let predI : Ident := ⟨pred.raw⟩
+  let predLem ← if pred.raw.isIdent
+    then pure #[← `(Lean.Parser.Tactic.simpLemma| $(⟨pred.raw⟩):ident),
+                ← `(Lean.Parser.Tactic.simpLemma| Qed.Lang.QedVal.val_id)]
+    else pure #[← `(Lean.Parser.Tactic.simpLemma| Qed.Lang.QedVal.val_id)]
   let elemClose ← if pred.raw.isIdent
-    then `(tactic| (try dsimp only) <;> (try simp only [$predI:ident, Qed.Lang.QedVal.val_id]) <;> (try (first | omega | simp_all | decide | trivial | qedAutoClose)))
-    else `(tactic| (try dsimp only) <;> (try simp only [Qed.Lang.QedVal.val_id]) <;> (try (first | omega | simp | simp_all | decide | trivial | qedAutoClose)))
+    then `(tactic| (try dsimp only) <;> (try simp only [$[$predLem],*]) <;>
+                   (try (first | omega | simp_all | decide | trivial | qedAutoClose)))
+    else `(tactic| (try dsimp only) <;> (try simp only [$[$predLem],*]) <;>
+                   (try (first | omega | simp | simp_all | decide | trivial | qedAutoClose)))
   -- Unhygienic binder names so manual `case … =>` proofs can reference `m`, `h`, `y`, `hP`.
   let m := mkIdent `m; let msg := mkIdent `msg; let h := mkIdent `h
   let y := mkIdent `y; let hy := mkIdent `hy; let hP := mkIdent `hP
-  let mapClose ← if pred.raw.isIdent
-    then `(tactic| ((try dsimp only at $hP:ident ⊢) <;> (try simp only [$predI:ident, Qed.Lang.QedVal.val_id] at $hP:ident ⊢) <;>
-                    (try (first | omega | (simp_all <;> omega) | (simp_all <;> done)
-                                | decide | trivial | qedAutoClose))))
-    else `(tactic| ((try dsimp only at $hP:ident ⊢) <;> (try simp only [Qed.Lang.QedVal.val_id] at $hP:ident ⊢) <;>
-                    (try (first | omega | (simp_all <;> omega) | (simp_all <;> done)
-                                | decide | trivial | qedAutoClose))))
+  let mapClose ← `(tactic|
+    ((try dsimp only at $hP:ident ⊢) <;> (try simp only [$[$predLem],*] at $hP:ident ⊢) <;>
+     (try (first | omega | (simp_all <;> omega) | (simp_all <;> done)
+                 | decide | trivial | qedAutoClose))))
   evalTactic (← `(tactic|
     (intro $m $msg $h
      cases $msg:ident <;>
@@ -88,32 +89,34 @@ macro_rules
                  (∀ c ∈ (InvTarget.proj ($upd m msg)).$field, ($pred) c) := by
         qedDischargeForEach $upd $childInv $name $pred)
 
-macro "forEachStyleLift " view:ident childStyled:ident : tactic =>
-  `(tactic|
-    (intro m
-     qedStyleReduce $view
-     all_goals (try (rw [Qed.everyElementL_mapList]
-                     intro c _
-                     first
-                       | (refine Qed.everyElement_through_map _ _ ?_ ($childStyled c) <;>
-                            (intro t a;
-                             first
-                               | (simp only [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done)
-                               | (simp [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done)))
-                       | (simp only [Qed.everyElement, Qed.everyElementL, Bool.and_eq_true]
-                          repeat' apply And.intro
-                          all_goals (first
-                            | (refine Qed.everyElement_through_map _ _ ?_ ($childStyled c) <;>
-                                 (intro t a;
-                                  first
-                                    | (simp only [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done)
-                                    | (simp [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done)))
-                            | (simp only [Qed.attrRole, Qed.attrClasses, Qed.hasOneClass,
-                                          Bool.true_and, Bool.and_true, Bool.false_and, Bool.and_false,
-                                          Bool.true_or, Bool.or_true, Bool.false_or, Bool.or_false,
-                                          ite_true, ite_false, beq_self_eq_true, eq_self]; (try rfl); done)
-                            | (simp [Qed.attrRole, Qed.attrClasses, Qed.hasOneClass]; done)
-                            | rfl))))))
+syntax "forEachStyleLift " ident ident : tactic
+
+macro_rules
+  | `(tactic| forEachStyleLift $view:ident $childStyled:ident) => do
+      let c := mkIdent `c
+      let liftChild ← `(tactic|
+        (refine Qed.everyElement_through_map _ _ ?_ ($childStyled $c) <;>
+          (intro t a;
+           first
+             | (simp only [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done)
+             | (simp [Qed.attrRole_map, Qed.attrClasses_map, Qed.hasOneClass]; done))))
+      `(tactic|
+        (intro m
+         qedStyleReduce $view
+         all_goals (try (rw [Qed.everyElementL_mapList]
+                         intro $c _
+                         first
+                           | $liftChild:tactic
+                           | (simp only [Qed.everyElement, Qed.everyElementL, Bool.and_eq_true]
+                              repeat' apply And.intro
+                              all_goals (first
+                                | $liftChild:tactic
+                                | (simp only [Qed.attrRole, Qed.attrClasses, Qed.hasOneClass,
+                                              Bool.true_and, Bool.and_true, Bool.false_and, Bool.and_false,
+                                              Bool.true_or, Bool.or_true, Bool.false_or, Bool.or_false,
+                                              ite_true, ite_false, beq_self_eq_true, eq_self]; (try rfl); done)
+                                | (simp [Qed.attrRole, Qed.attrClasses, Qed.hasOneClass]; done)
+                                | rfl))))))
 
 elab "qedDischargeStyledForEach" view:ident field:ident childStyled:ident nm:ident pred:term : tactic => do
   evalTactic (← `(tactic| forEachStyleLift $view $childStyled))

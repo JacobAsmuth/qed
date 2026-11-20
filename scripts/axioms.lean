@@ -306,7 +306,6 @@ import Examples.LiveRoom
 #print axioms Qed.Cached.all_put
 #print axioms Qed.Cached.all_lookup_state
 #print axioms Qed.Query.boot_preserves_inv
-#print axioms Qed.Query.wrap_preserves_inv
 
 -- Verified Multiplexed & 3rd-Party WebSockets (Framing, Reconnect, Transactional Emit, Subscriptions & Closure)
 #print axioms Qed.Reconnect.nextDelayMs_off

@@ -1,5 +1,4 @@
 import Qed.Runtime.App
-import Qed.Resource
 
 namespace Qed
 

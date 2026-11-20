@@ -1,6 +1,5 @@
 import Qed.Proto.Basic
 import Qed.Proto.Proofs
-import Qed.Json.Basic
 import Qed.Json.Lawful
 import Qed.Date
 

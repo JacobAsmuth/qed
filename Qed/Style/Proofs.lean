@@ -1,5 +1,4 @@
 import Qed.Style.Core
-import Qed.Style.Contrast
 
 namespace Qed
 
@@ -249,16 +248,14 @@ theorem Theme.render_no_closeSeq (th : Theme) :
 theorem Keyframes.renderSteps_no_lt :
     ∀ (steps : List (String × List Item)), ∀ c ∈ (Keyframes.renderSteps steps).toList, c ≠ '<'
   | [] => lit_no_lt "" rfl
-  | [(sel, body)] => by
-      simp only [Keyframes.renderSteps]
-      exact str_append_no_lt
+  | [(sel, body)] =>
+      str_append_no_lt
         (str_append_no_lt
           (str_append_no_lt (sanitizeCssSelector_no_lt sel) (lit_no_lt " { " rfl))
           (Item.renderList_no_lt body))
         (lit_no_lt " }" rfl)
-  | (sel, body) :: s2 :: rest => by
-      simp only [Keyframes.renderSteps]
-      exact str_append_no_lt
+  | (sel, body) :: s2 :: rest =>
+      str_append_no_lt
         (str_append_no_lt
           (str_append_no_lt
             (str_append_no_lt (sanitizeCssSelector_no_lt sel) (lit_no_lt " { " rfl))

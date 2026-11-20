@@ -1,4 +1,3 @@
-import Qed.Proofs.DomArena
 import Qed.Proofs.KeyedReconcile
 
 namespace Qed
@@ -20,7 +19,9 @@ theorem patchViewM_memo_hit {σ msg : Type} (sm : SoundMemo σ msg)
     readDomTree fuel a' node = specDom ns (View.render (.memo sm) s₂) := by
   have hbeq : (sm.keyOf s₂ == sm.keyOf s₁) = true := beq_iff_eq.2 hkey
   have heval : sm.eval s₂ = sm.eval s₁ := sm.sound s₂ s₁ hkey
-  simp [patchViewM, StateT.run, pure, StateT.pure, hbeq, View.render, heval, hdom]
+  dsimp only [patchViewM, StateT.run, pure, StateT.pure]
+  rw [if_pos hbeq]
+  exact ⟨rfl, rfl, by simpa only [View.render, heval] using hdom⟩
 
 theorem patchViewM_dyn_spec {σ msg : Type} (get : σ → String) (s₁ s₂ : σ)
     (parent node : Dom.Node) (idx : UInt32) (a : DomArena msg) (fuel : Nat) (hf : 0 < fuel) :
@@ -31,10 +32,15 @@ theorem patchViewM_dyn_spec {σ msg : Type} (get : σ → String) (s₁ s₂ : �
   cases fuel with
   | zero => omega
   | succ _ =>
-      dsimp only
+      dsimp only [patchViewM, StateT.run]
       by_cases heq : get s₂ = get s₁
-      · simp [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure, heq, readDomTree, DomArena.get_set_self, specDom, View.render]
-      · simp [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure, heq, MonadDom.setText, DomArena.modify, DomArena.get_set_self, readDomTree, specDom, View.render]
+      · have hne : (get s₂ != get s₁) = false := by rw [heq]; exact bne_self_eq_false _
+        rw [if_neg (by rw [hne]; exact Bool.false_ne_true)]
+        simp only [heq, bind, StateT.bind, pure, StateT.pure, readDomTree, DomArena.get_set_self, specDom, View.render, and_self]
+      · have hne : (get s₂ != get s₁) = true := bne_iff_ne.2 heq
+        rw [if_pos hne]
+        simp only [bind, StateT.bind, pure, StateT.pure, DomArena.modify,
+          DomArena.get_set_self, DomArena.set_set, readDomTree, specDom, View.render, and_self]
 
 theorem forEach_disambiguated_keys_nodup {α σ : Type} (items : σ → Array α) (key : α → String) (s : σ) :
     (disambiguateKeys ((items s).map key)).toList.Nodup :=
@@ -228,29 +234,44 @@ private def AttrKeyEq {msg : Type} : List (Attr msg) → List (Attr msg) → Pro
   | x :: xs, y :: ys => x.key? = y.key? ∧ managedAttrName x = managedAttrName y ∧ AttrKeyEq xs ys
   | _, _ => False
 
+private theorem stepSpecAttr_attr_ne {msg : Type} (st : SpecElemState msg) {k : String} (v : String) (h : k ≠ "value") :
+    stepSpecAttr st (.attr k v) = { st with attrs := setAssoc k v st.attrs } := by
+  simp [stepSpecAttr]
+
+private theorem stepSpecAttr_flag_ne {msg : Type} (st : SpecElemState msg) {k : String} (p : Bool) (h : k ≠ "checked") :
+    stepSpecAttr st (.flag k p) = { st with attrs := if p then setAssoc k k st.attrs else eraseAssoc k st.attrs } := by
+  simp [stepSpecAttr]
+
+private theorem filterMap_cls_eq_of_noBind {σ msg : Type} (s₁ s₂ : σ) :
+    ∀ (ys : List (VAttr σ msg)), noBind ys = true →
+      (ys.map (VAttr.eval s₁)).filterMap (fun | .cls c => some c | _ => none) =
+      (ys.map (VAttr.eval s₂)).filterMap (fun | .cls c => some c | _ => none)
+  | [], _ => rfl
+  | va :: rest, hn => by
+      simp only [noBind, List.all_cons, Bool.and_eq_true] at hn
+      cases va with
+      | bind _ | dynOn _ _ => exact absurd hn.1 Bool.false_ne_true
+      | dynVal _ _ =>
+          simp only [List.map_cons, VAttr.eval, List.filterMap_cons]
+          exact filterMap_cls_eq_of_noBind s₁ s₂ rest hn.2
+      | stat a =>
+          cases a <;> simp only [List.map_cons, VAttr.eval, List.filterMap_cons,
+            filterMap_cls_eq_of_noBind s₁ s₂ rest hn.2]
+
 private theorem managedNames_eq_of_noBind {σ msg : Type} {s₁ s₂ : σ} :
     ∀ {xs : List (VAttr σ msg)}, noBind xs = true →
       (normalizeAttrs (xs.map (VAttr.eval s₂))).filterMap managedAttrName =
       (normalizeAttrs (xs.map (VAttr.eval s₁))).filterMap managedAttrName := by
-  have hcls : ∀ (ys : List (VAttr σ msg)), noBind ys = true →
-      (ys.map (VAttr.eval s₁)).filterMap (fun | .cls c => some c | _ => none) =
-      (ys.map (VAttr.eval s₂)).filterMap (fun | .cls c => some c | _ => none) := by
-    intro ys; induction ys with
-    | nil => intro _; rfl
-    | cons va rest ih =>
-        intro hn; simp only [noBind, List.all_cons, Bool.and_eq_true] at hn
-        cases va with
-        | bind _ | dynOn _ _ => simp at hn
-        | dynVal _ _ => simpa using ih hn.2
-        | stat a => cases a <;> simp [ih hn.2]
   have hany : ∀ (k : String) (xs ys : List (Attr msg)), AttrKeyEq xs ys →
       xs.any (·.key? == some k) = ys.any (·.key? == some k) := fun k => by
     intro xs; induction xs with
     | nil => intro ys h; cases ys with | nil => rfl | cons _ _ => exact False.elim h
-    | cons x' xs' ih' => intro ys h; cases ys with | nil => exact False.elim h | cons y' ys' => simp [List.any_cons, h.1, ih' ys' h.2.2]
+    | cons x' xs' ih' =>
+        intro ys h; cases ys with | nil => exact False.elim h | cons y' ys' =>
+          simp only [List.any_cons, h.1, ih' ys' h.2.2]
   have hdd : ∀ (xs ys : List (Attr msg)), AttrKeyEq xs ys → AttrKeyEq (dedupAttrs xs) (dedupAttrs ys) := by
     intro xs; induction xs with
-    | nil => intro ys h; cases ys with | nil => simpa [dedupAttrs] using h | cons _ _ => exact False.elim h
+    | nil => intro ys h; cases ys with | nil => trivial | cons _ _ => exact False.elim h
     | cons x xs ih =>
         intro ys h; cases ys with
         | nil => exact False.elim h
@@ -258,14 +279,16 @@ private theorem managedNames_eq_of_noBind {σ msg : Type} {s₁ s₂ : σ} :
             rcases h with ⟨hk, hm, htl⟩
             have hih := ih ys htl
             cases hx : x.key? with
-            | none => have hy : y.key? = none := hk.symm.trans hx; simpa [dedupAttrs, hx, hy] using ⟨hk, hm, hih⟩
+            | none => have hy : y.key? = none := hk.symm.trans hx; simp only [dedupAttrs, hx, hy]; exact ⟨hk, hm, hih⟩
             | some k =>
                 have hy : y.key? = some k := hk.symm.trans hx
                 simp only [dedupAttrs, hx, hy, hany k xs ys htl]; split; exact hih; exact ⟨hk, hm, hih⟩
   have hfm : ∀ (xs ys : List (Attr msg)), AttrKeyEq xs ys → ys.filterMap managedAttrName = xs.filterMap managedAttrName := by
     intro xs; induction xs with
     | nil => intro ys h; cases ys with | nil => rfl | cons _ _ => exact False.elim h
-    | cons x xs ih => intro ys h; cases ys with | nil => exact False.elim h | cons y ys => simp [List.filterMap, h.2.1, ih ys h.2.2]
+    | cons x xs ih =>
+        intro ys h; cases ys with | nil => exact False.elim h | cons y ys =>
+          simp only [List.filterMap_cons, h.2.1]; cases managedAttrName y <;> simp only [ih ys h.2.2]
   have hnon : ∀ (ys : List (VAttr σ msg)), noBind ys = true →
       AttrKeyEq ((ys.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true))
                 ((ys.map (VAttr.eval s₂)).filter (fun | .cls _ => false | _ => true)) := by
@@ -273,37 +296,46 @@ private theorem managedNames_eq_of_noBind {σ msg : Type} {s₁ s₂ : σ} :
     | nil => intro _; trivial
     | cons va rest ih =>
         intro hn; simp only [noBind, List.all_cons, Bool.and_eq_true] at hn
-        cases va with | bind _ | dynOn _ _ => simp at hn | dynVal _ _ => exact ⟨rfl, rfl, ih hn.2⟩ | stat a => cases a <;> simp [AttrKeyEq, ih hn.2]
+        cases va with
+        | bind _ | dynOn _ _ => exact absurd hn.1 Bool.false_ne_true
+        | dynVal _ _ => exact ⟨rfl, rfl, ih hn.2⟩
+        | stat a => cases a <;> (simp only [List.map_cons, VAttr.eval, List.filter_cons]; first | exact ⟨rfl, rfl, ih hn.2⟩ | exact ih hn.2)
   intro xs hnb
   unfold normalizeAttrs; dsimp only
-  erw [← hcls xs hnb]
+  erw [← filterMap_cls_eq_of_noBind s₁ s₂ xs hnb]
   rw [List.filterMap_append, List.filterMap_append]; erw [hfm _ _ (hdd _ _ (hnon xs hnb))]; rfl
 
 private theorem stepSpecAttr_equiv {msg : Type} {s₁ s₂ : SpecElemState msg} (a : Attr msg)
     (he : ElemStateEquiv s₁ s₂) : ElemStateEquiv (stepSpecAttr s₁ a) (stepSpecAttr s₂ a) := by
   refine ⟨fun k => ?_, ?_, ?_, fun e => ?_, fun e => ?_⟩
   · cases a with
-    | cls _ | localCell _ _ _ _ _ => simp [stepSpecAttr, lookupAssoc_setAssoc, he.1]
-    | attr k' _ => by_cases hv : k' = "value" <;> simp [stepSpecAttr, hv, lookupAssoc_setAssoc, he.1]
-    | flag k' p => by_cases hc : k' = "checked" <;> cases p <;> simp [stepSpecAttr, hc, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, he.1] <;> split <;> exact he.1 k
+    | cls _ | localCell _ _ _ _ _ => simp only [stepSpecAttr, lookupAssoc_setAssoc, he.1]
+    | attr k' _ =>
+        by_cases hv : k' = "value"
+        · subst hv; exact he.1 k
+        · simp only [stepSpecAttr_attr_ne _ _ hv, lookupAssoc_setAssoc, he.1]
+    | flag k' p =>
+        by_cases hc : k' = "checked"
+        · subst hc; exact he.1 k
+        · cases p <;> simp only [stepSpecAttr_flag_ne _ _ hc, Bool.false_eq_true, ↓reduceIte, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, he.1]
     | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ => exact he.1 k
   · cases a with
-    | attr k' _ => by_cases hv : k' = "value" <;> simp [stepSpecAttr, hv, he.2.1]
-    | flag k' _ => by_cases hc : k' = "checked" <;> simp [stepSpecAttr, hc, he.2.1]
+    | attr k' _ => by_cases hv : k' = "value"; subst hv; rfl; simp only [stepSpecAttr_attr_ne _ _ hv, he.2.1]
+    | flag k' _ => by_cases hc : k' = "checked"; subst hc; exact he.2.1; simp only [stepSpecAttr_flag_ne _ _ hc, he.2.1]
     | _ => exact he.2.1
   · cases a with
-    | attr k' _ => by_cases hv : k' = "value" <;> simp [stepSpecAttr, hv, he.2.2.1]
-    | flag k' _ => by_cases hc : k' = "checked" <;> simp [stepSpecAttr, hc, he.2.2.1]
+    | attr k' _ => by_cases hv : k' = "value"; subst hv; exact he.2.2.1; simp only [stepSpecAttr_attr_ne _ _ hv, he.2.2.1]
+    | flag k' _ => by_cases hc : k' = "checked"; subst hc; rfl; simp only [stepSpecAttr_flag_ne _ _ hc, he.2.2.1]
     | _ => exact he.2.2.1
   · cases a with
-    | on _ _ => simp [stepSpecAttr, lookupAssoc_setAssoc, he.2.2.2.1]
-    | attr k' _ => by_cases hv : k' = "value" <;> simp [stepSpecAttr, hv, he.2.2.2.1]
-    | flag k' _ => by_cases hc : k' = "checked" <;> simp [stepSpecAttr, hc, he.2.2.2.1]
+    | on _ _ => simp only [stepSpecAttr, lookupAssoc_setAssoc, he.2.2.2.1]
+    | attr k' _ => by_cases hv : k' = "value"; subst hv; exact he.2.2.2.1 e; simp only [stepSpecAttr_attr_ne _ _ hv, he.2.2.2.1]
+    | flag k' _ => by_cases hc : k' = "checked"; subst hc; exact he.2.2.2.1 e; simp only [stepSpecAttr_flag_ne _ _ hc, he.2.2.2.1]
     | _ => exact he.2.2.2.1 e
   · cases a with
-    | onValue _ _ => simp [stepSpecAttr, lookupAssoc_setAssoc, he.2.2.2.2]
-    | attr k' _ => by_cases hv : k' = "value" <;> simp [stepSpecAttr, hv, he.2.2.2.2]
-    | flag k' _ => by_cases hc : k' = "checked" <;> simp [stepSpecAttr, hc, he.2.2.2.2]
+    | onValue _ _ => simp only [stepSpecAttr, lookupAssoc_setAssoc, he.2.2.2.2]
+    | attr k' _ => by_cases hv : k' = "value"; subst hv; exact he.2.2.2.2 e; simp only [stepSpecAttr_attr_ne _ _ hv, he.2.2.2.2]
+    | flag k' _ => by_cases hc : k' = "checked"; subst hc; exact he.2.2.2.2 e; simp only [stepSpecAttr_flag_ne _ _ hc, he.2.2.2.2]
     | _ => exact he.2.2.2.2 e
 
 private theorem dedupAttrs_foldl_equiv {msg : Type} :
@@ -327,48 +359,56 @@ private theorem dedupAttrs_foldl_equiv {msg : Type} :
               by_cases hkEq : k' = k
               · subst hkEq
                 by_cases hv : k' = "value"
-                · subst hv; right; cases x with | attr kx _ => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; rfl | flag _ _ => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; exact False.elim (by simpa [Attr.NormalKey] using hn.1) | _ => simp [Attr.key?] at hx
+                · subst hv; right; cases x with | attr kx _ => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; rfl | flag _ _ => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; exact False.elim (by simpa [Attr.NormalKey] using hn.1) | _ => simp only [Attr.key?, reduceCtorEq] at hx
                 · by_cases hc : k' = "checked"
-                  · subst hc; right; cases x with | flag kx p => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; cases p <;> rfl | attr _ _ => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; exact False.elim (by simpa [Attr.NormalKey] using hn.1) | _ => simp [Attr.key?] at hx
+                  · subst hc; right; cases x with | flag kx p => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; cases p <;> rfl | attr _ _ => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; exact False.elim (by simpa [Attr.NormalKey] using hn.1) | _ => simp only [Attr.key?, reduceCtorEq] at hx
                   · left; refine ⟨y, hy, ?_⟩; cases y with
                     | attr ky _ => simp only [Attr.key?, Option.some.injEq] at hyk'; subst hyk'; simp [attrWritesKey, hv]
                     | flag ky _ => simp only [Attr.key?, Option.some.injEq] at hyk'; subst hyk'; simp [attrWritesKey, hc]
-                    | _ => simp [Attr.key?] at hyk'
+                    | _ => simp only [Attr.key?, reduceCtorEq] at hyk'
               · right; cases x with
-                | attr kx _ => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; by_cases hv : kx = "value" <;> simp [stepSpecAttr, hv, lookupAssoc_setAssoc, beq_eq_false_iff_ne.2 (Ne.symm hkEq)]
-                | flag kx p => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; by_cases hc : kx = "checked" <;> cases p <;> simp [stepSpecAttr, hc, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, beq_eq_false_iff_ne.2 (Ne.symm hkEq)]
-                | _ => simp [Attr.key?] at hx
+                | attr kx _ =>
+                    simp only [Attr.key?, Option.some.injEq] at hx; subst hx
+                    by_cases hv : kx = "value"
+                    · subst hv; rfl
+                    · simp only [stepSpecAttr_attr_ne _ _ hv, lookupAssoc_setAssoc, beq_eq_false_iff_ne.2 (Ne.symm hkEq), Bool.false_eq_true, ↓reduceIte]
+                | flag kx p =>
+                    simp only [Attr.key?, Option.some.injEq] at hx; subst hx
+                    by_cases hc : kx = "checked"
+                    · subst hc; rfl
+                    · cases p <;> simp only [stepSpecAttr_flag_ne _ _ hc, Bool.false_eq_true, ↓reduceIte, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, beq_eq_false_iff_ne.2 (Ne.symm hkEq)]
+                | _ => simp only [Attr.key?, reduceCtorEq] at hx
             · apply foldl_stepSpecAttr_val
               by_cases hv : k = "value"
               · subst hv; right; cases y with
                 | attr ky v => simp only [Attr.key?, Option.some.injEq] at hyk'; subst hyk'; exact ⟨v, hy⟩
-                | flag ky _ => simp only [Attr.key?, Option.some.injEq] at hyk'; subst hyk'; simp [Attr.NormalKey] at hyN
-                | _ => simp [Attr.key?] at hyk'
+                | flag ky _ => simp only [Attr.key?, Option.some.injEq] at hyk'; subst hyk'; simp only [Attr.NormalKey, Bool.false_eq_true] at hyN
+                | _ => simp only [Attr.key?, reduceCtorEq] at hyk'
               · left; cases x with
-                | attr kx _ => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; simp [stepSpecAttr]
-                | flag kx p => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; by_cases hc : kx = "checked" <;> simp [stepSpecAttr, hc]
-                | _ => simp [Attr.key?] at hx
+                | attr kx _ => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; simp only [stepSpecAttr_attr_ne _ _ hv]
+                | flag kx p => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; by_cases hc : kx = "checked"; subst hc; rfl; simp only [stepSpecAttr_flag_ne _ _ hc]
+                | _ => simp only [Attr.key?, reduceCtorEq] at hx
             · apply foldl_stepSpecAttr_chk
               by_cases hc : k = "checked"
               · subst hc; right; cases y with
                 | flag ky p => simp only [Attr.key?, Option.some.injEq] at hyk'; subst hyk'; exact ⟨p, hy⟩
-                | attr ky _ => simp only [Attr.key?, Option.some.injEq] at hyk'; subst hyk'; simp [Attr.NormalKey] at hyN
-                | _ => simp [Attr.key?] at hyk'
+                | attr ky _ => simp only [Attr.key?, Option.some.injEq] at hyk'; subst hyk'; simp only [Attr.NormalKey, Bool.false_eq_true] at hyN
+                | _ => simp only [Attr.key?, reduceCtorEq] at hyk'
               · left; cases x with
-                | attr kx _ => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; by_cases hv : kx = "value" <;> simp [stepSpecAttr, hv]
-                | flag kx _ => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; simp [stepSpecAttr]
-                | _ => simp [Attr.key?] at hx
+                | attr kx _ => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; by_cases hv : kx = "value"; subst hv; rfl; simp only [stepSpecAttr_attr_ne _ _ hv]
+                | flag kx p => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; simp only [stepSpecAttr_flag_ne _ _ hc]
+                | _ => simp only [Attr.key?, reduceCtorEq] at hx
             · apply foldl_stepSpecAttr_clicks; right
               cases x with
-              | attr kx _ => by_cases hv : kx = "value" <;> simp [stepSpecAttr, hv]
-              | flag kx _ => by_cases hc : kx = "checked" <;> simp [stepSpecAttr, hc]
-              | _ => simp [Attr.key?] at hx
+              | attr kx _ => by_cases hv : kx = "value"; subst hv; rfl; simp only [stepSpecAttr_attr_ne _ _ hv]
+              | flag kx p => by_cases hc : kx = "checked"; subst hc; rfl; simp only [stepSpecAttr_flag_ne _ _ hc]
+              | _ => simp only [Attr.key?, reduceCtorEq] at hx
             · apply foldl_stepSpecAttr_inputs; right
               cases x with
-              | attr kx _ => by_cases hv : kx = "value" <;> simp [stepSpecAttr, hv]
-              | flag kx _ => by_cases hc : kx = "checked" <;> simp [stepSpecAttr, hc]
-              | _ => simp [Attr.key?] at hx
-          · simp only [dedupAttrs, hx, hany, List.foldl_cons]
+              | attr kx _ => by_cases hv : kx = "value"; subst hv; rfl; simp only [stepSpecAttr_attr_ne _ _ hv]
+              | flag kx p => by_cases hc : kx = "checked"; subst hc; rfl; simp only [stepSpecAttr_flag_ne _ _ hc]
+              | _ => simp only [Attr.key?, reduceCtorEq] at hx
+          · simp only [dedupAttrs, hx, hany, Bool.false_eq_true, ↓reduceIte, List.foldl_cons]
             exact dedupAttrs_foldl_equiv xs (stepSpecAttr cur x) hn.2
 
 private theorem stepDynAttr_equiv {σ msg : Type} (s : σ) :
@@ -377,7 +417,7 @@ private theorem stepDynAttr_equiv {σ msg : Type} (s : σ) :
   | [], _, _, h => h
   | va :: xs, _, _, h => by
       apply stepDynAttr_equiv s xs
-      cases va with | stat _ => exact h | bind _ | dynOn _ _ => exact stepSpecAttr_equiv _ h | dynVal _ _ => exact stepSpecAttr_equiv _ h
+      cases va with | stat _ => exact h | bind _ | dynOn _ _ | dynVal _ _ => exact stepSpecAttr_equiv _ h
 
 private def lastDynVal? {σ msg : Type} (k : String) (s : σ) : List (VAttr σ msg) → Option String
   | [] => none
@@ -390,9 +430,12 @@ private theorem stepDynAttr_checked {σ msg : Type} (s : σ) :
   | va :: rest, st, hnb => by
       simp only [noBind, List.all_cons, Bool.and_eq_true] at hnb
       cases va with
-      | bind _ | dynOn _ _ => simp at hnb
+      | bind _ | dynOn _ _ => exact absurd hnb.1 Bool.false_ne_true
       | stat _ => exact stepDynAttr_checked s rest st hnb.2
-      | dynVal k _ => by_cases hk : k = "value" <;> simp [List.foldl_cons, stepDynAttr, stepSpecAttr, hk, stepDynAttr_checked s rest _ hnb.2]
+      | dynVal k _ =>
+          by_cases hk : k = "value"
+          · subst hk; exact stepDynAttr_checked s rest _ hnb.2
+          · simp only [List.foldl_cons, stepDynAttr, stepSpecAttr_attr_ne _ _ hk, stepDynAttr_checked s rest _ hnb.2]
 
 private theorem nonCls_checked_eq {σ msg : Type} (s₁ s₂ : σ) :
     ∀ (xs : List (VAttr σ msg)) (st₁ st₂ : SpecElemState msg), noBind xs = true → st₁.checked = st₂.checked →
@@ -402,9 +445,24 @@ private theorem nonCls_checked_eq {σ msg : Type} (s₁ s₂ : σ) :
   | va :: rest, st₁, st₂, hnb, hc => by
       simp only [noBind, List.all_cons, Bool.and_eq_true] at hnb
       cases va with
-      | bind _ | dynOn _ _ => simp at hnb
-      | dynVal k _ => apply nonCls_checked_eq s₁ s₂ rest _ _ hnb.2; by_cases hv : k = "value" <;> simp [stepSpecAttr, hv, hc]
-      | stat a => cases a <;> (try exact nonCls_checked_eq s₁ s₂ rest _ _ hnb.2 (by simp [stepSpecAttr, hc]; all_goals (try split <;> simp [hc])))
+      | bind _ | dynOn _ _ => exact absurd hnb.1 Bool.false_ne_true
+      | dynVal k _ =>
+          simp only [List.map_cons, VAttr.eval, List.filter_cons]
+          apply nonCls_checked_eq s₁ s₂ rest _ _ hnb.2
+          by_cases hv : k = "value"; subst hv; exact hc; simp only [stepSpecAttr_attr_ne _ _ hv, hc]
+      | stat a =>
+          cases a with
+          | cls _ => exact nonCls_checked_eq s₁ s₂ rest _ _ hnb.2 hc
+          | attr k _ =>
+              simp only [List.map_cons, VAttr.eval, List.filter_cons]
+              apply nonCls_checked_eq s₁ s₂ rest _ _ hnb.2
+              by_cases hv : k = "value"; subst hv; exact hc; simp only [stepSpecAttr_attr_ne _ _ hv, hc]
+          | flag k p =>
+              simp only [List.map_cons, VAttr.eval, List.filter_cons]
+              apply nonCls_checked_eq s₁ s₂ rest _ _ hnb.2
+              by_cases hck : k = "checked"; subst hck; rfl; simp only [stepSpecAttr_flag_ne _ _ hck, hc]
+          | key _ | on _ _ | onValue _ _ | localCell _ _ _ _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ =>
+              exact nonCls_checked_eq s₁ s₂ rest _ _ hnb.2 hc
 
 private theorem stepDynAttr_clicks_inputs {σ msg : Type} (s : σ) :
     ∀ (xs : List (VAttr σ msg)) (st : SpecElemState msg), noBind xs = true →
@@ -414,10 +472,13 @@ private theorem stepDynAttr_clicks_inputs {σ msg : Type} (s : σ) :
   | va :: rest, st, hnb => by
       simp only [noBind, List.all_cons, Bool.and_eq_true] at hnb
       cases va with
-      | bind _ | dynOn _ _ => simp at hnb
+      | bind _ | dynOn _ _ => exact absurd hnb.1 Bool.false_ne_true
       | stat _ => exact stepDynAttr_clicks_inputs s rest st hnb.2
       | dynVal k _ =>
-          by_cases hk : k = "value" <;> simp [List.foldl_cons, stepDynAttr, stepSpecAttr, hk, stepDynAttr_clicks_inputs s rest _ hnb.2]
+          by_cases hk : k = "value"
+          · subst hk; exact stepDynAttr_clicks_inputs s rest _ hnb.2
+          · simp only [List.foldl_cons, stepDynAttr, stepSpecAttr_attr_ne _ _ hk]
+            exact stepDynAttr_clicks_inputs s rest _ hnb.2
 
 private theorem nonCls_handlers_eq {σ msg : Type} (s₁ s₂ : σ) :
     ∀ (xs : List (VAttr σ msg)) (st₁ st₂ : SpecElemState msg), noBind xs = true →
@@ -430,18 +491,33 @@ private theorem nonCls_handlers_eq {σ msg : Type} (s₁ s₂ : σ) :
   | va :: rest, st₁, st₂, hnb, hcl, hin => by
       simp only [noBind, List.all_cons, Bool.and_eq_true] at hnb
       cases va with
-      | bind _ | dynOn _ _ => simp at hnb
+      | bind _ | dynOn _ _ => exact absurd hnb.1 Bool.false_ne_true
       | dynVal k _ =>
+          simp only [List.map_cons, VAttr.eval, List.filter_cons]
           apply nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2
-          · by_cases hv : k = "value" <;> simp [stepSpecAttr, hv, hcl]
-          · by_cases hv : k = "value" <;> simp [stepSpecAttr, hv, hin]
+          · by_cases hv : k = "value"; subst hv; exact hcl; simp only [stepSpecAttr_attr_ne _ _ hv, hcl]
+          · by_cases hv : k = "value"; subst hv; exact hin; simp only [stepSpecAttr_attr_ne _ _ hv, hin]
       | stat a =>
           cases a with
           | cls _ => exact nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2 hcl hin
-          | attr k _ => by_cases hv : k = "value" <;> exact nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2 (by simp [stepSpecAttr, hv, hcl]) (by simp [stepSpecAttr, hv, hin])
-          | flag k p => by_cases hc : k = "checked" <;> cases p <;> exact nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2 (by simp [stepSpecAttr, hc, hcl]) (by simp [stepSpecAttr, hc, hin])
-          | on _ _ | onValue _ _ | key _ | localCell _ _ _ _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ =>
-              exact nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2 (by simp [stepSpecAttr, hcl]) (by simp [stepSpecAttr, hin])
+          | attr k _ =>
+              simp only [List.map_cons, VAttr.eval, List.filter_cons]
+              apply nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2
+              · by_cases hv : k = "value"; subst hv; exact hcl; simp only [stepSpecAttr_attr_ne _ _ hv, hcl]
+              · by_cases hv : k = "value"; subst hv; exact hin; simp only [stepSpecAttr_attr_ne _ _ hv, hin]
+          | flag k p =>
+              simp only [List.map_cons, VAttr.eval, List.filter_cons]
+              apply nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2
+              · by_cases hc : k = "checked"; subst hc; exact hcl; simp only [stepSpecAttr_flag_ne _ _ hc, hcl]
+              · by_cases hc : k = "checked"; subst hc; exact hin; simp only [stepSpecAttr_flag_ne _ _ hc, hin]
+          | on e m =>
+              simp only [List.map_cons, VAttr.eval, List.filter_cons]
+              exact nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2 (congrArg (setAssoc e m) hcl) hin
+          | onValue e f =>
+              simp only [List.map_cons, VAttr.eval, List.filter_cons]
+              exact nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2 hcl (congrArg (setAssoc e f) hin)
+          | key _ | localCell _ _ _ _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ =>
+              exact nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2 hcl hin
 
 private theorem stepDynAttr_last_key {σ msg : Type} (s : σ) (k : String) :
     ∀ (xs : List (VAttr σ msg)) (st : SpecElemState msg), noBind xs = true →
@@ -454,22 +530,24 @@ private theorem stepDynAttr_last_key {σ msg : Type} (s : σ) (k : String) :
   | va :: rest, st, hnb => by
       simp only [noBind, List.all_cons, Bool.and_eq_true] at hnb
       cases va with
-      | bind _ | dynOn _ _ => simp at hnb
-      | stat _ => simpa [lastDynVal?] using stepDynAttr_last_key s k rest st hnb.2
+      | bind _ | dynOn _ _ => exact absurd hnb.1 Bool.false_ne_true
+      | stat _ => exact stepDynAttr_last_key s k rest st hnb.2
       | dynVal k' g =>
           have ih := stepDynAttr_last_key s k rest (stepSpecAttr st (.attr k' (g s))) hnb.2
           cases hr : lastDynVal? k s rest with
-          | some v' => rw [hr] at ih; simpa [lastDynVal?, hr] using ih
+          | some v' => rw [hr] at ih; simp only [lastDynVal?, Option.orElse, hr]; exact ih
           | none =>
               rw [hr] at ih; by_cases hk' : k' = k
               · subst hk'; simp only [lastDynVal?, Option.orElse, hr, beq_self_eq_true, ↓reduceIte] at ih ⊢
                 exact ⟨fun hkv => (ih.1 hkv).trans (by subst hkv; rfl),
-                       fun hnk => (ih.2 hnk).trans (by simp [stepSpecAttr, lookupAssoc_setAssoc])⟩
+                       fun hnk => (ih.2 hnk).trans (by simp only [stepSpecAttr_attr_ne _ _ hnk, lookupAssoc_setAssoc, beq_self_eq_true, ↓reduceIte])⟩
               · have hb : (k' == k) = false := beq_eq_false_iff_ne.2 hk'
                 simp only [lastDynVal?, Option.orElse, hr, hb, Bool.false_eq_true, ↓reduceIte] at ih ⊢
-                refine ⟨fun hkv => (ih.1 hkv).trans (by subst hkv; simp [stepSpecAttr]),
+                refine ⟨fun hkv => (ih.1 hkv).trans (by subst hkv; simp only [stepSpecAttr_attr_ne _ _ hk']),
                         fun hnk => (ih.2 hnk).trans ?_⟩
-                by_cases hv : k' = "value" <;> simp [stepSpecAttr, hv, lookupAssoc_setAssoc, hb]
+                by_cases hv : k' = "value"
+                · subst hv; rfl
+                · simp only [stepSpecAttr_attr_ne _ _ hv, lookupAssoc_setAssoc, hb, Bool.false_eq_true, ↓reduceIte]
 
 private theorem ownsChildren_map_tail {σ msg : Type} (s : σ) (va : VAttr σ msg) (rest : List (VAttr σ msg))
     (h : ownsChildren ((va :: rest).map (VAttr.eval s)) = false) :
@@ -482,23 +560,25 @@ private theorem nonCls_last_key {σ msg : Type} (s : σ) (k : String) :
       lastDynVal? k s xs = some v →
       (k = "value" → (((xs.map (VAttr.eval s)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr st).value = v) ∧
       (k ≠ "value" → lookupAssoc k (((xs.map (VAttr.eval s)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr st).attrs = some v)
-  | [], _, _, _, _, _, h => by simp [lastDynVal?] at h
+  | [], _, _, _, _, _, h => by simp only [lastDynVal?, reduceCtorEq] at h
   | va :: rest, st, v, hnb, hns, hown, hs => by
       simp only [noBind, List.all_cons, Bool.and_eq_true] at hnb
       have hownR := ownsChildren_map_tail s va rest hown
       have hnsR : dynValNoLaterStat rest = true := by
-        cases va with | bind _ | dynOn _ _ => simp at hnb | stat _ => exact hns | dynVal _ _ => simp only [dynValNoLaterStat, Bool.and_eq_true] at hns; exact hns.2
+        cases va with | bind _ | dynOn _ _ => exact absurd hnb.1 Bool.false_ne_true | stat _ => exact hns | dynVal _ _ => simp only [dynValNoLaterStat, Bool.and_eq_true] at hns; exact hns.2
       cases va with
-      | bind _ | dynOn _ _ => simp at hnb
-      | stat a => cases a <;> exact nonCls_last_key s k rest _ v hnb.2 hnsR hownR (by simpa [lastDynVal?] using hs)
+      | bind _ | dynOn _ _ => exact absurd hnb.1 Bool.false_ne_true
+      | stat a => cases a <;> exact nonCls_last_key s k rest _ v hnb.2 hnsR hownR hs
       | dynVal k' g =>
           cases hr : lastDynVal? k s rest with
           | some v' =>
-              have hvv' : v' = v := by simpa [lastDynVal?, hr] using hs
+              have hvv' : v' = v := by simp only [lastDynVal?, Option.orElse, hr, Option.some.injEq] at hs; exact hs
               subst hvv'; exact nonCls_last_key s k rest _ v' hnb.2 hnsR hownR hr
           | none =>
               have hkk' : k' = k ∧ g s = v := by
-                by_cases hk : k' = k <;> simp [lastDynVal?, Option.orElse, hr, hk] at hs; subst hk; exact ⟨rfl, hs⟩
+                by_cases hk : k' = k
+                · subst hk; simp only [lastDynVal?, Option.orElse, hr, beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hs; exact ⟨rfl, hs⟩
+                · simp only [lastDynVal?, Option.orElse, hr, beq_eq_false_iff_ne.2 hk, Bool.false_eq_true, ↓reduceIte, reduceCtorEq] at hs
               rcases hkk' with ⟨rfl, rfl⟩
               simp only [dynValNoLaterStat, Bool.and_eq_true, List.all_eq_true] at hns
               have hpres : ∀ (ys : List (VAttr σ msg)) (cur : SpecElemState msg),
@@ -513,67 +593,63 @@ private theorem nonCls_last_key {σ msg : Type} (s : σ) (k : String) :
                     simp only [noBind, List.all_cons, Bool.and_eq_true] at hnbw
                     have hownwR := ownsChildren_map_tail s w ws hownw
                     cases w with
-                    | bind _ | dynOn _ _ => simp at hnbw
+                    | bind _ | dynOn _ _ => exact absurd hnbw.1 Bool.false_ne_true
                     | dynVal kw gw =>
                         cases hrw : lastDynVal? k' s ws with
-                        | some _ => simp [lastDynVal?, Option.orElse, hrw] at hnw
+                        | some _ => simp only [lastDynVal?, Option.orElse, hrw, reduceCtorEq] at hnw
                         | none =>
-                            have hne : kw ≠ k' := by intro hEq; subst hEq; simp [lastDynVal?, Option.orElse, hrw] at hnw
+                            have hne : kw ≠ k' := fun hEq => by subst hEq; simp only [lastDynVal?, Option.orElse, hrw, beq_self_eq_true, ↓reduceIte, reduceCtorEq] at hnw
                             have iht := ihw (stepSpecAttr cur (.attr kw (gw s))) hnbw.2 hownwR hrw (fun u hu => hstw u (.tail _ hu))
-                            refine ⟨fun hkv => (iht.1 hkv).trans (by subst hkv; simp [stepSpecAttr]),
+                            refine ⟨fun hkv => (iht.1 hkv).trans (by subst hkv; simp only [stepSpecAttr_attr_ne _ _ hne]),
                                     fun hnk => (iht.2 hnk).trans ?_⟩
-                            by_cases hv : kw = "value" <;> simp [stepSpecAttr, hv, lookupAssoc_setAssoc, beq_eq_false_iff_ne.2 hne]
+                            by_cases hv : kw = "value"
+                            · subst hv; rfl
+                            · simp only [stepSpecAttr_attr_ne _ _ hv, lookupAssoc_setAssoc, beq_eq_false_iff_ne.2 hne, Bool.false_eq_true, ↓reduceIte]
                     | stat b =>
-                        have hb : b.key? ≠ some k' := by simpa using hstw (.stat b) (.head _)
+                        have hb : b.key? ≠ some k' := bne_iff_ne.1 (hstw (.stat b) (.head _))
                         cases b with
                         | cls _ => exact ihw cur hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))
-                        | localCell _ _ _ _ _ => simp [ownsChildren] at hownw
+                        | localCell _ _ _ _ _ => simp only [ownsChildren, List.map_cons, VAttr.eval, List.any_cons, Bool.true_or, Bool.true_eq_false] at hownw
                         | attr kb vb =>
-                            have hne : kb ≠ k' := fun hEq => hb (by simp [Attr.key?, hEq])
+                            have hne : kb ≠ k' := fun hEq => hb (congrArg some hEq)
                             have iht := ihw (stepSpecAttr cur (.attr kb vb)) hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))
-                            refine ⟨fun hkv => (iht.1 hkv).trans (by subst hkv; simp [stepSpecAttr]),
+                            refine ⟨fun hkv => (iht.1 hkv).trans (by subst hkv; simp only [stepSpecAttr_attr_ne _ _ hne]),
                                     fun hnk => (iht.2 hnk).trans ?_⟩
-                            by_cases hv : kb = "value" <;> simp [stepSpecAttr, hv, lookupAssoc_setAssoc, beq_eq_false_iff_ne.2 hne]
+                            by_cases hv : kb = "value"
+                            · subst hv; rfl
+                            · simp only [stepSpecAttr_attr_ne _ _ hv, lookupAssoc_setAssoc, beq_eq_false_iff_ne.2 hne, Bool.false_eq_true, ↓reduceIte]
                         | flag kb p =>
-                            have hne : kb ≠ k' := fun hEq => hb (by simp [Attr.key?, hEq])
+                            have hne : kb ≠ k' := fun hEq => hb (congrArg some hEq)
                             have iht := ihw (stepSpecAttr cur (.flag kb p)) hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))
-                            refine ⟨fun hkv => (iht.1 hkv).trans (by by_cases hc : kb = "checked" <;> cases p <;> simp [stepSpecAttr, hc]),
+                            refine ⟨fun hkv => (iht.1 hkv).trans (by by_cases hc : kb = "checked"; subst hc; rfl; simp only [stepSpecAttr_flag_ne _ _ hc]),
                                     fun hnk => (iht.2 hnk).trans ?_⟩
-                            by_cases hc : kb = "checked" <;> cases p <;> simp [stepSpecAttr, hc, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, beq_eq_false_iff_ne.2 hne]
-                        | key kv =>
-                            have iht := ihw (stepSpecAttr cur (.key kv)) hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))
-                            exact ⟨fun hkv => iht.1 hkv, fun hnk => iht.2 hnk⟩
-                        | on ev m =>
-                            have iht := ihw (stepSpecAttr cur (.on ev m)) hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))
-                            exact ⟨fun hkv => iht.1 hkv, fun hnk => iht.2 hnk⟩
-                        | onValue ev dec =>
-                            have iht := ihw (stepSpecAttr cur (.onValue ev dec)) hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))
-                            exact ⟨fun hkv => iht.1 hkv, fun hnk => iht.2 hnk⟩
-                        | signalBind nm =>
-                            have iht := ihw (stepSpecAttr cur (.signalBind nm)) hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))
-                            exact ⟨fun hkv => iht.1 hkv, fun hnk => iht.2 hnk⟩
-                        | signalAttr nm ak av =>
-                            have iht := ihw (stepSpecAttr cur (.signalAttr nm ak av)) hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))
-                            exact ⟨fun hkv => iht.1 hkv, fun hnk => iht.2 hnk⟩
-                        | signalOn nm ev m =>
-                            have iht := ihw (stepSpecAttr cur (.signalOn nm ev m)) hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))
-                            exact ⟨fun hkv => iht.1 hkv, fun hnk => iht.2 hnk⟩
+                            by_cases hc : kb = "checked"
+                            · subst hc; rfl
+                            · cases p <;> simp only [stepSpecAttr_flag_ne _ _ hc, Bool.false_eq_true, ↓reduceIte, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, beq_eq_false_iff_ne.2 hne]
+                        | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ =>
+                            exact ihw _ hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))
               have hp := hpres rest (stepSpecAttr st (.attr k' (g s))) hnb.2 hownR hr (fun w hw => hns.1 w hw)
               refine ⟨fun hkv => (hp.1 hkv).trans (by subst hkv; rfl),
-                      fun hnk => (hp.2 hnk).trans (by simp [stepSpecAttr, lookupAssoc_setAssoc])⟩
+                      fun hnk => (hp.2 hnk).trans (by simp only [stepSpecAttr_attr_ne _ _ hnk, lookupAssoc_setAssoc, beq_self_eq_true, ↓reduceIte])⟩
 
 private theorem stepSpecAttr_lookup_congr {msg : Type} (k : String) {s₁ s₂ : SpecElemState msg}
     (ha : lookupAssoc k s₁.attrs = lookupAssoc k s₂.attrs) (a : Attr msg) :
     lookupAssoc k (stepSpecAttr s₁ a).attrs = lookupAssoc k (stepSpecAttr s₂ a).attrs := by
   cases a with
-  | cls _ | localCell _ _ _ _ _ => simp only [stepSpecAttr, lookupAssoc_setAssoc]; split <;> simp [ha]
-  | attr k' _ => by_cases hv : k' = "value" <;> simp [stepSpecAttr, hv, lookupAssoc_setAssoc, ha]
-  | flag k' p => by_cases hc : k' = "checked" <;> cases p <;> simp [stepSpecAttr, hc, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, ha]
+  | cls _ | localCell _ _ _ _ _ => simp only [stepSpecAttr, lookupAssoc_setAssoc, ha]
+  | attr k' _ => by_cases hv : k' = "value"; subst hv; exact ha; simp only [stepSpecAttr_attr_ne _ _ hv, lookupAssoc_setAssoc, ha]
+  | flag k' p =>
+      by_cases hc : k' = "checked"
+      · subst hc; exact ha
+      · cases p <;> simp only [stepSpecAttr_flag_ne _ _ hc, Bool.false_eq_true, ↓reduceIte, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, ha]
   | _ => exact ha
 
 private theorem stepSpecAttr_val_congr {msg : Type} (a : Attr msg) {s₁ s₂ : SpecElemState msg} (hv : s₁.value = s₂.value) :
     (stepSpecAttr s₁ a).value = (stepSpecAttr s₂ a).value := by
-  cases a with | attr k _ => by_cases h : k = "value" <;> simp [stepSpecAttr, h, hv] | flag k _ => by_cases h : k = "checked" <;> simp [stepSpecAttr, h, hv] | _ => simp [stepSpecAttr, hv]
+  cases a with
+  | attr k _ => by_cases h : k = "value"; subst h; rfl; simp only [stepSpecAttr_attr_ne _ _ h, hv]
+  | flag k p => by_cases h : k = "checked"; subst h; exact hv; simp only [stepSpecAttr_flag_ne _ _ h, hv]
+  | _ => exact hv
 
 private theorem nonCls_none_key {σ msg : Type} (s₁ s₂ : σ) (k : String) :
     ∀ (xs : List (VAttr σ msg)) (st₁ st₂ : SpecElemState msg),
@@ -588,55 +664,34 @@ private theorem nonCls_none_key {σ msg : Type} (s₁ s₂ : σ) (k : String) :
   | va :: rest, st₁, st₂, hnb, hn => by
       simp only [noBind, List.all_cons, Bool.and_eq_true] at hnb
       cases va with
-      | bind _ | dynOn _ _ => simp at hnb
+      | bind _ | dynOn _ _ => exact absurd hnb.1 Bool.false_ne_true
       | stat a =>
           cases a with
           | cls _ => exact nonCls_none_key s₁ s₂ k rest st₁ st₂ hnb.2 hn
-          | attr ak av =>
-              have ih := nonCls_none_key s₁ s₂ k rest (stepSpecAttr st₁ (.attr ak av)) (stepSpecAttr st₂ (.attr ak av)) hnb.2 hn
-              exact ⟨fun hkv hv => ih.1 hkv (stepSpecAttr_val_congr (.attr ak av) hv), fun hnk ha => ih.2 hnk (stepSpecAttr_lookup_congr k ha (.attr ak av))⟩
-          | flag ak p =>
-              have ih := nonCls_none_key s₁ s₂ k rest (stepSpecAttr st₁ (.flag ak p)) (stepSpecAttr st₂ (.flag ak p)) hnb.2 hn
-              exact ⟨fun hkv hv => ih.1 hkv (stepSpecAttr_val_congr (.flag ak p) hv), fun hnk ha => ih.2 hnk (stepSpecAttr_lookup_congr k ha (.flag ak p))⟩
-          | localCell l1 l2 l3 l4 l5 =>
-              have ih := nonCls_none_key s₁ s₂ k rest (stepSpecAttr st₁ (.localCell l1 l2 l3 l4 l5)) (stepSpecAttr st₂ (.localCell l1 l2 l3 l4 l5)) hnb.2 hn
-              exact ⟨fun hkv hv => ih.1 hkv (stepSpecAttr_val_congr (.localCell l1 l2 l3 l4 l5) hv), fun hnk ha => ih.2 hnk (stepSpecAttr_lookup_congr k ha (.localCell l1 l2 l3 l4 l5))⟩
-          | key kv =>
-              have ih := nonCls_none_key s₁ s₂ k rest (stepSpecAttr st₁ (.key kv)) (stepSpecAttr st₂ (.key kv)) hnb.2 hn
-              exact ⟨fun hkv hv => ih.1 hkv (stepSpecAttr_val_congr (.key kv) hv), fun hnk ha => ih.2 hnk (stepSpecAttr_lookup_congr k ha (.key kv))⟩
-          | on ev m =>
-              have ih := nonCls_none_key s₁ s₂ k rest (stepSpecAttr st₁ (.on ev m)) (stepSpecAttr st₂ (.on ev m)) hnb.2 hn
-              exact ⟨fun hkv hv => ih.1 hkv (stepSpecAttr_val_congr (.on ev m) hv), fun hnk ha => ih.2 hnk (stepSpecAttr_lookup_congr k ha (.on ev m))⟩
-          | onValue ev dec =>
-              have ih := nonCls_none_key s₁ s₂ k rest (stepSpecAttr st₁ (.onValue ev dec)) (stepSpecAttr st₂ (.onValue ev dec)) hnb.2 hn
-              exact ⟨fun hkv hv => ih.1 hkv (stepSpecAttr_val_congr (.onValue ev dec) hv), fun hnk ha => ih.2 hnk (stepSpecAttr_lookup_congr k ha (.onValue ev dec))⟩
-          | signalBind nm =>
-              have ih := nonCls_none_key s₁ s₂ k rest (stepSpecAttr st₁ (.signalBind nm)) (stepSpecAttr st₂ (.signalBind nm)) hnb.2 hn
-              exact ⟨fun hkv hv => ih.1 hkv (stepSpecAttr_val_congr (.signalBind nm) hv), fun hnk ha => ih.2 hnk (stepSpecAttr_lookup_congr k ha (.signalBind nm))⟩
-          | signalAttr nm ak av =>
-              have ih := nonCls_none_key s₁ s₂ k rest (stepSpecAttr st₁ (.signalAttr nm ak av)) (stepSpecAttr st₂ (.signalAttr nm ak av)) hnb.2 hn
-              exact ⟨fun hkv hv => ih.1 hkv (stepSpecAttr_val_congr (.signalAttr nm ak av) hv), fun hnk ha => ih.2 hnk (stepSpecAttr_lookup_congr k ha (.signalAttr nm ak av))⟩
-          | signalOn nm ev m =>
-              have ih := nonCls_none_key s₁ s₂ k rest (stepSpecAttr st₁ (.signalOn nm ev m)) (stepSpecAttr st₂ (.signalOn nm ev m)) hnb.2 hn
-              exact ⟨fun hkv hv => ih.1 hkv (stepSpecAttr_val_congr (.signalOn nm ev m) hv), fun hnk ha => ih.2 hnk (stepSpecAttr_lookup_congr k ha (.signalOn nm ev m))⟩
+          | attr _ _ | flag _ _ | localCell _ _ _ _ _ | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ =>
+              refine ⟨fun hkv hv => (nonCls_none_key s₁ s₂ k rest _ _ hnb.2 hn).1 hkv (stepSpecAttr_val_congr _ hv),
+                      fun hnk ha => (nonCls_none_key s₁ s₂ k rest _ _ hnb.2 hn).2 hnk (stepSpecAttr_lookup_congr k ha _)⟩
       | dynVal k' g =>
           cases hr : lastDynVal? k s₂ rest with
-          | some _ => simp [lastDynVal?, Option.orElse, hr] at hn
+          | some _ => simp only [lastDynVal?, Option.orElse, hr, reduceCtorEq] at hn
           | none =>
-              have hne : k' ≠ k := by intro hEq; subst hEq; simp [lastDynVal?, Option.orElse, hr] at hn
+              have hne : k' ≠ k := fun hEq => by subst hEq; simp only [lastDynVal?, Option.orElse, hr, beq_self_eq_true, ↓reduceIte, reduceCtorEq] at hn
               have ih := nonCls_none_key s₁ s₂ k rest (stepSpecAttr st₁ (.attr k' (g s₁))) (stepSpecAttr st₂ (.attr k' (g s₂))) hnb.2 hr
-              refine ⟨fun hkv hv => ih.1 hkv (by subst hkv; simp [stepSpecAttr, hv]),
-                      fun hnk ha => ih.2 hnk (by by_cases hv : k' = "value" <;> simp [stepSpecAttr, hv, lookupAssoc_setAssoc, beq_eq_false_iff_ne.2 hne, ha])⟩
+              refine ⟨fun hkv hv => ih.1 hkv (by subst hkv; simp only [stepSpecAttr_attr_ne _ _ hne, hv]),
+                      fun hnk ha => ih.2 hnk ?_⟩
+              by_cases hv : k' = "value"
+              · subst hv; exact ha
+              · simp only [stepSpecAttr_attr_ne _ _ hv, lookupAssoc_setAssoc, beq_eq_false_iff_ne.2 hne, Bool.false_eq_true, ↓reduceIte, ha]
 
 private theorem anyBind_false_noBind {σ msg : Type} (f : VAttr σ msg → Bool)
     (hf : ∀ x, f x = match x with | .bind _ | .dynOn _ _ => true | _ => false) :
     ∀ (xs : List (VAttr σ msg)), ¬(xs.any f = true) → noBind xs = true
   | [], _ => rfl
   | x :: xs, hn => by
-      have hx : f x = false := by cases hfx : f x; rfl; exact False.elim (hn (by simp [List.any_cons, hfx]))
-      have hxs : ¬(xs.any f = true) := fun h => hn (by simp [List.any_cons, h])
+      have hx : f x = false := by cases hfx : f x; rfl; exact False.elim (hn (by simp only [List.any_cons, hfx, Bool.true_or]))
+      have hxs : ¬(xs.any f = true) := fun h => hn (by simp only [List.any_cons, h, Bool.or_true])
       cases x with
-      | bind _ | dynOn _ _ => simp [hf] at hx
+      | bind _ | dynOn _ _ => simp only [hf, Bool.true_eq_false] at hx
       | stat _ | dynVal _ _ => simp only [noBind, List.all_cons, Bool.and_eq_true]; exact ⟨trivial, anyBind_false_noBind f hf xs hxs⟩
 
 theorem applyDynAttrsM_spec {σ msg : Type} (a : DomArena msg) (node : Dom.Node)
@@ -678,7 +733,7 @@ theorem applyDynAttrsM_spec {σ msg : Type} (a : DomArena msg) (node : Dom.Node)
             simp only [List.map_cons, List.all_cons, Bool.and_eq_true] at hcl'
             apply ih _ hnb'.2 hcl'.2 (fun k g hm => hmk k g (.tail _ hm))
             cases va with
-            | bind _ | dynOn _ _ => simp at hnb'
+            | bind _ | dynOn _ _ => exact absurd hnb'.1 Bool.false_ne_true
             | stat _ => exact hc
             | dynVal k g =>
                 exact ⟨stepSpecAttr_retains_managed cur (.attr k (g s₂)) mg (hmk k g (.head _)) hc.1,
@@ -689,17 +744,6 @@ theorem applyDynAttrsM_spec {σ msg : Type} (a : DomArena msg) (node : Dom.Node)
       have hmemN := mem_managed_of_key? hmemA (a := .attr k (g s₁)) rfl
       rcases List.mem_filterMap.1 hmemN with ⟨b, hb, hbn⟩
       exact hmg k (List.mem_filterMap.2 ⟨b, by simp only [normalizeAttrs, List.mem_append]; right; exact hb, hbn⟩)
-    have hclsEq : ∀ (ys : List (VAttr σ msg)), noBind ys = true →
-        (ys.map (VAttr.eval s₁)).filterMap (fun | .cls c => some c | _ => none) =
-        (ys.map (VAttr.eval s₂)).filterMap (fun | .cls c => some c | _ => none) := by
-      intro ys; induction ys with
-      | nil => intro _; rfl
-      | cons va rest ih =>
-          intro hn; simp only [noBind, List.all_cons, Bool.and_eq_true] at hn
-          cases va with | bind _ | dynOn _ _ => simp at hn | dynVal _ _ => simpa using ih hn.2 | stat a => cases a <;> simp [ih hn.2]
-    have hcls : ((attrs.map (VAttr.eval s₁)).filterMap (fun | .cls c => some c | _ => none)).filter (· != "") =
-                ((attrs.map (VAttr.eval s₂)).filterMap (fun | .cls c => some c | _ => none)).filter (· != "") := by
-      rw [hclsEq attrs hnb]
     let base : SpecElemState msg := (let cl := ((attrs.map (VAttr.eval s₁)).filterMap (fun | .cls c => some c | _ => none)).filter (· != "")
       if cl.isEmpty then [] else [Attr.cls (String.intercalate " " cl)]).foldl stepSpecAttr {}
     have hdd1 := dedupAttrs_foldl_equiv ((attrs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)) base
@@ -715,7 +759,7 @@ theorem applyDynAttrsM_spec {σ msg : Type} (a : DomArena msg) (node : Dom.Node)
       refine congrArg (fun (xs : List String) => List.foldl stepSpecAttr {}
         (let cl := xs.filter (· != ""); if cl.isEmpty then [] else [Attr.cls (String.intercalate " " cl)])) ?_
       exact (congrArg (fun f => (attrs.map (VAttr.eval s₂)).filterMap f) (funext fun x => by cases x <;> rfl)).trans
-        ((hclsEq attrs hnb).symm.trans
+        ((filterMap_cls_eq_of_noBind s₁ s₂ attrs hnb).symm.trans
           (congrArg (fun f => (attrs.map (VAttr.eval s₁)).filterMap f) (funext fun x => by cases x <;> rfl)))
     have heq1 : ElemStateEquiv st (((attrs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr base) :=
       ⟨fun k => (heq.1 k).trans (by rw [hev1]; exact hdd1.1 k),
@@ -730,41 +774,7 @@ theorem applyDynAttrsM_spec {σ msg : Type} (a : DomArena msg) (node : Dom.Node)
     · intro k
       by_cases hkv : k = "value"
       · subst hkv
-        have hnv : ∀ (xs : List (VAttr σ msg)) (cur : SpecElemState msg), noBind xs = true →
-            lookupAssoc "value" (xs.foldl (stepDynAttr s₂) cur).attrs = lookupAssoc "value" cur.attrs := by
-          intro xs; induction xs with
-          | nil => intro _ _; rfl
-          | cons va rest ih =>
-              intro cur hn; simp only [noBind, List.all_cons, Bool.and_eq_true] at hn
-              cases va with
-              | bind _ | dynOn _ _ => simp at hn
-              | stat _ => exact ih cur hn.2
-              | dynVal k' _ =>
-                  refine (ih _ hn.2).trans ?_
-                  by_cases hv : k' = "value"
-                  · simp [stepDynAttr, stepSpecAttr, hv]
-                  · simp [stepDynAttr, stepSpecAttr, hv, lookupAssoc_setAssoc]
-        have hev : ∀ (xs : List (VAttr σ msg)) (cur₁ cur₂ : SpecElemState msg), noBind xs = true →
-            lookupAssoc "value" cur₁.attrs = lookupAssoc "value" cur₂.attrs →
-            lookupAssoc "value" (((xs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr cur₁).attrs =
-            lookupAssoc "value" (((xs.map (VAttr.eval s₂)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr cur₂).attrs := by
-          intro xs; induction xs with
-          | nil => intro _ _ _ h; exact h
-          | cons va rest ih =>
-              intro cur₁ cur₂ hn hlk; simp only [noBind, List.all_cons, Bool.and_eq_true] at hn
-              cases va with
-              | bind _ | dynOn _ _ => simp at hn
-              | dynVal k' _ =>
-                  apply ih _ _ hn.2
-                  by_cases hv : k' = "value"
-                  · simp [stepSpecAttr, hv, hlk]
-                  · simp [stepSpecAttr, hv, lookupAssoc_setAssoc, hlk]
-              | stat a =>
-                  cases a with
-                  | cls _ => exact ih _ _ hn.2 hlk
-                  | _ => exact ih _ _ hn.2 (stepSpecAttr_lookup_congr "value" hlk _)
-        refine (hstepEq.1 "value").trans ((hnv attrs _ hnb).trans ((hev attrs base base hnb rfl).trans ?_))
-        rw [hev2]; exact (hdd2.1 "value").symm
+        exact (hEl'.2 "value" rfl).trans ((ElemClean_evalSpecAttrs (hclean.2.1 s₂)).2 "value" rfl).symm
       · cases hr : lastDynVal? k s₂ attrs with
         | some v =>
             have h1 := stepDynAttr_last_key s₂ k attrs (((attrs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr base) hnb
@@ -983,13 +993,6 @@ mutual
                         exact hrest1.trans hrest2
 end
 
-private theorem uint32_toNat_ofNat_lt_vp (n : Nat) (h : n < UInt32.size) :
-    (UInt32.ofNat n).toNat = n := by
-  simpa [UInt32.toNat_ofNat] using Nat.mod_eq_of_lt h
-
-private theorem node_ne_of_toNat_ne {x y : Dom.Node} (h : x.toNat ≠ y.toNat) : x ≠ y :=
-  fun he => h (congrArg UInt32.toNat he)
-
 mutual
   private theorem buildViewM_vstate_clean {σ msg : Type} (ns : String) :
       ∀ (v : View σ msg) (s : σ) (a : DomArena msg) (fuel : Nat),
@@ -1034,30 +1037,36 @@ mutual
         cases hb : buildDomM (m := StateM (DomArena msg)) ns (sm.eval s) a with
         | mk r a' => rw [hb] at hs hc; dsimp only at hs hc; exact ⟨rfl, hs.1, hs.2.1, Nat.le_trans hs.1 (Nat.le_of_lt hs.2.1), hs.2.2.1, hs.2.2.2.1, hc, rfl, rfl, rfl⟩
     | .ifElse c y no, s, a, fuel, ⟨hy, hn⟩, hpos, hbound, hdep => by
+        have hwrap : ∀ (v' : View σ msg) (b : Bool), c s = b → (if b then y else no) = v' →
+            (let ((root, vst), a') := (buildViewM (m := StateM (DomArena msg)) ns v' s).run a
+             vst.rootNode = root ∧ a.nextId ≤ root.toNat ∧ root.toNat < a'.nextId ∧
+             a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render v' s) ∧
+             (∀ m : Dom.Node, m.toNat < a.nextId → a'.get m = a.get m) ∧
+             CleanDomSubtree fuel ns (View.render v' s) a' (fun k => a.nextId ≤ k ∧ k < a'.nextId) root ∧
+             VStateMatches v' s a' root vst) →
+            let ((root, vst), a') := (buildViewM (m := StateM (DomArena msg)) ns (.ifElse c y no) s).run a
+            vst.rootNode = root ∧ a.nextId ≤ root.toNat ∧ root.toNat < a'.nextId ∧
+            a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render (.ifElse c y no) s) ∧
+            (∀ m : Dom.Node, m.toNat < a.nextId → a'.get m = a.get m) ∧
+            CleanDomSubtree fuel ns (View.render (.ifElse c y no) s) a' (fun k => a.nextId ≤ k ∧ k < a'.nextId) root ∧
+            VStateMatches (.ifElse c y no) s a' root vst := by
+          intro v' b hcb hveq ih
+          dsimp only [StateT.run] at ih
+          cases hb : buildViewM (m := StateM (DomArena msg)) ns v' s a with
+          | mk p a' =>
+              rcases p with ⟨r, inner⟩; rw [hb] at ih; rcases ih with ⟨hroot, h1, h2, h3, h4, h5, h6, h7⟩
+              dsimp only [buildViewM, View.render, StateT.run, bind]
+              cases b <;> (simp only [hcb, Bool.false_eq_true, ↓reduceIte, StateT.bind, pure, StateT.pure] at hveq ⊢; subst hveq; rw [hb]; dsimp only; exact ⟨hroot, h1, h2, h3, h4, h5, h6, ⟨hcb.symm, by simpa [hcb] using h7⟩⟩)
         cases hc : c s
-        · have ih := buildViewM_vstate_clean ns no s a fuel hn hpos (by simpa [View.render, hc] using hbound) (by simpa [View.render, hc] using hdep)
-          dsimp only [StateT.run] at ih
-          cases hb : buildViewM (m := StateM (DomArena msg)) ns no s a with
-          | mk p a' =>
-              rcases p with ⟨r, inner⟩; rw [hb] at ih; rcases ih with ⟨hroot, h1, h2, h3, h4, h5, h6, h7⟩
-              dsimp only [buildViewM, View.render, StateT.run, bind]
-              simp only [hc, Bool.false_eq_true, ↓reduceIte, StateT.bind, pure, StateT.pure]; rw [hb]; dsimp only
-              exact ⟨hroot, h1, h2, h3, h4, h5, h6, ⟨hc.symm, by simpa [hc] using h7⟩⟩
-        · have ih := buildViewM_vstate_clean ns y s a fuel hy hpos (by simpa [View.render, hc] using hbound) (by simpa [View.render, hc] using hdep)
-          dsimp only [StateT.run] at ih
-          cases hb : buildViewM (m := StateM (DomArena msg)) ns y s a with
-          | mk p a' =>
-              rcases p with ⟨r, inner⟩; rw [hb] at ih; rcases ih with ⟨hroot, h1, h2, h3, h4, h5, h6, h7⟩
-              dsimp only [buildViewM, View.render, StateT.run, bind]
-              simp only [hc, ↓reduceIte, StateT.bind, pure, StateT.pure]; rw [hb]; dsimp only
-              exact ⟨hroot, h1, h2, h3, h4, h5, h6, ⟨hc.symm, by simpa [hc] using h7⟩⟩
+        · exact hwrap no false hc rfl (buildViewM_vstate_clean ns no s a fuel hn hpos (by simpa [View.render, hc] using hbound) (by simpa [View.render, hc] using hdep))
+        · exact hwrap y true hc rfl (buildViewM_vstate_clean ns y s a fuel hy hpos (by simpa [View.render, hc] using hbound) (by simpa [View.render, hc] using hdep))
     | .element tag attrs kids, s, a, fuel, ⟨haClean, hkidsClean⟩, hpos, hbound, hdep => by
         cases fuel with
         | zero => simp [View.render, htmlDepth] at hdep
         | succ f =>
             simp only [View.render, htmlNodeCount] at hbound; simp only [View.render, htmlDepth] at hdep
             let node := UInt32.ofNat a.nextId
-            have hnodeNat : node.toNat = a.nextId := uint32_toNat_ofNat_lt_vp a.nextId (by omega)
+            have hnodeNat : node.toNat = a.nextId := uint32_toNat_ofNat_lt a.nextId (by omega)
             let realNs := if ns == "" && tag == "svg" then Dom.svgNs else ns
             let st := evalSpecAttrs (attrs.map (VAttr.eval s))
             let mg := (normalizeAttrs (attrs.map (VAttr.eval s))).filterMap managedAttrName
@@ -1260,60 +1269,6 @@ private theorem keyedRows_eq_of_keys_eq {σ msg : Type} {keys : σ → Array Str
 
 /-! ## Verified Bare-Array Index & Certifying `O(N log N)` LIS Keyed Reconciler -/
 
-private theorem nodup_getElem_inj {α : Type} :
-    ∀ {l : List α}, l.Nodup → ∀ {i j : Nat} (hi : i < l.length) (hj : j < l.length), l[i] = l[j] → i = j
-  | [], _, _, _, hi, _, _ => absurd hi (Nat.not_lt_zero _)
-  | a :: xs, hnd, i, j, hi, hj, heq => by
-      rcases List.nodup_cons.1 hnd with ⟨ha, hxs⟩
-      cases i <;> cases j
-      · rfl
-      · simp only [List.getElem_cons_zero, List.getElem_cons_succ] at heq
-        exact False.elim (ha (heq ▸ List.getElem_mem (Nat.lt_of_succ_lt_succ hj)))
-      · simp only [List.getElem_cons_zero, List.getElem_cons_succ] at heq
-        exact False.elim (ha (heq.symm ▸ List.getElem_mem (Nat.lt_of_succ_lt_succ hi)))
-      · exact congrArg Nat.succ (nodup_getElem_inj hxs (Nat.lt_of_succ_lt_succ hi) (Nat.lt_of_succ_lt_succ hj) heq)
-
-private theorem nodup_length_le_bound :
-    ∀ (n : Nat) (l : List Dom.Node), l.Nodup → (∀ x ∈ l, x.toNat < n) → l.length ≤ n
-  | 0, l, _, hb => by
-      cases l with
-      | nil => exact Nat.le_refl 0
-      | cons x _ => exact absurd (hb x (List.mem_cons_self ..)) (Nat.not_lt_zero _)
-  | n + 1, l, hnd, hb => by
-      let rest := l.filter (fun x => x.toNat != n)
-      have hrestNd : rest.Nodup := List.Pairwise.filter _ hnd
-      have hrestB : ∀ x ∈ rest, x.toNat < n := by
-        intro x hx
-        have ⟨hxl, hne⟩ := List.mem_filter.1 hx
-        have hlt := hb x hxl
-        have hne' : x.toNat ≠ n := by simpa using hne
-        omega
-      have hih := nodup_length_le_bound n rest hrestNd hrestB
-      have hcnt : l.length ≤ rest.length + 1 := by
-        have haux : ∀ (xs : List Dom.Node), xs.Nodup →
-            (∀ x ∈ xs, ∀ y ∈ xs, x.toNat = n → y.toNat = n → x = y) →
-            xs.length ≤ (xs.filter (fun x => x.toNat != n)).length + 1 := by
-          intro xs; induction xs with
-          | nil => intro _ _; simp
-          | cons a as ih =>
-              intro hnd' huniq
-              rcases List.nodup_cons.1 hnd' with ⟨ha, has⟩
-              by_cases han : a.toNat = n
-              · have hnotIn : ∀ y ∈ as, (y.toNat != n) = true := by
-                  intro y hy
-                  by_cases hyn : y.toNat = n
-                  · exact False.elim (ha ((huniq a (List.mem_cons_self ..) y (List.mem_cons_of_mem a hy) han hyn) ▸ hy))
-                  · simp [hyn]
-                have hfiltAs : as.filter (fun x => x.toNat != n) = as := List.filter_eq_self.2 hnotIn
-                simp [han, hfiltAs]
-              · have hneB : (a.toNat != n) = true := by simp [han]
-                have hrec := ih has (fun x hx y hy => huniq x (List.mem_cons_of_mem a hx) y (List.mem_cons_of_mem a hy))
-                simp only [List.filter_cons, hneB, ↓reduceIte, List.length_cons]
-                omega
-        exact haux l hnd fun x _ y _ hx hy => UInt32.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq (by
-          change x.toNat = y.toNat; omega))
-      omega
-
 private theorem htmlListNodeCount_append {msg : Type} :
     ∀ (xs ys : List (Html msg)), htmlListNodeCount (xs ++ ys) = htmlListNodeCount xs + htmlListNodeCount ys
   | [], ys => by simp [htmlListNodeCount]
@@ -1393,7 +1348,7 @@ private theorem buildKeyIndexLoop_spec (keys : Array String) (mask : USize)
                   have hsk : s = k := eq_of_beq hbeq; subst hsk
                   have h1 : keys[oi]'(Nat.lt_trans hoiLt hlt) = k := by
                     rw [Array.getElem?_eq_getElem (Nat.lt_trans hoiLt hlt), Option.some.injEq] at hs; exact hs
-                  exact False.elim (heqI (nodup_getElem_inj hnd (by simpa using Nat.lt_trans hoiLt hlt) (by simpa using hlt) (by simpa [k] using h1)))
+                  exact False.elim (heqI (nodup_getElem_inj (by simpa using Nat.lt_trans hoiLt hlt) (by simpa using hlt) hnd (by simpa [k] using h1)))
             simp only [hneK, Bool.false_eq_true, ↓reduceIte]
             exact hinv.2.2 oi hoiLt s hs
       exact ih (i + 1) (by omega) buckets' (by omega) hinv'
@@ -1801,7 +1756,7 @@ private theorem lis_filter_kept_eq (live : Array Dom.Node) (sources : Array (Opt
     kept.filter (fun x => !(filterLisNodes live sources inLis false n).contains x) = filterLisNodes live sources inLis true n := by
   intro kept
   have hliveInj : ∀ oi₁ oi₂, oi₁ < live.size → oi₂ < live.size → live.getD oi₁ 0 = live.getD oi₂ 0 → oi₁ = oi₂ := fun oi₁ oi₂ h1 h2 heq =>
-    nodup_getElem_inj hliveNd (by simpa using h1) (by simpa using h2) (by simpa [Array.getD, h1, h2] using heq)
+    nodup_getElem_inj (by simpa using h1) (by simpa using h2) hliveNd (by simpa [Array.getD, h1, h2] using heq)
   have hkeptMem : ∀ x, x ∈ kept ↔ ∃ oi, oi < live.size ∧ used.getD oi false = true ∧ live.getD oi 0 = x := by
     intro x; simp only [kept, List.mem_filterMap, List.mem_range]; constructor
     · rintro ⟨oi, hoi, hif⟩; cases hu : used.getD oi false with | false => simp [hu] at hif | true => simp [hu] at hif; exact ⟨oi, hoi, hu, by simpa [Array.getD, hoi] using hif⟩
@@ -1999,7 +1954,7 @@ private theorem reconcileLisBackM_spec {msg : Type} (f' : Nat) (node : Dom.Node)
         rw [List.take_succ_eq_append_getElem hkLt, htmlListNodeCount_append]; simp [htmlListNodeCount]
       have hdrop : newRowsL.drop k = newRowsL[k] :: newRowsL.drop (k + 1) := List.drop_eq_getElem_cons hkLt
       have hliveInj : ∀ oi₁ oi₂, oi₁ < live.size → oi₂ < live.size → live.getD oi₁ 0 = live.getD oi₂ 0 → oi₁ = oi₂ := fun oi₁ oi₂ h1 h2 heq =>
-        nodup_getElem_inj hliveNd (by simpa using h1) (by simpa using h2) (by simpa [Array.getD, h1, h2] using heq)
+        nodup_getElem_inj (by simpa using h1) (by simpa using h2) hliveNd (by simpa [Array.getD, h1, h2] using heq)
       dsimp only [reconcileLisBackM, StateT.run, bind, StateT.bind]
       cases hsK : sources.getD k none with
       | some oi =>
@@ -2215,6 +2170,557 @@ private theorem reconcileLisBackM_spec {msg : Type} (f' : Nat) (node : Dom.Node)
                 fun m hmn hmLt => (hres.2.2.1 m hmn (by rw [ha2Next]; exact Nat.lt_of_lt_of_le hmLt ha1Ge)).trans ((DomArena.get_set_ne _ _ hmn).trans (ha1Fr m hmLt)),
                 hres.2.2.2⟩
 
+private theorem appendFragmentRowsM_spec {msg : Type} (f' : Nat) (childNs : String)
+    (node : Dom.Node) (realNs tag : String) (st' : SpecElemState msg) (mg' : List String)
+    (rows : List (Html msg)) (Sold : Nat → Prop) (a aBase : DomArena msg)
+    (hrowsClean : Html.DomCleanList rows = true)
+    (hbound : a.nextId + (1 + htmlListNodeCount rows) < UInt32.size)
+    (hdep : htmlListDepth rows ≤ f') (hpos : 0 < a.nextId) (hnodeLt : node.toNat < a.nextId)
+    (haBaseN : aBase.nextId = a.nextId) (haBaseNode : aBase.get node = .element realNs tag st' mg' [])
+    (haBaseOut : ∀ m, m ≠ node → aBase.get m = a.get m) :
+    ∃ aBuilt aOut csNew,
+      buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf childNs tag)
+        (aBase.alloc (.fragment [])).1 rows (aBase.alloc (.fragment [])).2 = ((), aBuilt) ∧
+      MonadDom.appendChild (m := StateM (DomArena msg)) node (aBase.alloc (.fragment [])).1 aBuilt = ((), aOut) ∧
+      a.nextId ≤ aOut.nextId ∧ aOut.nextId ≤ a.nextId + (1 + htmlListNodeCount rows) ∧
+      (∀ m : Dom.Node, m ≠ node → m.toNat < a.nextId → aOut.get m = a.get m) ∧
+      aOut.get node = .element realNs tag st' mg' csNew ∧
+      CleanDomChildren f' (Dom.childNsOf childNs tag) rows aOut
+        (fun k => (Sold k ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) ∧ k ≠ node.toNat) csNew := by
+  let frag := UInt32.ofNat aBase.nextId
+  let aFragBase : DomArena msg := { aBase with nextId := aBase.nextId + 1 }
+  have hfragToNat : frag.toNat = a.nextId := by
+    dsimp only [frag]; rw [haBaseN]; exact uint32_toNat_ofNat_lt a.nextId (by omega)
+  have hfragNeNode : frag ≠ node := node_ne_of_toNat_ne (by rw [hfragToNat]; omega)
+  have hfragRun : aBase.alloc (ArenaEntry.fragment []) = (frag, aFragBase.set frag (.fragment [])) := rfl
+  have hbuilt := CleanDomChildren_of_buildDomListM (Dom.childNsOf childNs tag) rows [] aFragBase frag
+    ArenaEntry.fragment (.inr fun _ => rfl) [] f' (fun _ => False) hrowsClean
+    (by change frag.toNat < aBase.nextId + 1; rw [hfragToNat, haBaseN]; omega)
+    (by change 0 < aBase.nextId + 1; omega)
+    (by change aBase.nextId + 1 + htmlListNodeCount rows < UInt32.size; rw [haBaseN]; omega)
+    hdep (fun _ h => h.elim) trivial
+  dsimp only [StateT.run] at hbuilt
+  rcases hbuilt with ⟨csNew, aBase', haBuiltEq, haBuiltGe, haBuiltBound, haBuiltFr, hCleanOut⟩
+  simp only [List.nil_append, false_or] at haBuiltEq hCleanOut
+  let aBuilt := (buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf childNs tag) frag rows (aFragBase.set frag (.fragment []))).2
+  have haBuiltEq' : aBuilt = aBase'.set frag (.fragment csNew) := haBuiltEq
+  have haBuiltNext : a.nextId + 1 ≤ aBuilt.nextId := by
+    change aFragBase.nextId ≤ aBuilt.nextId at haBuiltGe
+    change aBase.nextId + 1 ≤ aBuilt.nextId at haBuiltGe; rw [← haBaseN]; exact haBuiltGe
+  have haBuiltBd' : aBuilt.nextId ≤ a.nextId + (1 + htmlListNodeCount rows) := by
+    change aBuilt.nextId ≤ aFragBase.nextId + htmlListNodeCount rows at haBuiltBound
+    change aBuilt.nextId ≤ aBase.nextId + 1 + htmlListNodeCount rows at haBuiltBound
+    rw [← haBaseN]; omega
+  have haBuiltFrag : aBuilt.get frag = .fragment csNew := by rw [haBuiltEq', DomArena.get_set_self]
+  have haBuiltNode : aBuilt.get node = .element realNs tag st' mg' [] := by
+    rw [haBuiltFr node (by change node.toNat < aBase.nextId + 1; rw [haBaseN]; omega) hfragNeNode.symm]
+    exact haBaseNode
+  let aOut := (aBuilt.set frag .null).set node (.element realNs tag st' mg' csNew)
+  have happendRun : MonadDom.appendChild (m := StateM (DomArena msg)) node frag aBuilt = ((), aOut) := by
+    simp only [MonadDom.appendChild, haBuiltFrag, DomArena.modifyChildren, DomArena.modify,
+      DomArena.get_set_ne _ _ hfragNeNode.symm, haBuiltNode, List.filter_nil, List.nil_append, aOut]
+  have hbuildEq : buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf childNs tag)
+      (aBase.alloc (.fragment [])).1 rows (aBase.alloc (.fragment [])).2 = ((), aBuilt) := by
+    rw [hfragRun]; rfl
+  have haOutNext : aOut.nextId = aBuilt.nextId := rfl
+  refine ⟨aBuilt, aOut, csNew, hbuildEq, by rw [hfragRun]; exact happendRun, by omega, by omega,
+    fun m hmn hmLt => ?_, DomArena.get_set_self _ _ _, ?_⟩
+  · have hmf : m ≠ frag := node_ne_of_toNat_ne (by rw [hfragToNat]; omega)
+    dsimp only [aOut]
+    rw [DomArena.get_set_ne _ _ hmn, DomArena.get_set_ne _ _ hmf,
+      haBuiltFr m (by change m.toNat < aBase.nextId + 1; rw [haBaseN]; omega) hmf]
+    exact haBaseOut m hmn
+  · refine CleanDomChildren_mono (fun k hk => ?_)
+      (CleanDomChildren_frame (a' := aOut) (fun m hm => ?_) hCleanOut)
+    · rcases hk with ⟨hk1, hk2⟩
+      change aBase.nextId + 1 ≤ k at hk1; change k < aBuilt.nextId at hk2; rw [haBaseN] at hk1
+      exact ⟨.inr ⟨by omega, by rw [haOutNext]; exact hk2⟩, by omega⟩
+    · rcases hm with ⟨hm1, hm2⟩
+      change aBase.nextId + 1 ≤ m.toNat at hm1; change m.toNat < aBuilt.nextId at hm2; rw [haBaseN] at hm1
+      have hmn : m ≠ node := node_ne_of_toNat_ne (by omega)
+      have hmf : m ≠ frag := node_ne_of_toNat_ne (by rw [hfragToNat]; omega)
+      simp only [aOut, DomArena.get_set_ne _ _ hmn, DomArena.get_set_ne _ _ hmf]; rfl
+
+private theorem patchViewM_keyedList_spec {σ msg : Type} (f : Nat) (childNs : String) (parent : Dom.Node)
+    (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
+    (tag : String) (attrs : List (VAttr σ msg)) (keys : σ → Array String)
+    (marks : σ → Array USize) (rowSig : σ → Array String → Nat → Array (String × String))
+    (rowEv : σ → Array String → Nat → Array (String × msg)) (rowsHtml : σ → List (Html msg))
+    (tmpl? : Option (RowTmpl σ msg))
+    (s₁ s₂ : σ) (pre suf : List Dom.Node) (Sold : Nat → Prop) (a : DomArena msg) (vst : VState σ msg)
+    (hchildNs : childNs = if pns == Dom.svgNs && ptag != "foreignObject" then Dom.svgNs else "")
+    (hclean : View.DomClean (.keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl?))
+    (hbound : a.nextId + htmlNodeCount (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl?) s₂) < UInt32.size)
+    (hdep : htmlDepth (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl?) s₂) ≤ f)
+    (hparLt : parent.toNat < a.nextId) (hpos : 0 < a.nextId)
+    (hpar : a.get parent = .element pns ptag pst pmg (pre ++ vst.rootNode :: suf))
+    (hnd : (pre ++ vst.rootNode :: suf).Nodup) (hparOut : ¬Sold parent.toNat)
+    (hSoldLt : ∀ k, Sold k → k < a.nextId) (hparNodes : ∀ r ∈ pre ++ vst.rootNode :: suf, r.toNat < a.nextId)
+    (hval : VStateValid f childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl?) s₁ a Sold vst) :
+    let (vst', a') := (patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length)
+      (.keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl?) s₂ vst).run a
+    a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl?) s₂) ∧
+    (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
+    a'.get parent = .element pns ptag pst pmg (pre ++ vst'.rootNode :: suf) ∧ (pre ++ vst'.rootNode :: suf).Nodup ∧
+    (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧
+    VStateValid f childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl?) s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧
+    DomTreeAssocEquiv (readDomTree f a' vst'.rootNode) (specDom childNs (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl?) s₂)) := by
+  cases tmpl? with
+  | some _ => exact False.elim hclean
+  | none =>
+  cases vst with
+  | list node oldKeys oldSigs oldRowsL oldMarks inst =>
+      rcases hclean with ⟨haClean, hrowsClean⟩
+      rcases hval with ⟨hcl, _, rfl, rfl⟩
+      dsimp only [VState.rootNode] at hpar hnd hparNodes
+      cases f with
+      | zero => simp [View.render, CleanDomSubtree] at hcl
+      | succ f' =>
+          rcases hcl with ⟨hnodeMem, _, _, st, mg, domCs, hnodeGet, hElClean, hElEq, hmg, hCleanCs⟩
+          dsimp only [VState.rootNode] at hnodeMem hnodeGet hCleanCs
+          have hne : node ≠ parent := fun h => hparOut (h ▸ hnodeMem)
+          have hnodeLt : node.toNat < a.nextId := hSoldLt _ hnodeMem
+          let realNs := if childNs == "" && tag == "svg" then Dom.svgNs else childNs
+          dsimp only [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure]
+          have hSameKeysBranch : ∀ (hsameK : disambiguateKeys (keys s₂) = disambiguateKeys (keys s₁)),
+              let res := (StateT.bind (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂) fun _ =>
+                StateT.bind (seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ (disambiguateKeys (keys s₁))) (rowEv s₂ (disambiguateKeys (keys s₁))) (marks s₂) oldMarks oldSigs) fun newSigs =>
+                  StateT.pure (VState.list node (disambiguateKeys (keys s₁)) newSigs (rowsHtml s₁) (marks s₂) inst)) a
+              a.nextId ≤ res.2.nextId ∧ res.2.nextId ≤ a.nextId + htmlNodeCount (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂) ∧
+              (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → res.2.get m = a.get m) ∧
+              res.2.get parent = .element pns ptag pst pmg (pre ++ res.1.rootNode :: suf) ∧ (pre ++ res.1.rootNode :: suf).Nodup ∧
+              (∀ r ∈ pre ++ res.1.rootNode :: suf, r.toNat < res.2.nextId) ∧
+              VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ res.2
+                (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < res.2.nextId)) res.1 ∧
+              DomTreeAssocEquiv (readDomTree (f' + 1) res.2 res.1.rootNode)
+                (specDom childNs (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂)) := by
+            intro hsameK
+            have haSet := DomArena.set_get_self a hnodeGet
+            have hdyn := applyDynAttrsM_spec a node realNs tag st mg domCs attrs s₁ s₂ haClean hElClean hElEq hmg
+            rw [haSet] at hdyn
+            rcases hdyn with ⟨ha1Next, ha1Ne, st', mg', ha1Get, hElClean', hElEq', hmg'⟩
+            let a1 := (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ a).2
+            have ha1Eq : applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ a = ((), a1) := rfl
+            have hseed := seedRowsM_sameDom inst (rowSig s₂ (disambiguateKeys (keys s₁))) (rowEv s₂ (disambiguateKeys (keys s₁))) (marks s₂) oldMarks oldSigs a1
+            dsimp only [StateT.run] at hseed
+            have hbind : (StateT.bind (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂) fun _ =>
+                StateT.bind (seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ (disambiguateKeys (keys s₁))) (rowEv s₂ (disambiguateKeys (keys s₁))) (marks s₂) oldMarks oldSigs) fun newSigs =>
+                  StateT.pure (VState.list (σ := σ) node (disambiguateKeys (keys s₁)) newSigs (rowsHtml s₁) (marks s₂) inst)) a =
+                match seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ (disambiguateKeys (keys s₁))) (rowEv s₂ (disambiguateKeys (keys s₁))) (marks s₂) oldMarks oldSigs a1 with
+                | (newSigs, aOut) => (VState.list (σ := σ) node (disambiguateKeys (keys s₁)) newSigs (rowsHtml s₁) (marks s₂) inst, aOut) := by
+              simp only [StateT.bind, StateT.pure, bind, pure]
+              rw [ha1Eq]; rfl
+            cases hsRun : seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ (disambiguateKeys (keys s₁))) (rowEv s₂ (disambiguateKeys (keys s₁))) (marks s₂) oldMarks oldSigs a1 with
+            | mk newSigs aOut =>
+                rw [hsRun] at hseed hbind; dsimp only at hseed hbind
+                rw [hbind]; dsimp only
+                have haOutNext : aOut.nextId = a.nextId := hseed.1.trans ha1Next
+                have haOutOutside : ∀ m, m ≠ node → aOut.get m = a.get m := fun m hm =>
+                  (hseed.get_eq m).trans (ha1Ne m hm)
+                have hparOut' : aOut.get parent = .element pns ptag pst pmg (pre ++ node :: suf) := by
+                  rw [haOutOutside parent hne.symm, hpar]
+                have hrowsEq : rowsHtml s₁ = rowsHtml s₂ := keyedRows_eq_of_keys_eq hrowsClean hsameK
+                have hCleanCsOut := CleanDomChildren_frame (fun m hm => haOutOutside m (node_ne_of_toNat_ne hm.2)) hCleanCs
+                have hvalOut : VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ aOut
+                    (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) (.list node (disambiguateKeys (keys s₁)) newSigs (rowsHtml s₁) (marks s₂) inst) :=
+                  ⟨⟨.inl hnodeMem, haClean.1 s₂, haClean.2.1 s₂, st', mg', domCs,
+                    (hseed.get_eq node).trans ha1Get, hElClean', hElEq', hmg',
+                    by rw [← hrowsEq]; exact CleanDomChildren_mono (fun k hk => ⟨.inl hk.1, hk.2⟩) hCleanCsOut⟩,
+                   rfl, hsameK.symm, hrowsEq⟩
+                refine ⟨by omega, by simp only [View.render, htmlNodeCount]; omega, fun m hmPar hmOut hmLt => ?_, hparOut', hnd,
+                  fun r hr => Nat.lt_of_lt_of_le (hparNodes r hr) (by omega), hvalOut, VStateValid_equiv hvalOut⟩
+                exact haOutOutside m (fun h => hmOut (h ▸ hnodeMem))
+          by_cases hrawEq : keys s₂ = disambiguateKeys (keys s₁)
+          · have hbRaw : (keys s₂ == disambiguateKeys (keys s₁)) = true := beq_iff_eq.2 hrawEq
+            simp only [hbRaw, ↓reduceIte]
+            have hnd2 : (keys s₂).toList.Nodup := hrawEq ▸ disambiguateKeys_nodup (keys s₁)
+            exact hSameKeysBranch ((disambiguateKeys_of_nodup hnd2).trans hrawEq)
+          · have hbRaw : (keys s₂ == disambiguateKeys (keys s₁)) = false := beq_eq_false_iff_ne.2 hrawEq
+            simp only [hbRaw, Bool.false_eq_true, ↓reduceIte]
+            by_cases hsameK : disambiguateKeys (keys s₂) = disambiguateKeys (keys s₁)
+            · simp only [beq_iff_eq.2 hsameK, ↓reduceIte]
+              exact hSameKeysBranch hsameK
+            · simp only [beq_eq_false_iff_ne.2 hsameK, Bool.false_eq_true, ↓reduceIte]
+              cases hnewEmp : (disambiguateKeys (keys s₂)).isEmpty
+              · simp only [Bool.false_eq_true, ↓reduceIte]
+                cases hemp : (rowsHtml s₁).isEmpty
+                · simp only [Bool.false_eq_true, ↓reduceIte]
+                  -- Non-empty → Non-empty: verified certifying `O(N log N)` LIS minimal-moves reconciler
+                  let oldKeys := disambiguateKeys (keys s₁)
+                  let newKeys := disambiguateKeys (keys s₂)
+                  have holdNd : oldKeys.toList.Nodup := disambiguateKeys_nodup (keys s₁)
+                  have hnewNd : newKeys.toList.Nodup := disambiguateKeys_nodup (keys s₂)
+                  have hidxSpec := buildKeyIndex_spec oldKeys holdNd
+                  let oldBuckets := (buildKeyIndex oldKeys).1
+                  let mask := (buildKeyIndex oldKeys).2
+                  have hidxBnd : ∀ k oi, keyIndexGet oldBuckets mask k = some oi → oi < oldKeys.size :=
+                    fun k oi hq => (hidxSpec.1 k oi hq).1
+                  let freshFn : Unit → Array (Html msg) := fun _ => ((rowsHtml s₂).map (Html.prefixSignals inst)).toArray
+                  let plan := planKeyedLoop newKeys oldBuckets mask (rowsHtml s₁).toArray oldMarks oldSigs freshFn none 0
+                    (Array.emptyWithCapacity newKeys.size) (Array.replicate oldKeys.size false)
+                    (Array.emptyWithCapacity newKeys.size) (Array.emptyWithCapacity newKeys.size) (Array.emptyWithCapacity newKeys.size)
+                  have hplanSpec := planKeyedLoop_spec newKeys oldBuckets mask (rowsHtml s₁).toArray oldMarks oldSigs freshFn oldKeys.size hidxBnd
+                    0 none (Array.emptyWithCapacity newKeys.size) (Array.replicate oldKeys.size false)
+                    (Array.emptyWithCapacity newKeys.size) (Array.emptyWithCapacity newKeys.size) (Array.emptyWithCapacity newKeys.size)
+                    (Nat.zero_le _) (fun _ h => by cases h) rfl (by simp) rfl
+                    (fun _ hj => by omega) (fun oi ho => by simp) (fun _ hj => by omega)
+                  let sources := plan.1
+                  let used := plan.2.1
+                  let rowsArr := plan.2.2.1
+                  let marksArr := plan.2.2.2.1
+                  let sigsArr := plan.2.2.2.2
+                  have hrowsArrEq : rowsArr.toList = rowsHtml s₂ := by
+                    have hpref : (rowsHtml s₂).map (Html.prefixSignals inst) = rowsHtml s₂ :=
+                      Html.map_prefixSignals_of_DomCleanList inst (hrowsClean.2.1 s₂)
+                    refine List.ext_getElem? fun i => ?_
+                    rw [Array.getElem?_toList]
+                    by_cases hi : i < newKeys.size
+                    · have hri : i < (rowsHtml s₂).length := by rw [hrowsClean.1 s₂]; exact hi
+                      rw [hplanSpec.2.2.2.2.2 i hi]
+                      cases hq : keyIndexGet oldBuckets mask newKeys[i] with
+                      | none =>
+                          have hszF : (rowsHtml s₂).toArray.size = (rowsHtml s₂).length := List.size_toArray ..
+                          simp only [freshFn, hpref, Array.getD, hszF, hri, ↓reduceDIte]
+                          rw [List.getElem?_eq_getElem hri]; simp
+                      | some oi =>
+                          have ⟨hoiK, hkeyEq?⟩ := hidxSpec.1 _ oi hq
+                          have hoi1 : oi < (rowsHtml s₁).length := by rw [hrowsClean.1 s₁]; exact hoiK
+                          have hkeyEq : oldKeys[oi]'hoiK = newKeys[i]'hi := by
+                            rw [Array.getElem?_eq_getElem hoiK, Option.some.injEq] at hkeyEq?; exact hkeyEq?
+                          have hrowEq := hrowsClean.2.2.2 s₁ s₂ oi i hoiK hi hkeyEq
+                          have hget1 : (rowsHtml s₁).toArray.getD oi default = (rowsHtml s₁)[oi] := by simp [Array.getD, hoi1]
+                          dsimp only; rw [hget1, ← List.getElem?_eq_getElem hoi1, hrowEq]
+                    · have h1 : rowsArr.size ≤ i := by
+                        change plan.2.2.1.size ≤ i
+                        have hszR : plan.2.2.1.size = newKeys.size := hplanSpec.2.2.1; omega
+                      have h2 : (rowsHtml s₂).length ≤ i := by rw [hrowsClean.1 s₂]; dsimp only [newKeys] at hi; omega
+                      rw [Array.getElem?_eq_none h1, List.getElem?_eq_none h2]
+                  have hsrcSz : sources.size = (rowsHtml s₂).length := by rw [hplanSpec.1, hrowsClean.1 s₂]
+                  have hsrcGet : ∀ i (hi : i < newKeys.size), sources.getD i none = keyIndexGet oldBuckets mask newKeys[i] := by
+                    intro i hi
+                    have hiS : i < sources.size := by rw [hplanSpec.1]; exact hi
+                    have h1 := hplanSpec.2.2.2.1 i hi
+                    rw [Array.getElem?_eq_getElem hiS, Option.some.injEq] at h1
+                    simpa [Array.getD, hiS] using h1
+                  have hsrcBound : ∀ i, i < (rowsHtml s₂).length → ∀ oi, sources.getD i none = some oi → oi < (rowsHtml s₁).length := by
+                    intro i hi oi hsi
+                    have hiK : i < newKeys.size := by rw [← hrowsClean.1 s₂]; exact hi
+                    rw [hsrcGet i hiK] at hsi; rw [hrowsClean.1 s₁]; exact hidxBnd _ oi hsi
+                  have hsrcInj : ∀ i₁ i₂, i₁ < (rowsHtml s₂).length → i₂ < (rowsHtml s₂).length →
+                      ∀ oi, sources.getD i₁ none = some oi → sources.getD i₂ none = some oi → i₁ = i₂ := by
+                    intro i₁ i₂ h1 h2 oi hs1 hs2
+                    have h1K : i₁ < newKeys.size := by rw [← hrowsClean.1 s₂]; exact h1
+                    have h2K : i₂ < newKeys.size := by rw [← hrowsClean.1 s₂]; exact h2
+                    rw [hsrcGet i₁ h1K] at hs1; rw [hsrcGet i₂ h2K] at hs2
+                    have hkeyEq : newKeys[i₁]'h1K = newKeys[i₂]'h2K := Option.some.inj ((hidxSpec.1 _ oi hs1).2.symm.trans (hidxSpec.1 _ oi hs2).2)
+                    exact nodup_getElem_inj (by simpa using h1K) (by simpa using h2K) hnewNd (by simpa using hkeyEq)
+                  have hsrcRow : ∀ i (hi : i < (rowsHtml s₂).length) oi (ho : oi < (rowsHtml s₁).length),
+                      sources.getD i none = some oi → (rowsHtml s₁)[oi] = (rowsHtml s₂)[i] := by
+                    intro i hi oi ho hsi
+                    have hiK : i < newKeys.size := by rw [← hrowsClean.1 s₂]; exact hi
+                    have hoK : oi < oldKeys.size := by rw [← hrowsClean.1 s₁]; exact ho
+                    rw [hsrcGet i hiK] at hsi
+                    have hkeyEq? := (hidxSpec.1 _ oi hsi).2
+                    have hkeyEq : oldKeys[oi]'hoK = newKeys[i]'hiK := by
+                      rw [Array.getElem?_eq_getElem hoK, Option.some.injEq] at hkeyEq?; exact hkeyEq?
+                    have hrowEq := hrowsClean.2.2.2 s₁ s₂ oi i hoK hiK hkeyEq
+                    rw [List.getElem?_eq_getElem ho, List.getElem?_eq_getElem hi, Option.some.injEq] at hrowEq
+                    exact hrowEq
+                  have hseed0 := seedRowsM_sameDom inst (rowSig s₂ newKeys) (rowEv s₂ newKeys) (marks s₂) marksArr sigsArr a
+                  dsimp only [StateT.run] at hseed0
+                  dsimp only [StateT.bind, StateT.pure, bind, pure]
+                  cases hsRun : seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ newKeys) (rowEv s₂ newKeys) (marks s₂) marksArr sigsArr a with
+                  | mk newSigs aSeed =>
+                      rw [hsRun] at hseed0; dsimp only at hseed0 ⊢
+                      have haSet := DomArena.set_get_self aSeed ((hseed0.get_eq node).trans hnodeGet)
+                      have hdyn := applyDynAttrsM_spec aSeed node realNs tag st mg domCs attrs s₁ s₂ haClean hElClean hElEq hmg
+                      rw [haSet] at hdyn
+                      rcases hdyn with ⟨ha1Next, ha1Ne, st', mg', ha1Get, hElClean', hElEq', hmg'⟩
+                      let a1 := (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ aSeed).2
+                      have ha1Eq : applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ aSeed = ((), a1) := rfl
+                      have ha1N : a1.nextId = a.nextId := ha1Next.trans hseed0.1
+                      have ha1Out : ∀ m, m ≠ node → a1.get m = a.get m := fun m hm => (ha1Ne m hm).trans (hseed0.get_eq m)
+                      have hcnV : childNs = "" ∨ childNs = Dom.svgNs := by rw [hchildNs]; split <;> simp
+                      have hccNs := childNamespace_eq_childNsOf (ptag := tag) hcnV
+                      rw [ha1Eq]; dsimp only
+                      rw [ha1Get]; dsimp only [realNs]; rw [hccNs]
+                      split
+                      rename_i vst' a' heq
+                      split at heq
+                      · dsimp only [StateT.bind, StateT.pure, bind, pure] at heq
+                        change (match buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf childNs tag)
+                            ((a1.modifyChildren node fun _ => []).alloc (.fragment [])).1 rowsArr.toList
+                            ((a1.modifyChildren node fun _ => []).alloc (.fragment [])).2 with
+                          | (_, s2) => match MonadDom.appendChild (m := StateM (DomArena msg)) node ((a1.modifyChildren node fun _ => []).alloc (.fragment [])).1 s2 with
+                            | (_, s3) => (VState.list (σ := σ) node newKeys newSigs rowsArr.toList (marks s₂) inst, s3)) = (vst', a') at heq
+                        let aClr := a1.set node (.element realNs tag st' mg' [])
+                        have hclr : a1.modifyChildren node (fun _ => []) = aClr := by
+                          dsimp only [DomArena.modifyChildren, DomArena.modify, aClr]; rw [ha1Get]
+                        rw [hclr, hrowsArrEq] at heq
+                        simp only [View.render, htmlNodeCount] at hbound; simp only [View.render, htmlDepth] at hdep
+                        rcases appendFragmentRowsM_spec f' childNs node realNs tag st' mg' (rowsHtml s₂) Sold a aClr
+                          (hrowsClean.2.1 s₂) hbound (by omega) hpos hnodeLt ha1N (DomArena.get_set_self _ _ _)
+                          (fun m hm => (DomArena.get_set_ne _ _ hm).trans (ha1Out m hm)) with
+                          ⟨aBuilt, aOut, csNew, hbuild, happ, haOutGe, haOutBd, haOutFr, haOutNode, hCleanOut'⟩
+                        rw [hbuild] at heq; dsimp only at heq; rw [happ] at heq
+                        injection heq with hvstEq haEq; rw [← hvstEq, ← haEq]
+                        have hparOut' : aOut.get parent = .element pns ptag pst pmg (pre ++ node :: suf) := by
+                          rw [haOutFr parent hne.symm hparLt, hpar]
+                        have hvalOut : VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ aOut
+                            (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) (.list node newKeys newSigs (rowsHtml s₂) (marks s₂) inst) :=
+                          ⟨⟨.inl hnodeMem, haClean.1 s₂, haClean.2.1 s₂, st', mg', csNew,
+                            haOutNode, hElClean', hElEq', hmg', hCleanOut'⟩, rfl, rfl, rfl⟩
+                        exact ⟨haOutGe, by simp only [View.render, htmlNodeCount]; omega,
+                          fun m _ hmSold hmLt => haOutFr m (fun h => hmSold (h ▸ hnodeMem)) hmLt,
+                          hparOut', hnd, fun r hr => Nat.lt_of_lt_of_le (hparNodes r hr) haOutGe,
+                          hvalOut, VStateValid_equiv hvalOut⟩
+                      · have ⟨hdomNd, hdomLen⟩ := CleanDomChildren_nodup hCleanCs
+                        have hdomLtU32 : domCs.length < UInt32.size := by
+                          have hle : domCs.length ≤ a.nextId :=
+                            nodup_nodes_lt_length_le a.nextId domCs hdomNd fun x hx =>
+                              hSoldLt _ (CleanDomChildren_mem hCleanCs x hx).1
+                          simp only [View.render, htmlNodeCount] at hbound; omega
+                        have hcountNat : (UInt32.ofNat domCs.length).toNat = domCs.length := uint32_toNat_ofNat_lt domCs.length hdomLtU32
+                        have hsnap := snapshotChildrenM_spec a1 node realNs tag st' mg' domCs hdomLtU32 0 domCs.length #[] (by omega)
+                        rw [DomArena.set_get_self a1 ha1Get] at hsnap
+                        dsimp only [StateT.run, List.nil_append, List.drop_zero] at hsnap
+                        let live : Array Dom.Node := ⟨domCs⟩
+                        have hliveSz : live.size = (rowsHtml s₁).length := by simpa [live] using hdomLen
+                        have hremSpec := removeUnusedM_spec node realNs tag st' mg' live used 0 [] a1 (Nat.zero_le _) (by simpa [live] using hdomNd) (by simpa [live] using ha1Get)
+                        let aRem := (removeUnusedM (m := StateM (DomArena msg)) node live used 0).run a1 |>.2
+                        have haRemEq : removeUnusedM (m := StateM (DomArena msg)) node live used 0 a1 = ((), aRem) := rfl
+                        have haRemN : aRem.nextId = a.nextId := hremSpec.1.trans ha1N
+                        have haRemOut : ∀ m, m ≠ node → aRem.get m = a.get m := fun m hm => (hremSpec.2.1 m hm).trans (ha1Out m hm)
+                        let kept := (List.range live.size).filterMap fun oi => if used.getD oi false then some (live.getD oi 0) else none
+                        have haRemNode : aRem.get node = .element realNs tag st' mg' kept := by simpa [kept] using hremSpec.2.2
+                        let inLis := verifiedLisFlags sources
+                        have hlisSpec := verifiedLisFlags_spec sources
+                        have hkeptSpec := lis_filter_kept_eq live sources inLis used (rowsHtml s₂).length hsrcSz
+                          (by rw [hplanSpec.2.1, hliveSz, hrowsClean.1 s₁])
+                          (fun i hi oi hsi => by rw [hliveSz]; exact hsrcBound i hi oi hsi)
+                          hsrcInj
+                          (fun oi ho => by
+                            have hoK : oi < oldKeys.size := by rw [← hrowsClean.1 s₁, ← hliveSz]; exact ho
+                            have hszEq : newKeys.size = (rowsHtml s₂).length := (hrowsClean.1 s₂).symm
+                            simpa [hszEq] using hplanSpec.2.2.2.2.1 oi hoK)
+                          hdomNd
+                          (fun i hi hf => hlisSpec.1 i (by rw [hsrcSz]; exact hi) hf)
+                          (fun i₁ i₂ h1 h2 hf1 hf2 oi₁ oi₂ hs1 hs2 => hlisSpec.2 i₁ i₂ h1 (by rw [hsrcSz]; exact h2) hf1 hf2 oi₁ oi₂ hs1 hs2)
+                        rcases CleanDomChildren_indexed hCleanCs with ⟨Si, hSiSub, hSiDisj, hSiGet⟩
+                        have hOldCleanRem : ∀ oi (ho : oi < (rowsHtml s₁).length),
+                            CleanDomSubtree f' (Dom.childNsOf childNs tag) (rowsHtml s₁)[oi] aRem (Si oi) (live.getD oi 0) := by
+                          intro oi ho
+                          have hoD : oi < domCs.length := by rw [hdomLen]; exact ho
+                          have hgl : live.getD oi 0 = domCs[oi] := by simp [live, Array.getD, hoD]
+                          rw [hgl]
+                          exact CleanDomSubtree_frame (fun m hm => haRemOut m (node_ne_of_toNat_ne (hSiSub oi m.toNat hm).2)) (hSiGet oi ho hoD)
+                        simp only [View.render, htmlNodeCount] at hbound; simp only [View.render, htmlDepth] at hdep
+                        have hrec := reconcileLisBackM_spec f' node realNs tag st' mg' (Dom.childNsOf childNs tag)
+                          live sources inLis rowsArr (rowsHtml s₂) (rowsHtml s₁) Si Sold a.nextId
+                          hsrcSz hrowsArrEq hliveSz hdomNd (hrowsClean.2.1 s₂)
+                          hsrcBound hsrcInj hsrcRow hSiSub hSiDisj hSoldLt (by omega)
+                          (rowsHtml s₂).length (Nat.le_refl _) false 0 kept [] (fun _ => False) aRem
+                          (by omega) (by omega) (by rw [haRemN, List.take_length]; omega) (by rw [haRemN]; exact hnodeLt)
+                          haRemNode hkeptSpec.1 rfl rfl (fun x => by rw [hkeptSpec.2.1 x]; simp)
+                          hkeptSpec.2.2.1 (fun _ _ h => nomatch h) (fun _ _ h => nomatch h)
+                          (by rw [List.append_nil]; exact hkeptSpec.2.2.2) hOldCleanRem
+                          (fun _ h => h.elim) (fun _ _ _ _ _ _ h => h.elim) (by rw [List.drop_length]; trivial)
+                        have hnewKeysSzEq : newKeys.size = (rowsHtml s₂).length := (hrowsClean.1 s₂).symm
+                        dsimp only [StateT.bind, StateT.pure, bind, pure] at heq
+                        change (match MonadDom.childCount (m := StateM (DomArena msg)) node a1 with
+                          | (oc, s3) => match snapshotChildrenM (m := StateM (DomArena msg)) node 0 #[] oc.toNat s3 with
+                            | (lv, s4) => match removeUnusedM (m := StateM (DomArena msg)) node lv used 0 s4 with
+                              | (_, s5) => match reconcileLisBackM (m := StateM (DomArena msg)) node (Dom.childNsOf childNs tag) lv sources inLis rowsArr newKeys.size false 0 s5 with
+                                | (_, s6) => (VState.list (σ := σ) node newKeys newSigs rowsArr.toList (marks s₂) inst, s6)) = (vst', a') at heq
+                        dsimp only [MonadDom.childCount] at heq; rw [ha1Get] at heq; dsimp only at heq; rw [hcountNat, hsnap] at heq; dsimp only at heq
+                        rw [haRemEq] at heq; dsimp only at heq; rw [hnewKeysSzEq] at heq
+                        cases hrecRun : reconcileLisBackM (m := StateM (DomArena msg)) node (Dom.childNsOf childNs tag) live sources inLis rowsArr (rowsHtml s₂).length false 0 aRem with
+                        | mk _ aOut =>
+                            rw [hrecRun] at heq
+                            injection heq with hvstEq haEq; rw [← hvstEq, ← haEq]
+                            dsimp only [StateT.run] at hrec; rw [hrecRun] at hrec; dsimp only at hrec ⊢
+                            rcases hrec with ⟨haOutGe, haOutBd, haOutFr, finalCs, haOutNode, hCleanOut⟩
+                            rw [haRemN] at haOutGe haOutBd haOutFr
+                            rw [List.take_length] at haOutBd
+                            rw [hrowsArrEq]
+                            have hfrAll : ∀ m : Dom.Node, m ≠ node → m.toNat < a.nextId → aOut.get m = a.get m :=
+                              fun m hmn hmLt => (haOutFr m hmn hmLt).trans (haRemOut m hmn)
+                            have hparOut' : aOut.get parent = .element pns ptag pst pmg (pre ++ node :: suf) := by
+                              rw [hfrAll parent hne.symm hparLt, hpar]
+                            have hvalOut : VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ aOut
+                                (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) (.list node newKeys newSigs (rowsHtml s₂) (marks s₂) inst) :=
+                              ⟨⟨.inl hnodeMem, haClean.1 s₂, haClean.2.1 s₂, st', mg', finalCs,
+                                haOutNode, hElClean', hElEq', hmg', hCleanOut⟩, rfl, rfl, rfl⟩
+                            exact ⟨haOutGe, by simp only [View.render, htmlNodeCount]; omega,
+                              fun m _ hmSold hmLt => hfrAll m (fun h => hmSold (h ▸ hnodeMem)) hmLt,
+                              hparOut', hnd, fun r hr => Nat.lt_of_lt_of_le (hparNodes r hr) haOutGe,
+                              hvalOut, VStateValid_equiv hvalOut⟩
+                · -- `oldRowsL.isEmpty = true`: fast create via DocumentFragment
+                  simp only [↓reduceIte]
+                  have hnilRows : rowsHtml s₁ = [] := List.isEmpty_iff.1 hemp
+                  have hnilDom : domCs = [] := by
+                    rw [hnilRows] at hCleanCs
+                    cases domCs with | nil => rfl | cons _ _ => exact False.elim hCleanCs
+                  subst hnilDom
+                  have haSet := DomArena.set_get_self a hnodeGet
+                  have hdyn := applyDynAttrsM_spec a node realNs tag st mg [] attrs s₁ s₂ haClean hElClean hElEq hmg
+                  rw [haSet] at hdyn
+                  rcases hdyn with ⟨ha1Next, ha1Ne, st', mg', ha1Get, hElClean', hElEq', hmg'⟩
+                  let a1 := (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ a).2
+                  have ha1Eq : applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ a = ((), a1) := rfl
+                  have hseed := seedRowsM_sameDom inst (rowSig s₂ (disambiguateKeys (keys s₂))) (rowEv s₂ (disambiguateKeys (keys s₂))) (marks s₂) #[] #[] a1
+                  dsimp only [StateT.run] at hseed
+                  dsimp only [StateT.bind, StateT.pure, bind, pure]
+                  rw [ha1Eq]; dsimp only
+                  cases hsRun : seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ (disambiguateKeys (keys s₂))) (rowEv s₂ (disambiguateKeys (keys s₂))) (marks s₂) #[] #[] a1 with
+                  | mk newSigs aSeed =>
+                      rw [hsRun] at hseed; dsimp only at hseed ⊢
+                      have haSeedN : aSeed.nextId = a.nextId := hseed.1.trans ha1Next
+                      have haSeedNode : aSeed.get node = .element realNs tag st' mg' [] := (hseed.get_eq node).trans ha1Get
+                      have haSeedOut : ∀ m, m ≠ node → aSeed.get m = a.get m := fun m hm => (hseed.get_eq m).trans (ha1Ne m hm)
+                      rw [Html.map_prefixSignals_of_DomCleanList inst (hrowsClean.2.1 s₂)]
+                      have hcnV : childNs = "" ∨ childNs = Dom.svgNs := by rw [hchildNs]; split <;> simp
+                      have hccNs := childNamespace_eq_childNsOf (ptag := tag) hcnV
+                      rw [haSeedNode]; dsimp only [realNs]; rw [hccNs]
+                      simp only [View.render, htmlNodeCount] at hbound; simp only [View.render, htmlDepth] at hdep
+                      rcases appendFragmentRowsM_spec f' childNs node realNs tag st' mg' (rowsHtml s₂) Sold a aSeed
+                        (hrowsClean.2.1 s₂) hbound (by omega) hpos hnodeLt haSeedN haSeedNode haSeedOut with
+                        ⟨aBuilt, aOut, csNew, hbuild, happ, haOutGe, haOutBd, haOutFr, haOutNode, hCleanOut'⟩
+                      rw [hbuild]; dsimp only; rw [happ]; dsimp only
+                      have hparOut' : aOut.get parent = .element pns ptag pst pmg (pre ++ node :: suf) := by
+                        rw [haOutFr parent hne.symm hparLt, hpar]
+                      have hvalOut : VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ aOut
+                          (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) (.list node (disambiguateKeys (keys s₂)) newSigs (rowsHtml s₂) (marks s₂) inst) :=
+                        ⟨⟨.inl hnodeMem, haClean.1 s₂, haClean.2.1 s₂, st', mg', csNew,
+                          haOutNode, hElClean', hElEq', hmg', hCleanOut'⟩, rfl, rfl, rfl⟩
+                      exact ⟨haOutGe, by simp only [View.render, htmlNodeCount]; omega,
+                        fun m _ hmSold hmLt => haOutFr m (fun h => hmSold (h ▸ hnodeMem)) hmLt,
+                        hparOut', hnd, fun r hr => Nat.lt_of_lt_of_le (hparNodes r hr) haOutGe,
+                        hvalOut, VStateValid_equiv hvalOut⟩
+              · -- `newKeys.isEmpty = true`: fast `clearChildren`
+                simp only [↓reduceIte, StateT.bind, StateT.pure]
+                have hnewSz0 : (disambiguateKeys (keys s₂)).size = 0 := Array.isEmpty_iff.1 hnewEmp |> fun h => by rw [h]; rfl
+                have hnewKeysEq : disambiguateKeys (keys s₂) = #[] := Array.isEmpty_iff.1 hnewEmp
+                have hnewRows0 : rowsHtml s₂ = [] := List.eq_nil_of_length_eq_zero (by rw [hrowsClean.1 s₂, hnewSz0])
+                have haSet := DomArena.set_get_self a hnodeGet
+                have hdyn := applyDynAttrsM_spec a node realNs tag st mg domCs attrs s₁ s₂ haClean hElClean hElEq hmg
+                rw [haSet] at hdyn
+                rcases hdyn with ⟨ha1Next, ha1Ne, st', mg', ha1Get, hElClean', hElEq', hmg'⟩
+                let a1 := (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ a).2
+                have ha1Eq : applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ a = ((), a1) := rfl
+                rw [ha1Eq]; dsimp only
+                let aOut := a1.set node (.element realNs tag st' mg' [])
+                have hclr : MonadDom.clearChildren (m := StateM (DomArena msg)) node a1 = ((), aOut) := by
+                  dsimp only [MonadDom.clearChildren, DomArena.modifyChildren, DomArena.modify, aOut]; rw [ha1Get]
+                rw [hclr]; dsimp only
+                have haOutNext : aOut.nextId = a.nextId := ha1Next
+                have haOutOutside : ∀ m, m ≠ node → aOut.get m = a.get m := fun m hm =>
+                  (DomArena.get_set_ne _ _ hm).trans (ha1Ne m hm)
+                have hparOut' : aOut.get parent = .element pns ptag pst pmg (pre ++ node :: suf) := by
+                  rw [haOutOutside parent hne.symm, hpar]
+                have hvalOut : VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ aOut
+                    (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) (.list node #[] #[] [] #[] inst) :=
+                  ⟨⟨.inl hnodeMem, haClean.1 s₂, haClean.2.1 s₂, st', mg', [],
+                    DomArena.get_set_self _ _ _, hElClean', hElEq', hmg', by rw [hnewRows0]; trivial⟩,
+                   rfl, hnewKeysEq.symm, hnewRows0.symm⟩
+                exact ⟨by omega, by simp only [View.render, htmlNodeCount]; omega,
+                  fun m _ hmOut _ => haOutOutside m (fun h => hmOut (h ▸ hnodeMem)),
+                  hparOut', hnd, fun r hr => Nat.lt_of_lt_of_le (hparNodes r hr) (by omega),
+                  hvalOut, VStateValid_equiv hvalOut⟩
+  | _ => exact False.elim hval.2
+
+private theorem patchViewM_leaf_spec {σ msg : Type} (f : Nat) (childNs : String) (parent : Dom.Node)
+    (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
+    (v : View σ msg) (hleaf : match v with | .text _ | .static _ | .dyn _ | .dynNode _ | .memo _ => True | _ => False)
+    (s₁ s₂ : σ) (pre suf : List Dom.Node) (Sold : Nat → Prop) (a : DomArena msg) (vst : VState σ msg)
+    (hchildNs : childNs = if pns == Dom.svgNs && ptag != "foreignObject" then Dom.svgNs else "")
+    (hclean : View.DomClean v) (hpreLen : pre.length + 1 + suf.length < UInt32.size)
+    (hbound : a.nextId + htmlNodeCount (View.render v s₂) < UInt32.size)
+    (hdep : htmlDepth (View.render v s₂) ≤ f) (hparLt : parent.toNat < a.nextId) (hpos : 0 < a.nextId)
+    (hpar : a.get parent = .element pns ptag pst pmg (pre ++ vst.rootNode :: suf))
+    (hnd : (pre ++ vst.rootNode :: suf).Nodup) (hparOut : ¬Sold parent.toNat)
+    (hSoldLt : ∀ k, Sold k → k < a.nextId) (hparNodes : ∀ r ∈ pre ++ vst.rootNode :: suf, r.toNat < a.nextId)
+    (hval : VStateValid f childNs v s₁ a Sold vst) :
+    let (vst', a') := (patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) v s₂ vst).run a
+    a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render v s₂) ∧
+    (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
+    a'.get parent = .element pns ptag pst pmg (pre ++ vst'.rootNode :: suf) ∧ (pre ++ vst'.rootNode :: suf).Nodup ∧
+    (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧
+    VStateValid f childNs v s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧
+    DomTreeAssocEquiv (readDomTree f a' vst'.rootNode) (specDom childNs (View.render v s₂)) := by
+  cases v with
+  | ifElse _ _ _ | element _ _ _ | keyedList _ _ _ _ _ _ _ _ => exact False.elim hleaf
+  | text _ =>
+      cases vst <;> try exact False.elim hval.2
+      dsimp only [patchViewM, StateT.run, pure, StateT.pure]
+      exact ⟨Nat.le_refl _, by simp [View.render, htmlNodeCount], fun _ _ _ _ => rfl, hpar, hnd, hparNodes,
+        VStateValid_mono (fun _ => .inl) hval, CleanDomSubtree_equiv hval.1⟩
+  | static _ =>
+      cases vst <;> try exact False.elim hval.2
+      dsimp only [patchViewM, StateT.run, pure, StateT.pure]
+      exact ⟨Nat.le_refl _, by omega, fun _ _ _ _ => rfl, hpar, hnd, hparNodes,
+        VStateValid_mono (fun _ => .inl) hval, CleanDomSubtree_equiv hval.1⟩
+  | dyn get =>
+      cases vst with
+      | dyn node _ =>
+          rcases hval with ⟨hcl, _, rfl⟩
+          cases f with
+          | zero => simp [CleanDomSubtree] at hcl
+          | succ f' =>
+              rcases hcl with ⟨hmem, hget⟩
+              dsimp only [VState.rootNode] at hmem hget
+              have hne : node ≠ parent := fun h => hparOut (h ▸ hmem)
+              by_cases heq : get s₂ = get s₁
+              · dsimp only [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure]
+                simp only [show (get s₂ != get s₁) = false by simp [heq], Bool.false_eq_true, ↓reduceIte]
+                have hval' : VStateValid (f' + 1) childNs (.dyn get) s₂ a (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a.nextId)) (.dyn node (get s₂)) :=
+                  ⟨⟨.inl hmem, by simpa [View.render, heq] using hget⟩, rfl, rfl⟩
+                exact ⟨Nat.le_refl _, by simp [View.render, htmlNodeCount], fun _ _ _ _ => rfl, hpar, hnd, hparNodes, hval', VStateValid_equiv hval'⟩
+              · dsimp only [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure]
+                simp only [show (get s₂ != get s₁) = true by simp [heq], ↓reduceIte, StateT.bind, pure, StateT.pure]
+                dsimp only [MonadDom.setText, DomArena.modify]; rw [hget]; dsimp only
+                let a' := a.set node (.text (get s₂))
+                have hval' : VStateValid (f' + 1) childNs (.dyn get) s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) (.dyn node (get s₂)) :=
+                  ⟨⟨.inl hmem, DomArena.get_set_self _ _ _⟩, rfl, rfl⟩
+                refine ⟨Nat.le_refl _, by simp [View.render, htmlNodeCount], fun m _ hmOut _ =>
+                  DomArena.get_set_ne _ _ (fun hEq => hmOut (hEq ▸ hmem)),
+                  by rw [DomArena.get_set_ne _ _ hne.symm]; simpa [VState.rootNode] using hpar,
+                  hnd, hparNodes, hval', VStateValid_equiv hval'⟩
+      | _ => exact False.elim hval.2
+  | dynNode get =>
+      cases vst with
+      | dynNode node _ =>
+          rcases hval with ⟨hcl, _, rfl⟩
+          have hp := patchHtmlSubtreeM_spec f childNs parent pns ptag pst pmg (get s₁) (get s₂) node pre suf Sold a
+            hchildNs hpreLen hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hcl (hclean s₂)
+          dsimp only [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure] at hp ⊢
+          cases hsp : patchHtmlSubtreeM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (get s₁) (get s₂) a with
+          | mk n' a' =>
+              rw [hsp] at hp; dsimp only at hp; rcases hp with ⟨h1, h2, h3, h4, h5, h6, h7, h8⟩
+              exact ⟨h1, h2, h3, h4, h5, h6, ⟨h7, rfl, rfl⟩, h8⟩
+      | _ => exact False.elim hval.2
+  | memo sm =>
+      cases vst with
+      | memo node lastKey lastHtml =>
+          rcases hval with ⟨hcl, _, rfl, rfl⟩
+          dsimp only [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure]
+          by_cases hkey : sm.keyOf s₂ = sm.keyOf s₁
+          · have hb : (sm.keyOf s₂ == sm.keyOf s₁) = true := beq_iff_eq.2 hkey
+            have heval : sm.eval s₂ = sm.eval s₁ := sm.sound s₂ s₁ hkey
+            simp only [hb, ↓reduceIte]
+            have hval' : VStateValid f childNs (.memo sm) s₂ a (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a.nextId)) (.memo node (sm.keyOf s₁) (sm.eval s₁)) :=
+              ⟨by simpa [View.render, heval] using CleanDomSubtree_mono (fun _ => .inl) hcl, rfl, hkey.symm, heval.symm⟩
+            exact ⟨Nat.le_refl _, by omega, fun _ _ _ _ => rfl, hpar, hnd, hparNodes, hval', VStateValid_equiv hval'⟩
+          · simp only [show (sm.keyOf s₂ == sm.keyOf s₁) = false by exact beq_eq_false_iff_ne.2 hkey, Bool.false_eq_true, ↓reduceIte, StateT.bind, pure, StateT.pure]
+            have hp := patchHtmlSubtreeM_spec f childNs parent pns ptag pst pmg (sm.eval s₁) (sm.eval s₂) node pre suf Sold a
+              hchildNs hpreLen hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hcl (hclean s₂)
+            dsimp only [StateT.run] at hp
+            cases hsp : patchHtmlSubtreeM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (sm.eval s₁) (sm.eval s₂) a with
+            | mk n' a' =>
+                rw [hsp] at hp; dsimp only at hp; rcases hp with ⟨h1, h2, h3, h4, h5, h6, h7, h8⟩
+                exact ⟨h1, h2, h3, h4, h5, h6, ⟨h7, rfl, rfl, rfl⟩, h8⟩
+      | _ => exact False.elim hval.2
+
 mutual
   theorem patchViewM_spec {σ msg : Type} (f : Nat) (childNs : String) (parent : Dom.Node)
       (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
@@ -2236,678 +2742,11 @@ mutual
       DomTreeAssocEquiv (readDomTree f a' vst'.rootNode) (specDom childNs (View.render v s₂)) := by
     cases v with
     | keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl? =>
-        cases tmpl? with
-        | some _ => exact False.elim hclean
-        | none =>
-        cases vst with
-        | list node oldKeys oldSigs oldRowsL oldMarks inst =>
-            rcases hclean with ⟨haClean, hrowsClean⟩
-            rcases hval with ⟨hcl, _, rfl, rfl⟩
-            dsimp only [VState.rootNode] at hpar hnd hparNodes
-            cases f with
-            | zero => simp [View.render, CleanDomSubtree] at hcl
-            | succ f' =>
-                rcases hcl with ⟨hnodeMem, _, _, st, mg, domCs, hnodeGet, hElClean, hElEq, hmg, hCleanCs⟩
-                dsimp only [VState.rootNode] at hnodeMem hnodeGet hCleanCs
-                have hne : node ≠ parent := fun h => hparOut (h ▸ hnodeMem)
-                have hnodeLt : node.toNat < a.nextId := hSoldLt _ hnodeMem
-                let realNs := if childNs == "" && tag == "svg" then Dom.svgNs else childNs
-                dsimp only [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure]
-                have hSameKeysBranch : ∀ (hsameK : disambiguateKeys (keys s₂) = disambiguateKeys (keys s₁)),
-                    let res := (StateT.bind (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂) fun _ =>
-                      StateT.bind (seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ (disambiguateKeys (keys s₁))) (rowEv s₂ (disambiguateKeys (keys s₁))) (marks s₂) oldMarks oldSigs) fun newSigs =>
-                        StateT.pure (VState.list node (disambiguateKeys (keys s₁)) newSigs (rowsHtml s₁) (marks s₂) inst)) a
-                    a.nextId ≤ res.2.nextId ∧ res.2.nextId ≤ a.nextId + htmlNodeCount (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂) ∧
-                    (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → res.2.get m = a.get m) ∧
-                    res.2.get parent = .element pns ptag pst pmg (pre ++ res.1.rootNode :: suf) ∧ (pre ++ res.1.rootNode :: suf).Nodup ∧
-                    (∀ r ∈ pre ++ res.1.rootNode :: suf, r.toNat < res.2.nextId) ∧
-                    VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ res.2
-                      (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < res.2.nextId)) res.1 ∧
-                    DomTreeAssocEquiv (readDomTree (f' + 1) res.2 res.1.rootNode)
-                      (specDom childNs (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂)) := by
-                  intro hsameK
-                  have haSet := DomArena.set_get_self a hnodeGet
-                  have hdyn := applyDynAttrsM_spec a node realNs tag st mg domCs attrs s₁ s₂ haClean hElClean hElEq hmg
-                  rw [haSet] at hdyn
-                  rcases hdyn with ⟨ha1Next, ha1Ne, st', mg', ha1Get, hElClean', hElEq', hmg'⟩
-                  let a1 := (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ a).2
-                  have ha1Eq : applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ a = ((), a1) := rfl
-                  have hseed := seedRowsM_sameDom inst (rowSig s₂ (disambiguateKeys (keys s₁))) (rowEv s₂ (disambiguateKeys (keys s₁))) (marks s₂) oldMarks oldSigs a1
-                  dsimp only [StateT.run] at hseed
-                  have hbind : (StateT.bind (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂) fun _ =>
-                      StateT.bind (seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ (disambiguateKeys (keys s₁))) (rowEv s₂ (disambiguateKeys (keys s₁))) (marks s₂) oldMarks oldSigs) fun newSigs =>
-                        StateT.pure (VState.list (σ := σ) node (disambiguateKeys (keys s₁)) newSigs (rowsHtml s₁) (marks s₂) inst)) a =
-                      match seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ (disambiguateKeys (keys s₁))) (rowEv s₂ (disambiguateKeys (keys s₁))) (marks s₂) oldMarks oldSigs a1 with
-                      | (newSigs, aOut) => (VState.list (σ := σ) node (disambiguateKeys (keys s₁)) newSigs (rowsHtml s₁) (marks s₂) inst, aOut) := by
-                    simp only [StateT.bind, StateT.pure, bind, pure]
-                    rw [ha1Eq]; rfl
-                  cases hsRun : seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ (disambiguateKeys (keys s₁))) (rowEv s₂ (disambiguateKeys (keys s₁))) (marks s₂) oldMarks oldSigs a1 with
-                  | mk newSigs aOut =>
-                      rw [hsRun] at hseed hbind; dsimp only at hseed hbind
-                      rw [hbind]; dsimp only
-                      have haOutNext : aOut.nextId = a.nextId := hseed.1.trans ha1Next
-                      have haOutOutside : ∀ m, m ≠ node → aOut.get m = a.get m := fun m hm =>
-                        (hseed.get_eq m).trans (ha1Ne m hm)
-                      have hparOut' : aOut.get parent = .element pns ptag pst pmg (pre ++ node :: suf) := by
-                        rw [haOutOutside parent hne.symm, hpar]
-                      have hrowsEq : rowsHtml s₁ = rowsHtml s₂ := keyedRows_eq_of_keys_eq hrowsClean hsameK
-                      have hCleanCsOut := CleanDomChildren_frame (fun m hm => haOutOutside m (node_ne_of_toNat_ne hm.2)) hCleanCs
-                      have hvalOut : VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ aOut
-                          (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) (.list node (disambiguateKeys (keys s₁)) newSigs (rowsHtml s₁) (marks s₂) inst) :=
-                        ⟨⟨.inl hnodeMem, haClean.1 s₂, haClean.2.1 s₂, st', mg', domCs,
-                          (hseed.get_eq node).trans ha1Get, hElClean', hElEq', hmg',
-                          by rw [← hrowsEq]; exact CleanDomChildren_mono (fun k hk => ⟨.inl hk.1, hk.2⟩) hCleanCsOut⟩,
-                         rfl, hsameK.symm, hrowsEq⟩
-                      refine ⟨by omega, by simp only [View.render, htmlNodeCount]; omega, fun m hmPar hmOut hmLt => ?_, hparOut', hnd,
-                        fun r hr => Nat.lt_of_lt_of_le (hparNodes r hr) (by omega), hvalOut, VStateValid_equiv hvalOut⟩
-                      have hmNeNode : m ≠ node := fun h => hmOut (h ▸ hnodeMem)
-                      exact haOutOutside m hmNeNode
-                by_cases hrawEq : keys s₂ = disambiguateKeys (keys s₁)
-                · have hbRaw : (keys s₂ == disambiguateKeys (keys s₁)) = true := beq_iff_eq.2 hrawEq
-                  simp only [hbRaw, ↓reduceIte]
-                  have hnd2 : (keys s₂).toList.Nodup := hrawEq ▸ disambiguateKeys_nodup (keys s₁)
-                  have hsameK : disambiguateKeys (keys s₂) = disambiguateKeys (keys s₁) :=
-                    (disambiguateKeys_of_nodup hnd2).trans hrawEq
-                  exact hSameKeysBranch hsameK
-                · have hbRaw : (keys s₂ == disambiguateKeys (keys s₁)) = false := beq_eq_false_iff_ne.2 hrawEq
-                  simp only [hbRaw, Bool.false_eq_true, ↓reduceIte]
-                  by_cases hsameK : disambiguateKeys (keys s₂) = disambiguateKeys (keys s₁)
-                  · have hbK : (disambiguateKeys (keys s₂) == disambiguateKeys (keys s₁)) = true := beq_iff_eq.2 hsameK
-                    simp only [hbK, ↓reduceIte]
-                    exact hSameKeysBranch hsameK
-                  · have hbK : (disambiguateKeys (keys s₂) == disambiguateKeys (keys s₁)) = false := beq_eq_false_iff_ne.2 hsameK
-                    simp only [hbK, Bool.false_eq_true, ↓reduceIte]
-                    cases hnewEmp : (disambiguateKeys (keys s₂)).isEmpty
-                    · simp only [Bool.false_eq_true, ↓reduceIte]
-                      cases hemp : (rowsHtml s₁).isEmpty
-                      · simp only [Bool.false_eq_true, ↓reduceIte]
-                        -- Non-empty → Non-empty: verified certifying `O(N log N)` LIS minimal-moves reconciler
-                        let oldKeys := disambiguateKeys (keys s₁)
-                        let newKeys := disambiguateKeys (keys s₂)
-                        have holdNd : oldKeys.toList.Nodup := disambiguateKeys_nodup (keys s₁)
-                        have hnewNd : newKeys.toList.Nodup := disambiguateKeys_nodup (keys s₂)
-                        have hidxSpec := buildKeyIndex_spec oldKeys holdNd
-                        let oldBuckets := (buildKeyIndex oldKeys).1
-                        let mask := (buildKeyIndex oldKeys).2
-                        have hidxBnd : ∀ k oi, keyIndexGet oldBuckets mask k = some oi → oi < oldKeys.size :=
-                          fun k oi hq => (hidxSpec.1 k oi hq).1
-                        let freshFn : Unit → Array (Html msg) := fun _ => ((rowsHtml s₂).map (Html.prefixSignals inst)).toArray
-                        let plan := planKeyedLoop newKeys oldBuckets mask (rowsHtml s₁).toArray oldMarks oldSigs freshFn none 0
-                          (Array.emptyWithCapacity newKeys.size) (Array.replicate oldKeys.size false)
-                          (Array.emptyWithCapacity newKeys.size) (Array.emptyWithCapacity newKeys.size) (Array.emptyWithCapacity newKeys.size)
-                        have hplanSpec := planKeyedLoop_spec newKeys oldBuckets mask (rowsHtml s₁).toArray oldMarks oldSigs freshFn oldKeys.size hidxBnd
-                          0 none (Array.emptyWithCapacity newKeys.size) (Array.replicate oldKeys.size false)
-                          (Array.emptyWithCapacity newKeys.size) (Array.emptyWithCapacity newKeys.size) (Array.emptyWithCapacity newKeys.size)
-                          (Nat.zero_le _) (fun _ h => by cases h) rfl (by simp) rfl
-                          (fun _ hj => by omega) (fun oi ho => by simp) (fun _ hj => by omega)
-                        let sources := plan.1
-                        let used := plan.2.1
-                        let rowsArr := plan.2.2.1
-                        let marksArr := plan.2.2.2.1
-                        let sigsArr := plan.2.2.2.2
-                        have hrowsArrEq : rowsArr.toList = rowsHtml s₂ := by
-                          have hpref : (rowsHtml s₂).map (Html.prefixSignals inst) = rowsHtml s₂ :=
-                            Html.map_prefixSignals_of_DomCleanList inst (hrowsClean.2.1 s₂)
-                          refine List.ext_getElem? fun i => ?_
-                          rw [Array.getElem?_toList]
-                          by_cases hi : i < newKeys.size
-                          · have hri : i < (rowsHtml s₂).length := by rw [hrowsClean.1 s₂]; exact hi
-                            have hpR := hplanSpec.2.2.2.2.2 i hi
-                            rw [hpR]
-                            cases hq : keyIndexGet oldBuckets mask newKeys[i] with
-                            | none =>
-                                have hszF : (rowsHtml s₂).toArray.size = (rowsHtml s₂).length := List.size_toArray ..
-                                simp only [freshFn, hpref, Array.getD, hszF, hri, ↓reduceDIte]
-                                rw [List.getElem?_eq_getElem hri]; simp
-                            | some oi =>
-                                have ⟨hoiK, hkeyEq?⟩ := hidxSpec.1 _ oi hq
-                                have hoi1 : oi < (rowsHtml s₁).length := by rw [hrowsClean.1 s₁]; exact hoiK
-                                have hkeyEq : oldKeys[oi]'hoiK = newKeys[i]'hi := by
-                                  rw [Array.getElem?_eq_getElem hoiK, Option.some.injEq] at hkeyEq?; exact hkeyEq?
-                                have hrowEq := hrowsClean.2.2.2 s₁ s₂ oi i hoiK hi hkeyEq
-                                have hget1 : (rowsHtml s₁).toArray.getD oi default = (rowsHtml s₁)[oi] := by
-                                  simp [Array.getD, hoi1]
-                                dsimp only
-                                rw [hget1, ← List.getElem?_eq_getElem hoi1, hrowEq]
-                          · have h1 : rowsArr.size ≤ i := by
-                              change plan.2.2.1.size ≤ i
-                              have hszR : plan.2.2.1.size = newKeys.size := hplanSpec.2.2.1; omega
-                            have h2 : (rowsHtml s₂).length ≤ i := by rw [hrowsClean.1 s₂]; dsimp only [newKeys] at hi; omega
-                            rw [Array.getElem?_eq_none h1, List.getElem?_eq_none h2]
-                        have hsrcSz : sources.size = (rowsHtml s₂).length := by rw [hplanSpec.1, hrowsClean.1 s₂]
-                        have hsrcGet : ∀ i (hi : i < newKeys.size), sources.getD i none = keyIndexGet oldBuckets mask newKeys[i] := by
-                          intro i hi
-                          have hiS : i < sources.size := by rw [hplanSpec.1]; exact hi
-                          have h1 := hplanSpec.2.2.2.1 i hi
-                          rw [Array.getElem?_eq_getElem hiS, Option.some.injEq] at h1
-                          simpa [Array.getD, hiS] using h1
-                        have hsrcBound : ∀ i, i < (rowsHtml s₂).length → ∀ oi, sources.getD i none = some oi → oi < (rowsHtml s₁).length := by
-                          intro i hi oi hsi
-                          have hiK : i < newKeys.size := by rw [← hrowsClean.1 s₂]; exact hi
-                          rw [hsrcGet i hiK] at hsi
-                          rw [hrowsClean.1 s₁]; exact hidxBnd _ oi hsi
-                        have hsrcInj : ∀ i₁ i₂, i₁ < (rowsHtml s₂).length → i₂ < (rowsHtml s₂).length →
-                            ∀ oi, sources.getD i₁ none = some oi → sources.getD i₂ none = some oi → i₁ = i₂ := by
-                          intro i₁ i₂ h1 h2 oi hs1 hs2
-                          have h1K : i₁ < newKeys.size := by rw [← hrowsClean.1 s₂]; exact h1
-                          have h2K : i₂ < newKeys.size := by rw [← hrowsClean.1 s₂]; exact h2
-                          rw [hsrcGet i₁ h1K] at hs1; rw [hsrcGet i₂ h2K] at hs2
-                          have heq1 := (hidxSpec.1 _ oi hs1).2
-                          have heq2 := (hidxSpec.1 _ oi hs2).2
-                          have hkeyEq : newKeys[i₁]'h1K = newKeys[i₂]'h2K := Option.some.inj (heq1.symm.trans heq2)
-                          have h1L : i₁ < newKeys.toList.length := by simpa using h1K
-                          have h2L : i₂ < newKeys.toList.length := by simpa using h2K
-                          exact nodup_getElem_inj hnewNd h1L h2L (by simpa using hkeyEq)
-                        have hsrcRow : ∀ i (hi : i < (rowsHtml s₂).length) oi (ho : oi < (rowsHtml s₁).length),
-                            sources.getD i none = some oi → (rowsHtml s₁)[oi] = (rowsHtml s₂)[i] := by
-                          intro i hi oi ho hsi
-                          have hiK : i < newKeys.size := by rw [← hrowsClean.1 s₂]; exact hi
-                          have hoK : oi < oldKeys.size := by rw [← hrowsClean.1 s₁]; exact ho
-                          rw [hsrcGet i hiK] at hsi
-                          have hkeyEq? := (hidxSpec.1 _ oi hsi).2
-                          have hkeyEq : oldKeys[oi]'hoK = newKeys[i]'hiK := by
-                            rw [Array.getElem?_eq_getElem hoK, Option.some.injEq] at hkeyEq?; exact hkeyEq?
-                          have hrowEq := hrowsClean.2.2.2 s₁ s₂ oi i hoK hiK hkeyEq
-                          rw [List.getElem?_eq_getElem ho, List.getElem?_eq_getElem hi, Option.some.injEq] at hrowEq
-                          exact hrowEq
-                        have hseed0 := seedRowsM_sameDom inst (rowSig s₂ newKeys) (rowEv s₂ newKeys) (marks s₂) marksArr sigsArr a
-                        dsimp only [StateT.run] at hseed0
-                        cases hsRun : seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ newKeys) (rowEv s₂ newKeys) (marks s₂) marksArr sigsArr a with
-                        | mk newSigs aSeed =>
-                            rw [hsRun] at hseed0; dsimp only at hseed0 ⊢
-                            have haSet := DomArena.set_get_self aSeed ((hseed0.get_eq node).trans hnodeGet)
-                            have hdyn := applyDynAttrsM_spec aSeed node realNs tag st mg domCs attrs s₁ s₂ haClean hElClean hElEq hmg
-                            rw [haSet] at hdyn
-                            rcases hdyn with ⟨ha1Next, ha1Ne, st', mg', ha1Get, hElClean', hElEq', hmg'⟩
-                            let a1 := (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ aSeed).2
-                            have ha1Eq : applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ aSeed = ((), a1) := rfl
-                            have ha1N : a1.nextId = a.nextId := ha1Next.trans hseed0.1
-                            have ha1Out : ∀ m, m ≠ node → a1.get m = a.get m := fun m hm => (ha1Ne m hm).trans (hseed0.get_eq m)
-                            have hcnV : childNs = "" ∨ childNs = Dom.svgNs := by rw [hchildNs]; split <;> simp
-                            have hccNs := childNamespace_eq_childNsOf (ptag := tag) hcnV
-                            by_cases hnoReuse : (!used.any id) = true
-                            · have hmonadEq : (StateT.bind (seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ newKeys) (rowEv s₂ newKeys) (marks s₂) marksArr sigsArr) fun newSigs =>
-                                  StateT.bind (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂) fun _ =>
-                                  StateT.bind (MonadDom.childNamespace node) fun cn =>
-                                  if (!used.any id) = true then
-                                    StateT.bind (MonadDom.clearChildren node) fun _ =>
-                                    StateT.bind MonadDom.createFragment fun frag =>
-                                    StateT.bind (buildDomListM cn frag rowsArr.toList) fun _ =>
-                                    StateT.bind (MonadDom.appendChild node frag) fun _ =>
-                                    StateT.pure (VState.list (σ := σ) node newKeys newSigs rowsArr.toList (marks s₂) inst)
-                                  else
-                                    StateT.bind (MonadDom.childCount node) fun oc =>
-                                    StateT.bind (snapshotChildrenM node 0 #[] oc.toNat) fun lv =>
-                                    StateT.bind (removeUnusedM node lv used 0) fun _ =>
-                                    StateT.bind (reconcileLisBackM node cn lv sources (verifiedLisFlags sources) rowsArr newKeys.size false 0) fun _ =>
-                                    StateT.pure (VState.list (σ := σ) node newKeys newSigs rowsArr.toList (marks s₂) inst)) a =
-                                  (match MonadDom.clearChildren (m := StateM (DomArena msg)) node a1 with
-                                  | (_, sClr) =>
-                                    match MonadDom.createFragment (m := StateM (DomArena msg)) sClr with
-                                    | (frag, sFrag) =>
-                                      match buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf childNs tag) frag (rowsHtml s₂) sFrag with
-                                      | (_, sB) =>
-                                        match MonadDom.appendChild (m := StateM (DomArena msg)) node frag sB with
-                                        | (_, sOut) => (VState.list (σ := σ) node newKeys newSigs (rowsHtml s₂) (marks s₂) inst, sOut)) := by
-                                simp only [hnoReuse, ↓reduceIte]
-                                change (match seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ newKeys) (rowEv s₂ newKeys) (marks s₂) marksArr sigsArr a with
-                                  | (newSigs, s0) =>
-                                    match applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ s0 with
-                                    | (_, s1) =>
-                                      match MonadDom.childNamespace (m := StateM (DomArena msg)) node s1 with
-                                      | (cn, s2) =>
-                                        match MonadDom.clearChildren (m := StateM (DomArena msg)) node s2 with
-                                        | (_, s3) =>
-                                          match MonadDom.createFragment (m := StateM (DomArena msg)) s3 with
-                                          | (frag, s4) =>
-                                            match buildDomListM (m := StateM (DomArena msg)) cn frag rowsArr.toList s4 with
-                                            | (_, s5) =>
-                                              match MonadDom.appendChild (m := StateM (DomArena msg)) node frag s5 with
-                                              | (_, s6) => (VState.list (σ := σ) node newKeys newSigs rowsArr.toList (marks s₂) inst, s6)) = _
-                                rw [hsRun]; dsimp only
-                                rw [ha1Eq]; dsimp only
-                                rw [ha1Get]; dsimp only [realNs]
-                                rw [hccNs, hrowsArrEq]; rfl
-                              change (match (StateT.bind (seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ newKeys) (rowEv s₂ newKeys) (marks s₂) marksArr sigsArr) fun newSigs =>
-                                  StateT.bind (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂) fun _ =>
-                                  StateT.bind (MonadDom.childNamespace node) fun cn =>
-                                  if (!used.any id) = true then
-                                    StateT.bind (MonadDom.clearChildren node) fun _ =>
-                                    StateT.bind MonadDom.createFragment fun frag =>
-                                    StateT.bind (buildDomListM cn frag rowsArr.toList) fun _ =>
-                                    StateT.bind (MonadDom.appendChild node frag) fun _ =>
-                                    StateT.pure (VState.list (σ := σ) node newKeys newSigs rowsArr.toList (marks s₂) inst)
-                                  else
-                                    StateT.bind (MonadDom.childCount node) fun oc =>
-                                    StateT.bind (snapshotChildrenM node 0 #[] oc.toNat) fun lv =>
-                                    StateT.bind (removeUnusedM node lv used 0) fun _ =>
-                                    StateT.bind (reconcileLisBackM node cn lv sources (verifiedLisFlags sources) rowsArr newKeys.size false 0) fun _ =>
-                                    StateT.pure (VState.list (σ := σ) node newKeys newSigs rowsArr.toList (marks s₂) inst)) a with
-                                | (vst', a') =>
-                                  a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂) ∧
-                                  (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
-                                  a'.get parent = .element pns ptag pst pmg (pre ++ vst'.rootNode :: suf) ∧ (pre ++ vst'.rootNode :: suf).Nodup ∧
-                                  (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧
-                                  VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ a'
-                                    (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧
-                                  DomTreeAssocEquiv (readDomTree (f' + 1) a' vst'.rootNode)
-                                    (specDom childNs (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂)))
-                              rw [hmonadEq]
-                              let aClr := a1.set node (.element realNs tag st' mg' [])
-                              have hclr : MonadDom.clearChildren (m := StateM (DomArena msg)) node a1 = ((), aClr) := by
-                                dsimp only [MonadDom.clearChildren, DomArena.modifyChildren, DomArena.modify, aClr]; rw [ha1Get]
-                              rw [hclr]; dsimp only
-                              have haClrN : aClr.nextId = a.nextId := ha1N
-                              have haClrNode : aClr.get node = .element realNs tag st' mg' [] := DomArena.get_set_self _ _ _
-                              have haClrOut : ∀ m, m ≠ node → aClr.get m = a.get m := fun m hm => (DomArena.get_set_ne _ _ hm).trans (ha1Out m hm)
-                              let frag := UInt32.ofNat aClr.nextId
-                              let aFragBase : DomArena msg := { aClr with nextId := aClr.nextId + 1 }
-                              have hfragToNat : frag.toNat = a.nextId := by
-                                dsimp only [frag]; rw [haClrN]
-                                simp only [View.render, htmlNodeCount] at hbound; exact uint32_toNat_ofNat_lt_vp a.nextId (by omega)
-                              have hfragNeNode : frag ≠ node := node_ne_of_toNat_ne (by rw [hfragToNat]; omega)
-                              have hfragRun : aClr.alloc (ArenaEntry.fragment []) = (frag, aFragBase.set frag (.fragment [])) := rfl
-                              simp only [View.render, htmlNodeCount] at hbound; simp only [View.render, htmlDepth] at hdep
-                              have hbuilt := CleanDomChildren_of_buildDomListM (Dom.childNsOf childNs tag) (rowsHtml s₂) [] aFragBase frag
-                                ArenaEntry.fragment (.inr fun _ => rfl) [] f' (fun _ => False) (hrowsClean.2.1 s₂)
-                                (by change frag.toNat < aClr.nextId + 1; rw [hfragToNat, haClrN]; omega)
-                                (by change 0 < aClr.nextId + 1; omega)
-                                (by change aClr.nextId + 1 + htmlListNodeCount (rowsHtml s₂) < UInt32.size; rw [haClrN]; omega)
-                                (by omega) (fun _ h => h.elim) trivial
-                              dsimp only [StateT.run] at hbuilt
-                              rcases hbuilt with ⟨csNew, aBase', haBuiltEq, haBuiltGe, haBuiltBound, haBuiltFr, hCleanOut⟩
-                              simp only [List.nil_append, false_or] at haBuiltEq hCleanOut
-                              let aBuilt := (buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf childNs tag) frag (rowsHtml s₂) (aFragBase.set frag (.fragment []))).2
-                              have haBuiltEq' : aBuilt = aBase'.set frag (.fragment csNew) := haBuiltEq
-                              have haBuiltNext : a.nextId + 1 ≤ aBuilt.nextId := by
-                                change aFragBase.nextId ≤ aBuilt.nextId at haBuiltGe; change aClr.nextId + 1 ≤ aBuilt.nextId at haBuiltGe; rw [← haClrN]; exact haBuiltGe
-                              have haBuiltBd' : aBuilt.nextId ≤ a.nextId + (1 + htmlListNodeCount (rowsHtml s₂)) := by
-                                change aBuilt.nextId ≤ aFragBase.nextId + htmlListNodeCount (rowsHtml s₂) at haBuiltBound
-                                change aBuilt.nextId ≤ aClr.nextId + 1 + htmlListNodeCount (rowsHtml s₂) at haBuiltBound
-                                rw [← haClrN]; omega
-                              have haBuiltFrag : aBuilt.get frag = .fragment csNew := by rw [haBuiltEq', DomArena.get_set_self]
-                              have haBuiltNode : aBuilt.get node = .element realNs tag st' mg' [] := by
-                                rw [haBuiltFr node (by change node.toNat < aClr.nextId + 1; rw [haClrN]; omega) hfragNeNode.symm]
-                                exact haClrNode
-                              let aOut := (aBuilt.set frag .null).set node (.element realNs tag st' mg' csNew)
-                              have happendRun : MonadDom.appendChild (m := StateM (DomArena msg)) node frag aBuilt = ((), aOut) := by
-                                simp [MonadDom.appendChild, haBuiltFrag, DomArena.modifyChildren, DomArena.modify, DomArena.get_set_ne _ _ hfragNeNode.symm, haBuiltNode, aOut]
-                              rw [hfragRun]; dsimp only
-                              cases hblR : buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf childNs tag) frag (rowsHtml s₂) (aFragBase.set frag (.fragment [])) with
-                              | mk _ aB =>
-                                  have hEqB : aB = aBuilt := by dsimp only [aBuilt]; rw [hblR]
-                                  subst hEqB; dsimp only; rw [happendRun]; dsimp only
-                                  have haOutNext : aOut.nextId = aBuilt.nextId := rfl
-                                  have haOutFr : ∀ m : Dom.Node, m ≠ node → m.toNat < a.nextId → aOut.get m = a.get m := fun m hmn hmLt => by
-                                    have hmf : m ≠ frag := node_ne_of_toNat_ne (by rw [hfragToNat]; omega)
-                                    dsimp only [aOut]
-                                    rw [DomArena.get_set_ne _ _ hmn, DomArena.get_set_ne _ _ hmf,
-                                      haBuiltFr m (by change m.toNat < aClr.nextId + 1; rw [haClrN]; omega) hmf]
-                                    exact haClrOut m hmn
-                                  have hparOut' : aOut.get parent = .element pns ptag pst pmg (pre ++ node :: suf) := by
-                                    rw [haOutFr parent hne.symm hparLt, hpar]
-                                  have hCleanOut' : CleanDomChildren f' (Dom.childNsOf childNs tag) (rowsHtml s₂) aOut
-                                      (fun k => (Sold k ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) ∧ k ≠ node.toNat) csNew := by
-                                    refine CleanDomChildren_mono (fun k hk => ?_)
-                                      (CleanDomChildren_frame (a' := aOut) (fun m hm => ?_) hCleanOut)
-                                    · rcases hk with ⟨hk1, hk2⟩
-                                      change aClr.nextId + 1 ≤ k at hk1; change k < aBuilt.nextId at hk2; rw [haClrN] at hk1
-                                      exact ⟨.inr ⟨by omega, by rw [haOutNext]; exact hk2⟩, by omega⟩
-                                    · rcases hm with ⟨hm1, hm2⟩
-                                      change aClr.nextId + 1 ≤ m.toNat at hm1; change m.toNat < aBuilt.nextId at hm2; rw [haClrN] at hm1
-                                      have hmn : m ≠ node := node_ne_of_toNat_ne (by omega)
-                                      have hmf : m ≠ frag := node_ne_of_toNat_ne (by rw [hfragToNat]; omega)
-                                      simp only [aOut, DomArena.get_set_ne _ _ hmn, DomArena.get_set_ne _ _ hmf]; rfl
-                                  have hvalOut : VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ aOut
-                                      (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) (.list node newKeys newSigs (rowsHtml s₂) (marks s₂) inst) :=
-                                    ⟨⟨.inl hnodeMem, haClean.1 s₂, haClean.2.1 s₂, st', mg', csNew,
-                                      DomArena.get_set_self _ _ _, hElClean', hElEq', hmg', hCleanOut'⟩, rfl, rfl, rfl⟩
-                                  refine ⟨by omega, by simp only [View.render, htmlNodeCount]; omega, fun m hmPar hmSold hmLt => ?_,
-                                    hparOut', hnd, fun r hr => Nat.lt_of_lt_of_le (hparNodes r hr) (by omega), hvalOut, VStateValid_equiv hvalOut⟩
-                                  exact haOutFr m (fun h => hmSold (h ▸ hnodeMem)) hmLt
-                            have ⟨hdomNd, hdomLen⟩ := CleanDomChildren_nodup hCleanCs
-                            have hdomLtU32 : domCs.length < UInt32.size := by
-                              have hle : domCs.length ≤ a.nextId :=
-                                nodup_length_le_bound a.nextId domCs hdomNd fun x hx =>
-                                  hSoldLt _ (CleanDomChildren_mem hCleanCs x hx).1
-                              simp only [View.render, htmlNodeCount] at hbound; omega
-                            have hcountEq : MonadDom.childCount (m := StateM (DomArena msg)) node a1 = (UInt32.ofNat domCs.length, a1) := by
-                              dsimp only [MonadDom.childCount]; rw [ha1Get]
-                            have hcountNat : (UInt32.ofNat domCs.length).toNat = domCs.length := uint32_toNat_ofNat_lt_vp domCs.length hdomLtU32
-                            have hsnap := snapshotChildrenM_spec a1 node realNs tag st' mg' domCs hdomLtU32 0 domCs.length #[] (by omega)
-                            rw [DomArena.set_get_self a1 ha1Get] at hsnap
-                            dsimp only [StateT.run, List.nil_append, List.drop_zero] at hsnap
-                            let live : Array Dom.Node := ⟨domCs⟩
-                            have hliveSz : live.size = (rowsHtml s₁).length := by simpa [live] using hdomLen
-                            have hliveToList : live.toList = domCs := rfl
-                            have hremSpec := removeUnusedM_spec node realNs tag st' mg' live used 0 [] a1 (Nat.zero_le _) (by simpa [live] using hdomNd) (by simpa [live] using ha1Get)
-                            let aRem := (removeUnusedM (m := StateM (DomArena msg)) node live used 0).run a1 |>.2
-                            have haRemEq : removeUnusedM (m := StateM (DomArena msg)) node live used 0 a1 = ((), aRem) := rfl
-                            have haRemN : aRem.nextId = a.nextId := hremSpec.1.trans ha1N
-                            have haRemOut : ∀ m, m ≠ node → aRem.get m = a.get m := fun m hm => (hremSpec.2.1 m hm).trans (ha1Out m hm)
-                            let kept := (List.range live.size).filterMap fun oi => if used.getD oi false then some (live.getD oi 0) else none
-                            have haRemNode : aRem.get node = .element realNs tag st' mg' kept := by
-                              simpa [kept] using hremSpec.2.2
-                            let inLis := verifiedLisFlags sources
-                            have hlisSpec := verifiedLisFlags_spec sources
-                            have hkeptSpec := lis_filter_kept_eq live sources inLis used (rowsHtml s₂).length hsrcSz
-                              (by rw [hplanSpec.2.1, hliveSz, hrowsClean.1 s₁])
-                              (fun i hi oi hsi => by rw [hliveSz]; exact hsrcBound i hi oi hsi)
-                              hsrcInj
-                              (fun oi ho => by
-                                have hoK : oi < oldKeys.size := by rw [← hrowsClean.1 s₁, ← hliveSz]; exact ho
-                                have hiff := hplanSpec.2.2.2.2.1 oi hoK
-                                have hszEq : newKeys.size = (rowsHtml s₂).length := (hrowsClean.1 s₂).symm
-                                simpa [hszEq] using hiff)
-                              hdomNd
-                              (fun i hi hf => hlisSpec.1 i (by rw [hsrcSz]; exact hi) hf)
-                              (fun i₁ i₂ h1 h2 hf1 hf2 oi₁ oi₂ hs1 hs2 => hlisSpec.2 i₁ i₂ h1 (by rw [hsrcSz]; exact h2) hf1 hf2 oi₁ oi₂ hs1 hs2)
-                            rcases CleanDomChildren_indexed hCleanCs with ⟨Si, hSiSub, hSiDisj, hSiGet⟩
-                            have hOldCleanRem : ∀ oi (ho : oi < (rowsHtml s₁).length),
-                                CleanDomSubtree f' (Dom.childNsOf childNs tag) (rowsHtml s₁)[oi] aRem (Si oi) (live.getD oi 0) := by
-                              intro oi ho
-                              have hoD : oi < domCs.length := by rw [hdomLen]; exact ho
-                              have hgl : live.getD oi 0 = domCs[oi] := by simp [live, Array.getD, hoD]
-                              rw [hgl]
-                              exact CleanDomSubtree_frame (fun m hm => haRemOut m (node_ne_of_toNat_ne (hSiSub oi m.toNat hm).2)) (hSiGet oi ho hoD)
-                            simp only [View.render, htmlNodeCount] at hbound
-                            simp only [View.render, htmlDepth] at hdep
-                            have hrec := reconcileLisBackM_spec f' node realNs tag st' mg' (Dom.childNsOf childNs tag)
-                              live sources inLis rowsArr (rowsHtml s₂) (rowsHtml s₁) Si Sold a.nextId
-                              hsrcSz hrowsArrEq hliveSz hdomNd (hrowsClean.2.1 s₂)
-                              hsrcBound hsrcInj hsrcRow hSiSub hSiDisj hSoldLt (by omega)
-                              (rowsHtml s₂).length (Nat.le_refl _) false 0 kept [] (fun _ => False) aRem
-                              (by omega) (by omega)
-                              (by rw [haRemN, List.take_length]; omega)
-                              (by rw [haRemN]; exact hnodeLt)
-                              haRemNode hkeptSpec.1 rfl rfl
-                              (fun x => by rw [hkeptSpec.2.1 x]; simp)
-                              hkeptSpec.2.2.1
-                              (fun _ _ h => nomatch h)
-                              (fun _ _ h => nomatch h)
-                              (by rw [List.append_nil]; exact hkeptSpec.2.2.2)
-                              hOldCleanRem
-                              (fun _ h => h.elim)
-                              (fun _ _ _ _ _ _ h => h.elim)
-                              (by rw [List.drop_length]; trivial)
-                            have hnsEq : MonadDom.childNamespace (m := StateM (DomArena msg)) node a1 = (Dom.childNsOf childNs tag, a1) := by
-                              dsimp only [MonadDom.childNamespace]; rw [ha1Get]; dsimp only [realNs]; rw [hccNs]
-                            have hnewKeysSzEq : newKeys.size = (rowsHtml s₂).length := (hrowsClean.1 s₂).symm
-                            cases hrecRun : reconcileLisBackM (m := StateM (DomArena msg)) node (Dom.childNsOf childNs tag) live sources inLis rowsArr (rowsHtml s₂).length false 0 aRem with
-                            | mk _ aOut =>
-                                dsimp only [StateT.run] at hrec
-                                rw [hrecRun] at hrec; dsimp only at hrec ⊢
-                                have hmonadEq : (StateT.bind (seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ newKeys) (rowEv s₂ newKeys) (marks s₂) marksArr sigsArr) fun newSigs =>
-                                    StateT.bind (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂) fun _ =>
-                                    StateT.bind (MonadDom.childNamespace node) fun cn =>
-                                    if (!used.any id) = true then
-                                      StateT.bind (MonadDom.clearChildren node) fun _ =>
-                                      StateT.bind MonadDom.createFragment fun frag =>
-                                      StateT.bind (buildDomListM cn frag rowsArr.toList) fun _ =>
-                                      StateT.bind (MonadDom.appendChild node frag) fun _ =>
-                                      StateT.pure (VState.list (σ := σ) node newKeys newSigs rowsArr.toList (marks s₂) inst)
-                                    else
-                                      StateT.bind (MonadDom.childCount node) fun oc =>
-                                      StateT.bind (snapshotChildrenM node 0 #[] oc.toNat) fun lv =>
-                                      StateT.bind (removeUnusedM node lv used 0) fun _ =>
-                                      StateT.bind (reconcileLisBackM node cn lv sources inLis rowsArr newKeys.size false 0) fun _ =>
-                                      StateT.pure (VState.list (σ := σ) node newKeys newSigs rowsArr.toList (marks s₂) inst)) a =
-                                    (VState.list (σ := σ) node newKeys newSigs rowsArr.toList (marks s₂) inst, aOut) := by
-                                  simp only [hnoReuse]
-                                  change (match seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ newKeys) (rowEv s₂ newKeys) (marks s₂) marksArr sigsArr a with
-                                    | (newSigs, s0) =>
-                                      match applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ s0 with
-                                      | (_, s1) =>
-                                        match MonadDom.childNamespace (m := StateM (DomArena msg)) node s1 with
-                                        | (cn, s2) =>
-                                          match MonadDom.childCount (m := StateM (DomArena msg)) node s2 with
-                                          | (oc, s3) =>
-                                            match snapshotChildrenM (m := StateM (DomArena msg)) node 0 #[] oc.toNat s3 with
-                                            | (lv, s4) =>
-                                              match removeUnusedM (m := StateM (DomArena msg)) node lv used 0 s4 with
-                                              | (_, s5) =>
-                                                match reconcileLisBackM (m := StateM (DomArena msg)) node cn lv sources inLis rowsArr newKeys.size false 0 s5 with
-                                                | (_, s6) => (VState.list (σ := σ) node newKeys newSigs rowsArr.toList (marks s₂) inst, s6)) = _
-                                  rw [hsRun]; dsimp only
-                                  rw [ha1Eq]; dsimp only
-                                  rw [ha1Get]; dsimp only [realNs]
-                                  rw [hccNs, hcountNat, hsnap]; dsimp only
-                                  rw [haRemEq]; dsimp only
-                                  rw [hnewKeysSzEq, hrecRun]
-                                change (match (StateT.bind (seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ newKeys) (rowEv s₂ newKeys) (marks s₂) marksArr sigsArr) fun newSigs =>
-                                    StateT.bind (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂) fun _ =>
-                                    StateT.bind (MonadDom.childNamespace node) fun cn =>
-                                    if (!used.any id) = true then
-                                      StateT.bind (MonadDom.clearChildren node) fun _ =>
-                                      StateT.bind MonadDom.createFragment fun frag =>
-                                      StateT.bind (buildDomListM cn frag rowsArr.toList) fun _ =>
-                                      StateT.bind (MonadDom.appendChild node frag) fun _ =>
-                                      StateT.pure (VState.list (σ := σ) node newKeys newSigs rowsArr.toList (marks s₂) inst)
-                                    else
-                                      StateT.bind (MonadDom.childCount node) fun oc =>
-                                      StateT.bind (snapshotChildrenM node 0 #[] oc.toNat) fun lv =>
-                                      StateT.bind (removeUnusedM node lv used 0) fun _ =>
-                                      StateT.bind (reconcileLisBackM node cn lv sources inLis rowsArr newKeys.size false 0) fun _ =>
-                                      StateT.pure (VState.list (σ := σ) node newKeys newSigs rowsArr.toList (marks s₂) inst)) a with
-                                  | (vst', a') =>
-                                    a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂) ∧
-                                    (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
-                                    a'.get parent = .element pns ptag pst pmg (pre ++ vst'.rootNode :: suf) ∧ (pre ++ vst'.rootNode :: suf).Nodup ∧
-                                    (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧
-                                    VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ a'
-                                      (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧
-                                    DomTreeAssocEquiv (readDomTree (f' + 1) a' vst'.rootNode)
-                                      (specDom childNs (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂)))
-                                rw [hmonadEq]; dsimp only
-                                rcases hrec with ⟨haOutGe, haOutBd, haOutFr, finalCs, haOutNode, hCleanOut⟩
-                                rw [haRemN] at haOutGe haOutBd haOutFr
-                                rw [List.take_length] at haOutBd
-                                rw [hrowsArrEq]
-                                have hfrAll : ∀ m : Dom.Node, m ≠ node → m.toNat < a.nextId → aOut.get m = a.get m :=
-                                  fun m hmn hmLt => (haOutFr m hmn hmLt).trans (haRemOut m hmn)
-                                have hparOut' : aOut.get parent = .element pns ptag pst pmg (pre ++ node :: suf) := by
-                                  rw [hfrAll parent hne.symm hparLt, hpar]
-                                have hvalOut : VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ aOut
-                                    (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) (.list node newKeys newSigs (rowsHtml s₂) (marks s₂) inst) :=
-                                  ⟨⟨.inl hnodeMem, haClean.1 s₂, haClean.2.1 s₂, st', mg', finalCs,
-                                    haOutNode, hElClean', hElEq', hmg', hCleanOut⟩, rfl, rfl, rfl⟩
-                                refine ⟨haOutGe, by simp only [View.render, htmlNodeCount]; omega,
-                                  fun m _ hmSold hmLt => hfrAll m (fun h => hmSold (h ▸ hnodeMem)) hmLt,
-                                  hparOut', hnd, fun r hr => Nat.lt_of_lt_of_le (hparNodes r hr) haOutGe,
-                                  hvalOut, VStateValid_equiv hvalOut⟩
-                      · -- `oldRowsL.isEmpty = true`: fast create via DocumentFragment
-                        simp only [↓reduceIte]
-                        have hnilRows : rowsHtml s₁ = [] := List.isEmpty_iff.1 hemp
-                        have hnilDom : domCs = [] := by
-                          rw [hnilRows] at hCleanCs
-                          cases domCs with | nil => rfl | cons _ _ => exact False.elim hCleanCs
-                        subst hnilDom
-                        have haSet := DomArena.set_get_self a hnodeGet
-                        have hdyn := applyDynAttrsM_spec a node realNs tag st mg [] attrs s₁ s₂ haClean hElClean hElEq hmg
-                        rw [haSet] at hdyn
-                        rcases hdyn with ⟨ha1Next, ha1Ne, st', mg', ha1Get, hElClean', hElEq', hmg'⟩
-                        let a1 := (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ a).2
-                        have ha1Eq : applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ a = ((), a1) := rfl
-                        have hseed := seedRowsM_sameDom inst (rowSig s₂ (disambiguateKeys (keys s₂))) (rowEv s₂ (disambiguateKeys (keys s₂))) (marks s₂) #[] #[] a1
-                        dsimp only [StateT.run] at hseed
-                        dsimp only [StateT.bind, StateT.pure, bind, pure]
-                        rw [ha1Eq]; dsimp only
-                        cases hsRun : seedRowsM (m := StateM (DomArena msg)) inst (rowSig s₂ (disambiguateKeys (keys s₂))) (rowEv s₂ (disambiguateKeys (keys s₂))) (marks s₂) #[] #[] a1 with
-                        | mk newSigs aSeed =>
-                            rw [hsRun] at hseed; dsimp only at hseed ⊢
-                            have haSeedN : aSeed.nextId = a.nextId := hseed.1.trans ha1Next
-                            have haSeedNode : aSeed.get node = .element realNs tag st' mg' [] := (hseed.get_eq node).trans ha1Get
-                            have haSeedOut : ∀ m, m ≠ node → aSeed.get m = a.get m := fun m hm => (hseed.get_eq m).trans (ha1Ne m hm)
-                            have hpref : (rowsHtml s₂).map (Html.prefixSignals inst) = rowsHtml s₂ :=
-                              Html.map_prefixSignals_of_DomCleanList inst (hrowsClean.2.1 s₂)
-                            rw [hpref]
-                            have hcnV : childNs = "" ∨ childNs = Dom.svgNs := by rw [hchildNs]; split <;> simp
-                            have hccNs := childNamespace_eq_childNsOf (ptag := tag) hcnV
-                            let frag := UInt32.ofNat aSeed.nextId
-                            let aFragBase : DomArena msg := { aSeed with nextId := aSeed.nextId + 1 }
-                            have hfragToNat : frag.toNat = a.nextId := by
-                              dsimp only [frag]; rw [haSeedN]
-                              simp only [View.render, htmlNodeCount] at hbound; exact uint32_toNat_ofNat_lt_vp a.nextId (by omega)
-                            have hfragNeNode : frag ≠ node := node_ne_of_toNat_ne (by rw [hfragToNat]; omega)
-                            have hfragRun : aSeed.alloc (ArenaEntry.fragment []) = (frag, aFragBase.set frag (.fragment [])) := rfl
-                            simp only [View.render, htmlNodeCount] at hbound; simp only [View.render, htmlDepth] at hdep
-                            have hbuilt := CleanDomChildren_of_buildDomListM (Dom.childNsOf childNs tag) (rowsHtml s₂) [] aFragBase frag
-                              ArenaEntry.fragment (.inr fun _ => rfl) [] f' (fun _ => False) (hrowsClean.2.1 s₂)
-                              (by change frag.toNat < aSeed.nextId + 1; rw [hfragToNat, haSeedN]; omega)
-                              (by change 0 < aSeed.nextId + 1; omega)
-                              (by change aSeed.nextId + 1 + htmlListNodeCount (rowsHtml s₂) < UInt32.size; rw [haSeedN]; omega)
-                              (by omega) (fun _ h => h.elim) trivial
-                            dsimp only [StateT.run] at hbuilt
-                            rcases hbuilt with ⟨csNew, aBase', haBuiltEq, haBuiltGe, haBuiltBound, haBuiltFr, hCleanOut⟩
-                            simp only [List.nil_append, false_or] at haBuiltEq hCleanOut
-                            let aBuilt := (buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf childNs tag) frag (rowsHtml s₂) (aFragBase.set frag (.fragment []))).2
-                            have haBuiltEq' : aBuilt = aBase'.set frag (.fragment csNew) := haBuiltEq
-                            have haBuiltNext : a.nextId + 1 ≤ aBuilt.nextId := by
-                              change aFragBase.nextId ≤ aBuilt.nextId at haBuiltGe; change aSeed.nextId + 1 ≤ aBuilt.nextId at haBuiltGe; rw [← haSeedN]; exact haBuiltGe
-                            have haBuiltBd' : aBuilt.nextId ≤ a.nextId + (1 + htmlListNodeCount (rowsHtml s₂)) := by
-                              change aBuilt.nextId ≤ aFragBase.nextId + htmlListNodeCount (rowsHtml s₂) at haBuiltBound
-                              change aBuilt.nextId ≤ aSeed.nextId + 1 + htmlListNodeCount (rowsHtml s₂) at haBuiltBound
-                              rw [← haSeedN]; omega
-                            have haBuiltFrag : aBuilt.get frag = .fragment csNew := by rw [haBuiltEq', DomArena.get_set_self]
-                            have haBuiltNode : aBuilt.get node = .element realNs tag st' mg' [] := by
-                              rw [haBuiltFr node (by change node.toNat < aSeed.nextId + 1; rw [haSeedN]; omega) hfragNeNode.symm]
-                              exact haSeedNode
-                            let aOut := (aBuilt.set frag .null).set node (.element realNs tag st' mg' csNew)
-                            have happendRun : MonadDom.appendChild (m := StateM (DomArena msg)) node frag aBuilt = ((), aOut) := by
-                              simp [MonadDom.appendChild, haBuiltFrag, DomArena.modifyChildren, DomArena.modify, DomArena.get_set_ne _ _ hfragNeNode.symm, haBuiltNode, aOut]
-                            rw [haSeedNode]; dsimp only [realNs]; rw [hccNs, hfragRun]; dsimp only
-                            cases hblR : buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf childNs tag) frag (rowsHtml s₂) (aFragBase.set frag (.fragment [])) with
-                            | mk _ aB =>
-                                have hEqB : aB = aBuilt := by dsimp only [aBuilt]; rw [hblR]
-                                subst hEqB; dsimp only; rw [happendRun]; dsimp only
-                                have haOutNext : aOut.nextId = aBuilt.nextId := rfl
-                                have haOutFr : ∀ m : Dom.Node, m ≠ node → m.toNat < a.nextId → aOut.get m = a.get m := fun m hmn hmLt => by
-                                  have hmf : m ≠ frag := node_ne_of_toNat_ne (by rw [hfragToNat]; omega)
-                                  dsimp only [aOut]
-                                  rw [DomArena.get_set_ne _ _ hmn, DomArena.get_set_ne _ _ hmf,
-                                    haBuiltFr m (by change m.toNat < aSeed.nextId + 1; rw [haSeedN]; omega) hmf]
-                                  exact haSeedOut m hmn
-                                have hparOut' : aOut.get parent = .element pns ptag pst pmg (pre ++ node :: suf) := by
-                                  rw [haOutFr parent hne.symm hparLt, hpar]
-                                have hCleanOut' : CleanDomChildren f' (Dom.childNsOf childNs tag) (rowsHtml s₂) aOut
-                                    (fun k => (Sold k ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) ∧ k ≠ node.toNat) csNew := by
-                                  refine CleanDomChildren_mono (fun k hk => ?_)
-                                    (CleanDomChildren_frame (a' := aOut) (fun m hm => ?_) hCleanOut)
-                                  · rcases hk with ⟨hk1, hk2⟩
-                                    change aSeed.nextId + 1 ≤ k at hk1; change k < aBuilt.nextId at hk2; rw [haSeedN] at hk1
-                                    exact ⟨.inr ⟨by omega, by rw [haOutNext]; exact hk2⟩, by omega⟩
-                                  · rcases hm with ⟨hm1, hm2⟩
-                                    change aSeed.nextId + 1 ≤ m.toNat at hm1; change m.toNat < aBuilt.nextId at hm2; rw [haSeedN] at hm1
-                                    have hmn : m ≠ node := node_ne_of_toNat_ne (by omega)
-                                    have hmf : m ≠ frag := node_ne_of_toNat_ne (by rw [hfragToNat]; omega)
-                                    simp only [aOut, DomArena.get_set_ne _ _ hmn, DomArena.get_set_ne _ _ hmf]; rfl
-                                have hvalOut : VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ aOut
-                                    (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) (.list node (disambiguateKeys (keys s₂)) newSigs (rowsHtml s₂) (marks s₂) inst) :=
-                                  ⟨⟨.inl hnodeMem, haClean.1 s₂, haClean.2.1 s₂, st', mg', csNew,
-                                    DomArena.get_set_self _ _ _, hElClean', hElEq', hmg', hCleanOut'⟩, rfl, rfl, rfl⟩
-                                refine ⟨by omega, by simp only [View.render, htmlNodeCount]; omega, fun m hmPar hmSold hmLt => ?_,
-                                  hparOut', hnd, fun r hr => Nat.lt_of_lt_of_le (hparNodes r hr) (by omega), hvalOut, VStateValid_equiv hvalOut⟩
-                                exact haOutFr m (fun h => hmSold (h ▸ hnodeMem)) hmLt
-                    · -- `newKeys.isEmpty = true`: fast `clearChildren`
-                      simp only [↓reduceIte, StateT.bind, StateT.pure]
-                      have hnewSz0 : (disambiguateKeys (keys s₂)).size = 0 := Array.isEmpty_iff.1 hnewEmp |> fun h => by rw [h]; rfl
-                      have hnewKeysEq : disambiguateKeys (keys s₂) = #[] := Array.isEmpty_iff.1 hnewEmp
-                      have hnewRows0 : rowsHtml s₂ = [] := List.eq_nil_of_length_eq_zero (by rw [hrowsClean.1 s₂, hnewSz0])
-                      have haSet := DomArena.set_get_self a hnodeGet
-                      have hdyn := applyDynAttrsM_spec a node realNs tag st mg domCs attrs s₁ s₂ haClean hElClean hElEq hmg
-                      rw [haSet] at hdyn
-                      rcases hdyn with ⟨ha1Next, ha1Ne, st', mg', ha1Get, hElClean', hElEq', hmg'⟩
-                      let a1 := (applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ a).2
-                      have ha1Eq : applyDynAttrsM (m := StateM (DomArena msg)) node attrs s₂ a = ((), a1) := rfl
-                      rw [ha1Eq]; dsimp only
-                      let aOut := a1.set node (.element realNs tag st' mg' [])
-                      have hclr : MonadDom.clearChildren (m := StateM (DomArena msg)) node a1 = ((), aOut) := by
-                        dsimp only [MonadDom.clearChildren, DomArena.modifyChildren, DomArena.modify, aOut]; rw [ha1Get]
-                      rw [hclr]; dsimp only
-                      have haOutNext : aOut.nextId = a.nextId := ha1Next
-                      have haOutOutside : ∀ m, m ≠ node → aOut.get m = a.get m := fun m hm =>
-                        (DomArena.get_set_ne _ _ hm).trans (ha1Ne m hm)
-                      have hparOut' : aOut.get parent = .element pns ptag pst pmg (pre ++ node :: suf) := by
-                        rw [haOutOutside parent hne.symm, hpar]
-                      have hvalOut : VStateValid (f' + 1) childNs (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s₂ aOut
-                          (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) (.list node #[] #[] [] #[] inst) :=
-                        ⟨⟨.inl hnodeMem, haClean.1 s₂, haClean.2.1 s₂, st', mg', [],
-                          DomArena.get_set_self _ _ _, hElClean', hElEq', hmg', by rw [hnewRows0]; trivial⟩,
-                         rfl, hnewKeysEq.symm, hnewRows0.symm⟩
-                      refine ⟨by omega, by simp only [View.render, htmlNodeCount]; omega, fun m hmPar hmOut hmLt => ?_, hparOut', hnd,
-                        fun r hr => Nat.lt_of_lt_of_le (hparNodes r hr) (by omega), hvalOut, VStateValid_equiv hvalOut⟩
-                      exact haOutOutside m (fun h => hmOut (h ▸ hnodeMem))
-        | _ => exact False.elim hval.2
-    | text _ =>
-        cases vst <;> try exact False.elim hval.2
-        dsimp only [patchViewM, StateT.run, pure, StateT.pure]
-        exact ⟨Nat.le_refl _, by simp [View.render, htmlNodeCount], fun _ _ _ _ => rfl, hpar, hnd, hparNodes,
-          VStateValid_mono (fun _ => .inl) hval, CleanDomSubtree_equiv hval.1⟩
-    | static _ =>
-        cases vst <;> try exact False.elim hval.2
-        dsimp only [patchViewM, StateT.run, pure, StateT.pure]
-        exact ⟨Nat.le_refl _, by omega, fun _ _ _ _ => rfl, hpar, hnd, hparNodes,
-          VStateValid_mono (fun _ => .inl) hval, CleanDomSubtree_equiv hval.1⟩
-    | dyn get =>
-        cases vst with
-        | dyn node _ =>
-            rcases hval with ⟨hcl, _, rfl⟩
-            cases f with
-            | zero => simp [CleanDomSubtree] at hcl
-            | succ f' =>
-                rcases hcl with ⟨hmem, hget⟩
-                dsimp only [VState.rootNode] at hmem hget
-                have hne : node ≠ parent := fun h => hparOut (h ▸ hmem)
-                by_cases heq : get s₂ = get s₁
-                · dsimp only [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure]
-                  simp only [show (get s₂ != get s₁) = false by simp [heq], Bool.false_eq_true, ↓reduceIte]
-                  have hval' : VStateValid (f' + 1) childNs (.dyn get) s₂ a (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a.nextId)) (.dyn node (get s₂)) :=
-                    ⟨⟨.inl hmem, by simpa [View.render, heq] using hget⟩, rfl, rfl⟩
-                  exact ⟨Nat.le_refl _, by simp [View.render, htmlNodeCount], fun _ _ _ _ => rfl, hpar, hnd, hparNodes, hval', VStateValid_equiv hval'⟩
-                · dsimp only [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure]
-                  simp only [show (get s₂ != get s₁) = true by simp [heq], ↓reduceIte, StateT.bind, pure, StateT.pure]
-                  dsimp only [MonadDom.setText, DomArena.modify]; rw [hget]; dsimp only
-                  let a' := a.set node (.text (get s₂))
-                  have hval' : VStateValid (f' + 1) childNs (.dyn get) s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) (.dyn node (get s₂)) :=
-                    ⟨⟨.inl hmem, DomArena.get_set_self _ _ _⟩, rfl, rfl⟩
-                  refine ⟨Nat.le_refl _, by simp [View.render, htmlNodeCount], fun m _ hmOut _ =>
-                    DomArena.get_set_ne _ _ (fun hEq => hmOut (hEq ▸ hmem)),
-                    by rw [DomArena.get_set_ne _ _ hne.symm]; simpa [VState.rootNode] using hpar,
-                    hnd, hparNodes, hval', VStateValid_equiv hval'⟩
-        | _ => exact False.elim hval.2
-    | dynNode get =>
-        cases vst with
-        | dynNode node _ =>
-            rcases hval with ⟨hcl, _, rfl⟩
-            have hp := patchHtmlSubtreeM_spec f childNs parent pns ptag pst pmg (get s₁) (get s₂) node pre suf Sold a
-              hchildNs hpreLen hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hcl (hclean s₂)
-            dsimp only [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure] at hp ⊢
-            cases hsp : patchHtmlSubtreeM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (get s₁) (get s₂) a with
-            | mk n' a' =>
-                rw [hsp] at hp; dsimp only at hp; rcases hp with ⟨h1, h2, h3, h4, h5, h6, h7, h8⟩
-                exact ⟨h1, h2, h3, h4, h5, h6, ⟨h7, rfl, rfl⟩, h8⟩
-        | _ => exact False.elim hval.2
-    | memo sm =>
-        cases vst with
-        | memo node lastKey lastHtml =>
-            rcases hval with ⟨hcl, _, rfl, rfl⟩
-            dsimp only [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure]
-            by_cases hkey : sm.keyOf s₂ = sm.keyOf s₁
-            · have hb : (sm.keyOf s₂ == sm.keyOf s₁) = true := beq_iff_eq.2 hkey
-              have heval : sm.eval s₂ = sm.eval s₁ := sm.sound s₂ s₁ hkey
-              simp only [hb, ↓reduceIte]
-              have hval' : VStateValid f childNs (.memo sm) s₂ a (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a.nextId)) (.memo node (sm.keyOf s₁) (sm.eval s₁)) :=
-                ⟨by simpa [View.render, heval] using CleanDomSubtree_mono (fun _ => .inl) hcl, rfl, hkey.symm, heval.symm⟩
-              exact ⟨Nat.le_refl _, by omega, fun _ _ _ _ => rfl, hpar, hnd, hparNodes, hval', VStateValid_equiv hval'⟩
-            · simp only [show (sm.keyOf s₂ == sm.keyOf s₁) = false by exact beq_eq_false_iff_ne.2 hkey, Bool.false_eq_true, ↓reduceIte, StateT.bind, pure, StateT.pure]
-              have hp := patchHtmlSubtreeM_spec f childNs parent pns ptag pst pmg (sm.eval s₁) (sm.eval s₂) node pre suf Sold a
-                hchildNs hpreLen hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hcl (hclean s₂)
-              dsimp only [StateT.run] at hp
-              cases hsp : patchHtmlSubtreeM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (sm.eval s₁) (sm.eval s₂) a with
-              | mk n' a' =>
-                  rw [hsp] at hp; dsimp only at hp; rcases hp with ⟨h1, h2, h3, h4, h5, h6, h7, h8⟩
-                  exact ⟨h1, h2, h3, h4, h5, h6, ⟨h7, rfl, rfl, rfl⟩, h8⟩
-        | _ => exact False.elim hval.2
+        exact patchViewM_keyedList_spec f childNs parent pns ptag pst pmg tag attrs keys marks rowSig rowEv rowsHtml tmpl?
+          s₁ s₂ pre suf Sold a vst hchildNs hclean hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hval
+    | text _ | static _ | dyn _ | dynNode _ | memo _ =>
+        exact patchViewM_leaf_spec f childNs parent pns ptag pst pmg _ trivial
+          s₁ s₂ pre suf Sold a vst hchildNs hclean hpreLen hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hval
     | ifElse cond yes no =>
         cases vst with
         | cond wasYes inner =>
@@ -2915,35 +2754,44 @@ mutual
             dsimp only [patchViewM, StateT.run, bind, StateT.bind, pure, StateT.pure]
             by_cases hsame : cond s₂ = wasYes
             · simp only [beq_iff_eq.2 hsame, ↓reduceIte]
+              have hwrap : ∀ (v' : View σ msg) (b : Bool), cond s₂ = b → (if b then yes else no) = v' →
+                  (let (inner', a') := (patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) v' s₂ inner).run a
+                   a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render v' s₂) ∧
+                   (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
+                   a'.get parent = .element pns ptag pst pmg (pre ++ inner'.rootNode :: suf) ∧ (pre ++ inner'.rootNode :: suf).Nodup ∧
+                   (∀ r ∈ pre ++ inner'.rootNode :: suf, r.toNat < a'.nextId) ∧
+                   VStateValid f childNs v' s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) inner' ∧
+                   DomTreeAssocEquiv (readDomTree f a' inner'.rootNode) (specDom childNs (View.render v' s₂))) →
+                  let (vst', a') := (StateT.bind (patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) (if cond s₂ then yes else no) s₂ inner)
+                    fun inner' => StateT.pure (VState.cond (cond s₂) inner')) a
+                  a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render (.ifElse cond yes no) s₂) ∧
+                  (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
+                  a'.get parent = .element pns ptag pst pmg (pre ++ vst'.rootNode :: suf) ∧ (pre ++ vst'.rootNode :: suf).Nodup ∧
+                  (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧
+                  VStateValid f childNs (.ifElse cond yes no) s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧
+                  DomTreeAssocEquiv (readDomTree f a' vst'.rootNode) (specDom childNs (View.render (.ifElse cond yes no) s₂)) := by
+                intro v' b hcb hveq hih
+                dsimp only [StateT.run] at hih
+                cases hp : patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) v' s₂ inner a with
+                | mk inner' a' =>
+                    rw [hp] at hih; dsimp only at hih; rcases hih with ⟨h1, h2, h3, h4, h5, h6, ⟨hcl', hm'⟩, heqv'⟩
+                    dsimp only [StateT.bind, StateT.pure]
+                    cases b <;> (simp only [hcb, Bool.false_eq_true, ↓reduceIte, View.render] at hveq ⊢; subst hveq; rw [hp]; dsimp only; exact ⟨h1, h2, h3, h4, h5, h6, ⟨by simpa [View.render, hcb] using hcl', hcb.symm, by simpa [hcb] using hm'⟩, heqv'⟩)
               cases hc₂ : cond s₂
-              · simp only [View.render, hc₂, Bool.false_eq_true, ↓reduceIte] at hbound hdep ⊢
-                dsimp only [StateT.bind, pure, StateT.pure]
-                have hF : cond s₁ = false := by rw [← hwy, ← hsame, hc₂]
-                have hvalBranch : VStateValid f childNs no s₁ a Sold inner := ⟨by simpa [View.render, hF] using hcl, by simpa [hF] using hin⟩
-                have hih := patchViewM_spec f childNs parent pns ptag pst pmg no s₁ s₂ pre suf Sold a inner
-                  hchildNs hclean.2 hpreLen hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hvalBranch
-                dsimp only [StateT.run] at hih
-                cases hp : patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) no s₂ inner a with
-                | mk inner' a' =>
-                    rw [hp] at hih; dsimp only at hih; rcases hih with ⟨h1, h2, h3, h4, h5, h6, ⟨hcl', hm'⟩, heqv'⟩
-                    exact ⟨h1, h2, h3, h4, h5, h6, ⟨by simpa [View.render, hc₂] using hcl', hc₂.symm, by simpa [hc₂] using hm'⟩,
-                      by simpa [View.render, hc₂] using heqv'⟩
-              · simp only [View.render, hc₂, ↓reduceIte] at hbound hdep ⊢
-                dsimp only [StateT.bind, pure, StateT.pure]
-                have hT : cond s₁ = true := by rw [← hwy, ← hsame, hc₂]
-                have hvalBranch : VStateValid f childNs yes s₁ a Sold inner := ⟨by simpa [View.render, hT] using hcl, by simpa [hT] using hin⟩
-                have hih := patchViewM_spec f childNs parent pns ptag pst pmg yes s₁ s₂ pre suf Sold a inner
-                  hchildNs hclean.1 hpreLen hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hvalBranch
-                dsimp only [StateT.run] at hih
-                cases hp : patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) yes s₂ inner a with
-                | mk inner' a' =>
-                    rw [hp] at hih; dsimp only at hih; rcases hih with ⟨h1, h2, h3, h4, h5, h6, ⟨hcl', hm'⟩, heqv'⟩
-                    exact ⟨h1, h2, h3, h4, h5, h6, ⟨by simpa [View.render, hc₂] using hcl', hc₂.symm, by simpa [hc₂] using hm'⟩,
-                      by simpa [View.render, hc₂] using heqv'⟩
+              · have hF : cond s₁ = false := by rw [← hwy, ← hsame, hc₂]
+                simpa only [hc₂, Bool.false_eq_true, ↓reduceIte] using
+                  hwrap no false hc₂ rfl (patchViewM_spec f childNs parent pns ptag pst pmg no s₁ s₂ pre suf Sold a inner
+                    hchildNs hclean.2 hpreLen (by simpa [View.render, hc₂] using hbound) (by simpa [View.render, hc₂] using hdep)
+                    hparLt hpos hpar hnd hparOut hSoldLt hparNodes ⟨by simpa [View.render, hF] using hcl, by simpa [hF] using hin⟩)
+              · have hT : cond s₁ = true := by rw [← hwy, ← hsame, hc₂]
+                simpa only [hc₂, ↓reduceIte] using
+                  hwrap yes true hc₂ rfl (patchViewM_spec f childNs parent pns ptag pst pmg yes s₁ s₂ pre suf Sold a inner
+                    hchildNs hclean.1 hpreLen (by simpa [View.render, hc₂] using hbound) (by simpa [View.render, hc₂] using hdep)
+                    hparLt hpos hpar hnd hparOut hSoldLt hparNodes ⟨by simpa [View.render, hT] using hcl, by simpa [hT] using hin⟩)
             · simp only [beq_eq_false_iff_ne.2 hsame, Bool.false_eq_true, ↓reduceIte, StateT.bind]
               have hnsRun : MonadDom.childNamespace (m := StateM (DomArena msg)) parent a = (childNs, a) := by
                 simp [MonadDom.childNamespace, hpar, hchildNs]
-              have huJ : (UInt32.ofNat pre.length).toNat = pre.length := uint32_toNat_ofNat_lt_vp pre.length (by omega)
+              have huJ : (UInt32.ofNat pre.length).toNat = pre.length := uint32_toNat_ofNat_lt pre.length (by omega)
               rw [hnsRun]; dsimp only [Bind.bind]
               let targetV := if cond s₂ then yes else no
               have htargetClean : View.DomClean targetV := by cases hc₂ : cond s₂ <;> simp [targetV, hc₂, hclean.1, hclean.2]
@@ -3151,100 +2999,6 @@ end
 
 /-! ## 4. Template Keyed Row Alignment, Signal Store & Diff Soundness -/
 
-private theorem collectChanged_eq_append (inst : String) (old new : Array (String × String)) :
-    ∀ (j : Nat) (acc : Array (String × String)),
-      (collectChanged inst old new j acc).toList = acc.toList ++ (collectChanged inst old new j #[]).toList := by
-  intro j
-  induction hrem : new.size - j generalizing j with
-  | zero =>
-      intro acc; have hge : ¬ j < new.size := by omega
-      rw [collectChanged.eq_1]; conv => rhs; rw [collectChanged.eq_1]
-      simp [hge]
-  | succ _ ih =>
-      intro acc; by_cases hlt : j < new.size
-      · rw [collectChanged.eq_1]; simp only [hlt, ↓reduceDIte]
-        conv => rhs; rw [collectChanged.eq_1]; simp only [hlt, ↓reduceDIte]
-        have h1 := ih (j + 1) (by omega) (if (old[j]?.map (·.2) == some new[j].2) = true then acc else acc.push (inst ++ new[j].1, new[j].2))
-        have h2 := ih (j + 1) (by omega) (if (old[j]?.map (·.2) == some new[j].2) = true then #[] else #[].push (inst ++ new[j].1, new[j].2))
-        split at h1 <;> simp_all [List.append_assoc]
-      · rw [collectChanged.eq_1]; conv => rhs; rw [collectChanged.eq_1]
-        simp [hlt]
-
-private theorem collectChanged_not_mem_lt (inst : String) (old new : Array (String × String))
-    (huniq : ∀ a b, a < new.size → b < new.size → new[a]!.1 = new[b]!.1 → a = b) (targetIdx : Nat) (ht : targetIdx < new.size) :
-    ∀ (j : Nat), targetIdx < j →
-      ∀ kv ∈ (collectChanged inst old new j #[]).toList, kv.1 ≠ inst ++ new[targetIdx]!.1 := by
-  intro j
-  induction hrem : new.size - j generalizing j with
-  | zero =>
-      intro _ kv hkv
-      have hge : ¬ j < new.size := by omega
-      rw [collectChanged.eq_1] at hkv
-      simp [hge] at hkv
-  | succ _ ih =>
-      intro hltIdx kv hkv
-      by_cases hlt : j < new.size
-      · rw [collectChanged.eq_1] at hkv; simp only [hlt, ↓reduceDIte] at hkv; rw [collectChanged_eq_append] at hkv
-        rcases List.mem_append.1 hkv with ha | htl
-        · split at ha
-          · simp at ha
-          · simp only [Array.toList_push, List.nil_append, List.mem_singleton] at ha
-            subst ha; intro hEq
-            have hkEq : new[j]!.1 = new[targetIdx]!.1 := by
-              have hcancel := string_append_left_cancel hEq
-              simpa [getElem!_pos new j hlt, getElem!_pos new targetIdx ht] using hcancel
-            have := huniq j targetIdx hlt ht hkEq; omega
-        · exact ih (j + 1) (by omega) (by omega) kv htl
-      · rw [collectChanged.eq_1] at hkv; simp [hlt] at hkv
-
-private theorem foldl_setAssoc_pres {k : String} :
-    ∀ (pairs : List (String × String)) (sigs : List (String × String)),
-      (∀ kv ∈ pairs, kv.1 ≠ k) → lookupAssoc k (pairs.foldl (fun acc (nm, v) => setAssoc nm v acc) sigs) = lookupAssoc k sigs
-  | [], _, _ => rfl
-  | (nm, v) :: rest, sigs, h => by
-      have hne : (nm == k) = false := beq_eq_false_iff_ne.2 (h (nm, v) (.head _))
-      simpa [List.foldl_cons, lookupAssoc_setAssoc, hne] using
-        (foldl_setAssoc_pres rest (setAssoc nm v sigs) (fun kv hkv => h kv (.tail _ hkv))).trans (by rw [lookupAssoc_setAssoc, hne]; simp)
-
-theorem collectChanged_lookup_spec {msg : Type} (inst : String) (old new : Array (String × String))
-    (huniq : ∀ a b, a < new.size → b < new.size → new[a]!.1 = new[b]!.1 → a = b) (a : DomArena msg)
-    (hunch : ∀ k (hk : k < new.size), old[k]?.map (·.2) = some new[k].2 → lookupAssoc (inst ++ new[k].1) a.signals = some new[k].2) :
-    let pairs := (collectChanged inst old new 0 #[]).toList
-    let a' := ((emitSignalsM (m := StateM (DomArena msg)) pairs).run a).2
-    ∀ k (hk : k < new.size), lookupAssoc (inst ++ new[k].1) a'.signals = some new[k].2 := by
-  have heq := emitSignalsM_spec (collectChanged inst old new 0 #[]).toList a
-  dsimp only; rw [heq]; dsimp only
-  have hgen : ∀ (j : Nat) (sigs : List (String × String)), j ≤ new.size →
-      (∀ k (hk : k < new.size), k ≥ j → old[k]?.map (·.2) = some new[k].2 → lookupAssoc (inst ++ new[k].1) sigs = some new[k].2) →
-      ∀ k (hk : k < new.size), k ≥ j →
-        lookupAssoc (inst ++ new[k].1) ((collectChanged inst old new j #[]).toList.foldl (fun acc (nm, v) => setAssoc nm v acc) sigs) = some new[k].2 := by
-    intro j; induction hrem : new.size - j generalizing j with
-    | zero => intro _ _ _ k hk hge; omega
-    | succ _ ih =>
-        intro sigs hj hpre k hk hge
-        have hlt : j < new.size := by omega
-        rw [collectChanged.eq_1]; simp only [hlt, ↓reduceDIte]; rw [collectChanged_eq_append, List.foldl_append]
-        by_cases hkj : k = j
-        · subst hkj
-          have hnoLater := collectChanged_not_mem_lt inst old new huniq k hk (k + 1) (by omega)
-          rw [foldl_setAssoc_pres _ _ (fun kv hkv => by simpa [getElem!_pos new k hk] using hnoLater kv hkv)]
-          split
-          · rename_i hchg
-            simp only [List.foldl_nil]
-            exact hpre k hk (Nat.le_refl _) (by simpa using hchg)
-          · simp [lookupAssoc_setAssoc]
-        · apply ih (j + 1) (by omega) _ (by omega) _ k hk (by omega)
-          intro k' hk' hk'ge hold'
-          split
-          · exact hpre k' hk' (by omega) hold'
-          · have hne : (inst ++ new[j].1 == inst ++ new[k'].1) = false := beq_eq_false_iff_ne.2 fun hEq => by
-              have hcancel := string_append_left_cancel hEq
-              have hjk : new[j]!.1 = new[k']!.1 := by
-                simpa [getElem!_pos new j hlt, getElem!_pos new k' hk'] using hcancel
-              have := huniq j k' hlt hk' hjk; omega
-            simp [List.foldl_cons, lookupAssoc_setAssoc, hne, hpre k' hk' (by omega) hold']
-  intro k hk; exact hgen 0 a.signals (Nat.zero_le _) (fun k' hk' _ => hunch k' hk') k hk (Nat.zero_le _)
-
 theorem diffRowSigs_sound {msg : Type} (rowSig : Nat → Array (String × String))
     (rowEv : Nat → Array (String × msg)) (inst : String)
     (newMarks oldMarks : Array USize) (oldSigs : Array (Array (String × String)))
@@ -3340,7 +3094,7 @@ theorem renderSig_resolved_spec {σ msg : Type} (ns : String) (get : σ → Stri
         (List.filterMap managedAttrName (normalizeAttrs [Attr.signalBind sigNm])) [] from DomArena.get_set_self _ _ _,
     hev, lookupAssoc_setAssoc, beq_self_eq_true, ↓reduceIte, Option.getD_some]
   refine ⟨trivial, rfl, fun m hm => ?_⟩
-  have hne : m ≠ node := node_ne_of_toNat_ne (by dsimp only [node]; rw [uint32_toNat_ofNat_lt_vp a.nextId (by omega)]; omega)
+  have hne : m ≠ node := node_ne_of_toNat_ne (by dsimp only [node]; rw [uint32_toNat_ofNat_lt a.nextId (by omega)]; omega)
   exact DomArena.get_set_ne _ _ hne
 
 /-! ## 5. Browser Runtime & Local Island Driver Specifications -/
@@ -3587,21 +3341,6 @@ theorem View.DomClean_forEach {α σ msg : Type} (tag : String) (items : σ → 
       rw [hd1, hd2, hkaEq, hkey _ _ hkaEq]
 
 /-! ## 6. Compiled Row-Template & Prefix/Suffix/Swap Fast-Path Soundness -/
-
-private theorem prefixMatchLen_ge (oldMarks newMarks : Array USize) :
-    ∀ i, i ≤ prefixMatchLen oldMarks newMarks i := by
-  intro i
-  induction hrem : oldMarks.size - i generalizing i with
-  | zero => unfold prefixMatchLen; split <;> omega
-  | succ r ih =>
-      unfold prefixMatchLen
-      split
-      · rename_i h
-        dsimp only
-        split
-        · exact Nat.le_trans (Nat.le_succ i) (ih (i + 1) (by omega))
-        · exact Nat.le_refl i
-      · exact Nat.le_refl i
 
 theorem prefixMatchLen_bound (oldMarks newMarks : Array USize) :
     ∀ i, i ≤ oldMarks.size → i ≤ newMarks.size →

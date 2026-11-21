@@ -1027,7 +1027,8 @@ private def parseCompClause (acc : SpecParseAcc) (cl : Syntax) : CommandElabM Sp
       return { acc with stylesheets := acc.stylesheets.push normPath }
     | "compThemeClause" => return { acc with themes := acc.themes.push ⟨(cl.getArg 1)⟩ }
     | "compActionClause" => return { acc with actions := acc.actions.push cl }
-    | "compInvariantClause" | "compForEachInvClause" => return { acc with invariants := acc.invariants.push cl }
+    | "compInvariantClause" | "compForEachInvClause" | "compReachableClause" | "compWitnessClause" =>
+        return { acc with invariants := acc.invariants.push cl }
     | _ => return acc
   | _ => return acc
 

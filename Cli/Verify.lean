@@ -292,7 +292,7 @@ def kernelEnvClean (q? : Option QedjsEnv := none) (alreadyBuilt : Bool := false)
       "Js.Backend", "Js.Proofs",
       "Examples.Counter", "Examples.Todo", "Examples.Signup",
       "Examples.Chat", "Examples.Bookshelf", "Examples.CloudBooks", "Examples.LiveRoom",
-      "Tests.ServerChecks", "Tests.DbChecks", "Tests.SpeculativeChecks", "Tests.SpeculativeApp", "Tests.DomProbe", "Tests.JsGate"
+      "Tests.ServerChecks", "Tests.DbChecks", "Tests.SpeculativeChecks", "Tests.SpeculativeApp", "Tests.DomProbe", "Tests.JsGate", "Tests.VerificationChecks"
     ]
     let mods := if baseMods.contains root then baseMods else baseMods.push root
     q.run (#["--verify-env"] ++ mods) (quiet := true)

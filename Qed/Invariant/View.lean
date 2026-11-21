@@ -130,6 +130,19 @@ private def styleReduceCoreNames : Array Name := #[
   ``Qed.hasRole, ``Qed.hasTag, ``Qed.both, ``Qed.either, ``Qed.exactlyOne,
   ``Qed.allRolesOff, ``Qed.exactlyOneOf, ``Qed.exactlyOneOf.go, ``Qed.hasOneClass,
   ``Qed.everyElement, ``Qed.everyElementL, ``Qed.attrClasses, ``Qed.attrRole,
+  ``Qed.Html.a11yValid, ``Qed.Html.imgsHaveAlt, ``Qed.Html.imgsHaveAltList,
+  ``Qed.Html.buttonsAccessible, ``Qed.Html.buttonsAccessibleList,
+  ``Qed.Html.elemHasAccessibleName, ``Qed.Html.hasAccessibleNameChild, ``Qed.Html.hasAccessibleNameChildren,
+  ``Qed.Html.validAriaRoles, ``Qed.Html.validAriaRolesList, ``Qed.attrsValidAriaRoles,
+  ``Qed.Html.labelsAssociated, ``Qed.Html.labelsAssociatedList,
+  ``Qed.Html.containsFormControl, ``Qed.Html.containsFormControlList, ``Qed.isFormControlTag,
+  ``Qed.Html.noDuplicateIds, ``Qed.Html.collectIds, ``Qed.Html.collectIdsList,
+  ``Qed.Html.headingsOrdered, ``Qed.Html.collectHeadings, ``Qed.Html.collectHeadingsList,
+  ``Qed.Html.htmlHasLang, ``Qed.Html.htmlHasLangList,
+  ``Qed.attrValue, ``Qed.hasAttr, ``Qed.hasNonBlankAttr,
+  ``Qed.Html.imgsHaveAlt_map, ``Qed.Html.buttonsAccessible_map, ``Qed.Html.validAriaRoles_map,
+  ``Qed.Html.labelsAssociated_map, ``Qed.Html.noDuplicateIds_map, ``Qed.Html.headingsOrdered_map,
+  ``Qed.Html.htmlHasLang_map, ``Qed.Html.a11yValid_map,
   ``Qed.Html.map, ``Qed.Html.mapChildren, ``Qed.Attr.map,
   ``Qed.Lang.QedVal.val_id, ``Qed.Lang.QedSeqLit.ofList_array, ``Qed.Lang.QedSeqLit.ofList_list,
   ``Qed.Lang.QedMem.mem_array, ``Qed.Lang.QedMem.mem_list, ``Qed.Lang.QedMem.mem_string,
@@ -202,7 +215,17 @@ private def runStyleLeafClose (g : MVarId) : TacticM (List MVarId) := do
     setGoals [g1]
     try evalTactic (← `(tactic|
       (simp_all [Qed.everyElement, Qed.everyElementL,
-                 Qed.attrClasses, Qed.attrRole, Qed.hasOneClass];
+                 Qed.attrClasses, Qed.attrRole, Qed.hasOneClass,
+                 Qed.Html.a11yValid, Qed.Html.imgsHaveAlt, Qed.Html.imgsHaveAltList,
+                 Qed.Html.buttonsAccessible, Qed.Html.buttonsAccessibleList,
+                 Qed.Html.elemHasAccessibleName, Qed.Html.hasAccessibleNameChild, Qed.Html.hasAccessibleNameChildren,
+                 Qed.Html.validAriaRoles, Qed.Html.validAriaRolesList, Qed.attrsValidAriaRoles,
+                 Qed.Html.labelsAssociated, Qed.Html.labelsAssociatedList,
+                 Qed.Html.containsFormControl, Qed.Html.containsFormControlList, Qed.isFormControlTag,
+                 Qed.Html.noDuplicateIds, Qed.Html.collectIds, Qed.Html.collectIdsList,
+                 Qed.Html.headingsOrdered, Qed.Html.collectHeadings, Qed.Html.collectHeadingsList,
+                 Qed.Html.htmlHasLang, Qed.Html.htmlHasLangList,
+                 Qed.attrValue, Qed.hasAttr, Qed.hasNonBlankAttr];
        try decide;
        try omega))) catch _ => pure ()
     for g2 in (← getGoals) do
@@ -230,6 +253,8 @@ private def runStyleReduce (view : Ident) : TacticM Unit := do
         continue
       setGoals [g1]
       runUnfoldViewHelpers
+      try evalTactic (← `(tactic| first | rfl | ((repeat' split); all_goals rfl; done) | skip)) catch _ => pure ()
+      if (← getGoals).isEmpty then continue
       try runStyleSimpPass catch _ => pure ()
       if (← getGoals).isEmpty then continue
       try evalTactic (← `(tactic| repeat' split)) catch _ => pure ()
@@ -270,7 +295,23 @@ private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM U
     let predStr := predLit.getString
     let vName := view.getId
     let diagnosis :=
-      if predStr.contains "roleLacks" || predStr.contains "tagLacks" then
+      if predStr.contains "imgsHaveAlt" then
+        s!"An `<img>` element in `{vName}` is missing an `alt` attribute. Add `alt=\"...\"` (or `alt=\"\"` for decorative images)."
+      else if predStr.contains "buttonsAccessible" then
+        s!"A `<button>` or `<a>` element in `{vName}` has no accessible name in some branch. Provide non-empty text, `aria-label`, `aria-labelledby`, `title`, or a child `<img>` with non-empty `alt`."
+      else if predStr.contains "validAriaRoles" then
+        s!"An element in `{vName}` has an unrecognized WAI-ARIA `role` attribute. Use a valid WAI-ARIA 1.2 role name."
+      else if predStr.contains "labelsAssociated" then
+        s!"A `<label>` element in `{vName}` neither has a non-empty `for` attribute nor wraps a form control (`<input>`, `<select>`, `<textarea>`)."
+      else if predStr.contains "noDuplicateIds" then
+        s!"Two elements in `{vName}` share the same `id` attribute in some branch. Ensure every non-empty `id` is unique."
+      else if predStr.contains "headingsOrdered" then
+        s!"Headings in `{vName}` skip a level (e.g. `<h1>` directly to `<h3>`). Use sequential heading levels."
+      else if predStr.contains "htmlHasLang" then
+        s!"An `<html>` element in `{vName}` is missing a non-empty `lang` attribute (e.g. `<html lang=\"en\">`)."
+      else if predStr.contains "a11yValid" then
+        s!"An accessibility check failed in `{vName}` (check `<img alt>`, `<button>`/`<a>` accessible names, WAI-ARIA `role`, `<label>` association, unique `id`s, heading order, and `<html lang>`)."
+      else if predStr.contains "roleLacks" || predStr.contains "tagLacks" then
         s!"A matching element in `{vName}` carries a forbidden style class in some branch. Remove that style from the matching element or guard it so it cannot apply there."
       else if predStr.contains "exactlyOne" then
         s!"In some branch of `{vName}`, either none or more than one of the listed roles carries the active style, a role is missing the inactive style, or one of the roles is not rendered."
@@ -279,7 +320,14 @@ private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM U
         s!"No element with the required `role`/tag is rendered in some branch of `{vName}`. Check every conditional branch of `{vName}`."
       else
         s!"Check that the matching `role`/tag is rendered and receives exactly one allowed style in every branch of `{vName}`."
-    throwErrorAt nm m!"Styling invariant `{nm.getId}` failed in `{vName}`:\n  • `{predStr}` does not hold in every state{extraBody}\n\nHint: {diagnosis}"
+    let label :=
+      if predStr.contains "a11yValid" || predStr.contains "imgsHaveAlt" ||
+         predStr.contains "buttonsAccessible" || predStr.contains "validAriaRoles" ||
+         predStr.contains "labelsAssociated" || predStr.contains "noDuplicateIds" ||
+         predStr.contains "headingsOrdered" || predStr.contains "htmlHasLang" then
+        "Accessibility invariant"
+      else "Styling invariant"
+    throwErrorAt nm m!"{label} `{nm.getId}` failed in `{vName}`:\n  • `{predStr}` does not hold in every state{extraBody}\n\nHint: {diagnosis}"
 
 elab "qedUnfoldViewHelpers" : tactic => runUnfoldViewHelpers
 elab "qedCloseExhaustiveEnum" : tactic => runCloseExhaustiveEnum

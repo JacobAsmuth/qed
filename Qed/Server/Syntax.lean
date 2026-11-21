@@ -147,6 +147,10 @@ def extHttpMethod : Parser :=
       many (atomic (checkColEq "contract" >> srvContractLine)) >>
       many1 (checkColEq "statement" >> categoryParser `qedStmt 0)))
 
+@[srvClause_parser] def srvJobClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `every) >> numLit >> ident >> ident >> ":" >> qedSuite)
+
 @[command_parser] def serverCmd : Parser := leading_parser
   withPosition (
     "server " >> ident >> ":" >>

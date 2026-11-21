@@ -111,7 +111,7 @@ private def normalizeText (lead : String) (raw : String) : String :=
 
 private def helperAttrs : List String :=
   ["value", "placeholder", "name", "href", "src", "action", "alt", "title", "style", "key",
-   "role", "onClick", "onInput", "onChange", "onCheck", "onKeydown",
+   "role", "ariaRole", "onClick", "onInput", "onChange", "onCheck", "onKeydown",
    "onKeyup", "onSubmit", "onBlur", "onFocus", "onDoubleClick", "onMouseDown",
    "onMouseUp", "disabled", "required", "checked", "readOnly"]
 

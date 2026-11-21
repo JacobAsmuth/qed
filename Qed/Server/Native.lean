@@ -1,5 +1,6 @@
 import Qed.Ssr
 import Qed.Server.Core
+import Qed.Server.Jobs
 import Qed.Server.Net
 import Qed.Server.Http
 import Qed.Server.Prim
@@ -877,7 +878,8 @@ def runFullstackWithDispatch {Model Msg : Type}
     (devMode : Bool := false)
     (numWorkers : UInt32 := 0)
     (wsDispatchFn? : Option (RequestCtx → UInt8 → String → ByteArray → ByteArray → IO (Except ApiError ByteArray)) := none)
-    (blockingMethods? : Option (Array String) := none) : IO UInt32 := do
+    (blockingMethods? : Option (Array String) := none)
+    (jobs : Array IoJob := #[]) : IO UInt32 := do
   if !(← verifyRequiredSecrets requiredSecrets) then
     return 1
   let cfg ← loadServerConfig devMode
@@ -1029,6 +1031,7 @@ def runFullstackWithDispatch {Model Msg : Type}
     if let some wsDispatchFn := wsDispatchFn? then
       discard <| wsDispatchFn ctx 3 ch params ByteArray.empty
 
+  let _jobTasks ← if jobs.isEmpty then pure #[] else spawnServerJobs jobs
   Prim.serveNative cfg.bindHost port numWorkers ({} : WsFragState) onHead dispatchAppReq onWsBytes onWsLeave
 
 def runStatefulFullstack {σ Model Msg : Type}
@@ -1039,7 +1042,8 @@ def runStatefulFullstack {σ Model Msg : Type}
     (port : UInt16) (staticDir : String) (devMode : Bool := false) (numWorkers : UInt32 := 0)
     (wsDispatchM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
         RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)) := none)
-    (blockingMethods? : Option (Array String) := none) : IO UInt32 := do
+    (blockingMethods? : Option (Array String) := none)
+    (jobs : Array (ServerJob σ) := #[]) : IO UInt32 := do
   let box ← Prim.mkStateBox initState
   let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
   let srvInst : MonadServer IO := mkNativeServerInst (some gcpCache)
@@ -1049,6 +1053,7 @@ def runStatefulFullstack {σ Model Msg : Type}
     port staticDir devMode numWorkers
     (wsDispatchM?.map fun wsM ctx kind ch params payload => @wsM IO _ srvInst atomicInst ctx kind ch params payload)
     blockingMethods?
+    (jobs.map (·.toIoJob srvInst atomicInst))
 
 def runStatelessFullstack {Model Msg : Type}
     (app : Qed.App Model Msg) (title serverShortName : String)
@@ -1058,7 +1063,8 @@ def runStatelessFullstack {Model Msg : Type}
     (port : UInt16) (staticDir : String) (devMode : Bool := false) (numWorkers : UInt32 := 0)
     (wsDispatchM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] →
         RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)) := none)
-    (blockingMethods? : Option (Array String) := none) : IO UInt32 := do
+    (blockingMethods? : Option (Array String) := none)
+    (jobs : Array StatelessJob := #[]) : IO UInt32 := do
   let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
   let srvInst : MonadServer IO := mkNativeServerInst (some gcpCache)
   runFullstackWithDispatch app title serverShortName requiredSecrets
@@ -1066,6 +1072,7 @@ def runStatelessFullstack {Model Msg : Type}
     port staticDir devMode numWorkers
     (wsDispatchM?.map fun wsM ctx kind ch params payload => @wsM IO _ srvInst ctx kind ch params payload)
     blockingMethods?
+    (jobs.map (·.toIoJob srvInst))
 
 /-- Serves a standalone `Qed.App` (`component` or `Qed.run`) with native in-memory SSR and static asset serving. -/
 def runStandaloneApp {Model Msg : Type} (app : Qed.App Model Msg) (title : String)

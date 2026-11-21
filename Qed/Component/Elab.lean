@@ -18,8 +18,10 @@ private def elabPureCompInvariants (spec : ComponentSpec) (viewId : Ident) (msgV
     CommandElabM Unit := do
   let tId := spec.t.getId
   for invStx in spec.invariants do
-    if invStx.getKind == ``compForEachInvClause then
-      throwErrorAt invStx "a pure component has no local state; `for_each` applies to stateful components"
+    if invStx.getKind == ``compForEachInvClause ||
+       invStx.getKind == ``compReachableClause ||
+       invStx.getKind == ``compWitnessClause then
+      throwErrorAt invStx "a pure component has no local state; `for_each`, `reachable`, and `witness` apply to stateful components"
     let invId := resolveInvIdent invStx tId
     let rawClauses := (invStx.getArg 2).getSepArgs
     let loweredClauses ← rawClauses.mapM (lowerCompExpr .val)
@@ -618,6 +620,8 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
   let stateInvEntries ← withOpenNs compNs (elabInlineInvariantsPhase spec false)
   let errsAfterInvs := (← get).messages.toList.filter (·.severity == .error) |>.length
   let activeInvEntries := if errsAfterInvs == errsBefore then stateInvEntries else #[]
+  if errsAfterInvs == errsBefore then
+    withOpenNs compNs (elabCompReachableAndWitnesses spec activeInvEntries)
   verifyPendingRpcChecks spec (activeInvEntries.map (·.1))
   if isTopMount then
     let (appCmds, eqCmd) ← mkCompAppCmds spec body' hasStart activeInvEntries
@@ -627,9 +631,16 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
   let _ ← withOpenNs compNs (elabInlineInvariantsPhase spec true)
   elabCompRegistryAndMeta spec hasStart hasLocalDef allUsedRpcs allUsedChannels
 
+private def compSnapshotTreeHasErrors : Nat → Language.SnapshotTree → Bool
+  | 0, tree => tree.element.diagnostics.msgLog.hasErrors
+  | fuel + 1, tree =>
+      tree.element.diagnostics.msgLog.hasErrors ||
+      tree.children.any fun t => compSnapshotTreeHasErrors fuel t.get
+
 @[command_elab componentCmd] def elabComponentCmd : CommandElab := fun stx => do
   let savedEnv ← getEnv
   let errsInit := (← get).messages.toList.filter (·.severity == .error) |>.length
+  let priorTasks := (← get).snapshotTasks.size
   let compNs := (← getCurrNamespace) ++ (stx.getArg 2).getId
   pendingRpcChecks.set #[]
   pendingPredictChecks.set #[]
@@ -645,7 +656,9 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
     pendingPredictChecks.set #[]
     currentCompSessionRef.set none
     let errsEnd := (← get).messages.toList.filter (·.severity == .error) |>.length
-    if !(← okRef.get) || errsEnd > errsInit then
+    let newTasks := (← get).snapshotTasks.extract priorTasks (← get).snapshotTasks.size
+    let asyncErr := newTasks.any fun t => compSnapshotTreeHasErrors 64 t.get
+    if !(← okRef.get) || errsEnd > errsInit || asyncErr then
       setEnv savedEnv
 
 end CompElab

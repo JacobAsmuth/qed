@@ -45,6 +45,7 @@ structure ServerInfo where
   externalServices : Array (String × String)
   methods          : Array ServerMethodInfo
   channels         : Array String := #[]
+  jobs             : Array String := #[]
   databases        : Array Lean.Name := #[]
 deriving Inhabited
 

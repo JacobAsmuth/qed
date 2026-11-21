@@ -19,6 +19,7 @@ def linkTo {α} [Router α] (route : α)
 def cls (name : String) : Attr msg := .cls name
 def attr {α} [ToString α] (key : String) (value : α) : Attr msg := .attr key (toString value)
 def role (name : String) : Attr msg := .attr "data-role" name
+abbrev ariaRole (name : String) : Attr msg := attr "role" name
 def on (event : String) (m : msg) : Attr msg := .on event m
 def onValue (event : String) (handler : String → msg) : Attr msg := .onValue event handler
 def onClick (m : msg) : Attr msg := .on "click" m

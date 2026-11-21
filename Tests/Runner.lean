@@ -2,13 +2,15 @@ import Tests.Native.CliScaffold
 import Tests.Native.Database
 import Tests.Native.FullstackRpc
 import Tests.Native.WebSocket
+import Tests.Native.VerificationAndJobs
 
 def main : IO UInt32 := do
   let suites : Array (String × IO Bool) := #[
-    ("cli-scaffold",  Tests.Native.CliScaffold.run),
-    ("fullstack-rpc", Tests.Native.FullstackRpc.run),
-    ("database",      Tests.Native.Database.run),
-    ("websockets",    Tests.Native.WebSocket.run)
+    ("cli-scaffold",          Tests.Native.CliScaffold.run),
+    ("fullstack-rpc",         Tests.Native.FullstackRpc.run),
+    ("database",              Tests.Native.Database.run),
+    ("websockets",            Tests.Native.WebSocket.run),
+    ("verification-and-jobs", Tests.Native.VerificationAndJobs.run)
   ]
   -- Run all 4 independent native suites concurrently!
   let mut tasks : Array (String × Task (Except IO.Error Bool)) := #[]

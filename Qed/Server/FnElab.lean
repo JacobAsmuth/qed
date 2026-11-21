@@ -151,7 +151,8 @@ structure ParsedServerBlock where
   invs        : Array ParsedInv
   fnClauses   : Array Lean.Syntax
   chanClauses : Array Lean.Syntax
-  httpClauses : Array Lean.Syntax
+  httpClauses : Array Lean.Syntax := #[]
+  jobClauses  : Array Lean.Syntax := #[]
 
 open Lean Elab Command in
 def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean.Syntax) :
@@ -165,6 +166,7 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
   let mut fnClauses   : Array Syntax := #[]
   let mut chanClauses : Array Syntax := #[]
   let mut httpClauses : Array Syntax := #[]
+  let mut jobClauses  : Array Syntax := #[]
   for c in clauses do
     let k := c.getKind
     if k == ``srvDbClause then
@@ -224,10 +226,12 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
       chanClauses := chanClauses.push c
     else if k == ``srvHttpRouteClause || k == ``srvStreamClause then
       httpClauses := httpClauses.push c
+    else if k == ``srvJobClause then
+      jobClauses := jobClauses.push c
     else
       throwErrorAt c "unexpected clause in `server` block"
-  if fnClauses.isEmpty && chanClauses.isEmpty && httpClauses.isEmpty then
-    throwErrorAt srvIdent s!"`server {srvName}` must declare at least one `def`, `channel`, `http`, or `stream` clause"
+  if fnClauses.isEmpty && chanClauses.isEmpty && httpClauses.isEmpty && jobClauses.isEmpty then
+    throwErrorAt srvIdent s!"`server {srvName}` must declare at least one `def`, `channel`, `http`, `stream`, or `every` job"
   let hasState := !stateDecls.isEmpty
   if !hasState && (!invs.isEmpty || !mutInvs.isEmpty) then
     throwErrorAt srvIdent s!"`server {srvName}` declares `invariant`s but has no `state` fields"
@@ -235,7 +239,7 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
     unless stateDecls.any (·.ident.getId == mi.fieldId.getId) do
       let avail := String.intercalate ", " (stateDecls.toList.map fun s => s!"`{s.ident.getId}`")
       throwErrorAt mi.fieldId s!"`invariant mutating {mi.fieldId.getId}` does not match any `state` field of `{srvName}` (`state` fields: {avail})"
-  return { dbDecls, envDecls, stateDecls, mutInvs, invs, fnClauses, chanClauses, httpClauses }
+  return { dbDecls, envDecls, stateDecls, mutInvs, invs, fnClauses, chanClauses, httpClauses, jobClauses }
 
 section
 open Lean Elab Command
@@ -569,7 +573,8 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
     (methodInfos : Array ServerMethodInfo) (dispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
     (chanNames : Array String) (wsDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
     (ctxId reqBytesId : Ident)
-    (httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]) : CommandElabM Unit := do
+    (httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[])
+    (jobNames : Array String := #[]) : CommandElabM Unit := do
   if hasState then
     let linThmId := mkIdentFrom srvIdent (srvName ++ `concurrent_linearizable)
     elabCommand (← `(command|
@@ -634,6 +639,7 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
     externalServices := usedExts
     methods := methodInfos
     channels := chanNames
+    jobs := jobNames
     databases := dbDecls.map (·.info.configConst)
     hasHttpRoutes := !httpDispatchArms.isEmpty
   }

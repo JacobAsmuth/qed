@@ -179,20 +179,26 @@ macro_rules
       `(tactic|
         (intro m
          qedStyleReduce $view
-         all_goals (try (rw [Qed.everyElementL_mapList]
-                         intro $c _
-                         first
-                           | $liftChild:tactic
-                           | (simp only [Qed.everyElement, Qed.everyElementL, Bool.and_eq_true]
-                              repeat' apply And.intro
-                              all_goals (first
-                                | $liftChild:tactic
-                                | (simp only [Qed.attrRole, Qed.attrClasses, Qed.hasOneClass,
-                                              Bool.true_and, Bool.and_true, Bool.false_and, Bool.and_false,
-                                              Bool.true_or, Bool.or_true, Bool.false_or, Bool.or_false,
-                                              ite_true, ite_false, beq_self_eq_true, eq_self]; (try rfl); done)
-                                | (simp [Qed.attrRole, Qed.attrClasses, Qed.hasOneClass]; done)
-                                | rfl))))))
+         all_goals (try (first
+           | (rw [Qed.everyElementL_mapList]
+              intro $c _
+              first
+                | $liftChild:tactic
+                | (simp only [Qed.everyElement, Qed.everyElementL, Bool.and_eq_true]
+                   repeat' apply And.intro
+                   all_goals (first
+                     | $liftChild:tactic
+                     | (simp only [Qed.attrRole, Qed.attrClasses, Qed.hasOneClass,
+                                   Bool.true_and, Bool.and_true, Bool.false_and, Bool.and_false,
+                                   Bool.true_or, Bool.or_true, Bool.false_or, Bool.or_false,
+                                   ite_true, ite_false, beq_self_eq_true, eq_self]; (try rfl); done)
+                     | (simp [Qed.attrRole, Qed.attrClasses, Qed.hasOneClass]; done)
+                     | rfl)))
+           | (rw [Qed.Html.imgsHaveAltList_mapList]; intro $c _; simpa [Qed.Html.imgsHaveAlt_map] using $childStyled $c)
+           | (rw [Qed.Html.buttonsAccessibleList_mapList]; intro $c _; simpa [Qed.Html.buttonsAccessible_map] using $childStyled $c)
+           | (rw [Qed.Html.validAriaRolesList_mapList]; intro $c _; simpa [Qed.Html.validAriaRoles_map] using $childStyled $c)
+           | (rw [Qed.Html.labelsAssociatedList_mapList]; intro $c _; simpa [Qed.Html.labelsAssociated_map] using $childStyled $c)
+           | (rw [Qed.Html.htmlHasLangList_mapList]; intro $c _; simpa [Qed.Html.htmlHasLang_map] using $childStyled $c)))))
 
 elab "qedDischargeStyledForEach" view:ident field:ident childStyled:ident nm:ident pred:term : tactic => do
   evalTactic (← `(tactic| forEachStyleLift $view $childStyled))

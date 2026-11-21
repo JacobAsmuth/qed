@@ -1,5 +1,6 @@
 import Qed.Ssr
 import Qed.Server.Core
+import Qed.Server.Jobs
 import Qed.Server.Net
 import Qed.Server.Http
 import Qed.Server.Prim
@@ -1192,7 +1193,8 @@ private def runFullstackCore {Model Msg : Type}
     (numWorkers : UInt32 := 0)
     (wsDispatchFn? : Option (RequestCtx → UInt8 → String → ByteArray → ByteArray → IO (Except ApiError ByteArray)) := none)
     (blockingMethods? : Option (Array String) := none)
-    (httpDispatchFn? : Option (RequestCtx → String → String → IO (Except ApiError (Option HttpResponse) × Array SetCookie)) := none) : IO UInt32 := do
+    (httpDispatchFn? : Option (RequestCtx → String → String → IO (Except ApiError (Option HttpResponse) × Array SetCookie)) := none)
+    (jobs : Array IoJob := #[]) : IO UInt32 := do
   if !(← verifyRequiredSecrets requiredSecrets) then
     return 1
   let cfg ← loadServerConfig devMode
@@ -1348,6 +1350,7 @@ private def runFullstackCore {Model Msg : Type}
     if let some wsDispatchFn := wsDispatchFn? then
       discard <| wsDispatchFn ctx 3 ch params ByteArray.empty
 
+  let _jobTasks ← if jobs.isEmpty then pure #[] else spawnServerJobs jobs
   Prim.serveNative cfg.bindHost port numWorkers ({} : WsFragState) onHead dispatchAppReq onWsBytes onWsLeave
 
 def runFullstackWithDispatch {Model Msg : Type}
@@ -1362,11 +1365,13 @@ def runFullstackWithDispatch {Model Msg : Type}
     (numWorkers : UInt32 := 0)
     (wsDispatchFn? : Option (RequestCtx → UInt8 → String → ByteArray → ByteArray → IO (Except ApiError ByteArray)) := none)
     (blockingMethods? : Option (Array String) := none)
-    (httpDispatchFn? : Option (RequestCtx → String → String → IO (Except ApiError (Option HttpResponse))) := none) : IO UInt32 :=
+    (httpDispatchFn? : Option (RequestCtx → String → String → IO (Except ApiError (Option HttpResponse))) := none)
+    (jobs : Array IoJob := #[]) : IO UInt32 :=
   runFullstackCore app title serverShortName requiredSecrets
     (fun ctx mName reqBytes => do return (← dispatchFn ctx mName reqBytes, #[]))
     port staticDir devMode numWorkers wsDispatchFn? blockingMethods?
     (httpDispatchFn?.map fun f ctx m p => do return (← f ctx m p, #[]))
+    jobs
 
 def runStatefulFullstack {σ Model Msg : Type}
     (app : Qed.App Model Msg) (title serverShortName : String)
@@ -1378,7 +1383,8 @@ def runStatefulFullstack {σ Model Msg : Type}
         RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)) := none)
     (blockingMethods? : Option (Array String) := none)
     (httpDispatchM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
-        RequestCtx → String → String → m (Except ApiError (Option HttpResponse))) := none) : IO UInt32 := do
+        RequestCtx → String → String → m (Except ApiError (Option HttpResponse))) := none)
+    (jobs : Array (ServerJob σ) := #[]) : IO UInt32 := do
   let box ← Prim.mkStateBox initState
   let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
   let wsSrvInst : MonadServer IO := mkNativeServerInst (some gcpCache) none
@@ -1397,6 +1403,7 @@ def runStatefulFullstack {σ Model Msg : Type}
       let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef)
       let res ← @httpM IO _ reqSrvInst atomicInst ctx method path
       return (res, ← cookieRef.get))
+    (jobs.map (·.toIoJob wsSrvInst atomicInst))
 
 def runStatelessFullstack {Model Msg : Type}
     (app : Qed.App Model Msg) (title serverShortName : String)
@@ -1408,7 +1415,8 @@ def runStatelessFullstack {Model Msg : Type}
         RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)) := none)
     (blockingMethods? : Option (Array String) := none)
     (httpDispatchM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] →
-        RequestCtx → String → String → m (Except ApiError (Option HttpResponse))) := none) : IO UInt32 := do
+        RequestCtx → String → String → m (Except ApiError (Option HttpResponse))) := none)
+    (jobs : Array StatelessJob := #[]) : IO UInt32 := do
   let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
   let wsSrvInst : MonadServer IO := mkNativeServerInst (some gcpCache) none
   runFullstackCore app title serverShortName requiredSecrets
@@ -1425,6 +1433,7 @@ def runStatelessFullstack {Model Msg : Type}
       let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef)
       let res ← @httpM IO _ reqSrvInst ctx method path
       return (res, ← cookieRef.get))
+    (jobs.map (·.toIoJob wsSrvInst))
 
 /-- Serves a standalone `Qed.App` (`component` or `Qed.run`) with native in-memory SSR and static asset serving. -/
 def runStandaloneApp {Model Msg : Type} (app : Qed.App Model Msg) (title : String)

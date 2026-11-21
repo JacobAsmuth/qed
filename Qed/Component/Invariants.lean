@@ -1,5 +1,6 @@
 import Qed.Component.AwaitLift
 import Qed.Invariant.ForEach
+import Qed.Invariant.Reachability
 
 namespace Qed
 section CompElab
@@ -170,6 +171,8 @@ def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) :
   let msgId := mkIdent (tId ++ `Msg)
   let mut statePreds : Array (Term × Option Ident) := #[]
   for invStx in spec.invariants do
+    if invStx.getKind == ``compReachableClause || invStx.getKind == ``compWitnessClause then
+      continue
     if invStx.getKind == ``compForEachInvClause then
       let isStyled ← isForEachStyled invStx
       if isStyled == wantView then
@@ -210,6 +213,63 @@ def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) :
         let id? := if !spec.hasProps && spec.mountable then some invId else none
         statePreds := statePreds.push (pred, id?)
   return statePreds
+
+def elabCompReachableAndWitnesses (spec : ComponentSpec)
+    (stateInvEntries : Array (Term × Option Ident)) : CommandElabM Unit := do
+  let tId      := spec.t.getId
+  let stateId  := mkIdent (tId ++ `State)
+  let msgId    := mkIdent (tId ++ `Msg)
+  let initId   := mkIdent (tId ++ `init)
+  let updateId := mkIdent (tId ++ `update)
+  for cl in spec.invariants do
+    if cl.getKind == ``compReachableClause then
+      unless spec.mountable && !spec.hasProps do
+        throwErrorAt cl "`reachable` inside a `component` requires a mountable component without `prop`s (use the standalone `reachable` command with explicit props instead)"
+      let thmId := resolveInvIdent cl tId
+      let rawGoal := cl.getArg 2
+      let bound? : Option (TSyntax `num) :=
+        if (cl.getArg 3).getNumArgs == 2 then some ⟨(cl.getArg 3).getArg 1⟩ else none
+      let rawTrace := cl.getArg 5
+      let goalTerm ← lowerCompExpr .propInv rawGoal
+      let pred ← `(fun (s : $stateId) => $(← bindMentionedFields spec (mentionsIdent goalTerm.raw) goalTerm))
+      let uTrace := Qed.Lang.unwrapParens1 rawTrace
+      let traceTerm : Term ←
+        if uTrace.getKind == ``Qed.Lang.qedArrLit then do
+          let elems ← (uTrace.getArg 1).getSepArgs.mapM (lowerCompExpr .val)
+          `(([$[$elems:term],*] : List $msgId))
+        else do
+          let t ← lowerCompExpr .val rawTrace
+          `(($t : List $msgId))
+      let lbl := Syntax.mkStrLit ((((rawGoal.reprint.getD "target").splitOn "\n").headD "target").trimAscii.toString)
+      match bound? with
+      | some bound =>
+          elabCommand (← `(command|
+            theorem $thmId:ident : Qed.ReachableIn $updateId $initId $bound ($pred) :=
+              Qed.reachableIn_of_trace $updateId $initId $bound ($pred) $traceTerm
+                (by simp only [List.length_cons, List.length_nil]; omega)
+                (by qedDischargeReachable $updateId $initId $thmId $lbl)))
+      | none =>
+          elabCommand (← `(command|
+            theorem $thmId:ident : Qed.Reachable $updateId $initId ($pred) :=
+              Qed.reachable_of_trace $updateId $initId ($pred) $traceTerm
+                (by qedDischargeReachable $updateId $initId $thmId $lbl)))
+    else if cl.getKind == ``compWitnessClause then
+      let thmId := resolveInvIdent cl tId
+      let rawState := cl.getArg 2
+      let stateTerm ← lowerCompExpr .val rawState
+      let wStateId := mkIdentFrom thmId (thmId.getId.appendAfter "_state")
+      elabCommand (← `(command| def $wStateId:ident : $stateId := $stateTerm))
+      if stateInvEntries.isEmpty then
+        elabCommand (← `(command| theorem $thmId:ident : Nonempty $stateId := ⟨$wStateId⟩))
+      else
+        let checks ← stateInvEntries.mapM fun (p, _) => `(($p) $wStateId)
+        let goal ← mkConjBody checks
+        let invNames := stateInvEntries.filterMap fun (_, id?) => id?.map (·.getId.toString)
+        let lbl := Syntax.mkStrLit (if invNames.isEmpty then "component invariant" else String.intercalate ", " invNames.toList)
+        elabCommand (← `(command|
+          theorem $thmId:ident : $goal := by
+            dsimp only [$wStateId:ident]
+            qedDischargeWitness $thmId $lbl))
 
 
 end CompElab

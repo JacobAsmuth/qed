@@ -1,6 +1,7 @@
 import Qed.Html
 import Qed.Date
 import Qed.Proto
+import Qed.Base64
 import Qed.Router.Basic
 import Qed.Socket.Basic
 
@@ -156,6 +157,38 @@ def FilePick.decode (s : String) (maxDepth : Nat := 64) : Except String FilePick
 
 def Cmd.pickFile (accept : String) (onFile : Except String FilePick → msg) : Cmd msg :=
   .fxResult "file.pick" accept "" fun s => onFile (FilePick.decode s)
+
+/-- Binary file upload payload returned by `Cmd.pickFileBytes`. -/
+structure FileBytes where
+  name  : String
+  mime  : String
+  size  : Nat
+  bytes : ByteArray
+
+instance : BEq FileBytes where
+  beq a b := a.name == b.name && a.mime == b.mime && a.size == b.size && a.bytes.data == b.bytes.data
+
+instance : FromJson FileBytes where
+  fromJson j := do
+    match (fromField j "error" : Except String String) with
+    | .ok errMsg => .error errMsg
+    | .error _   =>
+        let name  ← fromField j "name"
+        let mime  ← fromField j "mime"
+        let size  ← fromField j "size"
+        let b64   ← (fromField j "base64" : Except String String)
+        let bytes ← Base64.decode b64
+        return { name, mime, size, bytes }
+
+def FileBytes.decode (s : String) (maxDepth : Nat := 64) : Except String FileBytes :=
+  (Json.parse s maxDepth).bind fromJson
+
+/-- Opens the native browser file picker and reads the selected file as raw binary `ByteArray`,
+    enforcing `maxBytes` client-side (default 10 MiB) and decoding the base64 transfer payload
+    with Qed's verified `Base64.decode`. -/
+def Cmd.pickFileBytes (accept : String) (maxBytes : Nat := 10 * 1024 * 1024)
+    (onFile : Except String FileBytes → msg) : Cmd msg :=
+  .fxResult "file.pickBytes" accept (toString maxBytes) fun s => onFile (FileBytes.decode s)
 
 def dispatchPorts (handlers : Array (String × (String → Option msg))) (name payload : String) : Option msg :=
   match handlers.find? (fun h => h.1 == name) with

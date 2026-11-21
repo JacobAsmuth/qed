@@ -210,6 +210,23 @@ function mountApp(app, isTimeTravel = false) {
         input.onchange = () => { const f = input.files && input.files[0]; if (!f) { if (!disposed) effectDone(id, '{"error":"cancelled"}'); return; }
           const reader = new FileReader(); reader.onload = () => { if (!disposed) effectDone(id, JSON.stringify({ name: f.name, mime: f.type, size: f.size, text: String(reader.result) })); };
           reader.onerror = () => { if (!disposed) effectDone(id, '{"error":"read failed"}'); }; reader.readAsText(f); }; input.click(); break; }
+      case 'file.pickBytes': { const input = document.createElement('input'); input.type = 'file'; if (a) input.accept = a;
+        const maxBytes = parseInt(b, 10) || 0;
+        input.addEventListener('cancel', () => { if (!disposed) effectDone(id, '{"error":"cancelled"}'); });
+        input.onchange = () => { const f = input.files && input.files[0]; if (!f) { if (!disposed) effectDone(id, '{"error":"cancelled"}'); return; }
+          if (maxBytes > 0 && f.size > maxBytes) { if (!disposed) effectDone(id, JSON.stringify({ error: 'file too large (' + f.size + ' bytes; max ' + maxBytes + ')' })); return; }
+          const toB64 = (buf) => { const bytes = new Uint8Array(buf); const step = 24576; let out = '';
+            for (let i = 0; i < bytes.length; i += step) {
+              const slice = bytes.subarray(i, Math.min(i + step, bytes.length));
+              let bin = ''; for (let j = 0; j < slice.length; j++) bin += String.fromCharCode(slice[j]);
+              out += btoa(bin);
+            }
+            return out; };
+          const done = (buf) => { if (!disposed) effectDone(id, JSON.stringify({ name: f.name, mime: f.type, size: f.size, base64: toB64(buf) })); };
+          const fail = () => { if (!disposed) effectDone(id, '{"error":"read failed"}'); };
+          if (typeof f.arrayBuffer === 'function') { f.arrayBuffer().then(done).catch(fail); }
+          else { const reader = new FileReader(); reader.onload = () => done(reader.result); reader.onerror = fail; reader.readAsArrayBuffer(f); } };
+        input.click(); break; }
       default: console.warn('qed: unknown result effect', kind);
     }
   };

@@ -1,4 +1,5 @@
 import Qed.Server.ChannelElab
+import Qed.Server.JobElab
 import Qed.Server.Invariant
 import Qed.Resource.Basic
 
@@ -422,9 +423,15 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
     httpDispatchArms := httpDispatchArms.push arm
     allExtRoots := allExtRoots ++ er.filter (!allExtRoots.contains ·)
 
+  let some (jobNames, jobExtRoots) ← elabServerJobs priorRep priorUnrep
+      srvIdent srvName hasState stateId stateInvId ctxId parsed.envDecls envIdents envTypes
+      stateFieldNames envVarNames dbBindings parsed.invs parsed.mutInvs chanSigs methodInfos
+      parsed.jobClauses deferredProofs | return
+  allExtRoots := allExtRoots ++ jobExtRoots.filter (!allExtRoots.contains ·)
+
   elabServerDispatchCmds srvIdent stateId initStateId stateInvId invInitId
     srvName fullSrvName srvShort hasState parsed.dbDecls parsed.envDecls allExtRoots methodInfos dispatchArms
-    chanNames wsDispatchArms ctxId reqBytesId httpDispatchArms
+    chanNames wsDispatchArms ctxId reqBytesId httpDispatchArms jobNames
 
   -- Launch all method & channel proof theorems together in one parallel wave after all inductives/defs.
   for runProof in (← deferredProofs.get) do

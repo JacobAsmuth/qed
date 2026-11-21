@@ -9,11 +9,16 @@ schema OrderWithExample:
   name        : String where 1 <= name.length, name.length <= 40
   quantity    : Nat    where 1 <= quantity, quantity <= 10
   acceptTerms : Bool   where acceptTerms == true
-  example { name = "Alice", quantity = 3, acceptTerms = true }
+  example validOrder: name = "Alice", quantity = 3, acceptTerms = true
+  example maxOrder:
+    name = "Bob",
+    quantity = 10,
+    acceptTerms = true
 
 example : ∃ _x : OrderWithExample, True := OrderWithExample.satisfiable
 example : Nonempty OrderWithExample := inferInstance
-example : OrderWithExample.sample.quantity.val = 3 := rfl
+example : OrderWithExample.validOrder.quantity.val = 3 := rfl
+example : OrderWithExample.maxOrder.quantity.val = 10 := rfl
 
 schema BoundedQty:
   quantity : Nat where 10 <= quantity, quantity <= 20
@@ -43,26 +48,26 @@ schema UnsatBool:
 
 -- Negative: example failing a `where` constraint emits clear diagnostic
 /--
-error: Schema `BadExampleVal` example failed `where` constraint on field `quantity`:
+error: Schema `BadExampleVal` example `tooMany` failed `where` constraint on field `quantity`:
   • value `99` does not satisfy `1 <= quantity, quantity <= 10`
 
-Hint: Update the `example` value for `quantity` so it satisfies `1 <= quantity, quantity <= 10`, or weaken the `where` rule.
+Hint: Update `quantity` in example `tooMany` so it satisfies `1 <= quantity, quantity <= 10`, or weaken the `where` rule.
 -/
 #guard_msgs in
 schema BadExampleVal:
   name     : String where 1 <= name.length
   quantity : Nat    where 1 <= quantity, quantity <= 10
-  example { name = "Alice", quantity = 99 }
+  example tooMany: name = "Alice", quantity = 99
 
 -- Negative: example missing a required field
 /--
-error: schema `MissingExampleField` `example`: missing required field `quantity`
+error: Schema `MissingExampleField` example `incomplete`: missing required field `quantity`
 -/
 #guard_msgs in
 schema MissingExampleField:
   name     : String where 1 <= name.length
   quantity : Nat    where 1 <= quantity
-  example { name = "Alice" }
+  example incomplete: name = "Alice"
 
 /-! ## 1B. Unified Component `example` (Concrete & Universally Quantified Parametric Proofs) -/
 

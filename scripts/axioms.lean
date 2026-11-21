@@ -404,3 +404,12 @@ import Examples.LiveRoom
 #print axioms DbChecks.VaultApi.editNote_ensures
 #print axioms DbChecks.VaultApi.publishNote_ensures
 #print axioms DbChecks.VaultApi.orderBook_ensures
+#print axioms Qed.Server.Db.diffTableSchema_self_empty
+#print axioms Qed.Server.Db.verifyMigrationSafe_nullable_addColumn
+#print axioms DbChecks.ShopApi.createAuthorAndItem_inv
+#print axioms DbChecks.ShopApi.createAuthorAndItem_ensures
+#print axioms DbChecks.ShopApi.createPairDotSyntax_ensures
+#print axioms Qed.Server.SetCookie.render_no_crlf
+#print axioms Qed.safeCanonicalHref_no_markup_or_quote
+#print axioms Qed.escapeHeadMetaValue_no_markup_or_quote
+#print axioms Qed.renderHeadMeta_empty

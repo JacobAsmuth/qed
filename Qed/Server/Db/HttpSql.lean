@@ -156,10 +156,12 @@ def decodeD1Response (raw : String) (expectedCols : List String) : Except String
   | _ => .error "D1 response is not a JSON object"
 
 def queryExpectedCols : SqlQuery → List String
-  | .select _ cols _ _ _ => cols.map (·.raw)
-  | .count _ _           => []
-  | .insert _ _ ret      => ret.map (·.raw)
-  | .update _ _ _ ret    => ret.map (·.raw)
-  | .delete _ _ ret      => ret.map (·.raw)
+  | .select _ cols _ _ _ _ => cols.map (·.raw)
+  | .count _ _             => []
+  | .aggregate _ _ _ _     => []
+  | .joinSelect _ _ lc rc _ _ _ _ _ _ _ => lc.map (·.raw) ++ rc.map (·.raw)
+  | .insert _ _ ret        => ret.map (·.raw)
+  | .update _ _ _ ret      => ret.map (·.raw)
+  | .delete _ _ ret        => ret.map (·.raw)
 
 end Qed.Server.Db.HttpSql

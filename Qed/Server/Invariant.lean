@@ -131,10 +131,10 @@ private def stepFixedSimpNames : Array Lean.Name :=
   stepCombSimpNames ++ stepLetEqSimpNames ++ ensPostSimpNames ++ valUnwrapSimpNames ++ liftOptSimpNames
 
 private def asyncInitSimpNames : Array Lean.Name :=
-  #[``Qed.Server.srvFinishM, ``Qed.Server.srvSeqM]
+  #[``Qed.Server.srvFinishM, ``Qed.Server.srvSeqM, ``Qed.Server.dbRunTx]
 
 private def asyncDsimpNames : Array Lean.Name :=
-  #[``Qed.Server.srvSeqM, ``Qed.Server.SrvUnwrap.unwrap, ``Qed.Server.SrvErr.ofApi, ``Qed.Server.SrvUnwrapOpt.unwrapOpt]
+  #[``Qed.Server.srvSeqM, ``Qed.Server.dbRunTx, ``Qed.Server.SrvUnwrap.unwrap, ``Qed.Server.SrvErr.ofApi, ``Qed.Server.SrvUnwrapOpt.unwrapOpt]
 
 private def asyncNormSimpNames : Array Lean.Name :=
   stepCombSimpNames ++ stepLetEqSimpNames ++ ensPostSimpNames ++ threadProgBindSimpNames

@@ -1,4 +1,5 @@
 import Qed
+import Qed.Server.Http
 open Qed
 
 namespace ServerChecks
@@ -434,5 +435,96 @@ component VerifiedWsEnsures:
     if n <= 50:
       g.send(n)
   view: <span>{lastVal}</span>
+
+/-! ## Production Server & Web Essentials Compile-Time Checks -/
+
+-- 28. `SetCookie` safe defaults & CRLF sanitization
+#guard
+  let c := Qed.Server.SetCookie.mkSafe "qed_session" "tok\r\nX-Evil: 1" (maxAge? := some 3600) (secure := true)
+  let s := c.render
+  s.contains "qed_session=tokX-Evil: 1" &&
+  s.contains "HttpOnly" &&
+  s.contains "SameSite=Lax" &&
+  s.contains "Secure" &&
+  s.contains "Max-Age=3600" &&
+  !s.contains '\r' && !s.contains '\n'
+
+-- 29. `Http.parseRequestHead` detects `Accept-Encoding: gzip`
+#guard
+  match Qed.Server.Http.parseRequestHead "GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br, gzip, deflate".toUTF8 with
+  | .ok req => req.acceptsGzip == true
+  | .error _ => false
+
+#guard
+  match Qed.Server.Http.parseRequestHead "GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip;q=0".toUTF8 with
+  | .ok req => req.acceptsGzip == false
+  | .error _ => false
+
+-- 30. Per-route `<head>` metadata escaping & `ssrStatus` on `Qed.App`
+#guard
+  let hm : Qed.HeadMeta := {
+    title := some "Page </title><script>alert(1)</script>"
+    description := some "Desc \"quoted\" <tag>"
+    metaTags := [("og:title", "OG \"bad\"")]
+    canonical := some "https://example.com/posts/1"
+  }
+  let doc := Qed.renderDocument "Default" "<p>ok</p>" "/qed_host.mjs" (headMeta := hm)
+  doc.contains "<title>Page &lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>" &&
+  doc.contains "<meta name=\"description\" content=\"Desc &quot;quoted&quot; &lt;tag&gt;\">" &&
+  doc.contains "<meta name=\"og:title\" content=\"OG &quot;bad&quot;\">" &&
+  doc.contains "<link rel=\"canonical\" href=\"https://example.com/posts/1\">" &&
+  !doc.contains "<script>alert(1)</script>"
+
+-- Unsafe `javascript:` canonical URL is dropped by `safeCanonicalHref`
+#guard
+  let hm : Qed.HeadMeta := { canonical := some "javascript:alert(1)" }
+  let doc := Qed.renderDocument "Default" "<p>ok</p>" "/qed_host.mjs" (headMeta := hm)
+  !doc.contains "rel=\"canonical\"" && !doc.contains "javascript:"
+
+-- 31. Declarative `setCookie`, custom `http get/post`, and server-side `stream` SSE routes with invariants
+server WebEssentialsSrv:
+  state hits : Nat = 0
+  invariant hitsBounded: hits <= 1000
+
+  def login(token: String) -> String:
+    setCookie("qed_session", token)
+    return "ok"
+
+  http get "/robots.txt":
+    return Qed.Server.HttpResponse.text("User-agent: *\nAllow: /\n")
+
+  http post "/webhook":
+    requires ctx.isAuthenticated
+    atomic:
+      if hits < 1000:
+        hits += 1
+    setCookie(Qed.Server.SetCookie.mkSafe("wh_seen", "1"))
+    return Qed.Server.HttpResponse.json("{\"ok\":true}")
+
+  http post "/echo-cookie":
+    atomic:
+      if hits < 1000:
+        hits += 1
+    setCookie(Qed.Server.SetCookie.mkSafe("echo_ck", ctx.body))
+    return Qed.Server.HttpResponse.json("{\"ok\":true}")
+
+  stream "/events":
+    return [Qed.Server.SseEvent.msg("hello", some("greeting"), some("1")),
+            Qed.Server.SseEvent.msg("world")]
+
+-- 32. Negative: custom `http` route violating server `invariant` is rejected at compile time!
+/--
+error: Server invariant `hitsBounded` failed in `http POST /bad`:
+  • must satisfy:  hits + 5 <= 10
+
+Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant holds across every branch.
+-/
+#guard_msgs in
+server BadHttpRouteInv:
+  state hits : Nat = 0
+  invariant hitsBounded: hits <= 10
+  http post "/bad":
+    hits += 5
+    return Qed.Server.HttpResponse.text("oops")
 
 end ServerChecks

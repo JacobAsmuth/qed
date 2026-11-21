@@ -76,13 +76,33 @@ opaque sha256 (data : @& ByteArray) : IO ByteArray
 @[extern "qed_server_pbkdf2_sha256"]
 opaque pbkdf2HmacSha256 (password : @& ByteArray) (salt : @& ByteArray) (iterations : UInt32) : IO ByteArray
 
-/-- Executes a parameterized SQLite query against a pooled WAL connection and returns tagged JSON rows. -/
+/-- Compresses `data` into RFC 1952 gzip bytes using Qed's zero-dependency Rust DEFLATE encoder. -/
+@[extern "qed_server_gzip_compress"]
+opaque gzipCompress (data : @& ByteArray) : IO ByteArray
+
+/-- Executes a parameterized SQLite query against a pooled WAL writer or concurrent reader connection. -/
 @[extern "qed_server_sqlite_exec"]
 opaque sqliteExec (path : @& String) (sql : @& String) (paramsJson : @& String) : IO (Except String String)
 
 /-- Executes idempotent DDL statements (`CREATE TABLE IF NOT EXISTS ...`) on a pooled SQLite database. -/
 @[extern "qed_server_sqlite_ddl"]
 opaque sqliteDdl (path : @& String) (ddl : @& String) : IO (Except String Unit)
+
+/-- Begins a pinned SQLite `BEGIN IMMEDIATE` transaction and returns its transaction handle. -/
+@[extern "qed_server_sqlite_tx_begin"]
+opaque sqliteTxBegin (path : @& String) : IO (Except String UInt64)
+
+/-- Executes a parameterized query on a pinned SQLite transaction handle. -/
+@[extern "qed_server_sqlite_tx_exec"]
+opaque sqliteTxExec (txId : UInt64) (sql : @& String) (paramsJson : @& String) : IO (Except String String)
+
+/-- Commits a pinned SQLite transaction and releases the writer connection back to the pool. -/
+@[extern "qed_server_sqlite_tx_commit"]
+opaque sqliteTxCommit (txId : UInt64) : IO (Except String Unit)
+
+/-- Rolls back a pinned SQLite transaction and releases the writer connection back to the pool. -/
+@[extern "qed_server_sqlite_tx_rollback"]
+opaque sqliteTxRollback (txId : UInt64) : IO Unit
 
 /-- Acquires a pooled or fresh TCP/TLS (`rustls`) outbound stream. When `ssrfGuard != 0`,
     validates every DNS-resolved IP against Lean's verified `isBlockedIp` before `connect`.
@@ -104,6 +124,10 @@ opaque outboundReadSome (handle : UInt64) (maxBytes : UInt32) : IO (Except Strin
 
 @[extern "qed_server_outbound_upgrade_tls"]
 opaque outboundUpgradeTls (handle : UInt64) (host : @& String) : IO (Except String Unit)
+
+/-- Non-blocking liveness check (`MSG_PEEK | MSG_DONTWAIT`) on an idle pooled outbound connection. -/
+@[extern "qed_server_outbound_is_alive"]
+opaque outboundIsAlive (handle : UInt64) : IO Bool
 
 @[extern "qed_server_outbound_release"]
 opaque outboundRelease (handle : UInt64) (keepAlive : UInt8) : IO Unit

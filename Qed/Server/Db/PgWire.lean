@@ -1,3 +1,4 @@
+import Std.Data.HashMap.Basic
 import Qed.Server.Core
 import Qed.Server.Db.Core
 import Qed.Server.Net
@@ -467,18 +468,26 @@ private def authLoop (handle : UInt64) (cfg : PgConnParams)
             -- Skip ParameterStatus ('S'), BackendKeyData ('K'), NoticeResponse ('N')
             authLoop handle cfg b1 o1 clientNonce clientFirstBare fuel
 
+private def readyStatusByte (payload : ByteArray) : UInt8 :=
+  if h : 0 < payload.size then payload[0]'h else 0
+
+/-- Returns `(Except errMsg DbResult, remBuf, remOff, readyStatusByte)` where `readyStatusByte`
+    is `'I'` (`0x49`) when idle, `'T'` (`0x54`) inside a transaction, or `'E'` (`0x45`) on failed tx.
+    Returns `.error transportErr` on wire/EOF failure (connection must be evicted). -/
 private def collectQueryResultLoop (handle : UInt64) (buf : ByteArray) (off : Nat)
     (oids : Array Nat) (rows : Array DbRow) (affected : Nat) (err? : Option String) :
-    Nat → IO (Except String DbResult)
+    Nat → IO (Except String (Except String DbResult × ByteArray × Nat × UInt8))
   | 0 => return .error "postgres query response exceeded frame limit"
   | fuel + 1 => do
       match ← readNextFrame handle buf off 4096 with
       | .error e => return .error e
       | .ok (f, b1, o1) =>
           if f.tag == 0x5A then -- 'Z' ReadyForQuery
-            match err? with
-            | some e => return .error e
-            | none   => return .ok { rows, affected }
+            let status := readyStatusByte f.payload
+            let qRes := match err? with
+              | some e => Except.error e
+              | none   => Except.ok { rows, affected }
+            return .ok (qRes, b1, o1, status)
           else if f.tag == 0x45 then -- 'E' ErrorResponse
             collectQueryResultLoop handle b1 o1 oids rows affected (some (parseErrorResponse f.payload)) fuel
           else if f.tag == 0x54 then -- 'T' RowDescription
@@ -494,8 +503,49 @@ private def collectQueryResultLoop (handle : UInt64) (buf : ByteArray) (off : Na
             -- ParseComplete ('1'), BindComplete ('2'), NoData ('n'), NoticeResponse ('N'), EmptyQuery ('I')
             collectQueryResultLoop handle b1 o1 oids rows affected err? fuel
 
-private def connectPg (cfg : PgConnParams) : IO (Except String (UInt64 × ByteArray × Nat)) := do
-  -- Acquire fresh plain TCP socket (disable pool reuse since PG connections carry startup state).
+/-! ### Thread-Safe Per-DSN Connection Pool (`PgConn` & `pgPoolBox`) -/
+
+def PgSslMode.tag : PgSslMode → String
+  | .disable => "disable"
+  | .prefer  => "prefer"
+  | .require => "require"
+
+/-- Normalized connection-pool key uniquely identifying `(host, port, database, user, sslMode, password)`. -/
+def PgConnParams.poolKey (cfg : PgConnParams) : String :=
+  s!"{cfg.user}:{cfg.password}@{cfg.host.toLower}:{cfg.port}/{cfg.database}?ssl={cfg.sslMode.tag}"
+
+structure PgConn where
+  poolKey    : String
+  handle     : UInt64
+  buf        : ByteArray
+  off        : Nat
+  txStatus   : UInt8 := 0x49 -- 'I' idle
+  healthy    : Bool := true
+
+private structure PgPooledEntry where
+  handle     : UInt64
+  buf        : ByteArray
+  off        : Nat
+  lastUsedMs : Nat
+
+private def pgPoolMaxIdlePerDsn : Nat := 8
+private def pgPoolIdleTimeoutMs : Nat := 60000
+
+initialize pgPoolBox : IO.Ref (Std.HashMap String (Array PgPooledEntry)) ←
+  IO.mkRef {}
+
+private def closePgHandle (handle : UInt64) (sendTerm : Bool := true) : IO Unit := do
+  if sendTerm then
+    discard <| Prim.outboundWriteAll handle encodeTerminate
+  Prim.outboundRelease handle 0
+
+private def closeHandlesList : List UInt64 → IO Unit
+  | [] => pure ()
+  | h :: hs => do
+      closePgHandle h true
+      closeHandlesList hs
+
+private def connectPg (cfg : PgConnParams) : IO (Except String PgConn) := do
   match ← Prim.outboundAcquire 0 cfg.host cfg.port 0 (fun _ => false) with
   | .error e => return .error s!"postgres connect failed: {e}"
   | .ok (handleNat, _) =>
@@ -532,41 +582,162 @@ private def connectPg (cfg : PgConnParams) : IO (Except String (UInt64 × ByteAr
               Prim.outboundRelease handle 0
               return .error s!"postgres auth failed: {e}"
           | .ok (b, o) =>
-              return .ok (handle, b, o)
+              return .ok { poolKey := cfg.poolKey, handle, buf := b, off := o, txStatus := 0x49, healthy := true }
 
-/-- Executes a single parameterized SQL query over PostgreSQL Extended Query Protocol (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`). -/
+private def popPoolCandidate (key : String) (nowMs : Nat) :
+    IO (Option PgPooledEntry × List UInt64) :=
+  pgPoolBox.modifyGet fun m =>
+    match m[key]? with
+    | none => ((none, []), m)
+    | some arr =>
+        let (live, expired) := arr.foldl (init := (#[], [])) fun (l, ex) e =>
+          if nowMs - e.lastUsedMs ≤ pgPoolIdleTimeoutMs then (l.push e, ex)
+          else (l, e.handle :: ex)
+        if h : live.size > 0 then
+          let picked := live[live.size - 1]
+          let rest := live.pop
+          let m' := if rest.isEmpty then m.erase key else m.insert key rest
+          ((some picked, expired), m')
+        else
+          ((none, expired), m.erase key)
+
+private def acquirePooledLoop (cfg : PgConnParams) (key : String) (nowMs : Nat) :
+    Nat → IO (Except String (PgConn × Bool))
+  | 0 => do
+      match ← connectPg cfg with
+      | .ok c    => return .ok (c, false)
+      | .error e => return .error e
+  | fuel + 1 => do
+      let (cand?, expired) ← popPoolCandidate key nowMs
+      closeHandlesList expired
+      match cand? with
+      | none =>
+          match ← connectPg cfg with
+          | .ok c    => return .ok (c, false)
+          | .error e => return .error e
+      | some entry =>
+          if entry.off >= entry.buf.size && (← Prim.outboundIsAlive entry.handle) then
+            return .ok ({
+              poolKey := key, handle := entry.handle, buf := ByteArray.empty, off := 0,
+              txStatus := 0x49, healthy := true
+            }, true)
+          else
+            closePgHandle entry.handle false
+            acquirePooledLoop cfg key nowMs fuel
+
+/-- Acquires a live, authenticated PostgreSQL connection from the per-DSN pool (or opens one). -/
+def acquireConn (cfg : PgConnParams) : IO (Except String (PgConn × Bool)) := do
+  let nowMs := (← Prim.nowMs).toNat
+  acquirePooledLoop cfg cfg.poolKey nowMs (pgPoolMaxIdlePerDsn + 2)
+
+/-- Returns a healthy idle (`ReadyForQuery` `'I'`) PostgreSQL connection to the bounded per-DSN pool,
+    or closes it cleanly if broken, mid-transaction, or over the pool's idle cap. -/
+def releaseConn (conn : PgConn) : IO Unit := do
+  if !conn.healthy || conn.txStatus != 0x49 || conn.off < conn.buf.size then
+    closePgHandle conn.handle conn.healthy
+    return
+  let nowMs := (← Prim.nowMs).toNat
+  let entry : PgPooledEntry := { handle := conn.handle, buf := ByteArray.empty, off := 0, lastUsedMs := nowMs }
+  let evicted ← pgPoolBox.modifyGet fun m =>
+    let cur := m[conn.poolKey]?.getD #[]
+    let (live, expired) := cur.foldl (init := (#[], [])) fun (l, ex) e =>
+      if nowMs - e.lastUsedMs ≤ pgPoolIdleTimeoutMs then (l.push e, ex)
+      else (l, e.handle :: ex)
+    if live.size < pgPoolMaxIdlePerDsn then
+      (expired, m.insert conn.poolKey (live.push entry))
+    else
+      -- Evict oldest entry (index 0) and push newest
+      let (evictedOld, kept) :=
+        if h : 0 < live.size then (live[0].handle :: expired, live.extract 1 live.size)
+        else (expired, live)
+      (evictedOld, m.insert conn.poolKey (kept.push entry))
+  closeHandlesList evicted
+
+/-- Executes a parameterized query on an already-acquired `PgConn` (used by both pooled queries and transactions). -/
+def execOnConn (conn : PgConn) (sql : String) (params : Array SqlVal) :
+    IO (Except String (DbResult × PgConn) × PgConn) := do
+  let wire := encodeParse sql ++ encodeBind params ++ encodeDescribePortal ++ encodeExecute ++ encodeSync
+  match ← Prim.outboundWriteAll conn.handle wire with
+  | .error e =>
+      let dead := { conn with healthy := false }
+      return (.error s!"postgres query write failed: {e}", dead)
+  | .ok () =>
+      match ← collectQueryResultLoop conn.handle conn.buf conn.off #[] #[] 0 none 65536 with
+      | .error transportErr =>
+          let dead := { conn with healthy := false }
+          return (.error transportErr, dead)
+      | .ok (qRes, b', o', status) =>
+          let conn' := { conn with buf := b', off := o', txStatus := status, healthy := true }
+          match qRes with
+          | .ok r    => return (.ok (r, conn'), conn')
+          | .error e => return (.error e, conn')
+
+/-- Executes a Simple Query Protocol (`'Q'`) statement (e.g. DDL, `BEGIN`, `COMMIT`, `ROLLBACK`) on `conn`. -/
+def execSimpleOnConn (conn : PgConn) (sql : String) : IO (Except String PgConn × PgConn) := do
+  match ← Prim.outboundWriteAll conn.handle (encodeSimpleQuery sql) with
+  | .error e =>
+      let dead := { conn with healthy := false }
+      return (.error s!"postgres simple query write failed: {e}", dead)
+  | .ok () =>
+      match ← collectQueryResultLoop conn.handle conn.buf conn.off #[] #[] 0 none 4096 with
+      | .error transportErr =>
+          let dead := { conn with healthy := false }
+          return (.error transportErr, dead)
+      | .ok (qRes, b', o', status) =>
+          let conn' := { conn with buf := b', off := o', txStatus := status, healthy := true }
+          match qRes with
+          | .ok _    => return (.ok conn', conn')
+          | .error e => return (.error e, conn')
+
+private def execParameterizedAttempt (cfg : PgConnParams) (sql : String) (params : Array SqlVal) :
+    Nat → IO (Except String DbResult)
+  | 0 => return .error "postgres query failed after retry"
+  | attemptsLeft + 1 => do
+      match ← acquireConn cfg with
+      | .error e => return .error e
+      | .ok (conn, wasReused) =>
+          let (res, conn') ← execOnConn conn sql params
+          match res with
+          | .ok (dbRes, cFinal) =>
+              releaseConn cFinal
+              return .ok dbRes
+          | .error e =>
+              releaseConn conn'
+              -- If a pooled connection broke mid-flight, retry once on a fresh connection.
+              if !conn'.healthy && wasReused && attemptsLeft > 0 then
+                execParameterizedAttempt cfg sql params attemptsLeft
+              else
+                return .error e
+
+/-- Executes a single parameterized SQL query over PostgreSQL Extended Query Protocol (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`),
+    reusing authenticated pooled connections per DSN. -/
 def execParameterized (pgUrl : String) (sql : String) (params : Array SqlVal) : IO (Except String DbResult) := do
   let cfg ← match parsePgUrl pgUrl with
     | .ok c => pure c
     | .error e => return .error e
-  match ← connectPg cfg with
-  | .error e => return .error e
-  | .ok (handle, buf, off) =>
-      let wire := encodeParse sql ++ encodeBind params ++ encodeDescribePortal ++ encodeExecute ++ encodeSync
-      let res ← match ← Prim.outboundWriteAll handle wire with
-        | .error e => pure (.error s!"postgres query write failed: {e}")
-        | .ok () => collectQueryResultLoop handle buf off #[] #[] 0 none 65536
-      let _ ← Prim.outboundWriteAll handle encodeTerminate
-      Prim.outboundRelease handle 0
-      return res
+  execParameterizedAttempt cfg sql params 2
 
-/-- Executes DDL statements over PostgreSQL Simple Query Protocol (`'Q'`). -/
+/-- Closes and evicts all idle pooled PostgreSQL connections cleanly. -/
+def clearPool : IO Unit := do
+  let handles ← pgPoolBox.modifyGet fun m =>
+    let all := m.toList.foldl (init := []) fun acc (_, arr) =>
+      arr.foldl (init := acc) fun a e => e.handle :: a
+    (all, {})
+  closeHandlesList handles
+
+/-- Executes DDL statements over PostgreSQL Simple Query Protocol (`'Q'`) using the connection pool. -/
 def execDdl (pgUrl : String) (ddl : String) : IO (Except String Unit) := do
   if ddl.trimAscii.toString.isEmpty then return .ok ()
   let cfg ← match parsePgUrl pgUrl with
     | .ok c => pure c
     | .error e => return .error e
-  match ← connectPg cfg with
+  match ← acquireConn cfg with
   | .error e => return .error e
-  | .ok (handle, buf, off) =>
-      let res ← match ← Prim.outboundWriteAll handle (encodeSimpleQuery ddl) with
-        | .error e => pure (.error s!"postgres DDL write failed: {e}")
-        | .ok () =>
-            match ← collectQueryResultLoop handle buf off #[] #[] 0 none 4096 with
-            | .ok _ => pure (.ok ())
-            | .error e => pure (.error e)
-      let _ ← Prim.outboundWriteAll handle encodeTerminate
-      Prim.outboundRelease handle 0
-      return res
+  | .ok (conn, _) =>
+      let (res, conn') ← execSimpleOnConn conn ddl
+      releaseConn conn'
+      match res with
+      | .ok _    => return .ok ()
+      | .error e => return .error e
 
 end Qed.Server.Db.PgWire

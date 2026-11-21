@@ -26,6 +26,97 @@ const TOKEN_WAKE: u64 = 2;
 const RESP_503_WIRE: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 19\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nserver overloaded\r\n";
 
+// ---- Sharded Per-IP Token-Bucket Rate Limiter (Configurable via QED_RATE_LIMIT_RPS / BURST) ----
+
+const RL_SHARDS: usize = 16;
+const RL_MAX_ENTRIES_PER_SHARD: usize = 4096;
+
+struct IpBucket {
+    tokens_milli: u64,
+    last_ms: u64,
+}
+
+struct RateLimiter {
+    rps: u64,
+    burst_milli: u64,
+    epoch: Instant,
+    shards: [Mutex<HashMap<String, IpBucket>>; RL_SHARDS],
+}
+
+impl RateLimiter {
+    fn from_env() -> Option<Arc<Self>> {
+        let rps = std::env::var("QED_RATE_LIMIT_RPS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if rps == 0 {
+            return None;
+        }
+        let burst = std::env::var("QED_RATE_LIMIT_BURST")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&b| b > 0)
+            .unwrap_or_else(|| rps.saturating_mul(2).max(1));
+        let shards = std::array::from_fn(|_| Mutex::new(HashMap::new()));
+        Some(Arc::new(Self {
+            rps,
+            burst_milli: burst.saturating_mul(1000),
+            epoch: Instant::now(),
+            shards,
+        }))
+    }
+
+    #[inline]
+    fn shard_idx(ip: &str) -> usize {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in ip.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        (h as usize) & (RL_SHARDS - 1)
+    }
+
+    fn check(&self, ip: &str) -> Result<(), u64> {
+        let now_ms = self.epoch.elapsed().as_millis() as u64;
+        let shard = &self.shards[Self::shard_idx(ip)];
+        let mut map = lock_unpoison(shard);
+        if !map.contains_key(ip) && map.len() >= RL_MAX_ENTRIES_PER_SHARD {
+            let cutoff = now_ms.saturating_sub(60_000);
+            map.retain(|_, b| b.last_ms >= cutoff);
+            if map.len() >= RL_MAX_ENTRIES_PER_SHARD {
+                if let Some(oldest_k) = map.iter().min_by_key(|(_, b)| b.last_ms).map(|(k, _)| k.clone()) {
+                    map.remove(&oldest_k);
+                }
+            }
+        }
+        let bucket = map.entry(ip.to_owned()).or_insert(IpBucket {
+            tokens_milli: self.burst_milli,
+            last_ms: now_ms,
+        });
+        let elapsed_ms = now_ms.saturating_sub(bucket.last_ms);
+        if elapsed_ms > 0 {
+            let add = elapsed_ms.saturating_mul(self.rps);
+            bucket.tokens_milli = bucket.tokens_milli.saturating_add(add).min(self.burst_milli);
+            bucket.last_ms = now_ms;
+        }
+        if bucket.tokens_milli >= 1000 {
+            bucket.tokens_milli -= 1000;
+            Ok(())
+        } else {
+            let deficit = 1000 - bucket.tokens_milli;
+            let per_sec = self.rps.saturating_mul(1000).max(1);
+            let retry_after = deficit.div_ceil(per_sec).max(1);
+            Err(retry_after)
+        }
+    }
+}
+
+fn format_429_wire(retry_after: u64) -> String {
+    format!(
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 19\r\nRetry-After: {retry_after}\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\ntoo many requests\r\n"
+    )
+}
+
 static STOP: AtomicBool = AtomicBool::new(false);
 static INBOXES: RwLock<Vec<Arc<WorkerInbox>>> = RwLock::new(Vec::new());
 
@@ -848,6 +939,7 @@ struct Worker {
     inbox: Arc<WorkerInbox>,
     pool: Arc<BlockingPool>,
     cbs: Arc<Callbacks>,
+    rate_limiter: Option<Arc<RateLimiter>>,
     next_token: u64,
     conns: HashMap<u64, Conn>,
     topics: HashMap<String, TopicSubs>,
@@ -1172,6 +1264,19 @@ impl Worker {
                     return;
                 }
             };
+            if let Some(rl) = &self.rate_limiter {
+                let is_health = slice[..head_end].starts_with(b"GET /_qed/health ");
+                if !is_health {
+                    if let Err(retry_after) = rl.check(&conn.ip) {
+                        let resp = format_429_wire(retry_after);
+                        let sent = conn.queue_bytes(&self.poller, resp.as_bytes());
+                        conn.close_after_tx = true;
+                        let close_now = !sent || conn.tx.is_empty();
+                        if close_now { self.close_conn(token); }
+                        return;
+                    }
+                }
+            }
             let trailing_slice = if consume_len < slice.len() && slice.len() - consume_len <= 65536 {
                 &slice[consume_len..]
             } else {
@@ -1359,7 +1464,8 @@ pub unsafe extern "C" fn qed_server_run(
     );
     let _ = io::stdout().flush();
 
-    let run_worker = |lfd: libc::c_int, inbox: Arc<WorkerInbox>, pool_c: Arc<BlockingPool>, cbs_c: Arc<Callbacks>| {
+    let rate_limiter = RateLimiter::from_env();
+    let run_worker = |lfd: libc::c_int, inbox: Arc<WorkerInbox>, pool_c: Arc<BlockingPool>, cbs_c: Arc<Callbacks>, rl_c: Option<Arc<RateLimiter>>| {
         let Ok(poller) = Poller::new() else {
             eprintln!("✗ failed to initialize poller");
             unsafe { libc::close(lfd) };
@@ -1373,6 +1479,7 @@ pub unsafe extern "C" fn qed_server_run(
             inbox,
             pool: pool_c,
             cbs: cbs_c,
+            rate_limiter: rl_c,
             next_token: 16,
             conns: HashMap::new(),
             topics: HashMap::new(),
@@ -1380,20 +1487,20 @@ pub unsafe extern "C" fn qed_server_run(
     };
 
     let handles: Vec<_> = (1..num_workers).map(|i| {
-        let (inbox, pool_c, cbs_c) = (inboxes[i as usize].clone(), pools[i as usize].clone(), cbs.clone());
+        let (inbox, pool_c, cbs_c, rl_c) = (inboxes[i as usize].clone(), pools[i as usize].clone(), cbs.clone(), rate_limiter.clone());
         #[cfg(not(target_os = "linux"))]
         let shared_fd = libc::dup(first_fd);
         thread::spawn(move || {
             unsafe { lean_initialize_thread() };
             #[cfg(target_os = "linux")]
             match create_listener(bind_ip, port, true) {
-                Ok(lfd) => run_worker(lfd, inbox, pool_c, cbs_c),
+                Ok(lfd) => run_worker(lfd, inbox, pool_c, cbs_c, rl_c),
                 Err(e) => eprintln!("✗ worker {i} failed to bind {bind_ip}:{port}: {e}"),
             }
             #[cfg(not(target_os = "linux"))]
             {
                 if shared_fd >= 0 {
-                    run_worker(shared_fd, inbox, pool_c, cbs_c);
+                    run_worker(shared_fd, inbox, pool_c, cbs_c, rl_c);
                 } else {
                     eprintln!("✗ worker {i} failed to dup listener socket");
                 }
@@ -1402,7 +1509,7 @@ pub unsafe extern "C" fn qed_server_run(
         })
     }).collect();
 
-    run_worker(first_fd, inboxes[0].clone(), pools[0].clone(), cbs.clone());
+    run_worker(first_fd, inboxes[0].clone(), pools[0].clone(), cbs.clone(), rate_limiter);
     STOP.store(true, Ordering::SeqCst);
     for inbox in &inboxes { inbox.force_wake(); }
     for h in handles { let _ = h.join(); }

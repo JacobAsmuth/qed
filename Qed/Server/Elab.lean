@@ -267,6 +267,92 @@ private def elabServerFnClause (priorRep priorUnrep : Nat)
   return some (info, arm, extRoots)
 
 open Lean Elab Command in
+private def elabServerHttpRouteClause (priorRep priorUnrep : Nat)
+    (srvName fullSrvName : Name) (hasState : Bool)
+    (stateId stateInvId ctxId : Ident)
+    (envIdents : Array Ident) (envTypes : Array Term)
+    (stateFieldNames envVarNames : Array String)
+    (dbBindings : Array (String × DatabaseInfo))
+    (invs : Array ParsedInv) (mutInvs : Array ParsedMutInv)
+    (chanSigs : Array SrvChanSig) (routeIdx : Nat) (existingRoutes : Array (String × String))
+    (deferredProofs : IO.Ref (Array (CommandElabM Bool)))
+    (hc : Syntax) :
+    CommandElabM (Option ((String × String) × TSyntax ``Lean.Parser.Term.matchAltExpr × Array Name)) := do
+  let isStream := hc.getKind == ``srvStreamClause
+  let methodStr := if isStream then "GET" else (hc.getArg 1).getId.toString.toUpper
+  let pathStx := if isStream then hc.getArg 1 else hc.getArg 2
+  let pathStr := (⟨pathStx⟩ : TSyntax `str).getString
+  if !pathStr.startsWith "/" then
+    throwErrorAt pathStx s!"custom HTTP route path `{pathStr}` must start with `/`"
+  if pathStr.startsWith "/_qed/" then
+    throwErrorAt pathStx s!"custom HTTP route path `{pathStr}` cannot use reserved `/_qed/` prefix"
+  if existingRoutes.any (fun (m, p) => m == methodStr && p == pathStr) then
+    throwErrorAt pathStx s!"duplicate custom HTTP route `{methodStr} {pathStr}` in `server {srvName}`"
+
+  let contractStx := if isStream then hc.getArg 3 else hc.getArg 4
+  let bodyStmts := (if isStream then hc.getArg 4 else hc.getArg 5).getArgs
+  let mut reqExprs : Array Syntax := #[]
+  for cl in contractStx.getArgs do
+    if cl.getKind == ``srvRequiresLine then
+      reqExprs := reqExprs ++ (cl.getArg 1).getSepArgs
+    else
+      throwErrorAt cl "only `requires` contracts are supported on `http` / `stream` routes"
+
+  let routeLeaf := Name.mkSimple s!"_http_{routeIdx}"
+  let routeIdent := mkIdentFrom pathStx routeLeaf
+  let routeLabel := if isStream then s!"stream {pathStr}" else s!"http {methodStr} {pathStr}"
+  if !blockAlwaysReturns bodyStmts then
+    throwErrorAt pathStx s!"missing `return` on fallthrough path of `{routeLabel}`"
+
+  let reqs ← elabRequiresClauses routeIdent srvName fullSrvName routeLeaf routeLabel "_hHttpReq" "_req"
+    stateFieldNames envVarNames #[] #[] #[] #[] reqExprs (trackAuth := true)
+
+  let payloadTerm : Term ←
+    if isStream then `(Array Qed.Server.SseEvent) else `(Qed.Server.HttpResponse)
+  let errTyTerm : Term ← `(Qed.Server.ApiError)
+
+  let hasAwait := blockHasAwait bodyStmts
+  let baseCtx : LowerCtx := {
+    fnName := routeLabel, stateFields := stateFieldNames, envVars := envVarNames, locals := #[]
+    stateRule := if hasState then .pureStep (mkIdent `_s0) else .statelessServer
+    allowAwait := hasAwait, allowUnwrap := true
+    hasFallible := true, isOption := false, innerOptTy? := none
+    domainErrTy? := none, channels := chanSigs, dbs := dbBindings
+  }
+  let allBinderIds := envIdents ++ #[ctxId] ++ reqs.reqHypIds
+  let allBinderTys := envTypes ++ #[← `(Qed.Server.RequestCtx)] ++ reqs.reqHypTys
+  let callArgs : Array Term := envIdents.map (⟨·.raw⟩) ++ #[⟨ctxId.raw⟩] ++ reqs.reqHypIds.map (⟨·.raw⟩)
+
+  let (runExpr, bodyExtRoots) ←
+    if hasState && !hasAwait then
+      let some (re, _, er) ← elabServerPureFn priorRep priorUnrep srvName routeLabel routeIdent stateId stateInvId
+          allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
+          invs mutInvs stateFieldNames envVarNames none deferredProofs | return none
+      pure (re, er)
+    else if hasState && hasAwait then
+      let some (re, _, er) ← elabServerAsyncFn priorRep priorUnrep srvName routeLabel routeIdent stateId stateInvId
+          allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
+          invs mutInvs stateFieldNames envVarNames none deferredProofs | return none
+      pure (re, er)
+    else
+      let some (_, _, hApp, er, _) ← elabStatelessHandler priorRep priorUnrep routeIdent srvName routeLeaf
+          allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts | return none
+      pure (hApp, er)
+
+  let extRoots := reqs.extRoots ++ bodyExtRoots.filter (!reqs.extRoots.contains ·)
+  let wrappedRun ←
+    if isStream then
+      `($runExpr >>= fun _httpRes => Pure.pure (_httpRes.map (fun _evs => Option.some (Qed.Server.HttpResponse.sse _evs.toList))))
+    else
+      `($runExpr >>= fun _httpRes => Pure.pure (_httpRes.map Option.some))
+  let guardedRun ← wrapReqs reqs.reqPropTerms reqs.reqHypIds reqs.reqLabels wrappedRun
+  let methodLit := Syntax.mkStrLit methodStr
+  let pathLit := Syntax.mkStrLit pathStr
+  let arm ← `(Lean.Parser.Term.matchAltExpr|
+    | $methodLit, $pathLit => $guardedRun)
+  return some ((methodStr, pathStr), arm, extRoots)
+
+open Lean Elab Command in
 private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun stx => do
   let srvIdent : Ident := ⟨(stx.getArg 1)⟩
   let srvName := srvIdent.getId
@@ -325,9 +411,20 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
     wsDispatchArms := wsDispatchArms ++ chArms
     allExtRoots := allExtRoots ++ er.filter (!allExtRoots.contains ·)
 
+  let mut httpRoutes : Array (String × String) := #[]
+  let mut httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
+  for (hc, idx) in parsed.httpClauses.zipIdx do
+    let some (rt, arm, er) ← elabServerHttpRouteClause priorRep priorUnrep
+        srvName fullSrvName hasState stateId stateInvId ctxId
+        envIdents envTypes stateFieldNames envVarNames dbBindings parsed.invs parsed.mutInvs chanSigs
+        idx httpRoutes deferredProofs hc | return
+    httpRoutes := httpRoutes.push rt
+    httpDispatchArms := httpDispatchArms.push arm
+    allExtRoots := allExtRoots ++ er.filter (!allExtRoots.contains ·)
+
   elabServerDispatchCmds srvIdent stateId initStateId stateInvId invInitId
     srvName fullSrvName srvShort hasState parsed.dbDecls parsed.envDecls allExtRoots methodInfos dispatchArms
-    chanNames wsDispatchArms ctxId reqBytesId
+    chanNames wsDispatchArms ctxId reqBytesId httpDispatchArms
 
   -- Launch all method & channel proof theorems together in one parallel wave after all inductives/defs.
   for runProof in (← deferredProofs.get) do

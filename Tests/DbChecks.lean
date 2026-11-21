@@ -337,4 +337,226 @@ component BadClientQueryMut:
   view:
     <p>hi</p>
 
+/-! ## Extended Verified Database Layer: Richer SQL, FK Joins, Transactions & Migrations -/
+
+database ShopDb:
+  url secret("QED_TEST_SHOP_URL")
+  dev sqlite ".qed/shop_checks.db"
+
+  table authors:
+    id   : String primary_key where 1 <= id.length <= 64
+    name : String             where 1 <= name.length <= 120
+
+  table items:
+    id       : String primary_key where 1 <= id.length <= 64
+    authorId : String references authors(id)
+    ownerId  : String immutable   where 1 <= ownerId.length <= 64
+    title    : String             where 1 <= title.length <= 200
+    price    : Nat                where price <= 100000
+
+    policy read, write requires some(row.ownerId) == ctx.userId
+    index (ownerId, price)
+
+  table privateProfiles:
+    id      : String primary_key where 1 <= id.length <= 64
+    ownerId : String immutable   where 1 <= ownerId.length <= 64
+    bio     : String             where 1 <= bio.length <= 500
+
+    policy read, write requires some(row.ownerId) == ctx.userId
+
+  table secretLogs:
+    id        : String primary_key where 1 <= id.length <= 64
+    profileId : String references privateProfiles(id)
+    ownerId   : String immutable   where 1 <= ownerId.length <= 64
+    msg       : String             where 1 <= msg.length <= 200
+
+    policy read, write requires some(row.ownerId) == ctx.userId
+
+-- SQL injection closure for LIKE / startsWith / contains / IN / aggregate / joinSelect
+#guard
+  let q1 := Qed.Server.Db.SqlQuery.select ⟨"items", by decide⟩ [⟨"id", by decide⟩]
+    (.binOp .and (.startsWith (.col ⟨"title", by decide⟩) (.param (.text "Rust")))
+          (.binOp .and (.contains (.col ⟨"title", by decide⟩) (.param (.text "Lean")))
+                (.inList (.col ⟨"id", by decide⟩) [.text "a", .text "b"])))
+    (limit := some 10) (offset := some 5)
+  let q2 := Qed.Server.Db.SqlQuery.select ⟨"items", by decide⟩ [⟨"id", by decide⟩]
+    (.binOp .and (.startsWith (.col ⟨"title", by decide⟩) (.param (.text "'; DROP TABLE items; --")))
+          (.binOp .and (.contains (.col ⟨"title", by decide⟩) (.param (.text "%' OR 1=1 --")))
+                (.inList (.col ⟨"id", by decide⟩) [.text "'; DELETE FROM items;", .text "x"])))
+    (limit := some 10) (offset := some 5)
+  (q1.compile .postgres).1 == (q2.compile .postgres).1 &&
+  (q1.compile .sqlite).1 == (q2.compile .sqlite).1
+
+-- Pure schema diffing & migration safety checks
+#guard
+  let oldTbl : Qed.Server.Db.TableSchema := {
+    name := ⟨"items", by decide⟩
+    columns := [
+      { name := ⟨"id", by decide⟩, colType := .text, isPrimaryKey := true }
+    ]
+    indexes := []
+  }
+  let newTbl : Qed.Server.Db.TableSchema := {
+    name := ⟨"items", by decide⟩
+    columns := [
+      { name := ⟨"id", by decide⟩, colType := .text, isPrimaryKey := true },
+      { name := ⟨"notes", by decide⟩, colType := .text, nullable := true },
+      { name := ⟨"views", by decide⟩, colType := .int, nullable := false, checkSql? := some "\"views\" >= 0" }
+    ]
+    indexes := [[⟨"views", by decide⟩]]
+  }
+  let steps := Qed.Server.Db.diffTableSchemas [oldTbl] [newTbl]
+  let pgDdl := Qed.Server.Db.renderMigrationDdl .postgres steps
+  let sqDdl := Qed.Server.Db.renderMigrationDdl .sqlite steps
+  steps.length == 3 &&
+  (Qed.Server.Db.verifyMigrationSafe steps).isOk &&
+  pgDdl.contains "ADD COLUMN IF NOT EXISTS \"notes\" TEXT" &&
+  pgDdl.contains "ADD COLUMN IF NOT EXISTS \"views\" BIGINT NOT NULL DEFAULT 0" &&
+  sqDdl.contains "ADD COLUMN \"views\" INTEGER NOT NULL DEFAULT 0" &&
+  sqDdl.contains "CREATE INDEX IF NOT EXISTS \"idx_items_0\"" &&
+  (Qed.Server.Db.diffTableSchemas [newTbl] [newTbl]).isEmpty
+
+-- Unsafe additive migration (new non-nullable column with arbitrary CHECK) is rejected
+#guard
+  let unsafeCol : Qed.Server.Db.ColumnSchema := {
+    name := ⟨"code", by decide⟩, colType := .text, nullable := false,
+    checkSql? := some "LENGTH(\"code\") >= 4"
+  }
+  !(Qed.Server.Db.verifyMigrationSafe [.addColumn ⟨"items", by decide⟩ unsafeCol none]).isOk
+
+server ShopApi:
+  use db : ShopDb
+  state txOps : Nat = 0
+  invariant txOpsNonNeg: txOps >= 0
+
+  def searchItems(pfx: String, sub: String, pageOffset: Nat) -> ShopDb.items[]!:
+    requires ctx.userId != none
+    let uid = ctx.userId.getD("")
+    return await db.items.select(
+      where = r => r.ownerId == uid and r.title.startsWith(pfx) and r.title.contains(sub),
+      orderBy = "-price",
+      limit = 20,
+      offset = pageOffset
+    )?
+
+  def filterByIds(ids: String[]) -> ShopDb.items[]!:
+    requires ctx.userId != none
+    let uid = ctx.userId.getD("")
+    return await db.items.select(
+      where = r => r.ownerId == uid and ids.contains(r.id),
+      order_by = "id",
+      limit = 50,
+      offset = 0
+    )?
+
+  def totalInventoryValue() -> Nat!:
+    requires ctx.userId != none
+    let uid = ctx.userId.getD("")
+    return await db.items.sum(col = "price", where = r => r.ownerId == uid)?
+
+  def cheapestPrice() -> Nat?!:
+    requires ctx.userId != none
+    let uid = ctx.userId.getD("")
+    return await db.items.min(col = "price", where = r => r.ownerId == uid)?
+
+  def highestPrice() -> Nat?!:
+    requires ctx.userId != none
+    let uid = ctx.userId.getD("")
+    return await db.items.max(col = "price", where = r => r.ownerId == uid)?
+
+  def itemsWithAuthors() -> (ShopDb.items, ShopDb.authors)[]!:
+    requires ctx.userId != none
+    let uid = ctx.userId.getD("")
+    return await db.items.join(
+      table = authors,
+      where = r => r.ownerId == uid,
+      order_by = "-price",
+      limit = 25,
+      offset = 0
+    )?
+
+  def logsWithProfiles() -> (ShopDb.secretLogs, ShopDb.privateProfiles)[]!:
+    requires ctx.userId != none
+    let uid = ctx.userId.getD("")
+    return await db.secretLogs.join(
+      table = privateProfiles,
+      where = r => r.ownerId == uid,
+      rightWhere = p => p.ownerId == uid
+    )?
+
+  def createAuthorAndItem(aid: String, aname: String, iid: String, title: String, price: Nat) -> ShopDb.items!:
+    requires ctx.userId != none
+    requires 1 <= aid.length <= 64, 1 <= aname.length <= 120
+    requires 1 <= iid.length <= 64, 1 <= title.length <= 200, price <= 100000
+    ensures result.id == iid, result.price == price
+    let uid = ctx.userId.getD("")
+    if not (1 <= uid.length <= 64): return fail(.badUser)
+    transaction db:
+      let _a = await db.authors.insert(id = aid, name = aname)?
+      let created = await db.items.insert(id = iid, authorId = aid, ownerId = uid, title = title, price = price)?
+      atomic:
+        txOps += 1
+      return created
+
+  def createPairDotSyntax(aid: String, aname: String, iid: String, title: String, price: Nat) -> ShopDb.items!:
+    requires ctx.userId != none
+    requires 1 <= aid.length <= 64, 1 <= aname.length <= 120
+    requires 1 <= iid.length <= 64, 1 <= title.length <= 200, price <= 100000
+    ensures result.id == iid
+    let uid = ctx.userId.getD("")
+    if not (1 <= uid.length <= 64): return fail(.badUser)
+    db.transaction:
+      let _a = await db.authors.insert(id = aid, name = aname)?
+      if price == 99999:
+        return fail(.aborted)
+      let created = await db.items.insert(id = iid, authorId = aid, ownerId = uid, title = title, price = price)?
+      return created
+
+-- 13. Negative: aggregate (`sum`) without ReadPolicy proof is rejected
+/--
+error: Database read policy `ShopDb.items.read` failed in `leakSum → ShopDb.items.sum`:
+  • must prove: some ownerId = ctx.userId
+
+Hint: Ensure `where = r => ...` (together with `requires` / `if` guards) implies `some(row.ownerId) == ctx.userId`.
+-/
+#guard_msgs in
+server BadAggNoPolicy:
+  use db : ShopDb
+  def leakSum() -> Nat!:
+    return await db.items.sum(col = "price")?
+
+-- 14. Negative: FK `join` where right-hand table ReadPolicy is NOT satisfied is rejected!
+/--
+error: Database read policy `ShopDb.privateProfiles.read` (joined table) failed in `leakProfileJoin → ShopDb.secretLogs.join`:
+  • must prove: some ownerId = ctx.userId
+
+Hint: Ensure `right_where = r => ...` (together with `requires` / `if` guards) implies `some(row.ownerId) == ctx.userId`.
+-/
+#guard_msgs in
+server BadJoinRightPolicy:
+  use db : ShopDb
+  def leakProfileJoin() -> (ShopDb.secretLogs, ShopDb.privateProfiles)[]!:
+    requires ctx.userId != none
+    let uid = ctx.userId.getD("")
+    return await db.secretLogs.join(
+      table = privateProfiles,
+      where = r => r.ownerId == uid
+    )?
+
+-- 15. Negative: policy violation inside a `transaction db:` block is still rejected!
+/--
+error: Database insert policy `ShopDb.items.insert` failed in `badTxInsert → ShopDb.items.insert`:
+  • must prove: some "victim" = ctx.userId
+
+Hint: Ensure inserted row satisfies `some(row.ownerId) == ctx.userId`.
+-/
+#guard_msgs in
+server BadTxPolicy:
+  use db : ShopDb
+  def badTxInsert(aid: String, iid: String) -> ShopDb.items!:
+    requires ctx.userId != none
+    requires 1 <= aid.length <= 64, 1 <= iid.length <= 64
+    transaction db:
+      return await db.items.insert(id = iid, authorId = aid, ownerId = "victim", title = "oops", price = 10)?
+
 end DbChecks

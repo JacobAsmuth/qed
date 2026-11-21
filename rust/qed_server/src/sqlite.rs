@@ -1,25 +1,145 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use rusqlite::types::{Value, ValueRef};
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::{params_from_iter, Connection, OpenFlags};
 
 use crate::lean_ffi::*;
 use crate::lock_unpoison;
 
-static SQLITE_POOL: OnceLock<Mutex<HashMap<String, Arc<Mutex<Connection>>>>> = OnceLock::new();
+const MAX_READERS_PER_DB: usize = 16;
 
-fn open_connection(path: &str) -> Result<Arc<Mutex<Connection>>, String> {
+struct SqliteDbPool {
+    path: String,
+    is_memory: bool,
+    writer: Mutex<Option<Connection>>,
+    writer_cv: Condvar,
+    readers: Mutex<Vec<Connection>>,
+}
+
+impl SqliteDbPool {
+    fn checkout_writer(&self) -> Connection {
+        let mut guard = lock_unpoison(&self.writer);
+        loop {
+            if let Some(conn) = guard.take() {
+                return conn;
+            }
+            guard = self.writer_cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn return_writer(&self, conn: Connection) {
+        let mut guard = lock_unpoison(&self.writer);
+        *guard = Some(conn);
+        self.writer_cv.notify_one();
+    }
+
+    fn checkout_reader(&self) -> Result<Connection, String> {
+        {
+            let mut pool = lock_unpoison(&self.readers);
+            if let Some(conn) = pool.pop() {
+                return Ok(conn);
+            }
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(&self.path, flags)
+            .map_err(|e| format!("sqlite open read-only `{}` failed: {e}", self.path))?;
+        let _ = conn.busy_timeout(Duration::from_secs(5));
+        let _ = conn.execute_batch("PRAGMA query_only = ON;");
+        Ok(conn)
+    }
+
+    fn return_reader(&self, conn: Connection) {
+        let mut pool = lock_unpoison(&self.readers);
+        if pool.len() < MAX_READERS_PER_DB {
+            pool.push(conn);
+        }
+    }
+}
+
+struct WriterGuard<'a> {
+    pool: &'a SqliteDbPool,
+    conn: Option<Connection>,
+}
+
+impl<'a> WriterGuard<'a> {
+    fn acquire(pool: &'a SqliteDbPool) -> Self {
+        Self { pool, conn: Some(pool.checkout_writer()) }
+    }
+    fn conn_mut(&mut self) -> &mut Connection {
+        self.conn.as_mut().expect("writer checked out")
+    }
+}
+
+impl<'a> Drop for WriterGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.pool.return_writer(conn);
+        }
+    }
+}
+
+struct ReaderGuard<'a> {
+    pool: &'a SqliteDbPool,
+    conn: Option<Connection>,
+}
+
+impl<'a> ReaderGuard<'a> {
+    fn acquire(pool: &'a SqliteDbPool) -> Result<Self, String> {
+        Ok(Self { pool, conn: Some(pool.checkout_reader()?) })
+    }
+    fn conn_mut(&mut self) -> &mut Connection {
+        self.conn.as_mut().expect("reader checked out")
+    }
+}
+
+impl<'a> Drop for ReaderGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.pool.return_reader(conn);
+        }
+    }
+}
+
+struct ActiveSqliteTx {
+    pool: Arc<SqliteDbPool>,
+    conn: Option<Connection>,
+}
+
+impl Drop for ActiveSqliteTx {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let _ = conn.execute_batch("ROLLBACK;");
+            self.pool.return_writer(conn);
+        }
+    }
+}
+
+static SQLITE_POOL: OnceLock<Mutex<HashMap<String, Arc<SqliteDbPool>>>> = OnceLock::new();
+static ACTIVE_TXS: OnceLock<Mutex<HashMap<u64, Arc<Mutex<ActiveSqliteTx>>>>> = OnceLock::new();
+static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
+
+fn active_txs() -> &'static Mutex<HashMap<u64, Arc<Mutex<ActiveSqliteTx>>>> {
+    ACTIVE_TXS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_memory_path(path: &str) -> bool {
+    path == ":memory:" || path.is_empty() || path.contains("mode=memory") || path.starts_with("file::memory:")
+}
+
+fn open_db_pool(path: &str) -> Result<Arc<SqliteDbPool>, String> {
     let pool = SQLITE_POOL.get_or_init(|| Mutex::new(HashMap::new()));
     {
         let map = lock_unpoison(pool);
-        if let Some(conn) = map.get(path) {
-            return Ok(conn.clone());
+        if let Some(db) = map.get(path) {
+            return Ok(db.clone());
         }
     }
-    if path != ":memory:" {
+    let is_mem = is_memory_path(path);
+    if !is_mem {
         if let Some(parent) = Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
@@ -27,7 +147,7 @@ fn open_connection(path: &str) -> Result<Arc<Mutex<Connection>>, String> {
             }
         }
     }
-    let conn = if path == ":memory:" {
+    let conn = if is_mem {
         Connection::open_in_memory()
     } else {
         Connection::open(path)
@@ -35,9 +155,35 @@ fn open_connection(path: &str) -> Result<Arc<Mutex<Connection>>, String> {
     .map_err(|e| format!("sqlite open `{path}` failed: {e}"))?;
     let _ = conn.busy_timeout(Duration::from_secs(5));
     let _ = conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
-    let arc = Arc::new(Mutex::new(conn));
+    let arc = Arc::new(SqliteDbPool {
+        path: path.to_owned(),
+        is_memory: is_mem,
+        writer: Mutex::new(Some(conn)),
+        writer_cv: Condvar::new(),
+        readers: Mutex::new(Vec::new()),
+    });
     let mut map = lock_unpoison(pool);
     Ok(map.entry(path.to_owned()).or_insert_with(|| arc.clone()).clone())
+}
+
+/// Returns true iff `sql` is a pure single-statement `SELECT` query safe to execute on the
+/// concurrent read-only WAL reader pool (no write ops, no `RETURNING`, no stacked statements).
+fn is_readonly_select(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    if trimmed.contains(';') {
+        return false;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    let starts_select = upper.starts_with("SELECT ") || upper.starts_with("SELECT\t") || upper.starts_with("SELECT\n");
+    if !starts_select {
+        return false;
+    }
+    // Reject any mutating clauses (e.g. CTE writes or RETURNING)
+    const WRITE_TOKENS: &[&str] = &[
+        "INSERT ", "UPDATE ", "DELETE ", "REPLACE ", "DROP ", "ALTER ",
+        "CREATE ", "ATTACH ", "DETACH ", "VACUUM", "REINDEX", "RETURNING",
+    ];
+    !WRITE_TOKENS.iter().any(|kw| upper.contains(kw))
 }
 
 // ---- Minimal Zero-Dep Tagged JSON Codec for `SqlVal` ----
@@ -259,6 +405,36 @@ fn push_sqlite_val_json(out: &mut String, v: ValueRef<'_>) {
     }
 }
 
+fn exec_on_conn(conn: &Connection, sql: &str, params: &[Value]) -> Result<String, String> {
+    let mut stmt = conn.prepare_cached(sql).map_err(|e| format!("sqlite prepare failed: {e}"))?;
+    let col_count = stmt.column_count();
+    if col_count > 0 {
+        let mut rows = stmt.query(params_from_iter(params.iter()))
+            .map_err(|e| format!("sqlite query failed: {e}"))?;
+        let mut out = String::from("{\"rows\":[");
+        let mut row_count: usize = 0;
+        while let Some(row) = rows.next().map_err(|e| format!("sqlite step failed: {e}"))? {
+            if row_count > 0 { out.push(','); }
+            out.push('[');
+            for ci in 0..col_count {
+                if ci > 0 { out.push(','); }
+                let v = row.get_ref(ci).map_err(|e| format!("sqlite col {ci} failed: {e}"))?;
+                push_sqlite_val_json(&mut out, v);
+            }
+            out.push(']');
+            row_count += 1;
+        }
+        out.push_str("],\"affected\":");
+        out.push_str(&row_count.to_string());
+        out.push('}');
+        Ok(out)
+    } else {
+        let affected = stmt.execute(params_from_iter(params.iter()))
+            .map_err(|e| format!("sqlite execute failed: {e}"))?;
+        Ok(format!("{{\"rows\":[],\"affected\":{affected}}}"))
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_sqlite_exec(
     path_obj: *mut LeanObj,
@@ -272,34 +448,13 @@ pub unsafe extern "C" fn qed_server_sqlite_exec(
     let res: Result<String, String> = (|| {
         let mut cur = JsonCursor::new(params_json);
         let params = cur.parse_params_array()?;
-        let conn_arc = open_connection(path)?;
-        let conn = lock_unpoison(&conn_arc);
-        let mut stmt = conn.prepare_cached(sql).map_err(|e| format!("sqlite prepare failed: {e}"))?;
-        let col_count = stmt.column_count();
-        if col_count > 0 {
-            let mut rows = stmt.query(params_from_iter(params.iter()))
-                .map_err(|e| format!("sqlite query failed: {e}"))?;
-            let mut out = String::from("{\"rows\":[");
-            let mut row_count: usize = 0;
-            while let Some(row) = rows.next().map_err(|e| format!("sqlite step failed: {e}"))? {
-                if row_count > 0 { out.push(','); }
-                out.push('[');
-                for ci in 0..col_count {
-                    if ci > 0 { out.push(','); }
-                    let v = row.get_ref(ci).map_err(|e| format!("sqlite col {ci} failed: {e}"))?;
-                    push_sqlite_val_json(&mut out, v);
-                }
-                out.push(']');
-                row_count += 1;
-            }
-            out.push_str("],\"affected\":");
-            out.push_str(&row_count.to_string());
-            out.push('}');
-            Ok(out)
+        let db = open_db_pool(path)?;
+        if !db.is_memory && is_readonly_select(sql) {
+            let mut reader = ReaderGuard::acquire(&db)?;
+            exec_on_conn(reader.conn_mut(), sql, &params)
         } else {
-            let affected = stmt.execute(params_from_iter(params.iter()))
-                .map_err(|e| format!("sqlite execute failed: {e}"))?;
-            Ok(format!("{{\"rows\":[],\"affected\":{affected}}}"))
+            let mut writer = WriterGuard::acquire(&db);
+            exec_on_conn(writer.conn_mut(), sql, &params)
         }
     })();
 
@@ -317,12 +472,96 @@ pub unsafe extern "C" fn qed_server_sqlite_ddl(
     let path = str_slice(path_obj);
     let ddl = str_slice(ddl_obj);
     let res: Result<(), String> = (|| {
-        let conn_arc = open_connection(path)?;
-        let conn = lock_unpoison(&conn_arc);
-        conn.execute_batch(ddl).map_err(|e| format!("sqlite ddl failed: {e}"))
+        let db = open_db_pool(path)?;
+        let mut writer = WriterGuard::acquire(&db);
+        let r = writer.conn_mut().execute_batch(ddl).map_err(|e| format!("sqlite ddl failed: {e}"));
+        // Drop cached read-only connections so schema changes are immediately visible cleanly.
+        lock_unpoison(&db.readers).clear();
+        r
     })();
     match res {
         Ok(()) => mk_io_except_ok(qed_lean_box(0)),
         Err(e) => mk_io_except_err(&e),
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_sqlite_tx_begin(path_obj: *mut LeanObj) -> *mut LeanObj {
+    let path = str_slice(path_obj);
+    let res: Result<u64, String> = (|| {
+        let db = open_db_pool(path)?;
+        let conn = db.checkout_writer();
+        if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE;") {
+            db.return_writer(conn);
+            return Err(format!("sqlite BEGIN failed: {e}"));
+        }
+        let tx_id = NEXT_TX_ID.fetch_add(1, Ordering::Relaxed).max(1);
+        let tx = Arc::new(Mutex::new(ActiveSqliteTx { pool: db, conn: Some(conn) }));
+        lock_unpoison(active_txs()).insert(tx_id, tx);
+        Ok(tx_id)
+    })();
+    match res {
+        Ok(tx_id) => mk_io_except_ok(qed_lean_box_u64(tx_id)),
+        Err(e) => mk_io_except_err(&e),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_sqlite_tx_exec(
+    tx_id: u64,
+    sql_obj: *mut LeanObj,
+    params_json_obj: *mut LeanObj,
+) -> *mut LeanObj {
+    let sql = str_slice(sql_obj);
+    let params_json = str_slice(params_json_obj);
+    let res: Result<String, String> = (|| {
+        let mut cur = JsonCursor::new(params_json);
+        let params = cur.parse_params_array()?;
+        let tx_arc = lock_unpoison(active_txs())
+            .get(&tx_id)
+            .cloned()
+            .ok_or_else(|| format!("invalid sqlite transaction handle {tx_id}"))?;
+        let tx = lock_unpoison(&tx_arc);
+        let conn = tx.conn.as_ref().ok_or_else(|| "sqlite transaction already finished".to_owned())?;
+        exec_on_conn(conn, sql, &params)
+    })();
+    match res {
+        Ok(json) => mk_io_except_ok(mk_str(&json)),
+        Err(e) => mk_io_except_err(&e),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_sqlite_tx_commit(tx_id: u64) -> *mut LeanObj {
+    let res: Result<(), String> = (|| {
+        let tx_arc = lock_unpoison(active_txs())
+            .remove(&tx_id)
+            .ok_or_else(|| format!("invalid sqlite transaction handle {tx_id}"))?;
+        let mut tx = lock_unpoison(&tx_arc);
+        let Some(conn) = tx.conn.take() else {
+            return Err("sqlite transaction already finished".to_owned());
+        };
+        let r = conn.execute_batch("COMMIT;").map_err(|e| format!("sqlite COMMIT failed: {e}"));
+        if r.is_err() {
+            let _ = conn.execute_batch("ROLLBACK;");
+        }
+        tx.pool.return_writer(conn);
+        r
+    })();
+    match res {
+        Ok(()) => mk_io_except_ok(qed_lean_box(0)),
+        Err(e) => mk_io_except_err(&e),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_sqlite_tx_rollback(tx_id: u64) -> *mut LeanObj {
+    if let Some(tx_arc) = lock_unpoison(active_txs()).remove(&tx_id) {
+        let mut tx = lock_unpoison(&tx_arc);
+        if let Some(conn) = tx.conn.take() {
+            let _ = conn.execute_batch("ROLLBACK;");
+            tx.pool.return_writer(conn);
+        }
+    }
+    qed_lean_io_mk_ok(qed_lean_box(0))
 }

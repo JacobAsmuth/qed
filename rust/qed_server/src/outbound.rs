@@ -104,31 +104,35 @@ impl OutStream {
 struct OutConn { is_tls: bool, host: String, port: u16, stream: OutStream }
 struct PoolEntry { conn: OutConn, last_used: Instant }
 
-#[derive(Default)]
-struct OutboundState { next_id: u64, active: HashMap<u64, OutConn>, pool: Vec<PoolEntry> }
+static ACTIVE_CONNS: OnceLock<Mutex<HashMap<u64, Arc<Mutex<OutConn>>>>> = OnceLock::new();
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+fn active_map() -> &'static Mutex<HashMap<u64, Arc<Mutex<OutConn>>>> {
+    ACTIVE_CONNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 thread_local! {
-    static OUTBOUND: RefCell<OutboundState> = RefCell::new(OutboundState::default());
+    static OUTBOUND_POOL: RefCell<Vec<PoolEntry>> = const { RefCell::new(Vec::new()) };
 }
 
 fn socket_is_alive(fd: libc::c_int) -> bool {
     let mut b: u8 = 0;
     let r = unsafe { libc::recv(fd, &mut b as *mut u8 as *mut libc::c_void, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
-    // An idle HTTP/1.1 keep-alive connection must have zero pending bytes (`EAGAIN`/`EWOULDBLOCK`);
+    // An idle HTTP/1.1 keep-alive or PostgreSQL idle connection must have zero pending bytes (`EAGAIN`/`EWOULDBLOCK`);
     // `r == 0` is peer EOF and `r > 0` indicates an unread TLS `close_notify` alert or stray data.
     r < 0 && is_wouldblock(last_errno())
 }
 
 fn pop_pooled(is_tls: bool, host: &str, port: u16) -> Option<OutConn> {
-    OUTBOUND.with(|cell| {
-        let mut st = cell.borrow_mut();
+    OUTBOUND_POOL.with(|cell| {
+        let mut pool = cell.borrow_mut();
         let now = Instant::now();
         let mut i = 0;
-        while i < st.pool.len() {
-            if now.duration_since(st.pool[i].last_used) > POOL_TTL {
-                st.pool.swap_remove(i);
-            } else if st.pool[i].conn.is_tls == is_tls && st.pool[i].conn.port == port && st.pool[i].conn.host == host {
-                let entry = st.pool.swap_remove(i);
+        while i < pool.len() {
+            if now.duration_since(pool[i].last_used) > POOL_TTL {
+                pool.swap_remove(i);
+            } else if pool[i].conn.is_tls == is_tls && pool[i].conn.port == port && pool[i].conn.host == host {
+                let entry = pool.swap_remove(i);
                 if socket_is_alive(entry.conn.stream.raw_fd()) { return Some(entry.conn); }
             } else {
                 i += 1;
@@ -138,14 +142,20 @@ fn pop_pooled(is_tls: bool, host: &str, port: u16) -> Option<OutConn> {
     })
 }
 
-fn insert_active(conn: OutConn) -> usize {
-    OUTBOUND.with(|cell| {
-        let mut st = cell.borrow_mut();
-        st.next_id = st.next_id.wrapping_add(1).max(1);
-        let id = st.next_id;
-        st.active.insert(id, conn);
-        id as usize
-    })
+fn insert_active(conn: OutConn) -> u64 {
+    let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed).max(1);
+    let mut map = crate::lock_unpoison(active_map());
+    map.insert(id, Arc::new(Mutex::new(conn)));
+    id
+}
+
+fn get_active(handle: u64) -> Option<Arc<Mutex<OutConn>>> {
+    crate::lock_unpoison(active_map()).get(&handle).cloned()
+}
+
+fn remove_active(handle: u64) -> Option<OutConn> {
+    let arc = crate::lock_unpoison(active_map()).remove(&handle)?;
+    Arc::try_unwrap(arc).ok().map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
 }
 
 unsafe fn check_ssrf_lean(addrs: &[SocketAddr], is_blocked_fn: *mut LeanObj) -> Result<(), &'static str> {
@@ -176,7 +186,7 @@ pub unsafe extern "C" fn qed_server_outbound_acquire(
     let host = str_slice(host_obj);
     if ssrf_guard == 0 {
         if let Some(conn) = pop_pooled(want_tls, host, port) {
-            return mk_io_except_ok(qed_lean_mk_prod(qed_lean_usize_to_nat(insert_active(conn)), qed_lean_usize_to_nat(1)));
+            return mk_io_except_ok(qed_lean_mk_prod(qed_lean_usize_to_nat(insert_active(conn) as usize), qed_lean_usize_to_nat(1)));
         }
     }
     let addrs: Vec<SocketAddr> = match (host, port).to_socket_addrs() {
@@ -210,51 +220,54 @@ pub unsafe extern "C" fn qed_server_outbound_acquire(
         OutStream::Plain(sock)
     };
     let id = insert_active(OutConn { is_tls: want_tls, host: host.to_owned(), port, stream });
-    mk_io_except_ok(qed_lean_mk_prod(qed_lean_usize_to_nat(id), qed_lean_usize_to_nat(0)))
+    mk_io_except_ok(qed_lean_mk_prod(qed_lean_usize_to_nat(id as usize), qed_lean_usize_to_nat(0)))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_outbound_write_all(handle: u64, data_obj: *mut LeanObj) -> *mut LeanObj {
     let data = ba_slice(data_obj);
-    let res = OUTBOUND.with(|cell| match cell.borrow_mut().active.get_mut(&handle) {
-        Some(c) => c.stream.write_all_bytes(data).map_err(|e| format!("write failed: {e}")),
+    let res = match get_active(handle) {
+        Some(arc) => {
+            let mut c = crate::lock_unpoison(&arc);
+            c.stream.write_all_bytes(data).map_err(|e| format!("write failed: {e}"))
+        }
         None => Err("invalid outbound connection handle".to_owned()),
-    });
+    };
     match res { Ok(()) => mk_io_except_ok(qed_lean_box(0)), Err(e) => mk_io_except_err(&e) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_outbound_read_some(handle: u64, max_bytes: u32) -> *mut LeanObj {
     let mut buf = vec![0u8; (max_bytes as usize).clamp(1, 65536)];
-    let res = OUTBOUND.with(|cell| match cell.borrow_mut().active.get_mut(&handle) {
-        Some(c) => c.stream.read_some_bytes(&mut buf).map_err(|e| format!("read failed: {e}")),
+    let res = match get_active(handle) {
+        Some(arc) => {
+            let mut c = crate::lock_unpoison(&arc);
+            c.stream.read_some_bytes(&mut buf).map_err(|e| format!("read failed: {e}"))
+        }
         None => Err("invalid outbound connection handle".to_owned()),
-    });
+    };
     match res { Ok(n) => mk_io_except_ok(mk_ba(&buf[..n])), Err(e) => mk_io_except_err(&e) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_outbound_upgrade_tls(handle: u64, host_obj: *mut LeanObj) -> *mut LeanObj {
     let host = str_slice(host_obj);
-    let res = OUTBOUND.with(|cell| {
-        let mut st = cell.borrow_mut();
-        let Some(conn) = st.active.remove(&handle) else {
-            return Err("invalid outbound connection handle".to_owned());
-        };
-        match conn.stream {
+    let res = match remove_active(handle) {
+        None => Err("invalid outbound connection handle".to_owned()),
+        Some(conn) => match conn.stream {
             OutStream::Tls(_) => {
-                st.active.insert(handle, conn);
+                crate::lock_unpoison(active_map()).insert(handle, Arc::new(Mutex::new(conn)));
                 Ok(())
             }
             OutStream::Plain(mut sock) => {
                 let Ok(sni) = ServerName::try_from(host.to_owned()) else {
-                    return Err(format!("invalid TLS server name: {host}"));
+                    return mk_io_except_err(&format!("invalid TLS server name: {host}"));
                 };
                 let Ok(mut tls_conn) = ClientConnection::new(tls_config(), sni) else {
-                    return Err("TLS client init failed".to_owned());
+                    return mk_io_except_err("TLS client init failed");
                 };
                 if let Err(e) = tls_conn.complete_io(&mut sock) {
-                    return Err(format!("STARTTLS handshake failed for {host}: {e}"));
+                    return mk_io_except_err(&format!("STARTTLS handshake failed for {host}: {e}"));
                 }
                 let upgraded = OutConn {
                     is_tls: true,
@@ -262,29 +275,41 @@ pub unsafe extern "C" fn qed_server_outbound_upgrade_tls(handle: u64, host_obj: 
                     port: conn.port,
                     stream: OutStream::Tls(Box::new(StreamOwned::new(tls_conn, sock))),
                 };
-                st.active.insert(handle, upgraded);
+                crate::lock_unpoison(active_map()).insert(handle, Arc::new(Mutex::new(upgraded)));
                 Ok(())
             }
-        }
-    });
+        },
+    };
     match res { Ok(()) => mk_io_except_ok(qed_lean_box(0)), Err(e) => mk_io_except_err(&e) }
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn qed_server_outbound_is_alive(handle: u64) -> *mut LeanObj {
+    let alive = match get_active(handle) {
+        Some(arc) => {
+            let c = crate::lock_unpoison(&arc);
+            socket_is_alive(c.stream.raw_fd())
+        }
+        None => false,
+    };
+    qed_lean_io_mk_ok(qed_lean_box(if alive { 1 } else { 0 }))
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn qed_server_outbound_release(handle: u64, keep_alive: u8) -> *mut LeanObj {
-    OUTBOUND.with(|cell| {
-        let mut st = cell.borrow_mut();
-        if let Some(conn) = st.active.remove(&handle) {
-            if keep_alive != 0 {
-                if st.pool.len() >= POOL_SIZE {
-                    if let Some((idx, _)) = st.pool.iter().enumerate().min_by_key(|(_, e)| e.last_used) {
-                        st.pool.swap_remove(idx);
+    if let Some(conn) = remove_active(handle) {
+        if keep_alive != 0 {
+            OUTBOUND_POOL.with(|cell| {
+                let mut pool = cell.borrow_mut();
+                if pool.len() >= POOL_SIZE {
+                    if let Some((idx, _)) = pool.iter().enumerate().min_by_key(|(_, e)| e.last_used) {
+                        pool.swap_remove(idx);
                     }
                 }
-                st.pool.push(PoolEntry { conn, last_used: Instant::now() });
-            }
+                pool.push(PoolEntry { conn, last_used: Instant::now() });
+            });
         }
-    });
+    }
     qed_lean_io_mk_ok(qed_lean_box(0))
 }
 
@@ -348,13 +373,7 @@ pub unsafe extern "C" fn qed_server_tcp_accept(listener_id: u64, timeout_ms: u32
                     port: peer.port(),
                     stream: OutStream::Plain(sock),
                 };
-                let handle = OUTBOUND.with(|cell| {
-                    let mut st = cell.borrow_mut();
-                    let h = st.next_id;
-                    st.next_id += 1;
-                    st.active.insert(h, conn);
-                    h
-                });
+                let handle = insert_active(conn);
                 return mk_io_except_ok(qed_lean_box_u64(handle));
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {

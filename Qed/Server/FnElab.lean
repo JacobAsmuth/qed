@@ -151,6 +151,7 @@ structure ParsedServerBlock where
   invs        : Array ParsedInv
   fnClauses   : Array Lean.Syntax
   chanClauses : Array Lean.Syntax
+  httpClauses : Array Lean.Syntax
 
 open Lean Elab Command in
 def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean.Syntax) :
@@ -163,6 +164,7 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
   let mut seenInvNames : Array Name := #[]
   let mut fnClauses   : Array Syntax := #[]
   let mut chanClauses : Array Syntax := #[]
+  let mut httpClauses : Array Syntax := #[]
   for c in clauses do
     let k := c.getKind
     if k == ``srvDbClause then
@@ -220,10 +222,12 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
       fnClauses := fnClauses.push c
     else if k == ``srvChannelClause then
       chanClauses := chanClauses.push c
+    else if k == ``srvHttpRouteClause || k == ``srvStreamClause then
+      httpClauses := httpClauses.push c
     else
       throwErrorAt c "unexpected clause in `server` block"
-  if fnClauses.isEmpty && chanClauses.isEmpty then
-    throwErrorAt srvIdent s!"`server {srvName}` must declare at least one `def` or `channel`"
+  if fnClauses.isEmpty && chanClauses.isEmpty && httpClauses.isEmpty then
+    throwErrorAt srvIdent s!"`server {srvName}` must declare at least one `def`, `channel`, `http`, or `stream` clause"
   let hasState := !stateDecls.isEmpty
   if !hasState && (!invs.isEmpty || !mutInvs.isEmpty) then
     throwErrorAt srvIdent s!"`server {srvName}` declares `invariant`s but has no `state` fields"
@@ -231,7 +235,7 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
     unless stateDecls.any (·.ident.getId == mi.fieldId.getId) do
       let avail := String.intercalate ", " (stateDecls.toList.map fun s => s!"`{s.ident.getId}`")
       throwErrorAt mi.fieldId s!"`invariant mutating {mi.fieldId.getId}` does not match any `state` field of `{srvName}` (`state` fields: {avail})"
-  return { dbDecls, envDecls, stateDecls, mutInvs, invs, fnClauses, chanClauses }
+  return { dbDecls, envDecls, stateDecls, mutInvs, invs, fnClauses, chanClauses, httpClauses }
 
 section
 open Lean Elab Command
@@ -538,13 +542,34 @@ private def elabServerWsDispatchCmd (srvIdent ctxId : Ident) (srvName : Name)
       $fullWsBody))
 
 open Lean Elab Command in
+private def elabServerHttpDispatchCmd (srvIdent ctxId : Ident) (srvName : Name)
+    (envDecls : Array ParsedEnvDecl) (atomicBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder))
+    (httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr)) : CommandElabM Unit := do
+  let httpMethodVar := mkIdent `httpMethod
+  let httpPathVar := mkIdent `httpPath
+  let httpNotFoundArm ← `(Lean.Parser.Term.matchAltExpr|
+    | _, _ => Pure.pure (Except.ok none))
+  let allHttpArms := httpDispatchArms.push httpNotFoundArm
+  let httpMatchTerm ← `(match $httpMethodVar:ident, $httpPathVar:ident with $[$allHttpArms:matchAlt]*)
+  let fullHttpBody ← wrapDispatchWithEnvDecls envDecls httpMatchTerm
+  let httpDispatchId := mkIdentFrom srvIdent (srvName ++ `httpDispatchM)
+  elabCommand (← `(command|
+    set_option linter.unusedVariables false in
+    def $httpDispatchId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
+        $[$atomicBinders:bracketedBinder]*
+        ($ctxId:ident : Qed.Server.RequestCtx) ($httpMethodVar:ident : String) ($httpPathVar:ident : String) :
+        m (Except Qed.Server.ApiError (Option Qed.Server.HttpResponse)) :=
+      $fullHttpBody))
+
+open Lean Elab Command in
 def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : Ident)
     (srvName fullSrvName : Name) (srvShort : String) (hasState : Bool)
     (dbDecls : Array ParsedDbDecl)
     (envDecls : Array ParsedEnvDecl) (allExtRoots : Array Name)
     (methodInfos : Array ServerMethodInfo) (dispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
     (chanNames : Array String) (wsDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
-    (ctxId reqBytesId : Ident) : CommandElabM Unit := do
+    (ctxId reqBytesId : Ident)
+    (httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]) : CommandElabM Unit := do
   if hasState then
     let linThmId := mkIdentFrom srvIdent (srvName ++ `concurrent_linearizable)
     elabCommand (← `(command|
@@ -597,6 +622,9 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
   if !chanNames.isEmpty then
     elabServerWsDispatchCmd srvIdent ctxId srvName envDecls atomicBinders wsDispatchArms
 
+  if !httpDispatchArms.isEmpty then
+    elabServerHttpDispatchCmd srvIdent ctxId srvName envDecls atomicBinders httpDispatchArms
+
   modifyEnv fun env => serverRegistry.addEntry env {
     serverName := fullSrvName
     shortName := srvShort
@@ -607,6 +635,7 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
     methods := methodInfos
     channels := chanNames
     databases := dbDecls.map (·.info.configConst)
+    hasHttpRoutes := !httpDispatchArms.isEmpty
   }
 
 open Lean Elab Command in

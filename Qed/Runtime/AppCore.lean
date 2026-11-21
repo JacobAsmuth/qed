@@ -6,6 +6,14 @@ import Qed.Router.Basic
 
 namespace Qed
 
+/-- Per-route HTML `<head>` metadata rendered safely during SSR. -/
+structure HeadMeta where
+  title       : Option String := none
+  description : Option String := none
+  metaTags    : List (String × String) := []
+  canonical   : Option String := none
+deriving Inhabited, DecidableEq, Repr
+
 structure App (Model : Type) (Msg : Type) where
   private mk ::
   init           : Model × Cmd Msg
@@ -20,6 +28,8 @@ structure App (Model : Type) (Msg : Type) where
   rehydrate      : String → Option Model := fun _ => none
   styles         : List Style := []
   stylesheets    : List String := []
+  headFor        : Model → HeadMeta := fun _ => {}
+  ssrStatus      : Model → Nat := fun _ => 200
   valid_view     : ∀ m, Html.valid (View.render template m) = true
   dehydrate_view : ∀ m m', rehydrate (dehydrate m) = some m' →
                      View.render template m' = View.render template m := by
@@ -76,6 +86,8 @@ def App.liftModel {Model Model' Msg : Type}
   rehydrate      := fun raw => (app.rehydrate raw).map embed
   styles         := app.styles
   stylesheets    := app.stylesheets
+  headFor        := fun st => app.headFor (proj st)
+  ssrStatus      := fun st => app.ssrStatus (proj st)
   valid_view     := fun st => by rw [View.render_mapScope]; exact app.valid_view (proj st)
   dehydrate_view := fun st st' h => by
     simp only [Option.map_eq_some_iff] at h
@@ -202,5 +214,13 @@ def App.guardRehydrateCore {Model Msg : Type} (Inv : Model → Prop) [DecidableP
           split at h <;> simp at h
           subst h
           exact app.dehydrate_view m m0 hr }
+
+/-- Attaches dynamic per-route `<head>` metadata (title, description, meta tags, canonical URL) for SSR. -/
+def App.withHead (f : Model → HeadMeta) (app : App Model Msg) : App Model Msg :=
+  { app with headFor := f }
+
+/-- Attaches a per-model SSR HTTP status code (default `200`; e.g. `404` on unknown routes or `302` redirects). -/
+def App.withSsrStatus (f : Model → Nat) (app : App Model Msg) : App Model Msg :=
+  { app with ssrStatus := f }
 
 end Qed

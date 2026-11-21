@@ -1,4 +1,5 @@
 import Lean
+import Qed.Diag
 import Qed.Style.Core
 import Qed.Style.Contrast
 
@@ -133,13 +134,6 @@ def cssBlockHeader.parenthesizer : PrettyPrinter.Parenthesizer := PrettyPrinter.
 def cssDeclLine.formatter : PrettyPrinter.Formatter := PrettyPrinter.Formatter.visitAtom `Qed.StyleDsl.cssDeclLine
 @[combinator_parenthesizer Qed.StyleDsl.cssDeclLine]
 def cssDeclLine.parenthesizer : PrettyPrinter.Parenthesizer := PrettyPrinter.Parenthesizer.visitToken
-
-private def identEq (kwName : Name) : Parser :=
-  leading_parser withFn (fun fn c s =>
-    let s' := fn c s
-    if s'.hasError then s'
-    else if s'.stxStack.back.getId == kwName then s'
-    else s.mkError s!"expected `{kwName}`") Parser.ident
 
 declare_syntax_cat cssBlockItem
 
@@ -420,26 +414,9 @@ private def validateColorLiteral (tok : String) : Except String (Option (Nat × 
   else
     throw s!"invalid CSS color value `{tok}`"
 
-private def editDistLe2 (a b : String) : Bool :=
-  let as := a.toList; let bs := b.toList
-  if as.length + 2 < bs.length || bs.length + 2 < as.length then false
-  else
-    let rec go : Nat → List Char → List Char → Nat → Bool
-      | 0, _, _, _ => false
-      | _, [], ys, k => ys.length ≤ k
-      | _, xs, [], k => xs.length ≤ k
-      | f + 1, x :: xs, y :: ys, 0 => x == y && go f xs ys 0
-      | f + 1, x :: xs, y :: ys, k + 1 =>
-          if x == y then go f xs ys (k + 1)
-          else go f xs ys k || go f (x :: xs) ys k || go f xs (y :: ys) k
-    go (as.length + bs.length + 1) as bs 2
-
-private def suggestProp (bad : String) : Option String :=
-  knownCssProps.find? (editDistLe2 bad ·)
-
 /-! ## Environment Resolution for Tokens, Styles, Themes & Keyframes -/
 
-private def resolveInRegistry {α : Type} (reg : NameMap α) (env : Environment)
+def resolveInRegistry {α : Type} (reg : NameMap α) (env : Environment)
     (currNs : Name) (openDecls : List OpenDecl) (rawName : String) : Option α :=
   let nm := rawName.toName
   if let some v := reg.find? (currNs ++ nm) then some v
@@ -547,10 +524,7 @@ private def resolveAndValidateDecl (ref : Syntax) (env : Environment) (currNs : 
   if v.isEmpty then throwErrorAt ref s!"missing value for CSS property `{p}`"
   let isCustomProp := p.startsWith "--"
   if !isCustomProp && !knownCssProps.contains p then
-    let hint := match suggestProp p with
-      | some s => s!" (did you mean `{s}`?)"
-      | none   => ""
-    throwErrorAt ref s!"unknown CSS property `{p}`{hint}"
+    throwErrorAt ref s!"unknown CSS property `{p}`{Qed.Diag.didYouMean p knownCssProps}"
   let tokReg := tokenMetaRegistry.getState env
   let kfReg  := keyframesMetaRegistry.getState env
   let atoms := splitTopLevel ' ' v

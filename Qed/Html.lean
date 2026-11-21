@@ -447,20 +447,12 @@ def validTextIn (ctx : HtmlCtx) (s : String) : Bool :=
     simp only [List.mem_cons, List.not_mem_nil, or_false] at hm
     rcases hm with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> rfl
   · intro h
-    unfold isVoidTagFast at h
-    unfold isVoidTag
-    rw [List.contains_iff_mem]
-    split at h
-    · simp only [Bool.or_eq_true, beq_iff_eq] at h
-      rcases h with rfl | rfl <;> simp only [voidTags, List.mem_cons, true_or, or_true]
-    · simp only [Bool.or_eq_true, beq_iff_eq] at h
-      rcases h with (rfl | rfl) | rfl <;> simp only [voidTags, List.mem_cons, true_or, or_true]
-    · simp only [Bool.or_eq_true, beq_iff_eq] at h
-      rcases h with ((rfl | rfl) | rfl) | rfl <;> simp only [voidTags, List.mem_cons, true_or, or_true]
-    · simp only [Bool.or_eq_true, beq_iff_eq] at h
-      rcases h with (rfl | rfl) | rfl <;> simp only [voidTags, List.mem_cons, true_or, or_true]
-    · simp only [beq_iff_eq] at h; subst h; simp only [voidTags, List.mem_cons, true_or, or_true]
-    · exact absurd h (by decide)
+    unfold isVoidTagFast at h; unfold isVoidTag; rw [List.contains_iff_mem]
+    split at h <;> try exact absurd h (by decide)
+    all_goals
+      simp only [Bool.or_eq_true, beq_iff_eq] at h
+      repeat (cases h with | inl h => _ | inr h => _)
+      all_goals (subst h; simp [voidTags])
 
 mutual
   def Html.validIn (ctx : HtmlCtx) : Html msg → Bool
@@ -527,44 +519,32 @@ def Html.valid (h : Html msg) : Bool := Html.validIn {} h
       cases a <;> simp only [List.filter_cons, ↓reduceIte, Bool.false_eq_true, Attr.hasLocalCell, Attr.isLocalCell, ih, Bool.false_or]
 
 @[simp] theorem Attr.valid_map {α β : Type} (f : α → β) (a : Attr α) :
-    (a.map f).valid = a.valid := by
-  cases a <;> rfl
+    (a.map f).valid = a.valid := by cases a <;> rfl
 
 @[simp] theorem Attr.validList_map_attrMap {α β : Type} (f : α → β) (as : List (Attr α)) :
     Attr.validList (as.map (Attr.map f)) = Attr.validList as := by
-  induction as with
-  | nil => rfl
-  | cons a rest ih => simp only [List.map_cons, Attr.validList, Attr.valid_map, ih]
+  induction as <;> simp [Attr.validList, *]
 
 @[simp] theorem Attr.isLocalCell_map {α β : Type} (f : α → β) (a : Attr α) :
-    (a.map f).isLocalCell = a.isLocalCell := by
-  cases a <;> rfl
+    (a.map f).isLocalCell = a.isLocalCell := by cases a <;> rfl
 
 @[simp] theorem Attr.hasLocalCell_map_attrMap {α β : Type} (f : α → β) (as : List (Attr α)) :
     Attr.hasLocalCell (as.map (Attr.map f)) = Attr.hasLocalCell as := by
-  induction as with
-  | nil => rfl
-  | cons a rest ih => simp only [List.map_cons, Attr.hasLocalCell, Attr.isLocalCell_map, ih]
+  induction as <;> simp [Attr.hasLocalCell, *]
 
 @[simp] theorem Attr.valid_prefixSignal (pfx : String) (a : Attr msg) :
-    (a.prefixSignal pfx).valid = a.valid := by
-  cases a <;> rfl
+    (a.prefixSignal pfx).valid = a.valid := by cases a <;> rfl
 
 @[simp] theorem Attr.validList_prefixSignal (pfx : String) (as : List (Attr msg)) :
     Attr.validList (as.map (Attr.prefixSignal pfx)) = Attr.validList as := by
-  induction as with
-  | nil => rfl
-  | cons a rest ih => simp only [List.map_cons, Attr.validList, Attr.valid_prefixSignal, ih]
+  induction as <;> simp [Attr.validList, *]
 
 @[simp] theorem Attr.isLocalCell_prefixSignal (pfx : String) (a : Attr msg) :
-    (a.prefixSignal pfx).isLocalCell = a.isLocalCell := by
-  cases a <;> rfl
+    (a.prefixSignal pfx).isLocalCell = a.isLocalCell := by cases a <;> rfl
 
 @[simp] theorem Attr.hasLocalCell_prefixSignal (pfx : String) (as : List (Attr msg)) :
     Attr.hasLocalCell (as.map (Attr.prefixSignal pfx)) = Attr.hasLocalCell as := by
-  induction as with
-  | nil => rfl
-  | cons a rest ih => simp only [List.map_cons, Attr.hasLocalCell, Attr.isLocalCell_prefixSignal, ih]
+  induction as <;> simp [Attr.hasLocalCell, *]
 
 @[simp] theorem Html.mapChildren_isEmpty {α β : Type} (f : α → β) (cs : List (Html α)) :
     (Html.mapChildren f cs).isEmpty = cs.isEmpty := by
@@ -887,31 +867,15 @@ private theorem utf8EncodeChar_gt_127 (c : Char) (h : c.toNat > 127) :
   unfold String.utf8EncodeChar
   have h1 : ¬(c.val.toNat ≤ 127) := Nat.not_le_of_gt h
   simp only [h1, ↓reduceIte]
-  split
-  · intro b hb; simp only [List.mem_cons, List.not_mem_nil, or_false] at hb
-    rcases hb with rfl | rfl
-    · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
-    · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
-  · split
-    · intro b hb; simp only [List.mem_cons, List.not_mem_nil, or_false] at hb
-      rcases hb with rfl | rfl | rfl
-      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
-      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
-      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
-    · intro b hb; simp only [List.mem_cons, List.not_mem_nil, or_false] at hb
-      rcases hb with rfl | rfl | rfl | rfl
-      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
-      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
-      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
-      · exact uint8_ofNat_mod_add_ge_128 (by decide) (by decide) (by decide)
+  split <;> try split
+  all_goals
+    intro b hb
+    simp only [List.mem_cons, List.not_mem_nil, or_false] at hb
+    repeat (rcases hb with rfl | hb; · apply uint8_ofNat_mod_add_ge_128 <;> decide)
+    try (subst hb; apply uint8_ofNat_mod_add_ge_128 <;> decide)
 
 private theorem utf8EncodeChar_ne_nil (c : Char) : String.utf8EncodeChar c ≠ [] := by
-  unfold String.utf8EncodeChar; dsimp only
-  split
-  · simp
-  · split
-    · simp
-    · split <;> simp
+  unfold String.utf8EncodeChar; dsimp only; repeat (split <;> try simp)
 
 private theorem hasAsciiByteLoop_eq (s : String) (p : UInt8 → Bool) (i : Nat) :
     hasAsciiByteLoop s p s.utf8ByteSize rfl i = (s.toByteArray.data.toList.drop i).any p := by
@@ -1410,502 +1374,216 @@ abbrev a11yValid {msg : Type} : Html msg → Bool := Html.a11yValid
 /-! ### `Html.map` Invariance Theorems for Accessibility Predicates -/
 
 mutual
-  @[simp] theorem Html.imgsHaveAlt_map {α β : Type} (f : α → β) :
-      (h : Html α) → Html.imgsHaveAlt (h.map f) = Html.imgsHaveAlt h
-    | .text _ => rfl
-    | .element tag attrs kids => by
-        simp only [Html.map, Html.imgsHaveAlt, hasAttr_map, Html.imgsHaveAltList_map f kids]
-  @[simp] theorem Html.imgsHaveAltList_map {α β : Type} (f : α → β) :
-      (cs : List (Html α)) → Html.imgsHaveAltList (Html.mapChildren f cs) = Html.imgsHaveAltList cs
-    | [] => rfl
-    | c :: cs => by
-        simp only [Html.mapChildren, Html.imgsHaveAltList, Html.imgsHaveAlt_map f c, Html.imgsHaveAltList_map f cs]
+  private theorem htmlRec_map_node {α β γ : Type}
+      (F : ∀ {m : Type}, Html m → γ) (FL : ∀ {m : Type}, List (Html m) → γ) (f : α → β)
+      (hText : ∀ s, F (.text s : Html β) = F (.text s : Html α))
+      (hElem : ∀ t a cs, FL (Html.mapChildren f cs) = FL cs →
+        F (.element t (a.map (Attr.map f)) (Html.mapChildren f cs)) = F (.element t a cs))
+      (hNil : FL ([] : List (Html β)) = FL ([] : List (Html α)))
+      (hCons : ∀ c cs, F (c.map f) = F c → FL (Html.mapChildren f cs) = FL cs →
+        FL (c.map f :: Html.mapChildren f cs) = FL (c :: cs)) :
+      (h : Html α) → F (h.map f) = F h
+    | .text s => hText s
+    | .element t a cs => hElem t a cs (htmlRec_map_list F FL f hText hElem hNil hCons cs)
+  private theorem htmlRec_map_list {α β γ : Type}
+      (F : ∀ {m : Type}, Html m → γ) (FL : ∀ {m : Type}, List (Html m) → γ) (f : α → β)
+      (hText : ∀ s, F (.text s : Html β) = F (.text s : Html α))
+      (hElem : ∀ t a cs, FL (Html.mapChildren f cs) = FL cs →
+        F (.element t (a.map (Attr.map f)) (Html.mapChildren f cs)) = F (.element t a cs))
+      (hNil : FL ([] : List (Html β)) = FL ([] : List (Html α)))
+      (hCons : ∀ c cs, F (c.map f) = F c → FL (Html.mapChildren f cs) = FL cs →
+        FL (c.map f :: Html.mapChildren f cs) = FL (c :: cs)) :
+      (cs : List (Html α)) → FL (Html.mapChildren f cs) = FL cs
+    | [] => hNil
+    | c :: cs => hCons c cs
+        (htmlRec_map_node F FL f hText hElem hNil hCons c)
+        (htmlRec_map_list F FL f hText hElem hNil hCons cs)
 end
 
-mutual
-  @[simp] theorem Html.hasAccessibleNameChild_map {α β : Type} (f : α → β) :
-      (h : Html α) → Html.hasAccessibleNameChild (h.map f) = Html.hasAccessibleNameChild h
-    | .text _ => rfl
-    | .element tag attrs kids => by
-        simp only [Html.map, Html.hasAccessibleNameChild, hasNonBlankAttr_map,
-          Html.hasAccessibleNameChildren_map f kids]
-  @[simp] theorem Html.hasAccessibleNameChildren_map {α β : Type} (f : α → β) :
-      (cs : List (Html α)) →
-        Html.hasAccessibleNameChildren (Html.mapChildren f cs) = Html.hasAccessibleNameChildren cs
-    | [] => rfl
-    | c :: cs => by
-        simp only [Html.mapChildren, Html.hasAccessibleNameChildren,
-          Html.hasAccessibleNameChild_map f c, Html.hasAccessibleNameChildren_map f cs]
-end
+private theorem htmlRec_map {α β γ : Type}
+    (F : ∀ {m : Type}, Html m → γ) (FL : ∀ {m : Type}, List (Html m) → γ) (f : α → β)
+    (hText : ∀ s, F (.text s : Html β) = F (.text s : Html α))
+    (hElem : ∀ t a cs, FL (Html.mapChildren f cs) = FL cs →
+      F (.element t (a.map (Attr.map f)) (Html.mapChildren f cs)) = F (.element t a cs))
+    (hNil : FL ([] : List (Html β)) = FL ([] : List (Html α)))
+    (hCons : ∀ c cs, F (c.map f) = F c → FL (Html.mapChildren f cs) = FL cs →
+      FL (c.map f :: Html.mapChildren f cs) = FL (c :: cs)) :
+    (∀ h : Html α, F (h.map f) = F h) ∧
+    (∀ cs : List (Html α), FL (Html.mapChildren f cs) = FL cs) :=
+  ⟨htmlRec_map_node F FL f hText hElem hNil hCons,
+   htmlRec_map_list F FL f hText hElem hNil hCons⟩
 
-mutual
-  @[simp] theorem Html.buttonsAccessible_map {α β : Type} (f : α → β) :
-      (h : Html α) → Html.buttonsAccessible (h.map f) = Html.buttonsAccessible h
-    | .text _ => rfl
-    | .element tag attrs kids => by
-        simp only [Html.map, Html.buttonsAccessible, Html.elemHasAccessibleName,
-          hasNonBlankAttr_map, Html.hasAccessibleNameChildren_map f kids,
-          Html.buttonsAccessibleList_map f kids]
-  @[simp] theorem Html.buttonsAccessibleList_map {α β : Type} (f : α → β) :
-      (cs : List (Html α)) → Html.buttonsAccessibleList (Html.mapChildren f cs) = Html.buttonsAccessibleList cs
-    | [] => rfl
-    | c :: cs => by
-        simp only [Html.mapChildren, Html.buttonsAccessibleList,
-          Html.buttonsAccessible_map f c, Html.buttonsAccessibleList_map f cs]
-end
+local macro "html_map_pair" fn:ident fl:ident fnThm:ident flThm:ident "[" extra:ident,+ "]" : command =>
+  `(private theorem pair {α β : Type} (f : α → β) :
+        (∀ h : Html α, $fn (h.map f) = $fn h) ∧ (∀ cs : List (Html α), $fl (Html.mapChildren f cs) = $fl cs) :=
+      htmlRec_map (fun {_} => $fn) (fun {_} => $fl) f (fun _ => rfl)
+        (fun _ _ _ ih => by simp only [$fn:ident, $[$extra:ident],*, ih]) rfl
+        (fun _ _ h1 h2 => by simp only [$fl:ident, h1, h2])
+    @[simp] theorem $fnThm {α β : Type} (f : α → β) (h : Html α) : $fn (h.map f) = $fn h := (pair f).1 h
+    @[simp] theorem $flThm {α β : Type} (f : α → β) (cs : List (Html α)) :
+        $fl (Html.mapChildren f cs) = $fl cs := (pair f).2 cs)
 
-mutual
-  @[simp] theorem Html.validAriaRoles_map {α β : Type} (f : α → β) :
-      (h : Html α) → Html.validAriaRoles (h.map f) = Html.validAriaRoles h
-    | .text _ => rfl
-    | .element tag attrs kids => by
-        simp only [Html.map, Html.validAriaRoles, attrsValidAriaRoles_map, Html.validAriaRolesList_map f kids]
-  @[simp] theorem Html.validAriaRolesList_map {α β : Type} (f : α → β) :
-      (cs : List (Html α)) → Html.validAriaRolesList (Html.mapChildren f cs) = Html.validAriaRolesList cs
-    | [] => rfl
-    | c :: cs => by
-        simp only [Html.mapChildren, Html.validAriaRolesList,
-          Html.validAriaRoles_map f c, Html.validAriaRolesList_map f cs]
-end
-
-mutual
-  @[simp] theorem Html.containsFormControl_map {α β : Type} (f : α → β) :
-      (h : Html α) → Html.containsFormControl (h.map f) = Html.containsFormControl h
-    | .text _ => rfl
-    | .element tag attrs kids => by
-        simp only [Html.map, Html.containsFormControl, Html.containsFormControlList_map f kids]
-  @[simp] theorem Html.containsFormControlList_map {α β : Type} (f : α → β) :
-      (cs : List (Html α)) → Html.containsFormControlList (Html.mapChildren f cs) = Html.containsFormControlList cs
-    | [] => rfl
-    | c :: cs => by
-        simp only [Html.mapChildren, Html.containsFormControlList,
-          Html.containsFormControl_map f c, Html.containsFormControlList_map f cs]
-end
-
-mutual
-  @[simp] theorem Html.labelsAssociated_map {α β : Type} (f : α → β) :
-      (h : Html α) → Html.labelsAssociated (h.map f) = Html.labelsAssociated h
-    | .text _ => rfl
-    | .element tag attrs kids => by
-        simp only [Html.map, Html.labelsAssociated, hasNonBlankAttr_map,
-          Html.containsFormControlList_map f kids, Html.labelsAssociatedList_map f kids]
-  @[simp] theorem Html.labelsAssociatedList_map {α β : Type} (f : α → β) :
-      (cs : List (Html α)) → Html.labelsAssociatedList (Html.mapChildren f cs) = Html.labelsAssociatedList cs
-    | [] => rfl
-    | c :: cs => by
-        simp only [Html.mapChildren, Html.labelsAssociatedList,
-          Html.labelsAssociated_map f c, Html.labelsAssociatedList_map f cs]
-end
-
-mutual
-  @[simp] theorem Html.collectIds_map {α β : Type} (f : α → β) :
-      (h : Html α) → Html.collectIds (h.map f) = Html.collectIds h
-    | .text _ => rfl
-    | .element tag attrs kids => by
-        simp only [Html.map, Html.collectIds, attrValue_map, Html.collectIdsList_map f kids]
-  @[simp] theorem Html.collectIdsList_map {α β : Type} (f : α → β) :
-      (cs : List (Html α)) → Html.collectIdsList (Html.mapChildren f cs) = Html.collectIdsList cs
-    | [] => rfl
-    | c :: cs => by
-        simp only [Html.mapChildren, Html.collectIdsList, Html.collectIds_map f c, Html.collectIdsList_map f cs]
-end
+html_map_pair Html.imgsHaveAlt Html.imgsHaveAltList Html.imgsHaveAlt_map Html.imgsHaveAltList_map [hasAttr_map]
+html_map_pair Html.hasAccessibleNameChild Html.hasAccessibleNameChildren Html.hasAccessibleNameChild_map Html.hasAccessibleNameChildren_map [hasNonBlankAttr_map]
+html_map_pair Html.buttonsAccessible Html.buttonsAccessibleList Html.buttonsAccessible_map Html.buttonsAccessibleList_map [Html.elemHasAccessibleName, hasNonBlankAttr_map, Html.hasAccessibleNameChildren_map]
+html_map_pair Html.validAriaRoles Html.validAriaRolesList Html.validAriaRoles_map Html.validAriaRolesList_map [attrsValidAriaRoles_map]
+html_map_pair Html.containsFormControl Html.containsFormControlList Html.containsFormControl_map Html.containsFormControlList_map [Html.containsFormControl]
+html_map_pair Html.labelsAssociated Html.labelsAssociatedList Html.labelsAssociated_map Html.labelsAssociatedList_map [hasNonBlankAttr_map, Html.containsFormControlList_map]
+html_map_pair Html.collectIds Html.collectIdsList Html.collectIds_map Html.collectIdsList_map [attrValue_map]
 
 @[simp] theorem Html.noDuplicateIds_map {α β : Type} (f : α → β) (h : Html α) :
-    Html.noDuplicateIds (h.map f) = Html.noDuplicateIds h := by
-  simp [Html.noDuplicateIds]
+    Html.noDuplicateIds (h.map f) = Html.noDuplicateIds h := by simp [Html.noDuplicateIds]
 
-mutual
-  @[simp] theorem Html.collectHeadings_map {α β : Type} (f : α → β) :
-      (h : Html α) → Html.collectHeadings (h.map f) = Html.collectHeadings h
-    | .text _ => rfl
-    | .element tag attrs kids => by
-        simp only [Html.map, Html.collectHeadings, Html.collectHeadingsList_map f kids]
-  @[simp] theorem Html.collectHeadingsList_map {α β : Type} (f : α → β) :
-      (cs : List (Html α)) → Html.collectHeadingsList (Html.mapChildren f cs) = Html.collectHeadingsList cs
-    | [] => rfl
-    | c :: cs => by
-        simp only [Html.mapChildren, Html.collectHeadingsList,
-          Html.collectHeadings_map f c, Html.collectHeadingsList_map f cs]
-end
+html_map_pair Html.collectHeadings Html.collectHeadingsList Html.collectHeadings_map Html.collectHeadingsList_map [Html.collectHeadings]
 
 @[simp] theorem Html.headingsOrdered_map {α β : Type} (f : α → β) (h : Html α) :
-    Html.headingsOrdered (h.map f) = Html.headingsOrdered h := by
-  simp [Html.headingsOrdered]
+    Html.headingsOrdered (h.map f) = Html.headingsOrdered h := by simp [Html.headingsOrdered]
 
-mutual
-  @[simp] theorem Html.htmlHasLang_map {α β : Type} (f : α → β) :
-      (h : Html α) → Html.htmlHasLang (h.map f) = Html.htmlHasLang h
-    | .text _ => rfl
-    | .element tag attrs kids => by
-        simp only [Html.map, Html.htmlHasLang, hasNonBlankAttr_map, Html.htmlHasLangList_map f kids]
-  @[simp] theorem Html.htmlHasLangList_map {α β : Type} (f : α → β) :
-      (cs : List (Html α)) → Html.htmlHasLangList (Html.mapChildren f cs) = Html.htmlHasLangList cs
-    | [] => rfl
-    | c :: cs => by
-        simp only [Html.mapChildren, Html.htmlHasLangList, Html.htmlHasLang_map f c, Html.htmlHasLangList_map f cs]
-end
+html_map_pair Html.htmlHasLang Html.htmlHasLangList Html.htmlHasLang_map Html.htmlHasLangList_map [hasNonBlankAttr_map]
 
 @[simp] theorem Html.a11yValid_map {α β : Type} (f : α → β) (h : Html α) :
-    Html.a11yValid (h.map f) = Html.a11yValid h := by
-  simp [Html.a11yValid]
+    Html.a11yValid (h.map f) = Html.a11yValid h := by simp [Html.a11yValid]
 
 /-! ### `Html.canonical` Invariance Theorems for Accessibility Predicates -/
 
-mutual
-  @[simp] theorem Html.imgsHaveAlt_canonical {msg : Type} :
-      (h : Html msg) → Html.imgsHaveAlt (Html.canonical h) = Html.imgsHaveAlt h
-    | .text _ => rfl
-    | .element t a cs => by
-        dsimp [Html.canonical, mkCanonicalElem]
-        by_cases hcond : (t == "span" && onlySignalBind a) = true
-        · rw [if_pos hcond]
-          have ⟨ht, _⟩ := Bool.and_eq_true_iff.1 hcond
-          have hteq : t = "span" := beq_iff_eq.1 ht
-          subst hteq
-          cases hcl : Html.canonicalList cs with
-          | nil =>
-              have hL := Html.imgsHaveAltList_canonical cs; rw [hcl] at hL
-              simp [Html.imgsHaveAlt, hasAttr_canonical "alt" (by decide), hL]
-          | cons c rest =>
-              cases rest with
-              | nil =>
-                  rcases html_canonicalList_eq_singleton hcl with ⟨c₀, rfl, rfl⟩
-                  simp [Html.imgsHaveAlt, Html.imgsHaveAltList, Html.imgsHaveAlt_canonical c₀]
-              | cons _ _ =>
-                  have hL := Html.imgsHaveAltList_canonical cs; rw [hcl] at hL
-                  simp [Html.imgsHaveAlt, hasAttr_canonical "alt" (by decide), hL]
-        · rw [if_neg hcond]
-          simp [Html.imgsHaveAlt, hasAttr_canonical "alt" (by decide), Html.imgsHaveAltList_canonical cs]
-  @[simp] theorem Html.imgsHaveAltList_canonical {msg : Type} :
-      (cs : List (Html msg)) → Html.imgsHaveAltList (Html.canonicalList cs) = Html.imgsHaveAltList cs
-    | [] => rfl
-    | c :: cs => by
-        simp [Html.canonicalList, Html.imgsHaveAltList, Html.imgsHaveAlt_canonical c, Html.imgsHaveAltList_canonical cs]
-end
+private theorem mkCanonicalElem_cases {msg : Type} (t : String) (a : List (Attr msg)) (cs : List (Html msg)) :
+    (t = "span" ∧ onlySignalBind a = true ∧ ∃ c₀, cs = [c₀] ∧ mkCanonicalElem t a (Html.canonicalList cs) = c₀.canonical) ∨
+    mkCanonicalElem t a (Html.canonicalList cs) = .element t (a.filterMap Attr.canonical) (Html.canonicalList cs) := by
+  unfold mkCanonicalElem
+  split
+  · next h =>
+    have ⟨ht, ha⟩ := Bool.and_eq_true_iff.1 h
+    cases hcl : Html.canonicalList cs with
+    | cons c rest =>
+      cases rest with
+      | nil =>
+        rcases html_canonicalList_eq_singleton hcl with ⟨c₀, rfl, rfl⟩
+        exact .inl ⟨beq_iff_eq.1 ht, ha, c₀, rfl, rfl⟩
+      | cons _ _ => exact .inr rfl
+    | nil => exact .inr rfl
+  · exact .inr rfl
 
 mutual
-  @[simp] theorem Html.hasAccessibleNameChild_canonical {msg : Type} :
-      (h : Html msg) → Html.hasAccessibleNameChild (Html.canonical h) = Html.hasAccessibleNameChild h
+  private theorem htmlRec_canonical_node {msg γ : Type} (F : Html msg → γ) (FL : List (Html msg) → γ)
+      (hUnwrap : ∀ a c₀, onlySignalBind a = true → F (.element "span" a [c₀]) = F c₀)
+      (hElem : ∀ t a cs, FL (Html.canonicalList cs) = FL cs →
+        F (.element t (a.filterMap Attr.canonical) (Html.canonicalList cs)) = F (.element t a cs))
+      (hCons : ∀ c cs, F c.canonical = F c → FL (Html.canonicalList cs) = FL cs →
+        FL (c.canonical :: Html.canonicalList cs) = FL (c :: cs)) :
+      (h : Html msg) → F h.canonical = F h
     | .text _ => rfl
     | .element t a cs => by
-        dsimp [Html.canonical, mkCanonicalElem]
-        by_cases hcond : (t == "span" && onlySignalBind a) = true
-        · rw [if_pos hcond]
-          have ⟨ht, ha⟩ := Bool.and_eq_true_iff.1 hcond
-          have hteq : t = "span" := beq_iff_eq.1 ht
-          subst hteq
-          have hal := attrValue_of_onlySignalBind "aria-label" a ha
-          have halb := attrValue_of_onlySignalBind "aria-labelledby" a ha
-          cases hcl : Html.canonicalList cs with
-          | nil =>
-              have hL := Html.hasAccessibleNameChildren_canonical cs; rw [hcl] at hL
-              simp [Html.hasAccessibleNameChild, hasNonBlankAttr_canonical "alt" (by decide),
-                hasNonBlankAttr_canonical "aria-label" (by decide),
-                hasNonBlankAttr_canonical "aria-labelledby" (by decide), hL]
-          | cons c rest =>
-              cases rest with
-              | nil =>
-                  rcases html_canonicalList_eq_singleton hcl with ⟨c₀, rfl, rfl⟩
-                  simp [Html.hasAccessibleNameChild, Html.hasAccessibleNameChildren,
-                    hasNonBlankAttr, hal, halb, Html.hasAccessibleNameChild_canonical c₀]
-              | cons _ _ =>
-                  have hL := Html.hasAccessibleNameChildren_canonical cs; rw [hcl] at hL
-                  simp [Html.hasAccessibleNameChild, hasNonBlankAttr_canonical "alt" (by decide),
-                    hasNonBlankAttr_canonical "aria-label" (by decide),
-                    hasNonBlankAttr_canonical "aria-labelledby" (by decide), hL]
-        · rw [if_neg hcond]
-          simp [Html.hasAccessibleNameChild, hasNonBlankAttr_canonical "alt" (by decide),
-            hasNonBlankAttr_canonical "aria-label" (by decide),
-            hasNonBlankAttr_canonical "aria-labelledby" (by decide),
-            Html.hasAccessibleNameChildren_canonical cs]
-  @[simp] theorem Html.hasAccessibleNameChildren_canonical {msg : Type} :
-      (cs : List (Html msg)) →
-        Html.hasAccessibleNameChildren (Html.canonicalList cs) = Html.hasAccessibleNameChildren cs
+        change F (mkCanonicalElem t a (Html.canonicalList cs)) = F (.element t a cs)
+        rcases mkCanonicalElem_cases t a cs with ⟨rfl, ha, c₀, rfl, heq⟩ | heq
+        · rw [heq, hUnwrap a c₀ ha]
+          exact htmlRec_canonical_node F FL hUnwrap hElem hCons c₀
+        · rw [heq]
+          exact hElem t a cs (htmlRec_canonical_list F FL hUnwrap hElem hCons cs)
+  private theorem htmlRec_canonical_list {msg γ : Type} (F : Html msg → γ) (FL : List (Html msg) → γ)
+      (hUnwrap : ∀ a c₀, onlySignalBind a = true → F (.element "span" a [c₀]) = F c₀)
+      (hElem : ∀ t a cs, FL (Html.canonicalList cs) = FL cs →
+        F (.element t (a.filterMap Attr.canonical) (Html.canonicalList cs)) = F (.element t a cs))
+      (hCons : ∀ c cs, F c.canonical = F c → FL (Html.canonicalList cs) = FL cs →
+        FL (c.canonical :: Html.canonicalList cs) = FL (c :: cs)) :
+      (cs : List (Html msg)) → FL (Html.canonicalList cs) = FL cs
     | [] => rfl
-    | c :: cs => by
-        simp [Html.canonicalList, Html.hasAccessibleNameChildren,
-          Html.hasAccessibleNameChild_canonical c, Html.hasAccessibleNameChildren_canonical cs]
+    | c :: cs => hCons c cs
+        (htmlRec_canonical_node F FL hUnwrap hElem hCons c)
+        (htmlRec_canonical_list F FL hUnwrap hElem hCons cs)
 end
 
-mutual
-  @[simp] theorem Html.buttonsAccessible_canonical {msg : Type} :
-      (h : Html msg) → Html.buttonsAccessible (Html.canonical h) = Html.buttonsAccessible h
-    | .text _ => rfl
-    | .element t a cs => by
-        dsimp [Html.canonical, mkCanonicalElem]
-        by_cases hcond : (t == "span" && onlySignalBind a) = true
-        · rw [if_pos hcond]
-          have ⟨ht, _⟩ := Bool.and_eq_true_iff.1 hcond
-          have hteq : t = "span" := beq_iff_eq.1 ht
-          subst hteq
-          cases hcl : Html.canonicalList cs with
-          | nil =>
-              have hL := Html.buttonsAccessibleList_canonical cs; rw [hcl] at hL
-              simp [Html.buttonsAccessible, Html.elemHasAccessibleName, hL]
-          | cons c rest =>
-              cases rest with
-              | nil =>
-                  rcases html_canonicalList_eq_singleton hcl with ⟨c₀, rfl, rfl⟩
-                  simp [Html.buttonsAccessible, Html.buttonsAccessibleList, Html.buttonsAccessible_canonical c₀]
-              | cons _ _ =>
-                  have hL := Html.buttonsAccessibleList_canonical cs; rw [hcl] at hL
-                  simp [Html.buttonsAccessible, Html.elemHasAccessibleName, hL]
-        · rw [if_neg hcond]
-          simp [Html.buttonsAccessible, Html.elemHasAccessibleName,
-            hasNonBlankAttr_canonical "aria-label" (by decide),
-            hasNonBlankAttr_canonical "aria-labelledby" (by decide),
-            hasNonBlankAttr_canonical "title" (by decide),
-            Html.hasAccessibleNameChildren_canonical cs, Html.buttonsAccessibleList_canonical cs]
-  @[simp] theorem Html.buttonsAccessibleList_canonical {msg : Type} :
-      (cs : List (Html msg)) → Html.buttonsAccessibleList (Html.canonicalList cs) = Html.buttonsAccessibleList cs
-    | [] => rfl
-    | c :: cs => by
-        simp [Html.canonicalList, Html.buttonsAccessibleList,
-          Html.buttonsAccessible_canonical c, Html.buttonsAccessibleList_canonical cs]
-end
+private theorem htmlRec_canonical {msg γ : Type} (F : Html msg → γ) (FL : List (Html msg) → γ)
+    (hUnwrap : ∀ a c₀, onlySignalBind a = true → F (.element "span" a [c₀]) = F c₀)
+    (hElem : ∀ t a cs, FL (Html.canonicalList cs) = FL cs →
+      F (.element t (a.filterMap Attr.canonical) (Html.canonicalList cs)) = F (.element t a cs))
+    (hCons : ∀ c cs, F c.canonical = F c → FL (Html.canonicalList cs) = FL cs →
+      FL (c.canonical :: Html.canonicalList cs) = FL (c :: cs)) :
+    (∀ h : Html msg, F h.canonical = F h) ∧
+    (∀ cs : List (Html msg), FL (Html.canonicalList cs) = FL cs) :=
+  ⟨htmlRec_canonical_node F FL hUnwrap hElem hCons,
+   htmlRec_canonical_list F FL hUnwrap hElem hCons⟩
 
-mutual
-  @[simp] theorem Html.validAriaRoles_canonical {msg : Type} :
-      (h : Html msg) → Html.validAriaRoles (Html.canonical h) = Html.validAriaRoles h
-    | .text _ => rfl
-    | .element t a cs => by
-        dsimp [Html.canonical, mkCanonicalElem]
-        by_cases hcond : (t == "span" && onlySignalBind a) = true
-        · rw [if_pos hcond]
-          have ⟨ht, ha⟩ := Bool.and_eq_true_iff.1 hcond
-          have hteq : t = "span" := beq_iff_eq.1 ht
-          subst hteq
-          cases hcl : Html.canonicalList cs with
-          | nil =>
-              have hL := Html.validAriaRolesList_canonical cs; rw [hcl] at hL
-              simp [Html.validAriaRoles, hL]
-          | cons c rest =>
-              cases rest with
-              | nil =>
-                  rcases html_canonicalList_eq_singleton hcl with ⟨c₀, rfl, rfl⟩
-                  simp [Html.validAriaRoles, Html.validAriaRolesList,
-                    attrsValidAriaRoles_of_onlySignalBind a ha, Html.validAriaRoles_canonical c₀]
-              | cons _ _ =>
-                  have hL := Html.validAriaRolesList_canonical cs; rw [hcl] at hL
-                  simp [Html.validAriaRoles, hL]
-        · rw [if_neg hcond]
-          simp [Html.validAriaRoles, Html.validAriaRolesList_canonical cs]
-  @[simp] theorem Html.validAriaRolesList_canonical {msg : Type} :
-      (cs : List (Html msg)) → Html.validAriaRolesList (Html.canonicalList cs) = Html.validAriaRolesList cs
-    | [] => rfl
-    | c :: cs => by
-        simp [Html.canonicalList, Html.validAriaRolesList,
-          Html.validAriaRoles_canonical c, Html.validAriaRolesList_canonical cs]
-end
+local macro "html_canonical_pair" fn:ident fl:ident fnThm:ident flThm:ident
+    "unwrap:" ufn:term "elem:" efn:term : command =>
+  `(private theorem cpair {msg : Type} :
+        (∀ h : Html msg, $fn (Html.canonical h) = $fn h) ∧
+        (∀ cs : List (Html msg), $fl (Html.canonicalList cs) = $fl cs) :=
+      htmlRec_canonical $fn $fl $ufn $efn (fun _ _ h1 h2 => by simp [$fl:ident, h1, h2])
+    @[simp] theorem $fnThm {msg : Type} (h : Html msg) : $fn (Html.canonical h) = $fn h := cpair.1 h
+    @[simp] theorem $flThm {msg : Type} (cs : List (Html msg)) :
+        $fl (Html.canonicalList cs) = $fl cs := cpair.2 cs)
 
-mutual
-  @[simp] theorem Html.containsFormControl_canonical {msg : Type} :
-      (h : Html msg) → Html.containsFormControl (Html.canonical h) = Html.containsFormControl h
-    | .text _ => rfl
-    | .element t a cs => by
-        dsimp [Html.canonical, mkCanonicalElem]
-        by_cases hcond : (t == "span" && onlySignalBind a) = true
-        · rw [if_pos hcond]
-          have ⟨ht, _⟩ := Bool.and_eq_true_iff.1 hcond
-          have hteq : t = "span" := beq_iff_eq.1 ht
-          subst hteq
-          cases hcl : Html.canonicalList cs with
-          | nil =>
-              have hL := Html.containsFormControlList_canonical cs; rw [hcl] at hL
-              simp [Html.containsFormControl, hL]
-          | cons c rest =>
-              cases rest with
-              | nil =>
-                  rcases html_canonicalList_eq_singleton hcl with ⟨c₀, rfl, rfl⟩
-                  simp [Html.containsFormControl, Html.containsFormControlList, isFormControlTag,
-                    Html.containsFormControl_canonical c₀]
-              | cons _ _ =>
-                  have hL := Html.containsFormControlList_canonical cs; rw [hcl] at hL
-                  simp [Html.containsFormControl, hL]
-        · rw [if_neg hcond]
-          simp [Html.containsFormControl, Html.containsFormControlList_canonical cs]
-  @[simp] theorem Html.containsFormControlList_canonical {msg : Type} :
-      (cs : List (Html msg)) → Html.containsFormControlList (Html.canonicalList cs) = Html.containsFormControlList cs
-    | [] => rfl
-    | c :: cs => by
-        simp [Html.canonicalList, Html.containsFormControlList,
-          Html.containsFormControl_canonical c, Html.containsFormControlList_canonical cs]
-end
-
-mutual
-  @[simp] theorem Html.labelsAssociated_canonical {msg : Type} :
-      (h : Html msg) → Html.labelsAssociated (Html.canonical h) = Html.labelsAssociated h
-    | .text _ => rfl
-    | .element t a cs => by
-        dsimp [Html.canonical, mkCanonicalElem]
-        by_cases hcond : (t == "span" && onlySignalBind a) = true
-        · rw [if_pos hcond]
-          have ⟨ht, _⟩ := Bool.and_eq_true_iff.1 hcond
-          have hteq : t = "span" := beq_iff_eq.1 ht
-          subst hteq
-          cases hcl : Html.canonicalList cs with
-          | nil =>
-              have hL := Html.labelsAssociatedList_canonical cs; rw [hcl] at hL
-              simp [Html.labelsAssociated, hL]
-          | cons c rest =>
-              cases rest with
-              | nil =>
-                  rcases html_canonicalList_eq_singleton hcl with ⟨c₀, rfl, rfl⟩
-                  simp [Html.labelsAssociated, Html.labelsAssociatedList, Html.labelsAssociated_canonical c₀]
-              | cons _ _ =>
-                  have hL := Html.labelsAssociatedList_canonical cs; rw [hcl] at hL
-                  simp [Html.labelsAssociated, hL]
-        · rw [if_neg hcond]
-          simp [Html.labelsAssociated, hasNonBlankAttr_canonical "for" (by decide),
-            Html.containsFormControlList_canonical cs, Html.labelsAssociatedList_canonical cs]
-  @[simp] theorem Html.labelsAssociatedList_canonical {msg : Type} :
-      (cs : List (Html msg)) → Html.labelsAssociatedList (Html.canonicalList cs) = Html.labelsAssociatedList cs
-    | [] => rfl
-    | c :: cs => by
-        simp [Html.canonicalList, Html.labelsAssociatedList,
-          Html.labelsAssociated_canonical c, Html.labelsAssociatedList_canonical cs]
-end
-
-mutual
-  @[simp] theorem Html.collectIds_canonical {msg : Type} :
-      (h : Html msg) → Html.collectIds (Html.canonical h) = Html.collectIds h
-    | .text _ => rfl
-    | .element t a cs => by
-        dsimp [Html.canonical, mkCanonicalElem]
-        by_cases hcond : (t == "span" && onlySignalBind a) = true
-        · rw [if_pos hcond]
-          have ⟨ht, ha⟩ := Bool.and_eq_true_iff.1 hcond
-          have hteq : t = "span" := beq_iff_eq.1 ht
-          subst hteq
-          have hid := attrValue_of_onlySignalBind "id" a ha
-          cases hcl : Html.canonicalList cs with
-          | nil =>
-              have hL := Html.collectIdsList_canonical cs; rw [hcl] at hL
-              simp [Html.collectIds, attrValue_canonical "id" (by decide), hL]
-          | cons c rest =>
-              cases rest with
-              | nil =>
-                  rcases html_canonicalList_eq_singleton hcl with ⟨c₀, rfl, rfl⟩
-                  simp [Html.collectIds, Html.collectIdsList, hid, Html.collectIds_canonical c₀]
-              | cons _ _ =>
-                  have hL := Html.collectIdsList_canonical cs; rw [hcl] at hL
-                  simp [Html.collectIds, attrValue_canonical "id" (by decide), hL]
-        · rw [if_neg hcond]
-          simp [Html.collectIds, attrValue_canonical "id" (by decide), Html.collectIdsList_canonical cs]
-  @[simp] theorem Html.collectIdsList_canonical {msg : Type} :
-      (cs : List (Html msg)) → Html.collectIdsList (Html.canonicalList cs) = Html.collectIdsList cs
-    | [] => rfl
-    | c :: cs => by
-        simp [Html.canonicalList, Html.collectIdsList, Html.collectIds_canonical c, Html.collectIdsList_canonical cs]
-end
+html_canonical_pair Html.imgsHaveAlt Html.imgsHaveAltList Html.imgsHaveAlt_canonical Html.imgsHaveAltList_canonical
+  unwrap: (fun _ _ _ => by simp [Html.imgsHaveAlt, Html.imgsHaveAltList])
+  elem: (fun _ _ _ ih => by simp [Html.imgsHaveAlt, hasAttr_canonical "alt" (by decide), ih])
+html_canonical_pair Html.hasAccessibleNameChild Html.hasAccessibleNameChildren Html.hasAccessibleNameChild_canonical Html.hasAccessibleNameChildren_canonical
+  unwrap: (fun a _ ha => by simp [Html.hasAccessibleNameChild, Html.hasAccessibleNameChildren, hasNonBlankAttr,
+    attrValue_of_onlySignalBind "aria-label" a ha, attrValue_of_onlySignalBind "aria-labelledby" a ha])
+  elem: (fun _ _ _ ih => by simp [Html.hasAccessibleNameChild, hasNonBlankAttr_canonical "alt" (by decide),
+    hasNonBlankAttr_canonical "aria-label" (by decide), hasNonBlankAttr_canonical "aria-labelledby" (by decide), ih])
+html_canonical_pair Html.buttonsAccessible Html.buttonsAccessibleList Html.buttonsAccessible_canonical Html.buttonsAccessibleList_canonical
+  unwrap: (fun _ _ _ => by simp [Html.buttonsAccessible, Html.buttonsAccessibleList])
+  elem: (fun _ _ cs ih => by simp [Html.buttonsAccessible, Html.elemHasAccessibleName,
+    hasNonBlankAttr_canonical "aria-label" (by decide), hasNonBlankAttr_canonical "aria-labelledby" (by decide),
+    hasNonBlankAttr_canonical "title" (by decide), Html.hasAccessibleNameChildren_canonical cs, ih])
+html_canonical_pair Html.validAriaRoles Html.validAriaRolesList Html.validAriaRoles_canonical Html.validAriaRolesList_canonical
+  unwrap: (fun a _ ha => by simp [Html.validAriaRoles, Html.validAriaRolesList, attrsValidAriaRoles_of_onlySignalBind a ha])
+  elem: (fun _ _ _ ih => by simp [Html.validAriaRoles, ih])
+html_canonical_pair Html.containsFormControl Html.containsFormControlList Html.containsFormControl_canonical Html.containsFormControlList_canonical
+  unwrap: (fun _ _ _ => by simp [Html.containsFormControl, Html.containsFormControlList, isFormControlTag])
+  elem: (fun _ _ _ ih => by simp [Html.containsFormControl, ih])
+html_canonical_pair Html.labelsAssociated Html.labelsAssociatedList Html.labelsAssociated_canonical Html.labelsAssociatedList_canonical
+  unwrap: (fun _ _ _ => by simp [Html.labelsAssociated, Html.labelsAssociatedList])
+  elem: (fun _ _ cs ih => by simp [Html.labelsAssociated, hasNonBlankAttr_canonical "for" (by decide), Html.containsFormControlList_canonical cs, ih])
+html_canonical_pair Html.collectIds Html.collectIdsList Html.collectIds_canonical Html.collectIdsList_canonical
+  unwrap: (fun a _ ha => by simp [Html.collectIds, Html.collectIdsList, attrValue_of_onlySignalBind "id" a ha])
+  elem: (fun _ _ _ ih => by simp [Html.collectIds, attrValue_canonical "id" (by decide), ih])
 
 @[simp] theorem Html.noDuplicateIds_canonical {msg : Type} (h : Html msg) :
-    Html.noDuplicateIds (Html.canonical h) = Html.noDuplicateIds h := by
-  simp [Html.noDuplicateIds]
+    Html.noDuplicateIds (Html.canonical h) = Html.noDuplicateIds h := by simp [Html.noDuplicateIds]
 
-mutual
-  @[simp] theorem Html.collectHeadings_canonical {msg : Type} :
-      (h : Html msg) → Html.collectHeadings (Html.canonical h) = Html.collectHeadings h
-    | .text _ => rfl
-    | .element t a cs => by
-        dsimp [Html.canonical, mkCanonicalElem]
-        by_cases hcond : (t == "span" && onlySignalBind a) = true
-        · rw [if_pos hcond]
-          have ⟨ht, _⟩ := Bool.and_eq_true_iff.1 hcond
-          have hteq : t = "span" := beq_iff_eq.1 ht
-          subst hteq
-          cases hcl : Html.canonicalList cs with
-          | nil =>
-              have hL := Html.collectHeadingsList_canonical cs; rw [hcl] at hL
-              simp [Html.collectHeadings, hL]
-          | cons c rest =>
-              cases rest with
-              | nil =>
-                  rcases html_canonicalList_eq_singleton hcl with ⟨c₀, rfl, rfl⟩
-                  simp [Html.collectHeadings, Html.collectHeadingsList, headingLevel?, Html.collectHeadings_canonical c₀]
-              | cons _ _ =>
-                  have hL := Html.collectHeadingsList_canonical cs; rw [hcl] at hL
-                  simp [Html.collectHeadings, hL]
-        · rw [if_neg hcond]
-          simp [Html.collectHeadings, Html.collectHeadingsList_canonical cs]
-  @[simp] theorem Html.collectHeadingsList_canonical {msg : Type} :
-      (cs : List (Html msg)) → Html.collectHeadingsList (Html.canonicalList cs) = Html.collectHeadingsList cs
-    | [] => rfl
-    | c :: cs => by
-        simp [Html.canonicalList, Html.collectHeadingsList,
-          Html.collectHeadings_canonical c, Html.collectHeadingsList_canonical cs]
-end
+html_canonical_pair Html.collectHeadings Html.collectHeadingsList Html.collectHeadings_canonical Html.collectHeadingsList_canonical
+  unwrap: (fun _ _ _ => by simp [Html.collectHeadings, Html.collectHeadingsList, headingLevel?])
+  elem: (fun _ _ _ ih => by simp [Html.collectHeadings, ih])
 
 @[simp] theorem Html.headingsOrdered_canonical {msg : Type} (h : Html msg) :
-    Html.headingsOrdered (Html.canonical h) = Html.headingsOrdered h := by
-  simp [Html.headingsOrdered]
+    Html.headingsOrdered (Html.canonical h) = Html.headingsOrdered h := by simp [Html.headingsOrdered]
 
-mutual
-  @[simp] theorem Html.htmlHasLang_canonical {msg : Type} :
-      (h : Html msg) → Html.htmlHasLang (Html.canonical h) = Html.htmlHasLang h
-    | .text _ => rfl
-    | .element t a cs => by
-        dsimp [Html.canonical, mkCanonicalElem]
-        by_cases hcond : (t == "span" && onlySignalBind a) = true
-        · rw [if_pos hcond]
-          have ⟨ht, _⟩ := Bool.and_eq_true_iff.1 hcond
-          have hteq : t = "span" := beq_iff_eq.1 ht
-          subst hteq
-          cases hcl : Html.canonicalList cs with
-          | nil =>
-              have hL := Html.htmlHasLangList_canonical cs; rw [hcl] at hL
-              simp [Html.htmlHasLang, hL]
-          | cons c rest =>
-              cases rest with
-              | nil =>
-                  rcases html_canonicalList_eq_singleton hcl with ⟨c₀, rfl, rfl⟩
-                  simp [Html.htmlHasLang, Html.htmlHasLangList, Html.htmlHasLang_canonical c₀]
-              | cons _ _ =>
-                  have hL := Html.htmlHasLangList_canonical cs; rw [hcl] at hL
-                  simp [Html.htmlHasLang, hL]
-        · rw [if_neg hcond]
-          simp [Html.htmlHasLang, hasNonBlankAttr_canonical "lang" (by decide), Html.htmlHasLangList_canonical cs]
-  @[simp] theorem Html.htmlHasLangList_canonical {msg : Type} :
-      (cs : List (Html msg)) → Html.htmlHasLangList (Html.canonicalList cs) = Html.htmlHasLangList cs
-    | [] => rfl
-    | c :: cs => by
-        simp [Html.canonicalList, Html.htmlHasLangList, Html.htmlHasLang_canonical c, Html.htmlHasLangList_canonical cs]
-end
+html_canonical_pair Html.htmlHasLang Html.htmlHasLangList Html.htmlHasLang_canonical Html.htmlHasLangList_canonical
+  unwrap: (fun _ _ _ => by simp [Html.htmlHasLang, Html.htmlHasLangList])
+  elem: (fun _ _ _ ih => by simp [Html.htmlHasLang, hasNonBlankAttr_canonical "lang" (by decide), ih])
 
 @[simp] theorem Html.a11yValid_canonical {msg : Type} (h : Html msg) :
-    Html.a11yValid (Html.canonical h) = Html.a11yValid h := by
-  simp [Html.a11yValid]
+    Html.a11yValid (Html.canonical h) = Html.a11yValid h := by simp [Html.a11yValid]
 
 /-! ### List-Map Lifting Lemmas for Accessibility Predicates -/
 
-theorem Html.imgsHaveAltList_mapList {α msg : Type} (g : α → Html msg) (l : List α) :
-    Html.imgsHaveAltList (l.map g) = true ↔ ∀ x ∈ l, Html.imgsHaveAlt (g x) = true := by
+private theorem htmlListPred_mapList {α msg : Type} (F : Html msg → Bool) (FL : List (Html msg) → Bool)
+    (hNil : FL [] = true) (hCons : ∀ c cs, FL (c :: cs) = (F c && FL cs))
+    (g : α → Html msg) (l : List α) :
+    FL (l.map g) = true ↔ ∀ x ∈ l, F (g x) = true := by
   induction l with
-  | nil => simp [Html.imgsHaveAltList]
-  | cons x xs ih => simp [Html.imgsHaveAltList, ih, Bool.and_eq_true]
+  | nil => simp [hNil]
+  | cons x xs ih => simp [hCons, ih, Bool.and_eq_true]
+
+theorem Html.imgsHaveAltList_mapList {α msg : Type} (g : α → Html msg) (l : List α) :
+    Html.imgsHaveAltList (l.map g) = true ↔ ∀ x ∈ l, Html.imgsHaveAlt (g x) = true :=
+  htmlListPred_mapList Html.imgsHaveAlt Html.imgsHaveAltList rfl (fun _ _ => rfl) g l
 
 theorem Html.buttonsAccessibleList_mapList {α msg : Type} (g : α → Html msg) (l : List α) :
-    Html.buttonsAccessibleList (l.map g) = true ↔ ∀ x ∈ l, Html.buttonsAccessible (g x) = true := by
-  induction l with
-  | nil => simp [Html.buttonsAccessibleList]
-  | cons x xs ih => simp [Html.buttonsAccessibleList, ih, Bool.and_eq_true]
+    Html.buttonsAccessibleList (l.map g) = true ↔ ∀ x ∈ l, Html.buttonsAccessible (g x) = true :=
+  htmlListPred_mapList Html.buttonsAccessible Html.buttonsAccessibleList rfl (fun _ _ => rfl) g l
 
 theorem Html.validAriaRolesList_mapList {α msg : Type} (g : α → Html msg) (l : List α) :
-    Html.validAriaRolesList (l.map g) = true ↔ ∀ x ∈ l, Html.validAriaRoles (g x) = true := by
-  induction l with
-  | nil => simp [Html.validAriaRolesList]
-  | cons x xs ih => simp [Html.validAriaRolesList, ih, Bool.and_eq_true]
+    Html.validAriaRolesList (l.map g) = true ↔ ∀ x ∈ l, Html.validAriaRoles (g x) = true :=
+  htmlListPred_mapList Html.validAriaRoles Html.validAriaRolesList rfl (fun _ _ => rfl) g l
 
 theorem Html.labelsAssociatedList_mapList {α msg : Type} (g : α → Html msg) (l : List α) :
-    Html.labelsAssociatedList (l.map g) = true ↔ ∀ x ∈ l, Html.labelsAssociated (g x) = true := by
-  induction l with
-  | nil => simp [Html.labelsAssociatedList]
-  | cons x xs ih => simp [Html.labelsAssociatedList, ih, Bool.and_eq_true]
+    Html.labelsAssociatedList (l.map g) = true ↔ ∀ x ∈ l, Html.labelsAssociated (g x) = true :=
+  htmlListPred_mapList Html.labelsAssociated Html.labelsAssociatedList rfl (fun _ _ => rfl) g l
 
 theorem Html.htmlHasLangList_mapList {α msg : Type} (g : α → Html msg) (l : List α) :
-    Html.htmlHasLangList (l.map g) = true ↔ ∀ x ∈ l, Html.htmlHasLang (g x) = true := by
-  induction l with
-  | nil => simp [Html.htmlHasLangList]
-  | cons x xs ih => simp [Html.htmlHasLangList, ih, Bool.and_eq_true]
+    Html.htmlHasLangList (l.map g) = true ↔ ∀ x ∈ l, Html.htmlHasLang (g x) = true :=
+  htmlListPred_mapList Html.htmlHasLang Html.htmlHasLangList rfl (fun _ _ => rfl) g l
 
 end Qed

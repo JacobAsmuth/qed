@@ -233,7 +233,6 @@ def isPlaceholder (stx : Syntax) : Bool :=
   u.getKind == ``qedPlaceholder || (u.reprint.getD "").trimmed == "_"
 
 def atomStr : Syntax → String := Qed.Jsx.tokenVal
-def asTerm (s : Syntax) : Term := ⟨s⟩
 
 partial def mentionsIdent (stx : Syntax) (n : Name) : Bool :=
   match stx with
@@ -268,9 +267,6 @@ partial def hasFreeIdent (target : Name) (stx : Syntax) : Bool :=
     hasFreeIdent target (stx.getArg 1)
   else
     stx.getArgs.any (hasFreeIdent target)
-
-def unpackSeq (seqStx : Syntax) : Array Syntax :=
-  Qed.Lang.suiteStmts seqStx
 
 def isEventEmitExpr (eventNames : Array Name) (exprStx : Syntax) : Bool :=
   match matchIdentMethodCall? exprStx with

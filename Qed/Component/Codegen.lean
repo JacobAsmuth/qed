@@ -153,68 +153,23 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
         mkUpdateRet spec (← flushMutated sBase mutated) out? cmds
       else if sk == ``qedStmtLet then
         lowerLetStmt s (lowerCompExpr .val) (← compileStmts spec sBase mutated out? cmds rest)
-      else if sk == ``qedStmtAssign then
+      else if sk == ``qedStmtAssign && (s.getArg 0).getKind == ``qedIdent &&
+          spec.bindNames.contains ((s.getArg 0).getArg 0).getId.eraseMacroScopes then
         let op := atomStr (s.getArg 1)
-        if (s.getArg 0).getKind == ``qedIdent then
-          let fId : Ident := ⟨((s.getArg 0).getArg 0)⟩
-          let fname := fId.getId.eraseMacroScopes
-          let valTerm ←
-            if op == "=" && isPlaceholder (s.getArg 2) then `(v)
-            else desugarAssign fname op (← lowerCompExpr .val (s.getArg 2))
-          if spec.bindNames.contains fname then
-            if out?.isSome then
-              throwErrorAt s s!"cannot assign `bind` field `{fname}` here: this action already emits an output event (an action emits at most one output)"
-            let outCtor := mkIdent (spec.t.getId ++ `Out ++ Name.mkSimple s!"set_{fname}")
-            let oTerm ← `($outCtor $valTerm)
-            return ← compileStmts spec sBase mutated (some oTerm) cmds rest
-          unless spec.fieldNames.contains fname do
-            throwNotMutableStateField fId s!"`{fname}`" fname spec.fieldNames spec.propNames
-          let cont ← compileStmts spec sBase (mutated.push fname) out? cmds rest
-          let fIdent := mkIdent fname
-          `(let $fIdent:ident := $valTerm; $cont)
-        else if (s.getArg 0).getKind == ``qedIndex && ((s.getArg 0).getArg 0).getKind == ``qedIdent && op == "=" then
-          let fId : Ident := ⟨(((s.getArg 0).getArg 0).getArg 0)⟩
-          let fname := fId.getId.eraseMacroScopes
-          unless spec.fieldNames.contains fname do
-            throwNotMutableStateField fId s!"`{fname}`" fname spec.fieldNames spec.propNames
-          let idxT ← lowerCompExpr .val ((s.getArg 0).getArg 2)
-          let rhsT ← lowerCompExpr .val (s.getArg 2)
-          let fIdent := mkIdent fname
-          let cont ← compileStmts spec sBase (mutated.push fname) out? cmds rest
-          lowerArraySetExpr fIdent idxT rhsT cont
-        else
-          let lhsStr := stxSnippet (s.getArg 0)
-          let what := if lhsStr.isEmpty then "" else s!" `{lhsStr} {op} ...`"
-          throwErrorAt s s!"unsupported assignment{what} in component action; expected `field = val`, `field += val`, `field -= val`, or `arr[i] = val`"
+        let fname := ((s.getArg 0).getArg 0).getId.eraseMacroScopes
+        let valTerm ←
+          if op == "=" && isPlaceholder (s.getArg 2) then `(v)
+          else desugarAssign fname op (← lowerCompExpr .val (s.getArg 2))
+        if out?.isSome then
+          throwErrorAt s s!"cannot assign `bind` field `{fname}` here: this action already emits an output event (an action emits at most one output)"
+        let outCtor := mkIdent (spec.t.getId ++ `Out ++ Name.mkSimple s!"set_{fname}")
+        let oTerm ← `($outCtor $valTerm)
+        return ← compileStmts spec sBase mutated (some oTerm) cmds rest
+      else if let some (fname, wrap) ← lowerMutStmt? spec s true then
+        wrap (← compileStmts spec sBase (mutated.push fname) out? cmds rest)
       else if sk == ``qedStmtExpr then
         let exprStx := s.getArg 0
-        if let some (targetStx, elemStx) := matchPushCall? exprStx then
-          unless targetStx.getKind == ``qedIdent do
-            let tgtStr := stxSnippet targetStx
-            let got := if tgtStr.isEmpty then "" else s!", got `{tgtStr}.push(...)`"
-            throwErrorAt targetStx s!"array `.push(...)` in component actions requires a simple `state` field (e.g. `items.push(x)`){got}"
-          let fId : Ident := ⟨(targetStx.getArg 0)⟩
-          let fname := fId.getId.eraseMacroScopes
-          unless spec.fieldNames.contains fname do
-            throwNotMutableStateField fId s!"`{fname}`" fname spec.fieldNames spec.propNames
-          let elemT ← lowerCompExpr .val elemStx
-          let fIdent := mkIdent fname
-          let cont ← compileStmts spec sBase (mutated.push fname) out? cmds rest
-          `(let $fIdent:ident := ($fIdent).push $elemT; $cont)
-        else if let some (targetStx, keyStx) := matchRemoveCall? exprStx then
-          unless targetStx.getKind == ``qedIdent do
-            let tgtStr := stxSnippet targetStx
-            let got := if tgtStr.isEmpty then "" else s!", got `{tgtStr}.remove(...)`"
-            throwErrorAt targetStx s!"dictionary `.remove(...)` in component actions requires a simple `state` field (e.g. `scores.remove(k)`){got}"
-          let fId : Ident := ⟨(targetStx.getArg 0)⟩
-          let fname := fId.getId.eraseMacroScopes
-          unless spec.fieldNames.contains fname do
-            throwNotMutableStateField fId s!"`{fname}`" fname spec.fieldNames spec.propNames
-          let keyT ← lowerCompExpr .val keyStx
-          let fIdent := mkIdent fname
-          let cont ← compileStmts spec sBase (mutated.push fname) out? cmds rest
-          `(let $fIdent:ident := ($fIdent).remove $keyT; $cont)
-        else if let some (targetId, meth, rawArgs) := matchIdentMethodCall? exprStx then
+        if let some (targetId, meth, rawArgs) := matchIdentMethodCall? exprStx then
           let tname := targetId.getId.eraseMacroScopes
           if meth == "emit" then
             match spec.events.find? (·.id.getId.eraseMacroScopes == tname) with

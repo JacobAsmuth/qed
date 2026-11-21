@@ -24,11 +24,7 @@ private def elabPureCompInvariants (spec : ComponentSpec) (viewId : Ident) (msgV
     let invId := resolveInvIdent invStx tId
     let rawClauses := (invStx.getArg 2).getSepArgs
     let loweredClauses ← rawClauses.mapM (lowerCompExpr .val)
-    let vPred ← match loweredClauses.toList with
-      | [p] => pure p
-      | p :: ps => ps.foldlM (init := p) fun acc q => `(Qed.both $acc $q)
-      | [] => throwErrorAt invStx "empty view invariant"
-    let predStr := String.intercalate ", " (rawClauses.toList.map fun c => (c.reprint.getD "this rule").trimmed)
+    let (vPred, predStr) ← mkViewPredAndStr invStx rawClauses loweredClauses "empty view invariant"
     let vCall ← if needsProps then `($viewId p) else `(($viewId : Html $msgV))
     let pf? : Option Term := if (invStx.getArg 5).getNumArgs == 2 then some ⟨((invStx.getArg 5).getArg 1)⟩ else none
     let rhs ← pf?.getDM `(by
@@ -148,21 +144,11 @@ private def mkCompLocalDefCmds (spec : ComponentSpec) (idLit : StrLit) :
           localMountWith $idLit key onOut))
   return cmds
 
-private def canSynthDecidablePred (stateId : Ident) (pred : Term) : CommandElabM Bool := do
-  let saved ← get
-  try
-    let ok ← liftTermElabM do
-      let preCount := (← Core.getMessageLog).toList.length
-      let pVal ← Term.elabTermEnsuringType pred (← Term.elabType (← `($stateId → Prop)))
-      Term.synthesizeSyntheticMVarsNoPostponing
-      if ((← Core.getMessageLog).toList.drop preCount).any (·.severity == .error) then return false
-      let expected ← Meta.mkAppM ``DecidablePred #[pVal]
-      return (← Meta.trySynthInstance expected) matches .some _
-    modify fun _ => saved
-    return ok
-  catch _ =>
-    modify fun _ => saved
-    return false
+private def canSynthDecidablePred (stateId : Ident) (pred : Term) : CommandElabM Bool :=
+  probeTermElabM do
+    let pVal ← Term.elabTermEnsuringType pred (← Term.elabType (← `($stateId → Prop)))
+    Term.synthesizeSyntheticMVarsNoPostponing
+    return (← Meta.trySynthInstance (← Meta.mkAppM ``DecidablePred #[pVal])) matches .some _
 
 private def mkEnsuredExistentialWrap (ensConst : Name) (qaIds : Array Ident)
     (elemVar : Ident) : CommandElabM (Term × Term) := do
@@ -358,17 +344,10 @@ private def mkSpecAppCmds (spec : ComponentSpec) (tId : Name) (stateId msgId app
 private def resolveThemeStyles (themes : Array Ident) : CommandElabM (Array Term) := do
   let env ← getEnv; let currNs ← getCurrNamespace; let openDecls := (← getScope).openDecls
   let thReg := Qed.StyleDsl.themeMetaRegistry.getState env
-  let mut thStyleTerms : Array Term := #[]
-  for thId in themes do
-    let nm := thId.getId
-    let thInfo? := (thReg.find? (currNs ++ nm)).orElse (fun _ => thReg.find? nm) |>.orElse fun _ =>
-      openDecls.findSome? fun
-        | .simple ns _ => thReg.find? (ns ++ nm)
-        | .explicit id declName => if id == nm then thReg.find? declName else none
-    let some thInfo := thInfo?
-      | throwErrorAt thId s!"unknown `theme` `{nm}`"
-    thStyleTerms := thStyleTerms.push (mkIdentFrom thId thInfo.styleConst)
-  return thStyleTerms
+  themes.mapM fun thId => do
+    let some thInfo := Qed.StyleDsl.resolveInRegistry thReg env currNs openDecls thId.getId.toString
+      | throwErrorAt thId s!"unknown `theme` `{thId.getId}`"
+    return mkIdentFrom thId thInfo.styleConst
 
 private def applyHeadDirectives (hmId stId : Ident) (dirs : Array Syntax) (tail : Term) :
     CommandElabM Term := do

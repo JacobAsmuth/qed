@@ -101,6 +101,7 @@ open Lean in
         let hasPlaceholders := rawSegs.any (·.startsWith ":")
         let mut bs     : Array (TSyntax `ident) := #[]
         let mut btsArr : Array (TSyntax `term)  := #[]
+        let mut segments : Array (Sum String (TSyntax `ident)) := #[]
         let pathDesc := match seg with | some s => s!"`{s.getString}`" | none => s!"`/{c.getId}`"
         if hasPlaceholders then
           let mut seenPlaceholders : Array String := #[]
@@ -112,51 +113,32 @@ open Lean in
               if seenPlaceholders.contains pname then
                 Macro.throwErrorAt alt s!"router `{t.getId}`: route `{c.getId}` has duplicate `:{pname}` parameter in path {pathDesc}"
               seenPlaceholders := seenPlaceholders.push pname
-              match explicitBinders.find? (fun (b, _) => toString b.getId == pname) with
-              | some (b, bt) =>
-                  bs     := bs.push b
-                  btsArr := btsArr.push bt
-              | none =>
-                  bs     := bs.push (mkIdent (Name.mkSimple pname))
-                  btsArr := btsArr.push (← `(String))
+              let (b, bt) ← match explicitBinders.find? (fun (b, _) => toString b.getId == pname) with
+                | some pair => pure pair
+                | none => pure (mkIdent (Name.mkSimple pname), ← `(String))
+              bs := bs.push b; btsArr := btsArr.push bt; segments := segments.push (.inr b)
+            else
+              segments := segments.push (.inl rs)
           for (b, _) in explicitBinders do
             unless seenPlaceholders.contains (toString b.getId) do
               Macro.throwErrorAt b s!"router `{t.getId}`: parameter `{b.getId}` on route `{c.getId}` is not referenced as `:{b.getId}` in path {pathDesc}"
         else
-          bs     := explicitBinders.map (·.1)
+          bs := explicitBinders.map (·.1)
           btsArr := explicitBinders.map (·.2)
+          segments := rawSegs.map .inl ++ bs.map .inr
         let ctorId := mkIdent (t.getId ++ c.getId)
-        let patShape : Array (Option String) :=
-          if hasPlaceholders then
-            rawSegs.map fun rs => if rs.startsWith ":" then none else some rs
-          else
-            rawSegs.map some ++ Array.replicate bs.size none
+        let patShape : Array (Option String) := segments.map fun | .inl s => some s | .inr _ => none
         for (prevC, prevPat) in patShapes do
           if routePatternsOverlap prevPat patShape then
             Macro.throwErrorAt c
               s!"router `{t.getId}`: route `{c.getId}` overlaps with earlier route `{prevC.getId}` (both match {patShape.size}-segment paths)"
         patShapes := patShapes.push (c, patShape)
-        let (printSeg, parseSeg) ← if hasPlaceholders then do
-          let mut pr : Array (TSyntax `term) := #[]
-          let mut pa : Array (TSyntax `term) := #[]
-          for rs in rawSegs do
-            if rs.startsWith ":" then
-              let pname := String.ofList (rs.toList.drop 1)
-              let some bId := bs.find? (fun b => toString b.getId == pname)
-                | Macro.throwErrorAt alt "router: internal missing param"
-              let bTerm : TSyntax `term := ⟨bId.raw⟩
-              pr := pr.push (← `(RouteParam.toSeg $bTerm))
-              pa := pa.push bTerm
-            else
-              pr := pr.push (quote rs)
-              pa := pa.push (quote rs)
-          pure (pr, pa)
-        else do
-          let segs : Array (TSyntax `term) := rawSegs.map (quote ·)
-          let printTerms ← bs.mapM fun b => do
-            let bTerm : TSyntax `term := ⟨b.raw⟩
-            `(RouteParam.toSeg $bTerm)
-          pure (segs ++ printTerms, segs ++ bs.map (fun b => (⟨b.raw⟩ : TSyntax `term)))
+        let printSeg ← segments.mapM fun
+          | .inl s => pure (quote s : TSyntax `term)
+          | .inr b => let bTerm : TSyntax `term := ⟨b.raw⟩; `(RouteParam.toSeg $bTerm)
+        let parseSeg : Array (TSyntax `term) := segments.map fun
+          | .inl s => quote s
+          | .inr b => ⟨b.raw⟩
         let mut parseBody : TSyntax `term ← `(some ($ctorId $bs*))
         for i in (List.range bs.size).reverse do
           let bTerm : TSyntax `term := ⟨bs[i]!.raw⟩

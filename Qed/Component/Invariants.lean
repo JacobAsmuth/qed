@@ -13,20 +13,33 @@ def resolveInvIdent (invStx : Syntax) (compId : Name) : Ident :=
 
 /-! ## Inline Invariant Elaboration -/
 
-private def isViewPred (msgId : Ident) (pred : Term) : CommandElabM Bool := do
+def probeTermElabM (action : Term.TermElabM Bool) : CommandElabM Bool := do
   let saved ← get
   try
     let ok ← liftTermElabM do
       let preCount := (← Core.getMessageLog).toList.length
-      let expected ← Term.elabType (← `(Html $msgId → Bool))
-      let _ ← Term.elabTermEnsuringType pred expected
-      Term.synthesizeSyntheticMVarsNoPostponing
-      return ((← Core.getMessageLog).toList.drop preCount).all (·.severity != .error)
+      let res ← action
+      return res && ((← Core.getMessageLog).toList.drop preCount).all (·.severity != .error)
     modify fun _ => saved
     return ok
   catch _ =>
     modify fun _ => saved
     return false
+
+def mkViewPredAndStr (invStx : Syntax) (rawClauses : Array Syntax) (clauses : Array Term)
+    (emptyMsg : String) : CommandElabM (Term × String) := do
+  let vPred ← match clauses.toList with
+    | [p] => pure p
+    | p :: ps => ps.foldlM (init := p) fun acc q => `(Qed.both $acc $q)
+    | [] => throwErrorAt invStx emptyMsg
+  let predStr := String.intercalate ", " (rawClauses.toList.map fun c => (c.reprint.getD "this rule").trimmed)
+  return (vPred, predStr)
+
+private def isViewPred (msgId : Ident) (pred : Term) : CommandElabM Bool :=
+  probeTermElabM do
+    let _ ← Term.elabTermEnsuringType pred (← Term.elabType (← `(Html $msgId → Bool)))
+    Term.synthesizeSyntheticMVarsNoPostponing
+    return true
 
 private def isForEachStyled (invStx : Syntax) : CommandElabM Bool := do
   let pred ← lowerCompExpr .val (invStx.getArg 2)
@@ -88,11 +101,7 @@ private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : 
   let tId     := spec.t.getId
   let propsId := mkIdent (tId ++ `Props)
   let viewId  := mkIdent (tId ++ `view)
-  let vPred ← match clauses.toList with
-    | [p] => pure p
-    | p :: ps => ps.foldlM (init := p) fun acc q => `(Qed.both $acc $q)
-    | [] => throwErrorAt invStx "empty view styling invariant"
-  let predStr := String.intercalate ", " (rawClauses.toList.map fun c => (c.reprint.getD "this rule").trimmed)
+  let (vPred, predStr) ← mkViewPredAndStr invStx rawClauses clauses "empty view styling invariant"
   if spec.hasProps then
     let rhs ← pf?.getDM `(by
       let _qed_hv := $viewId p

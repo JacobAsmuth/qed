@@ -303,12 +303,7 @@ private theorem pendingIds_replacePending_sub {State Msg : Type}
 
 private theorem nodup_append_singleton {α : Type} {l : List α} {x : α}
     (hnd : l.Nodup) (hnot : x ∉ l) : (l ++ [x]).Nodup := by
-  induction l with
-  | nil => simp
-  | cons a t ih =>
-      rcases List.nodup_cons.1 hnd with ⟨ha, ht⟩
-      exact List.nodup_cons.2 ⟨by simp [ha, show a ≠ x from fun h => hnot (by simp [h])],
-        ih ht (fun h => hnot (List.mem_cons_of_mem a h))⟩
+  simp [List.nodup_append, hnd]; intro a ha heq; subst heq; exact hnot ha
 
 private theorem resolveReplace_preserves_wellFormedIds {State Msg : Type}
     (upd : State → Msg → State × Cmd Msg) (txId : Nat) (replMsgs : List Msg)
@@ -542,6 +537,27 @@ private theorem step_resolve_empty_pending_drains {State Msg : Type}
     split at hpe <;> (rename_i h2; simp only [h2, ↓reduceIte]; exact .inl (hdrain _ _ hpe))
   · rw [hstep] at hpe ⊢; exact hrr hpe
 
+private theorem step_resolve_pendingIds_split {State Msg : Type}
+    (upd : State → Msg → State × Cmd Msg) (classify : State → Msg → SpecAction Msg)
+    (st : SpecState State Msg) (msg : Msg)
+    (txId : Nat) (sm : Msg) (hit : Bool) (replMsgs confirmOnHit : List Msg)
+    (pre post : List (SpecEntry Msg))
+    (hlog : st.log = pre ++ .pending txId sm :: post)
+    (hnotPre : txId ∉ pendingIds pre)
+    (hcl : classify st.visible msg = .resolve txId hit replMsgs confirmOnHit) :
+    pendingIds (SpecEngine.step upd classify st msg).1.log = pendingIds pre ++ pendingIds post := by
+  by_cases hhh : hit && pre.isEmpty
+  · cases pre with
+    | nil =>
+        simp only [List.isEmpty_nil, Bool.and_true] at hhh; subst hhh
+        simp only [List.nil_append] at hlog
+        unfold SpecEngine.step; rw [hcl, hlog]; dsimp only
+        simp only [beq_self_eq_true, Bool.and_self, ↓reduceIte, pendingIds_nil, List.nil_append]
+        split <;> simp [drainConfirmed_pendingIds]
+    | cons _ _ => simp at hhh
+  · exact (resolve_general_linearizable upd classify st msg txId sm hit replMsgs
+      confirmOnHit pre post hlog hnotPre (by simp [hhh]) hcl).2.1
+
 /-- Zero-leak convergence for the final pending transaction. -/
 theorem step_resolve_clears_when_last {State Msg : Type}
     (upd : State → Msg → State × Cmd Msg)
@@ -563,18 +579,7 @@ theorem step_resolve_clears_when_last {State Msg : Type}
     | nil => simpa [hp] using hEq
     | cons _ _ => have hlen := congrArg List.length hEq; simp [hp] at hlen
   have hpendEmpty : pendingIds (SpecEngine.step upd classify st msg).1.log = [] := by
-    by_cases hhh : hit && pre.isEmpty
-    · cases pre with
-      | nil =>
-          simp only [List.isEmpty_nil, Bool.and_true] at hhh; subst hhh
-          simp only [List.nil_append, pendingIds_nil] at hlog hprePost
-          unfold SpecEngine.step; rw [hcl, hlog]; dsimp only
-          simp only [beq_self_eq_true, Bool.and_self, ↓reduceIte]
-          split <;> simp [drainConfirmed_pendingIds, hprePost]
-      | cons _ _ => simp at hhh
-    · have hlin := resolve_general_linearizable upd classify st msg txId sm hit replMsgs
-        confirmOnHit pre post hlog hnotPre (by simp [hhh]) hcl
-      simpa [hprePost] using hlin.2.1
+    rw [step_resolve_pendingIds_split upd classify st msg txId sm hit replMsgs confirmOnHit pre post hlog hnotPre hcl, hprePost]
   have hlogEmpty : (SpecEngine.step upd classify st msg).1.log = [] := by
     rcases step_resolve_empty_pending_drains upd classify st msg txId hit replMsgs confirmOnHit hcl hpendEmpty with
       hnil | hsame
@@ -620,23 +625,10 @@ theorem resolve_all_drains_log {State Msg : Type}
         intro id hid
         by_cases hmem : txId ∈ pendingIds st.log
         · rcases pendingIds_mem_split txId st.log hmem hwf.2 with ⟨pre, sm, post, hlog, hnotPre, hnotPost⟩
-          by_cases hhh : hit && pre.isEmpty
-          · cases pre with
-            | nil =>
-                simp only [List.isEmpty_nil, Bool.and_true] at hhh; subst hhh
-                simp only [List.nil_append] at hlog
-                unfold SpecEngine.step at hid; rw [hcl, hlog] at hid; dsimp only at hid
-                simp only [beq_self_eq_true, Bool.and_self, ↓reduceIte] at hid
-                have hidPost : id ∈ pendingIds post := by
-                  split at hid <;> rwa [drainConfirmed_pendingIds] at hid
-                exact ⟨by simp [hlog, hidPost], fun heq => hnotPost (heq ▸ hidPost)⟩
-            | cons _ _ => simp at hhh
-          · have hlin := resolve_general_linearizable upd classify st m txId sm hit replMsgs
-              confirmOnHit pre post hlog hnotPre (by simp [hhh]) hcl
-            rw [hlin.2.1] at hid
-            rcases List.mem_append.1 hid with h1 | h2
-            · exact ⟨by simp [hlog, pendingIds_append, h1], fun heq => hnotPre (heq ▸ h1)⟩
-            · exact ⟨by simp [hlog, pendingIds_append, h2], fun heq => hnotPost (heq ▸ h2)⟩
+          rw [step_resolve_pendingIds_split upd classify st m txId sm hit replMsgs confirmOnHit pre post hlog hnotPre hcl] at hid
+          rcases List.mem_append.1 hid with h1 | h2
+          · exact ⟨by simp [hlog, pendingIds_append, h1], fun heq => hnotPre (heq ▸ h1)⟩
+          · exact ⟨by simp [hlog, pendingIds_append, h2], fun heq => hnotPost (heq ▸ h2)⟩
         · rw [resolve_unknown_noop upd classify st m txId hit replMsgs confirmOnHit hmem hcl] at hid
           exact ⟨hid, fun heq => hmem (heq ▸ hid)⟩
       have hall1 : ∀ id ∈ pendingIds (SpecEngine.step upd classify st m).1.log,

@@ -45,19 +45,6 @@ private def eventPrime? : String → Option String
   | "onCheck" => some "onCheck'"
   | _         => none
 
-private def htmlTags : List String :=
-  ["div", "span", "p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "a", "nav",
-   "header", "footer", "section", "article", "button", "label", "table", "thead", "tbody",
-   "tfoot", "tr", "td", "th", "strong", "em", "select", "option", "input", "textarea",
-   "img", "br", "hr", "small", "pre", "code", "b", "i", "main", "aside", "figure",
-   "figcaption", "blockquote", "fieldset", "legend", "datalist", "progress", "meter"]
-
-private def elementTag? (n : Lean.Name) : Option String :=
-  match lastStr? n.eraseMacroScopes with
-  | some "formEl" => some "form"
-  | some s        => if htmlTags.contains s then some s else none
-  | none          => none
-
 open Lean in
 private def asApp? (stx : Syntax) : Option (Syntax × Array Syntax) :=
   if stx.getKind == kApp && stx.getArgs.size == 2 then
@@ -74,16 +61,9 @@ private def asElementApp? (stx : Syntax) : Option (String × Array Syntax) :=
   | some (fn, args) =>
       match fn with
       | .ident _ _ n _ =>
-          if lastStr? n.eraseMacroScopes == some "el" then
-            if 0 < args.size then
-              match args[0]!.isStrLit? with
-              | some tag => some (tag, args.extract 1 args.size)
-              | none     => none
-            else none
-          else
-            match elementTag? n with
-            | some tag => some (tag, args)
-            | none     => none
+          if lastStr? n.eraseMacroScopes == some "el" && 0 < args.size then
+            args[0]!.isStrLit?.map fun tag => (tag, args.extract 1 args.size)
+          else none
       | _ => none
   | none => none
 

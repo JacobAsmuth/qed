@@ -58,17 +58,7 @@ def disambiguateKeys (keys : Array String) : Array String :=
 
 private theorem nodup_append_singleton {α : Type} {xs : List α} {a : α}
     (hnd : xs.Nodup) (ha : a ∉ xs) : (xs ++ [a]).Nodup := by
-  induction xs with
-  | nil => exact List.Pairwise.cons (fun _ h => nomatch h) List.Pairwise.nil
-  | cons x rest ih =>
-      rcases List.nodup_cons.1 hnd with ⟨hx, hrest⟩
-      refine List.nodup_cons.2 ⟨?_, ih hrest (fun h => ha (List.mem_cons_of_mem x h))⟩
-      intro hm
-      rcases List.mem_append.1 hm with h1 | h2
-      · exact hx h1
-      · simp only [List.mem_singleton] at h2
-        subst h2
-        exact ha (List.mem_cons_self ..)
+  simp [List.nodup_append, hnd]; intro b hb heq; subst heq; exact ha hb
 
 private theorem disambiguateKeysTR_nodup (ks : List String) :
     ∀ (seen : Std.HashSet String) (maxLen : Nat) (acc : Array String),
@@ -960,70 +950,52 @@ def isDirectTmpl : View α msg → Bool
       | _ => isDirectTmplList kids
   | _ => false
 
-private structure CompiledTmpl (α msg : Type) where
-  proto     : Html msg
-  slotPaths : Array (Array UInt32)
-  slotAttrs : Array String
-  slotFns   : Array (α → String)
-  evPaths   : Array (Array UInt32)
-  evNames   : Array String
-  evFns     : Array (α → msg)
+private structure TmplAcc (α msg : Type) where
+  slotPaths : Array (Array UInt32) := #[]
+  slotAttrs : Array String := #[]
+  slotFns   : Array (α → String) := #[]
+  evPaths   : Array (Array UInt32) := #[]
+  evNames   : Array String := #[]
+  evFns     : Array (α → msg) := #[]
 
-private def compileTmplAttrs (path : Array UInt32) :
-    List (VAttr α msg) →
-    Array (Array UInt32) → Array String → Array (α → String) →
-    Array (Array UInt32) → Array String → Array (α → msg) →
-    List (Attr msg) × Array (Array UInt32) × Array String × Array (α → String) ×
-    Array (Array UInt32) × Array String × Array (α → msg)
-  | [], sp, sa, sf, ep, en, ef => ([], sp, sa, sf, ep, en, ef)
-  | va :: rest, sp, sa, sf, ep, en, ef =>
-      match va with
-      | .stat a =>
-          let (as, sp', sa', sf', ep', en', ef') := compileTmplAttrs path rest sp sa sf ep en ef
-          (a :: as, sp', sa', sf', ep', en', ef')
-      | .dynVal k get =>
-          let (as, sp', sa', sf', ep', en', ef') :=
-            compileTmplAttrs path rest (sp.push path) (sa.push k) (sf.push get) ep en ef
-          (.attr k "" :: as, sp', sa', sf', ep', en', ef')
-      | .dynOn ev get =>
-          compileTmplAttrs path rest sp sa sf (ep.push path) (en.push ev) (ef.push get)
-      | .bind _ =>
-          compileTmplAttrs path rest sp sa sf ep en ef
+private structure CompiledTmpl (α msg : Type) extends TmplAcc α msg where
+  proto : Html msg
+
+private def compileTmplAttrs (path : Array UInt32) : List (VAttr α msg) → StateM (TmplAcc α msg) (List (Attr msg))
+  | [] => pure []
+  | .stat a :: rest => return a :: (← compileTmplAttrs path rest)
+  | .dynVal k get :: rest => do
+      modify fun s => { s with slotPaths := s.slotPaths.push path, slotAttrs := s.slotAttrs.push k, slotFns := s.slotFns.push get }
+      return .attr k "" :: (← compileTmplAttrs path rest)
+  | .dynOn ev get :: rest => do
+      modify fun s => { s with evPaths := s.evPaths.push path, evNames := s.evNames.push ev, evFns := s.evFns.push get }
+      compileTmplAttrs path rest
+  | .bind _ :: rest => compileTmplAttrs path rest
 
 mutual
-  private def compileTmplNode (path : Array UInt32) :
-      View α msg →
-      Array (Array UInt32) → Array String → Array (α → String) →
-      Array (Array UInt32) → Array String → Array (α → msg) →
-      Html msg × Array (Array UInt32) × Array String × Array (α → String) ×
-      Array (Array UInt32) × Array String × Array (α → msg)
-    | .text s, sp, sa, sf, ep, en, ef => (.text s, sp, sa, sf, ep, en, ef)
-    | .dyn get, sp, sa, sf, ep, en, ef => (.text "", sp.push path, sa.push "", sf.push get, ep, en, ef)
-    | .static h, sp, sa, sf, ep, en, ef => (h, sp, sa, sf, ep, en, ef)
-    | .element tag attrs kids, sp, sa, sf, ep, en, ef =>
-        let (pAttrs, sp1, sa1, sf1, ep1, en1, ef1) := compileTmplAttrs path attrs sp sa sf ep en ef
-        let (pKids, sp2, sa2, sf2, ep2, en2, ef2) := compileTmplKids path 0 kids sp1 sa1 sf1 ep1 en1 ef1
-        (.element tag pAttrs pKids, sp2, sa2, sf2, ep2, en2, ef2)
-    | _, sp, sa, sf, ep, en, ef => (.text "", sp, sa, sf, ep, en, ef)
+  private def compileTmplNode (path : Array UInt32) : View α msg → StateM (TmplAcc α msg) (Html msg)
+    | .text s => pure (.text s)
+    | .dyn get => do
+        modify fun s => { s with slotPaths := s.slotPaths.push path, slotAttrs := s.slotAttrs.push "", slotFns := s.slotFns.push get }
+        pure (.text "")
+    | .static h => pure h
+    | .element tag attrs kids => do
+        let pAttrs ← compileTmplAttrs path attrs
+        let pKids ← compileTmplKids path 0 kids
+        pure (.element tag pAttrs pKids)
+    | _ => pure (.text "")
 
-  private def compileTmplKids (parentPath : Array UInt32) (idx : Nat) :
-      List (View α msg) →
-      Array (Array UInt32) → Array String → Array (α → String) →
-      Array (Array UInt32) → Array String → Array (α → msg) →
-      List (Html msg) × Array (Array UInt32) × Array String × Array (α → String) ×
-      Array (Array UInt32) × Array String × Array (α → msg)
-    | [], sp, sa, sf, ep, en, ef => ([], sp, sa, sf, ep, en, ef)
-    | k :: ks, sp, sa, sf, ep, en, ef =>
-        let (ph, sp1, sa1, sf1, ep1, en1, ef1) :=
-          compileTmplNode (parentPath.push (UInt32.ofNat idx)) k sp sa sf ep en ef
-        let (phs, sp2, sa2, sf2, ep2, en2, ef2) :=
-          compileTmplKids parentPath (idx + 1) ks sp1 sa1 sf1 ep1 en1 ef1
-        (ph :: phs, sp2, sa2, sf2, ep2, en2, ef2)
+  private def compileTmplKids (parentPath : Array UInt32) (idx : Nat) : List (View α msg) → StateM (TmplAcc α msg) (List (Html msg))
+    | [] => pure []
+    | k :: ks => do
+        let ph ← compileTmplNode (parentPath.push (UInt32.ofNat idx)) k
+        let phs ← compileTmplKids parentPath (idx + 1) ks
+        pure (ph :: phs)
 end
 
 private def compileRowTmpl (child : View α msg) : CompiledTmpl α msg :=
-  let (proto, sp, sa, sf, ep, en, ef) := compileTmplNode #[] child #[] #[] #[] #[] #[] #[]
-  { proto, slotPaths := sp, slotAttrs := sa, slotFns := sf, evPaths := ep, evNames := en, evFns := ef }
+  let (proto, acc) := (compileTmplNode #[] child).run {}
+  { acc with proto }
 
 private def CompiledTmpl.toRowTmpl {α σ msg : Type} (c : CompiledTmpl α msg)
     (items : σ → Array α) (key : α → String) : RowTmpl σ msg :=

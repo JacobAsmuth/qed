@@ -32,16 +32,16 @@ mutual
     | .element t₁ _ c₁, .element t₂ a₂ c₂ =>
         if t₁ = t₂ then
           let oldArr := c₁.toArray
-          let steps :=
+          let pick : Nat → Html msg → Option Nat :=
             match validatedKeyIndex c₁ with
             | some index =>
                 if (validatedKeyIndex c₂).isSome then
-                  (diffChildrenTR oldArr (fun _ n => n.keyOf.bind (fun k => index[k]?)) #[] 0 c₂).toList
+                  fun _ n => n.keyOf.bind (fun k => index[k]?)
                 else
-                  (diffChildrenTR oldArr (fun i _ => if i < oldArr.size then some i else none) #[] 0 c₂).toList
+                  fun i _ => if i < oldArr.size then some i else none
             | none =>
-                (diffChildrenTR oldArr (fun i _ => if i < oldArr.size then some i else none) #[] 0 c₂).toList
-          .patchElement a₂ steps
+                fun i _ => if i < oldArr.size then some i else none
+          .patchElement a₂ (diffChildrenTR oldArr pick #[] 0 c₂).toList
         else .replace (.element t₂ a₂ c₂)
     | _,                b                 => .replace b
   def diffChildrenTR (oldArr : Array (Html msg)) (pick : Nat → Html msg → Option Nat)
@@ -101,20 +101,9 @@ mutual
     case element.element t₁ a₁ c₁ t₂ a₂ c₂ =>
       simp only [diff]
       split
-      · rename_i ht
-        subst ht
-        cases h₁ : validatedKeyIndex c₁ with
-        | none =>
-            simp only [applyPatch, applyChildrenTR_toList, diffChildrenTR_toList, List.nil_append]
-            exact congrArg (Html.element t₁ a₂) (diffChildren_apply c₁ _ 0 c₂)
-        | some index =>
-            cases h₂ : (validatedKeyIndex c₂).isSome with
-            | false =>
-                simp only [Bool.false_eq_true, ↓reduceIte, applyPatch, applyChildrenTR_toList, diffChildrenTR_toList, List.nil_append]
-                exact congrArg (Html.element t₁ a₂) (diffChildren_apply c₁ _ 0 c₂)
-            | true =>
-                simp only [↓reduceIte, applyPatch, applyChildrenTR_toList, diffChildrenTR_toList, List.nil_append]
-                exact congrArg (Html.element t₁ a₂) (diffChildren_apply c₁ _ 0 c₂)
+      · rename_i ht; subst ht
+        simp only [applyPatch, applyChildrenTR_toList, diffChildrenTR_toList, List.nil_append]
+        exact congrArg (Html.element t₁ a₂) (diffChildren_apply c₁ _ 0 c₂)
       · rfl
   theorem diffChildren_apply (old : List (Html msg)) :
       ∀ (pick : Nat → Html msg → Option Nat) (i : Nat) (news : List (Html msg)),

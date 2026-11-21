@@ -864,15 +864,20 @@ private def requireTyOrDef (role : Name) (fId : Ident) (ty? d? : Option Term) : 
   if ty?.isNone && d?.isNone then
     throwErrorAt fId s!"`{role} {fId.getId}` needs a type (`: Type`), a default (`= value`), or both"
 
+private def parseCallArgsAndCond (argsStx condStx : Syntax) :
+    CommandElabM (Array Term × Option (Term × Term × Array Name) × Array Term) := do
+  let rawArgs : Array Term ← argsStx.getSepArgs.mapM (lowerCompExpr .val)
+  let (rawPat?, rawGuards) := parseCompIfCond condStx
+  let whenPat? ← rawPat?.mapM fun (p, s) => do
+    return (← liftMacroM (lowerQedPat p), ← lowerCompExpr .val s, collectQedPatIds p)
+  let whenGuards ← rawGuards.mapM (lowerCompExpr .propGuard)
+  return (rawArgs, whenPat?, whenGuards)
+
 private def parseRpcQueryClause (acc : SpecParseAcc) (cl : Syntax) : CommandElabM SpecParseAcc := do
   let qId : Ident := ⟨(cl.getArg 1)⟩
   let explicitTy? : Option Term ← if (cl.getArg 2).getNumArgs == 2 then some <$> liftMacroM (return (← lowerQedType ((cl.getArg 2).getArg 1) false).1) else pure none
   let rpcId : Ident := ⟨(cl.getArg 4)⟩
-  let rawArgs : Array Term ← (cl.getArg 6).getSepArgs.mapM (lowerCompExpr .val)
-  let (rawPat?, rawGuards) := parseCompIfCond (cl.getArg 8)
-  let whenPat? ← rawPat?.mapM fun (p, s) => do
-    return (← liftMacroM (lowerQedPat p), ← lowerCompExpr .val s, collectQedPatIds p)
-  let whenGuards ← rawGuards.mapM (lowerCompExpr .propGuard)
+  let (rawArgs, whenPat?, whenGuards) ← parseCallArgsAndCond (cl.getArg 6) (cl.getArg 8)
   let env ← getEnv
   let some (srvInfo, mInfo) := lookupServerMethod? env (← getCurrNamespace) (← getScope).openDecls rpcId.getId
     | throwErrorAt rpcId s!"unknown server RPC `{rpcId.getId}` in `query`"
@@ -903,11 +908,7 @@ private def parseRpcQueryClause (acc : SpecParseAcc) (cl : Syntax) : CommandElab
 private def parseSubscribeClause (acc : SpecParseAcc) (cl : Syntax) : CommandElabM SpecParseAcc := do
   let subId : Ident := ⟨(cl.getArg 1)⟩
   let chanId : Ident := ⟨(cl.getArg 3)⟩
-  let rawArgs : Array Term ← (cl.getArg 5).getSepArgs.mapM (lowerCompExpr .val)
-  let (rawPat?, rawGuards) := parseCompIfCond (cl.getArg 7)
-  let whenPat? ← rawPat?.mapM fun (p, s) => do
-    return (← liftMacroM (lowerQedPat p), ← lowerCompExpr .val s, collectQedPatIds p)
-  let whenGuards ← rawGuards.mapM (lowerCompExpr .propGuard)
+  let (rawArgs, whenPat?, whenGuards) ← parseCallArgsAndCond (cl.getArg 5) (cl.getArg 7)
   let env ← getEnv
   let some chInfo := Qed.lookupChannel? env (← getCurrNamespace) (← getScope).openDecls chanId.getId
     | throwErrorAt chanId s!"unknown WebSocket channel `{chanId.getId}` in `subscribe`"
@@ -1138,6 +1139,55 @@ def bindMentionedFields (spec : ComponentSpec) (shouldBind : Name → Bool)
             else `(let $gId:ident := (p.$gId:ident); $out)
   return out
 
+def lowerMutStmt? (spec : ComponentSpec) (s : Syntax) (strict : Bool) :
+    CommandElabM (Option (Name × (Term → CommandElabM Term))) := do
+  let checkField (fId : Ident) (fname : Name) : CommandElabM Unit := do
+    if strict then
+      unless spec.fieldNames.contains fname do
+        throwNotMutableStateField fId s!"`{fname}`" fname spec.fieldNames spec.propNames
+  let sk := s.getKind
+  if sk == ``qedStmtAssign then
+    let op := atomStr (s.getArg 1)
+    if (s.getArg 0).getKind == ``qedIdent then
+      let fId : Ident := ⟨(s.getArg 0).getArg 0⟩
+      let fname := fId.getId.eraseMacroScopes
+      checkField fId fname
+      let valT ← if strict && op == "=" && isPlaceholder (s.getArg 2) then `(v)
+                 else desugarAssign fname op (← lowerCompExpr .val (s.getArg 2))
+      let fIdent := mkIdent fname
+      return some (fname, fun cont => `(let $fIdent:ident := $valT; $cont))
+    else if (s.getArg 0).getKind == ``qedIndex && ((s.getArg 0).getArg 0).getKind == ``qedIdent && op == "=" then
+      let fId : Ident := ⟨((s.getArg 0).getArg 0).getArg 0⟩
+      let fname := fId.getId.eraseMacroScopes
+      checkField fId fname
+      let idxT ← lowerCompExpr .val ((s.getArg 0).getArg 2)
+      let rhsT ← lowerCompExpr .val (s.getArg 2)
+      return some (fname, fun cont => lowerArraySetExpr (mkIdent fname) idxT rhsT cont)
+    else if strict then
+      let lhsStr := stxSnippet (s.getArg 0)
+      let what := if lhsStr.isEmpty then "" else s!" `{lhsStr} {op} ...`"
+      throwErrorAt s s!"unsupported assignment{what} in component action; expected `field = val`, `field += val`, `field -= val`, or `arr[i] = val`"
+    else return none
+  else if sk == ``qedStmtExpr then
+    let exprStx := s.getArg 0
+    let mutCall? :=
+      (matchPushCall? exprStx).map (fun (t, a) => (t, a, true, "push", "array", "items.push(x)")) <|>
+      (matchRemoveCall? exprStx).map (fun (t, a) => (t, a, false, "remove", "dictionary", "scores.remove(k)"))
+    let some (targetStx, argStx, isPush, meth, kindLabel, exStr) := mutCall? | return none
+    unless targetStx.getKind == ``qedIdent do
+      if strict then
+        let tgtStr := stxSnippet targetStx
+        let got := if tgtStr.isEmpty then "" else s!", got `{tgtStr}.{meth}(...)`"
+        throwErrorAt targetStx s!"{kindLabel} `.{meth}(...)` in component actions requires a simple `state` field (e.g. `{exStr}`){got}"
+      return none
+    let fId : Ident := ⟨targetStx.getArg 0⟩
+    let fname := fId.getId.eraseMacroScopes
+    checkField fId fname
+    let argT ← lowerCompExpr .val argStx
+    let fIdent := mkIdent fname
+    let updT ← if isPush then `(($fIdent).push $argT) else `(($fIdent).remove $argT)
+    return some (fname, fun cont => `(let $fIdent:ident := $updT; $cont))
+  else return none
 
 end CompElab
 end Qed

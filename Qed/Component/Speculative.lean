@@ -60,37 +60,9 @@ private partial def compileClassifyTree (spec : ComponentSpec) : ClassifyTree �
         `(let _ := $rhsT; $bodyT)
   | .preAssign st body => do
       let bodyT ← compileClassifyTree spec body
-      let sk := st.getKind
-      if sk == ``qedStmtAssign then
-        let op := atomStr (st.getArg 1)
-        if (st.getArg 0).getKind == ``qedIdent then
-          let fId : Ident := ⟨((st.getArg 0).getArg 0)⟩
-          let fname := fId.getId.eraseMacroScopes
-          let valT ← desugarAssign fname op (← lowerCompExpr .val (st.getArg 2))
-          let fIdent := mkIdent fname
-          `(let $fIdent:ident := $valT; $bodyT)
-        else if (st.getArg 0).getKind == ``qedIndex && ((st.getArg 0).getArg 0).getKind == ``qedIdent && op == "=" then
-          let fname := (((st.getArg 0).getArg 0).getArg 0).getId.eraseMacroScopes
-          let idxT ← lowerCompExpr .val ((st.getArg 0).getArg 2)
-          let rhsT ← lowerCompExpr .val (st.getArg 2)
-          lowerArraySetExpr (mkIdent fname) idxT rhsT bodyT
-        else pure bodyT
-      else if sk == ``qedStmtExpr then
-        if let some (targetStx, elemStx) := matchPushCall? (st.getArg 0) then
-          if targetStx.getKind == ``qedIdent then
-            let fname := (targetStx.getArg 0).getId.eraseMacroScopes
-            let elemT ← lowerCompExpr .val elemStx
-            let fIdent := mkIdent fname
-            return ← `(let $fIdent:ident := ($fIdent).push $elemT; $bodyT)
-        else if let some (targetStx, keyStx) := matchRemoveCall? (st.getArg 0) then
-          if targetStx.getKind == ``qedIdent then
-            let fname := (targetStx.getArg 0).getId.eraseMacroScopes
-            let keyT ← lowerCompExpr .val keyStx
-            let fIdent := mkIdent fname
-            return ← `(let $fIdent:ident := ($fIdent).remove $keyT; $bodyT)
-        pure bodyT
-      else
-        pure bodyT
+      match ← lowerMutStmt? spec st false with
+      | some (_, wrap) => wrap bodyT
+      | none => pure bodyT
   | .ifBranch condStx thenT elseT => do
       let cond ← lowerCompExpr .propGuard condStx
       let tT ← compileClassifyTree spec thenT

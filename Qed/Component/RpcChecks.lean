@@ -57,19 +57,21 @@ private def extractArgExprsAndRecordRpcCheck (stx : Syntax) (resExpr : Expr)
     })
 
 open Lean Elab Term Meta in
+private def lookupCheckedMethod (stx : Syntax) (srvId methId : Ident) (label : String) :
+    TermElabM (ServerInfo × ServerMethodInfo) := do
+  let srvName := srvId.getId; let methStr := methId.getId.toString
+  let some srvInfo := (serverRegistry.getState (← getEnv)).find? srvName
+    | throwErrorAt stx s!"internal: unknown server `{srvName}` in {label}"
+  let some mInfo := srvInfo.methods.find? (·.name == methStr)
+    | throwErrorAt stx s!"internal: unknown method `{methStr}` on `{srvName}` in {label}"
+  return (srvInfo, mInfo)
+
+open Lean Elab Term Meta in
 @[term_elab qedCheckRpcCallTerm]
 def elabQedCheckRpcCall : TermElab := fun stx expectedType? => do
-  let srvId : Ident := ⟨(stx.getArg 1)⟩
-  let methId : Ident := ⟨(stx.getArg 2)⟩
   let argTerms : Array Term := (stx.getArg 4).getSepArgs.map (⟨·⟩)
   let cbTerm : Term := ⟨(stx.getArg 6)⟩
-  let srvName := srvId.getId
-  let methStr := methId.getId.toString
-  let env ← getEnv
-  let some srvInfo := (serverRegistry.getState env).find? srvName
-    | throwErrorAt stx s!"internal: unknown server `{srvName}` in RPC check"
-  let some mInfo := srvInfo.methods.find? (·.name == methStr)
-    | throwErrorAt stx s!"internal: unknown method `{methStr}` on `{srvName}` in RPC check"
+  let (srvInfo, mInfo) ← lookupCheckedMethod stx ⟨stx.getArg 1⟩ ⟨stx.getArg 2⟩ "RPC check"
   let rawRpcId := mkIdentFrom stx mInfo.rawRpcConst
   let callApp ← argTerms.foldlM (init := (rawRpcId : Term)) fun acc a => `($acc $a)
   let fullCall ← `($callApp $cbTerm)
@@ -82,17 +84,9 @@ def elabQedCheckRpcCall : TermElab := fun stx expectedType? => do
 open Lean Elab Term Meta in
 @[term_elab qedCheckPredictTerm]
 def elabQedCheckPredict : TermElab := fun stx expectedType? => do
-  let srvId : Ident := ⟨(stx.getArg 1)⟩
-  let methId : Ident := ⟨(stx.getArg 2)⟩
   let argTerms : Array Term := (stx.getArg 4).getSepArgs.map (⟨·⟩)
   let predTerm : Term := ⟨(stx.getArg 6)⟩
-  let srvName := srvId.getId
-  let methStr := methId.getId.toString
-  let env ← getEnv
-  let some srvInfo := (serverRegistry.getState env).find? srvName
-    | throwErrorAt stx s!"internal: unknown server `{srvName}` in predict check"
-  let some mInfo := srvInfo.methods.find? (·.name == methStr)
-    | throwErrorAt stx s!"internal: unknown method `{methStr}` on `{srvName}` in predict check"
+  let (srvInfo, mInfo) ← lookupCheckedMethod stx ⟨stx.getArg 1⟩ ⟨stx.getArg 2⟩ "predict check"
   let predExpr ← elabTerm predTerm expectedType?
   synthesizeSyntheticMVarsNoPostponing
   let predExpr ← instantiateMVars predExpr
@@ -143,20 +137,19 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
     let e ← instantiateMVars e
     let e ← Meta.zetaReduce e
     Qed.Diag.ppQedExpr e ["m"]
-  let tryDischargeWith (invProps : Array Expr) (goalBody : Expr) : TermElabM (Option String) := do
+  let tryDischargeWith (invProps : Array Expr) (goalBody : Expr)
+      (tac : Tactic.TacticM Unit) (fallbackUnfold : Expr → MetaM Expr) :
+      TermElabM (Except String (Expr × Expr)) := do
     let fullGoal ← invProps.foldrM (init := goalBody) fun hyp acc =>
       pure (Expr.forallE `_ hyp acc .default)
     let fullGoal ← instantiateMVars fullGoal
     let mv ← Meta.mkFreshExprSyntheticOpaqueMVar fullGoal
     try
-      let unsolved ← Tactic.run mv.mvarId! do
-        Tactic.evalTactic (← `(tactic| intros; qedProveRpcReq))
-      if unsolved.isEmpty then return none
-      let msg ← unsolved[0]!.withContext do cleanGoalExpr (← unsolved[0]!.getType)
-      return some msg
+      let unsolved ← Tactic.run mv.mvarId! tac
+      if unsolved.isEmpty then return .ok (fullGoal, mv)
+      return .error (← unsolved[0]!.withContext do cleanGoalExpr (← unsolved[0]!.getType))
     catch _ =>
-      let reduced := (← Meta.unfoldDefinition? goalBody).getD goalBody
-      return some (← cleanGoalExpr reduced)
+      return .error (← cleanGoalExpr (← fallbackUnfold goalBody))
   let mkProofLctx (lctx : LocalContext) : LocalContext :=
     lctx.foldl (init := {}) fun acc decl =>
       if decl.isAuxDecl then acc
@@ -167,7 +160,9 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
     liftTermElabM do
       Meta.withMCtx chk.mctx <| withLCtx (mkProofLctx chk.lctx) chk.localInsts do
         let (invProps, stateFVar?) ← buildInvProps chk.lctx
-        let tryDischarge := tryDischargeWith invProps
+        let tryDischarge (g : Expr) := tryDischargeWith invProps g
+          (do Tactic.evalTactic (← `(tactic| intros; qedProveRpcReq)))
+          (fun e => return (← Meta.unfoldDefinition? e).getD e)
         if chk.requiresAuth then
           let some sfName := chk.sessionVar?
             | throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`ctx.userId != none`), but `{spec.t.getId}` has no `session` field.\n\nHint: Add `session user` to `{spec.t.getId}` and guard the call with `if user.isSome:`."
@@ -183,11 +178,11 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
           let elemTy := if sfTy.isAppOfArity ``Option 1 then sfTy.appArg! else Lean.mkConst ``String
           let noneExpr ← Meta.mkAppOptM ``Option.none #[some elemTy]
           let authGoal ← Meta.mkAppM ``Ne #[sfExpr, noneExpr]
-          if (← tryDischarge authGoal).isSome then
+          if (← tryDischarge authGoal) matches .error _ then
             throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`{sfName} != none`), which could not be proved here.\n\nHint: Guard this call with `if {sfName}.isSome:` or `invariant ...: {sfName}.isSome`."
         if let some reqConst := chk.reqConst? then
           let reqGoal := mkAppN (Lean.mkConst reqConst) chk.argExprs
-          if let some obl ← tryDischarge reqGoal then
+          if let .error obl ← tryDischarge reqGoal then
             let oblLine := if obl.isEmpty then "" else s!"\n  • must satisfy:  {obl}"
             throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` precondition `{chk.reqLabel}` could not be proved here:{oblLine}\n\nHint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`."
   let currNs ← getCurrNamespace
@@ -208,39 +203,28 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
           else
             pure (mkAppN (Lean.mkConst chk.ensConst) (chk.argExprs.push chk.predExpr))
         let ensId := mkIdent (`_root_ ++ chk.ensConst)
-        let fullGoal ← invProps.foldrM (init := ensGoal) fun hyp acc =>
-          pure (Expr.forallE `_ hyp acc .default)
-        let fullGoal ← instantiateMVars fullGoal
-        let mv ← Meta.mkFreshExprSyntheticOpaqueMVar fullGoal
-        let obl? : Option String ← try
-            let unsolved ← Tactic.run mv.mvarId! do
-              Tactic.evalTactic (← `(tactic| intros; try simp only [$ensId:ident]; try qedProveRpcReq))
-            if unsolved.isEmpty then
-              -- Submit the complete proof term directly to Lean's kernel as a verified theorem
-              -- so it is typechecked by the kernel and audited by `qed check`.
-              let fvars := proofLctx.foldl (init := #[]) fun acc d =>
-                if d.isAuxDecl then acc else acc.push d.toExpr
-              let proofVal ← instantiateMVars mv
-              let closedType ← instantiateMVars (← Meta.mkForallFVars (usedOnly := false) (usedLetOnly := false) fvars fullGoal)
-              let closedVal ← instantiateMVars (← Meta.mkLambdaFVars (usedOnly := false) (usedLetOnly := false) fvars proofVal)
-              let levelParams := (collectLevelParams (collectLevelParams {} closedType) closedVal).params.toList
-              let thmName := currNs ++ spec.t.getId ++ Name.mkSimple s!"_specPredict_ens_{idx}"
-              Lean.addDecl (.thmDecl {
-                name := thmName
-                levelParams
-                type := closedType
-                value := closedVal
-              })
-              pure none
-            else
-              let msg ← unsolved[0]!.withContext do cleanGoalExpr (← unsolved[0]!.getType)
-              pure (some msg)
-          catch _ =>
-            let reduced := (← Meta.unfold ensGoal chk.ensConst).expr
-            pure (some (← cleanGoalExpr reduced))
-        if let some obl := obl? then
-          let oblLine := if obl.isEmpty then "" else s!"\n  • must satisfy:  {obl}"
-          throwErrorAt chk.callRef m!"Predicted response for `{chk.srvShort}.{chk.methodName}` does not satisfy server `ensures` postcondition:{oblLine}\n\nHint: Ensure the predicted value satisfies the server method's `ensures` clause (or guard it inside a `predict:` block)."
+        match ← tryDischargeWith invProps ensGoal
+            (do Tactic.evalTactic (← `(tactic| intros; try simp only [$ensId:ident]; try qedProveRpcReq)))
+            (fun e => return (← Meta.unfold e chk.ensConst).expr) with
+        | .ok (fullGoal, mv) =>
+            -- Submit the complete proof term directly to Lean's kernel as a verified theorem
+            -- so it is typechecked by the kernel and audited by `qed check`.
+            let fvars := proofLctx.foldl (init := #[]) fun acc d =>
+              if d.isAuxDecl then acc else acc.push d.toExpr
+            let proofVal ← instantiateMVars mv
+            let closedType ← instantiateMVars (← Meta.mkForallFVars (usedOnly := false) (usedLetOnly := false) fvars fullGoal)
+            let closedVal ← instantiateMVars (← Meta.mkLambdaFVars (usedOnly := false) (usedLetOnly := false) fvars proofVal)
+            let levelParams := (collectLevelParams (collectLevelParams {} closedType) closedVal).params.toList
+            let thmName := currNs ++ spec.t.getId ++ Name.mkSimple s!"_specPredict_ens_{idx}"
+            Lean.addDecl (.thmDecl {
+              name := thmName
+              levelParams
+              type := closedType
+              value := closedVal
+            })
+        | .error obl =>
+            let oblLine := if obl.isEmpty then "" else s!"\n  • must satisfy:  {obl}"
+            throwErrorAt chk.callRef m!"Predicted response for `{chk.srvShort}.{chk.methodName}` does not satisfy server `ensures` postcondition:{oblLine}\n\nHint: Ensure the predicted value satisfies the server method's `ensures` clause (or guard it inside a `predict:` block)."
 
 open Lean Elab Term Meta in
 private def elabAndRecordChanCheck (stx : Syntax) (expectedType? : Option Expr)

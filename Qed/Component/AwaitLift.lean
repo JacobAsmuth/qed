@@ -341,6 +341,38 @@ private def buildCatchArms (liftRec : LiftRecFn) (st : Syntax) (mInfo : ServerMe
         arms := arms.push (mkCaseStx st patS bLifted)
   return (arms, wildArms, covFailed, covNone)
 
+private def registerAwaitContSite (ctx : RewriteCtx) (liftRec : LiftRecFn)
+    (st : Syntax) (kIdx : Nat) (xId : Ident) (optTy? : Option Term)
+    (rpcId : Ident) (srvInfo : ServerInfo) (mInfo : ServerMethodInfo)
+    (catchHasNone : Bool) (parsedCatch : Array (CatchPatKind × Array Syntax))
+    (outerParams : Array (Ident × Term)) (localNames : Array Name)
+    (capturedParams : Array (Ident × Term)) (outTyTerm : Term)
+    (callArgs rpcCallArgs : Array Term)
+    (mkOkStmts : Array (Ident × Term) → CommandElabM (Array Syntax × ClassifyTree)) :
+    CommandElabM Syntax := do
+  let info := SourceInfo.fromRef st
+  let contCtor := Name.mkSimple s!"_cont_{kIdx}"
+  let outVarId := mkIdentFrom st (Name.mkSimple s!"_qedOut_{kIdx}")
+  let contParams := capturedParams.push (outVarId, outTyTerm)
+  let (okStmts, restTree) ← mkOkStmts contParams
+  let (okPat, okBody) ← mkOkPatAndBody st kIdx xId optTy? mInfo catchHasNone okStmts
+  let (catchArms, wildArms, covFailed, covNone) ←
+    buildCatchArms liftRec st mInfo parsedCatch outerParams localNames contParams
+  let mut matchCases := #[mkCaseStx st okPat okBody] ++ catchArms ++ wildArms
+  if wildArms.isEmpty && (!covFailed || (mInfo.isOption && !covNone)) then
+    matchCases := matchCases.push (mkCaseStx st (mkPatWild info) #[mkPassSt info])
+  ctx.sites.modify (·.push {
+    key := s!"cont:{contCtor}", ctor := contCtor, params := contParams,
+    stmts? := some #[mkMatchStx st outVarId matchCases]
+  })
+  unless restTree.isNormal do
+    let scrutClassify := Syntax.node info ``qedIdent #[outVarId.raw]
+    ctx.specDispatches.modify (·.push {
+      ctor := contCtor, params := contParams,
+      tree := .matchBr #[scrutClassify] #[(#[okPat], restTree), (#[mkPatWild info], .normal)]
+    })
+  mkRpcPerformStmt ctx st rpcId srvInfo mInfo contCtor callArgs rpcCallArgs
+
 private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident × Term))
     (liftRec : LiftRecFn)
     (st : Syntax) (xId : Ident) (optTy? : Option Term)
@@ -486,21 +518,12 @@ private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident �
     contCtor := specContCtor, confirmCtor?, rollbackCtor?, catchCtor?, callRef := st
   })
 
-  let fallbackContCtor := Name.mkSimple s!"_cont_{kIdx}"
-  let fbOutVarId := mkIdentFrom st (Name.mkSimple s!"_qedOut_{kIdx}")
-  let fbParams := capturedParams.push (fbOutVarId, outTyTerm)
-  let (ocFbLifted, _) ← if onConfirmStmts.isEmpty then pure (#[], .normal)
-    else liftRec fbParams nextOuter localNames onConfirmStmts
-  let (fbOkPat, fbOkBody) ← mkOkPatAndBody st kIdx xId optTy? mInfo catchHasNone (restArr ++ ocFbLifted)
-  let (fbCatchArms, fbWildArms, fbCovFailed, fbCovNone) ← buildCatchArms liftRec st mInfo parsedCatch outerParams localNames fbParams
-  let mut fbCases := #[mkCaseStx st fbOkPat fbOkBody] ++ fbCatchArms ++ fbWildArms
-  if fbWildArms.isEmpty && (!fbCovFailed || (mInfo.isOption && !fbCovNone)) then
-    fbCases := fbCases.push (mkCaseStx st (mkPatWild info) #[mkPassSt info])
-  ctx.sites.modify (·.push {
-    key := s!"cont:{fallbackContCtor}", ctor := fallbackContCtor, params := fbParams,
-    stmts? := some #[mkMatchStx st fbOutVarId fbCases]
-  })
-  let fbPerfSt ← mkRpcPerformStmt ctx st rpcId srvInfo mInfo fallbackContCtor callArgs rpcCallArgs
+  let fbPerfSt ← registerAwaitContSite ctx liftRec st kIdx xId optTy? rpcId srvInfo mInfo
+    catchHasNone parsedCatch outerParams localNames capturedParams outTyTerm callArgs rpcCallArgs
+    fun fbParams => do
+      let (ocFbLifted, _) ← if onConfirmStmts.isEmpty then pure (#[], .normal)
+        else liftRec fbParams nextOuter localNames onConfirmStmts
+      return (restArr ++ ocFbLifted, .normal)
   let dispNode : SpecDispatchNode := {
     ref := st, preCtor?, preArgs := actionParams.map (⟨·.1.raw⟩),
     capturedArgs := capturedOuter.map (⟨·.1.raw⟩),
@@ -592,13 +615,9 @@ private partial def liftAwaitStmts (ctx : RewriteCtx)
 
         let kIdx ← ctx.contCounter.get
         ctx.contCounter.set (kIdx + 1)
-        let contCtor := Name.mkSimple s!"_cont_{kIdx}"
         let (capturedParams, callArgs, preLetStmts, ensArgs, rpcCallArgs, _) :=
           hoistEnsuresArgs ctx info kIdx mInfo rawArgs localNames capturedOuter
         let outTyTerm ← mkOutcomeTy rpcId mInfo ensArgs
-        let outVarId := mkIdentFrom st (Name.mkSimple s!"_qedOut_{kIdx}")
-        let contParams := capturedParams.push (outVarId, outTyTerm)
-
         let catchHasNone := parsedCatch.any fun (pk, _) => pk matches .dotTag "none" _
         let xBinderTy? ← match optTy? with
           | some t => pure (some t)
@@ -608,26 +627,9 @@ private partial def liftAwaitStmts (ctx : RewriteCtx)
           | some xTy => (outerParams.filter (·.1.getId.eraseMacroScopes != xn)).push (xId, xTy)
           | none     => outerParams.filter (·.1.getId.eraseMacroScopes != xn)
         let nextLocals := if xBinderTy?.isSome then localNames else localNames.push xn
-        let (restLifted, restTree) ← liftAwaitStmts ctx contParams nextOuter nextLocals restArr
-
-        let (okPat, okBody) ← mkOkPatAndBody st kIdx xId optTy? mInfo catchHasNone restLifted
-        let (catchArms, wildArms, covFailed, covNone) ← buildCatchArms liftRec st mInfo parsedCatch outerParams localNames contParams
-        let mut matchCases := #[mkCaseStx st okPat okBody] ++ catchArms ++ wildArms
-        if wildArms.isEmpty && (!covFailed || (mInfo.isOption && !covNone)) then
-          matchCases := matchCases.push (mkCaseStx st (mkPatWild info) #[mkPassSt info])
-
-        ctx.sites.modify (·.push {
-          key := s!"cont:{contCtor}", ctor := contCtor, params := contParams,
-          stmts? := some #[mkMatchStx st outVarId matchCases]
-        })
-        unless restTree.isNormal do
-          let scrutClassify := Syntax.node info ``qedIdent #[outVarId.raw]
-          ctx.specDispatches.modify (·.push {
-            ctor := contCtor, params := contParams,
-            tree := .matchBr #[scrutClassify] #[(#[okPat], restTree), (#[mkPatWild info], .normal)]
-          })
-
-        let perfSt ← mkRpcPerformStmt ctx st rpcId srvInfo mInfo contCtor callArgs rpcCallArgs
+        let perfSt ← registerAwaitContSite ctx liftRec st kIdx xId optTy? rpcId srvInfo mInfo
+          catchHasNone parsedCatch outerParams localNames capturedParams outTyTerm callArgs rpcCallArgs
+          fun contParams => liftAwaitStmts ctx contParams nextOuter nextLocals restArr
         return (preLetStmts.push perfSt, .normal)
 
       if k == ``qedStmtLet then
@@ -702,6 +704,28 @@ private partial def liftAwaitStmts (ctx : RewriteCtx)
       return (#[st] ++ tail, tree)
   go outerParams localLetNames initPreStmts stmts.toList
 
+private def registerActionOrPort (spec : ComponentSpec) (baseCtx : RewriteCtx)
+    (kindPrefix dupLabel conflictLabel : String) (nameRef errRef : Syntax) (name : Name)
+    (params : Array (Ident × Term)) (bodyStx : Syntax) (checkPlaceholders : Bool) :
+    CommandElabM Unit := do
+  if (← baseCtx.sites.get).any (·.ctor == name) then
+    throwErrorAt nameRef s!"duplicate {dupLabel} name `{name}`"
+  if spec.collections.any (·.1.getId == name) then
+    throwErrorAt nameRef s!"{conflictLabel} name `{name}` conflicts with `collection {name}`"
+  let stmtsRaw := suiteStmts (← rewriteIn baseCtx false bodyStx)
+  let (stmts, dispTree) ← liftAwaitStmts baseCtx params params #[] stmtsRaw
+  unless dispTree.isNormal do
+    baseCtx.specDispatches.modify (·.push { ctor := name, params, tree := dispTree })
+  let mut dummyAssigns : Array (Name × Option Term) := #[]
+  if checkPlaceholders then
+    for s in stmts do
+      if s.getKind == ``qedStmtAssign && (s.getArg 0).getKind == ``qedIdent && atomStr (s.getArg 1) == "=" && isPlaceholder (s.getArg 2) then
+        dummyAssigns ← pushHandlerAssign baseCtx dummyAssigns ((s.getArg 0).getArg 0) none
+    if !params.isEmpty && !dummyAssigns.isEmpty then
+      throwErrorAt errRef s!"action `{name}` declares explicit parameter(s) and cannot use the `_` placeholder; assign explicitly (e.g. `{dummyAssigns[0]!.1} = {params[0]!.1.getId}`)"
+  baseCtx.sites.modify (·.push {
+    key := s!"{kindPrefix}:{name}", ctor := name, params, assigns := dummyAssigns, stmts? := some stmts })
+
 def collectSitesAndRewriteStateful (spec : ComponentSpec) :
     CommandElabM (Array SetSite × Option RouteDecl × Array QueryDecl × Array Term × Term × Array HoistedSub × Array FieldDecl × Array ResetFormSub × Array (String × String) × Array SpecDispatchArm × Array SpecResolveSite) := do
   let baseCtx ← mkRewriteCtx spec false
@@ -714,10 +738,6 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
   let specResolvesRef   := baseCtx.specResolves
   for a in spec.actions do
     let name := (a.getArg 1).getId
-    if (← sitesRef.get).any (·.ctor == name) then
-      throwErrorAt (a.getArg 1) s!"duplicate action name `{name}`"
-    if spec.collections.any (·.1.getId == name) then
-      throwErrorAt (a.getArg 1) s!"action name `{name}` conflicts with `collection {name}`"
     let rawParams := if (a.getArg 2).getNumArgs == 3 then ((a.getArg 2).getArg 1).getSepArgs else #[]
     let params : Array (Ident × Term) ← rawParams.mapM fun p =>
       return (⟨(p.getArg 0)⟩, ← liftMacroM (return (← lowerQedType (p.getArg 2) false).1))
@@ -729,35 +749,12 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
       if spec.allNames.contains pn then
         throwErrorAt pId s!"parameter `{pn}` in action `{name}` shadows a component field; rename the parameter"
       seenP := seenP.push pn
-    let stmtsRaw := suiteStmts (← rewriteIn baseCtx false (a.getArg 4))
-    let (stmts, dispTree) ← liftAwaitStmts baseCtx params params #[] stmtsRaw
-    unless dispTree.isNormal do
-      specDispatchesRef.modify (·.push { ctor := name, params, tree := dispTree })
-    let mut dummyAssigns : Array (Name × Option Term) := #[]
-    for s in stmts do
-      if s.getKind == ``qedStmtAssign && (s.getArg 0).getKind == ``qedIdent && atomStr (s.getArg 1) == "=" && isPlaceholder (s.getArg 2) then
-        dummyAssigns ← pushHandlerAssign baseCtx dummyAssigns ((s.getArg 0).getArg 0) none
-    if !params.isEmpty && !dummyAssigns.isEmpty then
-      throwErrorAt a s!"action `{name}` declares explicit parameter(s) and cannot use the `_` placeholder; assign explicitly (e.g. `{dummyAssigns[0]!.1} = {params[0]!.1.getId}`)"
-    let cur ← sitesRef.get
-    sitesRef.set (cur.push {
-      key := s!"action:{name}", ctor := name, params, assigns := dummyAssigns, stmts? := some stmts })
+    registerActionOrPort spec baseCtx "action" "action" "action" (a.getArg 1) a name params (a.getArg 4) true
   for p in spec.portIns do
     let name := p.id.getId
-    if (← sitesRef.get).any (·.ctor == name) then
-      throwErrorAt p.id s!"duplicate port/action name `{name}`"
-    if spec.collections.any (·.1.getId == name) then
-      throwErrorAt p.id s!"port name `{name}` conflicts with `collection {name}`"
     if spec.allNames.contains p.argId.getId then
       throwErrorAt p.argId s!"port parameter `{p.argId.getId}` on `port {name}` shadows a component field; rename the parameter"
-    let stmtsRaw := suiteStmts (← rewriteIn baseCtx false p.body)
-    let portParams := #[(p.argId, p.argTy)]
-    let (stmts, dispTree) ← liftAwaitStmts baseCtx portParams portParams #[] stmtsRaw
-    unless dispTree.isNormal do
-      specDispatchesRef.modify (·.push { ctor := name, params := portParams, tree := dispTree })
-    let cur ← sitesRef.get
-    sitesRef.set (cur.push {
-      key := s!"port:{name}", ctor := name, params := portParams, stmts? := some stmts })
+    registerActionOrPort spec baseCtx "port" "port/action" "port" p.id p.id name #[(p.argId, p.argTy)] p.body false
   let route'? ← spec.route?.mapM fun rd => do
     let rParamId := mkIdent `_r
     let rParams := #[(rParamId, rd.ty)]

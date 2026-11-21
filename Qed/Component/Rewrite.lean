@@ -116,11 +116,12 @@ def inferAwaitBinderTy? (mInfo : ServerMethodInfo) (hasCatchNone : Bool) :
         let mut ty ← Meta.whnf body
         if ty.isAppOfArity ``Qed.RpcOutcome 2 || ty.isAppOfArity ``Qed.RpcSimpleOutcome 1 then
           ty ← Meta.whnf ty.appArg!
+        let isEnsOrField (e : Expr) : Bool := e.isAppOfArity ``Qed.Ensured 2 || e.isAppOfArity ``Qed.Field 2
         if mInfo.isOption && ty.isAppOfArity ``Option 1 then
           let optInner ← Meta.whnf ty.appArg!
-          let unwrapped := if optInner.isAppOfArity ``Qed.Ensured 2 then optInner.appFn!.appArg! else optInner
+          let unwrapped := if isEnsOrField optInner then optInner.appFn!.appArg! else optInner
           ty ← if hasCatchNone then pure unwrapped else Meta.mkAppM ``Option #[unwrapped]
-        else if ty.isAppOfArity ``Qed.Ensured 2 then
+        else if isEnsOrField ty then
           ty := ty.appFn!.appArg!
         if ty.hasLooseBVars then return none
         return some (← PrettyPrinter.delab ty)
@@ -149,6 +150,7 @@ def SubDecl.statusCtor (s : SubDecl) : Name := Name.mkSimple s!"_wsStatus_{s.id.
 inductive PredictBody where
   | expr  (stx : Syntax)
   | block (stmts : Array Syntax)
+deriving Inhabited
 
 structure SpecResolveSite where
   resCtor        : Name
@@ -182,24 +184,19 @@ structure SpecDispatchNode where
   contCtor        : Name
   resCtor         : Name
   kIdx            : Nat
+deriving Inhabited
 
-inductive ClassifyTree where
-  | normal
-  | dispatch  (node : SpecDispatchNode)
-  | letBind   (binder : Syntax) (ty? : Option Term) (rhs : Syntax) (body : ClassifyTree)
-  | preAssign (stmt : Syntax) (body : ClassifyTree)
-  | ifBranch  (cond : Syntax) (thenT : ClassifyTree) (elseT : ClassifyTree)
-  | ifLet     (pat : Syntax) (scrut : Syntax) (thenT : ClassifyTree) (elseT : ClassifyTree)
-  | matchBr   (scruts : Array Syntax) (cases : Array (Array Syntax × ClassifyTree))
+inductive EnsuredWrapKind | plain | ensured | optEnsured deriving DecidableEq
 
-def ClassifyTree.isNormal : ClassifyTree → Bool
-  | .normal => true
-  | _       => false
+def ensuredWrapKind (mInfo : ServerMethodInfo) (catchHasNone : Bool) : EnsuredWrapKind :=
+  if !mInfo.hasEnsures then .plain
+  else if mInfo.isOption && !catchHasNone then .optEnsured
+  else .ensured
 
 structure SpecDispatchArm where
   ctor   : Name
   params : Array (Ident × Term) := #[]
-  tree   : ClassifyTree
+  stmts  : Array Syntax
 
 structure ComponentSpec where
   doc?            : Option (TSyntax ``Lean.Parser.Command.docComment)
@@ -235,6 +232,7 @@ structure ComponentSpec where
   themes          : Array Ident := #[]
   headClause?     : Option Syntax := none
   specDispatches  : Array SpecDispatchArm := #[]
+  specNodes       : Array SpecDispatchNode := #[]
   specResolves    : Array SpecResolveSite := #[]
 
 def ComponentSpec.hasSpeculative (s : ComponentSpec) : Bool := !s.specResolves.isEmpty
@@ -307,6 +305,7 @@ structure RewriteCtx where
   usedRpcs       : IO.Ref (Array (String × String))
   contCounter    : IO.Ref Nat
   specDispatches : IO.Ref (Array SpecDispatchArm)
+  specNodes      : IO.Ref (Array SpecDispatchNode)
   specResolves   : IO.Ref (Array SpecResolveSite)
 
 def mkRewriteCtx (spec : ComponentSpec) (isPureComp : Bool) (allowHoist : Bool := false) :
@@ -332,6 +331,7 @@ def mkRewriteCtx (spec : ComponentSpec) (isPureComp : Bool) (allowHoist : Bool :
     usedRpcs       := ← IO.mkRef #[]
     contCounter    := ← IO.mkRef 0
     specDispatches := ← IO.mkRef #[]
+    specNodes      := ← IO.mkRef #[]
     specResolves   := ← IO.mkRef #[]
   }
 
@@ -507,7 +507,7 @@ private def injectAutoKey (bodyStx : Syntax) (compFullName : Name) (bindId : Ide
     let ek := el.getKind
     if ek == ``Qed.Jsx.selfClosing || ek == ``Qed.Jsx.withChildren then
       let attrs := (el.getArg 2).getArgs
-      let hasKey := attrs.any fun a => a.getKind == ``Qed.Jsx.attrNamed && atomStr (a.getArg 0) == "key"
+      let hasKey := attrs.any fun a => (matchNamedAttr? a).any (·.2.1 == "key")
       if !hasKey then
         let keyVal ← `($(mkIdent (compFullName ++ `keyOf)) $bindId)
         let kids? := if ek == ``Qed.Jsx.withChildren then some (el.getArg 4) else none
@@ -520,16 +520,16 @@ private def rewriteLowerElement (ctx : RewriteCtx) (stx : Syntax)
   let some w := ctx.wrapMsg? | return rebuildJsxEl stx (rewrittenPairs.map (·.2)) kids?
   let msgTy := mkIdent ctx.msgPath
   let newAttrs ← rewrittenPairs.mapM fun (wasAssign, a') => do
-    if !wasAssign && a'.getKind == ``Qed.Jsx.attrNamed && a'[1].getNumArgs == 2 &&
-        a'[1][1].getKind == ``Qed.Jsx.attrValExpr then
-      let aname := atomStr a'[0]
-      let vT ← liftMacroM <| Qed.Jsx.expandAttrVal a'[1] (`(""))
-      let wrapped? : Option Term ←
-        if unitEvents.contains aname then some <$> `($w ($vT : $msgTy))
-        else if strEvents.contains aname then some <$> `(fun _s => $w (($vT : String → $msgTy) _s))
-        else if aname == "onCheck" then some <$> `(fun _b => $w (($vT : Bool → $msgTy) _b))
-        else pure none
-      return match wrapped? with | some wt => mkJsxAttrExpr aname wt | none => a'
+    if !wasAssign then
+      if let some (_, aname, valNode) := matchNamedAttr? a' then
+        if valNode.getNumArgs == 2 && (valNode.getArg 1).getKind == ``Qed.Jsx.attrValExpr then
+          let vT ← liftMacroM <| Qed.Jsx.expandAttrVal valNode (`(""))
+          let wrapped? : Option Term ←
+            if unitEvents.contains aname then some <$> `($w ($vT : $msgTy))
+            else if strEvents.contains aname then some <$> `(fun _s => $w (($vT : String → $msgTy) _s))
+            else if aname == "onCheck" then some <$> `(fun _b => $w (($vT : Bool → $msgTy) _b))
+            else pure none
+          return match wrapped? with | some wt => mkJsxAttrExpr aname wt | none => a'
     return a'
   return rebuildJsxEl stx newAttrs kids?
 
@@ -557,20 +557,19 @@ private def rewriteHoistedChild (ctx : RewriteCtx) (inLambda : Bool) (stx : Synt
   let mut outArms   : Array OutArm := #[]
   let mut keptAttrs : Array Syntax := #[]
   for a in rewrittenAttrs do
-    if a.getKind == ``Qed.Jsx.attrNamed then
-      let aname := atomStr (a.getArg 0)
-      let vT : Term ← if (a.getArg 1).getNumArgs == 0 then `(Bool.true)
-        else liftMacroM <| Qed.Jsx.expandAttrVal (a.getArg 1) (`(""))
+    if let some (nameRef, aname, valNode) := matchNamedAttr? a then
+      let vT : Term ← if valNode.getNumArgs == 0 then `(Bool.true)
+        else liftMacroM <| Qed.Jsx.expandAttrVal valNode (`(""))
       if let some ev := cInfo.events.find? (·.name.toString == aname) then
         outArms := outArms.push { ctor := ev.name, arity := ev.arity, handler := vT }
       else if aname.startsWith "bind:" then
         let bStr := (aname.drop 5).toString
         let valPart ← `(($vT).1)
-        dataProps := dataProps.push (mkIdentFrom (a.getArg 0) (Name.mkSimple bStr), valPart)
+        dataProps := dataProps.push (mkIdentFrom nameRef (Name.mkSimple bStr), valPart)
         outArms := outArms.push { ctor := Name.mkSimple s!"set_{bStr}", arity := 1, handler := ← `(($vT).2) }
         keptAttrs := keptAttrs.push (mkJsxAttrExpr bStr valPart)
       else
-        let pId := mkIdentFrom (a.getArg 0) (Name.mkSimple aname)
+        let pId := mkIdentFrom nameRef (Name.mkSimple aname)
         if cInfo.propNames.contains pId.getId then dataProps := dataProps.push (pId, vT)
         keptAttrs := keptAttrs.push a
     else
@@ -603,7 +602,7 @@ private def rewriteSchemaFormElement (ctx : RewriteCtx) (inLambda : Bool) (stx :
     let editFn ← wrapUnaryMsg ctx.wrapMsg? ⟨mkIdent (ctx.msgPath ++ editCtor)⟩
     pairs := pairs.push (false, mkJsxAttrExpr "bind" (← `(($fId, $editFn))))
     draftField? := some fId
-  if let some (_, resetAttr) := pairs.find? fun (_, a) => a.getKind == ``Qed.Jsx.attrNamed && atomStr (a.getArg 0) == "reset" then
+  if let some (_, resetAttr) := pairs.find? fun (_, a) => (matchNamedAttr? a).any (·.2.1 == "reset") then
     unless ctx.allowHoist do
       throwErrorAt resetAttr s!"<{tag}>: `reset` is only supported inside a `component` view"
     if inLambda then
@@ -615,7 +614,7 @@ private def rewriteSchemaFormElement (ctx : RewriteCtx) (inLambda : Bool) (stx :
     let resetCond : Term ←
       if (resetAttr.getArg 1).getNumArgs == 0 then `(Bool.true)
       else liftMacroM <| Qed.Jsx.expandAttrVal (resetAttr.getArg 1) (`(Bool.true))
-    let some (_, subAttr) := pairs.find? fun (_, a) => a.getKind == ``Qed.Jsx.attrNamed && atomStr (a.getArg 0) == "onSubmit"
+    let some (_, subAttr) := pairs.find? fun (_, a) => (matchNamedAttr? a).any (·.2.1 == "onSubmit")
       | throwErrorAt stx s!"<{tag}> requires `onSubmit=\{...}`"
     unless (subAttr.getArg 1).getNumArgs == 2 do
       throwErrorAt subAttr s!"<{tag}>: `onSubmit` requires a value"
@@ -623,10 +622,9 @@ private def rewriteSchemaFormElement (ctx : RewriteCtx) (inLambda : Bool) (stx :
     let handler ← `(($subVal : _ → $(mkIdent ctx.msgPath)))
     let mut ctxProps : Array (Syntax × String × Term) := #[]
     for (_, a) in pairs do
-      if a.getKind == ``Qed.Jsx.attrNamed && (a.getArg 1).getNumArgs == 2 then
-        let nm := atomStr (a.getArg 0)
-        if !["key", "bind", "reset", "onSubmit"].contains nm then
-          ctxProps := ctxProps.push ((a.getArg 0), nm, ← liftMacroM <| Qed.Jsx.expandAttrVal (a.getArg 1) (`("")))
+      if let some (nameRef, nm, valNode) := matchNamedAttr? a then
+        if valNode.getNumArgs == 2 && !["key", "bind", "reset", "onSubmit"].contains nm then
+          ctxProps := ctxProps.push (nameRef, nm, ← liftMacroM <| Qed.Jsx.expandAttrVal valNode (`("")))
     let ctxArgs ← liftMacroM <| resolveSchemaCtxArgs stx tag sInfo.ctxBinders ctxProps (checkUnknown := false)
     let parseCall ← ctxArgs.foldlM (init := (mkIdent (`_root_ ++ schemaFull ++ `parse) : Term)) fun acc ca => `($acc $ca)
     let curRF ← ctx.resetForms.get
@@ -636,12 +634,10 @@ private def rewriteSchemaFormElement (ctx : RewriteCtx) (inLambda : Bool) (stx :
     let resetMsg ← match ctx.wrapMsg? with | some w => `($w $cid) | none => pure cid
     let resetSub ← `(fun _ => $resetMsg)
     let finalAttrs := pairs.filterMap fun (_, a) =>
-      if a.getKind == ``Qed.Jsx.attrNamed then
-        let nm := atomStr (a.getArg 0)
-        if nm == "reset" then none
-        else if nm == "onSubmit" then some (mkJsxAttrExpr "onSubmit" resetSub)
-        else some a
-      else some a
+      match matchNamedAttr? a with
+      | some (_, "reset", _)    => none
+      | some (_, "onSubmit", _) => some (mkJsxAttrExpr "onSubmit" resetSub)
+      | _                       => some a
     return .inl (rebuildJsxEl stx finalAttrs kids?)
   return .inr pairs
 
@@ -651,8 +647,7 @@ private def rewriteUpperElement (ctx : RewriteCtx) (inLambda : Bool) (stx : Synt
   let rewrittenAttrs := rewrittenPairs.map (·.2)
   if tag == "Await" then
     return rebuildJsxEl stx rewrittenAttrs kids?
-  let attrNames := rewrittenAttrs.filterMap fun a =>
-    if a.getKind == ``Qed.Jsx.attrNamed then some (atomStr (a.getArg 0)) else none
+  let attrNames := rewrittenAttrs.filterMap fun a => (matchNamedAttr? a).map (·.2.1)
   let hasState := attrNames.contains "state"
   let cName := (tag.splitOn ".").foldl Name.str Name.anonymous
   if hasState && !attrNames.contains "onMsg" then
@@ -683,11 +678,11 @@ private def rewriteUpperElement (ctx : RewriteCtx) (inLambda : Bool) (stx : Synt
   if !evList.isEmpty then
     let msgTy := mkIdent ctx.msgPath
     let attrs' ← pairs.mapM fun (wasAssign, a) => do
-      if !wasAssign && a.getKind == ``Qed.Jsx.attrNamed && (a.getArg 1).getNumArgs == 2 &&
-          ((a.getArg 1).getArg 1).getKind == ``Qed.Jsx.attrValExpr then
-        let aname := atomStr (a.getArg 0)
-        if let some (_, arity) := evList.find? (·.1 == aname) then
-          return mkJsxAttrExpr aname (← wrapEventAttr (a.getArg 1) arity msgTy ctx.wrapMsg?)
+      if !wasAssign then
+        if let some (_, aname, valNode) := matchNamedAttr? a then
+          if valNode.getNumArgs == 2 && (valNode.getArg 1).getKind == ``Qed.Jsx.attrValExpr then
+            if let some (_, arity) := evList.find? (·.1 == aname) then
+              return mkJsxAttrExpr aname (← wrapEventAttr valNode arity msgTy ctx.wrapMsg?)
       return a
     return rebuildJsxEl stx attrs' kids?
   return rebuildJsxEl stx (pairs.map (·.2)) kids?

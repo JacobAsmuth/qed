@@ -46,113 +46,95 @@ private partial def lowerPredictStmts (wrapVal : Term → CommandElabM Term) :
       else
         throwErrorAt st "`predict:` only supports pure `let`, `if`, `if let`, `match`, `pass`, and `return`"
 
-private partial def compileClassifyTree (spec : ComponentSpec) : ClassifyTree → CommandElabM Term
-  | .normal => `(Qed.SpecAction.normal)
-  | .letBind bStx ty? rhsStx body => do
-      let rhsT ← lowerCompExpr .val rhsStx
-      let bodyT ← compileClassifyTree spec body
-      if bStx.isIdent then
-        let bId : Ident := ⟨bStx⟩
-        match ty? with
-        | some ty => `(let $bId:ident : $ty := $rhsT; $bodyT)
-        | none    => `(let $bId:ident := $rhsT; $bodyT)
+private def compileSpecDispatchNode (spec : ComponentSpec) (node : SpecDispatchNode) : CommandElabM Term := do
+  let tId := spec.t.getId
+  let srvId := mkIdentFrom node.ref node.srvInfo.serverName
+  let methId := mkIdentFrom node.ref (Name.mkSimple node.mInfo.name)
+  let mut hoistDefs : Array (Ident × Term × Term) := #[]
+  let mut allCapturedArgs : Array Term := node.capturedArgs
+  let mut rpcArgs : Array Term := #[]
+  for i in [0:node.rpcArgExprs.size] do
+    let argT := node.rpcArgExprs[i]!
+    if node.rpcArgNeedHoist[i]! then
+      let tmpId := mkIdentFrom argT.raw (Name.mkSimple s!"_rpcArg_{node.kIdx}_{i}")
+      let paramTyId := mkIdentFrom argT.raw node.mInfo.paramTypeConsts[i]!
+      hoistDefs := hoistDefs.push (tmpId, paramTyId, argT)
+      allCapturedArgs := allCapturedArgs.push tmpId
+      rpcArgs := rpcArgs.push tmpId
+    else
+      rpcArgs := rpcArgs.push argT
+
+  let wrapVal (valT : Term) : CommandElabM Term := do
+    if node.mInfo.hasEnsures then
+      withRef node.ref `(qedCheckPredict% $srvId:ident $methId:ident [$[$rpcArgs:term],*] ($valT : $(node.predValTy)))
+    else
+      `(($valT : $(node.predValTy)))
+
+  let predOptTerm ← match node.predBody with
+    | .expr eStx =>
+        let v ← wrapVal (← lowerPredictExpr eStx)
+        `(Option.some ($v))
+    | .block pStmts =>
+        lowerPredictStmts wrapVal pStmts.toList
+
+  let preMsgOpt : Term ← match node.preCtor? with
+    | none => `(Option.none)
+    | some preCtor =>
+        let preId := mkIdentFrom node.ref (tId ++ `Msg ++ preCtor)
+        let preCall ← node.preArgs.foldlM (init := (preId : Term)) fun acc a => `($acc $a)
+        `(Option.some ($preCall))
+
+  let contId := mkIdentFrom node.ref (tId ++ `Msg ++ node.contCtor)
+  let contBase ← allCapturedArgs.foldlM (init := (contId : Term)) fun acc a => `($acc $a)
+  let resId := mkIdentFrom node.ref (tId ++ `Msg ++ node.resCtor)
+  let txVar := mkIdent `_specTxId
+  let predVar := mkIdent `_specPredVal
+  let resCb ← (allCapturedArgs.push (predVar : Term)).foldlM
+    (init := ← `($resId $txVar)) fun acc a => `($acc $a)
+  let rpcCall ← withRef node.ref `(qedCheckRpcCall% $srvId:ident $methId:ident [$[$rpcArgs:term],*] $resCb)
+
+  let mkDisp (arg : Term) : CommandElabM Term :=
+    `(Qed.SpecAction.dispatch $preMsgOpt Qed.Cmd.none ($contBase $arg) (fun $txVar:ident => $rpcCall))
+  let dispatchBody ← match ensuredWrapKind node.mInfo node.catchHasNone with
+    | .plain => mkDisp predVar
+    | wrap =>
+        let some ensConst := node.mInfo.ensPredConst
+          | throwErrorAt node.ref "internal: missing server `ensures` predicate in `predict`"
+        let ensApp ← rpcArgs.foldlM (init := (mkIdent ensConst : Term)) fun acc a => `($acc $a)
+        if wrap == .optEnsured then
+          let innerTy := node.innerEnsTy?.getD node.predValTy
+          let dNone ← mkDisp (← `((Option.none : Option (Qed.Ensured $innerTy ($ensApp)))))
+          let dSome ← mkDisp (← `(Option.some (Qed.Ensured.mk _pv _hSpecEns)))
+          `(match $predVar:ident with
+            | Option.none => $dNone
+            | Option.some _pv => if _hSpecEns : ($ensApp) _pv then $dSome else Qed.SpecAction.normal)
+        else
+          let dVal ← mkDisp (← `(Qed.Ensured.mk $predVar:ident _hSpecEns))
+          `(if _hSpecEns : ($ensApp) $predVar:ident then $dVal else Qed.SpecAction.normal)
+
+  let matched ← `(match ($predOptTerm : Option $(node.predValTy)) with
+    | Option.none => Qed.SpecAction.normal
+    | Option.some $predVar:ident => $dispatchBody)
+
+  hoistDefs.foldrM (init := matched) fun (tmpId, pTy, argT) acc =>
+    `(let $tmpId:ident : $pTy := $argT; $acc)
+
+private partial def compileClassifyStmts (spec : ComponentSpec) : List Syntax → CommandElabM Term
+  | [] => `(Qed.SpecAction.normal)
+  | st :: rest => do
+      if let some idx := matchSpecDispatchMarker? st then
+        return ← compileSpecDispatchNode spec spec.specNodes[idx]!
+      let k := st.getKind
+      if k == ``qedStmtPass then
+        compileClassifyStmts spec rest
+      else if k == ``qedStmtLet then
+        lowerLetStmt st (lowerCompExpr .val) (← compileClassifyStmts spec rest)
+      else if k == ``qedStmtIf || k == ``qedStmtIfLet || k == ``qedStmtMatch then
+        lowerControlFlowStmt st (lowerCompExpr .val) fun seq => compileClassifyStmts spec seq.toList
+      else if let some (_, wrap) ← lowerMutStmt? spec st false then
+        wrap (← compileClassifyStmts spec rest)
       else
-        `(let _ := $rhsT; $bodyT)
-  | .preAssign st body => do
-      let bodyT ← compileClassifyTree spec body
-      match ← lowerMutStmt? spec st false with
-      | some (_, wrap) => wrap bodyT
-      | none => pure bodyT
-  | .ifBranch condStx thenT elseT => do
-      let cond ← lowerCompExpr .propGuard condStx
-      let tT ← compileClassifyTree spec thenT
-      let eT ← compileClassifyTree spec elseT
-      `(if $(mkIdent `_qedIf):ident : $cond then $tT else $eT)
-  | .ifLet patStx scrutStx thenT elseT => do
-      let pat ← liftMacroM (lowerQedPat patStx)
-      let scrut ← lowerCompExpr .val scrutStx
-      let tT ← compileClassifyTree spec thenT
-      let eT ← compileClassifyTree spec elseT
-      `(match $(mkIdent `_qedIfLet):ident : $scrut:term with | $pat:term => $tT | _ => $eT)
-  | .matchBr scruts cases => do
-      let scrutTs ← scruts.mapM (lowerCompExpr .val)
-      let alts ← cases.mapM fun (ps, tr) => do
-        let pats ← ps.mapM fun p => liftMacroM (lowerQedPat p)
-        `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $(← compileClassifyTree spec tr))
-      `(match $[$scrutTs:term],* with $[$alts:matchAlt]*)
-  | .dispatch node => do
-      let tId := spec.t.getId
-      let srvId := mkIdentFrom node.ref node.srvInfo.serverName
-      let methId := mkIdentFrom node.ref (Name.mkSimple node.mInfo.name)
-      let mut hoistDefs : Array (Ident × Term × Term) := #[]
-      let mut allCapturedArgs : Array Term := node.capturedArgs
-      let mut rpcArgs : Array Term := #[]
-      for i in [0:node.rpcArgExprs.size] do
-        let argT := node.rpcArgExprs[i]!
-        if node.rpcArgNeedHoist[i]! then
-          let tmpId := mkIdentFrom argT.raw (Name.mkSimple s!"_rpcArg_{node.kIdx}_{i}")
-          let paramTyId := mkIdentFrom argT.raw node.mInfo.paramTypeConsts[i]!
-          hoistDefs := hoistDefs.push (tmpId, paramTyId, argT)
-          allCapturedArgs := allCapturedArgs.push tmpId
-          rpcArgs := rpcArgs.push tmpId
-        else
-          rpcArgs := rpcArgs.push argT
-
-      let wrapVal (valT : Term) : CommandElabM Term := do
-        if node.mInfo.hasEnsures then
-          withRef node.ref `(qedCheckPredict% $srvId:ident $methId:ident [$[$rpcArgs:term],*] ($valT : $(node.predValTy)))
-        else
-          `(($valT : $(node.predValTy)))
-
-      let predOptTerm ← match node.predBody with
-        | .expr eStx =>
-            let v ← wrapVal (← lowerPredictExpr eStx)
-            `(Option.some ($v))
-        | .block pStmts =>
-            lowerPredictStmts wrapVal pStmts.toList
-
-      let preMsgOpt : Term ← match node.preCtor? with
-        | none => `(Option.none)
-        | some preCtor =>
-            let preId := mkIdentFrom node.ref (tId ++ `Msg ++ preCtor)
-            let preCall ← node.preArgs.foldlM (init := (preId : Term)) fun acc a => `($acc $a)
-            `(Option.some ($preCall))
-
-      let contId := mkIdentFrom node.ref (tId ++ `Msg ++ node.contCtor)
-      let contBase ← allCapturedArgs.foldlM (init := (contId : Term)) fun acc a => `($acc $a)
-      let resId := mkIdentFrom node.ref (tId ++ `Msg ++ node.resCtor)
-      let txVar := mkIdent `_specTxId
-      let predVar := mkIdent `_specPredVal
-      let resCb ← (allCapturedArgs.push (predVar : Term)).foldlM
-        (init := ← `($resId $txVar)) fun acc a => `($acc $a)
-      let rpcCall ← withRef node.ref `(qedCheckRpcCall% $srvId:ident $methId:ident [$[$rpcArgs:term],*] $resCb)
-
-      let mkDisp (arg : Term) : CommandElabM Term :=
-        `(Qed.SpecAction.dispatch $preMsgOpt Qed.Cmd.none ($contBase $arg) (fun $txVar:ident => $rpcCall))
-      let dispatchBody ←
-        if node.mInfo.hasEnsures then
-          let some ensConst := node.mInfo.ensPredConst
-            | throwErrorAt node.ref "internal: missing server `ensures` predicate in `predict`"
-          let ensApp ← rpcArgs.foldlM (init := (mkIdent ensConst : Term)) fun acc a => `($acc $a)
-          if node.mInfo.isOption && !node.catchHasNone then
-            let innerTy := node.innerEnsTy?.getD node.predValTy
-            let dNone ← mkDisp (← `((Option.none : Option (Qed.Ensured $innerTy ($ensApp)))))
-            let dSome ← mkDisp (← `(Option.some (Qed.Ensured.mk _pv _hSpecEns)))
-            `(match $predVar:ident with
-              | Option.none => $dNone
-              | Option.some _pv => if _hSpecEns : ($ensApp) _pv then $dSome else Qed.SpecAction.normal)
-          else
-            let dVal ← mkDisp (← `(Qed.Ensured.mk $predVar:ident _hSpecEns))
-            `(if _hSpecEns : ($ensApp) $predVar:ident then $dVal else Qed.SpecAction.normal)
-        else
-          mkDisp predVar
-
-      let matched ← `(match ($predOptTerm : Option $(node.predValTy)) with
-        | Option.none => Qed.SpecAction.normal
-        | Option.some $predVar:ident => $dispatchBody)
-
-      hoistDefs.foldrM (init := matched) fun (tmpId, pTy, argT) acc =>
-        `(let $tmpId:ident : $pTy := $argT; $acc)
+        compileClassifyStmts spec rest
 
 def mkSpecClassifyCmds (spec : ComponentSpec) : CommandElabM (Array (TSyntax `command)) := do
   if !spec.hasSpeculative then return #[]
@@ -167,7 +149,7 @@ def mkSpecClassifyCmds (spec : ComponentSpec) : CommandElabM (Array (TSyntax `co
   for da in spec.specDispatches do
     let cFull := mkIdent (tId ++ `Msg ++ da.ctor)
     let paramNames := da.params.map (·.1.getId.eraseMacroScopes)
-    let mut rhs ← compileClassifyTree spec da.tree
+    let mut rhs ← compileClassifyStmts spec da.stmts.toList
     rhs ← bindMentionedFields spec (fun g => !paramNames.contains g && mentionsIdent rhs.raw g) rhs
     if !da.params.isEmpty then
       let ids : Array Term := da.params.map (⟨·.1.raw⟩)
@@ -210,13 +192,10 @@ def mkSpecClassifyCmds (spec : ComponentSpec) : CommandElabM (Array (TSyntax `co
       | some cm => `([$cm])
       | none    => `(([] : List $msgId))
 
-    let rawValTerm ←
-      if rs.mInfo.hasEnsures && rs.mInfo.isOption && !rs.catchHasNone then
-        `(($vId).map Qed.Ensured.val)
-      else if rs.mInfo.hasEnsures then
-        `(($vId).val)
-      else
-        `($vId)
+    let rawValTerm ← match ensuredWrapKind rs.mInfo rs.catchHasNone with
+      | .optEnsured => `(($vId).map Qed.Ensured.val)
+      | .ensured    => `(($vId).val)
+      | .plain      => `($vId)
 
     let okBranchBody ← `(
       if (Qed.SpecEq.eq $rawValTerm $predId) then

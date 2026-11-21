@@ -1,8 +1,6 @@
 import Qed.Html
-import Qed.Lang
-import Qed.Json
-import Qed.Proto
-import Qed.Date
+import Qed.Json.Lawful
+import Qed.Proto.Lawful
 
 namespace Qed
 
@@ -10,15 +8,12 @@ structure Field {α : Type} (p : α → Prop) where
   val : α
   ok  : p val
 
-@[reducible, inline] instance {α : Type} {p : α → Prop} : Qed.Lang.QedVal (Field p) α := ⟨Field.val⟩
-@[simp] theorem QedVal.val_field {α : Type} {p : α → Prop} (f : Field p) :
-    Qed.Lang.QedVal.val f = f.val := rfl
-
 @[reducible] instance {α : Type} {p : α → Prop} : CoeOut (Field p) α := ⟨Field.val⟩
 @[reducible] instance {α msg : Type} {p : α → Prop} [Coe α (Html msg)] : CoeHTCT (Field p) (Html msg) := ⟨fun f => (f.val : Html msg)⟩
 @[reducible] instance {α : Type} {p : α → Prop} : CoeHTCT (Option (Field p)) (Option α) := ⟨Option.map Field.val⟩
 instance {α : Type} {p : α → Prop} [ToString α] : ToString (Field p) := ⟨fun f => toString f.val⟩
 instance {α : Type} {p : α → Prop} [BEq α] : BEq (Field p) := ⟨fun a b => a.val == b.val⟩
+instance {α : Type} {p : α → Prop} [Repr α] : Repr (Field p) := ⟨fun f n => reprPrec f.val n⟩
 instance {α : Type} {p : α → Prop} [BEq α] [LawfulBEq α] : LawfulBEq (Field p) where
   eq_of_beq {a b} h := by
     cases a; cases b
@@ -44,17 +39,30 @@ instance {α : Type} {p : α → Prop} [ToJson α] [NonNullJson α] : NonNullJso
 
 instance {α : Type} {p : α → Prop} [ToProto α] : ToProto (Field p) where
   toProtoVal f := ToProto.toProtoVal f.val
+  toProtoMsg f := ToProto.toProtoMsg f.val
 
 instance {α : Type} {p : α → Prop} [DecidablePred p] [FromProto α] : FromProto (Field p) where
   fromProtoVal w := do
     let a ← FromProto.fromProtoVal (α := α) w
     if h : p a then .ok ⟨a, h⟩ else .error "protobuf: failed field refinement"
+  fromProtoMsg fs := do
+    let a ← FromProto.fromProtoMsg (α := α) fs
+    if h : p a then .ok ⟨a, h⟩ else .error "protobuf: failed field refinement"
 
-instance {α : Type} {p : α → Prop} [DecidablePred p] [LawfulProto α] : LawfulProto (Field p) :=
-  .ofScalar fun ⟨val, hok⟩ => by
+instance {α : Type} {p : α → Prop} [DecidablePred p] [LawfulProto α] : LawfulProto (Field p) where
+  msg_tags_pos f := LawfulProto.msg_tags_pos f.val
+  fromProtoVal_toProtoVal := fun ⟨val, hok⟩ => by
     dsimp only [ToProto.toProtoVal, FromProto.fromProtoVal, bind, Except.bind]
     rw [LawfulProto.fromProtoVal_toProtoVal val]
     dsimp only
     rw [dif_pos hok]
+  fromProtoMsg_toProtoMsg := fun ⟨val, hok⟩ => by
+    dsimp only [ToProto.toProtoMsg, FromProto.fromProtoMsg, bind, Except.bind]
+    rw [LawfulProto.fromProtoMsg_toProtoMsg val]
+    dsimp only
+    rw [dif_pos hok]
+
+@[simp] theorem Proto.encode_field {α : Type} {p : α → Prop} [ToProto α] (f : Field p) :
+    Proto.encode f = Proto.encode f.val := rfl
 
 end Qed

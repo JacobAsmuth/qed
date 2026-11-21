@@ -273,4 +273,77 @@ def mkNameMapExt {α : Type} [Inhabited α] (keyOf : α → Lean.Name)
     addEntryFn := fun m info => m.insert (keyOf info) info
   }
 
+/-- Resolves `ref` inside a `NameMap α` by trying `currNs ++ clean`, `clean`, open namespaces,
+    and Lean global name resolution (either directly on `clean` or via a probe suffix whose
+    resolved prefix is looked up in `reg`). -/
+def lookupNameMap? {α : Type} (reg : Lean.NameMap α) (env : Lean.Environment)
+    (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (ref : Lean.Name)
+    (probeSuffix? : Option Lean.Name := none) : Option α :=
+  let clean := ref.eraseMacroScopes
+  (reg.find? (currNs ++ clean)).orElse fun _ =>
+    (reg.find? clean).orElse fun _ =>
+      let fromOpen := openDecls.findSome? fun
+        | .simple ns _ => reg.find? (ns ++ clean)
+        | .explicit id declName => if id == clean then reg.find? declName else none
+      fromOpen.orElse fun _ =>
+        match probeSuffix? with
+        | some suf =>
+            (Lean.ResolveName.resolveGlobalName env {} currNs openDecls (clean ++ suf)).findSome?
+              fun (full, _) => reg.find? full.getPrefix
+        | none =>
+            (Lean.ResolveName.resolveGlobalName env {} currNs openDecls clean).findSome?
+              fun (full, _) => reg.find? full
+
+/-- Resolves `ref` inside a persistent `NameMap` environment extension. -/
+def lookupNameMapExt? {α : Type} [Inhabited α]
+    (ext : Lean.SimplePersistentEnvExtension α (Lean.NameMap α))
+    (env : Lean.Environment) (currNs : Lean.Name)
+    (openDecls : List Lean.OpenDecl) (ref : Lean.Name)
+    (probeSuffix? : Option Lean.Name := none) : Option α :=
+  lookupNameMap? (ext.getState env) env currNs openDecls ref probeSuffix?
+
+/-- Recursively checks whether a `Language.SnapshotTree` contains any logged errors. -/
+def snapshotTreeHasErrors : Nat → Lean.Language.SnapshotTree → Bool
+  | 0, tree => tree.element.diagnostics.msgLog.hasErrors
+  | fuel + 1, tree =>
+      tree.element.diagnostics.msgLog.hasErrors ||
+      tree.children.any fun t => snapshotTreeHasErrors fuel t.get
+
+open Lean Meta Elab Tactic in
+/-- Formats unsolved goals via `formatGoal?` (deduplicating and optionally capping the list)
+    and throws a structured diagnostic error when any goal remains. -/
+def throwUnsolvedGoals
+    (header : MessageData)
+    (footer : MessageData := m!"")
+    (ref? : Option Syntax := none)
+    (stripPrefixes : List String := [])
+    (bulletPrefix : String := "  • must satisfy:  ")
+    (formatGoal? : Option (MVarId → MetaM (Option String)) := none)
+    (maxShown? : Option Nat := none)
+    (moreLabel : String := "failing branch(es)")
+    (goals? : Option (List MVarId) := none) : TacticM Unit := do
+  let goals ← match goals? with | some gs => pure gs | none => getUnsolvedGoals
+  if goals.isEmpty then return
+  let fmtGoal : MVarId → MetaM (Option String) := formatGoal?.getD fun g => do
+    let s ← g.withContext (ppQedExpr (← instantiateMVars (← g.getType)) stripPrefixes)
+    return some s!"{bulletPrefix}{s}"
+  let mut lines : Array String := #[]
+  for g in goals do
+    if let some line ← fmtGoal g then
+      unless lines.contains line do
+        lines := lines.push line
+  let shown := match maxShown? with
+    | some k => lines.extract 0 (min lines.size k)
+    | none   => lines
+  let extra := match maxShown? with
+    | some k => if lines.size > k then s!"\n  • (+ {lines.size - k} more {moreLabel})" else ""
+    | none   => ""
+  let bodyPart : MessageData :=
+    if shown.isEmpty then m!""
+    else m!"\n{String.intercalate "\n" shown.toList}{extra}"
+  let fullMsg : MessageData := m!"{header}{bodyPart}{footer}"
+  match ref? with
+  | some ref => throwErrorAt ref fullMsg
+  | none     => throwError fullMsg
+
 end Qed.Diag

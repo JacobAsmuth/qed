@@ -168,118 +168,60 @@ def styleStrictClause : Parser := leading_parser
 
 /-! ## CSS Property & Value Validation Engine -/
 
-private def knownCssProps : List String := [
-  -- Box & Layout
-  "display", "position", "inset", "top", "right", "bottom", "left", "z-index",
-  "box-sizing", "width", "height", "min-width", "max-width", "min-height", "max-height",
-  "aspect-ratio", "overflow", "overflow-x", "overflow-y", "visibility", "opacity",
-  "isolation", "float", "clear", "content", "vertical-align", "object-fit", "object-position",
-  -- Spacing
-  "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
-  "margin-inline", "margin-block", "margin-inline-start", "margin-inline-end",
-  "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
-  "padding-inline", "padding-block", "padding-inline-start", "padding-inline-end",
-  -- Flexbox & Grid
-  "flex", "flex-direction", "flex-wrap", "flex-flow", "flex-grow", "flex-shrink", "flex-basis",
-  "justify-content", "justify-items", "justify-self",
-  "align-items", "align-content", "align-self", "place-items", "place-content", "place-self",
-  "order", "gap", "row-gap", "column-gap",
-  "grid", "grid-template", "grid-template-columns", "grid-template-rows", "grid-template-areas",
-  "grid-column", "grid-row", "grid-area", "grid-auto-flow", "grid-auto-columns", "grid-auto-rows",
-  -- Typography
-  "color", "font", "font-family", "font-size", "font-weight", "font-style", "font-variant",
-  "line-height", "letter-spacing", "word-spacing", "text-align", "text-decoration",
-  "text-decoration-color", "text-decoration-thickness", "text-underline-offset",
-  "text-transform", "text-overflow", "text-indent", "text-shadow", "white-space",
-  "word-break", "overflow-wrap", "hyphens", "tab-size",
-  -- Backgrounds, Borders & Effects
-  "background", "background-color", "background-image", "background-position",
-  "background-size", "background-repeat", "background-clip", "background-origin",
-  "border", "border-top", "border-right", "border-bottom", "border-left",
-  "border-width", "border-style", "border-color",
-  "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
-  "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
-  "border-radius", "border-top-left-radius", "border-top-right-radius",
-  "border-bottom-left-radius", "border-bottom-right-radius", "border-collapse", "border-spacing",
-  "outline", "outline-width", "outline-style", "outline-color", "outline-offset",
-  "box-shadow", "filter", "backdrop-filter", "mix-blend-mode", "clip-path", "mask", "mask-image",
-  -- Transform, Transition & Animation
-  "transform", "transform-origin", "perspective", "rotate", "scale", "translate",
-  "transition", "transition-property", "transition-duration", "transition-timing-function", "transition-delay",
-  "animation", "animation-name", "animation-duration", "animation-timing-function",
-  "animation-delay", "animation-iteration-count", "animation-direction", "animation-fill-mode",
-  "animation-play-state", "will-change",
-  -- Interactivity, Lists, Tables, SVG & Scroll
-  "cursor", "pointer-events", "user-select", "resize", "appearance", "touch-action",
-  "accent-color", "caret-color", "list-style", "list-style-type", "list-style-position",
-  "table-layout", "caption-side", "empty-cells",
-  "fill", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin", "stroke-dasharray",
-  "scroll-behavior", "scroll-margin", "scroll-padding", "scroll-snap-type", "scroll-snap-align",
-  "overscroll-behavior", "container-type", "container-name", "container"
-]
+private inductive CssPropKind where
+  | color | len | border | num | time | any
+  | enum (vals : List String)
 
-private def commonGlobalKw : List String := ["inherit", "initial", "unset", "revert", "revert-layer"]
+private def ws (s : String) : List String := s.splitOn " "
+private def commonGlobalKw : List String := ws "inherit initial unset revert revert-layer"
+private def borderStyleVals : List String := ws "solid dashed dotted double groove ridge inset outset none hidden"
+private def overflowVals : List String := ws "visible hidden clip scroll auto"
 
-private def enumPropValues : String → Option (List String)
-  | "display"         => some ["flex", "inline-flex", "grid", "inline-grid", "block", "inline", "inline-block", "table", "table-row", "table-cell", "flow-root", "contents", "none", "list-item"]
-  | "position"        => some ["static", "relative", "absolute", "fixed", "sticky"]
-  | "text-align"      => some ["left", "right", "center", "justify", "start", "end"]
-  | "flex-direction"  => some ["row", "column", "row-reverse", "column-reverse"]
-  | "flex-wrap"       => some ["nowrap", "wrap", "wrap-reverse"]
-  | "justify-content" => some ["flex-start", "flex-end", "start", "end", "center", "space-between", "space-around", "space-evenly", "stretch", "normal"]
-  | "align-items"     => some ["flex-start", "flex-end", "start", "end", "center", "stretch", "baseline", "normal"]
-  | "align-self"      => some ["auto", "flex-start", "flex-end", "start", "end", "center", "stretch", "baseline"]
-  | "justify-self"    => some ["auto", "start", "end", "center", "stretch"]
-  | "box-sizing"      => some ["content-box", "border-box"]
-  | "cursor"          => some ["auto", "default", "pointer", "not-allowed", "text", "move", "grab", "grabbing", "wait", "progress", "help", "crosshair", "zoom-in", "zoom-out", "col-resize", "row-resize", "ew-resize", "ns-resize", "none"]
-  | "overflow" | "overflow-x" | "overflow-y" => some ["visible", "hidden", "clip", "scroll", "auto"]
-  | "white-space"     => some ["normal", "nowrap", "pre", "pre-wrap", "pre-line", "break-spaces"]
-  | "object-fit"      => some ["fill", "contain", "cover", "none", "scale-down"]
-  | "pointer-events"  => some ["auto", "none", "all"]
-  | "user-select"     => some ["auto", "none", "text", "all", "contain"]
-  | "visibility"      => some ["visible", "hidden", "collapse"]
-  | "font-style"      => some ["normal", "italic", "oblique"]
-  | "text-transform"  => some ["none", "capitalize", "uppercase", "lowercase", "full-width"]
-  | "text-overflow"   => some ["clip", "ellipsis"]
-  | "word-break"      => some ["normal", "break-all", "keep-all", "break-word"]
-  | "scroll-behavior" => some ["auto", "smooth"]
-  | "border-style"    => some ["solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset", "none", "hidden"]
-  | _                 => none
+private def cssPropMap : Std.HashMap String CssPropKind := Id.run do
+  let mut m : Std.HashMap String CssPropKind := {}
+  let add (k : CssPropKind) (props : String) (m : Std.HashMap String CssPropKind) :=
+    (ws props).foldl (fun acc p => acc.insert p k) m
+  m := add .color "color background-color border-color border-top-color border-right-color border-bottom-color border-left-color outline-color text-decoration-color fill stroke accent-color caret-color" m
+  m := add .len "width height min-width max-width min-height max-height padding padding-top padding-right padding-bottom padding-left padding-inline padding-block padding-inline-start padding-inline-end margin margin-top margin-right margin-bottom margin-left margin-inline margin-block margin-inline-start margin-inline-end inset top right bottom left gap row-gap column-gap font-size border-radius border-width outline-offset letter-spacing flex-basis" m
+  m := add .border "border border-top border-right border-bottom border-left outline" m
+  m := add .num "font-weight line-height opacity z-index" m
+  m := add .time "animation-duration transition-duration" m
+  m := add .any "aspect-ratio isolation float clear content vertical-align object-position flex flex-flow flex-grow flex-shrink justify-items align-content place-items place-content place-self order grid grid-template grid-template-columns grid-template-rows grid-template-areas grid-column grid-row grid-area grid-auto-flow grid-auto-columns grid-auto-rows font font-family font-variant word-spacing text-decoration text-decoration-thickness text-underline-offset text-indent text-shadow overflow-wrap hyphens tab-size background background-image background-position background-size background-repeat background-clip background-origin border-top-width border-right-width border-bottom-width border-left-width border-top-left-radius border-top-right-radius border-bottom-left-radius border-bottom-right-radius border-collapse border-spacing outline-width outline-style box-shadow filter backdrop-filter mix-blend-mode clip-path mask mask-image transform transform-origin perspective rotate scale translate transition transition-property transition-timing-function transition-delay animation animation-name animation-timing-function animation-delay animation-iteration-count animation-direction animation-fill-mode animation-play-state will-change resize appearance touch-action list-style list-style-type list-style-position table-layout caption-side empty-cells stroke-width stroke-linecap stroke-linejoin stroke-dasharray scroll-margin scroll-padding scroll-snap-type scroll-snap-align overscroll-behavior container-type container-name container" m
+  for (p, vs) in [
+    ("display", ws "flex inline-flex grid inline-grid block inline inline-block table table-row table-cell flow-root contents none list-item"),
+    ("position", ws "static relative absolute fixed sticky"),
+    ("text-align", ws "left right center justify start end"),
+    ("flex-direction", ws "row column row-reverse column-reverse"),
+    ("flex-wrap", ws "nowrap wrap wrap-reverse"),
+    ("justify-content", ws "flex-start flex-end start end center space-between space-around space-evenly stretch normal"),
+    ("align-items", ws "flex-start flex-end start end center stretch baseline normal"),
+    ("align-self", ws "auto flex-start flex-end start end center stretch baseline"),
+    ("justify-self", ws "auto start end center stretch"),
+    ("box-sizing", ws "content-box border-box"),
+    ("cursor", ws "auto default pointer not-allowed text move grab grabbing wait progress help crosshair zoom-in zoom-out col-resize row-resize ew-resize ns-resize none"),
+    ("overflow", overflowVals), ("overflow-x", overflowVals), ("overflow-y", overflowVals),
+    ("white-space", ws "normal nowrap pre pre-wrap pre-line break-spaces"),
+    ("object-fit", ws "fill contain cover none scale-down"),
+    ("pointer-events", ws "auto none all"),
+    ("user-select", ws "auto none text all contain"),
+    ("visibility", ws "visible hidden collapse"),
+    ("font-style", ws "normal italic oblique"),
+    ("text-transform", ws "none capitalize uppercase lowercase full-width"),
+    ("text-overflow", ws "clip ellipsis"),
+    ("word-break", ws "normal break-all keep-all break-word"),
+    ("scroll-behavior", ws "auto smooth"),
+    ("border-style", borderStyleVals)
+  ] do
+    m := m.insert p (.enum vs)
+  return m
 
-private def colorProps : List String := [
-  "color", "background-color", "border-color",
-  "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
-  "outline-color", "text-decoration-color", "fill", "stroke", "accent-color", "caret-color"
-]
+private def knownCssProps : List String := cssPropMap.keys
 
-private def lengthProps : List String := [
-  "width", "height", "min-width", "max-width", "min-height", "max-height",
-  "padding", "padding-top", "padding-right", "padding-bottom", "padding-left",
-  "padding-inline", "padding-block", "padding-inline-start", "padding-inline-end",
-  "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
-  "margin-inline", "margin-block", "margin-inline-start", "margin-inline-end",
-  "inset", "top", "right", "bottom", "left", "gap", "row-gap", "column-gap",
-  "font-size", "border-radius", "border-width", "outline-offset", "letter-spacing", "flex-basis"
-]
+private def namedCssColors : List String :=
+  ws "transparent currentcolor currentColor black white red green blue yellow orange purple pink gray grey cyan magenta navy teal maroon olive silver lime aqua fuchsia indigo violet gold coral crimson salmon tomato khaki plum orchid tan beige ivory linen snow azure mintcream honeydew lavender aliceblue whitesmoke gainsboro lightgray lightgrey darkgray darkgrey dimgray dimgrey slategray slategrey none"
 
-private def borderShorthandProps : List String := [
-  "border", "border-top", "border-right", "border-bottom", "border-left", "outline"
-]
-
-private def namedCssColors : List String := [
-  "transparent", "currentcolor", "currentColor", "black", "white", "red", "green", "blue",
-  "yellow", "orange", "purple", "pink", "gray", "grey", "cyan", "magenta", "navy", "teal",
-  "maroon", "olive", "silver", "lime", "aqua", "fuchsia", "indigo", "violet", "gold", "coral",
-  "crimson", "salmon", "tomato", "khaki", "plum", "orchid", "tan", "beige", "ivory", "linen",
-  "snow", "azure", "mintcream", "honeydew", "lavender", "aliceblue", "whitesmoke", "gainsboro",
-  "lightgray", "lightgrey", "darkgray", "darkgrey", "dimgray", "dimgrey", "slategray", "slategrey",
-  "none"
-]
-
-private def validUnits : List String := [
-  "px", "rem", "em", "%", "vh", "vw", "dvh", "svh", "lvh", "dvw", "svw", "lvw",
-  "fr", "ch", "ex", "vmin", "vmax", "pt", "cm", "mm", "in", "cqw", "cqh", "cqi", "cqb"
-]
+private def validUnits : List String :=
+  ws "px rem em % vh vw dvh svh lvh dvw svw lvw fr ch ex vmin vmax pt cm mm in cqw cqh cqi cqb"
 
 private def validTimeUnits : List String := ["ms", "s"]
 
@@ -408,19 +350,7 @@ private def validateColorLiteral (tok : String) : Except String (Option (Nat × 
 
 def resolveInRegistry {α : Type} (reg : NameMap α) (env : Environment)
     (currNs : Name) (openDecls : List OpenDecl) (rawName : String) : Option α :=
-  let nm := rawName.toName
-  if let some v := reg.find? (currNs ++ nm) then some v
-  else if let some v := reg.find? nm then some v
-  else
-    let fromOpen := openDecls.findSome? fun
-      | .simple ns _ => reg.find? (ns ++ nm)
-      | .explicit id declName => if id == nm then reg.find? declName else none
-    match fromOpen with
-    | some v => some v
-    | none =>
-        -- Check `env` global resolution as fallback
-        (ResolveName.resolveGlobalName env {} currNs openDecls nm).findSome? fun (full, _) =>
-          reg.find? full
+  Qed.Diag.lookupNameMap? reg env currNs openDecls rawName.toName
 
 private def isIdentLike (tok : String) : Bool :=
   match tok.toList with
@@ -433,76 +363,71 @@ private structure ResolvedCssValue where
   extraRules : List String := []
   themes     : List Name := []
 
-private def checkTokenKindForProp (ref : Syntax) (prop : String) (tokInfo : TokenMetaInfo) : CoreM Unit := do
+private def checkTokenKindForProp (ref : Syntax) (prop : String) (kind : CssPropKind) (tokInfo : TokenMetaInfo) : CoreM Unit := do
   if tokInfo.kind == "any" then return
-  if colorProps.contains prop && tokInfo.kind != "color" then
-    throwErrorAt ref s!"type mismatch in CSS `{prop}`: token `{tokInfo.fullName}` has kind `{tokInfo.kind}`, expected `color`"
-  if lengthProps.contains prop && tokInfo.kind != "len" then
-    throwErrorAt ref s!"type mismatch in CSS `{prop}`: token `{tokInfo.fullName}` has kind `{tokInfo.kind}`, expected `len`"
-  if (prop == "font-weight" || prop == "line-height" || prop == "opacity" || prop == "z-index") && tokInfo.kind != "num" then
-    throwErrorAt ref s!"type mismatch in CSS `{prop}`: token `{tokInfo.fullName}` has kind `{tokInfo.kind}`, expected `num`"
-  if prop == "animation-duration" && tokInfo.kind != "time" then
-    throwErrorAt ref s!"type mismatch in CSS `{prop}`: token `{tokInfo.fullName}` has kind `{tokInfo.kind}`, expected `time`"
+  let expected? := match kind with
+    | .color => some "color" | .len => some "len" | .num => some "num" | .time => some "time" | _ => none
+  if let some expected := expected? then
+    if tokInfo.kind != expected then
+      throwErrorAt ref s!"type mismatch in CSS `{prop}`: token `{tokInfo.fullName}` has kind `{tokInfo.kind}`, expected `{expected}`"
 
-private def checkStrictTokensForProp (ref : Syntax) (p : String) (resolvedAtoms : List String) : CoreM Unit := do
+private def checkStrictTokensForProp (ref : Syntax) (p : String) (kind : CssPropKind) (resolvedAtoms : List String) : CoreM Unit := do
   for a in resolvedAtoms do
-    if colorProps.contains p then
-      let allowed := a.startsWith "var(" || a == "transparent" || a == "currentColor" ||
-                     a == "currentcolor" || commonGlobalKw.contains a
-      unless allowed do
-        throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw color `{a}` is disallowed; use a `theme` color token instead"
-    if lengthProps.contains p then
-      let allowed := a.startsWith "var(" || a == "0" || a == "auto" || a == "none" ||
-                     a == "100%" || commonGlobalKw.contains a
-      unless allowed do
-        throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw length `{a}` is disallowed; use a `theme` length token instead"
-    if borderShorthandProps.contains p then
-      if a.startsWith "#" || a.startsWith "rgb(" || a.startsWith "rgba(" || a.startsWith "hsl(" || a.startsWith "oklch(" then
-        throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw color `{a}` is disallowed; use a `theme` color token instead"
+    match kind with
+    | .color =>
+        unless a.startsWith "var(" || a == "transparent" || a == "currentColor" ||
+               a == "currentcolor" || commonGlobalKw.contains a do
+          throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw color `{a}` is disallowed; use a `theme` color token instead"
+    | .len =>
+        unless a.startsWith "var(" || a == "0" || a == "auto" || a == "none" ||
+               a == "100%" || commonGlobalKw.contains a do
+          throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw length `{a}` is disallowed; use a `theme` length token instead"
+    | .border =>
+        if a.startsWith "#" || a.startsWith "rgb(" || a.startsWith "rgba(" || a.startsWith "hsl(" || a.startsWith "oklch(" then
+          throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw color `{a}` is disallowed; use a `theme` color token instead"
+    | _ => pure ()
 
-private def validatePropValue (ref : Syntax) (p resolvedVal : String) (resolvedAtoms : List String) : CoreM Unit := do
-  if let some allowed := enumPropValues p then
-    for a in resolvedAtoms do
-      unless allowed.contains a || commonGlobalKw.contains a || a.startsWith "var(" do
-        throwErrorAt ref s!"invalid value `{a}` for CSS property `{p}` (expected one of: {String.intercalate ", " allowed})"
-  else if colorProps.contains p then
-    if resolvedAtoms.length != 1 then
-      throwErrorAt ref s!"CSS color property `{p}` expects a single color value, got `{resolvedVal}`"
-    match validateColorLiteral resolvedAtoms.head! with
-    | .ok _ => pure ()
-    | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
-  else if lengthProps.contains p then
-    for a in resolvedAtoms do
-      unless isValidLenAtom a do
-        throwErrorAt ref s!"invalid length `{a}` for CSS property `{p}` (use a unit like `px`, `rem`, `em`, `%`, `vh`, `vw`, `0`, `auto`, `calc(...)`, or a `len` token)"
-  else if borderShorthandProps.contains p then
-    if resolvedAtoms == ["none"] || resolvedAtoms == ["0"] || resolvedAtoms.all (fun a => commonGlobalKw.contains a || a.startsWith "var(") then
-      pure ()
-    else if resolvedAtoms.length == 3 then
-      let w := resolvedAtoms[0]!; let s := resolvedAtoms[1]!; let c := resolvedAtoms[2]!
-      unless isValidLenAtom w do
-        throwErrorAt ref s!"in `{p}`: invalid border width `{w}`"
-      unless ["solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset", "none", "hidden"].contains s || s.startsWith "var(" do
-        throwErrorAt ref s!"in `{p}`: invalid border style `{s}`"
-      match validateColorLiteral c with
+private def validatePropValue (ref : Syntax) (p resolvedVal : String) (kind : CssPropKind) (resolvedAtoms : List String) : CoreM Unit := do
+  match kind with
+  | .enum allowed =>
+      for a in resolvedAtoms do
+        unless allowed.contains a || commonGlobalKw.contains a || a.startsWith "var(" do
+          throwErrorAt ref s!"invalid value `{a}` for CSS property `{p}` (expected one of: {String.intercalate ", " allowed})"
+  | .color =>
+      if resolvedAtoms.length != 1 then
+        throwErrorAt ref s!"CSS color property `{p}` expects a single color value, got `{resolvedVal}`"
+      match validateColorLiteral resolvedAtoms.head! with
       | .ok _ => pure ()
       | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
-    else
-      throwErrorAt ref s!"`{p}` expects `none`, `0`, or `<width> <style> <color>` (e.g. `1px solid #ddd`), got `{resolvedVal}`"
-  else if p == "animation-duration" || p == "transition-duration" then
-    for a in resolvedAtoms do
-      unless isValidTimeAtom a do
-        throwErrorAt ref s!"invalid duration `{a}` for `{p}` (expected e.g. `200ms` or `0.3s`)"
-  else
-    -- Still validate any inline `#hex` or `rgb(...)` embedded in shorthand properties like `box-shadow` or `background`
-    for a in resolvedAtoms do
-      if a.startsWith "#" && !Qed.isValidHexColor a then
-        throwErrorAt ref s!"in `{p}`: invalid hex color `{a}`"
-      if let some (fn, args) := parseFuncCall? a then
-        if fn == "rgb" || fn == "rgba" then
-          match validateRgbArgs fn args with
-          | .ok _ => pure ()
-          | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
+  | .len =>
+      for a in resolvedAtoms do
+        unless isValidLenAtom a do
+          throwErrorAt ref s!"invalid length `{a}` for CSS property `{p}` (use a unit like `px`, `rem`, `em`, `%`, `vh`, `vw`, `0`, `auto`, `calc(...)`, or a `len` token)"
+  | .border =>
+      if resolvedAtoms == ["none"] || resolvedAtoms == ["0"] || resolvedAtoms.all (fun a => commonGlobalKw.contains a || a.startsWith "var(") then
+        pure ()
+      else if resolvedAtoms.length == 3 then
+        let w := resolvedAtoms[0]!; let s := resolvedAtoms[1]!; let c := resolvedAtoms[2]!
+        unless isValidLenAtom w do throwErrorAt ref s!"in `{p}`: invalid border width `{w}`"
+        unless borderStyleVals.contains s || s.startsWith "var(" do throwErrorAt ref s!"in `{p}`: invalid border style `{s}`"
+        match validateColorLiteral c with
+        | .ok _ => pure ()
+        | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
+      else
+        throwErrorAt ref s!"`{p}` expects `none`, `0`, or `<width> <style> <color>` (e.g. `1px solid #ddd`), got `{resolvedVal}`"
+  | .time =>
+      for a in resolvedAtoms do
+        unless isValidTimeAtom a do
+          throwErrorAt ref s!"invalid duration `{a}` for `{p}` (expected e.g. `200ms` or `0.3s`)"
+  | .num | .any =>
+      for a in resolvedAtoms do
+        if a.startsWith "#" && !Qed.isValidHexColor a then
+          throwErrorAt ref s!"in `{p}`: invalid hex color `{a}`"
+        if let some (fn, args) := parseFuncCall? a then
+          if fn == "rgb" || fn == "rgba" then
+            match validateRgbArgs fn args with
+            | .ok _ => pure ()
+            | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
 
 private def resolveAndValidateDecl (ref : Syntax) (env : Environment) (currNs : Name)
     (openDecls : List OpenDecl) (strictTokens : Bool) (prop rawVal : String) :
@@ -513,8 +438,10 @@ private def resolveAndValidateDecl (ref : Syntax) (env : Environment) (currNs : 
   if p.isEmpty then throwErrorAt ref "empty CSS property name"
   if v.isEmpty then throwErrorAt ref s!"missing value for CSS property `{p}`"
   let isCustomProp := p.startsWith "--"
-  if !isCustomProp && !knownCssProps.contains p then
-    throwErrorAt ref s!"unknown CSS property `{p}`{Qed.Diag.didYouMean p knownCssProps}"
+  let propKind ← if isCustomProp then pure CssPropKind.any else
+    match cssPropMap[p]? with
+    | some k => pure k
+    | none   => throwErrorAt ref s!"unknown CSS property `{p}`{Qed.Diag.didYouMean p knownCssProps}"
   let tokReg := tokenMetaRegistry.getState env
   let kfReg  := keyframesMetaRegistry.getState env
   let atoms := splitTopLevel ' ' v
@@ -525,7 +452,7 @@ private def resolveAndValidateDecl (ref : Syntax) (env : Environment) (currNs : 
   for a in atoms do
     if isIdentLike a then
       if let some tInfo := resolveInRegistry tokReg env currNs openDecls a then
-        checkTokenKindForProp ref p tInfo
+        checkTokenKindForProp ref p propKind tInfo
         outAtoms := outAtoms.push s!"var(--{tInfo.cssName})"
         usedToks := usedToks ++ [tInfo.cssName]
         if let some thNm := tInfo.themeName? then
@@ -543,9 +470,9 @@ private def resolveAndValidateDecl (ref : Syntax) (env : Environment) (currNs : 
   let resolvedVal := String.intercalate " " outAtoms.toList
   let resolvedAtoms := outAtoms.toList
   if strictTokens && !isCustomProp then
-    checkStrictTokensForProp ref p resolvedAtoms
+    checkStrictTokensForProp ref p propKind resolvedAtoms
   if !isCustomProp then
-    validatePropValue ref p resolvedVal resolvedAtoms
+    validatePropValue ref p resolvedVal propKind resolvedAtoms
   let extraTokens := Qed.extractVarNames resolvedVal
   return {
     cssText    := resolvedVal
@@ -562,11 +489,10 @@ private def atomText (stx : Syntax) : String :=
   | .atom _ v              => v
   | _                      => ""
 
-private def splitFirstColon (s : String) : Option (String × String) :=
-  let cs := s.toList
-  let (lhs, rhs) := cs.span (· != ':')
+private def splitFirstChar (sep : Char) (s : String) : Option (String × String) :=
+  let (lhs, rhs) := s.toList.span (· != sep)
   match rhs with
-  | ':' :: rest => some ((String.ofList lhs).trimmed, (String.ofList rest).trimmed)
+  | c :: rest => if c == sep then some ((String.ofList lhs).trimmed, (String.ofList rest).trimmed) else none
   | _ => none
 
 private structure CompiledCssBlock where
@@ -594,7 +520,7 @@ private partial def compileCssBlockItems (env : Environment) (currNs : Name)
       for t in sub.themes do unless thms.contains t do thms := thms ++ [t]
     else if stx.getKind == ``cssSimpleDecl then
       let line := (atomText (stx.getArg 0)).trimmed
-      let some (p, v) := splitFirstColon line
+      let some (p, v) := splitFirstChar ':' line
         | throwErrorAt (stx.getArg 0) s!"expected CSS declaration `property: value`, got `{line}`"
       let res ← resolveAndValidateDecl (stx.getArg 0) env currNs openDecls strictTokens p v
       items := items ++ [.decl p.trimmed res.cssText]
@@ -724,24 +650,17 @@ private structure ThemeContrastInv where
 
 private def parseTokenLine (ref : Syntax) (line : String) : CoreM (String × String × String) := do
   -- Format: `<kind> <name> = <value>`
-  let cs := line.toList
-  let (lhs, rhs) := cs.span (· != '=')
-  match rhs with
-  | '=' :: rest =>
-      let val := (String.ofList rest).trimmed
-      let lhsToks := splitTopLevel ' ' (String.ofList lhs)
-      match lhsToks with
-      | [kind, nm] =>
-          unless ["color", "len", "num", "font", "time"].contains kind do
-            throwErrorAt ref s!"unknown theme token kind `{kind}` (expected `color`, `len`, `num`, `font`, or `time`)"
-          unless isIdentLike nm && !nm.contains '.' do
-            throwErrorAt ref s!"invalid theme token name `{nm}`"
-          if val.isEmpty then throwErrorAt ref s!"missing value for token `{nm}`"
-          return (kind, nm, val)
-      | _ =>
-          throwErrorAt ref s!"expected `<kind> <name> = <value>` in `theme`, got `{line}`"
-  | _ =>
-      throwErrorAt ref s!"expected `<kind> <name> = <value>` in `theme`, got `{line}`"
+  let some (lhs, val) := splitFirstChar '=' line
+    | throwErrorAt ref s!"expected `<kind> <name> = <value>` in `theme`, got `{line}`"
+  match splitTopLevel ' ' lhs with
+  | [kind, nm] =>
+      unless ["color", "len", "num", "font", "time"].contains kind do
+        throwErrorAt ref s!"unknown theme token kind `{kind}` (expected `color`, `len`, `num`, `font`, or `time`)"
+      unless isIdentLike nm && !nm.contains '.' do
+        throwErrorAt ref s!"invalid theme token name `{nm}`"
+      if val.isEmpty then throwErrorAt ref s!"missing value for token `{nm}`"
+      return (kind, nm, val)
+  | _ => throwErrorAt ref s!"expected `<kind> <name> = <value>` in `theme`, got `{line}`"
 
 private def parseDecimalX100 (s : String) : Option Nat :=
   let t := s.trimmed
@@ -761,7 +680,7 @@ private def parseDecimalX100 (s : String) : Option Nat :=
 
 private def parseContrastInvLine (ref : Syntax) (line : String) : CoreM ThemeContrastInv := do
   -- Format: `invariant <name>: contrast(<fg>, <bg>) >= <ratio>`
-  let some (lhs, rhs) := splitFirstColon line
+  let some (lhs, rhs) := splitFirstChar ':' line
     | throwErrorAt ref s!"expected `invariant <name>: contrast(fg, bg) >= <ratio>`, got `{line}`"
   let lhsParts := splitTopLevel ' ' lhs
   let invName ← match lhsParts with
@@ -819,37 +738,30 @@ private def toKebabCase (s : String) : String :=
   | '-' :: rest => String.ofList rest
   | cs          => String.ofList cs
 
-private def quoteOptColor (cssStr : String) (rgb? : Option (Nat × Nat × Nat)) : MacroM Term := do
-  match rgb? with
-  | some (r, g, b) =>
-      `(some ({ raw := $(Syntax.mkStrLit cssStr), rgb? := some ($(Syntax.mkNumLit (toString r)), $(Syntax.mkNumLit (toString g)), $(Syntax.mkNumLit (toString b))) } : Qed.Color))
-  | none =>
-      `(some ({ raw := $(Syntax.mkStrLit cssStr), rgb? := none } : Qed.Color))
+private def quoteOptColor (cssStr? : Option String) (rgb? : Option (Nat × Nat × Nat)) : MacroM Term := do
+  let some cssStr := cssStr? | `(none)
+  let rgbT ← match rgb? with
+    | some (r, g, b) => `(some ($(Syntax.mkNumLit (toString r)), $(Syntax.mkNumLit (toString g)), $(Syntax.mkNumLit (toString b))))
+    | none           => `(none)
+  `(some ({ raw := $(Syntax.mkStrLit cssStr), rgb? := $rgbT } : Qed.Color))
 
 private def emitThemeTokens (themeNm fullThemeName : Name) (thStyleRaw : String)
     (entries : Array ThemeTokEntry) : CommandElabM Unit := do
   for e in entries do
     let tokId := mkIdentFrom e.ref (themeNm ++ Name.mkSimple e.ident)
-    let cssLit := Syntax.mkStrLit e.cssName
-    let mkOptRaw (ty : Term) (val? : Option String) : MacroM Term := match val? with
+    let mkOptRaw (ty : Term) : Option String → MacroM Term
       | some s => `(some ({ raw := $(Syntax.mkStrLit s) } : $ty))
       | none   => `(none)
     let (tyTerm, lTerm, dTerm) ← match e.kind with
-      | "color" =>
-          let l ← liftMacroM <| quoteOptColor e.lightCss e.lightRgb
-          let d ← match e.darkCss? with
-            | some dc => liftMacroM <| quoteOptColor dc e.darkRgb?
-            | none    => `(none)
-          pure (← `(Qed.Color), l, d)
+      | "color" => pure (← `(Qed.Color), ← liftMacroM <| quoteOptColor (some e.lightCss) e.lightRgb, ← liftMacroM <| quoteOptColor e.darkCss? e.darkRgb?)
       | "len" | "num" | "time" =>
-          let ty ← match e.kind with
-            | "len" => `(Qed.Len) | "num" => `(Qed.CssNum) | _ => `(Qed.Time)
+          let ty ← match e.kind with | "len" => `(Qed.Len) | "num" => `(Qed.CssNum) | _ => `(Qed.Time)
           pure (ty, ← liftMacroM <| mkOptRaw ty (some e.lightCss), ← liftMacroM <| mkOptRaw ty e.darkCss?)
       | _ =>
           let d ← match e.darkCss? with | some dc => `(some $(Syntax.mkStrLit dc)) | none => `(none)
           pure (← `(String), ← `(some $(Syntax.mkStrLit e.lightCss)), d)
     elabCommand (← `(command| def $tokId : Qed.TypedToken $tyTerm :=
-      { name := $cssLit, lightVal := $lTerm, darkVal := $dTerm }))
+      { name := $(Syntax.mkStrLit e.cssName), lightVal := $lTerm, darkVal := $dTerm }))
     modifyEnv fun env' => tokenMetaRegistry.addEntry env' {
       fullName := fullThemeName ++ Name.mkSimple e.ident, cssName := e.cssName
       kind := e.kind, themeName? := some fullThemeName, themeRule? := some thStyleRaw
@@ -962,62 +874,6 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
 
 /-! ## `verify_theme <Theme> for <app>` Command (Kernel Proof of Token Completeness) -/
 
-private def decodeNatExpr? : Nat → Expr → Option Nat
-  | 0, _ => none
-  | fuel + 1, e =>
-      match e.consumeMData with
-      | .lit (.natVal n) => some n
-      | .const ``Nat.zero _ => some 0
-      | .app (.const ``Nat.succ _) a => (decodeNatExpr? fuel a).map (· + 1)
-      | .app (.app (.app (.const ``OfNat.ofNat _) _) n) _ => decodeNatExpr? fuel n
-      | _ => none
-
-private def decodeUInt8Expr? : Nat → Expr → Option UInt8
-  | 0, _ => none
-  | fuel + 1, e =>
-      let e := e.consumeMData
-      if let some n := decodeNatExpr? fuel e then some n.toUInt8
-      else
-        let (fn, args) := e.getAppFnArgs
-        if fn == ``Fin.mk && args.size ≥ 2 then decodeUInt8Expr? fuel args[1]!
-        else if fn == ``BitVec.ofFin && args.size ≥ 2 then decodeUInt8Expr? fuel args[1]!
-        else if (fn == `UInt8.ofBitVec || fn == ``UInt8.ofNat || fn == ``BitVec.ofNat) && args.size ≥ 1 then
-          decodeUInt8Expr? fuel args[args.size - 1]!
-        else if args.size == 1 then decodeUInt8Expr? fuel args[0]!
-        else none
-
-private def decodeExprList? : Nat → Expr → Option (List Expr)
-  | 0, _ => none
-  | fuel + 1, e =>
-      let e := e.consumeMData
-      let (fn, args) := e.getAppFnArgs
-      if fn == ``List.nil then some []
-      else if fn == ``List.cons && args.size >= 2 then do
-        let h := args[args.size - 2]!
-        let t ← decodeExprList? fuel args[args.size - 1]!
-        some (h :: t)
-      else none
-
-private def decodeReducedStr? : Nat → Expr → Option String
-  | 0, _ => none
-  | fuel + 1, e =>
-      let e := e.consumeMData
-      match e with
-      | .lit (.strVal s) => some s
-      | _ =>
-          let args := e.getAppArgs
-          if args.isEmpty then none
-          else
-            match decodeExprList? 4096 e with
-            | some elems => do
-                let bytes ← elems.mapM (decodeUInt8Expr? 64)
-                String.fromUTF8? (ByteArray.mk bytes.toArray)
-            | none => args.findSome? (decodeReducedStr? fuel)
-
-private def decodeReducedStrList? (e : Expr) : Option (List String) := do
-  let elems ← decodeExprList? 4096 e
-  elems.mapM (decodeReducedStr? 64)
-
 @[command_elab verifyThemeCmd] def elabVerifyThemeCmd : CommandElab := fun stx => do
   let thId : Ident := ⟨(stx.getArg 1)⟩
   let target : Term := ⟨(stx.getArg 3)⟩
@@ -1052,10 +908,8 @@ private def decodeReducedStrList? (e : Expr) : Option (List String) := do
     let missingStr ← liftTermElabM do
       try
         let expr ← elabTerm (← `(($thConst).missingTokens ($stylesTerm))) none
-        let red ← Meta.reduce expr (skipProofs := true) (skipTypes := true)
-        match decodeReducedStrList? red with
-        | some xs => return "[" ++ String.intercalate ", " (xs.map fun s => s!"\"{s}\"") ++ "]"
-        | none    => return (← Meta.ppExpr red).pretty
+        let xs : List String ← Lean.Meta.reduceEval expr
+        return "[" ++ String.intercalate ", " (xs.map fun s => s!"\"{s}\"") ++ "]"
       catch _ => return "(unknown)"
     let targetLabel := (target.raw.reprint.getD "target").trimmed
     throwErrorAt stx s!"theme `{thId.getId}` does not define all CSS tokens used by `{targetLabel}`.\n  Missing tokens: {missingStr}\nAdd them to `theme {thId.getId}:`."

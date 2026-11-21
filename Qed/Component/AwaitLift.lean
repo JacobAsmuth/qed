@@ -68,11 +68,11 @@ private def classifyCatchCase (validTags : Array String) (isOption : Bool) (cStx
       return ← checkTag pat tag none
   throwErrorAt pat "unsupported `catch` pattern; expected `.tag`, `.tag(msg)`, `.failed(err)`, `.none`, or `_`"
 
-private partial def stmtContainsAwait (st : Syntax) : Bool :=
-  let k := st.getKind
-  (k == ``qedStmtLet && (unwrapParens1 (st.getArg 4)).getKind == ``qedAwait) ||
-  (k == ``qedStmtAssign && (unwrapParens1 (st.getArg 2)).getKind == ``qedAwait) ||
-  st.getArgs.any stmtContainsAwait
+private def stmtContainsAwait (st : Syntax) : Bool :=
+  stxAny (fun s =>
+    let k := s.getKind
+    (k == ``qedStmtLet && (unwrapParens1 (s.getArg 4)).getKind == ``qedAwait) ||
+    (k == ``qedStmtAssign && (unwrapParens1 (s.getArg 2)).getKind == ``qedAwait)) st
 
 private def resolveRpcForAwait (ctx : RewriteCtx) (rpcId : Ident) (argCount : Nat) :
     CommandElabM (ServerInfo × ServerMethodInfo) := do
@@ -267,26 +267,60 @@ private def mkOutcomeTy (rpcId : Ident) (mInfo : ServerMethodInfo) (ensArgs : Ar
   if mInfo.hasEnsures then ensArgs.foldlM (init := (outId : Term)) fun acc a => `($acc $a)
   else pure (outId : Term)
 
+private structure PreparedAwait where
+  kIdx            : Nat
+  catchHasNone    : Bool
+  capturedOuter   : Array (Ident × Term)
+  capturedParams  : Array (Ident × Term)
+  callArgs        : Array Term
+  preLetStmts     : Array Syntax
+  ensArgs         : Array Term
+  rpcCallArgs     : Array Term
+  rpcArgNeedHoist : Array Bool
+  outTyTerm       : Term
+  xBinderTy?      : Option Term
+
+private def prepareAwaitCall (ctx : RewriteCtx) (st : Syntax) (rpcId : Ident)
+    (optTy? : Option Term) (rawArgs : Array Term) (mInfo : ServerMethodInfo)
+    (parsedCatch : Array (CatchPatKind × Array Syntax))
+    (outerParams : Array (Ident × Term)) (localNames : Array Name)
+    (captureStmts : Array Syntax) : CommandElabM PreparedAwait := do
+  let info := SourceInfo.fromRef st
+  checkExhaustiveCatch st rpcId mInfo parsedCatch
+  let catchHasNone := parsedCatch.any fun (pk, _) => pk matches .dotTag "none" _
+  let capturedOuter := outerParams.filter fun (pId, _) =>
+    let pn := pId.getId.eraseMacroScopes
+    captureStmts.any (mentionsIdent · pn) || rawArgs.any (mentionsIdent ·.raw pn)
+  let kIdx ← ctx.contCounter.get
+  ctx.contCounter.set (kIdx + 1)
+  let (capturedParams, callArgs, preLetStmts, ensArgs, rpcCallArgs, rpcArgNeedHoist) :=
+    hoistEnsuresArgs ctx info kIdx mInfo rawArgs localNames capturedOuter
+  let outTyTerm ← mkOutcomeTy rpcId mInfo ensArgs
+  let xBinderTy? ← match optTy? with
+    | some t => pure (some t)
+    | none   => inferAwaitBinderTy? mInfo catchHasNone
+  return { kIdx, catchHasNone, capturedOuter, capturedParams, callArgs, preLetStmts,
+           ensArgs, rpcCallArgs, rpcArgNeedHoist, outTyTerm, xBinderTy? }
+
 private def mkOkPatAndBody (st : Syntax) (kIdx : Nat) (xId : Ident) (optTy? : Option Term)
     (mInfo : ServerMethodInfo) (catchHasNone : Bool) (bodyIn : Array Syntax) :
     CommandElabM (Syntax × Array Syntax) := do
   let info := SourceInfo.fromRef st
-  let outcomePrefix := if mInfo.domainErrTags.isEmpty then `Qed.RpcSimpleOutcome else `Qed.RpcOutcome
-  let okCtorName := outcomePrefix ++ `ok
+  let okCtorName := (if mInfo.domainErrTags.isEmpty then `Qed.RpcSimpleOutcome else `Qed.RpcOutcome) ++ `ok
   let mut okBody := bodyIn
   if let some oTy := optTy? then
-    let typedExpr ← `(($xId:ident : $oTy))
-    okBody := #[mkLetRawSt info xId none (mkRawExpr typedExpr)] ++ okBody
-  if mInfo.isOption && !catchHasNone && mInfo.hasEnsures then
-    let optVar := mkIdentFrom xId (Name.mkSimple s!"_qedOpt_{kIdx}")
-    let mapped ← `(($optVar).map Qed.Ensured.val)
-    okBody := #[mkLetRawSt info xId none (mkRawExpr mapped)] ++ okBody
-    return (mkPatIdent info okCtorName #[mkPatIdent info optVar.getId], okBody)
-  let inner := if mInfo.hasEnsures then
-    mkPatIdent info `Qed.Ensured.mk #[mkPatIdent info xId.getId, mkPatIdent info `_qed_ens]
-  else mkPatIdent info xId.getId
-  let arg := if mInfo.isOption && catchHasNone then mkPatIdent info `some #[inner] else inner
-  return (mkPatIdent info okCtorName #[arg], okBody)
+    okBody := #[mkLetRawSt info xId none (mkRawExpr (← `(($xId:ident : $oTy))))] ++ okBody
+  match ensuredWrapKind mInfo catchHasNone with
+  | .optEnsured =>
+      let optVar := mkIdentFrom xId (Name.mkSimple s!"_qedOpt_{kIdx}")
+      okBody := #[mkLetRawSt info xId none (mkRawExpr (← `(($optVar).map Qed.Ensured.val)))] ++ okBody
+      return (mkPatIdent info okCtorName #[mkPatIdent info optVar.getId], okBody)
+  | wrap =>
+      let inner := if wrap == .ensured then
+        mkPatIdent info `Qed.Ensured.mk #[mkPatIdent info xId.getId, mkPatIdent info `_qed_ens]
+      else mkPatIdent info xId.getId
+      let arg := if mInfo.isOption && catchHasNone then mkPatIdent info `some #[inner] else inner
+      return (mkPatIdent info okCtorName #[arg], okBody)
 
 private def mkRpcPerformStmt (ctx : RewriteCtx) (st : Syntax) (rpcId : Ident)
     (srvInfo : ServerInfo) (mInfo : ServerMethodInfo) (contCtor : Name)
@@ -301,7 +335,7 @@ private def mkRpcPerformStmt (ctx : RewriteCtx) (st : Syntax) (rpcId : Ident)
 
 private abbrev LiftRecFn :=
   Array (Ident × Term) → Array (Ident × Term) → Array Name → Array Syntax →
-    CommandElabM (Array Syntax × ClassifyTree)
+    CommandElabM (Array Syntax × Option (Array Syntax))
 
 private def buildCatchArms (liftRec : LiftRecFn) (st : Syntax) (mInfo : ServerMethodInfo)
     (parsedCatch : Array (CatchPatKind × Array Syntax))
@@ -342,20 +376,18 @@ private def buildCatchArms (liftRec : LiftRecFn) (st : Syntax) (mInfo : ServerMe
   return (arms, wildArms, covFailed, covNone)
 
 private def registerAwaitContSite (ctx : RewriteCtx) (liftRec : LiftRecFn)
-    (st : Syntax) (kIdx : Nat) (xId : Ident) (optTy? : Option Term)
+    (st : Syntax) (prep : PreparedAwait) (xId : Ident) (optTy? : Option Term)
     (rpcId : Ident) (srvInfo : ServerInfo) (mInfo : ServerMethodInfo)
-    (catchHasNone : Bool) (parsedCatch : Array (CatchPatKind × Array Syntax))
+    (parsedCatch : Array (CatchPatKind × Array Syntax))
     (outerParams : Array (Ident × Term)) (localNames : Array Name)
-    (capturedParams : Array (Ident × Term)) (outTyTerm : Term)
-    (callArgs rpcCallArgs : Array Term)
-    (mkOkStmts : Array (Ident × Term) → CommandElabM (Array Syntax × ClassifyTree)) :
+    (mkOkStmts : Array (Ident × Term) → CommandElabM (Array Syntax × Option (Array Syntax))) :
     CommandElabM Syntax := do
   let info := SourceInfo.fromRef st
-  let contCtor := Name.mkSimple s!"_cont_{kIdx}"
-  let outVarId := mkIdentFrom st (Name.mkSimple s!"_qedOut_{kIdx}")
-  let contParams := capturedParams.push (outVarId, outTyTerm)
-  let (okStmts, restTree) ← mkOkStmts contParams
-  let (okPat, okBody) ← mkOkPatAndBody st kIdx xId optTy? mInfo catchHasNone okStmts
+  let contCtor := Name.mkSimple s!"_cont_{prep.kIdx}"
+  let outVarId := mkIdentFrom st (Name.mkSimple s!"_qedOut_{prep.kIdx}")
+  let contParams := prep.capturedParams.push (outVarId, prep.outTyTerm)
+  let (okStmts, restCls?) ← mkOkStmts contParams
+  let (okPat, okBody) ← mkOkPatAndBody st prep.kIdx xId optTy? mInfo prep.catchHasNone okStmts
   let (catchArms, wildArms, covFailed, covNone) ←
     buildCatchArms liftRec st mInfo parsedCatch outerParams localNames contParams
   let mut matchCases := #[mkCaseStx st okPat okBody] ++ catchArms ++ wildArms
@@ -365,13 +397,12 @@ private def registerAwaitContSite (ctx : RewriteCtx) (liftRec : LiftRecFn)
     key := s!"cont:{contCtor}", ctor := contCtor, params := contParams,
     stmts? := some #[mkMatchStx st outVarId matchCases]
   })
-  unless restTree.isNormal do
-    let scrutClassify := Syntax.node info ``qedIdent #[outVarId.raw]
+  if let some restCls := restCls? then
     ctx.specDispatches.modify (·.push {
       ctor := contCtor, params := contParams,
-      tree := .matchBr #[scrutClassify] #[(#[okPat], restTree), (#[mkPatWild info], .normal)]
+      stmts := #[mkMatchStx st outVarId #[mkCaseStx st okPat restCls, mkCaseStx st (mkPatWild info) #[mkPassSt info]]]
     })
-  mkRpcPerformStmt ctx st rpcId srvInfo mInfo contCtor callArgs rpcCallArgs
+  mkRpcPerformStmt ctx st rpcId srvInfo mInfo contCtor prep.callArgs prep.rpcCallArgs
 
 private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident × Term))
     (liftRec : LiftRecFn)
@@ -384,66 +415,50 @@ private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident �
     (catchCasesForCapture : Array Syntax)
     (outerParams : Array (Ident × Term)) (localNames : Array Name)
     (preStmts : Array Syntax) (unpredPreStmts : Array Syntax)
-    (rest : List Syntax) : CommandElabM (Array Syntax × ClassifyTree) := do
+    (rest : List Syntax) : CommandElabM (Array Syntax × Option (Array Syntax)) := do
   let info := SourceInfo.fromRef st
-  checkExhaustiveCatch st rpcId mInfo parsedCatch
   let restArr := rest.toArray
   checkPureSpecCont ctx restArr
   match predBody with
   | .block pStmts => checkPurePredictBlock pStmts
   | .expr _ => pure ()
-
-  let catchHasNone := parsedCatch.any fun (pk, _) => pk matches .dotTag "none" _
-  let rawValTy ← match optTy? with
-    | some t => pure t
-    | none =>
-        let some t ← inferAwaitBinderTy? mInfo catchHasNone
-          | throwErrorAt st s!"cannot infer response type for predicted `await {rpcId.getId}(...)`; add a type annotation `let {xId.getId} : Type = await ...`"
-        pure t
-  let innerEnsTy? : Option Term ←
-    if mInfo.hasEnsures && mInfo.isOption && !catchHasNone then inferAwaitBinderTy? mInfo true else pure none
-
   let onConfirmStmts := onConfirm?.map (·.2) |>.getD #[]
   let rollbackStmts := rollback?.map (·.2.2) |>.getD #[]
-  let capturedOuter := outerParams.filter fun (pId, _) =>
-    let pn := pId.getId.eraseMacroScopes
-    restArr.any (mentionsIdent · pn) || onConfirmStmts.any (mentionsIdent · pn) ||
-    rollbackStmts.any (mentionsIdent · pn) || catchCasesForCapture.any (mentionsIdent · pn) ||
-    rawArgs.any (mentionsIdent ·.raw pn)
-
-  let kIdx ← ctx.contCounter.get
-  ctx.contCounter.set (kIdx + 1)
-  let (capturedParams, callArgs, preLetStmts, ensArgs, rpcCallArgs, rpcArgNeedHoist) :=
-    hoistEnsuresArgs ctx info kIdx mInfo rawArgs localNames capturedOuter
-  let outTyTerm ← mkOutcomeTy rpcId mInfo ensArgs
-  let contPayloadTy : Term ← do
-    if mInfo.hasEnsures then
-      let some ensConst := mInfo.ensPredConst
-        | throwErrorAt st "internal: missing server `ensures` predicate in `predict`"
-      let ensApp ← ensArgs.foldlM (init := (mkIdent ensConst : Term)) fun acc a => `($acc $a)
-      if mInfo.isOption && !catchHasNone then
-        `(Option (Qed.Ensured $(innerEnsTy?.getD rawValTy) ($ensApp)))
-      else `(Qed.Ensured $rawValTy ($ensApp))
-    else pure rawValTy
+  let prep ← prepareAwaitCall ctx st rpcId optTy? rawArgs mInfo parsedCatch outerParams localNames
+    (restArr ++ onConfirmStmts ++ rollbackStmts ++ catchCasesForCapture)
+  let some rawValTy := prep.xBinderTy?
+    | throwErrorAt st s!"cannot infer response type for predicted `await {rpcId.getId}(...)`; add a type annotation `let {xId.getId} : Type = await ...`"
+  let wrapKind := ensuredWrapKind mInfo prep.catchHasNone
+  let innerEnsTy? : Option Term ←
+    if wrapKind == .optEnsured then inferAwaitBinderTy? mInfo true else pure none
+  let contPayloadTy : Term ← match wrapKind with
+    | .plain => pure rawValTy
+    | .ensured | .optEnsured =>
+        let some ensConst := mInfo.ensPredConst
+          | throwErrorAt st "internal: missing server `ensures` predicate in `predict`"
+        let ensApp ← prep.ensArgs.foldlM (init := (mkIdent ensConst : Term)) fun acc a => `($acc $a)
+        if wrapKind == .optEnsured then `(Option (Qed.Ensured $(innerEnsTy?.getD rawValTy) ($ensApp)))
+        else `(Qed.Ensured $rawValTy ($ensApp))
 
   let mkUnpackedBody (valVarId : Ident) (binder? : Option Ident) (bodyStmts : Array Syntax) :
       CommandElabM (Array Syntax) := do
     let mut stmtsOut := if bodyStmts.isEmpty then #[mkPassSt info] else bodyStmts
-    if mInfo.hasEnsures && mInfo.isOption && !catchHasNone then
-      if let some bId := binder? then
-        let mapped ← `(($valVarId).map Qed.Ensured.val)
-        stmtsOut := #[mkLetRawSt info bId none (mkRawExpr mapped)] ++ stmtsOut
-      return stmtsOut
-    else if mInfo.hasEnsures then
-      let bPat := match binder? with | some bId => mkPatIdent info bId.getId | none => mkPatWild info
-      let pat := mkPatIdent info `Qed.Ensured.mk #[bPat, mkPatIdent info `_qed_ens]
-      return #[mkMatchStx st valVarId #[mkCaseStx st pat stmtsOut]]
-    else
-      if let some bId := binder? then
-        if bId.getId.eraseMacroScopes != valVarId.getId.eraseMacroScopes then
-          stmtsOut := #[mkLetRawSt info bId none (Syntax.node info ``qedIdent #[valVarId.raw])] ++ stmtsOut
-      return stmtsOut
+    match wrapKind with
+    | .optEnsured =>
+        if let some bId := binder? then
+          stmtsOut := #[mkLetRawSt info bId none (mkRawExpr (← `(($valVarId).map Qed.Ensured.val)))] ++ stmtsOut
+        return stmtsOut
+    | .ensured =>
+        let bPat := match binder? with | some bId => mkPatIdent info bId.getId | none => mkPatWild info
+        let pat := mkPatIdent info `Qed.Ensured.mk #[bPat, mkPatIdent info `_qed_ens]
+        return #[mkMatchStx st valVarId #[mkCaseStx st pat stmtsOut]]
+    | .plain =>
+        if let some bId := binder? then
+          if bId.getId.eraseMacroScopes != valVarId.getId.eraseMacroScopes then
+            stmtsOut := #[mkLetRawSt info bId none (Syntax.node info ``qedIdent #[valVarId.raw])] ++ stmtsOut
+        return stmtsOut
 
+  let kIdx := prep.kIdx
   let preCtor? : Option Name ←
     if preStmts.any stmtHasStateMutation then
       let preCtor := Name.mkSimple s!"_specPre_{kIdx}"
@@ -458,7 +473,7 @@ private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident �
     contBodyStmts := #[mkLetRawSt info xId none (mkRawExpr (← `(($xId:ident : $oTy))))] ++ contBodyStmts
   ctx.sites.modify (·.push {
     key := s!"specCont:{specContCtor}", ctor := specContCtor,
-    params := capturedParams.push (specValId, contPayloadTy),
+    params := prep.capturedParams.push (specValId, contPayloadTy),
     stmts? := some (← mkUnpackedBody specValId (some xId) contBodyStmts)
   })
 
@@ -469,14 +484,14 @@ private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident �
       (bStmts : Array Syntax) : CommandElabM Name := do
     let ctor := Name.mkSimple s!"_{pfx}_{kIdx}"
     let valId := mkIdentFrom st (Name.mkSimple s!"_{valPfx}_{kIdx}")
-    let bParams := capturedParams.push (valId, contPayloadTy)
-    let (lifted, tree) ← liftRec bParams bOuter localNames bStmts
+    let bParams := prep.capturedParams.push (valId, contPayloadTy)
+    let (lifted, cls?) ← liftRec bParams bOuter localNames bStmts
     ctx.sites.modify (·.push {
       key := s!"{pfx}:{ctor}", ctor, params := bParams,
       stmts? := some (← mkUnpackedBody valId bId? lifted)
     })
-    unless tree.isNormal do
-      ctx.specDispatches.modify (·.push { ctor, params := bParams, tree })
+    if let some cls := cls? then
+      ctx.specDispatches.modify (·.push { ctor, params := bParams, stmts := cls })
     return ctor
 
   let confirmCtor? ← onConfirm?.mapM fun (_, ocStmts) =>
@@ -496,7 +511,7 @@ private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident �
     else
       let cCtor := Name.mkSimple s!"_specCatch_{kIdx}"
       let cOutId := mkIdentFrom st (Name.mkSimple s!"_specCatchOut_{kIdx}")
-      let cParams := capturedParams.push (cOutId, outTyTerm)
+      let cParams := prep.capturedParams.push (cOutId, prep.outTyTerm)
       let (cArms, cWilds, _, _) ← buildCatchArms liftRec st mInfo parsedCatch outerParams localNames cParams
       let allCatchCases := cArms ++ cWilds ++ (if cWilds.isEmpty then #[mkCaseStx st (mkPatWild info) #[mkPassSt info]] else #[])
       ctx.sites.modify (·.push {
@@ -510,38 +525,39 @@ private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident �
   let predParam := mkIdentFrom st (Name.mkSimple s!"_specPred_{kIdx}")
   let outParam := mkIdentFrom st (Name.mkSimple s!"_specOut_{kIdx}")
   let resParams : Array (Ident × Term) :=
-    #[(txIdParam, ← `(Nat))] ++ capturedParams ++ #[(predParam, rawValTy), (outParam, outTyTerm)]
+    #[(txIdParam, ← `(Nat))] ++ prep.capturedParams ++ #[(predParam, rawValTy), (outParam, prep.outTyTerm)]
   ctx.sites.modify (·.push { key := s!"specRes:{specResCtor}", ctor := specResCtor, params := resParams, stmts? := some #[mkPassSt info] })
   ctx.specResolves.modify (·.push {
-    resCtor := specResCtor, txIdParam, capturedParams, predParam, predTy := rawValTy,
-    outParam, outTy := outTyTerm, mInfo, catchHasNone,
+    resCtor := specResCtor, txIdParam, capturedParams := prep.capturedParams, predParam, predTy := rawValTy,
+    outParam, outTy := prep.outTyTerm, mInfo, catchHasNone := prep.catchHasNone,
     contCtor := specContCtor, confirmCtor?, rollbackCtor?, catchCtor?, callRef := st
   })
 
-  let fbPerfSt ← registerAwaitContSite ctx liftRec st kIdx xId optTy? rpcId srvInfo mInfo
-    catchHasNone parsedCatch outerParams localNames capturedParams outTyTerm callArgs rpcCallArgs
-    fun fbParams => do
-      let (ocFbLifted, _) ← if onConfirmStmts.isEmpty then pure (#[], .normal)
+  let fbPerfSt ← registerAwaitContSite ctx liftRec st prep xId optTy? rpcId srvInfo mInfo
+    parsedCatch outerParams localNames fun fbParams => do
+      let (ocFbLifted, _) ← if onConfirmStmts.isEmpty then pure (#[], none)
         else liftRec fbParams nextOuter localNames onConfirmStmts
-      return (restArr ++ ocFbLifted, .normal)
+      return (restArr ++ ocFbLifted, none)
   let dispNode : SpecDispatchNode := {
     ref := st, preCtor?, preArgs := actionParams.map (⟨·.1.raw⟩),
-    capturedArgs := capturedOuter.map (⟨·.1.raw⟩),
-    rpcArgExprs := rawArgs, rpcArgNeedHoist, srvInfo, mInfo, catchHasNone,
-    predValTy := rawValTy, innerEnsTy?, predBody,
+    capturedArgs := prep.capturedOuter.map (⟨·.1.raw⟩),
+    rpcArgExprs := rawArgs, rpcArgNeedHoist := prep.rpcArgNeedHoist, srvInfo, mInfo,
+    catchHasNone := prep.catchHasNone, predValTy := rawValTy, innerEnsTy?, predBody,
     contCtor := specContCtor, resCtor := specResCtor, kIdx
   }
-  return (unpredPreStmts ++ preLetStmts.push fbPerfSt, .dispatch dispNode)
+  let nodeIdx := (← ctx.specNodes.get).size
+  ctx.specNodes.modify (·.push dispNode)
+  return (unpredPreStmts ++ prep.preLetStmts.push fbPerfSt, some #[mkSpecDispatchMarker info nodeIdx])
 
 private partial def liftAwaitStmts (ctx : RewriteCtx)
     (actionParams : Array (Ident × Term))
     (outerParams : Array (Ident × Term))
     (localLetNames : Array Name) (stmts : Array Syntax)
-    (initPreStmts : Array Syntax := #[]) : CommandElabM (Array Syntax × ClassifyTree) := do
+    (initPreStmts : Array Syntax := #[]) : CommandElabM (Array Syntax × Option (Array Syntax)) := do
   let liftRec : LiftRecFn := fun ap op ln ss => liftAwaitStmts ctx ap op ln ss
   let rec go (outerParams : Array (Ident × Term)) (localNames : Array Name)
-      (preStmts : Array Syntax) : List Syntax → CommandElabM (Array Syntax × ClassifyTree)
-  | [] => return (#[], .normal)
+      (preStmts : Array Syntax) : List Syntax → CommandElabM (Array Syntax × Option (Array Syntax))
+  | [] => return (#[], none)
   | st :: rest => do
       let info := SourceInfo.fromRef st
       let k := st.getKind
@@ -581,8 +597,8 @@ private partial def liftAwaitStmts (ctx : RewriteCtx)
         let setterCtor ← registerSite ctx.sites #[(fname, none)] none
         let assignSt := mkResAssign (← `(Qed.Resource.loading))
         let perfSt ← mkRpcPerformStmt ctx st rpcId srvInfo mInfo setterCtor #[] rawArgs
-        let (tail, tailTree) ← go outerParams localNames (preStmts ++ #[assignSt, perfSt]) rest
-        return (#[assignSt, perfSt] ++ tail, tailTree)
+        let (tail, tailCls?) ← go outerParams localNames (preStmts ++ #[assignSt, perfSt]) rest
+        return (#[assignSt, perfSt] ++ tail, tailCls?)
 
       if k == ``qedStmtAssign && st.getNumArgs > 3 && (st.getArg 3).getNumArgs > 0 then
         throwErrorAt ((st.getArg 3).getArg 0) "`predict` can only be used on an `await` server RPC call"
@@ -606,102 +622,87 @@ private partial def liftAwaitStmts (ctx : RewriteCtx)
             clauses.onConfirm? clauses.rollback? parsedCatch catchCases
             outerParams localNames preStmts #[] rest
 
-        checkExhaustiveCatch st rpcId mInfo parsedCatch
         let restArr := rest.toArray
-        let capturedOuter := outerParams.filter fun (pId, _) =>
-          let pn := pId.getId.eraseMacroScopes
-          restArr.any (mentionsIdent · pn) || catchCases.any (mentionsIdent · pn) ||
-          rawArgs.any (mentionsIdent ·.raw pn)
-
-        let kIdx ← ctx.contCounter.get
-        ctx.contCounter.set (kIdx + 1)
-        let (capturedParams, callArgs, preLetStmts, ensArgs, rpcCallArgs, _) :=
-          hoistEnsuresArgs ctx info kIdx mInfo rawArgs localNames capturedOuter
-        let outTyTerm ← mkOutcomeTy rpcId mInfo ensArgs
-        let catchHasNone := parsedCatch.any fun (pk, _) => pk matches .dotTag "none" _
-        let xBinderTy? ← match optTy? with
-          | some t => pure (some t)
-          | none   => inferAwaitBinderTy? mInfo catchHasNone
+        let prep ← prepareAwaitCall ctx st rpcId optTy? rawArgs mInfo parsedCatch outerParams localNames
+          (restArr ++ catchCases)
         let xn := xId.getId.eraseMacroScopes
-        let nextOuter := match xBinderTy? with
+        let nextOuter := match prep.xBinderTy? with
           | some xTy => (outerParams.filter (·.1.getId.eraseMacroScopes != xn)).push (xId, xTy)
           | none     => outerParams.filter (·.1.getId.eraseMacroScopes != xn)
-        let nextLocals := if xBinderTy?.isSome then localNames else localNames.push xn
-        let perfSt ← registerAwaitContSite ctx liftRec st kIdx xId optTy? rpcId srvInfo mInfo
-          catchHasNone parsedCatch outerParams localNames capturedParams outTyTerm callArgs rpcCallArgs
-          fun contParams => liftAwaitStmts ctx contParams nextOuter nextLocals restArr
-        return (preLetStmts.push perfSt, .normal)
+        let nextLocals := if prep.xBinderTy?.isSome then localNames else localNames.push xn
+        let perfSt ← registerAwaitContSite ctx liftRec st prep xId optTy? rpcId srvInfo mInfo
+          parsedCatch outerParams localNames fun contParams =>
+            liftAwaitStmts ctx contParams nextOuter nextLocals restArr
+        return (prep.preLetStmts.push perfSt, none)
 
       if k == ``qedStmtLet then
         if (st.getArg 5).getNumArgs > 0 then
           throwErrorAt ((st.getArg 5).getArg 0) "`predict`, `on_confirm`, `rollback`, and `catch` can only be used on an `await` server RPC call"
-        let (outer', locals', tyOpt?) ←
+        let (outer', locals') ←
           if (st.getArg 1).isIdent then
             let lId : Ident := ⟨(st.getArg 1)⟩
             let ln := lId.getId.eraseMacroScopes
             if (st.getArg 2).getNumArgs == 2 then
               let tyT ← liftMacroM (return (← lowerQedType ((st.getArg 2).getArg 1) false).1)
-              pure (outerParams.filter (·.1.getId.eraseMacroScopes != ln) |>.push (lId, tyT), localNames, some tyT)
+              pure (outerParams.filter (·.1.getId.eraseMacroScopes != ln) |>.push (lId, tyT), localNames)
             else
-              pure (outerParams.filter (·.1.getId.eraseMacroScopes != ln), localNames.push ln, none)
-          else pure (outerParams, localNames, none)
-        let (tail, tailTree) ← go outer' locals' (preStmts.push st) rest
-        let tree := if tailTree.isNormal then .normal else .letBind (st.getArg 1) tyOpt? (st.getArg 4) tailTree
-        return (#[st] ++ tail, tree)
+              pure (outerParams.filter (·.1.getId.eraseMacroScopes != ln), localNames.push ln)
+          else pure (outerParams, localNames)
+        let (tail, tailCls?) ← go outer' locals' (preStmts.push st) rest
+        return (#[st] ++ tail, tailCls?.map (#[st] ++ ·))
 
       if k == ``qedStmtReturn then
-        return (#[st], .normal)
+        return (#[st], none)
 
       if (k == ``qedStmtIf || k == ``qedStmtIfLet || k == ``qedStmtMatch) &&
           (stmtContainsAwait st || (hasReturnStmt st && rest.any stmtContainsAwait)) then
         unless rest.isEmpty || hasReturnStmt st do
           throwErrorAt st "statements after an `if`/`match` containing `await` are not supported unless the branch `return`s; move trailing statements inside the branches"
         let tailIfReturn := if hasReturnStmt st then rest else []
-        let liftOptElse (eNode : Syntax) : CommandElabM (Syntax × ClassifyTree) := do
+        let setArg (n : Syntax) (i : Nat) (v : Syntax) : Syntax :=
+          Syntax.node n.getHeadInfo n.getKind (n.getArgs.set! i v)
+        let packOptElse : Option (Array Syntax) → Syntax
+          | some cs => Syntax.node info nullKind #[Syntax.atom info "else", Syntax.atom info ":", packSuite st cs]
+          | none    => Syntax.node info nullKind #[]
+        let liftOptElse (eNode : Syntax) : CommandElabM (Syntax × Option (Array Syntax)) := do
           if eNode.getNumArgs == 3 then
-            let (eLifted, eTree) ← go outerParams localNames preStmts ((suiteStmts (eNode.getArg 2)).toList ++ tailIfReturn)
-            pure (Syntax.node eNode.getHeadInfo eNode.getKind #[(eNode.getArg 0), (eNode.getArg 1), packSuite st eLifted], eTree)
+            let (eL, eC?) ← go outerParams localNames preStmts ((suiteStmts (eNode.getArg 2)).toList ++ tailIfReturn)
+            pure (setArg eNode 2 (packSuite st eL), eC?)
           else if !tailIfReturn.isEmpty then
-            let (eLifted, eTree) ← go outerParams localNames preStmts tailIfReturn
-            pure (Syntax.node info nullKind #[Syntax.atom info "else", Syntax.atom info ":", packSuite st eLifted], eTree)
-          else
-            pure (eNode, .normal)
+            let (eL, eC?) ← go outerParams localNames preStmts tailIfReturn
+            pure (packOptElse (some eL), eC?)
+          else pure (eNode, none)
         if k == ``qedStmtIf then
-          let (tLifted, tTree) ← go outerParams localNames preStmts ((suiteStmts (st.getArg 3)).toList ++ tailIfReturn)
-          let mut elifs' : Array Syntax := #[]
-          let mut elifTrees : Array (Syntax × ClassifyTree) := #[]
-          for el in (st.getArg 4).getArgs do
-            let (elLifted, elTree) ← go outerParams localNames preStmts ((suiteStmts (el.getArg 3)).toList ++ tailIfReturn)
-            elifs' := elifs'.push (Syntax.node el.getHeadInfo el.getKind #[(el.getArg 0), (el.getArg 1), (el.getArg 2), packSuite st elLifted])
-            elifTrees := elifTrees.push ((el.getArg 1), elTree)
-          let (eOpt, eTree) ← liftOptElse (st.getArg 5)
-          let combinedElse := elifTrees.foldr (init := eTree) fun (ec, et) acc =>
-            if et.isNormal && acc.isNormal then .normal else .ifBranch ec et acc
-          let tree := if tTree.isNormal && combinedElse.isNormal then .normal
-            else .ifBranch (st.getArg 1) tTree combinedElse
-          return (#[Syntax.node info k #[(st.getArg 0), (st.getArg 1), (st.getArg 2), packSuite st tLifted, Syntax.node info nullKind elifs', eOpt]], tree)
+          let (tL, tC?) ← go outerParams localNames preStmts ((suiteStmts (st.getArg 3)).toList ++ tailIfReturn)
+          let elRes ← (st.getArg 4).getArgs.mapM fun el => do
+            let (elL, elC?) ← go outerParams localNames preStmts ((suiteStmts (el.getArg 3)).toList ++ tailIfReturn)
+            pure (setArg el 3 (packSuite st elL), setArg el 3 (packSuite st (elC?.getD #[])), elC?.isSome)
+          let (eOpt, eC?) ← liftOptElse (st.getArg 5)
+          let mkIf (t : Array Syntax) (els : Array Syntax) (e : Syntax) :=
+            setArg (setArg (setArg st 3 (packSuite st t)) 4 (Syntax.node info nullKind els)) 5 e
+          let cls? := if tC?.isNone && !elRes.any (·.2.2) && eC?.isNone then none
+            else some #[mkIf (tC?.getD #[]) (elRes.map (·.2.1)) (packOptElse eC?)]
+          return (#[mkIf tL (elRes.map (·.1)) eOpt], cls?)
         else if k == ``qedStmtIfLet then
           let pIds := collectQedPatIds (st.getArg 2)
           let tLocals := localNames ++ pIds.filter fun n => !(outerParams.any (·.1.getId.eraseMacroScopes == n))
-          let (tLifted, tTree) ← go outerParams tLocals preStmts ((suiteStmts (st.getArg 6)).toList ++ tailIfReturn)
-          let (eOpt, eTree) ← liftOptElse (st.getArg 7)
-          let tree := if tTree.isNormal && eTree.isNormal then .normal else .ifLet (st.getArg 2) (st.getArg 4) tTree eTree
-          return (#[Syntax.node info k #[(st.getArg 0), (st.getArg 1), (st.getArg 2), (st.getArg 3), (st.getArg 4), (st.getArg 5), packSuite st tLifted, eOpt]], tree)
+          let (tL, tC?) ← go outerParams tLocals preStmts ((suiteStmts (st.getArg 6)).toList ++ tailIfReturn)
+          let (eOpt, eC?) ← liftOptElse (st.getArg 7)
+          let mkIfL (t : Array Syntax) (e : Syntax) := setArg (setArg st 6 (packSuite st t)) 7 e
+          let cls? := if tC?.isNone && eC?.isNone then none else some #[mkIfL (tC?.getD #[]) (packOptElse eC?)]
+          return (#[mkIfL tL eOpt], cls?)
         else
-          let mut cases' : Array Syntax := #[]
-          let mut caseTrees : Array (Array Syntax × ClassifyTree) := #[]
-          for c in (st.getArg 3).getArgs do
+          let cRes ← (st.getArg 3).getArgs.mapM fun c => do
             let pIds := (c.getArg 1).getSepArgs.flatMap collectQedPatIds
             let aLocals := localNames ++ pIds.filter fun n => !(outerParams.any (·.1.getId.eraseMacroScopes == n))
-            let (aLifted, aTree) ← go outerParams aLocals preStmts ((suiteStmts (c.getArg 3)).toList ++ tailIfReturn)
-            cases' := cases'.push (Syntax.node c.getHeadInfo c.getKind #[(c.getArg 0), (c.getArg 1), (c.getArg 2), packSuite st aLifted])
-            caseTrees := caseTrees.push ((c.getArg 1).getSepArgs, aTree)
-          let tree := if caseTrees.all (·.2.isNormal) then .normal else .matchBr (st.getArg 1).getSepArgs caseTrees
-          return (#[Syntax.node info k #[(st.getArg 0), (st.getArg 1), (st.getArg 2), Syntax.node (st.getArg 3).getHeadInfo (st.getArg 3).getKind cases']], tree)
+            let (aL, aC?) ← go outerParams aLocals preStmts ((suiteStmts (c.getArg 3)).toList ++ tailIfReturn)
+            pure (setArg c 3 (packSuite st aL), setArg c 3 (packSuite st (aC?.getD #[])), aC?.isSome)
+          let mkM (cs : Array Syntax) := setArg st 3 (Syntax.node (st.getArg 3).getHeadInfo (st.getArg 3).getKind cs)
+          let cls? := if !cRes.any (·.2.2) then none else some #[mkM (cRes.map (·.2.1))]
+          return (#[mkM (cRes.map (·.1))], cls?)
 
-      let (tail, tailTree) ← go outerParams localNames (preStmts.push st) rest
-      let tree := if tailTree.isNormal then .normal else .preAssign st tailTree
-      return (#[st] ++ tail, tree)
+      let (tail, tailCls?) ← go outerParams localNames (preStmts.push st) rest
+      return (#[st] ++ tail, tailCls?.map (#[st] ++ ·))
   go outerParams localLetNames initPreStmts stmts.toList
 
 private def registerActionOrPort (spec : ComponentSpec) (baseCtx : RewriteCtx)
@@ -713,9 +714,9 @@ private def registerActionOrPort (spec : ComponentSpec) (baseCtx : RewriteCtx)
   if spec.collections.any (·.1.getId == name) then
     throwErrorAt nameRef s!"{conflictLabel} name `{name}` conflicts with `collection {name}`"
   let stmtsRaw := suiteStmts (← rewriteIn baseCtx false bodyStx)
-  let (stmts, dispTree) ← liftAwaitStmts baseCtx params params #[] stmtsRaw
-  unless dispTree.isNormal do
-    baseCtx.specDispatches.modify (·.push { ctor := name, params, tree := dispTree })
+  let (stmts, dispCls?) ← liftAwaitStmts baseCtx params params #[] stmtsRaw
+  if let some dispStmts := dispCls? then
+    baseCtx.specDispatches.modify (·.push { ctor := name, params, stmts := dispStmts })
   let mut dummyAssigns : Array (Name × Option Term) := #[]
   if checkPlaceholders then
     for s in stmts do
@@ -727,7 +728,7 @@ private def registerActionOrPort (spec : ComponentSpec) (baseCtx : RewriteCtx)
     key := s!"{kindPrefix}:{name}", ctor := name, params, assigns := dummyAssigns, stmts? := some stmts })
 
 def collectSitesAndRewriteStateful (spec : ComponentSpec) :
-    CommandElabM (Array SetSite × Option RouteDecl × Array QueryDecl × Array Term × Term × Array HoistedSub × Array FieldDecl × Array ResetFormSub × Array (String × String) × Array SpecDispatchArm × Array SpecResolveSite) := do
+    CommandElabM (Array SetSite × Option RouteDecl × Array QueryDecl × Array Term × Term × Array HoistedSub × Array FieldDecl × Array ResetFormSub × Array (String × String) × Array SpecDispatchArm × Array SpecDispatchNode × Array SpecResolveSite) := do
   let baseCtx ← mkRewriteCtx spec false
   let sitesRef          := baseCtx.sites
   let hoistedRef        := baseCtx.hoisted
@@ -735,6 +736,7 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
   let resetFormsRef     := baseCtx.resetForms
   let usedRpcsRef       := baseCtx.usedRpcs
   let specDispatchesRef := baseCtx.specDispatches
+  let specNodesRef      := baseCtx.specNodes
   let specResolvesRef   := baseCtx.specResolves
   for a in spec.actions do
     let name := (a.getArg 1).getId
@@ -762,19 +764,20 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
       #[Syntax.node .none ``qedIdent #[rd.field.raw], Syntax.atom .none "=",
         Syntax.node .none ``qedIdent #[rParamId.raw], Syntax.node .none nullKind #[]]
     let mut alts' : Array Syntax := #[]
-    let mut altTrees : Array (Array Syntax × ClassifyTree) := #[]
+    let mut altCls : Array (Syntax × Option (Array Syntax)) := #[]
     for alt in rd.alts do
       let rwBody ← rewriteIn baseCtx false (alt.getArg 3)
       let patIds := (alt.getArg 1).getSepArgs.flatMap collectQedPatIds
-      let (lifted, altTree) ← liftAwaitStmts baseCtx rParams #[] patIds (suiteStmts rwBody) (initPreStmts := #[rFieldAssign])
+      let (lifted, altC?) ← liftAwaitStmts baseCtx rParams #[] patIds (suiteStmts rwBody) (initPreStmts := #[rFieldAssign])
       alts' := alts'.push (Syntax.node .none alt.getKind #[(alt.getArg 0), (alt.getArg 1), (alt.getArg 2), packSuite alt lifted])
-      altTrees := altTrees.push ((alt.getArg 1).getSepArgs, altTree)
-    if altTrees.any (!·.2.isNormal) then
-      let rScrut := Syntax.node .none ``qedIdent #[rParamId.raw]
+      altCls := altCls.push (alt, altC?)
+    if altCls.any (·.2.isSome) then
+      let clsCases := altCls.map fun (alt, ac?) =>
+        Syntax.node .none alt.getKind #[(alt.getArg 0), (alt.getArg 1), (alt.getArg 2), packSuite alt (ac?.getD #[])]
       specDispatchesRef.modify (·.push {
         ctor := `_onRoute
         params := rParams
-        tree := .preAssign rFieldAssign (.matchBr #[rScrut] altTrees)
+        stmts := #[rFieldAssign, mkMatchStx rd.field rParamId clsCases]
       })
     pure { rd with alts := alts' }
   let queries' ← spec.queries.mapM fun q => do
@@ -788,7 +791,7 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) :
     wrapMsg?   := if spec.hasSlotsOrKids then some (mkIdent `_wrap) else none }
   let bodyRw ← rewriteIn viewCtx false spec.body
   let body' ← lowerCompExpr .val bodyRw
-  return (← sitesRef.get, route'?, queries', starts', body', ← hoistedRef.get, ← formDraftsRef.get, ← resetFormsRef.get, ← usedRpcsRef.get, ← specDispatchesRef.get, ← specResolvesRef.get)
+  return (← sitesRef.get, route'?, queries', starts', body', ← hoistedRef.get, ← formDraftsRef.get, ← resetFormsRef.get, ← usedRpcsRef.get, ← specDispatchesRef.get, ← specNodesRef.get, ← specResolvesRef.get)
 
 end CompElab
 end Qed

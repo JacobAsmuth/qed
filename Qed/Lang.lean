@@ -1,5 +1,7 @@
 import Lean
 import Qed.Dict
+import Qed.Field
+import Qed.Diag
 
 namespace Qed.Lang
 
@@ -130,6 +132,9 @@ open Lean Parser
 /-- Non-reserved keyword parser so English keywords never pollute Lean's global token table. -/
 def kw (s : String) : Parser := nonReservedSymbol s (includeIdent := true)
 def qedBinder : Parser := ident <|> symbol "_"
+def qedEnvRef : Parser :=
+  node `Qed.Lang.envRef
+    ((identEq `secret <|> identEq `env) >> "(" >> strLit >> ")" >> optional (" ?? " >> strLit))
 
 -- Types (`qedType`)
 @[qedTypeMod_parser] def qedTypeModArr : Parser := leading_parser atomic ("[" >> "]")
@@ -304,6 +309,71 @@ end Parsers
 
 open Lean
 
+/-- Returns `true` if `p` holds on `stx` or any of its descendants. -/
+partial def stxAny (p : Syntax → Bool) (stx : Syntax) : Bool :=
+  p stx || stx.getArgs.any (stxAny p)
+
+/-- Pure splitter for raw `qedCallArg` syntax nodes into `(positional, named)` arrays. -/
+def splitCallArgsPure (callName : String) (rawArgs : Array Syntax)
+    (validKeys : Option (List String) := none) (allowWhere : Bool := false)
+    (errRef : Syntax := Syntax.missing) :
+    Except (Syntax × String) (Array Syntax × Array (String × Syntax)) := do
+  let mut posArgs : Array Syntax := #[]
+  let mut namedArgs : Array (String × Syntax) := #[]
+  for a in rawArgs do
+    let k := a.getKind
+    if k == ``qedCallArgPos then
+      posArgs := posArgs.push (a.getArg 0)
+    else if allowWhere && k == ``qedCallArgWhere then
+      namedArgs := namedArgs.push ("where", a.getArg 2)
+    else if k == ``qedCallArgNamed then
+      let key := (a.getArg 0).getId.eraseMacroScopes.toString
+      if let some allowed := validKeys then
+        unless allowed.contains key do
+          let hint := Qed.Diag.didYouMean key allowed
+          let ref := if errRef.isMissing then a else errRef
+          throw (ref, s!"unknown argument `{key}` in `{callName}(...)`{hint} (supported: {String.intercalate ", " allowed})")
+      namedArgs := namedArgs.push (key, a.getArg 2)
+    else
+      throw (a, s!"unexpected argument in `{callName}(...)`")
+  return (posArgs, namedArgs)
+
+/-- Splits raw `qedCallArg` syntax nodes into `(positional, named)` arrays in any `MonadError`. -/
+def splitCallArgs {m : Type → Type} [Monad m] [MonadError m]
+    (callName : String) (rawArgs : Array Syntax)
+    (validKeys : Option (List String) := none) (allowWhere : Bool := false)
+    (errRef : Syntax := Syntax.missing) :
+    m (Array Syntax × Array (String × Syntax)) :=
+  match splitCallArgsPure callName rawArgs validKeys allowWhere errRef with
+  | .ok res        => pure res
+  | .error (r, mg) => throwErrorAt r mg
+
+/-- Splits raw `qedCallArg` syntax nodes into `(positional, named)` arrays in `MacroM`. -/
+def splitCallArgsMacro (callName : String) (rawArgs : Array Syntax)
+    (validKeys : Option (List String) := none) (allowWhere : Bool := false)
+    (errRef : Syntax := Syntax.missing) :
+    MacroM (Array Syntax × Array (String × Syntax)) :=
+  match splitCallArgsPure callName rawArgs validKeys allowWhere errRef with
+  | .ok res        => pure res
+  | .error (r, mg) => Macro.throwErrorAt r mg
+
+structure ParsedEnvRef where
+  isSecret : Bool
+  envKey   : String
+  default? : Option String
+deriving Inhabited, Repr
+
+/-- Parses a `qedEnvRef` (`secret("KEY")` or `env("KEY") ?? "default"`) syntax node. -/
+def parseQedEnvRef {m : Type → Type} [Monad m] [MonadError m]
+    (ctxDesc : String) (stx : Syntax) : m ParsedEnvRef := do
+  let isSecret := (stx.getArg 0).getId.eraseMacroScopes == `secret
+  let envKey := (⟨stx.getArg 2⟩ : TSyntax `str).getString
+  let defOpt := stx.getArg 4
+  let default? := if defOpt.getNumArgs == 2 then some ((⟨defOpt.getArg 1⟩ : TSyntax `str).getString) else none
+  if envKey.isEmpty then
+    throwErrorAt stx s!"environment variable name in {ctxDesc} must not be empty"
+  return { isSecret, envKey, default? }
+
 /-- Extracts statements from a `qedSuite` (handles both `;`-separated single-line and multi-line indented suites). -/
 partial def suiteStmts (stx : Syntax) : Array Syntax :=
   if stx.getKind == `Qed.Lang.suite then
@@ -405,55 +475,123 @@ def resolveBaseTypeTerm (baseId : Ident) : Term :=
   else if baseId.getId == `WebhookUrl then mkIdentFrom baseId `Qed.Server.WebhookUrl
   else ⟨baseId.raw⟩
 
-def applyTypeMods (base : Term) (mods : Array TypeMod) (allowFallible : Bool) (ref : Syntax) :
-    MacroM (Term × Bool) := do
+/-- Builds a right-nested product type term (`Unit` if empty, `A` if 1, `A × B × ...`). -/
+def buildProdType (elems : Array Term) : MacroM Term := do
+  if elems.isEmpty then `(Unit)
+  else if elems.size == 1 then return elems[0]!
+  else elems.foldrM (init := elems.back!) (start := elems.size - 1) fun a acc => `($a × $acc)
+
+structure LoweredQedType where
+  term       : Term
+  isFallible : Bool := false
+  isProto    : Bool := false
+  isOption   : Bool := false
+  innerOpt?  : Option Term := none
+  baseName   : Name := .anonymous
+  mods       : Array TypeMod := #[]
+  isDict     : Bool := false
+deriving Inhabited
+
+private def applyTypeModsInfo (base : Term) (mods : Array TypeMod) (allowFallible : Bool)
+    (ref : Syntax) (ctxDesc? : Option String := none) (nestedErr? : Option String := none) :
+    MacroM (Term × Bool × Option Term) := do
   let mut acc := base
   let mut isFallible := false
+  let mut innerOpt? : Option Term := none
   for i in [0:mods.size] do
     match mods[i]! with
-    | .array    => acc ← `(Array $acc)
-    | .option   => acc ← `(Option $acc)
+    | .array =>
+        acc ← `(Array $acc)
+        innerOpt? := none
+    | .option =>
+        let prev := acc
+        acc ← `(Option $acc)
+        innerOpt? := some prev
     | .fallible =>
-        if !allowFallible then Macro.throwErrorAt ref "fallible `!` modifier is only allowed on server `def` return types"
-        if i + 1 < mods.size then Macro.throwErrorAt ref "place `!` last on fallible return types (for example `Book[]!` instead of `Book![]`)"
+        if !allowFallible then
+          if let some msg := nestedErr? then
+            Macro.throwErrorAt ref msg
+          else if let some desc := ctxDesc? then
+            Macro.throwErrorAt ref s!"fallible `!` modifier is not allowed on {desc}; only server `def` return types may use `T!`"
+          else
+            Macro.throwErrorAt ref "fallible `!` modifier is only allowed on server `def` return types"
+        if i + 1 < mods.size then
+          Macro.throwErrorAt ref "place `!` last on fallible return types (for example `Book[]!` instead of `Book![]`)"
         isFallible := true
+  return (acc, isFallible, innerOpt?)
+
+def applyTypeMods (base : Term) (mods : Array TypeMod) (allowFallible : Bool) (ref : Syntax) :
+    MacroM (Term × Bool) := do
+  let (acc, isFallible, _) ← applyTypeModsInfo base mods allowFallible ref
   return (acc, isFallible)
 
+/-- Lowers a unified `qedType` syntax node with full metadata (`isFallible`, `isProto`, `isOption`,
+    `innerOpt?`, `baseName`, `mods`, `isDict`). Set `allowHigherOrder := false` for server/DB/external
+    payload types that forbid type application (`Resource T`) and arrows (`A -> B`). -/
+partial def lowerQedTypeInfo (stx : Syntax) (allowFallible := false)
+    (allowHigherOrder := true) (ctxDesc? : Option String := none) : MacroM LoweredQedType := do
+  let rec go (s : Syntax) (allowFall : Bool) (nestedErr? : Option String) : MacroM LoweredQedType := do
+    let mkInvalidErr (node : Syntax) : MacroM LoweredQedType := do
+      let sn := stxSnippet node
+      let what := if sn.isEmpty then "" else s!" `{sn}`"
+      if allowHigherOrder then
+        Macro.throwErrorAt node s!"invalid Qed type{what}; expected a type such as `T`, `T[]`, `T?`, `T!`, `Resource T`, or `A -> B`"
+      else
+        Macro.throwErrorAt node s!"invalid server type{what}; expected `T`, `T[]`, `T?`, `T!`, `(T, U)`, or `Proto(T)`"
+    let k := s.getKind
+    if k == ``qedTypeProto then
+      let (baseId, initMods) ← splitIdentMods ⟨(s.getArg 2)⟩
+      let mods := initMods ++ (← (s.getArg 4).getArgs.mapM parseTypeModNode)
+      let (term, isFallible, innerOpt?) ← applyTypeModsInfo ⟨baseId.raw⟩ mods allowFall s ctxDesc? nestedErr?
+      return { term, isFallible, isProto := true, isOption := innerOpt?.isSome, innerOpt?,
+               baseName := baseId.getId.eraseMacroScopes, mods }
+    else if k == ``qedTypeDict then
+      let kInfo ← go (s.getArg 1) false (some "fallible `!` modifier cannot appear inside a dictionary key type")
+      let vInfo ← go (s.getArg 3) false (some "fallible `!` modifier cannot appear inside a dictionary value type")
+      let dictId := mkIdentFrom s `Qed.Dict
+      let baseT ← `($dictId $(kInfo.term) $(vInfo.term))
+      let mods ← (s.getArg 5).getArgs.mapM parseTypeModNode
+      let (term, isFallible, innerOpt?) ← applyTypeModsInfo baseT mods allowFall s ctxDesc? nestedErr?
+      return { term, isFallible, isOption := innerOpt?.isSome, innerOpt?,
+               baseName := `Qed.Dict, mods, isDict := true }
+    else if k == ``qedTypeParen then
+      let elems := (s.getArg 1).getSepArgs
+      let lowered ← elems.mapM fun p => return (← go p false (some "fallible `!` modifier cannot appear inside a tuple type")).term
+      let baseT ← buildProdType lowered
+      let mods ← (s.getArg 3).getArgs.mapM parseTypeModNode
+      let (term, isFallible, innerOpt?) ← applyTypeModsInfo baseT mods allowFall s ctxDesc? nestedErr?
+      return { term, isFallible, isOption := innerOpt?.isSome, innerOpt?, baseName := `Prod, mods }
+    else if k == ``qedTypeAtom then
+      let (baseId, initMods) ← splitIdentMods ⟨(s.getArg 0)⟩
+      let mods := initMods ++ (← (s.getArg 1).getArgs.mapM parseTypeModNode)
+      let (term, isFallible, innerOpt?) ← applyTypeModsInfo (resolveBaseTypeTerm baseId) mods allowFall s ctxDesc? nestedErr?
+      return { term, isFallible, isOption := innerOpt?.isSome, innerOpt?,
+               baseName := baseId.getId.eraseMacroScopes, mods }
+    else if k == ``qedTypeApp then
+      if (s.getArg 0).getKind == ``qedTypeAtom && ((s.getArg 0).getArg 1).getArgs.isEmpty then
+        let fnName := ((s.getArg 0).getArg 0).getId.eraseMacroScopes
+        let argStr := let sn := stxSnippet (s.getArg 1); if sn.isEmpty then "T" else sn
+        if fnName == `Array || fnName == `Option then
+          Macro.throwErrorAt s s!"use `{argStr}{if fnName == `Array then "[]" else "?"}` instead of `{fnName} {argStr}`"
+        if allowHigherOrder && fnName == `jsonOnly then
+          Macro.throwErrorAt s s!"use `jsonOnly({argStr})` with parentheses instead of `jsonOnly {argStr}`"
+      if !allowHigherOrder then return ← mkInvalidErr s
+      let fInfo ← go (s.getArg 0) false none
+      let aInfo ← go (s.getArg 1) false none
+      return { term := ← `($(fInfo.term) $(aInfo.term)) }
+    else if k == ``qedTypeArrow then
+      if !allowHigherOrder then return ← mkInvalidErr s
+      let aInfo ← go (s.getArg 0) false none
+      let bInfo ← go (s.getArg 2) false none
+      return { term := ← `($(aInfo.term) → $(bInfo.term)) }
+    else
+      mkInvalidErr s
+  go stx allowFallible none
+
 /-- Lowers a unified `qedType` syntax node to a Lean type `Term`, rejecting `Array T` / `Option T`. -/
-partial def lowerQedType (stx : Syntax) (allowFallible := false) : MacroM (Term × Bool) := do
-  let k := stx.getKind
-  if k == ``qedTypeProto then
-    let (baseId, initMods) ← splitIdentMods ⟨(stx.getArg 2)⟩
-    applyTypeMods ⟨baseId.raw⟩ (initMods ++ (← (stx.getArg 4).getArgs.mapM parseTypeModNode)) allowFallible stx
-  else if k == ``qedTypeDict then
-    let (kTy, _) ← lowerQedType (stx.getArg 1) false
-    let (vTy, _) ← lowerQedType (stx.getArg 3) false
-    let dictId := mkIdentFrom stx `Qed.Dict
-    let baseT ← `($dictId $kTy $vTy)
-    applyTypeMods baseT (← (stx.getArg 5).getArgs.mapM parseTypeModNode) allowFallible stx
-  else if k == ``qedTypeParen then
-    let lowered ← (stx.getArg 1).getSepArgs.mapM fun p => return (← lowerQedType p false).1
-    let baseT ← if lowered.size == 1 then pure lowered[0]!
-      else lowered.foldrM (init := lowered.back!) (start := lowered.size - 1) fun a acc => `($a × $acc)
-    applyTypeMods baseT (← (stx.getArg 3).getArgs.mapM parseTypeModNode) allowFallible stx
-  else if k == ``qedTypeAtom then
-    let (baseId, initMods) ← splitIdentMods ⟨(stx.getArg 0)⟩
-    applyTypeMods (resolveBaseTypeTerm baseId) (initMods ++ (← (stx.getArg 1).getArgs.mapM parseTypeModNode)) allowFallible stx
-  else if k == ``qedTypeApp then
-    if (stx.getArg 0).getKind == ``qedTypeAtom && ((stx.getArg 0).getArg 1).getArgs.isEmpty then
-      let fnName := ((stx.getArg 0).getArg 0).getId.eraseMacroScopes
-      let argStr := let s := stxSnippet (stx.getArg 1); if s.isEmpty then "T" else s
-      if fnName == `Array || fnName == `Option then
-        Macro.throwErrorAt stx s!"use `{argStr}{if fnName == `Array then "[]" else "?"}` instead of `{fnName} {argStr}`"
-      if fnName == `jsonOnly then
-        Macro.throwErrorAt stx s!"use `jsonOnly({argStr})` with parentheses instead of `jsonOnly {argStr}`"
-    return (← `($((← lowerQedType (stx.getArg 0) false).1) $((← lowerQedType (stx.getArg 1) false).1)), false)
-  else if k == ``qedTypeArrow then
-    return (← `($((← lowerQedType (stx.getArg 0) false).1) → $((← lowerQedType (stx.getArg 2) false).1)), false)
-  else
-    let sn := stxSnippet stx
-    let what := if sn.isEmpty then "" else s!" `{sn}`"
-    Macro.throwErrorAt stx s!"invalid Qed type{what}; expected a type such as `T`, `T[]`, `T?`, `T!`, `Resource T`, or `A -> B`"
+def lowerQedType (stx : Syntax) (allowFallible := false) : MacroM (Term × Bool) := do
+  let info ← lowerQedTypeInfo stx allowFallible
+  return (info.term, info.isFallible)
 
 /-- Infers automatic defaults for `qedType` state fields (`T[]` → `#[]`, `T?` → `none`, `Resource T` → `.idle`, `Cached T` → `{}`). -/
 partial def inferQedTypeDefault? (stx : Syntax) : MacroM (Option Term) := do
@@ -517,8 +655,8 @@ partial def collectQedPatIds (stx : Syntax) : Array Name :=
 
 inductive ExprMode where | val | boolCond | propGuard | propInv deriving BEq, DecidableEq
 
-partial def exprHasIndex (stx : Syntax) : Bool :=
-  stx.getKind == ``qedIndex || stx.getArgs.any exprHasIndex
+def exprHasIndex (stx : Syntax) : Bool :=
+  stxAny (·.getKind == ``qedIndex) stx
 
 /-- Checks whether a `qedExpr` AST is already a plain value (never `Qed.Field` or `Qed.Ensured`). -/
 def isPlainLiteralOrCtor (stx : Syntax) : Bool :=
@@ -846,6 +984,11 @@ def lowerSimpleQedExpr (mode : ExprMode) (stx : Syntax)
 end Qed.Lang
 
 namespace Qed
+
+@[reducible, inline] instance {α : Type} {p : α → Prop} : Qed.Lang.QedVal (Field p) α := ⟨Field.val⟩
+@[simp] theorem QedVal.val_field {α : Type} {p : α → Prop} (f : Field p) :
+    Qed.Lang.QedVal.val f = f.val := rfl
+
 open Lean Meta Elab Tactic Command Term PrettyPrinter
 
 def qedLooksGenerated (n : Name) : Bool :=

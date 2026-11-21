@@ -30,25 +30,15 @@ private def elabSchemaFormTag (stx : Syntax) (expectedType? : Option Expr)
   if hasKids then
     throwErrorAt stx s!"<{tag}> takes no children; write it self-closing (<{tag} …/>)"
   checkParentNesting stx pPath tag "div"
-  let mut key?    : Option Term := none
-  let mut bind?   : Option Term := none
-  let mut submit? : Option Term := none
-  let mut ctxProps : Array (Syntax × String × Term) := #[]
-  for p in propNodes do
-    let nm := (⟨(p.getArg 0)⟩ : TSyntax `str).getString
-    let v : Term := ⟨(p.getArg 2)⟩
-    if nm == "key" then key? := some v
-    else if nm == "bind" then bind? := some v
-    else if nm == "onSubmit" then submit? := some v
-    else if nm == "reset" then
-      throwErrorAt (p.getArg 0) s!"<{tag}>: `reset` is only supported inside a `component` view"
-    else
-      ctxProps := ctxProps.push ((p.getArg 0), nm, v)
-  let some b := bind?
+  let (ctxProps, specials) := splitCompProps propNodes ["key", "bind", "onSubmit", "reset"]
+  if let some (resetRef, _) := specials["reset"]? then
+    throwErrorAt resetRef s!"<{tag}>: `reset` is only supported inside a `component` view"
+  let key? := specials["key"]?.map (·.2)
+  let some (_, b) := specials["bind"]?
     | throwErrorAt stx s!"<{tag}> requires `bind=\{draft}` when used outside a `component` view"
   let dVal ← `(($b).1)
   let onEditVal ← `(($b).2)
-  let some submitVal := submit?
+  let some (_, submitVal) := specials["onSubmit"]?
     | throwErrorAt stx s!"<{tag}> requires `onSubmit=\{...}`"
   let ctxArgs ← liftMacroM <| resolveSchemaCtxArgs stx tag sInfo.ctxBinders ctxProps
   let mut callT : Term := ⟨mkIdentFrom stx sInfo.formViewName⟩
@@ -61,21 +51,19 @@ private def elabPureCompTag (stx : Syntax) (expectedType? : Option Expr) (info :
     (cId : Name → Term) (pPath tag : String) (propNodes : Array Syntax) (kidsT : Term) (hasKids : Bool) :
     TermElabM Expr := do
   checkInlineComp stx pPath tag hasKids info
-  let mut key? : Option Term := none
+  let (otherProps, specials) := splitCompProps propNodes ["key"]
+  let key? := specials["key"]?.map (·.2)
   let mut fids : Array Ident := #[]
   let mut vals : Array Term  := #[]
-  for p in propNodes do
-    let nm := (⟨(p.getArg 0)⟩ : TSyntax `str).getString
-    let v : Term := ⟨(p.getArg 2)⟩
-    if nm == "key" then key? := some v
-    else if nm.startsWith "bind:" then
+  for (ref, nm, v) in otherProps do
+    if nm.startsWith "bind:" then
       let bStr := (nm.drop 5).toString
-      fids := fids.push (mkIdentFrom (p.getArg 0) (Name.mkSimple bStr))
+      fids := fids.push (mkIdentFrom ref (Name.mkSimple bStr))
       vals := vals.push (← `(($v).1))
-      fids := fids.push (mkIdentFrom (p.getArg 0) (Name.mkSimple s!"set_{bStr}"))
+      fids := fids.push (mkIdentFrom ref (Name.mkSimple s!"set_{bStr}"))
       vals := vals.push (← `(($v).2))
     else
-      fids := fids.push (mkIdentFrom (p.getArg 0) (Name.mkSimple nm))
+      fids := fids.push (mkIdentFrom ref (Name.mkSimple nm))
       vals := vals.push v
   if hasKids then fids := fids.push (mkIdentFrom stx `children); vals := vals.push kidsT
   let callT ← if info.hasProps then
@@ -192,22 +180,12 @@ private def elabStatefulCompTag (stx : Syntax) (expectedType? : Option Expr) (in
     if info.kind == .pureView then
       return ← elabPureCompTag stx expectedType? info cId pPath tag propNodes kidsT hasKids
 
-  let mut props    : Array (Syntax × String × Term) := #[]
-  let mut key?     : Option Term := none
-  let mut state?   : Option Term := none
-  let mut initial? : Option Term := none
-  let mut onMsg?   : Option Term := none
-  let mut hoist?   : Option Term := none
-  for p in propNodes do
-    let nm := (⟨(p.getArg 0)⟩ : TSyntax `str).getString
-    let v : Term := ⟨(p.getArg 2)⟩
-    match nm with
-    | "key"     => key?     := some v
-    | "state"   => state?   := some v
-    | "initial" => initial? := some v
-    | "onMsg"   => onMsg?   := some v
-    | "_hoist"  => hoist?   := some v
-    | _         => props    := props.push ((p.getArg 0), nm, v)
+  let (props, specials) := splitCompProps propNodes ["key", "state", "initial", "onMsg", "_hoist"]
+  let key?     := specials["key"]?.map (·.2)
+  let state?   := specials["state"]?.map (·.2)
+  let initial? := specials["initial"]?.map (·.2)
+  let onMsg?   := specials["onMsg"]?.map (·.2)
+  let hoist?   := specials["_hoist"]?.map (·.2)
 
   if let some hPair := hoist? then
     return ← elabHoistedCompTag stx expectedType? info? tag pPath hasKids cId props kidsT hPair key?

@@ -40,14 +40,7 @@ initialize componentRegistry :
 
 open Lean in
 def lookupComponent? (cName : Name) : CoreM (Option ComponentInfo) := do
-  let env ← getEnv
-  let reg := componentRegistry.getState env
-  let ns ← getCurrNamespace
-  if let some info := reg.find? (ns ++ cName) then return some info
-  if let some info := reg.find? cName then return some info
-  for (fullView, _) in ResolveName.resolveGlobalName env {} ns (← getOpenDecls) (cName ++ `view) do
-    if let some info := reg.find? fullView.getPrefix then return some info
-  return none
+  return Qed.Diag.lookupNameMapExt? componentRegistry (← getEnv) (← getCurrNamespace) (← getOpenDecls) cName (some `view)
 
 /-! ## Component Surface Syntax (Sharing `Qed.Lang` Expressions, Statements & Types) -/
 
@@ -230,11 +223,8 @@ def isPlaceholder (stx : Syntax) : Bool :=
 
 def atomStr : Syntax → String := Qed.Jsx.tokenVal
 
-partial def mentionsIdent (stx : Syntax) (n : Name) : Bool :=
-  match stx with
-  | .ident _ _ v _ => n.isPrefixOf v.eraseMacroScopes
-  | .node _ _ args => args.any (mentionsIdent · n)
-  | _ => false
+def mentionsIdent (stx : Syntax) (n : Name) : Bool :=
+  stxAny (fun | .ident _ _ v _ => n.isPrefixOf v.eraseMacroScopes | _ => false) stx
 
 /-- True when `target` appears as a free identifier (or root of `target.field`) in `stx`,
     ignoring field projections (`x.target`), named-arg/record keys, JSX attribute names, and local binders. -/
@@ -269,16 +259,38 @@ def isEventEmitExpr (eventNames : Array Name) (exprStx : Syntax) : Bool :=
   | some (id, "emit", _) => eventNames.contains id.getId.eraseMacroScopes
   | _ => false
 
-partial def hasEffectStmt (eventNames : Array Name) (stx : Syntax) : Bool :=
-  let k := stx.getKind
-  (k == ``qedStmtExpr && (matchPushCall? (stx.getArg 0)).isNone && (matchRemoveCall? (stx.getArg 0)).isNone && !isEventEmitExpr eventNames (stx.getArg 0)) ||
-  (k == ``qedStmtLet && (unwrapParens1 (stx.getArg 4)).getKind == ``qedAwait) ||
-  (k == ``qedStmtAssign && (unwrapParens1 (stx.getArg 2)).getKind == ``qedAwait) ||
-  stx.getArgs.any (hasEffectStmt eventNames)
+def hasEffectStmt (eventNames : Array Name) (stx : Syntax) : Bool :=
+  stxAny (fun s =>
+    let k := s.getKind
+    (k == ``qedStmtExpr && (matchPushCall? (s.getArg 0)).isNone && (matchRemoveCall? (s.getArg 0)).isNone && !isEventEmitExpr eventNames (s.getArg 0)) ||
+    (k == ``qedStmtLet && (unwrapParens1 (s.getArg 4)).getKind == ``qedAwait) ||
+    (k == ``qedStmtAssign && (unwrapParens1 (s.getArg 2)).getKind == ``qedAwait)) stx
 
-partial def hasReturnStmt (stx : Syntax) : Bool :=
-  let k := stx.getKind
-  k == ``qedStmtReturn || stx.getArgs.any hasReturnStmt
+def hasReturnStmt (stx : Syntax) : Bool :=
+  stxAny (·.getKind == ``qedStmtReturn) stx
+
+def matchNamedAttr? (a : Syntax) : Option (Syntax × String × Syntax) :=
+  if a.getKind == ``Qed.Jsx.attrNamed then some (a.getArg 0, atomStr (a.getArg 0), a.getArg 1) else none
+
+def splitCompProps (propNodes : Array Syntax) (specials : List String) :
+    Array (Syntax × String × Term) × Std.HashMap String (Syntax × Term) := Id.run do
+  let mut rest : Array (Syntax × String × Term) := #[]
+  let mut spec : Std.HashMap String (Syntax × Term) := {}
+  for p in propNodes do
+    let ref := p.getArg 0
+    let nm := (⟨ref⟩ : TSyntax `str).getString
+    let v : Term := ⟨p.getArg 2⟩
+    if specials.contains nm then spec := spec.insert nm (ref, v)
+    else rest := rest.push (ref, nm, v)
+  return (rest, spec)
+
+def qedSpecDispatchKind : Name := `Qed.specDispatchMarker
+
+def mkSpecDispatchMarker (info : SourceInfo) (idx : Nat) : Syntax :=
+  Syntax.node info qedSpecDispatchKind #[Syntax.mkNumLit (toString idx)]
+
+def matchSpecDispatchMarker? (st : Syntax) : Option Nat :=
+  if st.getKind == qedSpecDispatchKind then some (⟨st.getArg 0⟩ : TSyntax `num).getNat else none
 
 def staticRootTag? (body : Syntax) : Option String :=
   if body.getKind == ``Qed.Jsx.qedExprJsx || body.getKind == ``Qed.Jsx.jsxTerm then

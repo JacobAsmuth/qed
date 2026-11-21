@@ -6,6 +6,7 @@ import Qed.Server.Http
 import Qed.Server.Prim
 import Qed.Server.Db.HttpSql
 import Qed.Server.Db.PgWire
+import Qed.Auth.Oidc
 
 namespace Qed.Server.Native
 
@@ -1054,19 +1055,46 @@ private def extractQuery (target : String) : String :=
       else String.Pos.Raw.extract target ⟨q + 1⟩ ⟨target.utf8ByteSize⟩
   | none => ""
 
+private def resolveAuthPrincipal (cfg : ServerConfig) (oidcRt? : Option Qed.Auth.Oidc.OidcRuntime)
+    (bearer? : Option String) (cookies : List (String × String)) :
+    IO (Option String × List (String × String)) := do
+  let nowSec := ((← Prim.nowMs).toNat) / 1000
+  -- 1. If an OIDC runtime is configured and a 3-segment Bearer JWT is supplied, verify via JWKS.
+  if let (some rt, some tok) := (oidcRt?, bearer?) then
+    if (tok.splitOn ".").length == 3 then
+      match ← Qed.Auth.Oidc.verifyOidcJwt execHttpCall rt tok with
+      | .ok jc   => return (some jc.sub, jc.flatClaims)
+      | .error _ => return (none, [])
+  -- 2. Check `qed_session` cookie for v2 OIDC-signed claim cookies (using OIDC or server secrets).
+  let sessionSecrets := match oidcRt? with
+    | some rt => if !rt.cfg.sessionSecrets.isEmpty then rt.cfg.sessionSecrets else cfg.authSecrets
+    | none    => cfg.authSecrets
+  let sessionCookie? := if cookies.isEmpty then none else (cookies.find? fun (k, _) => k == "qed_session").map Prod.snd
+  if let some tok := bearer?.orElse (fun _ => sessionCookie?) then
+    if tok.startsWith "v2." then
+      if let some p ← Qed.Auth.Oidc.verifySessionCookieV2 sessionSecrets tok nowSec then
+        return (some p.userId, p.claims)
+      else
+        return (none, [])
+    if !sessionSecrets.isEmpty then
+      let uid? ← verifyUserTokenWithNow sessionSecrets tok nowSec cfg.requireExpiring
+      return (uid?, [])
+  return (none, [])
+
 private def buildRequestCtxReq (cfg : ServerConfig) (req : ParsedReqHead) (clientIp : String)
-    (body : ByteArray := ByteArray.empty) : IO RequestCtx := do
+    (body : ByteArray := ByteArray.empty)
+    (oidcRt? : Option Qed.Auth.Oidc.OidcRuntime := none) : IO RequestCtx := do
   let hdrList := req.headers.toList
   let cookies :=
     if !req.hasCookie then []
     else hdrList.foldl (fun acc (k, v) =>
       if eqCI k "cookie" then acc ++ parseCookiePairs v else acc) []
   let bearer? := req.auth?.bind extractBearer
-  let userId? ← resolveUserId cfg bearer? cookies
+  let (userId?, claims) ← resolveAuthPrincipal cfg oidcRt? bearer? cookies
   let queryStr := extractQuery req.target
   let bodyStr := if body.isEmpty then "" else (String.fromUTF8? body).getD ""
   return {
-    headers := hdrList, cookies, bearerToken := bearer?, userId := userId?,
+    headers := hdrList, cookies, bearerToken := bearer?, userId := userId?, claims,
     clientIp, query := queryStr, body := bodyStr
   }
 
@@ -1194,10 +1222,14 @@ private def runFullstackCore {Model Msg : Type}
     (wsDispatchFn? : Option (RequestCtx → UInt8 → String → ByteArray → ByteArray → IO (Except ApiError ByteArray)) := none)
     (blockingMethods? : Option (Array String) := none)
     (httpDispatchFn? : Option (RequestCtx → String → String → IO (Except ApiError (Option HttpResponse) × Array SetCookie)) := none)
-    (jobs : Array IoJob := #[]) : IO UInt32 := do
+    (jobs : Array IoJob := #[])
+    (authSpec? : Option Qed.Auth.OidcAuthSpec := none) : IO UInt32 := do
   if !(← verifyRequiredSecrets requiredSecrets) then
     return 1
   let cfg ← loadServerConfig devMode
+  let oidcRt? ← match authSpec? with
+    | some spec => Qed.Auth.Oidc.initOidcRuntime spec cfg.authSecrets devMode
+    | none      => pure none
   let staticDirFd ← Prim.openStaticDir staticDir
   let hostScript ← loadHostScript staticDirFd devMode
   let rpcPrefix := "/_qed/rpc/" ++ serverShortName ++ "/"
@@ -1220,7 +1252,18 @@ private def runFullstackCore {Model Msg : Type}
     if let some st := staticTarget? then
       if isContentHashedAsset st.relPath then
         return ← serveStaticAsset staticDirFd (some assetCache) req st devMode
-    let ctx ← buildRequestCtxReq cfg req clientIp body
+    let ctx ← buildRequestCtxReq cfg req clientIp body oidcRt?
+    if pathOnly.startsWith "/_qed/auth/" then
+      if let some rt := oidcRt? then
+        if req.method == "POST" && pathOnly == rt.cfg.logoutPath then
+          match checkOriginAndFetchSiteParsed req.origin? req.host? req.secFetchSite?
+              (req.dupOrigin || req.dupSfs) cfg.rpcAllowedOrigins? false "auth logout" with
+          | .error (code, msg) =>
+              return formatHttpResponse code "text/plain; charset=utf-8" msg.toUTF8 isHead req.keepAlive false
+          | .ok () => pure ()
+        if let some authResp ← Qed.Auth.Oidc.handleAuthRoute execHttpCall rt req
+            pathOnly ctx.query ctx.cookies ctx.userId ctx.claims isHead then
+          return authResp
     if req.method == "POST" && pathOnly.startsWith rpcPrefix then
       match checkRpcCsrfReq req cfg.rpcAllowedOrigins? with
       | .error (code, msg) =>
@@ -1313,7 +1356,7 @@ private def runFullstackCore {Model Msg : Type}
               (req.dupOrigin || req.dupSfs) cfg.wsAllowedOrigins? true "WebSocket upgrade" with
           | .error (code, msg) => return .doneClose (formatErrorResponse code msg)
           | .ok () =>
-              let baseCtx ← buildRequestCtxReq cfg req clientIp
+              let baseCtx ← buildRequestCtxReq cfg req clientIp ByteArray.empty oidcRt?
               let cid ← Prim.randomHex 12
               return .wsUpgrade (formatWsUpgradeResponse acceptB64) { baseCtx with connId := "ws-" ++ cid }
         let isGetOrHead := req.method == "GET" || req.method == "HEAD"
@@ -1325,6 +1368,8 @@ private def runFullstackCore {Model Msg : Type}
               if let some hit ← Prim.atomicRead assetCache (fun m => m[st.relPath]?) then
                 let wire := hit.serve req st.isHead req.keepAlive
                 return if req.keepAlive then .doneKeepAlive wire else .doneClose wire
+            return .deferHead
+          if oidcRt?.isSome && (pathOnly.startsWith "/_qed/auth/" || req.auth?.isSome) then
             return .deferHead
           if httpDispatchFn?.isSome && !pathOnly.startsWith "/_qed/" then
             return .deferHead
@@ -1366,12 +1411,13 @@ def runFullstackWithDispatch {Model Msg : Type}
     (wsDispatchFn? : Option (RequestCtx → UInt8 → String → ByteArray → ByteArray → IO (Except ApiError ByteArray)) := none)
     (blockingMethods? : Option (Array String) := none)
     (httpDispatchFn? : Option (RequestCtx → String → String → IO (Except ApiError (Option HttpResponse))) := none)
-    (jobs : Array IoJob := #[]) : IO UInt32 :=
+    (jobs : Array IoJob := #[])
+    (authSpec? : Option Qed.Auth.OidcAuthSpec := none) : IO UInt32 :=
   runFullstackCore app title serverShortName requiredSecrets
     (fun ctx mName reqBytes => do return (← dispatchFn ctx mName reqBytes, #[]))
     port staticDir devMode numWorkers wsDispatchFn? blockingMethods?
     (httpDispatchFn?.map fun f ctx m p => do return (← f ctx m p, #[]))
-    jobs
+    jobs authSpec?
 
 def runStatefulFullstack {σ Model Msg : Type}
     (app : Qed.App Model Msg) (title serverShortName : String)
@@ -1384,7 +1430,8 @@ def runStatefulFullstack {σ Model Msg : Type}
     (blockingMethods? : Option (Array String) := none)
     (httpDispatchM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
         RequestCtx → String → String → m (Except ApiError (Option HttpResponse))) := none)
-    (jobs : Array (ServerJob σ) := #[]) : IO UInt32 := do
+    (jobs : Array (ServerJob σ) := #[])
+    (authSpec? : Option Qed.Auth.OidcAuthSpec := none) : IO UInt32 := do
   let box ← Prim.mkStateBox initState
   let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
   let wsSrvInst : MonadServer IO := mkNativeServerInst (some gcpCache) none
@@ -1404,6 +1451,7 @@ def runStatefulFullstack {σ Model Msg : Type}
       let res ← @httpM IO _ reqSrvInst atomicInst ctx method path
       return (res, ← cookieRef.get))
     (jobs.map (·.toIoJob wsSrvInst atomicInst))
+    authSpec?
 
 def runStatelessFullstack {Model Msg : Type}
     (app : Qed.App Model Msg) (title serverShortName : String)
@@ -1416,7 +1464,8 @@ def runStatelessFullstack {Model Msg : Type}
     (blockingMethods? : Option (Array String) := none)
     (httpDispatchM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] →
         RequestCtx → String → String → m (Except ApiError (Option HttpResponse))) := none)
-    (jobs : Array StatelessJob := #[]) : IO UInt32 := do
+    (jobs : Array StatelessJob := #[])
+    (authSpec? : Option Qed.Auth.OidcAuthSpec := none) : IO UInt32 := do
   let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
   let wsSrvInst : MonadServer IO := mkNativeServerInst (some gcpCache) none
   runFullstackCore app title serverShortName requiredSecrets
@@ -1434,6 +1483,7 @@ def runStatelessFullstack {Model Msg : Type}
       let res ← @httpM IO _ reqSrvInst ctx method path
       return (res, ← cookieRef.get))
     (jobs.map (·.toIoJob wsSrvInst))
+    authSpec?
 
 /-- Serves a standalone `Qed.App` (`component` or `Qed.run`) with native in-memory SSR and static asset serving. -/
 def runStandaloneApp {Model Msg : Type} (app : Qed.App Model Msg) (title : String)

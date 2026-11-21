@@ -216,6 +216,11 @@ def elabQedServerMain : CommandElab := fun stx => do
   let getEnvId := mkIdent `Qed.Server.Prim.getEnv
   let jobsArg : Term ← if srvInfo.jobs.isEmpty then `(#[]) else
     pure (mkIdentFrom fsIdent (srvInfo.serverName ++ `jobs))
+  let authArg : Term ← match srvInfo.authConfig? with
+    | some authCfgConst =>
+        let id := mkIdentFrom fsIdent authCfgConst
+        `(Option.some $id)
+    | none => `(Option.none)
   let runnerCall ← if srvInfo.hasState then
     let runFnId := mkIdent `Qed.Server.Native.runStatefulFullstack
     let initStateId := mkIdentFrom fsIdent (srvInfo.serverName ++ `initState)
@@ -228,7 +233,7 @@ def elabQedServerMain : CommandElab := fun stx => do
     `($runFnId
         $cliAppId $titleLit $shortLit $initStateId $secretsId
         (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $dispatchId)
-        port staticDir devMode numWorkers $wsArg $blockingArg $httpArg $jobsArg)
+        port staticDir devMode numWorkers $wsArg $blockingArg $httpArg $jobsArg $authArg)
   else
     let runFnId := mkIdent `Qed.Server.Native.runStatelessFullstack
     let wsArg ← if hasWs then
@@ -240,7 +245,7 @@ def elabQedServerMain : CommandElab := fun stx => do
     `($runFnId
         $cliAppId $titleLit $shortLit $secretsId
         (fun {m} [Monad m] [Qed.Server.MonadServer m] => $dispatchId)
-        port staticDir devMode numWorkers $wsArg $blockingArg $httpArg $jobsArg)
+        port staticDir devMode numWorkers $wsArg $blockingArg $httpArg $jobsArg $authArg)
   if dbCfgIds.isEmpty then
     elabCommand (← `(command|
       def $mainId:ident (args : List String) : IO UInt32 := do

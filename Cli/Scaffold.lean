@@ -50,6 +50,8 @@ def usage : IO UInt32 := do
   IO.println "  build          production build → dist/ (JS client + native server, verified)"
   IO.println "  start|preview  serve the build"
   IO.println "  serve <dir>    serve a static directory natively"
+  IO.println "  manifest       emit & validate qed_deploy.json infrastructure manifest"
+  IO.println "  dev-auth [p]   run local ES256 OIDC dev identity provider"
   IO.println "  test           run the native test suite (if present)"
   IO.println "  check          verify proofs + no-sorry + axioms"
   IO.println "  clean          remove build outputs"

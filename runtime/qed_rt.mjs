@@ -46,6 +46,7 @@ export const Nat_lor  = (a, b) => a | b;
 
 const M64 = (1n << 64n) - 1n, u64 = (x) => BigInt(x) & M64;
 export const UInt8_ofNat = (n) => Number(n & 0xFFn);
+export const UInt8_ofNatLT = (n) => Number(n & 0xFFn);
 export const UInt8_toNat = (a) => BigInt(a);
 export const UInt8_toUInt16 = (a) => a & 0xFF;
 export const UInt8_toUInt32 = (a) => a >>> 0;

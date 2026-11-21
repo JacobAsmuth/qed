@@ -1,4 +1,5 @@
 import Qed
+import Qed.Deploy
 import Qed.Server.Native
 import Qed.Proofs.DomArena
 import Qed.Proofs.ViewPatch
@@ -7,6 +8,7 @@ import Qed.Proofs.Hydration
 import Js.Proofs
 import Tests.AxiomFixtures
 import Tests.DbChecks
+import Tests.AuthChecks
 import Examples.Counter
 import Examples.Todo
 import Examples.Signup
@@ -413,3 +415,18 @@ import Examples.LiveRoom
 #print axioms Qed.safeCanonicalHref_no_markup_or_quote
 #print axioms Qed.escapeHeadMetaValue_no_markup_or_quote
 #print axioms Qed.renderHeadMeta_empty
+
+-- Verified OIDC/JWKS Auth & Deployment Manifest (`Qed.Auth.*`, `Qed.Deploy.*`)
+#print axioms Qed.Auth.parseJwtAlg_rejects_none
+#print axioms Qed.Auth.parseJwtAlg_rejects_hs256
+#print axioms Qed.Auth.validateJwtClaims_rejects_expired
+#print axioms Qed.Auth.validateJwtClaims_rejects_wrong_issuer
+#print axioms Qed.Auth.validateJwtClaims_rejects_wrong_audience
+#print axioms Qed.Auth.validateJwtClaims_rejects_empty_sub
+#print axioms Qed.Auth.isSafeReturnTo_rejects_protocol_relative
+#print axioms Qed.Auth.isSafeReturnTo_rejects_javascript
+#print axioms Qed.Auth.sanitizeReturnTo_safe
+#print axioms Qed.Deploy.validate_rejects_bad_version
+#print axioms Qed.Deploy.validate_rejects_unsafe_auth_callback
+#print axioms Qed.Deploy.validate_default_ok
+#print axioms AuthChecks.AuthApi.adminAction_mutInv0

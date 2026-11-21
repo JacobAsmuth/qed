@@ -143,8 +143,15 @@ structure ParsedDbDecl where
   dbRefIdent : Lean.Ident
   info       : DatabaseInfo
 
+structure ParsedAuthDecl where
+  ref          : Lean.Syntax
+  aliasIdent   : Lean.Ident
+  authRefIdent : Lean.Ident
+  info         : AuthInfo
+
 structure ParsedServerBlock where
   dbDecls     : Array ParsedDbDecl
+  authDecl?   : Option ParsedAuthDecl := none
   envDecls    : Array ParsedEnvDecl
   stateDecls  : Array ParsedStateDecl
   mutInvs     : Array ParsedMutInv
@@ -158,6 +165,7 @@ open Lean Elab Command in
 def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean.Syntax) :
     CommandElabM ParsedServerBlock := do
   let mut dbDecls     : Array ParsedDbDecl := #[]
+  let mut authDecl?   : Option ParsedAuthDecl := none
   let mut envDecls    : Array ParsedEnvDecl := #[]
   let mut stateDecls  : Array ParsedStateDecl := #[]
   let mut mutInvs     : Array ParsedMutInv := #[]
@@ -170,16 +178,25 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
   for c in clauses do
     let k := c.getKind
     if k == ``srvDbClause then
-      let aliasId : Ident := ⟨(c.getArg 1)⟩
-      let dbRefId : Ident := ⟨(c.getArg 3)⟩
+      let aliasRaw := c.getArg 1
+      let aliasId : Ident := if aliasRaw.isIdent then ⟨aliasRaw⟩ else mkIdentFrom aliasRaw `auth
+      let refId : Ident := ⟨(c.getArg 3)⟩
       if dbDecls.any (·.aliasIdent.getId == aliasId.getId) ||
+         authDecl?.any (·.aliasIdent.getId == aliasId.getId) ||
          envDecls.any (·.ident.getId == aliasId.getId) ||
          stateDecls.any (·.ident.getId == aliasId.getId) then
         throwErrorAt aliasId s!"duplicate declaration `{aliasId.getId}` in `server {srvName}`"
       let env ← getEnv
-      let some dbInfo := Qed.Server.lookupDatabase? env (← getCurrNamespace) (← getOpenDecls) dbRefId.getId
-        | throwErrorAt dbRefId s!"unknown `database` `{dbRefId.getId}` in `use {aliasId.getId} : {dbRefId.getId}`"
-      dbDecls := dbDecls.push { ref := c, aliasIdent := aliasId, dbRefIdent := dbRefId, info := dbInfo }
+      let currNs ← getCurrNamespace
+      let openDecls ← getOpenDecls
+      if let some dbInfo := Qed.Server.lookupDatabase? env currNs openDecls refId.getId then
+        dbDecls := dbDecls.push { ref := c, aliasIdent := aliasId, dbRefIdent := refId, info := dbInfo }
+      else if let some authInfo := Qed.Server.lookupAuth? env currNs openDecls refId.getId then
+        if authDecl?.isSome then
+          throwErrorAt refId s!"`server {srvName}` can declare at most one `use ... : <auth>` provider"
+        authDecl? := some { ref := c, aliasIdent := aliasId, authRefIdent := refId, info := authInfo }
+      else
+        throwErrorAt refId s!"unknown `database` or `auth` `{refId.getId}` in `use {aliasId.getId} : {refId.getId}`"
     else if k == ``srvEnvClause then
       let id : Ident := ⟨(c.getArg 1)⟩
       let osKey := (⟨(c.getArg 3)⟩ : TSyntax `str).getString
@@ -239,7 +256,7 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
     unless stateDecls.any (·.ident.getId == mi.fieldId.getId) do
       let avail := String.intercalate ", " (stateDecls.toList.map fun s => s!"`{s.ident.getId}`")
       throwErrorAt mi.fieldId s!"`invariant mutating {mi.fieldId.getId}` does not match any `state` field of `{srvName}` (`state` fields: {avail})"
-  return { dbDecls, envDecls, stateDecls, mutInvs, invs, fnClauses, chanClauses, httpClauses, jobClauses }
+  return { dbDecls, authDecl?, envDecls, stateDecls, mutInvs, invs, fnClauses, chanClauses, httpClauses, jobClauses }
 
 section
 open Lean Elab Command
@@ -298,6 +315,8 @@ def wrapReqs (reqProps : Array Term) (reqHIds : Array Ident) (reqLbls : Array St
     let errCtor : Term ←
       if isAuthReqLabel rLbl then
         `(Qed.Server.ApiError.unauthorized $rMsg)
+      else if rLbl.contains "ctx.hasClaim" || rLbl.contains "ctx.claim" then
+        `(Qed.Server.ApiError.forbidden $rMsg)
       else
         `(Qed.Server.ApiError.badRequest $rMsg)
     g ← `(if $rHyp:ident : $rCond then $g else Pure.pure (Except.error $errCtor))
@@ -574,7 +593,8 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
     (chanNames : Array String) (wsDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
     (ctxId reqBytesId : Ident)
     (httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[])
-    (jobNames : Array String := #[]) : CommandElabM Unit := do
+    (jobNames : Array String := #[])
+    (authDecl? : Option ParsedAuthDecl := none) : CommandElabM Unit := do
   if hasState then
     let linThmId := mkIdentFrom srvIdent (srvName ++ `concurrent_linearizable)
     elabCommand (← `(command|
@@ -584,7 +604,10 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
           $stateInvId st.shared :=
         Qed.Server.concurrent_schedule_preserves_inv $stateInvId $initStateId st $invInitId hsched))
 
-  let (reqSecrets, usedExts) ← collectServerSecretsAndExts dbDecls envDecls allExtRoots
+  let (baseSecrets, usedExts) ← collectServerSecretsAndExts dbDecls envDecls allExtRoots
+  let reqSecrets := match authDecl? with
+    | some ad => ad.info.secrets.foldl (init := baseSecrets) fun acc s => if acc.contains s then acc else acc.push s
+    | none    => baseSecrets
 
   let secretsId := mkIdentFrom srvIdent (srvName ++ `secrets)
   let secLits : Array Term := reqSecrets.map (Syntax.mkStrLit ·)
@@ -641,6 +664,8 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
     channels := chanNames
     jobs := jobNames
     databases := dbDecls.map (·.info.configConst)
+    authName? := authDecl?.map (·.info.authName)
+    authConfig? := authDecl?.map (·.info.configConst)
     hasHttpRoutes := !httpDispatchArms.isEmpty
   }
 

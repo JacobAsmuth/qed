@@ -431,7 +431,7 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
 
   elabServerDispatchCmds srvIdent stateId initStateId stateInvId invInitId
     srvName fullSrvName srvShort hasState parsed.dbDecls parsed.envDecls allExtRoots methodInfos dispatchArms
-    chanNames wsDispatchArms ctxId reqBytesId httpDispatchArms jobNames
+    chanNames wsDispatchArms ctxId reqBytesId httpDispatchArms jobNames parsed.authDecl?
 
   -- Launch all method & channel proof theorems together in one parallel wave after all inductives/defs.
   for runProof in (← deferredProofs.get) do

@@ -1,6 +1,8 @@
 import Cli.Verify
 import Cli.Watch
+import Cli.DevAuth
 import Qed.Server.Native
+import Qed.Deploy
 
 open System (FilePath)
 
@@ -470,6 +472,45 @@ private def clientBundlePaths (outDir : FilePath) : IO (List FilePath) := do
         found := entry.path :: found
   return found
 
+private def emitDeployManifest (outDir : FilePath) (mod : String) : IO Bool := do
+  let some q ← resolveQedjsEnv (needBuild := false) | return false
+  let outFile := outDir / "qed_deploy.json"
+  let mods ← serverImportModules mod
+  let args := #["--emit-deploy-manifest", outFile.toString, mod, "--assets-dir", outDir.toString] ++ mods
+  let (ok, _) ← q.runOut args (quiet := true)
+  return ok
+
+private def deployManifestHasAuth (outDir : FilePath) : IO Bool := do
+  let p := outDir / "qed_deploy.json"
+  if !(← p.pathExists) then return false
+  let raw ← IO.FS.readFile p
+  match Qed.Json.parse raw with
+  | .ok j =>
+      match j.get? "auth" with
+      | some (.obj _) => return true
+      | _             => return false
+  | .error _ => return false
+
+def cmdManifest (args : List String) : IO UInt32 := do
+  let mod ← jsRoot
+  let outPath := FilePath.mk (args.getD 0 (distDir / "qed_deploy.json").toString)
+  let mods ← serverImportModules mod
+  if (← sh "lake" (#["build"] ++ mods)) != 0 then
+    IO.eprintln (red "✗ build failed"); return 1
+  let some q ← resolveQedjsEnv (needBuild := true) | do
+    IO.eprintln (red "✗ could not locate qedjs"); return 1
+  let assetsArgs := if (← distDir.pathExists) then #["--assets-dir", distDir.toString] else #[]
+  let (ok, out) ← q.runOut (#["--emit-deploy-manifest", outPath.toString, mod] ++ assetsArgs ++ mods) (quiet := true)
+  if !ok then
+    IO.eprintln (red out.cliTrim); return 1
+  IO.println (green s!"✓ {out.cliTrim}")
+  return 0
+
+def cmdDevAuth (args : List String) : IO UInt32 := do
+  let port : UInt16 := ((args.getD 0 "8001").toNat?.getD 8001).toUInt16
+  IO.println (green s!"qed dev-auth → http://127.0.0.1:{port}   (local ES256 OIDC IdP)")
+  DevAuth.runDevAuthServer port
+
 def cmdBuild (prod : Bool) (skipVerify : Bool := false) (sourceMap : Bool := false) : IO UInt32 := do
   let skip := !prod && (skipVerify || (← env "QED_SKIP_VERIFY") == some "1")
   let wantMap := !prod || sourceMap || (← env "QED_SOURCEMAP") == some "1"
@@ -488,6 +529,8 @@ def cmdBuild (prod : Bool) (skipVerify : Bool := false) (sourceMap : Bool := fal
   if outOverride.isNone then step s!"compiling Lean → {outDir}/"
   if !(← buildJs outDir prod (alreadyBuilt := !skip) (cObjsBuilt := !skip && !extraLakeTargets.isEmpty) (sourceMap := wantMap)) then
     IO.eprintln (red "✗ build failed"); return 1
+  if !(← emitDeployManifest outDir mod) then
+    IO.eprintln (red "✗ deploy manifest validation failed"); return 1
   if outOverride.isNone then
     let bundlePaths ← clientBundlePaths outDir
     let filesArg := String.intercalate " " (bundlePaths.map (fun p => s!"'{p}'"))
@@ -522,11 +565,21 @@ def cmdClean : IO UInt32 := do
   IO.println (green "✓ cleaned")
   return 0
 
-private def spawnDevChild (port : String) :
+private def spawnDevChild (port : String) (extraEnv : Array (String × Option String) := #[]) :
     IO (IO.Process.Child ⟨.null, .null, .inherit⟩ × Bool) := do
   let (cmd, args, isNative) ← resolveServeCmd devDir port true
-  let c ← IO.Process.spawn { cmd, args, stdin := .null, stdout := .null, stderr := .inherit }
+  let c ← IO.Process.spawn { cmd, args, env := extraEnv, stdin := .null, stdout := .null, stderr := .inherit }
   return (c, isNative)
+
+private def spawnDevAuthChild : IO (IO.Process.Child ⟨.null, .null, .inherit⟩ × UInt16) := do
+  let p ← Qed.Server.Prim.freePort
+  let selfBin ← IO.appPath
+  let c ← IO.Process.spawn {
+    cmd := selfBin.toString
+    args := #["dev-auth", toString p.toNat]
+    stdin := .null, stdout := .null, stderr := .inherit
+  }
+  return (c, p)
 
 /-- Waits up to `timeoutMs` for the local dev server at `127.0.0.1:<port>` to answer `/_qed/health`
     so the browser never sees `ECONNREFUSED` during a server restart. -/
@@ -597,7 +650,8 @@ private def publishDevStatus (outDir : FilePath) (sse? : Option Watch.DevSseServ
 
 partial def watchLoop (watcher? : Option Watch.FileWatcher) (sse? : Option Watch.DevSseServer)
     (lastLeanMt lastCssMt lastRtMt : Int) (port : String)
-    (curServer : IO.Process.Child ⟨.null, .null, .inherit⟩) (isNative : Bool) : IO Unit := do
+    (curServer : IO.Process.Child ⟨.null, .null, .inherit⟩) (isNative : Bool)
+    (devEnv : Array (String × Option String) := #[]) : IO Unit := do
   let qh ← frameworkHome
   let sseUrl := match sse? with | some s => s.url | none => ""
   let mut nextWatcher? := watcher?
@@ -651,7 +705,7 @@ partial def watchLoop (watcher? : Option Watch.FileWatcher) (sse? : Option Watch
       if serverChanged then
         curServer.kill
         discard <| curServer.wait
-        let (restarted, nat) ← spawnDevChild port
+        let (restarted, nat) ← spawnDevChild port devEnv
         nextSrv := restarted
         nextNative := nat
         waitDevServerHealthy portNum
@@ -684,11 +738,12 @@ partial def watchLoop (watcher? : Option Watch.FileWatcher) (sse? : Option Watch
     publishDevStatus devDir sse? "ok" "full" "" elapsed true
     IO.println (green s!"✓ reloaded runtime ({elapsed}ms)")
 
-  watchLoop nextWatcher? sse? nextLeanMt nextCssMt nextRtMt port nextSrv nextNative
+  watchLoop nextWatcher? sse? nextLeanMt nextCssMt nextRtMt port nextSrv nextNative devEnv
 
 def cmdDev : IO UInt32 := do
   IO.FS.createDirAll devDir
   let qh ← frameworkHome
+  let mod ← jsRoot
   let ssePort : UInt16 := match ← env "QED_DEV_SSE_PORT" with
     | some s => (s.toNat?.getD 0).toUInt16
     | none   => 0
@@ -707,7 +762,16 @@ def cmdDev : IO UInt32 := do
   clearLastBuildError
   let initOk ← buildJs devDir (prod := false) (fastClientDev := true) (sourceMap := true) (sseUrl := sseUrl)
   let elapsed := (← IO.monoMsNow) - t0
+  let mut devEnv : Array (String × Option String) := #[]
+  let mut devAuthNote := ""
   if initOk then
+    discard <| emitDeployManifest devDir mod
+    if (← deployManifestHasAuth devDir) && (← env "QED_AUTH_ISSUER").isNone then
+      let (_authChild, authPort) ← spawnDevAuthChild
+      waitDevServerHealthy authPort
+      let issUrl := s!"http://127.0.0.1:{authPort.toNat}"
+      devEnv := devEnv.push ("QED_AUTH_ISSUER", some issUrl)
+      devAuthNote := s!" + dev-auth ({issUrl})"
     publishDevStatus devDir sse? "ok" "hmr" "" elapsed true
   else
     let errText ← getLastBuildError
@@ -715,7 +779,7 @@ def cmdDev : IO UInt32 := do
     IO.eprintln (red "initial build failed, fix the error and save; dev will rebuild")
   let port := (← env "PORT").getD devPort
   let portNum : UInt16 := (port.toNat?.getD 8000).toUInt16
-  let (serverChild, isNative) ← spawnDevChild port
+  let (serverChild, isNative) ← spawnDevChild port devEnv
   waitDevServerHealthy portNum
   let modeTag := if isNative then "   (Native + SSR + HMR)" else "   (HMR)"
   let watchTag := match watcher?, sse? with
@@ -723,8 +787,8 @@ def cmdDev : IO UInt32 := do
     | some _, none   => "OS watch"
     | none, some _   => "SSE push"
     | none, none     => "watching"
-  IO.println (green s!"\nqed dev → http://localhost:{port}{modeTag}   ({watchTag}; Ctrl-C to stop)\n")
-  watchLoop watcher? sse? initLeanMt initCssMt initRtMt port serverChild isNative
+  IO.println (green s!"\nqed dev → http://localhost:{port}{modeTag}{devAuthNote}   ({watchTag}; Ctrl-C to stop)\n")
+  watchLoop watcher? sse? initLeanMt initCssMt initRtMt port serverChild isNative devEnv
   return 0
 
 end Qed.Cli

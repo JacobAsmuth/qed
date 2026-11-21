@@ -16,6 +16,8 @@ def main (args : List String) : IO UInt32 := do
   | ["build", "--dev", "--no-verify", "--sourcemap"] => cmdBuild (prod := false) (skipVerify := true) (sourceMap := true)
   | ["start"] | ["preview"]             => cmdStart
   | "serve" :: rest                     => cmdServe rest
+  | "manifest" :: rest                  => cmdManifest rest
+  | "dev-auth" :: rest                  => cmdDevAuth rest
   | ["test"]                            => cmdTest
   | ["check"]                           => cmdCheck
   | ["clean"]                           => cmdClean

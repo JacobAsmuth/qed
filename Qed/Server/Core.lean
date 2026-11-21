@@ -57,6 +57,7 @@ structure RequestCtx where
   cookies     : List (String × String) := []
   bearerToken : Option String := none
   userId      : Option String := none
+  claims      : List (String × String) := []
   clientIp    : String := "127.0.0.1"
   connId      : String := ""
   query       : String := ""
@@ -71,6 +72,16 @@ def header (ctx : RequestCtx) (name : String) : Option String :=
 
 def cookie (ctx : RequestCtx) (name : String) : Option String :=
   (ctx.cookies.find? fun (k, _) => k == name).map Prod.snd
+
+def claim (ctx : RequestCtx) (name : String) : Option String :=
+  let direct := (ctx.claims.find? fun (k, _) => k == name).map Prod.snd
+  if direct.isSome then direct
+  else if name == "verified" then
+    (ctx.claims.find? fun (k, _) => k == "email_verified").map Prod.snd
+  else none
+
+def hasClaim (ctx : RequestCtx) (name expected : String) : Bool :=
+  ctx.claim name == some expected
 
 def isAuthenticated (ctx : RequestCtx) : Bool :=
   ctx.userId.isSome || ctx.bearerToken.isSome

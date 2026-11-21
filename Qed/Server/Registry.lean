@@ -47,6 +47,8 @@ structure ServerInfo where
   channels         : Array String := #[]
   jobs             : Array String := #[]
   databases        : Array Lean.Name := #[]
+  authName?        : Option Lean.Name := none
+  authConfig?      : Option Lean.Name := none
   hasHttpRoutes    : Bool := false
 deriving Inhabited
 
@@ -341,6 +343,55 @@ def lookupDatabase? (env : Lean.Environment) (currNs : Lean.Name)
     (openDecls : List Lean.OpenDecl) (dbRef : Lean.Name) : Option DatabaseInfo :=
   let reg := databaseRegistry.getState env
   let clean := dbRef.eraseMacroScopes
+  (reg.find? (currNs ++ clean)).orElse fun _ =>
+    (reg.find? clean).orElse fun _ =>
+      let resolved := Lean.ResolveName.resolveGlobalName env {} currNs openDecls (clean ++ `config)
+      resolved.findSome? fun (fullConst, _) =>
+        reg.find? fullConst.getPrefix
+
+/-! ## Persistent `auth` OIDC Configuration Registry (`authRegistry`) -/
+
+structure AuthClaimInfo where
+  name         : String
+  typeName     : String
+  defaultValue : String := ""
+deriving Inhabited, Repr
+
+structure AuthInfo where
+  authName         : Lean.Name
+  shortName        : String
+  userTypeConst    : Lean.Name
+  fromCtxConst     : Lean.Name
+  configConst      : Lean.Name
+  secrets          : Array String := #[]
+  issuerEnv        : String := "QED_AUTH_ISSUER"
+  issuerDefault?   : Option String := none
+  audienceEnv      : String := "QED_AUTH_AUDIENCE"
+  audienceDefault? : Option String := none
+  clientIdEnv?     : Option String := some "QED_AUTH_CLIENT_ID"
+  clientIdDefault? : Option String := none
+  clientSecretEnv? : Option String := none
+  providers        : Array String := #[]
+  sessionTtlSec    : Nat := 86400
+  loginPath        : String := "/_qed/auth/login"
+  callbackPath     : String := "/_qed/auth/callback"
+  logoutPath       : String := "/_qed/auth/logout"
+  mePath           : String := "/_qed/auth/me"
+  claims           : Array AuthClaimInfo := #[]
+deriving Inhabited, Repr
+
+initialize authRegistry :
+    Lean.SimplePersistentEnvExtension AuthInfo (Lean.NameMap AuthInfo) ←
+  Lean.registerSimplePersistentEnvExtension {
+    addImportedFn := fun arrays =>
+      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.authName info) acc) {}
+    addEntryFn := fun m info => m.insert info.authName info
+  }
+
+def lookupAuth? (env : Lean.Environment) (currNs : Lean.Name)
+    (openDecls : List Lean.OpenDecl) (authRef : Lean.Name) : Option AuthInfo :=
+  let reg := authRegistry.getState env
+  let clean := authRef.eraseMacroScopes
   (reg.find? (currNs ++ clean)).orElse fun _ =>
     (reg.find? clean).orElse fun _ =>
       let resolved := Lean.ResolveName.resolveGlobalName env {} currNs openDecls (clean ++ `config)

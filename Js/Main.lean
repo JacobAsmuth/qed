@@ -1,4 +1,5 @@
 import Js.Backend
+import Qed.Deploy
 open Lean
 
 def parseEntry (s : String) : Name × String :=
@@ -12,9 +13,16 @@ def splitDashes : List String → List String × List String
   | "--" :: rest => ([], rest)
   | a :: rest    => let (h, t) := splitDashes rest; (a :: h, t)
 
-private def loadEnv (mods : List String) : IO Environment := do
+private unsafe def enableInitExecUnsafe : IO Unit :=
+  Lean.enableInitializersExecution
+
+@[implemented_by enableInitExecUnsafe]
+private opaque enableInitExec : IO Unit
+
+private def loadEnv (mods : List String) (loadExts : Bool := false) : IO Environment := do
+  if loadExts then enableInitExec
   let imports := mods.map fun m => ({ module := m.toName } : Import)
-  importModules imports.toArray {} (trustLevel := 1024) (leakEnv := true)
+  importModules imports.toArray {} (trustLevel := 1024) (leakEnv := true) (loadExts := loadExts)
 
 private def orThrow {α : Type} : Except String α → IO α
   | .ok v    => pure v
@@ -117,9 +125,49 @@ private def emitCssForApp (env : Environment) (outPath : String) (appName : Name
     if !t.isEmpty then
       IO.println s!"STYLESHEET:{t}"
 
+private def guessDeployAssetMime (name : String) : Option String :=
+  if name.endsWith ".mjs" || name.endsWith ".js" then some "text/javascript; charset=utf-8"
+  else if name.endsWith ".css" then some "text/css; charset=utf-8"
+  else if name.endsWith ".html" then some "text/html; charset=utf-8"
+  else if name.endsWith ".map" then some "application/json; charset=utf-8"
+  else none
+
+private def scanDeployAssets (dir : System.FilePath) : IO (List Qed.Deploy.DeployAssetManifest) := do
+  if !(← dir.pathExists) then return []
+  let mut out : Array Qed.Deploy.DeployAssetManifest := #[]
+  for entry in (← dir.readDir) do
+    let name := entry.fileName
+    if let some mime := guessDeployAssetMime name then
+      let md ← entry.path.metadata
+      out := out.push { path := "/" ++ name, mime, bytes := md.byteSize.toNat }
+  return (out.qsort fun a b => a.path < b.path).toList
+
+private def splitAssetsDirFlag : List String → Option String × List String
+  | "--assets-dir" :: dir :: rest =>
+      let (_, rem) := splitAssetsDirFlag rest
+      (some dir, rem)
+  | a :: rest =>
+      let (d?, rem) := splitAssetsDirFlag rest
+      (d?, a :: rem)
+  | [] => (none, [])
+
 def main (args : List String) : IO Unit := do
   Lean.initSearchPath (← Lean.findSysroot)
   match args with
+  | "--emit-deploy-manifest" :: outJson :: rootMod :: rest =>
+    let (assetsDir?, mods) := splitAssetsDirFlag rest
+    let loadMods := if mods.isEmpty then [rootMod] else mods
+    let env ← loadEnv loadMods (loadExts := true)
+    let baseManifest := Qed.Deploy.extractFromEnv env rootMod
+    let assets ← match assetsDir? with
+      | some d => scanDeployAssets (System.FilePath.mk d)
+      | none   => pure []
+    let manifest : Qed.Deploy.DeployManifest := { baseManifest with assets }
+    orThrow manifest.validate
+    let p : System.FilePath := outJson
+    if let some dir := p.parent then IO.FS.createDirAll dir
+    IO.FS.writeFile p (manifest.render ++ "\n")
+    IO.println s!"wrote {outJson} (mode={manifest.mode}, secrets={manifest.secrets.length}, dbs={manifest.databases.length}, egress={manifest.egress.length}, auth={manifest.auth?.isSome})"
   | "--emit-css" :: outCss :: rest =>
     let (mods, entryArgs) := splitDashes rest
     if mods.isEmpty || entryArgs.isEmpty then

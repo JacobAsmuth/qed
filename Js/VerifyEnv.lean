@@ -223,8 +223,12 @@ def isExternalOwner (env : Environment) (owner : Name) : Bool :=
 def isDatabaseOwner (env : Environment) (owner : Name) : Bool :=
   !owner.isAnonymous && env.contains (owner ++ `_qed_database_marker)
 
+/-- True iff `owner` is an `auth` namespace (marked by `_qed_auth_marker`). -/
+def isAuthOwner (env : Environment) (owner : Name) : Bool :=
+  !owner.isAnonymous && env.contains (owner ++ `_qed_auth_marker)
+
 /-- True iff `n` (or an enclosing non-`_closed_` declaration prefix, e.g. `match_*` / `_unsafe_rec`
-    auxiliaries) is a server-only declaration owned by a `server`, `external`, or `database` block.
+    auxiliaries) is a server-only declaration owned by a `server`, `external`, `database`, or `auth` block.
     Module-wide CSE `_closed_*` thunks (such as a shared empty `Array.mkEmpty 0`) are excluded
     because Lean's closed-term extractor reuses them across unrelated declarations in the same file. -/
 def isServerOnlyDeclName (env : Environment) : Name → Bool
@@ -238,7 +242,9 @@ def isServerOnlyDeclName (env : Environment) : Name → Bool
         true
       else if (s == "config" || s == "ensureSchema" || s == "ddl" || s == "rlsDdl") && isDatabaseOwner env owner then
         true
-      else if s == "secrets" && (isServerOwner env owner || isExternalOwner env owner || isDatabaseOwner env owner) then
+      else if s == "config" && isAuthOwner env owner then
+        true
+      else if s == "secrets" && (isServerOwner env owner || isExternalOwner env owner || isDatabaseOwner env owner || isAuthOwner env owner) then
         true
       else
         isServerOnlyDeclName env owner
@@ -248,7 +254,8 @@ def isServerOnlyDeclName (env : Environment) : Name → Bool
 def clientLeakReason? (env : Environment) (n : Name) : Option String :=
   let modName := definingModule env n
   if modName == `Qed.Server.Prim || modName == `Qed.Server.Native ||
-     modName == `Qed.Server.Db.PgWire || modName == `Qed.Server.Db.HttpSql then
+     modName == `Qed.Server.Db.PgWire || modName == `Qed.Server.Db.HttpSql ||
+     modName == `Qed.Auth.Oidc then
     some s!"client bundle leak gate: server runtime primitive `{n}` (`{modName}`) cannot be bundled into client JavaScript"
   else if n == `Qed.Server.execExternalRaw ||
           n == `Qed.Server.MonadServer.httpCall ||

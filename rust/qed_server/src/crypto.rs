@@ -8,7 +8,11 @@ use ring::digest;
 use ring::hmac;
 use ring::pbkdf2;
 use ring::rand::{SecureRandom, SystemRandom};
-use ring::signature::{KeyPair, RsaKeyPair, UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256};
+use ring::signature::{
+    EcdsaKeyPair, KeyPair, RsaKeyPair, UnparsedPublicKey,
+    ECDSA_P256_SHA256_FIXED, ECDSA_P256_SHA256_FIXED_SIGNING,
+    RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256,
+};
 
 use crate::{last_errno, parse_pem_blocks};
 use crate::lean_ffi::*;
@@ -304,4 +308,136 @@ pub unsafe extern "C" fn qed_server_pbkdf2_sha256(
         &mut out,
     );
     qed_lean_io_mk_ok(mk_ba(&out))
+}
+
+// ---- RFC 7517 JWK Verification (RS256 & ES256) & Ephemeral P-256 Keygen/Sign ----
+
+fn der_push_len(out: &mut Vec<u8>, len: usize) {
+    if len < 0x80 {
+        out.push(len as u8);
+    } else if len < 0x100 {
+        out.push(0x81);
+        out.push(len as u8);
+    } else if len < 0x10000 {
+        out.push(0x82);
+        out.push((len >> 8) as u8);
+        out.push((len & 0xFF) as u8);
+    } else {
+        out.push(0x83);
+        out.push((len >> 16) as u8);
+        out.push(((len >> 8) & 0xFF) as u8);
+        out.push((len & 0xFF) as u8);
+    }
+}
+
+fn der_push_uint(out: &mut Vec<u8>, raw: &[u8]) {
+    let mut i = 0;
+    while i + 1 < raw.len() && raw[i] == 0 {
+        i += 1;
+    }
+    let trimmed = &raw[i..];
+    out.push(0x02); // INTEGER
+    if trimmed.is_empty() {
+        out.push(0x01);
+        out.push(0x00);
+    } else if trimmed[0] & 0x80 != 0 {
+        der_push_len(out, trimmed.len() + 1);
+        out.push(0x00);
+        out.extend_from_slice(trimmed);
+    } else {
+        der_push_len(out, trimmed.len());
+        out.extend_from_slice(trimmed);
+    }
+}
+
+fn encode_rsa_pub_der(n: &[u8], e: &[u8]) -> Option<Vec<u8>> {
+    if n.is_empty() || e.is_empty() || n.len() > 1024 || e.len() > 64 {
+        return None;
+    }
+    let mut body = Vec::with_capacity(n.len() + e.len() + 16);
+    der_push_uint(&mut body, n);
+    der_push_uint(&mut body, e);
+    let mut seq = Vec::with_capacity(body.len() + 8);
+    seq.push(0x30); // SEQUENCE
+    der_push_len(&mut seq, body.len());
+    seq.extend_from_slice(&body);
+    Some(seq)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_rsa_jwk_verify(
+    n_obj: *mut LeanObj,
+    e_obj: *mut LeanObj,
+    msg_obj: *mut LeanObj,
+    sig_obj: *mut LeanObj,
+) -> *mut LeanObj {
+    let ok: usize = match encode_rsa_pub_der(ba_slice(n_obj), ba_slice(e_obj)) {
+        Some(der) => {
+            let pk = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, der);
+            if pk.verify(ba_slice(msg_obj), ba_slice(sig_obj)).is_ok() { 1 } else { 0 }
+        }
+        None => 0,
+    };
+    qed_lean_io_mk_ok(qed_lean_box(ok))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_ec_p256_jwk_verify(
+    x_obj: *mut LeanObj,
+    y_obj: *mut LeanObj,
+    msg_obj: *mut LeanObj,
+    sig_obj: *mut LeanObj,
+) -> *mut LeanObj {
+    let x = ba_slice(x_obj);
+    let y = ba_slice(y_obj);
+    let ok: usize = if x.len() == 32 && y.len() == 32 {
+        let mut uncompressed = [0u8; 65];
+        uncompressed[0] = 0x04;
+        uncompressed[1..33].copy_from_slice(x);
+        uncompressed[33..65].copy_from_slice(y);
+        let pk = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &uncompressed[..]);
+        if pk.verify(ba_slice(msg_obj), ba_slice(sig_obj)).is_ok() { 1 } else { 0 }
+    } else {
+        0
+    };
+    qed_lean_io_mk_ok(qed_lean_box(ok))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_ec_p256_keygen() -> *mut LeanObj {
+    let rng = SystemRandom::new();
+    let doc = match EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng) {
+        Ok(d) => d,
+        Err(_) => return mk_io_except_err("P-256 keygen failed"),
+    };
+    let kp = match EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, doc.as_ref(), &rng) {
+        Ok(k) => k,
+        Err(_) => return mk_io_except_err("P-256 key parse failed"),
+    };
+    let pub_bytes = kp.public_key().as_ref();
+    if pub_bytes.len() != 65 || pub_bytes[0] != 0x04 {
+        return mk_io_except_err("unexpected P-256 public key format");
+    }
+    let pkcs8_obj = mk_ba(doc.as_ref());
+    let x_obj = mk_ba(&pub_bytes[1..33]);
+    let y_obj = mk_ba(&pub_bytes[33..65]);
+    let inner = qed_lean_mk_prod(x_obj, y_obj);
+    let triple = qed_lean_mk_prod(pkcs8_obj, inner);
+    mk_io_except_ok(triple)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_ec_p256_sign(
+    pkcs8_obj: *mut LeanObj,
+    msg_obj: *mut LeanObj,
+) -> *mut LeanObj {
+    let rng = SystemRandom::new();
+    let kp = match EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, ba_slice(pkcs8_obj), &rng) {
+        Ok(k) => k,
+        Err(_) => return mk_io_except_err("invalid P-256 PKCS#8 private key"),
+    };
+    match kp.sign(&rng, ba_slice(msg_obj)) {
+        Ok(sig) => mk_io_except_ok(mk_ba(sig.as_ref())),
+        Err(_) => mk_io_except_err("ES256 signing failed"),
+    }
 }

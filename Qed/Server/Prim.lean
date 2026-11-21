@@ -68,6 +68,24 @@ opaque rsaSha256Sign (pemPrivateKey : @& String) (msg : @& ByteArray) : IO (Exce
 @[extern "qed_server_rsa_sha256_verify"]
 opaque rsaSha256Verify (pemPrivateKey : @& String) (msg : @& ByteArray) (sig : @& ByteArray) : IO Bool
 
+/-- Verifies an RSASSA-PKCS1-v1_5 SHA-256 (`RS256`) JWS signature directly from JWK raw `(n, e)` bytes. -/
+@[extern "qed_server_rsa_jwk_verify"]
+opaque rsaJwkVerify (nBytes : @& ByteArray) (eBytes : @& ByteArray)
+    (msg : @& ByteArray) (sig : @& ByteArray) : IO Bool
+
+/-- Verifies an ECDSA P-256 SHA-256 (`ES256` fixed 64-byte `r || s`) JWS signature from JWK `(x, y)` coordinates. -/
+@[extern "qed_server_ec_p256_jwk_verify"]
+opaque ecP256JwkVerify (xBytes : @& ByteArray) (yBytes : @& ByteArray)
+    (msg : @& ByteArray) (sig : @& ByteArray) : IO Bool
+
+/-- Generates a fresh ephemeral P-256 (`ES256`) keypair returning `(pkcs8Der, pubX, pubY)`. -/
+@[extern "qed_server_ec_p256_keygen"]
+opaque ecP256Keygen : IO (Except String (ByteArray × ByteArray × ByteArray))
+
+/-- Signs `msg` with ECDSA P-256 SHA-256 (`ES256`, 64-byte `r || s`) using a PKCS#8 DER private key. -/
+@[extern "qed_server_ec_p256_sign"]
+opaque ecP256Sign (pkcs8Der : @& ByteArray) (msg : @& ByteArray) : IO (Except String ByteArray)
+
 /-- Computes a 32-byte SHA-256 digest (`ring::digest::SHA256`). -/
 @[extern "qed_server_sha256"]
 opaque sha256 (data : @& ByteArray) : IO ByteArray

@@ -1,10 +1,8 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -12,7 +10,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme, StreamOwned};
 
 use crate::lean_ffi::*;
-use crate::{is_wouldblock, last_errno};
+use crate::{HandleTable, is_wouldblock, last_errno, lock_unpoison};
 
 const POOL_SIZE: usize = 8;
 const POOL_TTL: Duration = Duration::from_secs(30);
@@ -104,12 +102,7 @@ impl OutStream {
 struct OutConn { is_tls: bool, host: String, port: u16, stream: OutStream }
 struct PoolEntry { conn: OutConn, last_used: Instant }
 
-static ACTIVE_CONNS: OnceLock<Mutex<HashMap<u64, Arc<Mutex<OutConn>>>>> = OnceLock::new();
-static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
-
-fn active_map() -> &'static Mutex<HashMap<u64, Arc<Mutex<OutConn>>>> {
-    ACTIVE_CONNS.get_or_init(|| Mutex::new(HashMap::new()))
-}
+static ACTIVE_CONNS: HandleTable<Arc<Mutex<OutConn>>> = HandleTable::new();
 
 thread_local! {
     static OUTBOUND_POOL: RefCell<Vec<PoolEntry>> = const { RefCell::new(Vec::new()) };
@@ -143,19 +136,19 @@ fn pop_pooled(is_tls: bool, host: &str, port: u16) -> Option<OutConn> {
 }
 
 fn insert_active(conn: OutConn) -> u64 {
-    let id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed).max(1);
-    let mut map = crate::lock_unpoison(active_map());
-    map.insert(id, Arc::new(Mutex::new(conn)));
-    id
-}
-
-fn get_active(handle: u64) -> Option<Arc<Mutex<OutConn>>> {
-    crate::lock_unpoison(active_map()).get(&handle).cloned()
+    ACTIVE_CONNS.insert(Arc::new(Mutex::new(conn)))
 }
 
 fn remove_active(handle: u64) -> Option<OutConn> {
-    let arc = crate::lock_unpoison(active_map()).remove(&handle)?;
+    let arc = ACTIVE_CONNS.remove(handle)?;
     Arc::try_unwrap(arc).ok().map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
+}
+
+fn wrap_tls(mut sock: TcpStream, host: &str, label: &str) -> Result<OutStream, String> {
+    let sni = ServerName::try_from(host.to_owned()).map_err(|_| format!("invalid TLS server name: {host}"))?;
+    let mut conn = ClientConnection::new(tls_config(), sni).map_err(|_| "TLS client init failed".to_owned())?;
+    conn.complete_io(&mut sock).map_err(|e| format!("{label} handshake failed for {host}: {e}"))?;
+    Ok(OutStream::Tls(Box::new(StreamOwned::new(conn, sock))))
 }
 
 unsafe fn check_ssrf_lean(addrs: &[SocketAddr], is_blocked_fn: *mut LeanObj) -> Result<(), &'static str> {
@@ -204,7 +197,7 @@ pub unsafe extern "C" fn qed_server_outbound_acquire(
             Err(e) => last_err = Some(e),
         }
     }
-    let Some(mut sock) = sock else {
+    let Some(sock) = sock else {
         let msg = last_err.map_or_else(|| format!("TCP connect failed for {host}:{port}"), |e| format!("TCP connect failed for {host}:{port}: {e}"));
         return mk_io_except_err(&msg);
     };
@@ -212,10 +205,7 @@ pub unsafe extern "C" fn qed_server_outbound_acquire(
     let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
     let _ = sock.set_nodelay(true);
     let stream = if want_tls {
-        let Ok(sni) = ServerName::try_from(host.to_owned()) else { return mk_io_except_err(&format!("invalid TLS server name: {host}")); };
-        let Ok(mut conn) = ClientConnection::new(tls_config(), sni) else { return mk_io_except_err("TLS client init failed"); };
-        if let Err(e) = conn.complete_io(&mut sock) { return mk_io_except_err(&format!("TLS handshake failed for {host}: {e}")); }
-        OutStream::Tls(Box::new(StreamOwned::new(conn, sock)))
+        match wrap_tls(sock, host, "TLS") { Ok(s) => s, Err(e) => return mk_io_except_err(&e) }
     } else {
         OutStream::Plain(sock)
     };
@@ -226,27 +216,21 @@ pub unsafe extern "C" fn qed_server_outbound_acquire(
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_outbound_write_all(handle: u64, data_obj: *mut LeanObj) -> *mut LeanObj {
     let data = ba_slice(data_obj);
-    let res = match get_active(handle) {
-        Some(arc) => {
-            let mut c = crate::lock_unpoison(&arc);
-            c.stream.write_all_bytes(data).map_err(|e| format!("write failed: {e}"))
-        }
+    let res = match ACTIVE_CONNS.get(handle) {
+        Some(arc) => lock_unpoison(&arc).stream.write_all_bytes(data).map_err(|e| format!("write failed: {e}")),
         None => Err("invalid outbound connection handle".to_owned()),
     };
-    match res { Ok(()) => mk_io_except_ok(qed_lean_box(0)), Err(e) => mk_io_except_err(&e) }
+    mk_io_except(res, |()| qed_lean_box(0))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_outbound_read_some(handle: u64, max_bytes: u32) -> *mut LeanObj {
     let mut buf = vec![0u8; (max_bytes as usize).clamp(1, 65536)];
-    let res = match get_active(handle) {
-        Some(arc) => {
-            let mut c = crate::lock_unpoison(&arc);
-            c.stream.read_some_bytes(&mut buf).map_err(|e| format!("read failed: {e}"))
-        }
+    let res = match ACTIVE_CONNS.get(handle) {
+        Some(arc) => lock_unpoison(&arc).stream.read_some_bytes(&mut buf).map_err(|e| format!("read failed: {e}")),
         None => Err("invalid outbound connection handle".to_owned()),
     };
-    match res { Ok(n) => mk_io_except_ok(mk_ba(&buf[..n])), Err(e) => mk_io_except_err(&e) }
+    mk_io_except(res, |n| mk_ba(&buf[..n]))
 }
 
 #[no_mangle]
@@ -256,42 +240,21 @@ pub unsafe extern "C" fn qed_server_outbound_upgrade_tls(handle: u64, host_obj: 
         None => Err("invalid outbound connection handle".to_owned()),
         Some(conn) => match conn.stream {
             OutStream::Tls(_) => {
-                crate::lock_unpoison(active_map()).insert(handle, Arc::new(Mutex::new(conn)));
+                ACTIVE_CONNS.insert_at(handle, Arc::new(Mutex::new(conn)));
                 Ok(())
             }
-            OutStream::Plain(mut sock) => {
-                let Ok(sni) = ServerName::try_from(host.to_owned()) else {
-                    return mk_io_except_err(&format!("invalid TLS server name: {host}"));
-                };
-                let Ok(mut tls_conn) = ClientConnection::new(tls_config(), sni) else {
-                    return mk_io_except_err("TLS client init failed");
-                };
-                if let Err(e) = tls_conn.complete_io(&mut sock) {
-                    return mk_io_except_err(&format!("STARTTLS handshake failed for {host}: {e}"));
-                }
-                let upgraded = OutConn {
-                    is_tls: true,
-                    host: conn.host,
-                    port: conn.port,
-                    stream: OutStream::Tls(Box::new(StreamOwned::new(tls_conn, sock))),
-                };
-                crate::lock_unpoison(active_map()).insert(handle, Arc::new(Mutex::new(upgraded)));
-                Ok(())
-            }
+            OutStream::Plain(sock) => wrap_tls(sock, host, "STARTTLS").map(|stream| {
+                let upgraded = OutConn { is_tls: true, host: conn.host, port: conn.port, stream };
+                ACTIVE_CONNS.insert_at(handle, Arc::new(Mutex::new(upgraded)));
+            }),
         },
     };
-    match res { Ok(()) => mk_io_except_ok(qed_lean_box(0)), Err(e) => mk_io_except_err(&e) }
+    mk_io_except(res, |()| qed_lean_box(0))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_outbound_is_alive(handle: u64) -> *mut LeanObj {
-    let alive = match get_active(handle) {
-        Some(arc) => {
-            let c = crate::lock_unpoison(&arc);
-            socket_is_alive(c.stream.raw_fd())
-        }
-        None => false,
-    };
+    let alive = ACTIVE_CONNS.get(handle).is_some_and(|arc| socket_is_alive(lock_unpoison(&arc).stream.raw_fd()));
     qed_lean_io_mk_ok(qed_lean_box(if alive { 1 } else { 0 }))
 }
 
@@ -315,12 +278,7 @@ pub unsafe extern "C" fn qed_server_outbound_release(handle: u64, keep_alive: u8
 
 // ---- Loopback TCP Listener Helpers (Native Server & Test Harnesses) ----
 
-static LISTENERS: OnceLock<Mutex<HashMap<u64, TcpListener>>> = OnceLock::new();
-static NEXT_LISTENER_ID: AtomicU64 = AtomicU64::new(1);
-
-fn listener_map() -> &'static Mutex<HashMap<u64, TcpListener>> {
-    LISTENERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
+static LISTENERS: HandleTable<TcpListener> = HandleTable::new();
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_free_port() -> *mut LeanObj {
@@ -340,10 +298,7 @@ pub unsafe extern "C" fn qed_server_tcp_listen(port: u16) -> *mut LeanObj {
         return mk_io_except_err("failed to query local TCP address");
     };
     let _ = listener.set_nonblocking(true);
-    let id = NEXT_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut map) = listener_map().lock() {
-        map.insert(id, listener);
-    }
+    let id = LISTENERS.insert(listener);
     let pair = qed_lean_mk_prod(qed_lean_box_u64(id), qed_lean_box(addr.port() as usize));
     mk_io_except_ok(pair)
 }
@@ -352,14 +307,8 @@ pub unsafe extern "C" fn qed_server_tcp_listen(port: u16) -> *mut LeanObj {
 pub unsafe extern "C" fn qed_server_tcp_accept(listener_id: u64, timeout_ms: u32) -> *mut LeanObj {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
     loop {
-        let step = {
-            let Ok(map) = listener_map().lock() else {
-                return mk_io_except_err("listener lock poisoned");
-            };
-            let Some(listener) = map.get(&listener_id) else {
-                return mk_io_except_err("closed");
-            };
-            listener.accept()
+        let Some(step) = LISTENERS.with(listener_id, |l| l.accept()) else {
+            return mk_io_except_err("closed");
         };
         match step {
             Ok((sock, peer)) => {
@@ -389,8 +338,6 @@ pub unsafe extern "C" fn qed_server_tcp_accept(listener_id: u64, timeout_ms: u32
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_tcp_close_listener(listener_id: u64) -> *mut LeanObj {
-    if let Ok(mut map) = listener_map().lock() {
-        map.remove(&listener_id);
-    }
+    LISTENERS.remove(listener_id);
     qed_lean_io_mk_ok(qed_lean_box(0))
 }

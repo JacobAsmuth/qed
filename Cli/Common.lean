@@ -258,19 +258,17 @@ def shQuiet (cmd : String) (args : Array String) (extraEnv : Array (String × Op
   if code != 0 then IO.eprint out
   return code
 
-def shLakeBuild (args : Array String) : IO UInt32 := do
-  let (code, out) ← shOut "lake" args
+private def shDiag (cmd : String) (args : Array String) (extraEnv : Array (String × Option String) := #[]) : IO UInt32 := do
+  let (code, out) ← shOut cmd args extraEnv
   if code != 0 then
     IO.eprint (← formatLakeDiagnostics out true)
     lastBuildErrorRef.set (← formatLakeDiagnostics out false)
   return code
 
-def shLean (leanPath : String) (args : Array String) : IO UInt32 := do
-  let (code, out) ← shOut "lean" args #[("LEAN_PATH", some leanPath)]
-  if code != 0 then
-    IO.eprint (← formatLakeDiagnostics out true)
-    lastBuildErrorRef.set (← formatLakeDiagnostics out false)
-  return code
+def shLakeBuild (args : Array String) : IO UInt32 := shDiag "lake" args
+
+def shLean (leanPath : String) (args : Array String) : IO UInt32 :=
+  shDiag "lean" args #[("LEAN_PATH", some leanPath)]
 
 def onPath (cmd : String) : IO Bool := do
   return (← shOut "bash" #["-c", s!"command -v {cmd}"]).1 == 0
@@ -323,13 +321,6 @@ def writeDevStatusJson (outDir : FilePath) (status : String) (kind : String := "
   IO.FS.writeFile tmp json
   IO.FS.rename tmp (outDir / "__dev_status")
   return json
-
-def writeDevStatus (outDir : FilePath) (status : String) (kind : String := "hmr")
-    (errText : String := "") (durationMs : Nat := 0) (bumpId : Bool := true) : IO Unit :=
-  discard <| writeDevStatusJson outDir status kind errText durationMs bumpId ""
-
-def writeBuildId (outDir : FilePath) : IO Unit :=
-  writeDevStatus outDir "ok" "hmr" "" 0 true
 
 def writeIfChanged (path : FilePath) (content : String) : IO Bool := do
   if (← path.pathExists) then

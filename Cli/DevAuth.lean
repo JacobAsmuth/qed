@@ -128,6 +128,16 @@ private def stripQ (target : String) : String × String :=
 private def lookupParam (ps : List (String × String)) (k : String) (fallback : String := "") : String :=
   ((ps.find? (·.1 == k)).map Prod.snd).getD fallback
 
+private def parseOAuthParams (ps : List (String × String)) : String × String × String × String × String :=
+  (lookupParam ps "client_id" "qed-app", lookupParam ps "redirect_uri",
+   lookupParam ps "state", lookupParam ps "nonce", lookupParam ps "code_challenge")
+
+private def parsePersona (ps : List (String × String)) (defaultOrg : String := "org_acme")
+    (checkboxVerified : Bool := false) : String × String × String × String × Bool :=
+  (lookupParam ps "sub" "usr_admin", lookupParam ps "email" "alice@dev.local",
+   lookupParam ps "role" "admin", lookupParam ps "orgId" defaultOrg,
+   if checkboxVerified then lookupParam ps "verified" != "" else lookupParam ps "verified" "1" != "0")
+
 /-- Starts the ephemeral local Dev OIDC Identity Provider on `127.0.0.1:<port>`. -/
 def runDevAuthServer (port : UInt16) : IO UInt32 := do
   let (pkcs8Der, pubX, pubY) ← match ← Prim.ecP256Keygen with
@@ -194,40 +204,35 @@ def runDevAuthServer (port : UInt16) : IO UInt32 := do
   let dispatchReq (req : ParsedReqHead) (body : ByteArray) (_clientIp : String) : IO ByteArray := do
     let isHead := req.method == "HEAD"
     let (pathOnly, queryStr) := stripQ req.target
+    let jsonResp (status : Nat) (b : ByteArray) : ByteArray :=
+      formatHttpResponse status "application/json" b isHead req.keepAlive true
+    let mintTokenResp (sub aud nonce email role orgId : String) (verified : Bool) : IO ByteArray := do
+      match ← signDevIdToken kp issuer sub aud nonce email role orgId verified with
+      | .error e => return jsonResp 500 (Qed.Json.render (.obj [("error", .str e)])).toUTF8
+      | .ok tok  =>
+          let resp := Qed.Json.render (.obj [
+            ("token_type", .str "Bearer"), ("id_token", .str tok),
+            ("access_token", .str tok), ("expires_in", .num ⟨3600, 0⟩)
+          ])
+          return jsonResp 200 resp.toUTF8
     if (req.method == "GET" || isHead) && pathOnly == "/_qed/health" then
-      return formatHttpResponse 200 "application/json" healthBody isHead req.keepAlive true
+      return jsonResp 200 healthBody
     else if (req.method == "GET" || isHead) && pathOnly == "/.well-known/openid-configuration" then
-      return formatHttpResponse 200 "application/json" discoveryBody isHead req.keepAlive true
+      return jsonResp 200 discoveryBody
     else if (req.method == "GET" || isHead) && pathOnly == "/jwks.json" then
-      return formatHttpResponse 200 "application/json" jwksBody isHead req.keepAlive true
+      return jsonResp 200 jwksBody
     else if req.method == "GET" && pathOnly == "/authorize" then
       let q := parseQueryParams queryStr
-      let clientId := lookupParam q "client_id" "qed-app"
-      let redirectUri := lookupParam q "redirect_uri"
-      let state := lookupParam q "state"
-      let nonce := lookupParam q "nonce"
-      let chal := lookupParam q "code_challenge"
+      let (clientId, redirectUri, state, nonce, chal) := parseOAuthParams q
       if lookupParam q "auto" == "1" then
-        let sub := lookupParam q "sub" "usr_admin"
-        let email := lookupParam q "email" "alice@dev.local"
-        let role := lookupParam q "role" "admin"
-        let orgId := lookupParam q "orgId" "org_acme"
-        let verified := lookupParam q "verified" "1" != "0"
+        let (sub, email, role, orgId, verified) := parsePersona q
         return ← issueCodeAndRedirect clientId redirectUri state nonce chal sub email role orgId verified req.keepAlive isHead
       let html := renderDevAuthorizePage issuer clientId redirectUri state nonce chal
       return formatHttpResponse 200 "text/html; charset=utf-8" html.toUTF8 isHead req.keepAlive true
     else if req.method == "POST" && pathOnly == "/authorize" then
       let form := parseQueryParams ((String.fromUTF8? body).getD "")
-      let clientId := lookupParam form "client_id" "qed-app"
-      let redirectUri := lookupParam form "redirect_uri"
-      let state := lookupParam form "state"
-      let nonce := lookupParam form "nonce"
-      let chal := lookupParam form "code_challenge"
-      let sub := lookupParam form "sub" "usr_admin"
-      let email := lookupParam form "email" "alice@dev.local"
-      let role := lookupParam form "role" "admin"
-      let orgId := lookupParam form "orgId" ""
-      let verified := lookupParam form "verified" != ""
+      let (clientId, redirectUri, state, nonce, chal) := parseOAuthParams form
+      let (sub, email, role, orgId, verified) := parsePersona form "" true
       return ← issueCodeAndRedirect clientId redirectUri state nonce chal sub email role orgId verified req.keepAlive isHead
     else if req.method == "POST" && pathOnly == "/token" then
       let form := parseQueryParams ((String.fromUTF8? body).getD "")
@@ -235,19 +240,10 @@ def runDevAuthServer (port : UInt16) : IO UInt32 := do
       if grant == "direct_dev_token" then
         -- Dev/test convenience minting an ES256 Bearer JWT directly from this IdP
         let aud := lookupParam form "audience" (lookupParam form "client_id" "qed-app")
-        let sub := lookupParam form "sub" "usr_admin"
-        let email := lookupParam form "email" "alice@dev.local"
-        let role := lookupParam form "role" "admin"
-        let orgId := lookupParam form "orgId" "org_acme"
-        let verified := lookupParam form "verified" "1" != "0"
-        match ← signDevIdToken kp issuer sub aud "" email role orgId verified with
-        | .error e =>
-            return formatHttpResponse 500 "application/json" (Qed.Json.render (.obj [("error", .str e)])).toUTF8 isHead req.keepAlive true
-        | .ok tok =>
-            let resp := Qed.Json.render (.obj [("token_type", .str "Bearer"), ("id_token", .str tok), ("access_token", .str tok), ("expires_in", .num ⟨3600, 0⟩)])
-            return formatHttpResponse 200 "application/json" resp.toUTF8 isHead req.keepAlive true
+        let (sub, email, role, orgId, verified) := parsePersona form
+        return ← mintTokenResp sub aud "" email role orgId verified
       if grant != "authorization_code" then
-        return formatHttpResponse 400 "application/json" "{\"error\":\"unsupported_grant_type\"}".toUTF8 isHead req.keepAlive true
+        return jsonResp 400 "{\"error\":\"unsupported_grant_type\"}".toUTF8
       let code := lookupParam form "code"
       let verifier := lookupParam form "code_verifier"
       let clientId := lookupParam form "client_id"
@@ -258,25 +254,14 @@ def runDevAuthServer (port : UInt16) : IO UInt32 := do
         | some c => (arr.filter (·.code != code), some c)
         | none   => (arr, none)
       let some entry := found?
-        | return formatHttpResponse 400 "application/json" "{\"error\":\"invalid_grant\",\"error_description\":\"unknown or already used code\"}".toUTF8 isHead req.keepAlive true
+        | return jsonResp 400 "{\"error\":\"invalid_grant\",\"error_description\":\"unknown or already used code\"}".toUTF8
       if nowSec >= entry.expiresAtSec || entry.clientId != clientId || entry.redirectUri != redirectUri then
-        return formatHttpResponse 400 "application/json" "{\"error\":\"invalid_grant\",\"error_description\":\"code mismatch or expired\"}".toUTF8 isHead req.keepAlive true
+        return jsonResp 400 "{\"error\":\"invalid_grant\",\"error_description\":\"code mismatch or expired\"}".toUTF8
       if !entry.codeChallenge.isEmpty then
         let digest ← Prim.sha256 verifier.toUTF8
-        let computed := base64UrlEncode digest
-        if computed != entry.codeChallenge then
-          return formatHttpResponse 400 "application/json" "{\"error\":\"invalid_grant\",\"error_description\":\"PKCE S256 verification failed\"}".toUTF8 isHead req.keepAlive true
-      match ← signDevIdToken kp issuer entry.sub entry.clientId entry.nonce entry.email entry.role entry.orgId entry.emailVerified with
-      | .error e =>
-          return formatHttpResponse 500 "application/json" (Qed.Json.render (.obj [("error", .str e)])).toUTF8 isHead req.keepAlive true
-      | .ok idTok =>
-          let resp := Qed.Json.render (Qed.Json.obj [
-            ("token_type", .str "Bearer"),
-            ("id_token", .str idTok),
-            ("access_token", .str idTok),
-            ("expires_in", .num ⟨3600, 0⟩)
-          ])
-          return formatHttpResponse 200 "application/json" resp.toUTF8 isHead req.keepAlive true
+        if base64UrlEncode digest != entry.codeChallenge then
+          return jsonResp 400 "{\"error\":\"invalid_grant\",\"error_description\":\"PKCE S256 verification failed\"}".toUTF8
+      return ← mintTokenResp entry.sub entry.clientId entry.nonce entry.email entry.role entry.orgId entry.emailVerified
     else
       return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 isHead req.keepAlive true
 

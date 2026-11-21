@@ -91,38 +91,21 @@ impl BitWriter {
 }
 
 #[inline]
+fn lookup_base(bases: &[u16], extra: &[u8], val: u16) -> (usize, u32, u8) {
+    let idx = bases.partition_point(|&b| b <= val) - 1;
+    (idx, (val - bases[idx]) as u32, extra[idx])
+}
+
+#[inline]
 fn encode_len(len: usize) -> (u16, u32, u8) {
-    let l = len as u16;
-    if l == 258 {
-        return (285, 0, 0);
-    }
-    let mut lo = 0usize;
-    let mut hi = 27usize;
-    while lo < hi {
-        let mid = (lo + hi + 1) / 2;
-        if LEN_BASES[mid] <= l {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    (257 + lo as u16, (l - LEN_BASES[lo]) as u32, LEN_EXTRA[lo])
+    let (idx, extra, bits) = lookup_base(&LEN_BASES, &LEN_EXTRA, len as u16);
+    (257 + idx as u16, extra, bits)
 }
 
 #[inline]
 fn encode_dist(dist: usize) -> (u8, u32, u8) {
-    let d = dist as u16;
-    let mut lo = 0usize;
-    let mut hi = 29usize;
-    while lo < hi {
-        let mid = (lo + hi + 1) / 2;
-        if DIST_BASES[mid] <= d {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    (lo as u8, (d - DIST_BASES[lo]) as u32, DIST_EXTRA[lo])
+    let (idx, extra, bits) = lookup_base(&DIST_BASES, &DIST_EXTRA, dist as u16);
+    (idx as u8, extra, bits)
 }
 
 #[inline]

@@ -16,18 +16,19 @@ const devEmit = (kind, detail) => {
   const h = typeof window !== 'undefined' && window.__qedDevHook;
   if (h) h(kind, detail);
 };
-const devRestoreState = (stateJson, localsJson) => {
-  if (!currentApp) return false;
+const remountApp = (app, stateJson, localsJson, isTimeTravel = false) => {
   if (active) active.teardown();
   const root = document.getElementById('app');
   if (root) root.innerHTML = '';
   const ssrStateEl = document.getElementById('qed-state');
   if (ssrStateEl) ssrStateEl.remove();
   if (typeof stateJson === 'string' && stateJson.length > 0) globalThis.__qedHmrState = stateJson;
-  const next = mountApp(currentApp, true);
+  const next = mountApp(app, isTimeTravel);
   if (localsJson && localsJson !== '{}') { try { next.restore(localsJson); } catch (_) {} }
-  return true;
+  return next;
 };
+const devRestoreState = (stateJson, localsJson) =>
+  currentApp ? (remountApp(currentApp, stateJson, localsJson, true), true) : false;
 
 function bindRootListeners() {
   if (listenersBound) return;
@@ -87,24 +88,25 @@ function mountApp(app, isTimeTravel = false) {
   bindRootListeners();
 
   let devAfter = null;
+  const wrap = (fn, kind, meta) => (...a) => { const r = fn(...a, W); if (devAfter && window.__qedDevHook) devAfter(kind, meta(...a)); return r; };
   const init             = () => app.qed_init(W);
-  const dispatch         = (id) => { const r = app.qed_dispatch(id, W); if (devAfter && window.__qedDevHook) devAfter('dispatch', { id }); return r; };
-  const dispatchStr      = (id, v) => { const r = app.qed_dispatch_str(id, v, W); if (devAfter && window.__qedDevHook) devAfter('dispatchStr', { id, value: v }); return r; };
+  const dispatch         = wrap(app.qed_dispatch, 'dispatch', (id) => ({ id }));
+  const dispatchStr      = wrap(app.qed_dispatch_str, 'dispatchStr', (id, value) => ({ id, value }));
   const streamChunk      = (cid, data) => app.qed_stream_chunk(cid, data, W);
-  const streamDone       = (did) => { const r = app.qed_stream_done(did, W); if (devAfter && window.__qedDevHook) devAfter('streamDone', { id: did }); return r; };
-  const httpDone         = (id, ok, text) => { const r = app.qed_http_done(id, ok, text, W); if (devAfter && window.__qedDevHook) devAfter('http', { id, ok: !!ok }); return r; };
-  const httpBytesDone    = (id, ok, bytes) => { const r = app.qed_http_bytes_done(id, ok, bytes, W); if (devAfter && window.__qedDevHook) devAfter('httpBytes', { id, ok: !!ok }); return r; };
-  const urlChanged       = (path) => { const r = app.qed_url_changed(path, W); if (devAfter && window.__qedDevHook) devAfter('url', { path }); return r; };
-  const localDispatch    = (key, id) => { const r = app.qed_local_dispatch(key, id, W); if (devAfter && window.__qedDevHook) devAfter('local', { key, id }); return r; };
-  const localDispatchStr = (key, id, v) => { const r = app.qed_local_dispatch_str(key, id, v, W); if (devAfter && window.__qedDevHook) devAfter('localStr', { key, id, value: v }); return r; };
+  const streamDone       = wrap(app.qed_stream_done, 'streamDone', (id) => ({ id }));
+  const httpDone         = wrap(app.qed_http_done, 'http', (id, ok) => ({ id, ok: !!ok }));
+  const httpBytesDone    = wrap(app.qed_http_bytes_done, 'httpBytes', (id, ok) => ({ id, ok: !!ok }));
+  const urlChanged       = wrap(app.qed_url_changed, 'url', (path) => ({ path }));
+  const localDispatch    = wrap(app.qed_local_dispatch, 'local', (key, id) => ({ key, id }));
+  const localDispatchStr = wrap(app.qed_local_dispatch_str, 'localStr', (key, id, value) => ({ key, id, value }));
   const localSnapshot    = () => $.ioVal(app.qed_local_snapshot(W));
   const localRestore     = (s) => app.qed_local_restore(s, W);
   const dehydrate        = () => (typeof app.qed_dehydrate === 'function' ? $.ioVal(app.qed_dehydrate(W)) : '');
-  const effectDone       = (id, result) => { const r = app.qed_effect_done(id, result, W); if (devAfter && window.__qedDevHook) devAfter('effect', { id }); return r; };
-  const portRecv         = (name, payload) => { const r = app.qed_port_recv(name, payload, W); if (devAfter && window.__qedDevHook) devAfter('port', { name }); return r; };
+  const effectDone       = wrap(app.qed_effect_done, 'effect', (id) => ({ id }));
+  const portRecv         = wrap(app.qed_port_recv, 'port', (name) => ({ name }));
   const wsOpen           = (cid) => app.qed_ws_open(cid, W);
-  const wsBytes          = (cid, bytes) => { const r = app.qed_ws_bytes(cid, bytes, W); if (devAfter && window.__qedDevHook) devAfter('wsBytes', { cid }); return r; };
-  const wsText           = (cid, text) => { const r = app.qed_ws_text(cid, text, W); if (devAfter && window.__qedDevHook) devAfter('wsText', { cid }); return r; };
+  const wsBytes          = wrap(app.qed_ws_bytes, 'wsBytes', (cid) => ({ cid }));
+  const wsText           = wrap(app.qed_ws_text, 'wsText', (cid) => ({ cid }));
   const wsClose          = (cid, err, nowMs) => app.qed_ws_close(cid, err, BigInt(nowMs), W);
 
   const g = (globalThis.__qed ||= {});
@@ -142,20 +144,14 @@ function mountApp(app, isTimeTravel = false) {
       }
     }).catch(() => { if (!disposed) streamDone(did); }).finally(() => aborts.delete(k));
   };
-  g.httpSend = (method, url, body, id) => {
-    const k = String(id), opts = { method, headers: { 'Content-Type': 'application/json' }, signal: trackAbort(k) };
+  const sendHttp = (method, url, body, id, headers, read, done, errVal) => {
+    const k = String(id), opts = { method, headers, signal: trackAbort(k) };
     if (method !== 'GET' && method !== 'HEAD') opts.body = body;
-    fetch(url, opts).then(async (r) => { const t = await r.text(); if (!disposed) httpDone(id, r.ok ? 1 : 0, t); })
-      .catch((e) => { if (!disposed) httpDone(id, 0, String(e)); }).finally(() => aborts.delete(k));
+    fetch(url, opts).then(async (r) => { const v = await read(r); if (!disposed) done(id, r.ok ? 1 : 0, v); })
+      .catch((e) => { if (!disposed) done(id, 0, errVal(e)); }).finally(() => aborts.delete(k));
   };
-  g.httpSendBytes = (method, url, body, id) => {
-    const k = String(id), opts = { method, headers: { 'Content-Type': 'application/x-protobuf', 'Accept': 'application/x-protobuf' }, signal: trackAbort(k) };
-    if (method !== 'GET' && method !== 'HEAD') opts.body = body;
-    fetch(url, opts).then(async (r) => {
-      const buf = new Uint8Array(await r.arrayBuffer());
-      if (!disposed) httpBytesDone(id, r.ok ? 1 : 0, buf);
-    }).catch((e) => { if (!disposed) httpBytesDone(id, 0, textEnc.encode(String(e))); }).finally(() => aborts.delete(k));
-  };
+  g.httpSend = (m, u, b, id) => sendHttp(m, u, b, id, { 'Content-Type': 'application/json' }, (r) => r.text(), httpDone, String);
+  g.httpSendBytes = (m, u, b, id) => sendHttp(m, u, b, id, { 'Content-Type': 'application/x-protobuf', 'Accept': 'application/x-protobuf' }, async (r) => new Uint8Array(await r.arrayBuffer()), httpBytesDone, (e) => textEnc.encode(String(e)));
   g.setSignal = (name, v) => {
     const s = String(v); g.sigVals.set(name, s); const b = g.sig.get(name);
     if (!b || !b.el || !b.el.isConnected) return;
@@ -197,6 +193,29 @@ function mountApp(app, isTimeTravel = false) {
       default: console.warn('qed: unknown effect', kind);
     }
   };
+  const toB64 = (buf) => {
+    const bytes = new Uint8Array(buf), step = 24576; let out = '';
+    for (let i = 0; i < bytes.length; i += step) {
+      const slice = bytes.subarray(i, Math.min(i + step, bytes.length));
+      let bin = ''; for (let j = 0; j < slice.length; j++) bin += String.fromCharCode(slice[j]);
+      out += btoa(bin);
+    }
+    return out;
+  };
+  const pickFile = (accept, id, maxBytes, asBytes) => {
+    const input = document.createElement('input'); input.type = 'file'; if (accept) input.accept = accept;
+    const reply = (v) => { if (!disposed) effectDone(id, typeof v === 'string' ? v : JSON.stringify(v)); };
+    input.addEventListener('cancel', () => reply('{"error":"cancelled"}'));
+    input.onchange = () => {
+      const f = input.files && input.files[0]; if (!f) { reply('{"error":"cancelled"}'); return; }
+      if (asBytes && maxBytes > 0 && f.size > maxBytes) { reply({ error: `file too large (${f.size} bytes; max ${maxBytes})` }); return; }
+      const fail = () => reply('{"error":"read failed"}');
+      const done = (v) => reply(asBytes ? { name: f.name, mime: f.type, size: f.size, base64: toB64(v) } : { name: f.name, mime: f.type, size: f.size, text: String(v) });
+      if (asBytes && typeof f.arrayBuffer === 'function') f.arrayBuffer().then(done).catch(fail);
+      else { const r = new FileReader(); r.onload = () => done(r.result); r.onerror = fail; asBytes ? r.readAsArrayBuffer(f) : r.readAsText(f); }
+    };
+    input.click();
+  };
   g.effectResult = (kind, a, b, id) => {
     if (disposed) return;
     switch (kind) {
@@ -205,28 +224,8 @@ function mountApp(app, isTimeTravel = false) {
       case 'timer.after': { const tid = setTimeout(() => { rawTimers.delete(tid); if (!disposed) effectDone(id, ''); }, parseInt(a, 10) || 0); rawTimers.add(tid); break; }
       case 'timer.afterKeyed': { if (timers[a]) clearTimeout(timers[a]); timers[a] = setTimeout(() => { delete timers[a]; if (!disposed) effectDone(id, ''); }, parseInt(b, 10) || 0); break; }
       case 'random.int': { const lo = parseInt(a, 10) || 0, hi = parseInt(b, 10) || 0; effectDone(id, String(lo + Math.floor(Math.random() * (hi - lo + 1)))); break; }
-      case 'file.pick': { const input = document.createElement('input'); input.type = 'file'; if (a) input.accept = a;
-        input.addEventListener('cancel', () => { if (!disposed) effectDone(id, '{"error":"cancelled"}'); });
-        input.onchange = () => { const f = input.files && input.files[0]; if (!f) { if (!disposed) effectDone(id, '{"error":"cancelled"}'); return; }
-          const reader = new FileReader(); reader.onload = () => { if (!disposed) effectDone(id, JSON.stringify({ name: f.name, mime: f.type, size: f.size, text: String(reader.result) })); };
-          reader.onerror = () => { if (!disposed) effectDone(id, '{"error":"read failed"}'); }; reader.readAsText(f); }; input.click(); break; }
-      case 'file.pickBytes': { const input = document.createElement('input'); input.type = 'file'; if (a) input.accept = a;
-        const maxBytes = parseInt(b, 10) || 0;
-        input.addEventListener('cancel', () => { if (!disposed) effectDone(id, '{"error":"cancelled"}'); });
-        input.onchange = () => { const f = input.files && input.files[0]; if (!f) { if (!disposed) effectDone(id, '{"error":"cancelled"}'); return; }
-          if (maxBytes > 0 && f.size > maxBytes) { if (!disposed) effectDone(id, JSON.stringify({ error: 'file too large (' + f.size + ' bytes; max ' + maxBytes + ')' })); return; }
-          const toB64 = (buf) => { const bytes = new Uint8Array(buf); const step = 24576; let out = '';
-            for (let i = 0; i < bytes.length; i += step) {
-              const slice = bytes.subarray(i, Math.min(i + step, bytes.length));
-              let bin = ''; for (let j = 0; j < slice.length; j++) bin += String.fromCharCode(slice[j]);
-              out += btoa(bin);
-            }
-            return out; };
-          const done = (buf) => { if (!disposed) effectDone(id, JSON.stringify({ name: f.name, mime: f.type, size: f.size, base64: toB64(buf) })); };
-          const fail = () => { if (!disposed) effectDone(id, '{"error":"read failed"}'); };
-          if (typeof f.arrayBuffer === 'function') { f.arrayBuffer().then(done).catch(fail); }
-          else { const reader = new FileReader(); reader.onload = () => done(reader.result); reader.onerror = fail; reader.readAsArrayBuffer(f); } };
-        input.click(); break; }
+      case 'file.pick': pickFile(a, id, 0, false); break;
+      case 'file.pickBytes': pickFile(a, id, parseInt(b, 10) || 0, true); break;
       default: console.warn('qed: unknown result effect', kind);
     }
   };
@@ -376,16 +375,7 @@ window.__qedHotReload = async function (buildId, opts = {}) {
   }
   const nextApp = await import(`/app.mjs?t=${encodeURIComponent(buildId)}`);
   await hotSwapStyles(buildId);
-  if (active) active.teardown();
-  const root = document.getElementById('app');
-  if (root) root.innerHTML = '';
-  const ssrStateEl = document.getElementById('qed-state');
-  if (ssrStateEl) ssrStateEl.remove();
-  if (savedState) globalThis.__qedHmrState = savedState;
-  const next = mountApp(nextApp);
-  if (savedLocals && savedLocals !== '{}') {
-    try { next.restore(savedLocals); } catch (_) {}
-  }
+  const next = remountApp(nextApp, savedState, savedLocals);
   let preserved = false;
   if (savedState) {
     try { preserved = next.dehydrate() === savedState; } catch (_) {}

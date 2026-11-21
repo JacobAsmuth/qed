@@ -14,7 +14,7 @@ use ring::signature::{
     RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256,
 };
 
-use crate::{last_errno, parse_pem_blocks};
+use crate::{encode_hex, last_errno, parse_pem_blocks};
 use crate::lean_ffi::*;
 
 const MAX_STATIC_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -208,13 +208,7 @@ pub unsafe extern "C" fn qed_server_random_hex(num_bytes: u32) -> *mut LeanObj {
     if SystemRandom::new().fill(&mut raw).is_err() {
         return qed_lean_io_mk_err(c"CSPRNG failure".as_ptr());
     }
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = Vec::with_capacity(raw.len() * 2);
-    for b in raw {
-        out.push(HEX[(b >> 4) as usize]);
-        out.push(HEX[(b & 0x0F) as usize]);
-    }
-    qed_lean_io_mk_ok(qed_lean_mk_str_bytes(out.as_ptr(), out.len()))
+    qed_lean_io_mk_ok(mk_str(&encode_hex(&raw)))
 }
 
 #[no_mangle]
@@ -235,28 +229,23 @@ pub unsafe extern "C" fn qed_server_hmac_sha256_verify(
     qed_lean_io_mk_ok(qed_lean_box(ok))
 }
 
+fn parse_rsa_keypair(pem: &str) -> Option<RsaKeyPair> {
+    parse_pem_blocks(pem, "PRIVATE KEY")
+        .into_iter().next().and_then(|der| RsaKeyPair::from_pkcs8(&der).ok())
+        .or_else(|| parse_pem_blocks(pem, "RSA PRIVATE KEY")
+            .into_iter().next().and_then(|der| RsaKeyPair::from_der(&der).ok()))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_rsa_sha256_sign(pem_obj: *mut LeanObj, msg_obj: *mut LeanObj) -> *mut LeanObj {
-    let pem = str_slice(pem_obj);
-    let key_pair = parse_pem_blocks(pem, "PRIVATE KEY")
-        .into_iter()
-        .next()
-        .and_then(|der| RsaKeyPair::from_pkcs8(&der).ok())
-        .or_else(|| {
-            parse_pem_blocks(pem, "RSA PRIVATE KEY")
-                .into_iter()
-                .next()
-                .and_then(|der| RsaKeyPair::from_der(&der).ok())
-        });
-    let Some(key_pair) = key_pair else {
+    let Some(key_pair) = parse_rsa_keypair(str_slice(pem_obj)) else {
         return mk_io_except_err("failed to parse RSA private key PEM");
     };
     let rng = SystemRandom::new();
     let mut sig = vec![0u8; key_pair.public().modulus_len()];
-    match key_pair.sign(&RSA_PKCS1_SHA256, &rng, ba_slice(msg_obj), &mut sig) {
-        Ok(()) => mk_io_except_ok(mk_ba(&sig)),
-        Err(_) => mk_io_except_err("RSA-SHA256 signing failed"),
-    }
+    let res = key_pair.sign(&RSA_PKCS1_SHA256, &rng, ba_slice(msg_obj), &mut sig)
+        .map_err(|_| "RSA-SHA256 signing failed");
+    mk_io_except(res, |()| mk_ba(&sig))
 }
 
 #[no_mangle]
@@ -265,18 +254,7 @@ pub unsafe extern "C" fn qed_server_rsa_sha256_verify(
     msg_obj: *mut LeanObj,
     sig_obj: *mut LeanObj,
 ) -> *mut LeanObj {
-    let pem = str_slice(pem_obj);
-    let key_pair = parse_pem_blocks(pem, "PRIVATE KEY")
-        .into_iter()
-        .next()
-        .and_then(|der| RsaKeyPair::from_pkcs8(&der).ok())
-        .or_else(|| {
-            parse_pem_blocks(pem, "RSA PRIVATE KEY")
-                .into_iter()
-                .next()
-                .and_then(|der| RsaKeyPair::from_der(&der).ok())
-        });
-    let ok: usize = match key_pair {
+    let ok: usize = match parse_rsa_keypair(str_slice(pem_obj)) {
         Some(kp) => {
             let pk = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, kp.public_key().as_ref());
             if pk.verify(ba_slice(msg_obj), ba_slice(sig_obj)).is_ok() { 1 } else { 0 }
@@ -436,8 +414,5 @@ pub unsafe extern "C" fn qed_server_ec_p256_sign(
         Ok(k) => k,
         Err(_) => return mk_io_except_err("invalid P-256 PKCS#8 private key"),
     };
-    match kp.sign(&rng, ba_slice(msg_obj)) {
-        Ok(sig) => mk_io_except_ok(mk_ba(sig.as_ref())),
-        Err(_) => mk_io_except_err("ES256 signing failed"),
-    }
+    mk_io_except(kp.sign(&rng, ba_slice(msg_obj)).map_err(|_| "ES256 signing failed"), |sig| mk_ba(sig.as_ref()))
 }

@@ -762,6 +762,23 @@ fn send_nonblock(fd: libc::c_int, data: &[u8]) -> isize {
     unsafe { libc::send(fd, data.as_ptr() as *const libc::c_void, data.len(), SEND_FLAGS) }
 }
 
+fn send_drain(fd: libc::c_int, mut buf: &[u8]) -> Option<usize> {
+    let total = buf.len();
+    while !buf.is_empty() {
+        let n = send_nonblock(fd, buf);
+        if n > 0 { buf = &buf[n as usize..]; }
+        else if n < 0 {
+            let e = last_errno();
+            if e == libc::EINTR { continue; }
+            if is_wouldblock(e) { break; }
+            return None;
+        } else {
+            return None;
+        }
+    }
+    Some(total - buf.len())
+}
+
 fn send_two_nonblock(fd: libc::c_int, a: &[u8], b: &[u8]) -> isize {
     let iovs = [
         libc::iovec { iov_base: a.as_ptr() as *mut libc::c_void, iov_len: a.len() },
@@ -815,38 +832,16 @@ impl Conn {
         if data.is_empty() { return true; }
         let mut rem = data;
         if self.tx.is_empty() {
-            while !rem.is_empty() {
-                let n = send_nonblock(self.fd, rem);
-                if n > 0 {
-                    rem = &rem[n as usize..];
-                } else if n < 0 {
-                    let e = last_errno();
-                    if e == libc::EINTR { continue; }
-                    if is_wouldblock(e) { break; }
-                    return false;
-                } else {
-                    return false;
-                }
-            }
+            let Some(sent) = send_drain(self.fd, rem) else { return false };
+            rem = &rem[sent..];
             if rem.is_empty() { return true; }
         }
         self.buffer_tx(poller, rem, &[])
     }
 
     fn flush_tx(&mut self, poller: &Poller) -> bool {
-        while !self.tx.is_empty() {
-            let n = send_nonblock(self.fd, self.tx.as_slice());
-            if n > 0 {
-                self.tx.consume(n as usize);
-            } else if n < 0 {
-                let e = last_errno();
-                if e == libc::EINTR { continue; }
-                if is_wouldblock(e) { break; }
-                return false;
-            } else {
-                return false;
-            }
-        }
+        let Some(sent) = send_drain(self.fd, self.tx.as_slice()) else { return false };
+        if sent > 0 { self.tx.consume(sent); }
         if self.tx.is_empty() && self.tx_armed {
             poller.set_write(self.fd, self.token, false);
             self.tx_armed = false;
@@ -949,11 +944,20 @@ struct Worker {
 enum ConnStep { Continue, Done, Close }
 
 impl Conn {
+    fn close_step(&mut self, sent: bool) -> ConnStep {
+        self.close_after_tx = true;
+        if !sent || self.tx.is_empty() { ConnStep::Close } else { ConnStep::Done }
+    }
+
+    fn send_and_close(&mut self, poller: &Poller, data: &[u8]) -> ConnStep {
+        let sent = self.queue_bytes(poller, data);
+        self.close_step(sent)
+    }
+
     fn apply_body_outcome(&mut self, poller: &Poller, resp: Option<WireBytes>, keep_alive: bool) -> ConnStep {
         let sent = resp.as_ref().is_some_and(|w| self.queue_bytes(poller, w.as_slice()));
         if !sent || !keep_alive {
-            self.close_after_tx = true;
-            if !sent || self.tx.is_empty() { ConnStep::Close } else { ConnStep::Done }
+            self.close_step(sent)
         } else if self.ready_to_close() {
             ConnStep::Close
         } else if self.rx.is_empty() {
@@ -996,8 +1000,7 @@ impl Conn {
             }
             HeadOutcome::Defer | HeadOutcome::Fatal => {
                 if consume_head > 0 { self.rx.consume(consume_head); }
-                self.close_after_tx = true;
-                if self.tx.is_empty() { ConnStep::Close } else { ConnStep::Done }
+                self.close_step(true)
             }
         }
     }
@@ -1147,8 +1150,7 @@ impl Worker {
                     if let Some(f) = new_frag { conn.frag = Some(f); }
                     let sent = out_wire.as_ref().map_or(true, |w| conn.queue_bytes(poller, w.as_slice()));
                     if !sent || close {
-                        conn.close_after_tx = true;
-                        if !sent || conn.tx.is_empty() { ConnStep::Close } else { ConnStep::Done }
+                        conn.close_step(sent)
                     } else if conn.ready_to_close() {
                         ConnStep::Close
                     } else if !conn.rx.is_empty() && consumed > 0 {
@@ -1183,9 +1185,7 @@ impl Worker {
     fn reject_overloaded(&mut self, token: u64) {
         let close = self.conns.get_mut(&token).is_some_and(|conn| {
             conn.in_flight = false;
-            let sent = conn.queue_bytes(&self.poller, RESP_503_WIRE);
-            conn.close_after_tx = true;
-            !sent || conn.tx.is_empty()
+            conn.send_and_close(&self.poller, RESP_503_WIRE) == ConnStep::Close
         });
         if close { self.close_conn(token); }
     }
@@ -1269,10 +1269,9 @@ impl Worker {
                 if !is_health {
                     if let Err(retry_after) = rl.check(&conn.ip) {
                         let resp = format_429_wire(retry_after);
-                        let sent = conn.queue_bytes(&self.poller, resp.as_bytes());
-                        conn.close_after_tx = true;
-                        let close_now = !sent || conn.tx.is_empty();
-                        if close_now { self.close_conn(token); }
+                        if conn.send_and_close(&self.poller, resp.as_bytes()) == ConnStep::Close {
+                            self.close_conn(token);
+                        }
                         return;
                     }
                 }

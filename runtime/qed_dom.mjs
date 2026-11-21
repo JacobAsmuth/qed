@@ -132,6 +132,12 @@ const toNameSet = (namesList) => {
   return names;
 };
 
+const placeBefore = (p, c, ref) => {
+  if (!p || !c || ref === c) return;
+  if (c.parentNode === p && p.moveBefore) { try { p.moveBefore(c, ref); return; } catch (e) {} }
+  p.insertBefore(c, ref);
+};
+
 export const dom = {
   createElement(ns, tag, w) { const real = ns || (tag === 'svg' ? SVG_NS : ''); return ok(nodeId(real ? document.createElementNS(real, tag) : document.createElement(tag)), w); },
   // Children inherit SVG namespace inside `<svg>`, except `<foreignObject>` whose content is HTML.
@@ -197,19 +203,13 @@ export const dom = {
   removeChild(parent, index, w) { const p = Q().nodes[parent], old = p && p.childNodes[index]; if (old) { p.removeChild(old); dropNode(old); } return ok(PUnit, w); },
   replaceChild(parent, index, newChild, w) { const N = Q().nodes, p = N[parent], c = N[newChild], old = p && p.childNodes[index]; if (old && c) { p.replaceChild(c, old); if (old !== c) dropNode(old); } return ok(PUnit, w); },
   insertBefore(parent, index, child, w) {
-    const N = Q().nodes, p = N[parent], c = N[child];
-    if (!p || !c) return ok(PUnit, w);
-    const ref = p.childNodes[index] || null;
-    if (ref === c) return ok(PUnit, w);
-    if (c.parentNode === p && p.moveBefore) { try { p.moveBefore(c, ref); return ok(PUnit, w); } catch (e) {} }
-    p.insertBefore(c, ref);
+    const N = Q().nodes, p = N[parent];
+    if (p) placeBefore(p, N[child], p.childNodes[index] || null);
     return ok(PUnit, w);
   },
   insertBeforeRef(parent, ref, child, w) {
-    const N = Q().nodes, p = N[parent], c = N[child], r = ref ? N[ref] : null;
-    if (!p || !c || r === c) return ok(PUnit, w);
-    if (c.parentNode === p && p.moveBefore) { try { p.moveBefore(c, r); return ok(PUnit, w); } catch (e) {} }
-    p.insertBefore(c, r);
+    const N = Q().nodes;
+    placeBefore(N[parent], N[child], ref ? N[ref] : null);
     return ok(PUnit, w);
   },
   removeNode(parent, child, w) {
@@ -218,18 +218,9 @@ export const dom = {
     return ok(PUnit, w);
   },
   clearChildren(parent, w) {
-    const g = Q(), p = g.nodes[parent];
+    const p = Q().nodes[parent];
     if (p) {
-      const N = g.nodes, F = (g.free ||= []);
-      for (let c = p.firstChild; c; c = c.nextSibling) {
-        if (c.__qedTmpl) {
-          const id = c.__qedId;
-          if (id !== undefined && N[id] === c) { N[id] = null; c.__qedId = undefined; F.push(id); }
-          c.__qedSlots = undefined;
-        } else {
-          dropNode(c);
-        }
-      }
+      for (let c = p.firstChild; c; c = c.nextSibling) dropNode(c);
       p.textContent = '';
     }
     return ok(PUnit, w);

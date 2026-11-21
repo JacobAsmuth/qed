@@ -7,12 +7,12 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::lean_ffi::*;
-use crate::lock_unpoison;
+use crate::{HandleTable, lock_unpoison};
 
 pub const CHANGE_LEAN: u32 = 1;
 pub const CHANGE_CSS: u32 = 2;
@@ -31,8 +31,40 @@ fn classify_file_name(name: &str, is_runtime: bool) -> u32 {
     }
 }
 
-fn should_skip_dir(name: &str, skip: &HashSet<String>) -> bool {
-    skip.contains(name)
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn watch_roots(project_dir: &str, runtime_dir: &str, mut add: impl FnMut(&Path, bool)) {
+    for (dir, is_rt) in [(project_dir, false), (runtime_dir, true)] {
+        if !dir.is_empty() {
+            let p = PathBuf::from(dir);
+            if p.exists() { add(&p, is_rt); }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn walk_tree(
+    dir: &Path,
+    is_runtime: bool,
+    skip: &HashSet<String>,
+    mut visit: impl FnMut(&Path, Option<u32>) -> bool,
+) {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        if !visit(&cur, None) { continue; }
+        let Ok(entries) = std::fs::read_dir(&cur) else { continue };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let name_os = entry.file_name();
+            let name = name_os.to_string_lossy();
+            if ft.is_dir() {
+                if !is_runtime && skip.contains(name.as_ref()) { continue; }
+                stack.push(entry.path());
+            } else {
+                let fmask = classify_file_name(&name, is_runtime);
+                if fmask != 0 { let _ = visit(&entry.path(), Some(fmask)); }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -76,41 +108,31 @@ mod os_watch {
             if fd < 0 {
                 return Err(format!("inotify_init1 failed: {}", std::io::Error::last_os_error()));
             }
-            let mut w = Self {
-                fd,
-                skip,
-                wds: HashMap::new(),
-                paths: HashSet::new(),
-            };
-            if !project_dir.is_empty() {
-                let root = PathBuf::from(project_dir);
-                if root.exists() {
-                    let _ = w.add_tree(&root, false, false);
-                }
-            }
-            if !runtime_dir.is_empty() {
-                let rt = PathBuf::from(runtime_dir);
-                if rt.exists() {
-                    let _ = w.add_tree(&rt, true, false);
-                }
-            }
+            let mut w = Self { fd, skip, wds: HashMap::new(), paths: HashSet::new() };
+            watch_roots(project_dir, runtime_dir, |p, is_rt| { let _ = w.add_tree(p, is_rt, false); });
             Ok(w)
         }
 
-        fn add_single_dir(&mut self, dir: &Path, is_runtime: bool) -> Result<(), String> {
+        fn add_single_dir(
+            fd: i32,
+            wds: &mut HashMap<i32, (PathBuf, bool)>,
+            paths: &mut HashSet<PathBuf>,
+            dir: &Path,
+            is_runtime: bool,
+        ) -> Result<(), String> {
             let canonical = dir.to_path_buf();
-            if self.paths.contains(&canonical) {
+            if paths.contains(&canonical) {
                 return Ok(());
             }
             let Ok(cpath) = CString::new(dir.as_os_str().as_bytes()) else {
                 return Ok(());
             };
-            let wd = unsafe { libc::inotify_add_watch(self.fd, cpath.as_ptr(), WATCH_MASK) };
+            let wd = unsafe { libc::inotify_add_watch(fd, cpath.as_ptr(), WATCH_MASK) };
             if wd < 0 {
                 return Err(format!("inotify_add_watch({}) failed: {}", dir.display(), std::io::Error::last_os_error()));
             }
-            self.wds.insert(wd, (canonical.clone(), is_runtime));
-            self.paths.insert(canonical);
+            wds.insert(wd, (canonical.clone(), is_runtime));
+            paths.insert(canonical);
             Ok(())
         }
 
@@ -119,26 +141,11 @@ mod os_watch {
         /// returns a bitmask of matching files already present inside.
         fn add_tree(&mut self, dir: &Path, is_runtime: bool, report_existing: bool) -> u32 {
             let mut mask = 0u32;
-            let mut stack = vec![dir.to_path_buf()];
-            while let Some(cur) = stack.pop() {
-                if self.add_single_dir(&cur, is_runtime).is_err() {
-                    continue;
-                }
-                let Ok(entries) = std::fs::read_dir(&cur) else { continue };
-                for entry in entries.flatten() {
-                    let Ok(ft) = entry.file_type() else { continue };
-                    let name_os = entry.file_name();
-                    let name = name_os.to_string_lossy();
-                    if ft.is_dir() {
-                        if !is_runtime && should_skip_dir(&name, &self.skip) {
-                            continue;
-                        }
-                        stack.push(entry.path());
-                    } else if report_existing {
-                        mask |= classify_file_name(&name, is_runtime);
-                    }
-                }
-            }
+            let (fd, wds, paths, skip) = (self.fd, &mut self.wds, &mut self.paths, &self.skip);
+            walk_tree(dir, is_runtime, skip, |p, fmask| match fmask {
+                None => Self::add_single_dir(fd, wds, paths, p, is_runtime).is_ok(),
+                Some(m) => { if report_existing { mask |= m; } true }
+            });
             mask
         }
 
@@ -183,7 +190,7 @@ mod os_watch {
                     if (ev.mask & libc::IN_ISDIR) != 0 {
                         if (ev.mask & (libc::IN_CREATE | libc::IN_MOVED_TO)) != 0
                             && !name.is_empty()
-                            && (is_runtime || !should_skip_dir(&name, &self.skip))
+                            && (is_runtime || !self.skip.contains(&name))
                         {
                             let sub = parent_dir.join(&name);
                             mask |= self.add_tree(&sub, is_runtime, true);
@@ -290,29 +297,21 @@ mod os_watch {
             if kq < 0 {
                 return Err(format!("kqueue failed: {}", std::io::Error::last_os_error()));
             }
-            let mut w = Self {
-                kq,
-                skip,
-                entries: HashMap::new(),
-                paths: HashSet::new(),
-            };
-            if !project_dir.is_empty() {
-                let root = PathBuf::from(project_dir);
-                if root.exists() {
-                    let _ = w.add_tree(&root, false, false);
-                }
-            }
-            if !runtime_dir.is_empty() {
-                let rt = PathBuf::from(runtime_dir);
-                if rt.exists() {
-                    let _ = w.add_tree(&rt, true, false);
-                }
-            }
+            let mut w = Self { kq, skip, entries: HashMap::new(), paths: HashSet::new() };
+            watch_roots(project_dir, runtime_dir, |p, is_rt| { let _ = w.add_tree(p, is_rt, false); });
             Ok(w)
         }
 
-        fn register_path(&mut self, path: &Path, is_dir: bool, is_runtime: bool, file_mask: u32) -> bool {
-            if self.entries.len() >= MAX_KQ_FDS || self.paths.contains(path) {
+        fn register_path_raw(
+            kq: i32,
+            entries: &mut HashMap<i32, WatchedEntry>,
+            paths: &mut HashSet<PathBuf>,
+            path: &Path,
+            is_dir: bool,
+            is_runtime: bool,
+            file_mask: u32,
+        ) -> bool {
+            if entries.len() >= MAX_KQ_FDS || paths.contains(path) {
                 return false;
             }
             let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
@@ -331,42 +330,34 @@ mod os_watch {
                 udata: std::ptr::null_mut(),
             };
             let rc = unsafe {
-                libc::kevent(self.kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null())
+                libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null())
             };
             if rc < 0 {
                 unsafe { libc::close(fd); }
                 return false;
             }
             let pb = path.to_path_buf();
-            self.paths.insert(pb.clone());
-            self.entries.insert(fd, WatchedEntry { path: pb, is_dir, is_runtime, file_mask });
+            paths.insert(pb.clone());
+            entries.insert(fd, WatchedEntry { path: pb, is_dir, is_runtime, file_mask });
             true
+        }
+
+        fn register_path(&mut self, path: &Path, is_dir: bool, is_runtime: bool, file_mask: u32) -> bool {
+            Self::register_path_raw(self.kq, &mut self.entries, &mut self.paths, path, is_dir, is_runtime, file_mask)
         }
 
         fn add_tree(&mut self, dir: &Path, is_runtime: bool, report_new: bool) -> u32 {
             let mut mask = 0u32;
-            let mut stack = vec![dir.to_path_buf()];
-            while let Some(cur) = stack.pop() {
-                self.register_path(&cur, true, is_runtime, 0);
-                let Ok(rd) = std::fs::read_dir(&cur) else { continue };
-                for entry in rd.flatten() {
-                    let Ok(ft) = entry.file_type() else { continue };
-                    let name_os = entry.file_name();
-                    let name = name_os.to_string_lossy();
-                    let p = entry.path();
-                    if ft.is_dir() {
-                        if !is_runtime && should_skip_dir(&name, &self.skip) {
-                            continue;
-                        }
-                        stack.push(p);
-                    } else {
-                        let fmask = classify_file_name(&name, is_runtime);
-                        if fmask != 0 && self.register_path(&p, false, is_runtime, fmask) && report_new {
-                            mask |= fmask;
-                        }
+            let (kq, entries, paths, skip) = (self.kq, &mut self.entries, &mut self.paths, &self.skip);
+            walk_tree(dir, is_runtime, skip, |p, fmask| match fmask {
+                None => { Self::register_path_raw(kq, entries, paths, p, true, is_runtime, 0); true }
+                Some(m) => {
+                    if Self::register_path_raw(kq, entries, paths, p, false, is_runtime, m) && report_new {
+                        mask |= m;
                     }
+                    true
                 }
-            }
+            });
             mask
         }
 
@@ -450,12 +441,7 @@ mod os_watch {
     }
 }
 
-static NEXT_WATCH_ID: AtomicU64 = AtomicU64::new(1);
-static WATCHERS: OnceLock<Mutex<HashMap<u64, Arc<Mutex<os_watch::OsWatcher>>>>> = OnceLock::new();
-
-fn watcher_map() -> &'static Mutex<HashMap<u64, Arc<Mutex<os_watch::OsWatcher>>>> {
-    WATCHERS.get_or_init(|| Mutex::new(HashMap::new()))
-}
+static WATCHERS: HandleTable<Arc<Mutex<os_watch::OsWatcher>>> = HandleTable::new();
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_watch_open(
@@ -471,32 +457,20 @@ pub unsafe extern "C" fn qed_watch_open(
         let elem = qed_lean_array_uget(skip_dirs, i);
         skip.insert(str_slice(elem).to_owned());
     }
-    match os_watch::OsWatcher::open(&proj, &rt, skip) {
-        Ok(w) => {
-            let id = NEXT_WATCH_ID.fetch_add(1, Ordering::Relaxed);
-            lock_unpoison(watcher_map()).insert(id, Arc::new(Mutex::new(w)));
-            mk_io_except_ok(qed_lean_box_u64(id))
-        }
-        Err(msg) => mk_io_except_err(&msg),
-    }
+    mk_io_except(os_watch::OsWatcher::open(&proj, &rt, skip), |w| {
+        qed_lean_box_u64(WATCHERS.insert(Arc::new(Mutex::new(w))))
+    })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_watch_wait(handle: u64, timeout_ms: u32) -> *mut LeanObj {
-    let watcher = {
-        let map = lock_unpoison(watcher_map());
-        map.get(&handle).cloned()
-    };
-    let mask = match watcher {
-        Some(w) => lock_unpoison(&w).wait(timeout_ms),
-        None => CHANGE_ERROR,
-    };
+    let mask = WATCHERS.get(handle).map_or(CHANGE_ERROR, |w| lock_unpoison(&w).wait(timeout_ms));
     qed_lean_io_mk_ok(qed_lean_box_u32(mask))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_watch_close(handle: u64) -> *mut LeanObj {
-    lock_unpoison(watcher_map()).remove(&handle);
+    WATCHERS.remove(handle);
     qed_lean_io_mk_ok(qed_lean_box(0))
 }
 
@@ -588,12 +562,7 @@ fn handle_sse_connection(mut stream: TcpStream, hub: &Arc<SseHub>) {
     }
 }
 
-static NEXT_SSE_ID: AtomicU64 = AtomicU64::new(1);
-static SSE_HUBS: OnceLock<Mutex<HashMap<u64, Arc<SseHub>>>> = OnceLock::new();
-
-fn sse_map() -> &'static Mutex<HashMap<u64, Arc<SseHub>>> {
-    SSE_HUBS.get_or_init(|| Mutex::new(HashMap::new()))
-}
+static SSE_HUBS: HandleTable<Arc<SseHub>> = HandleTable::new();
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_dev_sse_start(port: u16) -> *mut LeanObj {
@@ -636,8 +605,7 @@ pub unsafe extern "C" fn qed_dev_sse_start(port: u16) -> *mut LeanObj {
         lock_unpoison(&hub_bg.clients).clear();
     });
 
-    let id = NEXT_SSE_ID.fetch_add(1, Ordering::Relaxed);
-    lock_unpoison(sse_map()).insert(id, hub);
+    let id = SSE_HUBS.insert(hub);
     let pair = qed_lean_mk_prod(qed_lean_box_u64(id), qed_lean_box(actual_port as usize));
     mk_io_except_ok(pair)
 }
@@ -645,8 +613,7 @@ pub unsafe extern "C" fn qed_dev_sse_start(port: u16) -> *mut LeanObj {
 #[no_mangle]
 pub unsafe extern "C" fn qed_dev_sse_publish(handle: u64, payload: *mut LeanObj) -> *mut LeanObj {
     let msg = str_slice(payload).to_owned();
-    let hub = lock_unpoison(sse_map()).get(&handle).cloned();
-    if let Some(h) = hub {
+    if let Some(h) = SSE_HUBS.get(handle) {
         h.publish(&msg);
     }
     qed_lean_io_mk_ok(qed_lean_box(0))
@@ -654,7 +621,7 @@ pub unsafe extern "C" fn qed_dev_sse_publish(handle: u64, payload: *mut LeanObj)
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_dev_sse_stop(handle: u64) -> *mut LeanObj {
-    if let Some(hub) = lock_unpoison(sse_map()).remove(&handle) {
+    if let Some(hub) = SSE_HUBS.remove(handle) {
         hub.closed.store(true, Ordering::Relaxed);
         lock_unpoison(&hub.clients).clear();
     }

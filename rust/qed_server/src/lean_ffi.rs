@@ -81,6 +81,17 @@ pub unsafe fn mk_io_except_ok(val: *mut LeanObj) -> *mut LeanObj {
     qed_lean_io_mk_ok(qed_lean_mk_except_ok(val))
 }
 
+#[inline]
+pub unsafe fn mk_io_except<T, E: AsRef<str>>(
+    res: Result<T, E>,
+    to_obj: impl FnOnce(T) -> *mut LeanObj,
+) -> *mut LeanObj {
+    match res {
+        Ok(v) => mk_io_except_ok(to_obj(v)),
+        Err(e) => mk_io_except_err(e.as_ref()),
+    }
+}
+
 /// Owned reference to a `lean_object*` (decrefs on drop).
 pub struct LeanRef(pub *mut LeanObj);
 unsafe impl Send for LeanRef {}

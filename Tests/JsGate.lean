@@ -262,17 +262,4 @@ def probeCount : Nat := 16
 def names : Array String := #["render", "diff", "arith", "string", "json", "date", "array", "router", "seg",
   "childPatch", "wideRender", "keyIndex", "proto", "style", "wsMux", "codegenStress"]
 
-def jsonStr (s : String) : String :=
-  "\"" ++ (s.foldl (init := "") fun acc c =>
-    acc ++ (match c with
-      | '"' => "\\\"" | '\\' => "\\\\" | '\n' => "\\n" | '\t' => "\\t" | '\r' => "\\r"
-      | c => if c.toNat < 32 then "" else toString c)) ++ "\""
-
-def emitOracle : IO Unit := do
-  let mut out : Array String := #[]
-  for p in [0:probeCount] do
-    for i in [0:counts p] do
-      out := out.push s!"{p}\t{i}\t{jsonStr (run p i)}"
-  IO.print (String.intercalate "\n" out.toList)
-
 end JsGate

@@ -23,7 +23,6 @@
   // ---- DevTools State & Time-Travel History ----
   const MAX_HISTORY = 200;
   let drawerOpen = false;
-  let activeTab = 'state';
   let stateFilter = '';
   let restoreFn = typeof window.__qedDevRestore === 'function' ? window.__qedDevRestore : null;
   let history = [];
@@ -489,10 +488,14 @@
       .join('\n');
   }
 
-  function renderActionsPane() {
-    tabCountEl.textContent = String(history.length);
+  function updateBadge() {
     pillBadgeEl.textContent = timeTravelActive ? `TT #${activeSnapIdx}` : String(history.length);
     pillBadgeEl.className = timeTravelActive ? 'pill-badge tt' : 'pill-badge';
+  }
+
+  function renderActionsPane() {
+    tabCountEl.textContent = String(history.length);
+    updateBadge();
 
     if (timeTravelActive && activeSnapIdx >= 0 && activeSnapIdx < history.length) {
       ttLabelEl.textContent = `Time-travel: snapshot #${activeSnapIdx} of #${history.length - 1}`;
@@ -538,8 +541,7 @@
       renderStatePane();
       renderActionsPane();
     } else {
-      pillBadgeEl.textContent = timeTravelActive ? `TT #${activeSnapIdx}` : String(history.length);
-      pillBadgeEl.className = timeTravelActive ? 'pill-badge tt' : 'pill-badge';
+      updateBadge();
     }
   }
 
@@ -571,11 +573,22 @@
   }
 
   function setTab(name) {
-    activeTab = name;
     tabStateBtn.classList.toggle('active', name === 'state');
     tabActionsBtn.classList.toggle('active', name === 'actions');
     paneStateEl.classList.toggle('active', name === 'state');
     paneActionsEl.classList.toggle('active', name === 'actions');
+    renderDevTools();
+  }
+
+  function pushHistory(entry) {
+    history.push(entry);
+    if (history.length > MAX_HISTORY) {
+      history.shift();
+      if (pendingPredictIdx >= 0) pendingPredictIdx--;
+    }
+    if (entry.predict === 'pending') pendingPredictIdx = history.length - 1;
+    activeSnapIdx = history.length - 1;
+    timeTravelActive = false;
     renderDevTools();
   }
 
@@ -585,19 +598,15 @@
     if (typeof detail.restoreState === 'function') restoreFn = detail.restoreState;
     if (kind === 'mount') {
       if (detail.isTimeTravel) return;
-      const entry = {
+      const state = detail.state || '';
+      pushHistory({
         label: history.length === 0 ? 'init' : 'hmr mount',
-        state: detail.state || '',
+        state,
         locals: detail.locals || '',
-        diff: history.length === 0 ? 'initial state' : summarizeDiff(history[history.length - 1].state, detail.state || ''),
+        diff: history.length === 0 ? 'initial state' : summarizeDiff(history[history.length - 1].state, state),
         predict: null,
         ts: detail.ts || Date.now(),
-      };
-      history.push(entry);
-      if (history.length > MAX_HISTORY) history.shift();
-      activeSnapIdx = history.length - 1;
-      timeTravelActive = false;
-      renderDevTools();
+      });
       return;
     }
     if (kind === 'action') {
@@ -609,30 +618,13 @@
       if ((detail.kind === 'dispatch' || detail.kind === 'dispatchStr') && inFlightNow > prevInFlightHttp && prev && prev.state !== nextState) {
         predict = 'pending';
       } else if ((detail.kind === 'http' || detail.kind === 'httpBytes') && pendingPredictIdx >= 0 && pendingPredictIdx < history.length) {
-        const predictedState = history[pendingPredictIdx].state;
-        const hit = nextState === predictedState;
+        const hit = nextState === history[pendingPredictIdx].state;
         history[pendingPredictIdx].predict = hit ? 'hit' : 'rollback';
         predict = hit ? 'hit' : 'rollback';
         pendingPredictIdx = -1;
       }
       prevInFlightHttp = inFlightNow;
-      const entry = {
-        label: actionLabel(detail),
-        state: nextState,
-        locals: detail.locals || '',
-        diff,
-        predict,
-        ts: detail.ts || Date.now(),
-      };
-      history.push(entry);
-      if (history.length > MAX_HISTORY) {
-        history.shift();
-        if (pendingPredictIdx >= 0) pendingPredictIdx--;
-      }
-      if (predict === 'pending') pendingPredictIdx = history.length - 1;
-      activeSnapIdx = history.length - 1;
-      timeTravelActive = false;
-      renderDevTools();
+      pushHistory({ label: actionLabel(detail), state: nextState, locals: detail.locals || '', diff, predict, ts: detail.ts || Date.now() });
     }
   };
 
@@ -641,9 +633,7 @@
     try {
       const st = window.qed.dehydrate() || '';
       const loc = typeof window.qed.snapshot === 'function' ? window.qed.snapshot() || '' : '';
-      history.push({ label: 'init', state: st, locals: loc, diff: 'initial state', predict: null, ts: Date.now() });
-      activeSnapIdx = 0;
-      renderDevTools();
+      pushHistory({ label: 'init', state: st, locals: loc, diff: 'initial state', predict: null, ts: Date.now() });
     } catch (_) {}
   }
 

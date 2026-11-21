@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -8,7 +7,7 @@ use rusqlite::types::{Value, ValueRef};
 use rusqlite::{params_from_iter, Connection, OpenFlags};
 
 use crate::lean_ffi::*;
-use crate::lock_unpoison;
+use crate::{encode_hex, HandleTable, lock_unpoison};
 
 const MAX_READERS_PER_DB: usize = 16;
 
@@ -60,46 +59,29 @@ impl SqliteDbPool {
     }
 }
 
-struct WriterGuard<'a> {
+struct ConnGuard<'a> {
     pool: &'a SqliteDbPool,
     conn: Option<Connection>,
+    is_writer: bool,
 }
 
-impl<'a> WriterGuard<'a> {
-    fn acquire(pool: &'a SqliteDbPool) -> Self {
-        Self { pool, conn: Some(pool.checkout_writer()) }
+impl<'a> ConnGuard<'a> {
+    fn writer(pool: &'a SqliteDbPool) -> Self {
+        Self { pool, conn: Some(pool.checkout_writer()), is_writer: true }
+    }
+    fn reader(pool: &'a SqliteDbPool) -> Result<Self, String> {
+        Ok(Self { pool, conn: Some(pool.checkout_reader()?), is_writer: false })
     }
     fn conn_mut(&mut self) -> &mut Connection {
-        self.conn.as_mut().expect("writer checked out")
+        self.conn.as_mut().expect("connection checked out")
     }
 }
 
-impl<'a> Drop for WriterGuard<'a> {
+impl Drop for ConnGuard<'_> {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
-            self.pool.return_writer(conn);
-        }
-    }
-}
-
-struct ReaderGuard<'a> {
-    pool: &'a SqliteDbPool,
-    conn: Option<Connection>,
-}
-
-impl<'a> ReaderGuard<'a> {
-    fn acquire(pool: &'a SqliteDbPool) -> Result<Self, String> {
-        Ok(Self { pool, conn: Some(pool.checkout_reader()?) })
-    }
-    fn conn_mut(&mut self) -> &mut Connection {
-        self.conn.as_mut().expect("reader checked out")
-    }
-}
-
-impl<'a> Drop for ReaderGuard<'a> {
-    fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            self.pool.return_reader(conn);
+            if self.is_writer { self.pool.return_writer(conn); }
+            else { self.pool.return_reader(conn); }
         }
     }
 }
@@ -119,12 +101,7 @@ impl Drop for ActiveSqliteTx {
 }
 
 static SQLITE_POOL: OnceLock<Mutex<HashMap<String, Arc<SqliteDbPool>>>> = OnceLock::new();
-static ACTIVE_TXS: OnceLock<Mutex<HashMap<u64, Arc<Mutex<ActiveSqliteTx>>>>> = OnceLock::new();
-static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
-
-fn active_txs() -> &'static Mutex<HashMap<u64, Arc<Mutex<ActiveSqliteTx>>>> {
-    ACTIVE_TXS.get_or_init(|| Mutex::new(HashMap::new()))
-}
+static ACTIVE_TXS: HandleTable<Arc<Mutex<ActiveSqliteTx>>> = HandleTable::new();
 
 fn is_memory_path(path: &str) -> bool {
     path == ":memory:" || path.is_empty() || path.contains("mode=memory") || path.starts_with("file::memory:")
@@ -211,16 +188,6 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
         i += 2;
     }
     Ok(out)
-}
-
-fn encode_hex(bs: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bs.len() * 2);
-    for &b in bs {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0F) as usize] as char);
-    }
-    out
 }
 
 fn push_json_str(out: &mut String, s: &str) {
@@ -449,19 +416,14 @@ pub unsafe extern "C" fn qed_server_sqlite_exec(
         let mut cur = JsonCursor::new(params_json);
         let params = cur.parse_params_array()?;
         let db = open_db_pool(path)?;
-        if !db.is_memory && is_readonly_select(sql) {
-            let mut reader = ReaderGuard::acquire(&db)?;
-            exec_on_conn(reader.conn_mut(), sql, &params)
+        let mut guard = if !db.is_memory && is_readonly_select(sql) {
+            ConnGuard::reader(&db)?
         } else {
-            let mut writer = WriterGuard::acquire(&db);
-            exec_on_conn(writer.conn_mut(), sql, &params)
-        }
+            ConnGuard::writer(&db)
+        };
+        exec_on_conn(guard.conn_mut(), sql, &params)
     })();
-
-    match res {
-        Ok(json) => mk_io_except_ok(mk_str(&json)),
-        Err(e) => mk_io_except_err(&e),
-    }
+    mk_io_except(res, |json| mk_str(&json))
 }
 
 #[no_mangle]
@@ -473,16 +435,13 @@ pub unsafe extern "C" fn qed_server_sqlite_ddl(
     let ddl = str_slice(ddl_obj);
     let res: Result<(), String> = (|| {
         let db = open_db_pool(path)?;
-        let mut writer = WriterGuard::acquire(&db);
+        let mut writer = ConnGuard::writer(&db);
         let r = writer.conn_mut().execute_batch(ddl).map_err(|e| format!("sqlite ddl failed: {e}"));
         // Drop cached read-only connections so schema changes are immediately visible cleanly.
         lock_unpoison(&db.readers).clear();
         r
     })();
-    match res {
-        Ok(()) => mk_io_except_ok(qed_lean_box(0)),
-        Err(e) => mk_io_except_err(&e),
-    }
+    mk_io_except(res, |()| qed_lean_box(0))
 }
 
 #[no_mangle]
@@ -495,15 +454,9 @@ pub unsafe extern "C" fn qed_server_sqlite_tx_begin(path_obj: *mut LeanObj) -> *
             db.return_writer(conn);
             return Err(format!("sqlite BEGIN failed: {e}"));
         }
-        let tx_id = NEXT_TX_ID.fetch_add(1, Ordering::Relaxed).max(1);
-        let tx = Arc::new(Mutex::new(ActiveSqliteTx { pool: db, conn: Some(conn) }));
-        lock_unpoison(active_txs()).insert(tx_id, tx);
-        Ok(tx_id)
+        Ok(ACTIVE_TXS.insert(Arc::new(Mutex::new(ActiveSqliteTx { pool: db, conn: Some(conn) }))))
     })();
-    match res {
-        Ok(tx_id) => mk_io_except_ok(qed_lean_box_u64(tx_id)),
-        Err(e) => mk_io_except_err(&e),
-    }
+    mk_io_except(res, |tx_id| qed_lean_box_u64(tx_id))
 }
 
 #[no_mangle]
@@ -517,25 +470,19 @@ pub unsafe extern "C" fn qed_server_sqlite_tx_exec(
     let res: Result<String, String> = (|| {
         let mut cur = JsonCursor::new(params_json);
         let params = cur.parse_params_array()?;
-        let tx_arc = lock_unpoison(active_txs())
-            .get(&tx_id)
-            .cloned()
+        let tx_arc = ACTIVE_TXS.get(tx_id)
             .ok_or_else(|| format!("invalid sqlite transaction handle {tx_id}"))?;
         let tx = lock_unpoison(&tx_arc);
         let conn = tx.conn.as_ref().ok_or_else(|| "sqlite transaction already finished".to_owned())?;
         exec_on_conn(conn, sql, &params)
     })();
-    match res {
-        Ok(json) => mk_io_except_ok(mk_str(&json)),
-        Err(e) => mk_io_except_err(&e),
-    }
+    mk_io_except(res, |json| mk_str(&json))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_sqlite_tx_commit(tx_id: u64) -> *mut LeanObj {
     let res: Result<(), String> = (|| {
-        let tx_arc = lock_unpoison(active_txs())
-            .remove(&tx_id)
+        let tx_arc = ACTIVE_TXS.remove(tx_id)
             .ok_or_else(|| format!("invalid sqlite transaction handle {tx_id}"))?;
         let mut tx = lock_unpoison(&tx_arc);
         let Some(conn) = tx.conn.take() else {
@@ -548,15 +495,12 @@ pub unsafe extern "C" fn qed_server_sqlite_tx_commit(tx_id: u64) -> *mut LeanObj
         tx.pool.return_writer(conn);
         r
     })();
-    match res {
-        Ok(()) => mk_io_except_ok(qed_lean_box(0)),
-        Err(e) => mk_io_except_err(&e),
-    }
+    mk_io_except(res, |()| qed_lean_box(0))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_sqlite_tx_rollback(tx_id: u64) -> *mut LeanObj {
-    if let Some(tx_arc) = lock_unpoison(active_txs()).remove(&tx_id) {
+    if let Some(tx_arc) = ACTIVE_TXS.remove(tx_id) {
         let mut tx = lock_unpoison(&tx_arc);
         if let Some(conn) = tx.conn.take() {
             let _ = conn.execute_batch("ROLLBACK;");

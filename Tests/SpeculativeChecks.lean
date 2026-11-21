@@ -532,4 +532,9 @@ example := @CheckoutSpec.specApp_preserves_wellFormedIds
 example := @CatalogSpec.specApp_init_inv
 example := @CatalogSpec.specApp_preserves_inv
 
+fullstack SpecMain:
+  server StoreSrv
+  client CheckoutSpec
+  title "Speculative Check"
+
 end SpeculativeChecks

@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
 mod crypto;
 mod gzip;
 mod lean_ffi;
@@ -14,8 +18,44 @@ pub(crate) fn is_wouldblock(e: i32) -> bool {
     e == libc::EAGAIN || e == libc::EWOULDBLOCK
 }
 
-pub(crate) fn lock_unpoison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock_unpoison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub(crate) struct HandleTable<T> {
+    next: AtomicU64,
+    map: OnceLock<Mutex<HashMap<u64, T>>>,
+}
+
+impl<T> HandleTable<T> {
+    pub(crate) const fn new() -> Self {
+        Self { next: AtomicU64::new(1), map: OnceLock::new() }
+    }
+    fn lock(&self) -> MutexGuard<'_, HashMap<u64, T>> {
+        lock_unpoison(self.map.get_or_init(|| Mutex::new(HashMap::new())))
+    }
+    pub(crate) fn insert(&self, val: T) -> u64 {
+        let id = self.next.fetch_add(1, Ordering::Relaxed).max(1);
+        self.lock().insert(id, val);
+        id
+    }
+    pub(crate) fn insert_at(&self, id: u64, val: T) { self.lock().insert(id, val); }
+    pub(crate) fn remove(&self, id: u64) -> Option<T> { self.lock().remove(&id) }
+    pub(crate) fn with<R>(&self, id: u64, f: impl FnOnce(&T) -> R) -> Option<R> { self.lock().get(&id).map(f) }
+}
+
+impl<T: Clone> HandleTable<T> {
+    pub(crate) fn get(&self, id: u64) -> Option<T> { self.lock().get(&id).cloned() }
+}
+
+pub(crate) fn encode_hex(bs: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bs.len() * 2);
+    for &b in bs {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    out
 }
 
 pub(crate) fn decode_b64_pem_body(body: &str) -> Option<Vec<u8>> {

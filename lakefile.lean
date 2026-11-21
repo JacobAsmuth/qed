@@ -14,6 +14,7 @@ extern_lib libqed_server pkg := do
     ← inputTextFile (crateDir / "src" / "lib.rs"),
     ← inputTextFile (crateDir / "src" / "lean_ffi.rs"),
     ← inputTextFile (crateDir / "src" / "crypto.rs"),
+    ← inputTextFile (crateDir / "src" / "gzip.rs"),
     ← inputTextFile (crateDir / "src" / "outbound.rs"),
     ← inputTextFile (crateDir / "src" / "server.rs"),
     ← inputTextFile (crateDir / "src" / "sqlite.rs")

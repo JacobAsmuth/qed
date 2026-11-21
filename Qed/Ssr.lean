@@ -51,6 +51,45 @@ theorem safeScriptSrc_no_markup_or_quote (script : String) :
     intro c hc
     simpa using hconst c hc
 
+def safeCanonicalHref (url : String) : Option String :=
+  if isSafeUrl url then some (escapeHtml url) else none
+
+/-- Any canonical `<link rel="canonical" href="...">` URL emitted during SSR passes `isSafeUrl`
+    and is unconditionally free of `<`, `>`, `"`, and `'`. -/
+theorem safeCanonicalHref_no_markup_or_quote (url out : String)
+    (h : safeCanonicalHref url = some out) :
+    isSafeUrl url = true ∧ ∀ c ∈ out.toList, isMarkupOrQuote c = false := by
+  unfold safeCanonicalHref at h
+  by_cases hs : isSafeUrl url = true
+  · simp only [hs, ↓reduceIte, Option.some.injEq] at h
+    subst h
+    exact ⟨hs, escapeHtml_no_markup_or_quote url⟩
+  · simp [hs] at h
+
+/-- Escaped `<meta name="..." content="...">` tag with both attribute payloads guaranteed markup-free. -/
+def renderMetaTag (name content : String) : String :=
+  "<meta name=\"" ++ escapeHtml name ++ "\" content=\"" ++ escapeHtml content ++ "\">"
+
+def renderMetaTags : List (String × String) → String
+  | [] => ""
+  | (k, v) :: rest => renderMetaTag k v ++ renderMetaTags rest
+
+def renderHeadMeta (hm : HeadMeta) : String :=
+  let descTag := match hm.description with
+    | some d => renderMetaTag "description" d
+    | none   => ""
+  let extraTags := renderMetaTags hm.metaTags
+  let canonTag := match hm.canonical.bind safeCanonicalHref with
+    | some u => "<link rel=\"canonical\" href=\"" ++ u ++ "\">"
+    | none   => ""
+  descTag ++ extraTags ++ canonTag
+
+theorem renderHeadMeta_empty : renderHeadMeta {} = "" := rfl
+
+theorem escapeHeadMetaValue_no_markup_or_quote (s : String) :
+    ∀ c ∈ (escapeHtml s).toList, isMarkupOrQuote c = false :=
+  escapeHtml_no_markup_or_quote s
+
 def renderStylesheetLinks : List String → String
   | [] => ""
   | s :: rest =>
@@ -58,14 +97,17 @@ def renderStylesheetLinks : List String → String
       tag ++ renderStylesheetLinks rest
 
 def renderDocument (title : String) (appHtml : String) (script : String := "/qed.js")
-    (state : String := "") (css : String := "") (stylesheets : List String := []) : String :=
+    (state : String := "") (css : String := "") (stylesheets : List String := [])
+    (headMeta : HeadMeta := {}) : String :=
   -- Escape `</` → `<\/` (valid JSON/CSS) so embedded payloads cannot close `<script>`/`<style>` early.
+  let effTitle := headMeta.title.getD title
+  let metaTags := renderHeadMeta headMeta
   let linkTags := renderStylesheetLinks stylesheets
   let styleTag := if css.isEmpty || appHtml.contains css then ""
                   else "<style id=\"qed-styles\">" ++ escapeRawText css ++ "</style>"
   "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
     ++ "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-    ++ "<title>" ++ escapeHtml title ++ "</title>" ++ linkTags ++ styleTag ++ "</head>\n"
+    ++ "<title>" ++ escapeHtml effTitle ++ "</title>" ++ metaTags ++ linkTags ++ styleTag ++ "</head>\n"
     ++ "<body><div id=\"app\">" ++ appHtml ++ "</div>\n"
     ++ (if state.isEmpty then ""
         else "<script id=\"qed-state\" type=\"application/json\">" ++ escapeRawText state ++ "</script>\n")
@@ -73,8 +115,9 @@ def renderDocument (title : String) (appHtml : String) (script : String := "/qed
 
 /-- Render a complete SSR HTML5 document directly into a UTF-8 `ByteArray` for zero-copy native serving. -/
 def renderDocumentBytes (title : String) (appHtml : String) (script : String := "/qed_host.mjs")
-    (state : String := "") (css : String := "") (stylesheets : List String := []) : ByteArray :=
-  (renderDocument title appHtml script state css stylesheets).toUTF8
+    (state : String := "") (css : String := "") (stylesheets : List String := [])
+    (headMeta : HeadMeta := {}) : ByteArray :=
+  (renderDocument title appHtml script state css stylesheets headMeta).toUTF8
 
 private structure SsrNeed where
   method : String
@@ -143,7 +186,8 @@ def App.ssrStep (app : App Model Msg) (path title script resultsJson : String) :
   if needs.isEmpty then
     Json.render (.obj [("html",
       .str (renderDocument title (app.renderModel m) script
-        (state := app.dehydrate m) (css := renderStyleSheet app.styles) (stylesheets := app.stylesheets)))])
+        (state := app.dehydrate m) (css := renderStyleSheet app.styles)
+        (stylesheets := app.stylesheets) (headMeta := app.headFor m)))])
   else
     Json.render (.obj [("need", .arr (needs.toList.map fun n =>
       let base := [("method", .str n.method), ("url", .str n.url), ("body", .str n.body)]
@@ -237,6 +281,30 @@ def App.ssrRenderNativeBytesWithShell {Model Msg : Type} {m : Type → Type} [Mo
   let mdl ← app.ssrBootM path dispatchBytes dispatchText fuel sessionUser
   return sh.renderBytes (app.renderModel mdl) (app.dehydrate mdl)
 
+/-- Native SSR renderer returning `(httpStatus, headMeta, htmlBytes)`. Uses the prebuilt shell
+    on the fast path when `app.headFor mdl == {}`, and renders escaped per-route `<head>` tags
+    otherwise. -/
+@[specialize]
+def App.ssrRenderNativeWithStatus {Model Msg : Type} {m : Type → Type} [Monad m]
+    (app : App Model Msg) (sh : PrebuiltDocShell) (defaultTitle script path : String)
+    (dispatchBytes : String → String → ByteArray → m (Except String ByteArray))
+    (dispatchText  : String → String → String → m (Except String String) :=
+      fun _ _ _ => pure (.error "no external JSON handler registered for SSR"))
+    (fuel : Nat := 32) (sessionUser : Option String := none) : m (Nat × HeadMeta × ByteArray) := do
+  let mdl ← app.ssrBootM path dispatchBytes dispatchText fuel sessionUser
+  let hm := app.headFor mdl
+  let rawStatus := app.ssrStatus mdl
+  let status := if 100 ≤ rawStatus && rawStatus ≤ 599 then rawStatus else 200
+  let appHtml := app.renderModel mdl
+  let state := app.dehydrate mdl
+  let htmlBytes :=
+    if hm == {} then
+      sh.renderBytes appHtml state
+    else
+      renderDocumentBytes defaultTitle appHtml script (state := state)
+        (css := sh.css) (stylesheets := app.stylesheets) (headMeta := hm)
+  return (status, hm, htmlBytes)
+
 @[specialize]
 def App.ssrRenderNativeBytes {Model Msg : Type} {m : Type → Type} [Monad m]
     (app : App Model Msg) (path title : String)
@@ -247,7 +315,8 @@ def App.ssrRenderNativeBytes {Model Msg : Type} {m : Type → Type} [Monad m]
     (sessionUser : Option String := none) : m ByteArray := do
   let mdl ← app.ssrBootM path dispatchBytes dispatchText fuel sessionUser
   return renderDocumentBytes title (app.renderModel mdl) script
-    (state := app.dehydrate mdl) (css := renderStyleSheet app.styles) (stylesheets := app.stylesheets)
+    (state := app.dehydrate mdl) (css := renderStyleSheet app.styles)
+    (stylesheets := app.stylesheets) (headMeta := app.headFor mdl)
 
 /-! ## JS SSR (`ssrStep`) ↔ Native In-Memory SSR (`ssrRenderNativeBytes`) Equivalence -/
 
@@ -335,7 +404,8 @@ theorem App.ssrStep_equiv_ssrRenderNativeBytes {Model Msg : Type} (app : App Mod
     (hmatch : let initQ := app.ssrInitQueue path
               SsrResultsMatch app (ssrResults resultsJson) dispatchBytes dispatchText 0 initQ.1 initQ.2 fuel mFinal) :
     let doc := renderDocument title (app.renderModel mFinal) script
-      (state := app.dehydrate mFinal) (css := renderStyleSheet app.styles) (stylesheets := app.stylesheets)
+      (state := app.dehydrate mFinal) (css := renderStyleSheet app.styles)
+      (stylesheets := app.stylesheets) (headMeta := app.headFor mFinal)
     app.ssrStep path title script resultsJson = Json.render (.obj [("html", .str doc)]) ∧
     App.ssrRenderNativeBytes (m := Id) app path title dispatchBytes dispatchText script fuel = doc.toUTF8 := by
   obtain ⟨hd, hq⟩ := ssrDrain_eq_ssrDrainQueueM app (ssrResults resultsJson) dispatchBytes dispatchText hmatch

@@ -34,6 +34,7 @@ structure ParsedReqHead where
   hasCookie      : Bool := false
   auth?          : Option String := none
   hasIfNoneMatch : Bool := false
+  acceptsGzip    : Bool := false
 
 private structure HdrFoldState where
   keepAlive      : Bool
@@ -54,6 +55,7 @@ private structure HdrFoldState where
   hasCookie      : Bool := false
   auth?          : Option String := none
   hasIfNoneMatch : Bool := false
+  acceptsGzip    : Bool := false
 
 @[inline] private def isHostHeader (k : String) : Bool :=
   k.utf8ByteSize == 4 && (k == "Host" || k == "host" || k.toLower == "host")
@@ -72,6 +74,21 @@ private theorem isHostHeader_imp_toLower (k : String) (h : isHostHeader k = true
       unfold String.toLower; apply String.ext; simp [Char.toLower]
     simp [this]
   · exact h3
+
+private def acceptEncodingHasGzip (v : String) : Bool :=
+  (v.splitOn ",").any fun item =>
+    match item.splitOn ";" with
+    | [] => false
+    | tok :: params =>
+        if !eqCI (trimWs tok) "gzip" then false
+        else
+          !(params.any fun p =>
+            match p.splitOn "=" with
+            | [k, qv] =>
+                let lk := (trimWs k).toLower
+                let lq := trimWs qv
+                lk == "q" && (lq == "0" || lq == "0.0" || lq == "0.00" || lq == "0.000")
+            | _ => false)
 
 private def parseOtherHeader (k v : String) (st : HdrFoldState) : HdrFoldState :=
   let headers := st.headers.push (k, v)
@@ -106,6 +123,10 @@ private def parseOtherHeader (k v : String) (st : HdrFoldState) : HdrFoldState :
       if eqCI k "sec-fetch-site" then
         if st.secFetchSite?.isSome then { st with headers, dupSfs := true }
         else { st with headers, secFetchSite? := some v }
+      else { st with headers }
+  | 15 =>
+      if eqCI k "accept-encoding" && acceptEncodingHasGzip v then
+        { st with headers, acceptsGzip := true }
       else { st with headers }
   | 17 =>
       if eqCI k "sec-websocket-key" then { st with headers, wsKey? := some v } else { st with headers }
@@ -248,6 +269,7 @@ def parseRequestHead (headBytes : ByteArray) : Except (Nat × String) ParsedReqH
                       hasCookie      := st.hasCookie
                       auth?          := st.auth?
                       hasIfNoneMatch := st.hasIfNoneMatch
+                      acceptsGzip    := st.acceptsGzip
                     }
 
 theorem parseRequestHead_rejects_nul (headBytes : ByteArray)
@@ -429,6 +451,7 @@ def statusReason (code : Nat) : String :=
   | 405 => "Method Not Allowed"
   | 413 => "Payload Too Large"
   | 415 => "Unsupported Media Type"
+  | 429 => "Too Many Requests"
   | 431 => "Request Header Fields Too Large"
   | 500 => "Internal Server Error"
   | 501 => "Not Implemented"
@@ -445,9 +468,30 @@ theorem safeContentType_no_crlf (ct : String) :
   · decide
   · rename_i h; simpa using h
 
+/-- Default strict Content-Security-Policy enabled on HTML responses because Qed statically proves
+    zero inline `<script>` tags and zero inline `on*` event handler attributes. -/
+def defaultCsp : String :=
+  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+
+/-- True iff `mime` is a text/script/markup/JSON/SVG media type eligible for gzip compression. -/
+def isCompressibleMime (mime : String) : Bool :=
+  startsWithCI mime "text/" ||
+  startsWithCI mime "application/javascript" ||
+  startsWithCI mime "application/json" ||
+  startsWithCI mime "application/manifest+json" ||
+  startsWithCI mime "application/xml" ||
+  startsWithCI mime "image/svg+xml"
+
+private def renderExtraHeaders (extraHeaders : List (String × String)) : String :=
+  extraHeaders.foldl (init := "") fun acc (k, v) =>
+    if isValidHttpToken k && !hasCtlOrCrlf v false then
+      acc ++ k ++ ": " ++ v ++ "\r\n"
+    else acc
+
 def formatHttpResponseHead (status : Nat) (contentType : String) (contentLen : Nat)
     (keepAlive noStore : Bool) (etag? : Option String := none)
-    (cacheControl? : Option String := none) : ByteArray :=
+    (cacheControl? : Option String := none)
+    (extraHeaders : List (String × String) := []) : ByteArray :=
   let code := if status >= 100 && status <= 599 then status else 500
   let ct := safeContentType contentType
   let conn := if keepAlive then "keep-alive" else "close"
@@ -457,12 +501,14 @@ def formatHttpResponseHead (status : Nat) (contentType : String) (contentLen : N
   let etag := match etag? with
     | some et => if hasCtlOrCrlf et false then "" else s!"ETag: {et}\r\n"
     | none    => ""
+  let extra := renderExtraHeaders extraHeaders
   (s!"HTTP/1.1 {code} {statusReason code}\r\n" ++
    s!"Content-Type: {ct}\r\n" ++
    s!"Content-Length: {contentLen}\r\n" ++
    "X-Content-Type-Options: nosniff\r\n" ++
    etag ++
    cache ++
+   extra ++
    s!"Connection: {conn}\r\n\r\n").toUTF8
 
 def formatNotModifiedResponse (etag : String) (keepAlive : Bool) : ByteArray :=
@@ -490,8 +536,9 @@ def etagMatchesIfNoneMatch (headers : Array (String × String)) (etag : String) 
 
 def formatHttpResponse (status : Nat) (contentType : String) (body : ByteArray)
     (headOnly keepAlive noStore : Bool) (etag? : Option String := none)
-    (cacheControl? : Option String := none) : ByteArray :=
-  let head := formatHttpResponseHead status contentType body.size keepAlive noStore etag? cacheControl?
+    (cacheControl? : Option String := none)
+    (extraHeaders : List (String × String) := []) : ByteArray :=
+  let head := formatHttpResponseHead status contentType body.size keepAlive noStore etag? cacheControl? extraHeaders
   if headOnly then head else head ++ body
 
 private def okProtoHeadPrefix : ByteArray :=

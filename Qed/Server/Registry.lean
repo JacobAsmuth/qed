@@ -46,6 +46,7 @@ structure ServerInfo where
   methods          : Array ServerMethodInfo
   channels         : Array String := #[]
   databases        : Array Lean.Name := #[]
+  hasHttpRoutes    : Bool := false
 deriving Inhabited
 
 initialize serverRegistry :
@@ -289,6 +290,7 @@ structure DbColumnInfo where
   isNullable   : Bool := false
   isNat        : Bool := false
   isBytes      : Bool := false
+  refs?        : Option (String × String) := none
 deriving Inhabited, Repr
 
 structure DbTableInfo where

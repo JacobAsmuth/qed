@@ -1,4 +1,5 @@
 mod crypto;
+mod gzip;
 mod lean_ffi;
 mod outbound;
 mod server;

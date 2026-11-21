@@ -854,7 +854,8 @@ def elabDatabaseCmd : CommandElab := fun stx => do
       schemaConst       := fullRowTypeName ++ `schema
       columns           := t.cols.map fun c => {
         name := c.colName, isPrimaryKey := c.isPrimaryKey, isImmutable := c.isImmutable,
-        isUnique := c.isUnique, isNullable := c.isNullable, isNat := c.isNat, isBytes := c.isBytes
+        isUnique := c.isUnique, isNullable := c.isNullable, isNat := c.isNat, isBytes := c.isBytes,
+        refs? := c.refs?.map fun (rt, rc) => (rt.getId.eraseMacroScopes.toString, rc.getId.eraseMacroScopes.toString)
       }
       hasReadPolicy     := !t.readPols.isEmpty
       hasInsertPolicy   := !t.insertPols.isEmpty

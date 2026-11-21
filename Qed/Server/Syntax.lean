@@ -138,6 +138,37 @@ def extHttpMethod : Parser :=
     optional (":" >> checkColGt "expected indented `channel` clauses" >>
       many1Indent (categoryParser `srvChanSubClause 0)))
 
+private def identDotTransaction : Parser :=
+  leading_parser withFn (fun fn c s =>
+    let s' := fn c s
+    if s'.hasError then s'
+    else
+      match s'.stxStack.back.getId.eraseMacroScopes with
+      | .str (.str .anonymous _) "transaction" => s'
+      | _ => s.mkError "expected `<db>.transaction`") Parser.ident
+
+@[qedStmt_parser] def qedStmtTransaction : Parser := leading_parser
+  withPosition (atomic (identEq `transaction >> ident >> ":") >> qedSuite)
+
+@[qedStmt_parser] def qedStmtDbTransaction : Parser := leading_parser
+  withPosition (atomic (identDotTransaction >> ":") >> qedSuite)
+
+@[srvClause_parser] def srvHttpRouteClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `http >> extHttpMethod) >> strLit >> ":" >>
+    checkColGt "expected indented `http` route body" >>
+    withPosition (
+      many (atomic (checkColEq "contract" >> srvContractLine)) >>
+      many1 (checkColEq "statement" >> categoryParser `qedStmt 0)))
+
+@[srvClause_parser] def srvStreamClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `stream) >> strLit >> ":" >>
+    checkColGt "expected indented `stream` body" >>
+    withPosition (
+      many (atomic (checkColEq "contract" >> srvContractLine)) >>
+      many1 (checkColEq "statement" >> categoryParser `qedStmt 0)))
+
 @[srvClause_parser] def srvFnClause : Parser := leading_parser
   withPosition (
     symbol "def" >> ident >> checkNoWsBefore "" >> "(" >> sepBy srvParam "," >> ")" >>
@@ -175,19 +206,44 @@ end SrvParsers
 abbrev SrvTypeMod := Qed.Lang.TypeMod
 
 structure ParsedSrvType where
-  ref       : Lean.Syntax
-  baseIdent : Lean.Ident
-  isProto   : Bool := false
-  mods      : Array SrvTypeMod := #[]
+  ref        : Lean.Syntax
+  baseIdent  : Lean.Ident
+  isProto    : Bool := false
+  mods       : Array SrvTypeMod := #[]
+  tupleElems : Array Lean.Term := #[]
+deriving Inhabited
 
 namespace ParsedSrvType
 
-def parse (stx : Lean.Syntax) : Lean.MacroM ParsedSrvType := do
+private def buildProdTerm (elems : Array Lean.Term) : Lean.MacroM Lean.Term := do
+  if elems.isEmpty then `(Unit)
+  else if elems.size == 1 then return elems[0]!
+  else
+    let mut acc := elems.back!
+    for revIdx in [1:elems.size] do
+      acc ← `($(elems[elems.size - 1 - revIdx]!) × $acc)
+    return acc
+
+partial def parse (stx : Lean.Syntax) : Lean.MacroM ParsedSrvType := do
   let k := stx.getKind
   if k == ``Qed.Lang.qedTypeProto then
     let (baseId, initMods) ← Qed.Lang.splitIdentMods ⟨(stx.getArg 2)⟩
     return { ref := stx, baseIdent := baseId, isProto := true,
              mods := initMods ++ (← (stx.getArg 4).getArgs.mapM Qed.Lang.parseTypeModNode) }
+  else if k == ``Qed.Lang.qedTypeParen then
+    let elemStxs := (stx.getArg 1).getSepArgs
+    let mods ← (stx.getArg 3).getArgs.mapM Qed.Lang.parseTypeModNode
+    let mut elemTerms : Array Lean.Term := #[]
+    for eStx in elemStxs do
+      let pe ← parse eStx
+      if pe.mods.contains .fallible then
+        Lean.Macro.throwErrorAt eStx "fallible `!` modifier cannot appear inside a tuple type"
+      let baseT ← if pe.tupleElems.isEmpty then pure (Qed.Lang.resolveBaseTypeTerm pe.baseIdent)
+                  else buildProdTerm pe.tupleElems
+      let et ← Qed.Lang.applyTypeMods baseT pe.mods true pe.ref
+      elemTerms := elemTerms.push et.1
+    return { ref := stx, baseIdent := Lean.mkIdentFrom stx `Prod, isProto := false,
+             mods, tupleElems := elemTerms }
   else if k == ``Qed.Lang.qedTypeAtom then
     let (baseId, initMods) ← Qed.Lang.splitIdentMods ⟨(stx.getArg 0)⟩
     return { ref := stx, baseIdent := baseId, isProto := false,
@@ -200,11 +256,11 @@ def parse (stx : Lean.Syntax) : Lean.MacroM ParsedSrvType := do
     else
       let sn := Qed.Lang.stxSnippet stx
       let what := if sn.isEmpty then "" else s!" `{sn}`"
-      Lean.Macro.throwErrorAt stx s!"invalid server type{what}; expected `T`, `T[]`, `T?`, `T!`, or `Proto(T)`"
+      Lean.Macro.throwErrorAt stx s!"invalid server type{what}; expected `T`, `T[]`, `T?`, `T!`, `(T, U)`, or `Proto(T)`"
   else
     let sn := Qed.Lang.stxSnippet stx
     let what := if sn.isEmpty then "" else s!" `{sn}`"
-    Lean.Macro.throwErrorAt stx s!"invalid server type{what}; expected `T`, `T[]`, `T?`, `T!`, or `Proto(T)`"
+    Lean.Macro.throwErrorAt stx s!"invalid server type{what}; expected `T`, `T[]`, `T?`, `T!`, `(T, U)`, or `Proto(T)`"
 
 def hasFallible (t : ParsedSrvType) : Bool := t.mods.contains .fallible
 
@@ -216,9 +272,12 @@ def validate (t : ParsedSrvType) (allowFallible : Bool) (ctxDesc : String) : Lea
     if t.mods[i]! == .fallible && i + 1 < t.mods.size then
       Lean.Macro.throwErrorAt t.ref "place `!` last on fallible return types (for example `Book[]!` instead of `Book![]`)"
 
-/-- Lowers the non-`!` payload type (e.g. `Book[]!` → `Array Book`, `Book?` → `Option Book`). -/
-def toPayloadTerm (t : ParsedSrvType) : Lean.MacroM Lean.Term :=
-  return (← Qed.Lang.applyTypeMods (Qed.Lang.resolveBaseTypeTerm t.baseIdent) t.mods true t.ref).1
+/-- Lowers the non-`!` payload type (e.g. `Book[]!` → `Array Book`, `(A, B)[]!` → `Array (A × B)`). -/
+def toPayloadTerm (t : ParsedSrvType) : Lean.MacroM Lean.Term := do
+  let baseTerm ←
+    if t.tupleElems.isEmpty then pure (Qed.Lang.resolveBaseTypeTerm t.baseIdent)
+    else buildProdTerm t.tupleElems
+  return (← Qed.Lang.applyTypeMods baseTerm t.mods true t.ref).1
 
 end ParsedSrvType
 

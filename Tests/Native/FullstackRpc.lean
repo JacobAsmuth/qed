@@ -1,5 +1,7 @@
 import Tests.Native.Harness
 import Examples.CloudBooks
+import Tests.ServerChecks
+import Qed.Server.Native
 
 open System (FilePath)
 open Qed.Server
@@ -147,6 +149,140 @@ private def startMockExternal (pemKey : String) :
               catch _ => pure ()
               Prim.outboundRelease conn 0
       return .ok (s!"http://127.0.0.1:{port}", stRef, do runningRef.set false; Prim.tcpCloseListener lid)
+
+private def gunzipBytes (gz : ByteArray) : IO (Except String ByteArray) := do
+  let tmp ← makeTempDir "qed-gz-test"
+  try
+    let gzFile := s!"{tmp}/in.gz"
+    let outFile := s!"{tmp}/out.bin"
+    IO.FS.writeBinFile gzFile gz
+    let (code, _, err) ← runCmd "sh" #["-c", s!"gzip -dc '{gzFile}' > '{outFile}'"]
+    if code != 0 then
+      return .error s!"gzip -dc failed ({code}): {err}"
+    let raw ← IO.FS.readBinFile outFile
+    return .ok raw
+  finally
+    rmRf tmp
+
+private def runWebEssentialsSuite (c : TestChecker) : IO Unit := do
+  let some dir ← buildDevApp "Tests.WebEssentialsFixture"
+    | c.check "[web-essentials] buildDevApp Tests.WebEssentialsFixture" false; return
+
+  -- Write a content-hashed JS asset (> 256 bytes, compressible) to test CachedStaticAsset gzip cache
+  let jsContent := String.join (List.replicate 40 "export function qedHello(x) { return 'hello-' + x; }\n")
+  let hashedFile := s!"{dir}/bundle.deadbeef.mjs"
+  IO.FS.writeFile hashedFile jsContent
+  let authSecret := "web-essentials-hmac-secret"
+  let aliceTok ← signSessionToken authSecret "alice"
+  let (srv, ready) ← startNativeServer dir #[
+    ("QED_WORKERS", some "2"),
+    ("QED_AUTH_SECRET", some authSecret)
+  ] (dev := false)
+  try
+    c.check "[web-essentials] child native server healthy" ready
+    if !ready then return
+
+    -- 1. CachedStaticAsset pre-compressed gzip (first request fills cache, second hits cache)
+    for pass in [1, 2] do
+      match ← httpReq srv.port "GET" "/bundle.deadbeef.mjs" #[("Accept-Encoding", "gzip")] with
+      | .ok r =>
+          c.checkEq s!"[web-essentials] hashed JS gzip pass {pass} status 200" r.status 200
+          c.checkEq s!"[web-essentials] hashed JS gzip pass {pass} Content-Encoding" (r.header? "content-encoding") (some "gzip")
+          c.checkEq s!"[web-essentials] hashed JS gzip pass {pass} Vary" (r.header? "vary") (some "Accept-Encoding")
+          c.check s!"[web-essentials] hashed JS gzip pass {pass} smaller than raw ({r.body.size} < {jsContent.utf8ByteSize})"
+            (r.body.size < jsContent.utf8ByteSize)
+          match ← gunzipBytes r.body with
+          | .ok raw => c.checkEq s!"[web-essentials] hashed JS gzip pass {pass} decompresses identically" (String.fromUTF8? raw) (some jsContent)
+          | .error e => c.check s!"[web-essentials] gunzip pass {pass}" false e
+      | .error e => c.check s!"[web-essentials] hashed JS gzip pass {pass}" false e
+
+    -- Without Accept-Encoding: gzip, serves uncompressed asset with Vary: Accept-Encoding
+    match ← httpReq srv.port "GET" "/bundle.deadbeef.mjs" with
+    | .ok r =>
+        c.checkEq "[web-essentials] hashed JS plain status 200" r.status 200
+        c.checkEq "[web-essentials] hashed JS plain no Content-Encoding" (r.header? "content-encoding") none
+        c.checkEq "[web-essentials] hashed JS plain body exact" r.bodyStr jsContent
+    | .error e => c.check "[web-essentials] hashed JS plain" false e
+
+    -- 2. Custom HTTP routes: GET /robots.txt, POST /webhook (401 unauth, 200 auth + Set-Cookie), POST /echo-cookie
+    match ← httpReq srv.port "GET" "/robots.txt" with
+    | .ok r =>
+        c.checkEq "[web-essentials] GET /robots.txt status 200" r.status 200
+        c.checkEq "[web-essentials] GET /robots.txt body" r.bodyStr "User-agent: *\nAllow: /\n"
+    | .error e => c.check "[web-essentials] GET /robots.txt" false e
+
+    match ← httpReq srv.port "POST" "/webhook" #[] "{}".toUTF8 with
+    | .ok r => c.checkEq "[web-essentials] unauth POST /webhook rejected 401" r.status 401
+    | .error e => c.check "[web-essentials] POST /webhook unauth" false e
+
+    match ← httpReq srv.port "POST" "/webhook" #[("Authorization", s!"Bearer {aliceTok}")] "{}".toUTF8 with
+    | .ok r =>
+        c.checkEq "[web-essentials] auth POST /webhook status 200" r.status 200
+        c.checkEq "[web-essentials] auth POST /webhook JSON body" r.bodyStr "{\"ok\":true}"
+        let sc := (r.header? "set-cookie").getD ""
+        c.check "[web-essentials] auth POST /webhook emitted Set-Cookie wh_seen=1"
+          (sc.contains "wh_seen=1" && sc.contains "HttpOnly" && sc.contains "SameSite=Lax") sc
+    | .error e => c.check "[web-essentials] POST /webhook auth" false e
+
+    match ← httpReq srv.port "POST" "/echo-cookie" #[] "val123\r\nX-Inject: bad".toUTF8 with
+    | .ok r =>
+        c.checkEq "[web-essentials] POST /echo-cookie status 200" r.status 200
+        c.checkEq "[web-essentials] POST /echo-cookie JSON body" r.bodyStr "{\"ok\":true}"
+        let sc := (r.header? "set-cookie").getD ""
+        c.check "[web-essentials] POST /echo-cookie emitted sanitized HttpOnly SameSite=Lax cookie"
+          (sc.contains "echo_ck=val123X-Inject: bad" && sc.contains "HttpOnly" && sc.contains "SameSite=Lax") sc
+    | .error e => c.check "[web-essentials] POST /echo-cookie" false e
+
+    -- 3. RPC `setCookie(...)` emits Set-Cookie header on Protobuf response
+    match ← httpReq srv.port "POST" "/_qed/rpc/WebEssentialsSrv/login"
+      #[("Content-Type", "application/x-protobuf")] (Qed.Proto.encode "sess_tok_42") with
+    | .ok r =>
+        c.checkEq "[web-essentials] RPC login status 200" r.status 200
+        c.checkEq "[web-essentials] RPC login payload" (Qed.Proto.decode (α := String) r.body) (.ok "ok")
+        let sc := (r.header? "set-cookie").getD ""
+        c.check "[web-essentials] RPC login emitted Set-Cookie qed_session"
+          (sc.contains "qed_session=sess_tok_42" && sc.contains "HttpOnly" && sc.contains "SameSite=Lax") sc
+    | .error e => c.check "[web-essentials] RPC login" false e
+
+    -- 4. Server-side SSE streaming route (`stream "/events"`)
+    match ← httpReq srv.port "GET" "/events" with
+    | .ok r =>
+        c.checkEq "[web-essentials] GET /events SSE status 200" r.status 200
+        c.checkEq "[web-essentials] GET /events Content-Type" (r.header? "content-type") (some "text/event-stream; charset=utf-8")
+        c.checkEq "[web-essentials] GET /events Cache-Control" (r.header? "cache-control") (some "no-cache")
+        c.checkEq "[web-essentials] GET /events SSE wire format" r.bodyStr
+          "event: greeting\nid: 1\ndata: hello\n\ndata: world\n\n"
+    | .error e => c.check "[web-essentials] GET /events SSE" false e
+
+    -- 5. Per-route `<head>` metadata, XSS escaping, CSP header & SSR HTTP status codes (200 / 404 / 302)
+    match ← httpReq srv.port "GET" "/" with
+    | .ok r =>
+        c.checkEq "[web-essentials] SSR GET / status 200" r.status 200
+        c.check "[web-essentials] SSR GET / escaped title XSS"
+          (r.bodyStr.contains "<title>Home &lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>" &&
+           !r.bodyStr.contains "<script>alert(1)</script>")
+        c.check "[web-essentials] SSR GET / meta description & canonical"
+          (r.bodyStr.contains "<meta name=\"description\" content=\"Verified &quot;SSR&quot; &lt;head&gt;\">" &&
+           r.bodyStr.contains "<link rel=\"canonical\" href=\"https://example.com/\">")
+        let csp := (r.header? "content-security-policy").getD ""
+        c.check "[web-essentials] SSR GET / has strict default CSP"
+          (csp.contains "default-src 'self'" && csp.contains "script-src 'self'" && csp.contains "object-src 'none'") csp
+    | .error e => c.check "[web-essentials] SSR GET /" false e
+
+    match ← httpReq srv.port "GET" "/missing" with
+    | .ok r =>
+        c.checkEq "[web-essentials] SSR GET /missing returns HTTP 404" r.status 404
+        c.check "[web-essentials] SSR GET /missing renders 404 <title>" (r.bodyStr.contains "<title>404 Not Found</title>")
+    | .error e => c.check "[web-essentials] SSR GET /missing" false e
+
+    match ← httpReq srv.port "GET" "/old" with
+    | .ok r =>
+        c.checkEq "[web-essentials] SSR GET /old returns HTTP 302" r.status 302
+        c.checkEq "[web-essentials] SSR GET /old sets Location: /new" (r.header? "location") (some "/new")
+    | .error e => c.check "[web-essentials] SSR GET /old" false e
+  finally
+    srv.stop
+    rmRf hashedFile
 
 def run : IO Bool := do
   let c ← mkChecker "fullstack-rpc"
@@ -309,16 +445,78 @@ def run : IO Bool := do
           c.check "all 8 concurrent orders returned 200" all200
           c.checkEq "Cloudflare D1 received all 9 order queries" (← mockRef.get).d1Count 9
 
-          -- 8. Native SSR HTML + ETag / 304 Not Modified
+          -- 8. Native SSR HTML + strict default CSP + gzip compression
+          let mut rawSsrHtml := ""
           match ← httpReq srv.port "GET" "/" #[("Cookie", s!"qed_session={validTok}")] with
           | .ok r =>
               c.checkEq "native SSR GET / returns 200" r.status 200
               c.check "SSR HTML includes qed-state dehydration" (r.bodyStr.contains "id=\"qed-state\"")
+              let csp := (r.header? "content-security-policy").getD ""
+              c.check "SSR HTML includes strict default Content-Security-Policy"
+                (csp.contains "default-src 'self'" && csp.contains "script-src 'self'" && csp.contains "object-src 'none'") csp
+              rawSsrHtml := r.bodyStr
           | .error e => c.check "native SSR GET /" false e
+
+          match ← httpReq srv.port "GET" "/" #[("Cookie", s!"qed_session={validTok}"), ("Accept-Encoding", "gzip")] with
+          | .ok r =>
+              c.checkEq "SSR gzip GET / returns 200" r.status 200
+              c.checkEq "SSR gzip Content-Encoding header" (r.header? "content-encoding") (some "gzip")
+              c.checkEq "SSR gzip Vary header" (r.header? "vary") (some "Accept-Encoding")
+              c.check "SSR gzip body smaller than uncompressed" (r.body.size < rawSsrHtml.utf8ByteSize)
+              match ← gunzipBytes r.body with
+              | .ok decomp => c.checkEq "SSR gzip decompresses identically" (String.fromUTF8? decomp) (some rawSsrHtml)
+              | .error e => c.check "SSR gunzip" false e
+          | .error e => c.check "SSR gzip GET /" false e
         finally
           srv.stop
+
+        -- 9. Per-IP Rate Limiter (429 Too Many Requests + Retry-After) & QED_CSP override
+        let (srvRl, rlOk) ← startNativeServer dir #[
+          ("QED_WORKERS", some "2"),
+          ("QED_AUTH_SECRET", some authSecret),
+          ("CF_D1_TOKEN", some "test-cf-d1-secret"),
+          ("GCP_SA_JSON", some saJson),
+          ("QED_GCP_TOKEN_URL", some s!"{extBase}/oauth2/token"),
+          ("QED_EXT_GCPSTORAGE_BASE", some extBase),
+          ("QED_EXT_CLOUDFLARED1_BASE", some extBase),
+          ("QED_RATE_LIMIT_RPS", some "1"),
+          ("QED_RATE_LIMIT_BURST", some "2"),
+          ("QED_CSP", some "default-src 'none'")
+        ]
+        try
+          c.check "rate-limited server healthy" rlOk
+          if rlOk then
+            let r1 ← httpReq srvRl.port "GET" "/"
+            let r2 ← httpReq srvRl.port "GET" "/"
+            let r3 ← httpReq srvRl.port "GET" "/"
+            let r4 ← httpReq srvRl.port "GET" "/"
+            match r1 with
+            | .ok r =>
+                c.checkEq "rate-limit req 1 allowed (200)" r.status 200
+                c.checkEq "QED_CSP override applied" (r.header? "content-security-policy") (some "default-src 'none'")
+            | .error e => c.check "rate-limit req 1" false e
+            match r2 with
+            | .ok r => c.checkEq "rate-limit req 2 allowed (200)" r.status 200
+            | .error e => c.check "rate-limit req 2" false e
+            let got429 := match r3, r4 with
+              | .ok a, .ok b => a.status == 429 || b.status == 429
+              | .ok a, _     => a.status == 429
+              | _, .ok b     => b.status == 429
+              | _, _         => false
+            let hasRetryAfter := match r3, r4 with
+              | .ok a, .ok b => (a.status == 429 && (a.header? "retry-after").isSome) || (b.status == 429 && (b.header? "retry-after").isSome)
+              | .ok a, _     => a.status == 429 && (a.header? "retry-after").isSome
+              | _, .ok b     => b.status == 429 && (b.header? "retry-after").isSome
+              | _, _         => false
+            c.check "burst excess rejected with 429 Too Many Requests" got429
+            c.check "429 response includes Retry-After header" hasRetryAfter
+        finally
+          srvRl.stop
       finally
         stopMock
+
+  -- 10. Web Essentials suite (CachedStaticAsset gzip, Set-Cookie, custom HTTP routes, SSE stream, per-route head & 404/302 SSR)
+  runWebEssentialsSuite c
   c.finish
 
 end Tests.Native.FullstackRpc

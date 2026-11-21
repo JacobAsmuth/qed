@@ -59,6 +59,8 @@ structure RequestCtx where
   userId      : Option String := none
   clientIp    : String := "127.0.0.1"
   connId      : String := ""
+  query       : String := ""
+  body        : String := ""
 deriving Inhabited, DecidableEq, Repr
 
 namespace RequestCtx
@@ -149,6 +151,286 @@ theorem header_no_crlf (s : String) :
   unfold isSafeHeaderChar at hsafe
   simp only [Bool.and_eq_true, decide_eq_true_eq] at hsafe
   refine ⟨?_, ?_, ?_⟩ <;> (intro heq; subst heq; simp at hsafe)
+
+/-! ## First-Class Verified Cookies (`SetCookie`), Custom HTTP Responses & Server-Side SSE -/
+
+inductive SameSite where
+  | lax
+  | strict
+  | none
+deriving Inhabited, DecidableEq, Repr
+
+def SameSite.render : SameSite → String
+  | .lax    => "Lax"
+  | .strict => "Strict"
+  | .none   => "None"
+
+@[inline] def isSafeCookieAtomChar (c : Char) : Bool :=
+  let n := c.toNat
+  33 ≤ n && n ≠ 127 && c ≠ ';' && c ≠ '=' && c ≠ ',' && c ≠ '"'
+
+@[inline] def isSafeCookieValChar (c : Char) : Bool :=
+  let n := c.toNat
+  32 ≤ n && n ≠ 127 && c ≠ ';'
+
+def sanitizeCookieName (s : String) : String :=
+  String.ofList (s.toList.filter isSafeCookieAtomChar)
+
+def sanitizeCookieVal (s : String) : String :=
+  String.ofList (s.toList.filter isSafeCookieValChar)
+
+structure SetCookie where
+  name     : String
+  value    : String
+  path     : String := "/"
+  httpOnly : Bool := true
+  sameSite : SameSite := .lax
+  secure   : Bool := false
+  maxAge?  : Option Nat := none
+  domain?  : Option String := none
+deriving Inhabited, DecidableEq, Repr
+
+namespace SetCookie
+
+def mkSafe (name value : String) (maxAge? : Option Nat := none) (secure : Bool := false)
+    (httpOnly : Bool := true) (sameSite : SameSite := .lax) (path : String := "/") : SetCookie :=
+  { name, value, path, httpOnly, sameSite, secure, maxAge? }
+
+def clear (name : String) (path : String := "/") : SetCookie :=
+  { name, value := "", path, httpOnly := true, sameSite := .lax, maxAge? := some 0 }
+
+/-- Renders a `Set-Cookie` header value with safe defaults (`HttpOnly`, `SameSite=Lax`, `Path=/`)
+    and guaranteed CRLF / NUL / attribute-separator sanitization. -/
+def render (c : SetCookie) : String :=
+  let nm := sanitizeCookieName c.name
+  let vl := sanitizeCookieVal c.value
+  let pth := sanitizeCookieVal (if c.path.isEmpty then "/" else c.path)
+  let base := nm ++ "=" ++ vl ++ "; Path=" ++ pth
+  let dom := match c.domain? with
+    | some d =>
+        let sd := sanitizeCookieVal d
+        if sd.isEmpty then "" else "; Domain=" ++ sd
+    | none => ""
+  let age := match c.maxAge? with
+    | some n => "; Max-Age=" ++ toString n
+    | none   => ""
+  let sec := if c.secure then "; Secure" else ""
+  let ho  := if c.httpOnly then "; HttpOnly" else ""
+  let ss  := "; SameSite=" ++ c.sameSite.render
+  base ++ dom ++ age ++ sec ++ ho ++ ss
+
+private theorem sanitizeCookieName_no_crlf (s : String) :
+    ∀ c ∈ (sanitizeCookieName s).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' := by
+  intro c hc
+  unfold sanitizeCookieName at hc
+  rw [String.toList_ofList, List.mem_filter] at hc
+  have hs := hc.2
+  unfold isSafeCookieAtomChar at hs
+  simp only [Bool.and_eq_true, decide_eq_true_eq] at hs
+  refine ⟨?_, ?_, ?_⟩ <;> (intro heq; subst heq; simp at hs)
+
+private theorem sanitizeCookieVal_no_crlf (s : String) :
+    ∀ c ∈ (sanitizeCookieVal s).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' := by
+  intro c hc
+  unfold sanitizeCookieVal at hc
+  rw [String.toList_ofList, List.mem_filter] at hc
+  have hs := hc.2
+  unfold isSafeCookieValChar at hs
+  simp only [Bool.and_eq_true, decide_eq_true_eq] at hs
+  refine ⟨?_, ?_, ?_⟩ <;> (intro heq; subst heq; simp at hs)
+
+private theorem no_crlf_append {a b : String}
+    (ha : ∀ c ∈ a.toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00')
+    (hb : ∀ c ∈ b.toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00') :
+    ∀ c ∈ (a ++ b).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' := by
+  intro c hc
+  rw [String.toList_append, List.mem_append] at hc
+  exact hc.elim (ha c) (hb c)
+
+private theorem no_crlf_lit (s : String)
+    (h : s.toList.all (fun c => c != '\r' && c != '\n' && c != '\x00') = true) :
+    ∀ c ∈ s.toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' := by
+  intro c hc
+  rw [List.all_eq_true] at h
+  have := h c hc
+  simp only [Bool.and_eq_true, bne_iff_ne] at this
+  exact ⟨this.1.1, this.1.2, this.2⟩
+
+private theorem nat_toString_no_crlf (n : Nat) :
+    ∀ c ∈ (toString n).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' := by
+  have hdig : ∀ x ∈ (Nat.toDigits 10 n), '0' ≤ x ∧ x ≤ '9' := by
+    intro x hx
+    have hmem : ∀ m (b : Nat) (acc : List Char),
+        (∀ y ∈ acc, '0' ≤ y ∧ y ≤ '9') →
+        ∀ y ∈ Nat.toDigitsCore 10 m b acc, '0' ≤ y ∧ y ≤ '9' := by
+      intro m
+      induction m with
+      | zero => intro b acc hacc y hy; exact hacc y hy
+      | succ m ih =>
+          intro b acc hacc y hy
+          unfold Nat.toDigitsCore at hy
+          dsimp only at hy
+          have hd : '0' ≤ Nat.digitChar (b % 10) ∧ Nat.digitChar (b % 10) ≤ '9' := by
+            have hlt : b % 10 < 10 := Nat.mod_lt b (by decide)
+            have : b % 10 = 0 ∨ b % 10 = 1 ∨ b % 10 = 2 ∨ b % 10 = 3 ∨ b % 10 = 4 ∨
+                   b % 10 = 5 ∨ b % 10 = 6 ∨ b % 10 = 7 ∨ b % 10 = 8 ∨ b % 10 = 9 := by omega
+            rcases this with h | h | h | h | h | h | h | h | h | h <;> rw [h] <;> decide
+          split at hy
+          · rcases List.mem_cons.1 hy with rfl | hrest
+            · exact hd
+            · exact hacc y hrest
+          · exact ih (b / 10) (Nat.digitChar (b % 10) :: acc)
+              (fun z hz => (List.mem_cons.1 hz).elim (fun h => h ▸ hd) (hacc z)) y hy
+    exact hmem (n + 1) n [] (fun _ h => False.elim (List.not_mem_nil h)) x hx
+  intro c hc
+  have hrepr : (toString n).toList = Nat.toDigits 10 n := by
+    change (Nat.repr n).toList = Nat.toDigits 10 n
+    unfold Nat.repr
+    exact String.toList_ofList
+  rw [hrepr] at hc
+  have hbounds := hdig c hc
+  refine ⟨?_, ?_, ?_⟩ <;> (intro heq; subst heq; exact absurd hbounds (by decide))
+
+/-- **Cookie Header Injection Closure:** No rendered `Set-Cookie` header value can ever contain
+    CR, LF, or NUL bytes. -/
+theorem render_no_crlf (c : SetCookie) :
+    ∀ ch ∈ c.render.toList, ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' := by
+  unfold SetCookie.render
+  dsimp only
+  have hBase : ∀ ch ∈ (sanitizeCookieName c.name ++ "=" ++ sanitizeCookieVal c.value ++
+      "; Path=" ++ sanitizeCookieVal (if c.path.isEmpty then "/" else c.path)).toList,
+      ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' :=
+    no_crlf_append
+      (no_crlf_append
+        (no_crlf_append
+          (no_crlf_append (sanitizeCookieName_no_crlf c.name) (no_crlf_lit "=" rfl))
+          (sanitizeCookieVal_no_crlf c.value))
+        (no_crlf_lit "; Path=" rfl))
+      (sanitizeCookieVal_no_crlf _)
+  have hDom : ∀ ch ∈ (match c.domain? with
+      | some d => if (sanitizeCookieVal d).isEmpty then "" else "; Domain=" ++ sanitizeCookieVal d
+      | none => "").toList, ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' := by
+    cases c.domain? with
+    | none => exact no_crlf_lit "" rfl
+    | some d =>
+        dsimp only
+        split
+        · exact no_crlf_lit "" rfl
+        · exact no_crlf_append (no_crlf_lit "; Domain=" rfl) (sanitizeCookieVal_no_crlf d)
+  have hAge : ∀ ch ∈ (match c.maxAge? with
+      | some n => "; Max-Age=" ++ toString n
+      | none => "").toList, ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' := by
+    cases c.maxAge? with
+    | none => exact no_crlf_lit "" rfl
+    | some n => exact no_crlf_append (no_crlf_lit "; Max-Age=" rfl) (nat_toString_no_crlf n)
+  have hSec : ∀ ch ∈ (if c.secure then "; Secure" else "").toList,
+      ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' := by
+    cases c.secure
+    · exact no_crlf_lit "" rfl
+    · exact no_crlf_lit "; Secure" rfl
+  have hHo : ∀ ch ∈ (if c.httpOnly then "; HttpOnly" else "").toList,
+      ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' := by
+    cases c.httpOnly
+    · exact no_crlf_lit "" rfl
+    · exact no_crlf_lit "; HttpOnly" rfl
+  have hSs : ∀ ch ∈ ("; SameSite=" ++ c.sameSite.render).toList,
+      ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' := by
+    cases c.sameSite
+    · exact no_crlf_append (no_crlf_lit "; SameSite=" rfl) (no_crlf_lit "Lax" rfl)
+    · exact no_crlf_append (no_crlf_lit "; SameSite=" rfl) (no_crlf_lit "Strict" rfl)
+    · exact no_crlf_append (no_crlf_lit "; SameSite=" rfl) (no_crlf_lit "None" rfl)
+  exact no_crlf_append (no_crlf_append (no_crlf_append (no_crlf_append (no_crlf_append hBase hDom) hAge) hSec) hHo) hSs
+
+end SetCookie
+
+/-- Server-Sent Events (SSE) frame pairing with client `Cmd.stream`. -/
+structure SseEvent where
+  data  : String
+  event : Option String := none
+  id    : Option String := none
+  retry : Option Nat := none
+deriving Inhabited, DecidableEq, Repr
+
+namespace SseEvent
+
+def msg (data : String) (event : Option String := none) (id : Option String := none)
+    (retry : Option Nat := none) : SseEvent :=
+  { data, event, id, retry }
+
+/-- Renders one RFC 8895 / WHATWG `text/event-stream` frame (`event:`, `id:`, `retry:`, multiline `data:`, `\n\n`). -/
+def render (ev : SseEvent) : String :=
+  let evLine := match ev.event with
+    | some e => "event: " ++ sanitizeHeader e ++ "\n"
+    | none   => ""
+  let idLine := match ev.id with
+    | some i => "id: " ++ sanitizeHeader i ++ "\n"
+    | none   => ""
+  let retryLine := match ev.retry with
+    | some ms => "retry: " ++ toString ms ++ "\n"
+    | none    => ""
+  let cleanData := ev.data.replace "\r\n" "\n" |>.replace "\r" "\n"
+  let dataLines := String.join ((cleanData.splitOn "\n").map fun l => "data: " ++ l ++ "\n")
+  evLine ++ idLine ++ retryLine ++ dataLines ++ "\n"
+
+def formatStream (events : List SseEvent) : ByteArray :=
+  (String.join (events.map SseEvent.render)).toUTF8
+
+end SseEvent
+
+/-- First-class custom HTTP endpoint response returned from `server` `http` / `stream` routes. -/
+structure HttpResponse where
+  status      : Nat := 200
+  contentType : String := "text/plain; charset=utf-8"
+  body        : ByteArray := ByteArray.empty
+  headers     : List (String × String) := []
+  cookies     : List SetCookie := []
+deriving Inhabited
+
+namespace HttpResponse
+
+def text (body : String) (status : Nat := 200)
+    (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
+  { status, contentType := "text/plain; charset=utf-8", body := body.toUTF8, headers, cookies }
+
+def json (body : String) (status : Nat := 200)
+    (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
+  { status, contentType := "application/json; charset=utf-8", body := body.toUTF8, headers, cookies }
+
+def html (body : String) (status : Nat := 200)
+    (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
+  { status, contentType := "text/html; charset=utf-8", body := body.toUTF8, headers, cookies }
+
+def bytes (contentType : String) (body : ByteArray) (status : Nat := 200)
+    (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
+  { status, contentType, body, headers, cookies }
+
+def redirect (location : String) (status : Nat := 302) (cookies : List SetCookie := []) : HttpResponse :=
+  { status, contentType := "text/plain; charset=utf-8", body := ByteArray.empty,
+    headers := [("Location", sanitizeHeader location)], cookies }
+
+def sse (events : List SseEvent) (headers : List (String × String) := [])
+    (cookies : List SetCookie := []) : HttpResponse :=
+  { status := 200
+    contentType := "text/event-stream; charset=utf-8"
+    body := SseEvent.formatStream events
+    headers := [("Cache-Control", "no-cache"), ("X-Accel-Buffering", "no")] ++ headers
+    cookies }
+
+def withCookie (r : HttpResponse) (c : SetCookie) : HttpResponse :=
+  { r with cookies := r.cookies ++ [c] }
+
+def withHeader (r : HttpResponse) (k v : String) : HttpResponse :=
+  { r with headers := r.headers ++ [(k, v)] }
+
+end HttpResponse
+
+/-- Helper converting either `List SseEvent` or `Array SseEvent` into an SSE `HttpResponse`. -/
+class ToSseResponse (α : Type) where
+  toSseResponse : α → HttpResponse
+
+instance : ToSseResponse (List SseEvent) := ⟨HttpResponse.sse⟩
+instance : ToSseResponse (Array SseEvent) := ⟨fun arr => HttpResponse.sse arr.toList⟩
+instance : ToSseResponse HttpResponse := ⟨id⟩
 
 /-! ## SSRF Origin-Pinning & Path-Traversal Closure (`external_url_preserves_origin`) -/
 
@@ -504,14 +786,19 @@ structure OutboundResp where
 deriving Inhabited
 
 class MonadServer (m : Type → Type) where
-  httpCall    : OutboundReq → m (Except ApiError OutboundResp)
-  dbExec      : Db.DbConfig → Db.SqlQuery → m (Except ApiError Db.DbResult)
-  dbExecDdl   : Db.DbConfig → m (Except ApiError Unit)
-  readEnv     : String → m (Option String)
-  nowMs       : m UInt64
-  randomHex   : UInt32 → m String
-  hmacSha256  : ByteArray → ByteArray → m ByteArray
-  wsBroadcast : String → ByteArray → m Unit
+  httpCall     : OutboundReq → m (Except ApiError OutboundResp)
+  dbExec       : Db.DbConfig → Db.SqlQuery → m (Except ApiError Db.DbResult)
+  dbExecDdl    : Db.DbConfig → m (Except ApiError Unit)
+  dbTxBegin    : Db.DbConfig → m (Except ApiError UInt64)
+  dbTxExec     : Db.DbConfig → UInt64 → Db.SqlQuery → m (Except ApiError Db.DbResult)
+  dbTxCommit   : Db.DbConfig → UInt64 → m (Except ApiError Unit)
+  dbTxRollback : Db.DbConfig → UInt64 → m Unit
+  setCookie    : SetCookie → m Unit
+  readEnv      : String → m (Option String)
+  nowMs        : m UInt64
+  randomHex    : UInt32 → m String
+  hmacSha256   : ByteArray → ByteArray → m ByteArray
+  wsBroadcast  : String → ByteArray → m Unit
 
 structure WsEmit where
   topic   : String
@@ -542,25 +829,35 @@ class MonadAtomic (σ : Type) (m : Type → Type) where
 
 /-- Non-stateful external/OS I/O commands available to a server handler thread. -/
 inductive ServerEffect : Type where
-  | httpCall    (req : OutboundReq)
-  | dbExec      (cfg : Db.DbConfig) (q : Db.SqlQuery)
-  | dbExecDdl   (cfg : Db.DbConfig)
-  | readEnv     (v : String)
+  | httpCall     (req : OutboundReq)
+  | dbExec       (cfg : Db.DbConfig) (q : Db.SqlQuery)
+  | dbExecDdl    (cfg : Db.DbConfig)
+  | dbTxBegin    (cfg : Db.DbConfig)
+  | dbTxExec     (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery)
+  | dbTxCommit   (cfg : Db.DbConfig) (txId : UInt64)
+  | dbTxRollback (cfg : Db.DbConfig) (txId : UInt64)
+  | setCookie    (cookie : SetCookie)
+  | readEnv      (v : String)
   | nowMs
-  | randomHex   (n : UInt32)
-  | hmacSha256  (key msg : ByteArray)
-  | wsBroadcast (t : String) (p : ByteArray)
+  | randomHex    (n : UInt32)
+  | hmacSha256   (key msg : ByteArray)
+  | wsBroadcast  (t : String) (p : ByteArray)
 
 /-- Response payload type returned by each `ServerEffect`. -/
 def ServerEffect.Resp : ServerEffect → Type
-  | .httpCall _      => Except ApiError OutboundResp
-  | .dbExec _ _      => Except ApiError Db.DbResult
-  | .dbExecDdl _     => Except ApiError Unit
-  | .readEnv _       => Option String
-  | .nowMs           => UInt64
-  | .randomHex _     => String
-  | .hmacSha256 _ _  => ByteArray
-  | .wsBroadcast _ _ => Unit
+  | .httpCall _        => Except ApiError OutboundResp
+  | .dbExec _ _        => Except ApiError Db.DbResult
+  | .dbExecDdl _       => Except ApiError Unit
+  | .dbTxBegin _       => Except ApiError UInt64
+  | .dbTxExec _ _ _    => Except ApiError Db.DbResult
+  | .dbTxCommit _ _    => Except ApiError Unit
+  | .dbTxRollback _ _  => Unit
+  | .setCookie _       => Unit
+  | .readEnv _         => Option String
+  | .nowMs             => UInt64
+  | .randomHex _       => String
+  | .hmacSha256 _ _    => ByteArray
+  | .wsBroadcast _ _   => Unit
 
 /-- Effect tree of a server handler thread executing non-blocking external I/O interleaved with
     single-step `atomic` shared-state transitions on `σ`. Notice `σ` is unreachable during
@@ -582,14 +879,19 @@ instance {σ : Type} : Monad (ThreadProg σ) where
   bind := ThreadProg.bind
 
 instance {σ : Type} : MonadServer (ThreadProg σ) where
-  httpCall req       := .io (.httpCall req) .pure
-  dbExec cfg q       := .io (.dbExec cfg q) .pure
-  dbExecDdl cfg      := .io (.dbExecDdl cfg) .pure
-  readEnv v          := .io (.readEnv v) .pure
-  nowMs              := .io .nowMs .pure
-  randomHex n        := .io (.randomHex n) .pure
-  hmacSha256 key msg := .io (.hmacSha256 key msg) .pure
-  wsBroadcast t p    := .io (.wsBroadcast t p) .pure
+  httpCall req         := .io (.httpCall req) .pure
+  dbExec cfg q         := .io (.dbExec cfg q) .pure
+  dbExecDdl cfg        := .io (.dbExecDdl cfg) .pure
+  dbTxBegin cfg        := .io (.dbTxBegin cfg) .pure
+  dbTxExec cfg tid q   := .io (.dbTxExec cfg tid q) .pure
+  dbTxCommit cfg tid   := .io (.dbTxCommit cfg tid) .pure
+  dbTxRollback cfg tid := .io (.dbTxRollback cfg tid) .pure
+  setCookie c          := .io (.setCookie c) .pure
+  readEnv v            := .io (.readEnv v) .pure
+  nowMs                := .io .nowMs .pure
+  randomHex n          := .io (.randomHex n) .pure
+  hmacSha256 key msg   := .io (.hmacSha256 key msg) .pure
+  wsBroadcast t p      := .io (.wsBroadcast t p) .pure
 
 instance {σ : Type} : MonadAtomic σ (ThreadProg σ) where
   runAtomic f     := .atomic (fun s => (f s).1) (fun s => .pure (f s).2)
@@ -769,6 +1071,19 @@ instance {σ : Type} (req : OutboundReq) : SafeIO (MonadServer.httpCall (m := Th
 instance {σ : Type} (cfg : Db.DbConfig) (q : Db.SqlQuery) : SafeIO (MonadServer.dbExec (m := ThreadProg σ) cfg q) :=
   ⟨.io _ _ .pure⟩
 instance {σ : Type} (cfg : Db.DbConfig) : SafeIO (MonadServer.dbExecDdl (m := ThreadProg σ) cfg) :=
+  ⟨.io _ _ .pure⟩
+instance {σ : Type} (cfg : Db.DbConfig) : SafeIO (MonadServer.dbTxBegin (m := ThreadProg σ) cfg) :=
+  ⟨.io _ _ .pure⟩
+instance {σ : Type} (cfg : Db.DbConfig) (tid : UInt64) (q : Db.SqlQuery) :
+    SafeIO (MonadServer.dbTxExec (m := ThreadProg σ) cfg tid q) :=
+  ⟨.io _ _ .pure⟩
+instance {σ : Type} (cfg : Db.DbConfig) (tid : UInt64) :
+    SafeIO (MonadServer.dbTxCommit (m := ThreadProg σ) cfg tid) :=
+  ⟨.io _ _ .pure⟩
+instance {σ : Type} (cfg : Db.DbConfig) (tid : UInt64) :
+    SafeIO (MonadServer.dbTxRollback (m := ThreadProg σ) cfg tid) :=
+  ⟨.io _ _ .pure⟩
+instance {σ : Type} (c : SetCookie) : SafeIO (MonadServer.setCookie (m := ThreadProg σ) c) :=
   ⟨.io _ _ .pure⟩
 instance {σ : Type} (v : String) : SafeIO (MonadServer.readEnv (m := ThreadProg σ) v) :=
   ⟨.io _ _ .pure⟩
@@ -1202,6 +1517,34 @@ def srvFinishM {E : Type} [SrvErr E] {m : Type → Type} [Monad m] {α : Type}
   match ← res with
   | some r => return r
   | none   => return .error (SrvErr.ofApi (ApiError.internal "unreachable missing return"))
+
+/-- Executes a multi-statement database transaction on a single pinned connection:
+    begins with `BEGIN`, commits on `none` or `some (.ok v)`, and automatically executes
+    `ROLLBACK` on any `some (.error e)` (including `fail(.tag)` or `?`-propagated errors) or
+    commit failure. -/
+@[inline, specialize]
+def dbRunTx {E : Type} [SrvErr E] {m : Type → Type} [Monad m] [MonadServer m] {α : Type}
+    (cfg : Db.DbConfig) (body : UInt64 → m (Option (Except E α))) : m (Option (Except E α)) := do
+  match ← MonadServer.dbTxBegin cfg with
+  | .error e => return some (.error (SrvErr.ofApi e))
+  | .ok txId =>
+      let res ← body txId
+      match res with
+      | some (.error e) =>
+          MonadServer.dbTxRollback cfg txId
+          return some (.error e)
+      | some (.ok v) =>
+          match ← MonadServer.dbTxCommit cfg txId with
+          | .ok ()   => return some (.ok v)
+          | .error e =>
+              MonadServer.dbTxRollback cfg txId
+              return some (.error (SrvErr.ofApi e))
+      | none =>
+          match ← MonadServer.dbTxCommit cfg txId with
+          | .ok ()   => return none
+          | .error e =>
+              MonadServer.dbTxRollback cfg txId
+              return some (.error (SrvErr.ofApi e))
 
 /-! ## Opaque Equality-Abstracted SSA Stepping (`srvLetEq`) -/
 

@@ -5,25 +5,38 @@ import Qed.Proofs.ViewPatch.Runtime
 
 namespace Qed
 
+private abbrev PatchViewPost {σ msg : Type} (f : Nat) (childNs : String) (parent : Dom.Node)
+    (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
+    (v : View σ msg) (s₂ : σ) (pre suf : List Dom.Node) (Sold : Nat → Prop) (a : DomArena msg)
+    (res : VState σ msg × DomArena msg) : Prop :=
+  let (vst', a') := res
+  a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render v s₂) ∧
+  (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
+  a'.get parent = .element pns ptag pst pmg (pre ++ vst'.rootNode :: suf) ∧ (pre ++ vst'.rootNode :: suf).Nodup ∧
+  (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧
+  VStateValid f childNs v s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧
+  DomTreeAssocEquiv (readDomTree f a' vst'.rootNode) (specDom childNs (View.render v s₂))
+
+private abbrev PatchViewGoal {σ msg : Type} (f : Nat) (childNs : String) (parent : Dom.Node)
+    (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
+    (v : View σ msg) (s₁ s₂ : σ) (pre suf : List Dom.Node) (Sold : Nat → Prop) (a : DomArena msg) (vst : VState σ msg) : Prop :=
+  childNs = (if pns == Dom.svgNs && ptag != "foreignObject" then Dom.svgNs else "") →
+  View.DomClean v → pre.length + 1 + suf.length < UInt32.size →
+  a.nextId + htmlNodeCount (View.render v s₂) < UInt32.size →
+  htmlDepth (View.render v s₂) ≤ f → parent.toNat < a.nextId → 0 < a.nextId →
+  a.get parent = .element pns ptag pst pmg (pre ++ vst.rootNode :: suf) →
+  (pre ++ vst.rootNode :: suf).Nodup → ¬Sold parent.toNat →
+  (∀ k, Sold k → k < a.nextId) → (∀ r ∈ pre ++ vst.rootNode :: suf, r.toNat < a.nextId) →
+  VStateValid f childNs v s₁ a Sold vst →
+  PatchViewPost f childNs parent pns ptag pst pmg v s₂ pre suf Sold a
+    ((patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) v s₂ vst).run a)
+
 private theorem patchViewM_leaf_spec {σ msg : Type} (f : Nat) (childNs : String) (parent : Dom.Node)
     (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
     (v : View σ msg) (hleaf : match v with | .text _ | .static _ | .dyn _ | .dynNode _ | .memo _ => True | _ => False)
-    (s₁ s₂ : σ) (pre suf : List Dom.Node) (Sold : Nat → Prop) (a : DomArena msg) (vst : VState σ msg)
-    (hchildNs : childNs = if pns == Dom.svgNs && ptag != "foreignObject" then Dom.svgNs else "")
-    (hclean : View.DomClean v) (hpreLen : pre.length + 1 + suf.length < UInt32.size)
-    (hbound : a.nextId + htmlNodeCount (View.render v s₂) < UInt32.size)
-    (hdep : htmlDepth (View.render v s₂) ≤ f) (hparLt : parent.toNat < a.nextId) (hpos : 0 < a.nextId)
-    (hpar : a.get parent = .element pns ptag pst pmg (pre ++ vst.rootNode :: suf))
-    (hnd : (pre ++ vst.rootNode :: suf).Nodup) (hparOut : ¬Sold parent.toNat)
-    (hSoldLt : ∀ k, Sold k → k < a.nextId) (hparNodes : ∀ r ∈ pre ++ vst.rootNode :: suf, r.toNat < a.nextId)
-    (hval : VStateValid f childNs v s₁ a Sold vst) :
-    let (vst', a') := (patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) v s₂ vst).run a
-    a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render v s₂) ∧
-    (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
-    a'.get parent = .element pns ptag pst pmg (pre ++ vst'.rootNode :: suf) ∧ (pre ++ vst'.rootNode :: suf).Nodup ∧
-    (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧
-    VStateValid f childNs v s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧
-    DomTreeAssocEquiv (readDomTree f a' vst'.rootNode) (specDom childNs (View.render v s₂)) := by
+    (s₁ s₂ : σ) (pre suf : List Dom.Node) (Sold : Nat → Prop) (a : DomArena msg) (vst : VState σ msg) :
+    PatchViewGoal f childNs parent pns ptag pst pmg v s₁ s₂ pre suf Sold a vst := by
+  intro hchildNs hclean hpreLen hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hval
   cases v with
   | ifElse _ _ _ | element _ _ _ | keyedList _ _ _ _ _ _ _ _ => exact False.elim hleaf
   | text _ =>
@@ -97,25 +110,6 @@ private theorem patchViewM_leaf_spec {σ msg : Type} (f : Nat) (childNs : String
                 exact ⟨h1, h2, h3, h4, h5, h6, ⟨h7, rfl, rfl, rfl⟩, h8⟩
       | _ => exact False.elim hval.2
 
-private abbrev PatchViewGoal {σ msg : Type} (f : Nat) (childNs : String) (parent : Dom.Node)
-    (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
-    (v : View σ msg) (s₁ s₂ : σ) (pre suf : List Dom.Node) (Sold : Nat → Prop) (a : DomArena msg) (vst : VState σ msg) : Prop :=
-  childNs = (if pns == Dom.svgNs && ptag != "foreignObject" then Dom.svgNs else "") →
-  View.DomClean v → pre.length + 1 + suf.length < UInt32.size →
-  a.nextId + htmlNodeCount (View.render v s₂) < UInt32.size →
-  htmlDepth (View.render v s₂) ≤ f → parent.toNat < a.nextId → 0 < a.nextId →
-  a.get parent = .element pns ptag pst pmg (pre ++ vst.rootNode :: suf) →
-  (pre ++ vst.rootNode :: suf).Nodup → ¬Sold parent.toNat →
-  (∀ k, Sold k → k < a.nextId) → (∀ r ∈ pre ++ vst.rootNode :: suf, r.toNat < a.nextId) →
-  VStateValid f childNs v s₁ a Sold vst →
-  let (vst', a') := (patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) v s₂ vst).run a
-  a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render v s₂) ∧
-  (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
-  a'.get parent = .element pns ptag pst pmg (pre ++ vst'.rootNode :: suf) ∧ (pre ++ vst'.rootNode :: suf).Nodup ∧
-  (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧
-  VStateValid f childNs v s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧
-  DomTreeAssocEquiv (readDomTree f a' vst'.rootNode) (specDom childNs (View.render v s₂))
-
 private abbrev PatchViewKidsGoal {σ msg : Type} (f : Nat) (childNs : String) (parent : Dom.Node)
     (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
     (kids : List (View σ msg)) (targetsDone : List (Html msg)) (preC sufC : List Dom.Node)
@@ -155,27 +149,17 @@ private theorem patchViewM_ifElse_spec {σ msg : Type} (f : Nat) (childNs : Stri
       by_cases hsame : cond s₂ = wasYes
       · simp only [beq_iff_eq.2 hsame, ↓reduceIte]
         have hwrap : ∀ (v' : View σ msg) (b : Bool), cond s₂ = b → (if b then yes else no) = v' →
-            (let (inner', a') := (patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) v' s₂ inner).run a
-             a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render v' s₂) ∧
-             (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
-             a'.get parent = .element pns ptag pst pmg (pre ++ inner'.rootNode :: suf) ∧ (pre ++ inner'.rootNode :: suf).Nodup ∧
-             (∀ r ∈ pre ++ inner'.rootNode :: suf, r.toNat < a'.nextId) ∧
-             VStateValid f childNs v' s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) inner' ∧
-             DomTreeAssocEquiv (readDomTree f a' inner'.rootNode) (specDom childNs (View.render v' s₂))) →
-            let (vst', a') := (StateT.bind (patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) (if cond s₂ then yes else no) s₂ inner)
-              fun inner' => StateT.pure (VState.cond (cond s₂) inner')) a
-            a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render (.ifElse cond yes no) s₂) ∧
-            (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
-            a'.get parent = .element pns ptag pst pmg (pre ++ vst'.rootNode :: suf) ∧ (pre ++ vst'.rootNode :: suf).Nodup ∧
-            (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧
-            VStateValid f childNs (.ifElse cond yes no) s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧
-            DomTreeAssocEquiv (readDomTree f a' vst'.rootNode) (specDom childNs (View.render (.ifElse cond yes no) s₂)) := by
+            PatchViewPost f childNs parent pns ptag pst pmg v' s₂ pre suf Sold a
+              ((patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) v' s₂ inner).run a) →
+            PatchViewPost f childNs parent pns ptag pst pmg (.ifElse cond yes no) s₂ pre suf Sold a
+              ((StateT.bind (patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) (if cond s₂ then yes else no) s₂ inner)
+                fun inner' => StateT.pure (VState.cond (cond s₂) inner')) a) := by
           intro v' b hcb hveq hih
           dsimp only [StateT.run] at hih
           cases hp : patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) v' s₂ inner a with
           | mk inner' a' =>
-              rw [hp] at hih; dsimp only at hih; rcases hih with ⟨h1, h2, h3, h4, h5, h6, ⟨hcl', hm'⟩, heqv'⟩
-              dsimp only [StateT.bind, StateT.pure]
+              rw [hp] at hih; rcases hih with ⟨h1, h2, h3, h4, h5, h6, ⟨hcl', hm'⟩, heqv'⟩
+              dsimp only [PatchViewPost, StateT.bind, StateT.pure]
               cases b <;> (simp only [hcb, Bool.false_eq_true, ↓reduceIte, View.render] at hveq ⊢; subst hveq; rw [hp]; dsimp only; exact ⟨h1, h2, h3, h4, h5, h6, ⟨by simp only [View.render, hcb, Bool.false_eq_true, ↓reduceIte]; exact hcl', hcb.symm, by simp only [hcb, Bool.false_eq_true, ↓reduceIte]; exact hm'⟩, heqv'⟩)
         cases hc₂ : cond s₂
         · have hF : cond s₁ = false := by rw [← hwy, ← hsame, hc₂]
@@ -229,7 +213,7 @@ private theorem patchViewM_ifElse_spec {σ msg : Type} (f : Nat) (childNs : Stri
                 rw [hB] <;>
                 simp only [DomArena.modifyChildren, DomArena.modify, hparMid, huJ,
                   listReplaceAt_append_middle, pure, a']
-            rw [hgoalRun]; dsimp only
+            rw [hgoalRun]
             have hn2Ge : a.nextId ≤ n2.toNat := by have hrm := VStateValid_root_mem hVstMid; rw [hn2Root] at hrm; exact hrm.1
             have hn2NotIn : n2 ∉ pre ++ inner.rootNode :: suf := fun hm =>
               Nat.not_lt.2 hn2Ge (hparNodes n2 hm)
@@ -371,7 +355,7 @@ private theorem patchViewKidsM_spec_of {σ msg : Type} (f : Nat) (childNs : Stri
           dsimp only [patchViewKidsM, StateT.run, bind, StateT.bind, pure, StateT.pure]
           cases hpK : patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat preC.length) k s₂ kst a with
           | mk kst' aMid =>
-              rw [hpK] at hpatchK; dsimp only at hpatchK
+              rw [hpK] at hpatchK
               rcases hpatchK with ⟨haMidGe, haMidBound, hfrMid, hparMid, hndMid, hparNodesMid, hValK', _⟩
               let Sdone' : Nat → Prop := fun x => Sdone x ∨ (Sc x ∨ (a.nextId ≤ x ∧ x < aMid.nextId))
               have ⟨hSdone', hDone'⟩ := clean_done_extend haMidGe hparLt hSdone (fun x h => hSrem x (hSc x h))

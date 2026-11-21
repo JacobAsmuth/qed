@@ -171,14 +171,14 @@ private theorem clean_create_step {msg : Type} (f : Nat)
       CleanDomChildren f childNs (targetsDone ++ [newH]) aIns (fun k => Sdone k ∨ (a.nextId ≤ k ∧ k < aIns.nextId)) (pre ++ [cn]) := by
   have hchildNsRun : MonadDom.childNamespace (m := StateM (DomArena msg)) parent a = (childNs, a) := by
     simp [MonadDom.childNamespace, hpar, hchildNs]
-  have hbuildMono := buildDomM_nextId_mono childNs newH a
-  have hbuildSpec := buildDomM_spec childNs newH a f hposId hbound hdep
-  have hbuildClean := CleanDomSubtree_of_buildDomM childNs newH a f hclean hposId hbound hdep
-  dsimp only [StateT.run] at hbuildMono hbuildSpec hbuildClean
+  have hbuild := buildDomM_spec_full childNs newH a f hposId hbound hdep
+  dsimp only [StateT.run] at hbuild
   cases hB : buildDomM (m := StateM (DomArena msg)) childNs newH a with
   | mk cn aMid =>
-      rw [hB] at hbuildMono hbuildSpec hbuildClean; dsimp only at hbuildMono hbuildSpec hbuildClean
-      rcases hbuildSpec with ⟨hcnGe, hcnLt, haMidBound, haMidFrame, _, _⟩
+      rw [hB] at hbuild; dsimp only at hbuild
+      rcases hbuild with ⟨hcnGe, hcnLt, haMidExt, _, _, hbuildCleanFn⟩
+      have haMidFrame : ∀ m : Dom.Node, m.toNat < a.nextId → aMid.get m = a.get m :=
+        fun m hm => haMidExt.frame m hm id
       have hparMid : aMid.get parent = .element pns ptag pst pmg (pre ++ suf) := by rw [haMidFrame parent hparLt, hpar]
       have hcnNotIn : cn ∉ pre ++ suf := fun hm => by
         rcases List.mem_append.1 hm with hp | hs
@@ -186,7 +186,6 @@ private theorem clean_create_step {msg : Type} (f : Nat)
         · have := (hsufB cn hs).1; omega
       have huJ : (UInt32.ofNat pre.length).toNat = pre.length := uint32_toNat_ofNat_lt pre.length (by omega)
       let aIns := aMid.set parent (.element pns ptag pst pmg ((pre ++ [cn]) ++ suf))
-      have haInsNext : aIns.nextId = aMid.nextId := rfl
       have hinsRun : (aMid.modifyChildren parent fun cs => w3cInsertBefore cs (UInt32.ofNat pre.length).toNat cn) = aIns := by
         simp only [DomArena.modifyChildren, DomArena.modify, hparMid, huJ,
                    keyed_step_insertBefore_create pre suf cn hnd hcnNotIn, aIns, List.append_assoc, List.singleton_append]
@@ -194,11 +193,11 @@ private theorem clean_create_step {msg : Type} (f : Nat)
         CleanDomChildren_frame (fun m hm => by
           rw [DomArena.get_set_ne _ _ (node_ne_of_toNat_ne (hSdone _ hm).1)]; exact haMidFrame m (hSdone _ hm).2) hDoneC
       have hcnIns : CleanDomSubtree f childNs newH aIns (fun k => a.nextId ≤ k ∧ k < aIns.nextId) cn :=
-        CleanDomSubtree_frame (fun m _ => DomArena.get_set_ne _ _ fun heq => by subst heq; omega) hbuildClean
+        CleanDomSubtree_frame (fun m _ => DomArena.get_set_ne _ _ fun heq => by subst heq; omega) (hbuildCleanFn hclean)
       have hDone' := CleanDomChildren_append (fun k hk1 hk2 => by have := (hSdone k hk1).2; omega) hDoneIns
         (show CleanDomChildren f childNs [newH] aIns (fun k => a.nextId ≤ k ∧ k < aIns.nextId) [cn] from
           ⟨fun k => a.nextId ≤ k ∧ k < aIns.nextId, fun _ => False, fun _ h => h, fun _ h => h.elim, fun _ _ h => h.elim, hcnIns, trivial⟩)
-      exact ⟨cn, aMid, aIns, hchildNsRun, rfl, hinsRun, hbuildMono, haMidBound, haInsNext,
+      exact ⟨cn, aMid, aIns, hchildNsRun, rfl, hinsRun, haMidExt.next_ge, haMidExt.next_le, rfl,
         DomArena.get_set_self _ _ _, nodup_snoc_append hnd hcnNotIn,
         fun m hmPar hmLt => by rw [DomArena.get_set_ne _ _ hmPar, haMidFrame m hmLt], hDone'⟩
 
@@ -295,7 +294,6 @@ private theorem applyPositionalStepsM_clean_step {msg : Type} (f : Nat) (hPatch 
                       let aMid := (applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child (diff cO t) a).2
                       have haMidLe' : a.nextId ≤ aMid.nextId := haMidLe
                       have haMidBound' : aMid.nextId ≤ a.nextId + htmlNodeCount t := haMidBound
-                      have hApEq : (applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child (diff cO t) a).2 = aMid := rfl
                       let Sdone' : Nat → Prop := fun k => Sdone k ∨ (Sc k ∨ (a.nextId ≤ k ∧ k < aMid.nextId))
                       have ⟨hSdone', hDone'⟩ := clean_done_extend haMidLe' hparLt hSdone (fun k h => hSrem k (hSc k h))
                         (fun k h1 h2 => hDisj k h1 (hSc k h2))
@@ -330,17 +328,11 @@ private theorem applyPositionalStepsM_clean_step {msg : Type} (f : Nat) (hPatch 
                       rcases hih with ⟨targetsRest, sufRem, Snew, hlenR, htotLenR, hmonoR, hboundR, hparR, hfrR, hSnew, hDoneR⟩
                       have hstepRun : applyPositionalStepsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) (.reuse oldIdx (diff cO t) :: sRest) a =
                           applyPositionalStepsM (m := StateM (DomArena msg)) parent (UInt32.ofNat (pre ++ [newChild]).length) sRest aMid := by
-                        dsimp only [applyPositionalStepsM, bind, StateT.bind]
-                        have haEq := DomArena.set_get_self a hpar; rw [haEq] at hchildAt
-                        change (match MonadDom.childAt (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) a with
-                                | (ch, a1) => match applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) ch (diff cO t) a1 with
-                                  | (_, a2) => applyPositionalStepsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length + 1) sRest a2) = _
-                        rw [hchildAt]; dsimp only
-                        change (match applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child (diff cO t) a with
-                                | (_, a2) => applyPositionalStepsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length + 1) sRest a2) = _
-                        cases hAp : applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child (diff cO t) a with
-                        | mk _ a2 => have hEq2 : a2 = aMid := by rw [← hApEq, hAp]
-                                     subst hEq2; simp only [List.length_append, List.length_singleton, huJNext]
+                        dsimp only [applyPositionalStepsM, bind]
+                        rw [DomArena.set_get_self a hpar] at hchildAt
+                        rw [stateM_bind_step hchildAt]
+                        have hAp : applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child (diff cO t) a = ((), aMid) := rfl
+                        rw [stateM_bind_step hAp]; simp only [List.length_append, List.length_singleton, huJNext]
                       dsimp only [StateT.run] at hlenR htotLenR hmonoR hboundR hparR hfrR hSnew hDoneR ⊢
                       rw [hstepRun]
                       simp only [List.append_assoc, List.singleton_append] at hparR hDoneR
@@ -380,13 +372,10 @@ private theorem applyPositionalStepsM_clean_step {msg : Type} (f : Nat) (hPatch 
                 (fun r hr => have hb := hsufB r hr; ⟨Nat.lt_of_lt_of_le hb.1 haInsGe, hb.2⟩) hsufCleanIns
               have hstepRun : applyPositionalStepsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) (.create newH :: sRest) a =
                   applyPositionalStepsM (m := StateM (DomArena msg)) parent (UInt32.ofNat (pre ++ [cn]).length) sRest aIns := by
-                rw [htEq]; dsimp only [applyPositionalStepsM, bind, StateT.bind]
-                change (match MonadDom.childNamespace (m := StateM (DomArena msg)) parent a with
-                        | (ns', a1) => match buildDomM (m := StateM (DomArena msg)) ns' t a1 with
-                          | (cn', a2) => match MonadDom.insertBeforeNode (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) cn' a2 with
-                            | (_, a3) => applyPositionalStepsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length + 1) sRest a3) = _
-                rw [hchildNsRun]; dsimp only; rw [hbuildEq]; dsimp only
-                rw [hinsRun]; simp only [List.length_append, List.length_singleton, huJNext]
+                rw [htEq]; dsimp only [applyPositionalStepsM, bind]
+                rw [stateM_bind_step hchildNsRun, stateM_bind_step hbuildEq,
+                    stateM_bind_step (show MonadDom.insertBeforeNode (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) cn aMid = ((), aIns) from congrArg ((), ·) hinsRun)]
+                simp only [List.length_append, List.length_singleton, huJNext]
               dsimp only [StateT.run] at hih ⊢; rw [hstepRun]
               rcases hih with ⟨targetsRest, sufRem, Snew, hlenR, htotLenR, hmonoR, hboundR, hparR, hfrR, hSnew, hDoneR⟩
               simp only [List.append_assoc, List.singleton_append] at hparR hDoneR
@@ -417,36 +406,32 @@ private theorem replace_child_clean {msg : Type} (f : Nat)
       (∀ r ∈ pre ++ newNode :: suf, r.toNat < a'.nextId) ∧ CleanDomSubtree f childNs newH a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) newNode := by
   have hchildNsRun : MonadDom.childNamespace (m := StateM (DomArena msg)) parent a = (childNs, a) := by
     simp [MonadDom.childNamespace, hpar, hchildNs]
-  have hbuildMono := buildDomM_nextId_mono childNs newH a
-  have hbuildSpec := buildDomM_spec childNs newH a f hpos hbound hdep
-  have hbuildClean := CleanDomSubtree_of_buildDomM childNs newH a f hcleanNew hpos hbound hdep
-  dsimp only [StateT.run] at hbuildMono hbuildSpec hbuildClean ⊢
+  have hbuild := buildDomM_spec_full childNs newH a f hpos hbound hdep
+  dsimp only [StateT.run] at hbuild ⊢
   cases hB : buildDomM (m := StateM (DomArena msg)) childNs newH a with
   | mk n2 aMid =>
-      rw [hB] at hbuildMono hbuildSpec hbuildClean; dsimp only at hbuildMono hbuildSpec hbuildClean
-      rcases hbuildSpec with ⟨hn2Ge, hn2Lt, haMidBound, haMidFrame, _, _⟩
+      rw [hB] at hbuild; dsimp only at hbuild
+      rcases hbuild with ⟨hn2Ge, hn2Lt, haMidExt, _, _, hbuildCleanFn⟩
+      have haMidFrame : ∀ m : Dom.Node, m.toNat < a.nextId → aMid.get m = a.get m :=
+        fun m hm => haMidExt.frame m hm id
       have hparMid : aMid.get parent = .element pns ptag pst pmg (pre ++ node :: suf) := by rw [haMidFrame parent hparLt, hpar]
       have huJ : (UInt32.ofNat pre.length).toNat = pre.length := uint32_toNat_ofNat_lt pre.length (by omega)
       let a' := aMid.set parent (.element pns ptag pst pmg (pre ++ n2 :: suf))
-      have ha'Next : a'.nextId = aMid.nextId := rfl
       have hrun : applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (.replace newH) a = ((), a') := by
-        dsimp only [applyToDomM, bind, StateT.bind]
-        change (match MonadDom.childNamespace (m := StateM (DomArena msg)) parent a with
-                | (ns', a1) => match buildDomM (m := StateM (DomArena msg)) ns' newH a1 with
-                  | (n2', a2) => MonadDom.replaceChild (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) n2' a2) = _
-        rw [hchildNsRun]; dsimp only; rw [hB]; dsimp only
+        dsimp only [applyToDomM, bind]
+        rw [stateM_bind_step hchildNsRun, stateM_bind_step hB]
         simp [MonadDom.replaceChild, DomArena.modifyChildren, DomArena.modify, hparMid, huJ, listReplaceAt_append_middle, a']
-      rw [hrun, ha'Next]
+      rw [hrun]
       have hn2NotIn : n2 ∉ pre ++ node :: suf := fun hm => by have := hparNodesLt n2 hm; omega
-      refine ⟨hbuildMono, haMidBound, fun m hmPar _ hmLt => by rw [DomArena.get_set_ne _ _ hmPar, haMidFrame m hmLt],
+      refine ⟨haMidExt.next_ge, haMidExt.next_le, fun m hmPar _ hmLt => by rw [DomArena.get_set_ne _ _ hmPar, haMidFrame m hmLt],
         n2, rfl, DomArena.get_set_self _ _ _, nodup_append_replace hnd (.inr hn2NotIn), fun r hr => ?_, ?_⟩
       · rcases List.mem_append.1 hr with hp | hc
-        · have := hparNodesLt r (List.mem_append_left _ hp); omega
+        · exact Nat.lt_of_lt_of_le (hparNodesLt r (List.mem_append_left _ hp)) haMidExt.next_ge
         · rcases List.mem_cons.1 hc with rfl | hs
           · exact hn2Lt
-          · have := hparNodesLt r (List.mem_append_right _ (.tail _ hs)); omega
+          · exact Nat.lt_of_lt_of_le (hparNodesLt r (List.mem_append_right _ (.tail _ hs))) haMidExt.next_ge
       · exact CleanDomSubtree_mono (fun _ hk => .inr hk)
-          (CleanDomSubtree_frame (fun m _ => DomArena.get_set_ne _ _ fun heq => by subst heq; omega) hbuildClean)
+          (CleanDomSubtree_frame (fun m _ => DomArena.get_set_ne _ _ fun heq => by subst heq; omega) (hbuildCleanFn hcleanNew))
 
 private theorem positional_reuse_idx {msg : Type} :
     ∀ (base : Nat) (steps : List (KeyedStep msg)) (k idx : Nat) (p : Patch msg),
@@ -562,7 +547,6 @@ theorem applyKeyedStepsM_reconcile_spec {msg : Type} (f : Nat) (hPatch : @PatchS
               let aMid := (applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child (diff c₁[oldIdx] t) a1).2
               have haMidLe' : a.nextId ≤ aMid.nextId := haMidLe
               have haMidBound' : aMid.nextId ≤ a.nextId + htmlNodeCount t := haMidBound
-              have hApEq : (applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child (diff c₁[oldIdx] t) a1).2 = aMid := rfl
               let Sdone' : Nat → Prop := fun k => Sdone k ∨ (Si oldIdx k ∨ (a1.nextId ≤ k ∧ k < aMid.nextId))
               have ⟨hSdone', hDone'⟩ := clean_done_extend haMidLe' hparLt hSdone
                 (fun k h => let hb := hSiB _ k h; ⟨hb.1, Nat.lt_of_lt_of_le hb.2 hbase⟩)
@@ -606,16 +590,10 @@ theorem applyKeyedStepsM_reconcile_spec {msg : Type} (f : Nat) (hPatch : @PatchS
                 (fun r hr => have hr0 := hsufB r (List.mem_of_mem_erase hr); ⟨Nat.lt_of_lt_of_le hr0.1 haMidLe', hr0.2⟩)
               have hstepRun : applyKeyedStepsM (m := StateM (DomArena msg)) parent live (UInt32.ofNat pre.length) (.reuse oldIdx (diff c₁[oldIdx] t) :: sRest) a =
                   applyKeyedStepsM (m := StateM (DomArena msg)) parent live (UInt32.ofNat (pre ++ [newChild]).length) sRest aMid := by
-                dsimp only [applyKeyedStepsM, bind, StateT.bind]
-                change (match MonadDom.insertBeforeNode (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child a with
-                        | (_, a1') => match applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child (diff c₁[oldIdx] t) a1' with
-                          | (_, a2) => applyKeyedStepsM (m := StateM (DomArena msg)) parent live (UInt32.ofNat pre.length + 1) sRest a2) = _
-                rw [hparIns]; dsimp only
-                change (match applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child (diff c₁[oldIdx] t) a1 with
-                        | (_, a2) => applyKeyedStepsM (m := StateM (DomArena msg)) parent live (UInt32.ofNat pre.length + 1) sRest a2) = _
-                cases hAp : applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child (diff c₁[oldIdx] t) a1 with
-                | mk _ a2 => have hEq2 : a2 = aMid := by rw [← hApEq, hAp]
-                             subst hEq2; simp only [List.length_append, List.length_singleton, huJNext]
+                dsimp only [applyKeyedStepsM, bind]
+                rw [stateM_bind_step hparIns,
+                    stateM_bind_step (show applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child (diff c₁[oldIdx] t) a1 = ((), aMid) from rfl)]
+                simp only [List.length_append, List.length_singleton, huJNext]
               dsimp only [StateT.run] at hih ⊢; rw [hstepRun]
               rcases hih with ⟨targetsRest, sufRem, Snew, hfj, hlenR, htotLenR, hmonoR, hboundR, hparR, hfrR, hSnew, hDoneR⟩
               simp only [List.append_assoc, List.singleton_append] at hparR hDoneR
@@ -653,13 +631,10 @@ theorem applyKeyedStepsM_reconcile_spec {msg : Type} (f : Nat) (hPatch : @PatchS
                 (fun r hr => have hb := hsufB r hr; ⟨Nat.lt_of_lt_of_le hb.1 haInsGe, hb.2⟩)
               have hstepRun : applyKeyedStepsM (m := StateM (DomArena msg)) parent live (UInt32.ofNat pre.length) (.create newH :: sRest) a =
                   applyKeyedStepsM (m := StateM (DomArena msg)) parent live (UInt32.ofNat (pre ++ [cn]).length) sRest aIns := by
-                rw [htEq]; dsimp only [applyKeyedStepsM, bind, StateT.bind]
-                change (match MonadDom.childNamespace (m := StateM (DomArena msg)) parent a with
-                        | (ns', a1) => match buildDomM (m := StateM (DomArena msg)) ns' t a1 with
-                          | (cn', a2) => match MonadDom.insertBeforeNode (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) cn' a2 with
-                            | (_, a3) => applyKeyedStepsM (m := StateM (DomArena msg)) parent live (UInt32.ofNat pre.length + 1) sRest a3) = _
-                rw [hchildNsRun]; dsimp only; rw [hbuildEq]; dsimp only
-                rw [hinsRun]; simp only [List.length_append, List.length_singleton, huJNext]
+                rw [htEq]; dsimp only [applyKeyedStepsM, bind]
+                rw [stateM_bind_step hchildNsRun, stateM_bind_step hbuildEq,
+                    stateM_bind_step (show MonadDom.insertBeforeNode (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) cn aMid = ((), aIns) from congrArg ((), ·) hinsRun)]
+                simp only [List.length_append, List.length_singleton, huJNext]
               dsimp only [StateT.run] at hih ⊢; rw [hstepRun]
               rcases hih with ⟨targetsRest, sufRem, Snew, hfj, hlenR, htotLenR, hmonoR, hboundR, hparR, hfrR, hSnew, hDoneR⟩
               simp only [List.append_assoc, List.singleton_append] at hparR hDoneR
@@ -891,18 +866,13 @@ theorem applyToDomM_spec {msg : Type} (fuel : Nat) : @PatchSpecAt msg fuel := by
                           (∀ m : Dom.Node, m ≠ node → ¬(Sold m.toNat ∧ m.toNat ≠ node.toNat) → m.toNat < a1.nextId → aOut.get m = a1.get m) ∧
                           (∀ k, Snew k → ((Sold k ∧ k ≠ node.toNat) ∨ (a1.nextId ≤ k ∧ k < aOut.nextId)) ∧ k ≠ node.toNat) ∧
                           CleanDomChildren f (Dom.childNsOf childNs t₁) c₂ aOut Snew targetsOut) →
-                        a.nextId ≤ ((applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (diff (.element t₁ a₁ c₁) (.element t₁ a₂ c₂))).run a).2.nextId ∧
-                        ((applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (diff (.element t₁ a₁ c₁) (.element t₁ a₂ c₂))).run a).2.nextId ≤ a.nextId + htmlNodeCount (.element t₁ a₂ c₂) ∧
-                        (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId →
-                          ((applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (diff (.element t₁ a₁ c₁) (.element t₁ a₂ c₂))).run a).2.get m = a.get m) ∧
+                        let a' := ((applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (diff (.element t₁ a₁ c₁) (.element t₁ a₂ c₂))).run a).2
+                        a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (.element t₁ a₂ c₂) ∧
+                        (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
                         ∃ newNode, (diff (.element t₁ a₁ c₁) (.element t₁ a₂ c₂) = .replace (.element t₁ a₂ c₂) ∨ newNode = node) ∧
-                          ((applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (diff (.element t₁ a₁ c₁) (.element t₁ a₂ c₂))).run a).2.get parent = .element pns ptag pst pmg (pre ++ newNode :: suf) ∧
-                          (pre ++ newNode :: suf).Nodup ∧
-                          (∀ r ∈ pre ++ newNode :: suf, r.toNat < ((applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (diff (.element t₁ a₁ c₁) (.element t₁ a₂ c₂))).run a).2.nextId) ∧
-                          CleanDomSubtree (f + 1) childNs (.element t₁ a₂ c₂)
-                            ((applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (diff (.element t₁ a₁ c₁) (.element t₁ a₂ c₂))).run a).2
-                            (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < ((applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (diff (.element t₁ a₁ c₁) (.element t₁ a₂ c₂))).run a).2.nextId))
-                            newNode := by
+                          a'.get parent = .element pns ptag pst pmg (pre ++ newNode :: suf) ∧ (pre ++ newNode :: suf).Nodup ∧
+                          (∀ r ∈ pre ++ newNode :: suf, r.toNat < a'.nextId) ∧
+                          CleanDomSubtree (f + 1) childNs (.element t₁ a₂ c₂) a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) newNode := by
                       intro aOut hrun hres
                       rcases hres with ⟨targetsOut, Snew, haOutGe, haOutBound, hnodeOut, hfrOut, hSnew, hCleanOut⟩
                       dsimp only [StateT.run]; rw [hrun]
@@ -984,22 +954,16 @@ theorem patchHtmlSubtreeM_spec {msg : Type} (f : Nat)
            StateT.bind (buildDomM (m := StateM (DomArena msg)) ns' h2) fun n2' =>
            StateT.bind (MonadDom.replaceChild (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) n2') fun _ => StateT.pure n2') a =
           (n2, ((applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) node (.replace h2)).run a).2) := by
-        dsimp only [applyToDomM, StateT.run, bind, StateT.bind, pure, StateT.pure]
         have hns : MonadDom.childNamespace (m := StateM (DomArena msg)) parent a = (childNs, a) := by
           simp [MonadDom.childNamespace, hpar, hchildNs]
-        change (match MonadDom.childNamespace (m := StateM (DomArena msg)) parent a with
-                | (ns', a1) => match buildDomM (m := StateM (DomArena msg)) ns' h2 a1 with
-                  | (n2', a2) => match MonadDom.replaceChild (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) n2' a2 with
-                    | (_, a3) => (n2', a3)) =
-               (n2, (match MonadDom.childNamespace (m := StateM (DomArena msg)) parent a with
-                    | (ns', a1) => match buildDomM (m := StateM (DomArena msg)) ns' h2 a1 with
-                      | (n2', a2) => MonadDom.replaceChild (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) n2' a2).2)
-        rw [hns]; dsimp only
+        dsimp only [applyToDomM, StateT.run, bind]
+        rw [stateM_bind_step hns, stateM_bind_step hns]
         cases hB : buildDomM (m := StateM (DomArena msg)) childNs h2 a with
         | mk n' a' =>
             rw [hB] at hn2Eq; dsimp only at hn2Eq; subst hn2Eq
+            rw [stateM_bind_step hB, stateM_bind_step hB]
             cases hR : MonadDom.replaceChild (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) n2 a' with
-            | mk _ a3 => rfl
+            | mk _ a3 => rw [stateM_bind_step hR]; rfl
       dsimp only [patchHtmlSubtreeM, StateT.run, bind, StateT.bind, pure, StateT.pure]; rw [hd]; dsimp only; rw [hEqRun]
       exact ⟨hle, hbd, hfr, hpar', hnd', hnodes', hcl', CleanDomSubtree_equiv hcl'⟩
   | setText _ | patchElement _ _ =>

@@ -846,7 +846,8 @@ private def execNativeDbQuery (cfg : Db.DbConfig) (q : Db.SqlQuery) : IO (Except
 
 @[implicit_reducible]
 def mkNativeServerInst (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEntry)))
-    (cookieSink? : Option (IO.Ref (Array SetCookie)) := none) : MonadServer IO where
+    (cookieSink? : Option (IO.Ref (Array SetCookie)) := none)
+    (sseSink? : Option (IO.Ref (Array SseEvent)) := none) : MonadServer IO where
   httpCall req := do
     match ← resolveAuthHeaders gcpCache? req.auth with
     | .error e => return .error e
@@ -868,6 +869,9 @@ def mkNativeServerInst (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEn
   dbTxRollback := execNativeDbTxRollback
   setCookie c  := match cookieSink? with
     | some ref => ref.modify (·.push c)
+    | none     => pure ()
+  sendSse ev   := match sseSink? with
+    | some ref => ref.modify (·.push ev)
     | none     => pure ()
   readEnv := Prim.getEnv
   nowMs := Prim.nowMs
@@ -1461,7 +1465,7 @@ private def runFullstackCore {Model Msg : Type}
       let finalHtml := if devMode then injectDevReload rawHtml else rawHtml
       let redirectHdrs : List (String × String) :=
         if isSsrRedirectStatus ssrStatus then
-          match headMeta.canonical with
+          match headMeta.redirect.orElse (fun _ => headMeta.canonical) with
           | some loc => if isSafeUrl loc then [("Location", sanitizeHeader loc)] else []
           | none     => []
         else []
@@ -1604,9 +1608,17 @@ def runStatefulFullstack {σ Model Msg : Type}
     blockingMethods?
     (httpDispatchM?.map fun httpM ctx method path => do
       let cookieRef ← IO.mkRef (#[] : Array SetCookie)
-      let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef)
+      let sseRef ← IO.mkRef (#[] : Array SseEvent)
+      let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef) (some sseRef)
       let res ← @httpM IO _ reqSrvInst atomicInst ctx method path
-      return (res, ← cookieRef.get))
+      let sseEvs ← sseRef.get
+      let res' := match res with
+        | .ok (some resp) =>
+            if !sseEvs.isEmpty && startsWithCI resp.contentType "text/event-stream" then
+              .ok (some { resp with body := SseEvent.formatStream sseEvs.toList })
+            else .ok (some resp)
+        | other => other
+      return (res', ← cookieRef.get))
     (jobs.map (·.toIoJob wsSrvInst atomicInst))
     authSpec?
     (authHookM?.map fun hookM ctx kind => do
@@ -1647,9 +1659,17 @@ def runStatelessFullstack {Model Msg : Type}
     blockingMethods?
     (httpDispatchM?.map fun httpM ctx method path => do
       let cookieRef ← IO.mkRef (#[] : Array SetCookie)
-      let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef)
+      let sseRef ← IO.mkRef (#[] : Array SseEvent)
+      let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef) (some sseRef)
       let res ← @httpM IO _ reqSrvInst ctx method path
-      return (res, ← cookieRef.get))
+      let sseEvs ← sseRef.get
+      let res' := match res with
+        | .ok (some resp) =>
+            if !sseEvs.isEmpty && startsWithCI resp.contentType "text/event-stream" then
+              .ok (some { resp with body := SseEvent.formatStream sseEvs.toList })
+            else .ok (some resp)
+        | other => other
+      return (res', ← cookieRef.get))
     (jobs.map (·.toIoJob wsSrvInst))
     authSpec?
     (authHookM?.map fun hookM ctx kind => do

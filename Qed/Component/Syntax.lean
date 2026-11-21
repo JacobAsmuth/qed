@@ -161,6 +161,29 @@ def compStylesheetClause : Parser := leading_parser
 def compThemeClause : Parser := leading_parser
   withPosition ("theme " >> ident)
 
+def compHeadDirective : Parser :=
+  node `Qed.compHeadTitle       (withPosition (atomic (identEq `title)       >> categoryParser `qedExpr 0)) <|>
+  node `Qed.compHeadDescription (withPosition (atomic (identEq `description) >> categoryParser `qedExpr 0)) <|>
+  node `Qed.compHeadCanonical   (withPosition (atomic (identEq `canonical)   >> categoryParser `qedExpr 0)) <|>
+  node `Qed.compHeadMeta        (withPosition (atomic (symbol "meta")        >> categoryParser `qedExpr 0 >> "," >> categoryParser `qedExpr 0)) <|>
+  node `Qed.compHeadStatus      (withPosition (atomic (identEq `status)      >> categoryParser `qedExpr 0)) <|>
+  node `Qed.compHeadRedirect    (withPosition (atomic (identEq `redirect)    >> categoryParser `qedExpr 0 >>
+    optional ("," >> identEq `status >> "=" >> categoryParser `qedExpr 0)))
+
+def compHeadCase : Parser :=
+  node `Qed.compHeadCase (withPosition (
+    atomic (kw "case") >> sepBy1 (categoryParser `qedPat 0) "," >> ":" >>
+    checkColGt "expected indented `head` directives" >>
+    many1Indent compHeadDirective))
+
+def compHeadItem : Parser := compHeadCase <|> compHeadDirective
+
+def compHeadClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `head >> ":") >>
+    checkColGt "expected indented `head` directives" >>
+    many1Indent compHeadItem)
+
 def compExampleParam : Parser :=
   node `Qed.compExampleParam (ident >> ":" >> categoryParser `qedType 0)
 
@@ -183,7 +206,7 @@ def compClause : Parser :=
   compEventClause <|> compStartClause <|> compRouteClause <|>
   compPortOutClause <|> compPortInClause <|> compRpcQueryClause <|>
   compSubscribeClause <|> compStyleClause <|> compStylesheetClause <|> compThemeClause <|>
-  compActionClause <|> compInvAny
+  compHeadClause <|> compActionClause <|> compInvAny
 
 @[command_parser] def componentCmd : Parser := leading_parser
   optional Command.docComment >>

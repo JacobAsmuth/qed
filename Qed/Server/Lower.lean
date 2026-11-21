@@ -90,6 +90,8 @@ structure LowerCtx where
   wrapReturnSumInl : Bool := false
   dbs              : Array (String × DatabaseInfo) := #[]
   activeDbTx?      : Option (String × Lean.Ident) := none
+  isHttpRoute      : Bool := false
+  isStreamRoute    : Bool := false
 
 inductive HoistedStep where
   | awaitUnwrap (ref : Lean.Syntax) (tmp : Lean.Ident) (callTerm : Lean.Term)
@@ -131,8 +133,7 @@ private def matchTxStmt? (stx : Lean.Syntax) : Option (Lean.Syntax × String × 
     some (dotStx, aliasName, suiteStmts (stx.getArg 2))
   else none
 
-/-- Matches `setCookie(...)`, `ctx.setCookie(...)`, `clearCookie(...)`, or `ctx.clearCookie(...)`.
-    Returns `(isClear, rawArgs)`. -/
+/-- Matches `setCookie(...)` or `clearCookie(...)`. Returns `(isClear, rawArgs)`. -/
 private def matchSetCookieStmt? (stx : Lean.Syntax) : Option (Bool × Array Lean.Syntax) := do
   guard (stx.getKind == ``qedStmtExpr)
   let e := unwrapParens1 (stx.getArg 0)
@@ -140,8 +141,19 @@ private def matchSetCookieStmt? (stx : Lean.Syntax) : Option (Bool × Array Lean
   let callee := e.getArg 0
   let rawArgs := (e.getArg 2).getSepArgs
   match Db.extractDottedChain? callee with
-  | some ["setCookie"] | some ["ctx", "setCookie"] => some (false, rawArgs)
-  | some ["clearCookie"] | some ["ctx", "clearCookie"] => some (true, rawArgs)
+  | some ["setCookie"]   => some (false, rawArgs)
+  | some ["clearCookie"] => some (true, rawArgs)
+  | _ => none
+
+/-- Matches `send(...)` SSE event emission statements inside `stream` routes. -/
+private def matchSseSendStmt? (stx : Lean.Syntax) : Option (Array Lean.Syntax) := do
+  guard (stx.getKind == ``qedStmtExpr)
+  let e := unwrapParens1 (stx.getArg 0)
+  guard (e.getKind == ``qedCall)
+  let callee := e.getArg 0
+  let rawArgs := (e.getArg 2).getSepArgs
+  match Db.extractDottedChain? callee with
+  | some ["send"] => some rawArgs
   | _ => none
 
 partial def exprHasAwait (stx : Lean.Syntax) : Bool :=
@@ -149,7 +161,7 @@ partial def exprHasAwait (stx : Lean.Syntax) : Bool :=
   else stx.getArgs.any exprHasAwait
 
 partial def stmtHasAwait (stx : Lean.Syntax) : Bool :=
-  if (matchTxStmt? stx).isSome || (matchSetCookieStmt? stx).isSome then true
+  if (matchTxStmt? stx).isSome || (matchSetCookieStmt? stx).isSome || (matchSseSendStmt? stx).isSome then true
   else exprHasAwait stx || stx.getArgs.any stmtHasAwait
 
 def blockHasAwait (stmts : Array Lean.Syntax) : Bool :=
@@ -388,6 +400,43 @@ private def lowerSrvCallHook (stx calleeStx : Syntax) (rawArgs : Array Syntax) (
       return some (← `(Qed.Server.mkFail2 $(← go .val rawArgs[0]![0]) $(← go .val rawArgs[1]![0])))
     else
       throwErrorAt stx "`fail(...)` expects `(.tag)`, `(.tag, msg)`, `(message)`, or `(code, message)`"
+  if ctx.isHttpRoute && calleeStx.getKind == ``qedIdent then
+    let fnName := (calleeStx.getArg 0).getId.eraseMacroScopes.toString
+    let shadowed := ctx.locals.contains fnName || ctx.stateFields.contains fnName || ctx.envVars.contains fnName
+    if !shadowed && (fnName == "text" || fnName == "json" || fnName == "html" || fnName == "bytes" || fnName == "redirect") then
+      let mut posArgs : Array Syntax := #[]
+      let mut statusStx? : Option Syntax := none
+      for a in rawArgs do
+        let k := a.getKind
+        if k == ``qedCallArgPos then posArgs := posArgs.push (a.getArg 0)
+        else if k == ``qedCallArgNamed then
+          let key := (a.getArg 0).getId.eraseMacroScopes.toString
+          if key == "status" then statusStx? := some (a.getArg 2)
+          else throwErrorAt a s!"unknown argument `{key}` in `{fnName}(...)` (supported named argument: `status`)"
+        else throwErrorAt a s!"unexpected argument in `{fnName}(...)`"
+      if fnName == "bytes" then
+        if posArgs.size != 2 then
+          throwErrorAt stx "`bytes(contentType, body[, status = 200])` expects a content type and body"
+        let ctT ← go .val posArgs[0]!
+        let bodyT ← go .val posArgs[1]!
+        let stT ← match statusStx? with
+          | some s => go .val s
+          | none   => liftM (show CommandElabM Term from `((200 : Nat)))
+        return some (← `(Qed.Server.HttpResponse.bytes $ctT $bodyT $stT))
+      else
+        if posArgs.size != 1 then
+          throwErrorAt stx s!"`{fnName}(...)` expects one positional argument (and optional `status = ...`)"
+        let argT ← go .val posArgs[0]!
+        let defaultStatus : Nat := if fnName == "redirect" then 302 else 200
+        let stT ← match statusStx? with
+          | some s => go .val s
+          | none   => let lit := Syntax.mkNumLit (toString defaultStatus); liftM (show CommandElabM Term from `(($lit : Nat)))
+        match fnName with
+        | "text"     => return some (← `(Qed.Server.HttpResponse.text $argT $stT))
+        | "json"     => return some (← `(Qed.Server.HttpResponse.json $argT $stT))
+        | "html"     => return some (← `(Qed.Server.HttpResponse.html $argT $stT))
+        | "redirect" => return some (← `(Qed.Server.HttpResponse.redirect $argT $stT))
+        | _          => pure ()
   return none
 
 open Lean Elab Command in
@@ -940,6 +989,8 @@ partial def lowerPureBlock (ctx : LowerCtx) (inAtomic : Bool) (s₀ sCur : Ident
     throwErrorAt stmt "cannot start a database `transaction` inside an `atomic:` block; run database transactions outside `atomic:`"
   else if (matchSetCookieStmt? stmt).isSome then
     throwErrorAt stmt "cannot call `setCookie`/`clearCookie` inside an `atomic:` block; emit cookies outside `atomic:`"
+  else if (matchSseSendStmt? stmt).isSome then
+    throwErrorAt stmt "cannot call `send(...)` inside an `atomic:` block; emit SSE events outside `atomic:`"
   else if k == ``qedStmtReturn then
     lowerPureReturn pCtx s₀ matCur stmt
   else if k == ``qedStmtLet then
@@ -1196,10 +1247,11 @@ private def lowerSetCookieCall (ctx : LowerCtx) (stmt : Syntax) (isClear : Bool)
       | none => liftM (show CommandElabM Term from `("/"))
     return (← liftM (show CommandElabM Term from `(Qed.Server.SetCookie.clear $nameT $pathT)), allSteps)
   else
-    -- Allow either `setCookie(cookieObj)` (1 arg) or `setCookie(name, value, ...)`
-    if posArgs.size == 1 && namedArgs.isEmpty then
-      let (cT, s1) ← lowerExprCollectingHoists ctx .val posArgs[0]!
-      return (← liftM (show CommandElabM Term from `(($cT : Qed.Server.SetCookie))), s1)
+    let validCookieKeys : List String := ["name", "value", "path", "httpOnly", "secure", "sameSite", "maxAge", "domain"]
+    for (k, _) in namedArgs do
+      unless validCookieKeys.contains k do
+        let hint := Qed.Diag.didYouMean k validCookieKeys
+        throwErrorAt stmt s!"unknown argument `{k}` in `setCookie(...)`{hint} (supported: {String.intercalate ", " validCookieKeys})"
     let some nameStx := posArgs[0]? |>.orElse (fun _ => findN "name")
       | throwErrorAt stmt "`setCookie(name, value, ...)` requires a cookie name"
     let some valStx := posArgs[1]? |>.orElse (fun _ => findN "value")
@@ -1210,16 +1262,16 @@ private def lowerSetCookieCall (ctx : LowerCtx) (stmt : Syntax) (isClear : Bool)
     let pathT ← match findN "path" with
       | some s => let (t, hs) ← lowerExprCollectingHoists ctx .val s; allSteps := allSteps ++ hs; pure t
       | none   => liftM (show CommandElabM Term from `("/"))
-    let httpOnlyT ← match findN "httpOnly" |>.orElse (fun _ => findN "http_only") with
+    let httpOnlyT ← match findN "httpOnly" with
       | some s => let (t, hs) ← lowerExprCollectingHoists ctx .val s; allSteps := allSteps ++ hs; pure t
       | none   => liftM (show CommandElabM Term from `(true))
     let secureT ← match findN "secure" with
       | some s => let (t, hs) ← lowerExprCollectingHoists ctx .val s; allSteps := allSteps ++ hs; pure t
       | none   => liftM (show CommandElabM Term from `(false))
-    let sameSiteT ← match findN "sameSite" |>.orElse (fun _ => findN "same_site") with
+    let sameSiteT ← match findN "sameSite" with
       | some s => let (t, hs) ← lowerExprCollectingHoists ctx .val s; allSteps := allSteps ++ hs; pure t
       | none   => liftM (show CommandElabM Term from `(Qed.Server.SameSite.lax))
-    let maxAgeT ← match findN "maxAge" |>.orElse (fun _ => findN "max_age") with
+    let maxAgeT ← match findN "maxAge" with
       | some s =>
           let (t, hs) ← lowerExprCollectingHoists ctx .val s
           allSteps := allSteps ++ hs
@@ -1237,6 +1289,55 @@ private def lowerSetCookieCall (ctx : LowerCtx) (stmt : Syntax) (isClear : Bool)
       secure := $secureT, maxAge? := $maxAgeT, domain? := $domT
       : Qed.Server.SetCookie }))
     return (cTerm, allSteps)
+
+open Lean Elab Command in
+private def lowerSseSendCall (ctx : LowerCtx) (stmt : Syntax) (rawArgs : Array Syntax) :
+    LowerM (Term × Array HoistedStep) := do
+  unless ctx.isStreamRoute do
+    throwErrorAt stmt "`send(...)` is only available inside `stream \"/...\":` routes"
+  let mut posArgs : Array Syntax := #[]
+  let mut namedArgs : Array (String × Syntax) := #[]
+  for a in rawArgs do
+    let k := a.getKind
+    if k == ``qedCallArgPos then posArgs := posArgs.push (a.getArg 0)
+    else if k == ``qedCallArgNamed then
+      namedArgs := namedArgs.push ((a.getArg 0).getId.eraseMacroScopes.toString, a.getArg 2)
+    else throwErrorAt a "unexpected argument in `send(...)`"
+  let validKeys : List String := ["data", "event", "id", "retry"]
+  for (k, _) in namedArgs do
+    unless validKeys.contains k do
+      let hint := Qed.Diag.didYouMean k validKeys
+      throwErrorAt stmt s!"unknown argument `{k}` in `send(...)`{hint} (supported: {String.intercalate ", " validKeys})"
+  let findN (k : String) : Option Syntax := (namedArgs.find? (·.1 == k)).map Prod.snd
+  let some dataStx := posArgs[0]? |>.orElse (fun _ => findN "data")
+    | throwErrorAt stmt "`send(data[, event = ..., id = ..., retry = ...])` requires an event data string"
+  if posArgs.size > 1 then
+    throwErrorAt stmt "`send(...)` takes one positional `data` argument; pass `event = ...`, `id = ...`, or `retry = ...` as named arguments"
+  let mut allSteps : Array HoistedStep := #[]
+  let (dataT, s1) ← lowerExprCollectingHoists ctx .val dataStx
+  allSteps := allSteps ++ s1
+  let eventT ← match findN "event" with
+    | some s =>
+        let (t, hs) ← lowerExprCollectingHoists ctx .val s
+        allSteps := allSteps ++ hs
+        liftM (show CommandElabM Term from `(some ($t : String)))
+    | none => liftM (show CommandElabM Term from `(none))
+  let idT ← match findN "id" with
+    | some s =>
+        let (t, hs) ← lowerExprCollectingHoists ctx .val s
+        allSteps := allSteps ++ hs
+        liftM (show CommandElabM Term from `(some ($t : String)))
+    | none => liftM (show CommandElabM Term from `(none))
+  let retryT ← match findN "retry" with
+    | some s =>
+        let (t, hs) ← lowerExprCollectingHoists ctx .val s
+        allSteps := allSteps ++ hs
+        liftM (show CommandElabM Term from `(some ($t : Nat)))
+    | none => liftM (show CommandElabM Term from `(none))
+  let evTerm ← liftM (show CommandElabM Term from `({
+    data := $dataT, event := $eventT, id := $idT, retry := $retryT
+    : Qed.Server.SseEvent }))
+  return (evTerm, allSteps)
 
 open Lean Elab Command in
 private def lowerTxStmt (aCtx : LowerCtx) (stmt aliasRef : Syntax) (aliasName : String)
@@ -1291,6 +1392,11 @@ partial def lowerAsyncBlock (ctx : LowerCtx) (stateTyTerm? : Option Term) (stmts
     let (cookieTerm, steps) ← lowerSetCookieCall aCtx stmt isClear rawArgs
     let cont ← recAsync aCtx rest
     let body ← `(Qed.Server.MonadServer.setCookie $cookieTerm >>= fun _ => $cont)
+    wrapHoistsAsync aCtx steps body
+  else if let some rawArgs := matchSseSendStmt? stmt then
+    let (evTerm, steps) ← lowerSseSendCall aCtx stmt rawArgs
+    let cont ← recAsync aCtx rest
+    let body ← `(Qed.Server.MonadServer.sendSse $evTerm >>= fun _ => $cont)
     wrapHoistsAsync aCtx steps body
   else if let some (aliasRef, aliasName, txStmts) := matchTxStmt? stmt then
     lowerTxStmt aCtx stmt aliasRef aliasName txStmts rest recAsync

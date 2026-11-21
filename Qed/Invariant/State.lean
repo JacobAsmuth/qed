@@ -74,7 +74,8 @@ private def relevantAppLemmas (env : Environment) (cs : Std.HashSet Name) : Arra
     cs.contains `Qed.App.init || cs.contains `Qed.App.update ||
     cs.contains `Qed.Internal.App.withDehydrate || cs.contains `Qed.Internal.App.withQueries ||
     cs.contains `Qed.Internal.App.withSubscriptions || cs.contains `Qed.Internal.App.withStylesheets ||
-    cs.contains `Qed.Internal.App.withExtraStyles
+    cs.contains `Qed.Internal.App.withExtraStyles || cs.contains `Qed.App.withHead ||
+    cs.contains `Qed.App.withSsrStatus
   if hasApp then
     r := r ++ (#[`Qed.Internal.mkApp_init, `Qed.Internal.mkApp_update,
                  `Qed.Internal.mkRoutedApp_init, `Qed.Internal.mkRoutedApp_update,
@@ -83,6 +84,8 @@ private def relevantAppLemmas (env : Environment) (cs : Std.HashSet Name) : Arra
                  `Qed.Internal.App.withSubscriptions_init, `Qed.Internal.App.withSubscriptions_update,
                  `Qed.Internal.App.withStylesheets_init, `Qed.Internal.App.withStylesheets_update,
                  `Qed.Internal.App.withExtraStyles_init, `Qed.Internal.App.withExtraStyles_update,
+                 `Qed.App.withHead_init, `Qed.App.withHead_update,
+                 `Qed.App.withSsrStatus_init, `Qed.App.withSsrStatus_update,
                  `Qed.Query.boot, `Qed.Query.wrap, `Qed.Resource.query, `Qed.Resource.rpcQuery,
                  `Qed.Subscription.boot, `Qed.Subscription.wrap, `Qed.Subscription.boot_state_eq].filter env.contains)
   if cs.contains `Qed.Cached.activate || cs.contains `Qed.Cached.all then

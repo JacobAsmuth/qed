@@ -19,34 +19,29 @@ instance : Qed.Router TestRoute where
     | _           => some .missing
   round_trip r := by cases r <;> rfl
 
-def routedApp : Qed.App TestRoute TestRoute :=
-  let base : Qed.App TestRoute TestRoute :=
-    Qed.Internal.mkRoutedAppCore (R := TestRoute)
-      .home
-      (fun _ r => (r, .none))
-      (Qed.V.el "main" [] [Qed.V.text "ok"])
-      id
-      (valid_view := fun _ => rfl)
-  let withH := Qed.App.withHead (fun r =>
-    match r with
-    | .missing => { title := some "404 Not Found", description := some "Missing page" }
-    | .old     => { title := some "Moved", canonical := some "/new" }
-    | .home    =>
-      {
-        title := some "Home </title><script>alert(1)</script>"
-        description := some "Verified \"SSR\" <head>"
-        metaTags := [("og:type", "website")]
-        canonical := some "https://example.com/"
-      }) base
-  Qed.App.withSsrStatus (fun r =>
-    match r with
-    | .missing => 404
-    | .old     => 302
-    | .home    => 200) withH
+component RoutedSite:
+  route : TestRoute = .home
+
+  head:
+    case .home:
+      title       "Home </title><script>alert(1)</script>"
+      description "Verified \"SSR\" <head>"
+      canonical   "https://example.com/"
+      meta        "og:type", "website"
+    case .old:
+      title       "Moved"
+      redirect    "/new"
+    case .missing:
+      status      404
+      title       "404 Not Found"
+      description "Missing page"
+
+  view:
+    <main>ok</main>
 
 fullstack WebEssentialsApp:
   server ServerChecks.WebEssentialsSrv
-  client routedApp
+  client RoutedSite
   title "Fallback Title"
 
 end WebEssentialsFixture

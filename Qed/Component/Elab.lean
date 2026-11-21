@@ -370,6 +370,74 @@ private def resolveThemeStyles (themes : Array Ident) : CommandElabM (Array Term
     thStyleTerms := thStyleTerms.push (mkIdentFrom thId thInfo.styleConst)
   return thStyleTerms
 
+private def applyHeadDirectives (hmId stId : Ident) (dirs : Array Syntax) (tail : Term) :
+    CommandElabM Term := do
+  dirs.foldrM (init := tail) fun d acc => do
+    match d.getKind with
+    | `Qed.compHeadTitle =>
+        let v ← lowerCompExpr .val (d.getArg 1)
+        `(let $hmId:ident := { $hmId with title := Option.some ($v : String) }; $acc)
+    | `Qed.compHeadDescription =>
+        let v ← lowerCompExpr .val (d.getArg 1)
+        `(let $hmId:ident := { $hmId with description := Option.some ($v : String) }; $acc)
+    | `Qed.compHeadCanonical =>
+        let v ← lowerCompExpr .val (d.getArg 1)
+        `(let $hmId:ident := { $hmId with canonical := Option.some ($v : String) }; $acc)
+    | `Qed.compHeadMeta =>
+        let k ← lowerCompExpr .val (d.getArg 1)
+        let v ← lowerCompExpr .val (d.getArg 3)
+        `(let $hmId:ident := { $hmId with metaTags := ($hmId).metaTags ++ [(($k : String), ($v : String))] }; $acc)
+    | `Qed.compHeadStatus =>
+        let n ← lowerCompExpr .val (d.getArg 1)
+        `(let $stId:ident : Nat := $n; $acc)
+    | `Qed.compHeadRedirect =>
+        let u ← lowerCompExpr .val (d.getArg 1)
+        let optSt := d.getArg 2
+        let stT ← if optSt.getNumArgs == 4 then lowerCompExpr .val (optSt.getArg 3) else `((302 : Nat))
+        `(let $hmId:ident := { $hmId with redirect := Option.some ($u : String) };
+          let $stId:ident : Nat := $stT; $acc)
+    | _ =>
+        throwErrorAt d "unexpected directive in `head:`"
+
+private def mkCompHeadCmd? (spec : ComponentSpec) : CommandElabM (Option (TSyntax `command)) := do
+  let some headStx := spec.headClause? | return none
+  let tId := spec.t.getId
+  let stateId := mkIdent (tId ++ `State)
+  let headInfoId := mkIdent (tId ++ `headInfo)
+  let hmId := mkIdent `_qed_hm
+  let stId := mkIdent `_qed_st
+  let items := (headStx.getArg 2).getArgs
+  let mut sharedDirs : Array Syntax := #[]
+  let mut caseItems : Array Syntax := #[]
+  for item in items do
+    if item.getKind == `Qed.compHeadCase then
+      caseItems := caseItems.push item
+    else
+      if !caseItems.isEmpty then
+        throwErrorAt item "shared `head:` directives must appear before `case` arms"
+      sharedDirs := sharedDirs.push item
+  let coreTail : Term ←
+    if caseItems.isEmpty then
+      `(($hmId, $stId))
+    else
+      let some rd := spec.route?
+        | throwErrorAt caseItems[0]! s!"`case` inside `head:` requires a `route` declaration on `component {tId}`"
+      let mut alts : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
+      for c in caseItems do
+        let rawPats := (c.getArg 1).getSepArgs
+        let armDirs := (c.getArg 3).getArgs
+        let armBody ← applyHeadDirectives hmId stId armDirs (← `(($hmId, $stId)))
+        for p in rawPats do
+          let patT ← liftMacroM (lowerQedPat p)
+          alts := alts.push (← `(Lean.Parser.Term.matchAltExpr| | $patT => $armBody))
+      `(match $(rd.field):ident with $[$alts:matchAlt]*)
+  let withDirs ← applyHeadDirectives hmId stId sharedDirs coreTail
+  let fullBody ← `(let $hmId:ident : Qed.HeadMeta := {}; let $stId:ident : Nat := 200; $withDirs)
+  let boundBody ← bindMentionedFields spec (mentionsIdent fullBody.raw) fullBody
+  return some (← `(command|
+    set_option linter.unusedVariables false in
+    def $headInfoId (s : $stateId) : Qed.HeadMeta × Nat := $boundBody))
+
 private def buildCompFinalApp (spec : ComponentSpec) (body' : Term) (hasStart : Bool)
     (stateInvPreds : Array Term) :
     CommandElabM (Array (TSyntax `command) × Term × Option Term × Bool) := do
@@ -422,6 +490,10 @@ private def buildCompFinalApp (spec : ComponentSpec) (body' : Term) (hasStart : 
     `(Qed.Internal.App.withQueries $(mkIdent (tId ++ `queries)) $dehydApp)
   let subbedApp : Term ← if spec.subscriptions.isEmpty then pure queriedApp else
     `(Qed.Internal.App.withSubscriptions $(mkIdent (tId ++ `subscriptions)) $queriedApp)
+  let headedApp : Term ← if spec.headClause?.isNone then pure subbedApp else do
+    let headInfoId := mkIdent (tId ++ `headInfo)
+    `(Qed.App.withSsrStatus (fun _s => ($headInfoId _s).2)
+        (Qed.App.withHead (fun _s => ($headInfoId _s).1) $subbedApp))
   let compInv? : Option Term ← if stateInvPreds.isEmpty then pure none
     else if stateInvPreds.size == 1 then pure (some (← `(($(stateInvPreds[0]!) : $stateId → Prop))))
     else do
@@ -432,8 +504,8 @@ private def buildCompFinalApp (spec : ComponentSpec) (body' : Term) (hasStart : 
     | some inv => canSynthDecidablePred stateId inv
     | none     => pure false
   let finalApp : Term ← match compInv?, hasDecInv with
-    | some inv, true => `(Qed.App.guardRehydrate ($inv) $subbedApp)
-    | _, _           => pure subbedApp
+    | some inv, true => `(Qed.App.guardRehydrate ($inv) $headedApp)
+    | _, _           => pure headedApp
   return (cmds, finalApp, compInv?, hasDecInv)
 
 private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool)
@@ -575,7 +647,7 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
   if rawSpec.states.isEmpty && rawSpec.actions.isEmpty && rawSpec.keyF?.isNone &&
       rawSpec.starts.isEmpty && rawSpec.sessionField?.isNone &&
       rawSpec.portOuts.isEmpty && rawSpec.portIns.isEmpty && rawSpec.queries.isEmpty &&
-      rawSpec.subscriptions.isEmpty then
+      rawSpec.subscriptions.isEmpty && rawSpec.headClause?.isNone then
     let rCtx ← mkRewriteCtx rawSpec true (allowHoist := true)
     let body' ← lowerCompExpr .val (← rewriteIn rCtx false rawSpec.body)
     if (← rCtx.hoisted.get).isEmpty && (← rCtx.formDrafts.get).isEmpty && (← rCtx.resetForms.get).isEmpty then
@@ -615,6 +687,7 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
   if isTopMount then
     if let some qCmd ← mkCompQueriesCmd? spec then elabCommand qCmd
     if let some sCmd ← mkCompSubscriptionsCmd? spec then elabCommand sCmd
+    if let some hCmd ← mkCompHeadCmd? spec then elabCommand hCmd
     for clsCmd in (← mkSpecClassifyCmds spec) do elabCommand clsCmd
   let stateInvEntries ← withOpenNs compNs (elabInlineInvariantsPhase spec false)
   let errsAfterInvs := (← get).messages.toList.filter (·.severity == .error) |>.length

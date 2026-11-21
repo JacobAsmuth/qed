@@ -12,6 +12,7 @@ structure HeadMeta where
   description : Option String := none
   metaTags    : List (String × String) := []
   canonical   : Option String := none
+  redirect    : Option String := none
 deriving Inhabited, DecidableEq, Repr
 
 structure App (Model : Type) (Msg : Type) where
@@ -215,12 +216,34 @@ def App.guardRehydrateCore {Model Msg : Type} (Inv : Model → Prop) [DecidableP
           subst h
           exact app.dehydrate_view m m0 hr }
 
-/-- Attaches dynamic per-route `<head>` metadata (title, description, meta tags, canonical URL) for SSR. -/
+/-- Attaches dynamic per-route `<head>` metadata (title, description, meta tags, canonical URL, redirect) for SSR. -/
 def App.withHead (f : Model → HeadMeta) (app : App Model Msg) : App Model Msg :=
   { app with headFor := f }
 
 /-- Attaches a per-model SSR HTTP status code (default `200`; e.g. `404` on unknown routes or `302` redirects). -/
 def App.withSsrStatus (f : Model → Nat) (app : App Model Msg) : App Model Msg :=
   { app with ssrStatus := f }
+
+@[simp] theorem App.withHead_init (f : Model → HeadMeta) (app : App Model Msg) :
+    (App.withHead f app).init = app.init := rfl
+@[simp] theorem App.withHead_update (f : Model → HeadMeta) (app : App Model Msg) :
+    (App.withHead f app).update = app.update := rfl
+@[simp] theorem App.withHead_template (f : Model → HeadMeta) (app : App Model Msg) :
+    (App.withHead f app).template = app.template := rfl
+@[simp] theorem App.withHead_dehydrate (f : Model → HeadMeta) (app : App Model Msg) :
+    (App.withHead f app).dehydrate = app.dehydrate := rfl
+@[simp] theorem App.withHead_rehydrate (f : Model → HeadMeta) (app : App Model Msg) :
+    (App.withHead f app).rehydrate = app.rehydrate := rfl
+
+@[simp] theorem App.withSsrStatus_init (f : Model → Nat) (app : App Model Msg) :
+    (App.withSsrStatus f app).init = app.init := rfl
+@[simp] theorem App.withSsrStatus_update (f : Model → Nat) (app : App Model Msg) :
+    (App.withSsrStatus f app).update = app.update := rfl
+@[simp] theorem App.withSsrStatus_template (f : Model → Nat) (app : App Model Msg) :
+    (App.withSsrStatus f app).template = app.template := rfl
+@[simp] theorem App.withSsrStatus_dehydrate (f : Model → Nat) (app : App Model Msg) :
+    (App.withSsrStatus f app).dehydrate = app.dehydrate := rfl
+@[simp] theorem App.withSsrStatus_rehydrate (f : Model → Nat) (app : App Model Msg) :
+    (App.withSsrStatus f app).rehydrate = app.rehydrate := rfl
 
 end Qed

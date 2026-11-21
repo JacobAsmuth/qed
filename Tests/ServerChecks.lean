@@ -481,7 +481,7 @@ component VerifiedWsEnsures:
   let doc := Qed.renderDocument "Default" "<p>ok</p>" "/qed_host.mjs" (headMeta := hm)
   !doc.contains "rel=\"canonical\"" && !doc.contains "javascript:"
 
--- 31. Declarative `setCookie`, custom `http get/post`, and server-side `stream` SSE routes with invariants
+-- 31. Declarative `setCookie`, custom `get`/`post`, and server-side `stream` SSE routes with invariants
 server WebEssentialsSrv:
   state hits : Nat = 0
   invariant hitsBounded: hits <= 1000
@@ -490,31 +490,31 @@ server WebEssentialsSrv:
     setCookie("qed_session", token)
     return "ok"
 
-  http get "/robots.txt":
-    return Qed.Server.HttpResponse.text("User-agent: *\nAllow: /\n")
+  get "/robots.txt":
+    return text("User-agent: *\nAllow: /\n")
 
-  http post "/webhook":
+  post "/webhook":
     requires ctx.isAuthenticated
     atomic:
       if hits < 1000:
         hits += 1
-    setCookie(Qed.Server.SetCookie.mkSafe("wh_seen", "1"))
-    return Qed.Server.HttpResponse.json("{\"ok\":true}")
+    setCookie("wh_seen", "1")
+    return json("{\"ok\":true}")
 
-  http post "/echo-cookie":
+  post "/echo-cookie":
     atomic:
       if hits < 1000:
         hits += 1
-    setCookie(Qed.Server.SetCookie.mkSafe("echo_ck", ctx.body))
-    return Qed.Server.HttpResponse.json("{\"ok\":true}")
+    setCookie("echo_ck", ctx.body)
+    return json("{\"ok\":true}")
 
   stream "/events":
-    return [Qed.Server.SseEvent.msg("hello", some("greeting"), some("1")),
-            Qed.Server.SseEvent.msg("world")]
+    send("hello", event = "greeting", id = "1")
+    send("world")
 
--- 32. Negative: custom `http` route violating server `invariant` is rejected at compile time!
+-- 32. Negative: custom HTTP route violating server `invariant` is rejected at compile time!
 /--
-error: Server invariant `hitsBounded` failed in `http POST /bad`:
+error: Server invariant `hitsBounded` failed in `POST /bad`:
   • must satisfy:  hits + 5 <= 10
 
 Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant holds across every branch.
@@ -523,8 +523,42 @@ Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant h
 server BadHttpRouteInv:
   state hits : Nat = 0
   invariant hitsBounded: hits <= 10
-  http post "/bad":
+  post "/bad":
     hits += 5
-    return Qed.Server.HttpResponse.text("oops")
+    return text("oops")
+
+-- 33. Negative: `send(...)` outside `stream` is rejected at compile time
+/--
+error: `send(...)` is only available inside `stream "/...":` routes
+-/
+#guard_msgs in
+server BadSendOutsideStream:
+  get "/bad-send":
+    send("nope")
+    return text("ok")
+
+-- 34. Non-routed component with native `head:` compiles cleanly with verified `app_view_eq`
+component SimpleHeadPage:
+  head:
+    title       "Simple Page"
+    description "Static head metadata"
+    meta        "og:site_name", "Qed"
+  view:
+    <main><h1>Hello</h1></main>
+
+example : (SimpleHeadPage.app.headFor SimpleHeadPage.init).title = some "Simple Page" := rfl
+example : SimpleHeadPage.app.ssrStatus SimpleHeadPage.init = 200 := rfl
+
+-- 35. Negative: `case` in `head:` on a component without `route` is rejected cleanly
+/--
+error: `case` inside `head:` requires a `route` declaration on `component BadHeadCase`
+-/
+#guard_msgs in
+component BadHeadCase:
+  head:
+    case .home:
+      title "Nope"
+  view:
+    <main>ok</main>
 
 end ServerChecks

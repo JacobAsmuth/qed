@@ -280,8 +280,8 @@ private def elabServerHttpRouteClause (priorRep priorUnrep : Nat)
     (hc : Syntax) :
     CommandElabM (Option ((String × String) × TSyntax ``Lean.Parser.Term.matchAltExpr × Array Name)) := do
   let isStream := hc.getKind == ``srvStreamClause
-  let methodStr := if isStream then "GET" else (hc.getArg 1).getId.toString.toUpper
-  let pathStx := if isStream then hc.getArg 1 else hc.getArg 2
+  let methodStr := if isStream then "GET" else (hc.getArg 0).getId.toString.toUpper
+  let pathStx := hc.getArg 1
   let pathStr := (⟨pathStx⟩ : TSyntax `str).getString
   if !pathStr.startsWith "/" then
     throwErrorAt pathStx s!"custom HTTP route path `{pathStr}` must start with `/`"
@@ -290,26 +290,27 @@ private def elabServerHttpRouteClause (priorRep priorUnrep : Nat)
   if existingRoutes.any (fun (m, p) => m == methodStr && p == pathStr) then
     throwErrorAt pathStx s!"duplicate custom HTTP route `{methodStr} {pathStr}` in `server {srvName}`"
 
-  let contractStx := if isStream then hc.getArg 3 else hc.getArg 4
-  let bodyStmts := (if isStream then hc.getArg 4 else hc.getArg 5).getArgs
+  let contractStx := hc.getArg 3
+  let rawBodyStmts := (hc.getArg 4).getArgs
   let mut reqExprs : Array Syntax := #[]
   for cl in contractStx.getArgs do
     if cl.getKind == ``srvRequiresLine then
       reqExprs := reqExprs ++ (cl.getArg 1).getSepArgs
     else
-      throwErrorAt cl "only `requires` contracts are supported on `http` / `stream` routes"
+      throwErrorAt cl "only `requires` contracts are supported on HTTP / `stream` routes"
 
   let routeLeaf := Name.mkSimple s!"_http_{routeIdx}"
   let routeIdent := mkIdentFrom pathStx routeLeaf
-  let routeLabel := if isStream then s!"stream {pathStr}" else s!"http {methodStr} {pathStr}"
-  if !blockAlwaysReturns bodyStmts then
+  let routeLabel := if isStream then s!"stream {pathStr}" else s!"{methodStr} {pathStr}"
+  let bodyStmts := if isStream then ensureUnitReturn routeIdent rawBodyStmts else rawBodyStmts
+  if !isStream && !blockAlwaysReturns bodyStmts then
     throwErrorAt pathStx s!"missing `return` on fallthrough path of `{routeLabel}`"
 
   let reqs ← elabRequiresClauses routeIdent srvName fullSrvName routeLeaf routeLabel "_hHttpReq" "_req"
     stateFieldNames envVarNames #[] #[] #[] #[] reqExprs (trackAuth := true)
 
   let payloadTerm : Term ←
-    if isStream then `(Array Qed.Server.SseEvent) else `(Qed.Server.HttpResponse)
+    if isStream then `(Unit) else `(Qed.Server.HttpResponse)
   let errTyTerm : Term ← `(Qed.Server.ApiError)
 
   let hasAwait := blockHasAwait bodyStmts
@@ -319,6 +320,7 @@ private def elabServerHttpRouteClause (priorRep priorUnrep : Nat)
     allowAwait := hasAwait, allowUnwrap := true
     hasFallible := true, isOption := false, innerOptTy? := none
     domainErrTy? := none, channels := chanSigs, dbs := dbBindings
+    isHttpRoute := !isStream, isStreamRoute := isStream
   }
   let allBinderIds := envIdents ++ #[ctxId] ++ reqs.reqHypIds
   let allBinderTys := envTypes ++ #[← `(Qed.Server.RequestCtx)] ++ reqs.reqHypTys
@@ -343,7 +345,7 @@ private def elabServerHttpRouteClause (priorRep priorUnrep : Nat)
   let extRoots := reqs.extRoots ++ bodyExtRoots.filter (!reqs.extRoots.contains ·)
   let wrappedRun ←
     if isStream then
-      `($runExpr >>= fun _httpRes => Pure.pure (_httpRes.map (fun _evs => Option.some (Qed.Server.HttpResponse.sse _evs.toList))))
+      `($runExpr >>= fun _httpRes => Pure.pure (_httpRes.map (fun _ => Option.some (Qed.Server.HttpResponse.sse []))))
     else
       `($runExpr >>= fun _httpRes => Pure.pure (_httpRes.map Option.some))
   let guardedRun ← wrapReqs reqs.reqPropTerms reqs.reqHypIds reqs.reqLabels wrappedRun

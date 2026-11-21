@@ -1103,6 +1103,8 @@ private def dehydrateProjLemmas (env0 : Environment) : Array Name :=
     `Qed.Internal.App.withSubscriptions_dehydrate, `Qed.Internal.App.withSubscriptions_rehydrate,
     `Qed.Internal.App.withStylesheets_template, `Qed.Internal.App.withStylesheets_dehydrate, `Qed.Internal.App.withStylesheets_rehydrate,
     `Qed.Internal.App.withExtraStyles_template, `Qed.Internal.App.withExtraStyles_dehydrate, `Qed.Internal.App.withExtraStyles_rehydrate,
+    `Qed.App.withHead_template, `Qed.App.withHead_dehydrate, `Qed.App.withHead_rehydrate,
+    `Qed.App.withSsrStatus_template, `Qed.App.withSsrStatus_dehydrate, `Qed.App.withSsrStatus_rehydrate,
     `Qed.Internal.App.withFullDehydrate, `Qed.Internal.App.withDehydrate_rehydrate_dehydrate,
     `Qed.App.guardRehydrate_template, `Qed.App.guardRehydrate_dehydrate,
     `Qed.Dehydrate.full_project, `Qed.Dehydrate.slice_project, `Qed.Dehydrate.const_project,
@@ -1163,7 +1165,9 @@ private def tryFastFullDehydrateInv (tgt : Expr) : MetaM (Option Expr) := do
             if (fn == `Qed.Internal.App.withQueries ||
                 fn == `Qed.Internal.App.withSubscriptions ||
                 fn == `Qed.Internal.App.withStylesheets ||
-                fn == `Qed.Internal.App.withExtraStyles) && args.size ≥ 4 then
+                fn == `Qed.Internal.App.withExtraStyles ||
+                fn == `Qed.App.withHead ||
+                fn == `Qed.App.withSsrStatus) && args.size ≥ 4 then
               unwrapApp n args[args.size - 1]!
             else none
         | _, _ => none
@@ -1275,6 +1279,7 @@ private def runProveViewEquiv (appId viewId : Ident) : TacticM Unit := do
     `Qed.Internal.App.withDehydrate_template, `Qed.Internal.App.withQueries_template,
     `Qed.Internal.App.withSubscriptions_template,
     `Qed.Internal.App.withStylesheets_template, `Qed.Internal.App.withExtraStyles_template,
+    `Qed.App.withHead_template, `Qed.App.withSsrStatus_template,
     `Qed.App.guardRehydrate_template
   ].filter env0.contains
   let s1 ← stage1.mapM toLemma

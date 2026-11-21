@@ -805,6 +805,7 @@ class MonadServer (m : Type → Type) where
   dbTxCommit   : Db.DbConfig → UInt64 → m (Except ApiError Unit)
   dbTxRollback : Db.DbConfig → UInt64 → m Unit
   setCookie    : SetCookie → m Unit
+  sendSse      : SseEvent → m Unit
   readEnv      : String → m (Option String)
   nowMs        : m UInt64
   randomHex    : UInt32 → m String
@@ -848,6 +849,7 @@ inductive ServerEffect : Type where
   | dbTxCommit   (cfg : Db.DbConfig) (txId : UInt64)
   | dbTxRollback (cfg : Db.DbConfig) (txId : UInt64)
   | setCookie    (cookie : SetCookie)
+  | sendSse      (ev : SseEvent)
   | readEnv      (v : String)
   | nowMs
   | randomHex    (n : UInt32)
@@ -864,6 +866,7 @@ def ServerEffect.Resp : ServerEffect → Type
   | .dbTxCommit _ _    => Except ApiError Unit
   | .dbTxRollback _ _  => Unit
   | .setCookie _       => Unit
+  | .sendSse _         => Unit
   | .readEnv _         => Option String
   | .nowMs             => UInt64
   | .randomHex _       => String
@@ -898,6 +901,7 @@ instance {σ : Type} : MonadServer (ThreadProg σ) where
   dbTxCommit cfg tid   := .io (.dbTxCommit cfg tid) .pure
   dbTxRollback cfg tid := .io (.dbTxRollback cfg tid) .pure
   setCookie c          := .io (.setCookie c) .pure
+  sendSse ev           := .io (.sendSse ev) .pure
   readEnv v            := .io (.readEnv v) .pure
   nowMs                := .io .nowMs .pure
   randomHex n          := .io (.randomHex n) .pure
@@ -1095,6 +1099,8 @@ instance {σ : Type} (cfg : Db.DbConfig) (tid : UInt64) :
     SafeIO (MonadServer.dbTxRollback (m := ThreadProg σ) cfg tid) :=
   ⟨.io _ _ .pure⟩
 instance {σ : Type} (c : SetCookie) : SafeIO (MonadServer.setCookie (m := ThreadProg σ) c) :=
+  ⟨.io _ _ .pure⟩
+instance {σ : Type} (ev : SseEvent) : SafeIO (MonadServer.sendSse (m := ThreadProg σ) ev) :=
   ⟨.io _ _ .pure⟩
 instance {σ : Type} (v : String) : SafeIO (MonadServer.readEnv (m := ThreadProg σ) v) :=
   ⟨.io _ _ .pure⟩

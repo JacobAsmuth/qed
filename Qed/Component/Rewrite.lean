@@ -233,6 +233,7 @@ structure ComponentSpec where
   styles          : Array Syntax := #[]
   stylesheets     : Array String := #[]
   themes          : Array Ident := #[]
+  headClause?     : Option Syntax := none
   specDispatches  : Array SpecDispatchArm := #[]
   specResolves    : Array SpecResolveSite := #[]
 
@@ -839,6 +840,7 @@ private structure SpecParseAcc where
   styles          : Array Syntax := #[]
   stylesheets     : Array String := #[]
   themes          : Array Ident := #[]
+  headClause?     : Option Syntax := none
 
 private def requireTyOrDef (role : Name) (fId : Ident) (ty? d? : Option Term) : CommandElabM Unit := do
   if ty?.isNone && d?.isNone then
@@ -1026,6 +1028,9 @@ private def parseCompClause (acc : SpecParseAcc) (cl : Syntax) : CommandElabM Sp
         throwErrorAt (cl.getArg 1) s!"unsafe stylesheet URL `{rawPath}`: must be a root-relative path (e.g. `\"/app.css\"` or `\"app.css\"`) or `https://`/`http://` URL"
       return { acc with stylesheets := acc.stylesheets.push normPath }
     | "compThemeClause" => return { acc with themes := acc.themes.push ⟨(cl.getArg 1)⟩ }
+    | "compHeadClause" =>
+      if acc.headClause?.isSome then throwErrorAt cl "duplicate `head:` clause in component"
+      return { acc with headClause? := some cl }
     | "compActionClause" => return { acc with actions := acc.actions.push cl }
     | "compInvariantClause" | "compForEachInvClause" | "compExampleClause" =>
         return { acc with invariants := acc.invariants.push cl }
@@ -1093,7 +1098,8 @@ def parseComponentSpec (stx : Syntax) : CommandElabM ComponentSpec := do
     subscriptions := acc.subscriptions,
     actions := acc.actions, invariants, body := bodyStx,
     sessionField? := acc.sessionField?,
-    styles := acc.styles, stylesheets := acc.stylesheets, themes := acc.themes
+    styles := acc.styles, stylesheets := acc.stylesheets, themes := acc.themes,
+    headClause? := acc.headClause?
   }
 
 def bindMentionedFields (spec : ComponentSpec) (shouldBind : Name → Bool)

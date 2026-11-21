@@ -152,8 +152,8 @@ private def identDotTransaction : Parser :=
 
 @[srvClause_parser] def srvHttpRouteClause : Parser := leading_parser
   withPosition (
-    atomic (identEq `http >> extHttpMethod) >> strLit >> ":" >>
-    checkColGt "expected indented `http` route body" >>
+    atomic (extHttpMethod >> strLit >> ":") >>
+    checkColGt "expected indented HTTP route body" >>
     withPosition (
       many (atomic (checkColEq "contract" >> srvContractLine)) >>
       many1 (checkColEq "statement" >> categoryParser `qedStmt 0)))

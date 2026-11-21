@@ -3,6 +3,8 @@ import Qed.Server.Core
 import Qed.Server.Net
 import Qed.Server.Http
 import Qed.Server.Prim
+import Qed.Server.Db.HttpSql
+import Qed.Server.Db.PgWire
 
 namespace Qed.Server.Native
 
@@ -461,6 +463,190 @@ private def resolveAuthHeaders (gcpCache? : Option (Prim.StateBox (Array GcpToke
           | .ok accessToken => return .ok [("Authorization", "Bearer " ++ sanitizeHeader accessToken)]
           | .error errMsg   => return .error (ApiError.internal s!"GCP OAuth2 token exchange failed: {errMsg}")
 
+/-! ## Unified Native Database Dispatcher (SQLite, PostgreSQL v3 Wire & HTTP SQL) -/
+
+private inductive ResolvedDbTransport where
+  | sqlite   (path : String)
+  | postgres (url : String)
+  | httpSql  (url : String) (bearer? : Option String)
+  | d1       (accountId dbId token : String)
+  | turso    (url token : String)
+
+private def stripSqliteScheme (u : String) : String :=
+  if u.startsWith "sqlite://" then String.ofList (u.toList.drop 9)
+  else if u.startsWith "sqlite:" then String.ofList (u.toList.drop 7)
+  else if u.startsWith "file:" then String.ofList (u.toList.drop 5)
+  else u
+
+private def resolveUrlString (u : String) (token? : Option String) : Except String ResolvedDbTransport :=
+  let t := trimWs u
+  if t.startsWith "postgres://" || t.startsWith "postgresql://" then
+    .ok (.postgres t)
+  else if t.startsWith "sqlite:" || t.startsWith "file:" || t == ":memory:" ||
+          t.endsWith ".db" || t.endsWith ".sqlite" || t.endsWith ".sqlite3" then
+    .ok (.sqlite (stripSqliteScheme t))
+  else if t.startsWith "http://" || t.startsWith "https://" then
+    .ok (.httpSql t token?)
+  else
+    .error s!"unrecognized database URL scheme: `{t}` (expected postgres://, sqlite://, or https://)"
+
+private def resolveDbEndpoint (ep : Db.DbEndpoint) : IO (Except String ResolvedDbTransport) := do
+  match ep with
+  | .urlEnv envVar =>
+      match ← loadNonEmptyEnv envVar with
+      | some u =>
+          let tok? ← loadNonEmptyEnv (envVar ++ "_TOKEN")
+          return resolveUrlString u tok?
+      | none => return .error s!"missing database URL environment variable `{envVar}`"
+  | .postgresEnv envVar =>
+      match ← loadNonEmptyEnv envVar with
+      | some u => return .ok (.postgres u)
+      | none   => return .error s!"missing PostgreSQL URL environment variable `{envVar}`"
+  | .sqlitePath path =>
+      return .ok (.sqlite (stripSqliteScheme path))
+  | .sqliteEnv envVar def? =>
+      match ← loadNonEmptyEnv envVar with
+      | some p => return .ok (.sqlite (stripSqliteScheme p))
+      | none =>
+          match def? with
+          | some p => return .ok (.sqlite (stripSqliteScheme p))
+          | none   => return .error s!"missing SQLite path environment variable `{envVar}`"
+  | .cloudflareD1 accEnv accDef? dbEnv dbDef? tokSecret =>
+      let acc? := (← loadNonEmptyEnv accEnv).orElse (fun _ => accDef?)
+      let db?  := (← loadNonEmptyEnv dbEnv).orElse (fun _ => dbDef?)
+      let tok? ← loadNonEmptyEnv tokSecret
+      match acc?, db?, tok? with
+      | some acc, some db, some tok => return .ok (.d1 acc db tok)
+      | none, _, _ => return .error s!"missing Cloudflare account env `{accEnv}`"
+      | _, none, _ => return .error s!"missing Cloudflare D1 database env `{dbEnv}`"
+      | _, _, none => return .error s!"missing Cloudflare D1 token secret `{tokSecret}`"
+  | .turso urlEnv tokSecret =>
+      match ← loadNonEmptyEnv urlEnv, ← loadNonEmptyEnv tokSecret with
+      | some u, some tok => return .ok (.turso u tok)
+      | none, _ => return .error s!"missing Turso URL env `{urlEnv}`"
+      | _, none => return .error s!"missing Turso token secret `{tokSecret}`"
+  | .httpSql urlEnv tokSecret? =>
+      match ← loadNonEmptyEnv urlEnv with
+      | none => return .error s!"missing HTTP SQL URL env `{urlEnv}`"
+      | some u =>
+          let tok? ← match tokSecret? with
+            | some ts => loadNonEmptyEnv ts
+            | none    => pure none
+          return .ok (.httpSql u tok?)
+
+private def resolveDbConfig (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDbTransport) := do
+  match ← resolveDbEndpoint cfg.endpoint with
+  | .ok tr => return .ok tr
+  | .error primaryErr =>
+      match cfg.devFallback? with
+      | some fb =>
+          match ← resolveDbEndpoint fb with
+          | .ok tr => return .ok tr
+          | .error fbErr => return .error (ApiError.internal s!"database `{cfg.name}` unavailable: {primaryErr} (fallback: {fbErr})")
+      | none =>
+          return .error (ApiError.internal s!"database `{cfg.name}` unavailable: {primaryErr}")
+
+private def execHttpSqlRaw (url : String) (bearer? : Option String) (body : ByteArray) :
+    IO (Except ApiError String) := do
+  let baseHdrs : Array (String × String) := #[("Content-Type", "application/json"), ("Accept", "application/json")]
+  let hdrs := match bearer? with
+    | some tok => baseHdrs.push ("Authorization", "Bearer " ++ sanitizeHeader tok)
+    | none     => baseHdrs
+  match ← execHttpCall "POST" url hdrs body false with
+  | .error e => return .error (ApiError.internal s!"HTTP SQL transport error: {e}")
+  | .ok (status, respBody, _) =>
+      let txt := (String.fromUTF8? respBody).getD ""
+      if 200 ≤ status && status < 300 then return .ok txt
+      else return .error (ApiError.internal s!"HTTP SQL error {status}: {txt}")
+
+private def execNativeDbDdl (cfg : Db.DbConfig) : IO (Except ApiError Unit) := do
+  if cfg.tables.isEmpty then return .ok ()
+  match ← resolveDbConfig cfg with
+  | .error e => return .error e
+  | .ok (.sqlite path) =>
+      let ddl := Db.renderDatabaseDdl .sqlite cfg.tables
+      match ← Prim.sqliteDdl path ddl with
+      | .ok () => return .ok ()
+      | .error e => return .error (ApiError.internal e)
+  | .ok (.postgres url) =>
+      let ddl := Db.renderDatabaseDdl .postgres cfg.tables
+      match ← Db.PgWire.execDdl url ddl with
+      | .ok () => return .ok ()
+      | .error e => return .error (ApiError.internal e)
+  | .ok (.httpSql url bearer?) =>
+      for tbl in cfg.tables do
+        for stmt in tbl.renderDdlStatements .sqlite do
+          let body := Db.HttpSql.encodeGenericQueryBody stmt #[] .sqlite
+          match ← execHttpSqlRaw url bearer? body with
+          | .error e => return .error e
+          | .ok _    => pure ()
+      return .ok ()
+  | .ok (.d1 acc db tok) =>
+      let url := s!"https://api.cloudflare.com/client/v4/accounts/{Qed.encodeSeg acc}/d1/database/{Qed.encodeSeg db}/query"
+      for tbl in cfg.tables do
+        for stmt in tbl.renderDdlStatements .sqlite do
+          let body := Db.HttpSql.encodeD1QueryBody stmt #[]
+          match ← execHttpSqlRaw url (some tok) body with
+          | .error e => return .error e
+          | .ok _    => pure ()
+      return .ok ()
+  | .ok (.turso baseUrl tok) =>
+      let url := (if baseUrl.endsWith "/" then String.ofList baseUrl.toList.dropLast else baseUrl) ++ "/v2/pipeline"
+      for tbl in cfg.tables do
+        for stmt in tbl.renderDdlStatements .sqlite do
+          let body := Db.HttpSql.encodeTursoPipelineBody stmt #[]
+          match ← execHttpSqlRaw url (some tok) body with
+          | .error e => return .error e
+          | .ok _    => pure ()
+      return .ok ()
+
+private def execNativeDbQuery (cfg : Db.DbConfig) (q : Db.SqlQuery) : IO (Except ApiError Db.DbResult) := do
+  match ← resolveDbConfig cfg with
+  | .error e => return .error e
+  | .ok (.sqlite path) =>
+      let (sql, params) := q.compile .sqlite
+      let paramsJson := Db.encodeTaggedParamsJson params
+      match ← Prim.sqliteExec path sql paramsJson with
+      | .error e => return .error (ApiError.internal e)
+      | .ok rawJson =>
+          match Db.decodeTaggedResultJson rawJson with
+          | .ok res => return .ok res
+          | .error e => return .error (ApiError.internal s!"sqlite result decode failed: {e}")
+  | .ok (.postgres url) =>
+      let (sql, params) := q.compile .postgres
+      match ← Db.PgWire.execParameterized url sql params with
+      | .ok res => return .ok res
+      | .error e => return .error (ApiError.internal e)
+  | .ok (.httpSql url bearer?) =>
+      let (sql, params) := q.compile .sqlite
+      let body := Db.HttpSql.encodeGenericQueryBody sql params .sqlite
+      match ← execHttpSqlRaw url bearer? body with
+      | .error e => return .error e
+      | .ok rawJson =>
+          match Db.decodeTaggedResultJson rawJson with
+          | .ok res => return .ok res
+          | .error e => return .error (ApiError.internal s!"HTTP SQL result decode failed: {e}")
+  | .ok (.d1 acc db tok) =>
+      let url := s!"https://api.cloudflare.com/client/v4/accounts/{Qed.encodeSeg acc}/d1/database/{Qed.encodeSeg db}/query"
+      let (sql, params) := q.compile .sqlite
+      let body := Db.HttpSql.encodeD1QueryBody sql params
+      match ← execHttpSqlRaw url (some tok) body with
+      | .error e => return .error e
+      | .ok rawJson =>
+          match Db.HttpSql.decodeD1Response rawJson (Db.HttpSql.queryExpectedCols q) with
+          | .ok res => return .ok res
+          | .error e => return .error (ApiError.internal s!"Cloudflare D1 result decode failed: {e}")
+  | .ok (.turso baseUrl tok) =>
+      let url := (if baseUrl.endsWith "/" then String.ofList baseUrl.toList.dropLast else baseUrl) ++ "/v2/pipeline"
+      let (sql, params) := q.compile .sqlite
+      let body := Db.HttpSql.encodeTursoPipelineBody sql params
+      match ← execHttpSqlRaw url (some tok) body with
+      | .error e => return .error e
+      | .ok rawJson =>
+          match Db.HttpSql.decodeTursoResponse rawJson with
+          | .ok res => return .ok res
+          | .error e => return .error (ApiError.internal s!"Turso result decode failed: {e}")
+
 @[implicit_reducible]
 def mkNativeServerInst (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEntry))) : MonadServer IO where
   httpCall req := do
@@ -476,6 +662,8 @@ def mkNativeServerInst (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEn
             return .error (ApiError.internal s!"external HTTP transport error ({req.serviceName}): {transportErr}")
         | .ok (status, respBody, respHdrs) =>
             return .ok { status := status.toUInt32, body := respBody, headers := respHdrs.toList }
+  dbExec    := execNativeDbQuery
+  dbExecDdl := execNativeDbDdl
   readEnv := Prim.getEnv
   nowMs := Prim.nowMs
   randomHex := Prim.randomHex
@@ -499,10 +687,19 @@ def verifyRequiredSecrets (secrets : Array String) : IO Bool := do
         IO.eprintln s!"✗ missing required secret `{name}` (set `{name}` before starting the server)"
         return false
 
+/-- Initializes declared database schemas (`CREATE TABLE IF NOT EXISTS ...`) idempotently at server boot. -/
+def initDatabases (dbs : Array Db.DbConfig) : IO Bool := do
+  dbs.foldlM (init := true) fun ok cfg => do
+    match ← execNativeDbDdl cfg with
+    | .ok () => return ok
+    | .error e =>
+        IO.eprintln s!"✗ database `{cfg.name}` initialization failed: {e.message}"
+        return false
+
 /-! ## Full-Stack Native Server Runner (Verified HTTP/1.1 + Static + RFC 6455 WS + SSR) -/
 
 private def devReloadSnippet : String :=
-  "<script>(function(){let v=null;setInterval(async()=>{try{const t=await (await fetch('/__build_id',{cache:'no-store'})).text();if(v&&v!==t)location.reload();v=t;}catch(e){}},700)})()</script>\n</body>"
+  "<script type=\"module\" src=\"/qed_dev.mjs\"></script>\n</body>"
 
 private def injectDevReload (htmlBytes : ByteArray) : ByteArray :=
   match String.fromUTF8? htmlBytes with
@@ -725,7 +922,8 @@ def runFullstackWithDispatch {Model Msg : Type}
           let head := formatHttpResponseHead 200 st.mime fsize req.keepAlive true
           return if st.isHead then head else head ++ fbytes
       else if st.isBuildId then
-        return formatHttpResponse 200 st.mime "0".toUTF8 st.isHead req.keepAlive true
+        let fallback := if st.relPath == "__dev_status" then "{\"id\":\"0\",\"status\":\"ok\"}".toUTF8 else "0".toUTF8
+        return formatHttpResponse 200 st.mime fallback st.isHead req.keepAlive true
       else
         return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 st.isHead req.keepAlive false
     let isHead := req.method == "HEAD"
@@ -868,5 +1066,64 @@ def runStatelessFullstack {Model Msg : Type}
     port staticDir devMode numWorkers
     (wsDispatchM?.map fun wsM ctx kind ch params payload => @wsM IO _ srvInst ctx kind ch params payload)
     blockingMethods?
+
+/-- Serves a standalone `Qed.App` (`component` or `Qed.run`) with native in-memory SSR and static asset serving. -/
+def runStandaloneApp {Model Msg : Type} (app : Qed.App Model Msg) (title : String)
+    (args : List String) : IO UInt32 := do
+  let staticDir := args.getD 0 "dist"
+  let port : UInt16 := ((args.getD 1 "8000").toNat?.getD 8000).toUInt16
+  let devMode := args.contains "--dev"
+  let numWorkers : UInt32 := (((← Prim.getEnv "QED_WORKERS").bind String.toNat?).getD 0).toUInt32
+  runFullstackWithDispatch app title "_app" #[]
+    (fun _ _ _ => pure (.error (ApiError.notFound "no RPC server configured")))
+    port staticDir devMode numWorkers none (some #[])
+
+/-- Serves a static/SPA directory using Qed's native Rust/Lean HTTP/1.1 server (no Node.js or Python). -/
+def runStaticDir (staticDir : String) (port : UInt16) (devMode : Bool := false) : IO UInt32 := do
+  let cfg ← loadServerConfig devMode
+  let staticDirFd ← Prim.openStaticDir staticDir
+  let healthKA    := formatHttpResponse 200 "application/json" "{\"ok\":true}".toUTF8 false true false
+  let healthClose := formatHttpResponse 200 "application/json" "{\"ok\":true}".toUTF8 false false false
+  let dispatchReq (req : ParsedReqHead) (_body : ByteArray) (_clientIp : String) : IO ByteArray := do
+    let isHead := req.method == "HEAD"
+    if req.method != "GET" && !isHead then
+      return formatHttpResponse 405 "text/plain; charset=utf-8" "method not allowed".toUTF8 isHead req.keepAlive false
+    if let some st := classifyStaticPath req.method req.target devMode then
+      let headFlag : UInt8 := if st.isHead then 1 else 0
+      if let some (fsize, mtimeMs, fbytes) ← Prim.readStaticFile staticDirFd st.relPath headFlag then
+        if !st.noStore then
+          let etag := s!"W/\"{fsize}-{mtimeMs}\""
+          let cacheCtrl :=
+            if isContentHashedAsset st.relPath then "public, max-age=31536000, immutable"
+            else "public, max-age=0, must-revalidate"
+          if req.hasIfNoneMatch && etagMatchesIfNoneMatch req.headers etag then
+            return formatNotModifiedResponse etag req.keepAlive
+          let head := formatHttpResponseHead 200 st.mime fsize req.keepAlive false (some etag) (some cacheCtrl)
+          return if st.isHead then head else head ++ fbytes
+        else
+          let head := formatHttpResponseHead 200 st.mime fsize req.keepAlive true
+          return if st.isHead then head else head ++ fbytes
+      else if st.isBuildId then
+        let fallback := if st.relPath == "__dev_status" then "{\"id\":\"0\",\"status\":\"ok\"}".toUTF8 else "0".toUTF8
+        return formatHttpResponse 200 st.mime fallback st.isHead req.keepAlive true
+      else
+        return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 st.isHead req.keepAlive false
+    match ← Prim.readStaticFile staticDirFd "index.html" (if isHead then 1 else 0) with
+    | some (_, _, bytes) =>
+        return formatHttpResponse 200 "text/html; charset=utf-8" bytes isHead req.keepAlive true
+    | none =>
+        return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 isHead req.keepAlive false
+  let onHead (headBytes : ByteArray) (_clientIp : String) (_inline : Nat) : IO (Prim.HttpHeadAction ParsedReqHead RequestCtx) := do
+    match parseRequestHead headBytes with
+    | .error (code, msg) => return .doneClose (formatErrorResponse code msg)
+    | .ok req =>
+        let pathOnly := stripQuery req.target
+        if req.method == "GET" && pathOnly == "/_qed/health" && req.contentLen == 0 then
+          return if req.keepAlive then .doneKeepAlive healthKA else .doneClose healthClose
+        let wire ← dispatchReq req ByteArray.empty ""
+        return if req.keepAlive then .doneKeepAlive wire else .doneClose wire
+  let onWsBytes (_ : RequestCtx) (rx : ByteArray) (frag : WsFragState) (_ : Array (Nat × String × ByteArray)) :=
+    pure { consumed := rx.size, outWire := ByteArray.empty, closeFlag := 1, fragState := frag, subOps := #[] : Prim.WsStepOut WsFragState }
+  Prim.serveNative cfg.bindHost port 1 ({} : WsFragState) onHead dispatchReq onWsBytes (fun _ _ _ => pure ())
 
 end Qed.Server.Native

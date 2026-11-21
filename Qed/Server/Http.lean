@@ -590,7 +590,7 @@ def guessMimeType (path : String) : Option String :=
 def classifyStaticPath (method target : String) (devMode : Bool) : Option StaticTarget :=
   let isHead := method == "HEAD"
   if method != "GET" && !isHead then none
-  else if target == "/" || ((findByte target 0 46).isNone && !(devMode && target == "/__build_id")) then none
+  else if target == "/" || ((findByte target 0 46).isNone && !(devMode && (target == "/__build_id" || target == "/__dev_status"))) then none
   else
     let pathOnly := (target.splitOn "?").headD target
     if pathOnly.isEmpty || pathOnly.utf8ByteSize >= 2048 || !pathOnly.startsWith "/" ||
@@ -602,6 +602,8 @@ def classifyStaticPath (method target : String) (devMode : Bool) : Option Static
       if relPath.isEmpty || relPath.startsWith "/" then none
       else if devMode && pathOnly == "/__build_id" then
         some { relPath, mime := "text/plain; charset=utf-8", isHead, noStore := true, isBuildId := true }
+      else if devMode && pathOnly == "/__dev_status" then
+        some { relPath, mime := "application/json; charset=utf-8", isHead, noStore := true, isBuildId := true }
       else
         match guessMimeType pathOnly with
         | some mime => some { relPath, mime, isHead, noStore := devMode, isBuildId := false }

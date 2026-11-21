@@ -2,6 +2,7 @@ import Qed.Json.Lawful
 import Qed.Proto
 import Qed.Router.Basic
 import Qed.Collection
+import Qed.Server.Db.Core
 
 namespace Qed.Server
 
@@ -504,6 +505,8 @@ deriving Inhabited
 
 class MonadServer (m : Type → Type) where
   httpCall    : OutboundReq → m (Except ApiError OutboundResp)
+  dbExec      : Db.DbConfig → Db.SqlQuery → m (Except ApiError Db.DbResult)
+  dbExecDdl   : Db.DbConfig → m (Except ApiError Unit)
   readEnv     : String → m (Option String)
   nowMs       : m UInt64
   randomHex   : UInt32 → m String
@@ -540,6 +543,8 @@ class MonadAtomic (σ : Type) (m : Type → Type) where
 /-- Non-stateful external/OS I/O commands available to a server handler thread. -/
 inductive ServerEffect : Type where
   | httpCall    (req : OutboundReq)
+  | dbExec      (cfg : Db.DbConfig) (q : Db.SqlQuery)
+  | dbExecDdl   (cfg : Db.DbConfig)
   | readEnv     (v : String)
   | nowMs
   | randomHex   (n : UInt32)
@@ -549,6 +554,8 @@ inductive ServerEffect : Type where
 /-- Response payload type returned by each `ServerEffect`. -/
 def ServerEffect.Resp : ServerEffect → Type
   | .httpCall _      => Except ApiError OutboundResp
+  | .dbExec _ _      => Except ApiError Db.DbResult
+  | .dbExecDdl _     => Except ApiError Unit
   | .readEnv _       => Option String
   | .nowMs           => UInt64
   | .randomHex _     => String
@@ -576,6 +583,8 @@ instance {σ : Type} : Monad (ThreadProg σ) where
 
 instance {σ : Type} : MonadServer (ThreadProg σ) where
   httpCall req       := .io (.httpCall req) .pure
+  dbExec cfg q       := .io (.dbExec cfg q) .pure
+  dbExecDdl cfg      := .io (.dbExecDdl cfg) .pure
   readEnv v          := .io (.readEnv v) .pure
   nowMs              := .io .nowMs .pure
   randomHex n        := .io (.randomHex n) .pure
@@ -757,6 +766,10 @@ instance {σ α : Type} (a : α) : SafeIO (Pure.pure (f := ThreadProg σ) a) := 
 instance {σ α : Type} (a : α) : SafeIO (ThreadProg.pure (σ := σ) a) := ⟨.pure a⟩
 instance {σ : Type} (req : OutboundReq) : SafeIO (MonadServer.httpCall (m := ThreadProg σ) req) :=
   ⟨.io _ _ .pure⟩
+instance {σ : Type} (cfg : Db.DbConfig) (q : Db.SqlQuery) : SafeIO (MonadServer.dbExec (m := ThreadProg σ) cfg q) :=
+  ⟨.io _ _ .pure⟩
+instance {σ : Type} (cfg : Db.DbConfig) : SafeIO (MonadServer.dbExecDdl (m := ThreadProg σ) cfg) :=
+  ⟨.io _ _ .pure⟩
 instance {σ : Type} (v : String) : SafeIO (MonadServer.readEnv (m := ThreadProg σ) v) :=
   ⟨.io _ _ .pure⟩
 instance {σ : Type} : SafeIO (MonadServer.nowMs (m := ThreadProg σ)) :=
@@ -856,6 +869,32 @@ theorem safeIO_bind_ensures {σ α β : Type} {Inv : σ → Prop} {Post : β →
     (hk : ∀ a, ProgEnsures Inv Post (k a)) :
     ProgEnsures Inv Post (p >>= k) :=
   progEnsures_bind (safeIO_ensures_true p) (fun a _ => hk a)
+
+/-- Strengthened `SafeIO` witness carrying a zero-trust postcondition `Q` on the returned I/O value
+    (e.g. database row invariants and verified `WHERE` predicates). -/
+class SafeIOEnsures {σ α : Type} (p : ThreadProg σ α) (Q : outParam (α → Prop)) : Prop where
+  noAtomic : NoAtomic p
+  ensures  : ∀ {Inv : σ → Prop}, ProgEnsures Inv Q p
+
+theorem safeIOEnsures_bind {σ α β : Type} {Inv : σ → Prop} {Q : α → Prop} {Post : β → Prop}
+    (p : ThreadProg σ α) [h : SafeIOEnsures p Q] {k : α → ThreadProg σ β}
+    (hk : ∀ a, Q a → ProgEnsures Inv Post (k a)) :
+    ProgEnsures Inv Post (p >>= k) :=
+  progEnsures_bind h.ensures hk
+
+theorem progEnsures_imp {σ α : Type} {Inv : σ → Prop} {Q Post : α → Prop}
+    {p : ThreadProg σ α} (hp : ProgEnsures Inv Q p) (himp : ∀ a, Q a → Post a) :
+    ProgEnsures Inv Post p := by
+  induction hp with
+  | pure a ha => exact .pure a (himp a ha)
+  | io _ _ _ ih => exact .io _ _ ih
+  | atomic _ _ _ ih => exact .atomic _ _ ih
+
+theorem safeIOEnsures_final {σ α : Type} {Inv : σ → Prop} {Q Post : α → Prop}
+    (p : ThreadProg σ α) [h : SafeIOEnsures p Q]
+    (himp : ∀ a, Q a → Post a) :
+    ProgEnsures Inv Post p :=
+  progEnsures_imp h.ensures himp
 
 theorem progEnsures_runAtomic {σ α : Type} {Inv : σ → Prop} {Post : α → Prop}
     (step : σ → σ × α)
@@ -995,17 +1034,17 @@ class SrvUnwrap (E : Type) (W : Type) (Val : outParam Type) where
   unwrap := id
 
 @[reducible] instance {ε α : Type} : SrvUnwrap (SrvFailure ε) (Except ApiError α) α where
-  unwrap
+  unwrap := fun x => match x with
     | .ok a    => .ok a
     | .error e => .error (.api e)
 
 @[reducible] instance {E α : Type} [SrvErr E] : SrvUnwrap E (Except String α) α where
-  unwrap
+  unwrap := fun x => match x with
     | .ok a    => .ok a
     | .error e => .error (SrvErr.ofApi (ApiError.badRequest e))
 
 @[reducible] instance {E α : Type} [SrvErr E] : SrvUnwrap E (Option α) α where
-  unwrap
+  unwrap := fun x => match x with
     | some a => .ok a
     | none   => .error (SrvErr.ofApi (ApiError.notFound "optional value was empty"))
 
@@ -1014,14 +1053,26 @@ class SrvUnwrapOpt (W : Type) (Inner : Type) (Val : outParam Type) where
   unwrapOpt : W → Except (Except ApiError (Option Inner)) Val
 
 @[reducible] instance {Inner α : Type} : SrvUnwrapOpt (Option α) Inner α where
-  unwrapOpt
+  unwrapOpt := fun x => match x with
     | some a => .ok a
     | none   => .error (.ok none)
 
 @[reducible] instance {Inner α : Type} : SrvUnwrapOpt (Except ApiError α) Inner α where
-  unwrapOpt
+  unwrapOpt := fun x => match x with
     | .ok a    => .ok a
     | .error e => .error (.error e)
+
+@[simp] theorem srvUnwrap_srvFailure_ok_iff {ε α : Type} (x : Except ApiError α) (a : α) :
+    (SrvUnwrap.unwrap (E := SrvFailure ε) x = Except.ok a) = (x = Except.ok a) :=
+  propext (by cases x <;> simp [SrvUnwrap.unwrap])
+
+@[simp] theorem srvUnwrap_str_ok_iff {E α : Type} [SrvErr E] (x : Except String α) (a : α) :
+    (SrvUnwrap.unwrap (E := E) x = Except.ok a) = (x = Except.ok a) :=
+  propext (by cases x <;> simp [SrvUnwrap.unwrap])
+
+@[simp] theorem srvUnwrap_opt_ok_iff {E α : Type} [SrvErr E] (x : Option α) (a : α) :
+    (SrvUnwrap.unwrap (E := E) x = Except.ok a) = (x = some a) :=
+  propext (by cases x <;> simp [SrvUnwrap.unwrap])
 
 /-- Pure statement sequencing with early `return` short-circuiting. -/
 @[inline]
@@ -1246,6 +1297,10 @@ def srvEnsPostOpt {ε α : Type} (P : α → Prop) : Except ε (Option α) → P
 @[simp] theorem srvEnsPostOpt_srvLetEq {ε α γ : Type} (P : α → Prop) (val : γ)
     (k : (x : γ) → x = val → Except ε (Option α)) :
     srvEnsPostOpt P (srvLetEq val k) = srvLetEq val (fun x hx => srvEnsPostOpt P (k x hx)) := rfl
+
+@[simp] theorem srvEnsPostOpt_ok_iff {ε α : Type} (P : α → Prop) (o : Option α) :
+    srvEnsPostOpt (ε := ε) P (.ok o) = (∀ r, o = some r → P r) :=
+  propext (by cases o <;> simp [srvEnsPostOpt])
 
 theorem getElem_congr_arr {α : Type} {xs ys : Array α} {j : Nat}
     (heq : ys = xs) (hj : j < ys.size) :

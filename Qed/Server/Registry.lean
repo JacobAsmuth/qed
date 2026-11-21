@@ -45,6 +45,7 @@ structure ServerInfo where
   externalServices : Array (String × String)
   methods          : Array ServerMethodInfo
   channels         : Array String := #[]
+  databases        : Array Lean.Name := #[]
 deriving Inhabited
 
 initialize serverRegistry :
@@ -277,6 +278,71 @@ initialize externalRegistry :
       arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.serviceName info) acc) {}
     addEntryFn := fun m info => m.insert info.serviceName info
   }
+
+/-! ## Persistent `database` Schema & Policy Registry (`databaseRegistry`) -/
+
+structure DbColumnInfo where
+  name         : String
+  isPrimaryKey : Bool := false
+  isImmutable  : Bool := false
+  isUnique     : Bool := false
+  isNullable   : Bool := false
+  isNat        : Bool := false
+  isBytes      : Bool := false
+deriving Inhabited, Repr
+
+structure DbTableInfo where
+  tableName         : String
+  rowTypeConst      : Lean.Name
+  rowInvConst       : Lean.Name
+  rowInvBoolConst   : Lean.Name
+  rowInvSoundConst  : Lean.Name
+  transInvConst     : Lean.Name
+  readPolicyConst   : Lean.Name
+  insertPolicyConst : Lean.Name
+  updatePolicyConst : Lean.Name
+  deletePolicyConst : Lean.Name
+  decodeRowConst    : Lean.Name
+  schemaConst       : Lean.Name
+  columns           : Array DbColumnInfo
+  hasReadPolicy     : Bool := false
+  hasInsertPolicy   : Bool := false
+  hasUpdatePolicy   : Bool := false
+  hasDeletePolicy   : Bool := false
+  hasTransInv       : Bool := false
+  readPolicyLabel   : String := ""
+  insertPolicyLabel : String := ""
+  updatePolicyLabel : String := ""
+  deletePolicyLabel : String := ""
+deriving Inhabited, Repr
+
+structure DatabaseInfo where
+  dbName            : Lean.Name
+  shortName         : String
+  configConst       : Lean.Name
+  ensureSchemaConst : Lean.Name
+  secrets           : Array String
+  hasDevFallback    : Bool := false
+  tables            : Array DbTableInfo
+deriving Inhabited, Repr
+
+initialize databaseRegistry :
+    Lean.SimplePersistentEnvExtension DatabaseInfo (Lean.NameMap DatabaseInfo) ←
+  Lean.registerSimplePersistentEnvExtension {
+    addImportedFn := fun arrays =>
+      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.dbName info) acc) {}
+    addEntryFn := fun m info => m.insert info.dbName info
+  }
+
+def lookupDatabase? (env : Lean.Environment) (currNs : Lean.Name)
+    (openDecls : List Lean.OpenDecl) (dbRef : Lean.Name) : Option DatabaseInfo :=
+  let reg := databaseRegistry.getState env
+  let clean := dbRef.eraseMacroScopes
+  (reg.find? (currNs ++ clean)).orElse fun _ =>
+    (reg.find? clean).orElse fun _ =>
+      let resolved := Lean.ResolveName.resolveGlobalName env {} currNs openDecls (clean ++ `config)
+      resolved.findSome? fun (fullConst, _) =>
+        reg.find? fullConst.getPrefix
 
 open Lean Elab Command in
 def buildPropConj (ps : Array Term) : CommandElabM Term := do

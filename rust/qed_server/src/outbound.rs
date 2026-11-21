@@ -1,9 +1,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -233,6 +234,43 @@ pub unsafe extern "C" fn qed_server_outbound_read_some(handle: u64, max_bytes: u
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn qed_server_outbound_upgrade_tls(handle: u64, host_obj: *mut LeanObj) -> *mut LeanObj {
+    let host = str_slice(host_obj);
+    let res = OUTBOUND.with(|cell| {
+        let mut st = cell.borrow_mut();
+        let Some(conn) = st.active.remove(&handle) else {
+            return Err("invalid outbound connection handle".to_owned());
+        };
+        match conn.stream {
+            OutStream::Tls(_) => {
+                st.active.insert(handle, conn);
+                Ok(())
+            }
+            OutStream::Plain(mut sock) => {
+                let Ok(sni) = ServerName::try_from(host.to_owned()) else {
+                    return Err(format!("invalid TLS server name: {host}"));
+                };
+                let Ok(mut tls_conn) = ClientConnection::new(tls_config(), sni) else {
+                    return Err("TLS client init failed".to_owned());
+                };
+                if let Err(e) = tls_conn.complete_io(&mut sock) {
+                    return Err(format!("STARTTLS handshake failed for {host}: {e}"));
+                }
+                let upgraded = OutConn {
+                    is_tls: true,
+                    host: conn.host,
+                    port: conn.port,
+                    stream: OutStream::Tls(Box::new(StreamOwned::new(tls_conn, sock))),
+                };
+                st.active.insert(handle, upgraded);
+                Ok(())
+            }
+        }
+    });
+    match res { Ok(()) => mk_io_except_ok(qed_lean_box(0)), Err(e) => mk_io_except_err(&e) }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn qed_server_outbound_release(handle: u64, keep_alive: u8) -> *mut LeanObj {
     OUTBOUND.with(|cell| {
         let mut st = cell.borrow_mut();
@@ -247,5 +285,93 @@ pub unsafe extern "C" fn qed_server_outbound_release(handle: u64, keep_alive: u8
             }
         }
     });
+    qed_lean_io_mk_ok(qed_lean_box(0))
+}
+
+// ---- Loopback TCP Listener Helpers (Native Server & Test Harnesses) ----
+
+static LISTENERS: OnceLock<Mutex<HashMap<u64, TcpListener>>> = OnceLock::new();
+static NEXT_LISTENER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn listener_map() -> &'static Mutex<HashMap<u64, TcpListener>> {
+    LISTENERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_free_port() -> *mut LeanObj {
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())
+        .unwrap_or(0);
+    qed_lean_io_mk_ok(qed_lean_box(port as usize))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_tcp_listen(port: u16) -> *mut LeanObj {
+    let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) else {
+        return mk_io_except_err(&format!("failed to bind 127.0.0.1:{port}"));
+    };
+    let Ok(addr) = listener.local_addr() else {
+        return mk_io_except_err("failed to query local TCP address");
+    };
+    let _ = listener.set_nonblocking(true);
+    let id = NEXT_LISTENER_ID.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut map) = listener_map().lock() {
+        map.insert(id, listener);
+    }
+    let pair = qed_lean_mk_prod(qed_lean_box_u64(id), qed_lean_box(addr.port() as usize));
+    mk_io_except_ok(pair)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_tcp_accept(listener_id: u64, timeout_ms: u32) -> *mut LeanObj {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    loop {
+        let step = {
+            let Ok(map) = listener_map().lock() else {
+                return mk_io_except_err("listener lock poisoned");
+            };
+            let Some(listener) = map.get(&listener_id) else {
+                return mk_io_except_err("closed");
+            };
+            listener.accept()
+        };
+        match step {
+            Ok((sock, peer)) => {
+                let _ = sock.set_nonblocking(false);
+                let _ = sock.set_nodelay(true);
+                let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
+                let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
+                let conn = OutConn {
+                    is_tls: false,
+                    host: peer.ip().to_string(),
+                    port: peer.port(),
+                    stream: OutStream::Plain(sock),
+                };
+                let handle = OUTBOUND.with(|cell| {
+                    let mut st = cell.borrow_mut();
+                    let h = st.next_id;
+                    st.next_id += 1;
+                    st.active.insert(h, conn);
+                    h
+                });
+                return mk_io_except_ok(qed_lean_box_u64(handle));
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return mk_io_except_err("timeout");
+                }
+                std::thread::sleep(Duration::from_millis(3));
+            }
+            Err(e) => return mk_io_except_err(&format!("tcp accept failed: {e}")),
+        }
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_tcp_close_listener(listener_id: u64) -> *mut LeanObj {
+    if let Ok(mut map) = listener_map().lock() {
+        map.remove(&listener_id);
+    }
     qed_lean_io_mk_ok(qed_lean_box(0))
 }

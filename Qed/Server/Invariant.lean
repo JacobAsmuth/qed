@@ -74,7 +74,7 @@ private def stepLetEqSimpNames : Array Lean.Name := #[
 private def ensPostSimpNames : Array Lean.Name := #[
   ``Qed.Server.srvEnsPost_ok, ``Qed.Server.srvEnsPost_err, ``Qed.Server.srvEnsPost_srvLetEq,
   ``Qed.Server.srvEnsPostOpt_some, ``Qed.Server.srvEnsPostOpt_none, ``Qed.Server.srvEnsPostOpt_err,
-  ``Qed.Server.srvEnsPostOpt_srvLetEq]
+  ``Qed.Server.srvEnsPostOpt_srvLetEq, ``Qed.Server.srvEnsPostOpt_ok_iff]
 
 private def threadProgBindSimpNames : Array Lean.Name := #[
   ``Qed.Server.threadProg_pure_bind, ``Qed.Server.threadProg_pure_bind', ``Qed.Server.threadProg_bind_assoc]
@@ -115,7 +115,8 @@ private def finishAtomFallbackSimpNames : Array Lean.Name :=
 private def hypSimpEachNames : Array Lean.Name :=
   #[``id_eq, ``ne_eq, ``Prod.mk.injEq, ``Option.some.injEq, ``Except.ok.injEq, ``Except.error.injEq,
     ``reduceCtorEq, ``Qed.Lang.not_qedAndProp, ``Qed.Lang.not_qedOrProp,
-    ``Qed.Server.srvDiteFalse_eq_true, ``Qed.Server.srvDiteFalse_eq_false] ++
+    ``Qed.Server.srvDiteFalse_eq_true, ``Qed.Server.srvDiteFalse_eq_false,
+    ``Qed.Server.srvUnwrap_srvFailure_ok_iff, ``Qed.Server.srvUnwrap_str_ok_iff, ``Qed.Server.srvUnwrap_opt_ok_iff] ++
   valUnwrapSimpNames ++ liftOptSimpNames ++ optCodecSimpNames ++ arrayCoreSimpNames ++ boolSimpNames
 
 private def tgtSimpEachNames : Array Lean.Name :=
@@ -126,6 +127,7 @@ private def postRwSimpNames : Array Lean.Name :=
   #[``Array.sumBy_empty, ``Array.sumBy_push] ++ arrayCoreSimpNames ++ valUnwrapSimpNames ++ liftOptSimpNames
 
 private def stepFixedSimpNames : Array Lean.Name :=
+  #[``Qed.Server.srvUnwrap_srvFailure_ok_iff, ``Qed.Server.srvUnwrap_str_ok_iff, ``Qed.Server.srvUnwrap_opt_ok_iff] ++
   stepCombSimpNames ++ stepLetEqSimpNames ++ ensPostSimpNames ++ valUnwrapSimpNames ++ liftOptSimpNames
 
 private def asyncInitSimpNames : Array Lean.Name :=
@@ -186,13 +188,18 @@ private def getStrLenSimprocs : MetaM Simp.SimprocsArray := do
 open Lean Meta in
 private def getCachedSimpThms (key : String) (names : Array Name) (dsimpOnly : Bool := false) :
     MetaM SimpTheorems := do
-  let env ← getEnv
-  let cacheKey := (key, env.header.mainModule, env.contains `Qed.Codec.valid)
-  if let some (st, eqns) := (← srvSimpThmsCache.get).get? cacheKey then
-    if eqns.all env.contains then
+  let envBefore ← getEnv
+  let cacheKey := (key, envBefore.header.mainModule, envBefore.contains `Qed.Codec.valid)
+  if let some (st, needed) := (← srvSimpThmsCache.get).get? cacheKey then
+    if needed.all envBefore.contains then
       return st
   let (st, eqns) ← addSimpNamesWithEqns {} names dsimpOnly
-  srvSimpThmsCache.modify (·.insert cacheKey (st, eqns))
+  let envAfter ← getEnv
+  let mut needed := eqns
+  for (c, _) in envAfter.constants.map₂.toList do
+    if !envBefore.contains c then
+      needed := needed.push c
+  srvSimpThmsCache.modify (·.insert cacheKey (st, needed))
   return st
 
 open Lean Meta in
@@ -1738,13 +1745,31 @@ private def stepAsyncEnsuresLoop (dCtx sCtx : Simp.Context) (gInit : MVarId) :
             | _ => restoreState s
           else
             let s ← saveState
-            match ← try some <$> g.applyConst ``Qed.Server.safeIO_bind_ensures catch _ => pure none with
+            match ← try some <$> g.applyConst ``Qed.Server.safeIOEnsures_bind catch _ => pure none with
             | some [gCont] =>
-                let (_, gCont1) ← gCont.intro1
+                let (_, gCont1) ← gCont.introN 2
                 let nextC ← match ← normAsyncContGoal gCont1 dCtx sCtx with | none => pure [] | some c => pure [c]
                 return ← loop fuel (nextC ++ rest)
-            | _ => restoreState s
-        -- 3. Single runAtomic / runAtomicRead
+            | _ =>
+                restoreState s
+                let isBranchP := (pArg.find? fun e =>
+                  e.isAppOf ``ite || e.isAppOf ``dite ||
+                  (e.getAppFn.constName?.any fun c => c.toString.contains ".match_")).isSome
+                if isBranchP then
+                  if let some sgs ← trySplitTarget g then
+                    let mut next : List MVarId := []
+                    for sg in sgs do
+                      if let some sg' ← normAsyncContGoal sg dCtx sCtx then
+                        next := next ++ [sg']
+                    return ← loop fuel (next ++ rest)
+                let s2 ← saveState
+                match ← try some <$> g.applyConst ``Qed.Server.safeIO_bind_ensures catch _ => pure none with
+                | some [gCont] =>
+                    let (_, gCont1) ← gCont.intro1
+                    let nextC ← match ← normAsyncContGoal gCont1 dCtx sCtx with | none => pure [] | some c => pure [c]
+                    return ← loop fuel (nextC ++ rest)
+                | _ => restoreState s2
+        -- 3. Single runAtomic / runAtomicRead / SafeIOEnsures
         if prog.isAppOf ``Qed.Server.MonadAtomic.runAtomic then
           let s ← saveState
           match ← try some <$> g.applyConst ``Qed.Server.progEnsures_runAtomic catch _ => pure none with
@@ -1755,6 +1780,10 @@ private def stepAsyncEnsuresLoop (dCtx sCtx : Simp.Context) (gInit : MVarId) :
           match ← try some <$> g.applyConst ``Qed.Server.progEnsures_runAtomicRead catch _ => pure none with
           | some [gStep] => return gStep :: (← loop fuel rest)
           | _ => restoreState s
+        let sEns ← saveState
+        match ← try some <$> g.applyConst ``Qed.Server.safeIOEnsures_final catch _ => pure none with
+        | some [gImp] => return gImp :: (← loop fuel rest)
+        | _ => restoreState sEns
         -- 4. `srvLetEq`
         if prog.isAppOf ``Qed.Server.srvLetEq then
           if let some gLet ← elimSrvLetEqGoal g (allowHyps := false) then

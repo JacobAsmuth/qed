@@ -4,7 +4,7 @@ Qed provides a first-class, compile-time-verified CSS DSL that matches the inden
 
 ## 1. First-class `style` blocks
 
-Write scoped CSS using native CSS syntax with indentation nesting for pseudo-classes, pseudo-elements, and at-rules (`@media`, `@container`, `@supports`):
+Write scoped CSS using native CSS syntax with indentation nesting for pseudo-classes, pseudo-elements, and at-rules like `@media`, `@container`, and `@supports`:
 
 ```lean
 style card:
@@ -18,9 +18,9 @@ style card:
 ```
 
 Every `style` block is validated at compile time:
-- Unknown CSS properties fail with "did you mean" suggestions (`border-raduis` → `border-radius`).
-- Keyword properties (`display`, `position`, `cursor`, `overflow`, `box-sizing`, …), hex colors (`#rgb`/`#rrggbb`), `rgb(0..255, …)`, lengths (`px`, `rem`, `em`, `%`, `dvh`, `clamp(…)`, `calc(…)`), and typed design tokens are checked before any code runs.
-- Each `style` bakes its scoped class name (`qed-card-<hash>`) and rendered CSS string at elaboration time—zero runtime hashing in JS.
+- Unknown CSS properties fail with "did you mean" suggestions, such as `border-raduis` → `border-radius`.
+- Keyword properties like `display`, `position`, `cursor`, `overflow`, and `box-sizing`, hex colors `#rgb`/`#rrggbb`, `rgb(0..255, …)`, lengths in `px`, `rem`, `em`, `%`, `dvh`, `clamp(…)`, and `calc(…)`, and typed design tokens are checked before any code runs.
+- Each `style` bakes its scoped class name `qed-card-<hash>` and rendered CSS string at elaboration time—zero runtime hashing in JS.
 
 ### Deterministic composition with `extends`
 
@@ -65,11 +65,11 @@ component BookCard:
     </article>
 ```
 
-Every `style` block (top-level or colocated inside a `component`) referenced by your app is automatically discovered and included in `app.styles`.
+Every top-level or component-colocated `style` block referenced by your app is automatically discovered and included in `app.styles`.
 
 ## 2. Typed `theme` & WCAG contrast proofs
 
-Define typed design tokens (`color`, `len`, `num`, `font`, `time`), dark-mode overrides (`@media (prefers-color-scheme: dark)` + `[data-theme="dark"]`), element resets, and kernel-verified WCAG 2.1 contrast invariants in one place:
+Define typed design tokens—`color`, `len`, `num`, `font`, and `time`—dark-mode overrides via `@media (prefers-color-scheme: dark)` and `[data-theme="dark"]`, element resets, and kernel-verified WCAG 2.1 contrast invariants in one place:
 
 ```lean
 theme AppTheme:
@@ -93,8 +93,8 @@ theme AppTheme:
   invariant brandReadable: contrast(brand, surface) >= 4.5
 ```
 
-- **Type-safe tokens (`TypedToken α`):** Using a `color` token in `padding:` is a compile error.
-- **Automatic `<head>` injection:** Any component referencing `AppTheme.*` automatically includes `AppTheme.style` in its stylesheet (emitted into `<head>` on SSR and `styles.css` on build).
+- **Type-safe tokens:** Using a `color` token in `padding:` is a compile error.
+- **Automatic `<head>` injection:** Any component referencing `AppTheme.*` automatically includes `AppTheme.style` in its stylesheet, emitted into `<head>` on SSR and `styles.css` on build.
 - **Light + dark WCAG proofs:** `contrast(fg, bg) >= 4.5` proves WCAG 2.1 contrast in Lean's kernel across *both* light and dark modes, reporting the exact ratio on failure.
 
 ## 3. `keyframes`
@@ -113,20 +113,20 @@ Referencing `fadeIn` in `animation: fadeIn 200ms ease-out` automatically bundles
 
 ## 4. Safe dynamic inline styles & CSS variables
 
-For state-driven values (like progress widths or dynamic CSS variables), use sanitized `inlineStyle` and `styleVars` (proved free of `<`, `>`, `"`, `'`, and `/*`):
+For state-driven values like progress widths or dynamic CSS variables, use sanitized `inlineStyle` and `styleVars`, proved free of `<`, `>`, `"`, `'`, and `/*`:
 
 ```lean
 <div {inlineStyle([width(pct(progress))])}
      {styleVars([cssVar(AppTheme.brand, hex("0055aa"))])}/>
 ```
 
-## 5. Verification superpowers
+## 5. Verification checks
 
-- **Theme completeness (`verify_theme`):** Prove every `var(--...)` referenced by any style in an app is defined by the theme:
+- **Theme completeness with `verify_theme`:** Prove every `var(--...)` referenced by any style in an app is defined by the theme:
   ```lean
   verify_theme AppTheme for MyApp.app
   ```
-- **Token-only design-system enforcement (`strict_tokens`):** Reject raw color and non-zero length literals inside a `style` block:
+- **Token-only enforcement with `strict_tokens`:** Reject raw color and non-zero length literals inside a `style` block:
   ```lean
   style panel strict_tokens:
     padding: AppTheme.spaceMd
@@ -134,4 +134,4 @@ For state-driven values (like progress widths or dynamic CSS variables), use san
     color: AppTheme.text
   ```
 - **View styling invariants:** Combine `roleHasOneOf`, `roleHasAll`, `tagHas`, `roleLacks`, `tagLacks`, `exactlyOne`, `exactlyOneOf`, and `noConflictingStyles` inside any `component`.
-- **Build-time CSS extraction:** `qed build` and `qed dev` extract static CSS into `styles.css` (linked in `index.html` with zero FOUC) and copy declared local `stylesheet` files automatically, while SSR inlines `<style id="qed-styles">` in `<head>` for zero-RTT first paint.
+- **Build-time CSS extraction:** `qed build` and `qed dev` extract static CSS into `styles.css` linked in `index.html` with zero FOUC and copy declared local `stylesheet` files automatically, while SSR inlines `<style id="qed-styles">` in `<head>` for zero-RTT first paint.

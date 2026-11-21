@@ -3,6 +3,7 @@ import Qed.Proto
 import Qed.Server.Core
 import Qed.Server.Syntax
 import Qed.Server.Registry
+import Qed.Server.Db.QueryLower
 
 namespace Qed.Server
 open Qed.Lang
@@ -87,6 +88,7 @@ structure LowerCtx where
   channels         : Array SrvChanSig := #[]
   emitAcc?         : Option Lean.Ident := none
   wrapReturnSumInl : Bool := false
+  dbs              : Array (String × DatabaseInfo) := #[]
 
 inductive HoistedStep where
   | awaitUnwrap (ref : Lean.Syntax) (tmp : Lean.Ident) (callTerm : Lean.Term)
@@ -96,6 +98,7 @@ structure LowerState where
   nextId       : Nat := 0
   stateRead    : Bool := false
   mutated      : Array String := #[]
+  dbWrite      : Bool := false
   extRoots     : Array Lean.Name := #[]
   usedOld      : Bool := false
   hoisted      : Array HoistedStep := #[]
@@ -317,6 +320,17 @@ open Lean Elab Command in
 private def lowerSrvCallHook (stx calleeStx : Syntax) (rawArgs : Array Syntax) (mode : ExprMode)
     (go : ExprMode → Syntax → SrvExprM Term) : SrvExprM (Option Term) := do
   let ctx ← read
+  if !ctx.dbs.isEmpty then
+    if let some chain := Db.extractDottedChain? calleeStx then
+      if let some aliasName := chain.head? then
+        if let some (_, dbInfo) := ctx.dbs.find? (·.1 == aliasName) then
+          let lowerVal (e : Syntax) : SrvExprM Term := go .val e
+          let lowerValWithLocal (loc : String) (e : Syntax) : SrvExprM Term :=
+            withReader (fun c => { c with locals := c.locals.push loc }) (go .val e)
+          let (dbTerm, isWrite) ← Db.lowerDbCall lowerVal lowerValWithLocal ctx.fnName dbInfo stx chain rawArgs
+          if isWrite then
+            modify fun s => { s with dbWrite := true }
+          return some dbTerm
   if calleeStx.getKind == ``qedIdent && (calleeStx.getArg 0).getId == `old then
     match ctx.stateRule with
     | .invariantProp curV oldV _ =>
@@ -920,9 +934,10 @@ partial def lowerPureBlock (ctx : LowerCtx) (inAtomic : Bool) (s₀ sCur : Ident
     let patIds := (collectQedPatIds patStx).map (·.toString)
     let (scrutTerm, steps) ← lowerExprCollectingHoists pCtx .val (stmt.getArg 4)
     let thenCtx := { pCtx with locals := pCtx.locals ++ patIds }
+    let hMatch ← freshIdent "_srvM"
     let br ← lowerPureBranch pCtx sCur matCur rest (suiteStmts (stmt.getArg 6)) thenCtx
       (extractElseSuite (stmt.getArg 7)) false
-      (fun t e => `(match $scrutTerm:term with | $patTerm => $t | _ => $e)) recPure
+      (fun t e => `(match $hMatch:ident : $scrutTerm:term with | $patTerm => $t | _ => $e)) recPure
     wrapHoistsPure pCtx s₀ matCur steps br
   else if k == ``qedStmtMatch then
     let (matchT, allSteps) ← lowerMatchScrutineesAndAlts pCtx stmt rest (recPure · sCur)
@@ -1181,8 +1196,9 @@ partial def lowerAsyncBlock (ctx : LowerCtx) (stateTyTerm? : Option Term) (stmts
     let patIds := (collectQedPatIds patStx).map (·.toString)
     let (scrutTerm, steps) ← lowerExprCollectingHoists aCtx .val (stmt.getArg 4)
     let thenCtx := { aCtx with locals := aCtx.locals ++ patIds }
+    let hMatch ← freshIdent "_srvM"
     let br ← lowerAsyncBranch thenCtx (suiteStmts (stmt.getArg 6)) (extractElseSuite (stmt.getArg 7))
-      fun t e => `(match $scrutTerm:term with | $patTerm => $t | _ => $e)
+      fun t e => `(match $hMatch:ident : $scrutTerm:term with | $patTerm => $t | _ => $e)
     wrapHoistsAsync aCtx steps br
   else if k == ``qedStmtMatch then
     let (matchT, allSteps) ← lowerMatchScrutineesAndAlts aCtx stmt rest recAsync

@@ -234,7 +234,7 @@ private def runChanSubHandler (c : ChanBodyCtx) (subSuffix : String)
     c.extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
     return some hApp
   else
-    let some (_, _, hApp, er) ← elabStatelessHandler c.priorRep c.priorUnrep hdr.chIdent c.srvName subFnIdent.getId
+    let some (_, _, hApp, er, _) ← elabStatelessHandler c.priorRep c.priorUnrep hdr.chIdent c.srvName subFnIdent.getId
         allBinderIds allBinderTys callArgs retTyTerm c.errTyTerm baseCtx bodyStmts | return none
     c.extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
     return some hApp

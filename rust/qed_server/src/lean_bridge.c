@@ -79,3 +79,18 @@ lean_external_class *qed_lean_register_ext(lean_external_finalize_proc fin, lean
 }
 lean_object *qed_lean_alloc_ext(lean_external_class *cls, void *data) { return lean_alloc_external(cls, data); }
 void *qed_lean_get_ext(lean_object *o) { return lean_get_external_data(o); }
+
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
+#include <stdarg.h>
+/* Lean's bundled glibc 2.27 sysroot lacks `fcntl64`, while host glibc >= 2.28 headers
+   redirect `libsqlite3-sys`'s `fcntl` calls to `fcntl64`. On 64-bit Linux, `off_t` and
+   `struct flock` are already 64-bit, so `fcntl64` is identical to `fcntl`. */
+extern int fcntl(int fd, int cmd, ...);
+__attribute__((weak)) int fcntl64(int fd, int cmd, ...) {
+    va_list ap;
+    va_start(ap, cmd);
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+    return fcntl(fd, cmd, arg);
+}
+#endif

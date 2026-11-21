@@ -150,6 +150,7 @@ private def elabServerFnClause (priorRep priorUnrep : Nat)
     (stateId stateInvId ctxId reqBytesId : Ident)
     (envIdents : Array Ident) (envTypes : Array Term)
     (stateFieldNames envVarNames : Array String)
+    (dbBindings : Array (String × DatabaseInfo))
     (invs : Array ParsedInv) (mutInvs : Array ParsedMutInv)
     (chanSigs : Array SrvChanSig) (existingMethods : Array ServerMethodInfo)
     (deferredProofs : IO.Ref (Array (CommandElabM Bool)))
@@ -209,7 +210,7 @@ private def elabServerFnClause (priorRep priorUnrep : Nat)
     stateRule := if hasState then .pureStep (mkIdent `_s0) else .statelessServer
     allowAwait := hasAwait, allowUnwrap := retTy.hasFallible || innerOpt?.isSome
     hasFallible := retTy.hasFallible, isOption := innerOpt?.isSome, innerOptTy? := innerOpt?
-    domainErrTy? := domainErrTyTerm?, channels := chanSigs
+    domainErrTy? := domainErrTyTerm?, channels := chanSigs, dbs := dbBindings
   }
   let allBinderIds := envIdents ++ #[ctxId] ++ pIdents ++ reqs.reqHypIds
   let allBinderTys := envTypes ++ #[← `(Qed.Server.RequestCtx)] ++ pTyTerms ++ reqs.reqHypTys
@@ -230,7 +231,7 @@ private def elabServerFnClause (priorRep priorUnrep : Nat)
           invs mutInvs stateFieldNames envVarNames ensSpec? deferredProofs | return none
       pure r
     else
-      let some (handlerId, hCall, hApp, er) ← elabStatelessHandler priorRep priorUnrep fnIdent srvName fnIdent.getId
+      let some (handlerId, hCall, hApp, er, hasDbWrite) ← elabStatelessHandler priorRep priorUnrep fnIdent srvName fnIdent.getId
           allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts | return none
       if let some ensSpec := ensSpec? then
         let unitInv ← `(fun _ : Unit => True)
@@ -239,7 +240,7 @@ private def elabServerFnClause (priorRep priorUnrep : Nat)
           elabAsyncEnsuresThm priorRep priorUnrep srvName fnStr fnIdent handlerId
             unitInv unitTy payloadTerm errTyTerm
             allBinderIds allBinderTys hCall #[] ensSpec)
-      pure (hApp, true, er)
+      pure (hApp, !hasDbWrite, er)
 
   let extRoots := reqs.extRoots ++ bodyExtRoots.filter (!reqs.extRoots.contains ·)
   let arm ← mkFnDispatchArm fnStr reqBytesId reqVar reqTupleTy pIdents projs
@@ -306,10 +307,12 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
   let ctxId := mkIdent `ctx
   let reqBytesId := mkIdent `reqBytes
 
+  let dbBindings : Array (String × DatabaseInfo) :=
+    parsed.dbDecls.map fun d => (d.aliasIdent.getId.toString, d.info)
   for fc in parsed.fnClauses do
     let some (info, arm, er) ← elabServerFnClause priorRep priorUnrep srvName fullSrvName srvShort
         hasState stateId stateInvId ctxId reqBytesId envIdents envTypes stateFieldNames envVarNames
-        parsed.invs parsed.mutInvs chanSigs methodInfos deferredProofs fc | return
+        dbBindings parsed.invs parsed.mutInvs chanSigs methodInfos deferredProofs fc | return
     methodInfos := methodInfos.push info
     dispatchArms := dispatchArms.push arm
     allExtRoots := allExtRoots ++ er.filter (!allExtRoots.contains ·)
@@ -323,7 +326,7 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
     allExtRoots := allExtRoots ++ er.filter (!allExtRoots.contains ·)
 
   elabServerDispatchCmds srvIdent stateId initStateId stateInvId invInitId
-    srvName fullSrvName srvShort hasState parsed.envDecls allExtRoots methodInfos dispatchArms
+    srvName fullSrvName srvShort hasState parsed.dbDecls parsed.envDecls allExtRoots methodInfos dispatchArms
     chanNames wsDispatchArms ctxId reqBytesId
 
   -- Launch all method & channel proof theorems together in one parallel wave after all inductives/defs.

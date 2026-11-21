@@ -242,7 +242,8 @@ def buildGraphClean : IO Bool := do
     "Qed.Socket", "Qed.Driver", "Qed.Speculative",
     "Qed.Runtime.AppCore", "Qed.Runtime.LocalCore", "Qed.Runtime.Cmd",
     "Qed.Server.Core", "Qed.Server.Http", "Qed.Server.Net", "Qed.Server.Prim",
-    "Qed.Server.Native", "Qed.Server.Ensured"
+    "Qed.Server.Native", "Qed.Server.Ensured",
+    "Qed.Server.Db.Core", "Qed.Server.Db.HttpSql", "Qed.Server.Db.PgWire"
   ]
   for (mod, _) in adj.toList do
     let isPure := pureExact.contains mod || purePrefixes.any (mod.startsWith ·)
@@ -269,14 +270,14 @@ def buildGraphClean : IO Bool := do
     if adj.contains src && reaches src dst then
       IO.eprintln (red s!"  build-graph regression: `{src}` reaches forbidden dependency `{dst}`")
       ok := false
-  -- 3. Rust `Cargo.lock` crate-count cap (baseline: 28 after `ring` unification).
+  -- 3. Rust `Cargo.lock` crate-count cap (baseline: 46 with bundled `rusqlite` SQLite + `ring` TLS).
   let lockPath := qh / "rust" / "qed_server" / "Cargo.lock"
   if ← lockPath.pathExists then
     let lockSrc ← IO.FS.readFile lockPath
     let pkgCount := (lockSrc.splitOn "\n[[package]]\n").length - 1 +
       (if lockSrc.startsWith "[[package]]\n" then 1 else 0)
-    if pkgCount > 30 then
-      IO.eprintln (red s!"  build-graph regression: rust/qed_server/Cargo.lock has {pkgCount} packages (budget ≤ 30)")
+    if pkgCount > 50 then
+      IO.eprintln (red s!"  build-graph regression: rust/qed_server/Cargo.lock has {pkgCount} packages (budget ≤ 50)")
       ok := false
   return ok
 
@@ -291,7 +292,7 @@ def kernelEnvClean (q? : Option QedjsEnv := none) (alreadyBuilt : Bool := false)
       "Js.Backend", "Js.Proofs",
       "Examples.Counter", "Examples.Todo", "Examples.Signup",
       "Examples.Chat", "Examples.Bookshelf", "Examples.CloudBooks", "Examples.LiveRoom",
-      "Tests.ServerChecks", "Tests.SpeculativeChecks", "Tests.SpeculativeApp", "Tests.DomProbe", "Tests.JsGate"
+      "Tests.ServerChecks", "Tests.DbChecks", "Tests.SpeculativeChecks", "Tests.SpeculativeApp", "Tests.DomProbe", "Tests.JsGate"
     ]
     let mods := if baseMods.contains root then baseMods else baseMods.push root
     q.run (#["--verify-env"] ++ mods) (quiet := true)

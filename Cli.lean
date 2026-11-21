@@ -12,6 +12,7 @@ def main (args : List String) : IO UInt32 := do
   | ["build", "--dev"]                  => cmdBuild (prod := false)
   | ["build", "--dev", "--no-verify"]   => cmdBuild (prod := false) (skipVerify := true)
   | ["start"] | ["preview"]             => cmdStart
+  | "serve" :: rest                     => cmdServe rest
   | ["test"]                            => cmdTest
   | ["check"]                           => cmdCheck
   | ["clean"]                           => cmdClean

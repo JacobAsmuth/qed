@@ -64,6 +64,26 @@ opaque hmacSha256Verify (key : @& ByteArray) (msg : @& ByteArray) (sig : @& Byte
 @[extern "qed_server_rsa_sha256_sign"]
 opaque rsaSha256Sign (pemPrivateKey : @& String) (msg : @& ByteArray) : IO (Except String ByteArray)
 
+/-- Verifies an RSASSA-PKCS1-v1_5 SHA-256 (`RS256`) signature using the public key embedded in a PEM private key. -/
+@[extern "qed_server_rsa_sha256_verify"]
+opaque rsaSha256Verify (pemPrivateKey : @& String) (msg : @& ByteArray) (sig : @& ByteArray) : IO Bool
+
+/-- Computes a 32-byte SHA-256 digest (`ring::digest::SHA256`). -/
+@[extern "qed_server_sha256"]
+opaque sha256 (data : @& ByteArray) : IO ByteArray
+
+/-- Derives a 32-byte PBKDF2-HMAC-SHA256 key (`ring::pbkdf2`, used for PostgreSQL SCRAM-SHA-256). -/
+@[extern "qed_server_pbkdf2_sha256"]
+opaque pbkdf2HmacSha256 (password : @& ByteArray) (salt : @& ByteArray) (iterations : UInt32) : IO ByteArray
+
+/-- Executes a parameterized SQLite query against a pooled WAL connection and returns tagged JSON rows. -/
+@[extern "qed_server_sqlite_exec"]
+opaque sqliteExec (path : @& String) (sql : @& String) (paramsJson : @& String) : IO (Except String String)
+
+/-- Executes idempotent DDL statements (`CREATE TABLE IF NOT EXISTS ...`) on a pooled SQLite database. -/
+@[extern "qed_server_sqlite_ddl"]
+opaque sqliteDdl (path : @& String) (ddl : @& String) : IO (Except String Unit)
+
 /-- Acquires a pooled or fresh TCP/TLS (`rustls`) outbound stream. When `ssrfGuard != 0`,
     validates every DNS-resolved IP against Lean's verified `isBlockedIp` before `connect`.
     Returns `(handleId, wasReusedFlag)`. -/
@@ -82,8 +102,23 @@ opaque outboundWriteAll (handle : UInt64) (data : @& ByteArray) : IO (Except Str
 @[extern "qed_server_outbound_read_some"]
 opaque outboundReadSome (handle : UInt64) (maxBytes : UInt32) : IO (Except String ByteArray)
 
+@[extern "qed_server_outbound_upgrade_tls"]
+opaque outboundUpgradeTls (handle : UInt64) (host : @& String) : IO (Except String Unit)
+
 @[extern "qed_server_outbound_release"]
 opaque outboundRelease (handle : UInt64) (keepAlive : UInt8) : IO Unit
+
+@[extern "qed_server_free_port"]
+opaque freePort : IO UInt16
+
+@[extern "qed_server_tcp_listen"]
+opaque tcpListen (port : UInt16) : IO (Except String (UInt64 × UInt16))
+
+@[extern "qed_server_tcp_accept"]
+opaque tcpAccept (listenerId : UInt64) (timeoutMs : UInt32) : IO (Except String UInt64)
+
+@[extern "qed_server_tcp_close_listener"]
+opaque tcpCloseListener (listenerId : UInt64) : IO Unit
 
 /-- Broadcasts a pre-encoded Protobuf event payload across all multi-core worker threads to
     every WebSocket subscription matching `topicKey` (`<channel>:<hex(params)>`). -/

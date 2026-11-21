@@ -6,6 +6,7 @@ import Qed.Proofs.KeyedReconcile
 import Qed.Proofs.Hydration
 import Js.Proofs
 import Tests.AxiomFixtures
+import Tests.DbChecks
 import Examples.Counter
 import Examples.Todo
 import Examples.Signup
@@ -385,3 +386,21 @@ import Examples.LiveRoom
 #print axioms Qed.ForEach.forall_set
 #print axioms Qed.ForEach.forall_swap
 #print axioms Qed.ForEach.forall_modify
+
+-- Verified Native Database Support (`Qed.Server.Db.*` & `DbChecks`)
+#print axioms Qed.Server.Db.isSafeSqlIdent_no_inject
+#print axioms Qed.Server.Db.SqlExpr.compile_sameShape
+#print axioms Qed.Server.Db.SqlQuery.compile_sameShape
+#print axioms Qed.Server.Db.SqlQuery.compile_no_semicolon
+#print axioms Qed.Server.Db.evalSelect_satisfies_policy
+#print axioms Qed.Server.Db.evalInsert_preserves_inv
+#print axioms Qed.Server.Db.evalUpdate_preserves_inv_and_trans
+#print axioms Qed.Server.Db.evalDelete_preserves_inv_and_policy
+#print axioms Qed.Server.Db.PgWire.encodeMsg_size
+#print axioms DbChecks.VaultDb.notes.rowInvBool_sound
+#print axioms DbChecks.VaultDb.books.rowInvBool_sound
+#print axioms DbChecks.VaultApi.getNote_ensures
+#print axioms DbChecks.VaultApi.createNote_ensures
+#print axioms DbChecks.VaultApi.editNote_ensures
+#print axioms DbChecks.VaultApi.publishNote_ensures
+#print axioms DbChecks.VaultApi.orderBook_ensures

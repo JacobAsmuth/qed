@@ -15,7 +15,8 @@ extern_lib libqed_server pkg := do
     ← inputTextFile (crateDir / "src" / "lean_ffi.rs"),
     ← inputTextFile (crateDir / "src" / "crypto.rs"),
     ← inputTextFile (crateDir / "src" / "outbound.rs"),
-    ← inputTextFile (crateDir / "src" / "server.rs")
+    ← inputTextFile (crateDir / "src" / "server.rs"),
+    ← inputTextFile (crateDir / "src" / "sqlite.rs")
   ]
   buildFileAfterDep libFile srcJobs fun _ => do
     let incDir ← getLeanIncludeDir
@@ -32,7 +33,8 @@ extern_lib libqed_server pkg := do
 lean_lib Qed where
 
 lean_lib QedServer where
-  roots := #[`Qed.Server.Net, `Qed.Server.Http, `Qed.Server.Prim, `Qed.Server.Native]
+  roots := #[`Qed.Server.Net, `Qed.Server.Http, `Qed.Server.Prim,
+    `Qed.Server.Db.HttpSql, `Qed.Server.Db.PgWire, `Qed.Server.Native]
   moreLinkArgs := #["-pthread"]
 
 lean_lib QedProofs where
@@ -62,6 +64,11 @@ lean_lib Cli where
 
 lean_exe qed where
   root := `Cli
+  moreLinkArgs := #["-pthread"]
+
+lean_exe qedtest where
+  root := `Tests.Runner
+  moreLinkArgs := #["-pthread"]
 
 lean_exe bench where
   root := `Bench.Pipeline

@@ -63,6 +63,7 @@ structure Runtime where
   localDispatchStr : String → UInt32 → String → IO Unit
   snapshot         : IO String
   restore          : String → IO Unit
+  dehydrate        : IO String
   effectDone       : UInt32 → String → IO Unit
   portRecv         : String → String → IO Unit
   wsOpen           : UInt32 → IO Unit
@@ -143,6 +144,12 @@ def qedLocalRestore (s : String) : IO Unit := do
   match ← runtimeRef.get with
   | some rt => rt.restore s
   | none    => pure ()
+
+@[export qed_dehydrate]
+def qedDehydrate : IO String := do
+  match ← runtimeRef.get with
+  | some rt => rt.dehydrate
+  | none    => pure ""
 
 @[export qed_effect_done]
 def qedEffectDone (id : UInt32) (result : String) : IO Unit := do
@@ -757,6 +764,7 @@ def runWithHttpTimeout (app : App Model Msg) (httpTimeoutMs : Nat) : IO Unit := 
     localDispatchStr := handleLocalDispatchStr env
     snapshot         := handleSnapshotLocals env
     restore          := handleRestoreLocals env
+    dehydrate        := do return env.app.dehydrate (← env.modelRef.get)
     effectDone       := handleEffectDone env
     portRecv         := handlePortRecv env
     wsOpen           := handleWsOpen env

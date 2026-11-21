@@ -9,6 +9,7 @@ crate-type = ["staticlib"]
 [dependencies]
 libc = "0.2"
 ring = "0.17"
+rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "0.26"
 

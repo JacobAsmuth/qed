@@ -4,9 +4,11 @@ use std::os::fd::FromRawFd;
 use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ring::digest;
 use ring::hmac;
+use ring::pbkdf2;
 use ring::rand::{SecureRandom, SystemRandom};
-use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
+use ring::signature::{KeyPair, RsaKeyPair, UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256};
 
 use crate::{last_errno, parse_pem_blocks};
 use crate::lean_ffi::*;
@@ -251,4 +253,55 @@ pub unsafe extern "C" fn qed_server_rsa_sha256_sign(pem_obj: *mut LeanObj, msg_o
         Ok(()) => mk_io_except_ok(mk_ba(&sig)),
         Err(_) => mk_io_except_err("RSA-SHA256 signing failed"),
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_rsa_sha256_verify(
+    pem_obj: *mut LeanObj,
+    msg_obj: *mut LeanObj,
+    sig_obj: *mut LeanObj,
+) -> *mut LeanObj {
+    let pem = str_slice(pem_obj);
+    let key_pair = parse_pem_blocks(pem, "PRIVATE KEY")
+        .into_iter()
+        .next()
+        .and_then(|der| RsaKeyPair::from_pkcs8(&der).ok())
+        .or_else(|| {
+            parse_pem_blocks(pem, "RSA PRIVATE KEY")
+                .into_iter()
+                .next()
+                .and_then(|der| RsaKeyPair::from_der(&der).ok())
+        });
+    let ok: usize = match key_pair {
+        Some(kp) => {
+            let pk = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, kp.public_key().as_ref());
+            if pk.verify(ba_slice(msg_obj), ba_slice(sig_obj)).is_ok() { 1 } else { 0 }
+        }
+        None => 0,
+    };
+    qed_lean_io_mk_ok(qed_lean_box(ok))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_sha256(data_obj: *mut LeanObj) -> *mut LeanObj {
+    let d = digest::digest(&digest::SHA256, ba_slice(data_obj));
+    qed_lean_io_mk_ok(mk_ba(d.as_ref()))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn qed_server_pbkdf2_sha256(
+    password_obj: *mut LeanObj,
+    salt_obj: *mut LeanObj,
+    iterations: u32,
+) -> *mut LeanObj {
+    let iters = std::num::NonZeroU32::new(iterations.max(1)).unwrap();
+    let mut out = [0u8; 32];
+    pbkdf2::derive(
+        pbkdf2::PBKDF2_HMAC_SHA256,
+        iters,
+        ba_slice(salt_obj),
+        ba_slice(password_obj),
+        &mut out,
+    );
+    qed_lean_io_mk_ok(mk_ba(&out))
 }

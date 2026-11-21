@@ -154,6 +154,8 @@ def qedBinder : Parser := ident <|> symbol "_"
 -- Expressions (`qedExpr`)
 @[qedCallArg_parser] def qedCallArgNamed : Parser := leading_parser
   atomic (ident >> "=" >> notFollowedBy (symbol "=") "=") >> categoryParser `qedExpr 0
+@[qedCallArg_parser] def qedCallArgWhere : Parser := leading_parser
+  atomic (symbol "where" >> "=" >> notFollowedBy (symbol "=") "=") >> categoryParser `qedExpr 0
 @[qedCallArg_parser] def qedCallArgPos : Parser := leading_parser categoryParser `qedExpr 0
 
 def qedRecField : Parser := node `Qed.Lang.recField (atomic (ident >> "=") >> categoryParser `qedExpr 0)

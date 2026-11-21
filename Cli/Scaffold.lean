@@ -8,7 +8,7 @@ def cmdDoctor : IO UInt32 := do
   IO.println "qed doctor:"
   let report (label : String) (ok : Bool) : IO Unit :=
     IO.println s!"  {if ok then green "✓" else red "✗"} {label}"
-  for c in ["lean", "lake", "cargo", "node", "python3"] do
+  for c in ["lean", "lake", "cargo"] do
     report c (← onPath c)
   return 0
 
@@ -23,8 +23,7 @@ def cmdNew (dir : String) : IO UInt32 := do
     "import Lake\nopen Lake DSL\n\n" ++
     "package app where\n\n" ++
     "require qed from git \"https://github.com/JacobAsmuth/qed\" @ \"main\"\n\n" ++
-    "@[default_target] lean_lib App where\n\n" ++
-    "lean_exe web where\n  root := `Web\n"
+    "@[default_target] lean_lib App where\n"
   IO.FS.writeFile (root / "App.lean") <|
     "import Qed\nopen Qed\n\n" ++
     "component Quantity:\n" ++
@@ -40,8 +39,6 @@ def cmdNew (dir : String) : IO UInt32 := do
     "      <span>{quantity}</span>\n" ++
     "      <button onClick={.increase}>+</button>\n" ++
     "    </div>\n"
-  IO.FS.writeFile (root / "Web.lean") <|
-    "import App\nimport Qed.Driver\n\ndef main : IO Unit := Qed.run Quantity.app\n"
   IO.println (green s!"✓ created {dir}/")
   IO.println s!"  next:  cd {dir} && qed dev"
   return 0
@@ -51,8 +48,9 @@ def usage : IO UInt32 := do
   IO.println "Usage: qed <command>\n"
   IO.println "  dev            watch + rebuild + serve with live-reload"
   IO.println "  build          production build → dist/ (JS client + native server, verified)"
-  IO.println "  start|preview  serve the build (native server, SSR handler, or static)"
-  IO.println "  test           run the browser and full-stack tests (if present)"
+  IO.println "  start|preview  serve the build"
+  IO.println "  serve <dir>    serve a static directory natively"
+  IO.println "  test           run the native test suite (if present)"
   IO.println "  check          verify proofs + no-sorry + axioms"
   IO.println "  clean          remove build outputs"
   IO.println "  new <dir>      scaffold a new app"

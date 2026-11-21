@@ -208,6 +208,8 @@ def elabQedServerMain : CommandElab := fun stx => do
   let asyncNames : Array Term := srvInfo.methods.filterMap fun m =>
     if m.isAsync then some (Syntax.mkStrLit m.name) else none
   let blockingArg ← `(some #[$asyncNames,*])
+  let dbCfgIds : Array Ident := srvInfo.databases.map fun c => mkIdentFrom fsIdent c
+  let initDbsId := mkIdent `Qed.Server.Native.initDatabases
   let mainId := mkIdent `main
   let getEnvId := mkIdent `Qed.Server.Prim.getEnv
   let runnerCall ← if srvInfo.hasState then
@@ -229,13 +231,24 @@ def elabQedServerMain : CommandElab := fun stx => do
         $cliAppId $titleLit $shortLit $secretsId
         (fun {m} [Monad m] [Qed.Server.MonadServer m] => $dispatchId)
         port staticDir devMode numWorkers $wsArg $blockingArg)
-  elabCommand (← `(command|
-    def $mainId:ident (args : List String) : IO UInt32 := do
-      let staticDir := args[0]?.getD "dist"
-      let envPort ← ($getEnvId:ident "PORT")
-      let port := ((args[1]?.getD (envPort.getD "8000")).toNat?.getD 8000).toUInt16
-      let devMode := args.contains "--dev"
-      let numWorkers := (((← ($getEnvId:ident "QED_WORKERS")).bind String.toNat?).getD 0).toUInt32
-      $runnerCall:term))
+  if dbCfgIds.isEmpty then
+    elabCommand (← `(command|
+      def $mainId:ident (args : List String) : IO UInt32 := do
+        let staticDir := args[0]?.getD "dist"
+        let envPort ← ($getEnvId:ident "PORT")
+        let port := ((args[1]?.getD (envPort.getD "8000")).toNat?.getD 8000).toUInt16
+        let devMode := args.contains "--dev"
+        let numWorkers := (((← ($getEnvId:ident "QED_WORKERS")).bind String.toNat?).getD 0).toUInt32
+        $runnerCall:term))
+  else
+    elabCommand (← `(command|
+      def $mainId:ident (args : List String) : IO UInt32 := do
+        let staticDir := args[0]?.getD "dist"
+        let envPort ← ($getEnvId:ident "PORT")
+        let port := ((args[1]?.getD (envPort.getD "8000")).toNat?.getD 8000).toUInt16
+        let devMode := args.contains "--dev"
+        let numWorkers := (((← ($getEnvId:ident "QED_WORKERS")).bind String.toNat?).getD 0).toUInt32
+        if !(← $initDbsId #[$[$dbCfgIds:ident],*]) then return 1
+        $runnerCall:term))
 
 end Qed.Server

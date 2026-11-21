@@ -88,6 +88,9 @@ def extHttpMethod : Parser :=
     many1Indent (categoryParser `extClause 0))
 
 -- `server` & `fullstack` clauses & commands
+@[srvClause_parser] def srvDbClause : Parser := leading_parser
+  withPosition (atomic (identEq `use) >> ident >> ":" >> ident)
+
 @[srvClause_parser] def srvEnvClause : Parser := leading_parser
   withPosition (atomic (identEq `env) >> ident >> "=" >> strLit >> optional (" ?? " >> strLit))
 

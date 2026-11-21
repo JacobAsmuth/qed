@@ -137,7 +137,14 @@ def elabServerStateCmds (priorRep priorUnrep : Nat) (stateId initStateId stateIn
       qedSrvProveStep [$stateInvId, $initStateId] "initState" $initInvLbl))
   return !hasNewErrors (← get).messages priorRep priorUnrep
 
+structure ParsedDbDecl where
+  ref        : Lean.Syntax
+  aliasIdent : Lean.Ident
+  dbRefIdent : Lean.Ident
+  info       : DatabaseInfo
+
 structure ParsedServerBlock where
+  dbDecls     : Array ParsedDbDecl
   envDecls    : Array ParsedEnvDecl
   stateDecls  : Array ParsedStateDecl
   mutInvs     : Array ParsedMutInv
@@ -148,6 +155,7 @@ structure ParsedServerBlock where
 open Lean Elab Command in
 def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean.Syntax) :
     CommandElabM ParsedServerBlock := do
+  let mut dbDecls     : Array ParsedDbDecl := #[]
   let mut envDecls    : Array ParsedEnvDecl := #[]
   let mut stateDecls  : Array ParsedStateDecl := #[]
   let mut mutInvs     : Array ParsedMutInv := #[]
@@ -157,7 +165,18 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
   let mut chanClauses : Array Syntax := #[]
   for c in clauses do
     let k := c.getKind
-    if k == ``srvEnvClause then
+    if k == ``srvDbClause then
+      let aliasId : Ident := ⟨(c.getArg 1)⟩
+      let dbRefId : Ident := ⟨(c.getArg 3)⟩
+      if dbDecls.any (·.aliasIdent.getId == aliasId.getId) ||
+         envDecls.any (·.ident.getId == aliasId.getId) ||
+         stateDecls.any (·.ident.getId == aliasId.getId) then
+        throwErrorAt aliasId s!"duplicate declaration `{aliasId.getId}` in `server {srvName}`"
+      let env ← getEnv
+      let some dbInfo := Qed.Server.lookupDatabase? env (← getCurrNamespace) (← getOpenDecls) dbRefId.getId
+        | throwErrorAt dbRefId s!"unknown `database` `{dbRefId.getId}` in `use {aliasId.getId} : {dbRefId.getId}`"
+      dbDecls := dbDecls.push { ref := c, aliasIdent := aliasId, dbRefIdent := dbRefId, info := dbInfo }
+    else if k == ``srvEnvClause then
       let id : Ident := ⟨(c.getArg 1)⟩
       let osKey := (⟨(c.getArg 3)⟩ : TSyntax `str).getString
       let def? := if (c.getArg 4).getNumArgs == 2 then some ((⟨((c.getArg 4).getArg 1)⟩ : TSyntax `str).getString) else none
@@ -212,7 +231,7 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
     unless stateDecls.any (·.ident.getId == mi.fieldId.getId) do
       let avail := String.intercalate ", " (stateDecls.toList.map fun s => s!"`{s.ident.getId}`")
       throwErrorAt mi.fieldId s!"`invariant mutating {mi.fieldId.getId}` does not match any `state` field of `{srvName}` (`state` fields: {avail})"
-  return { envDecls, stateDecls, mutInvs, invs, fnClauses, chanClauses }
+  return { dbDecls, envDecls, stateDecls, mutInvs, invs, fnClauses, chanClauses }
 
 section
 open Lean Elab Command
@@ -352,10 +371,11 @@ def elabRequiresClauses (refIdent : Ident) (srvName fullSrvName itemName : Name)
 def elabStatelessHandler (priorRep priorUnrep : Nat) (refIdent : Ident)
     (srvName handlerLeaf : Name) (allBinderIds : Array Ident) (allBinderTys : Array Term)
     (callArgs : Array Term) (retTyTerm errTyTerm : Term) (baseCtx : LowerCtx)
-    (bodyStmts : Array Syntax) : CommandElabM (Option (Ident × Term × Term × Array Name)) := do
+    (bodyStmts : Array Syntax) : CommandElabM (Option (Ident × Term × Term × Array Name × Bool)) := do
   let (statelessBody, lSt) ← (lowerAsyncBlock baseCtx none bodyStmts).run {}
   let handlerId := mkIdentFrom refIdent (srvName ++ handlerLeaf.appendAfter "_handler")
   elabCommand (← `(command|
+    set_option linter.unusedVariables false in
     def $handlerId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
         $[($allBinderIds:ident : $allBinderTys:term)]* :
         m (Except $errTyTerm $retTyTerm) :=
@@ -363,7 +383,7 @@ def elabStatelessHandler (priorRep priorUnrep : Nat) (refIdent : Ident)
   if hasNewErrors (← get).messages priorRep priorUnrep then return none
   let hCall ← allBinderIds.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
   let hApp ← callArgs.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
-  return some (handlerId, hCall, hApp, lSt.extRoots)
+  return some (handlerId, hCall, hApp, lSt.extRoots, lSt.dbWrite)
 
 private partial def scanFailCallsAux (stx : Syntax) (tags : Array Ident) (hasPlain : Bool) :
     CommandElabM (Array Ident × Bool) := do
@@ -448,10 +468,16 @@ def elabDomainErrorType (srvName : Name) (fnIdent : Ident) (tagIdents : Array Id
 end
 
 open Lean Elab Command in
-private def collectServerSecretsAndExts (envDecls : Array ParsedEnvDecl) (allExtRoots : Array Name) :
+private def collectServerSecretsAndExts (dbDecls : Array ParsedDbDecl)
+    (envDecls : Array ParsedEnvDecl) (allExtRoots : Array Name) :
     CommandElabM (Array String × Array (String × String)) := do
   let extMap := externalRegistry.getState (← getEnv)
   let mut reqSecrets : Array String := #[]
+  for dbd in dbDecls do
+    if !dbd.info.hasDevFallback then
+      for sec in dbd.info.secrets do
+        unless reqSecrets.contains sec do
+          reqSecrets := reqSecrets.push sec
   for ed in envDecls do
     if ed.default?.isNone && !reqSecrets.contains ed.osKey then
       reqSecrets := reqSecrets.push ed.osKey
@@ -514,6 +540,7 @@ private def elabServerWsDispatchCmd (srvIdent ctxId : Ident) (srvName : Name)
 open Lean Elab Command in
 def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : Ident)
     (srvName fullSrvName : Name) (srvShort : String) (hasState : Bool)
+    (dbDecls : Array ParsedDbDecl)
     (envDecls : Array ParsedEnvDecl) (allExtRoots : Array Name)
     (methodInfos : Array ServerMethodInfo) (dispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
     (chanNames : Array String) (wsDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
@@ -527,7 +554,7 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
           $stateInvId st.shared :=
         Qed.Server.concurrent_schedule_preserves_inv $stateInvId $initStateId st $invInitId hsched))
 
-  let (reqSecrets, usedExts) ← collectServerSecretsAndExts envDecls allExtRoots
+  let (reqSecrets, usedExts) ← collectServerSecretsAndExts dbDecls envDecls allExtRoots
 
   let secretsId := mkIdentFrom srvIdent (srvName ++ `secrets)
   let secLits : Array Term := reqSecrets.map (Syntax.mkStrLit ·)
@@ -579,6 +606,7 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
     externalServices := usedExts
     methods := methodInfos
     channels := chanNames
+    databases := dbDecls.map (·.info.configConst)
   }
 
 open Lean Elab Command in
@@ -767,7 +795,7 @@ def elabServerAsyncFn (priorRep priorUnrep : Nat)
   let stateTyTerm : Term := ⟨stateId.raw⟩
   let fnLit := Syntax.mkStrLit fnStr
   let (asyncBody, lSt) ← (lowerAsyncBlock baseCtx (some stateTyTerm) bodyStmts).run {}
-  let isReadOnly := lSt.mutated.isEmpty
+  let isReadOnly := lSt.mutated.isEmpty && !lSt.dbWrite
   let handlerId := mkIdentFrom fnIdent (srvName ++ fnIdent.getId.appendAfter "_handler")
   elabCommand (← `(command|
     set_option linter.unusedVariables false in

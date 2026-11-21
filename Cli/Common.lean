@@ -1,6 +1,6 @@
 open System (FilePath)
 
-def String.trimmed (s : String) : String :=
+def String.cliTrim (s : String) : String :=
   s.trimAscii.toString
 
 namespace Qed.Cli
@@ -16,9 +16,11 @@ def runtimeFile (name : String) : IO FilePath := return (← frameworkHome) / "r
 
 def webRoot : IO String := do
   if let some r ← env "QED_WEB_ROOT" then return r
-  if !(← (FilePath.mk "Web.lean").pathExists) && (← (FilePath.mk "Examples" / "Counter.lean").pathExists) then
+  if (← (FilePath.mk "Web.lean").pathExists) then return "Web"
+  if (← (FilePath.mk "App.lean").pathExists) then return "App"
+  if (← (FilePath.mk "Examples" / "Counter.lean").pathExists) then
     return "Examples.Counter"
-  return "Web"
+  return "App"
 
 def jsRoot : IO String := do
   match ← env "QED_JS_ROOT" with
@@ -106,6 +108,7 @@ def driverEntries : Array String := #[
   "Qed.qedUrlChanged:qed_url_changed",
   "Qed.qedLocalDispatch:qed_local_dispatch", "Qed.qedLocalDispatchStr:qed_local_dispatch_str",
   "Qed.qedLocalSnapshot:qed_local_snapshot", "Qed.qedLocalRestore:qed_local_restore",
+  "Qed.qedDehydrate:qed_dehydrate",
   "Qed.qedEffectDone:qed_effect_done", "Qed.qedPortRecv:qed_port_recv",
   "Qed.qedWsOpen:qed_ws_open", "Qed.qedWsBytes:qed_ws_bytes",
   "Qed.qedWsText:qed_ws_text", "Qed.qedWsClose:qed_ws_close"]
@@ -129,9 +132,9 @@ private def parseLeanDiagLine (line : String) : Option (String × String × Nat 
   let parseLocMsg (sev rest : String) : Option (String × String × Nat × Nat × String) := do
     match rest.splitOn ":" with
     | path :: lnS :: colS :: msgParts =>
-        let ln ← lnS.trimmed.toNat?
-        let col ← colS.trimmed.toNat?
-        some (sev, path.trimmed, ln, col, (String.intercalate ":" msgParts).trimmed)
+        let ln ← lnS.cliTrim.toNat?
+        let col ← colS.cliTrim.toNat?
+        some (sev, path.cliTrim, ln, col, (String.intercalate ":" msgParts).cliTrim)
     | _ => none
   -- Handle `error(lean.xxx): File.lean:12:4: msg`
   if line.startsWith "error(" then
@@ -140,12 +143,12 @@ private def parseLeanDiagLine (line : String) : Option (String × String × Nat 
     | _ => failure
   for (pfx, sev) in [("error:", "error"), ("warning:", "warning")] do
     if line.startsWith pfx then
-      if let some r := parseLocMsg sev (line.drop pfx.length).toString.trimmed then return r
+      if let some r := parseLocMsg sev (line.drop pfx.length).toString.cliTrim then return r
   -- Handle `File.lean:12:4: error: msg`
   match line.splitOn ":" with
   | path :: lnS :: colS :: sevS :: msgParts =>
       if path.endsWith ".lean" then
-        let sev := sevS.trimmed
+        let sev := sevS.cliTrim
         if sev == "error" || sev == "warning" then
           return ← parseLocMsg sev (String.intercalate ":" (path :: lnS :: colS :: msgParts))
       failure
@@ -170,25 +173,30 @@ private def readSourceSnippet (path : String) (ln col : Nat) (color : Bool) : IO
     let caret := paint color "1;31" "^"
     let mut out := ""
     if let some pl := prevLine? then
-      if !pl.trimmed.isEmpty then
+      if !pl.cliTrim.isEmpty then
         out := out ++ s!"  {paint color "2" (padNum (ln - 1))} {bar} {paint color "2" pl}\n"
     out := out ++ s!"  {paint color "1" (padNum ln)} {bar} {srcLine}\n"
     out := out ++ s!"  {blankGutter} {bar} {caretPad}{caret}\n"
     return out
   catch _ => return ""
 
+initialize lastBuildErrorRef : IO.Ref String ← IO.mkRef ""
+
+def clearLastBuildError : IO Unit := lastBuildErrorRef.set ""
+def getLastBuildError : IO String := lastBuildErrorRef.get
+
 /-- Formats raw Lake / Lean compiler output into clean, readable terminal diagnostics:
     strips `trace: .> LEAN_PATH=...` noise and redundant build-failure footers, adds ANSI
-    colors, and displays source snippets with caret pointers for `.lean` errors. -/
-def formatLakeDiagnostics (raw : String) : IO String := do
-  if (← env "QED_VERBOSE") == some "1" then return raw
-  let color ← useColor
+    colors when `allowColor` is true, and displays source snippets with caret pointers for `.lean` errors. -/
+def formatLakeDiagnostics (raw : String) (allowColor : Bool := true) : IO String := do
+  if (← env "QED_VERBOSE") == some "1" && allowColor then return raw
+  let color := allowColor && (← useColor)
   let lines := raw.splitOn "\n"
   let mut out : Array String := #[]
   let mut skipTargetBullets := false
   let mut hasPrettyDiag := false
   for line in lines do
-    let t := line.trimmed
+    let t := line.cliTrim
     if t.startsWith "trace: .>" ||
        t == "error: Lean exited with code 1" ||
        t == "error: build failed" ||
@@ -234,7 +242,7 @@ def formatLakeDiagnostics (raw : String) : IO String := do
         else if !t.isEmpty then
           out := out.push line
   let formatted := String.intercalate "\n" out.toList
-  if formatted.trimmed.isEmpty then return raw else return formatted ++ "\n"
+  if formatted.cliTrim.isEmpty then return raw else return formatted ++ "\n"
 
 def sh (cmd : String) (args : Array String) (extraEnv : Array (String × Option String) := #[]) : IO UInt32 := do
   let child ← IO.Process.spawn
@@ -253,13 +261,15 @@ def shQuiet (cmd : String) (args : Array String) (extraEnv : Array (String × Op
 def shLakeBuild (args : Array String) : IO UInt32 := do
   let (code, out) ← shOut "lake" args
   if code != 0 then
-    IO.eprint (← formatLakeDiagnostics out)
+    IO.eprint (← formatLakeDiagnostics out true)
+    lastBuildErrorRef.set (← formatLakeDiagnostics out false)
   return code
 
 def shLean (leanPath : String) (args : Array String) : IO UInt32 := do
   let (code, out) ← shOut "lean" args #[("LEAN_PATH", some leanPath)]
   if code != 0 then
-    IO.eprint (← formatLakeDiagnostics out)
+    IO.eprint (← formatLakeDiagnostics out true)
+    lastBuildErrorRef.set (← formatLakeDiagnostics out false)
   return code
 
 def onPath (cmd : String) : IO Bool := do
@@ -278,8 +288,41 @@ partial def collect (dir : FilePath) (ext : String) (skipDirs : List String := [
       acc := acc.push p
   return acc
 
-def writeBuildId (outDir : FilePath) : IO Unit := do
-  IO.FS.writeFile (outDir / "__build_id") (toString (← IO.monoMsNow))
+private def escapeJsonStr (s : String) : String := Id.run do
+  let mut out := ""
+  for c in s.toList do
+    if c == '"' then out := out ++ "\\\""
+    else if c == '\\' then out := out ++ "\\\\"
+    else if c == '\n' then out := out ++ "\\n"
+    else if c == '\r' then out := out ++ "\\r"
+    else if c == '\t' then out := out ++ "\\t"
+    else if c.toNat < 32 then pure ()
+    else out := out.push c
+  return out
+
+def writeDevStatus (outDir : FilePath) (status : String) (kind : String := "hmr")
+    (errText : String := "") (durationMs : Nat := 0) (bumpId : Bool := true) : IO Unit := do
+  IO.FS.createDirAll outDir
+  let buildIdPath := outDir / "__build_id"
+  let idStr ←
+    if bumpId || !(← buildIdPath.pathExists) then
+      let id := toString (← IO.monoMsNow)
+      IO.FS.writeFile buildIdPath id
+      pure id
+    else
+      pure (← IO.FS.readFile buildIdPath).cliTrim
+  let json :=
+    s!"\{\"id\":\"{escapeJsonStr idStr}\"," ++
+    s!"\"status\":\"{escapeJsonStr status}\"," ++
+    s!"\"kind\":\"{escapeJsonStr kind}\"," ++
+    s!"\"durationMs\":{durationMs}," ++
+    s!"\"error\":\"{escapeJsonStr errText}\"}\n"
+  let tmp := outDir / "__dev_status.tmp"
+  IO.FS.writeFile tmp json
+  IO.FS.rename tmp (outDir / "__dev_status")
+
+def writeBuildId (outDir : FilePath) : IO Unit :=
+  writeDevStatus outDir "ok" "hmr" "" 0 true
 
 def writeIfChanged (path : FilePath) (content : String) : IO Bool := do
   if (← path.pathExists) then
@@ -307,7 +350,7 @@ def isUpToDate (out : FilePath) (deps : Array FilePath) : IO Bool := do
 def lakeEnvLeanPath : IO (Option String) := do
   if let some lp ← leanPathCache.get then return some lp
   if let some lp ← env "LEAN_PATH" then
-    let trimmed := lp.trimmed
+    let trimmed := lp.cliTrim
     if !trimmed.isEmpty then
       leanPathCache.set (some trimmed)
       return some trimmed
@@ -316,7 +359,7 @@ def lakeEnvLeanPath : IO (Option String) := do
   if isInRepo && !hasPkgs then
     let o ← IO.Process.output { cmd := "lean", args := #["--print-libdir"] }
     if o.exitCode == 0 then
-      let sysLib := o.stdout.trimmed
+      let sysLib := o.stdout.cliTrim
       if !sysLib.isEmpty then
         let cwd ← IO.currentDir
         let lp := s!"{cwd / ".lake" / "build" / "lib" / "lean"}:{sysLib}"
@@ -326,7 +369,7 @@ def lakeEnvLeanPath : IO (Option String) := do
   if o.exitCode != 0 then
     IO.eprint (o.stdout ++ o.stderr)
     return none
-  let trimmed := o.stdout.trimmed
+  let trimmed := o.stdout.cliTrim
   leanPathCache.set (some trimmed)
   return some trimmed
 
@@ -335,7 +378,7 @@ def lakeQueryPaths (targets : Array String) : IO (Option (Array String)) := do
   if o.exitCode != 0 then
     IO.eprint (o.stdout ++ o.stderr)
     return none
-  let paths := (o.stdout.splitOn "\n").toArray.map String.trimmed |>.filter (!·.isEmpty)
+  let paths := (o.stdout.splitOn "\n").toArray.map String.cliTrim |>.filter (!·.isEmpty)
   return some paths
 
 def resolveQedjsBin (needBuild : Bool := true) : IO (Option FilePath) := do
@@ -349,7 +392,7 @@ def resolveQedjsBin (needBuild : Bool := true) : IO (Option FilePath) := do
       let appTc : FilePath := "lean-toolchain"
       let fwTc := qh / "lean-toolchain"
       if (← appTc.pathExists) && (← fwTc.pathExists) then
-        pure ((← IO.FS.readFile appTc).trimmed == (← IO.FS.readFile fwTc).trimmed)
+        pure ((← IO.FS.readFile appTc).cliTrim == (← IO.FS.readFile fwTc).cliTrim)
       else pure false
     if tcMatch then return some prebuilt
   let target := if isInRepo then "qedjs" else "qed/qedjs"
@@ -382,9 +425,10 @@ def QedjsEnv.runOut (q : QedjsEnv) (args : Array String) (quiet : Bool := false)
   let (code, out) ← shOut q.bin.toString args #[("LEAN_PATH", some lp)]
   if code != 0 then
     IO.eprint out
+    lastBuildErrorRef.set out
   else if !quiet then
     for line in out.splitOn "\n" do
-      let t := line.trimmed
+      let t := line.cliTrim
       if !t.isEmpty && !t.startsWith "HAS_CSS:" && !t.startsWith "STYLESHEET:" then
         IO.println line
   return (code == 0, out)

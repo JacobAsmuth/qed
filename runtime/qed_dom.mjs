@@ -163,7 +163,15 @@ export const dom = {
     return ok(PUnit, w);
   },
   getAttribute(node, k, w)    { const el = Q().nodes[node]; const v = el ? el.getAttribute(k) : null; return ok(v == null ? '' : v, w); },
-  appState(w) { const el = document.getElementById('qed-state'); return ok(el ? el.textContent : '', w); },
+  appState(w) {
+    if (typeof globalThis.__qedHmrState === 'string') {
+      const s = globalThis.__qedHmrState;
+      delete globalThis.__qedHmrState;
+      return ok(s, w);
+    }
+    const el = document.getElementById('qed-state');
+    return ok(el ? el.textContent : '', w);
+  },
   clearHandlers(node, w) {
     const el = Q().nodes[node];
     if (el && el.attributes) {

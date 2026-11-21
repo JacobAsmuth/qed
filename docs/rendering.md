@@ -1,91 +1,77 @@
-# Rendering proofs and browser checks
+# Rendering proofs
 
 Qed views have a pure specification—rendering a `View` at state `s` produces an `Html` value—and
 an imperative browser driver that updates live DOM nodes in place. Qed connects the two with
-Lean refinement proofs over a pure DOM model and differential tests running in real Chromium.
+Lean refinement proofs over a pure W3C DOM arena model.
 
 ## Pure specs and driver proofs
 
 At the pure `Html` and `View` layer:
 
-- **`diff_apply`** (`Qed/Diff.lean`) proves that diffing an old `Html` tree against a new one
+- **`diff_apply`** in `Qed/Diff.lean` proves that diffing an old `Html` tree against a new one
   and applying the resulting patch yields the exact new `Html` tree.
-- **Conditionals (`showIf` / `ifElse`):** `showIf` lowers to `ifElse` with an empty text branch
+- **Conditionals with `showIf` and `ifElse`:** `showIf` lowers to `ifElse` with an empty text branch
   so rendering, patching, and hydration share a single conditional path. Hidden branches reserve
   their signal indices so sibling bindings stay aligned, and `patchViewM` skips unchanged hidden
   branches in place.
 
-In [`Qed/Proofs/`](../Qed/Proofs) (`DomArena.lean`, `KeyedReconcile.lean`, `ViewPatch.lean`, `Hydration.lean`), these theorems are lifted to the
-imperative `MonadDom` driver (`Qed/Driver/`). Evaluated against a pure W3C DOM arena
-(`SpecDom`), Qed proves via unified `CleanDomSubtree`/`VStateValid` invariants that initial
-mounts (`buildDomM`/`buildViewM`), positional/keyed tree patching (`applyToDomM`, `patchHtmlSubtreeM`),
-full incremental view patching (`patchViewM`), `.keyedList` (`V.forEach`) template reconciliation and
-hydration (`View.DomClean_forEach`), template row/signal alignment (`alignRows_spec`, `diffRowSigs_sound`,
-`seedRowsM_spec`, `renderSig_resolved_spec`), runtime handler/local-cell/FIFO queue specs, text-run
-hydration (`hydrateDomM`/`hydrateViewM`), `V.memo` skipping, and end-to-end SSR rehydration + client
-patching (`App.ssr_rehydrate_equiv`, `App.ssr_hydrate_patch_equiv`) produce the exact DOM tree specified
-by `Html.render`. Component elaboration (`Qed/Component/Elab.lean`) also emits `<Comp>.app_view_eq`
-via verified template lifting (`Qed/View/Lift.lean`) and transports view invariants (`<inv>_app`) onto
-`App.view` through `canonical_congr_pred`.
+In [`Qed/Proofs/`](../Qed/Proofs)—spanning `DomArena.lean`, `KeyedReconcile.lean`, `ViewPatch.lean`, and `Hydration.lean`—these theorems are lifted to the
+imperative `MonadDom` driver in `Qed/Driver/`. Evaluated against a pure W3C DOM arena
+`SpecDom`, Qed proves via unified `CleanDomSubtree` and `VStateValid` invariants that initial
+mounts `buildDomM`/`buildViewM`, positional and keyed tree patching `applyToDomM` and `patchHtmlSubtreeM`,
+full incremental view patching `patchViewM`, `V.forEach` template reconciliation and
+hydration, template row and signal alignment, runtime handler, local-cell, and FIFO queue specs, text-run
+hydration `hydrateDomM`/`hydrateViewM`, `V.memo` skipping, and end-to-end SSR rehydration and client
+patching produce the exact DOM tree specified by `Html.render`. Component elaboration in
+`Qed/Component/Elab.lean` also emits `<Comp>.app_view_eq` via verified template lifting in
+`Qed/View/Lift.lean` and transports view invariants onto `App.view` through `canonical_congr_pred`.
 
-### Tail-recursive compilation (`@[csimp]`)
+### Tail-recursive compilation with `@[csimp]`
 
 To keep proofs simple without sacrificing runtime stack safety, Qed defines structural recursion
 for verification and swaps in accumulator implementations during compilation via proven
 `@[csimp]` equivalence theorems:
 
-- **HTML string serialization** (`Qed/Render.lean`) collects sibling fragments into an array and
+- **HTML string serialization** in `Qed/Render.lean` collects sibling fragments into an array and
   joins them once, keeping wide sibling lists off the JavaScript call stack while preserving
-  handler registration order (deeply nested markup still recurses by tree depth).
-- **Pure child patching** (`Qed/Diff.lean`) converts the old child list to an array once and
-  steps through siblings with a tail-recursive accumulator (`applyChildrenTR_toList`).
+  handler registration order; deeply nested markup still recurses by tree depth.
+- **Pure child patching** in `Qed/Diff.lean` converts the old child list to an array once and
+  steps through siblings with a tail-recursive accumulator proved by `applyChildrenTR_toList`.
 
 ## How the browser reconciles updates
 
 Updating live browser DOM state requires a few guarantees beyond pure HTML serialization:
 
-- **Keyed siblings:** Standard virtual-DOM diffing indexes keyed children in a single pass
-  (`validatedKeyIndex`). If keys are missing or duplicated in plain `Html` lists, Qed falls back
+- **Keyed siblings:** Standard virtual-DOM diffing indexes keyed children in a single pass via
+  `validatedKeyIndex`. If keys are missing or duplicated in plain `Html` lists, Qed falls back
   to positional patching so a single DOM node is never reused twice.
 - **Duplicate keys in `V.forEach`:** Fine-grained template lists pass keys through
-  `disambiguateKeys` (proved collision-free by `forEach_disambiguated_keys_nodup`) during mount,
+  `disambiguateKeys`—proved collision-free by `forEach_disambiguated_keys_nodup`—during mount,
   update, and hydration. Duplicate user keys never crash the driver or collide on signal names.
 - **Signals vs. structural rows:** Template list rows whose dynamic parts are pure text/value
   signals update directly in place without regenerating HTML. Rows containing conditionals,
   helper views, nested lists, or dynamic event closures fall back to keyed diffing, since
   identical HTML strings do not imply identical closures or props.
 - **Single-pass list alignment:** When a `V.forEach` list reorders or adds items, Qed aligns old
-  DOM nodes, copy-on-write array marks (`refMark`), and signals in one pass, rendering fresh row
+  DOM nodes, copy-on-write array `refMark`s, and signals in one pass, rendering fresh row
   HTML lazily only when a newly inserted key appears.
 - **Local components:** Updating a parent refreshes a local component's live `prop`s and
   event callbacks without resetting its persisted local state; `initial` is read only on first
   mount.
 - **Attribute, event handler, and property cleanup:** Full attribute reconciliation removes stale
-  attributes, updates and retains `clicks` and `inputs` event handlers (`ElemStateEquiv.dispatchInput`),
+  attributes, updates and retains `clicks` and `inputs` event handlers via `ElemStateEquiv.dispatchInput`,
   and resets removed controlled `value` and `checked` DOM properties.
-- **Verified subtree memoization (`Qed.lazy` / `V.memo`):** Memoized subtrees require a
-  `LawfulKey` argument whose serialization is provably injective (`toKey a = toKey b → a = b`).
+- **Verified subtree memoization with `Qed.lazy` / `V.memo`:** Memoized subtrees require a
+  `LawfulKey` argument whose serialization is provably injective: `toKey a = toKey b → a = b`.
   When keys match, skipping the subtree is guaranteed exact by `patchViewM_memo_hit`.
 
-## Differential and browser tests
+## End-to-end verification
 
-Proofs verify the Lean driver against `SpecDom`; browser tests verify that `runtime/qed_dom.mjs`
-and Chromium behave the same way. Run the browser equivalence suite directly with:
+Proofs verify the Lean driver against `SpecDom`, while `qed check` verifies that every reachable
+`@[extern]` symbol in the browser driver has a matching export in `runtime/qed_rt.mjs` and every
+`Cmd` effect has a handler in `runtime/qed_host.mjs`. Run the full native integration test suite
+covering SSR, RPCs, databases, and WebSockets with:
 
 ```bash
-node test/dom_equivalence_test.mjs
+./scripts/qed test
 ```
-
-This suite compiles [`Tests/DomProbe.lean`](../Tests/DomProbe.lean) and runs deterministic
-and seeded mutation sequences through the real JavaScript driver in headless Chromium:
-
-- After every update, it asserts that the live DOM matches both a fresh `buildDom` mount and
-  parsed `Html.render` markup (including namespaces, attributes, `value`/`checked` properties,
-  and dispatched click messages).
-- Dedicated checks verify DOM node preservation across keyed reorders, `V.memo` cache hits, and
-  duplicate-key disambiguation across mount, patch, and hydration lifecycles.
-
-In addition, [`test/js_gate_test.mjs`](../test/js_gate_test.mjs) tests native Lean against
-transpiled JavaScript on pure rendering (including 16,000-sibling wide lists and handler order)
-and key indexing, while [`test/fullstack_rpc_test.mjs`](../test/fullstack_rpc_test.mjs) exercises
-the native C server, SSR, and binary RPC transport end-to-end.

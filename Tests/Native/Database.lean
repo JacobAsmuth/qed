@@ -144,63 +144,37 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
   let readyFrame (tx? : Option UInt64) : ByteArray :=
     pgFrame 'Z' (if tx?.isSome then "T" else "I").toUTF8
 
-  let readMore (b : ByteArray) : IO (Option ByteArray) := do
-    match ← Prim.outboundReadSome conn 16384 with
-    | .error _ => return none
-    | .ok chunk => if chunk.size == 0 then return none else return some (b ++ chunk)
-
-  let mut alive := true
-  while alive do
+  while true do
     if stage == "startup" then
-      while buf.size < 4 do
-        match ← readMore buf with
-        | none => alive := false; break
-        | some b' => buf := b'
-      if !alive then break
-      let len := (PgWire.readU32BE buf 0).getD 0
-      while buf.size < len do
-        match ← readMore buf with
-        | none => alive := false; break
-        | some b' => buf := b'
-      if !alive then break
-      let body := buf.extract 4 len
-      buf := buf.extract len buf.size
+      let some b1 ← readExact conn buf 4 | break
+      let len := (PgWire.readU32BE b1 0).getD 0
+      let some b2 ← readExact conn b1 len | break
+      let body := b2.extract 4 len
+      buf := b2.extract len b2.size
       let code := (PgWire.readU32BE body 0).getD 0
       if code == 80877103 then
         discard <| Prim.outboundWriteAll conn "N".toUTF8
         continue
       -- Parse StartupMessage null-terminated key/value pairs
       let kvRaw := (String.fromUTF8? (body.extract 4 body.size)).getD ""
-      let parts := kvRaw.splitOn "\x00"
-      let mut gotUser := ""
-      let mut gotDb := ""
       let rec scanKv : List String → String × String
         | k :: v :: rest =>
             let (u, d) := scanKv rest
             (if k == "user" then v else u, if k == "database" then v else d)
         | _ => ("", "")
-      let (u, d) := scanKv parts
-      gotUser := u; gotDb := d
+      let (gotUser, gotDb) := scanKv (kvRaw.splitOn "\x00")
       if gotUser == expectedUser && gotDb == expectedDb then
         startupOkRef.set true
       discard <| Prim.outboundWriteAll conn (pgAuthMsg 10 ((("SCRAM-SHA-256".toUTF8).push 0).push 0))
       stage := "scram_init"
       continue
 
-    while buf.size < 5 do
-      match ← readMore buf with
-      | none => alive := false; break
-      | some b' => buf := b'
-    if !alive then break
-    let tag := Char.ofNat (buf[0]!).toNat
-    let len := (PgWire.readU32BE buf 1).getD 0
-    while buf.size < 1 + len do
-      match ← readMore buf with
-      | none => alive := false; break
-      | some b' => buf := b'
-    if !alive then break
-    let payload := buf.extract 5 (1 + len)
-    buf := buf.extract (1 + len) buf.size
+    let some b1 ← readExact conn buf 5 | break
+    let tag := Char.ofNat (b1[0]!).toNat
+    let len := (PgWire.readU32BE b1 1).getD 0
+    let some b2 ← readExact conn b1 (1 + len) | break
+    let payload := b2.extract 5 (1 + len)
+    buf := b2.extract (1 + len) b2.size
 
     if stage == "scram_init" && tag == 'p' then
       let nul := findZeroByte payload 0
@@ -359,21 +333,13 @@ private def runVaultSuite (c : TestChecker) (label : String) (srv : NativeServer
   c.checkStatus s!"[{label}] empty body rejected by requires (400)" (← callRpc "createNote" (Qed.Proto.encode ((1 : Nat), "")) (some aliceTok)) 400
 
   -- Alice creates normal note + SQLi note (createNote returns `Except (RpcDomainError _) VaultDb.notes`)
-  let decodeCreated (bs : ByteArray) : Option DbChecks.VaultDb.notes :=
-    match Qed.Proto.decode (α := Except (Qed.RpcDomainError DbChecks.VaultApi.createNote.Error) DbChecks.VaultDb.notes) bs with
-    | .ok (.ok n) => some n
-    | _ => none
+  c.checkHttp s!"[{label}] alice createNote(1)" (← callRpc "createNote" (Qed.Proto.encode ((1 : Nat), "hello verified db")) (some aliceTok)) (extra := fun r =>
+    c.checkRpcDomainOk (E := DbChecks.VaultApi.createNote.Error) (α := DbChecks.VaultDb.notes) s!"[{label}] alice createNote(1) payload" (.ok (ε := String) r.body) fun got =>
+      c.checkEq s!"[{label}] alice createNote(1) payload" got { id := 1, ownerId := "alice", body := "hello verified db", version := 0, status := "draft" })
 
-  c.expectOk s!"[{label}] alice createNote(1)" (← callRpc "createNote" (Qed.Proto.encode ((1 : Nat), "hello verified db")) (some aliceTok)) fun r => do
-    c.checkEq s!"[{label}] alice createNote(1) status 200" r.status 200
-    let got := decodeCreated r.body
-    c.check s!"[{label}] alice createNote(1) payload"
-      (got == some { id := 1, ownerId := "alice", body := "hello verified db", version := 0, status := "draft" })
-      (reprStr got)
-
-  c.expectOk s!"[{label}] alice createNote(2)" (← callRpc "createNote" (Qed.Proto.encode ((2 : Nat), sqli)) (some aliceTok)) fun r => do
-    c.checkEq s!"[{label}] alice createNote(2) SQLi stored safely" r.status 200
-    c.checkEq s!"[{label}] alice createNote(2) verbatim body" ((decodeCreated r.body).map (·.body)) (some sqli)
+  c.checkHttp s!"[{label}] alice createNote(2) SQLi stored safely" (← callRpc "createNote" (Qed.Proto.encode ((2 : Nat), sqli)) (some aliceTok)) (extra := fun r =>
+    c.checkRpcDomainOk (E := DbChecks.VaultApi.createNote.Error) (α := DbChecks.VaultDb.notes) s!"[{label}] alice createNote(2) verbatim body" (.ok (ε := String) r.body) fun got =>
+      c.checkEq s!"[{label}] alice createNote(2) verbatim body" got.body sqli)
 
   -- Count & list for Alice
   c.checkRpcProto s!"[{label}] alice countMyNotes == 2" (← callRpc "countMyNotes" ByteArray.empty (some aliceTok)) (2 : Nat)
@@ -459,12 +425,10 @@ private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : Mon
   -- 1. Multi-statement verified DB transaction (`db.transaction:` commit + `atomic:` state update)
   let mkTxReq (aid aname iid title : String) (price : Nat) :=
     Qed.Proto.encode (aid, (aname, (iid, (title, price))))
-  c.expectOk s!"[{label}] createAuthorAndItem(i1)"
-    (← callShop aliceCtx "createAuthorAndItem" (mkTxReq "a1" "Ada Lovelace" "i1" "Lean 4 Proofs" 100)) fun bs =>
-      let okItem := match Qed.Proto.decode (α := Except (Qed.RpcDomainError DbChecks.ShopApi.createAuthorAndItem.Error) DbChecks.ShopDb.items) bs with
-        | .ok (.ok it) => it.id == "i1" && it.price == 100
-        | _ => false
-      c.check s!"[{label}] db.transaction: committed author + item" okItem
+  c.checkRpcDomainOk (E := DbChecks.ShopApi.createAuthorAndItem.Error) (α := DbChecks.ShopDb.items)
+    s!"[{label}] db.transaction: committed author + item"
+    (← callShop aliceCtx "createAuthorAndItem" (mkTxReq "a1" "Ada Lovelace" "i1" "Lean 4 Proofs" 100)) fun it =>
+      c.check s!"[{label}] db.transaction: committed author + item" (it.id == "i1" && it.price == 100)
   c.expectOk s!"[{label}] createAuthorAndItem(i2)"
     (← callShop aliceCtx "createAuthorAndItem" (mkTxReq "a2" "Alan Turing" "i2" "Lean 4 Compilers" 250)) fun _ => pure ()
   c.expectOk s!"[{label}] createAuthorAndItem(i3)"
@@ -474,12 +438,10 @@ private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : Mon
   c.checkEq s!"[{label}] atomic txOps incremented 3 times inside transactions" txOpsAfter 3
 
   -- 2. Multi-statement DB transaction ROLLBACK on `fail(.aborted)` (`db.transaction:`)
-  c.expectOk s!"[{label}] createPairDotSyntax rollback"
-    (← callShop aliceCtx "createPairDotSyntax" (mkTxReq "a_rolled_back" "Ghost Author" "i_ghost" "Ghost Item" 99999)) fun bs =>
-      let gotAborted := match Qed.Proto.decode (α := Except (Qed.RpcDomainError DbChecks.ShopApi.createPairDotSyntax.Error) DbChecks.ShopDb.items) bs with
-        | .ok (.error err) => err.tag == .aborted
-        | _ => false
-      c.check s!"[{label}] db.transaction: returned fail(.aborted)" gotAborted
+  c.checkRpcDomainErr (E := DbChecks.ShopApi.createPairDotSyntax.Error) (α := DbChecks.ShopDb.items)
+    s!"[{label}] db.transaction: returned fail(.aborted)"
+    (← callShop aliceCtx "createPairDotSyntax" (mkTxReq "a_rolled_back" "Ghost Author" "i_ghost" "Ghost Item" 99999))
+    (·.tag == .aborted)
 
   -- Verify the author inserted BEFORE `fail(.aborted)` was rolled back!
   let checkGhostAuthorQ := SqlQuery.count ⟨"authors", by decide⟩
@@ -537,37 +499,20 @@ private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : Mon
 
 private def runMigrationSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
   let migDb := s!"{tmpDir}/migrate.db"
-  let v1Table : TableSchema := {
-    name := ⟨"widgets", by decide⟩
-    columns := [
-      { name := ⟨"id", by decide⟩, colType := .text, isPrimaryKey := true },
-      { name := ⟨"name", by decide⟩, colType := .text }
-    ]
-    indexes := []
-  }
-  let v1Cfg : DbConfig := { name := "MigDb", endpoint := .sqlitePath migDb, tables := [v1Table] }
-  match ← Native.migrateDatabase v1Cfg with
+  let (v1Table, v2Table, unsafeCol) := DbChecks.mkMigrationFixture ⟨"widgets", by decide⟩
+    [{ name := ⟨"name", by decide⟩, colType := .text }] ⟨"sku", by decide⟩
+  let mkCfg (t : TableSchema) : DbConfig := { name := "MigDb", endpoint := .sqlitePath migDb, tables := [t] }
+  match ← Native.migrateDatabase (mkCfg v1Table) with
   | .ok steps => c.checkEq "[migrate] v1 initial creates 1 table" steps.length 1
   | .error e => c.check "[migrate] v1 init" false e.message; return
 
   -- Insert a v1 row
-  let insQ := SqlQuery.insert ⟨"widgets", by decide⟩
-    [(⟨"id", by decide⟩, .text "w1"), (⟨"name", by decide⟩, .text "Sprocket")] []
-  let (insSql, insParams) := insQ.compile .sqlite
+  let (insSql, insParams) := (SqlQuery.insert ⟨"widgets", by decide⟩
+    [(⟨"id", by decide⟩, .text "w1"), (⟨"name", by decide⟩, .text "Sprocket")] []).compile .sqlite
   c.expectOk "[migrate] insert v1 row" (← Prim.sqliteExec migDb insSql insParams) fun _ => pure ()
 
   -- Migrate to v2: adds nullable `notes`, non-nullable `views` with `>= 0` default, and an index
-  let v2Table : TableSchema := {
-    name := ⟨"widgets", by decide⟩
-    columns := [
-      { name := ⟨"id", by decide⟩, colType := .text, isPrimaryKey := true },
-      { name := ⟨"name", by decide⟩, colType := .text },
-      { name := ⟨"notes", by decide⟩, colType := .text, nullable := true },
-      { name := ⟨"views", by decide⟩, colType := .int, nullable := false, checkSql? := some "\"views\" >= 0" }
-    ]
-    indexes := [[⟨"views", by decide⟩]]
-  }
-  let v2Cfg : DbConfig := { name := "MigDb", endpoint := .sqlitePath migDb, tables := [v2Table] }
+  let v2Cfg := mkCfg v2Table
   c.expectOk "[migrate] v1 -> v2" (← Native.migrateDatabase v2Cfg) fun steps =>
     c.checkEq "[migrate] v1 -> v2 applied 3 additive steps (2 cols + 1 idx)" steps.length 3
 
@@ -582,14 +527,7 @@ private def runMigrationSuite (c : TestChecker) (tmpDir : String) : IO Unit := d
     c.checkEq "[migrate] v2 re-run is idempotent (0 steps)" steps.length 0
 
   -- Unsafe v3 migration (non-nullable column with arbitrary CHECK) is rejected before DDL runs!
-  let v3Table : TableSchema := {
-    v2Table with
-    columns := v2Table.columns ++ [
-      { name := ⟨"sku", by decide⟩, colType := .text, nullable := false, checkSql? := some "LENGTH(\"sku\") >= 4" }
-    ]
-  }
-  let v3Cfg : DbConfig := { name := "MigDb", endpoint := .sqlitePath migDb, tables := [v3Table] }
-  match ← Native.migrateDatabase v3Cfg with
+  match ← Native.migrateDatabase (mkCfg { v2Table with columns := v2Table.columns ++ [unsafeCol] }) with
   | .error e => c.check "[migrate] unsafe v3 migration rejected" (e.message.contains "unsafe additive migration") e.message
   | .ok _ => c.check "[migrate] unsafe v3 migration rejected" false "unexpectedly succeeded"
 
@@ -599,100 +537,53 @@ def run : IO Bool := do
     | c.check "buildDevApp Tests.DbChecks" false; return ← c.finish
 
   checkLeakGate c "Tests.DbChecks" #[
-    "DbChecks.VaultDb.config",
-    "DbChecks.VaultDb.secrets",
-    "DbChecks.VaultDb.ensureSchema",
-    "DbChecks.VaultDb.ddl",
-    "DbChecks.VaultDb.rlsDdl",
-    "DbChecks.VaultApi.dispatchM",
+    "DbChecks.VaultDb.config", "DbChecks.VaultDb.secrets", "DbChecks.VaultDb.ensureSchema",
+    "DbChecks.VaultDb.ddl", "DbChecks.VaultDb.rlsDdl", "DbChecks.VaultApi.dispatchM",
     "DbChecks.VaultApi.createNote_handler"
   ]
 
   let authSecret := "db-test-hmac-secret-key"
   let aliceTok ← signSessionToken authSecret "alice"
   let bobTok ← signSessionToken authSecret "bob"
-  let tmpDir ← makeTempDir "qed-db-native"
-  try
+  let dbEnv (url : String) : Array (String × Option String) :=
+    #[("QED_WORKERS", some "2"), ("QED_AUTH_SECRET", some authSecret), ("QED_TEST_DB_URL", some url)]
+  withTempDir "qed-db-native" fun tmpDir => do
     -- Transport 1: Native Embedded SQLite (with full server restart persistence!)
-    let sqliteFile := s!"{tmpDir}/vault.db"
-    let (srvSqlite, ok1) ← startNativeServer dir #[
-      ("QED_WORKERS", some "2"),
-      ("QED_AUTH_SECRET", some authSecret),
-      ("QED_TEST_DB_URL", some s!"sqlite://{sqliteFile}")
-    ]
-    try
-      c.check "[sqlite] native server healthy" ok1
-      if ok1 then runVaultSuite c "sqlite" srvSqlite aliceTok bobTok (testRestart := true)
-    finally
-      srvSqlite.stop
+    withNativeServer c "[sqlite] native server healthy" dir (dbEnv s!"sqlite://{tmpDir}/vault.db") (dev := true) fun srvSqlite =>
+      runVaultSuite c "sqlite" srvSqlite aliceTok bobTok (testRestart := true)
 
     -- Transport 2: HTTP SQL (exact same binary, native Lean HTTP SQL mock backed by Prim.sqliteExec!)
-    c.expectOk "[http-sql] start mock" (← startHttpSqlMock s!"{tmpDir}/http_mock.db") fun httpMock => do
-      try
-        let (srvHttp, ok2) ← startNativeServer dir #[
-          ("QED_WORKERS", some "2"),
-          ("QED_AUTH_SECRET", some authSecret),
-          ("QED_TEST_DB_URL", some httpMock.url)
-        ]
-        try
-          c.check "[http-sql] native server healthy" ok2
-          if ok2 then
-            runVaultSuite c "http-sql" srvHttp aliceTok bobTok
-            let seen ← httpMock.seenSqlRef.get
-            c.check "[http-sql] SQLi payload NEVER interpolated into SQL"
-              (!(seen.any fun (s, _) => s.contains "DROP TABLE"))
-            c.check "[http-sql] parameterized SQL sent with bound params"
-              (seen.any fun (s, n) => s.contains "?" && n > 0)
-        finally
-          srvHttp.stop
-      finally
-        httpMock.stop
+    withMockServer c "[http-sql] start mock" (startHttpSqlMock s!"{tmpDir}/http_mock.db") (·.stop) fun httpMock =>
+      withNativeServer c "[http-sql] native server healthy" dir (dbEnv httpMock.url) (dev := true) fun srvHttp => do
+        runVaultSuite c "http-sql" srvHttp aliceTok bobTok
+        let seen ← httpMock.seenSqlRef.get
+        c.check "[http-sql] SQLi payload NEVER interpolated into SQL" (!(seen.any fun (s, _) => s.contains "DROP TABLE"))
+        c.check "[http-sql] parameterized SQL sent with bound params" (seen.any fun (s, n) => s.contains "?" && n > 0)
 
     -- Transport 3: Native PostgreSQL v3 Wire Protocol + SCRAM-SHA-256 (exact same binary!)
-    c.expectOk "[pg-wire] start mock" (← startPgWireMock s!"{tmpDir}/pg_mock.db" "qeduser" "qedpass" "qeddb") fun pgMock => do
-      try
-        let (srvPg, ok3) ← startNativeServer dir #[
-          ("QED_WORKERS", some "2"),
-          ("QED_AUTH_SECRET", some authSecret),
-          ("QED_TEST_DB_URL", some pgMock.url)
-        ]
-        try
-          c.check "[pg-wire] native server healthy" ok3
-          if ok3 then
-            runVaultSuite c "pg-wire" srvPg aliceTok bobTok
-            c.check "[pg-wire] StartupMessage sent expected user & db" (← pgMock.startupOkRef.get)
-            let scramCnt ← pgMock.scramCountRef.get
-            let parsed ← pgMock.parsedSqlRef.get
-            c.check "[pg-wire] SCRAM-SHA-256 proof verified" (scramCnt > 0)
-            c.check s!"[pg-wire] connection pool reused authenticated sockets (scram={scramCnt}, queries={parsed.size})"
-              (scramCnt < parsed.size && scramCnt <= 6)
-              s!"scram={scramCnt}, parsed={parsed.size}"
-            c.check "[pg-wire] SQLi payload NEVER interpolated into Parse SQL"
-              (!(parsed.any fun s => s.contains "DROP TABLE"))
-            c.check "[pg-wire] Parse used $1 placeholders with Bind params"
-              (parsed.any fun s => s.contains "$1")
-        finally
-          srvPg.stop
-      finally
-        pgMock.stop
+    withMockServer c "[pg-wire] start mock" (startPgWireMock s!"{tmpDir}/pg_mock.db" "qeduser" "qedpass" "qeddb") (·.stop) fun pgMock =>
+      withNativeServer c "[pg-wire] native server healthy" dir (dbEnv pgMock.url) (dev := true) fun srvPg => do
+        runVaultSuite c "pg-wire" srvPg aliceTok bobTok
+        c.check "[pg-wire] StartupMessage sent expected user & db" (← pgMock.startupOkRef.get)
+        let scramCnt ← pgMock.scramCountRef.get
+        let parsed ← pgMock.parsedSqlRef.get
+        c.check "[pg-wire] SCRAM-SHA-256 proof verified" (scramCnt > 0)
+        c.check s!"[pg-wire] connection pool reused authenticated sockets (scram={scramCnt}, queries={parsed.size})"
+          (scramCnt < parsed.size && scramCnt <= 6) s!"scram={scramCnt}, parsed={parsed.size}"
+        c.check "[pg-wire] SQLi payload NEVER interpolated into Parse SQL" (!(parsed.any fun s => s.contains "DROP TABLE"))
+        c.check "[pg-wire] Parse used $1 placeholders with Bind params" (parsed.any fun s => s.contains "$1")
 
     -- Extended Direct Suite: Transactions, Richer SQL, FK Joins, Concurrent Reader Pool & Live Migrations
     runShopDirectSuite c "sqlite-direct" (withRedirectedDb (.sqlitePath s!"{tmpDir}/shop_direct.db")) (testConcurrentReaders := true)
     runMigrationSuite c tmpDir
 
-    c.expectOk "[pg-shop] start mock" (← startPgWireMock s!"{tmpDir}/shop_pg_mock.db" "shopuser" "shoppass" "shopdb") fun shopPgMock => do
-      try
+    withMockServer c "[pg-shop] start mock" (startPgWireMock s!"{tmpDir}/shop_pg_mock.db" "shopuser" "shoppass" "shopdb")
+      (fun m => do Db.PgWire.clearPool; m.stop) fun shopPgMock => do
         runShopDirectSuite c "pg-direct" (withRedirectedDb (.postgresUrl shopPgMock.url))
         let scramCnt ← shopPgMock.scramCountRef.get
         let parsed ← shopPgMock.parsedSqlRef.get
         c.check s!"[pg-direct] connection pool reused sockets across tx & queries (scram={scramCnt}, queries={parsed.size})"
-          (scramCnt > 0 && scramCnt <= 3 && parsed.size >= 10)
-          s!"scram={scramCnt}, queries={parsed.size}"
-      finally
-        Db.PgWire.clearPool
-        shopPgMock.stop
-  finally
-    rmRf tmpDir
+          (scramCnt > 0 && scramCnt <= 3 && parsed.size >= 10) s!"scram={scramCnt}, queries={parsed.size}"
   c.finish
 
 end Tests.Native.Database

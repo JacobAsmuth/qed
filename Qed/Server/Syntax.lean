@@ -209,25 +209,6 @@ def lowerSrvType (stx : Lean.Syntax) (allowFallible : Bool := false) (ctxDesc : 
   Qed.Lang.lowerQedTypeInfo stx (allowFallible := allowFallible) (allowHigherOrder := false)
     (ctxDesc? := if ctxDesc.isEmpty then none else some ctxDesc)
 
-/-- Thin compatibility wrapper over `Qed.Lang.LoweredQedType` retained for `Qed/Server/External.lean`
-    until it migrates directly to `lowerSrvType`. -/
-structure ParsedSrvType where
-  ref  : Lean.Syntax
-  info : Qed.Lang.LoweredQedType
-deriving Inhabited
-
-namespace ParsedSrvType
-def baseIdent (t : ParsedSrvType) : Lean.Ident := Lean.mkIdentFrom t.ref t.info.baseName
-def isProto (t : ParsedSrvType) : Bool := t.info.isProto
-def mods (t : ParsedSrvType) : Array Qed.Lang.TypeMod := t.info.mods
-def parse (stx : Lean.Syntax) : Lean.MacroM ParsedSrvType :=
-  return { ref := stx, info := ← Qed.Lang.lowerQedTypeInfo stx (allowFallible := true) (allowHigherOrder := false) }
-def validate (t : ParsedSrvType) (allowFallible : Bool) (ctxDesc : String) : Lean.MacroM Unit := do
-  if !allowFallible && t.info.isFallible then
-    Lean.Macro.throwErrorAt t.ref s!"fallible `!` modifier is not allowed on {ctxDesc}; only server `def` return types may use `T!`"
-def toPayloadTerm (t : ParsedSrvType) : Lean.MacroM Lean.Term := pure t.info.term
-end ParsedSrvType
-
 syntax (name := srvAutoFieldStx) "srvAutoField(" term ")" : term
 syntax (name := srvAutoEmitStx)  "srvAutoEmit(" term ")" : term
 syntax (name := srvTypedAsStx)   "srvTypedAs(" term ", " term ")" : term

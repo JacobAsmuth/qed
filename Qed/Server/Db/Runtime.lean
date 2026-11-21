@@ -4,6 +4,7 @@ import Qed.Diag
 import Qed.Server.Core
 import Qed.Server.Registry
 import Qed.Server.Db.Core
+import Qed.Verify.Core
 
 namespace Qed.Server.Db
 
@@ -349,43 +350,19 @@ syntax (name := qedDbProveTac) "qedDbProve" "[" ident,* "]" str str str : tactic
 open Lean Meta Elab Tactic in
 @[tactic qedDbProveTac]
 def elabQedDbProve : Tactic := fun stx => do
-  let unfoldIds : Array Ident := (stx.getArg 2).getSepArgs.map fun s => ⟨s⟩
+  let unfoldNames ← (stx.getArg 2).getSepArgs.mapM resolveGlobalConstNoOverload
   let kindStr := (⟨(stx.getArg 4)⟩ : TSyntax `str).getString
   let opStr   := (⟨(stx.getArg 5)⟩ : TSyntax `str).getString
   let hintStr := (⟨(stx.getArg 6)⟩ : TSyntax `str).getString
-  let runSimplifier : TacticM Unit :=
-    evalTactic (← `(tactic|
-      (intros;
-       try dsimp only [$[$unfoldIds:ident],*] at *;
-       try simp (config := { zetaDelta := true }) only [$[$unfoldIds:ident],*, Qed.Server.qedReduceStrLen,
-                  Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
-                  beq_iff_eq, bne_iff_ne, decide_eq_true_eq,
-                  Option.isSome_iff_ne_none, Option.getD_some,
-                  Qed.Server.Db.some_getD_eq_self_iff,
-                  Qed.QedVal.val_field, Qed.QedVal.val_ensured, Qed.Lang.QedVal.val_id,
-                  true_and, and_true, false_or, or_false, true_or, or_true, id_eq, ne_eq] at *;
-       try simp_all (config := { zetaDelta := true }) only [Qed.Server.qedReduceStrLen,
-                          Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
-                          beq_iff_eq, bne_iff_ne, decide_eq_true_eq,
-                          Option.isSome_iff_ne_none, Qed.Server.Db.some_getD_eq_self_iff,
-                          true_and, and_true, false_or, or_false, true_or, or_true, id_eq, ne_eq])))
-  let ok ← do
-    let s ← saveState
-    try
-      runSimplifier
-      evalTactic (← `(tactic| all_goals (try first | trivial | rfl | assumption | omega | grind | decide)))
-      if (← getUnsolvedGoals).isEmpty then pure true
-      else restoreState s; pure false
-    catch _ =>
-      restoreState s; pure false
+  let ok ← Qed.Verify.Core.solveWithUnfolds unfoldNames
+    (Qed.Verify.Core.dbBaseSimpNames.push ``eq_self) #[``Qed.Server.qedReduceStrLen]
   if !ok then
-    -- Run simplifier without closing so the remaining obligation is crisp & human-readable!
-    try runSimplifier catch _ => pure ()
-    let gs ← getUnsolvedGoals
-    let g := gs.headD (← getMainGoal)
-    let cleanGoal ← g.withContext do
-      let tgt ← instantiateMVars (← g.getType)
-      Qed.Diag.ppQedExpr tgt ["_row", "_old", "_new", "r"]
-    throwErrorAt stx s!"Database {kindStr} failed in `{opStr}`:\n  • must prove: {cleanGoal}\n\nHint: {hintStr}"
+    Qed.Diag.throwUnsolvedGoals
+      m!"Database {kindStr} failed in `{opStr}`:"
+      m!"\n\nHint: {hintStr}"
+      (ref? := some stx)
+      (stripPrefixes := ["_row", "_old", "_new", "r"])
+      (bulletPrefix := "  • must prove: ")
+      (goals? := some [(← getUnsolvedGoals).headD (← getMainGoal)])
 
 end Qed.Server.Db

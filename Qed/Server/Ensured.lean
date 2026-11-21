@@ -11,7 +11,7 @@ abbrev Ensured (α : Type) (p : α → Prop) := Field (α := α) p
   Field.mk val ok
 
 abbrev Ensured.val {α : Type} {p : α → Prop} (e : Ensured α p) : α := Field.val e
-abbrev Ensured.ok {α : Type} {p : α → Prop} (e : Ensured α p) : p e.val := Field.ok e
+abbrev Ensured.ok {α : Type} {p : α → Prop} (e : Ensured α p) : p (Field.val e) := Field.ok e
 
 @[simp] theorem Proto.encode_ensured {α : Type} {p : α → Prop} [ToProto α] (e : Ensured α p) :
     Proto.encode e = Proto.encode e.val := rfl

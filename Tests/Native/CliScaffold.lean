@@ -17,31 +17,21 @@ def run : IO Bool := do
   let root ← IO.currentDir
   let cli ← qedBinPath
   let qedjs ← qedjsBinPath
-  let scratch ← makeTempDir "qed-scaffold-test"
-  let appDir := s!"{scratch}/app"
   let cleanEnv : Array (String × Option String) := #[
-    ("QED_HOME", some root.toString),
-    ("QED_WEB_ROOT", none),
-    ("QED_JS_ROOT", none),
-    ("QED_SKIP_VERIFY", none),
-    ("LEAN_PATH", none),
-    ("QED_PREBUILT", none),
-    ("QED_OUT_DIR", none)
+    ("QED_HOME", some root.toString), ("QED_WEB_ROOT", none), ("QED_JS_ROOT", none),
+    ("QED_SKIP_VERIFY", none), ("LEAN_PATH", none), ("QED_PREBUILT", none), ("QED_OUT_DIR", none)
   ]
-  try
+  withTempDir "qed-scaffold-test" fun scratch => do
+    let appDir := s!"{scratch}/app"
     -- 1. `qed new` scaffolding
     let (cNew, outNew, errNew) ← runCmd cli #["new", appDir] (cwd := some root) (env := cleanEnv)
     c.check "qed new succeeds" (cNew == 0) (outNew ++ errNew)
-    let tcApp ← IO.FS.readFile (FilePath.mk appDir / "lean-toolchain")
-    let tcRoot ← IO.FS.readFile (root / "lean-toolchain")
-    c.checkEq "lean-toolchain matches repo" tcApp tcRoot
+    c.checkEq "lean-toolchain matches repo" (← IO.FS.readFile (FilePath.mk appDir / "lean-toolchain")) (← IO.FS.readFile (root / "lean-toolchain"))
 
     -- Point `lakefile.lean` at local repo
     let lfPath := FilePath.mk appDir / "lakefile.lean"
-    let lfSrc ← IO.FS.readFile lfPath
-    IO.FS.writeFile lfPath (lfSrc.replace
-      "from git \"https://github.com/JacobAsmuth/qed\" @ \"main\""
-      s!"from \"{root.toString}\"")
+    IO.FS.writeFile lfPath ((← IO.FS.readFile lfPath).replace
+      "from git \"https://github.com/JacobAsmuth/qed\" @ \"main\"" s!"from \"{root.toString}\"")
 
     -- 2. Full verified production build (`qed build`) -> hashed JS assets + native SSR `dist/server`
     let (cBld, outBld, errBld) ← runCmd cli #["build"] (cwd := some (FilePath.mk appDir)) (env := cleanEnv)
@@ -49,11 +39,10 @@ def run : IO Bool := do
 
     let distDir := FilePath.mk appDir / "dist"
     let manifestRaw ← IO.FS.readFile (distDir / "qed_manifest.json")
-    let manifestJson := match Qed.Json.parse manifestRaw with | .ok j => j | .error _ => .null
-    let hostPath := ((manifestJson.get? "host").bind (·.str?)).getD ""
-    let appPath  := ((manifestJson.get? "app").bind (·.str?)).getD ""
-    let rtPath   := ((manifestJson.get? "rt").bind (·.str?)).getD ""
-    let domPath  := ((manifestJson.get? "dom").bind (·.str?)).getD ""
+    let hostPath := Qed.Json.pathStr manifestRaw "host"
+    let appPath  := Qed.Json.pathStr manifestRaw "app"
+    let rtPath   := Qed.Json.pathStr manifestRaw "rt"
+    let domPath  := Qed.Json.pathStr manifestRaw "dom"
     c.check "manifest host hashed" (isHashedMjs "qed_host" hostPath) hostPath
     c.check "manifest app hashed" (isHashedMjs "app" appPath) appPath
     c.check "manifest rt hashed" (isHashedMjs "qed_rt" rtPath) rtPath
@@ -71,21 +60,12 @@ def run : IO Bool := do
     IO.FS.writeFile (secretDir / "leak.txt") "TOP_SECRET_SIBLING"
     discard <| runCmd "ln" #["-s", (secretDir / "leak.txt").toString, (distDir / "escape.txt").toString]
 
-    let (srv, healthy) ← startNativeServer distDir.toString #[] (dev := false)
-    try
-      c.check "standalone native server healthy" healthy
-      c.expectOk "SSR GET / succeeded" (← httpReq srv.port "GET" "/") fun r => do
-        c.checkEq "SSR GET / returns 200" r.status 200
-        let html := r.bodyStr
-        c.check "SSR HTML renders initial quantity 1" (html.contains "<span>1</span>") html
-        c.check "SSR HTML references hashed host script" (html.contains hostPath) html
-
-      c.expectOk "GET hashed asset succeeded" (← httpReq srv.port "GET" appPath) fun r => do
-        c.checkEq "hashed asset returns 200" r.status 200
-        c.checkEq "hashed asset immutable cache-control"
-          (r.header? "cache-control") (some "public, max-age=31536000, immutable")
-        c.checkEq "hashed asset nosniff" (r.header? "x-content-type-options") (some "nosniff")
-
+    withNativeServer c "standalone native server healthy" distDir.toString #[] (dev := false) fun srv => do
+      c.checkHttp "SSR GET /" (← httpReq srv.port "GET" "/") (contains := ["<span>1</span>", hostPath])
+      c.checkHttp "GET hashed asset" (← httpReq srv.port "GET" appPath) (headers := [
+        ("cache-control", some "public, max-age=31536000, immutable"),
+        ("x-content-type-options", some "nosniff")
+      ])
       let checkNoLeak (label reqPath : String) : IO Unit := do
         let raw := s!"GET {reqPath} HTTP/1.1\r\nHost: 127.0.0.1:{srv.port}\r\nConnection: close\r\n\r\n".toUTF8
         c.expectOk label (← rawTcpReq srv.port raw) fun resp =>
@@ -94,31 +74,18 @@ def run : IO Bool := do
       checkNoLeak "blocks /../dist-secret/leak.txt" "/../dist-secret/leak.txt"
       checkNoLeak "blocks /%2e%2e%2fdist-secret/leak.txt" "/%2e%2e%2fdist-secret/leak.txt"
       checkNoLeak "blocks symlink /escape.txt" "/escape.txt"
-    finally
-      srv.stop
 
     -- 4. Native `qed serve <dir> <port> --dev` static server + `/__dev_status` JSON endpoint
     let staticPort ← Prim.freePort
-    let (stSrv, stOk) ← startNativeBin cli #["serve", distDir.toString, toString staticPort, "--dev"] staticPort cleanEnv
-    try
-      c.check "qed serve native static server healthy" stOk
+    withNativeBin c "qed serve native static server healthy" cli #["serve", distDir.toString, toString staticPort, "--dev"] staticPort cleanEnv fun _ => do
       c.checkStatus "qed serve serves hashed asset 200" (← httpReq staticPort "GET" appPath) 200
-      c.expectOk "qed serve GET /__dev_status" (← httpReq staticPort "GET" "/__dev_status") fun r => do
-        c.checkEq "dev mode /__dev_status returns 200" r.status 200
-        c.check "dev mode /__dev_status returns valid JSON status" (r.bodyStr.contains "\"status\":\"ok\"") r.bodyStr
-    finally
-      stSrv.stop
+      c.checkHttp "qed serve GET /__dev_status" (← httpReq staticPort "GET" "/__dev_status") (contains := ["\"status\":\"ok\""])
 
     -- 5. `--min` identifier shortening, Source Map v3 VLQ & `.mjs.map` (dev & prod)
-    c.checkEq "VLQ encode 0" (Js.encodeVlqInt 0) "A"
-    c.checkEq "VLQ encode 1" (Js.encodeVlqInt 1) "C"
-    c.checkEq "VLQ encode -1" (Js.encodeVlqInt (-1)) "D"
-    c.checkEq "VLQ encode 16" (Js.encodeVlqInt 16) "gB"
-    c.checkEq "VLQ encode -16" (Js.encodeVlqInt (-16)) "hB"
-    c.checkEq "VLQ encode 123" (Js.encodeVlqInt 123) "2H"
+    for (n, want) in [(0, "A"), (1, "C"), (-1, "D"), (16, "gB"), (-16, "hB"), (123, "2H")] do
+      c.checkEq s!"VLQ encode {n}" (Js.encodeVlqInt n) want
     let vlqSamples : List Int := [0, 1, -1, 15, -15, 16, -16, 123, -123, 1024, -1024, 99999, -99999]
-    let vlqAllRt := vlqSamples.all fun v => Js.decodeVlqInt (Js.encodeVlqInt v) == some v
-    c.check "VLQ encode/decode round-trip on all samples" vlqAllRt
+    c.check "VLQ encode/decode round-trip on all samples" (vlqSamples.all fun v => Js.decodeVlqInt (Js.encodeVlqInt v) == some v)
 
     -- Base-52/62 short identifier hygiene & uniqueness
     let (idList, idsClean) := Id.run do
@@ -127,16 +94,13 @@ def run : IO Bool := do
       let mut ok := true
       for _ in [0:400] do
         let (nm, nextIdx) := Js.nextShortIdent Js.jsMinReservedSet idx
-        if seen.contains nm || Js.jsMinReservedSet.contains nm || nm.startsWith "$" || nm.startsWith "_" then
-          ok := false
-        seen := seen.insert nm
-        idx := nextIdx
+        if seen.contains nm || Js.jsMinReservedSet.contains nm || nm.startsWith "$" || nm.startsWith "_" then ok := false
+        seen := seen.insert nm; idx := nextIdx
       return (seen.size, ok)
     c.check "400 generated short identifiers are unique and skip reserved words/$" (idList == 400 && idsClean)
 
     -- Dev build emits `app.mjs` + `app.mjs.map` + `//# sourceMappingURL=app.mjs.map` + `qed_dev.mjs`
-    let (cDev, outDev, errDev) ← runCmd cli #["build", "--dev", "--no-verify"]
-      (cwd := some (FilePath.mk appDir)) (env := cleanEnv)
+    let (cDev, outDev, errDev) ← runCmd cli #["build", "--dev", "--no-verify"] (cwd := some (FilePath.mk appDir)) (env := cleanEnv)
     c.check "qed build --dev succeeds" (cDev == 0) (outDev ++ errDev)
     let devOut := FilePath.mk appDir / ".qed" / "dev"
     let devAppJs ← IO.FS.readFile (devOut / "app.mjs")
@@ -146,18 +110,13 @@ def run : IO Bool := do
     c.check "dev qed_dev.mjs emitted" (← (devOut / "qed_dev.mjs").pathExists)
     let devMapRaw ← IO.FS.readFile devMapPath
     c.expectOk "dev sourcemap valid JSON" (Qed.Json.parse devMapRaw) fun sm => do
-      c.checkEq "dev sourcemap version == 3" (((sm.get? "version").bind (·.num?)).bind (·.toInt?)) (some 3)
-      c.checkEq "dev sourcemap file == app.mjs" ((sm.get? "file").bind (·.str?)) (some "app.mjs")
-      let hasSources := match sm.get? "sources" with
-        | some (.arr xs) => !xs.isEmpty && xs.any (fun x => x.str? == some "App.lean")
-        | _ => false
-      let hasNames := match sm.get? "names" with | some (.arr xs) => !xs.isEmpty | _ => false
-      let hasMappings := match (sm.get? "mappings").bind (·.str?) with
-        | some m => !m.isEmpty && m.contains ";"
-        | none => false
-      c.check "dev sourcemap lists App.lean in sources" hasSources devMapRaw
-      c.check "dev sourcemap has non-empty names" hasNames
-      c.check "dev sourcemap has non-empty VLQ mappings" hasMappings
+      c.checkJsonInt "dev sourcemap version == 3" sm "version" 3
+      c.checkJsonStr "dev sourcemap file == app.mjs" sm "file" "app.mjs"
+      c.checkJsonPath "dev sourcemap lists App.lean in sources" sm "sources" (detail := devMapRaw) fun
+        | .arr xs => !xs.isEmpty && xs.any (·.str? == some "App.lean") | _ => false
+      c.checkJsonPath "dev sourcemap has non-empty names" sm "names" fun | .arr xs => !xs.isEmpty | _ => false
+      c.checkJsonPath "dev sourcemap has non-empty VLQ mappings" sm "mappings" fun
+        | .str m => !m.isEmpty && m.contains ";" | _ => false
 
     -- Minified prod `appJs` (from step 2) is significantly smaller and strips `_g0` / block comments
     c.check "minified prod app.mjs is >25% smaller than dev app.mjs" (appJs.length * 4 < devAppJs.length * 3)
@@ -167,21 +126,17 @@ def run : IO Bool := do
     c.check "minified prod app.mjs preserves $ runtime calls" (appJs.contains "$.")
 
     -- Prod build with `--sourcemap` emits hashed `app.<hash>.mjs.map` matching `app.<hash>.mjs`
-    let (cProdMap, outProdMap, errProdMap) ← runCmd cli #["build", "--sourcemap"]
-      (cwd := some (FilePath.mk appDir)) (env := cleanEnv)
+    let (cProdMap, outProdMap, errProdMap) ← runCmd cli #["build", "--sourcemap"] (cwd := some (FilePath.mk appDir)) (env := cleanEnv)
     c.check "qed build --sourcemap succeeds" (cProdMap == 0) (outProdMap ++ errProdMap)
-    let manifestRaw2 ← IO.FS.readFile (distDir / "qed_manifest.json")
-    let manifestJson2 := match Qed.Json.parse manifestRaw2 with | .ok j => j | .error _ => .null
-    let appPath2 := ((manifestJson2.get? "app").bind (·.str?)).getD ""
-    let appName2 := String.ofList (appPath2.toList.drop 1)
+    let appName2 := String.ofList ((Qed.Json.pathStr (← IO.FS.readFile (distDir / "qed_manifest.json")) "app").toList.drop 1)
     let prodJs2 ← IO.FS.readFile (distDir / appName2)
     let prodMap2Path := distDir / s!"{appName2}.map"
     c.check "prod --sourcemap appends hashed sourceMappingURL" (prodJs2.contains s!"//# sourceMappingURL={appName2}.map")
     c.check "prod --sourcemap emits hashed .mjs.map" (← prodMap2Path.pathExists)
     if ← prodMap2Path.pathExists then
       c.expectOk "prod sourcemap valid JSON" (Qed.Json.parse (← IO.FS.readFile prodMap2Path)) fun sm => do
-        c.checkEq "prod sourcemap version == 3" (((sm.get? "version").bind (·.num?)).bind (·.toInt?)) (some 3)
-        c.checkEq "prod sourcemap file matches hashed bundle" ((sm.get? "file").bind (·.str?)) (some appName2)
+        c.checkJsonInt "prod sourcemap version == 3" sm "version" 3
+        c.checkJsonStr "prod sourcemap file matches hashed bundle" sm "file" appName2
 
     -- 6. OS-native file watcher FFI (`Cli.Watch.FileWatcher`) + Dev SSE push server (`Cli.Watch.DevSseServer`)
     let watchRoot := FilePath.mk scratch / "watch_proj"
@@ -278,8 +233,6 @@ def run : IO Bool := do
     c.check "partial def rejected by kernel gate"
       (cPart != 0 && (outPart ++ errPart).contains "kernel gate: `partial` or `opaque` declaration `spin`")
       (outPart ++ errPart)
-  finally
-    rmRf scratch
   c.finish
 
 end Tests.Native.CliScaffold

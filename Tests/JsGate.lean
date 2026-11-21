@@ -217,49 +217,28 @@ def codegenStressP (i : Nat) : String :=
   let pairFn := fun (a b : Nat) => a * 17 + b
   s!"{tag}|{pairFn i s}"
 
-def run (probe i : Nat) : String :=
-  match probe with
-  | 0 => renderCase i
-  | 1 => diffCase i
-  | 2 => arith i
-  | 3 => strop i
-  | 4 => jsonRt i
-  | 5 => dateP i
-  | 6 => arrP i
-  | 7 => routeP i
-  | 8 => segP i
-  | 9 => childPatchCase i
-  | 10 => wideRenderCase i
-  | 11 => keyIndexCase i
-  | 12 => protoP i
-  | 13 => styleP i
-  | 14 => wsMuxP i
-  | 15 => codegenStressP i
-  | _ => ""
+def probes : Array (String × Nat × (Nat → String)) := #[
+  ("render",        treeCount,   renderCase),
+  ("diff",          pairCount,   diffCase),
+  ("arith",         32,          arith),
+  ("string",        strs.size,   strop),
+  ("json",          jsons.size,  jsonRt),
+  ("date",          dates.size,  dateP),
+  ("array",         12,          arrP),
+  ("router",        routes.size, routeP),
+  ("seg",           routes.size, segP),
+  ("childPatch",    4,           childPatchCase),
+  ("wideRender",    4,           wideRenderCase),
+  ("keyIndex",      6,           keyIndexCase),
+  ("proto",         10,          protoP),
+  ("style",         2,           styleP),
+  ("wsMux",         13,          wsMuxP),
+  ("codegenStress", 8,           codegenStressP)
+]
 
-def counts (probe : Nat) : Nat :=
-  match probe with
-  | 0 => treeCount
-  | 1 => pairCount
-  | 2 => 32
-  | 3 => strs.size
-  | 4 => jsons.size
-  | 5 => dates.size
-  | 6 => 12
-  | 7 => routes.size
-  | 8 => routes.size
-  | 9 => 4
-  | 10 => 4
-  | 11 => 6
-  | 12 => 10
-  | 13 => 2
-  | 14 => 13
-  | 15 => 8
-  | _ => 0
-
-def probeCount : Nat := 16
-
-def names : Array String := #["render", "diff", "arith", "string", "json", "date", "array", "router", "seg",
-  "childPatch", "wideRender", "keyIndex", "proto", "style", "wsMux", "codegenStress"]
+def run (probe i : Nat) : String := match probes[probe]? with | some (_, _, f) => f i | none => ""
+def counts (probe : Nat) : Nat := match probes[probe]? with | some (_, n, _) => n | none => 0
+def probeCount : Nat := probes.size
+def names : Array String := probes.map Prod.fst
 
 end JsGate

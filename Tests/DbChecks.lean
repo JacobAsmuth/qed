@@ -33,14 +33,15 @@ database VaultDb:
 #guard VaultDb.rlsDdl.contains "ENABLE ROW LEVEL SECURITY"
 #guard VaultDb.rlsDdl.contains "current_setting('qed.user_id', true)"
 
--- Verify SQL injection closure on compiled parameterized queries
-#guard
-  let q1 := Qed.Server.Db.SqlQuery.select ⟨"notes", by decide⟩ [⟨"id", by decide⟩]
-    (.binOp .eq (.col ⟨"ownerId", by decide⟩) (.param (.text "alice")))
-  let q2 := Qed.Server.Db.SqlQuery.select ⟨"notes", by decide⟩ [⟨"id", by decide⟩]
-    (.binOp .eq (.col ⟨"ownerId", by decide⟩) (.param (.text "' OR 1=1; DROP TABLE notes; --")))
+def sameCompiledSql (q1 q2 : Qed.Server.Db.SqlQuery) : Bool :=
   (q1.compile .postgres).1 == (q2.compile .postgres).1 &&
   (q1.compile .sqlite).1 == (q2.compile .sqlite).1
+
+-- Verify SQL injection closure on compiled parameterized queries
+#guard
+  let mk (v : String) := Qed.Server.Db.SqlQuery.select ⟨"notes", by decide⟩ [⟨"id", by decide⟩]
+    (.binOp .eq (.col ⟨"ownerId", by decide⟩) (.param (.text v)))
+  sameCompiledSql (mk "alice") (mk "' OR 1=1; DROP TABLE notes; --")
 
 /-! ## Positive End-to-End Verification: Valid DB-Backed Server + Client -/
 
@@ -374,37 +375,38 @@ database ShopDb:
 
 -- SQL injection closure for LIKE / startsWith / contains / IN / aggregate / joinSelect
 #guard
-  let q1 := Qed.Server.Db.SqlQuery.select ⟨"items", by decide⟩ [⟨"id", by decide⟩]
-    (.binOp .and (.startsWith (.col ⟨"title", by decide⟩) (.param (.text "Rust")))
-          (.binOp .and (.contains (.col ⟨"title", by decide⟩) (.param (.text "Lean")))
-                (.inList (.col ⟨"id", by decide⟩) [.text "a", .text "b"])))
+  let mk (p1 p2 i1 i2 : String) := Qed.Server.Db.SqlQuery.select ⟨"items", by decide⟩ [⟨"id", by decide⟩]
+    (.binOp .and (.startsWith (.col ⟨"title", by decide⟩) (.param (.text p1)))
+      (.binOp .and (.contains (.col ⟨"title", by decide⟩) (.param (.text p2)))
+        (.inList (.col ⟨"id", by decide⟩) [.text i1, .text i2])))
     (limit := some 10) (offset := some 5)
-  let q2 := Qed.Server.Db.SqlQuery.select ⟨"items", by decide⟩ [⟨"id", by decide⟩]
-    (.binOp .and (.startsWith (.col ⟨"title", by decide⟩) (.param (.text "'; DROP TABLE items; --")))
-          (.binOp .and (.contains (.col ⟨"title", by decide⟩) (.param (.text "%' OR 1=1 --")))
-                (.inList (.col ⟨"id", by decide⟩) [.text "'; DELETE FROM items;", .text "x"])))
-    (limit := some 10) (offset := some 5)
-  (q1.compile .postgres).1 == (q2.compile .postgres).1 &&
-  (q1.compile .sqlite).1 == (q2.compile .sqlite).1
+  sameCompiledSql (mk "Rust" "Lean" "a" "b") (mk "'; DROP TABLE items; --" "%' OR 1=1 --" "'; DELETE FROM items;" "x")
 
--- Pure schema diffing & migration safety checks
-#guard
-  let oldTbl : Qed.Server.Db.TableSchema := {
-    name := ⟨"items", by decide⟩
-    columns := [
-      { name := ⟨"id", by decide⟩, colType := .text, isPrimaryKey := true }
-    ]
-    indexes := []
-  }
-  let newTbl : Qed.Server.Db.TableSchema := {
-    name := ⟨"items", by decide⟩
-    columns := [
-      { name := ⟨"id", by decide⟩, colType := .text, isPrimaryKey := true },
+/-- Shared v1/v2/unsafe additive migration fixture reused by `Tests.Native.Database`. -/
+def mkMigrationFixture (tblName : Qed.Server.Db.SqlIdent)
+    (extraV1Cols : List Qed.Server.Db.ColumnSchema := [])
+    (unsafeColName : Qed.Server.Db.SqlIdent := ⟨"code", by decide⟩) :
+    Qed.Server.Db.TableSchema × Qed.Server.Db.TableSchema × Qed.Server.Db.ColumnSchema :=
+  let baseCols : List Qed.Server.Db.ColumnSchema :=
+    { name := ⟨"id", by decide⟩, colType := .text, isPrimaryKey := true } :: extraV1Cols
+  let v1 : Qed.Server.Db.TableSchema := { name := tblName, columns := baseCols, indexes := [] }
+  let v2 : Qed.Server.Db.TableSchema := {
+    name := tblName
+    columns := baseCols ++ [
       { name := ⟨"notes", by decide⟩, colType := .text, nullable := true },
       { name := ⟨"views", by decide⟩, colType := .int, nullable := false, checkSql? := some "\"views\" >= 0" }
     ]
     indexes := [[⟨"views", by decide⟩]]
   }
+  let unsafeCol : Qed.Server.Db.ColumnSchema := {
+    name := unsafeColName, colType := .text, nullable := false,
+    checkSql? := some s!"LENGTH(\"{unsafeColName.raw}\") >= 4"
+  }
+  (v1, v2, unsafeCol)
+
+-- Pure schema diffing & migration safety checks (safe additive v1->v2 & rejected unsafe CHECK)
+#guard
+  let (oldTbl, newTbl, unsafeCol) := mkMigrationFixture ⟨"items", by decide⟩
   let steps := Qed.Server.Db.diffTableSchemas [oldTbl] [newTbl]
   let pgDdl := Qed.Server.Db.renderMigrationDdl .postgres steps
   let sqDdl := Qed.Server.Db.renderMigrationDdl .sqlite steps
@@ -414,14 +416,7 @@ database ShopDb:
   pgDdl.contains "ADD COLUMN IF NOT EXISTS \"views\" BIGINT NOT NULL DEFAULT 0" &&
   sqDdl.contains "ADD COLUMN \"views\" INTEGER NOT NULL DEFAULT 0" &&
   sqDdl.contains "CREATE INDEX IF NOT EXISTS \"idx_items_0\"" &&
-  (Qed.Server.Db.diffTableSchemas [newTbl] [newTbl]).isEmpty
-
--- Unsafe additive migration (new non-nullable column with arbitrary CHECK) is rejected
-#guard
-  let unsafeCol : Qed.Server.Db.ColumnSchema := {
-    name := ⟨"code", by decide⟩, colType := .text, nullable := false,
-    checkSql? := some "LENGTH(\"code\") >= 4"
-  }
+  (Qed.Server.Db.diffTableSchemas [newTbl] [newTbl]).isEmpty &&
   !(Qed.Server.Db.verifyMigrationSafe [.addColumn ⟨"items", by decide⟩ unsafeCol none]).isOk
 
 server ShopApi:

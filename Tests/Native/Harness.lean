@@ -137,6 +137,17 @@ def findSubBytes (hay needle : ByteArray) (start : Nat := 0) : Option Nat := Id.
     if matched then return some i
   return none
 
+/-- Reads from `handle` into `buf` until at least `n` bytes are buffered (or EOF/error returns `none`). -/
+partial def readExact (handle : UInt64) (buf : ByteArray) (n : Nat) : IO (Option ByteArray) := do
+  let mut b := buf
+  while b.size < n do
+    match ← Prim.outboundReadSome handle 16384 with
+    | .error _ => return none
+    | .ok chunk =>
+        if chunk.size == 0 then return none
+        b := b ++ chunk
+  return some b
+
 /-- Reads all bytes from a connected socket until EOF. -/
 partial def readAllSocket (handle : UInt64) (acc : ByteArray := ByteArray.empty) : IO ByteArray := do
   match ← Prim.outboundReadSome handle 65536 with
@@ -171,6 +182,30 @@ def HttpResp.header? (r : HttpResp) (name : String) : Option String :=
 
 def HttpResp.bodyStr (r : HttpResp) : String :=
   (String.fromUTF8? r.body).getD ""
+
+def HttpResp.cookies (r : HttpResp) : List String :=
+  r.headers.foldl (init := []) fun acc (k, v) =>
+    if k.toLower == "set-cookie" then acc ++ [v] else acc
+
+def HttpResp.cookie? (r : HttpResp) (name : String) : Option String :=
+  r.cookies.findSome? fun sc =>
+    let pair := (sc.splitOn ";").headD "" |>.trimAscii.toString
+    if pair.startsWith (name ++ "=") then some pair else none
+
+def HttpResp.hasCookieFlag (r : HttpResp) (substrs : List String) : Bool :=
+  r.cookies.any fun s => substrs.all fun sub => s.contains sub
+
+def HttpResp.check (r : HttpResp) (c : TestChecker) (label : String)
+    (status? : Option Nat := none)
+    (headers : List (String × Option String) := [])
+    (bodyEq? : Option String := none)
+    (contains : List String := [])
+    (notContains : List String := []) : IO Unit := do
+  if let some st := status? then c.checkEq s!"{label} status {st}" r.status st
+  for (k, want) in headers do c.checkEq s!"{label} header {k}" (r.header? k) want
+  if let some b := bodyEq? then c.checkEq s!"{label} body" r.bodyStr b
+  for sub in contains do c.check s!"{label} contains {sub}" (r.bodyStr.contains sub) r.bodyStr
+  for sub in notContains do c.check s!"{label} omits {sub}" (!r.bodyStr.contains sub) r.bodyStr
 
 /-- Parses a raw HTTP/1.x response (`Connection: close` framing). -/
 def parseHttpResp (raw : ByteArray) : Except String HttpResp := do
@@ -216,6 +251,46 @@ def httpRpc (port : UInt16) (server fn : String) (body : ByteArray := ByteArray.
 def TestChecker.checkStatus (c : TestChecker) (label : String)
     (res : Except String HttpResp) (want : Nat) : IO Unit :=
   c.expectOk label res fun r => c.checkEq label r.status want
+
+def TestChecker.checkHttp (c : TestChecker) (label : String) (res : Except String HttpResp)
+    (status? : Option Nat := some 200)
+    (headers : List (String × Option String) := [])
+    (bodyEq? : Option String := none)
+    (contains : List String := [])
+    (notContains : List String := [])
+    (extra : HttpResp → IO Unit := fun _ => pure ()) : IO Unit :=
+  c.expectOk label res fun r => do
+    r.check c label status? headers bodyEq? contains notContains
+    extra r
+
+def TestChecker.checkRpcDomainOk {ε E α : Type} [ErrMsg ε] [Qed.FromProto E] [Qed.FromProto α]
+    (c : TestChecker) (label : String) (res : Except ε ByteArray) (k : α → IO Unit) : IO Unit :=
+  c.expectOk label res fun bs =>
+    match Qed.Proto.decode (α := Except (Qed.RpcDomainError E) α) bs with
+    | .ok (.ok v)      => k v
+    | .ok (.error err) => c.check label false s!"unexpected domain error: {err.message}"
+    | .error e         => c.check label false s!"decode error: {e}"
+
+def TestChecker.checkRpcDomainErr {ε E α : Type} [ErrMsg ε] [Qed.FromProto E] [Qed.FromProto α]
+    (c : TestChecker) (label : String) (res : Except ε ByteArray)
+    (pred : Qed.RpcDomainError E → Bool := fun _ => true) : IO Unit :=
+  c.expectOk label res fun bs =>
+    match Qed.Proto.decode (α := Except (Qed.RpcDomainError E) α) bs with
+    | .ok (.error err) => c.check label (pred err) s!"got domain error: {err.message}"
+    | .ok (.ok _)      => c.check label false "expected domain error, got ok"
+    | .error e         => c.check label false s!"decode error: {e}"
+
+def TestChecker.checkJsonPath (c : TestChecker) (label : String) (j : Qed.Json) (path : String)
+    (pred : Qed.Json → Bool) (detail : String := "") : IO Unit :=
+  match j.atPath path with
+  | some v => c.check label (pred v) (if detail.isEmpty then Qed.Json.render v else detail)
+  | none   => c.check label false s!"missing JSON path `{path}`"
+
+def TestChecker.checkJsonStr (c : TestChecker) (label : String) (j : Qed.Json) (path want : String) : IO Unit :=
+  c.checkEq label ((j.atPath path).bind (·.str?)) (some want)
+
+def TestChecker.checkJsonInt (c : TestChecker) (label : String) (j : Qed.Json) (path : String) (want : Int) : IO Unit :=
+  c.checkEq label (((j.atPath path).bind (·.num?)).bind (·.toInt?)) (some want)
 
 def TestChecker.checkProto {ε α : Type} [ErrMsg ε] [Qed.FromProto α] [BEq α] [Repr α]
     (c : TestChecker) (label : String) (res : Except ε ByteArray) (want : α) : IO Unit :=
@@ -287,6 +362,29 @@ def startNativeServer (dir : String) (extraEnv : Array (String × Option String)
   let args := #[dir, toString port] ++ (if dev then #["--dev"] else #[])
   startNativeBin (dir ++ "/server") args port extraEnv
 
+def withNativeBin (c : TestChecker) (label bin : String) (args : Array String) (port : UInt16)
+    (extraEnv : Array (String × Option String) := #[]) (k : NativeServerProc → IO Unit) : IO Unit := do
+  let (srv, ok) ← startNativeBin bin args port extraEnv
+  try
+    c.check label ok
+    if ok then k srv
+  finally
+    srv.stop
+
+def withNativeServer (c : TestChecker) (label dir : String)
+    (extraEnv : Array (String × Option String) := #[]) (dev : Bool := true)
+    (k : NativeServerProc → IO Unit) : IO Unit := do
+  let (srv, ok) ← startNativeServer dir extraEnv dev
+  try
+    c.check label ok
+    if ok then k srv
+  finally
+    srv.stop
+
+def withMockServer {α : Type} (c : TestChecker) (label : String)
+    (start : IO (Except String α)) (stop : α → IO Unit) (k : α → IO Unit) : IO Unit := do
+  c.expectOk label (← start) fun m => try k m finally stop m
+
 /-- Reads one HTTP/1.1 request (headers + `Content-Length` body) from an accepted socket handle. -/
 partial def readOneHttpReq (handle : UInt64) : IO (Option (String × String × Array (String × String) × ByteArray)) := do
   let sep := "\r\n\r\n".toUTF8
@@ -315,13 +413,8 @@ partial def readOneHttpReq (handle : UInt64) : IO (Option (String × String × A
         if kn.toLower == "content-length" then
           contentLen := kv.toNat?.getD 0
     | _ => pure ()
-  let mut body := buf.extract (hdrEnd + 4) buf.size
-  while body.size < contentLen do
-    match ← Prim.outboundReadSome handle 16384 with
-    | .error _ => break
-    | .ok chunk =>
-        if chunk.size == 0 then break
-        body := body ++ chunk
+  let initBody := buf.extract (hdrEnd + 4) buf.size
+  let body := (← readExact handle initBody contentLen).getD initBody
   return some (method, target, hdrs, body.extract 0 contentLen)
 
 /-- Starts a loopback TCP mock server on an ephemeral port, returning `(port, stop)`. -/
@@ -361,5 +454,9 @@ def makeTempDir (prefixStr : String) : IO String := do
 
 def rmRf (path : String) : IO Unit := do
   discard <| runCmd "rm" #["-rf", path]
+
+def withTempDir {α : Type} (prefixStr : String) (k : String → IO α) : IO α := do
+  let dir ← makeTempDir prefixStr
+  try k dir finally rmRf dir
 
 end Tests.Native

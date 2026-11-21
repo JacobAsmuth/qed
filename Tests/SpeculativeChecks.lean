@@ -288,81 +288,53 @@ theorem checkoutSpec_spec_inv :
   exact Qed.SpecEngine.step_preserves_inv CheckoutSpec.update CheckoutSpec._specClassify
     (fun s m hs => CheckoutSpec.validRemaining.2 s m hs) st msg h
 
--- Helper to drive `CheckoutSpec.app.update`
-private def csInit : Qed.SpecState CheckoutSpec.State CheckoutSpec.Msg :=
-  (CheckoutSpec.app.update CheckoutSpec.app.init.1 (._onSession (some "alice"))).1
+-- Generic trace combinators to drive speculative component `app.update`
+private def step {S M C : Type} (upd : S → M → S × C) (st : S) (m : M) : S := (upd st m).1
+private def runTrace {S M C : Type} (upd : S → M → S × C) (st : S) (ms : List M) : S :=
+  ms.foldl (step upd) st
 
 private def mkOrderOk (qty v : Nat) (h : v ≤ 10000) : StoreSrv.placeOrder_Outcome qty :=
   .ok ⟨v, h⟩
 
--- Test 1: Dispatch + Prediction Hit (`actual == predicted`)
-private def csAfterDispatch := (CheckoutSpec.app.update csInit (.buy 2)).1
-#guard csAfterDispatch.visible.remaining == 8
-#guard csAfterDispatch.visible.status == "Pending: 8"
-#guard csAfterDispatch.visible.clicks == 1
-#guard csAfterDispatch.confirmed.remaining == 10
-#guard csAfterDispatch.confirmed.clicks == 1
-#guard csAfterDispatch.log.length == 1
-
-private def csAfterHit :=
-  (CheckoutSpec.app.update csAfterDispatch (._specRes_0 0 2 8 (mkOrderOk 2 8 (by omega)))).1
-#guard csAfterHit.visible.remaining == 8
-#guard csAfterHit.confirmed.remaining == 8
-#guard csAfterHit.visible.confirmedCount == 1
-#guard csAfterHit.visible.status == "Confirmed: 8"
-#guard csAfterHit.log.isEmpty
-
--- Test 2: Prediction Mismatch (default: rollback + re-apply continuation with `actual` + `on_confirm`)
-private def csMismatchDisp := (CheckoutSpec.app.update csAfterHit (.buy 1)).1
-#guard csMismatchDisp.visible.remaining == 7
-#guard csMismatchDisp.visible.status == "Pending: 7"
-private def csAfterMismatch :=
-  (CheckoutSpec.app.update csMismatchDisp (._specRes_0 1 1 7 (mkOrderOk 1 5 (by omega)))).1
-#guard csAfterMismatch.visible.remaining == 5
-#guard csAfterMismatch.confirmed.remaining == 5
-#guard csAfterMismatch.visible.confirmedCount == 2
-#guard csAfterMismatch.visible.status == "Confirmed: 5"
-#guard csAfterMismatch.log.isEmpty
-
--- Test 3: Server Error Rollback WITH Concurrent Local Edit (`note` preserved, `clicks` committed, `remaining` rolled back!)
-private def csErrDisp := (CheckoutSpec.app.update csAfterMismatch (.buy 3)).1
-private def csErrTyped := (CheckoutSpec.app.update csErrDisp (.setNote "keep me")).1
-#guard csErrTyped.visible.remaining == 2
-#guard csErrTyped.visible.note == "keep me"
-#guard csErrTyped.log.length == 2
-private def csAfterErr :=
-  (CheckoutSpec.app.update csErrTyped (._specRes_0 2 3 2 (.err .outOfStock "outOfStock"))).1
-#guard csAfterErr.visible.remaining == 5
-#guard csAfterErr.confirmed.remaining == 5
-#guard csAfterErr.visible.status == "Out of stock"
-#guard csAfterErr.visible.note == "keep me"
-#guard csAfterErr.visible.clicks == 3
-#guard csAfterErr.visible.confirmedCount == 2
-#guard csAfterErr.log.isEmpty
-
--- Test 4: Two Overlapping Predictions Resolving Out-Of-Order (`txId = 4` before `txId = 3`)
-private def csTwo1 := (CheckoutSpec.app.update csAfterErr (.buy 1)).1     -- txId 3, predicts 4
-private def csTwo2 := (CheckoutSpec.app.update csTwo1 (.buy 1)).1         -- txId 4, predicts 3
-#guard csTwo2.visible.remaining == 3
-#guard csTwo2.confirmed.remaining == 5
-#guard csTwo2.log.length == 3           -- pending 3, resolved pre(buy2), pending 4
--- Second RPC (`txId = 4`) returns FIRST with mismatch `actual = 2`
-private def csTwoRes2 :=
-  (CheckoutSpec.app.update csTwo2 (._specRes_0 4 1 3 (mkOrderOk 1 2 (by omega)))).1
-#guard csTwoRes2.visible.remaining == 2
-#guard csTwoRes2.confirmed.remaining == 5  -- txId 3 still pending!
-#guard csTwoRes2.log.length == 4           -- pending 3, resolved pre(buy2), resolved cont 4, resolved confirm 4
--- First RPC (`txId = 3`) now fails with `.outOfStock`
-private def csTwoRes1 :=
-  (CheckoutSpec.app.update csTwoRes2 (._specRes_0 3 1 4 (.err .outOfStock "outOfStock"))).1
-#guard csTwoRes1.visible.remaining == 2
-#guard csTwoRes1.confirmed.remaining == 2
-#guard csTwoRes1.visible.confirmedCount == 3
-#guard csTwoRes1.log.isEmpty
-
--- Test 5: Rehydration guard rejects invalid state & preserves valid state
-#guard (CheckoutSpec.app.rehydrate (CheckoutSpec.app.dehydrate csAfterHit)).isSome
-#guard (CheckoutSpec.app.rehydrate "{\"user\":null,\"remaining\":99999,\"status\":\"\",\"note\":\"\",\"confirmedCount\":0,\"clicks\":0}").isNone
+-- Tests 1-5: Dispatch + hit, mismatch, error rollback with concurrent local edit, out-of-order resolution, rehydration
+#guard
+  let u := CheckoutSpec.app.update
+  let cs0 := step u CheckoutSpec.app.init.1 (._onSession (some "alice"))
+  -- 1. Dispatch + Prediction Hit (`actual == predicted`)
+  let sDisp := step u cs0 (.buy 2)
+  let sHit := step u sDisp (._specRes_0 0 2 8 (mkOrderOk 2 8 (by omega)))
+  -- 2. Prediction Mismatch (rollback + re-apply continuation with `actual` + `on_confirm`)
+  let sMisDisp := step u sHit (.buy 1)
+  let sMis := step u sMisDisp (._specRes_0 1 1 7 (mkOrderOk 1 5 (by omega)))
+  -- 3. Server Error Rollback WITH Concurrent Local Edit (`note` preserved, `clicks` committed, `remaining` rolled back)
+  let sErrTyped := runTrace u sMis [.buy 3, .setNote "keep me"]
+  let sAfterErr := step u sErrTyped (._specRes_0 2 3 2 (.err .outOfStock "outOfStock"))
+  -- 4. Two Overlapping Predictions Resolving Out-Of-Order (`txId = 4` before `txId = 3`)
+  let sTwo2 := runTrace u sAfterErr [.buy 1, .buy 1]
+  let sTwoRes2 := step u sTwo2 (._specRes_0 4 1 3 (mkOrderOk 1 2 (by omega)))
+  let sTwoRes1 := step u sTwoRes2 (._specRes_0 3 1 4 (.err .outOfStock "outOfStock"))
+  -- Test 1 assertions
+  sDisp.visible.remaining == 8 && sDisp.visible.status == "Pending: 8" && sDisp.visible.clicks == 1 &&
+  sDisp.confirmed.remaining == 10 && sDisp.confirmed.clicks == 1 && sDisp.log.length == 1 &&
+  sHit.visible.remaining == 8 && sHit.confirmed.remaining == 8 && sHit.visible.confirmedCount == 1 &&
+  sHit.visible.status == "Confirmed: 8" && sHit.log.isEmpty &&
+  -- Test 2 assertions
+  sMisDisp.visible.remaining == 7 && sMisDisp.visible.status == "Pending: 7" &&
+  sMis.visible.remaining == 5 && sMis.confirmed.remaining == 5 && sMis.visible.confirmedCount == 2 &&
+  sMis.visible.status == "Confirmed: 5" && sMis.log.isEmpty &&
+  -- Test 3 assertions
+  sErrTyped.visible.remaining == 2 && sErrTyped.visible.note == "keep me" && sErrTyped.log.length == 2 &&
+  sAfterErr.visible.remaining == 5 && sAfterErr.confirmed.remaining == 5 && sAfterErr.visible.status == "Out of stock" &&
+  sAfterErr.visible.note == "keep me" && sAfterErr.visible.clicks == 3 && sAfterErr.visible.confirmedCount == 2 &&
+  sAfterErr.log.isEmpty &&
+  -- Test 4 assertions
+  sTwo2.visible.remaining == 3 && sTwo2.confirmed.remaining == 5 && sTwo2.log.length == 3 &&
+  sTwoRes2.visible.remaining == 2 && sTwoRes2.confirmed.remaining == 5 && sTwoRes2.log.length == 4 &&
+  sTwoRes1.visible.remaining == 2 && sTwoRes1.confirmed.remaining == 2 && sTwoRes1.visible.confirmedCount == 3 &&
+  sTwoRes1.log.isEmpty &&
+  -- Test 5: Rehydration guard rejects invalid state & preserves valid state
+  (CheckoutSpec.app.rehydrate (CheckoutSpec.app.dehydrate sHit)).isSome &&
+  (CheckoutSpec.app.rehydrate "{\"user\":null,\"remaining\":99999,\"status\":\"\",\"note\":\"\",\"confirmedCount\":0,\"clicks\":0}").isNone
 
 -- 2b. Explicit `rollback(actual):` override (aborts continuation & `on_confirm` on mismatch)
 component ClaimSpec:
@@ -385,24 +357,16 @@ component ClaimSpec:
 
   view: <span>{status}</span>
 
-private def cl0 := ClaimSpec.app.init.1
-private def cl1 := (ClaimSpec.app.update cl0 (.claimItem 42)).1
-#guard cl1.visible.owned == #[42]
-#guard cl1.visible.status == "Claimed"
--- Mismatch (`actual = 2`): reverts `owned` to `[]`, skips `on_confirm`, runs `rollback(actual):`
-private def clMiss := (ClaimSpec.app.update cl1 (._specRes_0 0 42 1 (.ok ⟨2, by simp [StoreSrv.claim_ens]⟩))).1
-#guard clMiss.visible.owned == #[]
-#guard clMiss.confirmed.owned == #[]
-#guard clMiss.visible.confirmed == 0
-#guard clMiss.visible.status == "Mismatch:2"
-#guard clMiss.log.isEmpty
--- Hit (`actual = 1`): commits `owned == #[7]` and runs `on_confirm`
-private def clHitDisp := (ClaimSpec.app.update clMiss (.claimItem 7)).1
-private def clHit := (ClaimSpec.app.update clHitDisp (._specRes_0 1 7 1 (.ok ⟨1, by simp [StoreSrv.claim_ens]⟩))).1
-#guard clHit.visible.owned == #[7]
-#guard clHit.visible.confirmed == 1
-#guard clHit.visible.status == "Claimed"
-#guard clHit.log.isEmpty
+#guard
+  let u := ClaimSpec.app.update
+  let cl1 := step u ClaimSpec.app.init.1 (.claimItem 42)
+  let clMiss := step u cl1 (._specRes_0 0 42 1 (.ok ⟨2, by simp [StoreSrv.claim_ens]⟩))
+  let clHit := runTrace u clMiss [.claimItem 7, ._specRes_0 1 7 1 (.ok ⟨1, by simp [StoreSrv.claim_ens]⟩)]
+  cl1.visible.owned == #[42] && cl1.visible.status == "Claimed" &&
+  clMiss.visible.owned == #[] && clMiss.confirmed.owned == #[] && clMiss.visible.confirmed == 0 &&
+  clMiss.visible.status == "Mismatch:2" && clMiss.log.isEmpty &&
+  clHit.visible.owned == #[7] && clHit.visible.confirmed == 1 && clHit.visible.status == "Claimed" &&
+  clHit.log.isEmpty
 
 -- 2c. Conditional `predict:` block with Schema `Field` refinements, server `ensures`, and client `invariant`
 component CatalogSpec:
@@ -442,27 +406,20 @@ private def mkSpecBook (slot : Nat) (hSlot : slot ≤ 1000) (stock : Nat) (hStoc
     title := ⟨"Lean 4", by simp [Codec.refine, Codec.text]; decide⟩
     stock := ⟨stock, by simp [Codec.refine, Codec.nat]; exact hStock⟩ }
 
-private def catAuth :=
-  (CatalogSpec.app.update CatalogSpec.app.init.1 (._onSession (some "alice"))).1
--- When `books` is `.idle`, `predict:` falls through (`none`) -> unpredicted fallback (`log = []`)
-private def catUnpred := (CatalogSpec.app.update catAuth (.orderOne 0)).1
-#guard catUnpred.log.isEmpty
-#guard catUnpred.visible.lastOrdered.isNone
--- When `books` is loaded, `predict:` succeeds -> immediate speculative update!
-private def sampleBook : SpecBook := mkSpecBook 0 (by omega) 10 (by omega)
-private def catLoaded := (CatalogSpec.app.update catAuth (.loadDemo #[sampleBook])).1
-private def catPred := (CatalogSpec.app.update catLoaded (.orderOne 0)).1
-#guard catPred.log.length == 1
-#guard (catPred.visible.lastOrdered.map (fun b => b.stock.val)) == some 9
-#guard catPred.visible.statusMsg == "Ordered Lean 4"
--- Server returns actual stock = 6 (mismatch): rolls back 9 and reconciles to 6!
-private def actualBook : SpecBook := mkSpecBook 0 (by omega) 6 (by omega)
-private def predBook : SpecBook := mkSpecBook 0 (by omega) 9 (by omega)
-private def catReconciled :=
-  (CatalogSpec.app.update catPred
-    (._specRes_0 0 0 predBook (.ok ⟨actualBook, by simp [CatalogSrv.order_ens, actualBook, mkSpecBook]; decide⟩))).1
-#guard catReconciled.log.isEmpty
-#guard (catReconciled.visible.lastOrdered.map (fun b => b.stock.val)) == some 6
+#guard
+  let u := CatalogSpec.app.update
+  let catAuth := step u CatalogSpec.app.init.1 (._onSession (some "alice"))
+  let catUnpred := step u catAuth (.orderOne 0)
+  let sampleBook := mkSpecBook 0 (by omega) 10 (by omega)
+  let actualBook := mkSpecBook 0 (by omega) 6 (by omega)
+  let predBook := mkSpecBook 0 (by omega) 9 (by omega)
+  let catPred := runTrace u catAuth [.loadDemo #[sampleBook], .orderOne 0]
+  let catReconciled := step u catPred
+    (._specRes_0 0 0 predBook (.ok ⟨actualBook, by simp [CatalogSrv.order_ens, actualBook, mkSpecBook]; decide⟩))
+  catUnpred.log.isEmpty && catUnpred.visible.lastOrdered.isNone &&
+  catPred.log.length == 1 && (catPred.visible.lastOrdered.map (·.stock.val)) == some 9 &&
+  catPred.visible.statusMsg == "Ordered Lean 4" &&
+  catReconciled.log.isEmpty && (catReconciled.visible.lastOrdered.map (·.stock.val)) == some 6
 
 -- 2d. `Resource` assignment shorthand `field = await ... predict ...`
 component ResourceSpec:
@@ -474,19 +431,14 @@ component ResourceSpec:
       <span>{xs.size}</span>
     </Await>
 
-private def rs0 := ResourceSpec.app.init.1
-private def rs1 := (ResourceSpec.app.update rs0 .refresh).1
-#guard rs1.log.length == 1
-#guard rs1.visible.items.get? == some #[1, 2, 3]
--- Mismatch: server returns #[10, 20]
-private def rs2 := (ResourceSpec.app.update rs1 (._specRes_0 0 #[1, 2, 3] (.ok #[10, 20]))).1
-#guard rs2.log.isEmpty
-#guard rs2.visible.items.get? == some #[10, 20]
--- Error: reverts `.ok` to `.failed`
-private def rs3 := (ResourceSpec.app.update rs2 .refresh).1
-private def rs4 := (ResourceSpec.app.update rs3 (._specRes_0 1 #[1, 2, 3] (.failed "boom"))).1
-#guard rs4.log.isEmpty
-#guard (match rs4.visible.items with | .failed "boom" => true | _ => false)
+#guard
+  let u := ResourceSpec.app.update
+  let rs1 := step u ResourceSpec.app.init.1 .refresh
+  let rs2 := step u rs1 (._specRes_0 0 #[1, 2, 3] (.ok #[10, 20]))
+  let rs4 := runTrace u rs2 [.refresh, ._specRes_0 1 #[1, 2, 3] (.failed "boom")]
+  rs1.log.length == 1 && rs1.visible.items.get? == some #[1, 2, 3] &&
+  rs2.log.isEmpty && rs2.visible.items.get? == some #[10, 20] &&
+  rs4.log.isEmpty && (match rs4.visible.items with | .failed "boom" => true | _ => false)
 
 /-! ## 3. Kernel-Enforced Soundness Checks (`SpecEq`, `specClassify_pure`, `_specPredict_ens_*`, `specApp_*`) -/
 

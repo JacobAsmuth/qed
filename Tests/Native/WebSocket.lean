@@ -131,12 +131,10 @@ def run : IO Bool := do
   let authSecret := "ws-test-secret-key"
   let aliceTok ← signSessionToken authSecret "alice"
   let bobTok ← signSessionToken authSecret "bob"
-  let (srv, healthy) ← startNativeServer dir #[
+  withNativeServer c "LiveRoom native server healthy" dir #[
     ("QED_WORKERS", some "2"),
     ("QED_AUTH_SECRET", some authSecret)
-  ]
-  try
-    c.check "LiveRoom native server healthy" healthy
+  ] (dev := true) fun srv => do
     let sameOrigin := s!"http://127.0.0.1:{srv.port}"
 
     -- 1. CSWSH cross-origin & missing-origin rejection
@@ -196,11 +194,8 @@ def run : IO Bool := do
                     checkBroadcast "bob" wsB 2
 
                     -- Transactional `emit` rollback: announce "ROLLBACK" fails with domain error & emits nothing!
-                    c.expectOk "ROLLBACK RPC" (← hubRpc "announce" (Qed.Proto.encode ((1 : Nat), "ROLLBACK")) (some aliceTok)) fun r =>
-                      let isErr := match Qed.Proto.decode (α := Except (Qed.RpcDomainError LiveRoom.Hub.announce.Error) LiveRoom.ChatMsg) r.body with
-                        | .ok (.error _) => true
-                        | _ => false
-                      c.check "ROLLBACK returned domain error" isErr
+                    c.checkRpcDomainErr (E := LiveRoom.Hub.announce.Error) (α := LiveRoom.ChatMsg) "ROLLBACK returned domain error"
+                      ((← hubRpc "announce" (Qed.Proto.encode ((1 : Nat), "ROLLBACK")) (some aliceTok)).map (·.body))
 
                     -- Send a real follow-up message and verify alice's NEXT frame is "after rollback" (not "ROLLBACK"!)
                     discard <| hubRpc "announce" (Qed.Proto.encode ((1 : Nat), "after rollback")) (some aliceTok)
@@ -230,8 +225,6 @@ def run : IO Bool := do
         finally
           wsAnon.close
     | _ => c.check "anon WS connect" false
-  finally
-    srv.stop
   c.finish
 
 end Tests.Native.WebSocket

@@ -198,7 +198,7 @@ private structure ParsedExtParam where
   ref        : Lean.Syntax
   headerKey? : Option String
   ident      : Lean.Ident
-  ty         : ParsedSrvType
+  ty         : Qed.Lang.LoweredQedType
 
 open Lean Elab Command in
 private def parseExternalClauses (svcIdent : Ident) (svcName : Name) (clauses : Array Syntax) :
@@ -310,8 +310,7 @@ private def parseExtEndpointParams (fnName : Name) (rawParams : Array Syntax) :
       if pk == ``extParamHeader then pure (some (⟨(rp.getArg 2)⟩ : TSyntax `str).getString, (⟨(rp.getArg 4)⟩ : Ident), (rp.getArg 6))
       else if pk == ``extParamPlain then pure (none, (⟨(rp.getArg 0)⟩ : Ident), (rp.getArg 2))
       else throwErrorAt rp "invalid endpoint parameter"
-    let pty ← liftMacroM <| ParsedSrvType.parse tyNode
-    liftMacroM <| pty.validate (allowFallible := false) s!"parameter `{pid.getId}`"
+    let pty ← liftMacroM <| lowerSrvType tyNode false s!"parameter `{pid.getId}`"
     let pstr := pid.getId.toString
     if seenParamNames.contains pstr then throwErrorAt pid s!"duplicate parameter `{pstr}` in endpoint `{fnName}`"
     seenParamNames := seenParamNames.push pstr
@@ -319,9 +318,9 @@ private def parseExtEndpointParams (fnName : Name) (rawParams : Array Syntax) :
   return parsedParams
 
 open Lean Elab Command in
-private def lowerExtBodyAndDecode (bodyParam? : Option ParsedExtParam) (retTy : ParsedSrvType) :
+private def lowerExtBodyAndDecode (bodyParam? : Option ParsedExtParam) (retTy : Qed.Lang.LoweredQedType) :
     CommandElabM (Term × Array Term × Term × Term) := do
-  let baseRetStr := retTy.baseIdent.getId.toString
+  let baseRetStr := retTy.baseName.toString
   let acceptHdr : Option (String × String) :=
     if retTy.isProto then some ("Accept", "application/x-protobuf")
     else if retTy.mods.isEmpty && (baseRetStr == "Bytes" || baseRetStr == "ByteArray" || baseRetStr == "Unit" || baseRetStr == "String") then none
@@ -329,7 +328,7 @@ private def lowerExtBodyAndDecode (bodyParam? : Option ParsedExtParam) (retTy : 
   let (bodyTerm, ctHdr) ← match bodyParam? with
     | none => pure (← `(ByteArray.empty), (none : Option (String × String)))
     | some bp =>
-        let bBase := bp.ty.baseIdent.getId.toString
+        let bBase := bp.ty.baseName.toString
         if bp.ty.isProto then
           pure (← `(Qed.Proto.encode $(bp.ident)), some ("Content-Type", "application/x-protobuf"))
         else if bp.ty.mods.isEmpty && (bBase == "Bytes" || bBase == "ByteArray") then
@@ -343,7 +342,7 @@ private def lowerExtBodyAndDecode (bodyParam? : Option ParsedExtParam) (retTy : 
     defHdrTerms := defHdrTerms.push (← `(($(Syntax.mkStrLit k), $(Syntax.mkStrLit v))))
   if let some (k, v) := acceptHdr then
     defHdrTerms := defHdrTerms.push (← `(($(Syntax.mkStrLit k), $(Syntax.mkStrLit v))))
-  let retPayloadTerm ← liftMacroM retTy.toPayloadTerm
+  let retPayloadTerm := retTy.term
   let decodeCall : Term ←
     if retTy.isProto then
       `(Qed.Server.decodeRespProto (α := $retPayloadTerm) rawRes)
@@ -367,8 +366,7 @@ private def elabExternalEndpoint (svcName : Name) (svcStrLit : StrLit) (baseId :
   if methodNames.contains fnName then
     throwErrorAt fnIdent s!"duplicate endpoint `{fnName}` in `external {svcName}`"
   let parsedParams ← parseExtEndpointParams fnName (ep.getArg 4).getSepArgs
-  let retTy ← liftMacroM <| ParsedSrvType.parse (ep.getArg 7)
-  liftMacroM <| retTy.validate (allowFallible := false)
+  let retTy ← liftMacroM <| lowerSrvType (ep.getArg 7) false
     "external endpoint return types (external calls are automatically fallible at `await`; write `-> T` instead of `-> T!`)"
   let (segSpecs, querySpecs, placeholders) ← parseUrlTemplate (ep.getArg 1) urlTmpl
   for ph in placeholders do
@@ -383,7 +381,7 @@ private def elabExternalEndpoint (svcName : Name) (svcStrLit : StrLit) (baseId :
         throwErrorAt p.ref s!"endpoint `{fnName}` has multiple request body parameters (`{prev.ident.getId}` and `{p.ident.getId}`); bundle them into a `schema` type"
       bodyParam? := some p
   let pIdents := parsedParams.map (·.ident)
-  let pTyTerms ← parsedParams.mapM fun p => liftMacroM p.ty.toPayloadTerm
+  let pTyTerms := parsedParams.map (·.ty.term)
   let urlParamIdents := (parsedParams.filter (·.headerKey?.isNone)).map (·.ident)
   let (pathTerms, queryTerms) ← lowerUrlParts (ep.getArg 1) segSpecs querySpecs urlParamIdents
   let customHdrTerms ← (parsedParams.filterMap fun p => p.headerKey?.map (·, p.ident)).mapM fun (hk, pid) =>
@@ -396,17 +394,17 @@ private def elabExternalEndpoint (svcName : Name) (svcStrLit : StrLit) (baseId :
   return fnName
 
 open Lean Elab Command in
-private def classifyExtWsCodec (ty : ParsedSrvType) : Qed.ExtWsCodec :=
+private def classifyExtWsCodec (ty : Qed.Lang.LoweredQedType) : Qed.ExtWsCodec :=
   if ty.isProto then .proto
   else
-    let b := ty.baseIdent.getId.toString
+    let b := ty.baseName.toString
     if ty.mods.isEmpty && (b == "Bytes" || b == "ByteArray") then .bytes
     else if ty.mods.isEmpty && b == "String" then .text
     else .json
 
 private structure ParsedExtWsClauses where
   reqExprs     : Array Lean.Syntax
-  sendParams   : Array (Lean.Ident × ParsedSrvType × Lean.Term)
+  sendParams   : Array (Lean.Ident × Qed.Lang.LoweredQedType)
   sendReqExprs : Array Lean.Syntax
   hasSend      : Bool
   recPolicy    : Qed.Reconnect
@@ -422,25 +420,23 @@ private def parseExtWsParams (chName : Name) (rawParams : Array Syntax) :
     let pstr := pid.getId.toString
     if seenP.contains pstr then throwErrorAt pid s!"duplicate parameter `{pstr}` in `ws {chName}`"
     seenP := seenP.push pstr
-    let pty ← liftMacroM <| ParsedSrvType.parse (rp.getArg 2)
-    liftMacroM <| pty.validate (allowFallible := false) s!"parameter `{pstr}`"
+    let pty ← liftMacroM <| lowerSrvType (rp.getArg 2) false s!"parameter `{pstr}`"
     pIdents := pIdents.push pid
-    pTyTerms := pTyTerms.push (← liftMacroM pty.toPayloadTerm)
+    pTyTerms := pTyTerms.push pty.term
   return (pIdents, pTyTerms, seenP)
 
 open Lean Elab Command in
 private def parseExtWsSendClause (chName : Name) (sub : Syntax) :
-    CommandElabM (Array (Ident × ParsedSrvType × Term) × Array Syntax) := do
-  let mut sendParams : Array (Ident × ParsedSrvType × Term) := #[]
+    CommandElabM (Array (Ident × Qed.Lang.LoweredQedType) × Array Syntax) := do
+  let mut sendParams : Array (Ident × Qed.Lang.LoweredQedType) := #[]
   let mut seenSp : Array String := #[]
   for srp in (sub.getArg 2).getSepArgs do
     let spid : Ident := ⟨(srp.getArg 0)⟩
     let spstr := spid.getId.toString
     if seenSp.contains spstr then throwErrorAt spid s!"duplicate send parameter `{spstr}` in `ws {chName}`"
     seenSp := seenSp.push spstr
-    let spty ← liftMacroM <| ParsedSrvType.parse (srp.getArg 2)
-    liftMacroM <| spty.validate (allowFallible := false) s!"send parameter `{spstr}`"
-    sendParams := sendParams.push (spid, spty, ← liftMacroM spty.toPayloadTerm)
+    let spty ← liftMacroM <| lowerSrvType (srp.getArg 2) false s!"send parameter `{spstr}`"
+    sendParams := sendParams.push (spid, spty)
   let mut sendReqExprs : Array Syntax := #[]
   if (sub.getArg 4).getNumArgs == 2 then
     for srl in ((sub.getArg 4).getArg 1).getArgs do
@@ -451,7 +447,7 @@ open Lean Elab Command in
 private def parseExtWsSubClauses (chName : Name) (optBody : Syntax) :
     CommandElabM ParsedExtWsClauses := do
   let mut reqExprs : Array Syntax := #[]
-  let mut sendParams : Array (Ident × ParsedSrvType × Term) := #[]
+  let mut sendParams : Array (Ident × Qed.Lang.LoweredQedType) := #[]
   let mut sendReqExprs : Array Syntax := #[]
   let mut hasSend := false
   let mut recPolicy : Qed.Reconnect := .defaultPolicy
@@ -529,9 +525,10 @@ private structure ExtWsSendInfo where
 
 open Lean Elab Command in
 private def emitExtWsSend (chIdent : Ident) (svcName fullSvcName chName : Name)
-    (sendParams : Array (Ident × ParsedSrvType × Term)) (sendReqExprs : Array Syntax) :
+    (sendParams : Array (Ident × Qed.Lang.LoweredQedType)) (sendReqExprs : Array Syntax) :
     CommandElabM ExtWsSendInfo := do
-  let some (spId, spTy, spTyTerm) := sendParams[0]? | return {}
+  let some (spId, spTy) := sendParams[0]? | return {}
+  let spTyTerm := spTy.term
   let sendCodec := classifyExtWsCodec spTy
   let spAbbrevId := mkIdentFrom chIdent (svcName ++ chName.appendAfter "_SendParam_0")
   elabCommand (← `(command| abbrev $spAbbrevId : Type := $spTyTerm))
@@ -573,9 +570,8 @@ private def elabExternalWsChannel (svcName fullSvcName : Name) (svcNameStr : Str
   if existingNames.contains chName then
     throwErrorAt chIdent s!"duplicate channel/endpoint `{chName}` in `external {svcName}`"
   let (pIdents, pTyTerms, seenP) ← parseExtWsParams chName (wsStx.getArg 4).getSepArgs
-  let evTy ← liftMacroM <| ParsedSrvType.parse (wsStx.getArg 7)
-  liftMacroM <| evTy.validate (allowFallible := false) s!"event type of `ws {chName}`"
-  let evTyTerm ← liftMacroM evTy.toPayloadTerm
+  let evTy ← liftMacroM <| lowerSrvType (wsStx.getArg 7) false s!"event type of `ws {chName}`"
+  let evTyTerm := evTy.term
   let evCodec := classifyExtWsCodec evTy
   let isBinary := evCodec == .proto || evCodec == .bytes
   let (segSpecs, querySpecs, placeholders) ← parseUrlTemplate (wsStx.getArg 1) urlTmpl

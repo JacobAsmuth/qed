@@ -304,7 +304,7 @@ private def parseOrderByArg (tbl : DbTableInfo) (ordStx? : Option Syntax) : Comm
   | some stx =>
       let u := unwrapParens1 stx
       if u.getKind != ``qedLitStr then
-        throwErrorAt stx "`order_by` must be a string column name (e.g. `order_by = \"id\"` or `order_by = \"-version\"`)"
+        throwErrorAt stx "`orderBy` must be a string column name (e.g. `orderBy = \"id\"` or `orderBy = \"-version\"`)"
       let raw := (⟨(u.getArg 0)⟩ : TSyntax `str).getString
       let (colName, isDesc) :=
         if raw.startsWith "-" then (String.ofList (raw.toList.drop 1), true)
@@ -312,7 +312,7 @@ private def parseOrderByArg (tbl : DbTableInfo) (ordStx? : Option Syntax) : Comm
       let colNames := tbl.columns.map (·.name)
       unless colNames.contains colName do
         let hint := Qed.Diag.didYouMean colName colNames.toList
-        throwErrorAt stx s!"`order_by` references unknown column `{colName}` on table `{tbl.tableName}`{hint}"
+        throwErrorAt stx s!"`orderBy` references unknown column `{colName}` on table `{tbl.tableName}`{hint}"
       let cId ← mkSqlIdentT stx colName
       let dirT ← if isDesc then `(Qed.Server.Db.SqlOrderDir.desc) else `(Qed.Server.Db.SqlOrderDir.asc)
       `(some ($cId, $dirT))
@@ -381,7 +381,7 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
       let ctxId := mkIdent `ctx
       let (posArgs, namedArgs) ← liftM (extractCallArgs rawArgs)
       let findNamed (k : String) : Option Syntax := (namedArgs.find? (·.1 == k)).map Prod.snd
-      let findOrderArg : Option Syntax := (findNamed "order_by").orElse fun _ => findNamed "orderBy"
+      let findOrderArg : Option Syntax := findNamed "orderBy"
       let whereArg? : Option Syntax :=
         (findNamed "where").orElse fun _ => (findNamed "filter").orElse fun _ => posArgs[0]?
       let opQual := s!"{fnName} → {dbInfo.shortName}.{tbl.tableName}.{opName}"
@@ -507,8 +507,8 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
         let some (leftJoinCol, rightJoinCol) := fkMatch?
           | liftM (show CommandElabM (Term × Bool) from
               throwErrorAt stx s!"cannot `join` `{tbl.tableName}` with `{rightTbl.tableName}`: no `references` foreign key links these tables")
-        let leftWhereArg? := (findNamed "where").orElse fun _ => findNamed "left_where"
-        let rightWhereArg? := (findNamed "right_where").orElse fun _ => findNamed "rightWhere"
+        let leftWhereArg? := findNamed "where"
+        let rightWhereArg? := findNamed "rightWhere"
         let rRowTyId    := mkIdentFrom stx rightTbl.rowTypeConst
         let rRowInvId   := mkIdentFrom stx rightTbl.rowInvConst
         let rRowInvBId  := mkIdentFrom stx rightTbl.rowInvBoolConst
@@ -547,9 +547,9 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
         let lHintLit := Syntax.mkStrLit (mkReadPolHint tbl)
         let rHintLit := Syntax.mkStrLit (
           if rightTbl.readPolicyLabel.isEmpty then
-            "Check `right_where = r => ...` against the joined table's `policy read`."
+            "Check `rightWhere = r => ...` against the joined table's `policy read`."
           else
-            s!"Ensure `right_where = r => ...` (together with `requires` / `if` guards) implies `{rightTbl.readPolicyLabel}`.")
+            s!"Ensure `rightWhere = r => ...` (together with `requires` / `if` guards) implies `{rightTbl.readPolicyLabel}`.")
         let callT ← liftM (show CommandElabM Term from
           `(Qed.Server.Db.dbJoinSelect $cfgId $qT $lColCountLit
               $decRowId $rDecRowId

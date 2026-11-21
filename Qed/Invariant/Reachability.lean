@@ -87,6 +87,8 @@ elab "qedDischargeReachable" upd:term:max initT:term:max nm:ident labelLit:str :
     evalTactic (← `(tactic|
       (simp only [$[$unfoldL],*];
        qedUnfoldPresent [];
+       try simp only [Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
+         decide_eq_true_eq, decide_eq_false_iff_not, beq_iff_eq, bne_iff_ne] at *;
        try (repeat' split);
        all_goals (first | qedFastClose | decide | omega | rfl | (simp_all; first | decide | omega | rfl | qedAutoClose) | qedAutoClose))))
   catch _ => pure ()
@@ -97,72 +99,6 @@ elab "qedDischargeReachable" upd:term:max initT:term:max nm:ident labelLit:str :
       let s ← g.withContext (Qed.Diag.ppQedExpr (← instantiateMVars (← g.getType)) [])
       unless lines.contains s do lines := lines.push s
     let body := String.intercalate "\n" (lines.toList.map fun l => s!"  • must satisfy:  {l}")
-    throwErrorAt nm m!"Reachability check `{nm.getId}` failed for `{labelLit.getString}`:\n{body}\n\nHint: Verify that the action trace reaches a state satisfying `{labelLit.getString}` (and within the step bound, if specified)."
-
-open Lean Elab Tactic in
-elab "qedDischargeWitness" nm:ident labelLit:str : tactic => do
-  try
-    evalTactic (← `(tactic|
-      (try dsimp only at *;
-       qedUnfoldPresent [];
-       try (repeat' split);
-       all_goals (first | qedFastClose | decide | omega | rfl | (simp_all; first | decide | omega | rfl | qedAutoClose) | qedAutoClose))))
-  catch _ => pure ()
-  let goals ← getUnsolvedGoals
-  unless goals.isEmpty do
-    let mut lines : Array String := #[]
-    for g in goals do
-      let s ← g.withContext (Qed.Diag.ppQedExpr (← instantiateMVars (← g.getType)) [])
-      unless lines.contains s do lines := lines.push s
-    let body := String.intercalate "\n" (lines.toList.map fun l => s!"  • unsatisfied invariant condition:  {l}")
-    throwErrorAt nm m!"Witness `{nm.getId}` violates component/state invariant (`{labelLit.getString}`):\n{body}\n\nHint: Either the invariant is overly restrictive (accidentally disallowing this intended state) or the witness fields need adjustment."
-
-section ReachParsers
-open Lean Parser Qed.Lang
-
-@[command_parser] def reachableStandaloneCmd : Parser := leading_parser
-  atomic ("invariant " >> identEq `reachable) >> ident >> ":" >> termParser >>
-  optional (symbol "within" >> numLit) >>
-  symbol "from" >> termParser >> symbol "via" >> termParser >> symbol "by" >> termParser
-
-@[command_parser] def witnessStandaloneCmd : Parser := leading_parser
-  atomic ("invariant " >> identEq `witness) >> ident >> ":" >> termParser >> symbol "satisfies" >> termParser
-
-end ReachParsers
-
-open Lean Elab Command in
-@[command_elab reachableStandaloneCmd]
-def elabReachableStandaloneCmd : CommandElab := fun stx => do
-  let name : Ident := ⟨stx.getArg 2⟩
-  let pred : Term := ⟨stx.getArg 4⟩
-  let bound? : Option (TSyntax `num) :=
-    if (stx.getArg 5).getNumArgs == 2 then some ⟨(stx.getArg 5).getArg 1⟩ else none
-  let init : Term := ⟨stx.getArg 7⟩
-  let upd : Term := ⟨stx.getArg 9⟩
-  let trace : Term := ⟨stx.getArg 11⟩
-  let lbl := Syntax.mkStrLit ((((pred.raw.reprint.getD "target").splitOn "\n").headD "target").trimAscii.toString)
-  match bound? with
-  | some bound =>
-      elabCommand (← `(command|
-        theorem $name:ident : Qed.ReachableIn $upd $init $bound ($pred) :=
-          Qed.reachableIn_of_trace $upd $init $bound ($pred) $trace
-            (by simp only [List.length_cons, List.length_nil]; omega)
-            (by qedDischargeReachable ($upd) ($init) $name $lbl)))
-  | none =>
-      elabCommand (← `(command|
-        theorem $name:ident : Qed.Reachable $upd $init ($pred) :=
-          Qed.reachable_of_trace $upd $init ($pred) $trace
-            (by qedDischargeReachable ($upd) ($init) $name $lbl)))
-
-open Lean Elab Command in
-@[command_elab witnessStandaloneCmd]
-def elabWitnessStandaloneCmd : CommandElab := fun stx => do
-  let name : Ident := ⟨stx.getArg 2⟩
-  let stateVal : Term := ⟨stx.getArg 4⟩
-  let inv : Term := ⟨stx.getArg 6⟩
-  let lbl := Syntax.mkStrLit ((((inv.raw.reprint.getD "invariant").splitOn "\n").headD "invariant").trimAscii.toString)
-  elabCommand (← `(command|
-    theorem $name:ident : ($inv) ($stateVal) := by
-      qedDischargeWitness $name $lbl))
+    throwErrorAt nm m!"Example `{nm.getId}` failed to prove `{labelLit.getString}`:\n{body}\n\nHint: Verify the action sequence reaches a state satisfying `{labelLit.getString}` (or strengthen the `where` preconditions for parametric examples)."
 
 end Qed

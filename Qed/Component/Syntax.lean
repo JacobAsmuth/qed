@@ -161,18 +161,22 @@ def compStylesheetClause : Parser := leading_parser
 def compThemeClause : Parser := leading_parser
   withPosition ("theme " >> ident)
 
-def compReachableClause : Parser := leading_parser
-  withPosition (
-    atomic (identEq `reachable) >> compInvName >> categoryParser `qedExpr 0 >>
-    optional (kw "within" >> numLit) >>
-    kw "via" >> categoryParser `qedExpr 0)
+def compExampleParam : Parser :=
+  node `Qed.compExampleParam (ident >> ":" >> categoryParser `qedType 0)
 
-def compWitnessClause : Parser := leading_parser
+def compExampleClause : Parser := leading_parser
   withPosition (
-    atomic (identEq `witness) >> compInvName >> categoryParser `qedExpr 0)
+    atomic (symbol "example" >> ident) >>
+    optional (checkNoWsBefore "" >> "(" >> sepBy1 compExampleParam "," >> ")") >>
+    optional (symbol "where" >> sepBy1 (categoryParser `qedExpr 0) ",") >>
+    ":" >>
+    sepBy1 (categoryParser `qedExpr 55) "," >>
+    "->" >>
+    categoryParser `qedExpr 0 >>
+    optional (":=" >> kw "by" >> Parser.Tactic.tacticSeq))
 
 def compInvAny : Parser :=
-  compForEachInvClause <|> compInvariantClause <|> compReachableClause <|> compWitnessClause
+  compForEachInvClause <|> compInvariantClause <|> compExampleClause
 
 def compClause : Parser :=
   compSessionClause <|> compFieldClause <|> compKeyClause <|>

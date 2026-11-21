@@ -122,11 +122,7 @@ private def recordExtRoot (n : Lean.Name) : LowerM Unit := do
 /-! ## Static AST Queries (`exprHasAwait`, `blockHasAwait`, `allPathsReturn`) -/
 
 private def matchTxStmt? (stx : Lean.Syntax) : Option (Lean.Syntax × String × Array Lean.Syntax) :=
-  let k := stx.getKind
-  if k == ``qedStmtTransaction then
-    let aliasStx := stx.getArg 1
-    some (aliasStx, aliasStx.getId.eraseMacroScopes.toString, suiteStmts (stx.getArg 3))
-  else if k == ``qedStmtDbTransaction then
+  if stx.getKind == ``qedStmtDbTransaction then
     let dotStx := stx.getArg 0
     let idNode := if dotStx.isIdent then dotStx else dotStx.getArg 0
     let aliasName := match idNode.getId.eraseMacroScopes with
@@ -1250,7 +1246,7 @@ private def lowerTxStmt (aCtx : LowerCtx) (stmt aliasRef : Syntax) (aliasName : 
     | let avail := String.intercalate ", " (aCtx.dbs.toList.map Prod.fst)
       throwErrorAt aliasRef s!"unknown database alias `{aliasName}` in `transaction` (declared `use` databases: [{avail}])"
   if let some (curAlias, _) := aCtx.activeDbTx? then
-    throwErrorAt stmt s!"nested database transactions are not supported (already inside `transaction {curAlias}`)"
+    throwErrorAt stmt s!"nested database transactions are not supported (already inside `{curAlias}.transaction:`)"
   let txId ← freshIdent "_dbTxId"
   let cfgId := mkIdentFrom aliasRef dbInfo.configConst
   let txCtx := { aCtx with activeDbTx? := some (aliasName, txId) }

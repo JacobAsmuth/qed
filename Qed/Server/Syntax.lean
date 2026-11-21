@@ -147,9 +147,6 @@ private def identDotTransaction : Parser :=
       | .str (.str .anonymous _) "transaction" => s'
       | _ => s.mkError "expected `<db>.transaction`") Parser.ident
 
-@[qedStmt_parser] def qedStmtTransaction : Parser := leading_parser
-  withPosition (atomic (identEq `transaction >> ident >> ":") >> qedSuite)
-
 @[qedStmt_parser] def qedStmtDbTransaction : Parser := leading_parser
   withPosition (atomic (identDotTransaction >> ":") >> qedSuite)
 

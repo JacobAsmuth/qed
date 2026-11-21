@@ -661,7 +661,7 @@ private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : Mon
   | .ok bs => c.checkEq s!"[{label}] empty min == none" (Qed.Proto.decode (α := Option Nat) bs) (.ok none)
   | .error e => c.check s!"[{label}] empty min" false e.message
 
-  -- 1. Multi-statement verified DB transaction (`transaction db:` commit + `atomic:` state update)
+  -- 1. Multi-statement verified DB transaction (`db.transaction:` commit + `atomic:` state update)
   let mkTxReq (aid aname iid title : String) (price : Nat) :=
     Qed.Proto.encode (aid, (aname, (iid, (title, price))))
   match ← callShop aliceCtx "createAuthorAndItem" (mkTxReq "a1" "Ada Lovelace" "i1" "Lean 4 Proofs" 100) with
@@ -669,7 +669,7 @@ private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : Mon
       let okItem := match Qed.Proto.decode (α := Except (Qed.RpcDomainError DbChecks.ShopApi.createAuthorAndItem.Error) DbChecks.ShopDb.items) bs with
         | .ok (.ok it) => it.id == "i1" && it.price == 100
         | _ => false
-      c.check s!"[{label}] transaction db: committed author + item" okItem
+      c.check s!"[{label}] db.transaction: committed author + item" okItem
   | .error e => c.check s!"[{label}] createAuthorAndItem(i1)" false e.message
 
   match ← callShop aliceCtx "createAuthorAndItem" (mkTxReq "a2" "Alan Turing" "i2" "Lean 4 Compilers" 250) with

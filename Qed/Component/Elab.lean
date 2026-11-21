@@ -19,9 +19,8 @@ private def elabPureCompInvariants (spec : ComponentSpec) (viewId : Ident) (msgV
   let tId := spec.t.getId
   for invStx in spec.invariants do
     if invStx.getKind == ``compForEachInvClause ||
-       invStx.getKind == ``compReachableClause ||
-       invStx.getKind == ``compWitnessClause then
-      throwErrorAt invStx "a pure component has no local state; `for_each`, `reachable`, and `witness` apply to stateful components"
+       invStx.getKind == ``compExampleClause then
+      throwErrorAt invStx "a pure component has no local state; `for_each` and `example` apply to stateful components"
     let invId := resolveInvIdent invStx tId
     let rawClauses := (invStx.getArg 2).getSepArgs
     let loweredClauses ← rawClauses.mapM (lowerCompExpr .val)

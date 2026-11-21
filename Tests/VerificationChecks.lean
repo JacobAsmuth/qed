@@ -3,30 +3,23 @@ open Qed
 
 namespace VerificationChecks
 
-/-! ## 1A. Schema `witness`, `satisfiable`, and Vacuity Detection -/
+/-! ## 1A. Schema `example` & Automatic Vacuity Detection -/
 
-schema OrderWithWitness:
+schema OrderWithExample:
   name        : String where 1 <= name.length, name.length <= 40
   quantity    : Nat    where 1 <= quantity, quantity <= 10
   acceptTerms : Bool   where acceptTerms == true
-  witness { name = "Alice", quantity = 3, acceptTerms = true }
+  example { name = "Alice", quantity = 3, acceptTerms = true }
 
-example : ∃ _x : OrderWithWitness, True := OrderWithWitness.satisfiable
-example : Nonempty OrderWithWitness := inferInstance
-example : OrderWithWitness.witness.quantity.val = 3 := rfl
+example : ∃ _x : OrderWithExample, True := OrderWithExample.satisfiable
+example : Nonempty OrderWithExample := inferInstance
+example : OrderWithExample.sample.quantity.val = 3 := rfl
 
 schema BoundedQty:
   quantity : Nat where 10 <= quantity, quantity <= 20
 
 example : ∃ _x : BoundedQty, True := BoundedQty.satisfiable
 example : Nonempty BoundedQty := inferInstance
-
-schema ExplicitSat:
-  score : Nat where 50 <= score, score <= 100
-  active : Bool where active == true
-  satisfiable
-
-example : ∃ _x : ExplicitSat, True := ExplicitSat.satisfiable
 
 -- Negative: contradictory Nat `where` clauses are caught at compile time
 /--
@@ -48,97 +41,92 @@ Hint: Fix or remove the conflicting `where` conditions on `flag`.
 schema UnsatBool:
   flag : Bool where flag == true, flag == false
 
--- Negative: witness failing a `where` constraint emits clear diagnostic
+-- Negative: example failing a `where` constraint emits clear diagnostic
 /--
-error: Schema `BadWitnessVal` witness failed `where` constraint on field `quantity`:
+error: Schema `BadExampleVal` example failed `where` constraint on field `quantity`:
   • value `99` does not satisfy `1 <= quantity, quantity <= 10`
 
-Hint: Update the `witness` value for `quantity` so it satisfies `1 <= quantity, quantity <= 10`, or weaken the `where` rule.
+Hint: Update the `example` value for `quantity` so it satisfies `1 <= quantity, quantity <= 10`, or weaken the `where` rule.
 -/
 #guard_msgs in
-schema BadWitnessVal:
+schema BadExampleVal:
   name     : String where 1 <= name.length
   quantity : Nat    where 1 <= quantity, quantity <= 10
-  witness { name = "Alice", quantity = 99 }
+  example { name = "Alice", quantity = 99 }
 
--- Negative: witness missing a required field
+-- Negative: example missing a required field
 /--
-error: schema `MissingWitnessField` `witness`: missing required field `quantity`
+error: schema `MissingExampleField` `example`: missing required field `quantity`
 -/
 #guard_msgs in
-schema MissingWitnessField:
+schema MissingExampleField:
   name     : String where 1 <= name.length
   quantity : Nat    where 1 <= quantity
-  witness { name = "Alice" }
+  example { name = "Alice" }
 
--- Negative: explicit `satisfiable` fails with actionable hint when no witness can be auto-synthesized
-/--
-error: Schema `HardSat`: could not automatically synthesize a witness for field `code` satisfying `code.length == 70`.
-
-Hint: Add an explicit `witness { ... }` clause to `HardSat` to prove satisfiability.
--/
-#guard_msgs in
-schema HardSat:
-  code : String where code.length == 70
-  satisfiable
-
-/-! ## 1B. Invariant Non-Vacuity & Reachability Checks -/
+/-! ## 1B. Unified Component `example` (Concrete & Universally Quantified Parametric Proofs) -/
 
 component ReachCounter:
   state count : Nat = 0
-  action inc:
-    if count < 10:
-      count += 1
+  action inc(n: Nat):
+    if count + n <= 10:
+      count += n
   action reset:
     count = 0
   invariant bounded: count <= 10
-  reachable canReach3: count == 3 via [.inc, .inc, .inc]
-  reachable canReach2In3: count == 2 within 3 via [.inc, .inc]
-  witness midState: { count = 5 }
+
+  -- Concrete single-step & multi-step examples
+  example canAdd5:    .inc(5) -> count == 5
+  example canReach8:  .inc(5), .inc(3) -> count == 8
+  example staysCap:   .inc(5), .inc(9) -> count == 5
+
+  -- Universally quantified parametric proofs (for ALL values satisfying `where`!)
+  example addAny(n: Nat) where n <= 10:               .inc(n) -> count == n
+  example addTwo(a: Nat, b: Nat) where a + b <= 10:   .inc(a), .inc(b) -> count == a + b
+  example addThenReset(n: Nat):                       .inc(n), .reset -> count == 0
+  example ignoreOverflow(n: Nat) where n > 10:        .inc(n) -> count == 0
+
   view:
     <div>
-      <button onClick={.inc}>Add</button>
+      <button onClick={.inc(1)}>Add</button>
       <span>{count}</span>
     </div>
 
-example : ∃ s : ReachCounter.State, s.count ≤ 10 ∧ s.count = 3 :=
-  Qed.inv_nonvacuous_of_reachable ReachCounter.canReach3 ReachCounter.bounded.1 ReachCounter.bounded.2
+example : ∃ s : ReachCounter.State, s.count ≤ 10 ∧ s.count = 5 :=
+  Qed.inv_nonvacuous_of_reachable ReachCounter.canAdd5 ReachCounter.bounded.1 ReachCounter.bounded.2
 
--- Standalone `invariant reachable` and `invariant witness` commands
-invariant reachable standaloneReach : (fun s : ReachCounter.State => s.count = 2) within 2
-  from ReachCounter.init via ReachCounter.update by [.inc, .inc]
+example (n : Nat) (h : n ≤ 10) : ∃ s : ReachCounter.State, s.count ≤ 10 ∧ s.count = n :=
+  Qed.inv_nonvacuous_of_reachable (ReachCounter.addAny n h) ReachCounter.bounded.1 ReachCounter.bounded.2
 
-invariant witness standaloneWitness : ({ count := 7 } : ReachCounter.State)
-  satisfies (fun s : ReachCounter.State => s.count ≤ 10)
-
--- Negative: `reachable` fails when trace does not reach the target state
+-- Negative: concrete `example` fails when trace does not reach the target state
 /--
-error: Reachability check `BadReach.cantReach5` failed for `count == 5`:
+error: Example `BadReach.cantReach5` failed to prove `count == 5`:
   • must satisfy:  False
 
-Hint: Verify that the action trace reaches a state satisfying `count == 5` (and within the step bound, if specified).
+Hint: Verify the action sequence reaches a state satisfying `count == 5` (or strengthen the `where` preconditions for parametric examples).
 -/
 #guard_msgs in
 component BadReach:
   state count : Nat = 0
   action inc:
     count += 1
-  reachable cantReach5: count == 5 via [.inc, .inc]
+  example cantReach5: .inc, .inc -> count == 5
   view: <span>{count}</span>
 
--- Negative: `witness` catches overly restrictive invariant disallowing intended state
+-- Negative: universally quantified `example` fails when `where` precondition is missing/too weak
 /--
-error: Witness `OverlyStrictInv.midState` violates component/state invariant (`OverlyStrictInv.tooStrict`):
-  • unsatisfied invariant condition:  False
+error: Example `BadParamReach.addTooMuch` failed to prove `count == n`:
+  • must satisfy:  0 = n
 
-Hint: Either the invariant is overly restrictive (accidentally disallowing this intended state) or the witness fields need adjustment.
+Hint: Verify the action sequence reaches a state satisfying `count == n` (or strengthen the `where` preconditions for parametric examples).
 -/
 #guard_msgs in
-component OverlyStrictInv:
+component BadParamReach:
   state count : Nat = 0
-  action noop: pass
-  invariant tooStrict: count == 0
-  witness midState: { count = 5 }
+  action inc(n: Nat):
+    if count + n <= 10:
+      count += n
+  example addTooMuch(n: Nat): .inc(n) -> count == n
   view: <span>{count}</span>
 
 /-! ## 2. Compile-Time Accessibility (A11y) Proofs -/

@@ -48,12 +48,12 @@ server VaultApi:
   use db : VaultDb
 
   def listBooks() -> VaultDb.books[]!:
-    return await db.books.select(order_by = "id")?
+    return await db.books.select(orderBy = "id")?
 
   def listMyNotes() -> VaultDb.notes[]!:
     requires ctx.userId != none
     let uid = ctx.userId.getD("")
-    return await db.notes.select(where = r => r.ownerId == uid, order_by = "-version", limit = 50)?
+    return await db.notes.select(where = r => r.ownerId == uid, orderBy = "-version", limit = 50)?
 
   def getNote(noteId: Nat) -> VaultDb.notes?!:
     requires ctx.userId != none
@@ -444,7 +444,7 @@ server ShopApi:
     let uid = ctx.userId.getD("")
     return await db.items.select(
       where = r => r.ownerId == uid and ids.contains(r.id),
-      order_by = "id",
+      orderBy = "id",
       limit = 50,
       offset = 0
     )?
@@ -470,7 +470,7 @@ server ShopApi:
     return await db.items.join(
       table = authors,
       where = r => r.ownerId == uid,
-      order_by = "-price",
+      orderBy = "-price",
       limit = 25,
       offset = 0
     )?
@@ -491,7 +491,7 @@ server ShopApi:
     ensures result.id == iid, result.price == price
     let uid = ctx.userId.getD("")
     if not (1 <= uid.length <= 64): return fail(.badUser)
-    transaction db:
+    db.transaction:
       let _a = await db.authors.insert(id = aid, name = aname)?
       let created = await db.items.insert(id = iid, authorId = aid, ownerId = uid, title = title, price = price)?
       atomic:
@@ -530,7 +530,7 @@ server BadAggNoPolicy:
 error: Database read policy `ShopDb.privateProfiles.read` (joined table) failed in `leakProfileJoin → ShopDb.secretLogs.join`:
   • must prove: some ownerId = ctx.userId
 
-Hint: Ensure `right_where = r => ...` (together with `requires` / `if` guards) implies `some(row.ownerId) == ctx.userId`.
+Hint: Ensure `rightWhere = r => ...` (together with `requires` / `if` guards) implies `some(row.ownerId) == ctx.userId`.
 -/
 #guard_msgs in
 server BadJoinRightPolicy:
@@ -543,7 +543,7 @@ server BadJoinRightPolicy:
       where = r => r.ownerId == uid
     )?
 
--- 15. Negative: policy violation inside a `transaction db:` block is still rejected!
+-- 15. Negative: policy violation inside a `db.transaction:` block is still rejected!
 /--
 error: Database insert policy `ShopDb.items.insert` failed in `badTxInsert → ShopDb.items.insert`:
   • must prove: some "victim" = ctx.userId
@@ -556,7 +556,7 @@ server BadTxPolicy:
   def badTxInsert(aid: String, iid: String) -> ShopDb.items!:
     requires ctx.userId != none
     requires 1 <= aid.length <= 64, 1 <= iid.length <= 64
-    transaction db:
+    db.transaction:
       return await db.items.insert(id = iid, authorId = aid, ownerId = "victim", title = "oops", price = 10)?
 
 end DbChecks

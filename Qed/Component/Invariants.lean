@@ -171,7 +171,7 @@ def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) :
   let msgId := mkIdent (tId ++ `Msg)
   let mut statePreds : Array (Term × Option Ident) := #[]
   for invStx in spec.invariants do
-    if invStx.getKind == ``compReachableClause || invStx.getKind == ``compWitnessClause then
+    if invStx.getKind == ``compExampleClause then
       continue
     if invStx.getKind == ``compForEachInvClause then
       let isStyled ← isForEachStyled invStx
@@ -215,61 +215,62 @@ def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) :
   return statePreds
 
 def elabCompReachableAndWitnesses (spec : ComponentSpec)
-    (stateInvEntries : Array (Term × Option Ident)) : CommandElabM Unit := do
+    (_stateInvEntries : Array (Term × Option Ident)) : CommandElabM Unit := do
   let tId      := spec.t.getId
   let stateId  := mkIdent (tId ++ `State)
   let msgId    := mkIdent (tId ++ `Msg)
   let initId   := mkIdent (tId ++ `init)
   let updateId := mkIdent (tId ++ `update)
   for cl in spec.invariants do
-    if cl.getKind == ``compReachableClause then
+    if cl.getKind == ``compExampleClause then
       unless spec.mountable && !spec.hasProps do
-        throwErrorAt cl "`reachable` inside a `component` requires a mountable component without `prop`s (use the standalone `reachable` command with explicit props instead)"
-      let thmId := resolveInvIdent cl tId
-      let rawGoal := cl.getArg 2
-      let bound? : Option (TSyntax `num) :=
-        if (cl.getArg 3).getNumArgs == 2 then some ⟨(cl.getArg 3).getArg 1⟩ else none
-      let rawTrace := cl.getArg 5
+        throwErrorAt cl "`example` inside a `component` requires a mountable component without `prop`s"
+      let nameIdent : Ident := ⟨cl.getArg 1⟩
+      let thmId := mkIdentFrom nameIdent (tId ++ nameIdent.getId.eraseMacroScopes)
+      -- Parse optional `(p1 : T1, p2 : T2, ...)` universally quantified parameters
+      let mut paramBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) := #[]
+      let mut paramNames : Array Name := #[]
+      if (cl.getArg 2).getNumArgs == 3 then
+        for pStx in ((cl.getArg 2).getArg 1).getSepArgs do
+          let pId : Ident := ⟨pStx.getArg 0⟩
+          let pName := pId.getId.eraseMacroScopes
+          if spec.allNames.contains pName then
+            throwErrorAt pId s!"`example` parameter `{pName}` shadows a field of `{tId}`; rename the parameter"
+          let (pTy, _) ← liftMacroM <| Qed.Lang.lowerQedType (pStx.getArg 2) false
+          paramBinders := paramBinders.push (← `(bracketedBinder| ($pId:ident : $pTy:term)))
+          paramNames := paramNames.push pName
+      -- Parse optional `where cond1, cond2, ...` preconditions (bound separately for `omega`/`simp_all`)
+      let mut whereBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) := #[]
+      if (cl.getArg 3).getNumArgs == 2 then
+        let whereExprs := ((cl.getArg 3).getArg 1).getSepArgs
+        for (wStx, idx) in whereExprs.zipIdx do
+          let wProp ← lowerCompExpr .propInv wStx
+          let hId := mkIdentFrom wStx (Name.mkSimple s!"_hWhere{idx}")
+          whereBinders := whereBinders.push (← `(bracketedBinder| ($hId:ident : $wProp:term)))
+      let allBinders := paramBinders ++ whereBinders
+      -- Parse comma-separated action sequence `act1, act2, ...`
+      let rawActs := (cl.getArg 5).getSepArgs
+      let actTerms ← rawActs.mapM (lowerCompExpr .val)
+      let traceTerm : Term ← `(([$[$actTerms:term],*] : List $msgId))
+      -- Parse expected state goal after `->`
+      let rawGoal := cl.getArg 7
       let goalTerm ← lowerCompExpr .propInv rawGoal
-      let pred ← `(fun (s : $stateId) => $(← bindMentionedFields spec (mentionsIdent goalTerm.raw) goalTerm))
-      let uTrace := Qed.Lang.unwrapParens1 rawTrace
-      let traceTerm : Term ←
-        if uTrace.getKind == ``Qed.Lang.qedArrLit then do
-          let elems ← (uTrace.getArg 1).getSepArgs.mapM (lowerCompExpr .val)
-          `(([$[$elems:term],*] : List $msgId))
-        else do
-          let t ← lowerCompExpr .val rawTrace
-          `(($t : List $msgId))
+      let pred ← `(fun (s : $stateId) => $(← bindMentionedFields spec (fun nm => !paramNames.contains nm && mentionsIdent goalTerm.raw nm) goalTerm))
       let lbl := Syntax.mkStrLit ((((rawGoal.reprint.getD "target").splitOn "\n").headD "target").trimAscii.toString)
-      match bound? with
-      | some bound =>
+      let customPf? : Option (TSyntax `Lean.Parser.Tactic.tacticSeq) :=
+        if (cl.getArg 8).getNumArgs == 3 then some ⟨(cl.getArg 8).getArg 2⟩ else none
+      match customPf? with
+      | some tacSeq =>
           elabCommand (← `(command|
-            theorem $thmId:ident : Qed.ReachableIn $updateId $initId $bound ($pred) :=
-              Qed.reachableIn_of_trace $updateId $initId $bound ($pred) $traceTerm
-                (by simp only [List.length_cons, List.length_nil]; omega)
-                (by qedDischargeReachable $updateId $initId $thmId $lbl)))
+            theorem $thmId:ident $[$allBinders:bracketedBinder]* :
+                Qed.Reachable $updateId $initId ($pred) :=
+              Qed.reachable_of_trace $updateId $initId ($pred) $traceTerm (by $tacSeq)))
       | none =>
           elabCommand (← `(command|
-            theorem $thmId:ident : Qed.Reachable $updateId $initId ($pred) :=
+            theorem $thmId:ident $[$allBinders:bracketedBinder]* :
+                Qed.Reachable $updateId $initId ($pred) :=
               Qed.reachable_of_trace $updateId $initId ($pred) $traceTerm
                 (by qedDischargeReachable $updateId $initId $thmId $lbl)))
-    else if cl.getKind == ``compWitnessClause then
-      let thmId := resolveInvIdent cl tId
-      let rawState := cl.getArg 2
-      let stateTerm ← lowerCompExpr .val rawState
-      let wStateId := mkIdentFrom thmId (thmId.getId.appendAfter "_state")
-      elabCommand (← `(command| def $wStateId:ident : $stateId := $stateTerm))
-      if stateInvEntries.isEmpty then
-        elabCommand (← `(command| theorem $thmId:ident : Nonempty $stateId := ⟨$wStateId⟩))
-      else
-        let checks ← stateInvEntries.mapM fun (p, _) => `(($p) $wStateId)
-        let goal ← mkConjBody checks
-        let invNames := stateInvEntries.filterMap fun (_, id?) => id?.map (·.getId.toString)
-        let lbl := Syntax.mkStrLit (if invNames.isEmpty then "component invariant" else String.intercalate ", " invNames.toList)
-        elabCommand (← `(command|
-          theorem $thmId:ident : $goal := by
-            dsimp only [$wStateId:ident]
-            qedDischargeWitness $thmId $lbl))
 
 
 end CompElab

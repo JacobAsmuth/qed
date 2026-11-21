@@ -391,13 +391,11 @@ def schemaFieldCall : Parser := node `Qed.schemaFieldCall
 def schemaFieldSpec : Parser := schemaFieldJsonOnly <|> schemaFieldCall <|> categoryParser `qedType 0
 def schemaFieldP : Parser := node `Qed.schemaField (withPosition
   (ident >> ":" >> schemaFieldSpec >> optional (checkColGt >> " where " >> sepBy1 (categoryParser `qedExpr 0) ",")))
-def schemaWitnessFieldP : Parser := node `Qed.schemaWitnessField
+def schemaExampleFieldP : Parser := node `Qed.schemaExampleField
   (ident >> "=" >> categoryParser `qedExpr 0)
-def schemaWitnessP : Parser := node `Qed.schemaWitness (withPosition
-  (atomic (identEq `witness >> "{") >> sepBy schemaWitnessFieldP "," >> "}"))
-def schemaSatisfiableP : Parser := node `Qed.schemaSatisfiable (withPosition
-  (atomic (identEq `satisfiable >> notFollowedBy (symbol ":") ":")))
-def schemaItemP : Parser := schemaWitnessP <|> schemaSatisfiableP <|> schemaFieldP
+def schemaExampleP : Parser := node `Qed.schemaExample (withPosition
+  (atomic (symbol "example" >> "{") >> sepBy schemaExampleFieldP "," >> "}"))
+def schemaItemP : Parser := schemaExampleP <|> schemaFieldP
 @[command_parser] def schemaCmd : Parser := leading_parser withPosition
   ("schema " >> ident >> optional (checkLineEq >> "(" >> sepBy1 schemaCtxParamP "," >> ")") >> ":" >>
     checkColGt "expected indented `schema` fields" >> many1Indent schemaItemP)
@@ -980,27 +978,27 @@ private def synthesizeFieldWitness? (inp : Term) (isRefined : Bool) (rawWheres :
   return none
 
 open Lean Elab Command Term Meta in
-private def elabSchemaWitnessClause (t : Ident) (cbns : Array Ident) (cbts : Array Term)
+private def elabSchemaExampleClause (t : Ident) (cbns : Array Ident) (cbts : Array Term)
     (tApp : TSyntax `term) (appTo : TSyntax `term → CommandElabM (TSyntax `term))
     (fs : Array Ident) (inputs : Array Term) (refined : Array Bool)
-    (whereLabels : Array String) (witnessStx : Syntax) : CommandElabM Unit := do
+    (whereLabels : Array String) (exStx : Syntax) : CommandElabM Unit := do
   let tId := t.getId
   let validNames := fs.toList.map (·.getId.toString)
-  let rawEntries := (witnessStx.getArg 2).getSepArgs
+  let rawEntries := (exStx.getArg 2).getSepArgs
   let mut provided : Std.HashMap String (Syntax × Syntax) := {}
   for entry in rawEntries do
     let fid : Ident := ⟨entry.getArg 0⟩
     let fName := fid.getId.toString
     unless validNames.contains fName do
       let hint := Qed.Diag.didYouMean fName validNames
-      throwErrorAt fid s!"schema `{tId}` `witness`: unknown field `{fName}`{hint} (expected: {String.intercalate ", " validNames})"
+      throwErrorAt fid s!"schema `{tId}` `example`: unknown field `{fName}`{hint} (expected: {String.intercalate ", " validNames})"
     if provided.contains fName then
-      throwErrorAt fid s!"schema `{tId}` `witness`: duplicate field `{fName}`"
+      throwErrorAt fid s!"schema `{tId}` `example`: duplicate field `{fName}`"
     provided := provided.insert fName (fid.raw, entry.getArg 2)
   for f in fs do
     let fName := f.getId.toString
     unless provided.contains fName do
-      throwErrorAt witnessStx s!"schema `{tId}` `witness`: missing required field `{fName}`"
+      throwErrorAt exStx s!"schema `{tId}` `example`: missing required field `{fName}`"
   let pfTac ← mkSchemaWhereProofTac
   let mut fieldTerms : Array Term := #[]
   for i in [0:fs.size] do
@@ -1014,32 +1012,28 @@ private def elabSchemaWitnessClause (t : Ident) (cbns : Array Ident) (cbts : Arr
         unless ← tryCheckPropWithTactic goal pfTac do
           let valStr := (valStx.reprint.getD "<value>").trimAscii.toString
           let ruleStr := whereLabels[i]!
-          throwErrorAt valStx m!"Schema `{tId}` witness failed `where` constraint on field `{fName}`:\n  • value `{valStr}` does not satisfy `{ruleStr}`\n\nHint: Update the `witness` value for `{fName}` so it satisfies `{ruleStr}`, or weaken the `where` rule."
+          throwErrorAt valStx m!"Schema `{tId}` example failed `where` constraint on field `{fName}`:\n  • value `{valStr}` does not satisfy `{ruleStr}`\n\nHint: Update the `example` value for `{fName}` so it satisfies `{ruleStr}`, or weaken the `where` rule."
       fieldTerms := fieldTerms.push (← `(Qed.Field.mk (p := ($(inputs[i]!)).valid) $valTerm (by $pfTac:tactic)))
     else
       fieldTerms := fieldTerms.push valTerm
-  let witnessId := mkIdentFrom witnessStx (tId ++ `witness)
-  let satId := mkIdentFrom witnessStx (tId ++ `satisfiable)
-  let witnessApp ← appTo ⟨witnessId.raw⟩
+  let sampleId := mkIdentFrom exStx (tId ++ `sample)
+  let satId := mkIdentFrom exStx (tId ++ `satisfiable)
+  let sampleApp ← appTo ⟨sampleId.raw⟩
   elabCommand (← `(command|
-    def $witnessId $[($cbns:ident : $cbts:term)]* : $tApp := { $[$fs:ident := $fieldTerms:term],* }))
+    def $sampleId $[($cbns:ident : $cbts:term)]* : $tApp := { $[$fs:ident := $fieldTerms:term],* }))
   elabCommand (← `(command|
-    theorem $satId $[($cbns:ident : $cbts:term)]* : ∃ _x : $tApp, True := ⟨$witnessApp, trivial⟩))
+    theorem $satId $[($cbns:ident : $cbts:term)]* : ∃ _x : $tApp, True := ⟨$sampleApp, trivial⟩))
   if cbns.isEmpty then
-    let nonEmptyId := mkIdentFrom witnessStx (tId ++ `instNonempty)
+    let nonEmptyId := mkIdentFrom exStx (tId ++ `instNonempty)
     elabCommand (← `(command|
-      instance $nonEmptyId:ident : Nonempty $t := ⟨$witnessId⟩))
+      instance $nonEmptyId:ident : Nonempty $t := ⟨$sampleId⟩))
 
 open Lean Elab Command Term Meta in
 private def elabSchemaAutoSatisfiability (t : Ident) (cbns : Array Ident)
     (fs : Array Ident) (inputs : Array Term) (refined : Array Bool)
-    (whereRawExprs : Array (Array Syntax)) (whereLabels : Array String)
-    (satStx? : Option Syntax) : CommandElabM Unit := do
+    (whereRawExprs : Array (Array Syntax)) (whereLabels : Array String) : CommandElabM Unit := do
   let tId := t.getId
-  if !cbns.isEmpty then
-    if let some sRef := satStx? then
-      throwErrorAt sRef s!"schema `{tId}` has context parameters; add an explicit `witness \{ ... }` clause to prove satisfiability"
-    return
+  if !cbns.isEmpty then return
   -- 1. Catch provably contradictory `where` constraints on any refined field.
   for i in [0:fs.size] do
     if refined[i]! then
@@ -1049,25 +1043,18 @@ private def elabSchemaAutoSatisfiability (t : Ident) (cbns : Array Ident)
         throwErrorAt f m!"Schema `{tId}` is unsatisfiable: field `{f.getId}` has contradictory `where` constraints (`{ruleStr}`) — no value can ever satisfy it.\n\nHint: Fix or remove the conflicting `where` conditions on `{f.getId}`."
   -- 2. Auto-synthesize a concrete witness for bounded / standard schemas.
   let mut synthTerms : Array Term := #[]
-  let mut missingField? : Option (Ident × String) := none
+  let mut allOk := true
   for i in [0:fs.size] do
     match ← synthesizeFieldWitness? inputs[i]! refined[i]! whereRawExprs[i]! with
     | some ft => synthTerms := synthTerms.push ft
-    | none =>
-        if missingField?.isNone then
-          missingField? := some (fs[i]!, whereLabels[i]!)
-  match missingField? with
-  | none =>
-      let satId := mkIdentFrom t (tId ++ `satisfiable)
-      let nonEmptyId := mkIdentFrom t (tId ++ `instNonempty)
-      elabCommand (← `(command|
-        theorem $satId : ∃ _x : $t, True := ⟨{ $[$fs:ident := $synthTerms:term],* }, trivial⟩))
-      elabCommand (← `(command|
-        instance $nonEmptyId:ident : Nonempty $t := ⟨{ $[$fs:ident := $synthTerms:term],* }⟩))
-  | some (f, ruleStr) =>
-      if let some sRef := satStx? then
-        let condNote := if ruleStr.isEmpty then "" else s!" satisfying `{ruleStr}`"
-        throwErrorAt sRef m!"Schema `{tId}`: could not automatically synthesize a witness for field `{f.getId}`{condNote}.\n\nHint: Add an explicit `witness \{ ... }` clause to `{tId}` to prove satisfiability."
+    | none    => allOk := false; break
+  if allOk then
+    let satId := mkIdentFrom t (tId ++ `satisfiable)
+    let nonEmptyId := mkIdentFrom t (tId ++ `instNonempty)
+    elabCommand (← `(command|
+      theorem $satId : ∃ _x : $t, True := ⟨{ $[$fs:ident := $synthTerms:term],* }, trivial⟩))
+    elabCommand (← `(command|
+      instance $nonEmptyId:ident : Nonempty $t := ⟨{ $[$fs:ident := $synthTerms:term],* }⟩))
 
 open Lean Elab Command Term in
 @[command_elab schemaCmd] def elabSchemaCmd : CommandElab
@@ -1078,18 +1065,13 @@ open Lean Elab Command Term in
       let cbts ← rawCtx.mapM fun cp => liftMacroM (return (← Qed.Lang.lowerQedType (cp.getArg 2) false).1)
       let itemStxs := (stx.getArg 4).getArgs
       let mut fStxs : Array Syntax := #[]
-      let mut witnessStx? : Option Syntax := none
-      let mut satStx? : Option Syntax := none
+      let mut exampleStx? : Option Syntax := none
       for item in itemStxs do
         let k := item.getKind
-        if k == `Qed.schemaWitness then
-          if witnessStx?.isSome then
-            throwErrorAt item s!"duplicate `witness` clause in `schema {t.getId}`"
-          witnessStx? := some item
-        else if k == `Qed.schemaSatisfiable then
-          if satStx?.isSome then
-            throwErrorAt item s!"duplicate `satisfiable` clause in `schema {t.getId}`"
-          satStx? := some item
+        if k == `Qed.schemaExample then
+          if exampleStx?.isSome then
+            throwErrorAt item s!"duplicate `example` clause in `schema {t.getId}`"
+          exampleStx? := some item
         else
           fStxs := fStxs.push item
       if fStxs.isEmpty then
@@ -1133,11 +1115,11 @@ open Lean Elab Command Term in
       let protoCmds ← mkSchemaProtoCmds t cbns cbts tApp appTo fs inputs refined jsonReads allProto allLawfulProto
       for c in #[draftStructCmd, coreStructCmd] ++ draftCmds ++ coreCmds ++ jsonCmds ++ protoCmds do
         elabCommand c
-      match witnessStx? with
-      | some wStx =>
-          elabSchemaWitnessClause t cbns cbts tApp appTo fs inputs refined whereLabels wStx
+      match exampleStx? with
+      | some eStx =>
+          elabSchemaExampleClause t cbns cbts tApp appTo fs inputs refined whereLabels eStx
       | none =>
-          elabSchemaAutoSatisfiability t cbns fs inputs refined whereRawExprs whereLabels satStx?
+          elabSchemaAutoSatisfiability t cbns fs inputs refined whereRawExprs whereLabels
       let ns ← getCurrNamespace
       let fullSchema := ns ++ tId
       let info : SchemaFormInfo := {

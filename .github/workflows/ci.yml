@@ -11,8 +11,12 @@ concurrency:
 
 jobs:
   verify-and-test:
-    name: Verify Proofs & Run Test Suites
-    runs-on: ubuntu-latest
+    name: Verify Proofs & Run Test Suites (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
 
     steps:
@@ -31,12 +35,19 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.elan
-          key: ${{ runner.os }}-elan-${{ hashFiles('lean-toolchain') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-elan-${{ hashFiles('lean-toolchain') }}
 
       - name: Install elan (Lean toolchain manager)
         run: |
           if [ ! -x "$HOME/.elan/bin/lake" ]; then
-            curl -sSfL https://github.com/leanprover/elan/releases/latest/download/elan-x86_64-unknown-linux-gnu.tar.gz \
+            case "$(uname -sm)" in
+              "Linux x86_64")   TRIPLE="x86_64-unknown-linux-gnu" ;;
+              "Linux aarch64")  TRIPLE="aarch64-unknown-linux-gnu" ;;
+              "Darwin arm64")   TRIPLE="aarch64-apple-darwin" ;;
+              "Darwin x86_64")  TRIPLE="x86_64-apple-darwin" ;;
+              *) echo "unsupported platform $(uname -sm)" >&2; exit 1 ;;
+            esac
+            curl -sSfL "https://github.com/leanprover/elan/releases/latest/download/elan-${TRIPLE}.tar.gz" \
               | tar -xz -C /tmp
             /tmp/elan-init -y --default-toolchain none
           fi
@@ -47,28 +58,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .lake/build
-          key: ${{ runner.os }}-lake-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-${{ github.sha }}
+          key: ${{ runner.os }}-${{ runner.arch }}-lake-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-lake-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: test/package-lock.json
-
-      - name: Install Chromium runtime libraries
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libgbm1 \
-            libgtk-3-0 libnspr4 libnss3 libxcomposite1 libxdamage1 \
-            libxfixes3 libxkbcommon0 libxrandr2 xdg-utils \
-            $(apt-cache show libasound2t64 >/dev/null 2>&1 && echo libasound2t64 || echo libasound2)
-
-      - name: Install browser test dependencies
-        run: npm ci --prefix test
+            ${{ runner.os }}-${{ runner.arch }}-lake-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json') }}-
 
       - name: Build CLI and verify proofs, axioms & gates
         run: ./scripts/qed check

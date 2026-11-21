@@ -9,62 +9,6 @@ open Qed.Server.Http
 
 namespace Tests.Native.FullstackRpc
 
-private def decodeBase64Url (s : String) : ByteArray :=
-  let std := (s.replace "-" "+").replace "_" "/"
-  let pad := (4 - std.length % 4) % 4
-  let padded := std ++ String.ofList (List.replicate pad '=')
-  let valOf (c : Char) : Nat :=
-    let n := c.toNat
-    if 65 ≤ n && n ≤ 90 then n - 65
-    else if 97 ≤ n && n ≤ 122 then n - 71
-    else if 48 ≤ n && n ≤ 57 then n + 4
-    else if c == '+' then 62
-    else if c == '/' then 63
-    else 255
-  Id.run do
-    let cs := padded.toList.toArray
-    let mut out := ByteArray.empty
-    let mut i := 0
-    while i + 3 < cs.size do
-      let c0 := valOf cs[i]!
-      let c1 := valOf cs[i + 1]!
-      let c2 := valOf cs[i + 2]!
-      let c3 := valOf cs[i + 3]!
-      if c0 < 64 && c1 < 64 then
-        out := out.push (UInt8.ofNat ((c0 <<< 2) ||| (c1 >>> 4)))
-        if cs[i + 2]! != '=' && c2 < 64 then
-          out := out.push (UInt8.ofNat (((c1 &&& 0xF) <<< 4) ||| (c2 >>> 2)))
-          if cs[i + 3]! != '=' && c3 < 64 then
-            out := out.push (UInt8.ofNat (((c2 &&& 0x3) <<< 6) ||| c3))
-      i := i + 4
-    return out
-
-private def urlDecodeForm (s : String) : String :=
-  let s := s.replace "+" " "
-  let cs := s.toList.toArray
-  let hexVal (c : Char) : Option Nat :=
-    let n := c.toNat
-    if 48 ≤ n && n ≤ 57 then some (n - 48)
-    else if 65 ≤ n && n ≤ 70 then some (n - 55)
-    else if 97 ≤ n && n ≤ 102 then some (n - 87)
-    else none
-  Id.run do
-    let mut bs := ByteArray.empty
-    let mut i := 0
-    while i < cs.size do
-      if cs[i]! == '%' && i + 2 < cs.size then
-        match hexVal cs[i + 1]!, hexVal cs[i + 2]! with
-        | some h1, some h2 =>
-            bs := bs.push (UInt8.ofNat (h1 * 16 + h2))
-            i := i + 3
-        | _, _ =>
-            bs := bs.push (UInt8.ofNat cs[i]!.toNat)
-            i := i + 1
-      else
-        bs := bs.push (UInt8.ofNat cs[i]!.toNat)
-        i := i + 1
-    return (String.fromUTF8? bs).getD s
-
 structure MockExtState where
   tokenExchanges : Nat := 0
   rsaVerified    : Bool := false
@@ -75,80 +19,54 @@ structure MockExtState where
 
 private def startMockExternal (pemKey : String) :
     IO (Except String (String × IO.Ref MockExtState × IO Unit)) := do
-  match ← Prim.tcpListen 0 with
-  | .error e => return .error e
-  | .ok (lid, port) =>
-      let stRef ← IO.mkRef ({} : MockExtState)
-      let runningRef ← IO.mkRef true
-      let _ ← IO.asTask (prio := .dedicated) do
-        while ← runningRef.get do
-          match ← Prim.tcpAccept lid 100 with
-          | .error "timeout" => pure ()
-          | .error _ => break
-          | .ok conn =>
-              try
-                if let some (method, target, hdrs, body) ← readOneHttpReq conn then
-                  let authHdr := (hdrs.find? fun (k, _) => k.toLower == "authorization").map Prod.snd |>.getD ""
-                  let (pathOnly, queryStr) := match target.splitOn "?" with
-                    | p :: q :: _ => (p, q)
-                    | _           => (target, "")
-                  let (status, ctype, respBytes) ← do
-                    if method == "POST" && pathOnly == "/oauth2/token" then
-                      let form := (String.fromUTF8? body).getD ""
-                      let mut assertion := ""
-                      for pair in form.splitOn "&" do
-                        match pair.splitOn "=" with
-                        | ["assertion", v] => assertion := urlDecodeForm v
-                        | _ => pure ()
-                      match assertion.splitOn "." with
-                      | [p0, p1, p2] =>
-                          let sigBytes := decodeBase64Url p2
-                          let okSig ← Prim.rsaSha256Verify pemKey (s!"{p0}.{p1}").toUTF8 sigBytes
-                          let claimsStr := (String.fromUTF8? (decodeBase64Url p1)).getD ""
-                          if okSig && claimsStr.contains "qed-test@proj.iam.gserviceaccount.com" &&
-                             claimsStr.contains "devstorage.read_write" then
-                            stRef.modify fun s => { s with rsaVerified := true, tokenExchanges := s.tokenExchanges + 1 }
-                            pure (200, "application/json", "{\"access_token\":\"mock-gcs-token-777\",\"expires_in\":3600}".toUTF8)
-                          else
-                            pure (401, "application/json", "{\"error\":\"invalid_grant\"}".toUTF8)
-                      | _ => pure (401, "application/json", "{\"error\":\"invalid_grant\"}".toUTF8)
-                    else if pathOnly.startsWith "/upload/storage/v1/b/" || pathOnly.startsWith "/storage/v1/b/" then
-                      if authHdr != "Bearer mock-gcs-token-777" then
-                        pure (401, "text/plain", "unauthorized gcs".toUTF8)
-                      else if method == "POST" && pathOnly == "/upload/storage/v1/b/qed-covers/o" then
-                        let mut name := ""
-                        for pair in queryStr.splitOn "&" do
-                          match pair.splitOn "=" with
-                          | ["name", v] => name := urlDecodeForm v
-                          | _ => pure ()
-                        stRef.modify fun s => { s with gcsObjects := s.gcsObjects.insert name body }
-                        pure (200, "application/json", s!"\{\"name\":\"{name}\",\"size\":{body.size}}".toUTF8)
-                      else if method == "GET" && pathOnly.startsWith "/storage/v1/b/qed-covers/o/" then
-                        if target.contains "/o/covers/" then
-                          stRef.modify fun s => { s with sawUnescaped := true }
-                        let key := String.ofList (pathOnly.toList.drop "/storage/v1/b/qed-covers/o/".length)
-                        let st ← stRef.get
-                        match st.gcsObjects[key]? with
-                        | some stored => pure (200, "application/octet-stream", stored)
-                        | none => pure (404, "text/plain", "object not found".toUTF8)
-                      else pure (404, "text/plain", "unknown gcs".toUTF8)
-                    else if method == "POST" && pathOnly == "/accounts/demo-account/d1/database/demo-db/query" then
-                      if authHdr != "Bearer test-cf-d1-secret" then
-                        pure (401, "text/plain", "unauthorized d1".toUTF8)
-                      else
-                        let st ← stRef.get
-                        stRef.modify fun s => { s with d1Count := s.d1Count + 1 }
-                        if st.failD1 then
-                          pure (500, "application/json", "{\"success\":false,\"error\":\"simulated D1 outage\"}".toUTF8)
-                        else
-                          pure (200, "application/json", "{\"success\":true}".toUTF8)
-                    else
-                      pure (404, "text/plain", s!"unknown mock route: {target}".toUTF8)
-                  let wire := formatHttpResponse status ctype respBytes false false true
-                  discard <| Prim.outboundWriteAll conn wire
-              catch _ => pure ()
-              Prim.outboundRelease conn 0
-      return .ok (s!"http://127.0.0.1:{port}", stRef, do runningRef.set false; Prim.tcpCloseListener lid)
+  let stRef ← IO.mkRef ({} : MockExtState)
+  let res ← startMockHttpServer fun method target hdrs body => do
+    let authHdr := (hdrs.find? fun (k, _) => k.toLower == "authorization").map Prod.snd |>.getD ""
+    let (pathOnly, queryStr) := match target.splitOn "?" with
+      | p :: q :: _ => (p, q)
+      | _           => (target, "")
+    if method == "POST" && pathOnly == "/oauth2/token" then
+      let assertion := ((Qed.Auth.parseQueryParams ((String.fromUTF8? body).getD "")).lookup "assertion").getD ""
+      match assertion.splitOn "." with
+      | [p0, p1, p2] =>
+          let sigBytes := (Qed.Base64.decodeUrl p2).toOption.getD ByteArray.empty
+          let okSig ← Prim.rsaSha256Verify pemKey (s!"{p0}.{p1}").toUTF8 sigBytes
+          let claimsStr := (String.fromUTF8? ((Qed.Base64.decodeUrl p1).toOption.getD ByteArray.empty)).getD ""
+          if okSig && claimsStr.contains "qed-test@proj.iam.gserviceaccount.com" &&
+             claimsStr.contains "devstorage.read_write" then
+            stRef.modify fun s => { s with rsaVerified := true, tokenExchanges := s.tokenExchanges + 1 }
+            pure (200, "application/json", "{\"access_token\":\"mock-gcs-token-777\",\"expires_in\":3600}".toUTF8)
+          else
+            pure (401, "application/json", "{\"error\":\"invalid_grant\"}".toUTF8)
+      | _ => pure (401, "application/json", "{\"error\":\"invalid_grant\"}".toUTF8)
+    else if pathOnly.startsWith "/upload/storage/v1/b/" || pathOnly.startsWith "/storage/v1/b/" then
+      if authHdr != "Bearer mock-gcs-token-777" then
+        pure (401, "text/plain", "unauthorized gcs".toUTF8)
+      else if method == "POST" && pathOnly == "/upload/storage/v1/b/qed-covers/o" then
+        let name := ((Qed.Auth.parseQueryParams queryStr).lookup "name").getD ""
+        stRef.modify fun s => { s with gcsObjects := s.gcsObjects.insert name body }
+        pure (200, "application/json", s!"\{\"name\":\"{name}\",\"size\":{body.size}}".toUTF8)
+      else if method == "GET" && pathOnly.startsWith "/storage/v1/b/qed-covers/o/" then
+        if target.contains "/o/covers/" then
+          stRef.modify fun s => { s with sawUnescaped := true }
+        let key := String.ofList (pathOnly.toList.drop "/storage/v1/b/qed-covers/o/".length)
+        match (← stRef.get).gcsObjects[key]? with
+        | some stored => pure (200, "application/octet-stream", stored)
+        | none => pure (404, "text/plain", "object not found".toUTF8)
+      else pure (404, "text/plain", "unknown gcs".toUTF8)
+    else if method == "POST" && pathOnly == "/accounts/demo-account/d1/database/demo-db/query" then
+      if authHdr != "Bearer test-cf-d1-secret" then
+        pure (401, "text/plain", "unauthorized d1".toUTF8)
+      else
+        let st ← stRef.get
+        stRef.modify fun s => { s with d1Count := s.d1Count + 1 }
+        if st.failD1 then
+          pure (500, "application/json", "{\"success\":false,\"error\":\"simulated D1 outage\"}".toUTF8)
+        else
+          pure (200, "application/json", "{\"success\":true}".toUTF8)
+    else
+      pure (404, "text/plain", s!"unknown mock route: {target}".toUTF8)
+  return res.map fun (port, stop) => (s!"http://127.0.0.1:{port}", stRef, stop)
 
 private def gunzipBytes (gz : ByteArray) : IO (Except String ByteArray) := do
   let tmp ← makeTempDir "qed-gz-test"
@@ -184,102 +102,82 @@ private def runWebEssentialsSuite (c : TestChecker) : IO Unit := do
 
     -- 1. CachedStaticAsset pre-compressed gzip (first request fills cache, second hits cache)
     for pass in [1, 2] do
-      match ← httpReq srv.port "GET" "/bundle.deadbeef.mjs" #[("Accept-Encoding", "gzip")] with
-      | .ok r =>
+      c.expectOk s!"[web-essentials] hashed JS gzip pass {pass}"
+        (← httpReq srv.port "GET" "/bundle.deadbeef.mjs" #[("Accept-Encoding", "gzip")]) fun r => do
           c.checkEq s!"[web-essentials] hashed JS gzip pass {pass} status 200" r.status 200
           c.checkEq s!"[web-essentials] hashed JS gzip pass {pass} Content-Encoding" (r.header? "content-encoding") (some "gzip")
           c.checkEq s!"[web-essentials] hashed JS gzip pass {pass} Vary" (r.header? "vary") (some "Accept-Encoding")
           c.check s!"[web-essentials] hashed JS gzip pass {pass} smaller than raw ({r.body.size} < {jsContent.utf8ByteSize})"
             (r.body.size < jsContent.utf8ByteSize)
-          match ← gunzipBytes r.body with
-          | .ok raw => c.checkEq s!"[web-essentials] hashed JS gzip pass {pass} decompresses identically" (String.fromUTF8? raw) (some jsContent)
-          | .error e => c.check s!"[web-essentials] gunzip pass {pass}" false e
-      | .error e => c.check s!"[web-essentials] hashed JS gzip pass {pass}" false e
+          c.expectOk s!"[web-essentials] gunzip pass {pass}" (← gunzipBytes r.body) fun raw =>
+            c.checkEq s!"[web-essentials] hashed JS gzip pass {pass} decompresses identically" (String.fromUTF8? raw) (some jsContent)
 
     -- Without Accept-Encoding: gzip, serves uncompressed asset with Vary: Accept-Encoding
-    match ← httpReq srv.port "GET" "/bundle.deadbeef.mjs" with
-    | .ok r =>
-        c.checkEq "[web-essentials] hashed JS plain status 200" r.status 200
-        c.checkEq "[web-essentials] hashed JS plain no Content-Encoding" (r.header? "content-encoding") none
-        c.checkEq "[web-essentials] hashed JS plain body exact" r.bodyStr jsContent
-    | .error e => c.check "[web-essentials] hashed JS plain" false e
+    c.expectOk "[web-essentials] hashed JS plain" (← httpReq srv.port "GET" "/bundle.deadbeef.mjs") fun r => do
+      c.checkEq "[web-essentials] hashed JS plain status 200" r.status 200
+      c.checkEq "[web-essentials] hashed JS plain no Content-Encoding" (r.header? "content-encoding") none
+      c.checkEq "[web-essentials] hashed JS plain body exact" r.bodyStr jsContent
 
     -- 2. Custom HTTP routes: GET /robots.txt, POST /webhook (401 unauth, 200 auth + Set-Cookie), POST /echo-cookie
-    match ← httpReq srv.port "GET" "/robots.txt" with
-    | .ok r =>
-        c.checkEq "[web-essentials] GET /robots.txt status 200" r.status 200
-        c.checkEq "[web-essentials] GET /robots.txt body" r.bodyStr "User-agent: *\nAllow: /\n"
-    | .error e => c.check "[web-essentials] GET /robots.txt" false e
+    c.expectOk "[web-essentials] GET /robots.txt" (← httpReq srv.port "GET" "/robots.txt") fun r => do
+      c.checkEq "[web-essentials] GET /robots.txt status 200" r.status 200
+      c.checkEq "[web-essentials] GET /robots.txt body" r.bodyStr "User-agent: *\nAllow: /\n"
 
-    match ← httpReq srv.port "POST" "/webhook" #[] "{}".toUTF8 with
-    | .ok r => c.checkEq "[web-essentials] unauth POST /webhook rejected 401" r.status 401
-    | .error e => c.check "[web-essentials] POST /webhook unauth" false e
+    c.checkStatus "[web-essentials] unauth POST /webhook rejected 401" (← httpReq srv.port "POST" "/webhook" #[] "{}".toUTF8) 401
 
-    match ← httpReq srv.port "POST" "/webhook" #[("Authorization", s!"Bearer {aliceTok}")] "{}".toUTF8 with
-    | .ok r =>
+    c.expectOk "[web-essentials] POST /webhook auth"
+      (← httpReq srv.port "POST" "/webhook" #[("Authorization", s!"Bearer {aliceTok}")] "{}".toUTF8) fun r => do
         c.checkEq "[web-essentials] auth POST /webhook status 200" r.status 200
         c.checkEq "[web-essentials] auth POST /webhook JSON body" r.bodyStr "{\"ok\":true}"
         let sc := (r.header? "set-cookie").getD ""
         c.check "[web-essentials] auth POST /webhook emitted Set-Cookie wh_seen=1"
           (sc.contains "wh_seen=1" && sc.contains "HttpOnly" && sc.contains "SameSite=Lax") sc
-    | .error e => c.check "[web-essentials] POST /webhook auth" false e
 
-    match ← httpReq srv.port "POST" "/echo-cookie" #[] "val123\r\nX-Inject: bad".toUTF8 with
-    | .ok r =>
+    c.expectOk "[web-essentials] POST /echo-cookie"
+      (← httpReq srv.port "POST" "/echo-cookie" #[] "val123\r\nX-Inject: bad".toUTF8) fun r => do
         c.checkEq "[web-essentials] POST /echo-cookie status 200" r.status 200
         c.checkEq "[web-essentials] POST /echo-cookie JSON body" r.bodyStr "{\"ok\":true}"
         let sc := (r.header? "set-cookie").getD ""
         c.check "[web-essentials] POST /echo-cookie emitted sanitized HttpOnly SameSite=Lax cookie"
           (sc.contains "echo_ck=val123X-Inject: bad" && sc.contains "HttpOnly" && sc.contains "SameSite=Lax") sc
-    | .error e => c.check "[web-essentials] POST /echo-cookie" false e
 
     -- 3. RPC `setCookie(...)` emits Set-Cookie header on Protobuf response
-    match ← httpReq srv.port "POST" "/_qed/rpc/WebEssentialsSrv/login"
-      #[("Content-Type", "application/x-protobuf")] (Qed.Proto.encode "sess_tok_42") with
-    | .ok r =>
+    c.expectOk "[web-essentials] RPC login"
+      (← httpRpc srv.port "WebEssentialsSrv" "login" (Qed.Proto.encode "sess_tok_42")) fun r => do
         c.checkEq "[web-essentials] RPC login status 200" r.status 200
         c.checkEq "[web-essentials] RPC login payload" (Qed.Proto.decode (α := String) r.body) (.ok "ok")
         let sc := (r.header? "set-cookie").getD ""
         c.check "[web-essentials] RPC login emitted Set-Cookie qed_session"
           (sc.contains "qed_session=sess_tok_42" && sc.contains "HttpOnly" && sc.contains "SameSite=Lax") sc
-    | .error e => c.check "[web-essentials] RPC login" false e
 
     -- 4. Server-side SSE streaming route (`stream "/events"`)
-    match ← httpReq srv.port "GET" "/events" with
-    | .ok r =>
-        c.checkEq "[web-essentials] GET /events SSE status 200" r.status 200
-        c.checkEq "[web-essentials] GET /events Content-Type" (r.header? "content-type") (some "text/event-stream; charset=utf-8")
-        c.checkEq "[web-essentials] GET /events Cache-Control" (r.header? "cache-control") (some "no-cache")
-        c.checkEq "[web-essentials] GET /events SSE wire format" r.bodyStr
-          "event: greeting\nid: 1\ndata: hello\n\ndata: world\n\n"
-    | .error e => c.check "[web-essentials] GET /events SSE" false e
+    c.expectOk "[web-essentials] GET /events SSE" (← httpReq srv.port "GET" "/events") fun r => do
+      c.checkEq "[web-essentials] GET /events SSE status 200" r.status 200
+      c.checkEq "[web-essentials] GET /events Content-Type" (r.header? "content-type") (some "text/event-stream; charset=utf-8")
+      c.checkEq "[web-essentials] GET /events Cache-Control" (r.header? "cache-control") (some "no-cache")
+      c.checkEq "[web-essentials] GET /events SSE wire format" r.bodyStr
+        "event: greeting\nid: 1\ndata: hello\n\ndata: world\n\n"
 
     -- 5. Per-route `<head>` metadata, XSS escaping, CSP header & SSR HTTP status codes (200 / 404 / 302)
-    match ← httpReq srv.port "GET" "/" with
-    | .ok r =>
-        c.checkEq "[web-essentials] SSR GET / status 200" r.status 200
-        c.check "[web-essentials] SSR GET / escaped title XSS"
-          (r.bodyStr.contains "<title>Home &lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>" &&
-           !r.bodyStr.contains "<script>alert(1)</script>")
-        c.check "[web-essentials] SSR GET / meta description & canonical"
-          (r.bodyStr.contains "<meta name=\"description\" content=\"Verified &quot;SSR&quot; &lt;head&gt;\">" &&
-           r.bodyStr.contains "<link rel=\"canonical\" href=\"https://example.com/\">")
-        let csp := (r.header? "content-security-policy").getD ""
-        c.check "[web-essentials] SSR GET / has strict default CSP"
-          (csp.contains "default-src 'self'" && csp.contains "script-src 'self'" && csp.contains "object-src 'none'") csp
-    | .error e => c.check "[web-essentials] SSR GET /" false e
+    c.expectOk "[web-essentials] SSR GET /" (← httpReq srv.port "GET" "/") fun r => do
+      c.checkEq "[web-essentials] SSR GET / status 200" r.status 200
+      c.check "[web-essentials] SSR GET / escaped title XSS"
+        (r.bodyStr.contains "<title>Home &lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>" &&
+         !r.bodyStr.contains "<script>alert(1)</script>")
+      c.check "[web-essentials] SSR GET / meta description & canonical"
+        (r.bodyStr.contains "<meta name=\"description\" content=\"Verified &quot;SSR&quot; &lt;head&gt;\">" &&
+         r.bodyStr.contains "<link rel=\"canonical\" href=\"https://example.com/\">")
+      let csp := (r.header? "content-security-policy").getD ""
+      c.check "[web-essentials] SSR GET / has strict default CSP"
+        (csp.contains "default-src 'self'" && csp.contains "script-src 'self'" && csp.contains "object-src 'none'") csp
 
-    match ← httpReq srv.port "GET" "/missing" with
-    | .ok r =>
-        c.checkEq "[web-essentials] SSR GET /missing returns HTTP 404" r.status 404
-        c.check "[web-essentials] SSR GET /missing renders 404 <title>" (r.bodyStr.contains "<title>404 Not Found</title>")
-    | .error e => c.check "[web-essentials] SSR GET /missing" false e
+    c.expectOk "[web-essentials] SSR GET /missing" (← httpReq srv.port "GET" "/missing") fun r => do
+      c.checkEq "[web-essentials] SSR GET /missing returns HTTP 404" r.status 404
+      c.check "[web-essentials] SSR GET /missing renders 404 <title>" (r.bodyStr.contains "<title>404 Not Found</title>")
 
-    match ← httpReq srv.port "GET" "/old" with
-    | .ok r =>
-        c.checkEq "[web-essentials] SSR GET /old returns HTTP 302" r.status 302
-        c.checkEq "[web-essentials] SSR GET /old sets Location: /new" (r.header? "location") (some "/new")
-    | .error e => c.check "[web-essentials] SSR GET /old" false e
+    c.expectOk "[web-essentials] SSR GET /old" (← httpReq srv.port "GET" "/old") fun r => do
+      c.checkEq "[web-essentials] SSR GET /old returns HTTP 302" r.status 302
+      c.checkEq "[web-essentials] SSR GET /old sets Location: /new" (r.header? "location") (some "/new")
   finally
     srv.stop
     rmRf hashedFile
@@ -343,87 +241,69 @@ def run : IO Bool := do
 
           -- 4. RFC 9112 smuggling, traversal, symlink escape, CSRF
           let checkRaw400 (lbl raw : String) : IO Unit := do
-            match ← rawTcpReq srv.port raw.toUTF8 with
-            | .ok resp => c.check lbl (((String.fromUTF8? resp).getD "").startsWith "HTTP/1.1 400 ")
-            | .error e => c.check lbl false e
+            c.expectOk lbl (← rawTcpReq srv.port raw.toUTF8) fun resp =>
+              c.check lbl (((String.fromUTF8? resp).getD "").startsWith "HTTP/1.1 400 ")
           checkRaw400 "HTTP/1.1 without Host rejected 400" "GET /_qed/health HTTP/1.1\r\nConnection: close\r\n\r\n"
           checkRaw400 "HTTP/1.1 duplicate Host rejected 400" "GET /_qed/health HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
           checkRaw400 "whitespace before colon rejected 400" "GET /_qed/health HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length : 0\r\nConnection: close\r\n\r\n"
 
-          match ← rawTcpReq srv.port "GET /../lakefile.lean HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".toUTF8 with
-          | .ok resp => c.check "path traversal never leaks lakefile.lean" (!(((String.fromUTF8? resp).getD "").contains "lean_lib Qed"))
-          | .error e => c.check "path traversal test" false e
+          c.expectOk "path traversal test"
+            (← rawTcpReq srv.port "GET /../lakefile.lean HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".toUTF8) fun resp =>
+              c.check "path traversal never leaks lakefile.lean" (!(((String.fromUTF8? resp).getD "").contains "lean_lib Qed"))
 
-          match ← httpReq srv.port "GET" "/does-not-exist.js" with
-          | .ok r =>
-              c.checkEq "missing static asset returns 404" r.status 404
-              c.checkEq "nosniff header present" (r.header? "x-content-type-options") (some "nosniff")
-          | .error e => c.check "missing static asset" false e
+          c.expectOk "missing static asset" (← httpReq srv.port "GET" "/does-not-exist.js") fun r => do
+            c.checkEq "missing static asset returns 404" r.status 404
+            c.checkEq "nosniff header present" (r.header? "x-content-type-options") (some "nosniff")
 
           let cwd ← IO.currentDir
           let escLink := s!"{dir}/escape.txt"
           rmRf escLink
           discard <| runCmd "ln" #["-s", (cwd / "lakefile.lean").toString, escLink]
           try
-            match ← httpReq srv.port "GET" "/escape.txt" with
-            | .ok r =>
-                c.checkEq "symlink inside staticDir returns 404" r.status 404
-                c.check "symlink blocked by openat2/O_NOFOLLOW" (!r.bodyStr.contains "lean_lib Qed")
-            | .error e => c.check "symlink escape check" false e
+            c.expectOk "symlink escape check" (← httpReq srv.port "GET" "/escape.txt") fun r => do
+              c.checkEq "symlink inside staticDir returns 404" r.status 404
+              c.check "symlink blocked by openat2/O_NOFOLLOW" (!r.bodyStr.contains "lean_lib Qed")
           finally
             rmRf escLink
 
           let postRpc (m : String) (body : ByteArray) (tok? : Option String := none) :=
-            let hdrs := #[("Content-Type", "application/x-protobuf")] ++
-              match tok? with | some t => #[("Authorization", s!"Bearer {t}")] | none => #[]
-            httpReq srv.port "POST" s!"/_qed/rpc/Catalog/{m}" hdrs body
+            httpRpc srv.port "Catalog" m body tok?
 
-          match ← httpReq srv.port "POST" "/_qed/rpc/Catalog/list"
-            #[("Cookie", s!"qed_session={validTok}"), ("Content-Type", "application/x-protobuf"),
-              ("Origin", "https://evil.example.com")] ByteArray.empty with
-          | .ok r => c.checkEq "RPC rejects cross-origin Origin with 403" r.status 403
-          | .error e => c.check "cross-origin RPC" false e
+          c.checkStatus "RPC rejects cross-origin Origin with 403"
+            (← httpRpc srv.port "Catalog" "list" ByteArray.empty none
+              #[("Cookie", s!"qed_session={validTok}"), ("Origin", "https://evil.example.com")]) 403
 
-          match ← httpReq srv.port "POST" "/_qed/rpc/Catalog/list"
-            #[("Cookie", s!"qed_session={validTok}"), ("Content-Type", "text/plain")] "a=1".toUTF8 with
-          | .ok r => c.checkEq "RPC rejects non-protobuf Content-Type with 415" r.status 415
-          | .error e => c.check "non-protobuf RPC" false e
+          c.checkStatus "RPC rejects non-protobuf Content-Type with 415"
+            (← httpReq srv.port "POST" "/_qed/rpc/Catalog/list"
+              #[("Cookie", s!"qed_session={validTok}"), ("Content-Type", "text/plain")] "a=1".toUTF8) 415
 
-          match ← httpReq srv.port "POST" "/_qed/rpc/Catalog/list"
-            #[("Cookie", s!"qed_session={validTok}"), ("Content-Type", "application/x-protobuf"),
-              ("Origin", s!"http://127.0.0.1:{srv.port}"), ("Sec-Fetch-Site", "same-origin")] ByteArray.empty with
-          | .ok r => c.checkEq "RPC accepts same-origin protobuf with 200" r.status 200
-          | .error e => c.check "same-origin RPC" false e
+          c.checkStatus "RPC accepts same-origin protobuf with 200"
+            (← httpRpc srv.port "Catalog" "list" ByteArray.empty none
+              #[("Cookie", s!"qed_session={validTok}"), ("Origin", s!"http://127.0.0.1:{srv.port}"), ("Sec-Fetch-Site", "same-origin")]) 200
 
           -- 5. Auth, v1 expiry, rotation, and `requires` enforcement
           let orderReq (idx qty : Nat) := Qed.Proto.encode (idx, qty)
-          let checkStatus (lbl : String) (resp : Except String HttpResp) (want : Nat) : IO Unit :=
-            match resp with | .ok r => c.checkEq lbl r.status want | .error e => c.check lbl false e
-          checkStatus "unauth order rejected 401" (← postRpc "order" (orderReq 0 1) none) 401
-          checkStatus "forged HMAC rejected 401" (← postRpc "order" (orderReq 0 1) (some ("alice." ++ String.ofList (List.replicate 64 '0')))) 401
-          checkStatus "expired v1 token rejected 401" (← postRpc "order" (orderReq 0 1) (some expiredV1)) 401
-          checkStatus "requires qty <= 50 rejected 400" (← postRpc "order" (orderReq 0 99) (some validV1)) 400
-          checkStatus "rotated QED_AUTH_SECRET_PREV accepted (hits requires 400)" (← postRpc "order" (orderReq 0 99) (some rotatedV1)) 400
+          c.checkStatus "unauth order rejected 401" (← postRpc "order" (orderReq 0 1) none) 401
+          c.checkStatus "forged HMAC rejected 401" (← postRpc "order" (orderReq 0 1) (some ("alice." ++ String.ofList (List.replicate 64 '0')))) 401
+          c.checkStatus "expired v1 token rejected 401" (← postRpc "order" (orderReq 0 1) (some expiredV1)) 401
+          c.checkStatus "requires qty <= 50 rejected 400" (← postRpc "order" (orderReq 0 99) (some validV1)) 400
+          c.checkStatus "rotated QED_AUTH_SECRET_PREV accepted (hits requires 400)" (← postRpc "order" (orderReq 0 99) (some rotatedV1)) 400
 
           -- 6. GCP RS256 OAuth2 + binary PNG round-trip + StateBox token caching
           let pngBytes := ByteArray.mk #[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff, 0x42]
           let addReq := Qed.Proto.encode ("plfa", ("Programming Language Foundations", ((5 : Nat), pngBytes)))
-          match ← postRpc "addBook" addReq (some validTok) with
-          | .ok r =>
-              c.checkEq "addBook status 200" r.status 200
-              c.checkEq "addBook content-type protobuf" (r.header? "content-type") (some "application/x-protobuf")
-          | .error e => c.check "addBook RPC" false e
+          c.expectOk "addBook RPC" (← postRpc "addBook" addReq (some validTok)) fun r => do
+            c.checkEq "addBook status 200" r.status 200
+            c.checkEq "addBook content-type protobuf" (r.header? "content-type") (some "application/x-protobuf")
 
           let st1 ← mockRef.get
           c.check "GCP RS256 JWT signature verified" st1.rsaVerified
           c.checkEq "GCP token exchanged once on upload" st1.tokenExchanges 1
           c.checkEq "GCS received exact raw PNG bytes" (st1.gcsObjects["covers/plfa.png"]?) (some pngBytes)
 
-          match ← postRpc "cover" (Qed.Proto.encode "plfa.png") none with
-          | .ok r =>
-              c.checkEq "cover download status 200" r.status 200
-              c.checkEq "cover round-tripped exact binary PNG" (Qed.Proto.decode (α := ByteArray) r.body) (.ok pngBytes)
-          | .error e => c.check "cover RPC" false e
+          c.expectOk "cover RPC" (← postRpc "cover" (Qed.Proto.encode "plfa.png") none) fun r => do
+            c.checkEq "cover download status 200" r.status 200
+            c.checkEq "cover round-tripped exact binary PNG" (Qed.Proto.decode (α := ByteArray) r.body) (.ok pngBytes)
 
           let st2 ← mockRef.get
           c.check ":key* preserved literal / in download path" st2.sawUnescaped
@@ -431,7 +311,7 @@ def run : IO Bool := do
 
           -- 7. Inline `catch` fallback on D1 500 + 8 concurrent `await`+`atomic` RPCs
           mockRef.modify fun s => { s with failD1 := true }
-          checkStatus "order succeeds via catch fallback on D1 500" (← postRpc "order" (orderReq 0 1) (some validTok)) 200
+          c.checkStatus "order succeeds via catch fallback on D1 500" (← postRpc "order" (orderReq 0 1) (some validTok)) 200
           mockRef.modify fun s => { s with failD1 := false }
 
           let mut tasks : Array (Task (Except IO.Error (Except String HttpResp))) := #[]
@@ -446,27 +326,24 @@ def run : IO Bool := do
           c.checkEq "Cloudflare D1 received all 9 order queries" (← mockRef.get).d1Count 9
 
           -- 8. Native SSR HTML + strict default CSP + gzip compression
-          let mut rawSsrHtml := ""
-          match ← httpReq srv.port "GET" "/" #[("Cookie", s!"qed_session={validTok}")] with
-          | .ok r =>
-              c.checkEq "native SSR GET / returns 200" r.status 200
-              c.check "SSR HTML includes qed-state dehydration" (r.bodyStr.contains "id=\"qed-state\"")
-              let csp := (r.header? "content-security-policy").getD ""
-              c.check "SSR HTML includes strict default Content-Security-Policy"
-                (csp.contains "default-src 'self'" && csp.contains "script-src 'self'" && csp.contains "object-src 'none'") csp
-              rawSsrHtml := r.bodyStr
-          | .error e => c.check "native SSR GET /" false e
+          let rawSsrRef ← IO.mkRef ""
+          c.expectOk "native SSR GET /" (← httpReq srv.port "GET" "/" #[("Cookie", s!"qed_session={validTok}")]) fun r => do
+            c.checkEq "native SSR GET / returns 200" r.status 200
+            c.check "SSR HTML includes qed-state dehydration" (r.bodyStr.contains "id=\"qed-state\"")
+            let csp := (r.header? "content-security-policy").getD ""
+            c.check "SSR HTML includes strict default Content-Security-Policy"
+              (csp.contains "default-src 'self'" && csp.contains "script-src 'self'" && csp.contains "object-src 'none'") csp
+            rawSsrRef.set r.bodyStr
 
-          match ← httpReq srv.port "GET" "/" #[("Cookie", s!"qed_session={validTok}"), ("Accept-Encoding", "gzip")] with
-          | .ok r =>
+          let rawSsrHtml ← rawSsrRef.get
+          c.expectOk "SSR gzip GET /"
+            (← httpReq srv.port "GET" "/" #[("Cookie", s!"qed_session={validTok}"), ("Accept-Encoding", "gzip")]) fun r => do
               c.checkEq "SSR gzip GET / returns 200" r.status 200
               c.checkEq "SSR gzip Content-Encoding header" (r.header? "content-encoding") (some "gzip")
               c.checkEq "SSR gzip Vary header" (r.header? "vary") (some "Accept-Encoding")
               c.check "SSR gzip body smaller than uncompressed" (r.body.size < rawSsrHtml.utf8ByteSize)
-              match ← gunzipBytes r.body with
-              | .ok decomp => c.checkEq "SSR gzip decompresses identically" (String.fromUTF8? decomp) (some rawSsrHtml)
-              | .error e => c.check "SSR gunzip" false e
-          | .error e => c.check "SSR gzip GET /" false e
+              c.expectOk "SSR gunzip" (← gunzipBytes r.body) fun decomp =>
+                c.checkEq "SSR gzip decompresses identically" (String.fromUTF8? decomp) (some rawSsrHtml)
         finally
           srv.stop
 
@@ -490,26 +367,13 @@ def run : IO Bool := do
             let r2 ← httpReq srvRl.port "GET" "/"
             let r3 ← httpReq srvRl.port "GET" "/"
             let r4 ← httpReq srvRl.port "GET" "/"
-            match r1 with
-            | .ok r =>
-                c.checkEq "rate-limit req 1 allowed (200)" r.status 200
-                c.checkEq "QED_CSP override applied" (r.header? "content-security-policy") (some "default-src 'none'")
-            | .error e => c.check "rate-limit req 1" false e
-            match r2 with
-            | .ok r => c.checkEq "rate-limit req 2 allowed (200)" r.status 200
-            | .error e => c.check "rate-limit req 2" false e
-            let got429 := match r3, r4 with
-              | .ok a, .ok b => a.status == 429 || b.status == 429
-              | .ok a, _     => a.status == 429
-              | _, .ok b     => b.status == 429
-              | _, _         => false
-            let hasRetryAfter := match r3, r4 with
-              | .ok a, .ok b => (a.status == 429 && (a.header? "retry-after").isSome) || (b.status == 429 && (b.header? "retry-after").isSome)
-              | .ok a, _     => a.status == 429 && (a.header? "retry-after").isSome
-              | _, .ok b     => b.status == 429 && (b.header? "retry-after").isSome
-              | _, _         => false
-            c.check "burst excess rejected with 429 Too Many Requests" got429
-            c.check "429 response includes Retry-After header" hasRetryAfter
+            c.expectOk "rate-limit req 1" r1 fun r => do
+              c.checkEq "rate-limit req 1 allowed (200)" r.status 200
+              c.checkEq "QED_CSP override applied" (r.header? "content-security-policy") (some "default-src 'none'")
+            c.checkStatus "rate-limit req 2 allowed (200)" r2 200
+            let rlResps := [r3, r4].filterMap Except.toOption
+            c.check "burst excess rejected with 429 Too Many Requests" (rlResps.any (·.status == 429))
+            c.check "429 response includes Retry-After header" (rlResps.any fun r => r.status == 429 && (r.header? "retry-after").isSome)
         finally
           srvRl.stop
       finally

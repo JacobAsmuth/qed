@@ -74,29 +74,23 @@ def run : IO Bool := do
     let (srv, healthy) ← startNativeServer distDir.toString #[] (dev := false)
     try
       c.check "standalone native server healthy" healthy
-      match ← httpReq srv.port "GET" "/" with
-      | .ok r =>
-          c.checkEq "SSR GET / returns 200" r.status 200
-          let html := r.bodyStr
-          c.check "SSR HTML renders initial quantity 1" (html.contains "<span>1</span>") html
-          c.check "SSR HTML references hashed host script" (html.contains hostPath) html
-      | .error e => c.check "SSR GET / succeeded" false e
+      c.expectOk "SSR GET / succeeded" (← httpReq srv.port "GET" "/") fun r => do
+        c.checkEq "SSR GET / returns 200" r.status 200
+        let html := r.bodyStr
+        c.check "SSR HTML renders initial quantity 1" (html.contains "<span>1</span>") html
+        c.check "SSR HTML references hashed host script" (html.contains hostPath) html
 
-      match ← httpReq srv.port "GET" appPath with
-      | .ok r =>
-          c.checkEq "hashed asset returns 200" r.status 200
-          c.checkEq "hashed asset immutable cache-control"
-            (r.header? "cache-control") (some "public, max-age=31536000, immutable")
-          c.checkEq "hashed asset nosniff" (r.header? "x-content-type-options") (some "nosniff")
-      | .error e => c.check "GET hashed asset succeeded" false e
+      c.expectOk "GET hashed asset succeeded" (← httpReq srv.port "GET" appPath) fun r => do
+        c.checkEq "hashed asset returns 200" r.status 200
+        c.checkEq "hashed asset immutable cache-control"
+          (r.header? "cache-control") (some "public, max-age=31536000, immutable")
+        c.checkEq "hashed asset nosniff" (r.header? "x-content-type-options") (some "nosniff")
 
       let checkNoLeak (label reqPath : String) : IO Unit := do
         let raw := s!"GET {reqPath} HTTP/1.1\r\nHost: 127.0.0.1:{srv.port}\r\nConnection: close\r\n\r\n".toUTF8
-        match ← rawTcpReq srv.port raw with
-        | .ok resp =>
-            let s := (String.fromUTF8? resp).getD ""
-            c.check label (!s.contains "TOP_SECRET_SIBLING") s
-        | .error e => c.check label false e
+        c.expectOk label (← rawTcpReq srv.port raw) fun resp =>
+          let s := (String.fromUTF8? resp).getD ""
+          c.check label (!s.contains "TOP_SECRET_SIBLING") s
       checkNoLeak "blocks /../dist-secret/leak.txt" "/../dist-secret/leak.txt"
       checkNoLeak "blocks /%2e%2e%2fdist-secret/leak.txt" "/%2e%2e%2fdist-secret/leak.txt"
       checkNoLeak "blocks symlink /escape.txt" "/escape.txt"
@@ -108,15 +102,10 @@ def run : IO Bool := do
     let (stSrv, stOk) ← startNativeBin cli #["serve", distDir.toString, toString staticPort, "--dev"] staticPort cleanEnv
     try
       c.check "qed serve native static server healthy" stOk
-      match ← httpReq staticPort "GET" appPath with
-      | .ok r =>
-          c.checkEq "qed serve serves hashed asset 200" r.status 200
-      | .error e => c.check "qed serve GET hashed asset" false e
-      match ← httpReq staticPort "GET" "/__dev_status" with
-      | .ok r =>
-          c.checkEq "dev mode /__dev_status returns 200" r.status 200
-          c.check "dev mode /__dev_status returns valid JSON status" (r.bodyStr.contains "\"status\":\"ok\"") r.bodyStr
-      | .error e => c.check "qed serve GET /__dev_status" false e
+      c.checkStatus "qed serve serves hashed asset 200" (← httpReq staticPort "GET" appPath) 200
+      c.expectOk "qed serve GET /__dev_status" (← httpReq staticPort "GET" "/__dev_status") fun r => do
+        c.checkEq "dev mode /__dev_status returns 200" r.status 200
+        c.check "dev mode /__dev_status returns valid JSON status" (r.bodyStr.contains "\"status\":\"ok\"") r.bodyStr
     finally
       stSrv.stop
 
@@ -156,21 +145,19 @@ def run : IO Bool := do
     c.check "dev app.mjs.map exists" (← devMapPath.pathExists)
     c.check "dev qed_dev.mjs emitted" (← (devOut / "qed_dev.mjs").pathExists)
     let devMapRaw ← IO.FS.readFile devMapPath
-    match Qed.Json.parse devMapRaw with
-    | .ok sm =>
-        c.checkEq "dev sourcemap version == 3" (((sm.get? "version").bind (·.num?)).bind (·.toInt?)) (some 3)
-        c.checkEq "dev sourcemap file == app.mjs" ((sm.get? "file").bind (·.str?)) (some "app.mjs")
-        let hasSources := match sm.get? "sources" with
-          | some (.arr xs) => !xs.isEmpty && xs.any (fun x => x.str? == some "App.lean")
-          | _ => false
-        let hasNames := match sm.get? "names" with | some (.arr xs) => !xs.isEmpty | _ => false
-        let hasMappings := match (sm.get? "mappings").bind (·.str?) with
-          | some m => !m.isEmpty && m.contains ";"
-          | none => false
-        c.check "dev sourcemap lists App.lean in sources" hasSources devMapRaw
-        c.check "dev sourcemap has non-empty names" hasNames
-        c.check "dev sourcemap has non-empty VLQ mappings" hasMappings
-    | .error e => c.check "dev sourcemap valid JSON" false e
+    c.expectOk "dev sourcemap valid JSON" (Qed.Json.parse devMapRaw) fun sm => do
+      c.checkEq "dev sourcemap version == 3" (((sm.get? "version").bind (·.num?)).bind (·.toInt?)) (some 3)
+      c.checkEq "dev sourcemap file == app.mjs" ((sm.get? "file").bind (·.str?)) (some "app.mjs")
+      let hasSources := match sm.get? "sources" with
+        | some (.arr xs) => !xs.isEmpty && xs.any (fun x => x.str? == some "App.lean")
+        | _ => false
+      let hasNames := match sm.get? "names" with | some (.arr xs) => !xs.isEmpty | _ => false
+      let hasMappings := match (sm.get? "mappings").bind (·.str?) with
+        | some m => !m.isEmpty && m.contains ";"
+        | none => false
+      c.check "dev sourcemap lists App.lean in sources" hasSources devMapRaw
+      c.check "dev sourcemap has non-empty names" hasNames
+      c.check "dev sourcemap has non-empty VLQ mappings" hasMappings
 
     -- Minified prod `appJs` (from step 2) is significantly smaller and strips `_g0` / block comments
     c.check "minified prod app.mjs is >25% smaller than dev app.mjs" (appJs.length * 4 < devAppJs.length * 3)
@@ -192,11 +179,9 @@ def run : IO Bool := do
     c.check "prod --sourcemap appends hashed sourceMappingURL" (prodJs2.contains s!"//# sourceMappingURL={appName2}.map")
     c.check "prod --sourcemap emits hashed .mjs.map" (← prodMap2Path.pathExists)
     if ← prodMap2Path.pathExists then
-      match Qed.Json.parse (← IO.FS.readFile prodMap2Path) with
-      | .ok sm =>
-          c.checkEq "prod sourcemap version == 3" (((sm.get? "version").bind (·.num?)).bind (·.toInt?)) (some 3)
-          c.checkEq "prod sourcemap file matches hashed bundle" ((sm.get? "file").bind (·.str?)) (some appName2)
-      | .error e => c.check "prod sourcemap valid JSON" false e
+      c.expectOk "prod sourcemap valid JSON" (Qed.Json.parse (← IO.FS.readFile prodMap2Path)) fun sm => do
+        c.checkEq "prod sourcemap version == 3" (((sm.get? "version").bind (·.num?)).bind (·.toInt?)) (some 3)
+        c.checkEq "prod sourcemap file matches hashed bundle" ((sm.get? "file").bind (·.str?)) (some appName2)
 
     -- 6. OS-native file watcher FFI (`Cli.Watch.FileWatcher`) + Dev SSE push server (`Cli.Watch.DevSseServer`)
     let watchRoot := FilePath.mk scratch / "watch_proj"
@@ -207,73 +192,54 @@ def run : IO Bool := do
     IO.FS.writeFile (watchRoot / "Demo.lean") "def x := 1\n"
     IO.FS.writeFile (watchRoot / "site.css") "body{}\n"
     IO.FS.writeFile (watchRt / "qed_dev.mjs") "// v1\n"
-    match ← FileWatcher.open watchRoot.toString watchRt.toString #[".lake", ".git"] with
-    | .error e => c.check "OS file watcher opens cleanly" false e
-    | .ok w =>
-        try
-          -- Ignored directory must not trigger watch events
-          IO.FS.writeFile (watchSkip / "ignored.lean") "-- ignore\n"
-          let evSkip ← w.wait 80
-          c.check "OS watcher ignores skipped .lake/ directory" (!evSkip.any && !evSkip.error) (reprStr evSkip)
+    c.expectOk "OS file watcher opens cleanly" (← FileWatcher.open watchRoot.toString watchRt.toString #[".lake", ".git"]) fun w => do
+      try
+        -- Ignored directory must not trigger watch events
+        IO.FS.writeFile (watchSkip / "ignored.lean") "-- ignore\n"
+        let evSkip ← w.wait 80
+        c.check "OS watcher ignores skipped .lake/ directory" (!evSkip.any && !evSkip.error) (reprStr evSkip)
 
-          -- Modifying a .lean file triggers `ev.lean`
-          let tLean ← IO.asTask (w.wait 1500)
+        let waitWatchEdit (path : FilePath) (content : String) := do
+          let t ← IO.asTask (w.wait 1500)
           IO.sleep 30
-          IO.FS.writeFile (watchRoot / "Demo.lean") "def x := 2\n"
-          let evLean := (← IO.wait tLean).toOption.getD { lean := false, css := false, runtime := false, error := true }
-          c.check "OS watcher detects .lean modification" (evLean.lean && !evLean.error) (reprStr evLean)
+          IO.FS.writeFile path content
+          return (← IO.wait t).toOption.getD { lean := false, css := false, runtime := false, error := true }
 
-          -- Modifying a .css file triggers `ev.css`
-          let tCss ← IO.asTask (w.wait 1500)
+        let evLean ← waitWatchEdit (watchRoot / "Demo.lean") "def x := 2\n"
+        c.check "OS watcher detects .lean modification" (evLean.lean && !evLean.error) (reprStr evLean)
+        let evCss ← waitWatchEdit (watchRoot / "site.css") "body{color:red}\n"
+        c.check "OS watcher detects .css modification" (evCss.css && !evCss.error) (reprStr evCss)
+        let evRt ← waitWatchEdit (watchRt / "qed_dev.mjs") "// v2\n"
+        c.check "OS watcher detects runtime .mjs modification" (evRt.runtime && !evRt.error) (reprStr evRt)
+      finally
+        w.close
+
+    c.expectOk "DevSseServer starts on ephemeral port" (← DevSseServer.start 0) fun sse => do
+      try
+        c.check "DevSseServer bound ephemeral port > 0" (sse.port > 0)
+        sse.publish "{\"id\":\"42\",\"status\":\"ok\",\"kind\":\"hmr\",\"durationMs\":9,\"error\":\"\"}"
+        c.expectOk "TCP connect to DevSseServer" (← Prim.outboundAcquire 0 "127.0.0.1" sse.port 0 (fun _ => false)) fun (hNat, _) => do
+          let h := hNat.toUInt64
+          let req := s!"GET /events HTTP/1.1\r\nHost: 127.0.0.1:{sse.port}\r\nAccept: text/event-stream\r\n\r\n".toUTF8
+          let okW := (← Prim.outboundWriteAll h req).isOk
+          let readStr : IO String := do
+            if !okW then return ""
+            return ((← Prim.outboundReadSome h 4096).toOption.bind String.fromUTF8?).getD ""
+          let body ← readStr
+          -- Also verify live push on an already-open SSE connection
           IO.sleep 30
-          IO.FS.writeFile (watchRoot / "site.css") "body{color:red}\n"
-          let evCss := (← IO.wait tCss).toOption.getD { lean := false, css := false, runtime := false, error := true }
-          c.check "OS watcher detects .css modification" (evCss.css && !evCss.error) (reprStr evCss)
-
-          -- Modifying a runtime .mjs file triggers `ev.runtime`
-          let tRt ← IO.asTask (w.wait 1500)
-          IO.sleep 30
-          IO.FS.writeFile (watchRt / "qed_dev.mjs") "// v2\n"
-          let evRt := (← IO.wait tRt).toOption.getD { lean := false, css := false, runtime := false, error := true }
-          c.check "OS watcher detects runtime .mjs modification" (evRt.runtime && !evRt.error) (reprStr evRt)
-        finally
-          w.close
-
-    match ← DevSseServer.start 0 with
-    | .error e => c.check "DevSseServer starts on ephemeral port" false e
-    | .ok sse =>
-        try
-          c.check "DevSseServer bound ephemeral port > 0" (sse.port > 0)
-          sse.publish "{\"id\":\"42\",\"status\":\"ok\",\"kind\":\"hmr\",\"durationMs\":9,\"error\":\"\"}"
-          match ← Prim.outboundAcquire 0 "127.0.0.1" sse.port 0 (fun _ => false) with
-          | .error e => c.check "TCP connect to DevSseServer" false e
-          | .ok (hNat, _) =>
-              let h := hNat.toUInt64
-              let req := s!"GET /events HTTP/1.1\r\nHost: 127.0.0.1:{sse.port}\r\nAccept: text/event-stream\r\n\r\n".toUTF8
-              let okW ← match ← Prim.outboundWriteAll h req with | .ok () => pure true | .error _ => pure false
-              let body ← if okW then
-                  match ← Prim.outboundReadSome h 4096 with
-                  | .ok bs => pure ((String.fromUTF8? bs).getD "")
-                  | .error _ => pure ""
-                else pure ""
-              -- Also verify live push on an already-open SSE connection
-              IO.sleep 30
-              sse.publish "{\"id\":\"43\",\"status\":\"building\",\"kind\":\"hmr\",\"durationMs\":0,\"error\":\"\"}"
-              let pushed ← if okW then
-                  match ← Prim.outboundReadSome h 4096 with
-                  | .ok bs => pure ((String.fromUTF8? bs).getD "")
-                  | .error _ => pure ""
-                else pure ""
-              Prim.outboundRelease h 0
-              c.check "DevSseServer returns 200 text/event-stream with CORS and initial event"
-                (body.contains "200 OK" &&
-                 body.contains "text/event-stream" &&
-                 body.contains "Access-Control-Allow-Origin: *" &&
-                 body.contains "data: {\"id\":\"42\",\"status\":\"ok\"") body
-              c.check "DevSseServer pushes live building event to connected client"
-                (pushed.contains "data: {\"id\":\"43\",\"status\":\"building\"") pushed
-        finally
-          sse.stop
+          sse.publish "{\"id\":\"43\",\"status\":\"building\",\"kind\":\"hmr\",\"durationMs\":0,\"error\":\"\"}"
+          let pushed ← readStr
+          Prim.outboundRelease h 0
+          c.check "DevSseServer returns 200 text/event-stream with CORS and initial event"
+            (body.contains "200 OK" &&
+             body.contains "text/event-stream" &&
+             body.contains "Access-Control-Allow-Origin: *" &&
+             body.contains "data: {\"id\":\"42\",\"status\":\"ok\"") body
+          c.check "DevSseServer pushes live building event to connected client"
+            (pushed.contains "data: {\"id\":\"43\",\"status\":\"building\"") pushed
+      finally
+        sse.stop
 
     -- 7. `--check-externs` catches stripped extern in `qed_rt.mjs`
     let strippedRt := s!"{scratch}/stripped_rt.mjs"

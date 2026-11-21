@@ -45,6 +45,18 @@ def TestChecker.checkEq {α : Type} [BEq α] [Repr α] (c : TestChecker) (label 
     c.state.modify fun (p, f) => (p, f + 1)
     IO.eprintln s!"  FAIL  {label}: got {reprStr got}, want {reprStr want}"
 
+class ErrMsg (ε : Type) where
+  errMsg : ε → String
+
+instance : ErrMsg String where errMsg s := s
+instance : ErrMsg ApiError where errMsg e := e.message
+
+def TestChecker.expectOk {ε α : Type} [ErrMsg ε] (c : TestChecker) (label : String)
+    (res : Except ε α) (k : α → IO Unit) : IO Unit :=
+  match res with
+  | .ok v    => k v
+  | .error e => c.check label false (ErrMsg.errMsg e)
+
 def TestChecker.finish (c : TestChecker) : IO Bool := do
   let (passed, failed) ← c.state.get
   if failed == 0 then
@@ -192,6 +204,36 @@ def httpReq (port : UInt16) (method path : String)
   | .error e => return .error e
   | .ok raw  => return parseHttpResp raw
 
+/-- Performs a loopback Protobuf RPC POST to `/_qed/rpc/<server>/<fn>`. -/
+def httpRpc (port : UInt16) (server fn : String) (body : ByteArray := ByteArray.empty)
+    (tok? : Option String := none) (extraHdrs : Array (String × String) := #[]) :
+    IO (Except String HttpResp) :=
+  let hdrs := #[("Content-Type", "application/x-protobuf")] ++
+    (match tok? with | some t => #[("Authorization", s!"Bearer {t}")] | none => #[]) ++
+    extraHdrs
+  httpReq port "POST" s!"/_qed/rpc/{server}/{fn}" hdrs body
+
+def TestChecker.checkStatus (c : TestChecker) (label : String)
+    (res : Except String HttpResp) (want : Nat) : IO Unit :=
+  c.expectOk label res fun r => c.checkEq label r.status want
+
+def TestChecker.checkProto {ε α : Type} [ErrMsg ε] [Qed.FromProto α] [BEq α] [Repr α]
+    (c : TestChecker) (label : String) (res : Except ε ByteArray) (want : α) : IO Unit :=
+  c.expectOk label res fun bs => c.checkEq label (Qed.Proto.decode (α := α) bs) (.ok want)
+
+def TestChecker.checkProtoBy {ε α β : Type} [ErrMsg ε] [Qed.FromProto α] [BEq β] [Repr β]
+    (c : TestChecker) (label : String) (res : Except ε ByteArray) (f : α → β) (want : β) : IO Unit :=
+  c.expectOk label res fun bs =>
+    c.expectOk label (Qed.Proto.decode (α := α) bs) fun v => c.checkEq label (f v) want
+
+def TestChecker.checkRpcProto {α : Type} [Qed.FromProto α] [BEq α] [Repr α]
+    (c : TestChecker) (label : String) (res : Except String HttpResp) (want : α) : IO Unit :=
+  c.checkProto label (res.map (·.body)) want
+
+def TestChecker.checkRpcProtoBy {α β : Type} [Qed.FromProto α] [BEq β] [Repr β]
+    (c : TestChecker) (label : String) (res : Except String HttpResp) (f : α → β) (want : β) : IO Unit :=
+  c.checkProtoBy label (res.map (·.body)) f want
+
 def waitHealth (port : UInt16) (timeoutMs : Nat := 5000) : IO Bool := do
   let deadline := (← Prim.nowMs).toNat + timeoutMs
   let rec loop : Nat → IO Bool
@@ -281,6 +323,35 @@ partial def readOneHttpReq (handle : UInt64) : IO (Option (String × String × A
         if chunk.size == 0 then break
         body := body ++ chunk
   return some (method, target, hdrs, body.extract 0 contentLen)
+
+/-- Starts a loopback TCP mock server on an ephemeral port, returning `(port, stop)`. -/
+def startMockTcpServer (onConn : UInt64 → IO Unit) (concurrent : Bool := false) :
+    IO (Except String (UInt16 × IO Unit)) := do
+  match ← Prim.tcpListen 0 with
+  | .error e => return .error e
+  | .ok (lid, port) =>
+      let runningRef ← IO.mkRef true
+      let handle (conn : UInt64) : IO Unit := do
+        try onConn conn catch _ => pure ()
+        Prim.outboundRelease conn 0
+      let _ ← IO.asTask (prio := .dedicated) do
+        while ← runningRef.get do
+          match ← Prim.tcpAccept lid 100 with
+          | .error "timeout" => pure ()
+          | .error _ => break
+          | .ok conn =>
+              if concurrent then discard <| IO.asTask (prio := .dedicated) (handle conn)
+              else handle conn
+      return .ok (port, do runningRef.set false; Prim.tcpCloseListener lid)
+
+/-- Starts a loopback HTTP/1.1 mock server on an ephemeral port, returning `(port, stop)`. -/
+def startMockHttpServer
+    (onReq : String → String → Array (String × String) → ByteArray → IO (Nat × String × ByteArray)) :
+    IO (Except String (UInt16 × IO Unit)) :=
+  startMockTcpServer fun conn => do
+    if let some (method, target, hdrs, body) ← readOneHttpReq conn then
+      let (status, ctype, respBytes) ← onReq method target hdrs body
+      discard <| Prim.outboundWriteAll conn (formatHttpResponse status ctype respBytes false false true)
 
 def makeTempDir (prefixStr : String) : IO String := do
   let rnd ← Prim.randomHex 8

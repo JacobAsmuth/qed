@@ -100,30 +100,22 @@ private def connectWs (port : UInt16) (wsPath : String) (origin? : Option String
       | .ok () =>
           let sep := "\r\n\r\n".toUTF8
           let mut buf := ByteArray.empty
-          let mut hdrEnd? : Option Nat := none
           for _ in [0 : 16] do
-            if let some idx := findSubBytes buf sep then
-              hdrEnd? := some idx; break
+            if (findSubBytes buf sep).isSome then break
             match ← Prim.outboundReadSome handle 8192 with
             | .error _ => break
             | .ok chunk =>
                 if chunk.size == 0 then break
                 buf := buf ++ chunk
-          let some hdrEnd := hdrEnd?
-            | Prim.outboundRelease handle 0; return .error "truncated WS handshake response"
-          let headStr := (String.fromUTF8? (buf.extract 0 hdrEnd)).getD ""
-          let rest := buf.extract (hdrEnd + 4) buf.size
-          let lines := headStr.splitOn "\r\n"
-          let status := (((lines.headD "").splitOn " ").getD 1 "0").toNat?.getD 0
-          let mut accept := ""
-          for l in lines.drop 1 do
-            if l.toLower.startsWith "sec-websocket-accept:" then
-              accept := (String.ofList (l.toList.drop "sec-websocket-accept:".length)).trimAscii.toString
-          if status != 101 then
-            Prim.outboundRelease handle 0
-            return .ok (status, accept, none)
-          let bufRef ← IO.mkRef rest
-          return .ok (status, accept, some { handle, bufRef })
+          match parseHttpResp buf with
+          | .error _ => Prim.outboundRelease handle 0; return .error "truncated WS handshake response"
+          | .ok resp =>
+              let accept := (resp.header? "sec-websocket-accept").getD ""
+              if resp.status != 101 then
+                Prim.outboundRelease handle 0
+                return .ok (resp.status, accept, none)
+              let bufRef ← IO.mkRef resp.body
+              return .ok (resp.status, accept, some { handle, bufRef })
 
 def run : IO Bool := do
   let c ← mkChecker "websockets"
@@ -148,104 +140,84 @@ def run : IO Bool := do
     let sameOrigin := s!"http://127.0.0.1:{srv.port}"
 
     -- 1. CSWSH cross-origin & missing-origin rejection
-    match ← connectWs srv.port "/_qed/ws/Hub" (some "https://evil.example.com") #[("Authorization", s!"Bearer {aliceTok}")] with
-    | .ok (st, _, _) => c.checkEq "CSWSH cross-origin WS upgrade rejected 403" st 403
-    | .error e => c.check "CSWSH cross-origin check" false e
+    c.expectOk "CSWSH cross-origin check"
+      (← connectWs srv.port "/_qed/ws/Hub" (some "https://evil.example.com") #[("Authorization", s!"Bearer {aliceTok}")]) fun (st, _, _) =>
+        c.checkEq "CSWSH cross-origin WS upgrade rejected 403" st 403
 
-    match ← connectWs srv.port "/_qed/ws/Hub" none #[("Sec-Fetch-Site", "cross-site"), ("Authorization", s!"Bearer {aliceTok}")] with
-    | .ok (st, _, _) => c.checkEq "cross-site Sec-Fetch-Site WS upgrade rejected 403" st 403
-    | .error e => c.check "cross-site Sec-Fetch-Site check" false e
+    c.expectOk "cross-site Sec-Fetch-Site check"
+      (← connectWs srv.port "/_qed/ws/Hub" none #[("Sec-Fetch-Site", "cross-site"), ("Authorization", s!"Bearer {aliceTok}")]) fun (st, _, _) =>
+        c.checkEq "cross-site Sec-Fetch-Site WS upgrade rejected 403" st 403
 
     -- 2. Valid RFC 6455 handshake + Sec-WebSocket-Accept verification
     let wantAccept := (wsComputeAccept "dGhlIHNhbXBsZSBub25jZQ==").getD ""
-    match ← connectWs srv.port "/_qed/ws/Hub" (some sameOrigin) #[("Authorization", s!"Bearer {aliceTok}")] with
-    | .error e => c.check "alice WS connect" false e
-    | .ok (stA, accA, some wsA) =>
-        try
-          c.checkEq "alice WS upgrade returns 101" stA 101
-          c.checkEq "RFC 6455 Sec-WebSocket-Accept matches" accA wantAccept
+    let hubRpc (fn : String) (body : ByteArray := ByteArray.empty) (tok? : Option String := none) :=
+      httpRpc srv.port "Hub" fn body tok?
+    c.expectOk "alice WS connect"
+      (← connectWs srv.port "/_qed/ws/Hub" (some sameOrigin) #[("Authorization", s!"Bearer {aliceTok}")]) fun
+      | (stA, _, none) => c.checkEq "alice WS upgrade returns 101" stA 101
+      | (stA, accA, some wsA) =>
+          try
+            c.checkEq "alice WS upgrade returns 101" stA 101
+            c.checkEq "RFC 6455 Sec-WebSocket-Accept matches" accA wantAccept
 
-          -- Subscribe alice to room 1
-          wsA.sendBin (WsMuxFrame.encode (.sub 1 "room" (Qed.Proto.encode (1 : Nat))))
-          match ← wsA.recvMux with
-          | some (.joinOk sid _) => c.checkEq "alice joinOk subId=1" sid 1
-          | other => c.check "alice received joinOk" false (toString (other.isSome))
+            -- Subscribe alice to room 1
+            wsA.sendBin (WsMuxFrame.encode (.sub 1 "room" (Qed.Proto.encode (1 : Nat))))
+            match ← wsA.recvMux with
+            | some (.joinOk sid _) => c.checkEq "alice joinOk subId=1" sid 1
+            | other => c.check "alice received joinOk" false (toString (other.isSome))
 
-          -- Connect bob and subscribe to room 1 (and room 2 separately)
-          match ← connectWs srv.port "/_qed/ws/Hub" (some sameOrigin) #[("Authorization", s!"Bearer {bobTok}")] with
-          | .error e => c.check "bob WS connect" false e
-          | .ok (stB, _, some wsB) =>
-              try
-                c.checkEq "bob WS upgrade returns 101" stB 101
-                wsB.sendBin (WsMuxFrame.encode (.sub 2 "room" (Qed.Proto.encode (1 : Nat))))
-                match ← wsB.recvMux with
-                | some (.joinOk sid _) => c.checkEq "bob joinOk subId=2" sid 2
-                | _ => c.check "bob received joinOk" false
+            -- Connect bob and subscribe to room 1
+            c.expectOk "bob WS connect"
+              (← connectWs srv.port "/_qed/ws/Hub" (some sameOrigin) #[("Authorization", s!"Bearer {bobTok}")]) fun
+              | (stB, _, none) => c.checkEq "bob WS upgrade returns 101" stB 101
+              | (stB, _, some wsB) =>
+                  try
+                    c.checkEq "bob WS upgrade returns 101" stB 101
+                    wsB.sendBin (WsMuxFrame.encode (.sub 2 "room" (Qed.Proto.encode (1 : Nat))))
+                    match ← wsB.recvMux with
+                    | some (.joinOk sid _) => c.checkEq "bob joinOk subId=2" sid 2
+                    | _ => c.check "bob received joinOk" false
 
-                -- Verify online count == 2
-                match ← httpReq srv.port "POST" "/_qed/rpc/Hub/onlineCount"
-                  #[("Content-Type", "application/x-protobuf")] ByteArray.empty with
-                | .ok r => c.checkEq "onlineCount == 2" (Qed.Proto.decode (α := Nat) r.body) (.ok 2)
-                | .error e => c.check "onlineCount RPC" false e
+                    -- Verify online count == 2
+                    c.checkRpcProto "onlineCount == 2" (← hubRpc "onlineCount") (2 : Nat)
 
-                -- Announce in room 1 via RPC -> both alice and bob receive the ChatMsg broadcast!
-                match ← httpReq srv.port "POST" "/_qed/rpc/Hub/announce"
-                  #[("Content-Type", "application/x-protobuf"), ("Authorization", s!"Bearer {aliceTok}")]
-                  (Qed.Proto.encode ((1 : Nat), "hello live room")) with
-                | .ok r => c.checkEq "announce RPC status 200" r.status 200
-                | .error e => c.check "announce RPC" false e
+                    -- Announce in room 1 via RPC -> both alice and bob receive the ChatMsg broadcast!
+                    c.checkStatus "announce RPC status 200"
+                      (← hubRpc "announce" (Qed.Proto.encode ((1 : Nat), "hello live room")) (some aliceTok)) 200
 
-                match ← wsA.recvMux with
-                | some (.event sid payload) =>
-                    c.checkEq "alice received event on subId=1" sid 1
-                    match Qed.Proto.decode (α := LiveRoom.ChatMsg) payload with
-                    | .ok msg => c.checkEq "alice event body" msg.body.val "hello live room"
-                    | .error e => c.check "alice decode ChatMsg" false e
-                | _ => c.check "alice received broadcast event" false
+                    let checkBroadcast (who : String) (ws : WsClient) (wantSid : UInt32) : IO Unit := do
+                      match ← ws.recvMux with
+                      | some (.event sid payload) =>
+                          c.checkEq s!"{who} received event on subId={wantSid}" sid wantSid
+                          c.expectOk s!"{who} decode ChatMsg" (Qed.Proto.decode (α := LiveRoom.ChatMsg) payload) fun msg =>
+                            c.checkEq s!"{who} event body" msg.body.val "hello live room"
+                      | _ => c.check s!"{who} received broadcast event" false
+                    checkBroadcast "alice" wsA 1
+                    checkBroadcast "bob" wsB 2
 
-                match ← wsB.recvMux with
-                | some (.event sid payload) =>
-                    c.checkEq "bob received event on subId=2" sid 2
-                    match Qed.Proto.decode (α := LiveRoom.ChatMsg) payload with
-                    | .ok msg => c.checkEq "bob event body" msg.body.val "hello live room"
-                    | .error e => c.check "bob decode ChatMsg" false e
-                | _ => c.check "bob received broadcast event" false
+                    -- Transactional `emit` rollback: announce "ROLLBACK" fails with domain error & emits nothing!
+                    c.expectOk "ROLLBACK RPC" (← hubRpc "announce" (Qed.Proto.encode ((1 : Nat), "ROLLBACK")) (some aliceTok)) fun r =>
+                      let isErr := match Qed.Proto.decode (α := Except (Qed.RpcDomainError LiveRoom.Hub.announce.Error) LiveRoom.ChatMsg) r.body with
+                        | .ok (.error _) => true
+                        | _ => false
+                      c.check "ROLLBACK returned domain error" isErr
 
-                -- Transactional `emit` rollback: announce "ROLLBACK" fails with domain error & emits nothing!
-                match ← httpReq srv.port "POST" "/_qed/rpc/Hub/announce"
-                  #[("Content-Type", "application/x-protobuf"), ("Authorization", s!"Bearer {aliceTok}")]
-                  (Qed.Proto.encode ((1 : Nat), "ROLLBACK")) with
-                | .ok r =>
-                    let isErr := match Qed.Proto.decode (α := Except (Qed.RpcDomainError LiveRoom.Hub.announce.Error) LiveRoom.ChatMsg) r.body with
-                      | .ok (.error _) => true
-                      | _ => false
-                    c.check "ROLLBACK returned domain error" isErr
-                | .error e => c.check "ROLLBACK RPC" false e
+                    -- Send a real follow-up message and verify alice's NEXT frame is "after rollback" (not "ROLLBACK"!)
+                    discard <| hubRpc "announce" (Qed.Proto.encode ((1 : Nat), "after rollback")) (some aliceTok)
+                    match ← wsA.recvMux with
+                    | some (.event _ payload) =>
+                        c.expectOk "decode after-rollback event" (Qed.Proto.decode (α := LiveRoom.ChatMsg) payload) fun msg =>
+                          c.checkEq "ROLLBACK emit was rolled back; next event is 'after rollback'" msg.body.val "after rollback"
+                    | _ => c.check "received after-rollback event" false
 
-                -- Send a real follow-up message and verify alice's NEXT frame is "after rollback" (not "ROLLBACK"!)
-                discard <| httpReq srv.port "POST" "/_qed/rpc/Hub/announce"
-                  #[("Content-Type", "application/x-protobuf"), ("Authorization", s!"Bearer {aliceTok}")]
-                  (Qed.Proto.encode ((1 : Nat), "after rollback"))
-                match ← wsA.recvMux with
-                | some (.event _ payload) =>
-                    match Qed.Proto.decode (α := LiveRoom.ChatMsg) payload with
-                    | .ok msg => c.checkEq "ROLLBACK emit was rolled back; next event is 'after rollback'" msg.body.val "after rollback"
-                    | .error e => c.check "decode after-rollback event" false e
-                | _ => c.check "received after-rollback event" false
-
-                -- Unsub bob -> onlineCount drops to 1
-                wsB.sendBin (WsMuxFrame.encode (.unsub 2))
-                IO.sleep 60
-                match ← httpReq srv.port "POST" "/_qed/rpc/Hub/onlineCount"
-                  #[("Content-Type", "application/x-protobuf")] ByteArray.empty with
-                | .ok r => c.checkEq "onlineCount == 1 after bob unsub" (Qed.Proto.decode (α := Nat) r.body) (.ok 1)
-                | .error e => c.check "onlineCount after unsub" false e
-              finally
-                wsB.close
-          | .ok (stB, _, none) => c.checkEq "bob WS upgrade returns 101" stB 101
-        finally
-          wsA.close
-    | .ok (stA, _, none) => c.checkEq "alice WS upgrade returns 101" stA 101
+                    -- Unsub bob -> onlineCount drops to 1
+                    wsB.sendBin (WsMuxFrame.encode (.unsub 2))
+                    IO.sleep 60
+                    c.checkRpcProto "onlineCount == 1 after bob unsub" (← hubRpc "onlineCount") (1 : Nat)
+                  finally
+                    wsB.close
+          finally
+            wsA.close
 
     -- 3. Unauthenticated WS client rejected when subscribing to auth-gated `room` channel
     match ← connectWs srv.port "/_qed/ws/Hub" (some sameOrigin) #[] with

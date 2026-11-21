@@ -54,14 +54,11 @@ def run : IO Bool := do
     ("size", .num ⟨10, 0⟩),
     ("base64", .str (Base64.encode sampleBytes))
   ])
-  match FileBytes.decode sampleJson with
-  | .ok fb =>
-      c.checkEq "FileBytes.name" fb.name "icon.png"
-      c.checkEq "FileBytes.mime" fb.mime "image/png"
-      c.checkEq "FileBytes.size" fb.size 10
-      c.checkEq "FileBytes.bytes" fb.bytes sampleBytes
-  | .error e =>
-      c.check "FileBytes.decode ok" false e
+  c.expectOk "FileBytes.decode ok" (FileBytes.decode sampleJson) fun fb => do
+    c.checkEq "FileBytes.name" fb.name "icon.png"
+    c.checkEq "FileBytes.mime" fb.mime "image/png"
+    c.checkEq "FileBytes.size" fb.size 10
+    c.checkEq "FileBytes.bytes" fb.bytes sampleBytes
 
   c.check "FileBytes.decode propagates host error"
     (match FileBytes.decode "{\"error\":\"file too large (200 bytes; max 100)\"}" with

@@ -162,7 +162,7 @@ alongside `dist/server`.
 - [`Tests/Native/FullstackRpc.lean`](../Tests/Native/FullstackRpc.lean) — native Rust/Lean server RFC 9112 framing, concurrent handler pool, auth/expiring tokens/rotation, RS256 OAuth2 and TLS/HTTP external calls, SSR, and `/_qed/rpc/…` binary Protobuf RPCs.
 - [`Tests/Native/Database.lean`](../Tests/Native/Database.lean) — multi-transport database integration tests running the same compiled server binary against embedded SQLite with restart durability, HTTP SQL, and PostgreSQL v3 wire protocol with SCRAM-SHA-256 auth, plus RLS isolation and client leak checks.
 - [`Tests/Native/WebSocket.lean`](../Tests/Native/WebSocket.lean) — RFC 6455 multiplexed server channels, CSWSH origin enforcement, cross-worker broadcasts, and transactional `emit` rollback.
-- Pipeline benchmarks live in [`Bench/`](../Bench) via `lake exe bench`, plus [`test/loadgen.rs`](../test/loadgen.rs).
+- Pipeline benchmarks live in [`Bench/`](../Bench) via `lake exe bench`.
 
 ## Source map
 

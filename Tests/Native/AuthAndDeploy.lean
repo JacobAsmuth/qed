@@ -33,64 +33,37 @@ private def stripHostPrefix (url : String) : String :=
 
 private def testCryptoAndJwtCore (c : TestChecker) : IO Unit := do
   -- 1. Generate real ephemeral P-256 keypair & verify ES256 JWT via `verifyJwtWithKeys`
-  let kpRes ← Prim.ecP256Keygen
-  match kpRes with
-  | .error e =>
-      c.check "ecP256Keygen succeeds" false e
-  | .ok (pkcs8, pubX, pubY) =>
-      c.check "ecP256Keygen produces 32B X/Y" (pubX.size == 32 && pubY.size == 32)
-      let kp : Qed.Cli.DevAuth.DevAuthKeypair := {
-        kid := "k1", pkcs8Der := pkcs8
-        xB64 := base64UrlEncode pubX, yB64 := base64UrlEncode pubY
+  c.expectOk "ecP256Keygen succeeds" (← Prim.ecP256Keygen) fun (pkcs8, pubX, pubY) => do
+    c.check "ecP256Keygen produces 32B X/Y" (pubX.size == 32 && pubY.size == 32)
+    let kp : Qed.Cli.DevAuth.DevAuthKeypair := {
+      kid := "k1", pkcs8Der := pkcs8
+      xB64 := base64UrlEncode pubX, yB64 := base64UrlEncode pubY
+    }
+    let jwk : JwkKey := .ecP256 "k1" pubX pubY
+    let nowSec := ((← Prim.nowMs).toNat) / 1000
+    c.expectOk "signDevIdToken succeeds"
+      (← Qed.Cli.DevAuth.signDevIdToken kp "https://idp.test" "usr_42" "aud_app"
+        "nonce_xyz" "alice@test.dev" "admin" "org_7" true 600) fun jwt => do
+      let vcfg : OidcValidationCfg := {
+        issuer := "https://idp.test", audience := "aud_app", expectedNonce? := some "nonce_xyz"
       }
-      let jwk : JwkKey := .ecP256 "k1" pubX pubY
-      let nowSec := ((← Prim.nowMs).toNat) / 1000
-      let tokRes ← Qed.Cli.DevAuth.signDevIdToken kp "https://idp.test" "usr_42" "aud_app"
-        "nonce_xyz" "alice@test.dev" "admin" "org_7" true 600
-      match tokRes with
-      | .error e => c.check "signDevIdToken succeeds" false e
-      | .ok jwt =>
-          let vcfg : OidcValidationCfg := {
-            issuer := "https://idp.test", audience := "aud_app", expectedNonce? := some "nonce_xyz"
-          }
-          let okRes ← verifyJwtWithKeys vcfg #[jwk] jwt nowSec
-          match okRes with
-          | .error e => c.check "ES256 JWK verify valid JWT" false e
-          | .ok vc =>
-              let u := AuthChecks.CloudAuth.fromClaims vc.claims
-              c.checkEq "ES256 extracted sub" u.id "usr_42"
-              c.checkEq "ES256 extracted role" u.role "admin"
-              c.checkEq "ES256 extracted orgId" u.orgId (some "org_7")
-              c.checkEq "ES256 extracted email" u.email "alice@test.dev"
-              c.checkEq "ES256 extracted verified" u.verified true
+      c.expectOk "ES256 JWK verify valid JWT" (← verifyJwtWithKeys vcfg #[jwk] jwt nowSec) fun vc => do
+        let u := AuthChecks.CloudAuth.fromClaims vc.claims
+        c.checkEq "ES256 extracted sub" u.id "usr_42"
+        c.checkEq "ES256 extracted role" u.role "admin"
+        c.checkEq "ES256 extracted orgId" u.orgId (some "org_7")
+        c.checkEq "ES256 extracted email" u.email "alice@test.dev"
+        c.checkEq "ES256 extracted verified" u.verified true
 
-          -- Wrong audience rejected
-          let badAud ← verifyJwtWithKeys { vcfg with audience := "other_app" } #[jwk] jwt nowSec
-          c.check "JWT wrong audience rejected" (!badAud.isOk)
-
-          -- Wrong issuer rejected
-          let badIss ← verifyJwtWithKeys { vcfg with issuer := "https://evil.test" } #[jwk] jwt nowSec
-          c.check "JWT wrong issuer rejected" (!badIss.isOk)
-
-          -- Wrong nonce rejected
-          let badNonce ← verifyJwtWithKeys { vcfg with expectedNonce? := some "wrong" } #[jwk] jwt nowSec
-          c.check "JWT wrong nonce rejected" (!badNonce.isOk)
-
-          -- Expired token rejected
-          let expired ← verifyJwtWithKeys vcfg #[jwk] jwt (nowSec + 10000)
-          c.check "JWT expired token rejected" (!expired.isOk)
-
-          -- Tampered signature rejected
-          let tampered := jwt ++ "A"
-          let badSig ← verifyJwtWithKeys vcfg #[jwk] tampered nowSec
-          c.check "JWT tampered signature rejected" (!badSig.isOk)
-
-          -- `alg: none` forgery rejected
-          let noneHdr := base64UrlEncode "{\"alg\":\"none\",\"typ\":\"JWT\"}".toUTF8
-          let nonePay := base64UrlEncode "{\"iss\":\"https://idp.test\",\"sub\":\"admin\",\"aud\":\"aud_app\",\"exp\":9999999999}".toUTF8
-          let noneTok := s!"{noneHdr}.{nonePay}.sig"
-          let noneRes ← verifyJwtWithKeys vcfg #[jwk] noneTok nowSec
-          c.check "JWT alg:none rejected" (!noneRes.isOk)
+      -- Wrong audience, issuer, nonce, expired, tampered, `alg: none` all rejected
+      c.check "JWT wrong audience rejected" (!(← verifyJwtWithKeys { vcfg with audience := "other_app" } #[jwk] jwt nowSec).isOk)
+      c.check "JWT wrong issuer rejected" (!(← verifyJwtWithKeys { vcfg with issuer := "https://evil.test" } #[jwk] jwt nowSec).isOk)
+      c.check "JWT wrong nonce rejected" (!(← verifyJwtWithKeys { vcfg with expectedNonce? := some "wrong" } #[jwk] jwt nowSec).isOk)
+      c.check "JWT expired token rejected" (!(← verifyJwtWithKeys vcfg #[jwk] jwt (nowSec + 10000)).isOk)
+      c.check "JWT tampered signature rejected" (!(← verifyJwtWithKeys vcfg #[jwk] (jwt ++ "A") nowSec).isOk)
+      let noneHdr := base64UrlEncode "{\"alg\":\"none\",\"typ\":\"JWT\"}".toUTF8
+      let nonePay := base64UrlEncode "{\"iss\":\"https://idp.test\",\"sub\":\"admin\",\"aud\":\"aud_app\",\"exp\":9999999999}".toUTF8
+      c.check "JWT alg:none rejected" (!(← verifyJwtWithKeys vcfg #[jwk] s!"{noneHdr}.{nonePay}.sig" nowSec).isOk)
 
   -- 2. Base64URL round-trip & DeployManifest compile-time validation checks
   let sample := "hello+/world=123\x00\xff".toUTF8
@@ -116,33 +89,32 @@ private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit := do
   c.check "qed_deploy.json emitted on build" existsM
   if existsM then
     let raw ← IO.FS.readFile manifestPath
-    match Qed.Json.parse raw with
-    | .error e => c.check "qed_deploy.json valid JSON" false e
-    | .ok j =>
-        c.checkEq "manifest mode is fullstack" ((j.get? "mode").bind (·.str?)) (some "fullstack")
-        let authObj? := j.get? "auth"
-        c.checkEq "manifest auth.name" (authObj?.bind (·.get? "name") |>.bind (·.str?)) (some "CloudAuth")
-        c.checkEq "manifest auth.callbackPath" (authObj?.bind (·.get? "callbackPath") |>.bind (·.str?)) (some "/_qed/auth/callback")
-        let hasClaims := match authObj?.bind (·.get? "claims") with
-          | some (.arr cs) => cs.length == 4
-          | _              => false
-        c.check "manifest auth.claims has 4 typed claims" hasClaims
-        let hasProvs := match authObj?.bind (·.get? "providers") with
-          | some (.arr ps) => ps.length == 3
-          | _              => false
-        c.check "manifest auth.providers has 3 providers" hasProvs
-        let hasEgress := match j.get? "egress" with
-          | some (.arr es) => es.any (fun x => x.str? == some "https://billing.example.com")
-          | _              => false
-        c.check "manifest egress contains BillingApi origin" hasEgress
-        let hasDb := match j.get? "databases" with
-          | some (.arr ds) => ds.any (fun d => (d.get? "name").bind (·.str?) == some "AuthNotesDb")
-          | _              => false
-        c.check "manifest databases contains AuthNotesDb" hasDb
-        let hasSecrets := match j.get? "secrets" with
-          | some (.arr ss) => ss.any (fun s => s.str? == some "AUTH_NOTES_DB_URL")
-          | _              => false
-        c.check "manifest secrets contains AUTH_NOTES_DB_URL" hasSecrets
+    c.expectOk "qed_deploy.json valid JSON" (Qed.Json.parse raw) fun j => do
+      c.checkEq "manifest mode is fullstack" ((j.get? "mode").bind (·.str?)) (some "fullstack")
+      c.checkEq "manifest csp matches defaultCsp" ((j.get? "csp").bind (·.str?)) (some Qed.Server.defaultCsp)
+      let authObj? := j.get? "auth"
+      c.checkEq "manifest auth.name" (authObj?.bind (·.get? "name") |>.bind (·.str?)) (some "CloudAuth")
+      c.checkEq "manifest auth.callbackPath" (authObj?.bind (·.get? "callbackPath") |>.bind (·.str?)) (some "/_qed/auth/callback")
+      let hasClaims := match authObj?.bind (·.get? "claims") with
+        | some (.arr cs) => cs.length == 4
+        | _              => false
+      c.check "manifest auth.claims has 4 typed claims" hasClaims
+      let hasProvs := match authObj?.bind (·.get? "providers") with
+        | some (.arr ps) => ps.length == 3
+        | _              => false
+      c.check "manifest auth.providers has 3 providers" hasProvs
+      let hasEgress := match j.get? "egress" with
+        | some (.arr es) => es.any (fun x => x.str? == some "https://billing.example.com")
+        | _              => false
+      c.check "manifest egress contains BillingApi origin" hasEgress
+      let hasDb := match j.get? "databases" with
+        | some (.arr ds) => ds.any (fun d => (d.get? "name").bind (·.str?) == some "AuthNotesDb")
+        | _              => false
+      c.check "manifest databases contains AuthNotesDb" hasDb
+      let hasSecrets := match j.get? "secrets" with
+        | some (.arr ss) => ss.any (fun s => s.str? == some "AUTH_NOTES_DB_URL")
+        | _              => false
+      c.check "manifest secrets contains AUTH_NOTES_DB_URL" hasSecrets
 
   -- 3. Verify client bundle leak gate blocks `CloudAuth.config` & `CloudAuth.secrets`
   checkLeakGate c "Tests.AuthChecks" #[
@@ -160,18 +132,14 @@ private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit := do
     return
 
   -- Check discovery & JWKS endpoints on dev-auth
-  match ← httpReq devAuthPort "GET" "/.well-known/openid-configuration" with
-  | .ok r =>
-      c.checkEq "dev-auth discovery HTTP 200" r.status 200
-      c.check "dev-auth discovery advertises ES256 & S256"
-        (r.bodyStr.contains "ES256" && r.bodyStr.contains "S256")
-  | .error e => c.check "dev-auth discovery reachable" false e
+  c.expectOk "dev-auth discovery reachable" (← httpReq devAuthPort "GET" "/.well-known/openid-configuration") fun r => do
+    c.checkEq "dev-auth discovery HTTP 200" r.status 200
+    c.check "dev-auth discovery advertises ES256 & S256"
+      (r.bodyStr.contains "ES256" && r.bodyStr.contains "S256")
 
-  match ← httpReq devAuthPort "GET" "/jwks.json" with
-  | .ok r =>
-      c.checkEq "dev-auth JWKS HTTP 200" r.status 200
-      c.check "dev-auth JWKS serves EC P-256 key" (r.bodyStr.contains "\"P-256\"")
-  | .error e => c.check "dev-auth JWKS reachable" false e
+  c.expectOk "dev-auth JWKS reachable" (← httpReq devAuthPort "GET" "/jwks.json") fun r => do
+    c.checkEq "dev-auth JWKS HTTP 200" r.status 200
+    c.check "dev-auth JWKS serves EC P-256 key" (r.bodyStr.contains "\"P-256\"")
 
   -- 5. Spawn `Tests.AuthChecks` fullstack server pointed at `dev-auth`
   let issuerUrl := s!"http://127.0.0.1:{devAuthPort}"
@@ -190,133 +158,89 @@ private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit := do
     return
 
   -- 6. Unauthenticated `/_qed/auth/me` → 401
-  match ← httpReq appProc.port "GET" "/_qed/auth/me" with
-  | .ok r => c.checkEq "unauthenticated /_qed/auth/me returns 401" r.status 401
-  | .error e => c.check "GET /_qed/auth/me" false e
+  c.checkStatus "unauthenticated /_qed/auth/me returns 401" (← httpReq appProc.port "GET" "/_qed/auth/me") 401
 
   -- 7. Open-redirect attempt on `/_qed/auth/login?returnTo=//evil.com` → succeeds with sanitized `/`
-  match ← httpReq appProc.port "GET" "/_qed/auth/login?returnTo=//evil.com" with
-  | .ok r =>
-      c.checkEq "login returns 302 redirect" r.status 302
-      let loc := (r.header? "location").getD ""
-      c.check "login redirects to dev-auth /authorize with PKCE S256"
-        (loc.startsWith (issuerUrl ++ "/authorize") && loc.contains "code_challenge_method=S256")
-  | .error e => c.check "GET /_qed/auth/login open-redirect test" false e
+  c.expectOk "GET /_qed/auth/login open-redirect test" (← httpReq appProc.port "GET" "/_qed/auth/login?returnTo=//evil.com") fun r => do
+    c.checkEq "login returns 302 redirect" r.status 302
+    let loc := (r.header? "location").getD ""
+    c.check "login redirects to dev-auth /authorize with PKCE S256"
+      (loc.startsWith (issuerUrl ++ "/authorize") && loc.contains "code_challenge_method=S256")
 
   -- 8. Full OIDC Authorization Code + PKCE S256 login flow!
-  let mut sessionCookie := ""
-  match ← httpReq appProc.port "GET" "/_qed/auth/login?returnTo=/dashboard" with
-  | .error e => c.check "OIDC login step 1" false e
-  | .ok r1 =>
-      c.checkEq "OIDC login step 1 status 302" r1.status 302
-      let setCookies1 := extractSetCookies r1.headers
-      let txCookie? := findCookieByName setCookies1 "qed_auth_tx"
-      c.check "OIDC login sets HttpOnly qed_auth_tx cookie" txCookie?.isSome
-      let authLoc := (r1.header? "location").getD ""
-      -- Follow redirect to dev-auth /authorize with `&auto=1&sub=usr_alice&role=admin&email=alice@qed.dev&orgId=org_42`
-      let authPath := stripHostPrefix authLoc ++ "&auto=1&sub=usr_alice&role=admin&email=alice%40qed.dev&orgId=org_42"
-      match ← httpReq devAuthPort "GET" authPath with
-      | .error e => c.check "OIDC authorize step 2" false e
-      | .ok r2 =>
-          c.checkEq "dev-auth /authorize auto redirects 302" r2.status 302
-          let cbLoc := (r2.header? "location").getD ""
-          let cbPath := stripHostPrefix cbLoc
+  let aliceParams := "&auto=1&sub=usr_alice&role=admin&email=alice%40qed.dev&orgId=org_42"
+  let doOidcLogin (tag returnTo queryExtra : String) (fullChecks : Bool := false) : IO String := do
+    let sessRef ← IO.mkRef ""
+    c.expectOk s!"{tag} login step 1" (← httpReq appProc.port "GET" s!"/_qed/auth/login?returnTo={returnTo}") fun r1 => do
+      if fullChecks then c.checkEq s!"{tag} login step 1 status 302" r1.status 302
+      let txCookie? := findCookieByName (extractSetCookies r1.headers) "qed_auth_tx"
+      if fullChecks then c.check s!"{tag} login sets HttpOnly qed_auth_tx cookie" txCookie?.isSome
+      let authPath := stripHostPrefix ((r1.header? "location").getD "") ++ queryExtra
+      c.expectOk s!"{tag} authorize step 2" (← httpReq devAuthPort "GET" authPath) fun r2 => do
+        if fullChecks then c.checkEq "dev-auth /authorize auto redirects 302" r2.status 302
+        let cbPath := stripHostPrefix ((r2.header? "location").getD "")
+        if fullChecks then
           c.check "authorize redirects back to /_qed/auth/callback" (cbPath.startsWith "/_qed/auth/callback?")
+          c.checkStatus "callback rejects mismatched state (403)"
+            (← httpReq appProc.port "GET" (cbPath ++ "tampered") #[("Cookie", txCookie?.getD "")]) 403
+        c.expectOk s!"{tag} callback step 3" (← httpReq appProc.port "GET" cbPath #[("Cookie", txCookie?.getD "")]) fun r3 => do
+          c.checkEq s!"{tag} callback succeeds with 302" r3.status 302
+          if fullChecks then
+            c.checkEq s!"{tag} callback redirects to sanitized returnTo {returnTo}" (r3.header? "location") (some returnTo)
+          let sessC? := findCookieByName (extractSetCookies r3.headers) "qed_session"
+          if fullChecks then
+            c.check s!"{tag} callback sets signed v2 qed_session cookie" (sessC?.any (·.contains "v2."))
+          sessRef.set (sessC?.getD "")
+    sessRef.get
 
-          -- 8a. Negative test: tampered `state` fails with 403!
-          let txCookie := txCookie?.getD ""
-          match ← httpReq appProc.port "GET" (cbPath ++ "tampered") #[("Cookie", txCookie)] with
-          | .ok rBadState => c.checkEq "callback rejects mismatched state (403)" rBadState.status 403
-          | .error e => c.check "callback mismatched state check" false e
+  let emptyProto := Qed.Proto.encode ()
+  let authRpc (fn : String) (tok? : Option String := none) (extraHdrs : Array (String × String) := #[]) :=
+    httpRpc appProc.port "AuthApi" fn emptyProto tok? extraHdrs
 
-          -- 8b. Real callback with valid `code`, `state`, and `qed_auth_tx` cookie!
-          match ← httpReq appProc.port "GET" cbPath #[("Cookie", txCookie)] with
-          | .error e => c.check "OIDC callback step 3" false e
-          | .ok r3 =>
-              c.checkEq "OIDC callback succeeds with 302" r3.status 302
-              c.checkEq "OIDC callback redirects to sanitized returnTo /dashboard"
-                (r3.header? "location") (some "/dashboard")
-              let setCookies3 := extractSetCookies r3.headers
-              let sessC? := findCookieByName setCookies3 "qed_session"
-              c.check "OIDC callback sets signed v2 qed_session cookie" (sessC?.any (·.contains "v2."))
-              sessionCookie := sessC?.getD ""
+  let sessionCookie ← doOidcLogin "OIDC" "/dashboard" aliceParams (fullChecks := true)
 
   -- 9. Verify `/_qed/auth/me` with `qed_session` cookie returns authenticated admin claims
   if !sessionCookie.isEmpty then
-    match ← httpReq appProc.port "GET" "/_qed/auth/me" #[("Cookie", sessionCookie)] with
-    | .ok r =>
-        c.checkEq "authenticated /_qed/auth/me returns 200" r.status 200
-        c.check "authenticated /_qed/auth/me returns sub & admin role"
-          (r.bodyStr.contains "\"usr_alice\"" && r.bodyStr.contains "\"admin\"" && r.bodyStr.contains "\"org_42\"")
-    | .error e => c.check "authenticated /_qed/auth/me" false e
+    c.expectOk "authenticated /_qed/auth/me" (← httpReq appProc.port "GET" "/_qed/auth/me" #[("Cookie", sessionCookie)]) fun r => do
+      c.checkEq "authenticated /_qed/auth/me returns 200" r.status 200
+      c.check "authenticated /_qed/auth/me returns sub & admin role"
+        (r.bodyStr.contains "\"usr_alice\"" && r.bodyStr.contains "\"admin\"" && r.bodyStr.contains "\"org_42\"")
 
     -- 10. Call role-gated RPC `adminAction` with `qed_session` cookie → 200!
-    let emptyProto := Qed.Proto.encode ()
-    match ← httpReq appProc.port "POST" "/_qed/rpc/AuthApi/adminAction"
-        #[("Content-Type", "application/x-protobuf"), ("Cookie", sessionCookie)] emptyProto with
-    | .ok r =>
-        c.checkEq "admin RPC with OIDC v2 cookie returns 200" r.status 200
-    | .error e => c.check "admin RPC with OIDC v2 cookie" false e
+    c.checkStatus "admin RPC with OIDC v2 cookie returns 200" (← authRpc "adminAction" none #[("Cookie", sessionCookie)]) 200
 
     -- 10a. Verify `onCreateAccount` + `onSignIn` fired on 1st sign-in (`logins == 1`)!
-    match ← httpReq appProc.port "POST" "/_qed/rpc/AuthApi/getProfile"
-        #[("Content-Type", "application/x-protobuf"), ("Cookie", sessionCookie)] emptyProto with
-    | .ok r =>
-        c.checkEq "getProfile after 1st sign-in returns 200" r.status 200
-        match Qed.Proto.decode (α := Option AuthChecks.AuthNotesDb.profiles) r.body with
-        | .ok (some prof) =>
+    c.expectOk "getProfile after 1st sign-in" (← authRpc "getProfile" none #[("Cookie", sessionCookie)]) fun r => do
+      c.checkEq "getProfile after 1st sign-in returns 200" r.status 200
+      c.expectOk "decode getProfile after 1st sign-in" (Qed.Proto.decode (α := Option AuthChecks.AuthNotesDb.profiles) r.body) fun
+        | some prof => do
             c.checkEq "onCreateAccount stored profile id" prof.id "usr_alice"
             c.checkEq "onCreateAccount stored profile email" prof.email "alice@qed.dev"
             c.checkEq "onCreateAccount(0) + onSignIn(+1) -> logins == 1" prof.logins 1
-        | .ok none => c.check "profile exists after 1st sign-in" false "got none"
-        | .error e => c.check "decode getProfile after 1st sign-in" false e
-    | .error e => c.check "getProfile after 1st sign-in" false e
+        | none => c.check "profile exists after 1st sign-in" false "got none"
 
     -- 11. Logout via `logoutUrl` (`GET /_qed/auth/logout?returnTo=/`) redirects 302 and clears cookie!
-    match ← httpReq appProc.port "GET" (AuthChecks.CloudAuth.logoutUrl "/").raw
-        #[("Cookie", sessionCookie)] with
-    | .ok r =>
-        c.checkEq "GET logoutUrl(/) returns 302" r.status 302
-        c.checkEq "GET logoutUrl(/) redirects to /" (r.header? "location") (some "/")
-        let scs := extractSetCookies r.headers
-        c.check "GET logoutUrl emits Max-Age=0 clear cookie" (scs.any fun s => s.contains "qed_session=" && s.contains "Max-Age=0")
-    | .error e => c.check "GET logoutUrl(/)" false e
+    c.expectOk "GET logoutUrl(/)" (← httpReq appProc.port "GET" (AuthChecks.CloudAuth.logoutUrl "/").raw #[("Cookie", sessionCookie)]) fun r => do
+      c.checkEq "GET logoutUrl(/) returns 302" r.status 302
+      c.checkEq "GET logoutUrl(/) redirects to /" (r.header? "location") (some "/")
+      let scs := extractSetCookies r.headers
+      c.check "GET logoutUrl emits Max-Age=0 clear cookie" (scs.any fun s => s.contains "qed_session=" && s.contains "Max-Age=0")
 
     -- 11a. POST logout (without returnTo) also clears cookie and returns 200 JSON
-    match ← httpReq appProc.port "POST" "/_qed/auth/logout"
-        #[("Cookie", sessionCookie), ("Origin", s!"http://127.0.0.1:{appProc.port}")] with
-    | .ok r =>
+    c.expectOk "POST /_qed/auth/logout"
+      (← httpReq appProc.port "POST" "/_qed/auth/logout" #[("Cookie", sessionCookie), ("Origin", s!"http://127.0.0.1:{appProc.port}")]) fun r => do
         c.checkEq "POST /_qed/auth/logout returns 200" r.status 200
         let scs := extractSetCookies r.headers
         c.check "logout emits Max-Age=0 clear cookie" (scs.any fun s => s.contains "qed_session=" && s.contains "Max-Age=0")
-    | .error e => c.check "POST /_qed/auth/logout" false e
 
     -- 11b. Second OIDC sign-in as Alice: `onCreateAccount` must NOT re-run; `onSignIn` increments `logins` to 2!
-    match ← httpReq appProc.port "GET" "/_qed/auth/login?returnTo=/" with
-    | .error e => c.check "2nd OIDC login step 1" false e
-    | .ok r1b =>
-        let txCookie2 := (findCookieByName (extractSetCookies r1b.headers) "qed_auth_tx").getD ""
-        let authPath2 := stripHostPrefix ((r1b.header? "location").getD "") ++
-          "&auto=1&sub=usr_alice&role=admin&email=alice%40qed.dev&orgId=org_42"
-        match ← httpReq devAuthPort "GET" authPath2 with
-        | .error e => c.check "2nd OIDC authorize step 2" false e
-        | .ok r2b =>
-            let cbPath2 := stripHostPrefix ((r2b.header? "location").getD "")
-            match ← httpReq appProc.port "GET" cbPath2 #[("Cookie", txCookie2)] with
-            | .error e => c.check "2nd OIDC callback step 3" false e
-            | .ok r3b =>
-                c.checkEq "2nd OIDC callback succeeds with 302" r3b.status 302
-                let sessCookie2 := (findCookieByName (extractSetCookies r3b.headers) "qed_session").getD ""
-                match ← httpReq appProc.port "POST" "/_qed/rpc/AuthApi/getProfile"
-                    #[("Content-Type", "application/x-protobuf"), ("Cookie", sessCookie2)] emptyProto with
-                | .ok rp2 =>
-                    c.checkEq "getProfile after 2nd sign-in returns 200" rp2.status 200
-                    match Qed.Proto.decode (α := Option AuthChecks.AuthNotesDb.profiles) rp2.body with
-                    | .ok (some prof2) =>
-                        c.checkEq "2nd sign-in skips onCreateAccount and increments logins == 2" prof2.logins 2
-                    | .ok none => c.check "profile exists after 2nd sign-in" false "got none"
-                    | .error e => c.check "decode getProfile after 2nd sign-in" false e
-                | .error e => c.check "getProfile after 2nd sign-in" false e
+    let sessCookie2 ← doOidcLogin "2nd OIDC" "/" aliceParams
+    if !sessCookie2.isEmpty then
+      c.expectOk "getProfile after 2nd sign-in" (← authRpc "getProfile" none #[("Cookie", sessCookie2)]) fun rp2 => do
+        c.checkEq "getProfile after 2nd sign-in returns 200" rp2.status 200
+        c.expectOk "decode getProfile after 2nd sign-in" (Qed.Proto.decode (α := Option AuthChecks.AuthNotesDb.profiles) rp2.body) fun
+          | some prof2 => c.checkEq "2nd sign-in skips onCreateAccount and increments logins == 2" prof2.logins 2
+          | none => c.check "profile exists after 2nd sign-in" false "got none"
 
   -- 12. Bearer ES256 JWT mode (Firebase/Supabase/Clerk style): member rejected (403), admin allowed (200)!
   let mintBearer (sub role : String) : IO (Option String) := do
@@ -335,49 +259,33 @@ private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit := do
         else return none
     | .error _ => return none
 
-  let emptyProto := Qed.Proto.encode ()
   match ← mintBearer "usr_bob" "member" with
   | none => c.check "mint member ES256 JWT" false
   | some memberJwt =>
-      -- Member can call `whoami` (200)
-      match ← httpReq appProc.port "POST" "/_qed/rpc/AuthApi/whoami"
-          #[("Content-Type", "application/x-protobuf"), ("Authorization", "Bearer " ++ memberJwt)] emptyProto with
-      | .ok r => c.checkEq "member Bearer ES256 JWT passes whoami (200)" r.status 200
-      | .error e => c.check "member Bearer whoami" false e
-      -- Member is forbidden from `adminAction` (403)
-      match ← httpReq appProc.port "POST" "/_qed/rpc/AuthApi/adminAction"
-          #[("Content-Type", "application/x-protobuf"), ("Authorization", "Bearer " ++ memberJwt)] emptyProto with
-      | .ok r => c.checkEq "member Bearer ES256 JWT blocked on adminAction (403)" r.status 403
-      | .error e => c.check "member Bearer adminAction" false e
+      c.checkStatus "member Bearer ES256 JWT passes whoami (200)" (← authRpc "whoami" (some memberJwt)) 200
+      c.checkStatus "member Bearer ES256 JWT blocked on adminAction (403)" (← authRpc "adminAction" (some memberJwt)) 403
 
   match ← mintBearer "usr_root" "admin" with
   | none => c.check "mint admin ES256 JWT" false
   | some adminJwt =>
-      match ← httpReq appProc.port "POST" "/_qed/rpc/AuthApi/adminAction"
-          #[("Content-Type", "application/x-protobuf"), ("Authorization", "Bearer " ++ adminJwt)] emptyProto with
-      | .ok r => c.checkEq "admin Bearer ES256 JWT passes adminAction (200)" r.status 200
-      | .error e => c.check "admin Bearer adminAction" false e
+      c.checkStatus "admin Bearer ES256 JWT passes adminAction (200)" (← authRpc "adminAction" (some adminJwt)) 200
 
   -- 13. PKCE S256 enforcement test on dev-auth `/token`: wrong `code_verifier` fails with 400!
   let chal := base64UrlEncode (← Prim.sha256 "correct-verifier-123".toUTF8)
   let pkceAuthPath := s!"/authorize?auto=1&client_id=qed-cloud-test&redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fcb&state=s1&nonce=n1&code_challenge={chal}"
-  match ← httpReq devAuthPort "GET" pkceAuthPath with
-  | .ok r =>
-      let loc := (r.header? "location").getD ""
-      let q := match loc.splitOn "?" with | _ :: qs => String.intercalate "?" qs | _ => ""
-      let code := ((parseQueryParams q).find? (·.1 == "code")).map Prod.snd |>.getD ""
-      let badForm := encodeFormBody [
-        ("grant_type", "authorization_code"),
-        ("code", code),
-        ("redirect_uri", "http://127.0.0.1:9999/cb"),
-        ("client_id", "qed-cloud-test"),
-        ("code_verifier", "WRONG-verifier")
-      ]
-      match ← httpReq devAuthPort "POST" "/token"
-          #[("Content-Type", "application/x-www-form-urlencoded")] badForm.toUTF8 with
-      | .ok rt => c.checkEq "PKCE S256 rejects wrong code_verifier (400)" rt.status 400
-      | .error e => c.check "PKCE wrong verifier check" false e
-  | .error e => c.check "PKCE authorize setup" false e
+  c.expectOk "PKCE authorize setup" (← httpReq devAuthPort "GET" pkceAuthPath) fun r => do
+    let loc := (r.header? "location").getD ""
+    let q := match loc.splitOn "?" with | _ :: qs => String.intercalate "?" qs | _ => ""
+    let code := ((parseQueryParams q).find? (·.1 == "code")).map Prod.snd |>.getD ""
+    let badForm := encodeFormBody [
+      ("grant_type", "authorization_code"),
+      ("code", code),
+      ("redirect_uri", "http://127.0.0.1:9999/cb"),
+      ("client_id", "qed-cloud-test"),
+      ("code_verifier", "WRONG-verifier")
+    ]
+    c.checkStatus "PKCE S256 rejects wrong code_verifier (400)"
+      (← httpReq devAuthPort "POST" "/token" #[("Content-Type", "application/x-www-form-urlencoded")] badForm.toUTF8) 400
 
   -- Clean teardown (prevents hanging background child processes!)
   appProc.stop

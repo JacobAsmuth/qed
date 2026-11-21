@@ -16,7 +16,8 @@ extern_lib libqed_server pkg := do
     ← inputTextFile (crateDir / "src" / "crypto.rs"),
     ← inputTextFile (crateDir / "src" / "outbound.rs"),
     ← inputTextFile (crateDir / "src" / "server.rs"),
-    ← inputTextFile (crateDir / "src" / "sqlite.rs")
+    ← inputTextFile (crateDir / "src" / "sqlite.rs"),
+    ← inputTextFile (crateDir / "src" / "watch.rs")
   ]
   buildFileAfterDep libFile srcJobs fun _ => do
     let incDir ← getLeanIncludeDir

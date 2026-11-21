@@ -202,6 +202,21 @@ def wsMuxP (i : Nat) : String :=
     | some (p, att) => toString (p.nextDelayMs att)
     | none => ""
 
+def tailSumAcc (n acc : Nat) : Nat :=
+  match n with
+  | 0 => acc
+  | k + 1 => tailSumAcc k (acc + k + 1)
+
+def codegenStressP (i : Nat) : String :=
+  -- Exercises direct-loop tail recursion, multi-branch join points, and closures (for `--min` identifier renaming)
+  let s := tailSumAcc (i * 10 + 5) 0
+  let tag :=
+    if i % 3 == 0 then s!"even3:{s}"
+    else if i % 3 == 1 then s!"mod1:{s + 1}"
+    else s!"mod2:{s + 2}"
+  let pairFn := fun (a b : Nat) => a * 17 + b
+  s!"{tag}|{pairFn i s}"
+
 def run (probe i : Nat) : String :=
   match probe with
   | 0 => renderCase i
@@ -219,6 +234,7 @@ def run (probe i : Nat) : String :=
   | 12 => protoP i
   | 13 => styleP i
   | 14 => wsMuxP i
+  | 15 => codegenStressP i
   | _ => ""
 
 def counts (probe : Nat) : Nat :=
@@ -238,12 +254,13 @@ def counts (probe : Nat) : Nat :=
   | 12 => 10
   | 13 => 2
   | 14 => 13
+  | 15 => 8
   | _ => 0
 
-def probeCount : Nat := 15
+def probeCount : Nat := 16
 
 def names : Array String := #["render", "diff", "arith", "string", "json", "date", "array", "router", "seg",
-  "childPatch", "wideRender", "keyIndex", "proto", "style", "wsMux"]
+  "childPatch", "wideRender", "keyIndex", "proto", "style", "wsMux", "codegenStress"]
 
 def jsonStr (s : String) : String :=
   "\"" ++ (s.foldl (init := "") fun acc c =>

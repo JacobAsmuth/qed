@@ -4,6 +4,7 @@ mod lean_ffi;
 mod outbound;
 mod server;
 mod sqlite;
+mod watch;
 
 pub(crate) fn last_errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)

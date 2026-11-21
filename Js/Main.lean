@@ -22,12 +22,14 @@ private def orThrow {α : Type} : Except String α → IO α
 
 private structure JsCliFlags where
   min : Bool := false
+  sourceMap : Bool := false
   rt? : Option String := none
   css? : Option (String × String) := none
 
 private def parseJsFlags : List String → JsCliFlags → Except String (JsCliFlags × List String)
   | [], f => .ok (f, [])
   | "--min" :: rest, f => parseJsFlags rest { f with min := true }
+  | "--sourcemap" :: rest, f => parseJsFlags rest { f with sourceMap := true }
   | ["--rt"], _ => .error "missing argument for `--rt`"
   | "--rt" :: path :: rest, f => parseJsFlags rest { f with rt? := some path }
   | ["--css"], _ => .error "missing arguments for `--css <out.css> <appDecl>`"
@@ -45,15 +47,24 @@ private def splitAlso : List String → List String × Option (String × List St
       (a :: h, also)
 
 private def writeJsBundle (env : Environment) (avail? : Option (Std.HashSet String))
-    (outPath : String) (entryArgs : List String) (min : Bool) : IO Unit := do
+    (outPath : String) (entryArgs : List String) (min : Bool) (sourceMap : Bool := false) : IO Unit := do
   let entries := entryArgs.map parseEntry
   if entries.isEmpty then throw (IO.userError "no entry decls given (after `--`)")
-  let (js, externs) ← orThrow (Js.emitProgramWithExterns env entries min)
-  if let some avail := avail? then orThrow (Js.checkRtExterns avail externs)
   let p : System.FilePath := outPath
   if let some dir := p.parent then IO.FS.createDirAll dir
-  IO.FS.writeFile p js
-  IO.println s!"wrote {outPath} ({js.length} bytes)"
+  if sourceMap then
+    let fileName := p.fileName.getD "app.mjs"
+    let mapFileName := fileName ++ ".map"
+    let (js, smJson, externs) ← orThrow (Js.emitProgramWithSourceMap env entries min fileName (some mapFileName))
+    if let some avail := avail? then orThrow (Js.checkRtExterns avail externs)
+    IO.FS.writeFile p js
+    IO.FS.writeFile (System.FilePath.mk (outPath ++ ".map")) smJson
+    IO.println s!"wrote {outPath} ({js.length} bytes) + {mapFileName} ({smJson.length} bytes)"
+  else
+    let (js, externs) ← orThrow (Js.emitProgramWithExterns env entries min)
+    if let some avail := avail? then orThrow (Js.checkRtExterns avail externs)
+    IO.FS.writeFile p js
+    IO.println s!"wrote {outPath} ({js.length} bytes)"
 
 private def tryImport (mods : List String) : IO (Option Environment) :=
   (some <$> loadEnv mods) <|> return none
@@ -148,12 +159,12 @@ def main (args : List String) : IO Unit := do
     | out :: mods =>
       let env ← loadEnv mods
       let avail? ← flags.rt?.mapM fun rtPath => return Js.rtExports (← IO.FS.readFile rtPath)
-      writeJsBundle env avail? out rest flags.min
+      writeJsBundle env avail? out rest flags.min flags.sourceMap
       if let some (out2, entries2) := also? then
-        writeJsBundle env avail? out2 entries2 flags.min
+        writeJsBundle env avail? out2 entries2 flags.min flags.sourceMap
       if let some (cssOut, appDecl) := flags.css? then
         try
           emitCssForApp env cssOut (parseEntry appDecl).1
         catch _ =>
           IO.println "HAS_CSS:0"
-    | [] => throw (IO.userError "usage: qedjs [--min] [--rt <rt.mjs>] [--css <out.css> <appDecl>] <out.mjs> <module>… -- <decl>[:<export>]… [--also <out2.mjs> -- <decl>…]")
+    | [] => throw (IO.userError "usage: qedjs [--min] [--sourcemap] [--rt <rt.mjs>] [--css <out.css> <appDecl>] <out.mjs> <module>… -- <decl>[:<export>]… [--also <out2.mjs> -- <decl>…]")

@@ -7,8 +7,27 @@ const textEnc = new TextEncoder(), textDec = new TextDecoder();
 const resolveWsUrl = (u) => u.startsWith('/') ? (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + u : u;
 
 let active = null;
+let currentApp = null;
 let listenersBound = false;
 const attached = new Set();
+
+// __qedDevHook
+const devEmit = (kind, detail) => {
+  const h = typeof window !== 'undefined' && window.__qedDevHook;
+  if (h) h(kind, detail);
+};
+const devRestoreState = (stateJson, localsJson) => {
+  if (!currentApp) return false;
+  if (active) active.teardown();
+  const root = document.getElementById('app');
+  if (root) root.innerHTML = '';
+  const ssrStateEl = document.getElementById('qed-state');
+  if (ssrStateEl) ssrStateEl.remove();
+  if (typeof stateJson === 'string' && stateJson.length > 0) globalThis.__qedHmrState = stateJson;
+  const next = mountApp(currentApp, true);
+  if (localsJson && localsJson !== '{}') { try { next.restore(localsJson); } catch (_) {} }
+  return true;
+};
 
 function bindRootListeners() {
   if (listenersBound) return;
@@ -61,29 +80,31 @@ function ensureEvent(event) {
   }, true);
 }
 
-function mountApp(app) {
+function mountApp(app, isTimeTravel = false) {
+  currentApp = app;
   $.registerDom(dom);
   $.assertExterns(app.__externs, $);
   bindRootListeners();
 
+  let devAfter = null;
   const init             = () => app.qed_init(W);
-  const dispatch         = (id) => app.qed_dispatch(id, W);
-  const dispatchStr      = (id, v) => app.qed_dispatch_str(id, v, W);
+  const dispatch         = (id) => { const r = app.qed_dispatch(id, W); if (devAfter && window.__qedDevHook) devAfter('dispatch', { id }); return r; };
+  const dispatchStr      = (id, v) => { const r = app.qed_dispatch_str(id, v, W); if (devAfter && window.__qedDevHook) devAfter('dispatchStr', { id, value: v }); return r; };
   const streamChunk      = (cid, data) => app.qed_stream_chunk(cid, data, W);
-  const streamDone       = (did) => app.qed_stream_done(did, W);
-  const httpDone         = (id, ok, text) => app.qed_http_done(id, ok, text, W);
-  const httpBytesDone    = (id, ok, bytes) => app.qed_http_bytes_done(id, ok, bytes, W);
-  const urlChanged       = (path) => app.qed_url_changed(path, W);
-  const localDispatch    = (key, id) => app.qed_local_dispatch(key, id, W);
-  const localDispatchStr = (key, id, v) => app.qed_local_dispatch_str(key, id, v, W);
+  const streamDone       = (did) => { const r = app.qed_stream_done(did, W); if (devAfter && window.__qedDevHook) devAfter('streamDone', { id: did }); return r; };
+  const httpDone         = (id, ok, text) => { const r = app.qed_http_done(id, ok, text, W); if (devAfter && window.__qedDevHook) devAfter('http', { id, ok: !!ok }); return r; };
+  const httpBytesDone    = (id, ok, bytes) => { const r = app.qed_http_bytes_done(id, ok, bytes, W); if (devAfter && window.__qedDevHook) devAfter('httpBytes', { id, ok: !!ok }); return r; };
+  const urlChanged       = (path) => { const r = app.qed_url_changed(path, W); if (devAfter && window.__qedDevHook) devAfter('url', { path }); return r; };
+  const localDispatch    = (key, id) => { const r = app.qed_local_dispatch(key, id, W); if (devAfter && window.__qedDevHook) devAfter('local', { key, id }); return r; };
+  const localDispatchStr = (key, id, v) => { const r = app.qed_local_dispatch_str(key, id, v, W); if (devAfter && window.__qedDevHook) devAfter('localStr', { key, id, value: v }); return r; };
   const localSnapshot    = () => $.ioVal(app.qed_local_snapshot(W));
   const localRestore     = (s) => app.qed_local_restore(s, W);
   const dehydrate        = () => (typeof app.qed_dehydrate === 'function' ? $.ioVal(app.qed_dehydrate(W)) : '');
-  const effectDone       = (id, result) => app.qed_effect_done(id, result, W);
-  const portRecv         = (name, payload) => app.qed_port_recv(name, payload, W);
+  const effectDone       = (id, result) => { const r = app.qed_effect_done(id, result, W); if (devAfter && window.__qedDevHook) devAfter('effect', { id }); return r; };
+  const portRecv         = (name, payload) => { const r = app.qed_port_recv(name, payload, W); if (devAfter && window.__qedDevHook) devAfter('port', { name }); return r; };
   const wsOpen           = (cid) => app.qed_ws_open(cid, W);
-  const wsBytes          = (cid, bytes) => app.qed_ws_bytes(cid, bytes, W);
-  const wsText           = (cid, text) => app.qed_ws_text(cid, text, W);
+  const wsBytes          = (cid, bytes) => { const r = app.qed_ws_bytes(cid, bytes, W); if (devAfter && window.__qedDevHook) devAfter('wsBytes', { cid }); return r; };
+  const wsText           = (cid, text) => { const r = app.qed_ws_text(cid, text, W); if (devAfter && window.__qedDevHook) devAfter('wsText', { cid }); return r; };
   const wsClose          = (cid, err, nowMs) => app.qed_ws_close(cid, err, BigInt(nowMs), W);
 
   const g = (globalThis.__qed ||= {});
@@ -93,6 +114,13 @@ function mountApp(app) {
 
   let disposed = false;
   const aborts = new Map();
+  // __qedDevHook
+  devAfter = (kind, meta) => {
+    let state = '', locals = '';
+    try { state = dehydrate() || ''; } catch (_) {}
+    try { locals = localSnapshot() || ''; } catch (_) {}
+    devEmit('action', { kind, ...meta, state, locals, inFlightHttp: aborts.size, ts: Date.now() });
+  };
   const trackAbort = (k) => { const c = new AbortController(); aborts.set(k, c); return c.signal; };
   const timers = {};
   const rawTimers = new Set();
@@ -248,6 +276,16 @@ function mountApp(app) {
 
   app.__main(W);
   init();
+  // __qedDevHook
+  if (typeof window !== 'undefined') {
+    window.__qedDevRestore = devRestoreState;
+    if (window.__qedDevHook) {
+      let state = '', locals = '';
+      try { state = dehydrate() || ''; } catch (_) {}
+      try { locals = localSnapshot() || ''; } catch (_) {}
+      devEmit('mount', { state, locals, restoreState: devRestoreState, isTimeTravel, ts: Date.now() });
+    }
+  }
   return active;
 }
 

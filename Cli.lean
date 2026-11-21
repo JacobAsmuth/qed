@@ -7,10 +7,13 @@ import Cli.Scaffold
 open Qed.Cli in
 def main (args : List String) : IO UInt32 := do
   match args with
-  | ["dev"]                             => cmdDev
-  | ["build"]                           => cmdBuild (prod := true)
-  | ["build", "--dev"]                  => cmdBuild (prod := false)
-  | ["build", "--dev", "--no-verify"]   => cmdBuild (prod := false) (skipVerify := true)
+  | ["dev"]                                    => cmdDev
+  | ["build"]                                  => cmdBuild (prod := true)
+  | ["build", "--sourcemap"]                   => cmdBuild (prod := true) (sourceMap := true)
+  | ["build", "--dev"]                         => cmdBuild (prod := false)
+  | ["build", "--dev", "--sourcemap"]          => cmdBuild (prod := false) (sourceMap := true)
+  | ["build", "--dev", "--no-verify"]          => cmdBuild (prod := false) (skipVerify := true)
+  | ["build", "--dev", "--no-verify", "--sourcemap"] => cmdBuild (prod := false) (skipVerify := true) (sourceMap := true)
   | ["start"] | ["preview"]             => cmdStart
   | "serve" :: rest                     => cmdServe rest
   | ["test"]                            => cmdTest

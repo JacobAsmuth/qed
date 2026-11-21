@@ -300,8 +300,9 @@ private def escapeJsonStr (s : String) : String := Id.run do
     else out := out.push c
   return out
 
-def writeDevStatus (outDir : FilePath) (status : String) (kind : String := "hmr")
-    (errText : String := "") (durationMs : Nat := 0) (bumpId : Bool := true) : IO Unit := do
+def writeDevStatusJson (outDir : FilePath) (status : String) (kind : String := "hmr")
+    (errText : String := "") (durationMs : Nat := 0) (bumpId : Bool := true)
+    (sseUrl : String := "") : IO String := do
   IO.FS.createDirAll outDir
   let buildIdPath := outDir / "__build_id"
   let idStr ←
@@ -311,15 +312,21 @@ def writeDevStatus (outDir : FilePath) (status : String) (kind : String := "hmr"
       pure id
     else
       pure (← IO.FS.readFile buildIdPath).cliTrim
+  let sseField := if sseUrl.isEmpty then "" else s!",\"sseUrl\":\"{escapeJsonStr sseUrl}\""
   let json :=
     s!"\{\"id\":\"{escapeJsonStr idStr}\"," ++
     s!"\"status\":\"{escapeJsonStr status}\"," ++
     s!"\"kind\":\"{escapeJsonStr kind}\"," ++
     s!"\"durationMs\":{durationMs}," ++
-    s!"\"error\":\"{escapeJsonStr errText}\"}\n"
+    s!"\"error\":\"{escapeJsonStr errText}\"{sseField}}\n"
   let tmp := outDir / "__dev_status.tmp"
   IO.FS.writeFile tmp json
   IO.FS.rename tmp (outDir / "__dev_status")
+  return json
+
+def writeDevStatus (outDir : FilePath) (status : String) (kind : String := "hmr")
+    (errText : String := "") (durationMs : Nat := 0) (bumpId : Bool := true) : IO Unit :=
+  discard <| writeDevStatusJson outDir status kind errText durationMs bumpId ""
 
 def writeBuildId (outDir : FilePath) : IO Unit :=
   writeDevStatus outDir "ok" "hmr" "" 0 true

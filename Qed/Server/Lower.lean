@@ -356,6 +356,24 @@ open Lean Elab Command in
 private abbrev SrvExprM := ReaderT LowerCtx LowerM
 
 open Lean Elab Command in
+private partial def lowerJsonPayload (go : ExprMode → Syntax → SrvExprM Term) (stx : Syntax) : SrvExprM Term := do
+  let u := unwrapParens1 stx
+  if u.getKind == ``qedRecLit && (u.getArg 1).getNumArgs != 2 then
+    let fields := (u.getArg 2).getSepArgs
+    let pairs ← fields.mapM fun f => do
+      let kLit := Syntax.mkStrLit (f.getArg 0).getId.eraseMacroScopes.toString
+      let vJson ← lowerJsonPayload go (f.getArg 2)
+      `(($kLit, $vJson))
+    `(Qed.Json.obj [$[$pairs],*])
+  else if u.getKind == ``qedArrLit then
+    let elems := (u.getArg 1).getSepArgs
+    let jElems ← elems.mapM (lowerJsonPayload go)
+    `(Qed.Json.arr [$[$jElems],*])
+  else
+    let v ← go .val stx
+    `(Qed.toJson $v)
+
+open Lean Elab Command in
 private def lowerSrvCallHook (stx calleeStx : Syntax) (rawArgs : Array Syntax) (mode : ExprMode)
     (go : ExprMode → Syntax → SrvExprM Term) : SrvExprM (Option Term) := do
   let ctx ← read
@@ -426,16 +444,15 @@ private def lowerSrvCallHook (stx calleeStx : Syntax) (rawArgs : Array Syntax) (
       else
         if posArgs.size != 1 then
           throwErrorAt stx s!"`{fnName}(...)` expects one positional argument (and optional `status = ...`)"
-        let argT ← go .val posArgs[0]!
         let defaultStatus : Nat := if fnName == "redirect" then 302 else 200
         let stT ← match statusStx? with
           | some s => go .val s
           | none   => let lit := Syntax.mkNumLit (toString defaultStatus); liftM (show CommandElabM Term from `(($lit : Nat)))
         match fnName with
-        | "text"     => return some (← `(Qed.Server.HttpResponse.text $argT $stT))
-        | "json"     => return some (← `(Qed.Server.HttpResponse.json $argT $stT))
-        | "html"     => return some (← `(Qed.Server.HttpResponse.html $argT $stT))
-        | "redirect" => return some (← `(Qed.Server.HttpResponse.redirect $argT $stT))
+        | "text"     => let argT ← go .val posArgs[0]!; return some (← `(Qed.Server.HttpResponse.text $argT $stT))
+        | "json"     => let jT ← lowerJsonPayload go posArgs[0]!; return some (← `(Qed.Server.HttpResponse.jsonOf $jT $stT))
+        | "html"     => let argT ← go .val posArgs[0]!; return some (← `(Qed.Server.HttpResponse.html $argT $stT))
+        | "redirect" => let argT ← go .val posArgs[0]!; return some (← `(Qed.Server.HttpResponse.redirect $argT $stT))
         | _          => pure ()
   return none
 

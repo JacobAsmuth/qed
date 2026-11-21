@@ -407,6 +407,10 @@ def json (body : String) (status : Nat := 200)
     (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
   { status, contentType := "application/json; charset=utf-8", body := body.toUTF8, headers, cookies }
 
+def jsonOf {α : Type} [ToJson α] (val : α) (status : Nat := 200)
+    (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
+  json (Json.render (toJson val)) status headers cookies
+
 def html (body : String) (status : Nat := 200)
     (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
   { status, contentType := "text/html; charset=utf-8", body := body.toUTF8, headers, cookies }

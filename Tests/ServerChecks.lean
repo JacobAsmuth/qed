@@ -499,14 +499,20 @@ server WebEssentialsSrv:
       if hits < 1000:
         hits += 1
     setCookie("wh_seen", "1")
-    return json("{\"ok\":true}")
+    return json({ ok = true })
 
   post "/echo-cookie":
     atomic:
       if hits < 1000:
         hits += 1
     setCookie("echo_ck", ctx.body)
-    return json("{\"ok\":true}")
+    return json({ ok = true })
+
+  get "/stats":
+    return json({ ok = true, hits = hits })
+
+  get "/hits":
+    return json(hits)
 
   stream "/events":
     send("hello", event = "greeting", id = "1")

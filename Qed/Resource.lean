@@ -1,6 +1,7 @@
 import Qed.Resource.Basic
 import Qed.Runtime.AppCore
 import Qed.Server.Ensured
+import Qed.Socket
 
 namespace Qed
 
@@ -106,19 +107,12 @@ def rpcQueryKey {Req : Type} [ToProto Req] : Option Req → String
 
 theorem rpcQueryKey_injective {Req : Type} [LawfulProto Req] {a b : Option Req}
     (h : rpcQueryKey a = rpcQueryKey b) : a = b := by
-  cases a <;> cases b
-  · rfl
-  · have := congrArg String.toList h; simp [rpcQueryKey] at this
-  · have := congrArg String.toList h; simp [rpcQueryKey] at this
-  · rename_i x y
-    have hlist := congrArg String.toList h
-    simp only [rpcQueryKey, String.toList_append] at hlist
-    have hBytes := congrArg Proto.decodeHex (show Proto.encodeHex (Proto.encode x) = _ by
-      simpa [String.ofList_toList] using congrArg String.ofList hlist)
-    simp only [Proto.decodeHex_encodeHex] at hBytes
-    have hDec := congrArg (Proto.decode (α := Req)) (Except.ok.inj hBytes)
-    simp only [Proto.decode_encode] at hDec
-    exact congrArg some (Except.ok.inj hDec)
+  match a, b, h with
+  | none, none, _ => rfl
+  | some _, some _, h =>
+      exact congrArg some (Proto.encodeHex_encode_injective Proto.encode Proto.decode Proto.decode_encode h)
+  | none, some _, h | some _, none, h =>
+      have := congrArg String.toList h; simp [rpcQueryKey] at this
 
 def Resource.query {Model Msg α : Type} [FromJson α]
     (key : Model → String) (url : String → String)
@@ -145,24 +139,12 @@ def Resource.rpcQuery {Model Msg Req α ResMsg : Type} [ToProto Req]
 /-- Triggers active queries at initial component boot (`init` / SSR entry). -/
 def Query.boot {Model Msg : Type} (qs : List (Query Model Msg))
     (ic : Model × Cmd Msg) : Model × Cmd Msg :=
-  qs.foldl (fun (mc : Model × Cmd Msg) q =>
-    let k0 := q.key mc.1
-    if k0.isEmpty then mc
-    else
-      let (m', c') := q.load k0 mc.1
-      (m', .batch [mc.2, c'])) ic
+  KeyedLifecycle.boot (·.key) (fun q k m => let r := q.load k m; (r.1, some r.2)) qs ic
 
 def Query.wrap {Model Msg : Type} (qs : List (Query Model Msg))
     (update : Model → Msg → Model × Cmd Msg) : Model → Msg → Model × Cmd Msg :=
-  fun old msg =>
-    let (new, cmd) := update old msg
-    qs.foldl (fun (mc : Model × Cmd Msg) q =>
-      let kNew := q.key mc.1
-      if q.key old == kNew then mc
-      else if kNew.isEmpty then (q.idle mc.1, mc.2)
-      else
-        let (m', c') := q.load kNew mc.1
-        (m', .batch [mc.2, c'])) (new, cmd)
+  KeyedLifecycle.wrap (·.key) (fun q m => (q.idle m, none))
+    (fun q k m => let r := q.load k m; (r.1, some r.2)) qs update
 
 namespace Internal
 
@@ -170,16 +152,10 @@ def App.withQueries {Model Msg : Type} (qs : List (Query Model Msg))
     (app : App Model Msg) : App Model Msg :=
   Internal.App.setInitAndUpdate app (Query.boot qs app.init) (Query.wrap qs app.update)
 
-@[simp] theorem App.withQueries_init (qs : List (Query Model Msg)) (app : App Model Msg) :
-    (App.withQueries qs app).init = Query.boot qs app.init := rfl
-@[simp] theorem App.withQueries_update (qs : List (Query Model Msg)) (app : App Model Msg) :
-    (App.withQueries qs app).update = Query.wrap qs app.update := rfl
-@[simp] theorem App.withQueries_template (qs : List (Query Model Msg)) (app : App Model Msg) :
-    (App.withQueries qs app).template = app.template := rfl
-@[simp] theorem App.withQueries_dehydrate (qs : List (Query Model Msg)) (app : App Model Msg) :
-    (App.withQueries qs app).dehydrate = app.dehydrate := rfl
-@[simp] theorem App.withQueries_rehydrate (qs : List (Query Model Msg)) (app : App Model Msg) :
-    (App.withQueries qs app).rehydrate = app.rehydrate := rfl
+defAppProjSimps App.withQueries (qs : List (Query Model Msg)) (app : App Model Msg) =>
+    App.withQueries qs app with
+  [init := Query.boot qs app.init, update := Query.wrap qs app.update,
+   template := app.template, dehydrate := app.dehydrate, rehydrate := app.rehydrate]
 
 end Internal
 
@@ -455,19 +431,8 @@ theorem Query.boot_preserves_inv {Model Msg : Type} (Inv : Model → Prop)
     (qs : List (Query Model Msg)) (ic : Model × Cmd Msg)
     (hinit : Inv ic.1)
     (hqs : ∀ q ∈ qs, ∀ k m, Inv m → Inv (q.load k m).1) :
-    Inv (Query.boot qs ic).1 := by
-  unfold Query.boot
-  induction qs generalizing ic with
-  | nil => exact hinit
-  | cons q rest ih =>
-      simp only [List.foldl_cons]
-      apply ih
-      · dsimp only
-        split
-        · exact hinit
-        · exact hqs q (List.mem_cons_self ..) _ _ hinit
-      · intro q' hq'
-        exact hqs q' (List.mem_cons_of_mem q hq')
+    Inv (Query.boot qs ic).1 :=
+  KeyedLifecycle.boot_preserves_inv Inv _ _ qs ic hinit hqs
 
 theorem Query.wrap_preserves_inv {Model Msg : Type} (Inv : Model → Prop)
     (qs : List (Query Model Msg)) (upd : Model → Msg → Model × Cmd Msg)
@@ -475,23 +440,9 @@ theorem Query.wrap_preserves_inv {Model Msg : Type} (Inv : Model → Prop)
     (hold : Inv old)
     (hupd : ∀ m, Inv m → Inv (upd m msg).1)
     (hqs : ∀ q ∈ qs, (∀ m, Inv m → Inv (q.idle m)) ∧ (∀ k m, Inv m → Inv (q.load k m).1)) :
-    Inv (Query.wrap qs upd old msg).1 := by
-  unfold Query.wrap
-  dsimp only
-  have hacc := hupd old hold
-  generalize upd old msg = acc at hacc ⊢
-  induction qs generalizing acc with
-  | nil => exact hacc
-  | cons q rest ih =>
-      rcases hqs q (List.mem_cons_self ..) with ⟨hidle, hload⟩
-      let hrest := fun q' hq' => hqs q' (List.mem_cons_of_mem q hq')
-      simp only [List.foldl_cons]
-      split
-      · exact ih hrest acc hacc
-      · split
-        · exact ih hrest (_, _) (hidle acc.1 hacc)
-        · exact ih hrest ((q.load (q.key acc.1) acc.1).1, Cmd.batch [acc.2, (q.load (q.key acc.1) acc.1).2])
-            (hload (q.key acc.1) acc.1 hacc)
+    Inv (Query.wrap qs upd old msg).1 :=
+  KeyedLifecycle.wrap_preserves_inv Inv _ _ _ qs upd old msg (hupd old hold)
+    (fun q hq => (hqs q hq).1) (fun q hq => (hqs q hq).2)
 
 theorem Query.wrap_noop_when_keys_unchanged {Model Msg : Type}
     (qs : List (Query Model Msg)) (upd : Model → Msg → Model × Cmd Msg)
@@ -499,14 +450,7 @@ theorem Query.wrap_noop_when_keys_unchanged {Model Msg : Type}
     (hunchanged : ∀ q ∈ qs, q.key (upd old msg).1 = q.key old) :
     Query.wrap qs upd old msg = upd old msg := by
   unfold Query.wrap
-  dsimp only
-  induction qs with
-  | nil => rfl
-  | cons q rest ih =>
-      have hq : q.key (upd old msg).1 = q.key old := hunchanged q (List.mem_cons_self ..)
-      have hrest : ∀ q' ∈ rest, q'.key (upd old msg).1 = q'.key old :=
-        fun q' h => hunchanged q' (List.mem_cons_of_mem q h)
-      simp only [List.foldl_cons, hq, beq_self_eq_true, ↓reduceIte]
-      exact ih hrest
+  exact KeyedLifecycle.wrap_noop_when_keys_unchanged _ _ _ qs upd old msg
+    (fun q hq => (hunchanged q hq).symm)
 
 end Qed

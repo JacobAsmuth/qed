@@ -3,6 +3,78 @@ import Qed.Runtime.AppCore
 
 namespace Qed
 
+/-! ## Generic Key-Diffing Reactive Lifecycle (`KeyedLifecycle`) -/
+
+namespace KeyedLifecycle
+
+@[reducible, simp] def applyRes {Model Msg : Type} (cmd : Cmd Msg)
+    (res : Model × Option (Cmd Msg)) : Model × Cmd Msg :=
+  (res.1, match res.2 with | some c => .batch [cmd, c] | none => cmd)
+
+@[reducible, simp] def boot {Item Model Msg : Type}
+    (key : Item → Model → String)
+    (onBoot : Item → String → Model → Model × Option (Cmd Msg))
+    (items : List Item) (ic : Model × Cmd Msg) : Model × Cmd Msg :=
+  items.foldl (fun mc it =>
+    let k0 := key it mc.1
+    if k0.isEmpty then mc else applyRes mc.2 (onBoot it k0 mc.1)) ic
+
+@[reducible, simp] def wrap {Item Model Msg : Type}
+    (key : Item → Model → String)
+    (onLeave : Item → Model → Model × Option (Cmd Msg))
+    (onEnter : Item → String → Model → Model × Option (Cmd Msg))
+    (items : List Item)
+    (update : Model → Msg → Model × Cmd Msg) : Model → Msg → Model × Cmd Msg :=
+  fun old msg =>
+    items.foldl (fun mc it =>
+      let kNew := key it mc.1
+      if key it old == kNew then mc
+      else if kNew.isEmpty then applyRes mc.2 (onLeave it mc.1)
+      else applyRes mc.2 (onEnter it kNew mc.1)) (update old msg)
+
+private theorem foldl_preserves {α β : Type} (P : α → Prop) (f : α → β → α)
+    (xs : List β) (acc : α) (hacc : P acc) (hf : ∀ x ∈ xs, ∀ a, P a → P (f a x)) :
+    P (xs.foldl f acc) := by
+  induction xs generalizing acc with
+  | nil => exact hacc
+  | cons x rest ih =>
+      exact ih _ (hf x (List.mem_cons_self ..) _ hacc) (fun y hy => hf y (List.mem_cons_of_mem x hy))
+
+theorem boot_preserves_inv {Item Model Msg : Type} (Inv : Model → Prop)
+    (key : Item → Model → String) (onBoot : Item → String → Model → Model × Option (Cmd Msg))
+    (items : List Item) (ic : Model × Cmd Msg) (hinit : Inv ic.1)
+    (hboot : ∀ it ∈ items, ∀ k m, Inv m → Inv (onBoot it k m).1) :
+    Inv (boot key onBoot items ic).1 :=
+  foldl_preserves (Inv ·.1) _ items ic hinit fun it hit mc hmc => by
+    dsimp only; split
+    · exact hmc
+    · exact hboot it hit _ _ hmc
+
+theorem wrap_preserves_inv {Item Model Msg : Type} (Inv : Model → Prop)
+    (key : Item → Model → String) (onLeave : Item → Model → Model × Option (Cmd Msg))
+    (onEnter : Item → String → Model → Model × Option (Cmd Msg))
+    (items : List Item) (upd : Model → Msg → Model × Cmd Msg) (old : Model) (msg : Msg)
+    (hacc : Inv (upd old msg).1) (hleave : ∀ it ∈ items, ∀ m, Inv m → Inv (onLeave it m).1)
+    (henter : ∀ it ∈ items, ∀ k m, Inv m → Inv (onEnter it k m).1) :
+    Inv (wrap key onLeave onEnter items upd old msg).1 :=
+  foldl_preserves (Inv ·.1) _ items (upd old msg) hacc fun it hit mc hmc => by
+    dsimp only; split
+    · exact hmc
+    · split
+      · exact hleave it hit _ hmc
+      · exact henter it hit _ _ hmc
+
+theorem wrap_noop_when_keys_unchanged {Item Model Msg : Type}
+    (key : Item → Model → String) (onLeave : Item → Model → Model × Option (Cmd Msg))
+    (onEnter : Item → String → Model → Model × Option (Cmd Msg))
+    (items : List Item) (upd : Model → Msg → Model × Cmd Msg) (old : Model) (msg : Msg)
+    (hsame : ∀ it ∈ items, key it old = key it (upd old msg).1) :
+    wrap key onLeave onEnter items upd old msg = upd old msg :=
+  foldl_preserves (· = upd old msg) _ items (upd old msg) rfl fun it hit mc hmc => by
+    subst hmc; simp only [beq_iff_eq.2 (hsame it hit), ↓reduceIte]
+
+end KeyedLifecycle
+
 /-! ## Reactive WebSocket Subscriptions (`Subscription`) & Formal Lifecycle Guarantees -/
 
 /-- A reactive, key-driven WebSocket subscription attached to a component `App`.
@@ -21,13 +93,7 @@ namespace Subscription
 /-- Starts any subscriptions whose initial key is non-empty on non-SSR client boot. -/
 def boot {Model Msg : Type} (subs : List (Subscription Model Msg))
     (ic : Model × Cmd Msg) : Model × Cmd Msg :=
-  subs.foldl (fun (mc : Model × Cmd Msg) s =>
-    let k0 := s.key mc.1
-    if k0.isEmpty then mc
-    else
-      match s.openCmd k0 mc.1 with
-      | some c => (mc.1, .batch [mc.2, c])
-      | none   => mc) ic
+  KeyedLifecycle.boot (·.key) (fun s k m => (m, s.openCmd k m)) subs ic
 
 /-- Starts active subscriptions after SSR rehydration on the browser client. -/
 def hydrateCmds {Model Msg : Type} (subs : List (Subscription Model Msg)) (m : Model) : Cmd Msg :=
@@ -40,29 +106,17 @@ def hydrateCmds {Model Msg : Type} (subs : List (Subscription Model Msg)) (m : M
     new keys emit `openCmd` (which atomically supersedes the prior `subId` in the host). -/
 def wrap {Model Msg : Type} (subs : List (Subscription Model Msg))
     (update : Model → Msg → Model × Cmd Msg) : Model → Msg → Model × Cmd Msg :=
-  fun old msg =>
-    let (new, cmd) := update old msg
-    subs.foldl (fun (mc : Model × Cmd Msg) s =>
-      let kNew := s.key mc.1
-      if s.key old == kNew then mc
-      else if kNew.isEmpty then (s.onClose mc.1, .batch [mc.2, s.closeCmd])
-      else
-        match s.openCmd kNew mc.1 with
-        | some c => (mc.1, .batch [mc.2, c])
-        | none   => (s.onClose mc.1, .batch [mc.2, s.closeCmd])) (new, cmd)
+  KeyedLifecycle.wrap (·.key)
+    (fun s m => (s.onClose m, some s.closeCmd))
+    (fun s k m => match s.openCmd k m with
+      | some c => (m, some c)
+      | none   => (s.onClose m, some s.closeCmd))
+    subs update
 
 theorem boot_state_eq {Model Msg : Type} (subs : List (Subscription Model Msg))
     (ic : Model × Cmd Msg) :
-    (boot subs ic).1 = ic.1 := by
-  induction subs generalizing ic with
-  | nil => rfl
-  | cons s rest ih =>
-      simp only [boot, List.foldl_cons] at ih ⊢
-      split
-      · exact ih ic
-      · cases s.openCmd (s.key ic.1) ic.1 with
-        | none   => exact ih ic
-        | some c => exact ih (ic.1, .batch [ic.2, c])
+    (boot subs ic).1 = ic.1 :=
+  KeyedLifecycle.boot_preserves_inv (· = ic.1) _ _ subs ic rfl (fun _ _ _ _ h => h)
 
 theorem boot_preserves_inv {Model Msg : Type} (P : Model → Prop)
     (subs : List (Subscription Model Msg)) (ic : Model × Cmd Msg)
@@ -76,37 +130,12 @@ theorem wrap_preserves_inv {Model Msg : Type} (P : Model → Prop)
     (update : Model → Msg → Model × Cmd Msg)
     (hupd : ∀ m msg, P m → P (update m msg).1)
     (hclose : ∀ s ∈ subs, ∀ m, P m → P (s.onClose m)) :
-    ∀ m msg, P m → P (wrap subs update m msg).1 := by
-  intro old msg hm
-  unfold wrap
-  have h0 : P (update old msg).1 := hupd old msg hm
-  suffices ∀ (ss : List (Subscription Model Msg)) (mc : Model × Cmd Msg),
-      (∀ s ∈ ss, ∀ m, P m → P (s.onClose m)) → P mc.1 →
-      P (ss.foldl (fun (mc : Model × Cmd Msg) s =>
-        let kNew := s.key mc.1
-        if s.key old == kNew then mc
-        else if kNew.isEmpty then (s.onClose mc.1, .batch [mc.2, s.closeCmd])
-        else
-          match s.openCmd kNew mc.1 with
-          | some c => (mc.1, .batch [mc.2, c])
-          | none   => (s.onClose mc.1, .batch [mc.2, s.closeCmd])) mc).1 by
-    exact this subs (update old msg) hclose h0
-  intro ss
-  induction ss with
-  | nil => intro mc _ hmc; exact hmc
-  | cons s rest ih =>
-      intro mc hcl hmc
-      simp only [List.foldl_cons]
-      have hrest : ∀ r ∈ rest, ∀ m, P m → P (r.onClose m) :=
-        fun r hr => hcl r (List.mem_cons_of_mem s hr)
-      have hs : ∀ m, P m → P (s.onClose m) := hcl s (List.mem_cons_self ..)
-      split
-      · exact ih mc hrest hmc
-      · split
-        · exact ih (s.onClose mc.1, _) hrest (hs mc.1 hmc)
-        · cases s.openCmd (s.key mc.1) mc.1 with
-          | some c => exact ih (mc.1, _) hrest hmc
-          | none   => exact ih (s.onClose mc.1, _) hrest (hs mc.1 hmc)
+    ∀ m msg, P m → P (wrap subs update m msg).1 :=
+  fun old msg hm => KeyedLifecycle.wrap_preserves_inv P _ _ _ subs update old msg
+    (hupd old msg hm) hclose (fun s hs k m hm => by
+      cases s.openCmd k m with
+      | some _ => exact hm
+      | none   => exact hclose s hs m hm)
 
 theorem wrap_noop_when_keys_unchanged {Model Msg : Type}
     (subs : List (Subscription Model Msg))
@@ -115,26 +144,7 @@ theorem wrap_noop_when_keys_unchanged {Model Msg : Type}
     (hsame : ∀ s ∈ subs, s.key old = s.key (update old msg).1) :
     wrap subs update old msg = update old msg := by
   unfold wrap
-  suffices ∀ (ss : List (Subscription Model Msg)) (mc : Model × Cmd Msg),
-      (∀ s ∈ ss, s.key old = s.key mc.1) →
-      ss.foldl (fun (mc : Model × Cmd Msg) s =>
-        let kNew := s.key mc.1
-        if s.key old == kNew then mc
-        else if kNew.isEmpty then (s.onClose mc.1, .batch [mc.2, s.closeCmd])
-        else
-          match s.openCmd kNew mc.1 with
-          | some c => (mc.1, .batch [mc.2, c])
-          | none   => (s.onClose mc.1, .batch [mc.2, s.closeCmd])) mc = mc by
-    exact this subs (update old msg) hsame
-  intro ss
-  induction ss with
-  | nil => intro mc _; rfl
-  | cons s rest ih =>
-      intro mc hall
-      simp only [List.foldl_cons]
-      have hs : (s.key old == s.key mc.1) = true := beq_iff_eq.2 (hall s (List.mem_cons_self ..))
-      simp only [hs, ↓reduceIte]
-      exact ih mc (fun r hr => hall r (List.mem_cons_of_mem s hr))
+  exact KeyedLifecycle.wrap_noop_when_keys_unchanged _ _ _ subs update old msg hsame
 
 end Subscription
 
@@ -147,18 +157,11 @@ def App.withSubscriptions {Model Msg : Type} (subs : List (Subscription Model Ms
     (Subscription.wrap subs app.update)
     (fun m => .batch [app.onHydrate m, Subscription.hydrateCmds subs m])
 
-@[simp] theorem App.withSubscriptions_init (subs : List (Subscription Model Msg)) (app : App Model Msg) :
-    (App.withSubscriptions subs app).init = Subscription.boot subs app.init := rfl
-@[simp] theorem App.withSubscriptions_update (subs : List (Subscription Model Msg)) (app : App Model Msg) :
-    (App.withSubscriptions subs app).update = Subscription.wrap subs app.update := rfl
-@[simp] theorem App.withSubscriptions_template (subs : List (Subscription Model Msg)) (app : App Model Msg) :
-    (App.withSubscriptions subs app).template = app.template := rfl
-@[simp] theorem App.withSubscriptions_dehydrate (subs : List (Subscription Model Msg)) (app : App Model Msg) :
-    (App.withSubscriptions subs app).dehydrate = app.dehydrate := rfl
-@[simp] theorem App.withSubscriptions_rehydrate (subs : List (Subscription Model Msg)) (app : App Model Msg) :
-    (App.withSubscriptions subs app).rehydrate = app.rehydrate := rfl
+defAppProjSimps App.withSubscriptions (subs : List (Subscription Model Msg)) (app : App Model Msg) =>
+    App.withSubscriptions subs app with
+  [init := Subscription.boot subs app.init, update := Subscription.wrap subs app.update,
+   template := app.template, dehydrate := app.dehydrate, rehydrate := app.rehydrate]
 
 end Internal
-
 
 end Qed

@@ -397,23 +397,7 @@ def wsTopicKey {Params : Type} [ToProto Params] (channel : String) (params : Par
 
 theorem wsTopicKey_injective {Params : Type} [LawfulProto Params]
     (channel : String) (a b : Params)
-    (h : wsTopicKey channel a = wsTopicKey channel b) : a = b := by
-  unfold wsTopicKey at h
-  have hlist := congrArg String.toList h
-  simp only [String.toList_append] at hlist
-  have hhexList := List.append_cancel_left hlist
-  have hhex : Proto.encodeHex (Proto.encode a) = Proto.encodeHex (Proto.encode b) :=
-    String.toList_injective hhexList
-  have hbytes : Proto.encode a = Proto.encode b := by
-    have ha := Proto.decodeHex_encodeHex (Proto.encode a)
-    have hb := Proto.decodeHex_encodeHex (Proto.encode b)
-    rw [hhex] at ha
-    rw [ha] at hb
-    injection hb
-  have hda := Proto.decode_encode a
-  have hdb := Proto.decode_encode b
-  rw [hbytes] at hda
-  rw [hda] at hdb
-  injection hdb
+    (h : wsTopicKey channel a = wsTopicKey channel b) : a = b :=
+  Proto.encodeHex_encode_injective Proto.encode Proto.decode Proto.decode_encode h
 
 end Qed

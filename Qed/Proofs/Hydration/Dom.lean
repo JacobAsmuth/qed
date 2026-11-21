@@ -242,6 +242,37 @@ theorem HydratableDomList_frame {msg : Type} (f : Nat) (ns : String) (ds : List 
     (HydratableDom_frame f)
     ns ds a a' lo hi ns' hle hfr h
 
+theorem hydrateTextSlotM_alloc_spec (a : DomArena msg) (parent : Dom.Node) (inTextRun : Bool)
+    (s : String) (hcond : s = "" ∨ inTextRun = true) (moreInRun : Unit → Bool)
+    (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
+    (pre suf : List Dom.Node) (hnot : UInt32.ofNat a.nextId ∉ pre ++ suf)
+    (hdisj : ∀ r ∈ suf, r ∉ pre) (hpreLen : pre.length < UInt32.size)
+    (hparNe : parent ≠ UInt32.ofNat a.nextId)
+    (hpar : a.get parent = .element pns ptag pst pmg (pre ++ suf)) :
+    let tn := UInt32.ofNat a.nextId
+    let ((outNode, outRun), a') :=
+      (hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) inTextRun s moreInRun).run a
+    outNode = tn ∧ outRun = inTextRun ∧ a'.nextId = a.nextId + 1 ∧
+    a'.get tn = .text s ∧ a'.get parent = .element pns ptag pst pmg (pre ++ tn :: suf) ∧
+    (∀ m : Dom.Node, m ≠ parent → m ≠ tn → a'.get m = a.get m) := by
+  have hins : w3cInsertBefore (pre ++ suf) (UInt32.ofNat pre.length).toNat (UInt32.ofNat a.nextId) =
+      pre ++ UInt32.ofNat a.nextId :: suf := by
+    rw [uint32_toNat_ofNat_lt pre.length hpreLen]; exact w3cInsertBefore_fresh_append pre suf _ hnot hdisj
+  have hallocPar : (DomArena.mk (a.nextId + 1)
+      (fun m => if m == UInt32.ofNat a.nextId then .text s else a.store m)
+      a.signals a.sigEvents a.tmpls a.rowEvs).get parent = .element pns ptag pst pmg (pre ++ suf) := by
+    simp [DomArena.get, hparNe]; exact hpar
+  dsimp only [hydrateTextSlotM]
+  by_cases hs : (s == "") = true <;> (
+    first
+    | (have hse : s = "" := beq_iff_eq.1 hs; subst hse; rw [if_pos hs])
+    | (have hir : inTextRun = true := hcond.resolve_left (fun h => hs (by rw [h]; rfl)); subst hir; rw [if_neg hs, if_pos rfl])
+    dsimp only [StateT.run, bind, StateT.bind, pure,
+      MonadDom.createText, DomArena.alloc, MonadDom.insertBeforeNode, DomArena.modifyChildren, DomArena.modify]
+    rw [hallocPar]; dsimp only
+    exact ⟨rfl, rfl, rfl, by simp [DomArena.get, DomArena.set, hparNe.symm], by rw [DomArena.get_set_self, hins],
+      fun m hm1 hm2 => by simp [DomArena.get, DomArena.set, hm1, hm2]⟩)
+
 /-- Imperative `hydrateTextSlotM` equivalence over `DomArena`:
     handles all three HTML5 hydration cases (`s == ""` placeholder insertion, `inTextRun` split
     insertion, and reused first text node trimming via `setText` when `hasMoreText rest`), returning
@@ -260,30 +291,11 @@ theorem hydrateTextSlotM_empty_spec (a : DomArena msg) (parent : Dom.Node) (inTe
     a'.nextId = a.nextId + 1 ∧
     a'.get ph = .text "" ∧
     a'.get parent = .element pns ptag pst pmg (pre ++ ph :: suf) ∧
-    (∀ m : Dom.Node, m ≠ parent → m ≠ ph → a'.get m = a.get m) := by
-  have huIdx : (UInt32.ofNat pre.length).toNat = pre.length := uint32_toNat_ofNat_lt pre.length hpreLen
-  have hins : w3cInsertBefore (pre ++ suf) (UInt32.ofNat pre.length).toNat (UInt32.ofNat a.nextId) =
-      pre ++ UInt32.ofNat a.nextId :: suf := by
-    rw [huIdx]
-    exact w3cInsertBefore_fresh_append pre suf (UInt32.ofNat a.nextId) hnot hdisj
-  have hallocPar : (DomArena.mk (a.nextId + 1)
-      (fun m => if m == UInt32.ofNat a.nextId then .text "" else a.store m)
-      a.signals a.sigEvents a.tmpls a.rowEvs).get parent = .element pns ptag pst pmg (pre ++ suf) := by
-    simp [DomArena.get, hparNe]; exact hpar
-  dsimp only [hydrateTextSlotM]
-  rw [if_pos (beq_self_eq_true "")]
-  dsimp only [StateT.run, bind, StateT.bind, pure,
-              MonadDom.createText, DomArena.alloc, MonadDom.insertBeforeNode, DomArena.modifyChildren, DomArena.modify]
-  rw [hallocPar]
-  dsimp only
-  refine ⟨rfl, rfl, rfl, ?_, ?_, ?_⟩
-  · simp [DomArena.get, DomArena.set, hparNe.symm]
-  · rw [DomArena.get_set_self, hins]
-  · intro m hm1 hm2
-    simp [DomArena.get, DomArena.set, hm1, hm2]
+    (∀ m : Dom.Node, m ≠ parent → m ≠ ph → a'.get m = a.get m) :=
+  hydrateTextSlotM_alloc_spec a parent inTextRun "" (.inl rfl) moreInRun pns ptag pst pmg pre suf hnot hdisj hpreLen hparNe hpar
 
 theorem hydrateTextSlotM_split_spec (a : DomArena msg) (parent : Dom.Node) (s : String)
-    (hs : s ≠ "") (moreInRun : Unit → Bool)
+    (_hs : s ≠ "") (moreInRun : Unit → Bool)
     (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
     (pre suf : List Dom.Node) (_hlt : a.nextId < UInt32.size) (hnot : UInt32.ofNat a.nextId ∉ pre ++ suf)
     (hdisj : ∀ r ∈ suf, r ∉ pre)
@@ -297,28 +309,8 @@ theorem hydrateTextSlotM_split_spec (a : DomArena msg) (parent : Dom.Node) (s : 
     a'.nextId = a.nextId + 1 ∧
     a'.get tn = .text s ∧
     a'.get parent = .element pns ptag pst pmg (pre ++ tn :: suf) ∧
-    (∀ m : Dom.Node, m ≠ parent → m ≠ tn → a'.get m = a.get m) := by
-  have huIdx : (UInt32.ofNat pre.length).toNat = pre.length := uint32_toNat_ofNat_lt pre.length hpreLen
-  have hne : (s == "") = false := beq_eq_false_iff_ne.2 hs
-  have hins : w3cInsertBefore (pre ++ suf) (UInt32.ofNat pre.length).toNat (UInt32.ofNat a.nextId) =
-      pre ++ UInt32.ofNat a.nextId :: suf := by
-    rw [huIdx]
-    exact w3cInsertBefore_fresh_append pre suf (UInt32.ofNat a.nextId) hnot hdisj
-  have hallocPar : (DomArena.mk (a.nextId + 1)
-      (fun m => if m == UInt32.ofNat a.nextId then .text s else a.store m)
-      a.signals a.sigEvents a.tmpls a.rowEvs).get parent = .element pns ptag pst pmg (pre ++ suf) := by
-    simp [DomArena.get, hparNe]; exact hpar
-  dsimp only [hydrateTextSlotM]
-  rw [if_neg (by simp [hne]), if_pos rfl]
-  dsimp only [StateT.run, bind, StateT.bind, pure,
-              MonadDom.createText, DomArena.alloc, MonadDom.insertBeforeNode, DomArena.modifyChildren, DomArena.modify]
-  rw [hallocPar]
-  dsimp only
-  refine ⟨rfl, rfl, rfl, ?_, ?_, ?_⟩
-  · simp [DomArena.get, DomArena.set, hparNe.symm]
-  · rw [DomArena.get_set_self, hins]
-  · intro m hm1 hm2
-    simp [DomArena.get, DomArena.set, hm1, hm2]
+    (∀ m : Dom.Node, m ≠ parent → m ≠ tn → a'.get m = a.get m) :=
+  hydrateTextSlotM_alloc_spec a parent true s (.inr rfl) moreInRun pns ptag pst pmg pre suf hnot hdisj hpreLen hparNe hpar
 
 theorem hydrateTextSlotM_head_spec (a : DomArena msg) (parent tn : Dom.Node) (s rawTail : String)
     (hs : s ≠ "") (more : Bool) (hmore : more = false → rawTail = "")
@@ -634,75 +626,43 @@ private theorem hydrateDomKidsM_spec_step {msg : Type} (f : Nat)
           simp only [htmlListNodeCount, htmlNodeCount] at hbound
           simp only [htmlListDepth] at hdep
           have hrestDep : htmlListDepth rest ≤ f := Nat.le_trans (Nat.le_max_right _ _) hdep
-          by_cases hsEmpty : s = ""
-          · subst hsEmpty
-            have hdom' : HydratableDomList f childNs (if inTextRun then dropCurrentTextRun rest else coalesceTextRun rest) a lo hi domCs := by
-              cases inTextRun <;> simpa [coalesceTextRun, dropCurrentTextRun] using hdom
+          by_cases halloc : s = "" ∨ inTextRun = true
+          · have hdom' : HydratableDomList f childNs (if inTextRun then dropCurrentTextRun rest else coalesceTextRun rest) a lo hi domCs := by
+              rcases halloc with rfl | rfl
+              · cases inTextRun <;> simpa [coalesceTextRun, dropCurrentTextRun] using hdom
+              · by_cases hs : s = "" <;> simpa [dropCurrentTextRun, Html.textOf?, hs] using hdom
             rcases hydrateDomKidsM_fresh_nextId f childNs parent _ pre domCs lo hi a hposF (by omega) hparLo hpreSub hdom' with
-              ⟨hnotIn, hparNePh⟩
-            let ph := UInt32.ofNat a.nextId
+              ⟨hnotIn, hparNeTn⟩
+            let tn := UInt32.ofNat a.nextId
             let resSlot := (hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length)
-              inTextRun "" (fun () => hasMoreText rest)).run a
+              inTextRun s (fun () => hasMoreText rest)).run a
             let aMid := resSlot.2
-            have hslot := hydrateTextSlotM_empty_spec a parent inTextRun (fun () => hasMoreText rest)
-              pns ptag pst pmg pre domCs (by omega) hnotIn hdisjDom (by simp at hlen; omega) hparNePh hpar
+            have hslot := hydrateTextSlotM_alloc_spec a parent inTextRun s halloc (fun () => hasMoreText rest)
+              pns ptag pst pmg pre domCs hnotIn hdisjDom (by simp at hlen; omega) hparNeTn hpar
             have haMidNext : aMid.nextId = a.nextId + 1 := hslot.2.2.1
-            have hgetParMid : aMid.get parent = .element pns ptag pst pmg (pre ++ ph :: domCs) := hslot.2.2.2.2.1
-            exact hydrateDomKidsM_allocText_step f childNs parent pns ptag pst pmg "" rest inTextRun inTextRun
-              _ pre domCs lo hi a aMid hposF hparLo hloHi hhiNext hbound hpreSub hparNePh
+            exact hydrateDomKidsM_allocText_step f childNs parent pns ptag pst pmg s rest inTextRun inTextRun
+              _ pre domCs lo hi a aMid hposF hparLo hloHi hhiNext hbound hpreSub hparNeTn
               haMidNext hslot.2.2.2.1 hslot.2.2.2.2.2 hdom'
-              (fun hpreMid hdomMid => ih inTextRun (pre ++ [ph]) domCs lo hi aMid
+              (fun hpreMid hdomMid => ih inTextRun (pre ++ [tn]) domCs lo hi aMid
                 (by simp only [List.length_append, List.length_singleton]; simp only [List.length_cons] at hlen; omega)
-                (by rw [haMidNext]; omega) hrestDep hparLo hpreMid (by simpa using hgetParMid) hdomMid)
+                (by rw [haMidNext]; omega) hrestDep hparLo hpreMid (by simpa using hslot.2.2.2.2.1) hdomMid)
               (by
                 dsimp only [StateT.run, hydrateDomKidsM, Html.textOf?, bind, StateT.bind]
                 have hSlotEq : hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length)
-                    inTextRun "" (fun () => hasMoreText rest) a = ((ph, inTextRun), aMid) :=
+                    inTextRun s (fun () => hasMoreText rest) a = ((tn, inTextRun), aMid) :=
                   Prod.ext (Prod.ext hslot.1 hslot.2.1) rfl
-                rw [hSlotEq]
-                dsimp only
-                simp only [List.length_append, List.length_singleton]
-                rw [← huIdxNext])
-          · cases inTextRun with
-            | true =>
-                have hdom' : HydratableDomList f childNs (dropCurrentTextRun rest) a lo hi domCs := by
-                  simpa [dropCurrentTextRun, Html.textOf?, hsEmpty] using hdom
-                rcases hydrateDomKidsM_fresh_nextId f childNs parent _ pre domCs lo hi a hposF (by omega) hparLo hpreSub hdom' with
-                  ⟨hnotIn, hparNeTn⟩
-                let tn := UInt32.ofNat a.nextId
-                let resSlot := (hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length)
-                  true s (fun () => hasMoreText rest)).run a
-                let aMid := resSlot.2
-                have hslot := hydrateTextSlotM_split_spec a parent s hsEmpty (fun () => hasMoreText rest)
-                  pns ptag pst pmg pre domCs (by omega) hnotIn hdisjDom (by simp at hlen; omega) hparNeTn hpar
-                have haMidNext : aMid.nextId = a.nextId + 1 := hslot.2.2.1
-                have hgetParMid : aMid.get parent = .element pns ptag pst pmg (pre ++ tn :: domCs) := hslot.2.2.2.2.1
-                exact hydrateDomKidsM_allocText_step f childNs parent pns ptag pst pmg s rest true true
-                  _ pre domCs lo hi a aMid hposF hparLo hloHi hhiNext hbound hpreSub hparNeTn
-                  haMidNext hslot.2.2.2.1 hslot.2.2.2.2.2 hdom'
-                  (fun hpreMid hdomMid => ih true (pre ++ [tn]) domCs lo hi aMid
-                    (by simp only [List.length_append, List.length_singleton]; simp only [List.length_cons] at hlen; omega)
-                    (by rw [haMidNext]; omega) hrestDep hparLo hpreMid (by simpa using hgetParMid)
-                    (by simpa using hdomMid))
-                  (by
-                    dsimp only [StateT.run, hydrateDomKidsM, Html.textOf?, bind, StateT.bind]
-                    have hSlotEq : hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length)
-                        true s (fun () => hasMoreText rest) a = ((tn, true), aMid) :=
-                      Prod.ext (Prod.ext hslot.1 hslot.2.1) rfl
-                    rw [hSlotEq]
-                    dsimp only
-                    simp only [List.length_append, List.length_singleton]
-                    rw [← huIdxNext])
-            | false =>
-                have hdomCoal : HydratableDomList f childNs (.text (s ++ restOfTextRun rest) :: dropCurrentTextRun rest) a lo hi domCs := by
-                  simpa [coalesceTextRun, Html.textOf?, hsEmpty] using hdom
-                cases domCs with
-                | nil => exact False.elim hdomCoal
-                | cons tn domRest =>
-                    rcases HydratableDomList_cons_bounds hdomCoal with ⟨mid, hloMid, hmidHi, hiNext, htnDom, hrestDom⟩
-                    cases f with
-                    | zero => omega
-                    | succ f' =>
+                rw [hSlotEq]; dsimp only; simp only [List.length_append, List.length_singleton]; rw [← huIdxNext])
+          · have ⟨hsEmpty, hirF⟩ : s ≠ "" ∧ inTextRun = false := by cases inTextRun <;> simp_all
+            subst hirF
+            have hdomCoal : HydratableDomList f childNs (.text (s ++ restOfTextRun rest) :: dropCurrentTextRun rest) a lo hi domCs := by
+              simpa [coalesceTextRun, Html.textOf?, hsEmpty] using hdom
+            cases domCs with
+            | nil => exact False.elim hdomCoal
+            | cons tn domRest =>
+                rcases HydratableDomList_cons_bounds hdomCoal with ⟨mid, hloMid, hmidHi, hiNext, htnDom, hrestDom⟩
+                cases f with
+                | zero => omega
+                | succ f' =>
                         rcases htnDom with ⟨htnLo, htnMid, _, hgetTn⟩
                         let resSlot := (hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length)
                           false s (fun () => hasMoreText rest)).run a

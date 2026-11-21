@@ -305,38 +305,32 @@ private theorem managedNames_eq_of_noBind {σ msg : Type} {s₁ s₂ : σ} :
   erw [← filterMap_cls_eq_of_noBind s₁ s₂ xs hnb]
   rw [List.filterMap_append, List.filterMap_append]; erw [hfm _ _ (hdd _ _ (hnon xs hnb))]; rfl
 
+private theorem stepSpecAttr_lookup_congr {msg : Type} (k : String) {s₁ s₂ : SpecElemState msg}
+    (ha : lookupAssoc k s₁.attrs = lookupAssoc k s₂.attrs) (a : Attr msg) :
+    lookupAssoc k (stepSpecAttr s₁ a).attrs = lookupAssoc k (stepSpecAttr s₂ a).attrs := by
+  cases a with
+  | cls _ | localCell _ _ _ _ _ => simp only [stepSpecAttr, lookupAssoc_setAssoc, ha]
+  | attr k' _ => by_cases hv : k' = "value"; subst hv; exact ha; simp only [stepSpecAttr_attr_ne _ _ hv, lookupAssoc_setAssoc, ha]
+  | flag k' p =>
+      by_cases hc : k' = "checked"
+      · subst hc; exact ha
+      · cases p <;> simp only [stepSpecAttr_flag_ne _ _ hc, Bool.false_eq_true, ↓reduceIte, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, ha]
+  | _ => exact ha
+
+private theorem stepSpecAttr_val_congr {msg : Type} (a : Attr msg) {s₁ s₂ : SpecElemState msg} (hv : s₁.value = s₂.value) :
+    (stepSpecAttr s₁ a).value = (stepSpecAttr s₂ a).value := by
+  cases a with
+  | attr k _ => by_cases h : k = "value"; subst h; rfl; simp only [stepSpecAttr_attr_ne _ _ h, hv]
+  | flag k _ => by_cases h : k = "checked"; subst h; exact hv; simp only [stepSpecAttr_flag_ne _ _ h, hv]
+  | _ => exact hv
+
 private theorem stepSpecAttr_equiv {msg : Type} {s₁ s₂ : SpecElemState msg} (a : Attr msg)
-    (he : ElemStateEquiv s₁ s₂) : ElemStateEquiv (stepSpecAttr s₁ a) (stepSpecAttr s₂ a) := by
-  refine ⟨fun k => ?_, ?_, ?_, fun e => ?_, fun e => ?_⟩
-  · cases a with
-    | cls _ | localCell _ _ _ _ _ => simp only [stepSpecAttr, lookupAssoc_setAssoc, he.1]
-    | attr k' _ =>
-        by_cases hv : k' = "value"
-        · subst hv; exact he.1 k
-        · simp only [stepSpecAttr_attr_ne _ _ hv, lookupAssoc_setAssoc, he.1]
-    | flag k' p =>
-        by_cases hc : k' = "checked"
-        · subst hc; exact he.1 k
-        · cases p <;> simp only [stepSpecAttr_flag_ne _ _ hc, Bool.false_eq_true, ↓reduceIte, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, he.1]
-    | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ => exact he.1 k
-  · cases a with
-    | attr k' _ => by_cases hv : k' = "value"; subst hv; rfl; simp only [stepSpecAttr_attr_ne _ _ hv, he.2.1]
-    | flag k' _ => by_cases hc : k' = "checked"; subst hc; exact he.2.1; simp only [stepSpecAttr_flag_ne _ _ hc, he.2.1]
-    | _ => exact he.2.1
-  · cases a with
-    | attr k' _ => by_cases hv : k' = "value"; subst hv; exact he.2.2.1; simp only [stepSpecAttr_attr_ne _ _ hv, he.2.2.1]
-    | flag k' _ => by_cases hc : k' = "checked"; subst hc; rfl; simp only [stepSpecAttr_flag_ne _ _ hc, he.2.2.1]
-    | _ => exact he.2.2.1
-  · cases a with
-    | on _ _ => simp only [stepSpecAttr, lookupAssoc_setAssoc, he.2.2.2.1]
-    | attr k' _ => by_cases hv : k' = "value"; subst hv; exact he.2.2.2.1 e; simp only [stepSpecAttr_attr_ne _ _ hv, he.2.2.2.1]
-    | flag k' _ => by_cases hc : k' = "checked"; subst hc; exact he.2.2.2.1 e; simp only [stepSpecAttr_flag_ne _ _ hc, he.2.2.2.1]
-    | _ => exact he.2.2.2.1 e
-  · cases a with
-    | onValue _ _ => simp only [stepSpecAttr, lookupAssoc_setAssoc, he.2.2.2.2]
-    | attr k' _ => by_cases hv : k' = "value"; subst hv; exact he.2.2.2.2 e; simp only [stepSpecAttr_attr_ne _ _ hv, he.2.2.2.2]
-    | flag k' _ => by_cases hc : k' = "checked"; subst hc; exact he.2.2.2.2 e; simp only [stepSpecAttr_flag_ne _ _ hc, he.2.2.2.2]
-    | _ => exact he.2.2.2.2 e
+    (he : ElemStateEquiv s₁ s₂) : ElemStateEquiv (stepSpecAttr s₁ a) (stepSpecAttr s₂ a) :=
+  ⟨fun k => stepSpecAttr_lookup_congr k (he.1 k) a,
+   stepSpecAttr_val_congr a he.2.1,
+   by cases a <;> simp only [stepSpecAttr] <;> (try split) <;> simp [he.2.2.1],
+   fun e => by cases a <;> simp only [stepSpecAttr, lookupAssoc_setAssoc] <;> (try split) <;> simp [he.2.2.2.1],
+   fun e => by cases a <;> simp only [stepSpecAttr, lookupAssoc_setAssoc] <;> (try split) <;> simp [he.2.2.2.2]⟩
 
 private theorem dedupAttrs_foldl_equiv {msg : Type} :
     ∀ (xs : List (Attr msg)) (cur : SpecElemState msg),
@@ -399,15 +393,9 @@ private theorem dedupAttrs_foldl_equiv {msg : Type} :
                 | flag kx p => simp only [Attr.key?, Option.some.injEq] at hx; subst hx; simp only [stepSpecAttr_flag_ne _ _ hc]
                 | _ => simp only [Attr.key?, reduceCtorEq] at hx
             · apply foldl_stepSpecAttr_clicks; right
-              cases x with
-              | attr kx _ => by_cases hv : kx = "value"; subst hv; rfl; simp only [stepSpecAttr_attr_ne _ _ hv]
-              | flag kx p => by_cases hc : kx = "checked"; subst hc; rfl; simp only [stepSpecAttr_flag_ne _ _ hc]
-              | _ => simp only [Attr.key?, reduceCtorEq] at hx
+              cases x <;> simp only [Attr.key?, reduceCtorEq] at hx <;> simp only [stepSpecAttr] <;> (try split) <;> rfl
             · apply foldl_stepSpecAttr_inputs; right
-              cases x with
-              | attr kx _ => by_cases hv : kx = "value"; subst hv; rfl; simp only [stepSpecAttr_attr_ne _ _ hv]
-              | flag kx p => by_cases hc : kx = "checked"; subst hc; rfl; simp only [stepSpecAttr_flag_ne _ _ hc]
-              | _ => simp only [Attr.key?, reduceCtorEq] at hx
+              cases x <;> simp only [Attr.key?, reduceCtorEq] at hx <;> simp only [stepSpecAttr] <;> (try split) <;> rfl
           · simp only [dedupAttrs, hx, hany, Bool.false_eq_true, ↓reduceIte, List.foldl_cons]
             exact dedupAttrs_foldl_equiv xs (stepSpecAttr cur x) hn.2
 
@@ -424,100 +412,61 @@ private def lastDynVal? {σ msg : Type} (k : String) (s : σ) : List (VAttr σ m
   | .dynVal k' g :: rest => (lastDynVal? k s rest).orElse (fun _ => if k' == k then some (g s) else none)
   | _ :: rest => lastDynVal? k s rest
 
-private theorem stepDynAttr_checked {σ msg : Type} (s : σ) :
-    ∀ (xs : List (VAttr σ msg)) (st : SpecElemState msg), noBind xs = true → (xs.foldl (stepDynAttr s) st).checked = st.checked
-  | [], _, _ => rfl
-  | va :: rest, st, hnb => by
-      simp only [noBind, List.all_cons, Bool.and_eq_true] at hnb
-      cases va with
-      | bind _ | dynOn _ _ => exact absurd hnb.1 Bool.false_ne_true
-      | stat _ => exact stepDynAttr_checked s rest st hnb.2
-      | dynVal k _ =>
-          by_cases hk : k = "value"
-          · subst hk; exact stepDynAttr_checked s rest _ hnb.2
-          · simp only [List.foldl_cons, stepDynAttr, stepSpecAttr_attr_ne _ _ hk, stepDynAttr_checked s rest _ hnb.2]
-
-private theorem nonCls_checked_eq {σ msg : Type} (s₁ s₂ : σ) :
-    ∀ (xs : List (VAttr σ msg)) (st₁ st₂ : SpecElemState msg), noBind xs = true → st₁.checked = st₂.checked →
-      (((xs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr st₁).checked =
-      (((xs.map (VAttr.eval s₂)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr st₂).checked
-  | [], _, _, _, h => h
-  | va :: rest, st₁, st₂, hnb, hc => by
-      simp only [noBind, List.all_cons, Bool.and_eq_true] at hnb
-      cases va with
-      | bind _ | dynOn _ _ => exact absurd hnb.1 Bool.false_ne_true
-      | dynVal k _ =>
-          simp only [List.map_cons, VAttr.eval, List.filter_cons]
-          apply nonCls_checked_eq s₁ s₂ rest _ _ hnb.2
-          by_cases hv : k = "value"; subst hv; exact hc; simp only [stepSpecAttr_attr_ne _ _ hv, hc]
-      | stat a =>
-          cases a with
-          | cls _ => exact nonCls_checked_eq s₁ s₂ rest _ _ hnb.2 hc
-          | attr k _ =>
-              simp only [List.map_cons, VAttr.eval, List.filter_cons]
-              apply nonCls_checked_eq s₁ s₂ rest _ _ hnb.2
-              by_cases hv : k = "value"; subst hv; exact hc; simp only [stepSpecAttr_attr_ne _ _ hv, hc]
-          | flag k p =>
-              simp only [List.map_cons, VAttr.eval, List.filter_cons]
-              apply nonCls_checked_eq s₁ s₂ rest _ _ hnb.2
-              by_cases hck : k = "checked"; subst hck; rfl; simp only [stepSpecAttr_flag_ne _ _ hck, hc]
-          | key _ | on _ _ | onValue _ _ | localCell _ _ _ _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ =>
-              exact nonCls_checked_eq s₁ s₂ rest _ _ hnb.2 hc
-
-private theorem stepDynAttr_clicks_inputs {σ msg : Type} (s : σ) :
+private theorem stepDynAttr_preserves_other {σ msg : Type} (s : σ) :
     ∀ (xs : List (VAttr σ msg)) (st : SpecElemState msg), noBind xs = true →
+      (xs.foldl (stepDynAttr s) st).checked = st.checked ∧
       (xs.foldl (stepDynAttr s) st).clicks = st.clicks ∧
       (xs.foldl (stepDynAttr s) st).inputs = st.inputs
-  | [], _, _ => ⟨rfl, rfl⟩
+  | [], _, _ => ⟨rfl, rfl, rfl⟩
   | va :: rest, st, hnb => by
       simp only [noBind, List.all_cons, Bool.and_eq_true] at hnb
       cases va with
       | bind _ | dynOn _ _ => exact absurd hnb.1 Bool.false_ne_true
-      | stat _ => exact stepDynAttr_clicks_inputs s rest st hnb.2
+      | stat _ => exact stepDynAttr_preserves_other s rest st hnb.2
       | dynVal k _ =>
           by_cases hk : k = "value"
-          · subst hk; exact stepDynAttr_clicks_inputs s rest _ hnb.2
+          · subst hk; exact stepDynAttr_preserves_other s rest _ hnb.2
           · simp only [List.foldl_cons, stepDynAttr, stepSpecAttr_attr_ne _ _ hk]
-            exact stepDynAttr_clicks_inputs s rest _ hnb.2
+            exact stepDynAttr_preserves_other s rest _ hnb.2
 
-private theorem nonCls_handlers_eq {σ msg : Type} (s₁ s₂ : σ) :
+private theorem nonCls_other_eq {σ msg : Type} (s₁ s₂ : σ) :
     ∀ (xs : List (VAttr σ msg)) (st₁ st₂ : SpecElemState msg), noBind xs = true →
-      st₁.clicks = st₂.clicks → st₁.inputs = st₂.inputs →
+      st₁.checked = st₂.checked → st₁.clicks = st₂.clicks → st₁.inputs = st₂.inputs →
+      (((xs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr st₁).checked =
+      (((xs.map (VAttr.eval s₂)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr st₂).checked ∧
       (((xs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr st₁).clicks =
       (((xs.map (VAttr.eval s₂)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr st₂).clicks ∧
       (((xs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr st₁).inputs =
       (((xs.map (VAttr.eval s₂)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr st₂).inputs
-  | [], _, _, _, hcl, hin => ⟨hcl, hin⟩
-  | va :: rest, st₁, st₂, hnb, hcl, hin => by
+  | [], _, _, _, hck, hcl, hin => ⟨hck, hcl, hin⟩
+  | va :: rest, st₁, st₂, hnb, hck, hcl, hin => by
       simp only [noBind, List.all_cons, Bool.and_eq_true] at hnb
       cases va with
       | bind _ | dynOn _ _ => exact absurd hnb.1 Bool.false_ne_true
       | dynVal k _ =>
           simp only [List.map_cons, VAttr.eval, List.filter_cons]
-          apply nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2
-          · by_cases hv : k = "value"; subst hv; exact hcl; simp only [stepSpecAttr_attr_ne _ _ hv, hcl]
-          · by_cases hv : k = "value"; subst hv; exact hin; simp only [stepSpecAttr_attr_ne _ _ hv, hin]
+          refine nonCls_other_eq s₁ s₂ rest _ _ hnb.2 ?_ ?_ ?_ <;>
+            (by_cases hv : k = "value"; subst hv; assumption; simp only [stepSpecAttr_attr_ne _ _ hv]; assumption)
       | stat a =>
           cases a with
-          | cls _ => exact nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2 hcl hin
+          | cls _ => exact nonCls_other_eq s₁ s₂ rest _ _ hnb.2 hck hcl hin
           | attr k _ =>
               simp only [List.map_cons, VAttr.eval, List.filter_cons]
-              apply nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2
-              · by_cases hv : k = "value"; subst hv; exact hcl; simp only [stepSpecAttr_attr_ne _ _ hv, hcl]
-              · by_cases hv : k = "value"; subst hv; exact hin; simp only [stepSpecAttr_attr_ne _ _ hv, hin]
+              refine nonCls_other_eq s₁ s₂ rest _ _ hnb.2 ?_ ?_ ?_ <;>
+                (by_cases hv : k = "value"; subst hv; assumption; simp only [stepSpecAttr_attr_ne _ _ hv]; assumption)
           | flag k p =>
               simp only [List.map_cons, VAttr.eval, List.filter_cons]
-              apply nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2
+              refine nonCls_other_eq s₁ s₂ rest _ _ hnb.2 ?_ ?_ ?_
+              · by_cases hc : k = "checked"; subst hc; rfl; simp only [stepSpecAttr_flag_ne _ _ hc, hck]
               · by_cases hc : k = "checked"; subst hc; exact hcl; simp only [stepSpecAttr_flag_ne _ _ hc, hcl]
               · by_cases hc : k = "checked"; subst hc; exact hin; simp only [stepSpecAttr_flag_ne _ _ hc, hin]
           | on e m =>
               simp only [List.map_cons, VAttr.eval, List.filter_cons]
-              exact nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2 (congrArg (setAssoc e m) hcl) hin
+              exact nonCls_other_eq s₁ s₂ rest _ _ hnb.2 hck (congrArg (setAssoc e m) hcl) hin
           | onValue e f =>
               simp only [List.map_cons, VAttr.eval, List.filter_cons]
-              exact nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2 hcl (congrArg (setAssoc e f) hin)
-          | key _ | localCell _ _ _ _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ =>
-              exact nonCls_handlers_eq s₁ s₂ rest _ _ hnb.2 hcl hin
+              exact nonCls_other_eq s₁ s₂ rest _ _ hnb.2 hck hcl (congrArg (setAssoc e f) hin)
+          | _ => exact nonCls_other_eq s₁ s₂ rest _ _ hnb.2 hck hcl hin
 
 private theorem stepDynAttr_last_key {σ msg : Type} (s : σ) (k : String) :
     ∀ (xs : List (VAttr σ msg)) (st : SpecElemState msg), noBind xs = true →
@@ -631,25 +580,6 @@ private theorem nonCls_last_key {σ msg : Type} (s : σ) (k : String) :
               have hp := hpres rest (stepSpecAttr st (.attr k' (g s))) hnb.2 hownR hr (fun w hw => hns.1 w hw)
               refine ⟨fun hkv => (hp.1 hkv).trans (by subst hkv; rfl),
                       fun hnk => (hp.2 hnk).trans (by simp only [stepSpecAttr_attr_ne _ _ hnk, lookupAssoc_setAssoc, beq_self_eq_true, ↓reduceIte])⟩
-
-private theorem stepSpecAttr_lookup_congr {msg : Type} (k : String) {s₁ s₂ : SpecElemState msg}
-    (ha : lookupAssoc k s₁.attrs = lookupAssoc k s₂.attrs) (a : Attr msg) :
-    lookupAssoc k (stepSpecAttr s₁ a).attrs = lookupAssoc k (stepSpecAttr s₂ a).attrs := by
-  cases a with
-  | cls _ | localCell _ _ _ _ _ => simp only [stepSpecAttr, lookupAssoc_setAssoc, ha]
-  | attr k' _ => by_cases hv : k' = "value"; subst hv; exact ha; simp only [stepSpecAttr_attr_ne _ _ hv, lookupAssoc_setAssoc, ha]
-  | flag k' p =>
-      by_cases hc : k' = "checked"
-      · subst hc; exact ha
-      · cases p <;> simp only [stepSpecAttr_flag_ne _ _ hc, Bool.false_eq_true, ↓reduceIte, lookupAssoc_setAssoc, lookupAssoc_eraseAssoc, ha]
-  | _ => exact ha
-
-private theorem stepSpecAttr_val_congr {msg : Type} (a : Attr msg) {s₁ s₂ : SpecElemState msg} (hv : s₁.value = s₂.value) :
-    (stepSpecAttr s₁ a).value = (stepSpecAttr s₂ a).value := by
-  cases a with
-  | attr k _ => by_cases h : k = "value"; subst h; rfl; simp only [stepSpecAttr_attr_ne _ _ h, hv]
-  | flag k p => by_cases h : k = "checked"; subst h; exact hv; simp only [stepSpecAttr_flag_ne _ _ h, hv]
-  | _ => exact hv
 
 private theorem nonCls_none_key {σ msg : Type} (s₁ s₂ : σ) (k : String) :
     ∀ (xs : List (VAttr σ msg)) (st₁ st₂ : SpecElemState msg),
@@ -768,6 +698,8 @@ theorem applyDynAttrsM_spec {σ msg : Type} (a : DomArena msg) (node : Dom.Node)
        fun e => (heq.2.2.2.1 e).trans (by rw [hev1]; exact hdd1.2.2.2.1 e),
        fun e => (heq.2.2.2.2 e).trans (by rw [hev1]; exact hdd1.2.2.2.2 e)⟩
     have hstepEq := stepDynAttr_equiv s₂ attrs heq1
+    have hotherDyn := stepDynAttr_preserves_other s₂ attrs (((attrs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr base) hnb
+    have hotherNon := nonCls_other_eq s₁ s₂ attrs base base hnb rfl rfl rfl
     refine ⟨rfl, fun m hm => DomArena.get_set_ne _ _ hm, st', mg, DomArena.get_set_self _ _ _, hEl',
       ⟨?_, ?_, ?_, fun e => ?_, fun e => ?_⟩,
       fun nm hnm => hmg nm (hmgEq ▸ hnm)⟩
@@ -775,39 +707,28 @@ theorem applyDynAttrsM_spec {σ msg : Type} (a : DomArena msg) (node : Dom.Node)
       by_cases hkv : k = "value"
       · subst hkv
         exact (hEl'.2 "value" rfl).trans ((ElemClean_evalSpecAttrs (hclean.2.1 s₂)).2 "value" rfl).symm
-      · cases hr : lastDynVal? k s₂ attrs with
+      · have h1 := stepDynAttr_last_key s₂ k attrs (((attrs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr base) hnb
+        cases hr : lastDynVal? k s₂ attrs with
         | some v =>
-            have h1 := stepDynAttr_last_key s₂ k attrs (((attrs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr base) hnb
             rw [hr] at h1
             have h2 := (nonCls_last_key s₂ k attrs base v hnb hclean.2.2.2 (hclean.1 s₂) hr).2 hkv
-            refine (hstepEq.1 k).trans ((h1.2 hkv).trans (h2.symm.trans ?_))
-            rw [hev2]; exact (hdd2.1 k).symm
+            exact (hstepEq.1 k).trans ((h1.2 hkv).trans (h2.symm.trans (by rw [hev2]; exact (hdd2.1 k).symm)))
         | none =>
-            have h1 := stepDynAttr_last_key s₂ k attrs (((attrs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr base) hnb
             rw [hr] at h1
             have h2 := (nonCls_none_key s₁ s₂ k attrs base base hnb hr).2 hkv rfl
-            refine (hstepEq.1 k).trans ((h1.2 hkv).trans (h2.trans ?_))
-            rw [hev2]; exact (hdd2.1 k).symm
-    · cases hr : lastDynVal? "value" s₂ attrs with
+            exact (hstepEq.1 k).trans ((h1.2 hkv).trans (h2.trans (by rw [hev2]; exact (hdd2.1 k).symm)))
+    · have h1 := stepDynAttr_last_key s₂ "value" attrs (((attrs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr base) hnb
+      cases hr : lastDynVal? "value" s₂ attrs with
       | some v =>
-          have h1 := stepDynAttr_last_key s₂ "value" attrs (((attrs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr base) hnb
           rw [hr] at h1
           have h2 := (nonCls_last_key s₂ "value" attrs base v hnb hclean.2.2.2 (hclean.1 s₂) hr).1 rfl
-          refine hstepEq.2.1.trans ((h1.1 rfl).trans (h2.symm.trans ?_))
-          rw [hev2]; exact hdd2.2.1.symm
+          exact hstepEq.2.1.trans ((h1.1 rfl).trans (h2.symm.trans (by rw [hev2]; exact hdd2.2.1.symm)))
       | none =>
-          have h1 := stepDynAttr_last_key s₂ "value" attrs (((attrs.map (VAttr.eval s₁)).filter (fun | .cls _ => false | _ => true)).foldl stepSpecAttr base) hnb
           rw [hr] at h1
           have h2 := (nonCls_none_key s₁ s₂ "value" attrs base base hnb hr).1 rfl rfl
-          refine hstepEq.2.1.trans ((h1.1 rfl).trans (h2.trans ?_))
-          rw [hev2]; exact hdd2.2.1.symm
-    · refine hstepEq.2.2.1.trans ((stepDynAttr_checked s₂ attrs _ hnb).trans ((nonCls_checked_eq s₁ s₂ attrs base base hnb rfl).trans ?_))
-      rw [hev2]; exact hdd2.2.2.1.symm
-    · rw [hstepEq.2.2.2.1 e, (stepDynAttr_clicks_inputs s₂ attrs _ hnb).1,
-        (nonCls_handlers_eq s₁ s₂ attrs base base hnb rfl rfl).1, hev2]
-      exact (hdd2.2.2.2.1 e).symm
-    · rw [hstepEq.2.2.2.2 e, (stepDynAttr_clicks_inputs s₂ attrs _ hnb).2,
-        (nonCls_handlers_eq s₁ s₂ attrs base base hnb rfl rfl).2, hev2]
-      exact (hdd2.2.2.2.2 e).symm
+          exact hstepEq.2.1.trans ((h1.1 rfl).trans (h2.trans (by rw [hev2]; exact hdd2.2.1.symm)))
+    · rw [hstepEq.2.2.1, hotherDyn.1, hotherNon.1, hev2]; exact hdd2.2.2.1.symm
+    · rw [hstepEq.2.2.2.1 e, hotherDyn.2.1, hotherNon.2.1, hev2]; exact (hdd2.2.2.2.1 e).symm
+    · rw [hstepEq.2.2.2.2 e, hotherDyn.2.2, hotherNon.2.2, hev2]; exact (hdd2.2.2.2.2 e).symm
 
 end Qed

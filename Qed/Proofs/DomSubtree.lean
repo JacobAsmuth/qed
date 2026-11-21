@@ -349,77 +349,48 @@ theorem CleanDomSubtree_not_fragment {msg : Type} {f : Nat} {ns : String} {h : H
     | text _ => intro fcs hf; dsimp only [CleanDomSubtree] at hcl; rw [hcl.2] at hf; cases hf
     | element _ _ _ => intro fcs hf; rcases hcl with ⟨_, _, _, _, _, _, hg, _⟩; rw [hg] at hf; cases hf
 
-private theorem appendChild_nextId {msg : Type} (p c : Dom.Node) (a : DomArena msg) :
-    ((MonadDom.appendChild (m := StateM (DomArena msg)) p c).run a).2.nextId = a.nextId := by
-  dsimp only [MonadDom.appendChild, StateT.run]; split <;> rfl
+def DomArena.NextIdMono {msg α : Type} (op : StateM (DomArena msg) α) : Prop :=
+  ∀ (a : DomArena msg), a.nextId ≤ (op a).2.nextId
 
-private theorem htmlDepth_mem_le' {msg : Type} {c : Html msg} {cs : List (Html msg)} (hc : c ∈ cs) :
-    htmlDepth c ≤ htmlListDepth cs := by
-  induction cs with
-  | nil => cases hc
-  | cons _ _ ih =>
-      simp only [htmlListDepth]
-      cases hc with
-      | head => exact Nat.le_max_left _ _
-      | tail _ h => exact Nat.le_trans (ih h) (Nat.le_max_right _ _)
+theorem DomArena.NextIdMono.pure {msg α : Type} (x : α) :
+    DomArena.NextIdMono (msg := msg) (Pure.pure x) := fun _ => Nat.le_refl _
 
-private theorem buildDomListM_nextId_mono_of {msg : Type} (ns : String) (parent : Dom.Node) (cs : List (Html msg))
-    (hBuild : ∀ c ∈ cs, ∀ (a : DomArena msg), a.nextId ≤ ((buildDomM (m := StateM (DomArena msg)) ns c).run a).2.nextId) :
-    ∀ (a : DomArena msg), a.nextId ≤ ((buildDomListM (m := StateM (DomArena msg)) ns parent cs).run a).2.nextId := by
-  induction cs with
-  | nil => intro _; exact Nat.le_refl _
-  | cons c rest ih =>
-      intro a
-      have h1 := hBuild c (.head _) a
-      dsimp only [buildDomListM, StateT.run, bind, StateT.bind] at h1 ⊢
-      cases hres : buildDomM (m := StateM (DomArena msg)) ns c a with
-      | mk cn aMid =>
-          rw [hres] at h1; dsimp only at h1
-          have h2 := appendChild_nextId parent cn aMid
-          dsimp only [StateT.run] at h2
-          cases hApp : MonadDom.appendChild (m := StateM (DomArena msg)) parent cn aMid with
-          | mk _ a2 =>
-              dsimp only; rw [hApp] at h2 ⊢; dsimp only at h2 ⊢
-              have h3 := ih (fun x hx => hBuild x (.tail _ hx)) a2
-              dsimp only [StateT.run] at h3 ⊢
-              exact Nat.le_trans h1 (h2 ▸ h3)
+theorem DomArena.NextIdMono.bind {msg α β : Type} {op : StateM (DomArena msg) α}
+    {f : α → StateM (DomArena msg) β} (h1 : DomArena.NextIdMono op)
+    (h2 : ∀ x, DomArena.NextIdMono (f x)) : DomArena.NextIdMono (op >>= f) :=
+  fun a => Nat.le_trans (h1 a) (h2 (op a).1 (op a).2)
 
-private theorem buildDomM_nextId_mono_aux {msg : Type} :
-    ∀ (f : Nat) (ns : String) (h : Html msg) (a : DomArena msg),
-      htmlDepth h ≤ f → a.nextId ≤ ((buildDomM (m := StateM (DomArena msg)) ns h).run a).2.nextId
-  | 0, _, h, _, hdep => by cases h <;> { simp only [htmlDepth] at hdep; omega }
-  | _ + 1, _, .text _, _, _ => Nat.le_succ _
-  | f + 1, ns, .element tag attrs cs, a, hdep => by
-      simp only [htmlDepth] at hdep
-      let node := UInt32.ofNat a.nextId
-      let realNs := if ns == "" && tag == "svg" then Dom.svgNs else ns
-      let a1 : DomArena msg := { a with nextId := a.nextId + 1 }
-      have hnx := applyAttrsM_nextId a1 node attrs (.element realNs tag {} [] [])
-      dsimp only [StateT.run] at hnx
-      dsimp only [buildDomM, MonadDom.createElement, DomArena.alloc, StateT.run, bind, StateT.bind, pure, StateT.pure]
-      change a.nextId ≤ (match applyAttrsM (m := StateM (DomArena msg)) node attrs (a1.set node (.element realNs tag {} [] [])) with
-        | (_, s) => (if (!ownsChildren attrs) = true then
-            StateT.bind (buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) node cs) fun _ => StateT.pure node
-          else (StateT.pure PUnit.unit).bind fun _ => StateT.pure node) s).2.nextId
-      cases hres : applyAttrsM (m := StateM (DomArena msg)) node attrs (a1.set node (.element realNs tag {} [] [])) with
-      | mk _ s1 =>
-          rw [hres] at hnx
-          have hs1 : a.nextId ≤ s1.nextId := hnx ▸ Nat.le_succ _
-          cases ownsChildren attrs with
-          | true => exact hs1
-          | false =>
-              have hm := buildDomListM_nextId_mono_of (Dom.childNsOf ns tag) node cs
-                (fun c hc a' => buildDomM_nextId_mono_aux f (Dom.childNsOf ns tag) c a'
-                  (Nat.le_trans (htmlDepth_mem_le' hc) (by omega))) s1
-              dsimp only [StateT.run] at hm; exact Nat.le_trans hs1 hm
+private theorem appendChild_nextId_mono {msg : Type} (p c : Dom.Node) :
+    DomArena.NextIdMono (MonadDom.appendChild (m := StateM (DomArena msg)) p c) := fun a => by
+  dsimp only [MonadDom.appendChild]; split <;> exact Nat.le_refl _
 
-theorem buildDomM_nextId_mono {msg : Type} (ns : String) (h : Html msg) (a : DomArena msg) :
-    a.nextId ≤ ((buildDomM (m := StateM (DomArena msg)) ns h).run a).2.nextId :=
-  buildDomM_nextId_mono_aux (htmlDepth h) ns h a (Nat.le_refl _)
+private theorem applyAttrsM_nextId_mono {msg : Type} (node : Dom.Node) (attrs : List (Attr msg)) :
+    DomArena.NextIdMono (applyAttrsM (m := StateM (DomArena msg)) node attrs) := fun a => by
+  have h := applyAttrsM_nextId a node attrs (a.get node)
+  rw [DomArena.set_get_self a rfl] at h; exact h ▸ Nat.le_refl _
 
-theorem buildDomListM_nextId_mono {msg : Type} (ns : String) (parent : Dom.Node) (cs : List (Html msg)) (a : DomArena msg) :
-    a.nextId ≤ ((buildDomListM (m := StateM (DomArena msg)) ns parent cs).run a).2.nextId :=
-  buildDomListM_nextId_mono_of ns parent cs (fun c _ a' => buildDomM_nextId_mono ns c a') a
+mutual
+  theorem buildDomM_nextId_mono {msg : Type} (ns : String) :
+      (h : Html msg) → (a : DomArena msg) →
+      a.nextId ≤ ((buildDomM (m := StateM (DomArena msg)) ns h).run a).2.nextId
+    | .text _, _ => Nat.le_succ _
+    | .element tag attrs cs, a => by
+        dsimp only [buildDomM, StateT.run]
+        refine DomArena.NextIdMono.bind (fun s => Nat.le_succ s.nextId) (fun el =>
+          DomArena.NextIdMono.bind (applyAttrsM_nextId_mono el attrs) fun _ => ?_) a
+        cases ownsChildren attrs
+        · exact DomArena.NextIdMono.bind (buildDomListM_nextId_mono (Dom.childNsOf ns tag) el cs) fun _ => .pure el
+        · exact .pure el
+
+  theorem buildDomListM_nextId_mono {msg : Type} (ns : String) (parent : Dom.Node) :
+      (cs : List (Html msg)) → (a : DomArena msg) →
+      a.nextId ≤ ((buildDomListM (m := StateM (DomArena msg)) ns parent cs).run a).2.nextId
+    | [], _ => Nat.le_refl _
+    | c :: rest, a =>
+        DomArena.NextIdMono.bind (buildDomM_nextId_mono ns c) (fun cn =>
+          DomArena.NextIdMono.bind (appendChild_nextId_mono parent cn) fun _ =>
+            buildDomListM_nextId_mono ns parent rest) a
+end
 
 private theorem cleanDomChildren_of_buildDomListM_of {msg : Type} (f : Nat)
     (hSub : ∀ (ns : String) (h : Html msg) (a : DomArena msg),
@@ -707,5 +678,50 @@ theorem w3cInsertBefore_fresh_append (pre suf : List Dom.Node) (cn : Dom.Node)
       have hrc : (ref == cn) = false := beq_eq_false_iff_ne.2 (fun h => hnot (by simp [h]))
       simp only [hrc, Bool.false_eq_true, ↓reduceIte]
       exact insertBeforeRef_split pre rest (hdisj ref (List.mem_cons_self ..))
+
+theorem clean_done_extend {msg : Type} {f : Nat} {childNs : String}
+    {parent newChild : Dom.Node} {t : Html msg} {targetsDone : List (Html msg)} {pre : List Dom.Node}
+    {Sdone Sc : Nat → Prop} {a aMid : DomArena msg}
+    (haMidLe : a.nextId ≤ aMid.nextId) (hparLt : parent.toNat < a.nextId)
+    (hSdone : ∀ k, Sdone k → k ≠ parent.toNat ∧ k < a.nextId)
+    (hScB : ∀ k, Sc k → k ≠ parent.toNat ∧ k < a.nextId) (hDisj : ∀ k, Sdone k → ¬Sc k)
+    (hFrame : ∀ m : Dom.Node, Sdone m.toNat → aMid.get m = a.get m)
+    (hDoneC : CleanDomChildren f childNs targetsDone a Sdone pre)
+    (hcNew : CleanDomSubtree f childNs t aMid (fun k => Sc k ∨ (a.nextId ≤ k ∧ k < aMid.nextId)) newChild) :
+    let Sdone' := fun k => Sdone k ∨ (Sc k ∨ (a.nextId ≤ k ∧ k < aMid.nextId))
+    (∀ k, Sdone' k → k ≠ parent.toNat ∧ k < aMid.nextId) ∧
+    CleanDomChildren f childNs (targetsDone ++ [t]) aMid Sdone' (pre ++ [newChild]) :=
+  ⟨fun k hk => hk.elim (fun h1 => let hb := hSdone k h1; ⟨hb.1, Nat.lt_of_lt_of_le hb.2 haMidLe⟩)
+    (fun h2 => h2.elim (fun h => let hb := hScB k h; ⟨hb.1, Nat.lt_of_lt_of_le hb.2 haMidLe⟩)
+      (fun h3 => ⟨fun hEq => Nat.not_lt.2 h3.1 (hEq ▸ hparLt), h3.2⟩)),
+   CleanDomChildren_append (fun k hk1 hk2 => hk2.elim (hDisj k hk1) (fun hlo => Nat.not_lt.2 hlo.1 (hSdone k hk1).2))
+    (CleanDomChildren_frame hFrame hDoneC) ⟨_, fun _ => False, fun _ h => h, fun _ h => h.elim, fun _ _ h => h.elim, hcNew, trivial⟩⟩
+
+theorem clean_done_alloc_bounds {msg : Type} {parent : Dom.Node} {Sdone : Nat → Prop} {a aMid : DomArena msg}
+    (haMidLe : a.nextId ≤ aMid.nextId) (hparLt : parent.toNat < a.nextId)
+    (hSdone : ∀ k, Sdone k → k ≠ parent.toNat ∧ k < a.nextId) :
+    ∀ k, (Sdone k ∨ (a.nextId ≤ k ∧ k < aMid.nextId)) → k ≠ parent.toNat ∧ k < aMid.nextId :=
+  fun k hk => hk.elim (fun h => let hb := hSdone k h; ⟨hb.1, Nat.lt_of_lt_of_le hb.2 haMidLe⟩)
+    (fun h => ⟨fun hEq => Nat.not_lt.2 h.1 (hEq ▸ hparLt), h.2⟩)
+
+theorem clean_step_Snew_compose {Sdone Sc Srest Srem Snew : Nat → Prop} {n₀ n₁ n₂ p : Nat}
+    (h01 : n₀ ≤ n₁) (h12 : n₁ ≤ n₂) (hSc : ∀ k, Sc k → Srem k) (hSr : ∀ k, Srest k → Srem k)
+    (hSnew : ∀ k, Snew k → ((Sdone k ∨ (Sc k ∨ (n₀ ≤ k ∧ k < n₁))) ∨ Srest k ∨ (n₁ ≤ k ∧ k < n₂)) ∧ k ≠ p) :
+    ∀ k, Snew k → (Sdone k ∨ Srem k ∨ (n₀ ≤ k ∧ k < n₂)) ∧ k ≠ p := fun k hk => by
+  rcases hSnew k hk with ⟨hS | hSr' | hA, hnp⟩
+  · exact ⟨hS.elim .inl (fun h2 => h2.elim (fun hsc => .inr (.inl (hSc k hsc))) (fun hhi => .inr (.inr ⟨hhi.1, Nat.lt_of_lt_of_le hhi.2 h12⟩))), hnp⟩
+  · exact ⟨.inr (.inl (hSr k hSr')), hnp⟩
+  · exact ⟨.inr (.inr ⟨Nat.le_trans h01 hA.1, hA.2⟩), hnp⟩
+
+theorem clean_create_Snew_compose {Sdone Srem Snew : Nat → Prop} {n₀ n₁ n₂ p : Nat}
+    (h01 : n₀ ≤ n₁) (h12 : n₁ ≤ n₂)
+    (hSnew : ∀ k, Snew k → ((Sdone k ∨ (n₀ ≤ k ∧ k < n₁)) ∨ Srem k ∨ (n₁ ≤ k ∧ k < n₂)) ∧ k ≠ p) :
+    ∀ k, Snew k → (Sdone k ∨ Srem k ∨ (n₀ ≤ k ∧ k < n₂)) ∧ k ≠ p :=
+  clean_step_Snew_compose (Sc := fun _ => False) h01 h12 (fun _ h => h.elim) (fun _ h => h)
+    fun j hj => let ⟨h, hnp⟩ := hSnew j hj; ⟨h.elim (fun hs => .inl (hs.elim .inl (fun ha => .inr (.inr ha)))) .inr, hnp⟩
+
+theorem not_Sdone_extend {Sdone Sc : Nat → Prop} {n₀ n₁ k : Nat}
+    (hD : ¬Sdone k) (hSc : ¬Sc k) (hLt : k < n₀) : ¬(Sdone k ∨ (Sc k ∨ (n₀ ≤ k ∧ k < n₁))) :=
+  fun h => h.elim hD (fun h2 => h2.elim hSc (fun hlo => Nat.not_lt.2 hlo.1 hLt))
 
 end Qed

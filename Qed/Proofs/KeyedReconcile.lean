@@ -296,19 +296,11 @@ private theorem applyPositionalStepsM_clean_step {msg : Type} (f : Nat) (hPatch 
                       have haMidLe' : a.nextId ≤ aMid.nextId := haMidLe
                       have haMidBound' : aMid.nextId ≤ a.nextId + htmlNodeCount t := haMidBound
                       have hApEq : (applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child (diff cO t) a).2 = aMid := rfl
-                      let Sc' : Nat → Prop := fun k => Sc k ∨ (a.nextId ≤ k ∧ k < aMid.nextId)
-                      let Sdone' : Nat → Prop := fun k => Sdone k ∨ Sc' k
-                      have hDoneMid : CleanDomChildren f childNs targetsDone aMid Sdone pre :=
-                        CleanDomChildren_frame (fun m hm =>
-                          hframeMid m (node_ne_of_toNat_ne (hSdone _ hm).1) (fun hsc => hDisj _ hm (hSc _ hsc)) (hSdone _ hm).2) hDoneC
-                      have hDone' := CleanDomChildren_append (fun k hk1 hk2 =>
-                        hk2.elim (fun hsc => hDisj k hk1 (hSc k hsc)) (fun hlo => Nat.not_lt.2 hlo.1 (hSdone k hk1).2))
-                        hDoneMid (show CleanDomChildren f childNs [t] aMid Sc' [newChild] from
-                          ⟨Sc', fun _ => False, fun _ h => h, fun _ h => h.elim, fun _ _ h => h.elim, hcNew, trivial⟩)
-                      have hSdone' : ∀ k, Sdone' k → k ≠ parent.toNat ∧ k < aMid.nextId := fun k hk => hk.elim
-                        (fun h1 => have hb := hSdone k h1; ⟨hb.1, Nat.lt_of_lt_of_le hb.2 haMidLe'⟩)
-                        (fun h2 => h2.elim (fun h => have hb := hSrem k (hSc k h); ⟨hb.1, Nat.lt_of_lt_of_le hb.2 haMidLe'⟩)
-                          (fun h3 => ⟨fun hEq => Nat.not_lt.2 h3.1 (hEq ▸ hparLt), h3.2⟩))
+                      let Sdone' : Nat → Prop := fun k => Sdone k ∨ (Sc k ∨ (a.nextId ≤ k ∧ k < aMid.nextId))
+                      have ⟨hSdone', hDone'⟩ := clean_done_extend haMidLe' hparLt hSdone (fun k h => hSrem k (hSc k h))
+                        (fun k h1 h2 => hDisj k h1 (hSc k h2))
+                        (fun m hm => hframeMid m (node_ne_of_toNat_ne (hSdone _ hm).1) (fun hsc => hDisj _ hm (hSc _ hsc)) (hSdone _ hm).2)
+                        hDoneC hcNew
                       have hMatchRest : PosStepsMatch (pre ++ [newChild]).length sRest tRest oldRest := by
                         intro k hk; have hm' := hmatch (k + 1) (Nat.succ_lt_succ hk)
                         simp only [List.getElem?_cons_succ, List.getElem_cons_succ, List.length_append, List.length_singleton] at hm' ⊢
@@ -333,8 +325,7 @@ private theorem applyPositionalStepsM_clean_step {msg : Type} (f : Nat) (hPatch 
                         (by simp only [List.length_append, List.length_singleton]; omega) hRestBound
                         (Nat.lt_of_lt_of_le hparLt haMidLe') (Nat.lt_of_lt_of_le hposId haMidLe')
                         hparMid' hndMid' hSdone' hDone' (fun k hk => have hb := hSrem k (hSr k hk); ⟨hb.1, Nat.lt_of_lt_of_le hb.2 haMidLe'⟩)
-                        (fun k hk1 hk2 => hk1.elim (fun h1 => hDisj k h1 (hSr k hk2))
-                          (fun h2 => h2.elim (fun h => hDSr k h hk2) (fun hlo => Nat.not_lt.2 hlo.1 (hSrem k (hSr k hk2)).2)))
+                        (fun k hk1 hk2 => not_Sdone_extend (fun h1 => hDisj k h1 (hSr k hk2)) (fun h => hDSr k h hk2) (hSrem k (hSr k hk2)).2 hk1)
                         (fun r hr => have hb := hsufB r (.tail _ hr); ⟨Nat.lt_of_lt_of_le hb.1 haMidLe', hb.2⟩) hSufCleanMid
                       rcases hih with ⟨targetsRest, sufRem, Snew, hlenR, htotLenR, hmonoR, hboundR, hparR, hfrR, hSnew, hDoneR⟩
                       have hstepRun : applyPositionalStepsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) (.reuse oldIdx (diff cO t) :: sRest) a =
@@ -357,13 +348,11 @@ private theorem applyPositionalStepsM_clean_step {msg : Type} (f : Nat) (hPatch 
                         by simp only [List.cons_append, List.length_cons] at htotLenR ⊢; omega,
                         Nat.le_trans haMidLe' hmonoR,
                         Nat.le_trans hboundR (Nat.add_assoc _ _ _ ▸ Nat.add_le_add_right haMidBound' _),
-                        by simp only [List.append_assoc]; exact hparR, fun m hmPar hmD hmR hmLt => ?_, fun k hk => ?_, hDoneR⟩
-                      · have hnmD' : ¬Sdone' m.toNat := fun h => h.elim hmD (fun h2 => h2.elim (fun hsc => hmR (hSc _ hsc)) (fun hlo => Nat.not_lt.2 hlo.1 hmLt))
-                        rw [hfrR m hmPar hnmD' (fun hr => hmR (hSr _ hr)) (Nat.lt_of_lt_of_le hmLt haMidLe'), hframeMid m hmPar (fun hsc => hmR (hSc _ hsc)) hmLt]
-                      · rcases hSnew k hk with ⟨hS | hSr' | hA, hnp⟩
-                        · exact ⟨hS.elim .inl (fun h2 => h2.elim (fun hsc => .inr (.inl (hSc _ hsc))) (fun hhi => .inr (.inr ⟨hhi.1, Nat.lt_of_lt_of_le hhi.2 hmonoR⟩))), hnp⟩
-                        · exact ⟨.inr (.inl (hSr _ hSr')), hnp⟩
-                        · exact ⟨.inr (.inr ⟨Nat.le_trans haMidLe' hA.1, hA.2⟩), hnp⟩
+                        by simp only [List.append_assoc]; exact hparR,
+                        fun m hmPar hmD hmR hmLt =>
+                          (hfrR m hmPar (not_Sdone_extend hmD (fun hsc => hmR (hSc _ hsc)) hmLt) (fun hr => hmR (hSr _ hr)) (Nat.lt_of_lt_of_le hmLt haMidLe')).trans
+                            (hframeMid m hmPar (fun hsc => hmR (hSc _ hsc)) hmLt),
+                        clean_step_Snew_compose haMidLe' hmonoR hSc hSr hSnew, hDoneR⟩
           | create newH =>
               simp only [positional] at hpos
               have htEq : newH = t := hStep0.1 newH rfl
@@ -385,8 +374,7 @@ private theorem applyPositionalStepsM_clean_step {msg : Type} (f : Nat) (hPatch 
               have hih := ih tRest (targetsDone ++ [t]) [] (pre ++ [cn]) suf (fun k => Sdone k ∨ (a.nextId ≤ k ∧ k < aIns.nextId)) Srem aIns
                 hlen' hposRest hMatchRest hclean.2 hrestDep (by simp only [List.length_append, List.length_cons, List.length_nil]; omega)
                 hRestBound (Nat.lt_of_lt_of_le hparLt haInsGe) (Nat.lt_of_lt_of_le hposId haInsGe) hparIns hnd'
-                (fun k hk => hk.elim (fun h => have hb := hSdone k h; ⟨hb.1, Nat.lt_of_lt_of_le hb.2 haInsGe⟩)
-                  (fun h => ⟨fun hEq => Nat.not_lt.2 h.1 (hEq ▸ hparLt), h.2⟩)) hDone'
+                (clean_done_alloc_bounds haInsGe hparLt hSdone) hDone'
                 (fun k hk => have hb := hSrem k hk; ⟨hb.1, Nat.lt_of_lt_of_le hb.2 haInsGe⟩)
                 (fun k hk1 hk2 => hk1.elim (fun h => hDisj k h hk2) (fun hhi => Nat.not_lt.2 hhi.1 (hSrem k hk2).2))
                 (fun r hr => have hb := hsufB r hr; ⟨Nat.lt_of_lt_of_le hb.1 haInsGe, hb.2⟩) hsufCleanIns
@@ -406,12 +394,11 @@ private theorem applyPositionalStepsM_clean_step {msg : Type} (f : Nat) (hPatch 
                 by simp only [List.cons_append, List.length_cons] at htotLenR ⊢; omega,
                 Nat.le_trans haInsGe hmonoR,
                 Nat.le_trans hboundR (Nat.add_assoc _ _ _ ▸ Nat.add_le_add_right haInsLe _),
-                by simp only [List.append_assoc]; exact hparR, fun m hmPar hmD hmR hmLt => ?_, fun k hk => ?_, hDoneR⟩
-              · rw [hfrR m hmPar (fun h => h.elim hmD (fun hlo => Nat.not_lt.2 hlo.1 hmLt)) hmR (Nat.lt_of_lt_of_le hmLt haInsGe), hfrIns m hmPar hmLt]
-              · rcases hSnew k hk with ⟨hS | hR | hA, hnp⟩
-                · exact ⟨hS.elim .inl (fun h2 => .inr (.inr ⟨h2.1, Nat.lt_of_lt_of_le h2.2 hmonoR⟩)), hnp⟩
-                · exact ⟨.inr (.inl hR), hnp⟩
-                · exact ⟨.inr (.inr ⟨Nat.le_trans haInsGe hA.1, hA.2⟩), hnp⟩
+                by simp only [List.append_assoc]; exact hparR,
+                fun m hmPar hmD hmR hmLt =>
+                  (hfrR m hmPar (fun h => h.elim hmD (fun hlo => Nat.not_lt.2 hlo.1 hmLt)) hmR (Nat.lt_of_lt_of_le hmLt haInsGe)).trans
+                    (hfrIns m hmPar hmLt),
+                clean_create_Snew_compose haInsGe hmonoR hSnew, hDoneR⟩
 
 
 private theorem replace_child_clean {msg : Type} (f : Nat)
@@ -576,16 +563,14 @@ theorem applyKeyedStepsM_reconcile_spec {msg : Type} (f : Nat) (hPatch : @PatchS
               have haMidLe' : a.nextId ≤ aMid.nextId := haMidLe
               have haMidBound' : aMid.nextId ≤ a.nextId + htmlNodeCount t := haMidBound
               have hApEq : (applyToDomM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) child (diff c₁[oldIdx] t) a1).2 = aMid := rfl
-              let Sc' : Nat → Prop := fun k => Si oldIdx k ∨ (a1.nextId ≤ k ∧ k < aMid.nextId)
-              let Sdone' : Nat → Prop := fun k => Sdone k ∨ Sc' k
-              have hDoneMid : CleanDomChildren f childNs targetsDone aMid Sdone pre :=
-                CleanDomChildren_frame (fun m hm =>
+              let Sdone' : Nat → Prop := fun k => Sdone k ∨ (Si oldIdx k ∨ (a1.nextId ≤ k ∧ k < aMid.nextId))
+              have ⟨hSdone', hDone'⟩ := clean_done_extend haMidLe' hparLt hSdone
+                (fun k h => let hb := hSiB _ k h; ⟨hb.1, Nat.lt_of_lt_of_le hb.2 hbase⟩)
+                (fun k h1 h2 => hDisj oldIdx hOldNotUsed k h2 h1)
+                (fun m hm =>
                   (hframeMid m (node_ne_of_toNat_ne (hSdone _ hm).1) (fun h => hDisj _ hOldNotUsed _ h hm) (hSdone _ hm).2).trans
-                    (DomArena.get_set_ne _ _ (node_ne_of_toNat_ne (hSdone _ hm).1))) hDoneC
-              have hDone' := CleanDomChildren_append (fun k hk1 hk2 =>
-                hk2.elim (fun hsi => hDisj oldIdx hOldNotUsed k hsi hk1) (fun hlo => Nat.not_lt.2 hlo.1 (hSdone k hk1).2))
-                hDoneMid (show CleanDomChildren f childNs [t] aMid Sc' [newChild] from
-                  ⟨Sc', fun _ => False, fun _ h => h, fun _ h => h.elim, fun _ _ h => h.elim, hcNew, trivial⟩)
+                    (DomArena.get_set_ne _ _ (node_ne_of_toNat_ne (hSdone _ hm).1)))
+                hDoneC hcNew
               have hLive' : ∀ (i : Nat) (hi : i < c₁.length), i ∉ oldIdx :: usedIdxs →
                   live.getD i 0 ∈ suf.erase child ∧ CleanDomSubtree f childNs c₁[i] aMid (Si i) (live.getD i 0) := by
                 intro i hi hnotUsed
@@ -615,16 +600,9 @@ theorem applyKeyedStepsM_reconcile_spec {msg : Type} (f : Nat) (hPatch : @PatchS
               have hih := ih tRest (targetsDone ++ [t]) (oldIdx :: usedIdxs) (pre ++ [newChild]) (suf.erase child) Sdone' aMid
                 hlen' hMatchRest hclean.2 hrestDep hSufCleanLen (Nat.le_trans hbase haMidLe') hRestBound
                 (Nat.lt_of_lt_of_le hparLt haMidLe') (Nat.lt_of_lt_of_le hposId haMidLe') hparMid' hndMid'
-                (fun k hk => hk.elim (fun h => have hb := hSdone k h; ⟨hb.1, Nat.lt_of_lt_of_le hb.2 haMidLe'⟩)
-                  (fun h => h.elim (fun h2 => have hb := hSiB _ k h2; ⟨hb.1, Nat.lt_of_lt_of_le hb.2 (Nat.le_trans hbase haMidLe')⟩)
-                    (fun h3 => ⟨fun hEq => Nat.not_lt.2 h3.1 (hEq ▸ hparLt), h3.2⟩)))
-                hDone' hLive'
-                (fun i hi k hsi hk => by
-                  have hneIdx : i ≠ oldIdx := fun h => hi (h ▸ .head _)
-                  rcases hk with h1 | (h2 | h3)
-                  · exact hDisj i (fun h => hi (.tail _ h)) k hsi h1
-                  · exact hSiDisj i oldIdx hneIdx k hsi h2
-                  · exact Nat.not_lt.2 h3.1 (Nat.lt_of_lt_of_le (hSiB i k hsi).2 hbase))
+                hSdone' hDone' hLive'
+                (fun i hi k hsi hk => not_Sdone_extend (hDisj i (fun h => hi (.tail _ h)) k hsi)
+                  (hSiDisj i oldIdx (fun h => hi (h ▸ .head _)) k hsi) (Nat.lt_of_lt_of_le (hSiB i k hsi).2 hbase) hk)
                 (fun r hr => have hr0 := hsufB r (List.mem_of_mem_erase hr); ⟨Nat.lt_of_lt_of_le hr0.1 haMidLe', hr0.2⟩)
               have hstepRun : applyKeyedStepsM (m := StateM (DomArena msg)) parent live (UInt32.ofNat pre.length) (.reuse oldIdx (diff c₁[oldIdx] t) :: sRest) a =
                   applyKeyedStepsM (m := StateM (DomArena msg)) parent live (UInt32.ofNat (pre ++ [newChild]).length) sRest aMid := by
@@ -646,13 +624,11 @@ theorem applyKeyedStepsM_reconcile_spec {msg : Type} (f : Nat) (hPatch : @PatchS
                 by simp only [List.cons_append, List.length_cons] at htotLenR ⊢; omega,
                 Nat.le_trans haMidLe' hmonoR,
                 Nat.le_trans hboundR (Nat.add_assoc _ _ _ ▸ Nat.add_le_add_right haMidBound' _),
-                by simp only [List.append_assoc]; exact hparR, fun m hmPar hmD hmAll hmLt => ?_, fun k hk => ?_, hDoneR⟩
-              · have hnmD' : ¬Sdone' m.toNat := fun h => h.elim hmD (fun h2 => h2.elim (hmAll oldIdx) (fun hlo => Nat.not_lt.2 hlo.1 hmLt))
-                rw [hfrR m hmPar hnmD' hmAll (Nat.lt_of_lt_of_le hmLt haMidLe'), hframeMid m hmPar (hmAll oldIdx) hmLt, DomArena.get_set_ne _ _ hmPar]
-              · rcases hSnew k hk with ⟨hS | hEx | hA, hnp⟩
-                · exact ⟨hS.elim .inl (fun h2 => h2.elim (fun hsi => .inr (.inl ⟨oldIdx, hsi⟩)) (fun hhi => .inr (.inr ⟨hhi.1, Nat.lt_of_lt_of_le hhi.2 hmonoR⟩))), hnp⟩
-                · exact ⟨.inr (.inl hEx), hnp⟩
-                · exact ⟨.inr (.inr ⟨Nat.le_trans haMidLe' hA.1, hA.2⟩), hnp⟩
+                by simp only [List.append_assoc]; exact hparR,
+                fun m hmPar hmD hmAll hmLt =>
+                  ((hfrR m hmPar (not_Sdone_extend hmD (hmAll oldIdx) hmLt) hmAll (Nat.lt_of_lt_of_le hmLt haMidLe')).trans
+                    (hframeMid m hmPar (hmAll oldIdx) hmLt)).trans (DomArena.get_set_ne _ _ hmPar),
+                clean_step_Snew_compose haMidLe' hmonoR (fun _ hsi => ⟨oldIdx, hsi⟩) (fun _ h => h) hSnew, hDoneR⟩
           | create newH =>
               have htEq : newH = t := hStep0.1 newH rfl
               rcases clean_create_step f parent pns ptag pst pmg childNs hchildNs t targetsDone pre suf Sdone a
@@ -672,8 +648,7 @@ theorem applyKeyedStepsM_reconcile_spec {msg : Type} (f : Nat) (hPatch : @PatchS
                 (fun k => Sdone k ∨ (a.nextId ≤ k ∧ k < aIns.nextId)) aIns
                 hlen' hMatchRest hclean.2 hrestDep (by simp only [List.length_append, List.length_cons, List.length_nil]; omega)
                 (Nat.le_trans hbase haInsGe) hRestBound (Nat.lt_of_lt_of_le hparLt haInsGe) (Nat.lt_of_lt_of_le hposId haInsGe) hparIns hnd'
-                (fun k hk => hk.elim (fun h => have hb := hSdone k h; ⟨hb.1, Nat.lt_of_lt_of_le hb.2 haInsGe⟩)
-                  (fun h => ⟨fun hEq => Nat.not_lt.2 h.1 (hEq ▸ hparLt), h.2⟩)) hDone' hLiveIns
+                (clean_done_alloc_bounds haInsGe hparLt hSdone) hDone' hLiveIns
                 (fun i hnu k hsi hk => hk.elim (fun h => hDisj i hnu k hsi h) (fun hhi => Nat.not_lt.2 hhi.1 (Nat.lt_of_lt_of_le (hSiB i k hsi).2 hbase)))
                 (fun r hr => have hb := hsufB r hr; ⟨Nat.lt_of_lt_of_le hb.1 haInsGe, hb.2⟩)
               have hstepRun : applyKeyedStepsM (m := StateM (DomArena msg)) parent live (UInt32.ofNat pre.length) (.create newH :: sRest) a =
@@ -693,12 +668,11 @@ theorem applyKeyedStepsM_reconcile_spec {msg : Type} (f : Nat) (hPatch : @PatchS
                 by simp only [List.cons_append, List.length_cons] at htotLenR ⊢; omega,
                 Nat.le_trans haInsGe hmonoR,
                 Nat.le_trans hboundR (Nat.add_assoc _ _ _ ▸ Nat.add_le_add_right haInsLe _),
-                by simp only [List.append_assoc]; exact hparR, fun m hmPar hmD hmAll hmLt => ?_, fun k hk => ?_, hDoneR⟩
-              · rw [hfrR m hmPar (fun h => h.elim hmD (fun hlo => Nat.not_lt.2 hlo.1 hmLt)) hmAll (Nat.lt_of_lt_of_le hmLt haInsGe), hfrIns m hmPar hmLt]
-              · rcases hSnew k hk with ⟨hS | hEx | hA, hnp⟩
-                · exact ⟨hS.elim .inl (fun h2 => .inr (.inr ⟨h2.1, Nat.lt_of_lt_of_le h2.2 hmonoR⟩)), hnp⟩
-                · exact ⟨.inr (.inl hEx), hnp⟩
-                · exact ⟨.inr (.inr ⟨Nat.le_trans haInsGe hA.1, hA.2⟩), hnp⟩
+                by simp only [List.append_assoc]; exact hparR,
+                fun m hmPar hmD hmAll hmLt =>
+                  (hfrR m hmPar (fun h => h.elim hmD (fun hlo => Nat.not_lt.2 hlo.1 hmLt)) hmAll (Nat.lt_of_lt_of_le hmLt haInsGe)).trans
+                    (hfrIns m hmPar hmLt),
+                clean_create_Snew_compose haInsGe hmonoR hSnew, hDoneR⟩
 
 private theorem applyPositionalStepsM_clean_at0 {msg : Type} (f : Nat) (hPatch : @PatchSpecAt msg f)
     (parent : Dom.Node) (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)

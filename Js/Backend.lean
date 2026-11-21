@@ -93,12 +93,6 @@ def JsExpr.renderListMinAux (min : Bool) (acc : Array String) : List JsExpr → 
   | e :: es => JsExpr.renderListMinAux min ((acc.push (e.renderMin min)).push (if min then "," else ", ")) es
 end
 
-def JsExpr.render (e : JsExpr) : String :=
-  e.renderMin false
-
-def JsExpr.renderList (es : List JsExpr) : String :=
-  joinChunks (JsExpr.renderListMinAux false #[] es)
-
 mutual
 inductive JsStmt where
   | letVar           (name : String) (val : JsExpr)
@@ -124,93 +118,59 @@ inductive JsSwitchArm where
 end
 
 mutual
-def JsStmt.render (min : Bool) (d : Nat) : JsStmt → String
-  | .letVar x val =>
-      if min then s!"let {x}={val.renderMin true};"
-      else s!"{indStr false d}let {x} = {val.renderMin false};\n"
+def JsStmt.render (min : Bool) (d : Nat) (s : JsStmt) : String :=
+  let ind := indStr min d
+  let sp := if min then "" else " "
+  let nl := if min then "" else "\n"
+  let sep := if min then "," else ", "
+  let eq := if min then "=" else " = "
+  match s with
+  | .letVar x val => s!"{ind}let {x}{eq}{val.renderMin min};{nl}"
   | .letDecls names =>
-      if names.isEmpty then ""
-      else if min then s!"let {String.intercalate "," names};"
-      else s!"{indStr false d}let {String.intercalate ", " names};\n"
+      if names.isEmpty then "" else s!"{ind}let {String.intercalate sep names};{nl}"
   | .letBinds binds =>
       if binds.isEmpty then ""
-      else if min then s!"let {String.intercalate "," (binds.map fun (k, e) => s!"{k}={e.renderMin true}")};"
-      else s!"{indStr false d}let {String.intercalate ", " (binds.map fun (k, e) => s!"{k} = {e.renderMin false}")};\n"
+      else s!"{ind}let {String.intercalate sep (binds.map fun (k, e) => s!"{k}{eq}{e.renderMin min}")};{nl}"
   | .labeledBlock lbl body =>
-      if min then s!"{lbl}:\{" ++ joinChunks (JsStmt.renderListAux true (d + 1) #[] body) ++ "}"
-      else s!"{indStr false d}{lbl}: \{\n" ++ joinChunks (JsStmt.renderListAux false (d + 1) #[] body) ++ s!"{indStr false d}}\n"
+      s!"{ind}{lbl}:{sp}\{{nl}" ++ joinChunks (JsStmt.renderListAux min (d + 1) #[] body) ++ s!"{ind}}{nl}"
   | .constArrow name params body =>
-      if min then
-        s!"const {name}=({String.intercalate "," params})=>\{" ++
-          joinChunks (JsStmt.renderListAux true (d + 1) #[] body) ++ "};"
-      else
-        s!"{indStr false d}const {name} = ({String.intercalate ", " params}) => \{\n" ++
-          joinChunks (JsStmt.renderListAux false (d + 1) #[] body) ++ s!"{indStr false d}};\n"
-  | .setField x i val =>
-      if min then s!"{x}.f[{i}]={val.renderMin true};"
-      else s!"{indStr false d}{x}.f[{i}] = {val.renderMin false};\n"
-  | .setTag x cidx =>
-      if min then s!"{x}.t={cidx};"
-      else s!"{indStr false d}{x}.t = {cidx};\n"
-  | .setU x i val =>
-      if min then s!"{x}.u[{i}]={val.renderMin true};"
-      else s!"{indStr false d}{x}.u[{i}] = {val.renderMin false};\n"
-  | .setS x n off val =>
-      if min then s!"{x}.s[{soff n off}]={val.renderMin true};"
-      else s!"{indStr false d}{x}.s[{soff n off}] = {val.renderMin false};\n"
-  | .incRef x n =>
-      if min then s!"$.inc({x},{n});"
-      else s!"{indStr false d}$.inc({x}, {n});\n"
-  | .decRef x n =>
-      if min then s!"$.dec({x},{n});"
-      else s!"{indStr false d}$.dec({x}, {n});\n"
-  | .ret val =>
-      if min then s!"return {val.renderMin true};"
-      else s!"{indStr false d}return {val.renderMin false};\n"
+      s!"{ind}const {name}{eq}({String.intercalate sep params}){sp}=>{sp}\{{nl}" ++
+        joinChunks (JsStmt.renderListAux min (d + 1) #[] body) ++ s!"{ind}};{nl}"
+  | .setField x i val => s!"{ind}{x}.f[{i}]{eq}{val.renderMin min};{nl}"
+  | .setTag x cidx => s!"{ind}{x}.t{eq}{cidx};{nl}"
+  | .setU x i val => s!"{ind}{x}.u[{i}]{eq}{val.renderMin min};{nl}"
+  | .setS x n off val => s!"{ind}{x}.s[{soff n off}]{eq}{val.renderMin min};{nl}"
+  | .incRef x n => s!"{ind}$.inc({x}{sep}{n});{nl}"
+  | .decRef x n => s!"{ind}$.dec({x}{sep}{n});{nl}"
+  | .ret val => s!"{ind}return {val.renderMin min};{nl}"
   | .tailContinue params args =>
-      if args.isEmpty then
-        if min then "continue;" else s!"{indStr false d}continue;\n"
-      else if min then
-        match params, args with
-        | [p], [a] => s!"\{{p}={a.renderMin true};continue;}"
-        | _, _ =>
-            let tmps := String.intercalate "," (args.zipIdx.map fun (a, i) => s!"_{i}={a.renderMin true}")
-            let assigns := String.intercalate "" (params.zipIdx.map fun (p, i) => s!"{p}=_{i};")
-            s!"\{let {tmps};{assigns}continue;}"
-      else
-        let tmps := String.intercalate ", " (args.zipIdx.map fun (a, i) => s!"_t{i} = {a.renderMin false}")
-        let assigns := String.intercalate " " (params.zipIdx.map fun (p, i) => s!"{p} = _t{i};")
-        s!"{indStr false d}\{ let {tmps}; {assigns} continue; }\n"
+      if args.isEmpty then s!"{ind}continue;{nl}"
+      else match min, params, args with
+      | true, [p], [a] => s!"\{{p}={a.renderMin true};continue;}"
+      | _, _, _ =>
+          let tp := if min then "_" else "_t"
+          let tmps := String.intercalate sep (args.zipIdx.map fun (a, i) => s!"{tp}{i}{eq}{a.renderMin min}")
+          let assigns := String.intercalate sp (params.zipIdx.map fun (p, i) => s!"{p}{eq}{tp}{i};")
+          s!"{ind}\{{sp}let {tmps};{sp}{assigns}{sp}continue;{sp}}{nl}"
   | .breakLabel assigns lbl =>
-      if min then
-        let assignStr := String.intercalate "" (assigns.map fun (lhs, rhs) => s!"{lhs}={rhs.renderMin true};")
-        s!"{assignStr}break {lbl};"
-      else
-        let assignStr := String.intercalate " " (assigns.map fun (lhs, rhs) => s!"{lhs} = {rhs.renderMin false};")
-        let pfx := if assignStr.isEmpty then "" else assignStr ++ " "
-        s!"{indStr false d}{pfx}break {lbl};\n"
-  | .throwUnreachable =>
-      if min then "throw new Error('unreachable');"
-      else s!"{indStr false d}throw new Error('unreachable');\n"
+      let assignStr := String.intercalate sp (assigns.map fun (lhs, rhs) => s!"{lhs}{eq}{rhs.renderMin min};")
+      let pfx := if assignStr.isEmpty then "" else assignStr ++ sp
+      s!"{ind}{pfx}break {lbl};{nl}"
+  | .throwUnreachable => s!"{ind}throw new Error('unreachable');{nl}"
   | .switchStmt scrut arms =>
-      if min then
-        s!"switch({scrut.renderMin true})\{" ++
-          joinChunks (JsSwitchArm.renderListAux true (d + 1) #[] arms) ++ "}"
-      else
-        s!"{indStr false d}switch ({scrut.renderMin false}) \{\n" ++
-          joinChunks (JsSwitchArm.renderListAux false (d + 1) #[] arms) ++ s!"{indStr false d}}\n"
+      s!"{ind}switch{sp}({scrut.renderMin min}){sp}\{{nl}" ++
+        joinChunks (JsSwitchArm.renderListAux min (d + 1) #[] arms) ++ s!"{ind}}{nl}"
 
 def JsStmt.renderListAux (min : Bool) (d : Nat) (acc : Array String) : List JsStmt → Array String
   | []      => acc
   | s :: ss => JsStmt.renderListAux min d (acc.push (s.render min d)) ss
 
-def JsSwitchArm.render (min : Bool) (d : Nat) : JsSwitchArm → String
-  | .caseArm cidx body =>
-      if min then s!"case {cidx}:\{" ++ joinChunks (JsStmt.renderListAux true (d + 1) #[] body) ++ "}"
-      else s!"{indStr false d}case {cidx}: \{\n" ++ joinChunks (JsStmt.renderListAux false (d + 1) #[] body) ++ s!"{indStr false d}}\n"
-  | .defaultArm body =>
-      if min then "default:{" ++ joinChunks (JsStmt.renderListAux true (d + 1) #[] body) ++ "}"
-      else s!"{indStr false d}default: \{\n" ++ joinChunks (JsStmt.renderListAux false (d + 1) #[] body) ++ s!"{indStr false d}}\n"
+def JsSwitchArm.render (min : Bool) (d : Nat) (a : JsSwitchArm) : String :=
+  let (ind, sp, nl) := (indStr min d, if min then "" else " ", if min then "" else "\n")
+  let mk (hdr b : String) := s!"{ind}{hdr}{sp}\{{nl}" ++ b ++ s!"{ind}}{nl}"
+  match a with
+  | .caseArm cidx body => mk s!"case {cidx}:" (joinChunks (JsStmt.renderListAux min (d + 1) #[] body))
+  | .defaultArm body   => mk "default:" (joinChunks (JsStmt.renderListAux min (d + 1) #[] body))
 
 def JsSwitchArm.renderListAux (min : Bool) (d : Nat) (acc : Array String) : List JsSwitchArm → Array String
   | []      => acc
@@ -220,9 +180,6 @@ end
 def JsStmt.renderList (min : Bool) (d : Nat) (ss : List JsStmt) : String :=
   joinChunks (JsStmt.renderListAux min d #[] ss)
 
-def JsSwitchArm.renderList (min : Bool) (d : Nat) (as : List JsSwitchArm) : String :=
-  joinChunks (JsSwitchArm.renderListAux min d #[] as)
-
 inductive JsDecl where
   | memoInit     (name : String) (initFn : String)
   | memoThunk    (name : String) (body : List JsStmt)
@@ -231,41 +188,33 @@ inductive JsDecl where
   | fnTrampoline (name : String) (origName : Name) (params : List String) (body : List JsStmt)
 
 private def fnHeader (min : Bool) (name : String) (orig : Name) (params : List String) : String :=
-  if min then
-    s!"function {name}({String.intercalate "," params})\{"
-  else
-    let ps := String.intercalate ", " params
-    s!"function {name}({ps}) /* {orig} */ \{\n"
+  if min then s!"function {name}({String.intercalate "," params})\{"
+  else s!"function {name}({String.intercalate ", " params}) /* {orig} */ \{\n"
 
-def JsDecl.render (min : Bool) : JsDecl → String
+def JsDecl.render (min : Bool) (d : JsDecl) : String :=
+  let (eq, sp, nl) := (if min then "=" else " = ", if min then "" else " ", if min then "" else "\n")
+  match d with
   | .memoInit name initFn =>
-      if min then s!"const {name}=$.memo(()=>$.ioVal({initFn}(0)));\n"
-      else s!"const {name} = $.memo(() => $.ioVal({initFn}(0)));\n"
+      s!"const {name}{eq}$.memo((){sp}=>{sp}$.ioVal({initFn}(0)));\n"
   | .memoThunk name body =>
-      if min then s!"const {name}=$.memo(()=>\{" ++ JsStmt.renderList true 1 body ++ "});\n"
-      else s!"const {name} = $.memo(() => \{\n" ++ JsStmt.renderList false 1 body ++ "});\n"
+      s!"const {name}{eq}$.memo((){sp}=>{sp}\{{nl}" ++ JsStmt.renderList min 1 body ++ "});\n"
   | .fnPlain name orig params body =>
       fnHeader min name orig params ++ JsStmt.renderList min 1 body ++ "}\n"
   | .fnDirectLoop name orig params body =>
-      if min then
-        fnHeader true name orig params ++ "while(1){" ++ JsStmt.renderList true 2 body ++ "}}\n"
-      else
-        fnHeader false name orig params ++
-          s!"{indStr false 1}while (true) \{\n" ++ JsStmt.renderList false 2 body ++ s!"{indStr false 1}}\n}\n"
+      let w := if min then "while(1){" else s!"{indStr false 1}while (true) \{\n"
+      fnHeader min name orig params ++ w ++ JsStmt.renderList min 2 body ++ s!"{indStr min 1}}{nl}}\n"
   | .fnTrampoline name orig params body =>
+      let ps := String.intercalate (if min then "," else ", ") params
       if min then
-        let ps := String.intercalate "," params
         fnHeader true name orig params ++
           "const _s=()=>{" ++ JsStmt.renderList true 2 body ++ "};" ++
           s!"while(1)\{const _r=_s();if(_r!==null&&typeof _r===\"object\"&&_r.__tc!==void 0)\{[{ps}]=_r.__tc;continue;}return _r;}}\n"
       else
-        let ps := String.intercalate ", " params
-        let reasn := s!"[{ps}] = __r.__tc;"
         fnHeader false name orig params ++
           s!"{indStr false 1}const __step = () => \{\n" ++ JsStmt.renderList false 2 body ++ s!"{indStr false 1}};\n" ++
           s!"{indStr false 1}while (true) \{\n" ++
           s!"{indStr false 2}const __r = __step();\n" ++
-          s!"{indStr false 2}if (__r !== null && typeof __r === \"object\" && __r.__tc !== undefined) \{ {reasn} continue; }\n" ++
+          s!"{indStr false 2}if (__r !== null && typeof __r === \"object\" && __r.__tc !== undefined) \{ [{ps}] = __r.__tc; continue; }\n" ++
           s!"{indStr false 2}return __r;\n" ++
           s!"{indStr false 1}}\n}\n"
 
@@ -616,9 +565,8 @@ private def collectLocalArrowsStmts (acc : Std.HashSet String) : List JsStmt →
   | s :: ss => collectLocalArrowsStmts (collectLocalArrowsStmt acc s) ss
 
 private def collectLocalArrowsArms (acc : Std.HashSet String) : List JsSwitchArm → Std.HashSet String
-  | []                     => acc
-  | .caseArm _ b :: rest   => collectLocalArrowsArms (collectLocalArrowsStmts acc b) rest
-  | .defaultArm b :: rest  => collectLocalArrowsArms (collectLocalArrowsStmts acc b) rest
+  | [] => acc
+  | .caseArm _ b :: rest | .defaultArm b :: rest => collectLocalArrowsArms (collectLocalArrowsStmts acc b) rest
 end
 
 mutual
@@ -630,14 +578,10 @@ private def collectGlobalsExpr (localArrows : Std.HashSet String) (acc : Std.Has
   | .pap fn _ args =>
       let acc' := if !fn.startsWith "$." then acc.insert fn else acc
       collectGlobalsExprs localArrows acc' args
-  | .arrLit elems      => collectGlobalsExprs localArrows acc elems
-  | .ctorObj _ fs _ _  => collectGlobalsExprs localArrows acc fs
-  | .fieldProj o _     => collectGlobalsExpr localArrows acc o
-  | .uProj o _         => collectGlobalsExpr localArrows acc o
-  | .sProj o _ _       => collectGlobalsExpr localArrows acc o
-  | .app fn args       => collectGlobalsExprs localArrows (collectGlobalsExpr localArrows acc fn) args
-  | .tc args           => collectGlobalsExprs localArrows acc args
-  | _                  => acc
+  | .arrLit elems | .ctorObj _ elems _ _ | .tc elems => collectGlobalsExprs localArrows acc elems
+  | .fieldProj o _ | .uProj o _ | .sProj o _ _ => collectGlobalsExpr localArrows acc o
+  | .app fn args => collectGlobalsExprs localArrows (collectGlobalsExpr localArrows acc fn) args
+  | _ => acc
 
 private def collectGlobalsExprs (localArrows : Std.HashSet String) (acc : Std.HashSet String) :
     List JsExpr → Std.HashSet String
@@ -648,18 +592,13 @@ end
 mutual
 private def collectGlobalsStmt (localArrows : Std.HashSet String) (acc : Std.HashSet String) :
     JsStmt → Std.HashSet String
-  | .letVar _ val          => collectGlobalsExpr localArrows acc val
-  | .letBinds binds        => collectGlobalsExprs localArrows acc (binds.map Prod.snd)
-  | .labeledBlock _ body   => collectGlobalsStmts localArrows acc body
-  | .constArrow _ _ body   => collectGlobalsStmts localArrows acc body
-  | .setField _ _ val      => collectGlobalsExpr localArrows acc val
-  | .setU _ _ val          => collectGlobalsExpr localArrows acc val
-  | .setS _ _ _ val        => collectGlobalsExpr localArrows acc val
-  | .ret val               => collectGlobalsExpr localArrows acc val
-  | .tailContinue _ args   => collectGlobalsExprs localArrows acc args
-  | .breakLabel assigns _  => collectGlobalsExprs localArrows acc (assigns.map Prod.snd)
+  | .letVar _ val | .setField _ _ val | .setU _ _ val | .setS _ _ _ val | .ret val =>
+      collectGlobalsExpr localArrows acc val
+  | .letBinds binds | .breakLabel binds _ => collectGlobalsExprs localArrows acc (binds.map Prod.snd)
+  | .labeledBlock _ body | .constArrow _ _ body => collectGlobalsStmts localArrows acc body
+  | .tailContinue _ args => collectGlobalsExprs localArrows acc args
   | .switchStmt scrut arms => collectGlobalsArms localArrows (collectGlobalsExpr localArrows acc scrut) arms
-  | _                      => acc
+  | _ => acc
 
 private def collectGlobalsStmts (localArrows : Std.HashSet String) (acc : Std.HashSet String) :
     List JsStmt → Std.HashSet String
@@ -668,9 +607,9 @@ private def collectGlobalsStmts (localArrows : Std.HashSet String) (acc : Std.Ha
 
 private def collectGlobalsArms (localArrows : Std.HashSet String) (acc : Std.HashSet String) :
     List JsSwitchArm → Std.HashSet String
-  | []                    => acc
-  | .caseArm _ b :: rest  => collectGlobalsArms localArrows (collectGlobalsStmts localArrows acc b) rest
-  | .defaultArm b :: rest => collectGlobalsArms localArrows (collectGlobalsStmts localArrows acc b) rest
+  | [] => acc
+  | .caseArm _ b :: rest | .defaultArm b :: rest =>
+      collectGlobalsArms localArrows (collectGlobalsStmts localArrows acc b) rest
 end
 
 private structure MinSt where
@@ -681,192 +620,102 @@ private structure MinSt where
   lblMap      : Std.HashMap String String := {}
   lblIdx      : Nat := 0
 
-private def MinSt.mapVar (st : MinSt) (name : String) : String × MinSt :=
+private abbrev MinM := StateM MinSt
+
+private def mapVarM (name : String) : MinM String := do
+  let st ← get
   match st.varMap.get? name with
-  | some s => (s, st)
-  | none   =>
+  | some s => return s
+  | none =>
       let (s, idx') := nextShortIdent st.avoid st.varIdx
-      (s, { st with varMap := st.varMap.insert name s, varIdx := idx' })
+      set { st with varMap := st.varMap.insert name s, varIdx := idx' }
+      return s
 
-private def MinSt.mapVars (st : MinSt) : List String → List String × MinSt
-  | [] => ([], st)
-  | x :: xs =>
-      let (x', st1) := st.mapVar x
-      let (xs', st2) := st1.mapVars xs
-      (x' :: xs', st2)
-
-private def MinSt.mapLbl (st : MinSt) (lbl : String) : String × MinSt :=
+private def mapLblM (lbl : String) : MinM String := do
+  let st ← get
   match st.lblMap.get? lbl with
-  | some s => (s, st)
-  | none   =>
+  | some s => return s
+  | none =>
       let (s, idx') := nextShortIdent jsMinReservedSet st.lblIdx
-      (s, { st with lblMap := st.lblMap.insert lbl s, lblIdx := idx' })
+      set { st with lblMap := st.lblMap.insert lbl s, lblIdx := idx' }
+      return s
 
 mutual
-private def renameExpr (st : MinSt) : JsExpr → JsExpr × MinSt
-  | .var name =>
-      let (n', st') := st.mapVar name
-      (.var n', st')
-  | .numLit n      => (.numLit n, st)
-  | .bigIntLit n   => (.bigIntLit n, st)
-  | .strLit s      => (.strLit s, st)
-  | .arrLit elems  =>
-      let (es', st') := renameExprs st elems
-      (.arrLit es', st')
-  | .ctorObj cidx fs hasS hasU =>
-      let (fs', st') := renameExprs st fs
-      (.ctorObj cidx fs' hasS hasU, st')
-  | .fieldProj o i =>
-      let (o', st') := renameExpr st o
-      (.fieldProj o' i, st')
-  | .uProj o i =>
-      let (o', st') := renameExpr st o
-      (.uProj o' i, st')
-  | .sProj o n off =>
-      let (o', st') := renameExpr st o
-      (.sProj o' n off, st')
-  | .call fn args =>
-      let (fn', st1) := if st.localArrows.contains fn then st.mapVar fn else (fn, st)
-      let (args', st2) := renameExprs st1 args
-      (.call fn' args', st2)
-  | .pap fn ar args =>
-      let (args', st') := renameExprs st args
-      (.pap fn ar args', st')
-  | .app fn args =>
-      let (fn', st1) := renameExpr st fn
-      let (args', st2) := renameExprs st1 args
-      (.app fn' args', st2)
-  | .tc args =>
-      let (args', st') := renameExprs st args
-      (.tc args', st')
+private def renameExpr : JsExpr → MinM JsExpr
+  | .var name => return .var (← mapVarM name)
+  | .arrLit elems => return .arrLit (← renameExprs elems)
+  | .ctorObj cidx fs hasS hasU => return .ctorObj cidx (← renameExprs fs) hasS hasU
+  | .fieldProj o i => return .fieldProj (← renameExpr o) i
+  | .uProj o i => return .uProj (← renameExpr o) i
+  | .sProj o n off => return .sProj (← renameExpr o) n off
+  | .call fn args => do
+      let fn' ← if (← get).localArrows.contains fn then mapVarM fn else pure fn
+      return .call fn' (← renameExprs args)
+  | .pap fn ar args => return .pap fn ar (← renameExprs args)
+  | .app fn args => return .app (← renameExpr fn) (← renameExprs args)
+  | .tc args => return .tc (← renameExprs args)
+  | e => return e
 
-private def renameExprs (st : MinSt) : List JsExpr → List JsExpr × MinSt
-  | [] => ([], st)
-  | e :: es =>
-      let (e', st1) := renameExpr st e
-      let (es', st2) := renameExprs st1 es
-      (e' :: es', st2)
+private def renameExprs : List JsExpr → MinM (List JsExpr)
+  | [] => return []
+  | e :: es => return (← renameExpr e) :: (← renameExprs es)
 end
 
-private def renamePairs (st : MinSt) : List (String × JsExpr) → List (String × JsExpr) × MinSt
-  | [] => ([], st)
-  | (k, e) :: rest =>
-      let (k', st1) := st.mapVar k
-      let (e', st2) := renameExpr st1 e
-      let (rest', st3) := renamePairs st2 rest
-      ((k', e') :: rest', st3)
+private def renamePairs (ps : List (String × JsExpr)) : MinM (List (String × JsExpr)) :=
+  ps.mapM fun (k, e) => return (← mapVarM k, ← renameExpr e)
 
 mutual
-private def renameStmt (st : MinSt) : JsStmt → JsStmt × MinSt
-  | .letVar x val =>
-      let (val', st1) := renameExpr st val
-      let (x', st2) := st1.mapVar x
-      (.letVar x' val', st2)
-  | .letDecls names =>
-      let (ns', st') := st.mapVars names
-      (.letDecls ns', st')
-  | .letBinds binds =>
-      let (bs', st') := renamePairs st binds
-      (.letBinds bs', st')
-  | .labeledBlock lbl body =>
-      let (lbl', st1) := st.mapLbl lbl
-      let (body', st2) := renameStmts st1 body
-      (.labeledBlock lbl' body', st2)
+private def renameStmt : JsStmt → MinM JsStmt
+  | .letVar x val => do
+      let val' ← renameExpr val
+      return .letVar (← mapVarM x) val'
+  | .letDecls names => return .letDecls (← names.mapM mapVarM)
+  | .letBinds binds => return .letBinds (← renamePairs binds)
+  | .labeledBlock lbl body => return .labeledBlock (← mapLblM lbl) (← renameStmts body)
   | .constArrow name params body =>
-      let (name', st1) := st.mapVar name
-      let (ps', st2) := st1.mapVars params
-      let (body', st3) := renameStmts st2 body
-      (.constArrow name' ps' body', st3)
-  | .setField x i val =>
-      let (x', st1) := st.mapVar x
-      let (val', st2) := renameExpr st1 val
-      (.setField x' i val', st2)
-  | .setTag x cidx =>
-      let (x', st1) := st.mapVar x
-      (.setTag x' cidx, st1)
-  | .setU x i val =>
-      let (x', st1) := st.mapVar x
-      let (val', st2) := renameExpr st1 val
-      (.setU x' i val', st2)
-  | .setS x n off val =>
-      let (x', st1) := st.mapVar x
-      let (val', st2) := renameExpr st1 val
-      (.setS x' n off val', st2)
-  | .incRef x n =>
-      let (x', st1) := st.mapVar x
-      (.incRef x' n, st1)
-  | .decRef x n =>
-      let (x', st1) := st.mapVar x
-      (.decRef x' n, st1)
-  | .ret val =>
-      let (val', st1) := renameExpr st val
-      (.ret val', st1)
-  | .tailContinue params args =>
-      let (args', st1) := renameExprs st args
-      let (ps', st2) := st1.mapVars params
-      (.tailContinue ps' args', st2)
-  | .breakLabel assigns lbl =>
-      let (as', st1) := renamePairs st assigns
-      let (lbl', st2) := st1.mapLbl lbl
-      (.breakLabel as' lbl', st2)
-  | .throwUnreachable => (.throwUnreachable, st)
-  | .switchStmt scrut arms =>
-      let (scrut', st1) := renameExpr st scrut
-      let (arms', st2) := renameArms st1 arms
-      (.switchStmt scrut' arms', st2)
+      return .constArrow (← mapVarM name) (← params.mapM mapVarM) (← renameStmts body)
+  | .setField x i val => return .setField (← mapVarM x) i (← renameExpr val)
+  | .setTag x cidx => return .setTag (← mapVarM x) cidx
+  | .setU x i val => return .setU (← mapVarM x) i (← renameExpr val)
+  | .setS x n off val => return .setS (← mapVarM x) n off (← renameExpr val)
+  | .incRef x n => return .incRef (← mapVarM x) n
+  | .decRef x n => return .decRef (← mapVarM x) n
+  | .ret val => return .ret (← renameExpr val)
+  | .tailContinue params args => do
+      let args' ← renameExprs args
+      return .tailContinue (← params.mapM mapVarM) args'
+  | .breakLabel assigns lbl => return .breakLabel (← renamePairs assigns) (← mapLblM lbl)
+  | .throwUnreachable => return .throwUnreachable
+  | .switchStmt scrut arms => return .switchStmt (← renameExpr scrut) (← renameArms arms)
 
-private def renameStmts (st : MinSt) : List JsStmt → List JsStmt × MinSt
-  | [] => ([], st)
-  | s :: ss =>
-      let (s', st1) := renameStmt st s
-      let (ss', st2) := renameStmts st1 ss
-      (s' :: ss', st2)
+private def renameStmts : List JsStmt → MinM (List JsStmt)
+  | [] => return []
+  | s :: ss => return (← renameStmt s) :: (← renameStmts ss)
 
-private def renameArms (st : MinSt) : List JsSwitchArm → List JsSwitchArm × MinSt
-  | [] => ([], st)
-  | .caseArm cidx b :: rest =>
-      let (b', st1) := renameStmts st b
-      let (rest', st2) := renameArms st1 rest
-      (.caseArm cidx b' :: rest', st2)
-  | .defaultArm b :: rest =>
-      let (b', st1) := renameStmts st b
-      let (rest', st2) := renameArms st1 rest
-      (.defaultArm b' :: rest', st2)
+private def renameArms : List JsSwitchArm → MinM (List JsSwitchArm)
+  | [] => return []
+  | .caseArm cidx b :: rest => return .caseArm cidx (← renameStmts b) :: (← renameArms rest)
+  | .defaultArm b :: rest => return .defaultArm (← renameStmts b) :: (← renameArms rest)
 end
+
+private def minifyFnBody (name : String) (params : List String) (body : List JsStmt) :
+    List String × List JsStmt :=
+  let localArrows := collectLocalArrowsStmts {} body
+  let avoid := collectGlobalsStmts localArrows (jsMinReservedSet.insert name) body
+  ((do return (← params.mapM mapVarM, ← renameStmts body)).run { avoid, localArrows }).1
 
 /-- Deterministically alpha-renames all local variables, parameters, join-point arrow bindings,
     inline join-point slots, and block labels in a lowered `JsDecl` to short base-52/62 names,
     avoiding all JS reserved words, `$`, and any global function names referenced by the body. -/
 def minifyDecl : JsDecl → JsDecl
   | d@(.memoInit ..) => d
-  | .memoThunk name body =>
-      let localArrows := collectLocalArrowsStmts {} body
-      let avoid := collectGlobalsStmts localArrows (jsMinReservedSet.insert name) body
-      let (body', _) := renameStmts { avoid, localArrows } body
-      .memoThunk name body'
+  | .memoThunk name body => .memoThunk name (minifyFnBody name [] body).2
   | .fnPlain name orig params body =>
-      let localArrows := collectLocalArrowsStmts {} body
-      let avoid := collectGlobalsStmts localArrows (jsMinReservedSet.insert name) body
-      let (ps', st1) := ({ avoid, localArrows } : MinSt).mapVars params
-      let (body', _) := renameStmts st1 body
-      .fnPlain name orig ps' body'
+      let (ps', b') := minifyFnBody name params body; .fnPlain name orig ps' b'
   | .fnDirectLoop name orig params body =>
-      let localArrows := collectLocalArrowsStmts {} body
-      let avoid := collectGlobalsStmts localArrows (jsMinReservedSet.insert name) body
-      let (ps', st1) := ({ avoid, localArrows } : MinSt).mapVars params
-      let (body', _) := renameStmts st1 body
-      .fnDirectLoop name orig ps' body'
+      let (ps', b') := minifyFnBody name params body; .fnDirectLoop name orig ps' b'
   | .fnTrampoline name orig params body =>
-      let localArrows := collectLocalArrowsStmts {} body
-      let avoid := collectGlobalsStmts localArrows (jsMinReservedSet.insert name) body
-      let (ps', st1) := ({ avoid, localArrows } : MinSt).mapVars params
-      let (body', _) := renameStmts st1 body
-      .fnTrampoline name orig ps' body'
-
-def emitDecl (c0 : Ctx) (d : Decl) : String :=
-  match lowerDecl c0 d with
-  | some jd => (if c0.min then minifyDecl jd else jd).render c0.min
-  | none    => ""
+      let (ps', b') := minifyFnBody name params body; .fnTrampoline name orig ps' b'
 
 /-! ## Source Map v3 (`.mjs.map`) VLQ Encoder & Generator -/
 
@@ -1047,44 +896,28 @@ private def assignTopLevelNames (env : Environment) (names : Array Name)
     (entries : List (Name × String)) (min : Bool) : Std.HashMap Name String := Id.run do
   let entryMap : Std.HashMap Name String := entries.foldl (fun m e => m.insert e.1 e.2) {}
   let mut nm : Std.HashMap Name String := {}
+  let mut internals : Array Name := #[]
+  for n in names do
+    if let some (.fdecl ..) := findEnvDecl env n then
+      match entryMap.get? n with
+      | some s => nm := nm.insert n s
+      | none   => internals := internals.push n
   if !min then
-    let mut counter := 0
-    for n in names do
-      match findEnvDecl env n with
-      | some (.fdecl ..) =>
-          match entryMap.get? n with
-          | some s => nm := nm.insert n s
-          | none   => nm := nm.insert n s!"_g{counter}"; counter := counter + 1
-      | _ => pure ()
+    for h : i in [:internals.size] do
+      nm := nm.insert internals[i] s!"_g{i}"
     return nm
-
   -- In `--min` mode, assign deterministic short base-52/62 names to internal declarations,
   -- prioritizing the most-referenced declarations for 1-character names while preserving exports.
-  let mut avoid : Std.HashSet String := jsMinReservedSet
-  for (_, s) in entries do
-    avoid := avoid.insert s
+  let mut avoid : Std.HashSet String := entries.foldl (fun s (_, n) => s.insert n) jsMinReservedSet
   let mut refCounts : Std.HashMap Name Nat := {}
   for n in names do
-    match findEnvDecl env n with
-    | some (.fdecl (body := b) ..) =>
-        for callee in callees b #[] do
-          refCounts := refCounts.insert callee ((refCounts.getD callee 0) + 1)
-        if let some initFn := getInitFnNameFor? env n then
-          refCounts := refCounts.insert initFn ((refCounts.getD initFn 0) + 1)
-    | _ => pure ()
-  let mut internals : Array (Nat × Nat × Name) := #[]
-  let mut orderIdx := 0
-  for n in names do
-    match findEnvDecl env n with
-    | some (.fdecl ..) =>
-        match entryMap.get? n with
-        | some s => nm := nm.insert n s
-        | none   =>
-            internals := internals.push (refCounts.getD n 0, orderIdx, n)
-            orderIdx := orderIdx + 1
-    | _ => pure ()
-  let sorted := internals.qsort fun a b =>
-    a.1 > b.1 || (a.1 == b.1 && a.2.1 < b.2.1)
+    if let some (.fdecl (body := b) ..) := findEnvDecl env n then
+      for callee in callees b #[] do
+        refCounts := refCounts.insert callee ((refCounts.getD callee 0) + 1)
+      if let some initFn := getInitFnNameFor? env n then
+        refCounts := refCounts.insert initFn ((refCounts.getD initFn 0) + 1)
+  let ranked := internals.mapIdx fun i n => (refCounts.getD n 0, i, n)
+  let sorted := ranked.qsort fun a b => a.1 > b.1 || (a.1 == b.1 && a.2.1 < b.2.1)
   let mut idIdx := 0
   for (_, _, n) in sorted do
     let (shortName, nextIdx) := nextShortIdent avoid idIdx

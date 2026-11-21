@@ -98,6 +98,31 @@ theorem VStateValid_frame {σ msg : Type} {f : Nat} {ns : String} {v : View σ m
     (h : VStateValid f ns v s a S vst) : VStateValid f ns v s a' S vst :=
   ⟨CleanDomSubtree_frame hfr h.1, VStateMatches_frame hfr h.1 h.2⟩
 
+theorem View.ind {σ msg : Type} {P : View σ msg → Prop}
+    (text : ∀ str, P (.text str)) (dyn : ∀ get, P (.dyn get)) (static : ∀ h, P (.static h))
+    (dynNode : ∀ get, P (.dynNode get)) (memo : ∀ sm, P (.memo sm))
+    (ifElse : ∀ c y n, P y → P n → P (.ifElse c y n))
+    (element : ∀ tag attrs kids, (∀ k ∈ kids, P k) → P (.element tag attrs kids))
+    (keyedList : ∀ tag attrs keys marks rowSig rowEv rowsHtml tmpl?,
+      P (.keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl?))
+    (v : View σ msg) : P v := by
+  match v with
+  | .text str => exact text str
+  | .dyn get => exact dyn get
+  | .static h => exact static h
+  | .dynNode get => exact dynNode get
+  | .memo sm => exact memo sm
+  | .ifElse c y n =>
+      exact ifElse c y n (View.ind text dyn static dynNode memo ifElse element keyedList y)
+        (View.ind text dyn static dynNode memo ifElse element keyedList n)
+  | .element tag attrs kids =>
+      exact element tag attrs kids fun k hk =>
+        have : sizeOf k < sizeOf (View.element tag attrs kids) := by
+          have := List.sizeOf_lt_of_mem hk; simp only [View.element.sizeOf_spec]; omega
+        View.ind text dyn static dynNode memo ifElse element keyedList k
+  | .keyedList .. => exact keyedList ..
+termination_by sizeOf v
+
 
 theorem keyedRows_eq_of_keys_eq {σ msg : Type} {keys : σ → Array String} {rowsHtml : σ → List (Html msg)}
     (hr : KeyedRowsClean keys rowsHtml) {s₁ s₂ : σ} (hk : disambiguateKeys (keys s₂) = disambiguateKeys (keys s₁)) :

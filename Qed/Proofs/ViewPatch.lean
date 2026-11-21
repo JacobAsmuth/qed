@@ -97,25 +97,6 @@ private theorem patchViewM_leaf_spec {σ msg : Type} (f : Nat) (childNs : String
                 exact ⟨h1, h2, h3, h4, h5, h6, ⟨h7, rfl, rfl, rfl⟩, h8⟩
       | _ => exact False.elim hval.2
 
-private theorem view_sizeOf_pos' {σ msg : Type} (v : View σ msg) : 0 < sizeOf v := by
-  cases v <;> simp only [View.text.sizeOf_spec, View.dyn.sizeOf_spec, View.static.sizeOf_spec,
-    View.dynNode.sizeOf_spec, View.memo.sizeOf_spec, View.ifElse.sizeOf_spec,
-    View.element.sizeOf_spec, View.keyedList.sizeOf_spec] <;> omega
-
-private theorem view_sizeOf_ifElse_left' {σ msg : Type} (c : σ → Bool) (y n : View σ msg) :
-    sizeOf y < sizeOf (View.ifElse c y n) := by
-  simp only [View.ifElse.sizeOf_spec]; omega
-
-private theorem view_sizeOf_ifElse_right' {σ msg : Type} (c : σ → Bool) (y n : View σ msg) :
-    sizeOf n < sizeOf (View.ifElse c y n) := by
-  simp only [View.ifElse.sizeOf_spec]; omega
-
-private theorem view_sizeOf_element_mem' {σ msg : Type} {tag : String} {attrs : List (VAttr σ msg)}
-    {ks : List (View σ msg)} {k : View σ msg} (hk : k ∈ ks) :
-    sizeOf k < sizeOf (View.element tag attrs ks) := by
-  have h1 : sizeOf k < sizeOf ks := List.sizeOf_lt_of_mem hk
-  simp only [View.element.sizeOf_spec]; omega
-
 private abbrev PatchViewGoal {σ msg : Type} (f : Nat) (childNs : String) (parent : Dom.Node)
     (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
     (v : View σ msg) (s₁ s₂ : σ) (pre suf : List Dom.Node) (Sold : Nat → Prop) (a : DomArena msg) (vst : VState σ msg) : Prop :=
@@ -392,19 +373,11 @@ private theorem patchViewKidsM_spec_of {σ msg : Type} (f : Nat) (childNs : Stri
           | mk kst' aMid =>
               rw [hpK] at hpatchK; dsimp only at hpatchK
               rcases hpatchK with ⟨haMidGe, haMidBound, hfrMid, hparMid, hndMid, hparNodesMid, hValK', _⟩
-              let Sc' : Nat → Prop := fun x => Sc x ∨ (a.nextId ≤ x ∧ x < aMid.nextId)
-              let Sdone' : Nat → Prop := fun x => Sdone x ∨ Sc' x
-              have hSdone' : ∀ x, Sdone' x → x ≠ parent.toNat ∧ x < aMid.nextId := fun x hx => hx.elim
-                (fun h1 => have hb := hSdone x h1; ⟨hb.1, Nat.lt_of_lt_of_le hb.2 haMidGe⟩)
-                (fun h2 => h2.elim (fun h => have hb := hSrem x (hSc x h); ⟨hb.1, Nat.lt_of_lt_of_le hb.2 haMidGe⟩)
-                  (fun h3 => ⟨fun hEq => Nat.not_lt.2 h3.1 (hEq ▸ hparLt), h3.2⟩))
-              have hDoneMid : CleanDomChildren f childNs targetsDone aMid Sdone preC :=
-                CleanDomChildren_frame (fun m hm =>
-                  hfrMid m (node_ne_of_toNat_ne (hSdone _ hm).1) (fun hsc => hDisj _ hm (hSc _ hsc)) (hSdone _ hm).2) hDone
-              have hDone' := CleanDomChildren_append (fun x h1 h2 =>
-                h2.elim (fun hsc => hDisj x h1 (hSc x hsc)) (fun hlo => Nat.not_lt.2 hlo.1 (hSdone x h1).2))
-                hDoneMid (show CleanDomChildren f childNs [View.render k s₂] aMid Sc' [kst'.rootNode] from
-                  ⟨Sc', fun _ => False, fun _ h => h, fun _ h => h.elim, fun _ _ h => h.elim, hValK'.1, trivial⟩)
+              let Sdone' : Nat → Prop := fun x => Sdone x ∨ (Sc x ∨ (a.nextId ≤ x ∧ x < aMid.nextId))
+              have ⟨hSdone', hDone'⟩ := clean_done_extend haMidGe hparLt hSdone (fun x h => hSrem x (hSc x h))
+                (fun x h1 h2 => hDisj x h1 (hSc x h2))
+                (fun m hm => hfrMid m (node_ne_of_toNat_ne (hSdone _ hm).1) (fun hsc => hDisj _ hm (hSc _ hsc)) (hSdone _ hm).2)
+                hDone hValK'.1
               have hSufMid := CleanDomChildren_frame (fun m hm =>
                 hfrMid m (node_ne_of_toNat_ne (hSrem _ (hSr _ hm)).1) (fun hsc => hDSr _ hsc hm) (hSrem _ (hSr _ hm)).2) hSufCl
               have hRestMatchMid := VStateKidsMatches_frame (fun m hm =>
@@ -424,8 +397,7 @@ private theorem patchViewKidsM_spec_of {σ msg : Type} (f : Nat) (childNs : Stri
                 hRestBound (Nat.lt_of_lt_of_le hparLt haMidGe) (Nat.lt_of_lt_of_le hpos haMidGe) hparMid' hndMid'
                 hSdone' hDone'
                 (fun x hx => have hb := hSrem x (hSr x hx); ⟨hb.1, Nat.lt_of_lt_of_le hb.2 haMidGe⟩)
-                (fun x h1 h2 => h1.elim (fun h => hDisj x h (hSr x h2)) (fun h => h.elim (fun hsc => hDSr x hsc h2)
-                  (fun hlo => Nat.not_lt.2 hlo.1 (hSrem x (hSr x h2)).2)))
+                (fun x h1 h2 => not_Sdone_extend (fun h => hDisj x h (hSr x h2)) (fun hsc => hDSr x hsc h2) (hSrem x (hSr x h2)).2 h1)
                 (fun r hr => have hb := hsufB r (.tail _ hr); ⟨Nat.lt_of_lt_of_le hb.1 haMidGe, hb.2⟩) hSufMid hRestMatchMid
               dsimp only [StateT.run] at hih ⊢
               cases hpR : patchViewKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat (preC ++ [kst'.rootNode]).length) rest s₂ restSt aMid with
@@ -441,42 +413,11 @@ private theorem patchViewKidsM_spec_of {σ msg : Type} (f : Nat) (childNs : Stri
                   rw [List.append_assoc, List.singleton_append] at hCleanR
                   refine ⟨Snew, Nat.le_trans haMidGe haOutGe,
                     Nat.le_trans haOutBound (Nat.add_assoc _ _ _ ▸ Nat.add_le_add_right haMidBound _),
-                    hparR, hndR, fun m hmPar hmR hmLt => ?_, fun x hx => ?_, hCleanR, rfl, hValKOut, hVstR⟩
-                  · rw [hfrR m hmPar (fun hr => hmR (hSr _ hr)) (Nat.lt_of_lt_of_le hmLt haMidGe),
-                        hfrMid m hmPar (fun hsc => hmR (hSc _ hsc)) hmLt]
-                  · rcases hSnew x hx with ⟨hS | hSr' | hA, hnp⟩
-                    · exact ⟨hS.elim .inl (fun h2 => h2.elim (fun hsc => .inr (.inl (hSc _ hsc)))
-                        (fun hhi => .inr (.inr ⟨hhi.1, Nat.lt_of_lt_of_le hhi.2 haOutGe⟩))), hnp⟩
-                    · exact ⟨.inr (.inl (hSr _ hSr')), hnp⟩
-                    · exact ⟨.inr (.inr ⟨Nat.le_trans haMidGe hA.1, hA.2⟩), hnp⟩
-
-private theorem patchViewM_spec_aux {σ msg : Type} :
-    ∀ (n : Nat) f childNs parent pns ptag pst pmg (v : View σ msg) s₁ s₂ pre suf Sold a vst,
-      sizeOf v ≤ n → PatchViewGoal f childNs parent pns ptag pst pmg v s₁ s₂ pre suf Sold a vst
-  | 0, _, _, _, _, _, _, _, v, _, _, _, _, _, _, _, hsz =>
-      absurd (Nat.lt_of_lt_of_le (view_sizeOf_pos' v) hsz) (Nat.lt_irrefl 0)
-  | n + 1, f, childNs, parent, pns, ptag, pst, pmg, v, s₁, s₂, pre, suf, Sold, a, vst, hsz => by
-      cases v with
-      | keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl? =>
-          intro hchildNs hclean _ hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hval
-          exact patchViewM_keyedList_spec f childNs parent pns ptag pst pmg tag attrs keys marks rowSig rowEv rowsHtml tmpl?
-            s₁ s₂ pre suf Sold a vst hchildNs hclean hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hval
-      | text _ | static _ | dyn _ | dynNode _ | memo _ =>
-          exact patchViewM_leaf_spec f childNs parent pns ptag pst pmg _ trivial s₁ s₂ pre suf Sold a vst
-      | ifElse cond yes no =>
-          exact patchViewM_ifElse_spec f childNs parent pns ptag pst pmg cond yes no s₁ s₂ pre suf Sold a vst
-            (fun inner => patchViewM_spec_aux n f childNs parent pns ptag pst pmg yes s₁ s₂ pre suf Sold a inner
-              (Nat.le_of_lt_succ (Nat.lt_of_lt_of_le (view_sizeOf_ifElse_left' cond yes no) hsz)))
-            (fun inner => patchViewM_spec_aux n f childNs parent pns ptag pst pmg no s₁ s₂ pre suf Sold a inner
-              (Nat.le_of_lt_succ (Nat.lt_of_lt_of_le (view_sizeOf_ifElse_right' cond yes no) hsz)))
-      | element tag attrs kids =>
-          exact patchViewM_element_spec f childNs parent pns ptag pst pmg tag attrs kids s₁ s₂ pre suf Sold a vst
-            (fun f' node realNs st' mg' domCs kstates a1 =>
-              patchViewKidsM_spec_of f' (Dom.childNsOf childNs tag) node realNs tag st' mg' kids s₁ s₂
-                (fun k hk pre' suf' Sold' a' vst' =>
-                  patchViewM_spec_aux n f' (Dom.childNsOf childNs tag) node realNs tag st' mg' k s₁ s₂ pre' suf' Sold' a' vst'
-                    (Nat.le_of_lt_succ (Nat.lt_of_lt_of_le (view_sizeOf_element_mem' hk) hsz)))
-                [] [] domCs kstates (fun _ => False) (fun k => Sold k ∧ k ≠ node.toNat) a1)
+                    hparR, hndR,
+                    fun m hmPar hmR hmLt =>
+                      (hfrR m hmPar (fun hr => hmR (hSr _ hr)) (Nat.lt_of_lt_of_le hmLt haMidGe)).trans
+                        (hfrMid m hmPar (fun hsc => hmR (hSc _ hsc)) hmLt),
+                    clean_step_Snew_compose haMidGe haOutGe hSc hSr hSnew, hCleanR, rfl, hValKOut, hVstR⟩
 
 theorem patchViewM_spec {σ msg : Type} (f : Nat) (childNs : String) (parent : Dom.Node)
     (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
@@ -495,9 +436,27 @@ theorem patchViewM_spec {σ msg : Type} (f : Nat) (childNs : String) (parent : D
     a'.get parent = .element pns ptag pst pmg (pre ++ vst'.rootNode :: suf) ∧ (pre ++ vst'.rootNode :: suf).Nodup ∧
     (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧
     VStateValid f childNs v s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧
-    DomTreeAssocEquiv (readDomTree f a' vst'.rootNode) (specDom childNs (View.render v s₂)) :=
-  patchViewM_spec_aux (sizeOf v) f childNs parent pns ptag pst pmg v s₁ s₂ pre suf Sold a vst (Nat.le_refl _)
-    hchildNs hclean hpreLen hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hval
+    DomTreeAssocEquiv (readDomTree f a' vst'.rootNode) (specDom childNs (View.render v s₂)) := by
+  suffices h : PatchViewGoal f childNs parent pns ptag pst pmg v s₁ s₂ pre suf Sold a vst from
+    h hchildNs hclean hpreLen hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hval
+  clear hchildNs hclean hpreLen hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hval
+  induction v using View.ind generalizing f childNs parent pns ptag pst pmg pre suf Sold a vst with
+  | keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl? =>
+      intro hchildNs hclean _ hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hval
+      exact patchViewM_keyedList_spec f childNs parent pns ptag pst pmg tag attrs keys marks rowSig rowEv rowsHtml tmpl?
+        s₁ s₂ pre suf Sold a vst hchildNs hclean hbound hdep hparLt hpos hpar hnd hparOut hSoldLt hparNodes hval
+  | text _ | static _ | dyn _ | dynNode _ | memo _ =>
+      exact patchViewM_leaf_spec f childNs parent pns ptag pst pmg _ trivial s₁ s₂ pre suf Sold a vst
+  | ifElse cond yes no ihy ihn =>
+      exact patchViewM_ifElse_spec f childNs parent pns ptag pst pmg cond yes no s₁ s₂ pre suf Sold a vst
+        (fun inner => ihy f childNs parent pns ptag pst pmg pre suf Sold a inner)
+        (fun inner => ihn f childNs parent pns ptag pst pmg pre suf Sold a inner)
+  | element tag attrs kids ihk =>
+      exact patchViewM_element_spec f childNs parent pns ptag pst pmg tag attrs kids s₁ s₂ pre suf Sold a vst
+        (fun f' node realNs st' mg' domCs kstates a1 =>
+          patchViewKidsM_spec_of f' (Dom.childNsOf childNs tag) node realNs tag st' mg' kids s₁ s₂
+            (fun k hk pre' suf' Sold' a' vst' => ihk k hk f' (Dom.childNsOf childNs tag) node realNs tag st' mg' pre' suf' Sold' a' vst')
+            [] [] domCs kstates (fun _ => False) (fun k => Sold k ∧ k ≠ node.toNat) a1)
 
 theorem patchViewKidsM_spec {σ msg : Type} (f : Nat) (childNs : String) (parent : Dom.Node)
     (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)

@@ -19,34 +19,27 @@ theorem diffRowSigs_sound {msg : Type} (rowSig : Nat → Array (String × String
   | succ _ ih =>
       intro accSigs accEmit accEv hiLe hsz hprev; have hlt : i < newMarks.size := by omega
       dsimp only; rw [diffRowSigs.eq_1]; simp only [hlt, ↓reduceDIte]
+      have hpush : ∀ (v : Array (String × String)), v = rowSig i →
+          ∀ ae aev,
+          let (outSigs, _) := diffRowSigs rowSig rowEv inst newMarks oldMarks oldSigs (i + 1) (accSigs.push v) ae aev
+          outSigs.size = newMarks.size ∧ ∀ k, k < newMarks.size → outSigs[k]! = rowSig k := by
+        intro v hv ae aev
+        apply ih (i + 1) (by omega) (accSigs.push v) ae aev (by omega) (by simp [hsz])
+        intro k hk; have hkLtPush : k < (accSigs.push v).size := by simp [hsz]; omega
+        by_cases hki : k < i
+        · have hkLt : k < accSigs.size := by omega
+          rw [getElem!_pos _ k hkLtPush, Array.getElem_push_lt hkLt, ← getElem!_pos accSigs k hkLt]
+          exact hprev k hki
+        · have heq : k = i := by omega
+          subst heq
+          have hPushIdx : (accSigs.push v)[k]'hkLtPush = v := by subst hsz; exact Array.getElem_push_eq
+          rw [getElem!_pos _ k hkLtPush, hPushIdx, hv]
       by_cases hskip : (newMarks[i] != 0 && oldMarks[i]? == some newMarks[i]) = true
       · simp only [hskip, ↓reduceIte]
-        have hnz : newMarks[i]! ≠ 0 := by simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hskip; simpa [hlt] using hskip.1
-        have hold : oldMarks[i]? = some newMarks[i]! := by simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hskip; simpa [hlt] using hskip.2
-        have hsigEq : oldSigs[i]?.getD #[] = rowSig i := (hmark i hlt hnz hold).symm
-        apply ih (i + 1) (by omega) (accSigs.push (oldSigs[i]?.getD #[])) accEmit accEv (by omega) (by simp [hsz])
-        intro k hk; have hkLtPush : k < (accSigs.push (oldSigs[i]?.getD #[])).size := by simp [hsz]; omega
-        by_cases hki : k < i
-        · have hkLt : k < accSigs.size := by omega
-          rw [getElem!_pos _ k hkLtPush, Array.getElem_push_lt hkLt, ← getElem!_pos accSigs k hkLt]
-          exact hprev k hki
-        · have heq : k = i := by omega
-          subst heq
-          have hPushIdx : (accSigs.push (oldSigs[k]?.getD #[]))[k]'hkLtPush = oldSigs[k]?.getD #[] := by
-            subst hsz; exact Array.getElem_push_eq
-          rw [getElem!_pos _ k hkLtPush, hPushIdx, hsigEq]
+        simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hskip
+        exact hpush _ (hmark i hlt (by simpa [hlt] using hskip.1) (by simpa [hlt] using hskip.2)).symm accEmit accEv
       · simp only [hskip, Bool.false_eq_true, ↓reduceIte]
-        apply ih (i + 1) (by omega) (accSigs.push (rowSig i)) _ _ (by omega) (by simp [hsz])
-        intro k hk; have hkLtPush : k < (accSigs.push (rowSig i)).size := by simp [hsz]; omega
-        by_cases hki : k < i
-        · have hkLt : k < accSigs.size := by omega
-          rw [getElem!_pos _ k hkLtPush, Array.getElem_push_lt hkLt, ← getElem!_pos accSigs k hkLt]
-          exact hprev k hki
-        · have heq : k = i := by omega
-          subst heq
-          have hPushIdx : (accSigs.push (rowSig k))[k]'hkLtPush = rowSig k := by
-            subst hsz; exact Array.getElem_push_eq
-          rw [getElem!_pos _ k hkLtPush, hPushIdx]
+        exact hpush _ rfl _ _
 
 theorem seedRowsM_spec {msg : Type} (inst : String) (rowSig : Nat → Array (String × String))
     (rowEv : Nat → Array (String × msg))
@@ -142,27 +135,22 @@ def gcLocalsSpec (isConn : String → Bool) (st : LocalRuntimeSpec) : LocalRunti
   let dead := st.instances.toList.filterMap (fun (k, _) => if isConn k then none else some k)
   { store := dead.foldl (·.erase ·) st.store, instances := dead.foldl (·.erase ·) st.instances }
 
-private theorem foldl_erase_mem {α : Type} :
-    ∀ (ks : List String) (m : Std.HashMap String α) (k : String), k ∈ ks → (ks.foldl (·.erase ·) m)[k]? = none
-  | [], _, _, h => nomatch h
-  | x :: xs, m, k, h => by
-      rcases List.mem_cons.1 h with rfl | ht
-      · by_cases hx : k ∈ xs; exact foldl_erase_mem xs (m.erase k) k hx
-        have hf : ∀ (l : List String) (m' : Std.HashMap String α), k ∉ l → (l.foldl (·.erase ·) m')[k]? = m'[k]? := by
-          intro l; induction l with
-          | nil => intro _ _; rfl
-          | cons y ys ihl =>
-              intro m' hnl; have hne : y ≠ k := fun hEq => hnl (hEq ▸ .head _)
-              simpa [List.foldl_cons, Std.HashMap.getElem?_erase, beq_eq_false_iff_ne.2 hne] using ihl (m'.erase y) (fun hm => hnl (.tail _ hm))
-        simpa [List.foldl_cons] using hf xs (m.erase k) hx
-      · exact foldl_erase_mem xs (m.erase x) k ht
-
 private theorem foldl_erase_not_mem {α : Type} :
     ∀ (ks : List String) (m : Std.HashMap String α) (k : String), k ∉ ks → (ks.foldl (·.erase ·) m)[k]? = m[k]?
   | [], _, _, _ => rfl
   | x :: xs, m, k, h => by
       have hne : x ≠ k := fun hEq => h (hEq ▸ .head _)
       simpa [List.foldl_cons, Std.HashMap.getElem?_erase, beq_eq_false_iff_ne.2 hne] using foldl_erase_not_mem xs (m.erase x) k (fun hm => h (.tail _ hm))
+
+private theorem foldl_erase_mem {α : Type} :
+    ∀ (ks : List String) (m : Std.HashMap String α) (k : String), k ∈ ks → (ks.foldl (·.erase ·) m)[k]? = none
+  | [], _, _, h => nomatch h
+  | x :: xs, m, k, h => by
+      rcases List.mem_cons.1 h with rfl | ht
+      · by_cases hx : k ∈ xs
+        · exact foldl_erase_mem xs (m.erase k) k hx
+        · simpa [List.foldl_cons] using foldl_erase_not_mem xs (m.erase k) k hx
+      · exact foldl_erase_mem xs (m.erase x) k ht
 
 theorem gcLocalsSpec_frame (isConn : String → Bool) (st : LocalRuntimeSpec) (k : String) :
     let st' := gcLocalsSpec isConn st

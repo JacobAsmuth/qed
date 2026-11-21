@@ -2,25 +2,6 @@ import Qed.Proofs.ViewPatch.VState
 
 namespace Qed
 
-private theorem view_sizeOf_pos {σ msg : Type} (v : View σ msg) : 0 < sizeOf v := by
-  cases v <;> simp only [View.text.sizeOf_spec, View.dyn.sizeOf_spec, View.static.sizeOf_spec,
-    View.dynNode.sizeOf_spec, View.memo.sizeOf_spec, View.ifElse.sizeOf_spec,
-    View.element.sizeOf_spec, View.keyedList.sizeOf_spec] <;> omega
-
-private theorem view_sizeOf_ifElse_left {σ msg : Type} (c : σ → Bool) (y n : View σ msg) :
-    sizeOf y < sizeOf (View.ifElse c y n) := by
-  simp only [View.ifElse.sizeOf_spec]; omega
-
-private theorem view_sizeOf_ifElse_right {σ msg : Type} (c : σ → Bool) (y n : View σ msg) :
-    sizeOf n < sizeOf (View.ifElse c y n) := by
-  simp only [View.ifElse.sizeOf_spec]; omega
-
-private theorem view_sizeOf_element_mem {σ msg : Type} {tag : String} {attrs : List (VAttr σ msg)}
-    {ks : List (View σ msg)} {k : View σ msg} (hk : k ∈ ks) :
-    sizeOf k < sizeOf (View.element tag attrs ks) := by
-  have h1 : sizeOf k < sizeOf ks := List.sizeOf_lt_of_mem hk
-  simp only [View.element.sizeOf_spec]; omega
-
 private theorem buildViewKidsM_eq_buildDomListM_of {σ msg : Type} (ns : String) (parent : Dom.Node)
     (ks : List (View σ msg)) (s : σ)
     (hView : ∀ k ∈ ks, ∀ (a : DomArena msg), View.DomClean k →
@@ -60,29 +41,23 @@ private theorem buildViewKidsM_eq_buildDomListM_of {σ msg : Type} (ns : String)
                       dsimp only [StateT.run] at hrest1
                       exact hrest1.trans hrest2
 
-private theorem buildViewM_eq_buildDomM_aux {σ msg : Type} :
-    ∀ (n : Nat) (ns : String) (v : View σ msg) (s : σ) (a : DomArena msg),
-      sizeOf v ≤ n → View.DomClean v →
-      let r := (buildViewM (m := StateM (DomArena msg)) ns v s).run a
-      let d := (buildDomM (m := StateM (DomArena msg)) ns (View.render v s)).run a
-      r.1.1 = d.1 ∧ r.2.SameDom d.2
-  | 0, _, v, _, _, hsz, _ => absurd (Nat.lt_of_lt_of_le (view_sizeOf_pos v) hsz) (Nat.lt_irrefl 0)
-  | _ + 1, _, .text _, _, _, _, _ | _ + 1, _, .dyn _, _, _, _, _ | _ + 1, _, .static _, _, _, _, _
-  | _ + 1, _, .dynNode _, _, _, _, _ | _ + 1, _, .memo _, _, _, _, _ => ⟨rfl, .refl _⟩
-  | n + 1, ns, .ifElse c y no, s, a, hsz, ⟨hy, hn⟩ => by
+theorem buildViewM_eq_buildDomM {σ msg : Type} (ns : String) (v : View σ msg) (s : σ) (a : DomArena msg)
+    (hcl : View.DomClean v) :
+    let r := (buildViewM (m := StateM (DomArena msg)) ns v s).run a
+    let d := (buildDomM (m := StateM (DomArena msg)) ns (View.render v s)).run a
+    r.1.1 = d.1 ∧ r.2.SameDom d.2 := by
+  induction v using View.ind generalizing ns a with
+  | text _ | dyn _ | static _ | dynNode _ | memo _ => exact ⟨rfl, .refl _⟩
+  | ifElse c y no ihy ihn =>
+      rcases hcl with ⟨hy, hn⟩
       cases hc : c s <;>
         simp only [buildViewM, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure, hc, Bool.false_eq_true, ↓reduceIte]
-      · have ih := buildViewM_eq_buildDomM_aux n ns no s a
-          (Nat.le_of_lt_succ (Nat.lt_of_lt_of_le (view_sizeOf_ifElse_right c y no) hsz)) hn
-        dsimp only [StateT.run] at ih
-        cases hyR : buildViewM (m := StateM (DomArena msg)) ns no s a with
-        | mk _ _ => rw [hyR] at ih; exact ih
-      · have ih := buildViewM_eq_buildDomM_aux n ns y s a
-          (Nat.le_of_lt_succ (Nat.lt_of_lt_of_le (view_sizeOf_ifElse_left c y no) hsz)) hy
-        dsimp only [StateT.run] at ih
-        cases hyR : buildViewM (m := StateM (DomArena msg)) ns y s a with
-        | mk _ _ => rw [hyR] at ih; exact ih
-  | n + 1, ns, .element tag attrs kids, s, a, hsz, ⟨ha, hks⟩ => by
+      · have ih := ihn ns a hn; dsimp only [StateT.run] at ih
+        cases hyR : buildViewM (m := StateM (DomArena msg)) ns no s a with | mk _ _ => rw [hyR] at ih; exact ih
+      · have ih := ihy ns a hy; dsimp only [StateT.run] at ih
+        cases hyR : buildViewM (m := StateM (DomArena msg)) ns y s a with | mk _ _ => rw [hyR] at ih; exact ih
+  | element tag attrs kids ihk =>
+      rcases hcl with ⟨ha, hks⟩
       dsimp only [buildViewM, buildDomM, MonadDom.createElement, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure]
       cases hce : a.alloc (ArenaEntry.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag {} [] []) with
       | mk node a1 =>
@@ -92,41 +67,36 @@ private theorem buildViewM_eq_buildDomM_aux {σ msg : Type} :
               dsimp only
               simp only [ha.1 s, Bool.not_false, ↓reduceIte, bind, StateT.bind, pure, StateT.pure]
               have hkids := buildViewKidsM_eq_buildDomListM_of (Dom.childNsOf ns tag) node kids s
-                (fun k hk a' hkCl => buildViewM_eq_buildDomM_aux n (Dom.childNsOf ns tag) k s a'
-                  (Nat.le_of_lt_succ (Nat.lt_of_lt_of_le (view_sizeOf_element_mem hk) hsz)) hkCl) a2 hks
+                (fun k hk a' hkCl => ihk k hk (Dom.childNsOf ns tag) a' hkCl) a2 hks
               dsimp only [StateT.run] at hkids
               cases hbk : buildViewKidsM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) node kids s a2 with
               | mk _ _ =>
                   cases hbd : buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) node (View.renderEach kids s) a2 with
                   | mk _ _ => dsimp only; rw [hbk, hbd] at hkids; exact ⟨rfl, hkids⟩
-  | _ + 1, _, .keyedList _ _ _ _ _ _ _ (some _), _, _, _, h => False.elim h
-  | _ + 1, ns, .keyedList tag attrs keys marks rowSig rowEv rowsHtml none, s, a, _, ⟨ha, hrows⟩ => by
-      dsimp only [buildViewM, buildDomM, MonadDom.createElement, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure]
-      cases hce : a.alloc (ArenaEntry.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag {} [] []) with
-      | mk node a1 =>
-          dsimp only
-          cases ha1 : applyAttrsM (m := StateM (DomArena msg)) node (attrs.map (VAttr.eval s)) a1 with
-          | mk _ a2 =>
+  | keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl? =>
+      cases tmpl? with
+      | some _ => exact False.elim hcl
+      | none =>
+          rcases hcl with ⟨ha, hrows⟩
+          dsimp only [buildViewM, buildDomM, MonadDom.createElement, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure]
+          cases hce : a.alloc (ArenaEntry.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag {} [] []) with
+          | mk node a1 =>
               dsimp only
-              simp only [ha.1 s, Bool.not_false, ↓reduceIte, bind, StateT.bind, pure, StateT.pure]
-              have hseed := seedRowsM_sameDom s!"§{node}§" (rowSig s (disambiguateKeys (keys s))) (rowEv s (disambiguateKeys (keys s))) (marks s) #[] #[] a2
-              dsimp only [StateT.run] at hseed
-              cases hsRun : seedRowsM (m := StateM (DomArena msg)) s!"§{node}§" (rowSig s (disambiguateKeys (keys s))) (rowEv s (disambiguateKeys (keys s))) (marks s) #[] #[] a2 with
-              | mk _ a3 =>
-                  rw [hsRun] at hseed; dsimp only at hseed ⊢
-                  rw [Html.map_prefixSignals_of_DomCleanList s!"§{node}§" (hrows.2.1 s)]
-                  have hb := buildDomListM_sameDom (Dom.childNsOf ns tag) node (rowsHtml s) hseed
-                  cases hbl1 : buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) node (rowsHtml s) a3 with
-                  | mk _ _ =>
-                      cases hbl2 : buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) node (rowsHtml s) a2 with
-                      | mk _ _ => dsimp only; rw [hbl1, hbl2] at hb; exact ⟨rfl, hb⟩
-
-theorem buildViewM_eq_buildDomM {σ msg : Type} (ns : String) (v : View σ msg) (s : σ) (a : DomArena msg)
-    (hcl : View.DomClean v) :
-    let r := (buildViewM (m := StateM (DomArena msg)) ns v s).run a
-    let d := (buildDomM (m := StateM (DomArena msg)) ns (View.render v s)).run a
-    r.1.1 = d.1 ∧ r.2.SameDom d.2 :=
-  buildViewM_eq_buildDomM_aux (sizeOf v) ns v s a (Nat.le_refl _) hcl
+              cases ha1 : applyAttrsM (m := StateM (DomArena msg)) node (attrs.map (VAttr.eval s)) a1 with
+              | mk _ a2 =>
+                  dsimp only
+                  simp only [ha.1 s, Bool.not_false, ↓reduceIte, bind, StateT.bind, pure, StateT.pure]
+                  have hseed := seedRowsM_sameDom s!"§{node}§" (rowSig s (disambiguateKeys (keys s))) (rowEv s (disambiguateKeys (keys s))) (marks s) #[] #[] a2
+                  dsimp only [StateT.run] at hseed
+                  cases hsRun : seedRowsM (m := StateM (DomArena msg)) s!"§{node}§" (rowSig s (disambiguateKeys (keys s))) (rowEv s (disambiguateKeys (keys s))) (marks s) #[] #[] a2 with
+                  | mk _ a3 =>
+                      rw [hsRun] at hseed; dsimp only at hseed ⊢
+                      rw [Html.map_prefixSignals_of_DomCleanList s!"§{node}§" (hrows.2.1 s)]
+                      have hb := buildDomListM_sameDom (Dom.childNsOf ns tag) node (rowsHtml s) hseed
+                      cases hbl1 : buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) node (rowsHtml s) a3 with
+                      | mk _ _ =>
+                          cases hbl2 : buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) node (rowsHtml s) a2 with
+                          | mk _ _ => dsimp only; rw [hbl1, hbl2] at hb; exact ⟨rfl, hb⟩
 
 theorem buildViewKidsM_eq_buildDomListM {σ msg : Type} (ns : String) (parent : Dom.Node)
     (ks : List (View σ msg)) (s : σ) (a : DomArena msg) (hcl : View.DomCleanEach ks) :
@@ -245,50 +215,51 @@ private theorem buildViewKidsM_vstate_clean_of {σ msg : Type} (childNs : String
                   (fun h => .inr ⟨Nat.le_trans haMidGe h.1, h.2⟩)) hClR, hVkR⟩
               rw [hFrR m (by omega) hmNe, haMidFr m hmLt]; exact DomArena.get_set_ne _ _ hmNe
 
-private theorem buildViewM_vstate_clean_aux {σ msg : Type} :
-    ∀ (n : Nat) (ns : String) (v : View σ msg) (s : σ) (a : DomArena msg) (fuel : Nat),
-      sizeOf v ≤ n → View.DomClean v → 0 < a.nextId → a.nextId + htmlNodeCount (View.render v s) < UInt32.size →
-      htmlDepth (View.render v s) ≤ fuel →
-      let ((root, vst), a') := (buildViewM (m := StateM (DomArena msg)) ns v s).run a
-      vst.rootNode = root ∧ a.nextId ≤ root.toNat ∧ root.toNat < a'.nextId ∧
-      a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render v s) ∧
-      (∀ m : Dom.Node, m.toNat < a.nextId → a'.get m = a.get m) ∧
-      CleanDomSubtree fuel ns (View.render v s) a' (fun k => a.nextId ≤ k ∧ k < a'.nextId) root ∧
-      VStateMatches v s a' root vst
-  | 0, _, v, _, _, _, hsz, _, _, _, _ => absurd (Nat.lt_of_lt_of_le (view_sizeOf_pos v) hsz) (Nat.lt_irrefl 0)
-  | _ + 1, ns, .text str, _, a, fuel, _, _, hpos, hbound, hdep => by
+private theorem buildViewM_vstate_clean {σ msg : Type} (ns : String) (v : View σ msg) (s : σ)
+    (a : DomArena msg) (fuel : Nat) (hcl : View.DomClean v) (hpos : 0 < a.nextId)
+    (hbound : a.nextId + htmlNodeCount (View.render v s) < UInt32.size)
+    (hdep : htmlDepth (View.render v s) ≤ fuel) :
+    let ((root, vst), a') := (buildViewM (m := StateM (DomArena msg)) ns v s).run a
+    vst.rootNode = root ∧ a.nextId ≤ root.toNat ∧ root.toNat < a'.nextId ∧
+    a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render v s) ∧
+    (∀ m : Dom.Node, m.toNat < a.nextId → a'.get m = a.get m) ∧
+    CleanDomSubtree fuel ns (View.render v s) a' (fun k => a.nextId ≤ k ∧ k < a'.nextId) root ∧
+    VStateMatches v s a' root vst := by
+  induction v using View.ind generalizing ns a fuel with
+  | text str =>
       cases fuel with | zero => simp only [View.render, htmlDepth] at hdep; omega | succ _ =>
         have hs := buildDomM_spec ns (.text str) a _ hpos hbound hdep
         have hc := CleanDomSubtree_of_buildDomM ns (.text str) a _ rfl hpos hbound hdep
         simp only [buildViewM, buildDomM, MonadDom.createText, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure] at hs hc ⊢
         cases hb : a.alloc (.text str) with
         | mk r a' => rw [hb] at hs hc; dsimp only at hs hc ⊢; exact ⟨rfl, hs.1, hs.2.1, Nat.le_trans hs.1 (Nat.le_of_lt hs.2.1), hs.2.2.1, hs.2.2.2.1, hc, rfl⟩
-  | _ + 1, ns, .dyn get, s, a, fuel, _, _, hpos, hbound, hdep => by
+  | dyn get =>
       cases fuel with | zero => simp only [View.render, htmlDepth] at hdep; omega | succ _ =>
         have hs := buildDomM_spec ns (.text (get s)) a _ hpos hbound hdep
         have hc := CleanDomSubtree_of_buildDomM ns (.text (get s)) a _ rfl hpos hbound hdep
         simp only [buildViewM, buildDomM, MonadDom.createText, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure] at hs hc ⊢
         cases hb : a.alloc (.text (get s)) with
         | mk r a' => rw [hb] at hs hc; dsimp only at hs hc ⊢; exact ⟨rfl, hs.1, hs.2.1, Nat.le_trans hs.1 (Nat.le_of_lt hs.2.1), hs.2.2.1, hs.2.2.2.1, hc, rfl, rfl⟩
-  | _ + 1, ns, .static html, _, a, fuel, _, hcl, hpos, hbound, hdep => by
+  | static html =>
       have hs := buildDomM_spec ns html a fuel hpos hbound hdep
       have hc := CleanDomSubtree_of_buildDomM ns html a fuel hcl hpos hbound hdep
       simp only [buildViewM, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure] at hs hc ⊢
       cases hb : buildDomM (m := StateM (DomArena msg)) ns html a with
       | mk r a' => rw [hb] at hs hc; dsimp only at hs hc; exact ⟨rfl, hs.1, hs.2.1, Nat.le_trans hs.1 (Nat.le_of_lt hs.2.1), hs.2.2.1, hs.2.2.2.1, hc, rfl⟩
-  | _ + 1, ns, .dynNode get, s, a, fuel, _, hcl, hpos, hbound, hdep => by
+  | dynNode get =>
       have hs := buildDomM_spec ns (get s) a fuel hpos hbound hdep
       have hc := CleanDomSubtree_of_buildDomM ns (get s) a fuel (hcl s) hpos hbound hdep
       simp only [buildViewM, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure] at hs hc ⊢
       cases hb : buildDomM (m := StateM (DomArena msg)) ns (get s) a with
       | mk r a' => rw [hb] at hs hc; dsimp only at hs hc; exact ⟨rfl, hs.1, hs.2.1, Nat.le_trans hs.1 (Nat.le_of_lt hs.2.1), hs.2.2.1, hs.2.2.2.1, hc, rfl, rfl⟩
-  | _ + 1, ns, .memo sm, s, a, fuel, _, hcl, hpos, hbound, hdep => by
+  | memo sm =>
       have hs := buildDomM_spec ns (sm.eval s) a fuel hpos hbound hdep
       have hc := CleanDomSubtree_of_buildDomM ns (sm.eval s) a fuel (hcl s) hpos hbound hdep
       simp only [buildViewM, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure] at hs hc ⊢
       cases hb : buildDomM (m := StateM (DomArena msg)) ns (sm.eval s) a with
       | mk r a' => rw [hb] at hs hc; dsimp only at hs hc; exact ⟨rfl, hs.1, hs.2.1, Nat.le_trans hs.1 (Nat.le_of_lt hs.2.1), hs.2.2.1, hs.2.2.2.1, hc, rfl, rfl, rfl⟩
-  | n + 1, ns, .ifElse c y no, s, a, fuel, hsz, ⟨hy, hn⟩, hpos, hbound, hdep => by
+  | ifElse c y no ihy ihn =>
+      rcases hcl with ⟨hy, hn⟩
       have hwrap : ∀ (v' : View σ msg) (b : Bool), c s = b → (if b then y else no) = v' →
           (let ((root, vst), a') := (buildViewM (m := StateM (DomArena msg)) ns v' s).run a
            vst.rootNode = root ∧ a.nextId ≤ root.toNat ∧ root.toNat < a'.nextId ∧
@@ -310,15 +281,14 @@ private theorem buildViewM_vstate_clean_aux {σ msg : Type} :
             dsimp only [buildViewM, View.render, StateT.run, bind]
             cases b <;> (simp only [hcb, Bool.false_eq_true, ↓reduceIte, StateT.bind, pure, StateT.pure] at hveq ⊢; subst hveq; rw [hb]; dsimp only; exact ⟨hroot, h1, h2, h3, h4, h5, h6, ⟨hcb.symm, by simp only [hcb, Bool.false_eq_true, ↓reduceIte]; exact h7⟩⟩)
       cases hc : c s
-      · exact hwrap no false hc rfl (buildViewM_vstate_clean_aux n ns no s a fuel
-          (Nat.le_of_lt_succ (Nat.lt_of_lt_of_le (view_sizeOf_ifElse_right c y no) hsz)) hn hpos
+      · exact hwrap no false hc rfl (ihn ns a fuel hn hpos
           (by simp only [View.render, hc, Bool.false_eq_true, ↓reduceIte] at hbound; exact hbound)
           (by simp only [View.render, hc, Bool.false_eq_true, ↓reduceIte] at hdep; exact hdep))
-      · exact hwrap y true hc rfl (buildViewM_vstate_clean_aux n ns y s a fuel
-          (Nat.le_of_lt_succ (Nat.lt_of_lt_of_le (view_sizeOf_ifElse_left c y no) hsz)) hy hpos
+      · exact hwrap y true hc rfl (ihy ns a fuel hy hpos
           (by simp only [View.render, hc, ↓reduceIte] at hbound; exact hbound)
           (by simp only [View.render, hc, ↓reduceIte] at hdep; exact hdep))
-  | n + 1, ns, .element tag attrs kids, s, a, fuel, hsz, ⟨haClean, hkidsClean⟩, hpos, hbound, hdep => by
+  | element tag attrs kids ihk =>
+      rcases hcl with ⟨haClean, hkidsClean⟩
       cases fuel with
       | zero => simp only [View.render, htmlDepth] at hdep; omega
       | succ f =>
@@ -332,8 +302,7 @@ private theorem buildViewM_vstate_clean_aux {σ msg : Type} :
           let aElem := a1.set node (.element realNs tag st mg [])
           have ha1Next : a1.nextId = a.nextId + 1 := rfl
           have hkids := buildViewKidsM_vstate_clean_of (Dom.childNsOf ns tag) kids s f
-            (fun k hk a' hkCl hpos' hbd' hdp' => buildViewM_vstate_clean_aux n (Dom.childNsOf ns tag) k s a' f
-              (Nat.le_of_lt_succ (Nat.lt_of_lt_of_le (view_sizeOf_element_mem hk) hsz)) hkCl hpos' hbd' hdp')
+            (fun k hk a' hkCl hpos' hbd' hdp' => ihk k hk (Dom.childNsOf ns tag) a' f hkCl hpos' hbd' hdp')
             [] a1 node realNs tag st mg [] [] (fun _ => False) hkidsClean
             (by rw [hnodeNat, ha1Next]; omega) (by rw [ha1Next]; omega)
             (by rw [ha1Next]; omega) (by omega) (fun _ h => h.elim) trivial trivial
@@ -364,43 +333,46 @@ private theorem buildViewM_vstate_clean_aux {σ msg : Type} :
             rfl, realNs, tag, st, mg, csNew, DomArena.get_set_self _ _ _, hVstOut⟩
           · have hne : m ≠ node := node_ne_of_toNat_ne (by rw [hnodeNat]; omega)
             rw [← hOutEq]; rw [haOutFr m (by rw [ha1Next]; omega) hne]; rfl
-  | _ + 1, _, .keyedList _ _ _ _ _ _ _ (some _), _, _, _, _, h, _, _, _ => False.elim h
-  | _ + 1, ns, .keyedList tag attrs keys marks rowSig rowEv rowsHtml none, s, a, fuel, _, ⟨ha, hrows⟩, hpos, hbound, hdep => by
-      have heq := buildViewM_eq_buildDomM ns (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s a ⟨ha, hrows⟩
-      have hs := buildDomM_spec ns (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s) a fuel hpos hbound hdep
-      have hc := CleanDomSubtree_of_buildDomM ns (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s) a fuel
-        (View.DomClean_render (v := .keyedList tag attrs keys marks rowSig rowEv rowsHtml) ⟨ha, hrows⟩ s) hpos hbound hdep
-      have hvst : ∃ oldSigs, ((buildViewM (m := StateM (DomArena msg)) ns (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s).run a).1.2 =
-          let r := ((buildViewM (m := StateM (DomArena msg)) ns (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s).run a).1.1
-          .list r (disambiguateKeys (keys s)) oldSigs (rowsHtml s) (marks s) s!"§{r}§" := by
-        dsimp only [buildViewM, MonadDom.createElement, StateT.run, bind, StateT.bind, pure, StateT.pure]
-        cases a.alloc (ArenaEntry.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag {} [] []) with
-        | mk node a1 =>
-            dsimp only
-            cases applyAttrsM (m := StateM (DomArena msg)) node (attrs.map (VAttr.eval s)) a1 with
-            | mk _ a2 =>
+  | keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl? =>
+      cases tmpl? with
+      | some _ => exact False.elim hcl
+      | none =>
+          rcases hcl with ⟨ha, hrows⟩
+          have heq := buildViewM_eq_buildDomM ns (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s a ⟨ha, hrows⟩
+          have hs := buildDomM_spec ns (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s) a fuel hpos hbound hdep
+          have hc := CleanDomSubtree_of_buildDomM ns (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s) a fuel
+            (View.DomClean_render (v := .keyedList tag attrs keys marks rowSig rowEv rowsHtml) ⟨ha, hrows⟩ s) hpos hbound hdep
+          have hvst : ∃ oldSigs, ((buildViewM (m := StateM (DomArena msg)) ns (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s).run a).1.2 =
+              let r := ((buildViewM (m := StateM (DomArena msg)) ns (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s).run a).1.1
+              .list r (disambiguateKeys (keys s)) oldSigs (rowsHtml s) (marks s) s!"§{r}§" := by
+            dsimp only [buildViewM, MonadDom.createElement, StateT.run, bind, StateT.bind, pure, StateT.pure]
+            cases a.alloc (ArenaEntry.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag {} [] []) with
+            | mk node a1 =>
                 dsimp only
-                cases seedRowsM (m := StateM (DomArena msg)) s!"§{node}§" (rowSig s (disambiguateKeys (keys s))) (rowEv s (disambiguateKeys (keys s))) (marks s) #[] #[] a2 with
-                | mk perRow a3 =>
+                cases applyAttrsM (m := StateM (DomArena msg)) node (attrs.map (VAttr.eval s)) a1 with
+                | mk _ a2 =>
                     dsimp only
-                    cases buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) node ((rowsHtml s).map (Html.prefixSignals s!"§{node}§")) a3 with
-                    | mk _ _ =>
-                        exact ⟨perRow, by rw [Html.map_prefixSignals_of_DomCleanList _ (hrows.2.1 s)]⟩
-      rcases hvst with ⟨perRow, hvstEq⟩
-      dsimp only [StateT.run] at heq hs hc hvstEq ⊢
-      cases hbv : buildViewM (m := StateM (DomArena msg)) ns (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s a with
-      | mk p1 aOut =>
-          rcases p1 with ⟨root, vst⟩
-          cases hbd : buildDomM (m := StateM (DomArena msg)) ns (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s) a with
-          | mk droot aDom =>
-              rw [hbv] at heq hvstEq; rw [hbd] at heq hs hc; dsimp only at heq hs hc hvstEq ⊢
-              subst hvstEq
-              rcases heq with ⟨hnEq, hsd⟩
-              rw [← hnEq] at hs hc
-              rw [hsd.1]
-              refine ⟨rfl, hs.1, hs.2.1, Nat.le_trans hs.1 (Nat.le_of_lt hs.2.1), hs.2.2.1,
-                fun m hm => (hsd.get_eq m).trans (hs.2.2.2.1 m hm),
-                CleanDomSubtree_frame (fun m _ => hsd.get_eq m) hc, rfl, rfl, rfl⟩
+                    cases seedRowsM (m := StateM (DomArena msg)) s!"§{node}§" (rowSig s (disambiguateKeys (keys s))) (rowEv s (disambiguateKeys (keys s))) (marks s) #[] #[] a2 with
+                    | mk perRow a3 =>
+                        dsimp only
+                        cases buildDomListM (m := StateM (DomArena msg)) (Dom.childNsOf ns tag) node ((rowsHtml s).map (Html.prefixSignals s!"§{node}§")) a3 with
+                        | mk _ _ =>
+                            exact ⟨perRow, by rw [Html.map_prefixSignals_of_DomCleanList _ (hrows.2.1 s)]⟩
+          rcases hvst with ⟨perRow, hvstEq⟩
+          dsimp only [StateT.run] at heq hs hc hvstEq ⊢
+          cases hbv : buildViewM (m := StateM (DomArena msg)) ns (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s a with
+          | mk p1 aOut =>
+              rcases p1 with ⟨root, vst⟩
+              cases hbd : buildDomM (m := StateM (DomArena msg)) ns (View.render (.keyedList tag attrs keys marks rowSig rowEv rowsHtml) s) a with
+              | mk droot aDom =>
+                  rw [hbv] at heq hvstEq; rw [hbd] at heq hs hc; dsimp only at heq hs hc hvstEq ⊢
+                  subst hvstEq
+                  rcases heq with ⟨hnEq, hsd⟩
+                  rw [← hnEq] at hs hc
+                  rw [hsd.1]
+                  refine ⟨rfl, hs.1, hs.2.1, Nat.le_trans hs.1 (Nat.le_of_lt hs.2.1), hs.2.2.1,
+                    fun m hm => (hsd.get_eq m).trans (hs.2.2.2.1 m hm),
+                    CleanDomSubtree_frame (fun m _ => hsd.get_eq m) hc, rfl, rfl, rfl⟩
 
 theorem buildViewM_vstate_spec {σ msg : Type} (ns : String) (v : View σ msg) (s : σ) (a : DomArena msg) (fuel : Nat)
     (hclean : View.DomClean v) (hpos : 0 < a.nextId)
@@ -410,7 +382,7 @@ theorem buildViewM_vstate_spec {σ msg : Type} (ns : String) (v : View σ msg) (
     (∀ m : Dom.Node, m.toNat < a.nextId → a'.get m = a.get m) ∧
     VStateValid fuel ns v s a' (fun k => a.nextId ≤ k ∧ k < a'.nextId) vst ∧
     DomTreeAssocEquiv (readDomTree fuel a' vst.rootNode) (specDom ns (View.render v s)) := by
-  have h := buildViewM_vstate_clean_aux (sizeOf v) ns v s a fuel (Nat.le_refl _) hclean hpos hbound hdep
+  have h := buildViewM_vstate_clean ns v s a fuel hclean hpos hbound hdep
   dsimp only [StateT.run] at h ⊢
   rcases h with ⟨hroot, _, _, ha1, ha2, hfr, hcl, hmt⟩
   have hval : VStateValid fuel ns v s _ (fun k => a.nextId ≤ k ∧ k < _) _ := ⟨hroot ▸ hcl, hroot ▸ hmt⟩

@@ -43,154 +43,74 @@ theorem hydrateViewM_of_textOf? {σ msg : Type} :
       simp [hydrateViewM, StateT.run, bind, StateT.bind, pure, StateT.pure, hm, hydrateDomM, VState.rootNode, VStateMatches]
   | .ifElse c y n, s, str, h, kn, a => by
       simp only [View.textOf?] at h
-      cases hc : c s <;> simp only [hc, ↓reduceIte, Bool.false_eq_true] at h
-      · have ih := hydrateViewM_of_textOf? h kn a
+      cases hc : c s <;> (
+        simp only [hc, ↓reduceIte, Bool.false_eq_true] at h
+        have ih := hydrateViewM_of_textOf? h kn a
         dsimp only [StateT.run] at ih
-        cases hy : hydrateViewM (m := StateM (DomArena msg)) n s kn a with
+        cases hy : hydrateViewM (m := StateM (DomArena msg)) _ s kn a with
         | mk vst' a' =>
             rw [hy] at ih; dsimp only at ih
-            simp [hydrateViewM, StateT.run, bind, StateT.bind, pure, StateT.pure, hc, hy, VState.rootNode, VStateMatches, ih.1, ih.2.1, ih.2.2]
-      · have ih := hydrateViewM_of_textOf? h kn a
-        dsimp only [StateT.run] at ih
-        cases hy : hydrateViewM (m := StateM (DomArena msg)) y s kn a with
-        | mk vst' a' =>
-            rw [hy] at ih; dsimp only at ih
-            simp [hydrateViewM, StateT.run, bind, StateT.bind, pure, StateT.pure, hc, hy, VState.rootNode, VStateMatches, ih.1, ih.2.1, ih.2.2]
+            simp [hydrateViewM, StateT.run, bind, StateT.bind, pure, StateT.pure, hc, hy, VState.rootNode, VStateMatches, ih.1, ih.2.1, ih.2.2])
   | .element .., _, _, h, _, _ | .keyedList .., _, _, h, _, _ => by simp [View.textOf?] at h
 
-private theorem DomArena.modify_withSignals {msg : Type} (nxt : Nat)
-    (st : Dom.Node → ArenaEntry msg) (s₁ s₂ : List (String × String)) (e₁ e₂ : List (String × msg))
-    (t₁ t₂ : Array (ArenaTmpl msg)) (r₁ r₂ : Array (Nat → Nat → Option msg))
-    (n : Dom.Node) (f : ArenaEntry msg → ArenaEntry msg) :
-    DomArena.modify ⟨nxt, st, s₁, e₁, t₁, r₁⟩ n f = { DomArena.modify ⟨nxt, st, s₂, e₂, t₂, r₂⟩ n f with signals := s₁, sigEvents := e₁, tmpls := t₁, rowEvs := r₁ } := by
-  simp only [DomArena.modify, DomArena.get, DomArena.set]
-
-private theorem hydrateTextSlotM_withSignals {msg : Type} (sigs : List (String × String)) (evs : List (String × msg))
-    (tmpls : Array (ArenaTmpl msg)) (rowEvs : Array (Nat → Nat → Option msg))
-    (parent : Dom.Node) (index : UInt32) (inRun : Bool) (s : String) (more : Unit → Bool) (a : DomArena msg) :
-    hydrateTextSlotM (m := StateM (DomArena msg)) parent index inRun s more { a with signals := sigs, sigEvents := evs, tmpls, rowEvs } =
-      ((hydrateTextSlotM (m := StateM (DomArena msg)) parent index inRun s more a).1,
-       { (hydrateTextSlotM (m := StateM (DomArena msg)) parent index inRun s more a).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs }) := by
-  dsimp only [hydrateTextSlotM]
-  split
-  · simp only [bind, StateT.bind, pure, StateT.pure, DomArena.alloc, DomArena.modifyChildren]
-    refine Prod.ext rfl ?_; dsimp only; apply DomArena.modify_withSignals
-  · split
-    · simp only [bind, StateT.bind, pure, StateT.pure, DomArena.alloc, DomArena.modifyChildren]
-      refine Prod.ext rfl ?_; dsimp only; apply DomArena.modify_withSignals
-    · simp only [bind, StateT.bind, pure]
-      have hg : DomArena.get { a with signals := sigs, sigEvents := evs, tmpls, rowEvs } parent = DomArena.get a parent := rfl
-      rw [hg]
-      cases more ()
+private theorem hydrateTextSlotM_metaIndep {msg : Type} (parent : Dom.Node) (index : UInt32)
+    (inRun : Bool) (s : String) (more : Unit → Bool) :
+    DomArena.MetaIndep (hydrateTextSlotM (m := StateM (DomArena msg)) parent index inRun s more) :=
+  fun _ _ _ _ a => by
+    dsimp only [hydrateTextSlotM]
+    split
+    · rfl
+    · split
       · rfl
-      · simp only [↓reduceIte, bind, StateT.bind, pure, StateT.pure]
-        refine Prod.ext rfl ?_; dsimp only; apply DomArena.modify_withSignals
+      · dsimp only [bind, StateT.bind, pure, StateT.pure, MonadDom.childAt, DomArena.get, DomArena.withMeta]
+        cases more () <;> rfl
 
-private theorem htmlDepth_mem_le_h {msg : Type} {c : Html msg} {cs : List (Html msg)} (hc : c ∈ cs) :
-    htmlDepth c ≤ htmlListDepth cs := by
-  induction cs with
-  | nil => cases hc
-  | cons _ _ ih =>
-      simp only [htmlListDepth]
-      cases hc with
-      | head => exact Nat.le_max_left _ _
-      | tail _ h => exact Nat.le_trans (ih h) (Nat.le_max_right _ _)
+mutual
+  theorem hydrateDomM_metaIndep {msg : Type} :
+      (h : Html msg) → (node : Dom.Node) → DomArena.MetaIndep (hydrateDomM (m := StateM (DomArena msg)) h node)
+    | .text _, _ => .pure ()
+    | .element _ attrs cs, node => by
+        dsimp only [hydrateDomM]
+        refine .bind (fun _ _ _ _ _ => rfl) fun _ => .bind (applyAttrsM_metaIndep node attrs) fun _ => ?_
+        cases ownsChildren attrs
+        · exact hydrateDomKidsM_metaIndep cs node 0 false
+        · exact .pure ()
 
-private theorem hydrateDomKidsM_withSignals_of {msg : Type} (sigs : List (String × String)) (evs : List (String × msg))
-    (tmpls : Array (ArenaTmpl msg)) (rowEvs : Array (Nat → Nat → Option msg))
-    (node : Dom.Node) (cs : List (Html msg))
-    (hSub : ∀ c ∈ cs, ∀ (cn : Dom.Node) (a : DomArena msg),
-      (hydrateDomM (m := StateM (DomArena msg)) c cn { a with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
-        { (hydrateDomM (m := StateM (DomArena msg)) c cn a).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs }) :
-    ∀ (i : UInt32) (inRun : Bool) (a : DomArena msg),
-      (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs { a with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
-        { (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs a).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs } := by
-  induction cs with
-  | nil => intro _ _ _; rfl
-  | cons c rest ih =>
-      intro i inRun a
-      dsimp only [hydrateDomKidsM, bind, StateT.bind, pure, StateT.pure]
-      cases hc : c.textOf? with
-      | none =>
-        dsimp only [bind, StateT.bind, pure, StateT.pure]
-        have hg : ({ nextId := a.nextId, store := a.store, signals := sigs, sigEvents := evs, tmpls, rowEvs } : DomArena msg).get node = a.get node := rfl
-        rw [hg]
-        have hchild : ∀ cn : Dom.Node,
-            (match hydrateDomM (m := StateM (DomArena msg)) c cn { a with signals := sigs, sigEvents := evs, tmpls, rowEvs } with
-            | (_, s) => hydrateDomKidsM (m := StateM (DomArena msg)) node (i + 1) false rest s).snd =
-            { (match hydrateDomM (m := StateM (DomArena msg)) c cn a with
-              | (_, s) => hydrateDomKidsM (m := StateM (DomArena msg)) node (i + 1) false rest s).snd with signals := sigs, sigEvents := evs, tmpls, rowEvs } := by
-          intro cn
-          have hd := hSub c (.head _) cn a
-          cases hd1 : hydrateDomM (m := StateM (DomArena msg)) c cn { a with signals := sigs, sigEvents := evs, tmpls, rowEvs } with
-          | mk _ a1 => cases hd2 : hydrateDomM (m := StateM (DomArena msg)) c cn a with
-            | mk _ a2 => rw [hd1, hd2] at hd; dsimp only at hd; rw [hd]; exact ih (fun x hx => hSub x (.tail _ hx)) (i + 1) false a2
-        cases a.get node <;> dsimp only <;> exact hchild _
-      | some str =>
-        dsimp only [bind, StateT.bind, pure, StateT.pure]
-        have hs := hydrateTextSlotM_withSignals sigs evs tmpls rowEvs node i inRun str (fun () => hasMoreText rest) a
-        cases hs1 : hydrateTextSlotM (m := StateM (DomArena msg)) node i inRun str (fun () => hasMoreText rest) { a with signals := sigs, sigEvents := evs, tmpls, rowEvs } with
-        | mk r1 a1 =>
-            cases hs2 : hydrateTextSlotM (m := StateM (DomArena msg)) node i inRun str (fun () => hasMoreText rest) a with
-            | mk r2 a2 =>
-                rw [hs1, hs2] at hs; dsimp only at hs
-                rcases Prod.mk.inj hs with ⟨hreq, haeq⟩
-                rw [hreq, haeq]
-                exact ih (fun x hx => hSub x (.tail _ hx)) (i + 1) r2.2 a2
-
-private theorem hydrateDomM_withSignals_aux {msg : Type} (sigs : List (String × String)) (evs : List (String × msg))
-    (tmpls : Array (ArenaTmpl msg)) (rowEvs : Array (Nat → Nat → Option msg)) :
-    ∀ (f : Nat) (h : Html msg) (node : Dom.Node) (a : DomArena msg), htmlDepth h ≤ f →
-      (hydrateDomM (m := StateM (DomArena msg)) h node { a with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
-        { (hydrateDomM (m := StateM (DomArena msg)) h node a).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs }
-  | 0, h, _, _, hdep => by cases h <;> { simp only [htmlDepth] at hdep; omega }
-  | _ + 1, .text _, _, _, _ => rfl
-  | f + 1, .element _ attrs cs, node, a, hdep => by
-      simp only [htmlDepth] at hdep
-      dsimp only [hydrateDomM, bind, StateT.bind, pure, StateT.pure, DomArena.modifyElemState,
-        DomArena.modify, DomArena.get, DomArena.set]
-      have hstep : ∀ (nxt : Nat) (st : Dom.Node → ArenaEntry msg),
-          (match applyAttrsM (m := StateM (DomArena msg)) node attrs ⟨nxt, st, sigs, evs, tmpls, rowEvs⟩ with
-          | (_, s) => (if (!ownsChildren attrs) = true then hydrateDomKidsM (m := StateM (DomArena msg)) node 0 false cs else StateT.pure PUnit.unit) s).snd =
-          { (match applyAttrsM (m := StateM (DomArena msg)) node attrs ⟨nxt, st, a.signals, a.sigEvents, a.tmpls, a.rowEvs⟩ with
-            | (_, s) => (if (!ownsChildren attrs) = true then hydrateDomKidsM (m := StateM (DomArena msg)) node 0 false cs else StateT.pure PUnit.unit) s).snd with signals := sigs, sigEvents := evs, tmpls, rowEvs } := by
-        intro nxt st
-        have ha := applyAttrsM_withSignals sigs evs tmpls rowEvs node attrs ⟨nxt, st, a.signals, a.sigEvents, a.tmpls, a.rowEvs⟩
-        dsimp only [StateT.run] at ha
-        cases ha1 : applyAttrsM (m := StateM (DomArena msg)) node attrs ⟨nxt, st, sigs, evs, tmpls, rowEvs⟩ with
-        | mk _ s1 =>
-            cases ha2 : applyAttrsM (m := StateM (DomArena msg)) node attrs ⟨nxt, st, a.signals, a.sigEvents, a.tmpls, a.rowEvs⟩ with
-            | mk _ s2 =>
-                rw [ha1, ha2] at ha; dsimp only at ha; rw [ha]
-                cases ownsChildren attrs
-                · exact hydrateDomKidsM_withSignals_of sigs evs tmpls rowEvs node cs
-                    (fun c hc cn a' => hydrateDomM_withSignals_aux sigs evs tmpls rowEvs f c cn a'
-                      (Nat.le_trans (htmlDepth_mem_le_h hc) (by omega))) 0 false s2
-                · rfl
-      apply hstep
+  theorem hydrateDomKidsM_metaIndep {msg : Type} :
+      (cs : List (Html msg)) → (node : Dom.Node) → (i : UInt32) → (inRun : Bool) →
+      DomArena.MetaIndep (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs)
+    | [], _, _, _ => .pure ()
+    | c :: rest, node, i, inRun => by
+        dsimp only [hydrateDomKidsM]
+        cases c.textOf? with
+        | none =>
+            exact .bind (fun _ _ _ _ _ => rfl) fun cn =>
+              .bind (hydrateDomM_metaIndep c cn) fun _ =>
+                hydrateDomKidsM_metaIndep rest node (i + 1) false
+        | some str =>
+            exact .bind (hydrateTextSlotM_metaIndep node i inRun str (fun () => hasMoreText rest)) fun r =>
+              hydrateDomKidsM_metaIndep rest node (i + 1) r.2
+end
 
 theorem hydrateDomM_withSignals {msg : Type} (sigs : List (String × String)) (evs : List (String × msg))
     (tmpls : Array (ArenaTmpl msg)) (rowEvs : Array (Nat → Nat → Option msg))
     (h : Html msg) (node : Dom.Node) (a : DomArena msg) :
     (hydrateDomM (m := StateM (DomArena msg)) h node { a with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
       { (hydrateDomM (m := StateM (DomArena msg)) h node a).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs } :=
-  hydrateDomM_withSignals_aux sigs evs tmpls rowEvs (htmlDepth h) h node a (Nat.le_refl _)
+  congrArg Prod.snd (hydrateDomM_metaIndep h node sigs evs tmpls rowEvs a)
 
 theorem hydrateDomKidsM_withSignals {msg : Type} (sigs : List (String × String)) (evs : List (String × msg))
     (tmpls : Array (ArenaTmpl msg)) (rowEvs : Array (Nat → Nat → Option msg))
     (node : Dom.Node) (i : UInt32) (inRun : Bool) (cs : List (Html msg)) (a : DomArena msg) :
     (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs { a with signals := sigs, sigEvents := evs, tmpls, rowEvs }).2 =
       { (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs a).2 with signals := sigs, sigEvents := evs, tmpls, rowEvs } :=
-  hydrateDomKidsM_withSignals_of sigs evs tmpls rowEvs node cs
-    (fun c _ cn a' => hydrateDomM_withSignals sigs evs tmpls rowEvs c cn a') i inRun a
+  congrArg Prod.snd (hydrateDomKidsM_metaIndep cs node i inRun sigs evs tmpls rowEvs a)
 
 theorem hydrateDomKidsM_sameDom {msg : Type} (node : Dom.Node) (i : UInt32) (inRun : Bool)
     (cs : List (Html msg)) {a₁ a₂ : DomArena msg} (hs : a₁.SameDom a₂) :
     (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs a₁).2.SameDom
-      (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs a₂).2 := by
-  have heq : a₁ = { a₂ with signals := a₁.signals, sigEvents := a₁.sigEvents, tmpls := a₁.tmpls, rowEvs := a₁.rowEvs } :=
-    DomArena.ext hs.1 hs.2 rfl rfl rfl rfl
-  rw [heq, hydrateDomKidsM_withSignals]; exact ⟨rfl, rfl⟩
+      (hydrateDomKidsM (m := StateM (DomArena msg)) node i inRun cs a₂).2 :=
+  (hydrateDomKidsM_metaIndep cs node i inRun).sameDom hs
 
 theorem hydrateListRowsM_eq_hydrateDomKidsM {msg : Type} (node : Dom.Node) :
     ∀ (i : UInt32) (rs : List (Html msg)), (∀ r ∈ rs, r.textOf? = none) →
@@ -204,11 +124,6 @@ theorem hydrateListRowsM_eq_hydrateDomKidsM {msg : Type} (node : Dom.Node) :
       dsimp only [bind, StateT.bind, pure, StateT.pure]
       cases hydrateDomM (m := StateM (DomArena msg)) r (MonadDom.childAt (m := StateM (DomArena msg)) node i a).1 a with
       | mk _ a2 => exact hydrateListRowsM_eq_hydrateDomKidsM node (i + 1) rs (fun x hx => hr x (.tail _ hx)) a2
-
-private theorem view_sizeOf_pos_h {σ msg : Type} (v : View σ msg) : 0 < sizeOf v := by
-  cases v <;> simp only [View.text.sizeOf_spec, View.dyn.sizeOf_spec, View.static.sizeOf_spec,
-    View.dynNode.sizeOf_spec, View.memo.sizeOf_spec, View.ifElse.sizeOf_spec,
-    View.element.sizeOf_spec, View.keyedList.sizeOf_spec] <;> omega
 
 private theorem hydrateViewKidsM_eq_hydrateDomKidsM_of {σ msg : Type}
     (ks : List (View σ msg)) (node : Dom.Node) (s : σ)
@@ -264,71 +179,66 @@ private theorem hydrateViewKidsM_eq_hydrateDomKidsM_of {σ msg : Type}
                   | mk _ a3 =>
                       rw [hkRun] at hkEq; exact hkEq.trans (hydrateDomKidsM_sameDom node (i + 1) false (View.renderEach rest s) heq)
 
-private theorem hydrateViewM_eq_hydrateDomM_aux {σ msg : Type} :
-    ∀ (n : Nat) {v : View σ msg}, sizeOf v ≤ n → View.DomClean v → ∀ (s : σ) (node : Dom.Node) (a : DomArena msg),
-      ((hydrateViewM (m := StateM (DomArena msg)) v s node).run a).2.SameDom
-        ((hydrateDomM (m := StateM (DomArena msg)) (View.render v s) node).run a).2
-  | 0, v, hsz, _, _, _, _ => absurd (Nat.lt_of_lt_of_le (view_sizeOf_pos_h v) hsz) (Nat.lt_irrefl 0)
-  | _ + 1, .text _, _, _, _, _, a | _ + 1, .dyn _, _, _, _, _, a => DomArena.SameDom.refl a
-  | _ + 1, .static (.text _), _, _, _, _, _ | _ + 1, .static (.element ..), _, _, _, _, _ => by
-      dsimp only [hydrateViewM, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure]
-      cases hydrateDomM (m := StateM (DomArena msg)) _ _ _; exact DomArena.SameDom.refl _
-  | _ + 1, .dynNode get, _, _, s, node, a => by
+theorem hydrateViewM_eq_hydrateDomM {σ msg : Type} {v : View σ msg} (hcl : View.DomClean v)
+    (s : σ) (node : Dom.Node) (a : DomArena msg) :
+    ((hydrateViewM (m := StateM (DomArena msg)) v s node).run a).2.SameDom
+      ((hydrateDomM (m := StateM (DomArena msg)) (View.render v s) node).run a).2 := by
+  induction v using View.ind generalizing node a with
+  | text _ | dyn _ => exact DomArena.SameDom.refl a
+  | static h =>
+      cases h <;> (
+        dsimp only [hydrateViewM, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure]
+        cases hydrateDomM (m := StateM (DomArena msg)) _ _ _; exact DomArena.SameDom.refl _)
+  | dynNode get =>
       dsimp only [hydrateViewM, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure]
       cases hydrateDomM (m := StateM (DomArena msg)) (get s) node a; exact DomArena.SameDom.refl _
-  | _ + 1, .memo sm, _, _, s, node, a => by
+  | memo sm =>
       dsimp only [hydrateViewM, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure]
       cases hydrateDomM (m := StateM (DomArena msg)) (sm.eval s) node a; exact DomArena.SameDom.refl _
-  | n + 1, .ifElse c y no, hsz, ⟨hy, hn⟩, s, node, a => by
-      simp only [View.ifElse.sizeOf_spec] at hsz
-      cases hcs : c s
-      · have h := hydrateViewM_eq_hydrateDomM_aux n (by omega) hn s node a
-        dsimp only [hydrateViewM, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure] at h ⊢
-        rw [hcs]
-        cases hydrateViewM (m := StateM (DomArena msg)) no s node a; exact h
-      · have h := hydrateViewM_eq_hydrateDomM_aux n (by omega) hy s node a
-        dsimp only [hydrateViewM, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure] at h ⊢
-        rw [hcs]
-        cases hydrateViewM (m := StateM (DomArena msg)) y s node a; exact h
-  | n + 1, .element tag attrs kids, hsz, ⟨ha, hks⟩, s, node, a => by
+  | ifElse c y no ihy ihn =>
+      rcases hcl with ⟨hy, hn⟩
+      cases hcs : c s <;> (
+        dsimp only [hydrateViewM, View.render, StateT.run, bind, StateT.bind, pure, StateT.pure]
+        rw [hcs]; simp only [Bool.false_eq_true, ↓reduceIte, StateT.bind, StateT.pure]
+        cases hrun : hydrateViewM (m := StateM (DomArena msg)) _ s node a
+        first
+        | (have h := ihn hn node a; dsimp only [StateT.run] at h; rw [hrun] at h; exact h)
+        | (have h := ihy hy node a; dsimp only [StateT.run] at h; rw [hrun] at h; exact h))
+  | element tag attrs kids ihk =>
+      rcases hcl with ⟨ha, hks⟩
       dsimp only [hydrateViewM, View.render, hydrateDomM, StateT.run, bind, StateT.bind, pure, StateT.pure]
       rw [ha.1 s, Bool.not_false, if_pos rfl]
       cases applyAttrsM (m := StateM (DomArena msg)) node (attrs.map (VAttr.eval s))
           (a.modifyElemState node fun st => { st with clicks := [], inputs := [] }) with
       | mk _ a1 =>
           have h := hydrateViewKidsM_eq_hydrateDomKidsM_of kids node s
-            (fun k hk hkCl cn a' => hydrateViewM_eq_hydrateDomM_aux n
-              (by have := List.sizeOf_lt_of_mem hk; simp only [View.element.sizeOf_spec] at hsz; omega) hkCl s cn a')
-            hks 0 false a1
+            (fun k hk hkCl cn a' => ihk k hk hkCl cn a') hks 0 false a1
           dsimp only [StateT.run] at h
           cases hydrateViewKidsM (m := StateM (DomArena msg)) node s 0 false kids a1; exact h
-  | _ + 1, .keyedList _ _ _ _ _ _ _ (some _), _, h, _, _, _ => False.elim h
-  | _ + 1, .keyedList tag attrs keys marks rowSig rowEv rowsHtml none, _, ⟨ha, hrows⟩, s, node, a => by
-      dsimp only [hydrateViewM, View.render, hydrateDomM, StateT.run, bind, StateT.bind, pure, StateT.pure]
-      rw [ha.1 s, Bool.not_false, if_pos rfl]
-      cases applyAttrsM (m := StateM (DomArena msg)) node (attrs.map (VAttr.eval s))
-          (a.modifyElemState node fun st => { st with clicks := [], inputs := [] }) with
-      | mk _ a1 =>
-          dsimp only
-          cases hseed : seedRowsM (m := StateM (DomArena msg)) s!"§{node}§" (rowSig s (disambiguateKeys (keys s))) (rowEv s (disambiguateKeys (keys s))) (marks s) #[] #[] a1 with
-          | mk _ a2 =>
+  | keyedList tag attrs keys marks rowSig rowEv rowsHtml tmpl? =>
+      cases tmpl? with
+      | some _ => exact False.elim hcl
+      | none =>
+          rcases hcl with ⟨ha, hrows⟩
+          dsimp only [hydrateViewM, View.render, hydrateDomM, StateT.run, bind, StateT.bind, pure, StateT.pure]
+          rw [ha.1 s, Bool.not_false, if_pos rfl]
+          cases applyAttrsM (m := StateM (DomArena msg)) node (attrs.map (VAttr.eval s))
+              (a.modifyElemState node fun st => { st with clicks := [], inputs := [] }) with
+          | mk _ a1 =>
               dsimp only
-              have hsd : a2.SameDom a1 := by
-                have h := seedRowsM_sameDom s!"§{node}§" (rowSig s (disambiguateKeys (keys s))) (rowEv s (disambiguateKeys (keys s))) (marks s) #[] #[] a1
-                dsimp only [StateT.run] at h; rw [hseed] at h; exact h
-              rw [Html.map_prefixSignals_of_DomCleanList _ (hrows.2.1 s)]
-              have hlist := hydrateListRowsM_eq_hydrateDomKidsM node 0 (rowsHtml s) (hrows.2.2.1 s) a2
-              dsimp only [StateT.run] at hlist
-              cases hl : hydrateListRowsM (m := StateM (DomArena msg)) node 0 (rowsHtml s) a2 with
-              | mk _ a3 =>
-                  rw [hl] at hlist; dsimp only at hlist ⊢; rw [hlist]
-                  exact hydrateDomKidsM_sameDom node 0 false (rowsHtml s) hsd
-
-theorem hydrateViewM_eq_hydrateDomM {σ msg : Type} {v : View σ msg} (hcl : View.DomClean v)
-    (s : σ) (node : Dom.Node) (a : DomArena msg) :
-    ((hydrateViewM (m := StateM (DomArena msg)) v s node).run a).2.SameDom
-      ((hydrateDomM (m := StateM (DomArena msg)) (View.render v s) node).run a).2 :=
-  hydrateViewM_eq_hydrateDomM_aux (sizeOf v) (Nat.le_refl _) hcl s node a
+              cases hseed : seedRowsM (m := StateM (DomArena msg)) s!"§{node}§" (rowSig s (disambiguateKeys (keys s))) (rowEv s (disambiguateKeys (keys s))) (marks s) #[] #[] a1 with
+              | mk _ a2 =>
+                  dsimp only
+                  have hsd : a2.SameDom a1 := by
+                    have h := seedRowsM_sameDom s!"§{node}§" (rowSig s (disambiguateKeys (keys s))) (rowEv s (disambiguateKeys (keys s))) (marks s) #[] #[] a1
+                    dsimp only [StateT.run] at h; rw [hseed] at h; exact h
+                  rw [Html.map_prefixSignals_of_DomCleanList _ (hrows.2.1 s)]
+                  have hlist := hydrateListRowsM_eq_hydrateDomKidsM node 0 (rowsHtml s) (hrows.2.2.1 s) a2
+                  dsimp only [StateT.run] at hlist
+                  cases hl : hydrateListRowsM (m := StateM (DomArena msg)) node 0 (rowsHtml s) a2 with
+                  | mk _ a3 =>
+                      rw [hl] at hlist; dsimp only at hlist ⊢; rw [hlist]
+                      exact hydrateDomKidsM_sameDom node 0 false (rowsHtml s) hsd
 
 theorem hydrateViewKidsM_eq_hydrateDomKidsM {σ msg : Type} {ks : List (View σ msg)} (hcl : View.DomCleanEach ks)
     (node : Dom.Node) (s : σ) (i : UInt32) (inRun : Bool) (a : DomArena msg) :
@@ -406,29 +316,16 @@ private theorem viewKidsMatches_step {σ msg : Type} (f : Nat)
           have hrestDep : htmlListDepth (View.renderEach rest s) ≤ f := by
             simp only [View.renderEach, htmlListDepth] at hdep
             exact Nat.le_trans (Nat.le_max_right _ _) hdep
-          have hallocRun : ∀ (inRun' : Bool) (aMid : DomArena msg),
-              aMid.nextId = a.nextId + 1 →
-              aMid.get (UInt32.ofNat a.nextId) = .text str →
-              aMid.get parent = .element pns ptag pst pmg (pre ++ UInt32.ofNat a.nextId :: domCs) →
-              (∀ m : Dom.Node, m ≠ parent → m ≠ UInt32.ofNat a.nextId → aMid.get m = a.get m) →
-              HydratableDomList f childNs
-                (if inRun' then dropCurrentTextRun (View.renderEach rest s) else coalesceTextRun (View.renderEach rest s))
-                a lo hi domCs →
-              (hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length)
-                inTextRun str (fun () => hasMoreText (View.renderEach rest s)) a = ((UInt32.ofNat a.nextId, inRun'), aMid)) →
+          have htextFinish : ∀ (kn : Dom.Node) (inRun' : Bool) (aMid : DomArena msg),
+              hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) inTextRun str
+                (fun () => hasMoreText (View.renderEach rest s)) a = ((kn, inRun'), aMid) →
+              (let (ksR, aOut) := (hydrateViewKidsM (m := StateM (DomArena msg)) parent s (UInt32.ofNat (pre ++ [kn]).length) inRun' rest).run aMid
+               aOut.get parent = .element pns ptag pst pmg ((pre ++ [kn]) ++ ksR.map VState.rootNode) ∧
+               VStateKidsMatches rest s aOut (ksR.map VState.rootNode) ksR) →
               (let (kstates, aOut) := (hydrateViewKidsM (m := StateM (DomArena msg)) parent s (UInt32.ofNat pre.length) inTextRun (k :: rest)).run a
                aOut.get parent = .element pns ptag pst pmg (pre ++ kstates.map VState.rootNode) ∧
                VStateKidsMatches (k :: rest) s aOut (kstates.map VState.rootNode) kstates) := by
-            intro inRun' aMid haMidNext hgetNew hgetParMid hframeMid hdom' hslotEq
-            let kn := UInt32.ofNat a.nextId
-            have hparNeNew : parent ≠ kn := by
-              have huN : kn.toNat = a.nextId := uint32_toNat_ofNat_lt a.nextId (by omega)
-              intro heq; rw [heq, huN] at hparLo; omega
-            have ⟨hdomMid, hpreMid⟩ := preSub_extend_alloc f childNs parent _ pre domCs lo hi a aMid str
-              hposF (by omega) hparLo hhiNext haMidNext hgetNew hframeMid hpreSub hdom'
-            have hih := ih s inRun' (pre ++ [kn]) domCs lo hi aMid hrestCl
-              (by simp only [List.length_append, List.length_singleton]; simp only [List.length_cons] at hlen; omega)
-              (by rw [haMidNext]; omega) hrestDep hparLo hpreMid (by simpa [List.append_assoc] using hgetParMid) hdomMid
+            intro kn inRun' aMid hslotEq hih
             dsimp only [StateT.run] at hih ⊢
             dsimp only [hydrateViewKidsM]; rw [htxt]; simp only [hasMoreViewText_eq_renderEach]
             dsimp only [bind, StateT.bind, pure, StateT.pure]; rw [hslotEq]; dsimp only
@@ -446,82 +343,60 @@ private theorem viewKidsMatches_step {σ msg : Type} (f : Nat)
                     rw [hrest] at hih; dsimp only [List.map_cons, VStateKidsMatches] at hih ⊢
                     rw [hrootKst]
                     exact ⟨by simpa [List.append_assoc] using hih.1, rfl, hmatchKst aOut, hih.2⟩
-          by_cases hsEmpty : str = ""
-          · subst hsEmpty
-            have hdom' : HydratableDomList f childNs (if inTextRun then dropCurrentTextRun (View.renderEach rest s) else coalesceTextRun (View.renderEach rest s)) a lo hi domCs := by
-              cases inTextRun <;> simpa [View.renderEach, hkEq, coalesceTextRun, dropCurrentTextRun] using hdom
+          by_cases halloc : str = "" ∨ inTextRun = true
+          · have hdom' : HydratableDomList f childNs (if inTextRun then dropCurrentTextRun (View.renderEach rest s) else coalesceTextRun (View.renderEach rest s)) a lo hi domCs := by
+              rcases halloc with rfl | rfl
+              · cases inTextRun <;> simpa [View.renderEach, hkEq, coalesceTextRun, dropCurrentTextRun] using hdom
+              · by_cases hs : str = "" <;> simpa [View.renderEach, hkEq, dropCurrentTextRun, Html.textOf?, hs] using hdom
             rcases hydrateDomKidsM_fresh_nextId f childNs parent _ pre domCs lo hi a hposF (by omega) hparLo hpreSub hdom' with
-              ⟨hnotIn, hparNePh⟩
+              ⟨hnotIn, hparNeTn⟩
+            let kn := UInt32.ofNat a.nextId
             let resSlot := (hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length)
-              inTextRun "" (fun () => hasMoreText (View.renderEach rest s))).run a
-            have hslot := hydrateTextSlotM_empty_spec a parent inTextRun (fun () => hasMoreText (View.renderEach rest s))
-              pns ptag pst pmg pre domCs (by omega) hnotIn hdisjDom (by simp at hlen; omega) hparNePh hpar
-            exact hallocRun inTextRun resSlot.2 hslot.2.2.1 hslot.2.2.2.1 hslot.2.2.2.2.1 hslot.2.2.2.2.2 hdom'
-              (Prod.ext (Prod.ext hslot.1 hslot.2.1) rfl)
-          · cases inTextRun with
-            | true =>
-                have hdom' : HydratableDomList f childNs (dropCurrentTextRun (View.renderEach rest s)) a lo hi domCs := by
-                  simpa [View.renderEach, hkEq, dropCurrentTextRun, Html.textOf?, hsEmpty] using hdom
-                rcases hydrateDomKidsM_fresh_nextId f childNs parent _ pre domCs lo hi a hposF (by omega) hparLo hpreSub hdom' with
-                  ⟨hnotIn, hparNeTn⟩
-                let resSlot := (hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length)
-                  true str (fun () => hasMoreText (View.renderEach rest s))).run a
-                have hslot := hydrateTextSlotM_split_spec a parent str hsEmpty (fun () => hasMoreText (View.renderEach rest s))
-                  pns ptag pst pmg pre domCs (by omega) hnotIn hdisjDom (by simp at hlen; omega) hparNeTn hpar
-                exact hallocRun true resSlot.2 hslot.2.2.1 hslot.2.2.2.1 hslot.2.2.2.2.1 hslot.2.2.2.2.2 hdom'
-                  (Prod.ext (Prod.ext hslot.1 hslot.2.1) rfl)
-            | false =>
-                have hdomCoal : HydratableDomList f childNs
-                    (.text (str ++ restOfTextRun (View.renderEach rest s)) :: dropCurrentTextRun (View.renderEach rest s)) a lo hi domCs := by
-                  simpa [View.renderEach, hkEq, coalesceTextRun, Html.textOf?, hsEmpty] using hdom
-                cases domCs with
-                | nil => exact False.elim hdomCoal
-                | cons tn domRest =>
-                    rcases HydratableDomList_cons_bounds hdomCoal with ⟨mid, hloMid, hmidHi, hiNext, htnDom, hrestDom⟩
-                    cases f with
-                    | zero => omega
-                    | succ f' =>
-                        rcases htnDom with ⟨htnLo, htnMid, _, hgetTn⟩
-                        let resSlot := (hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length)
-                          false str (fun () => hasMoreText (View.renderEach rest s))).run a
-                        let aMid := resSlot.2
-                        have hslot := hydrateTextSlotM_head_spec a parent tn str (restOfTextRun (View.renderEach rest s)) hsEmpty
-                          (hasMoreText (View.renderEach rest s)) (hasMoreText_false_restOfTextRun (View.renderEach rest s))
-                          pns ptag pst pmg pre domRest (by simp at hlen; omega) hpar hgetTn
-                        have haMidNext : aMid.nextId = a.nextId := hslot.2.2.1
-                        have hgetTnMid : aMid.get tn = .text str := hslot.2.2.2.1
-                        have hframeMid : ∀ m : Dom.Node, m ≠ tn → aMid.get m = a.get m := hslot.2.2.2.2
-                        have hparNeTn : parent ≠ tn := by intro heq; rw [heq] at hparLo; omega
-                        have hparMid : aMid.get parent = .element pns ptag pst pmg ((pre ++ [tn]) ++ domRest) := by
-                          rw [hframeMid parent hparNeTn, hpar]; simp [List.append_assoc]
-                        have ⟨hdomMid, hpreMid⟩ := preSub_extend_existing (f' + 1) childNs parent tn
-                          (dropCurrentTextRun (View.renderEach rest s)) pre domRest lo mid hi a aMid (fun k' => k' = tn.toNat)
-                          hloMid hmidHi hiNext (by rw [haMidNext]; exact Nat.le_refl _)
-                          (fun m hm _ => hframeMid m (fun heq => by rw [heq] at hm; rcases hm with h1 | h2 <;> omega))
-                          hpreSub hrestDom (fun k' hk' => .inl ⟨by omega, by omega⟩) ⟨rfl, by simp [hgetTnMid]⟩
-                        have hih := ih s true (pre ++ [tn]) domRest mid hi aMid hrestCl
-                          (by simp only [List.length_append, List.length_singleton]; simp only [List.length_cons] at hlen; omega)
-                          (by rw [haMidNext]; omega) hrestDep (by omega) hpreMid hparMid (by simpa using hdomMid)
-                        have hslotEq : hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length)
-                            false str (fun () => hasMoreText (View.renderEach rest s)) a = ((tn, true), aMid) :=
-                          Prod.ext (Prod.ext hslot.1 hslot.2.1) rfl
-                        dsimp only [StateT.run] at hih ⊢
-                        dsimp only [hydrateViewKidsM]; rw [htxt]; simp only [hasMoreViewText_eq_renderEach]
-                        dsimp only [bind, StateT.bind, pure, StateT.pure]; rw [hslotEq]; dsimp only
-                        have hvk := hydrateViewM_of_textOf? htxt tn aMid
-                        dsimp only [StateT.run] at hvk
-                        cases hvm : hydrateViewM (m := StateM (DomArena msg)) k s tn aMid with
-                        | mk kst a2 =>
-                            rw [hvm] at hvk; dsimp only at hvk
-                            rcases hvk with ⟨ha2Eq, hrootKst, hmatchKst⟩
-                            rw [ha2Eq]; dsimp only
-                            rw [show UInt32.ofNat (pre ++ [tn]).length = UInt32.ofNat pre.length + 1 from by
-                              rw [List.length_append, List.length_singleton, huIdxNext]] at hih
-                            cases hrest : hydrateViewKidsM (m := StateM (DomArena msg)) parent s (UInt32.ofNat pre.length + 1) true rest aMid with
-                            | mk ksR aOut =>
-                                rw [hrest] at hih; dsimp only [List.map_cons, VStateKidsMatches] at hih ⊢
-                                rw [hrootKst]
-                                exact ⟨by simpa [List.append_assoc] using hih.1, rfl, hmatchKst aOut, hih.2⟩
+              inTextRun str (fun () => hasMoreText (View.renderEach rest s))).run a
+            have hslot := hydrateTextSlotM_alloc_spec a parent inTextRun str halloc (fun () => hasMoreText (View.renderEach rest s))
+              pns ptag pst pmg pre domCs hnotIn hdisjDom (by simp at hlen; omega) hparNeTn hpar
+            have haMidNext : resSlot.2.nextId = a.nextId + 1 := hslot.2.2.1
+            have hgetParMid : resSlot.2.get parent = .element pns ptag pst pmg (pre ++ kn :: domCs) := hslot.2.2.2.2.1
+            have ⟨hdomMid, hpreMid⟩ := preSub_extend_alloc f childNs parent _ pre domCs lo hi a resSlot.2 str
+              hposF (by omega) hparLo hhiNext haMidNext hslot.2.2.2.1 hslot.2.2.2.2.2 hpreSub hdom'
+            exact htextFinish kn inTextRun resSlot.2 (Prod.ext (Prod.ext hslot.1 hslot.2.1) rfl)
+              (ih s inTextRun (pre ++ [kn]) domCs lo hi resSlot.2 hrestCl
+                (by simp only [List.length_append, List.length_singleton]; simp only [List.length_cons] at hlen; omega)
+                (by rw [haMidNext]; omega) hrestDep hparLo hpreMid (by simpa [List.append_assoc] using hgetParMid) hdomMid)
+          · have ⟨hsEmpty, hirF⟩ : str ≠ "" ∧ inTextRun = false := by cases inTextRun <;> simp_all
+            subst hirF
+            have hdomCoal : HydratableDomList f childNs
+                (.text (str ++ restOfTextRun (View.renderEach rest s)) :: dropCurrentTextRun (View.renderEach rest s)) a lo hi domCs := by
+              simpa [View.renderEach, hkEq, coalesceTextRun, Html.textOf?, hsEmpty] using hdom
+            cases domCs with
+            | nil => exact False.elim hdomCoal
+            | cons tn domRest =>
+                rcases HydratableDomList_cons_bounds hdomCoal with ⟨mid, hloMid, hmidHi, hiNext, htnDom, hrestDom⟩
+                cases f with
+                | zero => omega
+                | succ f' =>
+                    rcases htnDom with ⟨htnLo, htnMid, _, hgetTn⟩
+                    let resSlot := (hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length)
+                      false str (fun () => hasMoreText (View.renderEach rest s))).run a
+                    let aMid := resSlot.2
+                    have hslot := hydrateTextSlotM_head_spec a parent tn str (restOfTextRun (View.renderEach rest s)) hsEmpty
+                      (hasMoreText (View.renderEach rest s)) (hasMoreText_false_restOfTextRun (View.renderEach rest s))
+                      pns ptag pst pmg pre domRest (by simp at hlen; omega) hpar hgetTn
+                    have haMidNext : aMid.nextId = a.nextId := hslot.2.2.1
+                    have hgetTnMid : aMid.get tn = .text str := hslot.2.2.2.1
+                    have hframeMid : ∀ m : Dom.Node, m ≠ tn → aMid.get m = a.get m := hslot.2.2.2.2
+                    have hparNeTn : parent ≠ tn := by intro heq; rw [heq] at hparLo; omega
+                    have hparMid : aMid.get parent = .element pns ptag pst pmg ((pre ++ [tn]) ++ domRest) := by
+                      rw [hframeMid parent hparNeTn, hpar]; simp [List.append_assoc]
+                    have ⟨hdomMid, hpreMid⟩ := preSub_extend_existing (f' + 1) childNs parent tn
+                      (dropCurrentTextRun (View.renderEach rest s)) pre domRest lo mid hi a aMid (fun k' => k' = tn.toNat)
+                      hloMid hmidHi hiNext (by rw [haMidNext]; exact Nat.le_refl _)
+                      (fun m hm _ => hframeMid m (fun heq => by rw [heq] at hm; rcases hm with h1 | h2 <;> omega))
+                      hpreSub hrestDom (fun k' hk' => .inl ⟨by omega, by omega⟩) ⟨rfl, by simp [hgetTnMid]⟩
+                    exact htextFinish tn true aMid (Prod.ext (Prod.ext hslot.1 hslot.2.1) rfl)
+                      (ih s true (pre ++ [tn]) domRest mid hi aMid hrestCl
+                        (by simp only [List.length_append, List.length_singleton]; simp only [List.length_cons] at hlen; omega)
+                        (by rw [haMidNext]; omega) hrestDep (by omega) hpreMid hparMid (by simpa using hdomMid))
       | none =>
           have hrenderTxt : (View.render k s).textOf? = none := (View.textOf?_eq_render s k).symm.trans htxt
           rcases textOf_none_is_element hrenderTxt with ⟨tag, attrs, kids, hcEq⟩
@@ -679,23 +554,15 @@ private theorem hydrateViewM_spec_view {msg : Type} (f : Nat)
           exact ⟨rfl, h1, h2, h4, ⟨h6 (hc s), rfl, rfl, rfl⟩, h5⟩
   | .ifElse c y n, s, root, a, lo, hi, ⟨hyCl, hnCl⟩, hbound, hdep, hdom => by
       dsimp only [hydrateViewM, StateT.run]
-      cases hcs : c s <;> simp only [hcs, Bool.false_eq_true, ↓reduceIte, View.render, bind, StateT.bind, pure, StateT.pure] at hbound hdep hdom ⊢
-      · have hr := hydrateViewM_spec_view f ihView ns n s root a lo hi hnCl hbound hdep hdom
-        dsimp only [StateT.run] at hr
-        cases hnRun : hydrateViewM (m := StateM (DomArena msg)) n s root a with
+      cases hcs : c s <;> (
+        simp only [hcs, Bool.false_eq_true, ↓reduceIte, View.render, bind, StateT.bind, pure, StateT.pure] at hbound hdep hdom ⊢
+        cases hRun : hydrateViewM (m := StateM (DomArena msg)) _ s root a with
         | mk inner aOut =>
-            rw [hnRun] at hr; dsimp only at hr ⊢
+            have hr := hydrateViewM_spec_view f ihView ns _ s root a lo hi (by first | exact hnCl | exact hyCl) hbound hdep hdom
+            dsimp only [StateT.run] at hr; rw [hRun] at hr; dsimp only at hr ⊢
             rcases hr with ⟨hroot, h1, h2, h4, hval, heqv⟩
-            exact ⟨hroot, h1, h2, h4, ⟨by simpa [VState.rootNode, View.render, hcs] using hval.1, hcs.symm, by simpa [VState.rootNode, hcs] using hval.2⟩,
-              by simpa [View.render, hcs] using heqv⟩
-      · have hr := hydrateViewM_spec_view f ihView ns y s root a lo hi hyCl hbound hdep hdom
-        dsimp only [StateT.run] at hr
-        cases hyRun : hydrateViewM (m := StateM (DomArena msg)) y s root a with
-        | mk inner aOut =>
-            rw [hyRun] at hr; dsimp only at hr ⊢
-            rcases hr with ⟨hroot, h1, h2, h4, hval, heqv⟩
-            exact ⟨hroot, h1, h2, h4, ⟨by simpa [VState.rootNode, View.render, hcs] using hval.1, hcs.symm, by simpa [VState.rootNode, hcs] using hval.2⟩,
-              by simpa [View.render, hcs] using heqv⟩
+            exact ⟨hroot, h1, h2, h4, ⟨by simpa [VState.rootNode, View.render, hcs] using hval.1, hcs.symm, by simpa [VState.rootNode, View.render, hcs] using hval.2⟩,
+              by simpa [View.render, hcs] using heqv⟩)
   | .element tag attrs kids, s, root, a, lo, hi, ⟨haCl, hkidsCl⟩, hbound, hdep, hdom => by
       rcases hdom with ⟨hlo, hhi, hnext, st, prev, domCs, hget, hm, hns, hownT, hownF⟩
       have hown : ownsChildren (attrs.map (VAttr.eval s)) = false := haCl.1 s

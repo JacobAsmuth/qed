@@ -185,8 +185,6 @@ def evalJsExprListM (prog : JsProg) (fuel : Nat) (st : JsState) (es : List JsExp
   evalJsExprListStep (evalJsCall prog fuel) (evalJsApp prog fuel) st es
 def evalJsAssigns (prog : JsProg) (fuel : Nat) (st : JsState) (ps : List (String × JsExpr)) : Option (List (String × JsVal) × JsState) :=
   evalJsAssignsStep (evalJsCall prog fuel) (evalJsApp prog fuel) st ps
-def evalJsStmt (prog : JsProg) (fuel : Nat) (st : JsState) (s : JsStmt) : Option (BlockExit × JsState) :=
-  evalJsStmtStep (evalJsCall prog fuel) (evalJsApp prog fuel) st s
 def evalJsStmts (prog : JsProg) (fuel : Nat) (st : JsState) (ss : List JsStmt) : Option (BlockExit × JsState) :=
   evalJsStmtsStep (evalJsCall prog fuel) (evalJsApp prog fuel) st ss
 def evalJsArms (prog : JsProg) (fuel : Nat) (st : JsState) (tag : Nat) (arms : List JsSwitchArm) : Option (BlockExit × JsState) :=

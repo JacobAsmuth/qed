@@ -17,22 +17,17 @@ private def boolVal? (e : Expr) : MetaM (Option Bool) := do
   if r.isConstOf ``Bool.false then return some false
   return none
 
+private def tagModeTable : Array (Name × TagMode) := #[
+  (``TagMode.normal, .normal), (``TagMode.ulOl, .ulOl), (``TagMode.dl, .dl),
+  (``TagMode.table, .table), (``TagMode.colgroup, .colgroup), (``TagMode.tableSection, .tableSection),
+  (``TagMode.tableRow, .tableRow), (``TagMode.select, .select), (``TagMode.optgroup, .optgroup),
+  (``TagMode.option, .option), (``TagMode.rawStyle, .rawStyle), (``TagMode.textarea, .textarea),
+  (``TagMode.svg, .svg)
+]
+
 private def tagModeVal? (e : Expr) : MetaM (Option TagMode) := do
   let r ← whnf e
-  if r.isConstOf ``TagMode.normal       then return some .normal
-  if r.isConstOf ``TagMode.ulOl         then return some .ulOl
-  if r.isConstOf ``TagMode.dl           then return some .dl
-  if r.isConstOf ``TagMode.table        then return some .table
-  if r.isConstOf ``TagMode.colgroup     then return some .colgroup
-  if r.isConstOf ``TagMode.tableSection then return some .tableSection
-  if r.isConstOf ``TagMode.tableRow     then return some .tableRow
-  if r.isConstOf ``TagMode.select       then return some .select
-  if r.isConstOf ``TagMode.optgroup     then return some .optgroup
-  if r.isConstOf ``TagMode.option       then return some .option
-  if r.isConstOf ``TagMode.rawStyle     then return some .rawStyle
-  if r.isConstOf ``TagMode.textarea     then return some .textarea
-  if r.isConstOf ``TagMode.svg          then return some .svg
-  return none
+  return (tagModeTable.find? fun (n, _) => r.isConstOf n).map Prod.snd
 
 private def htmlCtxVal? (e : Expr) : MetaM (Option HtmlCtx) := do
   if e.hasFVar || e.hasMVar then return none
@@ -45,20 +40,8 @@ private def htmlCtxVal? (e : Expr) : MetaM (Option HtmlCtx) := do
   let some inForm ← boolVal? args[3]!    | return none
   return some { mode, inP, interactive := inter, inForm }
 
-private def tagModeExpr : TagMode → Expr
-  | .normal       => mkConst ``TagMode.normal
-  | .ulOl         => mkConst ``TagMode.ulOl
-  | .dl           => mkConst ``TagMode.dl
-  | .table        => mkConst ``TagMode.table
-  | .colgroup     => mkConst ``TagMode.colgroup
-  | .tableSection => mkConst ``TagMode.tableSection
-  | .tableRow     => mkConst ``TagMode.tableRow
-  | .select       => mkConst ``TagMode.select
-  | .optgroup     => mkConst ``TagMode.optgroup
-  | .option       => mkConst ``TagMode.option
-  | .rawStyle     => mkConst ``TagMode.rawStyle
-  | .textarea     => mkConst ``TagMode.textarea
-  | .svg          => mkConst ``TagMode.svg
+private def tagModeExpr (tm : TagMode) : Expr :=
+  mkConst ((tagModeTable.find? fun (_, m) => m == tm).map Prod.fst |>.getD ``TagMode.normal)
 
 private def htmlCtxExpr (c : HtmlCtx) : Expr :=
   mkApp4 (mkConst ``HtmlCtx.mk) (tagModeExpr c.mode) (toExpr c.inP) (toExpr c.interactive) (toExpr c.inForm)
@@ -74,33 +57,20 @@ dsimproc [simp] reduceStepHtmlCtx (stepHtmlCtx _ _) := fun e => do
   | none =>
       return .done (mkApp (mkConst ``Option.none [Level.zero]) (mkConst ``HtmlCtx))
 
-dsimproc [simp] reduceIsVoidTag (isVoidTag _) := fun e => do
+private def strBoolSimproc (f : String → Bool) : Simp.DSimproc := fun e => do
   let some s := strLitVal? e.appArg! | return .continue
-  return .done (toExpr (Qed.isVoidTag s))
+  return .done (toExpr (f s))
 
-dsimproc [simp] reduceIsSafeAttrName (isSafeAttrName _) := fun e => do
-  let some s := strLitVal? e.appArg! | return .continue
-  return .done (toExpr (Qed.isSafeAttrName s))
-
-dsimproc [simp] reduceIsUrlAttrName (isUrlAttrName _) := fun e => do
-  let some s := strLitVal? e.appArg! | return .continue
-  return .done (toExpr (Qed.isUrlAttrName s))
-
-dsimproc [simp] reduceIsSafeUrl (isSafeUrl _) := fun e => do
-  let some s := strLitVal? e.appArg! | return .continue
-  return .done (toExpr (Qed.isSafeUrl s))
+dsimproc [simp] reduceIsVoidTag (isVoidTag _) := strBoolSimproc Qed.isVoidTag
+dsimproc [simp] reduceIsSafeAttrName (isSafeAttrName _) := strBoolSimproc Qed.isSafeAttrName
+dsimproc [simp] reduceIsUrlAttrName (isUrlAttrName _) := strBoolSimproc Qed.isUrlAttrName
+dsimproc [simp] reduceIsSafeUrl (isSafeUrl _) := strBoolSimproc Qed.isSafeUrl
+dsimproc [simp] reduceTagBlocksDirectSpan (tagBlocksDirectSpan _) := strBoolSimproc Qed.tagBlocksDirectSpan
+dsimproc [simp] reduceTagBlocksSpanSubtree (tagBlocksSpanSubtree _) := strBoolSimproc Qed.tagBlocksSpanSubtree
 
 dsimproc [simp] reduceContainsCloseSeq (containsCloseSeq (String.toList _)) := fun e => do
   let some s := strLitVal? e.appArg!.appArg! | return .continue
   return .done (toExpr (Qed.containsCloseSeq s.toList))
-
-dsimproc [simp] reduceTagBlocksDirectSpan (tagBlocksDirectSpan _) := fun e => do
-  let some s := strLitVal? e.appArg! | return .continue
-  return .done (toExpr (Qed.tagBlocksDirectSpan s))
-
-dsimproc [simp] reduceTagBlocksSpanSubtree (tagBlocksSpanSubtree _) := fun e => do
-  let some s := strLitVal? e.appArg! | return .continue
-  return .done (toExpr (Qed.tagBlocksSpanSubtree s))
 
 private def looksGeneratedForView (n : Name) : Bool :=
   qedLooksGenerated n ||
@@ -130,30 +100,33 @@ private def isUnfoldableUserDef (env : Environment) (viewOnly : Bool) (n : Name)
       return !viewOnly || mentionsViewType d.type
   | _ => return false
 
+def qedHtmlHelperNames : Array Name := #[
+  ``Qed.text, ``Qed.lazy, ``Qed.el, ``Qed.link, ``Qed.linkTo,
+  ``Qed.cls, ``Qed.attr, ``Qed.role, ``Qed.on, ``Qed.onValue, ``Qed.onClick, ``Qed.onInput,
+  ``Qed.onChange, ``Qed.onCheck, ``Qed.onKeydown, ``Qed.onKeyup, ``Qed.onSubmit,
+  ``Qed.onBlur, ``Qed.onFocus, ``Qed.onDoubleClick, ``Qed.onMouseDown, ``Qed.onMouseUp,
+  ``Qed.key, ``Qed.value, ``Qed.placeholder, ``Qed.name, ``Qed.href, ``Qed.src, ``Qed.action,
+  ``Qed.alt, ``Qed.title, ``Qed.style, ``Qed.inlineStyle, ``Qed.styleVars, ``Qed.type', ``Qed.disabled, ``Qed.required,
+  ``Qed.checked, ``Qed.readOnly
+]
+
+def qedForEachHelperNames : Array Name := #[
+  `Qed.ForEachItems.toList_array, `Qed.ForEachItems.toList_list, `Qed.ForEachItems.toArray, `Qed.mapList_eq
+]
+
+private def viewEquivHelperNames (env : Environment) : Array Name :=
+  #[``V.bindAttr, ``V.dynAttr, ``V.onClick', ``V.onInput', ``V.onCheck'] ++ qedHtmlHelperNames ++
+    (#[`Qed.Component.render, `Qed.localMount, `Qed.localMountWith] ++ qedForEachHelperNames).filter env.contains
+
 private def viewFrameworkUnfolds (env : Environment) : Array Name :=
-  let core := #[
-    ``Html.valid, ``Html.validIn, ``Html.validListIn,
+  #[``Html.valid, ``Html.validIn, ``Html.validListIn,
     ``Attr.validKeyValue,
     ``View.render, ``View.renderEach, ``View.renderSig, ``View.renderSigList,
     ``View.showIf, ``View.ofHtml, ``View.hasOpaque, ``View.hasOpaqueList,
     ``View.collectDyn, ``View.collectDynList, ``dynValGets,
     ``VAttr.eval, ``V.el, ``V.text, ``V.dyn, ``V.ifElse, ``V.showIf, ``V.static,
-    ``V.dynNode, ``V.memo, ``V.render_forEach, ``View.isDyn, ``V.bindAttr, ``V.dynAttr,
-    ``V.onClick', ``V.onInput', ``V.onCheck', ``SoundMemo.ofLawful,
-    ``Qed.text, ``Qed.lazy, ``Qed.el, ``Qed.link, ``Qed.linkTo,
-    ``Qed.cls, ``Qed.attr, ``Qed.role, ``Qed.on, ``Qed.onValue, ``Qed.onClick, ``Qed.onInput,
-    ``Qed.onChange, ``Qed.onCheck, ``Qed.onKeydown, ``Qed.onKeyup, ``Qed.onSubmit,
-    ``Qed.onBlur, ``Qed.onFocus, ``Qed.onDoubleClick, ``Qed.onMouseDown, ``Qed.onMouseUp,
-    ``Qed.key, ``Qed.value, ``Qed.placeholder, ``Qed.name, ``Qed.href, ``Qed.src, ``Qed.action,
-    ``Qed.alt, ``Qed.title, ``Qed.style, ``Qed.inlineStyle, ``Qed.styleVars, ``Qed.type', ``Qed.disabled, ``Qed.required,
-    ``Qed.checked, ``Qed.readOnly
-  ]
-  let opt := #[
-    `Qed.Component.render,
-    `Qed.ForEachItems.toList_array, `Qed.ForEachItems.toList_list, `Qed.ForEachItems.toArray, `Qed.mapList_eq,
-    `Qed.localMount, `Qed.localMountWith
-  ].filter env.contains
-  core ++ opt
+    ``V.dynNode, ``V.memo, ``V.render_forEach, ``View.isDyn, ``SoundMemo.ofLawful
+  ] ++ viewEquivHelperNames env
 
 private def viewValidSimpExtras (env : Environment) : Array Name :=
   let base := #[
@@ -275,17 +248,9 @@ private def isSafeKeyValLit (k v : Expr) : Bool :=
   | none => false
 
 private def isFixedSafeNonCellAttrName (n : Name) : Bool :=
-  n == ``Attr.cls || n == ``Qed.cls ||
-  n == ``Attr.key || n == ``Qed.key ||
-  n == ``Attr.empty || n == ``Attr.signalBind ||
-  n == ``Qed.role ||
-  n == ``Qed.onClick || n == ``Qed.onInput || n == ``Qed.onChange ||
-  n == ``Qed.onCheck || n == ``Qed.onKeydown || n == ``Qed.onKeyup ||
-  n == ``Qed.onSubmit || n == ``Qed.onBlur || n == ``Qed.onFocus ||
-  n == ``Qed.onDoubleClick || n == ``Qed.onMouseDown || n == ``Qed.onMouseUp ||
-  n == ``Qed.value || n == ``Qed.placeholder || n == ``Qed.name ||
-  n == ``Qed.alt || n == ``Qed.title || n == ``Qed.style || n == ``Qed.type' ||
-  n == ``Qed.disabled || n == ``Qed.required || n == ``Qed.checked || n == ``Qed.readOnly
+  n == ``Attr.cls || n == ``Qed.cls || n == ``Attr.key || n == ``Qed.key ||
+  n == ``Attr.empty || n == ``Attr.signalBind || n == ``Qed.onCheck || n == ``Qed.value ||
+  ValidLemmas.qedAttrWrapperMap.contains n
 
 private def isVAttrOnCheckEval (fn : Name) (args : Array Expr) : Bool :=
   fn == ``VAttr.eval && args.size == 4 &&
@@ -307,7 +272,7 @@ private def isDefValidAttr (a : Expr) : Bool :=
       else false
   | none => false
 
-private def stripLetE : Nat → Expr → Expr
+def stripLetE : Nat → Expr → Expr
   | 0, e => e.consumeMData.headBeta
   | fuel + 1, e =>
       let e := e.consumeMData.headBeta
@@ -1249,24 +1214,6 @@ private def viewEquivBaseNames : Array Name := #[
   ``mkCanonicalElem, ``onlySignalBind, ``Attr.canonical
 ]
 
-private def viewEquivHelperNames (env : Environment) : Array Name :=
-  let core := #[
-    ``V.bindAttr, ``V.dynAttr, ``V.onClick', ``V.onInput', ``V.onCheck',
-    ``Qed.text, ``Qed.lazy, ``Qed.el, ``Qed.link, ``Qed.linkTo,
-    ``Qed.cls, ``Qed.attr, ``Qed.role, ``Qed.on, ``Qed.onValue, ``Qed.onClick, ``Qed.onInput,
-    ``Qed.onChange, ``Qed.onCheck, ``Qed.onKeydown, ``Qed.onKeyup, ``Qed.onSubmit,
-    ``Qed.onBlur, ``Qed.onFocus, ``Qed.onDoubleClick, ``Qed.onMouseDown, ``Qed.onMouseUp,
-    ``Qed.key, ``Qed.value, ``Qed.placeholder, ``Qed.name, ``Qed.href, ``Qed.src, ``Qed.action,
-    ``Qed.alt, ``Qed.title, ``Qed.style, ``Qed.inlineStyle, ``Qed.styleVars, ``Qed.type', ``Qed.disabled,
-    ``Qed.required, ``Qed.checked, ``Qed.readOnly
-  ]
-  let opt := #[
-    `Qed.Component.render,
-    `Qed.ForEachItems.toList_array, `Qed.ForEachItems.toList_list, `Qed.ForEachItems.toArray, `Qed.mapList_eq,
-    `Qed.localMount, `Qed.localMountWith
-  ].filter env.contains
-  core ++ opt
-
 private def runProveViewEquiv (appId viewId : Ident) : TacticM Unit := do
   let appName ← realizeGlobalConstNoOverloadWithInfo appId
   let viewName ← realizeGlobalConstNoOverloadWithInfo viewId
@@ -1310,8 +1257,6 @@ private def runProveViewEquiv (appId viewId : Ident) : TacticM Unit := do
       | ((repeat' split) <;> simp_all [Qed.mkCanonicalElem, Qed.onlySignalBind, Qed.Attr.canonical])))
     catch _ => pure ()
 
-elab "qedUnfoldForValidHtml" : tactic => qedUnfoldHelpers 8 true
-elab "qedProveValidHtmlCore" : tactic => do let _ ← runValidHtmlPipeline
 elab "qedProveValidHtml" : tactic => runProveValidHtml
 elab "qedProveDehydrateView" : tactic => runProveDehydrateView
 elab "qedProveDehydrateInv" : tactic => runProveDehydrateInv

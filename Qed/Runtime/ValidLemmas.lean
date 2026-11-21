@@ -296,51 +296,67 @@ private theorem mk_snu (k : String) (h : checkSnuBytes k.toByteArray.data.toList
       rcases hu with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
       all_goals exact Bool.noConfusion h.2
 
-theorem snu_dataRole     : isSafeAttrName "data-role" = true ∧ isUrlAttrName "data-role" = false := mk_snu "data-role" rfl
-theorem snu_dataQedLink  : isSafeAttrName "data-qed-link" = true ∧ isUrlAttrName "data-qed-link" = false := mk_snu "data-qed-link" rfl
-theorem snu_value        : isSafeAttrName "value" = true ∧ isUrlAttrName "value" = false := mk_snu "value" rfl
-theorem snu_placeholder  : isSafeAttrName "placeholder" = true ∧ isUrlAttrName "placeholder" = false := mk_snu "placeholder" rfl
-theorem snu_name         : isSafeAttrName "name" = true ∧ isUrlAttrName "name" = false := mk_snu "name" rfl
-theorem snu_alt          : isSafeAttrName "alt" = true ∧ isUrlAttrName "alt" = false := mk_snu "alt" rfl
-theorem snu_title        : isSafeAttrName "title" = true ∧ isUrlAttrName "title" = false := mk_snu "title" rfl
-theorem snu_style        : isSafeAttrName "style" = true ∧ isUrlAttrName "style" = false := mk_snu "style" rfl
-theorem snu_type         : isSafeAttrName "type" = true ∧ isUrlAttrName "type" = false := mk_snu "type" rfl
-theorem snu_class        : isSafeAttrName "class" = true ∧ isUrlAttrName "class" = false := mk_snu "class" rfl
-theorem snu_id           : isSafeAttrName "id" = true ∧ isUrlAttrName "id" = false := mk_snu "id" rfl
-theorem snu_for          : isSafeAttrName "for" = true ∧ isUrlAttrName "for" = false := mk_snu "for" rfl
-theorem snu_role         : isSafeAttrName "role" = true ∧ isUrlAttrName "role" = false := mk_snu "role" rfl
-theorem snu_ariaLabel    : isSafeAttrName "aria-label" = true ∧ isUrlAttrName "aria-label" = false := mk_snu "aria-label" rfl
-theorem snu_ariaInvalid  : isSafeAttrName "aria-invalid" = true ∧ isUrlAttrName "aria-invalid" = false := mk_snu "aria-invalid" rfl
-theorem snu_ariaLive     : isSafeAttrName "aria-live" = true ∧ isUrlAttrName "aria-live" = false := mk_snu "aria-live" rfl
-theorem snu_rows         : isSafeAttrName "rows" = true ∧ isUrlAttrName "rows" = false := mk_snu "rows" rfl
-theorem snu_cols         : isSafeAttrName "cols" = true ∧ isUrlAttrName "cols" = false := mk_snu "cols" rfl
-theorem snu_min          : isSafeAttrName "min" = true ∧ isUrlAttrName "min" = false := mk_snu "min" rfl
-theorem snu_max          : isSafeAttrName "max" = true ∧ isUrlAttrName "max" = false := mk_snu "max" rfl
-theorem snu_step         : isSafeAttrName "step" = true ∧ isUrlAttrName "step" = false := mk_snu "step" rfl
-theorem snu_tabindex     : isSafeAttrName "tabindex" = true ∧ isUrlAttrName "tabindex" = false := mk_snu "tabindex" rfl
-theorem snu_target       : isSafeAttrName "target" = true ∧ isUrlAttrName "target" = false := mk_snu "target" rfl
-theorem snu_rel          : isSafeAttrName "rel" = true ∧ isUrlAttrName "rel" = false := mk_snu "rel" rfl
-theorem snu_accept       : isSafeAttrName "accept" = true ∧ isUrlAttrName "accept" = false := mk_snu "accept" rfl
-theorem snu_autocomplete : isSafeAttrName "autocomplete" = true ∧ isUrlAttrName "autocomplete" = false := mk_snu "autocomplete" rfl
+private def mkStrMap (entries : Array (String × Lean.Name)) : Std.HashMap String Lean.Name :=
+  entries.foldl (fun m (k, v) => m.insert k v) {}
 
-theorem sa_click     : isSafeAttrName "click" = true := mk_sa "click" rfl
-theorem sa_input     : isSafeAttrName "input" = true := mk_sa "input" rfl
-theorem sa_change    : isSafeAttrName "change" = true := mk_sa "change" rfl
-theorem sa_keydown   : isSafeAttrName "keydown" = true := mk_sa "keydown" rfl
-theorem sa_keyup     : isSafeAttrName "keyup" = true := mk_sa "keyup" rfl
-theorem sa_submit    : isSafeAttrName "submit" = true := mk_sa "submit" rfl
-theorem sa_blur      : isSafeAttrName "blur" = true := mk_sa "blur" rfl
-theorem sa_focus     : isSafeAttrName "focus" = true := mk_sa "focus" rfl
-theorem sa_dblclick  : isSafeAttrName "dblclick" = true := mk_sa "dblclick" rfl
-theorem sa_mousedown : isSafeAttrName "mousedown" = true := mk_sa "mousedown" rfl
-theorem sa_mouseup   : isSafeAttrName "mouseup" = true := mk_sa "mouseup" rfl
-theorem sa_disabled  : isSafeAttrName "disabled" = true := mk_sa "disabled" rfl
-theorem sa_required  : isSafeAttrName "required" = true := mk_sa "required" rfl
-theorem sa_checked   : isSafeAttrName "checked" = true := mk_sa "checked" rfl
-theorem sa_readonly  : isSafeAttrName "readonly" = true := mk_sa "readonly" rfl
-theorem sa_selected  : isSafeAttrName "selected" = true := mk_sa "selected" rfl
-theorem sa_multiple  : isSafeAttrName "multiple" = true := mk_sa "multiple" rfl
-theorem sa_hidden    : isSafeAttrName "hidden" = true := mk_sa "hidden" rfl
+local macro "genValidTable " kind:ident mapDef:ident " [" keys:str,* "]" : command => do
+  let camel (pfx s : String) : String :=
+    match s.splitOn "-" with
+    | [] => pfx
+    | h :: t => pfx ++ h ++ String.join (t.map fun p =>
+        match p.toList with | [] => "" | c :: cs => String.ofList (c.toUpper :: cs))
+  let mut cmds := #[]
+  let mut entries : Array (Lean.TSyntax `term) := #[]
+  let k := kind.getId.eraseMacroScopes.toString
+  let mkRef (n : String) := Lean.mkIdentFrom kind (Lean.Name.mkSimple n)
+  for sLit in keys.getElems do
+    let s := sLit.getString
+    let pfx := match k with
+      | "snu" => "snu_" | "sa" => "sa_" | "nv" => "nv_" | _ => "step_"
+    let thmStr := camel pfx s
+    let thm := Lean.mkIdentFrom sLit (Lean.Name.mkSimple thmStr)
+    let fullName := Lean.Name.mkStr (Lean.Name.mkStr (Lean.Name.mkSimple "Qed") "ValidLemmas") thmStr
+    entries := entries.push (← `(($sLit, $(Lean.quote fullName))))
+    let cmd ← match k with
+      | "snu" => `(command| theorem $thm : isSafeAttrName $sLit = true ∧ isUrlAttrName $sLit = false := $(mkRef "mk_snu") $sLit rfl)
+      | "sa"  => `(command| theorem $thm : isSafeAttrName $sLit = true := $(mkRef "mk_sa") $sLit rfl)
+      | "nv"  => `(command| theorem $thm : isVoidTag $sLit = false := $(mkRef "mk_nv") $sLit rfl)
+      | "block" =>
+          `(command| theorem $thm (i f : Bool) :
+              stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } $sLit =
+                some { mode := .normal, inP := false, interactive := i, inForm := f } := $(mkRef "mk_plainBlock") $sLit rfl i f)
+      | "inline" =>
+          `(command| theorem $thm (p i f : Bool) :
+              stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } $sLit =
+                some { mode := .normal, inP := p, interactive := i, inForm := f } := $(mkRef "mk_plainInline") $sLit rfl p i f)
+      | "heading" =>
+          `(command| theorem $thm (i f : Bool) :
+              stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } $sLit =
+                some { mode := .normal, inP := true, interactive := i, inForm := f } := $(mkRef "mk_heading") $sLit rfl (by simp [isHeadingTag]) i f)
+      | "inter" =>
+          `(command| theorem $thm (p f : Bool) :
+              stepHtmlCtx { mode := .normal, inP := p, interactive := false, inForm := f } $sLit =
+                some { mode := .normal, inP := p, interactive := true, inForm := f } := $(mkRef "mk_interactive") $sLit rfl (by simp) p f)
+      | "input" =>
+          `(command| theorem $thm (p f : Bool) :
+              stepHtmlCtx { mode := .normal, inP := p, interactive := false, inForm := f } $sLit =
+                some { mode := .normal, inP := p, interactive := false, inForm := f } := $(mkRef "mk_inputLike") $sLit rfl p f)
+      | _ => Lean.Macro.throwUnsupported
+    cmds := cmds.push cmd
+  if k == "snu" || k == "sa" || k == "nv" || k == "inline" then
+    cmds := cmds.push (← `(command| def $mapDef : Std.HashMap String Lean.Name := mkStrMap #[$entries,*]))
+  else
+    cmds := cmds.push (← `(command| private def $mapDef : Array (String × Lean.Name) := #[$entries,*]))
+  return ⟨Lean.mkNullNode cmds⟩
+
+genValidTable snu safeNonUrlAttrMap [
+  "data-role", "data-qed-link", "value", "placeholder", "name", "alt", "title", "style", "type",
+  "class", "id", "for", "role", "aria-label", "aria-invalid", "aria-live", "rows", "cols",
+  "min", "max", "step", "tabindex", "target", "rel", "accept", "autocomplete"]
+
+genValidTable sa safeAttrMap [
+  "click", "input", "change", "keydown", "keyup", "submit", "blur", "focus", "dblclick",
+  "mousedown", "mouseup", "disabled", "required", "checked", "readonly", "selected", "multiple", "hidden"]
 
 theorem valid_value {msg α : Type} [ToString α] (v : α) :
     (Qed.value v : Attr msg).valid = true :=
@@ -371,6 +387,17 @@ private def isVoidTagBytes : List UInt8 → Bool
     | _   => false
   | [] => false
 
+local macro "bytes_false_by " e:term " using " h:ident " [" unf:Lean.Parser.Tactic.simpLemma,* "]" : tactic => do
+  let simpT ← if unf.getElems.isEmpty then `(tactic| simp only [Bool.or_eq_true, beq_iff_eq] at hv)
+              else `(tactic| simp only [$unf,*, Bool.or_eq_true, beq_iff_eq] at hv)
+  `(tactic| (
+    cases hv : $e with
+    | false => rfl
+    | true =>
+        exfalso
+        $simpT
+        repeat (rcases hv with hv | hv <;> try (subst hv; exact Bool.noConfusion $h))))
+
 private theorem mk_nv (t : String) (h : isVoidTagBytes t.toByteArray.data.toList = false) :
     isVoidTag t = false := by
   cases hv : isVoidTag t with
@@ -380,8 +407,7 @@ private theorem mk_nv (t : String) (h : isVoidTagBytes t.toByteArray.data.toList
       have hmem : t ∈ voidTags := List.mem_of_elem_eq_true hv
       unfold voidTags at hmem
       simp only [List.mem_cons, List.not_mem_nil, or_false] at hmem
-      rcases hmem with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
-      all_goals exact Bool.noConfusion h
+      repeat (rcases hmem with rfl | hmem <;> try exact Bool.noConfusion h)
 
 private def isForbiddenBytes : List UInt8 → Bool
   | b0 :: rest =>
@@ -441,81 +467,43 @@ private def closesPBytes : List UInt8 → Bool
     | _   => false
   | [] => false
 
-private def isOtherNormalSpecialBytes : List UInt8 → Bool
+private def isModeChangeBytes : List UInt8 → Bool
   | b0 :: rest =>
     match b0.toNat with
     | 100 => rest == [108] -- dl
-    | 102 => rest == [111, 114, 109] -- form
-    | 108 => rest == [97, 98, 101, 108] -- label
     | 111 => rest == [108] -- ol
-    | 112 => rest == [] -- p
-    | 115 => rest == [118, 103] || rest == [116, 121, 108, 101] -- svg, style
-    | 116 => rest == [97, 98, 108, 101] -- table
+    | 115 => rest == [118, 103] || rest == [116, 121, 108, 101] || rest == [101, 108, 101, 99, 116] -- svg, style, select
+    | 116 => rest == [97, 98, 108, 101] || rest == [101, 120, 116, 97, 114, 101, 97] -- table, textarea
     | 117 => rest == [108] -- ul
     | _   => false
   | [] => false
 
 private theorem isForbidden_false_of_bytes (t : String)
     (h : isForbiddenBytes t.toByteArray.data.toList = false) : isForbiddenTag t = false := by
-  cases hv : isForbiddenTag t with
-  | false => rfl
-  | true =>
-      exfalso; unfold isForbiddenTag at hv
-      simp only [Bool.or_eq_true, beq_iff_eq, or_assoc] at hv
-      rcases hv with rfl | rfl | rfl | rfl | rfl
-      all_goals exact Bool.noConfusion h
+  bytes_false_by (isForbiddenTag t) using h [isForbiddenTag]
 
 private theorem isContextOnly_false_of_bytes (t : String)
     (h : isContextOnlyBytes t.toByteArray.data.toList = false) : isContextOnlyTag t = false := by
-  cases hv : isContextOnlyTag t with
-  | false => rfl
-  | true =>
-      exfalso; unfold isContextOnlyTag at hv
-      simp only [Bool.or_eq_true, beq_iff_eq, or_assoc] at hv
-      rcases hv with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
-      all_goals exact Bool.noConfusion h
+  bytes_false_by (isContextOnlyTag t) using h [isContextOnlyTag]
 
 private theorem isInteractive_false_of_bytes (t : String)
     (h : isInteractiveBytes t.toByteArray.data.toList = false) : isInteractiveTag t = false := by
-  cases hv : isInteractiveTag t with
-  | false => rfl
-  | true =>
-      exfalso; unfold isInteractiveTag at hv
-      simp only [Bool.or_eq_true, beq_iff_eq, or_assoc] at hv
-      rcases hv with rfl | rfl | rfl | rfl | rfl | rfl | rfl
-      all_goals exact Bool.noConfusion h
+  bytes_false_by (isInteractiveTag t) using h [isInteractiveTag]
 
 private theorem isHeading_false_of_bytes (t : String)
     (h : isHeadingBytes t.toByteArray.data.toList = false) : isHeadingTag t = false := by
-  cases hv : isHeadingTag t with
-  | false => rfl
-  | true =>
-      exfalso; unfold isHeadingTag at hv
-      simp only [Bool.or_eq_true, beq_iff_eq, or_assoc] at hv
-      rcases hv with rfl | rfl | rfl | rfl | rfl | rfl
-      all_goals exact Bool.noConfusion h
+  bytes_false_by (isHeadingTag t) using h [isHeadingTag]
 
 private theorem closesP_false_of_bytes (t : String)
     (h : closesPBytes t.toByteArray.data.toList = false) : closesPTag t = false := by
-  cases hv : closesPTag t with
-  | false => rfl
-  | true =>
-      exfalso; unfold closesPTag isHeadingTag at hv
-      simp only [Bool.or_eq_true, beq_iff_eq] at hv
-      repeat (rcases hv with hv | hv <;> try (subst hv; exact Bool.noConfusion h))
+  bytes_false_by (closesPTag t) using h [closesPTag, isHeadingTag]
 
-private theorem otherNormal_false_of_bytes (t : String)
-    (h : isOtherNormalSpecialBytes t.toByteArray.data.toList = false) :
-    (t == "svg" || t == "style" || t == "ul" || t == "ol" || t == "dl" ||
-     t == "table" || t == "p" || t == "label" || t == "form") = false := by
-  cases hv : (t == "svg" || t == "style" || t == "ul" || t == "ol" || t == "dl" ||
-              t == "table" || t == "p" || t == "label" || t == "form") with
-  | false => rfl
-  | true =>
-      exfalso
-      simp only [Bool.or_eq_true, beq_iff_eq, or_assoc] at hv
-      rcases hv with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
-      all_goals exact Bool.noConfusion h
+private theorem modeChange_false (t : String)
+    (h : isModeChangeBytes t.toByteArray.data.toList = false) :
+    (t == "svg" || t == "style" || t == "textarea" || t == "select" ||
+     t == "ul" || t == "ol" || t == "dl" || t == "table") = false := by
+  bytes_false_by (t == "svg" || t == "style" || t == "textarea" || t == "select" ||
+                  t == "ul" || t == "ol" || t == "dl" || t == "table") using h []
 
 private theorem isSafe_of_lower (tag : String)
     (h : (!tag.toByteArray.data.toList.isEmpty && tag.toByteArray.data.toList.all isLowerTagByte) = true) :
@@ -527,224 +515,137 @@ private theorem beq_false_of_bytes {a b : String}
     (h : (a.toByteArray.data.toList == b.toByteArray.data.toList) = false) : (a == b) = false := by
   rw [beq_eq_false_iff_ne]; intro heq; subst heq; simp at h
 
+private theorem bne_bytes_false {a b : String}
+    (h : (a.toByteArray.data.toList != b.toByteArray.data.toList) = true) : (a == b) = false :=
+  beq_false_of_bytes (by simpa [bne] using h)
+
+private theorem mk_normalSameMode (tag : String) (inP interactive inForm inP' interactive' inForm' : Bool)
+    (hnon : (!tag.toByteArray.data.toList.isEmpty) = true)
+    (hall : tag.toByteArray.data.toList.all isLowerTagByte = true)
+    (hforb : isForbiddenBytes tag.toByteArray.data.toList = false)
+    (hctx : isContextOnlyBytes tag.toByteArray.data.toList = false)
+    (hmc : isModeChangeBytes tag.toByteArray.data.toList = false)
+    (hp : (inP && closesPTag tag) = false)
+    (hi : (interactive && (isInteractiveTag tag || tag == "label" || tag == "form")) = false)
+    (hf : (inForm && tag == "form") = false)
+    (hP' : (inP || tag == "p" || isHeadingTag tag) = inP')
+    (hI' : (interactive || tag == "a" || tag == "button" || tag == "details" || tag == "summary") = interactive')
+    (hF' : (inForm || tag == "form") = inForm') :
+    stepHtmlCtx { mode := .normal, inP, interactive, inForm } tag =
+      some { mode := .normal, inP := inP', interactive := interactive', inForm := inForm' } := by
+  have hs := (lowerBytes_core tag hnon hall).1
+  have hfb := isForbidden_false_of_bytes tag hforb
+  have hc := isContextOnly_false_of_bytes tag hctx
+  have hm := modeChange_false tag hmc
+  simp only [Bool.or_eq_false_iff] at hm
+  rcases hm with ⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩
+  simp only [stepHtmlCtx, hs, hfb, hc, hp, hi, hf, h1, h2, h3, h4, h5, h6, h7, h8,
+    hP', hI', hF', Bool.not_true, Bool.or_false, Bool.false_eq_true, ↓reduceIte]
+
+private def checkNormalBaseBytes (bs : List UInt8) : Bool :=
+  !bs.isEmpty && bs.all isLowerTagByte && !isForbiddenBytes bs && !isContextOnlyBytes bs && !isModeChangeBytes bs
+
 private def checkPlainBlockBytes (bs : List UInt8) : Bool :=
-  !bs.isEmpty && bs.all isLowerTagByte &&
-  !isForbiddenBytes bs && !isContextOnlyBytes bs && !isInteractiveBytes bs &&
-  !isHeadingBytes bs && !isOtherNormalSpecialBytes bs
+  checkNormalBaseBytes bs && !isInteractiveBytes bs && !isHeadingBytes bs &&
+  bs != [112] && bs != [108, 97, 98, 101, 108] && bs != [102, 111, 114, 109]
 
 private def checkPlainInlineBytes (bs : List UInt8) : Bool :=
   checkPlainBlockBytes bs && !closesPBytes bs
 
-private theorem mk_plainBlock (tag : String)
+private theorem mk_plainCore (tag : String) (inP interactive inForm : Bool)
     (h : checkPlainBlockBytes tag.toByteArray.data.toList = true)
-    (interactive inForm : Bool) :
-    stepHtmlCtx { mode := .normal, inP := false, interactive, inForm } tag =
-      some { mode := .normal, inP := false, interactive, inForm } := by
-  unfold checkPlainBlockBytes at h
+    (hcp : (inP && closesPTag tag) = false) :
+    stepHtmlCtx { mode := .normal, inP, interactive, inForm } tag =
+      some { mode := .normal, inP, interactive, inForm } := by
+  unfold checkPlainBlockBytes checkNormalBaseBytes at h
   simp only [Bool.and_eq_true, Bool.not_eq_true'] at h
-  rcases h with ⟨⟨⟨⟨⟨⟨hnon, hall⟩, hforb⟩, hctx⟩, hinter⟩, hhead⟩, hoth⟩
-  have hs := (lowerBytes_core tag (by simpa using hnon) hall).1
-  have hf := isForbidden_false_of_bytes tag hforb
-  have hc := isContextOnly_false_of_bytes tag hctx
+  rcases h with ⟨⟨⟨⟨⟨⟨⟨⟨⟨hnon, hall⟩, hforb⟩, hctx⟩, hmc⟩, hinter⟩, hhead⟩, hp⟩, hlab⟩, hfrm⟩
   have hi := isInteractive_false_of_bytes tag hinter
   have hh := isHeading_false_of_bytes tag hhead
-  have ho := otherNormal_false_of_bytes tag hoth
-  have hi' := hi
-  simp only [isInteractiveTag, Bool.or_eq_false_iff] at hi'
-  rcases hi' with ⟨⟨⟨⟨⟨⟨ha, hbtn⟩, _⟩, hsel⟩, hta⟩, hdet⟩, hsum⟩
-  simp only [Bool.or_eq_false_iff] at ho
-  rcases ho with ⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h14⟩, h15⟩
-  simp only [stepHtmlCtx, hs, hf, hc, hi, hh, ha, hbtn, hsel, hta, hdet, hsum,
-    h1, h2, h5, h6, h7, h8, h9, h14, h15, Bool.not_true, Bool.or_false,
-    Bool.false_and, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
+  have hp' : (tag == "p") = false := bne_bytes_false hp
+  have hl' : (tag == "label") = false := bne_bytes_false hlab
+  have hf' : (tag == "form") = false := bne_bytes_false hfrm
+  have hi' := hi; simp only [isInteractiveTag, Bool.or_eq_false_iff] at hi'
+  rcases hi' with ⟨⟨⟨⟨⟨⟨ha, hbtn⟩, _⟩, _⟩, _⟩, hdet⟩, hsum⟩
+  exact mk_normalSameMode tag inP interactive inForm inP interactive inForm
+    (by simpa using hnon) hall hforb hctx hmc hcp
+    (by simp [hi, hl', hf']) (by simp [hf'])
+    (by simp [hp', hh]) (by simp [ha, hbtn, hdet, hsum]) (by simp [hf'])
 
-private theorem mk_plainInline (tag : String)
-    (h : checkPlainInlineBytes tag.toByteArray.data.toList = true)
+private theorem mk_plainBlock (tag : String) (h : checkPlainBlockBytes tag.toByteArray.data.toList = true)
+    (interactive inForm : Bool) :
+    stepHtmlCtx { mode := .normal, inP := false, interactive, inForm } tag =
+      some { mode := .normal, inP := false, interactive, inForm } :=
+  mk_plainCore tag false interactive inForm h rfl
+
+private theorem mk_plainInline (tag : String) (h : checkPlainInlineBytes tag.toByteArray.data.toList = true)
     (inP interactive inForm : Bool) :
     stepHtmlCtx { mode := .normal, inP, interactive, inForm } tag =
       some { mode := .normal, inP, interactive, inForm } := by
-  unfold checkPlainInlineBytes checkPlainBlockBytes at h
-  simp only [Bool.and_eq_true, Bool.not_eq_true'] at h
-  rcases h with ⟨⟨⟨⟨⟨⟨⟨hnon, hall⟩, hforb⟩, hctx⟩, hinter⟩, hhead⟩, hoth⟩, hcp⟩
-  have hs := (lowerBytes_core tag (by simpa using hnon) hall).1
-  have hf := isForbidden_false_of_bytes tag hforb
-  have hc := isContextOnly_false_of_bytes tag hctx
-  have hcp' := closesP_false_of_bytes tag hcp
-  have hi := isInteractive_false_of_bytes tag hinter
-  have hh := isHeading_false_of_bytes tag hhead
-  have ho := otherNormal_false_of_bytes tag hoth
-  have hi' := hi
-  simp only [isInteractiveTag, Bool.or_eq_false_iff] at hi'
-  rcases hi' with ⟨⟨⟨⟨⟨⟨ha, hbtn⟩, _⟩, hsel⟩, hta⟩, hdet⟩, hsum⟩
-  simp only [Bool.or_eq_false_iff] at ho
-  rcases ho with ⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h14⟩, h15⟩
-  simp only [stepHtmlCtx, hs, hf, hc, hcp', hi, hh, ha, hbtn, hsel, hta, hdet, hsum,
-    h1, h2, h5, h6, h7, h8, h9, h14, h15, Bool.not_true, Bool.or_false,
-    Bool.and_false, Bool.false_eq_true, ↓reduceIte]
+  unfold checkPlainInlineBytes at h
+  rw [Bool.and_eq_true, Bool.not_eq_true'] at h
+  exact mk_plainCore tag inP interactive inForm h.1 (by simp [closesP_false_of_bytes tag h.2])
 
-private theorem mk_heading (tag : String)
-    (h : (!tag.toByteArray.data.toList.isEmpty && tag.toByteArray.data.toList.all isLowerTagByte &&
-          !isForbiddenBytes tag.toByteArray.data.toList && !isContextOnlyBytes tag.toByteArray.data.toList &&
-          !isInteractiveBytes tag.toByteArray.data.toList) = true)
-    (hp : (tag == "p" || isHeadingTag tag) = true)
-    (ho : (tag == "svg" || tag == "style" || tag == "ul" || tag == "ol" || tag == "dl" ||
-           tag == "table" || tag == "label" || tag == "form") = false)
-    (interactive inForm : Bool) :
-    stepHtmlCtx { mode := .normal, inP := false, interactive, inForm } tag =
-      some { mode := .normal, inP := true, interactive, inForm } := by
-  simp only [Bool.and_eq_true, Bool.not_eq_true'] at h
-  rcases h with ⟨⟨⟨⟨hnon, hall⟩, hforb⟩, hctx⟩, hinter⟩
-  have hs := (lowerBytes_core tag (by simpa using hnon) hall).1
-  have hf := isForbidden_false_of_bytes tag hforb
-  have hc := isContextOnly_false_of_bytes tag hctx
-  have hi := isInteractive_false_of_bytes tag hinter
-  have hi' := hi
-  simp only [isInteractiveTag, Bool.or_eq_false_iff] at hi'
-  rcases hi' with ⟨⟨⟨⟨⟨⟨ha, hbtn⟩, _⟩, hsel⟩, hta⟩, hdet⟩, hsum⟩
-  simp only [Bool.or_eq_false_iff] at ho
-  rcases ho with ⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h5⟩, h6⟩, h7⟩, h8⟩, h14⟩, h15⟩
-  simp only [stepHtmlCtx, hs, hf, hc, hi, hp, ha, hbtn, hsel, hta, hdet, hsum,
-    h1, h2, h5, h6, h7, h8, h14, h15, Bool.not_true, Bool.false_or, Bool.or_false,
-    Bool.false_and, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
+private def checkHeadingBytes (bs : List UInt8) : Bool :=
+  checkNormalBaseBytes bs && !isInteractiveBytes bs &&
+  bs != [108, 97, 98, 101, 108] && bs != [102, 111, 114, 109]
 
-private def isHeadingNonSpecialBytes : List UInt8 → Bool
-  | b0 :: rest =>
-    match b0.toNat with
-    | 100 => rest == [108]
-    | 102 => rest == [111, 114, 109]
-    | 108 => rest == [97, 98, 101, 108]
-    | 111 => rest == [108]
-    | 115 => rest == [118, 103] || rest == [116, 121, 108, 101]
-    | 116 => rest == [97, 98, 108, 101]
-    | 117 => rest == [108]
-    | _   => false
-  | [] => false
-
-private theorem headingNonSpecial_false (t : String)
-    (h : isHeadingNonSpecialBytes t.toByteArray.data.toList = false) :
-    (t == "svg" || t == "style" || t == "ul" || t == "ol" || t == "dl" ||
-     t == "table" || t == "label" || t == "form") = false := by
-  cases hv : (t == "svg" || t == "style" || t == "ul" || t == "ol" || t == "dl" ||
-              t == "table" || t == "label" || t == "form") with
-  | false => rfl
-  | true =>
-      exfalso
-      simp only [Bool.or_eq_true, beq_iff_eq, or_assoc] at hv
-      rcases hv with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
-      all_goals exact Bool.noConfusion h
-
-private theorem mk_heading_fast (tag : String)
-    (h : (!tag.toByteArray.data.toList.isEmpty && tag.toByteArray.data.toList.all isLowerTagByte &&
-          !isForbiddenBytes tag.toByteArray.data.toList && !isContextOnlyBytes tag.toByteArray.data.toList &&
-          !isInteractiveBytes tag.toByteArray.data.toList && !isHeadingNonSpecialBytes tag.toByteArray.data.toList) = true)
+private theorem mk_heading (tag : String) (h : checkHeadingBytes tag.toByteArray.data.toList = true)
     (hp : (tag == "p" || isHeadingTag tag) = true) (interactive inForm : Bool) :
     stepHtmlCtx { mode := .normal, inP := false, interactive, inForm } tag =
       some { mode := .normal, inP := true, interactive, inForm } := by
-  rw [Bool.and_eq_true, Bool.not_eq_true'] at h
-  exact mk_heading tag h.1 hp (headingNonSpecial_false tag h.2) interactive inForm
+  unfold checkHeadingBytes checkNormalBaseBytes at h
+  simp only [Bool.and_eq_true, Bool.not_eq_true'] at h
+  rcases h with ⟨⟨⟨⟨⟨⟨⟨hnon, hall⟩, hforb⟩, hctx⟩, hmc⟩, hinter⟩, hlab⟩, hfrm⟩
+  have hi := isInteractive_false_of_bytes tag hinter
+  have hl' : (tag == "label") = false := bne_bytes_false hlab
+  have hf' : (tag == "form") = false := bne_bytes_false hfrm
+  have hi' := hi; simp only [isInteractiveTag, Bool.or_eq_false_iff] at hi'
+  rcases hi' with ⟨⟨⟨⟨⟨⟨ha, hbtn⟩, _⟩, _⟩, _⟩, hdet⟩, hsum⟩
+  exact mk_normalSameMode tag false interactive inForm true interactive inForm
+    (by simpa using hnon) hall hforb hctx hmc rfl
+    (by simp [hi, hl', hf']) (by simp [hf'])
+    (by simpa using hp) (by simp [ha, hbtn, hdet, hsum]) (by simp [hf'])
 
-private def isInterOtherBytes : List UInt8 → Bool
-  | b0 :: rest =>
-    match b0.toNat with
-    | 100 => rest == [108] -- dl
-    | 102 => rest == [111, 114, 109] -- form
-    | 111 => rest == [108] -- ol
-    | 112 => rest == [] -- p
-    | 115 => rest == [118, 103] || rest == [116, 121, 108, 101] || rest == [101, 108, 101, 99, 116] -- svg, style, select
-    | 116 => rest == [97, 98, 108, 101] || rest == [101, 120, 116, 97, 114, 101, 97] -- table, textarea
-    | 117 => rest == [108] -- ul
-    | _   => false
-  | [] => false
+private def checkInterBytes (bs : List UInt8) : Bool :=
+  checkNormalBaseBytes bs && !closesPBytes bs && !isHeadingBytes bs &&
+  bs != [112] && bs != [102, 111, 114, 109]
 
-private theorem interOther_false (t : String)
-    (h : isInterOtherBytes t.toByteArray.data.toList = false) :
-    (t == "svg" || t == "style" || t == "textarea" || t == "select" ||
-     t == "ul" || t == "ol" || t == "dl" || t == "table" ||
-     t == "p" || t == "form") = false := by
-  cases hv : (t == "svg" || t == "style" || t == "textarea" || t == "select" ||
-              t == "ul" || t == "ol" || t == "dl" || t == "table" ||
-              t == "p" || t == "form") with
-  | false => rfl
-  | true =>
-      exfalso
-      simp only [Bool.or_eq_true, beq_iff_eq, or_assoc] at hv
-      rcases hv with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
-      all_goals exact Bool.noConfusion h
-
-private theorem mk_interactive (tag : String)
-    (h : (!tag.toByteArray.data.toList.isEmpty && tag.toByteArray.data.toList.all isLowerTagByte &&
-          !isForbiddenBytes tag.toByteArray.data.toList && !isContextOnlyBytes tag.toByteArray.data.toList &&
-          !closesPBytes tag.toByteArray.data.toList && !isHeadingBytes tag.toByteArray.data.toList &&
-          !isInterOtherBytes tag.toByteArray.data.toList) = true)
+private theorem mk_interactive (tag : String) (h : checkInterBytes tag.toByteArray.data.toList = true)
     (hint : (tag == "a" || tag == "button" || tag == "details" || tag == "summary") = true)
     (inP inForm : Bool) :
     stepHtmlCtx { mode := .normal, inP, interactive := false, inForm } tag =
       some { mode := .normal, inP, interactive := true, inForm } := by
+  unfold checkInterBytes checkNormalBaseBytes at h
   simp only [Bool.and_eq_true, Bool.not_eq_true'] at h
-  rcases h with ⟨⟨⟨⟨⟨⟨hnon, hall⟩, hforb⟩, hctx⟩, hcp⟩, hhead⟩, hoth⟩
-  have hs := (lowerBytes_core tag (by simpa using hnon) hall).1
-  have hf := isForbidden_false_of_bytes tag hforb
-  have hc := isContextOnly_false_of_bytes tag hctx
-  have hcp' := closesP_false_of_bytes tag hcp
-  have hh := isHeading_false_of_bytes tag hhead
-  have ho := interOther_false tag hoth
-  simp only [Bool.or_eq_false_iff] at ho
-  rcases ho with ⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h10⟩
-  simp only [stepHtmlCtx, hs, hf, hc, hcp', hh, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10,
-    Bool.not_true, Bool.false_or, Bool.or_false, Bool.false_and, Bool.and_false,
-    Bool.false_eq_true, ↓reduceIte, Bool.or_assoc]
-  rw [show (tag == "a" || (tag == "button" || (tag == "details" || tag == "summary"))) = true by
-    simpa [Bool.or_assoc] using hint]
+  rcases h with ⟨⟨⟨⟨⟨⟨⟨⟨hnon, hall⟩, hforb⟩, hctx⟩, hmc⟩, hcp⟩, hhead⟩, hp⟩, hfrm⟩
+  have hf' : (tag == "form") = false := bne_bytes_false hfrm
+  exact mk_normalSameMode tag inP false inForm inP true inForm
+    (by simpa using hnon) hall hforb hctx hmc
+    (by simp [closesP_false_of_bytes tag hcp]) rfl (by simp [hf'])
+    (by simp [bne_bytes_false hp (b := "p"), isHeading_false_of_bytes tag hhead])
+    (by simpa [Bool.or_assoc] using hint) (by simp [hf'])
 
-private def isInputOtherBytes : List UInt8 → Bool
-  | b0 :: rest =>
-    isInterOtherBytes (b0 :: rest) ||
-    match b0.toNat with
-    | 97  => rest == []
-    | 98  => rest == [117, 116, 116, 111, 110]
-    | 100 => rest == [101, 116, 97, 105, 108, 115]
-    | 115 => rest == [117, 109, 109, 97, 114, 121]
-    | _   => false
-  | [] => false
+private def checkInputLikeBytes (bs : List UInt8) : Bool :=
+  checkInterBytes bs &&
+  bs != [97] && bs != [98, 117, 116, 116, 111, 110] &&
+  bs != [100, 101, 116, 97, 105, 108, 115] && bs != [115, 117, 109, 109, 97, 114, 121]
 
-private theorem inputOther_false (t : String)
-    (h : isInputOtherBytes t.toByteArray.data.toList = false) :
-    (t == "svg" || t == "style" || t == "textarea" || t == "select" ||
-     t == "ul" || t == "ol" || t == "dl" || t == "table" ||
-     t == "p" || t == "a" || t == "button" || t == "details" ||
-     t == "summary" || t == "form") = false := by
-  cases hv : (t == "svg" || t == "style" || t == "textarea" || t == "select" ||
-              t == "ul" || t == "ol" || t == "dl" || t == "table" ||
-              t == "p" || t == "a" || t == "button" || t == "details" ||
-              t == "summary" || t == "form") with
-  | false => rfl
-  | true =>
-      exfalso
-      simp only [Bool.or_eq_true, beq_iff_eq, or_assoc] at hv
-      rcases hv with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
-      all_goals exact Bool.noConfusion h
-
-private theorem mk_inputLike (tag : String)
-    (h : (!tag.toByteArray.data.toList.isEmpty && tag.toByteArray.data.toList.all isLowerTagByte &&
-          !isForbiddenBytes tag.toByteArray.data.toList && !isContextOnlyBytes tag.toByteArray.data.toList &&
-          !closesPBytes tag.toByteArray.data.toList && !isHeadingBytes tag.toByteArray.data.toList &&
-          !isInputOtherBytes tag.toByteArray.data.toList) = true)
+private theorem mk_inputLike (tag : String) (h : checkInputLikeBytes tag.toByteArray.data.toList = true)
     (inP inForm : Bool) :
     stepHtmlCtx { mode := .normal, inP, interactive := false, inForm } tag =
       some { mode := .normal, inP, interactive := false, inForm } := by
+  unfold checkInputLikeBytes checkInterBytes checkNormalBaseBytes at h
   simp only [Bool.and_eq_true, Bool.not_eq_true'] at h
-  rcases h with ⟨⟨⟨⟨⟨⟨hnon, hall⟩, hforb⟩, hctx⟩, hcp⟩, hhead⟩, hoth⟩
-  have hs := (lowerBytes_core tag (by simpa using hnon) hall).1
-  have hf := isForbidden_false_of_bytes tag hforb
-  have hc := isContextOnly_false_of_bytes tag hctx
-  have hcp' := closesP_false_of_bytes tag hcp
-  have hh := isHeading_false_of_bytes tag hhead
-  have ho := inputOther_false tag hoth
-  simp only [Bool.or_eq_false_iff] at ho
-  rcases ho with ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨h1, h2⟩, h3⟩, h4⟩, h5⟩, h6⟩, h7⟩, h8⟩, h9⟩, h10⟩, h11⟩, h12⟩, h13⟩, h14⟩
-  simp only [stepHtmlCtx, hs, hf, hc, hcp', hh, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14,
-    Bool.not_true, Bool.or_false, Bool.false_and, Bool.and_false,
-    Bool.false_eq_true, ↓reduceIte]
+  rcases h with ⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨⟨hnon, hall⟩, hforb⟩, hctx⟩, hmc⟩, hcp⟩, hhead⟩, hp⟩, hfrm⟩, ha⟩, hbtn⟩, hdet⟩, hsum⟩
+  have hf' : (tag == "form") = false := bne_bytes_false hfrm
+  exact mk_normalSameMode tag inP false inForm inP false inForm
+    (by simpa using hnon) hall hforb hctx hmc
+    (by simp [closesP_false_of_bytes tag hcp]) rfl (by simp [hf'])
+    (by simp [bne_bytes_false hp (b := "p"), isHeading_false_of_bytes tag hhead])
+    (by simp [bne_bytes_false ha (b := "a"), bne_bytes_false hbtn (b := "button"),
+              bne_bytes_false hdet (b := "details"), bne_bytes_false hsum (b := "summary")])
+    (by simp [hf'])
 
 private theorem mk_normalModeChange (tag : String) (m2 : TagMode)
     (h : (!tag.toByteArray.data.toList.isEmpty && tag.toByteArray.data.toList.all isLowerTagByte &&
@@ -765,21 +666,12 @@ private theorem mk_normalModeChange (tag : String) (m2 : TagMode)
   have hf := isForbidden_false_of_bytes tag hforb
   have hc := isContextOnly_false_of_bytes tag hctx
   have hi := isInteractive_false_of_bytes tag hinter
-  have hi' := hi
-  simp only [isInteractiveTag, Bool.or_eq_false_iff] at hi'
+  have hi' := hi; simp only [isInteractiveTag, Bool.or_eq_false_iff] at hi'
   rcases hi' with ⟨⟨⟨⟨⟨⟨_, _⟩, _⟩, hsel⟩, hta⟩, _⟩, _⟩
   simp only [stepHtmlCtx, hs, hf, hc, hi, hsel, hta, hsvg, hsty, hlab, hfrm,
     Bool.not_true, Bool.or_false, Bool.false_and, Bool.and_false,
     Bool.false_eq_true, ↓reduceIte]
-  by_cases h1 : (tag == "ul" || tag == "ol") = true
-  · rw [if_pos h1] at hstep ⊢; cases hstep; rfl
-  · rw [if_neg h1] at hstep ⊢
-    by_cases h2 : (tag == "dl") = true
-    · rw [if_pos h2] at hstep ⊢; cases hstep; rfl
-    · rw [if_neg h2] at hstep ⊢
-      by_cases h3 : (tag == "table") = true
-      · rw [if_pos h3] at hstep ⊢; cases hstep; rfl
-      · rw [if_neg h3] at hstep; cases hstep
+  repeat (first | (cases hstep; done) | (split at hstep <;> simp only [*, ↓reduceIte] <;> try (cases hstep; rfl)))
 
 private theorem mk_interModeChange (tag : String) (m2 : TagMode)
     (h : (!tag.toByteArray.data.toList.isEmpty && tag.toByteArray.data.toList.all isLowerTagByte &&
@@ -801,12 +693,7 @@ private theorem mk_interModeChange (tag : String) (m2 : TagMode)
   simp only [stepHtmlCtx, hs, hf, hc, hcp', hsvg, hsty, hfrm,
     Bool.not_true, Bool.or_false, Bool.false_and, Bool.and_false,
     Bool.false_eq_true, ↓reduceIte]
-  by_cases h1 : (tag == "textarea") = true
-  · rw [if_pos h1] at hstep ⊢; cases hstep; rfl
-  · rw [if_neg h1] at hstep ⊢
-    by_cases h2 : (tag == "select") = true
-    · rw [if_pos h2] at hstep ⊢; cases hstep; rfl
-    · rw [if_neg h2] at hstep; cases hstep
+  repeat (first | (cases hstep; done) | (split at hstep <;> simp only [*, ↓reduceIte] <;> try (cases hstep; rfl)))
 
 private theorem mk_modeStep (m1 m2 : TagMode) (tag : String)
     (hs : isSafeTagName tag = true) (hf : isForbiddenTag tag = false)
@@ -824,93 +711,30 @@ private theorem mk_modeStep (m1 m2 : TagMode) (tag : String)
       some { mode := m2, inP := false, interactive := i, inForm := f } := by
   cases m1 <;>
     simp only [stepHtmlCtx, hs, hf, Bool.not_true, Bool.or_false, Bool.false_eq_true, ↓reduceIte] at hstep ⊢ <;>
-    try cases hstep
-  · by_cases h : (tag == "li") = true
-    · rw [if_pos h] at hstep ⊢; cases hstep; rfl
-    · rw [if_neg h] at hstep; cases hstep
-  · by_cases h1 : (tag == "caption") = true
-    · rw [if_pos h1] at hstep ⊢; cases hstep; rfl
-    · rw [if_neg h1] at hstep ⊢
-      by_cases h2 : (tag == "colgroup") = true
-      · rw [if_pos h2] at hstep ⊢; cases hstep; rfl
-      · rw [if_neg h2] at hstep ⊢
-        by_cases h3 : (tag == "thead" || tag == "tbody" || tag == "tfoot") = true
-        · rw [if_pos h3] at hstep ⊢; cases hstep; rfl
-        · rw [if_neg h3] at hstep; cases hstep
-  · by_cases h : (tag == "tr") = true
-    · rw [if_pos h] at hstep ⊢; cases hstep; rfl
-    · rw [if_neg h] at hstep; cases hstep
-  · by_cases h : (tag == "td" || tag == "th") = true
-    · rw [if_pos h] at hstep ⊢; cases hstep; rfl
-    · rw [if_neg h] at hstep; cases hstep
+    repeat (first | (cases hstep; done) | (split at hstep <;> simp only [*, ↓reduceIte] <;> try (cases hstep; rfl)))
 
-theorem step_div (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "div" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "div" rfl i f
-theorem step_section (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "section" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "section" rfl i f
-theorem step_article (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "article" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "article" rfl i f
-theorem step_aside (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "aside" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "aside" rfl i f
-theorem step_header (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "header" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "header" rfl i f
-theorem step_footer (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "footer" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "footer" rfl i f
-theorem step_main (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "main" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "main" rfl i f
-theorem step_nav (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "nav" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "nav" rfl i f
-theorem step_blockquote (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "blockquote" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "blockquote" rfl i f
-theorem step_pre (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "pre" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "pre" rfl i f
-theorem step_fieldset (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "fieldset" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "fieldset" rfl i f
-theorem step_figure (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "figure" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "figure" rfl i f
-theorem step_figcaption (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "figcaption" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "figcaption" rfl i f
-theorem step_hr (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "hr" = some { mode := .normal, inP := false, interactive := i, inForm := f } := mk_plainBlock "hr" rfl i f
+genValidTable block stepPlainBlockEntries [
+  "div", "section", "article", "aside", "header", "footer", "main", "nav",
+  "blockquote", "pre", "fieldset", "figure", "figcaption", "hr"]
 
-theorem step_span (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "span" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "span" rfl p i f
-theorem step_strong (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "strong" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "strong" rfl p i f
-theorem step_em (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "em" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "em" rfl p i f
-theorem step_code (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "code" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "code" rfl p i f
-theorem step_small (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "small" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "small" rfl p i f
-theorem step_b (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "b" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "b" rfl p i f
-theorem step_i (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "i" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "i" rfl p i f
-theorem step_u (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "u" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "u" rfl p i f
-theorem step_s (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "s" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "s" rfl p i f
-theorem step_mark (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "mark" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "mark" rfl p i f
-theorem step_time (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "time" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "time" rfl p i f
-theorem step_kbd (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "kbd" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "kbd" rfl p i f
-theorem step_img (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "img" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "img" rfl p i f
-theorem step_br (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "br" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "br" rfl p i f
-theorem step_legend (p i f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } "legend" = some { mode := .normal, inP := p, interactive := i, inForm := f } := mk_plainInline "legend" rfl p i f
+genValidTable inline stepInlineMap [
+  "span", "strong", "em", "code", "small", "b", "i", "u", "s", "mark", "time", "kbd", "img", "br", "legend"]
 
-theorem step_p (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "p" = some { mode := .normal, inP := true, interactive := i, inForm := f } := mk_heading_fast "p" rfl (by simp) i f
-theorem step_h1 (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "h1" = some { mode := .normal, inP := true, interactive := i, inForm := f } := mk_heading_fast "h1" rfl (by simp [isHeadingTag]) i f
-theorem step_h2 (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "h2" = some { mode := .normal, inP := true, interactive := i, inForm := f } := mk_heading_fast "h2" rfl (by simp [isHeadingTag]) i f
-theorem step_h3 (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "h3" = some { mode := .normal, inP := true, interactive := i, inForm := f } := mk_heading_fast "h3" rfl (by simp [isHeadingTag]) i f
-theorem step_h4 (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "h4" = some { mode := .normal, inP := true, interactive := i, inForm := f } := mk_heading_fast "h4" rfl (by simp [isHeadingTag]) i f
-theorem step_h5 (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "h5" = some { mode := .normal, inP := true, interactive := i, inForm := f } := mk_heading_fast "h5" rfl (by simp [isHeadingTag]) i f
-theorem step_h6 (i f : Bool) : stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } "h6" = some { mode := .normal, inP := true, interactive := i, inForm := f } := mk_heading_fast "h6" rfl (by simp [isHeadingTag]) i f
+genValidTable heading stepHeadingEntries ["p", "h1", "h2", "h3", "h4", "h5", "h6"]
 
-theorem step_button (p f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := false, inForm := f } "button" = some { mode := .normal, inP := p, interactive := true, inForm := f } := mk_interactive "button" rfl (by simp) p f
-theorem step_a (p f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := false, inForm := f } "a" = some { mode := .normal, inP := p, interactive := true, inForm := f } := mk_interactive "a" rfl (by simp) p f
-theorem step_summary (p f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := false, inForm := f } "summary" = some { mode := .normal, inP := p, interactive := true, inForm := f } := mk_interactive "summary" rfl (by simp) p f
+genValidTable inter stepInterEntries ["button", "a", "summary"]
 
-theorem step_input (p f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := false, inForm := f } "input" = some { mode := .normal, inP := p, interactive := false, inForm := f } := mk_inputLike "input" rfl p f
-theorem step_label (p f : Bool) : stepHtmlCtx { mode := .normal, inP := p, interactive := false, inForm := f } "label" = some { mode := .normal, inP := p, interactive := false, inForm := f } := mk_inputLike "label" rfl p f
+genValidTable input stepInputEntries ["input", "label"]
 
 theorem step_form :
     stepHtmlCtx { mode := .normal, inP := false, interactive := false, inForm := false } "form" =
       some { mode := .normal, inP := false, interactive := false, inForm := true } := by
-  have hs := isSafe_of_lower "form" rfl
-  have hf := isForbidden_false_of_bytes "form" rfl
-  have hc := isContextOnly_false_of_bytes "form" rfl
-  have hh := isHeading_false_of_bytes "form" rfl
   have hi := isInteractive_false_of_bytes "form" rfl
   simp only [isInteractiveTag, Bool.or_eq_false_iff] at hi
-  rcases hi with ⟨⟨⟨⟨⟨⟨ha, hbtn⟩, _⟩, hsel⟩, hta⟩, hdet⟩, hsum⟩
-  have hsvg : ("form" == "svg") = false := beq_false_of_bytes rfl
-  have hsty : ("form" == "style") = false := beq_false_of_bytes rfl
-  have hul  : ("form" == "ul") = false := beq_false_of_bytes rfl
-  have hol  : ("form" == "ol") = false := beq_false_of_bytes rfl
-  have hdl  : ("form" == "dl") = false := beq_false_of_bytes rfl
-  have htbl : ("form" == "table") = false := beq_false_of_bytes rfl
-  have hp   : ("form" == "p") = false := beq_false_of_bytes rfl
-  simp only [stepHtmlCtx, hs, hf, hc, hh, ha, hbtn, hsel, hta, hdet, hsum,
-    hsvg, hsty, hul, hol, hdl, htbl, hp, beq_self_eq_true,
-    Bool.not_true, Bool.or_false, Bool.false_or, Bool.false_and,
-    Bool.false_eq_true, ↓reduceIte]
+  rcases hi with ⟨⟨⟨⟨⟨⟨ha, hbtn⟩, _⟩, _⟩, _⟩, hdet⟩, hsum⟩
+  exact mk_normalSameMode "form" false false false false false true rfl rfl rfl rfl rfl rfl rfl rfl
+    (by simp [beq_false_of_bytes (a := "form") (b := "p") rfl, isHeading_false_of_bytes "form" rfl])
+    (by simp [ha, hbtn, hdet, hsum]) (by simp)
 
 theorem step_textarea (inP inForm : Bool) :
     stepHtmlCtx { mode := .normal, inP, interactive := false, inForm } "textarea" =
@@ -967,108 +791,20 @@ theorem step_option (inP interactive inForm : Bool) :
   have h2 := isForbidden_false_of_bytes "option" rfl
   simp only [stepHtmlCtx, h1, h2, Bool.not_true, Bool.or_false, Bool.false_eq_true, ↓reduceIte, beq_self_eq_true]
 
-theorem nv_div : isVoidTag "div" = false := mk_nv "div" rfl
-theorem nv_span : isVoidTag "span" = false := mk_nv "span" rfl
-theorem nv_p : isVoidTag "p" = false := mk_nv "p" rfl
-theorem nv_a : isVoidTag "a" = false := mk_nv "a" rfl
-theorem nv_button : isVoidTag "button" = false := mk_nv "button" rfl
-theorem nv_form : isVoidTag "form" = false := mk_nv "form" rfl
-theorem nv_label : isVoidTag "label" = false := mk_nv "label" rfl
-theorem nv_ul : isVoidTag "ul" = false := mk_nv "ul" rfl
-theorem nv_ol : isVoidTag "ol" = false := mk_nv "ol" rfl
-theorem nv_li : isVoidTag "li" = false := mk_nv "li" rfl
-theorem nv_h1 : isVoidTag "h1" = false := mk_nv "h1" rfl
-theorem nv_h2 : isVoidTag "h2" = false := mk_nv "h2" rfl
-theorem nv_h3 : isVoidTag "h3" = false := mk_nv "h3" rfl
-theorem nv_h4 : isVoidTag "h4" = false := mk_nv "h4" rfl
-theorem nv_h5 : isVoidTag "h5" = false := mk_nv "h5" rfl
-theorem nv_h6 : isVoidTag "h6" = false := mk_nv "h6" rfl
-theorem nv_section : isVoidTag "section" = false := mk_nv "section" rfl
-theorem nv_article : isVoidTag "article" = false := mk_nv "article" rfl
-theorem nv_aside : isVoidTag "aside" = false := mk_nv "aside" rfl
-theorem nv_header : isVoidTag "header" = false := mk_nv "header" rfl
-theorem nv_footer : isVoidTag "footer" = false := mk_nv "footer" rfl
-theorem nv_main : isVoidTag "main" = false := mk_nv "main" rfl
-theorem nv_nav : isVoidTag "nav" = false := mk_nv "nav" rfl
-theorem nv_blockquote : isVoidTag "blockquote" = false := mk_nv "blockquote" rfl
-theorem nv_pre : isVoidTag "pre" = false := mk_nv "pre" rfl
-theorem nv_code : isVoidTag "code" = false := mk_nv "code" rfl
-theorem nv_strong : isVoidTag "strong" = false := mk_nv "strong" rfl
-theorem nv_em : isVoidTag "em" = false := mk_nv "em" rfl
-theorem nv_small : isVoidTag "small" = false := mk_nv "small" rfl
-theorem nv_b : isVoidTag "b" = false := mk_nv "b" rfl
-theorem nv_i : isVoidTag "i" = false := mk_nv "i" rfl
-theorem nv_u : isVoidTag "u" = false := mk_nv "u" rfl
-theorem nv_s : isVoidTag "s" = false := mk_nv "s" rfl
-theorem nv_mark : isVoidTag "mark" = false := mk_nv "mark" rfl
-theorem nv_time : isVoidTag "time" = false := mk_nv "time" rfl
-theorem nv_kbd : isVoidTag "kbd" = false := mk_nv "kbd" rfl
-theorem nv_table : isVoidTag "table" = false := mk_nv "table" rfl
-theorem nv_thead : isVoidTag "thead" = false := mk_nv "thead" rfl
-theorem nv_tbody : isVoidTag "tbody" = false := mk_nv "tbody" rfl
-theorem nv_tr : isVoidTag "tr" = false := mk_nv "tr" rfl
-theorem nv_td : isVoidTag "td" = false := mk_nv "td" rfl
-theorem nv_th : isVoidTag "th" = false := mk_nv "th" rfl
-theorem nv_select : isVoidTag "select" = false := mk_nv "select" rfl
-theorem nv_option : isVoidTag "option" = false := mk_nv "option" rfl
-theorem nv_textarea : isVoidTag "textarea" = false := mk_nv "textarea" rfl
-theorem nv_fieldset : isVoidTag "fieldset" = false := mk_nv "fieldset" rfl
-theorem nv_legend : isVoidTag "legend" = false := mk_nv "legend" rfl
-theorem nv_figure : isVoidTag "figure" = false := mk_nv "figure" rfl
-theorem nv_figcaption : isVoidTag "figcaption" = false := mk_nv "figcaption" rfl
-theorem nv_summary : isVoidTag "summary" = false := mk_nv "summary" rfl
+genValidTable nv nonVoidTagMap [
+  "div", "span", "p", "a", "button", "form", "label", "ul", "ol", "li",
+  "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "aside", "header", "footer", "main", "nav",
+  "blockquote", "pre", "code", "strong", "em", "small", "b", "i", "u", "s", "mark", "time", "kbd",
+  "table", "thead", "tbody", "tr", "td", "th", "select", "option", "textarea", "fieldset", "legend",
+  "figure", "figcaption", "summary"]
 
 open Lean
 
-private def mkStrMap (entries : Array (String × Name)) : Std.HashMap String Name :=
-  entries.foldl (fun m (k, v) => m.insert k v) {}
+private def stepBlockMap : Std.HashMap String Name :=
+  mkStrMap (stepPlainBlockEntries ++ stepHeadingEntries ++ #[("ul", ``step_ul), ("ol", ``step_ol), ("table", ``step_table)])
 
-def safeNonUrlAttrMap : Std.HashMap String Name := mkStrMap #[
-  ("data-role", ``snu_dataRole), ("data-qed-link", ``snu_dataQedLink), ("value", ``snu_value),
-  ("placeholder", ``snu_placeholder), ("name", ``snu_name), ("alt", ``snu_alt), ("title", ``snu_title),
-  ("style", ``snu_style), ("type", ``snu_type), ("class", ``snu_class), ("id", ``snu_id), ("for", ``snu_for),
-  ("role", ``snu_role), ("aria-label", ``snu_ariaLabel), ("aria-invalid", ``snu_ariaInvalid),
-  ("aria-live", ``snu_ariaLive), ("rows", ``snu_rows), ("cols", ``snu_cols), ("min", ``snu_min),
-  ("max", ``snu_max), ("step", ``snu_step), ("tabindex", ``snu_tabindex), ("target", ``snu_target),
-  ("rel", ``snu_rel), ("accept", ``snu_accept), ("autocomplete", ``snu_autocomplete)]
-
-def safeAttrMap : Std.HashMap String Name := mkStrMap #[
-  ("click", ``sa_click), ("input", ``sa_input), ("change", ``sa_change), ("keydown", ``sa_keydown),
-  ("keyup", ``sa_keyup), ("submit", ``sa_submit), ("blur", ``sa_blur), ("focus", ``sa_focus),
-  ("dblclick", ``sa_dblclick), ("mousedown", ``sa_mousedown), ("mouseup", ``sa_mouseup),
-  ("disabled", ``sa_disabled), ("required", ``sa_required), ("checked", ``sa_checked),
-  ("readonly", ``sa_readonly), ("selected", ``sa_selected), ("multiple", ``sa_multiple), ("hidden", ``sa_hidden)]
-
-def nonVoidTagMap : Std.HashMap String Name := mkStrMap #[
-  ("div", ``nv_div), ("span", ``nv_span), ("p", ``nv_p), ("a", ``nv_a), ("button", ``nv_button),
-  ("form", ``nv_form), ("label", ``nv_label), ("ul", ``nv_ul), ("ol", ``nv_ol), ("li", ``nv_li),
-  ("h1", ``nv_h1), ("h2", ``nv_h2), ("h3", ``nv_h3), ("h4", ``nv_h4), ("h5", ``nv_h5), ("h6", ``nv_h6),
-  ("section", ``nv_section), ("article", ``nv_article), ("aside", ``nv_aside), ("header", ``nv_header),
-  ("footer", ``nv_footer), ("main", ``nv_main), ("nav", ``nv_nav), ("blockquote", ``nv_blockquote),
-  ("pre", ``nv_pre), ("code", ``nv_code), ("strong", ``nv_strong), ("em", ``nv_em), ("small", ``nv_small),
-  ("b", ``nv_b), ("i", ``nv_i), ("u", ``nv_u), ("s", ``nv_s), ("mark", ``nv_mark), ("time", ``nv_time),
-  ("kbd", ``nv_kbd), ("table", ``nv_table), ("thead", ``nv_thead), ("tbody", ``nv_tbody), ("tr", ``nv_tr),
-  ("td", ``nv_td), ("th", ``nv_th), ("select", ``nv_select), ("option", ``nv_option), ("textarea", ``nv_textarea),
-  ("fieldset", ``nv_fieldset), ("legend", ``nv_legend), ("figure", ``nv_figure), ("figcaption", ``nv_figcaption),
-  ("summary", ``nv_summary)]
-
-private def stepBlockMap : Std.HashMap String Name := mkStrMap #[
-  ("div", ``step_div), ("section", ``step_section), ("article", ``step_article), ("aside", ``step_aside),
-  ("header", ``step_header), ("footer", ``step_footer), ("main", ``step_main), ("nav", ``step_nav),
-  ("blockquote", ``step_blockquote), ("pre", ``step_pre), ("fieldset", ``step_fieldset),
-  ("figure", ``step_figure), ("figcaption", ``step_figcaption), ("hr", ``step_hr),
-  ("p", ``step_p), ("h1", ``step_h1), ("h2", ``step_h2), ("h3", ``step_h3), ("h4", ``step_h4),
-  ("h5", ``step_h5), ("h6", ``step_h6), ("ul", ``step_ul), ("ol", ``step_ol), ("table", ``step_table)]
-
-private def stepInlineMap : Std.HashMap String Name := mkStrMap #[
-  ("span", ``step_span), ("strong", ``step_strong), ("em", ``step_em), ("code", ``step_code),
-  ("small", ``step_small), ("b", ``step_b), ("i", ``step_i), ("u", ``step_u), ("s", ``step_s),
-  ("mark", ``step_mark), ("time", ``step_time), ("kbd", ``step_kbd), ("img", ``step_img),
-  ("br", ``step_br), ("legend", ``step_legend)]
-
-private def stepNonInterMap : Std.HashMap String Name := mkStrMap #[
-  ("button", ``step_button), ("a", ``step_a), ("summary", ``step_summary),
-  ("input", ``step_input), ("label", ``step_label), ("textarea", ``step_textarea), ("select", ``step_select)]
+private def stepNonInterMap : Std.HashMap String Name :=
+  mkStrMap (stepInterEntries ++ stepInputEntries ++ #[("textarea", ``step_textarea), ("select", ``step_select)])
 
 def proveStepHtmlCtx (ctxV : HtmlCtx) (tagS : String) (childCtxE : Expr) : Expr :=
   let bP := toExpr ctxV.inP
@@ -1079,18 +815,8 @@ def proveStepHtmlCtx (ctxV : HtmlCtx) (tagS : String) (childCtxE : Expr) : Expr 
       if !ctxV.inP then
         if let some lm := stepBlockMap[tagS]? then mkApp2 (mkConst lm) bI bF
         else if !ctxV.interactive && !ctxV.inForm && tagS == "form" then mkConst ``step_form
-        else if !ctxV.interactive then
-          if let some lm := stepNonInterMap[tagS]? then mkApp2 (mkConst lm) bP bF
-          else if let some lm := stepInlineMap[tagS]? then mkApp3 (mkConst lm) bP bI bF
-          else rflStep childCtxE
-        else if let some lm := stepInlineMap[tagS]? then mkApp3 (mkConst lm) bP bI bF
-        else rflStep childCtxE
-      else if !ctxV.interactive then
-        if let some lm := stepNonInterMap[tagS]? then mkApp2 (mkConst lm) bP bF
-        else if let some lm := stepInlineMap[tagS]? then mkApp3 (mkConst lm) bP bI bF
-        else rflStep childCtxE
-      else if let some lm := stepInlineMap[tagS]? then mkApp3 (mkConst lm) bP bI bF
-      else rflStep childCtxE
+        else normalInlineOrInter bP bI bF
+      else normalInlineOrInter bP bI bF
   | .ulOl         => if tagS == "li"     then mkApp3 (mkConst ``step_li) bP bI bF     else rflStep childCtxE
   | .table        => if tagS == "thead"  then mkApp3 (mkConst ``step_thead) bP bI bF
                      else if tagS == "tbody" then mkApp3 (mkConst ``step_tbody) bP bI bF else rflStep childCtxE
@@ -1100,12 +826,16 @@ def proveStepHtmlCtx (ctxV : HtmlCtx) (tagS : String) (childCtxE : Expr) : Expr 
   | .select       => if tagS == "option" then mkApp3 (mkConst ``step_option) bP bI bF else rflStep childCtxE
   | _             => rflStep childCtxE
 where
+  normalInlineOrInter (bP bI bF : Expr) : Expr :=
+    if let some lm := if !ctxV.interactive then stepNonInterMap[tagS]? else none then mkApp2 (mkConst lm) bP bF
+    else if let some lm := stepInlineMap[tagS]? then mkApp3 (mkConst lm) bP bI bF
+    else rflStep childCtxE
   rflStep (childCtxE : Expr) : Expr :=
     mkApp2 (mkConst ``Eq.refl [Level.one])
       (mkApp (mkConst ``Option [Level.zero]) (mkConst ``HtmlCtx))
       (mkApp2 (mkConst ``Option.some [Level.zero]) (mkConst ``HtmlCtx) childCtxE)
 
-private def qedAttrWrapperMap : Std.HashMap Name (Name × String × Name) :=
+def qedAttrWrapperMap : Std.HashMap Name (Name × String × Name) :=
   #[
     (``Qed.role,          (``attr_nonUrl,  "data-role",   ``snu_dataRole)),
     (``Qed.placeholder,   (``attr_nonUrl,  "placeholder", ``snu_placeholder)),

@@ -92,6 +92,15 @@ private def relevantAppLemmas (env : Environment) (cs : Std.HashSet Name) : Arra
     r := r ++ (#[`Qed.Cached.activate, `Qed.Cached.all_empty].filter env.contains)
   return r
 
+def dictSimpNames : Array Name := #[
+  `Qed.Dict.emptyCollection_eq_empty, `Qed.Dict.getElem_eq_get,
+  `Qed.Lang.QedMem.mem_dict, `Qed.Lang.QedMemProp.memProp_dict,
+  `Qed.Dict.get_empty, `Qed.Dict.contains_empty, `Qed.Dict.size_empty, `Qed.Dict.isEmpty_empty,
+  `Qed.Dict.get_set, `Qed.Dict.get_set_self, `Qed.Dict.contains_set, `Qed.Dict.contains_set_self,
+  `Qed.Dict.get_remove, `Qed.Dict.get_remove_self, `Qed.Dict.contains_remove, `Qed.Dict.contains_remove_self,
+  `Qed.Dict.size_set, `Qed.Dict.isEmpty_iff_size
+]
+
 private def relevantOptResLemmas (env : Environment) (cs : Std.HashSet Name) : Array Name := Id.run do
   let mut r : Array Name := #[]
   if cs.contains `Qed.Cached.all || cs.contains `Qed.Resource.all then
@@ -104,12 +113,7 @@ private def relevantOptResLemmas (env : Environment) (cs : Std.HashSet Name) : A
                  `Qed.Codec.int, `Qed.Codec.checkbox, `Qed.Codec.date].filter env.contains)
   if cs.contains `Qed.Dict || cs.contains `Qed.Dict.size || cs.contains `Qed.Dict.get ||
      cs.contains `Qed.Dict.set || cs.contains `Qed.Dict.remove || cs.contains `Qed.Dict.contains then
-    r := r ++ (#[`Qed.Dict.emptyCollection_eq_empty, `Qed.Dict.getElem_eq_get,
-                 `Qed.Lang.QedMem.mem_dict, `Qed.Lang.QedMemProp.memProp_dict,
-                 `Qed.Dict.get_empty, `Qed.Dict.contains_empty, `Qed.Dict.size_empty, `Qed.Dict.isEmpty_empty,
-                 `Qed.Dict.get_set, `Qed.Dict.get_set_self, `Qed.Dict.contains_set, `Qed.Dict.contains_set_self,
-                 `Qed.Dict.get_remove, `Qed.Dict.get_remove_self, `Qed.Dict.contains_remove, `Qed.Dict.contains_remove_self,
-                 `Qed.Dict.size_set, `Qed.Dict.isEmpty_iff_size].filter env.contains)
+    r := r ++ dictSimpNames.filter env.contains
   return r
 
 private def stripStepPrefix : Name → Name
@@ -426,25 +430,16 @@ elab_rules : tactic
       m!"Hint: Guard the failing branch with `if ...:`, fix the update, or weaken the invariant.\n      If the rule does hold, add `using [lemma]` or a manual `:= by` proof."
 
 macro_rules
-  | `(qedInternalInvariant $name:ident : $pred from $init preserved_by $upd:ident using [$_ls,*] := $pf:term) =>
-    `(theorem $name:ident : ($pred) ($init) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
-  | `(qedInternalInvariant $name:ident : $pred from $init preserved_by $upd:ident := $pf:term) =>
-    `(theorem $name:ident : ($pred) ($init) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
-  | `(qedInternalInvariant $name:ident : $pred from $init preserved_by $upd:ident using [$ls,*]) =>
-    `(theorem $name:ident : ($pred) ($init) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
-        qedDischargePreserved [$ls,*] $upd $name ($pred) from $init)
-  | `(qedInternalInvariant $name:ident : $pred from $init preserved_by $upd:ident) =>
-    `(theorem $name:ident : ($pred) ($init) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
-        qedDischargePreserved [] $upd $name ($pred) from $init)
-  | `(qedInternalInvariant $name:ident : $pred preserved_by $upd:ident using [$_ls,*] := $pf:term) =>
-    `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
-  | `(qedInternalInvariant $name:ident : $pred preserved_by $upd:ident := $pf:term) =>
-    `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := $pf)
-  | `(qedInternalInvariant $name:ident : $pred preserved_by $upd:ident using [$ls,*]) =>
-    `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
-        qedDischargePreserved [$ls,*] $upd $name ($pred))
-  | `(qedInternalInvariant $name:ident : $pred preserved_by $upd:ident) =>
-    `(theorem $name:ident : ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)) := by
-        qedDischargePreserved [] $upd $name ($pred))
+  | `(qedInternalInvariant $name:ident : $pred $[from $init]? preserved_by $upd:ident $[using [$ls,*]]? $[:= $pf:term]?) => do
+      let prop ← match init with
+        | some i => `(($pred) ($i) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)))
+        | none   => `(∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)))
+      match pf with
+      | some p => `(theorem $name:ident : $prop := $p)
+      | none   =>
+          let lems := ls.getD ⟨#[]⟩
+          match init with
+          | some i => `(theorem $name:ident : $prop := by qedDischargePreserved [$lems,*] $upd $name ($pred) from $i)
+          | none   => `(theorem $name:ident : $prop := by qedDischargePreserved [$lems,*] $upd $name ($pred))
 
 end Qed

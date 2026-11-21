@@ -19,86 +19,61 @@ private def extractForEachColl? (tgt : Expr) : Option Expr :=
       else none
   | _ => none
 
-private def stripHeadLets : Nat → Expr → Expr
-  | 0, e => e.consumeMData.headBeta
-  | n + 1, e =>
-      let e := e.consumeMData.headBeta
-      match e with
-      | .letE _ _ val body _ => stripHeadLets n (body.instantiate1 val)
-      | _ => e
+private def forEachDirectTable : Array (Name × Name) := #[
+  (``Array.filter, ``Qed.ForEach.forall_filter),
+  (``Array.sortBy, ``Qed.ForEach.forall_sortBy),
+  (``Array.pop, ``Qed.ForEach.forall_pop),
+  (``Array.reverse, ``Qed.ForEach.forall_reverse),
+  (``Array.extract, ``Qed.ForEach.forall_extract),
+  (``Array.eraseIdx, ``Qed.ForEach.forall_eraseIdx),
+  (``Array.eraseIdxIfInBounds, ``Qed.ForEach.forall_eraseIdxIfInBounds),
+  (``Array.swap, ``Qed.ForEach.forall_swap),
+  (``Array.swapIfInBounds, ``Qed.ForEach.forall_swapIfInBounds)
+]
 
-private def forEachDirectLemma? : Name → Option Name
-  | ``Array.filter           => some ``Qed.ForEach.forall_filter
-  | ``Array.sortBy           => some ``Qed.ForEach.forall_sortBy
-  | ``Array.pop              => some ``Qed.ForEach.forall_pop
-  | ``Array.reverse          => some ``Qed.ForEach.forall_reverse
-  | ``Array.extract          => some ``Qed.ForEach.forall_extract
-  | ``Array.eraseIdx         => some ``Qed.ForEach.forall_eraseIdx
-  | ``Array.eraseIdxIfInBounds => some ``Qed.ForEach.forall_eraseIdxIfInBounds
-  | ``Array.swap             => some ``Qed.ForEach.forall_swap
-  | ``Array.swapIfInBounds   => some ``Qed.ForEach.forall_swapIfInBounds
-  | _                        => none
-
-private def forEachElemLemma? : Name → Option Name
-  | ``Array.push          => some ``Qed.ForEach.forall_push
-  | ``Array.set           => some ``Qed.ForEach.forall_set
-  | ``Array.setIfInBounds => some ``Qed.ForEach.forall_setIfInBounds
-  | ``HAppend.hAppend
-  | ``Array.append        => some ``Qed.ForEach.forall_append
-  | _                     => none
+private def forEachElemTable : Array (Name × Name) := #[
+  (``Array.push, ``Qed.ForEach.forall_push),
+  (``Array.set, ``Qed.ForEach.forall_set),
+  (``Array.setIfInBounds, ``Qed.ForEach.forall_setIfInBounds),
+  (``HAppend.hAppend, ``Qed.ForEach.forall_append),
+  (``Array.append, ``Qed.ForEach.forall_append)
+]
 
 private def runForEachArm (childInv : Ident) (pred : Term)
     (elemClose mapClose : TSyntax `tactic) : TacticM Unit := do
+  let _ := pred
   let h := mkIdent `h; let y := mkIdent `y; let hy := mkIdent `hy; let hP := mkIdent `hP
+  let mkDirect (lem : Name) := `(tactic| exact $(mkIdent lem):ident $h)
+  let mkElem (lem : Name) := `(tactic| (refine $(mkIdent lem):ident $h ?_ <;> ($elemClose:tactic)))
+  let mapTac ← `(tactic| (refine Qed.ForEach.forall_map ?_ <;> intro $y $hy <;> have $hP:ident := $h $y $hy <;> ($mapClose:tactic)))
+  let modTac ← `(tactic| (refine Qed.ForEach.forall_modify $h ?_ <;> intro $y $hy $hP <;> ($mapClose:tactic)))
+  let ukTac1 ← `(tactic| exact Qed.ForEach.updateKeyed_forall _ _ $childInv $h)
+  let ukTac2 ← `(tactic| exact Qed.ForEach.updateKeyed_forall _ _ ($childInv).2 $h)
+  let tryTac (tac : TSyntax `tactic) : TacticM Bool := do
+    let saved ← saveState
+    try evalTactic tac; return true
+    catch _ => restoreState saved; return false
   let fastTac? : Option (TSyntax `tactic) ← withMainContext do
     let tgt ← instantiateMVars (← getMainTarget)
     let some collRaw := extractForEachColl? tgt | return none
-    let coll := stripHeadLets 16 collRaw
+    let coll := Qed.stripLetE 16 collRaw
     let some nm := coll.getAppFn.constName? | return some (← `(tactic| exact $h))
-    if let some lem := forEachDirectLemma? nm then
-      let lemId := mkIdent lem
-      return some (← `(tactic| exact $lemId:ident $h))
-    if let some lem := forEachElemLemma? nm then
-      let lemId := mkIdent lem
-      return some (← `(tactic| (refine $lemId:ident $h ?_ <;> ($elemClose:tactic))))
-    if nm == ``Array.map then
-      return some (← `(tactic| (refine Qed.ForEach.forall_map ?_ <;> intro $y $hy <;> have $hP:ident := $h $y $hy <;> ($mapClose:tactic))))
-    if nm == ``Array.modify then
-      return some (← `(tactic| (refine Qed.ForEach.forall_modify $h ?_ <;> intro $y $hy $hP <;> ($mapClose:tactic))))
+    if let some (_, lem) := forEachDirectTable.find? (·.1 == nm) then return some (← mkDirect lem)
+    if let some (_, lem) := forEachElemTable.find? (·.1 == nm) then return some (← mkElem lem)
+    if nm == ``Array.map then return some mapTac
+    if nm == ``Array.modify then return some modTac
     if nm == ``Qed.Component.updateKeyed || nm.getString! == "updateKeyed" then
-      return some (← `(tactic| first
-        | exact Qed.ForEach.updateKeyed_forall _ _ $childInv $h
-        | exact Qed.ForEach.updateKeyed_forall _ _ ($childInv).2 $h))
+      return some (← `(tactic| first | $ukTac1:tactic | $ukTac2:tactic))
     return some (← `(tactic| exact $h))
   if let some tac := fastTac? then
-    let saved ← saveState
-    let ok ← try evalTactic tac; pure true catch _ => pure false
-    if ok then return
-    restoreState saved
-  let _ := pred
-  evalTactic (← `(tactic|
-    first
-      | exact $h
-      | exact Qed.ForEach.forall_filter $h
-      | exact Qed.ForEach.forall_sortBy $h
-      | exact Qed.ForEach.forall_pop $h
-      | exact Qed.ForEach.forall_reverse $h
-      | exact Qed.ForEach.forall_extract $h
-      | exact Qed.ForEach.forall_eraseIdx $h
-      | exact Qed.ForEach.forall_eraseIdxIfInBounds $h
-      | exact Qed.ForEach.forall_swap $h
-      | exact Qed.ForEach.forall_swapIfInBounds $h
-      | exact Qed.ForEach.updateKeyed_forall _ _ $childInv $h
-      | exact Qed.ForEach.updateKeyed_forall _ _ ($childInv).2 $h
-      | (refine Qed.ForEach.forall_map ?_ <;> intro $y $hy <;>
-          have $hP:ident := $h $y $hy <;> ($mapClose:tactic))
-      | (refine Qed.ForEach.forall_modify $h ?_ <;> intro $y $hy $hP <;> ($mapClose:tactic))
-      | (refine Qed.ForEach.forall_push $h ?_ <;> ($elemClose:tactic))
-      | (refine Qed.ForEach.forall_set $h ?_ <;> ($elemClose:tactic))
-      | (refine Qed.ForEach.forall_setIfInBounds $h ?_ <;> ($elemClose:tactic))
-      | (refine Qed.ForEach.forall_append $h ?_ <;> ($elemClose:tactic))
-      | grind
-      | skip))
+    if (← tryTac tac) then return
+  let mut fallbacks : Array (TSyntax `tactic) := #[← `(tactic| exact $h)]
+  for (_, lem) in forEachDirectTable do fallbacks := fallbacks.push (← mkDirect lem)
+  fallbacks := fallbacks ++ #[ukTac1, ukTac2, mapTac, modTac]
+  for (_, lem) in forEachElemTable.take 4 do fallbacks := fallbacks.push (← mkElem lem)
+  fallbacks := fallbacks.push (← `(tactic| grind))
+  for tac in fallbacks do
+    if (← tryTac tac) then return
 
 elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
   let predLem ← if pred.raw.isIdent

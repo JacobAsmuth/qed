@@ -18,44 +18,26 @@ def decodeChar (c : Char) : Option Nat :=
   else if n == 47 then some 63
   else none
 
-private theorem toNat_ofNat_lt_128 {k : Nat} (h : k < 128) :
-    (Char.ofNat k).toNat = k := by
-  have hv : k.isValidChar := Or.inl (by omega)
-  have h1 : Char.ofNat k = Char.ofNatAux k hv := by simp [Char.ofNat, hv]
-  rw [h1]
-  simp [Char.toNat, Char.ofNatAux]
+def isUrlChar (c : Char) : Bool :=
+  ('A' ≤ c && c ≤ 'Z') || ('a' ≤ c && c ≤ 'z') || ('0' ≤ c && c ≤ '9') || c == '-' || c == '_'
+
+def toUrlChar : Char → Char
+  | '+' => '-'
+  | '/' => '_'
+  | c   => c
+
+def fromUrlChar : Char → Char
+  | '-' => '+'
+  | '_' => '/'
+  | c   => c
+
+private theorem decodeChar_encodeChar_fin :
+    ∀ n : Fin 64, decodeChar (encodeChar n.val) = some n.val := by
+  decide
 
 theorem decodeChar_encodeChar (n : Nat) (h : n < 64) :
-    decodeChar (encodeChar n) = some n := by
-  unfold encodeChar decodeChar
-  by_cases h1 : n < 26
-  · rw [if_pos h1, toNat_ofNat_lt_128 (by omega)]
-    have hc : (decide (65 ≤ 65 + n) && decide (65 + n ≤ 90)) = true := by
-      simp only [Bool.and_eq_true, decide_eq_true_eq]; omega
-    rw [if_pos hc]; congr 1; omega
-  · rw [if_neg h1]
-    by_cases h2 : n < 52
-    · rw [if_pos h2, toNat_ofNat_lt_128 (by omega)]
-      have hc1 : (decide (65 ≤ 71 + n) && decide (71 + n ≤ 90)) = false := by
-        simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]; omega
-      have hc2 : (decide (97 ≤ 71 + n) && decide (71 + n ≤ 122)) = true := by
-        simp only [Bool.and_eq_true, decide_eq_true_eq]; omega
-      rw [if_neg (by simp [hc1]), if_pos hc2]; congr 1; omega
-    · rw [if_neg h2]
-      by_cases h3 : n < 62
-      · rw [if_pos h3, toNat_ofNat_lt_128 (by omega)]
-        have hc1 : (decide (65 ≤ n - 4) && decide (n - 4 ≤ 90)) = false := by
-          simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]; omega
-        have hc2 : (decide (97 ≤ n - 4) && decide (n - 4 ≤ 122)) = false := by
-          simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]; omega
-        have hc3 : (decide (48 ≤ n - 4) && decide (n - 4 ≤ 57)) = true := by
-          simp only [Bool.and_eq_true, decide_eq_true_eq]; omega
-        rw [if_neg (by rw [hc1]; decide), if_neg (by rw [hc2]; decide), if_pos hc3]; congr 1; omega
-      · rw [if_neg h3]
-        by_cases h4 : n = 62
-        · subst h4; rfl
-        · have h5 : n = 63 := by omega
-          subst h5; rfl
+    decodeChar (encodeChar n) = some n :=
+  decodeChar_encodeChar_fin ⟨n, h⟩
 
 theorem encodeChar_ne_pad (n : Nat) (h : n < 64) : encodeChar n ≠ '=' := by
   intro heq
@@ -63,22 +45,24 @@ theorem encodeChar_ne_pad (n : Nat) (h : n < 64) : encodeChar n ≠ '=' := by
   rw [heq] at h1
   contradiction
 
-def encodeList : List UInt8 → List Char
+def encodeListWith (f : Nat → Char) (pad : Bool) : List UInt8 → List Char
   | [] => []
   | [b0] =>
       let n0 := b0.toNat
-      [encodeChar (n0 / 4), encodeChar ((n0 % 4) * 16), '=', '=']
+      let c0 := f (n0 / 4); let c1 := f ((n0 % 4) * 16)
+      if pad then [c0, c1, '=', '='] else [c0, c1]
   | [b0, b1] =>
       let n0 := b0.toNat; let n1 := b1.toNat
-      [encodeChar (n0 / 4), encodeChar ((n0 % 4) * 16 + n1 / 16),
-       encodeChar ((n1 % 16) * 4), '=']
+      let c0 := f (n0 / 4); let c1 := f ((n0 % 4) * 16 + n1 / 16); let c2 := f ((n1 % 16) * 4)
+      if pad then [c0, c1, c2, '='] else [c0, c1, c2]
   | b0 :: b1 :: b2 :: rest =>
       let n0 := b0.toNat; let n1 := b1.toNat; let n2 := b2.toNat
-      encodeChar (n0 / 4) ::
-      encodeChar ((n0 % 4) * 16 + n1 / 16) ::
-      encodeChar ((n1 % 16) * 4 + n2 / 64) ::
-      encodeChar (n2 % 64) ::
-      encodeList rest
+      f (n0 / 4) :: f ((n0 % 4) * 16 + n1 / 16) ::
+      f ((n1 % 16) * 4 + n2 / 64) :: f (n2 % 64) ::
+      encodeListWith f pad rest
+
+def encodeList (bs : List UInt8) : List Char :=
+  encodeListWith encodeChar true bs
 
 def decodeQuad (c0 c1 c2 c3 : Char) (isLast : Bool) : Except String (List UInt8) :=
   if isLast && c2 == '=' && c3 == '=' then
@@ -116,7 +100,7 @@ theorem decodeList_encodeList : ∀ (bs : List UInt8), decodeList (encodeList bs
       have hb0 : b0.toNat < 256 := b0.toNat_lt
       have h0 := decodeChar_encodeChar (b0.toNat / 4) (by omega)
       have h1 := decodeChar_encodeChar ((b0.toNat % 4) * 16) (by omega)
-      simp only [encodeList, decodeList, decodeQuad, List.isEmpty_nil, beq_self_eq_true,
+      simp only [encodeList, encodeListWith, decodeList, decodeQuad, List.isEmpty_nil, beq_self_eq_true,
         Bool.and_self, ↓reduceIte, h0, h1, bind, Except.bind, List.append_nil]
       congr 1; congr 1
       exact uint8_ofNat_toNat_eq b0 (by omega)
@@ -128,7 +112,7 @@ theorem decodeList_encodeList : ∀ (bs : List UInt8), decodeList (encodeList bs
       have h2 := decodeChar_encodeChar ((b1.toNat % 16) * 4) (by omega)
       have hne2 : (encodeChar ((b1.toNat % 16) * 4) == '=') = false :=
         beq_false_of_ne (encodeChar_ne_pad _ (by omega))
-      simp only [encodeList, decodeList, decodeQuad, List.isEmpty_nil, hne2, beq_self_eq_true,
+      simp only [encodeList, encodeListWith, decodeList, decodeQuad, List.isEmpty_nil, hne2, beq_self_eq_true,
         Bool.true_and, Bool.false_and, Bool.false_eq_true, ↓reduceIte, h0, h1, h2,
         bind, Except.bind, List.append_nil]
       congr 1
@@ -147,8 +131,9 @@ theorem decodeList_encodeList : ∀ (bs : List UInt8), decodeList (encodeList bs
       have h3 := decodeChar_encodeChar (b2.toNat % 64) (by omega)
       have hne3 : (encodeChar (b2.toNat % 64) == '=') = false :=
         beq_false_of_ne (encodeChar_ne_pad _ (by omega))
-      have ih := decodeList_encodeList rest
-      simp only [encodeList, decodeList, decodeQuad, hne3, Bool.and_false, Bool.false_eq_true,
+      have ih : decodeList (encodeListWith encodeChar true rest) = .ok rest :=
+        decodeList_encodeList rest
+      simp only [encodeList, encodeListWith, decodeList, decodeQuad, hne3, Bool.and_false, Bool.false_eq_true,
         ↓reduceIte, h0, h1, h2, h3, ih, bind, Except.bind, List.cons_append, List.nil_append]
       congr 1
       have e0 : UInt8.ofNat (b0.toNat / 4 * 4 + ((b0.toNat % 4) * 16 + b1.toNat / 16) / 16) = b0 :=
@@ -171,43 +156,101 @@ theorem decode_encode (bs : ByteArray) : decode (encode bs) = .ok bs := by
   rw [String.toList_ofList, decodeList_encodeList]
   cases bs; rfl
 
+/-! ## Verified RFC 4648 §5 Base64URL Codec (Unpadded Encode, Padded/Unpadded Decode) -/
+
+/-- RFC 4648 §5 unpadded Base64URL encoding (`-` / `_`, no `=` padding). -/
+def encodeUrl (bs : ByteArray) : String :=
+  String.ofList (encodeListWith (fun n => toUrlChar (encodeChar n)) false bs.data.toList)
+
+/-- RFC 4648 §5 Base64URL decoding (accepts padded or unpadded input; rejects `+`/`/` and interior `=`). -/
+def decodeUrl (s : String) : Except String ByteArray :=
+  let cs := s.toList
+  let stripped := if cs.isEmpty then [] else (cs.reverse.dropWhile (· == '=')).reverse
+  if stripped.length % 4 == 1 then
+    .error "base64url: invalid length"
+  else if stripped.any (fun c => c == '+' || c == '/' || c == '=') then
+    .error "base64url: invalid character"
+  else
+    let mapped := stripped.map fromUrlChar
+    let padded := match mapped.length % 4 with
+      | 2 => mapped ++ ['=', '=']
+      | 3 => mapped ++ ['=']
+      | _ => mapped
+    decode (String.ofList padded)
+
+private theorem toUrlChar_encodeChar_safe_fin :
+    ∀ n : Fin 64, isUrlChar (toUrlChar (encodeChar n.val)) = true := by
+  decide
+
+private theorem encodeListWith_all (f : Nat → Char) (p : Char → Bool)
+    (hf : ∀ n < 64, p (f n) = true) :
+    ∀ bs : List UInt8, (encodeListWith f false bs).all p = true
+  | [] => rfl
+  | [b0] => by
+      have := b0.toNat_lt
+      simp only [encodeListWith, Bool.false_eq_true, ↓reduceIte, List.all_cons, List.all_nil, Bool.and_true]
+      rw [hf _ (by omega), hf _ (by omega)]; rfl
+  | [b0, b1] => by
+      have := b0.toNat_lt; have := b1.toNat_lt
+      simp only [encodeListWith, Bool.false_eq_true, ↓reduceIte, List.all_cons, List.all_nil, Bool.and_true]
+      rw [hf _ (by omega), hf _ (by omega), hf _ (by omega)]; rfl
+  | b0 :: b1 :: b2 :: rest => by
+      have := b0.toNat_lt; have := b1.toNat_lt; have := b2.toNat_lt
+      simp only [encodeListWith, List.all_cons, encodeListWith_all f p hf rest, Bool.and_true]
+      rw [hf _ (by omega), hf _ (by omega), hf _ (by omega), hf _ (by omega)]; rfl
+
+theorem encodeUrl_safe (bs : ByteArray) :
+    (encodeUrl bs).toList.all isUrlChar = true := by
+  unfold encodeUrl
+  rw [String.toList_ofList]
+  exact encodeListWith_all (fun n => toUrlChar (encodeChar n)) isUrlChar
+    (fun n h => toUrlChar_encodeChar_safe_fin ⟨n, h⟩) bs.data.toList
+
 /-! ## Tail-Recursive O(1)-Stack Fast Implementations (`@[csimp]`) -/
 
-private def encodeListRevAcc : List UInt8 → List Char → List Char
+private def encodeListRevAccWith (f : Nat → Char) (pad : Bool) : List UInt8 → List Char → List Char
   | [], acc => acc.reverse
   | [b0], acc =>
       let n0 := b0.toNat
-      ('=' :: '=' :: encodeChar ((n0 % 4) * 16) :: encodeChar (n0 / 4) :: acc).reverse
+      let acc' := f ((n0 % 4) * 16) :: f (n0 / 4) :: acc
+      (if pad then '=' :: '=' :: acc' else acc').reverse
   | [b0, b1], acc =>
       let n0 := b0.toNat; let n1 := b1.toNat
-      ('=' :: encodeChar ((n1 % 16) * 4) :: encodeChar ((n0 % 4) * 16 + n1 / 16) ::
-       encodeChar (n0 / 4) :: acc).reverse
+      let acc' := f ((n1 % 16) * 4) :: f ((n0 % 4) * 16 + n1 / 16) :: f (n0 / 4) :: acc
+      (if pad then '=' :: acc' else acc').reverse
   | b0 :: b1 :: b2 :: rest, acc =>
       let n0 := b0.toNat; let n1 := b1.toNat; let n2 := b2.toNat
-      encodeListRevAcc rest
-        (encodeChar (n2 % 64) ::
-         encodeChar ((n1 % 16) * 4 + n2 / 64) ::
-         encodeChar ((n0 % 4) * 16 + n1 / 16) ::
-         encodeChar (n0 / 4) :: acc)
+      encodeListRevAccWith f pad rest
+        (f (n2 % 64) :: f ((n1 % 16) * 4 + n2 / 64) ::
+         f ((n0 % 4) * 16 + n1 / 16) :: f (n0 / 4) :: acc)
 
-private theorem encodeListRevAcc_eq :
+private theorem encodeListRevAccWith_eq (f : Nat → Char) (pad : Bool) :
     ∀ (bs : List UInt8) (acc : List Char),
-      encodeListRevAcc bs acc = acc.reverse ++ encodeList bs
-  | [], acc => by simp [encodeListRevAcc, encodeList]
-  | [b0], acc => by simp [encodeListRevAcc, encodeList]
-  | [b0, b1], acc => by simp [encodeListRevAcc, encodeList]
+      encodeListRevAccWith f pad bs acc = acc.reverse ++ encodeListWith f pad bs
+  | [], acc => by simp [encodeListRevAccWith, encodeListWith]
+  | [b0], acc => by cases pad <;> simp [encodeListRevAccWith, encodeListWith]
+  | [b0, b1], acc => by cases pad <;> simp [encodeListRevAccWith, encodeListWith]
   | b0 :: b1 :: b2 :: rest, acc => by
-      simp only [encodeListRevAcc, encodeList]
-      rw [encodeListRevAcc_eq rest]
+      simp only [encodeListRevAccWith, encodeListWith]
+      rw [encodeListRevAccWith_eq f pad rest]
       simp [List.append_assoc]
 
 def encodeFast (bs : ByteArray) : String :=
-  String.ofList (encodeListRevAcc bs.data.toList [])
+  String.ofList (encodeListRevAccWith encodeChar true bs.data.toList [])
 
 @[csimp] theorem encode_eq_fast : @encode = @encodeFast := by
   funext bs
-  unfold encode encodeFast
-  rw [encodeListRevAcc_eq]
+  unfold encode encodeFast encodeList
+  rw [encodeListRevAccWith_eq]
+  simp
+
+def encodeUrlFast (bs : ByteArray) : String :=
+  String.ofList (encodeListRevAccWith (fun n => toUrlChar (encodeChar n)) false bs.data.toList [])
+
+@[csimp] theorem encodeUrl_eq_fast : @encodeUrl = @encodeUrlFast := by
+  funext bs
+  unfold encodeUrl encodeUrlFast
+  rw [encodeListRevAccWith_eq]
   simp
 
 private def decodeBufAcc : List Char → List UInt8 → Except String (List UInt8)

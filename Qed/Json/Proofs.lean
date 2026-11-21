@@ -14,117 +14,86 @@ private theorem parseDepth_le_all (fuel : Nat) :
       refine ⟨?_, ?_, ?_⟩
       · intro budget cs j r h
         dsimp only [parseVal] at h
-        split at h
-        · cases h; exact Nat.zero_le _
-        · cases h; exact Nat.zero_le _
-        · cases h; exact Nat.zero_le _
-        · cases hs : parseStr _ with
-          | error _ => rw [hs] at h; cases h
-          | ok p => rw [hs] at h; cases h; exact Nat.zero_le _
+        split at h <;> try (cases h; exact Nat.zero_le _)
+        · split at h <;> cases h; exact Nat.zero_le _
         · cases budget with
           | zero => cases h
           | succ b =>
               dsimp only at h
-              cases hws : skipWs _ with
-              | nil => rw [hws] at h; cases h
-              | cons c r' =>
-                  rw [hws] at h; dsimp only at h
-                  by_cases hcb : c = ']'
-                  · rw [if_pos hcb] at h; cases h; exact Nat.succ_le_succ (Nat.zero_le _)
-                  · rw [if_neg hcb] at h
-                    cases he : parseElems f b (c :: r') with
-                    | error _ => rw [he] at h; cases h
-                    | ok p =>
-                        rw [he] at h; cases h
-                        have hle := Json.maxArr_le_iff.mpr (ihE b _ _ _ he)
-                        simp only [Json.depth]; omega
+              split at h
+              · cases h
+              · split at h
+                · cases h; exact Nat.succ_le_succ (Nat.zero_le _)
+                · split at h
+                  · rename_i he; cases h
+                    have hle := Json.maxArr_le_iff.mpr (ihE b _ _ _ he)
+                    simp only [Json.depth]; omega
+                  · cases h
         · cases budget with
           | zero => cases h
           | succ b =>
               dsimp only at h
-              cases hws : skipWs _ with
-              | nil => rw [hws] at h; cases h
-              | cons c r' =>
-                  rw [hws] at h; dsimp only at h
-                  by_cases hcb : c = '}'
-                  · rw [if_pos hcb] at h; cases h; exact Nat.succ_le_succ (Nat.zero_le _)
-                  · rw [if_neg hcb] at h
-                    cases hm : parseMembers f b (c :: r') with
-                    | error _ => rw [hm] at h; cases h
-                    | ok p =>
-                        rw [hm] at h; cases h
-                        have hle := Json.maxObj_le_iff.mpr (ihM b _ _ _ hm)
-                        simp only [Json.depth]; omega
+              split at h
+              · cases h
+              · split at h
+                · cases h; exact Nat.succ_le_succ (Nat.zero_le _)
+                · split at h
+                  · rename_i hm; cases h
+                    have hle := Json.maxObj_le_iff.mpr (ihM b _ _ _ hm)
+                    simp only [Json.depth]; omega
+                  · cases h
         · split at h
-          · cases hn : parseNum _ with
-            | error _ => rw [hn] at h; cases h
-            | ok p => rw [hn] at h; cases h; exact Nat.zero_le _
+          · split at h <;> cases h; exact Nat.zero_le _
           · cases h
         · cases h
       · intro budget cs es r h
         dsimp only [parseElems] at h
-        cases hv : parseVal f budget cs with
-        | error _ => rw [hv] at h; cases h
-        | ok vr =>
-            rw [hv] at h
-            rcases vr with ⟨v, r1⟩
-            dsimp only at h
-            split at h
-            · cases he : parseElems f budget _ with
-              | error _ => rw [he] at h; cases h
-              | ok vsr =>
-                  rw [he] at h; cases h
-                  intro e hmem
-                  cases hmem with
-                  | head => exact ihV budget cs v r1 hv
-                  | tail _ hmem' => exact ihE budget _ _ _ he e hmem'
-            · cases h
+        split at h
+        · cases h
+        · rename_i v r1 hv
+          split at h
+          · split at h
+            · rename_i vs r'' he; cases h
               intro e hmem
               cases hmem with
               | head => exact ihV budget cs v r1 hv
-              | tail _ hmem' => nomatch hmem'
+              | tail _ hmem' => exact ihE budget _ _ _ he e hmem'
             · cases h
+          · cases h
+            intro e hmem
+            cases hmem with
+            | head => exact ihV budget cs v r1 hv
+            | tail _ hmem' => nomatch hmem'
+          · cases h
       · intro budget cs ms r h
         dsimp only [parseMembers] at h
         split at h
-        · cases hs : parseStr _ with
-          | error _ => rw [hs] at h; cases h
-          | ok kr =>
-              rw [hs] at h; rcases kr with ⟨k, r1⟩; dsimp only at h
-              split at h
-              · cases hv : parseVal f budget _ with
-                | error _ => rw [hv] at h; cases h
-                | ok vr =>
-                    rw [hv] at h; rcases vr with ⟨v, r3⟩; dsimp only at h
-                    split at h
-                    · cases hm : parseMembers f budget _ with
-                      | error _ => rw [hm] at h; cases h
-                      | ok msr =>
-                          rw [hm] at h; cases h
-                          intro kv hmem
-                          cases hmem with
-                          | head => exact ihV budget _ v r3 hv
-                          | tail _ hmem' => exact ihM budget _ _ _ hm kv hmem'
-                    · cases h
-                      intro kv hmem
-                      cases hmem with
-                      | head => exact ihV budget _ v r3 hv
-                      | tail _ hmem' => nomatch hmem'
-                    · cases h
+        · split at h
+          · cases h
+          · split at h
+            · split at h
               · cases h
+              · rename_i v r3 hv
+                split at h
+                · split at h
+                  · rename_i ms' r5 hm; cases h
+                    intro kv hmem
+                    cases hmem with
+                    | head => exact ihV budget _ v r3 hv
+                    | tail _ hmem' => exact ihM budget _ _ _ hm kv hmem'
+                  · cases h
+                · cases h
+                  intro kv hmem
+                  cases hmem with
+                  | head => exact ihV budget _ v r3 hv
+                  | tail _ hmem' => nomatch hmem'
+                · cases h
+            · cases h
         · cases h
 
 theorem parseVal_depth_le (fuel budget : Nat) (cs : List Char) (j : Json) (r : List Char)
     (h : parseVal fuel budget cs = .ok (j, r)) : j.depth ≤ budget :=
   (parseDepth_le_all fuel).1 budget cs j r h
-
-theorem parseElems_depth_le (fuel budget : Nat) (cs : List Char) (es : List Json) (r : List Char)
-    (h : parseElems fuel budget cs = .ok (es, r)) : ∀ e ∈ es, e.depth ≤ budget :=
-  (parseDepth_le_all fuel).2.1 budget cs es r h
-
-theorem parseMembers_depth_le (fuel budget : Nat) (cs : List Char) (ms : List (String × Json)) (r : List Char)
-    (h : parseMembers fuel budget cs = .ok (ms, r)) : ∀ kv ∈ ms, kv.2.depth ≤ budget :=
-  (parseDepth_le_all fuel).2.2 budget cs ms r h
 
 theorem parse_depth_le (s : String) (maxDepth : Nat) (j : Json) :
     parse s maxDepth = .ok j → j.depth ≤ maxDepth := by
@@ -137,21 +106,14 @@ theorem parse_depth_le (s : String) (maxDepth : Nat) (j : Json) :
     · cases h; exact parseVal_depth_le _ maxDepth _ _ _ heq
     · contradiction
 
+private theorem digit_spec_fin : ∀ k : Fin 10,
+    (Char.ofNat ('0'.toNat + k.val)).toNat - '0'.toNat = k.val
+    ∧ isDigit (Char.ofNat ('0'.toNat + k.val)) = true := by decide
+
 theorem digit_spec (k : Nat) (h : k < 10) :
     (Char.ofNat ('0'.toNat + k)).toNat - '0'.toNat = k
     ∧ isDigit (Char.ofNat ('0'.toNat + k)) = true :=
-  match k, h with
-  | 0, _ => by decide
-  | 1, _ => by decide
-  | 2, _ => by decide
-  | 3, _ => by decide
-  | 4, _ => by decide
-  | 5, _ => by decide
-  | 6, _ => by decide
-  | 7, _ => by decide
-  | 8, _ => by decide
-  | 9, _ => by decide
-  | _ + 10, h => absurd h (by omega)
+  digit_spec_fin ⟨k, h⟩
 
 theorem natDigitsAux_append (n : Nat) : ∀ acc : List Char,
     natDigitsAux n acc = natDigitsAux n [] ++ acc := by
@@ -249,13 +211,24 @@ theorem numDelim_head {c : Char} {t : List Char} (h : numDelim (c :: t) = true) 
   simp only [numDelim, Bool.not_eq_true', Bool.or_eq_false_iff, beq_eq_false_iff_ne] at h
   exact ⟨h.1.1.1, h.1.1.2, h.1.2, h.2⟩
 
-private theorem parseNum_after_sign (neg : Bool) (m : Nat) (ex : Int) (rest : List Char)
-    (hr : numDelim rest = true) :
-    let tail := (if ex == 0 then [] else 'e' :: intCharsL ex) ++ rest
-    let (intDs, cs2) := takeDigits (natDigitsAux m [] ++ tail)
-    (if intDs.isEmpty then Except.error "expected a number"
-     else
-       let (fracDs, cs3) := match cs2 with | '.' :: r => takeDigits r | _ => ([], cs2)
+theorem parseNum_render (n : JsonNumber) (rest : List Char) (hr : numDelim rest = true) :
+    parseNum (Json.renderNumL n ++ rest) = .ok (n, rest) := by
+  obtain ⟨m, ex⟩ := n
+  let tail := (if ex == 0 then [] else 'e' :: intCharsL ex) ++ rest
+  have harg : Json.renderNumL ⟨m, ex⟩ ++ rest = intCharsL m ++ tail := by
+    simp only [Json.renderNumL, tail, List.append_assoc]
+  have htailStop : takeDigits tail = ([], tail) := by
+    by_cases hex : ex = 0
+    · simp only [tail, hex, beq_self_eq_true, ↓reduceIte, List.nil_append]; exact takeDigits_stop hr
+    · simp only [tail, beq_eq_false_iff_ne.2 hex, Bool.false_eq_true, ↓reduceIte, List.cons_append]
+      exact takeDigits_cons_not (by decide)
+  have hne : (natDigitsAux m.natAbs []).isEmpty = false := by
+    cases h : natDigitsAux m.natAbs [] with
+    | nil => exact absurd h (natDigits_ne_nil m.natAbs)
+    | cons _ _ => rfl
+  have htd := takeDigits_append _ (natDigits_digit m.natAbs) _ htailStop
+  have finish : ∀ (neg : Bool), (if neg then (-1 : Int) else 1) * (m.natAbs : Int) = m →
+      (let (fracDs, cs3) := match tail with | '.' :: r => takeDigits r | _ => ([], tail)
        let (expVal, cs4) : Int × List Char := match cs3 with
          | 'e' :: r | 'E' :: r =>
              let (sgn, r1) : Int × List Char := match r with
@@ -263,180 +236,59 @@ private theorem parseNum_after_sign (neg : Bool) (m : Nat) (ex : Int) (rest : Li
              let (eds, r2) := takeDigits r1
              (sgn * digitsToInt eds, r2)
          | _ => (0, cs3)
-       let mant : Int := (if neg then -1 else 1) * digitsToInt (intDs ++ fracDs)
-       Except.ok (JsonNumber.mk mant (expVal - (fracDs.length : Int)), cs4))
-      = Except.ok (JsonNumber.mk ((if neg then -1 else 1) * (m : Int)) ex, rest) := by
-  intro tail
-  have htailStop : takeDigits tail = ([], tail) := by
+       let mant : Int := (if neg then -1 else 1) * digitsToInt (natDigitsAux m.natAbs [] ++ fracDs)
+       Except.ok (JsonNumber.mk mant (expVal - (fracDs.length : Int)), cs4)) =
+      (Except.ok (JsonNumber.mk m ex, rest) : Except String _) := by
+    intro neg hneg
     by_cases hex : ex = 0
-    · simp only [tail, hex, beq_self_eq_true, ↓reduceIte, List.nil_append]
-      exact takeDigits_stop hr
-    · simp only [tail, beq_eq_false_iff_ne.2 hex, Bool.false_eq_true, ↓reduceIte, List.cons_append]
-      exact takeDigits_cons_not (by decide)
-  rw [takeDigits_append _ (natDigits_digit m) _ htailStop]
-  have hne : (natDigitsAux m []).isEmpty = false := by
-    cases h : natDigitsAux m [] with
-    | nil => exact absurd h (natDigits_ne_nil m)
-    | cons _ _ => rfl
-  change (if (natDigitsAux m []).isEmpty = true then _ else _) = _
-  rw [hne, if_neg Bool.false_ne_true]
-  by_cases hex : ex = 0
-  · subst hex
-    have htail : tail = rest := by simp only [tail, beq_self_eq_true, ↓reduceIte, List.nil_append]
-    rw [htail]
-    cases rest with
-    | nil =>
-        change Except.ok (JsonNumber.mk ((if neg then -1 else 1) * digitsToInt (natDigitsAux m [] ++ [])) (0 - ([].length : Int)), []) = _
-        rw [List.append_nil, digitsToInt_natDigits]; rfl
-    | cons c t =>
-        obtain ⟨_, hdot, he, hE⟩ := numDelim_head hr
-        have h1 : (match c :: t with | '.' :: r => takeDigits r | _ => ([], c :: t)) = ([], c :: t) := by
-          split
-          · rename_i r heq; injection heq with hc; exact absurd hc hdot
-          · rfl
-        have h2 : (match c :: t with
-            | 'e' :: r | 'E' :: r =>
-                let (sgn, r1) : Int × List Char := match r with
-                  | '+' :: r' => (1, r') | '-' :: r' => (-1, r') | _ => (1, r)
-                let (eds, r2) := takeDigits r1
-                (sgn * digitsToInt eds, r2)
-            | _ => (0, c :: t)) = (0, c :: t) := by
-          split
-          · rename_i r heq; injection heq with hc; exact absurd hc he
-          · rename_i r heq; injection heq with hc; exact absurd hc hE
-          · rfl
-        simp only [h1, h2, List.append_nil, digitsToInt_natDigits, List.length_nil]
-        rfl
-  · have htail : tail = 'e' :: (intCharsL ex ++ rest) := by
-      simp only [tail, beq_eq_false_iff_ne.2 hex, Bool.false_eq_true, ↓reduceIte, List.cons_append]
-    rw [htail]
-    by_cases hexn : ex < 0
-    · have hint : intCharsL ex ++ rest = '-' :: (natDigitsAux ex.natAbs [] ++ rest) := by
-        simp only [intCharsL, hexn, ↓reduceIte, List.cons_append, List.nil_append]
-      rw [hint]
-      have htd := takeDigits_append _ (natDigits_digit ex.natAbs) _ (takeDigits_stop hr)
-      change (match (match 'e' :: '-' :: (natDigitsAux ex.natAbs [] ++ rest) with
-          | '.' :: r => takeDigits r | _ => ([], 'e' :: '-' :: (natDigitsAux ex.natAbs [] ++ rest))) with
-        | (fracDs, cs3) =>
-          match (match cs3 with
-            | 'e' :: r | 'E' :: r =>
-                match (match r with | '+' :: r' => ((1 : Int), r') | '-' :: r' => (-1, r') | _ => (1, r)) with
-                | (sgn, r1) => match takeDigits r1 with | (eds, r2) => (sgn * digitsToInt eds, r2)
-            | _ => ((0 : Int), cs3)) with
-          | (expVal, cs4) =>
-            let mant : Int := (if neg then -1 else 1) * digitsToInt (natDigitsAux m [] ++ fracDs)
-            Except.ok (JsonNumber.mk mant (expVal - (fracDs.length : Int)), cs4)) = _
-      change (match takeDigits (natDigitsAux ex.natAbs [] ++ rest) with
-        | (eds, r2) =>
-          let mant : Int := (if neg then -1 else 1) * digitsToInt (natDigitsAux m [] ++ [])
-          Except.ok (JsonNumber.mk mant (((-1 : Int) * digitsToInt eds) - ([].length : Int)), r2)) = _
-      rw [htd]
-      change Except.ok (JsonNumber.mk ((if neg then -1 else 1) * digitsToInt (natDigitsAux m [] ++ []))
-          (((-1 : Int) * digitsToInt (natDigitsAux ex.natAbs [])) - 0), rest) = _
-      rw [List.append_nil, digitsToInt_natDigits, digitsToInt_natDigits]
-      have hexEq : (-1 : Int) * (ex.natAbs : Int) - 0 = ex := by omega
-      rw [hexEq]
-    · obtain ⟨c1, t1, hex0, hc1⟩ := natDigits_cons ex.natAbs
-      obtain ⟨hns, hps⟩ := digit_not_sign hc1
-      have hint : intCharsL ex ++ rest = c1 :: (t1 ++ rest) := by
-        simp only [intCharsL, hexn, ↓reduceIte, hex0, List.cons_append, List.nil_append]
-      have htd : takeDigits (c1 :: (t1 ++ rest)) = (c1 :: t1, rest) := by
-        have := takeDigits_append _ (natDigits_digit ex.natAbs) _ (takeDigits_stop hr)
-        rwa [hex0, List.cons_append] at this
-      have hdi : digitsToInt (c1 :: t1) = (ex.natAbs : Int) := by
-        have := digitsToInt_natDigits ex.natAbs; rwa [hex0] at this
-      rw [hint]
-      have hsgn : (match c1 :: (t1 ++ rest) with
-          | '+' :: r' => ((1 : Int), r')
-          | '-' :: r' => ((-1 : Int), r')
-          | _ => ((1 : Int), c1 :: (t1 ++ rest))) = (1, c1 :: (t1 ++ rest)) := by
-        split
-        · rename_i r' heq; injection heq with hc; exact absurd hc hps
-        · rename_i r' heq; injection heq with hc; exact absurd hc hns
-        · rfl
-      change (match (match c1 :: (t1 ++ rest) with | '+' :: r' => ((1 : Int), r') | '-' :: r' => (-1, r') | _ => (1, c1 :: (t1 ++ rest))) with
-        | (sgn, r1) =>
-          match takeDigits r1 with
-          | (eds, r2) =>
-            let mant : Int := (if neg then -1 else 1) * digitsToInt (natDigitsAux m [] ++ [])
-            Except.ok (JsonNumber.mk mant (sgn * digitsToInt eds - 0), r2)) = _
-      rw [hsgn]
-      change (match takeDigits (c1 :: (t1 ++ rest)) with
-        | (eds, r2) =>
-          let mant : Int := (if neg then -1 else 1) * digitsToInt (natDigitsAux m [] ++ [])
-          Except.ok (JsonNumber.mk mant ((1 : Int) * digitsToInt eds - 0), r2)) = _
-      rw [htd]
-      change Except.ok (JsonNumber.mk ((if neg then -1 else 1) * digitsToInt (natDigitsAux m [] ++ []))
-          ((1 : Int) * digitsToInt (c1 :: t1) - 0), rest) = _
-      rw [hdi, List.append_nil, digitsToInt_natDigits]
-      have hexEq : (1 : Int) * (ex.natAbs : Int) - 0 = ex := by omega
-      rw [hexEq]
-
-theorem parseNum_render (n : JsonNumber) (rest : List Char) (hr : numDelim rest = true) :
-    parseNum (Json.renderNumL n ++ rest) = .ok (n, rest) := by
-  obtain ⟨m, ex⟩ := n
-  let tail := (if ex == 0 then [] else 'e' :: intCharsL ex) ++ rest
-  have harg : Json.renderNumL ⟨m, ex⟩ ++ rest = intCharsL m ++ tail := by
-    simp only [Json.renderNumL, tail, List.append_assoc]
+    · subst hex
+      have ht : tail = rest := by simp only [tail, beq_self_eq_true, ↓reduceIte, List.nil_append]
+      rw [ht]; clear ht harg htailStop htd
+      cases rest with
+      | nil => simp [digitsToInt_natDigits, hneg]
+      | cons c t =>
+          obtain ⟨_, hdot, he, hE⟩ := numDelim_head hr
+          simp [hdot, he, hE, digitsToInt_natDigits, hneg]
+    · have ht : tail = 'e' :: (intCharsL ex ++ rest) := by
+        simp only [tail, beq_eq_false_iff_ne.2 hex, Bool.false_eq_true, ↓reduceIte, List.cons_append]
+      rw [ht]; clear ht harg htailStop htd
+      by_cases hexn : ex < 0
+      · have hint : intCharsL ex ++ rest = '-' :: (natDigitsAux ex.natAbs [] ++ rest) := by
+          simp [intCharsL, hexn]
+        rw [hint]
+        simp [takeDigits_append _ (natDigits_digit ex.natAbs) _ (takeDigits_stop hr),
+          digitsToInt_natDigits, hneg]
+        omega
+      · obtain ⟨c1, t1, hex0, hc1⟩ := natDigits_cons ex.natAbs
+        obtain ⟨hns, hps⟩ := digit_not_sign hc1
+        have hint : intCharsL ex ++ rest = c1 :: (t1 ++ rest) := by
+          simp only [intCharsL, hexn, ↓reduceIte, hex0, List.cons_append, List.nil_append]
+        have htdE : takeDigits (c1 :: (t1 ++ rest)) = (c1 :: t1, rest) := by
+          have := takeDigits_append _ (natDigits_digit ex.natAbs) _ (takeDigits_stop hr)
+          rwa [hex0, List.cons_append] at this
+        have hdiE : digitsToInt (c1 :: t1) = (ex.natAbs : Int) := by
+          have := digitsToInt_natDigits ex.natAbs; rwa [hex0] at this
+        rw [hint]
+        simp [hps, hns, htdE, hdiE, digitsToInt_natDigits, hneg]
+        omega
   rw [harg]; unfold parseNum
   by_cases hm : m < 0
-  · have hcs : intCharsL m ++ tail = '-' :: (natDigitsAux m.natAbs [] ++ tail) := by
-      simp only [intCharsL, hm, ↓reduceIte, List.cons_append, List.nil_append]
-    rw [hcs]
-    have h := parseNum_after_sign true m.natAbs ex rest hr
-    have hmul : (-1 : Int) * (m.natAbs : Int) = m := by omega
-    refine h.trans ?_
-    simp only [↓reduceIte, hmul]
+  · have hcs : intCharsL m ++ tail = '-' :: (natDigitsAux m.natAbs [] ++ tail) := by simp [intCharsL, hm]
+    rw [hcs]; simp only [htd, hne, Bool.false_eq_true, ↓reduceIte]
+    exact finish true (by simp; omega)
   · obtain ⟨c0, t0, hm0, hc0⟩ := natDigits_cons m.natAbs
     obtain ⟨hns, _⟩ := digit_not_sign hc0
     have hcs : intCharsL m ++ tail = c0 :: (t0 ++ tail) := by
       simp only [intCharsL, hm, ↓reduceIte, hm0, List.cons_append, List.nil_append]
-    rw [hcs]
-    have hneg : (match c0 :: (t0 ++ tail) with | '-' :: r => (true, r) | _ => (false, c0 :: (t0 ++ tail))) =
-        (false, natDigitsAux m.natAbs [] ++ tail) := by
-      split
-      · rename_i r heq; injection heq with hc; exact absurd hc hns
-      · rw [hm0]; rfl
-    change (match (match c0 :: (t0 ++ tail) with | '-' :: r => (true, r) | _ => (false, c0 :: (t0 ++ tail))) with
-      | (neg, cs1) =>
-        let (intDs, cs2) := takeDigits cs1
-        if intDs.isEmpty then Except.error "expected a number"
-        else
-          let (fracDs, cs3) := match cs2 with | '.' :: r => takeDigits r | _ => ([], cs2)
-          let (expVal, cs4) : Int × List Char := match cs3 with
-            | 'e' :: r | 'E' :: r =>
-                let (sgn, r1) : Int × List Char := match r with
-                  | '+' :: r' => (1, r') | '-' :: r' => (-1, r') | _ => (1, r)
-                let (eds, r2) := takeDigits r1
-                (sgn * digitsToInt eds, r2)
-            | _ => (0, cs3)
-          let mant : Int := (if neg then -1 else 1) * digitsToInt (intDs ++ fracDs)
-          Except.ok (JsonNumber.mk mant (expVal - (fracDs.length : Int)), cs4)) = _
-    rw [hneg]
-    have h := parseNum_after_sign false m.natAbs ex rest hr
-    have hmul : (1 : Int) * (m.natAbs : Int) = m := by omega
-    refine h.trans ?_
-    simp only [Bool.false_eq_true, ↓reduceIte, hmul]
+    rw [hcs]; simp [hns]
+    rw [← List.cons_append, ← hm0, htd]
+    simpa [natDigits_ne_nil] using finish false (by simp; omega)
+
+private theorem hexVal_toHexDigit_fin :
+    ∀ d : Fin 16, hexVal (toHexDigit d.val) = some d.val := by decide
 
 theorem hexVal_toHexDigit (d : Nat) (h : d < 16) : hexVal (toHexDigit d) = some d :=
-  match d, h with
-  | 0, _ => by decide
-  | 1, _ => by decide
-  | 2, _ => by decide
-  | 3, _ => by decide
-  | 4, _ => by decide
-  | 5, _ => by decide
-  | 6, _ => by decide
-  | 7, _ => by decide
-  | 8, _ => by decide
-  | 9, _ => by decide
-  | 10, _ => by decide
-  | 11, _ => by decide
-  | 12, _ => by decide
-  | 13, _ => by decide
-  | 14, _ => by decide
-  | 15, _ => by decide
-  | _ + 16, h => absurd h (by omega)
+  hexVal_toHexDigit_fin ⟨d, h⟩
 
 theorem parseStrAux_escape (c : Char) (acc rest : List Char) :
     parseStrAux acc (escapeCharL c ++ rest) = parseStrAux (c :: acc) rest := by
@@ -587,24 +439,21 @@ theorem skipWs_renderMembersL (k : String) (v : Json) (ms : List (String × Json
   simp only [renderMembersL_cons, Json.renderStrL, List.cons_append, List.append_assoc]
   simp [skipWs, isWs]
 
+private theorem skipWs_cons {c : Char} {r : List Char} (h : isWs c = false) :
+    skipWs (c :: r) = c :: r := by
+  simp only [skipWs, h, Bool.false_eq_true, ↓reduceIte]
+
 theorem parseVal_arr (e : Json) (es : List Json) (f b : Nat) (rest : List Char) :
     parseVal (f + 1) (b + 1) ('[' :: (Json.renderElemsL (e :: es) ++ ']' :: rest))
       = (match parseElems f b (Json.renderElemsL (e :: es) ++ ']' :: rest) with
          | .ok (vs, r') => .ok (Json.arr vs, r')
          | .error msg   => .error msg) := by
-  obtain ⟨c, t, hren, hcws, hcbr, _⟩ := renderL_head e
+  obtain ⟨c, t, hren, _, hcbr, _⟩ := renderL_head e
   have hcons : Json.renderElemsL (e :: es) ++ ']' :: rest
              = c :: (t ++ Json.renderElemSep es ++ ']' :: rest) := by
     simp only [Json.renderElemsL, hren, List.cons_append, List.append_assoc]
-  have step : parseVal (f + 1) (b + 1) ('[' :: (Json.renderElemsL (e :: es) ++ ']' :: rest))
-            = (match skipWs (Json.renderElemsL (e :: es) ++ ']' :: rest) with
-               | []      => .error "unexpected end of input"
-               | c :: r' => if c = ']' then .ok (Json.arr [], r')
-                            else (match parseElems f b (c :: r') with
-                                  | .ok (es', r'') => .ok (Json.arr es', r'')
-                                  | .error e       => .error e)) := rfl
-  rw [step, skipWs_renderElemsL e es (']' :: rest), hcons]
-  simp only [if_neg hcbr]
+  unfold parseVal; simp only [skipWs_cons (by decide : isWs '[' = false)]
+  rw [skipWs_renderElemsL, hcons]; simp only [if_neg hcbr]; rfl
 
 theorem parseVal_obj (k : String) (v : Json) (ms : List (String × Json))
     (f b : Nat) (rest : List Char) :
@@ -616,50 +465,8 @@ theorem parseVal_obj (k : String) (v : Json) (ms : List (String × Json))
       = '"' :: (k.toList.flatMap escapeCharL
           ++ ('"' :: (':' :: (Json.renderL v ++ (Json.renderMemberSep ms ++ '}' :: rest))))) := by
     simp [renderMembersL_cons, Json.renderStrL]
-  have step : parseVal (f + 1) (b + 1) ('{' :: (Json.renderMembersL ((k, v) :: ms) ++ '}' :: rest))
-      = (match skipWs (Json.renderMembersL ((k, v) :: ms) ++ '}' :: rest) with
-         | []      => .error "unexpected end of input"
-         | c :: r' => if c = '}' then .ok (Json.obj [], r')
-                      else (match parseMembers f b (c :: r') with
-                            | .ok (ms', r'') => .ok (Json.obj ms', r'')
-                            | .error e       => .error e)) := rfl
-  rw [step, skipWs_renderMembersL, hcons]
-  simp only [if_neg (by decide : ¬('"' = '}'))]
-
-theorem parseMembers_step (f budget : Nat) (cs : List Char) :
-    parseMembers (f + 1) budget cs
-      = (match skipWs cs with
-         | '"' :: r =>
-             match parseStr r with
-             | .error e => .error e
-             | .ok (key, r1) =>
-                 match skipWs r1 with
-                 | ':' :: r2 =>
-                     match parseVal f budget (skipWs r2) with
-                     | .error e => .error e
-                     | .ok (v, r3) =>
-                         match skipWs r3 with
-                         | ',' :: r4 =>
-                             match parseMembers f budget (skipWs r4) with
-                             | .ok (ms, r5) => .ok ((key, v) :: ms, r5)
-                             | .error e     => .error e
-                         | '}' :: r4 => .ok ([(key, v)], r4)
-                         | _         => .error "expected ',' or '}'"
-                 | _ => .error "expected ':'"
-         | _ => .error "expected string key") := rfl
-
-theorem parseElems_step (f budget : Nat) (cs : List Char) :
-    parseElems (f + 1) budget cs
-      = (match parseVal f budget cs with
-         | .error msg => .error msg
-         | .ok (v, r) =>
-             match skipWs r with
-             | ',' :: r' =>
-                 (match parseElems f budget (skipWs r') with
-                  | .ok (vs, r'') => .ok (v :: vs, r'')
-                  | .error e      => .error e)
-             | ']' :: r' => .ok ([v], r')
-             | _         => .error "expected ',' or ']'") := rfl
+  unfold parseVal; simp only [skipWs_cons (by decide : isWs '{' = false)]
+  rw [skipWs_renderMembersL, hcons]; simp only [if_neg (by decide : ¬('"' = '}'))]; rfl
 
 private theorem rt_all (fuel : Nat) :
     (∀ (j : Json) (budget : Nat) (rest : List Char),
@@ -745,15 +552,11 @@ private theorem rt_all (fuel : Nat) :
               (numDelim_cons (by decide))
             have harg : Json.renderElemsL (e :: []) ++ ']' :: rest = Json.renderL e ++ ']' :: rest := by
               simp only [Json.renderElemsL, Json.renderElemSep, List.append_nil]
-            have hbr : skipWs (']' :: rest) = ']' :: rest := rfl
-            rw [harg, parseElems_step, hv]
-            dsimp only
-            rw [hbr]
-            rfl
+            rw [harg]; dsimp only [parseElems]
+            simp only [hv, skipWs_cons (by decide : isWs ']' = false)]
         | cons x xs =>
             have hdtail : ∀ y ∈ x :: xs, Json.depth y ≤ budget := fun y hy => hd y (List.mem_cons_of_mem _ hy)
-            simp only [Json.renderElemsL, Json.renderElemSep, List.length_append,
-                       List.length_cons] at hf
+            simp only [Json.renderElemsL, Json.renderElemSep, List.length_append, List.length_cons] at hf
             have hfe : (Json.renderL e).length < f := by omega
             have hfx : (Json.renderElemsL (x :: xs)).length + 1 < f := by
               simp only [Json.renderElemsL, List.length_append]; omega
@@ -764,11 +567,8 @@ private theorem rt_all (fuel : Nat) :
             have harg : Json.renderElemsL (e :: x :: xs) ++ ']' :: rest
                       = Json.renderL e ++ ',' :: (Json.renderElemsL (x :: xs) ++ ']' :: rest) := by
               simp only [Json.renderElemsL, Json.renderElemSep, List.cons_append, List.append_assoc]
-            have hcomma : skipWs (',' :: (Json.renderElemsL (x :: xs) ++ ']' :: rest))
-                        = ',' :: (Json.renderElemsL (x :: xs) ++ ']' :: rest) := rfl
-            have h2 := skipWs_renderElemsL x xs (']' :: rest)
-            rw [harg, parseElems_step, hv]
-            simp only [hcomma, h2, key]
+            rw [harg]; dsimp only [parseElems]
+            simp only [hv, skipWs_cons (by decide : isWs ',' = false), skipWs_renderElemsL, key]
       · intro kv ms budget rest hd hf
         rcases kv with ⟨k, v⟩
         cases ms with
@@ -784,12 +584,10 @@ private theorem rt_all (fuel : Nat) :
                     ++ ('"' :: (':' :: (Json.renderL v ++ '}' :: rest)))) := by
               simp only [renderMembersL_cons, Json.renderMemberSep, Json.renderStrL,
                          List.append_nil, List.nil_append, List.cons_append, List.append_assoc]
-            rw [harg, parseMembers_step]
-            have hq : skipWs ('"' :: (k.toList.flatMap escapeCharL ++ ('"' :: (':' :: (Json.renderL v ++ '}' :: rest)))))
-                = '"' :: (k.toList.flatMap escapeCharL ++ ('"' :: (':' :: (Json.renderL v ++ '}' :: rest)))) := rfl
-            have hc : skipWs (':' :: (Json.renderL v ++ '}' :: rest)) = ':' :: (Json.renderL v ++ '}' :: rest) := rfl
-            have hb : skipWs ('}' :: rest) = '}' :: rest := rfl
-            simp only [hq, parseStr_render, hc, skipWs_renderL, hv, hb]
+            rw [harg]; dsimp only [parseMembers]
+            simp only [skipWs_cons (by decide : isWs '"' = false), parseStr_render,
+              skipWs_cons (by decide : isWs ':' = false), skipWs_renderL, hv,
+              skipWs_cons (by decide : isWs '}' = false)]
         | cons kv' ms =>
             rcases kv' with ⟨k', v'⟩
             have hdtail : ∀ y ∈ (k', v') :: ms, Json.depth y.2 ≤ budget :=
@@ -810,37 +608,15 @@ private theorem rt_all (fuel : Nat) :
                         ++ (',' :: (Json.renderMembersL ((k', v') :: ms) ++ '}' :: rest)))))) := by
               simp only [renderMembersL_cons (ms := (k', v') :: ms), renderMemberSep_cons,
                          Json.renderStrL, List.nil_append, List.cons_append, List.append_assoc]
-            rw [harg, parseMembers_step]
-            have hq : skipWs ('"' :: (k.toList.flatMap escapeCharL
-                    ++ ('"' :: (':' :: (Json.renderL v
-                        ++ (',' :: (Json.renderMembersL ((k', v') :: ms) ++ '}' :: rest)))))))
-                = '"' :: (k.toList.flatMap escapeCharL
-                    ++ ('"' :: (':' :: (Json.renderL v
-                        ++ (',' :: (Json.renderMembersL ((k', v') :: ms) ++ '}' :: rest)))))) := rfl
-            have hc : skipWs (':' :: (Json.renderL v ++ (',' :: (Json.renderMembersL ((k', v') :: ms) ++ '}' :: rest))))
-                = ':' :: (Json.renderL v ++ (',' :: (Json.renderMembersL ((k', v') :: ms) ++ '}' :: rest))) := rfl
-            have hcm : skipWs (',' :: (Json.renderMembersL ((k', v') :: ms) ++ '}' :: rest))
-                = ',' :: (Json.renderMembersL ((k', v') :: ms) ++ '}' :: rest) := rfl
-            simp only [hq, parseStr_render, hc, skipWs_renderL, hv, hcm, skipWs_renderMembersL, key]
+            rw [harg]; dsimp only [parseMembers]
+            simp only [skipWs_cons (by decide : isWs '"' = false), parseStr_render,
+              skipWs_cons (by decide : isWs ':' = false), skipWs_renderL, hv,
+              skipWs_cons (by decide : isWs ',' = false), skipWs_renderMembersL, key]
 
 theorem rt_val (j : Json) (budget fuel : Nat) (rest : List Char)
     (hd : j.depth ≤ budget) (hf : (Json.renderL j).length < fuel) (hr : numDelim rest = true) :
     parseVal fuel budget (Json.renderL j ++ rest) = .ok (j, rest) :=
   (rt_all fuel).1 j budget rest hd hf hr
-
-theorem rt_elems (e : Json) (es : List Json) (budget fuel : Nat) (rest : List Char)
-    (hd : ∀ x ∈ e :: es, Json.depth x ≤ budget)
-    (hf : (Json.renderElemsL (e :: es)).length + 1 < fuel) :
-    parseElems fuel budget (Json.renderElemsL (e :: es) ++ ']' :: rest) = .ok (e :: es, rest) :=
-  (rt_all fuel).2.1 e es budget rest hd hf
-
-theorem rt_members (kv : String × Json) (ms : List (String × Json))
-    (budget fuel : Nat) (rest : List Char)
-    (hd : ∀ x ∈ kv :: ms, Json.depth x.2 ≤ budget)
-    (hf : (Json.renderMembersL (kv :: ms)).length + 1 < fuel) :
-    parseMembers fuel budget (Json.renderMembersL (kv :: ms) ++ '}' :: rest)
-      = .ok (kv :: ms, rest) :=
-  (rt_all fuel).2.2 kv ms budget rest hd hf
 
 theorem parse_render {j : Json} {maxDepth : Nat}
     (h : j.depth ≤ maxDepth) : parse (Json.render j) maxDepth = .ok j := by

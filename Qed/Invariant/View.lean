@@ -1,4 +1,5 @@
 import Qed.Invariant.Predicates
+import Qed.Runtime.Verify
 import Qed.Lang
 import Qed.Diag
 
@@ -124,12 +125,7 @@ private def runSplitFiniteEnums : TacticM Unit := do
     rem := rem ++ [g]
   setGoals rem
 
-private def styleReduceCoreNames : Array Name := #[
-  ``Qed.roleHasOneOf, ``Qed.tagHasOneOf, ``Qed.roleHas, ``Qed.roleHasOnly,
-  ``Qed.roleLacks, ``Qed.tagLacks, ``Qed.roleHasAll, ``Qed.tagHas, ``Qed.noConflictingStyles,
-  ``Qed.hasRole, ``Qed.hasTag, ``Qed.both, ``Qed.either, ``Qed.exactlyOne,
-  ``Qed.allRolesOff, ``Qed.exactlyOneOf, ``Qed.exactlyOneOf.go, ``Qed.hasOneClass,
-  ``Qed.everyElement, ``Qed.everyElementL, ``Qed.attrClasses, ``Qed.attrRole,
+private def a11yReduceNames : Array Name := #[
   ``Qed.Html.a11yValid, ``Qed.Html.imgsHaveAlt, ``Qed.Html.imgsHaveAltList,
   ``Qed.Html.buttonsAccessible, ``Qed.Html.buttonsAccessibleList,
   ``Qed.Html.elemHasAccessibleName, ``Qed.Html.hasAccessibleNameChild, ``Qed.Html.hasAccessibleNameChildren,
@@ -139,7 +135,16 @@ private def styleReduceCoreNames : Array Name := #[
   ``Qed.Html.noDuplicateIds, ``Qed.Html.collectIds, ``Qed.Html.collectIdsList,
   ``Qed.Html.headingsOrdered, ``Qed.Html.collectHeadings, ``Qed.Html.collectHeadingsList,
   ``Qed.Html.htmlHasLang, ``Qed.Html.htmlHasLangList,
-  ``Qed.attrValue, ``Qed.hasAttr, ``Qed.hasNonBlankAttr,
+  ``Qed.attrValue, ``Qed.hasAttr, ``Qed.hasNonBlankAttr
+]
+
+private def styleReduceCoreNames : Array Name := #[
+  ``Qed.roleHasOneOf, ``Qed.tagHasOneOf, ``Qed.roleHas, ``Qed.roleHasOnly,
+  ``Qed.roleLacks, ``Qed.tagLacks, ``Qed.roleHasAll, ``Qed.tagHas, ``Qed.noConflictingStyles,
+  ``Qed.hasRole, ``Qed.hasTag, ``Qed.both, ``Qed.either, ``Qed.exactlyOne,
+  ``Qed.allRolesOff, ``Qed.exactlyOneOf, ``Qed.exactlyOneOf.go, ``Qed.hasOneClass,
+  ``Qed.everyElement, ``Qed.everyElementL, ``Qed.attrClasses, ``Qed.attrRole
+] ++ a11yReduceNames ++ #[
   ``Qed.Html.imgsHaveAlt_map, ``Qed.Html.buttonsAccessible_map, ``Qed.Html.validAriaRoles_map,
   ``Qed.Html.labelsAssociated_map, ``Qed.Html.noDuplicateIds_map, ``Qed.Html.headingsOrdered_map,
   ``Qed.Html.htmlHasLang_map, ``Qed.Html.a11yValid_map,
@@ -154,16 +159,8 @@ private def styleReduceOptNames : Array Name := #[
   `Qed.VAttr.eval, `Qed.VAttr.mapScope, `Qed.View.showIf, `Qed.View.ofHtml,
   `Qed.V.el, `Qed.V.text, `Qed.V.dyn, `Qed.V.ifElse, `Qed.V.showIf, `Qed.V.static, `Qed.V.dynNode,
   `Qed.V.memo, `Qed.V.render_forEach, `Qed.View.isDyn, `Qed.View.memo,
-  `Qed.ForEachItems.toList_array, `Qed.ForEachItems.toList_list, `Qed.ForEachItems.toArray, `Qed.mapList_eq,
-  `Qed.text, `Qed.lazy, `Qed.el, `Qed.link, `Qed.linkTo,
-  `Qed.Attr.empty, `Qed.Html.ofOption, `Qed.toString_string, `Qed.withKey,
-  `Qed.cls, `Qed.attr, `Qed.role, `Qed.on,
-  `Qed.onValue, `Qed.onClick, `Qed.onInput, `Qed.onChange, `Qed.onCheck, `Qed.onKeydown,
-  `Qed.onKeyup, `Qed.onSubmit, `Qed.onBlur, `Qed.onFocus, `Qed.onDoubleClick, `Qed.onMouseDown,
-  `Qed.onMouseUp, `Qed.key, `Qed.value, `Qed.placeholder, `Qed.name, `Qed.href, `Qed.ToHref.toHref,
-  `Qed.src, `Qed.action, `Qed.alt, `Qed.title, `Qed.style, `Qed.inlineStyle, `Qed.styleVars, `Qed.type',
-  `Qed.disabled, `Qed.required, `Qed.checked, `Qed.readOnly
-]
+  `Qed.Attr.empty, `Qed.Html.ofOption, `Qed.toString_string, `Qed.withKey, `Qed.ToHref.toHref
+] ++ Qed.qedForEachHelperNames ++ Qed.qedHtmlHelperNames
 
 private def runStyleSimpPass : TacticM Unit := do
   if (← getGoals).isEmpty then return
@@ -213,21 +210,10 @@ private def runStyleLeafClose (g : MVarId) : TacticM (List MVarId) := do
       rem := rem ++ [g1]
       continue
     setGoals [g1]
-    try evalTactic (← `(tactic|
-      (simp_all [Qed.everyElement, Qed.everyElementL,
-                 Qed.attrClasses, Qed.attrRole, Qed.hasOneClass,
-                 Qed.Html.a11yValid, Qed.Html.imgsHaveAlt, Qed.Html.imgsHaveAltList,
-                 Qed.Html.buttonsAccessible, Qed.Html.buttonsAccessibleList,
-                 Qed.Html.elemHasAccessibleName, Qed.Html.hasAccessibleNameChild, Qed.Html.hasAccessibleNameChildren,
-                 Qed.Html.validAriaRoles, Qed.Html.validAriaRolesList, Qed.attrsValidAriaRoles,
-                 Qed.Html.labelsAssociated, Qed.Html.labelsAssociatedList,
-                 Qed.Html.containsFormControl, Qed.Html.containsFormControlList, Qed.isFormControlTag,
-                 Qed.Html.noDuplicateIds, Qed.Html.collectIds, Qed.Html.collectIdsList,
-                 Qed.Html.headingsOrdered, Qed.Html.collectHeadings, Qed.Html.collectHeadingsList,
-                 Qed.Html.htmlHasLang, Qed.Html.htmlHasLangList,
-                 Qed.attrValue, Qed.hasAttr, Qed.hasNonBlankAttr];
-       try decide;
-       try omega))) catch _ => pure ()
+    let leafLems ← (#[``Qed.everyElement, ``Qed.everyElementL,
+      ``Qed.attrClasses, ``Qed.attrRole, ``Qed.hasOneClass] ++ a11yReduceNames).mapM fun n =>
+        `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
+    try evalTactic (← `(tactic| (simp_all [$[$leafLems],*]; try decide; try omega))) catch _ => pure ()
     for g2 in (← getGoals) do
       setGoals [g2]
       try runCloseExhaustiveEnum catch _ => pure ()
@@ -329,14 +315,6 @@ private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM U
       else "Styling invariant"
     throwErrorAt nm m!"{label} `{nm.getId}` failed in `{vName}`:\n  • `{predStr}` does not hold in every state{extraBody}\n\nHint: {diagnosis}"
 
-elab "qedUnfoldViewHelpers" : tactic => runUnfoldViewHelpers
-elab "qedCloseExhaustiveEnum" : tactic => runCloseExhaustiveEnum
-elab "qedSplitFiniteEnums" : tactic => runSplitFiniteEnums
-elab "qedSkipIfFalse" tac:tactic : tactic => do
-  let tgt ← instantiateMVars (← getMainTarget)
-  if tgt.isFalse then return
-  evalTactic tac
-elab "qedStyleSimpPass" : tactic => runStyleSimpPass
 elab "qedStyleReduce " view:ident : tactic => runStyleReduce view
 elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic =>
   runDischargeStyling view nm predLit

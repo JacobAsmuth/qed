@@ -84,15 +84,7 @@ elab "qedDischargeReachable" upd:term:max initT:term:max nm:ident labelLit:str :
   if initInner.raw.isIdent then
     unfoldL := unfoldL.push (← `(Lean.Parser.Tactic.simpLemma| $(⟨initInner.raw⟩):term))
   let env0 ← getEnv
-  let extraDictNames : Array Name := (#[
-    `Qed.Dict.emptyCollection_eq_empty, `Qed.Dict.getElem_eq_get,
-    `Qed.Lang.QedMem.mem_dict, `Qed.Lang.QedMemProp.memProp_dict,
-    `Qed.Dict.get_empty, `Qed.Dict.contains_empty, `Qed.Dict.size_empty, `Qed.Dict.isEmpty_empty,
-    `Qed.Dict.get_set, `Qed.Dict.get_set_self, `Qed.Dict.contains_set, `Qed.Dict.contains_set_self,
-    `Qed.Dict.get_remove, `Qed.Dict.get_remove_self, `Qed.Dict.contains_remove, `Qed.Dict.contains_remove_self,
-    `Qed.Dict.size_set, `Qed.Dict.isEmpty_iff_size
-  ]).filter env0.contains
-  for dn in extraDictNames do
+  for dn in Qed.dictSimpNames.filter env0.contains do
     unfoldL := unfoldL.push (← `(Lean.Parser.Tactic.simpLemma| $(mkIdent dn):term))
   try
     evalTactic (← `(tactic|

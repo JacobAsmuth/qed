@@ -65,42 +65,28 @@ def decodeVarintList : List UInt8 → Except String (Nat × List UInt8)
         let (hi, rem) ← decodeVarintList rest
         return ((b.toNat - 128) + 128 * hi, rem)
 
-def encodeFixed32List (v : UInt32) : List UInt8 :=
-  let n := v.toNat
-  [ UInt8.ofNat (n % 256),
-    UInt8.ofNat ((n / 256) % 256),
-    UInt8.ofNat ((n / 65536) % 256),
-    UInt8.ofNat ((n / 16777216) % 256) ]
+def encodeLEList : Nat → Nat → List UInt8
+  | 0, _     => []
+  | k + 1, n => UInt8.ofNat (n % 256) :: encodeLEList k (n / 256)
 
-def decodeFixed32List : List UInt8 → Except String (UInt32 × List UInt8)
-  | b0 :: b1 :: b2 :: b3 :: rest =>
-      let n := b0.toNat + 256 * b1.toNat + 65536 * b2.toNat + 16777216 * b3.toNat
-      .ok (UInt32.ofNat n, rest)
-  | _ => .error "protobuf: truncated fixed32"
+def decodeLEList : Nat → List UInt8 → Option (Nat × List UInt8)
+  | 0, bs          => some (0, bs)
+  | k + 1, b :: bs => (decodeLEList k bs).map fun (hi, rem) => (b.toNat + 256 * hi, rem)
+  | _ + 1, []      => none
 
-def encodeFixed64List (v : UInt64) : List UInt8 :=
-  let n := v.toNat
-  [ UInt8.ofNat (n % 256),
-    UInt8.ofNat ((n / 256) % 256),
-    UInt8.ofNat ((n / 65536) % 256),
-    UInt8.ofNat ((n / 16777216) % 256),
-    UInt8.ofNat ((n / 4294967296) % 256),
-    UInt8.ofNat ((n / 1099511627776) % 256),
-    UInt8.ofNat ((n / 281474976710656) % 256),
-    UInt8.ofNat ((n / 72057594037927936) % 256) ]
+def encodeFixed32List (v : UInt32) : List UInt8 := encodeLEList 4 v.toNat
 
-def decodeFixed64List : List UInt8 → Except String (UInt64 × List UInt8)
-  | b0 :: b1 :: b2 :: b3 :: b4 :: b5 :: b6 :: b7 :: rest =>
-      let n := b0.toNat
-        + 256 * b1.toNat
-        + 65536 * b2.toNat
-        + 16777216 * b3.toNat
-        + 4294967296 * b4.toNat
-        + 1099511627776 * b5.toNat
-        + 281474976710656 * b6.toNat
-        + 72057594037927936 * b7.toNat
-      .ok (UInt64.ofNat n, rest)
-  | _ => .error "protobuf: truncated fixed64"
+def decodeFixed32List (bs : List UInt8) : Except String (UInt32 × List UInt8) :=
+  match decodeLEList 4 bs with
+  | some (n, rest) => .ok (UInt32.ofNat n, rest)
+  | none           => .error "protobuf: truncated fixed32"
+
+def encodeFixed64List (v : UInt64) : List UInt8 := encodeLEList 8 v.toNat
+
+def decodeFixed64List (bs : List UInt8) : Except String (UInt64 × List UInt8) :=
+  match decodeLEList 8 bs with
+  | some (n, rest) => .ok (UInt64.ofNat n, rest)
+  | none           => .error "protobuf: truncated fixed64"
 
 def bytesToList (b : ByteArray) : List UInt8 := b.data.toList
 def bytesOfList (xs : List UInt8) : ByteArray := ByteArray.mk xs.toArray
@@ -233,33 +219,21 @@ termination_by limit - pos
 
 def readFixed32At (buf : @& ByteArray) (pos limit : Nat) : Except String (UInt32 × Nat) :=
   if h : pos + 4 ≤ limit ∧ limit ≤ buf.size then
-    let b0 := buf[pos]'(by omega)
-    let b1 := buf[pos + 1]'(by omega)
-    let b2 := buf[pos + 2]'(by omega)
-    let b3 := buf[pos + 3]'(by omega)
-    let n := b0.toNat + 256 * b1.toNat + 65536 * b2.toNat + 16777216 * b3.toNat
+    let b0 := buf[pos]'(by omega); let b1 := buf[pos + 1]'(by omega)
+    let b2 := buf[pos + 2]'(by omega); let b3 := buf[pos + 3]'(by omega)
+    let n := b0.toNat + 256 * (b1.toNat + 256 * (b2.toNat + 256 * b3.toNat))
     .ok (UInt32.ofNat n, pos + 4)
   else
     .error "protobuf: truncated fixed32"
 
 def readFixed64At (buf : @& ByteArray) (pos limit : Nat) : Except String (UInt64 × Nat) :=
   if h : pos + 8 ≤ limit ∧ limit ≤ buf.size then
-    let b0 := buf[pos]'(by omega)
-    let b1 := buf[pos + 1]'(by omega)
-    let b2 := buf[pos + 2]'(by omega)
-    let b3 := buf[pos + 3]'(by omega)
-    let b4 := buf[pos + 4]'(by omega)
-    let b5 := buf[pos + 5]'(by omega)
-    let b6 := buf[pos + 6]'(by omega)
-    let b7 := buf[pos + 7]'(by omega)
-    let n := b0.toNat
-      + 256 * b1.toNat
-      + 65536 * b2.toNat
-      + 16777216 * b3.toNat
-      + 4294967296 * b4.toNat
-      + 1099511627776 * b5.toNat
-      + 281474976710656 * b6.toNat
-      + 72057594037927936 * b7.toNat
+    let b0 := buf[pos]'(by omega); let b1 := buf[pos + 1]'(by omega)
+    let b2 := buf[pos + 2]'(by omega); let b3 := buf[pos + 3]'(by omega)
+    let b4 := buf[pos + 4]'(by omega); let b5 := buf[pos + 5]'(by omega)
+    let b6 := buf[pos + 6]'(by omega); let b7 := buf[pos + 7]'(by omega)
+    let n := b0.toNat + 256 * (b1.toNat + 256 * (b2.toNat + 256 * (b3.toNat +
+      256 * (b4.toNat + 256 * (b5.toNat + 256 * (b6.toNat + 256 * b7.toNat))))))
     .ok (UInt64.ofNat n, pos + 8)
   else
     .error "protobuf: truncated fixed64"
@@ -302,13 +276,15 @@ def readFieldsLoop (fuel : Nat) (buf : @& ByteArray) (pos limit : Nat)
   else match fuel with
     | 0 => .error "protobuf: field budget exhausted"
     | fuel' + 1 =>
+        let fallback := fun () => match readFieldAt buf pos limit with
+          | .error e => .error e
+          | .ok (fw, pos') => readFieldsLoop fuel' buf pos' limit (fw :: acc)
         if h2 : pos + 1 < limit ∧ limit ≤ buf.size then
           let tagB := buf[pos]'(by omega)
           let b1 := buf[pos + 1]'(by omega)
           if tagB.toNat < 128 && b1.toNat < 128 then
-            let tag := tagB.toNat
-            let fn := tag / 8
-            let wt := tag % 8
+            let fn := tagB.toNat / 8
+            let wt := tagB.toNat % 8
             if fn != 0 && wt == 0 then
               readFieldsLoop fuel' buf (pos + 2) limit ((fn, .varint b1.toNat) :: acc)
             else if fn != 0 && wt == 2 then
@@ -316,15 +292,9 @@ def readFieldsLoop (fuel : Nat) (buf : @& ByteArray) (pos limit : Nat)
               if endPos ≤ limit then
                 readFieldsLoop fuel' buf endPos limit ((fn, .bytes (buf.extract (pos + 2) endPos)) :: acc)
               else .error "protobuf: truncated length-delimited field"
-            else match readFieldAt buf pos limit with
-              | .error e => .error e
-              | .ok (fw, pos') => readFieldsLoop fuel' buf pos' limit (fw :: acc)
-          else match readFieldAt buf pos limit with
-            | .error e => .error e
-            | .ok (fw, pos') => readFieldsLoop fuel' buf pos' limit (fw :: acc)
-        else match readFieldAt buf pos limit with
-          | .error e => .error e
-          | .ok (fw, pos') => readFieldsLoop fuel' buf pos' limit (fw :: acc)
+            else fallback ()
+          else fallback ()
+        else fallback ()
 
 def decodeFieldsFast (buf : ByteArray) : Except String (List (Nat × WireVal)) :=
   readFieldsLoop buf.size buf 0 buf.size []

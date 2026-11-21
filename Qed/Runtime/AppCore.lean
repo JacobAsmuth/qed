@@ -42,6 +42,25 @@ theorem App.valid_app_view (app : App Model Msg) (m : Model) :
     Html.valid (app.view m) = true :=
   app.valid_view m
 
+declare_syntax_cat appProjPair
+syntax ident " := " term : appProjPair
+
+macro "defAppProjSimps " pre:ident binders:bracketedBinder* " => " lhs:term
+    " with " "[" pairs:appProjPair,* "]" : command => do
+  let mut cmds := #[]
+  for p in pairs.getElems do
+    match p with
+    | `(appProjPair| $fld:ident := $rhs:term) =>
+        let thm := Lean.mkIdentFrom pre (pre.getId.appendAfter ("_" ++ fld.getId.eraseMacroScopes.toString))
+        cmds := cmds.push (← `(command| @[simp] theorem $thm $binders* : ($lhs).$fld = $rhs := rfl))
+    | _ => Lean.Macro.throwUnsupported
+  return ⟨Lean.mkNullNode cmds⟩
+
+macro "defAppProjSimps " pre:ident binders:bracketedBinder* " => " lhs:term " preserves " app:ident : command =>
+  `(command| defAppProjSimps $pre $binders* => $lhs with
+      [init := ($app).init, update := ($app).update, template := ($app).template,
+       dehydrate := ($app).dehydrate, rehydrate := ($app).rehydrate])
+
 namespace Internal
 
 def mkAppCore (init : Model) (update : Model → Msg → Model × Cmd Msg)
@@ -102,27 +121,11 @@ def App.withStylesheets (sheets : List String) (app : App Model Msg) : App Model
 def App.withExtraStyles (extra : List Style) (app : App Model Msg) : App Model Msg :=
   { app with styles := extra ++ app.styles }
 
-@[simp] theorem App.withStylesheets_init (sheets : List String) (app : App Model Msg) :
-    (App.withStylesheets sheets app).init = app.init := rfl
-@[simp] theorem App.withStylesheets_update (sheets : List String) (app : App Model Msg) :
-    (App.withStylesheets sheets app).update = app.update := rfl
-@[simp] theorem App.withStylesheets_template (sheets : List String) (app : App Model Msg) :
-    (App.withStylesheets sheets app).template = app.template := rfl
-@[simp] theorem App.withStylesheets_dehydrate (sheets : List String) (app : App Model Msg) :
-    (App.withStylesheets sheets app).dehydrate = app.dehydrate := rfl
-@[simp] theorem App.withStylesheets_rehydrate (sheets : List String) (app : App Model Msg) :
-    (App.withStylesheets sheets app).rehydrate = app.rehydrate := rfl
+defAppProjSimps App.withStylesheets (sheets : List String) (app : App Model Msg) =>
+  App.withStylesheets sheets app preserves app
 
-@[simp] theorem App.withExtraStyles_init (extra : List Style) (app : App Model Msg) :
-    (App.withExtraStyles extra app).init = app.init := rfl
-@[simp] theorem App.withExtraStyles_update (extra : List Style) (app : App Model Msg) :
-    (App.withExtraStyles extra app).update = app.update := rfl
-@[simp] theorem App.withExtraStyles_template (extra : List Style) (app : App Model Msg) :
-    (App.withExtraStyles extra app).template = app.template := rfl
-@[simp] theorem App.withExtraStyles_dehydrate (extra : List Style) (app : App Model Msg) :
-    (App.withExtraStyles extra app).dehydrate = app.dehydrate := rfl
-@[simp] theorem App.withExtraStyles_rehydrate (extra : List Style) (app : App Model Msg) :
-    (App.withExtraStyles extra app).rehydrate = app.rehydrate := rfl
+defAppProjSimps App.withExtraStyles (extra : List Style) (app : App Model Msg) =>
+  App.withExtraStyles extra app preserves app
 
 end Internal
 
@@ -224,26 +227,10 @@ def App.withHead (f : Model → HeadMeta) (app : App Model Msg) : App Model Msg 
 def App.withSsrStatus (f : Model → Nat) (app : App Model Msg) : App Model Msg :=
   { app with ssrStatus := f }
 
-@[simp] theorem App.withHead_init (f : Model → HeadMeta) (app : App Model Msg) :
-    (App.withHead f app).init = app.init := rfl
-@[simp] theorem App.withHead_update (f : Model → HeadMeta) (app : App Model Msg) :
-    (App.withHead f app).update = app.update := rfl
-@[simp] theorem App.withHead_template (f : Model → HeadMeta) (app : App Model Msg) :
-    (App.withHead f app).template = app.template := rfl
-@[simp] theorem App.withHead_dehydrate (f : Model → HeadMeta) (app : App Model Msg) :
-    (App.withHead f app).dehydrate = app.dehydrate := rfl
-@[simp] theorem App.withHead_rehydrate (f : Model → HeadMeta) (app : App Model Msg) :
-    (App.withHead f app).rehydrate = app.rehydrate := rfl
+defAppProjSimps App.withHead (f : Model → HeadMeta) (app : App Model Msg) =>
+  App.withHead f app preserves app
 
-@[simp] theorem App.withSsrStatus_init (f : Model → Nat) (app : App Model Msg) :
-    (App.withSsrStatus f app).init = app.init := rfl
-@[simp] theorem App.withSsrStatus_update (f : Model → Nat) (app : App Model Msg) :
-    (App.withSsrStatus f app).update = app.update := rfl
-@[simp] theorem App.withSsrStatus_template (f : Model → Nat) (app : App Model Msg) :
-    (App.withSsrStatus f app).template = app.template := rfl
-@[simp] theorem App.withSsrStatus_dehydrate (f : Model → Nat) (app : App Model Msg) :
-    (App.withSsrStatus f app).dehydrate = app.dehydrate := rfl
-@[simp] theorem App.withSsrStatus_rehydrate (f : Model → Nat) (app : App Model Msg) :
-    (App.withSsrStatus f app).rehydrate = app.rehydrate := rfl
+defAppProjSimps App.withSsrStatus (f : Model → Nat) (app : App Model Msg) =>
+  App.withSsrStatus f app preserves app
 
 end Qed

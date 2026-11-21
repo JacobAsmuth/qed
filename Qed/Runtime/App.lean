@@ -24,52 +24,25 @@ def mkRoutedApp {R : Type} [Router R] [Inhabited R]
     App Model Msg :=
   mkRoutedAppCore init update template onRoute start locals styles onPort onSession valid_view
 
-@[simp] theorem mkApp_init (init : Model) (u : Model → Msg → Model × Cmd Msg)
-    (t : View Model Msg) (s l st p os hv) :
-    (mkApp init u t s l st p os hv).init = (init, s) := rfl
-@[simp] theorem mkApp_update (init : Model) (u : Model → Msg → Model × Cmd Msg)
-    (t : View Model Msg) (s l st p os hv) :
-    (mkApp init u t s l st p os hv).update = u := rfl
-@[simp] theorem mkApp_template (init : Model) (u : Model → Msg → Model × Cmd Msg)
-    (t : View Model Msg) (s l st p os hv) :
-    (mkApp init u t s l st p os hv).template = t := rfl
-@[simp] theorem mkApp_dehydrate (init : Model) (u : Model → Msg → Model × Cmd Msg)
-    (t : View Model Msg) (s l st p os hv) :
-    (mkApp init u t s l st p os hv).dehydrate = fun _ => "" := rfl
-@[simp] theorem mkApp_rehydrate (init : Model) (u : Model → Msg → Model × Cmd Msg)
-    (t : View Model Msg) (s l st p os hv) :
-    (mkApp init u t s l st p os hv).rehydrate = fun _ => none := rfl
-@[simp] theorem mkRoutedApp_init {R : Type} [Router R] [Inhabited R]
-    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) :
-    (mkRoutedApp init u t r s l st p os hv).init = (init, s) := rfl
-@[simp] theorem mkRoutedApp_update {R : Type} [Router R] [Inhabited R]
-    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) :
-    (mkRoutedApp init u t r s l st p os hv).update = u := rfl
-@[simp] theorem mkRoutedApp_template {R : Type} [Router R] [Inhabited R]
-    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) :
-    (mkRoutedApp init u t r s l st p os hv).template = t := rfl
-@[simp] theorem mkRoutedApp_dehydrate {R : Type} [Router R] [Inhabited R]
-    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) :
-    (mkRoutedApp init u t r s l st p os hv).dehydrate = fun _ => "" := rfl
-@[simp] theorem mkRoutedApp_rehydrate {R : Type} [Router R] [Inhabited R]
-    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) :
-    (mkRoutedApp init u t r s l st p os hv).rehydrate = fun _ => none := rfl
+defAppProjSimps mkApp (init : Model) (u : Model → Msg → Model × Cmd Msg)
+    (t : View Model Msg) (s l st p os hv) => mkApp init u t s l st p os hv with
+  [init := (init, s), update := u, template := t, dehydrate := fun _ => "", rehydrate := fun _ => none]
+
+defAppProjSimps mkRoutedApp {R : Type} [Router R] [Inhabited R]
+    (init : Model) (u : Model → Msg → Model × Cmd Msg) (t : View Model Msg) (r : R → Msg) (s l st p os hv) =>
+    mkRoutedApp init u t r s l st p os hv with
+  [init := (init, s), update := u, template := t, dehydrate := fun _ => "", rehydrate := fun _ => none]
 
 @[reducible] def App.withDehydrate {Model Msg : Type} (d : Dehydrate Model) (app : App Model Msg)
     (hview : ∀ m, View.render app.template (d.project m) = View.render app.template m := by
       qedProveDehydrateView) : App Model Msg :=
   App.withDehydrateCore d app hview
 
-@[simp] theorem App.withDehydrate_init (d : Dehydrate Model) (app : App Model Msg) (hv) :
-    (App.withDehydrate d app hv).init = app.init := rfl
-@[simp] theorem App.withDehydrate_update (d : Dehydrate Model) (app : App Model Msg) (hv) :
-    (App.withDehydrate d app hv).update = app.update := rfl
-@[simp] theorem App.withDehydrate_template (d : Dehydrate Model) (app : App Model Msg) (hv) :
-    (App.withDehydrate d app hv).template = app.template := rfl
-@[simp] theorem App.withDehydrate_dehydrate (d : Dehydrate Model) (app : App Model Msg) (hv) :
-    (App.withDehydrate d app hv).dehydrate = d.dehydrate := rfl
-@[simp] theorem App.withDehydrate_rehydrate (d : Dehydrate Model) (app : App Model Msg) (hv) :
-    (App.withDehydrate d app hv).rehydrate = d.rehydrate := rfl
+defAppProjSimps App.withDehydrate (d : Dehydrate Model) (app : App Model Msg) (hv) =>
+    App.withDehydrate d app hv with
+  [init := app.init, update := app.update, template := app.template,
+   dehydrate := d.dehydrate, rehydrate := d.rehydrate]
+
 @[simp] theorem App.withDehydrate_rehydrate_dehydrate (d : Dehydrate Model) (app : App Model Msg) (hv) (m : Model) :
     (App.withDehydrate d app hv).rehydrate ((App.withDehydrate d app hv).dehydrate m) = some (d.project m) :=
   d.round_trip m
@@ -86,18 +59,9 @@ def App.guardRehydrate {Model Msg : Type} (Inv : Model → Prop) [DecidablePred 
       qedProveDehydrateInv) : App Model Msg :=
   App.guardRehydrateCore Inv app hpres
 
-@[simp] theorem App.guardRehydrate_init {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
-    (app : App Model Msg) (hp) :
-    (App.guardRehydrate Inv app hp).init = app.init := rfl
-@[simp] theorem App.guardRehydrate_update {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
-    (app : App Model Msg) (hp) :
-    (App.guardRehydrate Inv app hp).update = app.update := rfl
-@[simp] theorem App.guardRehydrate_template {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
-    (app : App Model Msg) (hp) :
-    (App.guardRehydrate Inv app hp).template = app.template := rfl
-@[simp] theorem App.guardRehydrate_dehydrate {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
-    (app : App Model Msg) (hp) :
-    (App.guardRehydrate Inv app hp).dehydrate = app.dehydrate := rfl
+defAppProjSimps App.guardRehydrate {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
+    (app : App Model Msg) (hp) => App.guardRehydrate Inv app hp with
+  [init := app.init, update := app.update, template := app.template, dehydrate := app.dehydrate]
 
 theorem App.guardRehydrate_sound {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
     (app : App Model Msg) (hp) (raw : String) (m' : Model)

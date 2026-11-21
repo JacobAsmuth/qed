@@ -31,93 +31,31 @@ theorem decodeVarintList_append (n : Nat) (rest : List UInt8) :
 theorem uint8_ext {a b : UInt8} (h : a.toNat = b.toNat) : a = b :=
   UInt8.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq h)
 
-private theorem uint32_ext {a b : UInt32} (h : a.toNat = b.toNat) : a = b :=
-  UInt32.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq h)
-
-private theorem uint64_ext {a b : UInt64} (h : a.toNat = b.toNat) : a = b :=
-  UInt64.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq h)
-
-private theorem base_decomp (a b n : Nat) :
-    n % a + a * (n / a % b) = n % (a * b) := by
-  have h1 := Nat.mod_mul_right_div_self n a b
-  have h2 := Nat.mod_add_div (n % (a * b)) a
-  rw [Nat.mod_mod_of_dvd n (Nat.dvd_mul_right a b), h1] at h2
-  exact h2
-
-private theorem base256_4 (n : Nat) :
-    n % 256 + 256 * (n / 256 % 256)
-      + 65536 * (n / 65536 % 256)
-      + 16777216 * (n / 16777216 % 256) = n % 4294967296 := by
-  have hlo : n % 256 + 256 * (n / 256 % 256) = n % 65536 := base_decomp 256 256 n
-  have hhi : n / 65536 % 256 + 256 * (n / 16777216 % 256) = n / 65536 % 65536 := by
-    have h := base_decomp 256 256 (n / 65536)
-    rwa [Nat.div_div_eq_div_mul] at h
-  have hcomb : n % 65536 + 65536 * (n / 65536 % 65536) = n % 4294967296 :=
-    base_decomp 65536 65536 n
-  have h16 : (16777216 : Nat) = 65536 * 256 := rfl
-  rw [hlo, Nat.add_assoc, h16, Nat.mul_assoc 65536 256, ← Nat.mul_add 65536, hhi, hcomb]
+private theorem decodeLEList_encodeLEList :
+    ∀ (k n : Nat) (rest : List UInt8),
+      decodeLEList k (encodeLEList k n ++ rest) = some (n % 256 ^ k, rest)
+  | 0, n, rest => by simp [encodeLEList, decodeLEList, Nat.mod_one]
+  | k + 1, n, rest => by
+      simp only [encodeLEList, List.cons_append, decodeLEList, decodeLEList_encodeLEList k (n / 256) rest,
+        Option.map_some, Option.some.injEq, Prod.mk.injEq, and_true]
+      have hmod : (UInt8.ofNat (n % 256)).toNat = n % 256 := by simp
+      have h1 := Nat.mod_mul_right_div_self n 256 (256 ^ k)
+      have h2 := Nat.mod_add_div (n % (256 * 256 ^ k)) 256
+      rw [Nat.mod_mod_of_dvd n (Nat.dvd_mul_right 256 (256 ^ k)), h1] at h2
+      rw [hmod, Nat.pow_succ']
+      exact h2
 
 theorem decodeFixed32List_append (v : UInt32) (rest : List UInt8) :
     decodeFixed32List (encodeFixed32List v ++ rest) = .ok (v, rest) := by
-  have hn' : v.toNat < 4294967296 := v.toBitVec.isLt
-  unfold encodeFixed32List decodeFixed32List
-  simp only [List.cons_append, List.nil_append]
-  congr 1
-  apply Prod.ext
-  · apply uint32_ext
-    change (v.toNat % 256 % 256
-      + 256 * (v.toNat / 256 % 256 % 256)
-      + 65536 * (v.toNat / 65536 % 256 % 256)
-      + 16777216 * (v.toNat / 16777216 % 256 % 256)) % 4294967296 = v.toNat
-    simp only [Nat.mod_mod]
-    rw [base256_4, Nat.mod_mod, Nat.mod_eq_of_lt hn']
-  · rfl
+  have hlt : v.toNat < 256 ^ 4 := v.toBitVec.isLt
+  simp only [encodeFixed32List, decodeFixed32List, decodeLEList_encodeLEList,
+    Nat.mod_eq_of_lt hlt, UInt32.ofNat_toNat]
 
 theorem decodeFixed64List_append (v : UInt64) (rest : List UInt8) :
     decodeFixed64List (encodeFixed64List v ++ rest) = .ok (v, rest) := by
-  have hn' : v.toNat < 18446744073709551616 := v.toBitVec.isLt
-  unfold encodeFixed64List decodeFixed64List
-  simp only [List.cons_append, List.nil_append]
-  congr 1
-  apply Prod.ext
-  · apply uint64_ext
-    change (v.toNat % 256 % 256
-      + 256 * (v.toNat / 256 % 256 % 256)
-      + 65536 * (v.toNat / 65536 % 256 % 256)
-      + 16777216 * (v.toNat / 16777216 % 256 % 256)
-      + 4294967296 * (v.toNat / 4294967296 % 256 % 256)
-      + 1099511627776 * (v.toNat / 1099511627776 % 256 % 256)
-      + 281474976710656 * (v.toNat / 281474976710656 % 256 % 256)
-      + 72057594037927936 * (v.toNat / 72057594037927936 % 256 % 256)) % 18446744073709551616 = v.toNat
-    simp only [Nat.mod_mod]
-    have hhi :
-        v.toNat / 4294967296 % 256
-        + 256 * (v.toNat / 1099511627776 % 256)
-        + 65536 * (v.toNat / 281474976710656 % 256)
-        + 16777216 * (v.toNat / 72057594037927936 % 256) = v.toNat / 4294967296 % 4294967296 := by
-      have h := base256_4 (v.toNat / 4294967296)
-      simpa only [Nat.div_div_eq_div_mul] using h
-    have hcomb : v.toNat % 4294967296 + 4294967296 * (v.toNat / 4294967296 % 4294967296) =
-        v.toNat % 18446744073709551616 :=
-      base_decomp 4294967296 4294967296 v.toNat
-    rw [base256_4]
-    have hfact :
-        v.toNat % 4294967296
-          + 4294967296 * (v.toNat / 4294967296 % 256)
-          + 1099511627776 * (v.toNat / 1099511627776 % 256)
-          + 281474976710656 * (v.toNat / 281474976710656 % 256)
-          + 72057594037927936 * (v.toNat / 72057594037927936 % 256) =
-        v.toNat % 4294967296 + 4294967296 * (v.toNat / 4294967296 % 256
-          + 256 * (v.toNat / 1099511627776 % 256)
-          + 65536 * (v.toNat / 281474976710656 % 256)
-          + 16777216 * (v.toNat / 72057594037927936 % 256)) := by
-      have c1 : (1099511627776 : Nat) = 4294967296 * 256 := rfl
-      have c2 : (281474976710656 : Nat) = 4294967296 * 65536 := rfl
-      have c3 : (72057594037927936 : Nat) = 4294967296 * 16777216 := rfl
-      rw [c1, c2, c3]
-      simp only [Nat.mul_add, ← Nat.mul_assoc, Nat.add_assoc]
-    rw [hfact, hhi, hcomb, Nat.mod_mod, Nat.mod_eq_of_lt hn']
-  · rfl
+  have hlt : v.toNat < 256 ^ 8 := v.toBitVec.isLt
+  simp only [encodeFixed64List, decodeFixed64List, decodeLEList_encodeLEList,
+    Nat.mod_eq_of_lt hlt, UInt64.ofNat_toNat]
 
 theorem splitExact_append :
     ∀ (xs rest : List UInt8), splitExact xs.length (xs ++ rest) = some (xs, rest)
@@ -222,33 +160,19 @@ theorem readVarintAt_advances (buf : ByteArray) (pos limit : Nat) {n pos' : Nat}
     pos < pos' ∧ pos' ≤ limit := by
   induction hfuel : limit - pos generalizing pos n with
   | zero =>
-      unfold readVarintAt at h
-      have hnot : ¬ (pos < limit ∧ limit ≤ buf.size) := by omega
-      rw [dif_neg hnot] at h
-      cases h
+      unfold readVarintAt at h; rw [dif_neg (by omega)] at h; cases h
   | succ d ih =>
       unfold readVarintAt at h
-      by_cases hcond : pos < limit ∧ limit ≤ buf.size
-      · rw [dif_pos hcond] at h
-        by_cases hb : (buf[pos]'(Nat.lt_of_lt_of_le hcond.1 hcond.2)).toNat < 128
-        · rw [if_pos hb] at h
-          injection h with hpair
-          injection hpair with _ hp'
-          omega
-        · rw [if_neg hb] at h
-          dsimp only [bind, Except.bind, pure, Except.pure] at h
-          cases hr : readVarintAt buf (pos + 1) limit with
-          | error _ => rw [hr] at h; cases h
-          | ok hp =>
-              rcases hp with ⟨hi, pos''⟩
-              rw [hr] at h
-              injection h with hpair
-              injection hpair with _ hp'
-              subst hp'
-              have hstep := ih (pos + 1) hr (by omega)
-              omega
-      · rw [dif_neg hcond] at h
-        cases h
+      split at h
+      · dsimp only at h
+        split at h
+        · cases h; omega
+        · dsimp only [bind, Except.bind, pure, Except.pure] at h
+          split at h
+          · cases h
+          · rename_i hi pos'' hr; cases h
+            have := ih (pos + 1) hr (by omega); omega
+      · cases h
 
 theorem readPayloadAt_bounds (wt : Nat) (buf : ByteArray) (pos limit : Nat) {w : WireVal} {pos' : Nat}
     (h : readPayloadAt wt buf pos limit = .ok (w, pos')) :
@@ -257,46 +181,29 @@ theorem readPayloadAt_bounds (wt : Nat) (buf : ByteArray) (pos limit : Nat) {w :
   match wt with
   | 0 =>
       dsimp only [bind, Except.bind, pure, Except.pure] at h
-      cases hr : readVarintAt buf pos limit with
-      | error _ => rw [hr] at h; cases h
-      | ok vp =>
-          rw [hr] at h
-          injection h with hpair
-          injection hpair with _ hp'
-          have hadv := readVarintAt_advances buf pos limit hr
-          omega
+      split at h
+      · cases h
+      · rename_i hr; cases h; have := readVarintAt_advances buf pos limit hr; omega
   | 1 =>
       unfold readFixed64At at h
       dsimp only [bind, Except.bind, pure, Except.pure] at h
-      by_cases hc : pos + 8 ≤ limit ∧ limit ≤ buf.size
-      · rw [dif_pos hc] at h
-        injection h with hpair
-        injection hpair with _ hp'
-        omega
-      · rw [dif_neg hc] at h; cases h
+      split at h
+      · cases h
+      · rename_i heq; cases h; split at heq <;> cases heq; omega
   | 2 =>
       dsimp only [bind, Except.bind] at h
-      cases hr : readVarintAt buf pos limit with
-      | error _ => rw [hr] at h; cases h
-      | ok vp =>
-          rw [hr] at h
-          dsimp only at h
-          have hadv := readVarintAt_advances buf pos limit hr
-          by_cases hc : vp.2 + vp.1 ≤ limit ∧ limit ≤ buf.size
-          · rw [if_pos hc] at h
-            injection h with hpair
-            injection hpair with _ hp'
-            omega
-          · rw [if_neg hc] at h; cases h
+      split at h
+      · cases h
+      · rename_i hr; have := readVarintAt_advances buf pos limit hr
+        split at h
+        · cases h; omega
+        · cases h
   | 5 =>
       unfold readFixed32At at h
       dsimp only [bind, Except.bind, pure, Except.pure] at h
-      by_cases hc : pos + 4 ≤ limit ∧ limit ≤ buf.size
-      · rw [dif_pos hc] at h
-        injection h with hpair
-        injection hpair with _ hp'
-        omega
-      · rw [dif_neg hc] at h; cases h
+      split at h
+      · cases h
+      · rename_i heq; cases h; split at heq <;> cases heq; omega
   | 3 | 4 | n + 6 => cases h
 
 /-- Linear DoS termination bound: every decoded Protobuf field strictly advances the byte cursor
@@ -307,23 +214,14 @@ theorem cursor_strictly_advances (buf : ByteArray) (pos limit : Nat)
     pos < pos' ∧ pos' ≤ limit := by
   unfold readFieldAt at h
   dsimp only [bind, Except.bind, pure, Except.pure] at h
-  cases htag : readVarintAt buf pos limit with
-  | error _ => rw [htag] at h; cases h
-  | ok tp =>
-      rw [htag] at h
-      dsimp only at h
-      have htagAdv := readVarintAt_advances buf pos limit htag
-      by_cases hf0 : (tp.1 / 8 == 0) = true
-      · rw [if_pos hf0] at h; cases h
-      · rw [if_neg hf0] at h
-        cases hpay : readPayloadAt (tp.1 % 8) buf tp.2 limit with
-        | error _ => rw [hpay] at h; cases h
-        | ok wp =>
-            rw [hpay] at h
-            injection h with hpair
-            injection hpair with _ hp'
-            have hpayBnd := readPayloadAt_bounds (tp.1 % 8) buf tp.2 limit hpay
-            omega
+  split at h
+  · cases h
+  · rename_i tp htag; have := readVarintAt_advances buf pos limit htag
+    split at h
+    · cases h
+    · split at h
+      · cases h
+      · rename_i hpay; cases h; have := readPayloadAt_bounds (tp.1 % 8) buf tp.2 limit hpay; omega
 
 /-- Rolling-deploy forward compatibility: unknown field tags placed before or after known schema
     fields never alter lookup of known fields. -/
@@ -389,11 +287,11 @@ private theorem writeVarint_toList (n : Nat) (buf : ByteArray) :
 
 private theorem writeFixed32_toList (buf : ByteArray) (v : UInt32) :
     bytesToList (writeFixed32 buf v) = bytesToList buf ++ encodeFixed32List v := by
-  simp [writeFixed32, encodeFixed32List, bytesToList_push, List.append_assoc]
+  simp [writeFixed32, encodeFixed32List, encodeLEList, bytesToList_push, List.append_assoc, Nat.div_div_eq_div_mul]
 
 private theorem writeFixed64_toList (buf : ByteArray) (v : UInt64) :
     bytesToList (writeFixed64 buf v) = bytesToList buf ++ encodeFixed64List v := by
-  simp [writeFixed64, encodeFixed64List, bytesToList_push, List.append_assoc]
+  simp [writeFixed64, encodeFixed64List, encodeLEList, bytesToList_push, List.append_assoc, Nat.div_div_eq_div_mul]
 
 private theorem writePayload_toList (buf : ByteArray) (w : WireVal) :
     bytesToList (writePayload buf w) = bytesToList buf ++ encodePayloadList w := by
@@ -521,7 +419,7 @@ private theorem readFixed32At_eq_spec (buf : ByteArray) (pos limit : Nat)
   by_cases h : pos + 4 ≤ limit ∧ limit ≤ buf.size
   · rw [dif_pos h, sliceList_cons ⟨by omega, hlim⟩, sliceList_cons ⟨by omega, hlim⟩,
         sliceList_cons ⟨by omega, hlim⟩, sliceList_cons ⟨by omega, hlim⟩]
-    rfl
+    simp [decodeFixed32List, decodeLEList, Except.map]
   · rw [dif_neg h]
     have hlen := sliceList_len_le buf pos limit
     match hsl : sliceList buf pos limit with
@@ -538,7 +436,7 @@ private theorem readFixed64At_eq_spec (buf : ByteArray) (pos limit : Nat)
         sliceList_cons ⟨by omega, hlim⟩, sliceList_cons ⟨by omega, hlim⟩,
         sliceList_cons ⟨by omega, hlim⟩, sliceList_cons ⟨by omega, hlim⟩,
         sliceList_cons ⟨by omega, hlim⟩, sliceList_cons ⟨by omega, hlim⟩]
-    rfl
+    simp [decodeFixed64List, decodeLEList, Except.map]
   · rw [dif_neg h]
     have hlen := sliceList_len_le buf pos limit
     match hsl : sliceList buf pos limit with
@@ -627,25 +525,16 @@ private theorem readFieldsLoop_eq_spec (buf : ByteArray)
   induction fuel generalizing pos acc with
   | zero =>
       by_cases heq : (pos == limit) = true
-      · have hp' : pos = limit := beq_iff_eq.1 heq
-        subst hp'
-        unfold readFieldsLoop
-        rw [if_pos heq, sliceList_eq_nil (Nat.le_refl pos)]
-        rfl
+      · have hp' := beq_iff_eq.1 heq; subst hp'
+        unfold readFieldsLoop; rw [if_pos heq, sliceList_eq_nil (Nat.le_refl pos)]; rfl
       · have hne : pos ≠ limit := beq_eq_false_iff_ne.1 (Bool.eq_false_iff.2 heq)
-        unfold readFieldsLoop
-        rw [if_neg heq, sliceList_cons ⟨by omega, hlim⟩]
-        rfl
+        unfold readFieldsLoop; rw [if_neg heq, sliceList_cons ⟨by omega, hlim⟩]; rfl
   | succ f' ih =>
       by_cases heq : (pos == limit) = true
-      · have hp' : pos = limit := beq_iff_eq.1 heq
-        subst hp'
-        unfold readFieldsLoop
-        rw [if_pos heq, sliceList_eq_nil (Nat.le_refl pos)]
-        rfl
+      · have hp' := beq_iff_eq.1 heq; subst hp'
+        unfold readFieldsLoop; rw [if_pos heq, sliceList_eq_nil (Nat.le_refl pos)]; rfl
       · have hlt : pos < limit := by
-          have hne : pos ≠ limit := beq_eq_false_iff_ne.1 (Bool.eq_false_iff.2 heq)
-          omega
+          have hne : pos ≠ limit := beq_eq_false_iff_ne.1 (Bool.eq_false_iff.2 heq); omega
         have hstep := readFieldAt_eq_spec buf pos limit hlim
         rw [sliceList_cons ⟨hlt, hlim⟩] at hstep
         have hfallback :
@@ -653,35 +542,25 @@ private theorem readFieldsLoop_eq_spec (buf : ByteArray)
               | .error e => .error e
               | .ok (fw, pos') => readFieldsLoop f' buf pos' limit (fw :: acc)) =
             decodeFieldsAux (f' + 1) (sliceList buf pos limit) acc := by
-          rw [sliceList_cons ⟨hlt, hlim⟩]
-          unfold decodeFieldsAux
-          dsimp only [bind, Except.bind]
+          rw [sliceList_cons ⟨hlt, hlim⟩]; unfold decodeFieldsAux; dsimp only [bind, Except.bind]
           rw [← hstep]
           cases hrf : readFieldAt buf pos limit with
           | error _ => rfl
           | ok fwp =>
               have hadv := cursor_strictly_advances buf pos limit hrf
               exact ih fwp.2 (fwp.1 :: acc) (by omega)
-        unfold readFieldsLoop
-        rw [if_neg heq]; dsimp only
+        unfold readFieldsLoop; rw [if_neg heq]; dsimp only
         split
-        · rename_i h2
-          split
+        · rename_i h2; split
           · rename_i hlt128
             simp only [Bool.and_eq_true, decide_eq_true_eq] at hlt128
             split
-            · rename_i hfw0
-              simp only [Bool.and_eq_true] at hfw0
+            · rename_i hfw0; simp only [Bool.and_eq_true] at hfw0
               rw [← hfallback, (readFieldAt_fast_step buf pos limit h2 hlt128.1 hlt128.2 hfw0.1).1 (beq_iff_eq.1 hfw0.2)]
             · split
-              · rename_i _ hfw2
-                simp only [Bool.and_eq_true] at hfw2
+              · rename_i _ hfw2; simp only [Bool.and_eq_true] at hfw2
                 have hrf := (readFieldAt_fast_step buf pos limit h2 hlt128.1 hlt128.2 hfw2.1).2 (beq_iff_eq.1 hfw2.2)
-                split
-                · rename_i hle
-                  rw [← hfallback, hrf, if_pos hle]
-                · rename_i hle
-                  rw [← hfallback, hrf, if_neg hle]
+                split <;> rename_i hle <;> simp [← hfallback, hrf, hle]
               · exact hfallback
           · exact hfallback
         · exact hfallback
@@ -722,6 +601,24 @@ private theorem decodeHexList_encodeHexList :
 
 theorem decodeHex_encodeHex (b : ByteArray) : decodeHex (encodeHex b) = .ok b := by
   simp [encodeHex, decodeHex, String.toList_ofList, decodeHexList_encodeHexList, bytesOfList_bytesToList]
+
+theorem encodeHex_injective {a b : ByteArray} (h : encodeHex a = encodeHex b) : a = b := by
+  have ha := congrArg decodeHex h
+  simp only [decodeHex_encodeHex] at ha
+  exact Except.ok.inj ha
+
+theorem encodeHex_prefix_injective {p : String} {a b : ByteArray}
+    (h : p ++ encodeHex a = p ++ encodeHex b) : a = b := by
+  have hlist := congrArg String.toList h
+  simp only [String.toList_append] at hlist
+  exact encodeHex_injective (String.toList_injective (List.append_cancel_left hlist))
+
+theorem encodeHex_encode_injective {α : Type} {p : String}
+    (enc : α → ByteArray) (dec : ByteArray → Except String α) (hinv : ∀ x, dec (enc x) = .ok x)
+    {a b : α} (h : p ++ encodeHex (enc a) = p ++ encodeHex (enc b)) : a = b := by
+  have hdec := congrArg dec (encodeHex_prefix_injective h)
+  simp only [hinv] at hdec
+  exact Except.ok.inj hdec
 
 private theorem encodeHexLoop_eq_spec (b : ByteArray) :
     ∀ (i : Nat) (acc : List Char),

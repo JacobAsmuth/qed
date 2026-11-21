@@ -73,119 +73,31 @@ structure Runtime where
 
 initialize runtimeRef : IO.Ref (Option Runtime) ← IO.mkRef none
 
-@[export qed_init]
-def qedInit : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.mount
-  | none    => IO.eprintln "qed: no application registered"
+@[inline] private def withRuntime (fallback : IO α) (f : Runtime → IO α) : IO α := do
+  match ← runtimeRef.get with | some rt => f rt | none => fallback
 
-@[export qed_dispatch]
-def qedDispatch (id : UInt32) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.dispatch id
-  | none    => pure ()
+@[inline] private def withRuntimeUnit (f : Runtime → IO Unit) : IO Unit :=
+  withRuntime (pure ()) f
 
-@[export qed_dispatch_str]
-def qedDispatchStr (id : UInt32) (s : String) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.dispatchStr id s
-  | none    => pure ()
-
-@[export qed_stream_chunk]
-def qedStreamChunk (cid : UInt32) (chunk : String) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.streamChunk cid chunk
-  | none    => pure ()
-
-@[export qed_stream_done]
-def qedStreamDone (did : UInt32) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.streamDone did
-  | none    => pure ()
-
-@[export qed_http_done]
-def qedHttpDone (id : UInt32) (ok : UInt32) (text : String) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.httpDone id (ok != 0) text
-  | none    => pure ()
-
-@[export qed_http_bytes_done]
-def qedHttpBytesDone (id : UInt32) (ok : UInt32) (bytes : ByteArray) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.httpBytesDone id (ok != 0) bytes
-  | none    => pure ()
-
-@[export qed_url_changed]
-def qedUrlChanged (path : String) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.urlChanged path
-  | none    => pure ()
-
-@[export qed_local_dispatch]
-def qedLocalDispatch (key : String) (id : UInt32) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.localDispatch key id
-  | none    => pure ()
-
-@[export qed_local_dispatch_str]
-def qedLocalDispatchStr (key : String) (id : UInt32) (s : String) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.localDispatchStr key id s
-  | none    => pure ()
-
-@[export qed_local_snapshot]
-def qedLocalSnapshot : IO String := do
-  match ← runtimeRef.get with
-  | some rt => rt.snapshot
-  | none    => return "{}"
-
-@[export qed_local_restore]
-def qedLocalRestore (s : String) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.restore s
-  | none    => pure ()
-
-@[export qed_dehydrate]
-def qedDehydrate : IO String := do
-  match ← runtimeRef.get with
-  | some rt => rt.dehydrate
-  | none    => pure ""
-
-@[export qed_effect_done]
-def qedEffectDone (id : UInt32) (result : String) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.effectDone id result
-  | none    => pure ()
-
-@[export qed_port_recv]
-def qedPortRecv (name payload : String) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.portRecv name payload
-  | none    => pure ()
-
-@[export qed_ws_open]
-def qedWsOpen (connId : UInt32) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.wsOpen connId
-  | none    => pure ()
-
-@[export qed_ws_bytes]
-def qedWsBytes (connId : UInt32) (bytes : ByteArray) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.wsBytes connId bytes
-  | none    => pure ()
-
-@[export qed_ws_text]
-def qedWsText (connId : UInt32) (text : String) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.wsText connId text
-  | none    => pure ()
-
-@[export qed_ws_close]
-def qedWsClose (connId : UInt32) (err : String) (nowMs : Nat) : IO Unit := do
-  match ← runtimeRef.get with
-  | some rt => rt.wsClose connId err nowMs
-  | none    => pure ()
+@[export qed_init] def qedInit : IO Unit := withRuntime (IO.eprintln "qed: no application registered") (·.mount)
+@[export qed_dispatch] def qedDispatch (id : UInt32) : IO Unit := withRuntimeUnit (·.dispatch id)
+@[export qed_dispatch_str] def qedDispatchStr (id : UInt32) (s : String) : IO Unit := withRuntimeUnit (·.dispatchStr id s)
+@[export qed_stream_chunk] def qedStreamChunk (cid : UInt32) (chunk : String) : IO Unit := withRuntimeUnit (·.streamChunk cid chunk)
+@[export qed_stream_done] def qedStreamDone (did : UInt32) : IO Unit := withRuntimeUnit (·.streamDone did)
+@[export qed_http_done] def qedHttpDone (id ok : UInt32) (text : String) : IO Unit := withRuntimeUnit (·.httpDone id (ok != 0) text)
+@[export qed_http_bytes_done] def qedHttpBytesDone (id ok : UInt32) (bytes : ByteArray) : IO Unit := withRuntimeUnit (·.httpBytesDone id (ok != 0) bytes)
+@[export qed_url_changed] def qedUrlChanged (path : String) : IO Unit := withRuntimeUnit (·.urlChanged path)
+@[export qed_local_dispatch] def qedLocalDispatch (key : String) (id : UInt32) : IO Unit := withRuntimeUnit (·.localDispatch key id)
+@[export qed_local_dispatch_str] def qedLocalDispatchStr (key : String) (id : UInt32) (s : String) : IO Unit := withRuntimeUnit (·.localDispatchStr key id s)
+@[export qed_local_snapshot] def qedLocalSnapshot : IO String := withRuntime (pure "{}") (·.snapshot)
+@[export qed_local_restore] def qedLocalRestore (s : String) : IO Unit := withRuntimeUnit (·.restore s)
+@[export qed_dehydrate] def qedDehydrate : IO String := withRuntime (pure "") (·.dehydrate)
+@[export qed_effect_done] def qedEffectDone (id : UInt32) (result : String) : IO Unit := withRuntimeUnit (·.effectDone id result)
+@[export qed_port_recv] def qedPortRecv (name payload : String) : IO Unit := withRuntimeUnit (·.portRecv name payload)
+@[export qed_ws_open] def qedWsOpen (connId : UInt32) : IO Unit := withRuntimeUnit (·.wsOpen connId)
+@[export qed_ws_bytes] def qedWsBytes (connId : UInt32) (bytes : ByteArray) : IO Unit := withRuntimeUnit (·.wsBytes connId bytes)
+@[export qed_ws_text] def qedWsText (connId : UInt32) (text : String) : IO Unit := withRuntimeUnit (·.wsText connId text)
+@[export qed_ws_close] def qedWsClose (connId : UInt32) (err : String) (nowMs : Nat) : IO Unit := withRuntimeUnit (·.wsClose connId err nowMs)
 
 /-- Parses complete `\n`-terminated SSE `data:` lines out of `buf`, returning `(events, remainder)`. -/
 private def parseSseBuffer (buf : String) : Array String × String :=
@@ -353,29 +265,24 @@ private def renderModel (env : RuntimeEnv Model Msg) : IO Unit := do
       env.vstateRef.set (some vst')
   gcLocals env
 
-private def performRequest (env : RuntimeEnv Model Msg) (method url body : String)
-    (onResult : Except String String → Msg) : IO Unit := do
+private def performHttp {α : Type} (env : RuntimeEnv Model Msg)
+    (cbRef : IO.Ref (Std.HashMap Nat (Except String α → Msg)))
+    (send : UInt32 → IO Unit) (onResult : Except String α → Msg) : IO Unit := do
   let id ← env.cbNextRef.modifyGet (fun n => (n, n + 1))
-  env.respCbRef.modify (·.insert id onResult)
+  cbRef.modify (·.insert id onResult)
   armHttpTimeout env id do
-    if let some f := (← env.respCbRef.get)[id]? then
-      env.respCbRef.modify (·.erase id)
+    if let some f := (← cbRef.get)[id]? then
+      cbRef.modify (·.erase id)
       env.httpTimerRef.modify (·.erase id)
       Dom.effect "http.abort" (toString id) "" ""
       (← env.dispatchRef.get) (f (.error "request timeout"))
-  Dom.httpSend method url body (UInt32.ofNat id)
+  send (UInt32.ofNat id)
 
-private def performRequestBytes (env : RuntimeEnv Model Msg) (method url : String) (body : ByteArray)
-    (onResult : Except String ByteArray → Msg) : IO Unit := do
-  let id ← env.cbNextRef.modifyGet (fun n => (n, n + 1))
-  env.respBytesCbRef.modify (·.insert id onResult)
-  armHttpTimeout env id do
-    if let some f := (← env.respBytesCbRef.get)[id]? then
-      env.respBytesCbRef.modify (·.erase id)
-      env.httpTimerRef.modify (·.erase id)
-      Dom.effect "http.abort" (toString id) "" ""
-      (← env.dispatchRef.get) (f (.error "request timeout"))
-  Dom.httpSendBytes method url body (UInt32.ofNat id)
+private def withOpenExtConn (env : RuntimeEnv Model Msg) (slot : String) (f : UInt32 → IO Unit) : IO Unit := do
+  let some sid := (← env.wsExtSlotRef.get)[slot]? | return
+  let some entry := (← env.wsExtEntriesRef.get)[sid]? | return
+  if entry.isOpen then
+    if let some cid := entry.connId then f cid
 
 private def performWsMuxSub (env : RuntimeEnv Model Msg) (slot url channel : String) (params : ByteArray)
     (rec : Reconnect) (onJoin onMessage : ByteArray → Msg) (onStatus : SocketStatus → Msg) : IO Unit := do
@@ -426,9 +333,9 @@ private def performLeaf (env : RuntimeEnv Model Msg) : Cmd Msg → IO Unit
       | some d => (← env.dispatchRef.get) (onNow d)
       | none   => pure ()
   | .request method url body onResult =>
-      performRequest env method url body onResult
+      performHttp env env.respCbRef (Dom.httpSend method url body) onResult
   | .requestBytes method url body onResult =>
-      performRequestBytes env method url body onResult
+      performHttp env env.respBytesCbRef (Dom.httpSendBytes method url body) onResult
   | .pushPath url => do
       Dom.pushPath url.raw
       match env.app.onUrlChange with
@@ -448,16 +355,8 @@ private def performLeaf (env : RuntimeEnv Model Msg) : Cmd Msg → IO Unit
       if (← env.wsBootedRef.get) then closeMuxSlot env slot
   | .wsExtOpen slot url isBinary rec onJoin onText onBytes onStatus =>
       performWsExtOpen env slot url isBinary rec onJoin onText onBytes onStatus
-  | .wsExtSendText slot text => do
-      let some sid := (← env.wsExtSlotRef.get)[slot]? | return
-      let some entry := (← env.wsExtEntriesRef.get)[sid]? | return
-      if entry.isOpen then
-        if let some cid := entry.connId then Dom.wsSendText cid text
-  | .wsExtSendBytes slot payload => do
-      let some sid := (← env.wsExtSlotRef.get)[slot]? | return
-      let some entry := (← env.wsExtEntriesRef.get)[sid]? | return
-      if entry.isOpen then
-        if let some cid := entry.connId then Dom.wsSendBytes cid payload
+  | .wsExtSendText slot text => withOpenExtConn env slot (Dom.wsSendText · text)
+  | .wsExtSendBytes slot payload => withOpenExtConn env slot (Dom.wsSendBytes · payload)
   | .wsExtClose slot => do
       if (← env.wsBootedRef.get) then closeExtSlot env slot
   | .fx kind a b c => Dom.effect kind a b c
@@ -560,23 +459,19 @@ private def handleStreamDone (env : RuntimeEnv Model Msg) (did : UInt32) : IO Un
       dispatchMsg env msg
   | none => pure ()
 
-private def handleHttpDone (env : RuntimeEnv Model Msg) (id : UInt32) (ok : Bool) (text : String) : IO Unit := do
+private def handleHttpResp {α : Type} (env : RuntimeEnv Model Msg)
+    (cbRef : IO.Ref (Std.HashMap Nat (Except String α → Msg)))
+    (id : UInt32) (res : Except String α) : IO Unit := do
   cancelHttpTimer env id.toNat
-  match (← env.respCbRef.get)[id.toNat]? with
-  | some f => env.respCbRef.modify (·.erase id.toNat); dispatchMsg env (f (if ok then .ok text else .error text))
-  | none   => pure ()
+  if let some f := (← cbRef.get)[id.toNat]? then
+    cbRef.modify (·.erase id.toNat)
+    dispatchMsg env (f res)
 
-private def handleHttpBytesDone (env : RuntimeEnv Model Msg) (id : UInt32) (ok : Bool) (bytes : ByteArray) : IO Unit := do
-  cancelHttpTimer env id.toNat
-  match (← env.respBytesCbRef.get)[id.toNat]? with
-  | some f =>
-      env.respBytesCbRef.modify (·.erase id.toNat)
-      if ok then
-        dispatchMsg env (f (.ok bytes))
-      else
-        let msg := (String.fromUTF8? bytes).getD "RPC transport error"
-        dispatchMsg env (f (.error msg))
-  | none => pure ()
+private def handleHttpDone (env : RuntimeEnv Model Msg) (id : UInt32) (ok : Bool) (text : String) : IO Unit :=
+  handleHttpResp env env.respCbRef id (if ok then .ok text else .error text)
+
+private def handleHttpBytesDone (env : RuntimeEnv Model Msg) (id : UInt32) (ok : Bool) (bytes : ByteArray) : IO Unit :=
+  handleHttpResp env env.respBytesCbRef id (if ok then .ok bytes else .error ((String.fromUTF8? bytes).getD "RPC transport error"))
 
 private def handleUrlChanged (env : RuntimeEnv Model Msg) (path : String) : IO Unit := do
   match env.app.onUrlChange with
@@ -601,6 +496,13 @@ private def handleWsOpen (env : RuntimeEnv Model Msg) (cid : UInt32) : IO Unit :
       dispatchMsg env (entry.handlers.onJoin ())
   | none => pure ()
 
+private def dropMuxSub (env : RuntimeEnv Model Msg) (url : String) (pool : WsMuxPool Msg)
+    (sid : UInt32) (st : SocketStatus) : IO Unit := do
+  let some sub := pool.subs[sid]? | return
+  env.wsMuxSubUrlRef.modify (·.erase sid)
+  env.wsMuxPoolsRef.modify (·.insert url { pool with subs := pool.subs.erase sid })
+  dispatchMsg env (sub.handlers.onStatus st)
+
 private def handleWsBytes (env : RuntimeEnv Model Msg) (cid : UInt32) (bytes : ByteArray) : IO Unit := do
   match (← env.wsConnOwnerRef.get)[cid]? with
   | some (.mux url) =>
@@ -616,16 +518,8 @@ private def handleWsBytes (env : RuntimeEnv Model Msg) (cid : UInt32) (bytes : B
       | .ok (.event sid payload) =>
           if let some sub := pool.subs[sid]? then
             dispatchMsg env (sub.handlers.onMessage payload)
-      | .ok (.err sid msg) =>
-          let some sub := pool.subs[sid]? | return
-          env.wsMuxSubUrlRef.modify (·.erase sid)
-          env.wsMuxPoolsRef.modify (·.insert url { pool with subs := pool.subs.erase sid })
-          dispatchMsg env (sub.handlers.onStatus (.failed msg))
-      | .ok (.closed sid _) =>
-          let some sub := pool.subs[sid]? | return
-          env.wsMuxSubUrlRef.modify (·.erase sid)
-          env.wsMuxPoolsRef.modify (·.insert url { pool with subs := pool.subs.erase sid })
-          dispatchMsg env (sub.handlers.onStatus .disconnected)
+      | .ok (.err sid msg) => dropMuxSub env url pool sid (.failed msg)
+      | .ok (.closed sid _) => dropMuxSub env url pool sid .disconnected
       | _ => pure ()
   | some (.ext subId) =>
       let some entry := (← env.wsExtEntriesRef.get)[subId]? | return
@@ -681,19 +575,19 @@ private def handleWsCloseMux (env : RuntimeEnv Model Msg) (cid : UInt32) (url er
     env.wsMuxPoolsRef.modify (·.insert url { pool with connId := none, isOpen := false, timerId := some tid, subs := keptSubs })
   for m in statusMsgs do dispatchMsg env m
 
+private def dropExtEntry (env : RuntimeEnv Model Msg) (subId : UInt32)
+    (entry : WsExtConnEntry Msg) (st : SocketStatus) : IO Unit := do
+  cancelWsTimer env entry.timerKey entry.timerId
+  env.wsExtEntriesRef.modify (·.erase subId)
+  dispatchMsg env (entry.handlers.onStatus st)
+
 private def handleWsCloseExt (env : RuntimeEnv Model Msg) (cid subId : UInt32) (err : String) : IO Unit := do
   let some entry := (← env.wsExtEntriesRef.get)[subId]? | return
   if entry.closed || entry.connId != some cid then return
   if !err.isEmpty then
-    cancelWsTimer env entry.timerKey entry.timerId
-    env.wsExtEntriesRef.modify (·.erase subId)
-    dispatchMsg env (entry.handlers.onStatus (.failed err))
-    return
+    dropExtEntry env subId entry (.failed err); return
   match entry.reconnect.nextDelayMs entry.attempt with
-  | none =>
-      cancelWsTimer env entry.timerKey entry.timerId
-      env.wsExtEntriesRef.modify (·.erase subId)
-      dispatchMsg env (entry.handlers.onStatus (wsClosedStatus entry.reconnect))
+  | none => dropExtEntry env subId entry (wsClosedStatus entry.reconnect)
   | some d =>
       let attempt' := entry.attempt + 1
       let tid ← scheduleWsTimer env entry.timerKey entry.timerId d (openExtConn env subId)

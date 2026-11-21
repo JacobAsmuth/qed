@@ -484,50 +484,38 @@ private def resolveUrlString (u : String) (token? : Option String) : Except Stri
   else
     .error s!"unrecognized database URL scheme: `{t}` (expected postgres://, sqlite://, or https://)"
 
+private def requireEnv (envVar label : String) (default? : Option String := none) : IO (Except String String) := do
+  match (← loadNonEmptyEnv envVar).orElse (fun _ => default?) with
+  | some v => return .ok v
+  | none   => return .error s!"missing {label} `{envVar}`"
+
 private def resolveDbEndpoint (ep : Db.DbEndpoint) : IO (Except String ResolvedDbTransport) := do
   match ep with
   | .urlEnv envVar =>
-      match ← loadNonEmptyEnv envVar with
-      | some u =>
-          let tok? ← loadNonEmptyEnv (envVar ++ "_TOKEN")
-          return resolveUrlString u tok?
-      | none => return .error s!"missing database URL environment variable `{envVar}`"
+      match ← requireEnv envVar "database URL environment variable" with
+      | .error e => return .error e
+      | .ok u    => return resolveUrlString u (← loadNonEmptyEnv (envVar ++ "_TOKEN"))
   | .postgresEnv envVar =>
-      match ← loadNonEmptyEnv envVar with
-      | some u => return .ok (.postgres u)
-      | none   => return .error s!"missing PostgreSQL URL environment variable `{envVar}`"
-  | .postgresUrl url =>
-      return .ok (.postgres (trimWs url))
-  | .sqlitePath path =>
-      return .ok (.sqlite (stripSqliteScheme path))
+      return (← requireEnv envVar "PostgreSQL URL environment variable").map .postgres
+  | .postgresUrl url => return .ok (.postgres (trimWs url))
+  | .sqlitePath path => return .ok (.sqlite (stripSqliteScheme path))
   | .sqliteEnv envVar def? =>
-      match ← loadNonEmptyEnv envVar with
-      | some p => return .ok (.sqlite (stripSqliteScheme p))
-      | none =>
-          match def? with
-          | some p => return .ok (.sqlite (stripSqliteScheme p))
-          | none   => return .error s!"missing SQLite path environment variable `{envVar}`"
+      return (← requireEnv envVar "SQLite path environment variable" def?).map (fun p => .sqlite (stripSqliteScheme p))
   | .cloudflareD1 accEnv accDef? dbEnv dbDef? tokSecret =>
-      let acc? := (← loadNonEmptyEnv accEnv).orElse (fun _ => accDef?)
-      let db?  := (← loadNonEmptyEnv dbEnv).orElse (fun _ => dbDef?)
-      let tok? ← loadNonEmptyEnv tokSecret
-      match acc?, db?, tok? with
-      | some acc, some db, some tok => return .ok (.d1 acc db tok)
-      | none, _, _ => return .error s!"missing Cloudflare account env `{accEnv}`"
-      | _, none, _ => return .error s!"missing Cloudflare D1 database env `{dbEnv}`"
-      | _, _, none => return .error s!"missing Cloudflare D1 token secret `{tokSecret}`"
+      match ← requireEnv accEnv "Cloudflare account env" accDef?,
+            ← requireEnv dbEnv "Cloudflare D1 database env" dbDef?,
+            ← requireEnv tokSecret "Cloudflare D1 token secret" with
+      | .ok acc, .ok db, .ok tok => return .ok (.d1 acc db tok)
+      | .error e, _, _ | _, .error e, _ | _, _, .error e => return .error e
   | .turso urlEnv tokSecret =>
-      match ← loadNonEmptyEnv urlEnv, ← loadNonEmptyEnv tokSecret with
-      | some u, some tok => return .ok (.turso u tok)
-      | none, _ => return .error s!"missing Turso URL env `{urlEnv}`"
-      | _, none => return .error s!"missing Turso token secret `{tokSecret}`"
+      match ← requireEnv urlEnv "Turso URL env", ← requireEnv tokSecret "Turso token secret" with
+      | .ok u, .ok tok => return .ok (.turso u tok)
+      | .error e, _ | _, .error e => return .error e
   | .httpSql urlEnv tokSecret? =>
-      match ← loadNonEmptyEnv urlEnv with
-      | none => return .error s!"missing HTTP SQL URL env `{urlEnv}`"
-      | some u =>
-          let tok? ← match tokSecret? with
-            | some ts => loadNonEmptyEnv ts
-            | none    => pure none
+      match ← requireEnv urlEnv "HTTP SQL URL env" with
+      | .error e => return .error e
+      | .ok u =>
+          let tok? ← match tokSecret? with | some ts => loadNonEmptyEnv ts | none => pure none
           return .ok (.httpSql u tok?)
 
 private def resolveDbConfig (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDbTransport) := do
@@ -561,6 +549,14 @@ private def execHttpSqlRaw (url : String) (bearer? : Option String) (body : Byte
       if 200 ≤ status && status < 300 then return .ok txt
       else return .error (ApiError.internal s!"HTTP SQL error {status}: {txt}")
 
+private def execHttpTransportStmt (tr : ResolvedDbTransport) (sql : String) (params : Array Db.SqlVal) :
+    IO (Except ApiError String) :=
+  match tr with
+  | .httpSql url bearer? => execHttpSqlRaw url bearer? (Db.HttpSql.encodeGenericQueryBody sql params .sqlite)
+  | .d1 acc db tok       => execHttpSqlRaw (d1QueryUrl acc db) (some tok) (Db.HttpSql.encodeD1QueryBody sql params)
+  | .turso baseUrl tok   => execHttpSqlRaw (tursoPipelineUrl baseUrl) (some tok) (Db.HttpSql.encodeTursoPipelineBody sql params)
+  | _                    => return .error (ApiError.internal "unexpected non-HTTP SQL transport")
+
 private def execRawOnTransport (tr : ResolvedDbTransport) (sqlSqlite sqlPg : String)
     (params : Array Db.SqlVal) (d1Cols : List String) (sqlHttp? : Option String := none)
     (decodeErrPrefix? : Option String := none) : IO (Except ApiError Db.DbResult) := do
@@ -569,53 +565,28 @@ private def execRawOnTransport (tr : ResolvedDbTransport) (sqlSqlite sqlPg : Str
     r.mapError fun e => ApiError.internal s!"{decodeErrPrefix?.getD defaultPfx}: {e}"
   match tr with
   | .sqlite path =>
-      match ← Prim.sqliteExec path sqlSqlite (Db.encodeTaggedParamsJson params) with
-      | .error e => return .error (ApiError.internal e)
-      | .ok raw  => return mapDec "sqlite result decode failed" (Db.decodeTaggedResultJson raw)
+      return (← Prim.sqliteExec path sqlSqlite params).mapError ApiError.internal
   | .postgres url =>
-      match ← Db.PgWire.execParameterized url sqlPg params with
-      | .ok res  => return .ok res
-      | .error e => return .error (ApiError.internal e)
-  | .httpSql url bearer? =>
-      match ← execHttpSqlRaw url bearer? (Db.HttpSql.encodeGenericQueryBody sqlH params .sqlite) with
+      return (← Db.PgWire.execParameterized url sqlPg params).mapError ApiError.internal
+  | .httpSql _ _ | .d1 _ _ _ | .turso _ _ =>
+      match ← execHttpTransportStmt tr sqlH params with
       | .error e => return .error e
-      | .ok raw  => return mapDec "HTTP SQL result decode failed" (Db.decodeTaggedResultJson raw)
-  | .d1 acc db tok =>
-      match ← execHttpSqlRaw (d1QueryUrl acc db) (some tok) (Db.HttpSql.encodeD1QueryBody sqlH params) with
-      | .error e => return .error e
-      | .ok raw  => return mapDec "Cloudflare D1 result decode failed" (Db.HttpSql.decodeD1Response raw d1Cols)
-  | .turso baseUrl tok =>
-      match ← execHttpSqlRaw (tursoPipelineUrl baseUrl) (some tok) (Db.HttpSql.encodeTursoPipelineBody sqlH params) with
-      | .error e => return .error e
-      | .ok raw  => return mapDec "Turso result decode failed" (Db.HttpSql.decodeTursoResponse raw)
+      | .ok raw  =>
+          match tr with
+          | .httpSql _ _ => return mapDec "HTTP SQL result decode failed" (Db.decodeTaggedResultJson raw)
+          | .d1 _ _ _    => return mapDec "Cloudflare D1 result decode failed" (Db.HttpSql.decodeD1Response raw d1Cols)
+          | _            => return mapDec "Turso result decode failed" (Db.HttpSql.decodeTursoResponse raw)
 
 private def execDdlOnTransport (tr : ResolvedDbTransport) (sqliteStmts : List String)
     (pgDdl : String) : IO (Except ApiError Unit) := do
   match tr with
   | .sqlite path =>
-      match ← Prim.sqliteDdl path (String.intercalate ";\n" sqliteStmts) with
-      | .ok ()   => return .ok ()
-      | .error e => return .error (ApiError.internal e)
+      return (← Prim.sqliteDdl path (String.intercalate ";\n" sqliteStmts)).mapError ApiError.internal
   | .postgres url =>
-      match ← Db.PgWire.execDdl url pgDdl with
-      | .ok ()   => return .ok ()
-      | .error e => return .error (ApiError.internal e)
-  | .httpSql url bearer? =>
+      return (← Db.PgWire.execDdl url pgDdl).mapError ApiError.internal
+  | .httpSql _ _ | .d1 _ _ _ | .turso _ _ =>
       for stmt in sqliteStmts do
-        if let .error e ← execHttpSqlRaw url bearer? (Db.HttpSql.encodeGenericQueryBody stmt #[] .sqlite) then
-          return .error e
-      return .ok ()
-  | .d1 acc db tok =>
-      let url := d1QueryUrl acc db
-      for stmt in sqliteStmts do
-        if let .error e ← execHttpSqlRaw url (some tok) (Db.HttpSql.encodeD1QueryBody stmt #[]) then
-          return .error e
-      return .ok ()
-  | .turso baseUrl tok =>
-      let url := tursoPipelineUrl baseUrl
-      for stmt in sqliteStmts do
-        if let .error e ← execHttpSqlRaw url (some tok) (Db.HttpSql.encodeTursoPipelineBody stmt #[]) then
-          return .error e
+        if let .error e ← execHttpTransportStmt tr stmt #[] then return .error e
       return .ok ()
 
 private def rowStrAt (row : Db.DbRow) (idx : Nat) : Option String :=
@@ -625,41 +596,38 @@ private def rowStrAt (row : Db.DbRow) (idx : Nat) : Option String :=
 
 private def introspectSqliteTable (path : String) (tbl : Db.TableSchema) :
     IO (Except ApiError (Bool × List String × List String)) := do
-  let tblInfoSql := "PRAGMA table_info(" ++ tbl.name.quoteIdent ++ ")"
-  match ← Prim.sqliteExec path tblInfoSql "[]" with
-  | .error e => return .error (ApiError.internal s!"sqlite table introspection failed: {e}")
-  | .ok rawCols =>
-      match Db.decodeTaggedResultJson rawCols with
-      | .error e => return .error (ApiError.internal s!"sqlite table_info decode failed: {e}")
-      | .ok colRes =>
-          if colRes.rows.isEmpty then
-            return .ok (false, [], [])
-          let cols := colRes.rows.toList.filterMap fun r => rowStrAt r 1
-          let idxSql := "PRAGMA index_list(" ++ tbl.name.quoteIdent ++ ")"
-          match ← Prim.sqliteExec path idxSql "[]" with
-          | .error e => return .error (ApiError.internal s!"sqlite index introspection failed: {e}")
-          | .ok rawIdxs =>
-              match Db.decodeTaggedResultJson rawIdxs with
-              | .error e => return .error (ApiError.internal s!"sqlite index_list decode failed: {e}")
-              | .ok idxRes =>
-                  let idxs := idxRes.rows.toList.filterMap fun r => rowStrAt r 1
-                  return .ok (true, cols, idxs)
+  let colRes ← match ← Prim.sqliteExec path ("PRAGMA table_info(" ++ tbl.name.quoteIdent ++ ")") #[] with
+    | .error e => return .error (ApiError.internal s!"sqlite table introspection failed: {e}")
+    | .ok r    => pure r
+  if colRes.rows.isEmpty then return .ok (false, [], [])
+  let cols := colRes.rows.toList.filterMap fun r => rowStrAt r 1
+  match ← Prim.sqliteExec path ("PRAGMA index_list(" ++ tbl.name.quoteIdent ++ ")") #[] with
+  | .error e   => return .error (ApiError.internal s!"sqlite index introspection failed: {e}")
+  | .ok idxRes => return .ok (true, cols, idxRes.rows.toList.filterMap fun r => rowStrAt r 1)
 
 private def introspectPostgresTable (url : String) (tbl : Db.TableSchema) :
     IO (Except String (Bool × List String × List String)) := do
   let colSql := "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1"
-  match ← Db.PgWire.execParameterized url colSql #[.text tbl.name.raw] with
-  | .error e => return .error e
-  | .ok colRes =>
-      if colRes.rows.isEmpty then
-        return .ok (false, [], [])
-      let cols := colRes.rows.toList.filterMap fun r => rowStrAt r 0
-      let idxSql := "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1"
-      match ← Db.PgWire.execParameterized url idxSql #[.text tbl.name.raw] with
-      | .error _ => return .ok (true, cols, [])
-      | .ok idxRes =>
-          let idxs := idxRes.rows.toList.filterMap fun r => rowStrAt r 0
-          return .ok (true, cols, idxs)
+  let colRes ← match ← Db.PgWire.execParameterized url colSql #[.text tbl.name.raw] with
+    | .error e => return .error e
+    | .ok r    => pure r
+  if colRes.rows.isEmpty then return .ok (false, [], [])
+  let cols := colRes.rows.toList.filterMap fun r => rowStrAt r 0
+  let idxSql := "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1"
+  let idxs := match ← Db.PgWire.execParameterized url idxSql #[.text tbl.name.raw] with
+    | .error _   => []
+    | .ok idxRes => idxRes.rows.toList.filterMap fun r => rowStrAt r 0
+  return .ok (true, cols, idxs)
+
+private def applyMigrationSteps (dialect : Db.SqlDialect) (steps : List Db.MigrationStep)
+    (runDdl : String → IO (Except String Unit)) : IO (Except ApiError (List Db.MigrationStep)) := do
+  match Db.verifyMigrationSafe steps with
+  | .error e => return .error (ApiError.internal e)
+  | .ok () =>
+      let ddl := Db.renderMigrationDdl dialect steps
+      if !ddl.isEmpty then
+        if let .error e ← runDdl ddl then return .error (ApiError.internal e)
+      return .ok steps
 
 /-- Idempotently initializes and applies verified additive schema migrations (`createTable`,
     safe `addColumn`, `createIndex`) for all tables in `cfg`, returning the applied steps. -/
@@ -672,18 +640,8 @@ def migrateDatabase (cfg : Db.DbConfig) : IO (Except ApiError (List Db.Migration
       for tbl in cfg.tables do
         match ← introspectSqliteTable path tbl with
         | .error e => return .error e
-        | .ok (exists_, existingCols, existingIdxs) =>
-            let steps := Db.diffTableSchema existingCols existingIdxs tbl exists_
-            allSteps := allSteps ++ steps
-      match Db.verifyMigrationSafe allSteps with
-      | .error e => return .error (ApiError.internal e)
-      | .ok () =>
-          let ddl := Db.renderMigrationDdl .sqlite allSteps
-          if !ddl.isEmpty then
-            match ← Prim.sqliteDdl path ddl with
-            | .ok () => pure ()
-            | .error e => return .error (ApiError.internal e)
-          return .ok allSteps
+        | .ok (exists_, cols, idxs) => allSteps := allSteps ++ Db.diffTableSchema cols idxs tbl exists_
+      applyMigrationSteps .sqlite allSteps (Prim.sqliteDdl path)
   | .ok (.postgres url) =>
       let mut allSteps : List Db.MigrationStep := []
       let mut introspectOk := true
@@ -691,33 +649,18 @@ def migrateDatabase (cfg : Db.DbConfig) : IO (Except ApiError (List Db.Migration
         if introspectOk then
           match ← introspectPostgresTable url tbl with
           | .error _ => introspectOk := false
-          | .ok (exists_, existingCols, existingIdxs) =>
-              allSteps := allSteps ++ Db.diffTableSchema existingCols existingIdxs tbl exists_
+          | .ok (exists_, cols, idxs) => allSteps := allSteps ++ Db.diffTableSchema cols idxs tbl exists_
       if introspectOk then
-        match Db.verifyMigrationSafe allSteps with
-        | .error e => return .error (ApiError.internal e)
-        | .ok () =>
-            let ddl := Db.renderMigrationDdl .postgres allSteps
-            if !ddl.isEmpty then
-              match ← Db.PgWire.execDdl url ddl with
-              | .ok () => pure ()
-              | .error e => return .error (ApiError.internal e)
-            return .ok allSteps
+        applyMigrationSteps .postgres allSteps (Db.PgWire.execDdl url)
       else
-        let ddl := Db.renderDatabaseDdl .postgres cfg.tables
-        match ← Db.PgWire.execDdl url ddl with
-        | .ok () => return .ok (cfg.tables.map .createTable)
-        | .error e => return .error (ApiError.internal e)
+        return (← Db.PgWire.execDdl url (Db.renderDatabaseDdl .postgres cfg.tables))
+          |>.map (fun () => cfg.tables.map .createTable) |>.mapError ApiError.internal
   | .ok tr =>
       let stmts := cfg.tables.flatMap (·.renderDdlStatements .sqlite)
-      match ← execDdlOnTransport tr stmts "" with
-      | .error e => return .error e
-      | .ok ()   => return .ok (cfg.tables.map .createTable)
+      return (← execDdlOnTransport tr stmts "").map fun () => cfg.tables.map .createTable
 
-private def execNativeDbDdl (cfg : Db.DbConfig) : IO (Except ApiError Unit) := do
-  match ← migrateDatabase cfg with
-  | .ok _    => return .ok ()
-  | .error e => return .error e
+private def execNativeDbDdl (cfg : Db.DbConfig) : IO (Except ApiError Unit) :=
+  return (← migrateDatabase cfg).map fun _ => ()
 
 /-- Active pinned PostgreSQL transaction connections keyed by monotonic transaction ID. -/
 initialize pgTxBox : IO.Ref (UInt64 × Std.HashMap UInt64 Db.PgWire.PgConn) ←
@@ -729,17 +672,27 @@ private def popPgTx (txId : UInt64) : IO (Option Db.PgWire.PgConn) :=
     | some c => (some c, (nextId, m.erase txId))
     | none   => (none, (nextId, m))
 
-private def execNativeDbTxBegin (cfg : Db.DbConfig) : IO (Except ApiError UInt64) := do
+private def withTxTransport {α : Type} (cfg : Db.DbConfig)
+    (onSqlite : String → IO (Except ApiError α))
+    (onPg : String → IO (Except ApiError α)) : IO (Except ApiError α) := do
   match ← resolveDbConfig cfg with
-  | .error e => return .error e
-  | .ok (.sqlite path) =>
-      match ← Prim.sqliteTxBegin path with
-      | .ok txId => return .ok txId
-      | .error e => return .error (ApiError.internal e)
-  | .ok (.postgres url) =>
-      let p ← match Db.PgWire.parsePgUrl url with
-        | .ok p    => pure p
-        | .error e => return .error (ApiError.internal e)
+  | .error e            => return .error e
+  | .ok (.sqlite path)  => onSqlite path
+  | .ok (.postgres url) => onPg url
+  | .ok _ => return .error (ApiError.internal "multi-statement transactions require SQLite or PostgreSQL transport")
+
+private def finishPgTx (conn : Db.PgWire.PgConn) (cmd : String) : IO (Except ApiError Unit) := do
+  let (res, conn') ← Db.PgWire.execSimpleOnConn conn cmd
+  match res with
+  | .ok cFinal => Db.PgWire.releaseConn cFinal; return .ok ()
+  | .error e   => Db.PgWire.releaseConn { conn' with healthy := false }
+                  return .error (ApiError.internal s!"postgres {cmd} failed: {e}")
+
+private def execNativeDbTxBegin (cfg : Db.DbConfig) : IO (Except ApiError UInt64) :=
+  withTxTransport cfg
+    (fun path => return (← Prim.sqliteTxBegin path).mapError ApiError.internal)
+    (fun url => do
+      let p ← match Db.PgWire.parsePgUrl url with | .ok p => pure p | .error e => return .error (ApiError.internal e)
       match ← Db.PgWire.acquireConn p with
       | .error e => return .error (ApiError.internal e)
       | .ok (conn, _) =>
@@ -749,26 +702,15 @@ private def execNativeDbTxBegin (cfg : Db.DbConfig) : IO (Except ApiError UInt64
               Db.PgWire.releaseConn { conn' with healthy := false }
               return .error (ApiError.internal s!"postgres BEGIN failed: {e}")
           | .ok cReady =>
-              let txId ← pgTxBox.modifyGet fun (nextId, m) =>
-                (nextId, (nextId + 1, m.insert nextId cReady))
-              return .ok txId
-  | .ok _ =>
-      return .error (ApiError.internal "multi-statement transactions require SQLite or PostgreSQL transport")
+              return .ok (← pgTxBox.modifyGet fun (nextId, m) => (nextId, (nextId + 1, m.insert nextId cReady))))
 
 private def execNativeDbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery) :
-    IO (Except ApiError Db.DbResult) := do
-  match ← resolveDbConfig cfg with
-  | .error e => return .error e
-  | .ok (.sqlite _) =>
+    IO (Except ApiError Db.DbResult) :=
+  withTxTransport cfg
+    (fun _ => do
       let (sql, params) := q.compile .sqlite
-      let paramsJson := Db.encodeTaggedParamsJson params
-      match ← Prim.sqliteTxExec txId sql paramsJson with
-      | .error e => return .error (ApiError.internal e)
-      | .ok rawJson =>
-          match Db.decodeTaggedResultJson rawJson with
-          | .ok res => return .ok res
-          | .error e => return .error (ApiError.internal s!"sqlite tx result decode failed: {e}")
-  | .ok (.postgres _) =>
+      return (← Prim.sqliteTxExec txId sql params).mapError ApiError.internal)
+    (fun _ => do
       let some conn ← popPgTx txId
         | return .error (ApiError.internal "unknown or closed PostgreSQL transaction")
       let (sql, params) := q.compile .postgres
@@ -778,90 +720,67 @@ private def execNativeDbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQu
           pgTxBox.modify fun (nextId, m) => (nextId, m.insert txId cNext)
           return .ok dbRes
       | .error e =>
-          if conn'.healthy then
-            pgTxBox.modify fun (nextId, m) => (nextId, m.insert txId conn')
-          else
-            Db.PgWire.releaseConn conn'
-          return .error (ApiError.internal e)
-  | .ok _ =>
-      return .error (ApiError.internal "multi-statement transactions require SQLite or PostgreSQL transport")
+          if conn'.healthy then pgTxBox.modify fun (nextId, m) => (nextId, m.insert txId conn')
+          else Db.PgWire.releaseConn conn'
+          return .error (ApiError.internal e))
 
-private def execNativeDbTxCommit (cfg : Db.DbConfig) (txId : UInt64) : IO (Except ApiError Unit) := do
-  match ← resolveDbConfig cfg with
-  | .error e => return .error e
-  | .ok (.sqlite _) =>
-      match ← Prim.sqliteTxCommit txId with
-      | .ok ()   => return .ok ()
-      | .error e => return .error (ApiError.internal e)
-  | .ok (.postgres _) =>
+private def execNativeDbTxCommit (cfg : Db.DbConfig) (txId : UInt64) : IO (Except ApiError Unit) :=
+  withTxTransport cfg
+    (fun _ => return (← Prim.sqliteTxCommit txId).mapError ApiError.internal)
+    (fun _ => do
       let some conn ← popPgTx txId
         | return .error (ApiError.internal "unknown or closed PostgreSQL transaction")
-      let (res, conn') ← Db.PgWire.execSimpleOnConn conn "COMMIT"
-      match res with
-      | .ok cFinal =>
-          Db.PgWire.releaseConn cFinal
-          return .ok ()
-      | .error e =>
-          Db.PgWire.releaseConn { conn' with healthy := false }
-          return .error (ApiError.internal s!"postgres COMMIT failed: {e}")
-  | .ok _ =>
-      return .error (ApiError.internal "multi-statement transactions require SQLite or PostgreSQL transport")
+      finishPgTx conn "COMMIT")
 
 private def execNativeDbTxRollback (cfg : Db.DbConfig) (txId : UInt64) : IO Unit := do
   match ← resolveDbConfig cfg with
-  | .ok (.sqlite _) =>
-      Prim.sqliteTxRollback txId
-  | .ok (.postgres _) =>
-      if let some conn ← popPgTx txId then
-        let (res, conn') ← Db.PgWire.execSimpleOnConn conn "ROLLBACK"
-        match res with
-        | .ok cFinal => Db.PgWire.releaseConn cFinal
-        | .error _   => Db.PgWire.releaseConn { conn' with healthy := false }
-  | _ => pure ()
+  | .ok (.sqlite _)   => Prim.sqliteTxRollback txId
+  | .ok (.postgres _) => if let some conn ← popPgTx txId then discard <| finishPgTx conn "ROLLBACK"
+  | _                 => pure ()
 
 private def execNativeDbQuery (cfg : Db.DbConfig) (q : Db.SqlQuery) : IO (Except ApiError Db.DbResult) := do
   match ← resolveDbConfig cfg with
   | .error e => return .error e
   | .ok tr =>
-      let (sqlSq, paramsSq) := q.compile .sqlite
-      let (sqlPg, paramsPg) := q.compile .postgres
-      let params := match tr with | .postgres _ => paramsPg | _ => paramsSq
-      execRawOnTransport tr sqlSq sqlPg params (Db.HttpSql.queryExpectedCols q)
+      match tr with
+      | .postgres _ =>
+          let (sqlPg, paramsPg) := q.compile .postgres
+          execRawOnTransport tr "" sqlPg paramsPg []
+      | _ =>
+          let (sqlSq, paramsSq) := q.compile .sqlite
+          execRawOnTransport tr sqlSq "" paramsSq (Db.HttpSql.queryExpectedCols q)
 
 @[implicit_reducible]
 def mkNativeServerInst (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEntry)))
     (cookieSink? : Option (IO.Ref (Array SetCookie)) := none)
     (sseSink? : Option (IO.Ref (Array SseEvent)) := none) : MonadServer IO where
-  httpCall req := do
-    match ← resolveAuthHeaders gcpCache? req.auth with
-    | .error e => return .error e
-    | .ok authHdrs =>
-        let base ← resolveBaseOrigin req
-        let fullUrl := base ++ req.pathAndQuery
-        let sanitizedReqHdrs := req.headers.map fun (k, v) => (sanitizeHeader k, sanitizeHeader v)
-        let allHdrs := (sanitizedReqHdrs ++ authHdrs).toArray
-        match ← execHttpCall req.method fullUrl allHdrs req.body req.ssrfGuard with
-        | .error transportErr =>
-            return .error (ApiError.internal s!"external HTTP transport error ({req.serviceName}): {transportErr}")
-        | .ok (status, respBody, respHdrs) =>
-            return .ok { status := status.toUInt32, body := respBody, headers := respHdrs.toList }
-  dbExec       := execNativeDbQuery
-  dbExecDdl    := execNativeDbDdl
-  dbTxBegin    := execNativeDbTxBegin
-  dbTxExec     := execNativeDbTxExec
-  dbTxCommit   := execNativeDbTxCommit
-  dbTxRollback := execNativeDbTxRollback
-  setCookie c  := match cookieSink? with
-    | some ref => ref.modify (·.push c)
-    | none     => pure ()
-  sendSse ev   := match sseSink? with
-    | some ref => ref.modify (·.push ev)
-    | none     => pure ()
-  readEnv := Prim.getEnv
-  nowMs := Prim.nowMs
-  randomHex := Prim.randomHex
-  hmacSha256 := Prim.hmacSha256
-  wsBroadcast := Prim.wsBroadcast
+  exec
+    | .httpCall req => do
+        match ← resolveAuthHeaders gcpCache? req.auth with
+        | .error e => return .error e
+        | .ok authHdrs =>
+            let base ← resolveBaseOrigin req
+            let fullUrl := base ++ req.pathAndQuery
+            let sanitizedReqHdrs := req.headers.map fun (k, v) => (sanitizeHeader k, sanitizeHeader v)
+            let allHdrs := (sanitizedReqHdrs ++ authHdrs).toArray
+            match ← execHttpCall req.method fullUrl allHdrs req.body req.ssrfGuard with
+            | .error transportErr =>
+                return .error (ApiError.internal s!"external HTTP transport error ({req.serviceName}): {transportErr}")
+            | .ok (status, respBody, respHdrs) =>
+                return .ok { status := status.toUInt32, body := respBody, headers := respHdrs.toList }
+    | .dbExec cfg q         => execNativeDbQuery cfg q
+    | .dbExecDdl cfg        => execNativeDbDdl cfg
+    | .dbTxBegin cfg        => execNativeDbTxBegin cfg
+    | .dbTxExec cfg tid q   => execNativeDbTxExec cfg tid q
+    | .dbTxCommit cfg tid   => execNativeDbTxCommit cfg tid
+    | .dbTxRollback cfg tid => execNativeDbTxRollback cfg tid
+    | .setCookie c          => if let some ref := cookieSink? then ref.modify (·.push c) else pure ()
+    | .sendSse ev           => if let some ref := sseSink? then ref.modify (·.push ev) else pure ()
+    | .readEnv v            => Prim.getEnv v
+    | .nowMs                => Prim.nowMs
+    | .randomHex n          => Prim.randomHex n
+    | .hmacSha256 key msg   => Prim.hmacSha256 key msg
+    | .wsBroadcast t p      => Prim.wsBroadcast t p
 
 instance : MonadServer IO := mkNativeServerInst none none
 
@@ -1135,27 +1054,33 @@ private def buildRequestCtxReq (cfg : ServerConfig) (req : ParsedReqHead) (clien
     clientIp, query := queryStr, body := bodyStr
   }
 
+private structure WireVariants where
+  headKA    : ByteArray
+  headClose : ByteArray
+  fullKA    : ByteArray
+  fullClose : ByteArray
+
+private def WireVariants.build (mime : String) (body : ByteArray) (etag cacheCtrl : String)
+    (hdrs : List (String × String)) : WireVariants :=
+  let hKA := formatHttpResponseHead 200 mime body.size true false (some etag) (some cacheCtrl) hdrs
+  let hCl := formatHttpResponseHead 200 mime body.size false false (some etag) (some cacheCtrl) hdrs
+  { headKA := hKA, headClose := hCl, fullKA := hKA ++ body, fullClose := hCl ++ body }
+
+private def WireVariants.pick (w : WireVariants) (isHead keepAlive : Bool) : ByteArray :=
+  if isHead then (if keepAlive then w.headKA else w.headClose)
+  else (if keepAlive then w.fullKA else w.fullClose)
+
 private structure CachedStaticAsset where
-  etag         : String
-  headKA       : ByteArray
-  headClose    : ByteArray
-  fullKA       : ByteArray
-  fullClose    : ByteArray
-  gzHeadKA?    : Option ByteArray := none
-  gzHeadClose? : Option ByteArray := none
-  gzFullKA?    : Option ByteArray := none
-  gzFullClose? : Option ByteArray := none
+  etag  : String
+  plain : WireVariants
+  gzip? : Option WireVariants := none
 
 private def CachedStaticAsset.serve (c : CachedStaticAsset) (req : ParsedReqHead)
     (isHead keepAlive : Bool) : ByteArray :=
-  if req.hasIfNoneMatch && etagMatchesIfNoneMatch req.headers c.etag then formatNotModifiedResponse c.etag keepAlive
-  else if req.acceptsGzip then
-    if isHead then
-      (if keepAlive then c.gzHeadKA? else c.gzHeadClose?).getD (if keepAlive then c.headKA else c.headClose)
-    else
-      (if keepAlive then c.gzFullKA? else c.gzFullClose?).getD (if keepAlive then c.fullKA else c.fullClose)
-  else if isHead then (if keepAlive then c.headKA else c.headClose)
-  else if keepAlive then c.fullKA else c.fullClose
+  if req.hasIfNoneMatch && etagMatchesIfNoneMatch req.headers c.etag then
+    formatNotModifiedResponse c.etag keepAlive
+  else
+    (if req.acceptsGzip then c.gzip?.getD c.plain else c.plain).pick isHead keepAlive
 
 private def cookieHeaders (cookies : List SetCookie) : List (String × String) :=
   cookies.map fun c => ("Set-Cookie", c.render)
@@ -1197,21 +1122,15 @@ private def serveStaticAsset (staticDirFd : Prim.StaticDir)
         else "public, max-age=0, must-revalidate"
       let varyHdrs : List (String × String) := if compressible then [("Vary", "Accept-Encoding")] else []
       if cacheable && fsize <= 2 * 1024 * 1024 then
-        let headKA := formatHttpResponseHead 200 st.mime fsize true false (some etag) (some cacheCtrl) varyHdrs
-        let headClose := formatHttpResponseHead 200 st.mime fsize false false (some etag) (some cacheCtrl) varyHdrs
-        let (gzHeadKA?, gzHeadClose?, gzFullKA?, gzFullClose?) ←
+        let gzip? ←
           if compressible && fsize >= 256 then do
             let gz ← Prim.gzipCompress fbytes
             if !gz.isEmpty && gz.size < fsize then
-              let gzHdrs := [("Content-Encoding", "gzip"), ("Vary", "Accept-Encoding")]
-              let ghKA := formatHttpResponseHead 200 st.mime gz.size true false (some etag) (some cacheCtrl) gzHdrs
-              let ghClose := formatHttpResponseHead 200 st.mime gz.size false false (some etag) (some cacheCtrl) gzHdrs
-              pure (some ghKA, some ghClose, some (ghKA ++ gz), some (ghClose ++ gz))
-            else pure (none, none, none, none)
-          else pure (none, none, none, none)
+              pure (some (WireVariants.build st.mime gz etag cacheCtrl [("Content-Encoding", "gzip"), ("Vary", "Accept-Encoding")]))
+            else pure none
+          else pure none
         let entry : CachedStaticAsset := {
-          etag, headKA, headClose, fullKA := headKA ++ fbytes, fullClose := headClose ++ fbytes,
-          gzHeadKA?, gzHeadClose?, gzFullKA?, gzFullClose?
+          etag, plain := WireVariants.build st.mime fbytes etag cacheCtrl varyHdrs, gzip?
         }
         if let some assetCache := assetCache? then
           Prim.atomicModify assetCache fun m =>
@@ -1243,246 +1162,223 @@ private def formatCustomHttpResponse (resp : HttpResponse) (extraCookies : Array
   maybeGzipResponse resp.status resp.contentType resp.body isHead req.keepAlive false
     req.acceptsGzip (!isSse && isCompressibleMime resp.contentType) (extraHeaders := baseHdrs)
 
-private def runFullstackCore {Model Msg : Type}
-    (app : Qed.App Model Msg)
-    (title : String)
-    (serverShortName : String)
-    (requiredSecrets : Array String)
-    (dispatchFn : RequestCtx → String → ByteArray → IO (Except ApiError ByteArray × Array SetCookie))
-    (port : UInt16)
-    (staticDir : String)
-    (devMode : Bool := false)
-    (numWorkers : UInt32 := 0)
-    (wsDispatchFn? : Option (RequestCtx → UInt8 → String → ByteArray → ByteArray → IO (Except ApiError ByteArray)) := none)
-    (blockingMethods? : Option (Array String) := none)
-    (httpDispatchFn? : Option (RequestCtx → String → String → IO (Except ApiError (Option HttpResponse) × Array SetCookie)) := none)
-    (jobs : Array IoJob := #[])
-    (authSpec? : Option Qed.Auth.OidcAuthSpec := none)
-    (authHookFn? : Option (RequestCtx → UInt8 → IO (Except ApiError Unit × Array SetCookie)) := none)
-    (authHookFlags : Bool × Bool := (false, false))
-    (primaryDb? : Option Db.DbConfig := none) : IO UInt32 := do
-  if !(← verifyRequiredSecrets requiredSecrets) then
-    return 1
-  let (hasOnCreateAccount, hasOnSignIn) := authHookFlags
-  if hasOnCreateAccount then
-    if let some dbCfg := primaryDb? then
-      match ← ensureAuthUsersTable dbCfg with
-      | .ok () => pure ()
-      | .error e =>
-          IO.eprintln s!"✗ failed to initialize `_qed_auth_users` table: {e.message}"
-          return 1
+private structure HttpLoopCtx where
+  cfg         : ServerConfig
+  staticDirFd : Prim.StaticDir
+  healthKA    : ByteArray
+  healthClose : ByteArray
+  htmlCspHdrs : List (String × String)
+
+private def serveHttpLoop (staticDir : String) (port : UInt16) (devMode : Bool) (numWorkers : UInt32)
+    (setup : HttpLoopCtx → IO (
+      (ParsedReqHead → String → String → Nat → IO (Prim.HttpHeadAction ParsedReqHead RequestCtx)) ×
+      (ParsedReqHead → ByteArray → String → IO ByteArray) ×
+      (RequestCtx → ByteArray → WsFragState → Array (Nat × String × ByteArray) → IO (Prim.WsStepOut WsFragState)) ×
+      (RequestCtx → String → ByteArray → IO Unit))) : IO UInt32 := do
   let cfg ← loadServerConfig devMode
-  let oidcRt? ← match authSpec? with
-    | some spec => Qed.Auth.Oidc.initOidcRuntime spec cfg.authSecrets devMode
-    | none      => pure none
-  let memSeenAuthUsers ← Prim.mkStateBox (∅ : Std.HashSet String)
   let staticDirFd ← Prim.openStaticDir staticDir
-  let hostScript ← loadHostScript staticDirFd devMode
-  let rpcPrefix := "/_qed/rpc/" ++ serverShortName ++ "/"
-  let rpcPrefixBytes := rpcPrefix.utf8ByteSize
-  let wsPath := "/_qed/ws/" ++ serverShortName
-  let assetCache ← Prim.mkStateBox (∅ : Std.HashMap String CachedStaticAsset)
   let healthKA := formatHttpResponse 200 "application/json" "{\"ok\":true}".toUTF8 false true false
   let healthClose := formatHttpResponse 200 "application/json" "{\"ok\":true}".toUTF8 false false false
-  let docShell := mkPrebuiltDocShell title hostScript (renderStyleSheet app.styles) app.stylesheets
   let htmlCspHdrs : List (String × String) :=
-    match cfg.csp? with
-    | some p => [("Content-Security-Policy", p)]
-    | none   => []
-
-  let dispatchAppReqWith (req : ParsedReqHead) (body : ByteArray) (clientIp pathOnly : String)
-      (staticTarget? : Option StaticTarget) : IO ByteArray := do
-    let isHead := req.method == "HEAD"
-    if req.method == "GET" && pathOnly == "/_qed/health" then
-      return if req.keepAlive then healthKA else healthClose
-    if let some st := staticTarget? then
-      if isContentHashedAsset st.relPath then
-        return ← serveStaticAsset staticDirFd (some assetCache) req st devMode
-    let ctx ← buildRequestCtxReq cfg req clientIp body oidcRt?
-    if pathOnly.startsWith "/_qed/auth/" then
-      if let some rt := oidcRt? then
-        if req.method == "POST" && pathOnly == rt.cfg.logoutPath then
-          match checkOriginAndFetchSiteParsed req.origin? req.host? req.secFetchSite?
-              (req.dupOrigin || req.dupSfs) cfg.rpcAllowedOrigins? false "auth logout" with
-          | .error (code, msg) =>
-              return formatHttpResponse code "text/plain; charset=utf-8" msg.toUTF8 isHead req.keepAlive false
-          | .ok () => pure ()
-        let onAuthCallback? : Option (String → List (String × String) → IO (Except (Nat × String) (Array SetCookie))) :=
-          authHookFn?.map fun hookFn => fun sub filteredClaims => do
-            let hookCtx : RequestCtx := { ctx with userId := some sub, claims := filteredClaims }
-            let mut outCookies : Array SetCookie := #[]
-            if hasOnCreateAccount then
-              match ← claimAuthUser primaryDb? memSeenAuthUsers sub with
-              | .error e => return .error (e.httpStatus.toNat, e.message)
-              | .ok true =>
-                  let (cRes, cCookies) ← hookFn hookCtx 0
-                  match cRes with
-                  | .error e =>
-                      releaseAuthUser primaryDb? memSeenAuthUsers sub
-                      return .error (e.httpStatus.toNat, e.message)
-                  | .ok () =>
-                      outCookies := outCookies ++ cCookies
-              | .ok false => pure ()
-            if hasOnSignIn then
-              let (sRes, sCookies) ← hookFn hookCtx 1
-              match sRes with
-              | .error e => return .error (e.httpStatus.toNat, e.message)
-              | .ok () => outCookies := outCookies ++ sCookies
-            return .ok outCookies
-        if let some authResp ← Qed.Auth.Oidc.handleAuthRoute execHttpCall rt req
-            pathOnly ctx.query ctx.cookies ctx.userId ctx.claims isHead onAuthCallback? then
-          return authResp
-    if req.method == "POST" && pathOnly.startsWith rpcPrefix then
-      match checkRpcCsrfReq req cfg.rpcAllowedOrigins? with
-      | .error (code, msg) =>
-          return formatHttpResponse code "text/plain; charset=utf-8" msg.toUTF8 isHead req.keepAlive false
-      | .ok () =>
-          let rpcMethod := dropPrefixBytes pathOnly rpcPrefixBytes
-          let (res, cookies) ← dispatchFn ctx rpcMethod body
-          match res with
-          | .ok respBytes =>
-              if cookies.isEmpty then
-                return formatOkProtoResponse respBytes isHead req.keepAlive
-              else
-                return formatHttpResponse 200 "application/x-protobuf" respBytes isHead req.keepAlive false (extraHeaders := cookieHeaders cookies.toList)
-          | .error apiErr =>
-              return formatHttpResponse apiErr.httpStatus.toNat "text/plain; charset=utf-8" apiErr.message.toUTF8 isHead req.keepAlive false (extraHeaders := cookieHeaders cookies.toList)
-    if !pathOnly.startsWith "/_qed/" then
-      if let some httpDispatchFn := httpDispatchFn? then
-        let effMethod := if isHead then "GET" else req.method
-        let (hRes, cookies) ← httpDispatchFn ctx effMethod pathOnly
-        match hRes with
-        | .error apiErr =>
-            return formatHttpResponse apiErr.httpStatus.toNat "text/plain; charset=utf-8" apiErr.message.toUTF8 isHead req.keepAlive false (extraHeaders := cookieHeaders cookies.toList)
-        | .ok (some resp) =>
-            return ← formatCustomHttpResponse resp cookies cfg.csp? req isHead
-        | .ok none => pure ()
-    if let some st := staticTarget? then
-      return ← serveStaticAsset staticDirFd (some assetCache) req st devMode
-    if (req.method == "GET" || isHead) && !pathOnly.startsWith "/_qed/" then
-      let ssrDispatchBytes : String → String → ByteArray → IO (Except String ByteArray) :=
-        fun reqMethod url reqBody => do
-          let uPath := stripQuery url
-          if reqMethod == "POST" && uPath.startsWith rpcPrefix then
-            let mName := dropPrefixBytes uPath rpcPrefixBytes
-            let (r, _) ← dispatchFn ctx mName reqBody
-            match r with
-            | .ok bs   => return .ok bs
-            | .error e => return .error e.message
-          else
-            return .error s!"SSR unknown binary RPC endpoint: {url}"
-      let (ssrStatus, headMeta, rawHtml) ← app.ssrRenderNativeWithStatus docShell title hostScript req.target ssrDispatchBytes
-        (sessionUser := ctx.userId)
-      let finalHtml := if devMode then injectDevReload rawHtml else rawHtml
-      let redirectHdrs : List (String × String) :=
-        if isSsrRedirectStatus ssrStatus then
-          match headMeta.redirect.orElse (fun _ => headMeta.canonical) with
-          | some loc => if isSafeUrl loc then [("Location", sanitizeHeader loc)] else []
-          | none     => []
-        else []
-      let baseHdrs := redirectHdrs ++ htmlCspHdrs ++ [("Vary", "Accept-Encoding")]
-      return ← maybeGzipResponse ssrStatus "text/html; charset=utf-8" finalHtml isHead req.keepAlive false
-        req.acceptsGzip true (extraHeaders := baseHdrs)
-    else
-      return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 isHead req.keepAlive false
-
-  let dispatchAppReq (req : ParsedReqHead) (body : ByteArray) (clientIp : String) : IO ByteArray :=
-    let staticTarget? :=
-      if req.method == "GET" || req.method == "HEAD" then classifyStaticPath req.method req.target devMode
-      else none
-    dispatchAppReqWith req body clientIp (stripQuery req.target) staticTarget?
-
-  let hasBlockingMethods : Bool :=
-    match blockingMethods? with
-    | none => true
-    | some ms => !ms.isEmpty
-
-  let methodMayBlock (rpcMethod : String) : Bool :=
-    match blockingMethods? with
-    | none => true
-    | some ms => ms.contains rpcMethod
-
+    match cfg.csp? with | some p => [("Content-Security-Policy", p)] | none => []
+  let (onParsedHead, onBody, onWsBytes, onWsLeave) ←
+    setup { cfg, staticDirFd, healthKA, healthClose, htmlCspHdrs }
   let onHead (headBytes : ByteArray) (clientIp : String) (inline : Nat) : IO (Prim.HttpHeadAction ParsedReqHead RequestCtx) := do
     match parseRequestHead headBytes with
-    | .error (code, msg) =>
-        return .doneClose (formatErrorResponse code msg)
+    | .error (code, msg) => return .doneClose (formatErrorResponse code msg)
     | .ok req =>
         let pathOnly := stripQuery req.target
         if req.method == "GET" && pathOnly == "/_qed/health" && req.contentLen == 0 then
           return if req.keepAlive then .doneKeepAlive healthKA else .doneClose healthClose
-        if wsDispatchFn?.isSome && req.method == "GET" && pathOnly == wsPath &&
-           req.upgrade?.any (eqCI · "websocket") then
-          if !req.isHttp11 || (req.conn?.map (containsCI · "upgrade") != some true) ||
-             req.wsVer? != some "13" then
-            return .doneClose (formatErrorResponse 400 "invalid WebSocket upgrade headers")
-          let some acceptB64 := req.wsKey?.bind wsComputeAccept
-            | return .doneClose (formatErrorResponse 400 "invalid Sec-WebSocket-Key")
-          match checkOriginAndFetchSiteParsed req.origin? req.host? req.secFetchSite?
-              (req.dupOrigin || req.dupSfs) cfg.wsAllowedOrigins? true "WebSocket upgrade" with
-          | .error (code, msg) => return .doneClose (formatErrorResponse code msg)
-          | .ok () =>
-              let baseCtx ← buildRequestCtxReq cfg req clientIp ByteArray.empty oidcRt?
-              let cid ← Prim.randomHex 12
-              return .wsUpgrade (formatWsUpgradeResponse acceptB64) { baseCtx with connId := "ws-" ++ cid }
-        let isGetOrHead := req.method == "GET" || req.method == "HEAD"
-        let staticTarget? :=
-          if isGetOrHead then classifyStaticPath req.method req.target devMode else none
-        if inline != 0 then
-          if let some st := staticTarget? then
-            if !devMode && !st.noStore && isContentHashedAsset st.relPath then
-              if let some hit ← Prim.atomicRead assetCache (fun m => m[st.relPath]?) then
-                let wire := hit.serve req st.isHead req.keepAlive
-                return if req.keepAlive then .doneKeepAlive wire else .doneClose wire
-            return .deferHead
-          if oidcRt?.isSome && (pathOnly.startsWith "/_qed/auth/" || req.auth?.isSome) then
-            return .deferHead
-          if httpDispatchFn?.isSome && !pathOnly.startsWith "/_qed/" then
-            return .deferHead
-          if hasBlockingMethods then
-            if req.method == "POST" && pathOnly.startsWith rpcPrefix then
-              if methodMayBlock (dropPrefixBytes pathOnly rpcPrefixBytes) then
-                return .deferHead
-            else if isGetOrHead && !pathOnly.startsWith "/_qed/" then
-              return .deferHead
-        if req.contentLen == 0 then
-          let wire ← dispatchAppReqWith req ByteArray.empty clientIp pathOnly staticTarget?
-          return if req.keepAlive then .doneKeepAlive wire else .doneClose wire
-        else
-          return if req.keepAlive then .needBodyKeep req.contentLen req else .needBodyClose req.contentLen req
+        onParsedHead req clientIp pathOnly inline
+  Prim.serveNative cfg.bindHost port numWorkers ({} : WsFragState) onHead onBody onWsBytes onWsLeave
 
-  let onWsBytes (ctx : RequestCtx) (rx : ByteArray) (frag : WsFragState)
-      (subs : Array (Nat × String × ByteArray)) : IO (Prim.WsStepOut WsFragState) := do
-    match wsDispatchFn? with
-    | some wsDispatchFn => stepWsRxLoop wsDispatchFn ctx rx 0 frag subs ByteArray.empty #[]
-    | none => return { consumed := rx.size, outWire := ByteArray.empty, closeFlag := 1, fragState := frag, subOps := #[] }
+private def finishHeadWire (req : ParsedReqHead) (wire : ByteArray) : Prim.HttpHeadAction ParsedReqHead RequestCtx :=
+  if req.keepAlive then .doneKeepAlive wire else .doneClose wire
 
-  let onWsLeave (ctx : RequestCtx) (ch : String) (params : ByteArray) : IO Unit := do
-    if let some wsDispatchFn := wsDispatchFn? then
-      discard <| wsDispatchFn ctx 3 ch params ByteArray.empty
+private def closedWsBytes (_ : RequestCtx) (rx : ByteArray) (frag : WsFragState)
+    (_ : Array (Nat × String × ByteArray)) : IO (Prim.WsStepOut WsFragState) :=
+  pure { consumed := rx.size, outWire := ByteArray.empty, closeFlag := 1, fragState := frag, subOps := #[] }
 
-  let _jobTasks ← if jobs.isEmpty then pure #[] else spawnServerJobs jobs
-  Prim.serveNative cfg.bindHost port numWorkers ({} : WsFragState) onHead dispatchAppReq onWsBytes onWsLeave
+private structure FullstackConfig where
+  title            : String
+  serverShortName  : String
+  requiredSecrets  : Array String
+  dispatchFn       : RequestCtx → String → ByteArray → IO (Except ApiError ByteArray × Array SetCookie)
+  port             : UInt16
+  staticDir        : String
+  devMode          : Bool := false
+  numWorkers       : UInt32 := 0
+  wsDispatchFn?    : Option (RequestCtx → UInt8 → String → ByteArray → ByteArray → IO (Except ApiError ByteArray)) := none
+  blockingMethods? : Option (Array String) := none
+  httpDispatchFn?  : Option (RequestCtx → String → String → IO (Except ApiError (Option HttpResponse) × Array SetCookie)) := none
+  jobs             : Array IoJob := #[]
+  authSpec?        : Option Qed.Auth.OidcAuthSpec := none
+  authHookFn?      : Option (RequestCtx → UInt8 → IO (Except ApiError Unit × Array SetCookie)) := none
+  authHookFlags    : Bool × Bool := (false, false)
+  primaryDb?       : Option Db.DbConfig := none
 
-def runFullstackWithDispatch {Model Msg : Type}
-    (app : Qed.App Model Msg)
-    (title : String)
-    (serverShortName : String)
-    (requiredSecrets : Array String)
-    (dispatchFn : RequestCtx → String → ByteArray → IO (Except ApiError ByteArray))
-    (port : UInt16)
-    (staticDir : String)
-    (devMode : Bool := false)
-    (numWorkers : UInt32 := 0)
-    (wsDispatchFn? : Option (RequestCtx → UInt8 → String → ByteArray → ByteArray → IO (Except ApiError ByteArray)) := none)
-    (blockingMethods? : Option (Array String) := none)
-    (httpDispatchFn? : Option (RequestCtx → String → String → IO (Except ApiError (Option HttpResponse))) := none)
-    (jobs : Array IoJob := #[])
-    (authSpec? : Option Qed.Auth.OidcAuthSpec := none) : IO UInt32 :=
-  runFullstackCore app title serverShortName requiredSecrets
-    (fun ctx mName reqBytes => do return (← dispatchFn ctx mName reqBytes, #[]))
-    port staticDir devMode numWorkers wsDispatchFn? blockingMethods?
-    (httpDispatchFn?.map fun f ctx m p => do return (← f ctx m p, #[]))
-    jobs authSpec?
+private def withCookieSink {α : Type} (gcpCache : Prim.StateBox (Array GcpTokenCacheEntry))
+    (f : MonadServer IO → IO α) : IO (α × Array SetCookie) := do
+  let cookieRef ← IO.mkRef (#[] : Array SetCookie)
+  let res ← f (mkNativeServerInst (some gcpCache) (some cookieRef))
+  return (res, ← cookieRef.get)
+
+private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : FullstackConfig) : IO UInt32 := do
+  if !(← verifyRequiredSecrets fc.requiredSecrets) then return 1
+  let (hasOnCreateAccount, hasOnSignIn) := fc.authHookFlags
+  if hasOnCreateAccount then
+    if let some dbCfg := fc.primaryDb? then
+      if let .error e ← ensureAuthUsersTable dbCfg then
+        IO.eprintln s!"✗ failed to initialize `_qed_auth_users` table: {e.message}"
+        return 1
+  serveHttpLoop fc.staticDir fc.port fc.devMode fc.numWorkers fun loop => do
+    let cfg := loop.cfg
+    let oidcRt? ← match fc.authSpec? with
+      | some spec => Qed.Auth.Oidc.initOidcRuntime spec cfg.authSecrets fc.devMode
+      | none      => pure none
+    let memSeenAuthUsers ← Prim.mkStateBox (∅ : Std.HashSet String)
+    let hostScript ← loadHostScript loop.staticDirFd fc.devMode
+    let rpcPrefix := "/_qed/rpc/" ++ fc.serverShortName ++ "/"
+    let rpcPrefixBytes := rpcPrefix.utf8ByteSize
+    let wsPath := "/_qed/ws/" ++ fc.serverShortName
+    let assetCache ← Prim.mkStateBox (∅ : Std.HashMap String CachedStaticAsset)
+    let docShell := mkPrebuiltDocShell fc.title hostScript (renderStyleSheet app.styles) app.stylesheets
+
+    let dispatchAppReqWith (req : ParsedReqHead) (body : ByteArray) (clientIp pathOnly : String)
+        (staticTarget? : Option StaticTarget) : IO ByteArray := do
+      let isHead := req.method == "HEAD"
+      if req.method == "GET" && pathOnly == "/_qed/health" then
+        return if req.keepAlive then loop.healthKA else loop.healthClose
+      if let some st := staticTarget? then
+        if isContentHashedAsset st.relPath then
+          return ← serveStaticAsset loop.staticDirFd (some assetCache) req st fc.devMode
+      let ctx ← buildRequestCtxReq cfg req clientIp body oidcRt?
+      if pathOnly.startsWith "/_qed/auth/" then
+        if let some rt := oidcRt? then
+          if req.method == "POST" && pathOnly == rt.cfg.logoutPath then
+            match checkOriginAndFetchSiteParsed req.origin? req.host? req.secFetchSite?
+                (req.dupOrigin || req.dupSfs) cfg.rpcAllowedOrigins? false "auth logout" with
+            | .error (code, msg) =>
+                return formatHttpResponse code "text/plain; charset=utf-8" msg.toUTF8 isHead req.keepAlive false
+            | .ok () => pure ()
+          let onAuthCallback? : Option (String → List (String × String) → IO (Except (Nat × String) (Array SetCookie))) :=
+            fc.authHookFn?.map fun hookFn => fun sub filteredClaims => do
+              let hookCtx : RequestCtx := { ctx with userId := some sub, claims := filteredClaims }
+              let mut outCookies : Array SetCookie := #[]
+              if hasOnCreateAccount then
+                match ← claimAuthUser fc.primaryDb? memSeenAuthUsers sub with
+                | .error e => return .error (e.httpStatus.toNat, e.message)
+                | .ok true =>
+                    let (cRes, cCookies) ← hookFn hookCtx 0
+                    match cRes with
+                    | .error e =>
+                        releaseAuthUser fc.primaryDb? memSeenAuthUsers sub
+                        return .error (e.httpStatus.toNat, e.message)
+                    | .ok () => outCookies := outCookies ++ cCookies
+                | .ok false => pure ()
+              if hasOnSignIn then
+                let (sRes, sCookies) ← hookFn hookCtx 1
+                match sRes with
+                | .error e => return .error (e.httpStatus.toNat, e.message)
+                | .ok () => outCookies := outCookies ++ sCookies
+              return .ok outCookies
+          if let some authResp ← Qed.Auth.Oidc.handleAuthRoute execHttpCall rt req
+              pathOnly ctx.query ctx.cookies ctx.userId ctx.claims isHead onAuthCallback? then
+            return authResp
+      if req.method == "POST" && pathOnly.startsWith rpcPrefix then
+        match checkRpcCsrfReq req cfg.rpcAllowedOrigins? with
+        | .error (code, msg) =>
+            return formatHttpResponse code "text/plain; charset=utf-8" msg.toUTF8 isHead req.keepAlive false
+        | .ok () =>
+            let (res, cookies) ← fc.dispatchFn ctx (dropPrefixBytes pathOnly rpcPrefixBytes) body
+            match res with
+            | .ok respBytes =>
+                if cookies.isEmpty then return formatOkProtoResponse respBytes isHead req.keepAlive
+                else return formatHttpResponse 200 "application/x-protobuf" respBytes isHead req.keepAlive false (extraHeaders := cookieHeaders cookies.toList)
+            | .error apiErr =>
+                return formatHttpResponse apiErr.httpStatus.toNat "text/plain; charset=utf-8" apiErr.message.toUTF8 isHead req.keepAlive false (extraHeaders := cookieHeaders cookies.toList)
+      if !pathOnly.startsWith "/_qed/" then
+        if let some httpDispatchFn := fc.httpDispatchFn? then
+          let (hRes, cookies) ← httpDispatchFn ctx (if isHead then "GET" else req.method) pathOnly
+          match hRes with
+          | .error apiErr =>
+              return formatHttpResponse apiErr.httpStatus.toNat "text/plain; charset=utf-8" apiErr.message.toUTF8 isHead req.keepAlive false (extraHeaders := cookieHeaders cookies.toList)
+          | .ok (some resp) =>
+              return ← formatCustomHttpResponse resp cookies cfg.csp? req isHead
+          | .ok none => pure ()
+      if let some st := staticTarget? then
+        return ← serveStaticAsset loop.staticDirFd (some assetCache) req st fc.devMode
+      if (req.method == "GET" || isHead) && !pathOnly.startsWith "/_qed/" then
+        let ssrDispatchBytes (reqMethod url : String) (reqBody : ByteArray) : IO (Except String ByteArray) := do
+          let uPath := stripQuery url
+          if reqMethod == "POST" && uPath.startsWith rpcPrefix then
+            let (r, _) ← fc.dispatchFn ctx (dropPrefixBytes uPath rpcPrefixBytes) reqBody
+            return r.mapError (·.message)
+          else
+            return .error s!"SSR unknown binary RPC endpoint: {url}"
+        let (ssrStatus, headMeta, rawHtml) ← app.ssrRenderNativeWithStatus docShell fc.title hostScript req.target ssrDispatchBytes
+          (sessionUser := ctx.userId)
+        let finalHtml := if fc.devMode then injectDevReload rawHtml else rawHtml
+        let redirectHdrs : List (String × String) :=
+          if isSsrRedirectStatus ssrStatus then
+            match headMeta.redirect.orElse (fun _ => headMeta.canonical) with
+            | some loc => if isSafeUrl loc then [("Location", sanitizeHeader loc)] else []
+            | none     => []
+          else []
+        return ← maybeGzipResponse ssrStatus "text/html; charset=utf-8" finalHtml isHead req.keepAlive false
+          req.acceptsGzip true (extraHeaders := redirectHdrs ++ loop.htmlCspHdrs ++ [("Vary", "Accept-Encoding")])
+      else
+        return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 isHead req.keepAlive false
+
+    let dispatchAppReq (req : ParsedReqHead) (body : ByteArray) (clientIp : String) : IO ByteArray :=
+      let staticTarget? :=
+        if req.method == "GET" || req.method == "HEAD" then classifyStaticPath req.method req.target fc.devMode else none
+      dispatchAppReqWith req body clientIp (stripQuery req.target) staticTarget?
+
+    let hasBlockingMethods : Bool := fc.blockingMethods?.map (!·.isEmpty) |>.getD true
+    let methodMayBlock (rpcMethod : String) : Bool := fc.blockingMethods?.map (·.contains rpcMethod) |>.getD true
+
+    let onParsedHead (req : ParsedReqHead) (clientIp pathOnly : String) (inline : Nat) : IO (Prim.HttpHeadAction ParsedReqHead RequestCtx) := do
+      if fc.wsDispatchFn?.isSome && req.method == "GET" && pathOnly == wsPath &&
+         req.upgrade?.any (eqCI · "websocket") then
+        if !req.isHttp11 || (req.conn?.map (containsCI · "upgrade") != some true) || req.wsVer? != some "13" then
+          return .doneClose (formatErrorResponse 400 "invalid WebSocket upgrade headers")
+        let some acceptB64 := req.wsKey?.bind wsComputeAccept
+          | return .doneClose (formatErrorResponse 400 "invalid Sec-WebSocket-Key")
+        match checkOriginAndFetchSiteParsed req.origin? req.host? req.secFetchSite?
+            (req.dupOrigin || req.dupSfs) cfg.wsAllowedOrigins? true "WebSocket upgrade" with
+        | .error (code, msg) => return .doneClose (formatErrorResponse code msg)
+        | .ok () =>
+            let baseCtx ← buildRequestCtxReq cfg req clientIp ByteArray.empty oidcRt?
+            return .wsUpgrade (formatWsUpgradeResponse acceptB64) { baseCtx with connId := "ws-" ++ (← Prim.randomHex 12) }
+      let isGetOrHead := req.method == "GET" || req.method == "HEAD"
+      let staticTarget? := if isGetOrHead then classifyStaticPath req.method req.target fc.devMode else none
+      if inline != 0 then
+        if let some st := staticTarget? then
+          if !fc.devMode && !st.noStore && isContentHashedAsset st.relPath then
+            if let some hit ← Prim.atomicRead assetCache (fun m => m[st.relPath]?) then
+              return finishHeadWire req (hit.serve req st.isHead req.keepAlive)
+          return .deferHead
+        if oidcRt?.isSome && (pathOnly.startsWith "/_qed/auth/" || req.auth?.isSome) then return .deferHead
+        if fc.httpDispatchFn?.isSome && !pathOnly.startsWith "/_qed/" then return .deferHead
+        if hasBlockingMethods then
+          if req.method == "POST" && pathOnly.startsWith rpcPrefix then
+            if methodMayBlock (dropPrefixBytes pathOnly rpcPrefixBytes) then return .deferHead
+          else if isGetOrHead && !pathOnly.startsWith "/_qed/" then return .deferHead
+      if req.contentLen == 0 then
+        return finishHeadWire req (← dispatchAppReqWith req ByteArray.empty clientIp pathOnly staticTarget?)
+      else
+        return if req.keepAlive then .needBodyKeep req.contentLen req else .needBodyClose req.contentLen req
+
+    let onWsBytes := match fc.wsDispatchFn? with
+      | some wsDispatchFn => fun ctx rx frag subs => stepWsRxLoop wsDispatchFn ctx rx 0 frag subs ByteArray.empty #[]
+      | none              => closedWsBytes
+    let onWsLeave (ctx : RequestCtx) (ch : String) (params : ByteArray) : IO Unit := do
+      if let some wsDispatchFn := fc.wsDispatchFn? then discard <| wsDispatchFn ctx 3 ch params ByteArray.empty
+
+    let _jobTasks ← if fc.jobs.isEmpty then pure #[] else spawnServerJobs fc.jobs
+    return (onParsedHead, dispatchAppReq, onWsBytes, onWsLeave)
 
 def runStatefulFullstack {σ Model Msg : Type}
     (app : Qed.App Model Msg) (title serverShortName : String)
@@ -1505,20 +1401,17 @@ def runStatefulFullstack {σ Model Msg : Type}
   let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
   let wsSrvInst : MonadServer IO := mkNativeServerInst (some gcpCache) none
   let atomicInst : MonadAtomic σ IO := withStateBox box
-  runFullstackCore app title serverShortName requiredSecrets
-    (fun ctx mName reqBytes => do
-      let cookieRef ← IO.mkRef (#[] : Array SetCookie)
-      let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef)
-      let res ← @dispatchM IO _ reqSrvInst atomicInst ctx mName reqBytes
-      return (res, ← cookieRef.get))
-    port staticDir devMode numWorkers
-    (wsDispatchM?.map fun wsM ctx kind ch params payload => @wsM IO _ wsSrvInst atomicInst ctx kind ch params payload)
-    blockingMethods?
-    (httpDispatchM?.map fun httpM ctx method path => do
+  runFullstackCore app {
+    title, serverShortName, requiredSecrets, port, staticDir, devMode, numWorkers,
+    blockingMethods?, authSpec?, authHookFlags, primaryDb?,
+    dispatchFn := fun ctx mName reqBytes =>
+      withCookieSink gcpCache fun srv => @dispatchM IO _ srv atomicInst ctx mName reqBytes,
+    wsDispatchFn? := wsDispatchM?.map fun wsM ctx kind ch params payload =>
+      @wsM IO _ wsSrvInst atomicInst ctx kind ch params payload,
+    httpDispatchFn? := httpDispatchM?.map fun httpM ctx method path => do
       let cookieRef ← IO.mkRef (#[] : Array SetCookie)
       let sseRef ← IO.mkRef (#[] : Array SseEvent)
-      let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef) (some sseRef)
-      let res ← @httpM IO _ reqSrvInst atomicInst ctx method path
+      let res ← @httpM IO _ (mkNativeServerInst (some gcpCache) (some cookieRef) (some sseRef)) atomicInst ctx method path
       let sseEvs ← sseRef.get
       let res' := match res with
         | .ok (some resp) =>
@@ -1526,16 +1419,11 @@ def runStatefulFullstack {σ Model Msg : Type}
               .ok (some { resp with body := SseEvent.formatStream sseEvs.toList })
             else .ok (some resp)
         | other => other
-      return (res', ← cookieRef.get))
-    (jobs.map (·.toIoJob wsSrvInst atomicInst))
-    authSpec?
-    (authHookM?.map fun hookM ctx kind => do
-      let cookieRef ← IO.mkRef (#[] : Array SetCookie)
-      let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef)
-      let res ← @hookM IO _ reqSrvInst atomicInst ctx kind
-      return (res, ← cookieRef.get))
-    authHookFlags
-    primaryDb?
+      return (res', ← cookieRef.get),
+    jobs := jobs.map (·.toIoJob wsSrvInst atomicInst),
+    authHookFn? := authHookM?.map fun hookM ctx kind =>
+      withCookieSink gcpCache fun srv => @hookM IO _ srv atomicInst ctx kind
+  }
 
 def runStatelessFullstack {Model Msg : Type}
     (app : Qed.App Model Msg) (title serverShortName : String)
@@ -1575,44 +1463,29 @@ def runStandaloneApp {Model Msg : Type} (app : Qed.App Model Msg) (title : Strin
   let port : UInt16 := ((args.getD 1 "8000").toNat?.getD 8000).toUInt16
   let devMode := args.contains "--dev"
   let numWorkers : UInt32 := (((← Prim.getEnv "QED_WORKERS").bind String.toNat?).getD 0).toUInt32
-  runFullstackWithDispatch app title "_app" #[]
-    (fun _ _ _ => pure (.error (ApiError.notFound "no RPC server configured")))
-    port staticDir devMode numWorkers none (some #[])
+  runFullstackCore app {
+    title, serverShortName := "_app", requiredSecrets := #[], port, staticDir, devMode, numWorkers,
+    dispatchFn := fun _ _ _ => pure (.error (ApiError.notFound "no RPC server configured"), #[]),
+    blockingMethods? := some #[]
+  }
 
 /-- Serves a static/SPA directory using Qed's native Rust/Lean HTTP/1.1 server (no Node.js or Python). -/
-def runStaticDir (staticDir : String) (port : UInt16) (devMode : Bool := false) : IO UInt32 := do
-  let cfg ← loadServerConfig devMode
-  let staticDirFd ← Prim.openStaticDir staticDir
-  let healthKA    := formatHttpResponse 200 "application/json" "{\"ok\":true}".toUTF8 false true false
-  let healthClose := formatHttpResponse 200 "application/json" "{\"ok\":true}".toUTF8 false false false
-  let htmlCspHdrs : List (String × String) :=
-    match cfg.csp? with
-    | some p => [("Content-Security-Policy", p)]
-    | none   => []
-  let dispatchReq (req : ParsedReqHead) (_body : ByteArray) (_clientIp : String) : IO ByteArray := do
-    let isHead := req.method == "HEAD"
-    if req.method != "GET" && !isHead then
-      return formatHttpResponse 405 "text/plain; charset=utf-8" "method not allowed".toUTF8 isHead req.keepAlive false
-    if let some st := classifyStaticPath req.method req.target devMode then
-      return ← serveStaticAsset staticDirFd none req st devMode
-    match ← Prim.readStaticFile staticDirFd "index.html" (if isHead then 1 else 0) with
-    | some (fsize, _, bytes) =>
-        let baseHdrs := htmlCspHdrs ++ [("Vary", "Accept-Encoding")]
-        return ← maybeGzipResponse 200 "text/html; charset=utf-8" bytes isHead req.keepAlive true
-          req.acceptsGzip true (extraHeaders := baseHdrs) (contentLen := fsize)
-    | none =>
-        return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 isHead req.keepAlive false
-  let onHead (headBytes : ByteArray) (_clientIp : String) (_inline : Nat) : IO (Prim.HttpHeadAction ParsedReqHead RequestCtx) := do
-    match parseRequestHead headBytes with
-    | .error (code, msg) => return .doneClose (formatErrorResponse code msg)
-    | .ok req =>
-        let pathOnly := stripQuery req.target
-        if req.method == "GET" && pathOnly == "/_qed/health" && req.contentLen == 0 then
-          return if req.keepAlive then .doneKeepAlive healthKA else .doneClose healthClose
-        let wire ← dispatchReq req ByteArray.empty ""
-        return if req.keepAlive then .doneKeepAlive wire else .doneClose wire
-  let onWsBytes (_ : RequestCtx) (rx : ByteArray) (frag : WsFragState) (_ : Array (Nat × String × ByteArray)) :=
-    pure { consumed := rx.size, outWire := ByteArray.empty, closeFlag := 1, fragState := frag, subOps := #[] : Prim.WsStepOut WsFragState }
-  Prim.serveNative cfg.bindHost port 1 ({} : WsFragState) onHead dispatchReq onWsBytes (fun _ _ _ => pure ())
+def runStaticDir (staticDir : String) (port : UInt16) (devMode : Bool := false) : IO UInt32 :=
+  serveHttpLoop staticDir port devMode 1 fun loop => do
+    let dispatchReq (req : ParsedReqHead) (_body : ByteArray) (_clientIp : String) : IO ByteArray := do
+      let isHead := req.method == "HEAD"
+      if req.method != "GET" && !isHead then
+        return formatHttpResponse 405 "text/plain; charset=utf-8" "method not allowed".toUTF8 isHead req.keepAlive false
+      if let some st := classifyStaticPath req.method req.target devMode then
+        return ← serveStaticAsset loop.staticDirFd none req st devMode
+      match ← Prim.readStaticFile loop.staticDirFd "index.html" (if isHead then 1 else 0) with
+      | some (fsize, _, bytes) =>
+          return ← maybeGzipResponse 200 "text/html; charset=utf-8" bytes isHead req.keepAlive true
+            req.acceptsGzip true (extraHeaders := loop.htmlCspHdrs ++ [("Vary", "Accept-Encoding")]) (contentLen := fsize)
+      | none =>
+          return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 isHead req.keepAlive false
+    let onParsedHead (req : ParsedReqHead) (_ _ : String) (_ : Nat) := do
+      return finishHeadWire req (← dispatchReq req ByteArray.empty "")
+    return (onParsedHead, dispatchReq, closedWsBytes, fun _ _ _ => pure ())
 
 end Qed.Server.Native

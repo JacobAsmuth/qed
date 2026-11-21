@@ -60,19 +60,13 @@ theorem progPreservesInv_of_pureStepRead {σ α : Type} {Inv : σ → Prop}
     ProgPreservesInv Inv (MonadAtomic.runAtomicRead (m := ThreadProg σ) f) :=
   progPreservesStepRel_runAtomicRead f (fun _ hs => hs)
 
-private theorem progPreservesInv_of_noAtomic {σ α : Type} {Inv : σ → Prop}
-    {p : ThreadProg σ α} (h : NoAtomic p) : ProgPreservesInv Inv p := by
-  induction h with
-  | pure a => exact .pure a
-  | io eff k _ ih => exact .io eff k ih
-
 theorem progPreservesInv_of_pureStepEmit {σ α : Type} {Inv : σ → Prop}
     (step : σ → σ × (α × List WsEmit)) (h : ∀ s, Inv s → Inv (step s).1) :
     ProgPreservesInv Inv
       (MonadAtomic.runAtomic (m := ThreadProg σ) step >>= fun p =>
         flushWsEmits (m := ThreadProg σ) p.2 >>= fun _ => Pure.pure p.1) :=
   progPreservesStepRel_bind (progPreservesStepRel_runAtomic step h) fun p =>
-    progPreservesStepRel_bind (progPreservesInv_of_noAtomic (noAtomic_flushWsEmits p.2)) (fun _ => .pure p.1)
+    progPreservesStepRel_bind (ProgSpec.of_noAtomic (noAtomic_flushWsEmits p.2)) (fun _ => .pure p.1)
 
 theorem progPreservesInv_of_pureStepReadEmit {σ α : Type} {Inv : σ → Prop}
     (f : σ → α × List WsEmit) :
@@ -80,14 +74,14 @@ theorem progPreservesInv_of_pureStepReadEmit {σ α : Type} {Inv : σ → Prop}
       (MonadAtomic.runAtomicRead (m := ThreadProg σ) f >>= fun p =>
         flushWsEmits (m := ThreadProg σ) p.2 >>= fun _ => Pure.pure p.1) :=
   progPreservesStepRel_bind (progPreservesStepRel_runAtomicRead f (fun _ hs => hs)) fun p =>
-    progPreservesStepRel_bind (progPreservesInv_of_noAtomic (noAtomic_flushWsEmits p.2)) (fun _ => .pure p.1)
+    progPreservesStepRel_bind (ProgSpec.of_noAtomic (noAtomic_flushWsEmits p.2)) (fun _ => .pure p.1)
 
 theorem progPreservesInv_readEnv_default {σ α : Type} {Inv : σ → Prop}
     (osKey defVal : String) (k : String → ThreadProg σ α)
     (hk : ∀ v, ProgPreservesInv Inv (k v)) :
     ProgPreservesInv Inv
       (MonadServer.readEnv (m := ThreadProg σ) osKey >>= fun opt => k (opt.getD defVal)) :=
-  progPreservesStepRel_bind (.io (.readEnv osKey) _ (fun r => .pure r)) (fun opt => hk (opt.getD defVal))
+  safeIO_bind_preservesStepRel _ (fun opt => hk (opt.getD defVal))
 
 theorem progPreservesInv_readEnv_required {σ α : Type} {Inv : σ → Prop}
     (osKey missingMsg : String) (k : String → ThreadProg σ (Except ApiError α))
@@ -96,11 +90,10 @@ theorem progPreservesInv_readEnv_required {σ α : Type} {Inv : σ → Prop}
       (MonadServer.readEnv (m := ThreadProg σ) osKey >>= fun opt =>
         match opt with
         | some v => k v
-        | none   => Pure.pure (Except.error (ApiError.internal missingMsg))) := by
-  refine progPreservesStepRel_bind (.io (.readEnv osKey) _ (fun r => .pure r)) fun opt => ?_
-  cases opt with
-  | some v => exact hk v
-  | none   => exact .pure _
+        | none   => Pure.pure (Except.error (ApiError.internal missingMsg))) :=
+  safeIO_bind_preservesStepRel _ fun
+    | some v => hk v
+    | none   => .pure _
 
 /-! ### Native Background Job Runner (Total, Tail-Recursive, Non-Blocking) -/
 

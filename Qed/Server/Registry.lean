@@ -7,9 +7,8 @@ import Qed.Socket.Basic
 
 namespace Qed
 
-@[reducible, inline] instance {α : Type} {p : α → Prop} : Qed.Lang.QedVal (Ensured α p) α := ⟨Ensured.val⟩
 @[simp] theorem QedVal.val_ensured {α : Type} {p : α → Prop} (e : Ensured α p) :
-    Qed.Lang.QedVal.val e = e.val := rfl
+    Qed.Lang.QedVal.val e = Field.val e := rfl
 
 end Qed
 

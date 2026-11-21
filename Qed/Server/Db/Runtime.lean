@@ -136,349 +136,199 @@ private theorem progEnsures_execDbMaybeTx {σ : Type} {Inv : σ → Prop} (cfg :
   | none     => exact .io (.dbExec cfg q) k hk
   | some tid => exact .io (.dbTxExec cfg tid q) k hk
 
-private theorem decodeCheckedList_ensures {σ Row : Type} {Inv : σ → Prop}
-    (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64)
+private abbrev dbArrPost {Row : Type} (P : Row → Prop) (res : Except ApiError (Array Row)) : Prop :=
+  match res with | .ok rows => ∀ r ∈ rows.toList, P r | .error _ => True
+
+private def decodeCheckedArr {Row : Type}
     (decode : DbRow → Except ApiError Row) (check : Row → Bool) (errMsg : String)
-    {P : Row → Prop} (hP : ∀ r, check r = true → P r) :
-    ProgEnsures Inv
-      (fun res => match res with | .ok rows => ∀ r ∈ rows.toList, P r | .error _ => True)
-      (execDbMaybeTx (m := ThreadProg σ) cfg q txId? >>= fun res =>
-        pure (res.bind fun dbRes => (decodeCheckedList decode check errMsg dbRes.rows.toList).map List.toArray)) :=
-  progEnsures_execDbMaybeTx cfg q txId? _ fun res => .pure _ (by
-    cases res with
-    | error _ => trivial
-    | ok dbRes =>
-        dsimp only [Except.bind, Except.map]
-        cases hd : decodeCheckedList decode check errMsg dbRes.rows.toList with
-        | error _ => trivial
-        | ok out => intro r hr; exact hP r (decodeCheckedList_sound decode check errMsg _ out hd r (by simpa using hr)))
+    (dbRes : DbResult) : Except ApiError (Array Row) :=
+  (decodeCheckedList decode check errMsg dbRes.rows.toList).map List.toArray
 
-private theorem decodeCheckedOne_ensures {σ Row : Type} {Inv : σ → Prop}
-    (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64)
+private theorem decodeCheckedArr_post {Row : Type}
+    (decode : DbRow → Except ApiError Row) (check : Row → Bool) (errMsg : String)
+    {P : Row → Prop} (hP : ∀ r, check r = true → P r) (dbRes : DbResult) :
+    dbArrPost P (decodeCheckedArr decode check errMsg dbRes) := by
+  unfold dbArrPost decodeCheckedArr; dsimp only [Except.map]
+  cases hd : decodeCheckedList decode check errMsg dbRes.rows.toList with
+  | error _ => trivial
+  | ok out => intro r hr; exact hP r (decodeCheckedList_sound decode check errMsg _ out hd r (by simpa using hr))
+
+private theorem decodeCheckedOne_post {Row : Type}
     (decode : DbRow → Except String Row) (check : Row → Bool) (errMsg : String)
-    {P : Row → Prop} (hP : ∀ r, check r = true → P r) :
-    ProgEnsures Inv
-      (fun res => ∀ r, res = .ok (some r) → P r)
-      (execDbMaybeTx (m := ThreadProg σ) cfg q txId? >>= fun res =>
-        pure (res.bind fun dbRes => decodeCheckedOne decode check errMsg dbRes.rows.toList)) :=
-  progEnsures_execDbMaybeTx cfg q txId? _ fun res => .pure _ (by
-    intro r hr
-    cases res with
-    | error _ => simp [Except.bind] at hr
-    | ok dbRes => exact hP r (decodeCheckedOne_sound decode check errMsg dbRes.rows.toList r hr))
+    {P : Row → Prop} (hP : ∀ r, check r = true → P r) (dbRes : DbResult) :
+    ∀ r, decodeCheckedOne decode check errMsg dbRes.rows.toList = .ok (some r) → P r :=
+  fun r hr => hP r (decodeCheckedOne_sound decode check errMsg dbRes.rows.toList r hr)
 
-/-- Verified `SELECT` returning all matching rows with zero-trust `RowInv ∧ wherePred` guarantees. -/
-@[specialize]
-def dbSelect {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
-    (cfg : DbConfig) (q : SqlQuery)
-    (decode : DbRow → Except String Row)
-    (RowInv : Row → Prop) (rowInvBool : Row → Bool)
-    (_hInvSound : ∀ r, rowInvBool r = true → RowInv r)
-    (wherePred : Row → Bool)
-    (ReadPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (_hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r)
-    (txId? : Option UInt64 := none) :
-    m (Except ApiError (Array Row)) := do
-  let res ← execDbMaybeTx cfg q txId?
-  return res.bind fun dbRes =>
-    (decodeCheckedList (decodeRowErr decode) (fun r => rowInvBool r && wherePred r)
-      "database row violated verified table invariant or query predicate" dbRes.rows.toList).map List.toArray
+@[inline, specialize]
+def dbRun {α : Type} {P : Prop} {m : Type → Type} [Monad m] [MonadServer m]
+    (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64)
+    (post : DbResult → Except ApiError α) (_pf : P) : m (Except ApiError α) := do
+  return (← execDbMaybeTx cfg q txId?).bind post
 
-/-- Verified `SELECT ... LIMIT 1` returning `Option Row` with zero-trust `RowInv ∧ wherePred` guarantees. -/
-@[specialize]
-def dbFindOne {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
-    (cfg : DbConfig) (q : SqlQuery)
-    (decode : DbRow → Except String Row)
-    (RowInv : Row → Prop) (rowInvBool : Row → Bool)
-    (_hInvSound : ∀ r, rowInvBool r = true → RowInv r)
-    (wherePred : Row → Bool)
-    (ReadPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (_hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r)
-    (txId? : Option UInt64 := none) :
-    m (Except ApiError (Option Row)) := do
-  let res ← execDbMaybeTx cfg q txId?
-  return res.bind fun dbRes =>
-    decodeCheckedOne decode (fun r => rowInvBool r && wherePred r)
-      "database row violated verified table invariant or query predicate" dbRes.rows.toList
-
-/-- Verified `SELECT COUNT(*)` requiring `ReadPolicy` on all counted rows. -/
-@[specialize]
-def dbCount {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
-    (cfg : DbConfig) (q : SqlQuery)
-    (RowInv : Row → Prop)
-    (wherePred : Row → Bool)
-    (ReadPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (_hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r)
-    (txId? : Option UInt64 := none) :
-    m (Except ApiError Nat) := do
-  let res ← execDbMaybeTx cfg q txId?
-  return res.bind (decodeFirstCell (α := Nat) id none 0 "COUNT")
-
-/-- Verified `SELECT SUM(col)` for `Nat` columns (returning `0` on empty result sets) requiring `ReadPolicy`. -/
-@[specialize]
-def dbSumNat {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
-    (cfg : DbConfig) (q : SqlQuery)
-    (RowInv : Row → Prop)
-    (wherePred : Row → Bool)
-    (ReadPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (_hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r)
-    (txId? : Option UInt64 := none) :
-    m (Except ApiError Nat) := do
-  let res ← execDbMaybeTx cfg q txId?
-  return res.bind (decodeFirstCell (α := Nat) id (some 0) 0 "SUM")
-
-/-- Verified `SELECT SUM(col)` for `Int` columns (returning `0` on empty result sets) requiring `ReadPolicy`. -/
-@[specialize]
-def dbSumInt {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
-    (cfg : DbConfig) (q : SqlQuery)
-    (RowInv : Row → Prop)
-    (wherePred : Row → Bool)
-    (ReadPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (_hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r)
-    (txId? : Option UInt64 := none) :
-    m (Except ApiError Int) := do
-  let res ← execDbMaybeTx cfg q txId?
-  return res.bind (decodeFirstCell (α := Int) id (some 0) 0 "SUM")
-
-/-- Verified `SELECT MIN(col)` / `MAX(col)` returning `Option Val` (`none` when 0 rows match),
-    inferring `Val` from `_proj` and requiring `ReadPolicy` on all aggregated rows. -/
-@[specialize]
-def dbAggOpt {Row Val : Type} [FromSql Val] {m : Type → Type} [Monad m] [MonadServer m]
-    (cfg : DbConfig) (q : SqlQuery)
-    (_proj : Row → Val)
-    (RowInv : Row → Prop)
-    (wherePred : Row → Bool)
-    (ReadPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (_hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r)
-    (txId? : Option UInt64 := none) :
-    m (Except ApiError (Option Val)) := do
-  let res ← execDbMaybeTx cfg q txId?
-  return res.bind (decodeFirstCell (α := Val) some (some none) none "aggregate")
-
-/-- Verified typed `INNER JOIN` checking BOTH tables' `ReadPolicy` at compile time and
-    zero-trust verifying both `RowInv`s, both `wherePred`s, and the join key equality on every row. -/
-@[specialize]
-def dbJoinSelect {RowL RowR Key : Type} [BEq Key] {m : Type → Type} [Monad m] [MonadServer m]
-    (cfg : DbConfig) (q : SqlQuery) (leftColCount : Nat)
-    (decodeL : DbRow → Except String RowL) (decodeR : DbRow → Except String RowR)
-    (RowInvL : RowL → Prop) (rowInvBoolL : RowL → Bool) (_hInvSoundL : ∀ r, rowInvBoolL r = true → RowInvL r)
-    (RowInvR : RowR → Prop) (rowInvBoolR : RowR → Bool) (_hInvSoundR : ∀ r, rowInvBoolR r = true → RowInvR r)
-    (wherePredL : RowL → Bool) (wherePredR : RowR → Bool)
-    (keyL : RowL → Key) (keyR : RowR → Key)
-    (ReadPolicyL : RequestCtx → RowL → Prop) (ReadPolicyR : RequestCtx → RowR → Prop)
-    (ctx : RequestCtx)
-    (_hPolicyL : ∀ r, RowInvL r → wherePredL r = true → ReadPolicyL ctx r)
-    (_hPolicyR : ∀ r, RowInvR r → wherePredR r = true → ReadPolicyR ctx r)
-    (txId? : Option UInt64 := none) :
-    m (Except ApiError (Array (RowL × RowR))) := do
-  let res ← execDbMaybeTx cfg q txId?
-  return res.bind fun dbRes =>
-    (decodeCheckedList (decodeJoinRowErr leftColCount decodeL decodeR)
-      (fun p => rowInvBoolL p.1 && wherePredL p.1 && rowInvBoolR p.2 && wherePredR p.2 && (keyL p.1 == keyR p.2))
-      "database joined row violated verified table invariant or query predicate"
-      dbRes.rows.toList).map List.toArray
-
-/-- Verified `INSERT` requiring `RowInv newRow` and `InsertPolicy ctx newRow` at compile time. -/
-@[specialize]
-def dbInsert {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
-    (cfg : DbConfig) (q : SqlQuery) (newRow : Row)
-    (RowInv : Row → Prop)
-    (InsertPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (_hInv : RowInv newRow)
-    (_hPolicy : InsertPolicy ctx newRow)
-    (txId? : Option UInt64 := none) :
-    m (Except ApiError Row) := do
-  let res ← execDbMaybeTx cfg q txId?
-  return res.map fun _ => newRow
-
-/-- Verified `UPDATE ... RETURNING *` returning all updated rows, requiring:
-    1. `UpdatePolicy ctx oldRow` (caller may update matched rows)
-    2. `UpdatePolicy ctx (setFn oldRow)` (no ownership hijacking)
-    3. `RowInv (setFn oldRow)` (all column `where` & single-row invariants preserved)
-    4. `TransInv oldRow (setFn oldRow)` (all `old(row)` & `transition` invariants preserved) -/
-@[specialize]
-def dbUpdate {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
-    (cfg : DbConfig) (q : SqlQuery)
-    (decode : DbRow → Except String Row)
-    (RowInv : Row → Prop) (rowInvBool : Row → Bool)
-    (_hInvSound : ∀ r, rowInvBool r = true → RowInv r)
-    (TransInv : Row → Row → Prop)
-    (wherePred : Row → Bool) (setFn : Row → Row)
-    (postPred : Row → Bool)
-    (UpdatePolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (_hPolicyOld : ∀ r, RowInv r → wherePred r = true → UpdatePolicy ctx r)
-    (_hPolicyNew : ∀ r, RowInv r → wherePred r = true → UpdatePolicy ctx (setFn r))
-    (_hInvPres   : ∀ r, RowInv r → wherePred r = true → RowInv (setFn r))
-    (_hTrans     : ∀ r, RowInv r → wherePred r = true → TransInv r (setFn r))
-    (txId? : Option UInt64 := none) :
-    m (Except ApiError (Array Row)) := do
-  let res ← execDbMaybeTx cfg q txId?
-  return res.bind fun dbRes =>
-    (decodeCheckedList (decodeRowErr decode) (fun r => rowInvBool r && postPred r)
-      "database row violated verified table invariant or query predicate" dbRes.rows.toList).map List.toArray
-
-/-- Verified single-row `UPDATE ... RETURNING *` returning `Option Row` (`none` if 0 rows matched). -/
-@[specialize]
-def dbUpdateOne {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
-    (cfg : DbConfig) (q : SqlQuery)
-    (decode : DbRow → Except String Row)
-    (RowInv : Row → Prop) (rowInvBool : Row → Bool)
-    (_hInvSound : ∀ r, rowInvBool r = true → RowInv r)
-    (TransInv : Row → Row → Prop)
-    (wherePred : Row → Bool) (setFn : Row → Row)
-    (postPred : Row → Bool)
-    (UpdatePolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (_hPolicyOld : ∀ r, RowInv r → wherePred r = true → UpdatePolicy ctx r)
-    (_hPolicyNew : ∀ r, RowInv r → wherePred r = true → UpdatePolicy ctx (setFn r))
-    (_hInvPres   : ∀ r, RowInv r → wherePred r = true → RowInv (setFn r))
-    (_hTrans     : ∀ r, RowInv r → wherePred r = true → TransInv r (setFn r))
-    (txId? : Option UInt64 := none) :
-    m (Except ApiError (Option Row)) := do
-  let res ← execDbMaybeTx cfg q txId?
-  return res.bind fun dbRes =>
-    decodeCheckedOne decode (fun r => rowInvBool r && postPred r)
-      "updated database row violated verified table invariant or postcondition" dbRes.rows.toList
-
-/-- Verified `DELETE` requiring `DeletePolicy` on all deleted rows and returning affected count. -/
-@[specialize]
-def dbDelete {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
-    (cfg : DbConfig) (q : SqlQuery)
-    (RowInv : Row → Prop)
-    (wherePred : Row → Bool)
-    (DeletePolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (_hPolicy : ∀ r, RowInv r → wherePred r = true → DeletePolicy ctx r)
-    (txId? : Option UInt64 := none) :
-    m (Except ApiError Nat) := do
-  let res ← execDbMaybeTx cfg q txId?
-  return res.map (·.affected)
+@[inline, specialize]
+def dbRunChecked {α : Type} {P : Prop} {Q : Except ApiError α → Prop}
+    {m : Type → Type} [Monad m] [MonadServer m]
+    (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64)
+    (post : DbResult → Except ApiError α)
+    (_hPost : ∀ r, Q (post r)) (_hErr : ∀ e, Q (.error e)) (_pf : P) :
+    m (Except ApiError α) := do
+  return (← execDbMaybeTx cfg q txId?).bind post
 
 /-! ## `SafeIO` & `SafeIOEnsures` Instances (Automatic Zero-Trust Postcondition Propagation) -/
 
-instance {σ Row : Type} (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
+instance {σ α : Type} {P : Prop} (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64)
+    (post : DbResult → Except ApiError α) (pf : P) :
+    SafeIO (dbRun (m := ThreadProg σ) cfg q txId? post pf) where
+  noAtomic := noAtomic_execDbMaybeTx cfg q txId? _ fun _ => .pure _
+
+instance {σ α : Type} {P : Prop} {Q : Except ApiError α → Prop}
+    (cfg : DbConfig) (q : SqlQuery) (txId? : Option UInt64)
+    (post : DbResult → Except ApiError α) (hPost : ∀ r, Q (post r)) (hErr : ∀ e, Q (.error e)) (pf : P) :
+    SafeIOEnsures (dbRunChecked (Q := Q) (m := ThreadProg σ) cfg q txId? post hPost hErr pf) Q where
+  noAtomic := noAtomic_execDbMaybeTx cfg q txId? _ fun _ => .pure _
+  ensures := progEnsures_execDbMaybeTx cfg q txId? _ fun res =>
+    .pure _ (by cases res with | error e => exact hErr e | ok r => exact hPost r)
+
+private abbrev dbPolicyRun {Row α : Type} {m : Type → Type} [Monad m] [MonadServer m]
+    (post : DbResult → Except ApiError α)
+    (cfg : DbConfig) (q : SqlQuery) (RowInv : Row → Prop) (wherePred : Row → Bool)
+    (Policy : RequestCtx → Row → Prop) (ctx : RequestCtx)
+    (hPolicy : ∀ r, RowInv r → wherePred r = true → Policy ctx r)
+    (txId? : Option UInt64 := none) : m (Except ApiError α) :=
+  dbRun cfg q txId? post hPolicy
+
+private theorem and_inv_pred {Row : Type} {RowInv : Row → Prop} {rowInvBool pred : Row → Bool}
+    (hInvSound : ∀ r, rowInvBool r = true → RowInv r) (r : Row)
+    (h : (rowInvBool r && pred r) = true) : RowInv r ∧ pred r = true := by
+  simp only [Bool.and_eq_true] at h; exact ⟨hInvSound r h.1, h.2⟩
+
+private abbrev dbRunRows {Row : Type} {P : Prop} {m : Type → Type} [Monad m] [MonadServer m]
+    (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
+    (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)
+    (pred : Row → Bool) (errMsg : String) (pf : P) (txId? : Option UInt64) : m (Except ApiError (Array Row)) :=
+  dbRunChecked (Q := dbArrPost fun r => RowInv r ∧ pred r = true)
+    cfg q txId?
+    (decodeCheckedArr (decodeRowErr decode) (fun r => rowInvBool r && pred r) errMsg)
+    (decodeCheckedArr_post _ _ _ (and_inv_pred hInvSound)) (fun _ => trivial) pf
+
+private abbrev dbRunOneRow {Row : Type} {P : Prop} {m : Type → Type} [Monad m] [MonadServer m]
+    (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
+    (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)
+    (pred : Row → Bool) (errMsg : String) (pf : P) (txId? : Option UInt64) : m (Except ApiError (Option Row)) :=
+  dbRunChecked (Q := fun res => ∀ r, res = .ok (some r) → RowInv r ∧ pred r = true)
+    cfg q txId?
+    (fun dbRes => decodeCheckedOne decode (fun r => rowInvBool r && pred r) errMsg dbRes.rows.toList)
+    (decodeCheckedOne_post _ _ _ (and_inv_pred hInvSound)) (fun _ _ h => nomatch h) pf
+
+/-- Verified `SELECT` returning all matching rows with zero-trust `RowInv ∧ wherePred` guarantees. -/
+abbrev dbSelect {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
+    (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
     (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)
     (wherePred : Row → Bool) (ReadPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r) (txId? : Option UInt64) :
-    SafeIOEnsures
-      (dbSelect (m := ThreadProg σ) cfg q decode RowInv rowInvBool hInvSound wherePred ReadPolicy ctx hPolicy txId?)
-      (fun res => match res with | .ok rows => ∀ r ∈ rows.toList, RowInv r ∧ wherePred r = true | .error _ => True) where
-  noAtomic := noAtomic_execDbMaybeTx cfg q txId? _ fun _ => .pure _
-  ensures := decodeCheckedList_ensures cfg q txId? _ _ _ fun r h => by
-    simp only [Bool.and_eq_true] at h; exact ⟨hInvSound r h.1, h.2⟩
+    (hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r)
+    (txId? : Option UInt64 := none) : m (Except ApiError (Array Row)) :=
+  dbRunRows cfg q decode RowInv rowInvBool hInvSound wherePred
+    "database row violated verified table invariant or query predicate" hPolicy txId?
 
-instance {σ Row : Type} (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
+/-- Verified `SELECT ... LIMIT 1` returning `Option Row` with zero-trust `RowInv ∧ wherePred` guarantees. -/
+abbrev dbFindOne {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
+    (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
     (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)
     (wherePred : Row → Bool) (ReadPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r) (txId? : Option UInt64) :
-    SafeIOEnsures
-      (dbFindOne (m := ThreadProg σ) cfg q decode RowInv rowInvBool hInvSound wherePred ReadPolicy ctx hPolicy txId?)
-      (fun res => ∀ r, res = .ok (some r) → RowInv r ∧ wherePred r = true) where
-  noAtomic := noAtomic_execDbMaybeTx cfg q txId? _ fun _ => .pure _
-  ensures := decodeCheckedOne_ensures cfg q txId? _ _ _ fun r h => by
-    simp only [Bool.and_eq_true] at h; exact ⟨hInvSound r h.1, h.2⟩
+    (hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r)
+    (txId? : Option UInt64 := none) : m (Except ApiError (Option Row)) :=
+  dbRunOneRow cfg q decode RowInv rowInvBool hInvSound wherePred
+    "database row violated verified table invariant or query predicate" hPolicy txId?
 
-instance {σ Row : Type} (cfg : DbConfig) (q : SqlQuery)
+/-- Verified `SELECT COUNT(*)` requiring `ReadPolicy` on all counted rows. -/
+abbrev dbCount {Row : Type} {m : Type → Type} [Monad m] [MonadServer m] :=
+  @dbPolicyRun Row Nat m _ _ (decodeFirstCell (α := Nat) id none 0 "COUNT")
+
+/-- Verified `SELECT SUM(col)` for `Nat` columns (returning `0` on empty result sets) requiring `ReadPolicy`. -/
+abbrev dbSumNat {Row : Type} {m : Type → Type} [Monad m] [MonadServer m] :=
+  @dbPolicyRun Row Nat m _ _ (decodeFirstCell (α := Nat) id (some 0) 0 "SUM")
+
+/-- Verified `SELECT SUM(col)` for `Int` columns (returning `0` on empty result sets) requiring `ReadPolicy`. -/
+abbrev dbSumInt {Row : Type} {m : Type → Type} [Monad m] [MonadServer m] :=
+  @dbPolicyRun Row Int m _ _ (decodeFirstCell (α := Int) id (some 0) 0 "SUM")
+
+/-- Verified `SELECT MIN(col)` / `MAX(col)` returning `Option Val` (`none` when 0 rows match),
+    inferring `Val` from `_proj` and requiring `ReadPolicy` on all aggregated rows. -/
+abbrev dbAggOpt {Row Val : Type} [FromSql Val] {m : Type → Type} [Monad m] [MonadServer m]
+    (cfg : DbConfig) (q : SqlQuery) (_proj : Row → Val)
     (RowInv : Row → Prop) (wherePred : Row → Bool)
     (ReadPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r) (txId? : Option UInt64) :
-    SafeIO (dbCount (m := ThreadProg σ) cfg q RowInv wherePred ReadPolicy ctx hPolicy txId?) where
-  noAtomic := noAtomic_execDbMaybeTx cfg q txId? _ fun _ => .pure _
+    (hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r)
+    (txId? : Option UInt64 := none) : m (Except ApiError (Option Val)) :=
+  dbRun cfg q txId? (decodeFirstCell (α := Val) some (some none) none "aggregate") hPolicy
 
-instance {σ Row : Type} (cfg : DbConfig) (q : SqlQuery)
-    (RowInv : Row → Prop) (wherePred : Row → Bool)
-    (ReadPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r) (txId? : Option UInt64) :
-    SafeIO (dbSumNat (m := ThreadProg σ) cfg q RowInv wherePred ReadPolicy ctx hPolicy txId?) where
-  noAtomic := noAtomic_execDbMaybeTx cfg q txId? _ fun _ => .pure _
-
-instance {σ Row : Type} (cfg : DbConfig) (q : SqlQuery)
-    (RowInv : Row → Prop) (wherePred : Row → Bool)
-    (ReadPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r) (txId? : Option UInt64) :
-    SafeIO (dbSumInt (m := ThreadProg σ) cfg q RowInv wherePred ReadPolicy ctx hPolicy txId?) where
-  noAtomic := noAtomic_execDbMaybeTx cfg q txId? _ fun _ => .pure _
-
-instance {σ Row Val : Type} [FromSql Val] (cfg : DbConfig) (q : SqlQuery) (proj : Row → Val)
-    (RowInv : Row → Prop) (wherePred : Row → Bool)
-    (ReadPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r) (txId? : Option UInt64) :
-    SafeIO (dbAggOpt (m := ThreadProg σ) cfg q proj RowInv wherePred ReadPolicy ctx hPolicy txId?) where
-  noAtomic := noAtomic_execDbMaybeTx cfg q txId? _ fun _ => .pure _
-
-instance {σ RowL RowR Key : Type} [BEq Key] (cfg : DbConfig) (q : SqlQuery) (leftColCount : Nat)
+/-- Verified typed `INNER JOIN` checking BOTH tables' `ReadPolicy` at compile time and
+    zero-trust verifying both `RowInv`s, both `wherePred`s, and the join key equality on every row. -/
+abbrev dbJoinSelect {RowL RowR Key : Type} [BEq Key] {m : Type → Type} [Monad m] [MonadServer m]
+    (cfg : DbConfig) (q : SqlQuery) (leftColCount : Nat)
     (decodeL : DbRow → Except String RowL) (decodeR : DbRow → Except String RowR)
     (RowInvL : RowL → Prop) (rowInvBoolL : RowL → Bool) (hInvSoundL : ∀ r, rowInvBoolL r = true → RowInvL r)
     (RowInvR : RowR → Prop) (rowInvBoolR : RowR → Bool) (hInvSoundR : ∀ r, rowInvBoolR r = true → RowInvR r)
     (wherePredL : RowL → Bool) (wherePredR : RowR → Bool) (keyL : RowL → Key) (keyR : RowR → Key)
-    (ReadPolicyL : RequestCtx → RowL → Prop) (ReadPolicyR : RequestCtx → RowR → Prop)
-    (ctx : RequestCtx)
+    (ReadPolicyL : RequestCtx → RowL → Prop) (ReadPolicyR : RequestCtx → RowR → Prop) (ctx : RequestCtx)
     (hPolicyL : ∀ r, RowInvL r → wherePredL r = true → ReadPolicyL ctx r)
     (hPolicyR : ∀ r, RowInvR r → wherePredR r = true → ReadPolicyR ctx r)
-    (txId? : Option UInt64) :
-    SafeIOEnsures
-      (dbJoinSelect (m := ThreadProg σ) cfg q leftColCount decodeL decodeR
-        RowInvL rowInvBoolL hInvSoundL RowInvR rowInvBoolR hInvSoundR
-        wherePredL wherePredR keyL keyR ReadPolicyL ReadPolicyR ctx hPolicyL hPolicyR txId?)
-      (fun res => match res with
-        | .ok rows => ∀ p ∈ rows.toList, RowInvL p.1 ∧ wherePredL p.1 = true ∧ RowInvR p.2 ∧ wherePredR p.2 = true
-        | .error _ => True) where
-  noAtomic := noAtomic_execDbMaybeTx cfg q txId? _ fun _ => .pure _
-  ensures := by
-    intro Inv
-    refine progEnsures_imp (decodeCheckedList_ensures cfg q txId? (decodeJoinRowErr leftColCount decodeL decodeR)
+    (txId? : Option UInt64 := none) : m (Except ApiError (Array (RowL × RowR))) :=
+  dbRunChecked (Q := dbArrPost fun p => RowInvL p.1 ∧ wherePredL p.1 = true ∧ RowInvR p.2 ∧ wherePredR p.2 = true)
+    cfg q txId?
+    (decodeCheckedArr (decodeJoinRowErr leftColCount decodeL decodeR)
+      (fun p => rowInvBoolL p.1 && wherePredL p.1 && rowInvBoolR p.2 && wherePredR p.2 && (keyL p.1 == keyR p.2))
+      "database joined row violated verified table invariant or query predicate")
+    (decodeCheckedArr_post (decodeJoinRowErr leftColCount decodeL decodeR)
       (fun p => rowInvBoolL p.1 && wherePredL p.1 && rowInvBoolR p.2 && wherePredR p.2 && (keyL p.1 == keyR p.2))
       "database joined row violated verified table invariant or query predicate"
-      (P := fun p => RowInvL p.1 ∧ wherePredL p.1 = true ∧ RowInvR p.2 ∧ wherePredR p.2 = true)
-      fun p h => by simp only [Bool.and_eq_true] at h; exact ⟨hInvSoundL p.1 h.1.1.1.1, h.1.1.1.2, hInvSoundR p.2 h.1.1.2, h.1.2⟩) ?_
-    intro res h; cases res <;> exact h
+      (P := fun p => RowInvL p.1 ∧ wherePredL p.1 = true ∧ RowInvR p.2 ∧ wherePredR p.2 = true) fun p h => by
+      simp only [Bool.and_eq_true] at h
+      exact ⟨hInvSoundL p.1 h.1.1.1.1, h.1.1.1.2, hInvSoundR p.2 h.1.1.2, h.1.2⟩)
+    (fun _ => trivial) (And.intro hPolicyL hPolicyR)
 
-instance {σ Row : Type} (cfg : DbConfig) (q : SqlQuery) (newRow : Row)
+/-- Verified `INSERT` requiring `RowInv newRow` and `InsertPolicy ctx newRow` at compile time. -/
+abbrev dbInsert {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
+    (cfg : DbConfig) (q : SqlQuery) (newRow : Row)
     (RowInv : Row → Prop) (InsertPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (hInv : RowInv newRow) (hPolicy : InsertPolicy ctx newRow) (txId? : Option UInt64) :
-    SafeIOEnsures
-      (dbInsert (m := ThreadProg σ) cfg q newRow RowInv InsertPolicy ctx hInv hPolicy txId?)
-      (fun res => match res with | .ok r => r = newRow ∧ RowInv r | .error _ => True) where
-  noAtomic := noAtomic_execDbMaybeTx cfg q txId? _ fun _ => .pure _
-  ensures := progEnsures_execDbMaybeTx cfg q txId? _ fun res =>
-    .pure _ (by cases res <;> simp [Except.map, hInv])
+    (hInv : RowInv newRow) (hPolicy : InsertPolicy ctx newRow)
+    (txId? : Option UInt64 := none) : m (Except ApiError Row) :=
+  dbRunChecked (Q := fun res => match res with | .ok r => r = newRow ∧ RowInv r | .error _ => True)
+    cfg q txId? (fun _ => .ok newRow) (fun _ => ⟨rfl, hInv⟩) (fun _ => trivial) hPolicy
 
-instance {σ Row : Type} (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
+/-- Verified `UPDATE ... RETURNING *` returning all updated rows. -/
+abbrev dbUpdate {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
+    (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
     (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)
     (TransInv : Row → Row → Prop) (wherePred : Row → Bool) (setFn : Row → Row) (postPred : Row → Bool)
     (UpdatePolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (hPO : ∀ r, RowInv r → wherePred r = true → UpdatePolicy ctx r)
-    (hPN : ∀ r, RowInv r → wherePred r = true → UpdatePolicy ctx (setFn r))
-    (hIP : ∀ r, RowInv r → wherePred r = true → RowInv (setFn r))
-    (hTr : ∀ r, RowInv r → wherePred r = true → TransInv r (setFn r)) (txId? : Option UInt64) :
-    SafeIOEnsures
-      (dbUpdate (m := ThreadProg σ) cfg q decode RowInv rowInvBool hInvSound TransInv
-        wherePred setFn postPred UpdatePolicy ctx hPO hPN hIP hTr txId?)
-      (fun res => match res with | .ok rows => ∀ r ∈ rows.toList, RowInv r ∧ postPred r = true | .error _ => True) where
-  noAtomic := noAtomic_execDbMaybeTx cfg q txId? _ fun _ => .pure _
-  ensures := decodeCheckedList_ensures cfg q txId? _ _ _ fun r h => by
-    simp only [Bool.and_eq_true] at h; exact ⟨hInvSound r h.1, h.2⟩
+    (hPolicyOld : ∀ r, RowInv r → wherePred r = true → UpdatePolicy ctx r)
+    (hPolicyNew : ∀ r, RowInv r → wherePred r = true → UpdatePolicy ctx (setFn r))
+    (hInvPres   : ∀ r, RowInv r → wherePred r = true → RowInv (setFn r))
+    (hTrans     : ∀ r, RowInv r → wherePred r = true → TransInv r (setFn r))
+    (txId? : Option UInt64 := none) : m (Except ApiError (Array Row)) :=
+  dbRunRows cfg q decode RowInv rowInvBool hInvSound postPred
+    "database row violated verified table invariant or query predicate"
+    (And.intro hPolicyOld (And.intro hPolicyNew (And.intro hInvPres hTrans))) txId?
 
-instance {σ Row : Type} (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
+/-- Verified single-row `UPDATE ... RETURNING *` returning `Option Row` (`none` if 0 rows matched). -/
+abbrev dbUpdateOne {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
+    (cfg : DbConfig) (q : SqlQuery) (decode : DbRow → Except String Row)
     (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)
     (TransInv : Row → Row → Prop) (wherePred : Row → Bool) (setFn : Row → Row) (postPred : Row → Bool)
     (UpdatePolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (hPO : ∀ r, RowInv r → wherePred r = true → UpdatePolicy ctx r)
-    (hPN : ∀ r, RowInv r → wherePred r = true → UpdatePolicy ctx (setFn r))
-    (hIP : ∀ r, RowInv r → wherePred r = true → RowInv (setFn r))
-    (hTr : ∀ r, RowInv r → wherePred r = true → TransInv r (setFn r)) (txId? : Option UInt64) :
-    SafeIOEnsures
-      (dbUpdateOne (m := ThreadProg σ) cfg q decode RowInv rowInvBool hInvSound TransInv
-        wherePred setFn postPred UpdatePolicy ctx hPO hPN hIP hTr txId?)
-      (fun res => ∀ r, res = .ok (some r) → RowInv r ∧ postPred r = true) where
-  noAtomic := noAtomic_execDbMaybeTx cfg q txId? _ fun _ => .pure _
-  ensures := decodeCheckedOne_ensures cfg q txId? _ _ _ fun r h => by
-    simp only [Bool.and_eq_true] at h; exact ⟨hInvSound r h.1, h.2⟩
+    (hPolicyOld : ∀ r, RowInv r → wherePred r = true → UpdatePolicy ctx r)
+    (hPolicyNew : ∀ r, RowInv r → wherePred r = true → UpdatePolicy ctx (setFn r))
+    (hInvPres   : ∀ r, RowInv r → wherePred r = true → RowInv (setFn r))
+    (hTrans     : ∀ r, RowInv r → wherePred r = true → TransInv r (setFn r))
+    (txId? : Option UInt64 := none) : m (Except ApiError (Option Row)) :=
+  dbRunOneRow cfg q decode RowInv rowInvBool hInvSound postPred
+    "updated database row violated verified table invariant or postcondition"
+    (And.intro hPolicyOld (And.intro hPolicyNew (And.intro hInvPres hTrans))) txId?
 
-instance {σ Row : Type} (cfg : DbConfig) (q : SqlQuery)
-    (RowInv : Row → Prop) (wherePred : Row → Bool)
-    (DeletePolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (hPolicy : ∀ r, RowInv r → wherePred r = true → DeletePolicy ctx r) (txId? : Option UInt64) :
-    SafeIO (dbDelete (m := ThreadProg σ) cfg q RowInv wherePred DeletePolicy ctx hPolicy txId?) where
-  noAtomic := noAtomic_execDbMaybeTx cfg q txId? _ fun _ => .pure _
+/-- Verified `DELETE` requiring `DeletePolicy` on all deleted rows and returning affected count. -/
+abbrev dbDelete {Row : Type} {m : Type → Type} [Monad m] [MonadServer m] :=
+  @dbPolicyRun Row Nat m _ _ (fun dbRes => .ok dbRes.affected)
 
 theorem some_getD_eq_self_iff {α : Type} (o : Option α) (d : α) :
     some (o.getD d) = o ↔ o ≠ none := by

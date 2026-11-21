@@ -1,3 +1,5 @@
+import Qed.Server.Db.Core
+
 namespace Qed.Server.Prim
 
 /-! ## Trusted Native Server FFI Boundary (`Qed.Server.Prim`)
@@ -100,7 +102,8 @@ opaque gzipCompress (data : @& ByteArray) : IO ByteArray
 
 /-- Executes a parameterized SQLite query against a pooled WAL writer or concurrent reader connection. -/
 @[extern "qed_server_sqlite_exec"]
-opaque sqliteExec (path : @& String) (sql : @& String) (paramsJson : @& String) : IO (Except String String)
+opaque sqliteExec (path : @& String) (sql : @& String) (params : @& Array Qed.Server.Db.SqlVal) :
+    IO (Except String Qed.Server.Db.DbResult)
 
 /-- Executes idempotent DDL statements (`CREATE TABLE IF NOT EXISTS ...`) on a pooled SQLite database. -/
 @[extern "qed_server_sqlite_ddl"]
@@ -112,7 +115,8 @@ opaque sqliteTxBegin (path : @& String) : IO (Except String UInt64)
 
 /-- Executes a parameterized query on a pinned SQLite transaction handle. -/
 @[extern "qed_server_sqlite_tx_exec"]
-opaque sqliteTxExec (txId : UInt64) (sql : @& String) (paramsJson : @& String) : IO (Except String String)
+opaque sqliteTxExec (txId : UInt64) (sql : @& String) (params : @& Array Qed.Server.Db.SqlVal) :
+    IO (Except String Qed.Server.Db.DbResult)
 
 /-- Commits a pinned SQLite transaction and releases the writer connection back to the pool. -/
 @[extern "qed_server_sqlite_tx_commit"]

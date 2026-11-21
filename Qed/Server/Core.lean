@@ -1,3 +1,4 @@
+import Qed.Field
 import Qed.Json.Lawful
 import Qed.Proto
 import Qed.Dict
@@ -97,53 +98,13 @@ abbrev isValidWebhookUrl (s : String) : Bool :=
   !s.startsWith "https:///" &&
   s.toList.all (fun c => isSafeUrlChar c && c != '\\' && decide (32 < c.toNat ∧ c.toNat ≠ 127))
 
-structure WebhookUrl where
-  raw   : String
-  valid : isValidWebhookUrl raw = true
-deriving DecidableEq, Repr
+abbrev WebhookUrl := Qed.Field (fun s : String => isValidWebhookUrl s = true)
 
-instance : ToString WebhookUrl := ⟨WebhookUrl.raw⟩
+@[match_pattern] abbrev WebhookUrl.mk (raw : String) (valid : isValidWebhookUrl raw = true) : WebhookUrl :=
+  Qed.Field.mk raw valid
 
-instance : ToJson WebhookUrl where
-  toJson u := toJson u.raw
-
-instance : FromJson WebhookUrl where
-  fromJson j := do
-    let s ← (FromJson.fromJson j : Except String String)
-    if h : isValidWebhookUrl s = true then .ok (WebhookUrl.mk s h)
-    else .error "invalid WebhookUrl: must be a well-formed https:// URL"
-
-instance : LawfulJson WebhookUrl where
-  depthBound := 0
-  depth_toJson _ := Nat.le_refl 0
-  fromJson_toJson u := by
-    rcases u with ⟨raw, hv⟩
-    change (FromJson.fromJson (toJson raw) : Except String String).bind
-      (fun s => if h : isValidWebhookUrl s = true then .ok (WebhookUrl.mk s h) else .error _) =
-        .ok (WebhookUrl.mk raw hv)
-    rw [LawfulJson.fromJson_toJson raw]
-    dsimp only [bind, Except.bind]
-    rw [dif_pos hv]
-
-instance : NonNullJson WebhookUrl := ⟨nofun⟩
-
-instance : ToProto WebhookUrl where
-  toProtoVal u := ToProto.toProtoVal u.raw
-
-instance : FromProto WebhookUrl where
-  fromProtoVal w := do
-    let s ← FromProto.fromProtoVal (α := String) w
-    if h : isValidWebhookUrl s = true then .ok (WebhookUrl.mk s h)
-    else .error "invalid WebhookUrl: must be a well-formed https:// URL"
-
-instance : LawfulProto WebhookUrl :=
-  .ofScalar fun ⟨raw, hv⟩ => by
-    change (FromProto.fromProtoVal (ToProto.toProtoVal raw) : Except String String).bind
-      (fun s => if h : isValidWebhookUrl s = true then .ok (WebhookUrl.mk s h) else .error _) =
-        .ok (WebhookUrl.mk raw hv)
-    rw [LawfulProto.fromProtoVal_toProtoVal raw]
-    dsimp only [bind, Except.bind]
-    rw [dif_pos hv]
+abbrev WebhookUrl.raw (u : WebhookUrl) : String := u.val
+abbrev WebhookUrl.valid (u : WebhookUrl) : isValidWebhookUrl u.raw = true := u.ok
 
 /-! ## CRLF Header Injection Closure (`sanitizeHeader` & `header_no_crlf`) -/
 
@@ -244,12 +205,6 @@ private theorem sanitizeCookieName_no_crlf (s : String) :
 private theorem sanitizeCookieVal_no_crlf (s : String) :
     ∀ c ∈ (sanitizeCookieVal s).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' :=
   filter_no_crlf isSafeCookieValChar (by decide) s
-
-private theorem no_crlf_append {a b : String}
-    (ha : ∀ c ∈ a.toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00')
-    (hb : ∀ c ∈ b.toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00') :
-    ∀ c ∈ (a ++ b).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' := by
-  intro c hc; rw [String.toList_append, List.mem_append] at hc; exact hc.elim (ha c) (hb c)
 
 private theorem no_crlf_lit (s : String)
     (h : s.toList.all (fun c => c != '\r' && c != '\n' && c != '\x00') = true) :
@@ -435,161 +390,25 @@ theorem encodeSingleSeg_safe {s out : String} (h : encodeSingleSeg s = .ok out) 
     simp only [Bool.or_eq_true, String.isEmpty_iff, beq_iff_eq, not_or] at hbad
     exact ⟨hbad.1.1, hbad.1.2, hbad.2, rawSingleSeg_safe s⟩
 
-private def encodeMultiSegList : List String → Except ApiError String
-  | [] => .error (ApiError.badRequest "multi-segment URL path cannot be empty")
-  | [seg] =>
-      if seg.isEmpty || seg == "." || seg == ".." then
-        .error (ApiError.badRequest "invalid multi-segment URL path component")
-      else
-        encodeSingleSeg seg
-  | seg :: s2 :: rest =>
-      if seg.isEmpty || seg == "." || seg == ".." then
-        .error (ApiError.badRequest "invalid multi-segment URL path component")
-      else do
-        let headEnc ← encodeSingleSeg seg
-        let tailEnc ← encodeMultiSegList (s2 :: rest)
-        return headEnc ++ "/" ++ tailEnc
+private theorem list_mapM_loop_ok {α β ε : Type} {f : α → Except ε β} {P : β → Prop}
+    (hf : ∀ a b, f a = .ok b → P b) :
+    ∀ (xs : List α) (acc ys : List β), (∀ y ∈ acc, P y) →
+      List.mapM.loop f xs acc = .ok ys → ∀ y ∈ ys, P y
+  | [], acc, _, hacc, h => by
+      injection h with h; subst h; intro y hy; exact hacc y (List.mem_reverse.1 hy)
+  | x :: xs, acc, ys, hacc, h => by
+      unfold List.mapM.loop at h; dsimp only [bind, Except.bind] at h
+      cases hx : f x with
+      | error _ => rw [hx] at h; contradiction
+      | ok b =>
+          rw [hx] at h
+          exact list_mapM_loop_ok hf xs (b :: acc) ys
+            (fun y hy => (List.mem_cons.1 hy).elim (· ▸ hf x b hx) (hacc y)) h
 
-private theorem encodeMultiSegList_safe :
-    ∀ (segs : List String) (out : String),
-      encodeMultiSegList segs = .ok out →
-      out.toList.all isSafeExtSuffixChar = true
-  | [], _, h => by unfold encodeMultiSegList at h; contradiction
-  | [seg], _, h => by
-      unfold encodeMultiSegList at h
-      split at h
-      · contradiction
-      · exact safeSeg_implies_extSuffix (encodeSingleSeg_safe h).2.2.2
-  | seg :: s2 :: rest, _, h => by
-      unfold encodeMultiSegList at h
-      split at h
-      · contradiction
-      · dsimp only [bind, Except.bind, pure, Except.pure] at h
-        cases h1 : encodeSingleSeg seg with
-        | error _ => rw [h1] at h; contradiction
-        | ok hd =>
-            rw [h1] at h
-            dsimp only at h
-            cases h2 : encodeMultiSegList (s2 :: rest) with
-            | error _ => rw [h2] at h; contradiction
-            | ok tl =>
-                rw [h2] at h
-                injection h with h; subst h
-                have hhd := safeSeg_implies_extSuffix (encodeSingleSeg_safe h1).2.2.2
-                have htl := encodeMultiSegList_safe (s2 :: rest) tl h2
-                have hsl : isSafeExtSuffixChar '/' = true := rfl
-                simp [String.toList_append, hhd, htl, hsl]
-
-/-- Encodes a `:path*` slash-delimited path while rejecting empty, `.`, and `..` traversal segments. -/
-def encodeMultiSeg (s : String) : Except ApiError String :=
-  let trimmed := match s.toList with
-    | '/' :: cs => String.ofList cs
-    | _         => s
-  encodeMultiSegList (trimmed.splitOn "/")
-
-theorem encodeMultiSeg_safe {s out : String} (h : encodeMultiSeg s = .ok out) :
-    out.toList.all isSafeExtSuffixChar = true :=
-  encodeMultiSegList_safe _ out h
-
-inductive PathPart where
-  | lit (seg : String)
-  | seg (val : String)
-  | multiSeg (val : String)
-deriving Inhabited, DecidableEq, Repr
-
-inductive QueryVal where
-  | lit (val : String)
-  | param (val : String)
-deriving Inhabited, DecidableEq, Repr
-
-def isValidBaseOrigin (base : String) : Bool :=
-  (base.startsWith "https://" || base.startsWith "http://") &&
-  !base.endsWith "/" &&
-  base.toList.all (fun c =>
-    isSafeUrlChar c && c != '?' && c != '#' && c != '\\' && c != '@' &&
-    decide (32 < c.toNat ∧ c.toNat ≠ 127))
-
-def isValidWsBaseOrigin (base : String) : Bool :=
-  (base.startsWith "wss://" || base.startsWith "ws://" ||
-   base.startsWith "https://" || base.startsWith "http://") &&
-  !base.endsWith "/" &&
-  base.toList.all (fun c =>
-    isSafeUrlChar c && c != '?' && c != '#' && c != '\\' && c != '@' &&
-    decide (32 < c.toNat ∧ c.toNat ≠ 127))
-
-def toWsOrigin (base : String) : String :=
-  if base.startsWith "https://" then "wss://" ++ String.ofList (base.toList.drop 8)
-  else if base.startsWith "http://" then "ws://" ++ String.ofList (base.toList.drop 7)
-  else base
-
-private def renderPathParts : List PathPart → Except ApiError (List String)
-  | [] => .ok []
-  | .lit s :: rest =>
-      if !s.isEmpty && s != "." && s != ".." && s.toList.all isSafeSegChar then do
-        let tl ← renderPathParts rest
-        return s :: tl
-      else
-        .error (ApiError.internal "invalid static path literal in external endpoint")
-  | .seg v :: rest => do
-      let hd ← encodeSingleSeg v
-      let tl ← renderPathParts rest
-      return hd :: tl
-  | .multiSeg v :: rest => do
-      let hd ← encodeMultiSeg v
-      let tl ← renderPathParts rest
-      return hd :: tl
-
-private theorem renderPathParts_safe :
-    ∀ (ps : List PathPart) (segs : List String),
-      renderPathParts ps = .ok segs →
-      ∀ seg ∈ segs, seg.toList.all isSafeExtSuffixChar = true
-  | [], _, h => by
-      injection h with h; subst h; intro _ hm; exact False.elim (List.not_mem_nil hm)
-  | .lit s :: rest, _, h => by
-      unfold renderPathParts at h
-      split at h
-      · rename_i hok
-        dsimp only [bind, Except.bind, pure, Except.pure] at h
-        cases hr : renderPathParts rest with
-        | error _ => rw [hr] at h; contradiction
-        | ok tl =>
-            rw [hr] at h; injection h with h; subst h
-            intro seg hm
-            rcases List.mem_cons.1 hm with rfl | htl
-            · simp only [Bool.and_eq_true] at hok
-              exact safeSeg_implies_extSuffix hok.2
-            · exact renderPathParts_safe rest tl hr seg htl
-      · contradiction
-  | .seg v :: rest, _, h => by
-      unfold renderPathParts at h
-      dsimp only [bind, Except.bind, pure, Except.pure] at h
-      cases h1 : encodeSingleSeg v with
-      | error _ => rw [h1] at h; contradiction
-      | ok hd =>
-          rw [h1] at h; dsimp only at h
-          cases hr : renderPathParts rest with
-          | error _ => rw [hr] at h; contradiction
-          | ok tl =>
-              rw [hr] at h; injection h with h; subst h
-              intro seg hm
-              rcases List.mem_cons.1 hm with rfl | htl
-              · exact safeSeg_implies_extSuffix (encodeSingleSeg_safe h1).2.2.2
-              · exact renderPathParts_safe rest tl hr seg htl
-  | .multiSeg v :: rest, _, h => by
-      unfold renderPathParts at h
-      dsimp only [bind, Except.bind, pure, Except.pure] at h
-      cases h1 : encodeMultiSeg v with
-      | error _ => rw [h1] at h; contradiction
-      | ok hd =>
-          rw [h1] at h; dsimp only at h
-          cases hr : renderPathParts rest with
-          | error _ => rw [hr] at h; contradiction
-          | ok tl =>
-              rw [hr] at h; injection h with h; subst h
-              intro seg hm
-              rcases List.mem_cons.1 hm with rfl | htl
-              · exact encodeMultiSeg_safe h1
-              · exact renderPathParts_safe rest tl hr seg htl
+private theorem list_mapM_except_all {α β ε : Type} {f : α → Except ε β} {P : β → Prop}
+    (hf : ∀ a b, f a = .ok b → P b) {xs : List α} {ys : List β}
+    (h : xs.mapM f = .ok ys) : ∀ y ∈ ys, P y :=
+  list_mapM_loop_ok hf xs [] ys (fun _ hm => False.elim (List.not_mem_nil hm)) h
 
 private def joinDelim (sep : Char) : List String → String
   | []      => ""
@@ -605,6 +424,88 @@ private theorem joinDelim_safe {sep : Char} (hsep : isSafeExtSuffixChar sep = tr
   | s₁ :: s₂ :: rest, hs => by
       have ih := joinDelim_safe hsep (s₂ :: rest) (fun x hx => hs x (by simp [hx]))
       simp [joinDelim, String.toList_append, hs s₁ (by simp), hsep, ih]
+
+private def encodeMultiSegElem (seg : String) : Except ApiError String :=
+  if seg.isEmpty || seg == "." || seg == ".." then
+    .error (ApiError.badRequest "invalid multi-segment URL path component")
+  else encodeSingleSeg seg
+
+/-- Encodes a `:path*` slash-delimited path while rejecting empty, `.`, and `..` traversal segments. -/
+def encodeMultiSeg (s : String) : Except ApiError String := do
+  let trimmed := match s.toList with
+    | '/' :: cs => String.ofList cs
+    | _         => s
+  let segs ← match trimmed.splitOn "/" with
+    | [] => .error (ApiError.badRequest "multi-segment URL path cannot be empty")
+    | xs => xs.mapM encodeMultiSegElem
+  return joinDelim '/' segs
+
+theorem encodeMultiSeg_safe {s out : String} (h : encodeMultiSeg s = .ok out) :
+    out.toList.all isSafeExtSuffixChar = true := by
+  unfold encodeMultiSeg at h
+  dsimp only [bind, Except.bind, pure, Except.pure] at h
+  split at h
+  · contradiction
+  · cases hm : List.mapM encodeMultiSegElem _ with
+    | error _ => rw [hm] at h; contradiction
+    | ok segs =>
+        rw [hm] at h; injection h with h; subst h
+        refine joinDelim_safe (sep := '/') rfl segs (list_mapM_except_all (fun a b hab => ?_) hm)
+        unfold encodeMultiSegElem at hab; split at hab
+        · contradiction
+        · exact safeSeg_implies_extSuffix (encodeSingleSeg_safe hab).2.2.2
+
+inductive PathPart where
+  | lit (seg : String)
+  | seg (val : String)
+  | multiSeg (val : String)
+deriving Inhabited, DecidableEq, Repr
+
+inductive QueryVal where
+  | lit (val : String)
+  | param (val : String)
+deriving Inhabited, DecidableEq, Repr
+
+private def hasValidOriginBody (base : String) : Bool :=
+  !base.endsWith "/" &&
+  base.toList.all (fun c =>
+    isSafeUrlChar c && c != '?' && c != '#' && c != '\\' && c != '@' &&
+    decide (32 < c.toNat ∧ c.toNat ≠ 127))
+
+def isValidBaseOrigin (base : String) : Bool :=
+  (base.startsWith "https://" || base.startsWith "http://") && hasValidOriginBody base
+
+def isValidWsBaseOrigin (base : String) : Bool :=
+  (base.startsWith "wss://" || base.startsWith "ws://" ||
+   base.startsWith "https://" || base.startsWith "http://") && hasValidOriginBody base
+
+def toWsOrigin (base : String) : String :=
+  if base.startsWith "https://" then "wss://" ++ String.ofList (base.toList.drop 8)
+  else if base.startsWith "http://" then "ws://" ++ String.ofList (base.toList.drop 7)
+  else base
+
+private def renderPathPart : PathPart → Except ApiError String
+  | .lit s =>
+      if !s.isEmpty && s != "." && s != ".." && s.toList.all isSafeSegChar then .ok s
+      else .error (ApiError.internal "invalid static path literal in external endpoint")
+  | .seg v      => encodeSingleSeg v
+  | .multiSeg v => encodeMultiSeg v
+
+private def renderPathParts (ps : List PathPart) : Except ApiError (List String) :=
+  ps.mapM renderPathPart
+
+private theorem renderPathParts_safe {ps : List PathPart} {segs : List String}
+    (h : renderPathParts ps = .ok segs) :
+    ∀ seg ∈ segs, seg.toList.all isSafeExtSuffixChar = true :=
+  list_mapM_except_all (fun p seg hp => by
+    cases p with
+    | lit s =>
+        dsimp only [renderPathPart] at hp; split at hp
+        · rename_i hok; injection hp with hp; subst hp
+          simp only [Bool.and_eq_true] at hok; exact safeSeg_implies_extSuffix hok.2
+        · contradiction
+    | seg _ => exact safeSeg_implies_extSuffix (encodeSingleSeg_safe hp).2.2.2
+    | multiSeg _ => exact encodeMultiSeg_safe hp) h
 
 private def renderQueryPairs : List (String × QueryVal) → List String
   | [] => []
@@ -643,7 +544,7 @@ theorem buildExternalSuffix_safe {parts : List PathPart} {query : List (String �
   | error _ => rw [hr] at h; contradiction
   | ok segs =>
       rw [hr] at h; dsimp only at h
-      have hpath := joinDelim_safe (sep := '/') rfl segs (renderPathParts_safe parts segs hr)
+      have hpath := joinDelim_safe (sep := '/') rfl segs (renderPathParts_safe hr)
       by_cases hq : query.isEmpty
       · simp [hq] at h; subst h; exact hpath
       · simp [hq] at h; subst h
@@ -731,21 +632,59 @@ structure OutboundResp where
   headers : List (String × String) := []
 deriving Inhabited
 
+/-- Non-stateful external/OS I/O commands available to a server handler thread. -/
+inductive ServerEffect : Type where
+  | httpCall     (req : OutboundReq)
+  | dbExec       (cfg : Db.DbConfig) (q : Db.SqlQuery)
+  | dbExecDdl    (cfg : Db.DbConfig)
+  | dbTxBegin    (cfg : Db.DbConfig)
+  | dbTxExec     (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery)
+  | dbTxCommit   (cfg : Db.DbConfig) (txId : UInt64)
+  | dbTxRollback (cfg : Db.DbConfig) (txId : UInt64)
+  | setCookie    (cookie : SetCookie)
+  | sendSse      (ev : SseEvent)
+  | readEnv      (v : String)
+  | nowMs
+  | randomHex    (n : UInt32)
+  | hmacSha256   (key msg : ByteArray)
+  | wsBroadcast  (t : String) (p : ByteArray)
+
+/-- Response payload type returned by each `ServerEffect`. -/
+@[reducible] def ServerEffect.Resp : ServerEffect → Type
+  | .httpCall _        => Except ApiError OutboundResp
+  | .dbExec _ _        => Except ApiError Db.DbResult
+  | .dbExecDdl _       => Except ApiError Unit
+  | .dbTxBegin _       => Except ApiError UInt64
+  | .dbTxExec _ _ _    => Except ApiError Db.DbResult
+  | .dbTxCommit _ _    => Except ApiError Unit
+  | .dbTxRollback _ _  => Unit
+  | .setCookie _       => Unit
+  | .sendSse _         => Unit
+  | .readEnv _         => Option String
+  | .nowMs             => UInt64
+  | .randomHex _       => String
+  | .hmacSha256 _ _    => ByteArray
+  | .wsBroadcast _ _   => Unit
+
 class MonadServer (m : Type → Type) where
-  httpCall     : OutboundReq → m (Except ApiError OutboundResp)
-  dbExec       : Db.DbConfig → Db.SqlQuery → m (Except ApiError Db.DbResult)
-  dbExecDdl    : Db.DbConfig → m (Except ApiError Unit)
-  dbTxBegin    : Db.DbConfig → m (Except ApiError UInt64)
-  dbTxExec     : Db.DbConfig → UInt64 → Db.SqlQuery → m (Except ApiError Db.DbResult)
-  dbTxCommit   : Db.DbConfig → UInt64 → m (Except ApiError Unit)
-  dbTxRollback : Db.DbConfig → UInt64 → m Unit
-  setCookie    : SetCookie → m Unit
-  sendSse      : SseEvent → m Unit
-  readEnv      : String → m (Option String)
-  nowMs        : m UInt64
-  randomHex    : UInt32 → m String
-  hmacSha256   : ByteArray → ByteArray → m ByteArray
-  wsBroadcast  : String → ByteArray → m Unit
+  exec : (eff : ServerEffect) → m eff.Resp
+
+namespace MonadServer
+@[reducible, inline] def httpCall {m : Type → Type} [MonadServer m] (req : OutboundReq) : m (Except ApiError OutboundResp) := exec (.httpCall req)
+@[reducible, inline] def dbExec {m : Type → Type} [MonadServer m] (cfg : Db.DbConfig) (q : Db.SqlQuery) : m (Except ApiError Db.DbResult) := exec (.dbExec cfg q)
+@[reducible, inline] def dbExecDdl {m : Type → Type} [MonadServer m] (cfg : Db.DbConfig) : m (Except ApiError Unit) := exec (.dbExecDdl cfg)
+@[reducible, inline] def dbTxBegin {m : Type → Type} [MonadServer m] (cfg : Db.DbConfig) : m (Except ApiError UInt64) := exec (.dbTxBegin cfg)
+@[reducible, inline] def dbTxExec {m : Type → Type} [MonadServer m] (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery) : m (Except ApiError Db.DbResult) := exec (.dbTxExec cfg txId q)
+@[reducible, inline] def dbTxCommit {m : Type → Type} [MonadServer m] (cfg : Db.DbConfig) (txId : UInt64) : m (Except ApiError Unit) := exec (.dbTxCommit cfg txId)
+@[reducible, inline] def dbTxRollback {m : Type → Type} [MonadServer m] (cfg : Db.DbConfig) (txId : UInt64) : m Unit := exec (.dbTxRollback cfg txId)
+@[reducible, inline] def setCookie {m : Type → Type} [MonadServer m] (c : SetCookie) : m Unit := exec (.setCookie c)
+@[reducible, inline] def sendSse {m : Type → Type} [MonadServer m] (ev : SseEvent) : m Unit := exec (.sendSse ev)
+@[reducible, inline] def readEnv {m : Type → Type} [MonadServer m] (v : String) : m (Option String) := exec (.readEnv v)
+@[reducible, inline] def nowMs {m : Type → Type} [MonadServer m] : m UInt64 := exec .nowMs
+@[reducible, inline] def randomHex {m : Type → Type} [MonadServer m] (n : UInt32) : m String := exec (.randomHex n)
+@[reducible, inline] def hmacSha256 {m : Type → Type} [MonadServer m] (key msg : ByteArray) : m ByteArray := exec (.hmacSha256 key msg)
+@[reducible, inline] def wsBroadcast {m : Type → Type} [MonadServer m] (t : String) (p : ByteArray) : m Unit := exec (.wsBroadcast t p)
+end MonadServer
 
 structure WsEmit where
   topic   : String
@@ -774,40 +713,6 @@ class MonadAtomic (σ : Type) (m : Type → Type) where
 
 /-! ## Multi-Core Interleaved Linearizability Model & Proof (`concurrent_schedule_preserves_inv`) -/
 
-/-- Non-stateful external/OS I/O commands available to a server handler thread. -/
-inductive ServerEffect : Type where
-  | httpCall     (req : OutboundReq)
-  | dbExec       (cfg : Db.DbConfig) (q : Db.SqlQuery)
-  | dbExecDdl    (cfg : Db.DbConfig)
-  | dbTxBegin    (cfg : Db.DbConfig)
-  | dbTxExec     (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery)
-  | dbTxCommit   (cfg : Db.DbConfig) (txId : UInt64)
-  | dbTxRollback (cfg : Db.DbConfig) (txId : UInt64)
-  | setCookie    (cookie : SetCookie)
-  | sendSse      (ev : SseEvent)
-  | readEnv      (v : String)
-  | nowMs
-  | randomHex    (n : UInt32)
-  | hmacSha256   (key msg : ByteArray)
-  | wsBroadcast  (t : String) (p : ByteArray)
-
-/-- Response payload type returned by each `ServerEffect`. -/
-def ServerEffect.Resp : ServerEffect → Type
-  | .httpCall _        => Except ApiError OutboundResp
-  | .dbExec _ _        => Except ApiError Db.DbResult
-  | .dbExecDdl _       => Except ApiError Unit
-  | .dbTxBegin _       => Except ApiError UInt64
-  | .dbTxExec _ _ _    => Except ApiError Db.DbResult
-  | .dbTxCommit _ _    => Except ApiError Unit
-  | .dbTxRollback _ _  => Unit
-  | .setCookie _       => Unit
-  | .sendSse _         => Unit
-  | .readEnv _         => Option String
-  | .nowMs             => UInt64
-  | .randomHex _       => String
-  | .hmacSha256 _ _    => ByteArray
-  | .wsBroadcast _ _   => Unit
-
 /-- Effect tree of a server handler thread executing non-blocking external I/O interleaved with
     single-step `atomic` shared-state transitions on `σ`. Notice `σ` is unreachable during
     `io` (`httpCall`, `readEnv`, `nowMs`, `randomHex`, `hmacSha256`, `wsBroadcast`) steps. -/
@@ -828,20 +733,7 @@ instance {σ : Type} : Monad (ThreadProg σ) where
   bind := ThreadProg.bind
 
 instance {σ : Type} : MonadServer (ThreadProg σ) where
-  httpCall req         := .io (.httpCall req) .pure
-  dbExec cfg q         := .io (.dbExec cfg q) .pure
-  dbExecDdl cfg        := .io (.dbExecDdl cfg) .pure
-  dbTxBegin cfg        := .io (.dbTxBegin cfg) .pure
-  dbTxExec cfg tid q   := .io (.dbTxExec cfg tid q) .pure
-  dbTxCommit cfg tid   := .io (.dbTxCommit cfg tid) .pure
-  dbTxRollback cfg tid := .io (.dbTxRollback cfg tid) .pure
-  setCookie c          := .io (.setCookie c) .pure
-  sendSse ev           := .io (.sendSse ev) .pure
-  readEnv v            := .io (.readEnv v) .pure
-  nowMs                := .io .nowMs .pure
-  randomHex n          := .io (.randomHex n) .pure
-  hmacSha256 key msg   := .io (.hmacSha256 key msg) .pure
-  wsBroadcast t p      := .io (.wsBroadcast t p) .pure
+  exec eff := .io eff .pure
 
 instance {σ : Type} : MonadAtomic σ (ThreadProg σ) where
   runAtomic f     := .atomic (fun s => (f s).1) (fun s => .pure (f s).2)
@@ -864,19 +756,64 @@ end ThreadProg
   | io _ _ ih => exact congrArg _ (funext ih)
   | atomic _ _ ih => exact congrArg _ (funext ih)
 
+/-- Unified verification judgment for an async `ThreadProg`:
+    - `AllowAtomic` gates whether `.atomic` steps are permitted (`False` for `NoAtomic`, `True` otherwise)
+    - `Step s s'` must hold on every `.atomic` transition when `Inv s` holds
+    - `Post a` must hold on every `.pure a` return value. -/
+inductive ProgSpec {σ α : Type} (Inv : σ → Prop) (AllowAtomic : Prop)
+    (Step : σ → σ → Prop) (Post : α → Prop) : ThreadProg σ α → Prop where
+  | pure (a : α) :
+      Post a → ProgSpec Inv AllowAtomic Step Post (.pure a)
+  | io (eff : ServerEffect) (k : eff.Resp → ThreadProg σ α) :
+      (∀ r, ProgSpec Inv AllowAtomic Step Post (k r)) → ProgSpec Inv AllowAtomic Step Post (.io eff k)
+  | atomic (st : σ → σ) (next : σ → ThreadProg σ α) :
+      AllowAtomic →
+      (∀ s, Inv s → Step s (st s)) →
+      (∀ s, Inv s → ProgSpec Inv AllowAtomic Step Post (next s)) →
+      ProgSpec Inv AllowAtomic Step Post (.atomic st next)
+
+theorem ProgSpec.bind {σ α β : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {Q : α → Prop} {Post : β → Prop} {p : ThreadProg σ α} {k : α → ThreadProg σ β}
+    (hp : ProgSpec Inv A Step Q p) (hk : ∀ a, Q a → ProgSpec Inv A Step Post (k a)) :
+    ProgSpec Inv A Step Post (p >>= k) := by
+  change ProgSpec Inv A Step Post (ThreadProg.bind p k)
+  induction hp with
+  | pure a ha => exact hk a ha
+  | io _ _ _ ih => exact .io _ _ ih
+  | atomic st _ ha hst _ ih => exact .atomic st _ ha hst ih
+
+theorem ProgSpec.mono {σ α : Type} {Inv₁ Inv₂ : σ → Prop} {A₁ A₂ : Prop}
+    {S₁ S₂ : σ → σ → Prop} {P₁ P₂ : α → Prop} {p : ThreadProg σ α}
+    (hp : ProgSpec Inv₁ A₁ S₁ P₁ p)
+    (hA : A₁ → A₂) (hInv : ∀ s, Inv₂ s → Inv₁ s)
+    (hS : A₁ → ∀ s s', Inv₂ s → S₁ s s' → S₂ s s')
+    (hP : ∀ a, P₁ a → P₂ a) :
+    ProgSpec Inv₂ A₂ S₂ P₂ p := by
+  induction hp with
+  | pure a ha => exact .pure a (hP a ha)
+  | io _ _ _ ih => exact .io _ _ ih
+  | atomic st _ ha hst _ ih =>
+      exact .atomic st _ (hA ha) (fun s hs => hS ha s _ hs (hst s (hInv s hs))) (fun s hs => ih s (hInv s hs))
+
+theorem ProgSpec.runAtomic {σ α : Type} {Inv : σ → Prop} {Step : σ → σ → Prop} {Post : α → Prop}
+    (step : σ → σ × α) (hstep : ∀ s, Inv s → Step s (step s).1) (hpost : ∀ s, Inv s → Post (step s).2) :
+    ProgSpec Inv True Step Post (MonadAtomic.runAtomic (m := ThreadProg σ) step) :=
+  .atomic _ _ trivial hstep (fun s hs => .pure _ (hpost s hs))
+
+theorem ProgSpec.runAtomicRead {σ α : Type} {Inv : σ → Prop} {Step : σ → σ → Prop} {Post : α → Prop}
+    (f : σ → α) (hrefl : ∀ s, Inv s → Step s s) (hpost : ∀ s, Inv s → Post (f s)) :
+    ProgSpec Inv True Step Post (MonadAtomic.runAtomicRead (m := ThreadProg σ) f) :=
+  .atomic id _ trivial hrefl (fun s hs => .pure _ (hpost s hs))
+
 /-- General two-state transition invariant across an async `ThreadProg`: every `atomic` step `s ↦ st s`
     may assume `Inv s` and must satisfy `Rel s (st s)` (covering single-state `Inv`, `old(...)`
     conservation/monotonicity laws, and `mutating <field> requires <cond>` access-control rules). -/
-inductive ProgPreservesStepRel {σ α : Type} (Inv : σ → Prop) (Rel : σ → σ → Prop) :
-    ThreadProg σ α → Prop where
-  | pure (a : α) :
-      ProgPreservesStepRel Inv Rel (.pure a)
-  | io (eff : ServerEffect) (k : eff.Resp → ThreadProg σ α) :
-      (∀ r, ProgPreservesStepRel Inv Rel (k r)) → ProgPreservesStepRel Inv Rel (.io eff k)
-  | atomic (st : σ → σ) (next : σ → ThreadProg σ α) :
-      (∀ s, Inv s → Rel s (st s)) →
-      (∀ s, Inv s → ProgPreservesStepRel Inv Rel (next s)) →
-      ProgPreservesStepRel Inv Rel (.atomic st next)
+abbrev ProgPreservesStepRel {σ α : Type} (Inv : σ → Prop) (Rel : σ → σ → Prop) (p : ThreadProg σ α) : Prop :=
+  ProgSpec Inv True Rel (fun _ => True) p
+
+theorem ProgPreservesStepRel.pure {σ α : Type} {Inv : σ → Prop} {Rel : σ → σ → Prop} (a : α) :
+    ProgPreservesStepRel Inv Rel (.pure a) :=
+  ProgSpec.pure a trivial
 
 /-- Single-state invariant preservation across an async `ThreadProg`. -/
 abbrev ProgPreservesInv {σ α : Type} (Inv : σ → Prop) (p : ThreadProg σ α) : Prop :=
@@ -888,42 +825,33 @@ theorem progPreservesStepRel_of_const {σ α : Type} {Inv : σ → Prop} {Rel : 
   induction p with
   | pure a => exact .pure a
   | io _ _ ih => exact .io _ _ ih
-  | atomic _ _ ih => exact .atomic _ _ (fun s _ => h s _) (fun s _ => ih s)
+  | atomic _ _ ih => exact .atomic _ _ trivial (fun s _ => h s _) (fun s _ => ih s)
 
 theorem progPreservesStepRel_bind {σ α β : Type} {Inv : σ → Prop} {Rel : σ → σ → Prop}
     {p : ThreadProg σ α} {k : α → ThreadProg σ β}
-    (hp : ProgPreservesStepRel Inv Rel p)
-    (hk : ∀ a, ProgPreservesStepRel Inv Rel (k a)) :
-    ProgPreservesStepRel Inv Rel (p >>= k) := by
-  change ProgPreservesStepRel Inv Rel (ThreadProg.bind p k)
-  induction hp with
-  | pure a => exact hk a
-  | io _ _ _ ih => exact .io _ _ ih
-  | atomic st _ hst _ ih => exact .atomic st _ hst ih
+    (hp : ProgPreservesStepRel Inv Rel p) (hk : ∀ a, ProgPreservesStepRel Inv Rel (k a)) :
+    ProgPreservesStepRel Inv Rel (p >>= k) :=
+  hp.bind (fun a _ => hk a)
 
 theorem progPreservesStepRel_runAtomic {σ α : Type} {Inv : σ → Prop} {Rel : σ → σ → Prop}
-    (step : σ → σ × α)
-    (hstep : ∀ s, Inv s → Rel s (step s).1) :
+    (step : σ → σ × α) (hstep : ∀ s, Inv s → Rel s (step s).1) :
     ProgPreservesStepRel Inv Rel (MonadAtomic.runAtomic (m := ThreadProg σ) step) :=
-  .atomic _ _ hstep (fun s _ => .pure (step s).2)
+  ProgSpec.runAtomic step hstep (fun _ _ => trivial)
 
 theorem progPreservesStepRel_runAtomicRead {σ α : Type} {Inv : σ → Prop} {Rel : σ → σ → Prop}
-    (f : σ → α)
-    (hrefl : ∀ s, Inv s → Rel s s) :
+    (f : σ → α) (hrefl : ∀ s, Inv s → Rel s s) :
     ProgPreservesStepRel Inv Rel (MonadAtomic.runAtomicRead (m := ThreadProg σ) f) :=
-  .atomic _ _ hrefl (fun s _ => .pure (f s))
+  ProgSpec.runAtomicRead f hrefl (fun _ _ => trivial)
 
 theorem runAtomic_bind_preservesStepRel {σ α β : Type} {Inv : σ → Prop} {Rel : σ → σ → Prop}
     (step : σ → σ × α) {k : α → ThreadProg σ β}
-    (hk : ∀ a, ProgPreservesStepRel Inv Rel (k a))
-    (hstep : ∀ s, Inv s → Rel s (step s).1) :
+    (hk : ∀ a, ProgPreservesStepRel Inv Rel (k a)) (hstep : ∀ s, Inv s → Rel s (step s).1) :
     ProgPreservesStepRel Inv Rel (MonadAtomic.runAtomic (m := ThreadProg σ) step >>= k) :=
   progPreservesStepRel_bind (progPreservesStepRel_runAtomic step hstep) hk
 
 theorem runAtomicRead_bind_preservesStepRel {σ α β : Type} {Inv : σ → Prop} {Rel : σ → σ → Prop}
     (f : σ → α) {k : α → ThreadProg σ β}
-    (hk : ∀ a, ProgPreservesStepRel Inv Rel (k a))
-    (hrefl : ∀ s, Inv s → Rel s s) :
+    (hk : ∀ a, ProgPreservesStepRel Inv Rel (k a)) (hrefl : ∀ s, Inv s → Rel s s) :
     ProgPreservesStepRel Inv Rel (MonadAtomic.runAtomicRead (m := ThreadProg σ) f >>= k) :=
   progPreservesStepRel_bind (progPreservesStepRel_runAtomicRead f hrefl) hk
 
@@ -988,7 +916,7 @@ private theorem step_preserves_inv_and_pool {σ Out : Type} {Inv : σ → Prop}
   | stepIo s pre post eff k resp =>
       cases mid hpool with | io _ _ hk => exact ⟨hinv, pool_replace_mid hpool (hk resp)⟩
   | stepAtomic s pre post st next =>
-      cases mid hpool with | atomic _ _ hst hnext => exact ⟨hst s hinv, pool_replace_mid hpool (hnext s hinv)⟩
+      cases mid hpool with | atomic _ _ _ hst hnext => exact ⟨hst s hinv, pool_replace_mid hpool (hnext s hinv)⟩
 
 /-- Multi-Core Linearizability Theorem:
     If `Inv s₀` holds at server boot and every spawned RPC handler thread preserves `Inv` across
@@ -1006,54 +934,32 @@ theorem concurrent_schedule_preserves_inv {σ Out : Type}
   | step _ hstep ih => exact step_preserves_inv_and_pool hstep ih.1 ih.2
 
 /-- Witness that a `ThreadProg` performs only external/env/clock/crypto I/O and zero `.atomic` transitions. -/
-inductive NoAtomic {σ α : Type} : ThreadProg σ α → Prop where
-  | pure (a : α) : NoAtomic (.pure a)
-  | io (eff : ServerEffect) (k : eff.Resp → ThreadProg σ α) :
-      (∀ r, NoAtomic (k r)) → NoAtomic (.io eff k)
+abbrev NoAtomic {σ α : Type} (p : ThreadProg σ α) : Prop :=
+  ProgSpec (fun _ : σ => True) False (fun _ _ => True) (fun _ => True) p
+
+theorem NoAtomic.pure {σ α : Type} (a : α) : NoAtomic (σ := σ) (.pure a) :=
+  ProgSpec.pure a trivial
+
+theorem NoAtomic.io {σ α : Type} (eff : ServerEffect) (k : eff.Resp → ThreadProg σ α)
+    (hk : ∀ r, NoAtomic (k r)) : NoAtomic (.io eff k) :=
+  ProgSpec.io eff k hk
+
+theorem ProgSpec.of_noAtomic {σ α : Type} {Inv : σ → Prop} {A : Prop} {Step : σ → σ → Prop}
+    {p : ThreadProg σ α} (h : NoAtomic p) : ProgSpec Inv A Step (fun _ => True) p :=
+  h.mono False.elim (fun _ _ => trivial) (fun h => h.elim) (fun _ _ => trivial)
 
 class SafeIO {σ α : Type} (p : ThreadProg σ α) : Prop where
   noAtomic : NoAtomic p
 
 instance {σ α : Type} (a : α) : SafeIO (Pure.pure (f := ThreadProg σ) a) := ⟨.pure a⟩
 instance {σ α : Type} (a : α) : SafeIO (ThreadProg.pure (σ := σ) a) := ⟨.pure a⟩
-instance {σ : Type} (req : OutboundReq) : SafeIO (MonadServer.httpCall (m := ThreadProg σ) req) :=
-  ⟨.io _ _ .pure⟩
-instance {σ : Type} (cfg : Db.DbConfig) (q : Db.SqlQuery) : SafeIO (MonadServer.dbExec (m := ThreadProg σ) cfg q) :=
-  ⟨.io _ _ .pure⟩
-instance {σ : Type} (cfg : Db.DbConfig) : SafeIO (MonadServer.dbExecDdl (m := ThreadProg σ) cfg) :=
-  ⟨.io _ _ .pure⟩
-instance {σ : Type} (cfg : Db.DbConfig) : SafeIO (MonadServer.dbTxBegin (m := ThreadProg σ) cfg) :=
-  ⟨.io _ _ .pure⟩
-instance {σ : Type} (cfg : Db.DbConfig) (tid : UInt64) (q : Db.SqlQuery) :
-    SafeIO (MonadServer.dbTxExec (m := ThreadProg σ) cfg tid q) :=
-  ⟨.io _ _ .pure⟩
-instance {σ : Type} (cfg : Db.DbConfig) (tid : UInt64) :
-    SafeIO (MonadServer.dbTxCommit (m := ThreadProg σ) cfg tid) :=
-  ⟨.io _ _ .pure⟩
-instance {σ : Type} (cfg : Db.DbConfig) (tid : UInt64) :
-    SafeIO (MonadServer.dbTxRollback (m := ThreadProg σ) cfg tid) :=
-  ⟨.io _ _ .pure⟩
-instance {σ : Type} (c : SetCookie) : SafeIO (MonadServer.setCookie (m := ThreadProg σ) c) :=
-  ⟨.io _ _ .pure⟩
-instance {σ : Type} (ev : SseEvent) : SafeIO (MonadServer.sendSse (m := ThreadProg σ) ev) :=
-  ⟨.io _ _ .pure⟩
-instance {σ : Type} (v : String) : SafeIO (MonadServer.readEnv (m := ThreadProg σ) v) :=
-  ⟨.io _ _ .pure⟩
-instance {σ : Type} : SafeIO (MonadServer.nowMs (m := ThreadProg σ)) :=
-  ⟨.io _ _ .pure⟩
-instance {σ : Type} (n : UInt32) : SafeIO (MonadServer.randomHex (m := ThreadProg σ) n) :=
-  ⟨.io _ _ .pure⟩
-instance {σ : Type} (key msg : ByteArray) : SafeIO (MonadServer.hmacSha256 (m := ThreadProg σ) key msg) :=
-  ⟨.io _ _ .pure⟩
-instance {σ : Type} (t : String) (p : ByteArray) : SafeIO (MonadServer.wsBroadcast (m := ThreadProg σ) t p) :=
-  ⟨.io _ _ .pure⟩
+instance {σ : Type} (eff : ServerEffect) :
+    @SafeIO σ (no_index eff.Resp) (MonadServer.exec (m := ThreadProg σ) eff) :=
+  ⟨.io eff _ .pure⟩
 
 theorem noAtomic_bind {σ α β : Type} {p : ThreadProg σ α} {k : α → ThreadProg σ β}
-    (hp : NoAtomic p) (hk : ∀ a, NoAtomic (k a)) : NoAtomic (p >>= k) := by
-  change NoAtomic (ThreadProg.bind p k)
-  induction hp with
-  | pure a => exact hk a
-  | io _ _ _ ih => exact .io _ _ ih
+    (hp : NoAtomic p) (hk : ∀ a, NoAtomic (k a)) : NoAtomic (p >>= k) :=
+  hp.bind (fun a _ => hk a)
 
 instance {σ α β : Type} (p : ThreadProg σ α) (k : α → ThreadProg σ β)
     [hp : SafeIO p] [hk : ∀ a, SafeIO (k a)] : SafeIO (p >>= k) where
@@ -1068,10 +974,8 @@ instance {σ : Type} (es : List WsEmit) : SafeIO (flushWsEmits (m := ThreadProg 
 
 theorem safeIO_preservesStepRel {σ α : Type} {Inv : σ → Prop} {Rel : σ → σ → Prop}
     (p : ThreadProg σ α) [hp : SafeIO p] :
-    ProgPreservesStepRel Inv Rel p := by
-  induction hp.noAtomic with
-  | pure a => exact .pure a
-  | io _ _ _ ih => exact .io _ _ ih
+    ProgPreservesStepRel Inv Rel p :=
+  ProgSpec.of_noAtomic hp.noAtomic
 
 theorem safeIO_bind_preservesStepRel {σ α β : Type} {Inv : σ → Prop} {Rel : σ → σ → Prop}
     (p : ThreadProg σ α) [SafeIO p] {k : α → ThreadProg σ β}
@@ -1099,14 +1003,12 @@ def SrvFailure.toWire {ε α : Type} :
 
 /-- Postcondition judgment for an async `ThreadProg`: every `.pure a` return value must satisfy
     `Post a`, assuming shared server state satisfies `Inv` at each `atomic` boundary. -/
-inductive ProgEnsures {σ α : Type} (Inv : σ → Prop) (Post : α → Prop) : ThreadProg σ α → Prop where
-  | pure (a : α) :
-      Post a → ProgEnsures Inv Post (.pure a)
-  | io (eff : ServerEffect) (k : eff.Resp → ThreadProg σ α) :
-      (∀ r, ProgEnsures Inv Post (k r)) → ProgEnsures Inv Post (.io eff k)
-  | atomic (st : σ → σ) (next : σ → ThreadProg σ α) :
-      (∀ s, Inv s → ProgEnsures Inv Post (next s)) →
-      ProgEnsures Inv Post (.atomic st next)
+abbrev ProgEnsures {σ α : Type} (Inv : σ → Prop) (Post : α → Prop) (p : ThreadProg σ α) : Prop :=
+  ProgSpec Inv True (fun _ _ => True) Post p
+
+theorem ProgEnsures.pure {σ α : Type} {Inv : σ → Prop} {Post : α → Prop}
+    (a : α) (ha : Post a) : ProgEnsures Inv Post (.pure a) :=
+  ProgSpec.pure a ha
 
 theorem progEnsures_pure {σ α : Type} {Inv : σ → Prop} {Post : α → Prop}
     (a : α) (ha : Post a) :
@@ -1115,21 +1017,14 @@ theorem progEnsures_pure {σ α : Type} {Inv : σ → Prop} {Post : α → Prop}
 
 theorem progEnsures_bind {σ α β : Type} {Inv : σ → Prop} {Q : α → Prop} {Post : β → Prop}
     {p : ThreadProg σ α} {k : α → ThreadProg σ β}
-    (hp : ProgEnsures Inv Q p)
-    (hk : ∀ a, Q a → ProgEnsures Inv Post (k a)) :
-    ProgEnsures Inv Post (p >>= k) := by
-  change ProgEnsures Inv Post (ThreadProg.bind p k)
-  induction hp with
-  | pure a ha => exact hk a ha
-  | io _ _ _ ih => exact .io _ _ ih
-  | atomic st _ _ ih => exact .atomic st _ ih
+    (hp : ProgEnsures Inv Q p) (hk : ∀ a, Q a → ProgEnsures Inv Post (k a)) :
+    ProgEnsures Inv Post (p >>= k) :=
+  hp.bind hk
 
 theorem safeIO_ensures_true {σ α : Type} {Inv : σ → Prop}
     (p : ThreadProg σ α) [hp : SafeIO p] :
-    ProgEnsures Inv (fun _ => True) p := by
-  induction hp.noAtomic with
-  | pure a => exact .pure a trivial
-  | io _ _ _ ih => exact .io _ _ ih
+    ProgEnsures Inv (fun _ => True) p :=
+  ProgSpec.of_noAtomic hp.noAtomic
 
 theorem safeIO_bind_ensures {σ α β : Type} {Inv : σ → Prop} {Post : β → Prop}
     (p : ThreadProg σ α) [SafeIO p] {k : α → ThreadProg σ β}
@@ -1154,41 +1049,35 @@ theorem safeIOEnsures_bind {σ α β : Type} {Inv : σ → Prop} {Q : α → Pro
 
 theorem progEnsures_imp {σ α : Type} {Inv : σ → Prop} {Q Post : α → Prop}
     {p : ThreadProg σ α} (hp : ProgEnsures Inv Q p) (himp : ∀ a, Q a → Post a) :
-    ProgEnsures Inv Post p := by
-  induction hp with
-  | pure a ha => exact .pure a (himp a ha)
-  | io _ _ _ ih => exact .io _ _ ih
-  | atomic _ _ _ ih => exact .atomic _ _ ih
+    ProgEnsures Inv Post p :=
+  hp.mono id (fun _ h => h) (fun _ _ _ _ h => h) himp
 
 theorem safeIOEnsures_final {σ α : Type} {Inv : σ → Prop} {Q Post : α → Prop}
-    (p : ThreadProg σ α) [h : SafeIOEnsures p Q]
-    (himp : ∀ a, Q a → Post a) :
+    (p : ThreadProg σ α) [h : SafeIOEnsures p Q] (himp : ∀ a, Q a → Post a) :
     ProgEnsures Inv Post p :=
   progEnsures_imp h.ensures himp
 
 theorem progEnsures_runAtomic {σ α : Type} {Inv : σ → Prop} {Post : α → Prop}
-    (step : σ → σ × α)
-    (hstep : ∀ s, Inv s → Post (step s).2) :
+    (step : σ → σ × α) (hstep : ∀ s, Inv s → Post (step s).2) :
     ProgEnsures Inv Post (MonadAtomic.runAtomic (m := ThreadProg σ) step) :=
-  .atomic _ (fun s => .pure (step s).2) (fun s hs => .pure _ (hstep s hs))
+  ProgSpec.runAtomic step (fun _ _ => trivial) hstep
 
 theorem progEnsures_runAtomicRead {σ α : Type} {Inv : σ → Prop} {Post : α → Prop}
-    (f : σ → α)
-    (hf : ∀ s, Inv s → Post (f s)) :
+    (f : σ → α) (hf : ∀ s, Inv s → Post (f s)) :
     ProgEnsures Inv Post (MonadAtomic.runAtomicRead (m := ThreadProg σ) f) :=
-  .atomic id (fun s => .pure (f s)) (fun s hs => .pure _ (hf s hs))
+  ProgSpec.runAtomicRead f (fun _ _ => trivial) hf
 
 theorem runAtomic_bind_ensures {σ α β : Type} {Inv : σ → Prop} {Post : β → Prop}
     (step : σ → σ × α) {k : α → ThreadProg σ β}
     (hk : ∀ s, Inv s → ProgEnsures Inv Post (k (step s).2)) :
     ProgEnsures Inv Post (MonadAtomic.runAtomic (m := ThreadProg σ) step >>= k) :=
-  .atomic (fun s => (step s).1) (fun s => k (step s).2) hk
+  .atomic (fun s => (step s).1) (fun s => k (step s).2) trivial (fun _ _ => trivial) hk
 
 theorem runAtomicRead_bind_ensures {σ α β : Type} {Inv : σ → Prop} {Post : β → Prop}
     (f : σ → α) {k : α → ThreadProg σ β}
     (hk : ∀ s, Inv s → ProgEnsures Inv Post (k (f s))) :
     ProgEnsures Inv Post (MonadAtomic.runAtomicRead (m := ThreadProg σ) f >>= k) :=
-  .atomic id (fun s => k (f s)) hk
+  .atomic id (fun s => k (f s)) trivial (fun _ _ => trivial) hk
 
 /-- Multi-core scheduler state tracking a target RPC thread alongside arbitrary concurrent
     `Inv`-preserving background handlers. -/
@@ -1235,8 +1124,8 @@ private theorem trackedStep_preserves {σ Tgt Out : Type} {Inv : σ → Prop} {P
       cases htinv with | io _ _ hk1 =>
       cases htens with | io _ _ hk2 => exact ⟨hinv, hk1 resp, hk2 resp, hopool⟩
   | stepTargetAtomic s os st next =>
-      cases htinv with | atomic _ _ hst hnext1 =>
-      cases htens with | atomic _ _ hnext2 => exact ⟨hst s hinv, hnext1 s hinv, hnext2 s hinv, hopool⟩
+      cases htinv with | atomic _ _ _ hst hnext1 =>
+      cases htens with | atomic _ _ _ _ hnext2 => exact ⟨hst s hinv, hnext1 s hinv, hnext2 s hinv, hopool⟩
 
 /-- Multi-Core Concurrent Postcondition Theorem:
     If `Inv s₀` holds at server boot, `tgt₀` preserves `Inv` (`ProgPreservesInv Inv tgt₀`) and

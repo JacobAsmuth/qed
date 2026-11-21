@@ -15,6 +15,7 @@ extern "C" {
     pub fn qed_lean_io_mk_err(msg: *const libc::c_char) -> *mut LeanObj;
     pub fn qed_lean_io_is_ok(r: *mut LeanObj) -> libc::c_int;
     pub fn qed_lean_io_val(r: *mut LeanObj) -> *mut LeanObj;
+    pub fn qed_lean_mk_ctor_1(tag: libc::c_uint, a: *mut LeanObj) -> *mut LeanObj;
     pub fn qed_lean_mk_opt_none() -> *mut LeanObj;
     pub fn qed_lean_mk_opt_some(v: *mut LeanObj) -> *mut LeanObj;
     pub fn qed_lean_mk_except_err_str(msg: *const u8, len: usize) -> *mut LeanObj;
@@ -31,9 +32,12 @@ extern "C" {
     pub fn qed_lean_array_size(arr: *mut LeanObj) -> usize;
     pub fn qed_lean_array_uget(arr: *mut LeanObj, i: usize) -> *mut LeanObj;
     pub fn qed_lean_ctor_get(o: *mut LeanObj, i: libc::c_uint) -> *mut LeanObj;
+    pub fn qed_lean_ctor_get_u8(o: *mut LeanObj, offset: libc::c_uint) -> u8;
     pub fn qed_lean_obj_tag(o: *mut LeanObj) -> libc::c_uint;
     pub fn qed_lean_usize_to_nat(n: usize) -> *mut LeanObj;
     pub fn qed_lean_usize_of_nat(o: *mut LeanObj) -> usize;
+    pub fn qed_lean_int64_to_int(n: i64) -> *mut LeanObj;
+    pub fn qed_lean_int_to_i64_checked(o: *mut LeanObj, out: *mut i64) -> libc::c_int;
     pub fn qed_lean_box(n: usize) -> *mut LeanObj;
     pub fn qed_lean_unbox(o: *mut LeanObj) -> usize;
     pub fn qed_lean_box_u32(n: u32) -> *mut LeanObj;

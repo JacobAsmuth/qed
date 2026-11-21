@@ -8,22 +8,17 @@ lean_object *qed_lean_io_mk_err(const char *msg) {
 int qed_lean_io_is_ok(lean_object *r) { return lean_io_result_is_ok(r) ? 1 : 0; }
 lean_object *qed_lean_io_val(lean_object *r) { return lean_io_result_get_value(r); }
 
+lean_object *qed_lean_mk_ctor_1(unsigned tag, lean_object *a) {
+    lean_object *o = lean_alloc_ctor(tag, 1, 0);
+    lean_ctor_set(o, 0, a);
+    return o;
+}
 lean_object *qed_lean_mk_opt_none(void) { return lean_box(0); }
-lean_object *qed_lean_mk_opt_some(lean_object *v) {
-    lean_object *o = lean_alloc_ctor(1, 1, 0);
-    lean_ctor_set(o, 0, v);
-    return o;
-}
+lean_object *qed_lean_mk_opt_some(lean_object *v) { return qed_lean_mk_ctor_1(1, v); }
 lean_object *qed_lean_mk_except_err_str(const char *msg, size_t len) {
-    lean_object *o = lean_alloc_ctor(0, 1, 0);
-    lean_ctor_set(o, 0, lean_mk_string_from_bytes(msg, len));
-    return o;
+    return qed_lean_mk_ctor_1(0, lean_mk_string_from_bytes(msg, len));
 }
-lean_object *qed_lean_mk_except_ok(lean_object *v) {
-    lean_object *o = lean_alloc_ctor(1, 1, 0);
-    lean_ctor_set(o, 0, v);
-    return o;
-}
+lean_object *qed_lean_mk_except_ok(lean_object *v) { return qed_lean_mk_ctor_1(1, v); }
 lean_object *qed_lean_mk_prod(lean_object *a, lean_object *b) {
     lean_object *o = lean_alloc_ctor(0, 2, 0);
     lean_ctor_set(o, 0, a);
@@ -51,9 +46,22 @@ size_t qed_lean_array_size(lean_object *a) { return lean_array_size(a); }
 lean_object *qed_lean_array_uget(lean_object *a, size_t i) { return lean_array_uget(a, i); }
 
 lean_object *qed_lean_ctor_get(lean_object *o, unsigned i) { return lean_ctor_get(o, i); }
+uint8_t qed_lean_ctor_get_u8(lean_object *o, unsigned offset) { return lean_ctor_get_uint8(o, offset); }
 unsigned qed_lean_obj_tag(lean_object *o) { return lean_obj_tag(o); }
 lean_object *qed_lean_usize_to_nat(size_t n) { return lean_usize_to_nat(n); }
 size_t qed_lean_usize_of_nat(lean_object *o) { return lean_usize_of_nat(o); }
+lean_object *qed_lean_int64_to_int(int64_t n) { return lean_int64_to_int(n); }
+int qed_lean_int_to_i64_checked(lean_object *o, int64_t *out) {
+    int64_t v = (int64_t)lean_int64_of_int(o);
+    if (!lean_is_scalar(o)) {
+        lean_object *rt = lean_int64_to_int(v);
+        bool ok = lean_int_eq(o, rt);
+        lean_dec(rt);
+        if (!ok) return 0;
+    }
+    *out = v;
+    return 1;
+}
 
 lean_object *qed_lean_box(size_t n) { return lean_box(n); }
 size_t qed_lean_unbox(lean_object *o) { return lean_unbox(o); }

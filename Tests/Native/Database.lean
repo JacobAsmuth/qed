@@ -26,9 +26,12 @@ private def startHttpSqlMock (sqliteFile : String) : IO (Except String HttpSqlMo
           let sql := match fs.lookup "sql" with | some (.str s) => s | _ => ""
           let paramsArr := match fs.lookup "params" with | some (.arr ps) => ps | _ => []
           seenSqlRef.modify (·.push (sql, paramsArr.length))
-          match ← Prim.sqliteExec sqliteFile sql (Qed.Json.render (.arr paramsArr)) with
-          | .ok rawJson => pure (200, rawJson)
-          | .error e    => pure (400, Qed.Json.render (.obj [("error", .str e)]))
+          match paramsArr.mapM SqlVal.fromTaggedJson with
+          | .error e => pure (400, Qed.Json.render (.obj [("error", .str e)]))
+          | .ok ps =>
+              match ← Prim.sqliteExec sqliteFile sql ps.toArray with
+              | .ok res  => pure (200, encodeTaggedResultJson res)
+              | .error e => pure (400, Qed.Json.render (.obj [("error", .str e)]))
       | .ok _ => pure (400, "{\"error\":\"expected object\"}")
     pure (status, "application/json", respStr.toUTF8)
   return res.map fun (port, stop) => { url := s!"http://127.0.0.1:{port}/query", seenSqlRef, stop }
@@ -301,32 +304,28 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
         pure ()
       else if tag == 'E' then
         let (sqliteSql, sqliteParams) := translatePgSql preparedSql boundParams
-        let paramsJson := encodeTaggedParamsJson sqliteParams
         let execRes ← match activeTxId? with
-          | some tid => Prim.sqliteTxExec tid sqliteSql paramsJson
-          | none     => Prim.sqliteExec sqliteFile sqliteSql paramsJson
+          | some tid => Prim.sqliteTxExec tid sqliteSql sqliteParams
+          | none     => Prim.sqliteExec sqliteFile sqliteSql sqliteParams
         match execRes with
         | .error e => discard <| Prim.outboundWriteAll conn (pgErrorResponse e)
-        | .ok rawJson =>
-            match decodeTaggedResultJson rawJson with
-            | .error e => discard <| Prim.outboundWriteAll conn (pgErrorResponse e)
-            | .ok res =>
-                let mut frames := ByteArray.empty
-                if h : 0 < res.rows.size then
-                  frames := frames ++ pgRowDescription res.rows[0]
-                  for row in res.rows do
-                    frames := frames ++ pgDataRow row
-                else if preparedSql.trimAscii.toString.toUpper.startsWith "SELECT COUNT" ||
-                        preparedSql.trimAscii.toString.toUpper.startsWith "SELECT SUM" ||
-                        preparedSql.trimAscii.toString.toUpper.startsWith "SELECT MIN" ||
-                        preparedSql.trimAscii.toString.toUpper.startsWith "SELECT MAX" then
-                  frames := frames ++ pgRowDescription #[.int 0]
-                let verb := (preparedSql.trimAscii.toString.splitOn " ").headD "OK" |>.toUpper
-                let tagStr :=
-                  if verb == "INSERT" then s!"INSERT 0 {res.affected}"
-                  else s!"{verb} {if res.rows.size > 0 then res.rows.size else res.affected}"
-                frames := frames ++ pgCommandComplete tagStr
-                discard <| Prim.outboundWriteAll conn frames
+        | .ok res =>
+            let mut frames := ByteArray.empty
+            if h : 0 < res.rows.size then
+              frames := frames ++ pgRowDescription res.rows[0]
+              for row in res.rows do
+                frames := frames ++ pgDataRow row
+            else if preparedSql.trimAscii.toString.toUpper.startsWith "SELECT COUNT" ||
+                    preparedSql.trimAscii.toString.toUpper.startsWith "SELECT SUM" ||
+                    preparedSql.trimAscii.toString.toUpper.startsWith "SELECT MIN" ||
+                    preparedSql.trimAscii.toString.toUpper.startsWith "SELECT MAX" then
+              frames := frames ++ pgRowDescription #[.int 0]
+            let verb := (preparedSql.trimAscii.toString.splitOn " ").headD "OK" |>.toUpper
+            let tagStr :=
+              if verb == "INSERT" then s!"INSERT 0 {res.affected}"
+              else s!"{verb} {if res.rows.size > 0 then res.rows.size else res.affected}"
+            frames := frames ++ pgCommandComplete tagStr
+            discard <| Prim.outboundWriteAll conn frames
       else if tag == 'S' then
         discard <| Prim.outboundWriteAll conn (readyFrame activeTxId?)
       else if tag == 'X' then
@@ -428,13 +427,14 @@ private def runVaultSuite (c : TestChecker) (label : String) (srv : NativeServer
 private def withRedirectedDb (ep : DbEndpoint) : MonadServer IO :=
   let base : MonadServer IO := Native.mkNativeServerInst none none
   let redir (cfg : DbConfig) : DbConfig := { cfg with endpoint := ep, devFallback? := none }
-  { base with
-    dbExec       := fun cfg q => base.dbExec (redir cfg) q
-    dbExecDdl    := fun cfg => base.dbExecDdl (redir cfg)
-    dbTxBegin    := fun cfg => base.dbTxBegin (redir cfg)
-    dbTxExec     := fun cfg tid q => base.dbTxExec (redir cfg) tid q
-    dbTxCommit   := fun cfg tid => base.dbTxCommit (redir cfg) tid
-    dbTxRollback := fun cfg tid => base.dbTxRollback (redir cfg) tid
+  { exec := fun
+      | .dbExec cfg q         => base.exec (.dbExec (redir cfg) q)
+      | .dbExecDdl cfg        => base.exec (.dbExecDdl (redir cfg))
+      | .dbTxBegin cfg        => base.exec (.dbTxBegin (redir cfg))
+      | .dbTxExec cfg tid q   => base.exec (.dbTxExec (redir cfg) tid q)
+      | .dbTxCommit cfg tid   => base.exec (.dbTxCommit (redir cfg) tid)
+      | .dbTxRollback cfg tid => base.exec (.dbTxRollback (redir cfg) tid)
+      | eff                   => base.exec eff
   }
 
 private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : MonadServer IO)
@@ -554,7 +554,7 @@ private def runMigrationSuite (c : TestChecker) (tmpDir : String) : IO Unit := d
   let insQ := SqlQuery.insert ⟨"widgets", by decide⟩
     [(⟨"id", by decide⟩, .text "w1"), (⟨"name", by decide⟩, .text "Sprocket")] []
   let (insSql, insParams) := insQ.compile .sqlite
-  c.expectOk "[migrate] insert v1 row" (← Prim.sqliteExec migDb insSql (encodeTaggedParamsJson insParams)) fun _ => pure ()
+  c.expectOk "[migrate] insert v1 row" (← Prim.sqliteExec migDb insSql insParams) fun _ => pure ()
 
   -- Migrate to v2: adds nullable `notes`, non-nullable `views` with `>= 0` default, and an index
   let v2Table : TableSchema := {
@@ -573,10 +573,9 @@ private def runMigrationSuite (c : TestChecker) (tmpDir : String) : IO Unit := d
 
   -- Verify existing row preserved with safe defaults
   c.expectOk "[migrate] select v2 row"
-    (← Prim.sqliteExec migDb "SELECT \"id\", \"name\", \"notes\", \"views\" FROM \"widgets\" WHERE \"id\" = ?" (encodeTaggedParamsJson #[.text "w1"])) fun raw =>
-      c.expectOk "[migrate] decode v2 row" (decodeTaggedResultJson raw) fun res =>
-        c.check "[migrate] existing row preserved with NULL + default 0"
-          (res.rows == #[#[.text "w1", .text "Sprocket", .null, .int 0]])
+    (← Prim.sqliteExec migDb "SELECT \"id\", \"name\", \"notes\", \"views\" FROM \"widgets\" WHERE \"id\" = ?" #[.text "w1"]) fun res =>
+      c.check "[migrate] existing row preserved with NULL + default 0"
+        (res.rows == #[#[.text "w1", .text "Sprocket", .null, .int 0]])
 
   -- Re-running v2 migration is strictly idempotent (0 steps)
   c.expectOk "[migrate] v2 idempotent" (← Native.migrateDatabase v2Cfg) fun steps =>

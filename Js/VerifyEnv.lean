@@ -258,6 +258,7 @@ def clientLeakReason? (env : Environment) (n : Name) : Option String :=
      modName == `Qed.Auth.Oidc then
     some s!"client bundle leak gate: server runtime primitive `{n}` (`{modName}`) cannot be bundled into client JavaScript"
   else if n == `Qed.Server.execExternalRaw ||
+          n == `Qed.Server.MonadServer.exec ||
           n == `Qed.Server.MonadServer.httpCall ||
           n == `Qed.Server.MonadServer.dbExec ||
           n == `Qed.Server.MonadServer.dbExecDdl ||

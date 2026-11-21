@@ -21,16 +21,10 @@ open Qed.Lang
     - Driver-agnostic `DbConfig` & `ensureSchema`
     - Persistent `databaseRegistry` metadata for `server` `use db : <Name>` lowering -/
 
-private structure ParsedEnvRef where
-  isSecret : Bool
-  envKey   : String
-  default? : Option String
-
 private structure ParsedCol where
   ref          : Lean.Syntax
   ident        : Lean.Ident
   colName      : String
-  ty           : ParsedSrvType
   tyTerm       : Lean.Term
   sqlColType   : SqlColType
   isNullable   : Bool
@@ -57,66 +51,49 @@ private structure ParsedTable where
   indexes       : Array (Array Lean.Ident)
 
 open Lean Elab Command in
-private def parseEnvRef (stx : Syntax) : CommandElabM ParsedEnvRef := do
-  let kwId := (stx.getArg 0).getId.eraseMacroScopes
-  let isSecret := kwId == `secret
-  let envKey := (⟨(stx.getArg 2)⟩ : TSyntax `str).getString
-  let defOpt := stx.getArg 4
-  let def? := if defOpt.getNumArgs == 2 then some ((⟨(defOpt.getArg 1)⟩ : TSyntax `str).getString) else none
-  if envKey.isEmpty then
-    throwErrorAt stx "database environment variable name must not be empty"
-  return { isSecret, envKey, default? := def? }
-
-open Lean Elab Command in
 private def parseEndpointSpec (stx : Syntax) :
     CommandElabM (Term × Array String) := do
   let k := stx.getKind
   let mut secs : Array String := #[]
+  let parseRef (s : Syntax) := parseQedEnvRef "database" s
   if k == ``dbEpUrl then
-    let er ← parseEnvRef (stx.getArg 1)
+    let er ← parseRef (stx.getArg 1)
     if er.isSecret then secs := secs.push er.envKey
-    let kLit := Syntax.mkStrLit er.envKey
-    return (← `(Qed.Server.Db.DbEndpoint.urlEnv $kLit), secs)
+    return (← `(Qed.Server.Db.DbEndpoint.urlEnv $(Syntax.mkStrLit er.envKey)), secs)
   else if k == ``dbEpPostgres then
-    let er ← parseEnvRef (stx.getArg 1)
+    let er ← parseRef (stx.getArg 1)
     if er.isSecret then secs := secs.push er.envKey
-    let kLit := Syntax.mkStrLit er.envKey
-    return (← `(Qed.Server.Db.DbEndpoint.postgresEnv $kLit), secs)
+    return (← `(Qed.Server.Db.DbEndpoint.postgresEnv $(Syntax.mkStrLit er.envKey)), secs)
   else if k == ``dbEpSqliteLit then
     let pStr := (⟨(stx.getArg 1)⟩ : TSyntax `str).getString
-    let pLit := Syntax.mkStrLit pStr
-    return (← `(Qed.Server.Db.DbEndpoint.sqlitePath $pLit), secs)
+    return (← `(Qed.Server.Db.DbEndpoint.sqlitePath $(Syntax.mkStrLit pStr)), secs)
   else if k == ``dbEpSqliteEnv then
-    let er ← parseEnvRef (stx.getArg 1)
+    let er ← parseRef (stx.getArg 1)
     if er.isSecret && er.default?.isNone then secs := secs.push er.envKey
-    let kLit := Syntax.mkStrLit er.envKey
     let defTerm ← match er.default? with
-      | some d => let dLit := Syntax.mkStrLit d; `(some $dLit)
+      | some d => `(some $(Syntax.mkStrLit d))
       | none   => `(none)
-    return (← `(Qed.Server.Db.DbEndpoint.sqliteEnv $kLit $defTerm), secs)
+    return (← `(Qed.Server.Db.DbEndpoint.sqliteEnv $(Syntax.mkStrLit er.envKey) $defTerm), secs)
   else if k == ``dbEpD1 then
-    let acc ← parseEnvRef (stx.getArg 3)
-    let db  ← parseEnvRef (stx.getArg 7)
-    let tok ← parseEnvRef (stx.getArg 11)
+    let acc ← parseRef (stx.getArg 3)
+    let db  ← parseRef (stx.getArg 7)
+    let tok ← parseRef (stx.getArg 11)
     if tok.isSecret then secs := secs.push tok.envKey
-    let accKey := Syntax.mkStrLit acc.envKey
     let accDef ← match acc.default? with | some d => `(some $(Syntax.mkStrLit d)) | none => `(none)
-    let dbKey := Syntax.mkStrLit db.envKey
     let dbDef ← match db.default? with | some d => `(some $(Syntax.mkStrLit d)) | none => `(none)
-    let tokKey := Syntax.mkStrLit tok.envKey
-    return (← `(Qed.Server.Db.DbEndpoint.cloudflareD1 $accKey $accDef $dbKey $dbDef $tokKey), secs)
+    return (← `(Qed.Server.Db.DbEndpoint.cloudflareD1 $(Syntax.mkStrLit acc.envKey) $accDef $(Syntax.mkStrLit db.envKey) $dbDef $(Syntax.mkStrLit tok.envKey)), secs)
   else if k == ``dbEpTurso then
-    let u   ← parseEnvRef (stx.getArg 3)
-    let tok ← parseEnvRef (stx.getArg 7)
+    let u   ← parseRef (stx.getArg 3)
+    let tok ← parseRef (stx.getArg 7)
     if u.isSecret then secs := secs.push u.envKey
     if tok.isSecret then secs := secs.push tok.envKey
     return (← `(Qed.Server.Db.DbEndpoint.turso $(Syntax.mkStrLit u.envKey) $(Syntax.mkStrLit tok.envKey)), secs)
   else if k == ``dbEpHttp then
-    let u ← parseEnvRef (stx.getArg 3)
+    let u ← parseRef (stx.getArg 3)
     if u.isSecret then secs := secs.push u.envKey
     let tokOpt := stx.getArg 4
     let tokTerm ← if tokOpt.getNumArgs == 4 then do
-      let tok ← parseEnvRef (tokOpt.getArg 3)
+      let tok ← parseRef (tokOpt.getArg 3)
       if tok.isSecret then secs := secs.push tok.envKey
       `(some $(Syntax.mkStrLit tok.envKey))
     else `(none)
@@ -124,9 +101,9 @@ private def parseEndpointSpec (stx : Syntax) :
   else
     throwErrorAt stx "unexpected database endpoint specification"
 
-private def inferSqlColType (pty : ParsedSrvType) : SqlColType × Bool × Bool × Bool :=
-  let base := pty.baseIdent.getId.eraseMacroScopes
-  let isNullable := pty.mods.back? == some .option
+private def inferSqlColType (pty : LoweredQedType) : SqlColType × Bool × Bool × Bool :=
+  let base := pty.baseName
+  let isNullable := pty.isOption
   if base == `Nat then (.int, isNullable, true, false)
   else if base == `Int then (.int, isNullable, false, false)
   else if base == `Bool then (.bool, isNullable, false, false)
@@ -276,51 +253,11 @@ private partial def renderSqlPred? (colNames : Array String) (forRls : Bool) (st
   else none
 
 open Lean Elab Command in
-private def elabTableProtoAndJson (rowTypeId : Ident) (rowTypeName : Name)
-    (cols : Array ParsedCol) : CommandElabM Unit := do
-  let xId := mkIdent `x
-  let jId := mkIdent `j
-  let fsId := mkIdent `fs
-  let fIds := cols.map (·.ident)
-  let fTys := cols.map (·.tyTerm)
-
-  -- `ToJson` & `FromJson`
-  let jsonPairs ← cols.mapM fun c => do
-    let fId := c.ident
-    let kLit := Syntax.mkStrLit c.colName
-    `(($kLit, Qed.ToJson.toJson ($xId.$fId)))
-  let jsonDecs ← cols.mapM fun c => do
-    let kLit := Syntax.mkStrLit c.colName
-    let fTy := c.tyTerm
-    `(Qed.FromJsonField.fromField (α := $fTy) $jId $kLit)
-  let toJsonInstId := mkIdent (rowTypeName ++ `instToJson)
-  let fromJsonInstId := mkIdent (rowTypeName ++ `instFromJson)
-  elabCommand (← `(command|
-    instance $toJsonInstId:ident : Qed.ToJson $rowTypeId where
-      toJson $xId:ident := Qed.Json.obj [$[$jsonPairs:term],*]))
-  let fVals := fIds
-  elabCommand (← `(command|
-    instance $fromJsonInstId:ident : Qed.FromJson $rowTypeId where
-      fromJson $jId:ident := do
-        $[let $fIds:ident ← $jsonDecs:term]*
-        return { $[$fIds:ident := $fVals:ident],* }))
-
-  -- `ToProto` & `FromProto` & `LawfulProto` (via shared `Qed.mkProtoFieldSkeleton` / `Qed.mkStructProtoInsts`)
-  let toId := mkIdent (rowTypeName ++ `toProtoFields)
-  let fromId := mkIdent (rowTypeName ++ `fromProtoFields)
-  let reads ← fIds.mapM fun fId => `($xId.$fId)
-  let (protoBody, tagsPosPf, pIdents, pHaveTacs) ← Qed.mkProtoFieldSkeleton reads (fun i => pure fTys[i]!)
-  let protoDecs ← (List.range cols.size).toArray.mapM fun i => do
-    let kLit := Syntax.mkNumLit (toString (i + 1))
-    let fTy := fTys[i]!
-    `(Qed.FromProtoField.decodeProtoField (α := $fTy) $kLit $fsId)
-  elabCommand (← `(command|
-    def $toId ($xId:ident : $rowTypeId) : List (Nat × Qed.Proto.WireVal) := $protoBody))
-  elabCommand (← `(command|
-    def $fromId ($fsId:ident : List (Nat × Qed.Proto.WireVal)) : Except String $rowTypeId := do
-      $[let $fIds:ident ← $protoDecs:term]*
-      return { $[$fIds:ident := $fVals:ident],* }))
-  for cmd in ← Qed.mkStructProtoInsts rowTypeId toId fromId xId tagsPosPf pIdents pHaveTacs true do
+private def elabTableProtoAndJson (rowTypeId : Ident) (cols : Array ParsedCol) : CommandElabM Unit := do
+  let specs : Array Qed.StructFieldSpec := cols.map fun c =>
+    { ident := c.ident, wireKey := c.colName, valTy := c.tyTerm }
+  for cmd in (← Qed.mkStructJsonCmds rowTypeId specs { emitNamedDefs := false }) ++
+             (← Qed.mkStructProtoCmds rowTypeId specs { emitBytesCodec := false, emitLawful := true }) do
     elabCommand cmd
 
 open Lean Elab Command in
@@ -378,9 +315,8 @@ def elabDatabaseCmd : CommandElab := fun stx => do
             throwErrorAt colId s!"invalid SQL column name `{colName}`"
           if cols.any (·.colName == colName) then
             throwErrorAt colId s!"duplicate column `{colName}` in `table {tName}`"
-          let pty ← liftMacroM <| ParsedSrvType.parse (sc.getArg 2)
-          liftMacroM <| pty.validate (allowFallible := false) s!"column `{colName}`"
-          let tyTerm ← liftMacroM pty.toPayloadTerm
+          let pty ← liftMacroM <| lowerSrvType (sc.getArg 2) (allowFallible := false) s!"column `{colName}`"
+          let tyTerm := pty.term
           let (sqlColType, isNullable, isNat, isBytes) := inferSqlColType pty
           let mods := (sc.getArg 3).getArgs
           let mut isPk := false
@@ -397,7 +333,7 @@ def elabDatabaseCmd : CommandElab := fun stx => do
           let whereOpt := sc.getArg 4
           let whereExprs := if whereOpt.getNumArgs == 2 then (whereOpt.getArg 1).getSepArgs else #[]
           cols := cols.push {
-            ref := sc, ident := colId, colName, ty := pty, tyTerm, sqlColType,
+            ref := sc, ident := colId, colName, tyTerm, sqlColType,
             isNullable, isNat, isBytes, isPrimaryKey := isPk, isImmutable := isImm,
             isUnique := isUniq, refs?, whereExprs
           }
@@ -492,7 +428,7 @@ def elabDatabaseCmd : CommandElab := fun stx => do
         structure $rowTypeId where
           $[$fIds:ident : $fTys:term]*
         deriving Inhabited, DecidableEq, Repr))
-    elabTableProtoAndJson rowTypeId rowTypeName t.cols
+    elabTableProtoAndJson rowTypeId t.cols
 
     -- 2. Single-row invariant (`RowInv`, `rowInvBool`, `rowInvBool_sound`)
     let rowVar := mkIdent `_row

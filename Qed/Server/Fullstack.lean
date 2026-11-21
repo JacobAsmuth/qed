@@ -114,9 +114,7 @@ def elabFullstackCmd : CommandElab := fun stx => do
     | throwErrorAt fsIdent s!"`fullstack {fsName}` must specify `client <AppName>`"
 
   let env ← getEnv
-  let srvMap := serverRegistry.getState env
-  let candSrv1 := currNs ++ srvIdent.getId
-  let some srvInfo := (srvMap.find? candSrv1).orElse (fun _ => srvMap.find? srvIdent.getId)
+  let some srvInfo := Qed.Diag.lookupNameMapExt? serverRegistry env currNs (← getOpenDecls) srvIdent.getId
     | throwErrorAt srvIdent s!"unknown `server` `{srvIdent.getId}` in `fullstack {fsName}`"
 
   -- Validate that `client` resolves to a `Qed.App _ _` value (or a `component`/`app` owning `.app`)
@@ -189,11 +187,9 @@ def elabQedServerMain : CommandElab := fun stx => do
   let fsIdent : Ident := ⟨stx[1]⟩
   let env ← getEnv
   let currNs ← getCurrNamespace
-  let fsMap := fullstackRegistry.getState env
-  let cand1 := currNs ++ fsIdent.getId
-  let some fsInfo := (fsMap.find? cand1).orElse (fun _ =>
-      fsMap.toList.findSome? fun (k, v) =>
-        if k == fsIdent.getId || k.getString! == fsIdent.getId.toString then some v else none)
+  let some fsInfo := (Qed.Diag.lookupNameMapExt? fullstackRegistry env currNs (← getOpenDecls) fsIdent.getId).orElse (fun _ =>
+      (fullstackRegistry.getState env).toList.findSome? fun (k, v) =>
+        if k.getString! == fsIdent.getId.toString then some v else none)
     | throwErrorAt fsIdent s!"unknown `fullstack` declaration `{fsIdent.getId}`"
   let srvMap := serverRegistry.getState env
   let some srvInfo := srvMap.find? fsInfo.serverName

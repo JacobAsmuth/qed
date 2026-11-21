@@ -18,22 +18,6 @@ open Lean Elab Command Qed.Lang Qed.Server
     - Persistent `authRegistry` entry consumed by `server` (`use auth : ...`), `fullstack`,
       `qed dev`, and `qed_deploy.json` manifest generation. -/
 
-private structure ParsedAuthEnvRef where
-  isSecret : Bool
-  envKey   : String
-  default? : Option String
-
-private def parseAuthEnvRef (stx : Syntax) : CommandElabM ParsedAuthEnvRef := do
-  let kindStr := (stx.getArg 0).getId.eraseMacroScopes.toString
-  let keyStr  := (⟨stx.getArg 2⟩ : TSyntax `str).getString
-  let defOpt  := stx.getArg 4
-  let def? : Option String :=
-    if defOpt.getNumArgs == 2 then some (⟨defOpt.getArg 1⟩ : TSyntax `str).getString
-    else none
-  if keyStr.isEmpty then
-    throwErrorAt stx "environment variable name in `auth` cannot be empty"
-  return { isSecret := kindStr == "secret", envKey := keyStr, default? := def? }
-
 private inductive AuthClaimKind where
   | str
   | bool
@@ -132,25 +116,14 @@ def elabAuthCmd : CommandElab := fun stx => do
 
   for c in clauses do
     let k := c.getKind
-    if k == ``authIssuerClause then
-      let r ← parseAuthEnvRef (c.getArg 1)
-      issuerEnv := r.envKey
-      issuerDefault? := r.default?
+    if k == ``authIssuerClause || k == ``authAudienceClause ||
+       k == ``authClientIdClause || k == ``authClientSecretClause then
+      let r ← parseQedEnvRef "`auth`" (c.getArg 1)
       if r.isSecret && !secrets.contains r.envKey then secrets := secrets.push r.envKey
-    else if k == ``authAudienceClause then
-      let r ← parseAuthEnvRef (c.getArg 1)
-      audienceEnv := r.envKey
-      audienceDefault? := r.default?
-      if r.isSecret && !secrets.contains r.envKey then secrets := secrets.push r.envKey
-    else if k == ``authClientIdClause then
-      let r ← parseAuthEnvRef (c.getArg 1)
-      clientIdEnv? := some r.envKey
-      clientIdDefault? := r.default?
-      if r.isSecret && !secrets.contains r.envKey then secrets := secrets.push r.envKey
-    else if k == ``authClientSecretClause then
-      let r ← parseAuthEnvRef (c.getArg 1)
-      clientSecretEnv? := some r.envKey
-      if r.isSecret && !secrets.contains r.envKey then secrets := secrets.push r.envKey
+      if k == ``authIssuerClause then issuerEnv := r.envKey; issuerDefault? := r.default?
+      else if k == ``authAudienceClause then audienceEnv := r.envKey; audienceDefault? := r.default?
+      else if k == ``authClientIdClause then clientIdEnv? := some r.envKey; clientIdDefault? := r.default?
+      else clientSecretEnv? := some r.envKey
     else if k == ``authProvidersClause then
       for p in (c.getArg 2).getSepArgs do
         let ps := p.getId.eraseMacroScopes.toString

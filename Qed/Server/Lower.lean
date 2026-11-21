@@ -129,36 +129,34 @@ private def matchTxStmt? (stx : Lean.Syntax) : Option (Lean.Syntax × String × 
     some (dotStx, aliasName, suiteStmts (stx.getArg 2))
   else none
 
-/-- Matches `setCookie(...)` or `clearCookie(...)`. Returns `(isClear, rawArgs)`. -/
-private def matchSetCookieStmt? (stx : Lean.Syntax) : Option (Bool × Array Lean.Syntax) := do
+private def matchNamedStmtCall? (stx : Lean.Syntax) : Option (String × Array Lean.Syntax) := do
   guard (stx.getKind == ``qedStmtExpr)
   let e := unwrapParens1 (stx.getArg 0)
   guard (e.getKind == ``qedCall)
-  let callee := e.getArg 0
-  let rawArgs := (e.getArg 2).getSepArgs
-  match Db.extractDottedChain? callee with
-  | some ["setCookie"]   => some (false, rawArgs)
-  | some ["clearCookie"] => some (true, rawArgs)
+  match Db.extractDottedChain? (e.getArg 0) with
+  | some [nm] => some (nm, (e.getArg 2).getSepArgs)
+  | _ => none
+
+/-- Matches `setCookie(...)` or `clearCookie(...)`. Returns `(isClear, rawArgs)`. -/
+private def matchSetCookieStmt? (stx : Lean.Syntax) : Option (Bool × Array Lean.Syntax) :=
+  match matchNamedStmtCall? stx with
+  | some ("setCookie", args)   => some (false, args)
+  | some ("clearCookie", args) => some (true, args)
   | _ => none
 
 /-- Matches `send(...)` SSE event emission statements inside `stream` routes. -/
-private def matchSseSendStmt? (stx : Lean.Syntax) : Option (Array Lean.Syntax) := do
-  guard (stx.getKind == ``qedStmtExpr)
-  let e := unwrapParens1 (stx.getArg 0)
-  guard (e.getKind == ``qedCall)
-  let callee := e.getArg 0
-  let rawArgs := (e.getArg 2).getSepArgs
-  match Db.extractDottedChain? callee with
-  | some ["send"] => some rawArgs
+private def matchSseSendStmt? (stx : Lean.Syntax) : Option (Array Lean.Syntax) :=
+  match matchNamedStmtCall? stx with
+  | some ("send", args) => some args
   | _ => none
 
-partial def exprHasAwait (stx : Lean.Syntax) : Bool :=
-  if stx.getKind == ``qedAwait then true
-  else stx.getArgs.any exprHasAwait
+def exprHasAwait (stx : Lean.Syntax) : Bool :=
+  stxAny (·.getKind == ``qedAwait) stx
 
-partial def stmtHasAwait (stx : Lean.Syntax) : Bool :=
-  if (matchTxStmt? stx).isSome || (matchSetCookieStmt? stx).isSome || (matchSseSendStmt? stx).isSome then true
-  else exprHasAwait stx || stx.getArgs.any stmtHasAwait
+def stmtHasAwait (stx : Lean.Syntax) : Bool :=
+  stxAny (fun s =>
+    s.getKind == ``qedAwait || (matchTxStmt? s).isSome ||
+    (matchSetCookieStmt? s).isSome || (matchSseSendStmt? s).isSome) stx
 
 def blockHasAwait (stmts : Array Lean.Syntax) : Bool :=
   stmts.any stmtHasAwait
@@ -169,15 +167,14 @@ private def matchSrvEmitStmt? (stx : Lean.Syntax) : Option (Lean.Ident × Array 
   guard (meth == "emit")
   return (chId, rawArgs)
 
-partial def stmtHasEmit (stx : Lean.Syntax) : Bool :=
-  if (matchSrvEmitStmt? stx).isSome then true
-  else stx.getArgs.any stmtHasEmit
+def stmtHasEmit (stx : Lean.Syntax) : Bool :=
+  stxAny (fun s => (matchSrvEmitStmt? s).isSome) stx
 
 def blockHasEmit (stmts : Array Lean.Syntax) : Bool :=
   stmts.any stmtHasEmit
 
-partial def stmtHasAtomic (stx : Lean.Syntax) : Bool :=
-  stx.getKind == ``qedStmtAtomic || stx.getArgs.any stmtHasAtomic
+def stmtHasAtomic (stx : Lean.Syntax) : Bool :=
+  stxAny (·.getKind == ``qedStmtAtomic) stx
 
 def blockHasAtomic (stmts : Array Lean.Syntax) : Bool :=
   stmts.any stmtHasAtomic
@@ -211,26 +208,6 @@ def ensureUnitReturn (ref : Lean.Syntax) (stmts : Array Lean.Syntax) : Array Lea
   else
     let info := Lean.SourceInfo.fromRef ref
     stmts.push (Lean.Syntax.node info ``qedStmtReturn #[Lean.Syntax.atom info "return", Lean.Syntax.node info Lean.nullKind #[]])
-
-open Lean Elab Command in
-private def splitPosNamedArgs (callName : String) (rawArgs : Array Syntax)
-    (validKeys : Option (List String) := none) (errRef : Syntax := Syntax.missing) :
-    CommandElabM (Array Syntax × Array (String × Syntax)) := do
-  let mut posArgs : Array Syntax := #[]
-  let mut namedArgs : Array (String × Syntax) := #[]
-  for a in rawArgs do
-    let k := a.getKind
-    if k == ``qedCallArgPos then posArgs := posArgs.push (a.getArg 0)
-    else if k == ``qedCallArgNamed then
-      let key := (a.getArg 0).getId.eraseMacroScopes.toString
-      if let some allowed := validKeys then
-        unless allowed.contains key do
-          let hint := Qed.Diag.didYouMean key allowed
-          let ref := if errRef.isMissing then a else errRef
-          throwErrorAt ref s!"unknown argument `{key}` in `{callName}(...)`{hint} (supported: {String.intercalate ", " allowed})"
-      namedArgs := namedArgs.push (key, a.getArg 2)
-    else throwErrorAt a s!"unexpected argument in `{callName}(...)`"
-  return (posArgs, namedArgs)
 
 mutual
   partial def exprHasUnwrap (stx : Lean.Syntax) : Bool :=
@@ -320,44 +297,25 @@ private def foldProjections (ref : Syntax) (base : Term) (fields : List Name) : 
 
 open Lean Elab Command in
 private def resolveDottedIdent (ref : Syntax) (ctx : LowerCtx) (id : Ident) : LowerM Term := do
-  let comps := id.getId.components
-  match comps with
+  match id.getId.components with
   | [] => throwErrorAt ref "empty identifier"
-  | [single] =>
-      let s := single.toString
-      if s == "true" then return ← `(true)
-      else if s == "false" then return ← `(false)
-      else if s == "none" then return ← `(none)
-      else if ctx.locals.contains s then
-        return ⟨mkIdentFrom ref single⟩
-      else if s == "ctx" then
-        if ctx.forbidCtxEnv then
-          throwErrorAt ref s!"`ensures` postcondition in `{ctx.fnName}` cannot reference `ctx` because client decoders re-verify `ensures` on the wire"
-        return ⟨mkIdentFrom ref single⟩
-      else if ctx.stateFields.contains s then
-        resolveStateFieldBase ref ctx single
-      else if ctx.envVars.contains s then
-        if ctx.forbidCtxEnv then
-          throwErrorAt ref s!"`ensures` postcondition in `{ctx.fnName}` cannot reference `env` binding `{s}` because client decoders re-verify `ensures` on the wire"
-        return ⟨mkIdentFrom ref single⟩
-      else
-        return ⟨id⟩
   | root :: rest =>
       let rStr := root.toString
-      if ctx.locals.contains rStr then
-        if rest.isEmpty then return ⟨id⟩
-        let base : Term := ⟨mkIdentFrom ref root⟩
-        foldProjections ref base rest
+      if rest.isEmpty && rStr == "true" then `(true)
+      else if rest.isEmpty && rStr == "false" then `(false)
+      else if rest.isEmpty && rStr == "none" then `(none)
+      else if ctx.locals.contains rStr then
+        foldProjections ref ⟨mkIdentFrom ref root⟩ rest
       else if rStr == "ctx" || ctx.envVars.contains rStr then
         if ctx.forbidCtxEnv then
-          throwErrorAt ref s!"`ensures` postcondition in `{ctx.fnName}` cannot reference `{rStr}` because client decoders re-verify `ensures` on the wire"
-        let base : Term := ⟨mkIdentFrom ref root⟩
-        foldProjections ref base rest
+          let what := if rest.isEmpty && rStr != "ctx" then s!"`env` binding `{rStr}`" else s!"`{rStr}`"
+          throwErrorAt ref s!"`ensures` postcondition in `{ctx.fnName}` cannot reference {what} because client decoders re-verify `ensures` on the wire"
+        foldProjections ref ⟨mkIdentFrom ref root⟩ rest
       else if ctx.stateFields.contains rStr then
         let base ← resolveStateFieldBase ref ctx root
         foldProjections ref base rest
       else
-        recordExtRoot root
+        if !rest.isEmpty then recordExtRoot root
         return ⟨id⟩
 
 open Lean Elab Command in
@@ -442,7 +400,7 @@ private def lowerSrvCallHook (stx calleeStx : Syntax) (rawArgs : Array Syntax) (
     let fnName := (calleeStx.getArg 0).getId.eraseMacroScopes.toString
     let shadowed := ctx.locals.contains fnName || ctx.stateFields.contains fnName || ctx.envVars.contains fnName
     if !shadowed && (fnName == "text" || fnName == "json" || fnName == "html" || fnName == "bytes" || fnName == "redirect") then
-      let (posArgs, namedArgs) ← liftM <| splitPosNamedArgs fnName rawArgs (some ["status"])
+      let (posArgs, namedArgs) ← splitCallArgs fnName rawArgs (some ["status"])
       let statusStx? := (namedArgs.find? (·.1 == "status")).map Prod.snd
       let defaultStatus : Nat := if fnName == "redirect" then 302 else 200
       let stT ← match statusStx? with
@@ -699,52 +657,63 @@ private def lowerEmitCall (ctx : LowerCtx) (stmt : Syntax) (chId : Ident) (rawAr
     call ← `($call (srvAutoEmit(True)))
   return (call, allSteps)
 
-open Lean Elab Command in
-private def wrapHoistsPure (ctx : LowerCtx) (s₀ : Ident) (matState : Term)
-    (steps : Array HoistedStep) (body : Term) : LowerM Term := do
-  let errTy ← liftM <| errTyOf ctx
-  steps.foldrM (init := body) fun step acc => do
-    match step with
-    | .awaitUnwrap ref _ _ =>
-        throwErrorAt ref "`await` cannot appear inside a pure/atomic block"
-    | .pureUnwrap _ tmp valTerm =>
-        if !ctx.hasFallible then
-          if let some innerTy := ctx.innerOptTy? then
-            let okNone ← liftM <| mkPureLeaf ctx matState (← `(some (Except.ok none)))
-            let errLeaf ← liftM <| mkPureErrLeaf ctx s₀ (← `(_e))
-            return ← `(match Qed.Server.SrvUnwrapOpt.unwrapOpt (Inner := $innerTy) $valTerm with
-              | Except.error (Except.ok none) => $okNone
-              | Except.error (Except.error _e) => $errLeaf
-              | Except.ok $tmp:ident => $acc)
-        let errLeaf ← liftM <| mkPureErrLeaf ctx s₀ (← `(_e))
-        `(match Qed.Server.SrvUnwrap.unwrap (E := $errTy) $valTerm with
-          | Except.error _e => $errLeaf
-          | Except.ok $tmp:ident => $acc)
+private inductive BlockMode where
+  | pure  (inAtomic : Bool) (s₀ sCur : Lean.Ident) (matCur : Lean.Term)
+  | async (stateTyTerm? : Option Lean.Term)
 
-open Lean Elab Command in
-private def mkAsyncUnwrapMatch (ctx : LowerCtx) (tmp : Ident) (valTerm acc : Term) : CommandElabM Term := do
+section BlockLowering
+open Lean Elab Command
+
+private def mkOkLeaf (mode : BlockMode) (ctx : LowerCtx) (valTerm : Term) : CommandElabM Term := do
+  let ok ← wrapOkValue ctx valTerm
+  match mode with
+  | .pure _ _ _ matCur => mkPureLeaf ctx matCur (← `(some $ok))
+  | .async _           => `(Pure.pure (some $ok))
+
+private def mkErrLeaf (mode : BlockMode) (ctx : LowerCtx) (errTerm : Term) : CommandElabM Term :=
+  match mode with
+  | .pure _ s₀ _ _ => mkPureErrLeaf ctx s₀ errTerm
+  | .async _       => `(Pure.pure (some (Except.error $errTerm)))
+
+private def mkEmptyLeaf (mode : BlockMode) (ctx : LowerCtx) : CommandElabM Term :=
+  match mode with
+  | .pure _ _ _ matCur => do mkPureLeaf ctx matCur (← `(none))
+  | .async _           => `(Pure.pure none)
+
+private def wrapUnwrapStep (mode : BlockMode) (ctx : LowerCtx) (tmp : Ident) (valTerm acc : Term) :
+    CommandElabM Term := do
   if !ctx.hasFallible then
     if let some innerTy := ctx.innerOptTy? then
-      return ← `(match Qed.Server.SrvUnwrapOpt.unwrapOpt (Inner := $innerTy) $valTerm with
-        | Except.error _early => Pure.pure (some _early)
-        | Except.ok $tmp:ident => $acc)
+      match mode with
+      | .pure _ s₀ _ matCur =>
+          let okNone ← mkPureLeaf ctx matCur (← `(some (Except.ok none)))
+          let errLeaf ← mkPureErrLeaf ctx s₀ (← `(_e))
+          return ← `(match Qed.Server.SrvUnwrapOpt.unwrapOpt (Inner := $innerTy) $valTerm with
+            | Except.error (Except.ok none) => $okNone
+            | Except.error (Except.error _e) => $errLeaf
+            | Except.ok $tmp:ident => $acc)
+      | .async _ =>
+          return ← `(match Qed.Server.SrvUnwrapOpt.unwrapOpt (Inner := $innerTy) $valTerm with
+            | Except.error _early => Pure.pure (some _early)
+            | Except.ok $tmp:ident => $acc)
   let errTy ← errTyOf ctx
+  let errLeaf ← mkErrLeaf mode ctx (← `(_e))
   `(match Qed.Server.SrvUnwrap.unwrap (E := $errTy) $valTerm with
-    | Except.error _e => Pure.pure (some (Except.error _e))
+    | Except.error _e => $errLeaf
     | Except.ok $tmp:ident => $acc)
 
-open Lean Elab Command in
-private def wrapHoistsAsync (ctx : LowerCtx)
-    (steps : Array HoistedStep) (body : Term) : LowerM Term := do
+private def wrapHoists (mode : BlockMode) (ctx : LowerCtx)
+    (steps : Array HoistedStep) (body : Term) : LowerM Term :=
   steps.foldrM (init := body) fun step acc => do
-    match step with
-    | .awaitUnwrap _ tmp callTerm =>
+    match step, mode with
+    | .awaitUnwrap ref _ _, .pure .. =>
+        throwErrorAt ref "`await` cannot appear inside a pure/atomic block"
+    | .awaitUnwrap _ tmp callTerm, .async _ =>
         let rawTmp ← freshIdent "_srvRaw"
-        `($callTerm >>= fun $rawTmp:ident => $(← liftM <| mkAsyncUnwrapMatch ctx tmp ⟨rawTmp⟩ acc))
-    | .pureUnwrap _ tmp valTerm =>
-        liftM <| mkAsyncUnwrapMatch ctx tmp valTerm acc
+        `($callTerm >>= fun $rawTmp:ident => $(← liftM <| wrapUnwrapStep mode ctx tmp ⟨rawTmp⟩ acc))
+    | .pureUnwrap _ tmp valTerm, _ =>
+        liftM <| wrapUnwrapStep mode ctx tmp valTerm acc
 
-open Lean Elab Command in
 private def bindOptIdent (xStx : Syntax) (val cont : Term) : CommandElabM Term :=
   if xStx.isIdent then
     let xId : Ident := ⟨xStx⟩
@@ -752,17 +721,19 @@ private def bindOptIdent (xStx : Syntax) (val cont : Term) : CommandElabM Term :
   else
     `(let _ := $val; $cont)
 
-open Lean Elab Command in
 private def bindSrvLetEq (xStx : Syntax) (val cont : Term) : LowerM Term := do
   let xId ← if xStx.isIdent then pure ⟨xStx⟩ else freshIdent "_srvDiscard"
   let hEq ← freshIdent "_srvEq"
   `(Qed.Server.srvLetEq $val (fun $xId:ident $hEq:ident => $cont))
 
-open Lean Elab Command in
+private def bindLet (mode : BlockMode) (xStx : Syntax) (val cont : Term) : LowerM Term :=
+  match mode with
+  | .pure .. => bindSrvLetEq xStx val cont
+  | .async _ => liftM <| bindOptIdent xStx val cont
+
 private def pushOptLocal (ctx : LowerCtx) (xStx : Syntax) : LowerCtx :=
   if xStx.isIdent then { ctx with locals := ctx.locals.push xStx.getId.toString } else ctx
 
-open Lean Elab Command in
 private def isBareUnwrapExpr (allowAwait : Bool) (eStx : Syntax) : Bool :=
   let u := unwrapParens1 eStx
   u.getKind == ``qedUnwrap ||
@@ -770,9 +741,8 @@ private def isBareUnwrapExpr (allowAwait : Bool) (eStx : Syntax) : Bool :=
   (eStx.getKind == ``qedIdent && (eStx.getArg 0).getId.toString.endsWith "?") ||
   (eStx.getKind == ``qedProj && (eStx.getArg 2).getId.toString.endsWith "?")
 
-/-! ## Pure Statement Block Lowering (`lowerPureBlock` — for Sync `def`s & `atomic:` Blocks) -/
+/-! ## Unified Pure & Async Statement Block Lowering (`lowerBlock`) -/
 
-open Lean Elab Command in
 private partial def lowerCatchFallback? (ctx : LowerCtx) (stmts : Array Syntax) : LowerM (Option Term) := do
   if stmts.isEmpty then
     return none
@@ -795,7 +765,6 @@ private partial def lowerCatchFallback? (ctx : LowerCtx) (stmts : Array Syntax) 
   else
     return none
 
-open Lean Elab Command in
 private def lowerMatchScrutineesAndAlts (ctx : LowerCtx) (stmt : Syntax) (rest : Array Syntax)
     (lowerArm : LowerCtx → Array Syntax → LowerM Term) : LowerM (Term × Array HoistedStep) := do
   let mut scrutTerms : Array Term := #[]
@@ -813,26 +782,22 @@ private def lowerMatchScrutineesAndAlts (ctx : LowerCtx) (stmt : Syntax) (rest :
     `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $cBody)
   return (← `(match $[$scrutTerms:term],* with $[$alts:matchAlt]*), allSteps)
 
-open Lean Elab Command in
 private def extractSrvLetCatch? (clausesNode : Syntax) : LowerM (Option Syntax) := do
   let mut catchOpt? : Option Syntax := none
   for cl in clausesNode.getArgs do
     let ck := cl.getKind
     if ck == `Qed.Lang.letCatch then
-      if catchOpt?.isSome then
-        throwErrorAt cl "duplicate `catch` clause on `let`"
+      if catchOpt?.isSome then throwErrorAt cl "duplicate `catch` clause on `let`"
       catchOpt? := some (cl.getArg 1)
     else if ck == `Qed.Lang.letPredictBlock || ck == `Qed.Lang.letPredictExpr ||
             ck == `Qed.Lang.letOnConfirm || ck == `Qed.Lang.letRollback then
       throwErrorAt cl "`predict`, `on_confirm`, and `rollback` are only supported on client `component` `await` calls, not in `server` functions"
   return catchOpt?
 
-open Lean Elab Command in
 private def rejectSrvAssignPredict (stmt : Syntax) : LowerM Unit := do
   if stmt.getKind == ``qedStmtAssign && stmt.getNumArgs > 3 && (stmt.getArg 3).getNumArgs > 0 then
     throwErrorAt ((stmt.getArg 3).getArg 0) "`predict` is only supported on client `component` `await` calls, not in `server` functions"
 
-open Lean Elab Command in
 private def lowerCatchBody (stmt : Syntax) (catchCtx : LowerCtx) (xStx : Syntax)
     (errId : Ident) (scrutTerm okTerm : Term) (catchStmts : Array Syntax)
     (bindFallback : Syntax → Term → Term → LowerM Term)
@@ -850,105 +815,121 @@ private def lowerCatchBody (stmt : Syntax) (catchCtx : LowerCtx) (xStx : Syntax)
     `(match Qed.Server.SrvUnwrap.unwrap (E := Qed.Server.ApiError) $scrutTerm with
       | Except.error $errId:ident => $catchTerm | Except.ok $bindId:ident => $okTerm)
 
-open Lean Elab Command in
-private def lowerBranchCore (rest : Array Syntax) (thenCtx elseCtx : LowerCtx)
-    (thenStmts : Array Syntax) (elseStmts? : Option (Array Syntax))
-    (lowerBlock : LowerCtx → Array Syntax → LowerM Term)
-    (emptyElse : LowerM Term)
+private def lowerBranch (mode : BlockMode) (ctx : LowerCtx)
+    (rest thenStmts : Array Syntax) (thenCtx : LowerCtx)
+    (elseStmts? : Option (Array Syntax)) (allowPureLetJoin : Bool)
     (mkBranch : Term → Term → CommandElabM Term)
-    (joinRest : Term → LowerM Term) : LowerM Term := do
+    (recSame : LowerCtx → Array Syntax → LowerM Term)
+    (recWithState : LowerCtx → Ident → Array Syntax → LowerM Term) : LowerM Term := do
   let thenRet := blockAlwaysReturns thenStmts
   let elseRet := elseStmts?.map blockAlwaysReturns |>.getD false
   let lowerElseOpt (es? : Option (Array Syntax)) : LowerM Term :=
     match es? with
-    | some es => lowerBlock elseCtx es
-    | none    => emptyElse
+    | some es => recSame ctx es
+    | none    => liftM <| mkEmptyLeaf mode ctx
   if rest.isEmpty then
-    liftM =<< (mkBranch <$> lowerBlock thenCtx thenStmts <*> lowerElseOpt elseStmts?)
+    liftM =<< (mkBranch <$> recSame thenCtx thenStmts <*> lowerElseOpt elseStmts?)
   else if thenRet && !elseRet then
-    liftM =<< (mkBranch <$> lowerBlock thenCtx thenStmts <*> lowerBlock elseCtx ((elseStmts?.getD #[]) ++ rest))
+    liftM =<< (mkBranch <$> recSame thenCtx thenStmts <*> recSame ctx ((elseStmts?.getD #[]) ++ rest))
   else if !thenRet && elseRet then
-    liftM =<< (mkBranch <$> lowerBlock thenCtx (thenStmts ++ rest) <*> lowerBlock elseCtx (elseStmts?.getD #[]))
+    liftM =<< (mkBranch <$> recSame thenCtx (thenStmts ++ rest) <*> recSame ctx (elseStmts?.getD #[]))
   else
-    let br ← liftM =<< (mkBranch <$> lowerBlock thenCtx thenStmts <*> lowerElseOpt elseStmts?)
-    joinRest br
+    let br ← liftM =<< (mkBranch <$> recSame thenCtx thenStmts <*> lowerElseOpt elseStmts?)
+    match mode with
+    | .pure .. =>
+        let sNext ← freshIdent "_s"
+        match ctx.emitAcc? with
+        | some _ =>
+            let esNext ← freshIdent "_es"
+            let joinCtx := { ctx with
+              stateRule := if ctx.stateFields.isEmpty then .statelessServer else .pureStep sNext #[]
+              emitAcc? := some esNext }
+            let cont ← recWithState joinCtx sNext rest
+            `(Qed.Server.srvEmitSeq $br (fun $sNext:ident $esNext:ident => $cont))
+        | none =>
+            let joinCtx := { ctx with stateRule := if ctx.stateFields.isEmpty then .statelessServer else .pureStep sNext #[] }
+            let cont ← recWithState joinCtx sNext rest
+            if allowPureLetJoin && !blockMayReturnEarly thenStmts && !(elseStmts?.map blockMayReturnEarly |>.getD false) then
+              let hJoin ← freshIdent "_srvEq"
+              `(Qed.Server.srvLetEq (($br : _ × Option Unit).1) (fun $sNext:ident $hJoin:ident => $cont))
+            else
+              `(Qed.Server.srvSeq $br (fun $sNext:ident => $cont))
+    | .async _ =>
+        let cont ← recSame ctx rest
+        `(Qed.Server.srvSeqM $br (fun _ => $cont))
 
-open Lean Elab Command in
-private def lowerPureBranch (pCtx : LowerCtx) (sCur : Ident) (matCur : Term)
-    (rest thenStmts : Array Syntax) (thenCtx : LowerCtx)
-    (elseStmts? : Option (Array Syntax)) (allowPureLetJoin : Bool)
-    (mkBranch : Term → Term → CommandElabM Term)
-    (recPure : LowerCtx → Ident → Array Syntax → LowerM Term) : LowerM Term :=
-  lowerBranchCore rest thenCtx pCtx thenStmts elseStmts?
-    (recPure · sCur)
-    (do liftM <| mkPureLeaf pCtx matCur (← `(none)))
-    mkBranch
-    fun br => do
-      let sNext ← freshIdent "_s"
-      match pCtx.emitAcc? with
-      | some _ =>
-          let esNext ← freshIdent "_es"
-          let joinCtx := { pCtx with
-            stateRule := if pCtx.stateFields.isEmpty then .statelessServer else .pureStep sNext #[]
-            emitAcc? := some esNext }
-          let cont ← recPure joinCtx sNext rest
-          `(Qed.Server.srvEmitSeq $br (fun $sNext:ident $esNext:ident => $cont))
-      | none =>
-          let joinCtx := { pCtx with stateRule := if pCtx.stateFields.isEmpty then .statelessServer else .pureStep sNext #[] }
-          let cont ← recPure joinCtx sNext rest
-          if allowPureLetJoin && !blockMayReturnEarly thenStmts && !(elseStmts?.map blockMayReturnEarly |>.getD false) then
-            let hJoin ← freshIdent "_srvEq"
-            `(Qed.Server.srvLetEq (($br : _ × Option Unit).1) (fun $sNext:ident $hJoin:ident => $cont))
-          else
-            `(Qed.Server.srvSeq $br (fun $sNext:ident => $cont))
-
-open Lean Elab Command in
-private def lowerPureReturn (pCtx : LowerCtx) (s₀ : Ident) (matCur : Term) (stmt : Syntax) : LowerM Term := do
+private def lowerReturn (mode : BlockMode) (ctx : LowerCtx) (stmt : Syntax) : LowerM Term := do
   if (stmt.getArg 1).getNumArgs == 0 then
-    liftM <| mkPureLeaf pCtx matCur (← `(some $(← wrapOkValue pCtx (← `(())))))
+    liftM <| mkOkLeaf mode ctx (← `(()))
   else
     let retExpr := (stmt.getArg 1).getArg 0
-    if exprHasAwait retExpr && !(unwrapParens1 retExpr).isOfKind ``qedUnwrap then
-      throwErrorAt retExpr "`await` cannot be used inside a synchronous or `atomic` block"
+    let uRet := unwrapParens1 retExpr
+    match mode with
+    | .pure .. =>
+        if exprHasAwait retExpr && !uRet.isOfKind ``qedUnwrap then
+          throwErrorAt retExpr "`await` cannot be used inside a synchronous or `atomic` block"
+    | .async _ =>
+        if uRet.getKind == ``qedAwait && !(unwrapParens1 (uRet.getArg 1)).isOfKind ``qedUnwrap then
+          unless ctx.hasFallible do
+            throwErrorAt retExpr s!"`return await ...` without `catch` requires `{ctx.fnName}` to have a fallible `T!` return type"
+          let (callTerm, steps) ← lowerExprCollectingHoists ctx .val (uRet.getArg 1)
+          let rawId ← freshIdent "_retAw"
+          let errTy ← liftM <| errTyOf ctx
+          let leaf ← match ctx.innerOptTy? with
+            | some innerTy =>
+                `($callTerm >>= fun $rawId:ident => Pure.pure (some (match $rawId:ident with
+                  | Except.ok _v => Except.ok (Qed.Server.SrvLiftOpt.liftOpt (Inner := $innerTy) _v)
+                  | Except.error _e => Except.error (Qed.Server.SrvErr.ofApi (E := $errTy) _e))))
+            | none =>
+                `($callTerm >>= fun $rawId:ident => Pure.pure (some (Qed.Server.SrvUnwrap.unwrap (E := $errTy) $rawId)))
+          return ← wrapHoists mode ctx steps leaf
     if isFailCall retExpr then
-      unless pCtx.hasFallible do
-        throwErrorAt retExpr s!"`fail(...)` can only be returned from a fallible `T!` function (`{pCtx.fnName}` is not declared `-> ...!`)"
-      let (errTerm, steps) ← lowerExprCollectingHoists pCtx .val retExpr
-      wrapHoistsPure pCtx s₀ matCur steps (← liftM <| mkPureErrLeaf pCtx s₀ errTerm)
+      unless ctx.hasFallible do
+        throwErrorAt retExpr s!"`fail(...)` can only be returned from a fallible `T!` function (`{ctx.fnName}` is not declared `-> ...!`)"
+      let (errTerm, steps) ← lowerExprCollectingHoists ctx .val retExpr
+      wrapHoists mode ctx steps (← liftM <| mkErrLeaf mode ctx errTerm)
     else
-      let (valTerm, steps) ← lowerExprCollectingHoists pCtx .val retExpr
-      wrapHoistsPure pCtx s₀ matCur steps (← liftM <| mkPureLeaf pCtx matCur (← `(some $(← wrapOkValue pCtx valTerm))))
+      let (valTerm, steps) ← lowerExprCollectingHoists ctx .val retExpr
+      wrapHoists mode ctx steps (← liftM <| mkOkLeaf mode ctx valTerm)
 
-open Lean Elab Command in
-private def lowerPureLet (pCtx : LowerCtx) (s₀ sCur : Ident) (matCur : Term)
-    (stmt : Syntax) (rest : Array Syntax)
-    (recPure : LowerCtx → Ident → Array Syntax → LowerM Term) : LowerM Term := do
+private def lowerLet (mode : BlockMode) (ctx : LowerCtx) (stmt : Syntax) (rest : Array Syntax)
+    (recBlock : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
   let xStx := stmt.getArg 1
-  let rhsStx := stmt.getArg 4
+  let rhsRaw := stmt.getArg 4
   if let some catchNode ← extractSrvLetCatch? (stmt.getArg 5) then
     if catchNode.getKind == `Qed.Lang.catchArms then
       throwErrorAt catchNode "multi-arm `catch: case ...` is for client components; in server functions use `catch err:`"
+    let rhsStx := unwrapParens1 rhsRaw
     let binderStx := catchNode.getArg 0
     let catchStmts := suiteStmts (catchNode.getArg 2)
-    if rhsStx.getKind == ``qedAwait then
-      throwErrorAt rhsStx "`await` cannot be used inside a synchronous or `atomic` block"
-    let (rhsTerm, steps) ← lowerExprCollectingHoists pCtx .val rhsStx
     let errId : Ident := if binderStx.isIdent then ⟨binderStx⟩ else mkIdent `_srvCatchErr
-    let catchCtx := pushOptLocal pCtx binderStx
-    let okTerm ← recPure (pushOptLocal pCtx xStx) sCur rest
-    let body ← lowerCatchBody stmt catchCtx xStx errId rhsTerm okTerm catchStmts
-      bindSrvLetEq (recPure · sCur)
-    wrapHoistsPure pCtx s₀ matCur steps body
+    let catchCtx := pushOptLocal ctx binderStx
+    let okTerm ← recBlock (pushOptLocal ctx xStx) rest
+    let (scrutTerm, steps, awaitCall?) : Term × Array HoistedStep × Option (Term × Ident) ←
+      if rhsStx.getKind == ``qedAwait then
+        match mode with
+        | .pure .. => throwErrorAt rhsRaw "`await` cannot be used inside a synchronous or `atomic` block"
+        | .async _ =>
+            let (callTerm, steps) ← lowerExprCollectingHoists ctx .val (rhsStx.getArg 1)
+            let rawId ← freshIdent "_catchAw"
+            pure ((⟨rawId⟩ : Term), steps, some (callTerm, rawId))
+      else
+        let (rhsTerm, steps) ← lowerExprCollectingHoists ctx .val rhsStx
+        pure (rhsTerm, steps, none)
+    let innerTerm ← lowerCatchBody stmt catchCtx xStx errId scrutTerm okTerm catchStmts (bindLet mode) recBlock
+    let awaitedTerm ← match awaitCall? with
+      | some (callTerm, rawId) => `($callTerm >>= fun $rawId:ident => $innerTerm)
+      | none                   => pure innerTerm
+    wrapHoists mode ctx steps awaitedTerm
   else
-    let (rhsTerm, steps) ← lowerExprCollectingHoists pCtx .val rhsStx
+    let (rhsTerm, steps) ← lowerExprCollectingHoists ctx .val rhsRaw
     let checkedRhs ← if steps.isEmpty then `(srvRejectUnhandledErr($rhsTerm)) else pure rhsTerm
-    let cont ← recPure (pushOptLocal pCtx xStx) sCur rest
-    wrapHoistsPure pCtx s₀ matCur steps (← bindSrvLetEq xStx checkedRhs cont)
+    let cont ← recBlock (pushOptLocal ctx xStx) rest
+    wrapHoists mode ctx steps (← bindLet mode xStx checkedRhs cont)
 
-open Lean Elab Command in
-private def lowerPureMutationStmt (pCtx : LowerCtx) (s₀ sCur : Ident) (matCur : Term)
+private def lowerPureMutationStmt (mode : BlockMode) (pCtx : LowerCtx) (sCur : Ident)
     (stmt : Syntax) (rest : Array Syntax)
-    (recPure : LowerCtx → Ident → Array Syntax → LowerM Term) : LowerM Term := do
+    (recPure : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
   rejectSrvAssignPredict stmt
   let lowerMut (lvalStx : Syntax) (steps : Array HoistedStep)
       (mkLeaf : Array LValStep → Term → LowerM Term) : LowerM Term := do
@@ -956,11 +937,11 @@ private def lowerPureMutationStmt (pCtx : LowerCtx) (s₀ sCur : Ident) (matCur 
     let curRoot ← resolveStateFieldBase lvalStx pCtx rootField.getId
     let fNext ← freshIdent s!"_fld_{rootField.getId}_"
     let hFNext ← freshIdent "_srvEq"
-    let cont ← recPure (setPureOverride pCtx sCur rootField.getId.toString fNext) sCur rest
+    let cont ← recPure (setPureOverride pCtx sCur rootField.getId.toString fNext) rest
     let chain ← withUpdatedPathCPS pathSteps 0 curRoot (mkLeaf pathSteps) fun updatedRaw => do
       let updatedRoot ← if pathSteps.isEmpty then `(srvTypedAs(($sCur).$rootField:ident, $updatedRaw)) else pure updatedRaw
       `(Qed.Server.srvLetEq $updatedRoot (fun $fNext:ident $hFNext:ident => $cont))
-    wrapHoistsPure pCtx s₀ matCur steps chain
+    wrapHoists mode pCtx steps chain
   if stmt.getKind == ``qedStmtAssign then
     let opStr := ((stmt.getArg 1).reprint.getD "=").trimAscii.toString
     let (rhsTerm, steps) ← lowerExprCollectingHoists pCtx .val (stmt.getArg 2)
@@ -973,128 +954,39 @@ private def lowerPureMutationStmt (pCtx : LowerCtx) (s₀ sCur : Ident) (matCur 
       if pathSteps.isEmpty then `(srvAutoField($val)) else pure val
   else if let some (targetStx, elemStx) := matchPushCall? (stmt.getArg 0) then
     let (elemTerm, steps) ← lowerExprCollectingHoists pCtx .val elemStx
-    lowerMut targetStx steps fun _ curArr =>
-      `(($curArr).push (srvAutoField($elemTerm)))
+    lowerMut targetStx steps fun _ curArr => `(($curArr).push (srvAutoField($elemTerm)))
   else
     let some (targetStx, keyStx) := matchRemoveCall? (stmt.getArg 0) | unreachable!
     let (keyTerm, steps) ← lowerExprCollectingHoists pCtx .val keyStx
-    lowerMut targetStx steps fun _ curDict =>
-      `(Qed.Dict.remove $curDict $keyTerm)
+    lowerMut targetStx steps fun _ curDict => `(Qed.Dict.remove $curDict $keyTerm)
 
-open Lean Elab Command in
-partial def lowerPureBlock (ctx : LowerCtx) (inAtomic : Bool) (s₀ sCur : Ident)
-    (stmts : Array Syntax) : LowerM Term := do
-  let curOverrides := getPureOverrides ctx
-  let matCur ← liftM <| materializeState sCur curOverrides
-  if stmts.isEmpty then
-    return ← liftM <| mkPureLeaf ctx matCur (← `(none))
-  let stmt := stmts[0]!
-  let rest := stmts.extract 1 stmts.size
-  let k := stmt.getKind
-  let pCtx := { ctx with
-    stateRule := if ctx.stateFields.isEmpty then .statelessServer else .pureStep sCur curOverrides
-    allowAwait := false }
-  let recPure := fun c s st => lowerPureBlock c inAtomic s₀ s st
-  if k == ``qedStmtPass then
-    recPure pCtx sCur rest
-  else if let some (chId, rawArgs) := matchSrvEmitStmt? stmt then
-    let some esId := pCtx.emitAcc?
-      | throwErrorAt stmt "internal error: `emit` accumulator not initialized"
-    let (emitTerm, steps) ← lowerEmitCall pCtx stmt chId rawArgs
-    let esNext ← freshIdent "_es"
-    let cont ← recPure { pCtx with emitAcc? := some esNext } sCur rest
-    let body ← `(let $esNext:ident : List Qed.Server.WsEmit := $esId ++ [$emitTerm]; $cont)
-    wrapHoistsPure pCtx s₀ matCur steps body
-  else if k == `Qed.Server.atomicExport then
-    let expTerm : Term := ⟨stmt.getArg 0⟩
-    let wrapped ← if pCtx.wrapReturnSumInl then `(Except.ok (Sum.inr $expTerm)) else `(Except.ok $expTerm)
-    liftM <| mkPureLeaf pCtx matCur (← `(some $wrapped))
-  else if k == ``qedStmtAtomic then
-    if inAtomic then throwErrorAt stmt "nested `atomic` blocks are forbidden"
-    else if ctx.stateFields.isEmpty then throwErrorAt stmt "`atomic` is only valid in a `server` with `state` declarations"
-    else throwErrorAt stmt s!"redundant `atomic` block: `{ctx.fnName}` has no `await` calls, so it already executes atomically"
-  else if (matchTxStmt? stmt).isSome then
-    throwErrorAt stmt "cannot start a database `transaction` inside an `atomic:` block; run database transactions outside `atomic:`"
-  else if (matchSetCookieStmt? stmt).isSome then
-    throwErrorAt stmt "cannot call `setCookie`/`clearCookie` inside an `atomic:` block; emit cookies outside `atomic:`"
-  else if (matchSseSendStmt? stmt).isSome then
-    throwErrorAt stmt "cannot call `send(...)` inside an `atomic:` block; emit SSE events outside `atomic:`"
-  else if k == ``qedStmtReturn then
-    lowerPureReturn pCtx s₀ matCur stmt
-  else if k == ``qedStmtLet then
-    lowerPureLet pCtx s₀ sCur matCur stmt rest recPure
-  else if k == ``qedStmtAssign || (k == ``qedStmtExpr && ((matchPushCall? (stmt.getArg 0)).isSome || (matchRemoveCall? (stmt.getArg 0)).isSome)) then
-    lowerPureMutationStmt pCtx s₀ sCur matCur stmt rest recPure
-  else if k == ``qedStmtExpr then
-    let eStx := stmt.getArg 0
-    let (eTerm, steps) ← lowerExprCollectingHoists pCtx .val eStx
-    let cont ← recPure pCtx sCur rest
-    let valTerm ← if isBareUnwrapExpr false eStx then pure eTerm else `(srvEnsureUnit($eTerm))
-    let xId ← freshIdent "_srvDiscard"
-    let hEq ← freshIdent "_srvEq"
-    let body ← `(Qed.Server.srvLetEq $valTerm (fun $xId:ident $hEq:ident => $cont))
-    wrapHoistsPure pCtx s₀ matCur steps body
-  else if k == ``qedStmtIf then
-    let (condTerm, steps) ← lowerExprCollectingHoists pCtx .propGuard (stmt.getArg 1)
-    let hGuard ← freshIdent "_srvG"
-    let br ← lowerPureBranch pCtx sCur matCur rest (suiteStmts (stmt.getArg 3)) pCtx
-      (desugarElifs (stmt.getArg 4).getArgs (stmt.getArg 5)) true
-      (fun t e => `(if $hGuard:ident : $condTerm then $t else $e)) recPure
-    wrapHoistsPure pCtx s₀ matCur steps br
-  else if k == ``qedStmtIfLet then
-    let patStx := stmt.getArg 2
-    let patTerm ← liftMacroM (lowerQedPat patStx)
-    let patIds := (collectQedPatIds patStx).map (·.toString)
-    let (scrutTerm, steps) ← lowerExprCollectingHoists pCtx .val (stmt.getArg 4)
-    let thenCtx := { pCtx with locals := pCtx.locals ++ patIds }
-    let hMatch ← freshIdent "_srvM"
-    let br ← lowerPureBranch pCtx sCur matCur rest (suiteStmts (stmt.getArg 6)) thenCtx
-      (extractElseSuite (stmt.getArg 7)) false
-      (fun t e => `(match $hMatch:ident : $scrutTerm:term with | $patTerm => $t | _ => $e)) recPure
-    wrapHoistsPure pCtx s₀ matCur steps br
-  else if k == ``qedStmtMatch then
-    let (matchT, allSteps) ← lowerMatchScrutineesAndAlts pCtx stmt rest (recPure · sCur)
-    wrapHoistsPure pCtx s₀ matCur allSteps matchT
-  else
-    let sn := stxSnippet stmt
-    let what := if sn.isEmpty then s!"({k})" else s!" `{sn}`"
-    throwErrorAt stmt s!"unsupported statement{what} in server function `{ctx.fnName}`"
+private def stxMentionsName (name : String) (stx : Syntax) : Bool :=
+  stxAny (fun
+    | .ident _ _ v _ => match v.eraseMacroScopes.components with | root :: _ => root.toString == name | [] => false
+    | _ => false) stx
 
-/-! ## Stateless Pure/Async & Stateful Async Block Lowering (`lowerAsyncBlock`) -/
+private def stmtHasNonFailReturn (stx : Syntax) : Bool :=
+  stxAny (fun s => s.getKind == ``qedStmtReturn &&
+    ((s.getArg 1).getNumArgs == 0 || !isFailCall ((s.getArg 1).getArg 0))) stx
 
-private partial def stxMentionsName (name : String) (stx : Lean.Syntax) : Bool :=
-  match stx with
-  | .ident _ _ v _ =>
-      match v.eraseMacroScopes.components with
-      | root :: _ => root.toString == name
-      | [] => false
-  | .node _ _ args => args.any (stxMentionsName name)
-  | _ => false
-
-private partial def stmtHasNonFailReturn (stx : Lean.Syntax) : Bool :=
-  let k := stx.getKind
-  if k == ``qedStmtReturn then
-    (stx.getArg 1).getNumArgs == 0 || !isFailCall ((stx.getArg 1).getArg 0)
-  else stx.getArgs.any stmtHasNonFailReturn
-
-private def collectAtomicExports (atomStmts rest : Array Lean.Syntax) : Array Lean.Ident := Id.run do
-  let mut ids : Array Lean.Ident := #[]
+private def collectAtomicExports (atomStmts rest : Array Syntax) : Array Ident := Id.run do
+  let mut ids : Array Ident := #[]
   for s in atomStmts do
     if s.getKind == ``qedStmtLet && (s.getArg 1).isIdent then
-      let id : Lean.Ident := ⟨s.getArg 1⟩
+      let id : Ident := ⟨s.getArg 1⟩
       let nm := id.getId.eraseMacroScopes.toString
       if rest.any (stxMentionsName nm) then
         ids := ids.filter (·.getId.eraseMacroScopes.toString != nm) |>.push id
   ids
 
-open Lean Elab Command in
 private def mkAtomicExportTuple (ids : Array Ident) : CommandElabM Term := do
   let ts : Array Term := ids.map (⟨·.raw⟩)
   ts.foldrM (init := ts.back!) (start := ts.size - 1) fun a acc => `(($a, $acc))
 
-open Lean Elab Command in
 private def lowerScopedAtomicBody (stmt : Syntax) (atomCtx : LowerCtx) (stateTyTerm? : Option Term)
-    (atomStmts : Array Syntax) : LowerM (Term × Ident × Term × Bool × Bool) := do
+    (atomStmts : Array Syntax)
+    (lowerPure : LowerCtx → Ident → Ident → Array Syntax → LowerM Term) :
+    LowerM (Term × Ident × Term × Bool × Bool) := do
   let some stateTyTerm := stateTyTerm?
     | throwErrorAt stmt "`atomic` is only valid in a `server` with `state` declarations"
   if blockHasAwait atomStmts then
@@ -1105,56 +997,40 @@ private def lowerScopedAtomicBody (stmt : Syntax) (atomCtx : LowerCtx) (stateTyT
   let savedMut := (← get).mutated
   modify fun s => { s with mutated := #[] }
   let bodyCtx := if hasEmit then { atomCtx with emitAcc? := some es0Id } else atomCtx
-  let rawAtomBody ← lowerPureBlock bodyCtx (inAtomic := true) s0Id s0Id atomStmts
-  let atomBody ← if hasEmit then
-    `(let $es0Id:ident : List Qed.Server.WsEmit := []; $rawAtomBody)
-  else
-    pure rawAtomBody
+  let rawAtomBody ← lowerPure bodyCtx s0Id s0Id atomStmts
+  let atomBody ← if hasEmit then `(let $es0Id:ident : List Qed.Server.WsEmit := []; $rawAtomBody) else pure rawAtomBody
   let atomMut := (← get).mutated
   modify fun s => { s with mutated := savedMut ++ atomMut.filter (!savedMut.contains ·) }
   return (stateTyTerm, s0Id, atomBody, atomMut.isEmpty, hasEmit)
 
-open Lean Elab Command in
 private def emitAtomicRun (s0Id : Ident) (stateTyTerm atomBody : Term)
     (readOnly hasEmit isFinish : Bool) (onResult : Term → CommandElabM Term) : LowerM Term := do
+  let committed ← match isFinish, hasEmit, readOnly with
+    | true,  true,  _     => `(Qed.Server.srvFinishEmit $s0Id $atomBody)
+    | false, true,  _     => `(Qed.Server.srvAtomicCommitEmit $s0Id $atomBody)
+    | true,  false, _     => `(Qed.Server.srvFinish $s0Id $atomBody)
+    | false, false, true  => pure atomBody
+    | false, false, false => `(Qed.Server.srvAtomicCommit $s0Id $atomBody)
+  let runCall ← if readOnly then
+      `(Qed.Server.MonadAtomic.runAtomicRead (fun ($s0Id:ident : $stateTyTerm) => ($committed).2))
+    else
+      `(Qed.Server.MonadAtomic.runAtomic (fun ($s0Id:ident : $stateTyTerm) => $committed))
   if hasEmit then
     let pairId ← freshIdent "_atomPair"
-    let runCall ←
-      if isFinish then
-        if readOnly then
-          `(Qed.Server.MonadAtomic.runAtomicRead (fun ($s0Id:ident : $stateTyTerm) => (Qed.Server.srvFinishEmit $s0Id $atomBody).2))
-        else
-          `(Qed.Server.MonadAtomic.runAtomic (fun ($s0Id:ident : $stateTyTerm) => Qed.Server.srvFinishEmit $s0Id $atomBody))
-      else
-        if readOnly then
-          `(Qed.Server.MonadAtomic.runAtomicRead (fun ($s0Id:ident : $stateTyTerm) => (Qed.Server.srvAtomicCommitEmit $s0Id $atomBody).2))
-        else
-          `(Qed.Server.MonadAtomic.runAtomic (fun ($s0Id:ident : $stateTyTerm) => Qed.Server.srvAtomicCommitEmit $s0Id $atomBody))
     `($runCall >>= fun $pairId:ident =>
         Qed.Server.flushWsEmits ($pairId).2 >>= fun _ =>
         $(← liftM <| onResult (← `(($pairId).1))))
   else
     let resId ← freshIdent "_atomRes"
-    let runCall ←
-      if isFinish then
-        if readOnly then
-          `(Qed.Server.MonadAtomic.runAtomicRead (fun ($s0Id:ident : $stateTyTerm) => (Qed.Server.srvFinish $s0Id $atomBody).2))
-        else
-          `(Qed.Server.MonadAtomic.runAtomic (fun ($s0Id:ident : $stateTyTerm) => Qed.Server.srvFinish $s0Id $atomBody))
-      else
-        if readOnly then
-          `(Qed.Server.MonadAtomic.runAtomicRead (fun ($s0Id:ident : $stateTyTerm) => ($atomBody).2))
-        else
-          `(Qed.Server.MonadAtomic.runAtomic (fun ($s0Id:ident : $stateTyTerm) => Qed.Server.srvAtomicCommit $s0Id $atomBody))
     `($runCall >>= fun $resId:ident => $(← liftM <| onResult ⟨resId.raw⟩))
 
-open Lean Elab Command in
 private def lowerAtomicStmt (aCtx : LowerCtx) (stateTyTerm? : Option Term)
     (stmt : Syntax) (rest : Array Syntax)
+    (lowerPure : LowerCtx → Ident → Ident → Array Syntax → LowerM Term)
     (lowerRest : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
   let atomStmts := suiteStmts (stmt.getArg 2)
   if blockAlwaysReturns atomStmts then
-    let (stateTyTerm, s0Id, atomBody, readOnly, hasEmit) ← lowerScopedAtomicBody stmt aCtx stateTyTerm? atomStmts
+    let (stateTyTerm, s0Id, atomBody, readOnly, hasEmit) ← lowerScopedAtomicBody stmt aCtx stateTyTerm? atomStmts lowerPure
     emitAtomicRun s0Id stateTyTerm atomBody readOnly hasEmit true fun res => `(Pure.pure (some $res))
   else
     let exportedIds := collectAtomicExports atomStmts rest
@@ -1166,7 +1042,7 @@ private def lowerAtomicStmt (aCtx : LowerCtx) (stateTyTerm? : Option Term)
         if hasEarlyOk then { aCtx with wrapReturnSumInl := true }
         else { aCtx with innerOptTy? := none, isOption := false }
       let (stateTyTerm, s0Id, atomBody, readOnly, hasEmit) ←
-        lowerScopedAtomicBody stmt atomCtx stateTyTerm? (atomStmts.push exportStmt)
+        lowerScopedAtomicBody stmt atomCtx stateTyTerm? (atomStmts.push exportStmt) lowerPure
       let contCtx := { aCtx with locals := aCtx.locals ++ exportedIds.map (·.getId.eraseMacroScopes.toString) }
       let cont ← lowerRest contCtx rest
       emitAtomicRun s0Id stateTyTerm atomBody readOnly hasEmit true fun res =>
@@ -1180,76 +1056,11 @@ private def lowerAtomicStmt (aCtx : LowerCtx) (stateTyTerm? : Option Term)
             | Except.error _e => Pure.pure (some (Except.error _e))
             | Except.ok $expTuple:term => $cont)
     else
-      let (stateTyTerm, s0Id, atomBody, readOnly, hasEmit) ← lowerScopedAtomicBody stmt aCtx stateTyTerm? atomStmts
+      let (stateTyTerm, s0Id, atomBody, readOnly, hasEmit) ← lowerScopedAtomicBody stmt aCtx stateTyTerm? atomStmts lowerPure
       let cont ← lowerRest aCtx rest
       emitAtomicRun s0Id stateTyTerm atomBody readOnly hasEmit false fun early =>
         `(match $early:term with | some _r => Pure.pure (some _r) | none => $cont)
 
-open Lean Elab Command in
-private def lowerAsyncReturn (aCtx : LowerCtx) (stmt : Syntax) : LowerM Term := do
-  if (stmt.getArg 1).getNumArgs == 0 then
-    `(Pure.pure (some $(← wrapOkValue aCtx (← `(())))))
-  else
-    let retExpr := (stmt.getArg 1).getArg 0
-    let uRet := unwrapParens1 retExpr
-    if uRet.getKind == ``qedAwait && !(unwrapParens1 (uRet.getArg 1)).isOfKind ``qedUnwrap then
-      unless aCtx.hasFallible do
-        throwErrorAt retExpr s!"`return await ...` without `catch` requires `{aCtx.fnName}` to have a fallible `T!` return type"
-      let (callTerm, steps) ← lowerExprCollectingHoists aCtx .val (uRet.getArg 1)
-      let rawId ← freshIdent "_retAw"
-      let errTy ← liftM <| errTyOf aCtx
-      let leaf ← match aCtx.innerOptTy? with
-        | some innerTy =>
-            `($callTerm >>= fun $rawId:ident => Pure.pure (some (match $rawId:ident with
-              | Except.ok _v => Except.ok (Qed.Server.SrvLiftOpt.liftOpt (Inner := $innerTy) _v)
-              | Except.error _e => Except.error (Qed.Server.SrvErr.ofApi (E := $errTy) _e))))
-        | none =>
-            `($callTerm >>= fun $rawId:ident => Pure.pure (some (Qed.Server.SrvUnwrap.unwrap (E := $errTy) $rawId)))
-      wrapHoistsAsync aCtx steps leaf
-    else if isFailCall retExpr then
-      unless aCtx.hasFallible do
-        throwErrorAt retExpr s!"`fail(...)` can only be returned from a fallible `T!` function (`{aCtx.fnName}` is not declared `-> ...!`)"
-      let (errTerm, steps) ← lowerExprCollectingHoists aCtx .val retExpr
-      wrapHoistsAsync aCtx steps (← `(Pure.pure (some (Except.error $errTerm))))
-    else
-      let (valTerm, steps) ← lowerExprCollectingHoists aCtx .val retExpr
-      wrapHoistsAsync aCtx steps (← `(Pure.pure (some $(← wrapOkValue aCtx valTerm))))
-
-open Lean Elab Command in
-private def lowerAsyncLet (aCtx : LowerCtx) (stmt : Syntax) (rest : Array Syntax)
-    (recAsync : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
-  let xStx := stmt.getArg 1
-  let rhsRaw := stmt.getArg 4
-  if let some catchNode ← extractSrvLetCatch? (stmt.getArg 5) then
-    if catchNode.getKind == `Qed.Lang.catchArms then
-      throwErrorAt catchNode "multi-arm `catch: case ...` is for client components; in server functions use `catch err:`"
-    let rhsStx := unwrapParens1 rhsRaw
-    let binderStx := catchNode.getArg 0
-    let catchStmts := suiteStmts (catchNode.getArg 2)
-    let errId : Ident := if binderStx.isIdent then ⟨binderStx⟩ else mkIdent `_srvCatchErr
-    let catchCtx := pushOptLocal aCtx binderStx
-    let okTerm ← recAsync (pushOptLocal aCtx xStx) rest
-    let (scrutTerm, steps, awaitCall?) : Term × Array HoistedStep × Option (Term × Ident) ←
-      if rhsStx.getKind == ``qedAwait then
-        let (callTerm, steps) ← lowerExprCollectingHoists aCtx .val (rhsStx.getArg 1)
-        let rawId ← freshIdent "_catchAw"
-        pure ((⟨rawId⟩ : Term), steps, some (callTerm, rawId))
-      else
-        let (rhsTerm, steps) ← lowerExprCollectingHoists aCtx .val rhsStx
-        pure (rhsTerm, steps, none)
-    let innerTerm ← lowerCatchBody stmt catchCtx xStx errId scrutTerm okTerm catchStmts
-      (fun x v c => liftM <| bindOptIdent x v c) recAsync
-    let awaitedTerm ← match awaitCall? with
-      | some (callTerm, rawId) => `($callTerm >>= fun $rawId:ident => $innerTerm)
-      | none                   => pure innerTerm
-    wrapHoistsAsync aCtx steps awaitedTerm
-  else
-    let (rhsTerm, steps) ← lowerExprCollectingHoists aCtx .val rhsRaw
-    let checkedRhs ← if steps.isEmpty then `(srvRejectUnhandledErr($rhsTerm)) else pure rhsTerm
-    let cont ← recAsync (pushOptLocal aCtx xStx) rest
-    wrapHoistsAsync aCtx steps (← liftM <| bindOptIdent xStx checkedRhs cont)
-
-open Lean Elab Command in
 private def lowerOptArg (ctx : LowerCtx) (stepsRef : IO.Ref (Array HoistedStep))
     (arg? : Option Syntax) (wrap : Term → CommandElabM Term) (default : CommandElabM Term) :
     LowerM Term := do
@@ -1260,19 +1071,17 @@ private def lowerOptArg (ctx : LowerCtx) (stepsRef : IO.Ref (Array HoistedStep))
       liftM (wrap t)
   | none => liftM default
 
-open Lean Elab Command in
 private def lowerSetCookieCall (ctx : LowerCtx) (stmt : Syntax) (isClear : Bool) (rawArgs : Array Syntax) :
     LowerM (Term × Array HoistedStep) := do
   let validKeys := if isClear then none else some ["name", "value", "path", "httpOnly", "secure", "sameSite", "maxAge", "domain"]
-  let (posArgs, namedArgs) ← liftM <| splitPosNamedArgs (if isClear then "clearCookie" else "setCookie") rawArgs validKeys stmt
+  let (posArgs, namedArgs) ← splitCallArgs (if isClear then "clearCookie" else "setCookie") rawArgs validKeys (errRef := stmt)
   let findN (k : String) : Option Syntax := (namedArgs.find? (·.1 == k)).map Prod.snd
   let stepsRef ← IO.mkRef (#[] : Array HoistedStep)
   let reqArg (stx : Syntax) : LowerM Term := do
     let (t, hs) ← lowerExprCollectingHoists ctx .val stx
     stepsRef.modify (· ++ hs)
     return t
-  let optVal (k : String) (d : CommandElabM Term) : LowerM Term :=
-    lowerOptArg ctx stepsRef (findN k) pure d
+  let optVal (k : String) (d : CommandElabM Term) : LowerM Term := lowerOptArg ctx stepsRef (findN k) pure d
   let optSome (k : String) (ty : CommandElabM Term) : LowerM Term :=
     lowerOptArg ctx stepsRef (findN k) (fun t => do `(some ($t : $(← ty)))) `(none)
   if isClear then
@@ -1280,7 +1089,7 @@ private def lowerSetCookieCall (ctx : LowerCtx) (stmt : Syntax) (isClear : Bool)
       | throwErrorAt stmt "`clearCookie(name[, path = \"/\"])` requires a cookie name"
     let nameT ← reqArg nameStx
     let pathT ← lowerOptArg ctx stepsRef ((findN "path").orElse (fun _ => posArgs[1]?)) pure `("/")
-    return (← liftM (show CommandElabM Term from `(Qed.Server.SetCookie.clear $nameT $pathT)), ← stepsRef.get)
+    return (← `(Qed.Server.SetCookie.clear $nameT $pathT), ← stepsRef.get)
   else
     let some nameStx := posArgs[0]? |>.orElse (fun _ => findN "name")
       | throwErrorAt stmt "`setCookie(name, value, ...)` requires a cookie name"
@@ -1288,25 +1097,21 @@ private def lowerSetCookieCall (ctx : LowerCtx) (stmt : Syntax) (isClear : Bool)
       | throwErrorAt stmt "`setCookie(name, value, ...)` requires a cookie value"
     let nameT ← reqArg nameStx
     let valT ← reqArg valStx
-    let pathT ← optVal "path" `("/")
-    let httpOnlyT ← optVal "httpOnly" `(true)
-    let secureT ← optVal "secure" `(false)
-    let sameSiteT ← optVal "sameSite" `(Qed.Server.SameSite.lax)
-    let maxAgeT ← optSome "maxAge" `(Nat)
-    let domT ← optSome "domain" `(String)
-    let cTerm ← liftM (show CommandElabM Term from `({
-      name := $nameT, value := $valT, path := $pathT,
-      httpOnly := $httpOnlyT, sameSite := ($sameSiteT : Qed.Server.SameSite),
-      secure := $secureT, maxAge? := $maxAgeT, domain? := $domT
-      : Qed.Server.SetCookie }))
+    let cTerm ← `({
+      name := $nameT, value := $valT, path := $(← optVal "path" `("/")),
+      httpOnly := $(← optVal "httpOnly" `(true)),
+      sameSite := ($(← optVal "sameSite" `(Qed.Server.SameSite.lax)) : Qed.Server.SameSite),
+      secure := $(← optVal "secure" `(false)),
+      maxAge? := $(← optSome "maxAge" `(Nat)),
+      domain? := $(← optSome "domain" `(String))
+      : Qed.Server.SetCookie })
     return (cTerm, ← stepsRef.get)
 
-open Lean Elab Command in
 private def lowerSseSendCall (ctx : LowerCtx) (stmt : Syntax) (rawArgs : Array Syntax) :
     LowerM (Term × Array HoistedStep) := do
   unless ctx.isStreamRoute do
     throwErrorAt stmt "`send(...)` is only available inside `stream \"/...\":` routes"
-  let (posArgs, namedArgs) ← liftM <| splitPosNamedArgs "send" rawArgs (some ["data", "event", "id", "retry"]) stmt
+  let (posArgs, namedArgs) ← splitCallArgs "send" rawArgs (some ["data", "event", "id", "retry"]) (errRef := stmt)
   let findN (k : String) : Option Syntax := (namedArgs.find? (·.1 == k)).map Prod.snd
   let some dataStx := posArgs[0]? |>.orElse (fun _ => findN "data")
     | throwErrorAt stmt "`send(data[, event = ..., id = ..., retry = ...])` requires an event data string"
@@ -1317,18 +1122,14 @@ private def lowerSseSendCall (ctx : LowerCtx) (stmt : Syntax) (rawArgs : Array S
   stepsRef.modify (· ++ s1)
   let optSome (k : String) (ty : CommandElabM Term) : LowerM Term :=
     lowerOptArg ctx stepsRef (findN k) (fun t => do `(some ($t : $(← ty)))) `(none)
-  let eventT ← optSome "event" `(String)
-  let idT ← optSome "id" `(String)
-  let retryT ← optSome "retry" `(Nat)
-  let evTerm ← liftM (show CommandElabM Term from `({
-    data := $dataT, event := $eventT, id := $idT, retry := $retryT
-    : Qed.Server.SseEvent }))
+  let evTerm ← `({
+    data := $dataT, event := $(← optSome "event" `(String)),
+    id := $(← optSome "id" `(String)), retry := $(← optSome "retry" `(Nat))
+    : Qed.Server.SseEvent })
   return (evTerm, ← stepsRef.get)
 
-open Lean Elab Command in
 private def lowerTxStmt (aCtx : LowerCtx) (stmt aliasRef : Syntax) (aliasName : String)
-    (txStmts rest : Array Syntax)
-    (recAsync : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
+    (txStmts rest : Array Syntax) (recAsync : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
   let some (_, dbInfo) := aCtx.dbs.find? (·.1 == aliasName)
     | let avail := String.intercalate ", " (aCtx.dbs.toList.map Prod.fst)
       throwErrorAt aliasRef s!"unknown database alias `{aliasName}` in `transaction` (declared `use` databases: [{avail}])"
@@ -1336,102 +1137,143 @@ private def lowerTxStmt (aCtx : LowerCtx) (stmt aliasRef : Syntax) (aliasName : 
     throwErrorAt stmt s!"nested database transactions are not supported (already inside `{curAlias}.transaction:`)"
   let txId ← freshIdent "_dbTxId"
   let cfgId := mkIdentFrom aliasRef dbInfo.configConst
-  let txCtx := { aCtx with activeDbTx? := some (aliasName, txId) }
-  let bodyTerm ← recAsync txCtx txStmts
+  let bodyTerm ← recAsync { aCtx with activeDbTx? := some (aliasName, txId) } txStmts
   let txRun ← `(Qed.Server.dbRunTx $cfgId (fun ($txId:ident : UInt64) => $bodyTerm))
   modify fun s => { s with dbWrite := true }
-  if rest.isEmpty || blockAlwaysReturns txStmts then
-    return txRun
-  else
-    let cont ← recAsync aCtx rest
-    `(Qed.Server.srvSeqM $txRun (fun _ => $cont))
+  if rest.isEmpty || blockAlwaysReturns txStmts then return txRun
+  else `(Qed.Server.srvSeqM $txRun (fun _ => $(← recAsync aCtx rest)))
 
-open Lean Elab Command in
-partial def lowerAsyncBlock (ctx : LowerCtx) (stateTyTerm? : Option Term) (stmts : Array Syntax) :
-    LowerM Term := do
-  if stmts.isEmpty then
-    return ← `(Pure.pure none)
+private partial def lowerBlock (isPure : Bool) (inAtomic : Bool) (s₀ sCur : Ident)
+    (stateTyTerm? : Option Term) (ctx : LowerCtx) (stmts : Array Syntax) : LowerM Term := do
+  let curOverrides := getPureOverrides ctx
+  let mode ← if isPure then
+      pure (BlockMode.pure inAtomic s₀ sCur (← liftM <| materializeState sCur curOverrides))
+    else
+      pure (BlockMode.async stateTyTerm?)
+  if stmts.isEmpty then return ← liftM <| mkEmptyLeaf mode ctx
   let stmt := stmts[0]!
   let rest := stmts.extract 1 stmts.size
   let k := stmt.getKind
-  let aCtx := { ctx with
-    stateRule := if ctx.stateFields.isEmpty then .statelessServer else .forbidAsyncOutsideAtomic
-    allowAwait := true }
-  let recAsync := fun c st => lowerAsyncBlock c stateTyTerm? st
-  let lowerAsyncBranch (thenCtx : LowerCtx) (thenStmts : Array Syntax)
-      (elseStmts? : Option (Array Syntax)) (mkBranch : Term → Term → CommandElabM Term) : LowerM Term :=
-    lowerBranchCore rest thenCtx aCtx thenStmts elseStmts?
-      recAsync `(Pure.pure none) mkBranch
-      fun br => do
-        let cont ← recAsync aCtx rest
-        `(Qed.Server.srvSeqM $br (fun _ => $cont))
+  let bCtx := if isPure then
+      { ctx with
+        stateRule := if ctx.stateFields.isEmpty then .statelessServer else .pureStep sCur curOverrides
+        allowAwait := false }
+    else
+      { ctx with
+        stateRule := if ctx.stateFields.isEmpty then .statelessServer else .forbidAsyncOutsideAtomic
+        allowAwait := true }
+  let recSame := fun c st => lowerBlock isPure inAtomic s₀ sCur stateTyTerm? c st
+  let recWithState := fun c s st => lowerBlock isPure inAtomic s₀ s stateTyTerm? c st
+  let recAtomicPure := fun c s0 s st => lowerBlock true true s0 s none c st
   if k == ``qedStmtPass then
-    recAsync aCtx rest
+    recSame bCtx rest
   else if let some (chId, rawArgs) := matchSrvEmitStmt? stmt then
-    let (emitTerm, steps) ← lowerEmitCall aCtx stmt chId rawArgs
-    let evId ← freshIdent "_wsEv"
-    let cont ← recAsync aCtx rest
-    let body ← `(let $evId:ident := $emitTerm;
-      Qed.Server.MonadServer.wsBroadcast ($evId).topic ($evId).payload >>= fun _ => $cont)
-    wrapHoistsAsync aCtx steps body
+    let (emitTerm, steps) ← lowerEmitCall bCtx stmt chId rawArgs
+    let body ← match mode with
+      | .pure .. =>
+          let some esId := bCtx.emitAcc?
+            | throwErrorAt stmt "internal error: `emit` accumulator not initialized"
+          let esNext ← freshIdent "_es"
+          let cont ← recSame { bCtx with emitAcc? := some esNext } rest
+          `(let $esNext:ident : List Qed.Server.WsEmit := $esId ++ [$emitTerm]; $cont)
+      | .async _ =>
+          let evId ← freshIdent "_wsEv"
+          let cont ← recSame bCtx rest
+          `(let $evId:ident := $emitTerm;
+            Qed.Server.MonadServer.wsBroadcast ($evId).topic ($evId).payload >>= fun _ => $cont)
+    wrapHoists mode bCtx steps body
+  else if k == `Qed.Server.atomicExport && isPure then
+    let expTerm : Term := ⟨stmt.getArg 0⟩
+    let wrapped ← if bCtx.wrapReturnSumInl then `(Except.ok (Sum.inr $expTerm)) else `(Except.ok $expTerm)
+    let .pure _ _ _ matCur := mode | unreachable!
+    liftM <| mkPureLeaf bCtx matCur (← `(some $wrapped))
   else if let some (isClear, rawArgs) := matchSetCookieStmt? stmt then
-    let (cookieTerm, steps) ← lowerSetCookieCall aCtx stmt isClear rawArgs
-    let cont ← recAsync aCtx rest
-    let body ← `(Qed.Server.MonadServer.setCookie $cookieTerm >>= fun _ => $cont)
-    wrapHoistsAsync aCtx steps body
+    if isPure then
+      throwErrorAt stmt "cannot call `setCookie`/`clearCookie` inside an `atomic:` block; emit cookies outside `atomic:`"
+    let (cookieTerm, steps) ← lowerSetCookieCall bCtx stmt isClear rawArgs
+    let cont ← recSame bCtx rest
+    wrapHoists mode bCtx steps (← `(Qed.Server.MonadServer.setCookie $cookieTerm >>= fun _ => $cont))
   else if let some rawArgs := matchSseSendStmt? stmt then
-    let (evTerm, steps) ← lowerSseSendCall aCtx stmt rawArgs
-    let cont ← recAsync aCtx rest
-    let body ← `(Qed.Server.MonadServer.sendSse $evTerm >>= fun _ => $cont)
-    wrapHoistsAsync aCtx steps body
+    if isPure then
+      throwErrorAt stmt "cannot call `send(...)` inside an `atomic:` block; emit SSE events outside `atomic:`"
+    let (evTerm, steps) ← lowerSseSendCall bCtx stmt rawArgs
+    let cont ← recSame bCtx rest
+    wrapHoists mode bCtx steps (← `(Qed.Server.MonadServer.sendSse $evTerm >>= fun _ => $cont))
   else if let some (aliasRef, aliasName, txStmts) := matchTxStmt? stmt then
-    lowerTxStmt aCtx stmt aliasRef aliasName txStmts rest recAsync
+    if isPure then
+      throwErrorAt stmt "cannot start a database `transaction` inside an `atomic:` block; run database transactions outside `atomic:`"
+    lowerTxStmt bCtx stmt aliasRef aliasName txStmts rest recSame
   else if k == ``qedStmtAtomic then
-    lowerAtomicStmt aCtx stateTyTerm? stmt rest recAsync
+    if isPure then
+      if inAtomic then throwErrorAt stmt "nested `atomic` blocks are forbidden"
+      else if ctx.stateFields.isEmpty then throwErrorAt stmt "`atomic` is only valid in a `server` with `state` declarations"
+      else throwErrorAt stmt s!"redundant `atomic` block: `{ctx.fnName}` has no `await` calls, so it already executes atomically"
+    else
+      lowerAtomicStmt bCtx stateTyTerm? stmt rest recAtomicPure recSame
   else if k == ``qedStmtReturn then
-    lowerAsyncReturn aCtx stmt
+    lowerReturn mode bCtx stmt
   else if k == ``qedStmtLet then
-    lowerAsyncLet aCtx stmt rest recAsync
-  else if k == ``qedStmtAssign then
-    rejectSrvAssignPredict stmt
-    let _ ← parseLValPath aCtx (stmt.getArg 0)
-    throwErrorAt stmt s!"cannot mutate server state outside an `atomic:` block in `{ctx.fnName}` because `{ctx.fnName}` uses `await`"
+    lowerLet mode bCtx stmt rest recSame
+  else if k == ``qedStmtAssign || (k == ``qedStmtExpr && ((matchPushCall? (stmt.getArg 0)).isSome || (matchRemoveCall? (stmt.getArg 0)).isSome)) then
+    if isPure then
+      lowerPureMutationStmt mode bCtx sCur stmt rest recSame
+    else if k == ``qedStmtAssign then
+      rejectSrvAssignPredict stmt
+      let _ ← parseLValPath bCtx (stmt.getArg 0)
+      throwErrorAt stmt s!"cannot mutate server state outside an `atomic:` block in `{ctx.fnName}` because `{ctx.fnName}` uses `await`"
+    else if let some (targetStx, _) := matchPushCall? (stmt.getArg 0) then
+      let _ ← parseLValPath bCtx targetStx
+      throwErrorAt stmt s!"cannot call `.push(...)` on server state outside an `atomic:` block in `{ctx.fnName}` because `{ctx.fnName}` uses `await`"
+    else
+      let some (targetStx, _) := matchRemoveCall? (stmt.getArg 0) | unreachable!
+      let _ ← parseLValPath bCtx targetStx
+      throwErrorAt stmt s!"cannot call `.remove(...)` on server state outside an `atomic:` block in `{ctx.fnName}` because `{ctx.fnName}` uses `await`"
   else if k == ``qedStmtExpr then
     let eStx := stmt.getArg 0
-    if let some (targetStx, _) := matchPushCall? eStx then
-      let _ ← parseLValPath aCtx targetStx
-      throwErrorAt stmt s!"cannot call `.push(...)` on server state outside an `atomic:` block in `{ctx.fnName}` because `{ctx.fnName}` uses `await`"
-    else if let some (targetStx, _) := matchRemoveCall? eStx then
-      let _ ← parseLValPath aCtx targetStx
-      throwErrorAt stmt s!"cannot call `.remove(...)` on server state outside an `atomic:` block in `{ctx.fnName}` because `{ctx.fnName}` uses `await`"
-    else
-      let (eTerm, steps) ← lowerExprCollectingHoists aCtx .val eStx
-      let cont ← recAsync aCtx rest
-      let body ← if isBareUnwrapExpr true eStx then `(let _ := $eTerm; $cont) else `(let _ : Unit := srvEnsureUnit($eTerm); $cont)
-      wrapHoistsAsync aCtx steps body
+    let (eTerm, steps) ← lowerExprCollectingHoists bCtx .val eStx
+    let cont ← recSame bCtx rest
+    let body ← if isPure then
+        let valTerm ← if isBareUnwrapExpr false eStx then pure eTerm else `(srvEnsureUnit($eTerm))
+        let xId ← freshIdent "_srvDiscard"
+        let hEq ← freshIdent "_srvEq"
+        `(Qed.Server.srvLetEq $valTerm (fun $xId:ident $hEq:ident => $cont))
+      else
+        if isBareUnwrapExpr true eStx then `(let _ := $eTerm; $cont)
+        else `(let _ : Unit := srvEnsureUnit($eTerm); $cont)
+    wrapHoists mode bCtx steps body
   else if k == ``qedStmtIf then
-    let (condTerm, steps) ← lowerExprCollectingHoists aCtx .propGuard (stmt.getArg 1)
+    let (condTerm, steps) ← lowerExprCollectingHoists bCtx .propGuard (stmt.getArg 1)
     let hGuard ← freshIdent "_srvG"
-    let br ← lowerAsyncBranch aCtx (suiteStmts (stmt.getArg 3)) (desugarElifs (stmt.getArg 4).getArgs (stmt.getArg 5))
-      fun t e => `(if $hGuard:ident : $condTerm then $t else $e)
-    wrapHoistsAsync aCtx steps br
+    let br ← lowerBranch mode bCtx rest (suiteStmts (stmt.getArg 3)) bCtx
+      (desugarElifs (stmt.getArg 4).getArgs (stmt.getArg 5)) isPure
+      (fun t e => `(if $hGuard:ident : $condTerm then $t else $e)) recSame recWithState
+    wrapHoists mode bCtx steps br
   else if k == ``qedStmtIfLet then
     let patStx := stmt.getArg 2
     let patTerm ← liftMacroM (lowerQedPat patStx)
     let patIds := (collectQedPatIds patStx).map (·.toString)
-    let (scrutTerm, steps) ← lowerExprCollectingHoists aCtx .val (stmt.getArg 4)
-    let thenCtx := { aCtx with locals := aCtx.locals ++ patIds }
+    let (scrutTerm, steps) ← lowerExprCollectingHoists bCtx .val (stmt.getArg 4)
+    let thenCtx := { bCtx with locals := bCtx.locals ++ patIds }
     let hMatch ← freshIdent "_srvM"
-    let br ← lowerAsyncBranch thenCtx (suiteStmts (stmt.getArg 6)) (extractElseSuite (stmt.getArg 7))
-      fun t e => `(match $hMatch:ident : $scrutTerm:term with | $patTerm => $t | _ => $e)
-    wrapHoistsAsync aCtx steps br
+    let br ← lowerBranch mode bCtx rest (suiteStmts (stmt.getArg 6)) thenCtx
+      (extractElseSuite (stmt.getArg 7)) false
+      (fun t e => `(match $hMatch:ident : $scrutTerm:term with | $patTerm => $t | _ => $e)) recSame recWithState
+    wrapHoists mode bCtx steps br
   else if k == ``qedStmtMatch then
-    let (matchT, allSteps) ← lowerMatchScrutineesAndAlts aCtx stmt rest recAsync
-    wrapHoistsAsync aCtx allSteps matchT
+    let (matchT, allSteps) ← lowerMatchScrutineesAndAlts bCtx stmt rest recSame
+    wrapHoists mode bCtx allSteps matchT
   else
     let sn := stxSnippet stmt
     let what := if sn.isEmpty then s!"({k})" else s!" `{sn}`"
-    throwErrorAt stmt s!"unsupported statement{what} in async server function `{ctx.fnName}`"
+    let kindStr := if isPure then "server" else "async server"
+    throwErrorAt stmt s!"unsupported statement{what} in {kindStr} function `{ctx.fnName}`"
 
+def lowerPureBlock (ctx : LowerCtx) (inAtomic : Bool) (s₀ sCur : Ident) (stmts : Array Syntax) : LowerM Term :=
+  lowerBlock true inAtomic s₀ sCur none ctx stmts
+
+def lowerAsyncBlock (ctx : LowerCtx) (stateTyTerm? : Option Term) (stmts : Array Syntax) : LowerM Term :=
+  lowerBlock false false (mkIdent `_unused) (mkIdent `_unused) stateTyTerm? ctx stmts
+
+end BlockLowering
 
 end Qed.Server

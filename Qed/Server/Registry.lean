@@ -195,20 +195,10 @@ def parseReconnectExpr (exprStx : Syntax) : MacroM Reconnect := do
     else Macro.throwErrorAt u s!"unknown `reconnect` policy `{nm}`; use `off`, `fixed(ms[, max])`, or `backoff(initMs, maxMs[, max])`"
   else if u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent then
     let fn := ((u.getArg 0).getArg 0).getId.eraseMacroScopes
-    let rawArgs := (u.getArg 2).getSepArgs
-    let mut posArgs : Array Syntax := #[]
+    let (posArgs, namedArgs) ← splitCallArgsMacro "reconnect" (u.getArg 2).getSepArgs (some ["maxRetries", "max"])
     let mut maxRet? : Option (Option Nat) := none
-    for a in rawArgs do
-      if a.getKind == ``qedCallArgNamed then
-        let k := (a.getArg 0).getId.eraseMacroScopes
-        if k == `maxRetries || k == `max then
-          maxRet? := some (← parseOptNatLitArg (a.getArg 2))
-        else
-          Macro.throwErrorAt a s!"unknown `reconnect` named argument `{k}`; expected `maxRetries`"
-      else if a.getKind == ``qedCallArgPos then
-        posArgs := posArgs.push (a.getArg 0)
-      else
-        Macro.throwErrorAt a "unexpected argument in `reconnect` policy"
+    for (_, valStx) in namedArgs do
+      maxRet? := some (← parseOptNatLitArg valStx)
     if fn == `fixed then
       if posArgs.size == 1 then
         return .fixed (← parseNatLitArg posArgs[0]!) (maxRet?.getD none)
@@ -279,12 +269,10 @@ def isValidEnvVarName (s : String) : Bool :=
   !s.isEmpty && s.toList.all fun c =>
     ('A' ≤ c && c ≤ 'Z') || ('a' ≤ c && c ≤ 'z') || ('0' ≤ c && c ≤ '9') || c == '_'
 
-partial def exprCallsOld (stx : Lean.Syntax) : Bool :=
-  if stx.getKind == ``Qed.Lang.qedCall then
-    let callee := stx.getArg 0
-    if callee.getKind == ``Qed.Lang.qedIdent && (callee.getArg 0).getId.eraseMacroScopes == `old then true
-    else stx.getArgs.any exprCallsOld
-  else stx.getArgs.any exprCallsOld
+def exprCallsOld (stx : Lean.Syntax) : Bool :=
+  Qed.Lang.stxAny (fun s =>
+    s.getKind == ``Qed.Lang.qedCall && (s.getArg 0).getKind == ``Qed.Lang.qedIdent &&
+    ((s.getArg 0).getArg 0).getId.eraseMacroScopes == `old) stx
 
 /-! ## Persistent `database` Schema & Policy Registry (`databaseRegistry`) -/
 
@@ -334,24 +322,13 @@ structure DatabaseInfo where
   tables            : Array DbTableInfo
 deriving Inhabited, Repr
 
-private def lookupByConfig? {α : Type} [Inhabited α]
-    (ext : Lean.SimplePersistentEnvExtension α (Lean.NameMap α))
-    (env : Lean.Environment) (currNs : Lean.Name)
-    (openDecls : List Lean.OpenDecl) (ref : Lean.Name) : Option α :=
-  let reg := ext.getState env
-  let clean := ref.eraseMacroScopes
-  (reg.find? (currNs ++ clean)).orElse fun _ =>
-    (reg.find? clean).orElse fun _ =>
-      let resolved := Lean.ResolveName.resolveGlobalName env {} currNs openDecls (clean ++ `config)
-      resolved.findSome? fun (fullConst, _) => reg.find? fullConst.getPrefix
-
 initialize databaseRegistry :
     Lean.SimplePersistentEnvExtension DatabaseInfo (Lean.NameMap DatabaseInfo) ←
   Qed.Diag.mkNameMapExt (·.dbName)
 
 def lookupDatabase? (env : Lean.Environment) (currNs : Lean.Name)
     (openDecls : List Lean.OpenDecl) (dbRef : Lean.Name) : Option DatabaseInfo :=
-  lookupByConfig? databaseRegistry env currNs openDecls dbRef
+  Qed.Diag.lookupNameMapExt? databaseRegistry env currNs openDecls dbRef (some `config)
 
 /-! ## Persistent `auth` OIDC Configuration Registry (`authRegistry`) -/
 
@@ -373,7 +350,7 @@ initialize authRegistry :
 
 def lookupAuth? (env : Lean.Environment) (currNs : Lean.Name)
     (openDecls : List Lean.OpenDecl) (authRef : Lean.Name) : Option AuthInfo :=
-  lookupByConfig? authRegistry env currNs openDecls authRef
+  Qed.Diag.lookupNameMapExt? authRegistry env currNs openDecls authRef (some `config)
 
 open Lean Elab Command in
 def buildPropConj (ps : Array Term) : CommandElabM Term := do

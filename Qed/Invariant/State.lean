@@ -1,7 +1,4 @@
-import Qed.Lang
-import Qed.Diag
-import Qed.Collection
-import Lean
+import Qed.Verify.Core
 
 namespace Qed
 
@@ -16,103 +13,56 @@ instance {Model β : Type} : InvTarget (Model × β) Model := ⟨Prod.fst⟩
 @[simp] theorem InvTarget.proj_fst {Model β : Type} (p : Model × β) :
     InvTarget.proj p = p.1 := rfl
 
-syntax (name := invariantCmd)
-  "qedInternalInvariant " ident " : " term (" from " term)? " preserved_by " ident
-    (" using " "[" term,* "]")? (" := " term)? : command
+abbrev dictSimpNames : Array Lean.Name := Qed.Verify.Core.dictSimpNames
 
-open Lean Elab Tactic
+open Lean Elab Tactic Qed.Verify.Core
 
-private def collectMainConsts (includeLCtx : Bool) : TacticM (Std.HashSet Name) :=
-  withMainContext do
-    let mut s : Std.HashSet Name := {}
-    for c in (← instantiateMVars (← getMainTarget)).getUsedConstants do
-      s := s.insert c
-    if includeLCtx then
-      for ldecl in (← getLCtx) do
-        if !ldecl.isImplementationDetail then
-          for c in (← instantiateMVars ldecl.type).getUsedConstants do
-            s := s.insert c
-    return s
+private def boundaryLemmaGroups : Array (Name × Array Name) := #[
+  (``Array.size, #[``Array.size_push, ``Array.size_modify, ``Array.size_set, ``Array.size_pop,
+    ``Array.size_map, ``Array.size_append, ``Array.size_eraseIdx, ``Array.size_reverse,
+    ``Array.size_extract, ``Array.size_swap, ``Array.size_mergeSort]),
+  (``Array.sumBy, #[``Array.sumBy_empty, ``Array.sumBy_push, ``Array.sumBy_append, ``Array.sumBy_map,
+    ``Array.sumBy_reverse, ``Array.sumBy_mergeSort]),
+  (``Array.sumByInt, #[``Array.sumByInt_empty, ``Array.sumByInt_push, ``Array.sumByInt_append,
+    ``Array.sumByInt_map, ``Array.sumByInt_mergeSort]),
+  (``Array.countWhere, #[``Array.countWhere_empty, ``Array.countWhere_push, ``Array.countWhere_append,
+    ``Array.countWhere_reverse, ``Array.countWhere_mergeSort]),
+  (``Array.uniqueBy, #[``Array.uniqueBy_empty, ``Array.uniqueBy_push_iff]),
+  (``Array.isSortedBy, #[``Array.isSortedBy_empty, ``Array.isSortedBy_singleton, ``Array.isSortedBy_push_iff]),
+  (``List.length, #[``List.length_cons, ``List.length_append, ``List.length_map]),
+  (``Qed.Lang.QedSeqLit.ofList, #[``Qed.Lang.QedSeqLit.ofList_array, ``Qed.Lang.QedSeqLit.ofList_list]),
+  (``Qed.Lang.QedMem.mem, #[``Qed.Lang.QedMem.mem_array, ``Qed.Lang.QedMem.mem_list, ``Qed.Lang.QedMem.mem_string]),
+  (``Qed.Lang.QedMemProp.memProp, #[``Qed.Lang.QedMemProp.memProp_array, ``Qed.Lang.QedMemProp.memProp_list, ``Qed.Lang.QedMemProp.memProp_string]),
+  (``Qed.Lang.QedAndProp, #[``Qed.Lang.not_qedAndProp]),
+  (``Qed.Lang.QedOrProp, #[``Qed.Lang.not_qedOrProp])]
 
-private def pushIf (arr : Array Name) (cond : Bool) (ns : Array Name) : Array Name :=
-  if cond then arr ++ ns else arr
-
-private def relevantBoundaryLemmas (cs : Std.HashSet Name) : Array Name := Id.run do
-  let mut r : Array Name := #[``Qed.Lang.QedVal.val_id]
-  r := pushIf r (cs.contains ``Array.size)
-    #[``Array.size_push, ``Array.size_modify, ``Array.size_set, ``Array.size_pop,
-      ``Array.size_map, ``Array.size_append, ``Array.size_eraseIdx, ``Array.size_reverse,
-      ``Array.size_extract, ``Array.size_swap, ``Array.size_mergeSort]
-  r := pushIf r (cs.contains ``Array.sumBy)
-    #[``Array.sumBy_empty, ``Array.sumBy_push, ``Array.sumBy_append, ``Array.sumBy_map,
-      ``Array.sumBy_reverse, ``Array.sumBy_mergeSort]
-  r := pushIf r (cs.contains ``Array.sumByInt)
-    #[``Array.sumByInt_empty, ``Array.sumByInt_push, ``Array.sumByInt_append,
-      ``Array.sumByInt_map, ``Array.sumByInt_mergeSort]
-  r := pushIf r (cs.contains ``Array.countWhere)
-    #[``Array.countWhere_empty, ``Array.countWhere_push, ``Array.countWhere_append,
-      ``Array.countWhere_reverse, ``Array.countWhere_mergeSort]
-  r := pushIf r (cs.contains ``Array.uniqueBy)
-    #[``Array.uniqueBy_empty, ``Array.uniqueBy_push_iff]
-  r := pushIf r (cs.contains ``Array.isSortedBy)
-    #[``Array.isSortedBy_empty, ``Array.isSortedBy_singleton, ``Array.isSortedBy_push_iff]
-  r := pushIf r (cs.contains ``List.length)
-    #[``List.length_cons, ``List.length_append, ``List.length_map]
-  r := pushIf r (cs.contains ``Qed.Lang.QedSeqLit.ofList)
-    #[``Qed.Lang.QedSeqLit.ofList_array, ``Qed.Lang.QedSeqLit.ofList_list]
-  r := pushIf r (cs.contains ``Qed.Lang.QedMem.mem)
-    #[``Qed.Lang.QedMem.mem_array, ``Qed.Lang.QedMem.mem_list, ``Qed.Lang.QedMem.mem_string]
-  r := pushIf r (cs.contains ``Qed.Lang.QedMemProp.memProp)
-    #[``Qed.Lang.QedMemProp.memProp_array, ``Qed.Lang.QedMemProp.memProp_list, ``Qed.Lang.QedMemProp.memProp_string]
-  r := pushIf r (cs.contains ``Qed.Lang.QedAndProp) #[``Qed.Lang.not_qedAndProp]
-  r := pushIf r (cs.contains ``Qed.Lang.QedOrProp) #[``Qed.Lang.not_qedOrProp]
-  return r
+private def relevantBoundaryLemmas (cs : Std.HashSet Name) : Array Name :=
+  boundaryLemmaGroups.foldl (init := #[``Qed.Lang.QedVal.val_id]) fun acc (k, ns) =>
+    if cs.contains k then acc ++ ns else acc
 
 private def relevantAppLemmas (env : Environment) (cs : Std.HashSet Name) : Array Name := Id.run do
   let mut r : Array Name := #[``InvTarget.proj_id, ``InvTarget.proj_fst]
-  let hasApp := cs.contains `Qed.Internal.mkApp || cs.contains `Qed.Internal.mkRoutedApp ||
-    cs.contains `Qed.App.init || cs.contains `Qed.App.update ||
-    cs.contains `Qed.Internal.App.withDehydrate || cs.contains `Qed.Internal.App.withQueries ||
-    cs.contains `Qed.Internal.App.withSubscriptions || cs.contains `Qed.Internal.App.withStylesheets ||
-    cs.contains `Qed.Internal.App.withExtraStyles || cs.contains `Qed.App.withHead ||
-    cs.contains `Qed.App.withSsrStatus
+  let hasApp := #[`Qed.Internal.mkApp, `Qed.Internal.mkRoutedApp, `Qed.App.init, `Qed.App.update,
+    `Qed.Internal.App.withDehydrate, `Qed.Internal.App.withQueries, `Qed.Internal.App.withSubscriptions,
+    `Qed.Internal.App.withStylesheets, `Qed.Internal.App.withExtraStyles,
+    `Qed.App.withHead, `Qed.App.withSsrStatus].any cs.contains
   if hasApp then
-    r := r ++ (#[`Qed.Internal.mkApp_init, `Qed.Internal.mkApp_update,
-                 `Qed.Internal.mkRoutedApp_init, `Qed.Internal.mkRoutedApp_update,
-                 `Qed.Internal.App.withDehydrate_init, `Qed.Internal.App.withDehydrate_update,
-                 `Qed.Internal.App.withQueries_init, `Qed.Internal.App.withQueries_update,
-                 `Qed.Internal.App.withSubscriptions_init, `Qed.Internal.App.withSubscriptions_update,
-                 `Qed.Internal.App.withStylesheets_init, `Qed.Internal.App.withStylesheets_update,
-                 `Qed.Internal.App.withExtraStyles_init, `Qed.Internal.App.withExtraStyles_update,
-                 `Qed.App.withHead_init, `Qed.App.withHead_update,
-                 `Qed.App.withSsrStatus_init, `Qed.App.withSsrStatus_update,
-                 `Qed.Query.boot, `Qed.Query.wrap, `Qed.Resource.query, `Qed.Resource.rpcQuery,
-                 `Qed.Subscription.boot, `Qed.Subscription.wrap, `Qed.Subscription.boot_state_eq].filter env.contains)
+    r := r ++ appProjSimpNames env #["init", "update"] ++
+      #[`Qed.Query.boot, `Qed.Query.wrap, `Qed.Resource.query, `Qed.Resource.rpcQuery,
+        `Qed.Subscription.boot, `Qed.Subscription.wrap, `Qed.Subscription.boot_state_eq].filter env.contains
   if cs.contains `Qed.Cached.activate || cs.contains `Qed.Cached.all then
-    r := r ++ (#[`Qed.Cached.activate, `Qed.Cached.all_empty].filter env.contains)
+    r := r ++ #[`Qed.Cached.activate, `Qed.Cached.all_empty].filter env.contains
   return r
-
-def dictSimpNames : Array Name := #[
-  `Qed.Dict.emptyCollection_eq_empty, `Qed.Dict.getElem_eq_get,
-  `Qed.Lang.QedMem.mem_dict, `Qed.Lang.QedMemProp.memProp_dict,
-  `Qed.Dict.get_empty, `Qed.Dict.contains_empty, `Qed.Dict.size_empty, `Qed.Dict.isEmpty_empty,
-  `Qed.Dict.get_set, `Qed.Dict.get_set_self, `Qed.Dict.contains_set, `Qed.Dict.contains_set_self,
-  `Qed.Dict.get_remove, `Qed.Dict.get_remove_self, `Qed.Dict.contains_remove, `Qed.Dict.contains_remove_self,
-  `Qed.Dict.size_set, `Qed.Dict.isEmpty_iff_size
-]
 
 private def relevantOptResLemmas (env : Environment) (cs : Std.HashSet Name) : Array Name := Id.run do
   let mut r : Array Name := #[]
   if cs.contains `Qed.Cached.all || cs.contains `Qed.Resource.all then
-    r := r ++ (#[`Qed.Cached.all, `Qed.Resource.all].filter env.contains)
+    r := r ++ #[`Qed.Cached.all, `Qed.Resource.all].filter env.contains
   if cs.contains ``Qed.Lang.QedVal.val then
-    r := r ++ (#[`Qed.QedVal.val_field, `Qed.QedVal.val_ensured].filter env.contains)
-  if cs.contains `Qed.Codec.valid || cs.contains `Qed.Field then
-    r := r ++ (#[`Qed.Codec.valid, `Qed.Codec.refine, `Qed.Codec.jsonOnly,
-                 `Qed.Codec.text, `Qed.Codec.textarea, `Qed.Codec.nat,
-                 `Qed.Codec.int, `Qed.Codec.checkbox, `Qed.Codec.date].filter env.contains)
-  if cs.contains `Qed.Dict || cs.contains `Qed.Dict.size || cs.contains `Qed.Dict.get ||
-     cs.contains `Qed.Dict.set || cs.contains `Qed.Dict.remove || cs.contains `Qed.Dict.contains then
+    r := r ++ #[`Qed.QedVal.val_field, `Qed.QedVal.val_ensured].filter env.contains
+  if cs.contains `Qed.Codec.valid || cs.contains `Qed.Field || cs.contains `Qed.Ensured then
+    r := r ++ optCodecSimpNames.filter env.contains
+  if #[`Qed.Dict, `Qed.Dict.size, `Qed.Dict.get, `Qed.Dict.set, `Qed.Dict.remove, `Qed.Dict.contains].any cs.contains then
     r := r ++ dictSimpNames.filter env.contains
   return r
 
@@ -123,111 +73,37 @@ private def stripStepPrefix : Name → Name
       if p' == .anonymous then Name.mkSimple s else .str p' s
   | n => n
 
-private def toSimpLemmas (ts : Array Term) : TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) :=
-  ts.mapM fun t => `(Lean.Parser.Tactic.simpLemma| $t:term)
-
-private def namesToSimpLemmas (ns : Array Name) : TacticM (Array (TSyntax `Lean.Parser.Tactic.simpLemma)) :=
-  ns.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
-
 private def runUnfoldPresent (extra : Array Term) : TacticM Unit := do
-  if (← getGoals).isEmpty then return
+  let g :: _ ← getGoals | return
   let env0 ← getEnv
-  let cs ← collectMainConsts true
+  let cs ← collectGoalConsts g true
   let fixedNames := relevantAppLemmas env0 cs ++ relevantBoundaryLemmas cs
-  let fixedL := (← namesToSimpLemmas fixedNames) ++ (← toSimpLemmas extra)
+  let fixedL := (← namesToSimpLemmas fixedNames) ++ (← termsToSimpLemmas extra)
   qedUnfoldHelperLoop 12
     (fun env n => return qedIsHelper env n && (← getProjectionFnInfo? n).isNone)
     fixedL (includeLCtx := true) (useSimpAll := true)
-
-private def isTrivialNonFieldTy (ty : Expr) : Bool :=
-  ty.isSort || ty.isForall ||
-  ty.isConstOf ``Nat || ty.isConstOf ``Int || ty.isConstOf ``Bool || ty.isConstOf ``String ||
-  ty.isConstOf ``Unit ||
-  ty.isAppOfArity ``Eq 3 || ty.isAppOfArity ``LE.le 4 || ty.isAppOfArity ``LT.lt 4 ||
-  ty.isAppOfArity ``And 2 || ty.isAppOfArity ``Or 2 ||
-  ty.isAppOfArity ``Array 1 || ty.isAppOfArity ``List 1
 
 private def runAddFieldFacts : TacticM Unit := do
   let env ← getEnv
   unless env.contains `Qed.Field.ok || env.contains `Qed.Ensured.ok || env.contains `Qed.Dict.size_remove_le do return
   let g ← getMainGoal
-  let facts ← g.withContext do
-    let tgt ← instantiateMVars (← g.getType)
-    let mut scan : Array Expr := #[tgt]
-    for decl in (← getLCtx) do
-      if !decl.isImplementationDetail then
-        scan := scan.push (← instantiateMVars decl.type)
-    let factsRef ← IO.mkRef (#[] : Array Expr)
-    let seenRef ← IO.mkRef (#[] : Array Expr)
-    for e in scan do
-      e.forEach fun sub => do
-        if !sub.hasLooseBVars && (sub.isFVar || sub.isProj || sub.isApp) then
-          if sub.isAppOfArity `Qed.Dict.remove 5 && env.contains `Qed.Dict.size_remove_le then
-            if !(← seenRef.get).contains sub then
-              seenRef.modify (·.push sub)
-              let rArgs := sub.getAppArgs
-              if let some remLe ← try some <$> Meta.mkAppM `Qed.Dict.size_remove_le #[rArgs[3]!, rArgs[4]!] catch _ => pure none then
-                factsRef.modify (·.push remLe)
-          let rawTy? ← try some <$> Meta.inferType sub catch _ => pure none
-          if let some rawTy := rawTy? then
-            if isTrivialNonFieldTy rawTy then return
-            let ty ←
-              if rawTy.isAppOfArity `Qed.Field 2 || rawTy.isAppOfArity `Qed.Ensured 2 then pure rawTy
-              else try Meta.whnf rawTy catch _ => pure rawTy
-            if ty.isAppOfArity `Qed.Field 2 && env.contains `Qed.Field.ok then
-              if !(← seenRef.get).contains sub then
-                seenRef.modify (·.push sub)
-                if let some okP ← try some <$> Meta.mkAppM `Qed.Field.ok #[sub] catch _ => pure none then
-                  factsRef.modify (·.push okP)
-            else if ty.isAppOfArity `Qed.Ensured 2 && env.contains `Qed.Ensured.ok then
-              if !(← seenRef.get).contains sub then
-                seenRef.modify (·.push sub)
-                if let some okP ← try some <$> Meta.mkAppM `Qed.Ensured.ok #[sub] catch _ => pure none then
-                  factsRef.modify (·.push okP)
-    factsRef.get
-  for idx in [0:facts.size] do
-    let fPrf := facts[idx]!
-    let g ← getMainGoal
-    let fTy ← g.withContext (Meta.inferType fPrf)
-    let (_, g') ← (← g.assert (Name.mkSimple s!"_qedFld{idx}") fTy fPrf).intro1P
-    replaceMainGoal [g']
+  let (g', _) ← collectAndAssertFacts g "_qedFld" {
+    includeFin := false
+    includeDictRemove := true
+    rounds := 1
+  }
+  replaceMainGoal [g']
 
-private def runFastClose : TacticM Unit := withMainContext do
-  let g ← getMainGoal
-  let tgt ← instantiateMVars (← g.getType)
-  if tgt.isConstOf ``True then
-    g.assign (mkConst ``True.intro)
-    replaceMainGoal []
-    return
-  let closed ← Meta.withTransparency .reducible do
-    if let some (_, lhs, rhs) := tgt.eq? then
-      if (← Meta.isDefEq lhs rhs) then
-        g.assign (← Meta.mkEqRefl lhs)
-        return true
-    for decl in (← getLCtx) do
-      if !decl.isImplementationDetail then
-        if (← Meta.isDefEq decl.type tgt) then
-          g.assign (mkFVar decl.fvarId)
-          return true
-    return false
-  if closed then
+private def runFastClose : TacticM Unit := do
+  if ← tryCloseTrivial (← getMainGoal) (reducibleOnly := true) then
     replaceMainGoal []
   else
     throwError "qedFastClose: not trivially closed"
 
 private def runDestructExistsHyps : TacticM Unit := do
-  for _ in [0:16] do
-    let g :: rem ← getGoals | return
-    let mut splitFv? : Option FVarId := none
-    for decl in (← g.withContext getLCtx) do
-      if splitFv?.isNone && !decl.isImplementationDetail && !decl.isLet then
-        if (← g.withContext (Meta.whnf decl.type)).isAppOfArity ``Exists 2 then
-          splitFv? := some decl.fvarId
-    match splitFv? with
-    | some fv =>
-        let subgoals ← g.cases fv
-        setGoals (subgoals.toList.map (·.mvarId) ++ rem)
-    | none => break
+  let g :: rem ← getGoals | return
+  let (g', _) ← splitAndHypsGoal g (existsOnly := true) (maxIters := 16)
+  setGoals (g' :: rem)
 
 private def mkPredUnfold (pred : Term) : TacticM (Term × TSyntax `tactic) := do
   let pred := match pred with | `(($p)) => p | p => p
@@ -236,28 +112,18 @@ private def mkPredUnfold (pred : Term) : TacticM (Term × TSyntax `tactic) := do
     else `(tactic| skip)
   return (pred, unfoldPred)
 
-private def throwUnsolvedInvGoals (nm : Ident) (hdr footer : MessageData) : TacticM Unit := do
-  let goals ← getUnsolvedGoals
-  unless goals.isEmpty do
-    let mut lines : Array String := #[]
-    for g in goals do
-      let line ← g.withContext do
-        let tagLabel := Qed.Diag.formatCaseTag (stripStepPrefix (← g.getTag))
-        let ty ← instantiateMVars (← g.getType)
-        let tgt ← Qed.Diag.ppQedExpr ty ["m"]
-        let env ← getEnv
-        let present ← (ty.getUsedConstants.filter (qedIsHelper env)).filterM
-          (fun n => return (← getProjectionFnInfo? n).isNone)
-        let involves := if present.isEmpty then ""
-          else s!"\n    (involves helper: {String.intercalate ", " (present.toList.map toString)})"
-        pure s!"  • {tagLabel} must satisfy:  {tgt}{involves}"
-      unless lines.contains line do
-        lines := lines.push line
-    let maxShown := 6
-    let shown := lines.extract 0 (min lines.size maxShown)
-    let extra := if lines.size > maxShown then s!"\n  • (+ {lines.size - maxShown} more failing branch(es))" else ""
-    let body := String.intercalate "\n" shown.toList ++ extra
-    throwErrorAt nm m!"{hdr}\n{body}\n\n{footer}"
+private def throwUnsolvedInvGoals (nm : Ident) (hdr footer : MessageData) : TacticM Unit :=
+  Qed.Diag.throwUnsolvedGoals hdr m!"\n\n{footer}" (ref? := some nm) (maxShown? := some 6)
+    (formatGoal? := some fun g => g.withContext do
+      let tagLabel := Qed.Diag.formatCaseTag (stripStepPrefix (← g.getTag))
+      let ty ← instantiateMVars (← g.getType)
+      let tgt ← Qed.Diag.ppQedExpr ty ["m"]
+      let env ← getEnv
+      let present ← (ty.getUsedConstants.filter (qedIsHelper env)).filterM
+        (fun n => return (← getProjectionFnInfo? n).isNone)
+      let involves := if present.isEmpty then ""
+        else s!"\n    (involves helper: {String.intercalate ", " (present.toList.map toString)})"
+      return some s!"  • {tagLabel} must satisfy:  {tgt}{involves}")
 
 elab "qedUnfoldPresent" "[" extra:term,* "]" : tactic => runUnfoldPresent extra.getElems
 elab "qedAddFieldFacts" : tactic => runAddFieldFacts
@@ -278,19 +144,31 @@ macro "qedAutoClose" : tactic => `(tactic|
     | (try (repeat' (apply And.intro)); all_goals (first | qedFastClose | omega | decide | (qedNonlinearClose; done) | grind); done)))
 
 private def runCloseStateGoal (extra : Array Term) : TacticM Unit := do
-  if (← getGoals).isEmpty then return
+  let g0 :: rest ← getGoals | return
   let env0 ← getEnv
-  let cs ← collectMainConsts true
+  let cs ← collectGoalConsts g0 true
   let relNames := relevantOptResLemmas env0 cs ++ relevantBoundaryLemmas cs
-  let relL := (← namesToSimpLemmas relNames) ++ (← toSimpLemmas extra)
-  if !relL.isEmpty then
-    try evalTactic (← `(tactic| simp_all only [$[$relL],*])) catch _ => pure ()
-  if (← getGoals).isEmpty then return
+  let g ← if extra.isEmpty then
+      if relNames.isEmpty then pure g0 else do
+        let ctx ← mkDynamicSimpCtx relNames
+        match ← trySimpAll g0 ctx with
+        | none    => setGoals rest; return
+        | some g' => setGoals (g' :: rest); pure g'
+    else do
+      let relL := (← namesToSimpLemmas relNames) ++ (← termsToSimpLemmas extra)
+      if !relL.isEmpty then
+        try evalTactic (← `(tactic| simp_all only [$[$relL],*])) catch _ => pure ()
+      let g' :: _ ← getGoals | return
+      pure g'
+  if ← tryCloseTrivial g (reducibleOnly := true) then
+    replaceMainGoal []; return
+  if ← tryDirectOmega g then
+    replaceMainGoal []; return
+  if ← tryDirectDecide g then
+    replaceMainGoal []; return
+  let relL := (← namesToSimpLemmas relNames) ++ (← termsToSimpLemmas extra)
   evalTactic (← `(tactic|
     first
-      | qedFastClose
-      | omega
-      | decide
       | (qedNonlinearClose; done)
       | (qedAutoClose; done)
       | (simp_all [$[$relL],*] <;> qedAutoClose; done)
@@ -302,7 +180,7 @@ private def runCloseCachedPut (extraL : Array Term) : TacticM Unit := do
   let anyCached ← gs0.anyM fun g =>
     return (← g.withContext (instantiateMVars (← g.getType))).getUsedConstants.contains `Qed.Cached.all
   unless anyCached do return
-  let extraSimpL ← toSimpLemmas extraL
+  let extraSimpL ← termsToSimpLemmas extraL
   for _ in [0:8] do
     let goals ← getGoals
     if goals.isEmpty then return
@@ -378,7 +256,7 @@ elab_rules : tactic
   | `(tactic| qedDischargePreserved [$[$usingL],*] $upd $nm $pred $[from $init]?) => do
     let (_, unfoldPred) ← mkPredUnfold pred
     let env0 ← getEnv
-    let cs0 ← collectMainConsts true
+    let cs0 ← collectGoalConsts (← getMainGoal) true
     let appL ← namesToSimpLemmas (relevantAppLemmas env0 cs0)
     let updL ← if upd.raw.isIdent
       then pure (#[← `(Lean.Parser.Tactic.simpLemma| $(⟨upd.raw⟩):term)] ++ appL)
@@ -407,8 +285,7 @@ elab_rules : tactic
     match init with
     | some initT =>
         let initTac ← mkInitTac usingL pred initT
-        let g0 ← getMainGoal
-        let gs ← g0.apply (mkConst ``And.intro)
+        let gs ← (← getMainGoal).apply (mkConst ``And.intro)
         match gs with
         | [gInit, gStep] =>
             gInit.setTag `init
@@ -428,18 +305,5 @@ elab_rules : tactic
     throwUnsolvedInvGoals nm
       m!"Invariant `{nm.getId}` failed in `{updName}`:"
       m!"Hint: Guard the failing branch with `if ...:`, fix the update, or weaken the invariant.\n      If the rule does hold, add `using [lemma]` or a manual `:= by` proof."
-
-macro_rules
-  | `(qedInternalInvariant $name:ident : $pred $[from $init]? preserved_by $upd:ident $[using [$ls,*]]? $[:= $pf:term]?) => do
-      let prop ← match init with
-        | some i => `(($pred) ($i) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)))
-        | none   => `(∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($upd m msg)))
-      match pf with
-      | some p => `(theorem $name:ident : $prop := $p)
-      | none   =>
-          let lems := ls.getD ⟨#[]⟩
-          match init with
-          | some i => `(theorem $name:ident : $prop := by qedDischargePreserved [$lems,*] $upd $name ($pred) from $i)
-          | none   => `(theorem $name:ident : $prop := by qedDischargePreserved [$lems,*] $upd $name ($pred))
 
 end Qed

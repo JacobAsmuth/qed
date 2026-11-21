@@ -1,11 +1,9 @@
 import Qed.Invariant.Predicates
 import Qed.Runtime.Verify
-import Qed.Lang
-import Qed.Diag
 
 namespace Qed
 
-open Lean Elab Tactic
+open Lean Elab Tactic Qed.Verify.Core
 
 private def runUnfoldViewHelpers : TacticM Unit :=
   -- Leave keyed component `.view` intact so `for_each … holds_in` can match the child contract.
@@ -100,8 +98,7 @@ private def runSplitFiniteEnums : TacticM Unit := do
         if let some e ← findFiniteEnumExpr (← getEnv) tgt then
           try
             if e.isFVar then
-              let subgoals ← g.cases e.fvarId!
-              return some (subgoals.toList.map (·.mvarId))
+              return some ((← g.cases e.fvarId!).toList.map (·.mvarId))
             else
               setGoals [g]
               let stx ← PrettyPrinter.delab e
@@ -114,7 +111,6 @@ private def runSplitFiniteEnums : TacticM Unit := do
       | none     => nextGoals := nextGoals ++ [g]
     setGoals nextGoals
     if !progress then break
-  -- Close or falsify any newly-ground goals created by the last split.
   let mut rem : List MVarId := []
   for g in (← getGoals) do
     let tgt ← g.withContext do instantiateMVars (← g.getType)
@@ -138,13 +134,16 @@ private def a11yReduceNames : Array Name := #[
   ``Qed.attrValue, ``Qed.hasAttr, ``Qed.hasNonBlankAttr
 ]
 
+private def styleLeafCoreNames : Array Name := #[
+  ``Qed.everyElement, ``Qed.everyElementL, ``Qed.attrClasses, ``Qed.attrRole, ``Qed.hasOneClass
+]
+
 private def styleReduceCoreNames : Array Name := #[
   ``Qed.roleHasOneOf, ``Qed.tagHasOneOf, ``Qed.roleHas, ``Qed.roleHasOnly,
   ``Qed.roleLacks, ``Qed.tagLacks, ``Qed.roleHasAll, ``Qed.tagHas, ``Qed.noConflictingStyles,
   ``Qed.hasRole, ``Qed.hasTag, ``Qed.both, ``Qed.either, ``Qed.exactlyOne,
-  ``Qed.allRolesOff, ``Qed.exactlyOneOf, ``Qed.exactlyOneOf.go, ``Qed.hasOneClass,
-  ``Qed.everyElement, ``Qed.everyElementL, ``Qed.attrClasses, ``Qed.attrRole
-] ++ a11yReduceNames ++ #[
+  ``Qed.allRolesOff, ``Qed.exactlyOneOf, ``Qed.exactlyOneOf.go
+] ++ styleLeafCoreNames ++ a11yReduceNames ++ #[
   ``Qed.Html.imgsHaveAlt_map, ``Qed.Html.buttonsAccessible_map, ``Qed.Html.validAriaRoles_map,
   ``Qed.Html.labelsAssociated_map, ``Qed.Html.noDuplicateIds_map, ``Qed.Html.headingsOrdered_map,
   ``Qed.Html.htmlHasLang_map, ``Qed.Html.a11yValid_map,
@@ -162,64 +161,51 @@ private def styleReduceOptNames : Array Name := #[
   `Qed.Attr.empty, `Qed.Html.ofOption, `Qed.toString_string, `Qed.withKey, `Qed.ToHref.toHref
 ] ++ Qed.qedForEachHelperNames ++ Qed.qedHtmlHelperNames
 
+private def styleLeafFastNames : Array Name :=
+  styleLeafCoreNames ++ boolConstSimpNames ++ #[
+    ``Bool.and_eq_true, ``Bool.or_eq_true, ``Bool.false_eq_true,
+    ``List.all_cons, ``List.all_nil, ``List.any_cons, ``List.any_nil,
+    ``beq_self_eq_true, ``eq_self, ``decide_true, ``decide_false
+  ]
+
 private def runStyleSimpPass : TacticM Unit := do
-  if (← getGoals).isEmpty then return
+  let g :: rest ← getGoals | return
   let env ← getEnv
-  let used ← withMainContext do
-    let mut s : Std.HashSet Name := {}
-    for c in (← instantiateMVars (← getMainTarget)).getUsedConstants do
-      s := s.insert c
-    return s
+  let used ← collectGoalConsts g false
   let optPresent := styleReduceOptNames.filter fun n => env.contains n && used.contains n
-  let allNames := styleReduceCoreNames ++ optPresent
-  let lems ← allNames.mapM fun n => `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
-  evalTactic (← `(tactic| simp only [$[$lems],*]))
+  let ctx ← mkDynamicSimpCtx optPresent (some ("styleReduceCore", styleReduceCoreNames)) (withEqns := false)
+  match ← simpGoalOnly g ctx with
+  | none    => setGoals rest
+  | some g' => setGoals (g' :: rest)
 
 private def isUnprovableFalseGoal (g : MVarId) : MetaM Bool := g.withContext do
   let tgt := (← instantiateMVars (← g.getType)).consumeMData
-  let isFalseEq :=
-    tgt.isFalse ||
-    match tgt.eq? with
+  let isFalseEq := tgt.isFalse || match tgt.eq? with
     | some (_, lhs, rhs) => lhs.consumeMData.isConstOf ``Bool.false && rhs.consumeMData.isConstOf ``Bool.true
     | none => false
   if !isFalseEq then return false
   for decl in (← getLCtx) do
-    if !decl.isImplementationDetail then
-      if (← Meta.isProp decl.type) then return false
+    if !decl.isImplementationDetail && (← Meta.isProp decl.type) then return false
   return true
 
 private def runStyleLeafClose (g : MVarId) : TacticM (List MVarId) := do
-  setGoals [g]
-  try evalTactic (← `(tactic| rfl)) catch _ => pure ()
-  if (← getGoals).isEmpty then return []
-  try evalTactic (← `(tactic|
-    (simp_all only [Qed.everyElement, Qed.everyElementL,
-                    Qed.attrClasses, Qed.attrRole, Qed.hasOneClass,
-                    Bool.true_and, Bool.and_true, Bool.false_and, Bool.and_false,
-                    Bool.true_or, Bool.or_true, Bool.false_or, Bool.or_false,
-                    Bool.not_true, Bool.not_false, Bool.and_eq_true, Bool.or_eq_true,
-                    Bool.false_eq_true, ite_true, ite_false, dite_true, dite_false,
-                    List.all_cons, List.all_nil, List.any_cons, List.any_nil,
-                    beq_self_eq_true, eq_self, decide_true, decide_false];
-     try rfl))) catch _ => pure ()
-  let gs1 ← getGoals
-  if gs1.isEmpty then return []
+  let s0 ← saveState
+  try g.refl; return [] catch _ => restoreState s0
+  let (fastCtx, _) ← mkCachedSimpCtx "styleLeafFast" styleLeafFastNames
+  let some g1 ← trySimpAll g fastCtx | return []
+  let s1 ← saveState
+  try g1.refl; return [] catch _ => restoreState s1
+  if ← isUnprovableFalseGoal g1 then return [g1]
+  let fullCtx ← mkSimpCtxWithBase (styleLeafCoreNames ++ a11yReduceNames) (cacheKey? := some "styleLeafFull")
+  let some g2 ← trySimpAll g1 fullCtx #[← Meta.Simp.getSimprocs] | return []
+  if ← tryDirectDecide g2 then return []
+  if ← tryDirectOmega g2 then return []
+  setGoals [g2]
+  try runCloseExhaustiveEnum catch _ => pure ()
   let mut rem : List MVarId := []
-  for g1 in gs1 do
-    if (← isUnprovableFalseGoal g1) then
-      rem := rem ++ [g1]
-      continue
-    setGoals [g1]
-    let leafLems ← (#[``Qed.everyElement, ``Qed.everyElementL,
-      ``Qed.attrClasses, ``Qed.attrRole, ``Qed.hasOneClass] ++ a11yReduceNames).mapM fun n =>
-        `(Lean.Parser.Tactic.simpLemma| $(mkIdent n):term)
-    try evalTactic (← `(tactic| (simp_all [$[$leafLems],*]; try decide; try omega))) catch _ => pure ()
-    for g2 in (← getGoals) do
-      setGoals [g2]
-      try runCloseExhaustiveEnum catch _ => pure ()
-      if !(← getGoals).isEmpty then
-        try evalTactic (← `(tactic| decide)) catch _ => pure ()
-      rem := rem ++ (← getGoals)
+  for g3 in (← getGoals) do
+    if ← tryDirectDecide g3 then continue
+    rem := rem ++ [g3]
   return rem
 
 private def runStyleReduce (view : Ident) : TacticM Unit := do
@@ -228,15 +214,13 @@ private def runStyleReduce (view : Ident) : TacticM Unit := do
   let mut rem : List MVarId := []
   for g0 in gs0 do
     if (← g0.withContext (instantiateMVars (← g0.getType))).isFalse then
-      rem := rem ++ [g0]
-      continue
+      rem := rem ++ [g0]; continue
     setGoals [g0]
     try evalTactic (← `(tactic| simp only [$view:ident])) catch _ => pure ()
     runSplitFiniteEnums
     for g1 in (← getGoals) do
       if (← g1.withContext (instantiateMVars (← g1.getType))).isFalse then
-        rem := rem ++ [g1]
-        continue
+        rem := rem ++ [g1]; continue
       setGoals [g1]
       runUnfoldViewHelpers
       try evalTactic (← `(tactic| first | rfl | ((repeat' split); all_goals rfl; done) | skip)) catch _ => pure ()
@@ -247,6 +231,34 @@ private def runStyleReduce (view : Ident) : TacticM Unit := do
       for g2 in (← getGoals) do
         rem := rem ++ (← runStyleLeafClose g2)
   setGoals rem
+
+private def a11yDiagTable : Array (String × (Name → String)) := #[
+  ("imgsHaveAlt",       fun v => s!"An `<img>` element in `{v}` is missing an `alt` attribute. Add `alt=\"...\"` (or `alt=\"\"` for decorative images)."),
+  ("buttonsAccessible", fun v => s!"A `<button>` or `<a>` element in `{v}` has no accessible name in some branch. Provide non-empty text, `aria-label`, `aria-labelledby`, `title`, or a child `<img>` with non-empty `alt`."),
+  ("validAriaRoles",    fun v => s!"An element in `{v}` has an unrecognized WAI-ARIA `role` attribute. Use a valid WAI-ARIA 1.2 role name."),
+  ("labelsAssociated",  fun v => s!"A `<label>` element in `{v}` neither has a non-empty `for` attribute nor wraps a form control (`<input>`, `<select>`, `<textarea>`)."),
+  ("noDuplicateIds",    fun v => s!"Two elements in `{v}` share the same `id` attribute in some branch. Ensure every non-empty `id` is unique."),
+  ("headingsOrdered",   fun v => s!"Headings in `{v}` skip a level (e.g. `<h1>` directly to `<h3>`). Use sequential heading levels."),
+  ("htmlHasLang",       fun v => s!"An `<html>` element in `{v}` is missing a non-empty `lang` attribute (e.g. `<html lang=\"en\">`)."),
+  ("a11yValid",         fun v => s!"An accessibility check failed in `{v}` (check `<img alt>`, `<button>`/`<a>` accessible names, WAI-ARIA `role`, `<label>` association, unique `id`s, heading order, and `<html lang>`).")
+]
+
+private def diagnoseStyling (predStr : String) (vName : Name) : String × String :=
+  let label := if a11yDiagTable.any (fun (k, _) => predStr.contains k)
+    then "Accessibility invariant" else "Styling invariant"
+  let diag := match a11yDiagTable.find? (fun (k, _) => predStr.contains k) with
+    | some (_, mk) => mk vName
+    | none =>
+        if predStr.contains "roleLacks" || predStr.contains "tagLacks" then
+          s!"A matching element in `{vName}` carries a forbidden style class in some branch. Remove that style from the matching element or guard it so it cannot apply there."
+        else if predStr.contains "exactlyOne" then
+          s!"In some branch of `{vName}`, either none or more than one of the listed roles carries the active style, a role is missing the inactive style, or one of the roles is not rendered."
+        else if (predStr.contains "hasRole" || predStr.contains "hasTag") &&
+                !(predStr.contains "roleHas" || predStr.contains "tagHas") then
+          s!"No element with the required `role`/tag is rendered in some branch of `{vName}`. Check every conditional branch of `{vName}`."
+        else
+          s!"Check that the matching `role`/tag is rendered and receives exactly one allowed style in every branch of `{vName}`."
+  (label, diag)
 
 private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM Unit := do
   evalTactic (← `(tactic| (intro m; try intro _qed_h_assume)))
@@ -268,52 +280,16 @@ private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM U
       runStyleReduce view
       rem := rem ++ (← getGoals)
     setGoals rem
-  let goals ← getUnsolvedGoals
-  unless goals.isEmpty do
-    let mut details : Array String := #[]
-    for g in goals do
-      let line ← g.withContext do
-        let s ← Qed.Diag.ppQedExpr (← g.getType) ["m"]
-        pure (if s == "False" || s == "false = true" then "" else s!"  • view must satisfy:  {s}")
-      if !line.isEmpty && !details.contains line then
-        details := details.push line
-    let extraBody := if details.isEmpty then "" else "\n" ++ String.intercalate "\n" details.toList
-    let predStr := predLit.getString
-    let vName := view.getId
-    let diagnosis :=
-      if predStr.contains "imgsHaveAlt" then
-        s!"An `<img>` element in `{vName}` is missing an `alt` attribute. Add `alt=\"...\"` (or `alt=\"\"` for decorative images)."
-      else if predStr.contains "buttonsAccessible" then
-        s!"A `<button>` or `<a>` element in `{vName}` has no accessible name in some branch. Provide non-empty text, `aria-label`, `aria-labelledby`, `title`, or a child `<img>` with non-empty `alt`."
-      else if predStr.contains "validAriaRoles" then
-        s!"An element in `{vName}` has an unrecognized WAI-ARIA `role` attribute. Use a valid WAI-ARIA 1.2 role name."
-      else if predStr.contains "labelsAssociated" then
-        s!"A `<label>` element in `{vName}` neither has a non-empty `for` attribute nor wraps a form control (`<input>`, `<select>`, `<textarea>`)."
-      else if predStr.contains "noDuplicateIds" then
-        s!"Two elements in `{vName}` share the same `id` attribute in some branch. Ensure every non-empty `id` is unique."
-      else if predStr.contains "headingsOrdered" then
-        s!"Headings in `{vName}` skip a level (e.g. `<h1>` directly to `<h3>`). Use sequential heading levels."
-      else if predStr.contains "htmlHasLang" then
-        s!"An `<html>` element in `{vName}` is missing a non-empty `lang` attribute (e.g. `<html lang=\"en\">`)."
-      else if predStr.contains "a11yValid" then
-        s!"An accessibility check failed in `{vName}` (check `<img alt>`, `<button>`/`<a>` accessible names, WAI-ARIA `role`, `<label>` association, unique `id`s, heading order, and `<html lang>`)."
-      else if predStr.contains "roleLacks" || predStr.contains "tagLacks" then
-        s!"A matching element in `{vName}` carries a forbidden style class in some branch. Remove that style from the matching element or guard it so it cannot apply there."
-      else if predStr.contains "exactlyOne" then
-        s!"In some branch of `{vName}`, either none or more than one of the listed roles carries the active style, a role is missing the inactive style, or one of the roles is not rendered."
-      else if (predStr.contains "hasRole" || predStr.contains "hasTag") &&
-              !(predStr.contains "roleHas" || predStr.contains "tagHas") then
-        s!"No element with the required `role`/tag is rendered in some branch of `{vName}`. Check every conditional branch of `{vName}`."
-      else
-        s!"Check that the matching `role`/tag is rendered and receives exactly one allowed style in every branch of `{vName}`."
-    let label :=
-      if predStr.contains "a11yValid" || predStr.contains "imgsHaveAlt" ||
-         predStr.contains "buttonsAccessible" || predStr.contains "validAriaRoles" ||
-         predStr.contains "labelsAssociated" || predStr.contains "noDuplicateIds" ||
-         predStr.contains "headingsOrdered" || predStr.contains "htmlHasLang" then
-        "Accessibility invariant"
-      else "Styling invariant"
-    throwErrorAt nm m!"{label} `{nm.getId}` failed in `{vName}`:\n  • `{predStr}` does not hold in every state{extraBody}\n\nHint: {diagnosis}"
+  let predStr := predLit.getString
+  let vName := view.getId
+  let (label, diagnosis) := diagnoseStyling predStr vName
+  Qed.Diag.throwUnsolvedGoals
+    m!"{label} `{nm.getId}` failed in `{vName}`:\n  • `{predStr}` does not hold in every state"
+    m!"\n\nHint: {diagnosis}"
+    (ref? := some nm)
+    (formatGoal? := some fun g => g.withContext do
+      let s ← Qed.Diag.ppQedExpr (← g.getType) ["m"]
+      return if s == "False" || s == "false = true" then none else some s!"  • view must satisfy:  {s}")
 
 elab "qedStyleReduce " view:ident : tactic => runStyleReduce view
 elab "qedDischargeStyling" view:ident nm:ident predLit:str : tactic =>

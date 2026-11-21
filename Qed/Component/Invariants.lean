@@ -63,37 +63,28 @@ private def elabForEachInlineInv (spec : ComponentSpec) (invStx : Syntax) (isSty
   let colField : Ident := ⟨(invStx.getArg 4)⟩
   let using? : Option Ident := if (invStx.getArg 6).getNumArgs == 2 then some ⟨((invStx.getArg 6).getArg 1)⟩ else none
   let pf? : Option Term := if (invStx.getArg 7).getNumArgs == 2 then some ⟨((invStx.getArg 7).getArg 1)⟩ else none
-  let (predToEmit, usingToEmit?) ← match using?, pf? with
-    | some u, _ => pure (pred, some u)
-    | none, some _ =>
+  let (predToEmit, childInv) ← match using? with
+    | some u => pure (pred, u)
+    | none =>
         unless pred.raw.isIdent do
-          throwErrorAt invStx "specify `using <ChildInvariant>` when proving a custom predicate"
+          let msg := if pf?.isSome
+            then "specify `using <ChildInvariant>` when proving a custom predicate"
+            else "specify `using <ChildInvariant>` for an inline `for_each` predicate"
+          throwErrorAt invStx msg
         let childInv : Ident := ⟨pred.raw⟩
-        let ep ← if isStyled then
-          liftTermElabM do
-            let cn ← realizeGlobalConstNoOverload childInv
-            Meta.forallTelescope (← getConstInfo cn).type fun _ body => do
-              let some lhs := body.eq?.map (·.2.1) | throwErrorAt childInv
-                "`{childInv}` doesn't look like a `… holds_in …` invariant"
-              PrettyPrinter.delab lhs.appFn!
-        else liftTermElabM (extractInvPred childInv)
-        pure (ep, some childInv)
-    | none, none =>
-        unless pred.raw.isIdent do
-          throwErrorAt invStx "specify `using <ChildInvariant>` for an inline `for_each` predicate"
-        pure (pred, none)
-  match isStyled, usingToEmit? with
-  | true,  some u => elabCommand (← `(qedInternalInvariant $invId : $predToEmit for_each $colField holds_in $viewId using $u $[:= $pf?]?))
-  | true,  none   =>
-      let pid : Ident := ⟨predToEmit.raw⟩
-      elabCommand (← `(qedInternalInvariant $invId : $pid for_each $colField holds_in $viewId))
-  | false, some u => elabCommand (← `(qedInternalInvariant $invId : $predToEmit for_each $colField preserved_by $updateId using $u $[:= $pf?]?))
-  | false, none   =>
-      let pid : Ident := ⟨predToEmit.raw⟩
-      elabCommand (← `(qedInternalInvariant $invId : $pid for_each $colField preserved_by $updateId))
-  if isStyled then return none
-  try
-    return some (← liftTermElabM (extractInvPred invId))
+        let ep ← liftTermElabM (if isStyled then extractViewInvPred childInv else extractInvPred childInv)
+        pure (ep, childInv)
+  if isStyled then
+    let rhs ← pf?.getDM `(by qedDischargeStyledForEach $viewId $colField $childInv $invId $predToEmit)
+    elabCommand (← `(command| set_option linter.unusedSimpArgs false in
+      theorem $invId:ident : ∀ m, ($predToEmit) ($viewId m) = true := $rhs))
+    return none
+  let rhs ← pf?.getDM `(by qedDischargeForEach $updateId $childInv $invId $predToEmit)
+  elabCommand (← `(command|
+    theorem $invId:ident :
+        ∀ m msg, (∀ c ∈ m.$colField, ($predToEmit) c) →
+                 (∀ c ∈ (InvTarget.proj ($updateId m msg)).$colField, ($predToEmit) c) := $rhs))
+  try return some (← liftTermElabM (extractInvPred invId))
   catch _ => return none
 
 private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : Ident)
@@ -110,17 +101,14 @@ private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : 
     elabCommand (← `(command| set_option linter.unusedSimpArgs false in
       theorem $invId:ident (p : $propsId) : ∀ m, ($vPred) ($viewId p m) = true := $rhs))
   else
-    let prop ← match assume? with
-      | some a =>
-          let P ← if a.raw.isIdent then try liftTermElabM (extractInvPred ⟨a.raw⟩) catch _ => pure a else pure a
-          `(∀ m, ($P) m → ($vPred) ($viewId m) = true)
-      | none => `(∀ m, ($vPred) ($viewId m) = true)
-    match pf? with
-    | some p => elabCommand (← `(theorem $invId:ident : $prop := $p))
-    | none   => elabCommand (← `(
-        set_option linter.unusedSimpArgs false in
-        theorem $invId:ident : $prop := by
-          qedDischargeStyling $viewId $invId $(Syntax.mkStrLit predStr)))
+    let assumePred? ← assume?.mapM fun a =>
+      if a.raw.isIdent then try liftTermElabM (extractInvPred ⟨a.raw⟩) catch _ => pure a else pure a
+    let prop ← match assumePred? with
+      | some P => `(∀ m, ($P) m → ($vPred) ($viewId m) = true)
+      | none   => `(∀ m, ($vPred) ($viewId m) = true)
+    let rhs ← pf?.getDM `(by qedDischargeStyling $viewId $invId $(Syntax.mkStrLit predStr))
+    elabCommand (← `(command| set_option linter.unusedSimpArgs false in
+      theorem $invId:ident : $prop := $rhs))
     let fullView ← liftCoreM (resolveGlobalConstNoOverload viewId)
     let compFull := fullView.getPrefix
     let appViewEqName := compFull ++ `app_view_eq
@@ -135,9 +123,8 @@ private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : 
           (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical, Qed.tagHasOneOf_canonical])
           (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical, Qed.tagHasOneOf_canonical]))
         let appViewFn := mkIdent `Qed.App.view
-        match assume? with
-        | some a =>
-            let P ← if a.raw.isIdent then try liftTermElabM (extractInvPred ⟨a.raw⟩) catch _ => pure a else pure a
+        match assumePred? with
+        | some P =>
             elabCommand (← `(command| set_option linter.unusedSimpArgs false in
               theorem $appInvId : ∀ m, ($P) $stateOfM → ($vPred) ($appViewFn $appId m) = true :=
                 fun m ha => ($congr).trans ($invId $stateOfM ha)))
@@ -166,12 +153,20 @@ private def elabStateInlineInv (spec : ComponentSpec) (invId : Ident)
     elabCommand (← `(theorem $invId:ident (p : $propsId) :
       ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($updateId p m msg)) := $rhs))
   else
-    let stepPf? ← pf?.mapM fun pf =>
-      if spec.mountable then
-        `(by exact ⟨by qedDischargeInit [$[$usingL],*] $initId $invId ($pred), $pf⟩)
-      else pure pf
-    let initOpt? : Option Term := if spec.mountable then some initId else none
-    elabCommand (← `(qedInternalInvariant $invId : $pred $[from $initOpt?]? preserved_by $updateId using [$[$usingL],*] $[ := $stepPf?]?))
+    let prop ← if spec.mountable
+      then `(($pred) ($initId) ∧ ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($updateId m msg)))
+      else `(∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($updateId m msg)))
+    let rhs ← match pf? with
+      | some pf =>
+          if spec.mountable then
+            `(by exact ⟨by qedDischargeInit [$[$usingL],*] $initId $invId ($pred), $pf⟩)
+          else pure pf
+      | none =>
+          if spec.mountable then
+            `(by qedDischargePreserved [$[$usingL],*] $updateId $invId ($pred) from $initId)
+          else
+            `(by qedDischargePreserved [$[$usingL],*] $updateId $invId ($pred))
+    elabCommand (← `(command| theorem $invId:ident : $prop := $rhs))
   return pred
 
 def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) :

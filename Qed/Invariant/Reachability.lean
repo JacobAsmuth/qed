@@ -69,39 +69,40 @@ theorem inv_nonvacuous_of_reachable {State Msg Out : Type} [InvTarget Out State]
 
 /-! ## Tactics & Standalone Commands (`reachable` / `witness`) -/
 
-open Lean Elab Tactic in
+private def reachBaseSimpNames : Array Lean.Name :=
+  #[``Qed.runTrace, ``Qed.InvTarget.proj_id, ``Qed.InvTarget.proj_fst, ``Qed.Lang.QedVal.val_id] ++
+  Qed.Verify.Core.dictSimpNames
+
+private def reachBoolSimpNames : Array Lean.Name :=
+  Qed.Verify.Core.boolSimpNames ++ #[``decide_eq_false_iff_not]
+
+open Lean Elab Tactic Qed.Verify.Core in
 elab "qedDischargeReachable" upd:term:max initT:term:max nm:ident labelLit:str : tactic => do
-  let mut unfoldL : Array (TSyntax `Lean.Parser.Tactic.simpLemma) := #[
-    ← `(Lean.Parser.Tactic.simpLemma| Qed.runTrace),
-    ← `(Lean.Parser.Tactic.simpLemma| Qed.InvTarget.proj_id),
-    ← `(Lean.Parser.Tactic.simpLemma| Qed.InvTarget.proj_fst),
-    ← `(Lean.Parser.Tactic.simpLemma| Qed.Lang.QedVal.val_id)
-  ]
-  let updInner := match upd with | `(($u)) => u | u => u
-  let initInner := match initT with | `(($i)) => i | i => i
-  if updInner.raw.isIdent then
-    unfoldL := unfoldL.push (← `(Lean.Parser.Tactic.simpLemma| $(⟨updInner.raw⟩):term))
-  if initInner.raw.isIdent then
-    unfoldL := unfoldL.push (← `(Lean.Parser.Tactic.simpLemma| $(⟨initInner.raw⟩):term))
-  let env0 ← getEnv
-  for dn in Qed.dictSimpNames.filter env0.contains do
-    unfoldL := unfoldL.push (← `(Lean.Parser.Tactic.simpLemma| $(mkIdent dn):term))
+  let mut dynNames : Array Name := #[]
+  for raw in #[upd, initT] do
+    let inner := match raw with | `(($u)) => u | u => u
+    if inner.raw.isIdent then
+      if let some cn ← try some <$> resolveGlobalConstNoOverload inner.raw catch _ => pure none then
+        dynNames := dynNames.push cn
   try
-    evalTactic (← `(tactic|
-      (simp only [$[$unfoldL],*];
-       qedUnfoldPresent [];
-       try simp only [Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
-         decide_eq_true_eq, decide_eq_false_iff_not, beq_iff_eq, bne_iff_ne] at *;
-       try (repeat' split);
-       all_goals (first | qedFastClose | decide | omega | rfl | (simp_all; first | decide | omega | rfl | qedAutoClose) | qedAutoClose))))
+    if let g :: rest ← getGoals then
+      let sCtx ← mkDynamicSimpCtx dynNames (some ("reachBase", reachBaseSimpNames))
+      setGoals (match ← simpGoalOnly g sCtx with | none => rest | some g' => g' :: rest)
+    evalTactic (← `(tactic| qedUnfoldPresent []))
+    let (bCtx, _) ← mkCachedSimpCtx "reachBool" reachBoolSimpNames
+    setGoals <| ← (← getGoals).filterMapM fun g => simpGoalAllHyps g bCtx
+    evalTactic (← `(tactic| try (repeat' split)))
+    let mut rem : List MVarId := []
+    for g in (← getGoals) do
+      if ← tryCloseBasic g then continue
+      setGoals [g]
+      try evalTactic (← `(tactic| first | (simp_all; first | decide | omega | rfl | qedAutoClose) | qedAutoClose)) catch _ => pure ()
+      rem := rem ++ (← getGoals)
+    setGoals rem
   catch _ => pure ()
-  let goals ← getUnsolvedGoals
-  unless goals.isEmpty do
-    let mut lines : Array String := #[]
-    for g in goals do
-      let s ← g.withContext (Qed.Diag.ppQedExpr (← instantiateMVars (← g.getType)) [])
-      unless lines.contains s do lines := lines.push s
-    let body := String.intercalate "\n" (lines.toList.map fun l => s!"  • must satisfy:  {l}")
-    throwErrorAt nm m!"Example `{nm.getId}` failed to prove `{labelLit.getString}`:\n{body}\n\nHint: Verify the action sequence reaches a state satisfying `{labelLit.getString}` (or strengthen the `where` preconditions for parametric examples)."
+  let lbl := labelLit.getString
+  Qed.Diag.throwUnsolvedGoals m!"Example `{nm.getId}` failed to prove `{lbl}`:"
+    m!"\n\nHint: Verify the action sequence reaches a state satisfying `{lbl}` (or strengthen the `where` preconditions for parametric examples)."
+    (ref? := some nm)
 
 end Qed

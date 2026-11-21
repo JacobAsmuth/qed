@@ -353,6 +353,71 @@ private def elabServerHttpRouteClause (priorRep priorUnrep : Nat)
     | $methodLit, $pathLit => $guardedRun)
   return some ((methodStr, pathStr), arm, extRoots)
 
+private partial def authHookStxHasAtomic (stx : Lean.Syntax) : Bool :=
+  stx.getKind == ``qedStmtAtomic || stx.getArgs.any authHookStxHasAtomic
+
+open Lean Elab Command in
+private def elabServerAuthHook (priorRep priorUnrep : Nat)
+    (srvName : Name) (hookLabel : String) (hookLeaf : Name) (hasState : Bool)
+    (stateId stateInvId ctxId : Ident)
+    (envIdents : Array Ident) (envTypes : Array Term)
+    (stateFieldNames envVarNames : Array String)
+    (dbBindings : Array (String × DatabaseInfo))
+    (invs : Array ParsedInv) (mutInvs : Array ParsedMutInv)
+    (chanSigs : Array SrvChanSig) (authDecl : ParsedAuthDecl)
+    (deferredProofs : IO.Ref (Array (CommandElabM Bool)))
+    (hc : Syntax) :
+    CommandElabM (Option (Term × Array Name)) := do
+  let paramIdent : Ident := ⟨hc.getArg 2⟩
+  let paramStr := paramIdent.getId.toString
+  if paramStr == "ctx" then
+    throwErrorAt paramIdent s!"`ctx` is already implicitly available as `RequestCtx` in `{hookLabel}`"
+  if envVarNames.contains paramStr then
+    throwErrorAt paramIdent s!"parameter `{paramStr}` in `{hookLabel}` shadows server `env` binding `{paramStr}`; rename the parameter"
+  if stateFieldNames.contains paramStr then
+    throwErrorAt paramIdent s!"parameter `{paramStr}` in `{hookLabel}` shadows server `state` field `{paramStr}`; rename the parameter"
+  let hookIdent := mkIdentFrom hc hookLeaf
+  let bodyStmts := ensureUnitReturn hookIdent (suiteStmts (hc.getArg 5))
+  let hasAwait := blockHasAwait bodyStmts
+  let hasAtomic := bodyStmts.any authHookStxHasAtomic
+  let isAsync := hasState && (hasAwait || hasAtomic)
+  let payloadTerm : Term ← `(Unit)
+  let errTyTerm : Term ← `(Qed.Server.ApiError)
+  let userTyId := mkIdentFrom paramIdent (authDecl.info.authName ++ `User)
+  let authUserVar := mkIdent `_authUser
+  let hAuthId := mkIdent `_hAuth
+  let hAuthEqId := mkIdent `_hAuthEq
+  let baseCtx : LowerCtx := {
+    fnName := hookLabel, stateFields := stateFieldNames, envVars := envVarNames, locals := #[paramStr]
+    stateRule := if hasState then .pureStep (mkIdent `_s0) else .statelessServer
+    allowAwait := if hasState then isAsync else hasAwait, allowUnwrap := true
+    hasFallible := true, isOption := false, innerOptTy? := none
+    domainErrTy? := none, channels := chanSigs, dbs := dbBindings
+  }
+  let allBinderIds := envIdents ++ #[ctxId, paramIdent, hAuthId, hAuthEqId]
+  let allBinderTys := envTypes ++ #[
+    ← `(Qed.Server.RequestCtx),
+    ← `($userTyId),
+    ← `(($ctxId).userId ≠ Option.none),
+    ← `(Option.some (($paramIdent).id) = ($ctxId).userId)
+  ]
+  let callArgs : Array Term :=
+    envIdents.map (⟨·.raw⟩) ++ #[⟨ctxId.raw⟩, ⟨authUserVar.raw⟩, ⟨hAuthId.raw⟩, ⟨hAuthEqId.raw⟩]
+  if hasState && !isAsync then
+    let some (re, _, er) ← elabServerPureFn priorRep priorUnrep srvName hookLabel hookIdent stateId stateInvId
+        allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
+        invs mutInvs stateFieldNames envVarNames none deferredProofs | return none
+    return some (re, er)
+  else if isAsync then
+    let some (re, _, er) ← elabServerAsyncFn priorRep priorUnrep srvName hookLabel hookIdent stateId stateInvId
+        allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
+        invs mutInvs stateFieldNames envVarNames none deferredProofs | return none
+    return some (re, er)
+  else
+    let some (_, _, hApp, er, _) ← elabStatelessHandler priorRep priorUnrep hookIdent srvName hookLeaf
+        allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts | return none
+    return some (hApp, er)
+
 open Lean Elab Command in
 private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun stx => do
   let srvIdent : Ident := ⟨(stx.getArg 1)⟩
@@ -429,9 +494,26 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
       parsed.jobClauses deferredProofs | return
   allExtRoots := allExtRoots ++ jobExtRoots.filter (!allExtRoots.contains ·)
 
+  let mut onCreateRun? : Option Term := none
+  let mut onSignInRun? : Option Term := none
+  if let some authDecl := parsed.authDecl? then
+    if let some cc := parsed.onCreateAccountClause? then
+      let some (re, er) ← elabServerAuthHook priorRep priorUnrep srvName "onCreateAccount" `_onCreateAccount
+          hasState stateId stateInvId ctxId envIdents envTypes stateFieldNames envVarNames
+          dbBindings parsed.invs parsed.mutInvs chanSigs authDecl deferredProofs cc | return
+      onCreateRun? := some re
+      allExtRoots := allExtRoots ++ er.filter (!allExtRoots.contains ·)
+    if let some sc := parsed.onSignInClause? then
+      let some (re, er) ← elabServerAuthHook priorRep priorUnrep srvName "onSignIn" `_onSignIn
+          hasState stateId stateInvId ctxId envIdents envTypes stateFieldNames envVarNames
+          dbBindings parsed.invs parsed.mutInvs chanSigs authDecl deferredProofs sc | return
+      onSignInRun? := some re
+      allExtRoots := allExtRoots ++ er.filter (!allExtRoots.contains ·)
+
   elabServerDispatchCmds srvIdent stateId initStateId stateInvId invInitId
     srvName fullSrvName srvShort hasState parsed.dbDecls parsed.envDecls allExtRoots methodInfos dispatchArms
     chanNames wsDispatchArms ctxId reqBytesId httpDispatchArms jobNames parsed.authDecl?
+    onCreateRun? onSignInRun?
 
   -- Launch all method & channel proof theorems together in one parallel wave after all inductives/defs.
   for runProof in (← deferredProofs.get) do

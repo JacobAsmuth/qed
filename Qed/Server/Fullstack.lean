@@ -205,12 +205,19 @@ def elabQedServerMain : CommandElab := fun stx => do
   let dispatchId := mkIdentFrom fsIdent (srvInfo.serverName ++ `dispatchM)
   let wsDispatchId := mkIdentFrom fsIdent (srvInfo.serverName ++ `wsDispatchM)
   let httpDispatchId := mkIdentFrom fsIdent (srvInfo.serverName ++ `httpDispatchM)
+  let authHookId := mkIdentFrom fsIdent (srvInfo.serverName ++ `authHookM)
   let hasWs := !srvInfo.channels.isEmpty
   let hasHttp := srvInfo.hasHttpRoutes
+  let hasAuthHooks := srvInfo.hasOnCreateAccount || srvInfo.hasOnSignIn
   let asyncNames : Array Term := srvInfo.methods.filterMap fun m =>
     if m.isAsync then some (Syntax.mkStrLit m.name) else none
   let blockingArg ← `(some #[$asyncNames,*])
   let dbCfgIds : Array Ident := srvInfo.databases.map fun c => mkIdentFrom fsIdent c
+  let primaryDbArg : Term ← match (dbCfgIds[0]? : Option Ident) with
+    | some dbId => `(Option.some $dbId:ident)
+    | none      => `(Option.none)
+  let mkBoolLit (b : Bool) : CommandElabM Term := if b then `(true) else `(false)
+  let hookFlagsArg ← `(($(← mkBoolLit srvInfo.hasOnCreateAccount), $(← mkBoolLit srvInfo.hasOnSignIn)))
   let initDbsId := mkIdent `Qed.Server.Native.initDatabases
   let mainId := mkIdent `main
   let getEnvId := mkIdent `Qed.Server.Prim.getEnv
@@ -230,10 +237,14 @@ def elabQedServerMain : CommandElab := fun stx => do
     let httpArg ← if hasHttp then
       `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $httpDispatchId))
     else `(none)
+    let authHookArg ← if hasAuthHooks then
+      `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $authHookId))
+    else `(none)
     `($runFnId
         $cliAppId $titleLit $shortLit $initStateId $secretsId
         (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $dispatchId)
-        port staticDir devMode numWorkers $wsArg $blockingArg $httpArg $jobsArg $authArg)
+        port staticDir devMode numWorkers $wsArg $blockingArg $httpArg $jobsArg $authArg
+        $authHookArg $hookFlagsArg $primaryDbArg)
   else
     let runFnId := mkIdent `Qed.Server.Native.runStatelessFullstack
     let wsArg ← if hasWs then
@@ -242,10 +253,14 @@ def elabQedServerMain : CommandElab := fun stx => do
     let httpArg ← if hasHttp then
       `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] => $httpDispatchId))
     else `(none)
+    let authHookArg ← if hasAuthHooks then
+      `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] => $authHookId))
+    else `(none)
     `($runFnId
         $cliAppId $titleLit $shortLit $secretsId
         (fun {m} [Monad m] [Qed.Server.MonadServer m] => $dispatchId)
-        port staticDir devMode numWorkers $wsArg $blockingArg $httpArg $jobsArg $authArg)
+        port staticDir devMode numWorkers $wsArg $blockingArg $httpArg $jobsArg $authArg
+        $authHookArg $hookFlagsArg $primaryDbArg)
   if dbCfgIds.isEmpty then
     elabCommand (← `(command|
       def $mainId:ident (args : List String) : IO UInt32 := do

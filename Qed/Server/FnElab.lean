@@ -150,16 +150,18 @@ structure ParsedAuthDecl where
   info         : AuthInfo
 
 structure ParsedServerBlock where
-  dbDecls     : Array ParsedDbDecl
-  authDecl?   : Option ParsedAuthDecl := none
-  envDecls    : Array ParsedEnvDecl
-  stateDecls  : Array ParsedStateDecl
-  mutInvs     : Array ParsedMutInv
-  invs        : Array ParsedInv
-  fnClauses   : Array Lean.Syntax
-  chanClauses : Array Lean.Syntax
-  httpClauses : Array Lean.Syntax := #[]
-  jobClauses  : Array Lean.Syntax := #[]
+  dbDecls                 : Array ParsedDbDecl
+  authDecl?               : Option ParsedAuthDecl := none
+  envDecls                : Array ParsedEnvDecl
+  stateDecls              : Array ParsedStateDecl
+  mutInvs                 : Array ParsedMutInv
+  invs                    : Array ParsedInv
+  fnClauses               : Array Lean.Syntax
+  chanClauses             : Array Lean.Syntax
+  httpClauses             : Array Lean.Syntax := #[]
+  jobClauses              : Array Lean.Syntax := #[]
+  onCreateAccountClause?  : Option Lean.Syntax := none
+  onSignInClause?         : Option Lean.Syntax := none
 
 open Lean Elab Command in
 def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean.Syntax) :
@@ -175,6 +177,8 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
   let mut chanClauses : Array Syntax := #[]
   let mut httpClauses : Array Syntax := #[]
   let mut jobClauses  : Array Syntax := #[]
+  let mut onCreateAccountClause? : Option Syntax := none
+  let mut onSignInClause?        : Option Syntax := none
   for c in clauses do
     let k := c.getKind
     if k == ``srvDbClause then
@@ -245,10 +249,25 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
       httpClauses := httpClauses.push c
     else if k == ``srvJobClause then
       jobClauses := jobClauses.push c
+    else if k == ``srvOnCreateAccountClause then
+      if onCreateAccountClause?.isSome then
+        throwErrorAt c s!"duplicate `onCreateAccount` hook in `server {srvName}`"
+      onCreateAccountClause? := some c
+    else if k == ``srvOnSignInClause then
+      if onSignInClause?.isSome then
+        throwErrorAt c s!"duplicate `onSignIn` hook in `server {srvName}`"
+      onSignInClause? := some c
     else
       throwErrorAt c "unexpected clause in `server` block"
-  if fnClauses.isEmpty && chanClauses.isEmpty && httpClauses.isEmpty && jobClauses.isEmpty then
-    throwErrorAt srvIdent s!"`server {srvName}` must declare at least one `def`, `channel`, `http`, `stream`, or `every` job"
+  if let some c := onCreateAccountClause? then
+    if authDecl?.isNone then
+      throwErrorAt c s!"`onCreateAccount` in `server {srvName}` requires `use auth : <Auth>`"
+  if let some c := onSignInClause? then
+    if authDecl?.isNone then
+      throwErrorAt c s!"`onSignIn` in `server {srvName}` requires `use auth : <Auth>`"
+  if fnClauses.isEmpty && chanClauses.isEmpty && httpClauses.isEmpty && jobClauses.isEmpty &&
+     onCreateAccountClause?.isNone && onSignInClause?.isNone then
+    throwErrorAt srvIdent s!"`server {srvName}` must declare at least one `def`, `channel`, `http`, `stream`, `every` job, or auth hook"
   let hasState := !stateDecls.isEmpty
   if !hasState && (!invs.isEmpty || !mutInvs.isEmpty) then
     throwErrorAt srvIdent s!"`server {srvName}` declares `invariant`s but has no `state` fields"
@@ -256,7 +275,7 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
     unless stateDecls.any (·.ident.getId == mi.fieldId.getId) do
       let avail := String.intercalate ", " (stateDecls.toList.map fun s => s!"`{s.ident.getId}`")
       throwErrorAt mi.fieldId s!"`invariant mutating {mi.fieldId.getId}` does not match any `state` field of `{srvName}` (`state` fields: {avail})"
-  return { dbDecls, authDecl?, envDecls, stateDecls, mutInvs, invs, fnClauses, chanClauses, httpClauses, jobClauses }
+  return { dbDecls, authDecl?, envDecls, stateDecls, mutInvs, invs, fnClauses, chanClauses, httpClauses, jobClauses, onCreateAccountClause?, onSignInClause? }
 
 section
 open Lean Elab Command
@@ -585,6 +604,47 @@ private def elabServerHttpDispatchCmd (srvIdent ctxId : Ident) (srvName : Name)
       $fullHttpBody))
 
 open Lean Elab Command in
+private def elabServerAuthHookDispatchCmd (srvIdent ctxId : Ident) (srvName : Name)
+    (envDecls : Array ParsedEnvDecl)
+    (atomicBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder))
+    (authDecl : ParsedAuthDecl)
+    (onCreateRun? onSignInRun? : Option Term) : CommandElabM Unit := do
+  let authHookId := mkIdentFrom srvIdent (srvName ++ `authHookM)
+  let hookKindVar := mkIdent `hookKind
+  let authUserVar := mkIdent `_authUser
+  let hFromCtxVar := mkIdent `_hFromCtx
+  let hAuthId := mkIdent `_hAuth
+  let hAuthEqId := mkIdent `_hAuthEq
+  let fromCtxId := mkIdentFrom srvIdent (authDecl.info.authName ++ `fromCtx)
+  let fromCtxUserIdThm := mkIdentFrom srvIdent (authDecl.info.authName ++ `fromCtx_userId)
+  let createBody ← match onCreateRun? with
+    | some t => pure t
+    | none   => `(Pure.pure (Except.ok ()))
+  let signInBody ← match onSignInRun? with
+    | some t => pure t
+    | none   => `(Pure.pure (Except.ok ()))
+  let innerMatch ← `(
+    match $hFromCtxVar:ident : $fromCtxId $ctxId with
+    | Option.none => Pure.pure (Except.error (Qed.Server.ApiError.unauthorized "missing authenticated user"))
+    | Option.some $authUserVar:ident =>
+        have $hAuthEqId:ident : Option.some (($authUserVar).id) = ($ctxId).userId :=
+          $fromCtxUserIdThm $ctxId $authUserVar $hFromCtxVar
+        have $hAuthId:ident : ($ctxId).userId ≠ Option.none := by
+          intro _hNone; rw [_hNone] at $hAuthEqId:ident; cases $hAuthEqId:ident
+        match $hookKindVar:ident with
+        | (0 : UInt8) => $createBody
+        | (1 : UInt8) => $signInBody
+        | _           => Pure.pure (Except.ok ()))
+  let fullBody ← wrapDispatchWithEnvDecls envDecls innerMatch
+  elabCommand (← `(command|
+    set_option linter.unusedVariables false in
+    def $authHookId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m]
+        $[$atomicBinders:bracketedBinder]*
+        ($ctxId:ident : Qed.Server.RequestCtx) ($hookKindVar:ident : UInt8) :
+        m (Except Qed.Server.ApiError Unit) :=
+      $fullBody))
+
+open Lean Elab Command in
 def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : Ident)
     (srvName fullSrvName : Name) (srvShort : String) (hasState : Bool)
     (dbDecls : Array ParsedDbDecl)
@@ -594,7 +654,9 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
     (ctxId reqBytesId : Ident)
     (httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[])
     (jobNames : Array String := #[])
-    (authDecl? : Option ParsedAuthDecl := none) : CommandElabM Unit := do
+    (authDecl? : Option ParsedAuthDecl := none)
+    (onCreateRun? : Option Term := none)
+    (onSignInRun? : Option Term := none) : CommandElabM Unit := do
   if hasState then
     let linThmId := mkIdentFrom srvIdent (srvName ++ `concurrent_linearizable)
     elabCommand (← `(command|
@@ -653,6 +715,10 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
   if !httpDispatchArms.isEmpty then
     elabServerHttpDispatchCmd srvIdent ctxId srvName envDecls atomicBinders httpDispatchArms
 
+  if let some authDecl := authDecl? then
+    if onCreateRun?.isSome || onSignInRun?.isSome then
+      elabServerAuthHookDispatchCmd srvIdent ctxId srvName envDecls atomicBinders authDecl onCreateRun? onSignInRun?
+
   modifyEnv fun env => serverRegistry.addEntry env {
     serverName := fullSrvName
     shortName := srvShort
@@ -666,6 +732,8 @@ def elabServerDispatchCmds (srvIdent stateId initStateId stateInvId invInitId : 
     databases := dbDecls.map (·.info.configConst)
     authName? := authDecl?.map (·.info.authName)
     authConfig? := authDecl?.map (·.info.configConst)
+    hasOnCreateAccount := onCreateRun?.isSome
+    hasOnSignIn := onSignInRun?.isSome
     hasHttpRoutes := !httpDispatchArms.isEmpty
   }
 

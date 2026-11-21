@@ -246,9 +246,10 @@ def elabAuthCmd : CommandElab := fun stx => do
         (fun ($tuplePat : $tupleTy) => ({ $[$fieldInits:structInstField],* } : $userTyId))
         (fun u => by cases u; rfl)))
 
-  -- 3. Generate `<Auth>.fromClaims` and `<Auth>.fromCtx`
+  -- 3. Generate `<Auth>.fromClaims`, `<Auth>.fromCtx`, and `<Auth>.fromCtx_userId`
   let fromClaimsId := mkIdentFrom authIdent (authName ++ `fromClaims)
   let fromCtxId := mkIdentFrom authIdent (authName ++ `fromCtx)
+  let fromCtxUserIdThm := mkIdentFrom authIdent (authName ++ `fromCtx_userId)
   let mut claimsInits : Array (TSyntax `Lean.Parser.Term.structInstField) := #[
     ← `(Lean.Parser.Term.structInstField| id := c.sub)
   ]
@@ -270,6 +271,12 @@ def elabAuthCmd : CommandElab := fun stx => do
       match ctx.userId with
       | some uid => some { $[$ctxInits:structInstField],* }
       | none     => none))
+  elabCommand (← `(command|
+    theorem $fromCtxUserIdThm (ctx : Qed.Server.RequestCtx) (u : $userTyId)
+        (h : $fromCtxId ctx = some u) : some u.id = ctx.userId := by
+      unfold $fromCtxId at h
+      cases hUid : ctx.userId <;> simp [hUid] at h
+      cases h; rfl))
 
   -- 4. Client-safe `Qed.Url` helpers (`loginUrl`, `logoutUrl`) usable directly in `<a href={...}>`
   let loginUrlId := mkIdentFrom authIdent (authName ++ `loginUrl)
@@ -279,7 +286,9 @@ def elabAuthCmd : CommandElab := fun stx => do
       let safe := Qed.Auth.sanitizeReturnTo (some returnTo)
       (Qed.Url.parse? ("/_qed/auth/login?returnTo=" ++ Qed.Auth.urlEncodeComponent safe)).getD Qed.Url.root))
   elabCommand (← `(command|
-    def $logoutUrlId : Qed.Url := ⟨"/_qed/auth/logout", by decide⟩))
+    def $logoutUrlId (returnTo : String := "/") : Qed.Url :=
+      let safe := Qed.Auth.sanitizeReturnTo (some returnTo)
+      (Qed.Url.parse? ("/_qed/auth/logout?returnTo=" ++ Qed.Auth.urlEncodeComponent safe)).getD Qed.Url.root))
 
   -- 5. Server-only config, secrets & leak-gate marker
   let markerId := mkIdentFrom authIdent (authName ++ `_qed_auth_marker)

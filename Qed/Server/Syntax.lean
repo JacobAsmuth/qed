@@ -179,6 +179,14 @@ private def identDotTransaction : Parser :=
   withPosition (
     atomic (identEq `every) >> numLit >> ident >> ident >> ":" >> qedSuite)
 
+@[srvClause_parser] def srvOnCreateAccountClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `onCreateAccount >> checkNoWsBefore "" >> "(") >> ident >> ")" >> ":" >> qedSuite)
+
+@[srvClause_parser] def srvOnSignInClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `onSignIn >> checkNoWsBefore "" >> "(") >> ident >> ")" >> ":" >> qedSuite)
+
 @[command_parser] def serverCmd : Parser := leading_parser
   withPosition (
     "server " >> ident >> ":" >>

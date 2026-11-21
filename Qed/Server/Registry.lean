@@ -46,10 +46,12 @@ structure ServerInfo where
   methods          : Array ServerMethodInfo
   channels         : Array String := #[]
   jobs             : Array String := #[]
-  databases        : Array Lean.Name := #[]
-  authName?        : Option Lean.Name := none
-  authConfig?      : Option Lean.Name := none
-  hasHttpRoutes    : Bool := false
+  databases          : Array Lean.Name := #[]
+  authName?          : Option Lean.Name := none
+  authConfig?        : Option Lean.Name := none
+  hasOnCreateAccount : Bool := false
+  hasOnSignIn        : Bool := false
+  hasHttpRoutes      : Bool := false
 deriving Inhabited
 
 initialize serverRegistry :

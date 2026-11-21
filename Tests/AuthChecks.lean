@@ -8,7 +8,7 @@ namespace AuthChecks
 auth CloudAuth:
   issuer        env("QED_AUTH_ISSUER") ?? "http://127.0.0.1:8001"
   audience      env("QED_AUTH_AUDIENCE") ?? "qed-cloud-test"
-  client_id     env("QED_AUTH_CLIENT_ID") ?? "qed-cloud-test"
+  clientId      env("QED_AUTH_CLIENT_ID") ?? "qed-cloud-test"
   providers     [email, google, github]
   session       ttl = 7200
   claims:
@@ -32,6 +32,13 @@ database AuthNotesDb:
 
     policy read, write requires some(row.ownerId) == ctx.userId
 
+  table profiles:
+    id     : String primary_key where 1 <= id.length <= 128
+    email  : String             where email.length <= 254
+    logins : Nat
+
+    policy read, write requires some(row.id) == ctx.userId
+
 server AuthApi:
   use auth : CloudAuth
   use db   : AuthNotesDb
@@ -40,11 +47,28 @@ server AuthApi:
   invariant nonNegCalls: adminCalls >= 0
   invariant adminOnly: mutating adminCalls requires ctx.userId != none and ctx.hasClaim("role", "admin")
 
+  onCreateAccount(user):
+    if 1 <= user.id.length <= 128 and user.email.length <= 254:
+      await db.profiles.insert(id = user.id, email = user.email, logins = 0)?
+
+  onSignIn(user):
+    if user.email.length <= 254:
+      await db.profiles.updateOne(
+        where = r => r.id == user.id,
+        set   = r => { email = user.email, logins = r.logins + 1 }
+      )?
+
   def whoami() -> CloudAuth.User!:
     requires ctx.userId != none
     if let some(u) = CloudAuth.fromCtx(ctx):
       return u
     return fail(.unauthorized)
+
+  def getProfile() -> AuthNotesDb.profiles?!:
+    requires ctx.userId != none
+    if let some(uid) = ctx.userId:
+      return await db.profiles.findOne(where = r => r.id == uid)?
+    return none
 
   def adminAction() -> Nat!:
     requires ctx.userId != none
@@ -62,6 +86,7 @@ component AuthShell:
     <main>
       <h1>Auth Test</h1>
       <a href={CloudAuth.loginUrl("/dashboard")}>Sign in</a>
+      <a href={CloudAuth.logoutUrl("/")}>Sign out</a>
       <p>{status}</p>
     </main>
 
@@ -81,8 +106,10 @@ example : Qed.Auth.isSafeReturnTo "//evil.com" = false := Qed.Auth.isSafeReturnT
 example : Qed.Auth.isSafeReturnTo "javascript:alert(1)" = false := Qed.Auth.isSafeReturnTo_rejects_javascript
 example : Qed.Auth.isSafeReturnTo "/dashboard?tab=1" = true := by decide
 
--- Verify `CloudAuth.loginUrl` returns a verified `Qed.Url` and open redirects sanitize to `/`
+-- Verify `CloudAuth.loginUrl` and `CloudAuth.logoutUrl` return verified `Qed.Url`s and sanitize open redirects
 example : (CloudAuth.loginUrl "//evil.com").raw = (CloudAuth.loginUrl "/").raw := rfl
+example : (CloudAuth.logoutUrl "//evil.com").raw = (CloudAuth.logoutUrl "/").raw := rfl
+#guard (CloudAuth.logoutUrl "/bye").raw == "/_qed/auth/logout?returnTo=%2Fbye"
 example : Qed.Auth.sanitizeReturnTo (some "//evil.com") = "/" := by decide
 example : Qed.Auth.sanitizeReturnTo (some "/dashboard") = "/dashboard" := by decide
 
@@ -90,5 +117,14 @@ example : Qed.Auth.sanitizeReturnTo (some "/dashboard") = "/dashboard" := by dec
 example :
     CloudAuth.fromCtx { userId := some "u1", claims := [("email", "a@b.c"), ("role", "admin"), ("orgId", "org_1"), ("email_verified", "true")] } =
     some { id := "u1", email := "a@b.c", role := "admin", orgId := some "org_1", verified := true } := by decide
+
+-- Negative: `onSignIn` without `use auth : <Auth>` is rejected at compile time
+/--
+error: `onSignIn` in `server MissingAuthServer` requires `use auth : <Auth>`
+-/
+#guard_msgs in
+server MissingAuthServer:
+  onSignIn(user):
+    pass
 
 end AuthChecks

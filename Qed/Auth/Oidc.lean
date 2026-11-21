@@ -364,7 +364,9 @@ private def filterSessionClaims (claimNames : List String) (c : JwtClaims) : Lis
 def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqHead)
     (pathOnly queryStr : String) (cookies : List (String × String))
     (resolvedUser? : Option String) (resolvedClaims : List (String × String))
-    (isHead : Bool) : IO (Option ByteArray) := do
+    (isHead : Bool)
+    (onCallbackAuthenticated? : Option (String → List (String × String) → IO (Except (Nat × String) (Array SetCookie))) := none) :
+    IO (Option ByteArray) := do
   let cfg := rt.cfg
   if req.method == "GET" && pathOnly == cfg.loginPath then
     let some signKey := cfg.sessionSecrets.head?
@@ -465,6 +467,13 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
       userId := claims.sub
       claims := filterSessionClaims cfg.claimNames claims
     }
+    let mut extraHookCookies : List (String × String) := []
+    if let some onAuth := onCallbackAuthenticated? then
+      match ← onAuth sessPayload.userId sessPayload.claims with
+      | .ok cs =>
+          extraHookCookies := cs.toList.map fun c => ("Set-Cookie", c.render)
+      | .error (status, msg) =>
+          return some (formatHttpResponse status "text/plain; charset=utf-8" msg.toUTF8 isHead req.keepAlive false)
     let sessTok ← signSessionCookieV2 signKey sessPayload cfg.sessionTtlSec
     let sessCookie := mkHardenedCookie "qed_session" sessTok cfg.sessionTtlSec cfg.devMode
     let clearTx := SetCookie.clear "qed_auth_tx" "/"
@@ -473,7 +482,7 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
       ("Location", safeLoc),
       ("Set-Cookie", clearTx.render),
       ("Set-Cookie", sessCookie.render)
-    ]
+    ] ++ extraHookCookies
     return some (formatHttpResponse 302 "text/plain; charset=utf-8" ByteArray.empty isHead req.keepAlive true (extraHeaders := hdrs))
 
   else if (req.method == "POST" || req.method == "GET") && pathOnly == cfg.logoutPath then

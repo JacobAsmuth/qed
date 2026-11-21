@@ -258,7 +258,31 @@ private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit := do
         c.checkEq "admin RPC with OIDC v2 cookie returns 200" r.status 200
     | .error e => c.check "admin RPC with OIDC v2 cookie" false e
 
-    -- 11. Logout clears cookie and returns 200
+    -- 10a. Verify `onCreateAccount` + `onSignIn` fired on 1st sign-in (`logins == 1`)!
+    match ← httpReq appProc.port "POST" "/_qed/rpc/AuthApi/getProfile"
+        #[("Content-Type", "application/x-protobuf"), ("Cookie", sessionCookie)] emptyProto with
+    | .ok r =>
+        c.checkEq "getProfile after 1st sign-in returns 200" r.status 200
+        match Qed.Proto.decode (α := Option AuthChecks.AuthNotesDb.profiles) r.body with
+        | .ok (some prof) =>
+            c.checkEq "onCreateAccount stored profile id" prof.id "usr_alice"
+            c.checkEq "onCreateAccount stored profile email" prof.email "alice@qed.dev"
+            c.checkEq "onCreateAccount(0) + onSignIn(+1) -> logins == 1" prof.logins 1
+        | .ok none => c.check "profile exists after 1st sign-in" false "got none"
+        | .error e => c.check "decode getProfile after 1st sign-in" false e
+    | .error e => c.check "getProfile after 1st sign-in" false e
+
+    -- 11. Logout via `logoutUrl` (`GET /_qed/auth/logout?returnTo=/`) redirects 302 and clears cookie!
+    match ← httpReq appProc.port "GET" (AuthChecks.CloudAuth.logoutUrl "/").raw
+        #[("Cookie", sessionCookie)] with
+    | .ok r =>
+        c.checkEq "GET logoutUrl(/) returns 302" r.status 302
+        c.checkEq "GET logoutUrl(/) redirects to /" (r.header? "location") (some "/")
+        let scs := extractSetCookies r.headers
+        c.check "GET logoutUrl emits Max-Age=0 clear cookie" (scs.any fun s => s.contains "qed_session=" && s.contains "Max-Age=0")
+    | .error e => c.check "GET logoutUrl(/)" false e
+
+    -- 11a. POST logout (without returnTo) also clears cookie and returns 200 JSON
     match ← httpReq appProc.port "POST" "/_qed/auth/logout"
         #[("Cookie", sessionCookie), ("Origin", s!"http://127.0.0.1:{appProc.port}")] with
     | .ok r =>
@@ -266,6 +290,33 @@ private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit := do
         let scs := extractSetCookies r.headers
         c.check "logout emits Max-Age=0 clear cookie" (scs.any fun s => s.contains "qed_session=" && s.contains "Max-Age=0")
     | .error e => c.check "POST /_qed/auth/logout" false e
+
+    -- 11b. Second OIDC sign-in as Alice: `onCreateAccount` must NOT re-run; `onSignIn` increments `logins` to 2!
+    match ← httpReq appProc.port "GET" "/_qed/auth/login?returnTo=/" with
+    | .error e => c.check "2nd OIDC login step 1" false e
+    | .ok r1b =>
+        let txCookie2 := (findCookieByName (extractSetCookies r1b.headers) "qed_auth_tx").getD ""
+        let authPath2 := stripHostPrefix ((r1b.header? "location").getD "") ++
+          "&auto=1&sub=usr_alice&role=admin&email=alice%40qed.dev&orgId=org_42"
+        match ← httpReq devAuthPort "GET" authPath2 with
+        | .error e => c.check "2nd OIDC authorize step 2" false e
+        | .ok r2b =>
+            let cbPath2 := stripHostPrefix ((r2b.header? "location").getD "")
+            match ← httpReq appProc.port "GET" cbPath2 #[("Cookie", txCookie2)] with
+            | .error e => c.check "2nd OIDC callback step 3" false e
+            | .ok r3b =>
+                c.checkEq "2nd OIDC callback succeeds with 302" r3b.status 302
+                let sessCookie2 := (findCookieByName (extractSetCookies r3b.headers) "qed_session").getD ""
+                match ← httpReq appProc.port "POST" "/_qed/rpc/AuthApi/getProfile"
+                    #[("Content-Type", "application/x-protobuf"), ("Cookie", sessCookie2)] emptyProto with
+                | .ok rp2 =>
+                    c.checkEq "getProfile after 2nd sign-in returns 200" rp2.status 200
+                    match Qed.Proto.decode (α := Option AuthChecks.AuthNotesDb.profiles) rp2.body with
+                    | .ok (some prof2) =>
+                        c.checkEq "2nd sign-in skips onCreateAccount and increments logins == 2" prof2.logins 2
+                    | .ok none => c.check "profile exists after 2nd sign-in" false "got none"
+                    | .error e => c.check "decode getProfile after 2nd sign-in" false e
+                | .error e => c.check "getProfile after 2nd sign-in" false e
 
   -- 12. Bearer ES256 JWT mode (Firebase/Supabase/Clerk style): member rejected (403), admin allowed (200)!
   let mintBearer (sub role : String) : IO (Option String) := do

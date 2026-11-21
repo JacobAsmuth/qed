@@ -901,6 +901,125 @@ def initDatabases (dbs : Array Db.DbConfig) : IO Bool := do
         IO.eprintln s!"✗ database `{cfg.name}` initialization failed: {e.message}"
         return false
 
+private def authUsersDdlSqlite : String :=
+  "CREATE TABLE IF NOT EXISTS \"_qed_auth_users\" (\"sub\" TEXT PRIMARY KEY, \"created_at\" INTEGER NOT NULL)"
+
+private def authUsersDdlPostgres : String :=
+  "CREATE TABLE IF NOT EXISTS \"_qed_auth_users\" (\"sub\" TEXT PRIMARY KEY, \"created_at\" BIGINT NOT NULL)"
+
+private def ensureAuthUsersTable (cfg : Db.DbConfig) : IO (Except ApiError Unit) := do
+  match ← resolveDbConfig cfg with
+  | .error e => return .error e
+  | .ok (.sqlite path) =>
+      match ← Prim.sqliteDdl path authUsersDdlSqlite with
+      | .ok () => return .ok ()
+      | .error e => return .error (ApiError.internal e)
+  | .ok (.postgres url) =>
+      match ← Db.PgWire.execDdl url authUsersDdlPostgres with
+      | .ok () => return .ok ()
+      | .error e => return .error (ApiError.internal e)
+  | .ok (.httpSql url bearer?) =>
+      let body := Db.HttpSql.encodeGenericQueryBody authUsersDdlSqlite #[] .sqlite
+      match ← execHttpSqlRaw url bearer? body with
+      | .ok _ => return .ok ()
+      | .error e => return .error e
+  | .ok (.d1 acc db tok) =>
+      let url := s!"https://api.cloudflare.com/client/v4/accounts/{Qed.encodeSeg acc}/d1/database/{Qed.encodeSeg db}/query"
+      let body := Db.HttpSql.encodeD1QueryBody authUsersDdlSqlite #[]
+      match ← execHttpSqlRaw url (some tok) body with
+      | .ok _ => return .ok ()
+      | .error e => return .error e
+  | .ok (.turso baseUrl tok) =>
+      let url := (if baseUrl.endsWith "/" then String.ofList baseUrl.toList.dropLast else baseUrl) ++ "/v2/pipeline"
+      let body := Db.HttpSql.encodeTursoPipelineBody authUsersDdlSqlite #[]
+      match ← execHttpSqlRaw url (some tok) body with
+      | .ok _ => return .ok ()
+      | .error e => return .error e
+
+/-- Atomically claims a first-time OIDC subject in `_qed_auth_users` (DB-backed when a database is attached,
+    falling back to an atomic in-memory set otherwise). Returns `true` iff this is a brand-new user. -/
+private def claimAuthUser (primaryDb? : Option Db.DbConfig) (memSeen : Prim.StateBox (Std.HashSet String))
+    (sub : String) : IO (Except ApiError Bool) := do
+  match primaryDb? with
+  | none =>
+      let isNew ← Prim.atomicModify memSeen fun s =>
+        if s.contains sub then (s, false) else (s.insert sub, true)
+      return .ok isNew
+  | some cfg =>
+      let nowMs := (← Prim.nowMs).toNat
+      let params : Array Db.SqlVal := #[.text sub, .int (Int.ofNat nowMs)]
+      match ← resolveDbConfig cfg with
+      | .error e => return .error e
+      | .ok (.sqlite path) =>
+          let sql := "INSERT OR IGNORE INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES (?1, ?2)"
+          match ← Prim.sqliteExec path sql (Db.encodeTaggedParamsJson params) with
+          | .error e => return .error (ApiError.internal e)
+          | .ok rawJson =>
+              match Db.decodeTaggedResultJson rawJson with
+              | .ok res => return .ok (res.affected > 0)
+              | .error e => return .error (ApiError.internal s!"auth user claim decode failed: {e}")
+      | .ok (.postgres url) =>
+          let sql := "INSERT INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES ($1, $2) ON CONFLICT (\"sub\") DO NOTHING RETURNING \"sub\""
+          match ← Db.PgWire.execParameterized url sql params with
+          | .error e => return .error (ApiError.internal e)
+          | .ok res => return .ok (!res.rows.isEmpty)
+      | .ok (.httpSql url bearer?) =>
+          let sql := "INSERT OR IGNORE INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES (?1, ?2) RETURNING \"sub\""
+          let body := Db.HttpSql.encodeGenericQueryBody sql params .sqlite
+          match ← execHttpSqlRaw url bearer? body with
+          | .error e => return .error e
+          | .ok rawJson =>
+              match Db.decodeTaggedResultJson rawJson with
+              | .ok res => return .ok (!res.rows.isEmpty || res.affected > 0)
+              | .error e => return .error (ApiError.internal s!"auth user claim decode failed: {e}")
+      | .ok (.d1 acc db tok) =>
+          let url := s!"https://api.cloudflare.com/client/v4/accounts/{Qed.encodeSeg acc}/d1/database/{Qed.encodeSeg db}/query"
+          let sql := "INSERT OR IGNORE INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES (?1, ?2) RETURNING \"sub\""
+          let body := Db.HttpSql.encodeD1QueryBody sql params
+          match ← execHttpSqlRaw url (some tok) body with
+          | .error e => return .error e
+          | .ok rawJson =>
+              match Db.HttpSql.decodeD1Response rawJson ["sub"] with
+              | .ok res => return .ok (!res.rows.isEmpty || res.affected > 0)
+              | .error e => return .error (ApiError.internal s!"auth user claim decode failed: {e}")
+      | .ok (.turso baseUrl tok) =>
+          let url := (if baseUrl.endsWith "/" then String.ofList baseUrl.toList.dropLast else baseUrl) ++ "/v2/pipeline"
+          let sql := "INSERT OR IGNORE INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES (?1, ?2) RETURNING \"sub\""
+          let body := Db.HttpSql.encodeTursoPipelineBody sql params
+          match ← execHttpSqlRaw url (some tok) body with
+          | .error e => return .error e
+          | .ok rawJson =>
+              match Db.HttpSql.decodeTursoResponse rawJson with
+              | .ok res => return .ok (!res.rows.isEmpty || res.affected > 0)
+              | .error e => return .error (ApiError.internal s!"auth user claim decode failed: {e}")
+
+/-- Releases a claimed OIDC subject if `onCreateAccount` fails so a subsequent retry re-runs account creation. -/
+private def releaseAuthUser (primaryDb? : Option Db.DbConfig) (memSeen : Prim.StateBox (Std.HashSet String))
+    (sub : String) : IO Unit := do
+  match primaryDb? with
+  | none =>
+      Prim.atomicModify memSeen fun s => (s.erase sub, ())
+  | some cfg =>
+      let params : Array Db.SqlVal := #[.text sub]
+      match ← resolveDbConfig cfg with
+      | .ok (.sqlite path) =>
+          discard <| Prim.sqliteExec path "DELETE FROM \"_qed_auth_users\" WHERE \"sub\" = ?1"
+            (Db.encodeTaggedParamsJson params)
+      | .ok (.postgres url) =>
+          discard <| Db.PgWire.execParameterized url "DELETE FROM \"_qed_auth_users\" WHERE \"sub\" = $1" params
+      | .ok (.httpSql url bearer?) =>
+          let body := Db.HttpSql.encodeGenericQueryBody "DELETE FROM \"_qed_auth_users\" WHERE \"sub\" = ?1" params .sqlite
+          discard <| execHttpSqlRaw url bearer? body
+      | .ok (.d1 acc db tok) =>
+          let url := s!"https://api.cloudflare.com/client/v4/accounts/{Qed.encodeSeg acc}/d1/database/{Qed.encodeSeg db}/query"
+          let body := Db.HttpSql.encodeD1QueryBody "DELETE FROM \"_qed_auth_users\" WHERE \"sub\" = ?1" params
+          discard <| execHttpSqlRaw url (some tok) body
+      | .ok (.turso baseUrl tok) =>
+          let url := (if baseUrl.endsWith "/" then String.ofList baseUrl.toList.dropLast else baseUrl) ++ "/v2/pipeline"
+          let body := Db.HttpSql.encodeTursoPipelineBody "DELETE FROM \"_qed_auth_users\" WHERE \"sub\" = ?1" params
+          discard <| execHttpSqlRaw url (some tok) body
+      | .error _ => pure ()
+
 /-! ## Full-Stack Native Server Runner (Verified HTTP/1.1 + Static + RFC 6455 WS + SSR) -/
 
 private def devReloadSnippet : String :=
@@ -1223,13 +1342,25 @@ private def runFullstackCore {Model Msg : Type}
     (blockingMethods? : Option (Array String) := none)
     (httpDispatchFn? : Option (RequestCtx → String → String → IO (Except ApiError (Option HttpResponse) × Array SetCookie)) := none)
     (jobs : Array IoJob := #[])
-    (authSpec? : Option Qed.Auth.OidcAuthSpec := none) : IO UInt32 := do
+    (authSpec? : Option Qed.Auth.OidcAuthSpec := none)
+    (authHookFn? : Option (RequestCtx → UInt8 → IO (Except ApiError Unit × Array SetCookie)) := none)
+    (authHookFlags : Bool × Bool := (false, false))
+    (primaryDb? : Option Db.DbConfig := none) : IO UInt32 := do
   if !(← verifyRequiredSecrets requiredSecrets) then
     return 1
+  let (hasOnCreateAccount, hasOnSignIn) := authHookFlags
+  if hasOnCreateAccount then
+    if let some dbCfg := primaryDb? then
+      match ← ensureAuthUsersTable dbCfg with
+      | .ok () => pure ()
+      | .error e =>
+          IO.eprintln s!"✗ failed to initialize `_qed_auth_users` table: {e.message}"
+          return 1
   let cfg ← loadServerConfig devMode
   let oidcRt? ← match authSpec? with
     | some spec => Qed.Auth.Oidc.initOidcRuntime spec cfg.authSecrets devMode
     | none      => pure none
+  let memSeenAuthUsers ← Prim.mkStateBox (∅ : Std.HashSet String)
   let staticDirFd ← Prim.openStaticDir staticDir
   let hostScript ← loadHostScript staticDirFd devMode
   let rpcPrefix := "/_qed/rpc/" ++ serverShortName ++ "/"
@@ -1261,8 +1392,30 @@ private def runFullstackCore {Model Msg : Type}
           | .error (code, msg) =>
               return formatHttpResponse code "text/plain; charset=utf-8" msg.toUTF8 isHead req.keepAlive false
           | .ok () => pure ()
+        let onAuthCallback? : Option (String → List (String × String) → IO (Except (Nat × String) (Array SetCookie))) :=
+          authHookFn?.map fun hookFn => fun sub filteredClaims => do
+            let hookCtx : RequestCtx := { ctx with userId := some sub, claims := filteredClaims }
+            let mut outCookies : Array SetCookie := #[]
+            if hasOnCreateAccount then
+              match ← claimAuthUser primaryDb? memSeenAuthUsers sub with
+              | .error e => return .error (e.httpStatus.toNat, e.message)
+              | .ok true =>
+                  let (cRes, cCookies) ← hookFn hookCtx 0
+                  match cRes with
+                  | .error e =>
+                      releaseAuthUser primaryDb? memSeenAuthUsers sub
+                      return .error (e.httpStatus.toNat, e.message)
+                  | .ok () =>
+                      outCookies := outCookies ++ cCookies
+              | .ok false => pure ()
+            if hasOnSignIn then
+              let (sRes, sCookies) ← hookFn hookCtx 1
+              match sRes with
+              | .error e => return .error (e.httpStatus.toNat, e.message)
+              | .ok () => outCookies := outCookies ++ sCookies
+            return .ok outCookies
         if let some authResp ← Qed.Auth.Oidc.handleAuthRoute execHttpCall rt req
-            pathOnly ctx.query ctx.cookies ctx.userId ctx.claims isHead then
+            pathOnly ctx.query ctx.cookies ctx.userId ctx.claims isHead onAuthCallback? then
           return authResp
     if req.method == "POST" && pathOnly.startsWith rpcPrefix then
       match checkRpcCsrfReq req cfg.rpcAllowedOrigins? with
@@ -1431,7 +1584,11 @@ def runStatefulFullstack {σ Model Msg : Type}
     (httpDispatchM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
         RequestCtx → String → String → m (Except ApiError (Option HttpResponse))) := none)
     (jobs : Array (ServerJob σ) := #[])
-    (authSpec? : Option Qed.Auth.OidcAuthSpec := none) : IO UInt32 := do
+    (authSpec? : Option Qed.Auth.OidcAuthSpec := none)
+    (authHookM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
+        RequestCtx → UInt8 → m (Except ApiError Unit)) := none)
+    (authHookFlags : Bool × Bool := (false, false))
+    (primaryDb? : Option Db.DbConfig := none) : IO UInt32 := do
   let box ← Prim.mkStateBox initState
   let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
   let wsSrvInst : MonadServer IO := mkNativeServerInst (some gcpCache) none
@@ -1452,6 +1609,13 @@ def runStatefulFullstack {σ Model Msg : Type}
       return (res, ← cookieRef.get))
     (jobs.map (·.toIoJob wsSrvInst atomicInst))
     authSpec?
+    (authHookM?.map fun hookM ctx kind => do
+      let cookieRef ← IO.mkRef (#[] : Array SetCookie)
+      let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef)
+      let res ← @hookM IO _ reqSrvInst atomicInst ctx kind
+      return (res, ← cookieRef.get))
+    authHookFlags
+    primaryDb?
 
 def runStatelessFullstack {Model Msg : Type}
     (app : Qed.App Model Msg) (title serverShortName : String)
@@ -1465,7 +1629,11 @@ def runStatelessFullstack {Model Msg : Type}
     (httpDispatchM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] →
         RequestCtx → String → String → m (Except ApiError (Option HttpResponse))) := none)
     (jobs : Array StatelessJob := #[])
-    (authSpec? : Option Qed.Auth.OidcAuthSpec := none) : IO UInt32 := do
+    (authSpec? : Option Qed.Auth.OidcAuthSpec := none)
+    (authHookM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] →
+        RequestCtx → UInt8 → m (Except ApiError Unit)) := none)
+    (authHookFlags : Bool × Bool := (false, false))
+    (primaryDb? : Option Db.DbConfig := none) : IO UInt32 := do
   let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
   let wsSrvInst : MonadServer IO := mkNativeServerInst (some gcpCache) none
   runFullstackCore app title serverShortName requiredSecrets
@@ -1484,6 +1652,13 @@ def runStatelessFullstack {Model Msg : Type}
       return (res, ← cookieRef.get))
     (jobs.map (·.toIoJob wsSrvInst))
     authSpec?
+    (authHookM?.map fun hookM ctx kind => do
+      let cookieRef ← IO.mkRef (#[] : Array SetCookie)
+      let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef)
+      let res ← @hookM IO _ reqSrvInst ctx kind
+      return (res, ← cookieRef.get))
+    authHookFlags
+    primaryDb?
 
 /-- Serves a standalone `Qed.App` (`component` or `Qed.run`) with native in-memory SSR and static asset serving. -/
 def runStandaloneApp {Model Msg : Type} (app : Qed.App Model Msg) (title : String)

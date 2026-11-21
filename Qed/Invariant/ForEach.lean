@@ -163,7 +163,7 @@ macro_rules
                    repeat' apply And.intro
                    all_goals (first
                      | $liftChild:tactic
-                     | (simp only [Qed.attrRole, Qed.attrClasses, Qed.hasOneClass,
+                     | (simp only [Qed.attrRole, Qed.attrValue, Qed.attrClasses, Qed.hasOneClass,
                                    Bool.true_and, Bool.and_true, Bool.false_and, Bool.and_false,
                                    Bool.true_or, Bool.or_true, Bool.false_or, Bool.or_false,
                                    ite_true, ite_false, beq_self_eq_true, eq_self]; (try rfl); done)

@@ -68,34 +68,22 @@ class MonadDom (msg : outParam Type) (m : Type → Type) extends Monad m where
   patchTmplRow     : Dom.Node → UInt32 → Array String → Array String → m Unit
   hydrateTmplRow   : Dom.Node → UInt32 → m Unit
 
-private def applyStaticProtoAttrs {msg : Type} (node : Dom.Node) : List (Attr msg) → IO Unit
-  | [] => pure ()
-  | a :: rest => do
-      match a with
-      | .cls c                  => Dom.setAttribute node "class" c
-      | .attr "value" v         => Dom.setValue node v
-      | .attr k v               => Dom.setAttribute node k v
-      | .flag "checked" present => Dom.setChecked node present
-      | .flag k present         => if present then Dom.setAttribute node k k else Dom.removeAttribute node k
-      | _                       => pure ()
-      applyStaticProtoAttrs node rest
-
-mutual
-  private def buildStaticProtoDom {msg : Type} (ns : String) : Html msg → IO Dom.Node
-    | .text s => Dom.createText s
-    | .element tag attrs children => do
-        let node ← Dom.createElement ns tag
-        applyStaticProtoAttrs node (normalizeAttrs attrs)
-        buildStaticProtoKids (Dom.childNsOf ns tag) node children
-        return node
-
-  private def buildStaticProtoKids {msg : Type} (ns : String) (parent : Dom.Node) : List (Html msg) → IO Unit
-    | [] => pure ()
-    | c :: cs => do
-        let cn ← buildStaticProtoDom ns c
-        Dom.appendChild parent cn
-        buildStaticProtoKids ns parent cs
-end
+private def buildStaticProtoDom {msg : Type} (ns : String) : Html msg → IO Dom.Node
+  | .text s => Dom.createText s
+  | .element tag attrs children => do
+      let node ← Dom.createElement ns tag
+      for a in normalizeAttrs attrs do
+        match a with
+        | .cls c                  => Dom.setAttribute node "class" c
+        | .attr "value" v         => Dom.setValue node v
+        | .attr k v               => Dom.setAttribute node k v
+        | .flag "checked" present => Dom.setChecked node present
+        | .flag k present         => if present then Dom.setAttribute node k k else Dom.removeAttribute node k
+        | _                       => pure ()
+      let childNs := Dom.childNsOf ns tag
+      for c in children do
+        Dom.appendChild node (← buildStaticProtoDom childNs c)
+      return node
 
 private def listenEvNames (evNames : Array String) (i : Nat) : IO Unit := do
   if hi : i < evNames.size then

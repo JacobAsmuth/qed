@@ -9,11 +9,8 @@ def attrClasses : List (Attr msg) → List String
   | .signalAttr _ k c :: r => if k == "class" then c :: attrClasses r else attrClasses r
   | _ :: r                 => attrClasses r
 
-def attrRole : List (Attr msg) → Option String
-  | []                                => none
-  | .attr "data-role" v :: _          => some v
-  | .signalAttr _ "data-role" v :: _  => some v
-  | _ :: r                            => attrRole r
+abbrev attrRole {msg : Type} : List (Attr msg) → Option String :=
+  attrValue "data-role"
 
 mutual
 def everyElement (p : String → List (Attr msg) → Bool) : Html msg → Bool
@@ -23,6 +20,14 @@ def everyElementL (p : String → List (Attr msg) → Bool) : List (Html msg) �
   | []     => true
   | h :: t => everyElement p h && everyElementL p t
 end
+
+private theorem everyElement_eq_fold (p : String → List (Attr msg) → Bool) (h : Html msg) :
+    everyElement p h = Html.fold (fun _ => true) (fun t a _ r => p t a && r) true (· && ·) h :=
+  Html.fold_eq_node (everyElement p) (everyElementL p) _ _ _ _ (fun _ => rfl) (fun _ _ _ => rfl) rfl (fun _ _ => rfl) h
+
+private theorem everyElementL_eq_fold (p : String → List (Attr msg) → Bool) (cs : List (Html msg)) :
+    everyElementL p cs = Html.foldList (fun _ => true) (fun t a _ r => p t a && r) true (· && ·) cs :=
+  Html.fold_eq_list (everyElement p) (everyElementL p) _ _ _ _ (fun _ => rfl) (fun _ _ _ => rfl) rfl (fun _ _ => rfl) cs
 
 def hasRole (r : String) (h : Html msg) : Bool :=
   !everyElement (fun _ a => !(attrRole a == some r)) h
@@ -97,42 +102,30 @@ theorem attrClasses_map {α β} (f : α → β) (a : List (Attr α)) :
       | _ => simp_all [attrClasses, Attr.map]
 
 theorem attrRole_map {α β} (f : α → β) (a : List (Attr α)) :
-    attrRole (a.map (Attr.map f)) = attrRole a := by
-  induction a with
-  | nil => rfl
-  | cons x xs ih => cases x
-                    case attr k v => by_cases hk : k = "data-role" <;>
-                                       simp [List.map, Attr.map, attrRole, hk, ih]
-                    case signalAttr sig k v =>
-                                     by_cases hk : k = "data-role" <;>
-                                       simp [List.map, Attr.map, attrRole, hk, ih]
-                    all_goals simp [List.map, Attr.map, attrRole, ih]
+    attrRole (a.map (Attr.map f)) = attrRole a := attrValue_map "data-role" f a
 
-mutual
 theorem everyElement_map {α β} (f : α → β)
     {pα : String → List (Attr α) → Bool} {pβ : String → List (Attr β) → Bool}
-    (hp : ∀ t a, pβ t (a.map (Attr.map f)) = pα t a) :
-    (h : Html α) → everyElement pβ (h.map f) = everyElement pα h
-  | .text _        => rfl
-  | .element t a k => by simp only [Html.map, everyElement, hp, everyElementL_map f hp k]
+    (hp : ∀ t a, pβ t (a.map (Attr.map f)) = pα t a) (h : Html α) :
+    everyElement pβ (h.map f) = everyElement pα h := by
+  rw [everyElement_eq_fold, everyElement_eq_fold]
+  exact Html.fold_map f _ _ _ true (· && ·) (fun t a _ _ => by simp [hp]) h
+
 theorem everyElementL_map {α β} (f : α → β)
     {pα : String → List (Attr α) → Bool} {pβ : String → List (Attr β) → Bool}
-    (hp : ∀ t a, pβ t (a.map (Attr.map f)) = pα t a) :
-    (l : List (Html α)) → everyElementL pβ (Html.mapChildren f l) = everyElementL pα l
-  | []     => rfl
-  | c :: cs => by simp only [Html.mapChildren, everyElementL,
-                             everyElement_map f hp c, everyElementL_map f hp cs]
-end
+    (hp : ∀ t a, pβ t (a.map (Attr.map f)) = pα t a) (l : List (Html α)) :
+    everyElementL pβ (Html.mapChildren f l) = everyElementL pα l := by
+  rw [everyElementL_eq_fold, everyElementL_eq_fold]
+  exact Html.foldList_map f _ _ _ true (· && ·) (fun t a _ _ => by simp [hp]) l
 
 theorem everyElementL_mapList {α β} (p) (g : β → Html α) (l : List β) :
     everyElementL p (l.map g) = true ↔ ∀ x ∈ l, everyElement p (g x) = true := by
-  induction l with
-  | nil => simp [everyElementL]
-  | cons x xs ih => simp [List.map, everyElementL, ih, Bool.and_eq_true]
+  simp only [everyElementL_eq_fold, everyElement_eq_fold]
+  exact Html.foldList_all_mapList _ _ g l
 
 @[simp] theorem roleLacks_map {α β} (f : α → β) (r) (s) (h : Html α) :
     roleLacks r s (h.map f) = roleLacks r s h :=
-  everyElement_map f (fun _ _ => by simp [attrRole_map, attrClasses_map]) h
+  everyElement_map f (fun _ _ => by simp [attrClasses_map]) h
 
 @[simp] theorem tagLacks_map {α β} (f : α → β) (tag) (s) (h : Html α) :
     tagLacks tag s (h.map f) = tagLacks tag s h :=
@@ -154,76 +147,34 @@ theorem everyElement_through_map {α β} (f : α → β) {Pα : String → List 
       | _ => simp [Attr.canonical, attrClasses, ih]
 
 @[simp] theorem attrRole_canonical (a : List (Attr msg)) :
-    attrRole (a.filterMap Attr.canonical) = attrRole a := by
-  induction a with
-  | nil => rfl
-  | cons x xs ih =>
-      cases x with
-      | attr k v | signalAttr _ k v =>
-          by_cases hk : k = "data-role" <;>
-            simp [Attr.canonical, attrRole, hk, ih]
-      | _ => simp [Attr.canonical, attrRole, ih]
+    attrRole (a.filterMap Attr.canonical) = attrRole a :=
+  attrValue_canonical "data-role" (by decide) a
 
-private theorem canonicalList_eq_singleton {cs : List (Html msg)} {c : Html msg}
-    (h : Html.canonicalList cs = [c]) : ∃ c₀, cs = [c₀] ∧ c = Html.canonical c₀ := by
-  cases cs with
-  | nil => simp [Html.canonicalList] at h
-  | cons c₀ rest =>
-      cases rest with
-      | nil => simp [Html.canonicalList] at h; exact ⟨c₀, rfl, h.symm⟩
-      | cons _ _ => simp [Html.canonicalList] at h
-
-private theorem attrRole_of_onlySignalBind :
-    ∀ a : List (Attr msg), onlySignalBind a = true → attrRole a = none
-  | [.signalBind _], _ => rfl
-  | .key _ :: rest, h => attrRole_of_onlySignalBind rest h
+private theorem attrRole_of_onlySignalBind (a : List (Attr msg)) (h : onlySignalBind a = true) :
+    attrRole a = none := attrValue_of_onlySignalBind "data-role" a h
 
 private theorem attrClasses_of_onlySignalBind :
     ∀ a : List (Attr msg), onlySignalBind a = true → attrClasses a = []
   | [.signalBind _], _ => rfl
   | .key _ :: rest, h => attrClasses_of_onlySignalBind rest h
 
-mutual
-  theorem everyElement_canonical {p : String → List (Attr msg) → Bool}
-      (hcanonical : ∀ t a, p t (a.filterMap Attr.canonical) = p t a)
-      (hspan : ∀ a, onlySignalBind a = true → p "span" a = true) :
-      ∀ h : Html msg, everyElement p (Html.canonical h) = everyElement p h
-    | .text _ => rfl
-    | .element t a cs => by
-        dsimp [Html.canonical, mkCanonicalElem]
-        by_cases hcond : (t == "span" && onlySignalBind a) = true
-        · rw [if_pos hcond]
-          have ⟨ht, ha⟩ := Bool.and_eq_true_iff.1 hcond
-          have hteq : t = "span" := beq_iff_eq.1 ht
-          subst hteq
-          cases hcl : Html.canonicalList cs with
-          | nil =>
-              have hL := everyElementL_canonical hcanonical hspan cs
-              rw [hcl] at hL
-              simp [everyElement, hcanonical, hL]
-          | cons c rest =>
-              cases rest with
-              | nil =>
-                  rcases canonicalList_eq_singleton hcl with ⟨c₀, rfl, rfl⟩
-                  simp [everyElement, everyElementL, hspan a ha,
-                        everyElement_canonical hcanonical hspan c₀]
-              | cons _ _ =>
-                  have hL := everyElementL_canonical hcanonical hspan cs
-                  rw [hcl] at hL
-                  simp [everyElement, hcanonical, hL]
-        · rw [if_neg hcond]
-          simp [everyElement, hcanonical t a, everyElementL_canonical hcanonical hspan cs]
+theorem everyElement_canonical {p : String → List (Attr msg) → Bool}
+    (hcanonical : ∀ t a, p t (a.filterMap Attr.canonical) = p t a)
+    (hspan : ∀ a, onlySignalBind a = true → p "span" a = true)
+    (h : Html msg) : everyElement p (Html.canonical h) = everyElement p h := by
+  rw [everyElement_eq_fold, everyElement_eq_fold]
+  exact Html.fold_canonical _ _ true (· && ·)
+    (fun a _ _ ha => by simp [hspan a ha])
+    (fun t a _ _ => by simp [hcanonical t a]) h
 
-  theorem everyElementL_canonical {p : String → List (Attr msg) → Bool}
-      (hcanonical : ∀ t a, p t (a.filterMap Attr.canonical) = p t a)
-      (hspan : ∀ a, onlySignalBind a = true → p "span" a = true) :
-      ∀ cs : List (Html msg), everyElementL p (Html.canonicalList cs) = everyElementL p cs
-    | [] => rfl
-    | c :: cs => by
-        simp [Html.canonicalList, everyElementL,
-              everyElement_canonical hcanonical hspan c,
-              everyElementL_canonical hcanonical hspan cs]
-end
+theorem everyElementL_canonical {p : String → List (Attr msg) → Bool}
+    (hcanonical : ∀ t a, p t (a.filterMap Attr.canonical) = p t a)
+    (hspan : ∀ a, onlySignalBind a = true → p "span" a = true)
+    (cs : List (Html msg)) : everyElementL p (Html.canonicalList cs) = everyElementL p cs := by
+  rw [everyElementL_eq_fold, everyElementL_eq_fold]
+  exact Html.foldList_canonical _ _ true (· && ·)
+    (fun a _ _ ha => by simp [hspan a ha])
+    (fun t a _ _ => by simp [hcanonical t a]) cs
 
 @[simp] theorem hasRole_canonical (r : String) (h : Html msg) :
     hasRole r (Html.canonical h) = hasRole r h := by

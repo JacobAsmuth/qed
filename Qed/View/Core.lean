@@ -541,97 +541,78 @@ instance : CoeFun (View σ msg) (fun _ => σ → Html msg) := ⟨View.render⟩
     View.render (if c then a else b) s = (if c then View.render a s else View.render b s) := by
   by_cases hc : c <;> simp [hc]
 
-theorem View.validIn_render_ifElse {σ msg : Type} (ctx : HtmlCtx) (cond : σ → Bool)
-    (y n : View σ msg) (s : σ)
+theorem View.validIn_render_ifElse {σ msg : Type} (ctx : HtmlCtx) (cond : σ → Bool) (y n : View σ msg) (s : σ)
     (hy : cond s = true → Html.validIn ctx (View.render y s) = true)
     (hn : cond s = false → Html.validIn ctx (View.render n s) = true) :
     Html.validIn ctx (View.render (.ifElse cond y n) s) = true := by
-  simp only [View.render]
-  cases hc : cond s
-  · exact hn hc
-  · exact hy hc
+  simp only [View.render]; cases hc : cond s <;> simp [hc, hy, hn]
 
-theorem View.validIn_render_showIf {σ msg : Type} (ctx : HtmlCtx) (cond : σ → Bool)
-    (child : View σ msg) (s : σ)
+theorem View.validIn_render_showIf {σ msg : Type} (ctx : HtmlCtx) (cond : σ → Bool) (child : View σ msg) (s : σ)
     (hy : cond s = true → Html.validIn ctx (View.render child s) = true) :
     Html.validIn ctx (View.render (.showIf cond child) s) = true :=
-  View.validIn_render_ifElse ctx cond child (.text "") s hy (fun _ => by
-    simp [View.render, Html.validIn, validTextIn_empty])
+  View.validIn_render_ifElse ctx cond child (.text "") s hy (fun _ => by simp [View.render, Html.validIn])
 
 theorem View.validIn_render_element_intro {σ msg : Type} (ctx childCtx : HtmlCtx)
     (tag : String) (attrs : List (VAttr σ msg)) (kids : List (View σ msg)) (s : σ)
-    (hstep : stepHtmlCtx ctx tag = some childCtx)
-    (hattrs : Attr.validList (attrs.map (VAttr.eval s)) = true)
+    (hstep : stepHtmlCtx ctx tag = some childCtx) (hattrs : Attr.validList (attrs.map (VAttr.eval s)) = true)
     (hvoid : (!isVoidTag tag || kids.isEmpty) = true)
     (hcell : (!Attr.hasLocalCell (attrs.map (VAttr.eval s)) || kids.isEmpty) = true)
     (hkids : Html.validListIn childCtx (View.renderEach kids s) = true) :
-    Html.validIn ctx (View.render (.element tag attrs kids) s) = true := by
-  refine Html.validIn_element_intro ctx childCtx tag (attrs.map (VAttr.eval s))
-    (View.renderEach kids s) hstep hattrs ?_ ?_ hkids
-  · simpa [View.renderEach_isEmpty] using hvoid
-  · simpa [View.renderEach_isEmpty] using hcell
+    Html.validIn ctx (View.render (.element tag attrs kids) s) = true :=
+  Html.validIn_element_intro ctx childCtx tag (attrs.map (VAttr.eval s)) (View.renderEach kids s) hstep hattrs
+    (by simpa [View.renderEach_isEmpty] using hvoid) (by simpa [View.renderEach_isEmpty] using hcell) hkids
 
 theorem View.validListIn_renderEach_nil {σ msg : Type} (ctx : HtmlCtx) (s : σ) :
     Html.validListIn ctx (View.renderEach ([] : List (View σ msg)) s) = true := rfl
 
 theorem View.validListIn_renderEach_cons {σ msg : Type} (ctx : HtmlCtx)
     (k : View σ msg) (ks : List (View σ msg)) (s : σ)
-    (hk : Html.validIn ctx (View.render k s) = true)
-    (hks : Html.validListIn ctx (View.renderEach ks s) = true) :
+    (hk : Html.validIn ctx (View.render k s) = true) (hks : Html.validListIn ctx (View.renderEach ks s) = true) :
     Html.validListIn ctx (View.renderEach (k :: ks) s) = true :=
   Html.validListIn_cons_intro ctx (View.render k s) (View.renderEach ks s) hk hks
 
 theorem View.validListIn_renderEach_map_intro {α σ msg : Type} (ctx : HtmlCtx)
-    (xs : List α) (f : α → View σ msg) (s : σ)
-    (hf : ∀ a, Html.validIn ctx (View.render (f a) s) = true) :
-    Html.validListIn ctx (View.renderEach (xs.map f) s) = true := by
-  rw [View.renderEach_map]
-  exact Html.validListIn_map_intro ctx xs (fun a => View.render (f a) s) hf
+    (xs : List α) (f : α → View σ msg) (s : σ) (hf : ∀ a, Html.validIn ctx (View.render (f a) s) = true) :
+    Html.validListIn ctx (View.renderEach (xs.map f) s) = true :=
+  (congrArg (Html.validListIn ctx · = true) (View.renderEach_map xs f s)).mpr
+    (Html.validListIn_map_intro ctx xs (fun a => View.render (f a) s) hf)
 
 theorem View.validIn_render_mapScope_intro {σ' σ msg : Type} (ctx : HtmlCtx)
-    (f : σ' → σ) (v : View σ msg) (s' : σ')
-    (hv : Html.validIn ctx (View.render v (f s')) = true) :
-    Html.validIn ctx (View.render (v.mapScope f) s') = true := by
-  rw [View.render_mapScope]; exact hv
+    (f : σ' → σ) (v : View σ msg) (s' : σ') (hv : Html.validIn ctx (View.render v (f s')) = true) :
+    Html.validIn ctx (View.render (v.mapScope f) s') = true :=
+  (congrArg (Html.validIn ctx · = true) (View.render_mapScope f v s')).mpr hv
 
 theorem View.validListIn_renderEach_mapScopeEach_intro {σ' σ msg : Type} (ctx : HtmlCtx)
-    (f : σ' → σ) (vs : List (View σ msg)) (s' : σ')
-    (hvs : Html.validListIn ctx (View.renderEach vs (f s')) = true) :
-    Html.validListIn ctx (View.renderEach (View.mapScopeEach f vs) s') = true := by
-  rw [View.renderEach_mapScopeEach]; exact hvs
+    (f : σ' → σ) (vs : List (View σ msg)) (s' : σ') (hvs : Html.validListIn ctx (View.renderEach vs (f s')) = true) :
+    Html.validListIn ctx (View.renderEach (View.mapScopeEach f vs) s') = true :=
+  (congrArg (Html.validListIn ctx · = true) (View.renderEach_mapScopeEach f vs s')).mpr hvs
 
 theorem View.validIn_render_ite_intro {σ msg : Type} (ctx : HtmlCtx) (c : Prop) [Decidable c]
-    (a b : View σ msg) (s : σ)
-    (ht : c → Html.validIn ctx (View.render a s) = true)
+    (a b : View σ msg) (s : σ) (ht : c → Html.validIn ctx (View.render a s) = true)
     (hf : ¬ c → Html.validIn ctx (View.render b s) = true) :
-    Html.validIn ctx (View.render (if c then a else b) s) = true := by
-  rw [View.render_ite]
-  exact Html.validIn_ite_intro ctx c (View.render a s) (View.render b s) ht hf
+    Html.validIn ctx (View.render (if c then a else b) s) = true :=
+  (congrArg (Html.validIn ctx · = true) (View.render_ite c a b s)).mpr
+    (Html.validIn_ite_intro ctx c (View.render a s) (View.render b s) ht hf)
 
 theorem Html.validIn_withKey_intro {msg : Type} (ctx : HtmlCtx) (k : String) (h : Html msg)
-    (hh : Html.validIn ctx h = true) :
-    Html.validIn ctx (withKey k h) = true := by
-  rw [Html.validIn_withKey]; exact hh
+    (hh : Html.validIn ctx h = true) : Html.validIn ctx (withKey k h) = true :=
+  (Html.validIn_withKey ctx k h).trans hh
 
 theorem Html.validIn_map_intro {α β : Type} (ctx : HtmlCtx) (f : α → β) (h : Html α)
-    (hh : Html.validIn ctx h = true) :
-    Html.validIn ctx (h.map f) = true := by
-  rw [Html.validIn_map]; exact hh
+    (hh : Html.validIn ctx h = true) : Html.validIn ctx (h.map f) = true :=
+  (Html.validIn_map ctx f h).trans hh
 
-theorem Html.validListIn_mapChildren_intro {α β : Type} (ctx : HtmlCtx) (f : α → β)
-    (cs : List (Html α)) (hcs : Html.validListIn ctx cs = true) :
-    Html.validListIn ctx (Html.mapChildren f cs) = true := by
-  rw [Html.validListIn_mapChildren]; exact hcs
+theorem Html.validListIn_mapChildren_intro {α β : Type} (ctx : HtmlCtx) (f : α → β) (cs : List (Html α))
+    (hcs : Html.validListIn ctx cs = true) : Html.validListIn ctx (Html.mapChildren f cs) = true :=
+  (Html.validListIn_mapChildren ctx f cs).trans hcs
 
 theorem Html.validIn_prefixSignals_intro {msg : Type} (ctx : HtmlCtx) (pfx : String) (h : Html msg)
-    (hh : Html.validIn ctx h = true) :
-    Html.validIn ctx (h.prefixSignals pfx) = true := by
-  rw [Html.validIn_prefixSignals]; exact hh
+    (hh : Html.validIn ctx h = true) : Html.validIn ctx (h.prefixSignals pfx) = true :=
+  (Html.validIn_prefixSignals ctx pfx h).trans hh
 
-theorem Html.validListIn_prefixSignalsList_intro {msg : Type} (ctx : HtmlCtx) (pfx : String)
-    (cs : List (Html msg)) (hcs : Html.validListIn ctx cs = true) :
-    Html.validListIn ctx (Html.prefixSignalsList pfx cs) = true := by
-  rw [Html.validListIn_prefixSignalsList]; exact hcs
+theorem Html.validListIn_prefixSignalsList_intro {msg : Type} (ctx : HtmlCtx) (pfx : String) (cs : List (Html msg))
+    (hcs : Html.validListIn ctx cs = true) : Html.validListIn ctx (Html.prefixSignalsList pfx cs) = true :=
+  (Html.validListIn_prefixSignalsList ctx pfx cs).trans hcs
 
 def View.ofHtml (f : σ → Html msg) : View σ msg := .dynNode f
 

@@ -257,17 +257,28 @@ def seedRowsM [MonadDom msg m] (inst : String) (rowSig : Nat → Array (String �
 
 /-! ## Compiled Row-Template Fast-Path Helpers -/
 
-def collectTmplValsLoop (rowVals : Nat → Array String) (start count : Nat)
-    (acc : Array (Array String)) : Array (Array String) :=
+def collectRangeLoop {α : Type} (f : Nat → α) (start count : Nat) (acc : Array α) : Array α :=
   match count with
   | 0 => acc
-  | n + 1 => collectTmplValsLoop rowVals (start + 1) n (acc.push (rowVals start))
+  | n + 1 => collectRangeLoop f (start + 1) n (acc.push (f start))
 
-def collectTmplKeysLoop (rowKey : Nat → String) (start count : Nat)
-    (acc : Array String) : Array String :=
-  match count with
-  | 0 => acc
-  | n + 1 => collectTmplKeysLoop rowKey (start + 1) n (acc.push (rowKey start))
+private def disambiguateWithFlag (rawKs : Array String) : Array String × Bool :=
+  let uKeys := disambiguateKeys rawKs
+  (uKeys, uKeys != rawKs)
+
+private def mountFreshTmplRowsM [MonadDom msg m] (node : Dom.Node) (tmplId evSlot : UInt32)
+    (uKeys : Array String) (hasDups : Bool) (rowVals : Nat → Array String)
+    (count : Nat) (newMarks : Array USize) : m (VState σ msg) := do
+  if count == 0 then return .tlist node tmplId evSlot #[] false #[] #[] #[]
+  let newVals := collectRangeLoop rowVals 0 count (Array.emptyWithCapacity count)
+  let newLive ← MonadDom.mountTmplRows node tmplId newVals
+  return .tlist node tmplId evSlot uKeys hasDups newLive newVals newMarks
+
+private def initRowTmplM [MonadDom msg m] (node : Dom.Node) (childNs : String)
+    (tmpl : RowTmpl σ msg) (s : σ) : m (UInt32 × UInt32) := do
+  let tmplId ← MonadDom.compileRowTmpl childNs tmpl.proto tmpl.slotPaths tmpl.slotAttrs tmpl.evPaths tmpl.evNames
+  let evSlot ← if tmpl.evNames.isEmpty then pure 0 else MonadDom.allocRowEvSlot node (tmpl.rowEvAt s)
+  return (tmplId, evSlot)
 
 def collectChangedMarksLoop (oldMarks newMarks : @& Array USize) (i : Nat)
     (acc : Array Nat) : Array Nat :=
@@ -414,9 +425,7 @@ def patchTmplListGeneralM [MonadDom msg m] (node : Dom.Node) (tmplId evSlot : UI
     (oldKeys : Array String) (oldLive : Array Dom.Node)
     (oldVals : Array (Array String)) (oldMarks newMarks : Array USize) :
     m (VState σ msg) := do
-  let rawKs := keys s
-  let newKeys := disambiguateKeys rawKs
-  let hasDups := newKeys != rawKs
+  let (newKeys, hasDups) := disambiguateWithFlag (keys s)
   let nNew := newKeys.size
   if newKeys == oldKeys then
     let vals' ← patchDirtyRowsM tmplId oldLive oldMarks newMarks (tmpl.rowVals s) 0 oldVals
@@ -428,9 +437,7 @@ def patchTmplListGeneralM [MonadDom msg m] (node : Dom.Node) (tmplId evSlot : UI
         (Array.emptyWithCapacity nNew) (Array.replicate oldKeys.size false)
     if !used.any id then
       MonadDom.clearChildren node
-      let newVals := collectTmplValsLoop (tmpl.rowVals s) 0 nNew (Array.emptyWithCapacity nNew)
-      let newLive ← MonadDom.mountTmplRows node tmplId newVals
-      return .tlist node tmplId evSlot newKeys hasDups newLive newVals newMarks
+      mountFreshTmplRowsM node tmplId evSlot newKeys hasDups (tmpl.rowVals s) nNew newMarks
     else
       removeUnusedM node oldLive used 0
       let inLis := verifiedLisFlags sources
@@ -453,75 +460,52 @@ def patchTmplListM [MonadDom msg m] (node : Dom.Node) (attrs : List (VAttr σ ms
   if nNew == 0 then
     if nOld > 0 then MonadDom.clearChildren node
     return .tlist node tmplId evSlot #[] false #[] #[] #[]
-  else if nOld == 0 then
-    let rawKs := keys s
-    let uKeys := disambiguateKeys rawKs
-    let hasDups := uKeys != rawKs
-    let newVals := collectTmplValsLoop (tmpl.rowVals s) 0 nNew (Array.emptyWithCapacity nNew)
-    let newLive ← MonadDom.mountTmplRows node tmplId newVals
-    return .tlist node tmplId evSlot uKeys hasDups newLive newVals newMarks
-  else if !oldDups && nOld == nNew then
-    let changed := collectChangedMarksLoop oldMarks newMarks 0 #[]
-    if changed.isEmpty then
-      return .tlist node tmplId evSlot oldKeys false oldLive oldVals newMarks
-    else if allChangedKeysMatch (tmpl.rowKey s) oldKeys changed 0 then
-      let vals' ← patchChangedRowsM tmplId oldLive (tmpl.rowVals s) changed 0 oldVals
-      return .tlist node tmplId evSlot oldKeys false oldLive vals' newMarks
-    else if h2 : changed.size = 2 then
-      let a := changed[0]'(h2 ▸ Nat.zero_lt_two)
-      let b := changed[1]'(h2 ▸ Nat.one_lt_two)
-      let ka := tmpl.rowKey s a
-      let kb := tmpl.rowKey s b
-      if ka == oldKeys.getD b "" && kb == oldKeys.getD a "" then
-        let nodeA := oldLive.getD a 0
-        let nodeB := oldLive.getD b 0
-        if b == a + 1 then
+  if nOld == 0 then
+    let (uKeys, hasDups) := disambiguateWithFlag (keys s)
+    return ← mountFreshTmplRowsM node tmplId evSlot uKeys hasDups (tmpl.rowVals s) nNew newMarks
+  if !oldDups then
+    if nOld == nNew then
+      let changed := collectChangedMarksLoop oldMarks newMarks 0 #[]
+      if changed.isEmpty then
+        return .tlist node tmplId evSlot oldKeys false oldLive oldVals newMarks
+      if allChangedKeysMatch (tmpl.rowKey s) oldKeys changed 0 then
+        let vals' ← patchChangedRowsM tmplId oldLive (tmpl.rowVals s) changed 0 oldVals
+        return .tlist node tmplId evSlot oldKeys false oldLive vals' newMarks
+      if h2 : changed.size = 2 then
+        let a := changed[0]'(h2 ▸ Nat.zero_lt_two)
+        let b := changed[1]'(h2 ▸ Nat.one_lt_two)
+        let ka := tmpl.rowKey s a
+        let kb := tmpl.rowKey s b
+        if ka == oldKeys.getD b "" && kb == oldKeys.getD a "" then
+          let nodeA := oldLive.getD a 0
+          let nodeB := oldLive.getD b 0
           MonadDom.insertBeforeRef node (some nodeA) nodeB
-        else
-          let afterB := if b + 1 < nOld then some (oldLive.getD (b + 1) 0) else none
-          MonadDom.insertBeforeRef node (some nodeA) nodeB
-          MonadDom.insertBeforeRef node afterB nodeA
-        let ovA := oldVals.getD b #[]
-        let ovB := oldVals.getD a #[]
-        let nvA ←
-          if newMarks.getD a 0 != 0 && oldMarks[b]? == some (newMarks.getD a 0) then pure ovA
-          else do let v := tmpl.rowVals s a; MonadDom.patchTmplRow nodeB tmplId v ovA; pure v
-        let nvB ←
-          if newMarks.getD b 0 != 0 && oldMarks[a]? == some (newMarks.getD b 0) then pure ovB
-          else do let v := tmpl.rowVals s b; MonadDom.patchTmplRow nodeA tmplId v ovB; pure v
-        let keys' := (oldKeys.set! a ka).set! b kb
-        let live' := (oldLive.set! a nodeB).set! b nodeA
-        let vals' := (oldVals.set! a nvA).set! b nvB
-        return .tlist node tmplId evSlot keys' false live' vals' newMarks
-      else
-        patchTmplListGeneralM node tmplId evSlot keys tmpl s oldKeys oldLive oldVals oldMarks newMarks
+          if b != a + 1 then
+            MonadDom.insertBeforeRef node (if b + 1 < nOld then some (oldLive.getD (b + 1) 0) else none) nodeA
+          let patchSwapped (dstIdx srcIdx : Nat) (rowNode : Dom.Node) : m (Array String) := do
+            let ov := oldVals.getD srcIdx #[]
+            if newMarks.getD dstIdx 0 != 0 && oldMarks[srcIdx]? == some (newMarks.getD dstIdx 0) then pure ov
+            else do let v := tmpl.rowVals s dstIdx; MonadDom.patchTmplRow rowNode tmplId v ov; pure v
+          let nvA ← patchSwapped a b nodeB
+          let nvB ← patchSwapped b a nodeA
+          return .tlist node tmplId evSlot ((oldKeys.set! a ka).set! b kb) false
+            ((oldLive.set! a nodeB).set! b nodeA) ((oldVals.set! a nvA).set! b nvB) newMarks
     else
-      patchTmplListGeneralM node tmplId evSlot keys tmpl s oldKeys oldLive oldVals oldMarks newMarks
-  else if !oldDups then
-    let p := prefixMatchLen oldMarks newMarks 0
-    if p == nOld && nNew > nOld then
-      let addCount := nNew - nOld
-      let tailVals := collectTmplValsLoop (tmpl.rowVals s) nOld addCount (Array.emptyWithCapacity addCount)
-      let tailKeys := collectTmplKeysLoop (tmpl.rowKey s) nOld addCount (Array.emptyWithCapacity addCount)
-      let rawKs := oldKeys ++ tailKeys
-      let uKeys := disambiguateKeys rawKs
-      let hasDups := uKeys != rawKs
-      let tailLive ← MonadDom.mountTmplRows node tmplId tailVals
-      return .tlist node tmplId evSlot uKeys hasDups (oldLive ++ tailLive) (oldVals ++ tailVals) newMarks
-    else if nNew < nOld then
-      let q := suffixMatchLen oldMarks newMarks p 0
-      if p + q == nNew then
-        removeRangeM node oldLive p (nOld - q)
-        let keys' := oldKeys.extract 0 p ++ oldKeys.extract (nOld - q) nOld
-        let live' := oldLive.extract 0 p ++ oldLive.extract (nOld - q) nOld
-        let vals' := oldVals.extract 0 p ++ oldVals.extract (nOld - q) nOld
-        return .tlist node tmplId evSlot keys' false live' vals' newMarks
-      else
-        patchTmplListGeneralM node tmplId evSlot keys tmpl s oldKeys oldLive oldVals oldMarks newMarks
-    else
-      patchTmplListGeneralM node tmplId evSlot keys tmpl s oldKeys oldLive oldVals oldMarks newMarks
-  else
-    patchTmplListGeneralM node tmplId evSlot keys tmpl s oldKeys oldLive oldVals oldMarks newMarks
+      let p := prefixMatchLen oldMarks newMarks 0
+      if p == nOld && nNew > nOld then
+        let addCount := nNew - nOld
+        let tailVals := collectRangeLoop (tmpl.rowVals s) nOld addCount (Array.emptyWithCapacity addCount)
+        let tailKeys := collectRangeLoop (tmpl.rowKey s) nOld addCount (Array.emptyWithCapacity addCount)
+        let (uKeys, hasDups) := disambiguateWithFlag (oldKeys ++ tailKeys)
+        let tailLive ← MonadDom.mountTmplRows node tmplId tailVals
+        return .tlist node tmplId evSlot uKeys hasDups (oldLive ++ tailLive) (oldVals ++ tailVals) newMarks
+      if nNew < nOld then
+        let q := suffixMatchLen oldMarks newMarks p 0
+        if p + q == nNew then
+          removeRangeM node oldLive p (nOld - q)
+          let keep {α} (arr : Array α) := arr.extract 0 p ++ arr.extract (nOld - q) nOld
+          return .tlist node tmplId evSlot (keep oldKeys) false (keep oldLive) (keep oldVals) newMarks
+  patchTmplListGeneralM node tmplId evSlot keys tmpl s oldKeys oldLive oldVals oldMarks newMarks
 
 mutual
 def buildViewM [MonadDom msg m] (ns : String) :
@@ -555,21 +539,13 @@ def buildViewM [MonadDom msg m] (ns : String) :
       let n ← buildDomM ns html
       return (n, .memo n k html)
   | .keyedList tag attrs keys marks _ _ _ (some tmpl), s => do
-      let rawKs := keys s
-      let uKeys := disambiguateKeys rawKs
-      let hasDups := uKeys != rawKs
+      let (uKeys, hasDups) := disambiguateWithFlag (keys s)
       let node ← MonadDom.createElement ns tag
       applyAttrsM node (attrs.map (VAttr.eval s))
-      let tmplId ← MonadDom.compileRowTmpl (Dom.childNsOf ns tag) tmpl.proto tmpl.slotPaths tmpl.slotAttrs tmpl.evPaths tmpl.evNames
-      let evSlot ← if tmpl.evNames.isEmpty then pure 0 else MonadDom.allocRowEvSlot node (tmpl.rowEvAt s)
+      let (tmplId, evSlot) ← initRowTmplM node (Dom.childNsOf ns tag) tmpl s
       let nMarks := marks s
-      let n := nMarks.size
-      if n == 0 then
-        return (node, .tlist node tmplId evSlot #[] false #[] #[] #[])
-      else
-        let newVals := collectTmplValsLoop (tmpl.rowVals s) 0 n (Array.emptyWithCapacity n)
-        let newLive ← MonadDom.mountTmplRows node tmplId newVals
-        return (node, .tlist node tmplId evSlot uKeys hasDups newLive newVals nMarks)
+      let st ← mountFreshTmplRowsM node tmplId evSlot uKeys hasDups (tmpl.rowVals s) nMarks.size nMarks
+      return (node, st)
   | .keyedList tag attrs keys marks rowSig rowEv rowsHtml none, s => do
       let uKeys := disambiguateKeys (keys s)
       let node ← MonadDom.createElement ns tag
@@ -751,17 +727,13 @@ def hydrateViewM [MonadDom msg m] :
       hydrateDomM html node
       return .memo node k html
   | .keyedList _ attrs keys marks _ _ _ (some tmpl), s, node => do
-      let rawKs := keys s
-      let uKeys := disambiguateKeys rawKs
-      let hasDups := uKeys != rawKs
+      let (uKeys, hasDups) := disambiguateWithFlag (keys s)
       MonadDom.clearHandlers node
       applyAttrsM node (attrs.map (VAttr.eval s))
-      let childNs ← MonadDom.childNamespace node
-      let tmplId ← MonadDom.compileRowTmpl childNs tmpl.proto tmpl.slotPaths tmpl.slotAttrs tmpl.evPaths tmpl.evNames
-      let evSlot ← if tmpl.evNames.isEmpty then pure 0 else MonadDom.allocRowEvSlot node (tmpl.rowEvAt s)
+      let (tmplId, evSlot) ← initRowTmplM node (← MonadDom.childNamespace node) tmpl s
       let nMarks := marks s
       let n := nMarks.size
-      let newVals := collectTmplValsLoop (tmpl.rowVals s) 0 n (Array.emptyWithCapacity n)
+      let newVals := collectRangeLoop (tmpl.rowVals s) 0 n (Array.emptyWithCapacity n)
       let live ← hydrateTmplRowsM node tmplId 0 n (Array.emptyWithCapacity n)
       return .tlist node tmplId evSlot uKeys hasDups live newVals nMarks
   | .keyedList _ attrs keys marks rowSig rowEv rowsHtml none, s, node => do

@@ -454,4 +454,92 @@ server BadAwaitInAtomicJob:
       let _ = await HealthPing.ping()?
       count += 1
 
+/-! ## 5. Verified Typed Dictionaries (`{K: V}`) — Components, Servers, JSON, Proto & Proofs -/
+
+example : Qed.LawfulJson (Qed.Dict String Nat) := inferInstance
+example : Qed.LawfulJson (Qed.Dict Nat String) := inferInstance
+example : Qed.LawfulProto (Qed.Dict String Nat) := inferInstance
+example : Qed.LawfulProto (Qed.Dict Nat (Array String)) := inferInstance
+
+#guard
+  let d : Qed.Dict String Nat := Qed.Dict.ofList [("alice", 10), ("bob", 20)]
+  Qed.Json.render (Qed.toJson d) == "{\"alice\":10,\"bob\":20}"
+
+#guard
+  let d : Qed.Dict String Nat := Qed.Dict.ofList [("alice", 10), ("bob", 20)]
+  match Qed.Proto.decode (α := Qed.Dict String Nat) (Qed.Proto.encode d) with
+  | .ok d' => d' == d
+  | .error _ => false
+
+component Scoreboard:
+  state scores : {String: Nat}
+  state preset = {"alice": 10, "bob": 20}
+
+  invariant capped: scores.size <= 100
+
+  action record(name: String, pts: Nat):
+    if scores.size < 100 or name in scores:
+      scores[name] = pts
+
+  action clear(name: String):
+    scores.remove(name)
+
+  action resetAll:
+    scores = {}
+
+  example recordConcrete:
+    .record("alice", 42) -> scores["alice"] == some(42)
+
+  example recordAndRead(name: String, pts: Nat):
+    .record(name, pts) -> scores[name] == some(pts)
+
+  example recordThenClear(name: String, pts: Nat):
+    .record(name, pts), .clear(name) -> name not in scores
+
+  view:
+    <section>
+      <h2>Scores ({scores.size})</h2>
+      <ul>
+        {for (name, pts) in scores.entries:
+          <li key={name}>{name}: {pts}</li>}
+      </ul>
+    </section>
+
+server ScoreboardApi:
+  state scores : {String: Nat}
+  state nested : {String: Nat[]}
+  invariant capped: scores.size <= 100
+
+  def record(name: String, pts: Nat) -> {String: Nat}:
+    if scores.size < 100 or name in scores:
+      scores[name] = pts
+    return scores
+
+  def lookup(name: String) -> Nat?:
+    return scores[name]
+
+  def clear(name: String) -> Unit:
+    scores.remove(name)
+
+  get "/scores":
+    return json(scores)
+
+  get "/by-id":
+    let byId : {Nat: String} = {1: "one", 2: "two"}
+    return json(byId)
+
+-- Negative: dictionary mutation violating size invariant is rejected at compile time
+/--
+error: Server invariant `capped` failed in `recordUnsafe`:
+  • must satisfy:  (if scores.contains name = true then scores.size else scores.size + 1) <= 100
+
+Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant holds across every branch.
+-/
+#guard_msgs in
+server BadDictCap:
+  state scores : {String: Nat}
+  invariant capped: scores.size <= 100
+  def recordUnsafe(name: String, pts: Nat) -> Unit:
+    scores[name] = pts
+
 end VerificationChecks

@@ -1,4 +1,5 @@
 import Lean
+import Qed.Dict
 
 namespace Qed.Lang
 
@@ -28,9 +29,11 @@ class QedMem (α : Type) (C : Type) where
 @[inline] instance {α : Type} [BEq α] : QedMem α (Array α) := ⟨fun x xs => xs.contains x⟩
 @[inline] instance {α : Type} [BEq α] : QedMem α (List α) := ⟨fun x xs => xs.contains x⟩
 @[inline] instance : QedMem Char String := ⟨fun c s => s.contains c⟩
+@[inline] instance {K V : Type} [BEq K] : QedMem K (Qed.Dict K V) := ⟨fun k d => d.contains k⟩
 @[simp] theorem QedMem.mem_array {α : Type} [BEq α] (x : α) (xs : Array α) : QedMem.mem x xs = xs.contains x := rfl
 @[simp] theorem QedMem.mem_list {α : Type} [BEq α] (x : α) (xs : List α) : QedMem.mem x xs = xs.contains x := rfl
 @[simp] theorem QedMem.mem_string (c : Char) (s : String) : QedMem.mem c s = s.contains c := rfl
+@[simp] theorem QedMem.mem_dict {K V : Type} [BEq K] (k : K) (d : Qed.Dict K V) : QedMem.mem k d = d.contains k := rfl
 
 /-- Propositional membership (`x in xs`) for invariants, guards, and schema `where` clauses. -/
 class QedMemProp (α : Type) (C : Type) where
@@ -39,9 +42,11 @@ class QedMemProp (α : Type) (C : Type) where
 @[reducible] instance {α : Type} : QedMemProp α (Array α) := ⟨fun x xs => x ∈ xs⟩
 @[reducible] instance {α : Type} : QedMemProp α (List α) := ⟨fun x xs => x ∈ xs⟩
 @[reducible] instance : QedMemProp Char String := ⟨fun c s => s.contains c = true⟩
+@[reducible] instance {K V : Type} [BEq K] : QedMemProp K (Qed.Dict K V) := ⟨fun k d => d.contains k = true⟩
 @[simp] theorem QedMemProp.memProp_array {α : Type} (x : α) (xs : Array α) : QedMemProp.memProp x xs = (x ∈ xs) := rfl
 @[simp] theorem QedMemProp.memProp_list {α : Type} (x : α) (xs : List α) : QedMemProp.memProp x xs = (x ∈ xs) := rfl
 @[simp] theorem QedMemProp.memProp_string (c : Char) (s : String) : QedMemProp.memProp c s = (s.contains c = true) := rfl
+@[simp] theorem QedMemProp.memProp_dict {K V : Type} [BEq K] (k : K) (d : Qed.Dict K V) : QedMemProp.memProp k d = (d.contains k = true) := rfl
 
 instance {α : Type} [DecidableEq α] (x : α) (xs : Array α) : Decidable (QedMemProp.memProp x xs) :=
   inferInstanceAs (Decidable (x ∈ xs))
@@ -49,6 +54,8 @@ instance {α : Type} [DecidableEq α] (x : α) (xs : List α) : Decidable (QedMe
   inferInstanceAs (Decidable (x ∈ xs))
 instance (c : Char) (s : String) : Decidable (QedMemProp.memProp c s) :=
   inferInstanceAs (Decidable (s.contains c = true))
+instance {K V : Type} [BEq K] (k : K) (d : Qed.Dict K V) : Decidable (QedMemProp.memProp k d) :=
+  inferInstanceAs (Decidable (d.contains k = true))
 
 /-- Dependent short-circuit conjunction preserving earlier index bounds hypotheses in `Prop`. -/
 structure QedAndProp (P : Prop) (Q : P → Prop) : Prop where
@@ -131,6 +138,9 @@ def qedBinder : Parser := ident <|> symbol "_"
 
 @[qedType_parser] def qedTypeProto : Parser := leading_parser:maxPrec
   atomic (kw "Proto" >> "(") >> ident >> ")" >> many (categoryParser `qedTypeMod 0)
+@[qedType_parser] def qedTypeDict : Parser := leading_parser:maxPrec
+  atomic ("{" >> categoryParser `qedType 0 >> ":") >> categoryParser `qedType 0 >> "}" >>
+  many (categoryParser `qedTypeMod 0)
 @[qedType_parser] def qedTypeParen : Parser := leading_parser:maxPrec
   "(" >> sepBy1 (categoryParser `qedType 0) "," >> ")" >> many (categoryParser `qedTypeMod 0)
 @[qedType_parser] def qedTypeAtom : Parser := leading_parser:maxPrec
@@ -159,6 +169,7 @@ def qedBinder : Parser := ident <|> symbol "_"
 @[qedCallArg_parser] def qedCallArgPos : Parser := leading_parser categoryParser `qedExpr 0
 
 def qedRecField : Parser := node `Qed.Lang.recField (atomic (ident >> "=") >> categoryParser `qedExpr 0)
+def qedDictEntry : Parser := node `Qed.Lang.dictEntry (categoryParser `qedExpr 0 >> ":" >> categoryParser `qedExpr 0)
 def qedExprCase : Parser := leading_parser
   withPosition (atomic (kw "case") >> sepBy1 (categoryParser `qedPat 0) "," >> ":" >> categoryParser `qedExpr 0)
 def qedLamParam : Parser := node `Qed.Lang.lamParam (qedBinder >> optional (":" >> categoryParser `qedType 0))
@@ -177,6 +188,9 @@ private def notReservedExprKw : Parser :=
 @[qedExpr_parser] def qedLitChar     : Parser := leading_parser:maxPrec charLit
 @[qedExpr_parser] def qedFStr        : Parser := leading_parser:maxPrec atomic (kw "f" >> checkNoWsBefore "") >> interpolatedStr (categoryParser `qedExpr 0)
 @[qedExpr_parser] def qedArrLit      : Parser := leading_parser:maxPrec "[" >> sepBy (categoryParser `qedExpr 0) "," >> "]"
+@[qedExpr_parser] def qedDictLit     : Parser := leading_parser:maxPrec
+  atomic ("{" >> categoryParser `qedExpr 0 >> ":") >> categoryParser `qedExpr 0 >>
+  many ("," >> qedDictEntry) >> optional "," >> "}"
 @[qedExpr_parser] def qedRecLit      : Parser := leading_parser:maxPrec "{" >> optional (atomic (categoryParser `qedExpr 0 >> symbol "with")) >> sepBy qedRecField "," >> "}"
 @[qedExpr_parser] def qedFieldSetter : Parser := leading_parser:maxPrec atomic ("(" >> ident >> "=" >> symbol "_" >> ")")
 @[qedExpr_parser] def qedTypeAscr    : Parser := leading_parser:maxPrec atomic ("(" >> categoryParser `qedExpr 0 >> ":" >> categoryParser `qedType 0 >> ")")
@@ -233,7 +247,7 @@ def qedCmpLink : Parser := node `Qed.Lang.cmpLink (qedCmpOp >> categoryParser `q
   withPosition (symbol "if" >> notFollowedBy (symbol "let") "let" >> categoryParser `qedExpr 0 >> ":" >>
     categoryParser `qedExpr 0 >> optional (atomic (checkColGe >> symbol "else" >> ":") >> categoryParser `qedExpr 0))
 @[qedExpr_parser 10] def qedExprFor : Parser := leading_parser:10
-  withPosition (atomic (symbol "for" >> ident >> symbol "in") >> categoryParser `qedExpr 0 >> ":" >> categoryParser `qedExpr 0)
+  withPosition (atomic (symbol "for" >> categoryParser `qedPat 0 >> symbol "in") >> categoryParser `qedExpr 0 >> ":" >> categoryParser `qedExpr 0)
 @[qedExpr_parser 10] def qedExprMatch : Parser := leading_parser:10
   withPosition (symbol "match" >> sepBy1 (categoryParser `qedExpr 0) "," >> ":" >> many1 (checkColGt >> qedExprCase))
 
@@ -348,6 +362,12 @@ def matchPushCall? (stx : Syntax) : Option (Syntax × Syntax) := do
   guard (meth == "push" && rawArgs.size == 1 && rawArgs[0]!.getKind == ``qedCallArgPos)
   return (target, rawArgs[0]![0])
 
+/-- Matches a standalone `target.remove(key)` call expression, returning `(targetExpr, keyExpr)`. -/
+def matchRemoveCall? (stx : Syntax) : Option (Syntax × Syntax) := do
+  let (target, meth, rawArgs) ← matchMethodCall? stx
+  guard (meth == "remove" && rawArgs.size == 1 && rawArgs[0]!.getKind == ``qedCallArgPos)
+  return (target, rawArgs[0]![0])
+
 inductive TypeMod where | array | option | fallible deriving Inhabited, DecidableEq, Repr
 
 /-- Pretty source snippet of a syntax node without trailing comments/newlines. -/
@@ -405,6 +425,12 @@ partial def lowerQedType (stx : Syntax) (allowFallible := false) : MacroM (Term 
   if k == ``qedTypeProto then
     let (baseId, initMods) ← splitIdentMods ⟨(stx.getArg 2)⟩
     applyTypeMods ⟨baseId.raw⟩ (initMods ++ (← (stx.getArg 4).getArgs.mapM parseTypeModNode)) allowFallible stx
+  else if k == ``qedTypeDict then
+    let (kTy, _) ← lowerQedType (stx.getArg 1) false
+    let (vTy, _) ← lowerQedType (stx.getArg 3) false
+    let dictId := mkIdentFrom stx `Qed.Dict
+    let baseT ← `($dictId $kTy $vTy)
+    applyTypeMods baseT (← (stx.getArg 5).getArgs.mapM parseTypeModNode) allowFallible stx
   else if k == ``qedTypeParen then
     let lowered ← (stx.getArg 1).getSepArgs.mapM fun p => return (← lowerQedType p false).1
     let baseT ← if lowered.size == 1 then pure lowered[0]!
@@ -434,7 +460,11 @@ partial def inferQedTypeDefault? (stx : Syntax) : MacroM (Option Term) := do
   let k := stx.getKind
   let modDef (mods : Array TypeMod) : MacroM (Option Term) :=
     match mods.back? with | some .array => some <$> `(#[]) | some .option => some <$> `(none) | _ => pure none
-  if k == ``qedTypeParen then
+  if k == ``qedTypeDict then
+    if let some d ← modDef (← (stx.getArg 5).getArgs.mapM parseTypeModNode) then return some d
+    let emptyId := mkIdentFrom stx `Qed.Dict.empty
+    some <$> `($emptyId)
+  else if k == ``qedTypeParen then
     if let some d ← modDef (← (stx.getArg 3).getArgs.mapM parseTypeModNode) then return some d
     if (stx.getArg 1).getSepArgs.size == 1 then inferQedTypeDefault? (stx.getArg 1).getSepArgs[0]! else return none
   else if k == ``qedTypeAtom then
@@ -497,7 +527,7 @@ def isPlainLiteralOrCtor (stx : Syntax) : Bool :=
   let isPlainField (f : String) : Bool :=
     f == "size" || f == "length" || f == "isSome" || f == "isNone" || f == "isEmpty" || f == "val"
   if k == ``qedLitNum || k == ``qedLitSci || k == ``qedLitStr || k == ``qedLitChar ||
-      k == ``qedFStr || k == ``qedArrLit || k == ``qedRecLit || k == ``qedDotIdent ||
+      k == ``qedFStr || k == ``qedArrLit || k == ``qedDictLit || k == ``qedRecLit || k == ``qedDotIdent ||
       k == ``qedNeg || k == ``qedMul || k == ``qedDiv || k == ``qedMod ||
       k == ``qedAdd || k == ``qedSub || k == ``qedCat then true
   else if k == ``qedIdent then
@@ -684,6 +714,17 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
       | "qedArrLit" =>
         let elems ← (stx.getArg 1).getSepArgs.mapM fun e => do hooks.lowerArrElem (← go .val e)
         if hooks.useDirectArray then `(#[$[$elems],*]) else `(Qed.Lang.QedSeqLit.ofList [$[$elems],*])
+      | "qedDictLit" =>
+        let k0 ← go .val (stx.getArg 1)
+        let v0 ← go .val (stx.getArg 3)
+        let mut pairs : Array Term := #[← `(($k0, $v0))]
+        for restEntry in (stx.getArg 4).getArgs do
+          let e := restEntry.getArg 1
+          let ke ← go .val (e.getArg 0)
+          let ve ← go .val (e.getArg 2)
+          pairs := pairs.push (← `(($ke, $ve)))
+        let ofListId := mkIdentFrom stx `Qed.Dict.ofList
+        `($ofListId [$[$pairs],*])
       | "qedRecLit" =>
         let fields := (stx.getArg 2).getSepArgs
         let fIds : Array Ident := fields.map (⟨·[0]⟩)
@@ -754,8 +795,16 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
           `(Lean.Parser.Term.matchAltExpr| | $[$(← (c.getArg 1).getSepArgs.mapM hooks.lowerPat):term],* => $(← go mode (c.getArg 3)))
         `(match $[$scruts:term],* with $[$alts:matchAlt]*)
       | "qedExprFor" =>
-        let xId : Ident := ⟨(stx.getArg 1)⟩
-        `(Qed.mapList (Qed.ForEachItems.toList $(← go .val (stx.getArg 3))) (fun $xId:ident => $(← go .val (stx.getArg 5))))
+        let patStx := stx.getArg 1
+        let xsT ← go .val (stx.getArg 3)
+        let bodyT ← hooks.withLocals ((collectQedPatIds patStx).map (·.toString)) (go .val (stx.getArg 5))
+        let fnT ← if patStx.getKind == ``qedPatIdent && (patStx.getArg 1).getNumArgs == 0 then
+            let xId : Ident := ⟨patStx.getArg 0⟩
+            `(fun $xId:ident => $bodyT)
+          else
+            let patT ← hooks.lowerPat patStx
+            `(fun _qed_fe => match _qed_fe with | $patT => $bodyT)
+        `(Qed.mapList (Qed.ForEachItems.toList $xsT) $fnT)
       | _ => hooks.lowerJsx stx mode
     | _ => hooks.lowerJsx stx mode
   go mode stx

@@ -42,6 +42,10 @@ import Examples.LiveRoom
 #print axioms Qed.parse_render
 #print axioms Qed.Json.render_eq_renderFast
 #print axioms Qed.LawfulJson.parse_render_toJson
+#print axioms Qed.Dict.get_set
+#print axioms Qed.Dict.get_remove
+#print axioms Qed.Dict.size_set
+#print axioms Qed.Dict.size_remove_le
 #print axioms Qed.hydrate_coalesce
 
 -- XSS, URL Scheme & HTML5 Serialization Closure (#3b)

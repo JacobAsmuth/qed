@@ -1,5 +1,6 @@
 import Qed.Json.Lawful
 import Qed.Proto
+import Qed.Dict
 import Qed.Router.Basic
 import Qed.Collection
 import Qed.Server.Db.Core

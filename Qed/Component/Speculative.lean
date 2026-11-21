@@ -82,6 +82,12 @@ private partial def compileClassifyTree (spec : ComponentSpec) : ClassifyTree �
             let elemT ← lowerCompExpr .val elemStx
             let fIdent := mkIdent fname
             return ← `(let $fIdent:ident := ($fIdent).push $elemT; $bodyT)
+        else if let some (targetStx, keyStx) := matchRemoveCall? (st.getArg 0) then
+          if targetStx.getKind == ``qedIdent then
+            let fname := (targetStx.getArg 0).getId.eraseMacroScopes
+            let keyT ← lowerCompExpr .val keyStx
+            let fIdent := mkIdent fname
+            return ← `(let $fIdent:ident := ($fIdent).remove $keyT; $bodyT)
         pure bodyT
       else
         pure bodyT

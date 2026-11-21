@@ -346,8 +346,25 @@ def lowerLetStmt (st : Syntax) (lowerVal : Syntax → CommandElabM Term) (cont :
     else `(let $lId:ident := $rhsT; $cont)
   else `(let _ := $rhsT; $cont)
 
+syntax (name := qedCompSetAtStx) "qedCompSetAt(" ident ", " term ", " term ")" : term
+
+open Lean Meta Elab Term in
+@[term_elab qedCompSetAtStx]
+def elabQedCompSetAt : TermElab := fun stx expectedType? => do
+  let fId : Ident := ⟨stx.getArg 1⟩
+  let idxStx : Term := ⟨stx.getArg 3⟩
+  let valStx : Term := ⟨stx.getArg 5⟩
+  let arrExpr ← elabTerm fId none
+  synthesizeSyntheticMVarsNoPostponing
+  let arrTy ← whnf (← instantiateMVars (← inferType arrExpr))
+  if arrTy.isAppOfArity `Qed.Dict 2 then
+    let setId := mkIdentFrom stx `Qed.Dict.set
+    elabTerm (← `($setId $fId $idxStx $valStx)) expectedType?
+  else
+    elabTerm (← `(($fId).set $idxStx $valStx (by first | get_elem_tactic | (simp (config := { zetaDelta := false }) only [$fId:ident, Array.size_set, Array.size_push] <;> omega)))) expectedType?
+
 def lowerArraySetExpr (fIdent : Ident) (idxT rhsT cont : Term) : CommandElabM Term :=
-  `(let $fIdent:ident := ($fIdent).set $idxT $rhsT (by first | get_elem_tactic | (simp (config := { zetaDelta := false }) only [$fIdent:ident, Array.size_set, Array.size_push] <;> omega)); $cont)
+  `(let $fIdent:ident := qedCompSetAt($fIdent, $idxT, $rhsT); $cont)
 
 def lowerControlFlowStmt (st : Syntax) (lowerVal : Syntax → CommandElabM Term)
     (lowerBranch : Array Syntax → CommandElabM Term) : CommandElabM Term := do
@@ -699,21 +716,22 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
   else if k == ``qedLam1 || k == ``qedLamN then
     return Syntax.node .none k (← stx.getArgs.mapM (rewriteIn ctx true))
   else if k == ``qedExprFor then
-    let bindId : Ident := ⟨(stx.getArg 1)⟩
+    let patStx := stx.getArg 1
     let collRaw := (stx.getArg 3)
     let collRewritten ← rewriteIn ctx inLambda collRaw
     let mut bodyRewritten ← rewriteIn ctx true (stx.getArg 5)
-    if collRaw.getKind == ``qedIdent then
+    if collRaw.getKind == ``qedIdent && patStx.getKind == ``qedPatIdent && (patStx.getArg 1).getNumArgs == 0 then
+      let bindId : Ident := ⟨patStx.getArg 0⟩
       let colName := (collRaw.getArg 0).getId.eraseMacroScopes
       if let some (_, childCompId) := ctx.collections.find? (·.1.getId == colName) then
         if let some cInfo ← liftCoreM (lookupComponent? childCompId.getId) then
           if (← liftCoreM getEnv).contains (cInfo.fullName ++ `keyOf) then
             bodyRewritten ← injectAutoKey bodyRewritten cInfo.fullName bindId
-    return Syntax.node .none k #[(stx.getArg 0), (stx.getArg 1), (stx.getArg 2), collRewritten, (stx.getArg 4), bodyRewritten]
+    return Syntax.node .none k #[(stx.getArg 0), patStx, (stx.getArg 2), collRewritten, (stx.getArg 4), bodyRewritten]
   else if k == ``qedStmtExpr then
     let e := stx.getArg 0
     let isHandleOrPush :=
-      (matchPushCall? e).isSome ||
+      (matchPushCall? e).isSome || (matchRemoveCall? e).isSome ||
       (match matchIdentMethodCall? e with
       | some (id, "emit", _) => ctx.eventNames.contains id.getId.eraseMacroScopes
       | some (id, "send", _) =>

@@ -156,7 +156,7 @@ private def forEachControlSubSuite (st : Syntax) (f : Array Syntax → CommandEl
 private partial def checkPureSpecCont (ctx : RewriteCtx) (stmts : Array Syntax) : CommandElabM Unit := do
   for st in stmts do
     let k := st.getKind
-    if k == ``qedStmtExpr && (matchPushCall? (st.getArg 0)).isNone then
+    if k == ``qedStmtExpr && (matchPushCall? (st.getArg 0)).isNone && (matchRemoveCall? (st.getArg 0)).isNone then
       throwErrorAt st "cannot run side effects or emit events inside a speculative continuation after `predict` (side effects cannot be rolled back); move it into `on_confirm:`"
     else if (k == ``qedStmtLet && (unwrapParens1 (st.getArg 4)).getKind == ``qedAwait) ||
             (k == ``qedStmtAssign && (unwrapParens1 (st.getArg 2)).getKind == ``qedAwait) then
@@ -174,8 +174,8 @@ private partial def checkPurePredictBlock (stmts : Array Syntax) : CommandElabM 
     if k == ``qedStmtAssign then
       throwErrorAt st "`predict:` computes a predicted server response and cannot mutate state or perform side effects"
     else if k == ``qedStmtExpr then
-      if (matchPushCall? (st.getArg 0)).isSome then
-        throwErrorAt st "`predict:` computes a predicted server response and cannot mutate state with `.push(...)`"
+      if (matchPushCall? (st.getArg 0)).isSome || (matchRemoveCall? (st.getArg 0)).isSome then
+        throwErrorAt st "`predict:` computes a predicted server response and cannot mutate state with `.push(...)`/`.remove(...)`"
       else if let some (_, meth, _) := matchIdentMethodCall? (st.getArg 0) then
         if meth == "send" || meth == "emit" then
           throwErrorAt st "`predict:` computes a predicted server response and cannot mutate state or perform side effects"

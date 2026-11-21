@@ -222,6 +222,8 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Lean
             #[Syntax.atom (.fromRef c) "[", Syntax.node (.fromRef c) Lean.nullKind #[], Syntax.atom (.fromRef c) "]"])
         else if ty.mods.back? == some .option then
           pure (Syntax.node (.fromRef c) ``qedIdent #[mkIdentFrom c `none])
+        else if ty.dictKv?.isSome && ty.mods.isEmpty then
+          pure (Syntax.node (.fromRef c) ``qedIdent #[mkIdentFrom c `Qed.Dict.empty])
         else
           throwErrorAt id s!"state field `{id.getId}` requires an initial value `= ...`"
       stateDecls := stateDecls.push { ref := c, ident := id, ty, initStx }

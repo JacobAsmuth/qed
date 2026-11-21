@@ -261,8 +261,9 @@ partial def hasFreeIdent (target : Name) (stx : Syntax) : Bool :=
     if bound then false else hasFreeIdent target (stx.getArg 4)
   else if k == ``qedExprFor then
     let b := stx.getArg 1
+    let boundIds := Qed.Lang.collectQedPatIds b
     hasFreeIdent target (stx.getArg 3) ||
-      (!(b.isIdent && b.getId.eraseMacroScopes == target) && hasFreeIdent target (stx.getArg 5))
+      (!boundIds.contains target && hasFreeIdent target (stx.getArg 5))
   else if k == ``Qed.Jsx.attrNamed then
     hasFreeIdent target (stx.getArg 1)
   else
@@ -278,7 +279,7 @@ def isEventEmitExpr (eventNames : Array Name) (exprStx : Syntax) : Bool :=
 
 partial def hasEffectStmt (eventNames : Array Name) (stx : Syntax) : Bool :=
   let k := stx.getKind
-  (k == ``qedStmtExpr && (matchPushCall? (stx.getArg 0)).isNone && !isEventEmitExpr eventNames (stx.getArg 0)) ||
+  (k == ``qedStmtExpr && (matchPushCall? (stx.getArg 0)).isNone && (matchRemoveCall? (stx.getArg 0)).isNone && !isEventEmitExpr eventNames (stx.getArg 0)) ||
   (k == ``qedStmtLet && (unwrapParens1 (stx.getArg 4)).getKind == ``qedAwait) ||
   (k == ``qedStmtAssign && (unwrapParens1 (stx.getArg 2)).getKind == ``qedAwait) ||
   stx.getArgs.any (hasEffectStmt eventNames)

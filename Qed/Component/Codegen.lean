@@ -201,6 +201,19 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
           let fIdent := mkIdent fname
           let cont ← compileStmts spec sBase (mutated.push fname) out? cmds rest
           `(let $fIdent:ident := ($fIdent).push $elemT; $cont)
+        else if let some (targetStx, keyStx) := matchRemoveCall? exprStx then
+          unless targetStx.getKind == ``qedIdent do
+            let tgtStr := stxSnippet targetStx
+            let got := if tgtStr.isEmpty then "" else s!", got `{tgtStr}.remove(...)`"
+            throwErrorAt targetStx s!"dictionary `.remove(...)` in component actions requires a simple `state` field (e.g. `scores.remove(k)`){got}"
+          let fId : Ident := ⟨(targetStx.getArg 0)⟩
+          let fname := fId.getId.eraseMacroScopes
+          unless spec.fieldNames.contains fname do
+            throwNotMutableStateField fId s!"`{fname}`" fname spec.fieldNames spec.propNames
+          let keyT ← lowerCompExpr .val keyStx
+          let fIdent := mkIdent fname
+          let cont ← compileStmts spec sBase (mutated.push fname) out? cmds rest
+          `(let $fIdent:ident := ($fIdent).remove $keyT; $cont)
         else if let some (targetId, meth, rawArgs) := matchIdentMethodCall? exprStx then
           let tname := targetId.getId.eraseMacroScopes
           if meth == "emit" then

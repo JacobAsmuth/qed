@@ -54,7 +54,13 @@ private def boolSimpNames : Array Lean.Name := #[
   ``beq_iff_eq, ``bne_iff_ne, ``decide_eq_true_eq]
 
 private def arrayCoreSimpNames : Array Lean.Name := #[
-  ``Array.size_set, ``Array.size_push, ``Array.getElem_set_self]
+  ``Array.size_set, ``Array.size_push, ``Array.getElem_set_self,
+  ``Qed.Dict.emptyCollection_eq_empty, ``Qed.Dict.getElem_eq_get,
+  ``Qed.Lang.QedMem.mem_dict, ``Qed.Lang.QedMemProp.memProp_dict,
+  ``Qed.Dict.get_empty, ``Qed.Dict.contains_empty, ``Qed.Dict.size_empty, ``Qed.Dict.isEmpty_empty,
+  ``Qed.Dict.get_set, ``Qed.Dict.get_set_self, ``Qed.Dict.contains_set, ``Qed.Dict.contains_set_self,
+  ``Qed.Dict.get_remove, ``Qed.Dict.get_remove_self, ``Qed.Dict.contains_remove, ``Qed.Dict.contains_remove_self,
+  ``Qed.Dict.size_set, ``Qed.Dict.isEmpty_iff_size]
 
 private def stepCombSimpNames : Array Lean.Name := #[
   ``Qed.Server.srvSeq_none, ``Qed.Server.srvSeq_some,
@@ -107,7 +113,12 @@ private def boundsHypSimpNames : Array Lean.Name :=
     ``Qed.Server.SrvIdx.toNat_nat, ``Qed.Server.SrvIdx.toNat_fin] ++ boolSimpNames
 
 private def finishAtomPreSimpNames : Array Lean.Name :=
-  valUnwrapSimpNames ++ liftOptSimpNames ++ #[``Array.getElem_set_self]
+  valUnwrapSimpNames ++ liftOptSimpNames ++ #[``Array.getElem_set_self,
+    ``Qed.Dict.emptyCollection_eq_empty, ``Qed.Dict.getElem_eq_get,
+    ``Qed.Lang.QedMem.mem_dict, ``Qed.Lang.QedMemProp.memProp_dict,
+    ``Qed.Dict.get_empty, ``Qed.Dict.contains_empty, ``Qed.Dict.size_empty,
+    ``Qed.Dict.get_set, ``Qed.Dict.contains_set, ``Qed.Dict.get_remove, ``Qed.Dict.contains_remove,
+    ``Qed.Dict.size_set]
 
 private def finishAtomFallbackSimpNames : Array Lean.Name :=
   valUnwrapSimpNames ++ arrayCoreSimpNames
@@ -959,7 +970,14 @@ private def elabArrAndIdx (arrStx idxStx : Term) (opDesc : String) : TermElabM (
 open Lean Meta Elab Term in
 @[term_elab srvGetElemStx]
 def elabSrvGetElem : TermElab := fun stx expectedType? => do
-  let (arrExpr, idxNatExpr, elemTy) ← elabArrAndIdx ⟨(stx.getArg 1)⟩ ⟨(stx.getArg 3)⟩ "indexing"
+  let arrStx : Term := ⟨(stx.getArg 1)⟩
+  let idxStx : Term := ⟨(stx.getArg 3)⟩
+  let probeExpr ← elabTerm arrStx none
+  synthesizeSyntheticMVarsNoPostponing
+  let probeTy ← whnf (← instantiateMVars (← inferType probeExpr))
+  if probeTy.isAppOfArity `Qed.Dict 2 then
+    return ← elabTerm (← `(Qed.Dict.get $arrStx $idxStx)) expectedType?
+  let (arrExpr, idxNatExpr, elemTy) ← elabArrAndIdx arrStx idxStx "indexing"
   let ltPrf ← proveBoundsFor stx arrExpr idxNatExpr
   let elemExpr ← mkAppOptM ``srvGetAt #[some elemTy, some arrExpr, some idxNatExpr, some ltPrf]
   match expectedType? with
@@ -969,8 +987,15 @@ def elabSrvGetElem : TermElab := fun stx expectedType? => do
 open Lean Meta Elab Term in
 @[term_elab srvSetElemStx]
 def elabSrvSetElem : TermElab := fun stx expectedType? => do
+  let arrStx : Term := ⟨(stx.getArg 1)⟩
+  let idxStx : Term := ⟨(stx.getArg 3)⟩
   let valStx : Term := ⟨(stx.getArg 5)⟩
-  let (arrExpr, idxNatExpr, elemTy) ← elabArrAndIdx ⟨(stx.getArg 1)⟩ ⟨(stx.getArg 3)⟩ "indexed assignment"
+  let probeExpr ← elabTerm arrStx none
+  synthesizeSyntheticMVarsNoPostponing
+  let probeTy ← whnf (← instantiateMVars (← inferType probeExpr))
+  if probeTy.isAppOfArity `Qed.Dict 2 then
+    return ← elabTerm (← `(Qed.Dict.set $arrStx $idxStx (srvAutoField($valStx)))) expectedType?
+  let (arrExpr, idxNatExpr, elemTy) ← elabArrAndIdx arrStx idxStx "indexed assignment"
   let valExpr ← elabTermEnsuringType (← `(srvAutoField($valStx))) (some elemTy)
   synthesizeSyntheticMVarsNoPostponing
   let arrExpr ← instantiateMVars arrExpr
@@ -1028,6 +1053,10 @@ private def poseInvFactsOnGoal (g0 : MVarId) : MetaM (MVarId × Array FVarId) :=
                       some <$> mkAppM ``Array.sumBy_set #[setArgs[1]!, sArgs[2]!, setArgs[2]!, setArgs[3]!, setArgs[4]!]
                     catch _ => pure none then
                     addFact sumEq
+              if sub.isAppOfArity `Qed.Dict.remove 5 then
+                let rArgs := sub.getAppArgs
+                if let some remLe ← try some <$> mkAppM `Qed.Dict.size_remove_le #[rArgs[3]!, rArgs[4]!] catch _ => pure none then
+                  addFact remLe
               if sub.isAppOfArity ``GetElem.getElem 8 then
                 let ltPrf := sub.getAppArgs[7]!
                 for fh in forallHyps do
@@ -1077,7 +1106,7 @@ private def finishAtomDeepFallback (g : MVarId) : TacticM Bool := do
   let s3 ← saveState
   setGoals [g]
   let ok ← try
-      evalTactic (← `(tactic| first | qedNonlinearClose | grind))
+      evalTactic (← `(tactic| first | qedNonlinearClose | (try simp_all [Qed.Server.srvLetEq]; try (repeat' (split <;> try simp_all [Qed.Server.srvLetEq])); all_goals (first | omega | decide | rfl)) | grind))
       pure (← getGoals).isEmpty
     catch _ => pure false
   unless ok do restoreState s3
@@ -1843,7 +1872,7 @@ private def closeRpcReqLeaf (g0 : MVarId) : TacticM (Option MVarId) := do
       let s ← saveState
       setGoals [g']
       let ok ← try
-          evalTactic (← `(tactic| first | qedNonlinearClose | grind))
+          evalTactic (← `(tactic| first | qedNonlinearClose | (try simp_all [Qed.Server.srvLetEq]; try (repeat' (split <;> try simp_all [Qed.Server.srvLetEq])); all_goals (first | omega | decide | rfl)) | grind))
           pure (← getGoals).isEmpty
         catch _ => pure false
       unless ok do restoreState s

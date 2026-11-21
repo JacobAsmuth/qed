@@ -102,6 +102,14 @@ private def relevantOptResLemmas (env : Environment) (cs : Std.HashSet Name) : A
     r := r ++ (#[`Qed.Codec.valid, `Qed.Codec.refine, `Qed.Codec.jsonOnly,
                  `Qed.Codec.text, `Qed.Codec.textarea, `Qed.Codec.nat,
                  `Qed.Codec.int, `Qed.Codec.checkbox, `Qed.Codec.date].filter env.contains)
+  if cs.contains `Qed.Dict || cs.contains `Qed.Dict.size || cs.contains `Qed.Dict.get ||
+     cs.contains `Qed.Dict.set || cs.contains `Qed.Dict.remove || cs.contains `Qed.Dict.contains then
+    r := r ++ (#[`Qed.Dict.emptyCollection_eq_empty, `Qed.Dict.getElem_eq_get,
+                 `Qed.Lang.QedMem.mem_dict, `Qed.Lang.QedMemProp.memProp_dict,
+                 `Qed.Dict.get_empty, `Qed.Dict.contains_empty, `Qed.Dict.size_empty, `Qed.Dict.isEmpty_empty,
+                 `Qed.Dict.get_set, `Qed.Dict.get_set_self, `Qed.Dict.contains_set, `Qed.Dict.contains_set_self,
+                 `Qed.Dict.get_remove, `Qed.Dict.get_remove_self, `Qed.Dict.contains_remove, `Qed.Dict.contains_remove_self,
+                 `Qed.Dict.size_set, `Qed.Dict.isEmpty_iff_size].filter env.contains)
   return r
 
 private def stripStepPrefix : Name → Name
@@ -137,7 +145,7 @@ private def isTrivialNonFieldTy (ty : Expr) : Bool :=
 
 private def runAddFieldFacts : TacticM Unit := do
   let env ← getEnv
-  unless env.contains `Qed.Field.ok || env.contains `Qed.Ensured.ok do return
+  unless env.contains `Qed.Field.ok || env.contains `Qed.Ensured.ok || env.contains `Qed.Dict.size_remove_le do return
   let g ← getMainGoal
   let facts ← g.withContext do
     let tgt ← instantiateMVars (← g.getType)
@@ -150,6 +158,12 @@ private def runAddFieldFacts : TacticM Unit := do
     for e in scan do
       e.forEach fun sub => do
         if !sub.hasLooseBVars && (sub.isFVar || sub.isProj || sub.isApp) then
+          if sub.isAppOfArity `Qed.Dict.remove 5 && env.contains `Qed.Dict.size_remove_le then
+            if !(← seenRef.get).contains sub then
+              seenRef.modify (·.push sub)
+              let rArgs := sub.getAppArgs
+              if let some remLe ← try some <$> Meta.mkAppM `Qed.Dict.size_remove_le #[rArgs[3]!, rArgs[4]!] catch _ => pure none then
+                factsRef.modify (·.push remLe)
           let rawTy? ← try some <$> Meta.inferType sub catch _ => pure none
           if let some rawTy := rawTy? then
             if isTrivialNonFieldTy rawTy then return

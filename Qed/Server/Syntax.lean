@@ -220,6 +220,7 @@ structure ParsedSrvType where
   isProto    : Bool := false
   mods       : Array SrvTypeMod := #[]
   tupleElems : Array Lean.Term := #[]
+  dictKv?    : Option (Lean.Term × Lean.Term) := none
 deriving Inhabited
 
 namespace ParsedSrvType
@@ -239,6 +240,24 @@ partial def parse (stx : Lean.Syntax) : Lean.MacroM ParsedSrvType := do
     let (baseId, initMods) ← Qed.Lang.splitIdentMods ⟨(stx.getArg 2)⟩
     return { ref := stx, baseIdent := baseId, isProto := true,
              mods := initMods ++ (← (stx.getArg 4).getArgs.mapM Qed.Lang.parseTypeModNode) }
+  else if k == ``Qed.Lang.qedTypeDict then
+    let pk ← parse (stx.getArg 1)
+    let pv ← parse (stx.getArg 3)
+    if pk.mods.contains .fallible then
+      Lean.Macro.throwErrorAt (stx.getArg 1) "fallible `!` modifier cannot appear inside a dictionary key type"
+    if pv.mods.contains .fallible then
+      Lean.Macro.throwErrorAt (stx.getArg 3) "fallible `!` modifier cannot appear inside a dictionary value type"
+    let mkInner (p : ParsedSrvType) : Lean.MacroM Lean.Term := do
+      let b ← match p.dictKv? with
+        | some (kt, vt) => let dictId := Lean.mkIdentFrom p.ref `Qed.Dict; `($dictId $kt $vt)
+        | none => if p.tupleElems.isEmpty then pure (Qed.Lang.resolveBaseTypeTerm p.baseIdent)
+                  else buildProdTerm p.tupleElems
+      return (← Qed.Lang.applyTypeMods b p.mods true p.ref).1
+    let kTerm ← mkInner pk
+    let vTerm ← mkInner pv
+    let mods ← (stx.getArg 5).getArgs.mapM Qed.Lang.parseTypeModNode
+    return { ref := stx, baseIdent := Lean.mkIdentFrom stx `Qed.Dict, isProto := false,
+             mods, dictKv? := some (kTerm, vTerm) }
   else if k == ``Qed.Lang.qedTypeParen then
     let elemStxs := (stx.getArg 1).getSepArgs
     let mods ← (stx.getArg 3).getArgs.mapM Qed.Lang.parseTypeModNode
@@ -247,7 +266,9 @@ partial def parse (stx : Lean.Syntax) : Lean.MacroM ParsedSrvType := do
       let pe ← parse eStx
       if pe.mods.contains .fallible then
         Lean.Macro.throwErrorAt eStx "fallible `!` modifier cannot appear inside a tuple type"
-      let baseT ← if pe.tupleElems.isEmpty then pure (Qed.Lang.resolveBaseTypeTerm pe.baseIdent)
+      let baseT ← match pe.dictKv? with
+        | some (kt, vt) => let dictId := Lean.mkIdentFrom pe.ref `Qed.Dict; `($dictId $kt $vt)
+        | none => if pe.tupleElems.isEmpty then pure (Qed.Lang.resolveBaseTypeTerm pe.baseIdent)
                   else buildProdTerm pe.tupleElems
       let et ← Qed.Lang.applyTypeMods baseT pe.mods true pe.ref
       elemTerms := elemTerms.push et.1
@@ -281,11 +302,13 @@ def validate (t : ParsedSrvType) (allowFallible : Bool) (ctxDesc : String) : Lea
     if t.mods[i]! == .fallible && i + 1 < t.mods.size then
       Lean.Macro.throwErrorAt t.ref "place `!` last on fallible return types (for example `Book[]!` instead of `Book![]`)"
 
-/-- Lowers the non-`!` payload type (e.g. `Book[]!` → `Array Book`, `(A, B)[]!` → `Array (A × B)`). -/
+/-- Lowers the non-`!` payload type (e.g. `Book[]!` → `Array Book`, `{String: Nat}` → `Qed.Dict String Nat`). -/
 def toPayloadTerm (t : ParsedSrvType) : Lean.MacroM Lean.Term := do
-  let baseTerm ←
-    if t.tupleElems.isEmpty then pure (Qed.Lang.resolveBaseTypeTerm t.baseIdent)
-    else buildProdTerm t.tupleElems
+  let baseTerm ← match t.dictKv? with
+    | some (kt, vt) => let dictId := Lean.mkIdentFrom t.ref `Qed.Dict; `($dictId $kt $vt)
+    | none =>
+        if t.tupleElems.isEmpty then pure (Qed.Lang.resolveBaseTypeTerm t.baseIdent)
+        else buildProdTerm t.tupleElems
   return (← Qed.Lang.applyTypeMods baseTerm t.mods true t.ref).1
 
 end ParsedSrvType

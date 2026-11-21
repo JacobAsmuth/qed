@@ -245,13 +245,19 @@ partial def expandJsxExpr (pPath : String) (parentCtx? : Option (String × HtmlC
         alts := alts.push (← `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $rhs))
       return (← `(match $[$scruts:term],* with $[$alts:matchAlt]*), anyList)
     | "qedExprFor" =>
-      let xId : Ident := ⟨(stx.getArg 1)⟩
+      let patStx := stx.getArg 1
       let xs ← Qed.Lang.lowerSimpleQedExpr .val (stx.getArg 3) (lowerJsx? := some jsxHook)
       let (bodyT, isListB) ← expandJsxExpr pPath parentCtx? fallback (stx.getArg 5)
+      let fnT ← if patStx.getKind == ``Qed.Lang.qedPatIdent && (patStx.getArg 1).getNumArgs == 0 then
+          let xId : Ident := ⟨patStx.getArg 0⟩
+          `(fun $xId:ident => $bodyT)
+        else
+          let patT ← Qed.Lang.lowerQedPat patStx
+          `(fun _qed_fe => match _qed_fe with | $patT => $bodyT)
       let res ← if isListB then
-        `((Qed.mapList (Qed.ForEachItems.toList $xs) (fun $xId:ident => $bodyT)).flatten)
+        `((Qed.mapList (Qed.ForEachItems.toList $xs) $fnT).flatten)
       else
-        `(Qed.mapList (Qed.ForEachItems.toList $xs) (fun $xId:ident => $bodyT))
+        `(Qed.mapList (Qed.ForEachItems.toList $xs) $fnT)
       return (res, true)
     | _ =>
       let exp ← Qed.Lang.lowerSimpleQedExpr .val stx (allowOptElse := true)

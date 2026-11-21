@@ -771,7 +771,7 @@ private partial def lowerCatchFallback? (ctx : LowerCtx) (stmts : Array Syntax) 
     return none
   else if stmts.size == 1 && stmts[0]!.getKind == ``qedStmtExpr then
     let eStx := stmts[0]![0]
-    if exprHasAwait eStx || exprHasUnwrap eStx || (matchPushCall? eStx).isSome || (matchSrvEmitStmt? stmts[0]!).isSome then return none
+    if exprHasAwait eStx || exprHasUnwrap eStx || (matchPushCall? eStx).isSome || (matchRemoveCall? eStx).isSome || (matchSrvEmitStmt? stmts[0]!).isSome then return none
     let (eTerm, steps) ← lowerExprCollectingHoists { ctx with allowAwait := false } .val eStx
     if !steps.isEmpty then return none
     some <$> `(srvAutoField($eTerm))
@@ -964,11 +964,15 @@ private def lowerPureMutationStmt (pCtx : LowerCtx) (s₀ sCur : Ident) (matCur 
         else if opStr == "-=" then `(Qed.Lang.QedVal.val $curLeaf - Qed.Lang.QedVal.val $rhsTerm)
         else throwErrorAt (stmt.getArg 1) s!"unsupported assignment operator `{opStr}`"
       if pathSteps.isEmpty then `(srvAutoField($val)) else pure val
-  else
-    let some (targetStx, elemStx) := matchPushCall? (stmt.getArg 0) | unreachable!
+  else if let some (targetStx, elemStx) := matchPushCall? (stmt.getArg 0) then
     let (elemTerm, steps) ← lowerExprCollectingHoists pCtx .val elemStx
     lowerMut targetStx steps fun _ curArr =>
       `(($curArr).push (srvAutoField($elemTerm)))
+  else
+    let some (targetStx, keyStx) := matchRemoveCall? (stmt.getArg 0) | unreachable!
+    let (keyTerm, steps) ← lowerExprCollectingHoists pCtx .val keyStx
+    lowerMut targetStx steps fun _ curDict =>
+      `(Qed.Dict.remove $curDict $keyTerm)
 
 open Lean Elab Command in
 partial def lowerPureBlock (ctx : LowerCtx) (inAtomic : Bool) (s₀ sCur : Ident)
@@ -1012,7 +1016,7 @@ partial def lowerPureBlock (ctx : LowerCtx) (inAtomic : Bool) (s₀ sCur : Ident
     lowerPureReturn pCtx s₀ matCur stmt
   else if k == ``qedStmtLet then
     lowerPureLet pCtx s₀ sCur matCur stmt rest recPure
-  else if k == ``qedStmtAssign || (k == ``qedStmtExpr && (matchPushCall? (stmt.getArg 0)).isSome) then
+  else if k == ``qedStmtAssign || (k == ``qedStmtExpr && ((matchPushCall? (stmt.getArg 0)).isSome || (matchRemoveCall? (stmt.getArg 0)).isSome)) then
     lowerPureMutationStmt pCtx s₀ sCur matCur stmt rest recPure
   else if k == ``qedStmtExpr then
     let eStx := stmt.getArg 0
@@ -1432,6 +1436,9 @@ partial def lowerAsyncBlock (ctx : LowerCtx) (stateTyTerm? : Option Term) (stmts
     if let some (targetStx, _) := matchPushCall? eStx then
       let _ ← parseLValPath aCtx targetStx
       throwErrorAt stmt s!"cannot call `.push(...)` on server state outside an `atomic:` block in `{ctx.fnName}` because `{ctx.fnName}` uses `await`"
+    else if let some (targetStx, _) := matchRemoveCall? eStx then
+      let _ ← parseLValPath aCtx targetStx
+      throwErrorAt stmt s!"cannot call `.remove(...)` on server state outside an `atomic:` block in `{ctx.fnName}` because `{ctx.fnName}` uses `await`"
     else
       let (eTerm, steps) ← lowerExprCollectingHoists aCtx .val eStx
       let cont ← recAsync aCtx rest

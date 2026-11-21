@@ -7,6 +7,7 @@ import Qed.Diff
 import Qed.Invariant
 import Qed.Json
 import Qed.Proto
+import Qed.Dict
 import Qed.Router
 import Qed.Date
 import Qed.Schema

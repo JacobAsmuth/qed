@@ -54,15 +54,6 @@ structure OidcRuntime where
   cfg   : ResolvedOidcConfig
   cache : Prim.StateBox OidcCacheState
 
-private def trimStr (s : String) : String :=
-  s.trimAscii.toString
-
-private def stripTrailingSlash (s : String) : String :=
-  let t := trimStr s
-  if t.endsWith "/" && t.length > 1 then
-    String.ofList (t.toList.dropLast)
-  else t
-
 private def isLocalDevIssuer (issuer : String) : Bool :=
   issuer.startsWith "http://127.0.0.1:" || issuer.startsWith "http://localhost:" ||
   issuer == "http://127.0.0.1" || issuer == "http://localhost"
@@ -70,7 +61,7 @@ private def isLocalDevIssuer (issuer : String) : Bool :=
 private def resolveEnvWithDefault (envName : String) (default? : Option String) : IO (Option String) := do
   match ← Prim.getEnv envName with
   | some v =>
-      let t := trimStr v
+      let t := trimWs v
       if !t.isEmpty then return some t
       else return default?
   | none => return default?
@@ -81,7 +72,7 @@ def initOidcRuntime (spec : OidcAuthSpec) (baseSecrets : List String) (devMode :
     IO (Option OidcRuntime) := do
   let some rawIss ← resolveEnvWithDefault spec.issuerEnv spec.issuerDefault?
     | return none
-  let issuer := stripTrailingSlash rawIss
+  let issuer := stripTrailingSlashes (trimWs rawIss)
   if issuer.isEmpty then return none
   let audience := (← resolveEnvWithDefault spec.audienceEnv spec.audienceDefault?).getD spec.name
   let clientId ← match spec.clientIdEnv? with
@@ -168,7 +159,7 @@ def fetchDiscovery (httpExec : HttpExecFn) (rt : OidcRuntime) (force : Bool := f
   let j ← match ← fetchJsonUrl httpExec discUrl ssrfGuard with
     | .ok v    => pure v
     | .error e => return .error e
-  let iss := ((j.get? "issuer").bind (·.str?)).map stripTrailingSlash |>.getD rt.cfg.issuer
+  let iss := ((j.get? "issuer").bind (·.str?)).map (fun s => stripTrailingSlashes (trimWs s)) |>.getD rt.cfg.issuer
   if iss != rt.cfg.issuer then
     return .error s!"oidc discovery issuer mismatch: expected `{rt.cfg.issuer}`, got `{iss}`"
   let some jwksUri := (j.get? "jwks_uri").bind (·.str?)
@@ -240,46 +231,42 @@ def verifyOidcJwt (httpExec : HttpExecFn) (rt : OidcRuntime) (token : String)
 
 /-! ### Signed `v2` Session Cookie & Short-Lived PKCE Transaction Cookie -/
 
-private def anySecretVerify (secrets : List String) (payload sigBytes : ByteArray) : IO Bool := do
+def anySecretVerify (secrets : List String) (payload sigBytes : ByteArray) : IO Bool := do
   for sec in secrets do
     if ← Prim.hmacSha256Verify sec.toUTF8 payload sigBytes then
       return true
   return false
 
-private def parseNatStrict (s : String) : Option Nat :=
-  if s.isEmpty || s.length > 20 then none
-  else if s.toList.all fun c => '0' ≤ c && c ≤ '9' then s.toNat?
-  else none
+private def signHmacEnvelope (secret tag : String) (expSec : Nat) (b64 : String) : IO String := do
+  let body := s!"{tag}.{expSec}.{b64}"
+  let mac ← Prim.hmacSha256 secret.toUTF8 body.toUTF8
+  return s!"{body}.{Proto.encodeHex mac}"
+
+private def verifyHmacEnvelope (secrets : List String) (tag raw : String) (nowSec : Nat) :
+    IO (Option String) := do
+  if secrets.isEmpty then return none
+  match raw.splitOn "." with
+  | [t, expStr, b64, sigHex] =>
+      if t != tag || sigHex.length != 64 then return none
+      let some expSec := parseStrictU64 expStr 18446744073709551615 | return none
+      if nowSec >= expSec then return none
+      let .ok sigBytes := Proto.decodeHex sigHex | return none
+      let body := s!"{tag}.{expStr}.{b64}"
+      if !(← anySecretVerify secrets body.toUTF8 sigBytes) then return none
+      return some b64
+  | _ => return none
 
 /-- Mints an expiring `v2.<expSec>.<b64urlPayload>.<hmacHex>` session cookie carrying verified claims. -/
 def signSessionCookieV2 (secret : String) (payload : SessionPayloadV2) (ttlSec : Nat := 86400) :
     IO String := do
   let nowSec := ((← Prim.nowMs).toNat) / 1000
-  let expSec := nowSec + ttlSec
-  let b64 := encodeSessionPayloadV2 payload
-  let body := s!"v2.{expSec}.{b64}"
-  let mac ← Prim.hmacSha256 secret.toUTF8 body.toUTF8
-  return s!"{body}.{Proto.encodeHex mac}"
+  signHmacEnvelope secret "v2" (nowSec + ttlSec) (encodeSessionPayloadV2 payload)
 
 /-- Verifies a `v2.<expSec>.<b64urlPayload>.<hmacHex>` cookie in constant time across active/rotated secrets. -/
 def verifySessionCookieV2 (secrets : List String) (token : String) (nowSec : Nat) :
     IO (Option SessionPayloadV2) := do
-  if secrets.isEmpty then return none
-  match token.splitOn "." with
-  | ["v2", expStr, b64, sigHex] =>
-      if sigHex.length != 64 then return none
-      let some expSec := parseNatStrict expStr | return none
-      if nowSec >= expSec then return none
-      let sigBytes ← match Proto.decodeHex sigHex with
-        | .ok b    => pure b
-        | .error _ => return none
-      let body := s!"v2.{expStr}.{b64}"
-      if !(← anySecretVerify secrets body.toUTF8 sigBytes) then
-        return none
-      match decodeSessionPayloadV2 b64 with
-      | .ok p    => return some p
-      | .error _ => return none
-  | _ => return none
+  let some b64 ← verifyHmacEnvelope secrets "v2" token nowSec | return none
+  return (decodeSessionPayloadV2 b64).toOption
 
 private structure AuthTxCookie where
   state        : String
@@ -289,46 +276,24 @@ private structure AuthTxCookie where
   redirectUri  : String
 
 private def signAuthTxCookie (secret : String) (tx : AuthTxCookie) (nowSec : Nat) : IO String := do
-  let expSec := nowSec + 600
   let j := Json.obj [
-    ("state", .str tx.state),
-    ("nonce", .str tx.nonce),
-    ("verifier", .str tx.codeVerifier),
-    ("returnTo", .str tx.returnTo),
-    ("redirectUri", .str tx.redirectUri)
+    ("state", .str tx.state), ("nonce", .str tx.nonce), ("verifier", .str tx.codeVerifier),
+    ("returnTo", .str tx.returnTo), ("redirectUri", .str tx.redirectUri)
   ]
-  let b64 := base64UrlEncode (Json.render j).toUTF8
-  let body := s!"tx1.{expSec}.{b64}"
-  let mac ← Prim.hmacSha256 secret.toUTF8 body.toUTF8
-  return s!"{body}.{Proto.encodeHex mac}"
+  signHmacEnvelope secret "tx1" (nowSec + 600) (base64UrlEncode (Json.render j).toUTF8)
 
 private def verifyAuthTxCookie (secrets : List String) (raw : String) (nowSec : Nat) :
     IO (Option AuthTxCookie) := do
-  if secrets.isEmpty then return none
-  match raw.splitOn "." with
-  | ["tx1", expStr, b64, sigHex] =>
-      if sigHex.length != 64 then return none
-      let some expSec := parseNatStrict expStr | return none
-      if nowSec >= expSec then return none
-      let sigBytes ← match Proto.decodeHex sigHex with
-        | .ok b    => pure b
-        | .error _ => return none
-      let body := s!"tx1.{expStr}.{b64}"
-      if !(← anySecretVerify secrets body.toUTF8 sigBytes) then return none
-      let bs ← match base64UrlDecode b64 with
-        | .ok b    => pure b
-        | .error _ => return none
-      let some js := String.fromUTF8? bs | return none
-      let j ← match Json.parse js with
-        | .ok v    => pure v
-        | .error _ => return none
-      let some state := (j.get? "state").bind (·.str?) | return none
-      let some nonce := (j.get? "nonce").bind (·.str?) | return none
-      let some verifier := (j.get? "verifier").bind (·.str?) | return none
-      let returnTo := sanitizeReturnTo ((j.get? "returnTo").bind (·.str?))
-      let some redirectUri := (j.get? "redirectUri").bind (·.str?) | return none
-      return some { state, nonce, codeVerifier := verifier, returnTo, redirectUri }
-  | _ => return none
+  let some b64 ← verifyHmacEnvelope secrets "tx1" raw nowSec | return none
+  let .ok bs := base64UrlDecode b64 | return none
+  let some js := String.fromUTF8? bs | return none
+  let .ok j := Json.parse js | return none
+  let some state := (j.get? "state").bind (·.str?) | return none
+  let some nonce := (j.get? "nonce").bind (·.str?) | return none
+  let some verifier := (j.get? "verifier").bind (·.str?) | return none
+  let returnTo := sanitizeReturnTo ((j.get? "returnTo").bind (·.str?))
+  let some redirectUri := (j.get? "redirectUri").bind (·.str?) | return none
+  return some { state, nonce, codeVerifier := verifier, returnTo, redirectUri }
 
 private def mkHardenedCookie (name value : String) (maxAge : Nat) (devMode : Bool) : SetCookie :=
   {
@@ -342,7 +307,7 @@ private def mkHardenedCookie (name value : String) (maxAge : Nat) (devMode : Boo
   }
 
 private def inferOriginFromReq (req : ParsedReqHead) (devMode : Bool) : String :=
-  let host := (req.host?.map trimStr).getD "127.0.0.1:8000"
+  let host := (req.host?.map trimWs).getD "127.0.0.1:8000"
   let isLocal := host.startsWith "127.0.0.1" || host.startsWith "localhost"
   let scheme := if devMode || isLocal then "http" else "https"
   s!"{scheme}://{host}"
@@ -368,14 +333,17 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
     (onCallbackAuthenticated? : Option (String → List (String × String) → IO (Except (Nat × String) (Array SetCookie))) := none) :
     IO (Option ByteArray) := do
   let cfg := rt.cfg
+  let textErr (status : Nat) (msg : String) : Option ByteArray :=
+    some (formatHttpResponse status "text/plain; charset=utf-8" msg.toUTF8 isHead req.keepAlive false)
+  let redirectResp (loc : String) (hdrs : List (String × String)) : Option ByteArray :=
+    some (formatHttpResponse 302 "text/plain; charset=utf-8" ByteArray.empty isHead req.keepAlive true
+      (extraHeaders := ("Location", loc) :: hdrs))
   if req.method == "GET" && pathOnly == cfg.loginPath then
     let some signKey := cfg.sessionSecrets.head?
-      | return some (formatHttpResponse 500 "text/plain; charset=utf-8"
-          "auth error: QED_AUTH_SECRET is not configured".toUTF8 isHead req.keepAlive false)
+      | return textErr 500 "auth error: QED_AUTH_SECRET is not configured"
     let disc ← match ← fetchDiscovery httpExec rt false with
       | .ok d => pure d
-      | .error e =>
-          return some (formatHttpResponse 502 "text/plain; charset=utf-8" e.toUTF8 isHead req.keepAlive false)
+      | .error e => return textErr 502 e
     let qParams := parseQueryParams queryStr
     let returnTo := sanitizeReturnTo ((qParams.find? (·.1 == "returnTo")).map Prod.snd)
     let state ← Prim.randomHex 24
@@ -388,51 +356,34 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
     let txVal ← signAuthTxCookie signKey { state, nonce, codeVerifier, returnTo, redirectUri } nowSec
     let txCookie := mkHardenedCookie "qed_auth_tx" txVal 600 cfg.devMode
     let authQuery := encodeFormBody [
-      ("response_type", "code"),
-      ("client_id", cfg.clientId),
-      ("redirect_uri", redirectUri),
-      ("scope", "openid email profile"),
-      ("state", state),
-      ("nonce", nonce),
-      ("code_challenge", codeChallenge),
-      ("code_challenge_method", "S256")
+      ("response_type", "code"), ("client_id", cfg.clientId), ("redirect_uri", redirectUri),
+      ("scope", "openid email profile"), ("state", state), ("nonce", nonce),
+      ("code_challenge", codeChallenge), ("code_challenge_method", "S256")
     ]
     let sep := if disc.authorizationEndpoint.contains "?" then "&" else "?"
-    let loc := disc.authorizationEndpoint ++ sep ++ authQuery
-    let hdrs := [("Location", sanitizeHeader loc), ("Set-Cookie", txCookie.render)]
-    return some (formatHttpResponse 302 "text/plain; charset=utf-8" ByteArray.empty isHead req.keepAlive true (extraHeaders := hdrs))
+    return redirectResp (sanitizeHeader (disc.authorizationEndpoint ++ sep ++ authQuery)) [("Set-Cookie", txCookie.render)]
 
   else if req.method == "GET" && pathOnly == cfg.callbackPath then
     let some signKey := cfg.sessionSecrets.head?
-      | return some (formatHttpResponse 500 "text/plain; charset=utf-8"
-          "auth error: QED_AUTH_SECRET is not configured".toUTF8 isHead req.keepAlive false)
+      | return textErr 500 "auth error: QED_AUTH_SECRET is not configured"
     let qParams := parseQueryParams queryStr
     let some code := (qParams.find? (·.1 == "code")).map Prod.snd
-      | return some (formatHttpResponse 400 "text/plain; charset=utf-8"
-          "auth callback missing `code`".toUTF8 isHead req.keepAlive false)
+      | return textErr 400 "auth callback missing `code`"
     let some state := (qParams.find? (·.1 == "state")).map Prod.snd
-      | return some (formatHttpResponse 400 "text/plain; charset=utf-8"
-          "auth callback missing `state`".toUTF8 isHead req.keepAlive false)
+      | return textErr 400 "auth callback missing `state`"
     let some rawTx := (cookies.find? (·.1 == "qed_auth_tx")).map Prod.snd
-      | return some (formatHttpResponse 400 "text/plain; charset=utf-8"
-          "auth callback missing transaction cookie".toUTF8 isHead req.keepAlive false)
+      | return textErr 400 "auth callback missing transaction cookie"
     let nowSec := ((← Prim.nowMs).toNat) / 1000
     let some tx ← verifyAuthTxCookie cfg.sessionSecrets rawTx nowSec
-      | return some (formatHttpResponse 400 "text/plain; charset=utf-8"
-          "auth callback invalid or expired transaction cookie".toUTF8 isHead req.keepAlive false)
+      | return textErr 400 "auth callback invalid or expired transaction cookie"
     if state != tx.state then
-      return some (formatHttpResponse 403 "text/plain; charset=utf-8"
-        "auth callback state mismatch".toUTF8 isHead req.keepAlive false)
+      return textErr 403 "auth callback state mismatch"
     let disc ← match ← fetchDiscovery httpExec rt false with
       | .ok d => pure d
-      | .error e =>
-          return some (formatHttpResponse 502 "text/plain; charset=utf-8" e.toUTF8 isHead req.keepAlive false)
+      | .error e => return textErr 502 e
     let formPairsBase := [
-      ("grant_type", "authorization_code"),
-      ("code", code),
-      ("redirect_uri", tx.redirectUri),
-      ("client_id", cfg.clientId),
-      ("code_verifier", tx.codeVerifier)
+      ("grant_type", "authorization_code"), ("code", code), ("redirect_uri", tx.redirectUri),
+      ("client_id", cfg.clientId), ("code_verifier", tx.codeVerifier)
     ]
     let formPairs := match cfg.clientSecret? with
       | some cs => formPairsBase ++ [("client_secret", cs)]
@@ -443,26 +394,18 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
       #[("Content-Type", "application/x-www-form-urlencoded"), ("Accept", "application/json")]
       formBody.toUTF8 ssrfGuard
     let tokJson ← match tokRes with
-      | .error e =>
-          return some (formatHttpResponse 502 "text/plain; charset=utf-8"
-            s!"oidc token exchange failed: {e}".toUTF8 isHead req.keepAlive false)
+      | .error e => return textErr 502 s!"oidc token exchange failed: {e}"
       | .ok (st, body, _) =>
           if st < 200 || st >= 300 then
-            return some (formatHttpResponse 502 "text/plain; charset=utf-8"
-              s!"oidc token endpoint returned HTTP {st}".toUTF8 isHead req.keepAlive false)
+            return textErr 502 s!"oidc token endpoint returned HTTP {st}"
           match (String.fromUTF8? body).bind (fun s => (Json.parse s).toOption) with
           | some j => pure j
-          | none   =>
-              return some (formatHttpResponse 502 "text/plain; charset=utf-8"
-                "oidc token endpoint returned invalid JSON".toUTF8 isHead req.keepAlive false)
+          | none   => return textErr 502 "oidc token endpoint returned invalid JSON"
     let some idToken := (tokJson.get? "id_token").bind (·.str?)
-      | return some (formatHttpResponse 502 "text/plain; charset=utf-8"
-          "oidc token response missing `id_token`".toUTF8 isHead req.keepAlive false)
+      | return textErr 502 "oidc token response missing `id_token`"
     let claims ← match ← verifyOidcJwt httpExec rt idToken (expectedNonce? := some tx.nonce) with
       | .ok c => pure c
-      | .error e =>
-          return some (formatHttpResponse 401 "text/plain; charset=utf-8"
-            s!"oidc id_token verification failed: {e}".toUTF8 isHead req.keepAlive false)
+      | .error e => return textErr 401 s!"oidc id_token verification failed: {e}"
     let sessPayload : SessionPayloadV2 := {
       userId := claims.sub
       claims := filterSessionClaims cfg.claimNames claims
@@ -470,37 +413,20 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
     let mut extraHookCookies : List (String × String) := []
     if let some onAuth := onCallbackAuthenticated? then
       match ← onAuth sessPayload.userId sessPayload.claims with
-      | .ok cs =>
-          extraHookCookies := cs.toList.map fun c => ("Set-Cookie", c.render)
-      | .error (status, msg) =>
-          return some (formatHttpResponse status "text/plain; charset=utf-8" msg.toUTF8 isHead req.keepAlive false)
+      | .ok cs => extraHookCookies := cs.toList.map fun c => ("Set-Cookie", c.render)
+      | .error (status, msg) => return textErr status msg
     let sessTok ← signSessionCookieV2 signKey sessPayload cfg.sessionTtlSec
     let sessCookie := mkHardenedCookie "qed_session" sessTok cfg.sessionTtlSec cfg.devMode
     let clearTx := SetCookie.clear "qed_auth_tx" "/"
-    let safeLoc := sanitizeReturnTo (some tx.returnTo)
-    let hdrs := [
-      ("Location", safeLoc),
-      ("Set-Cookie", clearTx.render),
-      ("Set-Cookie", sessCookie.render)
-    ] ++ extraHookCookies
-    return some (formatHttpResponse 302 "text/plain; charset=utf-8" ByteArray.empty isHead req.keepAlive true (extraHeaders := hdrs))
+    let hdrs := [("Set-Cookie", clearTx.render), ("Set-Cookie", sessCookie.render)] ++ extraHookCookies
+    return redirectResp (sanitizeReturnTo (some tx.returnTo)) hdrs
 
   else if (req.method == "POST" || req.method == "GET") && pathOnly == cfg.logoutPath then
-    let clearSess := SetCookie.clear "qed_session" "/"
-    let clearTx := SetCookie.clear "qed_auth_tx" "/"
+    let hdrs := [("Set-Cookie", (SetCookie.clear "qed_session" "/").render), ("Set-Cookie", (SetCookie.clear "qed_auth_tx" "/").render)]
     let qParams := parseQueryParams queryStr
     match (qParams.find? (·.1 == "returnTo")).map Prod.snd with
-    | some rawRt =>
-        let safeLoc := sanitizeReturnTo (some rawRt)
-        let hdrs := [
-          ("Location", safeLoc),
-          ("Set-Cookie", clearSess.render),
-          ("Set-Cookie", clearTx.render)
-        ]
-        return some (formatHttpResponse 302 "text/plain; charset=utf-8" ByteArray.empty isHead req.keepAlive true (extraHeaders := hdrs))
-    | none =>
-        let hdrs := [("Set-Cookie", clearSess.render), ("Set-Cookie", clearTx.render)]
-        return some (formatHttpResponse 200 "application/json" "{\"ok\":true}".toUTF8 isHead req.keepAlive true (extraHeaders := hdrs))
+    | some rawRt => return redirectResp (sanitizeReturnTo (some rawRt)) hdrs
+    | none => return some (formatHttpResponse 200 "application/json" "{\"ok\":true}".toUTF8 isHead req.keepAlive true (extraHeaders := hdrs))
 
   else if (req.method == "GET" || isHead) && pathOnly == cfg.mePath then
     match resolvedUser? with

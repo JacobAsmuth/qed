@@ -13,17 +13,13 @@ def maxWsMsgBytes   : Nat := 4 * 1024 * 1024
 
 /-! ## Inbound HTTP/1.1 Request Head Parser -/
 
-structure ParsedReqHead where
-  method         : String
-  target         : String
-  isHttp11       : Bool
+structure ReqHdrMeta where
   keepAlive      : Bool
-  contentLen     : Nat
   headers        : Array (String × String)
-  upgrade?       : Option String
-  conn?          : Option String
-  wsKey?         : Option String
-  wsVer?         : Option String
+  upgrade?       : Option String := none
+  conn?          : Option String := none
+  wsKey?         : Option String := none
+  wsVer?         : Option String := none
   host?          : Option String := none
   origin?        : Option String := none
   dupOrigin      : Bool := false
@@ -36,26 +32,15 @@ structure ParsedReqHead where
   hasIfNoneMatch : Bool := false
   acceptsGzip    : Bool := false
 
-private structure HdrFoldState where
-  keepAlive      : Bool
+structure ParsedReqHead extends ReqHdrMeta where
+  method         : String
+  target         : String
+  isHttp11       : Bool
+  contentLen     : Nat
+
+private structure HdrFoldState extends ReqHdrMeta where
   contentLen?    : Option Nat
   hostCount      : Nat
-  headers        : Array (String × String)
-  upgrade?       : Option String
-  conn?          : Option String
-  wsKey?         : Option String
-  wsVer?         : Option String
-  host?          : Option String := none
-  origin?        : Option String := none
-  dupOrigin      : Bool := false
-  secFetchSite?  : Option String := none
-  dupSfs         : Bool := false
-  contentType?   : Option String := none
-  dupCt          : Bool := false
-  hasCookie      : Bool := false
-  auth?          : Option String := none
-  hasIfNoneMatch : Bool := false
-  acceptsGzip    : Bool := false
 
 @[inline] private def isHostHeader (k : String) : Bool :=
   k.utf8ByteSize == 4 && (k == "Host" || k == "host" || k.toLower == "host")
@@ -250,26 +235,9 @@ def parseRequestHead (headBytes : ByteArray) : Except (Nat × String) ParsedReqH
                   if isHttp11 && st.hostCount != 1 then
                     .error (400, "missing Host header")
                   else
-                    .ok {
+                    .ok { st.toReqHdrMeta with
                       method, target, isHttp11
-                      keepAlive      := st.keepAlive
-                      contentLen     := st.contentLen?.getD 0
-                      headers        := st.headers
-                      upgrade?       := st.upgrade?
-                      conn?          := st.conn?
-                      wsKey?         := st.wsKey?
-                      wsVer?         := st.wsVer?
-                      host?          := st.host?
-                      origin?        := st.origin?
-                      dupOrigin      := st.dupOrigin
-                      secFetchSite?  := st.secFetchSite?
-                      dupSfs         := st.dupSfs
-                      contentType?   := st.contentType?
-                      dupCt          := st.dupCt
-                      hasCookie      := st.hasCookie
-                      auth?          := st.auth?
-                      hasIfNoneMatch := st.hasIfNoneMatch
-                      acceptsGzip    := st.acceptsGzip
+                      contentLen := st.contentLen?.getD 0
                     }
 
 theorem parseRequestHead_rejects_nul (headBytes : ByteArray)
@@ -470,8 +438,7 @@ theorem safeContentType_no_crlf (ct : String) :
 
 /-- Default strict Content-Security-Policy enabled on HTML responses because Qed statically proves
     zero inline `<script>` tags and zero inline `on*` event handler attributes. -/
-def defaultCsp : String :=
-  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+abbrev defaultCsp : String := Qed.Server.defaultCsp
 
 /-- True iff `mime` is a text/script/markup/JSON/SVG media type eligible for gzip compression. -/
 def isCompressibleMime (mime : String) : Bool :=
@@ -544,9 +511,6 @@ def formatHttpResponse (status : Nat) (contentType : String) (body : ByteArray)
 private def okProtoHeadPrefix : ByteArray :=
   "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: ".toUTF8
 
-private def okHtmlHeadPrefix : ByteArray :=
-  "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ".toUTF8
-
 private def okHeadTailKA : ByteArray :=
   "\r\nX-Content-Type-Options: nosniff\r\nConnection: keep-alive\r\n\r\n".toUTF8
 
@@ -580,9 +544,6 @@ private def formatFast200 (headPrefix body : ByteArray) (headOnly keepAlive : Bo
 
 def formatOkProtoResponse (body : ByteArray) (headOnly keepAlive : Bool) : ByteArray :=
   formatFast200 okProtoHeadPrefix body headOnly keepAlive
-
-def formatOkHtmlResponse (body : ByteArray) (headOnly keepAlive : Bool) : ByteArray :=
-  formatFast200 okHtmlHeadPrefix body headOnly keepAlive
 
 def formatErrorResponse (status : Nat) (msg : String) : ByteArray :=
   formatHttpResponse status "text/plain; charset=utf-8" msg.toUTF8 false false false

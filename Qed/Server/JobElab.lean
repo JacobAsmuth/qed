@@ -6,18 +6,6 @@ open Qed.Lang
 
 /-! ## `server` `every <duration> <name>:` Background Job Elaborator -/
 
-private def ensureJobUnitReturn (ref : Lean.Syntax) (stmts : Array Lean.Syntax) : Array Lean.Syntax :=
-  if blockAlwaysReturns stmts then stmts
-  else
-    let info := Lean.SourceInfo.fromRef ref
-    stmts.push (Lean.Syntax.node info ``qedStmtReturn #[Lean.Syntax.atom info "return", Lean.Syntax.node info Lean.nullKind #[]])
-
-private partial def stmtHasAtomic (stx : Lean.Syntax) : Bool :=
-  stx.getKind == ``qedStmtAtomic || stx.getArgs.any stmtHasAtomic
-
-private def blockHasAtomic (stmts : Array Lean.Syntax) : Bool :=
-  stmts.any stmtHasAtomic
-
 open Lean Elab Command in
 private def parseJobDurationMs (numStx unitStx : Syntax) (jobStr : String) : CommandElabM Nat := do
   let n := (⟨numStx⟩ : TSyntax `num).getNat
@@ -97,7 +85,7 @@ def elabServerJobs (priorRep priorUnrep : Nat)
     if existingMethods.any (·.name == jobStr) || jobNames.contains jobStr then
       throwErrorAt jobIdent s!"duplicate job or method name `{jobStr}` in `server {srvName}`"
     let intervalMs ← parseJobDurationMs numStx unitStx jobStr
-    let bodyStmts := ensureJobUnitReturn jobIdent (suiteStmts (jc.getArg 5))
+    let bodyStmts := ensureUnitReturn jobIdent (suiteStmts (jc.getArg 5))
     let hasAwait := blockHasAwait bodyStmts
     let hasAtomic := blockHasAtomic bodyStmts
     let hasEmit := blockHasEmit bodyStmts

@@ -1,5 +1,6 @@
 import Lean
 import Qed.Lang
+import Qed.Schema.Registry
 import Qed.Server.Registry
 import Qed.Server.Core
 import Qed.Server.Syntax
@@ -132,291 +133,147 @@ private def inferSqlColType (pty : ParsedSrvType) : SqlColType × Bool × Bool �
   else if base == `Bytes || base == `ByteArray then (.bytes, isNullable, false, true)
   else (.text, isNullable, false, false)
 
-private partial def dbExprUsesOld (stx : Lean.Syntax) : Bool :=
-  if stx.getKind == ``qedCall then
-    let callee := stx.getArg 0
-    if callee.getKind == ``qedIdent && (callee.getArg 0).getId.eraseMacroScopes == `old then true
-    else stx.getArgs.any dbExprUsesOld
-  else stx.getArgs.any dbExprUsesOld
-
 open Lean Elab Command in
 private partial def lowerDbExpr (colNames : Array String) (rowVar : Ident)
     (oldVar? : Option Ident) (ctxVar? : Option Ident) (asProp : Bool) (stx : Syntax) :
     CommandElabM Term := do
-  let k := stx.getKind
-  let recL (s : Syntax) (p : Bool := asProp) := lowerDbExpr colNames rowVar oldVar? ctxVar? p s
-  if k == ``qedLitNum then
-    let n : TSyntax `num := ⟨(stx.getArg 0)⟩
-    return ⟨n.raw⟩
-  else if k == ``qedLitStr then
-    let s : TSyntax `str := ⟨(stx.getArg 0)⟩
-    return ⟨s.raw⟩
-  else if k == ``qedLitChar then
-    let c : TSyntax `char := ⟨(stx.getArg 0)⟩
-    return ⟨c.raw⟩
-  else if k == ``qedDotIdent then
-    let ctor : Ident := ⟨(stx.getArg 1)⟩
-    `(.$ctor)
-  else if k == ``qedIdent then
-    let id : Ident := ⟨(stx.getArg 0)⟩
-    let comps := id.getId.eraseMacroScopes.components
-    let foldProjs (base : Term) (rest : List Name) : CommandElabM Term :=
-      rest.foldlM (init := base) fun acc f => do
-        let fId := mkIdentFrom stx f
-        `(($acc).$fId:ident)
-    match comps with
-    | [] => throwErrorAt stx "empty identifier in database predicate"
-    | [single] =>
-        let s := single.toString
-        if s == "true" then if asProp then `(True) else `(true)
-        else if s == "false" then if asProp then `(False) else `(false)
-        else if s == "none" then `(Option.none)
-        else if s == "row" then return ⟨rowVar.raw⟩
-        else if s == "ctx" then
-          match ctxVar? with
-          | some cv => return ⟨cv.raw⟩
-          | none    => throwErrorAt stx "`ctx` is only in scope inside `policy ... requires ...`"
-        else if colNames.contains s then
-          let fId := mkIdentFrom stx single
-          `($rowVar.$fId)
-        else
-          return ⟨id.raw⟩
-    | root :: rest =>
-        let rs := root.toString
-        if rs == "row" then
-          foldProjs ⟨rowVar.raw⟩ rest
-        else if rs == "ctx" then
-          match ctxVar? with
-          | some cv => foldProjs ⟨cv.raw⟩ rest
-          | none    => throwErrorAt stx "`ctx` is only in scope inside `policy ... requires ...`"
-        else if colNames.contains rs then
-          let fId := mkIdentFrom stx root
-          foldProjs (← `($rowVar.$fId)) rest
-        else
-          return ⟨id.raw⟩
-  else if k == ``qedParen then
-    let args := (stx.getArg 1).getSepArgs
-    if args.size == 1 then recL args[0]! asProp
-    else throwErrorAt stx "unsupported tuple in database predicate"
-  else if k == ``qedProj then
-    let base := stx.getArg 0
-    let field : Ident := ⟨(stx.getArg 2)⟩
-    let bTerm ← recL base false
-    `($bTerm.$field)
-  else if k == ``qedNeg then
-    let inner ← recL (stx.getArg 1) false
-    `(-$inner)
-  else if k == ``qedAdd then
-    `($(← recL (stx.getArg 0) false) + $(← recL (stx.getArg 2) false))
-  else if k == ``qedSub then
-    `($(← recL (stx.getArg 0) false) - $(← recL (stx.getArg 2) false))
-  else if k == ``qedMul then
-    `($(← recL (stx.getArg 0) false) * $(← recL (stx.getArg 2) false))
-  else if k == ``qedDiv then
-    `($(← recL (stx.getArg 0) false) / $(← recL (stx.getArg 2) false))
-  else if k == ``qedMod then
-    `($(← recL (stx.getArg 0) false) % $(← recL (stx.getArg 2) false))
-  else if k == ``qedNot then
-    if asProp then `(¬ $(← recL (stx.getArg 1) true))
-    else `(! $(← recL (stx.getArg 1) false))
-  else if k == ``qedAnd then
-    if asProp then `($(← recL (stx.getArg 0) true) ∧ $(← recL (stx.getArg 2) true))
-    else `($(← recL (stx.getArg 0) false) && $(← recL (stx.getArg 2) false))
-  else if k == ``qedOr then
-    if asProp then `($(← recL (stx.getArg 0) true) ∨ $(← recL (stx.getArg 2) true))
-    else `($(← recL (stx.getArg 0) false) || $(← recL (stx.getArg 2) false))
-  else if k == ``qedImp then
-    if asProp then `($(← recL (stx.getArg 0) true) → $(← recL (stx.getArg 2) true))
-    else `((! $(← recL (stx.getArg 0) false)) || $(← recL (stx.getArg 2) false))
-  else if k == ``qedCmp then
-    let links := (stx.getArg 1).getArgs
-    let mut lhsStx := stx.getArg 0
-    let mut clauses : Array Term := #[]
-    for lk in links do
-      let opStr := ((lk.getArg 0).reprint.getD "").trimAscii.toString
-      let rhsStx := lk.getArg 1
-      let l ← recL lhsStx false
-      let r ← recL rhsStx false
-      let c ←
-        if asProp then
-          match opStr with
-          | "==" => `($l = $r)
-          | "!=" => `($l ≠ $r)
-          | "<=" => `($l ≤ $r)
-          | ">=" => `($l ≥ $r)
-          | "<"  => `($l < $r)
-          | ">"  => `($l > $r)
-          | _ => throwErrorAt lk s!"unsupported comparison `{opStr}` in database predicate"
-        else
-          match opStr with
-          | "==" => `($l == $r)
-          | "!=" => `($l != $r)
-          | "<=" => `(decide ($l ≤ $r))
-          | ">=" => `(decide ($l ≥ $r))
-          | "<"  => `(decide ($l < $r))
-          | ">"  => `(decide ($l > $r))
-          | _ => throwErrorAt lk s!"unsupported comparison `{opStr}` in database predicate"
-      clauses := clauses.push c
-      lhsStx := rhsStx
-    match clauses.toList with
-    | [] => if asProp then `(True) else `(true)
-    | c :: rest =>
-        rest.foldlM (init := c) fun acc x =>
-          if asProp then `($acc ∧ $x) else `($acc && $x)
-  else if k == ``qedCall then
-    let callee := stx.getArg 0
-    let rawArgs := (stx.getArg 2).getSepArgs
-    if callee.getKind == ``qedIdent && (callee.getArg 0).getId.eraseMacroScopes == `old then
-      let some ov := oldVar?
-        | throwErrorAt stx "`old(...)` is only allowed inside two-state table `invariant` clauses"
-      if rawArgs.size != 1 || rawArgs[0]!.getKind != ``qedCallArgPos then
-        throwErrorAt stx "`old(...)` expects a single expression argument"
-      lowerDbExpr colNames ov none ctxVar? asProp (rawArgs[0]!.getArg 0)
-    else if callee.getKind == ``qedIdent && (callee.getArg 0).getId.eraseMacroScopes == `some then
-      if rawArgs.size != 1 || rawArgs[0]!.getKind != ``qedCallArgPos then
-        throwErrorAt stx "`some(...)` expects a single argument"
-      `(Option.some $(← recL (rawArgs[0]!.getArg 0) false))
-    else
-      let fnT ← recL callee false
-      let argTs ← rawArgs.mapM fun a => do
-        if a.getKind != ``qedCallArgPos then
-          throwErrorAt a "unexpected named argument in database expression"
-        recL (a.getArg 0) false
-      let appT ← argTs.foldlM (init := fnT) fun acc a => `($acc $a)
-      if asProp then `(qedAsProp($appT)) else return appT
-  else
-    let sn := stxSnippet stx
-    throwErrorAt stx s!"unsupported expression `{sn}` in `database` predicate"
+  let fail (ref : Syntax) (msg : String) : CommandElabM Term := throwErrorAt ref msg
+  let hooks : LowerHooks CommandElabM := {
+    lowerIdent := fun ref id mode => do
+      let comps := id.getId.eraseMacroScopes.components
+      let foldProjs (base : Term) (rest : List Name) : CommandElabM Term :=
+        rest.foldlM (init := base) fun acc f => `(($acc).$(mkIdentFrom ref f):ident)
+      let t ← match comps with
+        | [] => throwErrorAt ref "empty identifier in database predicate"
+        | [single] =>
+            let s := single.toString
+            if s == "true" then if mode == .propInv then `(True) else `(true)
+            else if s == "false" then if mode == .propInv then `(False) else `(false)
+            else if s == "none" then `(Option.none)
+            else if s == "row" then pure ⟨rowVar.raw⟩
+            else if s == "ctx" then
+              match ctxVar? with
+              | some cv => pure ⟨cv.raw⟩
+              | none    => throwErrorAt ref "`ctx` is only in scope inside `policy ... requires ...`"
+            else if colNames.contains s then `($rowVar.$(mkIdentFrom ref single))
+            else pure ⟨id.raw⟩
+        | root :: rest =>
+            let rs := root.toString
+            if rs == "row" then foldProjs ⟨rowVar.raw⟩ rest
+            else if rs == "ctx" then
+              match ctxVar? with
+              | some cv => foldProjs ⟨cv.raw⟩ rest
+              | none    => throwErrorAt ref "`ctx` is only in scope inside `policy ... requires ...`"
+            else if colNames.contains rs then foldProjs (← `($rowVar.$(mkIdentFrom ref root))) rest
+            else pure ⟨id.raw⟩
+      if mode == .propInv && comps != [`true] && comps != [`false] then `(qedAsProp($t)) else pure t
+    lowerProj := fun _ base field mode => do
+      let t ← `($base.$field)
+      if mode == .propInv then `(qedAsProp($t)) else pure t
+    lowerIndex := fun ref _ _ _ => fail ref "indexing is not supported in database predicates"
+    lowerCall := fun ref callee rawArgs mode go => do
+      if callee.getKind == ``qedIdent then
+        let nm := (callee.getArg 0).getId.eraseMacroScopes
+        if nm == `old then
+          let some ov := oldVar?
+            | throwErrorAt ref "`old(...)` is only allowed inside two-state table `invariant` clauses"
+          if rawArgs.size != 1 || rawArgs[0]!.getKind != ``qedCallArgPos then
+            throwErrorAt ref "`old(...)` expects a single expression argument"
+          return some (← lowerDbExpr colNames ov none ctxVar? (mode == .propInv) (rawArgs[0]!.getArg 0))
+        else if nm == `some then
+          if rawArgs.size != 1 || rawArgs[0]!.getKind != ``qedCallArgPos then
+            throwErrorAt ref "`some(...)` expects a single argument"
+          return some (← `(Option.some $(← go .val (rawArgs[0]!.getArg 0))))
+      return none
+    lowerUnwrap := fun ref _ _ => fail ref "`?` is not supported in database predicates"
+    lowerAwait := fun ref _ _ => fail ref "`await` is not supported in database predicates"
+    lowerFieldSetter := fun ref _ => fail ref "field setters are not supported in database predicates"
+    lowerJsx := fun ref _ => fail ref "JSX is not supported in database predicates"
+    lowerArrElem := pure
+    wrapNamedField := pure
+    lowerType := fun ref => fail ref "type annotations are not supported in database predicates"
+    lowerPat := fun ref => fail ref "patterns are not supported in database predicates"
+    withLocals := fun _ body => body
+    optElseFallback := `(())
+    freshIdent := fun pfx => return mkIdent (Name.mkSimple pfx)
+    throwErr := fail
+  }
+  lowerQedExpr hooks (if asProp then .propInv else .val) stx
 
-/-- Best-effort static SQL `CHECK (...)` expression renderer for column `where` clauses. -/
-private partial def renderCheckSql? (colNames : Array String) (stx : Lean.Syntax) : Option String :=
+/-- Best-effort static SQL predicate renderer for column `CHECK (...)` (`forRls := false`)
+    and Postgres RLS `USING (...)` (`forRls := true`) expressions. -/
+private partial def renderSqlPred? (colNames : Array String) (forRls : Bool) (stx : Lean.Syntax) : Option String :=
+  let recR := renderSqlPred? colNames forRls
   let k := stx.getKind
-  if k == ``qedLitNum then
-    let n : Lean.TSyntax `num := ⟨(stx.getArg 0)⟩
-    some (toString n.getNat)
-  else if k == ``qedIdent then
-    let comps := (stx.getArg 0).getId.eraseMacroScopes.components.map (·.toString)
-    match comps with
-    | [s] =>
-        if colNames.contains s then some ("\"" ++ s ++ "\"")
-        else if s == "true" then some "1"
-        else if s == "false" then some "0"
-        else none
-    | [col, "length"] =>
-        if colNames.contains col then some ("LENGTH(\"" ++ col ++ "\")") else none
-    | ["row", col] =>
-        if colNames.contains col then some ("\"" ++ col ++ "\"") else none
-    | ["row", col, "length"] =>
-        if colNames.contains col then some ("LENGTH(\"" ++ col ++ "\")") else none
-    | _ => none
-  else if k == ``qedParen then
-    let args := (stx.getArg 1).getSepArgs
-    if args.size == 1 then (renderCheckSql? colNames args[0]!).map fun s => "(" ++ s ++ ")" else none
-  else if k == ``qedProj then
-    let field := (stx.getArg 2).getId.eraseMacroScopes.toString
-    if field == "length" then
-      (renderCheckSql? colNames (stx.getArg 0)).map fun s => "LENGTH(" ++ s ++ ")"
-    else if (stx.getArg 0).getKind == ``qedIdent &&
-            ((stx.getArg 0).getArg 0).getId.eraseMacroScopes == `row &&
-            colNames.contains field then
-      some ("\"" ++ field ++ "\"")
-    else none
-  else if k == ``qedAnd then do
-    let l ← renderCheckSql? colNames (stx.getArg 0)
-    let r ← renderCheckSql? colNames (stx.getArg 2)
-    return "(" ++ l ++ " AND " ++ r ++ ")"
-  else if k == ``qedOr then do
-    let l ← renderCheckSql? colNames (stx.getArg 0)
-    let r ← renderCheckSql? colNames (stx.getArg 2)
-    return "(" ++ l ++ " OR " ++ r ++ ")"
-  else if k == ``qedNot then
-    (renderCheckSql? colNames (stx.getArg 1)).map fun s => "(NOT " ++ s ++ ")"
-  else if k == ``qedCmp then do
-    let links := (stx.getArg 1).getArgs
-    let mut lhsStx := stx.getArg 0
-    let mut parts : Array String := #[]
-    for lk in links do
-      let opStr := ((lk.getArg 0).reprint.getD "").trimAscii.toString
-      let rhsStx := lk.getArg 1
-      let sqlOp ← match opStr with
-        | "==" => some "=" | "!=" => some "<>" | "<=" => some "<="
-        | ">=" => some ">=" | "<" => some "<" | ">" => some ">"
-        | _ => none
-      let l ← renderCheckSql? colNames lhsStx
-      let r ← renderCheckSql? colNames rhsStx
-      parts := parts.push s!"{l} {sqlOp} {r}"
-      lhsStx := rhsStx
-    if parts.isEmpty then none
-    else some (String.intercalate " AND " parts.toList)
-  else none
-
-/-- Best-effort Postgres RLS `USING (...)` expression renderer for `policy ... requires ...`. -/
-private partial def renderRlsSql? (colNames : Array String) (stx : Lean.Syntax) : Option String :=
-  let k := stx.getKind
-  if k == ``qedProj then
-    let b := stx.getArg 0
-    let f := (stx.getArg 2).getId.eraseMacroScopes.toString
-    if b.getKind == ``qedIdent && (b.getArg 0).getId.eraseMacroScopes == `ctx && f == "userId" then
-      some "current_setting('qed.user_id', true)"
-    else if b.getKind == ``qedIdent && (b.getArg 0).getId.eraseMacroScopes == `row && colNames.contains f then
-      some ("\"" ++ f ++ "\"")
-    else none
-  else if k == ``qedCall then
+  if !forRls && k == ``qedLitNum then
+    some (toString (⟨(stx.getArg 0)⟩ : Lean.TSyntax `num).getNat)
+  else if forRls && k == ``qedCall then
     let callee := stx.getArg 0
     let rawArgs := (stx.getArg 2).getSepArgs
     if callee.getKind == ``qedIdent && (callee.getArg 0).getId.eraseMacroScopes == `some &&
        rawArgs.size == 1 && rawArgs[0]!.getKind == ``qedCallArgPos then
-      renderRlsSql? colNames (rawArgs[0]!.getArg 0)
+      recR (rawArgs[0]!.getArg 0)
     else none
   else if k == ``qedIdent then
-    let comps := (stx.getArg 0).getId.eraseMacroScopes.components.map (·.toString)
-    match comps with
+    match (stx.getArg 0).getId.eraseMacroScopes.components.map (·.toString) with
     | [s] =>
         if colNames.contains s then some ("\"" ++ s ++ "\"")
-        else if s == "true" then some "TRUE"
-        else if s == "false" then some "FALSE"
+        else if s == "true" then some (if forRls then "TRUE" else "1")
+        else if s == "false" then some (if forRls then "FALSE" else "0")
         else none
-    | ["ctx", "userId"] => some "current_setting('qed.user_id', true)"
-    | ["row", col] =>
-        if colNames.contains col then some ("\"" ++ col ++ "\"") else none
+    | ["row", col] => if colNames.contains col then some ("\"" ++ col ++ "\"") else none
+    | ["ctx", "userId"] => if forRls then some "current_setting('qed.user_id', true)" else none
+    | [col, "length"] => if !forRls && colNames.contains col then some ("LENGTH(\"" ++ col ++ "\")") else none
+    | ["row", col, "length"] => if !forRls && colNames.contains col then some ("LENGTH(\"" ++ col ++ "\")") else none
     | _ => none
   else if k == ``qedParen then
     let args := (stx.getArg 1).getSepArgs
-    if args.size == 1 then (renderRlsSql? colNames args[0]!).map fun s => "(" ++ s ++ ")" else none
-  else if k == ``qedAnd then do
-    let l ← renderRlsSql? colNames (stx.getArg 0)
-    let r ← renderRlsSql? colNames (stx.getArg 2)
-    return "(" ++ l ++ " AND " ++ r ++ ")"
-  else if k == ``qedOr then do
-    let l ← renderRlsSql? colNames (stx.getArg 0)
-    let r ← renderRlsSql? colNames (stx.getArg 2)
-    return "(" ++ l ++ " OR " ++ r ++ ")"
+    if args.size == 1 then (recR args[0]!).map fun s => "(" ++ s ++ ")" else none
+  else if k == ``qedProj then
+    let b := stx.getArg 0
+    let f := (stx.getArg 2).getId.eraseMacroScopes.toString
+    if forRls && b.getKind == ``qedIdent && (b.getArg 0).getId.eraseMacroScopes == `ctx && f == "userId" then
+      some "current_setting('qed.user_id', true)"
+    else if !forRls && f == "length" then
+      (recR b).map fun s => "LENGTH(" ++ s ++ ")"
+    else if b.getKind == ``qedIdent && (b.getArg 0).getId.eraseMacroScopes == `row && colNames.contains f then
+      some ("\"" ++ f ++ "\"")
+    else none
+  else if k == ``qedAnd || k == ``qedOr then do
+    let l ← recR (stx.getArg 0)
+    let r ← recR (stx.getArg 2)
+    return "(" ++ l ++ (if k == ``qedAnd then " AND " else " OR ") ++ r ++ ")"
+  else if !forRls && k == ``qedNot then
+    (recR (stx.getArg 1)).map fun s => "(NOT " ++ s ++ ")"
   else if k == ``qedCmp then do
     let links := (stx.getArg 1).getArgs
-    if links.size != 1 then none
-    else
-      let opStr := ((links[0]!.getArg 0).reprint.getD "").trimAscii.toString
-      let rhsStx := links[0]!.getArg 1
-      let lhsStx := stx.getArg 0
-      if opStr == "!=" && rhsStx.getKind == ``qedIdent && (rhsStx.getArg 0).getId.eraseMacroScopes == `none then
-        let l ← renderRlsSql? colNames lhsStx
-        some s!"({l} IS NOT NULL AND {l} <> '')"
+    let mapOp : String → Option String
+      | "==" => some "=" | "!=" => some "<>" | "<=" => some "<="
+      | ">=" => some ">=" | "<" => some "<" | ">" => some ">" | _ => none
+    if forRls then
+      if links.size != 1 then none
       else
-        let sqlOp ← match opStr with
-          | "==" => some "=" | "!=" => some "<>" | "<=" => some "<="
-          | ">=" => some ">=" | "<" => some "<" | ">" => some ">"
-          | _ => none
-        let l ← renderRlsSql? colNames lhsStx
-        let r ← renderRlsSql? colNames rhsStx
-        some s!"({l} {sqlOp} {r})"
+        let opStr := ((links[0]!.getArg 0).reprint.getD "").trimAscii.toString
+        let rhsStx := links[0]!.getArg 1
+        let lhsStx := stx.getArg 0
+        if opStr == "!=" && rhsStx.getKind == ``qedIdent && (rhsStx.getArg 0).getId.eraseMacroScopes == `none then
+          let l ← recR lhsStx
+          some s!"({l} IS NOT NULL AND {l} <> '')"
+        else
+          let sqlOp ← mapOp opStr
+          let l ← recR lhsStx; let r ← recR rhsStx
+          some s!"({l} {sqlOp} {r})"
+    else
+      let mut lhsStx := stx.getArg 0
+      let mut parts : Array String := #[]
+      for lk in links do
+        let sqlOp ← mapOp ((lk.getArg 0).reprint.getD "").trimAscii.toString
+        let rhsStx := lk.getArg 1
+        let l ← recR lhsStx; let r ← recR rhsStx
+        parts := parts.push s!"{l} {sqlOp} {r}"
+        lhsStx := rhsStx
+      if parts.isEmpty then none else some (String.intercalate " AND " parts.toList)
   else none
-
-open Lean Elab Command in
-private def mkSqlIdentTerm (ref : Syntax) (raw : String) : CommandElabM Term := do
-  if !isSafeSqlIdent raw then
-    throwErrorAt ref s!"invalid SQL identifier `{raw}` (must start with an ASCII letter or `_` and contain only ASCII letters, digits, and `_`, max 63 chars)"
-  let lit := Syntax.mkStrLit raw
-  `(Qed.Server.Db.SqlIdent.mk $lit (by decide))
 
 open Lean Elab Command in
 private def elabTableProtoAndJson (rowTypeId : Ident) (rowTypeName : Name)
@@ -426,7 +283,6 @@ private def elabTableProtoAndJson (rowTypeId : Ident) (rowTypeName : Name)
   let fsId := mkIdent `fs
   let fIds := cols.map (·.ident)
   let fTys := cols.map (·.tyTerm)
-  let fLits := cols.map fun c => Syntax.mkStrLit c.colName
 
   -- `ToJson` & `FromJson`
   let jsonPairs ← cols.mapM fun c => do
@@ -449,78 +305,23 @@ private def elabTableProtoAndJson (rowTypeId : Ident) (rowTypeName : Name)
         $[let $fIds:ident ← $jsonDecs:term]*
         return { $[$fIds:ident := $fVals:ident],* }))
 
-  -- `ToProto` & `FromProto` & `LawfulProto`
-  let nFields := cols.size
+  -- `ToProto` & `FromProto` & `LawfulProto` (via shared `Qed.mkProtoFieldSkeleton` / `Qed.mkStructProtoInsts`)
   let toId := mkIdent (rowTypeName ++ `toProtoFields)
   let fromId := mkIdent (rowTypeName ++ `fromProtoFields)
-  let emptyList ← `(term| ([] : List (Nat × Qed.Proto.WireVal)))
-  let mut tails : Array Term := Array.replicate (nFields + 1) emptyList
-  let mut tagsPosPf ← `(term| (fun (_ : Nat × Qed.Proto.WireVal) h => False.elim (List.not_mem_nil h)))
-  for revIdx in [0:nFields] do
-    let i := nFields - 1 - revIdx
-    let iLit := Syntax.mkNumLit (toString i)
-    let kLit := Syntax.mkNumLit (toString (i + 1))
-    let fId := fIds[i]!
-    let rd ← `($xId.$fId)
-    tails := tails.set! i (← `(term| Qed.ToProtoField.encodeProtoField $kLit $rd ++ $(tails[i + 1]!)))
-    tagsPosPf ← `(term| Qed.Proto.msg_tags_pos_encodeAppend (Nat.zero_lt_succ $iLit) $rd $tagsPosPf)
-  let protoBody := tails[0]!
-
-  let protoDecs ← (List.range nFields).toArray.mapM fun i => do
+  let reads ← fIds.mapM fun fId => `($xId.$fId)
+  let (protoBody, tagsPosPf, pIdents, pHaveTacs) ← Qed.mkProtoFieldSkeleton reads (fun i => pure fTys[i]!)
+  let protoDecs ← (List.range cols.size).toArray.mapM fun i => do
     let kLit := Syntax.mkNumLit (toString (i + 1))
     let fTy := fTys[i]!
     `(Qed.FromProtoField.decodeProtoField (α := $fTy) $kLit $fsId)
-
-  let mut pIdents : Array Ident := #[]
-  let mut pHaveTacs : Array (TSyntax `tactic) := #[]
-  for i in [0:nFields] do
-    let kLit := Syntax.mkNumLit (toString (i + 1))
-    let fTy := fTys[i]!
-    let fId := fIds[i]!
-    let rd ← `($xId.$fId)
-    let mut gtPf ← `(term| Qed.Proto.allTagsGt_nil $kLit)
-    for revAfter in [0 : nFields - 1 - i] do
-      let j := nFields - 1 - revAfter
-      let jLit := Syntax.mkNumLit (toString (j + 1))
-      let diffPredLit := Syntax.mkNumLit (toString (j - i - 1))
-      let fjId := fIds[j]!
-      let rdj ← `($xId.$fjId)
-      gtPf ← `(term| Qed.Proto.allTagsGt_encodeAppend (Nat.lt_of_sub_eq_succ (rfl : $jLit - $kLit = Nat.succ $diffPredLit)) $rdj $gtPf)
-    let mut rawEq ← `(term| Qed.Proto.decodeProtoField_hit $kLit $rd $(tails[i + 1]!) $gtPf)
-    for revBefore in [0:i] do
-      let j := i - 1 - revBefore
-      let jLit := Syntax.mkNumLit (toString (j + 1))
-      let diffPredLit := Syntax.mkNumLit (toString (i - j - 1))
-      let fjId := fIds[j]!
-      let rdj ← `($xId.$fjId)
-      rawEq ← `(term| Eq.trans (Qed.Proto.decodeProtoField_skip (α := $fTy) (Nat.ne_of_lt (Nat.lt_of_sub_eq_succ (rfl : $kLit - $jLit = Nat.succ $diffPredLit))) $rdj $(tails[j + 1]!)) $rawEq)
-    let hId := mkIdent (Name.mkSimple s!"_hp{i}")
-    pIdents := pIdents.push hId
-    pHaveTacs := pHaveTacs.push (← `(tactic| have $hId:ident := $rawEq))
-
-  let toProtoInstId := mkIdent (rowTypeName ++ `instToProto)
-  let fromProtoInstId := mkIdent (rowTypeName ++ `instFromProto)
-  let lawfulProtoInstId := mkIdent (rowTypeName ++ `instLawfulProto)
-  let fromProtoThmId := mkIdent (rowTypeName ++ `_fromProto_toProto)
-  let _ := fLits
   elabCommand (← `(command|
     def $toId ($xId:ident : $rowTypeId) : List (Nat × Qed.Proto.WireVal) := $protoBody))
   elabCommand (← `(command|
     def $fromId ($fsId:ident : List (Nat × Qed.Proto.WireVal)) : Except String $rowTypeId := do
       $[let $fIds:ident ← $protoDecs:term]*
       return { $[$fIds:ident := $fVals:ident],* }))
-  elabCommand (← `(command|
-    instance $toProtoInstId:ident : Qed.ToProto $rowTypeId := .ofFields $toId))
-  elabCommand (← `(command|
-    instance $fromProtoInstId:ident : Qed.FromProto $rowTypeId := .ofFields $fromId))
-  elabCommand (← `(command|
-    private theorem $fromProtoThmId ($xId:ident : $rowTypeId) : $fromId ($toId $xId) = Except.ok $xId := by
-      $[$pHaveTacs:tactic]*
-      unfold $fromId $toId
-      simp only [$[$pIdents:term],*, bind, Except.bind, pure, Except.pure]))
-  elabCommand (← `(command|
-    instance $lawfulProtoInstId:ident : Qed.LawfulProto $rowTypeId :=
-      .ofFields $toId $fromId (fun $xId => $tagsPosPf) $fromProtoThmId))
+  for cmd in ← Qed.mkStructProtoInsts rowTypeId toId fromId xId tagsPosPf pIdents pHaveTacs true do
+    elabCommand cmd
 
 open Lean Elab Command in
 @[command_elab databaseCmd]
@@ -624,7 +425,7 @@ def elabDatabaseCmd : CommandElab := fun stx => do
         else if sk == ``dbTableInvClause then
           let exprs := (sc.getArg 3).getSepArgs
           for e in exprs do
-            if dbExprUsesOld e then transInvs := transInvs.push e
+            if Qed.Server.exprCallsOld e then transInvs := transInvs.push e
             else singleInvs := singleInvs.push e
         else if sk == ``dbTableIndexClause then
           let idxs := (sc.getArg 2).getSepArgs.map fun s => (⟨s⟩ : Ident)
@@ -725,7 +526,7 @@ def elabDatabaseCmd : CommandElab := fun stx => do
           $rowInvId $rowVar := by
         unfold $rowInvBoolId at h
         simp only [Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true',
-                   beq_iff_eq, bne_iff_ne, decide_eq_true_eq] at h
+                   beq_iff_eq, bne_iff_ne, decide_eq_true_eq, Qed.Lang.QedVal.val_id] at h
         try exact trivial
         try exact h
         try simp_all))
@@ -767,10 +568,10 @@ def elabDatabaseCmd : CommandElab := fun stx => do
         @[simp] abbrev $pid ($ctxVar:ident : Qed.Server.RequestCtx) ($rowVar:ident : $rowTypeId) : Prop := $conj))
       return (pid, String.intercalate " and " lbls.toList)
 
-    let (readPolId, readPolLbl) ← mkPolDef `ReadPolicy t.readPols
-    let (insertPolId, insertPolLbl) ← mkPolDef `InsertPolicy t.insertPols
-    let (updatePolId, updatePolLbl) ← mkPolDef `UpdatePolicy t.updatePols
-    let (deletePolId, deletePolLbl) ← mkPolDef `DeletePolicy t.deletePols
+    let (_, readPolLbl) ← mkPolDef `ReadPolicy t.readPols
+    let (_, insertPolLbl) ← mkPolDef `InsertPolicy t.insertPols
+    let (_, updatePolLbl) ← mkPolDef `UpdatePolicy t.updatePols
+    let (_, deletePolLbl) ← mkPolDef `DeletePolicy t.deletePols
 
     -- 5. Zero-trust SQL row decoder (`decodeRow`)
     let valsVar := mkIdent `_vals
@@ -811,7 +612,7 @@ def elabDatabaseCmd : CommandElab := fun stx => do
       if col.isNat && !col.isNullable then
         chkParts := chkParts.push ("\"" ++ col.colName ++ "\" >= 0")
       for w in col.whereExprs do
-        if let some s := renderCheckSql? colNames w then
+        if let some s := renderSqlPred? colNames false w then
           chkParts := chkParts.push s
       let chkT : Term ←
         if chkParts.isEmpty then `(none)
@@ -822,8 +623,8 @@ def elabDatabaseCmd : CommandElab := fun stx => do
     let idxTerms ← t.indexes.mapM fun idxs => do
       let ids ← idxs.mapM fun ic => mkSqlIdentTerm ic ic.getId.eraseMacroScopes.toString
       `([$[$ids:term],*])
-    let rlsReadParts := t.readPols.filterMap (renderRlsSql? colNames)
-    let rlsWriteParts := t.updatePols.filterMap (renderRlsSql? colNames)
+    let rlsReadParts := t.readPols.filterMap (renderSqlPred? colNames true)
+    let rlsWriteParts := t.updatePols.filterMap (renderSqlPred? colNames true)
     let rlsReadT ← if rlsReadParts.isEmpty then `(none) else `(some $(Syntax.mkStrLit (String.intercalate " AND " rlsReadParts.toList)))
     let rlsWriteT ← if rlsWriteParts.isEmpty then `(none) else `(some $(Syntax.mkStrLit (String.intercalate " AND " rlsWriteParts.toList)))
 
@@ -838,7 +639,6 @@ def elabDatabaseCmd : CommandElab := fun stx => do
       }))
     tableSchemaTerms := tableSchemaTerms.push (← `($schemaId))
 
-    let _ := (readPolId, insertPolId, updatePolId, deletePolId)
     tableInfos := tableInfos.push {
       tableName         := t.tableName
       rowTypeConst      := fullRowTypeName

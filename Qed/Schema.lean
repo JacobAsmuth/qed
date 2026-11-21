@@ -78,146 +78,71 @@ private def toInt? (s : String) : Option Int :=
   | '-' :: ds => (String.ofList ds).toNat?.map fun n => -(Int.ofNat n)
   | _         => s.toNat?.map Int.ofNat
 
-private theorem step_input (inForm : Bool) :
-    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "input" = some ⟨.normal, false, false, inForm⟩ := by
-  cases inForm <;> rfl
-private theorem step_textarea (inForm : Bool) :
-    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "textarea" = some ⟨.textarea, false, true, inForm⟩ := by
-  cases inForm <;> rfl
-private theorem step_select (inForm : Bool) :
-    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "select" = some ⟨.select, false, true, inForm⟩ := by
-  cases inForm <;> rfl
-private theorem step_option (inForm : Bool) :
-    stepHtmlCtx ⟨.select, false, true, inForm⟩ "option" = some ⟨.option, false, true, inForm⟩ := rfl
-private theorem step_div (inForm : Bool) :
-    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "div" = some ⟨.normal, false, false, inForm⟩ := by
-  cases inForm <;> rfl
-private theorem step_label (inForm : Bool) :
-    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "label" = some ⟨.normal, false, false, inForm⟩ := by
-  cases inForm <;> rfl
-private theorem step_span (inForm : Bool) :
-    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "span" = some ⟨.normal, false, false, inForm⟩ := by
-  cases inForm <;> rfl
-private theorem step_fieldset (inForm : Bool) :
-    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "fieldset" = some ⟨.normal, false, false, inForm⟩ := by
-  cases inForm <;> rfl
-private theorem step_legend (inForm : Bool) :
-    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "legend" = some ⟨.normal, false, false, inForm⟩ := by
-  cases inForm <;> rfl
-private theorem step_button (inForm : Bool) :
-    stepHtmlCtx ⟨.normal, false, false, inForm⟩ "button" = some ⟨.normal, false, true, inForm⟩ := by
-  cases inForm <;> rfl
+private theorem attr_valid_kv {msg : Type} (k v : String)
+    (hs : isSafeAttrName k = true) (hu : isUrlAttrName k = false) :
+    Attr.valid (msg := msg) (.attr k v) = true := by
+  simp only [Attr.valid, Attr.validKeyValue, hs, hu, Bool.not_false, Bool.true_or, Bool.and_self]
 
-private theorem isVoid_input    : isVoidTag "input" = true := rfl
-private theorem isVoid_textarea : isVoidTag "textarea" = false := rfl
-private theorem isVoid_select   : isVoidTag "select" = false := rfl
-private theorem isVoid_option   : isVoidTag "option" = false := rfl
-private theorem isVoid_div      : isVoidTag "div" = false := rfl
-private theorem isVoid_label    : isVoidTag "label" = false := rfl
-private theorem isVoid_span     : isVoidTag "span" = false := rfl
-private theorem isVoid_fieldset : isVoidTag "fieldset" = false := rfl
-private theorem isVoid_legend   : isVoidTag "legend" = false := rfl
-private theorem isVoid_button   : isVoidTag "button" = false := rfl
+private theorem attr_valid_flag {msg : Type} (k : String) (b : Bool)
+    (hs : isSafeAttrName k = true) : Attr.valid (msg := msg) (.flag k b) = true := hs
 
-private theorem safe_value   : isSafeAttrName "value" = true := rfl
-private theorem url_value    : isUrlAttrName "value" = false := rfl
-private theorem safe_type    : isSafeAttrName "type" = true := rfl
-private theorem url_type     : isUrlAttrName "type" = false := rfl
-private theorem safe_min     : isSafeAttrName "min" = true := rfl
-private theorem url_min      : isUrlAttrName "min" = false := rfl
-private theorem safe_name    : isSafeAttrName "name" = true := rfl
-private theorem url_name     : isUrlAttrName "name" = false := rfl
-private theorem safe_checked : isSafeAttrName "checked" = true := rfl
-private theorem safe_inputEv : isSafeAttrName "input" = true := rfl
-private theorem safe_changeEv : isSafeAttrName "change" = true := rfl
-private theorem safe_clickEv : isSafeAttrName "click" = true := rfl
-private theorem safe_dis     : isSafeAttrName "disabled" = true := rfl
-private theorem safe_ariaInv : isSafeAttrName "aria-invalid" = true := rfl
-private theorem url_ariaInv  : isUrlAttrName "aria-invalid" = false := rfl
+private theorem attr_valid_on {msg : Type} (k : String) (m : msg)
+    (hs : isSafeAttrName k = true) : Attr.valid (.on k m) = true := hs
 
-private theorem attr_valid_value {msg : Type} (v : String) :
-    Attr.valid (msg := msg) (value v) = true := by
-  simp only [value, Attr.valid, Attr.validKeyValue, safe_value, url_value, Bool.not_false, Bool.true_or, Bool.and_self]
-private theorem attr_valid_onInput {msg : Type} (f : String → msg) :
-    Attr.valid (onInput f) = true := by
-  simp only [onInput, Attr.valid, safe_inputEv]
-private theorem attr_valid_onChange {msg : Type} (f : String → msg) :
-    Attr.valid (onChange f) = true := by
-  simp only [onChange, Attr.valid, safe_inputEv]
-private theorem attr_valid_onCheck {msg : Type} (f : Bool → msg) :
-    Attr.valid (onCheck f) = true := by
-  simp only [onCheck, Attr.valid, safe_changeEv]
-private theorem attr_valid_onClick {msg : Type} (m : msg) :
-    Attr.valid (onClick m) = true := by
-  simp only [onClick, Attr.valid, safe_clickEv]
-private theorem attr_valid_type {msg : Type} (v : String) :
-    Attr.valid (msg := msg) (type' v) = true := by
-  simp only [type', Attr.valid, Attr.validKeyValue, safe_type, url_type, Bool.not_false, Bool.true_or, Bool.and_self]
-private theorem attr_valid_name {msg : Type} (v : String) :
-    Attr.valid (msg := msg) (Qed.name v) = true := by
-  simp only [Qed.name, Attr.valid, Attr.validKeyValue, safe_name, url_name, Bool.not_false, Bool.true_or, Bool.and_self]
-private theorem attr_valid_min {msg : Type} (v : String) :
-    Attr.valid (msg := msg) (attr "min" v) = true := by
-  simp only [attr, Attr.valid, Attr.validKeyValue, safe_min, url_min, Bool.not_false, Bool.true_or, Bool.and_self]
-private theorem attr_valid_checked {msg : Type} (b : Bool) :
-    Attr.valid (msg := msg) (checked b) = true := by
-  simp only [checked, Attr.valid, safe_checked]
-private theorem attr_valid_disabled {msg : Type} (b : Bool) :
-    Attr.valid (msg := msg) (disabled b) = true := by
-  simp only [disabled, Attr.valid, safe_dis]
-private theorem attr_valid_ariaInvalid {msg : Type} (v : String) :
-    Attr.valid (msg := msg) (attr "aria-invalid" v) = true := by
-  simp only [attr, Attr.valid, Attr.validKeyValue, safe_ariaInv, url_ariaInv, Bool.not_false, Bool.true_or, Bool.and_self]
+private theorem attr_valid_onVal {msg : Type} (k : String) (f : String → msg)
+    (hs : isSafeAttrName k = true) : Attr.valid (.onValue k f) = true := hs
 
-private theorem attr_valid_cls {msg : Type} (v : String) :
-    Attr.valid (msg := msg) (cls v) = true := rfl
+private theorem validIn_el {msg : Type} {ctx next : HtmlCtx} {tag : String}
+    {attrs : List (Attr msg)} {kids : List (Html msg)}
+    (hstep : stepHtmlCtx ctx tag = some next)
+    (hvoid : isVoidTag tag = false ∨ kids = [])
+    (hv : Attr.validList attrs = true)
+    (hl : Attr.hasLocalCell attrs = false := by rfl)
+    (hk : Html.validListIn next kids = true := by rfl) :
+    Html.validIn ctx (el tag attrs kids) = true := by
+  rcases hvoid with hnv | rfl
+  · simp only [el, Html.validIn, hstep, hnv, hv, hl, hk, Bool.not_false, Bool.true_or, Bool.and_self]
+  · simp only [el, Html.validIn, hstep, hv, hl, hk, List.isEmpty_nil, Bool.not_false, Bool.or_true, Bool.and_self]
 
-private theorem validIn_input {msg : Type} (inForm : Bool) (attrs : List (Attr msg))
-    (hv : Attr.validList attrs = true) (hl : Attr.hasLocalCell attrs = false) :
-    Html.validIn ⟨.normal, false, false, inForm⟩ (el "input" attrs) = true := by
-  simp only [el, Html.validIn, Html.validListIn, step_input, isVoid_input, hv, hl,
-    Bool.not_false, Bool.or_true, Bool.and_self, List.isEmpty_nil]
+local macro "solve_attrs" : tactic =>
+  `(tactic| (dsimp only [Attr.validList, value, type', Qed.name, attr, checked, disabled, cls, onInput, onChange, onCheck, onClick]; simp only [Bool.and_eq_true]; repeat any_goals constructor) <;>
+    first
+    | exact attr_valid_kv _ _ rfl rfl
+    | exact attr_valid_flag _ _ rfl
+    | exact attr_valid_on _ _ rfl
+    | exact attr_valid_onVal _ _ rfl
+    | rfl)
 
 def text : Codec String where
   parse := some; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "input" [value raw, onInput set]
-  render_valid := fun inForm raw set => validIn_input inForm _
-    (by simp only [Attr.validList, attr_valid_value, attr_valid_onInput, Bool.and_self]) rfl
+  render_valid := fun inForm _ _ => by cases inForm <;> exact validIn_el rfl (.inr rfl) (by solve_attrs)
 
 def textarea : Codec String where
   parse := some; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "textarea" [value raw, onInput set]
-  render_valid := fun inForm raw set => by
-    have hv : Attr.validList [value (msg := _) raw, onInput set] = true := by
-      simp only [Attr.validList, attr_valid_value, attr_valid_onInput, Bool.and_self]
-    have hl : Attr.hasLocalCell [value (msg := _) raw, onInput set] = false := rfl
-    simp only [el, Html.validIn, Html.validListIn, step_textarea, isVoid_textarea, hv, hl,
-      Bool.not_false, Bool.true_or, Bool.and_self]
+  render_valid := fun inForm _ _ => by cases inForm <;> exact validIn_el rfl (.inl rfl) (by solve_attrs)
 
 def nat : Codec Nat where
   parse := fun s => s.toNat?; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "input" [type' "number", attr "min" "0", value raw, onInput set]
-  render_valid := fun inForm raw set => validIn_input inForm _
-    (by simp only [Attr.validList, attr_valid_type, attr_valid_min, attr_valid_value, attr_valid_onInput, Bool.and_self]) rfl
+  render_valid := fun inForm _ _ => by cases inForm <;> exact validIn_el rfl (.inr rfl) (by solve_attrs)
 
 def int : Codec Int where
   parse := toInt?; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "input" [type' "number", value raw, onInput set]
-  render_valid := fun inForm raw set => validIn_input inForm _
-    (by simp only [Attr.validList, attr_valid_type, attr_valid_value, attr_valid_onInput, Bool.and_self]) rfl
+  render_valid := fun inForm _ _ => by cases inForm <;> exact validIn_el rfl (.inr rfl) (by solve_attrs)
 
 def checkbox : Codec Bool where
   parse := fun s => some (s == "true"); valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set =>
     el "input" [type' "checkbox", checked (raw == "true"), onCheck (fun b => set (toString b))]
-  render_valid := fun inForm raw set => validIn_input inForm _
-    (by simp only [Attr.validList, attr_valid_type, attr_valid_checked, attr_valid_onCheck, Bool.and_self]) rfl
+  render_valid := fun inForm _ _ => by cases inForm <;> exact validIn_el rfl (.inr rfl) (by solve_attrs)
 
 def date : Codec Date where
   parse := Date.parse?; valid := fun _ => True; dec := fun _ => inferInstance
   render := fun raw set => el "input" [type' "date", value raw, onInput set]
-  render_valid := fun inForm raw set => validIn_input inForm _
-    (by simp only [Attr.validList, attr_valid_type, attr_valid_value, attr_valid_onInput, Bool.and_self]) rfl
+  render_valid := fun inForm _ _ => by cases inForm <;> exact validIn_el rfl (.inr rfl) (by solve_attrs)
 
 def select (options : List (String × String)) : Codec String where
   parse := fun s => if options.any (fun o => o.1 == s) then some s else none
@@ -225,17 +150,10 @@ def select (options : List (String × String)) : Codec String where
   render := fun raw set =>
     el "select" [value raw, onChange set]
       (options.map fun (v, lbl) => el "option" [value v] [lbl])
-  render_valid := fun {msg} inForm raw set => by
-    have hvSel : Attr.validList [value (msg := msg) raw, onChange set] = true := by
-      simp only [Attr.validList, attr_valid_value, attr_valid_onChange, Bool.and_self]
-    have hlSel : Attr.hasLocalCell [value (msg := msg) raw, onChange set] = false := rfl
-    have hvOpt : ∀ v : String, Attr.validList [value (msg := msg) v] = true := fun v => by
-      simp only [Attr.validList, attr_valid_value, Bool.and_self]
-    have hlOpt : ∀ v : String, Attr.hasLocalCell [value (msg := msg) v] = false := fun _ => rfl
-    simp only [el, Html.validIn, Html.validListIn, Html.validListIn_map,
-      step_select, step_option, isVoid_select, isVoid_option, validTextIn,
-      hvSel, hlSel, hvOpt, hlOpt, Bool.not_false, Bool.true_or, Bool.and_self,
-      Qed.List.all_const_true]
+  render_valid := fun inForm _ _ => by
+    cases inForm <;> exact validIn_el rfl (.inl rfl) (by solve_attrs) rfl (by
+      rw [Html.validListIn_map, List.all_eq_true]; intro p _
+      exact validIn_el (next := ⟨.option, false, true, _⟩) rfl (.inl rfl) (by solve_attrs))
 
 def radios (group : String) (options : List (String × String)) : Codec String where
   parse := fun s => if options.any (fun o => o.1 == s) then some s else none
@@ -245,36 +163,19 @@ def radios (group : String) (options : List (String × String)) : Codec String w
     el "div" [cls "qed-radios"]
       (options.map fun (v, lbl) =>
         el "label" [] [el "input" [type' "radio", Qed.name group, value v, checked (raw == v), onChange set], lbl])
-  render_valid := fun {msg} inForm raw set => by
-    have hvDiv : Attr.validList [cls (msg := msg) "qed-radios"] = true := rfl
-    have hlDiv : Attr.hasLocalCell [cls (msg := msg) "qed-radios"] = false := rfl
-    have hvNil : Attr.validList ([] : List (Attr msg)) = true := rfl
-    have hlNil : Attr.hasLocalCell ([] : List (Attr msg)) = false := rfl
-    have hInp : ∀ v : String, Html.validIn ⟨.normal, false, false, inForm⟩
-        (el "input" [type' "radio", Qed.name group, value v, checked (raw == v), onChange set]) = true := fun v =>
-      validIn_input inForm _
-        (by simp only [Attr.validList, attr_valid_type, attr_valid_name, attr_valid_value, attr_valid_checked, attr_valid_onChange, Bool.and_self])
-        rfl
-    have hLbl : ∀ p : String × String, Html.validIn ⟨.normal, false, false, inForm⟩
-        (el "label" [] [el "input" [type' "radio", Qed.name group, value p.1, checked (raw == p.1), onChange set], p.2]) = true := fun (v, lbl) => by
-      simp only [el, Html.validIn, Html.validListIn, step_label, isVoid_label, validTextIn,
-        hvNil, hlNil, Bool.not_false, Bool.true_or, Bool.and_self, Bool.and_true, Bool.true_and]
-      exact hInp v
-    change Html.validIn ⟨.normal, false, false, inForm⟩
-      (Html.element "div" [cls "qed-radios"] (options.map fun p =>
-        el "label" [] [el "input" [type' "radio", Qed.name group, value p.1, checked (raw == p.1), onChange set], p.2])) = true
-    rw [Html.validIn]
-    simp only [step_div, isVoid_div, hvDiv, hlDiv, Html.validListIn_map, hLbl,
-      Bool.not_false, Bool.true_or, Bool.and_self, Qed.List.all_const_true]
+  render_valid := fun inForm _ _ => by
+    cases inForm <;> exact validIn_el (next := ⟨.normal, false, false, _⟩) rfl (.inl rfl) rfl rfl (by
+      rw [Html.validListIn_map, List.all_eq_true]; intro p _
+      exact validIn_el (next := ⟨.normal, false, false, _⟩) rfl (.inl rfl) rfl rfl (by
+        simp only [Html.validListIn, Bool.and_true, Bool.and_eq_true]
+        exact ⟨validIn_el rfl (.inr rfl) (by solve_attrs), rfl⟩))
 
 def json (α : Type) [ToJson α] [FromJson α] : Codec α where
   parse := fun _ => none
   valid := fun _ => True; dec := fun _ => inferInstance
   render := fun _ _ => el "span" [] []
   inForm := false
-  render_valid := fun inForm _ _ => by
-    simp only [el, Html.validIn, Html.validListIn, step_span, isVoid_span,
-      Attr.validList, Attr.hasLocalCell, Bool.not_false, Bool.true_or, Bool.and_self]
+  render_valid := fun inForm _ _ => by cases inForm <;> exact validIn_el rfl (.inl rfl) rfl
 
 @[simp] theorem render_valid_simp {α msg : Type} (c : Codec α) (inForm : Bool) (raw : String) (set : String → msg) :
     Html.validIn ⟨.normal, false, false, inForm⟩ (c.render raw set) = true :=
@@ -295,48 +196,23 @@ def formFieldRow {msg : Type} (inForm wrapLabel bad : Bool) (label err : String)
     (hctrl : Html.validIn ⟨.normal, false, false, ctxInForm⟩ ctrl = true) :
     Html.validListIn ⟨.normal, false, false, ctxInForm⟩
       (formFieldRow inForm wrapLabel bad label err ctrl) = true := by
-  have hvRow : ∀ v : String, Attr.validList [cls (msg := msg) "qed-field", attr "aria-invalid" v] = true := fun v => by
-    simp only [Attr.validList, attr_valid_cls, attr_valid_ariaInvalid, Bool.and_self]
-  have hlRow : ∀ v : String, Attr.hasLocalCell [cls (msg := msg) "qed-field", attr "aria-invalid" v] = false := fun _ => rfl
-  have hvCls : ∀ s : String, Attr.validList [cls (msg := msg) s] = true := fun _ => rfl
-  have hlCls : ∀ s : String, Attr.hasLocalCell [cls (msg := msg) s] = false := fun _ => rfl
   cases inForm with
   | false => rfl
   | true =>
-    cases wrapLabel with
-    | true =>
-      cases bad with
-      | true =>
-        dsimp only [formFieldRow]
-        simp only [ite_true, List.cons_append, List.nil_append,
-          el, Html.validListIn, Html.validIn, step_label, step_span, isVoid_label, isVoid_span,
-          hvRow, hlRow, hvCls, hlCls, validTextIn, hctrl, Bool.not_false, Bool.true_or, Bool.and_self]
-      | false =>
-        dsimp only [formFieldRow]
-        simp only [Bool.false_eq_true, ite_true, ite_false, List.cons_append, List.nil_append,
-          el, Html.validListIn, Html.validIn, step_label, step_span, isVoid_label, isVoid_span,
-          hvRow, hlRow, hvCls, hlCls, validTextIn, hctrl, Bool.not_false, Bool.true_or, Bool.and_self]
-    | false =>
-      cases bad with
-      | true =>
-        dsimp only [formFieldRow]
-        simp only [Bool.false_eq_true, ite_true, ite_false, List.cons_append, List.nil_append,
-          el, Html.validListIn, Html.validIn, step_fieldset, step_legend, step_span,
-          isVoid_fieldset, isVoid_legend, isVoid_span,
-          hvRow, hlRow, hvCls, hlCls, validTextIn, hctrl, Bool.not_false, Bool.true_or, Bool.and_self]
-      | false =>
-        dsimp only [formFieldRow]
-        simp only [Bool.false_eq_true, ite_true, ite_false, List.cons_append, List.nil_append,
-          el, Html.validListIn, Html.validIn, step_fieldset, step_legend,
-          isVoid_fieldset, isVoid_legend,
-          hvRow, hlRow, hvCls, hlCls, validTextIn, hctrl, Bool.not_false, Bool.true_or, Bool.and_self]
+    cases wrapLabel <;> cases bad <;> cases ctxInForm
+    all_goals
+      dsimp only [formFieldRow]
+      simp only [Bool.false_eq_true, ite_true, ite_false, List.cons_append, List.nil_append,
+        Html.validListIn, Bool.and_true]
+      refine validIn_el (next := ⟨.normal, false, false, _⟩) rfl (.inl rfl) (by solve_attrs) rfl ?_
+      simp only [Html.validListIn, Bool.and_true, Bool.and_eq_true]
+      repeat any_goals constructor
+      all_goals first | exact hctrl | exact validIn_el rfl (.inl rfl) rfl rfl rfl
 
 theorem formDiv_validIn {msg : Type} (inForm : Bool) (kids : List (Html msg))
     (hk : Html.validListIn ⟨.normal, false, false, inForm⟩ kids = true) :
     Html.validIn ⟨.normal, false, false, inForm⟩ (el "div" [cls "qed-form"] kids) = true := by
-  have hv : Attr.validList [cls (msg := msg) "qed-form"] = true := rfl
-  have hl : Attr.hasLocalCell [cls (msg := msg) "qed-form"] = false := rfl
-  simp only [el, Html.validIn, step_div, isVoid_div, hv, hl, hk, Bool.not_false, Bool.true_or, Bool.and_self]
+  cases inForm <;> exact validIn_el rfl (.inl rfl) rfl rfl hk
 
 theorem formRowCons_validIn {msg : Type} (ctxInForm inForm wrapLabel bad : Bool)
     (label err : String) (ctrl : Html msg) (rest : List (Html msg))
@@ -353,19 +229,10 @@ def submitBtn {msg α : Type} (o : Option α) (submit : α → msg) : Html msg :
 
 theorem submitBtn_validIn {msg α : Type} (inForm : Bool) (o : Option α) (submit : α → msg) :
     Html.validListIn ⟨.normal, false, false, inForm⟩ [submitBtn o submit] = true := by
-  cases o with
-  | some p =>
-    have hv : Attr.validList [onClick (submit p)] = true := by
-      simp only [Attr.validList, attr_valid_onClick, Bool.and_self]
-    have hl : Attr.hasLocalCell [onClick (submit p)] = false := rfl
-    simp only [submitBtn, el, Html.validListIn, Html.validIn, step_button, isVoid_button,
-      hv, hl, validTextIn, Bool.not_false, Bool.true_or, Bool.and_self]
-  | none =>
-    have hv : Attr.validList [disabled (msg := msg) true] = true := by
-      simp only [Attr.validList, attr_valid_disabled, Bool.and_self]
-    have hl : Attr.hasLocalCell [disabled (msg := msg) true] = false := rfl
-    simp only [submitBtn, el, Html.validListIn, Html.validIn, step_button, isVoid_button,
-      hv, hl, validTextIn, Bool.not_false, Bool.true_or, Bool.and_self]
+  cases o <;> cases inForm
+  all_goals
+    simp only [submitBtn, Html.validListIn, Bool.and_true]
+    exact validIn_el rfl (.inl rfl) (by solve_attrs) rfl rfl
 
 end Codec
 
@@ -504,65 +371,6 @@ private partial def elabPredProbe (cbns : Array Ident) (cbts : Array Term) (inp 
     discard <| elabTermAndSynthesize inp none
 
 open Lean Elab Command Term in
-private def mkProtoFieldSkeleton
-    (reads : Array (TSyntax `term))
-    (fieldValTy : Nat → CommandElabM (TSyntax `term))
-    (wrapFieldEq : Nat → TSyntax `term → TSyntax `term → CommandElabM (TSyntax `term)) :
-    CommandElabM (TSyntax `term × TSyntax `term × Array Ident × Array (TSyntax `tactic)) := do
-  let nFields := reads.size
-  let emptyList ← `(term| ([] : List (Nat × Proto.WireVal)))
-  let mut tails : Array (TSyntax `term) := Array.replicate (nFields + 1) emptyList
-  let mut tagsPosPf ← `(term| (fun (_ : Nat × Proto.WireVal) h => False.elim (List.not_mem_nil h)))
-  for revIdx in [0:nFields] do
-    let i := nFields - 1 - revIdx
-    let iLit := Syntax.mkNumLit (toString i)
-    let kLit := Syntax.mkNumLit (toString (i + 1))
-    tails := tails.set! i (← `(term| ToProtoField.encodeProtoField $kLit $(reads[i]!) ++ $(tails[i + 1]!)))
-    tagsPosPf ← `(term| Proto.msg_tags_pos_encodeAppend (Nat.zero_lt_succ $iLit) $(reads[i]!) $tagsPosPf)
-  let body := tails[0]!
-  let mut pIdents : Array Ident := #[]
-  let mut pHaveTacs : Array (TSyntax `tactic) := #[]
-  for i in [0:nFields] do
-    let kLit := Syntax.mkNumLit (toString (i + 1))
-    let valTy ← fieldValTy i
-    let mut gtPf ← `(term| Proto.allTagsGt_nil $kLit)
-    for revAfter in [0 : nFields - 1 - i] do
-      let j := nFields - 1 - revAfter
-      let jLit := Syntax.mkNumLit (toString (j + 1))
-      let diffPredLit := Syntax.mkNumLit (toString (j - i - 1))
-      gtPf ← `(term| Proto.allTagsGt_encodeAppend (Nat.lt_of_sub_eq_succ (rfl : $jLit - $kLit = Nat.succ $diffPredLit)) $(reads[j]!) $gtPf)
-    let mut rawEq ← `(term| Proto.decodeProtoField_hit $kLit $(reads[i]!) $(tails[i + 1]!) $gtPf)
-    for revBefore in [0:i] do
-      let j := i - 1 - revBefore
-      let jLit := Syntax.mkNumLit (toString (j + 1))
-      let diffPredLit := Syntax.mkNumLit (toString (i - j - 1))
-      rawEq ← `(term| Eq.trans (Proto.decodeProtoField_skip (α := $valTy) (Nat.ne_of_lt (Nat.lt_of_sub_eq_succ (rfl : $kLit - $jLit = Nat.succ $diffPredLit))) $(reads[j]!) $(tails[j + 1]!)) $rawEq)
-    let fullEq ← wrapFieldEq i body rawEq
-    let hId := mkIdent (Name.mkSimple s!"_hp{i}")
-    pIdents := pIdents.push hId
-    pHaveTacs := pHaveTacs.push (← `(tactic| have $hId:ident := $fullEq))
-  return (body, tagsPosPf, pIdents, pHaveTacs)
-
-open Lean Elab Command Term in
-private def mkSchemaProtoInsts (t : Ident) (toId fromId : Ident)
-    (tagsPosPf : TSyntax `term) (pIdents : Array Ident) (pHaveTacs : Array (TSyntax `tactic))
-    (allLawfulProto : Bool) : CommandElabM (Array (TSyntax `command)) := do
-  let tId := t.getId
-  let instBase : Array (TSyntax `command) := #[
-    ← `(command| instance $(mkIdent (tId ++ `instToProto)):ident : ToProto $t := .ofFields $toId),
-    ← `(command| instance $(mkIdent (tId ++ `instFromProto)):ident : FromProto $t := .ofFields $fromId) ]
-  if !allLawfulProto then return instBase
-  let fromProtoThmId := mkIdent (tId ++ `_fromProto_toProto)
-  let lawCmds : Array (TSyntax `command) := #[
-    ← `(command| private theorem $fromProtoThmId (x : $t) : $fromId ($toId x) = Except.ok x := by
-          $[$pHaveTacs:tactic]*
-          unfold $fromId $toId
-          simp only [$[$pIdents:term],*, bind, Except.bind, pure, Except.pure]),
-    ← `(command| instance $(mkIdent (tId ++ `instLawfulProto)):ident : LawfulProto $t :=
-          .ofFields $toId $fromId (fun x => $tagsPosPf) $fromProtoThmId) ]
-  return instBase ++ lawCmds
-
-open Lean Elab Command Term in
 private def mkSchemaProtoCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
     (tApp : TSyntax `term) (appTo : TSyntax `term → CommandElabM (TSyntax `term))
     (fs : Array Ident) (inputs : Array Term) (refined : Array Bool)
@@ -599,7 +407,8 @@ private def mkSchemaProtoCmds (t : Ident) (cbns : Array Ident) (cbts : Array Ter
     ← `(command| def $decodeBytesId $[($cbns:ident : $cbts:term)]* (b : Bytes) : Except String $tApp :=
           (Proto.decodeFieldsSpec b).bind ($fromApp)) ]
   if !cbns.isEmpty then return baseCmds
-  let instCmds ← mkSchemaProtoInsts t toId fromId tagsPosPf pIdents pHaveTacs allLawfulProto
+  let xId : Ident := ⟨← `(x)⟩
+  let instCmds ← mkStructProtoInsts t toId fromId xId tagsPosPf pIdents pHaveTacs allLawfulProto
   return baseCmds ++ instCmds
 
 open Lean Elab Command Term in

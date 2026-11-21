@@ -1,3 +1,4 @@
+import Qed.Base64
 import Qed.Server.Core
 
 namespace Qed.Server.Net
@@ -406,95 +407,17 @@ theorem isBlockedIpBytes_badLen (addr : ByteArray) (h4 : addr.size ≠ 4) (h16 :
 
 /-! ## Unified RFC 4648 Base64 & Base64URL Encoder -/
 
-def isBase64UrlChar (c : Char) : Bool :=
-  ('A' ≤ c && c ≤ 'Z') || ('a' ≤ c && c ≤ 'z') || ('0' ≤ c && c ≤ '9') || c == '-' || c == '_'
-
-def b64Char (urlSafe : Bool) (n : Nat) : Char :=
-  if n < 26 then Char.ofNat (65 + n)
-  else if n < 52 then Char.ofNat (97 + (n - 26))
-  else if n < 62 then Char.ofNat (48 + (n - 52))
-  else if n == 62 then (if urlSafe then '-' else '+')
-  else (if urlSafe then '_' else '/')
-
-private theorem char_ofNat_toNat_small (m : Nat) (hm : m < 128) :
-    (Char.ofNat m).toNat = m := by
-  have hv : m.isValidChar := by simp [Nat.isValidChar]; omega
-  simp [Char.ofNat, hv, Char.ofNatAux, Char.toNat]
-
-private theorem b64UrlChar_safe (n : Nat) : isBase64UrlChar (b64Char true n) = true := by
-  unfold b64Char isBase64UrlChar
-  by_cases h1 : n < 26
-  · have hval := char_ofNat_toNat_small (65 + n) (by omega)
-    simp only [h1, ↓reduceIte, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq]
-    left; left; left; left
-    exact ⟨by change (65 : Nat) ≤ (Char.ofNat (65 + n)).toNat; omega,
-           by change (Char.ofNat (65 + n)).toNat ≤ (90 : Nat); omega⟩
-  · by_cases h2 : n < 52
-    · have hval := char_ofNat_toNat_small (97 + (n - 26)) (by omega)
-      simp only [h1, h2, ↓reduceIte, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq]
-      left; left; left; right
-      exact ⟨by change (97 : Nat) ≤ (Char.ofNat (97 + (n - 26))).toNat; omega,
-             by change (Char.ofNat (97 + (n - 26))).toNat ≤ (122 : Nat); omega⟩
-    · by_cases h3 : n < 62
-      · have hval := char_ofNat_toNat_small (48 + (n - 52)) (by omega)
-        simp only [h1, h2, h3, ↓reduceIte, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq]
-        left; left; right
-        exact ⟨by change (48 : Nat) ≤ (Char.ofNat (48 + (n - 52))).toNat; omega,
-               by change (Char.ofNat (48 + (n - 52))).toNat ≤ (57 : Nat); omega⟩
-      · by_cases h4 : n == 62
-        · simp [h1, h2, h3, h4]
-        · simp [h1, h2, h3, h4]
-
-private def base64Loop (urlSafe pad : Bool) (d : Array UInt8) (i : Nat) (acc : String) : Nat → String
-  | 0 => acc
-  | fuel + 1 =>
-      if h2 : i + 2 < d.size then
-        let v := ((d[i]'(by omega)).toNat <<< 16) ||| ((d[i + 1]'(by omega)).toNat <<< 8) ||| (d[i + 2]'(by omega)).toNat
-        let acc' := ((((acc.push (b64Char urlSafe ((v >>> 18) &&& 0x3F)))
-          |>.push (b64Char urlSafe ((v >>> 12) &&& 0x3F)))
-          |>.push (b64Char urlSafe ((v >>> 6) &&& 0x3F)))
-          |>.push (b64Char urlSafe (v &&& 0x3F)))
-        base64Loop urlSafe pad d (i + 3) acc' fuel
-      else if h1 : i + 1 < d.size then
-        let v := ((d[i]'(by omega)).toNat <<< 16) ||| ((d[i + 1]'(by omega)).toNat <<< 8)
-        let acc' := (((acc.push (b64Char urlSafe ((v >>> 18) &&& 0x3F)))
-          |>.push (b64Char urlSafe ((v >>> 12) &&& 0x3F)))
-          |>.push (b64Char urlSafe ((v >>> 6) &&& 0x3F)))
-        if pad then acc'.push '=' else acc'
-      else if h0 : i < d.size then
-        let v := (d[i]'(by omega)).toNat <<< 16
-        let acc' := ((acc.push (b64Char urlSafe ((v >>> 18) &&& 0x3F)))
-          |>.push (b64Char urlSafe ((v >>> 12) &&& 0x3F)))
-        if pad then (acc'.push '=').push '=' else acc'
-      else
-        acc
+abbrev isBase64UrlChar : Char → Bool := Qed.Base64.isUrlChar
 
 /-- RFC 4648 §4 standard Base64 encoding with `=` padding. -/
-def base64Encode (bs : ByteArray) : String :=
-  base64Loop false true bs.data 0 "" (bs.data.size / 3 + 1)
+abbrev base64Encode : ByteArray → String := Qed.Base64.encode
 
 /-- RFC 4648 §5 Base64URL encoding without padding. -/
-def base64UrlEncode (bs : ByteArray) : String :=
-  base64Loop true false bs.data 0 "" (bs.data.size / 3 + 1)
-
-private theorem base64UrlLoop_safe (d : Array UInt8) (i : Nat) (acc : String) (fuel : Nat)
-    (hacc : acc.toList.all isBase64UrlChar = true) :
-    (base64Loop true false d i acc fuel).toList.all isBase64UrlChar = true := by
-  induction fuel generalizing i acc with
-  | zero => exact hacc
-  | succ fuel ih =>
-      unfold base64Loop
-      split
-      · exact ih (i + 3) _ (by simp [String.toList_push, hacc, b64UrlChar_safe])
-      · split
-        · simp [String.toList_push, hacc, b64UrlChar_safe]
-        · split
-          · simp [String.toList_push, hacc, b64UrlChar_safe]
-          · exact hacc
+abbrev base64UrlEncode : ByteArray → String := Qed.Base64.encodeUrl
 
 theorem base64UrlEncode_safe (bs : ByteArray) :
     (base64UrlEncode bs).toList.all isBase64UrlChar = true :=
-  base64UrlLoop_safe bs.data 0 "" (bs.data.size / 3 + 1) rfl
+  Qed.Base64.encodeUrl_safe bs
 
 /-! ## Outbound HTTP/1.1 URL Parser, Request Serializer & Response Head Parser -/
 

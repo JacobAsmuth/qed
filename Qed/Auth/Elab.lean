@@ -332,7 +332,7 @@ def elabAuthCmd : CommandElab := fun stx => do
     }))
 
   -- 6. Register in persistent `authRegistry`
-  let claimInfos : Array AuthClaimInfo := claims.map fun cl =>
+  let claimInfos : List AuthClaimSpec := claims.toList.map fun cl =>
     { name := cl.name, typeName := claimKindTypeName cl.kind, defaultValue := cl.defaultStr }
   modifyEnv fun env => authRegistry.addEntry env {
     authName := fullAuthName
@@ -341,16 +341,12 @@ def elabAuthCmd : CommandElab := fun stx => do
     fromCtxConst := fullAuthName ++ `fromCtx
     configConst := fullAuthName ++ `config
     secrets
-    issuerEnv
-    issuerDefault?
-    audienceEnv
-    audienceDefault?
-    clientIdEnv?
-    clientIdDefault?
-    clientSecretEnv?
-    providers
-    sessionTtlSec
-    claims := claimInfos
+    spec := {
+      name := authShort
+      issuerEnv, issuerDefault?, audienceEnv, audienceDefault?
+      clientIdEnv?, clientIdDefault?, clientSecretEnv?
+      providers := providers.toList, sessionTtlSec, claims := claimInfos
+    }
   }
 
 end Qed.Auth

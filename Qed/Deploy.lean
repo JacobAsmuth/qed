@@ -1,6 +1,7 @@
 import Lean
 import Qed.Json
 import Qed.Auth.Core
+import Qed.Server.Core
 import Qed.Server.Registry
 
 namespace Qed.Deploy
@@ -23,29 +24,9 @@ structure DeployEnvVar where
   default? : Option String := none
 deriving Inhabited, DecidableEq, Repr
 
-structure DeployAuthClaim where
-  name         : String
-  typeName     : String
-  defaultValue : String := ""
-deriving Inhabited, DecidableEq, Repr
+abbrev DeployAuthClaim := Qed.Auth.AuthClaimSpec
 
-structure DeployAuthManifest where
-  name             : String
-  issuerEnv        : String
-  issuerDefault?   : Option String := none
-  audienceEnv      : String
-  audienceDefault? : Option String := none
-  clientIdEnv?     : Option String := none
-  clientIdDefault? : Option String := none
-  clientSecretEnv? : Option String := none
-  providers        : List String := []
-  sessionTtlSec    : Nat := 86400
-  loginPath        : String := "/_qed/auth/login"
-  callbackPath     : String := "/_qed/auth/callback"
-  logoutPath       : String := "/_qed/auth/logout"
-  mePath           : String := "/_qed/auth/me"
-  claims           : List DeployAuthClaim := []
-deriving Inhabited, DecidableEq, Repr
+abbrev DeployAuthManifest := Qed.Auth.OidcAuthSpec
 
 structure DeployDbColumn where
   name         : String
@@ -106,16 +87,12 @@ structure DeployManifest where
   auth?      : Option DeployAuthManifest := none
   server?    : Option DeployServerManifest := none
   assets     : List DeployAssetManifest := []
-  csp        : String := "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+  csp        : String := Qed.Server.defaultCsp
 deriving Inhabited, DecidableEq, Repr
 
 /-! ### Kernel-Verified Manifest Consistency Checks -/
 
-def isValidEnvKey (s : String) : Bool :=
-  match s.toList with
-  | [] => false
-  | cs => cs.all fun c =>
-      ('A' ≤ c && c ≤ 'Z') || ('a' ≤ c && c ≤ 'z') || ('0' ≤ c && c ≤ '9') || c == '_'
+abbrev isValidEnvKey : String → Bool := Qed.Server.isValidEnvVarName
 
 def isValidEgressOrigin (s : String) : Bool :=
   let cs := s.toList
@@ -339,24 +316,7 @@ def extractFromEnv (env : Lean.Environment) (rootMod : String) : DeployManifest 
     | some an => authReg.find? an
     | none    => (authReg.toList.find? fun (_, ai) => inRootMod ai.configConst).map Prod.snd
 
-  let auth? : Option DeployAuthManifest := authInfo?.map fun ai => {
-    name := ai.shortName
-    issuerEnv := ai.issuerEnv
-    issuerDefault? := ai.issuerDefault?
-    audienceEnv := ai.audienceEnv
-    audienceDefault? := ai.audienceDefault?
-    clientIdEnv? := ai.clientIdEnv?
-    clientIdDefault? := ai.clientIdDefault?
-    clientSecretEnv? := ai.clientSecretEnv?
-    providers := ai.providers.toList
-    sessionTtlSec := ai.sessionTtlSec
-    loginPath := ai.loginPath
-    callbackPath := ai.callbackPath
-    logoutPath := ai.logoutPath
-    mePath := ai.mePath
-    claims := ai.claims.toList.map fun c =>
-      { name := c.name, typeName := c.typeName, defaultValue := c.defaultValue }
-  }
+  let auth? : Option DeployAuthManifest := authInfo?.map (·.spec)
 
   let extOrigins : List String :=
     let fromSrv := match srvEntry? with

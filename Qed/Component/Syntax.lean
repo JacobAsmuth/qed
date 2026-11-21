@@ -36,11 +36,7 @@ deriving Inhabited
 
 initialize componentRegistry :
     Lean.SimplePersistentEnvExtension ComponentInfo (Lean.NameMap ComponentInfo) ←
-  Lean.registerSimplePersistentEnvExtension {
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.fullName info) acc) {}
-    addEntryFn := fun m info => m.insert info.fullName info
-  }
+  Qed.Diag.mkNameMapExt (·.fullName)
 
 open Lean in
 def lookupComponent? (cName : Name) : CoreM (Option ComponentInfo) := do

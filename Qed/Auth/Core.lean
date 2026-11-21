@@ -2,6 +2,7 @@ import Qed.Base64
 import Qed.Json
 import Qed.Proto
 import Qed.Html
+import Qed.Router.Basic
 
 namespace Qed.Auth
 
@@ -14,15 +15,8 @@ namespace Qed.Auth
 
 /-! ### Verified RFC 4648 Base64URL (Unpadded) -/
 
-def toUrlChar : Char → Char
-  | '+' => '-'
-  | '/' => '_'
-  | c   => c
-
-def fromUrlChar : Char → Char
-  | '-' => '+'
-  | '_' => '/'
-  | c   => c
+abbrev toUrlChar : Char → Char := Qed.Base64.toUrlChar
+abbrev fromUrlChar : Char → Char := Qed.Base64.fromUrlChar
 
 theorem fromUrlChar_toUrlChar (c : Char) (h1 : c ≠ '-') (h2 : c ≠ '_') :
     fromUrlChar (toUrlChar c) = c := by
@@ -30,69 +24,13 @@ theorem fromUrlChar_toUrlChar (c : Char) (h1 : c ≠ '-') (h2 : c ≠ '_') :
   · subst hp; rfl
   · by_cases hs : c = '/'
     · subst hs; rfl
-    · simp [toUrlChar, fromUrlChar]
-
-private theorem encodeChar_ne_dash (n : Nat) (h : n < 64) : Qed.Base64.encodeChar n ≠ '-' := by
-  unfold Qed.Base64.encodeChar
-  intro heq
-  split at heq
-  · have : (Char.ofNat (65 + n)).toNat = 45 := congrArg Char.toNat heq
-    have hlt : 65 + n < 128 := by omega
-    have hv : (65 + n).isValidChar := Or.inl (by omega)
-    simp [Char.ofNat, hv, Char.toNat, Char.ofNatAux] at this; omega
-  · split at heq
-    · have : (Char.ofNat (71 + n)).toNat = 45 := congrArg Char.toNat heq
-      have hv : (71 + n).isValidChar := Or.inl (by omega)
-      simp [Char.ofNat, hv, Char.toNat, Char.ofNatAux] at this; omega
-    · split at heq
-      · have : (Char.ofNat (n - 4)).toNat = 45 := congrArg Char.toNat heq
-        have hv : (n - 4).isValidChar := Or.inl (by omega)
-        simp [Char.ofNat, hv, Char.toNat, Char.ofNatAux] at this; omega
-      · split at heq <;> contradiction
-
-private theorem encodeChar_ne_underscore (n : Nat) (h : n < 64) : Qed.Base64.encodeChar n ≠ '_' := by
-  unfold Qed.Base64.encodeChar
-  intro heq
-  split at heq
-  · have : (Char.ofNat (65 + n)).toNat = 95 := congrArg Char.toNat heq
-    have hv : (65 + n).isValidChar := Or.inl (by omega)
-    simp [Char.ofNat, hv, Char.toNat, Char.ofNatAux] at this; omega
-  · split at heq
-    · have : (Char.ofNat (71 + n)).toNat = 95 := congrArg Char.toNat heq
-      have hv : (71 + n).isValidChar := Or.inl (by omega)
-      simp [Char.ofNat, hv, Char.toNat, Char.ofNatAux] at this; omega
-    · split at heq
-      · have : (Char.ofNat (n - 4)).toNat = 95 := congrArg Char.toNat heq
-        have hv : (n - 4).isValidChar := Or.inl (by omega)
-        simp [Char.ofNat, hv, Char.toNat, Char.ofNatAux] at this; omega
-      · split at heq <;> contradiction
-
-private def stripTrailingEq : List Char → List Char
-  | [] => []
-  | cs => (cs.reverse.dropWhile (· == '=')).reverse
-
-private def restorePad (cs : List Char) : List Char :=
-  match cs.length % 4 with
-  | 0 => cs
-  | 2 => cs ++ ['=', '=']
-  | 3 => cs ++ ['=']
-  | _ => cs
+    · simp [toUrlChar, fromUrlChar, Qed.Base64.toUrlChar, Qed.Base64.fromUrlChar]
 
 /-- Encodes bytes to RFC 4648 unpadded Base64URL (used for JWS, JWK, and PKCE S256). -/
-def base64UrlEncode (bs : ByteArray) : String :=
-  let std := Qed.Base64.encode bs
-  String.ofList (stripTrailingEq (std.toList.map toUrlChar))
+abbrev base64UrlEncode : ByteArray → String := Qed.Base64.encodeUrl
 
 /-- Decodes RFC 4648 Base64URL (padded or unpadded) into raw bytes. -/
-def base64UrlDecode (s : String) : Except String ByteArray :=
-  let stripped := stripTrailingEq s.toList
-  if stripped.length % 4 == 1 then
-    .error "base64url: invalid length"
-  else if stripped.any (fun c => c == '+' || c == '/' || c == '=') then
-    .error "base64url: invalid character"
-  else
-    let padded := restorePad (stripped.map fromUrlChar)
-    Qed.Base64.decode (String.ofList padded)
+abbrev base64UrlDecode : String → Except String ByteArray := Qed.Base64.decodeUrl
 
 /-! ### Strict Asymmetric JWT Algorithm Allowlist (Zero `alg: none` / `HS256` Confusion) -/
 
@@ -458,49 +396,10 @@ def decodeSessionPayloadV2 (b64 : String) : Except String SessionPayloadV2 := do
 
 /-! ### URL Query / Form-URLEncoded Helpers (Pure, Total) -/
 
-private def isUrlUnreserved (b : UInt8) : Bool :=
-  let n := b.toNat
-  (48 ≤ n && n ≤ 57) || (65 ≤ n && n ≤ 90) || (97 ≤ n && n ≤ 122) ||
-  n == 45 || n == 46 || n == 95 || n == 126 -- - . _ ~
-
-private def hexDigitUpper (n : Nat) : Char :=
-  if n < 10 then Char.ofNat (48 + n) else Char.ofNat (55 + n)
-
-def urlEncodeComponent (s : String) : String :=
-  let bs := s.toUTF8
-  Id.run do
-    let mut out := ""
-    for i in [0:bs.size] do
-      let b := bs[i]!
-      if isUrlUnreserved b then
-        out := out.push (Char.ofNat b.toNat)
-      else
-        out := out.push '%'
-        out := out.push (hexDigitUpper (b.toNat / 16))
-        out := out.push (hexDigitUpper (b.toNat % 16))
-    return out
-
-private def fromHexDigit (c : Char) : Option Nat :=
-  let n := c.toNat
-  if 48 ≤ n && n ≤ 57 then some (n - 48)
-  else if 65 ≤ n && n ≤ 70 then some (n - 55)
-  else if 97 ≤ n && n ≤ 102 then some (n - 87)
-  else none
-
-private def urlDecodeLoop : List Char → Array UInt8 → ByteArray
-  | [], acc => ByteArray.mk acc
-  | '+' :: rest, acc => urlDecodeLoop rest (acc.push 32)
-  | '%' :: h1 :: h2 :: rest, acc =>
-      match fromHexDigit h1, fromHexDigit h2 with
-      | some a, some b => urlDecodeLoop rest (acc.push (UInt8.ofNat (a * 16 + b)))
-      | _, _           => urlDecodeLoop (h1 :: h2 :: rest) (acc.push 37)
-  | c :: rest, acc =>
-      let bs := (String.singleton c).toUTF8
-      urlDecodeLoop rest (acc ++ bs.data)
+abbrev urlEncodeComponent : String → String := Qed.encodeSeg
 
 def urlDecodeComponent (s : String) : String :=
-  let ba := urlDecodeLoop s.toList #[]
-  (String.fromUTF8? ba).getD s
+  (String.fromUTF8? (Qed.decodeBytes (s.replace "+" " ").toList .empty)).getD s
 
 def parseQueryParams (q : String) : List (String × String) :=
   let trimmed := if q.startsWith "?" then String.ofList (q.toList.drop 1) else q

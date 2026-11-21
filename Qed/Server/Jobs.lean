@@ -25,8 +25,6 @@ structure VerifiedJob (σ : Type) (Inv : σ → Prop) where
                   m (Except ApiError Unit)
   preserves   : ProgPreservesInv Inv (runM (m := ThreadProg σ))
 
-abbrev JobSpec := @VerifiedJob
-
 /-- Runtime descriptor (erasing `Inv`) for a stateful periodic server job. -/
 structure ServerJob (σ : Type) where
   name        : String
@@ -41,9 +39,6 @@ structure StatelessJob where
   intervalMs  : Nat
   intervalPos : 0 < intervalMs
   runM        : {m : Type → Type} → [Monad m] → [MonadServer m] → m (Except ApiError Unit)
-
-def VerifiedJob.toServerJob {σ : Type} {Inv : σ → Prop} (j : VerifiedJob σ Inv) : ServerJob σ :=
-  { name := j.name, intervalMs := j.intervalMs, intervalPos := j.intervalPos, runM := j.runM }
 
 /-! ### Linearizability & Composition Lemmas for Verified Jobs -/
 

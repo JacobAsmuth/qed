@@ -220,28 +220,10 @@ private def elabServerFnClause (priorRep priorUnrep : Nat)
   let projs ← extractTupleProjections reqVar pTyTerms.size
   let callArgs : Array Term := envIdents.map (⟨·.raw⟩) ++ #[⟨ctxId.raw⟩] ++ projs ++ reqs.reqHypIds.map (⟨·.raw⟩)
 
-  let (runExpr, isReadOnly, bodyExtRoots) ←
-    if hasState && !hasAwait then
-      let some r ← elabServerPureFn priorRep priorUnrep srvName fnStr fnIdent stateId stateInvId
-          allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
-          invs mutInvs stateFieldNames envVarNames ensSpec? deferredProofs | return none
-      pure r
-    else if hasState && hasAwait then
-      let some r ← elabServerAsyncFn priorRep priorUnrep srvName fnStr fnIdent stateId stateInvId
-          allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
-          invs mutInvs stateFieldNames envVarNames ensSpec? deferredProofs | return none
-      pure r
-    else
-      let some (handlerId, hCall, hApp, er, hasDbWrite) ← elabStatelessHandler priorRep priorUnrep fnIdent srvName fnIdent.getId
-          allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts | return none
-      if let some ensSpec := ensSpec? then
-        let unitInv ← `(fun _ : Unit => True)
-        let unitTy ← `(Unit)
-        deferredProofs.modify (·.push do
-          elabAsyncEnsuresThm priorRep priorUnrep srvName fnStr fnIdent handlerId
-            unitInv unitTy payloadTerm errTyTerm
-            allBinderIds allBinderTys hCall #[] ensSpec)
-      pure (hApp, !hasDbWrite, er)
+  let some (runExpr, isReadOnly, bodyExtRoots) ← elabServerHandler priorRep priorUnrep hasState hasAwait
+      srvName fnStr fnIdent stateId stateInvId allBinderIds allBinderTys callArgs
+      payloadTerm errTyTerm baseCtx bodyStmts invs mutInvs stateFieldNames envVarNames
+      ensSpec? deferredProofs | return none
 
   let extRoots := reqs.extRoots ++ bodyExtRoots.filter (!reqs.extRoots.contains ·)
   let arm ← mkFnDispatchArm fnStr reqBytesId reqVar reqTupleTy pIdents projs
@@ -326,21 +308,10 @@ private def elabServerHttpRouteClause (priorRep priorUnrep : Nat)
   let allBinderTys := envTypes ++ #[← `(Qed.Server.RequestCtx)] ++ reqs.reqHypTys
   let callArgs : Array Term := envIdents.map (⟨·.raw⟩) ++ #[⟨ctxId.raw⟩] ++ reqs.reqHypIds.map (⟨·.raw⟩)
 
-  let (runExpr, bodyExtRoots) ←
-    if hasState && !hasAwait then
-      let some (re, _, er) ← elabServerPureFn priorRep priorUnrep srvName routeLabel routeIdent stateId stateInvId
-          allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
-          invs mutInvs stateFieldNames envVarNames none deferredProofs | return none
-      pure (re, er)
-    else if hasState && hasAwait then
-      let some (re, _, er) ← elabServerAsyncFn priorRep priorUnrep srvName routeLabel routeIdent stateId stateInvId
-          allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
-          invs mutInvs stateFieldNames envVarNames none deferredProofs | return none
-      pure (re, er)
-    else
-      let some (_, _, hApp, er, _) ← elabStatelessHandler priorRep priorUnrep routeIdent srvName routeLeaf
-          allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts | return none
-      pure (hApp, er)
+  let some (runExpr, _, bodyExtRoots) ← elabServerHandler priorRep priorUnrep hasState hasAwait
+      srvName routeLabel routeIdent stateId stateInvId allBinderIds allBinderTys callArgs
+      payloadTerm errTyTerm baseCtx bodyStmts invs mutInvs stateFieldNames envVarNames
+      none deferredProofs | return none
 
   let extRoots := reqs.extRoots ++ bodyExtRoots.filter (!reqs.extRoots.contains ·)
   let wrappedRun ←
@@ -354,9 +325,6 @@ private def elabServerHttpRouteClause (priorRep priorUnrep : Nat)
   let arm ← `(Lean.Parser.Term.matchAltExpr|
     | $methodLit, $pathLit => $guardedRun)
   return some ((methodStr, pathStr), arm, extRoots)
-
-private partial def authHookStxHasAtomic (stx : Lean.Syntax) : Bool :=
-  stx.getKind == ``qedStmtAtomic || stx.getArgs.any authHookStxHasAtomic
 
 open Lean Elab Command in
 private def elabServerAuthHook (priorRep priorUnrep : Nat)
@@ -381,8 +349,7 @@ private def elabServerAuthHook (priorRep priorUnrep : Nat)
   let hookIdent := mkIdentFrom hc hookLeaf
   let bodyStmts := ensureUnitReturn hookIdent (suiteStmts (hc.getArg 5))
   let hasAwait := blockHasAwait bodyStmts
-  let hasAtomic := bodyStmts.any authHookStxHasAtomic
-  let isAsync := hasState && (hasAwait || hasAtomic)
+  let isAsync := hasState && (hasAwait || blockHasAtomic bodyStmts)
   let payloadTerm : Term ← `(Unit)
   let errTyTerm : Term ← `(Qed.Server.ApiError)
   let userTyId := mkIdentFrom paramIdent (authDecl.info.authName ++ `User)
@@ -405,20 +372,11 @@ private def elabServerAuthHook (priorRep priorUnrep : Nat)
   ]
   let callArgs : Array Term :=
     envIdents.map (⟨·.raw⟩) ++ #[⟨ctxId.raw⟩, ⟨authUserVar.raw⟩, ⟨hAuthId.raw⟩, ⟨hAuthEqId.raw⟩]
-  if hasState && !isAsync then
-    let some (re, _, er) ← elabServerPureFn priorRep priorUnrep srvName hookLabel hookIdent stateId stateInvId
-        allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
-        invs mutInvs stateFieldNames envVarNames none deferredProofs | return none
-    return some (re, er)
-  else if isAsync then
-    let some (re, _, er) ← elabServerAsyncFn priorRep priorUnrep srvName hookLabel hookIdent stateId stateInvId
-        allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
-        invs mutInvs stateFieldNames envVarNames none deferredProofs | return none
-    return some (re, er)
-  else
-    let some (_, _, hApp, er, _) ← elabStatelessHandler priorRep priorUnrep hookIdent srvName hookLeaf
-        allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts | return none
-    return some (hApp, er)
+  let some (re, _, er) ← elabServerHandler priorRep priorUnrep hasState isAsync
+      srvName hookLabel hookIdent stateId stateInvId allBinderIds allBinderTys callArgs
+      payloadTerm errTyTerm baseCtx bodyStmts invs mutInvs stateFieldNames envVarNames
+      none deferredProofs | return none
+  return some (re, er)
 
 open Lean Elab Command in
 private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun stx => do

@@ -161,13 +161,6 @@ private def unwrapOptionalOuterAtomic (stmts : Array Syntax) : Array Syntax :=
     suiteStmts stmts[0]![2]
   else stmts
 
-open Lean Elab Command in
-def ensureUnitReturn (ref : Syntax) (stmts : Array Syntax) : Array Syntax :=
-  if blockAlwaysReturns stmts then stmts
-  else
-    let info := SourceInfo.fromRef ref
-    stmts.push (Syntax.node info ``qedStmtReturn #[Syntax.atom info "return", Syntax.node info nullKind #[]])
-
 private structure ChanBodyCtx where
   priorRep        : Nat
   priorUnrep      : Nat
@@ -219,25 +212,12 @@ private def runChanSubHandler (c : ChanBodyCtx) (subSuffix : String)
     allowAwait := hasAwait, allowUnwrap := true, hasFallible := true,
     isOption := false, innerOptTy? := none, channels := c.chanSigs
   }
-  if c.hasState && !hasAwait then
-    let some (runExpr, _, er) ← elabServerPureFn c.priorRep c.priorUnrep
-        c.srvName subFnStr subFnIdent c.stateId c.stateInvId
-        allBinderIds allBinderTys callArgs retTyTerm c.errTyTerm baseCtx bodyStmts
-        c.invs c.mutInvs c.stateFieldNames c.envVarNames none c.deferredProofs | return none
-    c.extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
-    return some runExpr
-  else if c.hasState && hasAwait then
-    let some (hApp, _, er) ← elabServerAsyncFn c.priorRep c.priorUnrep
-        c.srvName subFnStr subFnIdent c.stateId c.stateInvId
-        allBinderIds allBinderTys callArgs retTyTerm c.errTyTerm baseCtx bodyStmts
-        c.invs c.mutInvs c.stateFieldNames c.envVarNames none c.deferredProofs | return none
-    c.extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
-    return some hApp
-  else
-    let some (_, _, hApp, er, _) ← elabStatelessHandler c.priorRep c.priorUnrep hdr.chIdent c.srvName subFnIdent.getId
-        allBinderIds allBinderTys callArgs retTyTerm c.errTyTerm baseCtx bodyStmts | return none
-    c.extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
-    return some hApp
+  let some (runExpr, _, er) ← elabServerHandler c.priorRep c.priorUnrep c.hasState hasAwait
+      c.srvName subFnStr subFnIdent c.stateId c.stateInvId
+      allBinderIds allBinderTys callArgs retTyTerm c.errTyTerm baseCtx bodyStmts
+      c.invs c.mutInvs c.stateFieldNames c.envVarNames none c.deferredProofs | return none
+  c.extRootsRef.modify fun acc => acc ++ er.filter (!acc.contains ·)
+  return some runExpr
 
 open Lean Elab Command in
 private def mkChanDispatchArm (c : ChanBodyCtx) (kindLit : TSyntax `num) (bodyInParams : Term) :

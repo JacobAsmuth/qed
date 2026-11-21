@@ -101,9 +101,7 @@ def escapeLikePattern (s : String) : String :=
   String.ofList (s.toList.flatMap fun c =>
     if c == '!' || c == '%' || c == '_' then ['!', c] else [c])
 
-def startsWithLikeVal (s : String) : SqlVal := .text (escapeLikePattern s ++ "%")
-def containsLikeVal   (s : String) : SqlVal := .text ("%" ++ escapeLikePattern s ++ "%")
-def endsWithLikeVal   (s : String) : SqlVal := .text ("%" ++ escapeLikePattern s)
+def endsWithLikeVal (s : String) : SqlVal := .text ("%" ++ escapeLikePattern s)
 
 /-! ## Validated SQL Identifiers (`SqlIdent` & Injection Closure) -/
 
@@ -235,44 +233,31 @@ def placeholder (d : SqlDialect) (idx : Nat) : String :=
   | .postgres => "$" ++ toString idx
   | .sqlite   => "?" ++ toString idx
 
+theorem nat_toString_digits (n : Nat) :
+    ∀ c ∈ (toString n).toList, '0' ≤ c ∧ c ≤ '9' := by
+  have hdig : ∀ k : Fin 10, '0' ≤ Nat.digitChar k.val ∧ Nat.digitChar k.val ≤ '9' := by decide
+  have hmem : ∀ m (b : Nat) (acc : List Char),
+      (∀ y ∈ acc, '0' ≤ y ∧ y ≤ '9') →
+      ∀ y ∈ Nat.toDigitsCore 10 m b acc, '0' ≤ y ∧ y ≤ '9' := by
+    intro m; induction m with
+    | zero => intro _ _ hacc y hy; exact hacc y hy
+    | succ m ih =>
+        intro b acc hacc y hy
+        unfold Nat.toDigitsCore at hy; dsimp only at hy
+        have hd := hdig ⟨b % 10, Nat.mod_lt b (by decide)⟩
+        split at hy
+        · exact (List.mem_cons.1 hy).elim (· ▸ hd) (hacc y)
+        · exact ih (b / 10) _ (fun z hz => (List.mem_cons.1 hz).elim (· ▸ hd) (hacc z)) y hy
+  intro c hc
+  have hrepr : (toString n).toList = Nat.toDigits 10 n := by
+    change (Nat.repr n).toList = Nat.toDigits 10 n; unfold Nat.repr; exact String.toList_ofList
+  rw [hrepr] at hc
+  exact hmem (n + 1) n [] (fun _ h => False.elim (List.not_mem_nil h)) c hc
+
 private theorem nat_toString_no_semicolon (n : Nat) :
     ∀ c ∈ (toString n).toList, c ≠ ';' := by
-  intro c hc heq
-  subst heq
-  have h1 : ∀ cs : List Char, (∀ x ∈ cs, '0' ≤ x ∧ x ≤ '9') → ';' ∉ cs := by
-    intro cs hall hmem
-    have hlt := hall ';' hmem
-    exact absurd hlt (by decide)
-  have hdig : ∀ x ∈ (Nat.toDigits 10 n), '0' ≤ x ∧ x ≤ '9' := by
-    intro x hx
-    have hmem : ∀ m (b : Nat) (acc : List Char),
-        (∀ y ∈ acc, '0' ≤ y ∧ y ≤ '9') →
-        ∀ y ∈ Nat.toDigitsCore 10 m b acc, '0' ≤ y ∧ y ≤ '9' := by
-      intro m
-      induction m with
-      | zero => intro b acc hacc y hy; exact hacc y hy
-      | succ m ih =>
-          intro b acc hacc y hy
-          unfold Nat.toDigitsCore at hy
-          dsimp only at hy
-          have hd : '0' ≤ Nat.digitChar (b % 10) ∧ Nat.digitChar (b % 10) ≤ '9' := by
-            have hlt : b % 10 < 10 := Nat.mod_lt b (by decide)
-            have : b % 10 = 0 ∨ b % 10 = 1 ∨ b % 10 = 2 ∨ b % 10 = 3 ∨ b % 10 = 4 ∨
-                   b % 10 = 5 ∨ b % 10 = 6 ∨ b % 10 = 7 ∨ b % 10 = 8 ∨ b % 10 = 9 := by omega
-            rcases this with h | h | h | h | h | h | h | h | h | h <;> rw [h] <;> decide
-          split at hy
-          · rcases List.mem_cons.1 hy with rfl | hrest
-            · exact hd
-            · exact hacc y hrest
-          · exact ih (b / 10) (Nat.digitChar (b % 10) :: acc)
-              (fun z hz => (List.mem_cons.1 hz).elim (fun h => h ▸ hd) (hacc z)) y hy
-    exact hmem (n + 1) n [] (fun _ h => False.elim (List.not_mem_nil h)) x hx
-  have hrepr : (toString n).toList = Nat.toDigits 10 n := by
-    change (Nat.repr n).toList = Nat.toDigits 10 n
-    unfold Nat.repr
-    exact String.toList_ofList
-  rw [hrepr] at hc
-  exact h1 _ hdig hc
+  intro c hc heq; subst heq
+  exact absurd (nat_toString_digits n ';' hc) (by decide)
 
 theorem placeholder_no_semicolon (d : SqlDialect) (idx : Nat) :
     ∀ c ∈ (placeholder d idx).toList, c ≠ ';' := by
@@ -313,26 +298,46 @@ private theorem compileInParams_sameShape (d : SqlDialect) :
 private theorem str_append_no_semi {a b : String}
     (ha : ∀ c ∈ a.toList, c ≠ ';') (hb : ∀ c ∈ b.toList, c ≠ ';') :
     ∀ c ∈ (a ++ b).toList, c ≠ ';' := by
-  intro c hc
-  rw [String.toList_append, List.mem_append] at hc
-  exact hc.elim (ha c) (hb c)
+  intro c hc; rw [String.toList_append, List.mem_append] at hc; exact hc.elim (ha c) (hb c)
 
 private theorem lit_no_semi (s : String) (h : s.toList.all (· != ';') = true) :
     ∀ c ∈ s.toList, c ≠ ';' := by
-  intro c hc
-  rw [List.all_eq_true] at h
-  have := h c hc
-  simpa using this
+  intro c hc; rw [List.all_eq_true] at h; simpa using h c hc
 
 private theorem compileInParams_no_semicolon (d : SqlDialect) :
     ∀ (vs : List SqlVal) (params : Array SqlVal),
       ∀ c ∈ (compileInParams d vs params).1.toList, c ≠ ';'
   | [], _ => fun _ h => False.elim (List.not_mem_nil h)
   | [_], params => placeholder_no_semicolon d (params.size + 1)
-  | v :: x :: rest, params =>
-      str_append_no_semi
+  | v :: x :: rest, params => by
+      simp only [compileInParams]
+      exact str_append_no_semi
         (str_append_no_semi (placeholder_no_semicolon d (params.size + 1)) (lit_no_semi ", " rfl))
         (compileInParams_no_semicolon d (x :: rest) (params.push v))
+
+local syntax "solve_no_semi" (" with " tactic)? : tactic
+local macro_rules
+  | `(tactic| solve_no_semi) =>
+    `(tactic| ((intro c hc); (try simp only [String.toList_append, List.mem_append] at hc); (revert hc); (try simp only [or_imp]); repeat any_goals constructor) <;>
+      (intro hc; first
+        | with_reducible exact ‹∀ c ∈ _, c ≠ ';'› c hc
+        | with_reducible exact SqlIdent.quoteIdent_no_semicolon _ c hc
+        | with_reducible exact SqlBinOp.render_no_semicolon _ c hc
+        | with_reducible exact placeholder_no_semicolon _ _ c hc
+        | with_reducible exact nat_toString_no_semicolon _ c hc
+        | with_reducible exact compileInParams_no_semicolon _ _ _ c hc
+        | exact lit_no_semi _ rfl c hc))
+  | `(tactic| solve_no_semi with $t:tactic) =>
+    `(tactic| ((intro c hc); (try simp only [String.toList_append, List.mem_append] at hc); (revert hc); (try simp only [or_imp]); repeat any_goals constructor) <;>
+      (intro hc; first
+        | with_reducible exact ‹∀ c ∈ _, c ≠ ';'› c hc
+        | with_reducible exact SqlIdent.quoteIdent_no_semicolon _ c hc
+        | with_reducible exact SqlBinOp.render_no_semicolon _ c hc
+        | with_reducible exact placeholder_no_semicolon _ _ c hc
+        | with_reducible exact nat_toString_no_semicolon _ c hc
+        | with_reducible exact compileInParams_no_semicolon _ _ _ c hc
+        | with_reducible ($t:tactic)
+        | exact lit_no_semi _ rfl c hc))
 
 def SqlExpr.compileQual (d : SqlDialect) (pfx : String) (e : SqlExpr) (params : Array SqlVal) :
     String × Array SqlVal :=
@@ -391,98 +396,46 @@ theorem SqlExpr.compileQual_sameShape (d : SqlDialect) (pfx : String) {e₁ e₂
       (e₁.compileQual d pfx p₁).1 = (e₂.compileQual d pfx p₂).1 ∧
       (e₁.compileQual d pfx p₁).2.size = (e₂.compileQual d pfx p₂).2.size := by
   induction e₁ generalizing e₂ with
-  | litTrue =>
+  | litTrue | litFalse | col _ | param _ =>
       cases e₂ <;> simp_all [SqlExpr.sameShape, SqlExpr.compileQual]
-  | litFalse =>
-      cases e₂ <;> simp_all [SqlExpr.sameShape, SqlExpr.compileQual]
-  | col a =>
-      cases e₂ <;> simp_all [SqlExpr.sameShape, SqlExpr.compileQual]
-  | param v₁ =>
-      cases e₂ <;> simp_all [SqlExpr.sameShape, SqlExpr.compileQual]
-  | binOp op₁ l₁ r₁ ihl ihr =>
+  | not _ ih | isNull _ ih | isNotNull _ ih | strLen _ ih =>
+      cases e₂ <;> first
+      | (simp [SqlExpr.sameShape] at hsh; done)
+      | (intro p₁ p₂ hsz; have ⟨h1, h2⟩ := ih hsh p₁ p₂ hsz; simp [SqlExpr.compileQual, h1, h2])
+  | binOp _ _ _ ihl ihr =>
+      cases e₂ <;> first
+      | (simp [SqlExpr.sameShape] at hsh; done)
+      | (rcases hsh with ⟨rfl, hl, hr⟩; intro p₁ p₂ hsz
+         have ⟨h1, h2⟩ := ihl hl p₁ p₂ hsz; have ⟨h3, h4⟩ := ihr hr _ _ h2
+         simp [SqlExpr.compileQual, h1, h3, h4])
+  | like _ _ ihl ihr | contains _ _ ihl ihr =>
+      cases e₂ <;> first
+      | (simp [SqlExpr.sameShape] at hsh; done)
+      | (rcases hsh with ⟨hl, hr⟩; intro p₁ p₂ hsz
+         have ⟨h1, h2⟩ := ihl hl p₁ p₂ hsz; have ⟨h3, h4⟩ := ihr hr _ _ h2
+         simp [SqlExpr.compileQual, h1, h3, h4])
+  | startsWith _ _ ihl ihr =>
       cases e₂ with
-      | binOp op₂ l₂ r₂ =>
-          rcases hsh with ⟨rfl, hl, hr⟩
-          intro p₁ p₂ hsz
-          have ⟨hsqlL, hszL⟩ := ihl hl p₁ p₂ hsz
-          have ⟨hsqlR, hszR⟩ := ihr hr (l₁.compileQual d pfx p₁).2 (l₂.compileQual d pfx p₂).2 hszL
-          simp [SqlExpr.compileQual, hsqlL, hsqlR, hszR]
+      | startsWith _ _ =>
+          rcases hsh with ⟨hl, hr⟩; intro p₁ p₂ hsz
+          have ⟨h1, h2⟩ := ihl hl p₁ p₂ hsz
+          have ⟨h3, h4⟩ := ihr hr _ _ h2
+          have ⟨h5, h6⟩ := ihr hr _ _ h4
+          simp [SqlExpr.compileQual, h1, h3, h5, h6]
       | _ => simp [SqlExpr.sameShape] at hsh
-  | not e₁ ih =>
+  | inList _ vs₁ ihl =>
       cases e₂ with
-      | not e₂ =>
-          intro p₁ p₂ hsz
-          have ⟨hsql, hsz'⟩ := ih hsh p₁ p₂ hsz
-          simp [SqlExpr.compileQual, hsql, hsz']
-      | _ => simp [SqlExpr.sameShape] at hsh
-  | isNull e₁ ih =>
-      cases e₂ with
-      | isNull e₂ =>
-          intro p₁ p₂ hsz
-          have ⟨hsql, hsz'⟩ := ih hsh p₁ p₂ hsz
-          simp [SqlExpr.compileQual, hsql, hsz']
-      | _ => simp [SqlExpr.sameShape] at hsh
-  | isNotNull e₁ ih =>
-      cases e₂ with
-      | isNotNull e₂ =>
-          intro p₁ p₂ hsz
-          have ⟨hsql, hsz'⟩ := ih hsh p₁ p₂ hsz
-          simp [SqlExpr.compileQual, hsql, hsz']
-      | _ => simp [SqlExpr.sameShape] at hsh
-  | strLen e₁ ih =>
-      cases e₂ with
-      | strLen e₂ =>
-          intro p₁ p₂ hsz
-          have ⟨hsql, hsz'⟩ := ih hsh p₁ p₂ hsz
-          simp [SqlExpr.compileQual, hsql, hsz']
-      | _ => simp [SqlExpr.sameShape] at hsh
-  | like l₁ r₁ ihl ihr =>
-      cases e₂ with
-      | like l₂ r₂ =>
-          rcases hsh with ⟨hl, hr⟩
-          intro p₁ p₂ hsz
-          have ⟨hsqlL, hszL⟩ := ihl hl p₁ p₂ hsz
-          have ⟨hsqlR, hszR⟩ := ihr hr (l₁.compileQual d pfx p₁).2 (l₂.compileQual d pfx p₂).2 hszL
-          simp [SqlExpr.compileQual, hsqlL, hsqlR, hszR]
-      | _ => simp [SqlExpr.sameShape] at hsh
-  | startsWith l₁ r₁ ihl ihr =>
-      cases e₂ with
-      | startsWith l₂ r₂ =>
-          rcases hsh with ⟨hl, hr⟩
-          intro p₁ p₂ hsz
-          have ⟨hsqlL, hszL⟩ := ihl hl p₁ p₂ hsz
-          have ⟨hsqlR1, hszR1⟩ := ihr hr (l₁.compileQual d pfx p₁).2 (l₂.compileQual d pfx p₂).2 hszL
-          have ⟨hsqlR2, hszR2⟩ := ihr hr (r₁.compileQual d pfx (l₁.compileQual d pfx p₁).2).2
-            (r₂.compileQual d pfx (l₂.compileQual d pfx p₂).2).2 hszR1
-          simp [SqlExpr.compileQual, hsqlL, hsqlR1, hsqlR2, hszR2]
-      | _ => simp [SqlExpr.sameShape] at hsh
-  | contains l₁ r₁ ihl ihr =>
-      cases e₂ with
-      | contains l₂ r₂ =>
-          rcases hsh with ⟨hl, hr⟩
-          intro p₁ p₂ hsz
-          have ⟨hsqlL, hszL⟩ := ihl hl p₁ p₂ hsz
-          have ⟨hsqlR, hszR⟩ := ihr hr (l₁.compileQual d pfx p₁).2 (l₂.compileQual d pfx p₂).2 hszL
-          simp [SqlExpr.compileQual, hsqlL, hsqlR, hszR]
-      | _ => simp [SqlExpr.sameShape] at hsh
-  | inList l₁ vs₁ ihl =>
-      cases e₂ with
-      | inList l₂ vs₂ =>
-          rcases hsh with ⟨hl, hlen⟩
-          intro p₁ p₂ hsz
+      | inList _ vs₂ =>
+          rcases hsh with ⟨hl, hlen⟩; intro p₁ p₂ hsz
           cases vs₁ with
-          | nil =>
-              cases vs₂ with
-              | nil => simp [SqlExpr.compileQual, hsz]
-              | cons _ _ => simp at hlen
-          | cons a₁ r₁ =>
+          | nil => cases vs₂ <;> simp_all [SqlExpr.compileQual]
+          | cons _ _ =>
               cases vs₂ with
               | nil => simp at hlen
-              | cons a₂ r₂ =>
-                  have ⟨hsqlL, hszL⟩ := ihl hl p₁ p₂ hsz
-                  have ⟨hsqlV, hszV⟩ := compileInParams_sameShape d (a₁ :: r₁) (a₂ :: r₂) hlen
-                    (l₁.compileQual d pfx p₁).2 (l₂.compileQual d pfx p₂).2 hszL
-                  simp [SqlExpr.compileQual, hsqlL, hsqlV, hszV]
+              | cons _ _ =>
+                  have ⟨h1, h2⟩ := ihl hl p₁ p₂ hsz
+                  have ⟨h3, h4⟩ := compileInParams_sameShape d _ _ hlen _ _ h2
+                  simp [SqlExpr.compileQual, h1, h3, h4]
       | _ => simp [SqlExpr.sameShape] at hsh
 
 /-- Non-interference for `SqlExpr.compile`: changing runtime parameter values leaves the
@@ -498,103 +451,26 @@ theorem SqlExpr.compileQual_no_semicolon (d : SqlDialect) (pfx : String)
     (hpfx : ∀ c ∈ pfx.toList, c ≠ ';') (e : SqlExpr) :
     ∀ (params : Array SqlVal), ∀ c ∈ (e.compileQual d pfx params).1.toList, c ≠ ';' := by
   induction e with
-  | litTrue =>
-      intro _; cases d
-      · exact lit_no_semi "TRUE" rfl
-      · exact lit_no_semi "1" rfl
-  | litFalse =>
-      intro _; cases d
-      · exact lit_no_semi "FALSE" rfl
-      · exact lit_no_semi "0" rfl
-  | col id =>
-      intro _; exact str_append_no_semi hpfx id.quoteIdent_no_semicolon
-  | param _ =>
-      intro params; exact placeholder_no_semicolon d (params.size + 1)
-  | binOp op l r ihl ihr =>
-      intro params
-      simp only [SqlExpr.compileQual]
-      apply str_append_no_semi
-      · apply str_append_no_semi
-        · apply str_append_no_semi
-          · apply str_append_no_semi
-            · exact lit_no_semi "(" rfl
-            · exact ihl params
-          · exact op.render_no_semicolon
-        · exact ihr (l.compileQual d pfx params).2
-      · exact lit_no_semi ")" rfl
-  | not inner ih =>
-      intro params
-      simp only [SqlExpr.compileQual]
-      exact str_append_no_semi (str_append_no_semi (lit_no_semi "(NOT " rfl) (ih params)) (lit_no_semi ")" rfl)
-  | isNull inner ih =>
-      intro params
-      simp only [SqlExpr.compileQual]
-      exact str_append_no_semi (str_append_no_semi (lit_no_semi "(" rfl) (ih params)) (lit_no_semi " IS NULL)" rfl)
-  | isNotNull inner ih =>
-      intro params
-      simp only [SqlExpr.compileQual]
-      exact str_append_no_semi (str_append_no_semi (lit_no_semi "(" rfl) (ih params)) (lit_no_semi " IS NOT NULL)" rfl)
-  | strLen inner ih =>
-      intro params
-      simp only [SqlExpr.compileQual]
-      exact str_append_no_semi (str_append_no_semi (lit_no_semi "LENGTH(" rfl) (ih params)) (lit_no_semi ")" rfl)
-  | like l r ihl ihr =>
-      intro params
-      simp only [SqlExpr.compileQual]
-      exact str_append_no_semi
-        (str_append_no_semi
-          (str_append_no_semi
-            (str_append_no_semi (lit_no_semi "(" rfl) (ihl params))
-            (lit_no_semi " LIKE " rfl))
-          (ihr (l.compileQual d pfx params).2))
-        (lit_no_semi " ESCAPE '!')" rfl)
-  | startsWith l r ihl ihr =>
-      intro params
-      simp only [SqlExpr.compileQual]
-      exact str_append_no_semi
-        (str_append_no_semi
-          (str_append_no_semi
-            (str_append_no_semi
-              (str_append_no_semi
-                (str_append_no_semi (lit_no_semi "(SUBSTR(" rfl) (ihl params))
-                (lit_no_semi ", 1, LENGTH(" rfl))
-              (ihr (l.compileQual d pfx params).2))
-            (lit_no_semi ")) = " rfl))
-          (ihr (r.compileQual d pfx (l.compileQual d pfx params).2).2))
-        (lit_no_semi ")" rfl)
-  | contains l r ihl ihr =>
-      intro params
-      simp only [SqlExpr.compileQual]
+  | litTrue | litFalse => intro _; simp only [SqlExpr.compileQual]; cases d <;> exact lit_no_semi _ rfl
+  | col _ | param _ => intro _; simp only [SqlExpr.compileQual]; solve_no_semi
+  | not _ ih | isNull _ ih | isNotNull _ ih | strLen _ ih =>
+      intro params; simp only [SqlExpr.compileQual]
+      solve_no_semi with exact ih _ _ ‹_›
+  | binOp _ _ _ ihl ihr | like _ _ ihl ihr | startsWith _ _ ihl ihr =>
+      intro params; simp only [SqlExpr.compileQual]
+      solve_no_semi with (first | exact ihl _ _ ‹_› | exact ihr _ _ ‹_›)
+  | contains _ _ ihl ihr =>
+      intro params; simp only [SqlExpr.compileQual]
       have hfn : ∀ c ∈ (match d with | .postgres => "STRPOS(" | .sqlite => "INSTR(").toList, c ≠ ';' := by
-        cases d
-        · exact lit_no_semi "STRPOS(" rfl
-        · exact lit_no_semi "INSTR(" rfl
-      exact str_append_no_semi
-        (str_append_no_semi
-          (str_append_no_semi
-            (str_append_no_semi
-              (str_append_no_semi (lit_no_semi "(" rfl) hfn)
-              (ihl params))
-            (lit_no_semi ", " rfl))
-          (ihr (l.compileQual d pfx params).2))
-        (lit_no_semi ") > 0)" rfl)
-  | inList l vs ihl =>
+        cases d <;> exact lit_no_semi _ rfl
+      solve_no_semi with (first | exact hfn _ ‹_› | exact ihl _ _ ‹_› | exact ihr _ _ ‹_›)
+  | inList _ vs ihl =>
       intro params
       cases vs with
-      | nil =>
+      | nil => simp only [SqlExpr.compileQual]; cases d <;> exact lit_no_semi _ rfl
+      | cons _ _ =>
           simp only [SqlExpr.compileQual]
-          cases d
-          · exact lit_no_semi "FALSE" rfl
-          · exact lit_no_semi "0" rfl
-      | cons v rest =>
-          simp only [SqlExpr.compileQual]
-          exact str_append_no_semi
-            (str_append_no_semi
-              (str_append_no_semi
-                (str_append_no_semi (lit_no_semi "(" rfl) (ihl params))
-                (lit_no_semi " IN (" rfl))
-              (compileInParams_no_semicolon d (v :: rest) (l.compileQual d pfx params).2))
-            (lit_no_semi "))" rfl)
+          solve_no_semi with exact ihl _ _ ‹_›
 
 theorem SqlExpr.compile_no_semicolon (d : SqlDialect) (e : SqlExpr) :
     ∀ (params : Array SqlVal), ∀ c ∈ (e.compile d params).1.toList, c ≠ ';' :=
@@ -748,18 +624,12 @@ private theorem compileSets_no_semicolon (d : SqlDialect) :
     ∀ (l : List (SqlIdent × SqlExpr)) (params : Array SqlVal),
       ∀ c ∈ (compileSets d l params).1.toList, c ≠ ';'
   | [], _ => fun _ h => False.elim (List.not_mem_nil h)
-  | [(col, e)], params =>
-      str_append_no_semi
-        (str_append_no_semi col.quoteIdent_no_semicolon (lit_no_semi " = " rfl))
-        (e.compile_no_semicolon d params)
-  | (col, e) :: x :: rest, params =>
-      str_append_no_semi
-        (str_append_no_semi
-          (str_append_no_semi
-            (str_append_no_semi col.quoteIdent_no_semicolon (lit_no_semi " = " rfl))
-            (e.compile_no_semicolon d params))
-          (lit_no_semi ", " rfl))
-        (compileSets_no_semicolon d (x :: rest) (e.compile d params).2)
+  | [(_, _)], _ => by simp only [compileSets]; solve_no_semi with exact SqlExpr.compile_no_semicolon _ _ _ _ ‹_›
+  | (_, e) :: x :: rest, params => by
+      simp only [compileSets]
+      solve_no_semi with (first
+        | exact SqlExpr.compile_no_semicolon _ _ _ _ ‹_›
+        | exact compileSets_no_semicolon d (x :: rest) (e.compile d params).2 _ ‹_›)
 
 def SqlQuery.sameShape : SqlQuery → SqlQuery → Prop
   | .select t₁ c₁ w₁ o₁ l₁ off₁, .select t₂ c₂ w₂ o₂ l₂ off₂ =>
@@ -803,23 +673,8 @@ private def renderLimitOffset (d : SqlDialect) (limit? offset? : Option Nat) : S
 private theorem renderLimitOffset_no_semicolon (d : SqlDialect) (limit? offset? : Option Nat) :
     ∀ c ∈ (renderLimitOffset d limit? offset?).toList, c ≠ ';' := by
   unfold renderLimitOffset
-  cases limit? with
-  | none =>
-      cases offset? with
-      | none => exact fun _ h => False.elim (List.not_mem_nil h)
-      | some off =>
-          cases d
-          · exact str_append_no_semi (lit_no_semi " OFFSET " rfl) (nat_toString_no_semicolon off)
-          · exact str_append_no_semi (lit_no_semi " LIMIT -1 OFFSET " rfl) (nat_toString_no_semicolon off)
-  | some n =>
-      cases offset? with
-      | none => exact str_append_no_semi (lit_no_semi " LIMIT " rfl) (nat_toString_no_semicolon n)
-      | some off =>
-          exact str_append_no_semi
-            (str_append_no_semi
-              (str_append_no_semi (lit_no_semi " LIMIT " rfl) (nat_toString_no_semicolon n))
-              (lit_no_semi " OFFSET " rfl))
-            (nat_toString_no_semicolon off)
+  cases limit? <;> cases offset? <;> try cases d
+  all_goals solve_no_semi
 
 private def renderOrderBy (pfx : String) (orderBy? : Option (SqlIdent × SqlOrderDir)) : String :=
   match orderBy? with
@@ -832,16 +687,8 @@ private theorem renderOrderBy_no_semicolon (pfx : String) (hpfx : ∀ c ∈ pfx.
     ∀ c ∈ (renderOrderBy pfx orderBy?).toList, c ≠ ';' := by
   unfold renderOrderBy
   cases orderBy? with
-  | none => exact fun _ h => False.elim (List.not_mem_nil h)
-  | some p =>
-      rcases p with ⟨col, dir⟩
-      cases dir
-      · exact str_append_no_semi
-          (str_append_no_semi (str_append_no_semi (lit_no_semi " ORDER BY " rfl) hpfx) col.quoteIdent_no_semicolon)
-          (lit_no_semi " ASC" rfl)
-      · exact str_append_no_semi
-          (str_append_no_semi (str_append_no_semi (lit_no_semi " ORDER BY " rfl) hpfx) col.quoteIdent_no_semicolon)
-          (lit_no_semi " DESC" rfl)
+  | none => exact lit_no_semi "" rfl
+  | some p => rcases p with ⟨_, dir⟩; cases dir <;> solve_no_semi
 
 def SqlQuery.compile (d : SqlDialect) : SqlQuery → String × Array SqlVal
   | .select tbl cols whereExpr orderBy? limit? offset? =>
@@ -917,108 +764,20 @@ theorem SqlQuery.compile_sameShape (d : SqlDialect) {q₁ q₂ : SqlQuery}
 /-- **Stacked-Query Closure:** No compiled `SqlQuery` can ever contain a `;` statement separator. -/
 theorem SqlQuery.compile_no_semicolon (d : SqlDialect) (q : SqlQuery) :
     ∀ c ∈ (q.compile d).1.toList, c ≠ ';' := by
-  cases q with
-  | select tbl cols w ord lim off =>
-      simp only [SqlQuery.compile]
-      have hOrd := renderOrderBy_no_semicolon "" (fun _ h => False.elim (List.not_mem_nil h)) ord
-      have hLim := renderLimitOffset_no_semicolon d lim off
-      exact str_append_no_semi
-        (str_append_no_semi
-          (str_append_no_semi
-            (str_append_no_semi
-              (str_append_no_semi
-                (str_append_no_semi
-                  (str_append_no_semi (lit_no_semi "SELECT " rfl) (SqlIdent.joinQuoted_no_semicolon cols))
-                  (lit_no_semi " FROM " rfl))
-                tbl.quoteIdent_no_semicolon)
-              (lit_no_semi " WHERE " rfl))
-            (w.compile_no_semicolon d #[]))
-          hOrd)
-        hLim
-  | count tbl w =>
-      simp only [SqlQuery.compile]
-      exact str_append_no_semi
-        (str_append_no_semi
-          (str_append_no_semi (lit_no_semi "SELECT COUNT(*) FROM " rfl) tbl.quoteIdent_no_semicolon)
-          (lit_no_semi " WHERE " rfl))
-        (w.compile_no_semicolon d #[])
-  | aggregate op tbl col w =>
-      simp only [SqlQuery.compile]
-      exact str_append_no_semi
-        (str_append_no_semi
-          (str_append_no_semi
-            (str_append_no_semi
-              (str_append_no_semi
-                (str_append_no_semi
-                  (str_append_no_semi (lit_no_semi "SELECT " rfl) op.render_no_semicolon)
-                  (lit_no_semi "(" rfl))
-                col.quoteIdent_no_semicolon)
-              (lit_no_semi ") FROM " rfl))
-            tbl.quoteIdent_no_semicolon)
-          (lit_no_semi " WHERE " rfl))
-        (w.compile_no_semicolon d #[])
-  | joinSelect lt rt lCols rCols lJoin rJoin lWhere rWhere ord lim off =>
-      simp only [SqlQuery.compile]
-      have hlPfx : ∀ c ∈ "\"_l\".".toList, c ≠ ';' := lit_no_semi "\"_l\"." rfl
-      have hrPfx : ∀ c ∈ "\"_r\".".toList, c ≠ ';' := lit_no_semi "\"_r\"." rfl
-      have hSel := str_append_no_semi
-        (str_append_no_semi (SqlIdent.joinQuotedPrefixed_no_semicolon "\"_l\"." hlPfx lCols) (lit_no_semi ", " rfl))
-        (SqlIdent.joinQuotedPrefixed_no_semicolon "\"_r\"." hrPfx rCols)
-      have hOrd := renderOrderBy_no_semicolon "\"_l\"." hlPfx ord
-      have hLim := renderLimitOffset_no_semicolon d lim off
-      have h1 := str_append_no_semi (lit_no_semi "SELECT " rfl) hSel
-      have h2 := str_append_no_semi h1 (lit_no_semi " FROM " rfl)
-      have h3 := str_append_no_semi h2 lt.quoteIdent_no_semicolon
-      have h4 := str_append_no_semi h3 (lit_no_semi " AS \"_l\" INNER JOIN " rfl)
-      have h5 := str_append_no_semi h4 rt.quoteIdent_no_semicolon
-      have h6 := str_append_no_semi h5 (lit_no_semi " AS \"_r\" ON \"_l\"." rfl)
-      have h7 := str_append_no_semi h6 lJoin.quoteIdent_no_semicolon
-      have h8 := str_append_no_semi h7 (lit_no_semi " = \"_r\"." rfl)
-      have h9 := str_append_no_semi h8 rJoin.quoteIdent_no_semicolon
-      have h10 := str_append_no_semi h9 (lit_no_semi " WHERE (" rfl)
-      have h11 := str_append_no_semi h10 (lWhere.compileQual_no_semicolon d "\"_l\"." hlPfx #[])
-      have h12 := str_append_no_semi h11 (lit_no_semi " AND " rfl)
-      have h13 := str_append_no_semi h12 (rWhere.compileQual_no_semicolon d "\"_r\"." hrPfx (lWhere.compileQual d "\"_l\"." #[]).2)
-      have h14 := str_append_no_semi h13 (lit_no_semi ")" rfl)
-      have h15 := str_append_no_semi h14 hOrd
-      exact str_append_no_semi h15 hLim
-  | insert tbl cols ret =>
-      simp only [SqlQuery.compile]
-      exact str_append_no_semi
-        (str_append_no_semi
-          (str_append_no_semi
-            (str_append_no_semi
-              (str_append_no_semi
-                (str_append_no_semi
-                  (str_append_no_semi (lit_no_semi "INSERT INTO " rfl) tbl.quoteIdent_no_semicolon)
-                  (lit_no_semi " (" rfl))
-                (SqlIdent.joinQuoted_no_semicolon (cols.map Prod.fst)))
-              (lit_no_semi ") VALUES (" rfl))
-            (compileInsertVals_no_semicolon d cols #[]))
-          (lit_no_semi ")" rfl))
-        (renderReturning_no_semicolon ret)
-  | update tbl sets w ret =>
-      simp only [SqlQuery.compile]
-      exact str_append_no_semi
-        (str_append_no_semi
-          (str_append_no_semi
-            (str_append_no_semi
-              (str_append_no_semi
-                (str_append_no_semi (lit_no_semi "UPDATE " rfl) tbl.quoteIdent_no_semicolon)
-                (lit_no_semi " SET " rfl))
-              (compileSets_no_semicolon d sets #[]))
-            (lit_no_semi " WHERE " rfl))
-          (w.compile_no_semicolon d (compileSets d sets #[]).2))
-        (renderReturning_no_semicolon ret)
-  | delete tbl w ret =>
-      simp only [SqlQuery.compile]
-      exact str_append_no_semi
-        (str_append_no_semi
-          (str_append_no_semi
-            (str_append_no_semi (lit_no_semi "DELETE FROM " rfl) tbl.quoteIdent_no_semicolon)
-            (lit_no_semi " WHERE " rfl))
-          (w.compile_no_semicolon d #[]))
-        (renderReturning_no_semicolon ret)
+  cases q <;> ((intro c hc); (simp only [SqlQuery.compile, String.toList_append, List.mem_append] at hc); (revert hc); (try simp only [or_imp]); repeat any_goals constructor) <;>
+    (intro hc; first
+      | with_reducible exact SqlIdent.quoteIdent_no_semicolon _ c hc
+      | with_reducible exact SqlIdent.joinQuoted_no_semicolon _ c hc
+      | with_reducible exact SqlIdent.joinQuotedPrefixed_no_semicolon _ (lit_no_semi _ rfl) _ c hc
+      | with_reducible exact SqlAggOp.render_no_semicolon _ c hc
+      | with_reducible exact SqlExpr.compile_no_semicolon _ _ _ c hc
+      | with_reducible exact SqlExpr.compileQual_no_semicolon _ _ (lit_no_semi _ rfl) _ _ c hc
+      | with_reducible exact compileInsertVals_no_semicolon _ _ _ c hc
+      | with_reducible exact compileSets_no_semicolon _ _ _ c hc
+      | with_reducible exact renderReturning_no_semicolon _ c hc
+      | with_reducible exact renderLimitOffset_no_semicolon _ _ _ c hc
+      | with_reducible exact renderOrderBy_no_semicolon _ (lit_no_semi _ rfl) _ c hc
+      | exact lit_no_semi _ rfl c hc)
 
 /-! ## Abstract Relational Policy & Invariant Soundness Model -/
 
@@ -1315,6 +1074,7 @@ theorem diffTableSchema_self_empty (t : TableSchema) :
 inductive DbEndpoint where
   | urlEnv       (envVar : String)
   | postgresEnv  (urlEnvVar : String)
+  | postgresUrl  (url : String)
   | sqlitePath   (path : String)
   | sqliteEnv    (envVar : String) (defaultPath? : Option String := none)
   | cloudflareD1 (accountEnv : String) (accountDefault? : Option String)

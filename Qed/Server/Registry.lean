@@ -1,5 +1,7 @@
 import Lean
+import Qed.Diag
 import Qed.Lang
+import Qed.Auth.Core
 import Qed.Server.Ensured
 import Qed.Socket.Basic
 
@@ -56,11 +58,7 @@ deriving Inhabited
 
 initialize serverRegistry :
     Lean.SimplePersistentEnvExtension ServerInfo (Lean.NameMap ServerInfo) ←
-  Lean.registerSimplePersistentEnvExtension {
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.serverName info) acc) {}
-    addEntryFn := fun m info => m.insert info.serverName info
-  }
+  Qed.Diag.mkNameMapExt (·.serverName)
 
 /-- Resolves a `Server.fn` reference from a component (`Catalog.order`, `CloudBooks.Catalog.order`,
     or an `open Catalog` method name) against `serverRegistry`. -/
@@ -134,11 +132,7 @@ deriving Inhabited, Repr
 
 initialize channelRegistry :
     Lean.SimplePersistentEnvExtension ChannelInfo (Lean.NameMap ChannelInfo) ←
-  Lean.registerSimplePersistentEnvExtension {
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.fullName info) acc) {}
-    addEntryFn := fun m info => m.insert info.fullName info
-  }
+  Qed.Diag.mkNameMapExt (·.fullName)
 
 /-- Resolves a `<Server>.<chan>` or `<External>.<chan>` channel reference from a component
     against `channelRegistry`. -/
@@ -279,11 +273,18 @@ deriving Inhabited
 
 initialize externalRegistry :
     Lean.SimplePersistentEnvExtension ExternalServiceInfo (Lean.NameMap ExternalServiceInfo) ←
-  Lean.registerSimplePersistentEnvExtension {
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.serviceName info) acc) {}
-    addEntryFn := fun m info => m.insert info.serviceName info
-  }
+  Qed.Diag.mkNameMapExt (·.serviceName)
+
+def isValidEnvVarName (s : String) : Bool :=
+  !s.isEmpty && s.toList.all fun c =>
+    ('A' ≤ c && c ≤ 'Z') || ('a' ≤ c && c ≤ 'z') || ('0' ≤ c && c ≤ '9') || c == '_'
+
+partial def exprCallsOld (stx : Lean.Syntax) : Bool :=
+  if stx.getKind == ``Qed.Lang.qedCall then
+    let callee := stx.getArg 0
+    if callee.getKind == ``Qed.Lang.qedIdent && (callee.getArg 0).getId.eraseMacroScopes == `old then true
+    else stx.getArgs.any exprCallsOld
+  else stx.getArgs.any exprCallsOld
 
 /-! ## Persistent `database` Schema & Policy Registry (`databaseRegistry`) -/
 
@@ -333,31 +334,28 @@ structure DatabaseInfo where
   tables            : Array DbTableInfo
 deriving Inhabited, Repr
 
-initialize databaseRegistry :
-    Lean.SimplePersistentEnvExtension DatabaseInfo (Lean.NameMap DatabaseInfo) ←
-  Lean.registerSimplePersistentEnvExtension {
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.dbName info) acc) {}
-    addEntryFn := fun m info => m.insert info.dbName info
-  }
-
-def lookupDatabase? (env : Lean.Environment) (currNs : Lean.Name)
-    (openDecls : List Lean.OpenDecl) (dbRef : Lean.Name) : Option DatabaseInfo :=
-  let reg := databaseRegistry.getState env
-  let clean := dbRef.eraseMacroScopes
+private def lookupByConfig? {α : Type} [Inhabited α]
+    (ext : Lean.SimplePersistentEnvExtension α (Lean.NameMap α))
+    (env : Lean.Environment) (currNs : Lean.Name)
+    (openDecls : List Lean.OpenDecl) (ref : Lean.Name) : Option α :=
+  let reg := ext.getState env
+  let clean := ref.eraseMacroScopes
   (reg.find? (currNs ++ clean)).orElse fun _ =>
     (reg.find? clean).orElse fun _ =>
       let resolved := Lean.ResolveName.resolveGlobalName env {} currNs openDecls (clean ++ `config)
-      resolved.findSome? fun (fullConst, _) =>
-        reg.find? fullConst.getPrefix
+      resolved.findSome? fun (fullConst, _) => reg.find? fullConst.getPrefix
+
+initialize databaseRegistry :
+    Lean.SimplePersistentEnvExtension DatabaseInfo (Lean.NameMap DatabaseInfo) ←
+  Qed.Diag.mkNameMapExt (·.dbName)
+
+def lookupDatabase? (env : Lean.Environment) (currNs : Lean.Name)
+    (openDecls : List Lean.OpenDecl) (dbRef : Lean.Name) : Option DatabaseInfo :=
+  lookupByConfig? databaseRegistry env currNs openDecls dbRef
 
 /-! ## Persistent `auth` OIDC Configuration Registry (`authRegistry`) -/
 
-structure AuthClaimInfo where
-  name         : String
-  typeName     : String
-  defaultValue : String := ""
-deriving Inhabited, Repr
+abbrev AuthClaimInfo := Qed.Auth.AuthClaimSpec
 
 structure AuthInfo where
   authName         : Lean.Name
@@ -366,39 +364,16 @@ structure AuthInfo where
   fromCtxConst     : Lean.Name
   configConst      : Lean.Name
   secrets          : Array String := #[]
-  issuerEnv        : String := "QED_AUTH_ISSUER"
-  issuerDefault?   : Option String := none
-  audienceEnv      : String := "QED_AUTH_AUDIENCE"
-  audienceDefault? : Option String := none
-  clientIdEnv?     : Option String := some "QED_AUTH_CLIENT_ID"
-  clientIdDefault? : Option String := none
-  clientSecretEnv? : Option String := none
-  providers        : Array String := #[]
-  sessionTtlSec    : Nat := 86400
-  loginPath        : String := "/_qed/auth/login"
-  callbackPath     : String := "/_qed/auth/callback"
-  logoutPath       : String := "/_qed/auth/logout"
-  mePath           : String := "/_qed/auth/me"
-  claims           : Array AuthClaimInfo := #[]
+  spec             : Qed.Auth.OidcAuthSpec := default
 deriving Inhabited, Repr
 
 initialize authRegistry :
     Lean.SimplePersistentEnvExtension AuthInfo (Lean.NameMap AuthInfo) ←
-  Lean.registerSimplePersistentEnvExtension {
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.authName info) acc) {}
-    addEntryFn := fun m info => m.insert info.authName info
-  }
+  Qed.Diag.mkNameMapExt (·.authName)
 
 def lookupAuth? (env : Lean.Environment) (currNs : Lean.Name)
     (openDecls : List Lean.OpenDecl) (authRef : Lean.Name) : Option AuthInfo :=
-  let reg := authRegistry.getState env
-  let clean := authRef.eraseMacroScopes
-  (reg.find? (currNs ++ clean)).orElse fun _ =>
-    (reg.find? clean).orElse fun _ =>
-      let resolved := Lean.ResolveName.resolveGlobalName env {} currNs openDecls (clean ++ `config)
-      resolved.findSome? fun (fullConst, _) =>
-        reg.find? fullConst.getPrefix
+  lookupByConfig? authRegistry env currNs openDecls authRef
 
 open Lean Elab Command in
 def buildPropConj (ps : Array Term) : CommandElabM Term := do
@@ -416,6 +391,23 @@ def elabParamTypeAbbrevs (refIdent : Ident) (ownerName fullOwnerName itemName : 
     elabCommand (← `(command| abbrev $pTyId : Type := $pTy))
     consts := consts.push (fullOwnerName ++ leaf)
   return consts
+
+open Lean Meta in
+private def mkCharListExpr (s : String) : Expr :=
+  let charTy := mkConst ``Char
+  let nilE := mkApp (mkConst ``List.nil [0]) charTy
+  let consC := mkApp (mkConst ``List.cons [0]) charTy
+  s.toList.foldr (fun c acc => mkApp2 consC (mkApp (mkConst ``Char.ofNat) (mkNatLit c.toNat)) acc) nilE
+
+open Lean Meta in
+/-- Reduces `String.length "literal"` to a `Nat` literal using `String.length_ofList`,
+    shared by `Qed.Server.Invariant` and `Qed.Server.Db.Runtime`. -/
+simproc_decl qedReduceStrLen (String.length _) := fun e => do
+  let some (Expr.lit (Literal.strVal s)) := e.getAppArgs[0]? | return .continue
+  let cs := mkCharListExpr s
+  let nExpr := mkNatLit s.length
+  let prf ← mkEqTrans (mkApp (mkConst ``String.length_ofList) cs) (← mkEqRefl nExpr)
+  return .done { expr := nExpr, proof? := some prf }
 
 end Server
 

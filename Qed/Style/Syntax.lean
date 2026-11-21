@@ -8,16 +8,6 @@ open Lean Parser Elab Command Term Meta
 
 /-! ## Persistent Compile-Time CSS Registries -/
 
-private def registerNameMapExt {α : Type} [Inhabited α] (keyOf : α → Name)
-    (name : Name := by exact decl_name%) :
-    IO (SimplePersistentEnvExtension α (NameMap α)) :=
-  registerSimplePersistentEnvExtension {
-    name := name
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert (keyOf info) info) acc) {}
-    addEntryFn := fun m info => m.insert (keyOf info) info
-  }
-
 structure StyleMetaInfo where
   fullName   : Name
   items      : List Qed.Item
@@ -28,7 +18,7 @@ deriving Inhabited
 
 initialize styleMetaRegistry :
     SimplePersistentEnvExtension StyleMetaInfo (NameMap StyleMetaInfo) ←
-  registerNameMapExt (·.fullName)
+  Qed.Diag.mkNameMapExt (·.fullName)
 
 structure TokenMetaInfo where
   fullName   : Name
@@ -40,7 +30,7 @@ deriving Inhabited
 
 initialize tokenMetaRegistry :
     SimplePersistentEnvExtension TokenMetaInfo (NameMap TokenMetaInfo) ←
-  registerNameMapExt (·.fullName)
+  Qed.Diag.mkNameMapExt (·.fullName)
 
 structure KeyframesMetaInfo where
   fullName : Name
@@ -50,7 +40,7 @@ deriving Inhabited
 
 initialize keyframesMetaRegistry :
     SimplePersistentEnvExtension KeyframesMetaInfo (NameMap KeyframesMetaInfo) ←
-  registerNameMapExt (·.fullName)
+  Qed.Diag.mkNameMapExt (·.fullName)
 
 structure ThemeMetaInfo where
   fullName      : Name
@@ -63,7 +53,7 @@ deriving Inhabited
 
 initialize themeMetaRegistry :
     SimplePersistentEnvExtension ThemeMetaInfo (NameMap ThemeMetaInfo) ←
-  registerNameMapExt (·.fullName)
+  Qed.Diag.mkNameMapExt (·.fullName)
 
 /-! ## Custom Non-Polluting CSS Line Parsers -/
 

@@ -141,10 +141,6 @@ private inductive QueryValSpec where
   | lit (s : String)
   | param (name : String)
 
-private def isValidEnvVarName (s : String) : Bool :=
-  !s.isEmpty && s.toList.all fun c =>
-    ('A' ≤ c && c ≤ 'Z') || ('a' ≤ c && c ≤ 'z') || ('0' ≤ c && c ≤ '9') || c == '_'
-
 open Lean Elab Command in
 private def parseUrlTemplate (ref : Lean.Syntax) (tmpl : String) :
     CommandElabM (Array UrlSegSpec × Array (String × QueryValSpec) × Array String) := do

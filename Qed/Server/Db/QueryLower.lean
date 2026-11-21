@@ -56,12 +56,71 @@ private partial def splitAndStx (stx : Lean.Syntax) : Array Lean.Syntax :=
   if u.getKind == ``qedAnd then splitAndStx (u.getArg 0) ++ splitAndStx (u.getArg 2)
   else #[u]
 
+private abbrev mkSqlIdentT := mkSqlIdentTerm
+
 open Lean Elab Command in
-private def mkSqlIdentT (ref : Syntax) (raw : String) : CommandElabM Term := do
-  if !isSafeSqlIdent raw then
-    throwErrorAt ref s!"invalid SQL identifier `{raw}`"
-  let lit := Syntax.mkStrLit raw
-  `(Qed.Server.Db.SqlIdent.mk $lit (by decide))
+private def lowerSqlMethodCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
+    (ref : Syntax) (lowerVal : Syntax → M Term) (lowerSql : Syntax → M Term)
+    (lhsE : Term) (meth : String) (argStx : Syntax) : M Term := do
+  match meth with
+  | "startsWith" =>
+      let rE ← lowerSql argStx
+      liftM (show CommandElabM Term from `(Qed.Server.Db.SqlExpr.startsWith $lhsE $rE))
+  | "contains" =>
+      let rE ← lowerSql argStx
+      liftM (show CommandElabM Term from `(Qed.Server.Db.SqlExpr.contains $lhsE $rE))
+  | "endsWith" =>
+      let vT ← lowerVal argStx
+      liftM (show CommandElabM Term from
+        `(Qed.Server.Db.SqlExpr.like $lhsE (Qed.Server.Db.SqlExpr.param (Qed.Server.Db.endsWithLikeVal $vT))))
+  | "like" =>
+      let rE ← lowerSql argStx
+      liftM (show CommandElabM Term from `(Qed.Server.Db.SqlExpr.like $lhsE $rE))
+  | _ =>
+      liftM (show CommandElabM Term from
+        throwErrorAt ref s!"unsupported method `.{meth}` in SQL `where`/`set` clause")
+
+open Lean Elab Command in
+private def lowerOptNatArg {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
+    (lowerVal : Syntax → M Term) (arg? : Option Syntax) : M Term := do
+  match arg? with
+  | none => liftM (show CommandElabM Term from `(none))
+  | some s =>
+      let v ← lowerVal s
+      liftM (show CommandElabM Term from `(some ($v : Nat)))
+
+private structure TableIdents where
+  rowTyId      : Lean.Ident
+  rowInvId     : Lean.Ident
+  rowInvBId    : Lean.Ident
+  rowInvSId    : Lean.Ident
+  transInvId   : Lean.Ident
+  readPolId    : Lean.Ident
+  insPolId     : Lean.Ident
+  updPolId     : Lean.Ident
+  delPolId     : Lean.Ident
+  decRowId     : Lean.Ident
+  tblSqlId     : Lean.Term
+  allColsListT : Lean.Term
+
+open Lean Elab Command in
+private def mkTableIdents (stx : Syntax) (tbl : DbTableInfo) : CommandElabM TableIdents := do
+  let tblSqlId ← mkSqlIdentTerm stx tbl.tableName
+  let colSqlIds ← tbl.columns.mapM fun c => mkSqlIdentTerm stx c.name
+  let allColsListT ← `([$[$colSqlIds:term],*])
+  return {
+    rowTyId := mkIdentFrom stx tbl.rowTypeConst
+    rowInvId := mkIdentFrom stx tbl.rowInvConst
+    rowInvBId := mkIdentFrom stx tbl.rowInvBoolConst
+    rowInvSId := mkIdentFrom stx tbl.rowInvSoundConst
+    transInvId := mkIdentFrom stx tbl.transInvConst
+    readPolId := mkIdentFrom stx tbl.readPolicyConst
+    insPolId := mkIdentFrom stx tbl.insertPolicyConst
+    updPolId := mkIdentFrom stx tbl.updatePolicyConst
+    delPolId := mkIdentFrom stx tbl.deletePolicyConst
+    decRowId := mkIdentFrom stx tbl.decodeRowConst
+    tblSqlId, allColsListT
+  }
 
 open Lean Elab Command in
 private partial def lowerRowSqlExpr {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
@@ -166,89 +225,55 @@ private partial def lowerRowSqlExpr {M : Type → Type} [Monad M] [MonadLiftT Co
     let rawArgs := (u.getArg 2).getSepArgs
     let posOnly? : Option (Array Syntax) :=
       if rawArgs.all (·.getKind == ``qedCallArgPos) then some (rawArgs.map (·.getArg 0)) else none
+    let lowerSub := lowerRowSqlExpr lowerVal tbl rowVar
+    let mkInList (recvStx argStx : Syntax) : M Term := do
+      if !stxMentionsVar rowVar recvStx then
+        let lhsE ← lowerSub argStx
+        let listT ← lowerVal recvStx
+        liftM (show CommandElabM Term from
+          `(Qed.Server.Db.SqlExpr.inList $lhsE (Qed.Server.Db.ToSqlList.toSqlList $listT)))
+      else
+        liftM (show CommandElabM Term from
+          throwErrorAt u s!"`IN` list `{stxSnippet recvStx}` cannot depend on row variable `{rowVar}`")
     match extractDottedChain? callee, posOnly? with
     | some chain, some #[argStx] =>
-        let handledRowMethod : Option (String × String) :=
-          match chain with
-          | [rv, col, meth] =>
-              if rv == rowVar && colNames.contains col &&
-                 (meth == "startsWith" || meth == "contains" || meth == "endsWith" || meth == "like") then
-                some (col, meth)
-              else none
-          | _ => none
-        if let some (col, meth) := handledRowMethod then
-          let cId ← liftM (mkSqlIdentT u col)
-          let colE ← liftM (show CommandElabM Term from `(Qed.Server.Db.SqlExpr.col $cId))
-          if meth == "startsWith" then
-            let rE ← lowerRowSqlExpr lowerVal tbl rowVar argStx
-            return ← liftM (show CommandElabM Term from `(Qed.Server.Db.SqlExpr.startsWith $colE $rE))
-          else if meth == "contains" then
-            let rE ← lowerRowSqlExpr lowerVal tbl rowVar argStx
-            return ← liftM (show CommandElabM Term from `(Qed.Server.Db.SqlExpr.contains $colE $rE))
-          else if meth == "endsWith" then
-            let vT ← lowerVal argStx
-            return ← liftM (show CommandElabM Term from
-              `(Qed.Server.Db.SqlExpr.like $colE (Qed.Server.Db.SqlExpr.param (Qed.Server.Db.endsWithLikeVal $vT))))
-          else -- like
-            let rE ← lowerRowSqlExpr lowerVal tbl rowVar argStx
-            return ← liftM (show CommandElabM Term from `(Qed.Server.Db.SqlExpr.like $colE $rE))
-        else if chain.length >= 2 && chain.getLast? == some "contains" && stxMentionsVar rowVar argStx then
-          -- `xs.contains(r.col)` → `IN (...)` parameterized list membership!
-          let recvStx : Syntax :=
-            if callee.getKind == ``qedProj then callee.getArg 0
+        match chain with
+        | [rv, col, meth] =>
+            if rv == rowVar && colNames.contains col &&
+               (meth == "startsWith" || meth == "contains" || meth == "endsWith" || meth == "like") then
+              let cId ← liftM (mkSqlIdentT u col)
+              let colE ← liftM (show CommandElabM Term from `(Qed.Server.Db.SqlExpr.col $cId))
+              return ← lowerSqlMethodCall u lowerVal lowerSub colE meth argStx
+            else if meth == "contains" && stxMentionsVar rowVar argStx then
+              let recvStx : Syntax :=
+                if callee.getKind == ``qedProj then callee.getArg 0
+                else Syntax.node (.fromRef callee) ``qedIdent #[mkIdentFrom callee (chain.dropLast.foldl Name.str .anonymous)]
+              return ← mkInList recvStx argStx
             else
-              let initSegs := chain.dropLast
-              let nm := initSegs.foldl (fun acc s => Name.str acc s) .anonymous
-              Syntax.node (.fromRef callee) ``qedIdent #[mkIdentFrom callee nm]
-          if !stxMentionsVar rowVar recvStx then
-            let lhsE ← lowerRowSqlExpr lowerVal tbl rowVar argStx
-            let listT ← lowerVal recvStx
-            return ← liftM (show CommandElabM Term from
-              `(Qed.Server.Db.SqlExpr.inList $lhsE (Qed.Server.Db.ToSqlList.toSqlList $listT)))
-          else
-            liftM (show CommandElabM Term from
-              throwErrorAt u s!"`IN` list `{stxSnippet recvStx}` cannot depend on row variable `{rowVar}`")
-        else
-          liftM (show CommandElabM Term from
-            throwErrorAt u s!"unsupported call `{stxSnippet u}` in SQL `where`/`set` clause")
+              liftM (show CommandElabM Term from throwErrorAt u s!"unsupported call `{stxSnippet u}` in SQL `where`/`set` clause")
+        | _ =>
+            if chain.length >= 2 && chain.getLast? == some "contains" && stxMentionsVar rowVar argStx then
+              let recvStx : Syntax :=
+                if callee.getKind == ``qedProj then callee.getArg 0
+                else Syntax.node (.fromRef callee) ``qedIdent #[mkIdentFrom callee (chain.dropLast.foldl Name.str .anonymous)]
+              return ← mkInList recvStx argStx
+            else
+              liftM (show CommandElabM Term from throwErrorAt u s!"unsupported call `{stxSnippet u}` in SQL `where`/`set` clause")
     | _, _ =>
-        -- Handle `(expr).startsWith(x)` / `(expr).contains(x)` where receiver is a `qedProj`
         if callee.getKind == ``qedProj then
           let meth := (callee.getArg 2).getId.eraseMacroScopes.toString
           let recvStx := callee.getArg 0
           match posOnly? with
           | some #[argStx] =>
               if meth == "contains" && !stxMentionsVar rowVar recvStx && stxMentionsVar rowVar argStx then
-                let lhsE ← lowerRowSqlExpr lowerVal tbl rowVar argStx
-                let listT ← lowerVal recvStx
-                return ← liftM (show CommandElabM Term from
-                  `(Qed.Server.Db.SqlExpr.inList $lhsE (Qed.Server.Db.ToSqlList.toSqlList $listT)))
-              else if meth == "startsWith" then
-                let lE ← lowerRowSqlExpr lowerVal tbl rowVar recvStx
-                let rE ← lowerRowSqlExpr lowerVal tbl rowVar argStx
-                return ← liftM (show CommandElabM Term from `(Qed.Server.Db.SqlExpr.startsWith $lE $rE))
-              else if meth == "contains" then
-                let lE ← lowerRowSqlExpr lowerVal tbl rowVar recvStx
-                let rE ← lowerRowSqlExpr lowerVal tbl rowVar argStx
-                return ← liftM (show CommandElabM Term from `(Qed.Server.Db.SqlExpr.contains $lE $rE))
-              else if meth == "endsWith" then
-                let lE ← lowerRowSqlExpr lowerVal tbl rowVar recvStx
-                let vT ← lowerVal argStx
-                return ← liftM (show CommandElabM Term from
-                  `(Qed.Server.Db.SqlExpr.like $lE (Qed.Server.Db.SqlExpr.param (Qed.Server.Db.endsWithLikeVal $vT))))
-              else if meth == "like" then
-                let lE ← lowerRowSqlExpr lowerVal tbl rowVar recvStx
-                let rE ← lowerRowSqlExpr lowerVal tbl rowVar argStx
-                return ← liftM (show CommandElabM Term from `(Qed.Server.Db.SqlExpr.like $lE $rE))
+                return ← mkInList recvStx argStx
               else
-                liftM (show CommandElabM Term from
-                  throwErrorAt u s!"unsupported method `.{meth}` in SQL `where`/`set` clause")
+                let lE ← lowerSub recvStx
+                return ← lowerSqlMethodCall u lowerVal lowerSub lE meth argStx
           | _ =>
-              liftM (show CommandElabM Term from
-                throwErrorAt u s!"unsupported call `{stxSnippet u}` in SQL `where`/`set` clause")
+              liftM (show CommandElabM Term from throwErrorAt u s!"unsupported call `{stxSnippet u}` in SQL `where`/`set` clause")
         else
-          liftM (show CommandElabM Term from
-            throwErrorAt u s!"unsupported expression `{stxSnippet u}` in SQL `where`/`set` clause")
+          liftM (show CommandElabM Term from throwErrorAt u s!"unsupported expression `{stxSnippet u}` in SQL `where`/`set` clause")
   else
     let sn := stxSnippet u
     liftM (show CommandElabM Term from
@@ -365,19 +390,8 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
           let hint := Qed.Diag.didYouMean tblName avail
           liftM (show CommandElabM (Term × Bool) from
             throwErrorAt stx s!"database `{dbInfo.shortName}` has no table `{tblName}`{hint}")
-      let rowTyId     := mkIdentFrom stx tbl.rowTypeConst
-      let rowInvId    := mkIdentFrom stx tbl.rowInvConst
-      let rowInvBId   := mkIdentFrom stx tbl.rowInvBoolConst
-      let rowInvSId   := mkIdentFrom stx tbl.rowInvSoundConst
-      let transInvId  := mkIdentFrom stx tbl.transInvConst
-      let readPolId   := mkIdentFrom stx tbl.readPolicyConst
-      let insPolId    := mkIdentFrom stx tbl.insertPolicyConst
-      let updPolId    := mkIdentFrom stx tbl.updatePolicyConst
-      let delPolId    := mkIdentFrom stx tbl.deletePolicyConst
-      let decRowId    := mkIdentFrom stx tbl.decodeRowConst
-      let tblSqlId    ← liftM (mkSqlIdentT stx tbl.tableName)
-      let allColSqlIds ← liftM (tbl.columns.mapM fun c => mkSqlIdentT stx c.name)
-      let allColsListT ← liftM (show CommandElabM Term from `([$[$allColSqlIds:term],*]))
+      let { rowTyId, rowInvId, rowInvBId, rowInvSId, transInvId, readPolId, insPolId, updPolId, delPolId,
+            decRowId, tblSqlId, allColsListT } ← liftM (mkTableIdents stx tbl)
       let ctxId := mkIdent `ctx
       let (posArgs, namedArgs) ← liftM (extractCallArgs rawArgs)
       let findNamed (k : String) : Option Syntax := (namedArgs.find? (·.1 == k)).map Prod.snd
@@ -399,16 +413,8 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
         let hintLit := Syntax.mkStrLit (mkReadPolHint tbl)
         if opName == "select" then
           let ordT ← liftM (parseOrderByArg tbl findOrderArg)
-          let limT : Term ← match findNamed "limit" with
-            | none => liftM (show CommandElabM Term from `(none))
-            | some lStx =>
-                let lv ← lowerVal lStx
-                liftM (show CommandElabM Term from `(some ($lv : Nat)))
-          let offT : Term ← match findNamed "offset" with
-            | none => liftM (show CommandElabM Term from `(none))
-            | some oStx =>
-                let ov ← lowerVal oStx
-                liftM (show CommandElabM Term from `(some ($ov : Nat)))
+          let limT ← lowerOptNatArg lowerVal (findNamed "limit")
+          let offT ← lowerOptNatArg lowerVal (findNamed "offset")
           let qT ← liftM (show CommandElabM Term from
             `(Qed.Server.Db.SqlQuery.select $tblSqlId $allColsListT $sqlWhereT $ordT $limT $offT))
           let callT ← liftM (show CommandElabM Term from
@@ -509,30 +515,17 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
               throwErrorAt stx s!"cannot `join` `{tbl.tableName}` with `{rightTbl.tableName}`: no `references` foreign key links these tables")
         let leftWhereArg? := findNamed "where"
         let rightWhereArg? := findNamed "rightWhere"
-        let rRowTyId    := mkIdentFrom stx rightTbl.rowTypeConst
-        let rRowInvId   := mkIdentFrom stx rightTbl.rowInvConst
-        let rRowInvBId  := mkIdentFrom stx rightTbl.rowInvBoolConst
-        let rRowInvSId  := mkIdentFrom stx rightTbl.rowInvSoundConst
-        let rReadPolId  := mkIdentFrom stx rightTbl.readPolicyConst
-        let rDecRowId   := mkIdentFrom stx rightTbl.decodeRowConst
-        let rTblSqlId   ← liftM (mkSqlIdentT stx rightTbl.tableName)
-        let rColSqlIds  ← liftM (rightTbl.columns.mapM fun c => mkSqlIdentT stx c.name)
-        let rColsListT  ← liftM (show CommandElabM Term from `([$[$rColSqlIds:term],*]))
+        let rt ← liftM (mkTableIdents stx rightTbl)
+        let rRowTyId := rt.rowTyId; let rRowInvId := rt.rowInvId; let rRowInvBId := rt.rowInvBId
+        let rRowInvSId := rt.rowInvSId; let rReadPolId := rt.readPolId; let rDecRowId := rt.decRowId
+        let rTblSqlId := rt.tblSqlId; let rColsListT := rt.allColsListT
         let lJoinSqlId  ← liftM (mkSqlIdentT stx leftJoinCol)
         let rJoinSqlId  ← liftM (mkSqlIdentT stx rightJoinCol)
         let (lPredT, lSqlWhereT, _) ← parseWhereArg lowerVal lowerValWithLocal tbl rowTyId leftWhereArg?
         let (rPredT, rSqlWhereT, _) ← parseWhereArg lowerVal lowerValWithLocal rightTbl rRowTyId rightWhereArg?
         let ordT ← liftM (parseOrderByArg tbl findOrderArg)
-        let limT : Term ← match findNamed "limit" with
-          | none => liftM (show CommandElabM Term from `(none))
-          | some lStx =>
-              let lv ← lowerVal lStx
-              liftM (show CommandElabM Term from `(some ($lv : Nat)))
-        let offT : Term ← match findNamed "offset" with
-          | none => liftM (show CommandElabM Term from `(none))
-          | some oStx =>
-              let ov ← lowerVal oStx
-              liftM (show CommandElabM Term from `(some ($ov : Nat)))
+        let limT ← lowerOptNatArg lowerVal (findNamed "limit")
+        let offT ← lowerOptNatArg lowerVal (findNamed "offset")
         let qT ← liftM (show CommandElabM Term from
           `(Qed.Server.Db.SqlQuery.joinSelect $tblSqlId $rTblSqlId $allColsListT $rColsListT
               $lJoinSqlId $rJoinSqlId $lSqlWhereT $rSqlWhereT $ordT $limT $offT))

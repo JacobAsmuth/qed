@@ -318,57 +318,10 @@ def parsePgUrl (rawUrl : String) : Except String PgConnParams := do
 
 /-! ### Base64 Helpers & SCRAM-SHA-256 Auth (over `ring` SHA-256 / HMAC / PBKDF2) -/
 
-private def b64EncTable : Array Char :=
-  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".toList.toArray
-
-private def b64EncodeLoop (bs : ByteArray) (i : Nat) (acc : String) : Nat → String
-  | 0 => acc
-  | fuel + 1 =>
-      if h : i < bs.size then
-        let b0 := (bs[i]'h).toNat
-        let has1 := i + 1 < bs.size
-        let has2 := i + 2 < bs.size
-        let b1 := if h1 : i + 1 < bs.size then (bs[i + 1]'h1).toNat else 0
-        let b2 := if h2 : i + 2 < bs.size then (bs[i + 2]'h2).toNat else 0
-        let c0 := b64EncTable[(b0 >>> 2) &&& 0x3F]!
-        let c1 := b64EncTable[((b0 &&& 0x03) <<< 4) ||| (b1 >>> 4)]!
-        let c2 := if has1 then b64EncTable[((b1 &&& 0x0F) <<< 2) ||| (b2 >>> 6)]! else '='
-        let c3 := if has2 then b64EncTable[b2 &&& 0x3F]! else '='
-        b64EncodeLoop bs (i + 3) ((((acc.push c0).push c1).push c2).push c3) fuel
-      else acc
-
-def base64Encode (bs : ByteArray) : String :=
-  b64EncodeLoop bs 0 "" (bs.size + 1)
-
-private def b64Val (c : Char) : Option Nat :=
-  let n := c.toNat
-  if 65 ≤ n && n ≤ 90 then some (n - 65)
-  else if 97 ≤ n && n ≤ 122 then some (n - 71)
-  else if 48 ≤ n && n ≤ 57 then some (n + 4)
-  else if c == '+' then some 62
-  else if c == '/' then some 63
-  else none
-
-private def b64DecodeLoop : List Char → ByteArray → ByteArray
-  | c0 :: c1 :: c2 :: c3 :: rest, acc =>
-      match b64Val c0, b64Val c1 with
-      | some v0, some v1 =>
-          let a0 := acc.push (UInt8.ofNat (((v0 <<< 2) ||| (v1 >>> 4)) &&& 0xFF))
-          match c2, b64Val c2 with
-          | '=', _ => a0
-          | _, some v2 =>
-              let a1 := a0.push (UInt8.ofNat (((v1 <<< 4) ||| (v2 >>> 2)) &&& 0xFF))
-              match c3, b64Val c3 with
-              | '=', _ => a1
-              | _, some v3 =>
-                  b64DecodeLoop rest (a1.push (UInt8.ofNat (((v2 <<< 6) ||| v3) &&& 0xFF)))
-              | _, none => a1
-          | _, none => a0
-      | _, _ => acc
-  | _, acc => acc
+abbrev base64Encode : ByteArray → String := Qed.Base64.encode
 
 def base64Decode (s : String) : ByteArray :=
-  b64DecodeLoop (s.toList.filter fun c => !c.isWhitespace) ByteArray.empty
+  (Qed.Base64.decode (String.ofList (s.toList.filter (!·.isWhitespace)))).toOption.getD ByteArray.empty
 
 private def xorBytes (a b : ByteArray) : ByteArray :=
   let n := min a.size b.size
@@ -550,39 +503,25 @@ private def connectPg (cfg : PgConnParams) : IO (Except String PgConn) := do
   | .error e => return .error s!"postgres connect failed: {e}"
   | .ok (handleNat, _) =>
       let handle := UInt64.ofNat handleNat
-      -- Optional STARTTLS negotiation (`SSLRequest`)
+      let fail (msg : String) : IO (Except String PgConn) := do
+        Prim.outboundRelease handle 0; return .error msg
       if cfg.sslMode != .disable then
         match ← Prim.outboundWriteAll handle encodeSslRequest with
-        | .error e =>
-            Prim.outboundRelease handle 0
-            return .error s!"postgres SSLRequest write failed: {e}"
+        | .error e => return ← fail s!"postgres SSLRequest write failed: {e}"
         | .ok () =>
             match ← Prim.outboundReadSome handle 1 with
-            | .error e =>
-                Prim.outboundRelease handle 0
-                return .error s!"postgres SSLRequest read failed: {e}"
+            | .error e => return ← fail s!"postgres SSLRequest read failed: {e}"
             | .ok reply =>
                 if reply.size >= 1 && reply[0]! == 0x53 then -- 'S' = TLS accepted
-                  match ← Prim.outboundUpgradeTls handle cfg.host with
-                  | .error e =>
-                      Prim.outboundRelease handle 0
-                      return .error e
-                  | .ok () => pure ()
+                  if let .error e ← Prim.outboundUpgradeTls handle cfg.host then return ← fail e
                 else if cfg.sslMode == .require then
-                  Prim.outboundRelease handle 0
-                  return .error "PostgreSQL server rejected TLS but sslmode=require"
-                else pure ()
-      match ← Prim.outboundWriteAll handle (encodeStartup cfg.user cfg.database) with
-      | .error e =>
-          Prim.outboundRelease handle 0
-          return .error s!"postgres startup write failed: {e}"
-      | .ok () =>
-          match ← authLoop handle cfg ByteArray.empty 0 "" "" 64 with
-          | .error e =>
-              Prim.outboundRelease handle 0
-              return .error s!"postgres auth failed: {e}"
-          | .ok (b, o) =>
-              return .ok { poolKey := cfg.poolKey, handle, buf := b, off := o, txStatus := 0x49, healthy := true }
+                  return ← fail "PostgreSQL server rejected TLS but sslmode=require"
+      if let .error e ← Prim.outboundWriteAll handle (encodeStartup cfg.user cfg.database) then
+        return ← fail s!"postgres startup write failed: {e}"
+      match ← authLoop handle cfg ByteArray.empty 0 "" "" 64 with
+      | .error e => fail s!"postgres auth failed: {e}"
+      | .ok (b, o) =>
+          return .ok { poolKey := cfg.poolKey, handle, buf := b, off := o, txStatus := 0x49, healthy := true }
 
 private def popPoolCandidate (key : String) (nowMs : Nat) :
     IO (Option PgPooledEntry × List UInt64) :=
@@ -653,41 +592,29 @@ def releaseConn (conn : PgConn) : IO Unit := do
       (evictedOld, m.insert conn.poolKey (kept.push entry))
   closeHandlesList evicted
 
-/-- Executes a parameterized query on an already-acquired `PgConn` (used by both pooled queries and transactions). -/
-def execOnConn (conn : PgConn) (sql : String) (params : Array SqlVal) :
+private def runWireOnConn (conn : PgConn) (wire : ByteArray) (errPrefix : String) (fuel : Nat) :
     IO (Except String (DbResult × PgConn) × PgConn) := do
-  let wire := encodeParse sql ++ encodeBind params ++ encodeDescribePortal ++ encodeExecute ++ encodeSync
   match ← Prim.outboundWriteAll conn.handle wire with
-  | .error e =>
-      let dead := { conn with healthy := false }
-      return (.error s!"postgres query write failed: {e}", dead)
+  | .error e => return (.error s!"{errPrefix}: {e}", { conn with healthy := false })
   | .ok () =>
-      match ← collectQueryResultLoop conn.handle conn.buf conn.off #[] #[] 0 none 65536 with
-      | .error transportErr =>
-          let dead := { conn with healthy := false }
-          return (.error transportErr, dead)
+      match ← collectQueryResultLoop conn.handle conn.buf conn.off #[] #[] 0 none fuel with
+      | .error transportErr => return (.error transportErr, { conn with healthy := false })
       | .ok (qRes, b', o', status) =>
           let conn' := { conn with buf := b', off := o', txStatus := status, healthy := true }
           match qRes with
           | .ok r    => return (.ok (r, conn'), conn')
           | .error e => return (.error e, conn')
 
+/-- Executes a parameterized query on an already-acquired `PgConn` (used by both pooled queries and transactions). -/
+def execOnConn (conn : PgConn) (sql : String) (params : Array SqlVal) :
+    IO (Except String (DbResult × PgConn) × PgConn) :=
+  runWireOnConn conn (encodeParse sql ++ encodeBind params ++ encodeDescribePortal ++ encodeExecute ++ encodeSync)
+    "postgres query write failed" 65536
+
 /-- Executes a Simple Query Protocol (`'Q'`) statement (e.g. DDL, `BEGIN`, `COMMIT`, `ROLLBACK`) on `conn`. -/
 def execSimpleOnConn (conn : PgConn) (sql : String) : IO (Except String PgConn × PgConn) := do
-  match ← Prim.outboundWriteAll conn.handle (encodeSimpleQuery sql) with
-  | .error e =>
-      let dead := { conn with healthy := false }
-      return (.error s!"postgres simple query write failed: {e}", dead)
-  | .ok () =>
-      match ← collectQueryResultLoop conn.handle conn.buf conn.off #[] #[] 0 none 4096 with
-      | .error transportErr =>
-          let dead := { conn with healthy := false }
-          return (.error transportErr, dead)
-      | .ok (qRes, b', o', status) =>
-          let conn' := { conn with buf := b', off := o', txStatus := status, healthy := true }
-          match qRes with
-          | .ok _    => return (.ok conn', conn')
-          | .error e => return (.error e, conn')
+  let (res, conn') ← runWireOnConn conn (encodeSimpleQuery sql) "postgres simple query write failed" 4096
+  return (res.map Prod.snd, conn')
 
 private def execParameterizedAttempt (cfg : PgConnParams) (sql : String) (params : Array SqlVal) :
     Nat → IO (Except String DbResult)

@@ -331,12 +331,6 @@ def signUserToken (secret userId : String) (ttlSec : Nat := 86400) : IO String :
   let mac ← Prim.hmacSha256 secret.toUTF8 payload.toUTF8
   return s!"{payload}.{Proto.encodeHex mac}"
 
-private def anySecretVerify (secrets : List String) (payload sigBytes : ByteArray) : IO Bool := do
-  for sec in secrets do
-    if ← Prim.hmacSha256Verify sec.toUTF8 payload sigBytes then
-      return true
-  return false
-
 /-- Verifies either an expiring `v1.<expSec>.<userId>.<hmacHex>` token or (unless
     `requireExpiring` is true) a legacy `<userId>.<hmacHex>` token using Rust's constant-time
     `hmac::Mac::verify_slice` across active + rotated secrets. -/
@@ -358,10 +352,10 @@ def verifyUserTokenWithNow (secrets : List String) (token : String) (nowSec : Na
           if uid.isEmpty then return none
           let some expSec := parseStrictU64 expStr 18446744073709551615 | return none
           if nowSec >= expSec then return none
-          return if ← anySecretVerify secrets payload.toUTF8 sigBytes then some uid else none
+          return if ← Qed.Auth.Oidc.anySecretVerify secrets payload.toUTF8 sigBytes then some uid else none
       | _ =>
           if requireExpiring || payload.isEmpty then return none
-          return if ← anySecretVerify secrets payload.toUTF8 sigBytes then some payload else none
+          return if ← Qed.Auth.Oidc.anySecretVerify secrets payload.toUTF8 sigBytes then some payload else none
 
 def verifyUserToken (secret token : String) (requireExpiring : Bool := false) : IO (Option String) := do
   if secret.isEmpty then return none
@@ -427,16 +421,6 @@ private def extractBearer (authHdr : String) : Option String :=
     let tok := trimWs (String.ofList (t.toList.drop 7))
     if tok.isEmpty then none else some tok
   else none
-
-private def resolveUserId (cfg : ServerConfig) (bearer? : Option String)
-    (cookies : List (String × String)) : IO (Option String) := do
-  if cfg.authSecrets.isEmpty then return none
-  let sessionCookie? := if cookies.isEmpty then none else (cookies.find? fun (k, _) => k == "qed_session").map Prod.snd
-  match bearer?.orElse (fun _ => sessionCookie?) with
-  | some tok =>
-      let nowSec := ((← Prim.nowMs).toNat) / 1000
-      verifyUserTokenWithNow cfg.authSecrets tok nowSec cfg.requireExpiring
-  | none => return none
 
 /-! ## Native `MonadServer IO` & `MonadAtomic σ IO` Instances -/
 
@@ -512,6 +496,8 @@ private def resolveDbEndpoint (ep : Db.DbEndpoint) : IO (Except String ResolvedD
       match ← loadNonEmptyEnv envVar with
       | some u => return .ok (.postgres u)
       | none   => return .error s!"missing PostgreSQL URL environment variable `{envVar}`"
+  | .postgresUrl url =>
+      return .ok (.postgres (trimWs url))
   | .sqlitePath path =>
       return .ok (.sqlite (stripSqliteScheme path))
   | .sqliteEnv envVar def? =>
@@ -556,6 +542,12 @@ private def resolveDbConfig (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDb
       | none =>
           return .error (ApiError.internal s!"database `{cfg.name}` unavailable: {primaryErr}")
 
+private def d1QueryUrl (acc db : String) : String :=
+  s!"https://api.cloudflare.com/client/v4/accounts/{Qed.encodeSeg acc}/d1/database/{Qed.encodeSeg db}/query"
+
+private def tursoPipelineUrl (baseUrl : String) : String :=
+  stripTrailingSlashes baseUrl ++ "/v2/pipeline"
+
 private def execHttpSqlRaw (url : String) (bearer? : Option String) (body : ByteArray) :
     IO (Except ApiError String) := do
   let baseHdrs : Array (String × String) := #[("Content-Type", "application/json"), ("Accept", "application/json")]
@@ -568,6 +560,63 @@ private def execHttpSqlRaw (url : String) (bearer? : Option String) (body : Byte
       let txt := (String.fromUTF8? respBody).getD ""
       if 200 ≤ status && status < 300 then return .ok txt
       else return .error (ApiError.internal s!"HTTP SQL error {status}: {txt}")
+
+private def execRawOnTransport (tr : ResolvedDbTransport) (sqlSqlite sqlPg : String)
+    (params : Array Db.SqlVal) (d1Cols : List String) (sqlHttp? : Option String := none)
+    (decodeErrPrefix? : Option String := none) : IO (Except ApiError Db.DbResult) := do
+  let sqlH := sqlHttp?.getD sqlSqlite
+  let mapDec (defaultPfx : String) (r : Except String Db.DbResult) : Except ApiError Db.DbResult :=
+    r.mapError fun e => ApiError.internal s!"{decodeErrPrefix?.getD defaultPfx}: {e}"
+  match tr with
+  | .sqlite path =>
+      match ← Prim.sqliteExec path sqlSqlite (Db.encodeTaggedParamsJson params) with
+      | .error e => return .error (ApiError.internal e)
+      | .ok raw  => return mapDec "sqlite result decode failed" (Db.decodeTaggedResultJson raw)
+  | .postgres url =>
+      match ← Db.PgWire.execParameterized url sqlPg params with
+      | .ok res  => return .ok res
+      | .error e => return .error (ApiError.internal e)
+  | .httpSql url bearer? =>
+      match ← execHttpSqlRaw url bearer? (Db.HttpSql.encodeGenericQueryBody sqlH params .sqlite) with
+      | .error e => return .error e
+      | .ok raw  => return mapDec "HTTP SQL result decode failed" (Db.decodeTaggedResultJson raw)
+  | .d1 acc db tok =>
+      match ← execHttpSqlRaw (d1QueryUrl acc db) (some tok) (Db.HttpSql.encodeD1QueryBody sqlH params) with
+      | .error e => return .error e
+      | .ok raw  => return mapDec "Cloudflare D1 result decode failed" (Db.HttpSql.decodeD1Response raw d1Cols)
+  | .turso baseUrl tok =>
+      match ← execHttpSqlRaw (tursoPipelineUrl baseUrl) (some tok) (Db.HttpSql.encodeTursoPipelineBody sqlH params) with
+      | .error e => return .error e
+      | .ok raw  => return mapDec "Turso result decode failed" (Db.HttpSql.decodeTursoResponse raw)
+
+private def execDdlOnTransport (tr : ResolvedDbTransport) (sqliteStmts : List String)
+    (pgDdl : String) : IO (Except ApiError Unit) := do
+  match tr with
+  | .sqlite path =>
+      match ← Prim.sqliteDdl path (String.intercalate ";\n" sqliteStmts) with
+      | .ok ()   => return .ok ()
+      | .error e => return .error (ApiError.internal e)
+  | .postgres url =>
+      match ← Db.PgWire.execDdl url pgDdl with
+      | .ok ()   => return .ok ()
+      | .error e => return .error (ApiError.internal e)
+  | .httpSql url bearer? =>
+      for stmt in sqliteStmts do
+        if let .error e ← execHttpSqlRaw url bearer? (Db.HttpSql.encodeGenericQueryBody stmt #[] .sqlite) then
+          return .error e
+      return .ok ()
+  | .d1 acc db tok =>
+      let url := d1QueryUrl acc db
+      for stmt in sqliteStmts do
+        if let .error e ← execHttpSqlRaw url (some tok) (Db.HttpSql.encodeD1QueryBody stmt #[]) then
+          return .error e
+      return .ok ()
+  | .turso baseUrl tok =>
+      let url := tursoPipelineUrl baseUrl
+      for stmt in sqliteStmts do
+        if let .error e ← execHttpSqlRaw url (some tok) (Db.HttpSql.encodeTursoPipelineBody stmt #[]) then
+          return .error e
+      return .ok ()
 
 private def rowStrAt (row : Db.DbRow) (idx : Nat) : Option String :=
   match row[idx]? with
@@ -659,32 +708,11 @@ def migrateDatabase (cfg : Db.DbConfig) : IO (Except ApiError (List Db.Migration
         match ← Db.PgWire.execDdl url ddl with
         | .ok () => return .ok (cfg.tables.map .createTable)
         | .error e => return .error (ApiError.internal e)
-  | .ok (.httpSql url bearer?) =>
-      for tbl in cfg.tables do
-        for stmt in tbl.renderDdlStatements .sqlite do
-          let body := Db.HttpSql.encodeGenericQueryBody stmt #[] .sqlite
-          match ← execHttpSqlRaw url bearer? body with
-          | .error e => return .error e
-          | .ok _    => pure ()
-      return .ok (cfg.tables.map .createTable)
-  | .ok (.d1 acc db tok) =>
-      let url := s!"https://api.cloudflare.com/client/v4/accounts/{Qed.encodeSeg acc}/d1/database/{Qed.encodeSeg db}/query"
-      for tbl in cfg.tables do
-        for stmt in tbl.renderDdlStatements .sqlite do
-          let body := Db.HttpSql.encodeD1QueryBody stmt #[]
-          match ← execHttpSqlRaw url (some tok) body with
-          | .error e => return .error e
-          | .ok _    => pure ()
-      return .ok (cfg.tables.map .createTable)
-  | .ok (.turso baseUrl tok) =>
-      let url := (if baseUrl.endsWith "/" then String.ofList baseUrl.toList.dropLast else baseUrl) ++ "/v2/pipeline"
-      for tbl in cfg.tables do
-        for stmt in tbl.renderDdlStatements .sqlite do
-          let body := Db.HttpSql.encodeTursoPipelineBody stmt #[]
-          match ← execHttpSqlRaw url (some tok) body with
-          | .error e => return .error e
-          | .ok _    => pure ()
-      return .ok (cfg.tables.map .createTable)
+  | .ok tr =>
+      let stmts := cfg.tables.flatMap (·.renderDdlStatements .sqlite)
+      match ← execDdlOnTransport tr stmts "" with
+      | .error e => return .error e
+      | .ok ()   => return .ok (cfg.tables.map .createTable)
 
 private def execNativeDbDdl (cfg : Db.DbConfig) : IO (Except ApiError Unit) := do
   match ← migrateDatabase cfg with
@@ -694,6 +722,12 @@ private def execNativeDbDdl (cfg : Db.DbConfig) : IO (Except ApiError Unit) := d
 /-- Active pinned PostgreSQL transaction connections keyed by monotonic transaction ID. -/
 initialize pgTxBox : IO.Ref (UInt64 × Std.HashMap UInt64 Db.PgWire.PgConn) ←
   IO.mkRef (1, {})
+
+private def popPgTx (txId : UInt64) : IO (Option Db.PgWire.PgConn) :=
+  pgTxBox.modifyGet fun (nextId, m) =>
+    match m[txId]? with
+    | some c => (some c, (nextId, m.erase txId))
+    | none   => (none, (nextId, m))
 
 private def execNativeDbTxBegin (cfg : Db.DbConfig) : IO (Except ApiError UInt64) := do
   match ← resolveDbConfig cfg with
@@ -735,11 +769,7 @@ private def execNativeDbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQu
           | .ok res => return .ok res
           | .error e => return .error (ApiError.internal s!"sqlite tx result decode failed: {e}")
   | .ok (.postgres _) =>
-      let popped? ← pgTxBox.modifyGet fun (nextId, m) =>
-        match m[txId]? with
-        | some c => (some c, (nextId, m.erase txId))
-        | none   => (none, (nextId, m))
-      let some conn := popped?
+      let some conn ← popPgTx txId
         | return .error (ApiError.internal "unknown or closed PostgreSQL transaction")
       let (sql, params) := q.compile .postgres
       let (res, conn') ← Db.PgWire.execOnConn conn sql params
@@ -764,11 +794,7 @@ private def execNativeDbTxCommit (cfg : Db.DbConfig) (txId : UInt64) : IO (Excep
       | .ok ()   => return .ok ()
       | .error e => return .error (ApiError.internal e)
   | .ok (.postgres _) =>
-      let popped? ← pgTxBox.modifyGet fun (nextId, m) =>
-        match m[txId]? with
-        | some c => (some c, (nextId, m.erase txId))
-        | none   => (none, (nextId, m))
-      let some conn := popped?
+      let some conn ← popPgTx txId
         | return .error (ApiError.internal "unknown or closed PostgreSQL transaction")
       let (res, conn') ← Db.PgWire.execSimpleOnConn conn "COMMIT"
       match res with
@@ -786,11 +812,7 @@ private def execNativeDbTxRollback (cfg : Db.DbConfig) (txId : UInt64) : IO Unit
   | .ok (.sqlite _) =>
       Prim.sqliteTxRollback txId
   | .ok (.postgres _) =>
-      let popped? ← pgTxBox.modifyGet fun (nextId, m) =>
-        match m[txId]? with
-        | some c => (some c, (nextId, m.erase txId))
-        | none   => (none, (nextId, m))
-      if let some conn := popped? then
+      if let some conn ← popPgTx txId then
         let (res, conn') ← Db.PgWire.execSimpleOnConn conn "ROLLBACK"
         match res with
         | .ok cFinal => Db.PgWire.releaseConn cFinal
@@ -800,49 +822,11 @@ private def execNativeDbTxRollback (cfg : Db.DbConfig) (txId : UInt64) : IO Unit
 private def execNativeDbQuery (cfg : Db.DbConfig) (q : Db.SqlQuery) : IO (Except ApiError Db.DbResult) := do
   match ← resolveDbConfig cfg with
   | .error e => return .error e
-  | .ok (.sqlite path) =>
-      let (sql, params) := q.compile .sqlite
-      let paramsJson := Db.encodeTaggedParamsJson params
-      match ← Prim.sqliteExec path sql paramsJson with
-      | .error e => return .error (ApiError.internal e)
-      | .ok rawJson =>
-          match Db.decodeTaggedResultJson rawJson with
-          | .ok res => return .ok res
-          | .error e => return .error (ApiError.internal s!"sqlite result decode failed: {e}")
-  | .ok (.postgres url) =>
-      let (sql, params) := q.compile .postgres
-      match ← Db.PgWire.execParameterized url sql params with
-      | .ok res => return .ok res
-      | .error e => return .error (ApiError.internal e)
-  | .ok (.httpSql url bearer?) =>
-      let (sql, params) := q.compile .sqlite
-      let body := Db.HttpSql.encodeGenericQueryBody sql params .sqlite
-      match ← execHttpSqlRaw url bearer? body with
-      | .error e => return .error e
-      | .ok rawJson =>
-          match Db.decodeTaggedResultJson rawJson with
-          | .ok res => return .ok res
-          | .error e => return .error (ApiError.internal s!"HTTP SQL result decode failed: {e}")
-  | .ok (.d1 acc db tok) =>
-      let url := s!"https://api.cloudflare.com/client/v4/accounts/{Qed.encodeSeg acc}/d1/database/{Qed.encodeSeg db}/query"
-      let (sql, params) := q.compile .sqlite
-      let body := Db.HttpSql.encodeD1QueryBody sql params
-      match ← execHttpSqlRaw url (some tok) body with
-      | .error e => return .error e
-      | .ok rawJson =>
-          match Db.HttpSql.decodeD1Response rawJson (Db.HttpSql.queryExpectedCols q) with
-          | .ok res => return .ok res
-          | .error e => return .error (ApiError.internal s!"Cloudflare D1 result decode failed: {e}")
-  | .ok (.turso baseUrl tok) =>
-      let url := (if baseUrl.endsWith "/" then String.ofList baseUrl.toList.dropLast else baseUrl) ++ "/v2/pipeline"
-      let (sql, params) := q.compile .sqlite
-      let body := Db.HttpSql.encodeTursoPipelineBody sql params
-      match ← execHttpSqlRaw url (some tok) body with
-      | .error e => return .error e
-      | .ok rawJson =>
-          match Db.HttpSql.decodeTursoResponse rawJson with
-          | .ok res => return .ok res
-          | .error e => return .error (ApiError.internal s!"Turso result decode failed: {e}")
+  | .ok tr =>
+      let (sqlSq, paramsSq) := q.compile .sqlite
+      let (sqlPg, paramsPg) := q.compile .postgres
+      let params := match tr with | .postgres _ => paramsPg | _ => paramsSq
+      execRawOnTransport tr sqlSq sqlPg params (Db.HttpSql.queryExpectedCols q)
 
 @[implicit_reducible]
 def mkNativeServerInst (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEntry)))
@@ -914,31 +898,7 @@ private def authUsersDdlPostgres : String :=
 private def ensureAuthUsersTable (cfg : Db.DbConfig) : IO (Except ApiError Unit) := do
   match ← resolveDbConfig cfg with
   | .error e => return .error e
-  | .ok (.sqlite path) =>
-      match ← Prim.sqliteDdl path authUsersDdlSqlite with
-      | .ok () => return .ok ()
-      | .error e => return .error (ApiError.internal e)
-  | .ok (.postgres url) =>
-      match ← Db.PgWire.execDdl url authUsersDdlPostgres with
-      | .ok () => return .ok ()
-      | .error e => return .error (ApiError.internal e)
-  | .ok (.httpSql url bearer?) =>
-      let body := Db.HttpSql.encodeGenericQueryBody authUsersDdlSqlite #[] .sqlite
-      match ← execHttpSqlRaw url bearer? body with
-      | .ok _ => return .ok ()
-      | .error e => return .error e
-  | .ok (.d1 acc db tok) =>
-      let url := s!"https://api.cloudflare.com/client/v4/accounts/{Qed.encodeSeg acc}/d1/database/{Qed.encodeSeg db}/query"
-      let body := Db.HttpSql.encodeD1QueryBody authUsersDdlSqlite #[]
-      match ← execHttpSqlRaw url (some tok) body with
-      | .ok _ => return .ok ()
-      | .error e => return .error e
-  | .ok (.turso baseUrl tok) =>
-      let url := (if baseUrl.endsWith "/" then String.ofList baseUrl.toList.dropLast else baseUrl) ++ "/v2/pipeline"
-      let body := Db.HttpSql.encodeTursoPipelineBody authUsersDdlSqlite #[]
-      match ← execHttpSqlRaw url (some tok) body with
-      | .ok _ => return .ok ()
-      | .error e => return .error e
+  | .ok tr   => execDdlOnTransport tr [authUsersDdlSqlite] authUsersDdlPostgres
 
 /-- Atomically claims a first-time OIDC subject in `_qed_auth_users` (DB-backed when a database is attached,
     falling back to an atomic in-memory set otherwise). Returns `true` iff this is a brand-new user. -/
@@ -954,48 +914,16 @@ private def claimAuthUser (primaryDb? : Option Db.DbConfig) (memSeen : Prim.Stat
       let params : Array Db.SqlVal := #[.text sub, .int (Int.ofNat nowMs)]
       match ← resolveDbConfig cfg with
       | .error e => return .error e
-      | .ok (.sqlite path) =>
-          let sql := "INSERT OR IGNORE INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES (?1, ?2)"
-          match ← Prim.sqliteExec path sql (Db.encodeTaggedParamsJson params) with
-          | .error e => return .error (ApiError.internal e)
-          | .ok rawJson =>
-              match Db.decodeTaggedResultJson rawJson with
-              | .ok res => return .ok (res.affected > 0)
-              | .error e => return .error (ApiError.internal s!"auth user claim decode failed: {e}")
-      | .ok (.postgres url) =>
-          let sql := "INSERT INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES ($1, $2) ON CONFLICT (\"sub\") DO NOTHING RETURNING \"sub\""
-          match ← Db.PgWire.execParameterized url sql params with
-          | .error e => return .error (ApiError.internal e)
-          | .ok res => return .ok (!res.rows.isEmpty)
-      | .ok (.httpSql url bearer?) =>
-          let sql := "INSERT OR IGNORE INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES (?1, ?2) RETURNING \"sub\""
-          let body := Db.HttpSql.encodeGenericQueryBody sql params .sqlite
-          match ← execHttpSqlRaw url bearer? body with
+      | .ok tr =>
+          let sqlSq := "INSERT OR IGNORE INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES (?1, ?2)"
+          let sqlHttp := sqlSq ++ " RETURNING \"sub\""
+          let sqlPg := "INSERT INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES ($1, $2) ON CONFLICT (\"sub\") DO NOTHING RETURNING \"sub\""
+          match ← execRawOnTransport tr sqlSq sqlPg params ["sub"] (some sqlHttp) (some "auth user claim decode failed") with
           | .error e => return .error e
-          | .ok rawJson =>
-              match Db.decodeTaggedResultJson rawJson with
-              | .ok res => return .ok (!res.rows.isEmpty || res.affected > 0)
-              | .error e => return .error (ApiError.internal s!"auth user claim decode failed: {e}")
-      | .ok (.d1 acc db tok) =>
-          let url := s!"https://api.cloudflare.com/client/v4/accounts/{Qed.encodeSeg acc}/d1/database/{Qed.encodeSeg db}/query"
-          let sql := "INSERT OR IGNORE INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES (?1, ?2) RETURNING \"sub\""
-          let body := Db.HttpSql.encodeD1QueryBody sql params
-          match ← execHttpSqlRaw url (some tok) body with
-          | .error e => return .error e
-          | .ok rawJson =>
-              match Db.HttpSql.decodeD1Response rawJson ["sub"] with
-              | .ok res => return .ok (!res.rows.isEmpty || res.affected > 0)
-              | .error e => return .error (ApiError.internal s!"auth user claim decode failed: {e}")
-      | .ok (.turso baseUrl tok) =>
-          let url := (if baseUrl.endsWith "/" then String.ofList baseUrl.toList.dropLast else baseUrl) ++ "/v2/pipeline"
-          let sql := "INSERT OR IGNORE INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES (?1, ?2) RETURNING \"sub\""
-          let body := Db.HttpSql.encodeTursoPipelineBody sql params
-          match ← execHttpSqlRaw url (some tok) body with
-          | .error e => return .error e
-          | .ok rawJson =>
-              match Db.HttpSql.decodeTursoResponse rawJson with
-              | .ok res => return .ok (!res.rows.isEmpty || res.affected > 0)
-              | .error e => return .error (ApiError.internal s!"auth user claim decode failed: {e}")
+          | .ok res  => return .ok (match tr with
+              | .sqlite _   => res.affected > 0
+              | .postgres _ => !res.rows.isEmpty
+              | _           => !res.rows.isEmpty || res.affected > 0)
 
 /-- Releases a claimed OIDC subject if `onCreateAccount` fails so a subsequent retry re-runs account creation. -/
 private def releaseAuthUser (primaryDb? : Option Db.DbConfig) (memSeen : Prim.StateBox (Std.HashSet String))
@@ -1004,25 +932,11 @@ private def releaseAuthUser (primaryDb? : Option Db.DbConfig) (memSeen : Prim.St
   | none =>
       Prim.atomicModify memSeen fun s => (s.erase sub, ())
   | some cfg =>
-      let params : Array Db.SqlVal := #[.text sub]
-      match ← resolveDbConfig cfg with
-      | .ok (.sqlite path) =>
-          discard <| Prim.sqliteExec path "DELETE FROM \"_qed_auth_users\" WHERE \"sub\" = ?1"
-            (Db.encodeTaggedParamsJson params)
-      | .ok (.postgres url) =>
-          discard <| Db.PgWire.execParameterized url "DELETE FROM \"_qed_auth_users\" WHERE \"sub\" = $1" params
-      | .ok (.httpSql url bearer?) =>
-          let body := Db.HttpSql.encodeGenericQueryBody "DELETE FROM \"_qed_auth_users\" WHERE \"sub\" = ?1" params .sqlite
-          discard <| execHttpSqlRaw url bearer? body
-      | .ok (.d1 acc db tok) =>
-          let url := s!"https://api.cloudflare.com/client/v4/accounts/{Qed.encodeSeg acc}/d1/database/{Qed.encodeSeg db}/query"
-          let body := Db.HttpSql.encodeD1QueryBody "DELETE FROM \"_qed_auth_users\" WHERE \"sub\" = ?1" params
-          discard <| execHttpSqlRaw url (some tok) body
-      | .ok (.turso baseUrl tok) =>
-          let url := (if baseUrl.endsWith "/" then String.ofList baseUrl.toList.dropLast else baseUrl) ++ "/v2/pipeline"
-          let body := Db.HttpSql.encodeTursoPipelineBody "DELETE FROM \"_qed_auth_users\" WHERE \"sub\" = ?1" params
-          discard <| execHttpSqlRaw url (some tok) body
-      | .error _ => pure ()
+      if let .ok tr ← resolveDbConfig cfg then
+        discard <| execRawOnTransport tr
+          "DELETE FROM \"_qed_auth_users\" WHERE \"sub\" = ?1"
+          "DELETE FROM \"_qed_auth_users\" WHERE \"sub\" = $1"
+          #[.text sub] []
 
 /-! ## Full-Stack Native Server Runner (Verified HTTP/1.1 + Static + RFC 6455 WS + SSR) -/
 
@@ -1249,6 +1163,22 @@ private def cookieHeaders (cookies : List SetCookie) : List (String × String) :
 private def isSsrRedirectStatus (status : Nat) : Bool :=
   status == 301 || status == 302 || status == 303 || status == 307 || status == 308
 
+private def maybeGzipResponse (status : Nat) (contentType : String) (body : ByteArray)
+    (isHead keepAlive noStore acceptsGzip compressible : Bool)
+    (etag? : Option String := none) (cacheCtrl? : Option String := none)
+    (extraHeaders : List (String × String) := []) (contentLen : Nat := body.size) : IO ByteArray := do
+  if !isHead && acceptsGzip && compressible && body.size >= 256 then
+    let gz ← Prim.gzipCompress body
+    if !gz.isEmpty && gz.size < body.size then
+      let hdrs :=
+        if extraHeaders.any (fun (k, _) => eqCI k "vary") then
+          ("Content-Encoding", "gzip") :: extraHeaders
+        else
+          ("Content-Encoding", "gzip") :: ("Vary", "Accept-Encoding") :: extraHeaders
+      return formatHttpResponseHead status contentType gz.size keepAlive noStore etag? cacheCtrl? hdrs ++ gz
+  let head := formatHttpResponseHead status contentType contentLen keepAlive noStore etag? cacheCtrl? extraHeaders
+  return if isHead then head else head ++ body
+
 private def serveStaticAsset (staticDirFd : Prim.StaticDir)
     (assetCache? : Option (Prim.StateBox (Std.HashMap String CachedStaticAsset)))
     (req : ParsedReqHead) (st : StaticTarget) (devMode : Bool) : IO ByteArray := do
@@ -1289,23 +1219,11 @@ private def serveStaticAsset (staticDirFd : Prim.StaticDir)
         return entry.serve req st.isHead req.keepAlive
       if req.hasIfNoneMatch && etagMatchesIfNoneMatch req.headers etag then
         return formatNotModifiedResponse etag req.keepAlive
-      if !st.isHead && req.acceptsGzip && compressible && fsize >= 256 then
-        let gz ← Prim.gzipCompress fbytes
-        if !gz.isEmpty && gz.size < fsize then
-          let gzHdrs := [("Content-Encoding", "gzip"), ("Vary", "Accept-Encoding")]
-          let head := formatHttpResponseHead 200 st.mime gz.size req.keepAlive false (some etag) (some cacheCtrl) gzHdrs
-          return head ++ gz
-      let head := formatHttpResponseHead 200 st.mime fsize req.keepAlive false (some etag) (some cacheCtrl) varyHdrs
-      return if st.isHead then head else head ++ fbytes
+      return ← maybeGzipResponse 200 st.mime fbytes st.isHead req.keepAlive false req.acceptsGzip compressible
+        (some etag) (some cacheCtrl) varyHdrs fsize
     else
-      if !st.isHead && req.acceptsGzip && compressible && fsize >= 256 then
-        let gz ← Prim.gzipCompress fbytes
-        if !gz.isEmpty && gz.size < fsize then
-          let gzHdrs := [("Content-Encoding", "gzip"), ("Vary", "Accept-Encoding")]
-          let head := formatHttpResponseHead 200 st.mime gz.size req.keepAlive true none none gzHdrs
-          return head ++ gz
-      let head := formatHttpResponseHead 200 st.mime fsize req.keepAlive true
-      return if st.isHead then head else head ++ fbytes
+      return ← maybeGzipResponse 200 st.mime fbytes st.isHead req.keepAlive true req.acceptsGzip compressible
+        none none [] fsize
   else if st.isBuildId then
     let fallback := if st.relPath == "__dev_status" then "{\"id\":\"0\",\"status\":\"ok\"}".toUTF8 else "0".toUTF8
     return formatHttpResponse 200 st.mime fallback st.isHead req.keepAlive true
@@ -1322,15 +1240,8 @@ private def formatCustomHttpResponse (resp : HttpResponse) (extraCookies : Array
       match csp? with | some p => [("Content-Security-Policy", p)] | none => []
     else []
   let baseHdrs := resp.headers ++ cspHdrs ++ cookieHeaders allCookies
-  if !isHead && !isSse && req.acceptsGzip && isCompressibleMime resp.contentType && resp.body.size >= 256 then
-    let gz ← Prim.gzipCompress resp.body
-    if !gz.isEmpty && gz.size < resp.body.size then
-      let gzHdrs := baseHdrs ++ [("Content-Encoding", "gzip"), ("Vary", "Accept-Encoding")]
-      return formatHttpResponse resp.status resp.contentType gz isHead req.keepAlive false (extraHeaders := gzHdrs)
-    else
-      return formatHttpResponse resp.status resp.contentType resp.body isHead req.keepAlive false (extraHeaders := baseHdrs)
-  else
-    return formatHttpResponse resp.status resp.contentType resp.body isHead req.keepAlive false (extraHeaders := baseHdrs)
+  maybeGzipResponse resp.status resp.contentType resp.body isHead req.keepAlive false
+    req.acceptsGzip (!isSse && isCompressibleMime resp.contentType) (extraHeaders := baseHdrs)
 
 private def runFullstackCore {Model Msg : Type}
     (app : Qed.App Model Msg)
@@ -1470,11 +1381,8 @@ private def runFullstackCore {Model Msg : Type}
           | none     => []
         else []
       let baseHdrs := redirectHdrs ++ htmlCspHdrs ++ [("Vary", "Accept-Encoding")]
-      if !isHead && req.acceptsGzip && finalHtml.size >= 256 then
-        let gz ← Prim.gzipCompress finalHtml
-        if !gz.isEmpty && gz.size < finalHtml.size then
-          return formatHttpResponse ssrStatus "text/html; charset=utf-8" gz isHead req.keepAlive false (extraHeaders := ("Content-Encoding", "gzip") :: baseHdrs)
-      return formatHttpResponse ssrStatus "text/html; charset=utf-8" finalHtml isHead req.keepAlive false (extraHeaders := baseHdrs)
+      return ← maybeGzipResponse ssrStatus "text/html; charset=utf-8" finalHtml isHead req.keepAlive false
+        req.acceptsGzip true (extraHeaders := baseHdrs)
     else
       return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 isHead req.keepAlive false
 
@@ -1645,40 +1553,20 @@ def runStatelessFullstack {Model Msg : Type}
     (authHookM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] →
         RequestCtx → UInt8 → m (Except ApiError Unit)) := none)
     (authHookFlags : Bool × Bool := (false, false))
-    (primaryDb? : Option Db.DbConfig := none) : IO UInt32 := do
-  let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
-  let wsSrvInst : MonadServer IO := mkNativeServerInst (some gcpCache) none
-  runFullstackCore app title serverShortName requiredSecrets
-    (fun ctx mName reqBytes => do
-      let cookieRef ← IO.mkRef (#[] : Array SetCookie)
-      let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef)
-      let res ← @dispatchM IO _ reqSrvInst ctx mName reqBytes
-      return (res, ← cookieRef.get))
+    (primaryDb? : Option Db.DbConfig := none) : IO UInt32 :=
+  runStatefulFullstack (σ := Unit) app title serverShortName () requiredSecrets
+    (fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @dispatchM m _ _)
     port staticDir devMode numWorkers
-    (wsDispatchM?.map fun wsM ctx kind ch params payload => @wsM IO _ wsSrvInst ctx kind ch params payload)
+    (wsDispatchM?.map fun f => fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @f m _ _)
     blockingMethods?
-    (httpDispatchM?.map fun httpM ctx method path => do
-      let cookieRef ← IO.mkRef (#[] : Array SetCookie)
-      let sseRef ← IO.mkRef (#[] : Array SseEvent)
-      let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef) (some sseRef)
-      let res ← @httpM IO _ reqSrvInst ctx method path
-      let sseEvs ← sseRef.get
-      let res' := match res with
-        | .ok (some resp) =>
-            if !sseEvs.isEmpty && startsWithCI resp.contentType "text/event-stream" then
-              .ok (some { resp with body := SseEvent.formatStream sseEvs.toList })
-            else .ok (some resp)
-        | other => other
-      return (res', ← cookieRef.get))
-    (jobs.map (·.toIoJob wsSrvInst))
+    (httpDispatchM?.map fun f => fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @f m _ _)
+    (jobs.map fun j => {
+      name := j.name, intervalMs := j.intervalMs, intervalPos := j.intervalPos,
+      runM := fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @j.runM m _ _
+    })
     authSpec?
-    (authHookM?.map fun hookM ctx kind => do
-      let cookieRef ← IO.mkRef (#[] : Array SetCookie)
-      let reqSrvInst := mkNativeServerInst (some gcpCache) (some cookieRef)
-      let res ← @hookM IO _ reqSrvInst ctx kind
-      return (res, ← cookieRef.get))
-    authHookFlags
-    primaryDb?
+    (authHookM?.map fun f => fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @f m _ _)
+    authHookFlags primaryDb?
 
 /-- Serves a standalone `Qed.App` (`component` or `Qed.run`) with native in-memory SSR and static asset serving. -/
 def runStandaloneApp {Model Msg : Type} (app : Qed.App Model Msg) (title : String)
@@ -1708,13 +1596,10 @@ def runStaticDir (staticDir : String) (port : UInt16) (devMode : Bool := false) 
     if let some st := classifyStaticPath req.method req.target devMode then
       return ← serveStaticAsset staticDirFd none req st devMode
     match ← Prim.readStaticFile staticDirFd "index.html" (if isHead then 1 else 0) with
-    | some (_, _, bytes) =>
+    | some (fsize, _, bytes) =>
         let baseHdrs := htmlCspHdrs ++ [("Vary", "Accept-Encoding")]
-        if !isHead && req.acceptsGzip && bytes.size >= 256 then
-          let gz ← Prim.gzipCompress bytes
-          if !gz.isEmpty && gz.size < bytes.size then
-            return formatHttpResponse 200 "text/html; charset=utf-8" gz isHead req.keepAlive true (extraHeaders := ("Content-Encoding", "gzip") :: baseHdrs)
-        return formatHttpResponse 200 "text/html; charset=utf-8" bytes isHead req.keepAlive true (extraHeaders := baseHdrs)
+        return ← maybeGzipResponse 200 "text/html; charset=utf-8" bytes isHead req.keepAlive true
+          req.acceptsGzip true (extraHeaders := baseHdrs) (contentLen := fsize)
     | none =>
         return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 isHead req.keepAlive false
   let onHead (headBytes : ByteArray) (_clientIp : String) (_inline : Nat) : IO (Prim.HttpHeadAction ParsedReqHead RequestCtx) := do

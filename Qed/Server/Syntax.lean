@@ -225,7 +225,7 @@ deriving Inhabited
 
 namespace ParsedSrvType
 
-private def buildProdTerm (elems : Array Lean.Term) : Lean.MacroM Lean.Term := do
+def buildProdTerm (elems : Array Lean.Term) : Lean.MacroM Lean.Term := do
   if elems.isEmpty then `(Unit)
   else if elems.size == 1 then return elems[0]!
   else

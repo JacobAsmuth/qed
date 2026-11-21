@@ -7,7 +7,6 @@ namespace Qed.Auth
 
 declare_syntax_cat authClause
 declare_syntax_cat authClaimClause
-declare_syntax_cat authEnvRef
 
 section AuthParsers
 open Lean Parser Qed.Lang

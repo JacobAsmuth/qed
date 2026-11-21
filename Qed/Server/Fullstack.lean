@@ -228,57 +228,37 @@ def elabQedServerMain : CommandElab := fun stx => do
         let id := mkIdentFrom fsIdent authCfgConst
         `(Option.some $id)
     | none => `(Option.none)
+  let wrapHandler (id : Ident) : CommandElabM Term :=
+    if srvInfo.hasState then
+      `(fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $id)
+    else
+      `(fun {m} [Monad m] [Qed.Server.MonadServer m] => $id)
+  let optHandler (enabled : Bool) (id : Ident) : CommandElabM Term := do
+    if enabled then `(some $(← wrapHandler id)) else `(none)
+  let wsArg ← optHandler hasWs wsDispatchId
+  let httpArg ← optHandler hasHttp httpDispatchId
+  let authHookArg ← optHandler hasAuthHooks authHookId
+  let dispArg ← wrapHandler dispatchId
   let runnerCall ← if srvInfo.hasState then
     let runFnId := mkIdent `Qed.Server.Native.runStatefulFullstack
     let initStateId := mkIdentFrom fsIdent (srvInfo.serverName ++ `initState)
-    let wsArg ← if hasWs then
-      `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $wsDispatchId))
-    else `(none)
-    let httpArg ← if hasHttp then
-      `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $httpDispatchId))
-    else `(none)
-    let authHookArg ← if hasAuthHooks then
-      `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $authHookId))
-    else `(none)
-    `($runFnId
-        $cliAppId $titleLit $shortLit $initStateId $secretsId
-        (fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $dispatchId)
+    `($runFnId $cliAppId $titleLit $shortLit $initStateId $secretsId $dispArg
         port staticDir devMode numWorkers $wsArg $blockingArg $httpArg $jobsArg $authArg
         $authHookArg $hookFlagsArg $primaryDbArg)
   else
     let runFnId := mkIdent `Qed.Server.Native.runStatelessFullstack
-    let wsArg ← if hasWs then
-      `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] => $wsDispatchId))
-    else `(none)
-    let httpArg ← if hasHttp then
-      `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] => $httpDispatchId))
-    else `(none)
-    let authHookArg ← if hasAuthHooks then
-      `(some (fun {m} [Monad m] [Qed.Server.MonadServer m] => $authHookId))
-    else `(none)
-    `($runFnId
-        $cliAppId $titleLit $shortLit $secretsId
-        (fun {m} [Monad m] [Qed.Server.MonadServer m] => $dispatchId)
+    `($runFnId $cliAppId $titleLit $shortLit $secretsId $dispArg
         port staticDir devMode numWorkers $wsArg $blockingArg $httpArg $jobsArg $authArg
         $authHookArg $hookFlagsArg $primaryDbArg)
-  if dbCfgIds.isEmpty then
-    elabCommand (← `(command|
-      def $mainId:ident (args : List String) : IO UInt32 := do
-        let staticDir := args[0]?.getD "dist"
-        let envPort ← ($getEnvId:ident "PORT")
-        let port := ((args[1]?.getD (envPort.getD "8000")).toNat?.getD 8000).toUInt16
-        let devMode := args.contains "--dev"
-        let numWorkers := (((← ($getEnvId:ident "QED_WORKERS")).bind String.toNat?).getD 0).toUInt32
-        $runnerCall:term))
-  else
-    elabCommand (← `(command|
-      def $mainId:ident (args : List String) : IO UInt32 := do
-        let staticDir := args[0]?.getD "dist"
-        let envPort ← ($getEnvId:ident "PORT")
-        let port := ((args[1]?.getD (envPort.getD "8000")).toNat?.getD 8000).toUInt16
-        let devMode := args.contains "--dev"
-        let numWorkers := (((← ($getEnvId:ident "QED_WORKERS")).bind String.toNat?).getD 0).toUInt32
-        if !(← $initDbsId #[$[$dbCfgIds:ident],*]) then return 1
-        $runnerCall:term))
+  let initDbCheck ← if dbCfgIds.isEmpty then `(pure true) else `($initDbsId #[$[$dbCfgIds:ident],*])
+  elabCommand (← `(command|
+    def $mainId:ident (args : List String) : IO UInt32 := do
+      let staticDir := args[0]?.getD "dist"
+      let envPort ← ($getEnvId:ident "PORT")
+      let port := ((args[1]?.getD (envPort.getD "8000")).toNat?.getD 8000).toUInt16
+      let devMode := args.contains "--dev"
+      let numWorkers := (((← ($getEnvId:ident "QED_WORKERS")).bind String.toNat?).getD 0).toUInt32
+      if !(← $initDbCheck) then return 1
+      $runnerCall:term))
 
 end Qed.Server

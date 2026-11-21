@@ -50,11 +50,7 @@ deriving Inhabited, Repr
 
 initialize fullstackRegistry :
     Lean.SimplePersistentEnvExtension FullstackInfo (Lean.NameMap FullstackInfo) ←
-  Lean.registerSimplePersistentEnvExtension {
-    addImportedFn := fun arrays =>
-      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert info.fullstackName info) acc) {}
-    addEntryFn := fun m info => m.insert info.fullstackName info
-  }
+  Qed.Diag.mkNameMapExt (·.fullstackName)
 
 /-! ## Expression & Statement Lowering Context -/
 
@@ -180,13 +176,11 @@ partial def stmtHasEmit (stx : Lean.Syntax) : Bool :=
 def blockHasEmit (stmts : Array Lean.Syntax) : Bool :=
   stmts.any stmtHasEmit
 
-partial def exprCallsOld (stx : Lean.Syntax) : Bool :=
-  if stx.getKind == ``qedCall then
-    let callee := (stx.getArg 0)
-    if callee.getKind == ``qedIdent && (callee.getArg 0).getId == `old then true
-    else stx.getArgs.any exprCallsOld
-  else
-    stx.getArgs.any exprCallsOld
+partial def stmtHasAtomic (stx : Lean.Syntax) : Bool :=
+  stx.getKind == ``qedStmtAtomic || stx.getArgs.any stmtHasAtomic
+
+def blockHasAtomic (stmts : Array Lean.Syntax) : Bool :=
+  stmts.any stmtHasAtomic
 
 mutual
   partial def stmtAlwaysReturns (stx : Lean.Syntax) : Bool :=
@@ -211,6 +205,32 @@ mutual
   partial def blockAlwaysReturns (stmts : Array Lean.Syntax) : Bool :=
     stmts.any stmtAlwaysReturns
 end
+
+def ensureUnitReturn (ref : Lean.Syntax) (stmts : Array Lean.Syntax) : Array Lean.Syntax :=
+  if blockAlwaysReturns stmts then stmts
+  else
+    let info := Lean.SourceInfo.fromRef ref
+    stmts.push (Lean.Syntax.node info ``qedStmtReturn #[Lean.Syntax.atom info "return", Lean.Syntax.node info Lean.nullKind #[]])
+
+open Lean Elab Command in
+private def splitPosNamedArgs (callName : String) (rawArgs : Array Syntax)
+    (validKeys : Option (List String) := none) (errRef : Syntax := Syntax.missing) :
+    CommandElabM (Array Syntax × Array (String × Syntax)) := do
+  let mut posArgs : Array Syntax := #[]
+  let mut namedArgs : Array (String × Syntax) := #[]
+  for a in rawArgs do
+    let k := a.getKind
+    if k == ``qedCallArgPos then posArgs := posArgs.push (a.getArg 0)
+    else if k == ``qedCallArgNamed then
+      let key := (a.getArg 0).getId.eraseMacroScopes.toString
+      if let some allowed := validKeys then
+        unless allowed.contains key do
+          let hint := Qed.Diag.didYouMean key allowed
+          let ref := if errRef.isMissing then a else errRef
+          throwErrorAt ref s!"unknown argument `{key}` in `{callName}(...)`{hint} (supported: {String.intercalate ", " allowed})"
+      namedArgs := namedArgs.push (key, a.getArg 2)
+    else throwErrorAt a s!"unexpected argument in `{callName}(...)`"
+  return (posArgs, namedArgs)
 
 mutual
   partial def exprHasUnwrap (stx : Lean.Syntax) : Bool :=
@@ -422,37 +442,24 @@ private def lowerSrvCallHook (stx calleeStx : Syntax) (rawArgs : Array Syntax) (
     let fnName := (calleeStx.getArg 0).getId.eraseMacroScopes.toString
     let shadowed := ctx.locals.contains fnName || ctx.stateFields.contains fnName || ctx.envVars.contains fnName
     if !shadowed && (fnName == "text" || fnName == "json" || fnName == "html" || fnName == "bytes" || fnName == "redirect") then
-      let mut posArgs : Array Syntax := #[]
-      let mut statusStx? : Option Syntax := none
-      for a in rawArgs do
-        let k := a.getKind
-        if k == ``qedCallArgPos then posArgs := posArgs.push (a.getArg 0)
-        else if k == ``qedCallArgNamed then
-          let key := (a.getArg 0).getId.eraseMacroScopes.toString
-          if key == "status" then statusStx? := some (a.getArg 2)
-          else throwErrorAt a s!"unknown argument `{key}` in `{fnName}(...)` (supported named argument: `status`)"
-        else throwErrorAt a s!"unexpected argument in `{fnName}(...)`"
+      let (posArgs, namedArgs) ← liftM <| splitPosNamedArgs fnName rawArgs (some ["status"])
+      let statusStx? := (namedArgs.find? (·.1 == "status")).map Prod.snd
+      let defaultStatus : Nat := if fnName == "redirect" then 302 else 200
+      let stT ← match statusStx? with
+        | some s => go .val s
+        | none   => let lit := Syntax.mkNumLit (toString defaultStatus); liftM (show CommandElabM Term from `(($lit : Nat)))
       if fnName == "bytes" then
         if posArgs.size != 2 then
           throwErrorAt stx "`bytes(contentType, body[, status = 200])` expects a content type and body"
-        let ctT ← go .val posArgs[0]!
-        let bodyT ← go .val posArgs[1]!
-        let stT ← match statusStx? with
-          | some s => go .val s
-          | none   => liftM (show CommandElabM Term from `((200 : Nat)))
-        return some (← `(Qed.Server.HttpResponse.bytes $ctT $bodyT $stT))
+        return some (← `(Qed.Server.HttpResponse.bytes $(← go .val posArgs[0]!) $(← go .val posArgs[1]!) $stT))
       else
         if posArgs.size != 1 then
           throwErrorAt stx s!"`{fnName}(...)` expects one positional argument (and optional `status = ...`)"
-        let defaultStatus : Nat := if fnName == "redirect" then 302 else 200
-        let stT ← match statusStx? with
-          | some s => go .val s
-          | none   => let lit := Syntax.mkNumLit (toString defaultStatus); liftM (show CommandElabM Term from `(($lit : Nat)))
         match fnName with
-        | "text"     => let argT ← go .val posArgs[0]!; return some (← `(Qed.Server.HttpResponse.text $argT $stT))
-        | "json"     => let jT ← lowerJsonPayload go posArgs[0]!; return some (← `(Qed.Server.HttpResponse.jsonOf $jT $stT))
-        | "html"     => let argT ← go .val posArgs[0]!; return some (← `(Qed.Server.HttpResponse.html $argT $stT))
-        | "redirect" => let argT ← go .val posArgs[0]!; return some (← `(Qed.Server.HttpResponse.redirect $argT $stT))
+        | "text"     => return some (← `(Qed.Server.HttpResponse.text $(← go .val posArgs[0]!) $stT))
+        | "json"     => return some (← `(Qed.Server.HttpResponse.jsonOf $(← lowerJsonPayload go posArgs[0]!) $stT))
+        | "html"     => return some (← `(Qed.Server.HttpResponse.html $(← go .val posArgs[0]!) $stT))
+        | "redirect" => return some (← `(Qed.Server.HttpResponse.redirect $(← go .val posArgs[0]!) $stT))
         | _          => pure ()
   return none
 
@@ -1243,122 +1250,80 @@ private def lowerAsyncLet (aCtx : LowerCtx) (stmt : Syntax) (rest : Array Syntax
     wrapHoistsAsync aCtx steps (← liftM <| bindOptIdent xStx checkedRhs cont)
 
 open Lean Elab Command in
+private def lowerOptArg (ctx : LowerCtx) (stepsRef : IO.Ref (Array HoistedStep))
+    (arg? : Option Syntax) (wrap : Term → CommandElabM Term) (default : CommandElabM Term) :
+    LowerM Term := do
+  match arg? with
+  | some s =>
+      let (t, hs) ← lowerExprCollectingHoists ctx .val s
+      stepsRef.modify (· ++ hs)
+      liftM (wrap t)
+  | none => liftM default
+
+open Lean Elab Command in
 private def lowerSetCookieCall (ctx : LowerCtx) (stmt : Syntax) (isClear : Bool) (rawArgs : Array Syntax) :
     LowerM (Term × Array HoistedStep) := do
-  let mut posArgs : Array Syntax := #[]
-  let mut namedArgs : Array (String × Syntax) := #[]
-  for a in rawArgs do
-    let k := a.getKind
-    if k == ``qedCallArgPos then posArgs := posArgs.push (a.getArg 0)
-    else if k == ``qedCallArgNamed then
-      namedArgs := namedArgs.push ((a.getArg 0).getId.eraseMacroScopes.toString, a.getArg 2)
-    else throwErrorAt a "unexpected argument in `setCookie`/`clearCookie`"
+  let validKeys := if isClear then none else some ["name", "value", "path", "httpOnly", "secure", "sameSite", "maxAge", "domain"]
+  let (posArgs, namedArgs) ← liftM <| splitPosNamedArgs (if isClear then "clearCookie" else "setCookie") rawArgs validKeys stmt
   let findN (k : String) : Option Syntax := (namedArgs.find? (·.1 == k)).map Prod.snd
-  let mut allSteps : Array HoistedStep := #[]
+  let stepsRef ← IO.mkRef (#[] : Array HoistedStep)
+  let reqArg (stx : Syntax) : LowerM Term := do
+    let (t, hs) ← lowerExprCollectingHoists ctx .val stx
+    stepsRef.modify (· ++ hs)
+    return t
+  let optVal (k : String) (d : CommandElabM Term) : LowerM Term :=
+    lowerOptArg ctx stepsRef (findN k) pure d
+  let optSome (k : String) (ty : CommandElabM Term) : LowerM Term :=
+    lowerOptArg ctx stepsRef (findN k) (fun t => do `(some ($t : $(← ty)))) `(none)
   if isClear then
     let some nameStx := posArgs[0]? |>.orElse (fun _ => findN "name")
       | throwErrorAt stmt "`clearCookie(name[, path = \"/\"])` requires a cookie name"
-    let (nameT, s1) ← lowerExprCollectingHoists ctx .val nameStx
-    allSteps := allSteps ++ s1
-    let pathT ← match findN "path" |>.orElse (fun _ => posArgs[1]?) with
-      | some pStx =>
-          let (pt, s2) ← lowerExprCollectingHoists ctx .val pStx
-          allSteps := allSteps ++ s2
-          pure pt
-      | none => liftM (show CommandElabM Term from `("/"))
-    return (← liftM (show CommandElabM Term from `(Qed.Server.SetCookie.clear $nameT $pathT)), allSteps)
+    let nameT ← reqArg nameStx
+    let pathT ← lowerOptArg ctx stepsRef ((findN "path").orElse (fun _ => posArgs[1]?)) pure `("/")
+    return (← liftM (show CommandElabM Term from `(Qed.Server.SetCookie.clear $nameT $pathT)), ← stepsRef.get)
   else
-    let validCookieKeys : List String := ["name", "value", "path", "httpOnly", "secure", "sameSite", "maxAge", "domain"]
-    for (k, _) in namedArgs do
-      unless validCookieKeys.contains k do
-        let hint := Qed.Diag.didYouMean k validCookieKeys
-        throwErrorAt stmt s!"unknown argument `{k}` in `setCookie(...)`{hint} (supported: {String.intercalate ", " validCookieKeys})"
     let some nameStx := posArgs[0]? |>.orElse (fun _ => findN "name")
       | throwErrorAt stmt "`setCookie(name, value, ...)` requires a cookie name"
     let some valStx := posArgs[1]? |>.orElse (fun _ => findN "value")
       | throwErrorAt stmt "`setCookie(name, value, ...)` requires a cookie value"
-    let (nameT, s1) ← lowerExprCollectingHoists ctx .val nameStx
-    let (valT, s2) ← lowerExprCollectingHoists ctx .val valStx
-    allSteps := allSteps ++ s1 ++ s2
-    let pathT ← match findN "path" with
-      | some s => let (t, hs) ← lowerExprCollectingHoists ctx .val s; allSteps := allSteps ++ hs; pure t
-      | none   => liftM (show CommandElabM Term from `("/"))
-    let httpOnlyT ← match findN "httpOnly" with
-      | some s => let (t, hs) ← lowerExprCollectingHoists ctx .val s; allSteps := allSteps ++ hs; pure t
-      | none   => liftM (show CommandElabM Term from `(true))
-    let secureT ← match findN "secure" with
-      | some s => let (t, hs) ← lowerExprCollectingHoists ctx .val s; allSteps := allSteps ++ hs; pure t
-      | none   => liftM (show CommandElabM Term from `(false))
-    let sameSiteT ← match findN "sameSite" with
-      | some s => let (t, hs) ← lowerExprCollectingHoists ctx .val s; allSteps := allSteps ++ hs; pure t
-      | none   => liftM (show CommandElabM Term from `(Qed.Server.SameSite.lax))
-    let maxAgeT ← match findN "maxAge" with
-      | some s =>
-          let (t, hs) ← lowerExprCollectingHoists ctx .val s
-          allSteps := allSteps ++ hs
-          liftM (show CommandElabM Term from `(some ($t : Nat)))
-      | none => liftM (show CommandElabM Term from `(none))
-    let domT ← match findN "domain" with
-      | some s =>
-          let (t, hs) ← lowerExprCollectingHoists ctx .val s
-          allSteps := allSteps ++ hs
-          liftM (show CommandElabM Term from `(some ($t : String)))
-      | none => liftM (show CommandElabM Term from `(none))
+    let nameT ← reqArg nameStx
+    let valT ← reqArg valStx
+    let pathT ← optVal "path" `("/")
+    let httpOnlyT ← optVal "httpOnly" `(true)
+    let secureT ← optVal "secure" `(false)
+    let sameSiteT ← optVal "sameSite" `(Qed.Server.SameSite.lax)
+    let maxAgeT ← optSome "maxAge" `(Nat)
+    let domT ← optSome "domain" `(String)
     let cTerm ← liftM (show CommandElabM Term from `({
       name := $nameT, value := $valT, path := $pathT,
       httpOnly := $httpOnlyT, sameSite := ($sameSiteT : Qed.Server.SameSite),
       secure := $secureT, maxAge? := $maxAgeT, domain? := $domT
       : Qed.Server.SetCookie }))
-    return (cTerm, allSteps)
+    return (cTerm, ← stepsRef.get)
 
 open Lean Elab Command in
 private def lowerSseSendCall (ctx : LowerCtx) (stmt : Syntax) (rawArgs : Array Syntax) :
     LowerM (Term × Array HoistedStep) := do
   unless ctx.isStreamRoute do
     throwErrorAt stmt "`send(...)` is only available inside `stream \"/...\":` routes"
-  let mut posArgs : Array Syntax := #[]
-  let mut namedArgs : Array (String × Syntax) := #[]
-  for a in rawArgs do
-    let k := a.getKind
-    if k == ``qedCallArgPos then posArgs := posArgs.push (a.getArg 0)
-    else if k == ``qedCallArgNamed then
-      namedArgs := namedArgs.push ((a.getArg 0).getId.eraseMacroScopes.toString, a.getArg 2)
-    else throwErrorAt a "unexpected argument in `send(...)`"
-  let validKeys : List String := ["data", "event", "id", "retry"]
-  for (k, _) in namedArgs do
-    unless validKeys.contains k do
-      let hint := Qed.Diag.didYouMean k validKeys
-      throwErrorAt stmt s!"unknown argument `{k}` in `send(...)`{hint} (supported: {String.intercalate ", " validKeys})"
+  let (posArgs, namedArgs) ← liftM <| splitPosNamedArgs "send" rawArgs (some ["data", "event", "id", "retry"]) stmt
   let findN (k : String) : Option Syntax := (namedArgs.find? (·.1 == k)).map Prod.snd
   let some dataStx := posArgs[0]? |>.orElse (fun _ => findN "data")
     | throwErrorAt stmt "`send(data[, event = ..., id = ..., retry = ...])` requires an event data string"
   if posArgs.size > 1 then
     throwErrorAt stmt "`send(...)` takes one positional `data` argument; pass `event = ...`, `id = ...`, or `retry = ...` as named arguments"
-  let mut allSteps : Array HoistedStep := #[]
+  let stepsRef ← IO.mkRef (#[] : Array HoistedStep)
   let (dataT, s1) ← lowerExprCollectingHoists ctx .val dataStx
-  allSteps := allSteps ++ s1
-  let eventT ← match findN "event" with
-    | some s =>
-        let (t, hs) ← lowerExprCollectingHoists ctx .val s
-        allSteps := allSteps ++ hs
-        liftM (show CommandElabM Term from `(some ($t : String)))
-    | none => liftM (show CommandElabM Term from `(none))
-  let idT ← match findN "id" with
-    | some s =>
-        let (t, hs) ← lowerExprCollectingHoists ctx .val s
-        allSteps := allSteps ++ hs
-        liftM (show CommandElabM Term from `(some ($t : String)))
-    | none => liftM (show CommandElabM Term from `(none))
-  let retryT ← match findN "retry" with
-    | some s =>
-        let (t, hs) ← lowerExprCollectingHoists ctx .val s
-        allSteps := allSteps ++ hs
-        liftM (show CommandElabM Term from `(some ($t : Nat)))
-    | none => liftM (show CommandElabM Term from `(none))
+  stepsRef.modify (· ++ s1)
+  let optSome (k : String) (ty : CommandElabM Term) : LowerM Term :=
+    lowerOptArg ctx stepsRef (findN k) (fun t => do `(some ($t : $(← ty)))) `(none)
+  let eventT ← optSome "event" `(String)
+  let idT ← optSome "id" `(String)
+  let retryT ← optSome "retry" `(Nat)
   let evTerm ← liftM (show CommandElabM Term from `({
     data := $dataT, event := $eventT, id := $idT, retry := $retryT
     : Qed.Server.SseEvent }))
-  return (evTerm, allSteps)
+  return (evTerm, ← stepsRef.get)
 
 open Lean Elab Command in
 private def lowerTxStmt (aCtx : LowerCtx) (stmt aliasRef : Syntax) (aliasName : String)

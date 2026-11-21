@@ -262,4 +262,15 @@ def ppQedExpr (e : Expr) (stripPrefixes : List String := []) : MetaM String := d
   let fmt ← Meta.ppExpr cleaned
   return toQedAscii fmt.pretty stripPrefixes
 
+/-- Registers a persistent `NameMap` environment extension keyed by `keyOf`. -/
+def mkNameMapExt {α : Type} [Inhabited α] (keyOf : α → Lean.Name)
+    (name : Lean.Name := by exact decl_name%) :
+    IO (Lean.SimplePersistentEnvExtension α (Lean.NameMap α)) :=
+  Lean.registerSimplePersistentEnvExtension {
+    name := name
+    addImportedFn := fun arrays =>
+      arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert (keyOf info) info) acc) {}
+    addEntryFn := fun m info => m.insert (keyOf info) info
+  }
+
 end Qed.Diag

@@ -41,14 +41,8 @@ structure ParsedFnParam where
   tyTerm   : Lean.Term
 
 open Lean Elab Command in
-def buildTupleType (tys : Array Term) : CommandElabM Term := do
-  if tys.isEmpty then `(Unit)
-  else if tys.size == 1 then return tys[0]!
-  else
-    let mut acc := tys.back!
-    for revIdx in [1:tys.size] do
-      acc ← `($(tys[tys.size - 1 - revIdx]!) × $acc)
-    return acc
+def buildTupleType (tys : Array Term) : CommandElabM Term :=
+  liftMacroM (ParsedSrvType.buildProdTerm tys)
 
 open Lean Elab Command in
 def extractTupleProjections (reqVar : Ident) (n : Nat) : CommandElabM (Array Term) := do
@@ -958,5 +952,34 @@ def elabServerAsyncFn (priorRep priorUnrep : Nat)
   let hApp ← callArgs.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
   return some (hApp, isReadOnly, lSt.extRoots)
 
+open Lean Elab Command in
+def elabServerHandler (priorRep priorUnrep : Nat) (hasState isAsync : Bool)
+    (srvName : Name) (fnStr : String) (fnIdent stateId stateInvId : Ident)
+    (allBinderIds : Array Ident) (allBinderTys : Array Term) (callArgs : Array Term)
+    (payloadTerm errTyTerm : Term) (baseCtx : LowerCtx) (bodyStmts : Array Lean.Syntax)
+    (invs : Array ParsedInv) (mutInvs : Array ParsedMutInv)
+    (stateFieldNames envVarNames : Array String)
+    (ensSpec? : Option FnEnsSpec)
+    (deferredProofs : IO.Ref (Array (CommandElabM Bool))) :
+    CommandElabM (Option (Term × Bool × Array Name)) := do
+  if hasState && !isAsync then
+    elabServerPureFn priorRep priorUnrep srvName fnStr fnIdent stateId stateInvId
+      allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
+      invs mutInvs stateFieldNames envVarNames ensSpec? deferredProofs
+  else if hasState && isAsync then
+    elabServerAsyncFn priorRep priorUnrep srvName fnStr fnIdent stateId stateInvId
+      allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts
+      invs mutInvs stateFieldNames envVarNames ensSpec? deferredProofs
+  else
+    let some (handlerId, hCall, hApp, er, hasDbWrite) ←
+      elabStatelessHandler priorRep priorUnrep fnIdent srvName fnIdent.getId
+        allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts | return none
+    if let some ensSpec := ensSpec? then
+      let unitInv ← `(fun _ : Unit => True)
+      let unitTy ← `(Unit)
+      deferredProofs.modify (·.push do
+        elabAsyncEnsuresThm priorRep priorUnrep srvName fnStr fnIdent handlerId
+          unitInv unitTy payloadTerm errTyTerm allBinderIds allBinderTys hCall #[] ensSpec)
+    return some (hApp, !hasDbWrite, er)
 
 end Qed.Server

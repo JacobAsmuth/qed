@@ -154,15 +154,21 @@ instance : LawfulProto WebhookUrl :=
 def sanitizeHeader (s : String) : String :=
   String.ofList (s.toList.filter isSafeHeaderChar)
 
-theorem header_no_crlf (s : String) :
-    ∀ c ∈ (sanitizeHeader s).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' := by
+/-- Default strict Content-Security-Policy enabled on HTML responses because Qed statically proves
+    zero inline `<script>` tags and zero inline `on*` event handler attributes. -/
+def defaultCsp : String :=
+  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+
+private theorem filter_no_crlf (p : Char → Bool)
+    (hp : p '\r' = false ∧ p '\n' = false ∧ p '\x00' = false) (s : String) :
+    ∀ c ∈ (String.ofList (s.toList.filter p)).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' := by
   intro c hc
-  unfold sanitizeHeader at hc
   rw [String.toList_ofList, List.mem_filter] at hc
-  rcases hc with ⟨_, hsafe⟩
-  unfold isSafeHeaderChar at hsafe
-  simp only [Bool.and_eq_true, decide_eq_true_eq] at hsafe
-  refine ⟨?_, ?_, ?_⟩ <;> (intro heq; subst heq; simp at hsafe)
+  refine ⟨?_, ?_, ?_⟩ <;> (intro heq; subst heq; simp [hp] at hc)
+
+theorem header_no_crlf (s : String) :
+    ∀ c ∈ (sanitizeHeader s).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' :=
+  filter_no_crlf isSafeHeaderChar (by decide) s
 
 /-! ## First-Class Verified Cookies (`SetCookie`), Custom HTTP Responses & Server-Side SSE -/
 
@@ -232,126 +238,58 @@ def render (c : SetCookie) : String :=
   base ++ dom ++ age ++ sec ++ ho ++ ss
 
 private theorem sanitizeCookieName_no_crlf (s : String) :
-    ∀ c ∈ (sanitizeCookieName s).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' := by
-  intro c hc
-  unfold sanitizeCookieName at hc
-  rw [String.toList_ofList, List.mem_filter] at hc
-  have hs := hc.2
-  unfold isSafeCookieAtomChar at hs
-  simp only [Bool.and_eq_true, decide_eq_true_eq] at hs
-  refine ⟨?_, ?_, ?_⟩ <;> (intro heq; subst heq; simp at hs)
+    ∀ c ∈ (sanitizeCookieName s).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' :=
+  filter_no_crlf isSafeCookieAtomChar (by decide) s
 
 private theorem sanitizeCookieVal_no_crlf (s : String) :
-    ∀ c ∈ (sanitizeCookieVal s).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' := by
-  intro c hc
-  unfold sanitizeCookieVal at hc
-  rw [String.toList_ofList, List.mem_filter] at hc
-  have hs := hc.2
-  unfold isSafeCookieValChar at hs
-  simp only [Bool.and_eq_true, decide_eq_true_eq] at hs
-  refine ⟨?_, ?_, ?_⟩ <;> (intro heq; subst heq; simp at hs)
+    ∀ c ∈ (sanitizeCookieVal s).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' :=
+  filter_no_crlf isSafeCookieValChar (by decide) s
 
 private theorem no_crlf_append {a b : String}
     (ha : ∀ c ∈ a.toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00')
     (hb : ∀ c ∈ b.toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00') :
     ∀ c ∈ (a ++ b).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' := by
-  intro c hc
-  rw [String.toList_append, List.mem_append] at hc
-  exact hc.elim (ha c) (hb c)
+  intro c hc; rw [String.toList_append, List.mem_append] at hc; exact hc.elim (ha c) (hb c)
 
 private theorem no_crlf_lit (s : String)
     (h : s.toList.all (fun c => c != '\r' && c != '\n' && c != '\x00') = true) :
     ∀ c ∈ s.toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' := by
-  intro c hc
-  rw [List.all_eq_true] at h
-  have := h c hc
-  simp only [Bool.and_eq_true, bne_iff_ne] at this
-  exact ⟨this.1.1, this.1.2, this.2⟩
+  intro c hc; rw [List.all_eq_true] at h
+  have := h c hc; simp only [Bool.and_eq_true, bne_iff_ne] at this; exact ⟨this.1.1, this.1.2, this.2⟩
 
 private theorem nat_toString_no_crlf (n : Nat) :
     ∀ c ∈ (toString n).toList, c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' := by
-  have hdig : ∀ x ∈ (Nat.toDigits 10 n), '0' ≤ x ∧ x ≤ '9' := by
-    intro x hx
-    have hmem : ∀ m (b : Nat) (acc : List Char),
-        (∀ y ∈ acc, '0' ≤ y ∧ y ≤ '9') →
-        ∀ y ∈ Nat.toDigitsCore 10 m b acc, '0' ≤ y ∧ y ≤ '9' := by
-      intro m
-      induction m with
-      | zero => intro b acc hacc y hy; exact hacc y hy
-      | succ m ih =>
-          intro b acc hacc y hy
-          unfold Nat.toDigitsCore at hy
-          dsimp only at hy
-          have hd : '0' ≤ Nat.digitChar (b % 10) ∧ Nat.digitChar (b % 10) ≤ '9' := by
-            have hlt : b % 10 < 10 := Nat.mod_lt b (by decide)
-            have : b % 10 = 0 ∨ b % 10 = 1 ∨ b % 10 = 2 ∨ b % 10 = 3 ∨ b % 10 = 4 ∨
-                   b % 10 = 5 ∨ b % 10 = 6 ∨ b % 10 = 7 ∨ b % 10 = 8 ∨ b % 10 = 9 := by omega
-            rcases this with h | h | h | h | h | h | h | h | h | h <;> rw [h] <;> decide
-          split at hy
-          · rcases List.mem_cons.1 hy with rfl | hrest
-            · exact hd
-            · exact hacc y hrest
-          · exact ih (b / 10) (Nat.digitChar (b % 10) :: acc)
-              (fun z hz => (List.mem_cons.1 hz).elim (fun h => h ▸ hd) (hacc z)) y hy
-    exact hmem (n + 1) n [] (fun _ h => False.elim (List.not_mem_nil h)) x hx
   intro c hc
-  have hrepr : (toString n).toList = Nat.toDigits 10 n := by
-    change (Nat.repr n).toList = Nat.toDigits 10 n
-    unfold Nat.repr
-    exact String.toList_ofList
-  rw [hrepr] at hc
-  have hbounds := hdig c hc
-  refine ⟨?_, ?_, ?_⟩ <;> (intro heq; subst heq; exact absurd hbounds (by decide))
+  have hb := Qed.Server.Db.nat_toString_digits n c hc
+  refine ⟨?_, ?_, ?_⟩ <;> (intro heq; subst heq; exact absurd hb (by decide))
 
 /-- **Cookie Header Injection Closure:** No rendered `Set-Cookie` header value can ever contain
     CR, LF, or NUL bytes. -/
 theorem render_no_crlf (c : SetCookie) :
     ∀ ch ∈ c.render.toList, ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' := by
+  rcases c with ⟨_, _, _, ho, ss, sec, age, dom⟩
   unfold SetCookie.render
-  dsimp only
-  have hBase : ∀ ch ∈ (sanitizeCookieName c.name ++ "=" ++ sanitizeCookieVal c.value ++
-      "; Path=" ++ sanitizeCookieVal (if c.path.isEmpty then "/" else c.path)).toList,
-      ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' :=
-    no_crlf_append
-      (no_crlf_append
-        (no_crlf_append
-          (no_crlf_append (sanitizeCookieName_no_crlf c.name) (no_crlf_lit "=" rfl))
-          (sanitizeCookieVal_no_crlf c.value))
-        (no_crlf_lit "; Path=" rfl))
-      (sanitizeCookieVal_no_crlf _)
-  have hDom : ∀ ch ∈ (match c.domain? with
-      | some d => if (sanitizeCookieVal d).isEmpty then "" else "; Domain=" ++ sanitizeCookieVal d
-      | none => "").toList, ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' := by
-    cases c.domain? with
-    | none => exact no_crlf_lit "" rfl
-    | some d =>
-        dsimp only
-        split
-        · exact no_crlf_lit "" rfl
-        · exact no_crlf_append (no_crlf_lit "; Domain=" rfl) (sanitizeCookieVal_no_crlf d)
-  have hAge : ∀ ch ∈ (match c.maxAge? with
-      | some n => "; Max-Age=" ++ toString n
-      | none => "").toList, ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' := by
-    cases c.maxAge? with
-    | none => exact no_crlf_lit "" rfl
-    | some n => exact no_crlf_append (no_crlf_lit "; Max-Age=" rfl) (nat_toString_no_crlf n)
-  have hSec : ∀ ch ∈ (if c.secure then "; Secure" else "").toList,
-      ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' := by
-    cases c.secure
-    · exact no_crlf_lit "" rfl
-    · exact no_crlf_lit "; Secure" rfl
-  have hHo : ∀ ch ∈ (if c.httpOnly then "; HttpOnly" else "").toList,
-      ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' := by
-    cases c.httpOnly
-    · exact no_crlf_lit "" rfl
-    · exact no_crlf_lit "; HttpOnly" rfl
-  have hSs : ∀ ch ∈ ("; SameSite=" ++ c.sameSite.render).toList,
-      ch ≠ '\r' ∧ ch ≠ '\n' ∧ ch ≠ '\x00' := by
-    cases c.sameSite
-    · exact no_crlf_append (no_crlf_lit "; SameSite=" rfl) (no_crlf_lit "Lax" rfl)
-    · exact no_crlf_append (no_crlf_lit "; SameSite=" rfl) (no_crlf_lit "Strict" rfl)
-    · exact no_crlf_append (no_crlf_lit "; SameSite=" rfl) (no_crlf_lit "None" rfl)
-  exact no_crlf_append (no_crlf_append (no_crlf_append (no_crlf_append (no_crlf_append hBase hDom) hAge) hSec) hHo) hSs
+  intro ch hc
+  simp only [String.toList_append, List.mem_append] at hc
+  revert hc; simp only [or_imp]; repeat any_goals constructor
+  all_goals
+    intro hc
+    first
+    | with_reducible exact sanitizeCookieName_no_crlf _ ch hc
+    | with_reducible exact sanitizeCookieVal_no_crlf _ ch hc
+    | (cases dom with
+        | none => exact no_crlf_lit _ rfl ch hc
+        | some d => dsimp only at hc; split at hc
+                    · exact no_crlf_lit _ rfl ch hc
+                    · simp only [String.toList_append, List.mem_append] at hc
+                      exact hc.elim (no_crlf_lit _ rfl ch) (sanitizeCookieVal_no_crlf d ch))
+    | (cases age with
+        | none => exact no_crlf_lit _ rfl ch hc
+        | some n => simp only [String.toList_append, List.mem_append] at hc
+                    exact hc.elim (no_crlf_lit _ rfl ch) (nat_toString_no_crlf n ch))
+    | (split at hc <;> exact no_crlf_lit _ rfl ch hc)
+    | (cases ss <;> exact no_crlf_lit _ rfl ch hc)
+    | exact no_crlf_lit _ rfl ch hc
 
 end SetCookie
 
@@ -439,14 +377,6 @@ def withHeader (r : HttpResponse) (k v : String) : HttpResponse :=
   { r with headers := r.headers ++ [(k, v)] }
 
 end HttpResponse
-
-/-- Helper converting either `List SseEvent` or `Array SseEvent` into an SSE `HttpResponse`. -/
-class ToSseResponse (α : Type) where
-  toSseResponse : α → HttpResponse
-
-instance : ToSseResponse (List SseEvent) := ⟨HttpResponse.sse⟩
-instance : ToSseResponse (Array SseEvent) := ⟨fun arr => HttpResponse.sse arr.toList⟩
-instance : ToSseResponse HttpResponse := ⟨id⟩
 
 /-! ## SSRF Origin-Pinning & Path-Traversal Closure (`external_url_preserves_origin`) -/
 
@@ -1212,6 +1142,9 @@ theorem safeIO_bind_ensures {σ α β : Type} {Inv : σ → Prop} {Post : β →
 class SafeIOEnsures {σ α : Type} (p : ThreadProg σ α) (Q : outParam (α → Prop)) : Prop where
   noAtomic : NoAtomic p
   ensures  : ∀ {Inv : σ → Prop}, ProgEnsures Inv Q p
+
+instance (priority := low) {σ α : Type} {p : ThreadProg σ α} {Q : α → Prop}
+    [h : SafeIOEnsures p Q] : SafeIO p := ⟨h.noAtomic⟩
 
 theorem safeIOEnsures_bind {σ α β : Type} {Inv : σ → Prop} {Q : α → Prop} {Post : β → Prop}
     (p : ThreadProg σ α) [h : SafeIOEnsures p Q] {k : α → ThreadProg σ β}

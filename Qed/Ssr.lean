@@ -271,16 +271,6 @@ def PrebuiltDocShell.renderBytes (sh : PrebuiltDocShell) (appHtml state : String
     let out := escapeRawTextBytesInto out state
     appendSlice out sh.afterStateBytes
 
-@[specialize]
-def App.ssrRenderNativeBytesWithShell {Model Msg : Type} {m : Type → Type} [Monad m]
-    (app : App Model Msg) (sh : PrebuiltDocShell) (path : String)
-    (dispatchBytes : String → String → ByteArray → m (Except String ByteArray))
-    (dispatchText  : String → String → String → m (Except String String) :=
-      fun _ _ _ => pure (.error "no external JSON handler registered for SSR"))
-    (fuel : Nat := 32) (sessionUser : Option String := none) : m ByteArray := do
-  let mdl ← app.ssrBootM path dispatchBytes dispatchText fuel sessionUser
-  return sh.renderBytes (app.renderModel mdl) (app.dehydrate mdl)
-
 /-- Native SSR renderer returning `(httpStatus, headMeta, htmlBytes)`. Uses the prebuilt shell
     on the fast path when `app.headFor mdl == {}`, and renders escaped per-route `<head>` tags
     otherwise. -/

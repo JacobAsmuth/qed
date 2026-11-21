@@ -34,22 +34,9 @@ private def isFrameworkOrStdRoot (modName : String) : Bool :=
 private def readLocalImports (modName : String) : IO (List String × Bool) := do
   let path := FilePath.mk ((modName.replace "." "/") ++ ".lean")
   if !(← path.pathExists) then return ([], false)
-  let src ← IO.FS.readFile path
-  let mut deps : List String := []
-  let mut importsDriver := false
-  for raw in src.splitOn "\n" do
-    let code := (raw.splitOn "--").headD raw
-    let toks := ((code.replace "\t" " ").splitOn " ").filter (· != "")
-    let afterImp := match toks with
-      | "import" :: ds => ds
-      | "public" :: "import" :: ds => ds
-      | _ => []
-    for d in afterImp do
-      let dm := takeIdentChars d
-      if dm == "Qed.Driver" || dm == "Qed.Dom" then
-        importsDriver := true
-      else if !dm.isEmpty && !isFrameworkOrStdRoot dm then
-        deps := deps ++ [dm]
+  let imps := parseLeanImports (← IO.FS.readFile path)
+  let importsDriver := imps.any fun d => d == "Qed.Driver" || d == "Qed.Dom"
+  let deps := imps.toList.filter fun d => d != "Qed.Driver" && d != "Qed.Dom" && !isFrameworkOrStdRoot d
   return (deps, importsDriver)
 
 private partial def collectLocalModulesLoop (skipDriver : Bool) :
@@ -207,26 +194,22 @@ private def finalizeProdAssets (outDir : FilePath) (hasStylesCss : Bool) (styles
   ]
 
   let mut stylesHref := "/styles.css"
-  let mut stylesEntry := ""
+  let mut stylesField : List (String × Qed.Json) := []
   if hasStylesCss && (← (outDir / "styles.css").pathExists) then
     let cssRaw ← IO.FS.readBinFile (outDir / "styles.css")
     let cssFile := s!"styles.{shortContentHash cssRaw}.css"
     IO.FS.writeBinFile (outDir / cssFile) cssRaw
     removeIfExists (outDir / "styles.css")
     stylesHref := s!"/{cssFile}"
-    stylesEntry := s!",\"styles\":\"/{cssFile}\""
+    stylesField := [("styles", .str stylesHref)]
 
   IO.FS.writeFile (outDir / "index.html")
     (indexHtml (dev := false) hasStylesCss stylesheets (hostScript := s!"/{hostFile}") (stylesHref := stylesHref))
 
-  let manifest :=
-    "{" ++
-    s!"\"host\":\"/{hostFile}\"," ++
-    s!"\"app\":\"/{appFile}\"," ++
-    s!"\"rt\":\"/{rtFile}\"," ++
-    s!"\"dom\":\"/{domFile}\"" ++
-    stylesEntry ++
-    "}\n"
+  let manifest := Qed.Json.render (.obj ([
+    ("host", .str s!"/{hostFile}"), ("app", .str s!"/{appFile}"),
+    ("rt", .str s!"/{rtFile}"), ("dom", .str s!"/{domFile}")
+  ] ++ stylesField)) ++ "\n"
   IO.FS.writeFile (outDir / "qed_manifest.json") manifest
 
 private def resolveServeCmd (dir : FilePath) (port : String) (dev : Bool) :
@@ -248,12 +231,9 @@ private def serverCObjTargets (mod : String) : IO (Array String) := do
 
 private def resolveLinkMeta (genDir : FilePath) (cObjTargets : Array String) :
     IO (Option (Array String)) := do
+  let allExist (ps : Array String) : IO Bool := ps.allM fun p => (FilePath.mk p).pathExists
   if let some (cachedTargets, cachedInputs) ← fullstackLinkCache.get then
-    if cachedTargets == cObjTargets then
-      let mut ok := true
-      for p in cachedInputs do
-        if !(← (FilePath.mk p).pathExists) then ok := false; break
-      if ok then return some cachedInputs
+    if cachedTargets == cObjTargets && (← allExist cachedInputs) then return some cachedInputs
   let cacheKey := String.intercalate " " cObjTargets.toList
   let metaFile := genDir / "link_meta.txt"
   let lakeDep : Array FilePath ←
@@ -261,15 +241,11 @@ private def resolveLinkMeta (genDir : FilePath) (cObjTargets : Array String) :
     else if (← (FilePath.mk "lakefile.toml").pathExists) then pure #[FilePath.mk "lakefile.toml"]
     else pure #[]
   if (← isUpToDate metaFile lakeDep) then
-    let lines := ((← IO.FS.readFile metaFile).splitOn "\n").map String.cliTrim |>.filter (!·.isEmpty)
-    match lines with
+    match ((← IO.FS.readFile metaFile).splitOn "\n").map String.cliTrim |>.filter (!·.isEmpty) with
     | k :: rest =>
         if k == cacheKey && !rest.isEmpty then
           let paths := rest.toArray
-          let mut ok := true
-          for p in paths do
-            if !(← (FilePath.mk p).pathExists) then ok := false; break
-          if ok then
+          if ← allExist paths then
             fullstackLinkCache.set (some (cObjTargets, paths))
             return some paths
     | _ => pure ()
@@ -590,24 +566,20 @@ private def waitDevServerHealthy (port : UInt16) (timeoutMs : Nat := 3000) : IO 
         loop fuel
   loop 120
 
-private partial def scanNewestMtime (dir : FilePath) (exts : List String)
-    (skipDirs : List String) : IO Int := do
-  if !(← dir.pathExists) then return 0
+private def scanNewestMtime (dir : FilePath) (ext : String) (skipDirs : List String) : IO Int := do
   let mut newest : Int := 0
-  let entries ← try dir.readDir catch _ => pure #[]
-  for entry in entries do
-    let p := entry.path
-    let isD ← try p.isDir catch _ => pure false
-    if isD then
-      if (p.fileName.getD "") ∉ skipDirs then
-        let sub ← scanNewestMtime p exts skipDirs
-        if sub > newest then newest := sub
-    else
-      let extOk := exts.isEmpty || match p.extension with | some e => exts.contains e | none => false
-      if extOk then
-        if let some mt ← mtimeNs p then
-          if mt > newest then newest := mt
+  for p in ← collect dir ext skipDirs do
+    if let some mt ← mtimeNs p then
+      if mt > newest then newest := mt
   return newest
+
+private def devSkipDirs : List String :=
+  [".lake", ".qed", "dist", ".git", "toolchains", "target", "scratch", "node_modules"]
+
+private def scanDevMtimes (qh : FilePath) : IO (Int × Int × Int) :=
+  return (← scanNewestMtime "." "lean" devSkipDirs,
+          ← scanNewestMtime "." "css" devSkipDirs,
+          ← scanNewestMtime (qh / "runtime") "mjs" [])
 
 private def fileHash? (p : FilePath) : IO (Option String) := do
   if !(← p.pathExists) then return none
@@ -619,9 +591,6 @@ private def refreshLocalCss (outDir : FilePath) : IO Unit := do
   let metaPath : FilePath := ".qed" / "gen" / mod / "css_meta.txt"
   if let some (_, sheets) ← loadCssMeta metaPath then
     copyLocalStylesheets outDir sheets
-
-private def devSkipDirs : List String :=
-  [".lake", ".qed", "dist", ".git", "toolchains", "target", "scratch", "node_modules"]
 
 private def publishDevStatus (outDir : FilePath) (sse? : Option Watch.DevSseServer)
     (status : String) (kind : String := "hmr") (errText : String := "")
@@ -657,9 +626,7 @@ partial def watchLoop (watcher? : Option Watch.FileWatcher) (sse? : Option Watch
         rtChanged := ev.runtime
   | none =>
       IO.sleep 120
-      let curLeanMt ← scanNewestMtime "." ["lean"] devSkipDirs
-      let curCssMt ← scanNewestMtime "." ["css"] devSkipDirs
-      let curRtMt ← scanNewestMtime (qh / "runtime") ["mjs"] []
+      let (curLeanMt, curCssMt, curRtMt) ← scanDevMtimes qh
       if curLeanMt > lastLeanMt then
         nextLeanMt := curLeanMt; leanChanged := true
       else if curCssMt > lastCssMt then
@@ -737,9 +704,7 @@ def cmdDev : IO UInt32 := do
   let watcher? ← match ← Watch.FileWatcher.open "." (qh / "runtime").toString devSkipDirs.toArray with
     | .ok w => pure (some w)
     | .error _ => pure none
-  let initLeanMt ← if watcher?.isSome then pure 0 else scanNewestMtime "." ["lean"] devSkipDirs
-  let initCssMt ← if watcher?.isSome then pure 0 else scanNewestMtime "." ["css"] devSkipDirs
-  let initRtMt ← if watcher?.isSome then pure 0 else scanNewestMtime (qh / "runtime") ["mjs"] []
+  let (initLeanMt, initCssMt, initRtMt) ← if watcher?.isSome then pure (0, 0, 0) else scanDevMtimes qh
   let t0 ← IO.monoMsNow
   step "initial build"
   clearLastBuildError

@@ -185,19 +185,6 @@ def effectsCovered : IO Bool := do
     IO.eprintln (red s!"  effect kind \"{k}\" is emitted by a Cmd but no qed_host.mjs case handles it")
   return missing.isEmpty
 
-/-- Parse top-level `import Mod` lines from a Lean source file. -/
-private def parseLeanImports (src : String) : Array String := Id.run do
-  let mut imps : Array String := #[]
-  for rawLine in src.splitOn "\n" do
-    let line := rawLine.trimAscii.toString
-    if line.startsWith "import " then
-      let rest := (line.drop 7).trimAscii.toString
-      let mod := (rest.splitOn " ").headD ""
-      let mod := (mod.splitOn "--").headD ""
-      if !mod.isEmpty then
-        imps := imps.push mod
-  return imps
-
 private def pathToModule (base : FilePath) (p : FilePath) : Option String :=
   let s := p.toString
   let pref := base.toString ++ "/"

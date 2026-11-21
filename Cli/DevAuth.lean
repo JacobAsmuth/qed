@@ -1,4 +1,5 @@
 import Qed.Auth.Core
+import Qed.Render
 import Qed.Server.Http
 import Qed.Server.Prim
 
@@ -37,10 +38,6 @@ structure DevAuthKeypair where
   xB64     : String
   yB64     : String
 
-private def escapeHtmlText (s : String) : String :=
-  ((s.replace "&" "&amp;").replace "<" "&lt;").replace ">" "&gt;"
-    |>.replace "\"" "&quot;"
-
 /-- Mints a real RFC 7519 `ES256`-signed OIDC `id_token` using the ephemeral P-256 keypair. -/
 def signDevIdToken (kp : DevAuthKeypair) (issuer sub aud nonce email role orgId : String)
     (emailVerified : Bool) (ttlSec : Nat := 3600) : IO (Except String String) := do
@@ -71,12 +68,12 @@ def signDevIdToken (kp : DevAuthKeypair) (issuer sub aud nonce email role orgId 
   | .ok sig  => return .ok (signingInput ++ "." ++ base64UrlEncode sig)
 
 def renderDevAuthorizePage (issuer clientId redirectUri state nonce codeChallenge : String) : String :=
-  let hClient := escapeHtmlText clientId
-  let hRedir  := escapeHtmlText redirectUri
-  let hState  := escapeHtmlText state
-  let hNonce  := escapeHtmlText nonce
-  let hChal   := escapeHtmlText codeChallenge
-  let hIss    := escapeHtmlText issuer
+  let hClient := Qed.escapeHtml clientId
+  let hRedir  := Qed.escapeHtml redirectUri
+  let hState  := Qed.escapeHtml state
+  let hNonce  := Qed.escapeHtml nonce
+  let hChal   := Qed.escapeHtml codeChallenge
+  let hIss    := Qed.escapeHtml issuer
   "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">" ++
   "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">" ++
   "<title>Qed Dev Auth — Local OIDC Sign In</title>" ++

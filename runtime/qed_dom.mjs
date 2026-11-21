@@ -77,6 +77,12 @@ const walkOrCreateText = (root, path) => {
   }
   return target;
 };
+export const applySignalToEl = (el, attr, s) => {
+  if (attr === 'value') { if (el.value !== s) el.value = s; }
+  else if (attr === 'checked') { const on = (s !== '' && s !== 'false'); if (el.checked !== on) el.checked = on; }
+  else if (attr) { if (el.getAttribute(attr) !== s) el.setAttribute(attr, s); }
+  else if (el.textContent !== s) el.textContent = s;
+};
 const writeSlot = (target, kind, attrName, attrNs, attrLocal, v) => {
   if (!target) return;
   if (kind === 0) { if (target.nodeValue !== v) target.nodeValue = v; }
@@ -94,14 +100,7 @@ const cloneAndInitRow = (tmpl, vals) => {
     const t = walkers[j](el);
     slots[j] = t;
     const v = vals[j];
-    if (v !== '' && t) {
-      const k = kinds[j];
-      if (k === 0) t.nodeValue = v;
-      else if (k === 1) t.className = v;
-      else if (k === 2) t.value = v;
-      else if (attrNSs[j]) t.setAttributeNS(attrNSs[j], attrNames[j], v);
-      else t.setAttribute(attrNames[j], v);
-    }
+    if (v !== '' && t) writeSlot(t, kinds[j], attrNames[j], attrNSs[j], attrLocals[j], v);
   }
   el.__qedSlots = slots;
   el.__qedTmpl = true;
@@ -114,10 +113,7 @@ const bindSig = (node, name, attr, w) => {
   g.sig.set(name, { el, attr });
   if (el.__qedSigs) el.__qedSigs.push(name); else el.__qedSigs = [name];
   const v = g.sigVals.get(name);
-  if (v !== undefined) {
-    if (attr) { if (el.getAttribute(attr) !== v) el.setAttribute(attr, v); }
-    else if (el.textContent !== v) el.textContent = v;
-  }
+  if (v !== undefined) applySignalToEl(el, attr, v);
   return ok(PUnit, w);
 };
 

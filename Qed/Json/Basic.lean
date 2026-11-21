@@ -268,16 +268,14 @@ mutual
     | .obj ms       => '{' :: (renderMembersL ms ++ ['}'])
   def renderElemsL : List Json → List Char
     | []      => []
-    | e :: es => renderL e ++ renderElemSep es
-  def renderElemSep : List Json → List Char
-    | []      => []
-    | x :: xs => ',' :: (renderL x ++ renderElemSep xs)
+    | e :: es => match es with
+      | []     => renderL e
+      | _ :: _ => renderL e ++ ',' :: renderElemsL es
   def renderMembersL : List (String × Json) → List Char
     | []           => []
-    | (k, v) :: ms => renderStrL k ++ ':' :: (renderL v ++ renderMemberSep ms)
-  def renderMemberSep : List (String × Json) → List Char
-    | []           => []
-    | (k, v) :: ms => ',' :: (renderStrL k ++ ':' :: (renderL v ++ renderMemberSep ms))
+    | (k, v) :: ms => match ms with
+      | []     => renderStrL k ++ ':' :: renderL v
+      | _ :: _ => renderStrL k ++ ':' :: (renderL v ++ ',' :: renderMembersL ms)
 end
 
 def render (j : Json) : String := String.ofList (renderL j)
@@ -334,16 +332,14 @@ mutual
     | .obj ms     => (renderMembersAcc (acc.push '{') ms).push '}'
   def renderElemsAcc (acc : String) : List Json → String
     | []      => acc
-    | e :: es => renderElemSepAcc (renderAcc acc e) es
-  def renderElemSepAcc (acc : String) : List Json → String
-    | []      => acc
-    | x :: xs => renderElemSepAcc (renderAcc (acc.push ',') x) xs
+    | e :: es => match es with
+      | []     => renderAcc acc e
+      | _ :: _ => renderElemsAcc ((renderAcc acc e).push ',') es
   def renderMembersAcc (acc : String) : List (String × Json) → String
     | []           => acc
-    | (k, v) :: ms => renderMemberSepAcc (renderAcc ((renderStrAcc k acc).push ':') v) ms
-  def renderMemberSepAcc (acc : String) : List (String × Json) → String
-    | []           => acc
-    | (k, v) :: ms => renderMemberSepAcc (renderAcc ((renderStrAcc k (acc.push ',')).push ':') v) ms
+    | (k, v) :: ms => match ms with
+      | []     => renderAcc ((renderStrAcc k acc).push ':') v
+      | _ :: _ => renderMembersAcc ((renderAcc ((renderStrAcc k acc).push ':') v).push ',') ms
 end
 
 def renderFast (j : Json) : String := renderAcc "" j
@@ -474,37 +470,25 @@ mutual
         rw [renderMembersAcc_eq, push_eq_append, push_eq_append, ofList_cons, ofList_append, String.append_assoc, String.append_assoc]; rfl
   theorem renderElemsAcc_eq (acc : String) (es : List Json) :
       renderElemsAcc acc es = acc ++ String.ofList (renderElemsL es) := by
-    cases es with
-    | nil => simp [renderElemsAcc, renderElemsL]
-    | cons e es =>
+    match es with
+    | [] => simp [renderElemsAcc, renderElemsL]
+    | [e] => exact renderAcc_eq acc e
+    | e :: x :: xs =>
         unfold renderElemsAcc renderElemsL
-        rw [renderElemSepAcc_eq, renderAcc_eq, ofList_append, String.append_assoc]
-  theorem renderElemSepAcc_eq (acc : String) (es : List Json) :
-      renderElemSepAcc acc es = acc ++ String.ofList (renderElemSep es) := by
-    cases es with
-    | nil => simp [renderElemSepAcc, renderElemSep]
-    | cons x xs =>
-        unfold renderElemSepAcc renderElemSep
-        rw [renderElemSepAcc_eq, renderAcc_eq, push_eq_append, ofList_cons, ofList_append, String.append_assoc, String.append_assoc]
+        rw [renderElemsAcc_eq, push_eq_append, renderAcc_eq, ofList_append, ofList_cons,
+          String.append_assoc, String.append_assoc]
   theorem renderMembersAcc_eq (acc : String) (ms : List (String × Json)) :
       renderMembersAcc acc ms = acc ++ String.ofList (renderMembersL ms) := by
-    cases ms with
-    | nil => simp [renderMembersAcc, renderMembersL]
-    | cons kv ms =>
-        rcases kv with ⟨k, v⟩
-        unfold renderMembersAcc renderMembersL
-        rw [renderMemberSepAcc_eq, renderAcc_eq, push_eq_append, renderStrAcc_eq,
-          ofList_append, ofList_cons, ofList_append, String.append_assoc, String.append_assoc, String.append_assoc]
-  theorem renderMemberSepAcc_eq (acc : String) (ms : List (String × Json)) :
-      renderMemberSepAcc acc ms = acc ++ String.ofList (renderMemberSep ms) := by
-    cases ms with
-    | nil => simp [renderMemberSepAcc, renderMemberSep]
-    | cons kv ms =>
-        rcases kv with ⟨k, v⟩
-        unfold renderMemberSepAcc renderMemberSep
-        rw [renderMemberSepAcc_eq, renderAcc_eq, push_eq_append, renderStrAcc_eq, push_eq_append,
-          ofList_cons, ofList_append, ofList_cons, ofList_append,
-          String.append_assoc, String.append_assoc, String.append_assoc, String.append_assoc]
+    match ms with
+    | [] => simp [renderMembersAcc, renderMembersL]
+    | [(k, v)] =>
+        simp only [renderMembersAcc, renderMembersL, renderAcc_eq, push_eq_append, renderStrAcc_eq,
+          ofList_append, ofList_cons, String.append_assoc]
+    | (k, v) :: kv' :: ms =>
+        rw [renderMembersAcc.eq_def, renderMembersL.eq_def]; dsimp only
+        rw [renderMembersAcc_eq, push_eq_append, renderAcc_eq, push_eq_append, renderStrAcc_eq,
+          ofList_append, ofList_cons, ofList_append, ofList_cons]
+        simp only [String.append_assoc]
 end
 
 theorem renderFast_eq (j : Json) : renderFast j = String.ofList (renderL j) := by

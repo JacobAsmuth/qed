@@ -1,6 +1,6 @@
 import * as initialApp from './app.mjs';
 import * as $ from './qed_rt.mjs';
-import { dom } from './qed_dom.mjs';
+import { dom, applySignalToEl } from './qed_dom.mjs';
 
 const W = 0;
 const textEnc = new TextEncoder(), textDec = new TextDecoder();
@@ -11,24 +11,18 @@ let currentApp = null;
 let listenersBound = false;
 const attached = new Set();
 
-// __qedDevHook
-const devEmit = (kind, detail) => {
-  const h = typeof window !== 'undefined' && window.__qedDevHook;
-  if (h) h(kind, detail);
-};
-const remountApp = (app, stateJson, localsJson, isTimeTravel = false) => {
+const remount = (app = currentApp, stateJson, localsJson, isTimeTravel = false) => {
+  if (!app) return null;
   if (active) active.teardown();
   const root = document.getElementById('app');
   if (root) root.innerHTML = '';
-  const ssrStateEl = document.getElementById('qed-state');
-  if (ssrStateEl) ssrStateEl.remove();
+  document.getElementById('qed-state')?.remove();
   if (typeof stateJson === 'string' && stateJson.length > 0) globalThis.__qedHmrState = stateJson;
   const next = mountApp(app, isTimeTravel);
   if (localsJson && localsJson !== '{}') { try { next.restore(localsJson); } catch (_) {} }
   return next;
 };
-const devRestoreState = (stateJson, localsJson) =>
-  currentApp ? (remountApp(currentApp, stateJson, localsJson, true), true) : false;
+if (typeof window !== 'undefined') window.__qedHost = { remount, active: () => active };
 
 function bindRootListeners() {
   if (listenersBound) return;
@@ -87,8 +81,21 @@ function mountApp(app, isTimeTravel = false) {
   $.assertExterns(app.__externs, $);
   bindRootListeners();
 
-  let devAfter = null;
-  const wrap = (fn, kind, meta) => (...a) => { const r = fn(...a, W); if (devAfter && window.__qedDevHook) devAfter(kind, meta(...a)); return r; };
+  let disposed = false;
+  const aborts = new Map();
+  const emitDev = (ev, extra) => {
+    const h = typeof window !== 'undefined' && window.__qedDevHook;
+    if (!h) return;
+    let state = '', locals = '';
+    try { state = dehydrate() || ''; } catch (_) {}
+    try { locals = localSnapshot() || ''; } catch (_) {}
+    h(ev, { ...extra, state, locals, ts: Date.now() });
+  };
+  const wrap = (fn, kind, meta) => (...a) => {
+    const r = fn(...a, W);
+    if (typeof window !== 'undefined' && window.__qedDevHook) emitDev('action', { kind, ...meta(...a), inFlightHttp: aborts.size });
+    return r;
+  };
   const init             = () => app.qed_init(W);
   const dispatch         = wrap(app.qed_dispatch, 'dispatch', (id) => ({ id }));
   const dispatchStr      = wrap(app.qed_dispatch_str, 'dispatchStr', (id, value) => ({ id, value }));
@@ -114,15 +121,6 @@ function mountApp(app, isTimeTravel = false) {
   g.sig = new Map();
   g.sigVals = new Map();
 
-  let disposed = false;
-  const aborts = new Map();
-  // __qedDevHook
-  devAfter = (kind, meta) => {
-    let state = '', locals = '';
-    try { state = dehydrate() || ''; } catch (_) {}
-    try { locals = localSnapshot() || ''; } catch (_) {}
-    devEmit('action', { kind, ...meta, state, locals, inFlightHttp: aborts.size, ts: Date.now() });
-  };
   const trackAbort = (k) => { const c = new AbortController(); aborts.set(k, c); return c.signal; };
   const timers = {};
   const rawTimers = new Set();
@@ -154,11 +152,7 @@ function mountApp(app, isTimeTravel = false) {
   g.httpSendBytes = (m, u, b, id) => sendHttp(m, u, b, id, { 'Content-Type': 'application/x-protobuf', 'Accept': 'application/x-protobuf' }, async (r) => new Uint8Array(await r.arrayBuffer()), httpBytesDone, (e) => textEnc.encode(String(e)));
   g.setSignal = (name, v) => {
     const s = String(v); g.sigVals.set(name, s); const b = g.sig.get(name);
-    if (!b || !b.el || !b.el.isConnected) return;
-    if (b.attr === 'value') { if (b.el.value !== s) b.el.value = s; }
-    else if (b.attr === 'checked') { const on = (s !== '' && s !== 'false'); if (b.el.checked !== on) b.el.checked = on; }
-    else if (b.attr) { if (b.el.getAttribute(b.attr) !== s) b.el.setAttribute(b.attr, s); }
-    else if (b.el.textContent !== s) b.el.textContent = s;
+    if (b && b.el && b.el.isConnected) applySignalToEl(b.el, b.attr, s);
   };
   g.effect = (kind, a, b, c) => {
     if (disposed) return;
@@ -292,98 +286,9 @@ function mountApp(app, isTimeTravel = false) {
 
   app.__main(W);
   init();
-  // __qedDevHook
-  if (typeof window !== 'undefined') {
-    window.__qedDevRestore = devRestoreState;
-    if (window.__qedDevHook) {
-      let state = '', locals = '';
-      try { state = dehydrate() || ''; } catch (_) {}
-      try { locals = localSnapshot() || ''; } catch (_) {}
-      devEmit('mount', { state, locals, restoreState: devRestoreState, isTimeTravel, ts: Date.now() });
-    }
-  }
+  emitDev('mount', { isTimeTravel });
   return active;
 }
-
-// ---- Dev-Only State-Preserving Hot Swap (`__qedHotReload`, invoked by `qed_dev.mjs`) ----
-
-function captureFocus() {
-  const el = document.activeElement;
-  const root = document.getElementById('app');
-  if (!el || !root || !root.contains(el)) return null;
-  const info = {
-    id: el.id || null,
-    name: el.getAttribute('name') || null,
-    tag: el.tagName,
-    type: el.getAttribute('type') || null,
-    selStart: typeof el.selectionStart === 'number' ? el.selectionStart : null,
-    selEnd: typeof el.selectionEnd === 'number' ? el.selectionEnd : null,
-    idx: Array.prototype.indexOf.call(root.querySelectorAll(el.tagName), el),
-  };
-  return info;
-}
-
-function restoreFocus(info) {
-  if (!info) return;
-  const root = document.getElementById('app');
-  if (!root) return;
-  let target = info.id ? document.getElementById(info.id) : null;
-  if (!target && info.name) target = root.querySelector(`${info.tag.toLowerCase()}[name="${CSS.escape(info.name)}"]`);
-  if (!target && info.idx >= 0) target = root.querySelectorAll(info.tag)[info.idx] || null;
-  if (!target || typeof target.focus !== 'function') return;
-  try {
-    target.focus({ preventScroll: true });
-    if (info.selStart !== null && typeof target.setSelectionRange === 'function') {
-      target.setSelectionRange(info.selStart, info.selEnd ?? info.selStart);
-    }
-  } catch (_) {}
-}
-
-function hotSwapStyles(buildId) {
-  const links = [...document.querySelectorAll('link[rel="stylesheet"]')];
-  const loads = [];
-  for (const oldLink of links) {
-    const rawHref = oldLink.getAttribute('href') || '';
-    if (!rawHref.startsWith('/') || rawHref.startsWith('//')) continue;
-    const baseHref = rawHref.split('?')[0];
-    const nextLink = oldLink.cloneNode(false);
-    nextLink.setAttribute('href', `${baseHref}?t=${encodeURIComponent(buildId)}`);
-    loads.push(new Promise((resolve) => {
-      const done = () => { if (oldLink.parentNode) oldLink.remove(); resolve(); };
-      nextLink.addEventListener('load', done, { once: true });
-      nextLink.addEventListener('error', done, { once: true });
-      oldLink.after(nextLink);
-      setTimeout(done, 1200);
-    }));
-  }
-  return Promise.all(loads);
-}
-
-window.__qedHotReload = async function (buildId, opts = {}) {
-  const kind = opts.kind || 'hmr';
-  if (kind === 'css') {
-    await hotSwapStyles(buildId);
-    return { mode: 'css', preserved: true };
-  }
-  const scrollX = window.scrollX, scrollY = window.scrollY;
-  const focus = captureFocus();
-  let savedState = '';
-  let savedLocals = '';
-  if (active) {
-    try { savedState = active.dehydrate() || ''; } catch (_) {}
-    try { savedLocals = active.snapshot() || ''; } catch (_) {}
-  }
-  const nextApp = await import(`/app.mjs?t=${encodeURIComponent(buildId)}`);
-  await hotSwapStyles(buildId);
-  const next = remountApp(nextApp, savedState, savedLocals);
-  let preserved = false;
-  if (savedState) {
-    try { preserved = next.dehydrate() === savedState; } catch (_) {}
-  }
-  window.scrollTo(scrollX, scrollY);
-  restoreFocus(focus);
-  return { mode: 'hmr', preserved };
-};
 
 export function boot() {
   mountApp(initialApp);

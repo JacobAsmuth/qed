@@ -1,3 +1,5 @@
+import Qed.Json.Basic
+
 open System (FilePath)
 
 def String.cliTrim (s : String) : String :=
@@ -29,6 +31,20 @@ def jsRoot : IO String := do
 
 def takeIdentChars (s : String) : String :=
   (s.takeWhile fun c => c.isAlphanum || c == '.' || c == '_' || c == '\'').toString
+
+/-- Parse top-level `import` / `public import` module names from a Lean source file. -/
+def parseLeanImports (src : String) : Array String := Id.run do
+  let mut imps : Array String := #[]
+  for raw in src.splitOn "\n" do
+    let code := (raw.splitOn "--").headD raw
+    let toks := ((code.replace "\t" " ").splitOn " ").filter (!·.isEmpty)
+    let afterImp := match toks with
+      | "import" :: ds | "public" :: "import" :: ds => ds
+      | _ => []
+    for d in afterImp do
+      let m := takeIdentChars d
+      if !m.isEmpty then imps := imps.push m
+  return imps
 
 private def scanModuleTokens {α : Type} (mod : String) (init : α)
     (onLine : List String → List String → α → Except α α) : IO α := do
@@ -277,26 +293,16 @@ partial def collect (dir : FilePath) (ext : String) (skipDirs : List String := [
     IO (Array FilePath) := do
   if !(← dir.pathExists) then return #[]
   let mut acc : Array FilePath := #[]
-  for entry in (← dir.readDir) do
+  let entries ← try dir.readDir catch _ => pure #[]
+  for entry in entries do
     let p := entry.path
-    if (← p.isDir) then
+    let isD ← try p.isDir catch _ => pure false
+    if isD then
       if (p.fileName.getD "") ∉ skipDirs then
         acc := acc ++ (← collect p ext skipDirs)
     else if p.extension == some ext then
       acc := acc.push p
   return acc
-
-private def escapeJsonStr (s : String) : String := Id.run do
-  let mut out := ""
-  for c in s.toList do
-    if c == '"' then out := out ++ "\\\""
-    else if c == '\\' then out := out ++ "\\\\"
-    else if c == '\n' then out := out ++ "\\n"
-    else if c == '\r' then out := out ++ "\\r"
-    else if c == '\t' then out := out ++ "\\t"
-    else if c.toNat < 32 then pure ()
-    else out := out.push c
-  return out
 
 def writeDevStatusJson (outDir : FilePath) (status : String) (kind : String := "hmr")
     (errText : String := "") (durationMs : Nat := 0) (bumpId : Bool := true)
@@ -310,13 +316,11 @@ def writeDevStatusJson (outDir : FilePath) (status : String) (kind : String := "
       pure id
     else
       pure (← IO.FS.readFile buildIdPath).cliTrim
-  let sseField := if sseUrl.isEmpty then "" else s!",\"sseUrl\":\"{escapeJsonStr sseUrl}\""
-  let json :=
-    s!"\{\"id\":\"{escapeJsonStr idStr}\"," ++
-    s!"\"status\":\"{escapeJsonStr status}\"," ++
-    s!"\"kind\":\"{escapeJsonStr kind}\"," ++
-    s!"\"durationMs\":{durationMs}," ++
-    s!"\"error\":\"{escapeJsonStr errText}\"{sseField}}\n"
+  let fields : List (String × Qed.Json) := [
+    ("id", .str idStr), ("status", .str status), ("kind", .str kind),
+    ("durationMs", .num ⟨Int.ofNat durationMs, 0⟩), ("error", .str errText)
+  ] ++ (if sseUrl.isEmpty then [] else [("sseUrl", .str sseUrl)])
+  let json := Qed.Json.render (.obj fields) ++ "\n"
   let tmp := outDir / "__dev_status.tmp"
   IO.FS.writeFile tmp json
   IO.FS.rename tmp (outDir / "__dev_status")

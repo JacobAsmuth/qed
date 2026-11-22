@@ -22,120 +22,83 @@ private def forbiddenTokens : List String :=
 def findForbiddenTokens (src : String) : Array (Nat × String) := Id.run do
   let cs := src.toList.toArray
   let n := cs.size
+  let at2 (i : Nat) (a b : Char) : Bool := i + 1 < n && cs[i]! == a && cs[i + 1]! == b
+  let stepEsc (i line : Nat) : Nat × Nat :=
+    if i + 1 < n then (i + 2, if cs[i + 1]! == '\n' then line + 1 else line) else (i + 1, line)
   let mut i := 0
   let mut line := 1
   let mut inInterpStr := false
   let mut interpBraces : Array Nat := #[]
   let mut hits : Array (Nat × String) := #[]
   while i < n do
+    let c := cs[i]!
     if inInterpStr then
-      let c := cs[i]!
       if c == '\\' then
-        if i + 1 < n then
-          if cs[i + 1]! == '\n' then line := line + 1
-          i := i + 2
-        else
-          i := i + 1
+        let (ni, nl) := stepEsc i line; i := ni; line := nl
       else if c == '"' then
-        inInterpStr := false
-        i := i + 1
+        inInterpStr := false; i := i + 1
+      else if at2 i '{' '{' then
+        i := i + 2
       else if c == '{' then
-        if i + 1 < n && cs[i + 1]! == '{' then
-          i := i + 2
-        else
-          interpBraces := interpBraces.push 0
-          inInterpStr := false
-          i := i + 1
+        interpBraces := interpBraces.push 0; inInterpStr := false; i := i + 1
       else
         if c == '\n' then line := line + 1
         i := i + 1
-    else
-      let c := cs[i]!
-      if c == '\n' then
-        line := line + 1
-        i := i + 1
-      else if c == '-' && i + 1 < n && cs[i + 1]! == '-' then
-        i := i + 2
-        while i < n && cs[i]! != '\n' do
-          i := i + 1
-      else if c == '/' && i + 1 < n && cs[i + 1]! == '-' then
-        let mut depth := 1
-        i := i + 2
-        while i < n && depth > 0 do
-          let ch := cs[i]!
-          if ch == '\n' then
-            line := line + 1
-            i := i + 1
-          else if ch == '/' && i + 1 < n && cs[i + 1]! == '-' then
-            depth := depth + 1
-            i := i + 2
-          else if ch == '-' && i + 1 < n && cs[i + 1]! == '/' then
-            depth := depth - 1
-            i := i + 2
-          else
-            i := i + 1
-      else if c == '{' && !interpBraces.isEmpty then
-        let top := interpBraces.back!
-        interpBraces := interpBraces.pop.push (top + 1)
-        i := i + 1
-      else if c == '}' && !interpBraces.isEmpty then
-        let top := interpBraces.back!
-        if top == 0 then
-          interpBraces := interpBraces.pop
-          inInterpStr := true
-        else
-          interpBraces := interpBraces.pop.push (top - 1)
-        i := i + 1
-      else if c == '"' then
-        let isBangInterp :=
-          i >= 2 && cs[i - 1]! == '!' &&
-          (cs[i - 2]! == 's' || cs[i - 2]! == 'm') &&
-          (i == 2 || !isLeanIdentCont cs[i - 3]!)
-        let isFInterp :=
-          i >= 1 && cs[i - 1]! == 'f' &&
-          (i == 1 || !isLeanIdentCont cs[i - 2]!)
-        if isBangInterp || isFInterp then
-          inInterpStr := true
-          i := i + 1
-        else
-          i := i + 1
-          while i < n do
-            let ch := cs[i]!
-            if ch == '\\' then
-              if i + 1 < n then
-                if cs[i + 1]! == '\n' then line := line + 1
-                i := i + 2
-              else
-                i := i + 1
-            else if ch == '"' then
-              i := i + 1
-              break
-            else
-              if ch == '\n' then line := line + 1
-              i := i + 1
-      else if c == '\'' && (i == 0 || !isLeanIdentCont cs[i - 1]!) then
-        let mut j := i + 1
-        let mut closed := false
-        if j < n && cs[j]! == '\\' then
-          j := j + 2
-          while j < n && j < i + 10 && cs[j]! != '\n' do
-            if cs[j]! == '\'' then closed := true; j := j + 1; break
-            j := j + 1
-        else if j + 1 < n && cs[j]! != '\n' && cs[j + 1]! == '\'' then
-          closed := true
-          j := j + 2
-        i := if closed then j else i + 1
-      else if isLeanIdentStart c then
-        let start := i
-        let tokLine := line
-        i := i + 1
-        while i < n && isLeanIdentCont cs[i]! do
-          i := i + 1
-        let tok := String.ofList (cs.extract start i).toList
-        if forbiddenTokens.contains tok then
-          hits := hits.push (tokLine, tok)
+    else if c == '\n' then
+      line := line + 1; i := i + 1
+    else if at2 i '-' '-' then
+      i := i + 2
+      while i < n && cs[i]! != '\n' do i := i + 1
+    else if at2 i '/' '-' then
+      let mut depth := 1
+      i := i + 2
+      while i < n && depth > 0 do
+        if cs[i]! == '\n' then line := line + 1; i := i + 1
+        else if at2 i '/' '-' then depth := depth + 1; i := i + 2
+        else if at2 i '-' '/' then depth := depth - 1; i := i + 2
+        else i := i + 1
+    else if (c == '{' || c == '}') && !interpBraces.isEmpty then
+      let top := interpBraces.back!
+      if c == '{' then interpBraces := interpBraces.pop.push (top + 1)
+      else if top == 0 then interpBraces := interpBraces.pop; inInterpStr := true
+      else interpBraces := interpBraces.pop.push (top - 1)
+      i := i + 1
+    else if c == '"' then
+      let isInterp :=
+        (i >= 2 && cs[i - 1]! == '!' && (cs[i - 2]! == 's' || cs[i - 2]! == 'm') && (i == 2 || !isLeanIdentCont cs[i - 3]!)) ||
+        (i >= 1 && cs[i - 1]! == 'f' && (i == 1 || !isLeanIdentCont cs[i - 2]!))
+      i := i + 1
+      if isInterp then inInterpStr := true
       else
-        i := i + 1
+        while i < n do
+          let ch := cs[i]!
+          if ch == '\\' then
+            let (ni, nl) := stepEsc i line; i := ni; line := nl
+          else if ch == '"' then
+            i := i + 1; break
+          else
+            if ch == '\n' then line := line + 1
+            i := i + 1
+    else if c == '\'' && (i == 0 || !isLeanIdentCont cs[i - 1]!) then
+      let mut j := i + 1
+      let mut closed := false
+      if j < n && cs[j]! == '\\' then
+        j := j + 2
+        while j < n && j < i + 10 && cs[j]! != '\n' do
+          if cs[j]! == '\'' then closed := true; j := j + 1; break
+          j := j + 1
+      else if j + 1 < n && cs[j]! != '\n' && cs[j + 1]! == '\'' then
+        closed := true; j := j + 2
+      i := if closed then j else i + 1
+    else if isLeanIdentStart c then
+      let start := i
+      let tokLine := line
+      i := i + 1
+      while i < n && isLeanIdentCont cs[i]! do i := i + 1
+      let tok := String.ofList (cs.extract start i).toList
+      if forbiddenTokens.contains tok then hits := hits.push (tokLine, tok)
+    else
+      i := i + 1
   return hits
 
 def grepForbidden : IO Bool := do
@@ -268,10 +231,13 @@ def buildGraphClean : IO Bool := do
       ok := false
   return ok
 
+private def ensureQedjsEnv (q? : Option QedjsEnv) (needBuild : Bool := true) : IO (Option QedjsEnv) :=
+  match q? with | some e => pure (some e) | none => resolveQedjsEnv (needBuild := needBuild)
+
 def kernelEnvClean (q? : Option QedjsEnv := none) (alreadyBuilt : Bool := false) : IO Bool := do
   let root ← webRoot
-  let hasExamples ← (FilePath.mk "Examples").pathExists
-  let some q ← (match q? with | some e => pure (some e) | none => resolveQedjsEnv (needBuild := !hasExamples)) | return false
+  let hasExamples ← isInRepo
+  let some q ← ensureQedjsEnv q? (!hasExamples) | return false
   if hasExamples then
     let baseMods := #[
       "Qed", "Qed.Driver", "Qed.Server.Native",
@@ -292,8 +258,8 @@ def externsCovered (q? : Option QedjsEnv := none) (alreadyBuilt : Bool := false)
   let rtPath ← runtimeFile "qed_rt.mjs"
   unless (← rtPath.pathExists) do return true
   let mod ← jsRoot
-  let modPath := FilePath.mk ((mod.replace "." "/") ++ ".lean")
-  let hasExamples ← (FilePath.mk "Examples").pathExists
+  let modPath := modLeanPath mod
+  let hasExamples ← isInRepo
   let mut mods : Array String := #[]
   let mut entries : Array String := #[]
   if ← modPath.pathExists then
@@ -316,12 +282,12 @@ def externsCovered (q? : Option QedjsEnv := none) (alreadyBuilt : Bool := false)
     mods := mods.push "Tests.JsGate"
     entries := entries ++ #["JsGate.run", "JsGate.counts", "JsGate.probeCount", "JsGate.names"]
   if entries.isEmpty then return true
-  let some q ← (match q? with | some e => pure (some e) | none => resolveQedjsEnv) | return false
+  let some q ← ensureQedjsEnv q? | return false
   q.run (#["--check-externs", rtPath.toString] ++ mods ++ #["--"] ++ entries) (quiet := true)
 
 def verify (checkExterns : Bool := true) (extraLakeTargets : Array String := #[]) : IO Bool := do
   step "verifying proofs & axioms"
-  let hasExamples ← (FilePath.mk "Examples").pathExists
+  let hasExamples ← isInRepo
   -- Start source-only checks and LEAN_PATH lookup in parallel with `lake build`.
   let tGrep ← IO.asTask grepForbidden
   let tEff ← if hasExamples then IO.asTask effectsCovered else IO.asTask (pure true)

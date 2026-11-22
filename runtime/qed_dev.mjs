@@ -486,6 +486,12 @@
     renderDevTools();
   }
 
+  function resetToLatest() {
+    activeSnapIdx = history.length - 1;
+    timeTravelActive = false;
+    renderDevTools();
+  }
+
   function pushHistory(entry) {
     history.push(entry);
     if (history.length > MAX_HISTORY) {
@@ -493,9 +499,7 @@
       if (pendingPredictIdx >= 0) pendingPredictIdx--;
     }
     if (entry.predict === 'pending') pendingPredictIdx = history.length - 1;
-    activeSnapIdx = history.length - 1;
-    timeTravelActive = false;
-    renderDevTools();
+    resetToLatest();
   }
 
   // ---- Dev-Only State-Preserving Hot Swap (`__qedHotReload` & `__qedDevRestore`) ----
@@ -611,16 +615,7 @@
 
   // Capture initial state if `qed_host.mjs` already booted before `qed_dev.mjs` loaded
   if (window.qed?.dehydrate && history.length === 0) {
-    try {
-      pushHistory({
-        label: 'init',
-        state: window.qed.dehydrate() || '',
-        locals: window.qed.snapshot ? window.qed.snapshot() || '' : '',
-        diff: 'initial state',
-        predict: null,
-        ts: Date.now(),
-      });
-    } catch (_) {}
+    try { window.__qedDevHook('mount', { state: window.qed.dehydrate(), locals: window.qed.snapshot?.() }); } catch (_) {}
   }
 
   // ---- UI Event Listeners ----
@@ -634,10 +629,8 @@
     'clear-actions': () => {
       const cur = currentSnapshot();
       history = cur ? [{ ...cur, label: 'snapshot', diff: 'baseline' }] : [];
-      activeSnapIdx = history.length - 1;
-      timeTravelActive = false;
       pendingPredictIdx = -1;
-      renderDevTools();
+      resetToLatest();
     },
     'copy-err': () => copyFromBtn(lastError || $('errbody').textContent || '', $('copy-err'), 'Copy Error'),
     close: dismissOverlay,
@@ -696,21 +689,12 @@
       connectSse();
     }
 
-    if (lastId === null) {
-      lastId = st.id;
-      lastStatus = st.status;
-      if (st.status === 'error' && st.error) {
-        lastError = st.error;
-        showOverlay(st.error);
-        showToast('error', 'Build failed');
-      } else {
-        $('pill-dot').className = 'dot ok';
-      }
-      return;
-    }
+    const first = lastId === null;
+    if (first) lastId = st.id;
 
     if (st.status === 'building') {
-      if (lastStatus !== 'building') showToast('building', 'Rebuilding…');
+      if (!first && lastStatus !== 'building') showToast('building', 'Rebuilding…');
+      else if (first) $('pill-dot').className = 'dot ok';
       lastStatus = 'building';
       return;
     }
@@ -720,9 +704,11 @@
       const isNewErr = errText !== lastError || lastStatus !== 'error';
       lastStatus = 'error';
       lastError = errText;
-      if (isNewErr) {
+      if (isNewErr && (!first || errText)) {
         showToast('error', 'Build failed');
         if (errText !== overlayDismissedFor) showOverlay(errText);
+      } else if (first) {
+        $('pill-dot').className = 'dot ok';
       }
       return;
     }

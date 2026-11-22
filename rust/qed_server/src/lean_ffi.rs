@@ -16,10 +16,6 @@ extern "C" {
     pub fn qed_lean_io_is_ok(r: *mut LeanObj) -> libc::c_int;
     pub fn qed_lean_io_val(r: *mut LeanObj) -> *mut LeanObj;
     pub fn qed_lean_mk_ctor_1(tag: libc::c_uint, a: *mut LeanObj) -> *mut LeanObj;
-    pub fn qed_lean_mk_opt_none() -> *mut LeanObj;
-    pub fn qed_lean_mk_opt_some(v: *mut LeanObj) -> *mut LeanObj;
-    pub fn qed_lean_mk_except_err_str(msg: *const u8, len: usize) -> *mut LeanObj;
-    pub fn qed_lean_mk_except_ok(v: *mut LeanObj) -> *mut LeanObj;
     pub fn qed_lean_mk_prod(a: *mut LeanObj, b: *mut LeanObj) -> *mut LeanObj;
     pub fn qed_lean_mk_ba(data: *const u8, len: usize) -> *mut LeanObj;
     pub fn qed_lean_ba_ptr(ba: *mut LeanObj) -> *const u8;
@@ -76,13 +72,24 @@ pub unsafe fn mk_ba(data: &[u8]) -> *mut LeanObj { qed_lean_mk_ba(data.as_ptr(),
 pub unsafe fn mk_str(s: &str) -> *mut LeanObj { qed_lean_mk_str_bytes(s.as_ptr(), s.len()) }
 
 #[inline]
+pub unsafe fn mk_opt(v: Option<*mut LeanObj>) -> *mut LeanObj {
+    v.map_or_else(|| qed_lean_box(0), |o| qed_lean_mk_ctor_1(1, o))
+}
+
+#[inline]
+pub unsafe fn mk_io_unit() -> *mut LeanObj { qed_lean_io_mk_ok(qed_lean_box(0)) }
+
+#[inline]
+pub unsafe fn mk_io_bool(b: bool) -> *mut LeanObj { qed_lean_io_mk_ok(qed_lean_box(b as usize)) }
+
+#[inline]
 pub unsafe fn mk_io_except_err(msg: &str) -> *mut LeanObj {
-    qed_lean_io_mk_ok(qed_lean_mk_except_err_str(msg.as_ptr(), msg.len()))
+    qed_lean_io_mk_ok(qed_lean_mk_ctor_1(0, mk_str(msg)))
 }
 
 #[inline]
 pub unsafe fn mk_io_except_ok(val: *mut LeanObj) -> *mut LeanObj {
-    qed_lean_io_mk_ok(qed_lean_mk_except_ok(val))
+    qed_lean_io_mk_ok(qed_lean_mk_ctor_1(1, val))
 }
 
 #[inline]
@@ -106,6 +113,8 @@ impl LeanRef {
     pub unsafe fn new_persistent(ptr: *mut LeanObj) -> Self { qed_lean_mark_persistent(ptr); Self(ptr) }
     #[inline]
     pub unsafe fn clone_ptr(&self) -> *mut LeanObj { qed_lean_inc(self.0); self.0 }
+    #[inline]
+    pub fn into_raw(mut self) -> *mut LeanObj { std::mem::replace(&mut self.0, std::ptr::null_mut()) }
 }
 
 /// Zero-copy owned view of a Lean `ByteArray` passed between handler threads and I/O workers.

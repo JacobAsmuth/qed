@@ -15,6 +15,10 @@ def axiomsManifest : FilePath := "scripts" / "axioms.lean"
 def env (k : String) : IO (Option String) := IO.getEnv k
 def frameworkHome : IO FilePath := return (← env "QED_HOME").getD "."
 def runtimeFile (name : String) : IO FilePath := return (← frameworkHome) / "runtime" / name
+def isInRepo : IO Bool := (FilePath.mk "Examples").pathExists
+def modLeanPath (mod : String) : FilePath := FilePath.mk ((mod.replace "." "/") ++ ".lean")
+def modOleanPath (mod : String) : FilePath :=
+  FilePath.mk ".lake" / "build" / "lib" / "lean" / ((mod.replace "." "/") ++ ".olean")
 
 def webRoot : IO String := do
   if let some r ← env "QED_WEB_ROOT" then return r
@@ -32,13 +36,14 @@ def jsRoot : IO String := do
 def takeIdentChars (s : String) : String :=
   (s.takeWhile fun c => c.isAlphanum || c == '.' || c == '_' || c == '\'').toString
 
+def tokenizeCodeLine (raw : String) : List String :=
+  (((raw.splitOn "--").headD raw).replace "\t" " ").splitOn " " |>.filter (!·.isEmpty)
+
 /-- Parse top-level `import` / `public import` module names from a Lean source file. -/
 def parseLeanImports (src : String) : Array String := Id.run do
   let mut imps : Array String := #[]
   for raw in src.splitOn "\n" do
-    let code := (raw.splitOn "--").headD raw
-    let toks := ((code.replace "\t" " ").splitOn " ").filter (!·.isEmpty)
-    let afterImp := match toks with
+    let afterImp := match tokenizeCodeLine raw with
       | "import" :: ds | "public" :: "import" :: ds => ds
       | _ => []
     for d in afterImp do
@@ -48,7 +53,7 @@ def parseLeanImports (src : String) : Array String := Id.run do
 
 private def scanModuleTokens {α : Type} (mod : String) (init : α)
     (onLine : List String → List String → α → Except α α) : IO α := do
-  let path := FilePath.mk ((mod.replace "." "/") ++ ".lean")
+  let path := modLeanPath mod
   if !(← path.pathExists) then return init
   let src ← IO.FS.readFile path
   let mut depth : Nat := 0
@@ -58,8 +63,7 @@ private def scanModuleTokens {α : Type} (mod : String) (init : α)
     let inComment := depth > 0
     depth := depth + ((raw.splitOn "/-").length - 1) - ((raw.splitOn "-/").length - 1)
     if inComment then continue
-    let code := (raw.splitOn "--").headD raw
-    let toks := ((code.replace "\t" " ").splitOn " ").filter (· != "")
+    let toks := tokenizeCodeLine raw
     match toks with
     | "namespace" :: ns :: _ =>
         let cleanNs := takeIdentChars ns
@@ -82,7 +86,7 @@ def fullstackAppName (mod : String) : IO (Option String) :=
     | _ => .ok none
 
 def ssrAppName (mod : String) : IO (Option String) := do
-  let path := FilePath.mk ((mod.replace "." "/") ++ ".lean")
+  let path := modLeanPath mod
   if !(← path.pathExists) then return none
   let src ← IO.FS.readFile path
   match src.splitOn "Qed.run " with
@@ -146,29 +150,18 @@ private def paint (enabled : Bool) (code s : String) : String :=
     `File.lean:12:4: error: msg` into `(severity, path, line, col, msg)`. -/
 private def parseLeanDiagLine (line : String) : Option (String × String × Nat × Nat × String) := do
   let parseLocMsg (sev rest : String) : Option (String × String × Nat × Nat × String) := do
-    match rest.splitOn ":" with
-    | path :: lnS :: colS :: msgParts =>
-        let ln ← lnS.cliTrim.toNat?
-        let col ← colS.cliTrim.toNat?
-        some (sev, path.cliTrim, ln, col, (String.intercalate ":" msgParts).cliTrim)
-    | _ => none
-  -- Handle `error(lean.xxx): File.lean:12:4: msg`
+    let path :: lnS :: colS :: msgParts := rest.splitOn ":" | none
+    some (sev, path.cliTrim, ← lnS.cliTrim.toNat?, ← colS.cliTrim.toNat?, (String.intercalate ":" msgParts).cliTrim)
   if line.startsWith "error(" then
-    match line.splitOn "): " with
-    | _ :: restParts => return ← parseLocMsg "error" (String.intercalate "): " restParts)
-    | _ => failure
+    let _ :: restParts := line.splitOn "): " | failure
+    return ← parseLocMsg "error" (String.intercalate "): " restParts)
   for (pfx, sev) in [("error:", "error"), ("warning:", "warning")] do
     if line.startsWith pfx then
       if let some r := parseLocMsg sev (line.drop pfx.length).toString.cliTrim then return r
-  -- Handle `File.lean:12:4: error: msg`
-  match line.splitOn ":" with
-  | path :: lnS :: colS :: sevS :: msgParts =>
-      if path.endsWith ".lean" then
-        let sev := sevS.cliTrim
-        if sev == "error" || sev == "warning" then
-          return ← parseLocMsg sev (String.intercalate ":" (path :: lnS :: colS :: msgParts))
-      failure
-  | _ => failure
+  let path :: lnS :: colS :: sevS :: msgParts := line.splitOn ":" | failure
+  let sev := sevS.cliTrim
+  guard (path.endsWith ".lean" && (sev == "error" || sev == "warning"))
+  parseLocMsg sev (String.intercalate ":" (path :: lnS :: colS :: msgParts))
 
 private def readSourceSnippet (path : String) (ln col : Nat) (color : Bool) : IO String := do
   let fp : FilePath := path
@@ -213,28 +206,17 @@ def formatLakeDiagnostics (raw : String) (allowColor : Bool := true) : IO String
   let mut hasPrettyDiag := false
   for line in lines do
     let t := line.cliTrim
-    if t.startsWith "trace: .>" ||
-       t == "error: Lean exited with code 1" ||
-       t == "error: build failed" ||
-       t == "info: stderr:" ||
-       t.startsWith "✔ [" ||
-       t.startsWith "ℹ [" then
-      continue
-    if t == "Some required targets logged failures:" then
-      skipTargetBullets := true
-      continue
+    if ["error: Lean exited with code 1", "error: build failed", "info: stderr:"].contains t ||
+       ["trace: .>", "✔ [", "ℹ ["].any (t.startsWith ·) then continue
+    if t == "Some required targets logged failures:" then skipTargetBullets := true; continue
     if skipTargetBullets then
       if t.startsWith "- " then continue
       else skipTargetBullets := false
-    if t.startsWith "✖ [" then
-      continue
+    if t.startsWith "✖ [" then continue
     match parseLeanDiagLine line with
     | some (sev, path, ln, col, msg) =>
-        if msg == "could not synthesize default value for parameter 'hvalid' using tactics" ||
-           msg == "could not synthesize default value for parameter 'valid_view' using tactics" ||
-           msg == "could not synthesize default value for parameter 'hview' using tactics" ||
-           msg == "could not synthesize default value for parameter 'hpres' using tactics" then
-          continue
+        if ["hvalid", "valid_view", "hview", "hpres"].any (fun p =>
+            msg == s!"could not synthesize default value for parameter '{p}' using tactics") then continue
         hasPrettyDiag := true
         let sevTag := if sev == "error" then paint color "1;31" "error" else paint color "1;33" "warning"
         let locTag := paint color "1" s!"{path}:{ln}:{col}"
@@ -356,9 +338,9 @@ def lakeEnvLeanPath : IO (Option String) := do
     if !trimmed.isEmpty then
       leanPathCache.set (some trimmed)
       return some trimmed
-  let isInRepo ← (FilePath.mk "Examples").pathExists
+  let inRepo ← isInRepo
   let hasPkgs ← (FilePath.mk ".lake" / "packages").pathExists
-  if isInRepo && !hasPkgs then
+  if inRepo && !hasPkgs then
     let o ← IO.Process.output { cmd := "lean", args := #["--print-libdir"] }
     if o.exitCode == 0 then
       let sysLib := o.stdout.cliTrim
@@ -386,10 +368,10 @@ def lakeQueryPaths (targets : Array String) : IO (Option (Array String)) := do
 def resolveQedjsBin (needBuild : Bool := true) : IO (Option FilePath) := do
   let qh ← frameworkHome
   let prebuilt := qh / ".lake" / "build" / "bin" / "qedjs"
-  let isInRepo ← (FilePath.mk "Examples").pathExists
-  if isInRepo && (!needBuild || (← env "QED_PREBUILT") == some "1") && (← prebuilt.pathExists) then
+  let inRepo ← isInRepo
+  if inRepo && (!needBuild || (← env "QED_PREBUILT") == some "1") && (← prebuilt.pathExists) then
     return some prebuilt
-  if !isInRepo && (← prebuilt.pathExists) then
+  if !inRepo && (← prebuilt.pathExists) then
     let tcMatch ← do
       let appTc : FilePath := "lean-toolchain"
       let fwTc := qh / "lean-toolchain"
@@ -397,10 +379,10 @@ def resolveQedjsBin (needBuild : Bool := true) : IO (Option FilePath) := do
         pure ((← IO.FS.readFile appTc).cliTrim == (← IO.FS.readFile fwTc).cliTrim)
       else pure false
     if tcMatch then return some prebuilt
-  let target := if isInRepo then "qedjs" else "qed/qedjs"
+  let target := if inRepo then "qedjs" else "qed/qedjs"
   if needBuild then
     if (← shQuiet "lake" #["build", target]) != 0 then return none
-  if isInRepo && (← prebuilt.pathExists) then
+  if inRepo && (← prebuilt.pathExists) then
     return some prebuilt
   let some paths ← lakeQueryPaths #[target] | return none
   return paths[0]?.map FilePath.mk

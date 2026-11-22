@@ -167,6 +167,18 @@ unsafe fn check_ssrf_lean(addrs: &[SocketAddr], is_blocked_fn: *mut LeanObj) -> 
     Ok(())
 }
 
+fn configure_sock(sock: &TcpStream) {
+    let _ = sock.set_nodelay(true);
+    let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
+}
+
+fn with_active_conn<T>(handle: u64, f: impl FnOnce(&mut OutStream) -> Result<T, String>) -> Result<T, String> {
+    let arc = ACTIVE_CONNS.get(handle).ok_or_else(|| "invalid outbound connection handle".to_owned())?;
+    let res = f(&mut lock_unpoison(&arc).stream);
+    res
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_outbound_acquire(
     is_tls: u8,
@@ -175,61 +187,44 @@ pub unsafe extern "C" fn qed_server_outbound_acquire(
     ssrf_guard: u8,
     is_blocked_fn: *mut LeanObj,
 ) -> *mut LeanObj {
-    let want_tls = is_tls != 0;
-    let host = str_slice(host_obj);
-    if ssrf_guard == 0 {
-        if let Some(conn) = pop_pooled(want_tls, host, port) {
-            return mk_io_except_ok(qed_lean_mk_prod(qed_lean_usize_to_nat(insert_active(conn) as usize), qed_lean_usize_to_nat(1)));
+    let (want_tls, host) = (is_tls != 0, str_slice(host_obj));
+    let res: Result<(u64, usize), String> = (|| {
+        if ssrf_guard == 0 {
+            if let Some(conn) = pop_pooled(want_tls, host, port) {
+                return Ok((insert_active(conn), 1));
+            }
         }
-    }
-    let addrs: Vec<SocketAddr> = match (host, port).to_socket_addrs() {
-        Ok(it) => it.collect(),
-        Err(e) => return mk_io_except_err(&format!("DNS resolution failed for {host}: {e}")),
-    };
-    if ssrf_guard != 0 {
-        if let Err(msg) = check_ssrf_lean(&addrs, is_blocked_fn) { return mk_io_except_err(msg); }
-    }
-    let mut last_err = None;
-    let mut sock = None;
-    for addr in &addrs {
-        match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
-            Ok(s) => { sock = Some(s); break; }
-            Err(e) => last_err = Some(e),
+        let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs()
+            .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?.collect();
+        if ssrf_guard != 0 {
+            check_ssrf_lean(&addrs, is_blocked_fn).map_err(str::to_owned)?;
         }
-    }
-    let Some(sock) = sock else {
-        let msg = last_err.map_or_else(|| format!("TCP connect failed for {host}:{port}"), |e| format!("TCP connect failed for {host}:{port}: {e}"));
-        return mk_io_except_err(&msg);
-    };
-    let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
-    let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
-    let _ = sock.set_nodelay(true);
-    let stream = if want_tls {
-        match wrap_tls(sock, host, "TLS") { Ok(s) => s, Err(e) => return mk_io_except_err(&e) }
-    } else {
-        OutStream::Plain(sock)
-    };
-    let id = insert_active(OutConn { is_tls: want_tls, host: host.to_owned(), port, stream });
-    mk_io_except_ok(qed_lean_mk_prod(qed_lean_usize_to_nat(id as usize), qed_lean_usize_to_nat(0)))
+        let mut last_err = None;
+        let sock = addrs.iter().find_map(|addr| match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
+            Ok(s) => Some(s),
+            Err(e) => { last_err = Some(e); None }
+        }).ok_or_else(|| match last_err {
+            Some(e) => format!("TCP connect failed for {host}:{port}: {e}"),
+            None => format!("TCP connect failed for {host}:{port}"),
+        })?;
+        configure_sock(&sock);
+        let stream = if want_tls { wrap_tls(sock, host, "TLS")? } else { OutStream::Plain(sock) };
+        Ok((insert_active(OutConn { is_tls: want_tls, host: host.to_owned(), port, stream }), 0))
+    })();
+    mk_io_except(res, |(id, reused)| qed_lean_mk_prod(qed_lean_usize_to_nat(id as usize), qed_lean_usize_to_nat(reused)))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_outbound_write_all(handle: u64, data_obj: *mut LeanObj) -> *mut LeanObj {
     let data = ba_slice(data_obj);
-    let res = match ACTIVE_CONNS.get(handle) {
-        Some(arc) => lock_unpoison(&arc).stream.write_all_bytes(data).map_err(|e| format!("write failed: {e}")),
-        None => Err("invalid outbound connection handle".to_owned()),
-    };
+    let res = with_active_conn(handle, |s| s.write_all_bytes(data).map_err(|e| format!("write failed: {e}")));
     mk_io_except(res, |()| qed_lean_box(0))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_outbound_read_some(handle: u64, max_bytes: u32) -> *mut LeanObj {
     let mut buf = vec![0u8; (max_bytes as usize).clamp(1, 65536)];
-    let res = match ACTIVE_CONNS.get(handle) {
-        Some(arc) => lock_unpoison(&arc).stream.read_some_bytes(&mut buf).map_err(|e| format!("read failed: {e}")),
-        None => Err("invalid outbound connection handle".to_owned()),
-    };
+    let res = with_active_conn(handle, |s| s.read_some_bytes(&mut buf).map_err(|e| format!("read failed: {e}")));
     mk_io_except(res, |n| mk_ba(&buf[..n]))
 }
 
@@ -254,8 +249,7 @@ pub unsafe extern "C" fn qed_server_outbound_upgrade_tls(handle: u64, host_obj: 
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_outbound_is_alive(handle: u64) -> *mut LeanObj {
-    let alive = ACTIVE_CONNS.get(handle).is_some_and(|arc| socket_is_alive(lock_unpoison(&arc).stream.raw_fd()));
-    qed_lean_io_mk_ok(qed_lean_box(if alive { 1 } else { 0 }))
+    mk_io_bool(ACTIVE_CONNS.get(handle).is_some_and(|arc| socket_is_alive(lock_unpoison(&arc).stream.raw_fd())))
 }
 
 #[no_mangle]
@@ -273,7 +267,7 @@ pub unsafe extern "C" fn qed_server_outbound_release(handle: u64, keep_alive: u8
             });
         }
     }
-    qed_lean_io_mk_ok(qed_lean_box(0))
+    mk_io_unit()
 }
 
 // ---- Loopback TCP Listener Helpers (Native Server & Test Harnesses) ----
@@ -291,16 +285,15 @@ pub unsafe extern "C" fn qed_server_free_port() -> *mut LeanObj {
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_tcp_listen(port: u16) -> *mut LeanObj {
-    let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) else {
-        return mk_io_except_err(&format!("failed to bind 127.0.0.1:{port}"));
-    };
-    let Ok(addr) = listener.local_addr() else {
-        return mk_io_except_err("failed to query local TCP address");
-    };
-    let _ = listener.set_nonblocking(true);
-    let id = LISTENERS.insert(listener);
-    let pair = qed_lean_mk_prod(qed_lean_box_u64(id), qed_lean_box(addr.port() as usize));
-    mk_io_except_ok(pair)
+    let res: Result<(u64, u16), String> = (|| {
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .map_err(|_| format!("failed to bind 127.0.0.1:{port}"))?;
+        let actual_port = listener.local_addr()
+            .map_err(|_| "failed to query local TCP address".to_owned())?.port();
+        let _ = listener.set_nonblocking(true);
+        Ok((LISTENERS.insert(listener), actual_port))
+    })();
+    mk_io_except(res, |(id, p)| qed_lean_mk_prod(qed_lean_box_u64(id), qed_lean_box(p as usize)))
 }
 
 #[no_mangle]
@@ -313,17 +306,14 @@ pub unsafe extern "C" fn qed_server_tcp_accept(listener_id: u64, timeout_ms: u32
         match step {
             Ok((sock, peer)) => {
                 let _ = sock.set_nonblocking(false);
-                let _ = sock.set_nodelay(true);
-                let _ = sock.set_read_timeout(Some(IO_TIMEOUT));
-                let _ = sock.set_write_timeout(Some(IO_TIMEOUT));
+                configure_sock(&sock);
                 let conn = OutConn {
                     is_tls: false,
                     host: peer.ip().to_string(),
                     port: peer.port(),
                     stream: OutStream::Plain(sock),
                 };
-                let handle = insert_active(conn);
-                return mk_io_except_ok(qed_lean_box_u64(handle));
+                return mk_io_except_ok(qed_lean_box_u64(insert_active(conn)));
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
@@ -339,5 +329,5 @@ pub unsafe extern "C" fn qed_server_tcp_accept(listener_id: u64, timeout_ms: u32
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_tcp_close_listener(listener_id: u64) -> *mut LeanObj {
     LISTENERS.remove(listener_id);
-    qed_lean_io_mk_ok(qed_lean_box(0))
+    mk_io_unit()
 }

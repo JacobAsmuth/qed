@@ -61,9 +61,7 @@ export const UInt16_add = (a, b) => (a + b) & 0xFFFF;
 export const UInt16_mul = (a, b) => Math.imul(a, b) & 0xFFFF;
 export const UInt16_shiftLeft  = (a, b) => (a << (b & 15)) & 0xFFFF;
 export const UInt16_shiftRight = (a, b) => (a & 0xFFFF) >>> (b & 15);
-export const UInt32_mk = (n) => Number(n) >>> 0;
 export const UInt32_ofNat = (n) => Number(n & 0xFFFFFFFFn);
-export const UInt32_ofNatCore = UInt32_ofNat;
 export const UInt32_toNat = (a) => BigInt(a >>> 0);
 export const UInt32_toUInt8 = (a) => a & 0xFF;
 export const UInt32_toUInt64 = (a) => BigInt(a >>> 0);
@@ -75,7 +73,7 @@ export const UInt32_shiftRight = (a, b) => (a >>> (b & 31)) >>> 0;
 export const UInt32_decEq = (a, b) => a === b ? 1 : 0;
 export const UInt32_decLe = (a, b) => a <= b ? 1 : 0;
 export const UInt32_decLt = (a, b) => a < b ? 1 : 0;
-export const UInt64_ofNat = u64, UInt64_ofNatCore = u64, UInt64_ofBitVec = u64, UInt64_toNat = u64;
+export const UInt64_ofNat = u64, UInt64_ofBitVec = u64, UInt64_toNat = u64;
 export const UInt64_add = (a, b) => (BigInt(a) + BigInt(b)) & M64;
 export const UInt64_sub = (a, b) => (BigInt(a) - BigInt(b)) & M64;
 export const UInt64_mul = (a, b) => (BigInt(a) * BigInt(b)) & M64;
@@ -88,7 +86,7 @@ export const UInt64_decEq = (a, b) => u64(a) === u64(b) ? 1 : 0;
 export const UInt64_decLe = (a, b) => u64(a) <= u64(b) ? 1 : 0;
 export const UInt64_decLt = (a, b) => u64(a) < u64(b) ? 1 : 0;
 export const UInt64_toUSize = (a) => Number(BigInt(a) & 0x1FFFFFFFFFFFFFn);
-export const USize_ofNat = (n) => Number(n & 0x1FFFFFFFFFFFFFn), USize_ofNatCore = USize_ofNat;
+export const USize_ofNat = (n) => Number(n & 0x1FFFFFFFFFFFFFn);
 export const USize_toNat = (a) => BigInt(a);
 export const USize_add = (a, b) => a + b;
 export const USize_sub = (a, b) => a - b;
@@ -115,19 +113,20 @@ const owned = (a) => a.r === 1;
 let __markCtr = 0;
 export const refMark = (...a) => { const o = a[a.length - 1]; return (o !== null && typeof o === 'object') ? (o.__m ?? (o.__m = ++__markCtr)) : ++__markCtr; };
 
+const mutArr = (a) => owned(a) ? (a.__m = undefined, a) : own(a.slice());
 export const Array_mkEmpty = (_cap) => own([]);
-export const Array_mkArray = (n, x) => { const k = Number(n); inc(x, k); return own(new Array(k).fill(x)); };
+export const Array_replicate = (n, x) => { const k = Number(n); inc(x, k); return own(new Array(k).fill(x)); };
 export const Array_mk = (l) => own(listToArray(l));
 export const Array_toList = (a) => arrayToList(a);
 export const Array_size = (a) => BigInt(a.length);
 export const Array_usize = (a) => a.length;
-export const Array_get = (a, i) => { const x = a[Number(i)]; inc(x); return x; };
 export const Array_uget = (a, i) => { const x = a[i]; inc(x); return x; };
+export const Array_getInternal = (a, i) => Array_uget(a, Number(i));
 export const Array_push = (a, x) => owned(a) ? (a.__m = undefined, a.push(x), a) : own([...a, x]);
 export const Array_pop = (a) => owned(a) ? (a.__m = undefined, a.pop(), a) : own(a.slice(0, a.length - 1));
-export const Array_uset = (a, i, x) => { const b = owned(a) ? (a.__m = undefined, a) : own(a.slice()); b[i] = x; return b; };
-export const Array_swap = (a, i, j) => { const b = owned(a) ? (a.__m = undefined, a) : own(a.slice()); const t = b[Number(i)]; b[Number(i)] = b[Number(j)]; b[Number(j)] = t; return b; };
-export const Array_set = (a, i, x) => { const b = owned(a) ? (a.__m = undefined, a) : own(a.slice()); b[Number(i)] = x; return b; };
+export const Array_uset = (a, i, x) => { const b = mutArr(a); b[i] = x; return b; };
+export const Array_swap = (a, i, j) => { const b = mutArr(a), x = Number(i), y = Number(j), t = b[x]; b[x] = b[y]; b[y] = t; return b; };
+export const Array_set = (a, i, x) => Array_uset(a, Number(i), x);
 export const Array_setx33 = Array_set;
 
 const ENC = new TextEncoder(), DEC = new TextDecoder(), DEC_FATAL = new TextDecoder('utf-8', { fatal: true });
@@ -180,7 +179,7 @@ export const String_length = (s) => {
 export const String_utf8ByteSize = (s) => BigInt(getStrInfo(s).len);
 export const String_push = (s, c) => s + String.fromCodePoint(c);
 export const String_decEq = (a, b) => a === b ? 1 : 0;
-export const String_decLt = (a, b) => {
+export const String_decidableLT = (a, b) => {
   for (let i = 0, j = 0; i < a.length && j < b.length; ) {
     const cx = a.codePointAt(i), cy = b.codePointAt(j);
     if (cx !== cy) return cx < cy ? 1 : 0;
@@ -246,21 +245,20 @@ export const String_hash = (s) => {
   return (BigInt(h2 >>> 0) << 32n) | BigInt(h1 >>> 0);
 };
 export const String_toUTF8 = (s) => ENC.encode(s);
-export const String_fromUTF8 = (ba, _h) => DEC.decode(ba);
-export const String_validateUTF8 = (ba) => { try { DEC_FATAL.decode(ba); return 1; } catch { return 0; } };
+export const String_ofByteArray = (ba, _h) => DEC.decode(ba);
+export const ByteArray_validateUTF8 = (ba) => { try { DEC_FATAL.decode(ba); return 1; } catch { return 0; } };
 
-function mkCapBytes(cap, used) {
-  const ab = new ArrayBuffer(Math.max(16, cap));
+function mkCapBytes(cap, used, init) {
+  const ab = new ArrayBuffer(cap);
   ab.__used = used;
-  ab.__view = new Uint8Array(ab);
+  const full = ab.__view = new Uint8Array(ab);
+  if (init) init(full);
   return new Uint8Array(ab, 0, used);
 }
-export const ByteArray_mkEmpty = (c) => mkCapBytes(Number(c), 0);
-export const ByteArray_mk = (arr) => {
-  const u = mkCapBytes(arr.length, arr.length);
+export const ByteArray_emptyWithCapacity = (c) => mkCapBytes(Math.max(16, Number(c)), 0);
+export const ByteArray_mk = (arr) => mkCapBytes(Math.max(16, arr.length), arr.length, (u) => {
   for (let i = 0; i < arr.length; i++) u[i] = Number(arr[i]);
-  return u;
-};
+});
 export const ByteArray_data = (ba) => own(Array.from(ba));
 export const ByteArray_push = (ba, b) => {
   const len = ba.length, ab = ba.buffer;
@@ -269,13 +267,7 @@ export const ByteArray_push = (ba, b) => {
     ab.__used = len + 1;
     return new Uint8Array(ab, 0, len + 1);
   }
-  const nab = new ArrayBuffer(Math.max(16, (len + 1) * 2));
-  const full = new Uint8Array(nab);
-  full.set(ba);
-  full[len] = Number(b);
-  nab.__used = len + 1;
-  nab.__view = full;
-  return new Uint8Array(nab, 0, len + 1);
+  return mkCapBytes(Math.max(16, (len + 1) * 2), len + 1, (u) => { u.set(ba); u[len] = Number(b); });
 };
 export const ByteArray_size = (ba) => BigInt(ba.length);
 export const ByteArray_usize = (ba) => ba.length;
@@ -283,26 +275,19 @@ export const ByteArray_get = (ba, i) => ba[Number(i)];
 export const ByteArray_uget = ByteArray_get;
 export const ByteArray_getx33 = (ba, i) => ba[Number(i)] ?? 0;
 export const ByteArray_copySlice = (src, so, dst, dso, len, exact) => {
-  const s = Math.min(Number(so), src.length);
-  const d = Number(dso);
-  const n = Math.min(Number(len), src.length - s);
+  const s = Math.min(Number(so), src.length), d = Number(dso), n = Math.min(Number(len), src.length - s);
   if (n <= 0 && d <= dst.length) return dst;
-  const end = Math.max(dst.length, d + n);
-  const ab = dst.buffer;
+  const end = Math.max(dst.length, d + n), ab = dst.buffer;
   if (d >= dst.length && dst.byteOffset === 0 && ab.__used === dst.length && end <= ab.byteLength) {
     const full = ab.__view || (ab.__view = new Uint8Array(ab));
     if (n > 0) full.set(src.subarray(s, s + n), d);
     ab.__used = end;
     return new Uint8Array(ab, 0, end);
   }
-  const cap = exact ? end : Math.max(16, dst.length * 2, end);
-  const nab = new ArrayBuffer(cap);
-  const full = new Uint8Array(nab);
-  full.set(dst);
-  if (n > 0) full.set(src.subarray(s, s + n), d);
-  nab.__used = end;
-  nab.__view = full;
-  return new Uint8Array(nab, 0, end);
+  return mkCapBytes(exact ? end : Math.max(16, dst.length * 2, end), end, (u) => {
+    u.set(dst);
+    if (n > 0) u.set(src.subarray(s, s + n), d);
+  });
 };
 
 const _f64Buf = new ArrayBuffer(8), _f64View = new DataView(_f64Buf);
@@ -317,14 +302,11 @@ export const Float_ofBits = (b) => {
 };
 
 export const Array_emptyWithCapacity = Array_mkEmpty;
-export const Array_replicate = Array_mkArray;
-export const Array_getInternal = Array_get;
 export const Array_getInternalBorrowed = (a, i) => a[Number(i)];
 export const Array_ugetBorrowed = Array_getInternalBorrowed;
 export const Array_getx33Internal = (_inst, a, i) => { const x = a[Number(i)]; inc(x); return x; };
 export const Array_getx33InternalBorrowed = (_inst, a, i) => a[Number(i)];
 export const Nat_ble = (a, b) => a <= b ? 1 : 0;
-export const String_decidableLT = String_decLt;
 export const Nat_shiftRight = (a, b) => a >> b;
 export const UInt8_decEq = (a, b) => a === b ? 1 : 0;
 export const UInt8_decLt = (a, b) => a < b ? 1 : 0;
@@ -333,7 +315,6 @@ export const UInt32_ofBitVec = (bv) => Number(BigInt(bv) & 0xFFFFFFFFn);
 export const USize_ofNatLT = (n) => Number(n & 0x1FFFFFFFFFFFFFn);
 export const String_ofList = String_mk;
 export const String_toList = String_data;
-export const String_ofByteArray = String_fromUTF8;
 export const String_Internal_append = String_append;
 export const String_Internal_isPrefixOf = (p, s) => s.startsWith(p) ? 1 : 0;
 export const String_Internal_any = (s, f) => { for (const ch of s) { if (app(f, [ch.codePointAt(0)])) return 1; } return 0; };
@@ -357,8 +338,6 @@ export const String_Slice_Pattern_Internal_memcmpStr = (lhs, rhs, lstart, rstart
   }
   return 1;
 };
-export const ByteArray_emptyWithCapacity = ByteArray_mkEmpty;
-export const ByteArray_validateUTF8 = String_validateUTF8;
 
 export const ST_Prim_mkRef   = (a, _w) => ({ v: a });
 export const ST_Prim_Ref_get = (r, _w) => r.v;

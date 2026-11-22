@@ -30,16 +30,6 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-#[inline]
-fn reverse_bits(mut v: u32, n: u8) -> u32 {
-    let mut out = 0u32;
-    for _ in 0..n {
-        out = (out << 1) | (v & 1);
-        v >>= 1;
-    }
-    out
-}
-
 struct BitWriter {
     out: Vec<u8>,
     bit_buf: u64,
@@ -73,12 +63,7 @@ impl BitWriter {
         } else {
             (0xC0u32 + (sym as u32 - 280), 8u8)
         };
-        self.write_bits(reverse_bits(code, bits), bits);
-    }
-
-    #[inline]
-    fn write_huff_dist(&mut self, code: u8) {
-        self.write_bits(reverse_bits(code as u32, 5), 5);
+        self.write_bits(code.reverse_bits() >> (32 - bits), bits);
     }
 
     fn flush_pad(&mut self) {
@@ -94,18 +79,6 @@ impl BitWriter {
 fn lookup_base(bases: &[u16], extra: &[u8], val: u16) -> (usize, u32, u8) {
     let idx = bases.partition_point(|&b| b <= val) - 1;
     (idx, (val - bases[idx]) as u32, extra[idx])
-}
-
-#[inline]
-fn encode_len(len: usize) -> (u16, u32, u8) {
-    let (idx, extra, bits) = lookup_base(&LEN_BASES, &LEN_EXTRA, len as u16);
-    (257 + idx as u16, extra, bits)
-}
-
-#[inline]
-fn encode_dist(dist: usize) -> (u8, u32, u8) {
-    let (idx, extra, bits) = lookup_base(&DIST_BASES, &DIST_EXTRA, dist as u16);
-    (idx as u8, extra, bits)
 }
 
 #[inline]
@@ -167,33 +140,22 @@ pub fn gzip_compress(input: &[u8]) -> Vec<u8> {
                 cand = prev[c & (WINDOW - 1)];
                 steps += 1;
             }
-            if !prev.is_empty() {
-                prev[i & (WINDOW - 1)] = head[h];
-            }
+            prev[i & (WINDOW - 1)] = head[h];
             head[h] = i as u32;
         }
 
         if best_len >= 3 {
-            let (lsym, lextra, lbits) = encode_len(best_len);
-            bw.write_huff_litlen(lsym);
-            if lbits > 0 {
-                bw.write_bits(lextra, lbits);
-            }
-            let (dsym, dextra, dbits) = encode_dist(best_dist);
-            bw.write_huff_dist(dsym);
-            if dbits > 0 {
-                bw.write_bits(dextra, dbits);
-            }
+            let (lidx, lextra, lbits) = lookup_base(&LEN_BASES, &LEN_EXTRA, best_len as u16);
+            bw.write_huff_litlen(257 + lidx as u16);
+            if lbits > 0 { bw.write_bits(lextra, lbits); }
+            let (didx, dextra, dbits) = lookup_base(&DIST_BASES, &DIST_EXTRA, best_dist as u16);
+            bw.write_bits((didx as u32).reverse_bits() >> 27, 5);
+            if dbits > 0 { bw.write_bits(dextra, dbits); }
             // Insert intermediate positions into hash chain for better ratio
-            let end = (i + best_len).min(n.saturating_sub(2));
-            let mut j = i + 1;
-            while j < end {
+            for j in (i + 1)..(i + best_len).min(n.saturating_sub(2)) {
                 let hj = hash3(input, j);
-                if !prev.is_empty() {
-                    prev[j & (WINDOW - 1)] = head[hj];
-                }
+                prev[j & (WINDOW - 1)] = head[hj];
                 head[hj] = j as u32;
-                j += 1;
             }
             i += best_len;
         } else {

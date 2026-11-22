@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -45,24 +45,15 @@ struct RateLimiter {
 
 impl RateLimiter {
     fn from_env() -> Option<Arc<Self>> {
-        let rps = std::env::var("QED_RATE_LIMIT_RPS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(0);
-        if rps == 0 {
-            return None;
-        }
-        let burst = std::env::var("QED_RATE_LIMIT_BURST")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|&b| b > 0)
-            .unwrap_or_else(|| rps.saturating_mul(2).max(1));
-        let shards = std::array::from_fn(|_| Mutex::new(HashMap::new()));
+        let env_u64 = |k| std::env::var(k).ok().and_then(|s| s.trim().parse::<u64>().ok());
+        let rps = env_u64("QED_RATE_LIMIT_RPS").unwrap_or(0);
+        if rps == 0 { return None; }
+        let burst = env_u64("QED_RATE_LIMIT_BURST").filter(|&b| b > 0).unwrap_or_else(|| rps.saturating_mul(2).max(1));
         Some(Arc::new(Self {
             rps,
             burst_milli: burst.saturating_mul(1000),
             epoch: Instant::now(),
-            shards,
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
         }))
     }
 
@@ -173,8 +164,7 @@ struct BcastMsg { topic: String, payload: Vec<u8> }
 enum SubOp { Add(u32, String, String, Vec<u8>), Remove(u32) }
 
 enum HeadOutcome {
-    SendAndClose(WireBytes, usize),
-    SendKeepAlive(WireBytes, usize),
+    Send { wire: WireBytes, body_consumed: usize, keep_alive: bool },
     NeedBody { content_len: usize, keep_alive: bool, req: LeanRef, inline: bool },
     WsUpgrade { resp: WireBytes, ws_ctx: LeanRef },
     Defer,
@@ -285,7 +275,7 @@ pub unsafe extern "C" fn qed_server_ws_broadcast(topic_obj: *mut LeanObj, payloa
         });
         inbox.push_bcast(m.clone());
     }
-    qed_lean_io_mk_ok(qed_lean_box(0))
+    mk_io_unit()
 }
 
 // ---- Dedicated Blocking Handler Pool (Keeps epoll/kqueue Non-Blocking) ----
@@ -371,24 +361,15 @@ impl BlockingPool {
         Arc::new(Self { state, handles: Mutex::new(handles) })
     }
 
-    fn try_submit(&self, job: PoolJob) -> bool {
+    fn submit(&self, job: PoolJob, bounded: bool) -> bool {
         let (lock, cv) = &*self.state;
         let mut q = lock_unpoison(lock);
-        if q.closed || q.jobs.len() >= MAX_POOL_QUEUE {
+        if q.closed || (bounded && q.jobs.len() >= MAX_POOL_QUEUE) {
             return false;
         }
         q.jobs.push_back(job);
         cv.notify_one();
         true
-    }
-
-    fn submit_leave(&self, job: PoolJob) {
-        let (lock, cv) = &*self.state;
-        let mut q = lock_unpoison(lock);
-        if !q.closed {
-            q.jobs.push_back(job);
-            cv.notify_one();
-        }
     }
 
     fn shutdown(&self) {
@@ -439,21 +420,22 @@ fn eval_head(cbs: &Callbacks, head_bytes: &[u8], trailing: &[u8], ip: &str, inli
         }
         let act = qed_lean_io_val(res);
         let out = match qed_lean_obj_tag(act) {
-            0 => HeadOutcome::SendAndClose(WireBytes::from_borrowed(qed_lean_ctor_get(act, 0)), 0),
-            1 => HeadOutcome::SendKeepAlive(WireBytes::from_borrowed(qed_lean_ctor_get(act, 0)), 0),
+            t @ (0 | 1) => HeadOutcome::Send {
+                wire: WireBytes::from_borrowed(qed_lean_ctor_get(act, 0)),
+                body_consumed: 0,
+                keep_alive: t == 1,
+            },
             t @ (2 | 3) => {
                 let cl = qed_lean_usize_of_nat(qed_lean_ctor_get(act, 0));
                 let req_ptr = qed_lean_ctor_get(act, 1);
                 let keep_alive = t == 3;
+                qed_lean_inc(req_ptr);
                 if trailing.len() >= cl {
-                    qed_lean_inc(req_ptr);
                     match eval_body(cbs, req_ptr, &trailing[..cl], ip) {
-                        Some(w) if keep_alive => HeadOutcome::SendKeepAlive(w, cl),
-                        Some(w) => HeadOutcome::SendAndClose(w, cl),
+                        Some(wire) => HeadOutcome::Send { wire, body_consumed: cl, keep_alive },
                         None => HeadOutcome::Fatal,
                     }
                 } else {
-                    qed_lean_inc(req_ptr);
                     if !inline { qed_lean_mark_mt(req_ptr); }
                     HeadOutcome::NeedBody { content_len: cl, keep_alive, req: LeanRef(req_ptr), inline }
                 }
@@ -674,17 +656,18 @@ fn parse_bind_ip(host: &str) -> io::Result<IpAddr> {
     IpAddr::from_str(clean).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid bind IP `{host}`")))
 }
 
+unsafe fn set_sockopt(fd: libc::c_int, level: libc::c_int, name: libc::c_int, val: libc::c_int) {
+    let _ = libc::setsockopt(fd, level, name, &val as *const _ as *const _, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+}
+
 fn create_listener(bind_ip: IpAddr, port: u16, allow_reuseport: bool) -> io::Result<libc::c_int> {
     unsafe {
         let domain = match bind_ip { IpAddr::V4(_) => libc::AF_INET, IpAddr::V6(_) => libc::AF_INET6 };
         let fd = libc::socket(domain, libc::SOCK_STREAM, 0);
         if fd < 0 { return Err(io::Error::last_os_error()); }
-        let one: libc::c_int = 1;
-        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &one as *const _ as *const _, 4);
-        if allow_reuseport {
-            let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &one as *const _ as *const _, 4);
-        }
-        let _ = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const _ as *const _, 4);
+        set_sockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1);
+        if allow_reuseport { set_sockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, 1); }
+        set_sockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
         let bind_rc = match bind_ip {
             IpAddr::V4(v4) => {
                 let mut addr: libc::sockaddr_in = std::mem::zeroed();
@@ -694,10 +677,7 @@ fn create_listener(bind_ip: IpAddr, port: u16, allow_reuseport: bool) -> io::Res
                 libc::bind(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
             }
             IpAddr::V6(v6) => {
-                if v6.is_unspecified() {
-                    let zero: libc::c_int = 0;
-                    let _ = libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &zero as *const _ as *const _, 4);
-                }
+                if v6.is_unspecified() { set_sockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 0); }
                 let mut addr: libc::sockaddr_in6 = std::mem::zeroed();
                 addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
                 addr.sin6_port = port.to_be();
@@ -716,24 +696,9 @@ fn create_listener(bind_ip: IpAddr, port: u16, allow_reuseport: bool) -> io::Res
 }
 
 fn bound_port(fd: libc::c_int) -> u16 {
-    unsafe {
-        let mut storage: libc::sockaddr_storage = std::mem::zeroed();
-        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        if libc::getsockname(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len) != 0 {
-            return 0;
-        }
-        match storage.ss_family as libc::c_int {
-            libc::AF_INET => {
-                let addr = &*(&storage as *const _ as *const libc::sockaddr_in);
-                u16::from_be(addr.sin_port)
-            }
-            libc::AF_INET6 => {
-                let addr = &*(&storage as *const _ as *const libc::sockaddr_in6);
-                u16::from_be(addr.sin6_port)
-            }
-            _ => 0,
-        }
-    }
+    use std::os::fd::FromRawFd;
+    std::mem::ManuallyDrop::new(unsafe { std::net::TcpListener::from_raw_fd(fd) })
+        .local_addr().map_or(0, |a| a.port())
 }
 
 fn peer_ip_string(storage: &libc::sockaddr_storage) -> String {
@@ -893,38 +858,8 @@ impl Conn {
         self.queue_two(poller, &hdr[..hlen + 5], payload)
     }
 
-    fn ready_to_close(&self) -> bool {
-        !self.in_flight && self.tx.is_empty() && (self.close_after_tx || (self.peer_eof && (self.rx.is_empty() || self.is_ws)))
-    }
-}
-
-#[derive(Default)]
-struct TopicSubs {
-    entries: Vec<(u64, u32)>,
-    index: HashMap<(u64, u32), usize>,
-}
-
-impl TopicSubs {
-    fn insert(&mut self, key: (u64, u32)) -> bool {
-        if self.index.contains_key(&key) { return false; }
-        let idx = self.entries.len();
-        self.entries.push(key);
-        self.index.insert(key, idx);
-        true
-    }
-
-    fn remove(&mut self, key: (u64, u32)) -> bool {
-        let Some(idx) = self.index.remove(&key) else { return false };
-        let last = self.entries.pop().unwrap();
-        if idx < self.entries.len() {
-            self.entries[idx] = last;
-            self.index.insert(last, idx);
-        }
-        true
-    }
-
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+    fn ready_to_close(&self, hangup: bool) -> bool {
+        !self.in_flight && self.tx.is_empty() && (self.close_after_tx || ((self.peer_eof || hangup) && (self.rx.is_empty() || self.is_ws)))
     }
 }
 
@@ -937,7 +872,7 @@ struct Worker {
     rate_limiter: Option<Arc<RateLimiter>>,
     next_token: u64,
     conns: HashMap<u64, Conn>,
-    topics: HashMap<String, TopicSubs>,
+    topics: HashMap<String, HashSet<(u64, u32)>>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -954,38 +889,32 @@ impl Conn {
         self.close_step(sent)
     }
 
+    fn finish_write(&mut self, sent: bool, keep_open: bool, can_continue: bool) -> ConnStep {
+        if !sent || !keep_open { self.close_step(sent) }
+        else if self.ready_to_close(false) { ConnStep::Close }
+        else if can_continue && !self.rx.is_empty() { ConnStep::Continue }
+        else { ConnStep::Done }
+    }
+
     fn apply_body_outcome(&mut self, poller: &Poller, resp: Option<WireBytes>, keep_alive: bool) -> ConnStep {
         let sent = resp.as_ref().is_some_and(|w| self.queue_bytes(poller, w.as_slice()));
-        if !sent || !keep_alive {
-            self.close_step(sent)
-        } else if self.ready_to_close() {
-            ConnStep::Close
-        } else if self.rx.is_empty() {
-            ConnStep::Done
-        } else {
-            ConnStep::Continue
-        }
+        self.finish_write(sent, keep_alive, true)
     }
 
     fn apply_head_outcome(&mut self, poller: &Poller, init_frag: &LeanRef, consume_head: usize, outcome: HeadOutcome) -> ConnStep {
+        if consume_head > 0 { self.rx.consume(consume_head); }
         match outcome {
-            HeadOutcome::SendKeepAlive(wire, body_consumed) => {
-                if consume_head + body_consumed > 0 { self.rx.consume(consume_head + body_consumed); }
-                self.apply_body_outcome(poller, Some(wire), true)
-            }
-            HeadOutcome::SendAndClose(wire, body_consumed) => {
-                if consume_head + body_consumed > 0 { self.rx.consume(consume_head + body_consumed); }
-                self.apply_body_outcome(poller, Some(wire), false)
+            HeadOutcome::Send { wire, body_consumed, keep_alive } => {
+                if body_consumed > 0 { self.rx.consume(body_consumed); }
+                self.apply_body_outcome(poller, Some(wire), keep_alive)
             }
             HeadOutcome::NeedBody { content_len, keep_alive, req, inline } => {
-                if consume_head > 0 { self.rx.consume(consume_head); }
                 self.pending_body = Some(PendingBody { content_len, keep_alive, req, inline });
                 if self.rx.len() >= content_len { ConnStep::Continue }
                 else if self.peer_eof { ConnStep::Close }
                 else { ConnStep::Done }
             }
             HeadOutcome::WsUpgrade { resp, ws_ctx } => {
-                if consume_head > 0 { self.rx.consume(consume_head); }
                 if !self.queue_bytes(poller, resp.as_slice()) {
                     self.close_after_tx = true;
                     return ConnStep::Close;
@@ -998,17 +927,14 @@ impl Conn {
                 self.last_ping = now;
                 if self.rx.is_empty() { ConnStep::Done } else { ConnStep::Continue }
             }
-            HeadOutcome::Defer | HeadOutcome::Fatal => {
-                if consume_head > 0 { self.rx.consume(consume_head); }
-                self.close_step(true)
-            }
+            HeadOutcome::Defer | HeadOutcome::Fatal => self.close_step(true),
         }
     }
 }
 
-fn topic_remove_from(topics: &mut HashMap<String, TopicSubs>, inbox: &WorkerInbox, topic: &str, token: u64, sub_id: u32) {
+fn topic_remove_from(topics: &mut HashMap<String, HashSet<(u64, u32)>>, inbox: &WorkerInbox, topic: &str, token: u64, sub_id: u32) {
     if let Some(subs) = topics.get_mut(topic) {
-        if subs.remove((token, sub_id)) {
+        if subs.remove(&(token, sub_id)) {
             inbox.ws_subs.fetch_sub(1, Ordering::Release);
         }
         if subs.is_empty() { topics.remove(topic); }
@@ -1016,8 +942,18 @@ fn topic_remove_from(topics: &mut HashMap<String, TopicSubs>, inbox: &WorkerInbo
 }
 
 impl Worker {
-    fn topic_remove(&mut self, topic: &str, token: u64, sub_id: u32) {
-        topic_remove_from(&mut self.topics, &self.inbox, topic, token, sub_id);
+    fn spawn_and_run(listen_fd: libc::c_int, inbox: Arc<WorkerInbox>, pool: Arc<BlockingPool>, cbs: Arc<Callbacks>, rate_limiter: Option<Arc<RateLimiter>>) {
+        let Ok(poller) = Poller::new() else {
+            eprintln!("✗ failed to initialize poller");
+            unsafe { libc::close(listen_fd) };
+            return;
+        };
+        poller.add_read(listen_fd, TOKEN_LISTEN);
+        if inbox.wake_rfd >= 0 { poller.add_read(inbox.wake_rfd, TOKEN_WAKE); }
+        Self {
+            poller, listen_fd, inbox, pool, cbs, rate_limiter,
+            next_token: 16, conns: HashMap::new(), topics: HashMap::new(),
+        }.run();
     }
 
     fn accept_all(&mut self) {
@@ -1028,8 +964,7 @@ impl Worker {
             if fd < 0 { break; }
             if self.conns.len() >= MAX_WORKER_CONNS { unsafe { libc::close(fd) }; continue; }
             set_nonblocking(fd);
-            let one: libc::c_int = 1;
-            unsafe { libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const _ as *const _, 4) };
+            unsafe { set_sockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1) };
             let token = self.next_token;
             self.next_token += 1;
             if !self.poller.add_read(fd, token) { unsafe { libc::close(fd) }; continue; }
@@ -1049,12 +984,12 @@ impl Worker {
         unsafe { libc::close(conn.fd) };
         if let Some(ws_ctx) = conn.ws_ctx {
             for sub in conn.subs {
-                self.topic_remove(&sub.topic, token, sub.sub_id);
-                self.pool.submit_leave(PoolJob::WsLeave {
+                topic_remove_from(&mut self.topics, &self.inbox, &sub.topic, token, sub.sub_id);
+                let _ = self.pool.submit(PoolJob::WsLeave {
                     ws_ctx: ws_ctx.clone(),
                     channel: sub.channel,
                     params: sub.params,
-                });
+                }, false);
             }
         }
     }
@@ -1073,12 +1008,10 @@ impl Worker {
             let Worker { conns, topics, poller, .. } = self;
             for msg in bcast_msgs {
                 let Some(targets) = topics.get(&msg.topic) else { continue };
-                for &(token, sub_id) in &targets.entries {
+                for &(token, sub_id) in targets {
                     if let Some(c) = conns.get_mut(&token) {
-                        if c.is_ws && !c.close_after_tx {
-                            if !c.queue_ws_event(poller, sub_id, &msg.payload) {
-                                to_close.push(token);
-                            }
+                        if c.is_ws && !c.close_after_tx && !c.queue_ws_event(poller, sub_id, &msg.payload) {
+                            to_close.push(token);
                         }
                     }
                 }
@@ -1095,24 +1028,21 @@ impl Worker {
         }
     }
 
+    fn finish_http_done(&mut self, token: u64, f: impl FnOnce(&mut Conn, &Poller, &LeanRef) -> ConnStep) {
+        let step = self.conns.get_mut(&token).map_or(ConnStep::Done, |conn| {
+            conn.in_flight = false;
+            conn.last_active = Instant::now();
+            f(conn, &self.poller, &self.cbs.init_frag)
+        });
+        self.finish_step(token, step);
+    }
+
     fn handle_done_event(&mut self, ev: DoneEvent) {
         match ev {
-            DoneEvent::Head { token, outcome } => {
-                let step = if let Some(conn) = self.conns.get_mut(&token) {
-                    conn.in_flight = false;
-                    conn.last_active = Instant::now();
-                    conn.apply_head_outcome(&self.poller, &self.cbs.init_frag, 0, outcome)
-                } else { ConnStep::Done };
-                self.finish_step(token, step);
-            }
-            DoneEvent::Body { token, resp, keep_alive } => {
-                let step = if let Some(conn) = self.conns.get_mut(&token) {
-                    conn.in_flight = false;
-                    conn.last_active = Instant::now();
-                    conn.apply_body_outcome(&self.poller, resp, keep_alive)
-                } else { ConnStep::Done };
-                self.finish_step(token, step);
-            }
+            DoneEvent::Head { token, outcome } =>
+                self.finish_http_done(token, |c, p, f| c.apply_head_outcome(p, f, 0, outcome)),
+            DoneEvent::Body { token, resp, keep_alive } =>
+                self.finish_http_done(token, |c, p, _| c.apply_body_outcome(p, resp, keep_alive)),
             DoneEvent::WsStep { token, ws_ctx, consumed, out_wire, close, new_frag, ops } => {
                 let step = {
                     let Worker { conns, topics, inbox, poller, pool, .. } = self;
@@ -1120,11 +1050,7 @@ impl Worker {
                         // Connection closed while step was in flight: clean up any newly joined channels.
                         for op in ops {
                             if let SubOp::Add(_, _, channel, params) = op {
-                                pool.submit_leave(PoolJob::WsLeave {
-                                    ws_ctx: ws_ctx.clone(),
-                                    channel,
-                                    params,
-                                });
+                                let _ = pool.submit(PoolJob::WsLeave { ws_ctx: ws_ctx.clone(), channel, params }, false);
                             }
                         }
                         return;
@@ -1148,16 +1074,8 @@ impl Worker {
                         conn.last_active = Instant::now();
                     }
                     if let Some(f) = new_frag { conn.frag = Some(f); }
-                    let sent = out_wire.as_ref().map_or(true, |w| conn.queue_bytes(poller, w.as_slice()));
-                    if !sent || close {
-                        conn.close_step(sent)
-                    } else if conn.ready_to_close() {
-                        ConnStep::Close
-                    } else if !conn.rx.is_empty() && consumed > 0 {
-                        ConnStep::Continue
-                    } else {
-                        ConnStep::Done
-                    }
+                    let sent = out_wire.as_ref().is_none_or(|w| conn.queue_bytes(poller, w.as_slice()));
+                    conn.finish_write(sent, !close, consumed > 0)
                 };
                 self.finish_step(token, step);
             }
@@ -1204,14 +1122,14 @@ impl Worker {
                 let rx_bytes = conn.rx.as_slice().to_vec();
                 let subs = conn.subs.iter().map(|s| (s.sub_id, s.channel.clone(), s.params.clone())).collect();
                 conn.in_flight = true;
-                if !self.pool.try_submit(PoolJob::WsStep {
+                if !self.pool.submit(PoolJob::WsStep {
                     token,
                     ws_ctx,
                     rx_bytes,
                     frag,
                     subs,
                     inbox: self.inbox.clone(),
-                }) {
+                }, true) {
                     conn.in_flight = false;
                     self.close_conn(token);
                 }
@@ -1242,14 +1160,14 @@ impl Worker {
                 conn.rx.consume(pb.content_len);
                 let ip = conn.ip.clone();
                 conn.in_flight = true;
-                if !self.pool.try_submit(PoolJob::Body {
+                if !self.pool.submit(PoolJob::Body {
                     token,
                     req: pb.req,
                     body,
                     ip,
                     keep_alive: pb.keep_alive,
                     inbox: self.inbox.clone(),
-                }) {
+                }, true) {
                     self.reject_overloaded(token);
                 }
                 return;
@@ -1295,13 +1213,13 @@ impl Worker {
                     };
                     let ip = conn.ip.clone();
                     conn.in_flight = true;
-                    if !self.pool.try_submit(PoolJob::Head {
+                    if !self.pool.submit(PoolJob::Head {
                         token,
                         head_bytes,
                         trailing,
                         ip,
                         inbox: self.inbox.clone(),
-                    }) {
+                    }, true) {
                         self.reject_overloaded(token);
                     }
                     return;
@@ -1340,16 +1258,14 @@ impl Worker {
         } else { return; }
         if closed { self.close_conn(token); return; }
         if got_bytes { self.process_rx(token); }
-        if self.conns.get(&token).is_some_and(|c| {
-            !c.in_flight && c.tx.is_empty() && (c.close_after_tx || ((c.peer_eof || hangup) && (c.rx.is_empty() || c.is_ws)))
-        }) {
+        if self.conns.get(&token).is_some_and(|c| c.ready_to_close(hangup)) {
             self.close_conn(token);
         }
     }
 
     fn handle_writable(&mut self, token: u64) {
         let close = self.conns.get_mut(&token).is_some_and(|c| {
-            !c.flush_tx(&self.poller) || c.ready_to_close()
+            !c.flush_tx(&self.poller) || c.ready_to_close(false)
         });
         if close { self.close_conn(token); }
     }
@@ -1403,11 +1319,7 @@ pub unsafe extern "C" fn qed_server_run(
         Ok(ip) => ip,
         Err(e) => {
             eprintln!("✗ {e}");
-            qed_lean_dec(init_frag);
-            qed_lean_dec(on_head);
-            qed_lean_dec(on_body);
-            qed_lean_dec(on_ws_bytes);
-            qed_lean_dec(on_ws_leave);
+            for obj in [init_frag, on_head, on_body, on_ws_bytes, on_ws_leave] { qed_lean_dec(obj); }
             return qed_lean_io_mk_ok(qed_lean_box_u32(1));
         }
     };
@@ -1464,27 +1376,6 @@ pub unsafe extern "C" fn qed_server_run(
     let _ = io::stdout().flush();
 
     let rate_limiter = RateLimiter::from_env();
-    let run_worker = |lfd: libc::c_int, inbox: Arc<WorkerInbox>, pool_c: Arc<BlockingPool>, cbs_c: Arc<Callbacks>, rl_c: Option<Arc<RateLimiter>>| {
-        let Ok(poller) = Poller::new() else {
-            eprintln!("✗ failed to initialize poller");
-            unsafe { libc::close(lfd) };
-            return;
-        };
-        poller.add_read(lfd, TOKEN_LISTEN);
-        if inbox.wake_rfd >= 0 { poller.add_read(inbox.wake_rfd, TOKEN_WAKE); }
-        Worker {
-            poller,
-            listen_fd: lfd,
-            inbox,
-            pool: pool_c,
-            cbs: cbs_c,
-            rate_limiter: rl_c,
-            next_token: 16,
-            conns: HashMap::new(),
-            topics: HashMap::new(),
-        }.run();
-    };
-
     let handles: Vec<_> = (1..num_workers).map(|i| {
         let (inbox, pool_c, cbs_c, rl_c) = (inboxes[i as usize].clone(), pools[i as usize].clone(), cbs.clone(), rate_limiter.clone());
         #[cfg(not(target_os = "linux"))]
@@ -1493,13 +1384,13 @@ pub unsafe extern "C" fn qed_server_run(
             unsafe { lean_initialize_thread() };
             #[cfg(target_os = "linux")]
             match create_listener(bind_ip, port, true) {
-                Ok(lfd) => run_worker(lfd, inbox, pool_c, cbs_c, rl_c),
+                Ok(lfd) => Worker::spawn_and_run(lfd, inbox, pool_c, cbs_c, rl_c),
                 Err(e) => eprintln!("✗ worker {i} failed to bind {bind_ip}:{port}: {e}"),
             }
             #[cfg(not(target_os = "linux"))]
             {
                 if shared_fd >= 0 {
-                    run_worker(shared_fd, inbox, pool_c, cbs_c, rl_c);
+                    Worker::spawn_and_run(shared_fd, inbox, pool_c, cbs_c, rl_c);
                 } else {
                     eprintln!("✗ worker {i} failed to dup listener socket");
                 }
@@ -1508,7 +1399,7 @@ pub unsafe extern "C" fn qed_server_run(
         })
     }).collect();
 
-    run_worker(first_fd, inboxes[0].clone(), pools[0].clone(), cbs.clone(), rate_limiter);
+    Worker::spawn_and_run(first_fd, inboxes[0].clone(), pools[0].clone(), cbs.clone(), rate_limiter);
     STOP.store(true, Ordering::SeqCst);
     for inbox in &inboxes { inbox.force_wake(); }
     for h in handles { let _ = h.join(); }

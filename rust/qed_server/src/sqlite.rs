@@ -91,13 +91,26 @@ struct ActiveSqliteTx {
     conn: Option<Connection>,
 }
 
-impl Drop for ActiveSqliteTx {
-    fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
+impl ActiveSqliteTx {
+    fn finish(&mut self, commit: bool) -> Result<(), String> {
+        let Some(conn) = self.conn.take() else {
+            return Err("sqlite transaction already finished".to_owned());
+        };
+        let res = if commit {
+            conn.execute_batch("COMMIT;").map_err(|e| format!("sqlite COMMIT failed: {e}"))
+        } else {
+            Ok(())
+        };
+        if !commit || res.is_err() {
             let _ = conn.execute_batch("ROLLBACK;");
-            self.pool.return_writer(conn);
         }
+        self.pool.return_writer(conn);
+        res
     }
+}
+
+impl Drop for ActiveSqliteTx {
+    fn drop(&mut self) { let _ = self.finish(false); }
 }
 
 static SQLITE_POOL: OnceLock<Mutex<HashMap<String, Arc<SqliteDbPool>>>> = OnceLock::new();
@@ -215,12 +228,10 @@ unsafe fn exec_on_conn(conn: &Connection, sql: &str, params: &[Value]) -> Result
                 let v = row.get_ref(ci).map_err(|e| format!("sqlite col {ci} failed: {e}"))?;
                 row_arr.0 = qed_lean_array_push(row_arr.0, sqlite_val_to_lean(v));
             }
-            let row_ptr = std::mem::replace(&mut row_arr.0, std::ptr::null_mut());
-            rows_arr.0 = qed_lean_array_push(rows_arr.0, row_ptr);
+            rows_arr.0 = qed_lean_array_push(rows_arr.0, row_arr.into_raw());
             row_count += 1;
         }
-        let rows_ptr = std::mem::replace(&mut rows_arr.0, std::ptr::null_mut());
-        Ok(qed_lean_mk_prod(rows_ptr, qed_lean_usize_to_nat(row_count)))
+        Ok(qed_lean_mk_prod(rows_arr.into_raw(), qed_lean_usize_to_nat(row_count)))
     } else {
         let affected = stmt.execute(params_from_iter(params.iter()))
             .map_err(|e| format!("sqlite execute failed: {e}"))?;
@@ -303,31 +314,16 @@ pub unsafe extern "C" fn qed_server_sqlite_tx_exec(
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_sqlite_tx_commit(tx_id: u64) -> *mut LeanObj {
-    let res: Result<(), String> = (|| {
-        let tx_arc = ACTIVE_TXS.remove(tx_id)
-            .ok_or_else(|| format!("invalid sqlite transaction handle {tx_id}"))?;
-        let mut tx = lock_unpoison(&tx_arc);
-        let Some(conn) = tx.conn.take() else {
-            return Err("sqlite transaction already finished".to_owned());
-        };
-        let r = conn.execute_batch("COMMIT;").map_err(|e| format!("sqlite COMMIT failed: {e}"));
-        if r.is_err() {
-            let _ = conn.execute_batch("ROLLBACK;");
-        }
-        tx.pool.return_writer(conn);
-        r
-    })();
+    let res = ACTIVE_TXS.remove(tx_id)
+        .ok_or_else(|| format!("invalid sqlite transaction handle {tx_id}"))
+        .and_then(|tx| lock_unpoison(&tx).finish(true));
     mk_io_except(res, |()| qed_lean_box(0))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_sqlite_tx_rollback(tx_id: u64) -> *mut LeanObj {
-    if let Some(tx_arc) = ACTIVE_TXS.remove(tx_id) {
-        let mut tx = lock_unpoison(&tx_arc);
-        if let Some(conn) = tx.conn.take() {
-            let _ = conn.execute_batch("ROLLBACK;");
-            tx.pool.return_writer(conn);
-        }
+    if let Some(tx) = ACTIVE_TXS.remove(tx_id) {
+        let _ = lock_unpoison(&tx).finish(false);
     }
-    qed_lean_io_mk_ok(qed_lean_box(0))
+    mk_io_unit()
 }

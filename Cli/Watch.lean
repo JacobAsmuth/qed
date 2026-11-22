@@ -43,10 +43,8 @@ def WatchEvents.any (ev : WatchEvents) : Bool :=
   ev.lean || ev.css || ev.runtime
 
 def FileWatcher.open (projectDir : String) (runtimeDir : String := "")
-    (skipDirs : Array String := #[]) : IO (Except String FileWatcher) := do
-  match ← openRaw projectDir runtimeDir skipDirs with
-  | .ok h    => return .ok { handle := h }
-  | .error e => return .error e
+    (skipDirs : Array String := #[]) : IO (Except String FileWatcher) :=
+  (·.map fun handle => { handle }) <$> openRaw projectDir runtimeDir skipDirs
 
 def FileWatcher.wait (w : FileWatcher) (timeoutMs : UInt32 := 1000) : IO WatchEvents := do
   let mask ← waitRaw w.handle timeoutMs
@@ -67,10 +65,8 @@ structure DevSseServer where
 def DevSseServer.url (s : DevSseServer) : String :=
   s!"http://127.0.0.1:{s.port}/events"
 
-def DevSseServer.start (port : UInt16 := 0) : IO (Except String DevSseServer) := do
-  match ← sseStartRaw port with
-  | .ok (h, p) => return .ok { handle := h, port := p }
-  | .error e   => return .error e
+def DevSseServer.start (port : UInt16 := 0) : IO (Except String DevSseServer) :=
+  (·.map fun (handle, port) => { handle, port }) <$> sseStartRaw port
 
 def DevSseServer.publish (s : DevSseServer) (jsonPayload : String) : IO Unit :=
   ssePublishRaw s.handle jsonPayload

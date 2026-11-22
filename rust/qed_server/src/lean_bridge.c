@@ -13,12 +13,6 @@ lean_object *qed_lean_mk_ctor_1(unsigned tag, lean_object *a) {
     lean_ctor_set(o, 0, a);
     return o;
 }
-lean_object *qed_lean_mk_opt_none(void) { return lean_box(0); }
-lean_object *qed_lean_mk_opt_some(lean_object *v) { return qed_lean_mk_ctor_1(1, v); }
-lean_object *qed_lean_mk_except_err_str(const char *msg, size_t len) {
-    return qed_lean_mk_ctor_1(0, lean_mk_string_from_bytes(msg, len));
-}
-lean_object *qed_lean_mk_except_ok(lean_object *v) { return qed_lean_mk_ctor_1(1, v); }
 lean_object *qed_lean_mk_prod(lean_object *a, lean_object *b) {
     lean_object *o = lean_alloc_ctor(0, 2, 0);
     lean_ctor_set(o, 0, a);

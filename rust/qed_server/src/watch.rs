@@ -89,7 +89,7 @@ mod os_watch {
 
     pub struct OsWatcher {
         fd: i32,
-        skip: HashSet<String>,
+        skip: Arc<HashSet<String>>,
         wds: HashMap<i32, (PathBuf, bool)>,
         paths: HashSet<PathBuf>,
     }
@@ -102,37 +102,32 @@ mod os_watch {
         }
     }
 
+    fn poll_in(fd: i32, timeout_ms: i32) -> i32 {
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        unsafe { libc::poll(&mut pfd, 1, timeout_ms) }
+    }
+
     impl OsWatcher {
         pub fn open(project_dir: &str, runtime_dir: &str, skip: HashSet<String>) -> Result<Self, String> {
             let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
             if fd < 0 {
                 return Err(format!("inotify_init1 failed: {}", std::io::Error::last_os_error()));
             }
-            let mut w = Self { fd, skip, wds: HashMap::new(), paths: HashSet::new() };
+            let mut w = Self { fd, skip: Arc::new(skip), wds: HashMap::new(), paths: HashSet::new() };
             watch_roots(project_dir, runtime_dir, |p, is_rt| { let _ = w.add_tree(p, is_rt, false); });
             Ok(w)
         }
 
-        fn add_single_dir(
-            fd: i32,
-            wds: &mut HashMap<i32, (PathBuf, bool)>,
-            paths: &mut HashSet<PathBuf>,
-            dir: &Path,
-            is_runtime: bool,
-        ) -> Result<(), String> {
+        fn add_single_dir(&mut self, dir: &Path, is_runtime: bool) -> Result<(), String> {
             let canonical = dir.to_path_buf();
-            if paths.contains(&canonical) {
-                return Ok(());
-            }
-            let Ok(cpath) = CString::new(dir.as_os_str().as_bytes()) else {
-                return Ok(());
-            };
-            let wd = unsafe { libc::inotify_add_watch(fd, cpath.as_ptr(), WATCH_MASK) };
+            if self.paths.contains(&canonical) { return Ok(()); }
+            let Ok(cpath) = CString::new(dir.as_os_str().as_bytes()) else { return Ok(()); };
+            let wd = unsafe { libc::inotify_add_watch(self.fd, cpath.as_ptr(), WATCH_MASK) };
             if wd < 0 {
                 return Err(format!("inotify_add_watch({}) failed: {}", dir.display(), std::io::Error::last_os_error()));
             }
-            wds.insert(wd, (canonical.clone(), is_runtime));
-            paths.insert(canonical);
+            self.wds.insert(wd, (canonical.clone(), is_runtime));
+            self.paths.insert(canonical);
             Ok(())
         }
 
@@ -141,9 +136,9 @@ mod os_watch {
         /// returns a bitmask of matching files already present inside.
         fn add_tree(&mut self, dir: &Path, is_runtime: bool, report_existing: bool) -> u32 {
             let mut mask = 0u32;
-            let (fd, wds, paths, skip) = (self.fd, &mut self.wds, &mut self.paths, &self.skip);
-            walk_tree(dir, is_runtime, skip, |p, fmask| match fmask {
-                None => Self::add_single_dir(fd, wds, paths, p, is_runtime).is_ok(),
+            let skip = self.skip.clone();
+            walk_tree(dir, is_runtime, &skip, |p, fmask| match fmask {
+                None => self.add_single_dir(p, is_runtime).is_ok(),
                 Some(m) => { if report_existing { mask |= m; } true }
             });
             mask
@@ -215,34 +210,16 @@ mod os_watch {
                     return 0;
                 }
                 let rem_ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
-                let mut pfd = libc::pollfd {
-                    fd: self.fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let rc = unsafe { libc::poll(&mut pfd, 1, rem_ms) };
+                let rc = poll_in(self.fd, rem_ms);
                 if rc < 0 {
-                    let err = crate::last_errno();
-                    if err == libc::EINTR {
-                        continue;
-                    }
+                    if crate::last_errno() == libc::EINTR { continue; }
                     return CHANGE_ERROR;
                 }
-                if rc == 0 {
-                    return 0;
-                }
+                if rc == 0 { return 0; }
                 mask |= self.drain_events();
             }
             // Brief 20ms coalesce window for atomic editor saves (write temp + rename).
-            let mut pfd = libc::pollfd {
-                fd: self.fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let rc = unsafe { libc::poll(&mut pfd, 1, 20) };
-            if rc > 0 {
-                mask |= self.drain_events();
-            }
+            if poll_in(self.fd, 20) > 0 { mask |= self.drain_events(); }
             mask
         }
     }
@@ -275,7 +252,7 @@ mod os_watch {
 
     pub struct OsWatcher {
         kq: i32,
-        skip: HashSet<String>,
+        skip: Arc<HashSet<String>>,
         entries: HashMap<i32, WatchedEntry>,
         paths: HashSet<PathBuf>,
     }
@@ -297,30 +274,16 @@ mod os_watch {
             if kq < 0 {
                 return Err(format!("kqueue failed: {}", std::io::Error::last_os_error()));
             }
-            let mut w = Self { kq, skip, entries: HashMap::new(), paths: HashSet::new() };
+            let mut w = Self { kq, skip: Arc::new(skip), entries: HashMap::new(), paths: HashSet::new() };
             watch_roots(project_dir, runtime_dir, |p, is_rt| { let _ = w.add_tree(p, is_rt, false); });
             Ok(w)
         }
 
-        fn register_path_raw(
-            kq: i32,
-            entries: &mut HashMap<i32, WatchedEntry>,
-            paths: &mut HashSet<PathBuf>,
-            path: &Path,
-            is_dir: bool,
-            is_runtime: bool,
-            file_mask: u32,
-        ) -> bool {
-            if entries.len() >= MAX_KQ_FDS || paths.contains(path) {
-                return false;
-            }
-            let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
-                return false;
-            };
+        fn register_path(&mut self, path: &Path, is_dir: bool, is_runtime: bool, file_mask: u32) -> bool {
+            if self.entries.len() >= MAX_KQ_FDS || self.paths.contains(path) { return false; }
+            let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else { return false; };
             let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_EVTONLY | libc::O_CLOEXEC) };
-            if fd < 0 {
-                return false;
-            }
+            if fd < 0 { return false; }
             let ev = libc::kevent {
                 ident: fd as usize,
                 filter: libc::EVFILT_VNODE,
@@ -329,32 +292,23 @@ mod os_watch {
                 data: 0,
                 udata: std::ptr::null_mut(),
             };
-            let rc = unsafe {
-                libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null())
-            };
-            if rc < 0 {
+            if unsafe { libc::kevent(self.kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
                 unsafe { libc::close(fd); }
                 return false;
             }
             let pb = path.to_path_buf();
-            paths.insert(pb.clone());
-            entries.insert(fd, WatchedEntry { path: pb, is_dir, is_runtime, file_mask });
+            self.paths.insert(pb.clone());
+            self.entries.insert(fd, WatchedEntry { path: pb, is_dir, is_runtime, file_mask });
             true
-        }
-
-        fn register_path(&mut self, path: &Path, is_dir: bool, is_runtime: bool, file_mask: u32) -> bool {
-            Self::register_path_raw(self.kq, &mut self.entries, &mut self.paths, path, is_dir, is_runtime, file_mask)
         }
 
         fn add_tree(&mut self, dir: &Path, is_runtime: bool, report_new: bool) -> u32 {
             let mut mask = 0u32;
-            let (kq, entries, paths, skip) = (self.kq, &mut self.entries, &mut self.paths, &self.skip);
-            walk_tree(dir, is_runtime, skip, |p, fmask| match fmask {
-                None => { Self::register_path_raw(kq, entries, paths, p, true, is_runtime, 0); true }
+            let skip = self.skip.clone();
+            walk_tree(dir, is_runtime, &skip, |p, fmask| match fmask {
+                None => { self.register_path(p, true, is_runtime, 0); true }
                 Some(m) => {
-                    if Self::register_path_raw(kq, entries, paths, p, false, is_runtime, m) && report_new {
-                        mask |= m;
-                    }
+                    if self.register_path(p, false, is_runtime, m) && report_new { mask |= m; }
                     true
                 }
             });
@@ -471,7 +425,7 @@ pub unsafe extern "C" fn qed_watch_wait(handle: u64, timeout_ms: u32) -> *mut Le
 #[no_mangle]
 pub unsafe extern "C" fn qed_watch_close(handle: u64) -> *mut LeanObj {
     WATCHERS.remove(handle);
-    qed_lean_io_mk_ok(qed_lean_box(0))
+    mk_io_unit()
 }
 
 // ============================================================================
@@ -486,35 +440,20 @@ struct SseHub {
 
 impl SseHub {
     fn format_frame(payload: &str) -> Vec<u8> {
-        let clean = payload.trim();
-        let mut out = Vec::with_capacity(clean.len() + 10);
-        out.extend_from_slice(b"data: ");
-        for line in clean.lines() {
-            out.extend_from_slice(line.as_bytes());
-        }
-        out.extend_from_slice(b"\n\n");
-        out
+        format!("data: {}\n\n", payload.trim().lines().collect::<String>()).into_bytes()
+    }
+
+    fn broadcast(&self, frame: &[u8]) {
+        lock_unpoison(&self.clients).retain_mut(|s| s.write_all(frame).is_ok() && s.flush().is_ok());
     }
 
     fn publish(&self, payload: &str) {
         let trimmed = payload.trim().to_owned();
-        {
-            let mut last = lock_unpoison(&self.last_event);
-            *last = Some(trimmed.clone());
-        }
-        let frame = Self::format_frame(&trimmed);
-        let mut clients = lock_unpoison(&self.clients);
-        clients.retain_mut(|stream| {
-            stream.write_all(&frame).is_ok() && stream.flush().is_ok()
-        });
+        *lock_unpoison(&self.last_event) = Some(trimmed.clone());
+        self.broadcast(&Self::format_frame(&trimmed));
     }
 
-    fn send_keepalive(&self) {
-        let mut clients = lock_unpoison(&self.clients);
-        clients.retain_mut(|stream| {
-            stream.write_all(b": ping\n\n").is_ok() && stream.flush().is_ok()
-        });
-    }
+    fn send_keepalive(&self) { self.broadcast(b": ping\n\n"); }
 }
 
 fn handle_sse_connection(mut stream: TcpStream, hub: &Arc<SseHub>) {
@@ -566,57 +505,43 @@ static SSE_HUBS: HandleTable<Arc<SseHub>> = HandleTable::new();
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_dev_sse_start(port: u16) -> *mut LeanObj {
-    let listener = match TcpListener::bind(("127.0.0.1", port)) {
-        Ok(l) => l,
-        Err(e) => return mk_io_except_err(&format!("failed to bind dev SSE listener on 127.0.0.1:{port}: {e}")),
-    };
-    let actual_port = match listener.local_addr() {
-        Ok(a) => a.port(),
-        Err(e) => return mk_io_except_err(&format!("failed to read dev SSE local addr: {e}")),
-    };
-    let _ = listener.set_nonblocking(true);
-
-    let hub = Arc::new(SseHub {
-        closed: AtomicBool::new(false),
-        last_event: Mutex::new(None),
-        clients: Mutex::new(Vec::new()),
-    });
-    let hub_bg = hub.clone();
-
-    std::thread::spawn(move || {
-        let mut last_ping = Instant::now();
-        while !hub_bg.closed.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    handle_sse_connection(stream, &hub_bg);
+    let res: Result<(u64, u16), String> = (|| {
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .map_err(|e| format!("failed to bind dev SSE listener on 127.0.0.1:{port}: {e}"))?;
+        let actual_port = listener.local_addr()
+            .map_err(|e| format!("failed to read dev SSE local addr: {e}"))?.port();
+        let _ = listener.set_nonblocking(true);
+        let hub = Arc::new(SseHub {
+            closed: AtomicBool::new(false),
+            last_event: Mutex::new(None),
+            clients: Mutex::new(Vec::new()),
+        });
+        let hub_bg = hub.clone();
+        std::thread::spawn(move || {
+            let mut last_ping = Instant::now();
+            while !hub_bg.closed.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => handle_sse_connection(stream, &hub_bg),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(20)),
+                    Err(_) => std::thread::sleep(Duration::from_millis(50)),
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(_) => {
-                    std::thread::sleep(Duration::from_millis(50));
+                if last_ping.elapsed() >= Duration::from_secs(15) {
+                    hub_bg.send_keepalive();
+                    last_ping = Instant::now();
                 }
             }
-            if last_ping.elapsed() >= Duration::from_secs(15) {
-                hub_bg.send_keepalive();
-                last_ping = Instant::now();
-            }
-        }
-        lock_unpoison(&hub_bg.clients).clear();
-    });
-
-    let id = SSE_HUBS.insert(hub);
-    let pair = qed_lean_mk_prod(qed_lean_box_u64(id), qed_lean_box(actual_port as usize));
-    mk_io_except_ok(pair)
+            lock_unpoison(&hub_bg.clients).clear();
+        });
+        Ok((SSE_HUBS.insert(hub), actual_port))
+    })();
+    mk_io_except(res, |(id, p)| qed_lean_mk_prod(qed_lean_box_u64(id), qed_lean_box(p as usize)))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_dev_sse_publish(handle: u64, payload: *mut LeanObj) -> *mut LeanObj {
     let msg = str_slice(payload).to_owned();
-    if let Some(h) = SSE_HUBS.get(handle) {
-        h.publish(&msg);
-    }
-    qed_lean_io_mk_ok(qed_lean_box(0))
+    if let Some(h) = SSE_HUBS.get(handle) { h.publish(&msg); }
+    mk_io_unit()
 }
 
 #[no_mangle]
@@ -625,5 +550,5 @@ pub unsafe extern "C" fn qed_dev_sse_stop(handle: u64) -> *mut LeanObj {
         hub.closed.store(true, Ordering::Relaxed);
         lock_unpoison(&hub.clients).clear();
     }
-    qed_lean_io_mk_ok(qed_lean_box(0))
+    mk_io_unit()
 }

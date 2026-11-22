@@ -15,6 +15,7 @@ const SVG_NS   = 'http://www.w3.org/2000/svg';
 const XLINK_NS = 'http://www.w3.org/1999/xlink';
 const XML_NS   = 'http://www.w3.org/XML/1998/namespace';
 const attrNS = (k) => k.startsWith('xlink:') ? XLINK_NS : (k.startsWith('xml:') ? XML_NS : null);
+const attrLocal = (k) => k.slice(k.indexOf(':') + 1);
 const managedAttrs = new WeakMap();
 const nodeId = (el) => {
   if (!el) return 0;
@@ -25,19 +26,15 @@ const nodeId = (el) => {
   N[slot] = el;
   return (el.__qedId = slot);
 };
+const freeSlot = (cur, N, F) => { const id = cur.__qedId; if (id !== undefined && N[id] === cur) { N[id] = null; cur.__qedId = undefined; F.push(id); } };
 const dropNode = (el) => {
   if (!el) return;
   const g = Q(), N = g.nodes, F = (g.free ||= []);
-  if (el.__qedTmpl) {
-    const id = el.__qedId;
-    if (id !== undefined && N[id] === el) { N[id] = null; el.__qedId = undefined; F.push(id); }
-    el.__qedSlots = undefined;
-    return;
-  }
+  if (el.__qedTmpl) { freeSlot(el, N, F); el.__qedSlots = undefined; return; }
   const sig = g.sig, sigVals = g.sigVals, q = [el];
   while (q.length > 0) {
-    const cur = q.pop(), id = cur.__qedId;
-    if (id !== undefined && N[id] === cur) { N[id] = null; cur.__qedId = undefined; F.push(id); }
+    const cur = q.pop();
+    freeSlot(cur, N, F);
     const s = cur.__qedSigs;
     if (s !== undefined) {
       for (let i = 0; i < s.length; i++) {
@@ -140,8 +137,8 @@ export const dom = {
   childNamespace(node, w) { const el = Q().nodes[node]; const svg = !!el && el.namespaceURI === SVG_NS && el.localName !== 'foreignObject'; return ok(svg ? SVG_NS : '', w); },
   createText(s, w)      { return ok(nodeId(document.createTextNode(s)), w); },
   createFragment(w)     { return ok(nodeId(document.createDocumentFragment()), w); },
-  setAttribute(node, k, v, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) { if (el.getAttributeNS(ns, k.slice(k.indexOf(':') + 1)) !== v) el.setAttributeNS(ns, k, v); } else if (el.getAttribute(k) !== v) el.setAttribute(k, v); } return ok(PUnit, w); },
-  removeAttribute(node, k, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) el.removeAttributeNS(ns, k.slice(k.indexOf(':') + 1)); else el.removeAttribute(k); } return ok(PUnit, w); },
+  setAttribute(node, k, v, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) { if (el.getAttributeNS(ns, attrLocal(k)) !== v) el.setAttributeNS(ns, k, v); } else if (el.getAttribute(k) !== v) el.setAttribute(k, v); } return ok(PUnit, w); },
+  removeAttribute(node, k, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) el.removeAttributeNS(ns, attrLocal(k)); else el.removeAttribute(k); } return ok(PUnit, w); },
   retainAttributes(node, namesList, w) {
     const el = Q().nodes[node];
     if (!el?.attributes) return ok(PUnit, w);
@@ -240,17 +237,11 @@ export const dom = {
     const attrNames = new Array(n), attrNSs = new Array(n), attrLocals = new Array(n);
     for (let i = 0; i < n; i++) {
       walkers[i] = makeWalker(slotPaths[i]);
-      const a = slotAttrs[i];
-      attrNames[i] = a;
+      const a = attrNames[i] = slotAttrs[i];
       if (a === '') kinds[i] = 0;
       else if (a === 'class') kinds[i] = 1;
       else if (a === 'value') kinds[i] = 2;
-      else {
-        kinds[i] = 3;
-        const ns = attrNS(a);
-        attrNSs[i] = ns;
-        attrLocals[i] = ns ? a.slice(a.indexOf(':') + 1) : a;
-      }
+      else { kinds[i] = 3; const ns = attrNSs[i] = attrNS(a); attrLocals[i] = ns ? attrLocal(a) : a; }
     }
     const evN = evPaths.length, evWalkers = new Array(evN);
     for (let i = 0; i < evN; i++) {

@@ -32,7 +32,7 @@ private def isFrameworkOrStdRoot (modName : String) : Bool :=
   root == "Qed" || root == "Js" || root == "Cli"
 
 private def readLocalImports (modName : String) : IO (List String × Bool) := do
-  let path := FilePath.mk ((modName.replace "." "/") ++ ".lean")
+  let path := modLeanPath modName
   if !(← path.pathExists) then return ([], false)
   let imps := parseLeanImports (← IO.FS.readFile path)
   let importsDriver := imps.any fun d => d == "Qed.Driver" || d == "Qed.Dom"
@@ -45,14 +45,12 @@ private partial def collectLocalModulesLoop (skipDriver : Bool) :
   | m :: rest, visited => do
       if visited.contains m || isFrameworkOrStdRoot m then
         collectLocalModulesLoop skipDriver rest visited
+      else if !(← (modLeanPath m).pathExists) then
+        collectLocalModulesLoop skipDriver rest visited
       else
-        let path := FilePath.mk ((m.replace "." "/") ++ ".lean")
-        if !(← path.pathExists) then
-          collectLocalModulesLoop skipDriver rest visited
-        else
-          let (deps, importsDriver) ← readLocalImports m
-          let nextVisited := if skipDriver && importsDriver then visited else visited.push m
-          collectLocalModulesLoop skipDriver (rest ++ deps) nextVisited
+        let (deps, importsDriver) ← readLocalImports m
+        let nextVisited := if skipDriver && importsDriver then visited else visited.push m
+        collectLocalModulesLoop skipDriver (rest ++ deps) nextVisited
 
 private def collectLocalModules (rootMod : String) (skipDriver : Bool := false) : IO (Array String) :=
   collectLocalModulesLoop skipDriver [rootMod] #[]
@@ -255,12 +253,12 @@ private def resolveLinkMeta (genDir : FilePath) (cObjTargets : Array String) :
   IO.FS.writeFile metaFile (String.intercalate "\n" (cacheKey :: linkInputs.toList) ++ "\n")
   return some linkInputs
 
-private def compileClientMain (leanPath mod appExpr : String) (isInRepo prod : Bool) :
+private def compileClientMain (leanPath mod appExpr : String) (inRepo prod : Bool) :
     IO (Option (FilePath × FilePath)) := do
-  let fwRoot ← if isInRepo then pure (FilePath.mk ".") else frameworkHome
+  let fwRoot ← if inRepo then pure (FilePath.mk ".") else frameworkHome
   let genDir : FilePath := ".qed" / "gen" / mod
   IO.FS.createDirAll genDir
-  let modOlean := FilePath.mk ".lake" / "build" / "lib" / "lean" / ((mod.replace "." "/") ++ ".olean")
+  let modOlean := modOleanPath mod
   let drvOlean := fwRoot / ".lake" / "build" / "lib" / "lean" / "Qed" / "Driver.olean"
   let cliLean := genDir / "ClientMain.lean"
   let cliOlean := genDir / "ClientMain.olean"
@@ -272,6 +270,15 @@ private def compileClientMain (leanPath mod appExpr : String) (isInRepo prod : B
       return none
   return some (genDir, cliOlean)
 
+private def tryCachedCss (outDir cssPath cssMetaPath : FilePath)
+    (cssAppExpr? : Option String) (jsDeps : Array FilePath) : IO (Option (Bool × List String)) := do
+  let some _ := cssAppExpr? | return some (false, [])
+  unless ← isUpToDate cssMetaPath jsDeps do return none
+  let some (hasCss, sheets) ← loadCssMeta cssMetaPath | return none
+  if hasCss && !(← isUpToDate cssPath jsDeps) then return none
+  copyLocalStylesheets outDir sheets
+  return some (hasCss, sheets)
+
 private def buildWithNativeServer (mod : String) (clientAppExpr? : Option String)
     (cssAppExpr? : Option String) (serverMainSrc? : Option String) (outDir : FilePath) (prod : Bool)
     (alreadyBuilt : Bool := false) (cObjsBuilt : Bool := false)
@@ -279,25 +286,25 @@ private def buildWithNativeServer (mod : String) (clientAppExpr? : Option String
   let buildServer := serverMainSrc?.isSome
   let wantMap := !prod || sourceMap
   let cObjTargets ← if buildServer then serverCObjTargets mod else pure #[]
-  let isInRepo ← (FilePath.mk "Examples").pathExists
+  let inRepo ← isInRepo
   let prebuilt := (← env "QED_PREBUILT") == some "1"
   if !cObjsBuilt then
     let lakeTargets :=
       (if alreadyBuilt || prebuilt then #[] else #[mod]) ++
       (if alreadyBuilt || (clientAppExpr?.isNone && cssAppExpr?.isNone) then #[] else #["Qed.Driver"]) ++
-      (if isInRepo && !prebuilt && !alreadyBuilt then #["qedjs"] else #[]) ++
+      (if inRepo && !prebuilt && !alreadyBuilt then #["qedjs"] else #[]) ++
       cObjTargets
     if !lakeTargets.isEmpty then
       if (← shLakeBuild (#["build"] ++ lakeTargets)) != 0 then
         return false
-  let some q ← resolveQedjsEnv (needBuild := !isInRepo && !prebuilt && !alreadyBuilt) | return false
+  let some q ← resolveQedjsEnv (needBuild := !inRepo && !prebuilt && !alreadyBuilt) | return false
   let rtPath ← runtimeFile "qed_rt.mjs"
   let genDir : FilePath := ".qed" / "gen" / mod
   if clientAppExpr?.isSome || cssAppExpr?.isSome || buildServer then
     IO.FS.createDirAll genDir
   IO.FS.createDirAll outDir
 
-  let modOlean := FilePath.mk ".lake" / "build" / "lib" / "lean" / ((mod.replace "." "/") ++ ".olean")
+  let modOlean := modOleanPath mod
   let appMjs := outDir / "app.mjs"
   let appMap := outDir / "app.mjs.map"
   let cssPath := outDir / "styles.css"
@@ -313,26 +320,13 @@ private def buildWithNativeServer (mod : String) (clientAppExpr? : Option String
   let tClient ← IO.asTask do
     let (cliGen?, jsDeps) ← match clientAppExpr? with
       | some appExpr =>
-          let some (gd, cliOlean) ← compileClientMain q.leanPath mod appExpr isInRepo prod | return false
+          let some (gd, cliOlean) ← compileClientMain q.leanPath mod appExpr inRepo prod | return false
           pure (some gd, #[cliOlean, q.bin, rtPath, modOlean])
       | none =>
           pure (none, #[q.bin, rtPath, modOlean])
     let mapReady ← if wantMap then appMap.pathExists else pure true
-    let cached? : Option (Bool × List String) ←
-      if sameTarget && !prod && mapReady && (← isUpToDate appMjs jsDeps) then
-        match cssAppExpr? with
-        | none => pure (some (false, []))
-        | some _ =>
-            if ← isUpToDate cssMetaPath jsDeps then
-              match ← loadCssMeta cssMetaPath with
-              | some (hasCss, sheets) =>
-                  if !hasCss || (← isUpToDate cssPath jsDeps) then
-                    copyLocalStylesheets outDir sheets
-                    pure (some (hasCss, sheets))
-                  else pure none
-              | none => pure none
-            else pure none
-      else pure none
+    let cached? ← if sameTarget && !prod && mapReady && (← isUpToDate appMjs jsDeps) then
+      tryCachedCss outDir cssPath cssMetaPath cssAppExpr? jsDeps else pure none
     let (hasCss, sheets) ← match cached? with
       | some res => pure res
       | none =>
@@ -360,35 +354,31 @@ private def buildWithNativeServer (mod : String) (clientAppExpr? : Option String
       removeIfExists (outDir / "qed_manifest.json")
     return true
 
-  -- 2. Synthesize & compile native Rust/Lean server binary → `<outDir>/server` when needed
+  -- 2. Synthesize & compile native Rust/Lean server binary → `<outDir>/server` while `tClient` runs
+  let buildSrv (serverMainSrc : String) : IO Bool := do
+    let srvLean := genDir / "ServerMain.lean"
+    let srvC := genDir / "ServerMain.c"
+    let srvChanged ← writeIfChanged srvLean serverMainSrc
+    let some linkInputs ← resolveLinkMeta genDir cObjTargets | return false
+    let linkFiles := linkInputs.map FilePath.mk
+    if srvChanged || prod || !(← isUpToDate srvC (#[srvLean, modOlean] ++ linkFiles)) then
+      if (← shLean q.leanPath #["-R", genDir.toString, srvLean.toString, "-c", srvC.toString]) != 0 then
+        return false
+    if !sameTarget || prod || !(← isUpToDate srvBin (#[srvC] ++ linkFiles)) then
+      let srvTmp := outDir / "server.tmp"
+      let optFlags := if prod then #["-O3", "-DNDEBUG"] else #["-O0"]
+      let linkerPlatformFlags :=
+        if System.Platform.isOSX then #["-Wl,-undefined,dynamic_lookup"] else #["-Wl,--allow-shlib-undefined"]
+      let compileArgs := optFlags ++ #[srvC.toString] ++
+        linkInputs ++ #["-pthread"] ++ linkerPlatformFlags ++ #["-o", srvTmp.toString]
+      let code ← if (← onPath "leanc") then sh "leanc" compileArgs
+        else sh "lake" (#["env", "leanc"] ++ compileArgs)
+      if code != 0 then return false
+      IO.FS.rename srvTmp srvBin
+    return true
   let srvOk ← match serverMainSrc? with
     | none => pure true
-    | some serverMainSrc =>
-        let srvLean := genDir / "ServerMain.lean"
-        let srvC := genDir / "ServerMain.c"
-        let srvChanged ← writeIfChanged srvLean serverMainSrc
-        let tServer ← IO.asTask do
-          let some linkInputs ← resolveLinkMeta genDir cObjTargets | return false
-          let linkFiles := linkInputs.map FilePath.mk
-          let srvCDeps := #[srvLean, modOlean] ++ linkFiles
-          if srvChanged || prod || !(← isUpToDate srvC srvCDeps) then
-            if (← shLean q.leanPath #["-R", genDir.toString, srvLean.toString, "-c", srvC.toString]) != 0 then
-              return false
-          let linkDeps := #[srvC] ++ linkFiles
-          if !sameTarget || prod || !(← isUpToDate srvBin linkDeps) then
-            let srvTmp := outDir / "server.tmp"
-            let optFlags := if prod then #["-O3", "-DNDEBUG"] else #["-O0"]
-            let linkerPlatformFlags : Array String :=
-              if System.Platform.isOSX then #["-Wl,-undefined,dynamic_lookup"]
-              else #["-Wl,--allow-shlib-undefined"]
-            let compileArgs := optFlags ++ #[srvC.toString] ++
-              linkInputs ++ #["-pthread"] ++ linkerPlatformFlags ++ #["-o", srvTmp.toString]
-            let code ← if (← onPath "leanc") then sh "leanc" compileArgs
-              else sh "lake" (#["env", "leanc"] ++ compileArgs)
-            if code != 0 then return false
-            IO.FS.rename srvTmp srvBin
-          return true
-        pure ((← IO.wait tServer).toOption.getD false)
+    | some serverMainSrc => buildSrv serverMainSrc
 
   let cliOk := (← IO.wait tClient).toOption.getD false
   if cliOk && srvOk && !prod then recordDevTarget outDir mod
@@ -431,37 +421,31 @@ private def clientBundlePaths (outDir : FilePath) : IO (List FilePath) := do
         found := entry.path :: found
   return found
 
-private def emitDeployManifest (outDir : FilePath) (mod : String) : IO Bool := do
-  let some q ← resolveQedjsEnv (needBuild := false) | return false
-  let outFile := outDir / "qed_deploy.json"
-  let mods ← serverImportModules mod
-  let args := #["--emit-deploy-manifest", outFile.toString, mod, "--assets-dir", outDir.toString] ++ mods
-  let (ok, _) ← q.runOut args (quiet := true)
-  return ok
+private def runDeployManifest (mod : String) (outFile : FilePath) (assetsDir? : Option FilePath)
+    (needBuild : Bool) (mods? : Option (Array String) := none) : IO (Bool × String) := do
+  let some q ← resolveQedjsEnv (needBuild := needBuild) | return (false, "✗ could not locate qedjs")
+  let mods ← match mods? with | some ms => pure ms | none => serverImportModules mod
+  let assetsArgs := match assetsDir? with | some d => #["--assets-dir", d.toString] | none => #[]
+  q.runOut (#["--emit-deploy-manifest", outFile.toString, mod] ++ assetsArgs ++ mods) (quiet := true)
+
+private def emitDeployManifest (outDir : FilePath) (mod : String) : IO Bool :=
+  Prod.fst <$> runDeployManifest mod (outDir / "qed_deploy.json") (some outDir) false
 
 private def deployManifestHasAuth (outDir : FilePath) : IO Bool := do
   let p := outDir / "qed_deploy.json"
   if !(← p.pathExists) then return false
-  let raw ← IO.FS.readFile p
-  match Qed.Json.parse raw with
-  | .ok j =>
-      match j.get? "auth" with
-      | some (.obj _) => return true
-      | _             => return false
+  match Qed.Json.parse (← IO.FS.readFile p) with
+  | .ok j => return match j.get? "auth" with | some (.obj _) => true | _ => false
   | .error _ => return false
 
 def cmdManifest (args : List String) : IO UInt32 := do
   let mod ← jsRoot
   let outPath := FilePath.mk (args.getD 0 (distDir / "qed_deploy.json").toString)
   let mods ← serverImportModules mod
-  if (← sh "lake" (#["build"] ++ mods)) != 0 then
-    IO.eprintln (red "✗ build failed"); return 1
-  let some q ← resolveQedjsEnv (needBuild := true) | do
-    IO.eprintln (red "✗ could not locate qedjs"); return 1
-  let assetsArgs := if (← distDir.pathExists) then #["--assets-dir", distDir.toString] else #[]
-  let (ok, out) ← q.runOut (#["--emit-deploy-manifest", outPath.toString, mod] ++ assetsArgs ++ mods) (quiet := true)
-  if !ok then
-    IO.eprintln (red out.cliTrim); return 1
+  if (← sh "lake" (#["build"] ++ mods)) != 0 then IO.eprintln (red "✗ build failed"); return 1
+  let assetsDir? := if (← distDir.pathExists) then some distDir else none
+  let (ok, out) ← runDeployManifest mod outPath assetsDir? true (some mods)
+  if !ok then IO.eprintln (red out.cliTrim); return 1
   IO.println (green s!"✓ {out.cliTrim}")
   return 0
 
@@ -492,11 +476,11 @@ def cmdBuild (prod : Bool) (skipVerify : Bool := false) (sourceMap : Bool := fal
     IO.eprintln (red "✗ deploy manifest validation failed"); return 1
   if outOverride.isNone then
     let bundlePaths ← clientBundlePaths outDir
-    let filesArg := String.intercalate " " (bundlePaths.map (fun p => s!"'{p}'"))
-    let (_, sz) ← if bundlePaths.isEmpty then pure (0, "0") else
-      shOut "bash" #["-c", s!"cat {filesArg} | gzip -c | wc -c"]
+    let mut rawBytes := ByteArray.empty
+    for p in bundlePaths do rawBytes := rawBytes ++ (← IO.FS.readBinFile p)
+    let sz ← if bundlePaths.isEmpty then pure 0 else (·.size) <$> Qed.Server.Prim.gzipCompress rawBytes
     let srvNote := if (← (outDir / "server").pathExists) then s!" + native binary {outDir}/server" else ""
-    IO.println (green s!"✓ build complete → {outDir}{srvNote}, {sz.cliTrim} bytes gzipped to the client")
+    IO.println (green s!"✓ build complete → {outDir}{srvNote}, {sz} bytes gzipped to the client")
   return 0
 
 def cmdServe (args : List String) : IO UInt32 := do
@@ -544,27 +528,13 @@ private def spawnDevAuthChild : IO (IO.Process.Child ⟨.null, .null, .inherit�
     so the browser never sees `ECONNREFUSED` during a server restart. -/
 private def waitDevServerHealthy (port : UInt16) (timeoutMs : Nat := 3000) : IO Unit := do
   let deadline := (← IO.monoMsNow) + timeoutMs
-  let req := s!"GET /_qed/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".toUTF8
-  let rec loop : Nat → IO Unit
-    | 0 => pure ()
-    | fuel + 1 => do
-        let ok ← match ← Qed.Server.Prim.outboundAcquire 0 "127.0.0.1" port 0 (fun _ => false) with
-          | .error _ => pure false
-          | .ok (hNat, _) =>
-              let h := hNat.toUInt64
-              let r ← match ← Qed.Server.Prim.outboundWriteAll h req with
-                | .error _ => pure false
-                | .ok () =>
-                    match ← Qed.Server.Prim.outboundReadSome h 256 with
-                    | .ok bs => pure (((String.fromUTF8? bs).getD "").contains "200")
-                    | .error _ => pure false
-              Qed.Server.Prim.outboundRelease h 0
-              pure r
-        if ok then return
+  let url := s!"http://127.0.0.1:{port}/_qed/health"
+  for _ in [:120] do
+    match ← Qed.Server.Native.execHttpCall "GET" url #[] ByteArray.empty false with
+    | .ok (200, _, _) => return
+    | _ =>
         if (← IO.monoMsNow) >= deadline then return
         IO.sleep 25
-        loop fuel
-  loop 120
 
 private def scanNewestMtime (dir : FilePath) (ext : String) (skipDirs : List String) : IO Int := do
   let mut newest : Int := 0
@@ -638,8 +608,14 @@ partial def watchLoop (watcher? : Option Watch.FileWatcher) (sse? : Option Watch
   let mut nextNative := isNative
   let portNum : UInt16 := (port.toNat?.getD 8000).toUInt16
 
+  let t0 ← IO.monoMsNow
+  let finishOk (kind msg : String) (post : IO Unit := pure ()) : IO Unit := do
+    let elapsed := (← IO.monoMsNow) - t0
+    publishDevStatus devDir sse? "ok" kind "" elapsed true
+    post
+    IO.println (green s!"✓ {msg}{elapsed}ms)")
+
   if leanChanged then
-    let t0 ← IO.monoMsNow
     step "change detected, rebuilding"
     clearLastBuildError
     publishDevStatus devDir sse? "building" "hmr" "" 0 false
@@ -659,34 +635,22 @@ partial def watchLoop (watcher? : Option Watch.FileWatcher) (sse? : Option Watch
         nextSrv := restarted
         nextNative := nat
         waitDevServerHealthy portNum
-      let elapsed := (← IO.monoMsNow) - t0
       let cssOnly := !serverChanged && prevAppHash == newAppHash && prevCssHash != newCssHash
       let kind := if cssOnly then "css" else "hmr"
-      publishDevStatus devDir sse? "ok" kind "" elapsed true
-      if (← (FilePath.mk "Examples").pathExists) then
-        let _ ← effectsCovered
-      IO.println (green s!"✓ reloaded ({kind}, {elapsed}ms)")
+      finishOk kind s!"reloaded ({kind}, " (do if ← isInRepo then discard effectsCovered)
     else
       let elapsed := (← IO.monoMsNow) - t0
-      let errText ← getLastBuildError
-      publishDevStatus devDir sse? "error" "hmr" errText elapsed false
+      publishDevStatus devDir sse? "error" "hmr" (← getLastBuildError) elapsed false
       IO.eprintln (red "✗ build failed, fix and save again")
   else if cssChanged then
-    let t0 ← IO.monoMsNow
     refreshLocalCss devDir
-    let elapsed := (← IO.monoMsNow) - t0
-    publishDevStatus devDir sse? "ok" "css" "" elapsed true
-    IO.println (green s!"✓ styles updated ({elapsed}ms)")
+    finishOk "css" "styles updated ("
   else if rtChanged then
-    let t0 ← IO.monoMsNow
     step "runtime change detected, reloading"
     let mod ← jsRoot
-    let metaPath : FilePath := ".qed" / "gen" / mod / "css_meta.txt"
-    let (hasCss, sheets) := (← loadCssMeta metaPath).getD (false, [])
+    let (hasCss, sheets) := (← loadCssMeta (".qed" / "gen" / mod / "css_meta.txt")).getD (false, [])
     writeClientShell devDir (prod := false) hasCss sheets (sseUrl := sseUrl)
-    let elapsed := (← IO.monoMsNow) - t0
-    publishDevStatus devDir sse? "ok" "full" "" elapsed true
-    IO.println (green s!"✓ reloaded runtime ({elapsed}ms)")
+    finishOk "full" "reloaded runtime ("
 
   watchLoop nextWatcher? sse? nextLeanMt nextCssMt nextRtMt port nextSrv nextNative devEnv
 

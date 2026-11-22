@@ -182,26 +182,17 @@ def isValidHexColor (raw : String) : Bool :=
   (cs.length == 3 || cs.length == 4 || cs.length == 6 || cs.length == 8) &&
   cs.all (fun c => (hexDigitVal? c).isSome)
 
+private def hexPair? (c1 c2 : Char) : Option Nat := do
+  pure ((← hexDigitVal? c1) * 16 + (← hexDigitVal? c2))
+
 def parseHexRgb? (raw : String) : Option (Nat × Nat × Nat) :=
+  let rgb (r1 r2 g1 g2 b1 b2 : Char) : Option (Nat × Nat × Nat) := do
+    pure ((← hexPair? r1 r2), (← hexPair? g1 g2), (← hexPair? b1 b2))
   match stripHashChars raw with
-  | [r, g, b] => do
-      let rv ← hexDigitVal? r; let gv ← hexDigitVal? g; let bv ← hexDigitVal? b
-      some (rv * 17, gv * 17, bv * 17)
-  | [r, g, b, a] => do
-      let rv ← hexDigitVal? r; let gv ← hexDigitVal? g; let bv ← hexDigitVal? b
-      let av ← hexDigitVal? a
-      if av == 15 then some (rv * 17, gv * 17, bv * 17) else none
-  | [r1, r2, g1, g2, b1, b2] => do
-      let rv1 ← hexDigitVal? r1; let rv2 ← hexDigitVal? r2
-      let gv1 ← hexDigitVal? g1; let gv2 ← hexDigitVal? g2
-      let bv1 ← hexDigitVal? b1; let bv2 ← hexDigitVal? b2
-      some (rv1 * 16 + rv2, gv1 * 16 + gv2, bv1 * 16 + bv2)
-  | [r1, r2, g1, g2, b1, b2, a1, a2] => do
-      let rv1 ← hexDigitVal? r1; let rv2 ← hexDigitVal? r2
-      let gv1 ← hexDigitVal? g1; let gv2 ← hexDigitVal? g2
-      let bv1 ← hexDigitVal? b1; let bv2 ← hexDigitVal? b2
-      let av1 ← hexDigitVal? a1; let av2 ← hexDigitVal? a2
-      if av1 == 15 && av2 == 15 then some (rv1 * 16 + rv2, gv1 * 16 + gv2, bv1 * 16 + bv2) else none
+  | [r, g, b] => rgb r r g g b b
+  | [r, g, b, a] => do let c ← rgb r r g g b b; if (← hexDigitVal? a) == 15 then some c else none
+  | [r1, r2, g1, g2, b1, b2] => rgb r1 r2 g1 g2 b1 b2
+  | [r1, r2, g1, g2, b1, b2, a1, a2] => do let c ← rgb r1 r2 g1 g2 b1 b2; if (← hexPair? a1 a2) == 255 then some c else none
   | _ => none
 
 structure Color where
@@ -328,11 +319,8 @@ deriving Inhabited
 def keyframes (name : String) (steps : List (String × List Item)) : Keyframes :=
   { name := sanitizeCssIdent name, steps }
 
-def Keyframes.renderSteps : List (String × List Item) → String
-  | [] => ""
-  | [(sel, body)] => sanitizeCssSelector sel ++ " { " ++ Item.renderList body ++ " }"
-  | (sel, body) :: rest =>
-      sanitizeCssSelector sel ++ " { " ++ Item.renderList body ++ " } " ++ Keyframes.renderSteps rest
+def Keyframes.renderSteps (steps : List (String × List Item)) : String :=
+  Item.renderList (steps.map fun (sel, body) => .nest sel body)
 
 def Keyframes.rule (kf : Keyframes) : String :=
   "@keyframes " ++ sanitizeCssIdent kf.name ++ " { " ++ Keyframes.renderSteps kf.steps ++ " }"

@@ -101,6 +101,13 @@ def registerHandler {α : Type} (tbl : IO.Ref (Array α)) (node : Dom.Node)
               else do tbl.set (ts.push v); Dom.setAttribute node key next
   | none   => do tbl.set (ts.push v); Dom.setAttribute node key next
 
+private def allocSigSlot (h : Handlers msg) (name : String) (m : msg) : IO Nat := do
+  let ts ← h.click.get
+  let i := ts.size
+  h.click.set (ts.push m)
+  Dom.setSigSlot name (UInt32.ofNat (i + 1))
+  pure i
+
 abbrev DomM (msg : Type) := ReaderT (Handlers msg) IO
 
 instance : MonadDom msg (DomM msg) where
@@ -130,15 +137,7 @@ instance : MonadDom msg (DomM msg) where
   bindSignalOn n name event m := fun h => do
     Dom.effect "event.listen" event "" ""
     let slot ← Dom.getSigSlot name
-    let idx ←
-      if slot > 0 then
-        pure (slot.toNat - 1)
-      else do
-        let ts ← h.click.get
-        let i := ts.size
-        h.click.set (ts.push m)
-        Dom.setSigSlot name (UInt32.ofNat (i + 1))
-        pure i
+    let idx ← if slot > 0 then pure (slot.toNat - 1) else allocSigSlot h name m
     Dom.setAttribute n s!"data-qed-on-{event}" (toString idx)
   setSignalOn name m := fun h => do
     let slot ← Dom.getSigSlot name
@@ -147,10 +146,7 @@ instance : MonadDom msg (DomM msg) where
       let ts ← h.click.get
       if i < ts.size then h.click.set (ts.set! i m)
     else
-      let ts ← h.click.get
-      let i := ts.size
-      h.click.set (ts.push m)
-      Dom.setSigSlot name (UInt32.ofNat (i + 1))
+      discard <| allocSigSlot h name m
   onEvent n event m          := fun h => do
     Dom.effect "event.listen" event "" ""
     registerHandler h.click n s!"data-qed-on-{event}" m
@@ -381,9 +377,5 @@ def patchHtmlSubtreeM [MonadDom msg m] (parent : Dom.Node) (index : UInt32) (nod
 
 @[inline] def hydrateDom (h : Handlers msg) (tree : Html msg) (node : Dom.Node) : IO Unit :=
   ReaderT.run (hydrateDomM (m := DomM msg) tree node) h
-
-@[inline] def applyToDom (h : Handlers msg) (parent : Dom.Node) (index : UInt32) (node : Dom.Node)
-    (patch : Patch msg) : IO Unit :=
-  ReaderT.run (applyToDomM (m := DomM msg) parent index node patch) h
 
 end Qed

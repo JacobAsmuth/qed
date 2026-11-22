@@ -239,13 +239,18 @@ private def openExtConn (env : RuntimeEnv Model Msg) (subId : UInt32) : IO Unit 
   openWsConn env entry.conn (.ext subId) entry.isBinary fun conn' =>
     env.state.modify fun st => { st with wsExtEntries := st.wsExtEntries.insert subId { entry with conn := conn' } }
 
+private def findMuxPoolBySlot (st : RuntimeState Model Msg) (slot : String) :
+    Option (UInt32 × String × WsMuxPool Msg) := do
+  let sid ← st.wsMuxSlot[slot]?
+  let url ← st.wsMuxSubUrl[sid]?
+  let pool ← st.wsMuxPools[url]?
+  pure (sid, url, pool)
+
 private def closeMuxSlot (env : RuntimeEnv Model Msg) (slot : String) : IO Unit := do
   let st ← env.state.get
   let some sid := st.wsMuxSlot[slot]? | return
-  env.state.modify fun s => { s with wsMuxSlot := s.wsMuxSlot.erase slot }
-  let some url := st.wsMuxSubUrl[sid]? | return
-  env.state.modify fun s => { s with wsMuxSubUrl := s.wsMuxSubUrl.erase sid }
-  let some pool := (← env.state.get).wsMuxPools[url]? | return
+  env.state.modify fun s => { s with wsMuxSlot := s.wsMuxSlot.erase slot, wsMuxSubUrl := s.wsMuxSubUrl.erase sid }
+  let some (_, url, pool) := findMuxPoolBySlot st slot | return
   let subs' := pool.subs.erase sid
   withOpenWsConn pool.conn fun cid => Dom.wsSendBytes cid (WsMuxFrame.encode (.unsub sid))
   if subs'.isEmpty then
@@ -358,11 +363,8 @@ private def performLeaf (env : RuntimeEnv Model Msg) : Cmd Msg → IO Unit
   | .wsMuxSub slot url channel params rec onJoin onMessage onStatus =>
       performWsMuxSub env slot url channel params rec onJoin onMessage onStatus
   | .wsMuxSend slot payload => do
-      let st ← env.state.get
-      let some sid := st.wsMuxSlot[slot]? | return
-      let some url := st.wsMuxSubUrl[sid]? | return
-      let some pool := st.wsMuxPools[url]? | return
-      withOpenWsConn pool.conn fun cid => Dom.wsSendBytes cid (WsMuxFrame.encode (.send sid payload))
+      if let some (sid, _, pool) := findMuxPoolBySlot (← env.state.get) slot then
+        withOpenWsConn pool.conn fun cid => Dom.wsSendBytes cid (WsMuxFrame.encode (.send sid payload))
   | .wsMuxUnsub slot => do if (← env.state.get).wsBooted then closeMuxSlot env slot
   | .wsExtOpen slot url isBinary rec onJoin onText onBytes onStatus =>
       performWsExtOpen env slot url isBinary rec onJoin onText onBytes onStatus
@@ -477,21 +479,26 @@ private def handleHttpBytesDone (env : RuntimeEnv Model Msg) (id : UInt32) (ok :
 private def handleUrlChanged (env : RuntimeEnv Model Msg) (path : String) : IO Unit := do
   if let some f := env.app.onUrlChange then dispatchMsg env (f path)
 
+private def withActiveMuxPool (env : RuntimeEnv Model Msg) (cid : UInt32) (url : String)
+    (f : WsMuxPool Msg → IO Unit) : IO Unit := do
+  if let some pool := (← env.state.get).wsMuxPools[url]? then
+    if pool.conn.connId == some cid then f pool
+
+private def withActiveExtEntry (env : RuntimeEnv Model Msg) (cid subId : UInt32)
+    (f : WsExtConnEntry Msg → IO Unit) : IO Unit := do
+  if let some entry := (← env.state.get).wsExtEntries[subId]? then
+    if !entry.closed && entry.conn.connId == some cid then f entry
+
 private def handleWsOpen (env : RuntimeEnv Model Msg) (cid : UInt32) : IO Unit := do
-  let st ← env.state.get
-  match st.wsConnOwner[cid]? with
-  | some (.mux url) =>
-      let some pool := st.wsMuxPools[url]? | return
-      if pool.conn.connId != some cid then return
+  match (← env.state.get).wsConnOwner[cid]? with
+  | some (.mux url) => withActiveMuxPool env cid url fun pool => do
       let resetSubs := pool.subs.fold (init := (∅ : Std.HashMap UInt32 (WsMuxSubEntry Msg)))
         fun acc sid sub => acc.insert sid { sub with attempt := 0, pendingRetry := false, nextAtMs := 0 }
       env.state.modify fun s =>
         { s with wsMuxPools := s.wsMuxPools.insert url { conn := { pool.conn with isOpen := true }, subs := resetSubs } }
       for (_, sub) in resetSubs.toList do
         Dom.wsSendBytes cid (WsMuxFrame.encode (.sub sub.subId sub.channel sub.params))
-  | some (.ext subId) =>
-      let some entry := st.wsExtEntries[subId]? | return
-      if entry.closed || entry.conn.connId != some cid then return
+  | some (.ext subId) => withActiveExtEntry env cid subId fun entry => do
       env.state.modify fun s =>
         { s with wsExtEntries := s.wsExtEntries.insert subId { entry with attempt := 0, conn := { entry.conn with isOpen := true } } }
       dispatchMsg env (entry.handlers.onStatus .connected)
@@ -508,11 +515,8 @@ private def dropMuxSub (env : RuntimeEnv Model Msg) (url : String) (pool : WsMux
   dispatchMsg env (sub.handlers.onStatus st)
 
 private def handleWsBytes (env : RuntimeEnv Model Msg) (cid : UInt32) (bytes : ByteArray) : IO Unit := do
-  let st ← env.state.get
-  match st.wsConnOwner[cid]? with
-  | some (.mux url) =>
-      let some pool := st.wsMuxPools[url]? | return
-      if pool.conn.connId != some cid then return
+  match (← env.state.get).wsConnOwner[cid]? with
+  | some (.mux url) => withActiveMuxPool env cid url fun pool => do
       match WsMuxFrame.decode bytes with
       | .ok (.joinOk sid snap) =>
           let some sub := pool.subs[sid]? | return
@@ -527,58 +531,52 @@ private def handleWsBytes (env : RuntimeEnv Model Msg) (cid : UInt32) (bytes : B
       | .ok (.closed sid _) => dropMuxSub env url pool sid .disconnected
       | _ => pure ()
   | some (.ext subId) =>
-      let some entry := st.wsExtEntries[subId]? | return
-      if entry.closed || entry.conn.connId != some cid then return
-      dispatchMsg env (entry.handlers.onBytes bytes)
+      withActiveExtEntry env cid subId fun entry => dispatchMsg env (entry.handlers.onBytes bytes)
   | none => pure ()
 
 private def handleWsText (env : RuntimeEnv Model Msg) (cid : UInt32) (text : String) : IO Unit := do
-  let st ← env.state.get
-  if let some (.ext subId) := st.wsConnOwner[cid]? then
-    let some entry := st.wsExtEntries[subId]? | return
-    if entry.closed || entry.conn.connId != some cid then return
-    dispatchMsg env (entry.handlers.onText text)
+  if let some (.ext subId) := (← env.state.get).wsConnOwner[cid]? then
+    withActiveExtEntry env cid subId fun entry => dispatchMsg env (entry.handlers.onText text)
 
-private def handleWsCloseMux (env : RuntimeEnv Model Msg) (cid : UInt32) (url err : String) (nowMs : Nat) : IO Unit := do
-  let some pool := (← env.state.get).wsMuxPools[url]? | return
-  if pool.conn.connId != some cid then return
-  if !err.isEmpty || pool.subs.isEmpty then
-    cancelWsTimer env pool.conn.timerKey pool.conn.timerId
-    env.state.modify fun s =>
-      let subUrl' := pool.subs.fold (init := s.wsMuxSubUrl) fun acc sid _ => acc.erase sid
-      { s with wsMuxPools := s.wsMuxPools.erase url, wsMuxSubUrl := subUrl' }
-    if !err.isEmpty then
-      for (_, sub) in pool.subs.toList do dispatchMsg env (sub.handlers.onStatus (.failed err))
-    return
-  let mut keptSubs : Std.HashMap UInt32 (WsMuxSubEntry Msg) := ∅
-  let mut statusMsgs : Array Msg := #[]
-  let mut minDelay? : Option Nat := none
-  let mut dropSids : Array UInt32 := #[]
-  for (sid, sub) in pool.subs.toList do
-    if sub.pendingRetry && nowMs < sub.nextAtMs then
-      let rem := sub.nextAtMs - nowMs
-      keptSubs := keptSubs.insert sid sub
-      minDelay? := some (match minDelay? with | some m => min m rem | none => rem)
+private def handleWsCloseMux (env : RuntimeEnv Model Msg) (cid : UInt32) (url err : String) (nowMs : Nat) : IO Unit :=
+  withActiveMuxPool env cid url fun pool => do
+    if !err.isEmpty || pool.subs.isEmpty then
+      cancelWsTimer env pool.conn.timerKey pool.conn.timerId
+      env.state.modify fun s =>
+        let subUrl' := pool.subs.fold (init := s.wsMuxSubUrl) fun acc sid _ => acc.erase sid
+        { s with wsMuxPools := s.wsMuxPools.erase url, wsMuxSubUrl := subUrl' }
+      if !err.isEmpty then
+        for (_, sub) in pool.subs.toList do dispatchMsg env (sub.handlers.onStatus (.failed err))
+      return
+    let mut keptSubs : Std.HashMap UInt32 (WsMuxSubEntry Msg) := ∅
+    let mut statusMsgs : Array Msg := #[]
+    let mut minDelay? : Option Nat := none
+    let mut dropSids : Array UInt32 := #[]
+    for (sid, sub) in pool.subs.toList do
+      if sub.pendingRetry && nowMs < sub.nextAtMs then
+        let rem := sub.nextAtMs - nowMs
+        keptSubs := keptSubs.insert sid sub
+        minDelay? := some (match minDelay? with | some m => min m rem | none => rem)
+      else
+        match sub.reconnect.nextDelayMs sub.attempt with
+        | none =>
+            dropSids := dropSids.push sid
+            statusMsgs := statusMsgs.push (sub.handlers.onStatus (wsClosedStatus sub.reconnect))
+        | some d =>
+            let sub' := { sub with attempt := sub.attempt + 1, pendingRetry := true, nextAtMs := nowMs + d }
+            keptSubs := keptSubs.insert sid sub'
+            minDelay? := some (match minDelay? with | some m => min m d | none => d)
+            statusMsgs := statusMsgs.push (sub.handlers.onStatus (.reconnecting sub'.attempt))
+    if !dropSids.isEmpty then
+      env.state.modify fun s =>
+        { s with wsMuxSubUrl := dropSids.foldl (fun acc sid => acc.erase sid) s.wsMuxSubUrl }
+    if keptSubs.isEmpty then
+      cancelWsTimer env pool.conn.timerKey pool.conn.timerId
+      env.state.modify fun s => { s with wsMuxPools := s.wsMuxPools.erase url }
     else
-      match sub.reconnect.nextDelayMs sub.attempt with
-      | none =>
-          dropSids := dropSids.push sid
-          statusMsgs := statusMsgs.push (sub.handlers.onStatus (wsClosedStatus sub.reconnect))
-      | some d =>
-          let sub' := { sub with attempt := sub.attempt + 1, pendingRetry := true, nextAtMs := nowMs + d }
-          keptSubs := keptSubs.insert sid sub'
-          minDelay? := some (match minDelay? with | some m => min m d | none => d)
-          statusMsgs := statusMsgs.push (sub.handlers.onStatus (.reconnecting sub'.attempt))
-  if !dropSids.isEmpty then
-    env.state.modify fun s =>
-      { s with wsMuxSubUrl := dropSids.foldl (fun acc sid => acc.erase sid) s.wsMuxSubUrl }
-  if keptSubs.isEmpty then
-    cancelWsTimer env pool.conn.timerKey pool.conn.timerId
-    env.state.modify fun s => { s with wsMuxPools := s.wsMuxPools.erase url }
-  else
-    let conn' ← scheduleWsConnRetry env pool.conn (minDelay?.getD 0) (ensureMuxConn env url)
-    env.state.modify fun s => { s with wsMuxPools := s.wsMuxPools.insert url { conn := conn', subs := keptSubs } }
-  for m in statusMsgs do dispatchMsg env m
+      let conn' ← scheduleWsConnRetry env pool.conn (minDelay?.getD 0) (ensureMuxConn env url)
+      env.state.modify fun s => { s with wsMuxPools := s.wsMuxPools.insert url { conn := conn', subs := keptSubs } }
+    for m in statusMsgs do dispatchMsg env m
 
 private def dropExtEntry (env : RuntimeEnv Model Msg) (subId : UInt32)
     (entry : WsExtConnEntry Msg) (st : SocketStatus) : IO Unit := do
@@ -586,18 +584,17 @@ private def dropExtEntry (env : RuntimeEnv Model Msg) (subId : UInt32)
   env.state.modify fun s => { s with wsExtEntries := s.wsExtEntries.erase subId }
   dispatchMsg env (entry.handlers.onStatus st)
 
-private def handleWsCloseExt (env : RuntimeEnv Model Msg) (cid subId : UInt32) (err : String) : IO Unit := do
-  let some entry := (← env.state.get).wsExtEntries[subId]? | return
-  if entry.closed || entry.conn.connId != some cid then return
-  if !err.isEmpty then dropExtEntry env subId entry (.failed err); return
-  match entry.reconnect.nextDelayMs entry.attempt with
-  | none => dropExtEntry env subId entry (wsClosedStatus entry.reconnect)
-  | some d =>
-      let attempt' := entry.attempt + 1
-      let conn' ← scheduleWsConnRetry env entry.conn d (openExtConn env subId)
-      env.state.modify fun s =>
-        { s with wsExtEntries := s.wsExtEntries.insert subId { entry with attempt := attempt', conn := conn' } }
-      dispatchMsg env (entry.handlers.onStatus (.reconnecting attempt'))
+private def handleWsCloseExt (env : RuntimeEnv Model Msg) (cid subId : UInt32) (err : String) : IO Unit :=
+  withActiveExtEntry env cid subId fun entry => do
+    if !err.isEmpty then dropExtEntry env subId entry (.failed err); return
+    match entry.reconnect.nextDelayMs entry.attempt with
+    | none => dropExtEntry env subId entry (wsClosedStatus entry.reconnect)
+    | some d =>
+        let attempt' := entry.attempt + 1
+        let conn' ← scheduleWsConnRetry env entry.conn d (openExtConn env subId)
+        env.state.modify fun s =>
+          { s with wsExtEntries := s.wsExtEntries.insert subId { entry with attempt := attempt', conn := conn' } }
+        dispatchMsg env (entry.handlers.onStatus (.reconnecting attempt'))
 
 private def handleWsClose (env : RuntimeEnv Model Msg) (cid : UInt32) (err : String) (nowMs : Nat) : IO Unit := do
   let owner? ← env.state.modifyGet fun s => (s.wsConnOwner[cid]?, { s with wsConnOwner := s.wsConnOwner.erase cid })

@@ -25,7 +25,6 @@ structure TokenMetaInfo where
   cssName    : String
   kind       : String -- "color" | "len" | "num" | "font" | "time" | "any"
   themeName? : Option Name := none
-  themeRule? : Option String := none
 deriving Inhabited
 
 initialize tokenMetaRegistry :
@@ -43,12 +42,9 @@ initialize keyframesMetaRegistry :
   Qed.Diag.mkNameMapExt (·.fullName)
 
 structure ThemeMetaInfo where
-  fullName      : Name
-  styleConst    : Name
-  themeConst    : Name
-  renderedRule  : String
-  definedTokens : List String
-  darkTokens    : List String
+  fullName   : Name
+  styleConst : Name
+  themeConst : Name
 deriving Inhabited
 
 initialize themeMetaRegistry :
@@ -109,21 +105,16 @@ private def takeRestOfLineFn (kind : Name) (mustEndWithColon : Bool) : ParserFn 
       let s3 := s2.setPos stopPos
       whitespace c s3
 
-def cssBlockHeader : Parser where
-  fn := takeRestOfLineFn `Qed.StyleDsl.cssBlockHeader true
+local macro "def_css_line_parser " id:Parser.ident mustColon:term : command => do
+  let full := Name.mkStr3 "Qed" "StyleDsl" id.getId.toString
+  let fmtId := mkIdent (id.getId ++ `formatter)
+  let parId := mkIdent (id.getId ++ `parenthesizer)
+  `(def $id : Parser := { fn := takeRestOfLineFn $(quote full) $mustColon }
+    @[combinator_formatter $(mkIdent full)] def $fmtId : PrettyPrinter.Formatter := PrettyPrinter.Formatter.visitAtom $(quote full)
+    @[combinator_parenthesizer $(mkIdent full)] def $parId : PrettyPrinter.Parenthesizer := PrettyPrinter.Parenthesizer.visitToken)
 
-def cssDeclLine : Parser where
-  fn := takeRestOfLineFn `Qed.StyleDsl.cssDeclLine false
-
-@[combinator_formatter Qed.StyleDsl.cssBlockHeader]
-def cssBlockHeader.formatter : PrettyPrinter.Formatter := PrettyPrinter.Formatter.visitAtom `Qed.StyleDsl.cssBlockHeader
-@[combinator_parenthesizer Qed.StyleDsl.cssBlockHeader]
-def cssBlockHeader.parenthesizer : PrettyPrinter.Parenthesizer := PrettyPrinter.Parenthesizer.visitToken
-
-@[combinator_formatter Qed.StyleDsl.cssDeclLine]
-def cssDeclLine.formatter : PrettyPrinter.Formatter := PrettyPrinter.Formatter.visitAtom `Qed.StyleDsl.cssDeclLine
-@[combinator_parenthesizer Qed.StyleDsl.cssDeclLine]
-def cssDeclLine.parenthesizer : PrettyPrinter.Parenthesizer := PrettyPrinter.Parenthesizer.visitToken
+def_css_line_parser cssBlockHeader true
+def_css_line_parser cssDeclLine false
 
 declare_syntax_cat cssBlockItem
 
@@ -225,14 +216,6 @@ private def validUnits : List String :=
 
 private def validTimeUnits : List String := ["ms", "s"]
 
-private def isNumericString (s : String) : Bool :=
-  let cs := match s.toList with | '-' :: r | '+' :: r => r | r => r
-  let (intPart, rest) := cs.span Char.isDigit
-  match rest with
-  | [] => !intPart.isEmpty
-  | '.' :: fracPart => !fracPart.isEmpty && fracPart.all Char.isDigit
-  | _ => false
-
 private def parseNumberWithUnit (tok : String) : Option (String × String) :=
   let cs := tok.toList
   let (sign, rest0) := match cs with
@@ -247,6 +230,9 @@ private def parseNumberWithUnit (tok : String) : Option (String × String) :=
     | _ => (d1, rest1)
   if numCs.isEmpty then none
   else some (sign ++ String.ofList numCs, String.ofList unitCs)
+
+private def isNumericString (s : String) : Bool :=
+  (parseNumberWithUnit s).any (·.2.isEmpty)
 
 private def isValidLenAtom (tok : String) : Bool :=
   tok == "0" || tok == "auto" || tok == "none" ||
@@ -388,6 +374,9 @@ private def checkStrictTokensForProp (ref : Syntax) (p : String) (kind : CssProp
     | _ => pure ()
 
 private def validatePropValue (ref : Syntax) (p resolvedVal : String) (kind : CssPropKind) (resolvedAtoms : List String) : CoreM Unit := do
+  let checkOrThrow {α : Type} : Except String α → CoreM Unit
+    | .ok _ => pure ()
+    | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
   match kind with
   | .enum allowed =>
       for a in resolvedAtoms do
@@ -396,9 +385,7 @@ private def validatePropValue (ref : Syntax) (p resolvedVal : String) (kind : Cs
   | .color =>
       if resolvedAtoms.length != 1 then
         throwErrorAt ref s!"CSS color property `{p}` expects a single color value, got `{resolvedVal}`"
-      match validateColorLiteral resolvedAtoms.head! with
-      | .ok _ => pure ()
-      | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
+      checkOrThrow (validateColorLiteral resolvedAtoms.head!)
   | .len =>
       for a in resolvedAtoms do
         unless isValidLenAtom a do
@@ -410,9 +397,7 @@ private def validatePropValue (ref : Syntax) (p resolvedVal : String) (kind : Cs
         let w := resolvedAtoms[0]!; let s := resolvedAtoms[1]!; let c := resolvedAtoms[2]!
         unless isValidLenAtom w do throwErrorAt ref s!"in `{p}`: invalid border width `{w}`"
         unless borderStyleVals.contains s || s.startsWith "var(" do throwErrorAt ref s!"in `{p}`: invalid border style `{s}`"
-        match validateColorLiteral c with
-        | .ok _ => pure ()
-        | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
+        checkOrThrow (validateColorLiteral c)
       else
         throwErrorAt ref s!"`{p}` expects `none`, `0`, or `<width> <style> <color>` (e.g. `1px solid #ddd`), got `{resolvedVal}`"
   | .time =>
@@ -424,10 +409,7 @@ private def validatePropValue (ref : Syntax) (p resolvedVal : String) (kind : Cs
         if a.startsWith "#" && !Qed.isValidHexColor a then
           throwErrorAt ref s!"in `{p}`: invalid hex color `{a}`"
         if let some (fn, args) := parseFuncCall? a then
-          if fn == "rgb" || fn == "rgba" then
-            match validateRgbArgs fn args with
-            | .ok _ => pure ()
-            | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
+          if fn == "rgb" || fn == "rgba" then checkOrThrow (validateRgbArgs fn args)
 
 private def resolveAndValidateDecl (ref : Syntax) (env : Environment) (currNs : Name)
     (openDecls : List OpenDecl) (strictTokens : Bool) (prop rawVal : String) :
@@ -457,16 +439,13 @@ private def resolveAndValidateDecl (ref : Syntax) (env : Environment) (currNs : 
         usedToks := usedToks ++ [tInfo.cssName]
         if let some thNm := tInfo.themeName? then
           unless usedThemes.contains thNm do usedThemes := usedThemes ++ [thNm]
-      else if (p == "animation" || p == "animation-name") then
+        continue
+      if p == "animation" || p == "animation-name" then
         if let some kfInfo := resolveInRegistry kfReg env currNs openDecls a then
           outAtoms := outAtoms.push kfInfo.kfName
           unless extraRules.contains kfInfo.rule do extraRules := extraRules ++ [kfInfo.rule]
-        else
-          outAtoms := outAtoms.push a
-      else
-        outAtoms := outAtoms.push a
-    else
-      outAtoms := outAtoms.push a
+          continue
+    outAtoms := outAtoms.push a
   let resolvedVal := String.intercalate " " outAtoms.toList
   let resolvedAtoms := outAtoms.toList
   if strictTokens && !isCustomProp then
@@ -489,6 +468,15 @@ private def atomText (stx : Syntax) : String :=
   | .atom _ v              => v
   | _                      => ""
 
+private def stripTrailingColon (stx : Syntax) : String :=
+  (String.ofList (atomText stx).trimmed.toList.dropLast).trimmed
+
+private def optDocComment (stx : Syntax) : Option (TSyntax ``Lean.Parser.Command.docComment) :=
+  if (stx.getArg 0).getNumArgs == 1 then some ⟨(stx.getArg 0).getArg 0⟩ else none
+
+private def getCssScope : CommandElabM (Environment × Name × List OpenDecl) :=
+  return (← getEnv, ← getCurrNamespace, (← getScope).openDecls)
+
 private def splitFirstChar (sep : Char) (s : String) : Option (String × String) :=
   let (lhs, rhs) := s.toList.span (· != sep)
   match rhs with
@@ -510,8 +498,7 @@ private partial def compileCssBlockItems (env : Environment) (currNs : Name)
   let mut thms  : List Name := []
   for stx in stxs do
     if stx.getKind == ``cssNestedBlock then
-      let rawHdr := (atomText (stx.getArg 0)).trimmed
-      let sel := (String.ofList rawHdr.toList.dropLast).trimmed
+      let sel := stripTrailingColon (stx.getArg 0)
       if sel.isEmpty then throwErrorAt (stx.getArg 0) "empty nested CSS selector"
       let sub ← compileCssBlockItems env currNs openDecls strictTokens (stx.getArg 1).getArgs
       items := items ++ [.nest sel sub.items]
@@ -558,9 +545,7 @@ private def quoteStyleLiteral (s : Qed.Style) : MacroM Term := do
 def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
     (nameId : Ident) (extendsIds : Array Ident) (strictTokens : Bool)
     (bodyStxs : Array Syntax) : CommandElabM Unit := do
-  let env ← getEnv
-  let currNs ← getCurrNamespace
-  let openDecls := (← getScope).openDecls
+  let (env, currNs, openDecls) ← getCssScope
   let compiled ← liftCoreM <| compileCssBlockItems env currNs openDecls strictTokens bodyStxs
   let styleReg := styleMetaRegistry.getState env
   let shortLabel := nameId.getId.getString!
@@ -590,37 +575,28 @@ def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
   }
 
 @[command_elab styleCmd] def elabStyleCmd : CommandElab := fun stx => do
-  let doc? : Option (TSyntax ``Lean.Parser.Command.docComment) :=
-    if (stx.getArg 0).getNumArgs == 1 then some ⟨((stx.getArg 0).getArg 0)⟩ else none
   let nameId : Ident := ⟨(stx.getArg 2)⟩
   let extendsIds : Array Ident :=
     if (stx.getArg 3).getNumArgs == 1 then (((stx.getArg 3).getArg 0).getArg 1).getSepArgs.map (⟨·⟩) else #[]
-  let strictTokens := (stx.getArg 4).getNumArgs == 1
-  let bodyStxs := (stx.getArg 6).getArgs
-  elabStyleDef doc? nameId extendsIds strictTokens bodyStxs
+  elabStyleDef (optDocComment stx) nameId extendsIds ((stx.getArg 4).getNumArgs == 1) (stx.getArg 6).getArgs
 
 /-! ## `keyframes <name>:` Elaborator -/
 
 @[command_elab keyframesCmd] def elabKeyframesCmd : CommandElab := fun stx => do
-  let doc? : Option (TSyntax ``Lean.Parser.Command.docComment) :=
-    if (stx.getArg 0).getNumArgs == 1 then some ⟨((stx.getArg 0).getArg 0)⟩ else none
   let nameId : Ident := ⟨(stx.getArg 2)⟩
   let kfName := Qed.sanitizeCssIdent nameId.getId.getString!
-  let env ← getEnv
-  let currNs ← getCurrNamespace
-  let openDecls := (← getScope).openDecls
+  let (env, currNs, openDecls) ← getCssScope
   let mut steps : List (String × List Qed.Item) := []
   for stepStx in (stx.getArg 4).getArgs do
     unless stepStx.getKind == ``cssNestedBlock do
       throwErrorAt stepStx "expected keyframe stop (`from:`, `to:`, or `50%:`)"
-    let rawHdr := (atomText (stepStx.getArg 0)).trimmed
-    let stopSel := (String.ofList rawHdr.toList.dropLast).trimmed
     let compiled ← liftCoreM <| compileCssBlockItems env currNs openDecls false (stepStx.getArg 1).getArgs
-    steps := steps ++ [(stopSel, compiled.items)]
+    steps := steps ++ [(stripTrailingColon (stepStx.getArg 0), compiled.items)]
   let kf : Qed.Keyframes := { name := kfName, steps }
   let stepTerms ← liftMacroM <| steps.toArray.mapM fun (sel, body) => do
     let bTerms ← body.toArray.mapM quoteItem
     `(($(Syntax.mkStrLit sel), [$[$bTerms],*]))
+  let doc? := optDocComment stx
   elabCommand (← `(command| $[$doc?:docComment]? def $nameId : Qed.Keyframes :=
     Qed.keyframes $(Syntax.mkStrLit kfName) [$[$stepTerms],*]))
   let fullName := currNs ++ nameId.getId
@@ -745,8 +721,7 @@ private def quoteOptColor (cssStr? : Option String) (rgb? : Option (Nat × Nat �
     | none           => `(none)
   `(some ({ raw := $(Syntax.mkStrLit cssStr), rgb? := $rgbT } : Qed.Color))
 
-private def emitThemeTokens (themeNm fullThemeName : Name) (thStyleRaw : String)
-    (entries : Array ThemeTokEntry) : CommandElabM Unit := do
+private def emitThemeTokens (themeNm fullThemeName : Name) (entries : Array ThemeTokEntry) : CommandElabM Unit := do
   for e in entries do
     let tokId := mkIdentFrom e.ref (themeNm ++ Name.mkSimple e.ident)
     let mkOptRaw (ty : Term) : Option String → MacroM Term
@@ -764,7 +739,7 @@ private def emitThemeTokens (themeNm fullThemeName : Name) (thStyleRaw : String)
       { name := $(Syntax.mkStrLit e.cssName), lightVal := $lTerm, darkVal := $dTerm }))
     modifyEnv fun env' => tokenMetaRegistry.addEntry env' {
       fullName := fullThemeName ++ Name.mkSimple e.ident, cssName := e.cssName
-      kind := e.kind, themeName? := some fullThemeName, themeRule? := some thStyleRaw
+      kind := e.kind, themeName? := some fullThemeName
     }
 
 private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntry)
@@ -776,15 +751,14 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
       | throwErrorAt inv.ref s!"unknown token `{inv.bgName}` in contrast invariant `{inv.invName}`"
     unless fgE.kind == "color" && bgE.kind == "color" do
       throwErrorAt inv.ref s!"`contrast({inv.fgName}, {inv.bgName})` requires two `color` tokens"
-    let lightRatio := Qed.Color.contrastX100 ⟨fgE.lightCss, fgE.lightRgb⟩ ⟨bgE.lightCss, bgE.lightRgb⟩
-    if lightRatio < inv.minX100 then
-      throwErrorAt inv.ref s!"WCAG contrast invariant `{inv.invName}` failed in light mode: contrast({inv.fgName}={fgE.lightCss}, {inv.bgName}={bgE.lightCss}) is {Qed.formatContrastX100 lightRatio}, required >= {Qed.formatContrastX100 inv.minX100}"
+    let checkMode (mode : String) (fg bg : Qed.Color) : CommandElabM Unit := do
+      let ratio := Qed.Color.contrastX100 fg bg
+      if ratio < inv.minX100 then
+        throwErrorAt inv.ref s!"WCAG contrast invariant `{inv.invName}` failed in {mode} mode: contrast({inv.fgName}={fg.raw}, {inv.bgName}={bg.raw}) is {Qed.formatContrastX100 ratio}, required >= {Qed.formatContrastX100 inv.minX100}"
+    checkMode "light" ⟨fgE.lightCss, fgE.lightRgb⟩ ⟨bgE.lightCss, bgE.lightRgb⟩
     if fgE.darkCss?.isSome || bgE.darkCss?.isSome then
-      let darkFg : Qed.Color := ⟨fgE.darkCss?.getD fgE.lightCss, fgE.darkRgb?.orElse (fun _ => fgE.lightRgb)⟩
-      let darkBg : Qed.Color := ⟨bgE.darkCss?.getD bgE.lightCss, bgE.darkRgb?.orElse (fun _ => bgE.lightRgb)⟩
-      let darkRatio := Qed.Color.contrastX100 darkFg darkBg
-      if darkRatio < inv.minX100 then
-        throwErrorAt inv.ref s!"WCAG contrast invariant `{inv.invName}` failed in dark mode: contrast({inv.fgName}={darkFg.raw}, {inv.bgName}={darkBg.raw}) is {Qed.formatContrastX100 darkRatio}, required >= {Qed.formatContrastX100 inv.minX100}"
+      checkMode "dark" ⟨fgE.darkCss?.getD fgE.lightCss, fgE.darkRgb?.orElse (fun _ => fgE.lightRgb)⟩
+        ⟨bgE.darkCss?.getD bgE.lightCss, bgE.darkRgb?.orElse (fun _ => bgE.lightRgb)⟩
     let invId := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple inv.invName)
     let fgId  := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple inv.fgName)
     let bgId  := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple inv.bgName)
@@ -792,13 +766,10 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
       theorem $invId : Qed.TypedToken.wcagCheck $fgId $bgId $(Syntax.mkNumLit (toString inv.minX100)) = true := by decide))
 
 @[command_elab themeCmd] def elabThemeCmd : CommandElab := fun stx => do
-  let doc? : Option (TSyntax ``Lean.Parser.Command.docComment) :=
-    if (stx.getArg 0).getNumArgs == 1 then some ⟨((stx.getArg 0).getArg 0)⟩ else none
+  let doc? := optDocComment stx
   let themeId : Ident := ⟨(stx.getArg 2)⟩
   let themeNm := themeId.getId
-  let env ← getEnv
-  let currNs ← getCurrNamespace
-  let openDecls := (← getScope).openDecls
+  let (env, currNs, openDecls) ← getCssScope
   let mut entries : Array ThemeTokEntry := #[]
   let mut resets  : List Qed.Item := []
   let mut invs    : Array ThemeContrastInv := #[]
@@ -817,8 +788,7 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
           kind, lightCss := cleanVal, lightRgb := rgb?
         }
     else if itemStx.getKind == ``cssNestedBlock then
-      let rawHdr := (atomText (itemStx.getArg 0)).trimmed
-      let hdr := (String.ofList rawHdr.toList.dropLast).trimmed
+      let hdr := stripTrailingColon (itemStx.getArg 0)
       if hdr == "dark" then
         for dStx in (itemStx.getArg 1).getArgs do
           unless dStx.getKind == ``cssSimpleDecl do
@@ -848,7 +818,7 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
   }
   let thStyle := thVal.asStyle
   let fullThemeName := currNs ++ themeNm
-  emitThemeTokens themeNm fullThemeName thStyle.raw entries
+  emitThemeTokens themeNm fullThemeName entries
   let lDeclTerms ← liftMacroM <| lightDecls.toArray.mapM quoteItem
   let dDeclTerms ← liftMacroM <| darkDecls.toArray.mapM quoteItem
   let rTerms     ← liftMacroM <| resets.toArray.mapM quoteItem
@@ -867,9 +837,7 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
   elabCommand (← `(command| def $styleConstId : Qed.Style := $styleLit))
   emitThemeContrastInvs themeNm entries invs
   modifyEnv fun env' => themeMetaRegistry.addEntry env' {
-    fullName := fullThemeName, styleConst := fullThemeName ++ `style
-    themeConst := fullThemeName ++ `theme, renderedRule := thStyle.raw
-    definedTokens := defToks, darkTokens := darkToks
+    fullName := fullThemeName, styleConst := fullThemeName ++ `style, themeConst := fullThemeName ++ `theme
   }
 
 /-! ## `verify_theme <Theme> for <app>` Command (Kernel Proof of Token Completeness) -/
@@ -877,9 +845,7 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
 @[command_elab verifyThemeCmd] def elabVerifyThemeCmd : CommandElab := fun stx => do
   let thId : Ident := ⟨(stx.getArg 1)⟩
   let target : Term := ⟨(stx.getArg 3)⟩
-  let env ← getEnv
-  let currNs ← getCurrNamespace
-  let openDecls := (← getScope).openDecls
+  let (env, currNs, openDecls) ← getCssScope
   let some thInfo := resolveInRegistry (themeMetaRegistry.getState env) env currNs openDecls thId.getId.toString
     | throwErrorAt thId s!"unknown `theme` `{thId.getId}`"
   let thConst := mkIdentFrom thId thInfo.themeConst

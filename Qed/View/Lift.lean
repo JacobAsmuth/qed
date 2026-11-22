@@ -202,28 +202,22 @@ elab "qedInternalChild% " "fun " mb:ident " => " body:term : term <= expectedTyp
 open Lean in
 mutual
   partial def viewLift (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM Syntax := do
+    let liftIf (c t e : Term) (h? : Option Ident) : MacroM Syntax := do
+      let t' : Term := ⟨← viewLift m fields t⟩
+      let e' : Term := ⟨← viewLift m fields e⟩
+      let mkIte (a b : Term) := match h? with | some h => `(if $h:ident : $c then $a else $b) | none => `(if $c then $a else $b)
+      if viewMentionsAny m.getId fields c then
+        return (← `(Qed.V.ifElse $(← mkModelFn m fields (← mkIte (← `(true)) (← `(false)))) $t' $e'))
+      else return (← mkIte t' e')
     match stx with
     | `(text $e:term) =>
         if viewMentionsAny m.getId fields e then
           return (← `(Qed.V.dyn $(← mkModelFn m fields (← `(toString $e)))))
         else return (← `(Qed.V.text (toString $e)))
-    | `(if $c:term then $t:term else $e:term) =>
-        let t' : Term := ⟨← viewLift m fields t⟩
-        let e' : Term := ⟨← viewLift m fields e⟩
-        if viewMentionsAny m.getId fields c then
-          return (← `(Qed.V.ifElse $(← mkModelFn m fields (← `(if $c then true else false))) $t' $e'))
-        else
-          return (← `(if $c then $t' else $e'))
+    | `(if $c:term then $t:term else $e:term) => liftIf c t e none
     | `(if $h:ident : $c:term then $t:term else $e:term) =>
-        if !viewMentionsAny h.getId #[] t && !viewMentionsAny h.getId #[] e then
-          let t' : Term := ⟨← viewLift m fields t⟩
-          let e' : Term := ⟨← viewLift m fields e⟩
-          if viewMentionsAny m.getId fields c then
-            return (← `(Qed.V.ifElse $(← mkModelFn m fields (← `(if $h:ident : $c then true else false))) $t' $e'))
-          else
-            return (← `(if $h:ident : $c then $t' else $e'))
-        else
-          catchAll m fields stx
+        if !viewMentionsAny h.getId #[] t && !viewMentionsAny h.getId #[] e then liftIf c t e (some h)
+        else catchAll m fields stx
     | _ =>
         if stx.isStrLit?.isSome then return stx
         if stx.getKind == kMatch && viewMentionsAny m.getId fields stx then

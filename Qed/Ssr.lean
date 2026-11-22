@@ -96,22 +96,27 @@ def renderStylesheetLinks : List String → String
       let tag := if isSafeUrl s then "<link rel=\"stylesheet\" href=\"" ++ escapeHtml s ++ "\">" else ""
       tag ++ renderStylesheetLinks rest
 
+private def docHeadPrefix (title extra : String) : String :=
+  "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
+    ++ "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    ++ "<title>" ++ escapeHtml title ++ "</title>" ++ extra
+
+private def docStyleTag (css : String) : String :=
+  if css.isEmpty then "" else "<style id=\"qed-styles\">" ++ escapeRawText css ++ "</style>"
+
+private def docScriptTag (script : String) : String :=
+  "<script type=\"module\" src=\"" ++ safeScriptSrc script ++ "\"></script>\n</body>\n</html>"
+
 def renderDocument (title : String) (appHtml : String) (script : String := "/qed.js")
     (state : String := "") (css : String := "") (stylesheets : List String := [])
     (headMeta : HeadMeta := {}) : String :=
   -- Escape `</` → `<\/` (valid JSON/CSS) so embedded payloads cannot close `<script>`/`<style>` early.
-  let effTitle := headMeta.title.getD title
-  let metaTags := renderHeadMeta headMeta
-  let linkTags := renderStylesheetLinks stylesheets
-  let styleTag := if css.isEmpty || appHtml.contains css then ""
-                  else "<style id=\"qed-styles\">" ++ escapeRawText css ++ "</style>"
-  "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
-    ++ "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-    ++ "<title>" ++ escapeHtml effTitle ++ "</title>" ++ metaTags ++ linkTags ++ styleTag ++ "</head>\n"
-    ++ "<body><div id=\"app\">" ++ appHtml ++ "</div>\n"
+  let styleTag := if css.isEmpty || appHtml.contains css then "" else docStyleTag css
+  docHeadPrefix (headMeta.title.getD title) (renderHeadMeta headMeta ++ renderStylesheetLinks stylesheets)
+    ++ styleTag ++ "</head>\n<body><div id=\"app\">" ++ appHtml ++ "</div>\n"
     ++ (if state.isEmpty then ""
         else "<script id=\"qed-state\" type=\"application/json\">" ++ escapeRawText state ++ "</script>\n")
-    ++ "<script type=\"module\" src=\"" ++ safeScriptSrc script ++ "\"></script>\n</body>\n</html>"
+    ++ docScriptTag script
 
 /-- Render a complete SSR HTML5 document directly into a UTF-8 `ByteArray` for zero-copy native serving. -/
 def renderDocumentBytes (title : String) (appHtml : String) (script : String := "/qed_host.mjs")
@@ -180,14 +185,15 @@ private def App.ssrInitQueue (app : App Model Msg) (path : String)
     | none   => (mSess, .none)
   (m1, cSessList ++ Cmd.flatten cRoute ++ Cmd.flatten app.init.2)
 
+private def App.renderDocFor (app : App Model Msg) (title script : String) (m : Model) : String :=
+  renderDocument title (app.renderModel m) script (state := app.dehydrate m)
+    (css := renderStyleSheet app.styles) (stylesheets := app.stylesheets) (headMeta := app.headFor m)
+
 def App.ssrStep (app : App Model Msg) (path title script resultsJson : String) : String :=
   let (m1, queue) := app.ssrInitQueue path
   let (m, needs) := ssrDrain app (ssrResults resultsJson) m1 queue 0 #[]
   if needs.isEmpty then
-    Json.render (.obj [("html",
-      .str (renderDocument title (app.renderModel m) script
-        (state := app.dehydrate m) (css := renderStyleSheet app.styles)
-        (stylesheets := app.stylesheets) (headMeta := app.headFor m)))])
+    Json.render (.obj [("html", .str (app.renderDocFor title script m))])
   else
     Json.render (.obj [("need", .arr (needs.toList.map fun n =>
       let base := [("method", .str n.method), ("url", .str n.url), ("body", .str n.body)]
@@ -237,15 +243,10 @@ structure PrebuiltDocShell where
 
 def mkPrebuiltDocShell (title : String) (script : String := "/qed_host.mjs")
     (css : String := "") (stylesheets : List String := []) : PrebuiltDocShell :=
-  let linkTags := renderStylesheetLinks stylesheets
-  let baseHead :=
-    "<!doctype html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
-      ++ "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-      ++ "<title>" ++ escapeHtml title ++ "</title>" ++ linkTags
-  let styleTag := if css.isEmpty then "" else "<style id=\"qed-styles\">" ++ escapeRawText css ++ "</style>"
-  let scriptTag := "<script type=\"module\" src=\"" ++ safeScriptSrc script ++ "\"></script>\n</body>\n</html>"
+  let baseHead := docHeadPrefix title (renderStylesheetLinks stylesheets)
+  let scriptTag := docScriptTag script
   { css
-    headWithCssBytes := (baseHead ++ styleTag ++ "</head>\n<body><div id=\"app\">").toUTF8
+    headWithCssBytes := (baseHead ++ docStyleTag css ++ "</head>\n<body><div id=\"app\">").toUTF8
     headNoCssBytes   := (baseHead ++ "</head>\n<body><div id=\"app\">").toUTF8
     afterAppBytes    := "</div>\n<script id=\"qed-state\" type=\"application/json\">".toUTF8
     afterStateBytes  := ("</script>\n" ++ scriptTag).toUTF8
@@ -304,9 +305,7 @@ def App.ssrRenderNativeBytes {Model Msg : Type} {m : Type → Type} [Monad m]
     (script : String := "/qed_host.mjs") (fuel : Nat := 32)
     (sessionUser : Option String := none) : m ByteArray := do
   let mdl ← app.ssrBootM path dispatchBytes dispatchText fuel sessionUser
-  return renderDocumentBytes title (app.renderModel mdl) script
-    (state := app.dehydrate mdl) (css := renderStyleSheet app.styles)
-    (stylesheets := app.stylesheets) (headMeta := app.headFor mdl)
+  return (app.renderDocFor title script mdl).toUTF8
 
 /-! ## JS SSR (`ssrStep`) ↔ Native In-Memory SSR (`ssrRenderNativeBytes`) Equivalence -/
 
@@ -365,22 +364,10 @@ private theorem ssrDrain_eq_ssrDrainQueueM {Model Msg : Type} (app : App Model M
       simp only [ssrDrainQueueM, hdisp, bind]
       exact ih
   | @skip _ c hnot m rest fuel mFinal _ ih =>
-      have hDrain : ∀ (j : Nat), ssrDrain app results m (c :: rest) j #[] = ssrDrain app results m rest j #[] := by
-        intro j
-        rcases hnot with ⟨h1, h2⟩
-        cases c with
-        | request m' u b cb => exact absurd rfl (h1 m' u b cb)
-        | requestBytes m' u b cb => exact absurd rfl (h2 m' u b cb)
-        | _ => simp only [ssrDrain]
-      have hQueue : ssrDrainQueueM (m := Id) app dispatchBytes dispatchText (fuel + 1) m (c :: rest) =
-          ssrDrainQueueM (m := Id) app dispatchBytes dispatchText fuel m rest := by
-        rcases hnot with ⟨h1, h2⟩
-        cases c with
-        | request m' u b cb => exact absurd rfl (h1 m' u b cb)
-        | requestBytes m' u b cb => exact absurd rfl (h2 m' u b cb)
-        | _ => rfl
-      rw [hDrain, hQueue]
-      exact ih
+      cases c with
+      | request m' u b cb => exact absurd rfl (hnot.1 m' u b cb)
+      | requestBytes m' u b cb => exact absurd rfl (hnot.2 m' u b cb)
+      | _ => simpa only [ssrDrain, ssrDrainQueueM] using ih
 
 /-- Equivalence between Node/Edge JS SSR (`App.ssrStep`) and native in-memory SSR
     (`App.ssrRenderNativeBytes (m := Id)`): whenever the pre-fetched `resultsJson` matches the
@@ -399,10 +386,8 @@ theorem App.ssrStep_equiv_ssrRenderNativeBytes {Model Msg : Type} (app : App Mod
     app.ssrStep path title script resultsJson = Json.render (.obj [("html", .str doc)]) ∧
     App.ssrRenderNativeBytes (m := Id) app path title dispatchBytes dispatchText script fuel = doc.toUTF8 := by
   obtain ⟨hd, hq⟩ := ssrDrain_eq_ssrDrainQueueM app (ssrResults resultsJson) dispatchBytes dispatchText hmatch
-  refine ⟨?_, ?_⟩
-  · simp [App.ssrStep, hd]
-  · simp only [App.ssrRenderNativeBytes, App.ssrBootM, bind, pure, hq]
-    rfl
+  exact ⟨by simp [App.ssrStep, App.renderDocFor, hd],
+    by simp only [App.ssrRenderNativeBytes, App.ssrBootM, App.renderDocFor, bind, pure, hq]⟩
 
 /-- Server-side binary Protobuf wire adapter around a typed RPC handler `Req → Except String Resp`. -/
 def rpcWireDispatch {Req Resp : Type} [FromProto Req] [ToProto Resp]
@@ -466,18 +451,12 @@ def ssrDispatchRpc (srvShort : String) (methods : List String)
   else
     .error s!"SSR unknown binary RPC endpoint: {url}"
 
-private theorem takeWhile_ne_append (p : Char → Bool) :
-    ∀ (xs ys : List Char), (∀ c ∈ xs, p c = true) → (∀ c ∈ ys, p c = true) →
-      (xs ++ ys).takeWhile p = xs ++ ys
-  | [], ys, _, hys => by
-      induction ys with
-      | nil => rfl
-      | cons y rest ih =>
-          simp only [List.nil_append, List.takeWhile_cons, hys y (by simp), ↓reduceIte]
-          exact congrArg (y :: ·) (ih (fun c hc => hys c (by simp [hc])))
-  | x :: xs, ys, hxs, hys => by
-      simp only [List.cons_append, List.takeWhile_cons, hxs x (by simp), ↓reduceIte]
-      exact congrArg (x :: ·) (takeWhile_ne_append p xs ys (fun c hc => hxs c (by simp [hc])) hys)
+private theorem takeWhile_eq_self (p : Char → Bool) :
+    ∀ (xs : List Char), (∀ c ∈ xs, p c = true) → xs.takeWhile p = xs
+  | [], _ => rfl
+  | x :: xs, h => by
+      simp only [List.takeWhile_cons, h x List.mem_cons_self, ↓reduceIte]
+      exact congrArg (x :: ·) (takeWhile_eq_self p xs fun c hc => h c (List.mem_cons_of_mem _ hc))
 
 /-- Any binary RPC endpoint targeting `srvShort` and a declared method `m ∈ methods`
     routes directly to `dispatchMethod m reqBody` during in-memory SSR. -/
@@ -490,36 +469,23 @@ theorem ssr_rpc_endpoint_routed (srvShort : String) (methods : List String)
     ssrDispatchRpc srvShort methods dispatchMethod "POST" ("/_qed/rpc/" ++ srv ++ "/" ++ m) reqBody =
       dispatchMethod m reqBody := by
   subst srv
-  have hpfxNoQ : ∀ c ∈ ("/_qed/rpc/" ++ srvShort ++ "/").toList, c ≠ '?' := by
+  let pfx := "/_qed/rpc/" ++ srvShort ++ "/"
+  have hnoQ : ∀ c ∈ (pfx ++ m).toList, c ≠ '?' := by
     intro c hc
-    simp only [String.toList_append, List.mem_append] at hc
-    rcases hc with (h1 | h2) | h3
-    · have hlit : ∀ x ∈ "/_qed/rpc/".toList, x ≠ '?' := by decide
-      exact hlit c h1
-    · exact hsrvNoQ c h2
-    · have hlit : ∀ x ∈ "/".toList, x ≠ '?' := by decide
-      exact hlit c h3
-  have hurl : ("/_qed/rpc/" ++ srvShort ++ "/" ++ m).toList.takeWhile (· ≠ '?') =
-      ("/_qed/rpc/" ++ srvShort ++ "/").toList ++ m.toList := by
-    have h1 : ("/_qed/rpc/" ++ srvShort ++ "/" ++ m).toList =
-        ("/_qed/rpc/" ++ srvShort ++ "/").toList ++ m.toList := by
-      simp [String.toList_append, List.append_assoc]
-    rw [h1]
-    exact takeWhile_ne_append (· ≠ '?') ("/_qed/rpc/" ++ srvShort ++ "/").toList m.toList
-      (fun c hc => decide_eq_true (hpfxNoQ c hc))
-      (fun c hc => decide_eq_true (hmNoQ c hc))
-  have hpath : String.ofList (("/_qed/rpc/" ++ srvShort ++ "/" ++ m).toList.takeWhile (· ≠ '?')) =
-      ("/_qed/rpc/" ++ srvShort ++ "/") ++ m := by
-    rw [hurl, ← String.toList_append, String.ofList_toList]
-  have hdrop : (("/_qed/rpc/" ++ srvShort ++ "/") ++ m).toList.drop ("/_qed/rpc/" ++ srvShort ++ "/").length =
-      m.toList := by
-    rw [String.toList_append, ← String.length_toList (s := "/_qed/rpc/" ++ srvShort ++ "/"), List.drop_left]
-  unfold ssrDispatchRpc
-  dsimp only
-  rw [hpath]
-  have hsw : (("/_qed/rpc/" ++ srvShort ++ "/") ++ m).startsWith ("/_qed/rpc/" ++ srvShort ++ "/") = true := by
-    simp [String.startsWith]
-  simp only [beq_self_eq_true, hsw, Bool.and_self, ↓reduceIte, hdrop, String.ofList_toList, hm]
+    simp only [pfx, String.toList_append, List.mem_append] at hc
+    rcases hc with ((h | h) | h) | h
+    · exact (by decide : ∀ x ∈ "/_qed/rpc/".toList, x ≠ '?') c h
+    · exact hsrvNoQ c h
+    · exact (by decide : ∀ x ∈ "/".toList, x ≠ '?') c h
+    · exact hmNoQ c h
+  have hpath : String.ofList ((pfx ++ m).toList.takeWhile (· ≠ '?')) = pfx ++ m := by
+    rw [takeWhile_eq_self _ _ fun c hc => decide_eq_true (hnoQ c hc), String.ofList_toList]
+  have hdrop : (pfx ++ m).toList.drop pfx.length = m.toList := by
+    rw [String.toList_append, ← String.length_toList (s := pfx), List.drop_left]
+  have hsw : (pfx ++ m).startsWith pfx = true := by simp [String.startsWith]
+  unfold ssrDispatchRpc; dsimp only
+  rw [hpath, hsw, hdrop]
+  simp only [beq_self_eq_true, Bool.and_self, ↓reduceIte, String.ofList_toList, hm]
 
 /-- Full-stack SSR RPC closure theorem: when every client RPC in `usedRpcs` targets `srvShort`
     and a method in `methods`, SSR never encounters an unknown binary RPC endpoint error. -/

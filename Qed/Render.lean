@@ -547,10 +547,7 @@ theorem renderAttr_valid_on (hs : Array msg) {ev : String} (m : msg)
     renderAttr hs (.on ev m) = (" data-qed-on-" ++ ev ++ "=\"" ++ toString hs.size ++ "\"", hs.push m) := by
   simp only [Attr.valid, isSafeAttrName, Bool.and_eq_true] at hv
   have hsk : sanitizeKey ev = ev := sanitizeKey_of_safe hv.1
-  have hneB : ev.isEmpty = false := by
-    cases he : ev.isEmpty with
-    | false => rfl
-    | true => exact absurd (String.isEmpty_iff.1 he) hne
+  have hneB : ev.isEmpty = false := Bool.eq_false_iff.2 fun h => hne (String.isEmpty_iff.1 h)
   simp [renderAttr, hsk, hneB]
 
 private theorem isKeyChar_no_angle {c : Char} (h : isKeyChar c = true) : c ≠ '<' ∧ c ≠ '>' := by
@@ -568,21 +565,16 @@ private theorem toDigitsCore_no_angle :
     ∀ (k m : Nat) (acc : List Char),
       (∀ c ∈ acc, c ≠ '<' ∧ c ≠ '>') →
       ∀ c ∈ Nat.toDigitsCore 10 k m acc, c ≠ '<' ∧ c ≠ '>'
-  | 0, m, acc, hacc, c, hc => by
-      rw [Nat.toDigitsCore.eq_1] at hc
-      exact hacc c hc
+  | 0, _, _, hacc, c, hc => by rw [Nat.toDigitsCore.eq_1] at hc; exact hacc c hc
   | k + 1, m, acc, hacc, c, hc => by
+      have hcons : ∀ x ∈ Nat.digitChar (m % 10) :: acc, x ≠ '<' ∧ x ≠ '>' := fun x hx =>
+        match List.mem_cons.1 hx with
+        | .inl h => h ▸ digitChar_no_angle (m % 10) (Nat.mod_lt _ (by decide))
+        | .inr h => hacc x h
       rw [Nat.toDigitsCore.eq_2] at hc
       split at hc
-      · rcases List.mem_cons.1 hc with rfl | hmem
-        · exact digitChar_no_angle (m % 10) (Nat.mod_lt _ (by decide))
-        · exact hacc c hmem
-      · exact toDigitsCore_no_angle k (m / 10) (Nat.digitChar (m % 10) :: acc)
-          (fun x hx => by
-            rcases List.mem_cons.1 hx with rfl | hmem
-            · exact digitChar_no_angle (m % 10) (Nat.mod_lt _ (by decide))
-            · exact hacc x hmem)
-          c hc
+      · exact hcons c hc
+      · exact toDigitsCore_no_angle k (m / 10) _ hcons c hc
 
 private theorem nat_repr_no_angle (n : Nat) :
     ∀ c ∈ (toString n).toList, c ≠ '<' ∧ c ≠ '>' := by
@@ -599,23 +591,9 @@ private theorem escapeHtml_no_angle (s : String) :
   simp only [isMarkupOrQuote, Bool.or_eq_false_iff, beq_eq_false_iff_ne, ne_eq] at hnm
   exact ⟨hnm.1.1.1, hnm.1.1.2⟩
 
-private theorem str_append_no_angle {a b : String}
-    (ha : ∀ c ∈ a.toList, c ≠ '<' ∧ c ≠ '>')
-    (hb : ∀ c ∈ b.toList, c ≠ '<' ∧ c ≠ '>') :
-    ∀ c ∈ (a ++ b).toList, c ≠ '<' ∧ c ≠ '>' := by
-  intro c hc
-  rw [String.toList_append, List.mem_append] at hc
-  rcases hc with h1 | h2
-  · exact ha c h1
-  · exact hb c h2
-
 private theorem lit_no_angle (s : String) (h : s.toList.all (fun c => c != '<' && c != '>') = true) :
-    ∀ c ∈ s.toList, c ≠ '<' ∧ c ≠ '>' := by
-  rw [List.all_eq_true] at h
-  intro c hc
-  have hb := h c hc
-  simp only [Bool.and_eq_true, bne_iff_ne] at hb
-  exact hb
+    ∀ c ∈ s.toList, c ≠ '<' ∧ c ≠ '>' := fun c hc => by
+  simpa only [Bool.and_eq_true, bne_iff_ne] using List.all_eq_true.1 h c hc
 
 /-- End-to-end HTML safety closure: whenever `Html.validIn ctx h = true`, every element in `h`
     has a safe, non-forbidden tag (`<script>`/`<base>`/`<object>`/`<embed>`/`<applet>` forbidden),
@@ -690,9 +668,8 @@ theorem renderAttr_no_angle_brackets (hs : Array msg) (a : Attr msg) :
 theorem renderAttrs_no_angle_brackets (hs : Array msg) :
     ∀ (attrs : List (Attr msg)), ∀ c ∈ (renderAttrs hs attrs).1.toList, c ≠ '<' ∧ c ≠ '>'
   | [] => lit_no_angle "" rfl
-  | a :: as => by
-      simp only [renderAttrs]
-      exact str_append_no_angle (renderAttr_no_angle_brackets hs a)
-        (renderAttrs_no_angle_brackets (renderAttr hs a).2 as)
+  | a :: as => fun c hc => by
+      rw [renderAttrs, String.toList_append, List.mem_append] at hc
+      exact hc.elim (renderAttr_no_angle_brackets hs a c) (renderAttrs_no_angle_brackets (renderAttr hs a).2 as c)
 
 end Qed

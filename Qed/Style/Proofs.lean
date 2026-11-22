@@ -222,13 +222,9 @@ theorem Theme.render_no_closeSeq (th : Theme) :
     containsCloseSeq (Theme.render th).toList = false :=
   containsCloseSeq_of_no_lt (Theme.render_no_lt th)
 
-theorem Keyframes.renderSteps_no_lt :
-    ∀ (steps : List (String × List Item)), ∀ c ∈ (Keyframes.renderSteps steps).toList, c ≠ '<'
-  | [] => lit_no_lt "" rfl
-  | [(_, body)] => by have := Item.renderList_no_lt body; simp only [Keyframes.renderSteps]; solve_str_prop
-  | (_, body) :: s2 :: rest => by
-      have := Item.renderList_no_lt body; have := Keyframes.renderSteps_no_lt (s2 :: rest)
-      simp only [Keyframes.renderSteps]; solve_str_prop
+theorem Keyframes.renderSteps_no_lt (steps : List (String × List Item)) :
+    ∀ c ∈ (Keyframes.renderSteps steps).toList, c ≠ '<' :=
+  Item.renderList_no_lt _
 
 theorem Keyframes.rule_no_lt (kf : Keyframes) :
     ∀ c ∈ kf.rule.toList, c ≠ '<' := by

@@ -7,32 +7,21 @@ import Qed.View.Core
 namespace Qed.Jsx
 open Lean Parser PrettyPrinter
 
-def jsxTextFn : ParserFn := fun c s =>
+private def mkTokenParserFn (kind : Name) (pred : Char → Bool) (desc : String) : ParserFn := fun c s =>
   let startPos := s.pos
-  let s := takeWhile1Fn (fun ch => ch != '<' && ch != '{' && ch != '}') "JSX text" c s
-  if s.hasError then s else mkNodeToken `Qed.Jsx.jsxText startPos true c s
+  let s := takeWhile1Fn pred desc c s
+  if s.hasError then s else mkNodeToken kind startPos true c s
 
-def jsxText : Parser where
-  fn := jsxTextFn
+local macro "def_jsx_token " id:ident desc:str pred:term : command => do
+  let full := Name.mkStr3 "Qed" "Jsx" id.getId.toString
+  let fmtId := mkIdent (id.getId ++ `formatter)
+  let parId := mkIdent (id.getId ++ `parenthesizer)
+  `(def $id : Parser := { fn := mkTokenParserFn $(quote full) $pred $desc }
+    @[combinator_formatter $(mkIdent full)] def $fmtId : Formatter := Formatter.visitAtom $(quote full)
+    @[combinator_parenthesizer $(mkIdent full)] def $parId : Parenthesizer := Parenthesizer.visitToken)
 
-@[combinator_formatter Qed.Jsx.jsxText]
-def jsxText.formatter : Formatter := Formatter.visitAtom `Qed.Jsx.jsxText
-@[combinator_parenthesizer Qed.Jsx.jsxText]
-def jsxText.parenthesizer : Parenthesizer := Parenthesizer.visitToken
-
-def jsxNameFn : ParserFn := fun c s =>
-  let startPos := s.pos
-  let s := takeWhile1Fn (fun ch => ch.isAlphanum || ch == '-' || ch == '_' || ch == '.' || ch == ':')
-    "tag or attribute name" c s
-  if s.hasError then s else mkNodeToken `Qed.Jsx.jsxName startPos true c s
-
-def jsxName : Parser where
-  fn := jsxNameFn
-
-@[combinator_formatter Qed.Jsx.jsxName]
-def jsxName.formatter : Formatter := Formatter.visitAtom `Qed.Jsx.jsxName
-@[combinator_parenthesizer Qed.Jsx.jsxName]
-def jsxName.parenthesizer : Parenthesizer := Parenthesizer.visitToken
+def_jsx_token jsxText "JSX text" (fun ch => ch != '<' && ch != '{' && ch != '}')
+def_jsx_token jsxName "tag or attribute name" (fun ch => ch.isAlphanum || ch == '-' || ch == '_' || ch == '.' || ch == ':')
 
 declare_syntax_cat jsxElement
 declare_syntax_cat jsxAttr
@@ -172,6 +161,7 @@ private def validateHtmlTag (ref : Syntax) (tag : String) (parentCtx? : Option (
 private inductive KidPart where
   | single (t : Term)
   | many   (t : Term)
+  deriving Nonempty
 
 private def unpackPair? (t : Term) : Option (Term × Term) :=
   match t with
@@ -193,80 +183,64 @@ partial def expandJsxExpr (pPath : String) (parentCtx? : Option (String × HtmlC
       elementToTerm pPath parentCtx? (j.getArg 0)
     else
       let sn := Qed.Lang.stxSnippet j
-      let what := if sn.isEmpty then s!"({j.getKind})" else s!" `{sn}`"
-      Macro.throwErrorAt j s!"unsupported JSX expression{what}"
-  let expandOptElse (optNode : Syntax) (isListT : Bool) : MacroM (Term × Bool) :=
-    if optNode.getNumArgs == 2 then expandJsxExpr pPath parentCtx? fallback (optNode.getArg 1)
-    else return (← if isListT then `([]) else fallback, isListT)
-  match stx.getKind with
-  | .str (.str (.str .anonymous "Qed") "Jsx") "qedExprJsx" =>
-    if (stx.getArg 0).getKind == ``jsxFragment then
-      return (← childrenToTerm pPath parentCtx? ((stx.getArg 0).getArg 1) ((stx.getArg 0).getArg 2).getArgs, true)
-    else
-      return (← elementToTerm pPath parentCtx? (stx.getArg 0), false)
-  | .str (.str (.str .anonymous "Qed") "Lang") s =>
-    match s with
-    | "qedRawTerm" =>
-      return (⟨(stx.getArg 1)⟩, isMapCall (stx.getArg 1))
-    | "qedParen" =>
-      if (stx.getArg 1).getSepArgs.size == 1 then
-        expandJsxExpr pPath parentCtx? fallback (stx.getArg 1).getSepArgs[0]!
-      else
-        let exp ← Qed.Lang.lowerSimpleQedExpr .val stx (allowOptElse := true)
-          (optElseFallback := fallback) (lowerJsx? := some jsxHook)
-        return (exp, isMapCall exp.raw)
-    | "qedIdent" =>
-      return (⟨(stx.getArg 0)⟩, (stx.getArg 0).getId.eraseMacroScopes == `children)
-    | "qedTernary" =>
-      let (tT, isListT) ← expandJsxExpr pPath parentCtx? fallback (stx.getArg 0)
-      let condT ← Qed.Lang.lowerSimpleQedExpr .propGuard (stx.getArg 2) (lowerJsx? := some jsxHook)
-      let (eT, isListE) ← expandOptElse (stx.getArg 3) isListT
-      return (← `(if _qedIf : $condT then $tT else $eT), isListT || isListE)
-    | "qedExprIf" =>
-      let condT ← Qed.Lang.lowerSimpleQedExpr .propGuard (stx.getArg 1) (lowerJsx? := some jsxHook)
-      let (tT, isListT) ← expandJsxExpr pPath parentCtx? fallback (stx.getArg 3)
-      let (eT, isListE) ← expandOptElse (stx.getArg 4) isListT
-      return (← `(if _qedIf : $condT then $tT else $eT), isListT || isListE)
-    | "qedExprIfLet" =>
-      let patT ← Qed.Lang.lowerQedPat (stx.getArg 2)
-      let scrutT ← Qed.Lang.lowerSimpleQedExpr .val (stx.getArg 4) (lowerJsx? := some jsxHook)
-      let (tT, isListT) ← expandJsxExpr pPath parentCtx? fallback (stx.getArg 6)
-      let (eT, isListE) ← expandOptElse (stx.getArg 7) isListT
-      return (← `(if let $patT := $scrutT then $tT else $eT), isListT || isListE)
-    | "qedExprMatch" =>
-      let scruts ← (stx.getArg 1).getSepArgs.mapM fun s =>
-        Qed.Lang.lowerSimpleQedExpr .val s (lowerJsx? := some jsxHook)
-      let mut anyList := false
-      let mut alts : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
-      for c in (stx.getArg 3).getArgs do
-        let pats ← (c.getArg 1).getSepArgs.mapM Qed.Lang.lowerQedPat
-        let (rhs, isL) ← expandJsxExpr pPath parentCtx? fallback (c.getArg 3)
-        if isL then anyList := true
-        alts := alts.push (← `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $rhs))
-      return (← `(match $[$scruts:term],* with $[$alts:matchAlt]*), anyList)
-    | "qedExprFor" =>
-      let patStx := stx.getArg 1
-      let xs ← Qed.Lang.lowerSimpleQedExpr .val (stx.getArg 3) (lowerJsx? := some jsxHook)
-      let (bodyT, isListB) ← expandJsxExpr pPath parentCtx? fallback (stx.getArg 5)
-      let fnT ← if patStx.getKind == ``Qed.Lang.qedPatIdent && (patStx.getArg 1).getNumArgs == 0 then
-          let xId : Ident := ⟨patStx.getArg 0⟩
-          `(fun $xId:ident => $bodyT)
-        else
-          let patT ← Qed.Lang.lowerQedPat patStx
-          `(fun _qed_fe => match _qed_fe with | $patT => $bodyT)
-      let res ← if isListB then
-        `((Qed.mapList (Qed.ForEachItems.toList $xs) $fnT).flatten)
-      else
-        `(Qed.mapList (Qed.ForEachItems.toList $xs) $fnT)
-      return (res, true)
-    | _ =>
-      let exp ← Qed.Lang.lowerSimpleQedExpr .val stx (allowOptElse := true)
-        (optElseFallback := fallback) (lowerJsx? := some jsxHook)
-      return (exp, isMapCall exp.raw)
-  | _ =>
+      Macro.throwErrorAt j s!"unsupported JSX expression{if sn.isEmpty then s!"({j.getKind})" else s!" `{sn}`"}"
+  let lowerFallback : MacroM (Term × Bool) := do
     let exp ← Qed.Lang.lowerSimpleQedExpr .val stx (allowOptElse := true)
       (optElseFallback := fallback) (lowerJsx? := some jsxHook)
     return (exp, isMapCall exp.raw)
+  let expandOptElse (optNode : Syntax) (isListT : Bool) : MacroM (Term × Bool) :=
+    if optNode.getNumArgs == 2 then expandJsxExpr pPath parentCtx? fallback (optNode.getArg 1)
+    else return (← if isListT then `([]) else fallback, isListT)
+  let expandIf (condIdx thenIdx elseIdx : Nat) : MacroM (Term × Bool) := do
+    let condT ← Qed.Lang.lowerSimpleQedExpr .propGuard (stx.getArg condIdx) (lowerJsx? := some jsxHook)
+    let (tT, isListT) ← expandJsxExpr pPath parentCtx? fallback (stx.getArg thenIdx)
+    let (eT, isListE) ← expandOptElse (stx.getArg elseIdx) isListT
+    return (← `(if _qedIf : $condT then $tT else $eT), isListT || isListE)
+  let k := stx.getKind
+  if k == ``qedExprJsx then
+    if (stx.getArg 0).getKind == ``jsxFragment then
+      return (← childrenToTerm pPath parentCtx? ((stx.getArg 0).getArg 1) ((stx.getArg 0).getArg 2).getArgs, true)
+    else return (← elementToTerm pPath parentCtx? (stx.getArg 0), false)
+  else if k == ``Qed.Lang.qedRawTerm then
+    return (⟨(stx.getArg 1)⟩, isMapCall (stx.getArg 1))
+  else if k == ``Qed.Lang.qedParen then
+    if (stx.getArg 1).getSepArgs.size == 1 then
+      expandJsxExpr pPath parentCtx? fallback (stx.getArg 1).getSepArgs[0]!
+    else lowerFallback
+  else if k == ``Qed.Lang.qedIdent then
+    return (⟨(stx.getArg 0)⟩, (stx.getArg 0).getId.eraseMacroScopes == `children)
+  else if k == ``Qed.Lang.qedTernary then expandIf 2 0 3
+  else if k == ``Qed.Lang.qedExprIf then expandIf 1 3 4
+  else if k == ``Qed.Lang.qedExprIfLet then
+    let patT ← Qed.Lang.lowerQedPat (stx.getArg 2)
+    let scrutT ← Qed.Lang.lowerSimpleQedExpr .val (stx.getArg 4) (lowerJsx? := some jsxHook)
+    let (tT, isListT) ← expandJsxExpr pPath parentCtx? fallback (stx.getArg 6)
+    let (eT, isListE) ← expandOptElse (stx.getArg 7) isListT
+    return (← `(if let $patT := $scrutT then $tT else $eT), isListT || isListE)
+  else if k == ``Qed.Lang.qedExprMatch then
+    let scruts ← (stx.getArg 1).getSepArgs.mapM (Qed.Lang.lowerSimpleQedExpr .val · (lowerJsx? := some jsxHook))
+    let mut anyList := false
+    let mut alts : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
+    for c in (stx.getArg 3).getArgs do
+      let pats ← (c.getArg 1).getSepArgs.mapM Qed.Lang.lowerQedPat
+      let (rhs, isL) ← expandJsxExpr pPath parentCtx? fallback (c.getArg 3)
+      if isL then anyList := true
+      alts := alts.push (← `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $rhs))
+    return (← `(match $[$scruts:term],* with $[$alts:matchAlt]*), anyList)
+  else if k == ``Qed.Lang.qedExprFor then
+    let patStx := stx.getArg 1
+    let xs ← Qed.Lang.lowerSimpleQedExpr .val (stx.getArg 3) (lowerJsx? := some jsxHook)
+    let (bodyT, isListB) ← expandJsxExpr pPath parentCtx? fallback (stx.getArg 5)
+    let fnT ← if patStx.getKind == ``Qed.Lang.qedPatIdent && (patStx.getArg 1).getNumArgs == 0 then
+        let xId : Ident := ⟨patStx.getArg 0⟩
+        `(fun $xId:ident => $bodyT)
+      else
+        let patT ← Qed.Lang.lowerQedPat patStx
+        `(fun _qed_fe => match _qed_fe with | $patT => $bodyT)
+    let res ← if isListB then `((Qed.mapList (Qed.ForEachItems.toList $xs) $fnT).flatten)
+      else `(Qed.mapList (Qed.ForEachItems.toList $xs) $fnT)
+    return (res, true)
+  else lowerFallback
 
 partial def expandAttrVal (valNode : Syntax) (fallback : MacroM Term) : MacroM Term := do
   let inner := (valNode.getArg 1)
@@ -342,6 +316,13 @@ partial def isMapCall (stx : Syntax) : Bool :=
     | _ => false
   else false
 
+partial def expandKidExpr (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (exprStx : Syntax) :
+    MacroM KidPart := do
+  let (t, isList) ← expandJsxExpr pPath parentCtx? (`(Qed.Html.text "")) exprStx
+  if isMapCall t.raw then return .many (← `(($t).toList))
+  else if isList then return .many t
+  else return .single t
+
 partial def collectKidParts (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (opener : Syntax)
     (kids : Array Syntax) : MacroM (Array KidPart) := do
   let mut parts : Array KidPart := #[]
@@ -370,23 +351,16 @@ partial def collectKidParts (pPath : String) (parentCtx? : Option (String × Htm
         else
           parts := parts.push (.single (← elementToTerm pPath parentCtx? el))
       else
-        let (t, isList) ← expandJsxExpr pPath parentCtx? (`(Qed.Html.text "")) ((k.getArg 0).getArg 1)
-        if isMapCall t.raw then
-          parts := parts.push (.many (← `(($t).toList)))
-        else if isList then
-          parts := parts.push (.many t)
-        else
-          parts := parts.push (.single t)
+        parts := parts.push (← expandKidExpr pPath parentCtx? ((k.getArg 0).getArg 1))
     prev := k
   return parts
 
 partial def childrenToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (opener : Syntax)
     (kids : Array Syntax) : MacroM Term := do
   if kids.size == 1 && !isJsxTextKid kids[0]! && !isJsxElementKid kids[0]! then
-    let (t, isList) ← expandJsxExpr pPath parentCtx? (`(Qed.Html.text "")) kids[0]![0][1]
-    if isMapCall t.raw then return ⟨← `(($t).toList)⟩
-    else if isList then return t
-    else return ⟨← `([$t])⟩
+    match ← expandKidExpr pPath parentCtx? kids[0]![0][1] with
+    | .many t   => return t
+    | .single t => return ← `([$t])
   let parts ← collectKidParts pPath parentCtx? opener kids
   if !parts.any (fun | .many _ => true | .single _ => false) then
     let singles := parts.filterMap fun | .single t => some t | .many _ => none
@@ -479,26 +453,24 @@ partial def componentToTerm (pPath : String) (parentCtx? : Option (String × Htm
 partial def elementToTerm (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (stx : Syntax) : MacroM Term := do
   if stx.getKind == ``jsxFragment then
     childrenToTerm pPath parentCtx? (stx.getArg 1) (stx.getArg 2).getArgs
-  else if stx.getKind == ``selfClosing then
+  else if stx.getKind == ``selfClosing || stx.getKind == ``withChildren then
+    let hasKids := stx.getKind == ``withChildren
     let tag := tokenVal (stx.getArg 1)
+    if hasKids then
+      let closeTag := tokenVal (stx.getArg 6)
+      if tag != closeTag then
+        Macro.throwErrorAt (stx.getArg 6) s!"mismatched closing tag: expected </{tag}>, found </{closeTag}>"
     if !tag.isEmpty && tag.front.isUpper then
-      return ← componentToTerm pPath parentCtx? stx (stx.getArg 1) tag (stx.getArg 2).getArgs #[]
-    discard <| validateHtmlTag (stx.getArg 1) tag parentCtx?
-    let attrs ← attrsToTerms (stx.getArg 2).getArgs tag
-    `(Qed.el $(Syntax.mkStrLit tag) [$attrs,*] [])
-  else if stx.getKind == ``withChildren then
-    let tag := tokenVal (stx.getArg 1)
-    let closeTag := tokenVal (stx.getArg 6)
-    if tag != closeTag then
-      Macro.throwErrorAt (stx.getArg 6) s!"mismatched closing tag: expected </{tag}>, found </{closeTag}>"
-    if !tag.isEmpty && tag.front.isUpper then
-      return ← componentToTerm pPath parentCtx? stx (stx.getArg 3) tag (stx.getArg 2).getArgs (stx.getArg 4).getArgs
-    if isVoidTag tag then
+      return ← componentToTerm pPath parentCtx? stx (if hasKids then stx.getArg 3 else stx.getArg 1) tag
+        (stx.getArg 2).getArgs (if hasKids then (stx.getArg 4).getArgs else #[])
+    if hasKids && isVoidTag tag then
       Macro.throwErrorAt stx s!"<{tag}> is an HTML5 void element and cannot have children; write it self-closing (<{tag} …/>)"
     let childCtx ← validateHtmlTag (stx.getArg 1) tag parentCtx?
     let attrs ← attrsToTerms (stx.getArg 2).getArgs tag
-    let nextPath := if pPath.isEmpty then tag else pPath ++ "/" ++ tag
-    let kids ← childrenToTerm nextPath (some (tag, childCtx)) (stx.getArg 3) (stx.getArg 4).getArgs
+    let kids ← if hasKids then
+        let nextPath := if pPath.isEmpty then tag else pPath ++ "/" ++ tag
+        childrenToTerm nextPath (some (tag, childCtx)) (stx.getArg 3) (stx.getArg 4).getArgs
+      else `([])
     `(Qed.el $(Syntax.mkStrLit tag) [$attrs,*] $kids)
   else
     Macro.throwUnsupported

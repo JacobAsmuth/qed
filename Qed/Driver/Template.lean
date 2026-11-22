@@ -78,19 +78,6 @@ def planKeyedLoop (newKeys : @& Array String)
 termination_by newKeys.size - i
 decreasing_by all_goals exact Nat.sub_succ_lt_self newKeys.size i h
 
-private theorem lisLowerBound_dec1 {lo hi : Nat} (h : lo < hi) :
-    hi - (lo + (hi - lo) / 2 + 1) < hi - lo := by
-  have h1 : (hi - lo) / 2 < hi - lo := Nat.div_lt_self (Nat.sub_pos_of_lt h) (by decide)
-  have h2 : lo + (hi - lo) / 2 < hi := by
-    have := Nat.add_lt_add_left h1 lo
-    rwa [Nat.add_sub_of_le (Nat.le_of_lt h)] at this
-  exact Nat.sub_lt_sub_left h (Nat.lt_succ_of_le (Nat.le_add_right lo _))
-
-private theorem lisLowerBound_dec2 {lo hi : Nat} (h : lo < hi) :
-    lo + (hi - lo) / 2 - lo < hi - lo := by
-  rw [Nat.add_sub_cancel_left]
-  exact Nat.div_lt_self (Nat.sub_pos_of_lt h) (by decide)
-
 private def lisLowerBound (tails : @& Array Nat) (x : Nat) (lo hi : Nat) : Nat :=
   if h : lo < hi then
     let mid := lo + (hi - lo) / 2
@@ -100,9 +87,7 @@ private def lisLowerBound (tails : @& Array Nat) (x : Nat) (lo hi : Nat) : Nat :
       lisLowerBound tails x lo mid
   else lo
 termination_by hi - lo
-decreasing_by
-  · exact lisLowerBound_dec1 h
-  · exact lisLowerBound_dec2 h
+decreasing_by all_goals omega
 
 private def lisBuildLoop (sources : @& Array (Option Nat)) (i : Nat)
     (tails : Array Nat) (tailPos : Array Nat) (prev : Array Nat) :
@@ -376,6 +361,14 @@ def removeRangeM [MonadDom msg m] (node : Dom.Node) (live : Array Dom.Node)
 termination_by stop - i
 decreasing_by exact Nat.sub_succ_lt_self stop i h
 
+@[inline] private def patchRowIfDirty [MonadDom msg m] (tmplId : UInt32) (oldVals : Array (Array String))
+    (oldMarks newMarks : Array USize) (rowVals : Nat → Array String)
+    (dstIdx srcIdx : Nat) (rowNode : Dom.Node) : m (Array String) := do
+  let ov := oldVals.getD srcIdx #[]
+  let mk := newMarks.getD dstIdx 0
+  if mk != 0 && oldMarks[srcIdx]? == some mk then pure ov
+  else do let v := rowVals dstIdx; MonadDom.patchTmplRow rowNode tmplId v ov; pure v
+
 def reconcileTmplBackM [MonadDom msg m] (node : Dom.Node) (tmplId : UInt32)
     (oldLive : Array Dom.Node) (oldVals : Array (Array String)) (oldMarks : Array USize)
     (rowVals : Nat → Array String) (newMarks : Array USize)
@@ -383,33 +376,22 @@ def reconcileTmplBackM [MonadDom msg m] (node : Dom.Node) (tmplId : UInt32)
     Nat → Bool → Dom.Node → Array Dom.Node → Array (Array String) →
     m (Array Dom.Node × Array (Array String))
   | 0, _, _, outLive, outVals => return (outLive, outVals)
-  | k + 1, hasAnchor, anchor, outLive, outVals =>
-      match sources.getD k none with
-      | some oi => do
-          let child := oldLive.getD oi 0
-          if !inLis.getD k false then
-            MonadDom.insertBeforeRef node (if hasAnchor then some anchor else none) child
-          let ov := oldVals.getD oi #[]
-          let m := newMarks.getD k 0
-          let nv ←
-            if m != 0 && oldMarks[oi]? == some m then
-              pure ov
-            else do
-              let v := rowVals k
-              MonadDom.patchTmplRow child tmplId v ov
-              pure v
-          let outLive' := if hl : k < outLive.size then outLive.set k child hl else outLive
-          let outVals' := if hv : k < outVals.size then outVals.set k nv hv else outVals
-          reconcileTmplBackM node tmplId oldLive oldVals oldMarks rowVals newMarks sources inLis
-            k true child outLive' outVals'
-      | none => do
-          let nv := rowVals k
-          let cn ← MonadDom.mountTmplRow tmplId nv
-          MonadDom.insertBeforeRef node (if hasAnchor then some anchor else none) cn
-          let outLive' := if hl : k < outLive.size then outLive.set k cn hl else outLive
-          let outVals' := if hv : k < outVals.size then outVals.set k nv hv else outVals
-          reconcileTmplBackM node tmplId oldLive oldVals oldMarks rowVals newMarks sources inLis
-            k true cn outLive' outVals'
+  | k + 1, hasAnchor, anchor, outLive, outVals => do
+      let (child, nv) ← match sources.getD k none with
+        | some oi => do
+            let c := oldLive.getD oi 0
+            if !inLis.getD k false then
+              MonadDom.insertBeforeRef node (if hasAnchor then some anchor else none) c
+            pure (c, ← patchRowIfDirty tmplId oldVals oldMarks newMarks rowVals k oi c)
+        | none => do
+            let v := rowVals k
+            let cn ← MonadDom.mountTmplRow tmplId v
+            MonadDom.insertBeforeRef node (if hasAnchor then some anchor else none) cn
+            pure (cn, v)
+      let outLive' := if hl : k < outLive.size then outLive.set k child hl else outLive
+      let outVals' := if hv : k < outVals.size then outVals.set k nv hv else outVals
+      reconcileTmplBackM node tmplId oldLive oldVals oldMarks rowVals newMarks sources inLis
+        k true child outLive' outVals'
 
 def hydrateTmplRowsM [MonadDom msg m] (node : Dom.Node) (tmplId : UInt32)
     (i count : Nat) (acc : Array Dom.Node) : m (Array Dom.Node) := do
@@ -482,12 +464,8 @@ def patchTmplListM [MonadDom msg m] (node : Dom.Node) (attrs : List (VAttr σ ms
           MonadDom.insertBeforeRef node (some nodeA) nodeB
           if b != a + 1 then
             MonadDom.insertBeforeRef node (if b + 1 < nOld then some (oldLive.getD (b + 1) 0) else none) nodeA
-          let patchSwapped (dstIdx srcIdx : Nat) (rowNode : Dom.Node) : m (Array String) := do
-            let ov := oldVals.getD srcIdx #[]
-            if newMarks.getD dstIdx 0 != 0 && oldMarks[srcIdx]? == some (newMarks.getD dstIdx 0) then pure ov
-            else do let v := tmpl.rowVals s dstIdx; MonadDom.patchTmplRow rowNode tmplId v ov; pure v
-          let nvA ← patchSwapped a b nodeB
-          let nvB ← patchSwapped b a nodeA
+          let nvA ← patchRowIfDirty tmplId oldVals oldMarks newMarks (tmpl.rowVals s) a b nodeB
+          let nvB ← patchRowIfDirty tmplId oldVals oldMarks newMarks (tmpl.rowVals s) b a nodeA
           return .tlist node tmplId evSlot ((oldKeys.set! a ka).set! b kb) false
             ((oldLive.set! a nodeB).set! b nodeA) ((oldVals.set! a nvA).set! b nvB) newMarks
     else

@@ -5,12 +5,14 @@ import Std.Data.HashSet
 
 namespace Qed
 
-def pickFreshKeyLoop (k : String) (seen : Std.HashSet String) (maxLen : Nat) : Nat → Nat → String
+@[specialize 2] def pickFreshKeyLoopWith (k : String) (has : String → Bool) (maxLen : Nat) : Nat → Nat → String
   | _, 0 => k ++ String.ofList (List.replicate (maxLen + 1) '~')
   | i, fuel + 1 =>
       let cand := k ++ "~~dup" ++ Nat.repr i
-      if !seen.contains cand then cand
-      else pickFreshKeyLoop k seen maxLen (i + 1) fuel
+      if !has cand then cand else pickFreshKeyLoopWith k has maxLen (i + 1) fuel
+
+def pickFreshKeyLoop (k : String) (seen : Std.HashSet String) (maxLen : Nat) : Nat → Nat → String :=
+  pickFreshKeyLoopWith k seen.contains maxLen
 
 def pickFreshKey (k : String) (seen : Std.HashSet String) (maxLen : Nat) : String :=
   if !seen.contains k then k
@@ -19,31 +21,22 @@ def pickFreshKey (k : String) (seen : Std.HashSet String) (maxLen : Nat) : Strin
 theorem pickFreshKeyLoop_not_mem (k : String) (seen : Std.HashSet String) (maxLen : Nat)
     (hmax : ∀ s, s ∈ seen → s.length ≤ maxLen) :
     ∀ (i fuel : Nat), pickFreshKeyLoop k seen maxLen i fuel ∉ seen
-  | _, 0 => by
-      intro hmem
+  | _, 0 => fun hmem => by
       have hle := hmax _ hmem
       have hlen : (k ++ String.ofList (List.replicate (maxLen + 1) '~')).length = k.length + (maxLen + 1) := by
         simp [String.length_append]
-      unfold pickFreshKeyLoop at hle
-      omega
+      unfold pickFreshKeyLoop pickFreshKeyLoopWith at hle; omega
   | i, fuel + 1 => by
-      simp only [pickFreshKeyLoop]
+      simp only [pickFreshKeyLoop, pickFreshKeyLoopWith]
       split
-      · rename_i hc
-        intro hmem
-        have hc' : seen.contains (k ++ "~~dup" ++ Nat.repr i) = true := Std.HashSet.contains_iff_mem.2 hmem
-        simp [hc'] at hc
+      · rename_i hc; exact fun hmem => by simp [Std.HashSet.contains_iff_mem.2 hmem] at hc
       · exact pickFreshKeyLoop_not_mem k seen maxLen hmax (i + 1) fuel
 
 theorem pickFreshKey_not_mem (k : String) (seen : Std.HashSet String) (maxLen : Nat)
     (hmax : ∀ s, s ∈ seen → s.length ≤ maxLen) :
     pickFreshKey k seen maxLen ∉ seen := by
-  unfold pickFreshKey
-  split
-  · rename_i hc
-    intro hmem
-    have hc' : seen.contains k = true := Std.HashSet.contains_iff_mem.2 hmem
-    simp [hc'] at hc
+  unfold pickFreshKey; split
+  · rename_i hc; exact fun hmem => by simp [Std.HashSet.contains_iff_mem.2 hmem] at hc
   · exact pickFreshKeyLoop_not_mem k seen maxLen hmax 1 seen.size
 
 def disambiguateKeysTR (seen : Std.HashSet String) (maxLen : Nat) (acc : Array String) :
@@ -60,6 +53,13 @@ private theorem nodup_append_singleton {α : Type} {xs : List α} {a : α}
     (hnd : xs.Nodup) (ha : a ∉ xs) : (xs ++ [a]).Nodup := by
   simp [List.nodup_append, hnd]; intro b hb heq; subst heq; exact ha hb
 
+private theorem maxLen_insert {seen : Std.HashSet String} {maxLen : Nat}
+    (hmax : ∀ s, s ∈ seen → s.length ≤ maxLen) (k' : String) :
+    ∀ s, s ∈ seen.insert k' → s.length ≤ Nat.max maxLen k'.length := fun s hs =>
+  match Std.HashSet.mem_insert.1 hs with
+  | .inl heq => eq_of_beq heq ▸ Nat.le_max_right _ _
+  | .inr hmem => Nat.le_trans (hmax s hmem) (Nat.le_max_left _ _)
+
 private theorem disambiguateKeysTR_nodup (ks : List String) :
     ∀ (seen : Std.HashSet String) (maxLen : Nat) (acc : Array String),
       (∀ s, s ∈ seen → s.length ≤ maxLen) →
@@ -73,13 +73,7 @@ private theorem disambiguateKeysTR_nodup (ks : List String) :
       let k' := pickFreshKey k seen maxLen
       have hnot : k' ∉ seen := pickFreshKey_not_mem k seen maxLen hmax
       have hnotAcc : k' ∉ acc.toList := fun hm => hnot (hsub k' hm)
-      refine ih (seen.insert k') (Nat.max maxLen k'.length) (acc.push k') ?_ ?_ ?_
-      · intro s hs
-        rcases Std.HashSet.mem_insert.1 hs with heq | hmem
-        · have : k' = s := eq_of_beq heq
-          subst this
-          exact Nat.le_max_right _ _
-        · exact Nat.le_trans (hmax s hmem) (Nat.le_max_left _ _)
+      refine ih (seen.insert k') (Nat.max maxLen k'.length) (acc.push k') (maxLen_insert hmax k') ?_ ?_
       · intro s hs
         rw [Array.toList_push, List.mem_append] at hs
         rcases hs with h1 | h2
@@ -166,25 +160,13 @@ theorem strBucketIdx_lt (k : String) (mask : USize) (sz : Nat) (hsz : 0 < sz) :
     (buckets[strBucketIdx k mask buckets.size]'(strBucketIdx_lt k mask buckets.size h)).contains k
   else false
 
-private def pickFreshKeyLoopFast (k : String) (buckets : @& Array (List String)) (mask : USize)
-    (maxLen : Nat) : Nat → Nat → String
-  | _, 0 => k ++ String.ofList (List.replicate (maxLen + 1) '~')
-  | i, fuel + 1 =>
-      let cand := k ++ "~~dup" ++ Nat.repr i
-      if !bucketContains buckets mask cand then cand
-      else pickFreshKeyLoopFast k buckets mask maxLen (i + 1) fuel
-
-private def pickFreshKeyFast (k : String) (buckets : @& Array (List String)) (mask : USize)
-    (maxLen seenSize : Nat) : String :=
-  if !bucketContains buckets mask k then k
-  else pickFreshKeyLoopFast k buckets mask maxLen 1 seenSize
-
 private def disambiguateKeysFastLoop (keys : @& Array String) (i : Nat)
     (buckets : Array (List String)) (mask : USize) (maxLen : Nat) (acc : Array String) :
     Array String :=
   if h : i < keys.size then
     let k := keys[i]
-    let k' := pickFreshKeyFast k buckets mask maxLen i
+    let k' := if !bucketContains buckets mask k then k
+      else pickFreshKeyLoopWith k (bucketContains buckets mask) maxLen 1 i
     let buckets' :=
       if hb : 0 < buckets.size then
         let bi := strBucketIdx k' mask buckets.size
@@ -208,24 +190,13 @@ def disambiguateKeysFast (keys : Array String) : Array String :=
 private def BucketsMatch (buckets : Array (List String)) (mask : USize) (seen : Std.HashSet String) : Prop :=
   0 < buckets.size ∧ ∀ s : String, bucketContains buckets mask s = seen.contains s
 
-private theorem pickFreshKeyLoopFast_eq (k : String) (buckets : Array (List String)) (mask : USize)
-    (seen : Std.HashSet String) (maxLen : Nat) (hm : BucketsMatch buckets mask seen) :
-    ∀ i fuel, pickFreshKeyLoopFast k buckets mask maxLen i fuel = pickFreshKeyLoop k seen maxLen i fuel
+private theorem pickFreshKeyLoopWith_congr (k : String) {f g : String → Bool}
+    (hfg : ∀ s, f s = g s) (maxLen : Nat) :
+    ∀ i fuel, pickFreshKeyLoopWith k f maxLen i fuel = pickFreshKeyLoopWith k g maxLen i fuel
   | _, 0 => rfl
   | i, fuel + 1 => by
-      simp only [pickFreshKeyLoopFast, pickFreshKeyLoop, hm.2]
-      split
-      · rfl
-      · exact pickFreshKeyLoopFast_eq k buckets mask seen maxLen hm (i + 1) fuel
-
-private theorem pickFreshKeyFast_eq (k : String) (buckets : Array (List String)) (mask : USize)
-    (seen : Std.HashSet String) (maxLen seenSize : Nat)
-    (hm : BucketsMatch buckets mask seen) (hsz : seenSize = seen.size) :
-    pickFreshKeyFast k buckets mask maxLen seenSize = pickFreshKey k seen maxLen := by
-  simp only [pickFreshKeyFast, pickFreshKey, hm.2, hsz]
-  split
-  · rfl
-  · exact pickFreshKeyLoopFast_eq k buckets mask seen maxLen hm 1 seen.size
+      simp only [pickFreshKeyLoopWith, hfg]
+      split <;> first | rfl | exact pickFreshKeyLoopWith_congr k hfg maxLen (i + 1) fuel
 
 private theorem bucketsMatch_insert {buckets : Array (List String)} {mask : USize}
     {seen : Std.HashSet String} (hm : BucketsMatch buckets mask seen) (k' : String) :
@@ -234,40 +205,16 @@ private theorem bucketsMatch_insert {buckets : Array (List String)} {mask : USiz
     BucketsMatch (buckets.set bi (k' :: buckets[bi]) hbi) mask (seen.insert k') := by
   intro bi hbi
   refine ⟨by simp [hm.1], fun s => ?_⟩
-  have hpos' : 0 < (buckets.set bi (k' :: buckets[bi]) hbi).size := by simp [hm.1]
-  have hsz' : (buckets.set bi (k' :: buckets[bi]) hbi).size = buckets.size := Array.size_set ..
-  unfold bucketContains
-  simp only [hpos', ↓reduceDIte]
-  have hidxEq : strBucketIdx s mask (buckets.set bi (k' :: buckets[bi]) hbi).size =
-      strBucketIdx s mask buckets.size := by rw [hsz']
   have hprev : (buckets[strBucketIdx s mask buckets.size]'(strBucketIdx_lt s mask buckets.size hm.1)).contains s =
-      seen.contains s := by
-    have := hm.2 s
-    unfold bucketContains at this
-    simpa [hm.1] using this
-  have hset : (buckets.set bi (k' :: buckets[bi]) hbi)[strBucketIdx s mask (buckets.set bi (k' :: buckets[bi]) hbi).size]'(strBucketIdx_lt s mask _ hpos') =
-      if bi = strBucketIdx s mask buckets.size then k' :: buckets[bi]
-      else buckets[strBucketIdx s mask buckets.size]'(strBucketIdx_lt s mask buckets.size hm.1) := by
-    simp only [hidxEq, Array.getElem_set]
-  rw [hset]
-  by_cases hbiS : bi = strBucketIdx s mask buckets.size
-  · simp only [hbiS, ↓reduceIte, List.contains_cons, Std.HashSet.contains_insert, hprev]
-    cases hsk : (s == k') with
-    | true =>
-        have heq : s = k' := eq_of_beq hsk; subst heq; simp
-    | false =>
-        have hks : (k' == s) = false := beq_eq_false_iff_ne.2 fun h => by
-          subst h; simp at hsk
-        simp [hks]
-  · simp only [hbiS, ↓reduceIte, hprev, Std.HashSet.contains_insert]
-    have hne : (k' == s) = false := by
-      cases hbeq : (k' == s) with
-      | false => rfl
-      | true =>
-          have heq : k' = s := eq_of_beq hbeq
-          subst heq
-          exact False.elim (hbiS rfl)
-    simp [hne]
+      seen.contains s := by simpa [bucketContains, hm.1] using hm.2 s
+  simp only [bucketContains, Array.size_set, hm.1, ↓reduceDIte, Array.getElem_set, Std.HashSet.contains_insert]
+  by_cases heq : k' = s
+  · subst heq; simp [bi]
+  · have hks : (k' == s) = false := beq_eq_false_iff_ne.2 heq
+    have hsk : (s == k') = false := beq_eq_false_iff_ne.2 (Ne.symm heq)
+    split
+    · rename_i h; simp only [h, List.contains_cons, hks, hsk, hprev, Bool.false_or]
+    · simp only [hks, hprev, Bool.false_or]
 
 private theorem disambiguateKeysFastLoop_eq (keys : Array String) (mask : USize) :
     ∀ (i : Nat) (buckets : Array (List String)) (seen : Std.HashSet String)
@@ -291,41 +238,30 @@ private theorem disambiguateKeysFastLoop_eq (keys : Array String) (mask : USize)
       intro buckets seen maxLen acc hle hm hmax hsz
       have hlt : i < keys.size := by omega
       have hdrop : keys.toList.drop i = keys[i] :: keys.toList.drop (i + 1) := by
-        rw [List.drop_eq_getElem_cons (by simpa using hlt)]
-        rfl
+        rw [List.drop_eq_getElem_cons (by simpa using hlt)]; rfl
       rw [hdrop]
       unfold disambiguateKeysFastLoop
       simp only [hlt, ↓reduceDIte, hm.1, disambiguateKeysTR]
-      have hpk : pickFreshKeyFast keys[i] buckets mask maxLen i =
-          pickFreshKey keys[i] seen maxLen :=
-        pickFreshKeyFast_eq keys[i] buckets mask seen maxLen i hm hsz.symm
+      have hpk : (if !bucketContains buckets mask keys[i] then keys[i]
+            else pickFreshKeyLoopWith keys[i] (bucketContains buckets mask) maxLen 1 i) =
+          pickFreshKey keys[i] seen maxLen := by
+        simp only [pickFreshKey, pickFreshKeyLoop, hm.2, hsz.symm, pickFreshKeyLoopWith_congr _ hm.2]
       simp only [hpk]
       let k' := pickFreshKey keys[i] seen maxLen
       have hnot : k' ∉ seen := pickFreshKey_not_mem keys[i] seen maxLen hmax
-      have hsz' : (seen.insert k').size = i + 1 := by
-        simp [Std.HashSet.size_insert, hnot, hsz]
-      have hmax' : ∀ s, s ∈ seen.insert k' → s.length ≤ Nat.max maxLen k'.length := by
-        intro s hs
-        rcases Std.HashSet.mem_insert.1 hs with heq | hmem
-        · have : k' = s := eq_of_beq heq
-          subst this; exact Nat.le_max_right _ _
-        · exact Nat.le_trans (hmax s hmem) (Nat.le_max_left _ _)
+      have hsz' : (seen.insert k').size = i + 1 := by simp [Std.HashSet.size_insert, hnot, hsz]
       exact ih (i + 1) (by omega) _ (seen.insert k') (Nat.max maxLen k'.length) (acc.push k')
-        (by omega) (bucketsMatch_insert hm k') hmax' hsz'
+        (by omega) (bucketsMatch_insert hm k') (maxLen_insert hmax k') hsz'
 
 @[csimp] theorem disambiguateKeys_eq_fast : @disambiguateKeys = @disambiguateKeysFast := by
   funext keys
   unfold disambiguateKeys disambiguateKeysFast
-  have hcap : 0 < nextPow2Ge (keys.size * 2) 16 30 := nextPow2Ge_pos _ 16 30 (by omega)
-  have hm0 : BucketsMatch (Array.replicate (nextPow2Ge (keys.size * 2) 16 30) [])
-      (USize.ofNat (nextPow2Ge (keys.size * 2) 16 30 - 1)) (∅ : Std.HashSet String) := by
-    refine ⟨by simp [hcap], fun s => ?_⟩
-    unfold bucketContains
-    simp [hcap]
-  have heq := disambiguateKeysFastLoop_eq keys (USize.ofNat (nextPow2Ge (keys.size * 2) 16 30 - 1))
-    0 (Array.replicate (nextPow2Ge (keys.size * 2) 16 30) []) ∅ 0 (Array.emptyWithCapacity keys.size)
-    (Nat.zero_le _) hm0 (fun _ h => by simp at h) (by simp)
-  simpa using heq.symm
+  let cap := nextPow2Ge (keys.size * 2) 16 30
+  have hcap : 0 < cap := nextPow2Ge_pos _ 16 30 (by omega)
+  have hm0 : BucketsMatch (Array.replicate cap []) (USize.ofNat (cap - 1)) ∅ :=
+    ⟨by simp [hcap], fun s => by simp [bucketContains, hcap]⟩
+  simpa using (disambiguateKeysFastLoop_eq keys (USize.ofNat (cap - 1)) 0 (Array.replicate cap []) ∅ 0
+    (Array.emptyWithCapacity keys.size) (Nat.zero_le _) hm0 (fun _ h => by simp at h) (by simp)).symm
 
 /-- A congruence-verified memoized HTML fragment: whenever two projections produce
     equal string keys, they are kernel-proven to produce identical `Html` trees. -/
@@ -501,21 +437,12 @@ mutual
     | text _ => rfl
     | dyn _ => rfl
     | element t as ks =>
-        show Html.element t ((as.map (VAttr.mapScope f)).map (VAttr.eval s'))
-          (View.renderEach (View.mapScopeEach f ks) s') = _
-        rw [List.map_map, View.renderEach_mapScopeEach f ks s']
-        have h : ((VAttr.eval s' : VAttr σ' msg → Attr msg) ∘ VAttr.mapScope f) = VAttr.eval (f s') :=
-          funext fun va => VAttr.eval_mapScope f s' va
-        rw [h]; rfl
+        simp only [View.mapScope, View.render, List.map_map, Function.comp_def, VAttr.eval_mapScope,
+          View.renderEach_mapScopeEach f ks s']
     | ifElse cond y n =>
-        show (if cond (f s') then View.render (y.mapScope f) s' else View.render (n.mapScope f) s') = _
-        rw [View.render_mapScope f y s', View.render_mapScope f n s']; rfl
+        simp only [View.mapScope, View.render, View.render_mapScope f y s', View.render_mapScope f n s']
     | keyedList t as _ _ _ _ rh _ =>
-        show Html.element t ((as.map (VAttr.mapScope f)).map (VAttr.eval s')) (rh (f s')) = _
-        rw [List.map_map]
-        have h : ((VAttr.eval s' : VAttr σ' msg → Attr msg) ∘ VAttr.mapScope f) = VAttr.eval (f s') :=
-          funext fun va => VAttr.eval_mapScope f s' va
-        rw [h]; rfl
+        simp only [View.mapScope, View.render, List.map_map, Function.comp_def, VAttr.eval_mapScope]
     | static _ => rfl
     | dynNode _ => rfl
     | memo _ => rfl
@@ -740,14 +667,9 @@ end
   | [], _, _ => rfl
   | va :: rest, n, en => by
       cases va with
-      | stat a =>
+      | stat _ | bind _ =>
           dsimp only [renderSigAttrs, List.map, VAttr.eval, List.filterMap]
-          cases Attr.canonical a <;>
-            simp only [renderSigAttrs_canonical s pre rest n en]
-      | bind f =>
-          dsimp only [renderSigAttrs, List.map, VAttr.eval, List.filterMap]
-          cases Attr.canonical (f s) <;>
-            simp only [renderSigAttrs_canonical s pre rest n en]
+          cases Attr.canonical _ <;> simp only [renderSigAttrs_canonical s pre rest n en]
       | dynVal attr get =>
           exact congrArg (Attr.attr attr (get s) :: ·) (renderSigAttrs_canonical s pre rest (n + 1) en)
       | dynOn ev get =>
@@ -761,19 +683,11 @@ end
   | [va], _, _ => by cases va <;> rfl
   | va1 :: va2 :: rest, n, en => by
       cases va1 with
-      | stat a =>
-          cases a with
-          | key _ => exact onlySignalBind_renderSigAttrs s pre (va2 :: rest) n en
-          | _ => rfl
+      | stat a => cases a <;> first | rfl | exact onlySignalBind_renderSigAttrs s pre (va2 :: rest) n en
       | bind f =>
-          show onlySignalBind (f s :: (renderSigAttrs s pre (va2 :: rest) n en).1) =
-               onlySignalBind (f s :: (va2 :: rest).map (VAttr.eval s))
-          generalize f s = a
-          cases a with
-          | key _ => exact onlySignalBind_renderSigAttrs s pre (va2 :: rest) n en
-          | _ => rfl
-      | dynVal _ _ => rfl
-      | dynOn _ _ => rfl
+          dsimp only [renderSigAttrs, List.map, VAttr.eval]
+          cases f s <;> first | rfl | exact onlySignalBind_renderSigAttrs s pre (va2 :: rest) n en
+      | dynVal _ _ | dynOn _ _ => rfl
 
 mutual
   @[simp] theorem View.canonical_renderSig :
@@ -923,12 +837,7 @@ end
     slot or event handler, suitable for compile-once `cloneNode(true)` templates with direct
     slot paths and delegated row events. -/
 def isDirectTmpl : View α msg → Bool
-  | v@(.element _ attrs kids) =>
-      (!(View.collectDyn v).isEmpty || !(View.collectDynOn v).isEmpty) &&
-      directTmplAttrsOk attrs &&
-      match kids with
-      | [.dyn _] => true
-      | _ => isDirectTmplList kids
+  | v@(.element ..) => (!(View.collectDyn v).isEmpty || !(View.collectDynOn v).isEmpty) && isDirectTmplBody v
   | _ => false
 
 private structure TmplAcc (α msg : Type) where
@@ -1137,34 +1046,14 @@ mutual
         have hv : isVoidTag "span" = false := rfl
         rw [hv]; rfl
     | .element tag attrs kids, s, pre, n, en, hsafe, hvalid => by
-        change (match stepHtmlCtx ctx tag with | some childCtx => View.sigSafeListIn childCtx kids | none => false) = true at hsafe
-        change (Attr.validList (attrs.map (VAttr.eval s)) &&
-          (!isVoidTag tag || (View.renderEach kids s).isEmpty) &&
-          (!Attr.hasLocalCell (attrs.map (VAttr.eval s)) || (View.renderEach kids s).isEmpty) &&
-          match stepHtmlCtx ctx tag with
-          | some childCtx => Html.validListIn childCtx (View.renderEach kids s)
-          | none => false) = true at hvalid
-        change (Attr.validList (renderSigAttrs s pre attrs n en).1 &&
-          (!isVoidTag tag || (View.renderSigList kids s pre _ _).1.isEmpty) &&
-          (!Attr.hasLocalCell (renderSigAttrs s pre attrs n en).1 || (View.renderSigList kids s pre _ _).1.isEmpty) &&
-          match stepHtmlCtx ctx tag with
-          | some childCtx => Html.validListIn childCtx (View.renderSigList kids s pre _ _).1
-          | none => false) = true
-        rw [View.renderEach_isEmpty] at hvalid
-        rw [Attr.validList_renderSigAttrs, Attr.hasLocalCell_renderSigAttrs, View.renderSigList_isEmpty]
+        simp only [View.sigSafeIn] at hsafe
+        simp only [View.render, View.renderSig, Html.validIn, View.renderEach_isEmpty,
+          Attr.validList_renderSigAttrs, Attr.hasLocalCell_renderSigAttrs, View.renderSigList_isEmpty] at hvalid ⊢
         cases hstep : stepHtmlCtx ctx tag with
-        | none =>
-            rw [hstep] at hsafe
-            exact Bool.noConfusion hsafe
+        | none => simp [hstep] at hsafe
         | some childCtx =>
-            rw [hstep] at hsafe hvalid
-            dsimp only at hsafe hvalid ⊢
-            have h14 := Bool.and_eq_true_iff.1 hvalid
-            have h23 := Bool.and_eq_true_iff.1 h14.1
-            have h12 := Bool.and_eq_true_iff.1 h23.1
-            rw [h12.1, h12.2, h23.2,
-                View.validListIn_renderSigList_of_sigSafe childCtx kids s pre _ _ hsafe h14.2]
-            rfl
+            simp only [hstep, Bool.and_eq_true] at hsafe hvalid ⊢
+            exact ⟨hvalid.1, View.validListIn_renderSigList_of_sigSafe childCtx kids s pre _ _ hsafe hvalid.2⟩
     | .static _, _, _, _, _, _, hvalid => hvalid
     | .ifElse .., _, _, _, _, hsafe, _ => Bool.noConfusion hsafe
     | .keyedList .., _, _, _, _, hsafe, _ => Bool.noConfusion hsafe

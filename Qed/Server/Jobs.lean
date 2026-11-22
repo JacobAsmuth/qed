@@ -14,31 +14,26 @@ def durationToMs (n : Nat) : DurationUnit → Nat
   | .m  => n * 60000
   | .h  => n * 3600000
 
+/-- Shared metadata for periodic background server jobs. -/
+structure JobMeta where
+  name        : String
+  intervalMs  : Nat
+  intervalPos : 0 < intervalMs
+
+/-- Runtime descriptor (erasing `Inv`) for a stateful periodic server job. -/
+structure ServerJob (σ : Type) extends JobMeta where
+  runM : {m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
+           m (Except ApiError Unit)
+
 /-- A verified periodic background server job on stateful server `σ`, carrying both
     a compile-time positive-interval proof and a kernel-checked multi-core invariant
     preservation proof (`ProgPreservesInv Inv`). -/
-structure VerifiedJob (σ : Type) (Inv : σ → Prop) where
-  name        : String
-  intervalMs  : Nat
-  intervalPos : 0 < intervalMs
-  runM        : {m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
-                  m (Except ApiError Unit)
-  preserves   : ProgPreservesInv Inv (runM (m := ThreadProg σ))
-
-/-- Runtime descriptor (erasing `Inv`) for a stateful periodic server job. -/
-structure ServerJob (σ : Type) where
-  name        : String
-  intervalMs  : Nat
-  intervalPos : 0 < intervalMs
-  runM        : {m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] →
-                  m (Except ApiError Unit)
+structure VerifiedJob (σ : Type) (Inv : σ → Prop) extends ServerJob σ where
+  preserves : ProgPreservesInv Inv (runM (m := ThreadProg σ))
 
 /-- Runtime descriptor for a stateless periodic server job. -/
-structure StatelessJob where
-  name        : String
-  intervalMs  : Nat
-  intervalPos : 0 < intervalMs
-  runM        : {m : Type → Type} → [Monad m] → [MonadServer m] → m (Except ApiError Unit)
+structure StatelessJob extends JobMeta where
+  runM : {m : Type → Type} → [Monad m] → [MonadServer m] → m (Except ApiError Unit)
 
 /-! ### Linearizability & Composition Lemmas for Verified Jobs -/
 
@@ -98,24 +93,15 @@ theorem progPreservesInv_readEnv_required {σ α : Type} {Inv : σ → Prop}
 /-! ### Native Background Job Runner (Total, Tail-Recursive, Non-Blocking) -/
 
 /-- Type-erased `IO` job unit executed by the native server background scheduler. -/
-structure IoJob where
-  name        : String
-  intervalMs  : Nat
-  intervalPos : 0 < intervalMs
-  runOnce     : IO (Except ApiError Unit)
+structure IoJob extends JobMeta where
+  runOnce : IO (Except ApiError Unit)
 
 def ServerJob.toIoJob {σ : Type} (srvInst : MonadServer IO) (atomicInst : MonadAtomic σ IO)
     (j : ServerJob σ) : IoJob :=
-  { name := j.name
-    intervalMs := j.intervalMs
-    intervalPos := j.intervalPos
-    runOnce := @j.runM IO _ srvInst atomicInst }
+  { j.toJobMeta with runOnce := @j.runM IO _ srvInst atomicInst }
 
 def StatelessJob.toIoJob (srvInst : MonadServer IO) (j : StatelessJob) : IoJob :=
-  { name := j.name
-    intervalMs := j.intervalMs
-    intervalPos := j.intervalPos
-    runOnce := @j.runM IO _ srvInst }
+  { j.toJobMeta with runOnce := @j.runM IO _ srvInst }
 
 /-- Default tick budget for background server jobs (1 trillion ticks ≈ 31.7 years at 1ms). -/
 def defaultMaxJobTicks : Nat := 1000000000000

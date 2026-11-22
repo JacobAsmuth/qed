@@ -18,37 +18,16 @@ namespace Qed.Server.Db.PgWire
 
 /-! ### Big-Endian Binary Helpers -/
 
-def pushU16BE (ba : ByteArray) (n : Nat) : ByteArray :=
-  (ba.push (UInt8.ofNat ((n >>> 8) &&& 0xFF))).push (UInt8.ofNat (n &&& 0xFF))
-
-def pushU32BE (ba : ByteArray) (n : Nat) : ByteArray :=
-  let b1 := ba.push (UInt8.ofNat ((n >>> 24) &&& 0xFF))
-  let b2 := b1.push (UInt8.ofNat ((n >>> 16) &&& 0xFF))
-  let b3 := b2.push (UInt8.ofNat ((n >>> 8) &&& 0xFF))
-  b3.push (UInt8.ofNat (n &&& 0xFF))
+abbrev pushU16BE := Net.pushU16BE
+abbrev pushU32BE := Net.pushU32BE
+abbrev readU16BE := Net.readU16BE
+abbrev readU32BE := Net.readU32BE
 
 def pushI32BE (ba : ByteArray) (i : Int) : ByteArray :=
-  let n : Nat := if 0 ≤ i then i.toNat else (4294967296 + i).toNat
-  pushU32BE ba n
+  pushU32BE ba (if 0 ≤ i then i.toNat else (4294967296 + i).toNat)
 
 def pushCString (ba : ByteArray) (s : String) : ByteArray :=
   (ba ++ s.toUTF8).push 0
-
-def readU16BE (ba : ByteArray) (off : Nat) : Option Nat :=
-  if h : off + 1 < ba.size then
-    let b0 := (ba[off]'(by omega)).toNat
-    let b1 := (ba[off + 1]'h).toNat
-    some ((b0 <<< 8) ||| b1)
-  else none
-
-def readU32BE (ba : ByteArray) (off : Nat) : Option Nat :=
-  if h : off + 3 < ba.size then
-    let b0 := (ba[off]'(by omega)).toNat
-    let b1 := (ba[off + 1]'(by omega)).toNat
-    let b2 := (ba[off + 2]'(by omega)).toNat
-    let b3 := (ba[off + 3]'h).toNat
-    some ((b0 <<< 24) ||| (b1 <<< 16) ||| (b2 <<< 8) ||| b3)
-  else none
 
 def readI32BE (ba : ByteArray) (off : Nat) : Option Int :=
   (readU32BE ba off).map fun n =>
@@ -60,37 +39,19 @@ def encodeMsg (tag : UInt8) (payload : ByteArray) : ByteArray :=
 
 theorem encodeMsg_size (tag : UInt8) (payload : ByteArray) :
     (encodeMsg tag payload).size = payload.size + 5 := by
-  unfold encodeMsg pushU32BE
+  unfold encodeMsg pushU32BE Net.pushU32BE
   simp [ByteArray.size_append, ByteArray.size_push]
   omega
 
-/-- PostgreSQL `SSLRequest` startup packet (`len=8`, `code=80877103`). -/
-def encodeSslRequest : ByteArray :=
-  pushU32BE (pushU32BE ByteArray.empty 8) 80877103
-
 /-- PostgreSQL v3.0 `StartupMessage` (`protocol = 196608`). -/
 def encodeStartup (user database : String) : ByteArray :=
-  let body :=
-    pushU32BE ByteArray.empty 196608
-    |> (fun b => pushCString b "user")
-    |> (fun b => pushCString b user)
-    |> (fun b => pushCString b "database")
-    |> (fun b => pushCString b database)
-    |> (fun b => pushCString b "client_encoding")
-    |> (fun b => pushCString b "UTF8")
-    |> (fun b => b.push 0)
+  let body := (["user", user, "database", database, "client_encoding", "UTF8"].foldl
+    pushCString (pushU32BE ByteArray.empty 196608)).push 0
   pushU32BE ByteArray.empty (body.size + 4) ++ body
-
-def encodePasswordMsg (pw : String) : ByteArray :=
-  encodeMsg 0x70 (pushCString ByteArray.empty pw) -- 'p'
 
 def encodeSaslInitialResponse (mech : String) (initialResp : ByteArray) : ByteArray :=
   let p := pushCString ByteArray.empty mech
-  let p := pushI32BE p (Int.ofNat initialResp.size) ++ initialResp
-  encodeMsg 0x70 p
-
-def encodeSaslResponse (resp : ByteArray) : ByteArray :=
-  encodeMsg 0x70 resp
+  encodeMsg 0x70 (pushI32BE p (Int.ofNat initialResp.size) ++ initialResp)
 
 /-- Encodes a `SqlVal` as a PostgreSQL text-format Bind parameter (`none` → SQL NULL). -/
 def sqlValToPgText : SqlVal → Option ByteArray
@@ -102,36 +63,16 @@ def sqlValToPgText : SqlVal → Option ByteArray
 
 /-- Extended Query `Parse` (`'P'`) message for unnamed prepared statement. -/
 def encodeParse (sql : String) : ByteArray :=
-  let p := pushCString (pushCString ByteArray.empty "") sql
-  let p := pushU16BE p 0 -- let server infer parameter OIDs
-  encodeMsg 0x50 p
+  encodeMsg 0x50 (pushU16BE (pushCString (pushCString ByteArray.empty "") sql) 0)
 
 /-- Extended Query `Bind` (`'B'`) message carrying parameterized `SqlVal` values. -/
 def encodeBind (params : Array SqlVal) : ByteArray :=
-  let p := pushCString (pushCString ByteArray.empty "") "" -- portal="", stmt=""
-  let p := pushU16BE p 0 -- all parameter format codes = text (0)
-  let p := pushU16BE p params.size
+  let p := pushU16BE (pushU16BE (pushCString (pushCString ByteArray.empty "") "") 0) params.size
   let p := params.foldl (init := p) fun acc v =>
     match sqlValToPgText v with
     | none    => pushI32BE acc (-1)
     | some bs => pushI32BE acc (Int.ofNat bs.size) ++ bs
-  let p := pushU16BE p 0 -- all result column format codes = text (0)
-  encodeMsg 0x42 p
-
-def encodeDescribePortal : ByteArray :=
-  encodeMsg 0x44 (pushCString (ByteArray.empty.push 0x50) "") -- 'D', 'P', ""
-
-def encodeExecute : ByteArray :=
-  encodeMsg 0x45 (pushU32BE (pushCString ByteArray.empty "") 0) -- 'E', "", maxRows=0
-
-def encodeSync : ByteArray :=
-  encodeMsg 0x53 ByteArray.empty -- 'S'
-
-def encodeSimpleQuery (sql : String) : ByteArray :=
-  encodeMsg 0x51 (pushCString ByteArray.empty sql) -- 'Q'
-
-def encodeTerminate : ByteArray :=
-  encodeMsg 0x58 ByteArray.empty -- 'X'
+  encodeMsg 0x42 (pushU16BE p 0)
 
 /-! ### Backend Message Framing & Decoding -/
 
@@ -160,6 +101,12 @@ def decodeFrame (buf : ByteArray) (off : Nat) : DecodeFrameRes :=
           else .needMore
   else .needMore
 
+private def findZeroByte (ba : ByteArray) (i : Nat) : Nat :=
+  if h : i < ba.size then
+    if ba[i]'h == 0 then i else findZeroByte ba (i + 1)
+  else ba.size
+termination_by ba.size - i
+
 /-- Extracts the human-readable `M` (message) field from a PostgreSQL `ErrorResponse` payload. -/
 private def parseErrorFieldsLoop (ba : ByteArray) (off : Nat) : Nat → String
   | 0 => "postgres error"
@@ -168,13 +115,7 @@ private def parseErrorFieldsLoop (ba : ByteArray) (off : Nat) : Nat → String
         let code := ba[off]'h
         if code == 0 then "postgres error"
         else
-          let rec findZero (i : Nat) : Nat → Nat
-            | 0 => ba.size
-            | f + 1 =>
-                if hi : i < ba.size then
-                  if ba[i]'hi == 0 then i else findZero (i + 1) f
-                else ba.size
-          let zPos := findZero (off + 1) (ba.size - off)
+          let zPos := findZeroByte ba (off + 1)
           if code == 0x4D then -- 'M' = Message
             (String.fromUTF8? (ba.extract (off + 1) zPos)).getD "postgres error"
           else
@@ -188,13 +129,7 @@ def parseErrorResponse (payload : ByteArray) : String :=
 private def parseRowDescCols (ba : ByteArray) (off : Nat) (acc : Array Nat) : Nat → Array Nat
   | 0 => acc
   | n + 1 =>
-      let rec skipZero (i : Nat) : Nat → Nat
-        | 0 => ba.size
-        | f + 1 =>
-            if hi : i < ba.size then
-              if ba[i]'hi == 0 then i + 1 else skipZero (i + 1) f
-            else ba.size
-      let afterName := skipZero off (ba.size - off + 1)
+      let afterName := min (findZeroByte ba off + 1) ba.size
       -- 4 (tableOid) + 2 (colAttr) + 4 (typeOid) + 2 (typeSize) + 4 (typeMod) + 2 (fmtCode) = 18 bytes
       let typeOid := (readU32BE ba (afterName + 6)).getD 25
       parseRowDescCols ba (afterName + 18) (acc.push typeOid) n
@@ -271,54 +206,45 @@ structure PgConnParams where
 deriving Inhabited, Repr
 
 def parsePgUrl (rawUrl : String) : Except String PgConnParams := do
+  let split2 (s sep : String) : String × Option String :=
+    match s.splitOn sep with | a :: b :: _ => (a, some b) | _ => (s, none)
   let rest ←
     if rawUrl.startsWith "postgresql://" then .ok (String.ofList (rawUrl.toList.drop 13))
     else if rawUrl.startsWith "postgres://" then .ok (String.ofList (rawUrl.toList.drop 11))
     else .error "PostgreSQL URL must start with `postgres://` or `postgresql://`"
-  let (beforeQ, queryStr) := match rest.splitOn "?" with
-    | a :: b :: _ => (a, b)
-    | _           => (rest, "")
-  let (authAndHost, dbPart) := match beforeQ.splitOn "/" with
-    | a :: b :: _ => (a, b)
-    | _           => (beforeQ, "postgres")
-  let (userInfo?, hostPort) := match authAndHost.splitOn "@" with
-    | a :: b :: _ => (some a, b)
-    | _           => (none, authAndHost)
+  let (beforeQ, queryOpt) := split2 rest "?"
+  let (authAndHost, dbOpt) := split2 beforeQ "/"
+  let (userInfo?, hostPort) := match split2 authAndHost "@" with
+    | (a, some b) => (some a, b)
+    | (_, none)   => (none, authAndHost)
   let (user, password) := match userInfo? with
     | none => ("postgres", "")
     | some ui =>
-        match ui.splitOn ":" with
-        | u :: p :: _ => (Qed.decodeSeg u, Qed.decodeSeg p)
-        | u :: _      => (Qed.decodeSeg u, "")
-        | []          => ("postgres", "")
-  let (host, port) ← match hostPort.splitOn ":" with
-    | h :: pStr :: _ =>
-        match pStr.toNat? with
-        | some pn =>
-            if 1 ≤ pn && pn ≤ 65535 then .ok (h, UInt16.ofNat pn)
-            else .error s!"invalid postgres port `{pStr}`"
-        | none => .error s!"invalid postgres port `{pStr}`"
-    | h :: _ => .ok (h, (5432 : UInt16))
-    | []     => .error "missing postgres host"
+        let (u, p?) := split2 ui ":"
+        (Qed.decodeSeg u, (p?.map Qed.decodeSeg).getD "")
+  let (host, port) ← match split2 hostPort ":" with
+    | (h, some pStr) =>
+        match Net.parseStrictU64 pStr 65535 with
+        | some pn => if pn > 0 then .ok (h, UInt16.ofNat pn) else .error s!"invalid postgres port `{pStr}`"
+        | none    => .error s!"invalid postgres port `{pStr}`"
+    | (h, none) => .ok (h, (5432 : UInt16))
   let sslMode : PgSslMode :=
-    (queryStr.splitOn "&").foldl (init := .prefer) fun acc kv =>
+    (queryOpt.getD "").splitOn "&" |>.foldl (init := .prefer) fun acc kv =>
       match kv.splitOn "=" with
       | ["sslmode", "disable"] => .disable
       | ["sslmode", "require"] | ["sslmode", "verify-ca"] | ["sslmode", "verify-full"] => .require
       | _ => acc
   if host.isEmpty then .error "missing postgres host"
-  else .ok {
-    user := if user.isEmpty then "postgres" else user
-    password
-    host
-    port
-    database := if dbPart.isEmpty then "postgres" else Qed.decodeSeg dbPart
-    sslMode
-  }
+  else
+    let dbPart := dbOpt.getD "postgres"
+    .ok {
+      user := if user.isEmpty then "postgres" else user
+      password, host, port
+      database := if dbPart.isEmpty then "postgres" else Qed.decodeSeg dbPart
+      sslMode
+    }
 
 /-! ### Base64 Helpers & SCRAM-SHA-256 Auth (over `ring` SHA-256 / HMAC / PBKDF2) -/
-
-abbrev base64Encode : ByteArray → String := Qed.Base64.encode
 
 def base64Decode (s : String) : ByteArray :=
   (Qed.Base64.decode (String.ofList (s.toList.filter (!·.isWhitespace)))).toOption.getD ByteArray.empty
@@ -337,23 +263,27 @@ private def xorBytes (a b : ByteArray) : ByteArray :=
 
 /-! ### Live Wire Execution (Total Fuel-Bounded Socket Loops) -/
 
+private abbrev PgM := ExceptT String IO
+private def liftE {α : Type} (x : IO (Except String α)) : PgM α := ExceptT.mk x
+private def liftP {α : Type} (x : Except String α) : PgM α := ExceptT.mk (pure x)
+private def mapErr {α : Type} (pfx : String) (x : PgM α) : PgM α :=
+  ExceptT.mk ((·.mapError fun e => s!"{pfx}: {e}") <$> x.run)
+
 private def readNextFrame (handle : UInt64) (buf : ByteArray) (off : Nat) :
-    Nat → IO (Except String (PgFrame × ByteArray × Nat))
-  | 0 => return .error "postgres read frame fuel exceeded"
+    Nat → PgM (PgFrame × ByteArray × Nat)
+  | 0 => throw "postgres read frame fuel exceeded"
   | fuel + 1 => do
       match decodeFrame buf off with
       | .frame f nextOff =>
           let (b', o') := if nextOff >= buf.size then (ByteArray.empty, 0) else (buf, nextOff)
-          return .ok (f, b', o')
-      | .err msg => return .error msg
+          return (f, b', o')
+      | .err msg => throw msg
       | .needMore =>
-          match ← Prim.outboundReadSome handle 16384 with
-          | .error e => return .error e
-          | .ok chunk =>
-              if chunk.isEmpty then return .error "unexpected EOF from PostgreSQL server"
-              else
-                let compacted := if off > 0 then buf.extract off buf.size ++ chunk else buf ++ chunk
-                readNextFrame handle compacted 0 fuel
+          let chunk ← liftE (Prim.outboundReadSome handle 16384)
+          if chunk.isEmpty then throw "unexpected EOF from PostgreSQL server"
+          else
+            let compacted := if off > 0 then buf.extract off buf.size ++ chunk else buf ++ chunk
+            readNextFrame handle compacted 0 fuel
 
 private def parseScramServerFirst (s : String) : Except String (String × ByteArray × Nat) := do
   let parts := s.splitOn ","
@@ -370,56 +300,41 @@ private def parseScramServerFirst (s : String) : Except String (String × ByteAr
 
 private def authLoop (handle : UInt64) (cfg : PgConnParams)
     (buf : ByteArray) (off : Nat) (clientNonce : String) (clientFirstBare : String) :
-    Nat → IO (Except String (ByteArray × Nat))
-  | 0 => return .error "postgres auth loop exceeded limit"
+    Nat → PgM (ByteArray × Nat)
+  | 0 => throw "postgres auth loop exceeded limit"
   | fuel + 1 => do
-      match ← readNextFrame handle buf off 4096 with
-      | .error e => return .error e
-      | .ok (f, b1, o1) =>
-          if f.tag == 0x45 then -- 'E' ErrorResponse
-            return .error (parseErrorResponse f.payload)
-          else if f.tag == 0x5A then -- 'Z' ReadyForQuery
-            return .ok (b1, o1)
-          else if f.tag == 0x52 then -- 'R' Authentication
-            match readU32BE f.payload 0 with
-            | some 0 => authLoop handle cfg b1 o1 clientNonce clientFirstBare fuel -- AuthOk
-            | some 3 => -- CleartextPassword
-                match ← Prim.outboundWriteAll handle (encodePasswordMsg cfg.password) with
-                | .error e => return .error e
-                | .ok () => authLoop handle cfg b1 o1 clientNonce clientFirstBare fuel
-            | some 10 => -- AuthenticationSASL
-                let nonce ← Prim.randomHex 12
-                let bare := s!"n=,r={nonce}"
-                let initMsg := s!"n,,{bare}".toUTF8
-                match ← Prim.outboundWriteAll handle (encodeSaslInitialResponse "SCRAM-SHA-256" initMsg) with
-                | .error e => return .error e
-                | .ok () => authLoop handle cfg b1 o1 nonce bare fuel
-            | some 11 => -- AuthenticationSASLContinue
-                let serverFirst := (String.fromUTF8? (f.payload.extract 4 f.payload.size)).getD ""
-                match parseScramServerFirst serverFirst with
-                | .error e => return .error e
-                | .ok (srvNonce, salt, iters) =>
-                    if !srvNonce.startsWith clientNonce then
-                      return .error "SCRAM-SHA-256 server nonce mismatch"
-                    let saltedPw ← Prim.pbkdf2HmacSha256 cfg.password.toUTF8 salt (UInt32.ofNat iters)
-                    let clientKey ← Prim.hmacSha256 saltedPw "Client Key".toUTF8
-                    let storedKey ← Prim.sha256 clientKey
-                    let finalNoProof := s!"c=biws,r={srvNonce}"
-                    let authMsg := s!"{clientFirstBare},{serverFirst},{finalNoProof}"
-                    let clientSig ← Prim.hmacSha256 storedKey authMsg.toUTF8
-                    let proof := xorBytes clientKey clientSig
-                    let clientFinal := s!"{finalNoProof},p={base64Encode proof}".toUTF8
-                    match ← Prim.outboundWriteAll handle (encodeSaslResponse clientFinal) with
-                    | .error e => return .error e
-                    | .ok () => authLoop handle cfg b1 o1 clientNonce clientFirstBare fuel
-            | some 12 => -- AuthenticationSASLFinal
-                authLoop handle cfg b1 o1 clientNonce clientFirstBare fuel
-            | some code =>
-                return .error s!"unsupported PostgreSQL auth method {code} (supported: trust, cleartext, SCRAM-SHA-256)"
-            | none => return .error "truncated PostgreSQL Authentication packet"
-          else
-            -- Skip ParameterStatus ('S'), BackendKeyData ('K'), NoticeResponse ('N')
-            authLoop handle cfg b1 o1 clientNonce clientFirstBare fuel
+      let (f, b1, o1) ← readNextFrame handle buf off 4096
+      let sendNext (wire : ByteArray) (cNonce := clientNonce) (cBare := clientFirstBare) : PgM (ByteArray × Nat) := do
+        liftE (Prim.outboundWriteAll handle wire)
+        authLoop handle cfg b1 o1 cNonce cBare fuel
+      if f.tag == 0x45 then throw (parseErrorResponse f.payload) -- 'E' ErrorResponse
+      else if f.tag == 0x5A then return (b1, o1) -- 'Z' ReadyForQuery
+      else if f.tag == 0x52 then -- 'R' Authentication
+        match readU32BE f.payload 0 with
+        | some 0 | some 12 => authLoop handle cfg b1 o1 clientNonce clientFirstBare fuel
+        | some 3 => sendNext (encodeMsg 0x70 (pushCString ByteArray.empty cfg.password)) -- CleartextPassword
+        | some 10 => -- AuthenticationSASL
+            let nonce ← Prim.randomHex 12
+            let bare := s!"n=,r={nonce}"
+            sendNext (encodeSaslInitialResponse "SCRAM-SHA-256" s!"n,,{bare}".toUTF8) nonce bare
+        | some 11 => -- AuthenticationSASLContinue
+            let serverFirst := (String.fromUTF8? (f.payload.extract 4 f.payload.size)).getD ""
+            let (srvNonce, salt, iters) ← liftP (parseScramServerFirst serverFirst)
+            if !srvNonce.startsWith clientNonce then throw "SCRAM-SHA-256 server nonce mismatch"
+            let saltedPw ← Prim.pbkdf2HmacSha256 cfg.password.toUTF8 salt (UInt32.ofNat iters)
+            let clientKey ← Prim.hmacSha256 saltedPw "Client Key".toUTF8
+            let storedKey ← Prim.sha256 clientKey
+            let finalNoProof := s!"c=biws,r={srvNonce}"
+            let authMsg := s!"{clientFirstBare},{serverFirst},{finalNoProof}"
+            let clientSig ← Prim.hmacSha256 storedKey authMsg.toUTF8
+            let proof := xorBytes clientKey clientSig
+            sendNext (encodeMsg 0x70 s!"{finalNoProof},p={Qed.Base64.encode proof}".toUTF8)
+        | some code =>
+            throw s!"unsupported PostgreSQL auth method {code} (supported: trust, cleartext, SCRAM-SHA-256)"
+        | none => throw "truncated PostgreSQL Authentication packet"
+      else
+        -- Skip ParameterStatus ('S'), BackendKeyData ('K'), NoticeResponse ('N')
+        authLoop handle cfg b1 o1 clientNonce clientFirstBare fuel
 
 private def readyStatusByte (payload : ByteArray) : UInt8 :=
   if h : 0 < payload.size then payload[0]'h else 0
@@ -429,43 +344,33 @@ private def readyStatusByte (payload : ByteArray) : UInt8 :=
     Returns `.error transportErr` on wire/EOF failure (connection must be evicted). -/
 private def collectQueryResultLoop (handle : UInt64) (buf : ByteArray) (off : Nat)
     (oids : Array Nat) (rows : Array DbRow) (affected : Nat) (err? : Option String) :
-    Nat → IO (Except String (Except String DbResult × ByteArray × Nat × UInt8))
-  | 0 => return .error "postgres query response exceeded frame limit"
+    Nat → PgM (Except String DbResult × ByteArray × Nat × UInt8)
+  | 0 => throw "postgres query response exceeded frame limit"
   | fuel + 1 => do
-      match ← readNextFrame handle buf off 4096 with
-      | .error e => return .error e
-      | .ok (f, b1, o1) =>
-          if f.tag == 0x5A then -- 'Z' ReadyForQuery
-            let status := readyStatusByte f.payload
-            let qRes := match err? with
-              | some e => Except.error e
-              | none   => Except.ok { rows, affected }
-            return .ok (qRes, b1, o1, status)
-          else if f.tag == 0x45 then -- 'E' ErrorResponse
-            collectQueryResultLoop handle b1 o1 oids rows affected (some (parseErrorResponse f.payload)) fuel
-          else if f.tag == 0x54 then -- 'T' RowDescription
-            collectQueryResultLoop handle b1 o1 (parseRowDescription f.payload) rows affected err? fuel
-          else if f.tag == 0x44 then -- 'D' DataRow
-            match parseDataRow oids f.payload with
-            | .ok row => collectQueryResultLoop handle b1 o1 oids (rows.push row) affected err? fuel
-            | .error e => collectQueryResultLoop handle b1 o1 oids rows affected (some e) fuel
-          else if f.tag == 0x43 then -- 'C' CommandComplete
-            let aff := parseCommandTagAffected f.payload
-            collectQueryResultLoop handle b1 o1 oids rows aff err? fuel
-          else
-            -- ParseComplete ('1'), BindComplete ('2'), NoData ('n'), NoticeResponse ('N'), EmptyQuery ('I')
-            collectQueryResultLoop handle b1 o1 oids rows affected err? fuel
+      let (f, b1, o1) ← readNextFrame handle buf off 4096
+      if f.tag == 0x5A then -- 'Z' ReadyForQuery
+        let qRes := match err? with | some e => Except.error e | none => Except.ok { rows, affected }
+        return (qRes, b1, o1, readyStatusByte f.payload)
+      else if f.tag == 0x45 then -- 'E' ErrorResponse
+        collectQueryResultLoop handle b1 o1 oids rows affected (some (parseErrorResponse f.payload)) fuel
+      else if f.tag == 0x54 then -- 'T' RowDescription
+        collectQueryResultLoop handle b1 o1 (parseRowDescription f.payload) rows affected err? fuel
+      else if f.tag == 0x44 then -- 'D' DataRow
+        match parseDataRow oids f.payload with
+        | .ok row  => collectQueryResultLoop handle b1 o1 oids (rows.push row) affected err? fuel
+        | .error e => collectQueryResultLoop handle b1 o1 oids rows affected (some e) fuel
+      else if f.tag == 0x43 then -- 'C' CommandComplete
+        collectQueryResultLoop handle b1 o1 oids rows (parseCommandTagAffected f.payload) err? fuel
+      else
+        -- ParseComplete ('1'), BindComplete ('2'), NoData ('n'), NoticeResponse ('N'), EmptyQuery ('I')
+        collectQueryResultLoop handle b1 o1 oids rows affected err? fuel
 
 /-! ### Thread-Safe Per-DSN Connection Pool (`PgConn` & `pgPoolBox`) -/
 
-def PgSslMode.tag : PgSslMode → String
-  | .disable => "disable"
-  | .prefer  => "prefer"
-  | .require => "require"
-
 /-- Normalized connection-pool key uniquely identifying `(host, port, database, user, sslMode, password)`. -/
 def PgConnParams.poolKey (cfg : PgConnParams) : String :=
-  s!"{cfg.user}:{cfg.password}@{cfg.host.toLower}:{cfg.port}/{cfg.database}?ssl={cfg.sslMode.tag}"
+  let ssl := match cfg.sslMode with | .disable => "disable" | .prefer => "prefer" | .require => "require"
+  s!"{cfg.user}:{cfg.password}@{cfg.host.toLower}:{cfg.port}/{cfg.database}?ssl={ssl}"
 
 structure PgConn where
   poolKey    : String
@@ -489,39 +394,31 @@ initialize pgPoolBox : IO.Ref (Std.HashMap String (Array PgPooledEntry)) ←
 
 private def closePgHandle (handle : UInt64) (sendTerm : Bool := true) : IO Unit := do
   if sendTerm then
-    discard <| Prim.outboundWriteAll handle encodeTerminate
+    discard <| Prim.outboundWriteAll handle (encodeMsg 0x58 ByteArray.empty) -- 'X' Terminate
   Prim.outboundRelease handle 0
 
-private def closeHandlesList : List UInt64 → IO Unit
-  | [] => pure ()
-  | h :: hs => do
-      closePgHandle h true
-      closeHandlesList hs
+private def partitionPoolEntries (arr : Array PgPooledEntry) (nowMs : Nat) :
+    Array PgPooledEntry × List UInt64 :=
+  arr.foldl (init := (#[], [])) fun (l, ex) e =>
+    if nowMs - e.lastUsedMs ≤ pgPoolIdleTimeoutMs then (l.push e, ex) else (l, e.handle :: ex)
 
-private def connectPg (cfg : PgConnParams) : IO (Except String PgConn) := do
-  match ← Prim.outboundAcquire 0 cfg.host cfg.port 0 (fun _ => false) with
-  | .error e => return .error s!"postgres connect failed: {e}"
-  | .ok (handleNat, _) =>
-      let handle := UInt64.ofNat handleNat
-      let fail (msg : String) : IO (Except String PgConn) := do
-        Prim.outboundRelease handle 0; return .error msg
-      if cfg.sslMode != .disable then
-        match ← Prim.outboundWriteAll handle encodeSslRequest with
-        | .error e => return ← fail s!"postgres SSLRequest write failed: {e}"
-        | .ok () =>
-            match ← Prim.outboundReadSome handle 1 with
-            | .error e => return ← fail s!"postgres SSLRequest read failed: {e}"
-            | .ok reply =>
-                if reply.size >= 1 && reply[0]! == 0x53 then -- 'S' = TLS accepted
-                  if let .error e ← Prim.outboundUpgradeTls handle cfg.host then return ← fail e
-                else if cfg.sslMode == .require then
-                  return ← fail "PostgreSQL server rejected TLS but sslmode=require"
-      if let .error e ← Prim.outboundWriteAll handle (encodeStartup cfg.user cfg.database) then
-        return ← fail s!"postgres startup write failed: {e}"
-      match ← authLoop handle cfg ByteArray.empty 0 "" "" 64 with
-      | .error e => fail s!"postgres auth failed: {e}"
-      | .ok (b, o) =>
-          return .ok { poolKey := cfg.poolKey, handle, buf := b, off := o, txStatus := 0x49, healthy := true }
+private def connectPg (cfg : PgConnParams) : PgM PgConn := do
+  let (handleNat, _) ← mapErr "postgres connect failed" <| liftE (Prim.outboundAcquire 0 cfg.host cfg.port 0 (fun _ => false))
+  let handle := UInt64.ofNat handleNat
+  try
+    if cfg.sslMode != .disable then
+      mapErr "postgres SSLRequest write failed" <| liftE (Prim.outboundWriteAll handle (pushU32BE (pushU32BE ByteArray.empty 8) 80877103))
+      let reply ← mapErr "postgres SSLRequest read failed" <| liftE (Prim.outboundReadSome handle 1)
+      if reply.size >= 1 && reply[0]! == 0x53 then -- 'S' = TLS accepted
+        liftE (Prim.outboundUpgradeTls handle cfg.host)
+      else if cfg.sslMode == .require then
+        throw "PostgreSQL server rejected TLS but sslmode=require"
+    mapErr "postgres startup write failed" <| liftE (Prim.outboundWriteAll handle (encodeStartup cfg.user cfg.database))
+    let (b, o) ← mapErr "postgres auth failed" <| authLoop handle cfg ByteArray.empty 0 "" "" 64
+    return { poolKey := cfg.poolKey, handle, buf := b, off := o, txStatus := 0x49, healthy := true }
+  catch e =>
+    Prim.outboundRelease handle 0
+    throw e
 
 private def popPoolCandidate (key : String) (nowMs : Nat) :
     IO (Option PgPooledEntry × List UInt64) :=
@@ -529,34 +426,24 @@ private def popPoolCandidate (key : String) (nowMs : Nat) :
     match m[key]? with
     | none => ((none, []), m)
     | some arr =>
-        let (live, expired) := arr.foldl (init := (#[], [])) fun (l, ex) e =>
-          if nowMs - e.lastUsedMs ≤ pgPoolIdleTimeoutMs then (l.push e, ex)
-          else (l, e.handle :: ex)
+        let (live, expired) := partitionPoolEntries arr nowMs
         if h : live.size > 0 then
-          let picked := live[live.size - 1]
           let rest := live.pop
-          let m' := if rest.isEmpty then m.erase key else m.insert key rest
-          ((some picked, expired), m')
+          ((some live[live.size - 1], expired), if rest.isEmpty then m.erase key else m.insert key rest)
         else
           ((none, expired), m.erase key)
 
 private def acquirePooledLoop (cfg : PgConnParams) (key : String) (nowMs : Nat) :
-    Nat → IO (Except String (PgConn × Bool))
-  | 0 => do
-      match ← connectPg cfg with
-      | .ok c    => return .ok (c, false)
-      | .error e => return .error e
+    Nat → PgM (PgConn × Bool)
+  | 0 => (·, false) <$> connectPg cfg
   | fuel + 1 => do
       let (cand?, expired) ← popPoolCandidate key nowMs
-      closeHandlesList expired
+      expired.forM (closePgHandle · true)
       match cand? with
-      | none =>
-          match ← connectPg cfg with
-          | .ok c    => return .ok (c, false)
-          | .error e => return .error e
+      | none => (·, false) <$> connectPg cfg
       | some entry =>
           if entry.off >= entry.buf.size && (← Prim.outboundIsAlive entry.handle) then
-            return .ok ({
+            return ({
               poolKey := key, handle := entry.handle, buf := ByteArray.empty, off := 0,
               txStatus := 0x49, healthy := true
             }, true)
@@ -567,7 +454,7 @@ private def acquirePooledLoop (cfg : PgConnParams) (key : String) (nowMs : Nat) 
 /-- Acquires a live, authenticated PostgreSQL connection from the per-DSN pool (or opens one). -/
 def acquireConn (cfg : PgConnParams) : IO (Except String (PgConn × Bool)) := do
   let nowMs := (← Prim.nowMs).toNat
-  acquirePooledLoop cfg cfg.poolKey nowMs (pgPoolMaxIdlePerDsn + 2)
+  (acquirePooledLoop cfg cfg.poolKey nowMs (pgPoolMaxIdlePerDsn + 2)).run
 
 /-- Returns a healthy idle (`ReadyForQuery` `'I'`) PostgreSQL connection to the bounded per-DSN pool,
     or closes it cleanly if broken, mid-transaction, or over the pool's idle cap. -/
@@ -578,10 +465,7 @@ def releaseConn (conn : PgConn) : IO Unit := do
   let nowMs := (← Prim.nowMs).toNat
   let entry : PgPooledEntry := { handle := conn.handle, buf := ByteArray.empty, off := 0, lastUsedMs := nowMs }
   let evicted ← pgPoolBox.modifyGet fun m =>
-    let cur := m[conn.poolKey]?.getD #[]
-    let (live, expired) := cur.foldl (init := (#[], [])) fun (l, ex) e =>
-      if nowMs - e.lastUsedMs ≤ pgPoolIdleTimeoutMs then (l.push e, ex)
-      else (l, e.handle :: ex)
+    let (live, expired) := partitionPoolEntries (m[conn.poolKey]?.getD #[]) nowMs
     if live.size < pgPoolMaxIdlePerDsn then
       (expired, m.insert conn.poolKey (live.push entry))
     else
@@ -590,59 +474,54 @@ def releaseConn (conn : PgConn) : IO Unit := do
         if h : 0 < live.size then (live[0].handle :: expired, live.extract 1 live.size)
         else (expired, live)
       (evictedOld, m.insert conn.poolKey (kept.push entry))
-  closeHandlesList evicted
+  evicted.forM (closePgHandle · true)
 
 private def runWireOnConn (conn : PgConn) (wire : ByteArray) (errPrefix : String) (fuel : Nat) :
     IO (Except String (DbResult × PgConn) × PgConn) := do
   match ← Prim.outboundWriteAll conn.handle wire with
   | .error e => return (.error s!"{errPrefix}: {e}", { conn with healthy := false })
   | .ok () =>
-      match ← collectQueryResultLoop conn.handle conn.buf conn.off #[] #[] 0 none fuel with
+      match ← (collectQueryResultLoop conn.handle conn.buf conn.off #[] #[] 0 none fuel).run with
       | .error transportErr => return (.error transportErr, { conn with healthy := false })
       | .ok (qRes, b', o', status) =>
           let conn' := { conn with buf := b', off := o', txStatus := status, healthy := true }
-          match qRes with
-          | .ok r    => return (.ok (r, conn'), conn')
-          | .error e => return (.error e, conn')
+          return (qRes.map (·, conn'), conn')
 
 /-- Executes a parameterized query on an already-acquired `PgConn` (used by both pooled queries and transactions). -/
 def execOnConn (conn : PgConn) (sql : String) (params : Array SqlVal) :
     IO (Except String (DbResult × PgConn) × PgConn) :=
-  runWireOnConn conn (encodeParse sql ++ encodeBind params ++ encodeDescribePortal ++ encodeExecute ++ encodeSync)
+  let descPortal := encodeMsg 0x44 (pushCString (ByteArray.empty.push 0x50) "")
+  let execute := encodeMsg 0x45 (pushU32BE (pushCString ByteArray.empty "") 0)
+  let sync := encodeMsg 0x53 ByteArray.empty
+  runWireOnConn conn (encodeParse sql ++ encodeBind params ++ descPortal ++ execute ++ sync)
     "postgres query write failed" 65536
 
 /-- Executes a Simple Query Protocol (`'Q'`) statement (e.g. DDL, `BEGIN`, `COMMIT`, `ROLLBACK`) on `conn`. -/
 def execSimpleOnConn (conn : PgConn) (sql : String) : IO (Except String PgConn × PgConn) := do
-  let (res, conn') ← runWireOnConn conn (encodeSimpleQuery sql) "postgres simple query write failed" 4096
+  let (res, conn') ← runWireOnConn conn (encodeMsg 0x51 (pushCString ByteArray.empty sql)) "postgres simple query write failed" 4096
   return (res.map Prod.snd, conn')
 
 private def execParameterizedAttempt (cfg : PgConnParams) (sql : String) (params : Array SqlVal) :
-    Nat → IO (Except String DbResult)
-  | 0 => return .error "postgres query failed after retry"
+    Nat → PgM DbResult
+  | 0 => throw "postgres query failed after retry"
   | attemptsLeft + 1 => do
-      match ← acquireConn cfg with
-      | .error e => return .error e
-      | .ok (conn, wasReused) =>
-          let (res, conn') ← execOnConn conn sql params
-          match res with
-          | .ok (dbRes, cFinal) =>
-              releaseConn cFinal
-              return .ok dbRes
-          | .error e =>
-              releaseConn conn'
-              -- If a pooled connection broke mid-flight, retry once on a fresh connection.
-              if !conn'.healthy && wasReused && attemptsLeft > 0 then
-                execParameterizedAttempt cfg sql params attemptsLeft
-              else
-                return .error e
+      let (conn, wasReused) ← liftE (acquireConn cfg)
+      let (res, conn') ← execOnConn conn sql params
+      match res with
+      | .ok (dbRes, cFinal) => releaseConn cFinal; return dbRes
+      | .error e =>
+          releaseConn conn'
+          -- If a pooled connection broke mid-flight, retry once on a fresh connection.
+          if !conn'.healthy && wasReused && attemptsLeft > 0 then
+            execParameterizedAttempt cfg sql params attemptsLeft
+          else throw e
 
 /-- Executes a single parameterized SQL query over PostgreSQL Extended Query Protocol (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`),
     reusing authenticated pooled connections per DSN. -/
-def execParameterized (pgUrl : String) (sql : String) (params : Array SqlVal) : IO (Except String DbResult) := do
-  let cfg ← match parsePgUrl pgUrl with
-    | .ok c => pure c
-    | .error e => return .error e
-  execParameterizedAttempt cfg sql params 2
+def execParameterized (pgUrl : String) (sql : String) (params : Array SqlVal) : IO (Except String DbResult) :=
+  ExceptT.run do
+    let cfg ← liftP (parsePgUrl pgUrl)
+    execParameterizedAttempt cfg sql params 2
 
 /-- Closes and evicts all idle pooled PostgreSQL connections cleanly. -/
 def clearPool : IO Unit := do
@@ -650,21 +529,16 @@ def clearPool : IO Unit := do
     let all := m.toList.foldl (init := []) fun acc (_, arr) =>
       arr.foldl (init := acc) fun a e => e.handle :: a
     (all, {})
-  closeHandlesList handles
+  handles.forM (closePgHandle · true)
 
 /-- Executes DDL statements over PostgreSQL Simple Query Protocol (`'Q'`) using the connection pool. -/
-def execDdl (pgUrl : String) (ddl : String) : IO (Except String Unit) := do
-  if ddl.trimAscii.toString.isEmpty then return .ok ()
-  let cfg ← match parsePgUrl pgUrl with
-    | .ok c => pure c
-    | .error e => return .error e
-  match ← acquireConn cfg with
-  | .error e => return .error e
-  | .ok (conn, _) =>
-      let (res, conn') ← execSimpleOnConn conn ddl
-      releaseConn conn'
-      match res with
-      | .ok _    => return .ok ()
-      | .error e => return .error e
+def execDdl (pgUrl : String) (ddl : String) : IO (Except String Unit) :=
+  ExceptT.run do
+    if ddl.trimAscii.toString.isEmpty then return ()
+    let cfg ← liftP (parsePgUrl pgUrl)
+    let (conn, _) ← liftE (acquireConn cfg)
+    let (res, conn') ← execSimpleOnConn conn ddl
+    releaseConn conn'
+    discard <| liftP res
 
 end Qed.Server.Db.PgWire

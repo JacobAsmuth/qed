@@ -51,13 +51,9 @@ private theorem isHostHeader_imp_toLower (k : String) (h : isHostHeader k = true
   simp only [Bool.and_eq_true, Bool.or_eq_true] at h
   rcases h.2 with (h1 | h2) | h3
   · rw [beq_iff_eq.1 h1]
-    have : "Host".toLower = "host" := by
-      unfold String.toLower; apply String.ext; simp [Char.toLower]; decide
-    simp [this]
+    exact beq_iff_eq.2 (by unfold String.toLower; apply String.ext; simp [Char.toLower]; decide)
   · rw [beq_iff_eq.1 h2]
-    have : "host".toLower = "host" := by
-      unfold String.toLower; apply String.ext; simp [Char.toLower]
-    simp [this]
+    exact beq_iff_eq.2 (by unfold String.toLower; apply String.ext; simp [Char.toLower])
   · exact h3
 
 private def acceptEncodingHasGzip (v : String) : Bool :=
@@ -76,48 +72,39 @@ private def acceptEncodingHasGzip (v : String) : Bool :=
             | _ => false)
 
 private def parseOtherHeader (k v : String) (st : HdrFoldState) : HdrFoldState :=
-  let headers := st.headers.push (k, v)
+  let st := { st with headers := st.headers.push (k, v) }
   match k.utf8ByteSize with
   | 6 =>
       if eqCI k "origin" then
-        if st.origin?.isSome then { st with headers, dupOrigin := true }
-        else { st with headers, origin? := some v }
-      else if eqCI k "cookie" then { st with headers, hasCookie := true }
-      else { st with headers }
-  | 7 =>
-      if eqCI k "upgrade" then { st with headers, upgrade? := some v } else { st with headers }
+        if st.origin?.isSome then { st with dupOrigin := true } else { st with origin? := some v }
+      else if eqCI k "cookie" then { st with hasCookie := true }
+      else st
+  | 7 => if eqCI k "upgrade" then { st with upgrade? := some v } else st
   | 10 =>
       if eqCI k "connection" then
         let keepAlive :=
           if containsCI v "close" then false
           else if containsCI v "keep-alive" then true
           else st.keepAlive
-        { st with headers, keepAlive, conn? := some v }
-      else { st with headers }
+        { st with keepAlive, conn? := some v }
+      else st
   | 12 =>
       if eqCI k "content-type" then
-        if st.contentType?.isSome then { st with headers, dupCt := true }
-        else { st with headers, contentType? := some v }
-      else { st with headers }
+        if st.contentType?.isSome then { st with dupCt := true } else { st with contentType? := some v }
+      else st
   | 13 =>
       if eqCI k "authorization" then
-        if st.auth?.isNone then { st with headers, auth? := some v } else { st with headers }
-      else if eqCI k "if-none-match" then { st with headers, hasIfNoneMatch := true }
-      else { st with headers }
+        if st.auth?.isNone then { st with auth? := some v } else st
+      else if eqCI k "if-none-match" then { st with hasIfNoneMatch := true }
+      else st
   | 14 =>
       if eqCI k "sec-fetch-site" then
-        if st.secFetchSite?.isSome then { st with headers, dupSfs := true }
-        else { st with headers, secFetchSite? := some v }
-      else { st with headers }
-  | 15 =>
-      if eqCI k "accept-encoding" && acceptEncodingHasGzip v then
-        { st with headers, acceptsGzip := true }
-      else { st with headers }
-  | 17 =>
-      if eqCI k "sec-websocket-key" then { st with headers, wsKey? := some v } else { st with headers }
-  | 21 =>
-      if eqCI k "sec-websocket-version" then { st with headers, wsVer? := some v } else { st with headers }
-  | _ => { st with headers }
+        if st.secFetchSite?.isSome then { st with dupSfs := true } else { st with secFetchSite? := some v }
+      else st
+  | 15 => if eqCI k "accept-encoding" && acceptEncodingHasGzip v then { st with acceptsGzip := true } else st
+  | 17 => if eqCI k "sec-websocket-key" then { st with wsKey? := some v } else st
+  | 21 => if eqCI k "sec-websocket-version" then { st with wsVer? := some v } else st
+  | _ => st
 
 private theorem parseOtherHeader_invariants (k v : String) (st : HdrFoldState) :
     (parseOtherHeader k v st).contentLen? = st.contentLen? ∧
@@ -150,14 +137,9 @@ def parseOneHeaderLine (line : String) (st : HdrFoldState) :
         match parseStrictU64 v 18446744073709551615 with
         | none => .error (400, "invalid Content-Length")
         | some cl =>
-            match st.contentLen? with
-            | some prev =>
-                if prev ≠ cl then .error (400, "conflicting Content-Length headers")
-                else if cl > maxReqBodyBytes then .error (413, "payload too large")
-                else .ok { st with headers := st.headers.push (k, v) }
-            | none =>
-                if cl > maxReqBodyBytes then .error (413, "payload too large")
-                else .ok { st with contentLen? := some cl, headers := st.headers.push (k, v) }
+            if st.contentLen?.any (· != cl) then .error (400, "conflicting Content-Length headers")
+            else if cl > maxReqBodyBytes then .error (413, "payload too large")
+            else .ok { st with contentLen? := some cl, headers := st.headers.push (k, v) }
       else
         .ok (parseOtherHeader k v st)
 
@@ -226,8 +208,7 @@ def parseRequestHead (headBytes : ByteArray) : Except (Nat × String) ParsedReqH
           | .error e => .error e
           | .ok (method, target, isHttp11) =>
               let initSt : HdrFoldState := {
-                keepAlive := isHttp11, contentLen? := none, hostCount := 0, headers := Array.mkEmpty 12,
-                upgrade? := none, conn? := none, wsKey? := none, wsVer? := none
+                keepAlive := isHttp11, contentLen? := none, hostCount := 0, headers := Array.mkEmpty 12
               }
               match parseHdrLines lines 1 initSt with
               | .error e => .error e
@@ -262,59 +243,16 @@ private theorem parseOneHeaderLine_ok_spec (line : String) (st st' : HdrFoldStat
     (st'.hostCount = st.hostCount ∨
       (st'.hostCount = st.hostCount + 1 ∧ ∃ k v, (k, v) ∈ st'.headers.toList ∧ k.toLower == "host")) ∧
     (∀ p ∈ st.headers.toList, p ∈ st'.headers.toList) := by
-  unfold parseOneHeaderLine at hok
-  cases hs : splitHeaderKv line with
-  | none => simp [hs] at hok
-  | some kv =>
-      simp only [hs] at hok
-      by_cases htok : isValidHttpToken kv.1
-      · simp only [htok, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hok
-        by_cases hte : eqCI kv.1 "transfer-encoding"
-        · simp [hte] at hok
-        · by_cases hmax : st.headers.size >= maxReqHeaders
-          · simp [hte, hmax] at hok
-          · by_cases hhost : isHostHeader kv.1
-            · simp only [hte, hmax, hhost, ↓reduceIte, Bool.false_eq_true] at hok
-              split at hok
-              · cases hok
-              · split at hok
-                · cases hok
-                · simp only [Except.ok.injEq] at hok; subst hok
-                  refine ⟨id, Or.inr ⟨rfl, kv.1, kv.2, ?_, isHostHeader_imp_toLower kv.1 hhost⟩, ?_⟩
-                  · simp [Array.toList_push]
-                  · intro p hp; simp [Array.toList_push, hp]
-            · by_cases hcl : eqCI kv.1 "content-length"
-              · simp only [hte, hmax, hhost, hcl, ↓reduceIte, Bool.false_eq_true] at hok
-                cases hp : parseStrictU64 kv.2 18446744073709551615 with
-                | none => simp [hp] at hok
-                | some cl =>
-                    simp only [hp] at hok
-                    cases hprev : st.contentLen? with
-                    | some prev =>
-                        simp only [hprev] at hok
-                        by_cases hne : prev ≠ cl
-                        · simp [hne] at hok
-                        · by_cases hbig : maxReqBodyBytes < cl
-                          · simp [hne, hbig] at hok
-                          · simp only [hne, hbig, ↓reduceIte, Except.ok.injEq] at hok
-                            subst hok
-                            refine ⟨fun hinit c hc => hinit c hc, Or.inl rfl, ?_⟩
-                            intro p hp; simp [Array.toList_push, hp]
-                    | none =>
-                        simp only [hprev] at hok
-                        by_cases hbig : maxReqBodyBytes < cl
-                        · simp [hbig] at hok
-                        · simp only [hbig, ↓reduceIte, Except.ok.injEq] at hok
-                          subst hok
-                          refine ⟨fun _ c hc => by simp only [Option.some.injEq] at hc; omega, Or.inl rfl, ?_⟩
-                          intro p hp; simp [Array.toList_push, hp]
-              · simp only [hte, hmax, hhost, hcl, ↓reduceIte, Bool.false_eq_true, Except.ok.injEq] at hok
-                subst hok
-                have hinv := parseOtherHeader_invariants kv.1 kv.2 st
-                refine ⟨fun hinit => by rw [hinv.1]; exact hinit, Or.inl hinv.2.1, ?_⟩
-                rw [hinv.2.2]
-                intro p hp; simp [Array.toList_push, hp]
-      · simp [htok] at hok
+  revert hok; fun_cases parseOneHeaderLine line st <;> (intro hok; cases hok)
+  · rename_i k v _ _ _ _ hhost _ _
+    refine ⟨id, Or.inr ⟨rfl, k, v, by simp [Array.toList_push], isHostHeader_imp_toLower k hhost⟩,
+      fun p hp => by simp [Array.toList_push, hp]⟩
+  · refine ⟨fun _ c hc => by cases hc; omega, Or.inl rfl,
+      fun p hp => by simp [Array.toList_push, hp]⟩
+  · rename_i k v _ _ _ _ _ _
+    have hinv := parseOtherHeader_invariants k v st
+    refine ⟨fun h => hinv.1 ▸ h, Or.inl hinv.2.1,
+      fun p hp => by rw [hinv.2.2]; simp [Array.toList_push, hp]⟩
 
 private theorem parseHdrLines_inv (P : HdrFoldState → Prop)
     (hstep : ∀ line st st', P st → parseOneHeaderLine line st = .ok st' → P st')
@@ -335,43 +273,16 @@ private theorem parseRequestHead_ok_elim (headBytes : ByteArray) (req : ParsedRe
     (hok : parseRequestHead headBytes = .ok req) :
     ∃ (lines : Array String) (st : HdrFoldState),
       let initSt : HdrFoldState := {
-        keepAlive := req.isHttp11, contentLen? := none, hostCount := 0, headers := Array.mkEmpty 12,
-        upgrade? := none, conn? := none, wsKey? := none, wsVer? := none
+        keepAlive := req.isHttp11, contentLen? := none, hostCount := 0, headers := Array.mkEmpty 12
       }
       parseHdrLines lines 1 initSt = .ok st ∧
       (req.isHttp11 = true → st.hostCount = 1) ∧
       req.contentLen = st.contentLen?.getD 0 ∧
       req.headers = st.headers := by
-  unfold parseRequestHead at hok
-  by_cases hsz : headBytes.size > maxReqHdrBytes
-  · simp [hsz] at hok
-  · simp only [hsz, ↓reduceIte] at hok
-    cases hsp : splitCrlfLines headBytes with
-    | error e => simp [hsp] at hok
-    | ok lines =>
-        simp only [hsp] at hok
-        by_cases h0 : lines.size = 0
-        · simp [h0] at hok
-        · simp only [h0, ↓reduceDIte] at hok
-          cases hreq : parseReqLine (lines[0]'(by omega)) with
-          | error e => simp [hreq] at hok
-          | ok mti =>
-              rcases mti with ⟨m, t, is11⟩
-              simp only [hreq] at hok
-              let initSt : HdrFoldState := {
-                keepAlive := is11, contentLen? := none, hostCount := 0, headers := Array.mkEmpty 12,
-                upgrade? := none, conn? := none, wsKey? := none, wsVer? := none
-              }
-              cases hfold : parseHdrLines lines 1 initSt with
-              | error e => simp only [initSt, hfold] at hok; cases hok
-              | ok st =>
-                  simp only [initSt, hfold] at hok
-                  by_cases hmiss : (is11 && st.hostCount != 1) = true
-                  · simp [hmiss] at hok
-                  · simp only [hmiss, Bool.false_eq_true, ↓reduceIte, Except.ok.injEq] at hok
-                    subst hok
-                    refine ⟨lines, st, hfold, ?_, rfl, rfl⟩
-                    intro h11; simp at hmiss; exact hmiss h11
+  revert hok; fun_cases parseRequestHead headBytes <;> (intro hok; cases hok)
+  rename_i hmiss
+  refine ⟨_, _, ‹_›, ?_, rfl, rfl⟩
+  intro h11; simp at hmiss; exact hmiss h11
 
 theorem parseRequestHead_http11_has_host (headBytes : ByteArray) (req : ParsedReqHead)
     (hok : parseRequestHead headBytes = .ok req) (h11 : req.isHttp11 = true) :
@@ -435,10 +346,6 @@ theorem safeContentType_no_crlf (ct : String) :
   split
   · decide
   · rename_i h; simpa using h
-
-/-- Default strict Content-Security-Policy enabled on HTML responses because Qed statically proves
-    zero inline `<script>` tags and zero inline `on*` event handler attributes. -/
-abbrev defaultCsp : String := Qed.Server.defaultCsp
 
 /-- True iff `mime` is a text/script/markup/JSON/SVG media type eligible for gzip compression. -/
 def isCompressibleMime (mime : String) : Bool :=
@@ -545,8 +452,12 @@ private def formatFast200 (headPrefix body : ByteArray) (headOnly keepAlive : Bo
 def formatOkProtoResponse (body : ByteArray) (headOnly keepAlive : Bool) : ByteArray :=
   formatFast200 okProtoHeadPrefix body headOnly keepAlive
 
+def formatTextResponse (status : Nat) (msg : String) (isHead keepAlive : Bool)
+    (extraHeaders : List (String × String) := []) : ByteArray :=
+  formatHttpResponse status "text/plain; charset=utf-8" msg.toUTF8 isHead keepAlive false (extraHeaders := extraHeaders)
+
 def formatErrorResponse (status : Nat) (msg : String) : ByteArray :=
-  formatHttpResponse status "text/plain; charset=utf-8" msg.toUTF8 false false false
+  formatTextResponse status msg false false
 
 def formatWsUpgradeResponse (acceptB64 : String) : ByteArray :=
   (s!"HTTP/1.1 101 Switching Protocols\r\n" ++
@@ -782,26 +693,13 @@ def decodeWsFrame (buf : ByteArray) (offset : Nat) (maxMsgBytes : Nat := maxWsMs
         if len7 < 126 then
           some (.ok (2, len7))
         else if len7 == 126 then
-          if h4 : offset + 4 ≤ d.size then
-            let p := ((d[offset + 2]'(by omega)).toNat <<< 8) ||| (d[offset + 3]'(by omega)).toNat
-            some (.ok (4, p))
-          else none
+          (readU16BE buf (offset + 2)).map fun p => .ok (4, p)
         else
-          if h10 : offset + 10 ≤ d.size then
-            let p0 := d[offset + 2]'(by omega)
-            if (p0 &&& 0x80) != 0 then some (.error 1002)
-            else
-              let p :=
-                ((p0.toNat) <<< 56) |||
-                ((d[offset + 3]'(by omega)).toNat <<< 48) |||
-                ((d[offset + 4]'(by omega)).toNat <<< 40) |||
-                ((d[offset + 5]'(by omega)).toNat <<< 32) |||
-                ((d[offset + 6]'(by omega)).toNat <<< 24) |||
-                ((d[offset + 7]'(by omega)).toNat <<< 16) |||
-                ((d[offset + 8]'(by omega)).toNat <<< 8) |||
-                (d[offset + 9]'(by omega)).toNat
-              some (.ok (10, p))
-          else none
+          match readU32BE buf (offset + 2), readU32BE buf (offset + 6) with
+          | some hi, some lo =>
+              if (hi &&& 0x80000000) != 0 then some (.error 1002)
+              else some (.ok (10, (hi <<< 32) ||| lo))
+          | _, _ => none
       match hdr? with
       | none => .needMore
       | some (.error code) => .protocolErr code
@@ -829,21 +727,13 @@ def encodeWsFrame (opcode : UInt8) (payload : ByteArray) : ByteArray :=
   let b0 : UInt8 := 0x80 ||| (opcode &&& 0x0F)
   let n := payload.size
   let hdr :=
-    if n < 126 then
-      ByteArray.mk #[b0, UInt8.ofNat n]
-    else if n ≤ 65535 then
-      ByteArray.mk #[b0, 126, UInt8.ofNat ((n >>> 8) &&& 0xFF), UInt8.ofNat (n &&& 0xFF)]
-    else
-      let u := UInt64.ofNat n
-      ByteArray.mk #[
-        b0, 127,
-        ((u >>> 56).toUInt8), ((u >>> 48).toUInt8), ((u >>> 40).toUInt8), ((u >>> 32).toUInt8),
-        ((u >>> 24).toUInt8), ((u >>> 16).toUInt8), ((u >>> 8).toUInt8), u.toUInt8
-      ]
+    if n < 126 then ByteArray.mk #[b0, UInt8.ofNat n]
+    else if n ≤ 65535 then pushU16BE (ByteArray.mk #[b0, 126]) n
+    else pushU32BE (pushU32BE (ByteArray.mk #[b0, 127]) (n >>> 32)) n
   hdr ++ payload
 
 def encodeWsCloseFrame (code : UInt16) : ByteArray :=
-  encodeWsFrame 0x08 (ByteArray.mk #[(code >>> 8).toUInt8, code.toUInt8])
+  encodeWsFrame 0x08 (pushU16BE ByteArray.empty code.toNat)
 
 theorem decodeWsFrame_rejects_unmasked (b0 b1 : UInt8) (rest : Array UInt8)
     (hunmasked : (b1 &&& 0x80) = 0) :

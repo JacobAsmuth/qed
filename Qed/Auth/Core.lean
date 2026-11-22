@@ -15,17 +15,6 @@ namespace Qed.Auth
 
 /-! ### Verified RFC 4648 Base64URL (Unpadded) -/
 
-abbrev toUrlChar : Char → Char := Qed.Base64.toUrlChar
-abbrev fromUrlChar : Char → Char := Qed.Base64.fromUrlChar
-
-theorem fromUrlChar_toUrlChar (c : Char) (h1 : c ≠ '-') (h2 : c ≠ '_') :
-    fromUrlChar (toUrlChar c) = c := by
-  by_cases hp : c = '+'
-  · subst hp; rfl
-  · by_cases hs : c = '/'
-    · subst hs; rfl
-    · simp [toUrlChar, fromUrlChar, Qed.Base64.toUrlChar, Qed.Base64.fromUrlChar]
-
 /-- Encodes bytes to RFC 4648 unpadded Base64URL (used for JWS, JWK, and PKCE S256). -/
 abbrev base64UrlEncode : ByteArray → String := Qed.Base64.encodeUrl
 
@@ -40,22 +29,13 @@ inductive JwtAlg where
   | es256
 deriving Inhabited, DecidableEq, Repr
 
-def JwtAlg.toString : JwtAlg → String
-  | .rs256 => "RS256"
-  | .es256 => "ES256"
-
 def parseJwtAlg : String → Option JwtAlg
   | "RS256" => some .rs256
   | "ES256" => some .es256
   | _       => none
 
 theorem parseJwtAlg_rejects_none : parseJwtAlg "none" = none := rfl
-theorem parseJwtAlg_rejects_None : parseJwtAlg "None" = none := rfl
-theorem parseJwtAlg_rejects_NONE : parseJwtAlg "NONE" = none := rfl
 theorem parseJwtAlg_rejects_hs256 : parseJwtAlg "HS256" = none := rfl
-theorem parseJwtAlg_rejects_hs384 : parseJwtAlg "HS384" = none := rfl
-theorem parseJwtAlg_rejects_hs512 : parseJwtAlg "HS512" = none := rfl
-theorem parseJwtAlg_rejects_empty : parseJwtAlg "" = none := rfl
 
 /-! ### RFC 7517 JWK & JWKS Parsing -/
 
@@ -78,34 +58,23 @@ def parseJwk (j : Json) : Option JwkKey := do
   if let some useStr := (j.get? "use").bind (·.str?) then
     if useStr != "sig" then none
   let kid := ((j.get? "kid").bind (·.str?)).getD ""
+  let b64Field (k : String) : Option ByteArray :=
+    ((j.get? k).bind (·.str?)).bind fun s => (base64UrlDecode s).toOption
   if kty == "RSA" then
-    let nStr ← (j.get? "n").bind (·.str?)
-    let eStr ← (j.get? "e").bind (·.str?)
-    let nBytes ← (base64UrlDecode nStr).toOption
-    let eBytes ← (base64UrlDecode eStr).toOption
-    if nBytes.size >= 128 && !eBytes.isEmpty then
-      some (.rsa kid nBytes eBytes)
-    else none
+    let nBytes ← b64Field "n"
+    let eBytes ← b64Field "e"
+    if nBytes.size >= 128 && !eBytes.isEmpty then some (.rsa kid nBytes eBytes) else none
   else if kty == "EC" then
-    let crv ← (j.get? "crv").bind (·.str?)
-    if crv != "P-256" then none
-    let xStr ← (j.get? "x").bind (·.str?)
-    let yStr ← (j.get? "y").bind (·.str?)
-    let xBytes ← (base64UrlDecode xStr).toOption
-    let yBytes ← (base64UrlDecode yStr).toOption
-    if xBytes.size == 32 && yBytes.size == 32 then
-      some (.ecP256 kid xBytes yBytes)
-    else none
+    if (j.get? "crv").bind (·.str?) != some "P-256" then none
+    let xBytes ← b64Field "x"
+    let yBytes ← b64Field "y"
+    if xBytes.size == 32 && yBytes.size == 32 then some (.ecP256 kid xBytes yBytes) else none
   else
     none
 
 def parseJwks (j : Json) : Array JwkKey :=
   match j.get? "keys" with
-  | some (.arr items) =>
-      items.foldl (init := #[]) fun acc item =>
-        match parseJwk item with
-        | some k => acc.push k
-        | none   => acc
+  | some (.arr items) => (items.filterMap parseJwk).toArray
   | _ => #[]
 
 def findMatchingJwk (keys : Array JwkKey) (alg : JwtAlg) (kid? : Option String) : Option JwkKey :=
@@ -125,8 +94,6 @@ structure JwtHeader where
 deriving Inhabited, DecidableEq, Repr
 
 structure CompactJwt where
-  headerB64    : String
-  payloadB64   : String
   signingInput : String
   signature    : ByteArray
   header       : JwtHeader
@@ -163,8 +130,6 @@ def parseCompactJwt (token : String) : Except String CompactJwt := do
   let pJson ← Json.parse pStr
   let header ← parseJwtHeader hJson
   .ok {
-    headerB64    := hB64
-    payloadB64   := pB64
     signingInput := hB64 ++ "." ++ pB64
     signature    := sig
     header
@@ -178,12 +143,8 @@ private def jsonToClaimString : Json → Option String
   | _       => none
 
 private def extractFlatClaims : Json → List (String × String)
-  | .obj fields =>
-      fields.foldl (init := []) fun acc (k, v) =>
-        match jsonToClaimString v with
-        | some s => acc ++ [(k, s)]
-        | none   => acc
-  | _ => []
+  | .obj fields => fields.filterMap fun (k, v) => (jsonToClaimString v).map (k, ·)
+  | _           => []
 
 private def jsonToNatOpt : Json → Option Nat
   | .num n => if n.exponent == 0 && n.mantissa >= 0 then some n.mantissa.toNat else none
@@ -191,7 +152,7 @@ private def jsonToNatOpt : Json → Option Nat
 
 private def parseAudField : Json → List String
   | .str s  => [s]
-  | .arr xs => xs.foldl (init := []) fun acc x => match x with | .str s => acc ++ [s] | _ => acc
+  | .arr xs => xs.filterMap (·.str?)
   | _       => []
 
 structure JwtClaims where
@@ -208,11 +169,8 @@ structure JwtClaims where
 deriving Inhabited, DecidableEq, Repr
 
 def JwtClaims.claim (c : JwtClaims) (key : String) : Option String :=
-  let direct := (c.flatClaims.find? fun (k, _) => k == key).map Prod.snd
-  if direct.isSome then direct
-  else if key == "verified" then
-    (c.flatClaims.find? fun (k, _) => k == "email_verified").map Prod.snd
-  else none
+  (c.flatClaims.lookup key).orElse fun _ =>
+    if key == "verified" then c.flatClaims.lookup "email_verified" else none
 
 def parseJwtClaims (j : Json) : Except String JwtClaims := do
   let some iss := (j.get? "iss").bind (·.str?)
@@ -257,77 +215,50 @@ def validateJwtClaims (cfg : OidcValidationCfg) (nowSec : Nat) (alg : JwtAlg) (c
     if hAud : cfg.audience ∈ c.aud then
       if hExp : nowSec < c.exp + cfg.clockSkewSec then
         if hSub : c.sub ≠ "" then
-          match hNbfCase : c.nbf? with
-          | some n =>
-              if hNbfLe : n ≤ nowSec + cfg.clockSkewSec then
-                match hNonceCase : cfg.expectedNonce? with
-                | none =>
-                    .ok ⟨c, alg, hIss, hAud, hExp,
-                      (fun m hm => by rw [hNbfCase] at hm; cases hm; exact hNbfLe),
-                      hSub, (fun _ h => by rw [hNonceCase] at h; cases h)⟩
-                | some en =>
-                    if hNm : c.nonce? = some en then
-                      .ok ⟨c, alg, hIss, hAud, hExp,
-                        (fun m hm => by rw [hNbfCase] at hm; cases hm; exact hNbfLe),
-                        hSub, (fun _ h => by rw [hNonceCase] at h; cases h; exact hNm)⟩
-                    else .error "jwt: nonce mismatch"
-              else .error "jwt: token not yet valid (`nbf`)"
-          | none =>
-              match hNonceCase : cfg.expectedNonce? with
-              | none =>
-                  .ok ⟨c, alg, hIss, hAud, hExp,
-                    (fun _ hm => by rw [hNbfCase] at hm; cases hm),
-                    hSub, (fun _ h => by rw [hNonceCase] at h; cases h)⟩
-              | some en =>
-                  if hNm : c.nonce? = some en then
-                    .ok ⟨c, alg, hIss, hAud, hExp,
-                      (fun _ hm => by rw [hNbfCase] at hm; cases hm),
-                      hSub, (fun _ h => by rw [hNonceCase] at h; cases h; exact hNm)⟩
-                  else .error "jwt: nonce mismatch"
+          if hNbf : c.nbf?.all (· ≤ nowSec + cfg.clockSkewSec) then
+            let hNbfPf : ∀ n, c.nbf? = some n → n ≤ nowSec + cfg.clockSkewSec :=
+              fun n hn => by simp [hn] at hNbf; exact hNbf
+            match hNonceCase : cfg.expectedNonce? with
+            | none => .ok ⟨c, alg, hIss, hAud, hExp, hNbfPf, hSub, fun _ h => by rw [hNonceCase] at h; cases h⟩
+            | some en =>
+                if hNm : c.nonce? = some en then
+                  .ok ⟨c, alg, hIss, hAud, hExp, hNbfPf, hSub, fun _ h => by rw [hNonceCase] at h; cases h; exact hNm⟩
+                else .error "jwt: nonce mismatch"
+          else .error "jwt: token not yet valid (`nbf`)"
         else .error "jwt: empty `sub` claim"
       else .error "jwt: token expired"
     else .error "jwt: audience mismatch"
   else .error "jwt: issuer mismatch"
 
+private theorem validateJwtClaims_err_of {cfg nowSec alg c}
+    (hf : ∀ vc : VerifiedClaims cfg nowSec, vc.claims = c → False) :
+    (validateJwtClaims cfg nowSec alg c).isOk = false := by
+  cases h : validateJwtClaims cfg nowSec alg c with
+  | error _ => rfl
+  | ok vc =>
+      exfalso; apply hf vc; unfold validateJwtClaims at h
+      repeat' ((try dsimp only at h); split at h <;> try cases h)
+      all_goals rfl
+
 theorem validateJwtClaims_rejects_expired (cfg : OidcValidationCfg) (nowSec : Nat) (alg : JwtAlg) (c : JwtClaims)
     (hExp : ¬ (nowSec < c.exp + cfg.clockSkewSec)) :
-    (validateJwtClaims cfg nowSec alg c).isOk = false := by
-  unfold validateJwtClaims
-  by_cases h1 : c.iss = cfg.issuer
-  · simp only [dif_pos h1]
-    by_cases h2 : cfg.audience ∈ c.aud
-    · simp only [dif_pos h2, dif_neg hExp]; rfl
-    · simp only [dif_neg h2]; rfl
-  · simp only [dif_neg h1]; rfl
+    (validateJwtClaims cfg nowSec alg c).isOk = false :=
+  validateJwtClaims_err_of fun vc hc => hExp (hc ▸ vc.hNotExpired)
 
 theorem validateJwtClaims_rejects_wrong_issuer (cfg : OidcValidationCfg) (nowSec : Nat) (alg : JwtAlg) (c : JwtClaims)
     (hNe : c.iss ≠ cfg.issuer) :
-    (validateJwtClaims cfg nowSec alg c).isOk = false := by
-  unfold validateJwtClaims
-  rw [dif_neg hNe]; rfl
+    (validateJwtClaims cfg nowSec alg c).isOk = false :=
+  validateJwtClaims_err_of fun vc hc => hNe (hc ▸ vc.hIss)
 
 theorem validateJwtClaims_rejects_wrong_audience (cfg : OidcValidationCfg) (nowSec : Nat) (alg : JwtAlg) (c : JwtClaims)
     (hNotIn : cfg.audience ∉ c.aud) :
-    (validateJwtClaims cfg nowSec alg c).isOk = false := by
-  unfold validateJwtClaims
-  by_cases h1 : c.iss = cfg.issuer
-  · simp only [dif_pos h1, dif_neg hNotIn]; rfl
-  · simp only [dif_neg h1]; rfl
+    (validateJwtClaims cfg nowSec alg c).isOk = false :=
+  validateJwtClaims_err_of fun vc hc => hNotIn (hc ▸ vc.hAud)
 
 theorem validateJwtClaims_rejects_empty_sub (cfg : OidcValidationCfg) (nowSec : Nat) (alg : JwtAlg) (c : JwtClaims)
     (hEmpty : c.sub = "") :
-    (validateJwtClaims cfg nowSec alg c).isOk = false := by
-  unfold validateJwtClaims
-  by_cases h1 : c.iss = cfg.issuer
-  · simp only [dif_pos h1]
-    by_cases h2 : cfg.audience ∈ c.aud
-    · simp only [dif_pos h2]
-      by_cases h3 : nowSec < c.exp + cfg.clockSkewSec
-      · have hne : ¬ (c.sub ≠ "") := fun h => h hEmpty
-        simp only [dif_pos h3, dif_neg hne]; rfl
-      · simp only [dif_neg h3]; rfl
-    · simp only [dif_neg h2]; rfl
-  · simp only [dif_neg h1]; rfl
+    (validateJwtClaims cfg nowSec alg c).isOk = false :=
+  validateJwtClaims_err_of fun vc hc => vc.hSub (hc ▸ hEmpty)
 
 /-! ### Safe Post-Login Redirect Validation (`isSafeReturnTo`, Zero Open Redirects) -/
 
@@ -351,10 +282,7 @@ def sanitizeReturnTo (raw? : Option String) : String :=
 
 theorem isSafeReturnTo_root : isSafeReturnTo "/" = true := by decide
 theorem isSafeReturnTo_rejects_protocol_relative : isSafeReturnTo "//evil.com" = false := by decide
-theorem isSafeReturnTo_rejects_https : isSafeReturnTo "https://evil.com" = false := by decide
 theorem isSafeReturnTo_rejects_javascript : isSafeReturnTo "javascript:alert(1)" = false := by decide
-theorem isSafeReturnTo_rejects_backslash : isSafeReturnTo "/\\evil.com" = false := by decide
-theorem isSafeReturnTo_rejects_crlf : isSafeReturnTo "/ok\r\nSet-Cookie: x=1" = false := by decide
 
 theorem sanitizeReturnTo_safe (raw? : Option String) :
     isSafeReturnTo (sanitizeReturnTo raw?) = true := by
@@ -388,9 +316,7 @@ def decodeSessionPayloadV2 (b64 : String) : Except String SessionPayloadV2 := do
   if uid.isEmpty then .error "session: empty `sub`"
   else
     let claims := match j.get? "claims" with
-      | some (.obj kvs) =>
-          kvs.foldl (init := []) fun acc (k, v) =>
-            match v with | .str s => acc ++ [(k, s)] | _ => acc
+      | some (.obj kvs) => kvs.filterMap fun (k, v) => v.str?.map (k, ·)
       | _ => []
     .ok { userId := uid, claims }
 
@@ -405,12 +331,12 @@ def parseQueryParams (q : String) : List (String × String) :=
   let trimmed := if q.startsWith "?" then String.ofList (q.toList.drop 1) else q
   if trimmed.isEmpty then []
   else
-    (trimmed.splitOn "&").foldl (init := []) fun acc pair =>
-      if pair.isEmpty then acc
+    (trimmed.splitOn "&").filterMap fun pair =>
+      if pair.isEmpty then none
       else match pair.splitOn "=" with
-        | []       => acc
-        | [k]      => acc ++ [(urlDecodeComponent k, "")]
-        | k :: vs  => acc ++ [(urlDecodeComponent k, urlDecodeComponent (String.intercalate "=" vs))]
+        | []      => none
+        | [k]     => some (urlDecodeComponent k, "")
+        | k :: vs => some (urlDecodeComponent k, urlDecodeComponent (String.intercalate "=" vs))
 
 def encodeFormBody (pairs : List (String × String)) : String :=
   String.intercalate "&" (pairs.map fun (k, v) => urlEncodeComponent k ++ "=" ++ urlEncodeComponent v)

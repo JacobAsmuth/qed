@@ -130,103 +130,93 @@ private def readCrlfLineAt (handle : UInt64) (buf : ByteArray) (off : Nat) :
     (fun _ => .error "unexpected EOF in chunked framing")
     buf 256
 
+private def liftE {ε α : Type} (x : IO (Except ε α)) : ExceptT ε IO α := ExceptT.mk x
+private def liftP {ε α : Type} (x : Except ε α) : ExceptT ε IO α := ExceptT.mk (pure x)
+private def liftIO {ε α : Type} (x : IO α) : ExceptT ε IO α := liftM x
+private def nowSec : IO Nat := return (← Prim.nowMs).toNat / 1000
+
+private def loadNonEmptyEnv (name : String) : IO (Option String) := do
+  return (← Prim.getEnv name).bind fun v => let t := trimWs v; if t.isEmpty then none else some t
+
 private def drainChunkTrailers (handle : UInt64) (rx : ByteArray) (off : Nat) :
-    Nat → IO (Except String Bool)
-  | 0 => return .error "too many chunked trailers"
+    Nat → ExceptT String IO Bool
+  | 0 => throw "too many chunked trailers"
   | fuel + 1 => do
-      match ← readCrlfLineAt handle rx off with
-      | .error e => return .error e
-      | .ok (line, rx1, off1) =>
-          if line.isEmpty then return .ok (off1 >= rx1.size)
-          else drainChunkTrailers handle rx1 off1 fuel
+      let (line, rx1, off1) ← liftE (readCrlfLineAt handle rx off)
+      if line.isEmpty then return off1 >= rx1.size
+      else drainChunkTrailers handle rx1 off1 fuel
 
 private def readChunkedBody (handle : UInt64) (rx : ByteArray) (off : Nat) (out : ByteArray) :
-    Nat → IO (Except String (ByteArray × Bool))
-  | 0 => return .error "chunked response exceeded max chunks"
+    Nat → ExceptT String IO (ByteArray × Bool)
+  | 0 => throw "chunked response exceeded max chunks"
   | fuel + 1 => do
       let (rx0, off0) := compactRx rx off
-      match ← readCrlfLineAt handle rx0 off0 with
-      | .error e => return .error e
-      | .ok (szLine, rx1, off1) =>
-          let some sz := parseHexSize szLine maxRespBodyBytes
-            | return .error "invalid chunk size"
-          if sz == 0 then
-            match ← drainChunkTrailers handle rx1 off1 256 with
-            | .error e  => return .error e
-            | .ok clean => return .ok (out, clean)
-          else if out.size + sz > maxRespBodyBytes then
-            return .error "chunked HTTP response body too large"
-          else
-            match ← readAtLeast handle rx1 (off1 + sz + 2) with
-            | .error e => return .error e
-            | .ok full =>
-                if h : off1 + sz + 1 < full.size then
-                  if full[off1 + sz]'(by omega) != 13 || full[off1 + sz + 1] != 10 then
-                    return .error "missing CRLF after chunk data"
-                  let out' := full.copySlice off1 out out.size sz
-                  readChunkedBody handle full (off1 + sz + 2) out' fuel
-                else
-                  return .error "truncated chunk data"
+      let (szLine, rx1, off1) ← liftE (readCrlfLineAt handle rx0 off0)
+      let some sz := parseHexSize szLine maxRespBodyBytes | throw "invalid chunk size"
+      if sz == 0 then
+        return (out, ← drainChunkTrailers handle rx1 off1 256)
+      else if out.size + sz > maxRespBodyBytes then
+        throw "chunked HTTP response body too large"
+      else
+        let full ← liftE (readAtLeast handle rx1 (off1 + sz + 2))
+        if h : off1 + sz + 1 < full.size then
+          if full[off1 + sz]'(by omega) != 13 || full[off1 + sz + 1] != 10 then
+            throw "missing CRLF after chunk data"
+          readChunkedBody handle full (off1 + sz + 2) (full.copySlice off1 out out.size sz) fuel
+        else
+          throw "truncated chunk data"
 
 private def execHttpAttempt (method : String) (u : ParsedUrl) (wireReq : ByteArray)
     (ssrfGuard : Bool) : Nat → IO (Except String (Nat × ByteArray × Array (String × String)))
   | 0 => return .error "HTTP call failed"
   | attemptsLeft + 1 => do
-      let acq ← Prim.outboundAcquire (if u.isTls then 1 else 0) u.host u.port
-        (if ssrfGuard then 1 else 0) isBlockedIpBytes
-      let (handleNat, reusedNat) ← match acq with
+      let (handleNat, reusedNat) ← match ← Prim.outboundAcquire (if u.isTls then 1 else 0) u.host u.port
+          (if ssrfGuard then 1 else 0) isBlockedIpBytes with
         | .ok p    => pure p
         | .error e => return .error e
       let handle := UInt64.ofNat handleNat
-      let wasReused := reusedNat != 0
-      let canRetry := wasReused && isIdempotentHttpMethod method && attemptsLeft > 0
-      match ← Prim.outboundWriteAll handle wireReq with
+      let canRetry := reusedNat != 0 && isIdempotentHttpMethod method && attemptsLeft > 0
+      let sendAndReadHead : IO (Except String (ByteArray × Nat)) := ExceptT.run do
+        liftE (Prim.outboundWriteAll handle wireReq)
+        liftE (readUntilCrlfCrlf handle)
+      match ← sendAndReadHead with
       | .error e =>
           Prim.outboundRelease handle 0
           if canRetry then execHttpAttempt method u wireReq ssrfGuard attemptsLeft
           else return .error e
-      | .ok () =>
-          match ← readUntilCrlfCrlf handle with
+      | .ok (rxBuf, hdrEnd) =>
+          match parseHttpResponseHead (rxBuf.extract 0 hdrEnd) with
           | .error e =>
               Prim.outboundRelease handle 0
-              if canRetry then execHttpAttempt method u wireReq ssrfGuard attemptsLeft
-              else return .error e
-          | .ok (rxBuf, hdrEnd) =>
-              match parseHttpResponseHead (rxBuf.extract 0 hdrEnd) with
+              return .error e
+          | .ok head =>
+              let initBody := rxBuf.extract (hdrEnd + 4) rxBuf.size
+              let baseReuse := !head.connClose && !ssrfGuard
+              let bodyRes : Except String (ByteArray × Bool) ←
+                if method == "HEAD" || head.status == 204 || head.status == 304 then
+                  pure (.ok (ByteArray.empty, baseReuse && initBody.isEmpty))
+                else if head.isChunked then
+                  (·.map fun (b, clean) => (b, baseReuse && clean)) <$> (readChunkedBody handle initBody 0 ByteArray.empty 65536).run
+                else if let some cl := head.contentLen then
+                  if cl > maxRespBodyBytes then pure (.error "Content-Length too large")
+                  else (·.map fun full => (full.extract 0 cl, baseReuse && full.size == cl)) <$> readAtLeast handle initBody cl
+                else
+                  (·.map fun b => (b, false)) <$> readUntilEof handle initBody
+              match bodyRes with
               | .error e =>
                   Prim.outboundRelease handle 0
                   return .error e
-              | .ok head =>
-                  let initBody := rxBuf.extract (hdrEnd + 4) rxBuf.size
-                  let baseReuse := !head.connClose && !ssrfGuard
-                  let bodyRes : Except String (ByteArray × Bool) ←
-                    if method == "HEAD" || head.status == 204 || head.status == 304 then
-                      pure (Except.ok (ByteArray.empty, baseReuse && initBody.isEmpty))
-                    else if head.isChunked then
-                      (·.map fun (b, clean) => (b, baseReuse && clean)) <$> readChunkedBody handle initBody 0 ByteArray.empty 65536
-                    else if let some cl := head.contentLen then
-                      if cl > maxRespBodyBytes then pure (Except.error "Content-Length too large")
-                      else (·.map fun full => (full.extract 0 cl, baseReuse && full.size == cl)) <$> readAtLeast handle initBody cl
-                    else
-                      (·.map fun b => (b, false)) <$> readUntilEof handle initBody
-                  match bodyRes with
-                  | .error e =>
-                      Prim.outboundRelease handle 0
-                      return .error e
-                  | .ok (respBody, canReuse) =>
-                      Prim.outboundRelease handle (if canReuse then 1 else 0)
-                      return .ok (head.status, respBody, head.headers)
+              | .ok (respBody, canReuse) =>
+                  Prim.outboundRelease handle (if canReuse then 1 else 0)
+                  return .ok (head.status, respBody, head.headers)
 
 def execHttpCall (method url : String) (headers : Array (String × String))
     (body : ByteArray) (ssrfGuard : Bool) :
-    IO (Except String (Nat × ByteArray × Array (String × String))) := do
-  let u ← match parseHttpUrl url with
-    | .ok p    => pure p
-    | .error e => return .error e
-  let wireReq ← match formatOutboundRequest method u headers body with
-    | .ok w    => pure w
-    | .error e => return .error e
-  execHttpAttempt method u wireReq ssrfGuard 2
+    IO (Except String (Nat × ByteArray × Array (String × String))) :=
+  ExceptT.run do
+    let u ← liftP (parseHttpUrl url)
+    let wireReq ← liftP (formatOutboundRequest method u headers body)
+    liftE (execHttpAttempt method u wireReq ssrfGuard 2)
 
 /-! ## GCP RS256 OAuth2 Token Exchange (Total Lean + Verified `base64UrlEncode`) -/
 
@@ -264,103 +254,68 @@ private def gcpCacheInsert (entries : Array GcpTokenCacheEntry)
 /-- Mints an RS256-signed JWT using verified `Qed.Json` + total `Net.base64UrlEncode` and exchanges
     (caching in a thread-safe `StateBox` when provided) an OAuth2 Bearer access token for `scope`. -/
 def fetchGcpBearerToken (cache? : Option (Prim.StateBox (Array GcpTokenCacheEntry)))
-    (saJson scope : String) : IO (Except String String) := do
-  let j ← match Json.parse saJson with
-    | .ok v    => pure v
-    | .error e => return .error s!"invalid GCP service account JSON: {e}"
-  let some clientEmail := (j.get? "client_email").bind (·.str?)
-    | return .error "GCP service account JSON missing `client_email`"
-  let some privateKey := (j.get? "private_key").bind (·.str?)
-    | return .error "GCP service account JSON missing `private_key`"
-  let envTokUrl? := (← Prim.getEnv "QED_GCP_TOKEN_URL").bind fun s =>
-    let t := trimWs s; if t.isEmpty then none else some t
-  let tokenUri := match envTokUrl? with
-    | some u => u
-    | none   => ((j.get? "token_uri").bind (·.str?)).getD "https://oauth2.googleapis.com/token"
-  let nowSec := ((← Prim.nowMs).toNat) / 1000
-  if let some cache := cache? then
-    if let some cached ← Prim.atomicRead cache (gcpCacheLookup · clientEmail scope tokenUri nowSec) then
-      return .ok cached
-  let jwtHdr := Json.render (.obj [("alg", .str "RS256"), ("typ", .str "JWT")])
-  let claims := Json.render (.obj [
-    ("iss",   .str clientEmail),
-    ("scope", .str scope),
-    ("aud",   .str tokenUri),
-    ("iat",   .num ⟨Int.ofNat nowSec, 0⟩),
-    ("exp",   .num ⟨Int.ofNat (nowSec + 3600), 0⟩)
-  ])
-  let signingInput := base64UrlEncode jwtHdr.toUTF8 ++ "." ++ base64UrlEncode claims.toUTF8
-  let sigBytes ← match ← Prim.rsaSha256Sign privateKey signingInput.toUTF8 with
-    | .ok b    => pure b
-    | .error e => return .error e
-  let formBody :=
-    "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=" ++
-    signingInput ++ "." ++ base64UrlEncode sigBytes
-  let (status, respBody, _) ← match ← execHttpCall "POST" tokenUri
-      #[("Content-Type", "application/x-www-form-urlencoded")] formBody.toUTF8 false with
-    | .ok r    => pure r
-    | .error e => return .error e
-  let some respStr := String.fromUTF8? respBody
-    | return .error "invalid UTF-8 in GCP OAuth2 response"
-  if status < 200 || status >= 300 then
-    return .error s!"OAuth2 HTTP {status}: {String.ofList (respStr.toList.take 400)}"
-  let rj ← match Json.parse respStr with
-    | .ok v    => pure v
-    | .error e => return .error s!"invalid JSON in GCP OAuth2 response: {e}"
-  let some accessToken := (rj.get? "access_token").bind (·.str?)
-    | return .error "GCP OAuth2 response missing `access_token`"
-  let expiresIn : Nat := match rj.get? "expires_in" with
-    | some (.num n) =>
-        if n.exponent == 0 && n.mantissa > 0 then min n.mantissa.toNat (86400 * 365) else 3600
-    | _ => 3600
-  if let some cache := cache? then
-    let nowAfter := ((← Prim.nowMs).toNat) / 1000
-    let entry : GcpTokenCacheEntry := {
-      clientEmail, scope, tokenUrl := tokenUri, accessToken, expiresAt := nowAfter + expiresIn
-    }
-    Prim.atomicModify cache fun cur => (gcpCacheInsert cur entry, ())
-  return .ok accessToken
+    (saJson scope : String) : IO (Except String String) :=
+  ExceptT.run do
+    let j ← liftP ((Json.parse saJson).mapError (s!"invalid GCP service account JSON: {·}"))
+    let some clientEmail := (j.get? "client_email").bind (·.str?)
+      | throw "GCP service account JSON missing `client_email`"
+    let some privateKey := (j.get? "private_key").bind (·.str?)
+      | throw "GCP service account JSON missing `private_key`"
+    let tokenUri := ((← loadNonEmptyEnv "QED_GCP_TOKEN_URL").orElse fun _ =>
+      (j.get? "token_uri").bind (·.str?)).getD "https://oauth2.googleapis.com/token"
+    let now ← nowSec
+    if let some cache := cache? then
+      if let some cached ← liftIO (Prim.atomicRead cache (gcpCacheLookup · clientEmail scope tokenUri now)) then
+        return cached
+    let jwtHdr := Json.render (.obj [("alg", .str "RS256"), ("typ", .str "JWT")])
+    let claims := Json.render (.obj [
+      ("iss", .str clientEmail), ("scope", .str scope), ("aud", .str tokenUri),
+      ("iat", .num ⟨Int.ofNat now, 0⟩), ("exp", .num ⟨Int.ofNat (now + 3600), 0⟩)
+    ])
+    let signingInput := base64UrlEncode jwtHdr.toUTF8 ++ "." ++ base64UrlEncode claims.toUTF8
+    let sigBytes ← liftE (Prim.rsaSha256Sign privateKey signingInput.toUTF8)
+    let formBody :=
+      "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=" ++
+      signingInput ++ "." ++ base64UrlEncode sigBytes
+    let rj ← liftE (Qed.Auth.Oidc.execJsonHttp execHttpCall "POST" tokenUri
+      #[("Content-Type", "application/x-www-form-urlencoded")] formBody.toUTF8 false "GCP OAuth2")
+    let some accessToken := (rj.get? "access_token").bind (·.str?)
+      | throw "GCP OAuth2 response missing `access_token`"
+    let expiresIn : Nat := match rj.get? "expires_in" with
+      | some (.num n) =>
+          if n.exponent == 0 && n.mantissa > 0 then min n.mantissa.toNat (86400 * 365) else 3600
+      | _ => 3600
+    if let some cache := cache? then
+      let entry : GcpTokenCacheEntry := {
+        clientEmail, scope, tokenUrl := tokenUri, accessToken, expiresAt := (← nowSec) + expiresIn
+      }
+      liftIO (Prim.atomicModify cache fun cur => (gcpCacheInsert cur entry, ()))
+    return accessToken
 
 /-! ## Constant-Time HMAC Session & Bearer Token Verification (Expiring `v1` + Rotation) -/
-
-/-- Mints an expiring `v1.<expSec>.<userId>.<hmacHex>` session token signed with HMAC-SHA256. -/
-def signUserToken (secret userId : String) (ttlSec : Nat := 86400) : IO String := do
-  let nowSec := ((← Prim.nowMs).toNat) / 1000
-  let expSec := nowSec + ttlSec
-  let payload := s!"v1.{expSec}.{userId}"
-  let mac ← Prim.hmacSha256 secret.toUTF8 payload.toUTF8
-  return s!"{payload}.{Proto.encodeHex mac}"
 
 /-- Verifies either an expiring `v1.<expSec>.<userId>.<hmacHex>` token or (unless
     `requireExpiring` is true) a legacy `<userId>.<hmacHex>` token using Rust's constant-time
     `hmac::Mac::verify_slice` across active + rotated secrets. -/
-def verifyUserTokenWithNow (secrets : List String) (token : String) (nowSec : Nat)
+def verifyUserTokenWithNow (secrets : List String) (token : String) (now : Nat)
     (requireExpiring : Bool := false) : IO (Option String) := do
   if secrets.isEmpty then return none
   match (token.splitOn ".").reverse with
   | [] | [_] => return none
   | sigHex :: revPrefixParts =>
       if sigHex.length != 64 then return none
-      let sigBytes ← match Proto.decodeHex sigHex with
-        | .error _ => return none
-        | .ok b    => pure b
+      let .ok sigBytes := Proto.decodeHex sigHex | return none
       let prefixParts := revPrefixParts.reverse
       let payload := String.intercalate "." prefixParts
-      match prefixParts with
-      | "v1" :: expStr :: uidParts =>
-          let uid := String.intercalate "." uidParts
-          if uid.isEmpty then return none
-          let some expSec := parseStrictU64 expStr 18446744073709551615 | return none
-          if nowSec >= expSec then return none
-          return if ← Qed.Auth.Oidc.anySecretVerify secrets payload.toUTF8 sigBytes then some uid else none
-      | _ =>
-          if requireExpiring || payload.isEmpty then return none
-          return if ← Qed.Auth.Oidc.anySecretVerify secrets payload.toUTF8 sigBytes then some payload else none
-
-def verifyUserToken (secret token : String) (requireExpiring : Bool := false) : IO (Option String) := do
-  if secret.isEmpty then return none
-  let nowSec := ((← Prim.nowMs).toNat) / 1000
-  verifyUserTokenWithNow [secret] token nowSec requireExpiring
+      let candidate? : Option String := match prefixParts with
+        | "v1" :: expStr :: uidParts =>
+            let uid := String.intercalate "." uidParts
+            if uid.isEmpty then none
+            else (parseStrictU64 expStr 18446744073709551615).bind fun expSec =>
+              if now < expSec then some uid else none
+        | _ => if requireExpiring || payload.isEmpty then none else some payload
+      let some uid := candidate? | return none
+      return if ← Qed.Auth.Oidc.anySecretVerify secrets payload.toUTF8 sigBytes then some uid else none
 
 /-! ## Startup-Cached Server Config & Inbound `RequestCtx` Extraction -/
 
@@ -371,11 +326,6 @@ structure ServerConfig where
   wsAllowedOrigins?  : Option String := none
   bindHost           : String := "0.0.0.0"
   csp?               : Option String := some defaultCsp
-
-private def loadNonEmptyEnv (name : String) : IO (Option String) := do
-  match ← Prim.getEnv name with
-  | some v => let t := trimWs v; return if t.isEmpty then none else some t
-  | none   => return none
 
 def loadServerConfig (devMode : Bool) : IO ServerConfig := do
   let secCur?  ← Prim.getEnv "QED_AUTH_SECRET"
@@ -406,19 +356,18 @@ def loadServerConfig (devMode : Bool) : IO ServerConfig := do
   }
 
 private def parseCookiePairs (raw : String) : List (String × String) :=
-  (raw.splitOn ";").foldl (fun acc seg =>
+  (raw.splitOn ";").filterMap fun seg =>
     let t := trimWs seg
-    if t.isEmpty then acc
-    else
-      match t.splitOn "=" with
-      | []       => acc
-      | [k]      => acc ++ [(trimWs k, "")]
-      | k :: vs  => acc ++ [(trimWs k, trimWs (String.intercalate "=" vs))]) []
+    if t.isEmpty then none
+    else match t.splitOn "=" with
+      | []      => none
+      | [k]     => some (trimWs k, "")
+      | k :: vs => some (trimWs k, trimWs (String.intercalate "=" vs))
 
 private def extractBearer (authHdr : String) : Option String :=
   let t := trimWs authHdr
-  if t.length > 7 && (String.ofList (t.toList.take 7)).toLower == "bearer " then
-    let tok := trimWs (String.ofList (t.toList.drop 7))
+  if startsWithCI t "bearer " then
+    let tok := trimWs (String.Pos.Raw.extract t ⟨7⟩ ⟨t.utf8ByteSize⟩)
     if tok.isEmpty then none else some tok
   else none
 
@@ -450,12 +399,11 @@ private def resolveAuthHeaders (gcpCache? : Option (Prim.StateBox (Array GcpToke
   | .headerSecret hdrName envVar =>
       return (← requireSecretEnv envVar).map fun tok => [(sanitizeHeader hdrName, sanitizeHeader tok)]
   | .gcpServiceAccount envVar scope =>
-      match ← requireSecretEnv envVar with
-      | .error e => return .error e
-      | .ok saJson =>
-          match ← fetchGcpBearerToken gcpCache? saJson scope with
-          | .ok accessToken => return .ok [("Authorization", "Bearer " ++ sanitizeHeader accessToken)]
-          | .error errMsg   => return .error (ApiError.internal s!"GCP OAuth2 token exchange failed: {errMsg}")
+      ExceptT.run do
+        let saJson ← liftE (requireSecretEnv envVar)
+        let accessToken ← liftE ((·.mapError fun e => ApiError.internal s!"GCP OAuth2 token exchange failed: {e}") <$>
+          fetchGcpBearerToken gcpCache? saJson scope)
+        return [("Authorization", "Bearer " ++ sanitizeHeader accessToken)]
 
 /-! ## Unified Native Database Dispatcher (SQLite, PostgreSQL v3 Wire & HTTP SQL) -/
 
@@ -489,34 +437,28 @@ private def requireEnv (envVar label : String) (default? : Option String := none
   | some v => return .ok v
   | none   => return .error s!"missing {label} `{envVar}`"
 
-private def resolveDbEndpoint (ep : Db.DbEndpoint) : IO (Except String ResolvedDbTransport) := do
-  match ep with
-  | .urlEnv envVar =>
-      match ← requireEnv envVar "database URL environment variable" with
-      | .error e => return .error e
-      | .ok u    => return resolveUrlString u (← loadNonEmptyEnv (envVar ++ "_TOKEN"))
-  | .postgresEnv envVar =>
-      return (← requireEnv envVar "PostgreSQL URL environment variable").map .postgres
-  | .postgresUrl url => return .ok (.postgres (trimWs url))
-  | .sqlitePath path => return .ok (.sqlite (stripSqliteScheme path))
-  | .sqliteEnv envVar def? =>
-      return (← requireEnv envVar "SQLite path environment variable" def?).map (fun p => .sqlite (stripSqliteScheme p))
-  | .cloudflareD1 accEnv accDef? dbEnv dbDef? tokSecret =>
-      match ← requireEnv accEnv "Cloudflare account env" accDef?,
-            ← requireEnv dbEnv "Cloudflare D1 database env" dbDef?,
-            ← requireEnv tokSecret "Cloudflare D1 token secret" with
-      | .ok acc, .ok db, .ok tok => return .ok (.d1 acc db tok)
-      | .error e, _, _ | _, .error e, _ | _, _, .error e => return .error e
-  | .turso urlEnv tokSecret =>
-      match ← requireEnv urlEnv "Turso URL env", ← requireEnv tokSecret "Turso token secret" with
-      | .ok u, .ok tok => return .ok (.turso u tok)
-      | .error e, _ | _, .error e => return .error e
-  | .httpSql urlEnv tokSecret? =>
-      match ← requireEnv urlEnv "HTTP SQL URL env" with
-      | .error e => return .error e
-      | .ok u =>
-          let tok? ← match tokSecret? with | some ts => loadNonEmptyEnv ts | none => pure none
-          return .ok (.httpSql u tok?)
+private def resolveDbEndpoint (ep : Db.DbEndpoint) : IO (Except String ResolvedDbTransport) :=
+  ExceptT.run do
+    match ep with
+    | .urlEnv envVar =>
+        let u ← liftE (requireEnv envVar "database URL environment variable")
+        liftP (resolveUrlString u (← loadNonEmptyEnv (envVar ++ "_TOKEN")))
+    | .postgresEnv envVar => .postgres <$> liftE (requireEnv envVar "PostgreSQL URL environment variable")
+    | .postgresUrl url    => return .postgres (trimWs url)
+    | .sqlitePath path    => return .sqlite (stripSqliteScheme path)
+    | .sqliteEnv envVar def? =>
+        (.sqlite ∘ stripSqliteScheme) <$> liftE (requireEnv envVar "SQLite path environment variable" def?)
+    | .cloudflareD1 accEnv accDef? dbEnv dbDef? tokSecret =>
+        return .d1 (← liftE (requireEnv accEnv "Cloudflare account env" accDef?))
+                   (← liftE (requireEnv dbEnv "Cloudflare D1 database env" dbDef?))
+                   (← liftE (requireEnv tokSecret "Cloudflare D1 token secret"))
+    | .turso urlEnv tokSecret =>
+        return .turso (← liftE (requireEnv urlEnv "Turso URL env"))
+                      (← liftE (requireEnv tokSecret "Turso token secret"))
+    | .httpSql urlEnv tokSecret? =>
+        let u ← liftE (requireEnv urlEnv "HTTP SQL URL env")
+        let tok? ← match tokSecret? with | some ts => loadNonEmptyEnv ts | none => pure none
+        return .httpSql u tok?
 
 private def resolveDbConfig (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDbTransport) := do
   match ← resolveDbEndpoint cfg.endpoint with
@@ -569,13 +511,12 @@ private def execRawOnTransport (tr : ResolvedDbTransport) (sqlSqlite sqlPg : Str
   | .postgres url =>
       return (← Db.PgWire.execParameterized url sqlPg params).mapError ApiError.internal
   | .httpSql _ _ | .d1 _ _ _ | .turso _ _ =>
-      match ← execHttpTransportStmt tr sqlH params with
-      | .error e => return .error e
-      | .ok raw  =>
-          match tr with
-          | .httpSql _ _ => return mapDec "HTTP SQL result decode failed" (Db.decodeTaggedResultJson raw)
-          | .d1 _ _ _    => return mapDec "Cloudflare D1 result decode failed" (Db.HttpSql.decodeD1Response raw d1Cols)
-          | _            => return mapDec "Turso result decode failed" (Db.HttpSql.decodeTursoResponse raw)
+      ExceptT.run do
+        let raw ← liftE (execHttpTransportStmt tr sqlH params)
+        liftP (match tr with
+          | .httpSql _ _ => mapDec "HTTP SQL result decode failed" (Db.decodeTaggedResultJson raw)
+          | .d1 _ _ _    => mapDec "Cloudflare D1 result decode failed" (Db.HttpSql.decodeD1Response raw d1Cols)
+          | _            => mapDec "Turso result decode failed" (Db.HttpSql.decodeTursoResponse raw))
 
 private def execDdlOnTransport (tr : ResolvedDbTransport) (sqliteStmts : List String)
     (pgDdl : String) : IO (Except ApiError Unit) := do
@@ -594,70 +535,59 @@ private def rowStrAt (row : Db.DbRow) (idx : Nat) : Option String :=
   | some (.text s) => some s
   | _ => none
 
-private def introspectSqliteTable (path : String) (tbl : Db.TableSchema) :
-    IO (Except ApiError (Bool × List String × List String)) := do
-  let colRes ← match ← Prim.sqliteExec path ("PRAGMA table_info(" ++ tbl.name.quoteIdent ++ ")") #[] with
-    | .error e => return .error (ApiError.internal s!"sqlite table introspection failed: {e}")
-    | .ok r    => pure r
-  if colRes.rows.isEmpty then return .ok (false, [], [])
-  let cols := colRes.rows.toList.filterMap fun r => rowStrAt r 1
-  match ← Prim.sqliteExec path ("PRAGMA index_list(" ++ tbl.name.quoteIdent ++ ")") #[] with
-  | .error e   => return .error (ApiError.internal s!"sqlite index introspection failed: {e}")
-  | .ok idxRes => return .ok (true, cols, idxRes.rows.toList.filterMap fun r => rowStrAt r 1)
-
-private def introspectPostgresTable (url : String) (tbl : Db.TableSchema) :
-    IO (Except String (Bool × List String × List String)) := do
-  let colSql := "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1"
-  let colRes ← match ← Db.PgWire.execParameterized url colSql #[.text tbl.name.raw] with
-    | .error e => return .error e
-    | .ok r    => pure r
-  if colRes.rows.isEmpty then return .ok (false, [], [])
-  let cols := colRes.rows.toList.filterMap fun r => rowStrAt r 0
-  let idxSql := "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1"
-  let idxs := match ← Db.PgWire.execParameterized url idxSql #[.text tbl.name.raw] with
-    | .error _   => []
-    | .ok idxRes => idxRes.rows.toList.filterMap fun r => rowStrAt r 0
-  return .ok (true, cols, idxs)
+private def introspectTable (runQ : String → IO (Except String Db.DbResult))
+    (colSql idxSql : String) (colIdx : Nat) (ignoreIdxErr : Bool) :
+    IO (Except String (Bool × List String × List String)) :=
+  ExceptT.run do
+    let colRes ← liftE (runQ colSql)
+    if colRes.rows.isEmpty then return (false, [], [])
+    let cols := colRes.rows.toList.filterMap (rowStrAt · colIdx)
+    let idxs ← match ← liftIO (runQ idxSql) with
+      | .ok r    => pure (r.rows.toList.filterMap (rowStrAt · colIdx))
+      | .error e => if ignoreIdxErr then pure [] else throw e
+    return (true, cols, idxs)
 
 private def applyMigrationSteps (dialect : Db.SqlDialect) (steps : List Db.MigrationStep)
-    (runDdl : String → IO (Except String Unit)) : IO (Except ApiError (List Db.MigrationStep)) := do
-  match Db.verifyMigrationSafe steps with
-  | .error e => return .error (ApiError.internal e)
-  | .ok () =>
-      let ddl := Db.renderMigrationDdl dialect steps
-      if !ddl.isEmpty then
-        if let .error e ← runDdl ddl then return .error (ApiError.internal e)
-      return .ok steps
+    (runDdl : String → IO (Except String Unit)) : IO (Except ApiError (List Db.MigrationStep)) :=
+  (ExceptT.run do
+    liftP (Db.verifyMigrationSafe steps)
+    let ddl := Db.renderMigrationDdl dialect steps
+    if !ddl.isEmpty then liftE (runDdl ddl)
+    return steps) <&> (·.mapError ApiError.internal)
 
 /-- Idempotently initializes and applies verified additive schema migrations (`createTable`,
     safe `addColumn`, `createIndex`) for all tables in `cfg`, returning the applied steps. -/
-def migrateDatabase (cfg : Db.DbConfig) : IO (Except ApiError (List Db.MigrationStep)) := do
-  if cfg.tables.isEmpty then return .ok []
-  match ← resolveDbConfig cfg with
-  | .error e => return .error e
-  | .ok (.sqlite path) =>
-      let mut allSteps : List Db.MigrationStep := []
-      for tbl in cfg.tables do
-        match ← introspectSqliteTable path tbl with
-        | .error e => return .error e
-        | .ok (exists_, cols, idxs) => allSteps := allSteps ++ Db.diffTableSchema cols idxs tbl exists_
-      applyMigrationSteps .sqlite allSteps (Prim.sqliteDdl path)
-  | .ok (.postgres url) =>
-      let mut allSteps : List Db.MigrationStep := []
-      let mut introspectOk := true
-      for tbl in cfg.tables do
+def migrateDatabase (cfg : Db.DbConfig) : IO (Except ApiError (List Db.MigrationStep)) :=
+  ExceptT.run do
+    if cfg.tables.isEmpty then return []
+    match ← liftE (resolveDbConfig cfg) with
+    | .sqlite path =>
+        let mut allSteps : List Db.MigrationStep := []
+        for tbl in cfg.tables do
+          let (exists_, cols, idxs) ← liftE ((·.mapError fun e => ApiError.internal s!"sqlite introspection failed: {e}") <$>
+            introspectTable (Prim.sqliteExec path · #[])
+              ("PRAGMA table_info(" ++ tbl.name.quoteIdent ++ ")")
+              ("PRAGMA index_list(" ++ tbl.name.quoteIdent ++ ")") 1 false)
+          allSteps := allSteps ++ Db.diffTableSchema cols idxs tbl exists_
+        liftE (applyMigrationSteps .sqlite allSteps (Prim.sqliteDdl path))
+    | .postgres url =>
+        let mut allSteps : List Db.MigrationStep := []
+        let mut introspectOk := true
+        let colSql := "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1"
+        let idxSql := "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1"
+        for tbl in cfg.tables do
+          if introspectOk then
+            match ← introspectTable (Db.PgWire.execParameterized url · #[.text tbl.name.raw]) colSql idxSql 0 true with
+            | .error _ => introspectOk := false
+            | .ok (exists_, cols, idxs) => allSteps := allSteps ++ Db.diffTableSchema cols idxs tbl exists_
         if introspectOk then
-          match ← introspectPostgresTable url tbl with
-          | .error _ => introspectOk := false
-          | .ok (exists_, cols, idxs) => allSteps := allSteps ++ Db.diffTableSchema cols idxs tbl exists_
-      if introspectOk then
-        applyMigrationSteps .postgres allSteps (Db.PgWire.execDdl url)
-      else
-        return (← Db.PgWire.execDdl url (Db.renderDatabaseDdl .postgres cfg.tables))
-          |>.map (fun () => cfg.tables.map .createTable) |>.mapError ApiError.internal
-  | .ok tr =>
-      let stmts := cfg.tables.flatMap (·.renderDdlStatements .sqlite)
-      return (← execDdlOnTransport tr stmts "").map fun () => cfg.tables.map .createTable
+          liftE (applyMigrationSteps .postgres allSteps (Db.PgWire.execDdl url))
+        else
+          liftE ((·.mapError ApiError.internal) <$> Db.PgWire.execDdl url (Db.renderDatabaseDdl .postgres cfg.tables))
+          return cfg.tables.map .createTable
+    | tr =>
+        liftE (execDdlOnTransport tr (cfg.tables.flatMap (·.renderDdlStatements .sqlite)) "")
+        return cfg.tables.map .createTable
 
 private def execNativeDbDdl (cfg : Db.DbConfig) : IO (Except ApiError Unit) :=
   return (← migrateDatabase cfg).map fun _ => ()
@@ -672,14 +602,20 @@ private def popPgTx (txId : UInt64) : IO (Option Db.PgWire.PgConn) :=
     | some c => (some c, (nextId, m.erase txId))
     | none   => (none, (nextId, m))
 
+private def withPgTx {α : Type} (txId : UInt64) (f : Db.PgWire.PgConn → IO (Except ApiError α)) :
+    IO (Except ApiError α) := do
+  let some conn ← popPgTx txId
+    | return .error (ApiError.internal "unknown or closed PostgreSQL transaction")
+  f conn
+
 private def withTxTransport {α : Type} (cfg : Db.DbConfig)
     (onSqlite : String → IO (Except ApiError α))
-    (onPg : String → IO (Except ApiError α)) : IO (Except ApiError α) := do
-  match ← resolveDbConfig cfg with
-  | .error e            => return .error e
-  | .ok (.sqlite path)  => onSqlite path
-  | .ok (.postgres url) => onPg url
-  | .ok _ => return .error (ApiError.internal "multi-statement transactions require SQLite or PostgreSQL transport")
+    (onPg : String → IO (Except ApiError α)) : IO (Except ApiError α) :=
+  ExceptT.run do
+    match ← liftE (resolveDbConfig cfg) with
+    | .sqlite path  => liftE (onSqlite path)
+    | .postgres url => liftE (onPg url)
+    | _             => throw (ApiError.internal "multi-statement transactions require SQLite or PostgreSQL transport")
 
 private def finishPgTx (conn : Db.PgWire.PgConn) (cmd : String) : IO (Except ApiError Unit) := do
   let (res, conn') ← Db.PgWire.execSimpleOnConn conn cmd
@@ -691,18 +627,13 @@ private def finishPgTx (conn : Db.PgWire.PgConn) (cmd : String) : IO (Except Api
 private def execNativeDbTxBegin (cfg : Db.DbConfig) : IO (Except ApiError UInt64) :=
   withTxTransport cfg
     (fun path => return (← Prim.sqliteTxBegin path).mapError ApiError.internal)
-    (fun url => do
-      let p ← match Db.PgWire.parsePgUrl url with | .ok p => pure p | .error e => return .error (ApiError.internal e)
-      match ← Db.PgWire.acquireConn p with
-      | .error e => return .error (ApiError.internal e)
-      | .ok (conn, _) =>
-          let (res, conn') ← Db.PgWire.execSimpleOnConn conn "BEGIN"
-          match res with
-          | .error e =>
-              Db.PgWire.releaseConn { conn' with healthy := false }
-              return .error (ApiError.internal s!"postgres BEGIN failed: {e}")
-          | .ok cReady =>
-              return .ok (← pgTxBox.modifyGet fun (nextId, m) => (nextId, (nextId + 1, m.insert nextId cReady))))
+    (fun url => (·.mapError ApiError.internal) <$> ExceptT.run do
+      let p ← liftP (Db.PgWire.parsePgUrl url)
+      let (conn, _) ← liftE (Db.PgWire.acquireConn p)
+      let (res, conn') ← Db.PgWire.execSimpleOnConn conn "BEGIN"
+      match res with
+      | .error e => Db.PgWire.releaseConn { conn' with healthy := false }; throw s!"postgres BEGIN failed: {e}"
+      | .ok cReady => pgTxBox.modifyGet fun (nextId, m) => (nextId, (nextId + 1, m.insert nextId cReady)))
 
 private def execNativeDbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery) :
     IO (Except ApiError Db.DbResult) :=
@@ -710,9 +641,7 @@ private def execNativeDbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQu
     (fun _ => do
       let (sql, params) := q.compile .sqlite
       return (← Prim.sqliteTxExec txId sql params).mapError ApiError.internal)
-    (fun _ => do
-      let some conn ← popPgTx txId
-        | return .error (ApiError.internal "unknown or closed PostgreSQL transaction")
+    (fun _ => withPgTx txId fun conn => do
       let (sql, params) := q.compile .postgres
       let (res, conn') ← Db.PgWire.execOnConn conn sql params
       match res with
@@ -727,10 +656,7 @@ private def execNativeDbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQu
 private def execNativeDbTxCommit (cfg : Db.DbConfig) (txId : UInt64) : IO (Except ApiError Unit) :=
   withTxTransport cfg
     (fun _ => return (← Prim.sqliteTxCommit txId).mapError ApiError.internal)
-    (fun _ => do
-      let some conn ← popPgTx txId
-        | return .error (ApiError.internal "unknown or closed PostgreSQL transaction")
-      finishPgTx conn "COMMIT")
+    (fun _ => withPgTx txId (finishPgTx · "COMMIT"))
 
 private def execNativeDbTxRollback (cfg : Db.DbConfig) (txId : UInt64) : IO Unit := do
   match ← resolveDbConfig cfg with
@@ -738,36 +664,29 @@ private def execNativeDbTxRollback (cfg : Db.DbConfig) (txId : UInt64) : IO Unit
   | .ok (.postgres _) => if let some conn ← popPgTx txId then discard <| finishPgTx conn "ROLLBACK"
   | _                 => pure ()
 
-private def execNativeDbQuery (cfg : Db.DbConfig) (q : Db.SqlQuery) : IO (Except ApiError Db.DbResult) := do
-  match ← resolveDbConfig cfg with
-  | .error e => return .error e
-  | .ok tr =>
-      match tr with
-      | .postgres _ =>
-          let (sqlPg, paramsPg) := q.compile .postgres
-          execRawOnTransport tr "" sqlPg paramsPg []
-      | _ =>
-          let (sqlSq, paramsSq) := q.compile .sqlite
-          execRawOnTransport tr sqlSq "" paramsSq (Db.HttpSql.queryExpectedCols q)
+private def execNativeDbQuery (cfg : Db.DbConfig) (q : Db.SqlQuery) : IO (Except ApiError Db.DbResult) :=
+  ExceptT.run do
+    match ← liftE (resolveDbConfig cfg) with
+    | tr@(.postgres _) =>
+        let (sqlPg, paramsPg) := q.compile .postgres
+        liftE (execRawOnTransport tr "" sqlPg paramsPg [])
+    | tr =>
+        let (sqlSq, paramsSq) := q.compile .sqlite
+        liftE (execRawOnTransport tr sqlSq "" paramsSq (Db.HttpSql.queryExpectedCols q))
 
 @[implicit_reducible]
 def mkNativeServerInst (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEntry)))
     (cookieSink? : Option (IO.Ref (Array SetCookie)) := none)
     (sseSink? : Option (IO.Ref (Array SseEvent)) := none) : MonadServer IO where
   exec
-    | .httpCall req => do
-        match ← resolveAuthHeaders gcpCache? req.auth with
-        | .error e => return .error e
-        | .ok authHdrs =>
-            let base ← resolveBaseOrigin req
-            let fullUrl := base ++ req.pathAndQuery
-            let sanitizedReqHdrs := req.headers.map fun (k, v) => (sanitizeHeader k, sanitizeHeader v)
-            let allHdrs := (sanitizedReqHdrs ++ authHdrs).toArray
-            match ← execHttpCall req.method fullUrl allHdrs req.body req.ssrfGuard with
-            | .error transportErr =>
-                return .error (ApiError.internal s!"external HTTP transport error ({req.serviceName}): {transportErr}")
-            | .ok (status, respBody, respHdrs) =>
-                return .ok { status := status.toUInt32, body := respBody, headers := respHdrs.toList }
+    | .httpCall req => ExceptT.run do
+        let authHdrs ← liftE (resolveAuthHeaders gcpCache? req.auth)
+        let fullUrl := (← resolveBaseOrigin req) ++ req.pathAndQuery
+        let allHdrs := (req.headers.map (fun (k, v) => (sanitizeHeader k, sanitizeHeader v)) ++ authHdrs).toArray
+        let (status, respBody, respHdrs) ← liftE ((·.mapError fun e =>
+          ApiError.internal s!"external HTTP transport error ({req.serviceName}): {e}") <$>
+          execHttpCall req.method fullUrl allHdrs req.body req.ssrfGuard)
+        return { status := status.toUInt32, body := respBody, headers := respHdrs.toList }
     | .dbExec cfg q         => execNativeDbQuery cfg q
     | .dbExecDdl cfg        => execNativeDbDdl cfg
     | .dbTxBegin cfg        => execNativeDbTxBegin cfg
@@ -814,35 +733,29 @@ private def authUsersDdlSqlite : String :=
 private def authUsersDdlPostgres : String :=
   "CREATE TABLE IF NOT EXISTS \"_qed_auth_users\" (\"sub\" TEXT PRIMARY KEY, \"created_at\" BIGINT NOT NULL)"
 
-private def ensureAuthUsersTable (cfg : Db.DbConfig) : IO (Except ApiError Unit) := do
-  match ← resolveDbConfig cfg with
-  | .error e => return .error e
-  | .ok tr   => execDdlOnTransport tr [authUsersDdlSqlite] authUsersDdlPostgres
+private def ensureAuthUsersTable (cfg : Db.DbConfig) : IO (Except ApiError Unit) :=
+  ExceptT.run do
+    liftE (execDdlOnTransport (← liftE (resolveDbConfig cfg)) [authUsersDdlSqlite] authUsersDdlPostgres)
 
 /-- Atomically claims a first-time OIDC subject in `_qed_auth_users` (DB-backed when a database is attached,
     falling back to an atomic in-memory set otherwise). Returns `true` iff this is a brand-new user. -/
 private def claimAuthUser (primaryDb? : Option Db.DbConfig) (memSeen : Prim.StateBox (Std.HashSet String))
-    (sub : String) : IO (Except ApiError Bool) := do
-  match primaryDb? with
-  | none =>
-      let isNew ← Prim.atomicModify memSeen fun s =>
-        if s.contains sub then (s, false) else (s.insert sub, true)
-      return .ok isNew
-  | some cfg =>
-      let nowMs := (← Prim.nowMs).toNat
-      let params : Array Db.SqlVal := #[.text sub, .int (Int.ofNat nowMs)]
-      match ← resolveDbConfig cfg with
-      | .error e => return .error e
-      | .ok tr =>
-          let sqlSq := "INSERT OR IGNORE INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES (?1, ?2)"
-          let sqlHttp := sqlSq ++ " RETURNING \"sub\""
-          let sqlPg := "INSERT INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES ($1, $2) ON CONFLICT (\"sub\") DO NOTHING RETURNING \"sub\""
-          match ← execRawOnTransport tr sqlSq sqlPg params ["sub"] (some sqlHttp) (some "auth user claim decode failed") with
-          | .error e => return .error e
-          | .ok res  => return .ok (match tr with
-              | .sqlite _   => res.affected > 0
-              | .postgres _ => !res.rows.isEmpty
-              | _           => !res.rows.isEmpty || res.affected > 0)
+    (sub : String) : IO (Except ApiError Bool) :=
+  ExceptT.run do
+    match primaryDb? with
+    | none =>
+        liftIO (Prim.atomicModify memSeen fun s =>
+          if s.contains sub then (s, false) else (s.insert sub, true))
+    | some cfg =>
+        let params : Array Db.SqlVal := #[.text sub, .int (Int.ofNat (← Prim.nowMs).toNat)]
+        let tr ← liftE (resolveDbConfig cfg)
+        let sqlSq := "INSERT OR IGNORE INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES (?1, ?2)"
+        let sqlPg := "INSERT INTO \"_qed_auth_users\" (\"sub\", \"created_at\") VALUES ($1, $2) ON CONFLICT (\"sub\") DO NOTHING RETURNING \"sub\""
+        let res ← liftE (execRawOnTransport tr sqlSq sqlPg params ["sub"] (some (sqlSq ++ " RETURNING \"sub\"")) (some "auth user claim decode failed"))
+        return match tr with
+          | .sqlite _   => res.affected > 0
+          | .postgres _ => !res.rows.isEmpty
+          | _           => !res.rows.isEmpty || res.affected > 0
 
 /-- Releases a claimed OIDC subject if `onCreateAccount` fails so a subsequent retry re-runs account creation. -/
 private def releaseAuthUser (primaryDb? : Option Db.DbConfig) (memSeen : Prim.StateBox (Std.HashSet String))
@@ -881,13 +794,9 @@ private def handleMuxPayload
   let errWire (sid : UInt32) (msg : String) := encodeWsFrame 0x02 (WsMuxFrame.encode (.err sid msg))
   match WsMuxFrame.decode rawFrame with
   | .error errMsg =>
-      if h : 5 ≤ rawFrame.size then
-        let sid : UInt32 :=
-          ((rawFrame[1]'(by omega)).toUInt32 <<< 24) ||| ((rawFrame[2]'(by omega)).toUInt32 <<< 16) |||
-          ((rawFrame[3]'(by omega)).toUInt32 <<< 8) ||| (rawFrame[4]'(by omega)).toUInt32
-        return (errWire sid errMsg, subs, #[])
-      else
-        return (ByteArray.empty, subs, #[])
+      match readU32BE rawFrame 1 with
+      | some sid => return (errWire (UInt32.ofNat sid) errMsg, subs, #[])
+      | none     => return (ByteArray.empty, subs, #[])
   | .ok (.sub sid ch params) =>
       if ch.isEmpty || ch.utf8ByteSize > 256 then
         return (errWire sid "invalid channel name length", subs, #[])
@@ -932,35 +841,27 @@ private def stepWsRxLoop
         return { consumed := off, outWire, closeFlag := 0, fragState := frag, subOps := ops }
       else
       let nextOff := off + consumed
+      let closeWith (code : UInt16) (f := frag) :=
+        pure (true, f, subs, outWire ++ encodeWsCloseFrame code, ops)
+      let dispatchMsg (op : UInt8) (data : ByteArray) (f : WsFragState) := do
+        let (w', s', o') ← if op == 0x02 then handleMuxPayload wsDispatchFn ctx data subs else pure (ByteArray.empty, subs, #[])
+        pure (false, f, s', outWire ++ w', ops ++ o')
       let (close, frag', subs', outWire', ops') ←
-        if opcode == 0x08 then
-          pure (true, frag, subs, outWire ++ encodeWsCloseFrame 1000, ops)
-        else if opcode == 0x09 then
-          pure (false, frag, subs, outWire ++ encodeWsFrame 0x0A payload, ops)
-        else if opcode == 0x0A then
-          pure (false, frag, subs, outWire, ops)
+        if opcode == 0x08 then closeWith 1000
+        else if opcode == 0x09 then pure (false, frag, subs, outWire ++ encodeWsFrame 0x0A payload, ops)
+        else if opcode == 0x0A then pure (false, frag, subs, outWire, ops)
         else if opcode == 0x01 || opcode == 0x02 then
-          if frag.active then
-            pure (true, frag, subs, outWire ++ encodeWsCloseFrame 1002, ops)
-          else if fin then
-            let (w', s', o') ← if opcode == 0x02 then handleMuxPayload wsDispatchFn ctx payload subs else pure (ByteArray.empty, subs, #[])
-            pure (false, frag, s', outWire ++ w', ops ++ o')
-          else
-            pure (false, { active := true, opcode, buf := payload }, subs, outWire, ops)
+          if frag.active then closeWith 1002
+          else if fin then dispatchMsg opcode payload frag
+          else pure (false, { active := true, opcode, buf := payload }, subs, outWire, ops)
         else if opcode == 0x00 then
-          if !frag.active then
-            pure (true, frag, subs, outWire ++ encodeWsCloseFrame 1002, ops)
-          else if frag.buf.size + payload.size > maxWsMsgBytes then
-            pure (true, {}, subs, outWire ++ encodeWsCloseFrame 1009, ops)
+          if !frag.active then closeWith 1002
+          else if frag.buf.size + payload.size > maxWsMsgBytes then closeWith 1009 {}
           else
             let combined := frag.buf ++ payload
-            if fin then
-              let (w', s', o') ← if frag.opcode == 0x02 then handleMuxPayload wsDispatchFn ctx combined subs else pure (ByteArray.empty, subs, #[])
-              pure (false, {}, s', outWire ++ w', ops ++ o')
-            else
-              pure (false, { frag with buf := combined }, subs, outWire, ops)
-        else
-          pure (true, frag, subs, outWire ++ encodeWsCloseFrame 1002, ops)
+            if fin then dispatchMsg frag.opcode combined {}
+            else pure (false, { frag with buf := combined }, subs, outWire, ops)
+        else closeWith 1002
       if !close ∧ nextOff < rx.size then
         stepWsRxLoop wsDispatchFn ctx rx nextOff frag' subs' outWire' ops'
       else
@@ -970,18 +871,11 @@ termination_by rx.size - off
 
 private def loadHostScript (staticDirFd : Prim.StaticDir) (devMode : Bool) : IO String := do
   if devMode then return "/qed_host.mjs"
-  match ← Prim.readStaticFile staticDirFd "qed_manifest.json" 0 with
-  | none => return "/qed_host.mjs"
-  | some (_, _, bytes) =>
-      match String.fromUTF8? bytes with
-      | none => return "/qed_host.mjs"
-      | some raw =>
-          match Json.parse raw with
-          | .ok j =>
-              match (j.get? "host").bind (·.str?) with
-              | some h => if isSafeUrl h then return h else return "/qed_host.mjs"
-              | none   => return "/qed_host.mjs"
-          | .error _ => return "/qed_host.mjs"
+  let host? := (← Prim.readStaticFile staticDirFd "qed_manifest.json" 0).bind fun (_, _, bytes) =>
+    (String.fromUTF8? bytes).bind fun raw =>
+      (Json.parse raw).toOption.bind fun j =>
+        ((j.get? "host").bind (·.str?)).filter isSafeUrl
+  return host?.getD "/qed_host.mjs"
 
 private def stripQuery (target : String) : String :=
   match findByte target 0 63 with
@@ -1014,7 +908,7 @@ private def extractQuery (target : String) : String :=
 private def resolveAuthPrincipal (cfg : ServerConfig) (oidcRt? : Option Qed.Auth.Oidc.OidcRuntime)
     (bearer? : Option String) (cookies : List (String × String)) :
     IO (Option String × List (String × String)) := do
-  let nowSec := ((← Prim.nowMs).toNat) / 1000
+  let now ← nowSec
   -- 1. If an OIDC runtime is configured and a 3-segment Bearer JWT is supplied, verify via JWKS.
   if let (some rt, some tok) := (oidcRt?, bearer?) then
     if (tok.splitOn ".").length == 3 then
@@ -1025,16 +919,14 @@ private def resolveAuthPrincipal (cfg : ServerConfig) (oidcRt? : Option Qed.Auth
   let sessionSecrets := match oidcRt? with
     | some rt => if !rt.cfg.sessionSecrets.isEmpty then rt.cfg.sessionSecrets else cfg.authSecrets
     | none    => cfg.authSecrets
-  let sessionCookie? := if cookies.isEmpty then none else (cookies.find? fun (k, _) => k == "qed_session").map Prod.snd
-  if let some tok := bearer?.orElse (fun _ => sessionCookie?) then
+  if let some tok := bearer?.orElse (fun _ => cookies.lookup "qed_session") then
     if tok.startsWith "v2." then
-      if let some p ← Qed.Auth.Oidc.verifySessionCookieV2 sessionSecrets tok nowSec then
+      if let some p ← Qed.Auth.Oidc.verifySessionCookieV2 sessionSecrets tok now then
         return (some p.userId, p.claims)
       else
         return (none, [])
     if !sessionSecrets.isEmpty then
-      let uid? ← verifyUserTokenWithNow sessionSecrets tok nowSec cfg.requireExpiring
-      return (uid?, [])
+      return (← verifyUserTokenWithNow sessionSecrets tok now cfg.requireExpiring, [])
   return (none, [])
 
 private def buildRequestCtxReq (cfg : ServerConfig) (req : ParsedReqHead) (clientIp : String)
@@ -1147,7 +1039,7 @@ private def serveStaticAsset (staticDirFd : Prim.StaticDir)
     let fallback := if st.relPath == "__dev_status" then "{\"id\":\"0\",\"status\":\"ok\"}".toUTF8 else "0".toUTF8
     return formatHttpResponse 200 st.mime fallback st.isHead req.keepAlive true
   else
-    return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 st.isHead req.keepAlive false
+    return formatTextResponse 404 "not found" st.isHead req.keepAlive
 
 private def formatCustomHttpResponse (resp : HttpResponse) (extraCookies : Array SetCookie)
     (csp? : Option String) (req : ParsedReqHead) (isHead : Bool) : IO ByteArray := do
@@ -1257,39 +1149,33 @@ private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : 
       if pathOnly.startsWith "/_qed/auth/" then
         if let some rt := oidcRt? then
           if req.method == "POST" && pathOnly == rt.cfg.logoutPath then
-            match checkOriginAndFetchSiteParsed req.origin? req.host? req.secFetchSite?
-                (req.dupOrigin || req.dupSfs) cfg.rpcAllowedOrigins? false "auth logout" with
-            | .error (code, msg) =>
-                return formatHttpResponse code "text/plain; charset=utf-8" msg.toUTF8 isHead req.keepAlive false
-            | .ok () => pure ()
+            if let .error (code, msg) := checkOriginAndFetchSiteParsed req.origin? req.host? req.secFetchSite?
+                (req.dupOrigin || req.dupSfs) cfg.rpcAllowedOrigins? false "auth logout" then
+              return formatTextResponse code msg isHead req.keepAlive
           let onAuthCallback? : Option (String → List (String × String) → IO (Except (Nat × String) (Array SetCookie))) :=
-            fc.authHookFn?.map fun hookFn => fun sub filteredClaims => do
+            fc.authHookFn?.map fun hookFn sub filteredClaims => ExceptT.run do
               let hookCtx : RequestCtx := { ctx with userId := some sub, claims := filteredClaims }
+              let runHook (kind : UInt8) (onErr : IO Unit := pure ()) : ExceptT (Nat × String) IO (Array SetCookie) := do
+                let (hRes, hCookies) ← hookFn hookCtx kind
+                match hRes with
+                | .ok ()   => return hCookies
+                | .error e => onErr; throw (e.httpStatus.toNat, e.message)
               let mut outCookies : Array SetCookie := #[]
               if hasOnCreateAccount then
-                match ← claimAuthUser fc.primaryDb? memSeenAuthUsers sub with
-                | .error e => return .error (e.httpStatus.toNat, e.message)
-                | .ok true =>
-                    let (cRes, cCookies) ← hookFn hookCtx 0
-                    match cRes with
-                    | .error e =>
-                        releaseAuthUser fc.primaryDb? memSeenAuthUsers sub
-                        return .error (e.httpStatus.toNat, e.message)
-                    | .ok () => outCookies := outCookies ++ cCookies
-                | .ok false => pure ()
+                let isNew ← liftE ((·.mapError fun e => (e.httpStatus.toNat, e.message)) <$>
+                  claimAuthUser fc.primaryDb? memSeenAuthUsers sub)
+                if isNew then
+                  outCookies := outCookies ++ (← runHook 0 (releaseAuthUser fc.primaryDb? memSeenAuthUsers sub))
               if hasOnSignIn then
-                let (sRes, sCookies) ← hookFn hookCtx 1
-                match sRes with
-                | .error e => return .error (e.httpStatus.toNat, e.message)
-                | .ok () => outCookies := outCookies ++ sCookies
-              return .ok outCookies
+                outCookies := outCookies ++ (← runHook 1)
+              return outCookies
           if let some authResp ← Qed.Auth.Oidc.handleAuthRoute execHttpCall rt req
               pathOnly ctx.query ctx.cookies ctx.userId ctx.claims isHead onAuthCallback? then
             return authResp
       if req.method == "POST" && pathOnly.startsWith rpcPrefix then
         match checkRpcCsrfReq req cfg.rpcAllowedOrigins? with
         | .error (code, msg) =>
-            return formatHttpResponse code "text/plain; charset=utf-8" msg.toUTF8 isHead req.keepAlive false
+            return formatTextResponse code msg isHead req.keepAlive
         | .ok () =>
             let (res, cookies) ← fc.dispatchFn ctx (dropPrefixBytes pathOnly rpcPrefixBytes) body
             match res with
@@ -1297,13 +1183,13 @@ private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : 
                 if cookies.isEmpty then return formatOkProtoResponse respBytes isHead req.keepAlive
                 else return formatHttpResponse 200 "application/x-protobuf" respBytes isHead req.keepAlive false (extraHeaders := cookieHeaders cookies.toList)
             | .error apiErr =>
-                return formatHttpResponse apiErr.httpStatus.toNat "text/plain; charset=utf-8" apiErr.message.toUTF8 isHead req.keepAlive false (extraHeaders := cookieHeaders cookies.toList)
+                return formatTextResponse apiErr.httpStatus.toNat apiErr.message isHead req.keepAlive (cookieHeaders cookies.toList)
       if !pathOnly.startsWith "/_qed/" then
         if let some httpDispatchFn := fc.httpDispatchFn? then
           let (hRes, cookies) ← httpDispatchFn ctx (if isHead then "GET" else req.method) pathOnly
           match hRes with
           | .error apiErr =>
-              return formatHttpResponse apiErr.httpStatus.toNat "text/plain; charset=utf-8" apiErr.message.toUTF8 isHead req.keepAlive false (extraHeaders := cookieHeaders cookies.toList)
+              return formatTextResponse apiErr.httpStatus.toNat apiErr.message isHead req.keepAlive (cookieHeaders cookies.toList)
           | .ok (some resp) =>
               return ← formatCustomHttpResponse resp cookies cfg.csp? req isHead
           | .ok none => pure ()
@@ -1329,7 +1215,7 @@ private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : 
         return ← maybeGzipResponse ssrStatus "text/html; charset=utf-8" finalHtml isHead req.keepAlive false
           req.acceptsGzip true (extraHeaders := redirectHdrs ++ loop.htmlCspHdrs ++ [("Vary", "Accept-Encoding")])
       else
-        return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 isHead req.keepAlive false
+        return formatTextResponse 404 "not found" isHead req.keepAlive
 
     let dispatchAppReq (req : ParsedReqHead) (body : ByteArray) (clientIp : String) : IO ByteArray :=
       let staticTarget? :=
@@ -1475,7 +1361,7 @@ def runStaticDir (staticDir : String) (port : UInt16) (devMode : Bool := false) 
     let dispatchReq (req : ParsedReqHead) (_body : ByteArray) (_clientIp : String) : IO ByteArray := do
       let isHead := req.method == "HEAD"
       if req.method != "GET" && !isHead then
-        return formatHttpResponse 405 "text/plain; charset=utf-8" "method not allowed".toUTF8 isHead req.keepAlive false
+        return formatTextResponse 405 "method not allowed" isHead req.keepAlive
       if let some st := classifyStaticPath req.method req.target devMode then
         return ← serveStaticAsset loop.staticDirFd none req st devMode
       match ← Prim.readStaticFile loop.staticDirFd "index.html" (if isHead then 1 else 0) with
@@ -1483,7 +1369,7 @@ def runStaticDir (staticDir : String) (port : UInt16) (devMode : Bool := false) 
           return ← maybeGzipResponse 200 "text/html; charset=utf-8" bytes isHead req.keepAlive true
             req.acceptsGzip true (extraHeaders := loop.htmlCspHdrs ++ [("Vary", "Accept-Encoding")]) (contentLen := fsize)
       | none =>
-          return formatHttpResponse 404 "text/plain; charset=utf-8" "not found".toUTF8 isHead req.keepAlive false
+          return formatTextResponse 404 "not found" isHead req.keepAlive
     let onParsedHead (req : ParsedReqHead) (_ _ : String) (_ : Nat) := do
       return finishHeadWire req (← dispatchReq req ByteArray.empty "")
     return (onParsedHead, dispatchReq, closedWsBytes, fun _ _ _ => pure ())

@@ -792,11 +792,15 @@ def TableSchema.renderCreateTable (d : SqlDialect) (t : TableSchema) : String :=
   let cols := String.intercalate ", " (t.columns.map (·.renderDef d))
   "CREATE TABLE IF NOT EXISTS " ++ t.name.quoteIdent ++ " (" ++ cols ++ ")"
 
+def TableSchema.idxName (t : TableSchema) (i : Nat) : String :=
+  "idx_" ++ t.name.raw ++ "_" ++ toString i
+
+private def renderCreateIndex (tbl : SqlIdent) (idxName : String) (cols : List SqlIdent) : String :=
+  "CREATE INDEX IF NOT EXISTS \"" ++ idxName ++ "\" ON " ++ tbl.quoteIdent ++
+    " (" ++ SqlIdent.joinQuoted cols ++ ")"
+
 def TableSchema.renderIndexes (t : TableSchema) : List String :=
-  t.indexes.zipIdx.map fun (cols, i) =>
-    let idxName := "idx_" ++ t.name.raw ++ "_" ++ toString i
-    "CREATE INDEX IF NOT EXISTS \"" ++ idxName ++ "\" ON " ++ t.name.quoteIdent ++
-      " (" ++ SqlIdent.joinQuoted cols ++ ")"
+  t.indexes.zipIdx.map fun (cols, i) => renderCreateIndex t.name (t.idxName i) cols
 
 def TableSchema.renderDdlStatements (d : SqlDialect) (t : TableSchema) : List String :=
   t.renderCreateTable d :: t.renderIndexes
@@ -858,21 +862,20 @@ def ColumnSchema.safeDefaultSql (d : SqlDialect) (c : ColumnSchema) : Option Str
     | .bytes => some (match d with | .postgres => "'\\x'" | .sqlite => "X''")
 
 def TableSchema.indexNames (t : TableSchema) : List String :=
-  t.indexes.zipIdx.map fun (_, i) => "idx_" ++ t.name.raw ++ "_" ++ toString i
+  t.indexes.zipIdx.map fun (_, i) => t.idxName i
 
 /-- Pure schema diff for a single table against the database's live column and index names. -/
 def diffTableSchema (existingCols : List String) (existingIdxNames : List String)
     (desired : TableSchema) (tableExists : Bool) : List MigrationStep :=
   if !tableExists then
-    let idxSteps := desired.indexes.zipIdx.map fun (cols, i) =>
-      .createIndex desired.name ("idx_" ++ desired.name.raw ++ "_" ++ toString i) cols
-    .createTable desired :: idxSteps
+    .createTable desired :: desired.indexes.zipIdx.map fun (cols, i) =>
+      .createIndex desired.name (desired.idxName i) cols
   else
     let colSteps := desired.columns.filterMap fun col =>
       if existingCols.contains col.name.raw then none
       else some (.addColumn desired.name col none)
     let idxSteps := desired.indexes.zipIdx.filterMap fun (cols, i) =>
-      let idxName := "idx_" ++ desired.name.raw ++ "_" ++ toString i
+      let idxName := desired.idxName i
       if existingIdxNames.contains idxName then none
       else some (.createIndex desired.name idxName cols)
     colSteps ++ idxSteps
@@ -902,9 +905,7 @@ def MigrationStep.render (d : SqlDialect) : MigrationStep → String
         | none     => ""
       "ALTER TABLE " ++ tbl.quoteIdent ++ addKw ++ col.name.quoteIdent ++ " " ++
         col.colType.render d ++ nn ++ defClause ++ chk
-  | .createIndex tbl idxName cols =>
-      "CREATE INDEX IF NOT EXISTS \"" ++ idxName ++ "\" ON " ++ tbl.quoteIdent ++
-        " (" ++ SqlIdent.joinQuoted cols ++ ")"
+  | .createIndex tbl idxName cols => renderCreateIndex tbl idxName cols
 
 def renderMigrationDdl (d : SqlDialect) (steps : List MigrationStep) : String :=
   if steps.isEmpty then ""
@@ -927,37 +928,19 @@ theorem verifyMigrationSafe_nullable_addColumn (tbl : SqlIdent) (col : ColumnSch
     verifyMigrationSafe [.addColumn tbl col none] = .ok () := by
   simp [verifyMigrationSafe, ColumnSchema.isAdditiveSafe, hNull, hNoPk, hNoUniq, hNoFk]
 
-private theorem filterMap_all_none {α β : Type} (f : α → Option β) :
-    ∀ (xs : List α), (∀ x ∈ xs, f x = none) → xs.filterMap f = []
-  | [], _ => rfl
-  | x :: xs, hall => by
-      simp only [List.filterMap_cons, hall x (by simp)]
-      exact filterMap_all_none f xs (fun y hy => hall y (by simp [hy]))
+private theorem filterMap_contains_map_self {α β γ : Type} [BEq β] [LawfulBEq β]
+    (xs : List α) (key : α → β) (g : α → γ) :
+    xs.filterMap (fun x => if (xs.map key).contains (key x) then none else some (g x)) = [] :=
+  List.filterMap_eq_nil_iff.2 fun x hx => by
+    rw [if_pos (List.contains_iff_mem.2 (List.mem_map.2 ⟨x, hx, rfl⟩))]
 
 /-- Diffing any table against its own existing column and index lists yields zero migration steps (idempotence). -/
 theorem diffTableSchema_self_empty (t : TableSchema) :
     diffTableSchema (t.columns.map (·.name.raw)) t.indexNames t true = [] := by
-  unfold diffTableSchema
+  unfold diffTableSchema TableSchema.indexNames
   simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-  have hCols : t.columns.filterMap (fun col =>
-      if (t.columns.map (·.name.raw)).contains col.name.raw then none
-      else some (MigrationStep.addColumn t.name col none)) = [] := by
-    apply filterMap_all_none
-    intro col hcol
-    have hmem : (t.columns.map (·.name.raw)).contains col.name.raw = true :=
-      List.contains_iff_mem.2 (List.mem_map.2 ⟨col, hcol, rfl⟩)
-    rw [if_pos hmem]
-  have hIdxs : t.indexes.zipIdx.filterMap (fun p =>
-      let idxName := "idx_" ++ t.name.raw ++ "_" ++ toString p.2
-      if t.indexNames.contains idxName then none
-      else some (MigrationStep.createIndex t.name idxName p.1)) = [] := by
-    apply filterMap_all_none
-    intro p hp
-    have hmem : t.indexNames.contains ("idx_" ++ t.name.raw ++ "_" ++ toString p.2) = true :=
-      List.contains_iff_mem.2 (by unfold TableSchema.indexNames; exact List.mem_map.2 ⟨p, hp, rfl⟩)
-    dsimp only
-    rw [if_pos hmem]
-  rw [hCols, hIdxs]
+  rw [filterMap_contains_map_self t.columns (·.name.raw),
+      filterMap_contains_map_self t.indexes.zipIdx (fun p => t.idxName p.2)]
   rfl
 
 /-! ## Driver-Agnostic Database Endpoint Config & Execution Result -/
@@ -998,15 +981,34 @@ def SqlVal.toTaggedJson : SqlVal → Json
   | .bool b   => .obj [("t", .str "b"), ("v", .bool b)]
   | .bytes bs => .obj [("t", .str "x"), ("v", .str (Proto.encodeHex bs))]
 
+def jsonNatAt (j : Json) (k : String) : Nat :=
+  match j.get? k with
+  | some (.num n) => if 0 ≤ n.mantissa then n.mantissa.toNat else 0
+  | _ => 0
+
+def parseJsonIntCell (v? : Option Json) (badPfx missingErr : String) : Except String SqlVal :=
+  match v? with
+  | some (.str s) => match s.toInt? with | some i => .ok (.int i) | none => .error s!"{badPfx}: {s}"
+  | some (.num n) => .ok (.int n.mantissa)
+  | _ => .error missingErr
+
+def decodeJsonArrayRow (cellDec : Json → Except String SqlVal) (notArrErr : String) :
+    Json → Except String DbRow
+  | .arr vals => (vals.mapM cellDec).map List.toArray
+  | _         => .error notArrErr
+
+def decodeJsonRows (j : Json) (key : String) (rowDec : Json → Except String DbRow)
+    (notArrErr : String) : Except String (Array DbRow) :=
+  match j.get? key with
+  | some (.arr rs) => (rs.mapM rowDec).map List.toArray
+  | none           => .ok #[]
+  | _              => .error notArrErr
+
 def SqlVal.fromTaggedJson : Json → Except String SqlVal
   | .obj fs =>
       match fs.lookup "t" with
       | some (.str "n") => .ok .null
-      | some (.str "i") =>
-          match fs.lookup "v" with
-          | some (.str s) => match s.toInt? with | some i => .ok (.int i) | none => .error s!"bad int: {s}"
-          | some (.num n) => .ok (.int n.mantissa)
-          | _ => .error "missing int value"
+      | some (.str "i") => parseJsonIntCell (fs.lookup "v") "bad int" "missing int value"
       | some (.str "s") =>
           match fs.lookup "v" with
           | some (.str s) => .ok (.text s)
@@ -1034,9 +1036,6 @@ def SqlVal.toPlainJson : SqlVal → Json
   | .bool b   => .bool b
   | .bytes bs => .str (Proto.encodeHex bs)
 
-def encodeTaggedParamsJson (params : Array SqlVal) : String :=
-  Json.render (.arr (params.toList.map SqlVal.toTaggedJson))
-
 def encodeTaggedResultJson (res : DbResult) : String :=
   Json.render (.obj [
     ("rows", .arr (res.rows.toList.map fun r => .arr (r.toList.map SqlVal.toTaggedJson))),
@@ -1044,21 +1043,9 @@ def encodeTaggedResultJson (res : DbResult) : String :=
   ])
 
 def decodeTaggedResultJson (raw : String) : Except String DbResult := do
-  let j ← Json.parse raw 128
-  match j with
-  | .obj fs =>
-      let affected : Nat := match fs.lookup "affected" with
-        | some (.num n) => if 0 ≤ n.mantissa then n.mantissa.toNat else 0
-        | _ => 0
-      let rowsList ← match fs.lookup "rows" with
-        | some (.arr rs) =>
-            rs.mapM fun rj =>
-              match rj with
-              | .arr vals => (vals.mapM SqlVal.fromTaggedJson).map List.toArray
-              | _ => .error "expected row array"
-        | none => .ok []
-        | _ => .error "expected rows array"
-      return { rows := rowsList.toArray, affected }
-  | _ => .error "expected JSON object from database result"
+  let j@(.obj _) ← Json.parse raw 128 | .error "expected JSON object from database result"
+  let rows ← decodeJsonRows j "rows"
+    (decodeJsonArrayRow SqlVal.fromTaggedJson "expected row array") "expected rows array"
+  return { rows, affected := jsonNatAt j "affected" }
 
 end Qed.Server.Db

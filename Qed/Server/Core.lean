@@ -28,27 +28,13 @@ def httpStatus (e : ApiError) : UInt32 :=
 
 instance : ToString ApiError := ⟨fun e => e.message⟩
 
-instance : ToJson ApiError where
-  toJson e := toJson (e.code, e.message)
-
-instance : FromJson ApiError where
-  fromJson j := (FromJson.fromJson (α := Nat × String) j).map fun p => ApiError.mk p.1 p.2
-
-instance : LawfulJson ApiError where
-  depthBound := LawfulJson.depthBound (Nat × String)
-  depth_toJson e := LawfulJson.depth_toJson (e.code, e.message)
-  fromJson_toJson e := by
-    rcases e with ⟨c, m⟩
-    change (FromJson.fromJson (toJson (c, m)) : Except String (Nat × String)).map
-      (fun p => ApiError.mk p.1 p.2) = .ok (ApiError.mk c m)
-    rw [LawfulJson.fromJson_toJson (c, m)]
-    rfl
+instance : LawfulJson ApiError :=
+  .ofEquiv (fun e => (e.code, e.message)) (fun p => ⟨p.1, p.2⟩) (fun ⟨_, _⟩ => rfl)
 
 instance : NonNullJson ApiError := ⟨nofun⟩
 
-instance : ToProto ApiError   := .ofEquiv fun e => (e.code, e.message)
-instance : FromProto ApiError := .ofEquiv fun p : Nat × String => ApiError.mk p.1 p.2
-instance : LawfulProto ApiError := .ofEquiv (fun e => (e.code, e.message)) (fun p => ApiError.mk p.1 p.2) (fun ⟨_, _⟩ => rfl)
+instance : LawfulProto ApiError :=
+  .ofEquiv (fun e => (e.code, e.message)) (fun p => ⟨p.1, p.2⟩) (fun ⟨_, _⟩ => rfl)
 
 end ApiError
 
@@ -73,14 +59,11 @@ def header (ctx : RequestCtx) (name : String) : Option String :=
   (ctx.headers.find? fun (k, _) => k.toLower == target).map Prod.snd
 
 def cookie (ctx : RequestCtx) (name : String) : Option String :=
-  (ctx.cookies.find? fun (k, _) => k == name).map Prod.snd
+  ctx.cookies.lookup name
 
 def claim (ctx : RequestCtx) (name : String) : Option String :=
-  let direct := (ctx.claims.find? fun (k, _) => k == name).map Prod.snd
-  if direct.isSome then direct
-  else if name == "verified" then
-    (ctx.claims.find? fun (k, _) => k == "email_verified").map Prod.snd
-  else none
+  (ctx.claims.lookup name).orElse fun _ =>
+    if name == "verified" then ctx.claims.lookup "email_verified" else none
 
 def hasClaim (ctx : RequestCtx) (name expected : String) : Bool :=
   ctx.claim name == some expected
@@ -877,15 +860,21 @@ inductive MultiCoreStep {σ Out : Type} (Inv : σ → Prop) :
       MultiCoreStep Inv ⟨s, pre ++ .atomic st next :: post⟩
                         ⟨st s, pre ++ next s :: post⟩
 
+/-- Reflexive-transitive execution schedule for a transition relation `Step`. -/
+inductive Schedule {S : Type} (Step : S → S → Prop) : S → S → Prop where
+  | refl (st : S) : Schedule Step st st
+  | step {st₁ st₂ st₃ : S} : Schedule Step st₁ st₂ → Step st₂ st₃ → Schedule Step st₁ st₃
+
+theorem Schedule.preserves {S : Type} {Step : S → S → Prop} {P : S → Prop} {st₁ st₂ : S}
+    (h : Schedule Step st₁ st₂) (hinit : P st₁) (hstep : ∀ {a b}, Step a b → P a → P b) :
+    P st₂ := by
+  induction h with
+  | refl => exact hinit
+  | step _ hs ih => exact hstep hs ih
+
 /-- Multi-step multi-core execution schedule starting from `init`. -/
-inductive MultiCoreSchedule {σ Out : Type} (Inv : σ → Prop) :
-    MultiCoreState σ Out → MultiCoreState σ Out → Prop where
-  | refl (st : MultiCoreState σ Out) :
-      MultiCoreSchedule Inv st st
-  | step {st₁ st₂ st₃ : MultiCoreState σ Out} :
-      MultiCoreSchedule Inv st₁ st₂ →
-      MultiCoreStep Inv st₂ st₃ →
-      MultiCoreSchedule Inv st₁ st₃
+abbrev MultiCoreSchedule {σ Out : Type} (Inv : σ → Prop) :=
+  Schedule (@MultiCoreStep σ Out Inv)
 
 private theorem pool_replace_mid {α : Type} {P : α → Prop} {pre post : List α} {x y : α}
     (hpool : ∀ q ∈ pre ++ x :: post, P q) (hy : P y) :
@@ -927,11 +916,10 @@ theorem concurrent_schedule_preserves_inv {σ Out : Type}
     (Inv : σ → Prop) (s₀ : σ) (st : MultiCoreState σ Out)
     (hinit : Inv s₀)
     (hsched : MultiCoreSchedule Inv ⟨s₀, []⟩ st) :
-    Inv st.shared := by
-  suffices hboth : Inv st.shared ∧ (∀ p ∈ st.threads, ProgPreservesInv Inv p) from hboth.1
-  induction hsched with
-  | refl => exact ⟨hinit, fun _ hm => False.elim (List.not_mem_nil hm)⟩
-  | step _ hstep ih => exact step_preserves_inv_and_pool hstep ih.1 ih.2
+    Inv st.shared :=
+  (hsched.preserves (P := fun s => Inv s.shared ∧ ∀ p ∈ s.threads, ProgPreservesInv Inv p)
+    ⟨hinit, fun _ hm => False.elim (List.not_mem_nil hm)⟩
+    (fun hstep ih => step_preserves_inv_and_pool hstep ih.1 ih.2)).1
 
 /-- Witness that a `ThreadProg` performs only external/env/clock/crypto I/O and zero `.atomic` transitions. -/
 abbrev NoAtomic {σ α : Type} (p : ThreadProg σ α) : Prop :=
@@ -1021,16 +1009,11 @@ theorem progEnsures_bind {σ α β : Type} {Inv : σ → Prop} {Q : α → Prop}
     ProgEnsures Inv Post (p >>= k) :=
   hp.bind hk
 
-theorem safeIO_ensures_true {σ α : Type} {Inv : σ → Prop}
-    (p : ThreadProg σ α) [hp : SafeIO p] :
-    ProgEnsures Inv (fun _ => True) p :=
-  ProgSpec.of_noAtomic hp.noAtomic
-
 theorem safeIO_bind_ensures {σ α β : Type} {Inv : σ → Prop} {Post : β → Prop}
-    (p : ThreadProg σ α) [SafeIO p] {k : α → ThreadProg σ β}
+    (p : ThreadProg σ α) [hp : SafeIO p] {k : α → ThreadProg σ β}
     (hk : ∀ a, ProgEnsures Inv Post (k a)) :
     ProgEnsures Inv Post (p >>= k) :=
-  progEnsures_bind (safeIO_ensures_true p) (fun a _ => hk a)
+  progEnsures_bind (ProgSpec.of_noAtomic hp.noAtomic) (fun a _ => hk a)
 
 /-- Strengthened `SafeIO` witness carrying a zero-trust postcondition `Q` on the returned I/O value
     (e.g. database row invariants and verified `WHERE` predicates). -/
@@ -1047,15 +1030,10 @@ theorem safeIOEnsures_bind {σ α β : Type} {Inv : σ → Prop} {Q : α → Pro
     ProgEnsures Inv Post (p >>= k) :=
   progEnsures_bind h.ensures hk
 
-theorem progEnsures_imp {σ α : Type} {Inv : σ → Prop} {Q Post : α → Prop}
-    {p : ThreadProg σ α} (hp : ProgEnsures Inv Q p) (himp : ∀ a, Q a → Post a) :
-    ProgEnsures Inv Post p :=
-  hp.mono id (fun _ h => h) (fun _ _ _ _ h => h) himp
-
 theorem safeIOEnsures_final {σ α : Type} {Inv : σ → Prop} {Q Post : α → Prop}
     (p : ThreadProg σ α) [h : SafeIOEnsures p Q] (himp : ∀ a, Q a → Post a) :
     ProgEnsures Inv Post p :=
-  progEnsures_imp h.ensures himp
+  h.ensures.mono id (fun _ h => h) (fun _ _ _ _ h => h) himp
 
 theorem progEnsures_runAtomic {σ α : Type} {Inv : σ → Prop} {Post : α → Prop}
     (step : σ → σ × α) (hstep : ∀ s, Inv s → Post (step s).2) :
@@ -1098,14 +1076,8 @@ inductive TrackedMultiCoreStep {σ Tgt Out : Type} (Inv : σ → Prop) :
       (st : σ → σ) (next : σ → ThreadProg σ Tgt) :
       TrackedMultiCoreStep Inv ⟨s, .atomic st next, os⟩ ⟨st s, next s, os⟩
 
-inductive TrackedMultiCoreSchedule {σ Tgt Out : Type} (Inv : σ → Prop) :
-    TrackedMultiCoreState σ Tgt Out → TrackedMultiCoreState σ Tgt Out → Prop where
-  | refl (st : TrackedMultiCoreState σ Tgt Out) :
-      TrackedMultiCoreSchedule Inv st st
-  | step {st₁ st₂ st₃ : TrackedMultiCoreState σ Tgt Out} :
-      TrackedMultiCoreSchedule Inv st₁ st₂ →
-      TrackedMultiCoreStep Inv st₂ st₃ →
-      TrackedMultiCoreSchedule Inv st₁ st₃
+abbrev TrackedMultiCoreSchedule {σ Tgt Out : Type} (Inv : σ → Prop) :=
+  Schedule (@TrackedMultiCoreStep σ Tgt Out Inv)
 
 private theorem trackedStep_preserves {σ Tgt Out : Type} {Inv : σ → Prop} {Post : Tgt → Prop}
     {st₁ st₂ : TrackedMultiCoreState σ Tgt Out}
@@ -1140,14 +1112,13 @@ theorem concurrent_schedule_ensures {σ Tgt Out : Type}
     (htens : ProgEnsures Inv Post tgt₀)
     (hsched : TrackedMultiCoreSchedule Inv ⟨s₀, tgt₀, []⟩ st) :
     Inv st.shared ∧ ∀ out, st.target = .pure out → Post out := by
-  suffices h : Inv st.shared ∧ ProgPreservesInv Inv st.target ∧ ProgEnsures Inv Post st.target ∧
-      (∀ p ∈ st.others, ProgPreservesInv Inv p) by
-    refine ⟨h.1, fun out hout => ?_⟩
-    rw [hout] at h
-    cases h.2.2.1 with | pure _ hp => exact hp
-  induction hsched with
-  | refl => exact ⟨hinit, htinv, htens, fun _ hm => False.elim (List.not_mem_nil hm)⟩
-  | step _ hstep ih => exact trackedStep_preserves hstep ih.1 ih.2.1 ih.2.2.1 ih.2.2.2
+  have h := hsched.preserves
+    (P := fun s => Inv s.shared ∧ ProgPreservesInv Inv s.target ∧ ProgEnsures Inv Post s.target ∧
+      ∀ p ∈ s.others, ProgPreservesInv Inv p)
+    ⟨hinit, htinv, htens, fun _ hm => False.elim (List.not_mem_nil hm)⟩
+    (fun hstep ih => trackedStep_preserves hstep ih.1 ih.2.1 ih.2.2.1 ih.2.2.2)
+  refine ⟨h.1, fun out hout => ?_⟩
+  cases hout ▸ h.2.2.1 with | pure _ hp => exact hp
 
 /-! ## Control-Flow Combinators & Auto-Lifting Helpers (`@[reducible]` for Zero-Cost Proofs & C Codegen) -/
 
@@ -1372,20 +1343,13 @@ def dbRunTx {E : Type} [SrvErr E] {m : Type → Type} [Monad m] [MonadServer m] 
   match ← MonadServer.dbTxBegin cfg with
   | .error e => return some (.error (SrvErr.ofApi e))
   | .ok txId =>
-      let res ← body txId
-      match res with
+      match ← body txId with
       | some (.error e) =>
           MonadServer.dbTxRollback cfg txId
           return some (.error e)
-      | some (.ok v) =>
+      | res =>
           match ← MonadServer.dbTxCommit cfg txId with
-          | .ok ()   => return some (.ok v)
-          | .error e =>
-              MonadServer.dbTxRollback cfg txId
-              return some (.error (SrvErr.ofApi e))
-      | none =>
-          match ← MonadServer.dbTxCommit cfg txId with
-          | .ok ()   => return none
+          | .ok ()   => return res
           | .error e =>
               MonadServer.dbTxRollback cfg txId
               return some (.error (SrvErr.ofApi e))

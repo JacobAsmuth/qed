@@ -23,15 +23,12 @@ namespace Qed.Server.Net
   termination_by j
   (lo, scanHi hiCap (Nat.min_le_right _ _))
 
-def trimWs (s : String) : String :=
-  let (lo, hi) := trimRangeBytes isAsciiWsByte s 0 s.utf8ByteSize
-  if lo == 0 && hi == s.utf8ByteSize then s
-  else String.Pos.Raw.extract s ⟨lo⟩ ⟨hi⟩
+@[inline] private def trimBy (p : UInt8 → Bool) (s : String) : String :=
+  let (lo, hi) := trimRangeBytes p s 0 s.utf8ByteSize
+  if lo == 0 && hi == s.utf8ByteSize then s else String.Pos.Raw.extract s ⟨lo⟩ ⟨hi⟩
 
-def trimOws (s : String) : String :=
-  let (lo, hi) := trimRangeBytes isOwsByte s 0 s.utf8ByteSize
-  if lo == 0 && hi == s.utf8ByteSize then s
-  else String.Pos.Raw.extract s ⟨lo⟩ ⟨hi⟩
+def trimWs (s : String) : String := trimBy isAsciiWsByte s
+def trimOws (s : String) : String := trimBy isOwsByte s
 
 def stripTrailingSlashes (s : String) : String :=
   let rec scanHi (j : Nat) (hj : j ≤ s.utf8ByteSize) : Nat :=
@@ -90,23 +87,37 @@ def stripTrailingSlashes (s : String) : String :=
   (findByteInRange s lo hi target).isSome
 
 def containsCI (haystack needle : String) : Bool :=
-  if needle.utf8ByteSize == 0 || haystack.utf8ByteSize < needle.utf8ByteSize then false
+  let nLen := needle.utf8ByteSize
+  if nLen == 0 || haystack.utf8ByteSize < nLen then false
   else
-    let rec matchAt (base j : Nat) : Bool :=
-      if hj : j < needle.utf8ByteSize then
-        if hb : base + j < haystack.utf8ByteSize then
-          if asciiLowerByte (haystack.getUTF8Byte ⟨base + j⟩ hb) == asciiLowerByte (needle.getUTF8Byte ⟨j⟩ hj) then
-            matchAt base (j + 1)
-          else false
-        else false
-      else true
-    termination_by needle.utf8ByteSize - j
     let rec go (i : Nat) : Bool :=
-      if h : i + needle.utf8ByteSize ≤ haystack.utf8ByteSize ∧ i < haystack.utf8ByteSize then
-        if matchAt i 0 then true else go (i + 1)
+      if h : i + nLen ≤ haystack.utf8ByteSize ∧ i < haystack.utf8ByteSize then
+        if eqCIRange haystack i (i + nLen) needle 0 nLen then true else go (i + 1)
       else false
     termination_by haystack.utf8ByteSize - i
     go 0
+
+/-! ## Shared Big-Endian Binary Helpers -/
+
+def pushU16BE (ba : ByteArray) (n : Nat) : ByteArray :=
+  (ba.push (UInt8.ofNat ((n >>> 8) &&& 0xFF))).push (UInt8.ofNat (n &&& 0xFF))
+
+def pushU32BE (ba : ByteArray) (n : Nat) : ByteArray :=
+  (((ba.push (UInt8.ofNat ((n >>> 24) &&& 0xFF))).push
+    (UInt8.ofNat ((n >>> 16) &&& 0xFF))).push
+    (UInt8.ofNat ((n >>> 8) &&& 0xFF))).push
+    (UInt8.ofNat (n &&& 0xFF))
+
+def readU16BE (ba : ByteArray) (off : Nat) : Option Nat :=
+  if h : off + 1 < ba.size then
+    some (((ba[off]'(by omega)).toNat <<< 8) ||| (ba[off + 1]'h).toNat)
+  else none
+
+def readU32BE (ba : ByteArray) (off : Nat) : Option Nat :=
+  if h : off + 3 < ba.size then
+    some (((ba[off]'(by omega)).toNat <<< 24) ||| ((ba[off + 1]'(by omega)).toNat <<< 16) |||
+          ((ba[off + 2]'(by omega)).toNat <<< 8) ||| (ba[off + 3]'h).toNat)
+  else none
 
 def byteArrayContains (ba : ByteArray) (target : UInt8) : Bool :=
   let rec go (i : Nat) : Bool :=
@@ -188,12 +199,7 @@ def parseHexSize (s : String) (maxVal : Nat := 268435456) : Option Nat :=
     let rec go (acc : Nat) : List Char → Option Nat
       | [] => some acc
       | c :: rest =>
-          let d? : Option Nat :=
-            if '0' ≤ c && c ≤ '9' then some (c.toNat - '0'.toNat)
-            else if 'a' ≤ c && c ≤ 'f' then some (c.toNat - 'a'.toNat + 10)
-            else if 'A' ≤ c && c ≤ 'F' then some (c.toNat - 'A'.toNat + 10)
-            else none
-          match d? with
+          match Qed.hexVal c with
           | none => none
           | some d =>
               if acc > (maxVal - d) / 16 then none
@@ -243,28 +249,16 @@ private theorem splitCrlfLinesGo_rejects_nul (s : String) (i lineStart : Nat) (a
     (k : Nat) (hle : i ≤ k) (hk : k < s.utf8ByteSize) (hz : s.getUTF8Byte ⟨k⟩ hk = 0) :
     ∃ e, splitCrlfLinesGo s i lineStart acc = .error e := by
   fun_induction splitCrlfLinesGo s i lineStart acc with
-  | case1 i lineStart acc h b hb0 => exact ⟨_, rfl⟩
-  | case2 i lineStart acc h b _ hb10 => exact ⟨_, rfl⟩
-  | case3 i lineStart acc h b hb0 hb10 hb13 h2 hb10' ih =>
-      have hne0 : k ≠ i := by
-        intro heq; subst heq
-        have : s.getUTF8Byte ⟨k⟩ h = 0 := hz
-        exact hb0 (by simp [b, this])
-      have hne1 : k ≠ i + 1 := by
-        intro heq; subst heq
-        have h10 : s.getUTF8Byte ⟨i + 1⟩ h2 = 10 := beq_iff_eq.1 hb10'
-        have : (10 : UInt8) = 0 := h10.symm.trans hz
-        exact absurd this (by decide)
+  | case1 | case2 | case4 | case5 => exact ⟨_, rfl⟩
+  | case3 i _ _ _ b hb0 _ _ _ hb10' ih =>
+      have hne0 : k ≠ i := fun heq => hb0 (by subst heq; simp [b, hz])
+      have hne1 : k ≠ i + 1 := fun heq => by
+        subst heq; exact absurd ((beq_iff_eq.1 hb10').symm.trans hz) (by decide)
       exact ih (by omega)
-  | case4 i lineStart acc h b _ _ _ _ _ => exact ⟨_, rfl⟩
-  | case5 i lineStart acc h b _ _ _ _ => exact ⟨_, rfl⟩
-  | case6 i lineStart acc h b hb0 _ _ ih =>
-      have hne0 : k ≠ i := by
-        intro heq; subst heq
-        exact hb0 (by simp [b, hz])
+  | case6 i _ _ _ b hb0 _ _ ih =>
+      have hne0 : k ≠ i := fun heq => hb0 (by subst heq; simp [b, hz])
       exact ih (by omega)
-  | case7 i lineStart acc hge _ => exact absurd (Nat.lt_of_le_of_lt hle hk) hge
-  | case8 i lineStart acc hge _ => exact absurd (Nat.lt_of_le_of_lt hle hk) hge
+  | case7 _ _ _ hge | case8 _ _ _ hge => exact absurd (Nat.lt_of_le_of_lt hle hk) hge
 
 theorem splitCrlfLines_rejects_nul (ba : ByteArray) (hnul : byteArrayContains ba 0 = true) :
     ∃ e, splitCrlfLines ba = .error e := by
@@ -443,40 +437,22 @@ private def splitAuthorityAndPathGo (authRev : List Char) : List Char → Option
 private def splitAuthorityAndPath (rest : String) : Option (String × String) :=
   splitAuthorityAndPathGo [] rest.toList
 
-private theorem not_mem_takeWhile_ne_hash (cs : List Char) : '#' ∉ cs.takeWhile (· != '#') := by
-  induction cs with
-  | nil => simp
-  | cons c rest ih =>
-      simp only [List.takeWhile]
-      by_cases h : c = '#'
-      · subst h; simp
-      · have hne : (c != '#') = true := by simp [h]
-        simp only [hne, List.mem_cons, not_or]
-        exact ⟨Ne.symm h, ih⟩
+private theorem not_mem_takeWhile_ne_hash : ∀ cs : List Char, '#' ∉ cs.takeWhile (· != '#')
+  | [] => by simp
+  | c :: rest => by
+      simp only [List.takeWhile]; split
+      · rename_i h; simp only [List.mem_cons, not_or]
+        exact ⟨fun heq => by subst heq; simp at h, not_mem_takeWhile_ne_hash rest⟩
+      · simp
 
 private theorem splitAuthorityAndPathGo_no_hash (authRev cs : List Char) (auth path : String)
     (h : splitAuthorityAndPathGo authRev cs = some (auth, path)) :
     '#' ∉ path.toList := by
-  induction cs generalizing authRev with
-  | nil =>
-      simp only [splitAuthorityAndPathGo, Option.some.injEq, Prod.mk.injEq] at h
-      rcases h with ⟨_, rfl⟩; decide
-  | cons c tail ih =>
-      unfold splitAuthorityAndPathGo at h
-      split at h
-      · rename_i heq; cases heq
-      · simp at h
-      · simp only [Option.some.injEq, Prod.mk.injEq] at h
-        rcases h with ⟨_, rfl⟩
-        simp only [String.toList_ofList, List.mem_cons, not_or]
-        exact ⟨by decide, by decide, not_mem_takeWhile_ne_hash _⟩
-      · simp only [Option.some.injEq, Prod.mk.injEq] at h
-        rcases h with ⟨_, rfl⟩
-        simp only [String.toList_ofList, List.mem_cons, not_or]
-        exact ⟨by decide, not_mem_takeWhile_ne_hash _⟩
-      · rename_i c' tail' _ _ _ heq
-        cases heq
-        exact ih _ h
+  fun_induction splitAuthorityAndPathGo authRev cs with
+  | case1 => cases h; decide
+  | case2 => cases h
+  | case3 | case4 => cases h; simp [not_mem_takeWhile_ne_hash]
+  | case5 _ _ _ _ _ _ ih => exact ih h
 
 /-- True iff `method` is an RFC 9110 §9.2.2 idempotent HTTP method safe to retry on a stale
     pooled keep-alive socket. -/
@@ -532,22 +508,12 @@ def parseHttpUrl (url : String) : Except String ParsedUrl :=
 theorem parseHttpUrl_no_fragment (url : String) (u : ParsedUrl)
     (h : parseHttpUrl url = .ok u) : '#' ∉ u.pathAndQuery.toList := by
   unfold parseHttpUrl at h
-  split at h
-  · cases h
-  · dsimp only at h
-    split at h
-    · cases h
-    · rename_i isTls defPort dropLen _
-      cases hsp : splitAuthorityAndPath (String.ofList (url.toList.drop dropLen)) with
-      | none => simp [hsp] at h
-      | some ap =>
-          simp only [hsp] at h
-          cases hhp : parseHostPort url ap.1 defPort with
-          | error e => simp [hhp, Except.map] at h
-          | ok hp =>
-              simp only [hhp, Except.map, Except.ok.injEq] at h
-              subst h
-              exact splitAuthorityAndPathGo_no_hash [] _ ap.1 ap.2 hsp
+  split at h <;> try cases h
+  dsimp only at h; split at h <;> try cases h
+  split at h <;> try cases h
+  rename_i hsp
+  dsimp only [Except.map] at h; split at h <;> try cases h
+  exact splitAuthorityAndPathGo_no_hash [] _ _ _ hsp
 
 /-- Serializes a validated outbound HTTP/1.1 request wire buffer, rejecting invalid method tokens
     and CRLF/control header injection. -/

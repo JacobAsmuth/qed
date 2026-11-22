@@ -48,31 +48,22 @@ def encodeTursoPipelineBody (sql : String) (params : Array SqlVal) : ByteArray :
   ]
   (Json.render (.obj [("requests", reqs)])).toUTF8
 
-private def jsonNatAt (j : Json) (k : String) : Nat :=
-  match j.get? k with
-  | some (.num n) => if 0 ≤ n.mantissa then n.mantissa.toNat else 0
-  | _ => 0
-
 /-- Decodes a single Turso Hrana v2 cell (`{type, value}`). -/
 def decodeTursoCell : Json → Except String SqlVal
   | j@(.obj _) =>
       match j.get? "type" |>.bind (·.str?) with
-      | some "null" => .ok .null
-      | some "integer" =>
-          match j.get? "value" with
-          | some (.str s) => match s.toInt? with | some i => .ok (.int i) | none => .error s!"turso bad int: {s}"
-          | some (.num n) => .ok (.int n.mantissa)
-          | _ => .error "turso missing integer value"
-      | some "text" =>
+      | some "null"    => .ok .null
+      | some "integer" => parseJsonIntCell (j.get? "value") "turso bad int" "turso missing integer value"
+      | some "text"    =>
           match j.get? "value" |>.bind (·.str?) with
           | some s => .ok (.text s)
           | none   => .error "turso missing text value"
-      | some "float" =>
+      | some "float"   =>
           match j.get? "value" with
           | some (.str s) => .ok (.text s)
           | some (.num n) => .ok (.int n.mantissa)
           | _ => .error "turso missing float value"
-      | some "blob" =>
+      | some "blob"    =>
           match j.get? "base64" |>.bind (·.str?) with
           | some s => (Proto.decodeHex s).map .bytes
           | none   => .error "turso missing blob payload"
@@ -90,14 +81,9 @@ def decodeTursoResponse (raw : String) : Except String DbResult := do
   | some "ok" =>
       let some resp@(.obj _) := first.get? "response" | return ← .error "turso missing response"
       let some res@(.obj _) := resp.get? "result" | return ← .error "turso missing result"
-      let rowsList ← match res.get? "rows" with
-        | some (.arr rs) =>
-            rs.mapM fun
-              | .arr cells => (cells.mapM decodeTursoCell).map List.toArray
-              | _ => .error "turso row is not an array"
-        | none => .ok []
-        | _ => .error "turso rows is not an array"
-      return { rows := rowsList.toArray, affected := jsonNatAt res "affected_row_count" }
+      let rows ← decodeJsonRows res "rows"
+        (decodeJsonArrayRow decodeTursoCell "turso row is not an array") "turso rows is not an array"
+      return { rows, affected := jsonNatAt res "affected_row_count" }
   | _ => .error "turso unexpected result type"
 
 /-- Decodes a Cloudflare D1 REST response (`{success, result: [{results: [...], meta: {changes}}]}`)
@@ -110,22 +96,15 @@ def decodeD1Response (raw : String) (expectedCols : List String) : Except String
   | some (.arr (first :: _)) =>
       let .obj _ := first | return ← .error "D1 result entry is not an object"
       let affected := (first.get? "meta").map (jsonNatAt · "changes") |>.getD 0
-      let rowsList ← match first.get? "results" with
-        | some (.arr rs) =>
-            rs.mapM fun
-              | .arr vals => (vals.mapM SqlVal.fromTaggedJson).map List.toArray
-              | .obj rowObj =>
-                  if expectedCols.isEmpty then
-                    (rowObj.mapM fun (kv : String × Json) => SqlVal.fromTaggedJson kv.2).map List.toArray
-                  else
-                    (expectedCols.mapM fun c =>
-                      match rowObj.lookup c with
-                      | some v => SqlVal.fromTaggedJson v
-                      | none   => .ok .null).map List.toArray
-              | _ => .error "D1 row is not object or array"
-        | none => .ok []
-        | _ => .error "D1 results is not an array"
-      return { rows := rowsList.toArray, affected }
+      let rows ← decodeJsonRows first "results" (fun
+        | .arr vals => (vals.mapM SqlVal.fromTaggedJson).map List.toArray
+        | .obj rowObj =>
+            (if expectedCols.isEmpty then rowObj.mapM (SqlVal.fromTaggedJson ·.2)
+             else expectedCols.mapM fun c =>
+               match rowObj.lookup c with | some v => SqlVal.fromTaggedJson v | none => .ok .null)
+              |>.map List.toArray
+        | _ => .error "D1 row is not object or array") "D1 results is not an array"
+      return { rows, affected }
   | _ => decodeTaggedResultJson raw
 
 def queryExpectedCols : SqlQuery → List String

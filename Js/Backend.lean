@@ -8,27 +8,25 @@ open Lean IR
 
 namespace Js
 
-def mangle (n : Name) : String := Id.run do
-  let mut s := ""
-  for c in n.toString.toList do
-    if c.isAlphanum then s := s.push c
-    else if c == '.' || c == '_' then s := s.push '_'
-    else s := s ++ s!"x{c.toNat}"
-  return s
+def mangle (n : Name) : String :=
+  n.toString.foldl (init := "") fun s c =>
+    if c.isAlphanum then s.push c
+    else if c == '.' || c == '_' then s.push '_'
+    else s ++ s!"x{c.toNat}"
 
 def soff (n offset : Nat) : String := s!"\"{n}_{offset}\""
 
+def jsStrChar (c : Char) : String :=
+  match c with
+  | '\\' => "\\\\" | '"' => "\\\"" | '\n' => "\\n" | '\r' => "\\r" | '\t' => "\\t"
+  | c =>
+    if c.toNat < 32 then
+      let h := Nat.toDigits 16 c.toNat
+      "\\x" ++ String.ofList (if h.length == 1 then '0' :: h else h)
+    else String.singleton c
+
 def jsStr (s : String) : String :=
-  let escaped := s.foldl (init := "") fun acc c =>
-    acc ++ (match c with
-      | '\\' => "\\\\" | '"' => "\\\"" | '\n' => "\\n" | '\r' => "\\r"
-      | '\t' => "\\t"
-      | c =>
-        if c.toNat < 32 then
-          let h := Nat.toDigits 16 c.toNat
-          "\\x" ++ String.ofList (if h.length == 1 then '0' :: h else h)
-        else String.singleton c)
-  "\"" ++ escaped ++ "\""
+  "\"" ++ s.foldl (init := "") (fun acc c => acc ++ jsStrChar c) ++ "\""
 
 def indStr (min : Bool) (d : Nat) : String :=
   if min then "" else String.ofList (List.replicate (2 * d) ' ')
@@ -69,23 +67,26 @@ def JsExpr.renderMin (min : Bool) : JsExpr → String
   | .numLit n         => toString n
   | .bigIntLit n      => s!"{n}n"
   | .strLit s         => jsStr s
-  | .arrLit elems     => s!"[{joinChunks (JsExpr.renderListMinAux min #[] elems)}]"
+  | .arrLit elems     => s!"[{JsExpr.renderListMin min elems}]"
   | .ctorObj cidx fields hasS hasU =>
       let sep := if min then "" else " "
       let s := if hasS then s!",{sep}s:{sep}" ++ "{}" else ""
       let u := if hasU then s!",{sep}u:{sep}" ++ "{}" else ""
-      s!"\{t:{sep}{cidx},{sep}f:{sep}[{joinChunks (JsExpr.renderListMinAux min #[] fields)}]{s}{u}}"
+      s!"\{t:{sep}{cidx},{sep}f:{sep}[{JsExpr.renderListMin min fields}]{s}{u}}"
   | .fieldProj obj i  => s!"{obj.renderMin min}.f[{i}]"
   | .uProj obj i      => s!"{obj.renderMin min}.u[{i}]"
   | .sProj obj n off  => s!"{obj.renderMin min}.s[{soff n off}]"
-  | .call fn args     => s!"{fn}({joinChunks (JsExpr.renderListMinAux min #[] args)})"
+  | .call fn args     => s!"{fn}({JsExpr.renderListMin min args})"
   | .pap fn ar args   =>
       let sep := if min then "," else ", "
-      s!"$.pap({fn}{sep}{ar}{sep}[{joinChunks (JsExpr.renderListMinAux min #[] args)}])"
+      s!"$.pap({fn}{sep}{ar}{sep}[{JsExpr.renderListMin min args}])"
   | .app fn args      =>
       let sep := if min then "," else ", "
-      s!"$.app({fn.renderMin min}{sep}[{joinChunks (JsExpr.renderListMinAux min #[] args)}])"
-  | .tc args          => s!"$.tc([{joinChunks (JsExpr.renderListMinAux min #[] args)}])"
+      s!"$.app({fn.renderMin min}{sep}[{JsExpr.renderListMin min args}])"
+  | .tc args          => s!"$.tc([{JsExpr.renderListMin min args}])"
+
+def JsExpr.renderListMin (min : Bool) (es : List JsExpr) : String :=
+  joinChunks (JsExpr.renderListMinAux min #[] es)
 
 def JsExpr.renderListMinAux (min : Bool) (acc : Array String) : List JsExpr → Array String
   | []      => acc
@@ -205,18 +206,13 @@ def JsDecl.render (min : Bool) (d : JsDecl) : String :=
       fnHeader min name orig params ++ w ++ JsStmt.renderList min 2 body ++ s!"{indStr min 1}}{nl}}\n"
   | .fnTrampoline name orig params body =>
       let ps := String.intercalate (if min then "," else ", ") params
-      if min then
-        fnHeader true name orig params ++
-          "const _s=()=>{" ++ JsStmt.renderList true 2 body ++ "};" ++
-          s!"while(1)\{const _r=_s();if(_r!==null&&typeof _r===\"object\"&&_r.__tc!==void 0)\{[{ps}]=_r.__tc;continue;}return _r;}}\n"
-      else
-        fnHeader false name orig params ++
-          s!"{indStr false 1}const __step = () => \{\n" ++ JsStmt.renderList false 2 body ++ s!"{indStr false 1}};\n" ++
-          s!"{indStr false 1}while (true) \{\n" ++
-          s!"{indStr false 2}const __r = __step();\n" ++
-          s!"{indStr false 2}if (__r !== null && typeof __r === \"object\" && __r.__tc !== undefined) \{ [{ps}] = __r.__tc; continue; }\n" ++
-          s!"{indStr false 2}return __r;\n" ++
-          s!"{indStr false 1}}\n}\n"
+      let (ind1, ind2) := (indStr min 1, indStr min 2)
+      let (sf, rv, und, wt) := if min then ("_s", "_r", "void 0", "while(1){") else ("__step", "__r", "undefined", "while (true) {\n")
+      fnHeader min name orig params ++
+        s!"{ind1}const {sf}{eq}(){sp}=>{sp}\{{nl}" ++ JsStmt.renderList min 2 body ++ s!"{ind1}};{nl}" ++
+        s!"{ind1}{wt}{ind2}const {rv}{eq}{sf}();{nl}" ++
+        s!"{ind2}if{sp}({rv}{sp}!=={sp}null{sp}&&{sp}typeof {rv}{sp}==={sp}\"object\"{sp}&&{sp}{rv}.__tc{sp}!=={sp}{und}){sp}\{{sp}[{ps}]{eq}{rv}.__tc;{sp}continue;{sp}}{nl}" ++
+        s!"{ind2}return {rv};{nl}{ind1}}{nl}}\n"
 
 /-! ## Total IR Analysis & Reachability Passes -/
 
@@ -553,63 +549,46 @@ private def nextShortIdentAux (avoid : Std.HashSet String) : Nat → Nat → Str
 def nextShortIdent (avoid : Std.HashSet String) (idx : Nat) : String × Nat :=
   nextShortIdentAux avoid (avoid.size + 64) idx
 
-mutual
-private def collectLocalArrowsStmt (acc : Std.HashSet String) : JsStmt → Std.HashSet String
-  | .constArrow name _ body => collectLocalArrowsStmts (acc.insert name) body
-  | .labeledBlock _ body    => collectLocalArrowsStmts acc body
-  | .switchStmt _ arms      => collectLocalArrowsArms acc arms
-  | _                       => acc
-
-private def collectLocalArrowsStmts (acc : Std.HashSet String) : List JsStmt → Std.HashSet String
-  | []      => acc
-  | s :: ss => collectLocalArrowsStmts (collectLocalArrowsStmt acc s) ss
-
-private def collectLocalArrowsArms (acc : Std.HashSet String) : List JsSwitchArm → Std.HashSet String
-  | [] => acc
-  | .caseArm _ b :: rest | .defaultArm b :: rest => collectLocalArrowsArms (collectLocalArrowsStmts acc b) rest
-end
+private structure MinScan where
+  localArrows : Std.HashSet String := {}
+  called      : Std.HashSet String := {}
+  avoid       : Std.HashSet String
 
 mutual
-private def collectGlobalsExpr (localArrows : Std.HashSet String) (acc : Std.HashSet String) :
-    JsExpr → Std.HashSet String
+private def scanMinExpr (acc : MinScan) : JsExpr → MinScan
   | .call fn args =>
-      let acc' := if !fn.startsWith "$." && !localArrows.contains fn then acc.insert fn else acc
-      collectGlobalsExprs localArrows acc' args
+      let acc := if !fn.startsWith "$." then { acc with called := acc.called.insert fn } else acc
+      scanMinExprs acc args
   | .pap fn _ args =>
-      let acc' := if !fn.startsWith "$." then acc.insert fn else acc
-      collectGlobalsExprs localArrows acc' args
-  | .arrLit elems | .ctorObj _ elems _ _ | .tc elems => collectGlobalsExprs localArrows acc elems
-  | .fieldProj o _ | .uProj o _ | .sProj o _ _ => collectGlobalsExpr localArrows acc o
-  | .app fn args => collectGlobalsExprs localArrows (collectGlobalsExpr localArrows acc fn) args
+      let acc := if !fn.startsWith "$." then { acc with avoid := acc.avoid.insert fn } else acc
+      scanMinExprs acc args
+  | .arrLit elems | .ctorObj _ elems _ _ | .tc elems => scanMinExprs acc elems
+  | .fieldProj o _ | .uProj o _ | .sProj o _ _ => scanMinExpr acc o
+  | .app fn args => scanMinExprs (scanMinExpr acc fn) args
   | _ => acc
 
-private def collectGlobalsExprs (localArrows : Std.HashSet String) (acc : Std.HashSet String) :
-    List JsExpr → Std.HashSet String
+private def scanMinExprs (acc : MinScan) : List JsExpr → MinScan
   | []      => acc
-  | e :: es => collectGlobalsExprs localArrows (collectGlobalsExpr localArrows acc e) es
+  | e :: es => scanMinExprs (scanMinExpr acc e) es
 end
 
 mutual
-private def collectGlobalsStmt (localArrows : Std.HashSet String) (acc : Std.HashSet String) :
-    JsStmt → Std.HashSet String
-  | .letVar _ val | .setField _ _ val | .setU _ _ val | .setS _ _ _ val | .ret val =>
-      collectGlobalsExpr localArrows acc val
-  | .letBinds binds | .breakLabel binds _ => collectGlobalsExprs localArrows acc (binds.map Prod.snd)
-  | .labeledBlock _ body | .constArrow _ _ body => collectGlobalsStmts localArrows acc body
-  | .tailContinue _ args => collectGlobalsExprs localArrows acc args
-  | .switchStmt scrut arms => collectGlobalsArms localArrows (collectGlobalsExpr localArrows acc scrut) arms
+private def scanMinStmt (acc : MinScan) : JsStmt → MinScan
+  | .letVar _ val | .setField _ _ val | .setU _ _ val | .setS _ _ _ val | .ret val => scanMinExpr acc val
+  | .letBinds binds | .breakLabel binds _ => scanMinExprs acc (binds.map Prod.snd)
+  | .labeledBlock _ body => scanMinStmts acc body
+  | .constArrow name _ body => scanMinStmts { acc with localArrows := acc.localArrows.insert name } body
+  | .tailContinue _ args => scanMinExprs acc args
+  | .switchStmt scrut arms => scanMinArms (scanMinExpr acc scrut) arms
   | _ => acc
 
-private def collectGlobalsStmts (localArrows : Std.HashSet String) (acc : Std.HashSet String) :
-    List JsStmt → Std.HashSet String
+private def scanMinStmts (acc : MinScan) : List JsStmt → MinScan
   | []      => acc
-  | s :: ss => collectGlobalsStmts localArrows (collectGlobalsStmt localArrows acc s) ss
+  | s :: ss => scanMinStmts (scanMinStmt acc s) ss
 
-private def collectGlobalsArms (localArrows : Std.HashSet String) (acc : Std.HashSet String) :
-    List JsSwitchArm → Std.HashSet String
+private def scanMinArms (acc : MinScan) : List JsSwitchArm → MinScan
   | [] => acc
-  | .caseArm _ b :: rest | .defaultArm b :: rest =>
-      collectGlobalsArms localArrows (collectGlobalsStmts localArrows acc b) rest
+  | .caseArm _ b :: rest | .defaultArm b :: rest => scanMinArms (scanMinStmts acc b) rest
 end
 
 private structure MinSt where
@@ -622,23 +601,19 @@ private structure MinSt where
 
 private abbrev MinM := StateM MinSt
 
-private def mapVarM (name : String) : MinM String := do
-  let st ← get
-  match st.varMap.get? name with
-  | some s => return s
-  | none =>
-      let (s, idx') := nextShortIdent st.avoid st.varIdx
-      set { st with varMap := st.varMap.insert name s, varIdx := idx' }
-      return s
+private def internShort (avoid : Std.HashSet String) (m : Std.HashMap String String) (idx : Nat) (k : String) :
+    String × Std.HashMap String String × Nat :=
+  match m.get? k with
+  | some s => (s, m, idx)
+  | none   => let (s, idx') := nextShortIdent avoid idx; (s, m.insert k s, idx')
 
-private def mapLblM (lbl : String) : MinM String := do
-  let st ← get
-  match st.lblMap.get? lbl with
-  | some s => return s
-  | none =>
-      let (s, idx') := nextShortIdent jsMinReservedSet st.lblIdx
-      set { st with lblMap := st.lblMap.insert lbl s, lblIdx := idx' }
-      return s
+private def mapVarM (name : String) : MinM String := modifyGet fun st =>
+  let (s, m, i) := internShort st.avoid st.varMap st.varIdx name
+  (s, { st with varMap := m, varIdx := i })
+
+private def mapLblM (lbl : String) : MinM String := modifyGet fun st =>
+  let (s, m, i) := internShort jsMinReservedSet st.lblMap st.lblIdx lbl
+  (s, { st with lblMap := m, lblIdx := i })
 
 mutual
 private def renameExpr : JsExpr → MinM JsExpr
@@ -700,9 +675,9 @@ end
 
 private def minifyFnBody (name : String) (params : List String) (body : List JsStmt) :
     List String × List JsStmt :=
-  let localArrows := collectLocalArrowsStmts {} body
-  let avoid := collectGlobalsStmts localArrows (jsMinReservedSet.insert name) body
-  ((do return (← params.mapM mapVarM, ← renameStmts body)).run { avoid, localArrows }).1
+  let sc := scanMinStmts { avoid := jsMinReservedSet.insert name } body
+  let avoid := sc.called.fold (fun a fn => if sc.localArrows.contains fn then a else a.insert fn) sc.avoid
+  ((do return (← params.mapM mapVarM, ← renameStmts body)).run { avoid, localArrows := sc.localArrows }).1
 
 /-- Deterministically alpha-renames all local variables, parameters, join-point arrow bindings,
     inline join-point slots, and block labels in a lowered `JsDecl` to short base-52/62 names,
@@ -805,6 +780,12 @@ private def declNameColOffset : JsDecl → Nat
   | .memoInit .. | .memoThunk .. => 6  -- after "const "
   | .fnPlain .. | .fnDirectLoop .. | .fnTrampoline .. => 9  -- after "function "
 
+private def internIdx (arr : Array String) (idx : Std.HashMap String Nat) (s : String) :
+    Nat × Array String × Std.HashMap String Nat :=
+  match idx.get? s with
+  | some i => (i, arr, idx)
+  | none   => let i := arr.size; (i, arr.push s, idx.insert s i)
+
 /-- Render a valid Source Map v3 JSON string for `fileName` given per-declaration line spans. -/
 private def buildSourceMapV3 (fileName : String) (totalLines : Nat) (spans : Array DeclMapSpan) : String := Id.run do
   let mut sources : Array String := #[]
@@ -814,24 +795,13 @@ private def buildSourceMapV3 (fileName : String) (totalLines : Nat) (spans : Arr
   -- Per-line mapping info: `(srcIdx, origLine, origCol, optNameIdx, optNameCol)`
   let mut lineMap : Std.HashMap Nat (Nat × Nat × Nat × Option Nat × Nat) := {}
   for sp in spans do
-    let sIdx ← match sourceIdx.get? sp.sourceFile with
-      | some i => pure i
-      | none   =>
-          let i := sources.size
-          sources := sources.push sp.sourceFile
-          sourceIdx := sourceIdx.insert sp.sourceFile i
-          pure i
-    let nIdx ← match nameIdx.get? sp.origName with
-      | some i => pure i
-      | none   =>
-          let i := names.size
-          names := names.push sp.origName
-          nameIdx := nameIdx.insert sp.origName i
-          pure i
+    let (sIdx, sources', sourceIdx') := internIdx sources sourceIdx sp.sourceFile
+    sources := sources'; sourceIdx := sourceIdx'
+    let (nIdx, names', nameIdx') := internIdx names nameIdx sp.origName
+    names := names'; nameIdx := nameIdx'
     lineMap := lineMap.insert sp.startLine (sIdx, sp.origLine, sp.origCol, some nIdx, sp.nameCol)
-    if sp.lineCount > 1 then
-      for off in [1:sp.lineCount] do
-        lineMap := lineMap.insert (sp.startLine + off) (sIdx, sp.origLine, sp.origCol, none, 0)
+    for off in [1:sp.lineCount] do
+      lineMap := lineMap.insert (sp.startLine + off) (sIdx, sp.origLine, sp.origCol, none, 0)
 
   let mut prevSrc : Int := 0
   let mut prevOrigLine : Int := 0
@@ -839,44 +809,19 @@ private def buildSourceMapV3 (fileName : String) (totalLines : Nat) (spans : Arr
   let mut prevName : Int := 0
   let mut mapChunks : Array String := #[]
   for lineIdx in [0:totalLines] do
-    if lineIdx > 0 then
-      mapChunks := mapChunks.push ";"
+    if lineIdx > 0 then mapChunks := mapChunks.push ";"
     if let some (sIdx, oLine, oCol, nIdx?, nameCol) := lineMap.get? lineIdx then
-      let sI := Int.ofNat sIdx
-      let lI := Int.ofNat oLine
-      let cI := Int.ofNat oCol
-      -- Segment 1 at generated column 0
-      let seg1 :=
-        encodeVlqInt 0 ++
-        encodeVlqInt (sI - prevSrc) ++
-        encodeVlqInt (lI - prevOrigLine) ++
-        encodeVlqInt (cI - prevOrigCol) ++
-        match nIdx? with
-        | some ni => encodeVlqInt (Int.ofNat ni - prevName)
-        | none    => ""
-      prevSrc := sI
-      prevOrigLine := lI
-      prevOrigCol := cI
-      if let some ni := nIdx? then
-        prevName := Int.ofNat ni
-      mapChunks := mapChunks.push seg1
-      -- Segment 2 at function/const identifier column on declaration header lines
+      let (sI, lI, cI) := (Int.ofNat sIdx, Int.ofNat oLine, Int.ofNat oCol)
+      let nameVlq := match nIdx? with | some ni => encodeVlqInt (Int.ofNat ni - prevName) | none => ""
+      mapChunks := mapChunks.push ("A" ++ encodeVlqInt (sI - prevSrc) ++ encodeVlqInt (lI - prevOrigLine) ++ encodeVlqInt (cI - prevOrigCol) ++ nameVlq)
+      prevSrc := sI; prevOrigLine := lI; prevOrigCol := cI
+      if let some ni := nIdx? then prevName := Int.ofNat ni
       if nameCol > 0 then
-        let seg2 :=
-          "," ++
-          encodeVlqInt (Int.ofNat nameCol) ++
-          encodeVlqInt 0 ++
-          encodeVlqInt 0 ++
-          encodeVlqInt 0 ++
-          match nIdx? with
-          | some _ => encodeVlqInt 0
-          | none   => ""
-        mapChunks := mapChunks.push seg2
+        mapChunks := mapChunks.push ("," ++ encodeVlqInt (Int.ofNat nameCol) ++ if nIdx?.isSome then "AAAA" else "AAA")
 
   let sourcesJson := String.intercalate "," (sources.toList.map jsStr)
   let namesJson := String.intercalate "," (names.toList.map jsStr)
-  let mappingsStr := joinChunks mapChunks
-  return s!"\{\"version\":3,\"file\":{jsStr fileName},\"sources\":[{sourcesJson}],\"names\":[{namesJson}],\"mappings\":{jsStr mappingsStr}}\n"
+  return s!"\{\"version\":3,\"file\":{jsStr fileName},\"sources\":[{sourcesJson}],\"names\":[{namesJson}],\"mappings\":{jsStr (joinChunks mapChunks)}}\n"
 
 def collectProgramExterns (env : Environment) (roots : List Name) :
     Except String (Array Name × List String) := do
@@ -966,20 +911,18 @@ def emitProgramWithSourceMap (env : Environment) (entries : List (Name × String
   let exportList := entries.map fun (n, s) =>
     let loc := c.js n
     if loc == s then s else s!"{loc} as {s}"
+  let sep := if min then "," else ", "
   let exportChunk :=
-    if min then "export{" ++ String.intercalate "," exportList ++ "};\n"
-    else "\nexport { " ++ String.intercalate ", " exportList ++ " };\n"
-  let externsChunk :=
-    if min then "export const __externs=[" ++ String.intercalate "," (externNames.map (s!"\"{·}\"")) ++ "];\n"
-    else "export const __externs = [" ++ String.intercalate ", " (externNames.map (s!"\"{·}\"")) ++ "];\n"
-  chunks := chunks.push exportChunk
-  chunks := chunks.push externsChunk
+    if min then s!"export\{{String.intercalate sep exportList}};\n"
+    else s!"\nexport \{ {String.intercalate sep exportList} };\n"
+  let eq := if min then "=" else " = "
+  let externsChunk := s!"export const __externs{eq}[{String.intercalate sep (externNames.map (s!"\"{·}\""))}];\n"
+  chunks := chunks.push exportChunk |>.push externsChunk
   curLine := curLine + countNewlines exportChunk + countNewlines externsChunk
   if let some mapUrl := sourceMapUrl? then
-    let mapComment := s!"//# sourceMappingURL={mapUrl}\n"
-    chunks := chunks.push mapComment
+    chunks := chunks.push s!"//# sourceMappingURL={mapUrl}\n"
     curLine := curLine + 1
-  let sourceMap := buildSourceMapV3 fileName curLine spans
+  let sourceMap := if wantMap then buildSourceMapV3 fileName curLine spans else ""
   return (joinChunks chunks, sourceMap, externNames)
 
 def emitProgramWithExterns (env : Environment) (entries : List (Name × String)) (min : Bool := false) :
@@ -1031,6 +974,44 @@ private def stepBraceDepth (d : Nat) : String ⊕ Char → Nat
   | .inr ')' | .inr ']' | .inr '}' => d - 1
   | _ => d
 
+private def stepExportMode (depth : Nat) (mode : ExportMode) (tok : String ⊕ Char)
+    (acc : Std.HashSet String) : Nat × ExportMode × Std.HashSet String :=
+  let addOpt := fun p => match p with | some s => acc.insert s | none => acc
+  match mode with
+  | .none =>
+      if depth == 0 && tok == .inl "export" then (0, .afterExport, acc)
+      else (stepBraceDepth depth tok, .none, acc)
+  | .afterExport =>
+      match tok with
+      | .inl "function" => (0, .afterFn, acc)
+      | .inl "async"    => (0, .afterAsync, acc)
+      | .inl "const" | .inl "let" | .inl "var" => (0, .inVar true, acc)
+      | .inr '{'        => (1, .inBrace true none, acc)
+      | _               => (stepBraceDepth depth tok, .none, acc)
+  | .afterAsync =>
+      match tok with
+      | .inl "function" => (0, .afterFn, acc)
+      | _               => (stepBraceDepth depth tok, .none, acc)
+  | .afterFn =>
+      match tok with
+      | .inl name => (0, .none, acc.insert name)
+      | _         => (stepBraceDepth depth tok, .none, acc)
+  | .inVar expectName =>
+      if depth != 0 then (stepBraceDepth depth tok, .inVar expectName, acc)
+      else match tok with
+        | .inr ';' => (0, .none, acc)
+        | .inr ',' => (0, .inVar true, acc)
+        | .inl "export" => if expectName then (0, .inVar false, acc.insert "export") else (0, .afterExport, acc)
+        | .inl name => (0, .inVar false, if expectName then acc.insert name else acc)
+        | _ => (stepBraceDepth 0 tok, .inVar expectName, acc)
+  | .inBrace expectName pending =>
+      match tok with
+      | .inr '}' => (0, .none, addOpt pending)
+      | .inr ',' => (depth, .inBrace true none, addOpt pending)
+      | .inl "as" => (depth, .inBrace true none, acc)
+      | .inl name => (depth, .inBrace false (if expectName then some name else pending), acc)
+      | _ => (depth, .inBrace expectName pending, acc)
+
 private def walkRtExports (fuel depth : Nat) (mode : ExportMode)
     (cs : List Char) (acc : Std.HashSet String) : Std.HashSet String :=
   match fuel with
@@ -1039,50 +1020,8 @@ private def walkRtExports (fuel depth : Nat) (mode : ExportMode)
       match nextRtToken (fuel + 1) cs with
       | (none, _) => acc
       | (some tok, rest) =>
-          let addOpt (a : Std.HashSet String) : Option String → Std.HashSet String
-            | some s => a.insert s
-            | none   => a
-          match mode with
-          | .none =>
-              if depth == 0 && tok == .inl "export" then walkRtExports fuel 0 .afterExport rest acc
-              else walkRtExports fuel (stepBraceDepth depth tok) .none rest acc
-          | .afterExport =>
-              match tok with
-              | .inl "function" => walkRtExports fuel 0 .afterFn rest acc
-              | .inl "async"    => walkRtExports fuel 0 .afterAsync rest acc
-              | .inl "const" | .inl "let" | .inl "var" => walkRtExports fuel 0 (.inVar true) rest acc
-              | .inr '{'        => walkRtExports fuel 1 (.inBrace true none) rest acc
-              | _               => walkRtExports fuel (stepBraceDepth depth tok) .none rest acc
-          | .afterAsync =>
-              match tok with
-              | .inl "function" => walkRtExports fuel 0 .afterFn rest acc
-              | _               => walkRtExports fuel (stepBraceDepth depth tok) .none rest acc
-          | .afterFn =>
-              match tok with
-              | .inl name => walkRtExports fuel 0 .none rest (acc.insert name)
-              | _         => walkRtExports fuel (stepBraceDepth depth tok) .none rest acc
-          | .inVar expectName =>
-              if depth == 0 then
-                match tok with
-                | .inr ';' => walkRtExports fuel 0 .none rest acc
-                | .inr ',' => walkRtExports fuel 0 (.inVar true) rest acc
-                | .inl "export" =>
-                    if expectName then walkRtExports fuel 0 (.inVar false) rest (acc.insert "export")
-                    else walkRtExports fuel 0 .afterExport rest acc
-                | .inl name =>
-                    walkRtExports fuel 0 (.inVar false) rest (if expectName then acc.insert name else acc)
-                | _ => walkRtExports fuel (stepBraceDepth 0 tok) (.inVar expectName) rest acc
-              else
-                walkRtExports fuel (stepBraceDepth depth tok) (.inVar expectName) rest acc
-          | .inBrace expectName pending =>
-              match tok with
-              | .inr '}' => walkRtExports fuel 0 .none rest (addOpt acc pending)
-              | .inr ',' => walkRtExports fuel depth (.inBrace true none) rest (addOpt acc pending)
-              | .inl "as" => walkRtExports fuel depth (.inBrace true none) rest acc
-              | .inl name =>
-                  if expectName then walkRtExports fuel depth (.inBrace false (some name)) rest acc
-                  else walkRtExports fuel depth (.inBrace false pending) rest acc
-              | _ => walkRtExports fuel depth (.inBrace expectName pending) rest acc
+          let (d', m', acc') := stepExportMode depth mode tok acc
+          walkRtExports fuel d' m' rest acc'
 
 /-- Parse named ESM exports (`export const`, `export function`, `export { ... }`) from a JS runtime module. -/
 def rtExports (rtSrc : String) : Std.HashSet String :=

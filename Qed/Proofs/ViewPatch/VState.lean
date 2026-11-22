@@ -135,4 +135,16 @@ theorem keyedRows_eq_of_keys_eq {σ msg : Type} {keys : σ → Array String} {ro
     have h2 : (rowsHtml s₂).length ≤ i := by rw [hr.1 s₂, hk]; omega
     rw [List.getElem?_eq_none h1, List.getElem?_eq_none h2]
 
+abbrev PatchViewPost {σ msg : Type} (f : Nat) (childNs : String) (parent : Dom.Node)
+    (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
+    (v : View σ msg) (s₂ : σ) (pre suf : List Dom.Node) (Sold : Nat → Prop) (a : DomArena msg)
+    (res : VState σ msg × DomArena msg) : Prop :=
+  let (vst', a') := res
+  a.nextId ≤ a'.nextId ∧ a'.nextId ≤ a.nextId + htmlNodeCount (View.render v s₂) ∧
+  (∀ m : Dom.Node, m ≠ parent → ¬Sold m.toNat → m.toNat < a.nextId → a'.get m = a.get m) ∧
+  a'.get parent = .element pns ptag pst pmg (pre ++ vst'.rootNode :: suf) ∧ (pre ++ vst'.rootNode :: suf).Nodup ∧
+  (∀ r ∈ pre ++ vst'.rootNode :: suf, r.toNat < a'.nextId) ∧
+  VStateValid f childNs v s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) vst' ∧
+  DomTreeAssocEquiv (readDomTree f a' vst'.rootNode) (specDom childNs (View.render v s₂))
+
 end Qed

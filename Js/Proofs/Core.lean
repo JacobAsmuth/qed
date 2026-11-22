@@ -64,15 +64,11 @@ theorem genGlobalName_inj {a b : Nat} (h : genGlobalName a = genGlobalName b) : 
 theorem v_ne_jp (x : VarId) (j : JoinPointId) : v x ≠ jp j := fun h => by have := congrArg String.toList h; simp [v, jp, String.toList_append] at this
 theorem list_take_ne_x_append_digits (m j i : Nat) : s!"x{m}" ≠ s!"_{jp ⟨j⟩}_{i}" := fun h => by have := congrArg String.toList h; simp [jp, String.toList_append] at this
 private theorem nat_repr_digits (n : Nat) : ∀ c ∈ n.repr.toList, c.isDigit = true := by simpa [← Nat.toString_eq_repr] using nat_toString_digits n
-private theorem inline_var_ne_inline_var {j₁ j₂ i₁ i₂ : Nat} (hne : j₁ ≠ j₂) : s!"_{jp ⟨j₁⟩}_{i₁}" ≠ s!"_{jp ⟨j₂⟩}_{i₂}" := fun h => by
-  have h_ : "_".toList = ['_'] := rfl; have hj : "j".toList = ['j'] := rfl; have hl := congrArg String.toList h
-  simp only [jp, toString_str_eq, Nat.toString_eq_repr, String.toList_append, h_, hj, List.cons_append, List.nil_append, List.cons.injEq, true_and, List.append_assoc] at hl
-  exact hne (nat_repr_inj (String.ext (digits_sep_inj (sep := '_') rfl (nat_repr_digits j₁) (nat_repr_digits j₂) hl).1))
-private theorem inline_var_inj_idx {j i₁ i₂ : Nat} (h : s!"_{jp ⟨j⟩}_{i₁}" = s!"_{jp ⟨j⟩}_{i₂}") : i₁ = i₂ := by
-  have h_ : "_".toList = ['_'] := rfl; have hj : "j".toList = ['j'] := rfl; have hl := congrArg String.toList h
-  simp only [jp, toString_str_eq, Nat.toString_eq_repr, String.toList_append, h_, hj, List.cons_append, List.nil_append, List.cons.injEq, true_and, List.append_assoc, List.append_cancel_left_eq] at hl; exact nat_repr_inj (String.ext hl)
 theorem inlineJpSlot_inj {j₁ j₂ : JoinPointId} {i₁ i₂ : Nat} (h : inlineJpSlot j₁ i₁ = inlineJpSlot j₂ i₂) : j₁.idx = j₂.idx ∧ i₁ = i₂ := by
-  by_cases hj : j₁.idx = j₂.idx; obtain ⟨_⟩ := j₁; obtain ⟨_⟩ := j₂; simp at hj; subst hj; exact ⟨rfl, inline_var_inj_idx h⟩; exact False.elim (inline_var_ne_inline_var hj (by simpa [inlineJpSlot] using h))
+  have h_ : "_".toList = ['_'] := rfl; have hj : "j".toList = ['j'] := rfl; have hl := congrArg String.toList h
+  simp only [inlineJpSlot, jp, toString_str_eq, Nat.toString_eq_repr, String.toList_append, h_, hj, List.cons_append, List.nil_append, List.cons.injEq, true_and, List.append_assoc] at hl
+  have ⟨h1, h2⟩ := digits_sep_inj (sep := '_') rfl (nat_repr_digits j₁.idx) (nat_repr_digits j₂.idx) hl
+  exact ⟨nat_repr_inj (String.ext h1), nat_repr_inj (String.ext h2)⟩
 theorem genGlobalName_disjoint_all (counter : Nat) (x : VarId) (j : JoinPointId) (i : Nat) (ext : String) :
     genGlobalName counter ≠ v x ∧ genGlobalName counter ≠ jp j ∧ genGlobalName counter ≠ inlineJpSlot j i ∧
     genGlobalName counter ≠ "$." ++ ext ∧ genGlobalName counter ≠ "__step" ∧ genGlobalName counter ≠ "__r" ∧ genGlobalName counter ≠ "__externs" := by
@@ -92,44 +88,29 @@ private def hasInternalIdentShape (s : String) : Bool :=
   | 120 :: _ | 106 :: _ | 36 :: _ | 95 :: 103 :: _ | 95 :: 106 :: _ => true
   | _ => false
 
-private def noInternalIdentShapes : List String → Bool
-  | [] => true
-  | w :: ws => !hasInternalIdentShape w && noInternalIdentShapes ws
-
-private theorem noInternalIdentShapes_mem : ∀ {ws : List String}, noInternalIdentShapes ws = true → ∀ w ∈ ws, hasInternalIdentShape w = false
-  | [], _, _, h => nomatch h
-  | w :: ws, hall, x, hx => by
-      dsimp only [noInternalIdentShapes] at hall
-      have ⟨h1, h2⟩ := Bool.and_eq_true_iff.1 hall
-      have hw : hasInternalIdentShape w = false := by cases h : hasInternalIdentShape w <;> simp [h] at h1; rfl
-      exact (List.mem_cons.1 hx).elim (fun e => e ▸ hw) (noInternalIdentShapes_mem h2 x)
-
 private theorem toByteArray_toList_append (a b : String) : (a ++ b).toByteArray.data.toList = a.toByteArray.data.toList ++ b.toByteArray.data.toList := by
   rw [String.toByteArray_append, ByteArray.data_append, Array.toList_append]
 
-private theorem hasInternalIdentShape_b1 (p t : String) (b : UInt8) (hp : p.toByteArray.data.toList = [b]) (hb : b = 120 ∨ b = 106 ∨ b = 36) :
+private theorem hasInternalIdentShape_append (p t : String) (hp : hasInternalIdentShape p = true) :
     hasInternalIdentShape (p ++ t) = true := by
-  unfold hasInternalIdentShape; rw [toByteArray_toList_append, hp]; rcases hb with rfl | rfl | rfl <;> rfl
-
-private theorem hasInternalIdentShape_b2 (p t : String) (b0 b1 : UInt8) (hp : p.toByteArray.data.toList = [b0, b1]) (hb : (b0 = 95 ∧ b1 = 103) ∨ (b0 = 95 ∧ b1 = 106) ∨ b0 = 36) :
-    hasInternalIdentShape (p ++ t) = true := by
-  unfold hasInternalIdentShape; rw [toByteArray_toList_append, hp]; rcases hb with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | rfl <;> rfl
+  unfold hasInternalIdentShape at hp ⊢; rw [toByteArray_toList_append]
+  split at hp <;> simp_all
 
 /-- Every compiler-generated JS identifier (`v`, `jp`, `genGlobalName`, `inlineJpSlot`, `"$." ++ ext`) is disjoint from all ECMAScript reserved words. -/
 theorem ident_ne_jsKeyword (x : VarId) (j : JoinPointId) (k i : Nat) (ext : String) :
     v x ∉ jsReservedWords ∧ jp j ∉ jsReservedWords ∧ genGlobalName k ∉ jsReservedWords ∧ inlineJpSlot j i ∉ jsReservedWords ∧ ("$." ++ ext) ∉ jsReservedWords := by
-  have hall : noInternalIdentShapes jsReservedWords = true := rfl
+  have hall : jsReservedWords.all (!hasInternalIdentShape ·) = true := rfl
   have noRes {s : String} (hs : hasInternalIdentShape s = true) : s ∉ jsReservedWords := fun hm => by
-    have := noInternalIdentShapes_mem hall s hm; rw [hs] at this; exact nomatch this
-  refine ⟨noRes (hasInternalIdentShape_b1 "x" _ 120 rfl (.inl rfl)),
-          noRes (hasInternalIdentShape_b1 "j" _ 106 rfl (.inr (.inl rfl))),
-          noRes (hasInternalIdentShape_b2 "_g" _ 95 103 rfl (.inl ⟨rfl, rfl⟩)),
+    have := List.all_eq_true.1 hall s hm; rw [hs] at this; exact nomatch this
+  refine ⟨noRes (hasInternalIdentShape_append "x" _ rfl),
+          noRes (hasInternalIdentShape_append "j" _ rfl),
+          noRes (hasInternalIdentShape_append "_g" _ rfl),
           noRes ?_,
-          noRes (hasInternalIdentShape_b2 "$." ext 36 46 rfl (.inr (.inr rfl)))⟩
+          noRes (hasInternalIdentShape_append "$." ext rfl)⟩
   change hasInternalIdentShape ("_" ++ ("j" ++ toString j.idx) ++ "_" ++ toString i) = true
   rw [show "_" ++ ("j" ++ toString j.idx) ++ "_" ++ toString i = "_j" ++ (toString j.idx ++ "_" ++ toString i) by
     simp only [String.append_assoc]; rfl]
-  exact hasInternalIdentShape_b2 "_j" _ 95 106 rfl (.inr (.inl ⟨rfl, rfl⟩))
+  exact hasInternalIdentShape_append "_j" _ rfl
 
 private def mangleStep (s : String) (c : Char) : String :=
   if c.isAlphanum then s.push c else if c == '.' || c == '_' then s.push '_' else s ++ s!"x{c.toNat}"
@@ -145,16 +126,11 @@ private theorem mangleStep_preserves (s : String) (c : Char) (hs : ∀ ch ∈ s.
 
 /-- Identifier hygiene for `Js.mangle`: every character in `mangle n` is strictly alphanumeric or `'_'`. -/
 theorem mangle_chars_safe (n : Name) : ∀ ch ∈ (mangle n).toList, ch.isAlphanum = true ∨ ch = '_' := by
-  have hloop : ∀ (cs : List Char) (s : String), (∀ ch ∈ s.toList, ch.isAlphanum = true ∨ ch = '_') →
-      ∀ ch ∈ (Id.run (forIn cs s fun c r => if c.isAlphanum = true then pure (.yield (r.push c)) else if c = '.' ∨ c = '_' then pure (.yield (r.push '_')) else pure (.yield (r ++ (toString "x" ++ c.toNat.repr))))).toList,
-        ch.isAlphanum = true ∨ ch = '_' := fun cs => by
-    induction cs with | nil => exact fun s hs => by simpa using hs | cons c _ ih =>
-      intro s hs; simp only [List.forIn_cons, Id.run, bind, pure]; by_cases hal : c.isAlphanum = true
-      · simp only [hal, ↓reduceIte]; exact ih _ (by simpa [mangleStep, hal] using mangleStep_preserves s c hs)
-      · by_cases hdu : c = '.' ∨ c = '_'
-        · simp only [hal, Bool.false_eq_true, ↓reduceIte, hdu]; exact ih _ (by simpa [show mangleStep s c = s.push '_' by rcases hdu with rfl | rfl <;> simp [mangleStep, hal]] using mangleStep_preserves s c hs)
-        · simp only [hal, Bool.false_eq_true, ↓reduceIte, hdu]; exact ih _ (by simpa [show mangleStep s c = s ++ (toString "x" ++ c.toNat.repr) by simp only [mangleStep, hal, Bool.false_eq_true, ↓reduceIte, Bool.or_eq_true, beq_iff_eq]; split; exact absurd ‹_› hdu; rfl] using mangleStep_preserves s c hs)
-  unfold mangle; simpa using hloop n.toString.toList "" (fun _ h => by simp at h)
+  have hfold : ∀ (cs : List Char) (s : String), (∀ ch ∈ s.toList, ch.isAlphanum = true ∨ ch = '_') →
+      ∀ ch ∈ (cs.foldl mangleStep s).toList, ch.isAlphanum = true ∨ ch = '_' := fun cs => by
+    induction cs with | nil => exact fun _ hs => hs | cons c _ ih => exact fun s hs => ih _ (mangleStep_preserves s c hs)
+  rw [show mangle n = n.toString.foldl mangleStep "" from rfl]
+  simpa [String.foldl] using hfold n.toString.toList "" (fun _ h => by simp at h)
 
 /-- Valid JS string literal interiors: no raw control characters (`< 32`), no unescaped `'"'`, and every `'\\'` starts an escape pair. -/
 inductive ValidJsStrBody : List Char → Prop where
@@ -182,29 +158,27 @@ private theorem hex_toDigitsCore_valid (n fuel : Nat) (ds : List Char) (hds : Va
     · exact hcons
     · exact ih (n / 16) _ hcons
 
+private theorem jsStrChar_valid (c : Char) : ValidJsStrBody (jsStrChar c).toList := by
+  unfold jsStrChar
+  by_cases h1 : c = '\\'; · subst h1; exact .esc (by decide) .nil
+  by_cases h2 : c = '"'; · subst h2; exact .esc (by decide) .nil
+  by_cases h3 : c = '\n'; · subst h3; exact .esc (by decide) .nil
+  by_cases h4 : c = '\r'; · subst h4; exact .esc (by decide) .nil
+  by_cases h5 : c = '\t'; · subst h5; exact .esc (by decide) .nil
+  split <;> try contradiction
+  split
+  · rw [String.toList_append]
+    have hd : ValidJsStrBody (Nat.toDigits 16 c.toNat) := hex_toDigitsCore_valid c.toNat (c.toNat + 1) [] .nil
+    have hbody : ValidJsStrBody (if (Nat.toDigits 16 c.toNat).length == 1 then '0' :: Nat.toDigits 16 c.toNat else Nat.toDigits 16 c.toNat) := by
+      split; exact .plain (c := '0') (by decide) (by decide) (by decide) hd; exact hd
+    simpa only [String.toList_ofList, show "\\x".toList = ['\\', 'x'] from rfl, List.cons_append, List.nil_append] using ValidJsStrBody.esc (c := 'x') (by decide) hbody
+  · rw [String.toList_singleton]; exact .plain (by omega) h2 h1 .nil
+
 /-- Every string produced by `Js.jsStr s` has the form `"\"" ++ body ++ "\""` where `body` satisfies `ValidJsStrBody`. -/
 theorem jsStr_safe (s : String) : ∃ body : String, jsStr s = "\"" ++ body ++ "\"" ∧ ValidJsStrBody body.toList := by
-  let step : String → Char → String := fun acc c => acc ++ (match c with
-    | '\\' => "\\\\" | '"' => "\\\"" | '\n' => "\\n" | '\r' => "\\r" | '\t' => "\\t"
-    | c => if c.toNat < 32 then let h := Nat.toDigits 16 c.toNat; "\\x" ++ String.ofList (if h.length == 1 then '0' :: h else h) else String.singleton c)
-  have hstep : ∀ acc c, ValidJsStrBody acc.toList → ValidJsStrBody (step acc c).toList := fun acc c hacc => by
-    dsimp only [step]; rw [String.toList_append]; apply ValidJsStrBody.append hacc
-    by_cases h1 : c = '\\'; · subst h1; exact .esc (by decide) .nil
-    by_cases h2 : c = '"'; · subst h2; exact .esc (by decide) .nil
-    by_cases h3 : c = '\n'; · subst h3; exact .esc (by decide) .nil
-    by_cases h4 : c = '\r'; · subst h4; exact .esc (by decide) .nil
-    by_cases h5 : c = '\t'; · subst h5; exact .esc (by decide) .nil
-    split <;> try contradiction
-    split
-    · rw [String.toList_append]
-      have hd : ValidJsStrBody (Nat.toDigits 16 c.toNat) := hex_toDigitsCore_valid c.toNat (c.toNat + 1) [] .nil
-      have hbody : ValidJsStrBody (if (Nat.toDigits 16 c.toNat).length == 1 then '0' :: Nat.toDigits 16 c.toNat else Nat.toDigits 16 c.toNat) := by
-        split; exact .plain (c := '0') (by decide) (by decide) (by decide) hd; exact hd
-      simpa only [String.toList_ofList, show "\\x".toList = ['\\', 'x'] from rfl, List.cons_append, List.nil_append] using ValidJsStrBody.esc (c := 'x') (by decide) hbody
-    · rw [String.toList_singleton]; exact .plain (by omega) h2 h1 .nil
-  have hfold : ∀ (cs : List Char) (acc : String), ValidJsStrBody acc.toList → ValidJsStrBody (cs.foldl step acc).toList := fun cs => by
-    induction cs with | nil => exact fun _ ha => ha | cons c _ ih => exact fun acc ha => ih _ (hstep acc c ha)
-  exact ⟨s.foldl step "", rfl, by simpa [jsStr, String.foldl] using hfold s.toList "" .nil⟩
+  have hfold : ∀ (cs : List Char) (acc : String), ValidJsStrBody acc.toList → ValidJsStrBody (cs.foldl (fun a c => a ++ jsStrChar c) acc).toList := fun cs => by
+    induction cs with | nil => exact fun _ ha => ha | cons c _ ih => exact fun acc ha => ih _ (by rw [String.toList_append]; exact ha.append (jsStrChar_valid c))
+  exact ⟨s.foldl (fun a c => a ++ jsStrChar c) "", rfl, by simpa [jsStr, String.foldl] using hfold s.toList "" .nil⟩
 
 def assignProgramNamesStep (st : Std.HashMap Name String × Nat) (name : Name) (entryMap : Std.HashMap Name String) (isFdecl : Bool) : Std.HashMap Name String × Nat :=
   if isFdecl then match entryMap.get? name with | some s => (st.1.insert name s, st.2) | none => (st.1.insert name (genGlobalName st.2), st.2 + 1) else st
@@ -616,28 +590,17 @@ end
 @[simp] private theorem stmtsTailSafe_nil {a : Bool} : stmtsTailSafe a [] := trivial
 @[simp] private theorem stmtsTailSafe_cons_iff {a : Bool} {s : JsStmt} {ss : List JsStmt} : stmtsTailSafe a (s :: ss) ↔ stmtTailSafe a s ∧ stmtsTailSafe a ss := Iff.rfl
 @[simp] private theorem stmtsTailSafe_append_iff {a : Bool} {s₁ s₂ : List JsStmt} : stmtsTailSafe a (s₁ ++ s₂) ↔ stmtsTailSafe a s₁ ∧ stmtsTailSafe a s₂ := by induction s₁ with | nil => simp [stmtsTailSafe] | cons _ _ ih => simp [stmtsTailSafe, ih, and_assoc]
-mutual
-private theorem stmtsTailSafe_mono : ∀ {s : List JsStmt}, stmtsTailSafe false s → stmtsTailSafe true s | [], _ => trivial | _ :: _, h => ⟨stmtTailSafe_mono h.1, stmtsTailSafe_mono h.2⟩
-private theorem stmtTailSafe_mono : ∀ {st : JsStmt}, stmtTailSafe false st → stmtTailSafe true st | s, h => by cases s with | tailContinue => simp [stmtTailSafe] at h | labeledBlock => exact stmtsTailSafe_mono h | constArrow => exact h | switchStmt => exact armsTailSafe_mono h | _ => simp [stmtTailSafe]
-private theorem armsTailSafe_mono : ∀ {arms : List JsSwitchArm}, armsTailSafe false arms → armsTailSafe true arms | [], _ => trivial | .caseArm _ _ :: _, h | .defaultArm _ :: _, h => ⟨stmtsTailSafe_mono h.1, armsTailSafe_mono h.2⟩
-end
 private theorem hasSelfTailAltsAux_mem {f : Name} {onlyRec active : Bool} : ∀ {ls : List Alt}, hasSelfTailAltsAux f onlyRec active ls = false → ∀ arm ∈ ls, hasSelfTailAux f onlyRec active (altBody arm) = false
   | [], _, _, h => nomatch h | arm :: _, h, a, ha => have h' : hasSelfTailAux f onlyRec active (altBody arm) = false ∧ hasSelfTailAltsAux f onlyRec active _ = false := by cases arm <;> simpa [hasSelfTailAltsAux, Bool.or_eq_false_iff, altBody] using h
       (List.mem_cons.1 ha).elim (fun e => e ▸ h'.1) (hasSelfTailAltsAux_mem h'.2 a)
-
-private theorem lowerBody_vdecl_nonFap (c : Ctx) (x : VarId) (ty : IRType) (e : IR.Expr) (cont : FnBody) (f : Name)
-    (hne : ∀ g ys, e ≠ .fap g ys) :
-    lowerBody c (.vdecl x ty e cont) = .letVar (v x) (lowerExpr c ty e) :: lowerBody c cont ∧
-    (∀ a, hasSelfTailAux f true a (.vdecl x ty e cont) = hasSelfTailAux f true a cont) := by
-  cases e with | fap g ys => exact absurd rfl (hne g ys) | _ => exact ⟨rfl, fun _ => rfl⟩
 
 /-- Soundness of `hasJpSelfTail`: whenever `hasJpSelfTail f b = false`, no `.constArrow` closure generated by `lowerBody c b` ever contains an illegal `.tailContinue`. -/
 theorem noTailCont_of_hasJpSelfTail_false (f : Name) (b : FnBody) (c : Ctx) (hself : c.selfFn = none ∨ c.selfFn = some f) :
     (hasSelfTailAux f true true b = false → stmtsTailSafe false (lowerBody c b)) ∧ (hasSelfTailAux f true false b = false → stmtsTailSafe true (lowerBody c b)) := by
   revert c; refine fnBody_ind (fun b => ∀ c, c.selfFn = none ∨ c.selfFn = some f → (hasSelfTailAux f true true b = false → stmtsTailSafe false (lowerBody c b)) ∧ (hasSelfTailAux f true false b = false → stmtsTailSafe true (lowerBody c b))) (fun b hb c hself => ?_) b; cases b with
   | vdecl x ty e cont =>
-      by_cases hfap : ∃ g ys, e = .fap g ys
-      · rcases hfap with ⟨g, ys, rfl⟩
+      cases e with
+      | fap g ys =>
         refine ⟨fun h => ?_, fun h => ?_⟩
         · dsimp only [hasSelfTailAux] at h
           have ⟨h1, h2⟩ := Bool.or_eq_false_iff.1 h
@@ -651,9 +614,7 @@ theorem noTailCont_of_hasJpSelfTail_false (f : Name) (b : FnBody) (c : Ctx) (hse
           dsimp only [lowerBody]; rw [if_neg hnotSelf]; exact ⟨trivial, (hb c hself).1 h2⟩
         · dsimp only [hasSelfTailAux, Bool.false_and, Bool.false_or] at h
           dsimp only [lowerBody]; split; (split; exact ⟨rfl, trivial⟩; exact ⟨trivial, trivial⟩); exact ⟨trivial, (hb c hself).2 h⟩
-      · have ⟨hlow, hst⟩ := lowerBody_vdecl_nonFap c x ty e cont f fun g ys he => hfap ⟨g, ys, he⟩
-        rw [hlow, hst true, hst false]
-        exact ⟨fun h => ⟨trivial, (hb c hself).1 h⟩, fun h => ⟨trivial, (hb c hself).2 h⟩⟩
+      | _ => exact ⟨fun h => ⟨trivial, (hb c hself).1 h⟩, fun h => ⟨trivial, (hb c hself).2 h⟩⟩
   | jdecl j xs val _ =>
       have hself' : ({ c with inlineJps := c.inlineJps.insert j.idx xs } : Ctx).selfFn = none ∨ ({ c with inlineJps := c.inlineJps.insert j.idx xs } : Ctx).selfFn = some f := hself
       have hinline : ∀ a (s1 s2 : List JsStmt), stmtsTailSafe a s1 → stmtsTailSafe a s2 →

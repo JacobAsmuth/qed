@@ -102,11 +102,6 @@ mutual
     | k :: ks => View.DomClean k ∧ View.DomCleanEach ks
 end
 
-theorem View.renderEach_append {σ msg : Type} (s : σ) :
-    ∀ (xs ys : List (View σ msg)), View.renderEach (xs ++ ys) s = View.renderEach xs s ++ View.renderEach ys s
-  | [], _ => rfl
-  | _ :: rest, ys => by simp [View.renderEach, View.renderEach_append s rest ys]
-
 mutual
   theorem View.DomClean_render {σ msg : Type} :
       ∀ {v : View σ msg}, View.DomClean v → ∀ s, (View.render v s).DomClean = true
@@ -305,36 +300,26 @@ private theorem normalKey_slotUpdate_iff {msg : Type} {a b : Attr msg} {k : Stri
         (k = "value" ∧ sl = .val) ∨ (k = "checked" ∧ sl = .chk) ∨
         (k ≠ "value" ∧ k ≠ "checked" ∧ sl = .attr k)) := fun {x} hxk hxN => by
     cases x with
-    | attr kx _ =>
+    | attr kx _ | flag kx _ =>
         simp only [Attr.key?, Option.some.injEq] at hxk; subst hxk
-        have hnc : kx ≠ "checked" := fun h => by subst h; simp [Attr.NormalKey] at hxN
         cases sl with
-        | val => simp [Attr.slotUpdate?, beq_iff_eq, hnc]
         | attr k' =>
             dsimp only [Attr.slotUpdate?]; split
-            · rename_i h; simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at h; rcases h with ⟨hnv, rfl⟩; simp [hnv, hnc]
+            · rename_i h; simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at h
+              rcases h with ⟨h1, rfl⟩
+              first | (have hnc : kx ≠ "checked" := fun h => by subst h; exact Bool.noConfusion hxN
+                       simp [h1, hnc])
+                    | (have hnv : kx ≠ "value" := fun h => by subst h; exact Bool.noConfusion hxN
+                       simp [h1, hnv])
             · rename_i h; simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq, not_and] at h
-              refine ⟨(fun hc => nomatch hc), fun hr => ?_⟩
-              rcases hr with ⟨_, hc⟩ | ⟨_, hc⟩ | ⟨hnv, _, hEq⟩
-              · cases hc
-              · cases hc
-              · exact absurd (AttrSlot.attr.inj hEq).symm (h hnv)
-        | chk | click _ | input _ => simp [Attr.slotUpdate?, hnc]
-    | flag kx _ =>
-        simp only [Attr.key?, Option.some.injEq] at hxk; subst hxk
-        have hnv : kx ≠ "value" := fun h => by subst h; simp [Attr.NormalKey] at hxN
-        cases sl with
-        | chk => simp [Attr.slotUpdate?, beq_iff_eq, hnv]
-        | attr k' =>
-            dsimp only [Attr.slotUpdate?]; split
-            · rename_i h; simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at h; rcases h with ⟨hnc, rfl⟩; simp [hnv, hnc]
-            · rename_i h; simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq, not_and] at h
-              refine ⟨(fun hc => nomatch hc), fun hr => ?_⟩
-              rcases hr with ⟨_, hc⟩ | ⟨_, hc⟩ | ⟨_, hnc, hEq⟩
-              · cases hc
-              · cases hc
-              · exact absurd (AttrSlot.attr.inj hEq).symm (h hnc)
-        | val | click _ | input _ => simp [Attr.slotUpdate?, hnv]
+              exact ⟨(fun hc => nomatch hc), fun
+                | .inl ⟨_, hc⟩ | .inr (.inl ⟨_, hc⟩) => nomatch hc
+                | .inr (.inr ⟨hnv, hnc, hEq⟩) => absurd (AttrSlot.attr.inj hEq).symm (by first | exact h hnv | exact h hnc)⟩
+        | val | chk | click _ | input _ =>
+            first | (have hnc : kx ≠ "checked" := fun h => by subst h; exact Bool.noConfusion hxN
+                     simp [Attr.slotUpdate?, beq_iff_eq, hnc])
+                  | (have hnv : kx ≠ "value" := fun h => by subst h; exact Bool.noConfusion hxN
+                     simp [Attr.slotUpdate?, beq_iff_eq, hnv])
     | _ => simp [Attr.key?] at hxk
   exact (hslot hb hbN).2 ∘ (hslot ha haN).1
 
@@ -350,8 +335,8 @@ private theorem dedupAttrs_foldl_equiv {msg : Type} :
           by_cases hany : xs.any (·.key? == some k) = true
           · simp only [dedupAttrs, hx, hany, ↓reduceIte, List.foldl_cons]
             rcases List.any_eq_true.1 hany with ⟨y, hy, hyk⟩
-            have ih := ElemStateEquiv_iff.1 (dedupAttrs_foldl_equiv xs cur hn.2)
-            refine ElemStateEquiv_iff.2 fun sl => (ih sl).trans (foldl_stepSpecAttr_read sl xs cur (stepSpecAttr cur x) ?_)
+            have ih := dedupAttrs_foldl_equiv xs cur hn.2
+            intro sl; refine (ih sl).trans (foldl_stepSpecAttr_read sl xs cur (stepSpecAttr cur x) ?_)
             cases hxu : x.slotUpdate? sl with
             | some _ => exact .inl ⟨y, hy, normalKey_slotUpdate_iff hx (beq_iff_eq.1 hyk) hn.1 ((List.all_eq_true.1 hn.2) y hy) sl (by rw [hxu]; rfl)⟩
             | none => exact .inr (by rw [read_stepSpecAttr, hxu]; rfl)
@@ -412,6 +397,11 @@ private theorem nonCls_read_last {σ msg : Type} (sl : AttrSlot) (s : σ) :
           | none =>
               simp only [lastDynSlot?, Option.orElse, hr] at hs
               simp only [dynValNoLaterStat, Bool.and_eq_true, List.all_eq_true] at hns
+              have hslKey : (sl = .val ∧ k' = "value") ∨ (∃ k, sl = .attr k ∧ k' = k) := by
+                cases sl <;> simp only [Attr.slotUpdate?] at hs <;> first | (split at hs <;> first | (rename_i h; simp only [Bool.and_eq_true, beq_iff_eq] at h; first | exact .inl ⟨rfl, h⟩ | exact .inr ⟨_, rfl, h.2⟩) | cases hs) | cases hs
+              have hbn : ∀ (x : Attr msg), x.key? ≠ some k' → (match x with | .cls _ | .localCell .. => False | _ => True) → x.slotUpdate? sl = none := fun x hx hok => by
+                rcases hslKey with ⟨rfl, rfl⟩ | ⟨k, rfl, rfl⟩ <;> cases x <;> simp only [Attr.slotUpdate?] <;>
+                  first | exact False.elim hok | rfl | (rw [if_neg]; simp only [Bool.and_eq_true, beq_iff_eq]; first | (intro h; exact hx (congrArg some h)) | (intro h; exact hx (congrArg some h.2)))
               have hpres : ∀ (ys : List (VAttr σ msg)) (cur : SpecElemState msg),
                   noBind ys = true → ownsChildren (ys.map (VAttr.eval s)) = false → lastDynSlot? sl s ys = none →
                   (∀ w ∈ ys, (match w with | .stat a => a.key? != some k' | _ => true) = true) →
@@ -429,41 +419,14 @@ private theorem nonCls_read_last {σ msg : Type} (sl : AttrSlot) (s : σ) :
                         | some _ => simp only [lastDynSlot?, Option.orElse, hrw, reduceCtorEq] at hnw
                         | none =>
                             simp only [lastDynSlot?, Option.orElse, hrw] at hnw
-                            have iht := ihw (stepSpecAttr cur (.attr kw (gw s))) hnbw.2 hownwR hrw (fun u hu => hstw u (.tail _ hu))
-                            exact iht.trans (by rw [read_stepSpecAttr, hnw]; rfl)
+                            exact (ihw (stepSpecAttr cur (.attr kw (gw s))) hnbw.2 hownwR hrw (fun u hu => hstw u (.tail _ hu))).trans (by rw [read_stepSpecAttr, hnw]; rfl)
                     | stat b =>
                         have hb : b.key? ≠ some k' := bne_iff_ne.1 (hstw (.stat b) (.head _))
                         cases b with
                         | cls _ => exact ihw cur hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))
                         | localCell _ _ _ _ _ => simp only [ownsChildren, List.map_cons, VAttr.eval, List.any_cons, Bool.true_or, Bool.true_eq_false] at hownw
-                        | attr kb vb =>
-                            have hbn : (@Attr.attr msg kb vb).slotUpdate? sl = none := by
-                              cases sl with
-                              | val =>
-                                  have hk'v : k' = "value" := by simp only [Attr.slotUpdate?] at hs; split at hs <;> simp_all
-                                  simp only [Attr.slotUpdate?, beq_eq_false_iff_ne.2 fun h => hb (congrArg some (h.trans hk'v.symm))]; rfl
-                              | attr k =>
-                                  have hk'eq : k' = k := by simp only [Attr.slotUpdate?] at hs; split at hs <;> simp_all
-                                  have hne : (kb == k) = false := beq_eq_false_iff_ne.2 fun h => hb (congrArg some (h.trans hk'eq.symm))
-                                  simp [Attr.slotUpdate?, hne]
-                              | chk | click _ | input _ => simp [Attr.slotUpdate?] at hs
-                            exact (ihw (stepSpecAttr cur _) hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))).trans (by dsimp only [VAttr.eval]; rw [read_stepSpecAttr, hbn]; rfl)
-                        | flag kb pb =>
-                            have hbn : (@Attr.flag msg kb pb).slotUpdate? sl = none := by
-                              cases sl with
-                              | val => rfl
-                              | attr k =>
-                                  have hk'eq : k' = k := by simp only [Attr.slotUpdate?] at hs; split at hs <;> simp_all
-                                  have hne : (kb == k) = false := beq_eq_false_iff_ne.2 fun h => hb (congrArg some (h.trans hk'eq.symm))
-                                  simp [Attr.slotUpdate?, hne]
-                              | chk | click _ | input _ => simp [Attr.slotUpdate?] at hs
-                            exact (ihw (stepSpecAttr cur _) hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))).trans (by dsimp only [VAttr.eval]; rw [read_stepSpecAttr, hbn]; rfl)
-                        | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ =>
-                            have hbn : ∀ (x : Attr msg), (match x with | .cls _ | .localCell .. | .attr .. | .flag .. => False | _ => True) → x.slotUpdate? sl = none := fun x hx => by
-                              cases sl with
-                              | val | attr _ => cases x <;> first | exact False.elim hx | rfl
-                              | chk | click _ | input _ => simp [Attr.slotUpdate?] at hs
-                            exact (ihw (stepSpecAttr cur _) hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))).trans (by dsimp only [VAttr.eval]; rw [read_stepSpecAttr, hbn _ trivial]; rfl)
+                        | attr _ _ | flag _ _ | key _ | on _ _ | onValue _ _ | signalBind _ | signalAttr _ _ _ | signalOn _ _ _ =>
+                            exact (ihw (stepSpecAttr cur _) hnbw.2 hownwR hnw (fun u hu => hstw u (.tail _ hu))).trans (by dsimp only [VAttr.eval]; rw [read_stepSpecAttr, hbn _ hb trivial]; rfl)
               have hp := hpres rest (stepSpecAttr st (.attr k' (g s))) hnb.2 hownR hr (fun w hw => hns.1 w hw)
               exact hp.trans (by rw [read_stepSpecAttr, hs]; rfl)
 
@@ -516,8 +479,9 @@ theorem applyDynAttrsM_spec {σ msg : Type} (a : DomArena msg) (node : Dom.Node)
   dsimp only [applyDynAttrsM]
   split
   · have hm := ElemClean_applyAttrsM a node ns tag st mg cs (attrs.map (VAttr.eval s₂)) hElClean (hclean.2.1 s₂)
+    have ⟨hnx, hne⟩ := applyAttrsM_preserves (a.set node (.element ns tag st mg cs)) node (attrs.map (VAttr.eval s₂))
     rcases hm with ⟨st', hget, heqv', hElClean'⟩
-    exact ⟨applyAttrsM_nextId a node _ _, fun m hm => applyAttrsM_get_ne a node _ _ m hm,
+    exact ⟨hnx, fun m hm => (hne m hm).trans (DomArena.get_set_ne _ _ hm),
       st', (normalizeAttrs (attrs.map (VAttr.eval s₂))).filterMap managedAttrName, hget, hElClean',
       heqv', fun nm hnm => List.contains_iff_mem.2 hnm⟩
   · rename_i hnotBind
@@ -563,16 +527,12 @@ theorem applyDynAttrsM_spec {σ msg : Type} (a : DomArena msg) (node : Dom.Node)
       simp only [evalSpecAttrs, normalizeAttrs, List.foldl_append]; dsimp only [base]; congr 1
     have hev2 : evalSpecAttrs (attrs.map (VAttr.eval s₂)) =
         (dedupAttrs ((attrs.map (VAttr.eval s₂)).filter (fun | .cls _ => false | _ => true))).foldl stepSpecAttr base := by
-      simp only [evalSpecAttrs, normalizeAttrs, List.foldl_append]; dsimp only [base]; congr 1
-      refine congrArg (fun (xs : List String) => List.foldl stepSpecAttr {}
-        (let cl := xs.filter (· != ""); if cl.isEmpty then [] else [Attr.cls (String.intercalate " " cl)])) ?_
-      exact (congrArg (fun f => (attrs.map (VAttr.eval s₂)).filterMap f) (funext fun x => by cases x <;> rfl)).trans
-        ((filterMap_cls_eq_of_noBind s₁ s₂ attrs hnb).symm.trans
-          (congrArg (fun f => (attrs.map (VAttr.eval s₁)).filterMap f) (funext fun x => by cases x <;> rfl)))
-    have hstepEq := ElemStateEquiv_iff.1 (stepDynAttr_equiv s₂ attrs (heq.trans (hev1 ▸ hdd1)))
+      simp only [evalSpecAttrs, normalizeAttrs, List.foldl_append]; dsimp only [base]
+      erw [← filterMap_cls_eq_of_noBind s₁ s₂ attrs hnb]; rfl
+    have hstepEq := stepDynAttr_equiv s₂ attrs (heq.trans (hev1 ▸ hdd1))
     refine ⟨rfl, fun m hm => DomArena.get_set_ne _ _ hm, st', mg, DomArena.get_set_self _ _ _, hEl',
-      ElemStateEquiv_iff.2 fun sl => ?_, fun nm hnm => hmg nm (hmgEq ▸ hnm)⟩
-    rw [hstepEq sl, stepDynAttr_read sl s₂ attrs _ hnb, hev2, ElemStateEquiv_iff.1 hdd2 sl]
+      fun sl => ?_, fun nm hnm => hmg nm (hmgEq ▸ hnm)⟩
+    rw [hstepEq sl, stepDynAttr_read sl s₂ attrs _ hnb, hev2, hdd2 sl]
     cases hr : lastDynSlot? sl s₂ attrs with
     | some v => exact (nonCls_read_last sl s₂ attrs base v hnb hclean.2.2.2 (hclean.1 s₂) hr).symm
     | none => exact nonCls_read_none sl s₁ s₂ attrs base base hnb hr rfl

@@ -47,31 +47,23 @@ private def parseJsFlags : List String → JsCliFlags → Except String (JsCliFl
       let (f', rem) ← parseJsFlags rest f
       return (f', a :: rem)
 
-private def splitAlso : List String → List String × Option (String × List String)
-  | [] => ([], none)
-  | "--also" :: out2 :: "--" :: entries2 => ([], some (out2, entries2))
-  | a :: rest =>
-      let (h, also) := splitAlso rest
-      (a :: h, also)
-
 private def writeJsBundle (env : Environment) (avail? : Option (Std.HashSet String))
     (outPath : String) (entryArgs : List String) (min : Bool) (sourceMap : Bool := false) : IO Unit := do
   let entries := entryArgs.map parseEntry
   if entries.isEmpty then throw (IO.userError "no entry decls given (after `--`)")
   let p : System.FilePath := outPath
   if let some dir := p.parent then IO.FS.createDirAll dir
+  let fileName := p.fileName.getD "app.mjs"
+  let mapFileName := fileName ++ ".map"
+  let (js, smJson, externs) ←
+    if sourceMap then orThrow (Js.emitProgramWithSourceMap env entries min fileName (some mapFileName))
+    else let (js, ex) ← orThrow (Js.emitProgramWithExterns env entries min); pure (js, "", ex)
+  if let some avail := avail? then orThrow (Js.checkRtExterns avail externs)
+  IO.FS.writeFile p js
   if sourceMap then
-    let fileName := p.fileName.getD "app.mjs"
-    let mapFileName := fileName ++ ".map"
-    let (js, smJson, externs) ← orThrow (Js.emitProgramWithSourceMap env entries min fileName (some mapFileName))
-    if let some avail := avail? then orThrow (Js.checkRtExterns avail externs)
-    IO.FS.writeFile p js
     IO.FS.writeFile (System.FilePath.mk (outPath ++ ".map")) smJson
     IO.println s!"wrote {outPath} ({js.length} bytes) + {mapFileName} ({smJson.length} bytes)"
   else
-    let (js, externs) ← orThrow (Js.emitProgramWithExterns env entries min)
-    if let some avail := avail? then orThrow (Js.checkRtExterns avail externs)
-    IO.FS.writeFile p js
     IO.println s!"wrote {outPath} ({js.length} bytes)"
 
 private def tryImport (mods : List String) : IO (Option Environment) :=
@@ -88,9 +80,7 @@ private partial def verifyModBatch (mods : List String) (skipFw : Bool) : IO Nat
         let mid := mods.length / 2
         let tL ← IO.asTask (verifyModBatch (mods.take mid) skipFw)
         let tR ← IO.asTask (verifyModBatch (mods.drop mid) true)
-        let cL ← match ← IO.wait tL with | .ok n => pure n | .error e => throw e
-        let cR ← match ← IO.wait tR with | .ok n => pure n | .error e => throw e
-        return cL + cR
+        return (← IO.ofExcept (← IO.wait tL)) + (← IO.ofExcept (← IO.wait tR))
 
 private unsafe def evalCssForAppUnsafe (env : Environment) (appName : Name) : IO (String × List String) := do
   let m : MetaM (String × List String) := do
@@ -168,13 +158,6 @@ def main (args : List String) : IO Unit := do
     if let some dir := p.parent then IO.FS.createDirAll dir
     IO.FS.writeFile p (manifest.render ++ "\n")
     IO.println s!"wrote {outJson} (mode={manifest.mode}, secrets={manifest.secrets.length}, dbs={manifest.databases.length}, egress={manifest.egress.length}, auth={manifest.auth?.isSome})"
-  | "--emit-css" :: outCss :: rest =>
-    let (mods, entryArgs) := splitDashes rest
-    if mods.isEmpty || entryArgs.isEmpty then
-      throw (IO.userError "usage: qedjs --emit-css <out.css> <module>… -- <appDecl>")
-    let env ← loadEnv mods
-    let appName := (parseEntry entryArgs.head!).1
-    emitCssForApp env outCss appName
   | "--verify-env" :: rest =>
     let skipFw := rest.contains "--skip-qed"
     let mods := rest.filter (· ≠ "--skip-qed")
@@ -188,9 +171,7 @@ def main (args : List String) : IO Unit := do
             else IO.asTask (verifyModBatch fwMods false)
           let userSkipFw := skipFw || !fwMods.isEmpty
           let tUsr ← IO.asTask (verifyModBatch userMods userSkipFw)
-          let fwTotal ← match ← IO.wait tFw with | .ok n => pure n | .error e => throw e
-          let usrTotal ← match ← IO.wait tUsr with | .ok n => pure n | .error e => throw e
-          pure (fwTotal + usrTotal)
+          pure ((← IO.ofExcept (← IO.wait tFw)) + (← IO.ofExcept (← IO.wait tUsr)))
     IO.println s!"kernel-verified {total} declarations across {mods.length} root module(s)"
   | "--check-externs" :: rtPath :: rest =>
     let (mods, entryArgs) := splitDashes rest
@@ -201,18 +182,15 @@ def main (args : List String) : IO Unit := do
     orThrow (Js.checkRtExterns avail externs)
   | _ =>
     let (flags, cleanArgs) ← orThrow (parseJsFlags args {})
-    let (head, restWithAlso) := splitDashes cleanArgs
-    let (rest, also?) := splitAlso restWithAlso
+    let (head, rest) := splitDashes cleanArgs
     match head with
     | out :: mods =>
       let env ← loadEnv mods
       let avail? ← flags.rt?.mapM fun rtPath => return Js.rtExports (← IO.FS.readFile rtPath)
       writeJsBundle env avail? out rest flags.min flags.sourceMap
-      if let some (out2, entries2) := also? then
-        writeJsBundle env avail? out2 entries2 flags.min flags.sourceMap
       if let some (cssOut, appDecl) := flags.css? then
         try
           emitCssForApp env cssOut (parseEntry appDecl).1
         catch _ =>
           IO.println "HAS_CSS:0"
-    | [] => throw (IO.userError "usage: qedjs [--min] [--sourcemap] [--rt <rt.mjs>] [--css <out.css> <appDecl>] <out.mjs> <module>… -- <decl>[:<export>]… [--also <out2.mjs> -- <decl>…]")
+    | [] => throw (IO.userError "usage: qedjs [--min] [--sourcemap] [--rt <rt.mjs>] [--css <out.css> <appDecl>] <out.mjs> <module>… -- <decl>[:<export>]…")

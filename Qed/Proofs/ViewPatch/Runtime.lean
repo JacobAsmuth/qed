@@ -52,17 +52,7 @@ theorem seedRowsM_spec {msg : Type} (inst : String) (rowSig : Nat → Array (Str
     res.2.signals = d.2.1.toList.foldl (fun acc (nm, v) => setAssoc nm v acc) a.signals ∧
     res.2.sigEvents = d.2.2.toList.foldl (fun acc (nm, m) => setAssoc nm m acc) a.sigEvents := by
   have hs := diffRowSigs_sound rowSig rowEv inst newMarks oldMarks oldSigs hmark 0 #[] #[] #[] (Nat.zero_le _) rfl (fun _ h => nomatch h)
-  dsimp only [seedRowsM, StateT.run, bind, StateT.bind, pure, StateT.pure]
-  cases hd : diffRowSigs rowSig rowEv inst newMarks oldMarks oldSigs 0 #[] #[] #[] with
-  | mk newSigs rest =>
-      rcases rest with ⟨toEmit, toEv⟩
-      rw [hd] at hs; dsimp only at hs ⊢
-      have he := emitSignalsM_spec toEmit.toList a
-      dsimp only [StateT.run] at he
-      rw [he]; dsimp only
-      have hev := emitSignalOnsM_spec toEv.toList { a with signals := toEmit.toList.foldl (fun acc (nm, v) => setAssoc nm v acc) a.signals }
-      dsimp only [StateT.run] at hev
-      rw [hev]; exact ⟨hs.1, hs.2, rfl, rfl, rfl, rfl⟩
+  dsimp only; rw [seedRowsM_run_eq]; exact ⟨hs.1, hs.2, rfl, rfl, rfl, rfl⟩
 
 theorem renderSig_resolved_spec {σ msg : Type} (ns : String) (get : σ → String)
     (s₁ s₂ : σ) (pre : String) (n : Nat) (a : DomArena msg) (f : Nat) (hbound : a.nextId + 1 < UInt32.size) :
@@ -75,25 +65,15 @@ theorem renderSig_resolved_spec {σ msg : Type} (ns : String) (get : σ → Stri
   let sigNm := s!"{pre}#{n}"
   let realNs := if ns == "" && "span" == "svg" then Dom.svgNs else ns
   let a1 : DomArena msg := { a with nextId := a.nextId + 1 }
-  have haMid : (buildDomM (m := StateM (DomArena msg)) ns (.element "span" [.signalBind sigNm] [.text (get s₁)])).run a =
-      (node, (applyAttrsM (m := StateM (DomArena msg)) node [.signalBind sigNm] (a1.set node (.element realNs "span" {} [] []))).2) := by
-    dsimp only [buildDomM, StateT.run, bind, StateT.bind, pure, StateT.pure, MonadDom.createElement, DomArena.alloc]
-    have hset : ({ a with nextId := a.nextId + 1, store := fun m => if (m == node) = true then ArenaEntry.element realNs "span" {} [] [] else a.store m } : DomArena msg) =
-        a1.set node (.element realNs "span" {} [] []) := rfl
-    rw [hset]
-    cases applyAttrsM (m := StateM (DomArena msg)) node [.signalBind sigNm] (a1.set node (.element realNs "span" {} [] [])); rfl
+  dsimp only [View.renderSig, buildDomM, StateT.run, bind, StateT.bind, pure, StateT.pure, MonadDom.createElement, DomArena.alloc]
+  rw [show ({ a with nextId := a.nextId + 1, store := fun m => if (m == node) = true then ArenaEntry.element realNs "span" {} [] [] else a.store m } : DomArena msg) =
+        a1.set node (.element realNs "span" {} [] []) from rfl,
+      applyAttrsM_fresh_element a1 node realNs "span" [] [.signalBind sigNm]]
+  dsimp only [ownsChildren, List.any, Bool.not_true, Bool.false_eq_true, ↓reduceIte, bind, StateT.bind, pure, StateT.pure,
+    MonadDom.setSignal, View.render, specDom, readResolvedDomTree, DomArena.get]
   have hev : (evalSpecAttrs ([Attr.signalBind sigNm] : List (Attr msg))).sigBind = some sigNm := rfl
-  dsimp only [View.renderSig]
-  rw [haMid, applyAttrsM_fresh_element a1 node realNs "span" [] [.signalBind sigNm]]
-  simp only [sigNm, MonadDom.setSignal, View.render, specDom, readResolvedDomTree, DomArena.get,
-    show (a1.set node (ArenaEntry.element realNs "span" (evalSpecAttrs [Attr.signalBind sigNm])
-      (List.filterMap managedAttrName (normalizeAttrs [Attr.signalBind sigNm])) [])).store node =
-      ArenaEntry.element realNs "span" (evalSpecAttrs [Attr.signalBind sigNm])
-        (List.filterMap managedAttrName (normalizeAttrs [Attr.signalBind sigNm])) [] from DomArena.get_set_self _ _ _,
-    hev, lookupAssoc_setAssoc, beq_self_eq_true, ↓reduceIte, Option.getD_some]
-  refine ⟨trivial, rfl, fun m hm => ?_⟩
-  have hne : m ≠ node := node_ne_of_toNat_ne (by dsimp only [node]; rw [uint32_toNat_ofNat_lt a.nextId (by omega)]; omega)
-  exact DomArena.get_set_ne _ _ hne
+  refine ⟨?_, rfl, fun m hm => DomArena.get_set_ne _ _ (node_ne_of_toNat_ne (by dsimp only [node]; rw [uint32_toNat_ofNat_lt a.nextId (by omega)]; omega))⟩
+  simp only [sigNm, node, DomArena.set, hev, lookupAssoc_setAssoc, beq_self_eq_true, ↓reduceIte, Option.getD_some]
 
 /-! ## 5. Browser Runtime & Local Island Driver Specifications -/
 
@@ -180,27 +160,28 @@ theorem snapshot_restore_locals_roundtrip (entries : List (String × String))
     let out := restoreLocalsFromJson (snapshotLocalsJson entries) base
     ∀ kv ∈ entries, out[kv.1]? = some kv.2 := by
   have hdep : (Json.obj (entries.map fun x => (x.1, Json.str x.2))).depth ≤ 64 := by
-    have hm : Json.maxObj (entries.map fun x => (x.1, Json.str x.2)) ≤ 0 :=
-      Json.maxObj_le_iff.2 fun kv hkv => by rcases List.mem_map.1 hkv with ⟨p, _, rfl⟩; exact Nat.le_refl _
+    have : Json.maxObj (entries.map fun x => (x.1, Json.str x.2)) ≤ 0 :=
+      Json.maxObj_le_iff.2 fun _ hkv => by rcases List.mem_map.1 hkv with ⟨_, _, rfl⟩; exact Nat.le_refl _
     dsimp only [Json.depth]; omega
   have hpr := parse_render hdep
+  let step := fun (st : Std.HashMap String String) (kv : String × Json) => match kv.2 with | .str str => st.insert kv.1 str | _ => st
+  have hpres : ∀ (rs : List (String × String)) (b : Std.HashMap String String) (k : String),
+      k ∉ rs.map Prod.fst → ((rs.map fun (k, v) => (k, Json.str v)).foldl step b)[k]? = b[k]? := fun rs => by
+    induction rs with
+    | nil => intro _ _ _; rfl
+    | cons q qt ihr =>
+        intro b k hnm; have hne : q.1 ≠ k := fun h => hnm (h ▸ .head _)
+        simpa [List.foldl_cons, step, Std.HashMap.getElem?_insert, beq_eq_false_iff_ne.2 hne] using ihr (b.insert q.1 q.2) k (fun hm => hnm (.tail _ hm))
   have hfold : ∀ (es : List (String × String)) (b : Std.HashMap String String), (es.map Prod.fst).Nodup →
-      ∀ kv ∈ es, ((es.map fun (k, v) => (k, Json.str v)).foldl (fun st (k, v) => match v with | .str str => st.insert k str | _ => st) b)[kv.1]? = some kv.2 := by
-    intro es; induction es with
+      ∀ kv ∈ es, ((es.map fun (k, v) => (k, Json.str v)).foldl step b)[kv.1]? = some kv.2 := fun es => by
+    induction es with
     | nil => intro _ _ _ hm; nomatch hm
     | cons kv rest ih =>
         intro b hnde p hp; rcases List.nodup_cons.1 hnde with ⟨hnotin, hndr⟩
         rcases List.mem_cons.1 hp with rfl | ht
-        · have hpres : ∀ (rs : List (String × String)) (b' : Std.HashMap String String), p.1 ∉ rs.map Prod.fst →
-              ((rs.map fun (k, v) => (k, Json.str v)).foldl (fun st (k, v) => match v with | .str str => st.insert k str | _ => st) b')[p.1]? = b'[p.1]? := by
-            intro rs; induction rs with
-            | nil => intro _ _; rfl
-            | cons q qt ihr =>
-                intro b' hnm; have hne : q.1 ≠ p.1 := fun h => hnm (h ▸ .head _)
-                simpa [List.foldl_cons, Std.HashMap.getElem?_insert, beq_eq_false_iff_ne.2 hne] using ihr (b'.insert q.1 q.2) (fun hm => hnm (.tail _ hm))
-          simpa [List.foldl_cons] using (hpres rest (b.insert p.1 p.2) hnotin).trans (by simp)
+        · simpa [List.foldl_cons, step] using (hpres rest (b.insert p.1 p.2) p.1 hnotin).trans (by simp)
         · exact ih (b.insert kv.1 kv.2) hndr p ht
-  simpa [restoreLocalsFromJson, snapshotLocalsJson, hpr] using hfold entries base hnd
+  simpa [restoreLocalsFromJson, snapshotLocalsJson, hpr, step] using hfold entries base hnd
 
 def drainQueueSpec {σ Msg : Type} (step : σ → Msg → σ × List Msg) :
     Nat → σ → Array Msg → σ × Array Msg
@@ -282,97 +263,59 @@ private theorem Html.DomCleanList_map {α msg : Type} (f : α → Html msg) :
 
 theorem View.DomClean_forEach {α σ msg : Type} (tag : String) (items : σ → Array α)
     (key : α → String) (child : View α msg) (attrs : List (VAttr σ msg)) (sigPrefix : String)
-    (ha : VAttrListClean attrs)
-    (hdyn : (View.collectDyn child).isEmpty = true)
-    (hdynOn : (View.collectDynOn child).isEmpty = true)
-    (hcl : ∀ a, (child.render a).DomClean = true)
-    (htxt : ∀ a, (child.render a).textOf? = none)
-    (hnd : ∀ s, (((items s).map key).toList).Nodup)
+    (ha : VAttrListClean attrs) (hdyn : (View.collectDyn child).isEmpty = true)
+    (hdynOn : (View.collectDynOn child).isEmpty = true) (hcl : ∀ a, (child.render a).DomClean = true)
+    (htxt : ∀ a, (child.render a).textOf? = none) (hnd : ∀ s, (((items s).map key).toList).Nodup)
     (hkey : ∀ a b, key a = key b → child.render a = child.render b) :
     View.DomClean (V.forEach tag items key child attrs sigPrefix) := by
   dsimp only [V.forEach]
   have hnotDirect : V.isDirectTmpl child = false := by
-    cases child with
-    | element _ _ _ => simp [V.isDirectTmpl, hdyn, hdynOn]
-    | _ => rfl
+    cases child with | element _ _ _ => simp [V.isDirectTmpl, hdyn, hdynOn] | _ => rfl
   split
-  · intro s
-    simp only [Html.DomClean, ha.1 s, ha.2.1 s, Bool.not_false, Bool.true_and, Array.toList_map]
+  · intro s; simp only [Html.DomClean, ha.1 s, ha.2.1 s, Bool.not_false, Bool.true_and, Array.toList_map]
     exact Html.DomCleanList_map _ _ fun a _ => by simp [Html.DomClean_withKey, hcl a]
   · simp only [hnotDirect, Bool.false_eq_true, ↓reduceIte]
-    refine ⟨ha, ?_, ?_, ?_, ?_⟩
-    · intro s
-      dsimp only
-      have h1 : disambiguateKeys ((items s).map key) = (items s).map key := disambiguateKeys_of_nodup (by simpa using hnd s)
-      rw [h1]
-      simp [List.length_map, List.length_zipIdx]
-    · intro s
-      dsimp only
-      have hde : child.collectDyn = [] := List.isEmpty_iff.1 hdyn
-      have hdo : child.collectDynOn = [] := List.isEmpty_iff.1 hdynOn
-      exact Html.DomCleanList_map _ _ fun p _ => by
-        simp [Html.DomClean_withKey, renderSig_of_collectDyn_empty child hde hdo p.1, hcl p.1]
-    · intro s r hr
-      dsimp only at hr
-      rcases List.mem_map.1 hr with ⟨p, _, rfl⟩
-      rw [Html.textOf?_withKey, renderSig_of_collectDyn_empty child (List.isEmpty_iff.1 hdyn) (List.isEmpty_iff.1 hdynOn)]
-      exact htxt p.1
-    · intro s₁ s₂ i j hi hj hkeq
-      dsimp only at hi hj hkeq ⊢
-      have hde : child.collectDyn = [] := List.isEmpty_iff.1 hdyn
-      have hdo : child.collectDynOn = [] := List.isEmpty_iff.1 hdynOn
-      have hu1 : disambiguateKeys ((items s₁).map key) = (items s₁).map key := disambiguateKeys_of_nodup (by simpa using hnd s₁)
-      have hu2 : disambiguateKeys ((items s₂).map key) = (items s₂).map key := disambiguateKeys_of_nodup (by simpa using hnd s₂)
-      have hi' : i < (items s₁).size := by simpa [hu1] using hi
-      have hj' : j < (items s₂).size := by simpa [hu2] using hj
-      have hkaEq : key (items s₁)[i] = key (items s₂)[j] := by simpa [hu1, hu2] using hkeq
-      rw [getElem?_map_zipIdx _ (items s₁).toList 0 i, getElem?_map_zipIdx _ (items s₂).toList 0 j]
-      simp only [Nat.zero_add, Array.getElem?_toList, Array.getElem?_eq_getElem hi', Array.getElem?_eq_getElem hj', Option.map_some]
-      rw [renderSig_of_collectDyn_empty child hde hdo, renderSig_of_collectDyn_empty child hde hdo]
-      have hd1 : (disambiguateKeys ((items s₁).map key)).getD i (key (items s₁)[i]) = key (items s₁)[i] := by simp [hu1, Array.getD, hi']
-      have hd2 : (disambiguateKeys ((items s₂).map key)).getD j (key (items s₂)[j]) = key (items s₂)[j] := by simp [hu2, Array.getD, hj']
-      rw [hd1, hd2, hkaEq, hkey _ _ hkaEq]
+    have hde : child.collectDyn = [] := List.isEmpty_iff.1 hdyn
+    have hdo : child.collectDynOn = [] := List.isEmpty_iff.1 hdynOn
+    have hu : ∀ s, disambiguateKeys ((items s).map key) = (items s).map key := fun s =>
+      disambiguateKeys_of_nodup (by simpa using hnd s)
+    refine ⟨ha,
+      fun s => by simp [hu s, List.length_map, List.length_zipIdx],
+      fun s => Html.DomCleanList_map _ _ fun p _ => by simp [Html.DomClean_withKey, renderSig_of_collectDyn_empty child hde hdo p.1, hcl p.1],
+      fun s r hr => by rcases List.mem_map.1 hr with ⟨p, _, rfl⟩; rw [Html.textOf?_withKey, renderSig_of_collectDyn_empty child hde hdo]; exact htxt p.1,
+      fun s₁ s₂ i j hi hj hkeq => by
+        have hi' : i < (items s₁).size := by simpa [hu s₁] using hi
+        have hj' : j < (items s₂).size := by simpa [hu s₂] using hj
+        have hkaEq : key (items s₁)[i] = key (items s₂)[j] := by simpa [hu s₁, hu s₂] using hkeq
+        rw [getElem?_map_zipIdx _ (items s₁).toList 0 i, getElem?_map_zipIdx _ (items s₂).toList 0 j]
+        simp only [Nat.zero_add, Array.getElem?_toList, Array.getElem?_eq_getElem hi', Array.getElem?_eq_getElem hj', Option.map_some]
+        rw [renderSig_of_collectDyn_empty child hde hdo, renderSig_of_collectDyn_empty child hde hdo]
+        simp [hu s₁, hu s₂, Array.getD, hi', hj', hkaEq, hkey _ _ hkaEq]⟩
 
 /-! ## 6. Compiled Row-Template & Prefix/Suffix/Swap Fast-Path Soundness -/
 
 theorem prefixMatchLen_bound (oldMarks newMarks : Array USize) :
     ∀ i, i ≤ oldMarks.size → i ≤ newMarks.size →
-      prefixMatchLen oldMarks newMarks i ≤ oldMarks.size ∧
-      prefixMatchLen oldMarks newMarks i ≤ newMarks.size := by
-  intro i
-  induction hrem : oldMarks.size - i generalizing i with
-  | zero =>
-      intro ho hn; unfold prefixMatchLen; split
-      · omega
-      · exact ⟨ho, hn⟩
-  | succ r ih =>
-      intro ho hn; unfold prefixMatchLen; split
-      · rename_i h
-        dsimp only
-        split
-        · exact ih (i + 1) (by omega) (by omega) (by omega)
-        · exact ⟨ho, hn⟩
+      prefixMatchLen oldMarks newMarks i ≤ oldMarks.size ∧ prefixMatchLen oldMarks newMarks i ≤ newMarks.size := by
+  intro i; induction hrem : oldMarks.size - i generalizing i with
+  | zero => intro ho hn; unfold prefixMatchLen; split <;> first | omega | exact ⟨ho, hn⟩
+  | succ _ ih =>
+      intro ho hn; unfold prefixMatchLen
+      split
+      · dsimp only; split; exact ih (i + 1) (by omega) (by omega) (by omega); exact ⟨ho, hn⟩
       · exact ⟨ho, hn⟩
 
 theorem prefixMatchLen_sound (oldMarks newMarks : Array USize) :
     ∀ i k, i ≤ k → k < prefixMatchLen oldMarks newMarks i →
       ∃ (ho : k < oldMarks.size) (hn : k < newMarks.size),
         newMarks[k]'hn ≠ 0 ∧ oldMarks[k]'ho = newMarks[k]'hn := by
-  intro i
-  induction hrem : oldMarks.size - i generalizing i with
-  | zero =>
-      intro k hik hklt
-      unfold prefixMatchLen at hklt
-      split at hklt <;> omega
-  | succ r ih =>
-      intro k hik hklt
-      unfold prefixMatchLen at hklt
+  intro i; induction hrem : oldMarks.size - i generalizing i with
+  | zero => intro k _ hklt; unfold prefixMatchLen at hklt; split at hklt <;> omega
+  | succ _ ih =>
+      intro k hik hklt; unfold prefixMatchLen at hklt
       split at hklt
-      · rename_i h
-        dsimp only at hklt
-        split at hklt
-        · rename_i hm
-          simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hm
+      · rename_i h; dsimp only at hklt; split at hklt
+        · rename_i hm; simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hm
           by_cases heq : k = i
           · subst heq; exact ⟨h.1, h.2, hm.1, hm.2⟩
           · exact ih (i + 1) (by omega) k (by omega) hklt
@@ -385,21 +328,13 @@ theorem suffixMatchLen_sound (oldMarks newMarks : Array USize) (p : Nat) :
       ∃ (ho : oldMarks.size - 1 - j < oldMarks.size) (hn : newMarks.size - 1 - j < newMarks.size),
         newMarks[newMarks.size - 1 - j]'hn ≠ 0 ∧
         oldMarks[oldMarks.size - 1 - j]'ho = newMarks[newMarks.size - 1 - j]'hn := by
-  intro q
-  induction hrem : oldMarks.size - (p + q) generalizing q with
-  | zero =>
-      intro j hqj hjlt
-      unfold suffixMatchLen at hjlt
-      split at hjlt <;> omega
-  | succ r ih =>
-      intro j hqj hjlt
-      unfold suffixMatchLen at hjlt
+  intro q; induction hrem : oldMarks.size - (p + q) generalizing q with
+  | zero => intro j _ hjlt; unfold suffixMatchLen at hjlt; split at hjlt <;> omega
+  | succ _ ih =>
+      intro j hqj hjlt; unfold suffixMatchLen at hjlt
       split at hjlt
-      · rename_i h
-        dsimp only at hjlt
-        split at hjlt
-        · rename_i hm
-          simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hm
+      · rename_i h; dsimp only at hjlt; split at hjlt
+        · rename_i hm; simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hm
           by_cases heq : j = q
           · subst heq; exact ⟨h.1, h.2, by omega, by omega, hm.1, hm.2⟩
           · exact ih (q + 1) (by omega) j (by omega) hjlt
@@ -408,43 +343,29 @@ theorem suffixMatchLen_sound (oldMarks newMarks : Array USize) (p : Nat) :
 
 private theorem mem_collectChangedMarksLoop_of_mem (oldMarks newMarks : Array USize) :
     ∀ i (acc : Array Nat) x, x ∈ acc.toList → x ∈ (collectChangedMarksLoop oldMarks newMarks i acc).toList := by
-  intro i
-  induction hrem : newMarks.size - i generalizing i with
-  | zero =>
+  intro i; induction hrem : newMarks.size - i generalizing i with
+  | zero => intro acc x hx; unfold collectChangedMarksLoop; split <;> first | omega | exact hx
+  | succ _ ih =>
       intro acc x hx; unfold collectChangedMarksLoop
       split
-      · omega
-      · exact hx
-  | succ r ih =>
-      intro acc x hx; unfold collectChangedMarksLoop
-      split
-      · rename_i h
-        apply ih (i + 1) (by omega)
-        split
-        · exact hx
-        · rw [Array.toList_push]; exact List.mem_append_left _ hx
+      · apply ih (i + 1) (by omega); split; exact hx; rw [Array.toList_push]; exact List.mem_append_left _ hx
       · exact hx
 
 theorem collectChangedMarksLoop_sound (oldMarks newMarks : Array USize) :
     ∀ i (acc : Array Nat) k (hk : k < newMarks.size),
       i ≤ k → k ∉ (collectChangedMarksLoop oldMarks newMarks i acc).toList →
       newMarks[k]'hk ≠ 0 ∧ oldMarks[k]? = some (newMarks[k]'hk) := by
-  intro i
-  induction hrem : newMarks.size - i generalizing i with
+  intro i; induction hrem : newMarks.size - i generalizing i with
   | zero => intro _ k hk hik _; omega
-  | succ r ih =>
-      intro acc k hk hik hnot
-      unfold collectChangedMarksLoop at hnot
+  | succ _ ih =>
+      intro acc k hk hik hnot; unfold collectChangedMarksLoop at hnot
       simp only [show i < newMarks.size by omega, ↓reduceDIte] at hnot
       by_cases heq : k = i
       · subst heq
         by_cases hm : (newMarks[k]'hk != 0 && oldMarks[k]? == some (newMarks[k]'hk)) = true
         · simpa [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] using hm
-        · have hmf : (newMarks[k]'hk != 0 && oldMarks[k]? == some (newMarks[k]'hk)) = false := Bool.eq_false_iff.2 hm
-          simp only [hmf, Bool.false_eq_true, ↓reduceIte] at hnot
-          have hmem : k ∈ (collectChangedMarksLoop oldMarks newMarks (k + 1) (acc.push k)).toList :=
-            mem_collectChangedMarksLoop_of_mem oldMarks newMarks (k + 1) (acc.push k) k (by rw [Array.toList_push]; simp)
-          exact False.elim (hnot hmem)
+        · simp only [Bool.eq_false_iff.2 hm, Bool.false_eq_true, ↓reduceIte] at hnot
+          exact False.elim (hnot (mem_collectChangedMarksLoop_of_mem oldMarks newMarks (k + 1) (acc.push k) k (by rw [Array.toList_push]; simp)))
       · exact ih (i + 1) (by omega) _ k hk (by omega) hnot
 
 theorem patchNodeSlotAt_nextId {msg : Type} (a : DomArena msg) (n : Dom.Node)

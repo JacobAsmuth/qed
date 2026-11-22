@@ -19,7 +19,7 @@ def definingModule (env : Environment) (declName : Name) : Name :=
   | none     => Name.anonymous
 
 private def isAllowedKernelAxiom (n : Name) : Bool :=
-  n == ``propext || n == ``Classical.choice || n == ``Quot.sound
+  allowedKernelAxioms.contains n
 
 private def rootTwoAux : Name → Option String → Option (String × Option String)
   | .str .anonymous r, second => some (r, second)
@@ -140,29 +140,21 @@ private def checkAxiomLoop (env : Environment) (declName : Name) (initCi? : Opti
     (clean : Std.HashSet Name) : Except AxiomCheckErr (Std.HashSet Name) := Id.run do
   if clean.contains declName then return .ok clean
   let mut clean := clean
-  let mut stack : Array Name := #[]
+  let mut stack : Array Name := #[declName]
   let mut fuel : Nat := 2000000
-  match initCi? with
-  | some (.axiomInfo ax) =>
-      if isAllowedKernelAxiom ax.name && !ax.isUnsafe then
-        return .ok (clean.insert declName)
-      else
-        return .error (.disallowed ax.name)
-  | some ci =>
-      fuel := fuel - 1
-      clean := clean.insert declName
-      stack := pushConstDeps ci clean stack
-  | none =>
-      stack := stack.push declName
+  let mut firstCi? := initCi?
   while !stack.isEmpty do
     let n := stack.back!
     stack := stack.pop
-    if clean.contains n then
-      continue
+    let ci? ← match firstCi? with
+      | some ci => firstCi? := none; pure (some ci)
+      | none =>
+          if clean.contains n then continue
+          pure (env.find? n)
     if fuel == 0 then
       return .error (.fuelExhausted n)
     fuel := fuel - 1
-    match env.find? n with
+    match ci? with
     | none =>
         clean := clean.insert n
     | some (.axiomInfo ax) =>
@@ -206,26 +198,21 @@ private def verifyUserDecl (env : Environment) (modName n : Name) (ci? : Option 
   if Lean.isExtern env n && !isAllowedExternMod modName then
     throw s!"kernel gate: unverified `@[extern]` `{n}` in `{modName}` is forbidden outside `Qed.Dom` and `Qed.Server.Prim`"
 
+private def hasOwnerMarker (env : Environment) (owner marker : Name) : Bool :=
+  !owner.isAnonymous && env.contains (owner ++ marker)
+
 /-- True iff `owner` is a `server` namespace (marked by `_qed_server_marker` emitted by
     `server` elaboration, or carrying a `dispatchM` taking `Qed.Server.RequestCtx`). -/
 def isServerOwner (env : Environment) (owner : Name) : Bool :=
   if owner.isAnonymous then false
-  else if env.contains (owner ++ `_qed_server_marker) then true
+  else if hasOwnerMarker env owner `_qed_server_marker then true
   else match env.find? (owner ++ `dispatchM) with
     | some ci => ci.type.foldConsts false fun c acc => acc || c == `Qed.Server.RequestCtx
     | none    => false
 
-/-- True iff `owner` is an `external` service namespace (marked by `_qed_external_marker`). -/
-def isExternalOwner (env : Environment) (owner : Name) : Bool :=
-  !owner.isAnonymous && env.contains (owner ++ `_qed_external_marker)
-
-/-- True iff `owner` is a `database` namespace (marked by `_qed_database_marker`). -/
-def isDatabaseOwner (env : Environment) (owner : Name) : Bool :=
-  !owner.isAnonymous && env.contains (owner ++ `_qed_database_marker)
-
-/-- True iff `owner` is an `auth` namespace (marked by `_qed_auth_marker`). -/
-def isAuthOwner (env : Environment) (owner : Name) : Bool :=
-  !owner.isAnonymous && env.contains (owner ++ `_qed_auth_marker)
+def isExternalOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_external_marker
+def isDatabaseOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_database_marker
+def isAuthOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_auth_marker
 
 /-- True iff `n` (or an enclosing non-`_closed_` declaration prefix, e.g. `match_*` / `_unsafe_rec`
     auxiliaries) is a server-only declaration owned by a `server`, `external`, `database`, or `auth` block.

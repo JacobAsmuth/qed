@@ -23,14 +23,7 @@ private theorem buildViewKidsM_eq_buildDomListM_of {σ msg : Type} (ns : String)
           | mk dn ad =>
               rw [hbv, hbd] at hk; dsimp only at hk ⊢
               rw [hk.1]
-              have happ : ∀ (x y : DomArena msg), x.SameDom y →
-                  (MonadDom.appendChild (m := StateM (DomArena msg)) parent dn x).2.SameDom
-                    (MonadDom.appendChild (m := StateM (DomArena msg)) parent dn y).2 := by
-                intro x y ⟨h1, h2⟩
-                cases x; cases y; cases h1; cases h2
-                dsimp only [MonadDom.appendChild, DomArena.get, DomArena.set, DomArena.modifyChildren, DomArena.modify]
-                split <;> exact ⟨rfl, rfl⟩
-              have haEq := happ a1 ad hk.2
+              have haEq := (DomArena.MetaIndep.appendChild parent dn).sameDom hk.2
               cases ha1 : MonadDom.appendChild (m := StateM (DomArena msg)) parent dn a1 with
               | mk _ s1 =>
                   cases ha2 : MonadDom.appendChild (m := StateM (DomArena msg)) parent dn ad with

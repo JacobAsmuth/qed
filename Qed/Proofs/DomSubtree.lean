@@ -22,45 +22,13 @@ theorem erase_append_right_of_not_mem {α : Type} [BEq α] [LawfulBEq α]
       have hne : (a == x) = false := beq_eq_false_iff_ne.2 (fun h => hnot (by simp [h]))
       simp [hne, ih (fun h => hnot (List.mem_cons_of_mem a h))]
 
-private theorem not_mem_left_of_nodup_append {α : Type} {xs ys : List α} {y : α}
-    (hnd : (xs ++ ys).Nodup) (hy : y ∈ ys) : y ∉ xs := by
-  induction xs with
-  | nil => intro h; nomatch h
-  | cons x rest ih =>
-      rcases List.nodup_cons.1 hnd with ⟨hx, hrest⟩
-      intro hm
-      rcases List.mem_cons.1 hm with rfl | htail
-      · exact hx (List.mem_append_right rest hy)
-      · exact ih hrest htail
-
 private theorem nodup_reinsert {α : Type} [BEq α] [LawfulBEq α] {pre suf : List α} {c : α}
-    (hnd : (pre ++ suf).Nodup) (hc : c ∉ pre) :
-    (pre ++ c :: suf.erase c).Nodup := by
-  induction pre with
-  | nil =>
-      simp only [List.nil_append] at hnd ⊢
-      refine List.nodup_cons.2 ⟨?_, hnd.erase c⟩
-      clear hc
-      induction suf with
-      | nil => simp
-      | cons s srest ihS =>
-          rcases List.nodup_cons.1 hnd with ⟨hs, hsrest⟩
-          by_cases hsc : s == c
-          · have heq : s = c := eq_of_beq hsc
-            subst heq; simpa [List.erase_cons] using hs
-          · simp only [List.erase_cons, hsc, Bool.false_eq_true, ↓reduceIte, List.mem_cons, not_or]
-            refine ⟨fun h => hsc (beq_iff_eq.2 h.symm), ihS hsrest⟩
-  | cons p prest ih =>
-      simp only [List.cons_append] at hnd ⊢
-      rcases List.nodup_cons.1 hnd with ⟨hp, hprest⟩
-      have hcp : c ≠ p := fun h => hc (by simp [h])
-      refine List.nodup_cons.2 ⟨?_, ih hprest (fun h => hc (List.mem_cons_of_mem p h))⟩
-      intro hm
-      rcases List.mem_append.1 hm with h1 | h2
-      · exact hp (List.mem_append_left _ h1)
-      · rcases List.mem_cons.1 h2 with hpeq | her
-        · exact hcp hpeq.symm
-        · exact hp (List.mem_append_right _ (List.mem_of_mem_erase her))
+    (hnd : (pre ++ suf).Nodup) (hc : c ∉ pre) : (pre ++ c :: suf.erase c).Nodup := by
+  rcases List.nodup_append.1 hnd with ⟨hp, hs, hd⟩
+  refine List.nodup_append.2 ⟨hp, List.nodup_cons.2 ⟨hs.not_mem_erase, hs.erase c⟩, fun a ha b hb => ?_⟩
+  rcases List.mem_cons.1 hb with rfl | hbe
+  · exact fun h => hc (h ▸ ha)
+  · exact hd a ha b (List.mem_of_mem_erase hbe)
 
 /-- Unified W3C `insertBefore` step theorem: whether `child` is freshly created (`child ∉ suf`)
     or reused from `suf` (`child ∈ suf`), as long as `(pre ++ suf).Nodup` and `child ∉ pre`,
@@ -80,8 +48,7 @@ theorem w3cInsertBefore_step (pre suf : List Dom.Node) (child : Dom.Node)
         rw [erase_append_right_of_not_mem pre (ref :: rest) hnotPre]
         have hrc' : (ref == child) = false := Bool.eq_false_iff.2 hrc
         simp only [List.erase_cons, hrc', Bool.false_eq_true, ↓reduceIte]
-        have hrefNotPre : ref ∉ pre := not_mem_left_of_nodup_append hnd (List.mem_cons_self ..)
-        exact insertBeforeRef_split pre (rest.erase child) hrefNotPre
+        exact insertBeforeRef_split pre (rest.erase child) fun h => (List.nodup_append.1 hnd).2.2 _ h _ (List.mem_cons_self ..) rfl
 
 def w3cPlaceSeq : List Dom.Node → Nat → List Dom.Node → List Dom.Node
   | cs, _, [] => cs
@@ -180,17 +147,6 @@ theorem nodup_snoc_append {α : Type} {pre suf : List α} {cn : α}
   · exact hd x hxp y hy hEq
   · simp only [List.mem_singleton] at hxc; subst hxc; subst hEq; exact hcns.2 hy
 
-private theorem not_mem_erase_of_nodup {α : Type} [BEq α] [LawfulBEq α] :
-    ∀ {xs : List α} {x : α}, xs.Nodup → x ∉ xs.erase x
-  | [], _, _ => fun h => nomatch h
-  | y :: ys, x, hnd => by
-      rcases List.nodup_cons.1 hnd with ⟨hy, hys⟩
-      by_cases hyx : y = x
-      · subst hyx; simpa [List.erase_cons_head] using hy
-      · have hbeq : (y == x) = false := beq_eq_false_iff_ne.2 hyx
-        simp only [List.erase_cons, hbeq, Bool.false_eq_true, ↓reduceIte, List.mem_cons]
-        intro h; rcases h with rfl | ht; exact hyx rfl; exact not_mem_erase_of_nodup hys ht
-
 private theorem erase_nat_step (n : Nat) :
     ∀ (xs : List Nat), xs.Nodup → (∀ x ∈ xs, x < n + 1) →
       (xs.erase n).Nodup ∧ (∀ y ∈ xs.erase n, y < n) ∧ xs.length ≤ (xs.erase n).length + 1
@@ -242,7 +198,7 @@ theorem nodup_move_to_pre {α : Type} [BEq α] [LawfulBEq α] {pre suf : List α
     (hnd : (pre ++ suf).Nodup) (hx : x ∈ suf) (hy : y = x ∨ y ∉ pre ++ suf) : ((pre ++ [y]) ++ suf.erase x).Nodup := by
   rcases List.nodup_append.1 hnd with ⟨hpre, hsuf, hdisj⟩
   have hyNotPre : y ∉ pre := fun hp => hy.elim (fun h => hdisj _ (h ▸ hp) _ hx rfl) (fun hn => hn (by simp [hp]))
-  have hyNotSufE : y ∉ suf.erase x := fun hs => hy.elim (fun h => not_mem_erase_of_nodup hsuf (h ▸ hs)) (fun hn => hn (by simp [List.mem_of_mem_erase hs]))
+  have hyNotSufE : y ∉ suf.erase x := fun hs => hy.elim (fun h => hsuf.not_mem_erase (h ▸ hs)) (fun hn => hn (by simp [List.mem_of_mem_erase hs]))
   refine List.nodup_append.2 ⟨List.nodup_append.2 ⟨hpre, List.pairwise_singleton _ _, fun a ha b hb => by
     simp only [List.mem_singleton] at hb; subst hb; intro hEq; subst hEq; exact hyNotPre ha⟩,
     hsuf.erase x, fun a ha b hb => ?_⟩
@@ -261,18 +217,12 @@ theorem childNamespace_eq_childNsOf {ns ptag : String} (hns : ns = "" ∨ ns = D
   · simp [Dom.childNsOf, Dom.svgNs, hfo]
 
 
-theorem nodup_getElem_inj {α : Type} :
-    ∀ {xs : List α} {i₁ i₂ : Nat} (h₁ : i₁ < xs.length) (h₂ : i₂ < xs.length), xs.Nodup → xs[i₁] = xs[i₂] → i₁ = i₂
-  | [], _, _, h₁, _, _, _ => nomatch h₁
-  | x :: xs, 0, 0, _, _, _, _ => rfl
-  | x :: xs, 0, i₂ + 1, _, h₂, hnd, hEq => by
-      simp only [List.getElem_cons_zero, List.getElem_cons_succ] at hEq
-      exact absurd (hEq.symm ▸ List.getElem_mem (by simpa using h₂)) (List.nodup_cons.1 hnd).1
-  | x :: xs, i₁ + 1, 0, h₁, _, hnd, hEq => by
-      simp only [List.getElem_cons_zero, List.getElem_cons_succ] at hEq
-      exact absurd (hEq ▸ List.getElem_mem (by simpa using h₁)) (List.nodup_cons.1 hnd).1
-  | x :: xs, i₁ + 1, i₂ + 1, h₁, h₂, hnd, hEq =>
-      congrArg Nat.succ (nodup_getElem_inj (by simpa using h₁) (by simpa using h₂) (List.nodup_cons.1 hnd).2 hEq)
+theorem nodup_getElem_inj {α : Type} {xs : List α} {i₁ i₂ : Nat}
+    (h₁ : i₁ < xs.length) (h₂ : i₂ < xs.length) (hnd : xs.Nodup) (hEq : xs[i₁] = xs[i₂]) : i₁ = i₂ := by
+  rcases Nat.lt_trichotomy i₁ i₂ with hlt | rfl | hgt
+  · exact absurd hEq ((List.pairwise_iff_getElem.1 hnd) i₁ i₂ h₁ h₂ hlt)
+  · rfl
+  · exact absurd hEq.symm ((List.pairwise_iff_getElem.1 hnd) i₂ i₁ h₂ h₁ hgt)
 
 theorem w3cInsertBefore_fresh_append (pre suf : List Dom.Node) (cn : Dom.Node)
     (hnot : cn ∉ pre ++ suf) (hdisj : ∀ r ∈ suf, r ∉ pre) :
@@ -318,13 +268,6 @@ theorem clean_step_Snew_compose {Sdone Sc Srest Srem Snew : Nat → Prop} {n₀ 
   · exact ⟨hS.elim .inl (fun h2 => h2.elim (fun hsc => .inr (.inl (hSc k hsc))) (fun hhi => .inr (.inr ⟨hhi.1, Nat.lt_of_lt_of_le hhi.2 h12⟩))), hnp⟩
   · exact ⟨.inr (.inl (hSr k hSr')), hnp⟩
   · exact ⟨.inr (.inr ⟨Nat.le_trans h01 hA.1, hA.2⟩), hnp⟩
-
-theorem clean_create_Snew_compose {Sdone Srem Snew : Nat → Prop} {n₀ n₁ n₂ p : Nat}
-    (h01 : n₀ ≤ n₁) (h12 : n₁ ≤ n₂)
-    (hSnew : ∀ k, Snew k → ((Sdone k ∨ (n₀ ≤ k ∧ k < n₁)) ∨ Srem k ∨ (n₁ ≤ k ∧ k < n₂)) ∧ k ≠ p) :
-    ∀ k, Snew k → (Sdone k ∨ Srem k ∨ (n₀ ≤ k ∧ k < n₂)) ∧ k ≠ p :=
-  clean_step_Snew_compose (Sc := fun _ => False) h01 h12 (fun _ h => h.elim) (fun _ h => h)
-    fun j hj => let ⟨h, hnp⟩ := hSnew j hj; ⟨h.elim (fun hs => .inl (hs.elim .inl (fun ha => .inr (.inr ha)))) .inr, hnp⟩
 
 theorem not_Sdone_extend {Sdone Sc : Nat → Prop} {n₀ n₁ k : Nat}
     (hD : ¬Sdone k) (hSc : ¬Sc k) (hLt : k < n₀) : ¬(Sdone k ∨ (Sc k ∨ (n₀ ≤ k ∧ k < n₁))) :=

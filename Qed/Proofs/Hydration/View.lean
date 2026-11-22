@@ -144,19 +144,11 @@ private theorem hydrateViewKidsM_eq_hydrateDomKidsM_of {σ msg : Type}
                   cases hydrateViewKidsM (m := StateM (DomArena msg)) node s (i + 1) slot.2 rest a1; exact hkEq
       | none =>
           dsimp only [bind, StateT.bind, pure, StateT.pure]
-          suffices hCn : ∀ cn : Dom.Node,
-              (match hydrateViewM (m := StateM (DomArena msg)) k s cn a with
-              | (kst, a2) => match hydrateViewKidsM (m := StateM (DomArena msg)) node s (i + 1) false rest a2 with
-                | (r, a3) => (kst :: r, a3)).snd.SameDom
-              (match hydrateDomM (m := StateM (DomArena msg)) (k.render s) cn a with
-              | (_, ad) => hydrateDomKidsM (m := StateM (DomArena msg)) node (i + 1) false (View.renderEach rest s) ad).snd from
-            hCn _
-          intro cn
-          have heq := hView k (.head _) hk cn a
-          dsimp only [StateT.run] at heq
-          cases hvm : hydrateViewM (m := StateM (DomArena msg)) k s cn a with
+          have heq := hView k (.head _) hk (MonadDom.childAt (m := StateM (DomArena msg)) node i a).1 a
+          dsimp only [StateT.run, MonadDom.childAt] at heq
+          cases hvm : hydrateViewM (m := StateM (DomArena msg)) k s _ a with
           | mk kst a2 =>
-              cases hdm : hydrateDomM (m := StateM (DomArena msg)) (k.render s) cn a with
+              cases hdm : hydrateDomM (m := StateM (DomArena msg)) (k.render s) _ a with
               | mk _ ad =>
                   rw [hvm, hdm] at heq; dsimp only at heq ⊢
                   have hkEq := ih (fun x hx => hView x (.tail _ hx)) hrest (i + 1) false a2
@@ -420,35 +412,26 @@ private theorem hydrateViewM_matches {σ msg : Type} (ns : String) (f : Nat) (v 
       rcases hc with ⟨haCl, hkidsCl⟩
       rcases hdom with ⟨_, _, _, st, prev, domCs, hget, hm, hns, _, hownF⟩
       rcases hownF (haCl.1 s) with ⟨mid, hmidGt, hk⟩
-      have hattrs := applyAttrsM_existing_element a root
-        (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag
-        { st with clicks := [], inputs := [] } prev domCs (attrs.map (VAttr.eval s)) hm hns
-      rcases hattrs with ⟨st', ha2Get, _, _⟩
       let a2 := (applyAttrsM (m := StateM (DomArena msg)) root (attrs.map (VAttr.eval s))
-        (a.set root (.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag
-          { st with clicks := [], inputs := [] } prev domCs))).2
-      have ha2Next : a2.nextId = a.nextId := applyAttrsM_nextId a root (attrs.map (VAttr.eval s)) _
-      have hkFrame : HydratableDomList f (Dom.childNsOf ns tag) (coalesceTextRun (View.renderEach kids s)) a2 mid hi domCs :=
-        HydratableDomList_frame f (Dom.childNsOf ns tag) (coalesceTextRun (View.renderEach kids s)) a a2 mid hi domCs
-          (by rw [ha2Next]; exact Nat.le_refl _)
-          (fun m hm1 _ => applyAttrsM_get_ne a root (attrs.map (VAttr.eval s)) _ m (fun heq => by rw [heq] at hm1; omega)) hk
+        (a.modifyElemState root fun st => { st with clicks := [], inputs := [] })).2
+      rcases hydrateElemAttrs_step a root ns tag st prev domCs (attrs.map (VAttr.eval s)) hget hm hns with
+        ⟨st', ha2Get, _, _, ha2Next, ha2Outside⟩
+      have ha2Next' : a2.nextId = a.nextId := ha2Next
+      have hkFrame := HydratableDomList_frame f (Dom.childNsOf ns tag) (coalesceTextRun (View.renderEach kids s)) a a2 mid hi domCs
+        (by omega) (fun m hm1 _ => ha2Outside m (fun heq => by rw [heq] at hm1; omega)) hk
       have hvk := viewKidsMatches_step f (Dom.childNsOf ns tag) root
         (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag st'
         ((normalizeAttrs (attrs.map (VAttr.eval s))).filterMap managedAttrName)
         kids s false [] domCs mid hi a2 (fun k hkMem f' r a0 lo0 hi0 => ihk k hkMem (Dom.childNsOf ns tag) f' r a0 lo0 hi0)
         hkidsCl
-        (by have hcnt := list_length_le_htmlListNodeCount (View.renderEach kids s); have hlen : (View.renderEach kids s).length = kids.length := (by rw [View.renderEach_eq_map, List.length_map]); simp only [View.render, htmlNodeCount] at hbound; simp only [List.length_nil]; omega)
+        (by have := list_length_le_htmlListNodeCount (View.renderEach kids s); have : (View.renderEach kids s).length = kids.length := (by rw [View.renderEach_eq_map, List.length_map]); simp only [View.render, htmlNodeCount] at hbound; simp; omega)
         (by simp only [View.render, htmlNodeCount] at hbound; omega)
         (by simp only [View.render, htmlDepth] at hdep; omega)
         hmidGt (fun _ hm => nomatch hm) ha2Get hkFrame
-      have hclearMod : a.modifyElemState root (fun st : SpecElemState msg => { st with clicks := [], inputs := [] }) =
-          a.set root (.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag
-            { st with clicks := [], inputs := [] } prev domCs) := by simp [DomArena.modifyElemState, DomArena.modify, hget]
-      have ha2Run : applyAttrsM (m := StateM (DomArena msg)) root (attrs.map (VAttr.eval s))
-          (a.set root (.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag
-            { st with clicks := [], inputs := [] } prev domCs)) = ((), a2) := Prod.ext rfl rfl
-      dsimp only [hydrateViewM, StateT.run, bind, StateT.bind, pure, StateT.pure] at hvk ⊢
-      rw [hclearMod, ha2Run]; dsimp only
+      dsimp only [hydrateViewM, StateT.run, bind, StateT.bind, pure, StateT.pure, MonadDom.clearHandlers] at hvk ⊢
+      rw [show applyAttrsM (m := StateM (DomArena msg)) root (attrs.map (VAttr.eval s))
+            (a.modifyElemState root fun st => { st with clicks := [], inputs := [] }) = ((), a2) from rfl]
+      dsimp only
       cases hkidsRun : hydrateViewKidsM (m := StateM (DomArena msg)) root s 0 false kids a2 with
       | mk kstates aOut =>
           rw [show (UInt32.ofNat ([] : List Dom.Node).length) = 0 from rfl, hkidsRun] at hvk

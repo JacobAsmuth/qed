@@ -171,76 +171,40 @@ theorem HydratableDomList_nodes_lt {msg : Type} :
   | _, _, [], _, _, _, _ :: _, h => False.elim h
   | _, _, _ :: _, _, _, _, [], h => False.elim h
 
-private theorem HydratableDomListAux_bounds_le {msg : Type}
-    (P : String → Html msg → DomArena msg → Nat → Nat → Dom.Node → Prop)
-    (hP : ∀ ns d a lo hi n, P ns d a lo hi n → lo ≤ hi)
-    (ns : String) :
-    ∀ (ds : List (Html msg)) (a : DomArena msg) (lo hi : Nat) (ns' : List Dom.Node),
-      HydratableDomListAux P ns ds a lo hi ns' → lo ≤ hi
-  | [], _, _, _, [], h => h.1
-  | d :: dr, a, _, _, n :: nr, ⟨mid, hd, hrest⟩ =>
-      Nat.le_trans (hP ns d a _ mid n hd) (HydratableDomListAux_bounds_le P hP ns dr a mid _ nr hrest)
-  | [], _, _, _, _ :: _, h => False.elim h
-  | _ :: _, _, _, _, [], h => False.elim h
-
-private theorem HydratableDomListAux_frame {msg : Type}
-    (P : String → Html msg → DomArena msg → Nat → Nat → Dom.Node → Prop)
-    (hP_bounds : ∀ ns d a lo hi n, P ns d a lo hi n → lo ≤ hi ∧ hi ≤ a.nextId)
-    (hP_frame : ∀ ns d a a' lo hi n, a.nextId ≤ a'.nextId →
+private theorem HydratableDomList_frame_of {msg : Type} (f : Nat)
+    (ih : ∀ (ns : String) (d : Html msg) (a a' : DomArena msg) (lo hi : Nat) (n : Dom.Node), a.nextId ≤ a'.nextId →
       (∀ m : Dom.Node, lo ≤ m.toNat → m.toNat < hi → a'.get m = a.get m) →
-      P ns d a lo hi n → P ns d a' lo hi n)
-    (ns : String) :
+      HydratableDom f ns d a lo hi n → HydratableDom f ns d a' lo hi n) (ns : String) :
     ∀ (ds : List (Html msg)) (a a' : DomArena msg) (lo hi : Nat) (ns' : List Dom.Node),
-      a.nextId ≤ a'.nextId →
-      (∀ m : Dom.Node, lo ≤ m.toNat → m.toNat < hi → a'.get m = a.get m) →
-      HydratableDomListAux P ns ds a lo hi ns' →
-      HydratableDomListAux P ns ds a' lo hi ns'
+      a.nextId ≤ a'.nextId → (∀ m : Dom.Node, lo ≤ m.toNat → m.toNat < hi → a'.get m = a.get m) →
+      HydratableDomList f ns ds a lo hi ns' → HydratableDomList f ns ds a' lo hi ns'
   | [], _, _, _, _, [], hle, _, ⟨h1, h2⟩ => ⟨h1, Nat.le_trans h2 hle⟩
   | d :: drest, a, a', lo, hi, n :: nrest, hle, hfr, ⟨mid, hd, hrest⟩ =>
-      let b1 := hP_bounds ns d a lo mid n hd
-      let hmidLeHi := HydratableDomListAux_bounds_le P (fun _ _ _ _ _ _ h => (hP_bounds _ _ _ _ _ _ h).1)
-        ns drest a mid hi nrest hrest
-      ⟨mid,
-       hP_frame ns d a a' lo mid n hle (fun m hm1 hm2 => hfr m hm1 (Nat.lt_of_lt_of_le hm2 hmidLeHi)) hd,
-       HydratableDomListAux_frame P hP_bounds hP_frame ns drest a a' mid hi nrest hle
-         (fun m hm1 hm2 => hfr m (Nat.le_trans b1.1 hm1) hm2) hrest⟩
-  | [], _, _, _, _, _ :: _, _, _, h => False.elim h
-  | _ :: _, _, _, _, _, [], _, _, h => False.elim h
+      let h1 := (HydratableDom_bounds f ns d a lo mid n hd).2.2
+      let h2 := (HydratableDomList_bounds f ns drest a mid hi nrest hrest).1
+      ⟨mid, ih ns d a a' lo mid n hle (fun m hm1 hm2 => hfr m hm1 (Nat.lt_of_lt_of_le hm2 h2)) hd,
+       HydratableDomList_frame_of f ih ns drest a a' mid hi nrest hle (fun m hm1 hm2 => hfr m (Nat.le_trans h1 hm1) hm2) hrest⟩
+  | [], _, _, _, _, _ :: _, _, _, h | _ :: _, _, _, _, _, [], _, _, h => False.elim h
 
 private theorem HydratableDom_frame {msg : Type} :
     ∀ (f : Nat) (ns : String) (d : Html msg) (a a' : DomArena msg) (lo hi : Nat) (n : Dom.Node),
-      a.nextId ≤ a'.nextId →
-      (∀ m : Dom.Node, lo ≤ m.toNat → m.toNat < hi → a'.get m = a.get m) →
-      HydratableDom f ns d a lo hi n →
-      HydratableDom f ns d a' lo hi n
+      a.nextId ≤ a'.nextId → (∀ m : Dom.Node, lo ≤ m.toNat → m.toNat < hi → a'.get m = a.get m) →
+      HydratableDom f ns d a lo hi n → HydratableDom f ns d a' lo hi n
   | 0, _, _, _, _, _, _, _, _, _, h => False.elim h
-  | _ + 1, ns, .text s, a, a', lo, hi, n, hle, hfr, h =>
+  | _ + 1, _, .text _, _, _, _, _, n, hle, hfr, h =>
       ⟨h.1, h.2.1, Nat.le_trans h.2.2.1 hle, by rw [hfr n h.1 h.2.1, h.2.2.2]⟩
   | f + 1, ns, .element tag attrs cs, a, a', lo, hi, n, hle, hfr, h => by
       rcases h with ⟨hlo, hhi, hnext, st, prev, domCs, hget, hm, hns, hownT, hownF⟩
-      refine ⟨hlo, hhi, Nat.le_trans hnext hle, st, prev, domCs, ?_, hm, hns, hownT, ?_⟩
-      · rw [hfr n hlo hhi, hget]
-      · intro hown
-        rcases hownF hown with ⟨mid, hmid, hk⟩
-        refine ⟨mid, hmid, HydratableDomListAux_frame (HydratableDom f)
-          (fun ns' d' a0 lo' hi' n' hd' =>
-            let b := HydratableDom_bounds f ns' d' a0 lo' hi' n' hd'; ⟨b.2.2, b.2.1⟩)
-          (fun ns' d' a0 a0' lo' hi' n' hle' hfr' hd' =>
-            HydratableDom_frame f ns' d' a0 a0' lo' hi' n' hle' hfr' hd')
-          (Dom.childNsOf ns tag) (coalesceTextRun cs) a a' mid hi domCs hle
-          (fun m hm1 hm2 => hfr m (by omega) hm2) hk⟩
+      exact ⟨hlo, hhi, Nat.le_trans hnext hle, st, prev, domCs, by rw [hfr n hlo hhi, hget], hm, hns, hownT,
+        fun hown => let ⟨mid, hmid, hk⟩ := hownF hown
+          ⟨mid, hmid, HydratableDomList_frame_of f (HydratableDom_frame f) (Dom.childNsOf ns tag)
+            (coalesceTextRun cs) a a' mid hi domCs hle (fun m hm1 hm2 => hfr m (by omega) hm2) hk⟩⟩
 
 theorem HydratableDomList_frame {msg : Type} (f : Nat) (ns : String) (ds : List (Html msg))
-    (a a' : DomArena msg) (lo hi : Nat) (ns' : List Dom.Node)
-    (hle : a.nextId ≤ a'.nextId)
+    (a a' : DomArena msg) (lo hi : Nat) (ns' : List Dom.Node) (hle : a.nextId ≤ a'.nextId)
     (hfr : ∀ m : Dom.Node, lo ≤ m.toNat → m.toNat < hi → a'.get m = a.get m)
-    (h : HydratableDomList f ns ds a lo hi ns') :
-    HydratableDomList f ns ds a' lo hi ns' :=
-  HydratableDomListAux_frame (HydratableDom f)
-    (fun ns0 d0 a0 lo0 hi0 n0 hd0 =>
-      let b := HydratableDom_bounds f ns0 d0 a0 lo0 hi0 n0 hd0; ⟨b.2.2, b.2.1⟩)
-    (HydratableDom_frame f)
-    ns ds a a' lo hi ns' hle hfr h
+    (h : HydratableDomList f ns ds a lo hi ns') : HydratableDomList f ns ds a' lo hi ns' :=
+  HydratableDomList_frame_of f (HydratableDom_frame f) ns ds a a' lo hi ns' hle hfr h
 
 theorem hydrateTextSlotM_alloc_spec (a : DomArena msg) (parent : Dom.Node) (inTextRun : Bool)
     (s : String) (hcond : s = "" ∨ inTextRun = true) (moreInRun : Unit → Bool)
@@ -358,59 +322,47 @@ theorem htmlListDepth_cons_pos {msg : Type} (c : Html msg) (rest : List (Html ms
     | element _ _ _ => simp [htmlDepth]
   exact Nat.le_trans hc (by simp [htmlListDepth, Nat.le_max_left])
 
-theorem dropCurrentTextRun_head_element {msg : Type} (tag : String) (attrs : List (Attr msg))
-    (kids rest : List (Html msg)) :
-    dropCurrentTextRun (.element tag attrs kids :: rest) =
-      .element tag attrs kids :: coalesceTextRun rest := by
-  simp [dropCurrentTextRun, Html.textOf?]
-
-theorem coalesceTextRun_head_element {msg : Type} (tag : String) (attrs : List (Attr msg))
-    (kids rest : List (Html msg)) :
-    coalesceTextRun (.element tag attrs kids :: rest) =
-      .element tag attrs kids :: coalesceTextRun rest := by
-  simp [coalesceTextRun, Html.textOf?]
-
 theorem textOf_none_is_element {msg : Type} :
     ∀ {c : Html msg}, c.textOf? = none → ∃ tag attrs kids, c = .element tag attrs kids
   | .text _, h => by simp [Html.textOf?] at h
   | .element tag attrs kids, _ => ⟨tag, attrs, kids, rfl⟩
 
-def DomHydrateSpecAt {msg : Type} (f : Nat) : Prop :=
-  ∀ (ns : String) (h : Html msg) (root : Dom.Node) (a : DomArena msg) (lo hi : Nat),
-    a.nextId + htmlNodeCount h < UInt32.size →
-    htmlDepth h ≤ f + 1 →
-    HydratableDom (f + 1) ns h a lo hi root →
-    let aOut := ((hydrateDomM (m := StateM (DomArena msg)) h root).run a).2
-    a.nextId ≤ aOut.nextId ∧
-    aOut.nextId ≤ a.nextId + htmlNodeCount h ∧
-    SubtreeInSet (f + 1) aOut (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) root ∧
-    (∀ m : Dom.Node, (m.toNat < lo ∨ hi ≤ m.toNat) → m.toNat < a.nextId → aOut.get m = a.get m) ∧
-    DomTreeAssocEquiv (readDomTree (f + 1) aOut root) (specDom ns h) ∧
-    (h.DomClean = true →
-      CleanDomSubtree (f + 1) ns h aOut (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) root)
+abbrev DomHydrateOut {msg : Type} (f : Nat) (ns : String) (h : Html msg) (root : Dom.Node)
+    (a : DomArena msg) (lo hi : Nat) (aOut : DomArena msg) : Prop :=
+  a.nextId ≤ aOut.nextId ∧ aOut.nextId ≤ a.nextId + htmlNodeCount h ∧
+  SubtreeInSet (f + 1) aOut (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) root ∧
+  (∀ m : Dom.Node, (m.toNat < lo ∨ hi ≤ m.toNat) → m.toNat < a.nextId → aOut.get m = a.get m) ∧
+  DomTreeAssocEquiv (readDomTree (f + 1) aOut root) (specDom ns h) ∧
+  (h.DomClean = true →
+    CleanDomSubtree (f + 1) ns h aOut (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) root)
 
-def KidsHydrateSpecAt {msg : Type} (f : Nat) : Prop :=
-  ∀ (childNs : String) (parent : Dom.Node)
+abbrev KidsHydrateOut {msg : Type} (f : Nat) (childNs : String) (parent : Dom.Node)
     (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
-    (target : List (Html msg)) (inTextRun : Bool)
-    (pre domCs : List Dom.Node) (lo hi : Nat) (a : DomArena msg),
-    pre.length + target.length < UInt32.size →
-    a.nextId + htmlListNodeCount target < UInt32.size →
-    htmlListDepth target ≤ f →
-    parent.toNat < lo →
+    (target : List (Html msg)) (pre : List Dom.Node) (lo hi : Nat) (a aOut : DomArena msg) : Prop :=
+  ∃ hydratedCs : List Dom.Node,
+    a.nextId ≤ aOut.nextId ∧ aOut.nextId ≤ a.nextId + htmlListNodeCount target ∧
+    aOut.get parent = .element pns ptag pst pmg (pre ++ hydratedCs) ∧
+    (∀ c ∈ hydratedCs, SubtreeInSet f aOut (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) c) ∧
+    (∀ m : Dom.Node, m ≠ parent → (m.toNat < lo ∨ hi ≤ m.toNat) → m.toNat < a.nextId → aOut.get m = a.get m) ∧
+    DomTreeListAssocEquiv (hydratedCs.map (readDomTree f aOut)) (specDomList childNs target) ∧
+    (Html.DomCleanList target = true →
+      CleanDomChildren f childNs target aOut (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) hydratedCs)
+
+private abbrev DomHydrateSpecAt {msg : Type} (f : Nat) : Prop :=
+  ∀ (ns : String) (h : Html msg) (root : Dom.Node) (a : DomArena msg) (lo hi : Nat),
+    a.nextId + htmlNodeCount h < UInt32.size → htmlDepth h ≤ f + 1 → HydratableDom (f + 1) ns h a lo hi root →
+    DomHydrateOut f ns h root a lo hi ((hydrateDomM (m := StateM (DomArena msg)) h root).run a).2
+
+private abbrev KidsHydrateSpecAt {msg : Type} (f : Nat) : Prop :=
+  ∀ (childNs : String) (parent : Dom.Node) (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
+    (target : List (Html msg)) (inTextRun : Bool) (pre domCs : List Dom.Node) (lo hi : Nat) (a : DomArena msg),
+    pre.length + target.length < UInt32.size → a.nextId + htmlListNodeCount target < UInt32.size →
+    htmlListDepth target ≤ f → parent.toNat < lo →
     (∀ x ∈ pre, ∃ Sx, (∀ k, Sx k → (parent.toNat < k ∧ k < lo) ∨ (hi ≤ k ∧ k < a.nextId)) ∧ SubtreeInSet f a Sx x) →
     a.get parent = .element pns ptag pst pmg (pre ++ domCs) →
     HydratableDomList f childNs (if inTextRun then dropCurrentTextRun target else coalesceTextRun target) a lo hi domCs →
-    let aOut := ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) inTextRun target).run a).2
-    ∃ (hydratedCs : List Dom.Node),
-      a.nextId ≤ aOut.nextId ∧
-      aOut.nextId ≤ a.nextId + htmlListNodeCount target ∧
-      aOut.get parent = .element pns ptag pst pmg (pre ++ hydratedCs) ∧
-      (∀ c ∈ hydratedCs, SubtreeInSet f aOut (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) c) ∧
-      (∀ m : Dom.Node, m ≠ parent → (m.toNat < lo ∨ hi ≤ m.toNat) → m.toNat < a.nextId → aOut.get m = a.get m) ∧
-      DomTreeListAssocEquiv (hydratedCs.map (readDomTree f aOut)) (specDomList childNs target) ∧
-      (Html.DomCleanList target = true →
-        CleanDomChildren f childNs target aOut (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) hydratedCs)
+    KidsHydrateOut f childNs parent pns ptag pst pmg target pre lo hi a
+      ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) inTextRun target).run a).2
 
 theorem hydrateDomKidsM_fresh_nextId {msg : Type} (f : Nat) (childNs : String)
     (parent : Dom.Node) (hs : List (Html msg)) (pre domCs : List Dom.Node) (lo hi : Nat)
@@ -634,9 +586,7 @@ theorem hydrateKids_ind {α msg : Type} (f : Nat) (childNs : String) (parent : D
           have hcDep : htmlDepth (toHtml c) ≤ f := by simp only [List.map_cons, htmlListDepth] at hdep; exact Nat.le_trans (Nat.le_max_left _ _) hdep
           have hrestDep : htmlListDepth (rest.map toHtml) ≤ f := by simp only [List.map_cons, htmlListDepth] at hdep; exact Nat.le_trans (Nat.le_max_right _ _) hdep
           have hdomElem : HydratableDomList f childNs (toHtml c :: coalesceTextRun (rest.map toHtml)) a lo hi domCs := by
-            cases inTextRun
-            · simpa [List.map_cons, hcEq, coalesceTextRun_head_element] using hdom
-            · simpa [List.map_cons, hcEq, dropCurrentTextRun_head_element] using hdom
+            cases inTextRun <;> simpa [List.map_cons, hcEq, coalesceTextRun, dropCurrentTextRun, Html.textOf?] using hdom
           cases domCs with
           | nil => exact False.elim hdomElem
           | cons child domRest =>
@@ -663,96 +613,84 @@ theorem hydrateKids_ind {α msg : Type} (f : Nat) (childNs : String) (parent : D
                     hrestDep (by omega) hpreMid hparMid (by simpa using hdomMid),
                     hpreMid, hparMid, hdomMid⟩
 
+private theorem hydrateDomKidsM_text_finish {msg : Type} {f : Nat} {childNs : String}
+    {parent : Dom.Node} {pns ptag : String} {pst : SpecElemState msg} {pmg : List String}
+    {S_tn : Nat → Prop} {lo' loRest hi' : Nat} {inRun inRun' : Bool} {pr : List Dom.Node} {tn : Dom.Node}
+    {a0 aMid : DomArena msg} {s : String} {rest : List (Html msg)}
+    (hfPos : 1 ≤ f) (hloLe : lo' ≤ loRest) (haMidLe : a0.nextId ≤ aMid.nextId) (haMidLe1 : aMid.nextId ≤ a0.nextId + 1)
+    (hparNe : parent ≠ tn) (huNext : UInt32.ofNat pr.length + 1 = UInt32.ofNat (pr.length + 1))
+    (hslotEq : hydrateTextSlotM (m := StateM (DomArena msg)) parent (UInt32.ofNat pr.length) inRun s (fun () => hasMoreText rest) a0 = ((tn, inRun'), aMid))
+    (hgetNew : aMid.get tn = .text s) (htnIn : S_tn tn.toNat)
+    (hStnSub : ∀ k, S_tn k → (lo' ≤ k ∧ k < hi') ∨ (a0.nextId ≤ k ∧ k < aMid.nextId))
+    (hStnOut : ∀ k, S_tn k → (k < loRest ∨ hi' ≤ k) ∧ k < aMid.nextId)
+    (hfrMid : ∀ m : Dom.Node, m ≠ parent → (m.toNat < lo' ∨ hi' ≤ m.toNat) → m.toNat < a0.nextId → aMid.get m = a0.get m)
+    (hih : KidsHydrateOut f childNs parent pns ptag pst pmg rest (pr ++ [tn]) loRest hi' aMid
+      ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat (pr ++ [tn]).length) inRun' rest).run aMid).2) :
+    KidsHydrateOut f childNs parent pns ptag pst pmg (.text s :: rest) pr lo' hi' a0
+      ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pr.length) inRun (.text s :: rest)).run a0).2 := by
+  have hstep : ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pr.length) inRun (.text s :: rest)).run a0).2 =
+      ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat (pr ++ [tn]).length) inRun' rest).run aMid).2 := by
+    dsimp only [StateT.run, hydrateDomKidsM, Html.textOf?, bind, StateT.bind]
+    rw [hslotEq]; dsimp only; simp only [List.length_append, List.length_singleton]; rw [← huNext]
+  rcases hih with ⟨hydRest, hnextR, hboundR, hparR, hsubR, hfrR, heqR, hclR⟩
+  dsimp only [KidsHydrateOut]; rw [hstep]
+  have haOutTn : ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat (pr ++ [tn]).length) inRun' rest).run aMid).2.get tn = .text s := by
+    rw [hfrR tn hparNe.symm (hStnOut tn.toNat htnIn).1 (hStnOut tn.toNat htnIn).2, hgetNew]
+  cases f with
+  | zero => omega
+  | succ f' =>
+      refine ⟨tn :: hydRest, Nat.le_trans haMidLe hnextR,
+        by simp only [htmlListNodeCount, htmlNodeCount]; omega,
+        by simpa [List.append_assoc] using hparR, ?_, ?_, ?_, ?_⟩
+      · intro z hz; rcases List.mem_cons.1 hz with rfl | htail
+        · exact ⟨(hStnSub z.toNat htnIn).imp id (fun h => ⟨h.1, Nat.lt_of_lt_of_le h.2 hnextR⟩), by rw [haOutTn]; trivial⟩
+        · exact SubtreeInSet_mono (fun _ hkS => hkS.elim (fun h => .inl ⟨Nat.le_trans hloLe h.1, h.2⟩) (fun h => .inr ⟨Nat.le_trans haMidLe h.1, h.2⟩)) (hsubR z htail)
+      · intro m hmPar hmOut hmLt
+        rw [hfrR m hmPar (hmOut.elim (fun h1 => .inl (by omega)) .inr) (Nat.lt_of_lt_of_le hmLt haMidLe), hfrMid m hmPar hmOut hmLt]
+      · simp only [List.map_cons, specDomList, specDom, DomTreeListAssocEquiv, readDomTree, haOutTn]; exact ⟨rfl, heqR⟩
+      · intro hc; simp only [Html.DomCleanList, Html.DomClean, Bool.true_and] at hc
+        refine ⟨S_tn, fun k => (loRest ≤ k ∧ k < hi') ∨ (aMid.nextId ≤ k ∧ k < _),
+          fun k hk => (hStnSub k hk).imp id (fun h => ⟨h.1, Nat.lt_of_lt_of_le h.2 hnextR⟩),
+          fun _ hk => hk.elim (fun h => .inl ⟨Nat.le_trans hloLe h.1, h.2⟩) (fun h => .inr ⟨Nat.le_trans haMidLe h.1, h.2⟩),
+          fun k hk1 hk2 => by have ⟨ho, hl⟩ := hStnOut k hk1; rcases hk2 with h | h <;> rcases ho with h' | h' <;> omega,
+          ⟨htnIn, haOutTn⟩, hclR hc⟩
+
 private theorem hydrateDomKidsM_spec_step {msg : Type} (f : Nat)
     (hDom : ∀ f' < f, @DomHydrateSpecAt msg f') :
     @KidsHydrateSpecAt msg f := by
   intro childNs parent pns ptag pst pmg target inTextRun pre domCs lo hi a hlen hbound hdep hparLo hpreSub hpar hdom
   refine hydrateKids_ind (toHtml := id) (ItemOk := fun _ => True)
     (Post := fun tgt inRun pr lo' hi' a0 =>
-      let aOut := ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pr.length) inRun tgt).run a0).2
-      ∃ hydratedCs, a0.nextId ≤ aOut.nextId ∧ aOut.nextId ≤ a0.nextId + htmlListNodeCount tgt ∧
-        aOut.get parent = .element pns ptag pst pmg (pr ++ hydratedCs) ∧
-        (∀ c ∈ hydratedCs, SubtreeInSet f aOut (fun k => (lo' ≤ k ∧ k < hi') ∨ (a0.nextId ≤ k ∧ k < aOut.nextId)) c) ∧
-        (∀ m : Dom.Node, m ≠ parent → (m.toNat < lo' ∨ hi' ≤ m.toNat) → m.toNat < a0.nextId → aOut.get m = a0.get m) ∧
-        DomTreeListAssocEquiv (hydratedCs.map (readDomTree f aOut)) (specDomList childNs tgt) ∧
-        (Html.DomCleanList tgt = true →
-          CleanDomChildren f childNs tgt aOut (fun k => (lo' ≤ k ∧ k < hi') ∨ (a0.nextId ≤ k ∧ k < aOut.nextId)) hydratedCs))
+      KidsHydrateOut f childNs parent pns ptag pst pmg tgt pr lo' hi' a0
+        ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pr.length) inRun tgt).run a0).2)
     f childNs parent pns ptag pst pmg ?_ ?_ ?_ ?_ target inTextRun pre domCs lo hi a
     (fun _ _ => trivial) hlen (by simpa using hbound) (by simpa using hdep) hparLo hpreSub hpar (by simpa using hdom)
   · intro inRun pr _ _ a0 hpar0
     exact ⟨[], Nat.le_refl _, by simp [hydrateDomKidsM, StateT.run, pure, StateT.pure, htmlListNodeCount],
       by simpa [hydrateDomKidsM, StateT.run, pure, StateT.pure] using hpar0,
       (fun _ hm => nomatch hm), fun _ _ _ _ => rfl, trivial, fun _ => trivial⟩
-  · intro c rest inRun pr lo' hi' a0 s aMid hcEq _ _ hfPos hparLo' hloHi hhiNext hbd' hparNe huNext hslotEq haMidNext hgetNew hfrMid hih
+  · intro c rest inRun pr lo' hi' a0 s aMid hcEq _ _ hfPos _ _ hhiNext hbd' hparNe huNext hslotEq haMidNext hgetNew hfrMid hih
     dsimp only [id] at hcEq; subst hcEq; simp only [List.map_id] at hbd' hslotEq
-    let tn := UInt32.ofNat a0.nextId
-    have hstep : ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pr.length) inRun (.text s :: rest)).run a0).2 =
-        ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat (pr ++ [UInt32.ofNat a0.nextId]).length) inRun rest).run aMid).2 := by
-      dsimp only [StateT.run, hydrateDomKidsM, Html.textOf?, bind, StateT.bind]
-      rw [hslotEq]; dsimp only; simp only [List.length_append, List.length_singleton]; rw [← huNext]
-    rcases hih with ⟨hydRest, hnextR, hboundR, hparR, hsubR, hfrR, heqR, hclR⟩
-    rw [hstep]
-    have htnNat : tn.toNat = a0.nextId := uint32_toNat_ofNat_lt a0.nextId (by omega)
-    have haOutTn : ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat (pr ++ [UInt32.ofNat a0.nextId]).length) inRun rest).run aMid).2.get tn = .text s := by
-      rw [hfrR tn hparNe.symm (.inr (by omega)) (by rw [haMidNext]; omega), hgetNew]
-    refine ⟨tn :: hydRest, by rw [haMidNext] at hnextR; omega,
-      by rw [haMidNext] at hboundR; simp only [htmlListNodeCount, htmlNodeCount]; omega,
-      by simpa [List.append_assoc] using hparR, ?_, ?_, ?_, ?_⟩
-    · intro z hz; rcases List.mem_cons.1 hz with rfl | htail
-      · cases f with | zero => omega | succ _ =>
-          exact ⟨.inr ⟨by omega, by rw [haMidNext] at hnextR; omega⟩, by rw [haOutTn]; trivial⟩
-      · exact SubtreeInSet_mono (fun _ hkS => hkS.elim .inl fun h2 => .inr ⟨by rw [haMidNext] at h2; omega, h2.2⟩) (hsubR z htail)
-    · intro m hmPar hmOut hmLt
-      rw [hfrR m hmPar hmOut (by rw [haMidNext]; omega), hfrMid m hmPar (fun heq => by have : m.toNat = a0.nextId := heq ▸ htnNat; omega)]
-    · cases f with | zero => omega | succ _ =>
-        simp only [List.map_cons, specDomList, specDom, DomTreeListAssocEquiv, readDomTree, haOutTn]; exact ⟨rfl, heqR⟩
-    · intro hc; simp only [Html.DomCleanList, Html.DomClean, Bool.true_and] at hc
-      cases f with | zero => omega | succ _ =>
-        refine ⟨fun k => k = a0.nextId,
-          fun k => (lo' ≤ k ∧ k < hi') ∨ (aMid.nextId ≤ k ∧ k < _),
-          fun _ hk => .inr ⟨hk ▸ Nat.le_refl _, by rw [haMidNext] at hnextR; omega⟩,
-          fun _ hk => hk.elim .inl (fun h => .inr ⟨by rw [haMidNext] at h; omega, h.2⟩),
-          fun _ hk1 hk2 => by rcases hk2 with h | h <;> omega,
-          ⟨htnNat, haOutTn⟩, hclR hc⟩
-  · intro c rest pr tn lo' mid hi' a0 s aMid f' hfEq hcEq _ _ hparLo' hloMid hmidHi hiNext htnLo htnMid hparNe huNext hslotEq haMidNext hgetTnMid hfrMid hih
+    have htnNat : (UInt32.ofNat a0.nextId).toNat = a0.nextId := uint32_toNat_ofNat_lt a0.nextId (by omega)
+    exact hydrateDomKidsM_text_finish (S_tn := fun k => k = a0.nextId) hfPos (Nat.le_refl _) (by rw [haMidNext]; omega)
+      (by rw [haMidNext]; exact Nat.le_refl _) hparNe huNext hslotEq hgetNew htnNat
+      (fun _ hk => .inr ⟨hk ▸ Nat.le_refl _, by rw [haMidNext]; omega⟩)
+      (fun _ hk => ⟨.inr (by omega), by rw [haMidNext]; omega⟩)
+      (fun m hmPar _ hmLt => hfrMid m hmPar (fun heq => by have : m.toNat = a0.nextId := heq ▸ htnNat; omega)) hih
+  · intro c rest pr tn lo' mid hi' a0 s aMid f' hfEq hcEq _ _ _ hloMid hmidHi hiNext htnLo htnMid hparNe huNext hslotEq haMidNext hgetTnMid hfrMid hih
     subst hfEq; dsimp only [id] at hcEq; subst hcEq; simp only [List.map_id] at hslotEq
-    have hstep : ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pr.length) false (.text s :: rest)).run a0).2 =
-        ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat (pr ++ [tn]).length) true rest).run aMid).2 := by
-      dsimp only [StateT.run, hydrateDomKidsM, Html.textOf?, bind, StateT.bind]
-      rw [hslotEq]; dsimp only; simp only [List.length_append, List.length_singleton]; rw [← huNext]
-    rcases hih with ⟨hydRest, hnextR, hboundR, hparR, hsubR, hfrR, heqR, hclR⟩
-    rw [hstep]
-    have haOutTn : ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat (pr ++ [tn]).length) true rest).run aMid).2.get tn = .text s := by
-      rw [hfrR tn hparNe.symm (.inl htnMid) (by rw [haMidNext]; omega), hgetTnMid]
-    refine ⟨tn :: hydRest, by rw [haMidNext] at hnextR; omega,
-      by rw [haMidNext] at hboundR; simp only [htmlListNodeCount, htmlNodeCount]; omega,
-      by simpa [List.append_assoc] using hparR, ?_, ?_, ?_, ?_⟩
-    · intro z hz; rcases List.mem_cons.1 hz with rfl | htail
-      · exact ⟨.inl ⟨htnLo, Nat.lt_of_lt_of_le htnMid hmidHi⟩, by rw [haOutTn]; trivial⟩
-      · exact SubtreeInSet_mono (fun _ hkS => hkS.elim (fun h => .inl ⟨Nat.le_trans hloMid h.1, h.2⟩) (fun h => .inr ⟨by rw [haMidNext] at h; omega, h.2⟩)) (hsubR z htail)
-    · intro m hmPar hmOut hmLt
-      rw [hfrR m hmPar (hmOut.elim (fun h1 => .inl (by omega)) .inr) (by rw [haMidNext]; omega),
-          hfrMid m (fun heq => by rw [heq] at hmOut; rcases hmOut with h1 | h2 <;> omega)]
-    · simp only [List.map_cons, specDomList, specDom, DomTreeListAssocEquiv, readDomTree, haOutTn]; exact ⟨rfl, heqR⟩
-    · intro hc; simp only [Html.DomCleanList, Html.DomClean, Bool.true_and] at hc
-      refine ⟨fun k => lo' ≤ k ∧ k < mid, fun k => (mid ≤ k ∧ k < hi') ∨ (aMid.nextId ≤ k ∧ k < _),
-        fun _ hk => .inl ⟨hk.1, Nat.lt_of_lt_of_le hk.2 hmidHi⟩,
-        fun _ hk => hk.elim (fun h => .inl ⟨Nat.le_trans hloMid h.1, h.2⟩) (fun h => .inr ⟨by rw [haMidNext] at h; exact h.1, h.2⟩),
-        fun _ hk1 hk2 => by rcases hk2 with h | h <;> omega, ⟨⟨htnLo, htnMid⟩, haOutTn⟩, hclR hc⟩
+    exact hydrateDomKidsM_text_finish (S_tn := fun k => lo' ≤ k ∧ k < mid) (Nat.succ_pos _) hloMid (by rw [haMidNext]; exact Nat.le_refl _)
+      (by rw [haMidNext]; omega) hparNe huNext hslotEq hgetTnMid ⟨htnLo, htnMid⟩
+      (fun _ hk => .inl ⟨hk.1, Nat.lt_of_lt_of_le hk.2 hmidHi⟩)
+      (fun _ hk => ⟨.inl hk.2, by rw [haMidNext]; omega⟩)
+      (fun m _ hmOut _ => hfrMid m (fun heq => by rw [heq] at hmOut; rcases hmOut with h1 | h2 <;> omega)) hih
   · intro c rest inRun pr child domRest lo' mid hi' a0 f' hfEq htxt _ _ _ huIdx huNext hbd' hcDep _ hparLo' hloMid hmidHi hiNext hpar0 hchildDom _ hcont
     subst hfEq; simp only [List.map_id] at hbd'
     rcases textOf_none_is_element htxt with ⟨tag, attrs, kids, hcEq⟩; subst hcEq
     let aMid := (hydrateDomM (m := StateM (DomArena msg)) (.element tag attrs kids) child a0).2
-    have hchildSpec := hDom f' (Nat.lt_succ_self f') childNs (.element tag attrs kids) child a0 lo' mid
-      (by simp only [htmlListNodeCount] at hbd'; omega) hcDep hchildDom
-    dsimp only [StateT.run] at hchildSpec
-    change a0.nextId ≤ aMid.nextId ∧ aMid.nextId ≤ a0.nextId + htmlNodeCount (.element tag attrs kids) ∧
-      SubtreeInSet (f' + 1) aMid (fun k => (lo' ≤ k ∧ k < mid) ∨ (a0.nextId ≤ k ∧ k < aMid.nextId)) child ∧
-      (∀ m : Dom.Node, (m.toNat < lo' ∨ mid ≤ m.toNat) → m.toNat < a0.nextId → aMid.get m = a0.get m) ∧
-      DomTreeAssocEquiv (readDomTree (f' + 1) aMid child) (specDom childNs (.element tag attrs kids)) ∧
-      ((Html.element tag attrs kids).DomClean = true →
-        CleanDomSubtree (f' + 1) childNs (.element tag attrs kids) aMid
-          (fun k => (lo' ≤ k ∧ k < mid) ∨ (a0.nextId ≤ k ∧ k < aMid.nextId)) child) at hchildSpec
+    have hchildSpec : DomHydrateOut f' childNs (.element tag attrs kids) child a0 lo' mid aMid :=
+      hDom f' (Nat.lt_succ_self f') childNs (.element tag attrs kids) child a0 lo' mid
+        (by simp only [htmlListNodeCount] at hbd'; omega) hcDep hchildDom
     rcases hchildSpec with ⟨haMidNext, haMidBound, hchildSubMid, hframeMid, hequivChild, hchildClMid⟩
     have hih := (hcont aMid haMidNext haMidBound hchildSubMid hframeMid).1
     rcases hih with ⟨hydRest, hnextR, hboundR, hparR, hsubR, hfrR, heqR, hclR⟩
@@ -769,7 +707,7 @@ private theorem hydrateDomKidsM_spec_step {msg : Type} (f : Nat)
         (hm.elim (fun h1 => .inl h1.2) (fun h2 => .inr (Nat.le_trans hiNext h2.1)))
         (hm.elim (fun h1 => by omega) (fun h2 => h2.2))
     have haOutChild := SubtreeInSet_frame (n := child) hfrChild hchildSubMid
-    rw [hstep]
+    dsimp only [KidsHydrateOut]; rw [hstep]
     refine ⟨child :: hydRest, Nat.le_trans haMidNext hnextR, by simp only [htmlListNodeCount]; omega,
       by simpa [List.append_assoc] using hparR, ?_, ?_, ?_, ?_⟩
     · intro z hz; rcases List.mem_cons.1 hz with rfl | htail
@@ -787,6 +725,30 @@ private theorem hydrateDomKidsM_spec_step {msg : Type} (f : Nat)
         fun _ hk1 hk2 => by rcases hk1 with h1 | h1 <;> rcases hk2 with h2 | h2 <;> omega,
         CleanDomSubtree_frame hfrChild (hchildClMid hc.1), hclR hc.2⟩
 
+theorem hydrateElemAttrs_step {msg : Type} (a : DomArena msg) (root : Dom.Node)
+    (ns tag : String) (st : SpecElemState msg) (prev : List String) (domCs : List Dom.Node)
+    (attrs : List (Attr msg))
+    (hget : a.get root = .element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag st prev domCs)
+    (hm : ElemManaged ({ st with clicks := [], inputs := [] } : SpecElemState msg) prev)
+    (hns : AttrsNoShadow attrs ({ st with clicks := [], inputs := [] } : SpecElemState msg)) :
+    let aClear := a.modifyElemState root (fun st : SpecElemState msg => { st with clicks := [], inputs := [] })
+    let a2 := (applyAttrsM (m := StateM (DomArena msg)) root attrs aClear).2
+    ∃ st', a2.get root = .element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag st'
+        ((normalizeAttrs attrs).filterMap managedAttrName) domCs ∧
+      ElemStateEquiv st' (evalSpecAttrs attrs) ∧
+      ElemManaged st' ((normalizeAttrs attrs).filterMap managedAttrName) ∧
+      a2.nextId = a.nextId ∧ (∀ m : Dom.Node, m ≠ root → a2.get m = a.get m) := by
+  have hclear : a.modifyElemState root (fun st : SpecElemState msg => { st with clicks := [], inputs := [] }) =
+      a.set root (.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag
+        { st with clicks := [], inputs := [] } prev domCs) := by simp [DomArena.modifyElemState, DomArena.modify, hget]
+  rcases applyAttrsM_existing_element a root (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag
+      { st with clicks := [], inputs := [] } prev domCs attrs hm hns with ⟨st', ha2Get, ha2Eqv, hm'⟩
+  have ⟨ha2Next, ha2Out⟩ := applyAttrsM_preserves
+    (a.set root (.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag
+      { st with clicks := [], inputs := [] } prev domCs)) root attrs
+  dsimp only; rw [hclear]
+  exact ⟨st', ha2Get, ha2Eqv, hm', ha2Next, fun m hne => (ha2Out m hne).trans (DomArena.get_set_ne _ _ hne)⟩
+
 private theorem hydrateDomM_spec_strong (f : Nat) : @DomHydrateSpecAt msg f := by
   induction f using Nat.strongRecOn with
   | ind f ihDom =>
@@ -794,118 +756,59 @@ private theorem hydrateDomM_spec_strong (f : Nat) : @DomHydrateSpecAt msg f := b
       cases h with
       | text s =>
           rcases hdom with ⟨hlo, hhi, hnext, hget⟩
-          simp only [hydrateDomM, StateT.run, pure, StateT.pure]
-          refine ⟨Nat.le_refl _, by simp [htmlNodeCount], ?_, ?_, ?_, ?_⟩
-          · exact ⟨.inl ⟨hlo, hhi⟩, by simp [hget]⟩
-          · intro _ _ _; exact trivial
-          · simp [readDomTree, hget, specDom, DomTreeAssocEquiv]
-          · intro _; exact ⟨.inl ⟨hlo, hhi⟩, hget⟩
+          simp only [DomHydrateOut, hydrateDomM, StateT.run, pure, StateT.pure]
+          refine ⟨Nat.le_refl _, by simp [htmlNodeCount], ⟨.inl ⟨hlo, hhi⟩, by simp [hget]⟩,
+            fun _ _ _ => trivial, by simp [readDomTree, hget, specDom, DomTreeAssocEquiv],
+            fun _ => ⟨.inl ⟨hlo, hhi⟩, hget⟩⟩
       | element tag attrs cs =>
           rcases hdom with ⟨hlo, hhi, hnext, st, prev, domCs, hget, hm, hns, hownT, hownF⟩
-          have hattrs := applyAttrsM_existing_element a root
-            (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag
-            { st with clicks := [], inputs := [] } prev domCs attrs hm hns
-          rcases hattrs with ⟨st', ha2Get, ha2Eqv, hm'⟩
           let a2 := (applyAttrsM (m := StateM (DomArena msg)) root attrs
-            (a.set root (.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag
-              { st with clicks := [], inputs := [] } prev domCs))).2
-          have ha2Next : a2.nextId = a.nextId := applyAttrsM_nextId a root attrs
-            (.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag
-              { st with clicks := [], inputs := [] } prev domCs)
-          have ha2Outside : ∀ m : Dom.Node, m ≠ root → a2.get m = a.get m := by
-            intro m hne
-            exact applyAttrsM_get_ne a root attrs _ m hne
-          have hpreBind :
-              ((hydrateDomM (m := StateM (DomArena msg)) (.element tag attrs cs) root).run a).2 =
-              if !ownsChildren attrs then
-                ((hydrateDomKidsM (m := StateM (DomArena msg)) root 0 false cs).run a2).2
-              else a2 := by
-            dsimp only [hydrateDomM, StateT.run, bind, StateT.bind, pure, StateT.pure]
-            have hclearMod : a.modifyElemState root (fun st : SpecElemState msg => { st with clicks := [], inputs := [] }) =
-                a.set root (.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag
-                  { st with clicks := [], inputs := [] } prev domCs) := by
-              simp [DomArena.modifyElemState, DomArena.modify, hget]
-            rw [hclearMod]
-            cases hresA : applyAttrsM (m := StateM (DomArena msg)) root attrs
-                (a.set root (.element (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag
-                  { st with clicks := [], inputs := [] } prev domCs)) with
-            | mk u s' =>
-                have hsEq : s' = a2 := by dsimp [a2]; rw [hresA]
-                subst hsEq
-                cases ownsChildren attrs <;> rfl
+            (a.modifyElemState root fun st => { st with clicks := [], inputs := [] })).2
+          rcases hydrateElemAttrs_step a root ns tag st prev domCs attrs hget hm hns with
+            ⟨st', ha2Get, ha2Eqv, hm', ha2Next, ha2Outside⟩
+          have ha2Next' : a2.nextId = a.nextId := ha2Next
+          have hpreBind : ((hydrateDomM (m := StateM (DomArena msg)) (.element tag attrs cs) root).run a).2 =
+              if !ownsChildren attrs then ((hydrateDomKidsM (m := StateM (DomArena msg)) root 0 false cs).run a2).2 else a2 := by
+            dsimp only [hydrateDomM, StateT.run, bind, StateT.bind, pure, StateT.pure, MonadDom.clearHandlers]
+            cases ownsChildren attrs <;> rfl
+          dsimp only [DomHydrateOut]; rw [hpreBind]
           cases hown : ownsChildren attrs with
           | true =>
-              have hrunOut : ((hydrateDomM (m := StateM (DomArena msg)) (.element tag attrs cs) root).run a).2 = a2 := by
-                rw [hpreBind, hown]; rfl
-              rw [hrunOut]
-              have hdomNil : domCs = [] := hownT hown
-              subst hdomNil
-              refine ⟨by rw [ha2Next]; exact Nat.le_refl _, by rw [ha2Next]; simp [htmlNodeCount], ?_, ?_, ?_, ?_⟩
-              · dsimp only [SubtreeInSet]
-                refine ⟨.inl ⟨hlo, hhi⟩, ?_⟩
-                rw [ha2Get]
-                intro c hc; nomatch hc
-              · intro m hmOut hmLt
-                have hne : m ≠ root := by intro heq; rw [heq] at hmOut; omega
-                exact ha2Outside m hne
-              · dsimp only [readDomTree, specDom]
-                rw [ha2Get, hown]
-                exact ⟨rfl, rfl, ha2Eqv, trivial⟩
-              · intro hc; simp [Html.DomClean, hown] at hc
+              simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+              have hdomNil : domCs = [] := hownT hown; subst hdomNil
+              refine ⟨by omega, by simp only [htmlNodeCount]; omega,
+                ⟨.inl ⟨hlo, hhi⟩, by rw [ha2Get]; intro _ hc; nomatch hc⟩,
+                fun m hmOut _ => ha2Outside m (fun heq => by rw [heq] at hmOut; omega),
+                by dsimp only [readDomTree, specDom]; rw [ha2Get, hown]; exact ⟨rfl, rfl, ha2Eqv, trivial⟩,
+                fun hc => by simp [Html.DomClean, hown] at hc⟩
           | false =>
-              have hrunOut : ((hydrateDomM (m := StateM (DomArena msg)) (.element tag attrs cs) root).run a).2 =
-                  ((hydrateDomKidsM (m := StateM (DomArena msg)) root 0 false cs).run a2).2 := by
-                rw [hpreBind, hown]; rfl
+              simp only [Bool.not_false, ↓reduceIte]
               rcases hownF hown with ⟨mid, hmidGt, hk⟩
               rcases HydratableDomList_bounds f (Dom.childNsOf ns tag) (coalesceTextRun cs) a mid hi domCs hk with ⟨hmidHi, hhiNext⟩
-              have hkFrame : HydratableDomList f (Dom.childNsOf ns tag) (coalesceTextRun cs) a2 mid hi domCs :=
-                HydratableDomList_frame f (Dom.childNsOf ns tag) (coalesceTextRun cs) a a2 mid hi domCs
-                  (by rw [ha2Next]; exact Nat.le_refl _) (fun m hm1 _ => ha2Outside m (by intro heq; rw [heq] at hm1; omega)) hk
-              have hcsLenLt : ([] : List Dom.Node).length + cs.length < UInt32.size := by
-                simp only [List.length_nil, Nat.zero_add]
-                have := list_length_le_htmlListNodeCount cs
-                simp only [htmlNodeCount] at hbound
-                omega
-              have ha2Bound : a2.nextId + htmlListNodeCount cs < UInt32.size := by
-                simp only [htmlNodeCount] at hbound; omega
-              have hcsDep : htmlListDepth cs ≤ f := by
-                simp only [htmlDepth] at hdep; omega
+              have hkFrame := HydratableDomList_frame f (Dom.childNsOf ns tag) (coalesceTextRun cs) a a2 mid hi domCs
+                (by omega) (fun m hm1 _ => ha2Outside m (fun heq => by rw [heq] at hm1; omega)) hk
               have hkidsRun := hydrateDomKidsM_spec_step f ihDom (Dom.childNsOf ns tag) root
                 (if ns == "" && tag == "svg" then Dom.svgNs else ns) tag st'
-                ((normalizeAttrs attrs).filterMap managedAttrName)
-                cs false [] domCs mid hi a2 hcsLenLt ha2Bound hcsDep hmidGt
-                (fun _ hm => nomatch hm) ha2Get hkFrame
+                ((normalizeAttrs attrs).filterMap managedAttrName) cs false [] domCs mid hi a2
+                (by have := list_length_le_htmlListNodeCount cs; simp only [htmlNodeCount] at hbound; simp; omega)
+                (by simp only [htmlNodeCount] at hbound; omega) (by simp only [htmlDepth] at hdep; omega)
+                hmidGt (fun _ hm => nomatch hm) ha2Get hkFrame
               simp only [List.length_nil] at hkidsRun
-              change ∃ hydratedCs, _ ∧ _ ∧ _ ∧ _ ∧ _ ∧ _ ∧ _ at hkidsRun
-              have hzeroEq : (UInt32.ofNat 0 : UInt32) = 0 := rfl
-              rw [hzeroEq] at hkidsRun
+              rw [show (UInt32.ofNat 0 : UInt32) = 0 from rfl] at hkidsRun
               rcases hkidsRun with ⟨hydratedCs, hnextLe, hnextBound, hgetOut, hsubSet, hframeKids, hequivKids, hcleanKids⟩
-              rw [hrunOut]
               refine ⟨by omega, by simp only [htmlNodeCount]; omega, ?_, ?_, ?_, ?_⟩
-              · dsimp only [SubtreeInSet]
-                refine ⟨.inl ⟨hlo, hhi⟩, ?_⟩
-                rw [hgetOut]
-                intro c hc
-                exact SubtreeInSet_mono (fun k hkS => by
-                  rcases hkS with ⟨h1, h2⟩ | ⟨h1, h2⟩
-                  · exact .inl ⟨by omega, h2⟩
-                  · exact .inr ⟨by omega, h2⟩) (hsubSet c hc)
+              · refine ⟨.inl ⟨hlo, hhi⟩, ?_⟩; rw [hgetOut]
+                exact fun c hc => SubtreeInSet_mono (fun _ hkS => hkS.elim (fun h => .inl ⟨by omega, h.2⟩) (fun h => .inr ⟨by omega, h.2⟩)) (hsubSet c hc)
               · intro m hmOut hmLt
-                have hne : m ≠ root := by intro heq; rw [heq] at hmOut; omega
-                rw [hframeKids m hne (hmOut.elim (fun h1 => .inl (by omega)) .inr) (by omega),
-                    ha2Outside m hne]
-              · dsimp only [readDomTree, specDom]
-                rw [hgetOut, hown]
-                exact ⟨rfl, rfl, ha2Eqv, hequivKids⟩
+                have hne : m ≠ root := fun heq => by rw [heq] at hmOut; omega
+                rw [hframeKids m hne (hmOut.elim (fun h1 => .inl (by omega)) .inr) (by omega), ha2Outside m hne]
+              · dsimp only [readDomTree, specDom]; rw [hgetOut, hown]; exact ⟨rfl, rfl, ha2Eqv, hequivKids⟩
               · intro hc
                 simp only [Html.DomClean, hown, Bool.not_false, Bool.true_and, Bool.and_eq_true] at hc
-                refine ⟨.inl ⟨hlo, hhi⟩, hown, hc.1, st', (normalizeAttrs attrs).filterMap managedAttrName, hydratedCs,
-                  hgetOut, ⟨hm', fun k hk => (ha2Eqv.1 k).trans ((ElemClean_evalSpecAttrs hc.1).2 k hk)⟩,
+                exact ⟨.inl ⟨hlo, hhi⟩, hown, hc.1, st', (normalizeAttrs attrs).filterMap managedAttrName, hydratedCs,
+                  hgetOut, ⟨hm', fun k hk => (SlotVal.optStr.inj (ha2Eqv (.attr k))).trans ((ElemClean_evalSpecAttrs hc.1).2 k hk)⟩,
                   ha2Eqv, fun nm hnm => List.contains_iff_mem.2 hnm,
-                  CleanDomChildren_mono (fun k hkS => ?_) (hcleanKids hc.2)⟩
-                rcases hkS with ⟨h1, h2⟩ | ⟨h1, h2⟩
-                · exact ⟨.inl ⟨by omega, h2⟩, by omega⟩
-                · exact ⟨.inr ⟨by rw [ha2Next] at h1; exact h1, h2⟩, by rw [ha2Next] at h1; omega⟩
+                  CleanDomChildren_mono (fun _ hkS => hkS.elim (fun h => ⟨.inl ⟨by omega, h.2⟩, by omega⟩) (fun h => ⟨.inr ⟨by omega, h.2⟩, by omega⟩)) (hcleanKids hc.2)⟩
 
 /-- Imperative HTML5 hydration simulation for `hydrateDomM`:
     given an SSR-parsed `HydratableDom` tree whose text children were coalesced by the HTML5 parser
@@ -913,17 +816,9 @@ private theorem hydrateDomM_spec_strong (f : Nat) : @DomHydrateSpecAt msg f := b
     match `specDom ns h` via `DomTreeAssocEquiv`, producing `CleanDomSubtree` whenever `h.DomClean`. -/
 theorem hydrateDomM_spec {msg : Type} (ns : String)
     (f : Nat) (h : Html msg) (root : Dom.Node) (a : DomArena msg) (lo hi : Nat)
-    (hbound : a.nextId + htmlNodeCount h < UInt32.size)
-    (hdep : htmlDepth h ≤ f + 1)
+    (hbound : a.nextId + htmlNodeCount h < UInt32.size) (hdep : htmlDepth h ≤ f + 1)
     (hdom : HydratableDom (f + 1) ns h a lo hi root) :
-    let aOut := ((hydrateDomM (m := StateM (DomArena msg)) h root).run a).2
-    a.nextId ≤ aOut.nextId ∧
-    aOut.nextId ≤ a.nextId + htmlNodeCount h ∧
-    SubtreeInSet (f + 1) aOut (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) root ∧
-    (∀ m : Dom.Node, (m.toNat < lo ∨ hi ≤ m.toNat) → m.toNat < a.nextId → aOut.get m = a.get m) ∧
-    DomTreeAssocEquiv (readDomTree (f + 1) aOut root) (specDom ns h) ∧
-    (h.DomClean = true →
-      CleanDomSubtree (f + 1) ns h aOut (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) root) :=
+    DomHydrateOut f ns h root a lo hi ((hydrateDomM (m := StateM (DomArena msg)) h root).run a).2 :=
   hydrateDomM_spec_strong f ns h root a lo hi hbound hdep hdom
 
 /-- Imperative child-list HTML5 hydration simulation for `hydrateDomKidsM`:
@@ -933,23 +828,13 @@ theorem hydrateDomKidsM_spec {msg : Type} (childNs : String) (parent : Dom.Node)
     (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
     (f : Nat) (target : List (Html msg)) (inTextRun : Bool)
     (pre domCs : List Dom.Node) (lo hi : Nat) (a : DomArena msg)
-    (hlen : pre.length + target.length < UInt32.size)
-    (hbound : a.nextId + htmlListNodeCount target < UInt32.size)
-    (hdep : htmlListDepth target ≤ f)
-    (hparLo : parent.toNat < lo)
+    (hlen : pre.length + target.length < UInt32.size) (hbound : a.nextId + htmlListNodeCount target < UInt32.size)
+    (hdep : htmlListDepth target ≤ f) (hparLo : parent.toNat < lo)
     (hpreSub : ∀ x ∈ pre, ∃ Sx, (∀ k, Sx k → (parent.toNat < k ∧ k < lo) ∨ (hi ≤ k ∧ k < a.nextId)) ∧ SubtreeInSet f a Sx x)
     (hpar : a.get parent = .element pns ptag pst pmg (pre ++ domCs))
     (hdom : HydratableDomList f childNs (if inTextRun then dropCurrentTextRun target else coalesceTextRun target) a lo hi domCs) :
-    let aOut := ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) inTextRun target).run a).2
-    ∃ (hydratedCs : List Dom.Node),
-      a.nextId ≤ aOut.nextId ∧
-      aOut.nextId ≤ a.nextId + htmlListNodeCount target ∧
-      aOut.get parent = .element pns ptag pst pmg (pre ++ hydratedCs) ∧
-      (∀ c ∈ hydratedCs, SubtreeInSet f aOut (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) c) ∧
-      (∀ m : Dom.Node, m ≠ parent → (m.toNat < lo ∨ hi ≤ m.toNat) → m.toNat < a.nextId → aOut.get m = a.get m) ∧
-      DomTreeListAssocEquiv (hydratedCs.map (readDomTree f aOut)) (specDomList childNs target) ∧
-      (Html.DomCleanList target = true →
-        CleanDomChildren f childNs target aOut (fun k => (lo ≤ k ∧ k < hi) ∨ (a.nextId ≤ k ∧ k < aOut.nextId)) hydratedCs) :=
+    KidsHydrateOut f childNs parent pns ptag pst pmg target pre lo hi a
+      ((hydrateDomKidsM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) inTextRun target).run a).2 :=
   hydrateDomKidsM_spec_step f (fun f' _ => hydrateDomM_spec_strong f') childNs parent pns ptag pst pmg
     target inTextRun pre domCs lo hi a hlen hbound hdep hparLo hpreSub hpar hdom
 

@@ -39,31 +39,20 @@ instance : FromJson SocketStatus := ⟨fun j =>
   | some "disconnected" => .ok .disconnected
   | some "connecting"   => .ok .connecting
   | some "connected"    => .ok .connected
-  | some "reconnecting" =>
-      match j.get? "a" with
-      | some v => (FromJson.fromJson (α := Nat) v).map .reconnecting
-      | none   => .error "SocketStatus.reconnecting: missing 'a'"
-  | some "failed" =>
-      .ok (.failed (((j.get? "e").bind (·.str?)).getD ""))
+  | some "reconnecting" => ((j.field "a").bind fromJson).map .reconnecting
+  | some "failed"       => .ok (.failed (((j.get? "e").bind (·.str?)).getD ""))
   | _ => .error "expected a SocketStatus"⟩
 
 instance : LawfulJson SocketStatus where
   depthBound := 1 + LawfulJson.depthBound Nat
   depth_toJson
     | .disconnected | .connecting | .connected | .failed _ => Nat.le_add_right 1 _
-    | .reconnecting n => Nat.add_le_add_left (Json.maxObj_le_iff.2 (by
-        intro kv hkv
-        simp only [List.mem_cons, List.not_mem_nil, or_false] at hkv
-        rcases hkv with rfl | rfl
-        · exact Nat.zero_le _
-        · exact LawfulJson.depth_toJson n)) 1
+    | .reconnecting n => Nat.add_le_add_left (by simpa [Json.maxObj] using LawfulJson.depth_toJson n) 1
   fromJson_toJson
     | .disconnected | .connecting | .connected | .failed _ => rfl
     | .reconnecting n => by
-        change (FromJson.fromJson (toJson n) : Except String Nat).map SocketStatus.reconnecting =
-          .ok (.reconnecting n)
-        rw [LawfulJson.fromJson_toJson n]
-        rfl
+        change (FromJson.fromJson (toJson n) : Except String Nat).map SocketStatus.reconnecting = _
+        rw [LawfulJson.fromJson_toJson n]; rfl
 
 instance : NonNullJson SocketStatus :=
   ⟨fun | .disconnected | .connecting | .connected | .reconnecting _ | .failed _ => nofun⟩
@@ -80,28 +69,18 @@ private def decodeFields (fs : List (Nat × Proto.WireVal)) : Except String Sock
   | some (.varint 0) => .ok .disconnected
   | some (.varint 1) => .ok .connecting
   | some (.varint 2) => .ok .connected
-  | some (.varint 3) =>
-      match Proto.lookupField 2 fs with
-      | some w => (FromProto.fromProtoVal (α := Nat) w).map .reconnecting
-      | none   => .error "SocketStatus.reconnecting: missing field 2"
-  | some (.varint 4) =>
-      match Proto.lookupField 2 fs with
-      | some w => (FromProto.fromProtoVal (α := String) w).map .failed
-      | none   => .error "SocketStatus.failed: missing field 2"
+  | some (.varint 3) => (Proto.decodeFieldVal 2 fs "SocketStatus.reconnecting: missing field 2").map .reconnecting
+  | some (.varint 4) => (Proto.decodeFieldVal 2 fs "SocketStatus.failed: missing field 2").map .failed
   | _ => .error "protobuf: invalid SocketStatus tag"
 
 instance : ToProto SocketStatus   := .ofFields encodeFields
 instance : FromProto SocketStatus := .ofFields decodeFields
 instance : LawfulProto SocketStatus :=
   .ofFields encodeFields decodeFields
-    (by
-      intro s kw h
-      cases s <;>
-        (simp only [encodeFields, List.mem_cons, List.not_mem_nil, or_false] at h
-         rcases h with rfl | rfl <;> simp))
-    (by
-      intro s
-      cases s <;> simp [encodeFields, decodeFields, Proto.lookupField, Except.map])
+    (by intro s kw h; cases s <;>
+          (simp only [encodeFields, List.mem_cons, List.not_mem_nil, or_false] at h
+           rcases h with rfl | rfl <;> simp))
+    (by intro s; cases s <;> simp [encodeFields, decodeFields, Proto.decodeFieldVal, Proto.lookupField, Except.map])
 
 end SocketStatus
 
@@ -126,19 +105,9 @@ def nextDelayMs (p : Reconnect) (attempt : Nat) : Option Nat :=
   match p with
   | .off => none
   | .fixed delayMs maxRetries =>
-      match maxRetries with
-      | some limit => if attempt < limit then some delayMs else none
-      | none       => some delayMs
+      if maxRetries.all (attempt < ·) then some delayMs else none
   | .backoff initialMs maxMs maxRetries =>
-      match maxRetries with
-      | some limit =>
-          if attempt < limit then
-            let shift := min attempt 20
-            some (min maxMs (initialMs * (2 ^ shift)))
-          else none
-      | none =>
-          let shift := min attempt 20
-          some (min maxMs (initialMs * (2 ^ shift)))
+      if maxRetries.all (attempt < ·) then some (min maxMs (initialMs * (2 ^ min attempt 20))) else none
 
 theorem nextDelayMs_off (attempt : Nat) :
     Reconnect.off.nextDelayMs attempt = none := rfl
@@ -155,18 +124,7 @@ theorem nextDelayMs_backoff_le_max (initialMs maxMs : Nat) (maxRetries : Option 
     (attempt d : Nat)
     (h : (Reconnect.backoff initialMs maxMs maxRetries).nextDelayMs attempt = some d) :
     d ≤ maxMs := by
-  cases maxRetries with
-  | none =>
-      simp only [nextDelayMs, Option.some.injEq] at h
-      subst h
-      exact Nat.min_le_left _ _
-  | some limit =>
-      simp only [nextDelayMs] at h
-      split at h
-      · injection h with h
-        subst h
-        exact Nat.min_le_left _ _
-      · contradiction
+  simp only [nextDelayMs] at h; split at h <;> cases h; exact Nat.min_le_left _ _
 
 end Reconnect
 
@@ -235,38 +193,32 @@ def encode : WsMuxFrame → ByteArray
   | .closed sid reason =>
       mkMuxHdr 0x14 sid ++ reason.toUTF8
 
+@[inline] private def decodeBody (op : UInt8) (sid : UInt32) (rest : ByteArray) :
+    Except String WsMuxFrame :=
+  match op with
+  | 0x01 => do
+      let some chLen := readU16BE rest 0 | throw "truncated ws sub channel length"
+      let n := chLen.toNat
+      if 2 + n ≤ rest.size then
+        match String.fromUTF8? (rest.extract 2 (2 + n)) with
+        | some ch => return .sub sid ch (rest.extract (2 + n) rest.size)
+        | none    => throw "invalid UTF-8 in ws channel name"
+      else throw "truncated ws sub channel name"
+  | 0x02 =>
+      if rest.size == 0 then return .unsub sid
+      else throw "unexpected trailing bytes in ws unsub frame"
+  | 0x03 => return .send sid rest
+  | 0x11 => return .joinOk sid rest
+  | 0x12 => return .event sid rest
+  | 0x13 => (String.fromUTF8? rest).elim (throw "invalid UTF-8 in ws error frame") (return .err sid ·)
+  | 0x14 => (String.fromUTF8? rest).elim (throw "invalid UTF-8 in ws close frame") (return .closed sid ·)
+  | _ => throw s!"unknown ws mux opcode {op}"
+
 def decode (ba : ByteArray) : Except String WsMuxFrame := do
   if h0 : 5 ≤ ba.size then
     let op := ba[0]'(by omega)
     let some sid := readU32BE ba 1 | throw "truncated ws mux sub_id"
-    let rest := ba.extract 5 ba.size
-    match op with
-    | 0x01 =>
-        let some chLen := readU16BE rest 0 | throw "truncated ws sub channel length"
-        let n := chLen.toNat
-        if 2 + n ≤ rest.size then
-          let chBytes := rest.extract 2 (2 + n)
-          let params := rest.extract (2 + n) rest.size
-          match String.fromUTF8? chBytes with
-          | some ch => return .sub sid ch params
-          | none    => throw "invalid UTF-8 in ws channel name"
-        else
-          throw "truncated ws sub channel name"
-    | 0x02 =>
-        if rest.size == 0 then return .unsub sid
-        else throw "unexpected trailing bytes in ws unsub frame"
-    | 0x03 => return .send sid rest
-    | 0x11 => return .joinOk sid rest
-    | 0x12 => return .event sid rest
-    | 0x13 =>
-        match String.fromUTF8? rest with
-        | some msg => return .err sid msg
-        | none     => throw "invalid UTF-8 in ws error frame"
-    | 0x14 =>
-        match String.fromUTF8? rest with
-        | some msg => return .closed sid msg
-        | none     => throw "invalid UTF-8 in ws close frame"
-    | _ => throw s!"unknown ws mux opcode {op}"
+    decodeBody op sid (ba.extract 5 ba.size)
   else
     throw "ws mux frame shorter than 5-byte header"
 
@@ -275,25 +227,13 @@ private theorem u32_be_roundtrip (v : UInt32) :
     (v >>> 16).toUInt8.toUInt32 * (65536 : UInt32) +
     (v >>> 8).toUInt8.toUInt32 * (256 : UInt32) +
     v.toUInt8.toUInt32 = v := by
-  apply UInt32.eq_of_toBitVec_eq
-  apply BitVec.eq_of_toNat_eq
+  apply UInt32.eq_of_toBitVec_eq; apply BitVec.eq_of_toNat_eq
   have hv : v.toNat < 4294967296 := v.toBitVec.isLt
-  have h : ((v >>> 24).toUInt8.toUInt32 * (16777216 : UInt32) +
-            (v >>> 16).toUInt8.toUInt32 * (65536 : UInt32) +
-            (v >>> 8).toUInt8.toUInt32 * (256 : UInt32) +
-            v.toUInt8.toUInt32).toNat = v.toNat := by
-    simp only [UInt32.toNat_add, UInt32.toNat_mul, UInt8.toNat_toUInt32,
-      UInt32.toNat_toUInt8, UInt32.toNat_shiftRight]
-    have h1 : (24 : UInt32).toNat % 32 = 24 := rfl
-    have h2 : (16 : UInt32).toNat % 32 = 16 := rfl
-    have h3 : (8 : UInt32).toNat % 32 = 8 := rfl
-    have h4 : (16777216 : UInt32).toNat = 16777216 := rfl
-    have h5 : (65536 : UInt32).toNat = 65536 := rfl
-    have h6 : (256 : UInt32).toNat = 256 := rfl
-    rw [h1, h2, h3, h4, h5, h6]
-    simp only [Nat.shiftRight_eq_div_pow]
-    omega
-  exact h
+  change (_ : UInt32).toNat = v.toNat
+  simp only [UInt32.toNat_add, UInt32.toNat_mul, UInt8.toNat_toUInt32,
+    UInt32.toNat_toUInt8, UInt32.toNat_shiftRight, UInt32.reduceToNat, Nat.shiftRight_eq_div_pow,
+    Nat.reduceMod, Nat.reducePow]
+  omega
 
 private theorem byteArray_extract_append_right (a b : ByteArray) :
     (a ++ b).extract a.size (a ++ b).size = b := by
@@ -311,81 +251,39 @@ private theorem byteArray_extract_append_right (a b : ByteArray) :
 private theorem mkMuxHdr_size (op : UInt8) (sid : UInt32) :
     (mkMuxHdr op sid).size = 5 := rfl
 
-private theorem mkMuxHdr_get0 (op : UInt8) (sid : UInt32) (rest : ByteArray)
-    (h : 0 < (mkMuxHdr op sid ++ rest).size) :
-    (mkMuxHdr op sid ++ rest)[0]'h = op := by
-  rw [ByteArray.getElem_append_left (by simp [mkMuxHdr_size])]
-  rfl
-
 private theorem readU32BE_mkMuxHdr (op : UInt8) (sid : UInt32) (rest : ByteArray) :
     readU32BE (mkMuxHdr op sid ++ rest) 1 = some sid := by
   unfold readU32BE
   have hlen : 1 + 3 < (mkMuxHdr op sid ++ rest).size := by
     rw [ByteArray.size_append, mkMuxHdr_size]; omega
-  rw [dif_pos hlen]
-  dsimp only
-  congr 1
-  rw [ByteArray.getElem_append_left (by rw [mkMuxHdr_size]; omega),
-      ByteArray.getElem_append_left (by rw [mkMuxHdr_size]; omega),
-      ByteArray.getElem_append_left (by rw [mkMuxHdr_size]; omega),
-      ByteArray.getElem_append_left (by rw [mkMuxHdr_size]; omega)]
+  rw [dif_pos hlen]; dsimp only; congr 1
+  repeat rw [ByteArray.getElem_append_left (by rw [mkMuxHdr_size]; omega)]
   exact u32_be_roundtrip sid
+
+private theorem decode_mkMuxHdr (op : UInt8) (sid : UInt32) (rest : ByteArray) :
+    decode (mkMuxHdr op sid ++ rest) = decodeBody op sid rest := by
+  unfold decode
+  have h5 : 5 ≤ (mkMuxHdr op sid ++ rest).size := by rw [ByteArray.size_append, mkMuxHdr_size]; omega
+  rw [dif_pos h5, readU32BE_mkMuxHdr]; dsimp only
+  rw [ByteArray.getElem_append_left (by simp [mkMuxHdr_size])]
+  have hrest := byteArray_extract_append_right (mkMuxHdr op sid) rest
+  rw [mkMuxHdr_size] at hrest; rw [hrest]; rfl
 
 theorem decode_encode_unsub (sid : UInt32) :
     decode (encode (.unsub sid)) = .ok (.unsub sid) := by
-  have hread : readU32BE (mkMuxHdr 0x02 sid) 1 = some sid := by
-    simpa [ByteArray.append_empty] using readU32BE_mkMuxHdr 0x02 sid ByteArray.empty
-  unfold decode encode
-  have h5 : 5 ≤ (mkMuxHdr 0x02 sid).size := by rw [mkMuxHdr_size]; exact Nat.le_refl 5
-  rw [dif_pos h5, hread]
-  dsimp only
-  have hop : (mkMuxHdr 0x02 sid)[0]'(by rw [mkMuxHdr_size]; omega) = 0x02 := rfl
-  rw [hop]
-  have hrest : ((mkMuxHdr 0x02 sid).extract 5 (mkMuxHdr 0x02 sid).size).size = 0 := by
-    simp [mkMuxHdr_size]
-  simp [hrest, pure, Except.pure]
-
-private theorem decode_encode_payload (op : UInt8) (sid : UInt32) (payload : ByteArray)
-    (frame : WsMuxFrame)
-    (henc : encode frame = mkMuxHdr op sid ++ payload)
-    (hdec : (match op with
-      | 0x03 => (Except.ok (.send sid payload) : Except String WsMuxFrame)
-      | 0x11 => .ok (.joinOk sid payload)
-      | 0x12 => .ok (.event sid payload)
-      | _    => .error s!"unknown ws mux op {op.toNat}") = .ok frame) :
-    decode (encode frame) = .ok frame := by
-  rw [henc]
-  unfold decode
-  have hhdr := mkMuxHdr_size op sid
-  have h5 : 5 ≤ (mkMuxHdr op sid ++ payload).size := by
-    rw [ByteArray.size_append, hhdr]; omega
-  rw [dif_pos h5, readU32BE_mkMuxHdr]
-  dsimp only
-  rw [mkMuxHdr_get0]
-  have hrest := byteArray_extract_append_right (mkMuxHdr op sid) payload
-  rw [hhdr] at hrest
-  rw [hrest]
-  have hop : op = 0x03 ∨ op = 0x11 ∨ op = 0x12 := by
-    by_cases h3 : op = 0x03
-    · exact Or.inl h3
-    · by_cases h11 : op = 0x11
-      · exact Or.inr (Or.inl h11)
-      · by_cases h12 : op = 0x12
-        · exact Or.inr (Or.inr h12)
-        · simp at hdec
-  rcases hop with rfl | rfl | rfl <;> simpa [pure, Except.pure] using hdec
+  simpa [encode, ByteArray.append_empty, decodeBody] using decode_mkMuxHdr 0x02 sid ByteArray.empty
 
 theorem decode_encode_send (sid : UInt32) (payload : ByteArray) :
     decode (encode (.send sid payload)) = .ok (.send sid payload) :=
-  decode_encode_payload 0x03 sid payload (.send sid payload) rfl rfl
+  decode_mkMuxHdr 0x03 sid payload
 
 theorem decode_encode_joinOk (sid : UInt32) (snap : ByteArray) :
     decode (encode (.joinOk sid snap)) = .ok (.joinOk sid snap) :=
-  decode_encode_payload 0x11 sid snap (.joinOk sid snap) rfl rfl
+  decode_mkMuxHdr 0x11 sid snap
 
 theorem decode_encode_event (sid : UInt32) (payload : ByteArray) :
     decode (encode (.event sid payload)) = .ok (.event sid payload) :=
-  decode_encode_payload 0x12 sid payload (.event sid payload) rfl rfl
+  decode_mkMuxHdr 0x12 sid payload
 
 end WsMuxFrame
 

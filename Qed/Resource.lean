@@ -169,9 +169,7 @@ instance [FromJson α] : FromJson (Resource α) := ⟨fun j =>
   match (j.get? "t").bind (·.str?) with
   | some "idle"    => .ok .idle
   | some "loading" => .ok .loading
-  | some "ok"      => match j.get? "v" with
-                      | some v => (FromJson.fromJson v : Except String α).map .ok
-                      | none   => .error "Resource.ok: missing 'v'"
+  | some "ok"      => ((j.field "v").bind fromJson).map .ok
   | some "failed"  => .ok (.failed (((j.get? "e").bind (·.str?)).getD ""))
   | _              => .error "expected a Resource (tagged object)"⟩
 
@@ -179,36 +177,20 @@ instance [LawfulJson α] : LawfulJson (Resource α) where
   depthBound := 1 + LawfulJson.depthBound α
   depth_toJson
     | .idle | .loading | .failed _ => Nat.le_add_right 1 _
-    | .ok a => Nat.add_le_add_left (Json.maxObj_le_iff.2 (by
-        intro kv hkv; simp only [List.mem_cons, List.not_mem_nil, or_false] at hkv
-        rcases hkv with rfl | rfl
-        · exact Nat.zero_le _
-        · exact LawfulJson.depth_toJson a)) 1
+    | .ok a => Nat.add_le_add_left (by simpa [Json.maxObj] using LawfulJson.depth_toJson a) 1
   fromJson_toJson
     | .idle | .loading | .failed _ => rfl
     | .ok a => by
-        change (fromJson (toJson a) : Except String α).map Resource.ok = Except.ok (Resource.ok a)
+        change (fromJson (toJson a) : Except String α).map Resource.ok = _
         rw [LawfulJson.fromJson_toJson a]; rfl
 
 instance [ToJson α] : NonNullJson (Resource α) :=
   ⟨fun | .idle | .loading | .ok _ | .failed _ => nofun⟩
 
-instance [ToJson α] : ToJson (Cached α) :=
-  ⟨fun c => toJson (c.state, c.seen)⟩
-
-instance [FromJson α] : FromJson (Cached α) :=
-  ⟨fun j => (FromJson.fromJson (α := Resource α × List (String × α)) j).map fun p => ⟨p.1, p.2⟩⟩
-
-instance [LawfulJson α] : LawfulJson (Cached α) where
-  depthBound := LawfulJson.depthBound (Resource α × List (String × α))
-  depth_toJson c := LawfulJson.depth_toJson (c.state, c.seen)
-  fromJson_toJson c := by
-    rcases c with ⟨st, sn⟩
-    change (FromJson.fromJson (toJson (st, sn)) : Except String (Resource α × List (String × α))).map
-      (fun p => Cached.mk p.1 p.2) = .ok ⟨st, sn⟩
-    rw [LawfulJson.fromJson_toJson (st, sn)]
-    rfl
-
+instance [ToJson α] : ToJson (Cached α) := .ofEquiv fun c => (c.state, c.seen)
+instance [FromJson α] : FromJson (Cached α) := .ofEquiv fun p : Resource α × List (String × α) => ⟨p.1, p.2⟩
+instance [LawfulJson α] : LawfulJson (Cached α) :=
+  .ofEquiv (fun c => (c.state, c.seen)) (fun p => ⟨p.1, p.2⟩) (fun ⟨_, _⟩ => rfl)
 instance [ToJson α] : NonNullJson (Cached α) := ⟨nofun⟩
 
 private def encodeResourceFields [ToProto α] : Resource α → List (Nat × Proto.WireVal)
@@ -222,14 +204,8 @@ private def decodeResourceFields [FromProto α] (fs : List (Nat × Proto.WireVal
   match Proto.lookupField 1 fs with
   | some (.varint 0) => .ok .idle
   | some (.varint 1) => .ok .loading
-  | some (.varint 2) =>
-      match Proto.lookupField 2 fs with
-      | some w => (FromProto.fromProtoVal (α := α) w).map .ok
-      | none   => .error "Resource.ok: missing field 2"
-  | some (.varint 3) =>
-      match Proto.lookupField 2 fs with
-      | some w => (FromProto.fromProtoVal (α := String) w).map .failed
-      | none   => .error "Resource.failed: missing field 2"
+  | some (.varint 2) => (Proto.decodeFieldVal 2 fs "Resource.ok: missing field 2").map .ok
+  | some (.varint 3) => (Proto.decodeFieldVal 2 fs "Resource.failed: missing field 2").map .failed
   | _ => .error "protobuf: invalid Resource tag"
 
 instance [ToProto α]   : ToProto (Resource α)   := .ofFields encodeResourceFields
@@ -240,7 +216,7 @@ instance [LawfulProto α] : LawfulProto (Resource α) :=
     (by intro r kw h; cases r <;>
           (simp only [encodeResourceFields, List.mem_cons, List.not_mem_nil, or_false] at h
            rcases h with rfl | rfl <;> simp))
-    (by intro r; cases r <;> simp [encodeResourceFields, decodeResourceFields, Proto.lookupField, Except.map])
+    (by intro r; cases r <;> simp [encodeResourceFields, decodeResourceFields, Proto.decodeFieldVal, Proto.lookupField, Except.map])
 
 /-! ## Proof-Carrying RPC Responses (`Ensured`) & Typed Domain Outcomes -/
 
@@ -323,44 +299,25 @@ theorem Cached.lookup_put_ok {α : Type} (c : Cached α)
 
 private theorem find_take_mem {α : Type} (p : α → Bool) :
     ∀ (n : Nat) (xs : List α) (a : α), (xs.take n).find? p = some a → xs.find? p = some a
-  | 0, _, _, h => by simp at h
-  | _ + 1, [], _, h => by simp at h
+  | 0, _, _, h | _ + 1, [], _, h => by simp at h
   | n + 1, x :: xs, a, h => by
       simp only [List.take_succ_cons, List.find?] at h ⊢
-      cases hp : p x with
-      | true => simpa [hp] using h
-      | false =>
-          simp only [hp] at h
-          exact find_take_mem p n xs a h
+      cases hp : p x <;> simp only [hp] at h ⊢
+      · exact find_take_mem p n xs a h
+      · exact h
 
 private theorem find_filter_ne {α : Type} (p q : α → Bool) :
     ∀ (xs : List α) (a : α),
-      (xs.filter q).find? p = some a →
-      (∀ x, p x = true → q x = true) →
-      xs.find? p = some a
+      (xs.filter q).find? p = some a → (∀ x, p x = true → q x = true) → xs.find? p = some a
   | [], _, h, _ => by simp at h
   | x :: xs, a, h, hqp => by
-      simp only [List.filter_cons] at h
-      cases hq : q x with
-      | true =>
-          simp only [hq, ↓reduceIte, List.find?] at h
-          cases hp : p x with
-          | true =>
-              simp only [hp] at h
-              cases h
-              simp [List.find?, hp]
-          | false =>
-              simp only [hp] at h
-              simp only [List.find?, hp]
-              exact find_filter_ne p q xs a h hqp
+      simp only [List.filter_cons, List.find?] at h ⊢
+      cases hp : p x with
+      | true => simpa [hqp x hp, hp, List.find?] using h
       | false =>
-          simp only [hq, Bool.false_eq_true, ↓reduceIte] at h
-          have hpF : p x = false := by
-            cases hp : p x with
-            | false => rfl
-            | true => have := hqp x hp; simp [hq] at this
-          simp only [List.find?, hpF]
-          exact find_filter_ne p q xs a h hqp
+          cases hq : q x <;> rw [hq] at h
+          · simp only [Bool.false_eq_true, ↓reduceIte] at h; exact find_filter_ne p q xs a h hqp
+          · simp only [↓reduceIte, List.find?, hp] at h; exact find_filter_ne p q xs a h hqp
 
 theorem Cached.lookup_put_ok_sound {α : Type} (c : Cached α)
     (k k' currentKey : String) (v v' : α)
@@ -368,23 +325,14 @@ theorem Cached.lookup_put_ok_sound {α : Type} (c : Cached α)
     (k' = k ∧ v' = v) ∨ (k' ≠ k ∧ c.lookup k' = some v') := by
   simp only [Cached.lookup, Cached.put, Option.map_eq_some_iff] at h
   rcases h with ⟨kv, hfind, rfl⟩
-  have hmem := find_take_mem (fun x => x.1 == k') 32
-    ((k, v) :: c.seen.filter (fun x => x.1 != k)) kv hfind
+  have hmem := find_take_mem (·.1 == k') 32 _ kv hfind
   simp only [List.find?] at hmem
   by_cases heq : k = k'
-  · subst heq
-    simp only [beq_self_eq_true] at hmem
-    cases hmem
-    exact .inl ⟨rfl, rfl⟩
-  · have hbeq : (k == k') = false := beq_eq_false_iff_ne.2 heq
-    simp only [hbeq] at hmem
-    have horig := find_filter_ne (fun x => x.1 == k') (fun x => x.1 != k) c.seen kv hmem
-      (fun x hx => by
-        have hxk : x.1 = k' := eq_of_beq hx
-        subst hxk
-        exact bne_iff_ne.2 (fun h => heq h.symm))
-    refine .inr ⟨fun h => heq h.symm, ?_⟩
-    simp [Cached.lookup, horig]
+  · subst heq; simp only [beq_self_eq_true] at hmem; cases hmem; exact .inl ⟨rfl, rfl⟩
+  · simp only [beq_eq_false_iff_ne.2 heq] at hmem
+    have horig := find_filter_ne (·.1 == k') (·.1 != k) c.seen kv hmem
+      (fun x hx => bne_iff_ne.2 fun h => heq (h ▸ eq_of_beq hx))
+    exact .inr ⟨Ne.symm heq, by simp [Cached.lookup, horig]⟩
 
 theorem Cached.put_seen_length_le {α : Type} (c : Cached α) (k currentKey : String) (r : Resource α) :
     (c.put k r currentKey).seen.length ≤ Nat.max 32 c.seen.length := by

@@ -120,6 +120,29 @@ def resolveReplace {State Msg : Type}
     let vis' := log'.foldl (replayEntry stepOnly) conf'
     ({ st with visible := vis', confirmed := conf', log := log' }, mkBatchCmd cmds)
 
+@[inline] def appendNonPending {State Msg : Type} (st : SpecState State Msg)
+    (vis' : State) (entry : SpecEntry Msg) : SpecState State Msg :=
+  if st.log.isEmpty then { st with visible := vis', confirmed := vis', log := [] }
+  else { st with visible := vis', log := st.log ++ [entry] }
+
+@[inline] def appendPending {State Msg : Type} (stepOnly : State → Msg → State)
+    (st : SpecState State Msg) (specMsg : Msg) : SpecState State Msg :=
+  { visible := stepOnly st.visible specMsg, confirmed := st.confirmed,
+    nextTxId := st.nextTxId + 1, log := st.log ++ [SpecEntry.pending st.nextTxId specMsg] }
+
+@[inline] def resolveHeadHit {State Msg : Type} (upd : State → Msg → State × Cmd Msg)
+    (st : SpecState State Msg) (m0 : Msg) (tail : List (SpecEntry Msg))
+    (confirmOnHit : List Msg) : SpecState State Msg × Cmd Msg :=
+  let stepOnly := fun s m => (upd s m).1
+  let conf1 := stepOnly st.confirmed m0
+  if confirmOnHit.isEmpty then
+    let (conf2, log2) := drainConfirmed stepOnly conf1 tail
+    ({ st with confirmed := conf2, log := log2 }, .none)
+  else
+    let (conf2, cmds) := runMsgs upd conf1 confirmOnHit
+    let (conf3, log3) := drainConfirmed stepOnly conf2 tail
+    ({ st with visible := log3.foldl (replayEntry stepOnly) conf3, confirmed := conf3, log := log3 }, mkBatchCmd cmds)
+
 /-- Single step of the speculative state machine wrapping `upd : State → Msg → State × Cmd Msg`. -/
 def step {State Msg : Type}
     (upd : State → Msg → State × Cmd Msg)
@@ -129,36 +152,19 @@ def step {State Msg : Type}
   match classify st.visible msg with
   | .normal =>
       let (vis', cmd) := upd st.visible msg
-      if st.log.isEmpty then
-        ({ st with visible := vis', confirmed := vis' }, cmd)
-      else
-        ({ st with visible := vis', log := st.log ++ [SpecEntry.regular msg] }, cmd)
+      (appendNonPending st vis' (.regular msg), cmd)
   | .dispatch preMsg? preCmd specMsg rpcCmd =>
-      let txId := st.nextTxId
-      let (vis1, conf1, log1, cPre) :=
+      let (st1, cPre) :=
         match preMsg? with
-        | none => (st.visible, st.confirmed, st.log, preCmd)
+        | none => (st, preCmd)
         | some pm =>
             let (v1, c1) := upd st.visible pm
-            if st.log.isEmpty then (v1, v1, [], Cmd.batch [preCmd, c1])
-            else (v1, st.confirmed, st.log ++ [SpecEntry.resolved pm], Cmd.batch [preCmd, c1])
-      let vis2 := stepOnly vis1 specMsg
-      let log2 := log1 ++ [SpecEntry.pending txId specMsg]
-      ({ visible := vis2, confirmed := conf1, nextTxId := txId + 1, log := log2 },
-       Cmd.batch [cPre, rpcCmd txId])
+            (appendNonPending st v1 (.resolved pm), Cmd.batch [preCmd, c1])
+      (appendPending stepOnly st1 specMsg, Cmd.batch [cPre, rpcCmd st.nextTxId])
   | .resolve txId hit replMsgs confirmOnHit =>
       match st.log with
       | .pending id0 m0 :: tail =>
-          if hit && id0 == txId then
-            let conf1 := stepOnly st.confirmed m0
-            if confirmOnHit.isEmpty then
-              let (conf2, log2) := drainConfirmed stepOnly conf1 tail
-              ({ st with confirmed := conf2, log := log2 }, .none)
-            else
-              let (conf2, cmds) := runMsgs upd conf1 confirmOnHit
-              let (conf3, log3) := drainConfirmed stepOnly conf2 tail
-              let vis3 := log3.foldl (replayEntry stepOnly) conf3
-              ({ st with visible := vis3, confirmed := conf3, log := log3 }, mkBatchCmd cmds)
+          if hit && id0 == txId then resolveHeadHit upd st m0 tail confirmOnHit
           else resolveReplace upd txId replMsgs st
       | _ => resolveReplace upd txId replMsgs st
 

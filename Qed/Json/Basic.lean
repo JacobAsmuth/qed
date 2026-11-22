@@ -389,32 +389,20 @@ private theorem flatMap_escapeCharL_of_none : ∀ (cs : List Char),
       simp only [List.any_cons, Bool.or_eq_false_iff] at h
       simp [List.flatMap_cons, escapeCharL_of_not_needs h.1, flatMap_escapeCharL_of_none cs h.2]
 
+private theorem needsJsonEscapeByte_hi :
+    ∀ b : BitVec 8, b.toNat ≥ 128 → needsJsonEscapeByte ⟨b⟩ = false := by decide
+
+private theorem needsJsonEscapeByte_lo :
+    ∀ n : Fin 128, needsJsonEscapeByte (UInt8.ofNat n.val) = needsJsonEscape (Char.ofNat n.val) := by decide
+
 private theorem hasJsonEscapeByte_eq (s : String) :
-    hasAsciiByte s needsJsonEscapeByte = s.toList.any needsJsonEscape := by
-  apply hasAsciiByte_eq_any
-  · intro b hb
-    unfold needsJsonEscapeByte
-    have h1 : decide (b < 32) = false := by rw [decide_eq_false_iff_not]; change ¬(b.toNat < 32); omega
-    have h2 : (b == 34) = false := by rw [beq_eq_false_iff_ne]; intro h; subst h; exact absurd hb (by decide)
-    have h3 : (b == 92) = false := by rw [beq_eq_false_iff_ne]; intro h; subst h; exact absurd hb (by decide)
-    simp [h1, h2, h3]
-  · intro c hc
-    unfold needsJsonEscapeByte needsJsonEscape
-    have hlt : (UInt8.ofNat c.toNat).toNat = c.toNat := by change c.toNat % 256 = c.toNat; omega
-    have hlt32 : decide (UInt8.ofNat c.toNat < 32) = decide (c.toNat < 0x20) := by
-      by_cases h32 : c.toNat < 0x20
-      · simp [h32, show UInt8.ofNat c.toNat < 32 from (by omega : (UInt8.ofNat c.toNat).toNat < 32)]
-      · simp [h32, show ¬(UInt8.ofNat c.toNat < 32) from (by omega : ¬((UInt8.ofNat c.toNat).toNat < 32))]
-    change (decide (UInt8.ofNat c.toNat < 32) || (UInt8.ofNat c.toNat == UInt8.ofNat '"'.toNat) ||
-      (UInt8.ofNat c.toNat == UInt8.ofNat '\\'.toNat)) = _
-    rw [hlt32, asciiByte_beq_char c hc '"' (by decide), asciiByte_beq_char c hc '\\' (by decide)]
-    cases (c == '"') <;> cases (c == '\\') <;> cases decide (c.toNat < 0x20) <;> rfl
-  · intro c hgt
-    unfold needsJsonEscape
-    have h1 : (c == '"') = false := by rw [beq_eq_false_iff_ne]; intro h; subst h; exact absurd hgt (by decide)
-    have h2 : (c == '\\') = false := by rw [beq_eq_false_iff_ne]; intro h; subst h; exact absurd hgt (by decide)
-    have h3 : decide (c.toNat < 0x20) = false := by rw [decide_eq_false_iff_not]; omega
-    simp [h1, h2, h3]
+    hasAsciiByte s needsJsonEscapeByte = s.toList.any needsJsonEscape :=
+  hasAsciiByte_eq_any s needsJsonEscapeByte needsJsonEscape
+    (fun b => needsJsonEscapeByte_hi b.toBitVec)
+    (fun c hc => by simpa [Char.ofNat_toNat] using needsJsonEscapeByte_lo ⟨c.toNat, by omega⟩)
+    (fun c hgt => by
+      simp only [needsJsonEscape, Bool.or_eq_false_iff, beq_eq_false_iff_ne, decide_eq_false_iff_not]
+      refine ⟨⟨?_, ?_⟩, by omega⟩ <;> (rintro rfl; exact absurd hgt (by decide)))
 
 theorem renderStrAcc_eq (s acc : String) :
     renderStrAcc s acc = acc ++ String.ofList (renderStrL s) := by

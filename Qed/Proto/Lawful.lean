@@ -82,6 +82,11 @@ def decode {α : Type} [FromProto α] (buf : ByteArray) : Except String α :=
   rw [decodeFieldsSpec_encodeFieldsSpec _ (LawfulProto.msg_tags_pos a)]
   exact LawfulProto.fromProtoMsg_toProtoMsg a
 
+/-- Direct `[FromProto α]` field lookup (avoids `FromProtoField` priority coercion on `Option α`). -/
+def decodeFieldVal {α : Type} [FromProto α] (k : Nat) (fs : List (Nat × WireVal))
+    (err : String := s!"protobuf: missing field {k}") : Except String α :=
+  match lookupField k fs with | some w => FromProto.fromProtoVal w | none => .error err
+
 end Proto
 
 /-! ## Primitive & Scalar `LawfulProto` Instances -/
@@ -116,16 +121,14 @@ instance : FromProto Bool where
 instance : LawfulProto Bool :=
   .ofScalar (by intro b; cases b <;> rfl)
 
-instance : ToProto Nat where
-  toProtoVal n := .varint n
+local macro "defDirectProto " ty:ident ctor:ident err:str : command => do
+  return ⟨Lean.mkNullNode #[
+    ← `(command| instance : ToProto $ty where toProtoVal x := $ctor x),
+    ← `(command| instance : FromProto $ty where fromProtoVal | $ctor x => .ok x | _ => .error $err),
+    ← `(command| instance : LawfulProto $ty := .ofScalar fun _ => rfl)
+  ]⟩
 
-instance : FromProto Nat where
-  fromProtoVal
-    | .varint n => .ok n
-    | _         => .error "protobuf: expected varint for Nat"
-
-instance : LawfulProto Nat :=
-  .ofScalar (fun _ => rfl)
+defDirectProto Nat WireVal.varint "protobuf: expected varint for Nat"
 
 instance : ToProto Int where
   toProtoVal i := .varint (zigzagEncode i)
@@ -154,27 +157,8 @@ instance : LawfulProto UInt8 :=
     have heq : UInt8.ofNat b.toNat = b := uint8_ext (by change b.toNat % 256 = b.toNat; omega)
     simp [FromProto.fromProtoVal, hb, heq]
 
-instance : ToProto UInt32 where
-  toProtoVal v := .fixed32 v
-
-instance : FromProto UInt32 where
-  fromProtoVal
-    | .fixed32 v => .ok v
-    | _          => .error "protobuf: expected fixed32 for UInt32"
-
-instance : LawfulProto UInt32 :=
-  .ofScalar (fun _ => rfl)
-
-instance : ToProto UInt64 where
-  toProtoVal v := .fixed64 v
-
-instance : FromProto UInt64 where
-  fromProtoVal
-    | .fixed64 v => .ok v
-    | _          => .error "protobuf: expected fixed64 for UInt64"
-
-instance : LawfulProto UInt64 :=
-  .ofScalar (fun _ => rfl)
+defDirectProto UInt32 WireVal.fixed32 "protobuf: expected fixed32 for UInt32"
+defDirectProto UInt64 WireVal.fixed64 "protobuf: expected fixed64 for UInt64"
 
 instance : ToProto Float where
   toProtoVal f := .fixed64 f.toBits
@@ -184,16 +168,7 @@ instance : FromProto Float where
     | .fixed64 bits => .ok (Float.ofBits bits)
     | _             => .error "protobuf: expected fixed64 for Float"
 
-instance : ToProto ByteArray where
-  toProtoVal b := .bytes b
-
-instance : FromProto ByteArray where
-  fromProtoVal
-    | .bytes b => .ok b
-    | _        => .error "protobuf: expected length-delimited bytes"
-
-instance : LawfulProto ByteArray :=
-  .ofScalar (fun _ => rfl)
+defDirectProto ByteArray WireVal.bytes "protobuf: expected length-delimited bytes"
 
 instance : ToProto String where
   toProtoVal s := .bytes s.toUTF8
@@ -396,6 +371,22 @@ end Proto
     change (FromProto.fromProtoVal (ToProto.toProtoVal (toB a)) : Except String β).map ofB = .ok a
     rw [LawfulProto.fromProtoVal_toProtoVal (toB a)]; exact congrArg Except.ok (hinv a)
 
+@[reducible] def FromProto.ofRetract {α β : Type} [FromProto β] (ofB : β → Except String α) : FromProto α where
+  fromProtoMsg fs := (FromProto.fromProtoMsg (α := β) fs).bind ofB
+  fromProtoVal w  := (FromProto.fromProtoVal (α := β) w).bind ofB
+
+@[reducible] def LawfulProto.ofRetract {α β : Type} [LawfulProto β]
+    (toB : α → β) (ofB : β → Except String α) (hinv : ∀ a : α, ofB (toB a) = .ok a) : LawfulProto α where
+  toToProto := ToProto.ofEquiv toB
+  toFromProto := FromProto.ofRetract ofB
+  msg_tags_pos a := LawfulProto.msg_tags_pos (toB a)
+  fromProtoMsg_toProtoMsg a := by
+    change (FromProto.fromProtoMsg (ToProto.toProtoMsg (toB a)) : Except String β).bind ofB = .ok a
+    rw [LawfulProto.fromProtoMsg_toProtoMsg (toB a)]; exact hinv a
+  fromProtoVal_toProtoVal a := by
+    change (FromProto.fromProtoVal (ToProto.toProtoVal (toB a)) : Except String β).bind ofB = .ok a
+    rw [LawfulProto.fromProtoVal_toProtoVal (toB a)]; exact hinv a
+
 /-! ## Composite & Container `LawfulProto` Instances (`Date`, `Option`, `Except`, `Prod`, `List`, `Array`) -/
 
 def Date.toProtoFields (d : Date) : List (Nat × WireVal) :=
@@ -419,25 +410,12 @@ instance : LawfulProto Date :=
     (by rintro ⟨y, m, day, hok⟩; unfold Date.fromProtoFields Date.toProtoFields
         simp [FromProtoField.decodeProtoField, lookupField, Date.mk?, hok, bind, Except.bind])
 
-private def encodeOptionFields {α : Type} [ToProto α] : Option α → List (Nat × WireVal)
-  | none   => []
-  | some a => [(1, ToProto.toProtoVal a)]
-
-private def decodeOptionFields {α : Type} [FromProto α]
-    (fs : List (Nat × WireVal)) : Except String (Option α) :=
-  match lookupField 1 fs with
-  | none   => .ok none
-  | some w => (FromProto.fromProtoVal w).map some
-
-instance {α : Type} [ToProto α]   : ToProto (Option α)   := .ofFields encodeOptionFields
-instance {α : Type} [FromProto α] : FromProto (Option α) := .ofFields decodeOptionFields
-
+instance {α : Type} [ToProto α]   : ToProto (Option α)   := .ofFields (ToProtoField.encodeProtoField 1)
+instance {α : Type} [FromProto α] : FromProto (Option α) := .ofFields (FromProtoField.decodeProtoField 1)
 instance {α : Type} [LawfulProto α] : LawfulProto (Option α) :=
-  .ofFields encodeOptionFields decodeOptionFields
-    (by intro opt kw h; cases opt with
-        | none => cases h
-        | some _ => simp only [encodeOptionFields, List.mem_singleton] at h; rw [h]; simp)
-    (by intro opt; cases opt <;> simp [encodeOptionFields, decodeOptionFields, lookupField, Except.map])
+  .ofFields (ToProtoField.encodeProtoField 1) (FromProtoField.decodeProtoField 1)
+    (fun opt kw h => by rw [LawfulProtoField.encodeProtoField_tag 1 opt kw h]; simp)
+    (fun opt => by simpa using LawfulProtoField.decodeProtoField_hit_raw 1 opt [] (by simp))
 
 private def encodeExceptFields {ε α : Type} [ToProto ε] [ToProto α] : Except ε α → List (Nat × WireVal)
   | .ok a    => [(1, ToProto.toProtoVal a)]
@@ -465,9 +443,8 @@ private def encodeProdFields {α β : Type} [ToProto α] [ToProto β] (p : α ×
 
 private def decodeProdFields {α β : Type} [FromProto α] [FromProto β]
     (fs : List (Nat × WireVal)) : Except String (α × β) := do
-  let wa ← (lookupField 1 fs).elim (.error "protobuf: missing tuple field 1") .ok
-  let wb ← (lookupField 2 fs).elim (.error "protobuf: missing tuple field 2") .ok
-  return (← FromProto.fromProtoVal (α := α) wa, ← FromProto.fromProtoVal (α := β) wb)
+  return (← decodeFieldVal 1 fs "protobuf: missing tuple field 1",
+          ← decodeFieldVal 2 fs "protobuf: missing tuple field 2")
 
 instance {α β : Type} [ToProto α] [ToProto β]   : ToProto (α × β)   := .ofFields encodeProdFields
 instance {α β : Type} [FromProto α] [FromProto β] : FromProto (α × β) := .ofFields decodeProdFields
@@ -476,7 +453,7 @@ instance {α β : Type} [LawfulProto α] [LawfulProto β] : LawfulProto (α × �
   .ofFields encodeProdFields decodeProdFields
     (by intro p kw h; simp only [encodeProdFields, List.mem_cons, List.not_mem_nil, or_false] at h
         rcases h with rfl | rfl <;> simp)
-    (by rintro ⟨a, b⟩; simp [encodeProdFields, decodeProdFields, lookupField, Option.elim, bind, Except.bind, pure, Except.pure])
+    (by rintro ⟨a, b⟩; simp [encodeProdFields, decodeProdFields, decodeFieldVal, lookupField, bind, Except.bind, pure, Except.pure])
 
 private def encodeRepeatedField1 {α : Type} [ToProto α] (xs : List α) : List (Nat × WireVal) :=
   xs.map fun x => (1, ToProto.toProtoVal x)
@@ -493,15 +470,11 @@ private theorem lookupRepeated_map_one {α : Type} [ToProto α] :
   | [] => rfl
   | x :: rest => congrArg (ToProto.toProtoVal x :: ·) (lookupRepeated_map_one rest)
 
-private theorem mapM_fromProtoVal_toProtoVal {α : Type} [LawfulProto α] :
-    ∀ (xs : List α), (xs.map ToProto.toProtoVal).mapM (m := Except String) FromProto.fromProtoVal = .ok xs
-  | [] => rfl
-  | x :: xs => by simp only [List.map_cons, List.mapM_cons, LawfulProto.fromProtoVal_toProtoVal x, mapM_fromProtoVal_toProtoVal xs]; rfl
-
 instance {α : Type} [LawfulProto α] : LawfulProto (List α) :=
   .ofFields encodeRepeatedField1 decodeRepeatedField1
     (by intro xs kw h; rcases List.mem_map.1 h with ⟨_, _, rfl⟩; simp)
-    (by intro xs; unfold decodeRepeatedField1; rw [lookupRepeated_map_one, mapM_fromProtoVal_toProtoVal])
+    (by intro xs; unfold decodeRepeatedField1
+        rw [lookupRepeated_map_one, list_mapM_map_ok ToProto.toProtoVal FromProto.fromProtoVal LawfulProto.fromProtoVal_toProtoVal])
 
 instance {α : Type} [ToProto α]   : ToProto (Array α)   := .ofEquiv Array.toList
 instance {α : Type} [FromProto α] : FromProto (Array α) := .ofEquiv List.toArray

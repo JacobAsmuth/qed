@@ -151,9 +151,12 @@ theorem natDigits_cons (m : Nat) :
   | [] => exact absurd h (natDigits_ne_nil m)
   | c :: t => exact ⟨c, t, rfl, natDigits_digit m c (h ▸ List.mem_cons_self ..)⟩
 
-theorem digit_not_sign {c : Char} (h : isDigit c = true) : c ≠ '-' ∧ c ≠ '+' :=
-  ⟨fun e => by subst e; exact absurd h (by decide),
-   fun e => by subst e; exact absurd h (by decide)⟩
+private theorem isDigit_ne {c t : Char} (hc : isDigit c = true) (ht : isDigit t = false) : c ≠ t :=
+  fun e => by subst e; simp [hc] at ht
+
+private theorem isDigit_not_ws {c : Char} (h : isDigit c = true) : isWs c = false := by
+  simp only [isWs, Bool.or_eq_false_iff, beq_eq_false_iff_ne]
+  exact ⟨⟨⟨isDigit_ne h (by decide), isDigit_ne h (by decide)⟩, isDigit_ne h (by decide)⟩, isDigit_ne h (by decide)⟩
 
 theorem numDelim_head {c : Char} {t : List Char} (h : numDelim (c :: t) = true) :
     isDigit c = false ∧ c ≠ '.' ∧ c ≠ 'e' ∧ c ≠ 'E' := by
@@ -163,12 +166,11 @@ theorem numDelim_head {c : Char} {t : List Char} (h : numDelim (c :: t) = true) 
 private theorem intCharsL_cases (i : Int) (tail : List Char) :
     (i < 0 ∧ intCharsL i ++ tail = '-' :: (natDigitsAux i.natAbs [] ++ tail)) ∨
     (¬ i < 0 ∧ ∃ c t, intCharsL i ++ tail = c :: (t ++ tail) ∧
-      natDigitsAux i.natAbs [] = c :: t ∧ c ≠ '-' ∧ c ≠ '+') := by
+      natDigitsAux i.natAbs [] = c :: t ∧ isDigit c = true) := by
   by_cases hi : i < 0
   · exact .inl ⟨hi, by simp [intCharsL, hi]⟩
   · obtain ⟨c, t, h0, hc⟩ := natDigits_cons i.natAbs
-    obtain ⟨hns, hps⟩ := digit_not_sign hc
-    exact .inr ⟨hi, c, t, by simp [intCharsL, hi, h0], h0, hns, hps⟩
+    exact .inr ⟨hi, c, t, by simp [intCharsL, hi, h0], h0, hc⟩
 
 theorem parseNum_render (n : JsonNumber) (rest : List Char) (hr : numDelim rest = true) :
     parseNum (Json.renderNumL n ++ rest) = .ok (n, rest) := by
@@ -183,8 +185,8 @@ theorem parseNum_render (n : JsonNumber) (rest : List Char) (hr : numDelim rest 
   have hne : (natDigitsAux m.natAbs []).isEmpty = false := List.isEmpty_eq_false_iff.mpr (natDigits_ne_nil _)
   rw [show Json.renderNumL ⟨m, ex⟩ ++ rest = intCharsL m ++ tail by simp only [Json.renderNumL, tail, List.append_assoc]]
   unfold parseNum
-  rcases intCharsL_cases m tail with ⟨hm, hcs⟩ | ⟨hm, c0, t0, hcs, hm0, hns, _⟩ <;>
-    (rw [hcs]; try (simp [hns]; rw [← List.cons_append, ← hm0])) <;>
+  rcases intCharsL_cases m tail with ⟨hm, hcs⟩ | ⟨hm, c0, t0, hcs, hm0, hc0⟩ <;>
+    (rw [hcs]; try (simp [isDigit_ne hc0 (by decide : isDigit '-' = false)]; rw [← List.cons_append, ← hm0])) <;>
     (simp only [htd, hne, natDigits_ne_nil, Bool.false_eq_true, ↓reduceIte];
      by_cases hex : ex = 0
      · subst hex
@@ -195,8 +197,8 @@ theorem parseNum_render (n : JsonNumber) (rest : List Char) (hr : numDelim rest 
      · rw [show tail = 'e' :: (intCharsL ex ++ rest) by
            simp only [tail, beq_eq_false_iff_ne.2 hex, Bool.false_eq_true, ↓reduceIte, List.cons_append]]
        have htdE := takeDigits_append _ (natDigits_digit ex.natAbs) _ (takeDigits_stop hr)
-       rcases intCharsL_cases ex rest with ⟨hexn, hint⟩ | ⟨hexn, c1, t1, hint, hex0, hns1, hps1⟩ <;>
-         (rw [hint]; try (simp [hns1, hps1]; rw [← List.cons_append, ← hex0])) <;>
+       rcases intCharsL_cases ex rest with ⟨hexn, hint⟩ | ⟨hexn, c1, t1, hint, hex0, hc1⟩ <;>
+         (rw [hint]; try (simp [isDigit_ne hc1 (by decide : isDigit '-' = false), isDigit_ne hc1 (by decide : isDigit '+' = false)]; rw [← List.cons_append, ← hex0])) <;>
          (simp [htdE, digitsToInt_natDigits]; omega))
 
 private theorem hexVal_toHexDigit_fin :
@@ -208,31 +210,19 @@ theorem hexVal_toHexDigit (d : Nat) (h : d < 16) : hexVal (toHexDigit d) = some 
 theorem parseStrAux_escape (c : Char) (acc rest : List Char) :
     parseStrAux acc (escapeCharL c ++ rest) = parseStrAux (c :: acc) rest := by
   dsimp only [escapeCharL]
-  split
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rfl
-  · rename_i cv h1 h2 h3 h4 h5
-    by_cases hlt : c.toNat < 0x20
-    · rw [if_pos hlt]
-      simp only [List.cons_append, List.nil_append, parseStrAux, hex4]
-      have h16 : ∀ k : Nat, k % 16 < 16 := fun k => Nat.mod_lt _ (by omega)
-      rw [hexVal_toHexDigit _ (h16 _), hexVal_toHexDigit _ (h16 _),
-          hexVal_toHexDigit _ (h16 _), hexVal_toHexDigit _ (h16 _)]
-      simp only [bind, Option.bind, pure]
-      have harith : ((c.toNat / 4096 % 16 * 16 + c.toNat / 256 % 16) * 16 + c.toNat / 16 % 16) * 16
-              + c.toNat % 16 = c.toNat := by omega
-      rw [harith, Char.ofNat_toNat]
-    · simp only [if_neg hlt, List.cons_append, List.nil_append]
-      rw [parseStrAux.eq_def]
-      split
-      · rename_i heq; injection heq with hc; exact absurd hc h1
-      · rename_i heq; injection heq with hc; exact absurd hc h2
-      · rename_i heq; injection heq with hc; exact absurd hc h2
-      · rename_i heq; injection heq with hc hr; subst hc; subst hr; rfl
-      · rename_i heq; cases heq
+  split <;> try rfl
+  rename_i _ h1 h2 _ _ _
+  by_cases hlt : c.toNat < 0x20
+  · simp only [if_pos hlt, List.cons_append, List.nil_append, parseStrAux, hex4]
+    have h16 : ∀ k : Nat, k % 16 < 16 := fun k => Nat.mod_lt _ (by omega)
+    rw [hexVal_toHexDigit _ (h16 _), hexVal_toHexDigit _ (h16 _),
+        hexVal_toHexDigit _ (h16 _), hexVal_toHexDigit _ (h16 _)]
+    simp only [bind, Option.bind, pure]
+    rw [show ((c.toNat / 4096 % 16 * 16 + c.toNat / 256 % 16) * 16 + c.toNat / 16 % 16) * 16
+          + c.toNat % 16 = c.toNat by omega, Char.ofNat_toNat]
+  · simp only [if_neg hlt, List.cons_append, List.nil_append]
+    rw [parseStrAux.eq_def]
+    split <;> (rename_i heq; cases heq <;> first | contradiction | rfl)
 
 theorem parseStrAux_flatMap (cs : List Char) : ∀ (acc rest : List Char),
     parseStrAux acc (cs.flatMap escapeCharL ++ '"' :: rest)
@@ -254,39 +244,19 @@ theorem numDelim_cons {c : Char} {t : List Char}
     numDelim (c :: t) = true := by
   simp [numDelim, h]
 
-theorem digit_not_special {c : Char} (h : isDigit c = true) :
-    isWs c = false ∧ c ≠ ']' ∧ c ≠ '}' := by
-  refine ⟨?_, ?_, ?_⟩
-  · simp only [isWs, Bool.or_eq_false_iff, beq_eq_false_iff_ne]
-    refine ⟨⟨⟨?_, ?_⟩, ?_⟩, ?_⟩ <;> (intro rfl; exact absurd h (by decide))
-  · intro rfl; exact absurd h (by decide)
-  · intro rfl; exact absurd h (by decide)
-
-theorem digit_not_starts {c : Char} (h : isDigit c = true) :
-    c ≠ 'n' ∧ c ≠ 't' ∧ c ≠ 'f' ∧ c ≠ '"' ∧ c ≠ '[' ∧ c ≠ '{' := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> (intro rfl; exact absurd h (by decide))
-
 theorem renderL_head (j : Json) :
     ∃ c t, Json.renderL j = c :: t ∧ isWs c = false ∧ c ≠ ']' ∧ c ≠ '}' := by
   cases j with
-  | null => exact ⟨'n', _, rfl, by decide, by decide, by decide⟩
-  | bool b => cases b with
-      | true => exact ⟨'t', _, rfl, by decide, by decide, by decide⟩
-      | false => exact ⟨'f', _, rfl, by decide, by decide, by decide⟩
-  | str s => exact ⟨'"', _, rfl, by decide, by decide, by decide⟩
-  | arr es => exact ⟨'[', _, rfl, by decide, by decide, by decide⟩
-  | obj ms => exact ⟨'{', _, rfl, by decide, by decide, by decide⟩
+  | null => exact ⟨'n', _, rfl, by decide⟩
+  | bool b => cases b <;> first | exact ⟨'t', _, rfl, by decide⟩ | exact ⟨'f', _, rfl, by decide⟩
+  | str _ => exact ⟨'"', _, rfl, by decide⟩
+  | arr _ => exact ⟨'[', _, rfl, by decide⟩
+  | obj _ => exact ⟨'{', _, rfl, by decide⟩
   | num n =>
-      by_cases hm : n.mantissa < 0
-      · refine ⟨'-', natDigitsAux n.mantissa.natAbs []
-            ++ (if n.exponent == 0 then [] else 'e' :: intCharsL n.exponent),
-            ?_, by decide, by decide, by decide⟩
-        simp only [Json.renderL, Json.renderNumL, intCharsL, hm, ↓reduceIte, List.cons_append, List.nil_append]
-      · obtain ⟨c0, t0, h0, hc0⟩ := natDigits_cons n.mantissa.natAbs
-        obtain ⟨hws, hbr, hbc⟩ := digit_not_special hc0
-        refine ⟨c0, t0 ++ (if n.exponent == 0 then [] else 'e' :: intCharsL n.exponent),
-                ?_, hws, hbr, hbc⟩
-        simp only [Json.renderL, Json.renderNumL, intCharsL, hm, ↓reduceIte, h0, List.cons_append, List.nil_append]
+      rcases intCharsL_cases n.mantissa (if n.exponent == 0 then [] else 'e' :: intCharsL n.exponent) with
+        ⟨_, hcs⟩ | ⟨_, c0, _, hcs, _, hc0⟩
+      · exact ⟨'-', _, hcs, by decide⟩
+      · exact ⟨c0, _, hcs, isDigit_not_ws hc0, isDigit_ne hc0 (by decide), isDigit_ne hc0 (by decide)⟩
 
 private theorem skipWs_cons {c : Char} {r : List Char} (h : isWs c = false) :
     skipWs (c :: r) = c :: r := by
@@ -306,33 +276,29 @@ theorem skipWs_renderMembersL (k : String) (v : Json) (ms : List (String × Json
   cases ms <;> simp [Json.renderMembersL, Json.renderStrL, skipWs, isWs]
 
 theorem parseVal_to_parseNum (f b : Nat) (c0 : Char) (t : List Char)
-    (hws : isWs c0 = false)
-    (hn : c0 ≠ 'n') (ht : c0 ≠ 't') (hf : c0 ≠ 'f') (hq : c0 ≠ '"')
-    (hbk : c0 ≠ '[') (hbc : c0 ≠ '{') (hg : (c0 == '-' || isDigit c0) = true) :
+    (h0 : c0 = '-' ∨ isDigit c0 = true) :
     parseVal (f + 1) b (c0 :: t)
       = (match parseNum (c0 :: t) with
          | .ok (n, r') => .ok (.num n, r')
          | .error e => .error e) := by
+  have hws : isWs c0 = false := h0.elim (fun h => h ▸ rfl) isDigit_not_ws
+  have hg : (c0 == '-' || isDigit c0) = true := by rcases h0 with rfl | h <;> simp [*]
   dsimp only [parseVal]; rw [skipWs_cons hws]
-  split <;> (rename_i heq; cases heq <;> first | contradiction | (simp only [hg, ↓reduceIte]; rcases parseNum (c0 :: t) with _ | ⟨_, _⟩ <;> rfl))
+  split <;> (rename_i heq; cases heq <;> first
+    | (rcases h0 with h | hd <;> first | exact absurd h (by decide) | exact absurd hd (by decide))
+    | (simp only [hg, ↓reduceIte]; rcases parseNum (c0 :: t) with _ | ⟨_, _⟩ <;> rfl))
 
 theorem parseVal_num (n : JsonNumber) (f b : Nat) (rest : List Char)
     (hr : numDelim rest = true) :
     parseVal (f + 1) b (Json.renderNumL n ++ rest) = .ok (.num n, rest) := by
-  by_cases hm : n.mantissa < 0
-  · have harg : Json.renderNumL n ++ rest = '-' :: (natDigitsAux n.mantissa.natAbs []
-        ++ ((if n.exponent == 0 then [] else 'e' :: intCharsL n.exponent) ++ rest)) := by
-      simp [Json.renderNumL, intCharsL, hm]
-    rw [harg, parseVal_to_parseNum f b '-' _ (by decide) (by decide) (by decide) (by decide)
-          (by decide) (by decide) (by decide) (by decide), ← harg, parseNum_render n rest hr]
-  · obtain ⟨c0, t0, h0, hc0⟩ := natDigits_cons n.mantissa.natAbs
-    obtain ⟨hn, ht, hf', hq, hbk, hbc⟩ := digit_not_starts hc0
-    obtain ⟨hws, _, _⟩ := digit_not_special hc0
-    have harg : Json.renderNumL n ++ rest = c0 :: (t0
-        ++ ((if n.exponent == 0 then [] else 'e' :: intCharsL n.exponent) ++ rest)) := by
-      simp [Json.renderNumL, intCharsL, hm, h0]
-    rw [harg, parseVal_to_parseNum f b c0 _ hws hn ht hf' hq hbk hbc (by simp [hc0]),
-        ← harg, parseNum_render n rest hr]
+  have hsplit : Json.renderNumL n ++ rest =
+      intCharsL n.mantissa ++ ((if n.exponent == 0 then [] else 'e' :: intCharsL n.exponent) ++ rest) := by
+    simp only [Json.renderNumL, List.append_assoc]
+  rcases intCharsL_cases n.mantissa ((if n.exponent == 0 then [] else 'e' :: intCharsL n.exponent) ++ rest) with
+    ⟨_, hcs⟩ | ⟨_, c0, _, hcs, _, hc0⟩ <;>
+    (have harg := hsplit.trans hcs
+     rw [harg, parseVal_to_parseNum f b _ _ (by first | exact .inl rfl | exact .inr hc0),
+       ← harg, parseNum_render n rest hr])
 
 theorem parseVal_arr (e : Json) (es : List Json) (f b : Nat) (rest : List Char) :
     parseVal (f + 1) (b + 1) ('[' :: (Json.renderElemsL (e :: es) ++ ']' :: rest))

@@ -35,17 +35,7 @@ def zigzagDecode (n : Nat) : Int :=
   else .negSucc (n / 2)
 
 theorem zigzagDecode_zigzagEncode (i : Int) : zigzagDecode (zigzagEncode i) = i := by
-  cases i with
-  | ofNat n =>
-      unfold zigzagEncode zigzagDecode
-      have hmod : (2 * n) % 2 = 0 := by omega
-      have hdiv : (2 * n) / 2 = n := by omega
-      simp [hmod, hdiv]
-  | negSucc n =>
-      unfold zigzagEncode zigzagDecode
-      have hmod : (2 * n + 1) % 2 = 1 := by omega
-      have hdiv : (2 * n + 1) / 2 = n := by omega
-      simp [hmod, hdiv]
+  cases i <;> simp [zigzagEncode, zigzagDecode] <;> omega
 
 /-! ## Pure Specification over `List UInt8` -/
 

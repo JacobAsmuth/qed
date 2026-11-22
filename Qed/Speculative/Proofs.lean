@@ -4,18 +4,21 @@ namespace Qed
 
 namespace SpecEngine
 
+section
+variable {State Msg : Type}
+
 /-! ## Core Invariant & Coherence Proofs -/
 
 /-- Coherence property: `visible` always equals replaying `log` from `confirmed`. -/
-def Coherent {State Msg : Type} (stepOnly : State → Msg → State) (st : SpecState State Msg) : Prop :=
+def Coherent (stepOnly : State → Msg → State) (st : SpecState State Msg) : Prop :=
   st.visible = st.log.foldl (replayEntry stepOnly) st.confirmed
 
 /-- Both `confirmed` and `visible` states satisfy the component invariant `Inv`. -/
-def SpecInv {State Msg : Type} (Inv : State → Prop) (st : SpecState State Msg) : Prop :=
+def SpecInv (Inv : State → Prop) (st : SpecState State Msg) : Prop :=
   Inv st.confirmed ∧ Inv st.visible
 
 /-- Pending transaction IDs currently in the speculative journal, in dispatch order. -/
-def pendingIds {Msg : Type} : List (SpecEntry Msg) → List Nat
+def pendingIds : List (SpecEntry Msg) → List Nat
   | []                  => []
   | .pending id _ :: es => id :: pendingIds es
   | .regular _ :: es    => pendingIds es
@@ -23,49 +26,49 @@ def pendingIds {Msg : Type} : List (SpecEntry Msg) → List Nat
 
 /-- Well-formed transaction ID invariant: every pending ID in `log` is strictly below `nextTxId`
     and all pending IDs are distinct. -/
-def WellFormedIds {State Msg : Type} (st : SpecState State Msg) : Prop :=
+def WellFormedIds (st : SpecState State Msg) : Prop :=
   (∀ id ∈ pendingIds st.log, id < st.nextTxId) ∧ (pendingIds st.log).Nodup
 
-@[simp] theorem pendingIds_nil {Msg : Type} : pendingIds ([] : List (SpecEntry Msg)) = [] := rfl
-@[simp] theorem pendingIds_cons_regular {Msg : Type} (m : Msg) (es : List (SpecEntry Msg)) :
+@[simp] theorem pendingIds_nil : pendingIds ([] : List (SpecEntry Msg)) = [] := rfl
+@[simp] theorem pendingIds_cons_regular (m : Msg) (es : List (SpecEntry Msg)) :
     pendingIds (.regular m :: es) = pendingIds es := rfl
-@[simp] theorem pendingIds_cons_resolved {Msg : Type} (m : Msg) (es : List (SpecEntry Msg)) :
+@[simp] theorem pendingIds_cons_resolved (m : Msg) (es : List (SpecEntry Msg)) :
     pendingIds (.resolved m :: es) = pendingIds es := rfl
-@[simp] theorem pendingIds_cons_pending {Msg : Type} (id : Nat) (m : Msg) (es : List (SpecEntry Msg)) :
+@[simp] theorem pendingIds_cons_pending (id : Nat) (m : Msg) (es : List (SpecEntry Msg)) :
     pendingIds (.pending id m :: es) = id :: pendingIds es := rfl
 
-theorem pendingIds_append {Msg : Type} (a b : List (SpecEntry Msg)) :
+theorem pendingIds_append (a b : List (SpecEntry Msg)) :
     pendingIds (a ++ b) = pendingIds a ++ pendingIds b := by
   induction a with
   | nil => rfl
   | cons e _ ih => cases e <;> simp [pendingIds, ih]
 
-theorem pendingIds_map_resolved {Msg : Type} (ms : List Msg) :
+theorem pendingIds_map_resolved (ms : List Msg) :
     pendingIds (ms.map SpecEntry.resolved) = [] := by
   induction ms with
   | nil => rfl
   | cons _ _ ih => exact ih
 
-theorem foldl_replayEntry_eq_map {State Msg : Type} (stepOnly : State → Msg → State) :
+theorem foldl_replayEntry_eq_map (stepOnly : State → Msg → State) :
     ∀ (log : List (SpecEntry Msg)) (s : State),
       log.foldl (replayEntry stepOnly) s = (log.map entryMsg).foldl stepOnly s
   | [], _ => rfl
   | _ :: rest, _ => foldl_replayEntry_eq_map stepOnly rest _
 
-theorem runMsgs_fst_eq_foldl {State Msg : Type} (upd : State → Msg → State × Cmd Msg) :
+theorem runMsgs_fst_eq_foldl (upd : State → Msg → State × Cmd Msg) :
     ∀ (ms : List Msg) (s : State),
       (runMsgs upd s ms).1 = ms.foldl (fun acc m => (upd acc m).1) s
   | [], _ => rfl
   | m :: ms, s => runMsgs_fst_eq_foldl upd ms (upd s m).1
 
-theorem replayEntry_preserves_inv {State Msg : Type} {Inv : State → Prop}
+theorem replayEntry_preserves_inv {Inv : State → Prop}
     {stepOnly : State → Msg → State}
     (hstep : ∀ s m, Inv s → Inv (stepOnly s m))
     {s : State} (hs : Inv s) (e : SpecEntry Msg) :
     Inv (replayEntry stepOnly s e) :=
   hstep s (entryMsg e) hs
 
-theorem replay_preserves_inv {State Msg : Type} {Inv : State → Prop}
+theorem replay_preserves_inv {Inv : State → Prop}
     {stepOnly : State → Msg → State}
     (hstep : ∀ s m, Inv s → Inv (stepOnly s m)) :
     ∀ (log : List (SpecEntry Msg)) (s : State), Inv s → Inv (log.foldl (replayEntry stepOnly) s)
@@ -73,7 +76,7 @@ theorem replay_preserves_inv {State Msg : Type} {Inv : State → Prop}
   | e :: rest, s, hs =>
       replay_preserves_inv hstep rest (replayEntry stepOnly s e) (replayEntry_preserves_inv hstep hs e)
 
-theorem drainConfirmed_preserves_inv {State Msg : Type} {Inv : State → Prop}
+theorem drainConfirmed_preserves_inv {Inv : State → Prop}
     {stepOnly : State → Msg → State}
     (hstep : ∀ s m, Inv s → Inv (stepOnly s m)) :
     ∀ (log : List (SpecEntry Msg)) (conf : State), Inv conf →
@@ -83,7 +86,7 @@ theorem drainConfirmed_preserves_inv {State Msg : Type} {Inv : State → Prop}
       drainConfirmed_preserves_inv hstep rest (stepOnly conf m) (hstep conf m hc)
   | .pending _ _ :: _, _, hc => hc
 
-theorem drainConfirmed_foldl_eq {State Msg : Type} (stepOnly : State → Msg → State) :
+theorem drainConfirmed_foldl_eq (stepOnly : State → Msg → State) :
     ∀ (log : List (SpecEntry Msg)) (conf : State),
       let res := drainConfirmed stepOnly conf log
       res.2.foldl (replayEntry stepOnly) res.1 = log.foldl (replayEntry stepOnly) conf
@@ -92,7 +95,7 @@ theorem drainConfirmed_foldl_eq {State Msg : Type} (stepOnly : State → Msg →
       drainConfirmed_foldl_eq stepOnly rest (stepOnly conf m)
   | .pending _ _ :: _, _ => rfl
 
-theorem drainConfirmed_pendingIds {State Msg : Type} (stepOnly : State → Msg → State) :
+theorem drainConfirmed_pendingIds (stepOnly : State → Msg → State) :
     ∀ (log : List (SpecEntry Msg)) (conf : State),
       pendingIds (drainConfirmed stepOnly conf log).2 = pendingIds log
   | [], _ => rfl
@@ -100,7 +103,7 @@ theorem drainConfirmed_pendingIds {State Msg : Type} (stepOnly : State → Msg �
       drainConfirmed_pendingIds stepOnly rest (stepOnly conf m)
   | .pending _ _ :: _, _ => rfl
 
-theorem drainConfirmed_empty_of_no_pending {State Msg : Type} (stepOnly : State → Msg → State) :
+theorem drainConfirmed_empty_of_no_pending (stepOnly : State → Msg → State) :
     ∀ (log : List (SpecEntry Msg)) (conf : State),
       pendingIds log = [] →
       drainConfirmed stepOnly conf log = (log.foldl (replayEntry stepOnly) conf, [])
@@ -109,56 +112,29 @@ theorem drainConfirmed_empty_of_no_pending {State Msg : Type} (stepOnly : State 
       drainConfirmed_empty_of_no_pending stepOnly rest (stepOnly conf m) h
   | .pending _ _ :: _, _, h => by simp at h
 
-theorem drainConfirmed_append_resolved {State Msg : Type} (stepOnly : State → Msg → State) :
+theorem drainConfirmed_append_resolved (stepOnly : State → Msg → State) :
     ∀ (ms : List Msg) (tail : List (SpecEntry Msg)) (conf : State),
       drainConfirmed stepOnly conf (ms.map SpecEntry.resolved ++ tail) =
         drainConfirmed stepOnly (ms.foldl stepOnly conf) tail
   | [], _, _ => rfl
   | m :: ms, tail, conf => drainConfirmed_append_resolved stepOnly ms tail (stepOnly conf m)
 
-theorem runMsgs_preserves_inv {State Msg : Type} {Inv : State → Prop}
+theorem runMsgs_preserves_inv {Inv : State → Prop}
     {upd : State → Msg → State × Cmd Msg}
     (hupd : ∀ s m, Inv s → Inv (upd s m).1) :
     ∀ (ms : List Msg) (s : State), Inv s → Inv (runMsgs upd s ms).1
   | [], _, hs => hs
   | m :: ms, s, hs => runMsgs_preserves_inv hupd ms (upd s m).1 (hupd s m hs)
 
-private theorem resolveReplace_preserves_inv {State Msg : Type} {Inv : State → Prop}
-    (upd : State → Msg → State × Cmd Msg) (hupd : ∀ s m, Inv s → Inv (upd s m).1)
-    (txId : Nat) (replMsgs : List Msg) (st : SpecState State Msg) (h : SpecInv Inv st) :
-    SpecInv Inv (resolveReplace upd txId replMsgs st).1 := by
-  unfold resolveReplace; dsimp only; split
-  · exact h
-  · have hc' := drainConfirmed_preserves_inv hupd
-      (replacePending upd txId replMsgs st.confirmed st.log).1 st.confirmed h.1
-    exact ⟨hc', replay_preserves_inv hupd _ _ hc'⟩
+section
+variable (upd : State → Msg → State × Cmd Msg) (classify : State → Msg → SpecAction Msg)
 
-private theorem resolveReplace_preserves_coherent {State Msg : Type}
-    (upd : State → Msg → State × Cmd Msg)
-    (txId : Nat) (replMsgs : List Msg) (st : SpecState State Msg)
-    (hcoh : Coherent (fun s m => (upd s m).1) st) :
-    Coherent (fun s m => (upd s m).1) (resolveReplace upd txId replMsgs st).1 := by
-  unfold resolveReplace; dsimp only; split
-  · exact hcoh
-  · rfl
-
-private theorem step_resolve_cases {State Msg : Type}
-    (upd : State → Msg → State × Cmd Msg) (classify : State → Msg → SpecAction Msg)
+private theorem step_resolve_cases
     (st : SpecState State Msg) (msg : Msg)
     (txId : Nat) (hit : Bool) (replMsgs confirmOnHit : List Msg)
     (hcl : classify st.visible msg = .resolve txId hit replMsgs confirmOnHit) :
     (∃ m0 tail, st.log = .pending txId m0 :: tail ∧ hit = true ∧
-      let stepOnly := fun s m => (upd s m).1
-      let conf1 := stepOnly st.confirmed m0
-      SpecEngine.step upd classify st msg =
-        if confirmOnHit.isEmpty then
-          let (conf2, log2) := drainConfirmed stepOnly conf1 tail
-          ({ st with confirmed := conf2, log := log2 }, .none)
-        else
-          let (conf2, cmds) := runMsgs upd conf1 confirmOnHit
-          let (conf3, log3) := drainConfirmed stepOnly conf2 tail
-          let vis3 := log3.foldl (replayEntry stepOnly) conf3
-          ({ st with visible := vis3, confirmed := conf3, log := log3 }, mkBatchCmd cmds)) ∨
+      SpecEngine.step upd classify st msg = resolveHeadHit upd st m0 tail confirmOnHit) ∨
     SpecEngine.step upd classify st msg = resolveReplace upd txId replMsgs st := by
   unfold SpecEngine.step; rw [hcl]; dsimp only
   cases hlog : st.log with
@@ -168,78 +144,84 @@ private theorem step_resolve_cases {State Msg : Type}
       | pending id0 m0 =>
           dsimp only
           by_cases hcond : (hit && id0 == txId) = true
-          · rw [if_pos hcond]
-            have ⟨hhit, hid⟩ := Bool.and_eq_true_iff.1 hcond
-            have hidEq : id0 = txId := beq_iff_eq.1 hid
-            subst hidEq
-            exact .inl ⟨m0, tail, rfl, hhit, rfl⟩
+          · rw [if_pos hcond]; have ⟨hhit, hid⟩ := Bool.and_eq_true_iff.1 hcond
+            cases beq_iff_eq.1 hid; exact .inl ⟨m0, tail, rfl, hhit, rfl⟩
           · rw [if_neg hcond]; exact .inr rfl
       | regular _ | resolved _ => exact .inr rfl
 
-theorem step_preserves_inv {State Msg : Type} {Inv : State → Prop}
+private theorem step_preserves (P : SpecState State Msg → Prop)
+    (hNonPend : ∀ st m e, P st → entryMsg e = m → pendingIds [e] = [] →
+      P (appendNonPending st (upd st.visible m).1 e))
+    (hPend : ∀ st m, P st → P (appendPending (fun s m => (upd s m).1) st m))
+    (hHit : ∀ st txId m0 tail confirmOnHit, P st → st.log = .pending txId m0 :: tail →
+      P (resolveHeadHit upd st m0 tail confirmOnHit).1)
+    (hRepl : ∀ st txId replMsgs, P st →
+      let stepOnly := fun s m => (upd s m).1
+      let (conf', log') := drainConfirmed stepOnly st.confirmed (replacePending upd txId replMsgs st.confirmed st.log).1
+      P { st with visible := log'.foldl (replayEntry stepOnly) conf', confirmed := conf', log := log' })
+    (st : SpecState State Msg) (msg : Msg) (h : P st) :
+    P (SpecEngine.step upd classify st msg).1 := by
+  cases hcl : classify st.visible msg with
+  | normal =>
+      unfold SpecEngine.step; rw [hcl]; exact hNonPend st msg (.regular msg) h rfl rfl
+  | dispatch preMsg? _ specMsg _ =>
+      unfold SpecEngine.step; rw [hcl]; dsimp only
+      cases preMsg? with
+      | none => exact hPend st specMsg h
+      | some pm => exact hPend _ specMsg (hNonPend st pm (.resolved pm) h rfl rfl)
+  | resolve txId hit replMsgs confirmOnHit =>
+      rcases step_resolve_cases upd classify st msg txId hit replMsgs confirmOnHit hcl with
+        ⟨m0, tail, hlog, _, hstep⟩ | hstep
+      · rw [hstep]; exact hHit st txId m0 tail confirmOnHit h hlog
+      · rw [hstep]; unfold resolveReplace; dsimp only; split
+        · exact h
+        · exact hRepl st txId replMsgs h
+
+end
+
+theorem step_preserves_inv {Inv : State → Prop}
     (upd : State → Msg → State × Cmd Msg)
     (classify : State → Msg → SpecAction Msg)
     (hupd : ∀ s m, Inv s → Inv (upd s m).1)
     (st : SpecState State Msg) (msg : Msg)
     (h : SpecInv Inv st) :
-    SpecInv Inv (SpecEngine.step upd classify st msg).1 := by
-  rcases h with ⟨hconf, hvis⟩
-  cases hcl : classify st.visible msg with
-  | normal =>
-      unfold SpecEngine.step; rw [hcl]; dsimp only; split
-      · exact ⟨hupd _ _ hvis, hupd _ _ hvis⟩
-      · exact ⟨hconf, hupd _ _ hvis⟩
-  | dispatch preMsg? _ specMsg _ =>
-      unfold SpecEngine.step; rw [hcl]; dsimp only
-      cases preMsg? with
-      | none => exact ⟨hconf, hupd _ _ hvis⟩
-      | some pm =>
-          dsimp only; have hv1 := hupd st.visible pm hvis
-          split
-          · exact ⟨hv1, hupd _ _ hv1⟩
-          · exact ⟨hconf, hupd _ _ hv1⟩
-  | resolve txId hit replMsgs confirmOnHit =>
-      rcases step_resolve_cases upd classify st msg txId hit replMsgs confirmOnHit hcl with
-        ⟨m0, tail, _, _, hstep⟩ | hstep
-      · rw [hstep]; dsimp only; have hc1 := hupd st.confirmed m0 hconf; split
-        · exact ⟨drainConfirmed_preserves_inv hupd tail _ hc1, hvis⟩
-        · have hc2 := runMsgs_preserves_inv hupd confirmOnHit _ hc1
-          have hc3 := drainConfirmed_preserves_inv hupd tail _ hc2
-          exact ⟨hc3, replay_preserves_inv hupd _ _ hc3⟩
-      · rw [hstep]; exact resolveReplace_preserves_inv upd hupd txId replMsgs st ⟨hconf, hvis⟩
+    SpecInv Inv (SpecEngine.step upd classify st msg).1 :=
+  step_preserves upd classify (SpecInv Inv)
+    (fun st m _ h _ _ => by unfold appendNonPending; split <;> exact ⟨by first | exact hupd _ _ h.2 | exact h.1, hupd _ _ h.2⟩)
+    (fun st m h => ⟨h.1, hupd _ _ h.2⟩)
+    (fun st _ m0 tail conf h _ => by
+      unfold resolveHeadHit; dsimp only; have hc1 := hupd _ m0 h.1; split
+      · exact ⟨drainConfirmed_preserves_inv hupd tail _ hc1, h.2⟩
+      · have hc3 := drainConfirmed_preserves_inv hupd tail _ (runMsgs_preserves_inv hupd conf _ hc1)
+        exact ⟨hc3, replay_preserves_inv hupd _ _ hc3⟩)
+    (fun st txId repl h => by
+      have hc' := drainConfirmed_preserves_inv hupd (replacePending upd txId repl st.confirmed st.log).1 st.confirmed h.1
+      exact ⟨hc', replay_preserves_inv hupd _ _ hc'⟩)
+    st msg h
 
-theorem step_preserves_coherent {State Msg : Type}
+theorem step_preserves_coherent
     (upd : State → Msg → State × Cmd Msg)
     (classify : State → Msg → SpecAction Msg)
     (st : SpecState State Msg) (msg : Msg)
     (hcoh : Coherent (fun s m => (upd s m).1) st) :
-    Coherent (fun s m => (upd s m).1) (SpecEngine.step upd classify st msg).1 := by
-  cases hcl : classify st.visible msg with
-  | normal =>
-      unfold SpecEngine.step; rw [hcl]; dsimp only; split
-      · rename_i hemp; simp [Coherent, List.isEmpty_iff.1 hemp]
-      · unfold Coherent at hcoh ⊢; simp [List.foldl_append, replayEntry, entryMsg, hcoh]
-  | dispatch preMsg? _ specMsg _ =>
-      unfold SpecEngine.step; rw [hcl]; dsimp only
-      cases preMsg? with
-      | none => unfold Coherent at hcoh ⊢; simp [List.foldl_append, replayEntry, entryMsg, hcoh]
-      | some pm =>
-          dsimp only; split
-          · simp [Coherent, replayEntry, entryMsg]
-          · unfold Coherent at hcoh ⊢; simp [List.foldl_append, replayEntry, entryMsg, hcoh]
-  | resolve txId hit replMsgs confirmOnHit =>
-      rcases step_resolve_cases upd classify st msg txId hit replMsgs confirmOnHit hcl with
-        ⟨m0, tail, hlog, _, hstep⟩ | hstep
-      · rw [hstep]; dsimp only; split
-        · unfold Coherent at hcoh ⊢; dsimp only
-          rw [drainConfirmed_foldl_eq]
-          simpa [hlog, List.foldl_cons, replayEntry] using hcoh
-        · rfl
-      · rw [hstep]; exact resolveReplace_preserves_coherent upd txId replMsgs st hcoh
+    Coherent (fun s m => (upd s m).1) (SpecEngine.step upd classify st msg).1 :=
+  step_preserves upd classify (Coherent fun s m => (upd s m).1)
+    (fun st m e h he _ => by
+      unfold appendNonPending; unfold Coherent at h ⊢; split
+      · rfl
+      · simp [List.foldl_append, replayEntry, he, h])
+    (fun st m h => by unfold appendPending; unfold Coherent at h ⊢; simp [List.foldl_append, replayEntry, entryMsg, h])
+    (fun st _ m0 tail conf h hlog => by
+      unfold resolveHeadHit; dsimp only; split
+      · unfold Coherent at h ⊢; dsimp only; rw [drainConfirmed_foldl_eq]
+        simpa [hlog, List.foldl_cons, replayEntry] using h
+      · rfl)
+    (fun _ _ _ _ => rfl)
+    st msg hcoh
 
 /-! ## Multi-Transaction Linearizability, Hit Soundness, Zero-Leak Drain & Effect-Once Proofs -/
 
-theorem replacePending_not_mem {State Msg : Type}
+theorem replacePending_not_mem
     (upd : State → Msg → State × Cmd Msg) (txId : Nat) (replMsgs : List Msg) :
     ∀ (log : List (SpecEntry Msg)) (sCur : State),
       txId ∉ pendingIds log →
@@ -254,7 +236,7 @@ theorem replacePending_not_mem {State Msg : Type}
 
 /-- Exact characterization of `replacePending` on an arbitrary multi-transaction journal
     `pre ++ [.pending txId specMsg] ++ post` where `txId ∉ pendingIds pre`. -/
-theorem replacePending_split {State Msg : Type}
+theorem replacePending_split
     (upd : State → Msg → State × Cmd Msg) (txId : Nat) (specMsg : Msg) (replMsgs : List Msg) :
     ∀ (pre post : List (SpecEntry Msg)) (sCur : State),
       txId ∉ pendingIds pre →
@@ -272,109 +254,73 @@ theorem replacePending_split {State Msg : Type}
         (fun hm => h (by simp [hm]))
       simp [replacePending, replayEntry, entryMsg, hbeq, ih]
 
-theorem wellFormedIds_pure {State Msg : Type} (s : State) :
+theorem wellFormedIds_pure (s : State) :
     WellFormedIds (SpecState.pure (Msg := Msg) s) :=
   ⟨fun _ h => by simp at h, List.nodup_nil⟩
 
-private theorem pendingIds_replacePending_sub {State Msg : Type}
+private theorem pendingIds_replacePending_sublist
     (upd : State → Msg → State × Cmd Msg) (txId : Nat) (replMsgs : List Msg) :
     ∀ (log : List (SpecEntry Msg)) (sCur : State),
-      (∀ id ∈ pendingIds (replacePending upd txId replMsgs sCur log).1, id ∈ pendingIds log) ∧
-      ((pendingIds log).Nodup → (pendingIds (replacePending upd txId replMsgs sCur log).1).Nodup)
-  | [], _ => ⟨fun _ h => h, id⟩
-  | .regular m :: rest, sCur | .resolved m :: rest, sCur => by
-      simpa [replacePending, replayEntry] using
-        pendingIds_replacePending_sub upd txId replMsgs rest (upd sCur m).1
+      (pendingIds (replacePending upd txId replMsgs sCur log).1).Sublist (pendingIds log)
+  | [], _ => .slnil
+  | .regular m :: rest, sCur | .resolved m :: rest, sCur =>
+      pendingIds_replacePending_sublist upd txId replMsgs rest (upd sCur m).1
   | .pending id m :: rest, sCur => by
       by_cases heq : id = txId
       · subst heq
         simp only [replacePending, beq_self_eq_true, ↓reduceIte, pendingIds_append,
           pendingIds_map_resolved, List.nil_append, pendingIds_cons_pending]
-        exact ⟨fun _ hx => List.mem_cons_of_mem id hx, fun hnd => (List.nodup_cons.1 hnd).2⟩
-      · have hbeq : (id == txId) = false := beq_false_of_ne heq
-        have ⟨hsub, hnd⟩ := pendingIds_replacePending_sub upd txId replMsgs rest (upd sCur m).1
-        simp only [replacePending, hbeq, Bool.false_eq_true, ↓reduceIte, pendingIds_cons_pending]
-        refine ⟨fun x hx => ?_, fun hnodup => ?_⟩
-        · rcases List.mem_cons.1 hx with rfl | hx'
-          · exact List.mem_cons_self
-          · exact List.mem_cons_of_mem id (hsub x hx')
-        · rcases List.nodup_cons.1 hnodup with ⟨hnotmem, hrest⟩
-          exact List.nodup_cons.2 ⟨fun hin => hnotmem (hsub id hin), hnd hrest⟩
+        exact .cons id (.refl _)
+      · simp only [replacePending, beq_false_of_ne heq, Bool.false_eq_true, ↓reduceIte, pendingIds_cons_pending]
+        exact .cons_cons id (pendingIds_replacePending_sublist upd txId replMsgs rest (upd sCur m).1)
 
 private theorem nodup_append_singleton {α : Type} {l : List α} {x : α}
     (hnd : l.Nodup) (hnot : x ∉ l) : (l ++ [x]).Nodup := by
   simp [List.nodup_append, hnd]; intro a ha heq; subst heq; exact hnot ha
 
-private theorem resolveReplace_preserves_wellFormedIds {State Msg : Type}
-    (upd : State → Msg → State × Cmd Msg) (txId : Nat) (replMsgs : List Msg)
-    (st : SpecState State Msg) (hwf : WellFormedIds st) :
-    WellFormedIds (resolveReplace upd txId replMsgs st).1 := by
-  unfold resolveReplace; dsimp only; split
-  · exact hwf
-  · have ⟨hsub, hndR⟩ := pendingIds_replacePending_sub upd txId replMsgs st.log st.confirmed
-    exact ⟨fun id hid => hwf.1 id (hsub id (by rwa [drainConfirmed_pendingIds] at hid)),
-           by rw [drainConfirmed_pendingIds]; exact hndR hwf.2⟩
+private theorem wellFormedIds_of_sublist {st st' : SpecState State Msg}
+    (h : WellFormedIds st) (hnext : st'.nextTxId = st.nextTxId)
+    (hsub : (pendingIds st'.log).Sublist (pendingIds st.log)) :
+    WellFormedIds st' :=
+  ⟨fun id hid => hnext ▸ h.1 id (hsub.subset hid), h.2.sublist hsub⟩
 
-theorem step_preserves_wellFormedIds {State Msg : Type}
-    (upd : State → Msg → State × Cmd Msg)
-    (classify : State → Msg → SpecAction Msg)
-    (st : SpecState State Msg) (msg : Msg)
+section
+variable (upd : State → Msg → State × Cmd Msg) (classify : State → Msg → SpecAction Msg)
+
+theorem step_preserves_wellFormedIds (st : SpecState State Msg) (msg : Msg)
     (hwf : WellFormedIds st) :
-    WellFormedIds (SpecEngine.step upd classify st msg).1 := by
-  rcases hwf with ⟨hlt, hnd⟩
-  have hpush : ∀ (l : List (SpecEntry Msg)), (∀ id ∈ pendingIds l, id < st.nextTxId) →
-      (pendingIds l).Nodup →
-      (∀ id ∈ pendingIds l ++ [st.nextTxId], id < st.nextTxId + 1) ∧
-      (pendingIds l ++ [st.nextTxId]).Nodup := by
-    intro l hl hn
-    refine ⟨fun id hid => ?_, nodup_append_singleton hn (fun hm => Nat.lt_irrefl _ (hl _ hm))⟩
-    rcases List.mem_append.1 hid with h1 | h2
-    · exact Nat.lt_succ_of_lt (hl id h1)
-    · simp only [List.mem_singleton] at h2; subst h2; exact Nat.lt_succ_self _
-  cases hcl : classify st.visible msg with
-  | normal =>
-      unfold SpecEngine.step; rw [hcl]; dsimp only; split
-      · exact ⟨hlt, hnd⟩
-      · simpa [WellFormedIds, pendingIds_append] using And.intro hlt hnd
-  | dispatch preMsg? _ _ _ =>
-      unfold SpecEngine.step; rw [hcl]; dsimp only
-      cases preMsg? with
-      | none =>
-          simpa [WellFormedIds, pendingIds_append] using hpush st.log hlt hnd
-      | some _ =>
-          dsimp only; split
-          · simp [WellFormedIds, hpush [] (fun _ h => by simp at h) List.nodup_nil]
-          · simpa [WellFormedIds, pendingIds_append] using hpush st.log hlt hnd
-  | resolve txId hit replMsgs confirmOnHit =>
-      rcases step_resolve_cases upd classify st msg txId hit replMsgs confirmOnHit hcl with
-        ⟨_, tail, hlog, _, hstep⟩ | hstep
-      · rw [hstep]; dsimp only
-        have hltT : ∀ id ∈ pendingIds tail, id < st.nextTxId :=
-          fun id hid => hlt id (by simp [hlog, hid])
-        have hndT : (pendingIds tail).Nodup :=
-          (List.nodup_cons.1 (by simpa [hlog] using hnd)).2
-        split <;>
-          exact ⟨fun id hid => hltT id (by rwa [drainConfirmed_pendingIds] at hid),
-                 by rw [drainConfirmed_pendingIds]; exact hndT⟩
-      · rw [hstep]; exact resolveReplace_preserves_wellFormedIds upd txId replMsgs st ⟨hlt, hnd⟩
+    WellFormedIds (SpecEngine.step upd classify st msg).1 :=
+  step_preserves upd classify WellFormedIds
+    (fun st _ e h _ hp => by
+      unfold appendNonPending; split
+      · exact ⟨fun _ h => by simp at h, List.nodup_nil⟩
+      · simpa [WellFormedIds, pendingIds_append, hp] using h)
+    (fun st _ h => by
+      refine ⟨fun id hid => ?_, ?_⟩
+      · simp only [appendPending, pendingIds_append, pendingIds_cons_pending, pendingIds_nil,
+          List.mem_append, List.mem_singleton] at hid
+        rcases hid with h1 | rfl; exact Nat.lt_succ_of_lt (h.1 id h1); exact Nat.lt_succ_self _
+      · simp only [appendPending, pendingIds_append, pendingIds_cons_pending, pendingIds_nil]
+        exact nodup_append_singleton h.2 (fun hm => Nat.lt_irrefl _ (h.1 _ hm)))
+    (fun st _ _ tail _ h hlog => by
+      have hsub : (pendingIds tail).Sublist (pendingIds st.log) := by rw [hlog]; exact .cons _ (.refl _)
+      unfold resolveHeadHit; dsimp only; split <;>
+        exact wellFormedIds_of_sublist h rfl (by dsimp only; rw [drainConfirmed_pendingIds]; exact hsub))
+    (fun st txId repl h =>
+      wellFormedIds_of_sublist h rfl (by dsimp only; rw [drainConfirmed_pendingIds]; exact pendingIds_replacePending_sublist upd txId repl st.log st.confirmed))
+    st msg hwf
 
 /-- Prediction-hit stability: when the head prediction matches (`hit = true`) and there are no
     `on_confirm` state updates (`confirmOnHit = []`), `visible` is provably untouched. -/
-theorem resolve_hit_preserves_visible {State Msg : Type}
-    (upd : State → Msg → State × Cmd Msg)
-    (classify : State → Msg → SpecAction Msg)
-    (st : SpecState State Msg) (msg : Msg)
+theorem resolve_hit_preserves_visible (st : SpecState State Msg) (msg : Msg)
     (txId : Nat) (m0 : Msg) (tail : List (SpecEntry Msg)) (replMsgs : List Msg)
     (hlog : st.log = .pending txId m0 :: tail)
     (hcl : classify st.visible msg = .resolve txId true replMsgs []) :
     (SpecEngine.step upd classify st msg).1.visible = st.visible := by
-  simp [SpecEngine.step, hcl, hlog]
+  simp [SpecEngine.step, resolveHeadHit, hcl, hlog]
 
 /-- Duplicate / stale resolution safety: resolving a `txId` not pending in `st.log` is `(st, .none)`. -/
-theorem resolve_unknown_noop {State Msg : Type}
-    (upd : State → Msg → State × Cmd Msg)
-    (classify : State → Msg → SpecAction Msg)
-    (st : SpecState State Msg) (msg : Msg)
+theorem resolve_unknown_noop (st : SpecState State Msg) (msg : Msg)
     (txId : Nat) (hit : Bool) (replMsgs confirmOnHit : List Msg)
     (hnot : txId ∉ pendingIds st.log)
     (hcl : classify st.visible msg = .resolve txId hit replMsgs confirmOnHit) :
@@ -390,12 +336,8 @@ theorem resolve_unknown_noop {State Msg : Type}
     for ANY journal `pre ++ [.pending txId specMsg] ++ post` with `txId ∉ pendingIds pre`,
     resolving `txId` along the replace/replay path preserves `pre` and `post`, applies `replMsgs`
     in place, removes `txId` from `pendingIds`, and emits ONLY `replMsgs`'s commands at `pre`'s state. -/
-theorem resolve_general_linearizable {State Msg : Type}
-    (upd : State → Msg → State × Cmd Msg)
-    (classify : State → Msg → SpecAction Msg)
-    (st : SpecState State Msg) (msg : Msg)
-    (txId : Nat) (specMsg : Msg) (hit : Bool)
-    (replMsgs confirmOnHit : List Msg)
+theorem resolve_general_linearizable (st : SpecState State Msg) (msg : Msg)
+    (txId : Nat) (specMsg : Msg) (hit : Bool) (replMsgs confirmOnHit : List Msg)
     (pre post : List (SpecEntry Msg))
     (hlog : st.log = pre ++ .pending txId specMsg :: post)
     (hnotPre : txId ∉ pendingIds pre)
@@ -420,26 +362,18 @@ theorem resolve_general_linearizable {State Msg : Type}
     · dsimp only; rw [drainConfirmed_pendingIds, pendingIds_append, pendingIds_append,
         pendingIds_map_resolved, List.append_nil]
   have hstepEq : SpecEngine.step upd classify st msg = resolveReplace upd txId replMsgs st := by
-    unfold SpecEngine.step; rw [hcl]; dsimp only
-    cases pre with
-    | nil =>
-        simp only [List.isEmpty_nil, Bool.and_true, Bool.not_eq_true'] at hnotHeadHit
-        simp [hlog, hnotHeadHit]
-    | cons e0 _ =>
-        rw [hlog]
-        cases e0 with
-        | pending id0 _ =>
-            have hbeq : (id0 == txId) = false := beq_false_of_ne (fun heq => hnotPre (by simp [heq]))
-            simp [hbeq]
-        | regular _ | resolved _ => rfl
+    rcases step_resolve_cases upd classify st msg txId hit replMsgs confirmOnHit hcl with
+      ⟨_, _, hlog', hhit, _⟩ | hstep
+    · rw [hlog] at hlog'
+      cases pre with
+      | nil => simp [hhit] at hnotHeadHit
+      | cons e0 _ => cases hlog'; exact absurd List.mem_cons_self hnotPre
+    · exact hstep
   simpa [hstepEq] using hrr
 
 /-- Single-transaction rollback completeness: when a sole pending prediction fails or mismatches
     and resolves to `replMsgs`, `log = []` and `visible = confirmed` equals applying `replMsgs`. -/
-theorem resolve_rollback_reverts_single {State Msg : Type}
-    (upd : State → Msg → State × Cmd Msg)
-    (classify : State → Msg → SpecAction Msg)
-    (st : SpecState State Msg) (msg : Msg)
+theorem resolve_rollback_reverts_single (st : SpecState State Msg) (msg : Msg)
     (txId : Nat) (specMsg : Msg) (replMsgs : List Msg)
     (hlog : st.log = [.pending txId specMsg])
     (hcl : classify st.visible msg = .resolve txId false replMsgs []) :
@@ -451,9 +385,11 @@ theorem resolve_rollback_reverts_single {State Msg : Type}
   simp [SpecEngine.step, resolveReplace, hcl, hlog, replacePending, List.append_nil] at hdrain ⊢
   simp [hdrain, drainConfirmed]
 
+end
+
 /-- Lawful hit soundness: when `SpecEq.eq actual pred = true`, `actual = pred` and the O(1)
     head-hit fast path produces the exact same `SpecState` and `Cmd` as replacing and replaying. -/
-theorem resolve_hit_sound {State Msg α : Type} [SpecEq α]
+theorem resolve_hit_sound {α : Type} [SpecEq α]
     (upd : State → Msg → State × Cmd Msg)
     (classify : State → Msg → SpecAction Msg)
     (cont : α → Msg) (actual pred : α)
@@ -473,38 +409,30 @@ theorem resolve_hit_sound {State Msg α : Type} [SpecEq α]
       if confirmOnHit.isEmpty then .none
       else mkBatchCmd (runMsgs upd (stepOnly st.confirmed (cont actual)) confirmOnHit).2 := by
   cases SpecEq.eq_of_true heq
-  unfold SpecEngine.step; rw [hcl, hlog]; dsimp only
+  unfold SpecEngine.step resolveHeadHit; rw [hcl, hlog]; dsimp only
   simp only [beq_self_eq_true, Bool.and_self, ↓reduceIte]
   cases confirmOnHit with
   | nil =>
       simp only [List.isEmpty_nil, ↓reduceIte, List.map_cons, List.map_nil, List.cons_append,
         List.nil_append, drainConfirmed]
       refine ⟨?_, trivial⟩
-      cases st with
-      | mk vis conf nextTxId log =>
-          dsimp only at hcoh hlog ⊢; subst hlog; unfold Coherent at hcoh
-          have hvis : vis = (drainConfirmed (fun s m => (upd s m).1) (upd conf (cont actual)).1 tail).2.foldl
-              (replayEntry (fun s m => (upd s m).1))
-              (drainConfirmed (fun s m => (upd s m).1) (upd conf (cont actual)).1 tail).1 := by
-            rw [drainConfirmed_foldl_eq]; simpa [List.foldl_cons, replayEntry] using hcoh
-          simp [hvis]
+      cases st with | mk vis conf nextTxId log =>
+      dsimp only at hcoh hlog ⊢; subst hlog; unfold Coherent at hcoh
+      dsimp only [List.foldl_cons, replayEntry, entryMsg] at hcoh
+      simp [drainConfirmed_foldl_eq, hcoh]
   | cons _ _ =>
       simp only [List.isEmpty_cons, Bool.false_eq_true, ↓reduceIte, List.map_cons,
-        List.cons_append, drainConfirmed]
-      rw [runMsgs_fst_eq_foldl, drainConfirmed_append_resolved]
+        List.cons_append, drainConfirmed, runMsgs_fst_eq_foldl, drainConfirmed_append_resolved]
       exact ⟨rfl, trivial⟩
 
-private theorem pendingIds_mem_split {Msg : Type} (txId : Nat) :
+private theorem pendingIds_mem_split (txId : Nat) :
     ∀ (l : List (SpecEntry Msg)), txId ∈ pendingIds l → (pendingIds l).Nodup →
       ∃ pre specMsg post, l = pre ++ .pending txId specMsg :: post ∧
         txId ∉ pendingIds pre ∧ txId ∉ pendingIds post
   | [], hm, _ => by simp at hm
-  | .regular r :: t, hm, hnd => by
+  | .regular r :: t, hm, hnd | .resolved r :: t, hm, hnd => by
       rcases pendingIds_mem_split txId t hm hnd with ⟨pre, sm, post, rfl, hp, hq⟩
-      exact ⟨.regular r :: pre, sm, post, rfl, hp, hq⟩
-  | .resolved r :: t, hm, hnd => by
-      rcases pendingIds_mem_split txId t hm hnd with ⟨pre, sm, post, rfl, hp, hq⟩
-      exact ⟨.resolved r :: pre, sm, post, rfl, hp, hq⟩
+      exact ⟨_ :: pre, sm, post, rfl, hp, hq⟩
   | .pending id0 m0 :: t, hm, hnd => by
       rcases List.nodup_cons.1 hnd with ⟨hnotT, hndT⟩
       rcases List.mem_cons.1 hm with rfl | hmt
@@ -513,9 +441,10 @@ private theorem pendingIds_mem_split {Msg : Type} (txId : Nat) :
         have hne : txId ≠ id0 := fun h => hnotT (h ▸ hmt)
         exact ⟨.pending id0 m0 :: pre, sm, post, rfl, by simp [hne, hp], hq⟩
 
-private theorem step_resolve_empty_pending_drains {State Msg : Type}
-    (upd : State → Msg → State × Cmd Msg) (classify : State → Msg → SpecAction Msg)
-    (st : SpecState State Msg) (msg : Msg)
+section
+variable (upd : State → Msg → State × Cmd Msg) (classify : State → Msg → SpecAction Msg)
+
+private theorem step_resolve_empty_pending_drains (st : SpecState State Msg) (msg : Msg)
     (txId : Nat) (hit : Bool) (replMsgs confirmOnHit : List Msg)
     (hcl : classify st.visible msg = .resolve txId hit replMsgs confirmOnHit)
     (hpe : pendingIds (SpecEngine.step upd classify st msg).1.log = []) :
@@ -525,21 +454,16 @@ private theorem step_resolve_empty_pending_drains {State Msg : Type}
       pendingIds (drainConfirmed (fun s m => (upd s m).1) c l).2 = [] →
       (drainConfirmed (fun s m => (upd s m).1) c l).2 = [] := fun l c hp =>
     congrArg Prod.snd (drainConfirmed_empty_of_no_pending _ l c (by rwa [drainConfirmed_pendingIds] at hp))
-  have hrr : pendingIds (resolveReplace upd txId replMsgs st).1.log = [] →
-      (resolveReplace upd txId replMsgs st).1.log = [] ∨
-      st.log = (resolveReplace upd txId replMsgs st).1.log := by
-    unfold resolveReplace; dsimp only; split
-    · intro _; exact Or.inr rfl
-    · intro hp; exact Or.inl (hdrain _ _ hp)
   rcases step_resolve_cases upd classify st msg txId hit replMsgs confirmOnHit hcl with
     ⟨_, _, _, _, hstep⟩ | hstep
-  · rw [hstep] at hpe ⊢; dsimp only at hpe ⊢
+  · rw [hstep] at hpe ⊢; unfold resolveHeadHit at hpe ⊢; dsimp only at hpe ⊢
     split at hpe <;> (rename_i h2; simp only [h2, ↓reduceIte]; exact .inl (hdrain _ _ hpe))
-  · rw [hstep] at hpe ⊢; exact hrr hpe
+  · rw [hstep] at hpe ⊢; unfold resolveReplace at hpe ⊢; dsimp only at hpe ⊢
+    split at hpe
+    · rename_i h2; rw [if_pos h2]; exact .inr rfl
+    · rename_i h2; rw [if_neg h2]; exact .inl (hdrain _ _ hpe)
 
-private theorem step_resolve_pendingIds_split {State Msg : Type}
-    (upd : State → Msg → State × Cmd Msg) (classify : State → Msg → SpecAction Msg)
-    (st : SpecState State Msg) (msg : Msg)
+private theorem step_resolve_pendingIds_split (st : SpecState State Msg) (msg : Msg)
     (txId : Nat) (sm : Msg) (hit : Bool) (replMsgs confirmOnHit : List Msg)
     (pre post : List (SpecEntry Msg))
     (hlog : st.log = pre ++ .pending txId sm :: post)
@@ -551,7 +475,7 @@ private theorem step_resolve_pendingIds_split {State Msg : Type}
     | nil =>
         simp only [List.isEmpty_nil, Bool.and_true] at hhh; subst hhh
         simp only [List.nil_append] at hlog
-        unfold SpecEngine.step; rw [hcl, hlog]; dsimp only
+        unfold SpecEngine.step resolveHeadHit; rw [hcl, hlog]; dsimp only
         simp only [beq_self_eq_true, Bool.and_self, ↓reduceIte, pendingIds_nil, List.nil_append]
         split <;> simp [drainConfirmed_pendingIds]
     | cons _ _ => simp at hhh
@@ -559,10 +483,7 @@ private theorem step_resolve_pendingIds_split {State Msg : Type}
       confirmOnHit pre post hlog hnotPre (by simp [hhh]) hcl).2.1
 
 /-- Zero-leak convergence for the final pending transaction. -/
-theorem step_resolve_clears_when_last {State Msg : Type}
-    (upd : State → Msg → State × Cmd Msg)
-    (classify : State → Msg → SpecAction Msg)
-    (st : SpecState State Msg) (msg : Msg)
+theorem step_resolve_clears_when_last (st : SpecState State Msg) (msg : Msg)
     (txId : Nat) (hit : Bool) (replMsgs confirmOnHit : List Msg)
     (hcoh : Coherent (fun s m => (upd s m).1) st)
     (hlast : pendingIds st.log = [txId])
@@ -590,9 +511,7 @@ theorem step_resolve_clears_when_last {State Msg : Type}
 
 /-- Multi-transaction zero-leak convergence: resolving every pending `txId` in `st.log`
     (in *any* arrival order) drains `log` to `[]` and leaves `visible = confirmed`. -/
-theorem resolve_all_drains_log {State Msg : Type}
-    (upd : State → Msg → State × Cmd Msg)
-    (classify : State → Msg → SpecAction Msg) :
+theorem resolve_all_drains_log :
     ∀ (msgs : List Msg) (st : SpecState State Msg),
       Coherent (fun s m => (upd s m).1) st →
       WellFormedIds st →
@@ -653,94 +572,85 @@ theorem resolve_all_drains_log {State Msg : Type}
           · exact Or.inr (hsame.trans heq)
 
 /-- Pure dispatch guarantee: dispatching a speculative RPC never fires any `Cmd` from `specMsg`. -/
-theorem dispatch_never_fires_specMsg_cmd {State Msg : Type}
-    (upd : State → Msg → State × Cmd Msg)
-    (classify : State → Msg → SpecAction Msg)
-    (st : SpecState State Msg) (msg : Msg)
+theorem dispatch_never_fires_specMsg_cmd (st : SpecState State Msg) (msg : Msg)
     (preCmd : Cmd Msg) (specMsg : Msg) (rpcCmd : Nat → Cmd Msg)
     (hcl : classify st.visible msg = .dispatch none preCmd specMsg rpcCmd) :
     (SpecEngine.step upd classify st msg).2 = Cmd.batch [preCmd, rpcCmd st.nextTxId] := by
   simp [SpecEngine.step, hcl]
 
+end
+
+end
+
 end SpecEngine
 
 namespace Internal
 
+defAppProjSimps App.withSpeculative {State Msg : Type}
+    (classify : State → Msg → SpecAction Msg) (app : App State Msg) =>
+    App.withSpeculative classify app with
+  [init := (SpecState.pure app.init.1, app.init.2),
+   update := SpecEngine.step app.update classify,
+   template := app.template.mapScope SpecState.visible]
 
-@[simp] theorem App.withSpeculative_init {State Msg : Type}
-    (classify : State → Msg → SpecAction Msg) (app : App State Msg) :
-    (App.withSpeculative classify app).init = (SpecState.pure app.init.1, app.init.2) := rfl
+section
+variable {State Msg : Type} {Inv : State → Prop}
+  (classify : State → Msg → SpecAction Msg) (app : App State Msg)
 
-@[simp] theorem App.withSpeculative_update {State Msg : Type}
-    (classify : State → Msg → SpecAction Msg) (app : App State Msg) :
-    (App.withSpeculative classify app).update = SpecEngine.step app.update classify := rfl
-
-@[simp] theorem App.withSpeculative_template {State Msg : Type}
-    (classify : State → Msg → SpecAction Msg) (app : App State Msg) :
-    (App.withSpeculative classify app).template = app.template.mapScope SpecState.visible := rfl
-
-@[simp] theorem App.withSpeculative_view {State Msg : Type}
-    (classify : State → Msg → SpecAction Msg) (app : App State Msg) (st : SpecState State Msg) :
+@[simp] theorem App.withSpeculative_view (st : SpecState State Msg) :
     App.view (App.withSpeculative classify app) st = App.view app st.visible := by
   simp [App.view, App.withSpeculative, App.liftModel]
 
-theorem App.withSpeculative_init_inv {State Msg : Type} {Inv : State → Prop}
-    (classify : State → Msg → SpecAction Msg) (app : App State Msg) (hinit : Inv app.init.1) :
+theorem App.withSpeculative_init_inv (hinit : Inv app.init.1) :
     SpecEngine.SpecInv Inv (App.withSpeculative classify app).init.1 := ⟨hinit, hinit⟩
 
-theorem App.withSpeculative_step_inv {State Msg : Type} {Inv : State → Prop}
-    (classify : State → Msg → SpecAction Msg) (app : App State Msg)
+theorem App.withSpeculative_step_inv
     (hupd : ∀ s m, Inv s → Inv (app.update s m).1)
     (st : SpecState State Msg) (msg : Msg) (h : SpecEngine.SpecInv Inv st) :
     SpecEngine.SpecInv Inv ((App.withSpeculative classify app).update st msg).1 :=
   SpecEngine.step_preserves_inv app.update classify hupd st msg h
 
-theorem App.withSpeculative_init_coherent {State Msg : Type}
-    (classify : State → Msg → SpecAction Msg) (app : App State Msg) :
+theorem App.withSpeculative_init_coherent :
     SpecEngine.Coherent (fun s m => (app.update s m).1) (App.withSpeculative classify app).init.1 := rfl
 
-theorem App.withSpeculative_step_coherent {State Msg : Type}
-    (classify : State → Msg → SpecAction Msg) (app : App State Msg)
+theorem App.withSpeculative_step_coherent
     (st : SpecState State Msg) (msg : Msg)
     (hcoh : SpecEngine.Coherent (fun s m => (app.update s m).1) st) :
     SpecEngine.Coherent (fun s m => (app.update s m).1)
       ((App.withSpeculative classify app).update st msg).1 :=
   SpecEngine.step_preserves_coherent app.update classify st msg hcoh
 
-theorem App.withSpeculative_init_wellFormedIds {State Msg : Type}
-    (classify : State → Msg → SpecAction Msg) (app : App State Msg) :
+theorem App.withSpeculative_init_wellFormedIds :
     SpecEngine.WellFormedIds (App.withSpeculative classify app).init.1 :=
   SpecEngine.wellFormedIds_pure _
 
-theorem App.withSpeculative_step_wellFormedIds {State Msg : Type}
-    (classify : State → Msg → SpecAction Msg) (app : App State Msg)
+theorem App.withSpeculative_step_wellFormedIds
     (st : SpecState State Msg) (msg : Msg) (hwf : SpecEngine.WellFormedIds st) :
     SpecEngine.WellFormedIds ((App.withSpeculative classify app).update st msg).1 :=
   SpecEngine.step_preserves_wellFormedIds app.update classify st msg hwf
 
-theorem App.withSpeculative_rehydrate_sound {State Msg : Type} {Inv : State → Prop}
-    (classify : State → Msg → SpecAction Msg) (app : App State Msg)
+private theorem withSpeculative_rehydrate_inv {raw : String} {st' : SpecState State Msg}
+    (h : (App.withSpeculative classify app).rehydrate raw = some st')
+    (hinv : ∀ m', app.rehydrate raw = some m' → Inv m') :
+    SpecEngine.SpecInv Inv st' := by
+  rcases Option.map_eq_some_iff.1 h with ⟨m', hm', rfl⟩
+  exact ⟨hinv m' hm', hinv m' hm'⟩
+
+theorem App.withSpeculative_rehydrate_sound
     (hsound : ∀ raw m', app.rehydrate raw = some m' → Inv m')
     (raw : String) (st' : SpecState State Msg)
     (h : (App.withSpeculative classify app).rehydrate raw = some st') :
-    SpecEngine.SpecInv Inv st' := by
-  dsimp only [App.withSpeculative, App.liftModel] at h
-  simp only [Option.map_eq_some_iff] at h
-  rcases h with ⟨m', hm', rfl⟩
-  have hm := hsound raw m' hm'
-  exact ⟨hm, hm⟩
+    SpecEngine.SpecInv Inv st' :=
+  withSpeculative_rehydrate_inv classify app h (hsound raw)
 
-theorem App.withSpeculative_dehydrate_inv {State Msg : Type} {Inv : State → Prop}
-    (classify : State → Msg → SpecAction Msg) (app : App State Msg)
+theorem App.withSpeculative_dehydrate_inv
     (hpres : ∀ m m', Inv m → app.rehydrate (app.dehydrate m) = some m' → Inv m')
     (st st' : SpecState State Msg) (hst : SpecEngine.SpecInv Inv st)
     (h : (App.withSpeculative classify app).rehydrate ((App.withSpeculative classify app).dehydrate st) = some st') :
-    SpecEngine.SpecInv Inv st' := by
-  dsimp only [App.withSpeculative, App.liftModel] at h
-  simp only [Option.map_eq_some_iff] at h
-  rcases h with ⟨m', hm', rfl⟩
-  have hm := hpres st.visible m' hst.2 hm'
-  exact ⟨hm, hm⟩
+    SpecEngine.SpecInv Inv st' :=
+  withSpeculative_rehydrate_inv classify app h (hpres st.visible · hst.2)
+
+end
 
 end Internal
 

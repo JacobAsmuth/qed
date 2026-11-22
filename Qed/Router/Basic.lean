@@ -26,21 +26,13 @@ class LawfulKey (α : Type) where
   toKey     : α → String
   injective : ∀ a₁ a₂ : α, toKey a₁ = toKey a₂ → a₁ = a₂
 
-instance : LawfulKey String where
-  toKey := id
-  injective _ _ h := h
+@[reducible] def LawfulKey.ofRouteParam {α : Type} [RouteParam α] : LawfulKey α where
+  toKey := RouteParam.toSeg
+  injective a₁ a₂ h := Option.some.inj (by rw [← RouteParam.round_trip a₁, h, RouteParam.round_trip])
 
-instance : LawfulKey Nat where
-  toKey := Nat.repr
-  injective a₁ a₂ h := by
-    have := congrArg String.toNat? h
-    simpa [Nat.toNat?_repr] using this
-
-instance : LawfulKey Int where
-  toKey := Int.repr
-  injective a₁ a₂ h := by
-    have := congrArg String.toInt? h
-    simpa [Int.toInt?_repr] using this
+instance : LawfulKey String := .ofRouteParam
+instance : LawfulKey Nat    := .ofRouteParam
+instance : LawfulKey Int    := .ofRouteParam
 
 instance : LawfulKey Bool where
   toKey | true => "1" | false => "0"
@@ -167,26 +159,16 @@ private theorem dropWhile_slash_safe :
   | [], _ => ⟨rfl, rfl⟩
   | c :: rest, hcs => by
       simp only [List.all_cons, Bool.and_eq_true] at hcs
-      rcases hcs with ⟨hc, hrest⟩
       by_cases hslash : (c == '/') = true
-      · simpa [List.dropWhile, hslash] using dropWhile_slash_safe rest hrest
+      · simpa [List.dropWhile, hslash] using dropWhile_slash_safe rest hcs.2
       · have hcf : (c == '/') = false := Bool.eq_false_iff.2 hslash
-        simp only [List.dropWhile, hcf]
-        unfold isSafePathBodyChar at hc
-        rcases Bool.and_eq_true_iff.1 hc with ⟨hcUrl, hcNot92⟩
-        have hnotBs : (c != '\\') = true := by
-          rw [bne_iff_ne]
-          intro heq; subst heq; simp at hcNot92
-        have hnotSlash : (c != '/') = true := by
-          rw [bne_iff_ne]
-          intro heq; subst heq; simp at hcf
-        have hrestUrl : rest.all isSafeUrlChar = true := by
-          rw [List.all_eq_true] at hrest ⊢
-          intro x hx
-          exact (Bool.and_eq_true_iff.1 (hrest x hx)).1
-        have hslashUrl : isSafeUrlChar '/' = true := rfl
-        exact ⟨by simp only [hasSafeUrlPrefix, Bool.and_eq_true, hnotSlash, hnotBs, and_self],
-               by simp only [List.all_cons, Bool.and_eq_true, hslashUrl, hcUrl, hrestUrl, and_self]⟩
+        rcases Bool.and_eq_true_iff.1 hcs.1 with ⟨hcUrl, hcNot92⟩
+        have hnotBs : (c != '\\') = true := bne_iff_ne.2 fun h => by subst h; simp at hcNot92
+        have hnotSlash : (c != '/') = true := bne_iff_ne.2 fun h => by subst h; simp at hcf
+        have hrestUrl : rest.all isSafeUrlChar = true :=
+          List.all_eq_true.2 fun x hx => (Bool.and_eq_true_iff.1 (List.all_eq_true.1 hcs.2 x hx)).1
+        exact ⟨by simp [List.dropWhile, hcf, hasSafeUrlPrefix, hnotSlash, hnotBs],
+               by simp [List.dropWhile, hcf, show isSafeUrlChar '/' = true from rfl, hcUrl, hrestUrl]⟩
 
 def Router.toURL {α} [Router α] (a : α) : String :=
   String.ofList ('/' :: (joinSlash ((Router.print a).map encodeSeg)).toList.dropWhile (· == '/'))

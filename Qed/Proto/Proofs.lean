@@ -69,20 +69,14 @@ theorem bytesToList_length (b : ByteArray) : (bytesToList b).length = b.size := 
 theorem decodePayloadList_append (w : WireVal) (rest : List UInt8) :
     decodePayloadList w.wireType (encodePayloadList w ++ rest) = .ok (w, rest) := by
   cases w with
-  | varint n =>
-      simp [WireVal.wireType, encodePayloadList, decodePayloadList,
-            decodeVarintList_append, bind, Except.bind, pure, Except.pure]
-  | fixed64 v =>
-      simp [WireVal.wireType, encodePayloadList, decodePayloadList,
-            decodeFixed64List_append, bind, Except.bind, pure, Except.pure]
   | bytes b =>
       simp only [WireVal.wireType, encodePayloadList, List.append_assoc, decodePayloadList,
                  decodeVarintList_append, bind, Except.bind]
       rw [← bytesToList_length b, splitExact_append]
       simp [bytesOfList_bytesToList]
-  | fixed32 v =>
-      simp [WireVal.wireType, encodePayloadList, decodePayloadList,
-            decodeFixed32List_append, bind, Except.bind, pure, Except.pure]
+  | varint _ | fixed64 _ | fixed32 _ =>
+      simp [WireVal.wireType, encodePayloadList, decodePayloadList, decodeVarintList_append,
+            decodeFixed32List_append, decodeFixed64List_append, bind, Except.bind, pure, Except.pure]
 
 theorem wireType_lt_eight (w : WireVal) : w.wireType < 8 := by
   cases w <;> simp [WireVal.wireType]
@@ -113,27 +107,18 @@ private theorem decodeFieldsAux_encodeFieldsList :
       cases fuel <;> simp [encodeFieldsList, decodeFieldsAux]
   | (k, w) :: rest, fuel, acc, hpos, hfuel => by
       have hk : 0 < k := hpos (k, w) (by simp)
-      have hrest : ∀ kw ∈ rest, 0 < kw.1 := fun kw hm => hpos kw (by simp [hm])
-      have hlen : 0 < (encodeFieldList k w).length := encodeFieldList_pos k w
-      have htot : (encodeFieldsList ((k, w) :: rest)).length =
-          (encodeFieldList k w).length + (encodeFieldsList rest).length := by
-        simp [encodeFieldsList, List.length_append]
+      have hlen := encodeFieldList_pos k w
+      simp only [encodeFieldsList, List.length_append] at hfuel
       cases fuel with
       | zero => omega
       | succ f' =>
-          have hf' : (encodeFieldsList rest).length ≤ f' := by omega
           unfold encodeFieldsList
           cases henc : encodeFieldList k w ++ encodeFieldsList rest with
-          | nil =>
-              have : (encodeFieldList k w ++ encodeFieldsList rest).length = 0 := by rw [henc]; rfl
-              rw [List.length_append] at this
-              omega
+          | nil => have := congrArg List.length henc; simp only [List.length_append, List.length_nil] at this; omega
           | cons b bs =>
-              unfold decodeFieldsAux
-              dsimp only [bind, Except.bind]
-              rw [← henc, decodeFieldList_append hk w (encodeFieldsList rest)]
-              dsimp only
-              rw [decodeFieldsAux_encodeFieldsList rest f' ((k, w) :: acc) hrest hf']
+              simp only [decodeFieldsAux, bind, Except.bind, ← henc, decodeFieldList_append hk]
+              rw [decodeFieldsAux_encodeFieldsList rest f' ((k, w) :: acc)
+                (fun kw hm => hpos kw (by simp [hm])) (by omega)]
               simp [List.append_assoc]
 
 theorem decodeFieldsSpec_encodeFieldsSpec (fields : List (Nat × WireVal))
@@ -155,23 +140,22 @@ theorem decodeFrameList_append (payload rest : List UInt8) :
   dsimp only [bind, Except.bind]
   rw [splitExact_append]
 
+private theorem bind_eq_ok {α β : Type} {x : Except String α} {f : α → Except String β} {b : β}
+    (h : (x >>= f) = .ok b) : ∃ a, x = .ok a ∧ f a = .ok b := by
+  cases x with | error _ => cases h | ok a => exact ⟨a, rfl, h⟩
+
 theorem readVarintAt_advances (buf : ByteArray) (pos limit : Nat) {n pos' : Nat}
     (h : readVarintAt buf pos limit = .ok (n, pos')) :
     pos < pos' ∧ pos' ≤ limit := by
   induction hfuel : limit - pos generalizing pos n with
-  | zero =>
-      unfold readVarintAt at h; rw [dif_neg (by omega)] at h; cases h
+  | zero => unfold readVarintAt at h; rw [dif_neg (by omega)] at h; cases h
   | succ d ih =>
       unfold readVarintAt at h
       split at h
-      · dsimp only at h
-        split at h
+      · dsimp only at h; split at h
         · cases h; omega
-        · dsimp only [bind, Except.bind, pure, Except.pure] at h
-          split at h
-          · cases h
-          · rename_i hi pos'' hr; cases h
-            have := ih (pos + 1) hr (by omega); omega
+        · obtain ⟨⟨_, _⟩, hr, heq⟩ := bind_eq_ok h
+          cases heq; have := ih (pos + 1) hr (by omega); omega
       · cases h
 
 theorem readPayloadAt_bounds (wt : Nat) (buf : ByteArray) (pos limit : Nat) {w : WireVal} {pos' : Nat}
@@ -180,31 +164,25 @@ theorem readPayloadAt_bounds (wt : Nat) (buf : ByteArray) (pos limit : Nat) {w :
   unfold readPayloadAt at h
   match wt with
   | 0 =>
-      dsimp only [bind, Except.bind, pure, Except.pure] at h
-      split at h
-      · cases h
-      · rename_i hr; cases h; have := readVarintAt_advances buf pos limit hr; omega
+      obtain ⟨⟨_, _⟩, hr, heq⟩ := bind_eq_ok h
+      cases heq; have := readVarintAt_advances buf pos limit hr; omega
   | 1 =>
-      unfold readFixed64At at h
-      dsimp only [bind, Except.bind, pure, Except.pure] at h
-      split at h
-      · cases h
-      · rename_i heq; cases h; split at heq <;> cases heq; omega
+      obtain ⟨⟨_, _⟩, hr, heq⟩ := bind_eq_ok h
+      cases heq; unfold readFixed64At at hr
+      split at hr
+      · have := congrArg (fun | .ok (_, p) => p | .error _ => 0) hr; dsimp only at this; omega
+      · cases hr
   | 2 =>
-      dsimp only [bind, Except.bind] at h
-      split at h
-      · cases h
-      · rename_i hr; have := readVarintAt_advances buf pos limit hr
-        split at h
-        · cases h; omega
-        · cases h
+      obtain ⟨⟨_, _⟩, hr, heq⟩ := bind_eq_ok h
+      have := readVarintAt_advances buf pos limit hr
+      dsimp only at heq; split at heq <;> cases heq; omega
   | 5 =>
-      unfold readFixed32At at h
-      dsimp only [bind, Except.bind, pure, Except.pure] at h
-      split at h
-      · cases h
-      · rename_i heq; cases h; split at heq <;> cases heq; omega
-  | 3 | 4 | n + 6 => cases h
+      obtain ⟨⟨_, _⟩, hr, heq⟩ := bind_eq_ok h
+      cases heq; unfold readFixed32At at hr
+      split at hr
+      · have := congrArg (fun | .ok (_, p) => p | .error _ => 0) hr; dsimp only at this; omega
+      · cases hr
+  | 3 | 4 | _ + 6 => cases h
 
 /-- Linear DoS termination bound: every decoded Protobuf field strictly advances the byte cursor
     (`pos < pos' ≤ limit`), bounding loop iterations by `buf.size`. -/
@@ -213,15 +191,12 @@ theorem cursor_strictly_advances (buf : ByteArray) (pos limit : Nat)
     (h : readFieldAt buf pos limit = .ok (fw, pos')) :
     pos < pos' ∧ pos' ≤ limit := by
   unfold readFieldAt at h
-  dsimp only [bind, Except.bind, pure, Except.pure] at h
-  split at h
-  · cases h
-  · rename_i tp htag; have := readVarintAt_advances buf pos limit htag
-    split at h
-    · cases h
-    · split at h
-      · cases h
-      · rename_i hpay; cases h; have := readPayloadAt_bounds (tp.1 % 8) buf tp.2 limit hpay; omega
+  obtain ⟨⟨tag, afterTag⟩, htag, h1⟩ := bind_eq_ok h
+  have := readVarintAt_advances buf pos limit htag
+  dsimp only at h1; split at h1
+  · cases h1
+  · obtain ⟨⟨_, _⟩, hpay, heq⟩ := bind_eq_ok h1
+    cases heq; have := readPayloadAt_bounds (tag % 8) buf afterTag limit hpay; omega
 
 /-- Rolling-deploy forward compatibility: unknown field tags placed before or after known schema
     fields never alter lookup of known fields. -/
@@ -411,20 +386,22 @@ private theorem sliceList_len_le (buf : ByteArray) (pos limit : Nat) :
   have := List.length_take_le limit (bytesToList buf)
   rw [List.length_drop]; omega
 
+private theorem decodeLEList_none_of_lt : ∀ {k : Nat} {xs : List UInt8},
+    xs.length < k → decodeLEList k xs = none
+  | 0, _, h => nomatch h
+  | _ + 1, [], _ => rfl
+  | k + 1, _ :: xs, h => by simp [decodeLEList, decodeLEList_none_of_lt (k := k) (by simpa using h)]
+
 private theorem readFixed32At_eq_spec (buf : ByteArray) (pos limit : Nat)
     (hlim : limit ≤ buf.size) :
     (readFixed32At buf pos limit).map (fun (v, p') => (v, sliceList buf p' limit)) =
       decodeFixed32List (sliceList buf pos limit) := by
   unfold readFixed32At
   by_cases h : pos + 4 ≤ limit ∧ limit ≤ buf.size
-  · rw [dif_pos h, sliceList_cons ⟨by omega, hlim⟩, sliceList_cons ⟨by omega, hlim⟩,
-        sliceList_cons ⟨by omega, hlim⟩, sliceList_cons ⟨by omega, hlim⟩]
+  · rw [dif_pos h]; repeat rw [sliceList_cons ⟨by omega, hlim⟩]
     simp [decodeFixed32List, decodeLEList, Except.map]
-  · rw [dif_neg h]
-    have hlen := sliceList_len_le buf pos limit
-    match hsl : sliceList buf pos limit with
-    | _ :: _ :: _ :: _ :: _ => exfalso; simp [hsl] at hlen; omega
-    | [] | [_] | [_, _] | [_, _, _] => rfl
+  · have := sliceList_len_le buf pos limit
+    rw [dif_neg h, decodeFixed32List, decodeLEList_none_of_lt (by omega)]; rfl
 
 private theorem readFixed64At_eq_spec (buf : ByteArray) (pos limit : Nat)
     (hlim : limit ≤ buf.size) :
@@ -432,17 +409,10 @@ private theorem readFixed64At_eq_spec (buf : ByteArray) (pos limit : Nat)
       decodeFixed64List (sliceList buf pos limit) := by
   unfold readFixed64At
   by_cases h : pos + 8 ≤ limit ∧ limit ≤ buf.size
-  · rw [dif_pos h, sliceList_cons ⟨by omega, hlim⟩, sliceList_cons ⟨by omega, hlim⟩,
-        sliceList_cons ⟨by omega, hlim⟩, sliceList_cons ⟨by omega, hlim⟩,
-        sliceList_cons ⟨by omega, hlim⟩, sliceList_cons ⟨by omega, hlim⟩,
-        sliceList_cons ⟨by omega, hlim⟩, sliceList_cons ⟨by omega, hlim⟩]
+  · rw [dif_pos h]; repeat rw [sliceList_cons ⟨by omega, hlim⟩]
     simp [decodeFixed64List, decodeLEList, Except.map]
-  · rw [dif_neg h]
-    have hlen := sliceList_len_le buf pos limit
-    match hsl : sliceList buf pos limit with
-    | _ :: _ :: _ :: _ :: _ :: _ :: _ :: _ :: _ => exfalso; simp [hsl] at hlen; omega
-    | [] | [_] | [_, _] | [_, _, _] | [_, _, _, _] | [_, _, _, _, _]
-    | [_, _, _, _, _, _] | [_, _, _, _, _, _, _] => rfl
+  · have := sliceList_len_le buf pos limit
+    rw [dif_neg h, decodeFixed64List, decodeLEList_none_of_lt (by omega)]; rfl
 
 private theorem readPayloadAt_eq_spec (wt : Nat) (buf : ByteArray) (pos limit : Nat)
     (hlim : limit ≤ buf.size) :
@@ -450,12 +420,8 @@ private theorem readPayloadAt_eq_spec (wt : Nat) (buf : ByteArray) (pos limit : 
       decodePayloadList wt (sliceList buf pos limit) := by
   unfold readPayloadAt decodePayloadList
   match wt with
-  | 0 =>
-      rw [← readVarintAt_eq_spec buf pos limit hlim]
-      cases readVarintAt buf pos limit <;> simp [Except.map, bind, Except.bind, pure, Except.pure]
-  | 1 =>
-      rw [← readFixed64At_eq_spec buf pos limit hlim]
-      cases readFixed64At buf pos limit <;> simp [Except.map, bind, Except.bind, pure, Except.pure]
+  | 0 => rw [← readVarintAt_eq_spec buf pos limit hlim]; cases readVarintAt buf pos limit <;> rfl
+  | 1 => rw [← readFixed64At_eq_spec buf pos limit hlim]; cases readFixed64At buf pos limit <;> rfl
   | 2 =>
       rw [← readVarintAt_eq_spec buf pos limit hlim]
       cases hr : readVarintAt buf pos limit with
@@ -474,10 +440,8 @@ private theorem readPayloadAt_eq_spec (wt : Nat) (buf : ByteArray) (pos limit : 
             rw [if_pos hfit, if_pos hcond, hchunk]
           · have hnot : ¬ (afterLen + len ≤ limit ∧ limit ≤ buf.size) := by omega
             rw [if_neg hfit, if_neg hnot]
-  | 5 =>
-      rw [← readFixed32At_eq_spec buf pos limit hlim]
-      cases readFixed32At buf pos limit <;> simp [Except.map, bind, Except.bind, pure, Except.pure]
-  | 3 | 4 | n + 6 => rfl
+  | 5 => rw [← readFixed32At_eq_spec buf pos limit hlim]; cases readFixed32At buf pos limit <;> rfl
+  | 3 | 4 | _ + 6 => rfl
 
 private theorem readFieldAt_eq_spec (buf : ByteArray) (pos limit : Nat)
     (hlim : limit ≤ buf.size) :
@@ -518,52 +482,47 @@ private theorem readFieldAt_fast_step (buf : ByteArray) (pos limit : Nat)
   · simp [readFieldAt, hv1, hfn0, hwt, readPayloadAt, hv2, bind, Except.bind, pure, Except.pure]
   · split <;> simp [readFieldAt, readPayloadAt, h2.2, *, bind, Except.bind, pure, Except.pure]
 
-private theorem readFieldsLoop_eq_spec (buf : ByteArray)
-    (fuel pos limit : Nat) (acc : List (Nat × WireVal))
-    (hp : pos ≤ limit) (hlim : limit ≤ buf.size) :
-    readFieldsLoop fuel buf pos limit acc = decodeFieldsAux fuel (sliceList buf pos limit) acc := by
-  induction fuel generalizing pos acc with
-  | zero =>
+private theorem readFieldsLoop_eq_spec (buf : ByteArray) :
+    ∀ (fuel pos limit : Nat) (acc : List (Nat × WireVal)),
+      pos ≤ limit → limit ≤ buf.size →
+      readFieldsLoop fuel buf pos limit acc = decodeFieldsAux fuel (sliceList buf pos limit) acc
+  | fuel, pos, limit, acc, hp, hlim => by
       by_cases heq : (pos == limit) = true
       · have hp' := beq_iff_eq.1 heq; subst hp'
-        unfold readFieldsLoop; rw [if_pos heq, sliceList_eq_nil (Nat.le_refl pos)]; rfl
-      · have hne : pos ≠ limit := beq_eq_false_iff_ne.1 (Bool.eq_false_iff.2 heq)
-        unfold readFieldsLoop; rw [if_neg heq, sliceList_cons ⟨by omega, hlim⟩]; rfl
-  | succ f' ih =>
-      by_cases heq : (pos == limit) = true
-      · have hp' := beq_iff_eq.1 heq; subst hp'
-        unfold readFieldsLoop; rw [if_pos heq, sliceList_eq_nil (Nat.le_refl pos)]; rfl
-      · have hlt : pos < limit := by
-          have hne : pos ≠ limit := beq_eq_false_iff_ne.1 (Bool.eq_false_iff.2 heq); omega
-        have hstep := readFieldAt_eq_spec buf pos limit hlim
-        rw [sliceList_cons ⟨hlt, hlim⟩] at hstep
-        have hfallback :
-            (match readFieldAt buf pos limit with
-              | .error e => .error e
-              | .ok (fw, pos') => readFieldsLoop f' buf pos' limit (fw :: acc)) =
-            decodeFieldsAux (f' + 1) (sliceList buf pos limit) acc := by
-          rw [sliceList_cons ⟨hlt, hlim⟩]; unfold decodeFieldsAux; dsimp only [bind, Except.bind]
-          rw [← hstep]
-          cases hrf : readFieldAt buf pos limit with
-          | error _ => rfl
-          | ok fwp =>
-              have hadv := cursor_strictly_advances buf pos limit hrf
-              exact ih fwp.2 (fwp.1 :: acc) (by omega)
-        unfold readFieldsLoop; rw [if_neg heq]; dsimp only
-        split
-        · rename_i h2; split
-          · rename_i hlt128
-            simp only [Bool.and_eq_true, decide_eq_true_eq] at hlt128
+        unfold readFieldsLoop; rw [if_pos heq, sliceList_eq_nil (Nat.le_refl pos)]; cases fuel <;> rfl
+      · have hlt : pos < limit := by have := beq_eq_false_iff_ne.1 (Bool.eq_false_iff.2 heq); omega
+        cases fuel with
+        | zero => unfold readFieldsLoop; rw [if_neg heq, sliceList_cons ⟨hlt, hlim⟩]; rfl
+        | succ f' =>
+            have hstep := readFieldAt_eq_spec buf pos limit hlim
+            rw [sliceList_cons ⟨hlt, hlim⟩] at hstep
+            have hfallback :
+                (match readFieldAt buf pos limit with
+                  | .error e => .error e
+                  | .ok (fw, pos') => readFieldsLoop f' buf pos' limit (fw :: acc)) =
+                decodeFieldsAux (f' + 1) (sliceList buf pos limit) acc := by
+              rw [sliceList_cons ⟨hlt, hlim⟩]; unfold decodeFieldsAux; dsimp only [bind, Except.bind]
+              rw [← hstep]
+              cases hrf : readFieldAt buf pos limit with
+              | error _ => rfl
+              | ok fwp =>
+                  have hadv := cursor_strictly_advances buf pos limit hrf
+                  exact readFieldsLoop_eq_spec buf f' fwp.2 limit (fwp.1 :: acc) (by omega) hlim
+            unfold readFieldsLoop; rw [if_neg heq]; dsimp only
             split
-            · rename_i hfw0; simp only [Bool.and_eq_true] at hfw0
-              rw [← hfallback, (readFieldAt_fast_step buf pos limit h2 hlt128.1 hlt128.2 hfw0.1).1 (beq_iff_eq.1 hfw0.2)]
-            · split
-              · rename_i _ hfw2; simp only [Bool.and_eq_true] at hfw2
-                have hrf := (readFieldAt_fast_step buf pos limit h2 hlt128.1 hlt128.2 hfw2.1).2 (beq_iff_eq.1 hfw2.2)
-                split <;> rename_i hle <;> simp [← hfallback, hrf, hle]
+            · rename_i h2; split
+              · rename_i hlt128
+                simp only [Bool.and_eq_true, decide_eq_true_eq] at hlt128
+                split
+                · rename_i hfw0; simp only [Bool.and_eq_true] at hfw0
+                  rw [← hfallback, (readFieldAt_fast_step buf pos limit h2 hlt128.1 hlt128.2 hfw0.1).1 (beq_iff_eq.1 hfw0.2)]
+                · split
+                  · rename_i _ hfw2; simp only [Bool.and_eq_true] at hfw2
+                    have hrf := (readFieldAt_fast_step buf pos limit h2 hlt128.1 hlt128.2 hfw2.1).2 (beq_iff_eq.1 hfw2.2)
+                    split <;> rename_i hle <;> simp [← hfallback, hrf, hle]
+                  · exact hfallback
               · exact hfallback
-          · exact hfallback
-        · exact hfallback
+            · exact hfallback
 
 @[csimp] theorem decodeFieldsSpec_eq_fast : @decodeFieldsSpec = @decodeFieldsFast := by
   funext buf
@@ -621,41 +580,26 @@ theorem encodeHex_encode_injective {α : Type} {p : String}
   exact Except.ok.inj hdec
 
 private theorem encodeHexLoop_eq_spec (b : ByteArray) :
-    ∀ (i : Nat) (acc : List Char),
-      i ≤ b.size →
+    ∀ (i : Nat) (acc : List Char), i ≤ b.size →
       encodeHexLoop b i acc = acc.reverse ++ encodeHexList ((bytesToList b).drop i) := by
-  intro i
-  induction hfuel : b.size - i generalizing i with
+  intro i; induction hfuel : b.size - i generalizing i with
   | zero =>
-      intro acc hi
-      have heq : i = b.size := by omega
-      subst heq
-      unfold encodeHexLoop
-      have hnot : ¬ (b.size < b.size) := Nat.lt_irrefl _
-      rw [dif_neg hnot]
-      have hdrop : (bytesToList b).drop b.size = [] := by
-        rw [← bytesToList_length b]; exact List.drop_length
-      simp [hdrop, encodeHexList]
-  | succ d ih =>
-      intro acc hi
-      have hlt : i < b.size := by omega
-      unfold encodeHexLoop
-      rw [dif_pos hlt, ih (i + 1) (by omega) _ (by omega)]
+      intro acc hi; have : i = b.size := by omega
+      subst this; unfold encodeHexLoop
+      rw [dif_neg (Nat.lt_irrefl _), show (bytesToList b).drop b.size = [] by rw [← bytesToList_length b]; exact List.drop_length]
+      simp [encodeHexList]
+  | succ _ ih =>
+      intro acc hi; have hlt : i < b.size := by omega
+      unfold encodeHexLoop; rw [dif_pos hlt, ih (i + 1) (by omega) _ (by omega)]
       cases b with | mk arr =>
       have hltArr : i < arr.toList.length := by simpa [ByteArray.size] using hlt
-      have hget : ({ data := arr } : ByteArray)[i]'hlt = arr.toList[i]'hltArr := rfl
-      have hdrop : (bytesToList { data := arr }).drop i =
-          (arr.toList[i]'hltArr) :: arr.toList.drop (i + 1) := by
-        dsimp only [bytesToList]
-        exact (List.getElem_cons_drop hltArr).symm
-      rw [hget, hdrop]
-      simp [encodeHexList, bytesToList, List.append_assoc]
+      rw [show (bytesToList { data := arr }).drop i = arr.toList[i]'hltArr :: arr.toList.drop (i + 1) from
+        (List.getElem_cons_drop hltArr).symm]
+      simp [encodeHexList, bytesToList, List.append_assoc]; exact ⟨rfl, rfl⟩
 
 @[csimp] theorem encodeHex_eq_fast : @encodeHex = @encodeHexFast := by
-  funext b
-  unfold encodeHex encodeHexFast
-  rw [encodeHexLoop_eq_spec b 0 [] (Nat.zero_le _)]
-  simp
+  funext b; unfold encodeHex encodeHexFast
+  rw [encodeHexLoop_eq_spec b 0 [] (Nat.zero_le _)]; simp
 
 private theorem decodeHexBuf_eq_spec :
     ∀ (cs : List Char) (out : ByteArray),
@@ -673,23 +617,14 @@ private theorem decodeHexBuf_eq_spec :
           | none => rfl
           | some l =>
               dsimp only [bind, Option.bind]
-              rw [decodeHexBuf_eq_spec rest (out.push (UInt8.ofNat (h * 16 + l))),
-                  bytesToList_push]
+              rw [decodeHexBuf_eq_spec rest (out.push (UInt8.ofNat (h * 16 + l))), bytesToList_push]
               cases decodeHexList rest <;> simp [Option.map, List.append_assoc]
 
 @[csimp] theorem decodeHex_eq_fast : @decodeHex = @decodeHexFast := by
-  funext s
-  unfold decodeHex decodeHexFast
+  funext s; unfold decodeHex decodeHexFast
   have h := decodeHexBuf_eq_spec s.toList (ByteArray.emptyWithCapacity (s.utf8ByteSize / 2))
-  have hempty : bytesToList (ByteArray.emptyWithCapacity (s.utf8ByteSize / 2)) = [] := rfl
-  cases hbuf : decodeHexBuf s.toList (ByteArray.emptyWithCapacity (s.utf8ByteSize / 2)) <;>
-    cases hlst : decodeHexList s.toList
-  · rfl
-  · rw [hbuf, hlst] at h; cases h
-  · rw [hbuf, hlst] at h; cases h
-  · rw [hbuf, hlst] at h
-    simp only [Option.map, hempty, List.nil_append, Option.some.injEq] at h
-    dsimp only
-    rw [← h, bytesOfList_bytesToList]
+  cases hbuf : decodeHexBuf s.toList _ <;> cases hlst : decodeHexList s.toList <;>
+    rw [hbuf, hlst] at h <;> cases h
+  exact congrArg Except.ok (bytesOfList_bytesToList _)
 
 end Qed.Proto

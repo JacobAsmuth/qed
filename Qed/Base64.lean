@@ -97,53 +97,31 @@ private theorem uint8_ofNat_toNat_eq (b : UInt8) {k : Nat} (h : k = b.toNat) :
 theorem decodeList_encodeList : ∀ (bs : List UInt8), decodeList (encodeList bs) = .ok bs
   | [] => rfl
   | [b0] => by
-      have hb0 : b0.toNat < 256 := b0.toNat_lt
-      have h0 := decodeChar_encodeChar (b0.toNat / 4) (by omega)
-      have h1 := decodeChar_encodeChar ((b0.toNat % 4) * 16) (by omega)
+      have := b0.toNat_lt
       simp only [encodeList, encodeListWith, decodeList, decodeQuad, List.isEmpty_nil, beq_self_eq_true,
-        Bool.and_self, ↓reduceIte, h0, h1, bind, Except.bind, List.append_nil]
-      congr 1; congr 1
+        Bool.and_self, ↓reduceIte, bind, Except.bind, List.append_nil]
+      repeat rw [decodeChar_encodeChar _ (by omega)]
+      simp only [Except.ok.injEq, List.cons.injEq, and_true]
       exact uint8_ofNat_toNat_eq b0 (by omega)
   | [b0, b1] => by
-      have hb0 : b0.toNat < 256 := b0.toNat_lt
-      have hb1 : b1.toNat < 256 := b1.toNat_lt
-      have h0 := decodeChar_encodeChar (b0.toNat / 4) (by omega)
-      have h1 := decodeChar_encodeChar ((b0.toNat % 4) * 16 + b1.toNat / 16) (by omega)
-      have h2 := decodeChar_encodeChar ((b1.toNat % 16) * 4) (by omega)
+      have := b0.toNat_lt; have := b1.toNat_lt
       have hne2 : (encodeChar ((b1.toNat % 16) * 4) == '=') = false :=
         beq_false_of_ne (encodeChar_ne_pad _ (by omega))
       simp only [encodeList, encodeListWith, decodeList, decodeQuad, List.isEmpty_nil, hne2, beq_self_eq_true,
-        Bool.true_and, Bool.false_and, Bool.false_eq_true, ↓reduceIte, h0, h1, h2,
-        bind, Except.bind, List.append_nil]
-      congr 1
-      have e0 : UInt8.ofNat (b0.toNat / 4 * 4 + ((b0.toNat % 4) * 16 + b1.toNat / 16) / 16) = b0 :=
-        uint8_ofNat_toNat_eq b0 (by omega)
-      have e1 : UInt8.ofNat ((((b0.toNat % 4) * 16 + b1.toNat / 16) % 16) * 16 + ((b1.toNat % 16) * 4) / 4) = b1 :=
-        uint8_ofNat_toNat_eq b1 (by omega)
-      rw [e0, e1]
+        Bool.true_and, Bool.false_and, Bool.false_eq_true, ↓reduceIte, bind, Except.bind, List.append_nil]
+      repeat rw [decodeChar_encodeChar _ (by omega)]
+      simp only [Except.ok.injEq, List.cons.injEq, and_true]
+      exact ⟨uint8_ofNat_toNat_eq b0 (by omega), uint8_ofNat_toNat_eq b1 (by omega)⟩
   | b0 :: b1 :: b2 :: rest => by
-      have hb0 : b0.toNat < 256 := b0.toNat_lt
-      have hb1 : b1.toNat < 256 := b1.toNat_lt
-      have hb2 : b2.toNat < 256 := b2.toNat_lt
-      have h0 := decodeChar_encodeChar (b0.toNat / 4) (by omega)
-      have h1 := decodeChar_encodeChar ((b0.toNat % 4) * 16 + b1.toNat / 16) (by omega)
-      have h2 := decodeChar_encodeChar ((b1.toNat % 16) * 4 + b2.toNat / 64) (by omega)
-      have h3 := decodeChar_encodeChar (b2.toNat % 64) (by omega)
+      have := b0.toNat_lt; have := b1.toNat_lt; have := b2.toNat_lt
       have hne3 : (encodeChar (b2.toNat % 64) == '=') = false :=
         beq_false_of_ne (encodeChar_ne_pad _ (by omega))
-      have ih : decodeList (encodeListWith encodeChar true rest) = .ok rest :=
-        decodeList_encodeList rest
-      simp only [encodeList, encodeListWith, decodeList, decodeQuad, hne3, Bool.and_false, Bool.false_eq_true,
-        ↓reduceIte, h0, h1, h2, h3, ih, bind, Except.bind, List.cons_append, List.nil_append]
-      congr 1
-      have e0 : UInt8.ofNat (b0.toNat / 4 * 4 + ((b0.toNat % 4) * 16 + b1.toNat / 16) / 16) = b0 :=
-        uint8_ofNat_toNat_eq b0 (by omega)
-      have e1 : UInt8.ofNat ((((b0.toNat % 4) * 16 + b1.toNat / 16) % 16) * 16 +
-          ((b1.toNat % 16) * 4 + b2.toNat / 64) / 4) = b1 :=
-        uint8_ofNat_toNat_eq b1 (by omega)
-      have e2 : UInt8.ofNat ((((b1.toNat % 16) * 4 + b2.toNat / 64) % 4) * 64 + b2.toNat % 64) = b2 :=
-        uint8_ofNat_toNat_eq b2 (by omega)
-      rw [e0, e1, e2]
+      simp only [encodeList, encodeListWith, decodeList, decodeQuad, hne3, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
+      repeat rw [decodeChar_encodeChar _ (by omega)]
+      simp only [bind, Except.bind, show decodeList (encodeListWith encodeChar true rest) = .ok rest from
+        decodeList_encodeList rest, List.cons_append, List.nil_append, Except.ok.injEq, List.cons.injEq, and_true]
+      exact ⟨uint8_ofNat_toNat_eq b0 (by omega), uint8_ofNat_toNat_eq b1 (by omega),
+        uint8_ofNat_toNat_eq b2 (by omega)⟩
 
 def encode (bs : ByteArray) : String :=
   String.ofList (encodeList bs.data.toList)
@@ -186,18 +164,15 @@ private theorem encodeListWith_all (f : Nat → Char) (p : Char → Bool)
     (hf : ∀ n < 64, p (f n) = true) :
     ∀ bs : List UInt8, (encodeListWith f false bs).all p = true
   | [] => rfl
-  | [b0] => by
-      have := b0.toNat_lt
-      simp only [encodeListWith, Bool.false_eq_true, ↓reduceIte, List.all_cons, List.all_nil, Bool.and_true]
-      rw [hf _ (by omega), hf _ (by omega)]; rfl
+  | [b0] => by have := b0.toNat_lt; simp [encodeListWith]; exact ⟨hf _ (by omega), hf _ (by omega)⟩
   | [b0, b1] => by
       have := b0.toNat_lt; have := b1.toNat_lt
-      simp only [encodeListWith, Bool.false_eq_true, ↓reduceIte, List.all_cons, List.all_nil, Bool.and_true]
-      rw [hf _ (by omega), hf _ (by omega), hf _ (by omega)]; rfl
+      simp [encodeListWith]; exact ⟨hf _ (by omega), hf _ (by omega), hf _ (by omega)⟩
   | b0 :: b1 :: b2 :: rest => by
       have := b0.toNat_lt; have := b1.toNat_lt; have := b2.toNat_lt
       simp only [encodeListWith, List.all_cons, encodeListWith_all f p hf rest, Bool.and_true]
-      rw [hf _ (by omega), hf _ (by omega), hf _ (by omega), hf _ (by omega)]; rfl
+      repeat rw [hf _ (by omega)]
+      rfl
 
 theorem encodeUrl_safe (bs : ByteArray) :
     (encodeUrl bs).toList.all isUrlChar = true := by
@@ -264,21 +239,14 @@ private def decodeBufAcc : List Char → List UInt8 → Except String (List UInt
 private theorem decodeBufAcc_eq :
     ∀ (cs : List Char) (acc : List UInt8),
       decodeBufAcc cs acc = (decodeList cs).map (acc.reverse ++ ·)
-  | [], acc => by simp [decodeBufAcc, decodeList, Except.map]
-  | [_], acc => by simp [decodeBufAcc, decodeList, Except.map]
-  | [_, _], acc => by simp [decodeBufAcc, decodeList, Except.map]
-  | [_, _, _], acc => by simp [decodeBufAcc, decodeList, Except.map]
+  | [], acc | [_], acc | [_, _], acc | [_, _, _], acc => by simp [decodeBufAcc, decodeList, Except.map]
   | c0 :: c1 :: c2 :: c3 :: rest, acc => by
-      unfold decodeBufAcc decodeList
-      dsimp only [bind, Except.bind]
+      unfold decodeBufAcc decodeList; dsimp only [bind, Except.bind]
       cases decodeQuad c0 c1 c2 c3 rest.isEmpty with
-      | error e => rfl
+      | error _ => rfl
       | ok chunk =>
-          dsimp only
-          rw [decodeBufAcc_eq rest]
-          cases decodeList rest with
-          | error e => rfl
-          | ok tl => simp [Except.map, List.append_assoc]
+          dsimp only; rw [decodeBufAcc_eq rest]
+          cases decodeList rest <;> simp [Except.map, List.append_assoc]
 
 def decodeFast (s : String) : Except String ByteArray :=
   (decodeBufAcc s.toList []).map fun xs => ByteArray.mk xs.toArray

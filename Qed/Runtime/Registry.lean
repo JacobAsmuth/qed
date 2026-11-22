@@ -6,11 +6,7 @@ namespace Qed.Internal
 
 open Lean Elab Term Meta in
 private def isFrameworkRoot (env : Environment) (n : Name) : Bool :=
-  let mod := match env.getModuleIdxFor? n with
-    | some idx => env.header.moduleNames.getD idx.toNat n
-    | none     => n
-  let root := mod.getRoot
-  root == `Init || root == `Std || root == `Lean || root == `Lake || root == `Qed
+  Qed.Diag.isToolchainRoot (Qed.Diag.modRootOf env n n) (includeQed := true)
 
 open Lean Elab Term Meta in
 private def isStyleConstructorFn (env : Environment) (fn : Name) : Bool :=

@@ -5,50 +5,45 @@ namespace Qed
 section CompElab
 open Lean Elab Command Qed.Lang
 
-structure PendingRpcCheck where
-  callRef      : Syntax
-  srvShort     : String
-  methodName   : String
-  reqConst?    : Option Name
-  reqLabel     : String
-  requiresAuth : Bool
-  argExprs     : Array Expr
-  lctx         : LocalContext
-  localInsts   : LocalInstances
-  mctx         : MetavarContext
-  sessionVar?  : Option Name
-
-structure PendingPredictCheck where
+structure CheckOrigin where
   callRef    : Syntax
   srvShort   : String
   methodName : String
-  ensConst   : Name
-  isOptWrap  : Bool
   argExprs   : Array Expr
-  predExpr   : Expr
   lctx       : LocalContext
   localInsts : LocalInstances
   mctx       : MetavarContext
+
+structure PendingRpcCheck extends CheckOrigin where
+  reqConst?    : Option Name
+  reqLabel     : String
+  requiresAuth : Bool
+  sessionVar?  : Option Name
+
+structure PendingPredictCheck extends CheckOrigin where
+  ensConst  : Name
+  isOptWrap : Bool
+  predExpr  : Expr
 
 initialize pendingRpcChecks : IO.Ref (Array PendingRpcCheck) ← IO.mkRef #[]
 initialize pendingPredictChecks : IO.Ref (Array PendingPredictCheck) ← IO.mkRef #[]
 initialize currentCompSessionRef : IO.Ref (Option Ident) ← IO.mkRef none
 
-
+open Lean Elab Term Meta in
+private def elabArgExprs (argTerms : Array Term) (paramTypeConsts : Array Name) : TermElabM (Array Expr) :=
+  argTerms.zipIdx.mapM fun (aT, i) => do
+    instantiateMVars (← elabTermEnsuringType aT (Lean.mkConst paramTypeConsts[i]!))
 
 open Lean Elab Term Meta in
 private def extractArgExprsAndRecordRpcCheck (stx : Syntax) (resExpr : Expr)
     (fnConst : Name) (argTerms : Array Term) (paramCount : Nat) (paramTypeConsts : Array Name)
     (srvShort methodName : String) (reqConst? : Option Name) (reqLabel : String)
     (requiresAuth : Bool) (shouldRecord : Bool) : TermElabM Unit := do
-  let mut argExprs : Array Expr := #[]
   let fnArgs := resExpr.getAppArgs
-  if resExpr.isAppOf fnConst && fnArgs.size ≥ 2 + paramCount then
-    for i in [0:paramCount] do
-      argExprs := argExprs.push (← instantiateMVars fnArgs[2 + i]!)
-  else
-    for (aT, i) in argTerms.zipIdx do
-      argExprs := argExprs.push (← instantiateMVars (← elabTermEnsuringType aT (Lean.mkConst paramTypeConsts[i]!)))
+  let argExprs ←
+    if resExpr.isAppOf fnConst && fnArgs.size ≥ 2 + paramCount then
+      (Array.range paramCount).mapM fun i => instantiateMVars fnArgs[2 + i]!
+    else elabArgExprs argTerms paramTypeConsts
   if shouldRecord then
     pendingRpcChecks.modify (·.push {
       callRef := stx, srvShort, methodName, reqConst?, reqLabel, requiresAuth, argExprs,
@@ -72,9 +67,7 @@ def elabQedCheckRpcCall : TermElab := fun stx expectedType? => do
   let argTerms : Array Term := (stx.getArg 4).getSepArgs.map (⟨·⟩)
   let cbTerm : Term := ⟨(stx.getArg 6)⟩
   let (srvInfo, mInfo) ← lookupCheckedMethod stx ⟨stx.getArg 1⟩ ⟨stx.getArg 2⟩ "RPC check"
-  let rawRpcId := mkIdentFrom stx mInfo.rawRpcConst
-  let callApp ← argTerms.foldlM (init := (rawRpcId : Term)) fun acc a => `($acc $a)
-  let fullCall ← `($callApp $cbTerm)
+  let fullCall ← Qed.Lang.mkAppTerms (mkIdentFrom stx mInfo.rawRpcConst) (argTerms.push cbTerm)
   let resExpr ← instantiateMVars (← elabTerm fullCall expectedType?)
   extractArgExprsAndRecordRpcCheck stx resExpr mInfo.rawRpcConst argTerms mInfo.paramCount mInfo.paramTypeConsts
     srvInfo.shortName mInfo.name mInfo.clientReqConst mInfo.clientReqLabel mInfo.requiresAuth
@@ -92,23 +85,13 @@ def elabQedCheckPredict : TermElab := fun stx expectedType? => do
   let predExpr ← instantiateMVars predExpr
   if mInfo.hasEnsures then
     if let some ensConst := mInfo.ensPredConst then
-      let mut argExprs : Array Expr := #[]
-      for (aT, i) in argTerms.zipIdx do
-        let pTy := Lean.mkConst mInfo.paramTypeConsts[i]!
-        argExprs := argExprs.push (← instantiateMVars (← elabTermEnsuringType aT pTy))
+      let argExprs ← elabArgExprs argTerms mInfo.paramTypeConsts
       let predTy ← Meta.whnf (← Meta.inferType predExpr)
-      let isOptWrap := mInfo.isOption && predTy.isAppOfArity ``Option 1
       pendingPredictChecks.modify (·.push {
-        callRef := stx
-        srvShort := srvInfo.shortName
-        methodName := mInfo.name
-        ensConst
-        isOptWrap
-        argExprs
-        predExpr
-        lctx := ← getLCtx
-        localInsts := ← getLocalInstances
-        mctx := ← getMCtx
+        callRef := stx, srvShort := srvInfo.shortName, methodName := mInfo.name,
+        ensConst, isOptWrap := mInfo.isOption && predTy.isAppOfArity ``Option 1,
+        argExprs, predExpr,
+        lctx := ← getLCtx, localInsts := ← getLocalInstances, mctx := ← getMCtx
       })
   return predExpr
 
@@ -156,6 +139,7 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
       else match decl with
       | .ldecl _ fv nm ty val _ k => acc.mkLetDecl fv nm ty val (nondep := false) (kind := k)
       | .cdecl _ fv nm ty bi k    => acc.mkLocalDecl fv nm ty bi (kind := k)
+  let fmtObl (obl : String) : String := if obl.isEmpty then "" else s!"\n  • must satisfy:  {obl}"
   for chk in checks do
     liftTermElabM do
       Meta.withMCtx chk.mctx <| withLCtx (mkProofLctx chk.lctx) chk.localInsts do
@@ -183,8 +167,7 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
         if let some reqConst := chk.reqConst? then
           let reqGoal := mkAppN (Lean.mkConst reqConst) chk.argExprs
           if let .error obl ← tryDischarge reqGoal then
-            let oblLine := if obl.isEmpty then "" else s!"\n  • must satisfy:  {obl}"
-            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` precondition `{chk.reqLabel}` could not be proved here:{oblLine}\n\nHint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`."
+            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` precondition `{chk.reqLabel}` could not be proved here:{fmtObl obl}\n\nHint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`."
   let currNs ← getCurrNamespace
   for (chk, idx) in predChecks.zipIdx do
     liftTermElabM do
@@ -223,8 +206,14 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
               value := closedVal
             })
         | .error obl =>
-            let oblLine := if obl.isEmpty then "" else s!"\n  • must satisfy:  {obl}"
-            throwErrorAt chk.callRef m!"Predicted response for `{chk.srvShort}.{chk.methodName}` does not satisfy server `ensures` postcondition:{oblLine}\n\nHint: Ensure the predicted value satisfies the server method's `ensures` clause (or guard it inside a `predict:` block)."
+            throwErrorAt chk.callRef m!"Predicted response for `{chk.srvShort}.{chk.methodName}` does not satisfy server `ensures` postcondition:{fmtObl obl}\n\nHint: Ensure the predicted value satisfies the server method's `ensures` clause (or guard it inside a `predict:` block)."
+
+open Lean Elab Term Meta in
+private def lookupCheckedChannel (stx : Syntax) (label : String) : TermElabM Qed.ChannelInfo := do
+  let chFullName := (stx.getArg 1).getId
+  let some chInfo := (Qed.channelRegistry.getState (← getEnv)).find? chFullName
+    | throwErrorAt stx s!"internal: unknown channel `{chFullName}` in {label}"
+  return chInfo
 
 open Lean Elab Term Meta in
 private def elabAndRecordChanCheck (stx : Syntax) (expectedType? : Option Expr)
@@ -233,11 +222,7 @@ private def elabAndRecordChanCheck (stx : Syntax) (expectedType? : Option Expr)
     (trailingArgs : Array Term) (srvShort methodName : String)
     (reqConst? : Option Name) (reqLabel : String) (requiresAuth : Bool) : TermElabM Expr := do
   let fnId := mkIdentFrom stx helperConst
-  let mut fullCall : Term ← `($fnId $slotLit)
-  for a in argTerms do
-    fullCall ← `($fullCall ($a))
-  for t in trailingArgs do
-    fullCall ← `($fullCall ($t))
+  let fullCall ← (argTerms ++ trailingArgs).foldlM (init := ← `($fnId $slotLit)) fun acc a => `($acc ($a))
   let resExpr ← instantiateMVars (← elabTerm fullCall expectedType?)
   extractArgExprsAndRecordRpcCheck stx resExpr helperConst argTerms paramCount paramTypeConsts
     srvShort methodName reqConst? reqLabel requiresAuth (reqConst?.isSome || requiresAuth)
@@ -246,9 +231,7 @@ private def elabAndRecordChanCheck (stx : Syntax) (expectedType? : Option Expr)
 open Lean Elab Term Meta in
 @[term_elab qedCheckChanSubTerm]
 def elabCheckChanSub : TermElab := fun stx expectedType? => do
-  let chFullName := (stx.getArg 1).getId
-  let some chInfo := (Qed.channelRegistry.getState (← getEnv)).find? chFullName
-    | throwErrorAt stx s!"internal: unknown channel `{chFullName}` in subscription check"
+  let chInfo ← lookupCheckedChannel stx "subscription check"
   elabAndRecordChanCheck stx expectedType? ((stx.getArg 3).getSepArgs.map (⟨·⟩)) ⟨(stx.getArg 5)⟩
     chInfo.subHelperConst chInfo.paramCount chInfo.paramTypeConsts
     #[⟨(stx.getArg 7)⟩, ⟨(stx.getArg 9)⟩, ⟨(stx.getArg 11)⟩, ⟨(stx.getArg 13)⟩]
@@ -257,9 +240,7 @@ def elabCheckChanSub : TermElab := fun stx expectedType? => do
 open Lean Elab Term Meta in
 @[term_elab qedCheckChanSendTerm]
 def elabCheckChanSend : TermElab := fun stx expectedType? => do
-  let chFullName := (stx.getArg 1).getId
-  let some chInfo := (Qed.channelRegistry.getState (← getEnv)).find? chFullName
-    | throwErrorAt stx s!"internal: unknown channel `{chFullName}` in send check"
+  let chInfo ← lookupCheckedChannel stx "send check"
   elabAndRecordChanCheck stx expectedType? ((stx.getArg 3).getSepArgs.map (⟨·⟩)) ⟨(stx.getArg 5)⟩
     chInfo.sendHelperConst chInfo.sendParamCount chInfo.sendParamTypeConsts #[]
     chInfo.ownerShort s!"{chInfo.channelName}.send" chInfo.sendReqConst chInfo.sendReqLabel false

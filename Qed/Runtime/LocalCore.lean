@@ -19,9 +19,11 @@ structure LocalDef where
 def LocalDef.viewForProps (ldef : LocalDef) (props : String) : String → Html LocalMsg :=
   (ldef.viewProps.map (· props)).getD ldef.view
 
+private def dedupeStep (acc : Array LocalDef) (d : LocalDef) : Array LocalDef :=
+  if acc.any (·.id == d.id) then acc else acc.push d
+
 def LocalDef.dedupe (ds : List LocalDef) : List LocalDef :=
-  (ds.foldl (fun (acc : Array LocalDef) d =>
-    if acc.any (·.id == d.id) then acc else acc.push d) #[]).toList
+  (ds.foldl dedupeStep #[]).toList
 
 def Attr.localProps {msg P : Type} [ToJson P] (a : Attr msg) (props : P) : Attr msg :=
   match a with
@@ -76,76 +78,49 @@ theorem Attr.valid_localInit_intro {msg S : Type} [ToJson S] (a : Attr msg) (ini
 
 theorem LocalDef.valid_viewForProps (ldef : LocalDef) (props s : String) :
     Html.valid (ldef.viewForProps props s) = true := by
-  unfold LocalDef.viewForProps
-  have ⟨hv, hvp⟩ := ldef.valid_view
-  cases h : ldef.viewProps with
-  | none => simpa [h] using hv s
-  | some f =>
-      simp only [h] at hvp
-      simpa using hvp props s
+  rcases ldef with ⟨_, _, _, vp, hv, hvp⟩
+  cases vp <;> simp [LocalDef.viewForProps, hv, hvp]
+
+private theorem foldl_dedupe_inv (P : Array LocalDef → Prop) (xs : List LocalDef)
+    (acc : Array LocalDef) (h0 : P acc) (hstep : ∀ a d, d ∈ xs → P a → P (dedupeStep a d)) :
+    P (xs.foldl dedupeStep acc) := by
+  induction xs generalizing acc with
+  | nil => exact h0
+  | cons y ys ih =>
+      exact ih _ (hstep acc y (List.mem_cons_self ..) h0)
+        fun a d hd => hstep a d (List.mem_cons_of_mem y hd)
 
 theorem LocalDef.dedupe_mem {d : LocalDef} {ds : List LocalDef} (hm : d ∈ LocalDef.dedupe ds) :
-    d ∈ ds := by
-  unfold LocalDef.dedupe at hm
-  have hgen : ∀ (xs : List LocalDef) (acc : Array LocalDef),
-      (∀ x ∈ acc.toList, x ∈ ds) →
-      (∀ x ∈ xs, x ∈ ds) →
-      ∀ x ∈ (xs.foldl (fun (acc : Array LocalDef) d =>
-        if acc.any (·.id == d.id) then acc else acc.push d) acc).toList, x ∈ ds := by
-    intro xs
-    induction xs with
-    | nil => intro acc hacc _ x hx; exact hacc x hx
-    | cons y ys ih =>
-        intro acc hacc hys x hx
-        apply ih _ _ (fun z hz => hys z (List.mem_cons_of_mem y hz)) x hx
-        intro z hz
-        dsimp only at hz
-        split at hz
-        · exact hacc z hz
-        · rw [Array.toList_push, List.mem_append] at hz
-          rcases hz with h1 | h2
-          · exact hacc z h1
-          · simp only [List.mem_singleton] at h2
-            subst h2
-            exact hys z (List.mem_cons_self ..)
-  exact hgen ds #[] (fun _ h => nomatch h) (fun _ h => h) d hm
+    d ∈ ds :=
+  foldl_dedupe_inv (fun a => ∀ x ∈ a.toList, x ∈ ds) ds #[] (fun _ h => nomatch h)
+    (fun a y hy ha x hx => by
+      unfold dedupeStep at hx
+      split at hx
+      · exact ha x hx
+      · rw [Array.toList_push, List.mem_append, List.mem_singleton] at hx
+        exact hx.elim (ha x) (· ▸ hy))
+    d hm
 
 theorem LocalDef.dedupe_ids_nodup (ds : List LocalDef) :
-    ((LocalDef.dedupe ds).map (·.id)).Nodup := by
-  unfold LocalDef.dedupe
-  have hgen : ∀ (xs : List LocalDef) (acc : Array LocalDef),
-      (acc.toList.map (·.id)).Nodup →
-      ((xs.foldl (fun (acc : Array LocalDef) d =>
-        if acc.any (·.id == d.id) then acc else acc.push d) acc).toList.map (·.id)).Nodup := by
-    intro xs
-    induction xs with
-    | nil => intro acc hnd; exact hnd
-    | cons y ys ih =>
-        intro acc hnd
-        apply ih
-        dsimp only
-        by_cases hany : acc.any (·.id == y.id) = true
-        · simp [hany, hnd]
-        · have hanyF : acc.any (·.id == y.id) = false := Bool.eq_false_iff.2 hany
-          simp only [hanyF, Bool.false_eq_true, ↓reduceIte, Array.toList_push, List.map_append,
-            List.map_singleton]
-          have hnotMem : y.id ∉ acc.toList.map (·.id) := by
-            intro hm
-            rcases List.mem_map.1 hm with ⟨d, hd, hid⟩
-            obtain ⟨idx, hidx, hget⟩ := List.getElem_of_mem hd
-            have hidxA : idx < acc.size := by rw [← Array.length_toList]; exact hidx
-            have hanyT : acc.any (·.id == y.id) = true :=
-              Array.any_iff_exists.2 ⟨idx, hidxA, Nat.zero_le _, hidxA, by
-                have hgetA : acc[idx]'hidxA = d := hget
-                simp [hgetA, hid]⟩
-            simp [hanyT] at hanyF
-          rw [List.nodup_iff_pairwise_ne] at hnd ⊢
-          exact List.pairwise_append.2 ⟨hnd, List.pairwise_singleton _ _,
-            fun a ha b hb => by
-              simp only [List.mem_singleton] at hb
-              subst hb
-              intro heq; subst heq; exact hnotMem ha⟩
-  exact hgen ds #[] List.Pairwise.nil
+    ((LocalDef.dedupe ds).map (·.id)).Nodup :=
+  foldl_dedupe_inv (fun a => (a.toList.map (·.id)).Nodup) ds #[] List.Pairwise.nil
+    fun a y _ hnd => by
+      unfold dedupeStep
+      by_cases hany : a.any (·.id == y.id) = true
+      · simp [hany, hnd]
+      · have hnotMem : y.id ∉ a.toList.map (·.id) := by
+          intro hm
+          rcases List.mem_map.1 hm with ⟨d, hd, hid⟩
+          obtain ⟨i, hi, hget⟩ := List.getElem_of_mem hd
+          have hi' : i < a.size := by simpa using hi
+          have hgetA : a[i]'hi' = d := hget
+          exact hany (Array.any_iff_exists.2 ⟨i, hi', Nat.zero_le _, hi', by simp [hgetA, hid]⟩)
+        simp only [Bool.eq_false_iff.2 hany, Bool.false_eq_true, ↓reduceIte,
+          Array.toList_push, List.map_append, List.map_singleton]
+        dsimp only at hnd
+        rw [List.nodup_iff_pairwise_ne] at hnd ⊢
+        exact List.pairwise_append.2 ⟨hnd, List.pairwise_singleton _ _,
+          fun x hx z hz hxz => by simp only [List.mem_singleton] at hz; exact hnotMem (hz ▸ hxz ▸ hx)⟩
 
 theorem LocalDef.decode_toJson_eq {S : Type} [LawfulJson S] (s init : S)
     (hdepth : LawfulJson.depthBound S ≤ 64) :

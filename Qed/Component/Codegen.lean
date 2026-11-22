@@ -107,38 +107,17 @@ private def mkEmitOutTerm (spec : ComponentSpec) (s exprStx : Syntax) (targetId 
   let tname := targetId.getId.eraseMacroScopes
   if out?.isSome then
     throwErrorAt s "duplicate `.emit(...)` in action; an action emits at most one output"
-  if rawArgs.size != ev.params.size then
-    throwErrorAt exprStx s!"`{tname}.emit(...)` expects {ev.params.size} argument(s), got {rawArgs.size}"
-  let argTerms ← rawArgs.mapM fun ra => do
-    unless ra.getKind == ``qedCallArgPos do
-      throwErrorAt ra s!"named arguments are not supported in `{tname}.emit(...)`"
-    lowerCompExpr .val (ra.getArg 0)
-  let outCtor := mkIdentFrom targetId (spec.t.getId ++ `Out ++ ev.id.getId)
-  argTerms.foldlM (init := (outCtor : Term)) fun acc a => `($acc $a)
+  let argTerms ← lowerPosCallArgs exprStx s!"{tname}.emit(...)" (some ev.params.size) rawArgs
+  Qed.Lang.mkAppTerms (mkIdentFrom targetId (spec.t.getId ++ `Out ++ ev.id.getId)) argTerms
 
 private def mkChanSendCmdTerm (s exprStx : Syntax) (rawArgs : Array Syntax) (sub : SubDecl) :
     CommandElabM Term := do
   unless sub.chInfo.hasSend do
     throwErrorAt s s!"channel `{sub.chInfo.ownerShort}.{sub.chInfo.channelName}` does not declare `on_send` / `send`"
-  if rawArgs.size != sub.chInfo.sendParamCount then
-    throwErrorAt exprStx s!"`{sub.id.getId}.send(...)` expects {sub.chInfo.sendParamCount} argument(s), got {rawArgs.size}"
-  let argTerms ← rawArgs.mapM fun ra => do
-    unless ra.getKind == ``qedCallArgPos do
-      throwErrorAt ra s!"named arguments are not supported in `{sub.id.getId}.send(...)`"
-    lowerCompExpr .val (ra.getArg 0)
+  let argTerms ← lowerPosCallArgs exprStx s!"{sub.id.getId}.send(...)" (some sub.chInfo.sendParamCount) rawArgs
   let chFullId := mkIdentFrom s sub.chInfo.fullName
   let slotLit := Syntax.mkStrLit sub.id.getId.toString
   withRef s `(qedCheckChanSend% $chFullId:ident [$[$argTerms:term],*] $slotLit:str)
-
-private def mkPortSendCmdTerm (spec : ComponentSpec) (exprStx : Syntax) (targetId : Ident)
-    (rawArgs : Array Syntax) (po : PortOutDecl) : CommandElabM Term := do
-  if rawArgs.size != 1 then
-    throwErrorAt exprStx s!"`{po.id.getId}.send(...)` expects 1 argument, got {rawArgs.size}"
-  unless rawArgs[0]!.getKind == ``qedCallArgPos do
-    throwErrorAt rawArgs[0]! s!"named arguments are not supported in `{po.id.getId}.send(...)`"
-  let argT ← lowerCompExpr .val (rawArgs[0]!.getArg 0)
-  let poFn := mkIdentFrom targetId (spec.t.getId ++ po.id.getId)
-  `($poFn $argT)
 
 private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
     (mutated : Array Name) (out? : Option Term) (cmds : Array Term)
@@ -190,7 +169,7 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
             if let some sub := spec.subscriptions.find? (·.id.getId.eraseMacroScopes == tname) then
               bindCmd "wsSendCmd" (← mkChanSendCmdTerm s exprStx rawArgs sub)
             else if let some po := spec.portOuts.find? (·.id.getId.eraseMacroScopes == tname) then
-              bindCmd "portCmd" (← mkPortSendCmdTerm spec exprStx targetId rawArgs po)
+              bindCmd "portCmd" (← mkPortSendTerm spec.t.getId exprStx targetId po.id.getId rawArgs)
             else
               throwErrorAt targetId s!"unknown `subscribe` channel or outbound `port` `{tname}` in `{tname}.send(...)`"
           else bindRawCmd
@@ -223,9 +202,10 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
         let what := if sn.isEmpty then "" else s!" `{sn}`"
         throwErrorAt s s!"unsupported statement{what} in component action"
 
-def mkRightTuple (unit : CommandElabM Term) (pair : Term → Term → CommandElabM Term) :
-    List Term → CommandElabM Term
-  | [] => unit | [t] => pure t | t :: ts => do pair t (← mkRightTuple unit pair ts)
+private def appWithProps (spec : ComponentSpec) (fn : Ident) (args : Array Term := #[]) :
+    CommandElabM Term := do
+  let pTerm ← `(p)
+  Qed.Lang.mkAppTerms fn (if spec.hasProps then #[pTerm] ++ args else args)
 
 private def mkGuardedBranches (spec : ComponentSpec) (pfx : String)
     (paramTypeConsts : Array Name) (args : Array Term)
@@ -256,7 +236,7 @@ def mkRpcQueryBranches (spec : ComponentSpec) (rspec : RpcQuerySpec)
 
 def mkRpcQueryParamsBody (spec : ComponentSpec) (rspec : RpcQuerySpec) : CommandElabM Term :=
   mkRpcQueryBranches spec rspec fun qaIds => do
-    `(some $(← mkRightTuple (`(())) (fun a b => `(($a, $b))) (qaIds.toList.map (⟨·.raw⟩))))
+    `(some $(← Qed.Lang.buildTupleVal (qaIds.map (⟨·.raw⟩))))
 
 def mkSubBranches (spec : ComponentSpec) (sub : SubDecl) (elseTerm : Term)
     (depMatch : Bool) (leafFn : Array Ident → CommandElabM Term) : CommandElabM Term :=
@@ -266,7 +246,7 @@ def mkSubBranches (spec : ComponentSpec) (sub : SubDecl) (elseTerm : Term)
 private def mkSubKeyExpr (spec : ComponentSpec) (sub : SubDecl) : CommandElabM Term := do
   let keyFnId := mkIdentFrom sub.chanRef sub.chInfo.keyHelperConst
   mkSubBranches spec sub (← `("")) false fun qaIds =>
-    qaIds.foldlM (init := (keyFnId : Term)) fun acc a => `($acc $a)
+    Qed.Lang.mkAppTerms keyFnId (qaIds.map (⟨·.raw⟩))
 
 def subKeyFnName (tId : Name) (sub : SubDecl) : Name :=
   tId ++ Name.mkSimple s!"_wsKey_{sub.id.getId}"
@@ -454,7 +434,7 @@ private def mkHoistedSubArm (spec : ComponentSpec) (stepOwnId : Ident) (h : Hois
         | none => pure noOutRet
         | some pmOpt =>
             let pmVar := mkIdent `_pm
-            let stepCall ← if spec.hasProps then `($stepOwnId p $s1Var $pmVar) else `($stepOwnId $s1Var $pmVar)
+            let stepCall ← appWithProps spec stepOwnId #[s1Var, pmVar]
             let mergedStep ← match ccExpr?, spec.hasEffects with
               | some cc, true =>
                   let srVar := mkIdent `_sr
@@ -477,8 +457,7 @@ private def mkResetFormArm (spec : ComponentSpec) (stepOwnId : Ident) (unchanged
   let emptyExpr := mkIdent (`_root_ ++ rf.schemaName ++ `Draft ++ `empty)
   let df := rf.draftField
   let fvId := mkIdent `_fv
-  let callStep ← if spec.hasProps then `($stepOwnId p _s1 ($(rf.handler) $fvId))
-    else `($stepOwnId _s1 ($(rf.handler) $fvId))
+  let callStep ← appWithProps spec stepOwnId #[← `(_s1), ← `(($(rf.handler) $fvId))]
   let mut armBody ← `(
     match ($(rf.parseCall) s.$df:ident) with
     | some $fvId:ident =>
@@ -508,7 +487,7 @@ private def mkHoistedUpdateCmds (spec : ComponentSpec)
     fullArms := fullArms.push (← mkResetFormArm spec stepOwnId unchanged rf)
   if !ownArms.isEmpty then
     let otherVar := mkIdent `_m
-    let callOwn ← if spec.hasProps then `($stepOwnId p s $otherVar) else `($stepOwnId s $otherVar)
+    let callOwn ← appWithProps spec stepOwnId #[← `(s), otherVar]
     fullArms := fullArms.push (← `(Lean.Parser.Term.matchAltExpr| | $otherVar:ident => $callOwn))
   let updateBody ← if fullArms.isEmpty then `(fun m => nomatch m) else `(fun m => match m with $[$fullArms:matchAlt]*)
   return #[stepOwnCmd, ← `(command| def $updateId $[$pBinders:bracketedBinder]* (s : $stateId) : $msgId → $retTy := $updateBody)]
@@ -550,8 +529,7 @@ private def mkPureCompViewExtras (spec : ComponentSpec)
   let viewId      := mkIdent (tId ++ `view)
   let renderTagId := mkIdent (tId ++ `_qed_renderTag)
   let compId      := mkIdent (tId ++ `_qed_toComponent)
-  let appOptP (fn : Ident) := if spec.hasProps then `($fn p) else `($fn)
-  let compExpr ← appOptP compId
+  let compExpr ← appWithProps spec compId
   let mut cmds : Array (TSyntax `command) := #[
     ← (match spec.keyF? with
       | some kf =>
@@ -562,7 +540,7 @@ private def mkPureCompViewExtras (spec : ComponentSpec)
         `(command| def $renderTagId {parentMsg : Type} (p : $propsId)
             (route : $msgId → parentMsg) (s : $stateId) : Html parentMsg := ($rendered).map route)),
     ← `(command| $[$(spec.doc?):docComment]? def $compId $[$pBinders:bracketedBinder]*
-          : Component $stateId $msgId := { update := $(← appOptP updateId), view := $(← appOptP viewId) }) ]
+          : Component $stateId $msgId := { update := $(← appWithProps spec updateId), view := $(← appWithProps spec viewId) }) ]
   if let some kf := spec.keyF? then
     let keyOfId := mkIdent (tId ++ `keyOf)
     cmds := cmds ++ #[
@@ -590,11 +568,11 @@ def mkViewCmds (spec : ComponentSpec) (body' : Term)
     let renderBody ← bindMentionedFields spec (mentionsIdent body'.raw) body'
     cmds := cmds.push (← `(command| def $renderId {$pMsg : Type} $[$pBinders:bracketedBinder]* ($wrapId : $msgId → $pMsg)
         (s : $stateId) $[$slotBinders:bracketedBinder]* : Html $pMsg := $renderBody))
-    let viewCall ← if spec.hasProps then `($renderId p id s) else `($renderId id s)
+    let viewCall ← appWithProps spec renderId #[← `(id), ← `(s)]
     return cmds.push (← `(command| def $viewId $[$pBinders:bracketedBinder]* (s : $stateId) : Html $msgId := $viewCall))
   let viewBody ← bindMentionedFields spec (mentionsIdent body'.raw) body'
   cmds := cmds.push (← `(command| def $viewId $[$pBinders:bracketedBinder]* (s : $stateId) : Html $msgId := $viewBody))
-  let rendered ← if spec.hasProps then `($viewId p s) else `($viewId s)
+  let rendered ← appWithProps spec viewId #[← `(s)]
   cmds := cmds.push (← `(command| def $renderId {parentMsg : Type} $[$pBinders:bracketedBinder]*
       (route : $msgId → parentMsg) (s : $stateId) : Html parentMsg := ($rendered).map route))
   if spec.outTy?.isNone && !spec.hasEffects then

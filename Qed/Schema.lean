@@ -34,41 +34,32 @@ def run (c : Codec α) (raw : String) : Option (Field c.valid) :=
   | some a => if h : c.valid a then some ⟨a, h⟩ else none
   | none   => none
 
-theorem isSome_run (c : Codec α) (raw : String) :
-    (c.run raw).isSome = true ↔ ∃ a, c.parse raw = some a ∧ c.valid a := by
-  haveI := c.dec
-  unfold Codec.run
-  cases hp : c.parse raw with
-  | none   => simp
-  | some a => by_cases hv : c.valid a <;> simp [hv]
+def validateField {α} (c : Codec α) (label : String) : Except String α → Except String (Field c.valid)
+  | .error e => .error e
+  | .ok a    => haveI := c.dec; if h : c.valid a then .ok ⟨a, h⟩ else .error s!"{label}: failed validation"
+
+private theorem validateField_ok {α} (c : Codec α) (label : String) (f : Field c.valid)
+    (e : Except String α) (h : e = .ok f.val) : c.validateField label e = .ok f := by
+  rcases f with ⟨val, hok⟩; subst h; simp [validateField, hok]
 
 def fromJsonField {α} (c : Codec α) [FromJsonField α] (j : Json) (key : String) :
     Except String (Field c.valid) :=
-  haveI := c.dec
-  match (FromJsonField.fromField j key : Except String α) with
-  | .error e => .error e
-  | .ok a    => if h : c.valid a then .ok ⟨a, h⟩ else .error s!"{key}: failed validation"
+  c.validateField key (FromJsonField.fromField j key)
 
 @[simp] theorem fromJsonField_of_field {α : Type} (c : Codec α) [LawfulJson α]
-    (j : Json) (k : String) (f : Field c.valid)
-    (h : j.field k = .ok (toJson f.val)) :
-    c.fromJsonField j k = .ok f := by
-  rcases f with ⟨val, hok⟩
-  simp [Codec.fromJsonField, LawfulJson.fromField_of_field j k val h, hok]
+    (j : Json) (k : String) (f : Field c.valid) (h : j.field k = .ok (toJson f.val)) :
+    c.fromJsonField j k = .ok f :=
+  c.validateField_ok k f _ (LawfulJson.fromField_of_field j k f.val h)
 
 def fromProtoField {α} (c : Codec α) [FromProtoField α] (k : Nat) (fs : List (Nat × Proto.WireVal)) :
     Except String (Field c.valid) :=
-  haveI := c.dec
-  match (FromProtoField.decodeProtoField k fs : Except String α) with
-  | .error e => .error e
-  | .ok a    => if h : c.valid a then .ok ⟨a, h⟩ else .error s!"field {k}: failed validation"
+  c.validateField s!"field {k}" (FromProtoField.decodeProtoField k fs)
 
 theorem fromProtoField_of_field {α : Type} (c : Codec α) [FromProtoField α]
     (k : Nat) (fs : List (Nat × Proto.WireVal)) (f : Field c.valid)
     (h : FromProtoField.decodeProtoField k fs = .ok f.val) :
-    c.fromProtoField k fs = .ok f := by
-  rcases f with ⟨val, hok⟩
-  simp [Codec.fromProtoField, h, hok]
+    c.fromProtoField k fs = .ok f :=
+  c.validateField_ok s!"field {k}" f _ h
 
 private def toInt? (s : String) : Option Int :=
   match s.toList with
@@ -270,13 +261,18 @@ private def lowerSchemaFieldSpec (stx : Syntax) : MacroM Term := do
     let (innerTy, _) ← Qed.Lang.lowerQedType (stx.getArg 2) false
     `(jsonOnly $innerTy)
   else if k == `Qed.schemaFieldCall then
-    let callee : Term := ⟨(stx.getArg 0)⟩
-    let args := (stx.getArg 2).getSepArgs
-    args.foldlM (init := callee) fun acc a => do
-      let aT ← Qed.Lang.lowerSimpleQedExpr .val (a.getArg 0)
-      `($acc $aT)
+    let argTs ← (stx.getArg 2).getSepArgs.mapM fun a => Qed.Lang.lowerSimpleQedExpr .val (a.getArg 0)
+    Qed.Lang.mkAppTerms ⟨(stx.getArg 0)⟩ argTs
   else
     return (← Qed.Lang.lowerQedType stx false).1
+
+private def primSchemaTypes : Array (Lean.Name × Lean.Name × String) := #[
+  (``String,   ``Qed.Codec.text,     "String"),
+  (``Nat,      ``Qed.Codec.nat,      "Nat"),
+  (``Int,      ``Qed.Codec.int,      "Int"),
+  (``Bool,     ``Qed.Codec.checkbox, "Bool"),
+  (``Qed.Date, ``Qed.Codec.date,     "Date")
+]
 
 open Lean Elab Term Meta in
 private partial def resolveCodecBase (fieldName : Name) (rawSpec : Term) : TermElabM Term := do
@@ -293,11 +289,8 @@ private partial def resolveCodecBase (fieldName : Name) (rawSpec : Term) : TermE
     return scopedSpec
   else if ety.isSort then
     let eWhnf ← whnf (← instantiateMVars e)
-    if eWhnf.isConstOf ``String then return ← `(Qed.Codec.text)
-    else if eWhnf.isConstOf ``Nat then return ← `(Qed.Codec.nat)
-    else if eWhnf.isConstOf ``Int then return ← `(Qed.Codec.int)
-    else if eWhnf.isConstOf ``Bool then return ← `(Qed.Codec.checkbox)
-    else if eWhnf.isConstOf ``Qed.Date then return ← `(Qed.Codec.date)
+    if let some (_, codecNm, _) := primSchemaTypes.find? fun (tyNm, _, _) => eWhnf.isConstOf tyNm then
+      return mkCIdent codecNm
     else
       if (← trySynthInstance (← mkAppM ``Qed.DefaultCodec #[e])) matches .some _ then
         return ← `((Qed.DefaultCodec.codec : Qed.Codec $rawSpec))
@@ -336,12 +329,7 @@ private def elabSchemaFieldsAux (cbns : Array Ident) (cbts : Array Term)
       let base ← resolveCodecBase f.getId rawSpec
       let inp : Term ←
         if preds.isEmpty then pure base
-        else do
-          let propTerms ← preds.mapM fun p => `(($p : Prop))
-          let combined ← match propTerms.toList with
-            | []      => `(True)
-            | c :: cs => cs.foldlM (init := c) fun acc x => `($acc ∧ $x)
-          `(Qed.Codec.refine $base (fun $f:ident => $combined))
+        else `(Qed.Codec.refine $base (fun $f:ident => $(← mkConjBody preds)))
       let c ← elabTermAndSynthesize inp none
       let cty ← instantiateMVars (← inferType c)
       match cty.getAppFnArgs with
@@ -349,24 +337,18 @@ private def elabSchemaFieldsAux (cbns : Array Ident) (cbts : Array Term)
           let validExpr := mkApp2 (mkConst ``Qed.Codec.valid) α c
           let trueFn := Expr.lam `x α (mkConst ``True) BinderInfo.default
           let isRefined := !(← isDefEq validExpr trueFn)
-          let isLawful := (← trySynthInstance (mkApp (mkConst ``Qed.LawfulJson) α)) matches .some _
-          let hasToP := (← trySynthInstance (mkApp (mkConst ``Qed.ToProtoField) α)) matches .some _
-          let hasFromP := (← trySynthInstance (mkApp (mkConst ``Qed.FromProtoField) α)) matches .some _
-          let isLawfulP := (← trySynthInstance (mkApp (mkConst ``Qed.LawfulProtoField) α)) matches .some _
+          let hasInst (cls : Name) (lvls : List Level := []) : MetaM Bool := do
+            return (← trySynthInstance (mkApp (mkConst cls lvls) α)) matches .some _
+          let isLawful ← hasInst ``Qed.LawfulJson
+          let isProto := (← hasInst ``Qed.ToProtoField) && (← hasInst ``Qed.FromProtoField)
+          let isLawfulP ← hasInst ``Qed.LawfulProtoField
           let isLawfulBEq ← match ← trySynthInstance (mkApp (mkConst ``BEq [Level.zero]) α) with
             | .some beqInst => pure ((← trySynthInstance (mkApp2 (mkConst ``LawfulBEq [Level.zero]) α beqInst)) matches .some _)
             | _ => pure false
+          let hasInhab ← hasInst ``Inhabited [Level.zero]
           let αw ← whnf α
-          let hasInhab := (← trySynthInstance (mkApp (mkConst ``Inhabited [Level.zero]) α)) matches .some _
-          let tyKind :=
-            if αw.isConstOf ``Bool then "Bool"
-            else if αw.isConstOf ``Nat then "Nat"
-            else if αw.isConstOf ``Int then "Int"
-            else if αw.isConstOf ``String then "String"
-            else if αw.isConstOf ``Qed.Date then "Date"
-            else "Other"
-          return { input := inp, isRefined, isLawful, isProto := hasToP && hasFromP,
-                   isLawfulP, isLawfulBEq, tyKind, hasInhab }
+          let tyKind := (primSchemaTypes.find? fun (tyNm, _, _) => αw.isConstOf tyNm).map (·.2.2) |>.getD "Other"
+          return { input := inp, isRefined, isLawful, isProto, isLawfulP, isLawfulBEq, tyKind, hasInhab }
       | _ =>
           throwErrorAt rawSpec m!"failed to resolve schema field `{f.getId}` to a `Codec`"
 
@@ -376,14 +358,8 @@ private def checkSchemaFieldsDecidable (cbns : Array Ident) (cbts : Array Term)
   -- Lean logs failed instance synthesis to `messages` rather than throwing; probe in isolation to catch missing `DecidablePred` cleanly.
   for ((f, inp), r) in pairs.zip refined do
     unless r do continue
-    let before := (← get).messages
-    try liftTermElabM (withCtxDecls cbns cbts (discard <| elabTermAndSynthesize inp none)) catch _ => pure ()
-    let probeMsgs := (← get).messages.toList.drop before.toList.length
-    modify fun st => { st with messages := before }
-    let mut undecidable := false
-    for msg in probeMsgs do
-      if ((← msg.data.toString).splitOn "DecidablePred").length > 1 then undecidable := true
-    if undecidable then
+    let (_, probeMsgs) ← Qed.Diag.probeTermElabMsgs (withCtxDecls cbns cbts (discard <| elabTermAndSynthesize inp none))
+    if ← probeMsgs.anyM fun msg => return ((← msg.data.toString).splitOn "DecidablePred").length > 1 then
       throwErrorAt inp m!"schema field `{f.getId}` has a refinement that isn't decidable, so \
         validity can't be computed (no `DecidablePred` for it).\n\nThe usual cause is a \
         predicate written with `def`. Write it inline with `where …` or as an `abbrev`, so Lean \
@@ -448,9 +424,7 @@ private def mkSchemaParseCmds (tId : Name) (cbns : Array Ident) (cbts : Array Te
   let canId   := mkIdent (tId ++ `canSubmit)
   let iffId   := mkIdent (tId ++ `canSubmit_iff)
   let isSomes ← runCalls.mapM fun rc => `(($rc).isSome)
-  let rhs ← match isSomes.toList with
-    | []      => `(True)
-    | c :: cs => cs.foldlM (init := c) fun acc x => `($acc ∧ $x)
+  let rhs ← mkConjBody isSomes (ascribeProp := false)
   let casesTac ← runCalls.foldrM (init := ← `(tactic|
     simp only [Option.isSome_some, Option.isSome_none, Bool.false_eq_true,
       and_true, true_and, and_false, false_and, iff_self, bind, Option.bind, pure, Pure.pure]))
@@ -518,21 +492,11 @@ private partial def collectStxLits {α : Type} [BEq α] (extract : Lean.Syntax �
   stx.getArgs.foldl (fun a ch => collectStxLits extract ch a) acc
 
 open Lean Elab Command Term Meta in
-private def tryCheckPropWithTactic (goalTerm : Term) (tacStx : TSyntax `tactic) : CommandElabM Bool := do
-  let saved ← get
-  try
-    let ok ← liftTermElabM do
-      let preCount := (← Core.getMessageLog).toList.length
-      let pfTerm ← `(by $tacStx:tactic)
-      let expected ← elabType goalTerm
-      let _ ← elabTermEnsuringType pfTerm expected
-      synthesizeSyntheticMVarsNoPostponing
-      return ((← Core.getMessageLog).toList.drop preCount).all (·.severity != .error)
-    modify fun _ => saved
-    return ok
-  catch _ =>
-    modify fun _ => saved
-    return false
+private def tryCheckPropWithTactic (goalTerm : Term) (tacStx : TSyntax `tactic) : CommandElabM Bool :=
+  Qed.Diag.probeTermElabOk do
+    let _ ← elabTermEnsuringType (← `(by $tacStx:tactic)) (← elabType goalTerm)
+    synthesizeSyntheticMVarsNoPostponing
+    return true
 
 open Lean Elab Command Term Meta in
 private def schemaCodecSimp : CommandElabM (TSyntax `tactic) :=
@@ -712,9 +676,8 @@ open Lean Elab Command Term in
       let allLawfulBEq := resolved.all (·.isLawfulBEq)
       let pairs := fs.zip inputs
       checkSchemaFieldsDecidable cbns cbts pairs refined
-      let cbnsT : Array (TSyntax `term) := cbns.map fun c => ⟨c.raw⟩
-      let appTo : TSyntax `term → CommandElabM (TSyntax `term) := fun head =>
-        cbnsT.foldlM (init := head) fun acc c => `($acc $c)
+      let appTo (head : TSyntax `term) : CommandElabM (TSyntax `term) :=
+        Qed.Lang.mkAppTerms head (cbns.map (⟨·.raw⟩))
       let tApp     ← appTo ⟨t.raw⟩
       let beqApp   ← appTo ⟨beqFnId.raw⟩
       let parseApp ← appTo ⟨parseId.raw⟩

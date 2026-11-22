@@ -14,11 +14,13 @@ private def checkParentNesting (ref : Syntax) (pPath compLabel childTag : String
       let what := if compLabel == childTag then s!"<{childTag}>" else s!"<{compLabel}> (root <{childTag}>)"
       throwErrorAt ref s!"invalid HTML5 nesting: {what} is not allowed inside <{ptag}> (browsers rewrite this tree during HTML parsing, causing hydration mismatch)"
 
+private def throwNoChildren (stx : Syntax) (tag : String) : TermElabM Unit :=
+  throwErrorAt stx s!"<{tag}> does not render `\{children}` in its `view:`; write it self-closing (`<{tag} …/>`) or render `\{children}` in `{tag}`"
+
 private def checkInlineComp (stx : Syntax) (pPath tag : String) (hasKids : Bool) (info : ComponentInfo) :
     TermElabM Unit := do
   if let some rtag := info.rootTag? then checkParentNesting stx pPath tag rtag
-  if hasKids && !info.hasChildren then
-    throwErrorAt stx s!"<{tag}> does not render `\{children}` in its `view:`; write `<{tag} …/>` or render `\{children}` in `{tag}`"
+  if hasKids && !info.hasChildren then throwNoChildren stx tag
 
 private def finishWithKey (expectedType? : Option Expr) (key? : Option Term) (call : Term) : TermElabM Expr := do
   elabTerm (← match key? with | some k => `(Qed.withKey (toString $k) $call) | none => pure call) expectedType?
@@ -41,10 +43,7 @@ private def elabSchemaFormTag (stx : Syntax) (expectedType? : Option Expr)
   let some (_, submitVal) := specials["onSubmit"]?
     | throwErrorAt stx s!"<{tag}> requires `onSubmit=\{...}`"
   let ctxArgs ← liftMacroM <| resolveSchemaCtxArgs stx tag sInfo.ctxBinders ctxProps
-  let mut callT : Term := ⟨mkIdentFrom stx sInfo.formViewName⟩
-  for ca in ctxArgs do
-    callT ← `($callT $ca)
-  callT ← `($callT $dVal $onEditVal $submitVal)
+  let callT ← Qed.Lang.mkAppTerms ⟨mkIdentFrom stx sInfo.formViewName⟩ (ctxArgs ++ #[dVal, onEditVal, submitVal])
   some <$> finishWithKey expectedType? key? callT
 
 private def elabPureCompTag (stx : Syntax) (expectedType? : Option Expr) (info : ComponentInfo)
@@ -159,7 +158,7 @@ private def elabStatefulCompTag (stx : Syntax) (expectedType? : Option Expr) (in
   let propNodes := (stx.getArg 5).getSepArgs
   let kidsT : Term := ⟨(stx.getArg 7)⟩
   let hasKids := !(kidsT.raw.getKind == `«term[_]» && (kidsT.raw.getArg 1).getArgs.isEmpty)
-  let cName := (tag.splitOn ".").foldl Name.str Name.anonymous
+  let cName := tag.toName
   let info? ← lookupComponent? cName
   let baseName := match info? with | some info => info.fullName | none => cName
   let cId (sub : Name) : Term := ⟨mkIdentFrom stx (baseName ++ sub)⟩
@@ -181,19 +180,14 @@ private def elabStatefulCompTag (stx : Syntax) (expectedType? : Option Expr) (in
       return ← elabPureCompTag stx expectedType? info cId pPath tag propNodes kidsT hasKids
 
   let (props, specials) := splitCompProps propNodes ["key", "state", "initial", "onMsg", "_hoist"]
-  let key?     := specials["key"]?.map (·.2)
-  let state?   := specials["state"]?.map (·.2)
-  let initial? := specials["initial"]?.map (·.2)
-  let onMsg?   := specials["onMsg"]?.map (·.2)
-  let hoist?   := specials["_hoist"]?.map (·.2)
+  let sp (k : String) := specials[k]?.map (·.2)
 
-  if let some hPair := hoist? then
-    return ← elabHoistedCompTag stx expectedType? info? tag pPath hasKids cId props kidsT hPair key?
+  if let some hPair := sp "_hoist" then
+    return ← elabHoistedCompTag stx expectedType? info? tag pPath hasKids cId props kidsT hPair (sp "key")
 
-  if hasKids then
-    throwErrorAt stx s!"<{tag}> does not render `\{children}` in its `view:`; write it self-closing (`<{tag} …/>`) or render `\{children}` in `{tag}`"
+  if hasKids then throwNoChildren stx tag
 
-  elabStatefulCompTag stx expectedType? info? baseName cId tag pPath posNum props key? state? initial? onMsg?
+  elabStatefulCompTag stx expectedType? info? baseName cId tag pPath posNum props (sp "key") (sp "state") (sp "initial") (sp "onMsg")
 
 end CompElab
 end Qed

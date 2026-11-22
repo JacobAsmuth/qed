@@ -99,11 +99,11 @@ def compSubReconnect : Parser :=
 def compSubOnJoin : Parser :=
   node `Qed.compSubOnJoin (withPosition (atomic (identEq `on_join) >> optional (checkLineEq >> "(" >> qedBinder >> ")") >> ":" >> qedSuite))
 
-def compSubOnMsg : Parser :=
-  node `Qed.compSubOnMsg (withPosition (atomic (identEq `on_message) >> "(" >> qedBinder >> ")" >> ":" >> qedSuite))
+private def compSubHandler1 (kind kw : Name) : Parser :=
+  node kind (withPosition (atomic (identEq kw) >> "(" >> qedBinder >> ")" >> ":" >> qedSuite))
 
-def compSubOnStatus : Parser :=
-  node `Qed.compSubOnStatus (withPosition (atomic (identEq `on_status) >> "(" >> qedBinder >> ")" >> ":" >> qedSuite))
+def compSubOnMsg : Parser := compSubHandler1 `Qed.compSubOnMsg `on_message
+def compSubOnStatus : Parser := compSubHandler1 `Qed.compSubOnStatus `on_status
 
 def compSubHandler : Parser :=
   compSubReconnect <|> compSubOnJoin <|> compSubOnMsg <|> compSubOnStatus
@@ -150,13 +150,16 @@ def compStylesheetClause : Parser := leading_parser
 def compThemeClause : Parser := leading_parser
   withPosition ("theme " >> ident)
 
+private def compHeadDir1 (kind kw : Name) : Parser :=
+  node kind (withPosition (atomic (identEq kw) >> categoryParser `qedExpr 0))
+
 def compHeadDirective : Parser :=
-  node `Qed.compHeadTitle       (withPosition (atomic (identEq `title)       >> categoryParser `qedExpr 0)) <|>
-  node `Qed.compHeadDescription (withPosition (atomic (identEq `description) >> categoryParser `qedExpr 0)) <|>
-  node `Qed.compHeadCanonical   (withPosition (atomic (identEq `canonical)   >> categoryParser `qedExpr 0)) <|>
-  node `Qed.compHeadMeta        (withPosition (atomic (symbol "meta")        >> categoryParser `qedExpr 0 >> "," >> categoryParser `qedExpr 0)) <|>
-  node `Qed.compHeadStatus      (withPosition (atomic (identEq `status)      >> categoryParser `qedExpr 0)) <|>
-  node `Qed.compHeadRedirect    (withPosition (atomic (identEq `redirect)    >> categoryParser `qedExpr 0 >>
+  compHeadDir1 `Qed.compHeadTitle `title <|>
+  compHeadDir1 `Qed.compHeadDescription `description <|>
+  compHeadDir1 `Qed.compHeadCanonical `canonical <|>
+  node `Qed.compHeadMeta (withPosition (atomic (symbol "meta") >> categoryParser `qedExpr 0 >> "," >> categoryParser `qedExpr 0)) <|>
+  compHeadDir1 `Qed.compHeadStatus `status <|>
+  node `Qed.compHeadRedirect (withPosition (atomic (identEq `redirect) >> categoryParser `qedExpr 0 >>
     optional ("," >> identEq `status >> "=" >> categoryParser `qedExpr 0)))
 
 def compHeadCase : Parser :=
@@ -173,13 +176,10 @@ def compHeadClause : Parser := leading_parser
     checkColGt "expected indented `head` directives" >>
     many1Indent compHeadItem)
 
-def compExampleParam : Parser :=
-  node `Qed.compExampleParam (ident >> ":" >> categoryParser `qedType 0)
-
 def compExampleClause : Parser := leading_parser
   withPosition (
     atomic (symbol "example" >> ident) >>
-    optional (checkNoWsBefore "" >> "(" >> sepBy1 compExampleParam "," >> ")") >>
+    optional (checkNoWsBefore "" >> "(" >> sepBy1 compParam "," >> ")") >>
     optional (symbol "where" >> sepBy1 (categoryParser `qedExpr 0) ",") >>
     ":" >>
     sepBy1 (categoryParser `qedExpr 55) "," >>
@@ -259,18 +259,40 @@ def isEventEmitExpr (eventNames : Array Name) (exprStx : Syntax) : Bool :=
   | some (id, "emit", _) => eventNames.contains id.getId.eraseMacroScopes
   | _ => false
 
+def isAwaitStmt (s : Syntax) : Bool :=
+  let k := s.getKind
+  (k == ``qedStmtLet && (unwrapParens1 (s.getArg 4)).getKind == ``qedAwait) ||
+  (k == ``qedStmtAssign && (unwrapParens1 (s.getArg 2)).getKind == ``qedAwait)
+
 def hasEffectStmt (eventNames : Array Name) (stx : Syntax) : Bool :=
   stxAny (fun s =>
-    let k := s.getKind
-    (k == ``qedStmtExpr && (matchPushCall? (s.getArg 0)).isNone && (matchRemoveCall? (s.getArg 0)).isNone && !isEventEmitExpr eventNames (s.getArg 0)) ||
-    (k == ``qedStmtLet && (unwrapParens1 (s.getArg 4)).getKind == ``qedAwait) ||
-    (k == ``qedStmtAssign && (unwrapParens1 (s.getArg 2)).getKind == ``qedAwait)) stx
+    (s.getKind == ``qedStmtExpr && (matchPushCall? (s.getArg 0)).isNone && (matchRemoveCall? (s.getArg 0)).isNone && !isEventEmitExpr eventNames (s.getArg 0)) ||
+    isAwaitStmt s) stx
 
 def hasReturnStmt (stx : Syntax) : Bool :=
   stxAny (·.getKind == ``qedStmtReturn) stx
 
+def lowerTypeStx (stx : Syntax) : CommandElabM Term :=
+  liftMacroM (return (← lowerQedType stx false).1)
+
+def lowerOptType (optNode : Syntax) : CommandElabM (Option Term) :=
+  if optNode.getNumArgs == 2 then some <$> lowerTypeStx (optNode.getArg 1) else pure none
+
+def parseParamList (optNode : Syntax) : CommandElabM (Array (Ident × Term)) :=
+  if optNode.getNumArgs == 3 then
+    (optNode.getArg 1).getSepArgs.mapM fun p => return (⟨p.getArg 0⟩, ← lowerTypeStx (p.getArg 2))
+  else pure #[]
+
+def getErrorCount : CommandElabM Nat := do
+  return (← get).messages.toList.filter (·.severity == .error) |>.length
+
 def matchNamedAttr? (a : Syntax) : Option (Syntax × String × Syntax) :=
   if a.getKind == ``Qed.Jsx.attrNamed then some (a.getArg 0, atomStr (a.getArg 0), a.getArg 1) else none
+
+def matchAttrValExpr? (a : Syntax) : Option (Syntax × String × Syntax) := do
+  let (ref, nm, valNode) ← matchNamedAttr? a
+  guard (valNode.getNumArgs == 2 && (valNode.getArg 1).getKind == ``Qed.Jsx.attrValExpr)
+  return (ref, nm, valNode)
 
 def splitCompProps (propNodes : Array Syntax) (specials : List String) :
     Array (Syntax × String × Term) × Std.HashMap String (Syntax × Term) := Id.run do
@@ -322,7 +344,7 @@ def mkOutMatchTerm (baseName : Name) (totalCtors : Nat) (arms : Array OutArm) (o
     let oCtor := mkIdent (baseName ++ `Out ++ arm.ctor)
     let argIds := (List.range arm.arity).toArray.map fun i => mkIdent (Name.mkSimple s!"_a{i}")
     let patTerms : Array Term := argIds.map (⟨·.raw⟩)
-    let callH ← argIds.foldlM (init := arm.handler) fun acc id => `($acc $id:ident)
+    let callH ← Qed.Lang.mkAppTerms arm.handler patTerms
     `(Lean.Parser.Term.matchAltExpr| | $oCtor $patTerms* => some ($callH))
   if arms.size < totalCtors then
     alts := alts.push (← `(Lean.Parser.Term.matchAltExpr| | _ => none))

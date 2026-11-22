@@ -87,20 +87,6 @@ theorem App.guardRehydrate_complete {Model Msg : Type} (Inv : Model → Prop) [D
 section AutoDehydrate
 open Lean Meta Elab Term
 
-private def mkNestedTuple : List Term → MacroM Term
-  | []      => `(())
-  | [x]     => pure x
-  | x :: xs => do `(($x, $(← mkNestedTuple xs)))
-
-private def mkSndChain : Nat → Term → MacroM Term
-  | 0,     t => pure t
-  | n + 1, t => do mkSndChain n (← `(Prod.snd $t))
-
-private def mkTupleProjTerm (base : Term) (idx total : Nat) : MacroM Term := do
-  if total ≤ 1 then return base
-  let s ← mkSndChain idx base
-  if idx + 1 < total then `(Prod.fst $s) else return s
-
 private def prodTypeOf (pad : Bool) : List Expr → Expr
   | []      => Lean.mkConst ``Unit
   | [t]     => if pad then mkApp2 (Lean.mkConst ``Prod [Level.zero, Level.zero]) t (Lean.mkConst ``Unit) else t
@@ -200,10 +186,7 @@ def synthLawfulJsonAux : Nat → Expr → MetaM (Option (Expr × Option Expr))
       withEnsuredTypes (synthLawfulJsonAux fuel) args.toList do
         if let some hit ← synthDirect? ty then return some hit
         let env ← getEnv
-        let modRoot := match env.getModuleIdxFor? fn with
-          | some idx => (env.header.moduleNames.getD idx.toNat Name.anonymous).getRoot
-          | none     => Name.anonymous
-        if modRoot == `Init || modRoot == `Std || modRoot == `Lean || modRoot == `Lake then return none
+        if Qed.Diag.isToolchainRoot (Qed.Diag.modRootOf env fn) then return none
         let some (.inductInfo indVal) := env.find? fn | return none
         let casesName := mkCasesOnName fn
         if indVal.isRec || indVal.numIndices != 0 || args.size != indVal.numParams ||
@@ -256,8 +239,8 @@ def elabStructFieldsSlice (ref : Syntax) (initVal modelTy : Expr) (fArr : Array 
   if fArr.isEmpty then return mkApp2 (Lean.mkConst ``Dehydrate.const) modelTy initVal
   let mId := mkIdentFrom ref `_qed_m
   let pId := mkIdentFrom ref `_qed_p
-  let getterBody ← liftMacroM <| mkNestedTuple (← fArr.mapM fun f => `($mId.$f:ident)).toList
-  let projTerms ← liftMacroM <| (List.range fArr.size).toArray.mapM fun i => mkTupleProjTerm ⟨pId.raw⟩ i fArr.size
+  let getterBody ← Qed.Lang.buildTupleVal (← fArr.mapM fun f => `($mId.$f:ident))
+  let projTerms ← Qed.Lang.extractTupleProjections pId fArr.size
   let alphaMVar ← mkFreshExprMVar (mkSort Level.one)
   let getterVal ← elabTermEnsuringType (← `(fun $mId => $getterBody)) (← mkArrow modelTy alphaMVar)
   synthesizeSyntheticMVarsNoPostponing

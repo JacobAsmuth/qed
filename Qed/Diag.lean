@@ -112,17 +112,16 @@ private def collapseSpaces (s : String) : String := Id.run do
 /-- Rewrites `¬a = b` and `¬(a = b)` clauses (including inside `∧`, `∨`, `→` compounds) to `a != b`. -/
 private def rewriteNotEqAtom (chunk : String) : String :=
   let t := chunk.trimAscii.toString
-  if t.startsWith "¬(" && t.endsWith ")" then
-    let inner := (String.ofList ((t.toList.drop 2).dropLast)).trimAscii.toString
-    if (inner.splitOn " = ").length == 2 && !inner.contains '∧' && !inner.contains '∨' && !inner.contains '→' then
-      inner.replace " = " " != "
-    else chunk
-  else if t.startsWith "¬" && !t.startsWith "¬(" then
-    let inner := (String.ofList (t.toList.drop 1)).trimAscii.toString
-    if (inner.splitOn " = ").length == 2 && !inner.contains '∧' && !inner.contains '∨' && !inner.contains '→' then
-      inner.replace " = " " != "
-    else chunk
-  else chunk
+  let inner? :=
+    if t.startsWith "¬(" && t.endsWith ")" then some ((String.ofList ((t.toList.drop 2).dropLast)).trimAscii.toString)
+    else if t.startsWith "¬" && !t.startsWith "¬(" then some ((String.ofList (t.toList.drop 1)).trimAscii.toString)
+    else none
+  match inner? with
+  | some inner =>
+      if (inner.splitOn " = ").length == 2 && !inner.contains '∧' && !inner.contains '∨' && !inner.contains '→' then
+        inner.replace " = " " != "
+      else chunk
+  | none => chunk
 
 private def rewriteNotEq (s : String) : String :=
   let byOr := s.splitOn " ∨ " |>.map fun part =>
@@ -132,27 +131,16 @@ private def rewriteNotEq (s : String) : String :=
     String.intercalate " ∧ " byAnd
   String.intercalate " ∨ " byOr
 
+private def asciiReplacements : Array (String × String) := #[
+  (" ≤ ", " <= "), (" ≥ ", " >= "), (" ≠ ", " != "), (" ∧ ", " and "), (" ∨ ", " or "),
+  (" → ", " -> "), (" ↔ ", " <-> "), ("≤", "<="), ("≥", ">="), ("≠", "!="),
+  ("¬(", "not ("), ("¬", "not "), ("∀ ", "all "), ("∃ ", "exists ")
+]
+
 /-- Converts a Lean pretty-printed proposition/expression into Qed's plain ASCII syntax. -/
 def toQedAscii (raw : String) (stripPrefixes : List String := []) : String :=
-  let s0 := collapseSpaces (stripMacroDaggers raw)
-  let s1 := stripStatePrefixes s0 stripPrefixes
-  let s2 := rewriteNotEq s1
-  let s3 := s2
-    |>.replace " ≤ " " <= "
-    |>.replace " ≥ " " >= "
-    |>.replace " ≠ " " != "
-    |>.replace " ∧ " " and "
-    |>.replace " ∨ " " or "
-    |>.replace " → " " -> "
-    |>.replace " ↔ " " <-> "
-    |>.replace "≤" "<="
-    |>.replace "≥" ">="
-    |>.replace "≠" "!="
-    |>.replace "¬(" "not ("
-    |>.replace "¬" "not "
-    |>.replace "∀ " "all "
-    |>.replace "∃ " "exists "
-  s3.trimAscii.toString
+  let s := rewriteNotEq (stripStatePrefixes (collapseSpaces (stripMacroDaggers raw)) stripPrefixes)
+  (asciiReplacements.foldl (fun acc (a, b) => acc.replace a b) s).trimAscii.toString
 
 /-! ## Case Tag Formatting -/
 
@@ -176,45 +164,39 @@ def rootCaseTag (tag : Lean.Name) : String :=
         first :: kept
   String.intercalate "." parts
 
+private def caseTagPrefixes : Array (String × (String → String)) := #[
+  ("_query_",        fun s => s!"query `{s}`"),
+  ("_wsJoin_",       fun s => s!"subscribe `{s}` (`on_join`)"),
+  ("_wsMsg_",        fun s => s!"subscribe `{s}` (`on_event`)"),
+  ("_wsStatus_",     fun s => s!"subscribe `{s}` (status)"),
+  ("_specRollback_", fun _ => "`rollback` branch"),
+  ("_specConfirm_",  fun _ => "`on_confirm` branch"),
+  ("_specCont_",     fun _ => "speculative `predict` update"),
+  ("_specPre_",      fun _ => "before speculative `await`"),
+  ("_specRes_",      fun _ => "speculative resolution"),
+  ("_cont_",         fun _ => "continuation after `await`"),
+  ("_form_reset_",   fun _ => "form `reset`"),
+  ("_sub_",          fun _ => "child component update"),
+  ("set_",           fun s => s!"handler updating `{s}`")
+]
+
 /-- Formats a goal tag into a human-readable Qed branch label (e.g. `action \`decrease\``, `rollback`). -/
 def formatCaseTag (tag : Lean.Name) : String :=
   let raw := rootCaseTag tag
-  if raw.isEmpty || raw == "_" || raw == "anonymous" then
-    "this branch"
-  else if raw == "init" then
-    "initial state"
-  else if raw == "_onRoute" then
-    "route change"
-  else if raw.startsWith "_query_" then
-    s!"query `{(raw.drop 7).toString}`"
-  else if raw.startsWith "_wsJoin_" then
-    s!"subscribe `{(raw.drop 8).toString}` (`on_join`)"
-  else if raw.startsWith "_wsMsg_" then
-    s!"subscribe `{(raw.drop 7).toString}` (`on_event`)"
-  else if raw.startsWith "_wsStatus_" then
-    s!"subscribe `{(raw.drop 10).toString}` (status)"
-  else if raw.startsWith "_specRollback_" then
-    "`rollback` branch"
-  else if raw.startsWith "_specConfirm_" then
-    "`on_confirm` branch"
-  else if raw.startsWith "_specCont_" then
-    "speculative `predict` update"
-  else if raw.startsWith "_specPre_" then
-    "before speculative `await`"
-  else if raw.startsWith "_specRes_" then
-    "speculative resolution"
-  else if raw.startsWith "_cont_" then
-    "continuation after `await`"
-  else if raw.startsWith "_form_reset_" then
-    "form `reset`"
-  else if raw.startsWith "_sub_" then
-    "child component update"
-  else if raw.startsWith "set_" then
-    s!"handler updating `{(raw.drop 4).toString}`"
-  else
-    s!"action `{raw}`"
+  if raw.isEmpty || raw == "_" || raw == "anonymous" then "this branch"
+  else if raw == "init" then "initial state"
+  else if raw == "_onRoute" then "route change"
+  else match caseTagPrefixes.find? fun (pfx, _) => raw.startsWith pfx with
+    | some (pfx, fmt) => fmt (raw.drop pfx.length).toString
+    | none            => s!"action `{raw}`"
 
 /-! ## MetaM Expression Cleaner & Pretty-Printer -/
+
+private def cleanQedUnwrapTable : Array (Lean.Name × Nat × Nat) := #[
+  (`Qed.Lang.QedVal.val, 4, 3), (`Qed.Field.val, 3, 2), (`Qed.Ensured.val, 3, 2),
+  (`Qed.Server.SrvIdx.toNat, 3, 2), (`Qed.Server.SrvLiftOpt.liftOpt, 4, 3),
+  (`Qed.Lang.QedSeqLit.ofList, 4, 3), (``id, 2, 1)
+]
 
 open Lean Meta in
 /-- Unwraps internal Qed wrapper projections/coercions (`QedVal.val`, `Field.val`, `Ensured.val`,
@@ -225,35 +207,23 @@ def cleanQedExpr (e : Expr) : MetaM Expr := do
   Meta.transform e (pre := fun sub => do
     match sub with
     | .proj nm 0 inner =>
-        if nm == `Qed.Field || nm == `Qed.Ensured then
-          return .visit inner
-        return .continue
+        return if nm == `Qed.Field || nm == `Qed.Ensured then .visit inner else .continue
     | _ =>
-        let fn := sub.getAppFn
-        let args := sub.getAppArgs
-        match fn.constName? with
-        | some `Qed.Lang.QedVal.val =>
-            if args.size == 4 then return .visit args[3]!
-            return .continue
-        | some `Qed.Field.val =>
-            if args.size == 3 then return .visit args[2]!
-            return .continue
-        | some `Qed.Ensured.val =>
-            if args.size == 3 then return .visit args[2]!
-            return .continue
-        | some `Qed.Server.SrvIdx.toNat =>
-            if args.size == 3 then return .visit args[2]!
-            return .continue
-        | some `Qed.Server.SrvLiftOpt.liftOpt =>
-            if args.size == 4 then return .visit args[3]!
-            return .continue
-        | some `Qed.Lang.QedSeqLit.ofList =>
-            if args.size == 4 then return .visit args[3]!
-            return .continue
-        | some ``id =>
-            if args.size == 2 then return .visit args[1]!
-            return .continue
-        | _ => return .continue)
+        if let some c := sub.getAppFn.constName? then
+          let args := sub.getAppArgs
+          if let some (_, _, idx) := cleanQedUnwrapTable.find? fun (nm, ar, _) => nm == c && args.size == ar then
+            return .visit args[idx]!
+        return .continue)
+
+/-- Returns the root component of the module defining `n`, or `fallback.getRoot` for current-module declarations. -/
+def modRootOf (env : Lean.Environment) (n : Lean.Name) (fallback : Lean.Name := .anonymous) : Lean.Name :=
+  match env.getModuleIdxFor? n with
+  | some idx => (env.header.moduleNames.getD idx.toNat fallback).getRoot
+  | none     => fallback.getRoot
+
+/-- Checks whether `root` belongs to the Lean toolchain (`Init`, `Std`, `Lean`, `Lake`) and optionally `Qed`. -/
+def isToolchainRoot (root : Lean.Name) (includeQed : Bool := false) : Bool :=
+  root == `Init || root == `Std || root == `Lean || root == `Lake || (includeQed && root == `Qed)
 
 open Lean Meta in
 /-- Pretty-prints a Lean expression in clean Qed-native ASCII syntax. -/
@@ -345,5 +315,24 @@ def throwUnsolvedGoals
   match ref? with
   | some ref => throwErrorAt ref fullMsg
   | none     => throwError fullMsg
+
+open Lean Elab Command in
+/-- Runs `action` inside `liftTermElabM` while rolling back `Command.State`, returning the result
+    (or `none` on exception) together with any messages logged during the probe. -/
+def probeTermElabMsgs {α : Type} (action : Term.TermElabM α) :
+    CommandElabM (Option α × List Message) := do
+  let saved ← get
+  let preCount := saved.messages.toList.length
+  let res? ← try some <$> liftTermElabM action catch _ => pure none
+  let newMsgs := (← get).messages.toList.drop preCount
+  set saved
+  return (res?, newMsgs)
+
+open Lean Elab Command in
+/-- Probes a `TermElabM Bool` check in isolation, returning `true` iff it succeeds with `true`
+    and logs no error messages. -/
+def probeTermElabOk (action : Term.TermElabM Bool) : CommandElabM Bool := do
+  let (res?, msgs) ← probeTermElabMsgs action
+  return res? == some true && msgs.all (·.severity != .error)
 
 end Qed.Diag

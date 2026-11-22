@@ -386,6 +386,33 @@ partial def suiteStmts (stx : Syntax) : Array Syntax :=
 partial def unwrapParens1 (stx : Syntax) : Syntax :=
   if stx.getKind == ``qedParen && (stx.getArg 1).getSepArgs.size == 1 then unwrapParens1 (stx.getArg 1).getSepArgs[0]! else stx
 
+/-- Extracts a dotted identifier/projection chain (`a.b.c`) from a `qedExpr` syntax node. -/
+partial def extractDottedChain? (stx : Syntax) : Option (List String) :=
+  let u := unwrapParens1 stx
+  if u.getKind == ``qedIdent then
+    some ((u.getArg 0).getId.eraseMacroScopes.components.map (·.toString))
+  else if u.getKind == ``qedProj then
+    (extractDottedChain? (u.getArg 0)).map (· ++ [(u.getArg 2).getId.eraseMacroScopes.toString])
+  else none
+
+/-- Splits a nested `a and b and …` (`qedAnd`) expression into its top-level conjuncts. -/
+partial def splitAndStx (stx : Syntax) : Array Syntax :=
+  let u := unwrapParens1 stx
+  if u.getKind == ``qedAnd then splitAndStx (u.getArg 0) ++ splitAndStx (u.getArg 2) else #[u]
+
+/-- Returns `true` if variable `v` appears free as a `qedIdent` root in `stx` (respecting `qedLam1` shadowing). -/
+partial def stxMentionsVar (v : String) (stx : Syntax) : Bool :=
+  let k := stx.getKind
+  if k == ``qedIdent then
+    match (stx.getArg 0).getId.eraseMacroScopes.components with
+    | root :: _ => root.toString == v
+    | []        => false
+  else if k == ``qedLam1 then
+    let b := if (stx.getArg 0).isIdent then (stx.getArg 0).getId.eraseMacroScopes.toString else ""
+    if b == v then false else stxMentionsVar v (stx.getArg 2)
+  else
+    stx.getArgs.any (stxMentionsVar v)
+
 /-- Extracts the optional `else:` suite from `qedStmtIf` / `qedStmtIfLet`. -/
 def extractElseSuite (optElse : Syntax) : Option (Array Syntax) :=
   if optElse.getNumArgs == 3 then some (suiteStmts (optElse.getArg 2)) else none
@@ -476,10 +503,37 @@ def resolveBaseTypeTerm (baseId : Ident) : Term :=
   else ⟨baseId.raw⟩
 
 /-- Builds a right-nested product type term (`Unit` if empty, `A` if 1, `A × B × ...`). -/
-def buildProdType (elems : Array Term) : MacroM Term := do
+def buildProdType {m : Type → Type} [Monad m] [MonadQuotation m] (elems : Array Term) : m Term := do
   if elems.isEmpty then `(Unit)
   else if elems.size == 1 then return elems[0]!
   else elems.foldrM (init := elems.back!) (start := elems.size - 1) fun a acc => `($a × $acc)
+
+/-- Builds a right-nested tuple value/pattern term (`()` if empty, `a` if 1, `(a, (b, ...))`). -/
+def buildTupleVal {m : Type → Type} [Monad m] [MonadQuotation m] (vals : Array Term) : m Term := do
+  if vals.isEmpty then `(())
+  else if vals.size == 1 then return vals[0]!
+  else vals.foldrM (init := vals.back!) (start := vals.size - 1) fun a acc => `(($a, $acc))
+
+/-- Builds projections for an `n`-element right-nested tuple held in `tupleVar`. -/
+def extractTupleProjections {m : Type → Type} [Monad m] [MonadQuotation m]
+    (tupleVar : Ident) (n : Nat) : m (Array Term) := do
+  if n == 0 then return #[]
+  else if n == 1 then return #[⟨tupleVar.raw⟩]
+  else
+    let mut out : Array Term := #[]
+    let mut cur : Term := ⟨tupleVar.raw⟩
+    for i in [0:n] do
+      if i + 1 < n then
+        out := out.push (← `(($cur).1))
+        cur ← `(($cur).2)
+      else
+        out := out.push cur
+    return out
+
+/-- Builds a left-nested function application term `fn a₁ a₂ …`. -/
+def mkAppTerms {m : Type → Type} [Monad m] [MonadQuotation m]
+    (fn : Term) (args : Array Term) : m Term :=
+  args.foldlM (init := fn) fun acc a => `($acc $a)
 
 structure LoweredQedType where
   term       : Term
@@ -489,7 +543,6 @@ structure LoweredQedType where
   innerOpt?  : Option Term := none
   baseName   : Name := .anonymous
   mods       : Array TypeMod := #[]
-  isDict     : Bool := false
 deriving Inhabited
 
 private def applyTypeModsInfo (base : Term) (mods : Array TypeMod) (allowFallible : Bool)
@@ -520,13 +573,8 @@ private def applyTypeModsInfo (base : Term) (mods : Array TypeMod) (allowFallibl
         isFallible := true
   return (acc, isFallible, innerOpt?)
 
-def applyTypeMods (base : Term) (mods : Array TypeMod) (allowFallible : Bool) (ref : Syntax) :
-    MacroM (Term × Bool) := do
-  let (acc, isFallible, _) ← applyTypeModsInfo base mods allowFallible ref
-  return (acc, isFallible)
-
 /-- Lowers a unified `qedType` syntax node with full metadata (`isFallible`, `isProto`, `isOption`,
-    `innerOpt?`, `baseName`, `mods`, `isDict`). Set `allowHigherOrder := false` for server/DB/external
+    `innerOpt?`, `baseName`, `mods`). Set `allowHigherOrder := false` for server/DB/external
     payload types that forbid type application (`Resource T`) and arrows (`A -> B`). -/
 partial def lowerQedTypeInfo (stx : Syntax) (allowFallible := false)
     (allowHigherOrder := true) (ctxDesc? : Option String := none) : MacroM LoweredQedType := do
@@ -538,35 +586,28 @@ partial def lowerQedTypeInfo (stx : Syntax) (allowFallible := false)
         Macro.throwErrorAt node s!"invalid Qed type{what}; expected a type such as `T`, `T[]`, `T?`, `T!`, `Resource T`, or `A -> B`"
       else
         Macro.throwErrorAt node s!"invalid server type{what}; expected `T`, `T[]`, `T?`, `T!`, `(T, U)`, or `Proto(T)`"
+    let finishMods (base : Term) (mods : Array TypeMod) (baseName : Name) (isProto := false) : MacroM LoweredQedType := do
+      let (term, isFallible, innerOpt?) ← applyTypeModsInfo base mods allowFall s ctxDesc? nestedErr?
+      return { term, isFallible, isProto, isOption := innerOpt?.isSome, innerOpt?, baseName, mods }
     let k := s.getKind
     if k == ``qedTypeProto then
       let (baseId, initMods) ← splitIdentMods ⟨(s.getArg 2)⟩
       let mods := initMods ++ (← (s.getArg 4).getArgs.mapM parseTypeModNode)
-      let (term, isFallible, innerOpt?) ← applyTypeModsInfo ⟨baseId.raw⟩ mods allowFall s ctxDesc? nestedErr?
-      return { term, isFallible, isProto := true, isOption := innerOpt?.isSome, innerOpt?,
-               baseName := baseId.getId.eraseMacroScopes, mods }
+      finishMods ⟨baseId.raw⟩ mods baseId.getId.eraseMacroScopes (isProto := true)
     else if k == ``qedTypeDict then
       let kInfo ← go (s.getArg 1) false (some "fallible `!` modifier cannot appear inside a dictionary key type")
       let vInfo ← go (s.getArg 3) false (some "fallible `!` modifier cannot appear inside a dictionary value type")
       let dictId := mkIdentFrom s `Qed.Dict
-      let baseT ← `($dictId $(kInfo.term) $(vInfo.term))
       let mods ← (s.getArg 5).getArgs.mapM parseTypeModNode
-      let (term, isFallible, innerOpt?) ← applyTypeModsInfo baseT mods allowFall s ctxDesc? nestedErr?
-      return { term, isFallible, isOption := innerOpt?.isSome, innerOpt?,
-               baseName := `Qed.Dict, mods, isDict := true }
+      finishMods (← `($dictId $(kInfo.term) $(vInfo.term))) mods `Qed.Dict
     else if k == ``qedTypeParen then
-      let elems := (s.getArg 1).getSepArgs
-      let lowered ← elems.mapM fun p => return (← go p false (some "fallible `!` modifier cannot appear inside a tuple type")).term
-      let baseT ← buildProdType lowered
+      let lowered ← (s.getArg 1).getSepArgs.mapM fun p => return (← go p false (some "fallible `!` modifier cannot appear inside a tuple type")).term
       let mods ← (s.getArg 3).getArgs.mapM parseTypeModNode
-      let (term, isFallible, innerOpt?) ← applyTypeModsInfo baseT mods allowFall s ctxDesc? nestedErr?
-      return { term, isFallible, isOption := innerOpt?.isSome, innerOpt?, baseName := `Prod, mods }
+      finishMods (← buildProdType lowered) mods `Prod
     else if k == ``qedTypeAtom then
       let (baseId, initMods) ← splitIdentMods ⟨(s.getArg 0)⟩
       let mods := initMods ++ (← (s.getArg 1).getArgs.mapM parseTypeModNode)
-      let (term, isFallible, innerOpt?) ← applyTypeModsInfo (resolveBaseTypeTerm baseId) mods allowFall s ctxDesc? nestedErr?
-      return { term, isFallible, isOption := innerOpt?.isSome, innerOpt?,
-               baseName := baseId.getId.eraseMacroScopes, mods }
+      finishMods (resolveBaseTypeTerm baseId) mods baseId.getId.eraseMacroScopes
     else if k == ``qedTypeApp then
       if (s.getArg 0).getKind == ``qedTypeAtom && ((s.getArg 0).getArg 1).getArgs.isEmpty then
         let fnName := ((s.getArg 0).getArg 0).getId.eraseMacroScopes
@@ -619,12 +660,7 @@ partial def lowerQedPat (stx : Syntax) : MacroM Term := do
   if k == ``qedPatWild then `(_)
   else if k == ``qedPatNum || k == ``qedPatStr || k == ``qedPatChar then return ⟨(stx.getArg 0)⟩
   else if k == ``qedPatParen then
-    let elems := (stx.getArg 1).getSepArgs
-    if elems.isEmpty then `(())
-    else if elems.size == 1 then lowerQedPat elems[0]!
-    else
-      let ps ← elems.mapM lowerQedPat
-      ps.foldrM (init := ps.back!) (start := ps.size - 1) fun a acc => `(($a, $acc))
+    buildTupleVal (← (stx.getArg 1).getSepArgs.mapM lowerQedPat)
   else if k == ``qedPatDot || k == ``qedPatIdent then
     let headT : Term := if k == ``qedPatDot then
         ⟨Syntax.node (.fromRef stx) ``Lean.Parser.Term.dotIdent #[Syntax.atom (.fromRef stx) ".", (stx.getArg 1)]⟩
@@ -707,13 +743,35 @@ structure LowerHooks (m : Type → Type) where
   freshIdent       : String → m Ident
   throwErr         : Syntax → String → m Term
 
-def finishTermMode (mode : ExprMode) (t : Term) : MacroM Term :=
+def finishTermMode {m : Type → Type} [Monad m] [MonadQuotation m] (mode : ExprMode) (t : Term) : m Term :=
   if mode == .propInv || mode == .propGuard then `(qedAsProp($t)) else return t
 
-def buildTupleVal (vals : Array Term) : MacroM Term :=
-  if vals.isEmpty then `(())
-  else if vals.size == 1 then return vals[0]!
-  else vals.foldrM (init := vals.back!) (start := vals.size - 1) fun a acc => `(($a, $acc))
+/-- Builds a default `LowerHooks` record suitable for `{ LowerHooks.mkDefault throwErr with ... }`. -/
+def LowerHooks.mkDefault {m : Type → Type} [Monad m] [MonadQuotation m]
+    (throwErr : Syntax → String → m Term) : LowerHooks m := {
+  lowerIdent       := fun _ id mode => finishTermMode mode ⟨id.raw⟩
+  lowerProj        := fun _ obj fld mode => do finishTermMode mode (← `(($obj).$fld:ident))
+  lowerIndex       := fun _ arr idx mode => do finishTermMode mode (← `($arr[$idx]))
+  lowerCall        := fun _ _ _ _ _ => pure none
+  lowerUnwrap      := fun ref _ _ => throwErr ref "operator `?` is only supported inside `server` functions with a fallible (`T!`) or optional (`T?`) return type"
+  lowerAwait       := fun ref _ _ => throwErr ref "`await` is only supported in statements (`let x = await ...` or `field = await ...`)"
+  lowerFieldSetter := fun ref fid => throwErr ref s!"`({fid.getId} = _)` is a component field setter and can only be used inside a `component`"
+  lowerJsx         := fun ref _ =>
+    if ref.getKind.toString.contains "Jsx" then
+      throwErr ref "JSX elements are only allowed inside view expressions"
+    else
+      let sn := stxSnippet ref
+      let what := if sn.isEmpty then s!"({ref.getKind})" else s!" `{sn}`"
+      throwErr ref s!"unsupported Qed expression{what}"
+  lowerArrElem     := pure
+  wrapNamedField   := pure
+  lowerType        := fun ref => throwErr ref "type annotations are not supported here"
+  lowerPat         := fun ref => throwErr ref "patterns are not supported here"
+  withLocals       := fun _ k => k
+  optElseFallback  := `(())
+  freshIdent       := fun pfx => pure (mkIdent (Name.mkSimple pfx))
+  throwErr
+}
 
 private def lowerCallExpr {m : Type → Type} [Monad m] [MonadQuotation m]
     (hooks : LowerHooks m) (go : ExprMode → Syntax → m Term) (finish : Term → m Term)
@@ -873,11 +931,8 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
       | "qedTypeAscr" => `(($(← go mode (stx.getArg 1)) : $(← hooks.lowerType (stx.getArg 3))))
       | "qedParen" =>
         let elems := (stx.getArg 1).getSepArgs
-        if elems.isEmpty then `(())
-        else if elems.size == 1 then go mode elems[0]!
-        else
-          let vs ← elems.mapM (go .val)
-          vs.foldrM (init := vs.back!) (start := vs.size - 1) fun a acc => `(($a, $acc))
+        if elems.size == 1 then go mode elems[0]!
+        else buildTupleVal (← elems.mapM (go .val))
       | "qedPlaceholder" => `(_)
       | "qedDotIdent" =>
         finish ⟨Syntax.node (.fromRef stx) ``Lean.Parser.Term.dotIdent #[Syntax.atom (.fromRef stx) ".", (stx.getArg 1)]⟩
@@ -901,9 +956,12 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
       | "qedImp" =>
         if mode == .propInv || mode == .propGuard then `($(← go mode (stx.getArg 0)) → $(← go mode (stx.getArg 2)))
         else `(!$(← go .boolCond (stx.getArg 0)) || $(← go .boolCond (stx.getArg 2)))
-      | "qedTernary" =>
-        let (hIf, condT, thenT) := (← hooks.freshIdent "_qedIf", ← go .propGuard (stx.getArg 2), ← go mode (stx.getArg 0))
-        let elseT ← lowerOptElse stx (stx.getArg 3) "conditional expression `a if cond else b` requires an `else` branch here"
+      | "qedTernary" | "qedExprIf" =>
+        let (condI, thenI, elseI, err) :=
+          if k == "qedTernary" then (2, 0, 3, "conditional expression `a if cond else b` requires an `else` branch here")
+          else (1, 3, 4, "`if cond: ...` expression requires `else:` here")
+        let (hIf, condT, thenT) := (← hooks.freshIdent "_qedIf", ← go .propGuard (stx.getArg condI), ← go mode (stx.getArg thenI))
+        let elseT ← lowerOptElse stx (stx.getArg elseI) err
         `(if $hIf:ident : $condT then $thenT else $elseT)
       | "qedLam1" | "qedLamN" => lowerLamExpr hooks go (k == "qedLam1") mode stx
       | "qedAllIn" | "qedAnyIn" =>
@@ -920,10 +978,6 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
         let vIds : Array Ident := (stx.getArg 1).getSepArgs.map (⟨·⟩)
         let bodyT ← hooks.withLocals (vIds.map (·.getId.toString)) (go mode (stx.getArg 3))
         vIds.foldrM (init := bodyT) fun vid acc => `(∀ $vid:ident, $acc)
-      | "qedExprIf" =>
-        let (hIf, condT, thenT) := (← hooks.freshIdent "_qedIf", ← go .propGuard (stx.getArg 1), ← go mode (stx.getArg 3))
-        let elseT ← lowerOptElse stx (stx.getArg 4) "`if cond: ...` expression requires `else:` here"
-        `(if $hIf:ident : $condT then $thenT else $elseT)
       | "qedExprIfLet" =>
         let elseT ← lowerOptElse stx (stx.getArg 7) "`if let pat = expr: ...` expression requires `else:` here"
         `(if let $(← hooks.lowerPat (stx.getArg 2)) := $(← go .val (stx.getArg 4)) then $(← go mode (stx.getArg 6)) else $elseT)
@@ -951,34 +1005,16 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
 def lowerSimpleQedExpr (mode : ExprMode) (stx : Syntax)
     (allowOptElse := false) (optElseFallback : MacroM Term := `(()))
     (lowerJsx? : Option (Syntax → ExprMode → MacroM Term) := none)
-    (lowerFieldSetter? : Option (Syntax → Ident → MacroM Term) := none)
     (wrapNamedField : Term → MacroM Term := pure)
     (lowerIndex? : Option (Syntax → Term → Term → ExprMode → MacroM Term) := none) : MacroM Term :=
-  lowerQedExpr {
-    lowerIdent := fun _ id m => finishTermMode m ⟨id.raw⟩
-    lowerProj := fun _ obj fld m => do finishTermMode m (← `(($obj).$fld:ident))
-    lowerIndex := fun ref arr idx m => match lowerIndex? with
-      | some f => f ref arr idx m
-      | none   => do finishTermMode m (← `($arr[$idx]))
-    lowerCall := fun _ _ _ _ _ => pure none
-    lowerUnwrap := fun ref _ _ => Macro.throwErrorAt ref "operator `?` is only supported inside `server` functions with a fallible (`T!`) or optional (`T?`) return type"
-    lowerAwait := fun ref _ _ => Macro.throwErrorAt ref "`await` is only supported in statements (`let x = await ...` or `field = await ...`)"
-    lowerFieldSetter := fun ref fid => match lowerFieldSetter? with | some f => f ref fid | none => Macro.throwErrorAt ref s!"`({fid.getId} = _)` is a component field setter and can only be used inside a `component`"
-    lowerJsx := fun ref m => match lowerJsx? with
-      | some f => f ref m
-      | none =>
-          if ref.getKind.toString.contains "Jsx" then
-            Macro.throwErrorAt ref "JSX elements are only allowed inside view expressions"
-          else
-            let sn := stxSnippet ref
-            let what := if sn.isEmpty then s!"({ref.getKind})" else s!" `{sn}`"
-            Macro.throwErrorAt ref s!"unsupported Qed expression{what}"
-    lowerArrElem := pure, wrapNamedField
+  let base := LowerHooks.mkDefault Macro.throwErrorAt
+  lowerQedExpr { base with
+    lowerIndex := lowerIndex?.getD base.lowerIndex
+    lowerJsx := lowerJsx?.getD base.lowerJsx
+    wrapNamedField
     lowerType := fun t => return (← lowerQedType t false).1
-    lowerPat := lowerQedPat, withLocals := fun _ k => k
+    lowerPat := lowerQedPat
     allowOptElse, optElseFallback
-    freshIdent := fun pfx => pure (mkIdent (Name.mkSimple pfx))
-    throwErr := Macro.throwErrorAt
   } mode stx
 
 end Qed.Lang
@@ -1005,8 +1041,7 @@ def qedLooksGenerated (n : Name) : Bool :=
   | _ => n.isInternalDetail
 
 def qedIsHelper (env : Environment) (n : Name) : Bool :=
-  let mod := match env.getModuleIdxFor? n with | some i => env.header.moduleNames[i]! | none => n
-  ![`Init, `Std, `Lean, `Qed].contains mod.getRoot
+  !Qed.Diag.isToolchainRoot (Qed.Diag.modRootOf env n n) (includeQed := true)
     && (match env.find? n with | some (.defnInfo d) => !d.type.isConstOf `Qed.Style | _ => false)
     && !qedLooksGenerated n
 
@@ -1041,8 +1076,9 @@ def qedUnfoldHelperLoop (maxIters : Nat)
     let ok ← try evalTactic tac; pure true catch _ => pure false
     unless ok do break
 
-def mkConjBody (clauses : Array Term) : CommandElabM Term := do
-  let props ← clauses.mapM fun c => `(($c : Prop))
+def mkConjBody {m : Type → Type} [Monad m] [MonadQuotation m]
+    (clauses : Array Term) (ascribeProp : Bool := true) : m Term := do
+  let props ← if ascribeProp then clauses.mapM fun c => `(($c : Prop)) else pure clauses
   match props.toList with
   | []      => `(True)
   | p :: ps => ps.foldlM (init := p) fun acc x => `($acc ∧ $x)

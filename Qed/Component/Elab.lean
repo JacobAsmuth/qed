@@ -140,14 +140,14 @@ private def mkCompLocalDefCmds (spec : ComponentSpec) (idLit : StrLit) :
   return cmds
 
 private def canSynthDecidablePred (stateId : Ident) (pred : Term) : CommandElabM Bool :=
-  probeTermElabM do
+  Qed.Diag.probeTermElabOk do
     let pVal ← Term.elabTermEnsuringType pred (← Term.elabType (← `($stateId → Prop)))
     Term.synthesizeSyntheticMVarsNoPostponing
     return (← Meta.trySynthInstance (← Meta.mkAppM ``DecidablePred #[pVal])) matches .some _
 
 private def mkEnsuredExistentialWrap (ensConst : Name) (qaIds : Array Ident)
     (elemVar : Ident) : CommandElabM (Term × Term) := do
-  let ensApp ← qaIds.foldlM (init := (mkIdent ensConst : Term)) fun acc a => `($acc $a)
+  let ensApp ← Qed.Lang.mkAppTerms (mkIdent ensConst) (qaIds.map (⟨·.raw⟩))
   let exPrf ← qaIds.foldrM (init := ← `(($elemVar:ident).ok)) fun qa acc => `(Exists.intro $qa $acc)
   return (ensApp, exPrf)
 
@@ -160,8 +160,7 @@ private def mkCompQueriesCmd? (spec : ComponentSpec) : CommandElabM (Option (TSy
     let qNm := q.id
     let qCtor := mkIdent (tId ++ `Msg ++ q.ctorName)
     let rspec := q.rpc
-    let reqTupleTy ← mkRightTuple (`(Unit)) (fun a b => `($a × $b))
-      (rspec.mInfo.paramTypeConsts.toList.map fun n => (mkIdent n : Term))
+    let reqTupleTy ← Qed.Lang.buildProdType (rspec.mInfo.paramTypeConsts.map fun n => (mkIdent n : Term))
     let paramsBody ← mkRpcQueryParamsBody spec rspec
     let fetchBody ← mkRpcQueryBranches spec rspec fun qaIds => do
       let cbTerm : Term ← if !rspec.hasMsgEnsured then
@@ -234,6 +233,17 @@ private def mkSpecStepPf (sVar mVar : Ident) : List Ident → Term → CommandEl
       let leftPf ← mkSpecStepPf sVar mVar prevRev (← `(($hTerm).1))
       `(And.intro $leftPf (($lastId:ident).2 $sVar $mVar ($hTerm).2))
 
+private def mkSpecPropPair (tId : Name) (suffix : String) (stateId msgId appIdent : Ident)
+    (prop initPf stepFn : Term) : CommandElabM (Array (TSyntax `command)) := do
+  pure #[
+    ← `(command|
+      theorem $(mkIdent (tId ++ Name.mkSimple s!"specApp_init_{suffix}")) :
+          $prop ($appIdent).init.1 := $initPf),
+    ← `(command|
+      theorem $(mkIdent (tId ++ Name.mkSimple s!"specApp_preserves_{suffix}"))
+          (st : Qed.SpecState $stateId $msgId) (msg : $msgId) (h : $prop st) :
+          $prop (($appIdent).update st msg).1 := $stepFn st msg h) ]
+
 private def mkSpecInvThmCmds (tId : Name) (stateId msgId appIdent baseAppIdent clsIdent : Ident)
     (inv : Term) (stateInvEntries : Array (Term × Option Ident)) :
     CommandElabM (Array (TSyntax `command)) := do
@@ -253,47 +263,28 @@ private def mkSpecInvThmCmds (tId : Name) (stateId msgId appIdent baseAppIdent c
   let mVar := mkIdent `_m
   let hVar := mkIdent `_h
   let stepPf ← mkSpecStepPf sVar mVar invIds.toList.reverse hVar
-  pure #[
-    ← `(command|
-      theorem $(mkIdent (tId ++ `specApp_init_inv)) :
-          Qed.SpecEngine.SpecInv ($inv) ($appIdent).init.1 :=
-        Qed.Internal.App.withSpeculative_init_inv $clsIdent $baseAppIdent $initPf),
-    ← `(command|
-      theorem $(mkIdent (tId ++ `specApp_preserves_inv))
-          (st : Qed.SpecState $stateId $msgId) (msg : $msgId)
-          (h : Qed.SpecEngine.SpecInv ($inv) st) :
-          Qed.SpecEngine.SpecInv ($inv) (($appIdent).update st msg).1 :=
-        Qed.Internal.App.withSpeculative_step_inv $clsIdent $baseAppIdent
-          (fun $sVar $mVar $hVar => $stepPf) st msg h) ]
+  mkSpecPropPair tId "inv" stateId msgId appIdent
+    (← `(Qed.SpecEngine.SpecInv ($inv)))
+    (← `(Qed.Internal.App.withSpeculative_init_inv $clsIdent $baseAppIdent $initPf))
+    (← `(Qed.Internal.App.withSpeculative_step_inv $clsIdent $baseAppIdent (fun $sVar $mVar $hVar => $stepPf)))
 
 private def mkSpecCoreCmds (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
     (tId : Name) (stateId msgId appIdent baseAppIdent clsIdent : Ident) (finalApp : Term) :
     CommandElabM (Array (TSyntax `command)) := do
-  pure #[
+  let cohCmds ← mkSpecPropPair tId "coherent" stateId msgId appIdent
+    (← `(Qed.SpecEngine.Coherent (fun s m => (($baseAppIdent).update s m).1)))
+    (← `(Qed.Internal.App.withSpeculative_init_coherent $clsIdent $baseAppIdent))
+    (← `(Qed.Internal.App.withSpeculative_step_coherent $clsIdent $baseAppIdent))
+  let wfCmds ← mkSpecPropPair tId "wellFormedIds" stateId msgId appIdent
+    (← `(Qed.SpecEngine.WellFormedIds))
+    (← `(Qed.Internal.App.withSpeculative_init_wellFormedIds $clsIdent $baseAppIdent))
+    (← `(Qed.Internal.App.withSpeculative_step_wellFormedIds $clsIdent $baseAppIdent))
+  return #[
     ← `(command| def $baseAppIdent : App $stateId $msgId := $finalApp),
     ← `(command| $[$doc?:docComment]? def $appIdent :
       App (Qed.SpecState $stateId $msgId) $msgId :=
-      Qed.Internal.App.withSpeculative $clsIdent $baseAppIdent),
-    ← `(command|
-      theorem $(mkIdent (tId ++ `specApp_init_coherent)) :
-          Qed.SpecEngine.Coherent (fun s m => (($baseAppIdent).update s m).1) ($appIdent).init.1 :=
-        Qed.Internal.App.withSpeculative_init_coherent $clsIdent $baseAppIdent),
-    ← `(command|
-      theorem $(mkIdent (tId ++ `specApp_preserves_coherent))
-          (st : Qed.SpecState $stateId $msgId) (msg : $msgId)
-          (hcoh : Qed.SpecEngine.Coherent (fun s m => (($baseAppIdent).update s m).1) st) :
-          Qed.SpecEngine.Coherent (fun s m => (($baseAppIdent).update s m).1) (($appIdent).update st msg).1 :=
-        Qed.Internal.App.withSpeculative_step_coherent $clsIdent $baseAppIdent st msg hcoh),
-    ← `(command|
-      theorem $(mkIdent (tId ++ `specApp_init_wellFormedIds)) :
-          Qed.SpecEngine.WellFormedIds ($appIdent).init.1 :=
-        Qed.Internal.App.withSpeculative_init_wellFormedIds $clsIdent $baseAppIdent),
-    ← `(command|
-      theorem $(mkIdent (tId ++ `specApp_preserves_wellFormedIds))
-          (st : Qed.SpecState $stateId $msgId) (msg : $msgId)
-          (hwf : Qed.SpecEngine.WellFormedIds st) :
-          Qed.SpecEngine.WellFormedIds (($appIdent).update st msg).1 :=
-        Qed.Internal.App.withSpeculative_step_wellFormedIds $clsIdent $baseAppIdent st msg hwf) ]
+      Qed.Internal.App.withSpeculative $clsIdent $baseAppIdent)
+  ] ++ cohCmds ++ wfCmds
 
 private def mkRehydrateInvCmds (tId : Name) (stateId msgId appIdent : Ident)
     (specBaseApp? : Option Ident) (compInv? : Option Term) (hasDecInv : Bool) :
@@ -352,15 +343,11 @@ private def applyHeadDirectives (hmId stId : Ident) (dirs : Array Syntax) (tail 
     CommandElabM Term := do
   dirs.foldrM (init := tail) fun d acc => do
     match d.getKind with
-    | `Qed.compHeadTitle =>
+    | `Qed.compHeadTitle | `Qed.compHeadDescription | `Qed.compHeadCanonical =>
         let v ← lowerCompExpr .val (d.getArg 1)
-        `(let $hmId:ident := { $hmId with title := Option.some ($v : String) }; $acc)
-    | `Qed.compHeadDescription =>
-        let v ← lowerCompExpr .val (d.getArg 1)
-        `(let $hmId:ident := { $hmId with description := Option.some ($v : String) }; $acc)
-    | `Qed.compHeadCanonical =>
-        let v ← lowerCompExpr .val (d.getArg 1)
-        `(let $hmId:ident := { $hmId with canonical := Option.some ($v : String) }; $acc)
+        let fId := mkIdent <| match d.getKind with
+          | `Qed.compHeadTitle => `title | `Qed.compHeadDescription => `description | _ => `canonical
+        `(let $hmId:ident := { $hmId with $fId:ident := Option.some ($v : String) }; $acc)
     | `Qed.compHeadMeta =>
         let k ← lowerCompExpr .val (d.getArg 1)
         let v ← lowerCompExpr .val (d.getArg 3)
@@ -595,14 +582,11 @@ private def collectCompEndpoints (rawSpec : ComponentSpec) (hoisted : Array Hois
 
 private def elabCompRegistryAndMeta (spec : ComponentSpec) (hasStart hasLocalDef : Bool)
     (allUsedRpcs allUsedChannels : Array (String × String)) : CommandElabM Unit := do
-  let usedRpcsId := mkIdent (spec.t.getId ++ `usedRpcs)
-  let epTerms ← allUsedRpcs.mapM fun (sStr, mStr) =>
-    `((($(Syntax.mkStrLit sStr), $(Syntax.mkStrLit mStr)) : String × String))
-  elabCommand (← `(command| def $usedRpcsId : List (String × String) := [$[$epTerms],*]))
-  let usedChsId := mkIdent (spec.t.getId ++ `usedChannels)
-  let chTerms ← allUsedChannels.mapM fun (sStr, cStr) =>
-    `((($(Syntax.mkStrLit sStr), $(Syntax.mkStrLit cStr)) : String × String))
-  elabCommand (← `(command| def $usedChsId : List (String × String) := [$[$chTerms],*]))
+  let elabPairListDef (defName : Name) (pairs : Array (String × String)) : CommandElabM Unit := do
+    let ts ← pairs.mapM fun (a, b) => `((($(Syntax.mkStrLit a), $(Syntax.mkStrLit b)) : String × String))
+    elabCommand (← `(command| def $(mkIdent (spec.t.getId ++ defName)) : List (String × String) := [$[$ts],*]))
+  elabPairListDef `usedRpcs allUsedRpcs
+  elabPairListDef `usedChannels allUsedChannels
   let baseInfo ← mkBaseCompInfo spec .stateful spec.hasProps
   modifyEnv fun env => componentRegistry.addEntry env { baseInfo with
     hasOut := spec.outTy?.isSome, hasEffects := spec.hasEffects,
@@ -620,34 +604,29 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
       elabPureComponent rawSpec body'
       return
   let idLit := Syntax.mkStrLit compNs.toString
-  let (sites, route'?, queries', starts', body', hoisted, formDrafts, resetForms, ownUsedRpcs, specDispatches, specNodes, specResolves) ←
-    collectSitesAndRewriteStateful rawSpec
-  if !specResolves.isEmpty then
-    let blockers := topLevelMountBlockers rawSpec.props rawSpec.binds rawSpec.slots
-      rawSpec.hasChildren rawSpec.events rawSpec.states
-    if !blockers.isEmpty then
-      if let some rs0 := specResolves[0]? then
-        throwErrorAt rs0.callRef s!"speculative `predict` is only supported on top-level mountable components, but `{rawSpec.t.getId}` declares {String.intercalate ", " blockers.toList}"
-  let (allUsedRpcs, allUsedChannels) := collectCompEndpoints rawSpec hoisted ownUsedRpcs
+  let rw ← collectSitesAndRewriteStateful rawSpec
+  if let some rs0 := rw.specResolves[0]? then
+    checkTopLevelMountable rawSpec rs0.callRef "speculative `predict`"
+  let (allUsedRpcs, allUsedChannels) := collectCompEndpoints rawSpec rw.hoisted rw.usedRpcs
   let eventNames := rawSpec.events.map (·.id.getId)
   let ownHasEffects :=
-    !starts'.isEmpty ||
-    !rawSpec.portOuts.isEmpty || !rawSpec.portIns.isEmpty || !queries'.isEmpty ||
+    !rw.starts.isEmpty ||
+    !rawSpec.portOuts.isEmpty || !rawSpec.portIns.isEmpty || !rawSpec.queries.isEmpty ||
     !rawSpec.subscriptions.isEmpty ||
-    !specResolves.isEmpty ||
-    sites.any (fun s => s.stmts?.any (·.any (hasEffectStmt eventNames))) ||
-    (route'?.any fun rd => rd.alts.any (hasEffectStmt eventNames)) ||
-    hoisted.any (·.info.hasEffects)
+    !rw.specResolves.isEmpty ||
+    rw.sites.any (fun s => s.stmts?.any (·.any (hasEffectStmt eventNames))) ||
+    (rw.route?.any fun rd => rd.alts.any (hasEffectStmt eventNames)) ||
+    rw.hoisted.any (·.info.hasEffects)
   let spec ← elabStructsAndResolveTypes {
-    rawSpec with route? := route'?, queries := queries', hasEffects := ownHasEffects,
+    rawSpec with route? := rw.route?, hasEffects := ownHasEffects,
                  usedRpcs := allUsedRpcs, usedChannels := allUsedChannels,
-                 specDispatches, specNodes, specResolves
-  } hoisted formDrafts resetForms
+                 specDispatches := rw.specDispatches, specNodes := rw.specNodes, specResolves := rw.specResolves
+  } rw.hoisted rw.formDrafts rw.resetForms
   currentCompSessionRef.set spec.sessionField?
-  let errsBefore := (← get).messages.toList.filter (·.severity == .error) |>.length
-  let coreCmds ← mkViewCmds spec body' (← mkMsgAndUpdateCmds spec sites)
+  let errsBefore ← getErrorCount
+  let coreCmds ← mkViewCmds spec rw.body (← mkMsgAndUpdateCmds spec rw.sites)
   for c in coreCmds do elabCommand c
-  let (mountCmds, hasStart, hasLocalDef) ← mkCodecAndMountCmds spec starts' idLit
+  let (mountCmds, hasStart, hasLocalDef) ← mkCodecAndMountCmds spec rw.starts idLit
   for c in mountCmds do elabCommand c
   let isTopMount := spec.mountable && spec.outTy?.isNone && !spec.hasProps && !spec.hasSlotsOrKids
   if isTopMount then
@@ -656,22 +635,21 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
     if let some hCmd ← mkCompHeadCmd? spec then elabCommand hCmd
     for clsCmd in (← mkSpecClassifyCmds spec) do elabCommand clsCmd
   let stateInvEntries ← withOpenNs compNs (elabInlineInvariantsPhase spec false)
-  let errsAfterInvs := (← get).messages.toList.filter (·.severity == .error) |>.length
+  let errsAfterInvs ← getErrorCount
   let activeInvEntries := if errsAfterInvs == errsBefore then stateInvEntries else #[]
   if errsAfterInvs == errsBefore then
-    withOpenNs compNs (elabCompReachableAndWitnesses spec activeInvEntries)
+    withOpenNs compNs (elabCompReachableAndWitnesses spec)
   verifyPendingRpcChecks spec (activeInvEntries.map (·.1))
   if isTopMount then
-    let (appCmds, eqCmd) ← mkCompAppCmds spec body' hasStart activeInvEntries
+    let (appCmds, eqCmd) ← mkCompAppCmds spec rw.body hasStart activeInvEntries
     for c in appCmds do elabCommand c
-    let errsAfterApp := (← get).messages.toList.filter (·.severity == .error) |>.length
-    if errsAfterApp == errsBefore then elabCommand eqCmd
+    if (← getErrorCount) == errsBefore then elabCommand eqCmd
   let _ ← withOpenNs compNs (elabInlineInvariantsPhase spec true)
   elabCompRegistryAndMeta spec hasStart hasLocalDef allUsedRpcs allUsedChannels
 
 @[command_elab componentCmd] def elabComponentCmd : CommandElab := fun stx => do
   let savedEnv ← getEnv
-  let errsInit := (← get).messages.toList.filter (·.severity == .error) |>.length
+  let errsInit ← getErrorCount
   let priorTasks := (← get).snapshotTasks.size
   let compNs := (← getCurrNamespace) ++ (stx.getArg 2).getId
   pendingRpcChecks.set #[]
@@ -687,7 +665,7 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
     pendingRpcChecks.set #[]
     pendingPredictChecks.set #[]
     currentCompSessionRef.set none
-    let errsEnd := (← get).messages.toList.filter (·.severity == .error) |>.length
+    let errsEnd ← getErrorCount
     let newTasks := (← get).snapshotTasks.extract priorTasks (← get).snapshotTasks.size
     let asyncErr := newTasks.any fun t => Qed.Diag.snapshotTreeHasErrors 64 t.get
     if !(← okRef.get) || errsEnd > errsInit || asyncErr then

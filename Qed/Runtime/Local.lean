@@ -3,18 +3,21 @@ import Qed.Runtime.Verify
 
 namespace Qed
 
+private def wrapLocalView {S M O : Type} [ToJson S] [FromJson S] [ToJson O]
+    (init : S) (view : S → Html M) (update : S → M → S × Option O) : String → Html LocalMsg :=
+  let dec : String → S := fun s => ((Json.parse s).bind FromJson.fromJson).toOption.getD init
+  fun s => (view (dec s)).map fun m =>
+    { run := fun st =>
+        let (s', o) := update (dec st) m
+        (Json.render (ToJson.toJson s'), o.map (Json.render ∘ toJson)) }
+
 def LocalDef.of {S M O : Type} [ToJson S] [FromJson S] [ToJson O]
     (id : String) (init : S)
     (view : S → Html M) (update : S → M → S × Option O)
     (hvalid : ∀ s, Html.valid (view s) = true := by qedProveValidHtml) : LocalDef :=
-  let dec : String → S := fun s => ((Json.parse s).bind FromJson.fromJson).toOption.getD init
-  { id   := id
-    init := Json.render (ToJson.toJson init)
-    view := fun s => (view (dec s)).map fun m =>
-      { run := fun st =>
-          let (s', o) := update (dec st) m
-          (Json.render (ToJson.toJson s'), o.map fun x => Json.render (ToJson.toJson x)) }
-    valid_view := ⟨fun s => by simpa [Html.valid] using hvalid (dec s), trivial⟩ }
+  { id, init := Json.render (ToJson.toJson init)
+    view := wrapLocalView init view update
+    valid_view := ⟨fun _ => by simpa [wrapLocalView, Html.valid] using hvalid _, trivial⟩ }
 
 def LocalDef.ofSimple {S M : Type} [ToJson S] [FromJson S]
     (id : String) (init : S) (view : S → Html M) (update : S → M → S)
@@ -25,23 +28,17 @@ def LocalDef.ofProps {P S M O : Type} [FromJson P] [ToJson S] [FromJson S] [ToJs
     (id : String) (init : S) (view : P → S → Html M)
     (update : P → S → M → S × Option O)
     (hvalid : ∀ p s, Html.valid (view p s) = true := by qedProveValidHtml) : LocalDef :=
-  let dec : String → S := fun s => ((Json.parse s).bind FromJson.fromJson).toOption.getD init
-  { id
-    init := Json.render (toJson init)
+  { id, init := Json.render (toJson init)
     view := fun _ => .text ""
     viewProps := some fun props =>
       match (Json.parse props).bind (FromJson.fromJson (α := P)) with
       | .error e => fun _ => .text s!"Invalid component props: {e}"
-      | .ok p => fun s => (view p (dec s)).map fun m =>
-          { run := fun st =>
-              let (next, out) := update p (dec st) m
-              (Json.render (toJson next), out.map (Json.render ∘ toJson)) }
-    valid_view := by
-      refine ⟨fun _ => rfl, fun props s => ?_⟩
+      | .ok p    => wrapLocalView init (view p) (update p)
+    valid_view := ⟨fun _ => rfl, fun props s => by
       dsimp only
       cases (Json.parse props).bind (FromJson.fromJson (α := P)) with
       | error _ => rfl
-      | ok p    => simpa [Html.valid] using hvalid p (dec s) }
+      | ok p    => simpa [wrapLocalView, Html.valid] using hvalid p _⟩ }
 
 theorem LocalDef.of_view_roundtrip {S M O : Type} [LawfulJson S] [ToJson O]
     (id : String) (init s : S) (view : S → Html M) (update : S → M → S × Option O)
@@ -52,7 +49,7 @@ theorem LocalDef.of_view_roundtrip {S M O : Type} [LawfulJson S] [ToJson O]
         { run := fun st =>
             let (s', o) := update (((Json.parse st).bind FromJson.fromJson).toOption.getD init) m
             (Json.render (ToJson.toJson s'), o.map fun x => Json.render (ToJson.toJson x)) }) := by
-  simp only [LocalDef.of, LocalDef.decode_toJson_eq s init hdepth]
+  simp only [LocalDef.of, wrapLocalView, LocalDef.decode_toJson_eq s init hdepth]; rfl
 
 theorem LocalDef.ofProps_view_roundtrip {P S M O : Type} [LawfulJson P] [LawfulJson S] [ToJson O]
     (id : String) (init s : S) (p : P) (view : P → S → Html M) (update : P → S → M → S × Option O)
@@ -65,7 +62,7 @@ theorem LocalDef.ofProps_view_roundtrip {P S M O : Type} [LawfulJson P] [LawfulJ
         { run := fun st =>
             let (next, out) := update p (((Json.parse st).bind FromJson.fromJson).toOption.getD init) m
             (Json.render (toJson next), out.map (Json.render ∘ toJson)) }) := by
-  simp only [LocalDef.viewForProps, LocalDef.ofProps, Option.map_some, Option.getD_some]
+  simp only [LocalDef.viewForProps, LocalDef.ofProps, wrapLocalView, Option.map_some, Option.getD_some]
   rw [LawfulJson.parse_render_toJson p hdepthP]
   simp only [LocalDef.decode_toJson_eq s init hdepthS]
 

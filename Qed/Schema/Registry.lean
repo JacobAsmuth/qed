@@ -1,5 +1,6 @@
 import Lean
 import Qed.Diag
+import Qed.Lang
 import Qed.Proto
 
 namespace Qed
@@ -134,8 +135,7 @@ private def mkStructCodecCtx (t : Ident) (fields : Array StructFieldSpec)
   let cbns := ctxBinders.map (·.1)
   let cbts := ctxBinders.map (·.2)
   let xId : Ident := mkIdent `x
-  let appTo (head : Term) : CommandElabM Term :=
-    (cbns.map fun c => (⟨c.raw⟩ : Term)).foldlM (init := head) fun acc c => `($acc $c)
+  let appTo (head : Term) : CommandElabM Term := Qed.Lang.mkAppTerms head (cbns.map (⟨·.raw⟩))
   let tApp ← appTo ⟨t.raw⟩
   let fs := fields.map (·.ident)
   let reads ← fields.mapM fun f => do
@@ -157,24 +157,21 @@ def mkStructJsonCmds (t : Ident) (fields : Array StructFieldSpec)
     match f.isRefinedField, f.codecTerm? with
     | true, some inp => `(($inp).fromJsonField $jId $kLit)
     | _, _           => `(Qed.FromJsonField.fromField (α := $(f.valTy)) $jId $kLit)
+  let toBody ← `(Qed.Json.obj [$[$jsonPairs:term],*])
+  let fromBody ← `(do
+    $[let $fs:ident ← $jsonDecodes:term]*
+    return { $[$fs:ident],* })
   if !opts.emitNamedDefs then
     return #[
-      ← `(command| instance $(mkIdent (tId ++ `instToJson)):ident : Qed.ToJson $t :=
-            ⟨fun $xId:ident => Qed.Json.obj [$[$jsonPairs:term],*]⟩),
-      ← `(command| instance $(mkIdent (tId ++ `instFromJson)):ident : Qed.FromJson $t :=
-            ⟨fun $jId:ident => do
-              $[let $fs:ident ← $jsonDecodes:term]*
-              return { $[$fs:ident],* }⟩) ]
+      ← `(command| instance $(mkIdent (tId ++ `instToJson)):ident : Qed.ToJson $t := ⟨fun $xId:ident => $toBody⟩),
+      ← `(command| instance $(mkIdent (tId ++ `instFromJson)):ident : Qed.FromJson $t := ⟨fun $jId:ident => $fromBody⟩) ]
   let toJsonId   := mkIdent (tId ++ `toJson)
   let fromJsonId := mkIdent (tId ++ `fromJson)
   let toJsonApp   ← appTo ⟨toJsonId.raw⟩
   let fromJsonApp ← appTo ⟨fromJsonId.raw⟩
   let mut cmds : Array (TSyntax `command) := #[
-    ← `(command| def $toJsonId $[($cbns:ident : $cbts:term)]* ($xId:ident : $tApp) : Qed.Json :=
-          Qed.Json.obj [$[$jsonPairs:term],*]),
-    ← `(command| def $fromJsonId $[($cbns:ident : $cbts:term)]* ($jId:ident : Qed.Json) : Except String $tApp := do
-          $[let $fs:ident ← $jsonDecodes:term]*
-          return { $[$fs:ident],* }) ]
+    ← `(command| def $toJsonId $[($cbns:ident : $cbts:term)]* ($xId:ident : $tApp) : Qed.Json := $toBody),
+    ← `(command| def $fromJsonId $[($cbns:ident : $cbts:term)]* ($jId:ident : Qed.Json) : Except String $tApp := $fromBody) ]
   if opts.emitStringCodec then
     let decodeId := mkIdent (tId ++ `decode)
     let encodeId := mkIdent (tId ++ `encode)

@@ -50,19 +50,7 @@ private def compileSpecDispatchNode (spec : ComponentSpec) (node : SpecDispatchN
   let tId := spec.t.getId
   let srvId := mkIdentFrom node.ref node.srvInfo.serverName
   let methId := mkIdentFrom node.ref (Name.mkSimple node.mInfo.name)
-  let mut hoistDefs : Array (Ident × Term × Term) := #[]
-  let mut allCapturedArgs : Array Term := node.capturedArgs
-  let mut rpcArgs : Array Term := #[]
-  for i in [0:node.rpcArgExprs.size] do
-    let argT := node.rpcArgExprs[i]!
-    if node.rpcArgNeedHoist[i]! then
-      let tmpId := mkIdentFrom argT.raw (Name.mkSimple s!"_rpcArg_{node.kIdx}_{i}")
-      let paramTyId := mkIdentFrom argT.raw node.mInfo.paramTypeConsts[i]!
-      hoistDefs := hoistDefs.push (tmpId, paramTyId, argT)
-      allCapturedArgs := allCapturedArgs.push tmpId
-      rpcArgs := rpcArgs.push tmpId
-    else
-      rpcArgs := rpcArgs.push argT
+  let rpcArgs := node.rpcArgs
 
   let wrapVal (valT : Term) : CommandElabM Term := do
     if node.mInfo.hasEnsures then
@@ -80,17 +68,14 @@ private def compileSpecDispatchNode (spec : ComponentSpec) (node : SpecDispatchN
   let preMsgOpt : Term ← match node.preCtor? with
     | none => `(Option.none)
     | some preCtor =>
-        let preId := mkIdentFrom node.ref (tId ++ `Msg ++ preCtor)
-        let preCall ← node.preArgs.foldlM (init := (preId : Term)) fun acc a => `($acc $a)
+        let preCall ← Qed.Lang.mkAppTerms (mkIdentFrom node.ref (tId ++ `Msg ++ preCtor)) node.preArgs
         `(Option.some ($preCall))
 
-  let contId := mkIdentFrom node.ref (tId ++ `Msg ++ node.contCtor)
-  let contBase ← allCapturedArgs.foldlM (init := (contId : Term)) fun acc a => `($acc $a)
+  let contBase ← Qed.Lang.mkAppTerms (mkIdentFrom node.ref (tId ++ `Msg ++ node.contCtor)) node.capturedArgs
   let resId := mkIdentFrom node.ref (tId ++ `Msg ++ node.resCtor)
   let txVar := mkIdent `_specTxId
   let predVar := mkIdent `_specPredVal
-  let resCb ← (allCapturedArgs.push (predVar : Term)).foldlM
-    (init := ← `($resId $txVar)) fun acc a => `($acc $a)
+  let resCb ← Qed.Lang.mkAppTerms (← `($resId $txVar)) (node.capturedArgs.push predVar)
   let rpcCall ← withRef node.ref `(qedCheckRpcCall% $srvId:ident $methId:ident [$[$rpcArgs:term],*] $resCb)
 
   let mkDisp (arg : Term) : CommandElabM Term :=
@@ -100,7 +85,7 @@ private def compileSpecDispatchNode (spec : ComponentSpec) (node : SpecDispatchN
     | wrap =>
         let some ensConst := node.mInfo.ensPredConst
           | throwErrorAt node.ref "internal: missing server `ensures` predicate in `predict`"
-        let ensApp ← rpcArgs.foldlM (init := (mkIdent ensConst : Term)) fun acc a => `($acc $a)
+        let ensApp ← Qed.Lang.mkAppTerms (mkIdent ensConst) rpcArgs
         if wrap == .optEnsured then
           let innerTy := node.innerEnsTy?.getD node.predValTy
           let dNone ← mkDisp (← `((Option.none : Option (Qed.Ensured $innerTy ($ensApp)))))
@@ -116,7 +101,7 @@ private def compileSpecDispatchNode (spec : ComponentSpec) (node : SpecDispatchN
     | Option.none => Qed.SpecAction.normal
     | Option.some $predVar:ident => $dispatchBody)
 
-  hoistDefs.foldrM (init := matched) fun (tmpId, pTy, argT) acc =>
+  node.hoistDefs.foldrM (init := matched) fun (tmpId, pTy, argT) acc =>
     `(let $tmpId:ident : $pTy := $argT; $acc)
 
 private partial def compileClassifyStmts (spec : ComponentSpec) : List Syntax → CommandElabM Term
@@ -169,28 +154,21 @@ def mkSpecClassifyCmds (spec : ComponentSpec) : CommandElabM (Array (TSyntax `co
     let okCtorId := mkIdent (outcomePrefix ++ `ok)
     let vId := mkIdent `_specOkVal
 
-    let mkCtorApp (ctorNm : Name) (extraArg : Term) : CommandElabM Term := do
-      let cid := mkIdent (tId ++ `Msg ++ ctorNm)
-      let base ← capIds.foldlM (init := (cid : Term)) fun acc a => `($acc $a)
-      `($base $extraArg)
+    let mkCtorApp (ctorNm : Name) (extraArg : Term) : CommandElabM Term :=
+      Qed.Lang.mkAppTerms (mkIdent (tId ++ `Msg ++ ctorNm)) (capIds.push extraArg)
 
     let contMsg ← mkCtorApp rs.contCtor ⟨vId.raw⟩
     let confirmMsg? ← rs.confirmCtor?.mapM fun cn => mkCtorApp cn ⟨vId.raw⟩
     let rollbackMsg? ← rs.rollbackCtor?.mapM fun rn => mkCtorApp rn ⟨vId.raw⟩
     let catchMsg? ← rs.catchCtor?.mapM fun cn => mkCtorApp cn ⟨outId.raw⟩
 
-    let okReplList ← match confirmMsg? with
-      | some cm => `([$contMsg, $cm])
-      | none    => `([$contMsg])
-    let confirmOnHitList ← match confirmMsg? with
-      | some cm => `([$cm])
-      | none    => `(([] : List $msgId))
-    let missReplList ← match rollbackMsg? with
-      | some rm => `([$rm])
-      | none    => pure okReplList
-    let errReplList ← match catchMsg? with
-      | some cm => `([$cm])
-      | none    => `(([] : List $msgId))
+    let optList : Option Term → CommandElabM Term
+      | some m => `([$m])
+      | none   => `(([] : List $msgId))
+    let okReplList ← match confirmMsg? with | some cm => `([$contMsg, $cm]) | none => `([$contMsg])
+    let confirmOnHitList ← optList confirmMsg?
+    let missReplList ← match rollbackMsg? with | some rm => `([$rm]) | none => pure okReplList
+    let errReplList ← optList catchMsg?
 
     let rawValTerm ← match ensuredWrapKind rs.mInfo rs.catchHasNone with
       | .optEnsured => `(($vId).map Qed.Ensured.val)
@@ -203,15 +181,11 @@ def mkSpecClassifyCmds (spec : ComponentSpec) : CommandElabM (Array (TSyntax `co
       else
         Qed.SpecAction.resolve $txId false $missReplList ([] : List $msgId))
 
-    let matchTerm ←
-      if rs.mInfo.isOption && rs.catchHasNone then
-        `(match $outId:ident with
-          | $okCtorId (Option.some $vId:ident) => $okBranchBody
-          | _ => Qed.SpecAction.resolve $txId false $errReplList ([] : List $msgId))
-      else
-        `(match $outId:ident with
-          | $okCtorId $vId:ident => $okBranchBody
-          | _ => Qed.SpecAction.resolve $txId false $errReplList ([] : List $msgId))
+    let okPat ← if rs.mInfo.isOption && rs.catchHasNone then `($okCtorId (Option.some $vId:ident))
+                else `($okCtorId $vId:ident)
+    let matchTerm ← `(match $outId:ident with
+      | $okPat => $okBranchBody
+      | _ => Qed.SpecAction.resolve $txId false $errReplList ([] : List $msgId))
 
     arms := arms.push (← `(Lean.Parser.Term.matchAltExpr| | $cFull:ident $allPatIds* => $matchTerm))
 

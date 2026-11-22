@@ -99,9 +99,10 @@ private theorem mk_modeNormal (t : String) (m2 : TagMode) (interOut : Bool)
               else
                 if t == "ul" || t == "ol" then some TagMode.ulOl
                 else if t == "table" then some TagMode.table else none) = some m2)
-    (p i f : Bool) (hp : (p && !interOut) = false) (hi : (i && interOut) = false) :
+    (p i f i' : Bool) (hp : (p && !interOut) = false) (hi : (i && interOut) = false) (hi' : (i || interOut) = i') :
     stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } t =
-      some { mode := m2, inP := p, interactive := i || interOut, inForm := f } := by
+      some { mode := m2, inP := p, interactive := i', inForm := f } := by
+  subst hi'
   simp only [Bool.and_eq_true, Bool.not_eq_true', Bool.or_eq_false_iff] at h
   rcases h with ⟨⟨⟨⟨hs, hfb⟩, hc⟩, ⟨⟨⟨hsvg, hsty⟩, hdl⟩, hfrm⟩⟩, hguard⟩
   have hp0 : (p && closesPTag t) = false := by cases p <;> cases interOut <;> simp_all
@@ -141,57 +142,86 @@ private theorem mk_modeStep (m1 m2 : TagMode) (tag : String) (resetP : Bool)
     simp only [stepHtmlCtx, hs, hf, Bool.not_true, Bool.or_false, Bool.false_eq_true, ↓reduceIte] at hstep ⊢ <;>
     repeat (first | (cases hstep; done) | (split at hstep <;> simp only [*, ↓reduceIte] <;> try (cases hstep; rfl)))
 
+private def camelValidName (pfx s : String) : String :=
+  match s.splitOn "-" with
+  | [] => pfx
+  | h :: t => pfx ++ h ++ String.join (t.map fun p =>
+      match p.toList with | [] => "" | c :: cs => String.ofList (c.toUpper :: cs))
+
+private def mkStepThmCmd (ref thm : Lean.Ident) (sLit : Lean.StrLit) (m1 m2 : Lean.Name)
+    (pVar iVar : Bool) (pOut iOut prf : Lean.TSyntax `term) : Lean.MacroM (Lean.TSyntax `command) := do
+  let mk (n : String) := Lean.mkIdentFrom ref (Lean.Name.mkSimple n)
+  let p := mk "p"; let i := mk "i"; let f := mk "f"; let tF : Lean.TSyntax `term := mk "false"
+  let pIn : Lean.TSyntax `term := if pVar then p else tF
+  let iIn : Lean.TSyntax `term := if iVar then i else tF
+  let bs : Array Lean.Ident := (if pVar then #[p] else #[]) ++ (if iVar then #[i] else #[]) ++ #[f]
+  let m1Id := Lean.mkIdentFrom ref (``TagMode ++ m1); let m2Id := Lean.mkIdentFrom ref (``TagMode ++ m2)
+  `(command| theorem $thm ($bs* : Bool) :
+      stepHtmlCtx { mode := $m1Id, inP := $pIn, interactive := $iIn, inForm := $f } $sLit =
+        some { mode := $m2Id, inP := $pOut, interactive := $iOut, inForm := $f } := $prf)
+
+private def modeStepInfo : String → Lean.Name × Lean.Name × Bool
+  | "li" => (`ulOl, `normal, true) | "thead" | "tbody" => (`table, `tableSection, true)
+  | "tr" => (`tableSection, `tableRow, true) | "option" => (`select, `option, false)
+  | _ => (`tableRow, `normal, true)
+
+private def genStepItem (k : String) (ref thm : Lean.Ident) (sLit : Lean.StrLit) :
+    Lean.MacroM (Lean.TSyntax `command) := do
+  let mk (n : String) := Lean.mkIdentFrom ref (Lean.Name.mkSimple n)
+  let mkM (m : Lean.Name) := Lean.mkIdentFrom ref (``TagMode ++ m)
+  let p := mk "p"; let i := mk "i"; let f := mk "f"
+  let tT : Lean.TSyntax `term := mk "true"; let tF : Lean.TSyntax `term := mk "false"
+  let tRfl : Lean.TSyntax `term := mk "rfl"; let bT (b : Bool) := if b then tT else tF
+  if k == "modeStep" then
+    let (m1, m2, rst) := modeStepInfo sLit.getString
+    let prf ← `($(mk "mk_modeStep") $(mkM m1) $(mkM m2) $sLit $(bT rst) rfl rfl rfl $p $i $f)
+    return ← mkStepThmCmd ref thm sLit m1 m2 true true (if rst then tF else p) i prf
+  let (pVar, iVar, wHead, wInter) ← match k with
+    | "block" | "modeBlock" => pure (false, true, false, false)
+    | "inter" | "modeInter" => pure (true, false, false, true)
+    | "inline" => pure (true, true, false, false) | "heading" => pure (false, true, true, false)
+    | "input"  => pure (true, false, false, false) | _ => Lean.Macro.throwUnsupported
+  let pIn : Lean.TSyntax `term := if pVar then p else tF
+  let iIn : Lean.TSyntax `term := if iVar then i else tF
+  let pOut : Lean.TSyntax `term := if pVar then p else bT wHead
+  let iOut : Lean.TSyntax `term := if iVar then i else bT wInter
+  let hp ← if pVar then `(Bool.and_false $p) else pure tRfl
+  let hi ← if iVar then `(Bool.and_false $i) else pure tRfl
+  let hp' ← if pVar then `(Bool.or_false $p) else pure tRfl
+  let hi' ← if iVar then `(Bool.or_false $i) else pure tRfl
+  let s := sLit.getString
+  let (m2, prf) ← if k == "modeBlock" || k == "modeInter" then
+    let m2 := if wInter then (if s == "select" then `select else `textarea)
+              else (if s == "table" then `table else `ulOl)
+    pure (m2, ← `($(mk "mk_modeNormal") $sLit $(mkM m2) $(bT wInter) rfl rfl $pIn $iIn $f $iOut $hp $hi $hi'))
+  else
+    pure (`normal, ← `($(mk "mk_stepNormal") $sLit $(bT pVar) $(bT iVar) $(bT wHead) $(bT wInter) rfl
+      $pIn $iIn $f $pOut $iOut $hp $hi $hp' $hi'))
+  mkStepThmCmd ref thm sLit `normal m2 pVar iVar pOut iOut prf
+
 local macro "genValidTable " kind:ident mapDef:ident " [" keys:str,* "]" : command => do
-  let camel (pfx s : String) : String :=
-    match s.splitOn "-" with
-    | [] => pfx
-    | h :: t => pfx ++ h ++ String.join (t.map fun p =>
-        match p.toList with | [] => "" | c :: cs => String.ofList (c.toUpper :: cs))
-  let mut cmds := #[]
-  let mut entries : Array (Lean.TSyntax `term) := #[]
+  let mut cmds := #[]; let mut entries : Array (Lean.TSyntax `term) := #[]
   let k := kind.getId.eraseMacroScopes.toString
-  let mkRef (n : String) := Lean.mkIdentFrom kind (Lean.Name.mkSimple n)
+  let pfx := match k with | "snu" => "snu_" | "sa" => "sa_" | "nv" => "nv_" | _ => "step_"
   for sLit in keys.getElems do
     let s := sLit.getString
-    let pfx := match k with
-      | "snu" => "snu_" | "sa" => "sa_" | "nv" => "nv_" | _ => "step_"
-    let thmStr := camel pfx s
+    let thmStr := camelValidName pfx s
     let thm := Lean.mkIdentFrom sLit (Lean.Name.mkSimple thmStr)
     let fullName := Lean.Name.mkStr (Lean.Name.mkStr (Lean.Name.mkSimple "Qed") "ValidLemmas") thmStr
-    entries := entries.push (← `(($sLit, $(Lean.quote fullName))))
+    let entry ← if k == "modeStep" then
+        `(((($(Lean.mkIdentFrom kind (``TagMode ++ (modeStepInfo s).1))).ctorIdx, $sLit), $(Lean.quote fullName)))
+      else `(($sLit, $(Lean.quote fullName)))
     let cmd ← match k with
       | "snu" => `(command| theorem $thm : isSafeAttrName $sLit = true ∧ isUrlAttrName $sLit = false := ⟨rfl, rfl⟩)
       | "sa"  => `(command| theorem $thm : isSafeAttrName $sLit = true := rfl)
-      | "nv"  => `(command| theorem $thm : isVoidTag $sLit = false := $(mkRef "mk_nv") $sLit rfl)
-      | "block" =>
-          `(command| theorem $thm (i f : Bool) :
-              stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } $sLit =
-                some { mode := .normal, inP := false, interactive := i, inForm := f } :=
-              $(mkRef "mk_stepNormal") $sLit false true false false rfl false i f false i rfl (Bool.and_false i) rfl (Bool.or_false i))
-      | "inline" =>
-          `(command| theorem $thm (p i f : Bool) :
-              stepHtmlCtx { mode := .normal, inP := p, interactive := i, inForm := f } $sLit =
-                some { mode := .normal, inP := p, interactive := i, inForm := f } :=
-              $(mkRef "mk_stepNormal") $sLit true true false false rfl p i f p i (Bool.and_false p) (Bool.and_false i) (Bool.or_false p) (Bool.or_false i))
-      | "heading" =>
-          `(command| theorem $thm (i f : Bool) :
-              stepHtmlCtx { mode := .normal, inP := false, interactive := i, inForm := f } $sLit =
-                some { mode := .normal, inP := true, interactive := i, inForm := f } :=
-              $(mkRef "mk_stepNormal") $sLit false true true false rfl false i f true i rfl (Bool.and_false i) rfl (Bool.or_false i))
-      | "inter" =>
-          `(command| theorem $thm (p f : Bool) :
-              stepHtmlCtx { mode := .normal, inP := p, interactive := false, inForm := f } $sLit =
-                some { mode := .normal, inP := p, interactive := true, inForm := f } :=
-              $(mkRef "mk_stepNormal") $sLit true false false true rfl p false f p true (Bool.and_false p) rfl (Bool.or_false p) rfl)
-      | "input" =>
-          `(command| theorem $thm (p f : Bool) :
-              stepHtmlCtx { mode := .normal, inP := p, interactive := false, inForm := f } $sLit =
-                some { mode := .normal, inP := p, interactive := false, inForm := f } :=
-              $(mkRef "mk_stepNormal") $sLit true false false false rfl p false f p false (Bool.and_false p) rfl (Bool.or_false p) rfl)
-      | _ => Lean.Macro.throwUnsupported
-    cmds := cmds.push cmd
+      | "nv"  => `(command| theorem $thm : isVoidTag $sLit = false := $(Lean.mkIdentFrom kind `mk_nv) $sLit rfl)
+      | _     => genStepItem k kind thm sLit
+    entries := entries.push entry; cmds := cmds.push cmd
   if k == "snu" || k == "sa" || k == "nv" || k == "inline" then
     cmds := cmds.push (← `(command| def $mapDef : Std.HashMap String Lean.Name := mkStrMap #[$entries,*]))
+  else if k == "modeStep" then
+    cmds := cmds.push (← `(command| private def $mapDef : Std.HashMap (Nat × String) Lean.Name :=
+      #[$entries,*].foldl (fun m (k, v) => m.insert k v) {}))
   else
     cmds := cmds.push (← `(command| private def $mapDef : Array (String × Lean.Name) := #[$entries,*]))
   return ⟨Lean.mkNullNode cmds⟩
@@ -225,43 +255,10 @@ genValidTable input stepInputEntries ["input", "label"]
 theorem step_form :
     stepHtmlCtx { mode := .normal, inP := false, interactive := false, inForm := false } "form" =
       some { mode := .normal, inP := false, interactive := false, inForm := true } := rfl
-theorem step_textarea (inP inForm : Bool) :
-    stepHtmlCtx { mode := .normal, inP, interactive := false, inForm } "textarea" =
-      some { mode := .textarea, inP, interactive := true, inForm } :=
-  mk_modeNormal "textarea" .textarea true rfl rfl inP false inForm (by simp) rfl
-theorem step_select (inP inForm : Bool) :
-    stepHtmlCtx { mode := .normal, inP, interactive := false, inForm } "select" =
-      some { mode := .select, inP, interactive := true, inForm } :=
-  mk_modeNormal "select" .select true rfl rfl inP false inForm (by simp) rfl
-theorem step_ul (interactive inForm : Bool) :
-    stepHtmlCtx { mode := .normal, inP := false, interactive, inForm } "ul" =
-      some { mode := .ulOl, inP := false, interactive, inForm } := by
-  simpa using mk_modeNormal "ul" .ulOl false rfl rfl false interactive inForm rfl (by simp)
-theorem step_ol (interactive inForm : Bool) :
-    stepHtmlCtx { mode := .normal, inP := false, interactive, inForm } "ol" =
-      some { mode := .ulOl, inP := false, interactive, inForm } := by
-  simpa using mk_modeNormal "ol" .ulOl false rfl rfl false interactive inForm rfl (by simp)
-theorem step_table (interactive inForm : Bool) :
-    stepHtmlCtx { mode := .normal, inP := false, interactive, inForm } "table" =
-      some { mode := .table, inP := false, interactive, inForm } := by
-  simpa using mk_modeNormal "table" .table false rfl rfl false interactive inForm rfl (by simp)
 
-theorem step_li (p i f : Bool) : stepHtmlCtx { mode := .ulOl, inP := p, interactive := i, inForm := f } "li" = some { mode := .normal, inP := false, interactive := i, inForm := f } :=
-  mk_modeStep .ulOl .normal "li" true rfl rfl rfl p i f
-theorem step_thead (p i f : Bool) : stepHtmlCtx { mode := .table, inP := p, interactive := i, inForm := f } "thead" = some { mode := .tableSection, inP := false, interactive := i, inForm := f } :=
-  mk_modeStep .table .tableSection "thead" true rfl rfl rfl p i f
-theorem step_tbody (p i f : Bool) : stepHtmlCtx { mode := .table, inP := p, interactive := i, inForm := f } "tbody" = some { mode := .tableSection, inP := false, interactive := i, inForm := f } :=
-  mk_modeStep .table .tableSection "tbody" true rfl rfl rfl p i f
-theorem step_tr (p i f : Bool) : stepHtmlCtx { mode := .tableSection, inP := p, interactive := i, inForm := f } "tr" = some { mode := .tableRow, inP := false, interactive := i, inForm := f } :=
-  mk_modeStep .tableSection .tableRow "tr" true rfl rfl rfl p i f
-theorem step_td (p i f : Bool) : stepHtmlCtx { mode := .tableRow, inP := p, interactive := i, inForm := f } "td" = some { mode := .normal, inP := false, interactive := i, inForm := f } :=
-  mk_modeStep .tableRow .normal "td" true rfl rfl rfl p i f
-theorem step_th (p i f : Bool) : stepHtmlCtx { mode := .tableRow, inP := p, interactive := i, inForm := f } "th" = some { mode := .normal, inP := false, interactive := i, inForm := f } :=
-  mk_modeStep .tableRow .normal "th" true rfl rfl rfl p i f
-theorem step_option (inP interactive inForm : Bool) :
-    stepHtmlCtx { mode := .select, inP, interactive, inForm } "option" =
-      some { mode := .option, inP, interactive, inForm } :=
-  mk_modeStep .select .option "option" false rfl rfl rfl inP interactive inForm
+genValidTable modeBlock stepModeBlockEntries ["ul", "ol", "table"]
+genValidTable modeInter stepModeInterEntries ["textarea", "select"]
+genValidTable modeStep stepModeMap ["li", "thead", "tbody", "tr", "td", "th", "option"]
 
 genValidTable nv nonVoidTagMap [
   "div", "span", "p", "a", "button", "form", "label", "ul", "ol", "li",
@@ -273,10 +270,10 @@ genValidTable nv nonVoidTagMap [
 open Lean
 
 private def stepBlockMap : Std.HashMap String Name :=
-  mkStrMap (stepPlainBlockEntries ++ stepHeadingEntries ++ #[("ul", ``step_ul), ("ol", ``step_ol), ("table", ``step_table)])
+  mkStrMap (stepPlainBlockEntries ++ stepHeadingEntries ++ stepModeBlockEntries)
 
 private def stepNonInterMap : Std.HashMap String Name :=
-  mkStrMap (stepInterEntries ++ stepInputEntries ++ #[("textarea", ``step_textarea), ("select", ``step_select)])
+  mkStrMap (stepInterEntries ++ stepInputEntries ++ stepModeInterEntries)
 
 def proveStepHtmlCtx (ctxV : HtmlCtx) (tagS : String) (childCtxE : Expr) : Expr :=
   let bP := toExpr ctxV.inP
@@ -289,14 +286,9 @@ def proveStepHtmlCtx (ctxV : HtmlCtx) (tagS : String) (childCtxE : Expr) : Expr 
         else if !ctxV.interactive && !ctxV.inForm && tagS == "form" then mkConst ``step_form
         else normalInlineOrInter bP bI bF
       else normalInlineOrInter bP bI bF
-  | .ulOl         => if tagS == "li"     then mkApp3 (mkConst ``step_li) bP bI bF     else rflStep childCtxE
-  | .table        => if tagS == "thead"  then mkApp3 (mkConst ``step_thead) bP bI bF
-                     else if tagS == "tbody" then mkApp3 (mkConst ``step_tbody) bP bI bF else rflStep childCtxE
-  | .tableSection => if tagS == "tr"     then mkApp3 (mkConst ``step_tr) bP bI bF     else rflStep childCtxE
-  | .tableRow     => if tagS == "td"     then mkApp3 (mkConst ``step_td) bP bI bF
-                     else if tagS == "th" then mkApp3 (mkConst ``step_th) bP bI bF    else rflStep childCtxE
-  | .select       => if tagS == "option" then mkApp3 (mkConst ``step_option) bP bI bF else rflStep childCtxE
-  | _             => rflStep childCtxE
+  | m =>
+      if let some lm := stepModeMap[(m.ctorIdx, tagS)]? then mkApp3 (mkConst lm) bP bI bF
+      else rflStep childCtxE
 where
   normalInlineOrInter (bP bI bF : Expr) : Expr :=
     if let some lm := if !ctxV.interactive then stepNonInterMap[tagS]? else none then mkApp2 (mkConst lm) bP bF
@@ -308,30 +300,19 @@ where
       (mkApp2 (mkConst ``Option.some [Level.zero]) (mkConst ``HtmlCtx) childCtxE)
 
 def qedAttrWrapperMap : Std.HashMap Name (Name × String × Name) :=
-  #[
-    (``Qed.role,          (``attr_nonUrl,  "data-role",   ``snu_dataRole)),
-    (``Qed.placeholder,   (``attr_nonUrl,  "placeholder", ``snu_placeholder)),
-    (``Qed.name,          (``attr_nonUrl,  "name",        ``snu_name)),
-    (``Qed.alt,           (``attr_nonUrl,  "alt",         ``snu_alt)),
-    (``Qed.title,         (``attr_nonUrl,  "title",       ``snu_title)),
-    (``Qed.style,         (``attr_nonUrl,  "style",       ``snu_style)),
-    (``Qed.type',         (``attr_nonUrl,  "type",        ``snu_type)),
-    (``Qed.onClick,       (``on_safe,      "click",       ``sa_click)),
-    (``Qed.onSubmit,      (``on_safe,      "submit",      ``sa_submit)),
-    (``Qed.onBlur,        (``on_safe,      "blur",        ``sa_blur)),
-    (``Qed.onFocus,       (``on_safe,      "focus",       ``sa_focus)),
-    (``Qed.onDoubleClick, (``on_safe,      "dblclick",    ``sa_dblclick)),
-    (``Qed.onMouseDown,   (``on_safe,      "mousedown",   ``sa_mousedown)),
-    (``Qed.onMouseUp,     (``on_safe,      "mouseup",     ``sa_mouseup)),
-    (``Qed.onInput,       (``onValue_safe, "input",       ``sa_input)),
-    (``Qed.onChange,      (``onValue_safe, "input",       ``sa_input)),
-    (``Qed.onKeydown,     (``onValue_safe, "keydown",     ``sa_keydown)),
-    (``Qed.onKeyup,       (``onValue_safe, "keyup",       ``sa_keyup)),
-    (``Qed.disabled,      (``flag_safe,    "disabled",    ``sa_disabled)),
-    (``Qed.required,      (``flag_safe,    "required",    ``sa_required)),
-    (``Qed.checked,       (``flag_safe,    "checked",     ``sa_checked)),
-    (``Qed.readOnly,      (``flag_safe,    "readonly",    ``sa_readonly))
-  ].foldl (fun m (k, v) => m.insert k v) {}
+  let add (comb : Name) (tbl : Std.HashMap String Name) (ps : Array (Name × String))
+      (m : Std.HashMap Name (Name × String × Name)) :=
+    ps.foldl (fun m (fn, key) => match tbl[key]? with | some lm => m.insert fn (comb, key, lm) | none => m) m
+  {} |> add ``attr_nonUrl safeNonUrlAttrMap #[
+          (``Qed.role, "data-role"), (``Qed.placeholder, "placeholder"), (``Qed.name, "name"),
+          (``Qed.alt, "alt"), (``Qed.title, "title"), (``Qed.style, "style"), (``Qed.type', "type")]
+     |> add ``on_safe safeAttrMap #[
+          (``Qed.onClick, "click"), (``Qed.onSubmit, "submit"), (``Qed.onBlur, "blur"), (``Qed.onFocus, "focus"),
+          (``Qed.onDoubleClick, "dblclick"), (``Qed.onMouseDown, "mousedown"), (``Qed.onMouseUp, "mouseup")]
+     |> add ``onValue_safe safeAttrMap #[
+          (``Qed.onInput, "input"), (``Qed.onChange, "input"), (``Qed.onKeydown, "keydown"), (``Qed.onKeyup, "keyup")]
+     |> add ``flag_safe safeAttrMap #[
+          (``Qed.disabled, "disabled"), (``Qed.required, "required"), (``Qed.checked, "checked"), (``Qed.readOnly, "readonly")]
 
 private def fastAttrCtorMap : Std.HashMap Name (Nat × Nat × Bool × Name) :=
   #[

@@ -33,11 +33,14 @@ def optCodecSimpNames : Array Name := #[
 def valUnwrapBaseNames : Array Name := #[
   `Qed.QedVal.val_field, `Qed.QedVal.val_ensured, ``Qed.Lang.QedVal.val_id]
 
-private def appWrapperBases : Array Name := #[
-  `Qed.Internal.mkApp, `Qed.Internal.mkRoutedApp, `Qed.Internal.App.withDehydrate,
+def appPassThroughWrappers : Array Name := #[
   `Qed.Internal.App.withQueries, `Qed.Internal.App.withSubscriptions,
   `Qed.Internal.App.withStylesheets, `Qed.Internal.App.withExtraStyles,
   `Qed.App.withHead, `Qed.App.withSsrStatus]
+
+def appWrapperBases : Array Name :=
+  #[`Qed.Internal.mkApp, `Qed.Internal.mkRoutedApp, `Qed.Internal.App.withDehydrate] ++
+  appPassThroughWrappers
 
 /-- Expands `appWrapperBases` with each suffix (`"init"`, `"update"`, `"template"`, `"dehydrate"`,
     `"rehydrate"`), keeping only declarations present in `env`. -/
@@ -161,24 +164,33 @@ def trySimpAll (g : MVarId) (ctx : Simp.Context) (sp : Simp.SimprocsArray := #[]
     MetaM (Option MVarId) :=
   tryGoalOptM g fun g => return (← simpAll g ctx sp).1
 
-def trySplitTarget (g : MVarId) : MetaM (Option (List MVarId)) := do
+private def tryGoalSplit (g : MVarId) (k : MetaM (Option (List MVarId))) : MetaM (Option (List MVarId)) := do
   let s ← saveState
   try
-    let r ← g.withContext (Meta.splitTarget? g)
+    let r ← g.withContext k
     if r.isNone then restoreState s
     return r
   catch _ => restoreState s; return none
 
-def trySplitLocalDecl (g : MVarId) (fv : FVarId) : MetaM (Option (List MVarId)) := do
-  let s ← saveState
-  try
-    let r ← g.withContext (Meta.splitLocalDecl? g fv)
-    if r.isNone then restoreState s
-    return r
-  catch _ => restoreState s; return none
+def trySplitTarget (g : MVarId) : MetaM (Option (List MVarId)) :=
+  tryGoalSplit g (Meta.splitTarget? g)
+
+def trySplitLocalDecl (g : MVarId) (fv : FVarId) : MetaM (Option (List MVarId)) :=
+  tryGoalSplit g (Meta.splitLocalDecl? g fv)
 
 def tryApplyConst (g : MVarId) (c : Name) : MetaM (Option (List MVarId)) := do
   let s ← saveState; try return some (← g.applyConst c) catch _ => restoreState s; return none
+
+def tryReflGoal (g : MVarId) : MetaM Bool := do
+  let s ← saveState; try g.refl; return true catch _ => restoreState s; return false
+
+/-- Extract the collection expression `xs` from a goal of shape `∀ c ∈ xs, P c`. -/
+def extractForEachColl? (tgt : Expr) : Option Expr :=
+  match tgt.consumeMData with
+  | .forallE _ _ (.forallE _ memTy _ _) _ =>
+      let memTy := memTy.consumeMData
+      if memTy.isAppOfArity ``Membership.mem 5 then some memTy.getAppArgs[3]!.consumeMData else none
+  | _ => none
 
 def collectGoalConsts (g : MVarId) (includeLCtx : Bool := false) : MetaM (Std.HashSet Name) :=
   g.withContext do
@@ -228,9 +240,8 @@ private def tryEmitFieldOrFin (env : Environment) (includeFin : Bool) (sub ty : 
   let emit (c : Name) : MetaM Unit := do
     if env.contains c then
       if let some p ← try some <$> mkAppM c #[sub] catch _ => pure none then addFact p
-  if ty.isAppOfArity `Qed.Field 2 then emit `Qed.Field.ok; return true
-  if ty.isAppOfArity `Qed.Ensured 2 then
-    emit (if env.contains `Qed.Ensured.ok then `Qed.Ensured.ok else `Qed.Field.ok); return true
+  if ty.isAppOfArity `Qed.Field 2 || ty.isAppOfArity `Qed.Ensured 2 then
+    emit `Qed.Field.ok; return true
   if includeFin && ty.isAppOfArity ``Fin 1 then emit ``Fin.isLt; return true
   return false
 
@@ -357,8 +368,9 @@ def tryDirectOmega (g : MVarId) : MetaM Bool := do
     return true
   catch _ => restoreState s; return false
 
-def tryCloseBasic (g : MVarId) (skipTarget : Expr → Bool := fun _ => false) : MetaM Bool := do
-  if ← tryCloseTrivial g skipTarget then return true
+def tryCloseBasic (g : MVarId) (skipTarget : Expr → Bool := fun _ => false)
+    (reducibleOnly : Bool := false) : MetaM Bool := do
+  if ← tryCloseTrivial g skipTarget reducibleOnly then return true
   if ← tryDirectDecide g then return true
   tryDirectOmega g
 
@@ -463,26 +475,21 @@ def simplifyWithUnfolds (g0 : MVarId) (unfoldNames extraSimpNames : Array Name)
 def solveWithUnfolds (unfoldNames extraSimpNames : Array Name)
     (simprocNames : Array Name := #[]) (simpCfg : Simp.Config := { zetaDelta := true }) :
     TacticM Bool := do
-  let s ← saveState
-  let ok ← try
+  let runPass (close : Bool) : TacticM (List MVarId) := do
     let mut rem : List MVarId := []
     for g in (← getGoals) do
       if let some g' ← simplifyWithUnfolds g unfoldNames extraSimpNames simprocNames simpCfg then
-        if !(← tryCloseBasic g') then
+        if !close then rem := rem ++ [g']
+        else if !(← tryCloseBasic g') then
           let saved ← getGoals; setGoals [g']
           try evalTactic (← `(tactic| grind)) catch _ => pure ()
           rem := rem ++ (← getGoals); setGoals saved
-    setGoals rem; pure rem.isEmpty
-  catch _ => pure false
+    return rem
+  let s ← saveState
+  let ok ← try let rem ← runPass true; setGoals rem; pure rem.isEmpty catch _ => pure false
   if ok then return true
   restoreState s
-  try
-    let mut rem : List MVarId := []
-    for g in (← getGoals) do
-      if let some g' ← simplifyWithUnfolds g unfoldNames extraSimpNames simprocNames simpCfg then
-        rem := rem ++ [g']
-    setGoals rem
-  catch _ => pure ()
+  try setGoals (← runPass false) catch _ => pure ()
   return false
 
 end Qed.Verify.Core

@@ -78,32 +78,32 @@ private def evalGroundBoolGoal (g : MVarId) (tgt : Expr) : TacticM (Option (List
 
 private def runSplitFiniteEnums : TacticM Unit := do
   let mut checkedGround : Std.HashSet MVarId := {}
+  let evalGroundPass (gs : List MVarId) (checked : Std.HashSet MVarId) :
+      TacticM (List MVarId × Std.HashSet MVarId × Bool) := do
+    let mut checked := checked; let mut progress := false; let mut out : List MVarId := []
+    for g in gs do
+      let tgt ← g.withContext do instantiateMVars (← g.getType)
+      if !tgt.isFalse && !tgt.hasFVar && !checked.contains g then
+        checked := checked.insert g
+        if let some gs' ← evalGroundBoolGoal g tgt then
+          progress := true; out := out ++ gs'; continue
+      out := out ++ [g]
+    return (out, checked, progress)
   for _ in [0:2] do
     let gs ← getGoals
     if gs.isEmpty then return
-    let mut progress := false
-    let mut nextGoals : List MVarId := []
+    let (gs, checked', prog0) ← evalGroundPass gs checkedGround
+    checkedGround := checked'
+    let mut progress := prog0; let mut nextGoals : List MVarId := []
     for g in gs do
       let tgt ← g.withContext do instantiateMVars (← g.getType)
-      if tgt.isFalse then
-        nextGoals := nextGoals ++ [g]
-        continue
-      if !tgt.hasFVar && !checkedGround.contains g then
-        checkedGround := checkedGround.insert g
-        if let some gs' ← evalGroundBoolGoal g tgt then
-          progress := true
-          nextGoals := nextGoals ++ gs'
-          continue
-      let splitRes? ← g.withContext do
+      let splitRes? ← if tgt.isFalse then pure none else g.withContext do
         if let some e ← findFiniteEnumExpr (← getEnv) tgt then
           try
-            if e.isFVar then
-              return some ((← g.cases e.fvarId!).toList.map (·.mvarId))
-            else
-              setGoals [g]
-              let stx ← PrettyPrinter.delab e
-              evalTactic (← `(tactic| (generalize $stx:term = _qed_enum_x at *; cases _qed_enum_x)))
-              return some (← getGoals)
+            if e.isFVar then return some ((← g.cases e.fvarId!).toList.map (·.mvarId))
+            setGoals [g]
+            evalTactic (← `(tactic| (generalize $(← PrettyPrinter.delab e):term = _qed_enum_x at *; cases _qed_enum_x)))
+            return some (← getGoals)
           catch _ => pure ()
         return none
       match splitRes? with
@@ -111,14 +111,7 @@ private def runSplitFiniteEnums : TacticM Unit := do
       | none     => nextGoals := nextGoals ++ [g]
     setGoals nextGoals
     if !progress then break
-  let mut rem : List MVarId := []
-  for g in (← getGoals) do
-    let tgt ← g.withContext do instantiateMVars (← g.getType)
-    if !tgt.isFalse && !tgt.hasFVar && !checkedGround.contains g then
-      if let some gs' ← evalGroundBoolGoal g tgt then
-        rem := rem ++ gs'
-        continue
-    rem := rem ++ [g]
+  let (rem, _, _) ← evalGroundPass (← getGoals) checkedGround
   setGoals rem
 
 private def a11yReduceNames : Array Name := #[
@@ -153,13 +146,11 @@ private def styleReduceCoreNames : Array Name := #[
   ``Qed.Lang.QedMemProp.memProp_array, ``Qed.Lang.QedMemProp.memProp_list, ``Qed.Lang.QedMemProp.memProp_string
 ]
 
-private def styleReduceOptNames : Array Name := #[
-  `Qed.View.render, `Qed.View.renderEach, `Qed.View.mapScope, `Qed.View.mapScopeEach,
-  `Qed.VAttr.eval, `Qed.VAttr.mapScope, `Qed.View.showIf, `Qed.View.ofHtml,
-  `Qed.V.el, `Qed.V.text, `Qed.V.dyn, `Qed.V.ifElse, `Qed.V.showIf, `Qed.V.static, `Qed.V.dynNode,
-  `Qed.V.memo, `Qed.V.render_forEach, `Qed.View.isDyn, `Qed.View.memo,
-  `Qed.Attr.empty, `Qed.Html.ofOption, `Qed.toString_string, `Qed.withKey, `Qed.ToHref.toHref
-] ++ Qed.qedForEachHelperNames ++ Qed.qedHtmlHelperNames
+private def styleReduceOptNames : Array Name :=
+  Qed.viewCoreUnfolds ++ #[
+    `Qed.View.mapScope, `Qed.View.mapScopeEach, `Qed.VAttr.mapScope, `Qed.View.memo,
+    `Qed.Attr.empty, `Qed.Html.ofOption, `Qed.toString_string, `Qed.withKey, `Qed.ToHref.toHref
+  ] ++ Qed.qedForEachHelperNames ++ Qed.qedHtmlHelperNames
 
 private def styleLeafFastNames : Array Name :=
   styleLeafCoreNames ++ boolConstSimpNames ++ #[
@@ -189,12 +180,10 @@ private def isUnprovableFalseGoal (g : MVarId) : MetaM Bool := g.withContext do
   return true
 
 private def runStyleLeafClose (g : MVarId) : TacticM (List MVarId) := do
-  let s0 ← saveState
-  try g.refl; return [] catch _ => restoreState s0
+  if ← tryReflGoal g then return []
   let (fastCtx, _) ← mkCachedSimpCtx "styleLeafFast" styleLeafFastNames
   let some g1 ← trySimpAll g fastCtx | return []
-  let s1 ← saveState
-  try g1.refl; return [] catch _ => restoreState s1
+  if ← tryReflGoal g1 then return []
   if ← isUnprovableFalseGoal g1 then return [g1]
   let fullCtx ← mkSimpCtxWithBase (styleLeafCoreNames ++ a11yReduceNames) (cacheKey? := some "styleLeafFull")
   let some g2 ← trySimpAll g1 fullCtx #[← Meta.Simp.getSimprocs] | return []
@@ -202,11 +191,7 @@ private def runStyleLeafClose (g : MVarId) : TacticM (List MVarId) := do
   if ← tryDirectOmega g2 then return []
   setGoals [g2]
   try runCloseExhaustiveEnum catch _ => pure ()
-  let mut rem : List MVarId := []
-  for g3 in (← getGoals) do
-    if ← tryDirectDecide g3 then continue
-    rem := rem ++ [g3]
-  return rem
+  (← getGoals).filterM fun g3 => return !(← tryDirectDecide g3)
 
 private def runStyleReduce (view : Ident) : TacticM Unit := do
   runSplitFiniteEnums

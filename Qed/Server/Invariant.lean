@@ -257,9 +257,12 @@ private def proveGoalWithMeta (facts : Array Expr) (goalProp : Expr)
     restoreState s
     return none
 
-private def dsimpCodecAndStrLen (g0 : MVarId) : MetaM (Option MVarId) := do
+private def dsimpCodecGoal (g : MVarId) : MetaM (Option MVarId) := do
   let (dcCtx, _) ← mkCachedSimpCtx "dsimpCodec" dsimpCodecUnfoldNames { zetaDelta := false } #[] true
-  let some g1 ← simpGoalOnly g0 dcCtx #[] #[] true true | return none
+  simpGoalOnly g dcCtx #[] #[] true true
+
+private def dsimpCodecAndStrLen (g0 : MVarId) : MetaM (Option MVarId) := do
+  let some g1 ← dsimpCodecGoal g0 | return none
   let (strCtx, strSp) ← mkCachedSimpCtx "strLenOnly" #[] { zetaDelta := false } strLenSP
   simpGoalOnly g1 strCtx strSp
 
@@ -317,11 +320,10 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
         let isLit := valExpr.isLit || (valExpr.getAppFn.isConstOf ``OfNat.ofNat && !valExpr.hasFVar)
         let localFacts ← if isLit then pure #[] else
           liftMetaM <| collectFacts { scanLCtx := false, includeFin := true } #[valExpr]
-        if let some fastPrf ← proveGoalWithMeta localFacts goalProp (solveAutoFieldFast isLit) then
-          return ← mkAppOptM ``Qed.Field.mk #[some innerTy, some predFn, some valExpr, some (← wrapAuxProof goalProp fastPrf)]
-        let facts ← collectProofFacts #[valExpr]
-        let some prfExpr ← proveGoalWithMeta facts goalProp (fun g _ => solveRefinementSlow g)
-          | throwFieldRuleFailed stx predFn valExpr
+        let mut prf? ← proveGoalWithMeta localFacts goalProp (solveAutoFieldFast isLit)
+        if prf?.isNone then
+          prf? ← proveGoalWithMeta (← collectProofFacts #[valExpr]) goalProp (fun g _ => solveRefinementSlow g)
+        let some prfExpr := prf? | throwFieldRuleFailed stx predFn valExpr
         return ← mkAppOptM ``Qed.Field.mk #[some innerTy, some predFn, some valExpr, some (← wrapAuxProof goalProp prfExpr)]
       else
         return ← try elabTermEnsuringType valStx (some expTy)
@@ -491,21 +493,15 @@ private def elabSrvArrOrDictOp (stx : Syntax) (arrStx idxStx : Term) (valStx? : 
     throwErrorAt arrStx m!"expected an array (`T[]`) for {opDesc}, got `{← ppExpr arrTy}`"
   let elemTy := arrTy.getAppArgs[0]!
   let idxNatExpr ← elabTermEnsuringType (← `(Qed.Server.SrvIdx.toNat $idxStx)) (some (mkConst ``Nat))
-  let resExpr ← match valStx? with
-    | none =>
-        synthesizeSyntheticMVarsNoPostponing
-        let arrExpr ← instantiateMVars arrExpr
-        let idxNatExpr ← instantiateMVars idxNatExpr
-        let ltPrf ← proveBoundsFor stx arrExpr idxNatExpr
-        mkAppOptM ``srvGetAt #[some elemTy, some arrExpr, some idxNatExpr, some ltPrf]
-    | some valStx =>
-        let valExpr ← elabTermEnsuringType (← `(srvAutoField($valStx))) (some elemTy)
-        synthesizeSyntheticMVarsNoPostponing
-        let arrExpr ← instantiateMVars arrExpr
-        let idxNatExpr ← instantiateMVars idxNatExpr
-        let valExpr ← instantiateMVars valExpr
-        let ltPrf ← proveBoundsFor stx arrExpr idxNatExpr
-        mkAppOptM ``Array.set #[some elemTy, some arrExpr, some idxNatExpr, some valExpr, some ltPrf]
+  let valExpr? ← valStx?.mapM fun valStx => do elabTermEnsuringType (← `(srvAutoField($valStx))) (some elemTy)
+  synthesizeSyntheticMVarsNoPostponing
+  let arrExpr ← instantiateMVars arrExpr
+  let idxNatExpr ← instantiateMVars idxNatExpr
+  let valExpr? ← valExpr?.mapM instantiateMVars
+  let ltPrf ← proveBoundsFor stx arrExpr idxNatExpr
+  let resExpr ← match valExpr? with
+    | none         => mkAppOptM ``srvGetAt #[some elemTy, some arrExpr, some idxNatExpr, some ltPrf]
+    | some valExpr => mkAppOptM ``Array.set #[some elemTy, some arrExpr, some idxNatExpr, some valExpr, some ltPrf]
   match expectedType? with
   | some expTy => ensureHasType expTy resExpr
   | none       => return resExpr
@@ -538,8 +534,7 @@ private def finishAtomGoal (g0 : MVarId) (allowDeepFallback : Bool := true) : Ta
   let (preCtx, _) ← mkCachedSimpCtx "finishAtomPre"
     (valUnwrapSimpNames ++ liftOptSimpNames ++ #[``Array.getElem_set_self] ++ dictSimpNames)
   let some g ← simpGoalOnly g preCtx | return none
-  let (dcCtx, _) ← mkCachedSimpCtx "dsimpCodec" dsimpCodecUnfoldNames { zetaDelta := false } #[] true
-  let some g ← simpGoalOnly g dcCtx #[] #[] true true | return none
+  let some g ← dsimpCodecGoal g | return none
   if ← tryCloseSrvTrivial g then return none
   if ← tryDirectOmega g then return none
   let (g, invFactFVars) ← poseInvFactsOnGoal g
@@ -547,7 +542,7 @@ private def finishAtomGoal (g0 : MVarId) (allowDeepFallback : Bool := true) : Ta
     let (codecCtx, _) ← mkCachedSimpCtx "optCodecDsimp" optCodecSimpNames { zetaDelta := false } #[] true
     let some g' ← simpGoalOnly g codecCtx #[] invFactFVars false true | return none
     pure g'
-  let some g ← simpGoalOnly g dcCtx #[] #[] true true | return none
+  let some g ← dsimpCodecGoal g | return none
   if ← tryCloseSrvBasic g then return none
   let (fbCtx, _) ← mkCachedSimpCtx "finishAtomFb" (valUnwrapSimpNames ++ arrayCoreSimpNames)
   let some g ← simpGoalOnly g fbCtx | return none
@@ -709,10 +704,7 @@ private def peelArrayForallGoal (g0 : MVarId) (allowDeepFallback : Bool := true)
     | fuel + 1, g => do
         let some g ← simpGoalOnly g emptyDsimpCtx #[] #[] true true | return []
         if ← tryCloseSrvTrivial g then return []
-        let tgt ← g.withContext (instantiateMVars (← g.getType))
-        let .forallE _ _ (.forallE _ memTy _ _) _ := tgt.consumeMData | return [g]
-        unless memTy.consumeMData.isAppOfArity ``Membership.mem 5 do return [g]
-        let arrExpr := (memTy.consumeMData.getAppArgs[3]!).consumeMData
+        let some arrExpr := extractForEachColl? (← g.withContext (instantiateMVars (← g.getType))) | return [g]
         for (ctor, arity, lem) in #[(``Array.set, 5, ``Array.forall_set), (``Array.push, 3, ``srv_forall_push)] do
           if arrExpr.isAppOfArity ctor arity then
             if let some [gPrev, gElem] ← tryApplyConst g lem then
@@ -781,8 +773,7 @@ private def closeLeafGoal (g0 : MVarId) (allowDeepFallback : Bool := true) : Tac
   let g ← substMatchEqHypsGoal g
   let some g ← simpWithNewState g | return []
   let some g ← simpGoalOnly g emptyDsimpCtx #[] #[] true true | return []
-  let (dcCtx, _) ← mkCachedSimpCtx "dsimpCodec" dsimpCodecUnfoldNames { zetaDelta := false } #[] true
-  let some g ← simpGoalOnly g dcCtx #[] #[] true true | return []
+  let some g ← dsimpCodecGoal g | return []
   if ← tryCloseSrvTrivial g then return []
   let (g, didSplit2) ← splitAndHypsGoal g
   let g ← if !didSplit2 then pure g else do
@@ -843,10 +834,7 @@ private def proveStepSingleGoal (g0 : MVarId) (allStepCtx stepFloatCtx : Simp.Co
           | some g' => return ← stepTargetLoop fuel (g' :: rest)
         match ← trySplitTarget g with
         | some sgs =>
-            let mut next : List MVarId := []
-            for sg in sgs do
-              if let some sg' ← simpGoalOnly sg stepFloatCtx then next := next ++ [sg']
-            return ← stepTargetLoop fuel (next ++ rest)
+            return ← stepTargetLoop fuel ((← sgs.filterMapM (simpGoalOnly · stepFloatCtx)) ++ rest)
         | none =>
             if !(← goalHasSplittableHyp g) then
               return (← closeLeafGoal g (allowDeepFallback := true)) ++ (← stepTargetLoop fuel rest)
@@ -859,10 +847,7 @@ private def proveStepSingleGoal (g0 : MVarId) (allStepCtx stepFloatCtx : Simp.Co
               | none    => return ← stepTargetLoop fuel rest
               | some g' => return ← stepTargetLoop fuel (g' :: rest)
             if let some eqSgs ← splitEqHypGoal g then
-              let mut next : List MVarId := []
-              for sg in eqSgs do
-                if let some sg' ← simpGoalAllHyps sg stepFloatCtx then next := next ++ [sg']
-              return ← stepTargetLoop fuel (next ++ rest)
+              return ← stepTargetLoop fuel ((← eqSgs.filterMapM (simpGoalAllHyps · stepFloatCtx)) ++ rest)
             return (← closeLeafGoal g (allowDeepFallback := true)) ++ (← stepTargetLoop fuel rest)
   stepTargetLoop 256 [g2]
 
@@ -935,12 +920,8 @@ private def normAndPushCont (g : MVarId) (introN : Nat) (dCtx sCtx : Simp.Contex
   let (_, g1) ← if introN == 0 then pure (#[], g) else g.introN introN
   return match ← normAsyncContGoal g1 dCtx sCtx with | none => [] | some c => [c]
 
-private def normSplitGoals (sgs : List MVarId) (dCtx sCtx : Simp.Context) :
-    MetaM (List MVarId) := do
-  let mut next : List MVarId := []
-  for sg in sgs do
-    if let some sg' ← normAsyncContGoal sg dCtx sCtx then next := next ++ [sg']
-  return next
+private def normSplitGoals (sgs : List MVarId) (dCtx sCtx : Simp.Context) : MetaM (List MVarId) :=
+  sgs.filterMapM (normAsyncContGoal · dCtx sCtx)
 
 /-- Parameterization unifying `ProgPreservesStepRel`/`ProgPreservesInv` and `ProgEnsures` AST stepping. -/
 private structure AsyncStepSpec where
@@ -995,20 +976,18 @@ private def stepAsyncLoop (spec : AsyncStepSpec) (dCtx sCtx : Simp.Context) (gIn
         let some progRaw := prog? | return g :: (← loop fuel rest)
         let prog := progRaw.consumeMData
         -- 1. Pure
-        if prog.isAppOf ``Qed.Server.ThreadProg.pure then
-          if let some sgs ← tryApplyConst g spec.pureThreadLem then
-            return sgs ++ (← loop fuel rest)
-        if prog.isAppOf ``Pure.pure then
-          if let some sgs ← tryApplyConst g spec.pureClassLem then
-            return sgs ++ (← loop fuel rest)
+        for (head, lem) in #[(``Qed.Server.ThreadProg.pure, spec.pureThreadLem), (``Pure.pure, spec.pureClassLem)] do
+          if prog.isAppOf head then
+            if let some sgs ← tryApplyConst g lem then return sgs ++ (← loop fuel rest)
         -- 2. Bind
         if prog.isAppOf ``Bind.bind || prog.isAppOf ``Qed.Server.ThreadProg.bind then
           let pArg := (if prog.isAppOf ``Bind.bind then prog.getAppArgs[4]! else prog.getAppArgs[3]!).consumeMData
-          if pArg.isAppOf ``Qed.Server.MonadAtomic.runAtomic then
-            if let some (gCont :: gExtra) ← tryApplyConst g spec.bindAtomicLem then
-              return ← loop fuel ((← normAndPushCont gCont spec.atomicContIntros dCtx sCtx) ++ gExtra ++ rest)
-          else if pArg.isAppOf ``Qed.Server.MonadAtomic.runAtomicRead then
-            if let some (gCont :: gExtra) ← tryApplyConst g spec.bindAtomicReadLem then
+          let atomicLem? :=
+            if pArg.isAppOf ``Qed.Server.MonadAtomic.runAtomic then some spec.bindAtomicLem
+            else if pArg.isAppOf ``Qed.Server.MonadAtomic.runAtomicRead then some spec.bindAtomicReadLem
+            else none
+          if let some lem := atomicLem? then
+            if let some (gCont :: gExtra) ← tryApplyConst g lem then
               return ← loop fuel ((← normAndPushCont gCont spec.atomicContIntros dCtx sCtx) ++ gExtra ++ rest)
           else
             if !spec.isPreserves then
@@ -1020,12 +999,10 @@ private def stepAsyncLoop (spec : AsyncStepSpec) (dCtx sCtx : Simp.Context) (gIn
             if let some [gCont] ← tryApplyConst g spec.bindSafeIOLem then
               return ← loop fuel ((← normAndPushCont gCont 1 dCtx sCtx) ++ rest)
         -- 3. Single runAtomic / runAtomicRead / SafeIO
-        if prog.isAppOf ``Qed.Server.MonadAtomic.runAtomic then
-          if let some [gStep] ← tryApplyConst g spec.singleAtomicLem then
-            return gStep :: (← loop fuel rest)
-        if prog.isAppOf ``Qed.Server.MonadAtomic.runAtomicRead then
-          if let some [gStep] ← tryApplyConst g spec.singleAtomicReadLem then
-            return gStep :: (← loop fuel rest)
+        for (head, lem) in #[(``Qed.Server.MonadAtomic.runAtomic, spec.singleAtomicLem),
+                             (``Qed.Server.MonadAtomic.runAtomicRead, spec.singleAtomicReadLem)] do
+          if prog.isAppOf head then
+            if let some [gStep] ← tryApplyConst g lem then return gStep :: (← loop fuel rest)
         if !spec.isPreserves then
           if let some [gImp] ← tryApplyConst g ``Qed.Server.safeIOEnsures_final then
             return gImp :: (← loop fuel rest)
@@ -1094,11 +1071,8 @@ elab_rules : tactic
       let some g ← simpGoalAllHyps g abCtx | replaceMainGoal []; return
       let (reqCtx, _) ← mkCachedSimpCtx "rpcReq" rpcReqSimpNames { zetaDelta := true, zetaHave := true }
       let some g ← simpGoalAllHyps g reqCtx | replaceMainGoal []; return
-      let (dcCtx, _) ← mkCachedSimpCtx "dsimpCodec" dsimpCodecUnfoldNames { zetaDelta := false } #[] true
-      let some g ← simpGoalOnly g dcCtx #[] #[] true true | replaceMainGoal []; return
-      let mut rem : List MVarId := []
-      for cg in ← splitGoalAnds g do
-        if let some fg ← closeRpcReqLeaf cg then rem := rem ++ [fg]
+      let some g ← dsimpCodecGoal g | replaceMainGoal []; return
+      let rem ← (← splitGoalAnds g).filterMapM closeRpcReqLeaf
       setGoals rem
       unless rem.isEmpty do
         Qed.Diag.throwUnsolvedGoals

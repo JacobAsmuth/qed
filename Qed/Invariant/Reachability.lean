@@ -26,29 +26,11 @@ def Reachable {State Msg Out : Type} [InvTarget Out State]
     (update : State → Msg → Out) (init : State) (target : State → Prop) : Prop :=
   ∃ trace : List Msg, target (runTrace update init trace)
 
-/-- `ReachableIn update init n target` holds iff `target` is reachable in at most `n` actions. -/
-def ReachableIn {State Msg Out : Type} [InvTarget Out State]
-    (update : State → Msg → Out) (init : State) (n : Nat) (target : State → Prop) : Prop :=
-  ∃ trace : List Msg, trace.length ≤ n ∧ target (runTrace update init trace)
-
 theorem reachable_of_trace {State Msg Out : Type} [InvTarget Out State]
     (update : State → Msg → Out) (init : State) (target : State → Prop)
     (trace : List Msg) (h : target (runTrace update init trace)) :
     Reachable update init target :=
   ⟨trace, h⟩
-
-theorem reachableIn_of_trace {State Msg Out : Type} [InvTarget Out State]
-    (update : State → Msg → Out) (init : State) (n : Nat) (target : State → Prop)
-    (trace : List Msg) (hlen : trace.length ≤ n) (h : target (runTrace update init trace)) :
-    ReachableIn update init n target :=
-  ⟨trace, hlen, h⟩
-
-theorem reachable_of_reachableIn {State Msg Out : Type} [InvTarget Out State]
-    {update : State → Msg → Out} {init : State} {n : Nat} {target : State → Prop}
-    (h : ReachableIn update init n target) :
-    Reachable update init target :=
-  let ⟨tr, _, ht⟩ := h
-  ⟨tr, ht⟩
 
 theorem inv_holds_on_runTrace {State Msg Out : Type} [InvTarget Out State]
     {update : State → Msg → Out} {init : State} {Inv : State → Prop}

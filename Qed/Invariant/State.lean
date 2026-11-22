@@ -13,8 +13,6 @@ instance {Model β : Type} : InvTarget (Model × β) Model := ⟨Prod.fst⟩
 @[simp] theorem InvTarget.proj_fst {Model β : Type} (p : Model × β) :
     InvTarget.proj p = p.1 := rfl
 
-abbrev dictSimpNames : Array Lean.Name := Qed.Verify.Core.dictSimpNames
-
 open Lean Elab Tactic Qed.Verify.Core
 
 private def boundaryLemmaGroups : Array (Name × Array Name) := #[
@@ -42,10 +40,7 @@ private def relevantBoundaryLemmas (cs : Std.HashSet Name) : Array Name :=
 
 private def relevantAppLemmas (env : Environment) (cs : Std.HashSet Name) : Array Name := Id.run do
   let mut r : Array Name := #[``InvTarget.proj_id, ``InvTarget.proj_fst]
-  let hasApp := #[`Qed.Internal.mkApp, `Qed.Internal.mkRoutedApp, `Qed.App.init, `Qed.App.update,
-    `Qed.Internal.App.withDehydrate, `Qed.Internal.App.withQueries, `Qed.Internal.App.withSubscriptions,
-    `Qed.Internal.App.withStylesheets, `Qed.Internal.App.withExtraStyles,
-    `Qed.App.withHead, `Qed.App.withSsrStatus].any cs.contains
+  let hasApp := appWrapperBases.any cs.contains || cs.contains `Qed.App.init || cs.contains `Qed.App.update
   if hasApp then
     r := r ++ appProjSimpNames env #["init", "update"] ++
       #[`Qed.Query.boot, `Qed.Query.wrap, `Qed.Resource.query, `Qed.Resource.rpcQuery,
@@ -160,11 +155,7 @@ private def runCloseStateGoal (extra : Array Term) : TacticM Unit := do
         try evalTactic (← `(tactic| simp_all only [$[$relL],*])) catch _ => pure ()
       let g' :: _ ← getGoals | return
       pure g'
-  if ← tryCloseTrivial g (reducibleOnly := true) then
-    replaceMainGoal []; return
-  if ← tryDirectOmega g then
-    replaceMainGoal []; return
-  if ← tryDirectDecide g then
+  if ← tryCloseBasic g (reducibleOnly := true) then
     replaceMainGoal []; return
   let relL := (← namesToSimpLemmas relNames) ++ (← termsToSimpLemmas extra)
   evalTactic (← `(tactic|
@@ -238,16 +229,18 @@ private def mkInitTac (usingL : Array Term) (pred initT : Term) : TacticM (TSynt
      qedUnfoldPresent [$[$usingL],*];
      try ((repeat' split) <;> qedCloseStateGoal [$[$usingL],*])))
 
+private def formatTargetName (t : Term) : String :=
+  if t.raw.isIdent then toString t.raw.getId
+  else (t.raw.reprint.getD (toString t.raw)).trimAscii.toString
+
 syntax "qedDischargeInit " "[" term,* "]" term:max ident term:max : tactic
 
 elab_rules : tactic
   | `(tactic| qedDischargeInit [$[$usingL],*] $initT $nm $pred) => do
     (← getMainGoal).setTag `init
     evalTactic (← mkInitTac usingL pred initT)
-    let initName := if initT.raw.isIdent then toString initT.raw.getId
-      else (initT.raw.reprint.getD (toString initT.raw)).trimAscii.toString
     throwUnsolvedInvGoals nm
-      m!"Invariant `{nm.getId}` failed on initial state `{initName}`:"
+      m!"Invariant `{nm.getId}` failed on initial state `{formatTargetName initT}`:"
       m!"Hint: Update the initial `state` values so `{nm.getId}` holds, add `using [lemma]`, or supply a `:= by` proof."
 
 syntax "qedDischargePreserved " "[" term,* "]" term:max ident term:max (" from " term)? : tactic
@@ -300,10 +293,8 @@ elab_rules : tactic
         | _ => throwError "internal error splitting invariant init/step goals"
     | none =>
         evalTactic stepTac
-    let updName := if upd.raw.isIdent then toString upd.raw.getId
-      else (upd.raw.reprint.getD (toString upd.raw)).trimAscii.toString
     throwUnsolvedInvGoals nm
-      m!"Invariant `{nm.getId}` failed in `{updName}`:"
+      m!"Invariant `{nm.getId}` failed in `{formatTargetName upd}`:"
       m!"Hint: Guard the failing branch with `if ...:`, fix the update, or weaken the invariant.\n      If the rule does hold, add `using [lemma]` or a manual `:= by` proof."
 
 end Qed

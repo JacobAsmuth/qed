@@ -3,7 +3,7 @@ import Qed.Invariant.State
 import Qed.Invariant.View
 
 namespace Qed
-open Lean Elab Tactic
+open Lean Elab Tactic Qed.Verify.Core
 
 /-- Extracts the view predicate `P` from a `∀ m, P (view m) = true` theorem. -/
 def extractViewInvPred (childStyled : Ident) : Term.TermElabM Term := do
@@ -14,15 +14,12 @@ def extractViewInvPred (childStyled : Ident) : Term.TermElabM Term := do
        inferred, write it explicitly (`<pred> for_each … using {childStyled}`)."
     PrettyPrinter.delab lhs.appFn!
 
-/-- Extract the collection expression `xs` from a goal of shape `∀ c ∈ xs, P c`. -/
-private def extractForEachColl? (tgt : Expr) : Option Expr :=
-  match tgt.consumeMData with
-  | .forallE _ _ (.forallE _ memTy _ _) _ =>
-      let memTy := memTy.consumeMData
-      if memTy.isAppOfArity ``Membership.mem 5 then
-        some memTy.getAppArgs[3]!.consumeMData
-      else none
-  | _ => none
+private def tryTac (mk : TacticM (TSyntax `tactic)) (requireClosed : Bool := false) : TacticM Bool := do
+  let saved ← saveState
+  try
+    withoutRecover <| evalTactic (← mk)
+    return !requireClosed || (← getGoals).isEmpty
+  catch _ => restoreState saved; return false
 
 private def forEachDirectTable : Array (Name × Name) := #[
   (``Array.filter, ``Qed.ForEach.forall_filter),
@@ -47,12 +44,6 @@ private def forEachElemTable : Array (Name × Name) := #[
 private def runForEachArm (childInv : Ident)
     (elemClose mapClose : TSyntax `tactic) : TacticM Unit := do
   let h := mkIdent `h; let y := mkIdent `y; let hy := mkIdent `hy; let hP := mkIdent `hP
-  let tryTac (mk : TacticM (TSyntax `tactic)) : TacticM Bool := do
-    let saved ← saveState
-    try
-      withoutRecover <| evalTactic (← mk)
-      return true
-    catch _ => restoreState saved; return false
   let mkDirect (lem : Name) := `(tactic| exact $(mkIdent lem):ident $h)
   let mkElem (lem : Name) := `(tactic| (refine $(mkIdent lem):ident $h ?_ <;> ($elemClose:tactic)))
   let mkMap := `(tactic| (refine Qed.ForEach.forall_map ?_ <;> intro $y $hy <;> have $hP:ident := $h $y $hy <;> ($mapClose:tactic)))
@@ -83,11 +74,10 @@ elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
     then pure #[← `(Lean.Parser.Tactic.simpLemma| $(⟨pred.raw⟩):ident),
                 ← `(Lean.Parser.Tactic.simpLemma| Qed.Lang.QedVal.val_id)]
     else pure #[← `(Lean.Parser.Tactic.simpLemma| Qed.Lang.QedVal.val_id)]
-  let elemClose ← if pred.raw.isIdent
-    then `(tactic| (try dsimp only) <;> (try simp only [$[$predLem],*]) <;>
-                   (try (first | omega | decide | trivial | simp_all | qedAutoClose)))
-    else `(tactic| (try dsimp only) <;> (try simp only [$[$predLem],*]) <;>
-                   (try (first | omega | decide | trivial | simp | simp_all | qedAutoClose)))
+  let elemFallback ← if pred.raw.isIdent
+    then `(tactic| first | omega | decide | trivial | simp_all | qedAutoClose)
+    else `(tactic| first | omega | decide | trivial | simp | simp_all | qedAutoClose)
+  let elemClose ← `(tactic| (try dsimp only) <;> (try simp only [$[$predLem],*]) <;> (try ($elemFallback:tactic)))
   -- Unhygienic binder names so manual `case … =>` proofs can reference `m`, `h`, `y`, `hP`.
   let m := mkIdent `m; let msg := mkIdent `msg; let h := mkIdent `h; let hP := mkIdent `hP
   let mapClose ← `(tactic|
@@ -164,18 +154,10 @@ elab "forEachStyleLift " view:ident childStyled:ident : tactic => do
   let mut rem : List MVarId := []
   for g in (← getGoals) do
     setGoals [g]
-    let saved ← saveState
-    let ok ← try withoutRecover <| evalTactic everyArm; pure (← getGoals).isEmpty catch _ => restoreState saved; pure false
-    if !ok then
-      let mut closed := false
-      for (mapListLem, mapLem) in a11yForEachLiftPairs do
-        let sA ← saveState
-        let aOk ← try
-            withoutRecover <| evalTactic (← `(tactic|
-              (rw [$(mkIdent mapListLem):ident]; intro $c _; simpa [$(mkIdent mapLem):ident] using $childStyled $c)))
-            pure (← getGoals).isEmpty
-          catch _ => restoreState sA; pure false
-        if aOk then closed := true; break
+    if !(← tryTac (pure everyArm) (requireClosed := true)) then
+      let closed ← a11yForEachLiftPairs.anyM fun (mapListLem, mapLem) =>
+        tryTac (requireClosed := true) `(tactic|
+          (rw [$(mkIdent mapListLem):ident]; intro $c _; simpa [$(mkIdent mapLem):ident] using $childStyled $c))
       unless closed do rem := rem ++ (← getGoals)
   setGoals rem
 

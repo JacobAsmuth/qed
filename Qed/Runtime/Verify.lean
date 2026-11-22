@@ -91,7 +91,7 @@ private def viewEquivHelperNames (env : Environment) : Array Name :=
   #[``V.bindAttr, ``V.dynAttr, ``V.onClick', ``V.onInput', ``V.onCheck'] ++ qedHtmlHelperNames ++
     (#[`Qed.Component.render, `Qed.localMount, `Qed.localMountWith] ++ qedForEachHelperNames).filter env.contains
 
-private def viewCoreUnfolds : Array Name := #[
+def viewCoreUnfolds : Array Name := #[
   ``View.render, ``View.renderEach, ``View.showIf, ``View.ofHtml,
   ``VAttr.eval, ``V.el, ``V.text, ``V.dyn, ``V.ifElse, ``V.showIf, ``V.static,
   ``V.dynNode, ``V.memo, ``V.render_forEach, ``View.isDyn]
@@ -109,10 +109,7 @@ private def qedUnfoldHelpers (maxIters : Nat) (allowView : Bool)
     extraLemmas (includeLCtx := includeLCtx) (tryRfl := tryRfl)
 
 private def simpAllGoalsWith (ctx : Simp.Context) (sp : Simp.SimprocsArray := #[]) : TacticM Unit := do
-  let mut rem : List MVarId := []
-  for g in (← getGoals) do
-    if let some g' ← simpGoalOnly g ctx sp then rem := rem ++ [g']
-  setGoals rem
+  setGoals <| ← (← getGoals).filterMapM (simpGoalOnly · ctx sp)
 
 private def runHtmlSimpLoop (maxIters : Nat) (ctx : Simp.Context) (sp : Simp.SimprocsArray) : TacticM Unit := do
   for _ in [0:maxIters] do
@@ -125,10 +122,8 @@ private def runHtmlSimpLoop (maxIters : Nat) (ctx : Simp.Context) (sp : Simp.Sim
     let mut afterSplit : List MVarId := []
     for g in (← getGoals) do
       match ← trySplitTarget g with
-      | some sgs =>
-          for sg in sgs do
-            if let some sg' ← simpGoalOnly sg ctx sp then afterSplit := afterSplit ++ [sg']
-      | none => afterSplit := afterSplit ++ [g]
+      | some sgs => afterSplit := afterSplit ++ (← sgs.filterMapM (simpGoalOnly · ctx sp))
+      | none     => afterSplit := afterSplit ++ [g]
     setGoals afterSplit
     if (← getGoals).isEmpty then return
     let after ← (← getGoals).mapM fun g => g.withContext do instantiateMVars (← g.getType)
@@ -682,7 +677,7 @@ private def diagnoseAttrKey (k : String) : Option String :=
   let kl := k.toLower
   if kl == "srcdoc" || kl.startsWith "on" then
     some s!"forbidden attribute `{k}` (inline event handlers and `srcdoc` are disallowed)"
-  else if ["href", "src", "action", "formaction", "poster", "cite", "data"].contains kl then
+  else if Qed.isUrlAttrName k then
     some s!"URL attribute `{k}` must use a typed `Router` route or `Url` (raw dynamic strings are disallowed)"
   else none
 
@@ -775,10 +770,7 @@ private def dehydrateProjLemmas (env0 : Environment) : Array Name :=
     `Qed.InvTarget.proj_id, `Qed.InvTarget.proj_fst].filter env0.contains
 
 private def closeGoalsByRfl : TacticM Unit := do
-  let mut rem : List MVarId := []
-  for g in (← getGoals) do
-    let s ← saveState; try g.refl catch _ => restoreState s; rem := rem ++ [g]
-  setGoals rem
+  setGoals <| ← (← getGoals).filterM fun g => return !(← tryReflGoal g)
 
 private def runProveDehydrateView : TacticM Unit := do
   evalTactic (← `(tactic| intro _qed_m))
@@ -811,8 +803,7 @@ private def tryFastFullDehydrateInv (tgt : Expr) : MetaM (Option Expr) := do
         if e.isAppOfArity `Qed.Internal.App.withFullDehydrate 4 then some e
         else match e.getAppFn.constName?, e.getAppArgs with
         | some fn, args =>
-            if [`Qed.Internal.App.withQueries, `Qed.Internal.App.withSubscriptions, `Qed.Internal.App.withStylesheets,
-                `Qed.Internal.App.withExtraStyles, `Qed.App.withHead, `Qed.App.withSsrStatus].contains fn && args.size ≥ 4 then
+            if appPassThroughWrappers.contains fn && args.size ≥ 4 then
               unwrapApp n args[args.size - 1]!
             else none
         | _, _ => none
@@ -860,10 +851,10 @@ private def runProveDehydrateInv : TacticM Unit := do
     (if (if c then true else false) = true then a else b) = (if c then a else b) := by
   by_cases hc : c <;> simp [hc]
 
-private def viewEquivBaseNames : Array Name := #[
-  ``View.render, ``View.renderEach, ``View.render_mapScope, ``View.renderEach_mapScopeEach,
-  ``View.showIf, ``View.ofHtml, ``VAttr.eval, ``V.el, ``V.text, ``V.dyn, ``V.ifElse, ``V.showIf,
-  ``V.static, ``V.dynNode, ``V.memo, ``V.canonical_render_forEach, ``SoundMemo.ofLawful, ``SoundMemo.eval,
+private def viewEquivBaseNames : Array Name :=
+  (viewCoreUnfolds.filter fun n => n != ``V.render_forEach && n != ``View.isDyn) ++ #[
+  ``View.render_mapScope, ``View.renderEach_mapScopeEach, ``V.canonical_render_forEach,
+  ``SoundMemo.ofLawful, ``SoundMemo.eval,
   ``Html.ofOption, ``Html.canonical, ``Html.canonicalList, ``Html.canonicalList_map,
   ``Attr.isSignalBind, ``Attr.isSignalBind_ite, ``Attr.canonical_ite,
   ``List.map_cons, ``List.map_nil, ``List.map_map, ``List.filterMap_cons, ``List.filterMap_nil,

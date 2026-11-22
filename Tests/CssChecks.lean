@@ -43,14 +43,11 @@ theme AppTheme:
   invariant brandReadable: contrast(brand, surface) >= 4.5
   invariant mutedReadable: contrast(muted, surface) >= 4.5
 
-#guard AppTheme.theme.definedTokens.contains "brand"
-#guard AppTheme.theme.definedTokens.contains "space-md"
-#guard AppTheme.theme.darkComplete == true
-#guard AppTheme.style.isGlobal == true
-#guard AppTheme.style.raw.contains ":root {"
-#guard AppTheme.style.raw.contains "@media (prefers-color-scheme: dark)"
-#guard AppTheme.style.raw.contains "[data-theme=\"dark\"]"
-#guard AppTheme.style.raw.contains ":where(*) { box-sizing: border-box; margin: 0; }"
+#guard ["brand", "space-md"].all AppTheme.theme.definedTokens.contains &&
+  AppTheme.theme.darkComplete && AppTheme.style.isGlobal &&
+  let css := AppTheme.style.raw
+  [":root {", "@media (prefers-color-scheme: dark)", "[data-theme=\"dark\"]",
+   ":where(*) { box-sizing: border-box; margin: 0; }"].all (css.contains ·)
 
 -- WCAG contrast checks fail at compile time with exact ratio diagnostics
 /-- error: WCAG contrast invariant `badContrast` failed in light mode: contrast(fg=#777777, bg=#ffffff) is 4.47:1, required >= 4.50:1 -/
@@ -116,20 +113,15 @@ style strictCard strict_tokens:
   margin: 0 auto
   max-width: 100%
 
--- Readable dev class names
-#guard baseBtn.className.startsWith "qed-baseBtn-"
-#guard primaryBtn.className.startsWith "qed-primaryBtn-"
--- Deterministic Option A merge: `border` overridden, `&:hover` merged recursively
-#guard primaryBtn.raw.contains "background-color: var(--brand);"
-#guard primaryBtn.raw.contains "border: 1px solid var(--brand);"
-#guard !primaryBtn.raw.contains "#d1d5db"
-#guard primaryBtn.raw.contains "&:hover { opacity: 1; transform: translateY(-1px); }"
-#guard primaryBtn.raw.contains "@media (max-width: 600px) { width: 100%; }"
--- Keyframes auto-attached to `extraRules`
-#guard primaryBtn.extraRules.any (·.contains "@keyframes fadeIn")
--- Token references tracked on Style
-#guard primaryBtn.usedTokens.contains "brand"
-#guard primaryBtn.usedTokens.contains "space-md"
+-- Readable dev class names, Option A merge, auto-attached keyframes & token tracking
+#guard baseBtn.className.startsWith "qed-baseBtn-" && primaryBtn.className.startsWith "qed-primaryBtn-" &&
+  let css := primaryBtn.raw
+  (["background-color: var(--brand);", "border: 1px solid var(--brand);",
+    "&:hover { opacity: 1; transform: translateY(-1px); }",
+    "@media (max-width: 600px) { width: 100%; }"].all (css.contains ·)) &&
+  !css.contains "#d1d5db" &&
+  primaryBtn.extraRules.any (·.contains "@keyframes fadeIn") &&
+  ["brand", "space-md"].all primaryBtn.usedTokens.contains
 
 -- Compile-time CSS validation error checks
 /-- error: unknown CSS property `border-raduis` (did you mean `border-radius`?) -/
@@ -184,11 +176,9 @@ style modernStyle:
   @media (prefers-color-scheme: dark):
     background-color: #111827
 
-#guard modernStyle.raw.contains "box-sizing: border-box;"
-#guard modernStyle.raw.contains "min-height: 100dvh;"
-#guard modernStyle.raw.contains "clamp(20rem, 50vw, 45rem)"
-#guard modernStyle.raw.contains "&:hover { opacity: 0.85; }"
-#guard modernStyle.raw.contains "@media (prefers-color-scheme: dark)"
+#guard let css := modernStyle.raw
+  ["box-sizing: border-box;", "min-height: 100dvh;", "clamp(20rem, 50vw, 45rem)",
+   "&:hover { opacity: 0.85; }", "@media (prefers-color-scheme: dark)"].all (css.contains ·)
 
 -- Extending an undeclared style fails at compile time
 /-- error: unknown style `noSuchStyle` in `extends` (declare it with `style noSuchStyle:`) -/
@@ -197,13 +187,12 @@ style badExtends extends noSuchStyle:
   color: #ffffff
 
 -- `renderThemeRule` does not wrap `@media` / `@keyframes` in `:where(...)`
-#guard !(renderThemeRule (.nest "@media (prefers-color-scheme: dark)" [color (hex "fff")])).contains ":where("
-#guard (renderThemeRule (.nest "@media (prefers-color-scheme: dark)" [color (hex "fff")])).contains "@media (prefers-color-scheme: dark)"
+#guard let r := renderThemeRule (.nest "@media (prefers-color-scheme: dark)" [color (hex "fff")])
+  !r.contains ":where(" && r.contains "@media (prefers-color-scheme: dark)"
 
 -- Safe dynamic inline styles sanitize `<`, `>`, quotes, and `/*`
-#guard !(inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]).contains "<"
-#guard !(inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]).contains "\""
-#guard !(inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]).contains "/*"
+#guard let s := inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]
+  ["<", "\"", "/*"].all (!s.contains ·)
 
 /-! ## 5. Component-Colocated `style`, `stylesheet`, Discovery & Invariants -/
 
@@ -258,13 +247,10 @@ component StyledShowcase:
     </div>
 
 -- Verify auto-discovery collected: AppTheme.style, StyledCard.wrapper, shell, pill, pillActive, progressBox
-#guard (renderStyleSheet StyledShowcase.app.styles).contains ":root {"
-#guard (renderStyleSheet StyledShowcase.app.styles).contains "@media (prefers-color-scheme: dark)"
-#guard (renderStyleSheet StyledShowcase.app.styles).contains StyledCard.wrapper.className
-#guard (renderStyleSheet StyledShowcase.app.styles).contains StyledShowcase.shell.className
-#guard (renderStyleSheet StyledShowcase.app.styles).contains StyledShowcase.pillActive.className
-#guard (renderStyleSheet StyledShowcase.app.styles).contains "border-radius: 999px;"
-#guard (renderStyleSheet StyledShowcase.app.styles).contains "padding: 0.5rem; margin-top: 1rem;"
+#guard let css := renderStyleSheet StyledShowcase.app.styles
+  [":root {", "@media (prefers-color-scheme: dark)", StyledCard.wrapper.className,
+   StyledShowcase.shell.className, StyledShowcase.pillActive.className,
+   "border-radius: 999px;", "padding: 0.5rem; margin-top: 1rem;"].all (css.contains ·)
 -- External stylesheet linked in SSR HTML `<head>`
 #guard StyledShowcase.app.stylesheets == ["/app.css"]
 #guard (renderDocument "Demo" "" (stylesheets := StyledShowcase.app.stylesheets)).contains "<link rel=\"stylesheet\" href=\"/app.css\">"

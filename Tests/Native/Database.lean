@@ -66,23 +66,15 @@ private def pgRowDescription (sampleRow : Array SqlVal) : ByteArray := Id.run do
   return pgFrame 'T' p
 
 private def pgDataRow (row : Array SqlVal) : ByteArray := Id.run do
+  let pushVal (p b : ByteArray) : ByteArray := PgWire.pushU32BE p b.size ++ b
   let mut p := PgWire.pushU16BE ByteArray.empty row.size
   for cell in row do
-    match cell with
-    | .null =>
-        p := PgWire.pushU32BE p 0xFFFFFFFF
-    | .int i =>
-        let b := (toString i).toUTF8
-        p := PgWire.pushU32BE p b.size ++ b
-    | .text s =>
-        let b := s.toUTF8
-        p := PgWire.pushU32BE p b.size ++ b
-    | .bool b =>
-        let s := if b then "t".toUTF8 else "f".toUTF8
-        p := PgWire.pushU32BE p s.size ++ s
-    | .bytes bs =>
-        let s := ("\\x" ++ Qed.Proto.encodeHex bs).toUTF8
-        p := PgWire.pushU32BE p s.size ++ s
+    p := match cell with
+      | .null     => PgWire.pushU32BE p 0xFFFFFFFF
+      | .int i    => pushVal p (toString i).toUTF8
+      | .text s   => pushVal p s.toUTF8
+      | .bool b   => pushVal p (if b then "t" else "f").toUTF8
+      | .bytes bs => pushVal p ("\\x" ++ Qed.Proto.encodeHex bs).toUTF8
   return pgFrame 'D' p
 
 /-- Translates PostgreSQL `$1, $2, ...` placeholders and `STRPOS(` into SQLite equivalents. -/
@@ -143,6 +135,7 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
 
   let readyFrame (tx? : Option UInt64) : ByteArray :=
     pgFrame 'Z' (if tx?.isSome then "T" else "I").toUTF8
+  let send (bs : ByteArray) : IO Unit := discard <| Prim.outboundWriteAll conn bs
 
   while true do
     if stage == "startup" then
@@ -153,7 +146,7 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
       buf := b2.extract len b2.size
       let code := (PgWire.readU32BE body 0).getD 0
       if code == 80877103 then
-        discard <| Prim.outboundWriteAll conn "N".toUTF8
+        send "N".toUTF8
         continue
       -- Parse StartupMessage null-terminated key/value pairs
       let kvRaw := (String.fromUTF8? (body.extract 4 body.size)).getD ""
@@ -165,7 +158,7 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
       let (gotUser, gotDb) := scanKv (kvRaw.splitOn "\x00")
       if gotUser == expectedUser && gotDb == expectedDb then
         startupOkRef.set true
-      discard <| Prim.outboundWriteAll conn (pgAuthMsg 10 ((("SCRAM-SHA-256".toUTF8).push 0).push 0))
+      send (pgAuthMsg 10 ((("SCRAM-SHA-256".toUTF8).push 0).push 0))
       stage := "scram_init"
       continue
 
@@ -182,8 +175,7 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
       let initLen := (PgWire.readI32BE payload (nul + 1)).getD 0
       let cf := (String.fromUTF8? (payload.extract (nul + 5) (nul + 5 + initLen.toNat))).getD ""
       if mech != "SCRAM-SHA-256" || !cf.startsWith "n,," then
-        discard <| Prim.outboundWriteAll conn (pgErrorResponse "unsupported SASL mechanism")
-        break
+        send (pgErrorResponse "unsupported SASL mechanism"); break
       clientFirstBare := String.ofList (cf.toList.drop 3)
       let clientNonce := match (clientFirstBare.splitOn "r=").drop 1 with
         | r :: _ => (r.splitOn ",").headD ""
@@ -191,7 +183,7 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
       let serverNonce := clientNonce ++ "qedservernonce9876"
       let saltB64 := Qed.Server.Net.base64Encode saltBytes
       serverFirst := s!"r={serverNonce},s={saltB64},i={iters}"
-      discard <| Prim.outboundWriteAll conn (pgAuthMsg 11 serverFirst.toUTF8)
+      send (pgAuthMsg 11 serverFirst.toUTF8)
       stage := "scram_final"
     else if stage == "scram_final" && tag == 'p' then
       let cf := (String.fromUTF8? payload).getD ""
@@ -205,55 +197,38 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
           let clientSig ← Prim.hmacSha256 storedKey authMsg.toUTF8
           let expectedProof := Qed.Server.Net.base64Encode (xorBytes clientKey clientSig)
           if clientProofB64 != expectedProof then
-            discard <| Prim.outboundWriteAll conn (pgErrorResponse "SCRAM-SHA-256 authentication failed")
-            break
+            send (pgErrorResponse "SCRAM-SHA-256 authentication failed"); break
           let serverSig ← Prim.hmacSha256 serverKey authMsg.toUTF8
           scramCountRef.modify (· + 1)
-          let okBundle :=
-            pgAuthMsg 12 (s!"v={Qed.Server.Net.base64Encode serverSig}").toUTF8 ++
-            pgAuthMsg 0 ++ pgReadyForQuery
-          discard <| Prim.outboundWriteAll conn okBundle
+          send (pgAuthMsg 12 (s!"v={Qed.Server.Net.base64Encode serverSig}").toUTF8 ++ pgAuthMsg 0 ++ pgReadyForQuery)
           stage := "ready"
       | _ =>
-          discard <| Prim.outboundWriteAll conn (pgErrorResponse "malformed SASLResponse")
-          break
+          send (pgErrorResponse "malformed SASLResponse"); break
     else if stage == "ready" then
       if tag == 'Q' then
         let sql := ((String.fromUTF8? (payload.extract 0 (payload.size - 1))).getD "").trimAscii.toString
         let upper := sql.toUpper
         if upper == "BEGIN" then
           match ← Prim.sqliteTxBegin sqliteFile with
-          | .ok tid =>
-              activeTxId? := some tid
-              discard <| Prim.outboundWriteAll conn (pgCommandComplete "BEGIN" ++ readyFrame activeTxId?)
-          | .error e =>
-              discard <| Prim.outboundWriteAll conn (pgErrorResponse e ++ readyFrame activeTxId?)
-        else if upper == "COMMIT" then
-          match activeTxId? with
-          | some tid =>
-              activeTxId? := none
-              match ← Prim.sqliteTxCommit tid with
-              | .ok () => discard <| Prim.outboundWriteAll conn (pgCommandComplete "COMMIT" ++ readyFrame none)
-              | .error e => discard <| Prim.outboundWriteAll conn (pgErrorResponse e ++ readyFrame none)
-          | none =>
-              discard <| Prim.outboundWriteAll conn (pgCommandComplete "COMMIT" ++ readyFrame none)
-        else if upper == "ROLLBACK" then
-          match activeTxId? with
-          | some tid =>
-              activeTxId? := none
-              Prim.sqliteTxRollback tid
-              discard <| Prim.outboundWriteAll conn (pgCommandComplete "ROLLBACK" ++ readyFrame none)
-          | none =>
-              discard <| Prim.outboundWriteAll conn (pgCommandComplete "ROLLBACK" ++ readyFrame none)
+          | .ok tid  => activeTxId? := some tid; send (pgCommandComplete "BEGIN" ++ readyFrame activeTxId?)
+          | .error e => send (pgErrorResponse e ++ readyFrame activeTxId?)
+        else if upper == "COMMIT" || upper == "ROLLBACK" then
+          let mut resp := pgCommandComplete upper
+          if let some tid := activeTxId? then
+            activeTxId? := none
+            if upper == "COMMIT" then
+              if let .error e ← Prim.sqliteTxCommit tid then resp := pgErrorResponse e
+            else Prim.sqliteTxRollback tid
+          send (resp ++ readyFrame none)
         else
           match ← Prim.sqliteDdl sqliteFile sql with
-          | .ok () => discard <| Prim.outboundWriteAll conn (pgCommandComplete "CREATE TABLE" ++ readyFrame activeTxId?)
-          | .error e => discard <| Prim.outboundWriteAll conn (pgErrorResponse e ++ readyFrame activeTxId?)
+          | .ok ()   => send (pgCommandComplete "CREATE TABLE" ++ readyFrame activeTxId?)
+          | .error e => send (pgErrorResponse e ++ readyFrame activeTxId?)
       else if tag == 'P' then
         let n1 := findZeroByte payload 0
         let n2 := findZeroByte payload (n1 + 1)
         preparedSql := (String.fromUTF8? (payload.extract (n1 + 1) n2)).getD ""
-        discard <| Prim.outboundWriteAll conn (pgFrame '1' ByteArray.empty)
+        send (pgFrame '1' ByteArray.empty)
       else if tag == 'B' then
         let o1 := findZeroByte payload 0 + 1
         let o2 := findZeroByte payload o1 + 1
@@ -273,7 +248,7 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
             ps := ps.push (.text raw)
         boundParams := ps
         parsedSqlRef.modify (·.push preparedSql)
-        discard <| Prim.outboundWriteAll conn (pgFrame '2' ByteArray.empty)
+        send (pgFrame '2' ByteArray.empty)
       else if tag == 'D' then
         pure ()
       else if tag == 'E' then
@@ -282,29 +257,25 @@ private partial def handlePgConn (conn : UInt64) (sqliteFile expectedUser expect
           | some tid => Prim.sqliteTxExec tid sqliteSql sqliteParams
           | none     => Prim.sqliteExec sqliteFile sqliteSql sqliteParams
         match execRes with
-        | .error e => discard <| Prim.outboundWriteAll conn (pgErrorResponse e)
+        | .error e => send (pgErrorResponse e)
         | .ok res =>
             let mut frames := ByteArray.empty
+            let upperSql := preparedSql.trimAscii.toString.toUpper
             if h : 0 < res.rows.size then
               frames := frames ++ pgRowDescription res.rows[0]
               for row in res.rows do
                 frames := frames ++ pgDataRow row
-            else if preparedSql.trimAscii.toString.toUpper.startsWith "SELECT COUNT" ||
-                    preparedSql.trimAscii.toString.toUpper.startsWith "SELECT SUM" ||
-                    preparedSql.trimAscii.toString.toUpper.startsWith "SELECT MIN" ||
-                    preparedSql.trimAscii.toString.toUpper.startsWith "SELECT MAX" then
+            else if ["SELECT COUNT", "SELECT SUM", "SELECT MIN", "SELECT MAX"].any (upperSql.startsWith ·) then
               frames := frames ++ pgRowDescription #[.int 0]
-            let verb := (preparedSql.trimAscii.toString.splitOn " ").headD "OK" |>.toUpper
+            let verb := (upperSql.splitOn " ").headD "OK"
             let tagStr :=
               if verb == "INSERT" then s!"INSERT 0 {res.affected}"
               else s!"{verb} {if res.rows.size > 0 then res.rows.size else res.affected}"
-            frames := frames ++ pgCommandComplete tagStr
-            discard <| Prim.outboundWriteAll conn frames
+            send (frames ++ pgCommandComplete tagStr)
       else if tag == 'S' then
-        discard <| Prim.outboundWriteAll conn (readyFrame activeTxId?)
+        send (readyFrame activeTxId?)
       else if tag == 'X' then
-        if let some tid := activeTxId? then
-          Prim.sqliteTxRollback tid
+        if let some tid := activeTxId? then Prim.sqliteTxRollback tid
         break
   if let some tid := activeTxId? then
     Prim.sqliteTxRollback tid
@@ -483,18 +454,10 @@ private def runShopDirectSuite (c : TestChecker) (label : String) (srvInst : Mon
 
   -- 7. SQLite concurrent reader pool stress test (8 parallel read tasks under WAL)
   if testConcurrentReaders then
-    let mut readTasks : Array (Task (Except IO.Error Bool)) := #[]
-    for _ in [0 : 8] do
-      let t ← IO.asTask (prio := .dedicated) do
-        match ← callShop aliceCtx "totalInventoryValue" ByteArray.empty with
-        | .ok bs => return Qed.Proto.decode (α := Nat) bs == .ok 400
-        | .error _ => return false
-      readTasks := readTasks.push t
-    let mut allOk := true
-    for t in readTasks do
-      match ← IO.wait t with
-      | .ok true => pure ()
-      | _ => allOk := false
+    let allOk ← runParallelAll 8 do
+      match ← callShop aliceCtx "totalInventoryValue" ByteArray.empty with
+      | .ok bs   => return Qed.Proto.decode (α := Nat) bs == .ok 400
+      | .error _ => return false
     c.check s!"[{label}] 8 concurrent SQLite reader-pool queries succeeded" allOk
 
 private def runMigrationSuite (c : TestChecker) (tmpDir : String) : IO Unit := do

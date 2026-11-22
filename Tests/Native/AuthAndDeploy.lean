@@ -41,14 +41,16 @@ private def testCryptoAndJwtCore (c : TestChecker) : IO Unit := do
         c.checkEq "ES256 extracted verified" u.verified true
 
       -- Wrong audience, issuer, nonce, expired, tampered, `alg: none` all rejected
-      c.check "JWT wrong audience rejected" (!(← verifyJwtWithKeys { vcfg with audience := "other_app" } #[jwk] jwt nowSec).isOk)
-      c.check "JWT wrong issuer rejected" (!(← verifyJwtWithKeys { vcfg with issuer := "https://evil.test" } #[jwk] jwt nowSec).isOk)
-      c.check "JWT wrong nonce rejected" (!(← verifyJwtWithKeys { vcfg with expectedNonce? := some "wrong" } #[jwk] jwt nowSec).isOk)
-      c.check "JWT expired token rejected" (!(← verifyJwtWithKeys vcfg #[jwk] jwt (nowSec + 10000)).isOk)
-      c.check "JWT tampered signature rejected" (!(← verifyJwtWithKeys vcfg #[jwk] (jwt ++ "A") nowSec).isOk)
       let noneHdr := base64UrlEncode "{\"alg\":\"none\",\"typ\":\"JWT\"}".toUTF8
       let nonePay := base64UrlEncode "{\"iss\":\"https://idp.test\",\"sub\":\"admin\",\"aud\":\"aud_app\",\"exp\":9999999999}".toUTF8
-      c.check "JWT alg:none rejected" (!(← verifyJwtWithKeys vcfg #[jwk] s!"{noneHdr}.{nonePay}.sig" nowSec).isOk)
+      for (lbl, cfg, tok, ts) in [
+          ("wrong audience", { vcfg with audience := "other_app" }, jwt, nowSec),
+          ("wrong issuer", { vcfg with issuer := "https://evil.test" }, jwt, nowSec),
+          ("wrong nonce", { vcfg with expectedNonce? := some "wrong" }, jwt, nowSec),
+          ("expired token", vcfg, jwt, nowSec + 10000),
+          ("tampered signature", vcfg, jwt ++ "A", nowSec),
+          ("alg:none", vcfg, s!"{noneHdr}.{nonePay}.sig", nowSec)] do
+        c.check s!"JWT {lbl} rejected" (!(← verifyJwtWithKeys cfg #[jwk] tok ts).isOk)
 
   -- 2. Base64URL round-trip & DeployManifest compile-time validation checks
   let sample := "hello+/world=123\x00\xff".toUTF8
@@ -164,13 +166,15 @@ private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit := do
           c.checkStatus "admin RPC with OIDC v2 cookie returns 200" (← authRpc "adminAction" none #[("Cookie", sessionCookie)]) 200
 
           -- 10a. Verify `onCreateAccount` + `onSignIn` fired on 1st sign-in (`logins == 1`)!
-          c.checkHttp "getProfile after 1st sign-in" (← authRpc "getProfile" none #[("Cookie", sessionCookie)]) (extra := fun r =>
-            c.expectOk "decode getProfile after 1st sign-in" (Qed.Proto.decode (α := Option AuthChecks.AuthNotesDb.profiles) r.body) fun
-              | some prof => do
-                  c.checkEq "onCreateAccount stored profile id" prof.id "usr_alice"
-                  c.checkEq "onCreateAccount stored profile email" prof.email "alice@qed.dev"
-                  c.checkEq "onCreateAccount(0) + onSignIn(+1) -> logins == 1" prof.logins 1
-              | none => c.check "profile exists after 1st sign-in" false "got none")
+          let checkProfile (tag cookie : String) (k : AuthChecks.AuthNotesDb.profiles → IO Unit) : IO Unit := do
+            c.checkHttp s!"getProfile after {tag}" (← authRpc "getProfile" none #[("Cookie", cookie)]) (extra := fun r =>
+              c.expectOk s!"decode getProfile after {tag}" (Qed.Proto.decode (α := Option AuthChecks.AuthNotesDb.profiles) r.body) fun
+                | some prof => k prof
+                | none => c.check s!"profile exists after {tag}" false "got none")
+          checkProfile "1st sign-in" sessionCookie fun prof => do
+            c.checkEq "onCreateAccount stored profile id" prof.id "usr_alice"
+            c.checkEq "onCreateAccount stored profile email" prof.email "alice@qed.dev"
+            c.checkEq "onCreateAccount(0) + onSignIn(+1) -> logins == 1" prof.logins 1
 
           -- 11. Logout via `logoutUrl` (`GET /_qed/auth/logout?returnTo=/`) redirects 302 and clears cookie!
           c.checkHttp "GET logoutUrl(/)" (← httpReq appProc.port "GET" (AuthChecks.CloudAuth.logoutUrl "/").raw #[("Cookie", sessionCookie)])
@@ -185,10 +189,8 @@ private def testOidcFlowAndDeployManifest (c : TestChecker) : IO Unit := do
           -- 11b. Second OIDC sign-in as Alice: `onCreateAccount` must NOT re-run; `onSignIn` increments `logins` to 2!
           let sessCookie2 ← doOidcLogin "2nd OIDC" "/" aliceParams
           if !sessCookie2.isEmpty then
-            c.checkHttp "getProfile after 2nd sign-in" (← authRpc "getProfile" none #[("Cookie", sessCookie2)]) (extra := fun rp2 =>
-              c.expectOk "decode getProfile after 2nd sign-in" (Qed.Proto.decode (α := Option AuthChecks.AuthNotesDb.profiles) rp2.body) fun
-                | some prof2 => c.checkEq "2nd sign-in skips onCreateAccount and increments logins == 2" prof2.logins 2
-                | none => c.check "profile exists after 2nd sign-in" false "got none")
+            checkProfile "2nd sign-in" sessCookie2 fun prof2 =>
+              c.checkEq "2nd sign-in skips onCreateAccount and increments logins == 2" prof2.logins 2
 
         -- 12. Bearer ES256 JWT mode (Firebase/Supabase/Clerk style): member rejected (403), admin allowed (200)!
         let mintBearer (sub role : String) : IO (Option String) := do

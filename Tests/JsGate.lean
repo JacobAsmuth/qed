@@ -35,6 +35,8 @@ def pairs : Array (Html Unit × Html Unit) := #[
 def diffCase (i : Nat) : String := let p := pairs.getD i (t "", t ""); Html.render (applyPatch (diff p.1 p.2) p.1)
 def pairCount : Nat := pairs.size
 
+private def strHash (init : Nat) (s : String) : Nat := s.foldl (init := init) fun acc c => (acc * 31 + c.toNat) % 1000000007
+
 def childPatchCase (i : Nat) : String :=
   let n := (#[0, 1, 32, 12000] : Array Nat).getD i 0
   let old := (Array.range n).map fun j => e "span" [] [t (toString j)]
@@ -45,8 +47,7 @@ def childPatchCase (i : Nat) : String :=
   let patched := applyChildrenTR #[t "prefix"] steps old
   let (length, checksum) := patched.foldl (init := (0, 0)) fun (length, checksum) child =>
     let rendered := Html.render child
-    (length + rendered.length,
-      rendered.foldl (init := checksum) fun acc c => (acc * 31 + c.toNat) % 1000000007)
+    (length + rendered.length, strHash checksum rendered)
   s!"{patched.size}|{length}|{checksum}"
 
 def wideRenderCase (i : Nat) : String :=
@@ -54,7 +55,7 @@ def wideRenderCase (i : Nat) : String :=
   let children : List (Html Nat) := (List.range n).map fun j =>
     .element "button" [.on "click" j, .attr "title" "<&\""] [.text s!"row {j} & < >"]
   let (html, handlers) := renderNode #[777] (.element "main" [] children)
-  let digest := html.toList.foldl (init := 0) fun acc c => (acc * 31 + c.toNat) % 1000000007
+  let digest := strHash 0 html
   let handlerDigest := handlers.foldl (init := 0) fun acc m => (acc * 31 + m) % 1000000007
   s!"{html.length}|{digest}|{handlers.size}|{handlerDigest}"
 

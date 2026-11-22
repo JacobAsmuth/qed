@@ -62,10 +62,9 @@ component HelperApp:
   action localEvent(m: LocalNested.ParentMsg): pass
   view: importedHelper({ id = 8, label = draft }).map(.localEvent)
 
-#guard (HelperApp.app.locals.map (·.id)).contains "SyntaxChecks.HelperApp"
-#guard (HelperApp.app.locals.map (·.id)).contains "SyntaxChecks.LocalNested.Widget"
-#guard (HelperApp.app.locals.map (·.id)).contains "SyntaxChecks.LocalNested.Tag"
-#guard HelperApp.app.locals.length == 3
+#guard let ids := HelperApp.app.locals.map (·.id)
+  ids.length == 3 &&
+  ["SyntaxChecks.HelperApp", "SyntaxChecks.LocalNested.Widget", "SyntaxChecks.LocalNested.Tag"].all ids.contains
 
 /-- error: `label` is a read-only `prop` and cannot be assigned (`state` fields: `count`) -/
 #guard_msgs in
@@ -102,10 +101,8 @@ def ssrEdgeCases : Html Unit :=
     <br/>
     {defaults}
   </div>
-#guard (Html.renderWith Counter.regs ssrEdgeCases).contains ".a > .b"
-#guard (Html.renderWith Counter.regs ssrEdgeCases).contains "<\\/style>"
-#guard !(Html.renderWith Counter.regs ssrEdgeCases).contains "</br>"
-#guard (Html.renderWith Counter.regs ssrEdgeCases).contains "8</button>"
+#guard let s := Html.renderWith Counter.regs ssrEdgeCases
+  [".a > .b", "<\\/style>", "8</button>"].all (s.contains ·) && !s.contains "</br>"
 
 route_enum Section:
   overview
@@ -282,9 +279,8 @@ def jsxErgonomicsView (items : Array Nat) (note? : Option String) (highlight : B
     </ul>
   </div>
 
-#guard (Html.render (jsxErgonomicsView #[1, 2] (some "ok") true)).contains "<p>ok</p>"
-#guard (Html.render (jsxErgonomicsView #[1, 2] (some "ok") true)).contains "<li>3</li><li>4</li>"
-#guard !(Html.render (jsxErgonomicsView #[] none false)).contains "<em>"
+#guard let s := Html.render (jsxErgonomicsView #[1, 2] (some "ok") true)
+  ["<p>ok</p>", "<li>3</li><li>4</li>"].all (s.contains ·) && !(Html.render (jsxErgonomicsView #[] none false)).contains "<em>"
 
 inductive FilterTab | all | tagged (tag : String) deriving DecidableEq
 structure PlainNote where
@@ -594,9 +590,8 @@ component StyleLacksGood:
     </div>
   invariant noDanger: roleLacks("submit", dangerBtnStyle), tagLacks("span", dangerBtnStyle)
 
-#guard !(renderStyleSheet [{ className := "x", raw := Item.renderList [background "red/*evil*/</style"] }]).contains "/*"
-#guard !(renderStyleSheet [{ className := "x", raw := Item.renderList [background "red/*evil*/</style"] }]).contains "<"
-#guard !(renderStyleSheet [{ className := "x", raw := Item.renderList [background "red/*evil*/</style"] }]).contains "</style"
+#guard let css := renderStyleSheet [{ className := "x", raw := Item.renderList [background "red/*evil*/</style"] }]
+  ["/*", "<", "</style"].all (!css.contains ·)
 #guard (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := 5 })).map (·.x) == some 5
 #guard (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := -1 })).isNone
 
@@ -726,13 +721,11 @@ component PythonicShowcase:
       <span>{"has-lean" if "lean" in tags and pick is not none else "none"}</span>
     </div>
 
-#guard (PythonicShowcase.update PythonicShowcase.init (.classify 5)).label == "low:5"
-#guard (PythonicShowcase.update PythonicShowcase.init (.classify 25)).label == "mid:25"
-#guard (PythonicShowcase.update PythonicShowcase.init (.classify 80)).label == "high:80"
-#guard (PythonicShowcase.update PythonicShowcase.init (.addTag "lean")).tags.size == 1
-#guard (PythonicShowcase.update PythonicShowcase.init (.addTag "qed")).label == "tags:2"
-#guard (PythonicShowcase.update PythonicShowcase.init .usePick).label == "score=4"
-#guard (PythonicShowcase.update PythonicShowcase.init (.describeTab (.tagged "ui"))).label == "tag:ui"
+#guard let upd := PythonicShowcase.update PythonicShowcase.init
+  ([(.classify 5, "low:5"), (.classify 25, "mid:25"), (.classify 80, "high:80"),
+    (.addTag "qed", "tags:2"), (.usePick, "score=4"), (.describeTab (.tagged "ui"), "tag:ui")].all
+      fun (m, want) => (upd m).label == want) &&
+  (upd (.addTag "lean")).tags.size == 1
 #guard (Html.render (PythonicShowcase.view PythonicShowcase.init)).contains "has-lean"
 #guard Json.pathStr "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}" "choices.0.delta.content" == "hi"
 #guard Json.pathStr "{\"choices\":[]}" "choices.0.delta.content" == ""

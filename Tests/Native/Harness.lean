@@ -38,12 +38,8 @@ def TestChecker.check (c : TestChecker) (label : String) (ok : Bool) (detail : S
     IO.eprintln s!"  FAIL  {label}{extra}"
 
 def TestChecker.checkEq {α : Type} [BEq α] [Repr α] (c : TestChecker) (label : String)
-    (got want : α) : IO Unit := do
-  if got == want then
-    c.state.modify fun (p, f) => (p + 1, f)
-  else
-    c.state.modify fun (p, f) => (p, f + 1)
-    IO.eprintln s!"  FAIL  {label}: got {reprStr got}, want {reprStr want}"
+    (got want : α) : IO Unit :=
+  c.check label (got == want) s!"got {reprStr got}, want {reprStr want}"
 
 class ErrMsg (ε : Type) where
   errMsg : ε → String
@@ -72,13 +68,11 @@ def runCmd (cmd : String) (args : Array String) (cwd : Option FilePath := none)
   let out ← IO.Process.output { cmd, args, cwd, env }
   return (out.exitCode, out.stdout, out.stderr)
 
-def qedBinPath : IO String := do
-  let cwd ← IO.currentDir
-  return (cwd / ".lake" / "build" / "bin" / "qed").toString
+private def buildBinPath (name : String) : IO String := do
+  return ((← IO.currentDir) / ".lake" / "build" / "bin" / name).toString
 
-def qedjsBinPath : IO String := do
-  let cwd ← IO.currentDir
-  return (cwd / ".lake" / "build" / "bin" / "qedjs").toString
+def qedBinPath : IO String := buildBinPath "qed"
+def qedjsBinPath : IO String := buildBinPath "qedjs"
 
 def getLeanPath : IO String := do
   if let some lp ← IO.getEnv "LEAN_PATH" then
@@ -126,16 +120,17 @@ def signExpiringSessionToken (secret userId : String) (expSec : Nat) : IO String
   let mac ← Prim.hmacSha256 secret.toUTF8 payload.toUTF8
   return s!"{payload}.{Qed.Proto.encodeHex mac}"
 
-def findSubBytes (hay needle : ByteArray) (start : Nat := 0) : Option Nat := Id.run do
-  if needle.size == 0 || start + needle.size > hay.size then return none
-  for i in [start : hay.size - needle.size + 1] do
-    let mut matched := true
-    for j in [0 : needle.size] do
-      if hay[i + j]! != needle[j]! then
-        matched := false
-        break
-    if matched then return some i
-  return none
+/-- Reads from `handle` until `\r\n\r\n` is buffered, returning `(buf, hdrEnd)`. -/
+def readHeadUntilCrlfCrlf (handle : UInt64) (maxReads : Nat := 64) : IO (Option (ByteArray × Nat)) := do
+  let mut buf := ByteArray.empty
+  for _ in [0 : maxReads] do
+    if let some idx := Net.findCrlfCrlf buf then return some (buf, idx)
+    match ← Prim.outboundReadSome handle 16384 with
+    | .error _ => return none
+    | .ok chunk =>
+        if chunk.size == 0 then return none
+        buf := buf ++ chunk
+  return (Net.findCrlfCrlf buf).map (buf, ·)
 
 /-- Reads from `handle` into `buf` until at least `n` bytes are buffered (or EOF/error returns `none`). -/
 partial def readExact (handle : UInt64) (buf : ByteArray) (n : Nat) : IO (Option ByteArray) := do
@@ -209,21 +204,9 @@ def HttpResp.check (r : HttpResp) (c : TestChecker) (label : String)
 
 /-- Parses a raw HTTP/1.x response (`Connection: close` framing). -/
 def parseHttpResp (raw : ByteArray) : Except String HttpResp := do
-  let sep := "\r\n\r\n".toUTF8
-  let some hdrEnd := findSubBytes raw sep
-    | .error "missing CRLFCRLF in HTTP response"
-  let headStr := (String.fromUTF8? (raw.extract 0 hdrEnd)).getD ""
-  let body := raw.extract (hdrEnd + 4) raw.size
-  let lines := headStr.splitOn "\r\n"
-  let statusLine := lines.headD ""
-  let parts := statusLine.splitOn " "
-  let status := (parts.getD 1 "0").toNat?.getD 0
-  let mut hdrs : Array (String × String) := #[]
-  for l in lines.drop 1 do
-    match l.splitOn ":" with
-    | k :: rest => hdrs := hdrs.push (k.trimAscii.toString, (String.intercalate ":" rest).trimAscii.toString)
-    | _ => pure ()
-  return { status, headers := hdrs, body }
+  let some hdrEnd := Net.findCrlfCrlf raw | .error "missing CRLFCRLF in HTTP response"
+  let head ← Net.parseHttpResponseHead (raw.extract 0 hdrEnd)
+  return { status := head.status, headers := head.headers, body := raw.extract (hdrEnd + 4) raw.size }
 
 /-- Performs a loopback HTTP/1.1 request with `Connection: close`. -/
 def httpReq (port : UInt16) (method path : String)
@@ -356,12 +339,6 @@ def startNativeBin (bin : String) (args : Array String) (port : UInt16)
   let ok ← waitHealth port
   return (proc, ok)
 
-def startNativeServer (dir : String) (extraEnv : Array (String × Option String) := #[])
-    (dev : Bool := true) : IO (NativeServerProc × Bool) := do
-  let port ← Prim.freePort
-  let args := #[dir, toString port] ++ (if dev then #["--dev"] else #[])
-  startNativeBin (dir ++ "/server") args port extraEnv
-
 def withNativeBin (c : TestChecker) (label bin : String) (args : Array String) (port : UInt16)
     (extraEnv : Array (String × Option String) := #[]) (k : NativeServerProc → IO Unit) : IO Unit := do
   let (srv, ok) ← startNativeBin bin args port extraEnv
@@ -374,48 +351,21 @@ def withNativeBin (c : TestChecker) (label bin : String) (args : Array String) (
 def withNativeServer (c : TestChecker) (label dir : String)
     (extraEnv : Array (String × Option String) := #[]) (dev : Bool := true)
     (k : NativeServerProc → IO Unit) : IO Unit := do
-  let (srv, ok) ← startNativeServer dir extraEnv dev
-  try
-    c.check label ok
-    if ok then k srv
-  finally
-    srv.stop
+  let port ← Prim.freePort
+  let args := #[dir, toString port] ++ (if dev then #["--dev"] else #[])
+  withNativeBin c label (dir ++ "/server") args port extraEnv k
 
 def withMockServer {α : Type} (c : TestChecker) (label : String)
     (start : IO (Except String α)) (stop : α → IO Unit) (k : α → IO Unit) : IO Unit := do
   c.expectOk label (← start) fun m => try k m finally stop m
 
 /-- Reads one HTTP/1.1 request (headers + `Content-Length` body) from an accepted socket handle. -/
-partial def readOneHttpReq (handle : UInt64) : IO (Option (String × String × Array (String × String) × ByteArray)) := do
-  let sep := "\r\n\r\n".toUTF8
-  let rec readHead (buf : ByteArray) : IO (Option (ByteArray × Nat)) := do
-    if let some idx := findSubBytes buf sep then
-      return some (buf, idx)
-    match ← Prim.outboundReadSome handle 16384 with
-    | .error _ => return none
-    | .ok chunk =>
-        if chunk.size == 0 then return none
-        readHead (buf ++ chunk)
-  let some (buf, hdrEnd) ← readHead ByteArray.empty | return none
-  let headStr := (String.fromUTF8? (buf.extract 0 hdrEnd)).getD ""
-  let lines := headStr.splitOn "\r\n"
-  let reqLine := (lines.headD "").splitOn " "
-  let method := reqLine.getD 0 ""
-  let target := reqLine.getD 1 "/"
-  let mut hdrs : Array (String × String) := #[]
-  let mut contentLen : Nat := 0
-  for l in lines.drop 1 do
-    match l.splitOn ":" with
-    | k :: rest =>
-        let kn := k.trimAscii.toString
-        let kv := (String.intercalate ":" rest).trimAscii.toString
-        hdrs := hdrs.push (kn, kv)
-        if kn.toLower == "content-length" then
-          contentLen := kv.toNat?.getD 0
-    | _ => pure ()
+def readOneHttpReq (handle : UInt64) : IO (Option (String × String × Array (String × String) × ByteArray)) := do
+  let some (buf, hdrEnd) ← readHeadUntilCrlfCrlf handle | return none
+  let .ok h := Http.parseRequestHead (buf.extract 0 hdrEnd) | return none
   let initBody := buf.extract (hdrEnd + 4) buf.size
-  let body := (← readExact handle initBody contentLen).getD initBody
-  return some (method, target, hdrs, body.extract 0 contentLen)
+  let body := (← readExact handle initBody h.contentLen).getD initBody
+  return some (h.method, h.target, h.headers, body.extract 0 h.contentLen)
 
 /-- Starts a loopback TCP mock server on an ephemeral port, returning `(port, stop)`. -/
 def startMockTcpServer (onConn : UInt64 → IO Unit) (concurrent : Bool := false) :
@@ -458,5 +408,15 @@ def rmRf (path : String) : IO Unit := do
 def withTempDir {α : Type} (prefixStr : String) (k : String → IO α) : IO α := do
   let dir ← makeTempDir prefixStr
   try k dir finally rmRf dir
+
+/-- Runs `n` dedicated concurrent IO tasks and returns `true` iff every task returns `true`. -/
+def runParallelAll (n : Nat) (f : IO Bool) : IO Bool := do
+  let mut tasks : Array (Task (Except IO.Error Bool)) := #[]
+  for _ in [0 : n] do
+    tasks := tasks.push (← IO.asTask (prio := .dedicated) f)
+  let mut allOk := true
+  for t in tasks do
+    if (← IO.wait t).toOption != some true then allOk := false
+  return allOk
 
 end Tests.Native

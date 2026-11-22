@@ -197,13 +197,8 @@ component PhotoGallery:
 
 -- Confirm `htmlHasLang` positive case
 example : Qed.htmlHasLang (el "html" [attr "lang" "en"] [el "body" [] ["Hello"]] : Html Unit) = true := rfl
-example : Qed.a11yValid ((el "div" [] [el "img" [alt "Ok"] []] : Html Nat).map (· + 1)) = true := by
-  simp [Html.a11yValid_map, Html.a11yValid, Html.imgsHaveAlt, Html.imgsHaveAltList,
-    Html.buttonsAccessible, Html.buttonsAccessibleList, Html.validAriaRoles, Html.validAriaRolesList,
-    Html.labelsAssociated, Html.labelsAssociatedList, Html.noDuplicateIds, Html.collectIds,
-    Html.collectIdsList, Html.headingsOrdered, Html.collectHeadings, Html.collectHeadingsList,
-    Html.htmlHasLang, Html.htmlHasLangList, attrsValidAriaRoles, hasAttr, attrValue,
-    listNoDups, headingLevelsOrderedFrom, headingLevel?, el, alt]
+example : Qed.a11yValid ((el "div" [] [el "img" [alt "Ok"] []] : Html Nat).map (· + 1)) = true :=
+  (Html.a11yValid_map _ _).trans rfl
 
 -- Negative A11y checks (each rule rejects bad markup at compile time)
 /--

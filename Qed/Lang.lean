@@ -730,7 +730,6 @@ structure LowerHooks (m : Type → Type) where
   lowerCall        : Syntax → Syntax → Array Syntax → ExprMode → (ExprMode → Syntax → m Term) → m (Option Term)
   lowerUnwrap      : Syntax → Syntax → ExprMode → m Term
   lowerAwait       : Syntax → Syntax → ExprMode → m Term
-  lowerFieldSetter : Syntax → Ident → m Term
   lowerJsx         : Syntax → ExprMode → m Term
   lowerArrElem     : Term → m Term
   wrapNamedField   : Term → m Term
@@ -755,7 +754,6 @@ def LowerHooks.mkDefault {m : Type → Type} [Monad m] [MonadQuotation m]
   lowerCall        := fun _ _ _ _ _ => pure none
   lowerUnwrap      := fun ref _ _ => throwErr ref "operator `?` is only supported inside `server` functions with a fallible (`T!`) or optional (`T?`) return type"
   lowerAwait       := fun ref _ _ => throwErr ref "`await` is only supported in statements (`let x = await ...` or `field = await ...`)"
-  lowerFieldSetter := fun ref fid => throwErr ref s!"`({fid.getId} = _)` is a component field setter and can only be used inside a `component`"
   lowerJsx         := fun ref _ =>
     if ref.getKind.toString.contains "Jsx" then
       throwErr ref "JSX elements are only allowed inside view expressions"
@@ -927,7 +925,7 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
         let fVals ← fields.mapM fun f => do hooks.wrapNamedField (← go .val (f.getArg 2))
         if (stx.getArg 1).getNumArgs == 2 then `({ $(← go .val ((stx.getArg 1).getArg 0)) with $[$fIds:ident := $fVals:term],* })
         else if fIds.isEmpty then `({}) else `({ $[$fIds:ident := $fVals:term],* })
-      | "qedFieldSetter" => hooks.lowerFieldSetter stx ⟨(stx.getArg 1)⟩
+      | "qedFieldSetter" => hooks.throwErr stx s!"`({(stx.getArg 1).getId} = _)` is a component field setter and can only be used inside a `component`"
       | "qedTypeAscr" => `(($(← go mode (stx.getArg 1)) : $(← hooks.lowerType (stx.getArg 3))))
       | "qedParen" =>
         let elems := (stx.getArg 1).getSepArgs

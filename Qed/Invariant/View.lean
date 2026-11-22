@@ -140,7 +140,7 @@ private def styleReduceCoreNames : Array Name := #[
   ``Qed.Html.imgsHaveAlt_map, ``Qed.Html.buttonsAccessible_map, ``Qed.Html.validAriaRoles_map,
   ``Qed.Html.labelsAssociated_map, ``Qed.Html.noDuplicateIds_map, ``Qed.Html.headingsOrdered_map,
   ``Qed.Html.htmlHasLang_map, ``Qed.Html.a11yValid_map,
-  ``Qed.Html.map, ``Qed.Html.mapChildren, ``Qed.Attr.map,
+  ``Qed.Html.map, ``Qed.Html.mapChildren, ``Qed.Html.mapAttrs, ``Qed.Html.mapAttrsList, ``Qed.Attr.map,
   ``Qed.Lang.QedVal.val_id, ``Qed.Lang.QedSeqLit.ofList_array, ``Qed.Lang.QedSeqLit.ofList_list,
   ``Qed.Lang.QedMem.mem_array, ``Qed.Lang.QedMem.mem_list, ``Qed.Lang.QedMem.mem_string,
   ``Qed.Lang.QedMemProp.memProp_array, ``Qed.Lang.QedMemProp.memProp_list, ``Qed.Lang.QedMemProp.memProp_string

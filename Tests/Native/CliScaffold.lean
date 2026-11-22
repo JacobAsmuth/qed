@@ -41,12 +41,9 @@ def run : IO Bool := do
     let manifestRaw ← IO.FS.readFile (distDir / "qed_manifest.json")
     let hostPath := Qed.Json.pathStr manifestRaw "host"
     let appPath  := Qed.Json.pathStr manifestRaw "app"
-    let rtPath   := Qed.Json.pathStr manifestRaw "rt"
-    let domPath  := Qed.Json.pathStr manifestRaw "dom"
-    c.check "manifest host hashed" (isHashedMjs "qed_host" hostPath) hostPath
-    c.check "manifest app hashed" (isHashedMjs "app" appPath) appPath
-    c.check "manifest rt hashed" (isHashedMjs "qed_rt" rtPath) rtPath
-    c.check "manifest dom hashed" (isHashedMjs "qed_dom" domPath) domPath
+    for (key, pfx, p) in [("host", "qed_host", hostPath), ("app", "app", appPath),
+        ("rt", "qed_rt", Qed.Json.pathStr manifestRaw "rt"), ("dom", "qed_dom", Qed.Json.pathStr manifestRaw "dom")] do
+      c.check s!"manifest {key} hashed" (isHashedMjs pfx p) p
     c.check "unhashed dist/app.mjs removed" (!(← (distDir / "app.mjs").pathExists))
     c.check "dev client qed_dev.mjs omitted from prod dist" (!(← (distDir / "qed_dev.mjs").pathExists))
     c.check "native dist/server binary built" (← (distDir / "server").pathExists)
@@ -160,12 +157,12 @@ def run : IO Bool := do
           IO.FS.writeFile path content
           return (← IO.wait t).toOption.getD { lean := false, css := false, runtime := false, error := true }
 
-        let evLean ← waitWatchEdit (watchRoot / "Demo.lean") "def x := 2\n"
-        c.check "OS watcher detects .lean modification" (evLean.lean && !evLean.error) (reprStr evLean)
-        let evCss ← waitWatchEdit (watchRoot / "site.css") "body{color:red}\n"
-        c.check "OS watcher detects .css modification" (evCss.css && !evCss.error) (reprStr evCss)
-        let evRt ← waitWatchEdit (watchRt / "qed_dev.mjs") "// v2\n"
-        c.check "OS watcher detects runtime .mjs modification" (evRt.runtime && !evRt.error) (reprStr evRt)
+        for (label, path, content, proj) in [
+            (".lean", watchRoot / "Demo.lean", "def x := 2\n", fun (e : WatchEvents) => e.lean),
+            (".css", watchRoot / "site.css", "body{color:red}\n", fun e => e.css),
+            ("runtime .mjs", watchRt / "qed_dev.mjs", "// v2\n", fun e => e.runtime)] do
+          let ev ← waitWatchEdit path content
+          c.check s!"OS watcher detects {label} modification" (proj ev && !ev.error) (reprStr ev)
       finally
         w.close
 
@@ -219,20 +216,16 @@ def run : IO Bool := do
        "def my_handler (n : Nat) : Nat := n\n" ++
        "def my_step (n : Nat) : Nat := n\n" ++
        "def admitted_sorry_msg : String := \"We are sorry, please admit this item\"\n")
-    IO.FS.writeFile appLean withBenign
-    let (cBenign, outBenign, errBenign) ← runCmd cli #["check"] (cwd := some (FilePath.mk appDir)) (env := cleanEnv)
-    c.check "benign comments/strings/client helpers pass qed check" (cBenign == 0) (outBenign ++ errBenign)
-
-    IO.FS.writeFile appLean (validSrc ++ "\ndef badInterp : String := s!\"{(by sorry : Nat)}\" -- never emit\n")
-    let (cSorry, outSorry, errSorry) ← runCmd cli #["check"] (cwd := some (FilePath.mk appDir)) (env := cleanEnv)
-    c.check "real sorry inside interpolated string rejected"
-      (cSorry != 0 && (outSorry ++ errSorry).contains "forbidden token `sorry`") (outSorry ++ errSorry)
-
-    IO.FS.writeFile appLean (validSrc ++ "\npartial def spin (n : Nat) : Nat := spin n\n")
-    let (cPart, outPart, errPart) ← runCmd cli #["check"] (cwd := some (FilePath.mk appDir)) (env := cleanEnv)
-    c.check "partial def rejected by kernel gate"
-      (cPart != 0 && (outPart ++ errPart).contains "kernel gate: `partial` or `opaque` declaration `spin`")
-      (outPart ++ errPart)
+    for (label, src, wantOk, wantSub) in [
+        ("benign comments/strings/client helpers pass qed check", withBenign, true, ""),
+        ("real sorry inside interpolated string rejected",
+          validSrc ++ "\ndef badInterp : String := s!\"{(by sorry : Nat)}\" -- never emit\n", false, "forbidden token `sorry`"),
+        ("partial def rejected by kernel gate",
+          validSrc ++ "\npartial def spin (n : Nat) : Nat := spin n\n", false, "kernel gate: `partial` or `opaque` declaration `spin`")] do
+      IO.FS.writeFile appLean src
+      let (code, out, err) ← runCmd cli #["check"] (cwd := some (FilePath.mk appDir)) (env := cleanEnv)
+      let combined := out ++ err
+      c.check label ((code == 0) == wantOk && (wantSub.isEmpty || combined.contains wantSub)) combined
   c.finish
 
 end Tests.Native.CliScaffold

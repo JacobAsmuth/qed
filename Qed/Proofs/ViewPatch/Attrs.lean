@@ -146,16 +146,16 @@ mutual
         simp only [Html.DomClean, Bool.and_eq_true] at hc
         rcases hc with ⟨⟨hownT, hA⟩, hCs⟩
         have hown : ownsChildren attrs = false := by simpa using hownT
-        rw [Html.prefixSignals, map_prefixSignal_of_clean pfx attrs hown hA,
-          Html.prefixSignalsList_of_DomClean pfx hCs]
+        change Html.element tag (attrs.map (Attr.prefixSignal pfx)) (Html.prefixSignalsList pfx cs) = _
+        rw [map_prefixSignal_of_clean pfx attrs hown hA, Html.prefixSignalsList_of_DomClean pfx hCs]
 
   theorem Html.prefixSignalsList_of_DomClean {msg : Type} (pfx : String) :
       ∀ {hs : List (Html msg)}, Html.DomCleanList hs = true → Html.prefixSignalsList pfx hs = hs
     | [], _ => rfl
     | c :: cs, hc => by
         simp only [Html.DomCleanList, Bool.and_eq_true] at hc
-        rw [Html.prefixSignalsList, Html.prefixSignals_of_DomClean pfx hc.1,
-          Html.prefixSignalsList_of_DomClean pfx hc.2]
+        change Html.prefixSignals pfx c :: Html.prefixSignalsList pfx cs = _
+        rw [Html.prefixSignals_of_DomClean pfx hc.1, Html.prefixSignalsList_of_DomClean pfx hc.2]
 end
 
 theorem Html.map_prefixSignals_of_DomCleanList {msg : Type} (pfx : String) :

@@ -225,13 +225,16 @@ def Attr.map (f : α → β) : Attr α → Attr β
   | .signalOn n e m      => .signalOn n e (f m)
 
 mutual
-  def Html.map (f : α → β) : Html α → Html β
+  def Html.mapAttrs (f : Attr α → Attr β) : Html α → Html β
     | .text s => .text s
-    | .element tag attrs children => .element tag (attrs.map (Attr.map f)) (Html.mapChildren f children)
-  def Html.mapChildren (f : α → β) : List (Html α) → List (Html β)
+    | .element tag attrs children => .element tag (attrs.map f) (Html.mapAttrsList f children)
+  def Html.mapAttrsList (f : Attr α → Attr β) : List (Html α) → List (Html β)
     | []      => []
-    | c :: cs => Html.map f c :: Html.mapChildren f cs
+    | c :: cs => Html.mapAttrs f c :: Html.mapAttrsList f cs
 end
+
+def Html.map (f : α → β) : Html α → Html β := Html.mapAttrs (Attr.map f)
+def Html.mapChildren (f : α → β) : List (Html α) → List (Html β) := Html.mapAttrsList (Attr.map f)
 
 def Attr.prefixSignal (pfx : String) : Attr msg → Attr msg
   | .signalBind n     => .signalBind (pfx ++ n)
@@ -239,14 +242,8 @@ def Attr.prefixSignal (pfx : String) : Attr msg → Attr msg
   | .signalOn n e m   => .signalOn (pfx ++ n) e m
   | other             => other
 
-mutual
-  def Html.prefixSignals (pfx : String) : Html msg → Html msg
-    | .text s => .text s
-    | .element tag attrs children => .element tag (attrs.map (Attr.prefixSignal pfx)) (Html.prefixSignalsList pfx children)
-  def Html.prefixSignalsList (pfx : String) : List (Html msg) → List (Html msg)
-    | []      => []
-    | c :: cs => Html.prefixSignals pfx c :: Html.prefixSignalsList pfx cs
-end
+def Html.prefixSignals (pfx : String) : Html msg → Html msg := Html.mapAttrs (Attr.prefixSignal pfx)
+def Html.prefixSignalsList (pfx : String) : List (Html msg) → List (Html msg) := Html.mapAttrsList (Attr.prefixSignal pfx)
 
 @[inline] def isKeyChar (c : Char) : Bool :=
   c.isAlphanum || c == '-' || c == '_' || c == ':' || c == '.'
@@ -518,66 +515,46 @@ private theorem Attr.hasLocalCell_eq_any (as : List (Attr msg)) : Attr.hasLocalC
 @[simp] theorem Attr.hasLocalCell_prefixSignal (pfx : String) (as : List (Attr msg)) :
     Attr.hasLocalCell (as.map (Attr.prefixSignal pfx)) = Attr.hasLocalCell as := by simp [Attr.hasLocalCell_eq_any, Function.comp_def]
 
-@[simp] theorem Html.mapChildren_isEmpty {α β : Type} (f : α → β) (cs : List (Html α)) :
-    (Html.mapChildren f cs).isEmpty = cs.isEmpty := by cases cs <;> rfl
-
-@[simp] theorem Html.prefixSignalsList_isEmpty (pfx : String) (cs : List (Html msg)) :
-    (Html.prefixSignalsList pfx cs).isEmpty = cs.isEmpty := by cases cs <;> rfl
+@[simp] theorem Html.mapAttrsList_isEmpty {α β : Type} (f : Attr α → Attr β) (cs : List (Html α)) :
+    (Html.mapAttrsList f cs).isEmpty = cs.isEmpty := by cases cs <;> rfl
 
 mutual
-  private theorem htmlValidIn_map_of {α β : Type} (ctx : HtmlCtx) (f : Attr α → Attr β)
-      (M : Html α → Html β) (ML : List (Html α) → List (Html β))
-      (hT : ∀ s, M (.text s) = .text s) (hE : ∀ t a cs, M (.element t a cs) = .element t (a.map f) (ML cs))
-      (hN : ML [] = []) (hC : ∀ c cs, ML (c :: cs) = M c :: ML cs)
-      (hEmp : ∀ cs, (ML cs).isEmpty = cs.isEmpty)
+  private theorem htmlValidIn_mapAttrs {α β : Type} (ctx : HtmlCtx) (f : Attr α → Attr β)
       (hv : ∀ a, (f a).valid = a.valid) (hl : ∀ a, (f a).isLocalCell = a.isLocalCell) :
-      (h : Html α) → Html.validIn ctx (M h) = Html.validIn ctx h
-    | .text s => by rw [hT]; rfl
+      (h : Html α) → Html.validIn ctx (Html.mapAttrs f h) = Html.validIn ctx h
+    | .text _ => rfl
     | .element tag attrs children => by
         have hvl : Attr.validList (attrs.map f) = Attr.validList attrs := by simp [Attr.validList_eq_all, Function.comp_def, hv]
         have hlc : Attr.hasLocalCell (attrs.map f) = Attr.hasLocalCell attrs := by simp [Attr.hasLocalCell_eq_any, Function.comp_def, hl]
-        simp only [hE, Html.validIn, hvl, hlc, hEmp]
+        simp only [Html.mapAttrs, Html.validIn, hvl, hlc, Html.mapAttrsList_isEmpty]
         cases stepHtmlCtx ctx tag with
         | none => rfl
-        | some childCtx => exact congrArg (_ && ·) (htmlValidListIn_map_of childCtx f M ML hT hE hN hC hEmp hv hl children)
+        | some childCtx => exact congrArg (_ && ·) (htmlValidListIn_mapAttrs childCtx f hv hl children)
 
-  private theorem htmlValidListIn_map_of {α β : Type} (ctx : HtmlCtx) (f : Attr α → Attr β)
-      (M : Html α → Html β) (ML : List (Html α) → List (Html β))
-      (hT : ∀ s, M (.text s) = .text s) (hE : ∀ t a cs, M (.element t a cs) = .element t (a.map f) (ML cs))
-      (hN : ML [] = []) (hC : ∀ c cs, ML (c :: cs) = M c :: ML cs)
-      (hEmp : ∀ cs, (ML cs).isEmpty = cs.isEmpty)
+  private theorem htmlValidListIn_mapAttrs {α β : Type} (ctx : HtmlCtx) (f : Attr α → Attr β)
       (hv : ∀ a, (f a).valid = a.valid) (hl : ∀ a, (f a).isLocalCell = a.isLocalCell) :
-      (cs : List (Html α)) → Html.validListIn ctx (ML cs) = Html.validListIn ctx cs
-    | [] => by rw [hN]; rfl
+      (cs : List (Html α)) → Html.validListIn ctx (Html.mapAttrsList f cs) = Html.validListIn ctx cs
+    | [] => rfl
     | c :: cs => by
-        simp only [hC, Html.validListIn,
-          htmlValidIn_map_of ctx f M ML hT hE hN hC hEmp hv hl c,
-          htmlValidListIn_map_of ctx f M ML hT hE hN hC hEmp hv hl cs]
+        simp only [Html.mapAttrsList, Html.validListIn,
+          htmlValidIn_mapAttrs ctx f hv hl c, htmlValidListIn_mapAttrs ctx f hv hl cs]
 end
 
 @[simp] theorem Html.validIn_map {α β : Type} (ctx : HtmlCtx) (f : α → β) (h : Html α) :
     Html.validIn ctx (h.map f) = Html.validIn ctx h :=
-  htmlValidIn_map_of ctx (Attr.map f) (Html.map f) (Html.mapChildren f)
-    (fun _ => rfl) (fun _ _ _ => rfl) rfl (fun _ _ => rfl) (Html.mapChildren_isEmpty f)
-    (Attr.valid_map f) (Attr.isLocalCell_map f) h
+  htmlValidIn_mapAttrs ctx (Attr.map f) (Attr.valid_map f) (Attr.isLocalCell_map f) h
 
 @[simp] theorem Html.validListIn_mapChildren {α β : Type} (ctx : HtmlCtx) (f : α → β) (cs : List (Html α)) :
     Html.validListIn ctx (Html.mapChildren f cs) = Html.validListIn ctx cs :=
-  htmlValidListIn_map_of ctx (Attr.map f) (Html.map f) (Html.mapChildren f)
-    (fun _ => rfl) (fun _ _ _ => rfl) rfl (fun _ _ => rfl) (Html.mapChildren_isEmpty f)
-    (Attr.valid_map f) (Attr.isLocalCell_map f) cs
+  htmlValidListIn_mapAttrs ctx (Attr.map f) (Attr.valid_map f) (Attr.isLocalCell_map f) cs
 
 @[simp] theorem Html.validIn_prefixSignals (ctx : HtmlCtx) (pfx : String) (h : Html msg) :
     Html.validIn ctx (h.prefixSignals pfx) = Html.validIn ctx h :=
-  htmlValidIn_map_of ctx (Attr.prefixSignal pfx) (Html.prefixSignals pfx) (Html.prefixSignalsList pfx)
-    (fun _ => rfl) (fun _ _ _ => rfl) rfl (fun _ _ => rfl) (Html.prefixSignalsList_isEmpty pfx)
-    (Attr.valid_prefixSignal pfx) (Attr.isLocalCell_prefixSignal pfx) h
+  htmlValidIn_mapAttrs ctx (Attr.prefixSignal pfx) (Attr.valid_prefixSignal pfx) (Attr.isLocalCell_prefixSignal pfx) h
 
 @[simp] theorem Html.validListIn_prefixSignalsList (ctx : HtmlCtx) (pfx : String) (cs : List (Html msg)) :
     Html.validListIn ctx (Html.prefixSignalsList pfx cs) = Html.validListIn ctx cs :=
-  htmlValidListIn_map_of ctx (Attr.prefixSignal pfx) (Html.prefixSignals pfx) (Html.prefixSignalsList pfx)
-    (fun _ => rfl) (fun _ _ _ => rfl) rfl (fun _ _ => rfl) (Html.prefixSignalsList_isEmpty pfx)
-    (Attr.valid_prefixSignal pfx) (Attr.isLocalCell_prefixSignal pfx) cs
+  htmlValidListIn_mapAttrs ctx (Attr.prefixSignal pfx) (Attr.valid_prefixSignal pfx) (Attr.isLocalCell_prefixSignal pfx) cs
 
 @[simp] theorem Html.validListIn_nil (ctx : HtmlCtx) : Html.validListIn ctx ([] : List (Html msg)) = true := rfl
 @[simp] theorem Html.validListIn_cons (ctx : HtmlCtx) (c : Html msg) (cs : List (Html msg)) :

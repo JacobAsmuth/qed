@@ -270,14 +270,10 @@ def run : IO Bool := do
       c.checkStatus "order succeeds via catch fallback on D1 500" (← postRpc "order" (orderReq 0 1) (some validTok)) 200
       mockRef.modify fun s => { s with failD1 := false }
 
-      let mut tasks : Array (Task (Except IO.Error (Except String HttpResp))) := #[]
-      for _ in [0 : 8] do
-        tasks := tasks.push (← IO.asTask (prio := .dedicated) (postRpc "order" (orderReq 0 1) (some validTok)))
-      let mut all200 := true
-      for t in tasks do
-        match ← IO.wait t with
-        | .ok (.ok r) => if r.status != 200 then all200 := false
-        | _ => all200 := false
+      let all200 ← runParallelAll 8 do
+        match ← postRpc "order" (orderReq 0 1) (some validTok) with
+        | .ok r => return r.status == 200
+        | .error _ => return false
       c.check "all 8 concurrent orders returned 200" all200
       c.checkEq "Cloudflare D1 received all 9 order queries" (← mockRef.get).d1Count 9
 
@@ -304,13 +300,10 @@ def run : IO Bool := do
       ("QED_WORKERS", some "2"), ("QED_RATE_LIMIT_RPS", some "1"),
       ("QED_RATE_LIMIT_BURST", some "2"), ("QED_CSP", some "default-src 'none'")
     ]) (dev := true) fun srvRl => do
-      let r1 ← httpReq srvRl.port "GET" "/"
-      let r2 ← httpReq srvRl.port "GET" "/"
-      let r3 ← httpReq srvRl.port "GET" "/"
-      let r4 ← httpReq srvRl.port "GET" "/"
-      c.checkHttp "rate-limit req 1" r1 (headers := [("content-security-policy", some "default-src 'none'")])
-      c.checkStatus "rate-limit req 2 allowed (200)" r2 200
-      let rlResps := [r3, r4].filterMap Except.toOption
+      let rlAll ← (List.range 4).mapM fun _ => httpReq srvRl.port "GET" "/"
+      c.checkHttp "rate-limit req 1" rlAll[0]! (headers := [("content-security-policy", some "default-src 'none'")])
+      c.checkStatus "rate-limit req 2 allowed (200)" rlAll[1]! 200
+      let rlResps := (rlAll.drop 2).filterMap Except.toOption
       c.check "burst excess rejected with 429 Too Many Requests" (rlResps.any (·.status == 429))
       c.check "429 response includes Retry-After header" (rlResps.any fun r => r.status == 429 && (r.header? "retry-after").isSome)
 

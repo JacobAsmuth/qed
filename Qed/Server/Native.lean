@@ -1311,37 +1311,6 @@ def runStatefulFullstack {σ Model Msg : Type}
       withCookieSink gcpCache fun srv => @hookM IO _ srv atomicInst ctx kind
   }
 
-def runStatelessFullstack {Model Msg : Type}
-    (app : Qed.App Model Msg) (title serverShortName : String)
-    (requiredSecrets : Array String)
-    (dispatchM : {m : Type → Type} → [Monad m] → [MonadServer m] →
-        RequestCtx → String → ByteArray → m (Except ApiError ByteArray))
-    (port : UInt16) (staticDir : String) (devMode : Bool := false) (numWorkers : UInt32 := 0)
-    (wsDispatchM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] →
-        RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)) := none)
-    (blockingMethods? : Option (Array String) := none)
-    (httpDispatchM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] →
-        RequestCtx → String → String → m (Except ApiError (Option HttpResponse))) := none)
-    (jobs : Array StatelessJob := #[])
-    (authSpec? : Option Qed.Auth.OidcAuthSpec := none)
-    (authHookM? : Option ({m : Type → Type} → [Monad m] → [MonadServer m] →
-        RequestCtx → UInt8 → m (Except ApiError Unit)) := none)
-    (authHookFlags : Bool × Bool := (false, false))
-    (primaryDb? : Option Db.DbConfig := none) : IO UInt32 :=
-  runStatefulFullstack (σ := Unit) app title serverShortName () requiredSecrets
-    (fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @dispatchM m _ _)
-    port staticDir devMode numWorkers
-    (wsDispatchM?.map fun f => fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @f m _ _)
-    blockingMethods?
-    (httpDispatchM?.map fun f => fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @f m _ _)
-    (jobs.map fun j => {
-      name := j.name, intervalMs := j.intervalMs, intervalPos := j.intervalPos,
-      runM := fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @j.runM m _ _
-    })
-    authSpec?
-    (authHookM?.map fun f => fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @f m _ _)
-    authHookFlags primaryDb?
-
 /-- Serves a standalone `Qed.App` (`component` or `Qed.run`) with native in-memory SSR and static asset serving. -/
 def runStandaloneApp {Model Msg : Type} (app : Qed.App Model Msg) (title : String)
     (args : List String) : IO UInt32 := do

@@ -127,24 +127,10 @@ def mkBaseLowerCtx (fnName : String) (locals : Array String) (allowAwait allowUn
   return {
     fnName, stateFields := c.stateFieldNames, envVars := c.envVarNames, locals
     stateRule := if c.hasState then .pureStep (mkIdent `_s0) else .statelessServer
-    allowAwait, allowUnwrap, hasFallible, isOption := innerOptTy?.isSome, innerOptTy?, domainErrTy?
+    allowAwait, allowUnwrap, hasFallible, innerOptTy?, domainErrTy?
     channels := c.chanSigs, dbs := if includeDbs then c.dbBindings else #[]
     isHttpRoute, isStreamRoute
   }
-
-def extractTupleProjections (reqVar : Ident) (n : Nat) : CommandElabM (Array Term) := do
-  if n == 0 then return #[]
-  else if n == 1 then return #[⟨reqVar.raw⟩]
-  else
-    let mut out : Array Term := #[]
-    let mut cur : Term := ⟨reqVar.raw⟩
-    for i in [0:n] do
-      if i + 1 < n then
-        out := out.push (← `(($cur).1))
-        cur ← `(($cur).2)
-      else
-        out := out.push cur
-    return out
 
 def mkProtoDecodeBind (bytesVar tupleVar : Ident) (tupleTy : Term)
     (pIdents : Array Ident) (projs : Array Term) (body : Term) : CommandElabM Term := do
@@ -192,11 +178,7 @@ def elabServerStateCmds (stateDecls : Array ParsedStateDecl) : SrvElabM Bool := 
   let mut stFieldIds : Array Ident := #[]
   let mut stFieldTys : Array Term := #[]
   let mut stInitVals : Array Term := #[]
-  let initCtx : LowerCtx := {
-    fnName := "initState", stateFields := #[], envVars := #[], locals := #[]
-    stateRule := .statelessServer, allowAwait := false, allowUnwrap := false
-    hasFallible := false, isOption := false, innerOptTy? := none
-  }
+  let initCtx : LowerCtx := { fnName := "initState" }
   for sd in stateDecls do
     let initTerm ← match sd.initStx?, sd.defaultTerm? with
       | some stx, _ => pure (← liftM <| (lowerExpr initCtx .val stx).run {}).1
@@ -218,13 +200,12 @@ def elabServerStateCmds (stateDecls : Array ParsedStateDecl) : SrvElabM Bool := 
   for inv in c.invs do
     if !inv.isTwoSt then
       let invCtx : LowerCtx := {
-        fnName := "invariant", stateFields := c.stateFieldNames, envVars := c.envVarNames, locals := #[]
+        fnName := "invariant", stateFields := c.stateFieldNames, envVars := c.envVarNames
         stateRule := .invariantProp sParam sOldDummy false
-        allowAwait := false, allowUnwrap := false, hasFallible := false, isOption := false, innerOptTy? := none
       }
       let (pTerm, _) ← liftM <| (lowerExpr invCtx .propInv inv.exprStx).run {}
       singleProps := singleProps.push pTerm
-  let invBody ← liftM <| buildPropConj singleProps
+  let invBody ← Qed.mkConjBody singleProps (ascribeProp := false)
   let initInvLbl := Syntax.mkStrLit ("init: " ++ singleInvLabelStr c.invs)
   liftM <| elabCommand (← `(command|
     def $(c.stateInvId) ($sParam:ident : $(c.stateId)) : Prop := $invBody))
@@ -288,21 +269,18 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Synt
           | some dt => pure (none, some dt)
           | none    => throwErrorAt id s!"state field `{id.getId}` requires an initial value `= ...`"
       stateDecls := stateDecls.push { ref := c, ident := id, tyTerm := ty.term, initStx?, defaultTerm? }
-    else if k == ``srvInvMutatingClause then
-      let nameId : Ident := ⟨(c.getArg 1)⟩
+    else if k == ``srvInvMutatingClause || k == ``srvInvClause then
+      let nameId : Ident := ⟨c.getArg 1⟩
       if seenInvNames.contains nameId.getId then
         throwErrorAt nameId s!"duplicate invariant `{nameId.getId}` in `server {srvName}`"
       seenInvNames := seenInvNames.push nameId.getId
-      mutInvs := mutInvs.push {
-        ref := c, name := nameId, fieldId := ⟨c.getArg 4⟩, condStx := c.getArg 6, label := s!"mutating:{nameId.getId}"
-      }
-    else if k == ``srvInvClause then
-      let nameId : Ident := ⟨(c.getArg 1)⟩
-      if seenInvNames.contains nameId.getId then
-        throwErrorAt nameId s!"duplicate invariant `{nameId.getId}` in `server {srvName}`"
-      seenInvNames := seenInvNames.push nameId.getId
-      for e in (c.getArg 3).getSepArgs do
-        invs := invs.push { ref := c, name := nameId, exprStx := e, isTwoSt := exprCallsOld e, label := nameId.getId.toString }
+      if k == ``srvInvMutatingClause then
+        mutInvs := mutInvs.push {
+          ref := c, name := nameId, fieldId := ⟨c.getArg 4⟩, condStx := c.getArg 6, label := s!"mutating:{nameId.getId}"
+        }
+      else
+        for e in (c.getArg 3).getSepArgs do
+          invs := invs.push { ref := c, name := nameId, exprStx := e, isTwoSt := exprCallsOld e, label := nameId.getId.toString }
     else if k == ``srvFnClause then fnClauses := fnClauses.push c
     else if k == ``srvChannelClause then chanClauses := chanClauses.push c
     else if k == ``srvHttpRouteClause || k == ``srvStreamClause then httpClauses := httpClauses.push c
@@ -330,10 +308,6 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Synt
       let avail := String.intercalate ", " (stateDecls.toList.map fun s => s!"`{s.ident.getId}`")
       throwErrorAt mi.fieldId s!"`invariant mutating {mi.fieldId.getId}` does not match any `state` field of `{srvName}` (`state` fields: {avail})"
   return { dbDecls, authDecl?, envDecls, stateDecls, mutInvs, invs, fnClauses, chanClauses, httpClauses, jobClauses, onCreateAccountClause?, onSignInClause? }
-
-partial def splitSrvAnd (stx : Syntax) : Array Syntax :=
-  let u := unwrapParens1 stx
-  if u.getKind == ``qedAnd then splitSrvAnd (u.getArg 0) ++ splitSrvAnd (u.getArg 2) else #[u]
 
 partial def scanCtxEnv (envVars : Array String) (locals : Array String) (stx : Syntax) : Bool × Bool :=
   let k := stx.getKind
@@ -409,9 +383,8 @@ def elabRequiresClauses (refIdent : Ident) (itemName : Name)
     let rExpr := reqExprs[idx]!
     if exprHasAwait rExpr then throwErrorAt rExpr "`requires` precondition cannot contain `await`"
     let reqCtx : LowerCtx := {
-      fnName := fnLabel, stateFields := c.stateFieldNames, envVars := c.envVarNames, locals := serverLocals
-      stateRule := .forbidInRequires, allowAwait := false, allowUnwrap := false
-      hasFallible := false, isOption := false, innerOptTy? := none
+      fnName := fnLabel, stateFields := c.stateFieldNames, envVars := c.envVarNames,
+      locals := serverLocals, stateRule := .forbidInRequires
     }
     let (pTerm, rSt) ← liftM <| (lowerExpr reqCtx .propGuard rExpr).run {}
     recordSrvExtRoots rSt.extRoots
@@ -419,16 +392,15 @@ def elabRequiresClauses (refIdent : Ident) (itemName : Name)
     reqHypIds := reqHypIds.push (mkIdent (Name.mkSimple s!"{hypPrefix}{idx}"))
     reqHypTys := reqHypTys.push pTerm
     reqLabels := reqLabels.push ((rExpr.reprint.getD "requires").trimAscii.toString)
-    for conj in splitSrvAnd rExpr do
+    for conj in splitAndStx rExpr do
       let (mentionsCtx, mentionsEnv) := scanCtxEnv c.envVarNames serverLocals conj
       if trackAuth && mentionsCtx && !mentionsEnv && isAuthReqLabel (conj.reprint.getD "") then
         requiresAuth := true
       else if !mentionsCtx && !mentionsEnv then
         if excludedClientVars.isEmpty || !(scanCtxEnv excludedClientVars clientLocals conj).2 then
           let cliReqCtx : LowerCtx := {
-            fnName := fnLabel, stateFields := c.stateFieldNames, envVars := #[], locals := clientLocals
-            stateRule := .forbidInRequires, allowAwait := false, allowUnwrap := false
-            hasFallible := false, isOption := false, innerOptTy? := none, forbidCtxEnv := true
+            fnName := fnLabel, stateFields := c.stateFieldNames, locals := clientLocals,
+            stateRule := .forbidInRequires, forbidCtxEnv := true
           }
           let (cpTerm, _) ← liftM <| (lowerExpr cliReqCtx .propInv conj).run {}
           clientReqProps := clientReqProps.push cpTerm
@@ -438,7 +410,7 @@ def elabRequiresClauses (refIdent : Ident) (itemName : Name)
     else
       let leaf := itemName.appendAfter reqSuffix
       let cid := mkIdentFrom refIdent (c.srvName ++ leaf)
-      let reqConj ← liftM <| buildPropConj clientReqProps
+      let reqConj ← Qed.mkConjBody clientReqProps (ascribeProp := false)
       liftM <| elabCommand (← `(command|
         set_option linter.unusedVariables false in
         @[simp] abbrev $cid $[($clientBindIds:ident : $clientBindTys:term)]* : Prop := $reqConj))
@@ -461,9 +433,7 @@ def elabEnsuresAbbrev (ownerIdent : Ident) (fnLabel : String) (binderName : Name
     if exprHasAwait eExpr then throwErrorAt eExpr "`ensures` postcondition cannot contain `await`"
     let ensCtx : LowerCtx := {
       fnName := fnLabel, stateFields := c.stateFieldNames, envVars := c.envVarNames,
-      locals := paramNames.push binderName.toString, stateRule := .forbidInEnsures,
-      allowAwait := false, allowUnwrap := false, hasFallible := false,
-      isOption := false, innerOptTy? := none, forbidCtxEnv := true
+      locals := paramNames.push binderName.toString, stateRule := .forbidInEnsures, forbidCtxEnv := true
     }
     let (pTerm, _) ← liftM <| (lowerExpr ensCtx .propInv eExpr).run {}
     ensProps := ensProps.push pTerm
@@ -471,7 +441,7 @@ def elabEnsuresAbbrev (ownerIdent : Ident) (fnLabel : String) (binderName : Name
   let leaf := ownerIdent.getId.appendAfter "_ens"
   let ensId := mkIdentFrom ownerIdent (c.srvName ++ leaf)
   let resIdent := mkIdent binderName
-  let ensConj ← liftM <| buildPropConj ensProps
+  let ensConj ← Qed.mkConjBody ensProps (ascribeProp := false)
   liftM <| elabCommand (← `(command|
     set_option linter.unusedVariables false in
     @[simp] abbrev $ensId $[($pIdents:ident : $pTyTerms:term)]* ($resIdent:ident : $resTyTerm) : Prop :=
@@ -705,20 +675,15 @@ def elabServerFnInvariants (isAsync : Bool) (fnStr : String) (fnIdent targetId :
   for inv in c.invs do
     if inv.isTwoSt then
       let twoCtx : LowerCtx := {
-        fnName := "invariant", stateFields := c.stateFieldNames, envVars := c.envVarNames, locals := #[]
+        fnName := "invariant", stateFields := c.stateFieldNames, envVars := c.envVarNames
         stateRule := .invariantProp sNewId sOldId false
-        allowAwait := false, allowUnwrap := false, hasFallible := false, isOption := false, innerOptTy? := none
       }
       let relProp := (← liftM <| (lowerExpr twoCtx .propInv inv.exprStx).run {}).1
       let pureGoal ← `(Qed.Server.srvWithNewState (($targetCall).1) (fun ($sNewId:ident : $(c.stateId)) => $relProp))
       unless (← emitStepRelInv s!"_twoInv{twoIdx}" inv.label relProp pureGoal) do return false
       twoIdx := twoIdx + 1
   for (mi, mutIdx) in c.mutInvs.zipIdx do
-    let miCtx : LowerCtx := {
-      fnName := fnStr, stateFields := #[], envVars := c.envVarNames, locals := #[]
-      stateRule := .statelessServer, allowAwait := false, allowUnwrap := false
-      hasFallible := false, isOption := false, innerOptTy? := none
-    }
+    let miCtx : LowerCtx := { fnName := fnStr, envVars := c.envVarNames }
     let miProp := (← liftM <| (lowerExpr miCtx .propInv mi.condStx).run {}).1
     let fldId := mi.fieldId
     let asyncRel ← `(($sNewId).$fldId:ident = ($sOldId).$fldId:ident ∨ $miProp)
@@ -751,12 +716,16 @@ def elabAsyncEnsuresThm (fnStr : String) (fnIdent handlerId : Ident)
   return !(← hasSrvErrors)
 
 /-- Elaborates a server handler (stateful pure, stateful async, or stateless) and schedules its
-    invariant/`ensures` proofs. Returns `(runExpr, isReadOnly, hasEmit)`. -/
+    invariant/`ensures` proofs. Automatically prepends `env` and `ctx` binders/arguments.
+    Returns `(runExpr, isReadOnly, hasEmit)`. -/
 def elabServerHandler (isAsync : Bool) (fnStr : String) (fnIdent : Ident)
-    (allBinderIds : Array Ident) (allBinderTys : Array Term) (callArgs : Array Term)
+    (extraBinderIds : Array Ident) (extraBinderTys : Array Term) (extraCallArgs : Array Term)
     (payloadTerm errTyTerm : Term) (baseCtx : LowerCtx) (bodyStmts : Array Syntax)
-    (ensSpec? : Option FnEnsSpec) : SrvElabM (Option (Term × Bool × Bool)) := do
+    (ensSpec? : Option FnEnsSpec) (ctxArg? : Option Term := none) : SrvElabM (Option (Term × Bool × Bool)) := do
   let c ← read
+  let allBinderIds := c.envIdents ++ #[c.ctxId] ++ extraBinderIds
+  let allBinderTys := c.envTypes ++ #[← `(Qed.Server.RequestCtx)] ++ extraBinderTys
+  let callArgs : Array Term := c.envIdents.map (⟨·.raw⟩) ++ #[ctxArg?.getD ⟨c.ctxId.raw⟩] ++ extraCallArgs
   let fnLit := Syntax.mkStrLit fnStr
   let hasEmit := blockHasEmit bodyStmts
   if c.hasState && !isAsync then
@@ -767,21 +736,19 @@ def elabServerHandler (isAsync : Bool) (fnStr : String) (fnIdent : Ident)
     recordSrvExtRoots lSt.extRoots
     let isReadOnly := lSt.mutated.isEmpty
     let stepId := mkIdentFrom fnIdent (c.srvName ++ fnIdent.getId.appendAfter "_step")
-    if hasEmit then
-      liftM <| elabCommand (← `(command|
-        set_option linter.unusedVariables false in
-        def $stepId ($s0Id:ident : $(c.stateId)) $[($allBinderIds:ident : $allBinderTys:term)]* :
-            $(c.stateId) × (Except $errTyTerm $payloadTerm × List Qed.Server.WsEmit) :=
-          Qed.Server.srvFinishEmit $s0Id (let $es0Id:ident : List Qed.Server.WsEmit := []; $pureBody)))
+    let (stepRetTy, stepBody) ← if hasEmit then
+      pure (← `($(c.stateId) × (Except $errTyTerm $payloadTerm × List Qed.Server.WsEmit)),
+            ← `(Qed.Server.srvFinishEmit $s0Id (let $es0Id:ident : List Qed.Server.WsEmit := []; $pureBody)))
     else
-      liftM <| elabCommand (← `(command|
-        set_option linter.unusedVariables false in
-        def $stepId ($s0Id:ident : $(c.stateId)) $[($allBinderIds:ident : $allBinderTys:term)]* :
-            $(c.stateId) × Except $errTyTerm $payloadTerm :=
-          Qed.Server.srvFinish $s0Id $pureBody))
+      pure (← `($(c.stateId) × Except $errTyTerm $payloadTerm),
+            ← `(Qed.Server.srvFinish $s0Id $pureBody))
+    liftM <| elabCommand (← `(command|
+      set_option linter.unusedVariables false in
+      def $stepId ($s0Id:ident : $(c.stateId)) $[($allBinderIds:ident : $allBinderTys:term)]* :
+          $stepRetTy := $stepBody))
     if (← hasSrvErrors) then return none
 
-    let stepCall ← allBinderIds.foldlM (init := ← `($stepId $s0Id)) fun acc id => `($acc $id)
+    let stepCall ← mkAppTerms (← `($stepId $s0Id)) (allBinderIds.map (⟨·.raw⟩))
     if isReadOnly then
       let roThmId := mkIdentFrom fnIdent (c.srvName ++ fnIdent.getId.appendAfter "_readOnly")
       let roLbl := Syntax.mkStrLit s!"{fnStr} read-only state preservation"
@@ -813,7 +780,7 @@ def elabServerHandler (isAsync : Bool) (fnStr : String) (fnIdent : Ident)
             (_hInv : $(c.stateInvId) $s0Id) : $postGoal := by
           qedSrvProveStep [$(c.stateInvId), $stepId, $ensId] $fnLit $ensLbl))
 
-    let snapCall ← callArgs.foldlM (init := ← `($stepId _sSnap)) fun acc a => `($acc $a)
+    let snapCall ← mkAppTerms (← `($stepId _sSnap)) callArgs
     let rawRun ← if isReadOnly then
       `(Qed.Server.MonadAtomic.runAtomicRead (fun (_sSnap : $(c.stateId)) => ($snapCall).2))
     else
@@ -839,7 +806,7 @@ def elabServerHandler (isAsync : Bool) (fnStr : String) (fnIdent : Ident)
         Qed.Server.srvFinishM $asyncBody))
     if (← hasSrvErrors) then return none
 
-    let hCall ← allBinderIds.foldlM (init := ← `($handlerId)) fun acc id => `($acc $id)
+    let hCall ← mkAppTerms handlerId (allBinderIds.map (⟨·.raw⟩))
     if c.hasState then
       let asyncInvId := mkIdentFrom fnIdent (c.srvName ++ fnIdent.getId.appendAfter "_inv")
       let singleInvLbl := Syntax.mkStrLit (singleInvLabelStr c.invs)
@@ -859,7 +826,7 @@ def elabServerHandler (isAsync : Bool) (fnStr : String) (fnIdent : Ident)
       deferSrvProof <| (elabAsyncEnsuresThm fnStr fnIdent handlerId invT tyT payloadTerm errTyTerm
         allBinderIds allBinderTys hCall extra ensSpec).run c
 
-    let hApp ← callArgs.foldlM (init := ← `($handlerId)) fun acc a => `($acc $a)
+    let hApp ← mkAppTerms handlerId callArgs
     return some (hApp, isReadOnly, hasEmit)
 
 end SrvHelpers

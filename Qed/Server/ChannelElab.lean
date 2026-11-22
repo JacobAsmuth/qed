@@ -13,13 +13,7 @@ structure ParsedChanHeader where
   paramNames     : Array String
   paramTypeConsts: Array Lean.Name
   evTyTerm       : Lean.Term
-  reqPropTerms   : Array Lean.Term
-  reqHypIds      : Array Lean.Ident
-  reqHypTys      : Array Lean.Term
-  reqLabels      : Array String
-  requiresAuth   : Bool
-  clientReqConst : Option Lean.Name
-  clientReqLabel : String
+  reqs           : LoweredRequires
   ensId?         : Option Lean.Ident
   ensConst?      : Option Lean.Name
   recPolicy      : Qed.Reconnect
@@ -97,7 +91,7 @@ def elabServerChannelHeader (existingChanNames : Array String) (chStx : Syntax) 
   let paramTupleVal ← liftMacroM <| buildTupleVal (pIdents.map (⟨·.raw⟩))
   let extraBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) ← match ensId? with
     | some eid =>
-        let ensApp ← (pIdents.push evVar).foldlM (init := (eid : Term)) fun acc x => `($acc $x)
+        let ensApp ← mkAppTerms eid ((pIdents.push evVar).map (⟨·.raw⟩))
         pure #[← `(bracketedBinder| (_hEns : $ensApp))]
     | none => pure #[]
   liftM <| elabCommand (← `(command|
@@ -110,10 +104,7 @@ def elabServerChannelHeader (existingChanNames : Array String) (chStx : Syntax) 
   let sig : SrvChanSig := { name := chStr, mkEmitId, paramCount := pIdents.size, hasEnsures := ensId?.isSome }
   return some {
     chIdent, chName, chStr, pIdents, pTyTerms, paramNames, paramTypeConsts, evTyTerm,
-    reqPropTerms := reqs.reqPropTerms, reqHypIds := reqs.reqHypIds, reqHypTys := reqs.reqHypTys,
-    reqLabels := reqs.reqLabels, requiresAuth := reqs.requiresAuth,
-    clientReqConst := reqs.clientReqConst?, clientReqLabel := reqs.clientReqLabel,
-    ensId?, ensConst?, recPolicy, onJoin?, onSend?, onLeave?, sig
+    reqs, ensId?, ensConst?, recPolicy, onJoin?, onSend?, onLeave?, sig
   }
 
 private def unwrapOptionalOuterAtomic (stmts : Array Syntax) : Array Syntax :=
@@ -121,9 +112,11 @@ private def unwrapOptionalOuterAtomic (stmts : Array Syntax) : Array Syntax :=
     suiteStmts stmts[0]![2]
   else stmts
 
+private def wrapEmptyWs (r : Term) : CommandElabM Term :=
+  `($r >>= fun _wsRes => Pure.pure (_wsRes.map fun _ => ByteArray.empty))
+
 private structure ChanBodyCtx where
   hdr          : ParsedChanHeader
-  ctxTyTerm    : Term
   errTyTerm    : Term
   paramTupleTy : Term
   pProjs       : Array Term
@@ -133,7 +126,6 @@ private def runChanSubHandler (cb : ChanBodyCtx) (subSuffix : String)
     (extraReqIds : Array Ident) (extraReqTys : Array Term)
     (retTyTerm : Term) (isUnitRet : Bool) (rawStmts : Array Syntax) :
     SrvElabM (Option Term) := do
-  let c ← read
   let hdr := cb.hdr
   let normStmts := unwrapOptionalOuterAtomic rawStmts
   let bodyStmts := if isUnitRet then ensureUnitReturn hdr.chIdent normStmts else normStmts
@@ -142,15 +134,14 @@ private def runChanSubHandler (cb : ChanBodyCtx) (subSuffix : String)
   let subFnStr := s!"{hdr.chStr}_{subSuffix}"
   let subFnIdent := mkIdentFrom hdr.chIdent (hdr.chName.appendAfter s!"_{subSuffix}")
   let hasAwait := blockHasAwait bodyStmts
-  let allBinderIds := c.envIdents ++ #[c.ctxId] ++ hdr.pIdents ++ extraIds ++ hdr.reqHypIds ++ extraReqIds
-  let allBinderTys := c.envTypes ++ #[cb.ctxTyTerm] ++ hdr.pTyTerms ++ extraTys ++ hdr.reqHypTys ++ extraReqTys
-  let callArgs : Array Term :=
-    c.envIdents.map (⟨·.raw⟩) ++ #[⟨c.ctxId.raw⟩] ++ cb.pProjs ++ extraProjs ++
-    hdr.reqHypIds.map (⟨·.raw⟩) ++ extraReqIds.map (⟨·.raw⟩)
+  let extraBinderIds := hdr.pIdents ++ extraIds ++ hdr.reqs.reqHypIds ++ extraReqIds
+  let extraBinderTys := hdr.pTyTerms ++ extraTys ++ hdr.reqs.reqHypTys ++ extraReqTys
+  let extraCallArgs : Array Term :=
+    cb.pProjs ++ extraProjs ++ hdr.reqs.reqHypIds.map (⟨·.raw⟩) ++ extraReqIds.map (⟨·.raw⟩)
   let baseCtx ← mkBaseLowerCtx subFnStr (hdr.paramNames ++ extraIds.map (·.getId.toString))
     hasAwait true true (includeDbs := false)
   let some (runExpr, _, _) ← elabServerHandler hasAwait subFnStr subFnIdent
-      allBinderIds allBinderTys callArgs retTyTerm cb.errTyTerm baseCtx bodyStmts none | return none
+      extraBinderIds extraBinderTys extraCallArgs retTyTerm cb.errTyTerm baseCtx bodyStmts none | return none
   return some runExpr
 
 private def mkChanDispatchArm (cb : ChanBodyCtx) (kindLit : TSyntax `num) (bodyInParams : Term) :
@@ -170,11 +161,11 @@ private def elabChanOnJoin (cb : ChanBodyCtx) :
     | some (none, stmts) =>
         let jt ← `(Unit)
         let some r ← runChanSubHandler cb "onJoin" #[] #[] #[] #[] #[] jt true stmts | return none
-        pure (false, jt, ← `($r >>= fun _jRes => Pure.pure (_jRes.map fun _ => ByteArray.empty)))
+        pure (false, jt, ← liftM (wrapEmptyWs r))
     | none =>
         pure (false, ← `(Unit), ← `(Pure.pure (Except.ok ByteArray.empty)))
   let arm ← liftM <| mkChanDispatchArm cb (Syntax.mkNumLit "1")
-    (← liftM <| wrapReqs hdr.reqPropTerms hdr.reqHypIds hdr.reqLabels joinRunTerm)
+    (← liftM <| wrapReqs hdr.reqs.reqPropTerms hdr.reqs.reqHypIds hdr.reqs.reqLabels joinRunTerm)
   return some (hasJoinSnapshot, joinTyTerm, arm)
 
 private structure ChanSendInfo where
@@ -198,10 +189,11 @@ private def elabChanOnSend (cb : ChanBodyCtx) : SrvElabM (Option ChanSendInfo) :
     (excludedClientVars := hdr.paramNames) (trackAuth := false)
   let sendTupleTy ← liftMacroM <| buildProdType spTyTerms
   let sTupleVar := mkIdent `_chSendVal
-  let sProjs ← liftM <| extractTupleProjections sTupleVar spTyTerms.size
+  let sProjs ← extractTupleProjections sTupleVar spTyTerms.size
   let some sendRun ← runChanSubHandler cb "onSend" spIdents spTyTerms sProjs sReqs.reqHypIds sReqs.reqHypTys (← `(Unit)) true sBody | return none
-  let sendOut ← `($sendRun >>= fun _sRes => Pure.pure (_sRes.map fun _ => ByteArray.empty))
-  let sendGuarded ← liftM <| wrapReqs (hdr.reqPropTerms ++ sReqs.reqPropTerms) (hdr.reqHypIds ++ sReqs.reqHypIds) (hdr.reqLabels ++ sReqs.reqLabels) sendOut
+  let sendOut ← liftM (wrapEmptyWs sendRun)
+  let sendGuarded ← liftM <| wrapReqs (hdr.reqs.reqPropTerms ++ sReqs.reqPropTerms)
+    (hdr.reqs.reqHypIds ++ sReqs.reqHypIds) (hdr.reqs.reqLabels ++ sReqs.reqLabels) sendOut
   let sendDecode ← liftM <| mkProtoDecodeBind (mkIdent `wsPayload) sTupleVar sendTupleTy spIdents sProjs sendGuarded
   let arm ← liftM <| mkChanDispatchArm cb (Syntax.mkNumLit "2") sendDecode
   return some {
@@ -224,7 +216,7 @@ private def emitChanClientHelpers (cb : ChanBodyCtx) (hasJoinSnapshot : Bool) (j
     def $keyId $[($pIdents:ident : $pTyTerms:term)]* : String := Qed.wsTopicKey $chLit $paramTupleVal))
   let wireEvTerm : Term ← match hdr.ensId? with
     | some eid =>
-        let ensApp ← pIdents.foldlM (init := (eid : Term)) fun acc p => `($acc $p)
+        let ensApp ← mkAppTerms eid (pIdents.map (⟨·.raw⟩))
         `(Qed.Ensured $(hdr.evTyTerm) ($ensApp))
     | none => pure hdr.evTyTerm
   let (subId, slotId, recId, onJoinId, onMsgId, onStatusId) :=
@@ -232,23 +224,19 @@ private def emitChanClientHelpers (cb : ChanBodyCtx) (hasJoinSnapshot : Bool) (j
      mkIdent `slot, mkIdent `rec, mkIdent `onJoin, mkIdent `onMsg, mkIdent `onStatus)
   let wsPathStr := s!"/_qed/ws/{c.srvShort}"
   let wsPathLit := Syntax.mkStrLit wsPathStr
-  let onJoinDecTerm : Term ←
-    if hasJoinSnapshot then
-      `(fun bs => match Qed.Proto.decode (α := $joinTyTerm) bs with
-        | Except.ok v    => $onJoinId v
-        | Except.error e => $onStatusId (Qed.SocketStatus.failed e))
-    else `(fun _ => $onJoinId ())
+  let mkProtoCb (ty : Term) (onOk : Ident) : CommandElabM Term :=
+    `(fun bs => match Qed.Proto.decode (α := $ty) bs with
+      | Except.ok v    => $onOk v
+      | Except.error e => $onStatusId (Qed.SocketStatus.failed e))
+  let onJoinDecTerm ← if hasJoinSnapshot then liftM (mkProtoCb joinTyTerm onJoinId) else `(fun _ => $onJoinId ())
+  let onEvDecTerm ← liftM (mkProtoCb wireEvTerm onMsgId)
   liftM <| elabCommand (← `(command|
     set_option linter.unusedVariables false in
     def $subId {msg : Type} ($slotId:ident : String) $[($pIdents:ident : $pTyTerms:term)]*
         ($recId:ident : Qed.Reconnect) ($onJoinId:ident : $joinTyTerm → msg)
         ($onMsgId:ident : $wireEvTerm → msg) ($onStatusId:ident : Qed.SocketStatus → msg) : Qed.Cmd msg :=
       Qed.Cmd.wsMuxSub $slotId $wsPathLit $chLit (Qed.Proto.encode $paramTupleVal) $recId
-        $onJoinDecTerm
-        (fun bs => match Qed.Proto.decode (α := $wireEvTerm) bs with
-          | Except.ok v    => $onMsgId v
-          | Except.error e => $onStatusId (Qed.SocketStatus.failed e))
-        $onStatusId))
+        $onJoinDecTerm $onEvDecTerm $onStatusId))
   let unsubId := mkIdentFrom hdr.chIdent (c.srvName ++ hdr.chName.appendAfter "_unsub")
   liftM <| elabCommand (← `(command|
     def $unsubId {msg : Type} ($slotId:ident : String) : Qed.Cmd msg := Qed.Cmd.wsMuxUnsub $slotId))
@@ -268,19 +256,19 @@ def elabServerChannelBody (hdr : ParsedChanHeader) :
     SrvElabM (Option (Array (TSyntax ``Lean.Parser.Term.matchAltExpr))) := do
   let c ← read
   let cb : ChanBodyCtx := {
-    hdr, ctxTyTerm := ← `(Qed.Server.RequestCtx), errTyTerm := ← `(Qed.Server.ApiError),
+    hdr, errTyTerm := ← `(Qed.Server.ApiError),
     paramTupleTy := ← liftMacroM <| buildProdType hdr.pTyTerms,
-    pProjs := ← liftM <| extractTupleProjections (mkIdent `_chParams) hdr.pTyTerms.size
+    pProjs := ← extractTupleProjections (mkIdent `_chParams) hdr.pTyTerms.size
   }
   let some (hasJoinSnapshot, joinTyTerm, joinArm) ← elabChanOnJoin cb | return none
   let some sendInfo ← elabChanOnSend cb | return none
   let leaveRunTerm ← match hdr.onLeave? with
     | some stmts =>
         let some r ← runChanSubHandler cb "onLeave" #[] #[] #[] #[] #[] (← `(Unit)) true stmts | return none
-        `($r >>= fun _lRes => Pure.pure (_lRes.map fun _ => ByteArray.empty))
+        liftM (wrapEmptyWs r)
     | none => `(Pure.pure (Except.ok ByteArray.empty))
   let leaveArm ← liftM <| mkChanDispatchArm cb (Syntax.mkNumLit "3")
-    (← liftM <| wrapReqs hdr.reqPropTerms hdr.reqHypIds hdr.reqLabels leaveRunTerm)
+    (← liftM <| wrapReqs hdr.reqs.reqPropTerms hdr.reqs.reqHypIds hdr.reqs.reqLabels leaveRunTerm)
   let arms := #[joinArm] ++ (match sendInfo.arm? with | some a => #[a] | none => #[]) ++ #[leaveArm]
   let (wsPathStr, sendHelperConst) ← emitChanClientHelpers cb hasJoinSnapshot joinTyTerm sendInfo
   if (← hasSrvErrors) then return none
@@ -291,11 +279,11 @@ def elabServerChannelBody (hdr : ParsedChanHeader) :
     paramTypeConsts := hdr.paramTypeConsts
     eventTypeConst := c.fullSrvName ++ hdr.chName.appendAfter "_Event"
     hasJoinSnapshot, joinTypeConst := c.fullSrvName ++ hdr.chName.appendAfter "_Join"
-    hasSend := sendInfo.hasSend, sendParamNames := sendInfo.spIdents.map (·.getId)
+    hasSend := sendInfo.hasSend
     sendParamCount := sendInfo.spIdents.size, sendParamTypeConsts := sendInfo.sendParamTypeConsts
     sendReqConst := sendInfo.sendReqConst?, sendReqLabel := sendInfo.sendReqLabel
-    requiresAuth := hdr.requiresAuth, clientReqConst := hdr.clientReqConst
-    clientReqLabel := hdr.clientReqLabel, hasEnsures := hdr.ensConst?.isSome
+    requiresAuth := hdr.reqs.requiresAuth, clientReqConst := hdr.reqs.clientReqConst?
+    clientReqLabel := hdr.reqs.clientReqLabel, hasEnsures := hdr.ensConst?.isSome
     ensPredConst := hdr.ensConst?, defaultReconnect := hdr.recPolicy
     keyHelperConst := c.fullSrvName ++ hdr.chName.appendAfter "_key"
     subHelperConst := c.fullSrvName ++ hdr.chName.appendAfter "_sub"

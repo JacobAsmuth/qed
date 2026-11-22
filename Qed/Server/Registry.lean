@@ -31,7 +31,6 @@ structure ServerMethodInfo where
   hasEnsures      : Bool := false
   ensPredConst    : Option Lean.Name := none
   domainErrTags   : Array String := #[]
-  errTypeConst    : Option Lean.Name := none
   rawRpcConst     : Lean.Name := .anonymous
   outcomeConst    : Lean.Name := .anonymous
   paramTypeConsts : Array Lean.Name := #[]
@@ -112,7 +111,6 @@ structure ChannelInfo where
   hasJoinSnapshot     : Bool := false
   joinTypeConst       : Lean.Name := .anonymous
   hasSend             : Bool := false
-  sendParamNames      : Array Lean.Name := #[]
   sendParamCount      : Nat := 0
   sendParamTypeConsts : Array Lean.Name := #[]
   sendReqConst        : Option Lean.Name := none
@@ -199,27 +197,21 @@ def parseReconnectExpr (exprStx : Syntax) : MacroM Reconnect := do
     for (_, valStx) in namedArgs do
       maxRet? := some (← parseOptNatLitArg valStx)
     if fn == `fixed then
-      if posArgs.size == 1 then
-        return .fixed (← parseNatLitArg posArgs[0]!) (maxRet?.getD none)
-      else if posArgs.size == 2 && maxRet?.isNone then
-        return .fixed (← parseNatLitArg posArgs[0]!) (← parseOptNatLitArg posArgs[1]!)
+      if posArgs.size == 1 || (posArgs.size == 2 && maxRet?.isNone) then
+        let maxR ← if posArgs.size == 2 then parseOptNatLitArg posArgs[1]! else pure (maxRet?.getD none)
+        return .fixed (← parseNatLitArg posArgs[0]!) maxR
       else
         Macro.throwErrorAt u "`reconnect fixed(...)` expects 1 or 2 arguments: `fixed(delayMs)` or `fixed(delayMs, maxRetries)`"
     else if fn == `backoff then
       if posArgs.size == 0 then
         return .backoff 250 30000 (maxRet?.getD none)
-      else if posArgs.size == 2 then
+      else if posArgs.size == 2 || (posArgs.size == 3 && maxRet?.isNone) then
         let initMs ← parseNatLitArg posArgs[0]!
         let maxMs ← parseNatLitArg posArgs[1]!
         if maxMs < initMs then
           Macro.throwErrorAt u s!"`reconnect backoff({initMs}, {maxMs})` requires `initialMs <= maxMs`"
-        return .backoff initMs maxMs (maxRet?.getD none)
-      else if posArgs.size == 3 && maxRet?.isNone then
-        let initMs ← parseNatLitArg posArgs[0]!
-        let maxMs ← parseNatLitArg posArgs[1]!
-        if maxMs < initMs then
-          Macro.throwErrorAt u s!"`reconnect backoff({initMs}, {maxMs})` requires `initialMs <= maxMs`"
-        return .backoff initMs maxMs (← parseOptNatLitArg posArgs[2]!)
+        let maxR ← if posArgs.size == 3 then parseOptNatLitArg posArgs[2]! else pure (maxRet?.getD none)
+        return .backoff initMs maxMs maxR
       else
         Macro.throwErrorAt u "`reconnect backoff(...)` expects `backoff(initialMs, maxMs)` or `backoff(initialMs, maxMs, maxRetries)`"
     else
@@ -228,24 +220,13 @@ def parseReconnectExpr (exprStx : Syntax) : MacroM Reconnect := do
     Macro.throwErrorAt u "expected `reconnect` policy: `off`, `fixed(ms[, max])`, or `backoff(initMs, maxMs[, max])`"
 
 def Reconnect.toSyntaxTerm (r : Reconnect) : MacroM Term := do
+  let optNat : Option Nat → MacroM Term
+    | none   => `(none)
+    | some m => `(some $(Syntax.mkNumLit (toString m)))
   match r with
   | .off => `(Qed.Reconnect.off)
-  | .fixed d none =>
-      let dLit := Syntax.mkNumLit (toString d)
-      `(Qed.Reconnect.fixed $dLit none)
-  | .fixed d (some m) =>
-      let dLit := Syntax.mkNumLit (toString d)
-      let mLit := Syntax.mkNumLit (toString m)
-      `(Qed.Reconnect.fixed $dLit (some $mLit))
-  | .backoff i mx none =>
-      let iLit := Syntax.mkNumLit (toString i)
-      let mxLit := Syntax.mkNumLit (toString mx)
-      `(Qed.Reconnect.backoff $iLit $mxLit none)
-  | .backoff i mx (some m) =>
-      let iLit := Syntax.mkNumLit (toString i)
-      let mxLit := Syntax.mkNumLit (toString mx)
-      let mLit := Syntax.mkNumLit (toString m)
-      `(Qed.Reconnect.backoff $iLit $mxLit (some $mLit))
+  | .fixed d m? => `(Qed.Reconnect.fixed $(Syntax.mkNumLit (toString d)) $(← optNat m?))
+  | .backoff i mx m? => `(Qed.Reconnect.backoff $(Syntax.mkNumLit (toString i)) $(Syntax.mkNumLit (toString mx)) $(← optNat m?))
 
 end ReconnectParser
 
@@ -282,7 +263,6 @@ structure DbColumnInfo where
   isUnique     : Bool := false
   isNullable   : Bool := false
   isNat        : Bool := false
-  isBytes      : Bool := false
   refs?        : Option (String × String) := none
 deriving Inhabited, Repr
 
@@ -298,7 +278,6 @@ structure DbTableInfo where
   updatePolicyConst : Lean.Name
   deletePolicyConst : Lean.Name
   decodeRowConst    : Lean.Name
-  schemaConst       : Lean.Name
   columns           : Array DbColumnInfo
   hasReadPolicy     : Bool := false
   hasInsertPolicy   : Bool := false
@@ -331,13 +310,9 @@ def lookupDatabase? (env : Lean.Environment) (currNs : Lean.Name)
 
 /-! ## Persistent `auth` OIDC Configuration Registry (`authRegistry`) -/
 
-abbrev AuthClaimInfo := Qed.Auth.AuthClaimSpec
-
 structure AuthInfo where
   authName         : Lean.Name
   shortName        : String
-  userTypeConst    : Lean.Name
-  fromCtxConst     : Lean.Name
   configConst      : Lean.Name
   secrets          : Array String := #[]
   spec             : Qed.Auth.OidcAuthSpec := default
@@ -350,12 +325,6 @@ initialize authRegistry :
 def lookupAuth? (env : Lean.Environment) (currNs : Lean.Name)
     (openDecls : List Lean.OpenDecl) (authRef : Lean.Name) : Option AuthInfo :=
   Qed.Diag.lookupNameMapExt? authRegistry env currNs openDecls authRef (some `config)
-
-open Lean Elab Command in
-def buildPropConj (ps : Array Term) : CommandElabM Term := do
-  match ps.toList with
-  | [] => `(True)
-  | p :: rest => rest.foldlM (init := p) fun acc q => `($acc ∧ $q)
 
 open Lean Elab Command in
 def elabParamTypeAbbrevs (refIdent : Ident) (ownerName fullOwnerName itemName : Name)

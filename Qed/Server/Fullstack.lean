@@ -8,11 +8,6 @@ open Qed.Lang
 
 /-! ## `fullstack` Command Elaborator & Endpoint Closure Verification -/
 
-private def modRootOf (env : Lean.Environment) (n : Lean.Name) : Lean.Name :=
-  match env.getModuleIdxFor? n with
-  | some idx => (env.header.moduleNames.getD idx.toNat Lean.Name.anonymous).getRoot
-  | none     => Lean.Name.anonymous
-
 private def collectReachableDefns (env : Lean.Environment) :
     Nat → List Lean.Name → Std.HashSet Lean.Name → Except Lean.Name (Std.HashSet Lean.Name)
   | _, [], seen => .ok seen
@@ -22,8 +17,7 @@ private def collectReachableDefns (env : Lean.Environment) :
         collectReachableDefns env fuel rest seen
       else
         let seen' := seen.insert n
-        let root := modRootOf env n
-        if root == `Init || root == `Std || root == `Lean || root == `Lake then
+        if Qed.Diag.isToolchainRoot (Qed.Diag.modRootOf env n) then
           collectReachableDefns env fuel rest seen'
         else
           match env.find? n with
@@ -63,7 +57,7 @@ private def verifyFullstackRpcClosure (env : Environment) (fsName : Name) (srvIn
     if let some (otherSrv, mInfo) := rpcConstMap.find? n then
       if otherSrv.serverName != srvInfo.serverName then
         throwErrorAt cliIdent s!"`fullstack {fsName}` mounts `server {srvInfo.shortName}`, but client `{cliIdent.getId}` calls RPC `{otherSrv.shortName}.{mInfo.name}` on unmounted server `{otherSrv.shortName}`"
-    let root := modRootOf env n
+    let root := Qed.Diag.modRootOf env n
     if root != `Qed && root != `Js && root != `Cli then
       if let some (.defnInfo d) := env.find? n then
         let badRef ← IO.mkRef (none : Option String)
@@ -173,7 +167,6 @@ def elabFullstackCmd : CommandElab := fun stx => do
   modifyEnv fun e => fullstackRegistry.addEntry e {
     fullstackName := fullFsName
     serverName := srvInfo.serverName
-    clientName := resolvedCli
     title := pageTitle
   }
 
@@ -209,43 +202,37 @@ def elabQedServerMain : CommandElab := fun stx => do
     if m.isAsync then some (Syntax.mkStrLit m.name) else none
   let blockingArg ← `(some #[$asyncNames,*])
   let dbCfgIds : Array Ident := srvInfo.databases.map fun c => mkIdentFrom fsIdent c
-  let primaryDbArg : Term ← match (dbCfgIds[0]? : Option Ident) with
-    | some dbId => `(Option.some $dbId:ident)
-    | none      => `(Option.none)
-  let mkBoolLit (b : Bool) : CommandElabM Term := if b then `(true) else `(false)
-  let hookFlagsArg ← `(($(← mkBoolLit srvInfo.hasOnCreateAccount), $(← mkBoolLit srvInfo.hasOnSignIn)))
+  let optId (id? : Option Ident) : CommandElabM Term := match id? with
+    | some id => `(Option.some $id:ident)
+    | none    => `(Option.none)
+  let primaryDbArg ← optId dbCfgIds[0]?
+  let authArg ← optId (srvInfo.authConfig?.map (mkIdentFrom fsIdent ·))
+  let hookFlagsArg ← `(($(quote srvInfo.hasOnCreateAccount), $(quote srvInfo.hasOnSignIn)))
   let initDbsId := mkIdent `Qed.Server.Native.initDatabases
   let mainId := mkIdent `main
   let getEnvId := mkIdent `Qed.Server.Prim.getEnv
+  let initStateArg : Term ← if srvInfo.hasState then
+      pure (mkIdentFrom fsIdent (srvInfo.serverName ++ `initState) : Term)
+    else `((() : Unit))
   let jobsArg : Term ← if srvInfo.jobs.isEmpty then `(#[]) else
-    pure (mkIdentFrom fsIdent (srvInfo.serverName ++ `jobs))
-  let authArg : Term ← match srvInfo.authConfig? with
-    | some authCfgConst =>
-        let id := mkIdentFrom fsIdent authCfgConst
-        `(Option.some $id)
-    | none => `(Option.none)
+    let jId := mkIdentFrom fsIdent (srvInfo.serverName ++ `jobs)
+    if srvInfo.hasState then pure (jId : Term)
+    else `(($jId).map fun j => {
+      name := j.name, intervalMs := j.intervalMs, intervalPos := j.intervalPos,
+      runM := fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic Unit m] => @j.runM m _ _
+    })
   let wrapHandler (id : Ident) : CommandElabM Term :=
-    if srvInfo.hasState then
-      `(fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $id)
-    else
-      `(fun {m} [Monad m] [Qed.Server.MonadServer m] => $id)
+    `(fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic _ m] => $id)
   let optHandler (enabled : Bool) (id : Ident) : CommandElabM Term := do
     if enabled then `(some $(← wrapHandler id)) else `(none)
   let wsArg ← optHandler hasWs wsDispatchId
   let httpArg ← optHandler hasHttp httpDispatchId
   let authHookArg ← optHandler hasAuthHooks authHookId
   let dispArg ← wrapHandler dispatchId
-  let runnerCall ← if srvInfo.hasState then
-    let runFnId := mkIdent `Qed.Server.Native.runStatefulFullstack
-    let initStateId := mkIdentFrom fsIdent (srvInfo.serverName ++ `initState)
-    `($runFnId $cliAppId $titleLit $shortLit $initStateId $secretsId $dispArg
-        port staticDir devMode numWorkers $wsArg $blockingArg $httpArg $jobsArg $authArg
-        $authHookArg $hookFlagsArg $primaryDbArg)
-  else
-    let runFnId := mkIdent `Qed.Server.Native.runStatelessFullstack
-    `($runFnId $cliAppId $titleLit $shortLit $secretsId $dispArg
-        port staticDir devMode numWorkers $wsArg $blockingArg $httpArg $jobsArg $authArg
-        $authHookArg $hookFlagsArg $primaryDbArg)
+  let runFnId := mkIdent `Qed.Server.Native.runStatefulFullstack
+  let runnerCall ← `($runFnId $cliAppId $titleLit $shortLit $initStateArg $secretsId $dispArg
+      port staticDir devMode numWorkers $wsArg $blockingArg $httpArg $jobsArg $authArg
+      $authHookArg $hookFlagsArg $primaryDbArg)
   let initDbCheck ← if dbCfgIds.isEmpty then `(pure true) else `($initDbsId #[$[$dbCfgIds:ident],*])
   elabCommand (← `(command|
     def $mainId:ident (args : List String) : IO UInt32 := do

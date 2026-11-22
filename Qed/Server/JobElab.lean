@@ -36,9 +36,8 @@ def elabServerJobs (existingMethods : Array ServerMethodInfo) (jobClauses : Arra
   let mut verifiedJobTerms : Array Term := #[]
   let payloadTerm ← `(Unit)
   let errTyTerm ← `(Qed.Server.ApiError)
-  let allBinderIds := c.envIdents ++ #[c.ctxId]
-  let allBinderTys := c.envTypes ++ #[← `(Qed.Server.RequestCtx)]
-  let callArgs : Array Term := c.envIdents.map (⟨·.raw⟩) ++ #[← `(({} : Qed.Server.RequestCtx))]
+  let emptyCtx ← `(({} : Qed.Server.RequestCtx))
+  let callArgs : Array Term := c.envIdents.map (⟨·.raw⟩) ++ #[emptyCtx]
 
   for jc in jobClauses do
     let jobIdent : Ident := ⟨jc.getArg 3⟩
@@ -50,18 +49,18 @@ def elabServerJobs (existingMethods : Array ServerMethodInfo) (jobClauses : Arra
     let isAsyncJob := c.hasState && (blockHasAwait bodyStmts || blockHasAtomic bodyStmts)
     let baseCtx ← mkBaseLowerCtx jobStr #[] isAsyncJob true true
     let some (runExpr, isRO, hasEmit) ← elabServerHandler isAsyncJob jobStr jobIdent
-        allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts none | return none
+        #[] #[] #[] payloadTerm errTyTerm baseCtx bodyStmts none (ctxArg? := some emptyCtx) | return none
     let proofExpr? : Option Term ←
       if !c.hasState then pure none
       else if isAsyncJob then
         let invThmId := mkIdentFrom jobIdent (c.srvName ++ jobIdent.getId.appendAfter "_inv")
-        some <$> callArgs.foldlM (init := ← `($invThmId)) fun acc a => `($acc $a)
+        some <$> mkAppTerms invThmId callArgs
       else if isRO then
         some <$> if hasEmit then `(Qed.Server.progPreservesInv_of_pureStepReadEmit _)
           else `(Qed.Server.progPreservesInv_of_pureStepRead _)
       else
         let invThmId := mkIdentFrom jobIdent (c.srvName ++ jobIdent.getId.appendAfter "_inv")
-        let invApp ← callArgs.foldlM (init := ← `($invThmId _s)) fun acc a => `($acc $a)
+        let invApp ← mkAppTerms (← `($invThmId _s)) callArgs
         some <$> if hasEmit then `(Qed.Server.progPreservesInv_of_pureStepEmit _ (fun _s _h => $invApp _h))
           else `(Qed.Server.progPreservesInv_of_pureStep _ (fun _s _h => $invApp _h))
 
@@ -70,15 +69,13 @@ def elabServerJobs (existingMethods : Array ServerMethodInfo) (jobClauses : Arra
     let msLit := Syntax.mkNumLit (toString intervalMs)
     let posPf ← `(by decide)
     if c.hasState then
+      let runMTerm ← `(fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic $(c.stateId) m] => $wrappedRun)
       runtimeJobTerms := runtimeJobTerms.push (← `({
-        name := $nameLit, intervalMs := $msLit, intervalPos := $posPf,
-        runM := fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic $(c.stateId) m] => $wrappedRun
+        name := $nameLit, intervalMs := $msLit, intervalPos := $posPf, runM := $runMTerm
         : Qed.Server.ServerJob $(c.stateId) }))
       if let some pf := wrappedPf? then
         verifiedJobTerms := verifiedJobTerms.push (← `({
-          name := $nameLit, intervalMs := $msLit, intervalPos := $posPf,
-          runM := fun {m} [Monad m] [Qed.Server.MonadServer m] [Qed.Server.MonadAtomic $(c.stateId) m] => $wrappedRun,
-          preserves := $pf
+          name := $nameLit, intervalMs := $msLit, intervalPos := $posPf, runM := $runMTerm, preserves := $pf
           : Qed.Server.VerifiedJob $(c.stateId) $(c.stateInvId) }))
     else
       runtimeJobTerms := runtimeJobTerms.push (← `({

@@ -54,52 +54,42 @@ open Lean Elab Command in
 private def parseEndpointSpec (stx : Syntax) :
     CommandElabM (Term × Array String) := do
   let k := stx.getKind
-  let mut secs : Array String := #[]
-  let parseRef (s : Syntax) := parseQedEnvRef "database" s
-  if k == ``dbEpUrl then
-    let er ← parseRef (stx.getArg 1)
-    if er.isSecret then secs := secs.push er.envKey
-    return (← `(Qed.Server.Db.DbEndpoint.urlEnv $(Syntax.mkStrLit er.envKey)), secs)
-  else if k == ``dbEpPostgres then
-    let er ← parseRef (stx.getArg 1)
-    if er.isSecret then secs := secs.push er.envKey
-    return (← `(Qed.Server.Db.DbEndpoint.postgresEnv $(Syntax.mkStrLit er.envKey)), secs)
-  else if k == ``dbEpSqliteLit then
-    let pStr := (⟨(stx.getArg 1)⟩ : TSyntax `str).getString
-    return (← `(Qed.Server.Db.DbEndpoint.sqlitePath $(Syntax.mkStrLit pStr)), secs)
-  else if k == ``dbEpSqliteEnv then
-    let er ← parseRef (stx.getArg 1)
-    if er.isSecret && er.default?.isNone then secs := secs.push er.envKey
-    let defTerm ← match er.default? with
-      | some d => `(some $(Syntax.mkStrLit d))
-      | none   => `(none)
-    return (← `(Qed.Server.Db.DbEndpoint.sqliteEnv $(Syntax.mkStrLit er.envKey) $defTerm), secs)
-  else if k == ``dbEpD1 then
-    let acc ← parseRef (stx.getArg 3)
-    let db  ← parseRef (stx.getArg 7)
-    let tok ← parseRef (stx.getArg 11)
-    if tok.isSecret then secs := secs.push tok.envKey
-    let accDef ← match acc.default? with | some d => `(some $(Syntax.mkStrLit d)) | none => `(none)
-    let dbDef ← match db.default? with | some d => `(some $(Syntax.mkStrLit d)) | none => `(none)
-    return (← `(Qed.Server.Db.DbEndpoint.cloudflareD1 $(Syntax.mkStrLit acc.envKey) $accDef $(Syntax.mkStrLit db.envKey) $dbDef $(Syntax.mkStrLit tok.envKey)), secs)
-  else if k == ``dbEpTurso then
-    let u   ← parseRef (stx.getArg 3)
-    let tok ← parseRef (stx.getArg 7)
-    if u.isSecret then secs := secs.push u.envKey
-    if tok.isSecret then secs := secs.push tok.envKey
-    return (← `(Qed.Server.Db.DbEndpoint.turso $(Syntax.mkStrLit u.envKey) $(Syntax.mkStrLit tok.envKey)), secs)
-  else if k == ``dbEpHttp then
-    let u ← parseRef (stx.getArg 3)
-    if u.isSecret then secs := secs.push u.envKey
-    let tokOpt := stx.getArg 4
-    let tokTerm ← if tokOpt.getNumArgs == 4 then do
-      let tok ← parseRef (tokOpt.getArg 3)
-      if tok.isSecret then secs := secs.push tok.envKey
-      `(some $(Syntax.mkStrLit tok.envKey))
-    else `(none)
-    return (← `(Qed.Server.Db.DbEndpoint.httpSql $(Syntax.mkStrLit u.envKey) $tokTerm), secs)
-  else
-    throwErrorAt stx "unexpected database endpoint specification"
+  let secsRef ← IO.mkRef (#[] : Array String)
+  let optStrLit : Option String → CommandElabM Term
+    | some d => `(some $(Syntax.mkStrLit d))
+    | none   => `(none)
+  let readRef (s : Syntax) (recordSec := true) (onlyIfNoDefault := false) : CommandElabM (Term × Term) := do
+    let er ← parseQedEnvRef "database" s
+    if recordSec && er.isSecret && (!onlyIfNoDefault || er.default?.isNone) then
+      secsRef.modify (·.push er.envKey)
+    return (Syntax.mkStrLit er.envKey, ← optStrLit er.default?)
+  let epT : Term ←
+    if k == ``dbEpUrl then
+      `(Qed.Server.Db.DbEndpoint.urlEnv $((← readRef (stx.getArg 1)).1))
+    else if k == ``dbEpPostgres then
+      `(Qed.Server.Db.DbEndpoint.postgresEnv $((← readRef (stx.getArg 1)).1))
+    else if k == ``dbEpSqliteLit then
+      `(Qed.Server.Db.DbEndpoint.sqlitePath $(Syntax.mkStrLit (⟨stx.getArg 1⟩ : TSyntax `str).getString))
+    else if k == ``dbEpSqliteEnv then
+      let (keyT, defT) ← readRef (stx.getArg 1) (onlyIfNoDefault := true)
+      `(Qed.Server.Db.DbEndpoint.sqliteEnv $keyT $defT)
+    else if k == ``dbEpD1 then
+      let (accK, accD) ← readRef (stx.getArg 3) (recordSec := false)
+      let (dbK, dbD)   ← readRef (stx.getArg 7) (recordSec := false)
+      let (tokK, _)    ← readRef (stx.getArg 11)
+      `(Qed.Server.Db.DbEndpoint.cloudflareD1 $accK $accD $dbK $dbD $tokK)
+    else if k == ``dbEpTurso then
+      let (uK, _)   ← readRef (stx.getArg 3)
+      let (tokK, _) ← readRef (stx.getArg 7)
+      `(Qed.Server.Db.DbEndpoint.turso $uK $tokK)
+    else if k == ``dbEpHttp then
+      let (uK, _) ← readRef (stx.getArg 3)
+      let tokOpt := stx.getArg 4
+      let tokT ← if tokOpt.getNumArgs == 4 then `(some $((← readRef (tokOpt.getArg 3)).1)) else `(none)
+      `(Qed.Server.Db.DbEndpoint.httpSql $uK $tokT)
+    else
+      throwErrorAt stx "unexpected database endpoint specification"
+  return (epT, ← secsRef.get)
 
 private def inferSqlColType (pty : LoweredQedType) : SqlColType × Bool × Bool × Bool :=
   let base := pty.baseName
@@ -115,32 +105,23 @@ private partial def lowerDbExpr (colNames : Array String) (rowVar : Ident)
     (oldVar? : Option Ident) (ctxVar? : Option Ident) (asProp : Bool) (stx : Syntax) :
     CommandElabM Term := do
   let fail (ref : Syntax) (msg : String) : CommandElabM Term := throwErrorAt ref msg
-  let hooks : LowerHooks CommandElabM := {
+  let hooks : LowerHooks CommandElabM := { LowerHooks.mkDefault fail with
     lowerIdent := fun ref id mode => do
       let comps := id.getId.eraseMacroScopes.components
       let foldProjs (base : Term) (rest : List Name) : CommandElabM Term :=
         rest.foldlM (init := base) fun acc f => `(($acc).$(mkIdentFrom ref f):ident)
       let t ← match comps with
         | [] => throwErrorAt ref "empty identifier in database predicate"
-        | [single] =>
-            let s := single.toString
-            if s == "true" then if mode == .propInv then `(True) else `(true)
-            else if s == "false" then if mode == .propInv then `(False) else `(false)
-            else if s == "none" then `(Option.none)
-            else if s == "row" then pure ⟨rowVar.raw⟩
-            else if s == "ctx" then
-              match ctxVar? with
-              | some cv => pure ⟨cv.raw⟩
-              | none    => throwErrorAt ref "`ctx` is only in scope inside `policy ... requires ...`"
-            else if colNames.contains s then `($rowVar.$(mkIdentFrom ref single))
-            else pure ⟨id.raw⟩
         | root :: rest =>
             let rs := root.toString
-            if rs == "row" then foldProjs ⟨rowVar.raw⟩ rest
+            if rest.isEmpty && rs == "true" then if mode == .propInv then `(True) else `(true)
+            else if rest.isEmpty && rs == "false" then if mode == .propInv then `(False) else `(false)
+            else if rest.isEmpty && rs == "none" then `(Option.none)
+            else if rs == "row" then foldProjs ⟨rowVar.raw⟩ rest
             else if rs == "ctx" then
-              match ctxVar? with
-              | some cv => foldProjs ⟨cv.raw⟩ rest
-              | none    => throwErrorAt ref "`ctx` is only in scope inside `policy ... requires ...`"
+              let some cv := ctxVar?
+                | throwErrorAt ref "`ctx` is only in scope inside `policy ... requires ...`"
+              foldProjs ⟨cv.raw⟩ rest
             else if colNames.contains rs then foldProjs (← `($rowVar.$(mkIdentFrom ref root))) rest
             else pure ⟨id.raw⟩
       if mode == .propInv && comps != [`true] && comps != [`false] then `(qedAsProp($t)) else pure t
@@ -162,18 +143,6 @@ private partial def lowerDbExpr (colNames : Array String) (rowVar : Ident)
             throwErrorAt ref "`some(...)` expects a single argument"
           return some (← `(Option.some $(← go .val (rawArgs[0]!.getArg 0))))
       return none
-    lowerUnwrap := fun ref _ _ => fail ref "`?` is not supported in database predicates"
-    lowerAwait := fun ref _ _ => fail ref "`await` is not supported in database predicates"
-    lowerFieldSetter := fun ref _ => fail ref "field setters are not supported in database predicates"
-    lowerJsx := fun ref _ => fail ref "JSX is not supported in database predicates"
-    lowerArrElem := pure
-    wrapNamedField := pure
-    lowerType := fun ref => fail ref "type annotations are not supported in database predicates"
-    lowerPat := fun ref => fail ref "patterns are not supported in database predicates"
-    withLocals := fun _ body => body
-    optElseFallback := `(())
-    freshIdent := fun pfx => return mkIdent (Name.mkSimple pfx)
-    throwErr := fail
   }
   lowerQedExpr hooks (if asProp then .propInv else .val) stx
 
@@ -191,31 +160,24 @@ private partial def renderSqlPred? (colNames : Array String) (forRls : Bool) (st
        rawArgs.size == 1 && rawArgs[0]!.getKind == ``qedCallArgPos then
       recR (rawArgs[0]!.getArg 0)
     else none
-  else if k == ``qedIdent then
-    match (stx.getArg 0).getId.eraseMacroScopes.components.map (·.toString) with
-    | [s] =>
+  else if k == ``qedParen then
+    let args := (stx.getArg 1).getSepArgs
+    if args.size == 1 then (recR args[0]!).map fun s => "(" ++ s ++ ")" else none
+  else if k == ``qedIdent || k == ``qedProj then
+    match extractDottedChain? stx with
+    | some [s] =>
         if colNames.contains s then some ("\"" ++ s ++ "\"")
         else if s == "true" then some (if forRls then "TRUE" else "1")
         else if s == "false" then some (if forRls then "FALSE" else "0")
         else none
-    | ["row", col] => if colNames.contains col then some ("\"" ++ col ++ "\"") else none
-    | ["ctx", "userId"] => if forRls then some "current_setting('qed.user_id', true)" else none
-    | [col, "length"] => if !forRls && colNames.contains col then some ("LENGTH(\"" ++ col ++ "\")") else none
-    | ["row", col, "length"] => if !forRls && colNames.contains col then some ("LENGTH(\"" ++ col ++ "\")") else none
-    | _ => none
-  else if k == ``qedParen then
-    let args := (stx.getArg 1).getSepArgs
-    if args.size == 1 then (recR args[0]!).map fun s => "(" ++ s ++ ")" else none
-  else if k == ``qedProj then
-    let b := stx.getArg 0
-    let f := (stx.getArg 2).getId.eraseMacroScopes.toString
-    if forRls && b.getKind == ``qedIdent && (b.getArg 0).getId.eraseMacroScopes == `ctx && f == "userId" then
-      some "current_setting('qed.user_id', true)"
-    else if !forRls && f == "length" then
-      (recR b).map fun s => "LENGTH(" ++ s ++ ")"
-    else if b.getKind == ``qedIdent && (b.getArg 0).getId.eraseMacroScopes == `row && colNames.contains f then
-      some ("\"" ++ f ++ "\"")
-    else none
+    | some ["row", col] => if colNames.contains col then some ("\"" ++ col ++ "\"") else none
+    | some ["ctx", "userId"] => if forRls then some "current_setting('qed.user_id', true)" else none
+    | some [col, "length"] | some ["row", col, "length"] =>
+        if !forRls && colNames.contains col then some ("LENGTH(\"" ++ col ++ "\")") else none
+    | _ =>
+        if !forRls && k == ``qedProj && (stx.getArg 2).getId.eraseMacroScopes == `length then
+          (recR (stx.getArg 0)).map fun s => "LENGTH(" ++ s ++ ")"
+        else none
   else if k == ``qedAnd || k == ``qedOr then do
     let l ← recR (stx.getArg 0)
     let r ← recR (stx.getArg 2)
@@ -224,32 +186,27 @@ private partial def renderSqlPred? (colNames : Array String) (forRls : Bool) (st
     (recR (stx.getArg 1)).map fun s => "(NOT " ++ s ++ ")"
   else if k == ``qedCmp then do
     let links := (stx.getArg 1).getArgs
+    if links.isEmpty || (forRls && links.size != 1) then none
     let mapOp : String → Option String
       | "==" => some "=" | "!=" => some "<>" | "<=" => some "<="
       | ">=" => some ">=" | "<" => some "<" | ">" => some ">" | _ => none
-    if forRls then
-      if links.size != 1 then none
-      else
-        let opStr := ((links[0]!.getArg 0).reprint.getD "").trimAscii.toString
-        let rhsStx := links[0]!.getArg 1
-        let lhsStx := stx.getArg 0
-        if opStr == "!=" && rhsStx.getKind == ``qedIdent && (rhsStx.getArg 0).getId.eraseMacroScopes == `none then
-          let l ← recR lhsStx
+    let mut lhsStx := stx.getArg 0
+    let mut parts : Array String := #[]
+    for lk in links do
+      let opStr := ((lk.getArg 0).reprint.getD "").trimAscii.toString
+      let rhsStx := lk.getArg 1
+      let l ← recR lhsStx
+      let part ←
+        if forRls && opStr == "!=" && rhsStx.getKind == ``qedIdent &&
+           (rhsStx.getArg 0).getId.eraseMacroScopes == `none then
           some s!"({l} IS NOT NULL AND {l} <> '')"
-        else
+        else do
           let sqlOp ← mapOp opStr
-          let l ← recR lhsStx; let r ← recR rhsStx
-          some s!"({l} {sqlOp} {r})"
-    else
-      let mut lhsStx := stx.getArg 0
-      let mut parts : Array String := #[]
-      for lk in links do
-        let sqlOp ← mapOp ((lk.getArg 0).reprint.getD "").trimAscii.toString
-        let rhsStx := lk.getArg 1
-        let l ← recR lhsStx; let r ← recR rhsStx
-        parts := parts.push s!"{l} {sqlOp} {r}"
-        lhsStx := rhsStx
-      if parts.isEmpty then none else some (String.intercalate " AND " parts.toList)
+          let r ← recR rhsStx
+          some (if forRls then s!"({l} {sqlOp} {r})" else s!"{l} {sqlOp} {r}")
+      parts := parts.push part
+      lhsStx := rhsStx
+    some (String.intercalate " AND " parts.toList)
   else none
 
 open Lean Elab Command in
@@ -418,31 +375,23 @@ def elabDatabaseCmd : CommandElab := fun stx => do
     let hasBytes := t.cols.any (·.isBytes)
 
     -- 1. Row structure + ToJson / FromJson / ToProto / FromProto / LawfulProto
-    if hasBytes then
-      elabCommand (← `(command|
-        structure $rowTypeId where
-          $[$fIds:ident : $fTys:term]*
-        deriving Inhabited, DecidableEq))
-    else
-      elabCommand (← `(command|
-        structure $rowTypeId where
-          $[$fIds:ident : $fTys:term]*
-        deriving Inhabited, DecidableEq, Repr))
+    let derives := if hasBytes then #[mkIdent `Inhabited, mkIdent `DecidableEq]
+      else #[mkIdent `Inhabited, mkIdent `DecidableEq, mkIdent `Repr]
+    elabCommand (← `(command|
+      structure $rowTypeId where
+        $[$fIds:ident : $fTys:term]*
+      deriving $[$derives:ident],*))
     elabTableProtoAndJson rowTypeId t.cols
 
     -- 2. Single-row invariant (`RowInv`, `rowInvBool`, `rowInvBool_sound`)
     let rowVar := mkIdent `_row
     let mut rowInvProps : Array Term := #[]
     let mut rowInvBools : Array Term := #[]
-    for col in t.cols do
-      for w in col.whereExprs do
-        rowInvProps := rowInvProps.push (← lowerDbExpr colNames rowVar none none true w)
-        rowInvBools := rowInvBools.push (← lowerDbExpr colNames rowVar none none false w)
-    for inv in t.singleInvs do
-      rowInvProps := rowInvProps.push (← lowerDbExpr colNames rowVar none none true inv)
-      rowInvBools := rowInvBools.push (← lowerDbExpr colNames rowVar none none false inv)
+    for w in t.cols.flatMap (·.whereExprs) ++ t.singleInvs do
+      rowInvProps := rowInvProps.push (← lowerDbExpr colNames rowVar none none true w)
+      rowInvBools := rowInvBools.push (← lowerDbExpr colNames rowVar none none false w)
 
-    let rowInvPropTerm ← buildPropConj rowInvProps
+    let rowInvPropTerm ← Qed.mkConjBody rowInvProps (ascribeProp := false)
     let rowInvBoolTerm ← match rowInvBools.toList with
       | [] => `(true)
       | b :: rest => rest.foldlM (init := b) fun acc x => `($acc && $x)
@@ -483,7 +432,7 @@ def elabDatabaseCmd : CommandElab := fun stx => do
           disj ← `($disj ∨ ($oldTgt = $aT ∧ $newTgt = $bT))
       transProps := transProps.push disj
 
-    let transInvTerm ← buildPropConj transProps
+    let transInvTerm ← Qed.mkConjBody transProps (ascribeProp := false)
     let transInvId := mkIdentFrom t.ident (rowTypeName ++ `TransInv)
     elabCommand (← `(command|
       set_option linter.unusedVariables false in
@@ -497,7 +446,7 @@ def elabDatabaseCmd : CommandElab := fun stx => do
       for pe in polExprs do
         ps := ps.push (← lowerDbExpr colNames rowVar none (some ctxVar) true pe)
         lbls := lbls.push ((pe.reprint.getD "policy").trimAscii.toString)
-      let conj ← buildPropConj ps
+      let conj ← Qed.mkConjBody ps (ascribeProp := false)
       let pid := mkIdentFrom t.ident (rowTypeName ++ polSuffix)
       elabCommand (← `(command|
         set_option linter.unusedVariables false in
@@ -526,43 +475,30 @@ def elabDatabaseCmd : CommandElab := fun stx => do
         return { $[$fIds:ident := $fVals2:ident],* }))
 
     -- 6. TableSchema metadata + DDL / Postgres RLS
+    let optSqlStr (parts : Array String) : CommandElabM Term :=
+      if parts.isEmpty then `(none)
+      else `(some $(Syntax.mkStrLit (String.intercalate " AND " parts.toList)))
     let tblSqlId ← mkSqlIdentTerm t.ident t.tableName
     let colSchemaTerms ← t.cols.mapM fun col => do
       let cSqlId ← mkSqlIdentTerm col.ident col.colName
-      let cTyT : Term ← match col.sqlColType with
-        | .text  => `(Qed.Server.Db.SqlColType.text)
-        | .int   => `(Qed.Server.Db.SqlColType.int)
-        | .bool  => `(Qed.Server.Db.SqlColType.bool)
-        | .bytes => `(Qed.Server.Db.SqlColType.bytes)
-      let nn := quote col.isNullable
-      let pk := quote col.isPrimaryKey
-      let uq := quote col.isUnique
-      let im := quote col.isImmutable
+      let cTyT : Term := mkIdent <| match col.sqlColType with
+        | .text  => `Qed.Server.Db.SqlColType.text  | .int   => `Qed.Server.Db.SqlColType.int
+        | .bool  => `Qed.Server.Db.SqlColType.bool  | .bytes => `Qed.Server.Db.SqlColType.bytes
       let refT : Term ← match col.refs? with
         | some (rt, rc) =>
-            let rtId ← mkSqlIdentTerm rt rt.getId.eraseMacroScopes.toString
-            let rcId ← mkSqlIdentTerm rc rc.getId.eraseMacroScopes.toString
-            `(some ($rtId, $rcId))
+            `(some ($(← mkSqlIdentTerm rt rt.getId.eraseMacroScopes.toString), $(← mkSqlIdentTerm rc rc.getId.eraseMacroScopes.toString)))
         | none => `(none)
-      let mut chkParts : Array String := #[]
-      if col.isNat && !col.isNullable then
-        chkParts := chkParts.push ("\"" ++ col.colName ++ "\" >= 0")
-      for w in col.whereExprs do
-        if let some s := renderSqlPred? colNames false w then
-          chkParts := chkParts.push s
-      let chkT : Term ←
-        if chkParts.isEmpty then `(none)
-        else `(some $(Syntax.mkStrLit (String.intercalate " AND " chkParts.toList)))
-      `({ name := $cSqlId, colType := $cTyT, nullable := $nn, isPrimaryKey := $pk,
-          isUnique := $uq, isImmutable := $im, references? := $refT, checkSql? := $chkT
+      let chkParts := (if col.isNat && !col.isNullable then #["\"" ++ col.colName ++ "\" >= 0"] else #[]) ++
+        col.whereExprs.filterMap (renderSqlPred? colNames false)
+      `({ name := $cSqlId, colType := $cTyT, nullable := $(quote col.isNullable),
+          isPrimaryKey := $(quote col.isPrimaryKey), isUnique := $(quote col.isUnique),
+          isImmutable := $(quote col.isImmutable), references? := $refT, checkSql? := $(← optSqlStr chkParts)
           : Qed.Server.Db.ColumnSchema })
     let idxTerms ← t.indexes.mapM fun idxs => do
       let ids ← idxs.mapM fun ic => mkSqlIdentTerm ic ic.getId.eraseMacroScopes.toString
       `([$[$ids:term],*])
-    let rlsReadParts := t.readPols.filterMap (renderSqlPred? colNames true)
-    let rlsWriteParts := t.updatePols.filterMap (renderSqlPred? colNames true)
-    let rlsReadT ← if rlsReadParts.isEmpty then `(none) else `(some $(Syntax.mkStrLit (String.intercalate " AND " rlsReadParts.toList)))
-    let rlsWriteT ← if rlsWriteParts.isEmpty then `(none) else `(some $(Syntax.mkStrLit (String.intercalate " AND " rlsWriteParts.toList)))
+    let rlsReadT ← optSqlStr (t.readPols.filterMap (renderSqlPred? colNames true))
+    let rlsWriteT ← optSqlStr (t.updatePols.filterMap (renderSqlPred? colNames true))
 
     let schemaId := mkIdentFrom t.ident (rowTypeName ++ `schema)
     elabCommand (← `(command|
@@ -587,10 +523,9 @@ def elabDatabaseCmd : CommandElab := fun stx => do
       updatePolicyConst := fullRowTypeName ++ `UpdatePolicy
       deletePolicyConst := fullRowTypeName ++ `DeletePolicy
       decodeRowConst    := fullRowTypeName ++ `decodeRow
-      schemaConst       := fullRowTypeName ++ `schema
       columns           := t.cols.map fun c => {
         name := c.colName, isPrimaryKey := c.isPrimaryKey, isImmutable := c.isImmutable,
-        isUnique := c.isUnique, isNullable := c.isNullable, isNat := c.isNat, isBytes := c.isBytes,
+        isUnique := c.isUnique, isNullable := c.isNullable, isNat := c.isNat,
         refs? := c.refs?.map fun (rt, rc) => (rt.getId.eraseMacroScopes.toString, rc.getId.eraseMacroScopes.toString)
       }
       hasReadPolicy     := !t.readPols.isEmpty
@@ -606,40 +541,26 @@ def elabDatabaseCmd : CommandElab := fun stx => do
 
   -- Database-level config, DDL, RLS DDL, secrets, and `ensureSchema`
   let dbShort := dbName.toString
-  let dbShortLit := Syntax.mkStrLit dbShort
-  let devEpTerm ← match devEp? with
-    | some dt => `(some $dt)
-    | none    => `(none)
-  let configId := mkIdentFrom dbIdent (dbName ++ `config)
-  let ddlId := mkIdentFrom dbIdent (dbName ++ `ddl)
-  let rlsDdlId := mkIdentFrom dbIdent (dbName ++ `rlsDdl)
-  let secretsId := mkIdentFrom dbIdent (dbName ++ `secrets)
-  let ensureId := mkIdentFrom dbIdent (dbName ++ `ensureSchema)
+  let devEpTerm ← match devEp? with | some dt => `(some $dt) | none => `(none)
+  let (configId, ddlId, rlsDdlId, secretsId, ensureId, safeEnsureId, mId) :=
+    (mkIdentFrom dbIdent (dbName ++ `config), mkIdentFrom dbIdent (dbName ++ `ddl),
+     mkIdentFrom dbIdent (dbName ++ `rlsDdl), mkIdentFrom dbIdent (dbName ++ `secrets),
+     mkIdentFrom dbIdent (dbName ++ `ensureSchema), mkIdentFrom dbIdent (dbName ++ `instSafeIOEnsureSchema), mkIdent `m)
   let secLits := secrets.map Syntax.mkStrLit
-  elabCommand (← `(command|
-    def $secretsId : Array String := #[$[$secLits:term],*]))
-  elabCommand (← `(command|
-    def $configId : Qed.Server.Db.DbConfig := {
-      name         := $dbShortLit
-      endpoint     := $primaryEp
-      devFallback? := $devEpTerm
-      tables       := [$[$tableSchemaTerms:term],*]
-    }))
-  elabCommand (← `(command|
-    def $ddlId (dialect : Qed.Server.Db.SqlDialect := .postgres) : String :=
-      Qed.Server.Db.renderDatabaseDdl dialect ($configId).tables))
-  elabCommand (← `(command|
-    def $rlsDdlId : String :=
-      Qed.Server.Db.renderDatabaseRlsDdl ($configId).tables))
-  let mId := mkIdent `m
-  elabCommand (← `(command|
-    def $ensureId {$mId:ident : Type → Type} [Monad $mId] [Qed.Server.MonadServer $mId] :
-        $mId (Except Qed.Server.ApiError Unit) :=
-      Qed.Server.MonadServer.dbExecDdl $configId))
-  let safeEnsureId := mkIdentFrom dbIdent (dbName ++ `instSafeIOEnsureSchema)
-  elabCommand (← `(command|
-    instance $safeEnsureId:ident {_σ : Type} : Qed.Server.SafeIO (@$ensureId (Qed.Server.ThreadProg _σ) _ _) where
-      noAtomic := .io (.dbExecDdl $configId) _ .pure))
+  for cmd in #[
+    ← `(command| def $secretsId : Array String := #[$[$secLits:term],*]),
+    ← `(command| def $configId : Qed.Server.Db.DbConfig := {
+        name := $(Syntax.mkStrLit dbShort), endpoint := $primaryEp,
+        devFallback? := $devEpTerm, tables := [$[$tableSchemaTerms:term],*] }),
+    ← `(command| def $ddlId (dialect : Qed.Server.Db.SqlDialect := .postgres) : String :=
+        Qed.Server.Db.renderDatabaseDdl dialect ($configId).tables),
+    ← `(command| def $rlsDdlId : String := Qed.Server.Db.renderDatabaseRlsDdl ($configId).tables),
+    ← `(command| def $ensureId {$mId:ident : Type → Type} [Monad $mId] [Qed.Server.MonadServer $mId] :
+        $mId (Except Qed.Server.ApiError Unit) := Qed.Server.MonadServer.dbExecDdl $configId),
+    ← `(command| instance $safeEnsureId:ident {_σ : Type} :
+        Qed.Server.SafeIO (@$ensureId (Qed.Server.ThreadProg _σ) _ _) where
+          noAtomic := .io (.dbExecDdl $configId) _ .pure)
+  ] do elabCommand cmd
 
   modifyEnv fun env => databaseRegistry.addEntry env {
     dbName            := fullDbName

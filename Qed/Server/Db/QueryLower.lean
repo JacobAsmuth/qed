@@ -17,27 +17,6 @@ open Qed.Lang
        column `where` / `RowInv` constraints, `immutable` guards, and `old(row)` / `transition`
        invariants. -/
 
-open Lean in
-partial def extractDottedChain? (stx : Syntax) : Option (List String) :=
-  let u := unwrapParens1 stx
-  if u.getKind == ``qedIdent then
-    some ((u.getArg 0).getId.eraseMacroScopes.components.map (·.toString))
-  else if u.getKind == ``qedProj then
-    (extractDottedChain? (u.getArg 0)).map (· ++ [(u.getArg 2).getId.eraseMacroScopes.toString])
-  else none
-
-private partial def stxMentionsVar (v : String) (stx : Lean.Syntax) : Bool :=
-  let k := stx.getKind
-  if k == ``qedIdent then
-    match (stx.getArg 0).getId.eraseMacroScopes.components with
-    | root :: _ => root.toString == v
-    | []        => false
-  else if k == ``qedLam1 then
-    let b := if (stx.getArg 0).isIdent then (stx.getArg 0).getId.eraseMacroScopes.toString else ""
-    if b == v then false else stxMentionsVar v (stx.getArg 2)
-  else
-    stx.getArgs.any (stxMentionsVar v)
-
 private partial def stxCollectRowCols (rowVar : String) (colNames : Array String) (stx : Lean.Syntax) :
     Array String :=
   match extractDottedChain? stx with
@@ -46,12 +25,6 @@ private partial def stxCollectRowCols (rowVar : String) (colNames : Array String
       stx.getArgs.foldl (init := #[]) fun acc child =>
         (stxCollectRowCols rowVar colNames child).foldl (init := acc) fun a c =>
           if a.contains c then a else a.push c
-
-private partial def splitAndStx (stx : Lean.Syntax) : Array Lean.Syntax :=
-  let u := unwrapParens1 stx
-  if u.getKind == ``qedAnd then splitAndStx (u.getArg 0) ++ splitAndStx (u.getArg 2) else #[u]
-
-private abbrev mkSqlIdentT := mkSqlIdentTerm
 
 private def sqlBinOpTable : Array (Lean.Name × Lean.Name) := #[
   (``qedAdd, `Qed.Server.Db.SqlBinOp.add), (``qedSub, `Qed.Server.Db.SqlBinOp.sub),
@@ -93,6 +66,21 @@ private def findDbTable {M : Type → Type} [Monad M] [MonadError M]
     | let hint := Qed.Diag.didYouMean tblName (dbInfo.tables.map (·.tableName)).toList
       throwErrorAt ref s!"database `{dbInfo.shortName}` has no table `{tblName}`{hint}"
   return tbl
+
+private def findDbCol {M : Type → Type} [Monad M] [MonadError M]
+    (ref : Syntax) (tbl : DbTableInfo) (colName : String)
+    (fmtErr : String → String → String := fun c t => s!"table `{t}` has no column `{c}`") : M DbColumnInfo := do
+  let some colInfo := tbl.columns.find? (·.name == colName)
+    | let hint := Qed.Diag.didYouMean colName (tbl.columns.map (·.name)).toList
+      throwErrorAt ref s!"{fmtErr colName tbl.tableName}{hint}"
+  return colInfo
+
+private def parseStrLitArg? (stx : Syntax) : Option String :=
+  let u := unwrapParens1 stx
+  if u.getKind == ``qedLitStr then some (⟨u.getArg 0⟩ : TSyntax `str).getString else none
+
+private def mkPolHint (label fallback nonEmptyPrefix : String) : String :=
+  if label.isEmpty then fallback else s!"{nonEmptyPrefix} `{label}`."
 
 private structure TableIdents where
   rowTyId      : Ident
@@ -143,13 +131,11 @@ private partial def lowerRowSqlExpr {M : Type → Type} [Monad M] [MonadLiftT Co
   match extractDottedChain? u with
   | some [rv, col] =>
       if rv == rowVar then
-        unless colNames.contains col do
-          let hint := Qed.Diag.didYouMean col colNames.toList
-          throwErrorAt u s!"table `{tbl.tableName}` has no column `{col}`{hint}"
-        return ← `(Qed.Server.Db.SqlExpr.col $(← liftM (mkSqlIdentT u col)))
+        let _ ← findDbCol u tbl col
+        return ← `(Qed.Server.Db.SqlExpr.col $(← liftM (mkSqlIdentTerm u col)))
   | some [rv, col, "length"] =>
       if rv == rowVar && colNames.contains col then
-        return ← `(Qed.Server.Db.SqlExpr.strLen (Qed.Server.Db.SqlExpr.col $(← liftM (mkSqlIdentT u col))))
+        return ← `(Qed.Server.Db.SqlExpr.strLen (Qed.Server.Db.SqlExpr.col $(← liftM (mkSqlIdentTerm u col))))
   | _ => pure ()
   -- Compound expressions referencing `rowVar`
   let lowerSub := lowerRowSqlExpr lowerVal tbl rowVar
@@ -187,15 +173,10 @@ private partial def lowerRowSqlExpr {M : Type → Type} [Monad M] [MonadLiftT Co
       if rawArgs.size == 1 && rawArgs[0]!.getKind == ``qedCallArgPos then
         let argStx := rawArgs[0]!.getArg 0
         if meth == "contains" && !stxMentionsVar rowVar recvStx && stxMentionsVar rowVar argStx then
-          `(Qed.Server.Db.SqlExpr.inList $(← lowerSub argStx) (Qed.Server.Db.ToSqlList.toSqlList $(← lowerVal recvStx)))
-        else if meth == "startsWith" || meth == "contains" || meth == "endsWith" || meth == "like" then
-          lowerSqlMethodCall u lowerVal lowerSub (← lowerSub recvStx) meth argStx
-        else
-          throwErrorAt u s!"unsupported call `{stxSnippet u}` in SQL `where`/`set` clause"
-      else
-        throwErrorAt u s!"unsupported call `{stxSnippet u}` in SQL `where`/`set` clause"
-    else
-      throwErrorAt u s!"unsupported expression `{stxSnippet u}` in SQL `where`/`set` clause"
+          return ← `(Qed.Server.Db.SqlExpr.inList $(← lowerSub argStx) (Qed.Server.Db.ToSqlList.toSqlList $(← lowerVal recvStx)))
+        if meth == "startsWith" || meth == "contains" || meth == "endsWith" || meth == "like" then
+          return ← lowerSqlMethodCall u lowerVal lowerSub (← lowerSub recvStx) meth argStx
+    throwErrorAt u s!"unsupported call `{stxSnippet u}` in SQL `where`/`set` clause"
   else
     throwErrorAt u s!"unsupported expression `{stxSnippet u}` in SQL `where`/`set` clause (use row columns, comparisons, `and`/`or`/`not`, arithmetic, `.length`, `.startsWith`, `.contains`, `xs.contains(r.col)`, or bound variables)"
 
@@ -223,18 +204,13 @@ private def parseOrderByArg (tbl : DbTableInfo) (ordStx? : Option Syntax) : Comm
   match ordStx? with
   | none => `(none)
   | some stx =>
-      let u := unwrapParens1 stx
-      if u.getKind != ``qedLitStr then
-        throwErrorAt stx "`orderBy` must be a string column name (e.g. `orderBy = \"id\"` or `orderBy = \"-version\"`)"
-      let raw := (⟨(u.getArg 0)⟩ : TSyntax `str).getString
+      let some raw := parseStrLitArg? stx
+        | throwErrorAt stx "`orderBy` must be a string column name (e.g. `orderBy = \"id\"` or `orderBy = \"-version\"`)"
       let (colName, isDesc) :=
         if raw.startsWith "-" then (String.ofList (raw.toList.drop 1), true) else (raw, false)
-      let colNames := tbl.columns.map (·.name)
-      unless colNames.contains colName do
-        let hint := Qed.Diag.didYouMean colName colNames.toList
-        throwErrorAt stx s!"`orderBy` references unknown column `{colName}` on table `{tbl.tableName}`{hint}"
+      let _ ← findDbCol stx tbl colName (fun c t => s!"`orderBy` references unknown column `{c}` on table `{t}`")
       let dirT ← if isDesc then `(Qed.Server.Db.SqlOrderDir.desc) else `(Qed.Server.Db.SqlOrderDir.asc)
-      `(some ($(← mkSqlIdentT stx colName), $dirT))
+      `(some ($(← mkSqlIdentTerm stx colName), $dirT))
 
 private def parseQueryWindow {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M] [MonadQuotation M]
     (tbl : DbTableInfo) (lowerVal : Syntax → M Term) (findNamed : String → Option Syntax) :
@@ -247,8 +223,7 @@ private def parseAggColArg (tbl : DbTableInfo) (colStx : Syntax) : CommandElabM 
   let u := unwrapParens1 colStx
   let errMsg := "aggregate column selector must be a column name string (e.g. `\"stock\"`) or `r => r.col`"
   let colName ←
-    if u.getKind == ``qedLitStr then
-      pure (⟨(u.getArg 0)⟩ : TSyntax `str).getString
+    if let some s := parseStrLitArg? colStx then pure s
     else if u.getKind == ``qedLam1 then
       let b := u.getArg 0
       let rName := if b.isIdent then b.getId.eraseMacroScopes.toString else ""
@@ -256,10 +231,7 @@ private def parseAggColArg (tbl : DbTableInfo) (colStx : Syntax) : CommandElabM 
       | some [rv, col] => if rv == rName then pure col else throwErrorAt colStx errMsg
       | _ => throwErrorAt colStx errMsg
     else throwErrorAt colStx errMsg
-  let some colInfo := tbl.columns.find? (·.name == colName)
-    | let hint := Qed.Diag.didYouMean colName (tbl.columns.map (·.name)).toList
-      throwErrorAt colStx s!"table `{tbl.tableName}` has no column `{colName}`{hint}"
-  return colInfo
+  findDbCol colStx tbl colName
 
 /-- Main lowering entrypoint invoked from `Qed.Server.Lower.lowerSrvCallHook` whenever a server
     function invokes `db.<table>.<op>(...)` or `db.ensureSchema()`.
@@ -289,9 +261,9 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
         (findNamed "where").orElse fun _ => (findNamed "filter").orElse fun _ => posArgs[0]?
       let opQual := s!"{fnName} → {dbInfo.shortName}.{tbl.tableName}.{opName}"
       let readPolKind := s!"read policy `{dbInfo.shortName}.{tbl.tableName}.read`"
-      let mkReadPolHint (t : DbTableInfo) (clause := "`where = r => ...`") : String :=
-        if t.readPolicyLabel.isEmpty then s!"Check {clause} against the table's `policy read`."
-        else s!"Ensure {clause} (together with `requires` / `if` guards) implies `{t.readPolicyLabel}`."
+      let mkReadPolHint (t : DbTableInfo) (clause := "`where = r => ...`") (tblDesc := "the table's") : String :=
+        mkPolHint t.readPolicyLabel s!"Check {clause} against {tblDesc} `policy read`."
+          s!"Ensure {clause} (together with `requires` / `if` guards) implies"
 
       if opName == "select" || opName == "findOne" || opName == "count" then
         let (predT, sqlWhereT, _) ← parseWhereArg lowerVal lowerValWithLocal tbl rowTyId whereArg?
@@ -316,7 +288,7 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
           if (findNamed "col").isSome then posArgs[0]? else posArgs[1]?
         let (predT, sqlWhereT, _) ← parseWhereArg lowerVal lowerValWithLocal tbl rowTyId aggWhereArg?
         let pf ← mkDbProveTac #[rowInvId, readPolId] readPolKind opQual (mkReadPolHint tbl)
-        let cSqlId ← liftM (mkSqlIdentT colStx colInfo.name)
+        let cSqlId ← liftM (mkSqlIdentTerm colStx colInfo.name)
         let aggOpT ← if opName == "sum" then `(Qed.Server.Db.SqlAggOp.sum)
           else if opName == "min" then `(Qed.Server.Db.SqlAggOp.min) else `(Qed.Server.Db.SqlAggOp.max)
         let qT ← `(Qed.Server.Db.SqlQuery.aggregate $aggOpT $tblSqlId $cSqlId $sqlWhereT)
@@ -332,16 +304,13 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
           | throwErrorAt stx s!"`{dbInfo.shortName}.{tbl.tableName}.join` requires a target table name (e.g. `join(\"books\", where = ...)` )"
         let uRt := unwrapParens1 rightTblStx
         let rightTblName ←
-          if uRt.getKind == ``qedLitStr then pure (⟨(uRt.getArg 0)⟩ : TSyntax `str).getString
+          if let some s := parseStrLitArg? rightTblStx then pure s
           else if uRt.getKind == ``qedIdent then pure (uRt.getArg 0).getId.eraseMacroScopes.toString
           else throwErrorAt rightTblStx "`join` target table must be a string table name (e.g. `\"books\"`)"
         let rightTbl ← findDbTable rightTblStx dbInfo rightTblName
-        let onColFilter? : Option String ← match findNamed "on" with
-          | none => pure none
-          | some oStx =>
-              let uo := unwrapParens1 oStx
-              if uo.getKind == ``qedLitStr then pure (some (⟨(uo.getArg 0)⟩ : TSyntax `str).getString)
-              else throwErrorAt oStx "`on` must be a string column name"
+        let onColFilter? : Option String ← (findNamed "on").mapM fun oStx => do
+          let some s := parseStrLitArg? oStx | throwErrorAt oStx "`on` must be a string column name"
+          return s
         -- Resolve FK relationship (`left.col references right(refCol)` or reverse `right.col references left(refCol)`)
         let fkMatch? : Option (String × String) :=
           (tbl.columns.findSome? fun c => c.refs?.bind fun (rt, rc) =>
@@ -355,16 +324,14 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
         let (rPredT, rSqlWhereT, _) ← parseWhereArg lowerVal lowerValWithLocal rightTbl rt.rowTyId (findNamed "rightWhere")
         let (ordT, limT, offT) ← parseQueryWindow tbl lowerVal findNamed
         let qT ← `(Qed.Server.Db.SqlQuery.joinSelect $tblSqlId $(rt.tblSqlId) $allColsListT $(rt.allColsListT)
-            $(← liftM (mkSqlIdentT stx leftJoinCol)) $(← liftM (mkSqlIdentT stx rightJoinCol))
+            $(← liftM (mkSqlIdentTerm stx leftJoinCol)) $(← liftM (mkSqlIdentTerm stx rightJoinCol))
             $lSqlWhereT $rSqlWhereT $ordT $limT $offT)
         let keyLT ← `(fun (_l : $rowTyId) => _l.$(mkIdentFrom stx (Name.mkSimple leftJoinCol)))
         let keyRT ← `(fun (_r : $(rt.rowTyId)) => _r.$(mkIdentFrom stx (Name.mkSimple rightJoinCol)))
         let lPf ← mkDbProveTac #[rowInvId, readPolId] readPolKind opQual (mkReadPolHint tbl)
-        let rHint := if rightTbl.readPolicyLabel.isEmpty
-          then "Check `rightWhere = r => ...` against the joined table's `policy read`."
-          else mkReadPolHint rightTbl "`rightWhere = r => ...`"
         let rPf ← mkDbProveTac #[rt.rowInvId, rt.readPolId]
-          s!"read policy `{dbInfo.shortName}.{rightTbl.tableName}.read` (joined table)" opQual rHint
+          s!"read policy `{dbInfo.shortName}.{rightTbl.tableName}.read` (joined table)" opQual
+          (mkReadPolHint rightTbl "`rightWhere = r => ...`" "the joined table's")
         return (← `(Qed.Server.Db.dbJoinSelect $cfgId $qT $(Syntax.mkNumLit (toString tbl.columns.size))
             $decRowId $(rt.decRowId) $rowInvId $rowInvBId $rowInvSId
             $(rt.rowInvId) $(rt.rowInvBId) $(rt.rowInvSId)
@@ -372,9 +339,9 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
 
       else if opName == "delete" then
         let (predT, sqlWhereT, _) ← parseWhereArg lowerVal lowerValWithLocal tbl rowTyId whereArg?
-        let hintMsg := if tbl.deletePolicyLabel.isEmpty
-          then "Check the `where = r => ...` clause against the table's `policy delete` / `policy write`."
-          else s!"Ensure `where = r => ...` implies `{tbl.deletePolicyLabel}`."
+        let hintMsg := mkPolHint tbl.deletePolicyLabel
+          "Check the `where = r => ...` clause against the table's `policy delete` / `policy write`."
+          "Ensure `where = r => ...` implies"
         let pf ← mkDbProveTac #[rowInvId, delPolId] s!"delete policy `{dbInfo.shortName}.{tbl.tableName}.delete`" opQual hintMsg
         let qT ← `(Qed.Server.Db.SqlQuery.delete $tblSqlId $sqlWhereT [])
         return (← `(Qed.Server.Db.dbDelete $cfgId $qT $rowInvId $predT $delPolId $ctxId $pf $txOptT), true)
@@ -397,21 +364,19 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
                   else
                     throwErrorAt stx s!"`{dbInfo.shortName}.{tbl.tableName}.insert` is missing required column `{col.name}`"
             for (k, _) in namedArgs do
-              unless tbl.columns.any (·.name == k) do
-                let hint := Qed.Diag.didYouMean k (tbl.columns.map (·.name)).toList
-                throwErrorAt stx s!"unknown column `{k}` in `{dbInfo.shortName}.{tbl.tableName}.insert`{hint}"
+              let _ ← findDbCol stx tbl k (fun c t => s!"unknown column `{c}` in `{dbInfo.shortName}.{t}.insert`")
             `({ $[$fieldIds:ident := $fieldVals:term],* : $rowTyId })
           else
             throwErrorAt stx s!"`{dbInfo.shortName}.{tbl.tableName}.insert` expects named column arguments (`col = val, ...`) or a single `{dbInfo.shortName}.{tbl.tableName}` row value"
         let rowVar := mkIdent `_insRow
         let pairTs ← tbl.columns.mapM fun col => do
-          let cId ← liftM (mkSqlIdentT stx col.name)
+          let cId ← liftM (mkSqlIdentTerm stx col.name)
           `(($cId, Qed.Server.Db.ToSql.toSql (($rowVar).$(mkIdentFrom stx (Name.mkSimple col.name)))))
         let invPf ← mkDbProveTac #[rowInvId] s!"table constraint `{dbInfo.shortName}.{tbl.tableName}.RowInv`" opQual
           "Guard input parameters with `requires` or `if` so every column `where` constraint and table `invariant` holds."
-        let polHint := if tbl.insertPolicyLabel.isEmpty
-          then "Ensure inserted row satisfies the table's `policy insert` / `policy write`."
-          else s!"Ensure inserted row satisfies `{tbl.insertPolicyLabel}`."
+        let polHint := mkPolHint tbl.insertPolicyLabel
+          "Ensure inserted row satisfies the table's `policy insert` / `policy write`."
+          "Ensure inserted row satisfies"
         let polPf ← mkDbProveTac #[insPolId] s!"insert policy `{dbInfo.shortName}.{tbl.tableName}.insert`" opQual polHint
         return (← `(let $rowVar:ident : $rowTyId := $rowTerm
           Qed.Server.Db.dbInsert $cfgId (Qed.Server.Db.SqlQuery.insert $tblSqlId [$[$pairTs:term],*] [])
@@ -448,15 +413,13 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
           let colId : Ident := ⟨(sf.getArg 0)⟩
           let colName := colId.getId.eraseMacroScopes.toString
           let valStx := sf.getArg 2
-          let some colInfo := tbl.columns.find? (·.name == colName)
-            | let hint := Qed.Diag.didYouMean colName (tbl.columns.map (·.name)).toList
-              throwErrorAt colId s!"table `{tbl.tableName}` has no column `{colName}`{hint}"
+          let colInfo ← findDbCol colId tbl colName
           if colInfo.isImmutable then
             throwErrorAt colId s!"cannot update `immutable` column `{dbInfo.shortName}.{tbl.tableName}.{colName}` in `{fnName}`"
           setColNames := setColNames.push colName
           let leanV ← lowerValWithLocal setRowName valStx
           let sqlE ← lowerRowSqlExpr lowerVal tbl setRowName valStx
-          let cSqlId ← liftM (mkSqlIdentT colId colName)
+          let cSqlId ← liftM (mkSqlIdentTerm colId colName)
           let fId := mkIdentFrom colId (Name.mkSimple colName)
           leanFieldIds := leanFieldIds.push fId
           leanFieldVals := leanFieldVals.push leanV
@@ -483,9 +446,9 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
 
         let setFnT ← `(fun ($setRowVar:ident : $rowTyId) => { $setRowVar with $[$leanFieldIds:ident := $leanFieldVals:term],* })
         let qT ← `(Qed.Server.Db.SqlQuery.update $tblSqlId [$[$sqlSetPairs:term],*] $sqlWhereT $allColsListT)
-        let polHint := if tbl.updatePolicyLabel.isEmpty
-          then "Ensure `where = r => ...` satisfies the table's `policy update` / `policy write`."
-          else s!"Ensure `where = r => ...` implies `{tbl.updatePolicyLabel}`."
+        let polHint := mkPolHint tbl.updatePolicyLabel
+          "Ensure `where = r => ...` satisfies the table's `policy update` / `policy write`."
+          "Ensure `where = r => ...` implies"
         let polOldPf ← mkDbProveTac #[rowInvId, updPolId] s!"update policy `{dbInfo.shortName}.{tbl.tableName}.update`" opQual polHint
         let polNewPf ← mkDbProveTac #[rowInvId, updPolId] s!"post-update policy `{dbInfo.shortName}.{tbl.tableName}.update` (anti-hijack)" opQual polHint
         let invPf    ← mkDbProveTac #[rowInvId] s!"table constraint `{dbInfo.shortName}.{tbl.tableName}.RowInv`" opQual

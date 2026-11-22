@@ -16,14 +16,14 @@ private def emitClientRpcStubs (fnStr : String) (fnIdent : Ident)
   let c ← read
   let paramTypeConsts ← liftM <| elabParamTypeAbbrevs fnIdent c.srvName c.fullSrvName fnIdent.getId "_Param_" pTyTerms
 
-  let ensPayloadTerm : Term ← match ensSpec?, innerOpt? with
-    | some ensSpec, some innerTy =>
-        let ensApp ← pIdents.foldlM (init := ← `($(ensSpec.ensId))) fun acc p => `($acc $p)
-        `(Option (Qed.Ensured $innerTy ($ensApp)))
-    | some ensSpec, none =>
-        let ensApp ← pIdents.foldlM (init := ← `($(ensSpec.ensId))) fun acc p => `($acc $p)
-        `(Qed.Ensured $payloadTerm ($ensApp))
-    | none, _ => pure payloadTerm
+  let pTerms : Array Term := pIdents.map (⟨·.raw⟩)
+  let ensPayloadTerm : Term ← match ensSpec? with
+    | some ensSpec =>
+        let ensApp ← mkAppTerms ensSpec.ensId pTerms
+        match innerOpt? with
+        | some innerTy => `(Option (Qed.Ensured $innerTy ($ensApp)))
+        | none         => `(Qed.Ensured $payloadTerm ($ensApp))
+    | none => pure payloadTerm
   let clientWireRespTerm : Term ← match errTypeId? with
     | some errId => `(Except (Qed.RpcDomainError $errId) $ensPayloadTerm)
     | none       => pure ensPayloadTerm
@@ -42,17 +42,17 @@ private def emitClientRpcStubs (fnStr : String) (fnIdent : Ident)
   let rawRpcId := mkIdentFrom fnIdent (c.srvName ++ Name.mkSimple s!"_rpc_{fnStr}")
   let clientFnId := mkIdentFrom fnIdent (c.srvName ++ fnIdent.getId)
   let rpcUrlLit := Syntax.mkStrLit s!"/_qed/rpc/{c.srvShort}/{fnStr}"
-  let reqTupleVal ← liftMacroM <| buildTupleVal (pIdents.map (⟨·.raw⟩))
+  let reqTupleVal ← liftMacroM <| buildTupleVal pTerms
   liftM <| elabCommand (← `(command|
     def $rawRpcId {msg cb : Type} $[($pIdents:ident : $pTyTerms:term)]*
         (onDone : cb) [Qed.RpcCallback $clientWireRespTerm msg cb] : Qed.Cmd msg :=
       Qed.Cmd.rpc (req := $reqTupleTy) (resp := $clientWireRespTerm)
         $rpcUrlLit $reqTupleVal (Qed.RpcCallback.adapt (α := $clientWireRespTerm) onDone)))
 
-  let rawApp ← pIdents.foldlM (init := ← `($rawRpcId)) fun acc p => `($acc $p)
+  let rawApp ← mkAppTerms rawRpcId pTerms
   let reqBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) ← match clientReqId? with
     | some reqId =>
-        let reqApp ← pIdents.foldlM (init := ← `($reqId)) fun acc p => `($acc $p)
+        let reqApp ← mkAppTerms reqId pTerms
         pure #[← `(bracketedBinder| (_hReq : $reqApp := by qedProveRpcReq))]
     | none => pure #[]
   liftM <| elabCommand (← `(command|
@@ -128,7 +128,7 @@ private def elabServerFnClause (existingMethods : Array ServerMethodInfo) (fc : 
   let ensSpec? : Option FnEnsSpec := ensRes?.map fun (ensId, _, labelStr) => {
     ensId, labelStr
     postFn := fun outTerm => do
-      let ensApp ← pIdents.foldlM (init := ← `($ensId)) fun acc p => `($acc $p)
+      let ensApp ← mkAppTerms ensId (pIdents.map (⟨·.raw⟩))
       if innerOpt?.isSome then `(Qed.Server.srvEnsPostOpt ($ensApp) $outTerm)
       else `(Qed.Server.srvEnsPost ($ensApp) $outTerm)
   }
@@ -136,15 +136,12 @@ private def elabServerFnClause (existingMethods : Array ServerMethodInfo) (fc : 
   let hasAwait := blockHasAwait bodyStmts
   let baseCtx ← mkBaseLowerCtx fnStr paramNames hasAwait (retTy.isFallible || innerOpt?.isSome)
     retTy.isFallible innerOpt? domainErrTyTerm?
-  let allBinderIds := c.envIdents ++ #[c.ctxId] ++ pIdents ++ reqs.reqHypIds
-  let allBinderTys := c.envTypes ++ #[← `(Qed.Server.RequestCtx)] ++ pTyTerms ++ reqs.reqHypTys
   let reqTupleTy ← liftMacroM <| buildProdType pTyTerms
   let reqVar := mkIdent `_reqVal
-  let projs ← liftM <| extractTupleProjections reqVar pTyTerms.size
-  let callArgs : Array Term := c.envIdents.map (⟨·.raw⟩) ++ #[⟨c.ctxId.raw⟩] ++ projs ++ reqs.reqHypIds.map (⟨·.raw⟩)
-
+  let projs ← extractTupleProjections reqVar pTyTerms.size
   let some (runExpr, isReadOnly, _) ← elabServerHandler hasAwait fnStr fnIdent
-      allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts ensSpec? | return none
+      (pIdents ++ reqs.reqHypIds) (pTyTerms ++ reqs.reqHypTys) (projs ++ reqs.reqHypIds.map (⟨·.raw⟩))
+      payloadTerm errTyTerm baseCtx bodyStmts ensSpec? | return none
 
   let arm ← liftM <| mkFnDispatchArm fnStr c.reqBytesId reqVar reqTupleTy pIdents projs
     reqs.reqPropTerms reqs.reqHypIds reqs.reqLabels domainErrTyTerm?.isSome runExpr
@@ -159,7 +156,6 @@ private def elabServerFnClause (existingMethods : Array ServerMethodInfo) (fc : 
     hasEnsures := ensSpec?.isSome
     ensPredConst := ensRes?.map (·.2.1)
     domainErrTags := domainTagIdents.map (·.getId.toString)
-    errTypeConst := errTypeId?.map fun _ => c.fullSrvName ++ fnIdent.getId ++ `Error
     rawRpcConst := c.fullSrvName ++ Name.mkSimple s!"_rpc_{fnStr}"
     outcomeConst := c.fullSrvName ++ fnIdent.getId.appendAfter "_Outcome"
     paramTypeConsts
@@ -200,12 +196,9 @@ private def elabServerHttpRouteClause (routeIdx : Nat) (existingRoutes : Array (
   let errTyTerm : Term ← `(Qed.Server.ApiError)
   let hasAwait := blockHasAwait bodyStmts
   let baseCtx ← mkBaseLowerCtx routeLabel #[] hasAwait true true (isHttpRoute := !isStream) (isStreamRoute := isStream)
-  let allBinderIds := c.envIdents ++ #[c.ctxId] ++ reqs.reqHypIds
-  let allBinderTys := c.envTypes ++ #[← `(Qed.Server.RequestCtx)] ++ reqs.reqHypTys
-  let callArgs : Array Term := c.envIdents.map (⟨·.raw⟩) ++ #[⟨c.ctxId.raw⟩] ++ reqs.reqHypIds.map (⟨·.raw⟩)
-
   let some (runExpr, _, _) ← elabServerHandler hasAwait routeLabel routeIdent
-      allBinderIds allBinderTys callArgs payloadTerm errTyTerm baseCtx bodyStmts none | return none
+      reqs.reqHypIds reqs.reqHypTys (reqs.reqHypIds.map (⟨·.raw⟩))
+      payloadTerm errTyTerm baseCtx bodyStmts none | return none
 
   let wrappedRun ← if isStream then
       `($runExpr >>= fun _httpRes => Pure.pure (_httpRes.map (fun _ => Option.some (Qed.Server.HttpResponse.sse []))))
@@ -227,16 +220,13 @@ private def elabServerAuthHook (hookLabel : String) (hookLeaf : Name)
   let userTyId := mkIdentFrom paramIdent (authDecl.info.authName ++ `User)
   let (authUserVar, hAuthId, hAuthEqId) := (mkIdent `_authUser, mkIdent `_hAuth, mkIdent `_hAuthEq)
   let baseCtx ← mkBaseLowerCtx hookLabel #[paramStr] (if c.hasState then isAsync else hasAwait) true true
-  let allBinderIds := c.envIdents ++ #[c.ctxId, paramIdent, hAuthId, hAuthEqId]
-  let allBinderTys := c.envTypes ++ #[
-    ← `(Qed.Server.RequestCtx), ← `($userTyId),
-    ← `(($(c.ctxId)).userId ≠ Option.none),
+  let extraBinderTys : Array Term := #[
+    ← `($userTyId), ← `(($(c.ctxId)).userId ≠ Option.none),
     ← `(Option.some (($paramIdent).id) = ($(c.ctxId)).userId)
   ]
-  let callArgs : Array Term :=
-    c.envIdents.map (⟨·.raw⟩) ++ #[⟨c.ctxId.raw⟩, ⟨authUserVar.raw⟩, ⟨hAuthId.raw⟩, ⟨hAuthEqId.raw⟩]
   let some (re, _, _) ← elabServerHandler isAsync hookLabel hookIdent
-      allBinderIds allBinderTys callArgs (← `(Unit)) (← `(Qed.Server.ApiError)) baseCtx bodyStmts none | return none
+      #[paramIdent, hAuthId, hAuthEqId] extraBinderTys #[⟨authUserVar.raw⟩, ⟨hAuthId.raw⟩, ⟨hAuthEqId.raw⟩]
+      (← `(Unit)) (← `(Qed.Server.ApiError)) baseCtx bodyStmts none | return none
   return some re
 
 private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun stx => do

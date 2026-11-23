@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::lean_ffi::*;
-use crate::{is_wouldblock, last_errno, lock_unpoison};
+use crate::{WakeFd, is_wouldblock, last_errno, lock_unpoison};
 
 const MAX_REQ_HDR_BYTES: usize = 65536;
 const MAX_RX_BUF_BYTES: usize = 34 * 1024 * 1024;
@@ -188,28 +188,17 @@ enum DoneEvent {
 struct WorkerInbox {
     done_queue: Mutex<Vec<DoneEvent>>,
     bcast_queue: Mutex<VecDeque<Arc<BcastMsg>>>,
-    wake_rfd: libc::c_int,
-    wake_wfd: libc::c_int,
+    wake_fd: WakeFd,
     wake_pending: AtomicBool,
     ws_subs: AtomicUsize,
 }
 
 impl WorkerInbox {
     fn new() -> Self {
-        #[cfg(target_os = "linux")]
-        let (rfd, wfd) = { let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) }; (fd, fd) };
-        #[cfg(not(target_os = "linux"))]
-        let (rfd, wfd) = {
-            let mut fds = [-1 as libc::c_int; 2];
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
-                set_nonblocking(fds[0]); set_nonblocking(fds[1]); (fds[0], fds[1])
-            } else { (-1, -1) }
-        };
         Self {
             done_queue: Mutex::new(Vec::new()),
             bcast_queue: Mutex::new(VecDeque::new()),
-            wake_rfd: rfd,
-            wake_wfd: wfd,
+            wake_fd: WakeFd::new(),
             wake_pending: AtomicBool::new(false),
             ws_subs: AtomicUsize::new(0),
         }
@@ -237,25 +226,12 @@ impl WorkerInbox {
     }
 
     fn force_wake(&self) {
-        if self.wake_wfd >= 0 {
-            let v: u64 = 1;
-            let _ = unsafe { libc::write(self.wake_wfd, &v as *const u64 as *const libc::c_void, 8) };
-        }
+        self.wake_fd.wake();
     }
 
     fn drain_wake(&self) {
-        if self.wake_rfd >= 0 {
-            let mut buf = [0u8; 64];
-            while unsafe { libc::read(self.wake_rfd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) } > 0 {}
-        }
+        self.wake_fd.drain();
         self.wake_pending.store(false, Ordering::SeqCst);
-    }
-}
-
-impl Drop for WorkerInbox {
-    fn drop(&mut self) {
-        if self.wake_rfd >= 0 { unsafe { libc::close(self.wake_rfd) }; }
-        if self.wake_wfd >= 0 && self.wake_wfd != self.wake_rfd { unsafe { libc::close(self.wake_wfd) }; }
     }
 }
 
@@ -467,7 +443,7 @@ fn exec_pool_job(cbs: &Callbacks, job: PoolJob) {
         }
         PoolJob::WsStep { token, ws_ctx, rx_bytes, frag, subs, inbox } => {
             let ev = unsafe {
-                let mut subs_arr = qed_lean_array_empty();
+                let mut subs_arr = qed_lean_array_with_cap(subs.len());
                 for (sid, ch, params) in &subs {
                     let entry = qed_lean_mk_prod(
                         qed_lean_usize_to_nat(*sid as usize),
@@ -505,7 +481,7 @@ fn exec_pool_job(cbs: &Callbacks, job: PoolJob) {
                     let ops_arr = qed_lean_ctor_get(out, 4);
                     let mut ops = Vec::new();
                     for i in 0..qed_lean_array_size(ops_arr) {
-                        let op = qed_lean_array_uget(ops_arr, i);
+                        let op = qed_lean_array_get_core(ops_arr, i);
                         let sid = qed_lean_usize_of_nat(qed_lean_ctor_get(op, 0)) as u32;
                         match qed_lean_obj_tag(op) {
                             0 => ops.push(SubOp::Add(
@@ -949,7 +925,7 @@ impl Worker {
             return;
         };
         poller.add_read(listen_fd, TOKEN_LISTEN);
-        if inbox.wake_rfd >= 0 { poller.add_read(inbox.wake_rfd, TOKEN_WAKE); }
+        if inbox.wake_fd.read_fd() >= 0 { poller.add_read(inbox.wake_fd.read_fd(), TOKEN_WAKE); }
         Self {
             poller, listen_fd, inbox, pool, cbs, rate_limiter,
             next_token: 16, conns: HashMap::new(), topics: HashMap::new(),

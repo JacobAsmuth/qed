@@ -1,5 +1,27 @@
 #include <lean/lean.h>
+#include <pthread.h>
 #include <string.h>
+
+static pthread_once_t qed_empty_once = PTHREAD_ONCE_INIT;
+static lean_object *qed_empty_ba = NULL;
+static lean_object *qed_empty_str = NULL;
+
+static void qed_init_empty_singletons(void) {
+    qed_empty_ba = lean_alloc_sarray(1, 0, 0);
+    lean_mark_persistent(qed_empty_ba);
+    qed_empty_str = lean_mk_string("");
+    lean_mark_persistent(qed_empty_str);
+}
+
+static inline lean_object *qed_get_empty_ba(void) {
+    pthread_once(&qed_empty_once, qed_init_empty_singletons);
+    return qed_empty_ba;
+}
+
+static inline lean_object *qed_get_empty_str(void) {
+    pthread_once(&qed_empty_once, qed_init_empty_singletons);
+    return qed_empty_str;
+}
 
 lean_object *qed_lean_io_mk_ok(lean_object *v) { return lean_io_result_mk_ok(v); }
 lean_object *qed_lean_io_mk_err(const char *msg) {
@@ -21,23 +43,31 @@ lean_object *qed_lean_mk_prod(lean_object *a, lean_object *b) {
 }
 
 lean_object *qed_lean_mk_ba(const uint8_t *data, size_t len) {
+    if (len == 0) return qed_get_empty_ba();
     lean_object *ba = lean_alloc_sarray(1, len, len);
-    if (len > 0 && data) memcpy(lean_sarray_cptr(ba), data, len);
+    if (data) memcpy(lean_sarray_cptr(ba), data, len);
     return ba;
 }
-const uint8_t *qed_lean_ba_ptr(lean_object *ba) { return lean_sarray_cptr(ba); }
+lean_object *qed_lean_alloc_ba_uninit(size_t cap) { return lean_alloc_sarray(1, 0, cap); }
+uint8_t *qed_lean_ba_ptr(lean_object *ba) { return lean_sarray_cptr(ba); }
 size_t qed_lean_ba_len(lean_object *ba) { return lean_sarray_size(ba); }
+void qed_lean_ba_set_size(lean_object *ba, size_t sz) { lean_sarray_set_size(ba, sz); }
 
+/* Caller (`mk_str(&str)` in Rust) guarantees valid UTF-8. Fast-path unchecked when NUL-free. */
 lean_object *qed_lean_mk_str_bytes(const uint8_t *data, size_t len) {
+    if (len == 0) return qed_get_empty_str();
+    if (memchr(data, 0, len) == NULL) {
+        return lean_mk_string_from_bytes_unchecked((const char *)data, len);
+    }
     return lean_mk_string_from_bytes((const char *)data, len);
 }
 const char *qed_lean_str_cstr(lean_object *s) { return lean_string_cstr(s); }
 size_t qed_lean_str_len(lean_object *s) { size_t n = lean_string_size(s); return n > 0 ? n - 1 : 0; }
 
-lean_object *qed_lean_array_empty(void) { return lean_mk_empty_array(); }
+lean_object *qed_lean_array_with_cap(size_t cap) { return lean_alloc_array(0, cap); }
 lean_object *qed_lean_array_push(lean_object *a, lean_object *v) { return lean_array_push(a, v); }
 size_t qed_lean_array_size(lean_object *a) { return lean_array_size(a); }
-lean_object *qed_lean_array_uget(lean_object *a, size_t i) { return lean_array_uget(a, i); }
+lean_object *qed_lean_array_get_core(lean_object *a, size_t i) { return lean_array_get_core(a, i); }
 
 lean_object *qed_lean_ctor_get(lean_object *o, unsigned i) { return lean_ctor_get(o, i); }
 uint8_t qed_lean_ctor_get_u8(lean_object *o, unsigned offset) { return lean_ctor_get_uint8(o, offset); }

@@ -18,15 +18,17 @@ extern "C" {
     pub fn qed_lean_mk_ctor_1(tag: libc::c_uint, a: *mut LeanObj) -> *mut LeanObj;
     pub fn qed_lean_mk_prod(a: *mut LeanObj, b: *mut LeanObj) -> *mut LeanObj;
     pub fn qed_lean_mk_ba(data: *const u8, len: usize) -> *mut LeanObj;
-    pub fn qed_lean_ba_ptr(ba: *mut LeanObj) -> *const u8;
+    pub fn qed_lean_alloc_ba_uninit(cap: usize) -> *mut LeanObj;
+    pub fn qed_lean_ba_ptr(ba: *mut LeanObj) -> *mut u8;
     pub fn qed_lean_ba_len(ba: *mut LeanObj) -> usize;
-    pub fn qed_lean_mk_str_bytes(data: *const u8, len: usize) -> *mut LeanObj;
+    pub fn qed_lean_ba_set_size(ba: *mut LeanObj, sz: usize);
+    fn qed_lean_mk_str_bytes(data: *const u8, len: usize) -> *mut LeanObj;
     pub fn qed_lean_str_cstr(s: *mut LeanObj) -> *const libc::c_char;
     pub fn qed_lean_str_len(s: *mut LeanObj) -> usize;
-    pub fn qed_lean_array_empty() -> *mut LeanObj;
+    pub fn qed_lean_array_with_cap(cap: usize) -> *mut LeanObj;
     pub fn qed_lean_array_push(arr: *mut LeanObj, v: *mut LeanObj) -> *mut LeanObj;
     pub fn qed_lean_array_size(arr: *mut LeanObj) -> usize;
-    pub fn qed_lean_array_uget(arr: *mut LeanObj, i: usize) -> *mut LeanObj;
+    pub fn qed_lean_array_get_core(arr: *mut LeanObj, i: usize) -> *mut LeanObj;
     pub fn qed_lean_ctor_get(o: *mut LeanObj, i: libc::c_uint) -> *mut LeanObj;
     pub fn qed_lean_ctor_get_u8(o: *mut LeanObj, offset: libc::c_uint) -> u8;
     pub fn qed_lean_obj_tag(o: *mut LeanObj) -> libc::c_uint;
@@ -56,7 +58,7 @@ extern "C" {
 #[inline]
 pub unsafe fn ba_slice<'a>(ba: *mut LeanObj) -> &'a [u8] {
     let len = qed_lean_ba_len(ba);
-    if len == 0 { &[] } else { slice::from_raw_parts(qed_lean_ba_ptr(ba), len) }
+    if len == 0 { &[] } else { slice::from_raw_parts(qed_lean_ba_ptr(ba).cast_const(), len) }
 }
 
 #[inline]

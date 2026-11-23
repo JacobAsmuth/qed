@@ -184,19 +184,19 @@ unsafe fn params_from_lean(params_arr: *mut LeanObj) -> Result<Vec<Value>, Strin
     let n = qed_lean_array_size(params_arr);
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let elem = LeanRef(qed_lean_array_uget(params_arr, i));
-        let val = match qed_lean_obj_tag(elem.0) {
+        let elem = qed_lean_array_get_core(params_arr, i);
+        let val = match qed_lean_obj_tag(elem) {
             0 => Value::Null,
             1 => {
                 let mut v: i64 = 0;
-                if qed_lean_int_to_i64_checked(qed_lean_ctor_get(elem.0, 0), &mut v) == 0 {
+                if qed_lean_int_to_i64_checked(qed_lean_ctor_get(elem, 0), &mut v) == 0 {
                     return Err("SQLite integer parameter out of i64 range".to_owned());
                 }
                 Value::Integer(v)
             }
-            2 => Value::Text(str_slice(qed_lean_ctor_get(elem.0, 0)).to_owned()),
-            3 => Value::Integer(if qed_lean_ctor_get_u8(elem.0, 0) != 0 { 1 } else { 0 }),
-            4 => Value::Blob(ba_slice(qed_lean_ctor_get(elem.0, 0)).to_vec()),
+            2 => Value::Text(str_slice(qed_lean_ctor_get(elem, 0)).to_owned()),
+            3 => Value::Integer(if qed_lean_ctor_get_u8(elem, 0) != 0 { 1 } else { 0 }),
+            4 => Value::Blob(ba_slice(qed_lean_ctor_get(elem, 0)).to_vec()),
             tag => return Err(format!("unknown SqlVal constructor tag {tag}")),
         };
         out.push(val);
@@ -220,10 +220,10 @@ unsafe fn exec_on_conn(conn: &Connection, sql: &str, params: &[Value]) -> Result
     if col_count > 0 {
         let mut rows = stmt.query(params_from_iter(params.iter()))
             .map_err(|e| format!("sqlite query failed: {e}"))?;
-        let mut rows_arr = LeanRef(qed_lean_array_empty());
+        let mut rows_arr = LeanRef(qed_lean_array_with_cap(0));
         let mut row_count: usize = 0;
         while let Some(row) = rows.next().map_err(|e| format!("sqlite step failed: {e}"))? {
-            let mut row_arr = LeanRef(qed_lean_array_empty());
+            let mut row_arr = LeanRef(qed_lean_array_with_cap(col_count));
             for ci in 0..col_count {
                 let v = row.get_ref(ci).map_err(|e| format!("sqlite col {ci} failed: {e}"))?;
                 row_arr.0 = qed_lean_array_push(row_arr.0, sqlite_val_to_lean(v));
@@ -235,7 +235,7 @@ unsafe fn exec_on_conn(conn: &Connection, sql: &str, params: &[Value]) -> Result
     } else {
         let affected = stmt.execute(params_from_iter(params.iter()))
             .map_err(|e| format!("sqlite execute failed: {e}"))?;
-        Ok(qed_lean_mk_prod(qed_lean_array_empty(), qed_lean_usize_to_nat(affected)))
+        Ok(qed_lean_mk_prod(qed_lean_array_with_cap(0), qed_lean_usize_to_nat(affected)))
     }
 }
 

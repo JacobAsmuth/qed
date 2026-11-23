@@ -14,7 +14,7 @@ use ring::signature::{
     RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256,
 };
 
-use crate::{encode_hex, last_errno, parse_pem_blocks};
+use crate::{last_errno, parse_pem_blocks};
 use crate::lean_ffi::*;
 
 const MAX_STATIC_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -187,6 +187,16 @@ pub unsafe extern "C" fn qed_server_get_env(name_obj: *mut LeanObj) -> *mut Lean
 pub unsafe extern "C" fn qed_server_now_ms() -> *mut LeanObj {
     let ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     qed_lean_io_mk_ok(qed_lean_box_u64(ms))
+}
+
+fn encode_hex(bs: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bs.len() * 2);
+    for &b in bs {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    out
 }
 
 #[no_mangle]

@@ -102,11 +102,6 @@ mod os_watch {
         }
     }
 
-    fn poll_in(fd: i32, timeout_ms: i32) -> i32 {
-        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        unsafe { libc::poll(&mut pfd, 1, timeout_ms) }
-    }
-
     impl OsWatcher {
         pub fn open(project_dir: &str, runtime_dir: &str, skip: HashSet<String>) -> Result<Self, String> {
             let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
@@ -210,7 +205,7 @@ mod os_watch {
                     return 0;
                 }
                 let rem_ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
-                let rc = poll_in(self.fd, rem_ms);
+                let rc = crate::poll_in(self.fd, rem_ms);
                 if rc < 0 {
                     if crate::last_errno() == libc::EINTR { continue; }
                     return CHANGE_ERROR;
@@ -219,7 +214,7 @@ mod os_watch {
                 mask |= self.drain_events();
             }
             // Brief 20ms coalesce window for atomic editor saves (write temp + rename).
-            if poll_in(self.fd, 20) > 0 { mask |= self.drain_events(); }
+            if crate::poll_in(self.fd, 20) > 0 { mask |= self.drain_events(); }
             mask
         }
     }
@@ -408,7 +403,7 @@ pub unsafe extern "C" fn qed_watch_open(
     let n = qed_lean_array_size(skip_dirs);
     let mut skip = HashSet::with_capacity(n);
     for i in 0..n {
-        let elem = qed_lean_array_uget(skip_dirs, i);
+        let elem = qed_lean_array_get_core(skip_dirs, i);
         skip.insert(str_slice(elem).to_owned());
     }
     mk_io_except(os_watch::OsWatcher::open(&proj, &rt, skip), |w| {

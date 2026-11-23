@@ -176,71 +176,44 @@ private def isCheckboxAttrs (attrStxs : Array Syntax) : Bool :=
 
 mutual
 
+private partial def isListJsxExpr (stx : Syntax) : Bool :=
+  let k := stx.getKind
+  if k == ``qedExprJsx then (stx.getArg 0).getKind == ``jsxFragment
+  else if k == ``Qed.Lang.qedRawTerm then isMapCall (stx.getArg 1)
+  else if k == ``Qed.Lang.qedParen then
+    (stx.getArg 1).getSepArgs.size == 1 && isListJsxExpr (stx.getArg 1).getSepArgs[0]!
+  else if k == ``Qed.Lang.qedIdent then (stx.getArg 0).getId.eraseMacroScopes == `children
+  else if k == ``Qed.Lang.qedTernary then
+    isListJsxExpr (stx.getArg 0) || ((stx.getArg 3).getNumArgs == 2 && isListJsxExpr ((stx.getArg 3).getArg 1))
+  else if k == ``Qed.Lang.qedExprIf then
+    isListJsxExpr (stx.getArg 3) || ((stx.getArg 4).getNumArgs == 2 && isListJsxExpr ((stx.getArg 4).getArg 1))
+  else if k == ``Qed.Lang.qedExprIfLet then
+    isListJsxExpr (stx.getArg 6) || ((stx.getArg 7).getNumArgs == 2 && isListJsxExpr ((stx.getArg 7).getArg 1))
+  else if k == ``Qed.Lang.qedExprMatch then
+    (stx.getArg 3).getArgs.any fun c => isListJsxExpr (c.getArg 3)
+  else if k == ``Qed.Lang.qedCall then
+    (stx.getArg 0).getKind == ``Qed.Lang.qedProj && ((stx.getArg 0).getArg 2).getId.eraseMacroScopes == `map
+  else k == ``Qed.Lang.qedExprFor
+
 partial def expandJsxExpr (pPath : String) (parentCtx? : Option (String × HtmlCtx)) (fallback : MacroM Term)
     (stx : Syntax) : MacroM (Term × Bool) := do
-  let jsxHook : Syntax → Qed.Lang.ExprMode → MacroM Term := fun j _ => do
-    if j.getKind == ``qedExprJsx then
-      elementToTerm pPath parentCtx? (j.getArg 0)
-    else
-      let sn := Qed.Lang.stxSnippet j
-      Macro.throwErrorAt j s!"unsupported JSX expression{if sn.isEmpty then s!"({j.getKind})" else s!" `{sn}`"}"
-  let lowerFallback : MacroM (Term × Bool) := do
-    let exp ← Qed.Lang.lowerSimpleQedExpr .val stx (allowOptElse := true)
-      (optElseFallback := fallback) (lowerJsx? := some jsxHook)
-    return (exp, isMapCall exp.raw)
-  let expandOptElse (optNode : Syntax) (isListT : Bool) : MacroM (Term × Bool) :=
-    if optNode.getNumArgs == 2 then expandJsxExpr pPath parentCtx? fallback (optNode.getArg 1)
-    else return (← if isListT then `([]) else fallback, isListT)
-  let expandIf (condIdx thenIdx elseIdx : Nat) : MacroM (Term × Bool) := do
-    let condT ← Qed.Lang.lowerSimpleQedExpr .propGuard (stx.getArg condIdx) (lowerJsx? := some jsxHook)
-    let (tT, isListT) ← expandJsxExpr pPath parentCtx? fallback (stx.getArg thenIdx)
-    let (eT, isListE) ← expandOptElse (stx.getArg elseIdx) isListT
-    return (← `(if _qedIf : $condT then $tT else $eT), isListT || isListE)
-  let k := stx.getKind
-  if k == ``qedExprJsx then
-    if (stx.getArg 0).getKind == ``jsxFragment then
-      return (← childrenToTerm pPath parentCtx? ((stx.getArg 0).getArg 1) ((stx.getArg 0).getArg 2).getArgs, true)
-    else return (← elementToTerm pPath parentCtx? (stx.getArg 0), false)
-  else if k == ``Qed.Lang.qedRawTerm then
-    return (⟨(stx.getArg 1)⟩, isMapCall (stx.getArg 1))
-  else if k == ``Qed.Lang.qedParen then
-    if (stx.getArg 1).getSepArgs.size == 1 then
-      expandJsxExpr pPath parentCtx? fallback (stx.getArg 1).getSepArgs[0]!
-    else lowerFallback
-  else if k == ``Qed.Lang.qedIdent then
-    return (⟨(stx.getArg 0)⟩, (stx.getArg 0).getId.eraseMacroScopes == `children)
-  else if k == ``Qed.Lang.qedTernary then expandIf 2 0 3
-  else if k == ``Qed.Lang.qedExprIf then expandIf 1 3 4
-  else if k == ``Qed.Lang.qedExprIfLet then
-    let patT ← Qed.Lang.lowerQedPat (stx.getArg 2)
-    let scrutT ← Qed.Lang.lowerSimpleQedExpr .val (stx.getArg 4) (lowerJsx? := some jsxHook)
-    let (tT, isListT) ← expandJsxExpr pPath parentCtx? fallback (stx.getArg 6)
-    let (eT, isListE) ← expandOptElse (stx.getArg 7) isListT
-    return (← `(if let $patT := $scrutT then $tT else $eT), isListT || isListE)
-  else if k == ``Qed.Lang.qedExprMatch then
-    let scruts ← (stx.getArg 1).getSepArgs.mapM (Qed.Lang.lowerSimpleQedExpr .val · (lowerJsx? := some jsxHook))
-    let mut anyList := false
-    let mut alts : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
-    for c in (stx.getArg 3).getArgs do
-      let pats ← (c.getArg 1).getSepArgs.mapM Qed.Lang.lowerQedPat
-      let (rhs, isL) ← expandJsxExpr pPath parentCtx? fallback (c.getArg 3)
-      if isL then anyList := true
-      alts := alts.push (← `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $rhs))
-    return (← `(match $[$scruts:term],* with $[$alts:matchAlt]*), anyList)
-  else if k == ``Qed.Lang.qedExprFor then
-    let patStx := stx.getArg 1
-    let xs ← Qed.Lang.lowerSimpleQedExpr .val (stx.getArg 3) (lowerJsx? := some jsxHook)
-    let (bodyT, isListB) ← expandJsxExpr pPath parentCtx? fallback (stx.getArg 5)
-    let fnT ← if patStx.getKind == ``Qed.Lang.qedPatIdent && (patStx.getArg 1).getNumArgs == 0 then
-        let xId : Ident := ⟨patStx.getArg 0⟩
-        `(fun $xId:ident => $bodyT)
+  let base := Qed.Lang.LowerHooks.mkDefault Macro.throwErrorAt
+  let hooks : Qed.Lang.LowerHooks MacroM := { base with
+    lowerJsx := fun j _ => do
+      if j.getKind == ``qedExprJsx then elementToTerm pPath parentCtx? (j.getArg 0)
       else
-        let patT ← Qed.Lang.lowerQedPat patStx
-        `(fun _qed_fe => match _qed_fe with | $patT => $bodyT)
-    let res ← if isListB then `((Qed.mapList (Qed.ForEachItems.toList $xs) $fnT).flatten)
-      else `(Qed.mapList (Qed.ForEachItems.toList $xs) $fnT)
-    return (res, true)
-  else lowerFallback
+        let sn := Qed.Lang.stxSnippet j
+        Macro.throwErrorAt j s!"unsupported JSX expression{if sn.isEmpty then s!"({j.getKind})" else s!" `{sn}`"}"
+    lowerType := fun s => return (← Qed.Lang.lowerQedType s false).1
+    lowerPat  := Qed.Lang.lowerQedPat
+    allowOptElse := true
+    optElseFallback := fun thenStx thenT =>
+      if isListJsxExpr thenStx || isMapCall thenT.raw then `([]) else fallback
+    wrapForMap := fun bodyStx bodyT mapT =>
+      if isListJsxExpr bodyStx || isMapCall bodyT.raw then `(($mapT).flatten) else pure mapT
+  }
+  let exp ← Qed.Lang.lowerQedExpr hooks .val stx
+  return (exp, isListJsxExpr stx || isMapCall exp.raw)
 
 partial def expandAttrVal (valNode : Syntax) (fallback : MacroM Term) : MacroM Term := do
   let inner := (valNode.getArg 1)

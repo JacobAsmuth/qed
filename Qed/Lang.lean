@@ -738,7 +738,8 @@ structure LowerHooks (m : Type → Type) where
   withLocals       : Array String → m Term → m Term
   useDirectArray   : Bool := false
   allowOptElse     : Bool := false
-  optElseFallback  : m Term
+  optElseFallback  : Syntax → Term → m Term
+  wrapForMap       : Syntax → Term → Term → m Term
   freshIdent       : String → m Ident
   throwErr         : Syntax → String → m Term
 
@@ -766,7 +767,8 @@ def LowerHooks.mkDefault {m : Type → Type} [Monad m] [MonadQuotation m]
   lowerType        := fun ref => throwErr ref "type annotations are not supported here"
   lowerPat         := fun ref => throwErr ref "patterns are not supported here"
   withLocals       := fun _ k => k
-  optElseFallback  := `(())
+  optElseFallback  := fun _ _ => `(())
+  wrapForMap       := fun _ _ t => pure t
   freshIdent       := fun pfx => pure (mkIdent (Name.mkSimple pfx))
   throwErr
 }
@@ -887,9 +889,9 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
       if isPlainLiteralOrCtor s then return t else `(Qed.Lang.QedVal.val $t)
     let finish (t : Term) : m Term :=
       if mode == .propInv || mode == .propGuard then `(qedAsProp($t)) else return t
-    let lowerOptElse (ref : Syntax) (optNode : Syntax) (errMsg : String) : m Term :=
+    let lowerOptElse (ref optNode thenStx : Syntax) (thenT : Term) (errMsg : String) : m Term :=
       if optNode.getNumArgs == 2 then go mode (optNode.getArg 1)
-      else if hooks.allowOptElse then hooks.optElseFallback
+      else if hooks.allowOptElse then hooks.optElseFallback thenStx thenT
       else hooks.throwErr ref errMsg
     match stx.getKind with
     | .str (.str (.str .anonymous "Qed") "Lang") k =>
@@ -959,7 +961,7 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
           if k == "qedTernary" then (2, 0, 3, "conditional expression `a if cond else b` requires an `else` branch here")
           else (1, 3, 4, "`if cond: ...` expression requires `else:` here")
         let (hIf, condT, thenT) := (← hooks.freshIdent "_qedIf", ← go .propGuard (stx.getArg condI), ← go mode (stx.getArg thenI))
-        let elseT ← lowerOptElse stx (stx.getArg elseI) err
+        let elseT ← lowerOptElse stx (stx.getArg elseI) (stx.getArg thenI) thenT err
         `(if $hIf:ident : $condT then $thenT else $elseT)
       | "qedLam1" | "qedLamN" => lowerLamExpr hooks go (k == "qedLam1") mode stx
       | "qedAllIn" | "qedAnyIn" =>
@@ -977,8 +979,11 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
         let bodyT ← hooks.withLocals (vIds.map (·.getId.toString)) (go mode (stx.getArg 3))
         vIds.foldrM (init := bodyT) fun vid acc => `(∀ $vid:ident, $acc)
       | "qedExprIfLet" =>
-        let elseT ← lowerOptElse stx (stx.getArg 7) "`if let pat = expr: ...` expression requires `else:` here"
-        `(if let $(← hooks.lowerPat (stx.getArg 2)) := $(← go .val (stx.getArg 4)) then $(← go mode (stx.getArg 6)) else $elseT)
+        let patT ← hooks.lowerPat (stx.getArg 2)
+        let scrutT ← go .val (stx.getArg 4)
+        let thenT ← go mode (stx.getArg 6)
+        let elseT ← lowerOptElse stx (stx.getArg 7) (stx.getArg 6) thenT "`if let pat = expr: ...` expression requires `else:` here"
+        `(if let $patT := $scrutT then $thenT else $elseT)
       | "qedExprMatch" =>
         let scruts ← (stx.getArg 1).getSepArgs.mapM (go .val)
         let alts ← (stx.getArg 3).getArgs.mapM fun c => do
@@ -987,14 +992,17 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m]
       | "qedExprFor" =>
         let patStx := stx.getArg 1
         let xsT ← go .val (stx.getArg 3)
-        let bodyT ← hooks.withLocals ((collectQedPatIds patStx).map (·.toString)) (go .val (stx.getArg 5))
+        let bodyStx := stx.getArg 5
+        let bodyT ← hooks.withLocals ((collectQedPatIds patStx).map (·.toString)) (go .val bodyStx)
         let fnT ← if patStx.getKind == ``qedPatIdent && (patStx.getArg 1).getNumArgs == 0 then
             let xId : Ident := ⟨patStx.getArg 0⟩
             `(fun $xId:ident => $bodyT)
           else
             let patT ← hooks.lowerPat patStx
             `(fun _qed_fe => match _qed_fe with | $patT => $bodyT)
-        `(Qed.mapList (Qed.ForEachItems.toList $xsT) $fnT)
+        let mapListId := mkIdentFrom stx `Qed.mapList
+        let toListId := mkIdentFrom stx `Qed.ForEachItems.toList
+        hooks.wrapForMap bodyStx bodyT (← `($mapListId ($toListId $xsT) $fnT))
       | _ => hooks.lowerJsx stx mode
     | _ => hooks.lowerJsx stx mode
   go mode stx
@@ -1012,7 +1020,7 @@ def lowerSimpleQedExpr (mode : ExprMode) (stx : Syntax)
     wrapNamedField
     lowerType := fun t => return (← lowerQedType t false).1
     lowerPat := lowerQedPat
-    allowOptElse, optElseFallback
+    allowOptElse, optElseFallback := fun _ _ => optElseFallback
   } mode stx
 
 end Qed.Lang

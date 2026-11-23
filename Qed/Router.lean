@@ -28,11 +28,8 @@ instance (priority := low) {α : Type} [LawfulJson α] : LawfulKey α where
     rw [h₁] at h₂
     exact Except.ok.inj h₂
 
-private theorem unhex_hexDigit_fin :
-    ∀ n : Fin 16, unhex (hexDigit (UInt8.ofNat n.val)) = some (UInt8.ofNat n.val) := by decide
-
 private theorem unhex_hexDigit (n : UInt8) (hn : n.toNat < 16) : unhex (hexDigit n) = some n := by
-  simpa [UInt8.ofNat_toNat] using unhex_hexDigit_fin ⟨n.toNat, hn⟩
+  simp [unhex, hexDigit, unhexNat?_hexDigitUpper hn, UInt8.ofNat_toNat]
 
 private theorem bitvec8_nibbles : ∀ x : BitVec 8,
     (((x >>> 4) <<< 4) ||| (x &&& 0x0F#8) = x) ∧ (x >>> 4#8).toNat < 16 ∧ (x &&& 0x0F#8).toNat < 16 := by
@@ -139,15 +136,8 @@ private theorem isPctEncodedChar_props {c : Char} (h : isPctEncodedChar c = true
 
 private theorem encodeUTF8Loop_nonEmpty (bs : ByteArray) (i : Nat) (hlt : i < bs.size) :
     (encodeUTF8Loop bs i "").toList ≠ [] := by
-  rw [encodeUTF8Loop.eq_1 (acc := "")]
-  simp only [hlt, ↓reduceDIte]
-  by_cases hu : isUnreserved bs[i]
-  · simp only [hu, ↓reduceIte]
-    rw [encodeUTF8Loop_toList]
-    simp
-  · simp only [hu, Bool.false_eq_true, ↓reduceIte]
-    rw [encodeUTF8Loop_toList]
-    simp
+  rw [encodeUTF8Loop.eq_1 (acc := "")]; simp only [hlt, ↓reduceDIte]
+  split <;> (rw [encodeUTF8Loop_toList]; simp)
 
 private theorem encodeSeg_nonEmpty {s : String} (hne : s ≠ "") : encodeSeg s ≠ "" := by
   have hsz : 0 < s.toUTF8.size := Nat.pos_of_ne_zero fun hz => hne (by
@@ -155,40 +145,6 @@ private theorem encodeSeg_nonEmpty {s : String} (hne : s ≠ "") : encodeSeg s �
       ByteArray.ext (Array.ext' (List.eq_nil_of_length_eq_zero (by rw [Array.length_toList]; exact hz)))
     exact String.ext_iff.2 (by simpa [String.toUTF8] using hemp))
   intro heq; exact encodeUTF8Loop_nonEmpty s.toUTF8 0 hsz (by change (encodeSeg s).toList = []; rw [heq]; rfl)
-
-private theorem isPctOrSlash_props {c : Char} (h : (isPctEncodedChar c || c == '/') = true) :
-    c ≠ '#' ∧ c ≠ '?' := by
-  simp only [Bool.or_eq_true, beq_iff_eq] at h
-  rcases h with hp | rfl
-  · exact ⟨(isPctEncodedChar_props hp).2.2, (isPctEncodedChar_props hp).2.1⟩
-  · exact ⟨by decide, by decide⟩
-
-private theorem takeWhile_pctOrSlash {cs : List Char}
-    (h : cs.all (fun c => isPctEncodedChar c || c == '/') = true) :
-    cs.takeWhile (fun c => c != '#' && c != '?') = cs := by
-  induction cs with
-  | nil => rfl
-  | cons c rest ih =>
-      simp only [List.all_cons, Bool.and_eq_true] at h
-      have ⟨hh, hq⟩ := isPctOrSlash_props h.1
-      have hpred : (c != '#' && c != '?') = true := by simp [bne_iff_ne, hh, hq]
-      simp [List.takeWhile, hpred, ih h.2]
-
-private theorem joinSlash_pctOrSlash :
-    ∀ (segs : List String),
-      (∀ s ∈ segs, s.toList.all isPctEncodedChar = true) →
-      (joinSlash segs).toList.all (fun c => isPctEncodedChar c || c == '/') = true
-  | [], _ => rfl
-  | [s], hs => by
-      have hp := hs s (by simp)
-      rw [List.all_eq_true] at hp ⊢
-      intro c hc; simp [hp c hc]
-  | s₁ :: s₂ :: rest, hs => by
-      have h1 := hs s₁ (by simp)
-      have h2 := joinSlash_pctOrSlash (s₂ :: rest) (fun x hx => hs x (by simp [hx]))
-      have h1' : s₁.toList.all (fun c => isPctEncodedChar c || c == '/') = true := by
-        rw [List.all_eq_true] at h1 ⊢; intro c hc; simp [h1 c hc]
-      simp [joinSlash, String.toList_append, h1', h2]
 
 private theorem splitSlashChars_append_nonSlash (cs rest acc : List Char)
     (hno : cs.all (· != '/') = true) :
@@ -252,7 +208,12 @@ theorem Router.fromURL_toURL {α : Type} [Router α] (a : α)
               exact beq_eq_false_iff_ne.2 (bne_iff_ne.1 h.1)
             cases xs <;> simp [joinSlash, String.toList_append, hxl, hcSlash]
   rw [hdrop, String.toList_ofList]
-  have htw := takeWhile_pctOrSlash (joinSlash_pctOrSlash _ fun s hs => (hnonempty s hs).2)
+  have hall : (joinSlash ((Router.print a).map encodeSeg)).toList.all (fun c => c != '#' && c != '?') = true :=
+    joinSlash_all _ rfl _ fun s hs => List.all_eq_true.2 fun c hc => by
+      have ⟨_, hq, hh⟩ := isPctEncodedChar_props (List.all_eq_true.1 (hnonempty s hs).2 c hc)
+      simp [bne_iff_ne, hq, hh]
+  have htw : (joinSlash ((Router.print a).map encodeSeg)).toList.takeWhile (fun c => c != '#' && c != '?') = _ :=
+    list_takeWhile_eq_self _ fun c hc => List.all_eq_true.1 hall c hc
   rw [List.takeWhile_cons, if_pos (by decide : ('/' != '#' && '/' != '?') = true), htw]
   change Router.parse (((("" :: splitSlashChars (joinSlash _).toList []).filter (· ≠ "")).map decodeSeg)) = _
   simp only [List.filter_cons, ne_eq, not_true_eq_false, decide_false, Bool.false_eq_true,

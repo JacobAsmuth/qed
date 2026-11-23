@@ -187,11 +187,8 @@ instance [LawfulJson α] : LawfulJson (Resource α) where
 instance [ToJson α] : NonNullJson (Resource α) :=
   ⟨fun | .idle | .loading | .ok _ | .failed _ => nofun⟩
 
-instance [ToJson α] : ToJson (Cached α) := .ofEquiv fun c => (c.state, c.seen)
-instance [FromJson α] : FromJson (Cached α) := .ofEquiv fun p : Resource α × List (String × α) => ⟨p.1, p.2⟩
-instance [LawfulJson α] : LawfulJson (Cached α) :=
-  .ofEquiv (fun c => (c.state, c.seen)) (fun p => ⟨p.1, p.2⟩) (fun ⟨_, _⟩ => rfl)
-instance [ToJson α] : NonNullJson (Cached α) := ⟨nofun⟩
+qed_equiv_codec% json [α] (Cached α,
+  fun c => (c.state, c.seen), fun p : Resource α × List (String × α) => ⟨p.1, p.2⟩, fun ⟨_, _⟩ => rfl)
 
 private def encodeResourceFields [ToProto α] : Resource α → List (Nat × Proto.WireVal)
   | .idle     => [(1, .varint 0)]
@@ -208,15 +205,12 @@ private def decodeResourceFields [FromProto α] (fs : List (Nat × Proto.WireVal
   | some (.varint 3) => (Proto.decodeFieldVal 2 fs "Resource.failed: missing field 2").map .failed
   | _ => .error "protobuf: invalid Resource tag"
 
-instance [ToProto α]   : ToProto (Resource α)   := .ofFields encodeResourceFields
-instance [FromProto α] : FromProto (Resource α) := .ofFields decodeResourceFields
-
-instance [LawfulProto α] : LawfulProto (Resource α) :=
-  .ofFields encodeResourceFields decodeResourceFields
-    (by intro r kw h; cases r <;>
-          (simp only [encodeResourceFields, List.mem_cons, List.not_mem_nil, or_false] at h
-           rcases h with rfl | rfl <;> simp))
-    (by intro r; cases r <;> simp [encodeResourceFields, decodeResourceFields, Proto.decodeFieldVal, Proto.lookupField, Except.map])
+qed_proto_fields% [α] (Resource α, encodeResourceFields, decodeResourceFields,
+  by intro r kw h; cases r <;>
+       (simp only [encodeResourceFields, List.mem_cons, List.not_mem_nil, or_false] at h
+        rcases h with rfl | rfl <;> simp),
+  by intro r; cases r <;>
+       simp [encodeResourceFields, decodeResourceFields, Proto.decodeFieldVal, Proto.lookupField, Except.map])
 
 /-! ## Proof-Carrying RPC Responses (`Ensured`) & Typed Domain Outcomes -/
 

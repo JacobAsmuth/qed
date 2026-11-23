@@ -21,7 +21,9 @@ def routeAltP : Parser := node `Qed.routeAlt (withPosition
   ("router " >> ident >> ":" >> checkColGt "expected indented `router` routes" >> many1Indent routeAltP)
 end RouterParsers
 
-open Lean in
+section RouterElab
+open Lean
+
 @[macro routeEnumCmd] def expandRouteEnumCmd : Macro
   | stx => do
       let t : Ident := ⟨(stx.getArg 1)⟩
@@ -59,12 +61,10 @@ open Lean in
           intro a; cases a <;> rfl
         instance : RouteParam $t:ident := ⟨$toSegId, $fromSegId, $rtId⟩)
 
-open Lean in
 private def parseRouteParam (b : Syntax) : MacroM (TSyntax `ident × TSyntax `term) := do
   let ty ← if (b.getArg 1).getNumArgs == 2 then do pure (← Qed.Lang.lowerQedType ((b.getArg 1).getArg 1) false).1 else `(String)
   pure (⟨(b.getArg 0)⟩, ty)
 
-open Lean in
 private def routePatternsOverlap (p₁ p₂ : Array (Option String)) : Bool :=
   p₁.size == p₂.size &&
   (List.range p₁.size).all fun i =>
@@ -72,7 +72,6 @@ private def routePatternsOverlap (p₁ p₂ : Array (Option String)) : Bool :=
     | some a, some b => a == b
     | _, _           => true
 
-open Lean in
 @[macro routerCmd] def expandRouterCmd : Macro
   | stx => do
       let t : Ident := ⟨(stx.getArg 1)⟩
@@ -178,4 +177,5 @@ open Lean in
             (try simp [$printId:ident, $parseId:ident, RouteParam.round_trip])
         instance : Router $t:ident := ⟨$printId, $parseId, $rtId⟩)
 
+end RouterElab
 end Qed

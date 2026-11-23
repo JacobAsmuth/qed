@@ -521,25 +521,22 @@ theorem View.validIn_render_ite_intro {σ msg : Type} (ctx : HtmlCtx) (c : Prop)
   (congrArg (Html.validIn ctx · = true) (View.render_ite c a b s)).mpr
     (Html.validIn_ite_intro ctx c (View.render a s) (View.render b s) ht hf)
 
-theorem Html.validIn_withKey_intro {msg : Type} (ctx : HtmlCtx) (k : String) (h : Html msg)
-    (hh : Html.validIn ctx h = true) : Html.validIn ctx (withKey k h) = true :=
-  (Html.validIn_withKey ctx k h).trans hh
+local macro "valid_pres_intro " thm:ident " [" bs:ident* "] "
+    argTy:term ", " targetTy:term ", " pred:ident ", " op:term " via " eqLem:ident : command =>
+  `(theorem $thm {$bs:ident* : Type} (ctx : HtmlCtx) (a : $argTy) (x : $targetTy)
+        (hx : $pred ctx x = true) : $pred ctx ($op a x) = true :=
+      ($eqLem ctx a x).trans hx)
 
-theorem Html.validIn_map_intro {α β : Type} (ctx : HtmlCtx) (f : α → β) (h : Html α)
-    (hh : Html.validIn ctx h = true) : Html.validIn ctx (h.map f) = true :=
-  (Html.validIn_map ctx f h).trans hh
-
-theorem Html.validListIn_mapChildren_intro {α β : Type} (ctx : HtmlCtx) (f : α → β) (cs : List (Html α))
-    (hcs : Html.validListIn ctx cs = true) : Html.validListIn ctx (Html.mapChildren f cs) = true :=
-  (Html.validListIn_mapChildren ctx f cs).trans hcs
-
-theorem Html.validIn_prefixSignals_intro {msg : Type} (ctx : HtmlCtx) (pfx : String) (h : Html msg)
-    (hh : Html.validIn ctx h = true) : Html.validIn ctx (h.prefixSignals pfx) = true :=
-  (Html.validIn_prefixSignals ctx pfx h).trans hh
-
-theorem Html.validListIn_prefixSignalsList_intro {msg : Type} (ctx : HtmlCtx) (pfx : String) (cs : List (Html msg))
-    (hcs : Html.validListIn ctx cs = true) : Html.validListIn ctx (Html.prefixSignalsList pfx cs) = true :=
-  (Html.validListIn_prefixSignalsList ctx pfx cs).trans hcs
+valid_pres_intro Html.validIn_withKey_intro [msg] String, Html msg,
+  Html.validIn, withKey via Html.validIn_withKey
+valid_pres_intro Html.validIn_map_intro [α β] (α → β), Html α,
+  Html.validIn, (fun f h => h.map f) via Html.validIn_map
+valid_pres_intro Html.validListIn_mapChildren_intro [α β] (α → β), List (Html α),
+  Html.validListIn, Html.mapChildren via Html.validListIn_mapChildren
+valid_pres_intro Html.validIn_prefixSignals_intro [msg] String, Html msg,
+  Html.validIn, (fun p h => h.prefixSignals p) via Html.validIn_prefixSignals
+valid_pres_intro Html.validListIn_prefixSignalsList_intro [msg] String, List (Html msg),
+  Html.validListIn, Html.prefixSignalsList via Html.validListIn_prefixSignalsList
 
 def View.ofHtml (f : σ → Html msg) : View σ msg := .dynNode f
 
@@ -909,55 +906,45 @@ private def CompiledTmpl.toRowTmpl {α σ msg : Type} (c : CompiledTmpl α msg)
       | some a, some f => some (f a)
       | _, _ => none }
 
+-- `hasOpaque` rows can change props/closures without changing signal leaves, so fall back to `dynNode` diff.
+@[reducible] def forEachBlocked {α msg : Type} (tag : String) (child : View α msg) : Bool :=
+  child.hasOpaque ||
+    ((tagBlocksDirectSpan tag && child.isDyn) ||
+     (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))
+
 def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → String)
     (child : View α msg) (attrs : List (VAttr σ msg) := []) (sigPrefix : String := "") : View σ msg :=
-  -- `hasOpaque` rows can change props/closures without changing signal leaves, so fall back to `dynNode` diff.
-  let directDynBlocked :=
-    (tagBlocksDirectSpan tag && child.isDyn) ||
-    (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty)
-  if child.hasOpaque || directDynBlocked then
+  if forEachBlocked tag child then
     .dynNode fun s => .element tag (attrs.map (VAttr.eval s))
       (((items s).map fun a => withKey (key a) (child.render a)).toList)
-  else if isDirectTmpl child then
-    let c := compileRowTmpl child
-    let rawKeys : σ → Array String := fun s => (items s).map key
-    .keyedList tag attrs
-      rawKeys
-      (fun s => (items s).map (fun a => Qed.refMark a))
-      (fun _ _ _ => #[])
-      (fun _ _ _ => #[])
-      (fun s => ((items s).map fun a => withKey (key a) (child.render a)).toList)
-      (some (c.toRowTmpl items key))
   else
-    let projs := View.collectDyn child
-    let evProjs := View.collectDynOn child
     let rawKeys : σ → Array String := fun s => (items s).map key
-    .keyedList tag attrs
-      rawKeys
-      (fun s => (items s).map (fun a => Qed.refMark a))
-      (fun s uKeys i => match (items s)[i]? with
-        | some a =>
-            let sk := sigPrefix ++ uKeys.getD i (key a)
-            (projs.mapIdx fun j p => (s!"{sk}#{j}", p a)).toArray
-        | none => #[])
-      (fun s uKeys i => match (items s)[i]? with
-        | some a =>
-            let sk := sigPrefix ++ uKeys.getD i (key a)
-            (evProjs.mapIdx fun j p => (s!"{sk}#e{j}", p a)).toArray
-        | none => #[])
-      (fun s =>
-        let ks := disambiguateKeys (rawKeys s)
-        (items s).toList.zipIdx.map fun (a, i) =>
-          let uk := ks.getD i (key a)
-          withKey uk (View.renderSig child a (sigPrefix ++ uk) 0).1)
-      none
+    let marks : σ → Array USize := fun s => (items s).map fun a => Qed.refMark a
+    if isDirectTmpl child then
+      .keyedList tag attrs rawKeys marks (fun _ _ _ => #[]) (fun _ _ _ => #[])
+        (fun s => ((items s).map fun a => withKey (key a) (child.render a)).toList)
+        (some ((compileRowTmpl child).toRowTmpl items key))
+    else
+      let mkSigRow {β : Type} (sep : String) (ps : List (α → β)) : σ → Array String → Nat → Array (String × β) :=
+        fun s uKeys i => match (items s)[i]? with
+          | some a =>
+              let sk := sigPrefix ++ uKeys.getD i (key a)
+              (ps.mapIdx fun j p => (s!"{sk}{sep}{j}", p a)).toArray
+          | none => #[]
+      .keyedList tag attrs rawKeys marks
+        (mkSigRow "#" (View.collectDyn child)) (mkSigRow "#e" (View.collectDynOn child))
+        (fun s =>
+          let ks := disambiguateKeys (rawKeys s)
+          (items s).toList.zipIdx.map fun (a, i) =>
+            let uk := ks.getD i (key a)
+            withKey uk (View.renderSig child a (sigPrefix ++ uk) 0).1)
+        none
 
 @[simp] theorem render_forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → String)
     (child : View α msg) (attrs : List (VAttr σ msg)) (sigPrefix : String) (s : σ) :
     (forEach tag items key child attrs sigPrefix).render s =
       .element tag (attrs.map (VAttr.eval s))
-        (if child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
-            (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty)) || isDirectTmpl child
+        (if forEachBlocked tag child || isDirectTmpl child
          then ((items s).map fun a => withKey (key a) (child.render a)).toList
          else
            let ks := disambiguateKeys ((items s).map key)
@@ -965,15 +952,9 @@ def forEach {α : Type} (tag : String) (items : σ → Array α) (key : α → S
              let uk := ks.getD i (key a)
              withKey uk (View.renderSig child a (sigPrefix ++ uk) 0).1) := by
   dsimp only [forEach]
-  by_cases h1 : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
-      (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))) = true
-  · simp [h1, View.render]
-  · have hf1 : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
-        (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))) = false := Bool.eq_false_iff.2 h1
-    by_cases h2 : isDirectTmpl child = true
-    · simp [hf1, h2, View.render]
-    · have hf2 : isDirectTmpl child = false := Bool.eq_false_iff.2 h2
-      simp [hf1, hf2, View.render]
+  cases forEachBlocked tag child
+  · cases isDirectTmpl child <;> simp [View.render]
+  · simp [View.render]
 
 private theorem zipIdx_map_fst {α β : Type _} (g : α → β) :
     ∀ (xs : List α) (k : Nat), (xs.zipIdx k).map (fun p => g p.1) = xs.map g
@@ -987,13 +968,9 @@ private theorem zipIdx_map_fst {α β : Type _} (g : α → β) :
       mkCanonicalElem tag (attrs.map (VAttr.eval s))
         ((items s).toList.map fun a => Html.canonical (child.render a)) := by
   rw [render_forEach, Html.canonical_element]
-  by_cases h : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
-      (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty)) || isDirectTmpl child) = true
-  · simp [h, Array.toList_map]
-  · have hf : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
-        (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty)) || isDirectTmpl child) = false := Bool.eq_false_iff.2 h
-    simp [hf]
-    rw [zipIdx_map_fst (fun a => (child.render a).canonical) (items s).toList 0]
+  cases (forEachBlocked tag child || isDirectTmpl child)
+  · simp; rw [zipIdx_map_fst (fun a => (child.render a).canonical) (items s).toList 0]
+  · simp [Array.toList_map]
 
 mutual
   def View.sigSafeIn {σ msg : Type} (ctx : HtmlCtx) : View σ msg → Bool
@@ -1082,31 +1059,22 @@ theorem validIn_render_forEach {α σ msg : Type} (ctx childCtx : HtmlCtx) (tag 
     (hcell : (!Attr.hasLocalCell (attrs.map (VAttr.eval s))) = true)
     (hattrs : Attr.validList (attrs.map (VAttr.eval s)) = true)
     (hchild : ∀ a, Html.validIn childCtx (child.render a) = true)
-    (hsig : (child.hasOpaque ||
-              ((tagBlocksDirectSpan tag && child.isDyn) ||
-               (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty)) ||
-              View.sigSafeIn childCtx child) = true) :
+    (hsig : (forEachBlocked tag child || View.sigSafeIn childCtx child) = true) :
     Html.validIn ctx ((forEach tag items key child attrs sigPrefix).render s) = true := by
   rw [render_forEach]
   simp only [Html.validIn, hstep, hattrs, hvoid, hcell, Bool.not_false, Bool.true_or, Bool.true_and]
-  by_cases hc : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
-      (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty)) || isDirectTmpl child) = true
-  · simp only [hc, ↓reduceIte, Html.validListIn_toList_map, List.all_eq_true]
-    intro a _
-    rw [Html.validIn_withKey]
-    exact hchild a
-  · have hfalse : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
-        (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty)) || isDirectTmpl child) = false := Bool.eq_false_iff.2 hc
-    have hfalse0 : (child.hasOpaque || ((tagBlocksDirectSpan tag && child.isDyn) ||
-        (tagBlocksSpanSubtree tag && !(View.collectDyn child).isEmpty))) = false := by
-      simpa [Bool.or_eq_false_iff] using (Bool.or_eq_false_iff.1 hfalse).1
-    have hsafe : View.sigSafeIn childCtx child = true := by
-      simpa [hfalse0] using hsig
-    simp only [hfalse, Bool.false_eq_true, ↓reduceIte, Html.validListIn_map, List.all_eq_true]
+  cases hc : (forEachBlocked tag child || isDirectTmpl child)
+  · have hsafe : View.sigSafeIn childCtx child = true := by
+      simpa [(Bool.or_eq_false_iff.1 hc).1] using hsig
+    simp only [Bool.false_eq_true, ↓reduceIte, Html.validListIn_map, List.all_eq_true]
     rintro ⟨a, i⟩ _
     dsimp only
     rw [Html.validIn_withKey]
     exact View.validIn_renderSig_of_sigSafe childCtx child a _ 0 0 hsafe (hchild a)
+  · simp only [↓reduceIte, Html.validListIn_toList_map, List.all_eq_true]
+    intro a _
+    rw [Html.validIn_withKey]
+    exact hchild a
 
 end V
 

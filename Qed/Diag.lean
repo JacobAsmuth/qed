@@ -95,19 +95,9 @@ def stripStatePrefixes (s : String) (prefixes : List String := []) : String := I
   return String.ofList out.toList
 
 /-- Collapses runs of whitespace/newlines into single spaces for compact one-line obligations. -/
-private def collapseSpaces (s : String) : String := Id.run do
-  let mut out : Array Char := #[]
-  let mut prevWs := false
-  for c in s.toList do
-    if c.isWhitespace then
-      if !prevWs && !out.isEmpty then
-        out := out.push ' '
-        prevWs := true
-    else
-      out := out.push c
-      prevWs := false
-  let res := String.ofList out.toList
-  if res.endsWith " " then String.ofList res.toList.dropLast else res
+private def collapseSpaces (s : String) : String :=
+  String.intercalate " " ((s.split Char.isWhitespace).toList.filterMap fun sl =>
+    if sl.isEmpty then none else some sl.toString)
 
 /-- Rewrites `¬a = b` and `¬(a = b)` clauses (including inside `∧`, `∨`, `→` compounds) to `a != b`. -/
 private def rewriteNotEqAtom (chunk : String) : String :=
@@ -145,10 +135,8 @@ def toQedAscii (raw : String) (stripPrefixes : List String := []) : String :=
 /-! ## Case Tag Formatting -/
 
 private def isSplitSuffix (s : String) : Bool :=
-  s == "pos" || s == "neg" || s == "inl" || s == "inr" ||
-  s == "isTrue" || s == "isFalse" || s == "intro" || s == "mk" ||
-  s == "left" || s == "right" || s == "some" || s == "none" ||
-  s == "ok" || s == "err" || s == "failed" || s == "loading" || s == "idle" ||
+  ["pos", "neg", "inl", "inr", "isTrue", "isFalse", "intro", "mk", "left", "right",
+   "some", "none", "ok", "err", "failed", "loading", "idle"].contains s ||
   s.startsWith "h_" || s.startsWith "case" || s.all Char.isDigit
 
 /-- Extracts the root component/message tag, dropping `step.` prefixes and tactic split suffixes. -/
@@ -198,7 +186,9 @@ private def cleanQedUnwrapTable : Array (Lean.Name × Nat × Nat) := #[
   (`Qed.Lang.QedSeqLit.ofList, 4, 3), (``id, 2, 1)
 ]
 
-open Lean Meta in
+section MetaHelpers
+open Lean Meta Elab Tactic Command
+
 /-- Unwraps internal Qed wrapper projections/coercions (`QedVal.val`, `Field.val`, `Ensured.val`,
     `SrvIdx.toNat`, `SrvLiftOpt.liftOpt`, `QedSeqLit.ofList`, `id`) so pretty-printed proof
     obligations read like the user's source code. -/
@@ -216,16 +206,15 @@ def cleanQedExpr (e : Expr) : MetaM Expr := do
         return .continue)
 
 /-- Returns the root component of the module defining `n`, or `fallback.getRoot` for current-module declarations. -/
-def modRootOf (env : Lean.Environment) (n : Lean.Name) (fallback : Lean.Name := .anonymous) : Lean.Name :=
+def modRootOf (env : Environment) (n : Name) (fallback : Name := .anonymous) : Name :=
   match env.getModuleIdxFor? n with
   | some idx => (env.header.moduleNames.getD idx.toNat fallback).getRoot
   | none     => fallback.getRoot
 
 /-- Checks whether `root` belongs to the Lean toolchain (`Init`, `Std`, `Lean`, `Lake`) and optionally `Qed`. -/
-def isToolchainRoot (root : Lean.Name) (includeQed : Bool := false) : Bool :=
+def isToolchainRoot (root : Name) (includeQed : Bool := false) : Bool :=
   root == `Init || root == `Std || root == `Lean || root == `Lake || (includeQed && root == `Qed)
 
-open Lean Meta in
 /-- Pretty-prints a Lean expression in clean Qed-native ASCII syntax. -/
 def ppQedExpr (e : Expr) (stripPrefixes : List String := []) : MetaM String := do
   let cleaned ← cleanQedExpr e
@@ -233,10 +222,10 @@ def ppQedExpr (e : Expr) (stripPrefixes : List String := []) : MetaM String := d
   return toQedAscii fmt.pretty stripPrefixes
 
 /-- Registers a persistent `NameMap` environment extension keyed by `keyOf`. -/
-def mkNameMapExt {α : Type} [Inhabited α] (keyOf : α → Lean.Name)
-    (name : Lean.Name := by exact decl_name%) :
-    IO (Lean.SimplePersistentEnvExtension α (Lean.NameMap α)) :=
-  Lean.registerSimplePersistentEnvExtension {
+def mkNameMapExt {α : Type} [Inhabited α] (keyOf : α → Name)
+    (name : Name := by exact decl_name%) :
+    IO (SimplePersistentEnvExtension α (NameMap α)) :=
+  registerSimplePersistentEnvExtension {
     name := name
     addImportedFn := fun arrays =>
       arrays.foldl (fun acc arr => arr.foldl (fun m info => m.insert (keyOf info) info) acc) {}
@@ -246,9 +235,9 @@ def mkNameMapExt {α : Type} [Inhabited α] (keyOf : α → Lean.Name)
 /-- Resolves `ref` inside a `NameMap α` by trying `currNs ++ clean`, `clean`, open namespaces,
     and Lean global name resolution (either directly on `clean` or via a probe suffix whose
     resolved prefix is looked up in `reg`). -/
-def lookupNameMap? {α : Type} (reg : Lean.NameMap α) (env : Lean.Environment)
-    (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (ref : Lean.Name)
-    (probeSuffix? : Option Lean.Name := none) : Option α :=
+def lookupNameMap? {α : Type} (reg : NameMap α) (env : Environment)
+    (currNs : Name) (openDecls : List OpenDecl) (ref : Name)
+    (probeSuffix? : Option Name := none) : Option α :=
   let clean := ref.eraseMacroScopes
   (reg.find? (currNs ++ clean)).orElse fun _ =>
     (reg.find? clean).orElse fun _ =>
@@ -258,28 +247,27 @@ def lookupNameMap? {α : Type} (reg : Lean.NameMap α) (env : Lean.Environment)
       fromOpen.orElse fun _ =>
         match probeSuffix? with
         | some suf =>
-            (Lean.ResolveName.resolveGlobalName env {} currNs openDecls (clean ++ suf)).findSome?
+            (ResolveName.resolveGlobalName env {} currNs openDecls (clean ++ suf)).findSome?
               fun (full, _) => reg.find? full.getPrefix
         | none =>
-            (Lean.ResolveName.resolveGlobalName env {} currNs openDecls clean).findSome?
+            (ResolveName.resolveGlobalName env {} currNs openDecls clean).findSome?
               fun (full, _) => reg.find? full
 
 /-- Resolves `ref` inside a persistent `NameMap` environment extension. -/
 def lookupNameMapExt? {α : Type} [Inhabited α]
-    (ext : Lean.SimplePersistentEnvExtension α (Lean.NameMap α))
-    (env : Lean.Environment) (currNs : Lean.Name)
-    (openDecls : List Lean.OpenDecl) (ref : Lean.Name)
-    (probeSuffix? : Option Lean.Name := none) : Option α :=
+    (ext : SimplePersistentEnvExtension α (NameMap α))
+    (env : Environment) (currNs : Name)
+    (openDecls : List OpenDecl) (ref : Name)
+    (probeSuffix? : Option Name := none) : Option α :=
   lookupNameMap? (ext.getState env) env currNs openDecls ref probeSuffix?
 
 /-- Recursively checks whether a `Language.SnapshotTree` contains any logged errors. -/
-def snapshotTreeHasErrors : Nat → Lean.Language.SnapshotTree → Bool
+def snapshotTreeHasErrors : Nat → Language.SnapshotTree → Bool
   | 0, tree => tree.element.diagnostics.msgLog.hasErrors
   | fuel + 1, tree =>
       tree.element.diagnostics.msgLog.hasErrors ||
       tree.children.any fun t => snapshotTreeHasErrors fuel t.get
 
-open Lean Meta Elab Tactic in
 /-- Formats unsolved goals via `formatGoal?` (deduplicating and optionally capping the list)
     and throws a structured diagnostic error when any goal remains. -/
 def throwUnsolvedGoals
@@ -316,7 +304,6 @@ def throwUnsolvedGoals
   | some ref => throwErrorAt ref fullMsg
   | none     => throwError fullMsg
 
-open Lean Elab Command in
 /-- Runs `action` inside `liftTermElabM` while rolling back `Command.State`, returning the result
     (or `none` on exception) together with any messages logged during the probe. -/
 def probeTermElabMsgs {α : Type} (action : Term.TermElabM α) :
@@ -328,11 +315,12 @@ def probeTermElabMsgs {α : Type} (action : Term.TermElabM α) :
   set saved
   return (res?, newMsgs)
 
-open Lean Elab Command in
 /-- Probes a `TermElabM Bool` check in isolation, returning `true` iff it succeeds with `true`
     and logs no error messages. -/
 def probeTermElabOk (action : Term.TermElabM Bool) : CommandElabM Bool := do
   let (res?, msgs) ← probeTermElabMsgs action
   return res? == some true && msgs.all (·.severity != .error)
+
+end MetaHelpers
 
 end Qed.Diag

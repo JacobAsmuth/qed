@@ -38,12 +38,7 @@ instance : LawfulKey Bool where
   toKey | true => "1" | false => "0"
   injective a₁ a₂ h := by cases a₁ <;> cases a₂ <;> simp_all
 
-def hexDigit (n : UInt8) : Char :=
-  match n.toNat % 16 with
-  | 0 => '0' | 1 => '1' | 2 => '2' | 3 => '3' | 4 => '4'
-  | 5 => '5' | 6 => '6' | 7 => '7' | 8 => '8' | 9 => '9'
-  | 10 => 'A' | 11 => 'B' | 12 => 'C' | 13 => 'D' | 14 => 'E'
-  | _ => 'F'
+abbrev hexDigit (n : UInt8) : Char := hexDigitUpper n.toNat
 
 def isUnreserved (b : UInt8) : Bool :=
   let c := b.toNat
@@ -58,9 +53,12 @@ def isUnreserved (b : UInt8) : Bool :=
 @[inline] def isSafePathBodyChar (c : Char) : Bool :=
   isSafeUrlChar c && c.toNat != 92
 
+private theorem isPctEncodedChar_hexDigitUpper_fin :
+    ∀ d : Fin 16, isPctEncodedChar (hexDigitUpper d.val) = true := by decide
+
 theorem isPctEncodedChar_hexDigit (n : UInt8) :
     isPctEncodedChar (hexDigit n) = true := by
-  unfold hexDigit; split <;> rfl
+  simpa [hexDigit, hexDigitUpper] using isPctEncodedChar_hexDigitUpper_fin ⟨n.toNat % 16, Nat.mod_lt _ (by omega)⟩
 
 theorem isPctEncodedChar_unreserved {b : UInt8} (h : isUnreserved b = true) :
     isPctEncodedChar (Char.ofNat b.toNat) = true := by
@@ -117,12 +115,7 @@ theorem encodeSeg_safe (s : String) :
   simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq, bne_iff_ne] at h ⊢
   omega
 
-def unhex (c : Char) : Option UInt8 :=
-  let n := c.toNat
-  if 48 ≤ n && n ≤ 57 then some (UInt8.ofNat (n - 48))
-  else if 65 ≤ n && n ≤ 70 then some (UInt8.ofNat (n - 55))
-  else if 97 ≤ n && n ≤ 102 then some (UInt8.ofNat (n - 87))
-  else none
+@[inline] def unhex (c : Char) : Option UInt8 := (unhexNat? c).map UInt8.ofNat
 
 def decodeBytes : List Char → ByteArray → ByteArray
   | '%' :: h :: l :: rest, acc =>
@@ -140,15 +133,14 @@ def joinSlash : List String → String
   | [s]     => s
   | s :: ss => s ++ "/" ++ joinSlash ss
 
-private theorem joinSlash_safe :
+theorem joinSlash_all (p : Char → Bool) (hslash : p '/' = true) :
     ∀ (segs : List String),
-      (∀ s ∈ segs, s.toList.all isSafePathBodyChar = true) →
-      (joinSlash segs).toList.all isSafePathBodyChar = true
+      (∀ s ∈ segs, s.toList.all p = true) →
+      (joinSlash segs).toList.all p = true
   | [], _ => rfl
   | [s], hs => hs s (by simp)
   | s₁ :: s₂ :: rest, hs => by
-      have hslash : isSafePathBodyChar '/' = true := rfl
-      have ih := joinSlash_safe (s₂ :: rest) (fun x hx => hs x (by simp [hx]))
+      have ih := joinSlash_all p hslash (s₂ :: rest) (fun x hx => hs x (by simp [hx]))
       simp [joinSlash, String.toList_append, hs s₁ (by simp), hslash, ih]
 
 private theorem dropWhile_slash_safe :
@@ -177,11 +169,9 @@ def Router.toURL {α} [Router α] (a : α) : String :=
     isSafeUrl (Router.toURL a) = true := by
   unfold Router.toURL isSafeUrl
   rw [String.toList_ofList]
-  have hbody : (joinSlash ((Router.print a).map encodeSeg)).toList.all isSafePathBodyChar = true := by
-    apply joinSlash_safe
-    intro s hs
-    rcases List.mem_map.1 hs with ⟨raw, _, rfl⟩
-    exact encodeSeg_safe raw
+  have hbody : (joinSlash ((Router.print a).map encodeSeg)).toList.all isSafePathBodyChar = true :=
+    joinSlash_all isSafePathBodyChar rfl _ fun s hs => by
+      rcases List.mem_map.1 hs with ⟨raw, _, rfl⟩; exact encodeSeg_safe raw
   have ⟨hpfx, hall⟩ := dropWhile_slash_safe _ hbody
   exact Bool.and_eq_true_iff.2 ⟨hpfx, hall⟩
 

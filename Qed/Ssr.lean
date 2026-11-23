@@ -130,6 +130,12 @@ private structure SsrNeed where
   body   : String
   bin    : Bool
 
+@[reducible] def ssrSlotText (slot : Bool × Bool × String) : Except String String :=
+  if slot.1 then .ok slot.2.2 else .error slot.2.2
+
+@[reducible] def ssrSlotBytes (slot : Bool × Bool × String) : Except String ByteArray :=
+  if slot.1 then if slot.2.1 then Proto.decodeHex slot.2.2 else .ok slot.2.2.toUTF8 else .error slot.2.2
+
 private def ssrDrain (app : App Model Msg) (results : Array (Bool × Bool × String)) :
     Model → List (Cmd Msg) → Nat → Array SsrNeed →
     Model × Array SsrNeed
@@ -138,20 +144,13 @@ private def ssrDrain (app : App Model Msg) (results : Array (Bool × Bool × Str
     match c with
     | .request method url body onResult =>
         if h : needs.isEmpty ∧ i < results.size then
-          let (ok, _, text) := results[i]
-          let (m', c') := app.update m (onResult (if ok then .ok text else .error text))
+          let (m', c') := app.update m (onResult (ssrSlotText results[i]))
           ssrDrain app results m' (rest ++ Cmd.flatten c') (i + 1) needs
         else
           ssrDrain app results m rest i (needs.push ⟨method, url, body, false⟩)
     | .requestBytes method url body onResult =>
         if h : needs.isEmpty ∧ i < results.size then
-          let (ok, isBin, raw) := results[i]
-          let res : Except String ByteArray :=
-            if ok then
-              if isBin then Proto.decodeHex raw else .ok raw.toUTF8
-            else
-              .error raw
-          let (m', c') := app.update m (onResult res)
+          let (m', c') := app.update m (onResult (ssrSlotBytes results[i]))
           ssrDrain app results m' (rest ++ Cmd.flatten c') (i + 1) needs
         else
           ssrDrain app results m rest i (needs.push ⟨method, url, Proto.encodeHex body, true⟩)
@@ -321,22 +320,19 @@ inductive SsrResultsMatch {Model Msg : Type} (app : App Model Msg)
   | reqHit {i : Nat} (hi : i < results.size) (method url body : String)
       (onResult : Except String String → Msg) (m : Model) (rest : List (Cmd Msg))
       (fuel : Nat) (mFinal : Model)
-      (hdisp : dispatchText method url body =
-        if results[i].1 then .ok results[i].2.2 else .error results[i].2.2) :
+      (hdisp : dispatchText method url body = ssrSlotText results[i]) :
       SsrResultsMatch app results dispatchBytes dispatchText (i + 1)
-        (app.update m (onResult (if results[i].1 then .ok results[i].2.2 else .error results[i].2.2))).1
-        (rest ++ Cmd.flatten (app.update m (onResult (if results[i].1 then .ok results[i].2.2 else .error results[i].2.2))).2)
+        (app.update m (onResult (ssrSlotText results[i]))).1
+        (rest ++ Cmd.flatten (app.update m (onResult (ssrSlotText results[i]))).2)
         fuel mFinal →
       SsrResultsMatch app results dispatchBytes dispatchText i m (.request method url body onResult :: rest) (fuel + 1) mFinal
   | reqBytesHit {i : Nat} (hi : i < results.size) (method url : String) (body : ByteArray)
       (onResult : Except String ByteArray → Msg) (m : Model) (rest : List (Cmd Msg))
       (fuel : Nat) (mFinal : Model)
-      (hdisp : dispatchBytes method url body =
-        if results[i].1 then if results[i].2.1 then Proto.decodeHex results[i].2.2 else .ok results[i].2.2.toUTF8
-        else .error results[i].2.2) :
+      (hdisp : dispatchBytes method url body = ssrSlotBytes results[i]) :
       SsrResultsMatch app results dispatchBytes dispatchText (i + 1)
-        (app.update m (onResult (if results[i].1 then if results[i].2.1 then Proto.decodeHex results[i].2.2 else .ok results[i].2.2.toUTF8 else .error results[i].2.2))).1
-        (rest ++ Cmd.flatten (app.update m (onResult (if results[i].1 then if results[i].2.1 then Proto.decodeHex results[i].2.2 else .ok results[i].2.2.toUTF8 else .error results[i].2.2))).2)
+        (app.update m (onResult (ssrSlotBytes results[i]))).1
+        (rest ++ Cmd.flatten (app.update m (onResult (ssrSlotBytes results[i]))).2)
         fuel mFinal →
       SsrResultsMatch app results dispatchBytes dispatchText i m (.requestBytes method url body onResult :: rest) (fuel + 1) mFinal
   | skip {i : Nat} (c : Cmd Msg) (hnot : (∀ m u b cb, c ≠ .request m u b cb) ∧ (∀ m u b cb, c ≠ .requestBytes m u b cb))
@@ -451,13 +447,6 @@ def ssrDispatchRpc (srvShort : String) (methods : List String)
   else
     .error s!"SSR unknown binary RPC endpoint: {url}"
 
-private theorem takeWhile_eq_self (p : Char → Bool) :
-    ∀ (xs : List Char), (∀ c ∈ xs, p c = true) → xs.takeWhile p = xs
-  | [], _ => rfl
-  | x :: xs, h => by
-      simp only [List.takeWhile_cons, h x List.mem_cons_self, ↓reduceIte]
-      exact congrArg (x :: ·) (takeWhile_eq_self p xs fun c hc => h c (List.mem_cons_of_mem _ hc))
-
 /-- Any binary RPC endpoint targeting `srvShort` and a declared method `m ∈ methods`
     routes directly to `dispatchMethod m reqBody` during in-memory SSR. -/
 theorem ssr_rpc_endpoint_routed (srvShort : String) (methods : List String)
@@ -479,7 +468,7 @@ theorem ssr_rpc_endpoint_routed (srvShort : String) (methods : List String)
     · exact (by decide : ∀ x ∈ "/".toList, x ≠ '?') c h
     · exact hmNoQ c h
   have hpath : String.ofList ((pfx ++ m).toList.takeWhile (· ≠ '?')) = pfx ++ m := by
-    rw [takeWhile_eq_self _ _ fun c hc => decide_eq_true (hnoQ c hc), String.ofList_toList]
+    rw [list_takeWhile_eq_self _ fun c hc => decide_eq_true (hnoQ c hc), String.ofList_toList]
   have hdrop : (pfx ++ m).toList.drop pfx.length = m.toList := by
     rw [String.toList_append, ← String.length_toList (s := pfx), List.drop_left]
   have hsw : (pfx ++ m).startsWith pfx = true := by simp [String.startsWith]

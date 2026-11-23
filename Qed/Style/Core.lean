@@ -166,11 +166,7 @@ instance : ToString Time := ⟨Time.raw⟩
 
 /-! ## Colors & Hex Parsing -/
 
-def hexDigitVal? (c : Char) : Option Nat :=
-  if '0' ≤ c && c ≤ '9' then some (c.toNat - '0'.toNat)
-  else if 'a' ≤ c && c ≤ 'f' then some (c.toNat - 'a'.toNat + 10)
-  else if 'A' ≤ c && c ≤ 'F' then some (c.toNat - 'A'.toNat + 10)
-  else none
+abbrev hexDigitVal? : Char → Option Nat := unhexNat?
 
 private def stripHashChars (raw : String) : List Char :=
   match raw.toList with
@@ -284,18 +280,11 @@ def cssHashLoop : List UInt8 → UInt64 → UInt64
 def cssHash (s : String) : UInt64 :=
   cssHashLoop s.toUTF8.data.toList 1469598103934665603
 
-private def hexChar (n : Nat) : Char :=
-  match n % 16 with
-  | 0 => '0' | 1 => '1' | 2 => '2' | 3 => '3'
-  | 4 => '4' | 5 => '5' | 6 => '6' | 7 => '7'
-  | 8 => '8' | 9 => '9' | 10 => 'a' | 11 => 'b'
-  | 12 => 'c' | 13 => 'd' | 14 => 'e' | _ => 'f'
-
 def shortHexHash (h : UInt64) : String :=
   let v := h.toNat
   String.ofList [
-    hexChar (v / 268435456), hexChar (v / 16777216), hexChar (v / 1048576), hexChar (v / 65536),
-    hexChar (v / 4096),      hexChar (v / 256),      hexChar (v / 16),      hexChar v
+    hexDigitLower (v / 268435456), hexDigitLower (v / 16777216), hexDigitLower (v / 1048576), hexDigitLower (v / 65536),
+    hexDigitLower (v / 4096),      hexDigitLower (v / 256),      hexDigitLower (v / 16),      hexDigitLower v
   ]
 
 structure Style where

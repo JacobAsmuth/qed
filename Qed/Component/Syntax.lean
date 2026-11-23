@@ -264,9 +264,19 @@ def isAwaitStmt (s : Syntax) : Bool :=
   (k == ``qedStmtLet && (unwrapParens1 (s.getArg 4)).getKind == ``qedAwait) ||
   (k == ``qedStmtAssign && (unwrapParens1 (s.getArg 2)).getKind == ``qedAwait)
 
+def isCollMutExpr (e : Syntax) : Bool :=
+  (matchPushCall? e).isSome || (matchRemoveCall? e).isSome
+
+def pushUnique {α : Type} [BEq α] (xs : Array α) (x : α) : Array α :=
+  if xs.contains x then xs else xs.push x
+
+def unpackBindProp (nm : String) (v : Term) : MacroM (Option (String × Term × Term)) := do
+  if nm.startsWith "bind:" then return some ((nm.drop 5).toString, ← `(($v).1), ← `(($v).2))
+  else return none
+
 def hasEffectStmt (eventNames : Array Name) (stx : Syntax) : Bool :=
   stxAny (fun s =>
-    (s.getKind == ``qedStmtExpr && (matchPushCall? (s.getArg 0)).isNone && (matchRemoveCall? (s.getArg 0)).isNone && !isEventEmitExpr eventNames (s.getArg 0)) ||
+    (s.getKind == ``qedStmtExpr && !isCollMutExpr (s.getArg 0) && !isEventEmitExpr eventNames (s.getArg 0)) ||
     isAwaitStmt s) stx
 
 def hasReturnStmt (stx : Syntax) : Bool :=

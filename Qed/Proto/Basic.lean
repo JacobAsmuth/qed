@@ -1,3 +1,5 @@
+import Qed.Html
+
 namespace Qed
 
 /-- Alias for binary byte payloads (`ByteArray` natively, `Uint8Array` in JavaScript). -/
@@ -160,23 +162,17 @@ def writeVarint (buf : ByteArray) (n : Nat) : ByteArray :=
     writeVarint (buf.push (UInt8.ofNat (n % 128 + 128))) (n / 128)
 termination_by n
 
-def writeFixed32 (buf : ByteArray) (v : UInt32) : ByteArray :=
-  let n := v.toNat
+@[reducible, inline] def writeLE4 (buf : ByteArray) (n : Nat) : ByteArray :=
   (((buf.push (UInt8.ofNat (n % 256))).push
       (UInt8.ofNat ((n / 256) % 256))).push
       (UInt8.ofNat ((n / 65536) % 256))).push
       (UInt8.ofNat ((n / 16777216) % 256))
 
+def writeFixed32 (buf : ByteArray) (v : UInt32) : ByteArray :=
+  writeLE4 buf v.toNat
+
 def writeFixed64 (buf : ByteArray) (v : UInt64) : ByteArray :=
-  let n := v.toNat
-  (((((((buf.push (UInt8.ofNat (n % 256))).push
-      (UInt8.ofNat ((n / 256) % 256))).push
-      (UInt8.ofNat ((n / 65536) % 256))).push
-      (UInt8.ofNat ((n / 16777216) % 256))).push
-      (UInt8.ofNat ((n / 4294967296) % 256))).push
-      (UInt8.ofNat ((n / 1099511627776) % 256))).push
-      (UInt8.ofNat ((n / 281474976710656) % 256))).push
-      (UInt8.ofNat ((n / 72057594037927936) % 256))
+  writeLE4 (writeLE4 buf v.toNat) (v.toNat / 4294967296)
 
 def writePayload (buf : ByteArray) : WireVal → ByteArray
   | .varint n  => writeVarint buf n
@@ -207,24 +203,20 @@ def readVarintAt (buf : @& ByteArray) (pos limit : Nat) : Except String (Nat × 
     .error "protobuf: truncated varint"
 termination_by limit - pos
 
+@[reducible, inline] def readLE4At (buf : @& ByteArray) (pos : Nat) (h : pos + 4 ≤ buf.size) : Nat :=
+  let b0 := buf[pos]'(by omega); let b1 := buf[pos + 1]'(by omega)
+  let b2 := buf[pos + 2]'(by omega); let b3 := buf[pos + 3]'(by omega)
+  b0.toNat + 256 * (b1.toNat + 256 * (b2.toNat + 256 * b3.toNat))
+
 def readFixed32At (buf : @& ByteArray) (pos limit : Nat) : Except String (UInt32 × Nat) :=
   if h : pos + 4 ≤ limit ∧ limit ≤ buf.size then
-    let b0 := buf[pos]'(by omega); let b1 := buf[pos + 1]'(by omega)
-    let b2 := buf[pos + 2]'(by omega); let b3 := buf[pos + 3]'(by omega)
-    let n := b0.toNat + 256 * (b1.toNat + 256 * (b2.toNat + 256 * b3.toNat))
-    .ok (UInt32.ofNat n, pos + 4)
+    .ok (UInt32.ofNat (readLE4At buf pos (by omega)), pos + 4)
   else
     .error "protobuf: truncated fixed32"
 
 def readFixed64At (buf : @& ByteArray) (pos limit : Nat) : Except String (UInt64 × Nat) :=
   if h : pos + 8 ≤ limit ∧ limit ≤ buf.size then
-    let b0 := buf[pos]'(by omega); let b1 := buf[pos + 1]'(by omega)
-    let b2 := buf[pos + 2]'(by omega); let b3 := buf[pos + 3]'(by omega)
-    let b4 := buf[pos + 4]'(by omega); let b5 := buf[pos + 5]'(by omega)
-    let b6 := buf[pos + 6]'(by omega); let b7 := buf[pos + 7]'(by omega)
-    let n := b0.toNat + 256 * (b1.toNat + 256 * (b2.toNat + 256 * (b3.toNat +
-      256 * (b4.toNat + 256 * (b5.toNat + 256 * (b6.toNat + 256 * b7.toNat))))))
-    .ok (UInt64.ofNat n, pos + 8)
+    .ok (UInt64.ofNat (readLE4At buf pos (by omega) + 4294967296 * readLE4At buf (pos + 4) (by omega)), pos + 8)
   else
     .error "protobuf: truncated fixed64"
 
@@ -316,16 +308,8 @@ def decodeFrameList (bs : List UInt8) : Except String (List UInt8 × List UInt8)
 
 /-! ## Hex Codec for `Bytes` JSON / SSR Interop -/
 
-def hexByte (n : Nat) : Char :=
-  let d := n % 16
-  if d < 10 then Char.ofNat (48 + d) else Char.ofNat (87 + d)
-
-def unhexChar (c : Char) : Option Nat :=
-  let n := c.toNat
-  if 48 ≤ n && n ≤ 57 then some (n - 48)
-  else if 97 ≤ n && n ≤ 102 then some (n - 87)
-  else if 65 ≤ n && n ≤ 70 then some (n - 55)
-  else none
+abbrev hexByte : Nat → Char := hexDigitLower
+abbrev unhexChar : Char → Option Nat := unhexNat?
 
 def encodeHexList : List UInt8 → List Char
   | [] => []

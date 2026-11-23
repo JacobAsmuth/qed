@@ -71,15 +71,6 @@ private theorem attr_valid_kv {msg : Type} (k v : String)
     Attr.valid (msg := msg) (.attr k v) = true := by
   simp only [Attr.valid, Attr.validKeyValue, hs, hu, Bool.not_false, Bool.true_or, Bool.and_self]
 
-private theorem attr_valid_flag {msg : Type} (k : String) (b : Bool)
-    (hs : isSafeAttrName k = true) : Attr.valid (msg := msg) (.flag k b) = true := hs
-
-private theorem attr_valid_on {msg : Type} (k : String) (m : msg)
-    (hs : isSafeAttrName k = true) : Attr.valid (.on k m) = true := hs
-
-private theorem attr_valid_onVal {msg : Type} (k : String) (f : String → msg)
-    (hs : isSafeAttrName k = true) : Attr.valid (.onValue k f) = true := hs
-
 private theorem validIn_el {msg : Type} {ctx next : HtmlCtx} {tag : String}
     {attrs : List (Attr msg)} {kids : List (Html msg)}
     (hstep : stepHtmlCtx ctx tag = some next)
@@ -94,12 +85,7 @@ private theorem validIn_el {msg : Type} {ctx next : HtmlCtx} {tag : String}
 
 local macro "solve_attrs" : tactic =>
   `(tactic| (dsimp only [Attr.validList, value, type', Qed.name, attr, checked, disabled, cls, onInput, onChange, onCheck, onClick]; simp only [Bool.and_eq_true]; repeat any_goals constructor) <;>
-    first
-    | exact attr_valid_kv _ _ rfl rfl
-    | exact attr_valid_flag _ _ rfl
-    | exact attr_valid_on _ _ rfl
-    | exact attr_valid_onVal _ _ rfl
-    | rfl)
+    first | exact attr_valid_kv _ _ rfl rfl | rfl)
 
 private abbrev mkSimpleCodec {α : Type} (parse : String → Option α)
     (render : {msg : Type} → String → (String → msg) → Html msg)
@@ -254,7 +240,9 @@ def schemaItemP : Parser := schemaExampleP <|> schemaFieldP
     checkColGt "expected indented `schema` fields" >> many1Indent schemaItemP)
 end SchemaParsers
 
-open Lean in
+section SchemaElab
+open Lean Elab Command Term Meta
+
 private def lowerSchemaFieldSpec (stx : Syntax) : MacroM Term := do
   let k := stx.getKind
   if k == `Qed.schemaFieldJsonOnly then
@@ -266,7 +254,7 @@ private def lowerSchemaFieldSpec (stx : Syntax) : MacroM Term := do
   else
     return (← Qed.Lang.lowerQedType stx false).1
 
-private def primSchemaTypes : Array (Lean.Name × Lean.Name × String) := #[
+private def primSchemaTypes : Array (Name × Name × String) := #[
   (``String,   ``Qed.Codec.text,     "String"),
   (``Nat,      ``Qed.Codec.nat,      "Nat"),
   (``Int,      ``Qed.Codec.int,      "Int"),
@@ -274,7 +262,6 @@ private def primSchemaTypes : Array (Lean.Name × Lean.Name × String) := #[
   (``Qed.Date, ``Qed.Codec.date,     "Date")
 ]
 
-open Lean Elab Term Meta in
 private partial def resolveCodecBase (fieldName : Name) (rawSpec : Term) : TermElabM Term := do
   match rawSpec with
   | `($fn:ident $arg:term) =>
@@ -302,7 +289,7 @@ private partial def resolveCodecBase (fieldName : Name) (rawSpec : Term) : TermE
       type{indentExpr ety}"
 
 private structure ResolvedSchemaField where
-  input       : Lean.Term
+  input       : Term
   isRefined   : Bool
   isLawful    : Bool
   isProto     : Bool
@@ -312,7 +299,6 @@ private structure ResolvedSchemaField where
   hasInhab    : Bool
 deriving Inhabited
 
-open Lean Elab Term Meta in
 private partial def withCtxDecls {α : Type} (cbns : Array Ident) (cbts : Array Term)
     (k : TermElabM α) (i : Nat := 0) : TermElabM α := do
   if i < cbns.size then
@@ -320,7 +306,6 @@ private partial def withCtxDecls {α : Type} (cbns : Array Ident) (cbts : Array 
     withLocalDeclD cbns[i]!.getId bt fun _ => withCtxDecls cbns cbts k (i + 1)
   else k
 
-open Lean Elab Term Meta in
 private def elabSchemaFieldsAux (cbns : Array Ident) (cbts : Array Term)
     (fs : Array Ident) (rawSpecs : Array Term) (whereClauses : Array (Array Term)) :
     TermElabM (Array ResolvedSchemaField) :=
@@ -352,7 +337,6 @@ private def elabSchemaFieldsAux (cbns : Array Ident) (cbts : Array Term)
       | _ =>
           throwErrorAt rawSpec m!"failed to resolve schema field `{f.getId}` to a `Codec`"
 
-open Lean Elab Command Term in
 private def checkSchemaFieldsDecidable (cbns : Array Ident) (cbts : Array Term)
     (pairs : Array (Ident × Term)) (refined : Array Bool) : CommandElabM Unit := do
   -- Lean logs failed instance synthesis to `messages` rather than throwing; probe in isolation to catch missing `DecidablePred` cleanly.
@@ -366,7 +350,6 @@ private def checkSchemaFieldsDecidable (cbns : Array Ident) (cbts : Array Term)
         sees it reduces to a decidable check:\n    abbrev MyPredicate (x : …) : Prop := …\n\
         If it genuinely can't be decided, give it a `DecidablePred` instance."
 
-open Lean Elab Command Term in
 private def mkDraftCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
     CommandElabM (TSyntax `command × Array (TSyntax `command)) := do
   let emptyId := mkIdent (tId ++ `Draft ++ `empty)
@@ -380,11 +363,11 @@ private def mkDraftCmds (tId : Name) (draftId : Ident) (fs : Array Ident) :
   let jsonCmds ← mkStructJsonCmds draftId draftFields { fixedDepthBound := some 1 }
   pure (structCmd, #[emptyCmd] ++ jsonCmds)
 
-open Lean Elab Command Term in
 private def mkSchemaBeqCmds (tId : Name) (cbns : Array Ident) (cbts : Array Term)
-    (tApp beqApp : TSyntax `term) (fs : Array Ident) (allLawfulBEq : Bool) :
+    (tApp : Term) (appTo : Term → CommandElabM Term) (fs : Array Ident) (allLawfulBEq : Bool) :
     CommandElabM (Array (TSyntax `command)) := do
   let beqFnId := mkIdent (tId ++ `beq)
+  let beqApp  ← appTo ⟨beqFnId.raw⟩
   let beqExpr ← match fs.toList with
     | []      => `(true)
     | f :: rest =>
@@ -415,13 +398,13 @@ private def mkSchemaBeqCmds (tId : Name) (cbns : Array Ident) (cbts : Array Term
         eq_of_beq := $beqEqThmId
         rfl := $beqRflThmId) ]
 
-open Lean Elab Command Term in
 private def mkSchemaParseCmds (tId : Name) (cbns : Array Ident) (cbts : Array Term)
-    (tApp parseApp canApp : TSyntax `term) (draftId : Ident)
-    (fs : Array Ident) (runCalls : Array (TSyntax `term)) :
+    (tApp parseApp : Term) (appTo : Term → CommandElabM Term) (draftId : Ident)
+    (fs : Array Ident) (runCalls : Array Term) :
     CommandElabM (Array (TSyntax `command)) := do
   let parseId := mkIdent (tId ++ `parse)
   let canId   := mkIdent (tId ++ `canSubmit)
+  let canApp  ← appTo ⟨canId.raw⟩
   let iffId   := mkIdent (tId ++ `canSubmit_iff)
   let isSomes ← runCalls.mapM fun rc => `(($rc).isSome)
   let rhs ← mkConjBody isSomes (ascribeProp := false)
@@ -441,12 +424,12 @@ private def mkSchemaParseCmds (tId : Name) (cbns : Array Ident) (cbts : Array Te
     ← `(command| theorem $iffId $[($cbns:ident : $cbts:term)]* (d : $draftId) :
           $canApp d = true ↔ $rhs := by unfold $canId $parseId; $casesTac) ]
 
-open Lean Elab Command Term in
 private def mkSchemaFormViewCmds (tId : Name) (cbns : Array Ident) (cbts : Array Term)
-    (tApp parseApp viewApp : TSyntax `term) (draftId : Ident)
-    (fs : Array Ident) (inputs : Array Term) (runCalls : Array (TSyntax `term)) :
+    (tApp parseApp : Term) (appTo : Term → CommandElabM Term) (draftId : Ident)
+    (fs : Array Ident) (inputs : Array Term) (runCalls : Array Term) :
     CommandElabM (Array (TSyntax `command)) := do
   let viewId      := mkIdent (tId ++ `formView)
+  let viewApp     ← appTo ⟨viewId.raw⟩
   let formValidId := mkIdent (tId ++ `formView_validIn)
   let rowGroups ← ((fs.zip inputs).zip runCalls).mapM fun ((f, inp), rc) => do
     let nameLit := Syntax.mkStrLit (toString f.getId)
@@ -466,9 +449,8 @@ private def mkSchemaFormViewCmds (tId : Name) (cbns : Array Ident) (cbts : Array
           Html.validIn ⟨.normal, false, false, inForm⟩ ($viewApp d onEdit submit) = true :=
           Codec.formDiv_validIn inForm _ $validBodyPf) ]
 
-open Lean Elab Command Term in
 private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term)
-    (tApp beqApp parseApp canApp viewApp : TSyntax `term) (draftId : Ident)
+    (tApp : Term) (appTo : Term → CommandElabM Term) (draftId : Ident)
     (fs : Array Ident) (inputs : Array Term) (refined : Array Bool) (allLawfulBEq : Bool) :
     CommandElabM (TSyntax `command × Array (TSyntax `command)) := do
   let tId := t.getId
@@ -479,45 +461,41 @@ private def mkSchemaCoreCmds (t : Ident) (cbns : Array Ident) (cbts : Array Term
     if r then `(($inp).run (d.$f:ident)) else `(($inp).parse (d.$f:ident))
   let structCmd ← `(command| structure $t $[($cbns:ident : $cbts:term)]* where
           $[$fs:ident : $structTys]*)
-  let beqCmds   ← mkSchemaBeqCmds tId cbns cbts tApp beqApp fs allLawfulBEq
-  let parseCmds ← mkSchemaParseCmds tId cbns cbts tApp parseApp canApp draftId fs runCalls
-  let viewCmds  ← mkSchemaFormViewCmds tId cbns cbts tApp parseApp viewApp draftId fs inputs runCalls
+  let parseApp  ← appTo ⟨(mkIdent (tId ++ `parse)).raw⟩
+  let beqCmds   ← mkSchemaBeqCmds tId cbns cbts tApp appTo fs allLawfulBEq
+  let parseCmds ← mkSchemaParseCmds tId cbns cbts tApp parseApp appTo draftId fs runCalls
+  let viewCmds  ← mkSchemaFormViewCmds tId cbns cbts tApp parseApp appTo draftId fs inputs runCalls
   pure (structCmd, beqCmds ++ parseCmds ++ viewCmds)
 
-private partial def collectStxLits {α : Type} [BEq α] (extract : Lean.Syntax → Option α)
-    (stx : Lean.Syntax) (acc : Array α) : Array α :=
+private partial def collectStxLits {α : Type} [BEq α] (extract : Syntax → Option α)
+    (stx : Syntax) (acc : Array α) : Array α :=
   let acc := match extract stx with
     | some v => if acc.contains v then acc else acc.push v
     | none   => acc
   stx.getArgs.foldl (fun a ch => collectStxLits extract ch a) acc
 
-open Lean Elab Command Term Meta in
 private def tryCheckPropWithTactic (goalTerm : Term) (tacStx : TSyntax `tactic) : CommandElabM Bool :=
   Qed.Diag.probeTermElabOk do
     let _ ← elabTermEnsuringType (← `(by $tacStx:tactic)) (← elabType goalTerm)
     synthesizeSyntheticMVarsNoPostponing
     return true
 
-open Lean Elab Command Term Meta in
 private def schemaCodecSimp : CommandElabM (TSyntax `tactic) :=
   `(tactic| simp only [Qed.Codec.valid, Qed.Codec.refine, Qed.Codec.jsonOnly,
       Qed.Codec.text, Qed.Codec.textarea, Qed.Codec.nat, Qed.Codec.int,
       Qed.Codec.checkbox, Qed.Codec.date, Qed.Codec.select, Qed.Codec.radios,
       Qed.Codec.json, Qed.Lang.QedVal.val_id])
 
-open Lean Elab Command Term Meta in
 private def mkSchemaWhereProofTac : CommandElabM (TSyntax `tactic) := do
   let simpTac ← schemaCodecSimp
   `(tactic| ($simpTac:tactic <;> first | rfl | decide | omega | trivial | (simp_all; try rfl; try decide; try omega)))
 
-open Lean Elab Command Term Meta in
 private def isFieldProvablyUnsat (inp : Term) : CommandElabM Bool := do
   let simpTac ← schemaCodecSimp
   let unsatGoal ← `(∀ _qed_x : Qed.Codec.Val $inp, ¬ ($inp).valid _qed_x)
   let unsatTac ← `(tactic| (intro _qed_x; $simpTac:tactic; first | omega | decide | (cases _qed_x <;> decide)))
   tryCheckPropWithTactic unsatGoal unsatTac
 
-open Lean Elab Command Term Meta in
 private def synthesizeFieldWitness? (rf : ResolvedSchemaField) (rawWheres : Array Syntax) :
     CommandElabM (Option Term) := do
   let inp := rf.input
@@ -552,7 +530,6 @@ private def synthesizeFieldWitness? (rf : ResolvedSchemaField) (rawWheres : Arra
       return some (← `(Qed.Field.mk (p := ($inp).valid) $cand (by $pfTac:tactic)))
   return none
 
-open Lean Elab Command Term in
 private def emitSatisfiableCmds (ref : Syntax) (t : Ident) (cbns : Array Ident) (cbts : Array Term)
     (tApp witness : Term) : CommandElabM Unit := do
   let tId := t.getId
@@ -563,9 +540,8 @@ private def emitSatisfiableCmds (ref : Syntax) (t : Ident) (cbns : Array Ident) 
     let nonEmptyId := mkIdentFrom ref (tId ++ `instNonempty)
     elabCommand (← `(command| instance $nonEmptyId:ident : Nonempty $t := ⟨$witness⟩))
 
-open Lean Elab Command Term Meta in
 private def elabSchemaExampleClause (t : Ident) (cbns : Array Ident) (cbts : Array Term)
-    (tApp : TSyntax `term) (appTo : TSyntax `term → CommandElabM (TSyntax `term))
+    (tApp : Term) (appTo : Term → CommandElabM Term)
     (fs : Array Ident) (inputs : Array Term) (refined : Array Bool)
     (whereLabels : Array String) (exStx : Syntax) (emitSatisfiable : Bool) : CommandElabM Unit := do
   let tId := t.getId
@@ -598,7 +574,7 @@ private def elabSchemaExampleClause (t : Ident) (cbns : Array Ident) (cbts : Arr
       if cbns.isEmpty then
         let goal ← `(($(inputs[i]!)).valid $valTerm)
         unless ← tryCheckPropWithTactic goal pfTac do
-          let valStr := (valStx.unsetTrailing.reprint.getD "<value>").trimAscii.toString
+          let valStr := let s := Qed.Lang.stxSnippet valStx; if s.isEmpty then "<value>" else s
           let ruleStr := whereLabels[i]!
           throwErrorAt valStx m!"Schema `{tId}` example `{exId}` failed `where` constraint on field `{fName}`:\n  • value `{valStr}` does not satisfy `{ruleStr}`\n\nHint: Update `{fName}` in example `{exId}` so it satisfies `{ruleStr}`, or weaken the `where` rule."
       fieldTerms := fieldTerms.push (← `(Qed.Field.mk (p := ($(inputs[i]!)).valid) $valTerm (by $pfTac:tactic)))
@@ -611,7 +587,6 @@ private def elabSchemaExampleClause (t : Ident) (cbns : Array Ident) (cbts : Arr
   if emitSatisfiable then
     emitSatisfiableCmds exStx t cbns cbts tApp sampleApp
 
-open Lean Elab Command Term Meta in
 private def elabSchemaAutoSatisfiability (t : Ident) (cbns : Array Ident)
     (fs : Array Ident) (resolved : Array ResolvedSchemaField)
     (whereRawExprs : Array (Array Syntax)) (whereLabels : Array String) : CommandElabM Unit := do
@@ -629,7 +604,6 @@ private def elabSchemaAutoSatisfiability (t : Ident) (cbns : Array Ident)
     | none    => return
   emitSatisfiableCmds t t #[] #[] ⟨t.raw⟩ (← `({ $[$fs:ident := $synthTerms:term],* }))
 
-open Lean Elab Command Term in
 @[command_elab schemaCmd] def elabSchemaCmd : CommandElab
   | stx => do
       let t : Ident := ⟨(stx.getArg 1)⟩
@@ -658,15 +632,11 @@ open Lean Elab Command Term in
         if (f.getArg 3).getNumArgs == 2 then ((f.getArg 3).getArg 1).getSepArgs else #[]
       let whereLabels : Array String := whereRawExprs.map fun ws =>
         String.intercalate ", " (ws.toList.map fun w =>
-          (((w.reprint.getD "constraint").splitOn "\n").headD "constraint").trimAscii.toString)
+          let s := Qed.Lang.stxSnippet w; if s.isEmpty then "constraint" else s)
       let whereClauses : Array (Array Term) ← whereRawExprs.mapM fun ws =>
         ws.mapM fun w => liftMacroM (Qed.Lang.lowerSimpleQedExpr .propInv w)
       let tId     := t.getId
       let draftId := mkIdent (tId ++ `Draft)
-      let beqFnId := mkIdent (tId ++ `beq)
-      let parseId := mkIdent (tId ++ `parse)
-      let canId   := mkIdent (tId ++ `canSubmit)
-      let viewId  := mkIdent (tId ++ `formView)
       let resolved ← liftTermElabM (elabSchemaFieldsAux cbns cbts fs rawSpecs whereClauses)
       let inputs := resolved.map (·.input)
       let refined := resolved.map (·.isRefined)
@@ -676,15 +646,10 @@ open Lean Elab Command Term in
       let allLawfulBEq := resolved.all (·.isLawfulBEq)
       let pairs := fs.zip inputs
       checkSchemaFieldsDecidable cbns cbts pairs refined
-      let appTo (head : TSyntax `term) : CommandElabM (TSyntax `term) :=
-        Qed.Lang.mkAppTerms head (cbns.map (⟨·.raw⟩))
-      let tApp     ← appTo ⟨t.raw⟩
-      let beqApp   ← appTo ⟨beqFnId.raw⟩
-      let parseApp ← appTo ⟨parseId.raw⟩
-      let canApp   ← appTo ⟨canId.raw⟩
-      let viewApp  ← appTo ⟨viewId.raw⟩
+      let appTo (head : Term) : CommandElabM Term := Qed.Lang.mkAppTerms head (cbns.map (⟨·.raw⟩))
+      let tApp ← appTo ⟨t.raw⟩
       let (draftStructCmd, draftCmds) ← mkDraftCmds tId draftId fs
-      let (coreStructCmd, coreCmds) ← mkSchemaCoreCmds t cbns cbts tApp beqApp parseApp canApp viewApp draftId fs inputs refined allLawfulBEq
+      let (coreStructCmd, coreCmds) ← mkSchemaCoreCmds t cbns cbts tApp appTo draftId fs inputs refined allLawfulBEq
       let schemaFields ← (pairs.zip refined).mapM fun ((f, inp), r) =>
         return ({ ident := f, wireKey := f.getId.toString, valTy := ← `(Codec.Val $inp),
                   isRefinedField := r, codecTerm? := if r then some inp else none } : StructFieldSpec)
@@ -710,4 +675,5 @@ open Lean Elab Command Term in
       }
       modifyEnv fun env => schemaFormRegistry.addEntry env info
 
+end SchemaElab
 end Qed

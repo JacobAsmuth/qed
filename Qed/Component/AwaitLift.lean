@@ -55,28 +55,20 @@ private def classifyCatchCase (validTags : Array String) (isOption : Bool) (cStx
     return (.dotTag tag binder?, body)
   if pat.getKind == ``qedPatDot then
     let tag := (pat.getArg 1).getId.toString
-    if (pat.getArg 2).getNumArgs == 3 then
-      let args := ((pat.getArg 2).getArg 1).getSepArgs
-      if args.size == 1 then
-        let b := args[0]!
-        unless b.getKind == ``qedPatWild || (b.getKind == ``qedPatIdent && (b.getArg 1).getNumArgs == 0) do
-          throwErrorAt b "error message pattern in `catch` must be an identifier or `_`"
-        return ← checkTag pat tag (some b)
-      else
-        throwErrorAt pat "unsupported `catch` pattern; expected `.tag`, `.tag(msg)`, `.failed(err)`, `.none`, or `_`"
-    else
-      return ← checkTag pat tag none
+    if (pat.getArg 2).getNumArgs != 3 then return ← checkTag pat tag none
+    let args := ((pat.getArg 2).getArg 1).getSepArgs
+    if args.size == 1 then
+      let b := args[0]!
+      unless b.getKind == ``qedPatWild || (b.getKind == ``qedPatIdent && (b.getArg 1).getNumArgs == 0) do
+        throwErrorAt b "error message pattern in `catch` must be an identifier or `_`"
+      return ← checkTag pat tag (some b)
   throwErrorAt pat "unsupported `catch` pattern; expected `.tag`, `.tag(msg)`, `.failed(err)`, `.none`, or `_`"
 
 private def stmtContainsAwait (st : Syntax) : Bool := stxAny isAwaitStmt st
 
 private def resolveRpcForAwait (ctx : RewriteCtx) (rpcId : Ident) (argCount : Nat) :
     CommandElabM (ServerInfo × ServerMethodInfo) := do
-  let openDecls := (← getScope).openDecls
-  let some (srvInfo, mInfo) := lookupServerMethod? (← getEnv) (← getCurrNamespace) openDecls rpcId.getId
-    | throwErrorAt rpcId s!"unknown server RPC `{rpcId.getId}` in `await`"
-  if argCount != mInfo.paramCount then
-    throwErrorAt rpcId s!"`{rpcId.getId}` expects {mInfo.paramCount} argument(s), got {argCount}"
+  let (srvInfo, mInfo) ← resolveServerRpc rpcId argCount "await"
   recordUsedRpc ctx.usedRpcs srvInfo.shortName mInfo.name
   return (srvInfo, mInfo)
 
@@ -105,32 +97,29 @@ private def parsePredictClauseNode (cl : Syntax) : CommandElabM (Syntax × Predi
     throwErrorAt cl "internal: unexpected `predict` clause node"
 
 private def parseLetClauses (clausesNode : Syntax) : CommandElabM ParsedLetClauses := do
+  let checkDup {α : Type} (cl : Syntax) (lbl : String) (cur : Option α) : CommandElabM Unit := do
+    if cur.isSome then throwErrorAt cl s!"duplicate `{lbl}` clause on `await`"
   let mut acc : ParsedLetClauses := {}
   for cl in clausesNode.getArgs do
     let ck := cl.getKind
     if ck == `Qed.Lang.letPredictBlock || ck == `Qed.Lang.letPredictExpr then
-      if acc.predict?.isSome then
-        throwErrorAt cl "duplicate `predict` clause on `await`"
+      checkDup cl "predict" acc.predict?
       acc := { acc with predict? := some (← parsePredictClauseNode cl) }
     else if ck == `Qed.Lang.letOnConfirm then
-      if acc.onConfirm?.isSome then
-        throwErrorAt cl "duplicate `on_confirm` clause on `await`"
+      checkDup cl "on_confirm" acc.onConfirm?
       acc := { acc with onConfirm? := some (cl, suiteStmts (cl.getArg 2)) }
     else if ck == `Qed.Lang.letRollback then
-      if acc.rollback?.isSome then
-        throwErrorAt cl "duplicate `rollback` clause on `await`"
+      checkDup cl "rollback" acc.rollback?
       let binder? : Option Syntax := if (cl.getArg 1).getNumArgs == 3 then some ((cl.getArg 1).getArg 1) else none
       acc := { acc with rollback? := some (cl, binder?, suiteStmts (cl.getArg 3)) }
     else if ck == `Qed.Lang.letCatch then
-      if acc.catch?.isSome then
-        throwErrorAt cl "duplicate `catch` clause on `await`"
+      checkDup cl "catch" acc.catch?
       acc := { acc with catch? := some (cl, (cl.getArg 1)) }
-  if let some (ocRef, _) := acc.onConfirm? then
-    unless acc.predict?.isSome do
-      throwErrorAt ocRef "`on_confirm` requires a `predict` clause on the same `await`"
-  if let some (rbRef, _, _) := acc.rollback? then
-    unless acc.predict?.isSome do
-      throwErrorAt rbRef "`rollback` requires a `predict` clause on the same `await`"
+  let reqPred (lbl : String) (ref? : Option Syntax) : CommandElabM Unit := do
+    if let some ref := ref? then
+      unless acc.predict?.isSome do throwErrorAt ref s!"`{lbl}` requires a `predict` clause on the same `await`"
+  reqPred "on_confirm" (acc.onConfirm?.map (·.1))
+  reqPred "rollback" (acc.rollback?.map (·.1))
   return acc
 
 private def forEachControlSubSuite (st : Syntax) (f : Array Syntax → CommandElabM Unit) : CommandElabM Unit := do
@@ -148,7 +137,7 @@ private def forEachControlSubSuite (st : Syntax) (f : Array Syntax → CommandEl
 private partial def checkPureSpecCont (ctx : RewriteCtx) (stmts : Array Syntax) : CommandElabM Unit := do
   for st in stmts do
     let k := st.getKind
-    if k == ``qedStmtExpr && (matchPushCall? (st.getArg 0)).isNone && (matchRemoveCall? (st.getArg 0)).isNone then
+    if k == ``qedStmtExpr && !isCollMutExpr (st.getArg 0) then
       throwErrorAt st "cannot run side effects or emit events inside a speculative continuation after `predict` (side effects cannot be rolled back); move it into `on_confirm:`"
     else if isAwaitStmt st then
       throwErrorAt st "cannot `await` inside a speculative continuation after `predict`; move sequential `await` calls into `on_confirm:`"
@@ -165,7 +154,7 @@ private partial def checkPurePredictBlock (stmts : Array Syntax) : CommandElabM 
     if k == ``qedStmtAssign then
       throwErrorAt st "`predict:` computes a predicted server response and cannot mutate state or perform side effects"
     else if k == ``qedStmtExpr then
-      if (matchPushCall? (st.getArg 0)).isSome || (matchRemoveCall? (st.getArg 0)).isSome then
+      if isCollMutExpr (st.getArg 0) then
         throwErrorAt st "`predict:` computes a predicted server response and cannot mutate state with `.push(...)`/`.remove(...)`"
       else if (matchIdentMethodCall? (st.getArg 0)).any fun (_, m, _) => m == "send" || m == "emit" then
         throwErrorAt st "`predict:` computes a predicted server response and cannot mutate state or perform side effects"
@@ -359,6 +348,10 @@ private def buildCatchArms (liftRec : LiftRecFn) (st : Syntax) (mInfo : ServerMe
         arms := arms.push (mkCaseStx st patS bLifted)
   return (arms, wildArms, covFailed, covNone)
 
+private def pushSite (ctx : RewriteCtx) (keyPfx : String) (ctor : Name)
+    (params : Array (Ident × Term)) (stmts : Array Syntax) : IO Unit :=
+  ctx.sites.modify (·.push { key := s!"{keyPfx}:{ctor}", ctor, params, stmts? := some stmts })
+
 private def registerAwaitContSite (ctx : RewriteCtx) (liftRec : LiftRecFn)
     (st : Syntax) (prep : PreparedAwait) (xId : Ident) (optTy? : Option Term)
     (rpcId : Ident) (srvInfo : ServerInfo) (mInfo : ServerMethodInfo)
@@ -377,10 +370,7 @@ private def registerAwaitContSite (ctx : RewriteCtx) (liftRec : LiftRecFn)
   let mut matchCases := #[mkCaseStx st okPat okBody] ++ catchArms ++ wildArms
   if wildArms.isEmpty && (!covFailed || (mInfo.isOption && !covNone)) then
     matchCases := matchCases.push (mkCaseStx st (mkPatWild info) #[mkPassSt info])
-  ctx.sites.modify (·.push {
-    key := s!"cont:{contCtor}", ctor := contCtor, params := contParams,
-    stmts? := some #[mkMatchStx st outVarId matchCases]
-  })
+  pushSite ctx "cont" contCtor contParams #[mkMatchStx st outVarId matchCases]
   if let some restCls := restCls? then
     ctx.specDispatches.modify (·.push {
       ctor := contCtor, params := contParams,
@@ -446,7 +436,7 @@ private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident �
   let preCtor? : Option Name ←
     if preStmts.any stmtHasStateMutation then
       let preCtor := Name.mkSimple s!"_specPre_{kIdx}"
-      ctx.sites.modify (·.push { key := s!"specPre:{preCtor}", ctor := preCtor, params := actionParams, stmts? := some preStmts })
+      pushSite ctx "specPre" preCtor actionParams preStmts
       pure (some preCtor)
     else pure none
 
@@ -455,11 +445,8 @@ private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident �
   let mut contBodyStmts := restArr
   if let some oTy := optTy? then
     contBodyStmts := #[mkLetRawSt info xId none (mkRawExpr (← `(($xId:ident : $oTy))))] ++ contBodyStmts
-  ctx.sites.modify (·.push {
-    key := s!"specCont:{specContCtor}", ctor := specContCtor,
-    params := prep.capturedParams.push (specValId, contPayloadTy),
-    stmts? := some (← mkUnpackedBody specValId (some xId) contBodyStmts)
-  })
+  pushSite ctx "specCont" specContCtor (prep.capturedParams.push (specValId, contPayloadTy))
+    (← mkUnpackedBody specValId (some xId) contBodyStmts)
 
   let nextOuter := shadowOuter outerParams xId (some rawValTy)
 
@@ -469,10 +456,7 @@ private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident �
     let valId := mkIdentFrom st (Name.mkSimple s!"_{valPfx}_{kIdx}")
     let bParams := prep.capturedParams.push (valId, contPayloadTy)
     let (lifted, cls?) ← liftRec bParams bOuter localNames bStmts
-    ctx.sites.modify (·.push {
-      key := s!"{pfx}:{ctor}", ctor, params := bParams,
-      stmts? := some (← mkUnpackedBody valId bId? lifted)
-    })
+    pushSite ctx pfx ctor bParams (← mkUnpackedBody valId bId? lifted)
     if let some cls := cls? then
       ctx.specDispatches.modify (·.push { ctor, params := bParams, stmts := cls })
     return ctor
@@ -497,10 +481,7 @@ private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident �
       let cParams := prep.capturedParams.push (cOutId, prep.outTyTerm)
       let (cArms, cWilds, _, _) ← buildCatchArms liftRec st mInfo parsedCatch outerParams localNames cParams
       let allCatchCases := cArms ++ cWilds ++ (if cWilds.isEmpty then #[mkCaseStx st (mkPatWild info) #[mkPassSt info]] else #[])
-      ctx.sites.modify (·.push {
-        key := s!"specCatch:{cCtor}", ctor := cCtor, params := cParams,
-        stmts? := some #[mkMatchStx st cOutId allCatchCases]
-      })
+      pushSite ctx "specCatch" cCtor cParams #[mkMatchStx st cOutId allCatchCases]
       pure (some cCtor)
 
   let specResCtor := Name.mkSimple s!"_specRes_{kIdx}"
@@ -509,7 +490,7 @@ private def liftPredictedAwait (ctx : RewriteCtx) (actionParams : Array (Ident �
   let outParam := mkIdentFrom st (Name.mkSimple s!"_specOut_{kIdx}")
   let resParams : Array (Ident × Term) :=
     #[(txIdParam, ← `(Nat))] ++ prep.capturedParams ++ #[(predParam, rawValTy), (outParam, prep.outTyTerm)]
-  ctx.sites.modify (·.push { key := s!"specRes:{specResCtor}", ctor := specResCtor, params := resParams, stmts? := some #[mkPassSt info] })
+  pushSite ctx "specRes" specResCtor resParams #[mkPassSt info]
   ctx.specResolves.modify (·.push {
     resCtor := specResCtor, txIdParam, capturedParams := prep.capturedParams, predParam,
     outParam, mInfo, catchHasNone := prep.catchHasNone,

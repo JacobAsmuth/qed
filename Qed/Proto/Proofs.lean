@@ -166,9 +166,9 @@ theorem readPayloadAt_bounds (wt : Nat) (buf : ByteArray) (pos limit : Nat) {w :
   | 0 =>
       obtain ⟨⟨_, _⟩, hr, heq⟩ := bind_eq_ok h
       cases heq; have := readVarintAt_advances buf pos limit hr; omega
-  | 1 =>
+  | 1 | 5 =>
       obtain ⟨⟨_, _⟩, hr, heq⟩ := bind_eq_ok h
-      cases heq; unfold readFixed64At at hr
+      cases heq; first | unfold readFixed64At at hr | unfold readFixed32At at hr
       split at hr
       · have := congrArg (fun | .ok (_, p) => p | .error _ => 0) hr; dsimp only at this; omega
       · cases hr
@@ -176,12 +176,6 @@ theorem readPayloadAt_bounds (wt : Nat) (buf : ByteArray) (pos limit : Nat) {w :
       obtain ⟨⟨_, _⟩, hr, heq⟩ := bind_eq_ok h
       have := readVarintAt_advances buf pos limit hr
       dsimp only at heq; split at heq <;> cases heq; omega
-  | 5 =>
-      obtain ⟨⟨_, _⟩, hr, heq⟩ := bind_eq_ok h
-      cases heq; unfold readFixed32At at hr
-      split at hr
-      · have := congrArg (fun | .ok (_, p) => p | .error _ => 0) hr; dsimp only at this; omega
-      · cases hr
   | 3 | 4 | _ + 6 => cases h
 
 /-- Linear DoS termination bound: every decoded Protobuf field strictly advances the byte cursor
@@ -213,18 +207,13 @@ theorem skipUnknown_preserves_lookup_suffix (k : Nat) :
     ∀ (known unknown : List (Nat × WireVal)),
       (∀ u ∈ unknown, u.1 ≠ k) →
       lookupField k (known ++ unknown) = lookupField k known
-  | [], unknown, hne => by
-      simpa using skipUnknown_preserves_lookup_prefix k unknown [] hne
+  | [], unknown, hne => by simpa using skipUnknown_preserves_lookup_prefix k unknown [] hne
   | (kk, kw) :: rest, unknown, hne => by
-      by_cases h : (kk == k) = true
-      · simp [lookupField, h]
-      · have hf : (kk == k) = false := Bool.eq_false_iff.2 h
-        simp [lookupField, hf, skipUnknown_preserves_lookup_suffix k rest unknown hne]
+      cases h : (kk == k) <;> simp [lookupField, h, skipUnknown_preserves_lookup_suffix k rest unknown hne]
 
 private theorem lookupRepeated_none_of_ne (k : Nat) :
     ∀ (unknown : List (Nat × WireVal)),
-      (∀ u ∈ unknown, u.1 ≠ k) →
-      lookupRepeated k unknown = []
+      (∀ u ∈ unknown, u.1 ≠ k) → lookupRepeated k unknown = []
   | [], _ => rfl
   | (uk, uw) :: rest, hne => by
       have huk : (uk == k) = false := beq_eq_false_iff_ne.2 (hne (uk, uw) (by simp))
@@ -236,10 +225,7 @@ theorem skipUnknown_preserves_repeated_suffix (k : Nat) :
       lookupRepeated k (known ++ unknown) = lookupRepeated k known
   | [], unknown, hne => by simpa using lookupRepeated_none_of_ne k unknown hne
   | (kk, kw) :: rest, unknown, hne => by
-      by_cases h : (kk == k) = true
-      · simp [lookupRepeated, h, skipUnknown_preserves_repeated_suffix k rest unknown hne]
-      · have hf : (kk == k) = false := Bool.eq_false_iff.2 h
-        simp [lookupRepeated, hf, skipUnknown_preserves_repeated_suffix k rest unknown hne]
+      cases h : (kk == k) <;> simp [lookupRepeated, h, skipUnknown_preserves_repeated_suffix k rest unknown hne]
 
 /-! ## 3. `@[csimp]` Fast Writer & Borrowed-Cursor Equivalence -/
 
@@ -399,7 +385,7 @@ private theorem readFixed32At_eq_spec (buf : ByteArray) (pos limit : Nat)
   unfold readFixed32At
   by_cases h : pos + 4 ≤ limit ∧ limit ≤ buf.size
   · rw [dif_pos h]; repeat rw [sliceList_cons ⟨by omega, hlim⟩]
-    simp [decodeFixed32List, decodeLEList, Except.map]
+    simp [readLE4At, decodeFixed32List, decodeLEList, Except.map]
   · have := sliceList_len_le buf pos limit
     rw [dif_neg h, decodeFixed32List, decodeLEList_none_of_lt (by omega)]; rfl
 
@@ -410,7 +396,8 @@ private theorem readFixed64At_eq_spec (buf : ByteArray) (pos limit : Nat)
   unfold readFixed64At
   by_cases h : pos + 8 ≤ limit ∧ limit ≤ buf.size
   · rw [dif_pos h]; repeat rw [sliceList_cons ⟨by omega, hlim⟩]
-    simp [decodeFixed64List, decodeLEList, Except.map]
+    simp only [readLE4At, decodeFixed64List, decodeLEList, Option.map_some, Except.map, Nat.add_assoc, Nat.reduceAdd]
+    exact congrArg (fun n => Except.ok (UInt64.ofNat n, sliceList buf (pos + 8) limit)) (by omega)
   · have := sliceList_len_le buf pos limit
     rw [dif_neg h, decodeFixed64List, decodeLEList_none_of_lt (by omega)]; rfl
 
@@ -536,11 +523,6 @@ private theorem readFieldsLoop_eq_spec (buf : ByteArray) :
 
 /-! ## 4. Hex `ByteArray` Round-Trip Theorem -/
 
-private theorem unhexChar_hexByte {d : Nat} (hd : d < 16) : unhexChar (hexByte d) = some d := by
-  match d with
-  | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 => decide
-  | _ + 16 => omega
-
 private theorem decodeHexList_encodeHexList :
     ∀ (xs : List UInt8), decodeHexList (encodeHexList xs) = some xs
   | [] => rfl
@@ -553,9 +535,8 @@ private theorem decodeHexList_encodeHexList :
         change (b.toNat / 16 * 16 + b.toNat % 16) % 256 = b.toNat
         omega
       unfold encodeHexList decodeHexList
-      rw [unhexChar_hexByte hhi, unhexChar_hexByte hlo, decodeHexList_encodeHexList bs]
-      dsimp only [bind, Option.bind]
-      rw [hrec]
+      simp only [unhexChar, hexByte, unhexNat?_hexDigitLower hhi, unhexNat?_hexDigitLower hlo,
+        decodeHexList_encodeHexList bs, bind, Option.bind, hrec]
       rfl
 
 theorem decodeHex_encodeHex (b : ByteArray) : decodeHex (encodeHex b) = .ok b := by

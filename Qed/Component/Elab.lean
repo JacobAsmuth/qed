@@ -35,11 +35,8 @@ private def elabPureCompInvariants (spec : ComponentSpec) (viewId : Ident) (msgV
       theorem $invId:ident $[$viewBinders:bracketedBinder]* : ($vPred) $vCall = true := $rhs))
 
 private def elabPureComponent (spec : ComponentSpec) (body' : Term) : CommandElabM Unit := do
-  let doc?    := spec.doc?
-  let tId     := spec.t.getId
-  let propsId := mkIdent (tId ++ `Props)
-  let viewId  := mkIdent (tId ++ `view)
-  let msgV    := mkIdent `msg
+  let doc? := spec.doc?
+  let msgV := mkIdent `msg
   let mut pBinders ← spec.props.mapM mkStructBinder
   let mut propReadNames := spec.propNames
   for sl in spec.slots do
@@ -59,7 +56,7 @@ private def elabPureComponent (spec : ComponentSpec) (body' : Term) : CommandEla
   if spec.hasChildren then
     propReadNames := propReadNames.push `children
     pBinders := pBinders.push (← `(Lean.Parser.Command.structExplicitBinder| ($(mkIdent `children) : List (Html $msgV) := [])))
-  elabCommand (← `(command| structure $propsId ($msgV : Type) where $[$pBinders:structExplicitBinder]*))
+  elabCommand (← `(command| structure $(spec.propsId) ($msgV : Type) where $[$pBinders:structExplicitBinder]*))
   let mut viewBody := body'
   for g in propReadNames.reverse do
     if mentionsIdent viewBody.raw g then
@@ -67,10 +64,10 @@ private def elabPureComponent (spec : ComponentSpec) (body' : Term) : CommandEla
       viewBody ← `(let $gId:ident := (p.$gId:ident); $viewBody)
   let needsProps := !pBinders.isEmpty
   let viewBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) ←
-    if needsProps then pure #[← `(bracketedBinder| {$msgV : Type}), ← `(bracketedBinder| (p : $propsId $msgV))]
+    if needsProps then pure #[← `(bracketedBinder| {$msgV : Type}), ← `(bracketedBinder| (p : $(spec.propsId) $msgV))]
     else pure #[← `(bracketedBinder| {$msgV : Type})]
-  elabCommand (← `(command| $[$doc?:docComment]? @[inline] def $viewId $[$viewBinders:bracketedBinder]* : Html $msgV := $viewBody))
-  elabPureCompInvariants spec viewId msgV needsProps viewBinders
+  elabCommand (← `(command| $[$doc?:docComment]? @[inline] def $(spec.viewId) $[$viewBinders:bracketedBinder]* : Html $msgV := $viewBody))
+  elabPureCompInvariants spec spec.viewId msgV needsProps viewBinders
   let info ← mkBaseCompInfo spec .pureView needsProps
   modifyEnv fun env => componentRegistry.addEntry env info
 
@@ -116,25 +113,20 @@ private def mkOutJsonCmds (tId : Name) (outCtorSpecs : Array (Name × Array (Ide
 
 private def mkCompLocalDefCmds (spec : ComponentSpec) (idLit : StrLit) :
     CommandElabM (Array (TSyntax `command)) := do
-  let doc?     := spec.doc?
-  let tId      := spec.t.getId
-  let initId   := mkIdent (tId ++ `init)
-  let updateId := mkIdent (tId ++ `update)
-  let viewId   := mkIdent (tId ++ `view)
-  let regId    := mkIdent (tId ++ `reg)
+  let doc? := spec.doc?
+  let regId := spec.id `reg
+  let regRhs ← match spec.hasProps, spec.outTy?.isNone with
+    | true,  true  => `(LocalDef.ofProps $idLit $(spec.initId) $(spec.viewId) (fun p s m => ($(spec.updateId) p s m, (none : Option Bool))))
+    | true,  false => `(LocalDef.ofProps $idLit $(spec.initId) $(spec.viewId) $(spec.updateId))
+    | false, true  => `(LocalDef.ofSimple $idLit $(spec.initId) $(spec.viewId) $(spec.updateId))
+    | false, false => `(LocalDef.of $idLit $(spec.initId) $(spec.viewId) $(spec.updateId))
+  let regDoc? := if spec.hasProps then none else doc?
   let mut cmds : Array (TSyntax `command) := #[
-    ← (if spec.hasProps then
-        if spec.outTy?.isNone then `(command| def $regId : LocalDef :=
-          LocalDef.ofProps $idLit $initId $viewId (fun p s m => ($updateId p s m, (none : Option Bool))))
-        else `(command| def $regId : LocalDef := LocalDef.ofProps $idLit $initId $viewId $updateId)
-      else if spec.outTy?.isNone then `(command| $[$doc?:docComment]? def $regId : LocalDef :=
-        LocalDef.ofSimple $idLit $initId $viewId $updateId)
-      else `(command| $[$doc?:docComment]? def $regId : LocalDef :=
-        LocalDef.of $idLit $initId $viewId $updateId)),
-    ← `(command| $[$doc?:docComment]? def $(mkIdent (tId ++ `_qed_mount)) {msg : Type} (key : String) : Attr msg :=
+    ← `(command| $[$regDoc?:docComment]? def $regId : LocalDef := $regRhs),
+    ← `(command| $[$doc?:docComment]? def $(spec.id `_qed_mount) {msg : Type} (key : String) : Attr msg :=
           localMount $idLit key) ]
   if let some o := spec.outTy? then
-    cmds := cmds.push (← `(command| def $(mkIdent (tId ++ `_qed_mountWithOpt)) {msg : Type}
+    cmds := cmds.push (← `(command| def $(spec.id `_qed_mountWithOpt) {msg : Type}
           (key : String) (onOut : $o → Option msg) : Attr msg :=
           localMountWith $idLit key onOut))
   return cmds
@@ -153,12 +145,8 @@ private def mkEnsuredExistentialWrap (ensConst : Name) (qaIds : Array Ident)
 
 private def mkCompQueriesCmd? (spec : ComponentSpec) : CommandElabM (Option (TSyntax `command)) := do
   if spec.queries.isEmpty then return none
-  let tId := spec.t.getId
-  let stateId := mkIdent (tId ++ `State)
-  let msgId := mkIdent (tId ++ `Msg)
   let qTerms ← spec.queries.mapM fun q => do
     let qNm := q.id
-    let qCtor := mkIdent (tId ++ `Msg ++ q.ctorName)
     let rspec := q.rpc
     let reqTupleTy ← Qed.Lang.buildProdType (rspec.mInfo.paramTypeConsts.map fun n => (mkIdent n : Term))
     let paramsBody ← mkRpcQueryParamsBody spec rspec
@@ -176,33 +164,28 @@ private def mkCompQueriesCmd? (spec : ComponentSpec) : CommandElabM (Option (TSy
       let methId := mkIdentFrom rspec.rpcRef (Name.mkSimple rspec.mInfo.name)
       `(some $(← withRef rspec.rpcRef `(qedCheckRpcCall% $srvId:ident $methId:ident [$[$qaTerms:term],*] $cbTerm)))
     `(Qed.Resource.rpcQuery (Req := $reqTupleTy)
-        (params? := fun (s : $stateId) => $paramsBody)
-        (fetch := fun (s : $stateId) _qgot _qk => $fetchBody)
-        (got := $qCtor)
-        (get := fun (s : $stateId) => s.$qNm:ident)
-        (set := fun c (s : $stateId) => { s with $qNm:ident := c }))
+        (params? := fun (s : $(spec.stateId)) => $paramsBody)
+        (fetch := fun (s : $(spec.stateId)) _qgot _qk => $fetchBody)
+        (got := $(spec.msgCtor q.ctorName))
+        (get := fun (s : $(spec.stateId)) => s.$qNm:ident)
+        (set := fun c (s : $(spec.stateId)) => { s with $qNm:ident := c }))
   return some (← `(command|
     set_option linter.unusedVariables false in
-    def $(mkIdent (tId ++ `queries)) : List (Query $stateId $msgId) := [$[$qTerms],*]))
+    def $(spec.id `queries) : List (Query $(spec.stateId) $(spec.msgId)) := [$[$qTerms],*]))
 
 private def mkCompSubscriptionsCmd? (spec : ComponentSpec) : CommandElabM (Option (TSyntax `command)) := do
   if spec.subscriptions.isEmpty then return none
-  let tId := spec.t.getId
-  let stateId := mkIdent (tId ++ `State)
-  let msgId := mkIdent (tId ++ `Msg)
   let subTerms ← spec.subscriptions.mapM fun sub => do
     let subNm := sub.id
     let slotLit := Syntax.mkStrLit subNm.getId.toString
-    let wsKeyId := mkIdent (subKeyFnName tId sub)
-    let joinCtor := mkIdent (tId ++ `Msg ++ sub.joinCtor)
-    let msgCtor := mkIdent (tId ++ `Msg ++ sub.msgCtor)
-    let stCtor := mkIdent (tId ++ `Msg ++ sub.statusCtor)
+    let wsKeyId := mkIdent (subKeyFnName spec.t.getId sub)
+    let msgCtor := spec.msgCtor sub.msgCtor
     let recTerm ← liftMacroM <| sub.reconnect.toSyntaxTerm
     let unsubFnId := mkIdentFrom sub.chanRef sub.chInfo.unsubHelperConst
     let chFullId := mkIdentFrom sub.chanRef sub.chInfo.fullName
     let openBody ← mkSubBranches spec sub (← `(none)) true fun qaIds => do
-      let onJoinCb ← `($joinCtor _wk)
-      let onStCb ← `($stCtor _wk)
+      let onJoinCb ← `($(spec.msgCtor sub.joinCtor) _wk)
+      let onStCb ← `($(spec.msgCtor sub.statusCtor) _wk)
       let onMsgCb ← if !sub.hasMsgEnsured then
           `($msgCtor _wk)
         else
@@ -218,12 +201,12 @@ private def mkCompSubscriptionsCmd? (spec : ComponentSpec) : CommandElabM (Optio
     `(Qed.Subscription.mk
         $slotLit
         $wsKeyId
-        (fun _wk (s : $stateId) => $openBody)
+        (fun _wk (s : $(spec.stateId)) => $openBody)
         ($unsubFnId $slotLit)
-        (fun (s : $stateId) => { s with $subNm:ident := Qed.SocketStatus.disconnected }))
+        (fun (s : $(spec.stateId)) => { s with $subNm:ident := Qed.SocketStatus.disconnected }))
   return some (← `(command|
     set_option linter.unusedVariables false in
-    def $(mkIdent (tId ++ `subscriptions)) : List (Qed.Subscription $stateId $msgId) := [$[$subTerms],*]))
+    def $(spec.id `subscriptions) : List (Qed.Subscription $(spec.stateId) $(spec.msgId)) := [$[$subTerms],*]))
 
 
 private def mkSpecStepPf (sVar mVar : Ident) : List Ident → Term → CommandElabM Term
@@ -233,18 +216,19 @@ private def mkSpecStepPf (sVar mVar : Ident) : List Ident → Term → CommandEl
       let leftPf ← mkSpecStepPf sVar mVar prevRev (← `(($hTerm).1))
       `(And.intro $leftPf (($lastId:ident).2 $sVar $mVar ($hTerm).2))
 
-private def mkSpecPropPair (tId : Name) (suffix : String) (stateId msgId appIdent : Ident)
+private def mkSpecPropPair (spec : ComponentSpec) (suffix : String)
     (prop initPf stepFn : Term) : CommandElabM (Array (TSyntax `command)) := do
+  let appIdent := spec.id `app
   pure #[
     ← `(command|
-      theorem $(mkIdent (tId ++ Name.mkSimple s!"specApp_init_{suffix}")) :
+      theorem $(spec.id (Name.mkSimple s!"specApp_init_{suffix}")) :
           $prop ($appIdent).init.1 := $initPf),
     ← `(command|
-      theorem $(mkIdent (tId ++ Name.mkSimple s!"specApp_preserves_{suffix}"))
-          (st : Qed.SpecState $stateId $msgId) (msg : $msgId) (h : $prop st) :
+      theorem $(spec.id (Name.mkSimple s!"specApp_preserves_{suffix}"))
+          (st : Qed.SpecState $(spec.stateId) $(spec.msgId)) (msg : $(spec.msgId)) (h : $prop st) :
           $prop (($appIdent).update st msg).1 := $stepFn st msg h) ]
 
-private def mkSpecInvThmCmds (tId : Name) (stateId msgId appIdent baseAppIdent clsIdent : Ident)
+private def mkSpecInvThmCmds (spec : ComponentSpec) (baseAppIdent clsIdent : Ident)
     (inv : Term) (stateInvEntries : Array (Term × Option Ident)) :
     CommandElabM (Array (TSyntax `command)) := do
   let invIds? : Option (Array Ident) :=
@@ -263,42 +247,42 @@ private def mkSpecInvThmCmds (tId : Name) (stateId msgId appIdent baseAppIdent c
   let mVar := mkIdent `_m
   let hVar := mkIdent `_h
   let stepPf ← mkSpecStepPf sVar mVar invIds.toList.reverse hVar
-  mkSpecPropPair tId "inv" stateId msgId appIdent
+  mkSpecPropPair spec "inv"
     (← `(Qed.SpecEngine.SpecInv ($inv)))
     (← `(Qed.Internal.App.withSpeculative_init_inv $clsIdent $baseAppIdent $initPf))
     (← `(Qed.Internal.App.withSpeculative_step_inv $clsIdent $baseAppIdent (fun $sVar $mVar $hVar => $stepPf)))
 
-private def mkSpecCoreCmds (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
-    (tId : Name) (stateId msgId appIdent baseAppIdent clsIdent : Ident) (finalApp : Term) :
+private def mkSpecCoreCmds (spec : ComponentSpec) (baseAppIdent clsIdent : Ident) (finalApp : Term) :
     CommandElabM (Array (TSyntax `command)) := do
-  let cohCmds ← mkSpecPropPair tId "coherent" stateId msgId appIdent
+  let doc? := spec.doc?
+  let cohCmds ← mkSpecPropPair spec "coherent"
     (← `(Qed.SpecEngine.Coherent (fun s m => (($baseAppIdent).update s m).1)))
     (← `(Qed.Internal.App.withSpeculative_init_coherent $clsIdent $baseAppIdent))
     (← `(Qed.Internal.App.withSpeculative_step_coherent $clsIdent $baseAppIdent))
-  let wfCmds ← mkSpecPropPair tId "wellFormedIds" stateId msgId appIdent
+  let wfCmds ← mkSpecPropPair spec "wellFormedIds"
     (← `(Qed.SpecEngine.WellFormedIds))
     (← `(Qed.Internal.App.withSpeculative_init_wellFormedIds $clsIdent $baseAppIdent))
     (← `(Qed.Internal.App.withSpeculative_step_wellFormedIds $clsIdent $baseAppIdent))
   return #[
-    ← `(command| def $baseAppIdent : App $stateId $msgId := $finalApp),
-    ← `(command| $[$doc?:docComment]? def $appIdent :
-      App (Qed.SpecState $stateId $msgId) $msgId :=
+    ← `(command| def $baseAppIdent : App $(spec.stateId) $(spec.msgId) := $finalApp),
+    ← `(command| $[$doc?:docComment]? def $(spec.id `app) :
+      App (Qed.SpecState $(spec.stateId) $(spec.msgId)) $(spec.msgId) :=
       Qed.Internal.App.withSpeculative $clsIdent $baseAppIdent)
   ] ++ cohCmds ++ wfCmds
 
-private def mkRehydrateInvCmds (tId : Name) (stateId msgId appIdent : Ident)
-    (specBaseApp? : Option Ident) (compInv? : Option Term) (hasDecInv : Bool) :
-    CommandElabM (Array (TSyntax `command)) := do
+private def mkRehydrateInvCmds (spec : ComponentSpec) (specBaseApp? : Option Ident)
+    (compInv? : Option Term) (hasDecInv : Bool) : CommandElabM (Array (TSyntax `command)) := do
   let some inv := compInv? | return #[]
+  let appIdent := spec.id `app
   let (stTy, invWrap) ← match specBaseApp? with
-    | some _ => pure (← `(Qed.SpecState $stateId $msgId), ← `(Qed.SpecEngine.SpecInv ($inv)))
-    | none   => pure ((stateId : Term), inv)
+    | some _ => pure (← `(Qed.SpecState $(spec.stateId) $(spec.msgId)), ← `(Qed.SpecEngine.SpecInv ($inv)))
+    | none   => pure ((spec.stateId : Term), inv)
   if hasDecInv then
     let pf ← match specBaseApp? with
       | some _ => `(Qed.Internal.App.withSpeculative_rehydrate_sound _ _ (Qed.App.guardRehydrate_sound _ _ _) raw st')
       | none   => `(Qed.App.guardRehydrate_sound _ _ _ raw st')
     pure #[← `(command|
-      theorem $(mkIdent (tId ++ `rehydrate_inv)) (raw : String) (st' : $stTy) :
+      theorem $(spec.id `rehydrate_inv) (raw : String) (st' : $stTy) :
           ($appIdent).rehydrate raw = some st' → ($invWrap) st' := $pf)]
   else
     let pf ← match specBaseApp? with
@@ -306,28 +290,32 @@ private def mkRehydrateInvCmds (tId : Name) (stateId msgId appIdent : Ident)
           `(Qed.Internal.App.withSpeculative_dehydrate_inv _ _ (by dsimp only [$baseAppId:ident]; qedProveDehydrateInv))
       | none => `(by dsimp only [$appIdent:ident]; qedProveDehydrateInv)
     pure #[← `(command|
-      theorem $(mkIdent (tId ++ `dehydrate_inv)) :
+      theorem $(spec.id `dehydrate_inv) :
           ∀ st st', ($invWrap) st → ($appIdent).rehydrate (($appIdent).dehydrate st) = some st' → ($invWrap) st' := $pf)]
 
-private def mkSpecAppCmds (spec : ComponentSpec) (tId : Name) (stateId msgId appIdent viewIdent : Ident)
-    (finalApp : Term) (compInv? : Option Term) (hasDecInv : Bool)
-    (stateInvEntries : Array (Term × Option Ident)) (initCmds : Array (TSyntax `command)) :
+private def mkViewEqThm (thmId appId viewId stateId : Ident) : CommandElabM (TSyntax `command) :=
+  `(command|
+    theorem $thmId (s : $stateId) :
+        Qed.Html.canonical (Qed.App.view $appId s) = Qed.Html.canonical ($viewId s) := by
+      qedProveViewEquiv $appId $viewId)
+
+private def mkSpecAppCmds (spec : ComponentSpec) (finalApp : Term) (compInv? : Option Term)
+    (hasDecInv : Bool) (stateInvEntries : Array (Term × Option Ident))
+    (initCmds : Array (TSyntax `command)) :
     CommandElabM (Array (TSyntax `command) × TSyntax `command) := do
-  let baseAppIdent := mkIdent (tId ++ `_baseApp)
-  let clsIdent := mkIdent (tId ++ `_specClassify)
-  let mut cmds := initCmds ++ (← mkSpecCoreCmds spec.doc? tId stateId msgId appIdent baseAppIdent clsIdent finalApp)
+  let appIdent := spec.id `app
+  let baseAppIdent := spec.id `_baseApp
+  let clsIdent := spec.id `_specClassify
+  let mut cmds := initCmds ++ (← mkSpecCoreCmds spec baseAppIdent clsIdent finalApp)
   if spec.queries.isEmpty && spec.subscriptions.isEmpty then
     if let some inv := compInv? then
-      cmds := cmds ++ (← mkSpecInvThmCmds tId stateId msgId appIdent baseAppIdent clsIdent inv stateInvEntries)
-  cmds := cmds ++ (← mkRehydrateInvCmds tId stateId msgId appIdent (some baseAppIdent) compInv? hasDecInv)
-  let baseViewEqIdent := mkIdent (tId ++ `_base_app_view_eq)
-  cmds := cmds.push (← `(command|
-    theorem $baseViewEqIdent (s : $stateId) :
-        Qed.Html.canonical (Qed.App.view $baseAppIdent s) = Qed.Html.canonical ($viewIdent s) := by
-      qedProveViewEquiv $baseAppIdent $viewIdent))
+      cmds := cmds ++ (← mkSpecInvThmCmds spec baseAppIdent clsIdent inv stateInvEntries)
+  cmds := cmds ++ (← mkRehydrateInvCmds spec (some baseAppIdent) compInv? hasDecInv)
+  let baseViewEqIdent := spec.id `_base_app_view_eq
+  cmds := cmds.push (← mkViewEqThm baseViewEqIdent baseAppIdent spec.viewId spec.stateId)
   let appViewEqCmd ← `(command|
-    theorem $(mkIdent (tId ++ `app_view_eq)) (st : Qed.SpecState $stateId $msgId) :
-        Qed.Html.canonical (Qed.App.view $appIdent st) = Qed.Html.canonical ($viewIdent st.visible) := by
+    theorem $(spec.id `app_view_eq) (st : Qed.SpecState $(spec.stateId) $(spec.msgId)) :
+        Qed.Html.canonical (Qed.App.view $appIdent st) = Qed.Html.canonical ($(spec.viewId) st.visible) := by
       simpa [Qed.Internal.App.withSpeculative_view, $appIdent:ident] using $baseViewEqIdent st.visible)
   return (cmds, appViewEqCmd)
 
@@ -366,9 +354,6 @@ private def applyHeadDirectives (hmId stId : Ident) (dirs : Array Syntax) (tail 
 
 private def mkCompHeadCmd? (spec : ComponentSpec) : CommandElabM (Option (TSyntax `command)) := do
   let some headStx := spec.headClause? | return none
-  let tId := spec.t.getId
-  let stateId := mkIdent (tId ++ `State)
-  let headInfoId := mkIdent (tId ++ `headInfo)
   let hmId := mkIdent `_qed_hm
   let stId := mkIdent `_qed_st
   let items := (headStx.getArg 2).getArgs
@@ -386,7 +371,7 @@ private def mkCompHeadCmd? (spec : ComponentSpec) : CommandElabM (Option (TSynta
       `(($hmId, $stId))
     else
       let some rd := spec.route?
-        | throwErrorAt caseItems[0]! s!"`case` inside `head:` requires a `route` declaration on `component {tId}`"
+        | throwErrorAt caseItems[0]! s!"`case` inside `head:` requires a `route` declaration on `component {spec.t.getId}`"
       let mut alts : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
       for c in caseItems do
         let rawPats := (c.getArg 1).getSepArgs
@@ -401,28 +386,19 @@ private def mkCompHeadCmd? (spec : ComponentSpec) : CommandElabM (Option (TSynta
   let boundBody ← bindMentionedFields spec (mentionsIdent fullBody.raw) fullBody
   return some (← `(command|
     set_option linter.unusedVariables false in
-    def $headInfoId (s : $stateId) : Qed.HeadMeta × Nat := $boundBody))
+    def $(spec.id `headInfo) (s : $(spec.stateId)) : Qed.HeadMeta × Nat := $boundBody))
 
 private def buildCompFinalApp (spec : ComponentSpec) (body' : Term) (hasStart : Bool)
     (stateInvPreds : Array Term) :
     CommandElabM (Array (TSyntax `command) × Term × Option Term × Bool) := do
-  let tId        := spec.t.getId
-  let stateId    := mkIdent (tId ++ `State)
-  let initId     := mkIdent (tId ++ `init)
-  let startCmdId := mkIdent (tId ++ `startCmd)
-  let msgId      := mkIdent (tId ++ `Msg)
-  let updateId   := mkIdent (tId ++ `update)
-  let viewId     := mkIdent (tId ++ `view)
-  let regsId     := mkIdent (tId ++ `regs)
   let mut cmds : Array (TSyntax `command) := #[]
-  let startArg : Term ← if hasStart then `($startCmdId) else `(Qed.Cmd.none)
+  let startArg : Term ← if hasStart then `($(spec.id `startCmd)) else `(Qed.Cmd.none)
   let onPortArg : Term ← if spec.portIns.isEmpty then `(Option.none) else do
-    let onPortId := mkIdent (tId ++ `onPort)
+    let onPortId := spec.id `onPort
     let inTuples ← spec.portIns.mapM fun p => do
       let pLit := Syntax.mkStrLit p.id.getId.toString
-      let pCtor := mkIdent (tId ++ `Msg ++ p.id.getId)
-      `(($pLit, fun raw => (((Json.parse raw).bind FromJson.fromJson : Except String $(p.argTy)).toOption).map $pCtor))
-    cmds := cmds.push (← `(command| def $onPortId : String → String → Option $msgId :=
+      `(($pLit, fun raw => (((Json.parse raw).bind FromJson.fromJson : Except String $(p.argTy)).toOption).map $(spec.msgCtor p.id.getId)))
+    cmds := cmds.push (← `(command| def $onPortId : String → String → Option $(spec.msgId) :=
       dispatchPorts #[$inTuples,*]))
     `(some $onPortId)
   let expandedBody ← liftMacroM <| Qed.Jsx.expandJsxIn body'.raw
@@ -431,83 +407,67 @@ private def buildCompFinalApp (spec : ComponentSpec) (body' : Term) (hasStart : 
   for po in spec.portOuts.reverse do
     if mentionsIdent templateTerm.raw po.id.getId then
       let poId := mkIdent po.id.getId
-      templateTerm ← `(let $poId:ident := $(mkIdent (tId ++ po.id.getId)); $templateTerm)
-  let appUpdate : Term ← if spec.hasEffects then `($updateId)
-    else `(fun s m => ($updateId s m, Qed.Cmd.none))
+      templateTerm ← `(let $poId:ident := $(spec.id po.id.getId); $templateTerm)
+  let appUpdate : Term ← if spec.hasEffects then `($(spec.updateId))
+    else `(fun s m => ($(spec.updateId) s m, Qed.Cmd.none))
   let onSessionArg : Term ← match spec.sessionField? with
-    | some _ => `(some $(mkIdent (tId ++ `Msg ++ `_onSession)))
+    | some _ => `(some $(spec.msgCtor `_onSession))
     | none   => `(none)
-  let baseApp0 : Term ← match spec.route? with
-    | some _ => `(Qed.Internal.mkRoutedApp $initId $appUpdate $templateTerm
-        (onRoute := $(mkIdent (tId ++ `Msg ++ `_onRoute))) (onSession := $onSessionArg)
-        (start := $startArg) (locals := $regsId) (styles := qedInternalStyles% $viewId) (onPort := $onPortArg))
-    | none   => `(Qed.Internal.mkApp $initId $appUpdate $templateTerm (onSession := $onSessionArg)
-        (start := $startArg) (locals := $regsId) (styles := qedInternalStyles% $viewId) (onPort := $onPortArg))
-  let baseApp1 : Term ← if spec.themes.isEmpty then pure baseApp0 else do
+  let app0 : Term ← match spec.route? with
+    | some _ => `(Qed.Internal.mkRoutedApp $(spec.initId) $appUpdate $templateTerm
+        (onRoute := $(spec.msgCtor `_onRoute)) (onSession := $onSessionArg)
+        (start := $startArg) (locals := $(spec.id `regs)) (styles := qedInternalStyles% $(spec.viewId)) (onPort := $onPortArg))
+    | none   => `(Qed.Internal.mkApp $(spec.initId) $appUpdate $templateTerm (onSession := $onSessionArg)
+        (start := $startArg) (locals := $(spec.id `regs)) (styles := qedInternalStyles% $(spec.viewId)) (onPort := $onPortArg))
+  let mut appT : Term := app0
+  if !spec.themes.isEmpty then
     let thStyleTerms ← resolveThemeStyles spec.themes
-    `(Qed.Internal.App.withExtraStyles [$[$thStyleTerms],*] $baseApp0)
-  let baseApp : Term ← if spec.stylesheets.isEmpty then pure baseApp1 else do
+    appT ← `(Qed.Internal.App.withExtraStyles [$[$thStyleTerms],*] $appT)
+  if !spec.stylesheets.isEmpty then
     let shLits := spec.stylesheets.map Syntax.mkStrLit
-    `(Qed.Internal.App.withStylesheets [$[$shLits:str],*] $baseApp1)
-  let dehydApp : Term ← if spec.ephemeralFields.isEmpty then `(qedInternalAutoDehydrate% $initId $baseApp)
-    else `(Qed.Internal.App.withDehydrate (Dehydrate.except $initId [$[$spec.ephemeralFields:ident],*]) $baseApp)
-  let queriedApp : Term ← if spec.queries.isEmpty then pure dehydApp else
-    `(Qed.Internal.App.withQueries $(mkIdent (tId ++ `queries)) $dehydApp)
-  let subbedApp : Term ← if spec.subscriptions.isEmpty then pure queriedApp else
-    `(Qed.Internal.App.withSubscriptions $(mkIdent (tId ++ `subscriptions)) $queriedApp)
-  let headedApp : Term ← if spec.headClause?.isNone then pure subbedApp else do
-    let headInfoId := mkIdent (tId ++ `headInfo)
-    `(Qed.App.withSsrStatus (fun _s => ($headInfoId _s).2)
-        (Qed.App.withHead (fun _s => ($headInfoId _s).1) $subbedApp))
+    appT ← `(Qed.Internal.App.withStylesheets [$[$shLits:str],*] $appT)
+  appT ← if spec.ephemeralFields.isEmpty then `(qedInternalAutoDehydrate% $(spec.initId) $appT)
+    else `(Qed.Internal.App.withDehydrate (Dehydrate.except $(spec.initId) [$[$spec.ephemeralFields:ident],*]) $appT)
+  if !spec.queries.isEmpty then
+    appT ← `(Qed.Internal.App.withQueries $(spec.id `queries) $appT)
+  if !spec.subscriptions.isEmpty then
+    appT ← `(Qed.Internal.App.withSubscriptions $(spec.id `subscriptions) $appT)
+  if spec.headClause?.isSome then
+    let headInfoId := spec.id `headInfo
+    appT ← `(Qed.App.withSsrStatus (fun _s => ($headInfoId _s).2) (Qed.App.withHead (fun _s => ($headInfoId _s).1) $appT))
   let compInv? : Option Term ← if stateInvPreds.isEmpty then pure none
-    else if stateInvPreds.size == 1 then pure (some (← `(($(stateInvPreds[0]!) : $stateId → Prop))))
+    else if stateInvPreds.size == 1 then pure (some (← `(($(stateInvPreds[0]!) : $(spec.stateId) → Prop))))
     else do
       let sVar := mkIdent `_qed_s
       let checks ← stateInvPreds.mapM fun p => `(($p) $sVar)
-      pure (some (← `(fun ($sVar:ident : $stateId) => $(← mkConjBody checks))))
+      pure (some (← `(fun ($sVar:ident : $(spec.stateId)) => $(← mkConjBody checks))))
   let hasDecInv ← match compInv? with
-    | some inv => canSynthDecidablePred stateId inv
+    | some inv => canSynthDecidablePred spec.stateId inv
     | none     => pure false
-  let finalApp : Term ← match compInv?, hasDecInv with
-    | some inv, true => `(Qed.App.guardRehydrate ($inv) $headedApp)
-    | _, _           => pure headedApp
-  return (cmds, finalApp, compInv?, hasDecInv)
+  if let (some inv, true) := (compInv?, hasDecInv) then
+    appT ← `(Qed.App.guardRehydrate ($inv) $appT)
+  return (cmds, appT, compInv?, hasDecInv)
 
 private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool)
     (stateInvEntries : Array (Term × Option Ident)) : CommandElabM (Array (TSyntax `command) × TSyntax `command) := do
-  let tId       := spec.t.getId
-  let stateId   := mkIdent (tId ++ `State)
-  let msgId     := mkIdent (tId ++ `Msg)
-  let appIdent  := mkIdent (tId ++ `app)
-  let viewIdent := mkIdent (tId ++ `view)
   let (initCmds, finalApp, compInv?, hasDecInv) ←
     buildCompFinalApp spec body' hasStart (stateInvEntries.map (·.1))
   if spec.hasSpeculative then
-    return ← mkSpecAppCmds spec tId stateId msgId appIdent viewIdent finalApp compInv? hasDecInv stateInvEntries initCmds
+    return ← mkSpecAppCmds spec finalApp compInv? hasDecInv stateInvEntries initCmds
   let doc? := spec.doc?
-  let cmds := initCmds.push (← `(command| $[$doc?:docComment]? def $appIdent : App $stateId $msgId :=
-    $finalApp)) ++ (← mkRehydrateInvCmds tId stateId msgId appIdent none compInv? hasDecInv)
-  let appViewEqCmd ← `(command|
-    theorem $(mkIdent (tId ++ `app_view_eq)) (s : $stateId) :
-        Qed.Html.canonical (Qed.App.view $appIdent s) = Qed.Html.canonical ($viewIdent s) := by
-      qedProveViewEquiv $appIdent $viewIdent)
-  return (cmds, appViewEqCmd)
+  let appIdent := spec.id `app
+  let cmds := initCmds.push (← `(command| $[$doc?:docComment]? def $appIdent : App $(spec.stateId) $(spec.msgId) :=
+    $finalApp)) ++ (← mkRehydrateInvCmds spec none compInv? hasDecInv)
+  return (cmds, ← mkViewEqThm (spec.id `app_view_eq) appIdent spec.viewId spec.stateId)
 
 private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (idLit : StrLit) :
     CommandElabM (Array (TSyntax `command) × Bool × Bool) := do
-  let tId        := spec.t.getId
-  let fs         := spec.states.map (·.id)
-  let stateId    := mkIdent (tId ++ `State)
-  let initId     := mkIdent (tId ++ `init)
-  let startCmdId := mkIdent (tId ++ `startCmd)
-  let msgId      := mkIdent (tId ++ `Msg)
-  let viewId     := mkIdent (tId ++ `view)
-  let regId      := mkIdent (tId ++ `reg)
-  let regsId     := mkIdent (tId ++ `regs)
+  let tId := spec.t.getId
+  let fs := spec.states.map (·.id)
   let mut cmds : Array (TSyntax `command) := #[]
   if spec.mountable then
     let dsT := spec.states.filterMap (·.def?)
-    cmds := cmds.push (← `(command| def $initId : $stateId := { $[$fs:ident := $dsT],* }))
+    cmds := cmds.push (← `(command| def $(spec.initId) : $(spec.stateId) := { $[$fs:ident := $dsT],* }))
   let hoistedStarts := spec.hoisted.filter (·.info.hasStart)
   let hasStart := !starts'.isEmpty || !hoistedStarts.isEmpty
   if hasStart then
@@ -515,13 +475,13 @@ private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (i
     let subStarts ← hoistedStarts.mapM fun h => do
       let cStart := mkIdent (h.info.fullName ++ `startCmd)
       let call ← if h.info.hasProps then `($cStart $(← mkHoistedPropsTerm h)) else `($cStart)
-      `(Cmd.map $(mkIdent (tId ++ `Msg ++ h.ctorName)) $call)
+      `(Cmd.map $(spec.msgCtor h.ctorName) $call)
     let mut startBody ← mkCmdBatch (starts' ++ subStarts)
     if spec.mountable then
       startBody ← bindMentionedFields spec (mentionsIdent startBody.raw) startBody
       if mentionsIdent startBody.raw `s then
-        startBody ← `(let s := $initId; $startBody)
-    cmds := cmds.push (← `(command| def $startCmdId $[$pBinders:bracketedBinder]* : Cmd $msgId := $startBody))
+        startBody ← `(let s := $(spec.initId); $startBody)
+    cmds := cmds.push (← `(command| def $(spec.id `startCmd) $[$pBinders:bracketedBinder]* : Cmd $(spec.msgId) := $startBody))
   let outCtorSpecs : Array (Name × Array (Ident × Term)) :=
     spec.events.map (fun ev => (ev.id.getId, ev.params)) ++
     spec.binds.map (fun bd => (Name.mkSimple s!"set_{bd.id.getId}", #[(mkIdent `v, bd.ty)]))
@@ -538,9 +498,9 @@ private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (i
   let hasLocalDef := spec.mountable && !spec.hasEffects && !spec.hasSlotsOrKids && canEmitCodecs && outJsonOk
   if hasLocalDef then
     cmds := cmds ++ (← mkCompLocalDefCmds spec idLit)
-  let own : Term ← if hasLocalDef then `([$regId]) else `(([] : List LocalDef))
-  cmds := cmds.push (← `(command| def $regsId : List LocalDef :=
-    LocalDef.dedupe ($own ++ qedInternalLocalRegistrations% $viewId)))
+  let own : Term ← if hasLocalDef then `([$(spec.id `reg)]) else `(([] : List LocalDef))
+  cmds := cmds.push (← `(command| def $(spec.id `regs) : List LocalDef :=
+    LocalDef.dedupe ($own ++ qedInternalLocalRegistrations% $(spec.viewId))))
   return (cmds, hasStart, hasLocalDef)
 
 
@@ -552,32 +512,20 @@ private def withOpenNs {α : Type} (ns : Name) (k : CommandElabM α) : CommandEl
 private def elabCompStyles (compNs : Name) (rawSpec : ComponentSpec) : CommandElabM Unit := do
   for stCl in rawSpec.styles do
     withOpenNs compNs do
-      let sNameId : Ident := ⟨(stCl.getArg 1)⟩
-      let qualifiedId := mkIdentFrom sNameId (rawSpec.t.getId ++ sNameId.getId)
-      let extendsIds : Array Ident :=
-        if (stCl.getArg 2).getNumArgs == 1 then (((stCl.getArg 2).getArg 0).getArg 1).getSepArgs.map (⟨·⟩) else #[]
-      let strictTokens := (stCl.getArg 3).getNumArgs == 1
-      let bodyStxs := (stCl.getArg 5).getArgs
-      Qed.StyleDsl.elabStyleDef none qualifiedId extendsIds strictTokens bodyStxs
+      let sNameId : Ident := ⟨stCl.getArg 1⟩
+      Qed.StyleDsl.elabStyleDef none (mkIdentFrom sNameId (rawSpec.t.getId ++ sNameId.getId))
+        (Qed.StyleDsl.extractStyleExtends (stCl.getArg 2)) ((stCl.getArg 3).getNumArgs == 1) (stCl.getArg 5).getArgs
 
 private def collectCompEndpoints (rawSpec : ComponentSpec) (hoisted : Array HoistedSub)
     (ownUsedRpcs : Array (String × String)) : Array (String × String) × Array (String × String) := Id.run do
   let mut allUsedRpcs := ownUsedRpcs
   let mut allUsedChannels : Array (String × String) := #[]
   for sub in rawSpec.subscriptions do
-    match sub.chInfo.kind with
-    | .fullstack _ srvShort _ =>
-        let pair := (srvShort, sub.chInfo.channelName)
-        unless allUsedChannels.contains pair do
-          allUsedChannels := allUsedChannels.push pair
-    | .external .. => pure ()
+    if let .fullstack _ srvShort _ := sub.chInfo.kind then
+      allUsedChannels := pushUnique allUsedChannels (srvShort, sub.chInfo.channelName)
   for h in hoisted do
-    for ep in h.info.usedRpcs do
-      unless allUsedRpcs.contains ep do
-        allUsedRpcs := allUsedRpcs.push ep
-    for ch in h.info.usedChannels do
-      unless allUsedChannels.contains ch do
-        allUsedChannels := allUsedChannels.push ch
+    allUsedRpcs := h.info.usedRpcs.foldl pushUnique allUsedRpcs
+    allUsedChannels := h.info.usedChannels.foldl pushUnique allUsedChannels
   return (allUsedRpcs, allUsedChannels)
 
 private def elabCompRegistryAndMeta (spec : ComponentSpec) (hasStart hasLocalDef : Bool)

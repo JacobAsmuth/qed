@@ -113,31 +113,18 @@ private theorem lit_safe_inline (s : String)
     ∀ c ∈ s.toList, c ≠ '<' ∧ c ≠ '>' ∧ c ≠ '"' ∧ c ≠ '\'' :=
   lit_prop (fun _ h => by simp only [Bool.and_eq_true, bne_iff_ne] at h; exact ⟨h.1.1.1, h.1.1.2, h.1.2, h.2⟩) s h
 
-private theorem sanitizeCssAtom_no_lt (s : String) :
-    ∀ c ∈ (sanitizeCssAtom s).toList, c ≠ '<' := by
-  intro c hc
-  have hs := sanitizeCssAtom_safe s c hc
-  simp only [isSafeCssAtomChar, Bool.and_eq_true, bne_iff_ne] at hs
-  exact hs.1.1.2
+private theorem sanitizeCssAtom_no_lt (s : String) : ∀ c ∈ (sanitizeCssAtom s).toList, c ≠ '<' := fun c hc => by
+  have hs := sanitizeCssAtom_safe s c hc; simp only [isSafeCssAtomChar, Bool.and_eq_true, bne_iff_ne] at hs; exact hs.1.1.2
 
-private theorem sanitizeCssSelector_no_lt (s : String) :
-    ∀ c ∈ (sanitizeCssSelector s).toList, c ≠ '<' := by
-  intro c hc
-  have hs := sanitizeCssSelector_safe s c hc
-  simp only [isSafeCssSelectorChar, Bool.and_eq_true, bne_iff_ne] at hs
-  exact hs.1.2
+private theorem sanitizeCssSelector_no_lt (s : String) : ∀ c ∈ (sanitizeCssSelector s).toList, c ≠ '<' := fun c hc => by
+  have hs := sanitizeCssSelector_safe s c hc; simp only [isSafeCssSelectorChar, Bool.and_eq_true, bne_iff_ne] at hs; exact hs.1.2
 
-private theorem sanitizeCssIdent_no_lt (s : String) :
-    ∀ c ∈ (sanitizeCssIdent s).toList, c ≠ '<' := by
-  intro c hc
-  have hs := sanitizeCssIdent_safe s c hc
-  intro heq
-  subst heq
+private theorem sanitizeCssIdent_no_lt (s : String) : ∀ c ∈ (sanitizeCssIdent s).toList, c ≠ '<' := fun c hc heq => by
+  have hs := sanitizeCssIdent_safe s c hc; subst heq
   simp [isSafeCssIdentChar, Char.isAlphanum, Char.isAlpha, Char.isDigit] at hs
 
 private theorem sanitizeInlineCssAtom_no_lt_or_quote (s : String) :
-    ∀ c ∈ (sanitizeInlineCssAtom s).toList, c ≠ '<' ∧ c ≠ '>' ∧ c ≠ '"' ∧ c ≠ '\'' := by
-  intro c hc
+    ∀ c ∈ (sanitizeInlineCssAtom s).toList, c ≠ '<' ∧ c ≠ '>' ∧ c ≠ '"' ∧ c ≠ '\'' := fun c hc => by
   have hs := sanitizeInlineCssAtom_safe s c hc
   simp only [isSafeInlineCssChar, isSafeCssAtomChar, Bool.and_eq_true, bne_iff_ne] at hs
   exact ⟨hs.1.1.1.1.2, hs.1.1.1.2, hs.1.2, hs.2⟩
@@ -200,23 +187,18 @@ private theorem renderThemeRule_no_lt (item : Item) :
 
 theorem Theme.render_no_lt (th : Theme) :
     ∀ c ∈ (Theme.render th).toList, c ≠ '<' := by
-  unfold Theme.render; dsimp only
-  apply cssJoinLines_no_lt
-  intro s hs
-  rw [List.mem_append] at hs
-  rcases hs with h1 | hreset
-  · rw [List.mem_append] at h1
-    rcases h1 with hlight | hdark
-    · split at hlight
-      · nomatch hlight
-      · simp only [List.mem_singleton] at hlight; subst hlight
-        have := Item.renderList_no_lt th.lightDecls; solve_str_prop
-    · split at hdark
-      · nomatch hdark
-      · simp only [List.mem_cons, List.not_mem_nil, or_false] at hdark
-        rcases hdark with rfl | rfl <;> (have := Item.renderList_no_lt th.darkDecls; solve_str_prop)
-  · rcases List.mem_map.1 hreset with ⟨item, _, rfl⟩
-    exact renderThemeRule_no_lt item
+  apply cssJoinLines_no_lt; intro s hs
+  simp only [List.mem_append, List.mem_map] at hs
+  rcases hs with (hlight | hdark) | ⟨item, _, rfl⟩
+  · split at hlight
+    · nomatch hlight
+    · simp only [List.mem_singleton] at hlight; subst hlight
+      have := Item.renderList_no_lt th.lightDecls; solve_str_prop
+  · split at hdark
+    · nomatch hdark
+    · simp only [List.mem_cons, List.not_mem_nil, or_false] at hdark
+      rcases hdark with rfl | rfl <;> (have := Item.renderList_no_lt th.darkDecls; solve_str_prop)
+  · exact renderThemeRule_no_lt item
 
 theorem Theme.render_no_closeSeq (th : Theme) :
     containsCloseSeq (Theme.render th).toList = false :=
@@ -241,21 +223,12 @@ theorem Style.rule_no_lt (s : Style) :
 
 theorem renderStyleSheet_no_lt (styles : List Style) :
     ∀ c ∈ (renderStyleSheet styles).toList, c ≠ '<' := by
-  unfold renderStyleSheet
-  dsimp only
-  apply cssJoinLines_no_lt
-  intro r hr
-  rw [List.mem_append] at hr
-  rcases hr with h1 | hscoped
-  · rw [List.mem_append] at h1
-    rcases h1 with hglob | hextra
-    · rcases List.mem_map.1 hglob with ⟨s, _, rfl⟩
-      exact Style.rule_no_lt s
-    · rcases List.mem_map.1 hextra with ⟨e, _, rfl⟩
-      intro c hc
-      exact bne_iff_ne.1 (sanitizeWith_safe (· != '<') e c hc)
-  · rcases List.mem_map.1 hscoped with ⟨s, _, rfl⟩
-    exact Style.rule_no_lt s
+  apply cssJoinLines_no_lt; intro r hr
+  simp only [List.mem_append, List.mem_map] at hr
+  rcases hr with (⟨s, _, rfl⟩ | ⟨e, _, rfl⟩) | ⟨s, _, rfl⟩
+  · exact Style.rule_no_lt s
+  · exact fun c hc => bne_iff_ne.1 (sanitizeWith_safe (· != '<') e c hc)
+  · exact Style.rule_no_lt s
 
 theorem renderStyleSheet_no_closeSeq (styles : List Style) :
     containsCloseSeq (renderStyleSheet styles).toList = false :=

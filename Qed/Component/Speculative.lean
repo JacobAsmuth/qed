@@ -123,16 +123,11 @@ private partial def compileClassifyStmts (spec : ComponentSpec) : List Syntax �
 
 def mkSpecClassifyCmds (spec : ComponentSpec) : CommandElabM (Array (TSyntax `command)) := do
   if !spec.hasSpeculative then return #[]
-  let tId := spec.t.getId
-  let stateId := mkIdent (tId ++ `State)
-  let msgId := mkIdent (tId ++ `Msg)
-  let updateId := mkIdent (tId ++ `update)
-  let clsId := mkIdent (tId ++ `_specClassify)
-  let pureId := mkIdent (tId ++ `specClassify_pure)
+  let clsId := spec.id `_specClassify
   let mut arms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
 
   for da in spec.specDispatches do
-    let cFull := mkIdent (tId ++ `Msg ++ da.ctor)
+    let cFull := spec.msgCtor da.ctor
     let paramNames := da.params.map (·.1.getId.eraseMacroScopes)
     let mut rhs ← compileClassifyStmts spec da.stmts.toList
     rhs ← bindMentionedFields spec (fun g => !paramNames.contains g && mentionsIdent rhs.raw g) rhs
@@ -143,7 +138,6 @@ def mkSpecClassifyCmds (spec : ComponentSpec) : CommandElabM (Array (TSyntax `co
       arms := arms.push (← `(Lean.Parser.Term.matchAltExpr| | $cFull:ident => $rhs))
 
   for rs in spec.specResolves do
-    let cFull := mkIdent (tId ++ `Msg ++ rs.resCtor)
     let txId := rs.txIdParam
     let capIds : Array Term := rs.capturedParams.map (⟨·.1.raw⟩)
     let predId := rs.predParam
@@ -155,7 +149,7 @@ def mkSpecClassifyCmds (spec : ComponentSpec) : CommandElabM (Array (TSyntax `co
     let vId := mkIdent `_specOkVal
 
     let mkCtorApp (ctorNm : Name) (extraArg : Term) : CommandElabM Term :=
-      Qed.Lang.mkAppTerms (mkIdent (tId ++ `Msg ++ ctorNm)) (capIds.push extraArg)
+      Qed.Lang.mkAppTerms (spec.msgCtor ctorNm) (capIds.push extraArg)
 
     let contMsg ← mkCtorApp rs.contCtor ⟨vId.raw⟩
     let confirmMsg? ← rs.confirmCtor?.mapM fun cn => mkCtorApp cn ⟨vId.raw⟩
@@ -164,7 +158,7 @@ def mkSpecClassifyCmds (spec : ComponentSpec) : CommandElabM (Array (TSyntax `co
 
     let optList : Option Term → CommandElabM Term
       | some m => `([$m])
-      | none   => `(([] : List $msgId))
+      | none   => `(([] : List $(spec.msgId)))
     let okReplList ← match confirmMsg? with | some cm => `([$contMsg, $cm]) | none => `([$contMsg])
     let confirmOnHitList ← optList confirmMsg?
     let missReplList ← match rollbackMsg? with | some rm => `([$rm]) | none => pure okReplList
@@ -179,35 +173,35 @@ def mkSpecClassifyCmds (spec : ComponentSpec) : CommandElabM (Array (TSyntax `co
       if (Qed.SpecEq.eq $rawValTerm $predId) then
         Qed.SpecAction.resolve $txId true $okReplList $confirmOnHitList
       else
-        Qed.SpecAction.resolve $txId false $missReplList ([] : List $msgId))
+        Qed.SpecAction.resolve $txId false $missReplList ([] : List $(spec.msgId)))
 
     let okPat ← if rs.mInfo.isOption && rs.catchHasNone then `($okCtorId (Option.some $vId:ident))
                 else `($okCtorId $vId:ident)
     let matchTerm ← `(match $outId:ident with
       | $okPat => $okBranchBody
-      | _ => Qed.SpecAction.resolve $txId false $errReplList ([] : List $msgId))
+      | _ => Qed.SpecAction.resolve $txId false $errReplList ([] : List $(spec.msgId)))
 
-    arms := arms.push (← `(Lean.Parser.Term.matchAltExpr| | $cFull:ident $allPatIds* => $matchTerm))
+    arms := arms.push (← `(Lean.Parser.Term.matchAltExpr| | $(spec.msgCtor rs.resCtor):ident $allPatIds* => $matchTerm))
 
   arms := arms.push (← `(Lean.Parser.Term.matchAltExpr| | _ => Qed.SpecAction.normal))
   return #[
     ← `(command|
       set_option linter.unusedVariables false in
-      def $clsId (s : $stateId) : $msgId → Qed.SpecAction $msgId :=
+      def $clsId (s : $(spec.stateId)) : $(spec.msgId) → Qed.SpecAction $(spec.msgId) :=
         fun m => match m with $[$arms:matchAlt]*),
     ← `(command|
       set_option linter.unusedVariables false in
-      theorem $pureId (s : $stateId) (m : $msgId)
-          (preMsg? : Option $msgId) (preCmd : Qed.Cmd $msgId)
-          (specMsg : $msgId) (rpcCmd : Nat → Qed.Cmd $msgId)
+      theorem $(spec.id `specClassify_pure) (s : $(spec.stateId)) (m : $(spec.msgId))
+          (preMsg? : Option $(spec.msgId)) (preCmd : Qed.Cmd $(spec.msgId))
+          (specMsg : $(spec.msgId)) (rpcCmd : Nat → Qed.Cmd $(spec.msgId))
           (h : $clsId s m = Qed.SpecAction.dispatch preMsg? preCmd specMsg rpcCmd) :
-          ∀ s', ($updateId s' specMsg).2 = Qed.Cmd.none := by
+          ∀ s', ($(spec.updateId) s' specMsg).2 = Qed.Cmd.none := by
         intro s'
         unfold $clsId at h
         cases m <;> dsimp only at h
         all_goals
           repeat (first
-            | (injection h with _ _ _hspec _; subst _hspec; dsimp only [$updateId:ident];
+            | (injection h with _ _ _hspec _; subst _hspec; dsimp only [$(spec.updateId):ident];
                repeat (first | rfl | (split <;> try dsimp only)))
             | (cases h)
             | (split at h <;> try dsimp only at h)))

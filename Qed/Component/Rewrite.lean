@@ -259,6 +259,23 @@ def ComponentSpec.allNames   (s : ComponentSpec) : Array Name :=
   (s.fieldNames ++ s.propNames ++ s.bindNames).toList.eraseDups.toArray
 def ComponentSpec.mountable  (s : ComponentSpec) : Bool := s.states.all (·.def?.isSome)
 def ComponentSpec.hasSlotsOrKids (s : ComponentSpec) : Bool := !s.slots.isEmpty || s.hasChildren
+def ComponentSpec.id (s : ComponentSpec) (sub : Name) : Ident := mkIdent (s.t.getId ++ sub)
+def ComponentSpec.msgCtor (s : ComponentSpec) (c : Name) : Ident := mkIdent (s.t.getId ++ `Msg ++ c)
+def ComponentSpec.outCtor (s : ComponentSpec) (c : Name) : Ident := mkIdent (s.t.getId ++ `Out ++ c)
+def ComponentSpec.stateId  (s : ComponentSpec) : Ident := s.id `State
+def ComponentSpec.msgId    (s : ComponentSpec) : Ident := s.id `Msg
+def ComponentSpec.propsId  (s : ComponentSpec) : Ident := s.id `Props
+def ComponentSpec.initId   (s : ComponentSpec) : Ident := s.id `init
+def ComponentSpec.updateId (s : ComponentSpec) : Ident := s.id `update
+def ComponentSpec.viewId   (s : ComponentSpec) : Ident := s.id `view
+
+def resolveServerRpc (rpcId : Ident) (argCount : Nat) (ctxDesc : String) :
+    CommandElabM (ServerInfo × ServerMethodInfo) := do
+  let some (srvInfo, mInfo) := lookupServerMethod? (← getEnv) (← getCurrNamespace) (← getScope).openDecls rpcId.getId
+    | throwErrorAt rpcId s!"unknown server RPC `{rpcId.getId}` in `{ctxDesc}`"
+  if argCount != mInfo.paramCount then
+    throwErrorAt rpcId s!"`{rpcId.getId}` expects {mInfo.paramCount} argument(s), got {argCount}"
+  return (srvInfo, mInfo)
 
 def mkBaseCompInfo (spec : ComponentSpec) (kind : CompMountKind) (hasProps : Bool) :
     CommandElabM ComponentInfo := do
@@ -410,10 +427,8 @@ private def mkEnsuredExistentialTy (valTy : Term) (ensConst : Name) (paramCount 
     `(∃ ($pId:ident : $(mkIdent pTy)), $acc)
   `(Qed.Ensured $valTy (fun ($vId:ident : $valTy) => $exBody))
 
-def recordUsedRpc (ref : IO.Ref (Array (String × String))) (srv : String) (m : String) : IO Unit := do
-  let cur ← ref.get
-  unless cur.contains (srv, m) do
-    ref.set (cur.push (srv, m))
+def recordUsedRpc (ref : IO.Ref (Array (String × String))) (srv : String) (m : String) : IO Unit :=
+  ref.modify (pushUnique · (srv, m))
 
 def checkRecordRpcIdent (ctx : RewriteCtx) (id : Name) : CommandElabM Unit := do
   let shouldCheck := ctx.inPerform || match id.eraseMacroScopes with | .str p _ => !p.isAnonymous | _ => false
@@ -498,21 +513,27 @@ private def unitEvents : List String :=
   ["onClick", "onSubmit", "onBlur", "onFocus", "onDoubleClick", "onMouseDown", "onMouseUp"]
 private def strEvents : List String := ["onInput", "onChange", "onKeydown", "onKeyup"]
 
-private def wrapEventAttr (vNode : Syntax) (arity : Nat) (msgTy : Ident)
+private def wrapEventAttr (vNode : Syntax) (argTys : Array Term) (msgTy : Ident)
     (wrapMsg? : Option Ident) : CommandElabM Term := do
   let vT ← liftMacroM <| Qed.Jsx.expandAttrVal vNode (`(""))
-  let mut evTy : Term := msgTy
-  for _ in [0:arity] do evTy ← `(_ → $evTy)
+  let evTy ← argTys.foldrM (init := (msgTy : Term)) fun aTy acc => `($aTy → $acc)
   let mut typedV : Term ← `(($vT : $evTy))
   if let some w := wrapMsg? then
-    let argIds := (List.range arity).toArray.map fun i => mkIdent (Name.mkSimple s!"_ea{i}")
-    if argIds.isEmpty then
-      typedV ← `($w $typedV)
+    if argTys.isEmpty then typedV ← `($w $typedV)
     else
-      let appV ← Qed.Lang.mkAppTerms typedV (argIds.map (⟨·.raw⟩))
-      let wrapped ← `($w $appV)
+      let argIds := (List.range argTys.size).toArray.map fun i => mkIdent (Name.mkSimple s!"_ea{i}")
+      let wrapped ← `($w $(← Qed.Lang.mkAppTerms typedV (argIds.map (⟨·.raw⟩))))
       typedV ← argIds.foldrM (init := wrapped) fun arg acc => `(fun $arg => $acc)
   return typedV
+
+private def wrapEventAttrs (pairs : Array (Bool × Syntax)) (msgTy : Ident) (wrapMsg? : Option Ident)
+    (lookupArgTys : String → CommandElabM (Option (Array Term))) : CommandElabM (Array Syntax) :=
+  pairs.mapM fun (wasAssign, a') => do
+    if !wasAssign then
+      if let some (_, aname, valNode) := matchAttrValExpr? a' then
+        if let some argTys ← lookupArgTys aname then
+          return mkJsxAttrExpr aname (← wrapEventAttr valNode argTys msgTy wrapMsg?)
+    return a'
 
 private def injectAutoKey (bodyStx : Syntax) (compFullName : Name) (bindId : Ident) :
     CommandElabM Syntax := do
@@ -531,19 +552,12 @@ private def injectAutoKey (bodyStx : Syntax) (compFullName : Name) (bindId : Ide
 
 private def rewriteLowerElement (ctx : RewriteCtx) (stx : Syntax)
     (rewrittenPairs : Array (Bool × Syntax)) (kids? : Option Syntax) : CommandElabM Syntax := do
-  let some w := ctx.wrapMsg? | return rebuildJsxEl stx (rewrittenPairs.map (·.2)) kids?
-  let msgTy := mkIdent ctx.msgPath
-  let newAttrs ← rewrittenPairs.mapM fun (wasAssign, a') => do
-    if !wasAssign then
-      if let some (_, aname, valNode) := matchAttrValExpr? a' then
-        let vT ← liftMacroM <| Qed.Jsx.expandAttrVal valNode (`(""))
-        let wrapped? : Option Term ←
-          if unitEvents.contains aname then some <$> `($w ($vT : $msgTy))
-          else if strEvents.contains aname then some <$> `(fun _s => $w (($vT : String → $msgTy) _s))
-          else if aname == "onCheck" then some <$> `(fun _b => $w (($vT : Bool → $msgTy) _b))
-          else pure none
-        return match wrapped? with | some wt => mkJsxAttrExpr aname wt | none => a'
-    return a'
+  let some _ := ctx.wrapMsg? | return rebuildJsxEl stx (rewrittenPairs.map (·.2)) kids?
+  let newAttrs ← wrapEventAttrs rewrittenPairs (mkIdent ctx.msgPath) ctx.wrapMsg? fun aname => do
+    if unitEvents.contains aname then pure (some #[])
+    else if strEvents.contains aname then pure (some #[← `(String)])
+    else if aname == "onCheck" then pure (some #[← `(Bool)])
+    else pure none
   return rebuildJsxEl stx newAttrs kids?
 
 private def isSomePlaceholder (stx : Syntax) : Bool :=
@@ -575,11 +589,9 @@ private def rewriteHoistedChild (ctx : RewriteCtx) (inLambda : Bool) (stx : Synt
         else liftMacroM <| Qed.Jsx.expandAttrVal valNode (`(""))
       if let some ev := cInfo.events.find? (·.name.toString == aname) then
         outArms := outArms.push { ctor := ev.name, arity := ev.arity, handler := vT }
-      else if aname.startsWith "bind:" then
-        let bStr := (aname.drop 5).toString
-        let valPart ← `(($vT).1)
+      else if let some (bStr, valPart, setPart) ← liftMacroM (unpackBindProp aname vT) then
         dataProps := dataProps.push (mkIdentFrom nameRef (Name.mkSimple bStr), valPart)
-        outArms := outArms.push { ctor := Name.mkSimple s!"set_{bStr}", arity := 1, handler := ← `(($vT).2) }
+        outArms := outArms.push { ctor := Name.mkSimple s!"set_{bStr}", arity := 1, handler := setPart }
         keptAttrs := keptAttrs.push (mkJsxAttrExpr bStr valPart)
       else
         let pId := mkIdentFrom nameRef (Name.mkSimple aname)
@@ -688,13 +700,10 @@ private def rewriteUpperElement (ctx : RewriteCtx) (inLambda : Bool) (stx : Synt
     else if sInfo?.isSome && ctx.wrapMsg?.isSome then #[("onSubmit", 1)]
     else #[]
   if !evList.isEmpty then
-    let msgTy := mkIdent ctx.msgPath
-    let attrs' ← pairs.mapM fun (wasAssign, a) => do
-      if !wasAssign then
-        if let some (_, aname, valNode) := matchAttrValExpr? a then
-          if let some (_, arity) := evList.find? (·.1 == aname) then
-            return mkJsxAttrExpr aname (← wrapEventAttr valNode arity msgTy ctx.wrapMsg?)
-      return a
+    let attrs' ← wrapEventAttrs pairs (mkIdent ctx.msgPath) ctx.wrapMsg? fun aname => do
+      match evList.find? (·.1 == aname) with
+      | some (_, arity) => some <$> (List.range arity).toArray.mapM fun _ => `(_)
+      | none            => pure none
     return rebuildJsxEl stx attrs' kids?
   return rebuildJsxEl stx (pairs.map (·.2)) kids?
 
@@ -734,7 +743,7 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
   else if k == ``qedStmtExpr then
     let e := stx.getArg 0
     let isHandleOrPush :=
-      (matchPushCall? e).isSome || (matchRemoveCall? e).isSome ||
+      isCollMutExpr e ||
       (match matchIdentMethodCall? e with
       | some (id, "emit", _) => ctx.eventNames.contains id.getId.eraseMacroScopes
       | some (id, "send", _) =>
@@ -748,24 +757,21 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
     if ctx.actionNames.contains actId then
       return mkRawExpr (mkIdentFrom stx (ctx.msgPath ++ actId))
     else return stx
-  else if ctx.inPerform && k == ``qedCall &&
-      (match matchIdentMethodCall? stx with
-      | some (poId, "send", _) => ctx.portOutNames.contains poId.getId.eraseMacroScopes
-      | _ => false) then
-    let some (poId, _, rawArgs) := matchIdentMethodCall? stx | unreachable!
-    return mkRawExpr (← mkPortSendTerm ctx.compName stx poId poId.getId.eraseMacroScopes rawArgs
-      (fun e => do lowerCompExpr .val (← rewriteIn ctx inLambda e)))
   else if k == ``qedFieldSetter then
     let fname := (stx.getArg 1).getId.eraseMacroScopes
     checkMutableField ctx (stx.getArg 1) s!"`({fname} = _)`" fname
     return mkRawExpr (← mkSetterHandler ctx fname)
-  else if ctx.allowHoist && !ctx.isPureComp && k == ``qedCall &&
-      (match matchIdentMethodCall? stx with
-      | some (evId, "emit", _) => ctx.eventNames.contains evId.getId.eraseMacroScopes
-      | _ => false) then
-    let some (evId, _, rawArgs) := matchIdentMethodCall? stx | unreachable!
-    let outTerm ← lowerEmitCall stx evId rawArgs
-    return mkRawExpr (← mkSiteExpr ctx #[] (some outTerm))
+  else if k == ``qedCall then
+    match matchIdentMethodCall? stx with
+    | some (poId, "send", rawArgs) =>
+        if ctx.inPerform && ctx.portOutNames.contains poId.getId.eraseMacroScopes then
+          return mkRawExpr (← mkPortSendTerm ctx.compName stx poId poId.getId.eraseMacroScopes rawArgs
+            (fun e => do lowerCompExpr .val (← rewriteIn ctx inLambda e)))
+    | some (evId, "emit", rawArgs) =>
+        if ctx.allowHoist && !ctx.isPureComp && ctx.eventNames.contains evId.getId.eraseMacroScopes then
+          return mkRawExpr (← mkSiteExpr ctx #[] (some (← lowerEmitCall stx evId rawArgs)))
+    | _ => pure ()
+    return Syntax.node stx.getHeadInfo k (← stx.getArgs.mapM (rewriteIn ctx inLambda))
   else if k == ``Qed.Jsx.attrValAssign then
     let mut assigns := #[]
     let more := (stx.getArg 4).getArgs.map fun m =>
@@ -843,11 +849,7 @@ private def parseRpcQueryClause (acc : ComponentSpec) (cl : Syntax) : CommandEla
   let explicitTy? ← lowerOptType (cl.getArg 2)
   let rpcId : Ident := ⟨(cl.getArg 4)⟩
   let (rawArgs, whenPat?, whenGuards) ← parseCallArgsAndCond (cl.getArg 6) (cl.getArg 8)
-  let env ← getEnv
-  let some (srvInfo, mInfo) := lookupServerMethod? env (← getCurrNamespace) (← getScope).openDecls rpcId.getId
-    | throwErrorAt rpcId s!"unknown server RPC `{rpcId.getId}` in `query`"
-  if rawArgs.size != mInfo.paramCount then
-    throwErrorAt rpcId s!"`{rpcId.getId}` expects {mInfo.paramCount} argument(s), got {rawArgs.size}"
+  let (srvInfo, mInfo) ← resolveServerRpc rpcId rawArgs.size "query"
   unless mInfo.isReadOnly do
     throwErrorAt rpcId s!"reactive `query {qId.getId}` cannot call mutating server RPC `{srvInfo.shortName}.{mInfo.name}`; `query` only permits read-only server functions"
   let qTy ← match explicitTy? with
@@ -1074,7 +1076,7 @@ def bindMentionedFields (spec : ComponentSpec) (shouldBind : Name → Bool)
   for ev in spec.events.reverse do
     if shouldBind ev.id.getId then
       let evId := mkIdent ev.id.getId
-      out ← `(let $evId:ident := $(mkIdent (spec.t.getId ++ `Out ++ ev.id.getId)); $out)
+      out ← `(let $evId:ident := $(spec.outCtor ev.id.getId); $out)
   for g in spec.allNames.reverse do
     if shouldBind g then
       let gId := mkIdent g

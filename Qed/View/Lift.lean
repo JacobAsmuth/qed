@@ -2,42 +2,27 @@ import Qed.View.Core
 import Lean
 
 namespace Qed
+section ViewLift
+open Lean
 
-open Lean in
 private partial def viewMentions (m : Name) : Syntax → Bool
   | .ident _ _ n _ => m.isPrefixOf n
   | .node _ _ args => args.any (viewMentions m)
   | _              => false
 
-private def lastStr? : Lean.Name → Option String
+private def lastStr? : Name → Option String
   | .str _ s => some s
   | _        => none
 
-private def kApp      : Lean.Name := `Lean.Parser.Term.app
-private def kParen    : Lean.Name := `Lean.Parser.Term.paren
-private def kFun      : Lean.Name := `Lean.Parser.Term.fun
-private def kBasicFun : Lean.Name := `Lean.Parser.Term.basicFun
-private def kMatch    : Lean.Name := `Lean.Parser.Term.match
-private def kList     : Lean.Name := `«term[_]»
-
-private def dropLastComp : Lean.Name → Lean.Name
+private def dropLastComp : Name → Name
   | .str p _   => p
   | .num p _   => p
   | .anonymous => .anonymous
 
 private def stringAttrName? : String → Option String
-  | "cls"         => some "class"
-  | "value"       => some "value"
-  | "placeholder" => some "placeholder"
-  | "style"       => some "style"
-  | "href"        => some "href"
-  | "src"         => some "src"
-  | "action"      => some "action"
-  | "alt"         => some "alt"
-  | "title"       => some "title"
-  | "type'"       => some "type"
-  | "name"        => some "name"
-  | _             => none
+  | "cls"   => some "class"
+  | "type'" => some "type"
+  | s       => if ["value", "placeholder", "style", "href", "src", "action", "alt", "title", "name"].contains s then some s else none
 
 private def eventPrime? : String → Option String
   | "onClick" => some "onClick'"
@@ -45,36 +30,33 @@ private def eventPrime? : String → Option String
   | "onCheck" => some "onCheck'"
   | _         => none
 
-open Lean in
 private def asApp? (stx : Syntax) : Option (Syntax × Array Syntax) :=
-  if stx.getKind == kApp && stx.getArgs.size == 2 then
+  if stx.getKind == `Lean.Parser.Term.app && stx.getArgs.size == 2 then
     some (stx.getArgs[0]!, stx.getArgs[1]!.getArgs)
   else none
 
-open Lean in
 private def unparen (stx : Syntax) : Syntax :=
-  if stx.getKind == kParen && stx.getArgs.size == 3 then stx.getArgs[1]! else stx
+  if stx.getKind == `Lean.Parser.Term.paren && stx.getArgs.size == 3 then stx.getArgs[1]! else stx
 
-open Lean in
+private def asIdentApp? (stx : Syntax) : Option (String × Array Syntax) :=
+  match asApp? stx with
+  | some (.ident _ _ n _, args) => (lastStr? n.eraseMacroScopes).map (·, args)
+  | _                           => none
+
+private def asListElems? (stx : Syntax) : Option (Array Syntax) :=
+  if stx.getKind == `«term[_]» && stx.getArgs.size == 3 then some stx.getArgs[1]!.getSepArgs else none
+
 private def asElementApp? (stx : Syntax) : Option (String × Array Syntax) :=
-  match asApp? (unparen stx) with
-  | some (fn, args) =>
-      match fn with
-      | .ident _ _ n _ =>
-          if lastStr? n.eraseMacroScopes == some "el" && 0 < args.size then
-            args[0]!.isStrLit?.map fun tag => (tag, args.extract 1 args.size)
-          else none
-      | _ => none
-  | none => none
+  match asIdentApp? (unparen stx) with
+  | some ("el", args) => if 0 < args.size then args[0]!.isStrLit?.map (·, args.extract 1 args.size) else none
+  | _                 => none
 
-open Lean in
 private def asProj? (stx : Syntax) (field : Name) : Option Syntax :=
   let s := unparen stx
   if s.getKind == `Lean.Parser.Term.proj && s.getArgs.size == 3
       && s.getArgs[2]!.getId.eraseMacroScopes == field
   then some s.getArgs[0]! else none
 
-open Lean in
 private def unwrapForEachItems (recv : Syntax) : Syntax × Bool :=
   let r := unparen recv
   match asApp? r with
@@ -82,7 +64,6 @@ private def unwrapForEachItems (recv : Syntax) : Syntax × Bool :=
       if rn.eraseMacroScopes == ``Qed.ForEachItems.toList then (unparen xs, true) else (r, false)
   | _ => (r, false)
 
-open Lean in
 private def asMap? (stx : Syntax) : Option (Syntax × Syntax × Bool) :=
   let stx := (asProj? stx `toList).getD stx
   match asApp? (unparen stx) with
@@ -103,33 +84,26 @@ private def asMap? (stx : Syntax) : Option (Syntax × Syntax × Bool) :=
             (xs, unparen fnArg, isFE)
   | _ => none
 
-open Lean in
 private def asFun? (stx : Syntax) : Option (Syntax × Syntax) :=
   let s := unparen stx
-  if s.getKind == kFun && s.getArgs.size ≥ 2 then
+  if s.getKind == `Lean.Parser.Term.fun && s.getArgs.size ≥ 2 then
     let basic := s.getArgs[1]!
-    if basic.getKind == kBasicFun && basic.getArgs.size ≥ 4 then
+    if basic.getKind == `Lean.Parser.Term.basicFun && basic.getArgs.size ≥ 4 then
       let binders := basic.getArgs[0]!.getArgs
       if binders.size == 1 then some (binders[0]!, basic.getArgs[3]!) else none
     else none
   else none
 
-open Lean in
 private def keyArg? (e : Syntax) : Option Syntax :=
-  match asApp? e with
-  | some (fn, args) =>
-      match fn with
-      | .ident _ _ n _ =>
-          if lastStr? n.eraseMacroScopes == some "key" && args.size == 1 then some args[0]! else none
-      | _ => none
-  | none => none
+  match asIdentApp? e with
+  | some ("key", #[v]) => some v
+  | _                  => none
 
-open Lean in
 private def extractKey (attrsList : Syntax) : MacroM (Option (Term × Term)) := do
-  if attrsList.getKind != kList || attrsList.getArgs.size != 3 then return none
+  let some elems := asListElems? attrsList | return none
   let mut keyV : Option Syntax := none
   let mut kept : Array Term := #[]
-  for e in attrsList.getArgs[1]!.getSepArgs do
+  for e in elems do
     match keyArg? e with
     | some v => keyV := some v
     | none   => kept := kept.push ⟨e⟩
@@ -137,11 +111,9 @@ private def extractKey (attrsList : Syntax) : MacroM (Option (Term × Term)) := 
   | some v => return some (⟨v⟩, ← `([$kept,*]))
   | none   => return none
 
-open Lean in
 private def viewMentionsAny (m : Name) (fields : Array Ident) (stx : Syntax) : Bool :=
   viewMentions m stx || fields.any (fun f => viewMentions f.getId stx)
 
-open Lean in
 private def wrapFieldLets (m : Ident) (fields : Array Ident) (body : Term) : MacroM Term := do
   let mut out := body
   for f in fields.reverse do
@@ -149,11 +121,9 @@ private def wrapFieldLets (m : Ident) (fields : Array Ident) (body : Term) : Mac
       out ← `(let $f:ident := $m.$f:ident; $out)
   return out
 
-open Lean in
 private def mkModelFn (m : Ident) (fields : Array Ident) (body : Term) : MacroM Term := do
   `(fun $m => $(← wrapFieldLets m fields body))
 
-open Lean in
 private def stripFieldLets (fv : Expr) : Nat → Expr → Expr
   | 0, e => e
   | fuel + 1, .letE n ty val body nonDep =>
@@ -161,7 +131,7 @@ private def stripFieldLets (fv : Expr) : Nat → Expr → Expr
       else .letE n ty val body nonDep
   | _, e => e
 
-open Lean Lean.Elab Lean.Elab.Term Lean.Meta in
+open Lean.Elab Lean.Elab.Term Lean.Meta in
 elab "qedInternalChild% " "fun " mb:ident " => " body:term : term <= expectedType => do
   match_expr (← instantiateMVars expectedType) with
   | Qed.View σ msg =>
@@ -199,7 +169,6 @@ elab "qedInternalChild% " "fun " mb:ident " => " body:term : term <= expectedTyp
           mkAppOptM ``Qed.View.dynNode #[σ, msg, ← mkLambdaFVars #[fv] b']
   | _ => throwError "qedInternalChild% expects a `View` expected type"
 
-open Lean in
 mutual
   partial def viewLift (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM Syntax := do
     let liftIf (c t e : Term) (h? : Option Ident) : MacroM Syntax := do
@@ -220,7 +189,7 @@ mutual
         else catchAll m fields stx
     | _ =>
         if stx.isStrLit?.isSome then return stx
-        if stx.getKind == kMatch && viewMentionsAny m.getId fields stx then
+        if stx.getKind == `Lean.Parser.Term.match && viewMentionsAny m.getId fields stx then
           return (← `(Qed.V.dynNode $(← mkModelFn m fields ⟨stx⟩)))
         if let some out ← tryForEach m fields stx then return out
         if let some out ← tryElement m fields stx then return out
@@ -239,8 +208,8 @@ mutual
     | _, _ => return none
 
   partial def liftAttrList (m : Ident) (fields : Array Ident) (lst : Syntax) : MacroM (Option Term) := do
-    if lst.getKind != kList || lst.getArgs.size != 3 then return none
-    let lifted ← lst.getArgs[1]!.getSepArgs.mapM fun a => do
+    let some elems := asListElems? lst | return none
+    let lifted ← elems.mapM fun a => do
       let aT : Term := ⟨a⟩
       match ← tryAttr m fields a with
       | some a' => pure (⟨a'⟩ : Term)
@@ -251,8 +220,8 @@ mutual
     return some (← `([$lifted,*]))
 
   partial def liftKidList (m : Ident) (fields : Array Ident) (lst : Syntax) : MacroM (Option Term) := do
-    if lst.getKind != kList || lst.getArgs.size != 3 then return none
-    let lifted ← lst.getArgs[1]!.getSepArgs.mapM fun k => do pure (⟨← viewLift m fields k⟩ : Term)
+    let some elems := asListElems? lst | return none
+    let lifted ← elems.mapM fun k => do pure (⟨← viewLift m fields k⟩ : Term)
     return some (← `([$lifted,*]))
 
   partial def catchAll (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM Syntax := do
@@ -262,28 +231,22 @@ mutual
     else return (← `(Qed.V.static $e))
 
   partial def tryAttr (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM (Option Syntax) := do
-    let some (fn, args) := asApp? stx | return none
-    match fn with
-    | .ident _ _ n _ =>
-        let hn := (lastStr? n.eraseMacroScopes).getD ""
-        if let some an := stringAttrName? hn then
-          if args.size == 1 && viewMentionsAny m.getId fields args[0]! then
-            let nm : Term := ⟨Syntax.mkStrLit an⟩
-            let rawV : Term := ⟨args[0]!⟩
-            let v : Term ← if hn == "href" || hn == "src" || hn == "action" then `(Qed.ToHref.toHref $rawV)
-                           else if hn == "value" then `(toString $rawV)
-                           else pure rawV
-            return some (← `(Qed.V.dynAttr $nm $(← mkModelFn m fields v)))
-        if hn == "attr" && args.size == 2 && viewMentionsAny m.getId fields args[1]! then
-          let k : Term := ⟨args[0]!⟩
-          let v : Term := ⟨args[1]!⟩
-          return some (← `(Qed.V.dynAttr $k $(← mkModelFn m fields (← `(toString $v)))))
-        if let some pn := eventPrime? hn then
-          if args.size == 1 && viewMentionsAny m.getId fields args[0]! then
-            let primed := mkIdent ((`Qed.V).append (Name.mkSimple pn))
-            return some (← `($primed $(← mkModelFn m fields ⟨args[0]!⟩)))
-        return none
-    | _ => return none
+    let some (hn, args) := asIdentApp? stx | return none
+    if let some an := stringAttrName? hn then
+      if args.size == 1 && viewMentionsAny m.getId fields args[0]! then
+        let nm : Term := ⟨Syntax.mkStrLit an⟩
+        let rawV : Term := ⟨args[0]!⟩
+        let v : Term ← if hn == "href" || hn == "src" || hn == "action" then `(Qed.ToHref.toHref $rawV)
+                       else if hn == "value" then `(toString $rawV)
+                       else pure rawV
+        return some (← `(Qed.V.dynAttr $nm $(← mkModelFn m fields v)))
+    if hn == "attr" && args.size == 2 && viewMentionsAny m.getId fields args[1]! then
+      return some (← `(Qed.V.dynAttr $(⟨args[0]!⟩) $(← mkModelFn m fields (← `(toString $(⟨args[1]!⟩))))))
+    if let some pn := eventPrime? hn then
+      if args.size == 1 && viewMentionsAny m.getId fields args[0]! then
+        let primed := mkIdent ((`Qed.V).append (Name.mkSimple pn))
+        return some (← `($primed $(← mkModelFn m fields ⟨args[0]!⟩)))
+    return none
 
   partial def tryForEach (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM (Option Syntax) := do
     let some (tag, pargs) := asElementApp? stx | return none
@@ -321,9 +284,9 @@ mutual
 end
 
 namespace Internal
-open Lean in
 def liftViewWithFields (m : Ident) (fields : Array Ident) (stx : Syntax) : MacroM Syntax :=
   viewLift m fields stx
 end Internal
 
+end ViewLift
 end Qed

@@ -124,6 +124,6 @@ theorem NonNullJson.iso {α β : Type} (inst : LawfulJson β)
 @[simp] theorem LawfulJson.fromField_of_field {α : Type} [LawfulJson α] (j : Json) (k : String) (a : α)
     (h : j.field k = .ok (toJson a)) :
     (FromJsonField.fromField j k : Except String α) = .ok a := by
-  simp [FromJsonField.fromField, h]
+  simp [FromJsonField.fromField, fromFieldVal, h]
 
 end Qed

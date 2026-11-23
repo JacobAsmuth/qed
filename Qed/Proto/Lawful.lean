@@ -400,22 +400,41 @@ def Date.fromProtoFields (fs : List (Nat × WireVal)) : Except String Date := do
   | some d => .ok d
   | none   => .error "protobuf: invalid calendar Date"
 
-instance : ToProto Date   := .ofFields Date.toProtoFields
-instance : FromProto Date := .ofFields Date.fromProtoFields
+macro "qed_proto_fields% " "[" vs:ident,* "]"
+    "(" ty:term "," enc:term "," dec:term "," htags:term "," hinv:term ")" : command => do
+  let ids := vs.getElems
+  `(instance $[{$ids:ident : Type}]* $[[ToProto $ids]]* : ToProto $ty := .ofFields $enc
+    instance $[{$ids:ident : Type}]* $[[FromProto $ids]]* : FromProto $ty := .ofFields $dec
+    instance $[{$ids:ident : Type}]* $[[LawfulProto $ids]]* : LawfulProto $ty := .ofFields $enc $dec $htags $hinv)
 
-instance : LawfulProto Date :=
-  .ofFields Date.toProtoFields Date.fromProtoFields
-    (by intro d kw h; simp only [Date.toProtoFields, List.mem_cons, List.not_mem_nil, or_false] at h
-        rcases h with rfl | rfl | rfl <;> simp)
-    (by rintro ⟨y, m, day, hok⟩; unfold Date.fromProtoFields Date.toProtoFields
-        simp [FromProtoField.decodeProtoField, lookupField, Date.mk?, hok, bind, Except.bind])
+macro "qed_equiv_codec% " kind:ident "[" vs:ident,* "]"
+    "(" ty:term "," toB:term "," ofB:term "," hinv:term ")" : command => do
+  let ids := vs.getElems
+  if kind.getId == `json then
+    `(instance $[{$ids:ident : Type}]* $[[ToJson $ids]]* : ToJson $ty := .ofEquiv $toB
+      instance $[{$ids:ident : Type}]* $[[FromJson $ids]]* : FromJson $ty := .ofEquiv $ofB
+      instance $[{$ids:ident : Type}]* $[[LawfulJson $ids]]* : LawfulJson $ty := .ofEquiv $toB $ofB $hinv
+      instance $[{$ids:ident : Type}]* $[[ToJson $ids]]* : NonNullJson $ty := ⟨nofun⟩)
+  else if kind.getId == `jsonLow then
+    `(instance (priority := low) $[{$ids:ident : Type}]* $[[ToJson $ids]]* : ToJson $ty := .ofEquiv $toB
+      instance (priority := low) $[{$ids:ident : Type}]* $[[FromJson $ids]]* : FromJson $ty := .ofEquiv $ofB
+      instance (priority := low) $[{$ids:ident : Type}]* $[[LawfulJson $ids]]* :
+          LawfulJson $ty := .ofEquiv $toB $ofB $hinv
+      instance (priority := low) $[{$ids:ident : Type}]* $[[ToJson $ids]]* : NonNullJson $ty := ⟨nofun⟩)
+  else
+    `(instance $[{$ids:ident : Type}]* $[[ToProto $ids]]* : ToProto $ty := .ofEquiv $toB
+      instance $[{$ids:ident : Type}]* $[[FromProto $ids]]* : FromProto $ty := .ofEquiv $ofB
+      instance $[{$ids:ident : Type}]* $[[LawfulProto $ids]]* : LawfulProto $ty := .ofEquiv $toB $ofB $hinv)
 
-instance {α : Type} [ToProto α]   : ToProto (Option α)   := .ofFields (ToProtoField.encodeProtoField 1)
-instance {α : Type} [FromProto α] : FromProto (Option α) := .ofFields (FromProtoField.decodeProtoField 1)
-instance {α : Type} [LawfulProto α] : LawfulProto (Option α) :=
-  .ofFields (ToProtoField.encodeProtoField 1) (FromProtoField.decodeProtoField 1)
-    (fun opt kw h => by rw [LawfulProtoField.encodeProtoField_tag 1 opt kw h]; simp)
-    (fun opt => by simpa using LawfulProtoField.decodeProtoField_hit_raw 1 opt [] (by simp))
+qed_proto_fields% [] (Date, Date.toProtoFields, Date.fromProtoFields,
+  by intro d kw h; simp only [Date.toProtoFields, List.mem_cons, List.not_mem_nil, or_false] at h
+     rcases h with rfl | rfl | rfl <;> simp,
+  by rintro ⟨y, m, day, hok⟩; unfold Date.fromProtoFields Date.toProtoFields
+     simp [FromProtoField.decodeProtoField, lookupField, Date.mk?, hok, bind, Except.bind])
+
+qed_proto_fields% [α] (Option α, ToProtoField.encodeProtoField 1, FromProtoField.decodeProtoField 1,
+  fun opt kw h => by rw [LawfulProtoField.encodeProtoField_tag 1 opt kw h]; simp,
+  fun opt => by simpa using LawfulProtoField.decodeProtoField_hit_raw 1 opt [] (by simp))
 
 private def encodeExceptFields {ε α : Type} [ToProto ε] [ToProto α] : Except ε α → List (Nat × WireVal)
   | .ok a    => [(1, ToProto.toProtoVal a)]
@@ -430,13 +449,9 @@ private def decodeExceptFields {ε α : Type} [FromProto ε] [FromProto α]
       | some w => (FromProto.fromProtoVal (α := ε) w).map Except.error
       | none   => .error "protobuf: missing Except branch"
 
-instance {ε α : Type} [ToProto ε] [ToProto α]   : ToProto (Except ε α)   := .ofFields encodeExceptFields
-instance {ε α : Type} [FromProto ε] [FromProto α] : FromProto (Except ε α) := .ofFields decodeExceptFields
-
-instance {ε α : Type} [LawfulProto ε] [LawfulProto α] : LawfulProto (Except ε α) :=
-  .ofFields encodeExceptFields decodeExceptFields
-    (by intro r kw h; cases r <;> (simp only [encodeExceptFields, List.mem_singleton] at h; rw [h]; simp))
-    (by intro r; cases r <;> simp [encodeExceptFields, decodeExceptFields, lookupField, Except.map])
+qed_proto_fields% [ε, α] (Except ε α, encodeExceptFields, decodeExceptFields,
+  by intro r kw h; cases r <;> (simp only [encodeExceptFields, List.mem_singleton] at h; rw [h]; simp),
+  by intro r; cases r <;> simp [encodeExceptFields, decodeExceptFields, lookupField, Except.map])
 
 private def encodeProdFields {α β : Type} [ToProto α] [ToProto β] (p : α × β) : List (Nat × WireVal) :=
   [(1, ToProto.toProtoVal p.1), (2, ToProto.toProtoVal p.2)]
@@ -446,14 +461,11 @@ private def decodeProdFields {α β : Type} [FromProto α] [FromProto β]
   return (← decodeFieldVal 1 fs "protobuf: missing tuple field 1",
           ← decodeFieldVal 2 fs "protobuf: missing tuple field 2")
 
-instance {α β : Type} [ToProto α] [ToProto β]   : ToProto (α × β)   := .ofFields encodeProdFields
-instance {α β : Type} [FromProto α] [FromProto β] : FromProto (α × β) := .ofFields decodeProdFields
-
-instance {α β : Type} [LawfulProto α] [LawfulProto β] : LawfulProto (α × β) :=
-  .ofFields encodeProdFields decodeProdFields
-    (by intro p kw h; simp only [encodeProdFields, List.mem_cons, List.not_mem_nil, or_false] at h
-        rcases h with rfl | rfl <;> simp)
-    (by rintro ⟨a, b⟩; simp [encodeProdFields, decodeProdFields, decodeFieldVal, lookupField, bind, Except.bind, pure, Except.pure])
+qed_proto_fields% [α, β] (α × β, encodeProdFields, decodeProdFields,
+  by intro p kw h; simp only [encodeProdFields, List.mem_cons, List.not_mem_nil, or_false] at h
+     rcases h with rfl | rfl <;> simp,
+  by rintro ⟨a, b⟩
+     simp [encodeProdFields, decodeProdFields, decodeFieldVal, lookupField, bind, Except.bind, pure, Except.pure])
 
 private def encodeRepeatedField1 {α : Type} [ToProto α] (xs : List α) : List (Nat × WireVal) :=
   xs.map fun x => (1, ToProto.toProtoVal x)
@@ -462,22 +474,17 @@ private def decodeRepeatedField1 {α : Type} [FromProto α]
     (fs : List (Nat × WireVal)) : Except String (List α) :=
   (lookupRepeated 1 fs).mapM FromProto.fromProtoVal
 
-instance {α : Type} [ToProto α]   : ToProto (List α)   := .ofFields encodeRepeatedField1
-instance {α : Type} [FromProto α] : FromProto (List α) := .ofFields decodeRepeatedField1
-
 private theorem lookupRepeated_map_one {α : Type} [ToProto α] :
     ∀ (xs : List α), lookupRepeated 1 (encodeRepeatedField1 xs) = xs.map ToProto.toProtoVal
   | [] => rfl
   | x :: rest => congrArg (ToProto.toProtoVal x :: ·) (lookupRepeated_map_one rest)
 
-instance {α : Type} [LawfulProto α] : LawfulProto (List α) :=
-  .ofFields encodeRepeatedField1 decodeRepeatedField1
-    (by intro xs kw h; rcases List.mem_map.1 h with ⟨_, _, rfl⟩; simp)
-    (by intro xs; unfold decodeRepeatedField1
-        rw [lookupRepeated_map_one, list_mapM_map_ok ToProto.toProtoVal FromProto.fromProtoVal LawfulProto.fromProtoVal_toProtoVal])
+qed_proto_fields% [α] (List α, encodeRepeatedField1, decodeRepeatedField1,
+  by intro xs kw h; rcases List.mem_map.1 h with ⟨_, _, rfl⟩; simp,
+  by intro xs; unfold decodeRepeatedField1
+     rw [lookupRepeated_map_one,
+       list_mapM_map_ok ToProto.toProtoVal FromProto.fromProtoVal LawfulProto.fromProtoVal_toProtoVal])
 
-instance {α : Type} [ToProto α]   : ToProto (Array α)   := .ofEquiv Array.toList
-instance {α : Type} [FromProto α] : FromProto (Array α) := .ofEquiv List.toArray
-instance {α : Type} [LawfulProto α] : LawfulProto (Array α) := .ofEquiv Array.toList List.toArray (fun xs => by cases xs; rfl)
+qed_equiv_codec% proto [α] (Array α, Array.toList, List.toArray, fun xs => by cases xs; rfl)
 
 end Qed

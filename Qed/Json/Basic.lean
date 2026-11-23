@@ -56,11 +56,7 @@ def takeDigits : List Char → List Char × List Char
 def digitsToInt (ds : List Char) : Int :=
   (ds.foldl (fun acc c => acc * 10 + (c.toNat - '0'.toNat)) 0 : Nat)
 
-def hexVal (c : Char) : Option Nat :=
-  if '0' ≤ c && c ≤ '9' then some (c.toNat - '0'.toNat)
-  else if 'a' ≤ c && c ≤ 'f' then some (c.toNat - 'a'.toNat + 10)
-  else if 'A' ≤ c && c ≤ 'F' then some (c.toNat - 'A'.toNat + 10)
-  else none
+abbrev hexVal : Char → Option Nat := unhexNat?
 
 def hex4 (a b c d : Char) : Option Nat := do
   let va ← hexVal a; let vb ← hexVal b; let vc ← hexVal c; let vd ← hexVal d
@@ -145,10 +141,7 @@ mutual
       | 'n' :: 'u' :: 'l' :: 'l' :: r        => .ok (.null, r)
       | 't' :: 'r' :: 'u' :: 'e' :: r        => .ok (.bool true, r)
       | 'f' :: 'a' :: 'l' :: 's' :: 'e' :: r => .ok (.bool false, r)
-      | '"' :: r =>
-          match parseStr r with
-          | .ok (s, r') => .ok (.str s, r')
-          | .error e    => .error e
+      | '"' :: r => do let (s, r') ← parseStr r; return (.str s, r')
       | '[' :: r =>
           match budget with
           | 0          => .error "maximum depth exceeded"
@@ -157,9 +150,7 @@ mutual
               | []      => .error "unexpected end of input"
               | c :: r' =>
                   if c = ']' then .ok (.arr [], r')
-                  else match parseElems fuel budget (c :: r') with
-                       | .ok (es, r'') => .ok (.arr es, r'')
-                       | .error e      => .error e
+                  else do let (es, r'') ← parseElems fuel budget (c :: r'); return (.arr es, r'')
       | '{' :: r =>
           match budget with
           | 0          => .error "maximum depth exceeded"
@@ -168,53 +159,36 @@ mutual
               | []      => .error "unexpected end of input"
               | c :: r' =>
                   if c = '}' then .ok (.obj [], r')
-                  else match parseMembers fuel budget (c :: r') with
-                       | .ok (ms, r'') => .ok (.obj ms, r'')
-                       | .error e      => .error e
+                  else do let (ms, r'') ← parseMembers fuel budget (c :: r'); return (.obj ms, r'')
       | c :: rest =>
-          if c == '-' || isDigit c then
-            match parseNum (c :: rest) with
-            | .ok (n, r') => .ok (.num n, r')
-            | .error e    => .error e
+          if c == '-' || isDigit c then do let (n, r') ← parseNum (c :: rest); return (.num n, r')
           else .error "unexpected character"
       | [] => .error "unexpected end of input"
   def parseElems (fuel budget : Nat) (cs : List Char) : Except String (List Json × List Char) :=
     match fuel with
     | 0 => .error "out of fuel"
-    | fuel + 1 =>
-      match parseVal fuel budget cs with
-      | .error e => .error e
-      | .ok (v, r) =>
-          match skipWs r with
-          | ',' :: r' =>
-              match parseElems fuel budget (skipWs r') with
-              | .ok (vs, r'') => .ok (v :: vs, r'')
-              | .error e      => .error e
-          | ']' :: r' => .ok ([v], r')
-          | _         => .error "expected ',' or ']'"
+    | fuel + 1 => do
+      let (v, r) ← parseVal fuel budget cs
+      match skipWs r with
+      | ',' :: r' => let (vs, r'') ← parseElems fuel budget (skipWs r'); return (v :: vs, r'')
+      | ']' :: r' => .ok ([v], r')
+      | _         => .error "expected ',' or ']'"
   def parseMembers (fuel budget : Nat) (cs : List Char) :
       Except String (List (String × Json) × List Char) :=
     match fuel with
     | 0 => .error "out of fuel"
     | fuel + 1 =>
       match skipWs cs with
-      | '"' :: r =>
-          match parseStr r with
-          | .error e => .error e
-          | .ok (key, r1) =>
-              match skipWs r1 with
-              | ':' :: r2 =>
-                  match parseVal fuel budget (skipWs r2) with
-                  | .error e => .error e
-                  | .ok (v, r3) =>
-                      match skipWs r3 with
-                      | ',' :: r4 =>
-                          match parseMembers fuel budget (skipWs r4) with
-                          | .ok (ms, r5) => .ok ((key, v) :: ms, r5)
-                          | .error e     => .error e
-                      | '}' :: r4 => .ok ([(key, v)], r4)
-                      | _         => .error "expected ',' or '}'"
-              | _ => .error "expected ':'"
+      | '"' :: r => do
+          let (key, r1) ← parseStr r
+          match skipWs r1 with
+          | ':' :: r2 =>
+              let (v, r3) ← parseVal fuel budget (skipWs r2)
+              match skipWs r3 with
+              | ',' :: r4 => let (ms, r5) ← parseMembers fuel budget (skipWs r4); return ((key, v) :: ms, r5)
+              | '}' :: r4 => .ok ([(key, v)], r4)
+              | _         => .error "expected ',' or '}'"
+          | _ => .error "expected ':'"
       | _ => .error "expected string key"
 end
 
@@ -227,8 +201,7 @@ def parse (s : String) (maxDepth : Nat := 64) : Except String Json :=
 abbrev Json.parse (s : String) (maxDepth : Nat := 64) : Except String Json :=
   Qed.parse s maxDepth
 
-def toHexDigit (n : Nat) : Char :=
-  if n < 10 then Char.ofNat ('0'.toNat + n) else Char.ofNat ('a'.toNat + (n - 10))
+abbrev toHexDigit : Nat → Char := hexDigitLower
 
 def escapeCharL (c : Char) : List Char :=
   match c with
@@ -587,19 +560,19 @@ class FromJsonField (α : Type) where
   fromField : Json → String → Except String α
 export FromJsonField (fromField)
 
+@[inline] abbrev fromFieldVal [FromJson α] (key : String) (v : Json) : Except String α :=
+  match (fromJson v : Except String α) with
+  | .ok a    => .ok a
+  | .error e => .error s!"{key}: {e}"
+
 instance (priority := low) [FromJson α] : FromJsonField α where
   fromField j key := match j.field key with
     | .error e => .error e
-    | .ok v    => match (fromJson v : Except String α) with
-                  | .ok a    => .ok a
-                  | .error e => .error s!"{key}: {e}"
+    | .ok v    => fromFieldVal key v
 
 instance [FromJson α] : FromJsonField (Option α) where
   fromField j key := match j.get? key with
-    | none       => .ok none
-    | some .null => .ok none
-    | some v     => match (fromJson v : Except String α) with
-                    | .ok a    => .ok (some a)
-                    | .error e => .error s!"{key}: {e}"
+    | none | some .null => .ok none
+    | some v            => (fromFieldVal key v).map some
 
 end Qed

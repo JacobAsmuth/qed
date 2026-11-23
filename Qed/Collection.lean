@@ -138,17 +138,35 @@ private theorem sumBy_of_sublist {α : Type} {xs ys : Array α} (f : α → Nat)
     (hsub : ys.toList.Sublist xs.toList) : ys.sumBy f ≤ xs.sumBy f := by
   rw [Array.sumBy, Array.sumBy, foldl_sum_eq, foldl_sum_eq]; exact list_sum_nat_sublist (hsub.map f)
 
-@[simp, grind =] theorem _root_.Array.sumBy_empty {α : Type} (f : α → Nat) : (#[] : Array α).sumBy f = 0 := rfl
+local macro "def_array_sum_lemmas " fn:ident ty:term : command => do
+  let suf (s : String) := Lean.mkIdentFrom fn (fn.getId.appendAfter s)
+  let hEmpty := suf "_empty"
+  let hAppend := suf "_append"
+  let hMap := suf "_map"
+  let hRev := suf "_reverse"
+  let hSort := suf "_mergeSort"
+  let hErase := suf "_eraseIdx"
+  `(@[simp, grind =] theorem $hEmpty {α : Type} (f : α → $ty) : $fn (#[] : Array α) f = 0 := rfl
+    @[simp, grind =] theorem $hAppend {α : Type} (xs ys : Array α) (f : α → $ty) :
+        $fn (xs ++ ys) f = $fn xs f + $fn ys f := by
+      rw [$fn:ident, $fn:ident, $fn:ident, foldl_sum_eq, foldl_sum_eq, foldl_sum_eq]; simp
+    @[simp, grind =] theorem $hMap {α β : Type} (xs : Array α) (g : α → β) (f : β → $ty) :
+        $fn (xs.map g) f = $fn xs (fun x => f (g x)) := by
+      rw [$fn:ident, $fn:ident, foldl_sum_eq, foldl_sum_eq]; simp [List.map_map, Function.comp_def]
+    @[simp, grind =] theorem $hRev {α : Type} (xs : Array α) (f : α → $ty) :
+        $fn xs.reverse f = $fn xs f := by
+      rw [$fn:ident, $fn:ident, foldl_sum_eq, foldl_sum_eq]; simp
+    @[simp, grind =] theorem $hSort {α : Type} (xs : Array α) (le : α → α → Bool) (f : α → $ty) :
+        $fn (xs.mergeSort le) f = $fn xs f := foldl_sum_mergeSort xs le f
+    @[grind =] theorem $hErase {α : Type} (xs : Array α) (i : Nat) (h : i < xs.size) (f : α → $ty) :
+        $fn (xs.eraseIdx i h) f + f xs[i] = $fn xs f := by
+      rw [$fn:ident, $fn:ident, foldl_sum_eq, foldl_sum_eq, Array.toList_eraseIdx]
+      exact list_sum_map_eraseIdx f xs.toList i h)
+
+def_array_sum_lemmas _root_.Array.sumBy Nat
+
 @[simp, grind =] theorem _root_.Array.sumBy_push {α : Type} (xs : Array α) (f : α → Nat) (v : α) :
     (xs.push v).sumBy f = xs.sumBy f + f v := by simp [Array.sumBy, foldl_sum_eq]
-@[simp, grind =] theorem _root_.Array.sumBy_append {α : Type} (xs ys : Array α) (f : α → Nat) :
-    (xs ++ ys).sumBy f = xs.sumBy f + ys.sumBy f := by rw [Array.sumBy, Array.sumBy, Array.sumBy, foldl_sum_eq, foldl_sum_eq, foldl_sum_eq]; simp
-@[simp, grind =] theorem _root_.Array.sumBy_map {α β : Type} (xs : Array α) (g : α → β) (f : β → Nat) :
-    (xs.map g).sumBy f = xs.sumBy (fun x => f (g x)) := by rw [Array.sumBy, Array.sumBy, foldl_sum_eq, foldl_sum_eq]; simp [List.map_map, Function.comp_def]
-@[simp, grind =] theorem _root_.Array.sumBy_reverse {α : Type} (xs : Array α) (f : α → Nat) :
-    xs.reverse.sumBy f = xs.sumBy f := by rw [Array.sumBy, Array.sumBy, foldl_sum_eq, foldl_sum_eq]; simp
-@[simp, grind =] theorem _root_.Array.sumBy_mergeSort {α : Type} (xs : Array α) (le : α → α → Bool) (f : α → Nat) :
-    (xs.mergeSort le).sumBy f = xs.sumBy f := foldl_sum_mergeSort xs le f
 @[grind <=] theorem _root_.Array.sumBy_filter_le {α : Type} (xs : Array α) (p : α → Bool) (f : α → Nat) :
     (xs.filter p).sumBy f ≤ xs.sumBy f := sumBy_of_sublist f (toList_filter_sublist xs p)
 @[grind <=] theorem _root_.Array.sumBy_pop_le {α : Type} (xs : Array α) (f : α → Nat) :
@@ -158,9 +176,6 @@ private theorem sumBy_of_sublist {α : Type} {xs ys : Array α} (f : α → Nat)
 @[grind =] theorem _root_.Array.sumBy_set {α : Type} (xs : Array α) (f : α → Nat) (i : Nat) (v : α) (h : i < xs.size) :
     (xs.set i v h).sumBy f + f xs[i] = xs.sumBy f + f v := by
   rw [Array.sumBy, Array.sumBy, foldl_sum_eq, foldl_sum_eq, Array.toList_set]; exact list_sum_map_set f xs.toList i v h
-@[grind =] theorem _root_.Array.sumBy_eraseIdx {α : Type} (xs : Array α) (i : Nat) (h : i < xs.size) (f : α → Nat) :
-    (xs.eraseIdx i h).sumBy f + f xs[i] = xs.sumBy f := by
-  rw [Array.sumBy, Array.sumBy, foldl_sum_eq, foldl_sum_eq, Array.toList_eraseIdx]; exact list_sum_map_eraseIdx f xs.toList i h
 
 theorem _root_.Array.sumBy_le_size_mul {α : Type} {xs : Array α} (f : α → Nat) (bound : Nat)
     (h : ∀ x ∈ xs, f x ≤ bound) : xs.sumBy f ≤ xs.size * bound := by
@@ -172,23 +187,13 @@ theorem _root_.Array.sumBy_le_size_mul {α : Type} {xs : Array α} (f : α → N
 def _root_.Array.sumByInt {α : Type} (xs : Array α) (f : α → Int) : Int :=
   xs.foldl (fun acc x => acc + f x) 0
 
-@[simp, grind =] theorem _root_.Array.sumByInt_empty {α : Type} (f : α → Int) : (#[] : Array α).sumByInt f = 0 := rfl
+def_array_sum_lemmas _root_.Array.sumByInt Int
+
 @[simp, grind =] theorem _root_.Array.sumByInt_push {α : Type} (xs : Array α) (x : α) (f : α → Int) :
     (xs.push x).sumByInt f = xs.sumByInt f + f x := by simp [Array.sumByInt, foldl_sum_eq]
-@[simp, grind =] theorem _root_.Array.sumByInt_append {α : Type} (xs ys : Array α) (f : α → Int) :
-    (xs ++ ys).sumByInt f = xs.sumByInt f + ys.sumByInt f := by rw [Array.sumByInt, Array.sumByInt, Array.sumByInt, foldl_sum_eq, foldl_sum_eq, foldl_sum_eq]; simp
-@[simp, grind =] theorem _root_.Array.sumByInt_map {α β : Type} (xs : Array α) (g : α → β) (f : β → Int) :
-    (xs.map g).sumByInt f = xs.sumByInt (fun x => f (g x)) := by rw [Array.sumByInt, Array.sumByInt, foldl_sum_eq, foldl_sum_eq]; simp [List.map_map, Function.comp_def]
-@[simp, grind =] theorem _root_.Array.sumByInt_reverse {α : Type} (xs : Array α) (f : α → Int) :
-    xs.reverse.sumByInt f = xs.sumByInt f := by rw [Array.sumByInt, Array.sumByInt, foldl_sum_eq, foldl_sum_eq]; simp
-@[simp, grind =] theorem _root_.Array.sumByInt_mergeSort {α : Type} (xs : Array α) (le : α → α → Bool) (f : α → Int) :
-    (xs.mergeSort le).sumByInt f = xs.sumByInt f := foldl_sum_mergeSort xs le f
 @[grind =] theorem _root_.Array.sumByInt_set {α : Type} (xs : Array α) (i : Nat) (x : α) (h : i < xs.size) (f : α → Int) :
     (xs.set i x h).sumByInt f + f xs[i] = xs.sumByInt f + f x := by
   rw [Array.sumByInt, Array.sumByInt, foldl_sum_eq, foldl_sum_eq, Array.toList_set]; exact list_sum_map_set f xs.toList i x h
-@[grind =] theorem _root_.Array.sumByInt_eraseIdx {α : Type} (xs : Array α) (i : Nat) (h : i < xs.size) (f : α → Int) :
-    (xs.eraseIdx i h).sumByInt f + f xs[i] = xs.sumByInt f := by
-  rw [Array.sumByInt, Array.sumByInt, foldl_sum_eq, foldl_sum_eq, Array.toList_eraseIdx]; exact list_sum_map_eraseIdx f xs.toList i h
 
 /-! ### `Array.countWhere` -/
 
@@ -256,16 +261,24 @@ private theorem uniqueBy_of_sublist {α β : Type} {xs ys : Array α} {key : α 
     (hsub : ys.toList.Sublist xs.toList) (h : xs.uniqueBy key) : ys.uniqueBy key :=
   h.sublist (hsub.map key)
 
-@[grind ←] theorem _root_.Array.uniqueBy_filter {α β : Type} {xs : Array α} {key : α → β} {p : α → Bool}
-    (h : xs.uniqueBy key) : (xs.filter p).uniqueBy key := uniqueBy_of_sublist (toList_filter_sublist xs p) h
-@[grind ←] theorem _root_.Array.uniqueBy_pop {α β : Type} {xs : Array α} {key : α → β}
-    (h : xs.uniqueBy key) : xs.pop.uniqueBy key := uniqueBy_of_sublist (toList_pop_sublist xs) h
-@[grind ←] theorem _root_.Array.uniqueBy_eraseIdx {α β : Type} {xs : Array α} {key : α → β}
-    {i : Nat} {hi : i < xs.size} (h : xs.uniqueBy key) : (xs.eraseIdx i hi).uniqueBy key :=
-  uniqueBy_of_sublist (toList_eraseIdx_sublist xs i hi) h
-@[grind ←] theorem _root_.Array.uniqueBy_extract {α β : Type} {xs : Array α} {key : α → β}
-    {start stop : Nat} (h : xs.uniqueBy key) : (xs.extract start stop).uniqueBy key :=
-  uniqueBy_of_sublist (toList_extract_sublist xs start stop) h
+local macro "def_sublist_pres " fn:ident " {" ts:ident* "} " keyTy:term " by " ofSub:term : command => do
+  let suf (s : String) := Lean.mkIdentFrom fn (fn.getId.appendAfter s)
+  let hF := suf "_filter"
+  let hP := suf "_pop"
+  let hE := suf "_eraseIdx"
+  let hX := suf "_extract"
+  `(@[grind ←] theorem $hF {α $ts:ident* : Type} {xs : Array α} {key : α → $keyTy} {p : α → Bool}
+        (h : $fn xs key) : $fn (xs.filter p) key := $ofSub (toList_filter_sublist xs p) h
+    @[grind ←] theorem $hP {α $ts:ident* : Type} {xs : Array α} {key : α → $keyTy}
+        (h : $fn xs key) : $fn xs.pop key := $ofSub (toList_pop_sublist xs) h
+    @[grind ←] theorem $hE {α $ts:ident* : Type} {xs : Array α} {key : α → $keyTy}
+        {i : Nat} {hi : i < xs.size} (h : $fn xs key) : $fn (xs.eraseIdx i hi) key :=
+      $ofSub (toList_eraseIdx_sublist xs i hi) h
+    @[grind ←] theorem $hX {α $ts:ident* : Type} {xs : Array α} {key : α → $keyTy}
+        {start stop : Nat} (h : $fn xs key) : $fn (xs.extract start stop) key :=
+      $ofSub (toList_extract_sublist xs start stop) h)
+
+def_sublist_pres _root_.Array.uniqueBy {β} β by uniqueBy_of_sublist
 
 @[grind ←] theorem _root_.Array.uniqueBy_reverse {α β : Type} {xs : Array α} {key : α → β}
     (h : xs.uniqueBy key) : xs.reverse.uniqueBy key := by
@@ -300,16 +313,7 @@ instance {α : Type} (xs : Array α) (key : α → Nat) : Decidable (xs.isSorted
   simp only [Array.isSortedBy, Array.toList_push, List.pairwise_append, List.pairwise_singleton,
     List.mem_singleton, forall_eq, true_and, Array.mem_toList_iff]
 
-@[grind ←] theorem _root_.Array.isSortedBy_filter {α : Type} {xs : Array α} {key : α → Nat} {p : α → Bool}
-    (h : xs.isSortedBy key) : (xs.filter p).isSortedBy key := h.sublist (toList_filter_sublist xs p)
-@[grind ←] theorem _root_.Array.isSortedBy_pop {α : Type} {xs : Array α} {key : α → Nat}
-    (h : xs.isSortedBy key) : xs.pop.isSortedBy key := h.sublist (toList_pop_sublist xs)
-@[grind ←] theorem _root_.Array.isSortedBy_eraseIdx {α : Type} {xs : Array α} {key : α → Nat}
-    {i : Nat} {hi : i < xs.size} (h : xs.isSortedBy key) : (xs.eraseIdx i hi).isSortedBy key :=
-  h.sublist (toList_eraseIdx_sublist xs i hi)
-@[grind ←] theorem _root_.Array.isSortedBy_extract {α : Type} {xs : Array α} {key : α → Nat}
-    {start stop : Nat} (h : xs.isSortedBy key) : (xs.extract start stop).isSortedBy key :=
-  h.sublist (toList_extract_sublist xs start stop)
+def_sublist_pres _root_.Array.isSortedBy {} Nat by (fun hsub h => h.sublist hsub)
 
 @[grind .] theorem _root_.Array.isSortedBy_mergeSort_le {α : Type} (xs : Array α) (key : α → Nat) :
     (xs.mergeSort (fun a b => decide (key a ≤ key b))).isSortedBy key :=

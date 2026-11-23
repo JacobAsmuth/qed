@@ -55,12 +55,9 @@ private def elabPureCompTag (stx : Syntax) (expectedType? : Option Expr) (info :
   let mut fids : Array Ident := #[]
   let mut vals : Array Term  := #[]
   for (ref, nm, v) in otherProps do
-    if nm.startsWith "bind:" then
-      let bStr := (nm.drop 5).toString
-      fids := fids.push (mkIdentFrom ref (Name.mkSimple bStr))
-      vals := vals.push (← `(($v).1))
-      fids := fids.push (mkIdentFrom ref (Name.mkSimple s!"set_{bStr}"))
-      vals := vals.push (← `(($v).2))
+    if let some (bStr, v1, v2) ← liftMacroM (unpackBindProp nm v) then
+      fids := fids.push (mkIdentFrom ref (Name.mkSimple bStr)) |>.push (mkIdentFrom ref (Name.mkSimple s!"set_{bStr}"))
+      vals := vals.push v1 |>.push v2
     else
       fids := fids.push (mkIdentFrom ref (Name.mkSimple nm))
       vals := vals.push v
@@ -104,10 +101,9 @@ private def elabStatefulCompTag (stx : Syntax) (expectedType? : Option Expr) (in
   let mut dataProps : Array (Syntax × String × Term) := #[]
   let mut evArms    : Array OutArm := #[]
   for (ref, nm, v) in props do
-    if nm.startsWith "bind:" then
-      let bStr := (nm.drop 5).toString
-      dataProps := dataProps.push (ref, bStr, ← `(($v).1))
-      evArms := evArms.push { ctor := Name.mkSimple s!"set_{bStr}", arity := 1, handler := ← `(($v).2) }
+    if let some (bStr, v1, v2) ← liftMacroM (unpackBindProp nm v) then
+      dataProps := dataProps.push (ref, bStr, v1)
+      evArms := evArms.push { ctor := Name.mkSimple s!"set_{bStr}", arity := 1, handler := v2 }
     else if let some sig := evSigs.find? (·.name.toString == nm) then
       evArms := evArms.push { ctor := sig.name, arity := sig.arity, handler := v }
     else

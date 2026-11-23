@@ -42,10 +42,7 @@ private def isForEachStyled (invStx : Syntax) : CommandElabM Bool := do
 
 private def elabForEachInlineInv (spec : ComponentSpec) (invStx : Syntax) (isStyled : Bool) :
     CommandElabM (Option Term) := do
-  let tId      := spec.t.getId
-  let updateId := mkIdent (tId ++ `update)
-  let viewId   := mkIdent (tId ++ `view)
-  let invId := resolveInvIdent invStx tId
+  let invId := resolveInvIdent invStx spec.t.getId
   let pred ← lowerCompExpr .val (invStx.getArg 2)
   let colField : Ident := ⟨(invStx.getArg 4)⟩
   let using? : Option Ident := if (invStx.getArg 6).getNumArgs == 2 then some ⟨((invStx.getArg 6).getArg 1)⟩ else none
@@ -62,41 +59,38 @@ private def elabForEachInlineInv (spec : ComponentSpec) (invStx : Syntax) (isSty
         let ep ← liftTermElabM (if isStyled then extractViewInvPred childInv else extractInvPred childInv)
         pure (ep, childInv)
   if isStyled then
-    let rhs ← pf?.getDM `(by qedDischargeStyledForEach $viewId $colField $childInv $invId $predToEmit)
+    let rhs ← pf?.getDM `(by qedDischargeStyledForEach $(spec.viewId) $colField $childInv $invId $predToEmit)
     elabCommand (← `(command| set_option linter.unusedSimpArgs false in
-      theorem $invId:ident : ∀ m, ($predToEmit) ($viewId m) = true := $rhs))
+      theorem $invId:ident : ∀ m, ($predToEmit) ($(spec.viewId) m) = true := $rhs))
     return none
-  let rhs ← pf?.getDM `(by qedDischargeForEach $updateId $childInv $invId $predToEmit)
+  let rhs ← pf?.getDM `(by qedDischargeForEach $(spec.updateId) $childInv $invId $predToEmit)
   elabCommand (← `(command|
     theorem $invId:ident :
         ∀ m msg, (∀ c ∈ m.$colField, ($predToEmit) c) →
-                 (∀ c ∈ (InvTarget.proj ($updateId m msg)).$colField, ($predToEmit) c) := $rhs))
+                 (∀ c ∈ (InvTarget.proj ($(spec.updateId) m msg)).$colField, ($predToEmit) c) := $rhs))
   try return some (← liftTermElabM (extractInvPred invId))
   catch _ => return none
 
 private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : Ident)
     (rawClauses : Array Syntax) (clauses : Array Term) (assume? pf? : Option Term) : CommandElabM Unit := do
-  let tId     := spec.t.getId
-  let propsId := mkIdent (tId ++ `Props)
-  let viewId  := mkIdent (tId ++ `view)
   let (vPred, predStr) ← mkViewPredAndStr invStx rawClauses clauses "empty view styling invariant"
   if spec.hasProps then
     let rhs ← pf?.getDM `(by
-      let _qed_hv := $viewId p
+      let _qed_hv := $(spec.viewId) p
       change ∀ m, ($vPred) (_qed_hv m) = true
       qedDischargeStyling _qed_hv $invId $(Syntax.mkStrLit predStr))
     elabCommand (← `(command| set_option linter.unusedSimpArgs false in
-      theorem $invId:ident (p : $propsId) : ∀ m, ($vPred) ($viewId p m) = true := $rhs))
+      theorem $invId:ident (p : $(spec.propsId)) : ∀ m, ($vPred) ($(spec.viewId) p m) = true := $rhs))
   else
     let assumePred? ← assume?.mapM fun a =>
       if a.raw.isIdent then try liftTermElabM (extractInvPred ⟨a.raw⟩) catch _ => pure a else pure a
     let prop ← match assumePred? with
-      | some P => `(∀ m, ($P) m → ($vPred) ($viewId m) = true)
-      | none   => `(∀ m, ($vPred) ($viewId m) = true)
-    let rhs ← pf?.getDM `(by qedDischargeStyling $viewId $invId $(Syntax.mkStrLit predStr))
+      | some P => `(∀ m, ($P) m → ($vPred) ($(spec.viewId) m) = true)
+      | none   => `(∀ m, ($vPred) ($(spec.viewId) m) = true)
+    let rhs ← pf?.getDM `(by qedDischargeStyling $(spec.viewId) $invId $(Syntax.mkStrLit predStr))
     elabCommand (← `(command| set_option linter.unusedSimpArgs false in
       theorem $invId:ident : $prop := $rhs))
-    let fullView ← liftCoreM (resolveGlobalConstNoOverload viewId)
+    let fullView ← liftCoreM (resolveGlobalConstNoOverload spec.viewId)
     let compFull := fullView.getPrefix
     let appViewEqName := compFull ++ `app_view_eq
     if (← getEnv).contains appViewEqName then
@@ -106,9 +100,8 @@ private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : 
       let saved ← get
       try
         let stateOfM : Term ← if spec.hasSpeculative then `(m.visible) else `(m)
-        let congr ← `(Qed.canonical_congr_pred ($appViewEqId m)
-          (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical, Qed.tagHasOneOf_canonical])
-          (by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical, Qed.tagHasOneOf_canonical]))
+        let simpCan ← `(by simp (discharger := decide) [Qed.both, Qed.either, Qed.hasTag_canonical, Qed.tagHasOneOf_canonical])
+        let congr ← `(Qed.canonical_congr_pred ($appViewEqId m) $simpCan $simpCan)
         let appViewFn := mkIdent `Qed.App.view
         let (appProp, appPf) ← match assumePred? with
           | some P => pure (← `(∀ m, ($P) $stateOfM → ($vPred) ($appViewFn $appId m) = true),
@@ -121,38 +114,31 @@ private def elabViewInlineInv (spec : ComponentSpec) (invStx : Syntax) (invId : 
 
 private def elabStateInlineInv (spec : ComponentSpec) (invId : Ident)
     (clauses : Array Term) (using? : Option (Array Term)) (pf? : Option Term) : CommandElabM Term := do
-  let tId      := spec.t.getId
-  let propsId  := mkIdent (tId ++ `Props)
-  let stateId  := mkIdent (tId ++ `State)
-  let initId   := mkIdent (tId ++ `init)
-  let updateId := mkIdent (tId ++ `update)
   let conj ← mkConjBody clauses
-  let pred ← `(fun (s : $stateId) => $(← bindMentionedFields spec (mentionsIdent conj.raw) conj))
+  let pred ← `(fun (s : $(spec.stateId)) => $(← bindMentionedFields spec (mentionsIdent conj.raw) conj))
   let usingL := using?.getD #[]
   if spec.hasProps then
     if spec.mountable then
       let initInvId := mkIdentFrom invId (invId.getId.appendAfter "_init")
-      elabCommand (← `(theorem $initInvId:ident : ($pred) $initId := by
-        qedDischargeInit [$[$usingL],*] $initId $invId ($pred)))
-    let rhs ← pf?.getDM `(by qedDischargePreserved [$[$usingL],*] ($updateId p) $invId ($pred))
-    elabCommand (← `(theorem $invId:ident (p : $propsId) :
-      ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($updateId p m msg)) := $rhs))
+      elabCommand (← `(theorem $initInvId:ident : ($pred) $(spec.initId) := by
+        qedDischargeInit [$[$usingL],*] $(spec.initId) $invId ($pred)))
+    let rhs ← pf?.getDM `(by qedDischargePreserved [$[$usingL],*] ($(spec.updateId) p) $invId ($pred))
+    elabCommand (← `(theorem $invId:ident (p : $(spec.propsId)) :
+      ∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($(spec.updateId) p m msg)) := $rhs))
   else
-    let presProp ← `(∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($updateId m msg)))
+    let presProp ← `(∀ m msg, ($pred) m → ($pred) (InvTarget.proj ($(spec.updateId) m msg)))
     let (prop, rhs) ← if spec.mountable then
         let r ← match pf? with
-          | some pf => `(by exact ⟨by qedDischargeInit [$[$usingL],*] $initId $invId ($pred), $pf⟩)
-          | none    => `(by qedDischargePreserved [$[$usingL],*] $updateId $invId ($pred) from $initId)
-        pure (← `(($pred) ($initId) ∧ $presProp), r)
+          | some pf => `(by exact ⟨by qedDischargeInit [$[$usingL],*] $(spec.initId) $invId ($pred), $pf⟩)
+          | none    => `(by qedDischargePreserved [$[$usingL],*] $(spec.updateId) $invId ($pred) from $(spec.initId))
+        pure (← `(($pred) ($(spec.initId)) ∧ $presProp), r)
       else
-        pure (presProp, ← pf?.getDM `(by qedDischargePreserved [$[$usingL],*] $updateId $invId ($pred)))
+        pure (presProp, ← pf?.getDM `(by qedDischargePreserved [$[$usingL],*] $(spec.updateId) $invId ($pred)))
     elabCommand (← `(command| theorem $invId:ident : $prop := $rhs))
   return pred
 
 def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) :
     CommandElabM (Array (Term × Option Ident)) := do
-  let tId   := spec.t.getId
-  let msgId := mkIdent (tId ++ `Msg)
   let mut statePreds : Array (Term × Option Ident) := #[]
   for invStx in spec.invariants do
     if invStx.getKind == ``compExampleClause then
@@ -180,12 +166,12 @@ def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) :
     let autoView ← match valClauses? with
       | some vc =>
           if !hasHoldsIn && !vc.any (fun c => spec.allNames.any (mentionsIdent c.raw)) then
-            vc.allM (isViewPred msgId)
+            vc.allM (isViewPred spec.msgId)
           else pure false
       | none => pure false
     let isView := hasHoldsIn || autoView
     if isView == wantView then
-      let invId := resolveInvIdent invStx tId
+      let invId := resolveInvIdent invStx spec.t.getId
       if isView then
         let valClauses ← match valClauses? with
           | some vc => pure vc
@@ -199,24 +185,19 @@ def elabInlineInvariantsPhase (spec : ComponentSpec) (wantView : Bool) :
   return statePreds
 
 def elabCompReachableAndWitnesses (spec : ComponentSpec) : CommandElabM Unit := do
-  let tId      := spec.t.getId
-  let stateId  := mkIdent (tId ++ `State)
-  let msgId    := mkIdent (tId ++ `Msg)
-  let initId   := mkIdent (tId ++ `init)
-  let updateId := mkIdent (tId ++ `update)
   for cl in spec.invariants do
     if cl.getKind == ``compExampleClause then
       unless spec.mountable && !spec.hasProps do
         throwErrorAt cl "`example` inside a `component` requires a mountable component without `prop`s"
       let nameIdent : Ident := ⟨cl.getArg 1⟩
-      let thmId := mkIdentFrom nameIdent (tId ++ nameIdent.getId.eraseMacroScopes)
+      let thmId := mkIdentFrom nameIdent (spec.t.getId ++ nameIdent.getId.eraseMacroScopes)
       let parsedParams ← parseParamList (cl.getArg 2)
       let mut paramBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) := #[]
       let mut paramNames : Array Name := #[]
       for (pId, pTy) in parsedParams do
         let pName := pId.getId.eraseMacroScopes
         if spec.allNames.contains pName then
-          throwErrorAt pId s!"`example` parameter `{pName}` shadows a field of `{tId}`; rename the parameter"
+          throwErrorAt pId s!"`example` parameter `{pName}` shadows a field of `{spec.t.getId}`; rename the parameter"
         paramBinders := paramBinders.push (← `(bracketedBinder| ($pId:ident : $pTy:term)))
         paramNames := paramNames.push pName
       -- Parse optional `where cond1, cond2, ...` preconditions (bound separately for `omega`/`simp_all`)
@@ -229,19 +210,19 @@ def elabCompReachableAndWitnesses (spec : ComponentSpec) : CommandElabM Unit := 
           whereBinders := whereBinders.push (← `(bracketedBinder| ($hId:ident : $wProp:term)))
       let allBinders := paramBinders ++ whereBinders
       let actTerms ← (cl.getArg 5).getSepArgs.mapM (lowerCompExpr .val)
-      let traceTerm : Term ← `(([$[$actTerms:term],*] : List $msgId))
+      let traceTerm : Term ← `(([$[$actTerms:term],*] : List $(spec.msgId)))
       let rawGoal := cl.getArg 7
       let goalTerm ← lowerCompExpr .propInv rawGoal
-      let pred ← `(fun (s : $stateId) => $(← bindMentionedFields spec (fun nm => !paramNames.contains nm && mentionsIdent goalTerm.raw nm) goalTerm))
-      let lbl := Syntax.mkStrLit ((((rawGoal.reprint.getD "target").splitOn "\n").headD "target").trimAscii.toString)
+      let pred ← `(fun (s : $(spec.stateId)) => $(← bindMentionedFields spec (fun nm => !paramNames.contains nm && mentionsIdent goalTerm.raw nm) goalTerm))
+      let lbl := Syntax.mkStrLit (let s := stxSnippet rawGoal; if s.isEmpty then "target" else s)
       let pf ← if (cl.getArg 8).getNumArgs == 3 then
           let tacSeq : TSyntax `Lean.Parser.Tactic.tacticSeq := ⟨(cl.getArg 8).getArg 2⟩
           `(by $tacSeq)
-        else `(by qedDischargeReachable $updateId $initId $thmId $lbl)
+        else `(by qedDischargeReachable $(spec.updateId) $(spec.initId) $thmId $lbl)
       elabCommand (← `(command|
         theorem $thmId:ident $[$allBinders:bracketedBinder]* :
-            Qed.Reachable $updateId $initId ($pred) :=
-          Qed.reachable_of_trace $updateId $initId ($pred) $traceTerm $pf))
+            Qed.Reachable $(spec.updateId) $(spec.initId) ($pred) :=
+          Qed.reachable_of_trace $(spec.updateId) $(spec.initId) ($pred) $traceTerm $pf))
 
 
 end CompElab

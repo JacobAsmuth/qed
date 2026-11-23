@@ -32,29 +32,11 @@ def escapeHtmlAcc (acc s : String) : String :=
 
 def escapeHtmlFast (s : String) : String := escapeHtmlAcc "" s
 
-private theorem isHtmlSpecialByte_eq (c : Char) (hc : c.toNat ≤ 127) :
-    isHtmlSpecialByte (UInt8.ofNat c.toNat) = isHtmlSpecial c := by
-  unfold isHtmlSpecialByte isHtmlSpecial isMarkupOrQuote
-  have hlt : (UInt8.ofNat c.toNat).toNat = c.toNat := by change c.toNat % 256 = c.toNat; omega
-  change (decide (UInt8.ofNat c.toNat ≤ 62) &&
-    ((UInt8.ofNat c.toNat == UInt8.ofNat '&'.toNat) ||
-     (UInt8.ofNat c.toNat == UInt8.ofNat '<'.toNat) ||
-     (UInt8.ofNat c.toNat == UInt8.ofNat '>'.toNat) ||
-     (UInt8.ofNat c.toNat == UInt8.ofNat '"'.toNat) ||
-     (UInt8.ofNat c.toNat == UInt8.ofNat '\''.toNat))) = _
-  rw [asciiByte_beq_char c hc '&' (by decide), asciiByte_beq_char c hc '<' (by decide),
-      asciiByte_beq_char c hc '>' (by decide), asciiByte_beq_char c hc '"' (by decide),
-      asciiByte_beq_char c hc '\'' (by decide)]
-  by_cases hle : c.toNat ≤ 62
-  · have hle' : decide (UInt8.ofNat c.toNat ≤ 62) = true := by
-      rw [decide_eq_true_iff]; change (UInt8.ofNat c.toNat).toNat ≤ 62; omega
-    simp [hle', Bool.or_assoc]
-  · have hle' : decide (UInt8.ofNat c.toNat ≤ 62) = false := by
-      rw [decide_eq_false_iff_not]; change ¬((UInt8.ofNat c.toNat).toNat ≤ 62); omega
-    have hne : ∀ t : Char, t.toNat ≤ 62 → (c == t) = false := by
-      intro t ht; rw [beq_eq_false_iff_ne]; intro heq; subst heq; omega
-    simp [hle', hne '&' (by decide), hne '<' (by decide), hne '>' (by decide),
-      hne '"' (by decide), hne '\'' (by decide)]
+private theorem isHtmlSpecialByte_hi :
+    ∀ b : BitVec 8, b.toNat ≥ 128 → isHtmlSpecialByte ⟨b⟩ = false := by decide
+
+private theorem isHtmlSpecialByte_lo :
+    ∀ n : Fin 128, isHtmlSpecialByte (UInt8.ofNat n.val) = isHtmlSpecial (Char.ofNat n.val) := by decide
 
 private theorem push_eq_append_r (a : String) (c : Char) : a.push c = a ++ String.singleton c := by
   ext; simp
@@ -83,19 +65,13 @@ private theorem foldl_escapeHtmlStep_append (cs : List Char) (acc : String) :
 
 private theorem escapeHtmlAcc_eq (acc s : String) : escapeHtmlAcc acc s = acc ++ escapeHtml s := by
   unfold escapeHtmlAcc escapeHtml; dsimp only
-  have h1 : hasAsciiByte s isHtmlSpecialByte = s.toList.any isHtmlSpecial := by
-    apply hasAsciiByte_eq_any
-    · intro b hb
-      unfold isHtmlSpecialByte
-      have : decide (b ≤ 62) = false := by rw [decide_eq_false_iff_not]; change ¬(b.toNat ≤ 62); omega
-      simp [this]
-    · exact isHtmlSpecialByte_eq
-    · intro c hgt
-      unfold isHtmlSpecial isMarkupOrQuote
-      have hne : ∀ t : Char, t.toNat ≤ 127 → (c == t) = false := by
-        intro t ht; rw [beq_eq_false_iff_ne]; intro heq; subst heq; omega
-      simp [hne '&' (by decide), hne '<' (by decide), hne '>' (by decide),
-        hne '"' (by decide), hne '\'' (by decide)]
+  have h1 : hasAsciiByte s isHtmlSpecialByte = s.toList.any isHtmlSpecial :=
+    hasAsciiByte_eq_any s isHtmlSpecialByte isHtmlSpecial
+      (fun b => isHtmlSpecialByte_hi b.toBitVec)
+      (fun c hc => by simpa [Char.ofNat_toNat] using isHtmlSpecialByte_lo ⟨c.toNat, by omega⟩)
+      (fun c hgt => by
+        simp only [isHtmlSpecial, isMarkupOrQuote, Bool.or_eq_false_iff, beq_eq_false_iff_ne]
+        refine ⟨?_, ⟨⟨⟨?_, ?_⟩, ?_⟩, ?_⟩⟩ <;> (rintro rfl; exact absurd hgt (by decide)))
   have h2 : s.foldl escapeHtmlStep acc = s.toList.foldl escapeHtmlStep acc := by simp
   rw [h1, h2]
   cases ha : s.toList.any isHtmlSpecial with
@@ -389,24 +365,18 @@ mutual
     | element tag attrs children =>
         unfold renderNodeAcc renderNode renderElement
         rw [renderElemAttrsAcc_eq]
-        by_cases hraw : (tag == "style" || tag == "script") = true
-        · simp only [hraw, ↓reduceIte, push_eq_append_r, singleton_lt, singleton_gt, toString_string,
-            String.append_assoc]
-        · have hrawF : (tag == "style" || tag == "script") = false := Bool.eq_false_iff.2 hraw
-          simp only [hrawF, Bool.false_eq_true, ↓reduceIte]
-          by_cases hvoid : isVoidTag tag = true
-          · simp only [hvoid, ↓reduceIte, push_eq_append_r, singleton_lt, singleton_gt, toString_string,
-              String.append_assoc]
-          · have hvoidF : isVoidTag tag = false := Bool.eq_false_iff.2 hvoid
-            simp only [hvoidF, Bool.false_eq_true, ↓reduceIte]
-            by_cases hta : (tag == "textarea") = true
-            · simp only [hta, ↓reduceIte, renderChildrenAcc_eq, String.empty_append, Bool.true_and]
+        cases hraw : (tag == "style" || tag == "script")
+        · cases hvoid : isVoidTag tag
+          · cases hta : (tag == "textarea")
+            · simp only [Bool.false_eq_true, ↓reduceIte, Bool.false_and, renderChildrenAcc_eq,
+                push_eq_append_r, singleton_lt, singleton_gt, toString_string, String.append_assoc]
+            · simp only [↓reduceIte, Bool.false_eq_true, Bool.true_and, renderChildrenAcc_eq, String.empty_append]
               split <;> simp only [push_eq_append_r, singleton_lt, singleton_gt, singleton_nl,
                 toString_string, String.append_assoc]
-            · have htaF : (tag == "textarea") = false := Bool.eq_false_iff.2 hta
-              simp only [htaF, Bool.false_eq_true, ↓reduceIte, Bool.false_and,
-                renderChildrenAcc_eq, push_eq_append_r, singleton_lt, singleton_gt, toString_string,
-                String.append_assoc]
+          · simp only [↓reduceIte, Bool.false_eq_true, push_eq_append_r, singleton_lt, singleton_gt,
+              toString_string, String.append_assoc]
+        · simp only [↓reduceIte, push_eq_append_r, singleton_lt, singleton_gt, toString_string,
+            String.append_assoc]
   theorem renderChildrenAcc_eq (hs : Array msg) (acc : String) (cs : List (Html msg)) :
       renderChildrenAcc hs acc cs =
         (acc ++ (renderChildren hs cs).1, (renderChildren hs cs).2) := by

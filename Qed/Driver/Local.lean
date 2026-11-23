@@ -53,17 +53,10 @@ def localMountFuel : Nat → ∀ {Msg : Type}, LocalCtx → (Msg → IO Unit) �
           | none =>
               let s0 := (← ctx.store.get).getD fk (init?.getD ldef.init)
               ctx.store.modify (·.insert fk s0)
-              let cRef ← IO.mkRef (#[] : Array LocalMsg)
-              let iRef ← IO.mkRef (#[] : Array (String → LocalMsg))
-              let rRef ← IO.mkRef (#[] : Array (Nat → Nat → Option LocalMsg))
               -- Look up `fk` lazily at event time since `self` is inserted into `ctx.instances` after `lh` is built.
-              let lh : Handlers LocalMsg :=
-                { click := cRef, input := iRef, rowEv := rRef,
-                  mountLocal := fun k c i p b hn =>
-                    localMountFuel fuel ctx (fun lm => do
-                      match (← ctx.instances.get)[fk]? with
-                      | some self => localRun ctx fk self lm
-                      | none      => pure ()) k c i p b hn }
+              let lh : Handlers LocalMsg ← Handlers.mkNew fun k c i p b hn =>
+                localMountFuel fuel ctx (fun lm => do
+                  if let some self := (← ctx.instances.get)[fk]? then localRun ctx fk self lm) k c i p b hn
               let view := ldef.viewForProps props
               let tree := view s0
               if (← Dom.childCount host) > 0 then

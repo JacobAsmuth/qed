@@ -237,19 +237,12 @@ instance (priority := high) {V : Type} [LawfulJson V] : LawfulJson (Dict String 
 
 instance (priority := high) {V : Type} [ToJson V] : NonNullJson (Dict String V) := ⟨nofun⟩
 
-/-- Non-`String`-keyed dictionaries `{K: V}` serialize as JSON arrays of `[k, v]` pairs. -/
-instance (priority := low) {K V : Type} [ToJson K] [ToJson V] : ToJson (Dict K V) := .ofEquiv Dict.entriesList
-instance (priority := low) {K V : Type} [FromJson K] [FromJson V] : FromJson (Dict K V) := .ofEquiv Dict.mk
-instance (priority := low) {K V : Type} [LawfulJson K] [LawfulJson V] : LawfulJson (Dict K V) :=
-  .ofEquiv Dict.entriesList Dict.mk (fun ⟨_⟩ => rfl)
-instance (priority := low) {K V : Type} [ToJson K] [ToJson V] : NonNullJson (Dict K V) := ⟨nofun⟩
+-- Non-`String`-keyed dictionaries `{K: V}` serialize as JSON arrays of `[k, v]` pairs.
+qed_equiv_codec% jsonLow [K, V] (Dict K V, Dict.entriesList, Dict.mk, fun ⟨_⟩ => rfl)
 
 /-! ### Verified Binary Protobuf Codecs (`LawfulProto`) -/
 
-instance {K V : Type} [ToProto K] [ToProto V] : ToProto (Dict K V) := .ofEquiv Dict.entriesList
-instance {K V : Type} [FromProto K] [FromProto V] : FromProto (Dict K V) := .ofEquiv Dict.mk
-instance {K V : Type} [LawfulProto K] [LawfulProto V] : LawfulProto (Dict K V) :=
-  .ofEquiv Dict.entriesList Dict.mk (fun ⟨_⟩ => rfl)
+qed_equiv_codec% proto [K, V] (Dict K V, Dict.entriesList, Dict.mk, fun ⟨_⟩ => rfl)
 
 end Dict
 end Qed

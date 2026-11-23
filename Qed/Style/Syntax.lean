@@ -411,6 +411,12 @@ private def validatePropValue (ref : Syntax) (p resolvedVal : String) (kind : Cs
         if let some (fn, args) := parseFuncCall? a then
           if fn == "rgb" || fn == "rgba" then checkOrThrow (validateRgbArgs fn args)
 
+private def addUnique {α : Type} [BEq α] (xs : List α) (x : α) : List α :=
+  if xs.contains x then xs else xs ++ [x]
+
+private def mergeUnique {α : Type} [BEq α] (xs ys : List α) : List α :=
+  ys.foldl addUnique xs
+
 private def resolveAndValidateDecl (ref : Syntax) (env : Environment) (currNs : Name)
     (openDecls : List OpenDecl) (strictTokens : Bool) (prop rawVal : String) :
     CoreM ResolvedCssValue := do
@@ -437,13 +443,12 @@ private def resolveAndValidateDecl (ref : Syntax) (env : Environment) (currNs : 
         checkTokenKindForProp ref p propKind tInfo
         outAtoms := outAtoms.push s!"var(--{tInfo.cssName})"
         usedToks := usedToks ++ [tInfo.cssName]
-        if let some thNm := tInfo.themeName? then
-          unless usedThemes.contains thNm do usedThemes := usedThemes ++ [thNm]
+        if let some thNm := tInfo.themeName? then usedThemes := addUnique usedThemes thNm
         continue
       if p == "animation" || p == "animation-name" then
         if let some kfInfo := resolveInRegistry kfReg env currNs openDecls a then
           outAtoms := outAtoms.push kfInfo.kfName
-          unless extraRules.contains kfInfo.rule do extraRules := extraRules ++ [kfInfo.rule]
+          extraRules := addUnique extraRules kfInfo.rule
           continue
     outAtoms := outAtoms.push a
   let resolvedVal := String.intercalate " " outAtoms.toList
@@ -504,7 +509,7 @@ private partial def compileCssBlockItems (env : Environment) (currNs : Name)
       items := items ++ [.nest sel sub.items]
       toks  := toks ++ sub.usedTokens
       rules := rules ++ sub.extraRules
-      for t in sub.themes do unless thms.contains t do thms := thms ++ [t]
+      thms  := mergeUnique thms sub.themes
     else if stx.getKind == ``cssSimpleDecl then
       let line := (atomText (stx.getArg 0)).trimmed
       let some (p, v) := splitFirstChar ':' line
@@ -513,31 +518,30 @@ private partial def compileCssBlockItems (env : Environment) (currNs : Name)
       items := items ++ [.decl p.trimmed res.cssText]
       toks  := toks ++ res.usedTokens
       rules := rules ++ res.extraRules
-      for t in res.themes do unless thms.contains t do thms := thms ++ [t]
+      thms  := mergeUnique thms res.themes
     else
       throwErrorAt stx s!"unexpected syntax in CSS block ({stx.getKind})"
   return { items, usedTokens := Qed.dedupStrings toks, extraRules := Qed.dedupStrings rules, themes := thms }
 
 private partial def quoteItem : Qed.Item → MacroM Term
   | .decl p v => `(Qed.Item.decl $(Syntax.mkStrLit p) $(Syntax.mkStrLit v))
-  | .nest sel body => do
-      let bTerms ← body.toArray.mapM quoteItem
-      `(Qed.Item.nest $(Syntax.mkStrLit sel) [$[$bTerms],*])
+  | .nest sel body => do `(Qed.Item.nest $(Syntax.mkStrLit sel) $(← quoteItems body))
+where
+  quoteItems (items : List Qed.Item) : MacroM Term := do
+    let ts ← items.toArray.mapM quoteItem
+    `([$[$ts],*])
 
 private def quoteStringList (xs : List String) : MacroM Term := do
   let lits := xs.toArray.map Syntax.mkStrLit
   `([$[$lits:str],*])
 
 private def quoteStyleLiteral (s : Qed.Style) : MacroM Term := do
-  let itemTerms ← s.items.toArray.mapM quoteItem
-  let tokList   ← quoteStringList s.usedTokens
-  let extraList ← quoteStringList s.extraRules
   let isGlob : Term ← if s.isGlobal then `(Bool.true) else `(Bool.false)
   `({ className  := $(Syntax.mkStrLit s.className)
       raw        := $(Syntax.mkStrLit s.raw)
-      items      := [$[$itemTerms],*]
-      usedTokens := $tokList
-      extraRules := $extraList
+      items      := $(← quoteItem.quoteItems s.items)
+      usedTokens := $(← quoteStringList s.usedTokens)
+      extraRules := $(← quoteStringList s.extraRules)
       isGlobal   := $isGlob : Qed.Style })
 
 /-! ## `style <name> [extends ...] [strict_tokens]:` Elaborator -/
@@ -563,7 +567,7 @@ def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
                      else s!"qed-{clean}-{Qed.shortHexHash (Qed.cssHash rawCss)}"
   let allToks  := Qed.dedupStrings ((baseMetas.foldl (fun acc bm => acc ++ bm.usedTokens) []) ++ compiled.usedTokens ++ Qed.collectItemTokens finalItems)
   let allExtra := Qed.dedupStrings ((baseMetas.foldl (fun acc bm => acc ++ bm.extraRules) []) ++ compiled.extraRules)
-  let allThemes := baseMetas.foldl (fun acc bm => bm.themes.foldl (fun a t => if a.contains t then a else a ++ [t]) acc) compiled.themes
+  let allThemes := baseMetas.foldl (fun acc bm => mergeUnique acc bm.themes) compiled.themes
   let baked : Qed.Style := {
     className := cls, raw := rawCss, items := finalItems,
     usedTokens := allToks, extraRules := allExtra, isGlobal := false
@@ -574,11 +578,12 @@ def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
     fullName, items := finalItems, usedTokens := allToks, extraRules := allExtra, themes := allThemes
   }
 
+def extractStyleExtends (optStx : Syntax) : Array Ident :=
+  if optStx.getNumArgs == 1 then ((optStx.getArg 0).getArg 1).getSepArgs.map (⟨·⟩) else #[]
+
 @[command_elab styleCmd] def elabStyleCmd : CommandElab := fun stx => do
-  let nameId : Ident := ⟨(stx.getArg 2)⟩
-  let extendsIds : Array Ident :=
-    if (stx.getArg 3).getNumArgs == 1 then (((stx.getArg 3).getArg 0).getArg 1).getSepArgs.map (⟨·⟩) else #[]
-  elabStyleDef (optDocComment stx) nameId extendsIds ((stx.getArg 4).getNumArgs == 1) (stx.getArg 6).getArgs
+  elabStyleDef (optDocComment stx) ⟨stx.getArg 2⟩ (extractStyleExtends (stx.getArg 3))
+    ((stx.getArg 4).getNumArgs == 1) (stx.getArg 6).getArgs
 
 /-! ## `keyframes <name>:` Elaborator -/
 
@@ -594,8 +599,7 @@ def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
     steps := steps ++ [(stripTrailingColon (stepStx.getArg 0), compiled.items)]
   let kf : Qed.Keyframes := { name := kfName, steps }
   let stepTerms ← liftMacroM <| steps.toArray.mapM fun (sel, body) => do
-    let bTerms ← body.toArray.mapM quoteItem
-    `(($(Syntax.mkStrLit sel), [$[$bTerms],*]))
+    `(($(Syntax.mkStrLit sel), $(← quoteItem.quoteItems body)))
   let doc? := optDocComment stx
   elabCommand (← `(command| $[$doc?:docComment]? def $nameId : Qed.Keyframes :=
     Qed.keyframes $(Syntax.mkStrLit kfName) [$[$stepTerms],*]))
@@ -819,22 +823,17 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
   let thStyle := thVal.asStyle
   let fullThemeName := currNs ++ themeNm
   emitThemeTokens themeNm fullThemeName entries
-  let lDeclTerms ← liftMacroM <| lightDecls.toArray.mapM quoteItem
-  let dDeclTerms ← liftMacroM <| darkDecls.toArray.mapM quoteItem
-  let rTerms     ← liftMacroM <| resets.toArray.mapM quoteItem
-  let defTokList ← liftMacroM <| quoteStringList defToks
-  let drkTokList ← liftMacroM <| quoteStringList darkToks
   let themeConstId := mkIdentFrom themeId (themeNm ++ `theme)
   let styleConstId := mkIdentFrom themeId (themeNm ++ `style)
-  elabCommand (← `(command| $[$doc?:docComment]? def $themeConstId : Qed.Theme :=
-    { name          := $(Syntax.mkStrLit thVal.name)
-      lightDecls    := [$[$lDeclTerms],*]
-      darkDecls     := [$[$dDeclTerms],*]
-      resets        := [$[$rTerms],*]
-      definedTokens := $defTokList
-      darkTokens    := $drkTokList }))
-  let styleLit ← liftMacroM <| quoteStyleLiteral thStyle
-  elabCommand (← `(command| def $styleConstId : Qed.Style := $styleLit))
+  let themeLit ← liftMacroM do
+    `({ name          := $(Syntax.mkStrLit thVal.name)
+        lightDecls    := $(← quoteItem.quoteItems lightDecls)
+        darkDecls     := $(← quoteItem.quoteItems darkDecls)
+        resets        := $(← quoteItem.quoteItems resets)
+        definedTokens := $(← quoteStringList defToks)
+        darkTokens    := $(← quoteStringList darkToks) })
+  elabCommand (← `(command| $[$doc?:docComment]? def $themeConstId : Qed.Theme := $themeLit))
+  elabCommand (← `(command| def $styleConstId : Qed.Style := $(← liftMacroM <| quoteStyleLiteral thStyle)))
   emitThemeContrastInvs themeNm entries invs
   modifyEnv fun env' => themeMetaRegistry.addEntry env' {
     fullName := fullThemeName, styleConst := fullThemeName ++ `style, themeConst := fullThemeName ++ `theme

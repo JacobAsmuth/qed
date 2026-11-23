@@ -3,7 +3,7 @@ import Qed.Server.Invariant
 
 namespace Qed
 section CompElab
-open Lean Elab Command Qed.Lang
+open Lean Elab Command Term Meta Qed.Lang
 
 structure CheckOrigin where
   callRef    : Syntax
@@ -29,12 +29,10 @@ initialize pendingRpcChecks : IO.Ref (Array PendingRpcCheck) ← IO.mkRef #[]
 initialize pendingPredictChecks : IO.Ref (Array PendingPredictCheck) ← IO.mkRef #[]
 initialize currentCompSessionRef : IO.Ref (Option Ident) ← IO.mkRef none
 
-open Lean Elab Term Meta in
 private def elabArgExprs (argTerms : Array Term) (paramTypeConsts : Array Name) : TermElabM (Array Expr) :=
   argTerms.zipIdx.mapM fun (aT, i) => do
     instantiateMVars (← elabTermEnsuringType aT (Lean.mkConst paramTypeConsts[i]!))
 
-open Lean Elab Term Meta in
 private def extractArgExprsAndRecordRpcCheck (stx : Syntax) (resExpr : Expr)
     (fnConst : Name) (argTerms : Array Term) (paramCount : Nat) (paramTypeConsts : Array Name)
     (srvShort methodName : String) (reqConst? : Option Name) (reqLabel : String)
@@ -51,7 +49,6 @@ private def extractArgExprsAndRecordRpcCheck (stx : Syntax) (resExpr : Expr)
       sessionVar? := (← currentCompSessionRef.get).map (·.getId)
     })
 
-open Lean Elab Term Meta in
 private def lookupCheckedMethod (stx : Syntax) (srvId methId : Ident) (label : String) :
     TermElabM (ServerInfo × ServerMethodInfo) := do
   let srvName := srvId.getId; let methStr := methId.getId.toString
@@ -61,7 +58,6 @@ private def lookupCheckedMethod (stx : Syntax) (srvId methId : Ident) (label : S
     | throwErrorAt stx s!"internal: unknown method `{methStr}` on `{srvName}` in {label}"
   return (srvInfo, mInfo)
 
-open Lean Elab Term Meta in
 @[term_elab qedCheckRpcCallTerm]
 def elabQedCheckRpcCall : TermElab := fun stx expectedType? => do
   let argTerms : Array Term := (stx.getArg 4).getSepArgs.map (⟨·⟩)
@@ -74,7 +70,6 @@ def elabQedCheckRpcCall : TermElab := fun stx expectedType? => do
     (mInfo.hasClientReq || mInfo.requiresAuth)
   return resExpr
 
-open Lean Elab Term Meta in
 @[term_elab qedCheckPredictTerm]
 def elabQedCheckPredict : TermElab := fun stx expectedType? => do
   let argTerms : Array Term := (stx.getArg 4).getSepArgs.map (⟨·⟩)
@@ -95,13 +90,12 @@ def elabQedCheckPredict : TermElab := fun stx expectedType? => do
       })
   return predExpr
 
-open Lean Elab Meta in
 def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
     CommandElabM Unit := do
   let checks ← pendingRpcChecks.get
   let predChecks ← pendingPredictChecks.get
   if checks.isEmpty && predChecks.isEmpty then return
-  let stateConstName ← liftCoreM <| realizeGlobalConstNoOverload (mkIdent (spec.t.getId ++ `State))
+  let stateConstName ← liftCoreM <| realizeGlobalConstNoOverload spec.stateId
   let buildInvProps (lctx : LocalContext) : TermElabM (Array Expr × Option Expr) := do
     let mut invProps : Array Expr := #[]
     let mut stateFVar? : Option Expr := none
@@ -208,14 +202,12 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
         | .error obl =>
             throwErrorAt chk.callRef m!"Predicted response for `{chk.srvShort}.{chk.methodName}` does not satisfy server `ensures` postcondition:{fmtObl obl}\n\nHint: Ensure the predicted value satisfies the server method's `ensures` clause (or guard it inside a `predict:` block)."
 
-open Lean Elab Term Meta in
 private def lookupCheckedChannel (stx : Syntax) (label : String) : TermElabM Qed.ChannelInfo := do
   let chFullName := (stx.getArg 1).getId
   let some chInfo := (Qed.channelRegistry.getState (← getEnv)).find? chFullName
     | throwErrorAt stx s!"internal: unknown channel `{chFullName}` in {label}"
   return chInfo
 
-open Lean Elab Term Meta in
 private def elabAndRecordChanCheck (stx : Syntax) (expectedType? : Option Expr)
     (argTerms : Array Term) (slotLit : TSyntax `str)
     (helperConst : Name) (paramCount : Nat) (paramTypeConsts : Array Name)
@@ -228,7 +220,6 @@ private def elabAndRecordChanCheck (stx : Syntax) (expectedType? : Option Expr)
     srvShort methodName reqConst? reqLabel requiresAuth (reqConst?.isSome || requiresAuth)
   return resExpr
 
-open Lean Elab Term Meta in
 @[term_elab qedCheckChanSubTerm]
 def elabCheckChanSub : TermElab := fun stx expectedType? => do
   let chInfo ← lookupCheckedChannel stx "subscription check"
@@ -237,7 +228,6 @@ def elabCheckChanSub : TermElab := fun stx expectedType? => do
     #[⟨(stx.getArg 7)⟩, ⟨(stx.getArg 9)⟩, ⟨(stx.getArg 11)⟩, ⟨(stx.getArg 13)⟩]
     chInfo.ownerShort chInfo.channelName chInfo.clientReqConst chInfo.clientReqLabel chInfo.requiresAuth
 
-open Lean Elab Term Meta in
 @[term_elab qedCheckChanSendTerm]
 def elabCheckChanSend : TermElab := fun stx expectedType? => do
   let chInfo ← lookupCheckedChannel stx "send check"

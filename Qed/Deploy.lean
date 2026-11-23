@@ -103,9 +103,7 @@ def isValidEgressOrigin (s : String) : Bool :=
     | 'h' :: 't' :: 't' :: 'p' :: 's' :: ':' :: '/' :: '/' :: _ :: _ => true
     | 'h' :: 't' :: 't' :: 'p' :: ':' :: '/' :: '/' :: _ :: _        => true
     | _ => false
-  hasScheme && cs.all fun c =>
-    c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != '\x00' &&
-    decide (32 < c.toNat ∧ c.toNat ≠ 127)
+  hasScheme && cs.all isSafeUrlChar
 
 def validateAuthManifest (a : DeployAuthManifest) : Except String Unit :=
   if !isValidEnvKey a.issuerEnv then .error s!"deploy manifest: invalid auth issuerEnv `{a.issuerEnv}`"

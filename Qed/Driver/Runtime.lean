@@ -395,15 +395,6 @@ private def dispatchMsg (env : RuntimeEnv Model Msg) (msg : Msg) : IO Unit := do
     performCmd env (← applyOne env msg)
     drainPendingQueue env.state (fun qm => do performCmd env (← applyOne env qm)) 1024
 
-private def handleLocalDispatch (env : RuntimeEnv Model Msg) (fullKey : String) (id : UInt32) : IO Unit := do
-  if let some inst := (← env.localCtx.instances.get)[fullKey]? then
-    if let some lm := (← inst.handlers.click.get)[id.toNat]? then
-      localRun env.localCtx fullKey inst lm
-
-private def handleLocalDispatchStr (env : RuntimeEnv Model Msg) (fullKey : String) (id : UInt32) (s : String) : IO Unit := do
-  if let some inst := (← env.localCtx.instances.get)[fullKey]? then
-    dispatchStrWithRows inst.handlers.input inst.handlers.rowEv (localRun env.localCtx fullKey inst) id s
-
 private def handleEffectDone (env : RuntimeEnv Model Msg) (id : UInt32) (result : String) : IO Unit := do
   let st ← env.state.get
   match st.wsTimerCb[id.toNat]? with
@@ -412,14 +403,6 @@ private def handleEffectDone (env : RuntimeEnv Model Msg) (id : UInt32) (result 
       if let some onResult := st.effectCb[id.toNat]? then
         env.state.modify fun s => { s with effectCb := s.effectCb.erase id.toNat }
         dispatchMsg env (onResult result)
-
-private def handlePortRecv (env : RuntimeEnv Model Msg) (name payload : String) : IO Unit := do
-  if let some f := env.app.onPort then
-    if let some m := f name payload then dispatchMsg env m
-
-private def handleSnapshotLocals (env : RuntimeEnv Model Msg) : IO String := do
-  let members := (← env.localCtx.store.get).toList.map (fun (k, v) => (k, Json.str v))
-  return Json.render (Json.obj members)
 
 private def handleRestoreLocals (env : RuntimeEnv Model Msg) (s : String) : IO Unit := do
   if let .ok (.obj members) := Json.parse s then
@@ -446,11 +429,6 @@ private def handleMount (env : RuntimeEnv Model Msg) : IO Unit := do
       env.state.modify fun s => { s with wsBooted := true }
       performCmd env (env.app.onHydrate (← env.state.get).model)
 
-private def handleDispatch (env : RuntimeEnv Model Msg) (id : UInt32) : IO Unit := do
-  match (← env.handlers.click.get)[id.toNat]? with
-  | some msg => dispatchMsg env msg
-  | none     => IO.eprintln s!"qed: unknown click id {id}"
-
 private def handleStreamChunk (env : RuntimeEnv Model Msg) (cid : UInt32) (rawChunk : String) : IO Unit := do
   let st ← env.state.get
   let (events, rem) := parseSseBuffer (st.streamBuf.getD cid.toNat "" ++ rawChunk)
@@ -458,26 +436,12 @@ private def handleStreamChunk (env : RuntimeEnv Model Msg) (cid : UInt32) (rawCh
   if let some f := st.chunkCb[cid.toNat]? then
     for ev in events do dispatchMsg env (f ev)
 
-private def handleStreamDone (env : RuntimeEnv Model Msg) (did : UInt32) : IO Unit := do
-  if let some (cid, msg) := (← env.state.get).doneCb[did.toNat]? then
-    env.state.modify fun s => { s with streamBuf := s.streamBuf.erase cid }
-    dispatchMsg env msg
-
 private def handleHttpResp {α : Type} (env : RuntimeEnv Model Msg) (lens : HttpCbLens Model Msg α)
     (id : UInt32) (res : Except String α) : IO Unit := do
   cancelHttpTimer env id.toNat
   if let some f := (lens.get (← env.state.get))[id.toNat]? then
     env.state.modify (lens.mod (·.erase id.toNat))
     dispatchMsg env (f res)
-
-private def handleHttpDone (env : RuntimeEnv Model Msg) (id : UInt32) (ok : Bool) (text : String) : IO Unit :=
-  handleHttpResp env respCbLens id (if ok then .ok text else .error text)
-
-private def handleHttpBytesDone (env : RuntimeEnv Model Msg) (id : UInt32) (ok : Bool) (bytes : ByteArray) : IO Unit :=
-  handleHttpResp env respBytesCbLens id (if ok then .ok bytes else .error ((String.fromUTF8? bytes).getD "RPC transport error"))
-
-private def handleUrlChanged (env : RuntimeEnv Model Msg) (path : String) : IO Unit := do
-  if let some f := env.app.onUrlChange then dispatchMsg env (f path)
 
 private def withActiveMuxPool (env : RuntimeEnv Model Msg) (cid : UInt32) (url : String)
     (f : WsMuxPool Msg → IO Unit) : IO Unit := do
@@ -533,10 +497,6 @@ private def handleWsBytes (env : RuntimeEnv Model Msg) (cid : UInt32) (bytes : B
   | some (.ext subId) =>
       withActiveExtEntry env cid subId fun entry => dispatchMsg env (entry.handlers.onBytes bytes)
   | none => pure ()
-
-private def handleWsText (env : RuntimeEnv Model Msg) (cid : UInt32) (text : String) : IO Unit := do
-  if let some (.ext subId) := (← env.state.get).wsConnOwner[cid]? then
-    withActiveExtEntry env cid subId fun entry => dispatchMsg env (entry.handlers.onText text)
 
 private def handleWsCloseMux (env : RuntimeEnv Model Msg) (cid : UInt32) (url err : String) (nowMs : Nat) : IO Unit :=
   withActiveMuxPool env cid url fun pool => do
@@ -604,40 +564,50 @@ private def handleWsClose (env : RuntimeEnv Model Msg) (cid : UInt32) (err : Str
   | none              => pure ()
 
 def runWithHttpTimeout (app : App Model Msg) (httpTimeoutMs : Nat) : IO Unit := do
-  let state        ← IO.mkRef ({ model := app.init.1 } : RuntimeState Model Msg)
-  let clickRef     ← IO.mkRef (#[] : Array Msg)
-  let inputRef     ← IO.mkRef (#[] : Array (String → Msg))
-  let rowEvRef     ← IO.mkRef (#[] : Array (Nat → Nat → Option Msg))
+  let state ← IO.mkRef ({ model := app.init.1 } : RuntimeState Model Msg)
   let localCtx : LocalCtx := {
     registry  := app.locals.foldl (fun m d => m.insert d.id d) ∅
     store     := ← IO.mkRef (∅ : Std.HashMap String String)
     instances := ← IO.mkRef (∅ : Std.HashMap String LocalInstance)
   }
-  let handlers : Handlers Msg := {
-    click := clickRef, input := inputRef, rowEv := rowEvRef,
-    mountLocal := fun k c i p b hn => localMountRoot localCtx (fun m => do (← state.get).dispatch m) k c i p b hn
-  }
+  let handlers : Handlers Msg ← Handlers.mkNew fun k c i p b hn =>
+    localMountRoot localCtx (fun m => do (← state.get).dispatch m) k c i p b hn
   let env : RuntimeEnv Model Msg := { app, httpTimeoutMs, state, localCtx, handlers }
   state.modify fun s => { s with dispatch := dispatchMsg env }
   runtimeRef.set (some {
     mount            := handleMount env
-    dispatch         := handleDispatch env
+    dispatch         := fun id => do
+      match (← env.handlers.click.get)[id.toNat]? with
+      | some msg => dispatchMsg env msg
+      | none     => IO.eprintln s!"qed: unknown click id {id}"
     dispatchStr      := fun id s => dispatchStrWithRows env.handlers.input env.handlers.rowEv (dispatchMsg env) id s
     streamChunk      := handleStreamChunk env
-    streamDone       := handleStreamDone env
-    httpDone         := handleHttpDone env
-    httpBytesDone    := handleHttpBytesDone env
-    urlChanged       := handleUrlChanged env
-    localDispatch    := handleLocalDispatch env
-    localDispatchStr := handleLocalDispatchStr env
-    snapshot         := handleSnapshotLocals env
+    streamDone       := fun did => do
+      if let some (cid, msg) := (← env.state.get).doneCb[did.toNat]? then
+        env.state.modify fun s => { s with streamBuf := s.streamBuf.erase cid }
+        dispatchMsg env msg
+    httpDone         := fun id ok text => handleHttpResp env respCbLens id (if ok then .ok text else .error text)
+    httpBytesDone    := fun id ok bytes => handleHttpResp env respBytesCbLens id
+      (if ok then .ok bytes else .error ((String.fromUTF8? bytes).getD "RPC transport error"))
+    urlChanged       := fun path => do if let some f := env.app.onUrlChange then dispatchMsg env (f path)
+    localDispatch    := fun fk id => do
+      if let some inst := (← env.localCtx.instances.get)[fk]? then
+        if let some lm := (← inst.handlers.click.get)[id.toNat]? then localRun env.localCtx fk inst lm
+    localDispatchStr := fun fk id s => do
+      if let some inst := (← env.localCtx.instances.get)[fk]? then
+        dispatchStrWithRows inst.handlers.input inst.handlers.rowEv (localRun env.localCtx fk inst) id s
+    snapshot         := do
+      return Json.render (.obj ((← env.localCtx.store.get).toList.map fun (k, v) => (k, .str v)))
     restore          := handleRestoreLocals env
     dehydrate        := do return env.app.dehydrate (← env.state.get).model
     effectDone       := handleEffectDone env
-    portRecv         := handlePortRecv env
+    portRecv         := fun nm payload => do
+      if let some f := env.app.onPort then if let some m := f nm payload then dispatchMsg env m
     wsOpen           := handleWsOpen env
     wsBytes          := handleWsBytes env
-    wsText           := handleWsText env
+    wsText           := fun cid text => do
+      if let some (.ext subId) := (← env.state.get).wsConnOwner[cid]? then
+        withActiveExtEntry env cid subId fun entry => dispatchMsg env (entry.handlers.onText text)
     wsClose          := handleWsClose env
   })
 

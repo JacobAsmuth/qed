@@ -11,6 +11,11 @@ structure Handlers (msg : Type) where
   rowEv      : IO.Ref (Array (Nat → Nat → Option msg))
   mountLocal : String → String → Option String → String → (String → Option msg) → Dom.Node → IO Unit
 
+def Handlers.mkNew {msg : Type}
+    (mountLocal : String → String → Option String → String → (String → Option msg) → Dom.Node → IO Unit) :
+    IO (Handlers msg) := do
+  return { click := ← IO.mkRef #[], input := ← IO.mkRef #[], rowEv := ← IO.mkRef #[], mountLocal }
+
 def rowEvBase : UInt32 := 0x80000000
 
 def dispatchStrWithRows {msg : Type} (inputRef : IO.Ref (Array (String → msg)))

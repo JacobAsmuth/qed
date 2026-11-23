@@ -11,7 +11,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme, StreamOwned};
 
 use crate::lean_ffi::*;
-use crate::{HandleTable, is_wouldblock, last_errno, lock_unpoison};
+use crate::{HandleTable, bind_loopback_nonblock, is_wouldblock, last_errno, lock_unpoison, rem_timeout_ms};
 
 const POOL_MAX_PER_HOST: usize = 16;
 const POOL_MAX_TOTAL: usize = 128;
@@ -25,15 +25,15 @@ const READ_BUF_CAP: usize = 65536;
 struct NoVerify;
 
 impl ServerCertVerifier for NoVerify {
-    fn verify_server_cert(&self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls13_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
+    fn verify_server_cert(
+        &self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> { Ok(ServerCertVerified::assertion()) }
+    fn verify_tls12_signature(
+        &self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> { Ok(HandshakeSignatureValid::assertion()) }
+    fn verify_tls13_signature(
+        &self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> { Ok(HandshakeSignatureValid::assertion()) }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
     }
@@ -42,21 +42,14 @@ impl ServerCertVerifier for NoVerify {
 static TLS_CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
 
 fn load_extra_ca_certs(roots: &mut RootCertStore) {
-    let path = std::env::var("QED_CA_CERT_FILE")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| std::env::var("SSL_CERT_FILE").ok().filter(|s| !s.trim().is_empty()));
-    let Some(path) = path else { return };
+    let Some(path) = ["QED_CA_CERT_FILE", "SSL_CERT_FILE"].into_iter()
+        .find_map(|k| std::env::var(k).ok().filter(|s| !s.trim().is_empty())) else { return };
     match std::fs::read_to_string(&path) {
         Ok(pem) => {
-            let certs: Vec<CertificateDer<'static>> = crate::parse_pem_blocks(&pem, "CERTIFICATE")
-                .into_iter()
-                .map(CertificateDer::from)
-                .collect();
-            let (added, ignored) = roots.add_parsable_certificates(certs);
-            if added == 0 {
-                eprintln!("warning: no valid CA certificates loaded from `{path}` (ignored: {ignored})");
-            }
+            let (added, ignored) = roots.add_parsable_certificates(
+                crate::parse_pem_blocks(&pem, "CERTIFICATE").into_iter().map(CertificateDer::from),
+            );
+            if added == 0 { eprintln!("warning: no valid CA certificates loaded from `{path}` (ignored: {ignored})"); }
         }
         Err(e) => eprintln!("warning: failed to read CA bundle `{path}`: {e}"),
     }
@@ -65,8 +58,7 @@ fn load_extra_ca_certs(roots: &mut RootCertStore) {
 fn tls_config() -> Arc<ClientConfig> {
     TLS_CONFIG.get_or_init(|| {
         let builder = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .expect("TLS versions");
+            .with_safe_default_protocol_versions().expect("TLS versions");
         let cfg = if std::env::var("QED_INSECURE_SKIP_TLS_VERIFY").as_deref() == Ok("1") {
             builder.dangerous().with_custom_certificate_verifier(Arc::new(NoVerify)).with_no_client_auth()
         } else {
@@ -95,9 +87,8 @@ impl OutStream {
         match self {
             OutStream::Plain(s) => s.read(buf),
             OutStream::Tls(s) => match s.read(buf) {
-                Ok(n) => Ok(n),
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(0),
-                Err(e) => Err(e),
+                r => r,
             },
         }
     }
@@ -114,10 +105,7 @@ struct OutConn {
     stream: OutStream,
 }
 
-struct PoolEntry {
-    conn: OutConn,
-    last_used: Instant,
-}
+struct PoolEntry { conn: OutConn, last_used: Instant }
 
 struct OutboundPool {
     buckets: HashMap<PoolKey, Vec<PoolEntry>>,
@@ -136,9 +124,7 @@ impl OutboundPool {
         while let Some(entry) = vec.pop() {
             self.total -= 1;
             if now.duration_since(entry.last_used) <= POOL_TTL {
-                if vec.is_empty() {
-                    self.buckets.remove(key);
-                }
+                if vec.is_empty() { self.buckets.remove(key); }
                 return Some(entry.conn);
             }
         }
@@ -163,27 +149,19 @@ impl OutboundPool {
             let before = vec.len();
             vec.retain(|e| now.duration_since(e.last_used) <= POOL_TTL);
             self.total -= before - vec.len();
-            while vec.len() >= self.max_per_host {
-                vec.remove(0);
-                self.total -= 1;
-            }
+            while vec.len() >= self.max_per_host { vec.remove(0); self.total -= 1; }
         }
         if self.total >= self.max_total {
             self.sweep_expired(now);
             if self.total >= self.max_total {
                 if let Some(oldest_key) = self.buckets.iter()
                     .filter_map(|(k, v)| v.first().map(|e| (k, e.last_used)))
-                    .min_by_key(|(_, ts)| *ts)
-                    .map(|(k, _)| k.clone())
+                    .min_by_key(|(_, ts)| *ts).map(|(k, _)| k.clone())
                 {
                     if let Some(vec) = self.buckets.get_mut(&oldest_key) {
-                        if !vec.is_empty() {
-                            vec.remove(0);
-                            self.total -= 1;
-                        }
-                        if vec.is_empty() {
-                            self.buckets.remove(&oldest_key);
-                        }
+                        vec.remove(0);
+                        self.total -= 1;
+                        if vec.is_empty() { self.buckets.remove(&oldest_key); }
                     }
                 }
             }
@@ -216,17 +194,12 @@ fn pop_pooled(is_tls: bool, host: &str, port: u16, ssrf_guarded: bool) -> Option
     let key: PoolKey = (is_tls, host.to_owned(), port, ssrf_guarded);
     let pool = global_pool();
     loop {
-        let candidate = lock_unpoison(pool).pop_entry(&key, Instant::now());
-        let conn = candidate?;
-        if socket_is_alive(conn.stream.raw_fd()) {
-            return Some(conn);
-        }
+        let conn = lock_unpoison(pool).pop_entry(&key, Instant::now())?;
+        if socket_is_alive(conn.stream.raw_fd()) { return Some(conn); }
     }
 }
 
-fn insert_active(conn: OutConn) -> u64 {
-    ACTIVE_CONNS.insert(Arc::new(Mutex::new(conn)))
-}
+fn insert_active(conn: OutConn) -> u64 { ACTIVE_CONNS.insert(Arc::new(Mutex::new(conn))) }
 
 fn remove_active(handle: u64) -> Option<OutConn> {
     let arc = ACTIVE_CONNS.remove(handle)?;
@@ -240,18 +213,15 @@ fn wrap_tls(mut sock: TcpStream, host: &str, label: &str) -> Result<OutStream, S
     Ok(OutStream::Tls(Box::new(StreamOwned::new(conn, sock))))
 }
 
-unsafe fn check_ssrf_lean(addrs: &[SocketAddr], is_blocked_fn: *mut LeanObj) -> Result<(), &'static str> {
-    if addrs.is_empty() { return Err("SSRF blocked: empty DNS resolution"); }
+unsafe fn check_ssrf_lean(addrs: &[SocketAddr], is_blocked_fn: *mut LeanObj) -> Result<(), String> {
+    if addrs.is_empty() { return Err("SSRF blocked: empty DNS resolution".to_owned()); }
     for addr in addrs {
-        let ba = match addr.ip() {
-            IpAddr::V4(v4) => mk_ba(&v4.octets()),
-            IpAddr::V6(v6) => mk_ba(&v6.octets()),
-        };
+        let ba = match addr.ip() { IpAddr::V4(v4) => mk_ba(&v4.octets()), IpAddr::V6(v6) => mk_ba(&v6.octets()) };
         qed_lean_inc(is_blocked_fn);
-        let res = qed_lean_apply_1(is_blocked_fn, ba);
+        let res = lean_apply_1(is_blocked_fn, ba);
         let blocked = qed_lean_unbox(res) != 0;
         qed_lean_dec(res);
-        if blocked { return Err("SSRF blocked: private/internal IP address"); }
+        if blocked { return Err("SSRF blocked: private/internal IP address".to_owned()); }
     }
     Ok(())
 }
@@ -279,22 +249,17 @@ pub unsafe extern "C" fn qed_server_outbound_acquire(
     let (want_tls, want_ssrf, host) = (is_tls != 0, ssrf_guard != 0, str_slice(host_obj));
     let res: Result<(u64, usize), String> = (|| {
         if let Some(conn) = pop_pooled(want_tls, host, port, want_ssrf) {
-            if want_ssrf {
-                check_ssrf_lean(&[conn.peer_addr], is_blocked_fn).map_err(str::to_owned)?;
-            }
+            if want_ssrf { check_ssrf_lean(&[conn.peer_addr], is_blocked_fn)?; }
             return Ok((insert_active(conn), 1));
         }
         let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs()
             .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?.collect();
-        if want_ssrf {
-            check_ssrf_lean(&addrs, is_blocked_fn).map_err(str::to_owned)?;
-        }
+        if want_ssrf { check_ssrf_lean(&addrs, is_blocked_fn)?; }
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         let multi = addrs.len() > 1;
         let mut last_err = None;
         let (sock, peer_addr) = addrs.iter().find_map(|&addr| {
-            let rem = deadline.saturating_duration_since(Instant::now());
-            if rem.is_zero() { return None; }
+            let rem = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())?;
             let timeout = if multi { rem.min(MULTI_ADDR_CONNECT_TIMEOUT) } else { rem };
             match TcpStream::connect_timeout(&addr, timeout) {
                 Ok(s) => Some((s, addr)),
@@ -306,14 +271,7 @@ pub unsafe extern "C" fn qed_server_outbound_acquire(
         })?;
         configure_sock(&sock);
         let stream = if want_tls { wrap_tls(sock, host, "TLS")? } else { OutStream::Plain(sock) };
-        let conn = OutConn {
-            is_tls: want_tls,
-            host: host.to_owned(),
-            port,
-            ssrf_guarded: want_ssrf,
-            peer_addr,
-            stream,
-        };
+        let conn = OutConn { is_tls: want_tls, host: host.to_owned(), port, ssrf_guarded: want_ssrf, peer_addr, stream };
         Ok((insert_active(conn), 0))
     })();
     mk_io_except(res, |(id, reused)| qed_lean_mk_prod(qed_lean_usize_to_nat(id as usize), qed_lean_usize_to_nat(reused)))
@@ -331,12 +289,8 @@ pub unsafe extern "C" fn qed_server_outbound_read_some(handle: u64, max_bytes: u
     let want = (max_bytes as usize).clamp(1, READ_BUF_CAP);
     READ_SCRATCH.with(|cell| {
         let mut buf = cell.borrow_mut();
-        if buf.len() < want {
-            buf.resize(READ_BUF_CAP, 0);
-        }
-        let res = with_active_conn(handle, |s| {
-            s.read_some_bytes(&mut buf[..want]).map_err(|e| format!("read failed: {e}"))
-        });
+        if buf.len() < want { buf.resize(READ_BUF_CAP, 0); }
+        let res = with_active_conn(handle, |s| s.read_some_bytes(&mut buf[..want]).map_err(|e| format!("read failed: {e}")));
         mk_io_except(res, |n| mk_ba(&buf[..n]))
     })
 }
@@ -347,20 +301,9 @@ pub unsafe extern "C" fn qed_server_outbound_upgrade_tls(handle: u64, host_obj: 
     let res = match remove_active(handle) {
         None => Err("invalid outbound connection handle".to_owned()),
         Some(conn) => match conn.stream {
-            OutStream::Tls(_) => {
-                ACTIVE_CONNS.insert_at(handle, Arc::new(Mutex::new(conn)));
-                Ok(())
-            }
+            OutStream::Tls(_) => { ACTIVE_CONNS.insert_at(handle, Arc::new(Mutex::new(conn))); Ok(()) }
             OutStream::Plain(sock) => wrap_tls(sock, host, "STARTTLS").map(|stream| {
-                let upgraded = OutConn {
-                    is_tls: true,
-                    host: conn.host,
-                    port: conn.port,
-                    ssrf_guarded: conn.ssrf_guarded,
-                    peer_addr: conn.peer_addr,
-                    stream,
-                };
-                ACTIVE_CONNS.insert_at(handle, Arc::new(Mutex::new(upgraded)));
+                ACTIVE_CONNS.insert_at(handle, Arc::new(Mutex::new(OutConn { is_tls: true, stream, ..conn })));
             }),
         },
     };
@@ -375,9 +318,7 @@ pub unsafe extern "C" fn qed_server_outbound_is_alive(handle: u64) -> *mut LeanO
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_outbound_release(handle: u64, keep_alive: u8) -> *mut LeanObj {
     if let Some(conn) = remove_active(handle) {
-        if keep_alive != 0 {
-            lock_unpoison(global_pool()).push(conn, Instant::now());
-        }
+        if keep_alive != 0 { lock_unpoison(global_pool()).push(conn, Instant::now()); }
     }
     mk_io_unit()
 }
@@ -388,61 +329,41 @@ static LISTENERS: HandleTable<Arc<TcpListener>> = HandleTable::new();
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_free_port() -> *mut LeanObj {
-    let port = TcpListener::bind(("127.0.0.1", 0))
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .unwrap_or(0);
+    let port = TcpListener::bind(("127.0.0.1", 0)).and_then(|l| l.local_addr()).map_or(0, |a| a.port());
     qed_lean_io_mk_ok(qed_lean_box(port as usize))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_tcp_listen(port: u16) -> *mut LeanObj {
-    let res: Result<(u64, u16), String> = (|| {
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .map_err(|_| format!("failed to bind 127.0.0.1:{port}"))?;
-        let actual_port = listener.local_addr()
-            .map_err(|_| "failed to query local TCP address".to_owned())?.port();
-        let _ = listener.set_nonblocking(true);
-        Ok((LISTENERS.insert(Arc::new(listener)), actual_port))
-    })();
+    let res = bind_loopback_nonblock(port).map(|(l, p)| (LISTENERS.insert(Arc::new(l)), p));
     mk_io_except(res, |(id, p)| qed_lean_mk_prod(qed_lean_box_u64(id), qed_lean_box(p as usize)))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_tcp_accept(listener_id: u64, timeout_ms: u32) -> *mut LeanObj {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-    loop {
-        let Some(listener) = LISTENERS.get(listener_id) else {
-            return mk_io_except_err("closed");
-        };
+    let res: Result<u64, String> = loop {
+        let Some(listener) = LISTENERS.get(listener_id) else { break Err("closed".to_owned()); };
         match listener.accept() {
             Ok((sock, peer)) => {
                 let _ = sock.set_nonblocking(false);
                 configure_sock(&sock);
                 let conn = OutConn {
-                    is_tls: false,
-                    host: peer.ip().to_string(),
-                    port: peer.port(),
-                    ssrf_guarded: false,
-                    peer_addr: peer,
-                    stream: OutStream::Plain(sock),
+                    is_tls: false, host: peer.ip().to_string(), port: peer.port(),
+                    ssrf_guarded: false, peer_addr: peer, stream: OutStream::Plain(sock),
                 };
-                return mk_io_except_ok(qed_lean_box_u64(insert_active(conn)));
+                break Ok(insert_active(conn));
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                let now = Instant::now();
-                if now >= deadline {
-                    return mk_io_except_err("timeout");
-                }
-                let rem_ms = (deadline - now).as_millis().clamp(1, i32::MAX as u128) as i32;
-                let rc = crate::poll_in(listener.as_raw_fd(), rem_ms);
-                if rc < 0 && last_errno() != libc::EINTR {
-                    return mk_io_except_err(&format!("tcp accept failed: {}", io::Error::last_os_error()));
+                let Some(rem_ms) = rem_timeout_ms(deadline, 1) else { break Err("timeout".to_owned()); };
+                if crate::poll_in(listener.as_raw_fd(), rem_ms) < 0 && last_errno() != libc::EINTR {
+                    break Err(format!("tcp accept failed: {}", io::Error::last_os_error()));
                 }
             }
-            Err(e) => return mk_io_except_err(&format!("tcp accept failed: {e}")),
+            Err(e) => break Err(format!("tcp accept failed: {e}")),
         }
-    }
+    };
+    mk_io_except(res, |id| qed_lean_box_u64(id))
 }
 
 #[no_mangle]
@@ -462,68 +383,52 @@ mod tests {
         let mut accepted = Vec::new();
         let mut mk = |host: &str, port: u16, ssrf: bool| -> (OutConn, u16) {
             let cli = TcpStream::connect(addr).unwrap();
-            let (srv, _) = listener.accept().unwrap();
-            accepted.push(srv);
-            let local_port = cli.local_addr().unwrap().port();
-            (
-                OutConn {
-                    is_tls: false,
-                    host: host.to_owned(),
-                    port,
-                    ssrf_guarded: ssrf,
-                    peer_addr: addr,
-                    stream: OutStream::Plain(cli),
-                },
-                local_port,
-            )
+            accepted.push(listener.accept().unwrap().0);
+            let lp = cli.local_addr().unwrap().port();
+            (OutConn { is_tls: false, host: host.to_owned(), port, ssrf_guarded: ssrf, peer_addr: addr, stream: OutStream::Plain(cli) }, lp)
         };
-        let local_port = |c: &OutConn| match &c.stream {
-            OutStream::Plain(s) => s.local_addr().unwrap().port(),
-            OutStream::Tls(s) => s.sock.local_addr().unwrap().port(),
-        };
-
         let t0 = Instant::now();
-        let mut pool = OutboundPool::new(2, 3);
+        let at = |s| t0 + Duration::from_secs(s);
+        let pop_port = |pool: &mut OutboundPool, k: &PoolKey, t: Instant| {
+            pool.pop_entry(k, t).map(|c| match &c.stream {
+                OutStream::Plain(s) => s.local_addr().unwrap().port(),
+                OutStream::Tls(s) => s.sock.local_addr().unwrap().port(),
+            })
+        };
 
-        // Per-host cap (2) evicts oldest and pops LIFO
+        let mut pool = OutboundPool::new(2, 3);
+        let (k_a_u, k_a_g, k_b) = (
+            (false, "a.test".to_owned(), 80, false),
+            (false, "a.test".to_owned(), 80, true),
+            (false, "b.test".to_owned(), 80, false),
+        );
+
+        // Per-host cap (2) evicts oldest and pops LIFO; SSRF partition stays isolated
         let (c1, _) = mk("a.test", 80, false);
         let (c2, p2) = mk("a.test", 80, false);
         let (c3, p3) = mk("a.test", 80, false);
-        pool.push(c1, t0);
-        pool.push(c2, t0 + Duration::from_secs(1));
-        pool.push(c3, t0 + Duration::from_secs(2));
+        for (c, s) in [(c1, 0), (c2, 1), (c3, 2)] { pool.push(c, at(s)); }
         assert_eq!(pool.total, 2);
-
-        // SSRF partition isolation: ssrf_guarded=true must NEVER pop ssrf_guarded=false sockets
-        let k_a_unguarded = (false, "a.test".to_owned(), 80, false);
-        let k_a_guarded = (false, "a.test".to_owned(), 80, true);
-        assert!(pool.pop_entry(&k_a_guarded, t0 + Duration::from_secs(2)).is_none());
-
-        let popped1 = pool.pop_entry(&k_a_unguarded, t0 + Duration::from_secs(2)).unwrap();
-        assert_eq!(local_port(&popped1), p3);
-        let popped2 = pool.pop_entry(&k_a_unguarded, t0 + Duration::from_secs(2)).unwrap();
-        assert_eq!(local_port(&popped2), p2);
-        assert!(pool.pop_entry(&k_a_unguarded, t0 + Duration::from_secs(2)).is_none());
+        assert_eq!(pop_port(&mut pool, &k_a_g, at(2)), None);
+        assert_eq!(pop_port(&mut pool, &k_a_u, at(2)), Some(p3));
+        assert_eq!(pop_port(&mut pool, &k_a_u, at(2)), Some(p2));
+        assert_eq!(pop_port(&mut pool, &k_a_u, at(2)), None);
         assert_eq!(pool.total, 0);
 
-        // Global cap (3) evicts globally oldest across hosts & keeps SSRF partitions separate
+        // Global cap (3) evicts globally oldest across hosts & preserves SSRF partition isolation
         let (g1, _) = mk("a.test", 80, true);
         let (g2, gp2) = mk("a.test", 80, true);
         let (b1, _) = mk("b.test", 80, false);
         let (b2, bp2) = mk("b.test", 80, false);
-        pool.push(g1, t0);
-        pool.push(g2, t0 + Duration::from_secs(1));
-        pool.push(b1, t0 + Duration::from_secs(2));
-        pool.push(b2, t0 + Duration::from_secs(3));
+        for (c, s) in [(g1, 0), (g2, 1), (b1, 2), (b2, 3)] { pool.push(c, at(s)); }
         assert_eq!(pool.total, 3);
-        assert!(pool.pop_entry(&k_a_unguarded, t0 + Duration::from_secs(3)).is_none());
-        assert_eq!(local_port(&pool.pop_entry(&k_a_guarded, t0 + Duration::from_secs(3)).unwrap()), gp2);
-        assert!(pool.pop_entry(&k_a_guarded, t0 + Duration::from_secs(3)).is_none());
+        assert_eq!(pop_port(&mut pool, &k_a_u, at(3)), None);
+        assert_eq!(pop_port(&mut pool, &k_a_g, at(3)), Some(gp2));
+        assert_eq!(pop_port(&mut pool, &k_a_g, at(3)), None);
 
         // TTL expiry evicts stale entries deterministically
-        let k_b = (false, "b.test".to_owned(), 80, false);
-        assert_eq!(local_port(&pool.pop_entry(&k_b, t0 + Duration::from_secs(3)).unwrap()), bp2);
-        assert!(pool.pop_entry(&k_b, t0 + POOL_TTL + Duration::from_secs(10)).is_none());
+        assert_eq!(pop_port(&mut pool, &k_b, at(3)), Some(bp2));
+        assert_eq!(pop_port(&mut pool, &k_b, t0 + POOL_TTL + Duration::from_secs(10)), None);
         assert_eq!(pool.total, 0);
     }
 }

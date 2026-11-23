@@ -26,7 +26,6 @@ extern "C" {
     pub fn qed_lean_str_cstr(s: *mut LeanObj) -> *const libc::c_char;
     pub fn qed_lean_str_len(s: *mut LeanObj) -> usize;
     pub fn qed_lean_array_with_cap(cap: usize) -> *mut LeanObj;
-    pub fn qed_lean_array_push(arr: *mut LeanObj, v: *mut LeanObj) -> *mut LeanObj;
     pub fn qed_lean_array_size(arr: *mut LeanObj) -> usize;
     pub fn qed_lean_array_get_core(arr: *mut LeanObj, i: usize) -> *mut LeanObj;
     pub fn qed_lean_ctor_get(o: *mut LeanObj, i: libc::c_uint) -> *mut LeanObj;
@@ -43,14 +42,16 @@ extern "C" {
     pub fn qed_lean_inc(o: *mut LeanObj);
     pub fn qed_lean_dec(o: *mut LeanObj);
     pub fn qed_lean_dec_ref(o: *mut LeanObj);
-    pub fn qed_lean_mark_mt(o: *mut LeanObj);
-    pub fn qed_lean_mark_persistent(o: *mut LeanObj);
-    pub fn qed_lean_apply_1(f: *mut LeanObj, a: *mut LeanObj) -> *mut LeanObj;
-    pub fn qed_lean_apply_4(f: *mut LeanObj, a: *mut LeanObj, b: *mut LeanObj, c: *mut LeanObj, d: *mut LeanObj) -> *mut LeanObj;
-    pub fn qed_lean_apply_5(f: *mut LeanObj, a: *mut LeanObj, b: *mut LeanObj, c: *mut LeanObj, d: *mut LeanObj, e: *mut LeanObj) -> *mut LeanObj;
-    pub fn qed_lean_register_ext(fin: FinalizeProc, fe: ForeachProc) -> *mut LeanExtClass;
     pub fn qed_lean_alloc_ext(cls: *mut LeanExtClass, data: *mut c_void) -> *mut LeanObj;
     pub fn qed_lean_get_ext(o: *mut LeanObj) -> *mut c_void;
+    // Direct `LEAN_EXPORT` runtime symbols from `libleanrt` / `libleanshared`.
+    pub fn lean_array_push(arr: *mut LeanObj, v: *mut LeanObj) -> *mut LeanObj;
+    pub fn lean_mark_mt(o: *mut LeanObj);
+    pub fn lean_mark_persistent(o: *mut LeanObj);
+    pub fn lean_apply_1(f: *mut LeanObj, a: *mut LeanObj) -> *mut LeanObj;
+    pub fn lean_apply_4(f: *mut LeanObj, a: *mut LeanObj, b: *mut LeanObj, c: *mut LeanObj, d: *mut LeanObj) -> *mut LeanObj;
+    pub fn lean_apply_5(f: *mut LeanObj, a: *mut LeanObj, b: *mut LeanObj, c: *mut LeanObj, d: *mut LeanObj, e: *mut LeanObj) -> *mut LeanObj;
+    pub fn lean_register_external_class(fin: FinalizeProc, fe: ForeachProc) -> *mut LeanExtClass;
     pub fn lean_initialize_thread();
     pub fn lean_finalize_thread();
 }
@@ -85,24 +86,19 @@ pub unsafe fn mk_io_unit() -> *mut LeanObj { qed_lean_io_mk_ok(qed_lean_box(0)) 
 pub unsafe fn mk_io_bool(b: bool) -> *mut LeanObj { qed_lean_io_mk_ok(qed_lean_box(b as usize)) }
 
 #[inline]
-pub unsafe fn mk_io_except_err(msg: &str) -> *mut LeanObj {
-    qed_lean_io_mk_ok(qed_lean_mk_ctor_1(0, mk_str(msg)))
+pub unsafe fn mk_io_except<T, E: AsRef<str>>(res: Result<T, E>, to_obj: impl FnOnce(T) -> *mut LeanObj) -> *mut LeanObj {
+    let ctor = match res {
+        Ok(v) => qed_lean_mk_ctor_1(1, to_obj(v)),
+        Err(e) => qed_lean_mk_ctor_1(0, mk_str(e.as_ref())),
+    };
+    qed_lean_io_mk_ok(ctor)
 }
 
 #[inline]
-pub unsafe fn mk_io_except_ok(val: *mut LeanObj) -> *mut LeanObj {
-    qed_lean_io_mk_ok(qed_lean_mk_ctor_1(1, val))
-}
-
-#[inline]
-pub unsafe fn mk_io_except<T, E: AsRef<str>>(
-    res: Result<T, E>,
-    to_obj: impl FnOnce(T) -> *mut LeanObj,
-) -> *mut LeanObj {
-    match res {
-        Ok(v) => mk_io_except_ok(to_obj(v)),
-        Err(e) => mk_io_except_err(e.as_ref()),
-    }
+pub unsafe fn with_io_ok<R>(res: *mut LeanObj, f: impl FnOnce(*mut LeanObj) -> R) -> Option<R> {
+    let out = (qed_lean_io_is_ok(res) != 0).then(|| f(qed_lean_io_val(res)));
+    qed_lean_dec_ref(res);
+    out
 }
 
 /// Owned reference to a `lean_object*` (decrefs on drop).
@@ -112,28 +108,13 @@ unsafe impl Sync for LeanRef {}
 
 impl LeanRef {
     #[inline]
-    pub unsafe fn new_persistent(ptr: *mut LeanObj) -> Self { qed_lean_mark_persistent(ptr); Self(ptr) }
+    pub unsafe fn new_persistent(ptr: *mut LeanObj) -> Self { lean_mark_persistent(ptr); Self(ptr) }
+    #[inline]
+    pub unsafe fn clone_mt(ptr: *mut LeanObj) -> Self { qed_lean_inc(ptr); lean_mark_mt(ptr); Self(ptr) }
     #[inline]
     pub unsafe fn clone_ptr(&self) -> *mut LeanObj { qed_lean_inc(self.0); self.0 }
     #[inline]
     pub fn into_raw(mut self) -> *mut LeanObj { std::mem::replace(&mut self.0, std::ptr::null_mut()) }
-}
-
-/// Zero-copy owned view of a Lean `ByteArray` passed between handler threads and I/O workers.
-pub struct WireBytes(pub LeanRef);
-
-impl WireBytes {
-    #[inline]
-    pub unsafe fn from_borrowed(ba: *mut LeanObj) -> Self {
-        qed_lean_inc(ba);
-        qed_lean_mark_mt(ba);
-        Self(LeanRef(ba))
-    }
-
-    #[inline]
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe { ba_slice(self.0 .0) }
-    }
 }
 
 impl Clone for LeanRef {
@@ -142,4 +123,14 @@ impl Clone for LeanRef {
 
 impl Drop for LeanRef {
     fn drop(&mut self) { if !self.0.is_null() { unsafe { qed_lean_dec(self.0) }; } }
+}
+
+/// Zero-copy owned view of a Lean `ByteArray` passed between handler threads and I/O workers.
+pub struct WireBytes(pub LeanRef);
+
+impl WireBytes {
+    #[inline]
+    pub unsafe fn from_borrowed(ba: *mut LeanObj) -> Self { Self(LeanRef::clone_mt(ba)) }
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] { unsafe { ba_slice(self.0 .0) } }
 }

@@ -10,30 +10,20 @@ static void qed_init_empty_singletons(void) {
     lean_object *ba = lean_alloc_sarray(1, 0, 0);
     lean_mark_persistent(ba);
     __atomic_store_n(&qed_empty_ba, ba, __ATOMIC_RELEASE);
-
     lean_object *s = lean_mk_string("");
     lean_mark_persistent(s);
     __atomic_store_n(&qed_empty_str, s, __ATOMIC_RELEASE);
 }
 
-static inline lean_object *qed_get_empty_ba(void) {
-    lean_object *ba = __atomic_load_n(&qed_empty_ba, __ATOMIC_ACQUIRE);
-    if (__builtin_expect(ba != NULL, 1)) return ba;
+static inline lean_object *qed_get_empty(lean_object **slot) {
+    lean_object *obj = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(obj != NULL, 1)) return obj;
     pthread_once(&qed_empty_once, qed_init_empty_singletons);
-    return __atomic_load_n(&qed_empty_ba, __ATOMIC_ACQUIRE);
-}
-
-static inline lean_object *qed_get_empty_str(void) {
-    lean_object *s = __atomic_load_n(&qed_empty_str, __ATOMIC_ACQUIRE);
-    if (__builtin_expect(s != NULL, 1)) return s;
-    pthread_once(&qed_empty_once, qed_init_empty_singletons);
-    return __atomic_load_n(&qed_empty_str, __ATOMIC_ACQUIRE);
+    return __atomic_load_n(slot, __ATOMIC_ACQUIRE);
 }
 
 lean_object *qed_lean_io_mk_ok(lean_object *v) { return lean_io_result_mk_ok(v); }
-lean_object *qed_lean_io_mk_err(const char *msg) {
-    return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(msg)));
-}
+lean_object *qed_lean_io_mk_err(const char *msg) { return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(msg))); }
 int qed_lean_io_is_ok(lean_object *r) { return lean_io_result_is_ok(r) ? 1 : 0; }
 lean_object *qed_lean_io_val(lean_object *r) { return lean_io_result_get_value(r); }
 
@@ -50,7 +40,7 @@ lean_object *qed_lean_mk_prod(lean_object *a, lean_object *b) {
 }
 
 lean_object *qed_lean_mk_ba(const uint8_t *data, size_t len) {
-    if (len == 0) return qed_get_empty_ba();
+    if (len == 0) return qed_get_empty(&qed_empty_ba);
     lean_object *ba = lean_alloc_sarray(1, len, len);
     if (data) memcpy(lean_sarray_cptr(ba), data, len);
     return ba;
@@ -62,17 +52,15 @@ void qed_lean_ba_set_size(lean_object *ba, size_t sz) { lean_sarray_set_size(ba,
 
 /* Caller (`mk_str(&str)` in Rust) guarantees valid UTF-8. Fast-path unchecked when NUL-free. */
 lean_object *qed_lean_mk_str_bytes(const uint8_t *data, size_t len) {
-    if (len == 0) return qed_get_empty_str();
-    if (memchr(data, 0, len) == NULL) {
-        return lean_mk_string_from_bytes_unchecked((const char *)data, len);
-    }
-    return lean_mk_string_from_bytes((const char *)data, len);
+    if (len == 0) return qed_get_empty(&qed_empty_str);
+    return memchr(data, 0, len) == NULL
+        ? lean_mk_string_from_bytes_unchecked((const char *)data, len)
+        : lean_mk_string_from_bytes((const char *)data, len);
 }
 const char *qed_lean_str_cstr(lean_object *s) { return lean_string_cstr(s); }
 size_t qed_lean_str_len(lean_object *s) { size_t n = lean_string_size(s); return n > 0 ? n - 1 : 0; }
 
 lean_object *qed_lean_array_with_cap(size_t cap) { return lean_alloc_array(0, cap); }
-lean_object *qed_lean_array_push(lean_object *a, lean_object *v) { return lean_array_push(a, v); }
 size_t qed_lean_array_size(lean_object *a) { return lean_array_size(a); }
 lean_object *qed_lean_array_get_core(lean_object *a, size_t i) { return lean_array_get_core(a, i); }
 
@@ -102,20 +90,7 @@ lean_object *qed_lean_box_u64(uint64_t n) { return lean_box_uint64(n); }
 void qed_lean_inc(lean_object *o) { lean_inc(o); }
 void qed_lean_dec(lean_object *o) { lean_dec(o); }
 void qed_lean_dec_ref(lean_object *o) { lean_dec_ref(o); }
-void qed_lean_mark_mt(lean_object *o) { lean_mark_mt(o); }
-void qed_lean_mark_persistent(lean_object *o) { lean_mark_persistent(o); }
 
-lean_object *qed_lean_apply_1(lean_object *f, lean_object *a) { return lean_apply_1(f, a); }
-lean_object *qed_lean_apply_4(lean_object *f, lean_object *a, lean_object *b, lean_object *c, lean_object *d) {
-    return lean_apply_4(f, a, b, c, d);
-}
-lean_object *qed_lean_apply_5(lean_object *f, lean_object *a, lean_object *b, lean_object *c, lean_object *d, lean_object *e) {
-    return lean_apply_5(f, a, b, c, d, e);
-}
-
-lean_external_class *qed_lean_register_ext(lean_external_finalize_proc fin, lean_external_foreach_proc fe) {
-    return lean_register_external_class(fin, fe);
-}
 lean_object *qed_lean_alloc_ext(lean_external_class *cls, void *data) { return lean_alloc_external(cls, data); }
 void *qed_lean_get_ext(lean_object *o) { return lean_get_external_data(o); }
 

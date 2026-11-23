@@ -13,6 +13,7 @@ use crate::{WakeFd, is_wouldblock, last_errno, lock_unpoison};
 const MAX_REQ_HDR_BYTES: usize = 65536;
 const MAX_RX_BUF_BYTES: usize = 34 * 1024 * 1024;
 const MAX_TX_BUF_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TX_SEND_ITERS: usize = 16;
 const MAX_INBOX_BCAST: usize = 16384;
 const MAX_POOL_QUEUE: usize = 8192;
 const MAX_WORKER_CONNS: usize = 4096;
@@ -956,13 +957,20 @@ impl Conn {
     fn send_one(&mut self, poller: &Poller, slice: &[u8], make_chunk: impl FnOnce(usize) -> TxChunk) -> bool {
         if slice.is_empty() { return true; }
         if self.tx.is_empty() {
-            let iov = [libc::iovec { iov_base: slice.as_ptr() as *mut libc::c_void, iov_len: slice.len() }];
-            return match send_iovs(self.fd, &iov) {
-                SendRes::Done(sent) if sent >= slice.len() => true,
-                SendRes::Done(sent) => self.enqueue_chunk(poller, make_chunk(sent)),
-                SendRes::WouldBlock => self.enqueue_chunk(poller, make_chunk(0)),
-                SendRes::Err => false,
-            };
+            let mut off = 0usize;
+            for _ in 0..MAX_TX_SEND_ITERS {
+                let rem = &slice[off..];
+                let iov = [libc::iovec { iov_base: rem.as_ptr() as *mut libc::c_void, iov_len: rem.len() }];
+                match send_iovs(self.fd, &iov) {
+                    SendRes::Done(sent) => {
+                        off += sent;
+                        if off >= slice.len() { return true; }
+                    }
+                    SendRes::WouldBlock => break,
+                    SendRes::Err => return false,
+                }
+            }
+            return self.enqueue_chunk(poller, make_chunk(off));
         }
         if self.tx_bytes.saturating_add(slice.len()) > MAX_TX_BUF_BYTES { return false; }
         self.enqueue_chunk(poller, make_chunk(0))
@@ -1036,16 +1044,15 @@ impl Conn {
     }
 
     fn flush_tx(&mut self, poller: &Poller) -> bool {
-        while !self.tx.is_empty() {
+        for _ in 0..MAX_TX_SEND_ITERS {
+            if self.tx.is_empty() { break; }
             let mut iovs: [libc::iovec; 16] = unsafe { std::mem::zeroed() };
             let mut count = 0usize;
-            let mut total = 0usize;
             for chunk in self.tx.iter().take(16) {
                 let s = chunk.as_slice();
                 if !s.is_empty() {
                     iovs[count] = libc::iovec { iov_base: s.as_ptr() as *mut libc::c_void, iov_len: s.len() };
                     count += 1;
-                    total += s.len();
                 }
             }
             if count == 0 {
@@ -1056,7 +1063,6 @@ impl Conn {
             match send_iovs(self.fd, &iovs[..count]) {
                 SendRes::Done(mut sent) => {
                     self.tx_bytes = self.tx_bytes.saturating_sub(sent);
-                    let full_batch = sent >= total;
                     while sent > 0 {
                         let front_len = self.tx[0].len();
                         if sent >= front_len {
@@ -1067,7 +1073,6 @@ impl Conn {
                             sent = 0;
                         }
                     }
-                    if !full_batch { break; }
                 }
                 SendRes::WouldBlock => break,
                 SendRes::Err => return false,

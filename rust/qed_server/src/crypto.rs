@@ -124,12 +124,16 @@ fn open_beneath_nofollow(dirfd: libc::c_int, rel_path: &str) -> Option<libc::c_i
         let bytes = rel_path.as_bytes();
         if bytes.contains(&0) { return None; }
         let how = OpenHow { flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64, mode: 0, resolve: 0x0C };
-        let mut stack_buf = [0u8; 512];
+        const STACK_PATH_CAP: usize = 512;
+        let mut stack_buf = std::mem::MaybeUninit::<[u8; STACK_PATH_CAP]>::uninit();
         let heap_cstr;
-        let cptr = if bytes.len() < stack_buf.len() {
-            stack_buf[..bytes.len()].copy_from_slice(bytes);
-            stack_buf[bytes.len()] = 0;
-            stack_buf.as_ptr() as *const libc::c_char
+        let cptr = if bytes.len() < STACK_PATH_CAP {
+            let dst = stack_buf.as_mut_ptr() as *mut u8;
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+                *dst.add(bytes.len()) = 0;
+            }
+            dst as *const libc::c_char
         } else {
             heap_cstr = CString::new(bytes).ok()?;
             heap_cstr.as_ptr()

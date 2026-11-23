@@ -121,7 +121,6 @@ impl<T> HandleTable<T> {
     }
     pub(crate) fn insert_at(&self, id: u64, val: T) { self.write(id).insert(id, val); }
     pub(crate) fn remove(&self, id: u64) -> Option<T> { self.write(id).remove(&id) }
-    pub(crate) fn with<R>(&self, id: u64, f: impl FnOnce(&T) -> R) -> Option<R> { self.read(id).get(&id).map(f) }
 }
 
 impl<T: Clone> HandleTable<T> {
@@ -178,7 +177,6 @@ mod tests {
         let ids: Vec<u64> = (0u64..48).map(|v| tbl.insert(v * 10)).collect();
         for (i, &id) in ids.iter().enumerate() {
             assert_eq!(tbl.get(id), Some((i as u64) * 10));
-            assert_eq!(tbl.with(id, |v| *v + 1), Some((i as u64) * 10 + 1));
         }
         tbl.insert_at(ids[3], 999);
         assert_eq!(tbl.get(ids[3]), Some(999));

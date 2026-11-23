@@ -7,20 +7,27 @@ static lean_object *qed_empty_ba = NULL;
 static lean_object *qed_empty_str = NULL;
 
 static void qed_init_empty_singletons(void) {
-    qed_empty_ba = lean_alloc_sarray(1, 0, 0);
-    lean_mark_persistent(qed_empty_ba);
-    qed_empty_str = lean_mk_string("");
-    lean_mark_persistent(qed_empty_str);
+    lean_object *ba = lean_alloc_sarray(1, 0, 0);
+    lean_mark_persistent(ba);
+    __atomic_store_n(&qed_empty_ba, ba, __ATOMIC_RELEASE);
+
+    lean_object *s = lean_mk_string("");
+    lean_mark_persistent(s);
+    __atomic_store_n(&qed_empty_str, s, __ATOMIC_RELEASE);
 }
 
 static inline lean_object *qed_get_empty_ba(void) {
+    lean_object *ba = __atomic_load_n(&qed_empty_ba, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(ba != NULL, 1)) return ba;
     pthread_once(&qed_empty_once, qed_init_empty_singletons);
-    return qed_empty_ba;
+    return __atomic_load_n(&qed_empty_ba, __ATOMIC_ACQUIRE);
 }
 
 static inline lean_object *qed_get_empty_str(void) {
+    lean_object *s = __atomic_load_n(&qed_empty_str, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(s != NULL, 1)) return s;
     pthread_once(&qed_empty_once, qed_init_empty_singletons);
-    return qed_empty_str;
+    return __atomic_load_n(&qed_empty_str, __ATOMIC_ACQUIRE);
 }
 
 lean_object *qed_lean_io_mk_ok(lean_object *v) { return lean_io_result_mk_ok(v); }

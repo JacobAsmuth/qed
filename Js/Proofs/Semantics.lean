@@ -610,10 +610,10 @@ structure StatesMatch (prog : IrProg) (c c0 : Ctx) (inlineJps recJps : List (Nat
   fns_only_jp : ∀ s, jsSt.fns s ≠ none → ∃ j : JoinPointId, s = jp j
   jps_none    : ∀ j : JoinPointId, irSt.jps j.idx = none ↔ jsSt.fns (jp j) = none
   jps_some    : ∀ (j : JoinPointId) xs val capIr, irSt.jps j.idx = some (xs, val, capIr) → (j.idx, xs.size) ∈ recJps →
-    ∃ cVal capJs, jsSt.fns (jp j) = some (xs.toList.map (v ·.x), lowerBody cVal val, capJs) ∧ cVal.names = c0.names ∧ cVal.min = c0.min ∧ cVal.env = c0.env ∧
-      cVal.nonArr = c.nonArr ∧ cVal.projSrc = c.projSrc ∧ cVal.selfFn = c.selfFn ∧ cVal.selfParams = c.selfParams ∧ cVal.directLoop = c.directLoop ∧
-      (∀ p ∈ suffixFrom j.idx recJps, cVal.inlineJps.get? p.1 = none) ∧ (∀ x : VarId, capIr x.idx = capJs (v x)) ∧ (∀ k, (capIr k).noTc) ∧
-      (∀ k, c.nonArr.contains k = true → (capIr k).isNonArr = true) ∧ (xs.toList.map (·.x.idx)).Nodup ∧ BodyWf cVal prog [] (suffixFrom j.idx recJps) (if cVal.directLoop then false else allowTailCont) val
+    ∃ jpsMap capJs, let cVal : Ctx := { c with names := c0.names, min := c0.min, env := c0.env, inlineJps := jpsMap }
+      jsSt.fns (jp j) = some (xs.toList.map (v ·.x), lowerBody cVal val, capJs) ∧
+      (∀ p ∈ suffixFrom j.idx recJps, jpsMap.get? p.1 = none) ∧ (∀ x : VarId, capIr x.idx = capJs (v x)) ∧ (∀ k, (capIr k).noTc) ∧
+      (∀ k, c.nonArr.contains k = true → (capIr k).isNonArr = true) ∧ (xs.toList.map (·.x.idx)).Nodup ∧ BodyWf cVal prog [] (suffixFrom j.idx recJps) (if c.directLoop then false else allowTailCont) val
   rec_ar      : ∀ (j : JoinPointId) ar xs val capIr, (j.idx, ar) ∈ recJps → irSt.jps j.idx = some (xs, val, capIr) → xs.size = ar
   rec_nodup   : (recJps.map Prod.fst).Nodup
   rec_disj    : ∀ p ∈ recJps, c.inlineJps.get? p.1 = none
@@ -677,9 +677,10 @@ theorem StatesMatch.updCall {prog : IrProg} {c c0 : Ctx} {inlineJps recJps allow
    fun s hs => (by rw [hfns] at hs; exact hsm.fns_only_jp s hs), fun j' => (by rw [hfns]; exact hsm.jps_none j'), fun j' xs' val' capIr' hj' hm' => (by rw [hfns]; exact hsm.jps_some j' xs' val' capIr' hj' hm'), hsm.rec_ar, hsm.rec_nodup, hsm.rec_disj, hsm.inline_sub⟩
 theorem StatesMatch.withCtx {prog : IrProg} {c c' c0 : Ctx} {inlineJps inlineJps' recJps allowTailCont} {irSt : IrState} {jsSt : JsState} (hsm : StatesMatch prog c c0 inlineJps recJps allowTailCont irSt jsSt) (hNA : c'.nonArr = c.nonArr) (hPS : c'.projSrc = c.projSrc) (hSF : c'.selfFn = c.selfFn) (hSP : c'.selfParams = c.selfParams) (hDL : c'.directLoop = c.directLoop) (hDisj : ∀ p ∈ recJps, c'.inlineJps.get? p.1 = none) (hIn : ∀ idx ar, (idx, ar) ∈ inlineJps' → ∃ xs, c'.inlineJps.get? idx = some xs ∧ xs.size = ar) :
     StatesMatch prog c' c0 inlineJps' recJps allowTailCont irSt jsSt :=
-  ⟨hsm.env_eq, hsm.heap_eq, hsm.memos_eq, hsm.memos_noTc, hsm.env_noTc, fun k hk => hsm.nonArr_ok k (hNA ▸ hk), hsm.fns_only_jp, hsm.jps_none,
-   fun j' xs' val' capIr' hj' hm' => let ⟨cv, cj, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15⟩ := hsm.jps_some j' xs' val' capIr' hj' hm'
-     ⟨cv, cj, s1, s2, s3, s4, hNA ▸ s5, hPS ▸ s6, hSF ▸ s7, hSP ▸ s8, hDL ▸ s9, s10, s11, s12, fun k hk => s13 k (hNA ▸ hk), s14, s15⟩, hsm.rec_ar, hsm.rec_nodup, hDisj, hIn⟩
+  { hsm with
+    nonArr_ok := fun k hk => hsm.nonArr_ok k (hNA ▸ hk),
+    jps_some := fun j' xs' val' capIr' hj' hm' => by simpa only [hNA, hPS, hSF, hSP, hDL] using hsm.jps_some j' xs' val' capIr' hj' hm',
+    rec_disj := hDisj, inline_sub := hIn }
 theorem findEnv_fap_args (c c0 : Ctx) (f : Name) (ys : Array Arg) (hnames : c.names = c0.names) (henv : c.env = c0.env) (hfe : findEnvDecl c0.env f = some (.fdecl xs₀ ps ty b info)) (hneq : f ≠ `Qed.refMark) : lowerApp c f ys = .call (c0.js f) (ys.toList.map lowerArg) := by
   have hjs : c.js f = c0.js f := by simp [Ctx.js, hnames]
   simp [lowerApp, beq_false_of_ne hneq, henv, hfe, hjs]
@@ -815,10 +816,11 @@ theorem StatesMatch.pushRecJp {prog c c0 inlineJps recJps allowTailCont irSt jsS
     jps_some := fun j' xs' val' capIr' hj' hmem' => (by
       by_cases hjj : j' = j
       · subst hjj; simp only [beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hj'; obtain ⟨rfl, rfl, rfl⟩ := hj'; rw [suffixFrom_head]
-        exact ⟨c, jsSt.env, by simp [bindEnv], hnames, hmin, henv, rfl, rfl, rfl, rfl, rfl, fun p hp => (List.mem_cons.1 hp).elim (fun h => by subst h; exact hcNone) (hsm.rec_disj _), hsm.env_eq, hsm.env_noTc, hsm.nonArr_ok, hnd, hwfVal⟩
+        have hcEq : ({ c with names := c0.names, min := c0.min, env := c0.env, inlineJps := c.inlineJps } : Ctx) = c := by cases c; simp_all
+        exact ⟨c.inlineJps, jsSt.env, by simp [bindEnv, hcEq], fun p hp => (List.mem_cons.1 hp).elim (fun h => by subst h; exact hcNone) (hsm.rec_disj _), hsm.env_eq, hsm.env_noTc, hsm.nonArr_ok, hnd, hcEq.symm ▸ hwfVal⟩
       · have hne : j'.idx ≠ j.idx := fun h => hjj (jp_ext h); simp only [beq_false_of_ne hne, Bool.false_eq_true, ↓reduceIte] at hj'
-        obtain ⟨cv, cj, s1, rest⟩ := hsm.jps_some j' xs' val' capIr' hj' ((List.mem_cons.1 hmem').elim (fun h => absurd (Prod.mk.inj h).1 hne) id)
-        rw [show suffixFrom j'.idx ((j.idx, xs.size) :: recJps) = suffixFrom j'.idx recJps by simp [suffixFrom, beq_false_of_ne hne.symm]]; exact ⟨cv, cj, by simp [bindEnv, beq_false_of_ne (fun h => hne (jp_inj h)), s1], rest⟩),
+        obtain ⟨jm, cj, s1, rest⟩ := hsm.jps_some j' xs' val' capIr' hj' ((List.mem_cons.1 hmem').elim (fun h => absurd (Prod.mk.inj h).1 hne) id)
+        rw [show suffixFrom j'.idx ((j.idx, xs.size) :: recJps) = suffixFrom j'.idx recJps by simp [suffixFrom, beq_false_of_ne hne.symm]]; exact ⟨jm, cj, by simp [bindEnv, beq_false_of_ne (fun h => hne (jp_inj h)), s1], rest⟩),
     rec_ar := fun j' ar xs' val' capIr' hmem' hj' => (by
       by_cases hjj : j' = j
       · subst hjj; simp only [beq_self_eq_true, ↓reduceIte, Option.some.injEq] at hj'; obtain ⟨rfl, rfl, rfl⟩ := hj'; exact (nodup_fst_eq hrecNodup hmem' (.head _) rfl).symm
@@ -827,16 +829,17 @@ theorem StatesMatch.pushRecJp {prog c c0 inlineJps recJps allowTailCont irSt jsS
 theorem StatesMatch.enterRecJp {prog c c0 inlineJps recJps allowTailCont irSt jsSt} (hsm : StatesMatch prog c c0 inlineJps recJps allowTailCont irSt jsSt) (hprogNA : ∀ (nonArr : Std.HashSet Nat) xs as ρ k, nonArr.contains k = true → (∀ m, nonArr.contains m = true → (ρ m).isNonArr = true) → (bindIrParams xs as ρ k).isNonArr = true) (hselfNodup : ∀ sf, c.selfFn = some sf → prog sf ≠ none ∧ c.selfParams.size > 0 ∧ (c.selfParams.toList.map (·.x.idx)).Nodup) {j : JoinPointId} {ys : Array Arg} {xs : Array Param} {val : FnBody} {capIr : Nat → JsVal} (hrec : (j.idx, ys.size) ∈ recJps) (hjir : irSt.jps j.idx = some (xs, val, capIr)) :
     ∃ cVal capJs, jsSt.fns (jp j) = some (xs.toList.map (v ·.x), lowerBody cVal val, capJs) ∧ cVal.names = c0.names ∧ cVal.min = c0.min ∧ cVal.env = c0.env ∧ cVal.selfFn = c.selfFn ∧ cVal.selfParams = c.selfParams ∧ cVal.directLoop = c.directLoop ∧ (∀ sf, cVal.selfFn = some sf → prog sf ≠ none ∧ cVal.selfParams.size > 0 ∧ (cVal.selfParams.toList.map (·.x.idx)).Nodup) ∧ BodyWf cVal prog [] (suffixFrom j.idx recJps) (if cVal.directLoop then false else allowTailCont) val ∧
       StatesMatch prog cVal c0 [] (suffixFrom j.idx recJps) (if cVal.directLoop then false else allowTailCont) { env := bindIrParams xs (ys.toList.map (evalIrArg irSt.env)) capIr, heap := irSt.heap, jps := irSt.jps, memos := irSt.memos } { env := bindMany ((xs.toList.map (v ·.x)).zip (ys.toList.map (evalIrArg irSt.env))) capJs, heap := jsSt.heap, fns := jsSt.fns, memos := jsSt.memos } := by
-  obtain ⟨cVal, capJs, hjjs, hcvN, hcvM, hcvE, hcvNA, hcvPS, hcvSF, hcvSP, hcvDL, hcvInNone, hcapEq, hcapNoTc, hcapNA, hnd, hwfVal⟩ := hsm.jps_some j xs val capIr hjir ((hsm.rec_ar j ys.size xs val capIr hrec hjir) ▸ hrec)
+  obtain ⟨jpsMap, capJs, hjjs, hcvInNone, hcapEq, hcapNoTc, hcapNA, hnd, hwfVal⟩ := hsm.jps_some j xs val capIr hjir ((hsm.rec_ar j ys.size xs val capIr hrec hjir) ▸ hrec)
   have hargsNoTc : ∀ a ∈ ys.toList.map (evalIrArg irSt.env), a.noTc := fun a ha => by rcases List.mem_map.1 ha with ⟨a', _, rfl⟩; exact evalIrArg_noTc hsm.env_noTc a'
-  refine ⟨cVal, capJs, hjjs, hcvN, hcvM, hcvE, hcvSF, hcvSP, hcvDL, by rw [hcvSF, hcvSP]; exact hselfNodup, hwfVal,
+  let cVal : Ctx := { c with names := c0.names, min := c0.min, env := c0.env, inlineJps := jpsMap }
+  refine ⟨cVal, capJs, hjjs, rfl, rfl, rfl, rfl, rfl, rfl, hselfNodup, hwfVal,
     { env_eq := bindIrParams_toList_eq xs _ capIr capJs hnd hcapEq, heap_eq := hsm.heap_eq, memos_eq := hsm.memos_eq, memos_noTc := hsm.memos_noTc, env_noTc := bindIrParams_noTc xs.toList _ capIr hcapNoTc hargsNoTc,
-      nonArr_ok := fun k hk => hprogNA cVal.nonArr xs _ capIr k hk fun m hm => hcapNA m (hcvNA ▸ hm), fns_only_jp := hsm.fns_only_jp, jps_none := hsm.jps_none,
+      nonArr_ok := fun k hk => hprogNA c.nonArr xs _ capIr k hk hcapNA, fns_only_jp := hsm.fns_only_jp, jps_none := hsm.jps_none,
       jps_some := fun j' xs' val' capIr' hj' hmem => (by
-        obtain ⟨cv', cj', s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15⟩ := hsm.jps_some j' xs' val' capIr' hj' (mem_suffixFrom_mem hmem); have hsuf := suffixFrom_idem hsm.rec_nodup hmem
-        refine ⟨cv', cj', s1, s2, s3, s4, hcvNA ▸ s5, hcvPS ▸ s6, hcvSF ▸ s7, hcvSP ▸ s8, hcvDL ▸ s9, fun p hp => s10 p (hsuf ▸ hp), s11, s12, fun k hk => s13 k (by rw [← hcvNA]; exact hk), s14, ?_⟩
-        rw [hsuf, show (if cv'.directLoop then false else if cVal.directLoop then false else allowTailCont) = if cv'.directLoop then false else allowTailCont by rw [hcvDL, ← s9]; cases cv'.directLoop <;> rfl]; exact s15),
-      rec_ar := fun j' ar xs' val' capIr' hmem hj' => hsm.rec_ar j' ar xs' val' capIr' (mem_suffixFrom_mem hmem) hj', rec_nodup := nodup_suffixFrom hsm.rec_nodup, rec_disj := fun p hp => hcvInNone p hp, inline_sub := fun _ _ hm => nomatch hm }⟩
+        have hsuf := suffixFrom_idem hsm.rec_nodup hmem
+        have hdl : (if c.directLoop then false else if c.directLoop then false else allowTailCont) = if c.directLoop then false else allowTailCont := by cases c.directLoop <;> rfl
+        simpa only [cVal, hsuf, hdl] using hsm.jps_some j' xs' val' capIr' hj' (mem_suffixFrom_mem hmem)),
+      rec_ar := fun j' ar xs' val' capIr' hmem hj' => hsm.rec_ar j' ar xs' val' capIr' (mem_suffixFrom_mem hmem) hj', rec_nodup := nodup_suffixFrom hsm.rec_nodup, rec_disj := hcvInNone, inline_sub := fun _ _ hm => nomatch hm }⟩
 
 def refMarkPair (h : CowHeap JsVal) : List JsVal → JsVal × CowHeap JsVal | [.arr id] => let p := h.refMark id; (.num p.1, p.2) | _ => (.num 0, h)
 theorem StatesMatch.updRefMark {prog c c0 inlineJps recJps allowTailCont irSt jsSt} (hsm : StatesMatch prog c c0 inlineJps recJps allowTailCont irSt jsSt) (x : VarId) (vs : List JsVal) :

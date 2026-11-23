@@ -74,13 +74,9 @@ elab "qedDischargeReachable" upd:term:max initT:term:max nm:ident labelLit:str :
     let (bCtx, _) ← mkCachedSimpCtx "reachBool" reachBoolSimpNames
     setGoals <| ← (← getGoals).filterMapM fun g => simpGoalAllHyps g bCtx
     evalTactic (← `(tactic| try (repeat' split)))
-    let mut rem : List MVarId := []
-    for g in (← getGoals) do
-      if ← tryCloseBasic g then continue
-      setGoals [g]
-      try evalTactic (← `(tactic| first | (simp_all; first | decide | omega | rfl | qedAutoClose) | qedAutoClose)) catch _ => pure ()
-      rem := rem ++ (← getGoals)
-    setGoals rem
+    forEachGoal fun g => do
+      if ← tryCloseBasic g then setGoals []
+      else (try evalTactic (← `(tactic| first | (simp_all; first | decide | omega | rfl | qedAutoClose) | qedAutoClose)) catch _ => pure ())
   catch _ => pure ()
   let lbl := labelLit.getString
   Qed.Diag.throwUnsolvedGoals m!"Example `{nm.getId}` failed to prove `{lbl}`:"

@@ -151,8 +151,7 @@ private def runCloseStateGoal (extra : Array Term) : TacticM Unit := do
         | some g' => setGoals (g' :: rest); pure g'
     else do
       let relL := (← namesToSimpLemmas relNames) ++ (← termsToSimpLemmas extra)
-      if !relL.isEmpty then
-        try evalTactic (← `(tactic| simp_all only [$[$relL],*])) catch _ => pure ()
+      if !relL.isEmpty then let _ ← tryTac `(tactic| simp_all only [$[$relL],*])
       let g' :: _ ← getGoals | return
       pure g'
   if ← tryCloseBasic g (reducibleOnly := true) then
@@ -173,46 +172,28 @@ private def runCloseCachedPut (extraL : Array Term) : TacticM Unit := do
   unless anyCached do return
   let extraSimpL ← termsToSimpLemmas extraL
   for _ in [0:8] do
-    let goals ← getGoals
-    if goals.isEmpty then return
-    let mut progressed := false
-    let mut rem : List MVarId := []
-    for g in goals do
-      setGoals [g]
+    if (← getGoals).isEmpty then return
+    let progressedRef ← IO.mkRef false
+    forEachGoal fun g => do
       let tgt ← g.withContext (instantiateMVars (← g.getType))
       if tgt.isAppOfArity ``And 2 && tgt.getUsedConstants.contains `Qed.Cached.all then
-        evalTactic (← `(tactic| apply And.intro))
-        progressed := true
-      else if tgt.isAppOfArity `Qed.Cached.all 3 then
-        let cArg := tgt.getAppArgs[2]!.consumeMData
-        if cArg.isAppOfArity `Qed.Cached.put 5 then
-          let saved ← saveState
-          let allPutId := mkIdent `Qed.Cached.all_put
-          let stripImpId := mkIdent `Qed.Resource.all_stripEnsured_of_imp
-          let ok ← try
-              evalTactic (← `(tactic| apply $allPutId))
-              match ← getGoals with
-              | [gHall, gHr] =>
-                  setGoals [gHall]
-                  evalTactic (← `(tactic| first | assumption | simp_all))
-                  unless (← getUnsolvedGoals).isEmpty do throwError "hall unsolved"
-                  setGoals [gHr]
-                  evalTactic (← `(tactic| (
-                    try (apply $stripImpId; intro _ _hEns; try dsimp only at _hEns; qedDestructExistsHyps);
-                    qedUnfoldPresent [$[$extraL],*];
-                    (try simp_all [$[$extraSimpL],*]);
-                    all_goals (first | rfl | decide | omega | assumption | trivial))))
-                  pure (← getUnsolvedGoals).isEmpty
-              | _ => pure false
-            catch _ => pure false
-          if ok then
-            progressed := true
-            setGoals []
-          else
-            restoreState saved
-      rem := rem ++ (← getGoals)
-    setGoals rem
-    unless progressed do break
+        evalTactic (← `(tactic| apply And.intro)); progressedRef.set true
+      else if tgt.isAppOfArity `Qed.Cached.all 3 && tgt.getAppArgs[2]!.consumeMData.isAppOfArity `Qed.Cached.put 5 then
+        let allPutId := mkIdent `Qed.Cached.all_put
+        let stripImpId := mkIdent `Qed.Resource.all_stripEnsured_of_imp
+        if ← tryRestoreM false id do
+            evalTactic (← `(tactic| apply $allPutId))
+            let [gHall, gHr] ← getGoals | return false
+            setGoals [gHall]; evalTactic (← `(tactic| first | assumption | simp_all))
+            unless (← getUnsolvedGoals).isEmpty do return false
+            setGoals [gHr]
+            evalTactic (← `(tactic| (
+              try (apply $stripImpId; intro _ _hEns; try dsimp only at _hEns; qedDestructExistsHyps);
+              qedUnfoldPresent [$[$extraL],*]; (try simp_all [$[$extraSimpL],*]);
+              all_goals (first | rfl | decide | omega | assumption | trivial))))
+            return (← getUnsolvedGoals).isEmpty
+        then do progressedRef.set true; setGoals []
+    unless ← progressedRef.get do break
 
 elab "qedCloseStateGoal" "[" extra:term,* "]" : tactic => runCloseStateGoal extra.getElems
 elab "qedCloseCachedPut" "[" extra:term,* "]" : tactic => runCloseCachedPut extra.getElems
@@ -251,13 +232,10 @@ elab_rules : tactic
     let env0 ← getEnv
     let cs0 ← collectGoalConsts (← getMainGoal) true
     let appL ← namesToSimpLemmas (relevantAppLemmas env0 cs0)
-    let updL ← if upd.raw.isIdent
-      then pure (#[← `(Lean.Parser.Tactic.simpLemma| $(⟨upd.raw⟩):term)] ++ appL)
-      else match upd with
-        | `((($a:ident).update)) => pure (#[← `(Lean.Parser.Tactic.simpLemma| $a:term)] ++ appL)
-        | `(($a:ident).update)   => pure (#[← `(Lean.Parser.Tactic.simpLemma| $a:term)] ++ appL)
-        | `(($fn:ident $_:term*)) => pure (#[← `(Lean.Parser.Tactic.simpLemma| $fn:term)] ++ appL)
-        | _ => pure appL
+    let updL ← match upd with
+      | `($a:ident) | `(($a:ident).update) | `((($a:ident).update)) | `(($a:ident $_:term*)) =>
+          pure (#[← `(Lean.Parser.Tactic.simpLemma| $a:term)] ++ appL)
+      | _ => pure appL
     let stepTac ← `(tactic|
       (intro m msg h;
        $unfoldPred:tactic;
@@ -278,21 +256,13 @@ elab_rules : tactic
     match init with
     | some initT =>
         let initTac ← mkInitTac usingL pred initT
-        let gs ← (← getMainGoal).apply (mkConst ``And.intro)
-        match gs with
+        match ← (← getMainGoal).apply (mkConst ``And.intro) with
         | [gInit, gStep] =>
-            gInit.setTag `init
-            gStep.setTag `step
-            setGoals [gInit]
-            evalTactic initTac
-            let remInit ← getUnsolvedGoals
-            setGoals [gStep]
-            evalTactic stepTac
-            let remStep ← getUnsolvedGoals
-            setGoals (remInit ++ remStep)
+            gInit.setTag `init; gStep.setTag `step
+            setGoals [gInit]; evalTactic initTac; let remInit ← getUnsolvedGoals
+            setGoals [gStep]; evalTactic stepTac; setGoals (remInit ++ (← getUnsolvedGoals))
         | _ => throwError "internal error splitting invariant init/step goals"
-    | none =>
-        evalTactic stepTac
+    | none => evalTactic stepTac
     throwUnsolvedInvGoals nm
       m!"Invariant `{nm.getId}` failed in `{formatTargetName upd}`:"
       m!"Hint: Guard the failing branch with `if ...:`, fix the update, or weaken the invariant.\n      If the rule does hold, add `using [lemma]` or a manual `:= by` proof."

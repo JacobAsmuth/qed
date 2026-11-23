@@ -200,6 +200,14 @@ theorem App.dehydrate_preserves_of_project {Model Msg : Type} (Inv : Model → P
 
 end Internal
 
+theorem App.guardRehydrate_step_eq_some {Model : Type} (Inv : Model → Prop) [DecidablePred Inv]
+    (rehydrate : String → Option Model) {raw : String} {m' : Model}
+    (h : (match rehydrate raw with | some m => if decide (Inv m) then some m else none | none => none) = some m') :
+    rehydrate raw = some m' ∧ Inv m' := by
+  cases hr : rehydrate raw with
+  | none => simp [hr] at h
+  | some m => simp only [hr] at h; split at h <;> simp at h; subst h; exact ⟨rfl, of_decide_eq_true ‹_›⟩
+
 set_option linter.unusedVariables false in
 def App.guardRehydrateCore {Model Msg : Type} (Inv : Model → Prop) [DecidablePred Inv]
     (app : App Model Msg)
@@ -210,14 +218,8 @@ def App.guardRehydrateCore {Model Msg : Type} (Inv : Model → Prop) [DecidableP
       match app.rehydrate s with
       | some m => if decide (Inv m) then some m else none
       | none   => none
-    dehydrate_view := fun m m' h => by
-      cases hr : app.rehydrate (app.dehydrate m) with
-      | none => simp [hr] at h
-      | some m0 =>
-          simp only [hr] at h
-          split at h <;> simp at h
-          subst h
-          exact app.dehydrate_view m m0 hr }
+    dehydrate_view := fun m m' h =>
+      app.dehydrate_view m m' (App.guardRehydrate_step_eq_some Inv app.rehydrate h).1 }
 
 /-- Attaches dynamic per-route `<head>` metadata (title, description, meta tags, canonical URL, redirect) for SSR. -/
 def App.withHead (f : Model → HeadMeta) (app : App Model Msg) : App Model Msg :=

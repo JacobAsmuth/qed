@@ -111,23 +111,24 @@ private def qedUnfoldHelpers (maxIters : Nat) (allowView : Bool)
 private def simpAllGoalsWith (ctx : Simp.Context) (sp : Simp.SimprocsArray := #[]) : TacticM Unit := do
   setGoals <| ← (← getGoals).filterMapM (simpGoalOnly · ctx sp)
 
-private def runHtmlSimpLoop (maxIters : Nat) (ctx : Simp.Context) (sp : Simp.SimprocsArray) : TacticM Unit := do
+private def runGoalsFixpoint (maxIters : Nat) (step : TacticM Unit) : TacticM Unit := do
   for _ in [0:maxIters] do
     if (← getGoals).isEmpty then return
     let before ← (← getGoals).mapM fun g => g.withContext do instantiateMVars (← g.getType)
+    step
+    if (← getGoals).isEmpty then return
+    if before == (← (← getGoals).mapM fun g => g.withContext do instantiateMVars (← g.getType)) then break
+
+private def runHtmlSimpLoop (maxIters : Nat) (ctx : Simp.Context) (sp : Simp.SimprocsArray) : TacticM Unit :=
+  runGoalsFixpoint maxIters do
     qedUnfoldHelpers 8 true
     if (← getGoals).isEmpty then return
     simpAllGoalsWith ctx sp
     if (← getGoals).isEmpty then return
-    let mut afterSplit : List MVarId := []
-    for g in (← getGoals) do
+    setGoals <| (← (← getGoals).mapM fun g => do
       match ← trySplitTarget g with
-      | some sgs => afterSplit := afterSplit ++ (← sgs.filterMapM (simpGoalOnly · ctx sp))
-      | none     => afterSplit := afterSplit ++ [g]
-    setGoals afterSplit
-    if (← getGoals).isEmpty then return
-    let after ← (← getGoals).mapM fun g => g.withContext do instantiateMVars (← g.getType)
-    if before == after then break
+      | some sgs => sgs.filterMapM (simpGoalOnly · ctx sp)
+      | none     => pure [g]).flatten
 
 /-! ## Direct Proof-Term Builder (`ProveValidM`) -/
 
@@ -355,26 +356,24 @@ private def proveAttrIsLocalCellFalse (msgTy a : Expr) : Nat → Option Expr
   | fuel + 1 =>
       let a := stripLetE 32 a
       if (classifyAttr a).isNonCell then some rflBoolFalse
-      else if a.isAppOfArity ``ite 5 then
+      else
         let args := a.getAppArgs
-        match proveAttrIsLocalCellFalse msgTy args[3]! fuel, proveAttrIsLocalCellFalse msgTy args[4]! fuel with
-        | some pT, some pF =>
-            some <| mkAppN (mkConst ``Qed.Attr.isLocalCell_ite_eq_false)
-              #[msgTy, args[1]!, args[2]!, args[3]!, args[4]!, Expr.lam `_qed_h args[1]! pT .default, Expr.lam `_qed_h (mkApp (mkConst ``Not) args[1]!) pF .default]
-        | _, _ => none
-      else if a.isAppOfArity ``dite 5 then
-        let args := a.getAppArgs
-        match args[3]!.consumeMData, args[4]!.consumeMData with
-        | .lam nT _ bT _, .lam nF _ bF _ =>
-            if !bT.hasLooseBVars && !bF.hasLooseBVars then
-              match proveAttrIsLocalCellFalse msgTy bT fuel, proveAttrIsLocalCellFalse msgTy bF fuel with
-              | some pT, some pF =>
-                  some <| mkAppN (mkConst ``ValidLemmas.attr_isLocalCell_dite_eq_false)
-                    #[msgTy, args[1]!, args[2]!, args[3]!, args[4]!, Expr.lam nT args[1]! pT .default, Expr.lam nF (mkApp (mkConst ``Not) args[1]!) pF .default]
-              | _, _ => none
-            else none
-        | _, _ => none
-      else none
+        let branch? :=
+          if a.isAppOfArity ``ite 5 then
+            some (``Qed.Attr.isLocalCell_ite_eq_false, `_qed_h, `_qed_h, args[3]!, args[4]!)
+          else if a.isAppOfArity ``dite 5 then
+            match args[3]!.consumeMData, args[4]!.consumeMData with
+            | .lam nT _ bT _, .lam nF _ bF _ =>
+                if !bT.hasLooseBVars && !bF.hasLooseBVars then
+                  some (``ValidLemmas.attr_isLocalCell_dite_eq_false, nT, nF, bT, bF)
+                else none
+            | _, _ => none
+          else none
+        branch?.bind fun (lem, nT, nF, bT, bF) => do
+          let pT ← proveAttrIsLocalCellFalse msgTy bT fuel
+          let pF ← proveAttrIsLocalCellFalse msgTy bF fuel
+          return mkAppN (mkConst lem) #[msgTy, args[1]!, args[2]!, args[3]!, args[4]!,
+            .lam nT args[1]! pT .default, .lam nF (mkApp (mkConst ``Not) args[1]!) pF .default]
 
 private def proveAttrHasLocalCellFalse (msgTy attrs : Expr) : Nat → Option Expr
   | 0 => none
@@ -489,19 +488,25 @@ mutual
         let node := node.consumeMData.headBeta
         if let .letE _ _ val body _ := node then return ← proveNode fuel env kind ctxV ctxE msgTy (body.instantiate1 val)
         let args := node.getAppArgs; let fn? := node.getAppFn.constName?
+        let elemArgs? : Option (Expr × Expr × Expr) := match kind with
+          | .html => if node.isAppOfArity ``Html.element 4 || node.isAppOfArity ``Qed.el 4 then some (args[1]!, args[2]!, args[3]!) else none
+          | .view _ _ => if node.isAppOfArity ``View.element 5 || node.isAppOfArity ``V.el 5 then some (args[2]!, args[3]!, args[4]!) else none
+        if let some (tagE, attrsE, kidsE) := elemArgs? then
+          if let some tagS := strLitVal? tagE then
+            if let some (childCtx, childCtxE, hstep, hattrs, hvoid, hcell) ←
+                proveElementCore env kind ctxV msgTy tagE attrsE kidsE tagS then
+              let hkids ← proveNodeList fuel env kind childCtx childCtxE msgTy kidsE
+              return match kind with
+                | .html => mkAppN (mkConst ``Qed.Html.validIn_element_intro)
+                    #[msgTy, ctxE, childCtxE, tagE, attrsE, kidsE, hstep, hattrs, hvoid, hcell, hkids]
+                | .view σ s => mkAppN (mkConst ``View.validIn_render_element_intro)
+                    #[σ, msgTy, ctxE, childCtxE, tagE, attrsE, kidsE, s, hstep, hattrs, hvoid, hcell, hkids]
+          return ← emitValidMVar goalTy
         match kind with
         | .html =>
             if node.isAppOfArity ``Html.text 2 then return ← proveTextValidIn ctxV args[1]! goalTy
             if node.isAppOfArity ``Qed.text 4 then
               match ctxV.mode with | .normal | .option | .textarea | .svg => return rflBoolTrue | _ => pure ()
-            if node.isAppOfArity ``Html.element 4 || node.isAppOfArity ``Qed.el 4 then
-              if let some tagS := strLitVal? args[1]! then
-                if let some (childCtx, childCtxE, hstep, hattrs, hvoid, hcell) ←
-                    proveElementCore env .html ctxV msgTy args[1]! args[2]! args[3]! tagS then
-                  let hkids ← proveNodeList fuel env .html childCtx childCtxE msgTy args[3]!
-                  return mkAppN (mkConst ``Qed.Html.validIn_element_intro)
-                    #[msgTy, ctxE, childCtxE, args[1]!, args[2]!, args[3]!, hstep, hattrs, hvoid, hcell, hkids]
-              return ← emitValidMVar goalTy
             if node.isAppOfArity ``Qed.withKey 3 then
               return mkAppN (mkConst ``Qed.Html.validIn_withKey_intro) #[msgTy, ctxE, args[1]!, args[2]!, ← proveNode fuel env .html ctxV ctxE msgTy args[2]!]
             if node.isAppOfArity ``Html.map 4 then
@@ -534,24 +539,18 @@ mutual
             if let some pf ← proveCtrlFlow? env cfSpec node (proveNode fuel env .html ctxV ctxE msgTy) (proveSplitSubgoal fuel env goalTy) then return pf
             emitValidMVar goalTy
         | .view sigmaTy sExpr =>
-            let loweredHtml? : Option Expr :=
-              if node.isAppOfArity ``View.text 3 || node.isAppOfArity ``V.text 3 then some (mkApp2 (mkConst ``Html.text) msgTy args[2]!)
-              else if node.isAppOfArity ``View.dyn 3 || node.isAppOfArity ``V.dyn 3 then some (mkApp2 (mkConst ``Html.text) msgTy (mkApp args[2]! sExpr))
-              else if node.isAppOfArity ``View.static 3 || node.isAppOfArity ``V.static 3 then some args[2]!
-              else if node.isAppOfArity ``View.dynNode 3 || node.isAppOfArity ``V.dynNode 3 || node.isAppOfArity ``View.ofHtml 3 then some (mkApp args[2]! sExpr)
-              else if node.isAppOfArity ``V.memo 6 then some (mkApp args[4]! (mkApp args[5]! sExpr))
-              else if node.isAppOfArity ``View.memo 3 && args[2]!.consumeMData.isAppOfArity ``SoundMemo.ofLawful 6 then
-                let sm := args[2]!.consumeMData.getAppArgs; some (mkApp sm[4]! (mkApp sm[5]! sExpr))
-              else none
+            let loweredHtml? : Option Expr := match fn?, args.size with
+              | some ``View.text, 3 | some ``V.text, 3 => some (mkApp2 (mkConst ``Html.text) msgTy args[2]!)
+              | some ``View.dyn, 3 | some ``V.dyn, 3 => some (mkApp2 (mkConst ``Html.text) msgTy (mkApp args[2]! sExpr))
+              | some ``View.static, 3 | some ``V.static, 3 => some args[2]!
+              | some ``View.dynNode, 3 | some ``V.dynNode, 3 | some ``View.ofHtml, 3 => some (mkApp args[2]! sExpr)
+              | some ``V.memo, 6 => some (mkApp args[4]! (mkApp args[5]! sExpr))
+              | some ``View.memo, 3 =>
+                  if args[2]!.consumeMData.isAppOfArity ``SoundMemo.ofLawful 6 then
+                    let sm := args[2]!.consumeMData.getAppArgs; some (mkApp sm[4]! (mkApp sm[5]! sExpr))
+                  else none
+              | _, _ => none
             if let some hExpr := loweredHtml? then return ← proveNode fuel env .html ctxV ctxE msgTy hExpr
-            if node.isAppOfArity ``View.element 5 || node.isAppOfArity ``V.el 5 then
-              if let some tagS := strLitVal? args[2]! then
-                if let some (childCtx, childCtxE, hstep, hattrs, hvoid, hcell) ←
-                    proveElementCore env kind ctxV msgTy args[2]! args[3]! args[4]! tagS then
-                  let hkids ← proveNodeList fuel env kind childCtx childCtxE msgTy args[4]!
-                  return mkAppN (mkConst ``View.validIn_render_element_intro)
-                    #[sigmaTy, msgTy, ctxE, childCtxE, args[2]!, args[3]!, args[4]!, sExpr, hstep, hattrs, hvoid, hcell, hkids]
-              return ← emitValidMVar goalTy
             if node.isAppOfArity ``View.showIf 4 || node.isAppOfArity ``V.showIf 4 then
               let pfY ← withHypLam (mkBoolEqTrue (mkApp args[2]! sExpr)) fun _ => proveNode fuel env kind ctxV ctxE msgTy args[3]!
               return mkAppN (mkConst ``View.validIn_render_showIf) #[sigmaTy, msgTy, ctxE, args[2]!, args[3]!, sExpr, pfY]
@@ -636,12 +635,11 @@ mutual
           let pf? : Option Expr ←
             if lhs.isAppOfArity ``Html.valid 2 then
               some <$> proveNode fuel env .html defaultHtmlCtx defaultHtmlCtxExpr lhs.getAppArgs[0]! lhs.getAppArgs[1]!
-            else if lhs.isAppOfArity ``Html.validIn 3 then
+            else if lhs.isAppOfArity ``Html.validIn 3 || lhs.isAppOfArity ``Html.validListIn 3 then
               let a := lhs.getAppArgs
-              match ← htmlCtxVal? a[1]! with | some ctxV => some <$> proveNode fuel env .html ctxV a[1]! a[0]! a[2]! | none => pure none
-            else if lhs.isAppOfArity ``Html.validListIn 3 then
-              let a := lhs.getAppArgs
-              match ← htmlCtxVal? a[1]! with | some ctxV => some <$> proveNodeList fuel env .html ctxV a[1]! a[0]! a[2]! | none => pure none
+              match ← htmlCtxVal? a[1]! with
+              | some ctxV => some <$> (if lhs.isAppOfArity ``Html.validIn 3 then proveNode else proveNodeList) fuel env .html ctxV a[1]! a[0]! a[2]!
+              | none => pure none
             else pure none
           match pf? with | some pf => g'.assign pf | none => modify (·.push g')
 end
@@ -701,12 +699,13 @@ private def diagnoseValidGoal (g : MVarId) : MetaM (Option String) := g.withCont
       | .select | .optgroup => return some "raw text cannot appear directly inside `<select>` (wrap it in `<option>`)"
       | .colgroup => return some "raw text cannot appear directly inside `<colgroup>`"
       | _ => pure ()
-  if lhs.isAppOfArity ``Attr.validKeyValue 2 then
-    if let some msg := (strLitVal? lhs.getAppArgs[0]!).bind diagnoseAttrKey then return some msg
-  if lhs.isAppOfArity ``Attr.valid 2 then
-    let attrE := lhs.getAppArgs[1]!.consumeMData.headBeta
-    if attrE.isAppOfArity ``Attr.attr 3 then
-      if let some msg := (strLitVal? attrE.getAppArgs[1]!).bind diagnoseAttrKey then return some msg
+  let attrKey? :=
+    if lhs.isAppOfArity ``Attr.validKeyValue 2 then some lhs.getAppArgs[0]!
+    else if lhs.isAppOfArity ``Attr.valid 2 then
+      let attrE := lhs.getAppArgs[1]!.consumeMData.headBeta
+      if attrE.isAppOfArity ``Attr.attr 3 then some attrE.getAppArgs[1]! else none
+    else none
+  if let some msg := attrKey?.bind strLitVal? |>.bind diagnoseAttrKey then return some msg
   if lhs.isAppOfArity ``Bool.or 2 then
     let o0 := lhs.getAppArgs[0]!.consumeMData.headBeta
     if o0.isAppOfArity ``Bool.not 1 then
@@ -734,7 +733,7 @@ private def runValidHtmlPipeline : TacticM (Array (MVarId × Option String)) := 
     let fwCtx ← mkSimpCtxWithBase (viewFrameworkUnfolds env) (cacheKey? := some "validHtmlFw")
     runHtmlSimpLoop 4 fwCtx #[← Simp.getSimprocs]
     if !(← getGoals).isEmpty then
-      try evalTactic (← `(tactic| all_goals (first | rfl | decide | (split <;> simp)))) catch _ => pure ()
+      let _ ← tryTac `(tactic| all_goals (first | rfl | decide | (split <;> simp)))
   return preDiags
 
 private def runProveValidHtml : TacticM Unit := do
@@ -801,12 +800,10 @@ private def tryFastFullDehydrateInv (tgt : Expr) : MetaM (Option Expr) := do
     | n + 1, e =>
         let e := e.consumeMData
         if e.isAppOfArity `Qed.Internal.App.withFullDehydrate 4 then some e
-        else match e.getAppFn.constName?, e.getAppArgs with
-        | some fn, args =>
-            if appPassThroughWrappers.contains fn && args.size ≥ 4 then
-              unwrapApp n args[args.size - 1]!
-            else none
-        | _, _ => none
+        else if let some fn := e.getAppFn.constName? then
+          let args := e.getAppArgs
+          if appPassThroughWrappers.contains fn && args.size ≥ 4 then unwrapApp n args[args.size - 1]! else none
+        else none
   let some wfd := unwrapApp 8 appE | return none
   let rt := mkApp2 (mkConst `Qed.Dehydrate.round_trip) modelTy (mkApp2 (mkConst `Qed.Dehydrate.full) modelTy wfd.getAppArgs[2]!)
   let invLam := Expr.lam `_m modelTy (invDom.lowerLooseBVars 1 1) .default
@@ -818,13 +815,11 @@ private def tryFastFullDehydrateInv (tgt : Expr) : MetaM (Option Expr) := do
 private def runProveDehydrateInv : TacticM Unit := do
   let env0 ← getEnv
   if env0.contains `Qed.Internal.App.dehydrate_preserves_of_project && env0.contains `Qed.Dehydrate.full then
-    let saved ← saveState
-    if ← try withMainContext do
+    if ← tryRestoreM false id <| withMainContext do
         let g ← getMainGoal
-        match ← tryFastFullDehydrateInv (← instantiateMVars (← g.getType)) with
-        | some pf => g.assign pf; setGoals []; pure true | none => pure false
-      catch _ => pure false then return
-    restoreState saved
+        let some pf ← tryFastFullDehydrateInv (← instantiateMVars (← g.getType)) | return false
+        g.assign pf; setGoals []; return true
+    then return
   let g0 :: rest ← getGoals | return
   let (fvs, g1) ← g0.introN 4 [`_qed_m, `_qed_m', `_qed_hinv, `_qed_hre]
   let pNames := dehydrateProjLemmas env0
@@ -832,14 +827,13 @@ private def runProveDehydrateInv : TacticM Unit := do
     | setGoals rest; return
   setGoals (g2 :: rest)
   let hreId := mkIdent `_qed_hre; let hinvId := mkIdent `_qed_hinv
-  try evalTactic (← `(tactic| cases $hreId:ident)) catch _ => pure ()
-  try evalTactic (← `(tactic| exact $hinvId:ident)) catch _ => pure ()
+  let _ ← tryTac `(tactic| cases $hreId:ident)
+  let _ ← tryTac `(tactic| exact $hinvId:ident)
   if (← getGoals).isEmpty then return
   qedUnfoldHelpers 6 false (← namesToSimpLemmas pNames) true true
   if !(← getGoals).isEmpty then
-    try evalTactic (← `(tactic|
-      ((repeat' split) <;> first | exact $hinvId:ident | rfl | decide | omega | (simp_all <;> first | exact $hinvId:ident | rfl | decide | omega))))
-    catch _ => pure ()
+    let _ ← tryTac `(tactic|
+      ((repeat' split) <;> first | exact $hinvId:ident | rfl | decide | omega | (simp_all <;> first | exact $hinvId:ident | rfl | decide | omega)))
   if !(← getGoals).isEmpty && env0.contains `Qed.Lang.QedVal.val_id then
     simpAllGoalsWith (← mkCachedSimpCtx "valIdOnly" #[``Qed.Lang.QedVal.val_id]).1
   Qed.Diag.throwUnsolvedGoals
@@ -877,17 +871,11 @@ private def runProveViewEquiv (appId viewId : Ident) : TacticM Unit := do
   closeGoalsByRfl
   if (← getGoals).isEmpty then return
   let fwFull ← namesToSimpLemmas (viewEquivBaseNames ++ viewEquivHelperNames env0)
-  try evalTactic (← `(tactic| try simp [-Qed.V.render_forEach, $[$fwFull],*])) catch _ => pure ()
-  for _ in [0:5] do
-    if (← getGoals).isEmpty then break
-    let before ← (← getGoals).mapM fun g => g.withContext do instantiateMVars (← g.getType)
-    qedUnfoldHelpers 8 true
-    try evalTactic (← `(tactic| try simp [-Qed.V.render_forEach, $[$fwFull],*])) catch _ => pure ()
-    if (← getGoals).isEmpty then break
-    if before == (← (← getGoals).mapM fun g => g.withContext do instantiateMVars (← g.getType)) then break
+  let simpStep : TacticM Unit := do let _ ← tryTac `(tactic| try simp [-Qed.V.render_forEach, $[$fwFull],*])
+  simpStep
+  runGoalsFixpoint 5 do qedUnfoldHelpers 8 true; simpStep
   if !(← getGoals).isEmpty then
-    try evalTactic (← `(tactic| all_goals first | rfl | ((repeat' split) <;> simp_all [Qed.mkCanonicalElem, Qed.onlySignalBind, Qed.Attr.canonical])))
-    catch _ => pure ()
+    let _ ← tryTac `(tactic| all_goals first | rfl | ((repeat' split) <;> simp_all [Qed.mkCanonicalElem, Qed.onlySignalBind, Qed.Attr.canonical]))
 
 elab "qedProveValidHtml" : tactic => runProveValidHtml
 elab "qedProveDehydrateView" : tactic => runProveDehydrateView

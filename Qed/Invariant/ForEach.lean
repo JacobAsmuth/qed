@@ -14,13 +14,6 @@ def extractViewInvPred (childStyled : Ident) : Term.TermElabM Term := do
        inferred, write it explicitly (`<pred> for_each … using {childStyled}`)."
     PrettyPrinter.delab lhs.appFn!
 
-private def tryTac (mk : TacticM (TSyntax `tactic)) (requireClosed : Bool := false) : TacticM Bool := do
-  let saved ← saveState
-  try
-    withoutRecover <| evalTactic (← mk)
-    return !requireClosed || (← getGoals).isEmpty
-  catch _ => restoreState saved; return false
-
 private def forEachDirectTable : Array (Name × Name) := #[
   (``Array.filter, ``Qed.ForEach.forall_filter),
   (``Array.sortBy, ``Qed.ForEach.forall_sortBy),
@@ -87,12 +80,7 @@ elab "forEachLift " upd:ident childInv:ident pred:term : tactic => do
     (intro $m $msg $h
      cases $msg:ident <;>
        simp only [$upd:ident, InvTarget.proj_id, InvTarget.proj_fst])))
-  let mut rem : List MVarId := []
-  for g in (← getGoals) do
-    setGoals [g]
-    runForEachArm childInv elemClose mapClose
-    rem := rem ++ (← getGoals)
-  setGoals rem
+  forEachGoal fun _ => runForEachArm childInv elemClose mapClose
 
 elab "qedDischargeForEach" upd:ident childInv:ident nm:ident pred:term : tactic => do
   evalTactic (← `(tactic| forEachLift $upd $childInv $pred))
@@ -151,15 +139,11 @@ elab "forEachStyleLift " view:ident childStyled:ident : tactic => do
             | (simp [Qed.attrRole, Qed.attrClasses, Qed.hasOneClass]; done)
             | rfl))))
   evalTactic (← `(tactic| (intro m; qedStyleReduce $view)))
-  let mut rem : List MVarId := []
-  for g in (← getGoals) do
-    setGoals [g]
-    if !(← tryTac (pure everyArm) (requireClosed := true)) then
-      let closed ← a11yForEachLiftPairs.anyM fun (mapListLem, mapLem) =>
-        tryTac (requireClosed := true) `(tactic|
-          (rw [$(mkIdent mapListLem):ident]; intro $c _; simpa [$(mkIdent mapLem):ident] using $childStyled $c))
-      unless closed do rem := rem ++ (← getGoals)
-  setGoals rem
+  forEachGoal fun _ => do
+    if ← tryTac (pure everyArm) (requireClosed := true) then return
+    let _ ← a11yForEachLiftPairs.anyM fun (mapListLem, mapLem) =>
+      tryTac (requireClosed := true) `(tactic|
+        (rw [$(mkIdent mapListLem):ident]; intro $c _; simpa [$(mkIdent mapLem):ident] using $childStyled $c))
 
 elab "qedDischargeStyledForEach" view:ident field:ident childStyled:ident nm:ident pred:term : tactic => do
   evalTactic (← `(tactic| forEachStyleLift $view $childStyled))

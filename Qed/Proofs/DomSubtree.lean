@@ -22,13 +22,16 @@ theorem erase_append_right_of_not_mem {α : Type} [BEq α] [LawfulBEq α]
       have hne : (a == x) = false := beq_eq_false_iff_ne.2 (fun h => hnot (by simp [h]))
       simp [hne, ih (fun h => hnot (List.mem_cons_of_mem a h))]
 
-private theorem nodup_reinsert {α : Type} [BEq α] [LawfulBEq α] {pre suf : List α} {c : α}
-    (hnd : (pre ++ suf).Nodup) (hc : c ∉ pre) : (pre ++ c :: suf.erase c).Nodup := by
+private theorem nodup_insert_middle {α : Type} {pre suf : List α} {c : α}
+    (hnd : (pre ++ suf).Nodup) (hpre : c ∉ pre) (hsuf : c ∉ suf) : (pre ++ c :: suf).Nodup := by
   rcases List.nodup_append.1 hnd with ⟨hp, hs, hd⟩
-  refine List.nodup_append.2 ⟨hp, List.nodup_cons.2 ⟨hs.not_mem_erase, hs.erase c⟩, fun a ha b hb => ?_⟩
-  rcases List.mem_cons.1 hb with rfl | hbe
-  · exact fun h => hc (h ▸ ha)
-  · exact hd a ha b (List.mem_of_mem_erase hbe)
+  exact List.nodup_append.2 ⟨hp, List.nodup_cons.2 ⟨hsuf, hs⟩, fun a ha b hb =>
+    (List.mem_cons.1 hb).elim (fun h hEq => hpre (h ▸ hEq ▸ ha)) (hd a ha b)⟩
+
+private theorem nodup_reinsert {α : Type} [BEq α] [LawfulBEq α] {pre suf : List α} {c : α}
+    (hnd : (pre ++ suf).Nodup) (hc : c ∉ pre) : (pre ++ c :: suf.erase c).Nodup :=
+  have ⟨hp, hs, hd⟩ := List.nodup_append.1 hnd
+  nodup_insert_middle (List.nodup_append.2 ⟨hp, hs.erase c, fun a ha b hb => hd a ha b (List.mem_of_mem_erase hb)⟩) hc hs.not_mem_erase
 
 /-- Unified W3C `insertBefore` step theorem: whether `child` is freshly created (`child ∉ suf`)
     or reused from `suf` (`child ∈ suf`), as long as `(pre ++ suf).Nodup` and `child ∉ pre`,
@@ -139,13 +142,8 @@ theorem list_length_le_htmlListNodeCount {msg : Type} :
 
 theorem nodup_snoc_append {α : Type} {pre suf : List α} {cn : α}
     (hnd : (pre ++ suf).Nodup) (hnot : cn ∉ pre ++ suf) : ((pre ++ [cn]) ++ suf).Nodup := by
-  rcases List.nodup_append.1 hnd with ⟨hp, hs, hd⟩
-  have hcns : cn ∉ pre ∧ cn ∉ suf := by simpa [List.mem_append, not_or] using hnot
-  refine List.nodup_append.2 ⟨List.nodup_append.2 ⟨hp, List.pairwise_singleton _ _, fun x hx y hy hEq => by
-    simp only [List.mem_singleton] at hy; subst hy; subst hEq; exact hcns.1 hx⟩, hs, fun x hx y hy hEq => ?_⟩
-  rcases List.mem_append.1 hx with hxp | hxc
-  · exact hd x hxp y hy hEq
-  · simp only [List.mem_singleton] at hxc; subst hxc; subst hEq; exact hcns.2 hy
+  rw [List.append_assoc, List.singleton_append]
+  exact nodup_insert_middle hnd (fun h => hnot (by simp [h])) (fun h => hnot (by simp [h]))
 
 private theorem erase_nat_step (n : Nat) :
     ∀ (xs : List Nat), xs.Nodup → (∀ x ∈ xs, x < n + 1) →
@@ -173,38 +171,23 @@ theorem nodup_lt_length_le :
 
 theorem nodup_nodes_lt_length_le (n : Nat) (xs : List Dom.Node)
     (hnd : xs.Nodup) (hlt : ∀ x ∈ xs, x.toNat < n) : xs.length ≤ n := by
-  have hmapNd : (xs.map UInt32.toNat).Nodup := by
-    clear hlt; induction xs with
-    | nil => exact List.nodup_nil
-    | cons x xs ih =>
-        rcases List.nodup_cons.1 hnd with ⟨hxNot, hxsNd⟩
-        refine List.nodup_cons.2 ⟨fun hm => ?_, ih hxsNd⟩
-        rcases List.mem_map.1 hm with ⟨y, hy, hyEq⟩; exact hxNot ((uint32_eq_of_toNat_eq hyEq) ▸ hy)
   have hmapLt : ∀ k ∈ xs.map UInt32.toNat, k < n := fun k hk => by rcases List.mem_map.1 hk with ⟨y, hy, rfl⟩; exact hlt y hy
-  simpa using nodup_lt_length_le n (xs.map UInt32.toNat) hmapNd hmapLt
+  simpa using nodup_lt_length_le n (xs.map UInt32.toNat) (hnd.map UInt32.toNat fun _ _ h h' => h (uint32_eq_of_toNat_eq h')) hmapLt
 
 theorem nodup_append_replace {α : Type} {pre suf : List α} {x y : α}
-    (hnd : (pre ++ x :: suf).Nodup) (hy : y = x ∨ y ∉ pre ++ x :: suf) : (pre ++ y :: suf).Nodup := by
-  rcases hy with rfl | hnot
-  · exact hnd
-  · rcases List.nodup_append.1 hnd with ⟨hpre, hcons, hdisj⟩
-    rcases List.nodup_cons.1 hcons with ⟨_, hsuf⟩
-    refine List.nodup_append.2 ⟨hpre, List.nodup_cons.2 ⟨fun h => hnot (by simp [h]), hsuf⟩, fun a ha b hb => ?_⟩
-    rcases List.mem_cons.1 hb with rfl | hbs
-    · intro hEq; subst hEq; exact hnot (by simp [ha])
-    · exact hdisj a ha b (.tail _ hbs)
+    (hnd : (pre ++ x :: suf).Nodup) (hy : y = x ∨ y ∉ pre ++ x :: suf) : (pre ++ y :: suf).Nodup :=
+  hy.elim (· ▸ hnd) fun hnot => by
+    rcases List.nodup_append.1 hnd with ⟨hpre, hcons, hdisj⟩
+    exact nodup_insert_middle (List.nodup_append.2 ⟨hpre, (List.nodup_cons.1 hcons).2, fun a ha b hb => hdisj a ha b (.tail _ hb)⟩)
+      (fun h => hnot (by simp [h])) (fun h => hnot (by simp [h]))
 
 theorem nodup_move_to_pre {α : Type} [BEq α] [LawfulBEq α] {pre suf : List α} {x y : α}
     (hnd : (pre ++ suf).Nodup) (hx : x ∈ suf) (hy : y = x ∨ y ∉ pre ++ suf) : ((pre ++ [y]) ++ suf.erase x).Nodup := by
+  rw [List.append_assoc, List.singleton_append]
   rcases List.nodup_append.1 hnd with ⟨hpre, hsuf, hdisj⟩
-  have hyNotPre : y ∉ pre := fun hp => hy.elim (fun h => hdisj _ (h ▸ hp) _ hx rfl) (fun hn => hn (by simp [hp]))
-  have hyNotSufE : y ∉ suf.erase x := fun hs => hy.elim (fun h => hsuf.not_mem_erase (h ▸ hs)) (fun hn => hn (by simp [List.mem_of_mem_erase hs]))
-  refine List.nodup_append.2 ⟨List.nodup_append.2 ⟨hpre, List.pairwise_singleton _ _, fun a ha b hb => by
-    simp only [List.mem_singleton] at hb; subst hb; intro hEq; subst hEq; exact hyNotPre ha⟩,
-    hsuf.erase x, fun a ha b hb => ?_⟩
-  rcases List.mem_append.1 ha with hap | ha1
-  · exact hdisj a hap b (List.mem_of_mem_erase hb)
-  · simp only [List.mem_singleton] at ha1; subst ha1; intro hEq; subst hEq; exact hyNotSufE hb
+  exact nodup_insert_middle (List.nodup_append.2 ⟨hpre, hsuf.erase x, fun a ha b hb => hdisj a ha b (List.mem_of_mem_erase hb)⟩)
+    (fun hp => hy.elim (fun h => hdisj _ (h ▸ hp) _ hx rfl) (fun hn => hn (by simp [hp])))
+    (fun hs => hy.elim (fun h => hsuf.not_mem_erase (h ▸ hs)) (fun hn => hn (by simp [List.mem_of_mem_erase hs])))
 
 
 theorem childNamespace_eq_childNsOf {ns ptag : String} (hns : ns = "" ∨ ns = Dom.svgNs) :

@@ -109,12 +109,14 @@ def getCachedSimpThms (key : String) (names : Array Name) (dsimpOnly : Bool := f
   simpThmsCache.modify (·.insert cacheKey (st, eqns))
   return st
 
+private def mkSimpCtx (cfg : Simp.Config) (thms : Array SimpTheorems) : MetaM Simp.Context := do
+  Simp.mkContext { cfg with failIfUnchanged := false } thms (← getSimpCongrTheorems)
+
 def mkCachedSimpCtx (key : String) (names : Array Name)
     (cfg : Simp.Config := { zetaDelta := false }) (simprocNames : Array Name := #[])
     (dsimpOnly : Bool := false) (withEqns : Bool := true) :
     MetaM (Simp.Context × Simp.SimprocsArray) := do
-  let st ← getCachedSimpThms key names dsimpOnly withEqns
-  return (← Simp.mkContext { cfg with failIfUnchanged := false } #[st] (← getSimpCongrTheorems),
+  return (← mkSimpCtx cfg #[← getCachedSimpThms key names dsimpOnly withEqns],
           ← getCachedSimprocs simprocNames)
 
 def mkDynamicSimpCtx (extraNames : Array Name) (baseKey? : Option (String × Array Name) := none)
@@ -123,11 +125,10 @@ def mkDynamicSimpCtx (extraNames : Array Name) (baseKey? : Option (String × Arr
   let baseSt ← match baseKey? with
     | some (k, ns) => getCachedSimpThms k ns dsimpOnly withEqns
     | none         => pure {}
-  Simp.mkContext { cfg with failIfUnchanged := false } #[← addSimpNames baseSt extraNames dsimpOnly withEqns]
-    (← getSimpCongrTheorems)
+  mkSimpCtx cfg #[← addSimpNames baseSt extraNames dsimpOnly withEqns]
 
-def mkEmptyDsimpCtx (cfg : Simp.Config := {}) : MetaM Simp.Context := do
-  Simp.mkContext { cfg with failIfUnchanged := false } #[] (← getSimpCongrTheorems)
+def mkEmptyDsimpCtx (cfg : Simp.Config := {}) : MetaM Simp.Context :=
+  mkSimpCtx cfg #[]
 
 def mkSimpCtxWithBase (extraNames : Array Name := #[]) (cfg : Simp.Config := {})
     (cacheKey? : Option String := none) (withEqns : Bool := false) : MetaM Simp.Context := do
@@ -136,15 +137,24 @@ def mkSimpCtxWithBase (extraNames : Array Name := #[]) (cfg : Simp.Config := {})
     else match cacheKey? with
       | some k => pure #[base, ← getCachedSimpThms k extraNames false withEqns]
       | none   => pure #[← addSimpNames base extraNames false withEqns]
-  Simp.mkContext { cfg with failIfUnchanged := false } thms (← getSimpCongrTheorems)
+  mkSimpCtx cfg thms
 
-/-! ## MetaM Goal Helpers -/
+/-! ## MetaM & TacticM Goal Helpers -/
 
-def tryGoalM (g : MVarId) (k : MVarId → MetaM MVarId) : MetaM MVarId := do
-  let s ← saveState; try k g catch _ => restoreState s; return g
+def tryRestoreM {m : Type → Type} {s α : Type} [Monad m] [MonadBacktrack s m] [MonadExcept Exception m]
+    (fail : α) (ok : α → Bool) (k : m α) : m α := do
+  let st ← saveState
+  try
+    let r ← k
+    unless ok r do restoreState st
+    return r
+  catch _ => restoreState st; return fail
 
-def tryGoalOptM (g : MVarId) (k : MVarId → MetaM (Option MVarId)) : MetaM (Option MVarId) := do
-  let s ← saveState; try k g catch _ => restoreState s; return some g
+def tryGoalM (g : MVarId) (k : MVarId → MetaM MVarId) : MetaM MVarId :=
+  tryRestoreM g (fun _ => true) (k g)
+
+def tryGoalOptM (g : MVarId) (k : MVarId → MetaM (Option MVarId)) : MetaM (Option MVarId) :=
+  tryRestoreM (some g) (fun _ => true) (k g)
 
 def simpGoalOnly (g : MVarId) (ctx : Simp.Context) (simprocs : Simp.SimprocsArray := #[])
     (fvarIds : Array FVarId := #[]) (simplifyTarget : Bool := true) (dsimpOnly : Bool := false) :
@@ -164,25 +174,28 @@ def trySimpAll (g : MVarId) (ctx : Simp.Context) (sp : Simp.SimprocsArray := #[]
     MetaM (Option MVarId) :=
   tryGoalOptM g fun g => return (← simpAll g ctx sp).1
 
-private def tryGoalSplit (g : MVarId) (k : MetaM (Option (List MVarId))) : MetaM (Option (List MVarId)) := do
-  let s ← saveState
-  try
-    let r ← g.withContext k
-    if r.isNone then restoreState s
-    return r
-  catch _ => restoreState s; return none
-
 def trySplitTarget (g : MVarId) : MetaM (Option (List MVarId)) :=
-  tryGoalSplit g (Meta.splitTarget? g)
+  tryRestoreM none Option.isSome (g.withContext (Meta.splitTarget? g))
 
 def trySplitLocalDecl (g : MVarId) (fv : FVarId) : MetaM (Option (List MVarId)) :=
-  tryGoalSplit g (Meta.splitLocalDecl? g fv)
+  tryRestoreM none Option.isSome (g.withContext (Meta.splitLocalDecl? g fv))
 
-def tryApplyConst (g : MVarId) (c : Name) : MetaM (Option (List MVarId)) := do
-  let s ← saveState; try return some (← g.applyConst c) catch _ => restoreState s; return none
+def tryApplyConst (g : MVarId) (c : Name) : MetaM (Option (List MVarId)) :=
+  tryRestoreM none (fun _ => true) (some <$> g.applyConst c)
 
-def tryReflGoal (g : MVarId) : MetaM Bool := do
-  let s ← saveState; try g.refl; return true catch _ => restoreState s; return false
+def tryReflGoal (g : MVarId) : MetaM Bool :=
+  tryRestoreM false id (do g.refl; return true)
+
+def tryTac (mk : TacticM (TSyntax `tactic)) (requireClosed : Bool := false) : TacticM Bool :=
+  tryRestoreM false id do
+    withoutRecover <| evalTactic (← mk)
+    return !requireClosed || (← getGoals).isEmpty
+
+def forEachGoal (f : MVarId → TacticM Unit) : TacticM Unit := do
+  let mut rem : List MVarId := []
+  for g in (← getGoals) do
+    setGoals [g]; f g; rem := rem ++ (← getGoals)
+  setGoals rem
 
 /-- Extract the collection expression `xs` from a goal of shape `∀ c ∈ xs, P c`. -/
 def extractForEachColl? (tgt : Expr) : Option Expr :=
@@ -330,43 +343,32 @@ def tryCloseTrivial (g : MVarId) (skipTarget : Expr → Bool := fun _ => false)
         if !d.isImplementationDetail && (← isDefEq d.type tgtC) then
           g.assign (mkFVar d.fvarId); return true
       return false
-  let tryClose (k : MetaM Bool) : MetaM Bool := do
-    let s ← saveState
-    try if ← k then return true else restoreState s; return false
-    catch _ => restoreState s; return false
-  if tgtC.isAppOfArity ``Eq 3 then if ← tryClose (do g.refl; return true) then return true
+  if tgtC.isAppOfArity ``Eq 3 then if ← tryReflGoal g then return true
   if tgtC.isAppOfArity ``LE.le 4 || tgtC.isAppOfArity ``GE.ge 4 then
     let args := tgtC.getAppArgs
     if args[2]! == args[3]! then
-      if ← tryClose (return (← g.applyConst ``Nat.le_refl).isEmpty) then return true
+      if ← tryRestoreM false id (return (← g.applyConst ``Nat.le_refl).isEmpty) then return true
   if ← g.assumptionCore then return true
   if tgtC.isAppOfArity ``Or 2 then
-    if ← tryClose (do match ← g.applyConst ``Or.inl with | [gL] => gL.refl; return true | _ => return false) then return true
-    if ← tryClose (do match ← g.applyConst ``Or.inr with | [gR] => gR.assumptionCore | _ => return false) then return true
+    if ← tryRestoreM false id (do match ← g.applyConst ``Or.inl with | [gL] => gL.refl; return true | _ => return false) then return true
+    if ← tryRestoreM false id (do match ← g.applyConst ``Or.inr with | [gR] => gR.assumptionCore | _ => return false) then return true
   return false
 
 def tryDirectDecide (g : MVarId) : MetaM Bool := do
   let tgt ← g.withContext do instantiateMVars (← g.getType)
   if tgt.hasFVar || tgt.hasMVar then return false
-  let s ← saveState
-  try
-    let ok ← g.withContext do
-      let decInst ← synthInstance (mkApp (mkConst ``Decidable) tgt)
-      if ← isDefEq (mkApp2 (mkConst ``Decidable.decide) tgt decInst) (mkConst ``Bool.true) then
-        g.assign (mkApp3 (mkConst ``of_decide_eq_true) tgt decInst (← mkEqRefl (mkConst ``Bool.true)))
-        return true
-      return false
-    unless ok do restoreState s
-    return ok
-  catch _ => restoreState s; return false
+  tryRestoreM false id <| g.withContext do
+    let decInst ← synthInstance (mkApp (mkConst ``Decidable) tgt)
+    if ← isDefEq (mkApp2 (mkConst ``Decidable.decide) tgt decInst) (mkConst ``Bool.true) then
+      g.assign (mkApp3 (mkConst ``of_decide_eq_true) tgt decInst (← mkEqRefl (mkConst ``Bool.true)))
+      return true
+    return false
 
-def tryDirectOmega (g : MVarId) : MetaM Bool := do
-  let s ← saveState
-  try
+def tryDirectOmega (g : MVarId) : MetaM Bool :=
+  tryRestoreM false id do
     let some g' ← g.falseOrByContra | return true
     g'.withContext do Omega.omega ((← getPropHyps).toList.map mkFVar) g' {}
     return true
-  catch _ => restoreState s; return false
 
 def tryCloseBasic (g : MVarId) (skipTarget : Expr → Bool := fun _ => false)
     (reducibleOnly : Bool := false) : MetaM Bool := do
@@ -386,13 +388,11 @@ def splitAndHypsGoal (g0 : MVarId) (existsOnly : Bool := false) (maxIters : Nat 
         let tC := decl.type.consumeMData
         let maybe := isMatchTy tC || match tC.getAppFn with | .const c _ => !isKnownNonRefinedHead c | _ => true
         if maybe then
-          let s ← saveState
-          try
-            if isMatchTy (← g.withContext (whnf tC)) then
-              if let some sg := (← g.cases decl.fvarId)[0]? then
-                nextG? := some sg.mvarId; didSplit := true
-              else restoreState s
-          catch _ => restoreState s
+          if let some g' ← tryRestoreM none Option.isSome do
+              if isMatchTy (← g.withContext (whnf tC)) then
+                return ((← g.cases decl.fvarId)[0]?).map (·.mvarId)
+              return none then
+            nextG? := some g'; didSplit := true
     match nextG? with | some g' => g := g' | none => break
   return (g, didSplit)
 
@@ -408,19 +408,16 @@ def splitGoalAnds (g0 : MVarId) (maxIters : Nat := 64) : MetaM (List MVarId) := 
   loop maxIters [g0]
 
 def tryDeepFallbackTactic (g : MVarId) (extraSimpAll : Array Name := #[]) : TacticM Bool := do
-  let saved ← getGoals; let s ← saveState; setGoals [g]
-  let ok ← try
-      let simpArgs ← namesToSimpLemmas extraSimpAll
-      evalTactic (← `(tactic|
-        first
-          | qedNonlinearClose
-          | (try simp_all [$[$simpArgs],*];
-             try (repeat' (split <;> try simp_all [$[$simpArgs],*]));
-             all_goals (first | omega | decide | rfl))
-          | grind))
-      pure (← getGoals).isEmpty
-    catch _ => pure false
-  unless ok do restoreState s
+  let saved ← getGoals; setGoals [g]
+  let ok ← tryTac (requireClosed := true) do
+    let simpArgs ← namesToSimpLemmas extraSimpAll
+    `(tactic|
+      first
+        | qedNonlinearClose
+        | (try simp_all [$[$simpArgs],*];
+           try (repeat' (split <;> try simp_all [$[$simpArgs],*]));
+           all_goals (first | omega | decide | rfl))
+        | grind)
   setGoals saved; return ok
 
 structure CloseFallbackConfig where
@@ -433,26 +430,23 @@ structure CloseFallbackConfig where
   deepExtraSimpAll : Array Name := #[]
 
 def closeWithFallback (g : MVarId) (cfg : CloseFallbackConfig := {}) : TacticM Bool := do
-  let saved ← getGoals
   if cfg.trySimpStarOmega then
-    let s1 ← saveState
-    let stWithHyps ← g.withContext do
-      let mut st ← getSimpTheorems
-      for d in (← getLCtx) do
-        if !d.isImplementationDetail && !d.isLet && (← try isProp d.type catch _ => pure false) then
-          st ← try st.add (.fvar d.fvarId) #[] d.toExpr catch _ => pure st
-      return st
-    let ctx ← Simp.mkContext { cfg.simpAllCfg with failIfUnchanged := false } #[stWithHyps] (← getSimpCongrTheorems)
-    match ← simpGoalOnly g ctx with
-    | none => setGoals saved; return true
-    | some g' => if ← tryDirectOmega g' then setGoals saved; return true
-    restoreState s1
-  let s2 ← saveState
-  let saCtx ← mkSimpCtxWithBase cfg.simpAllExtra cfg.simpAllCfg
-  match ← trySimpAll g saCtx (← getCachedSimprocs cfg.simpAllSimprocs) with
-  | none => setGoals saved; return true
-  | some g' => if ← tryCloseBasic g' cfg.skipTarget then setGoals saved; return true
-  restoreState s2
+    if ← tryRestoreM false id do
+      let stWithHyps ← g.withContext do
+        let mut st ← getSimpTheorems
+        for d in (← getLCtx) do
+          if !d.isImplementationDetail && !d.isLet && (← try isProp d.type catch _ => pure false) then
+            st ← try st.add (.fvar d.fvarId) #[] d.toExpr catch _ => pure st
+        return st
+      let ctx ← mkSimpCtx cfg.simpAllCfg #[stWithHyps]
+      match ← simpGoalOnly g ctx with | none => return true | some g' => tryDirectOmega g'
+    then return true
+  if ← tryRestoreM false id do
+    let saCtx ← mkSimpCtxWithBase cfg.simpAllExtra cfg.simpAllCfg
+    match ← trySimpAll g saCtx (← getCachedSimprocs cfg.simpAllSimprocs) with
+    | none => return true
+    | some g' => tryCloseBasic g' cfg.skipTarget
+  then return true
   if cfg.tryDeepFallback then tryDeepFallbackTactic g cfg.deepExtraSimpAll else return false
 
 /-! ## Wave 3 Public Entry Point (`Qed.Server.Db` & General Unfold-and-Solve Provers) -/
@@ -475,21 +469,13 @@ def simplifyWithUnfolds (g0 : MVarId) (unfoldNames extraSimpNames : Array Name)
 def solveWithUnfolds (unfoldNames extraSimpNames : Array Name)
     (simprocNames : Array Name := #[]) (simpCfg : Simp.Config := { zetaDelta := true }) :
     TacticM Bool := do
-  let runPass (close : Bool) : TacticM (List MVarId) := do
-    let mut rem : List MVarId := []
-    for g in (← getGoals) do
-      if let some g' ← simplifyWithUnfolds g unfoldNames extraSimpNames simprocNames simpCfg then
-        if !close then rem := rem ++ [g']
-        else if !(← tryCloseBasic g') then
-          let saved ← getGoals; setGoals [g']
-          try evalTactic (← `(tactic| grind)) catch _ => pure ()
-          rem := rem ++ (← getGoals); setGoals saved
-    return rem
-  let s ← saveState
-  let ok ← try let rem ← runPass true; setGoals rem; pure rem.isEmpty catch _ => pure false
-  if ok then return true
-  restoreState s
-  try setGoals (← runPass false) catch _ => pure ()
+  let runPass (close : Bool) : TacticM Unit := forEachGoal fun g => do
+    let some g' ← simplifyWithUnfolds g unfoldNames extraSimpNames simprocNames simpCfg | setGoals []
+    if !close then setGoals [g']
+    else if ← tryCloseBasic g' then setGoals []
+    else do setGoals [g']; let _ ← tryTac `(tactic| grind)
+  if ← tryRestoreM false id (do runPass true; return (← getGoals).isEmpty) then return true
+  try runPass false catch _ => pure ()
   return false
 
 end Qed.Verify.Core

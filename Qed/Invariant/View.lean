@@ -195,27 +195,19 @@ private def runStyleLeafClose (g : MVarId) : TacticM (List MVarId) := do
 
 private def runStyleReduce (view : Ident) : TacticM Unit := do
   runSplitFiniteEnums
-  let gs0 ← getGoals
-  let mut rem : List MVarId := []
-  for g0 in gs0 do
-    if (← g0.withContext (instantiateMVars (← g0.getType))).isFalse then
-      rem := rem ++ [g0]; continue
-    setGoals [g0]
-    try evalTactic (← `(tactic| simp only [$view:ident])) catch _ => pure ()
+  forEachGoal fun g0 => do
+    if (← g0.withContext (instantiateMVars (← g0.getType))).isFalse then return
+    let _ ← tryTac `(tactic| simp only [$view:ident])
     runSplitFiniteEnums
-    for g1 in (← getGoals) do
-      if (← g1.withContext (instantiateMVars (← g1.getType))).isFalse then
-        rem := rem ++ [g1]; continue
-      setGoals [g1]
+    forEachGoal fun g1 => do
+      if (← g1.withContext (instantiateMVars (← g1.getType))).isFalse then return
       runUnfoldViewHelpers
-      try evalTactic (← `(tactic| first | rfl | ((repeat' split); all_goals rfl; done) | skip)) catch _ => pure ()
-      if (← getGoals).isEmpty then continue
+      let _ ← tryTac `(tactic| first | rfl | ((repeat' split); all_goals rfl; done) | skip)
+      if (← getGoals).isEmpty then return
       try runStyleSimpPass catch _ => pure ()
-      if (← getGoals).isEmpty then continue
-      try evalTactic (← `(tactic| repeat' split)) catch _ => pure ()
-      for g2 in (← getGoals) do
-        rem := rem ++ (← runStyleLeafClose g2)
-  setGoals rem
+      if (← getGoals).isEmpty then return
+      let _ ← tryTac `(tactic| repeat' split)
+      setGoals <| (← (← getGoals).mapM runStyleLeafClose).flatten
 
 private def a11yDiagTable : Array (String × (Name → String)) := #[
   ("imgsHaveAlt",       fun v => s!"An `<img>` element in `{v}` is missing an `alt` attribute. Add `alt=\"...\"` (or `alt=\"\"` for decorative images)."),
@@ -229,11 +221,10 @@ private def a11yDiagTable : Array (String × (Name → String)) := #[
 ]
 
 private def diagnoseStyling (predStr : String) (vName : Name) : String × String :=
-  let label := if a11yDiagTable.any (fun (k, _) => predStr.contains k)
-    then "Accessibility invariant" else "Styling invariant"
-  let diag := match a11yDiagTable.find? (fun (k, _) => predStr.contains k) with
-    | some (_, mk) => mk vName
-    | none =>
+  match a11yDiagTable.find? (fun (k, _) => predStr.contains k) with
+  | some (_, mk) => ("Accessibility invariant", mk vName)
+  | none =>
+      let diag :=
         if predStr.contains "roleLacks" || predStr.contains "tagLacks" then
           s!"A matching element in `{vName}` carries a forbidden style class in some branch. Remove that style from the matching element or guard it so it cannot apply there."
         else if predStr.contains "exactlyOne" then
@@ -243,7 +234,7 @@ private def diagnoseStyling (predStr : String) (vName : Name) : String × String
           s!"No element with the required `role`/tag is rendered in some branch of `{vName}`. Check every conditional branch of `{vName}`."
         else
           s!"Check that the matching `role`/tag is rendered and receives exactly one allowed style in every branch of `{vName}`."
-  (label, diag)
+      ("Styling invariant", diag)
 
 private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM Unit := do
   evalTactic (← `(tactic| (intro m; try intro _qed_h_assume)))
@@ -251,20 +242,14 @@ private def runDischargeStyling (view nm : Ident) (predLit : StrLit) : TacticM U
     for ldecl in (← getLCtx) do
       if ldecl.userName == `_qed_h_assume then
         if let .const c _ := (← instantiateMVars ldecl.type).getAppFn then
-          try evalTactic (← `(tactic| simp only [$(mkIdent c):ident] at *)) catch _ => pure ()
+          let _ ← tryTac `(tactic| simp only [$(mkIdent c):ident] at *)
     if let some (_, lhs, _) := (← instantiateMVars (← getMainTarget)).eq? then
       let (fn, args) := (lhs.getAppFn, lhs.getAppArgs)
       if (fn.isConstOf ``Qed.roleHasOneOf || fn.isConstOf ``Qed.tagHasOneOf) && args.size == 4 then
         let chk := mkIdent (if fn.isConstOf ``Qed.roleHasOneOf then ``Qed.hasRole else ``Qed.hasTag)
         evalTactic (← `(tactic| (suffices $chk $(← PrettyPrinter.delab args[1]!) ($view m) = true ∧ _ from this.2; constructor)))
   withOptions (fun o => maxRecDepth.set o (max (maxRecDepth.get o) 16384)) do
-    let gs ← getGoals
-    let mut rem : List MVarId := []
-    for g in gs do
-      setGoals [g]
-      runStyleReduce view
-      rem := rem ++ (← getGoals)
-    setGoals rem
+    forEachGoal fun _ => runStyleReduce view
   let predStr := predLit.getString
   let vName := view.getId
   let (label, diagnosis) := diagnoseStyling predStr vName

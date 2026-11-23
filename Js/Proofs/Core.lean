@@ -15,35 +15,12 @@ open Lean IR
 /-! ## 1. Digit/String Injectivity, Identifier Hygiene, `jsStr` Safety & `reach` Closure -/
 
 @[simp] theorem toString_str_eq (s : String) : toString s = s := rfl
-private def digitVal (c : Char) : Nat := c.toNat - '0'.toNat
-private def fromDigits (ds : List Char) : Nat := ds.foldl (fun acc c => acc * 10 + digitVal c) 0
-private theorem digitVal_digitChar (d : Nat) (hd : d < 10) : digitVal (Nat.digitChar d) = d := by match d, hd with | 0,_|1,_|2,_|3,_|4,_|5,_|6,_|7,_|8,_|9,_ => rfl
-private theorem digitChar_isDigit (d : Nat) (hd : d < 10) : (Nat.digitChar d).isDigit = true := by match d, hd with | 0,_|1,_|2,_|3,_|4,_|5,_|6,_|7,_|8,_|9,_ => rfl
+private def fromDigits (ds : List Char) : Nat := Nat.ofDigitChars 10 ds 0
 
-private theorem toDigitsCore_all_digits (n fuel : Nat) (ds : List Char) (hds : ∀ c ∈ ds, c.isDigit = true) : ∀ c ∈ Nat.toDigitsCore 10 fuel n ds, c.isDigit = true := by
-  induction fuel generalizing n ds with
-  | zero => exact hds
-  | succ _ ih => simp only [Nat.toDigitsCore]; split <;> first
-    | exact fun c hc => (List.mem_cons.1 hc).elim (· ▸ digitChar_isDigit _ (Nat.mod_lt _ (by omega))) (hds c)
-    | exact ih (n / 10) _ fun c hc => (List.mem_cons.1 hc).elim (· ▸ digitChar_isDigit _ (Nat.mod_lt _ (by omega))) (hds c)
-
-private theorem foldl_fromDigits (ds : List Char) (acc : Nat) : ds.foldl (fun a c => a * 10 + digitVal c) acc = acc * 10 ^ ds.length + fromDigits ds := by
-  induction ds generalizing acc with | nil => simp [fromDigits] | cons d rest ih =>
-    have hhd : fromDigits (d :: rest) = digitVal d * 10 ^ rest.length + fromDigits rest := by rw [fromDigits, List.foldl_cons, Nat.zero_mul, Nat.zero_add, ih]
-    rw [List.foldl_cons, ih, hhd, List.length_cons, Nat.pow_succ']; simp only [Nat.add_mul, Nat.mul_assoc, Nat.add_assoc]
-private theorem fromDigits_append (xs ys : List Char) : fromDigits (xs ++ ys) = fromDigits xs * 10 ^ ys.length + fromDigits ys := by unfold fromDigits; rw [List.foldl_append, foldl_fromDigits]; rfl
-private theorem toDigitsCore_append : ∀ (fuel n : Nat) (ds : List Char), Nat.toDigitsCore 10 fuel n ds = Nat.toDigitsCore 10 fuel n [] ++ ds
-  | 0, _, _ => rfl | f + 1, n, ds => by simp only [Nat.toDigitsCore]; split; rfl; rw [toDigitsCore_append f (n / 10) (Nat.digitChar (n % 10) :: ds), toDigitsCore_append f (n / 10) [Nat.digitChar (n % 10)], List.append_assoc]; rfl
-private theorem fromDigits_toDigitsCore : ∀ (fuel n : Nat), n < fuel → fromDigits (Nat.toDigitsCore 10 fuel n []) = n
-  | 0, _, h => by omega
-  | f + 1, n, h => by
-      simp only [Nat.toDigitsCore]; split
-      · have hlt : n < 10 := by omega
-        simp only [fromDigits, List.foldl_cons, List.foldl_nil, Nat.zero_mul, Nat.zero_add, Nat.mod_eq_of_lt hlt, digitVal_digitChar n hlt]
-      · rw [toDigitsCore_append, fromDigits_append, fromDigits_toDigitsCore f (n / 10) (by omega)]; simp only [fromDigits, List.foldl_cons, List.foldl_nil, List.length_singleton, Nat.pow_one, Nat.zero_mul, Nat.zero_add, digitVal_digitChar (n % 10) (Nat.mod_lt _ (by omega))]; omega
-
-theorem nat_toString_digits (n : Nat) : ∀ c ∈ (toString n).toList, c.isDigit = true := by simpa [Nat.toString_eq_repr, Nat.repr, Nat.toDigits] using toDigitsCore_all_digits n (n + 1) [] (fun _ h => nomatch h)
-theorem fromDigits_toString (n : Nat) : fromDigits (toString n).toList = n := by simpa [Nat.toString_eq_repr, Nat.repr, Nat.toDigits] using fromDigits_toDigitsCore (n + 1) n (Nat.lt_succ_self n)
+theorem nat_toString_digits (n : Nat) : ∀ c ∈ (toString n).toList, c.isDigit = true := by
+  simpa [Nat.toString_eq_repr, Nat.toList_repr] using fun c hc => Nat.isDigit_of_mem_toDigits (by decide) (by decide) hc
+theorem fromDigits_toString (n : Nat) : fromDigits (toString n).toList = n := by
+  simp [fromDigits, Nat.toString_eq_repr, Nat.toList_repr, Nat.ofDigitChars_ten_toDigits]
 theorem nat_toString_inj {a b : Nat} (h : toString a = toString b) : a = b := by rw [← fromDigits_toString a, ← fromDigits_toString b, h]
 theorem nat_repr_inj {a b : Nat} (h : Nat.repr a = Nat.repr b) : a = b := nat_toString_inj (by simpa [Nat.toString_eq_repr] using h)
 private theorem pref_nat_inj (pfx : String) {a b : Nat} (h : pfx ++ toString a = pfx ++ toString b) : a = b :=

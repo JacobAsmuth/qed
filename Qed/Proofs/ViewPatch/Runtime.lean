@@ -15,31 +15,21 @@ theorem diffRowSigs_sound {msg : Type} (rowSig : Nat → Array (String × String
   intro i; induction hrem : newMarks.size - i generalizing i with
   | zero =>
       intro accSigs accEmit accEv hiLe hsz hprev; have hge : ¬ i < newMarks.size := by omega
-      dsimp only; rw [diffRowSigs.eq_1]; simp only [hge, ↓reduceDIte]; refine ⟨by omega, fun k hk => hprev k (by omega)⟩
+      dsimp only; rw [diffRowSigs.eq_1]; simp only [hge, ↓reduceDIte]
+      exact ⟨by omega, fun k hk => hprev k (by omega)⟩
   | succ _ ih =>
       intro accSigs accEmit accEv hiLe hsz hprev; have hlt : i < newMarks.size := by omega
       dsimp only; rw [diffRowSigs.eq_1]; simp only [hlt, ↓reduceDIte]
-      have hpush : ∀ (v : Array (String × String)), v = rowSig i →
-          ∀ ae aev,
-          let (outSigs, _) := diffRowSigs rowSig rowEv inst newMarks oldMarks oldSigs (i + 1) (accSigs.push v) ae aev
-          outSigs.size = newMarks.size ∧ ∀ k, k < newMarks.size → outSigs[k]! = rowSig k := by
-        intro v hv ae aev
-        apply ih (i + 1) (by omega) (accSigs.push v) ae aev (by omega) (by simp [hsz])
-        intro k hk; have hkLtPush : k < (accSigs.push v).size := by simp [hsz]; omega
-        by_cases hki : k < i
-        · have hkLt : k < accSigs.size := by omega
-          rw [getElem!_pos _ k hkLtPush, Array.getElem_push_lt hkLt, ← getElem!_pos accSigs k hkLt]
-          exact hprev k hki
-        · have heq : k = i := by omega
-          subst heq
-          have hPushIdx : (accSigs.push v)[k]'hkLtPush = v := by subst hsz; exact Array.getElem_push_eq
-          rw [getElem!_pos _ k hkLtPush, hPushIdx, hv]
+      have hstep (v : Array (String × String)) (hv : v = rowSig i) (ae aev) :=
+        ih (i + 1) (by omega) (accSigs.push v) ae aev (by omega) (by simp [hsz]) fun k hk => by
+          rw [getElem!_pos _ k (by simp [hsz]; omega)]
+          exact array_push_step_inv (f := fun j _ => rowSig j) hlt hsz
+            (fun j hj => by rw [← getElem!_pos accSigs j (by omega)]; exact hprev j hj) hv k hk
       by_cases hskip : (newMarks[i] != 0 && oldMarks[i]? == some newMarks[i]) = true
       · simp only [hskip, ↓reduceIte]
         simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at hskip
-        exact hpush _ (hmark i hlt (by simpa [hlt] using hskip.1) (by simpa [hlt] using hskip.2)).symm accEmit accEv
-      · simp only [hskip, Bool.false_eq_true, ↓reduceIte]
-        exact hpush _ rfl _ _
+        exact hstep _ (hmark i hlt (by simpa [hlt] using hskip.1) (by simpa [hlt] using hskip.2)).symm _ _
+      · simp only [hskip, Bool.false_eq_true, ↓reduceIte]; exact hstep _ rfl _ _
 
 theorem seedRowsM_spec {msg : Type} (inst : String) (rowSig : Nat → Array (String × String))
     (rowEv : Nat → Array (String × msg))
@@ -150,10 +140,22 @@ theorem gcLocalsSpec_frame (isConn : String → Bool) (st : LocalRuntimeSpec) (k
 def snapshotLocalsJson (entries : List (String × String)) : String :=
   Json.render (Json.obj (entries.map fun (k, v) => (k, .str v)))
 
+private def localJsonStep (st : Std.HashMap String String) (kv : String × Json) : Std.HashMap String String :=
+  match kv.2 with | .str str => st.insert kv.1 str | _ => st
+
 def restoreLocalsFromJson (s : String) (base : Std.HashMap String String) : Std.HashMap String String :=
   match Json.parse s with
-  | .ok (.obj members) => members.foldl (fun st (k, v) => match v with | .str str => st.insert k str | _ => st) base
+  | .ok (.obj members) => members.foldl localJsonStep base
   | _ => base
+
+private theorem foldl_localJsonStep_not_mem :
+    ∀ (rs : List (String × String)) (b : Std.HashMap String String) (k : String),
+      k ∉ rs.map Prod.fst → ((rs.map fun (k, v) => (k, Json.str v)).foldl localJsonStep b)[k]? = b[k]?
+  | [], _, _, _ => rfl
+  | q :: qt, b, k, hnm => by
+      have hne : q.1 ≠ k := fun h => hnm (h ▸ .head _)
+      simpa [List.foldl_cons, localJsonStep, Std.HashMap.getElem?_insert, beq_eq_false_iff_ne.2 hne]
+        using foldl_localJsonStep_not_mem qt (b.insert q.1 q.2) k (fun hm => hnm (.tail _ hm))
 
 theorem snapshot_restore_locals_roundtrip (entries : List (String × String))
     (hnd : (entries.map Prod.fst).Nodup) (base : Std.HashMap String String) :
@@ -163,25 +165,17 @@ theorem snapshot_restore_locals_roundtrip (entries : List (String × String))
     have : Json.maxObj (entries.map fun x => (x.1, Json.str x.2)) ≤ 0 :=
       Json.maxObj_le_iff.2 fun _ hkv => by rcases List.mem_map.1 hkv with ⟨_, _, rfl⟩; exact Nat.le_refl _
     dsimp only [Json.depth]; omega
-  have hpr := parse_render hdep
-  let step := fun (st : Std.HashMap String String) (kv : String × Json) => match kv.2 with | .str str => st.insert kv.1 str | _ => st
-  have hpres : ∀ (rs : List (String × String)) (b : Std.HashMap String String) (k : String),
-      k ∉ rs.map Prod.fst → ((rs.map fun (k, v) => (k, Json.str v)).foldl step b)[k]? = b[k]? := fun rs => by
-    induction rs with
-    | nil => intro _ _ _; rfl
-    | cons q qt ihr =>
-        intro b k hnm; have hne : q.1 ≠ k := fun h => hnm (h ▸ .head _)
-        simpa [List.foldl_cons, step, Std.HashMap.getElem?_insert, beq_eq_false_iff_ne.2 hne] using ihr (b.insert q.1 q.2) k (fun hm => hnm (.tail _ hm))
   have hfold : ∀ (es : List (String × String)) (b : Std.HashMap String String), (es.map Prod.fst).Nodup →
-      ∀ kv ∈ es, ((es.map fun (k, v) => (k, Json.str v)).foldl step b)[kv.1]? = some kv.2 := fun es => by
-    induction es with
+      ∀ kv ∈ es, ((es.map fun (k, v) => (k, Json.str v)).foldl localJsonStep b)[kv.1]? = some kv.2 := by
+    intro es; induction es with
     | nil => intro _ _ _ hm; nomatch hm
     | cons kv rest ih =>
         intro b hnde p hp; rcases List.nodup_cons.1 hnde with ⟨hnotin, hndr⟩
         rcases List.mem_cons.1 hp with rfl | ht
-        · simpa [List.foldl_cons, step] using (hpres rest (b.insert p.1 p.2) p.1 hnotin).trans (by simp)
+        · simpa [List.foldl_cons, localJsonStep]
+            using (foldl_localJsonStep_not_mem rest (b.insert p.1 p.2) p.1 hnotin).trans (by simp)
         · exact ih (b.insert kv.1 kv.2) hndr p ht
-  simpa [restoreLocalsFromJson, snapshotLocalsJson, hpr, step] using hfold entries base hnd
+  simpa [restoreLocalsFromJson, snapshotLocalsJson, parse_render hdep] using hfold entries base hnd
 
 def drainQueueSpec {σ Msg : Type} (step : σ → Msg → σ × List Msg) :
     Nat → σ → Array Msg → σ × Array Msg
@@ -200,12 +194,13 @@ theorem drainPendingQueue_fifo_spec {σ Msg : Type} (step : σ → Msg → σ)
   | succ f =>
       dsimp only [drainQueueSpec]
       by_cases hemp : q.isEmpty
-      · have hnil : q.toList = [] := by cases q; simp_all
-        simp [hemp, hnil]
+      · cases q; simp_all
       · simp only [hemp, Bool.false_eq_true, ↓reduceIte]
         have hfold : ∀ (ms : List Msg) (s : σ) (acc : List Msg),
-            ms.foldl (fun p m => (step p.1 m, p.2 ++ [])) (s, acc) = (ms.foldl step s, acc) := by
-          intro ms; induction ms with | nil => intro _ _; rfl | cons m ms ih => intro s acc; simpa [List.foldl_cons] using ih (step s m) acc
+            ms.foldl (fun p m => (step p.1 m, p.2 ++ [])) (s, acc) = (ms.foldl step s, acc) := fun ms => by
+          induction ms with
+          | nil => exact fun _ _ => rfl
+          | cons m ms ih => exact fun s acc => by simpa [List.foldl_cons] using ih (step s m) acc
         rw [hfold q.toList st []]; cases f <;> simp [drainQueueSpec]
 
 private theorem renderSigAttrs_of_dynValGets_empty {σ msg : Type} (s : σ) (pre : String) :
@@ -372,27 +367,17 @@ theorem patchNodeSlotAt_nextId {msg : Type} (a : DomArena msg) (n : Dom.Node)
     (path : List Nat) (attrName val : String) :
     (patchNodeSlotAt a n path attrName val).nextId = a.nextId := by
   induction path generalizing n with
-  | nil =>
-      dsimp only [patchNodeSlotAt]
-      split
-      · rfl
-      · split <;> rfl
+  | nil => dsimp only [patchNodeSlotAt]; split <;> first | rfl | (split <;> rfl)
   | cons idx rest ih =>
       dsimp only [patchNodeSlotAt]
       cases a.get n with
-      | element _ _ _ _ cs =>
-          dsimp only
-          cases cs[idx]? with
-          | none => rfl
-          | some child => exact ih child
+      | element _ _ _ _ cs => dsimp only; cases cs[idx]? with | none => rfl | some child => exact ih child
       | _ => rfl
 
 theorem patchNodeSlotAt_text_root {msg : Type} (a : DomArena msg) (n : Dom.Node) (old val : String)
     (hget : a.get n = .text old) :
     (patchNodeSlotAt a n [] "" val).get n = .text val ∧
-    ∀ m, m ≠ n → (patchNodeSlotAt a n [] "" val).get m = a.get m := by
-  refine ⟨?_, ?_⟩
-  · simp [patchNodeSlotAt, DomArena.modify, hget]
-  · intro m hm; simp [patchNodeSlotAt, DomArena.modify, hm]
+    ∀ m, m ≠ n → (patchNodeSlotAt a n [] "" val).get m = a.get m :=
+  ⟨by simp [patchNodeSlotAt, DomArena.modify, hget], fun m hm => by simp [patchNodeSlotAt, DomArena.modify, hm]⟩
 
 end Qed

@@ -60,12 +60,12 @@ def Attr.localInit {msg S : Type} [ToJson S] (a : Attr msg) (init : S) : Attr ms
   cases a <;> rfl
 
 theorem Attr.valid_localProps_intro {msg P : Type} [ToJson P] (a : Attr msg) (props : P)
-    (ha : a.valid = true) : (a.localProps props).valid = true := by
-  rw [Attr.valid_localProps]; exact ha
+    (ha : a.valid = true) : (a.localProps props).valid = true :=
+  Attr.valid_localProps a props ▸ ha
 
 theorem Attr.valid_localInit_intro {msg S : Type} [ToJson S] (a : Attr msg) (init : S)
-    (ha : a.valid = true) : (a.localInit init).valid = true := by
-  rw [Attr.valid_localInit]; exact ha
+    (ha : a.valid = true) : (a.localInit init).valid = true :=
+  Attr.valid_localInit a init ▸ ha
 
 @[simp] theorem Attr.valid_localMount (component key : String) :
     (localMount component key : Attr msg).valid = true := rfl
@@ -117,15 +117,12 @@ theorem LocalDef.dedupe_ids_nodup (ds : List LocalDef) :
           exact hany (Array.any_iff_exists.2 ⟨i, hi', Nat.zero_le _, hi', by simp [hgetA, hid]⟩)
         simp only [Bool.eq_false_iff.2 hany, Bool.false_eq_true, ↓reduceIte,
           Array.toList_push, List.map_append, List.map_singleton]
-        dsimp only at hnd
-        rw [List.nodup_iff_pairwise_ne] at hnd ⊢
-        exact List.pairwise_append.2 ⟨hnd, List.pairwise_singleton _ _,
-          fun x hx z hz hxz => by simp only [List.mem_singleton] at hz; exact hnotMem (hz ▸ hxz ▸ hx)⟩
+        exact List.nodup_append.2 ⟨hnd, List.pairwise_singleton _ _,
+          fun x hx _ hz hxz => hnotMem (List.mem_singleton.1 hz ▸ hxz ▸ hx)⟩
 
 theorem LocalDef.decode_toJson_eq {S : Type} [LawfulJson S] (s init : S)
     (hdepth : LawfulJson.depthBound S ≤ 64) :
     ((Json.parse (Json.render (toJson s))).bind FromJson.fromJson).toOption.getD init = s := by
-  rw [LawfulJson.parse_render_toJson s hdepth]
-  rfl
+  rw [LawfulJson.parse_render_toJson s hdepth]; rfl
 
 end Qed

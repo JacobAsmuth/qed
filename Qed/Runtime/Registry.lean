@@ -4,11 +4,11 @@ import Lean
 
 namespace Qed.Internal
 
-open Lean Elab Term Meta in
+open Lean Elab Term Meta
+
 private def isFrameworkRoot (env : Environment) (n : Name) : Bool :=
   Qed.Diag.isToolchainRoot (Qed.Diag.modRootOf env n n) (includeQed := true)
 
-open Lean Elab Term Meta in
 private def isStyleConstructorFn (env : Environment) (fn : Name) : Bool :=
   fn == ``Qed.Style.mk ||
   fn == ``Qed.Theme.asStyle || fn == ``Qed.Keyframes.asStyle ||
@@ -16,43 +16,32 @@ private def isStyleConstructorFn (env : Environment) (fn : Name) : Bool :=
   | some (.defnInfo d) => d.type.getForallBody.isConstOf ``Qed.Style && !d.type.isConstOf ``Qed.Style
   | _ => false
 
-open Lean Elab Term Meta in
 private partial def collectInlineStylesFromExpr (env : Environment) (e : Expr)
     (acc : Array Expr) : MetaM (Array Expr) := do
   match e with
   | .app .. =>
-      let fn := e.getAppFn
       let isClosedStyleApp ←
-        if !e.hasLooseBVars && !e.hasFVar && !e.hasMVar then
-          match fn with
-          | .const fnName _ =>
-              if isStyleConstructorFn env fnName then
-                try
-                  let ty ← whnf (← inferType e)
-                  pure (ty.isConstOf ``Qed.Style)
-                catch _ => pure false
-              else pure false
-          | _ => pure false
-        else pure false
+        match e.getAppFn with
+        | .const fnName _ =>
+            if !e.hasLooseBVars && !e.hasFVar && !e.hasMVar && isStyleConstructorFn env fnName then
+              try pure ((← whnf (← inferType e)).isConstOf ``Qed.Style) catch _ => pure false
+            else pure false
+        | _ => pure false
       if isClosedStyleApp then
-        if acc.contains e then return acc
-        else return acc.push e
+        return if acc.contains e then acc else acc.push e
       else
         let acc ← collectInlineStylesFromExpr env e.appFn! acc
         collectInlineStylesFromExpr env e.appArg! acc
-  | .lam _ _ b _     => collectInlineStylesFromExpr env b acc
+  | .lam _ _ b _ | .mdata _ b | .proj _ _ b => collectInlineStylesFromExpr env b acc
   | .letE _ _ v b _  =>
       let acc ← collectInlineStylesFromExpr env v acc
       collectInlineStylesFromExpr env b acc
-  | .mdata _ b       => collectInlineStylesFromExpr env b acc
-  | .proj _ _ b      => collectInlineStylesFromExpr env b acc
   | _                => return acc
 
-private def isLocalMountConst : Lean.Name → Bool
+private def isLocalMountConst : Name → Bool
   | .str _ s => s == "_qed_mount" || s == "_qed_mountWithOpt"
   | _        => false
 
-open Lean Elab Term Meta in
 private def walkAppDefs (value : Expr) (onMount : Name → MetaM Unit)
     (onDef : Name → DefinitionVal → MetaM Bool) : MetaM Unit := do
   let env ← getEnv
@@ -73,7 +62,6 @@ private def walkAppDefs (value : Expr) (onMount : Name → MetaM Unit)
         if (← onDef n d) && !isFrameworkRoot env n then
           pending := d.value.getUsedConstants.toList ++ pending
 
-open Lean Elab Term Meta in
 private def discoverRegistrations (value : Expr) : TermElabM Expr := do
   let regsRef ← IO.mkRef (#[] : Array Expr)
   walkAppDefs value
@@ -84,7 +72,6 @@ private def discoverRegistrations (value : Expr) : TermElabM Expr := do
     locals ← mkAppM ``List.append #[locals, reg]
   mkAppM ``LocalDef.dedupe #[locals]
 
-open Lean Elab Term Meta in
 private def discoverStyles (value : Expr) : TermElabM Expr := do
   let env ← getEnv
   let styleMetaMap := Qed.StyleDsl.styleMetaRegistry.getState env
@@ -128,16 +115,12 @@ private def discoverStyles (value : Expr) : TermElabM Expr := do
 syntax (name := registrationsTerm) "qedInternalLocalRegistrations% " term:max : term
 syntax (name := stylesTerm) "qedInternalStyles% " term:max : term
 
-open Lean Elab Term in
 private def elabValueThen (f : Expr → TermElabM Expr) : TermElab := fun stx _ => do
   let value ← elabTerm stx[1] none
   synthesizeSyntheticMVarsNoPostponing
   f (← instantiateMVars value)
 
-open Lean Elab Term in
 @[term_elab registrationsTerm] def elabRegistrations : TermElab := elabValueThen discoverRegistrations
-
-open Lean Elab Term in
 @[term_elab stylesTerm] def elabStyles : TermElab := elabValueThen discoverStyles
 
 end Qed.Internal

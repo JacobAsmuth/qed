@@ -353,6 +353,7 @@ deriving Inhabited, DecidableEq, Repr
     Never bundled into client JS (`Js.VerifyEnv.clientLeakReason?`). -/
 structure OidcAuthSpec where
   name             : String
+  isManaged        : Bool := false
   issuerEnv        : String := "QED_AUTH_ISSUER"
   issuerDefault?   : Option String := none
   audienceEnv      : String := "QED_AUTH_AUDIENCE"

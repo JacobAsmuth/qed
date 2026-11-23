@@ -1,6 +1,7 @@
 import Lean
 import Qed.Diag
 import Qed.Lang
+import Qed.Cloud.Env
 import Qed.Auth.Core
 import Qed.Server.Ensured
 import Qed.Socket.Basic
@@ -41,6 +42,7 @@ structure ServerInfo where
   shortName        : String
   hasState         : Bool
   secrets          : Array String
+  ownSecrets       : Array String := #[]
   envVars          : Array (String × String × Option String)
   externalServices : Array (String × String)
   methods          : Array ServerMethodInfo
@@ -297,6 +299,8 @@ structure DatabaseInfo where
   ensureSchemaConst : Lean.Name
   secrets           : Array String
   hasDevFallback    : Bool := false
+  isManaged         : Bool := false
+  envSpecs          : Qed.Cloud.EnvMap Qed.Cloud.DbEnvSpec := Qed.Cloud.EnvMap.ofDefault (.byoSqlite "")
   tables            : Array DbTableInfo
 deriving Inhabited, Repr
 

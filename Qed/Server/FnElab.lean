@@ -498,27 +498,35 @@ def elabDomainErrorType (fnIdent : Ident) (tagIdents : Array Ident) : SrvElabM I
   ] do liftM <| elabCommand cmd
   return errTypeId
 
-private def collectServerSecretsAndExts : SrvElabM (Array String × Array (String × String)) := do
+private def collectServerSecretsAndExts : SrvElabM (Array String × Array String × Array (String × String)) := do
   let c ← read
   let env ← getEnv
   let currNs ← getCurrNamespace
   let openDecls ← getOpenDecls
   let allExtRoots ← c.extRootsRef.get
   let mut reqSecrets : Array String := #[]
+  let mut ownSecrets : Array String := #[]
   let pushSec (s : String) (arr : Array String) := if arr.contains s then arr else arr.push s
   for dbd in c.dbDecls do
-    if !dbd.info.hasDevFallback then reqSecrets := dbd.info.secrets.foldl (fun a s => pushSec s a) reqSecrets
+    let es := dbd.info.envSpecs
+    let uniformNonDev := es.prod == es.staging && es.prod == es.preview
+    if !dbd.info.hasDevFallback && uniformNonDev then
+      reqSecrets := dbd.info.secrets.foldl (fun a s => pushSec s a) reqSecrets
   for ed in c.envDecls do
-    if ed.default?.isNone then reqSecrets := pushSec ed.osKey reqSecrets
+    if ed.default?.isNone then
+      reqSecrets := pushSec ed.osKey reqSecrets
+      ownSecrets := pushSec ed.osKey ownSecrets
   if let some ad := c.authDecl? then
-    reqSecrets := ad.info.secrets.foldl (fun a s => pushSec s a) reqSecrets
+    if !ad.info.spec.isManaged then
+      reqSecrets := ad.info.secrets.foldl (fun a s => pushSec s a) reqSecrets
   let mut usedExts : Array (String × String) := #[]
   for root in allExtRoots do
     if let some extInfo := Qed.Diag.lookupNameMapExt? externalRegistry env currNs openDecls root then
       let sStr := root.toString
       unless usedExts.any (·.1 == sStr) do usedExts := usedExts.push (sStr, extInfo.baseOrigin)
       reqSecrets := extInfo.secrets.foldl (fun a s => pushSec s a) reqSecrets
-  return (reqSecrets, usedExts)
+      ownSecrets := extInfo.secrets.foldl (fun a s => pushSec s a) ownSecrets
+  return (reqSecrets, ownSecrets, usedExts)
 
 /-- Wraps `innerRun` (and optionally a `ProgPreservesInv` proof) with `readEnv` bindings for `envDecls`. -/
 def wrapWithEnvDecls (envDecls : Array ParsedEnvDecl)
@@ -581,7 +589,7 @@ def elabServerDispatchCmds
           $(c.stateInvId) st.shared :=
         Qed.Server.concurrent_schedule_preserves_inv $(c.stateInvId) $(c.initStateId) st $(c.invInitId) hsched))
 
-  let (reqSecrets, usedExts) ← collectServerSecretsAndExts
+  let (reqSecrets, ownSecrets, usedExts) ← collectServerSecretsAndExts
   let mkStrArr (ss : Array String) : Array Term := ss.map (Syntax.mkStrLit ·)
   for cmd in #[
     ← `(command| def $(mkIdentFrom c.srvIdent (c.srvName ++ `secrets)) : Array String := #[$(mkStrArr reqSecrets),*]),
@@ -639,7 +647,7 @@ def elabServerDispatchCmds
 
   modifyEnv fun env => serverRegistry.addEntry env {
     serverName := c.fullSrvName, shortName := c.srvShort, hasState := c.hasState
-    secrets := reqSecrets
+    secrets := reqSecrets, ownSecrets := ownSecrets
     envVars := c.envDecls.map fun e => (e.ident.getId.toString, e.osKey, e.default?)
     externalServices := usedExts, methods := methodInfos, channels := chanNames, jobs := jobNames
     databases := c.dbDecls.map (·.info.configConst)

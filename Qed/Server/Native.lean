@@ -459,18 +459,36 @@ private def resolveDbEndpoint (ep : Db.DbEndpoint) : IO (Except String ResolvedD
         let u ← liftE (requireEnv urlEnv "HTTP SQL URL env")
         let tok? ← match tokSecret? with | some ts => loadNonEmptyEnv ts | none => pure none
         return .httpSql u tok?
+    | .managedPostgres dbName _ =>
+        let envKey := Qed.Cloud.managedPostgresSecretVar dbName
+        .postgres <$> liftE (requireEnv envKey "managed PostgreSQL secret")
 
 private def resolveDbConfig (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDbTransport) := do
-  match ← resolveDbEndpoint cfg.endpoint with
-  | .ok tr => return .ok tr
-  | .error primaryErr =>
-      match cfg.devFallback? with
-      | some fb =>
-          match ← resolveDbEndpoint fb with
-          | .ok tr => return .ok tr
-          | .error fbErr => return .error (ApiError.internal s!"database `{cfg.name}` unavailable: {primaryErr} (fallback: {fbErr})")
+  -- Fail-closed environment dispatch whenever `QED_DEPLOY_ENV` is set (including empty string) or on Cloud Run (`K_SERVICE`).
+  match ← Prim.getEnv "QED_DEPLOY_ENV" with
+  | some rawEnv =>
+      match Qed.Cloud.DeployEnv.parse? (trimWs rawEnv) with
       | none =>
-          return .error (ApiError.internal s!"database `{cfg.name}` unavailable: {primaryErr}")
+          return .error (ApiError.internal s!"invalid QED_DEPLOY_ENV `{rawEnv}` (expected dev, preview, staging, or prod)")
+      | some env =>
+          match ← resolveDbEndpoint (cfg.endpointForEnv env) with
+          | .ok tr => return .ok tr
+          | .error err =>
+              return .error (ApiError.internal s!"database `{cfg.name}` unavailable for env `{env}`: {err}")
+  | none =>
+      let onCloudRun := (← loadNonEmptyEnv "K_SERVICE").isSome
+      match ← resolveDbEndpoint cfg.endpoint with
+      | .ok tr => return .ok tr
+      | .error primaryErr =>
+          if onCloudRun then
+            return .error (ApiError.internal s!"database `{cfg.name}` unavailable on Cloud Run (fail-closed, no dev fallback): {primaryErr}")
+          match cfg.devFallback? with
+          | some fb =>
+              match ← resolveDbEndpoint fb with
+              | .ok tr => return .ok tr
+              | .error fbErr => return .error (ApiError.internal s!"database `{cfg.name}` unavailable: {primaryErr} (fallback: {fbErr})")
+          | none =>
+              return .error (ApiError.internal s!"database `{cfg.name}` unavailable: {primaryErr}")
 
 private def d1QueryUrl (acc db : String) : String :=
   s!"https://api.cloudflare.com/client/v4/accounts/{Qed.encodeSeg acc}/d1/database/{Qed.encodeSeg db}/query"
@@ -1117,7 +1135,13 @@ private def withCookieSink {α : Type} (gcpCache : Prim.StateBox (Array GcpToken
   return (res, ← cookieRef.get)
 
 private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : FullstackConfig) : IO UInt32 := do
-  if !(← verifyRequiredSecrets fc.requiredSecrets) then return 1
+  let activeEnv? := (← Prim.getEnv "QED_DEPLOY_ENV").bind (fun s => Qed.Cloud.DeployEnv.parse? (trimWs s))
+  let mut reqSecrets := fc.requiredSecrets
+  if let some spec := fc.authSpec? then
+    if spec.isManaged && !fc.devMode && activeEnv? != some .dev && activeEnv? != some .preview then
+      if let some sec := spec.clientSecretEnv? then
+        if !reqSecrets.contains sec then reqSecrets := reqSecrets.push sec
+  if !(← verifyRequiredSecrets reqSecrets) then return 1
   let (hasOnCreateAccount, hasOnSignIn) := fc.authHookFlags
   if hasOnCreateAccount then
     if let some dbCfg := fc.primaryDb? then

@@ -213,9 +213,10 @@ def isServerOwner (env : Environment) (owner : Name) : Bool :=
 def isExternalOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_external_marker
 def isDatabaseOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_database_marker
 def isAuthOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_auth_marker
+def isDeployOwner (env : Environment) (owner : Name) : Bool := hasOwnerMarker env owner `_qed_deploy_marker
 
 /-- True iff `n` (or an enclosing non-`_closed_` declaration prefix, e.g. `match_*` / `_unsafe_rec`
-    auxiliaries) is a server-only declaration owned by a `server`, `external`, `database`, or `auth` block.
+    auxiliaries) is a server-only declaration owned by a `server`, `external`, `database`, `auth`, or `deploy` block.
     Module-wide CSE `_closed_*` thunks (such as a shared empty `Array.mkEmpty 0`) are excluded
     because Lean's closed-term extractor reuses them across unrelated declarations in the same file. -/
 def isServerOnlyDeclName (env : Environment) : Name → Bool
@@ -231,6 +232,8 @@ def isServerOnlyDeclName (env : Environment) : Name → Bool
         true
       else if s == "config" && isAuthOwner env owner then
         true
+      else if s == "spec" && isDeployOwner env owner then
+        true
       else if s == "secrets" && (isServerOwner env owner || isExternalOwner env owner || isDatabaseOwner env owner || isAuthOwner env owner) then
         true
       else
@@ -242,7 +245,8 @@ def clientLeakReason? (env : Environment) (n : Name) : Option String :=
   let modName := definingModule env n
   if modName == `Qed.Server.Prim || modName == `Qed.Server.Native ||
      modName == `Qed.Server.Db.PgWire || modName == `Qed.Server.Db.HttpSql ||
-     modName == `Qed.Auth.Oidc then
+     modName == `Qed.Auth.Oidc || modName == `Qed.Deploy ||
+     modName == `Qed.Cloud.Compile || modName == `Qed.Cloud.Proofs then
     some s!"client bundle leak gate: server runtime primitive `{n}` (`{modName}`) cannot be bundled into client JavaScript"
   else if n == `Qed.Server.execExternalRaw ||
           n == `Qed.Server.MonadServer.exec ||

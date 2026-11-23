@@ -51,45 +51,58 @@ private structure ParsedTable where
   indexes       : Array (Array Lean.Ident)
 
 open Lean Elab Command in
-private def parseEndpointSpec (stx : Syntax) :
-    CommandElabM (Term × Array String) := do
+private def parseEndpointSpec (stx : Syntax) (pinEnv? : Option Qed.Cloud.DeployEnv := none) :
+    CommandElabM (Term × Array String × Qed.Cloud.DbEnvSpec) := do
   let k := stx.getKind
   let secsRef ← IO.mkRef (#[] : Array String)
+  let scope : Qed.Cloud.SecretScope := match pinEnv? with
+    | some e => .pinned e
+    | none   => .envScoped
   let optStrLit : Option String → CommandElabM Term
     | some d => `(some $(Syntax.mkStrLit d))
     | none   => `(none)
-  let readRef (s : Syntax) (recordSec := true) (onlyIfNoDefault := false) : CommandElabM (Term × Term) := do
+  let readRef (s : Syntax) (recordSec := true) (onlyIfNoDefault := false) :
+      CommandElabM (Term × Term × String × Option String) := do
     let er ← parseQedEnvRef "database" s
     if recordSec && er.isSecret && (!onlyIfNoDefault || er.default?.isNone) then
       secsRef.modify (·.push er.envKey)
-    return (Syntax.mkStrLit er.envKey, ← optStrLit er.default?)
-  let epT : Term ←
+    return (Syntax.mkStrLit er.envKey, ← optStrLit er.default?, er.envKey, er.default?)
+  let (epT, spec) : (Term × Qed.Cloud.DbEnvSpec) ←
     if k == ``dbEpUrl then
-      `(Qed.Server.Db.DbEndpoint.urlEnv $((← readRef (stx.getArg 1)).1))
+      let (kT, _, kS, _) ← readRef (stx.getArg 1)
+      pure (← `(Qed.Server.Db.DbEndpoint.urlEnv $kT), .byoUrl { envVar := kS, scope })
     else if k == ``dbEpPostgres then
-      `(Qed.Server.Db.DbEndpoint.postgresEnv $((← readRef (stx.getArg 1)).1))
+      let (kT, _, kS, _) ← readRef (stx.getArg 1)
+      pure (← `(Qed.Server.Db.DbEndpoint.postgresEnv $kT), .byoPostgres { envVar := kS, scope })
     else if k == ``dbEpSqliteLit then
-      `(Qed.Server.Db.DbEndpoint.sqlitePath $(Syntax.mkStrLit (⟨stx.getArg 1⟩ : TSyntax `str).getString))
+      let p := (⟨stx.getArg 1⟩ : TSyntax `str).getString
+      pure (← `(Qed.Server.Db.DbEndpoint.sqlitePath $(Syntax.mkStrLit p)), .byoSqlite p)
     else if k == ``dbEpSqliteEnv then
-      let (keyT, defT) ← readRef (stx.getArg 1) (onlyIfNoDefault := true)
-      `(Qed.Server.Db.DbEndpoint.sqliteEnv $keyT $defT)
+      let (keyT, defT, keyS, defS?) ← readRef (stx.getArg 1) (onlyIfNoDefault := true)
+      pure (← `(Qed.Server.Db.DbEndpoint.sqliteEnv $keyT $defT), .byoSqliteEnv keyS defS?)
     else if k == ``dbEpD1 then
-      let (accK, accD) ← readRef (stx.getArg 3) (recordSec := false)
-      let (dbK, dbD)   ← readRef (stx.getArg 7) (recordSec := false)
-      let (tokK, _)    ← readRef (stx.getArg 11)
-      `(Qed.Server.Db.DbEndpoint.cloudflareD1 $accK $accD $dbK $dbD $tokK)
+      let (accK, accD, accS, _) ← readRef (stx.getArg 3) (recordSec := false)
+      let (dbK, dbD, dbS, _)    ← readRef (stx.getArg 7) (recordSec := false)
+      let (tokK, _, tokS, _)    ← readRef (stx.getArg 11)
+      pure (← `(Qed.Server.Db.DbEndpoint.cloudflareD1 $accK $accD $dbK $dbD $tokK),
+            .byoD1 accS dbS { envVar := tokS, scope })
     else if k == ``dbEpTurso then
-      let (uK, _)   ← readRef (stx.getArg 3)
-      let (tokK, _) ← readRef (stx.getArg 7)
-      `(Qed.Server.Db.DbEndpoint.turso $uK $tokK)
+      let (uK, _, uS, _)     ← readRef (stx.getArg 3)
+      let (tokK, _, tokS, _) ← readRef (stx.getArg 7)
+      pure (← `(Qed.Server.Db.DbEndpoint.turso $uK $tokK),
+            .byoTurso uS { envVar := tokS, scope })
     else if k == ``dbEpHttp then
-      let (uK, _) ← readRef (stx.getArg 3)
+      let (uK, _, uS, _) ← readRef (stx.getArg 3)
       let tokOpt := stx.getArg 4
-      let tokT ← if tokOpt.getNumArgs == 4 then `(some $((← readRef (tokOpt.getArg 3)).1)) else `(none)
-      `(Qed.Server.Db.DbEndpoint.httpSql $uK $tokT)
+      let (tokT, tokRef?) ←
+        if tokOpt.getNumArgs == 4 then
+          let (tT, _, tS, _) ← readRef (tokOpt.getArg 3)
+          pure (← `(some $tT), some ({ envVar := tS, scope } : Qed.Cloud.SecretRef))
+        else pure (← `(none), none)
+      pure (← `(Qed.Server.Db.DbEndpoint.httpSql $uK $tokT), .byoHttpSql uS tokRef?)
     else
       throwErrorAt stx "unexpected database endpoint specification"
-  return (epT, ← secsRef.get)
+  return (epT, ← secsRef.get, spec)
 
 private def inferSqlColType (pty : LoweredQedType) : SqlColType × Bool × Bool × Bool :=
   let base := pty.baseName
@@ -226,25 +239,85 @@ def elabDatabaseCmd : CommandElab := fun stx => do
   let fullDbName := currNs ++ dbName
   let clauses := (stx.getArg 3).getArgs
 
-  let mut primaryEp? : Option Term := none
-  let mut devEp?     : Option Term := none
-  let mut secrets    : Array String := #[]
-  let mut tables     : Array ParsedTable := #[]
+  let mut primaryEp?     : Option (Term × Qed.Cloud.DbEnvSpec) := none
+  let mut envSlots       : Qed.Cloud.EnvMap (Option (Term × Qed.Cloud.DbEnvSpec)) := Qed.Cloud.EnvMap.ofDefault none
+  let mut isManaged      : Bool := false
+  let mut hasExplicitEnv : Bool := false
+  let mut secrets        : Array String := #[]
+  let mut tables         : Array ParsedTable := #[]
+  let dbShort := dbName.toString
+
+  let pushSecrets (secs : Array String) (cur : Array String) : Array String :=
+    secs.foldl (init := cur) fun acc s => if acc.contains s then acc else acc.push s
+
+  let managedSpecToTerm : Qed.Cloud.DbEnvSpec → CommandElabM Term
+    | .managedPostgres nm .prod    => `(Qed.Server.Db.DbEndpoint.managedPostgres $(Syntax.mkStrLit nm) Qed.Cloud.DeployEnv.prod)
+    | .managedPostgres nm .staging => `(Qed.Server.Db.DbEndpoint.managedPostgres $(Syntax.mkStrLit nm) Qed.Cloud.DeployEnv.staging)
+    | .managedPostgres nm .preview => `(Qed.Server.Db.DbEndpoint.managedPostgres $(Syntax.mkStrLit nm) Qed.Cloud.DeployEnv.preview)
+    | .managedPostgres nm .dev     => `(Qed.Server.Db.DbEndpoint.managedPostgres $(Syntax.mkStrLit nm) Qed.Cloud.DeployEnv.dev)
+    | .ephemeralSqlite p | .byoSqlite p => `(Qed.Server.Db.DbEndpoint.sqlitePath $(Syntax.mkStrLit p))
+    | _ => throwErrorAt dbIdent s!"internal error lowering managed database target in `database {dbName}`"
+
+  let setEnvSlot (ref : Syntax) (envStr : String) (epStx : Syntax) (inManaged : Bool)
+      (curSlots : Qed.Cloud.EnvMap (Option (Term × Qed.Cloud.DbEnvSpec))) (curSecs : Array String) :
+      CommandElabM (Qed.Cloud.EnvMap (Option (Term × Qed.Cloud.DbEnvSpec)) × Array String) := do
+    let some env := Qed.Cloud.DeployEnv.parse? envStr
+      | throwErrorAt ref s!"unexpected environment `{envStr}` in `database {dbName}`"
+    if inManaged && env == .prod then
+      throwErrorAt ref s!"cannot override `prod` inside `managed postgres:` in `database {dbName}`"
+    if (curSlots.get env).isSome then
+      throwErrorAt ref s!"duplicate `{envStr}` endpoint in `database {dbName}`"
+    let (epT, secs, spec) ← parseEndpointSpec epStx (some env)
+    let nextSecs := if env == .dev then curSecs else pushSecrets secs curSecs
+    return (curSlots.set env (some (epT, spec)), nextSecs)
 
   for c in clauses do
     let k := c.getKind
-    if k == ``dbPrimaryEpClause then
-      if primaryEp?.isSome then
+    if k == ``dbManagedClause then
+      if isManaged || primaryEp?.isSome || envSlots.prod.isSome ||
+         envSlots.staging.isSome || envSlots.preview.isSome || envSlots.dev.isSome then
+        throwErrorAt c s!"cannot combine `managed postgres` with other endpoint clauses in `database {dbName}` (nest overrides under `managed postgres:`)"
+      isManaged := true
+      hasExplicitEnv := true
+      let mut previewEphemeral := false
+      let subOpt := c.getArg 2
+      if subOpt.getNumArgs == 2 then
+        for sc in (subOpt.getArg 1).getArgs do
+          let sk := sc.getKind
+          if sk == ``dbManagedPreviewEphemeral then
+            if previewEphemeral || envSlots.preview.isSome then
+              throwErrorAt sc s!"duplicate `preview` override in `managed postgres:` of `database {dbName}`"
+            previewEphemeral := true
+          else if sk == ``dbManagedEnvOverride then
+            let envStr := (sc.getArg 0).getId.eraseMacroScopes.toString
+            if envStr == "preview" && previewEphemeral then
+              throwErrorAt sc s!"duplicate `preview` override in `managed postgres:` of `database {dbName}`"
+            let (nextSlots, nextSecs) ← setEnvSlot sc envStr (sc.getArg 1) true envSlots secrets
+            envSlots := nextSlots; secrets := nextSecs
+          else
+            throwErrorAt sc s!"unexpected clause in `managed postgres:`"
+      let targets := Qed.Cloud.managedPostgresTargets dbShort previewEphemeral (envSlots.dev.map Prod.snd)
+      for e in Qed.Cloud.DeployEnv.all do
+        if (envSlots.get e).isNone then
+          let sp := targets.get e
+          envSlots := envSlots.set e (some (← managedSpecToTerm sp, sp))
+      for sr in targets.prod.secrets do
+        secrets := pushSecrets #[sr.envVar] secrets
+    else if k == ``dbPrimaryEpClause then
+      if isManaged || primaryEp?.isSome || envSlots.prod.isSome then
         throwErrorAt c s!"duplicate endpoint specification in `database {dbName}`"
-      let (epT, secs) ← parseEndpointSpec (c.getArg 0)
-      primaryEp? := some epT
-      for s in secs do
-        if !secrets.contains s then secrets := secrets.push s
-    else if k == ``dbDevEpClause then
-      if devEp?.isSome then
-        throwErrorAt c s!"duplicate `dev` endpoint fallback in `database {dbName}`"
-      let (epT, _) ← parseEndpointSpec (c.getArg 1)
-      devEp? := some epT
+      let (epT, secs, spec) ← parseEndpointSpec (c.getArg 0) none
+      primaryEp? := some (epT, spec)
+      secrets := pushSecrets secs secrets
+    else if k == ``dbEnvEpClause then
+      let envStr := (c.getArg 0).getId.eraseMacroScopes.toString
+      if isManaged then
+        throwErrorAt c s!"cannot combine `managed postgres` with top-level `{envStr}` endpoint in `database {dbName}` (nest overrides under `managed postgres:`)"
+      if envStr == "prod" && primaryEp?.isSome then
+        throwErrorAt c s!"cannot combine a default endpoint with `prod` in `database {dbName}`"
+      if envStr != "dev" then hasExplicitEnv := true
+      let (nextSlots, nextSecs) ← setEnvSlot c envStr (c.getArg 1) false envSlots secrets
+      envSlots := nextSlots; secrets := nextSecs
     else if k == ``dbTableClauseTop then
       let tIdent : Ident := ⟨(c.getArg 1)⟩
       let tName := tIdent.getId.eraseMacroScopes.toString
@@ -336,8 +409,23 @@ def elabDatabaseCmd : CommandElab := fun stx => do
     else
       throwErrorAt c s!"unexpected clause in `database {dbName}`"
 
-  let some primaryEp := primaryEp?
-    | throwErrorAt dbIdent s!"`database {dbName}` must specify an endpoint (e.g. `url secret(\"DATABASE_URL\")`, `postgres ...`, `sqlite ...`, `d1 ...`, `turso ...`, or `http ...`)"
+  let resolveSlot (e : Qed.Cloud.DeployEnv) : CommandElabM (Term × Qed.Cloud.DbEnvSpec) :=
+    match envSlots.get e with
+    | some p => pure p
+    | none   =>
+        match primaryEp? with
+        | some p => pure p
+        | none   =>
+            throwErrorAt dbIdent s!"`database {dbName}` is missing a `{e}` endpoint (specify `{e} ...`, a default endpoint, or use `managed postgres`)"
+  let some _ := envSlots.prod.orElse (fun _ => primaryEp?)
+    | throwErrorAt dbIdent s!"`database {dbName}` must specify an endpoint (e.g. `managed postgres`, `postgres ...`, `sqlite ...`, `url secret(\"DATABASE_URL\")`, `d1 ...`, `turso ...`, or `http ...`)"
+  let (prodEpT, prodSpec)       ← resolveSlot .prod
+  let (stagingEpT, stagingSpec) ← resolveSlot .staging
+  let (previewEpT, previewSpec) ← resolveSlot .preview
+  let (devEpT, devSpec)         ← resolveSlot .dev
+  let envSpecs : Qed.Cloud.EnvMap Qed.Cloud.DbEnvSpec := {
+    dev := devSpec, preview := previewSpec, staging := stagingSpec, prod := prodSpec
+  }
   if tables.isEmpty then
     throwErrorAt dbIdent s!"`database {dbName}` must declare at least one `table`"
 
@@ -540,8 +628,11 @@ def elabDatabaseCmd : CommandElab := fun stx => do
     }
 
   -- Database-level config, DDL, RLS DDL, secrets, and `ensureSchema`
-  let dbShort := dbName.toString
-  let devEpTerm ← match devEp? with | some dt => `(some $dt) | none => `(none)
+  let devEpTerm ← match envSlots.dev with | some (dt, _) => `(some $dt) | none => `(none)
+  let envEndpointsTerm ←
+    if hasExplicitEnv then
+      `(some ({ dev := $devEpT, preview := $previewEpT, staging := $stagingEpT, prod := $prodEpT } : Qed.Cloud.EnvMap Qed.Server.Db.DbEndpoint))
+    else `(none)
   let (configId, ddlId, rlsDdlId, secretsId, ensureId, safeEnsureId, mId) :=
     (mkIdentFrom dbIdent (dbName ++ `config), mkIdentFrom dbIdent (dbName ++ `ddl),
      mkIdentFrom dbIdent (dbName ++ `rlsDdl), mkIdentFrom dbIdent (dbName ++ `secrets),
@@ -550,8 +641,9 @@ def elabDatabaseCmd : CommandElab := fun stx => do
   for cmd in #[
     ← `(command| def $secretsId : Array String := #[$[$secLits:term],*]),
     ← `(command| def $configId : Qed.Server.Db.DbConfig := {
-        name := $(Syntax.mkStrLit dbShort), endpoint := $primaryEp,
-        devFallback? := $devEpTerm, tables := [$[$tableSchemaTerms:term],*] }),
+        name := $(Syntax.mkStrLit dbShort), endpoint := $prodEpT,
+        devFallback? := $devEpTerm, envEndpoints? := $envEndpointsTerm,
+        isManaged := $(quote isManaged), tables := [$[$tableSchemaTerms:term],*] }),
     ← `(command| def $ddlId (dialect : Qed.Server.Db.SqlDialect := .postgres) : String :=
         Qed.Server.Db.renderDatabaseDdl dialect ($configId).tables),
     ← `(command| def $rlsDdlId : String := Qed.Server.Db.renderDatabaseRlsDdl ($configId).tables),
@@ -568,7 +660,9 @@ def elabDatabaseCmd : CommandElab := fun stx => do
     configConst       := fullDbName ++ `config
     ensureSchemaConst := fullDbName ++ `ensureSchema
     secrets           := secrets
-    hasDevFallback    := devEp?.isSome
+    hasDevFallback    := envSlots.dev.isSome
+    isManaged         := isManaged
+    envSpecs          := envSpecs
     tables            := tableInfos
   }
 

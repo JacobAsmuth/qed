@@ -1,5 +1,6 @@
 import Qed.Json.Lawful
 import Qed.Proto
+import Qed.Cloud.Env
 
 namespace Qed.Server.Db
 
@@ -956,14 +957,37 @@ inductive DbEndpoint where
                  (tokenSecret : String)
   | turso        (urlEnv : String) (tokenSecret : String)
   | httpSql      (urlEnv : String) (tokenSecret? : Option String := none)
+  | managedPostgres (dbName : String) (env : Qed.Cloud.DeployEnv)
 deriving Inhabited, DecidableEq, Repr
 
 structure DbConfig where
   name         : String
   endpoint     : DbEndpoint
   devFallback? : Option DbEndpoint := none
+  envEndpoints? : Option (Qed.Cloud.EnvMap DbEndpoint) := none
+  isManaged     : Bool := false
   tables       : List TableSchema := []
 deriving Inhabited, Repr
+
+/-- Strictly resolves the database endpoint for a concrete `DeployEnv` with ZERO cross-env fallback. -/
+def DbConfig.endpointForEnv (cfg : DbConfig) (env : Qed.Cloud.DeployEnv) : DbEndpoint :=
+  match cfg.envEndpoints? with
+  | some em => em.get env
+  | none    =>
+      match env with
+      | .dev => cfg.devFallback?.getD cfg.endpoint
+      | _    => cfg.endpoint
+
+/-- Production resolution never uses `devFallback?`. -/
+theorem DbConfig.endpointForEnv_prod_no_devFallback (cfg : DbConfig) (hnone : cfg.envEndpoints? = none) :
+    cfg.endpointForEnv .prod = cfg.endpoint := by
+  simp [DbConfig.endpointForEnv, hnone]
+
+/-- Managed databases strictly dispatch to their environment's dedicated slot in `envEndpoints?`. -/
+theorem DbConfig.endpointForEnv_envMap (cfg : DbConfig) (em : Qed.Cloud.EnvMap DbEndpoint)
+    (h : cfg.envEndpoints? = some em) (env : Qed.Cloud.DeployEnv) :
+    cfg.endpointForEnv env = em.get env := by
+  simp [DbConfig.endpointForEnv, h]
 
 abbrev DbRow := Array SqlVal
 

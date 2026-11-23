@@ -8,6 +8,7 @@ namespace Qed.Server.Db
 
 declare_syntax_cat dbClause
 declare_syntax_cat dbEndpointSpec
+declare_syntax_cat dbManagedSubClause
 declare_syntax_cat dbTableClause
 declare_syntax_cat dbColMod
 
@@ -86,12 +87,29 @@ def dbTransEdge : Parser :=
     many (checkLineEq >> categoryParser `dbColMod 0) >>
     optional (checkLineEq >> symbol "where" >> sepBy1 (categoryParser `qedExpr 0) ","))
 
+-- Sub-clauses for `managed postgres:`
+@[dbManagedSubClause_parser] def dbManagedPreviewEphemeral : Parser := leading_parser
+  withPosition (atomic (identEq `preview >> identEq `ephemeral))
+
+@[dbManagedSubClause_parser] def dbManagedEnvOverride : Parser := leading_parser
+  withPosition (
+    atomic ((identEq `dev <|> identEq `preview <|> identEq `staging <|> identEq `prod) >> notFollowedBy (identEq `ephemeral) "ephemeral") >>
+    categoryParser `dbEndpointSpec 0)
+
 -- Top-level `database` clauses
+@[dbClause_parser] def dbManagedClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `managed >> identEq `postgres) >>
+    optional (":" >> checkColGt "expected indented `managed postgres:` clauses" >>
+      many1Indent (categoryParser `dbManagedSubClause 0)))
+
+@[dbClause_parser] def dbEnvEpClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `prod <|> identEq `staging <|> identEq `preview <|> identEq `dev) >>
+    categoryParser `dbEndpointSpec 0)
+
 @[dbClause_parser] def dbPrimaryEpClause : Parser := leading_parser
   withPosition (categoryParser `dbEndpointSpec 0)
-
-@[dbClause_parser] def dbDevEpClause : Parser := leading_parser
-  withPosition (atomic (identEq `dev) >> categoryParser `dbEndpointSpec 0)
 
 @[dbClause_parser] def dbTableClauseTop : Parser := leading_parser
   withPosition (

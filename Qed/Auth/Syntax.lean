@@ -27,6 +27,9 @@ def authEnvRefParser : Parser :=
 @[authClause_parser] def authClientSecretClause : Parser := leading_parser
   withPosition (atomic (identEq `clientSecret) >> authEnvRefParser)
 
+@[authClause_parser] def authManagedClause : Parser := leading_parser
+  withPosition (atomic (identEq `managed) >> "[" >> sepBy1 ident "," >> "]")
+
 @[authClause_parser] def authProvidersClause : Parser := leading_parser
   withPosition (atomic (identEq `providers) >> "[" >> sepBy ident "," >> "]")
 

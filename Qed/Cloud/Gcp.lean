@@ -1,0 +1,730 @@
+import Qed.Cloud.Env
+
+/-! ## Formal GCP Cloud Run & IAM Model (`Qed.Cloud.Gcp`)
+    Pure, total, axiom-free model of Qed Cloud's opinionated GCP Cloud Run topology:
+    - Typed `GcpRegion`, `ScaleSpec` (full Cloud Run CPU↔memory↔concurrency↔timeout tier checks),
+      `PreviewSpec`, and `DeploySpec` (with section-tagged validation errors).
+    - Proved-injective, GCP-length-bounded canonical Service Account (`[6, 30]`) and Cloud Run
+      service (`[6, 63]`) naming (`renderSaId_injective`, `renderCloudRunName_injective`).
+    - Open `GcpPrincipal` universe (including `allUsers`, `allAuthenticatedUsers`, `external`).
+    - Typed predefined `GcpRole`s (basic `roles/owner` and `roles/editor` are unrepresentable).
+    - Formal IAM `allows` (allow ∧ ¬deny) and conservative transitive escalation reachability (`canReach`).
+    - 4-phase zero-downtime Cloud Run rollout model (`RolloutPhase`, `GcpAction`). -/
+
+namespace Qed.Cloud
+
+/-! ### 1. GCP Regions & Cloud Run Scaling Spec -/
+
+inductive GcpRegion where
+  | us_central1
+  | us_east1
+  | us_east4
+  | us_west1
+  | europe_west1
+  | europe_west4
+  | asia_east1
+  | asia_northeast1
+deriving Inhabited, DecidableEq, Repr
+
+def GcpRegion.toString : GcpRegion → String
+  | .us_central1     => "us-central1"
+  | .us_east1        => "us-east1"
+  | .us_east4        => "us-east4"
+  | .us_west1        => "us-west1"
+  | .europe_west1    => "europe-west1"
+  | .europe_west4    => "europe-west4"
+  | .asia_east1      => "asia-east1"
+  | .asia_northeast1 => "asia-northeast1"
+
+instance : ToString GcpRegion := ⟨GcpRegion.toString⟩
+
+def GcpRegion.parse? : String → Option GcpRegion
+  | "us_central1"     | "us-central1"     => some .us_central1
+  | "us_east1"        | "us-east1"        => some .us_east1
+  | "us_east4"        | "us-east4"        => some .us_east4
+  | "us_west1"        | "us-west1"        => some .us_west1
+  | "europe_west1"    | "europe-west1"    => some .europe_west1
+  | "europe_west4"    | "europe-west4"    => some .europe_west4
+  | "asia_east1"      | "asia-east1"      => some .asia_east1
+  | "asia_northeast1" | "asia-northeast1" => some .asia_northeast1
+  | _                                     => none
+
+def GcpRegion.allNames : List String :=
+  ["us_central1", "us_east1", "us_east4", "us_west1", "europe_west1", "europe_west4", "asia_east1", "asia_northeast1"]
+
+def GcpRegion.inEu : GcpRegion → Bool
+  | .europe_west1 | .europe_west4 => true
+  | _                             => false
+
+/-- Vercel-style bundled `(vCPU, RAM)` compute presets, all valid on Cloud Run by construction. -/
+inductive ComputeTier where
+  | standard     -- 1 vCPU,  2 GB RAM (default)
+  | performance  -- 2 vCPU,  4 GB RAM
+  | large        -- 4 vCPU,  8 GB RAM
+  | xlarge       -- 8 vCPU, 16 GB RAM
+deriving Inhabited, DecidableEq, Repr
+
+def ComputeTier.memoryMb : ComputeTier → Nat
+  | .standard    => 2048
+  | .performance => 4096
+  | .large       => 8192
+  | .xlarge      => 16384
+
+def ComputeTier.cpuMilli : ComputeTier → Nat
+  | .standard    => 1000
+  | .performance => 2000
+  | .large       => 4000
+  | .xlarge      => 8000
+
+/-- Default Cloud Run per-instance concurrency tuned for Qed's epoll Rust/Lean runtime. -/
+def ComputeTier.defaultConcurrency : ComputeTier → Nat
+  | .standard    => 250
+  | .performance => 500
+  | .large       => 1000
+  | .xlarge      => 1000
+
+def ComputeTier.parse? : String → Option ComputeTier
+  | "standard"    => some .standard
+  | "performance" => some .performance
+  | "large"       => some .large
+  | "xlarge"      => some .xlarge
+  | _             => none
+
+def ComputeTier.allNames : List String :=
+  ["standard", "performance", "large", "xlarge"]
+
+/-- Compiled Cloud Run container scaling & hardware configuration (platform-derived in `compileInfra`). -/
+structure ScaleSpec where
+  minInstances : Nat := 0
+  maxInstances : Nat := 100
+  memoryMb     : Nat := 2048
+  cpuMilli     : Nat := 1000
+  concurrency  : Nat := 250
+  timeoutSec   : Nat := 60
+deriving Inhabited, DecidableEq, Repr
+
+/-- Exact Cloud Run hardware coupling & tier validation. -/
+def ScaleSpec.validate (s : ScaleSpec) : Except String Unit :=
+  if s.maxInstances == 0 then
+    .error "scale: `max_instances` must be at least 1"
+  else if s.minInstances > s.maxInstances then
+    .error s!"scale: `min_instances` ({s.minInstances}) cannot exceed `max_instances` ({s.maxInstances})"
+  else if s.memoryMb < 128 || s.memoryMb > 32768 then
+    .error s!"scale: unsupported Cloud Run `memory` ({s.memoryMb}mb; expected 128mb..32gb)"
+  else if !(s.cpuMilli ∈ [250, 500, 1000, 2000, 4000, 6000, 8000]) then
+    .error s!"scale: unsupported Cloud Run `cpu` ({s.cpuMilli}m)"
+  else if s.memoryMb > 24576 && s.cpuMilli < 8000 then
+    .error s!"scale: Cloud Run `memory` {s.memoryMb}mb requires 8 vCPU"
+  else if s.memoryMb > 16384 && s.cpuMilli < 6000 then
+    .error s!"scale: Cloud Run `memory` {s.memoryMb}mb requires at least 6 vCPU"
+  else if s.memoryMb > 8192 && s.cpuMilli < 4000 then
+    .error s!"scale: Cloud Run `memory` {s.memoryMb}mb requires at least 4 vCPU"
+  else if s.memoryMb > 4096 && s.cpuMilli < 2000 then
+    .error s!"scale: Cloud Run `memory` {s.memoryMb}mb requires at least 2 vCPU"
+  else if s.memoryMb > 1024 && s.cpuMilli < 1000 then
+    .error s!"scale: Cloud Run `memory` {s.memoryMb}mb requires at least 1 vCPU"
+  else if s.memoryMb > 512 && s.cpuMilli < 500 then
+    .error s!"scale: Cloud Run `memory` {s.memoryMb}mb requires at least 500m CPU"
+  else if s.cpuMilli ≥ 6000 && s.memoryMb < 4096 then
+    .error s!"scale: Cloud Run {s.cpuMilli / 1000} vCPU requires at least 4gb `memory` (got {s.memoryMb}mb)"
+  else if s.cpuMilli ≥ 4000 && s.memoryMb < 2048 then
+    .error s!"scale: Cloud Run 4 vCPU requires at least 2gb `memory` (got {s.memoryMb}mb)"
+  else if s.cpuMilli ≥ 2000 && s.memoryMb < 512 then
+    .error s!"scale: Cloud Run 2 vCPU requires at least 512mb `memory` (got {s.memoryMb}mb)"
+  else if s.cpuMilli < 1000 && s.concurrency > 1 then
+    .error "scale: fractional `cpu` (< 1 vCPU) on Cloud Run requires `concurrency` = 1 (or raise `cpu` to >= 1)"
+  else if s.concurrency == 0 || s.concurrency > 1000 then
+    .error s!"scale: `concurrency` ({s.concurrency}) must be between 1 and 1000"
+  else if s.timeoutSec == 0 || s.timeoutSec > 3600 then
+    .error s!"scale: `timeout` ({s.timeoutSec}s) must be between 1s and 3600s"
+  else
+    .ok ()
+
+theorem ScaleSpec.validate_default_ok : ({} : ScaleSpec).validate = .ok () := rfl
+
+/-! ### 2. Preview & Top-Level `DeploySpec` -/
+
+inductive PreviewProtection where
+  | team_only
+  | pub
+deriving Inhabited, DecidableEq, Repr
+
+structure PreviewSpec where
+  enabled    : Bool := true
+  subdomain? : Option String := some "preview"
+  host?      : Option HostPattern := none
+  protection : PreviewProtection := .team_only
+  ttlSec     : Nat := 7 * 86400
+deriving Inhabited, DecidableEq, Repr
+
+/-- Resolves the preview host pattern: explicit `host?` if set, otherwise derived from `prodDomain` + `subdomain?`. -/
+def PreviewSpec.resolvedHost? (p : PreviewSpec) (prodDomain? : Option String) : Option HostPattern :=
+  match p.host? with
+  | some hp => some hp
+  | none    =>
+      match prodDomain?, p.subdomain? with
+      | some prod, some sub => some (derivePreviewHost prod sub)
+      | _, _                => none
+
+structure DeploySpec where
+  name        : String
+  appName     : String
+  regions     : List GcpRegion := [.us_central1]
+  domain?     : Option String := none
+  compute     : ComputeTier := .standard
+  timeoutSec? : Option Nat := none
+  preview     : PreviewSpec := {}
+deriving Inhabited, DecidableEq, Repr
+
+inductive DeploySection where
+  | regions | timeout | domain | preview
+deriving Inhabited, DecidableEq, Repr
+
+/-- Section-tagged validation so elaborator errors highlight the exact offending clause. -/
+def DeploySpec.validateSectioned (d : DeploySpec) : Except (DeploySection × String) Unit := do
+  if d.regions.isEmpty then
+    .error (.regions, s!"`deploy {d.name}`: `regions` must list at least one GCP region")
+  if let some t := d.timeoutSec? then
+    if t == 0 || t > 3600 then
+      .error (.timeout, s!"`deploy {d.name}`: `timeout` ({t}s) must be between 1s and 3600s")
+  if let some dom := d.domain? then
+    if !isValidHostname dom then
+      .error (.domain, s!"`deploy {d.name}`: invalid RFC 1123 production `domain` `{dom}` (omit scheme/path/trailing dot)")
+  if d.preview.enabled then
+    if d.preview.ttlSec == 0 then
+      .error (.preview, s!"`deploy {d.name}`: preview `ttl` must be positive")
+    if let some sub := d.preview.subdomain? then
+      if !isValidDnsLabel sub then
+        .error (.preview, s!"`deploy {d.name}`: invalid preview `subdomain` label `{sub}`")
+    if let some hp := d.preview.resolvedHost? d.domain? then
+      if !hp.isValid then
+        .error (.preview, s!"`deploy {d.name}`: invalid preview host `{hp.render}`")
+      if let some prodDom := d.domain? then
+        if hp.matches prodDom then
+          .error (.preview, s!"`deploy {d.name}`: preview host `{hp.render}` overlaps production domain `{prodDom}`")
+
+def DeploySpec.validate (d : DeploySpec) : Except String Unit :=
+  match d.validateSectioned with
+  | .ok ()         => .ok ()
+  | .error (_, msg) => .error msg
+
+/-! ### 3. Canonical Proved-Injective GCP Naming (`DeployKey`, `renderSaId`, `renderCloudRunName`) -/
+
+structure TenantId where
+  num   : Nat
+  valid : num < 1000000
+deriving DecidableEq, Repr
+
+instance : Inhabited TenantId := ⟨⟨0, by decide⟩⟩
+
+structure AppId where
+  num   : Nat
+  valid : num < 100000
+deriving DecidableEq, Repr
+
+instance : Inhabited AppId := ⟨⟨0, by decide⟩⟩
+
+structure PrId where
+  num   : Nat
+  valid : num < 100000
+deriving DecidableEq, Repr
+
+instance : Inhabited PrId := ⟨⟨0, by decide⟩⟩
+
+/-- Concrete deployed environment instance (distinguishes distinct bounded PR previews). -/
+inductive EnvInstance where
+  | prod
+  | staging
+  | preview (pr : PrId)
+deriving Inhabited, DecidableEq, Repr
+
+def EnvInstance.toDeployEnv : EnvInstance → DeployEnv
+  | .prod      => .prod
+  | .staging   => .staging
+  | .preview _ => .preview
+
+def EnvInstance.isProd : EnvInstance → Bool
+  | .prod => true
+  | _     => false
+
+def EnvInstance.isPreview : EnvInstance → Bool
+  | .preview _ => true
+  | _          => false
+
+structure ShardProject where
+  projectId : String
+deriving Inhabited, DecidableEq, Repr
+
+/-- Unique identity of a single deployed `(shard, tenant, app, envInstance)` slice. -/
+structure DeployKey where
+  shard  : ShardProject
+  tenant : TenantId
+  app    : AppId
+  env    : EnvInstance
+deriving Inhabited, DecidableEq, Repr
+
+/-- Encode a natural number into decimal digits (always non-empty, pure digits `'0'..'9'`, no `'-'`). -/
+def encNatAux : Nat → Nat → List Char → List Char
+  | 0, _, acc => acc
+  | k + 1, n, acc =>
+      let d := Char.ofNat (48 + n % 10)
+      if n < 10 then d :: acc
+      else encNatAux k (n / 10) (d :: acc)
+
+def encNat (n : Nat) : String :=
+  String.ofList (encNatAux 10 n [])
+
+def decDigitsAux (acc : Nat) : List Char → Option Nat
+  | [] => some acc
+  | c :: cs =>
+      if '0' ≤ c && c ≤ '9' then decDigitsAux (acc * 10 + (c.toNat - 48)) cs
+      else none
+
+def decNat (s : String) : Option Nat :=
+  match s.toList with
+  | [] => none
+  | cs => decDigitsAux 0 cs
+
+private theorem encNatAux_length_pos (k n : Nat) (acc : List Char) (hk : 0 < k) :
+    0 < (encNatAux k n acc).length := by
+  induction k generalizing n acc with
+  | zero => omega
+  | succ k ih =>
+      simp only [encNatAux]
+      split
+      · simp
+      · cases k with
+        | zero => simp [encNatAux]
+        | succ k' => exact ih (n / 10) (Char.ofNat (48 + n % 10) :: acc) (Nat.succ_pos k')
+
+private theorem encNatAux_length_bound (d k n : Nat) (hn : n < 10 ^ (d + 1)) (hk : d + 1 ≤ k)
+    (acc : List Char) :
+    (encNatAux k n acc).length ≤ d + 1 + acc.length := by
+  induction d generalizing k n acc with
+  | zero =>
+      cases k with
+      | zero => omega
+      | succ k' =>
+          simp only [Nat.zero_add, Nat.pow_one] at hn
+          simp [encNatAux, hn]; omega
+  | succ d ih =>
+      cases k with
+      | zero => omega
+      | succ k' =>
+          simp only [encNatAux]
+          split
+          · simp; omega
+          · have hdiv : n / 10 < 10 ^ (d + 1) := by rw [Nat.pow_succ] at hn; omega
+            have h := ih k' (n / 10) hdiv (by omega) (Char.ofNat (48 + n % 10) :: acc)
+            simp at h
+            omega
+
+private theorem char_ofNat_digit (d : Nat) (hd : d < 10) :
+    '0' ≤ Char.ofNat (48 + d) ∧ Char.ofNat (48 + d) ≤ '9' ∧ (Char.ofNat (48 + d)).toNat - 48 = d := by
+  have hall : ∀ i : Fin 10,
+      '0' ≤ Char.ofNat (48 + i.val) ∧ Char.ofNat (48 + i.val) ≤ '9' ∧ (Char.ofNat (48 + i.val)).toNat - 48 = i.val := by
+    decide
+  exact hall ⟨d, hd⟩
+
+private theorem encNatAux_all_digits (k n : Nat) (acc : List Char)
+    (hacc : ∀ c ∈ acc, '0' ≤ c ∧ c ≤ '9') :
+    ∀ c ∈ encNatAux k n acc, '0' ≤ c ∧ c ≤ '9' := by
+  induction k generalizing n acc with
+  | zero => exact hacc
+  | succ k ih =>
+      simp only [encNatAux]
+      have hd := char_ofNat_digit (n % 10) (Nat.mod_lt _ (by decide))
+      split
+      · intro c hc
+        rcases List.mem_cons.mp hc with rfl | hc'
+        · exact ⟨hd.1, hd.2.1⟩
+        · exact hacc c hc'
+      · apply ih
+        intro c hc
+        rcases List.mem_cons.mp hc with rfl | hc'
+        · exact ⟨hd.1, hd.2.1⟩
+        · exact hacc c hc'
+
+private theorem decDigitsAux_append_digit (acc d : Nat) (hd : d < 10) (cs : List Char) :
+    decDigitsAux acc (Char.ofNat (48 + d) :: cs) = decDigitsAux (acc * 10 + d) cs := by
+  have h := char_ofNat_digit d hd
+  simp [decDigitsAux, h.1, h.2.1, h.2.2]
+
+private theorem decDigitsAux_encNatAux (k n : Nat) (hbound : n < 10 ^ k) (cs : List Char) :
+    decDigitsAux 0 (encNatAux k n cs) = decDigitsAux n cs := by
+  induction k generalizing n cs with
+  | zero =>
+      simp at hbound; subst hbound; rfl
+  | succ k ih =>
+      simp only [encNatAux]
+      split
+      · rename_i hlt
+        rw [decDigitsAux_append_digit 0 (n % 10) (Nat.mod_lt _ (by decide))]
+        simp [Nat.mod_eq_of_lt hlt]
+      · have hdiv : n / 10 < 10 ^ k := by rw [Nat.pow_succ] at hbound; omega
+        rw [ih (n / 10) hdiv (Char.ofNat (48 + n % 10) :: cs)]
+        rw [decDigitsAux_append_digit (n / 10) (n % 10) (Nat.mod_lt _ (by decide))]
+        have hrec : n / 10 * 10 + n % 10 = n := by omega
+        rw [hrec]
+
+theorem decNat_encNat (n : Nat) (hn : n < 10000000000) : decNat (encNat n) = some n := by
+  unfold decNat encNat
+  rw [String.toList_ofList]
+  have hne : encNatAux 10 n [] ≠ [] := fun heq => by
+    have hpos := encNatAux_length_pos 10 n [] (by decide)
+    rw [heq] at hpos; simp at hpos
+  cases h : encNatAux 10 n [] with
+  | nil => exact absurd h hne
+  | cons c cs =>
+      have hdec := decDigitsAux_encNatAux 10 n hn []
+      rw [h] at hdec; exact hdec
+
+theorem encNat_injective {a b : Nat} (ha : a < 10000000000) (hb : b < 10000000000)
+    (heq : encNat a = encNat b) : a = b := by
+  have h1 := decNat_encNat a ha
+  have h2 := decNat_encNat b hb
+  rw [heq] at h1
+  rw [h1] at h2
+  exact Option.some.inj h2
+
+theorem encNat_no_hyphen (n : Nat) : '-' ∉ (encNat n).toList := by
+  unfold encNat
+  rw [String.toList_ofList]
+  intro hmem
+  have hle : (48 : Nat) ≤ ('-').toNat := (encNatAux_all_digits 10 n [] (by simp) '-' hmem).1
+  revert hle; decide
+
+def renderEnvTag : EnvInstance → String
+  | .prod       => "p"
+  | .staging    => "s"
+  | .preview pr => "r" ++ encNat pr.num
+
+/-- Canonical slug `<tenant>-<app>-<envTag>` shared by SA IDs (`q-<slug>`) and Cloud Run (`cr-<slug>`). -/
+def renderKeySlug (k : DeployKey) : String :=
+  encNat k.tenant.num ++ "-" ++ encNat k.app.num ++ "-" ++ renderEnvTag k.env
+
+def renderSaId (k : DeployKey) : String :=
+  "q-" ++ renderKeySlug k
+
+def renderSaEmail (k : DeployKey) : String :=
+  renderSaId k ++ "@" ++ k.shard.projectId ++ ".iam.gserviceaccount.com"
+
+def renderCloudRunName (k : DeployKey) : String :=
+  "cr-" ++ renderKeySlug k
+
+private theorem append_hyphen_inj {a₁ b₁ a₂ b₂ : List Char}
+    (h1 : '-' ∉ a₁) (h2 : '-' ∉ a₂)
+    (heq : a₁ ++ '-' :: b₁ = a₂ ++ '-' :: b₂) : a₁ = a₂ ∧ b₁ = b₂ := by
+  induction a₁ generalizing a₂ with
+  | nil =>
+      cases a₂ with
+      | nil => simp_all
+      | cons c cs =>
+          simp only [List.nil_append, List.cons_append, List.cons.injEq] at heq
+          rcases heq with ⟨rfl, _⟩; exact absurd List.mem_cons_self h2
+  | cons c cs ih =>
+      cases a₂ with
+      | nil =>
+          simp only [List.nil_append, List.cons_append, List.cons.injEq] at heq
+          rcases heq with ⟨rfl, _⟩; exact absurd List.mem_cons_self h1
+      | cons d ds =>
+          simp only [List.cons_append, List.cons.injEq] at heq
+          rcases heq with ⟨rfl, htail⟩
+          rcases ih (fun hm => h1 (List.mem_cons_of_mem _ hm)) (fun hm => h2 (List.mem_cons_of_mem _ hm)) htail with ⟨rfl, rfl⟩
+          exact ⟨rfl, rfl⟩
+
+private theorem str_eq_of_toList {s₁ s₂ : String} (h : s₁.toList = s₂.toList) : s₁ = s₂ := by
+  rw [← String.ofList_toList (s := s₁), ← String.ofList_toList (s := s₂), h]
+
+private theorem renderEnvTag_injective {e₁ e₂ : EnvInstance}
+    (heq : renderEnvTag e₁ = renderEnvTag e₂) : e₁ = e₂ := by
+  have hlist := congrArg String.toList heq
+  cases e₁ <;> cases e₂ <;> simp [renderEnvTag, String.toList_append] at hlist
+  · rfl
+  · rfl
+  case preview.preview pr₁ pr₂ =>
+    rcases pr₁ with ⟨n₁, h₁⟩; rcases pr₂ with ⟨n₂, h₂⟩
+    have hn : n₁ = n₂ := encNat_injective (by omega) (by omega) (str_eq_of_toList hlist)
+    subst hn; rfl
+
+theorem renderKeySlug_injective {k₁ k₂ : DeployKey}
+    (hshard : k₁.shard = k₂.shard) (heq : renderKeySlug k₁ = renderKeySlug k₂) : k₁ = k₂ := by
+  rcases k₁ with ⟨sh₁, ⟨t₁, ht₁⟩, ⟨a₁, ha₁⟩, e₁⟩
+  rcases k₂ with ⟨sh₂, ⟨t₂, ht₂⟩, ⟨a₂, ha₂⟩, e₂⟩
+  simp only at hshard; subst hshard
+  have hlist :
+      (encNat t₁).toList ++ '-' :: ((encNat a₁).toList ++ '-' :: (renderEnvTag e₁).toList) =
+      (encNat t₂).toList ++ '-' :: ((encNat a₂).toList ++ '-' :: (renderEnvTag e₂).toList) := by
+    have := congrArg String.toList heq
+    simpa [renderKeySlug, String.toList_append, List.append_assoc] using this
+  rcases append_hyphen_inj (encNat_no_hyphen t₁) (encNat_no_hyphen t₂) hlist with ⟨htL, hrest⟩
+  rcases append_hyphen_inj (encNat_no_hyphen a₁) (encNat_no_hyphen a₂) hrest with ⟨haL, heL⟩
+  have htEq : t₁ = t₂ := encNat_injective (by omega) (by omega) (str_eq_of_toList htL)
+  have haEq : a₁ = a₂ := encNat_injective (by omega) (by omega) (str_eq_of_toList haL)
+  have heEq : e₁ = e₂ := renderEnvTag_injective (str_eq_of_toList heL)
+  subst htEq; subst haEq; subst heEq; rfl
+
+/-- **SA Injectivity Theorem:** Distinct `(tenant, app, env)` deployments in a shard ALWAYS map
+    to distinct GCP Service Account IDs (zero collision/truncation risk). -/
+theorem renderSaId_injective {k₁ k₂ : DeployKey}
+    (hshard : k₁.shard = k₂.shard) (heq : renderSaId k₁ = renderSaId k₂) : k₁ = k₂ := by
+  have hlist := congrArg String.toList heq
+  simp only [renderSaId, String.toList_append] at hlist
+  have hq : "q-".toList = ['q', '-'] := by decide
+  rw [hq] at hlist
+  exact renderKeySlug_injective hshard (str_eq_of_toList (List.cons.inj (List.cons.inj hlist).2).2)
+
+/-- **Cloud Run Service Injectivity Theorem:** Distinct `(tenant, app, env)` deployments in a shard
+    ALWAYS map to distinct Cloud Run service names. -/
+theorem renderCloudRunName_injective {k₁ k₂ : DeployKey}
+    (hshard : k₁.shard = k₂.shard) (heq : renderCloudRunName k₁ = renderCloudRunName k₂) : k₁ = k₂ := by
+  have hlist := congrArg String.toList heq
+  simp only [renderCloudRunName, String.toList_append] at hlist
+  have hcr : "cr-".toList = ['c', 'r', '-'] := by decide
+  rw [hcr] at hlist
+  exact renderKeySlug_injective hshard (str_eq_of_toList (List.cons.inj (List.cons.inj (List.cons.inj hlist).2).2).2)
+
+private theorem renderKeySlug_length_bounds (k : DeployKey) :
+    5 ≤ (renderKeySlug k).toList.length ∧ (renderKeySlug k).toList.length ≤ 19 := by
+  have htPos : 0 < (encNat k.tenant.num).toList.length := by
+    simpa [encNat] using encNatAux_length_pos 10 k.tenant.num [] (by decide)
+  have haPos : 0 < (encNat k.app.num).toList.length := by
+    simpa [encNat] using encNatAux_length_pos 10 k.app.num [] (by decide)
+  have htLe : (encNat k.tenant.num).toList.length ≤ 6 := by
+    simpa [encNat] using encNatAux_length_bound 5 10 k.tenant.num k.tenant.valid (by decide) []
+  have haLe : (encNat k.app.num).toList.length ≤ 5 := by
+    simpa [encNat] using encNatAux_length_bound 4 10 k.app.num k.app.valid (by decide) []
+  have heBounds : 1 ≤ (renderEnvTag k.env).toList.length ∧ (renderEnvTag k.env).toList.length ≤ 6 := by
+    cases h : k.env with
+    | prod => decide
+    | staging => decide
+    | preview pr =>
+        have hprLe : (encNat pr.num).toList.length ≤ 5 := by
+          simpa [encNat] using encNatAux_length_bound 4 10 pr.num pr.valid (by decide) []
+        have hcat : (renderEnvTag (.preview pr)).toList.length = 1 + (encNat pr.num).toList.length := by
+          simp [renderEnvTag, String.toList_append]; omega
+        omega
+  have htot : (renderKeySlug k).toList.length =
+      (encNat k.tenant.num).toList.length + 1 + (encNat k.app.num).toList.length + 1 + (renderEnvTag k.env).toList.length := by
+    simp only [renderKeySlug, String.toList_append, List.length_append]
+    have hd : "-".toList.length = 1 := by decide
+    omega
+  omega
+
+/-- **GCP SA Length-Bound Theorem:** Every SA ID length is in `[7, 21]` (strictly inside `[6, 30]`). -/
+theorem renderSaId_gcp_length_valid (k : DeployKey) :
+    6 ≤ (renderSaId k).toList.length ∧ (renderSaId k).toList.length ≤ 30 := by
+  have hb := renderKeySlug_length_bounds k
+  have hq : "q-".toList.length = 2 := by decide
+  simp only [renderSaId, String.toList_append, List.length_append]
+  omega
+
+/-- **Cloud Run Name Length-Bound Theorem:** Every Cloud Run service name length is in `[8, 22]` (≤ 63). -/
+theorem renderCloudRunName_gcp_length_valid (k : DeployKey) :
+    6 ≤ (renderCloudRunName k).toList.length ∧ (renderCloudRunName k).toList.length ≤ 63 := by
+  have hb := renderKeySlug_length_bounds k
+  have hcr : "cr-".toList.length = 3 := by decide
+  simp only [renderCloudRunName, String.toList_append, List.length_append]
+  omega
+
+/-! ### 4. Open Principal Universe, Typed Roles (No `owner`/`editor`), & IAM Semantics -/
+
+/-- Open principal universe: includes unauthenticated internet callers (`allUsers`),
+    any Google account (`allAuthenticatedUsers`), external accounts, control-plane SAs,
+    and per-deployment runtime SAs. -/
+inductive GcpPrincipal where
+  | allUsers
+  | allAuthenticatedUsers
+  | builder
+  | edgeRouter
+  | runtimeSa (key : DeployKey)
+  | external  (email : String)
+deriving Inhabited, DecidableEq, Repr
+
+inductive GcpPermission where
+  | secretAccessor
+  | runInvoke
+  | cloudSqlClient
+  | storageObjectViewer
+  | storageObjectAdmin
+  | iamSetPolicy
+  | iamActAs
+  | iamGetAccessToken
+  | iamSignJwt
+deriving Inhabited, DecidableEq, Repr
+
+/-- Permissions that allow modifying IAM or impersonating another principal in GCP. -/
+def GcpPermission.isEscalation : GcpPermission → Bool
+  | .iamSetPolicy | .iamActAs | .iamGetAccessToken | .iamSignJwt => true
+  | _ => false
+
+/-- Typed least-privilege GCP predefined roles.
+    Basic roles (`roles/owner`, `roles/editor`) are structurally unrepresentable. -/
+inductive GcpRole where
+  | secretManagerAccessor
+  | runInvoker
+  | cloudSqlClient
+  | storageObjectViewer
+  | storageObjectAdmin
+deriving Inhabited, DecidableEq, Repr
+
+def GcpRole.gcpName : GcpRole → String
+  | .secretManagerAccessor => "roles/secretmanager.secretAccessor"
+  | .runInvoker            => "roles/run.invoker"
+  | .cloudSqlClient        => "roles/cloudsql.client"
+  | .storageObjectViewer   => "roles/storage.objectViewer"
+  | .storageObjectAdmin    => "roles/storage.objectAdmin"
+
+def GcpRole.permissions : GcpRole → List GcpPermission
+  | .secretManagerAccessor => [.secretAccessor]
+  | .runInvoker            => [.runInvoke]
+  | .cloudSqlClient        => [.cloudSqlClient]
+  | .storageObjectViewer   => [.storageObjectViewer]
+  | .storageObjectAdmin    => [.storageObjectAdmin, .storageObjectViewer]
+
+/-- No predefined role emitted by Qed Cloud contains an IAM escalation permission. -/
+theorem GcpRole.no_escalation (role : GcpRole) (perm : GcpPermission)
+    (h : perm ∈ role.permissions) : perm.isEscalation = false := by
+  cases role <;> simp [GcpRole.permissions] at h <;> rcases h with rfl | rfl <;> rfl
+
+inductive GcpResource where
+  | secret      (key : DeployKey) (secretName : String)
+  | cloudRun    (key : DeployKey)
+  | cloudSqlDb  (cluster : DbCluster) (key : DeployKey) (dbName : String)
+  | assetPrefix (key : DeployKey) (buildHash : String)
+deriving Inhabited, DecidableEq, Repr
+
+def GcpResource.ownerKey : GcpResource → DeployKey
+  | .secret k _        => k
+  | .cloudRun k        => k
+  | .cloudSqlDb _ k _  => k
+  | .assetPrefix k _   => k
+
+def GcpResource.isProdResource : GcpResource → Bool
+  | .cloudSqlDb .prodCluster _ _ => true
+  | r                            => r.ownerKey.env.isProd
+
+def GcpResource.isPublicAsset : GcpResource → Bool
+  | .assetPrefix _ _ => true
+  | _                => false
+
+structure GcpIamBinding where
+  principal : GcpPrincipal
+  role      : GcpRole
+  resource  : GcpResource
+deriving Inhabited, DecidableEq, Repr
+
+structure GcpDenyRule where
+  principals  : List GcpPrincipal
+  permissions : List GcpPermission
+  resource    : GcpResource
+deriving Inhabited, DecidableEq, Repr
+
+/-- Combined multi-tenant GCP policy & egress state across all deployments. -/
+structure GcpPolicyState where
+  bindings    : List GcpIamBinding := []
+  denies      : List GcpDenyRule := []
+  egressAllow : List (DeployKey × String) := []
+deriving Inhabited, DecidableEq, Repr
+
+/-- Direct GCP IAM evaluation: `p` is allowed `perm` on `r` iff some binding grants `perm`
+    to `p` on `r` AND no deny rule blocks `(p, perm, r)`. -/
+def GcpPolicyState.allows (st : GcpPolicyState) (p : GcpPrincipal)
+    (perm : GcpPermission) (r : GcpResource) : Prop :=
+  (∃ b ∈ st.bindings, b.principal = p ∧ b.resource = r ∧ perm ∈ b.role.permissions) ∧
+  ¬ (∃ d ∈ st.denies, p ∈ d.principals ∧ perm ∈ d.permissions ∧ d.resource = r)
+
+/-- Conservative privilege-escalation step relation:
+    if `p₁` holds ANY escalation permission on ANY resource, we conservatively allow `p₁` to step to any `p₂`. -/
+def GcpPolicyState.canStep (st : GcpPolicyState) (p₁ _p₂ : GcpPrincipal) : Prop :=
+  ∃ perm r, perm.isEscalation = true ∧ st.allows p₁ perm r
+
+inductive GcpPolicyState.canReachPrincipal (st : GcpPolicyState) : GcpPrincipal → GcpPrincipal → Prop where
+  | refl (p : GcpPrincipal) : st.canReachPrincipal p p
+  | step {p₁ p₂ p₃ : GcpPrincipal} :
+      st.canStep p₁ p₂ → st.canReachPrincipal p₂ p₃ → st.canReachPrincipal p₁ p₃
+
+/-- Transitive IAM reachability across any sequence of `canStep` hops. -/
+def GcpPolicyState.canReach (st : GcpPolicyState) (p : GcpPrincipal)
+    (perm : GcpPermission) (r : GcpResource) : Prop :=
+  ∃ p', st.canReachPrincipal p p' ∧ st.allows p' perm r
+
+def GcpPolicyState.egressAllowed (st : GcpPolicyState) (k : DeployKey) (origin : String) : Prop :=
+  (k, origin) ∈ st.egressAllow
+
+/-! ### 5. Four-Phase Zero-Downtime Cloud Run Rollout Model -/
+
+inductive RolloutPhase where
+  | phase1_provision     -- upload immutable assets, create secrets/DBs, grant new IAM, widen egress union
+  | phase2_deployZero    -- deploy Cloud Run revision at 0% traffic & health check
+  | phase3_shiftTraffic  -- atomically shift traffic 0% -> 100%
+  | phase4_cleanup       -- revoke stale bindings/secrets & narrow removed egress AFTER traffic flip
+deriving Inhabited, DecidableEq, Repr
+
+def RolloutPhase.rank : RolloutPhase → Nat
+  | .phase1_provision    => 1
+  | .phase2_deployZero   => 2
+  | .phase3_shiftTraffic => 3
+  | .phase4_cleanup      => 4
+
+inductive GcpAction where
+  | uploadAssets       (key : DeployKey) (buildHash : String) (paths : List String)
+  | ensureSecret       (key : DeployKey) (secretName : String)
+  | ensureDb           (cluster : DbCluster) (key : DeployKey) (dbName : String)
+  | grantBinding       (binding : GcpIamBinding)
+  | putDenyRule        (rule : GcpDenyRule)
+  | setEgressRules     (key : DeployKey) (origins : List String)
+  | deployRevisionZero (key : DeployKey) (buildHash : String) (scale : ScaleSpec)
+  | healthCheck        (key : DeployKey) (buildHash : String)
+  | shiftTraffic100    (key : DeployKey) (buildHash : String)
+  | revokeBinding      (binding : GcpIamBinding)
+  | deleteSecret       (key : DeployKey) (secretName : String)
+  | narrowEgressRules  (key : DeployKey) (origins : List String)
+  | deleteService      (key : DeployKey)
+  | dropPreviewDb      (key : DeployKey) (dbName : String)
+deriving Inhabited, DecidableEq, Repr
+
+def GcpAction.phase : GcpAction → RolloutPhase
+  | .uploadAssets _ _ _       => .phase1_provision
+  | .ensureSecret _ _         => .phase1_provision
+  | .ensureDb _ _ _           => .phase1_provision
+  | .grantBinding _           => .phase1_provision
+  | .putDenyRule _            => .phase1_provision
+  | .setEgressRules _ _       => .phase1_provision
+  | .deployRevisionZero _ _ _ => .phase2_deployZero
+  | .healthCheck _ _          => .phase2_deployZero
+  | .shiftTraffic100 _ _      => .phase3_shiftTraffic
+  | .revokeBinding _          => .phase4_cleanup
+  | .deleteSecret _ _         => .phase4_cleanup
+  | .narrowEgressRules _ _    => .phase4_cleanup
+  | .deleteService _          => .phase4_cleanup
+  | .dropPreviewDb _ _        => .phase4_cleanup
+
+def GcpAction.isDestructive : GcpAction → Bool
+  | .revokeBinding _ | .deleteSecret _ _ | .narrowEgressRules _ _
+  | .deleteService _ | .dropPreviewDb _ _ => true
+  | _ => false
+
+def GcpAction.targetKey : GcpAction → DeployKey
+  | .uploadAssets k _ _       => k
+  | .ensureSecret k _         => k
+  | .ensureDb _ k _           => k
+  | .grantBinding b           => b.resource.ownerKey
+  | .putDenyRule d            => d.resource.ownerKey
+  | .setEgressRules k _       => k
+  | .deployRevisionZero k _ _ => k
+  | .healthCheck k _          => k
+  | .shiftTraffic100 k _      => k
+  | .revokeBinding b          => b.resource.ownerKey
+  | .deleteSecret k _         => k
+  | .narrowEgressRules k _    => k
+  | .deleteService k          => k
+  | .dropPreviewDb k _        => k
+
+/-- Monotonicity predicate: every action list is non-decreasing in `RolloutPhase.rank`. -/
+def actionsPhaseOrdered : List GcpAction → Prop
+  | []           => True
+  | [_]          => True
+  | a :: b :: xs => a.phase.rank ≤ b.phase.rank ∧ actionsPhaseOrdered (b :: xs)
+
+end Qed.Cloud

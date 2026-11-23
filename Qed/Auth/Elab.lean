@@ -81,7 +81,8 @@ private def oidcAuthSpecToTerm (s : OidcAuthSpec) : CommandElabM Term := do
   let claimTms ← s.claims.toArray.mapM fun cl =>
     `({ name := $(Syntax.mkStrLit cl.name), typeName := $(Syntax.mkStrLit cl.typeName),
         defaultValue := $(Syntax.mkStrLit cl.defaultValue) : Qed.Auth.AuthClaimSpec })
-  `({ name := $(Syntax.mkStrLit s.name), issuerEnv := $(Syntax.mkStrLit s.issuerEnv),
+  `({ name := $(Syntax.mkStrLit s.name), isManaged := $(quote s.isManaged),
+      issuerEnv := $(Syntax.mkStrLit s.issuerEnv),
       issuerDefault? := $(← optStr s.issuerDefault?), audienceEnv := $(Syntax.mkStrLit s.audienceEnv),
       audienceDefault? := $(← optStr s.audienceDefault?), clientIdEnv? := $(← optStr s.clientIdEnv?),
       clientIdDefault? := $(← optStr s.clientIdDefault?), clientSecretEnv? := $(← optStr s.clientSecretEnv?),
@@ -97,6 +98,8 @@ def elabAuthCmd : CommandElab := fun stx => do
   let authShort := authName.toString
   let clauses := (stx.getArg 3).getArgs
 
+  let mut isManaged : Bool := false
+  let mut seen : Array Name := #[]
   let mut issuerEnv : String := "QED_AUTH_ISSUER"
   let mut issuerDefault? : Option String := none
   let mut audienceEnv : String := "QED_AUTH_AUDIENCE"
@@ -109,10 +112,30 @@ def elabAuthCmd : CommandElab := fun stx => do
   let mut claims : Array ParsedClaimDecl := #[]
   let mut secrets : Array String := #[]
 
+  let pushProviders (args : Array Syntax) (cur : Array String) : Array String :=
+    args.foldl (init := cur) fun acc p =>
+      let ps := p.getId.eraseMacroScopes.toString
+      if acc.contains ps then acc else acc.push ps
+
   for c in clauses do
     let k := c.getKind
-    if k == ``authIssuerClause || k == ``authAudienceClause ||
+    if seen.contains k then
+      throwErrorAt c s!"duplicate clause in `auth {authShort}`"
+    seen := seen.push k
+    if k == ``authManagedClause then
+      if seen.any fun sk => sk == ``authIssuerClause || sk == ``authAudienceClause ||
+          sk == ``authClientIdClause || sk == ``authClientSecretClause || sk == ``authProvidersClause then
+        throwErrorAt c s!"cannot combine `managed [...]` with explicit OIDC/provider clauses in `auth {authShort}`"
+      isManaged := true
+      audienceDefault? := none
+      clientIdDefault? := none
+      clientSecretEnv? := some "QED_AUTH_CLIENT_SECRET"
+      secrets := secrets.push "QED_AUTH_CLIENT_SECRET"
+      providers := pushProviders (c.getArg 2).getSepArgs providers
+    else if k == ``authIssuerClause || k == ``authAudienceClause ||
        k == ``authClientIdClause || k == ``authClientSecretClause then
+      if isManaged then
+        throwErrorAt c s!"cannot combine `managed [...]` with explicit OIDC clauses in `auth {authShort}`"
       let r ← parseQedEnvRef "`auth`" (c.getArg 1)
       if r.isSecret && !secrets.contains r.envKey then secrets := secrets.push r.envKey
       if k == ``authIssuerClause then issuerEnv := r.envKey; issuerDefault? := r.default?
@@ -120,9 +143,9 @@ def elabAuthCmd : CommandElab := fun stx => do
       else if k == ``authClientIdClause then clientIdEnv? := some r.envKey; clientIdDefault? := r.default?
       else clientSecretEnv? := some r.envKey
     else if k == ``authProvidersClause then
-      for p in (c.getArg 2).getSepArgs do
-        let ps := p.getId.eraseMacroScopes.toString
-        if !providers.contains ps then providers := providers.push ps
+      if isManaged then
+        throwErrorAt c s!"cannot combine `managed [...]` with `providers` in `auth {authShort}`"
+      providers := pushProviders (c.getArg 2).getSepArgs providers
     else if k == ``authSessionClause then
       let ttl := (⟨c.getArg 3⟩ : TSyntax `num).getNat
       if ttl == 0 then
@@ -223,6 +246,7 @@ def elabAuthCmd : CommandElab := fun stx => do
   let secLits : Array Term := secrets.map (Syntax.mkStrLit ·)
   let spec : OidcAuthSpec := {
     name := authShort
+    isManaged
     issuerEnv, issuerDefault?, audienceEnv, audienceDefault?
     clientIdEnv?, clientIdDefault?, clientSecretEnv?
     providers := providers.toList, sessionTtlSec

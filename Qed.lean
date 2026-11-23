@@ -22,4 +22,5 @@ import Qed.Ssr
 import Qed.Style
 import Qed.Auth
 import Qed.Server
+import Qed.Cloud
 -- `Qed.Dom`, `Qed.Driver`, and `Qed.Server.Native` are omitted so pure app modules compile cleanly to both JS and native SSR/RPC targets.

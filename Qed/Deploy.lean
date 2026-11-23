@@ -1,5 +1,6 @@
 import Lean
 import Qed.Json
+import Qed.Cloud.Env
 import Qed.Auth.Core
 import Qed.Server.Core
 import Qed.Server.Registry
@@ -40,6 +41,57 @@ structure DeployManifest where
   csp        : String := Qed.Server.defaultCsp
 deriving Inhabited
 
+/-- Per-environment least-privilege infrastructure footprint derived from `DeployManifest`. -/
+structure EnvFootprint where
+  secrets      : List Qed.Cloud.SecretRef := []
+  egress       : List String := []
+  managedDbs   : List (String × Qed.Cloud.DbCluster) := []
+  ephemeralDbs : List String := []
+  authTarget?  : Option Qed.Cloud.AuthEnvTarget := none
+deriving Inhabited, DecidableEq, Repr
+
+private def dedupSecretsByEnvVar (xs : List Qed.Cloud.SecretRef) : List Qed.Cloud.SecretRef :=
+  xs.foldl (init := []) fun acc s =>
+    if acc.any (·.envVar == s.envVar) then acc else acc ++ [s]
+
+/-- Computes the exact least-privilege footprint for a single `DeployEnv`.
+    Uses server-owned secrets (`ownSecrets`, never DB/auth unions), gates `managed` auth's
+    client secret to `staging`/`prod`, and deduplicates secrets strictly by `envVar`. -/
+def DeployManifest.footprintFor (m : DeployManifest) (env : Qed.Cloud.DeployEnv) : EnvFootprint :=
+  let dbSpecs := m.databases.map fun db => (db.shortName, db.envSpecs.get env)
+  let dbSecrets := dbSpecs.flatMap fun (_, sp) => sp.secrets
+  let srvSecrets : List Qed.Cloud.SecretRef :=
+    ((m.server?.map (·.ownSecrets.toList)).getD []).map fun k => { envVar := k, scope := .envScoped }
+  let authSecrets : List Qed.Cloud.SecretRef :=
+    match m.auth? with
+    | some a =>
+        if a.isManaged && (env == .dev || env == .preview) then []
+        else (a.clientSecretEnv?.map fun s => [{ envVar := s, scope := .envScoped }]).getD []
+    | none => []
+  let rawSecrets : List Qed.Cloud.SecretRef :=
+    if m.server?.isSome || !m.databases.isEmpty || m.auth?.isSome then
+      dbSecrets ++ srvSecrets ++ authSecrets
+    else
+      m.secrets.map fun k => { envVar := k, scope := .envScoped }
+  let dbEgress := dbSpecs.flatMap fun (_, sp) => sp.egressOrigins
+  let managedDbs := dbSpecs.filterMap fun (nm, sp) => sp.cluster?.map (nm, ·)
+  let ephemeralDbs := dbSpecs.filterMap fun (nm, sp) => if sp.isEphemeral then some nm else none
+  let authTarget? := m.auth?.map fun a =>
+    if a.isManaged then (Qed.Cloud.managedAuthTargets a.providers).get env else .customOidc
+  {
+    secrets      := dedupSecretsByEnvVar rawSecrets
+    egress       := (m.egress ++ dbEgress).eraseDups
+    managedDbs
+    ephemeralDbs
+    authTarget?
+  }
+
+def DeployManifest.envs (m : DeployManifest) : Qed.Cloud.EnvMap EnvFootprint :=
+  { dev     := m.footprintFor .dev
+    preview := m.footprintFor .preview
+    staging := m.footprintFor .staging
+    prod    := m.footprintFor .prod }
+
 /-! ### Kernel-Verified Manifest Consistency Checks -/
 
 abbrev isValidEnvKey : String → Bool := Qed.Server.isValidEnvVarName
@@ -63,6 +115,8 @@ def validateAuthManifest (a : DeployAuthManifest) : Except String Unit :=
   else if !Qed.Auth.isSafeReturnTo a.callbackPath then .error s!"deploy manifest: unsafe auth callbackPath `{a.callbackPath}`"
   else if !Qed.Auth.isSafeReturnTo a.logoutPath then .error s!"deploy manifest: unsafe auth logoutPath `{a.logoutPath}`"
   else if !Qed.Auth.isSafeReturnTo a.mePath then .error s!"deploy manifest: unsafe auth mePath `{a.mePath}`"
+  else if a.clientIdEnv?.any (!isValidEnvKey ·) then .error "deploy manifest: invalid auth clientIdEnv"
+  else if a.clientSecretEnv?.any (!isValidEnvKey ·) then .error "deploy manifest: invalid auth clientSecretEnv"
   else .ok ()
 
 def DeployManifest.validate (m : DeployManifest) : Except String Unit := do
@@ -104,12 +158,30 @@ theorem validate_default_ok : ({} : DeployManifest).validate = .ok () := rfl
 
 /-! ### Deterministic JSON Serialization -/
 
+private def footprintToJson (fp : EnvFootprint) : Json :=
+  let authTargetJ : Json := match fp.authTarget? with
+    | none                 => .null
+    | some .localDev       => .str "localDev"
+    | some .previewIdp     => .str "previewIdp"
+    | some (.managedOidc _) => .str "managedOidc"
+    | some .customOidc     => .str "customOidc"
+  let managedDbsJ := Json.arr (fp.managedDbs.map fun (nm, cl) =>
+    Json.obj [("name", .str nm), ("cluster", .str (match cl with | .prodCluster => "prod" | .nonProdCluster => "nonProd"))])
+  Json.obj [
+    ("secrets", ToJson.toJson (fp.secrets.map (·.envVar))),
+    ("egress", ToJson.toJson fp.egress),
+    ("managedDbs", managedDbsJ),
+    ("ephemeralDbs", ToJson.toJson fp.ephemeralDbs),
+    ("authTarget", authTargetJ)
+  ]
+
 def DeployManifest.toJson (m : DeployManifest) : Json :=
   let envVarsJ := Json.arr (m.envVars.map fun (nm, osKey, def?) =>
     Json.obj [("name", .str nm), ("osKey", .str osKey), ("default", ToJson.toJson def?)])
   let dbsJ := Json.arr (m.databases.map fun db =>
     Json.obj [
       ("name", .str db.shortName),
+      ("isManaged", .bool db.isManaged),
       ("hasDevFallback", .bool db.hasDevFallback),
       ("secrets", ToJson.toJson db.secrets),
       ("tables", .arr (db.tables.toList.map fun t =>
@@ -136,6 +208,7 @@ def DeployManifest.toJson (m : DeployManifest) : Json :=
     | some a =>
         Json.obj [
           ("name", .str a.name),
+          ("isManaged", .bool a.isManaged),
           ("issuerEnv", .str a.issuerEnv),
           ("issuerDefault", ToJson.toJson a.issuerDefault?),
           ("audienceEnv", .str a.audienceEnv),
@@ -167,6 +240,13 @@ def DeployManifest.toJson (m : DeployManifest) : Json :=
         ]
   let assetsJ := Json.arr (m.assets.map fun a =>
     Json.obj [("path", .str a.path), ("mime", .str a.mime), ("bytes", ToJson.toJson a.bytes)])
+  let em := m.envs
+  let envsJ := Json.obj [
+    ("dev",     footprintToJson em.dev),
+    ("preview", footprintToJson em.preview),
+    ("staging", footprintToJson em.staging),
+    ("prod",    footprintToJson em.prod)
+  ]
   Json.obj [
     ("version", ToJson.toJson m.version),
     ("rootModule", .str m.rootModule),
@@ -178,6 +258,7 @@ def DeployManifest.toJson (m : DeployManifest) : Json :=
     ("auth", authJ),
     ("server", srvJ),
     ("assets", assetsJ),
+    ("envs", envsJ),
     ("csp", .str m.csp)
   ]
 

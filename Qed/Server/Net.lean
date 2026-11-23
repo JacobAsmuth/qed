@@ -303,11 +303,11 @@ def isBlockedIpv4 (b0 b1 b2 _b3 : UInt8) : Bool :=
   (b0 == 203 && b1 == 0 && b2 == 113) ||
   b0 >= 224
 
-private def allZeroRange (data : Array UInt8) (lo : Nat) : Nat → Bool
+private def allZeroRange (addr : ByteArray) (lo : Nat) : Nat → Bool
   | 0 => true
   | k + 1 =>
-      if h : lo < data.size then
-        data[lo] == 0 && allZeroRange data (lo + 1) k
+      if h : lo < addr.size then
+        addr[lo] == 0 && allZeroRange addr (lo + 1) k
       else false
 
 /-- Total SSRF IP blocklist over raw 4-byte IPv4 or 16-byte IPv6 addresses (fail-closed on any
@@ -316,36 +316,35 @@ private def allZeroRange (data : Array UInt8) (lo : Nat) : Nat → Bool
     deprecated site-local (`fec0::/10`), multicast (`ff00::/8`), discard-only (`100::/64`),
     documentation (`2001:db8::/32`), Teredo (`2001::/32`), and 6to4 (`2002::/16`). -/
 def isBlockedIpBytes (addr : ByteArray) : Bool :=
-  let d := addr.data
-  if h4 : d.size = 4 then
-    isBlockedIpv4 (d[0]'(by omega)) (d[1]'(by omega)) (d[2]'(by omega)) (d[3]'(by omega))
-  else if h16 : d.size = 16 then
-    let b0  := d[0]'(by omega)
-    let b1  := d[1]'(by omega)
-    let b2  := d[2]'(by omega)
-    let b3  := d[3]'(by omega)
-    let b4  := d[4]'(by omega)
-    let b5  := d[5]'(by omega)
-    let b10 := d[10]'(by omega)
-    let b11 := d[11]'(by omega)
-    let b12 := d[12]'(by omega)
-    let b13 := d[13]'(by omega)
-    let b14 := d[14]'(by omega)
-    let b15 := d[15]'(by omega)
-    if allZeroRange d 0 12 then
+  if h4 : addr.size = 4 then
+    isBlockedIpv4 (addr[0]'(by omega)) (addr[1]'(by omega)) (addr[2]'(by omega)) (addr[3]'(by omega))
+  else if h16 : addr.size = 16 then
+    let b0  := addr[0]'(by omega)
+    let b1  := addr[1]'(by omega)
+    let b2  := addr[2]'(by omega)
+    let b3  := addr[3]'(by omega)
+    let b4  := addr[4]'(by omega)
+    let b5  := addr[5]'(by omega)
+    let b10 := addr[10]'(by omega)
+    let b11 := addr[11]'(by omega)
+    let b12 := addr[12]'(by omega)
+    let b13 := addr[13]'(by omega)
+    let b14 := addr[14]'(by omega)
+    let b15 := addr[15]'(by omega)
+    if allZeroRange addr 0 12 then
       (b12 == 0 && b13 == 0 && b14 == 0 && b15 <= 1) || isBlockedIpv4 b12 b13 b14 b15
     else if (b0 &&& 0xFE) == 0xFC then true
     else if b0 == 0xFE && (b1 &&& 0xC0) == 0x80 then true
     else if b0 == 0xFE && (b1 &&& 0xC0) == 0xC0 then true
     else if b0 == 0xFF then true
-    else if b0 == 0x01 && b1 == 0x00 && allZeroRange d 2 6 then true
+    else if b0 == 0x01 && b1 == 0x00 && allZeroRange addr 2 6 then true
     else if b0 == 0x20 && b1 == 0x01 && b2 == 0x0D && b3 == 0xB8 then true
     else if b0 == 0x20 && b1 == 0x01 && b2 == 0x00 && b3 == 0x00 then true
     else if b0 == 0x20 && b1 == 0x02 then true
     else if b0 == 0x00 && b1 == 0x64 && b2 == 0xFF && b3 == 0x9B && b4 == 0x00 && b5 == 0x01 then true
-    else if allZeroRange d 0 10 && b10 == 0xFF && b11 == 0xFF then
+    else if allZeroRange addr 0 10 && b10 == 0xFF && b11 == 0xFF then
       isBlockedIpv4 b12 b13 b14 b15
-    else if b0 == 0x00 && b1 == 0x64 && b2 == 0xFF && b3 == 0x9B && allZeroRange d 4 8 then
+    else if b0 == 0x00 && b1 == 0x64 && b2 == 0xFF && b3 == 0x9B && allZeroRange addr 4 8 then
       isBlockedIpv4 b12 b13 b14 b15
     else false
   else
@@ -353,23 +352,28 @@ def isBlockedIpBytes (addr : ByteArray) : Bool :=
 
 theorem isBlockedIpBytes_loopback_v4 (b1 b2 b3 : UInt8) :
     isBlockedIpBytes (ByteArray.mk #[127, b1, b2, b3]) = true := by
-  simp [isBlockedIpBytes, isBlockedIpv4]
+  simp only [isBlockedIpBytes, isBlockedIpv4, ByteArray.getElem_eq_getElem_data]
+  simp [ByteArray.size, -ByteArray.size_data]
 
 theorem isBlockedIpBytes_metadata_v4 (b2 b3 : UInt8) :
     isBlockedIpBytes (ByteArray.mk #[169, 254, b2, b3]) = true := by
-  simp [isBlockedIpBytes, isBlockedIpv4]
+  simp only [isBlockedIpBytes, isBlockedIpv4, ByteArray.getElem_eq_getElem_data]
+  simp [ByteArray.size, -ByteArray.size_data]
 
 theorem isBlockedIpBytes_rfc1918_10 (b1 b2 b3 : UInt8) :
     isBlockedIpBytes (ByteArray.mk #[10, b1, b2, b3]) = true := by
-  simp [isBlockedIpBytes, isBlockedIpv4]
+  simp only [isBlockedIpBytes, isBlockedIpv4, ByteArray.getElem_eq_getElem_data]
+  simp [ByteArray.size, -ByteArray.size_data]
 
 theorem isBlockedIpBytes_testnet_v4 (b3 : UInt8) :
     isBlockedIpBytes (ByteArray.mk #[192, 0, 2, b3]) = true := by
-  simp [isBlockedIpBytes, isBlockedIpv4]
+  simp only [isBlockedIpBytes, isBlockedIpv4, ByteArray.getElem_eq_getElem_data]
+  simp [ByteArray.size, -ByteArray.size_data]
 
 theorem isBlockedIpBytes_benchmark_v4 (b2 b3 : UInt8) :
     isBlockedIpBytes (ByteArray.mk #[198, 18, b2, b3]) = true := by
-  simp [isBlockedIpBytes, isBlockedIpv4]; decide
+  simp only [isBlockedIpBytes, isBlockedIpv4, ByteArray.getElem_eq_getElem_data]
+  simp [ByteArray.size, -ByteArray.size_data]; decide
 
 theorem isBlockedIpBytes_loopback_v6 :
     isBlockedIpBytes (ByteArray.mk #[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]) = true := by
@@ -570,23 +574,22 @@ def parseHttpResponseHead (headBytes : ByteArray) : Except String ParsedRespHead
           | some sc => pure sc
           | none    => throw "invalid HTTP status code"
       | _ => throw "invalid HTTP status line"
-    let mut hdrs : Array (String × String) := #[]
+    let mut hdrs : Array (String × String) := Array.mkEmpty (lines.size - 1)
     let mut isChunked := false
     let mut connClose := false
     let mut contentLen? : Option Nat := none
     for idx in [1:lines.size] do
       if h : idx < lines.size then
         if let some (k, v) := splitHeaderKv lines[idx] then
-          let kl := k.toLower
-          if kl == "content-length" then
+          if eqCI k "content-length" then
             let some cl := parseStrictU64 v (256 * 1024 * 1024)
               | throw "invalid Content-Length in HTTP response"
             if let some prev := contentLen? then
               if prev != cl then throw "conflicting Content-Length in HTTP response"
             contentLen? := some cl
-          else if kl == "transfer-encoding" && containsCI v "chunked" then
+          else if eqCI k "transfer-encoding" && containsCI v "chunked" then
             isChunked := true
-          else if kl == "connection" && containsCI v "close" then
+          else if eqCI k "connection" && containsCI v "close" then
             connClose := true
           hdrs := hdrs.push (k, v)
     return { status, headers := hdrs, isChunked, connClose, contentLen := contentLen? }

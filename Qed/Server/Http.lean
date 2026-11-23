@@ -663,24 +663,24 @@ inductive WsFrameStep where
   | frame (fin : Bool) (opcode : UInt8) (payload : ByteArray) (consumed : Nat)
   | protocolErr (closeCode : UInt16)
 
-private def unmaskPayload (data : Array UInt8) (dataOff plen : Nat) (hbound : dataOff + plen ≤ data.size)
+private def unmaskPayload (buf : ByteArray) (dataOff plen : Nat) (hbound : dataOff + plen ≤ buf.size)
     (m0 m1 m2 m3 : UInt8) : ByteArray :=
-  let rec go (i : Nat) (out : Array UInt8) : Array UInt8 :=
-    if h : i < plen then
-      let b := data[dataOff + i]'(by omega)
-      let m := match i &&& 3 with | 0 => m0 | 1 => m1 | 2 => m2 | _ => m3
-      go (i + 1) (out.push (b ^^^ m))
-    else out
-  termination_by plen - i
-  ByteArray.mk (go 0 (Array.mkEmpty plen))
+  if plen == 0 then ByteArray.empty
+  else
+    let endOff := dataOff + plen
+    let rec go (idx : Nat) (a b c d : UInt8) (out : ByteArray) : ByteArray :=
+      if h : idx < endOff then
+        go (idx + 1) b c d a (out.push ((buf[idx]'(by omega)) ^^^ a))
+      else out
+    termination_by dataOff + plen - idx
+    go dataOff m0 m1 m2 m3 (ByteArray.emptyWithCapacity plen)
 
 /-- Decodes one client-to-server RFC 6455 frame from `buf` starting at `offset`, enforcing
     `RSV == 0`, client masking, non-fragmented control frames (`≤ 125` bytes), and `maxMsgBytes`. -/
 def decodeWsFrame (buf : ByteArray) (offset : Nat) (maxMsgBytes : Nat := maxWsMsgBytes) : WsFrameStep :=
-  let d := buf.data
-  if h2 : offset + 2 ≤ d.size then
-    let b0 := d[offset]'(by omega)
-    let b1 := d[offset + 1]'(by omega)
+  if h2 : offset + 2 ≤ buf.size then
+    let b0 := buf[offset]'(by omega)
+    let b1 := buf[offset + 1]'(by omega)
     let fin := (b0 &&& 0x80) != 0
     let rsv := (b0 >>> 4) &&& 0x07
     let opcode := b0 &&& 0x0F
@@ -710,13 +710,13 @@ def decodeWsFrame (buf : ByteArray) (offset : Nat) (maxMsgBytes : Nat := maxWsMs
             .protocolErr 1009
           else
             let frameTotal := hdrLen + 4 + plen
-            if htot : offset + frameTotal ≤ d.size then
+            if htot : offset + frameTotal ≤ buf.size then
               let mOff := offset + hdrLen
-              let m0 := d[mOff]'(by omega)
-              let m1 := d[mOff + 1]'(by omega)
-              let m2 := d[mOff + 2]'(by omega)
-              let m3 := d[mOff + 3]'(by omega)
-              .frame fin opcode (unmaskPayload d (mOff + 4) plen (by omega) m0 m1 m2 m3) frameTotal
+              let m0 := buf[mOff]'(by omega)
+              let m1 := buf[mOff + 1]'(by omega)
+              let m2 := buf[mOff + 2]'(by omega)
+              let m3 := buf[mOff + 3]'(by omega)
+              .frame fin opcode (unmaskPayload buf (mOff + 4) plen (by omega) m0 m1 m2 m3) frameTotal
             else
               .needMore
   else
@@ -726,11 +726,14 @@ def decodeWsFrame (buf : ByteArray) (offset : Nat) (maxMsgBytes : Nat := maxWsMs
 def encodeWsFrame (opcode : UInt8) (payload : ByteArray) : ByteArray :=
   let b0 : UInt8 := 0x80 ||| (opcode &&& 0x0F)
   let n := payload.size
-  let hdr :=
-    if n < 126 then ByteArray.mk #[b0, UInt8.ofNat n]
-    else if n ≤ 65535 then pushU16BE (ByteArray.mk #[b0, 126]) n
-    else pushU32BE (pushU32BE (ByteArray.mk #[b0, 127]) (n >>> 32)) n
-  hdr ++ payload
+  let out :=
+    if n < 126 then
+      ((ByteArray.emptyWithCapacity (2 + n)).push b0).push (UInt8.ofNat n)
+    else if n ≤ 65535 then
+      pushU16BE (((ByteArray.emptyWithCapacity (4 + n)).push b0).push 126) n
+    else
+      pushU32BE (pushU32BE (((ByteArray.emptyWithCapacity (10 + n)).push b0).push 127) (n >>> 32)) n
+  if n == 0 then out else appendByteSlice out payload
 
 def encodeWsCloseFrame (code : UInt16) : ByteArray :=
   encodeWsFrame 0x08 (pushU16BE ByteArray.empty code.toNat)
@@ -738,13 +741,13 @@ def encodeWsCloseFrame (code : UInt16) : ByteArray :=
 theorem decodeWsFrame_rejects_unmasked (b0 b1 : UInt8) (rest : Array UInt8)
     (hunmasked : (b1 &&& 0x80) = 0) :
     decodeWsFrame (ByteArray.mk (#[b0, b1] ++ rest)) 0 = .protocolErr 1002 := by
-  unfold decodeWsFrame
-  simp [hunmasked]
+  simp only [decodeWsFrame, ByteArray.getElem_eq_getElem_data]
+  simp [ByteArray.size, -ByteArray.size_data, hunmasked]
 
 theorem decodeWsFrame_rejects_rsv (b0 b1 : UInt8) (rest : Array UInt8)
     (hrsv : ((b0 >>> 4) &&& 0x07) ≠ 0) :
     decodeWsFrame (ByteArray.mk (#[b0, b1] ++ rest)) 0 = .protocolErr 1002 := by
-  unfold decodeWsFrame
-  simp [hrsv]
+  simp only [decodeWsFrame, ByteArray.getElem_eq_getElem_data]
+  simp [ByteArray.size, -ByteArray.size_data, hrsv]
 
 end Qed.Server.Http

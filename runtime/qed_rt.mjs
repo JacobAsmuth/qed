@@ -25,8 +25,7 @@ export const Int_neg = (a) => -a;
 export const Int_ofNat = (n) => n;
 export const Int_negSucc = (n) => -(n + 1n);
 export const Int_natAbs = (a) => a < 0n ? -a : a;
-const iabs = (b) => b < 0n ? -b : b;
-export const Int_emod = (a, b) => { if (b === 0n) return a; let r = a % b; return r < 0n ? r + iabs(b) : r; };
+export const Int_emod = (a, b) => { if (b === 0n) return a; let r = a % b; return r < 0n ? r + Int_natAbs(b) : r; };
 export const Int_ediv = (a, b) => { if (b === 0n) return 0n; return (a - Int_emod(a, b)) / b; };
 export const Int_decEq = (a, b) => a === b ? 1 : 0;
 export const Int_decLe = (a, b) => a <= b ? 1 : 0;
@@ -46,7 +45,7 @@ export const Nat_lor  = (a, b) => a | b;
 
 const M64 = (1n << 64n) - 1n, u64 = (x) => BigInt(x) & M64;
 export const UInt8_ofNat = (n) => Number(n & 0xFFn);
-export const UInt8_ofNatLT = (n) => Number(n & 0xFFn);
+export const UInt8_ofNatLT = UInt8_ofNat;
 export const UInt8_toNat = (a) => BigInt(a);
 export const UInt8_toUInt16 = (a) => a & 0xFF;
 export const UInt8_toUInt32 = (a) => a >>> 0;
@@ -64,7 +63,7 @@ export const UInt16_shiftRight = (a, b) => (a & 0xFFFF) >>> (b & 15);
 export const UInt32_ofNat = (n) => Number(n & 0xFFFFFFFFn);
 export const UInt32_toNat = (a) => BigInt(a >>> 0);
 export const UInt32_toUInt8 = (a) => a & 0xFF;
-export const UInt32_toUInt64 = (a) => BigInt(a >>> 0);
+export const UInt32_toUInt64 = UInt32_toNat;
 export const UInt32_add = (a, b) => (a + b) >>> 0;
 export const UInt32_sub = (a, b) => (a - b) >>> 0;
 export const UInt32_mul = (a, b) => Math.imul(a, b) >>> 0;
@@ -91,8 +90,7 @@ export const USize_toNat = (a) => BigInt(a);
 export const USize_add = (a, b) => a + b;
 export const USize_sub = (a, b) => a - b;
 export const USize_land = (a, b) => (a <= 0x7FFFFFFF && b <= 0x7FFFFFFF) ? ((a & b) >>> 0) : Number(BigInt(a) & BigInt(b));
-export const USize_decEq = (a, b) => a === b ? 1 : 0;
-export const USize_decLt = (a, b) => a < b ? 1 : 0;
+export const USize_decEq = UInt32_decEq, USize_decLt = UInt32_decLt;
 export const USize_repr = (a) => String(a);
 export const System_Platform_getNumBits = () => 64n;
 
@@ -306,24 +304,15 @@ export const Array_getInternalBorrowed = (a, i) => a[Number(i)];
 export const Array_ugetBorrowed = Array_getInternalBorrowed;
 export const Array_getx33Internal = (_inst, a, i) => { const x = a[Number(i)]; inc(x); return x; };
 export const Array_getx33InternalBorrowed = (_inst, a, i) => a[Number(i)];
-export const Nat_ble = (a, b) => a <= b ? 1 : 0;
-export const Nat_shiftRight = (a, b) => a >> b;
-export const UInt8_decEq = (a, b) => a === b ? 1 : 0;
-export const UInt8_decLt = (a, b) => a < b ? 1 : 0;
-export const UInt8_decLe = (a, b) => a <= b ? 1 : 0;
+export const Nat_ble = Nat_decLe, Nat_shiftRight = (a, b) => a >> b;
+export const UInt8_decEq = UInt32_decEq, UInt8_decLt = UInt32_decLt, UInt8_decLe = UInt32_decLe;
 export const UInt32_ofBitVec = (bv) => Number(BigInt(bv) & 0xFFFFFFFFn);
-export const USize_ofNatLT = (n) => Number(n & 0x1FFFFFFFFFFFFFn);
-export const String_ofList = String_mk;
-export const String_toList = String_data;
-export const String_Internal_append = String_append;
+export const USize_ofNatLT = USize_ofNat;
+export const String_ofList = String_mk, String_toList = String_data, String_Internal_append = String_append;
 export const String_Internal_isPrefixOf = (p, s) => s.startsWith(p) ? 1 : 0;
 export const String_Internal_any = (s, f) => { for (const ch of s) { if (app(f, [ch.codePointAt(0)])) return 1; } return 0; };
-export const String_Pos_Raw_get = String_get;
-export const String_Pos_Raw_next = String_next;
-export const String_Pos_Raw_atEnd = String_atEnd;
-export const String_Pos_Raw_extract = String_extract;
-export const String_Pos_next = String_next;
-export const String_decodeChar = (s, i) => codeAtByte(s, Number(i));
+export const String_Pos_Raw_get = String_get, String_Pos_Raw_next = String_next, String_Pos_Raw_atEnd = String_atEnd;
+export const String_Pos_Raw_extract = String_extract, String_Pos_next = String_next, String_decodeChar = String_get;
 export const String_getUTF8Byte = (s, p) => { const info = getStrInfo(s); return info.ascii ? s.charCodeAt(Number(p)) : info.bytes[Number(p)]; };
 export const String_Slice_Pattern_Internal_memcmpStr = (lhs, rhs, lstart, rstart, len) => {
   const ls = Number(lstart), rs = Number(rstart), n = Number(len);
@@ -339,10 +328,9 @@ export const String_Slice_Pattern_Internal_memcmpStr = (lhs, rhs, lstart, rstart
   return 1;
 };
 
-export const ST_Prim_mkRef   = (a, _w) => ({ v: a });
-export const ST_Prim_Ref_get = (r, _w) => r.v;
+export const ST_Prim_mkRef = (a, _w) => ({ v: a });
+export const ST_Prim_Ref_get = (r, _w) => r.v, ST_Prim_Ref_take = ST_Prim_Ref_get;
 export const ST_Prim_Ref_set = (r, a, _w) => { r.v = a; return PUnit; };
-export const ST_Prim_Ref_take = (r, _w) => r.v;
 const mkStream = (writeFn) => ctor(0,
   pap((_w) => mkOk(PUnit), 1, []),
   pap((_n, _w) => mkOk(new Uint8Array(0)), 2, []),

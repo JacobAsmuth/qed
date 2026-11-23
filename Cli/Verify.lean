@@ -6,14 +6,8 @@ open System (FilePath)
 
 namespace Qed.Cli
 
-private def isLeanIdentStart (c : Char) : Bool :=
-  c.isAlpha || c == '_'
-
-private def isLeanIdentCont (c : Char) : Bool :=
-  c.isAlphanum || c == '_' || c == '\''
-
-private def forbiddenTokens : List String :=
-  ["sorry", "admit", "native_decide", "sorryAx"]
+private def isLeanIdentCont (c : Char) : Bool := c.isAlphanum || c == '_' || c == '\''
+private def forbiddenTokens : List String := ["sorry", "admit", "native_decide", "sorryAx"]
 
 /-- Lexically scan a Lean source file for forbidden proof-bypass tokens (`sorry`, `admit`,
     `native_decide`, `sorryAx`), skipping line/nested-block comments, char literals, and plain
@@ -23,35 +17,37 @@ def findForbiddenTokens (src : String) : Array (Nat × String) := Id.run do
   let cs := src.toList.toArray
   let n := cs.size
   let at2 (i : Nat) (a b : Char) : Bool := i + 1 < n && cs[i]! == a && cs[i + 1]! == b
-  let stepEsc (i line : Nat) : Nat × Nat :=
-    if i + 1 < n then (i + 2, if cs[i + 1]! == '\n' then line + 1 else line) else (i + 1, line)
   let mut i := 0
   let mut line := 1
   let mut inInterpStr := false
   let mut interpBraces : Array Nat := #[]
   let mut hits : Array (Nat × String) := #[]
+  let scanStr (start : Nat) (interp : Bool) (ln : Nat) : Nat × Nat × Bool := Id.run do
+    let mut k := start
+    let mut l := ln
+    while k < n do
+      let ch := cs[k]!
+      if ch == '\\' then
+        if k + 1 < n && cs[k + 1]! == '\n' then l := l + 1
+        k := min (k + 2) n
+      else if ch == '"' then return (k + 1, l, false)
+      else if interp && at2 k '{' '{' then k := k + 2
+      else if interp && ch == '{' then return (k + 1, l, true)
+      else
+        if ch == '\n' then l := l + 1
+        k := k + 1
+    return (k, l, false)
   while i < n do
     let c := cs[i]!
     if inInterpStr then
-      if c == '\\' then
-        let (ni, nl) := stepEsc i line; i := ni; line := nl
-      else if c == '"' then
-        inInterpStr := false; i := i + 1
-      else if at2 i '{' '{' then
-        i := i + 2
-      else if c == '{' then
-        interpBraces := interpBraces.push 0; inInterpStr := false; i := i + 1
-      else
-        if c == '\n' then line := line + 1
-        i := i + 1
-    else if c == '\n' then
-      line := line + 1; i := i + 1
+      let (ni, nl, enterBrace) := scanStr i true line
+      i := ni; line := nl; inInterpStr := false
+      if enterBrace then interpBraces := interpBraces.push 0
+    else if c == '\n' then line := line + 1; i := i + 1
     else if at2 i '-' '-' then
-      i := i + 2
-      while i < n && cs[i]! != '\n' do i := i + 1
+      i := i + 2; while i < n && cs[i]! != '\n' do i := i + 1
     else if at2 i '/' '-' then
-      let mut depth := 1
-      i := i + 2
+      let mut depth := 1; i := i + 2
       while i < n && depth > 0 do
         if cs[i]! == '\n' then line := line + 1; i := i + 1
         else if at2 i '/' '-' then depth := depth + 1; i := i + 2
@@ -67,18 +63,9 @@ def findForbiddenTokens (src : String) : Array (Nat × String) := Id.run do
       let isInterp :=
         (i >= 2 && cs[i - 1]! == '!' && (cs[i - 2]! == 's' || cs[i - 2]! == 'm') && (i == 2 || !isLeanIdentCont cs[i - 3]!)) ||
         (i >= 1 && cs[i - 1]! == 'f' && (i == 1 || !isLeanIdentCont cs[i - 2]!))
-      i := i + 1
-      if isInterp then inInterpStr := true
-      else
-        while i < n do
-          let ch := cs[i]!
-          if ch == '\\' then
-            let (ni, nl) := stepEsc i line; i := ni; line := nl
-          else if ch == '"' then
-            i := i + 1; break
-          else
-            if ch == '\n' then line := line + 1
-            i := i + 1
+      let (ni, nl, enterBrace) := scanStr (i + 1) isInterp line
+      i := ni; line := nl
+      if enterBrace then interpBraces := interpBraces.push 0
     else if c == '\'' && (i == 0 || !isLeanIdentCont cs[i - 1]!) then
       let mut j := i + 1
       let mut closed := false
@@ -87,18 +74,14 @@ def findForbiddenTokens (src : String) : Array (Nat × String) := Id.run do
         while j < n && j < i + 10 && cs[j]! != '\n' do
           if cs[j]! == '\'' then closed := true; j := j + 1; break
           j := j + 1
-      else if j + 1 < n && cs[j]! != '\n' && cs[j + 1]! == '\'' then
-        closed := true; j := j + 2
+      else if j + 1 < n && cs[j]! != '\n' && cs[j + 1]! == '\'' then closed := true; j := j + 2
       i := if closed then j else i + 1
-    else if isLeanIdentStart c then
-      let start := i
-      let tokLine := line
-      i := i + 1
+    else if c.isAlpha || c == '_' then
+      let start := i; let tokLine := line; i := i + 1
       while i < n && isLeanIdentCont cs[i]! do i := i + 1
       let tok := String.ofList (cs.extract start i).toList
       if forbiddenTokens.contains tok then hits := hits.push (tokLine, tok)
-    else
-      i := i + 1
+    else i := i + 1
   return hits
 
 def grepForbidden : IO Bool := do
@@ -258,26 +241,19 @@ def externsCovered (q? : Option QedjsEnv := none) (alreadyBuilt : Bool := false)
   let rtPath ← runtimeFile "qed_rt.mjs"
   unless (← rtPath.pathExists) do return true
   let mod ← jsRoot
-  let modPath := modLeanPath mod
   let hasExamples ← isInRepo
   let mut mods : Array String := #[]
   let mut entries : Array String := #[]
-  if ← modPath.pathExists then
+  if ← (modLeanPath mod).pathExists then
     if !alreadyBuilt && !hasExamples && mod != (← webRoot) then
       if (← shQuiet "lake" #["build", mod]) != 0 then return false
-    match ← resolveAppMode mod with
-    | .fullstack fsName =>
-        mods := #[mod, "Qed.Driver"]
-        entries := #[s!"{fsName}.clientApp", "Qed.run"] ++ driverEntries.filter (!·.startsWith "main:")
-    | .ssr a =>
-        mods := #[mod]
-        entries := driverEntries ++ #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"]
-    | .component a =>
-        mods := #[mod, "Qed.Driver"]
-        entries := #["Qed.run"] ++ driverEntries.filter (!·.startsWith "main:") ++ #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"]
-    | .raw =>
-        mods := #[mod]
-        entries := driverEntries
+    let noMain := driverEntries.filter (!·.startsWith "main:")
+    let (m, e) := match ← resolveAppMode mod with
+      | .fullstack fs => (#[mod, "Qed.Driver"], #[s!"{fs}.clientApp", "Qed.run"] ++ noMain)
+      | .ssr a        => (#[mod], driverEntries ++ #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"])
+      | .component a  => (#[mod, "Qed.Driver"], #["Qed.run"] ++ noMain ++ #[s!"{a}:app", "Qed.App.ssrStep:ssrStep"])
+      | .raw          => (#[mod], driverEntries)
+    mods := m; entries := e
   if hasExamples then
     mods := mods.push "Tests.JsGate"
     entries := entries ++ #["JsGate.run", "JsGate.counts", "JsGate.probeCount", "JsGate.names"]
@@ -285,28 +261,30 @@ def externsCovered (q? : Option QedjsEnv := none) (alreadyBuilt : Bool := false)
   let some q ← ensureQedjsEnv q? | return false
   q.run (#["--check-externs", rtPath.toString] ++ mods ++ #["--"] ++ entries) (quiet := true)
 
+private def spawnIf (cond : Bool) (act : IO Bool) : IO (Task (Except IO.Error Bool)) :=
+  IO.asTask (if cond then act else pure true)
+
+private def waitAllOk (tasks : List (Task (Except IO.Error Bool))) : IO Bool := do
+  let mut ok := true
+  for t in tasks do
+    if !((← IO.wait t).toOption.getD false) then ok := false
+  return ok
+
 def verify (checkExterns : Bool := true) (extraLakeTargets : Array String := #[]) : IO Bool := do
   step "verifying proofs & axioms"
   let hasExamples ← isInRepo
-  -- Start source-only checks and LEAN_PATH lookup in parallel with `lake build`.
   let tGrep ← IO.asTask grepForbidden
-  let tEff ← if hasExamples then IO.asTask effectsCovered else IO.asTask (pure true)
-  let tGraph ← if hasExamples then IO.asTask buildGraphClean else IO.asTask (pure true)
+  let tEff ← spawnIf hasExamples effectsCovered
+  let tGraph ← spawnIf hasExamples buildGraphClean
   let tLp ← IO.asTask lakeEnvLeanPath
-  let lakeOk ← if hasExamples then
-    let base := #["Qed", "Qed.Driver", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples", "Tests"]
-    let extra := extraLakeTargets.filter (!base.contains ·)
-    pure ((← shLakeBuild (#["build"] ++ base ++ extra)) == 0)
-  else
-    let root ← webRoot
-    let jsMod ← jsRoot
-    let base := if checkExterns && jsMod != root then #[root, jsMod] else #[root]
-    let extra := extraLakeTargets.filter (!base.contains ·)
-    pure ((← shLakeBuild (#["build"] ++ base ++ extra)) == 0)
+  let base ← if hasExamples then
+      pure #["Qed", "Qed.Driver", "QedServer", "QedProofs", "JsProofs", "qedjs", "Examples", "Tests"]
+    else do
+      let root ← webRoot; let jsMod ← jsRoot
+      pure (if checkExterns && jsMod != root then #[root, jsMod] else #[root])
+  let lakeOk := (← shLakeBuild (#["build"] ++ base ++ extraLakeTargets.filter (!base.contains ·))) == 0
   if !lakeOk then
-    discard <| IO.wait tGrep
-    discard <| IO.wait tEff
-    discard <| IO.wait tGraph
+    discard <| waitAllOk [tGrep, tEff, tGraph]
     discard <| IO.wait tLp
     return false
   let lp? := (← IO.wait tLp).toOption.join
@@ -314,14 +292,9 @@ def verify (checkExterns : Bool := true) (extraLakeTargets : Array String := #[]
     | some bin, some leanPath => pure (some { bin, leanPath : QedjsEnv })
     | _, _ => resolveQedjsEnv (needBuild := false)
   let tAxiom ← IO.asTask (axiomClean (q?.map (·.leanPath)))
-  let tExt ← if checkExterns then IO.asTask (externsCovered q? (alreadyBuilt := true)) else IO.asTask (pure true)
-  let ok3 ← kernelEnvClean q? (alreadyBuilt := true)
-  let ok5 := (← IO.wait tExt).toOption.getD false
-  let ok1 := (← IO.wait tGrep).toOption.getD false
-  let ok2 := (← IO.wait tAxiom).toOption.getD false
-  let ok4 := (← IO.wait tEff).toOption.getD false
-  let ok6 := (← IO.wait tGraph).toOption.getD false
-  return ok1 && ok2 && ok3 && ok4 && ok5 && ok6
+  let tExt ← spawnIf checkExterns (externsCovered q? (alreadyBuilt := true))
+  let okKernel ← kernelEnvClean q? (alreadyBuilt := true)
+  return (← waitAllOk [tGrep, tEff, tGraph, tAxiom, tExt]) && okKernel
 
 def cmdCheck : IO UInt32 := do
   if (← verify (checkExterns := true)) then

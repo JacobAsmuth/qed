@@ -251,14 +251,9 @@ function mountApp(app, isTimeTravel = false) {
       wsClose(cid, '', Date.now());
     };
   };
-  g.wsSendBytes = (cid, payload) => {
-    const ws = wsConns.get(cid);
-    if (ws && ws.readyState === 1) ws.send(payload instanceof Uint8Array ? payload : new Uint8Array(0));
-  };
-  g.wsSendText = (cid, text) => {
-    const ws = wsConns.get(cid);
-    if (ws && ws.readyState === 1) ws.send(String(text));
-  };
+  const wsSend = (cid, data) => { const ws = wsConns.get(cid); if (ws && ws.readyState === 1) ws.send(data); };
+  g.wsSendBytes = (cid, payload) => wsSend(cid, payload instanceof Uint8Array ? payload : new Uint8Array(0));
+  g.wsSendText = (cid, text) => wsSend(cid, String(text));
   g.wsClose = (cid) => {
     const ws = wsConns.get(cid);
     if (!ws) return;
@@ -281,8 +276,9 @@ function mountApp(app, isTimeTravel = false) {
     wsConns.clear();
   };
 
-  active = { init, dispatch, dispatchStr, urlChanged, fire, fireStr, snapshot: localSnapshot, restore: localRestore, dehydrate, teardown };
-  window.qed = { init, dispatch, dispatchStr, urlChanged, snapshot: localSnapshot, restore: localRestore, dehydrate };
+  const api = { init, dispatch, dispatchStr, urlChanged, snapshot: localSnapshot, restore: localRestore, dehydrate };
+  active = { ...api, fire, fireStr, teardown };
+  window.qed = api;
 
   app.__main(W);
   init();

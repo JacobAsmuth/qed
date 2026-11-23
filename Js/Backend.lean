@@ -61,6 +61,9 @@ inductive JsExpr where
   | app       (fn : JsExpr) (args : List JsExpr)
   | tc        (args : List JsExpr)
 
+private def fmtTokens (min : Bool) : String × String × String × String :=
+  if min then ("", "", ",", "=") else (" ", "\n", ", ", " = ")
+
 mutual
 def JsExpr.renderMin (min : Bool) : JsExpr → String
   | .var name         => name
@@ -69,10 +72,10 @@ def JsExpr.renderMin (min : Bool) : JsExpr → String
   | .strLit s         => jsStr s
   | .arrLit elems     => s!"[{JsExpr.renderListMin min elems}]"
   | .ctorObj cidx fields hasS hasU =>
-      let sep := if min then "" else " "
-      let s := if hasS then s!",{sep}s:{sep}" ++ "{}" else ""
-      let u := if hasU then s!",{sep}u:{sep}" ++ "{}" else ""
-      s!"\{t:{sep}{cidx},{sep}f:{sep}[{JsExpr.renderListMin min fields}]{s}{u}}"
+      let sp := if min then "" else " "
+      let s := if hasS then s!",{sp}s:{sp}" ++ "{}" else ""
+      let u := if hasU then s!",{sp}u:{sp}" ++ "{}" else ""
+      s!"\{t:{sp}{cidx},{sp}f:{sp}[{JsExpr.renderListMin min fields}]{s}{u}}"
   | .fieldProj obj i  => s!"{obj.renderMin min}.f[{i}]"
   | .uProj obj i      => s!"{obj.renderMin min}.u[{i}]"
   | .sProj obj n off  => s!"{obj.renderMin min}.s[{soff n off}]"
@@ -86,12 +89,12 @@ def JsExpr.renderMin (min : Bool) : JsExpr → String
   | .tc args          => s!"$.tc([{JsExpr.renderListMin min args}])"
 
 def JsExpr.renderListMin (min : Bool) (es : List JsExpr) : String :=
-  joinChunks (JsExpr.renderListMinAux min #[] es)
-
-def JsExpr.renderListMinAux (min : Bool) (acc : Array String) : List JsExpr → Array String
-  | []      => acc
-  | [e]     => acc.push (e.renderMin min)
-  | e :: es => JsExpr.renderListMinAux min ((acc.push (e.renderMin min)).push (if min then "," else ", ")) es
+  go #[] es
+where
+  go (acc : Array String) : List JsExpr → String
+    | []      => joinChunks acc
+    | [e]     => joinChunks (acc.push (e.renderMin min))
+    | e :: es => go ((acc.push (e.renderMin min)).push (if min then "," else ", ")) es
 end
 
 mutual
@@ -121,10 +124,7 @@ end
 mutual
 def JsStmt.render (min : Bool) (d : Nat) (s : JsStmt) : String :=
   let ind := indStr min d
-  let sp := if min then "" else " "
-  let nl := if min then "" else "\n"
-  let sep := if min then "," else ", "
-  let eq := if min then "=" else " = "
+  let (sp, nl, sep, eq) := fmtTokens min
   match s with
   | .letVar x val => s!"{ind}let {x}{eq}{val.renderMin min};{nl}"
   | .letDecls names =>
@@ -133,10 +133,9 @@ def JsStmt.render (min : Bool) (d : Nat) (s : JsStmt) : String :=
       if binds.isEmpty then ""
       else s!"{ind}let {String.intercalate sep (binds.map fun (k, e) => s!"{k}{eq}{e.renderMin min}")};{nl}"
   | .labeledBlock lbl body =>
-      s!"{ind}{lbl}:{sp}\{{nl}" ++ joinChunks (JsStmt.renderListAux min (d + 1) #[] body) ++ s!"{ind}}{nl}"
+      s!"{ind}{lbl}:{sp}\{{nl}{JsStmt.renderListAux min (d + 1) #[] body}{ind}}{nl}"
   | .constArrow name params body =>
-      s!"{ind}const {name}{eq}({String.intercalate sep params}){sp}=>{sp}\{{nl}" ++
-        joinChunks (JsStmt.renderListAux min (d + 1) #[] body) ++ s!"{ind}};{nl}"
+      s!"{ind}const {name}{eq}({String.intercalate sep params}){sp}=>{sp}\{{nl}{JsStmt.renderListAux min (d + 1) #[] body}{ind}};{nl}"
   | .setField x i val => s!"{ind}{x}.f[{i}]{eq}{val.renderMin min};{nl}"
   | .setTag x cidx => s!"{ind}{x}.t{eq}{cidx};{nl}"
   | .setU x i val => s!"{ind}{x}.u[{i}]{eq}{val.renderMin min};{nl}"
@@ -159,27 +158,27 @@ def JsStmt.render (min : Bool) (d : Nat) (s : JsStmt) : String :=
       s!"{ind}{pfx}break {lbl};{nl}"
   | .throwUnreachable => s!"{ind}throw new Error('unreachable');{nl}"
   | .switchStmt scrut arms =>
-      s!"{ind}switch{sp}({scrut.renderMin min}){sp}\{{nl}" ++
-        joinChunks (JsSwitchArm.renderListAux min (d + 1) #[] arms) ++ s!"{ind}}{nl}"
+      s!"{ind}switch{sp}({scrut.renderMin min}){sp}\{{nl}{JsSwitchArm.renderListAux min (d + 1) #[] arms}{ind}}{nl}"
 
-def JsStmt.renderListAux (min : Bool) (d : Nat) (acc : Array String) : List JsStmt → Array String
-  | []      => acc
+def JsStmt.renderListAux (min : Bool) (d : Nat) (acc : Array String) : List JsStmt → String
+  | []      => joinChunks acc
   | s :: ss => JsStmt.renderListAux min d (acc.push (s.render min d)) ss
 
-def JsSwitchArm.render (min : Bool) (d : Nat) (a : JsSwitchArm) : String :=
-  let (ind, sp, nl) := (indStr min d, if min then "" else " ", if min then "" else "\n")
-  let mk (hdr b : String) := s!"{ind}{hdr}{sp}\{{nl}" ++ b ++ s!"{ind}}{nl}"
-  match a with
-  | .caseArm cidx body => mk s!"case {cidx}:" (joinChunks (JsStmt.renderListAux min (d + 1) #[] body))
-  | .defaultArm body   => mk "default:" (joinChunks (JsStmt.renderListAux min (d + 1) #[] body))
+def JsSwitchArm.render (min : Bool) (d : Nat) : JsSwitchArm → String
+  | .caseArm cidx body =>
+      let (sp, nl, _, _) := fmtTokens min; let ind := indStr min d
+      s!"{ind}case {cidx}:{sp}\{{nl}{JsStmt.renderListAux min (d + 1) #[] body}{ind}}{nl}"
+  | .defaultArm body =>
+      let (sp, nl, _, _) := fmtTokens min; let ind := indStr min d
+      s!"{ind}default:{sp}\{{nl}{JsStmt.renderListAux min (d + 1) #[] body}{ind}}{nl}"
 
-def JsSwitchArm.renderListAux (min : Bool) (d : Nat) (acc : Array String) : List JsSwitchArm → Array String
-  | []      => acc
+def JsSwitchArm.renderListAux (min : Bool) (d : Nat) (acc : Array String) : List JsSwitchArm → String
+  | []      => joinChunks acc
   | a :: as => JsSwitchArm.renderListAux min d (acc.push (a.render min d)) as
 end
 
 def JsStmt.renderList (min : Bool) (d : Nat) (ss : List JsStmt) : String :=
-  joinChunks (JsStmt.renderListAux min d #[] ss)
+  JsStmt.renderListAux min d #[] ss
 
 inductive JsDecl where
   | memoInit     (name : String) (initFn : String)
@@ -193,23 +192,23 @@ private def fnHeader (min : Bool) (name : String) (orig : Name) (params : List S
   else s!"function {name}({String.intercalate ", " params}) /* {orig} */ \{\n"
 
 def JsDecl.render (min : Bool) (d : JsDecl) : String :=
-  let (eq, sp, nl) := (if min then "=" else " = ", if min then "" else " ", if min then "" else "\n")
+  let (sp, nl, sep, eq) := fmtTokens min
   match d with
   | .memoInit name initFn =>
       s!"const {name}{eq}$.memo((){sp}=>{sp}$.ioVal({initFn}(0)));\n"
   | .memoThunk name body =>
-      s!"const {name}{eq}$.memo((){sp}=>{sp}\{{nl}" ++ JsStmt.renderList min 1 body ++ "});\n"
+      s!"const {name}{eq}$.memo((){sp}=>{sp}\{{nl}{JsStmt.renderList min 1 body}});\n"
   | .fnPlain name orig params body =>
       fnHeader min name orig params ++ JsStmt.renderList min 1 body ++ "}\n"
   | .fnDirectLoop name orig params body =>
       let w := if min then "while(1){" else s!"{indStr false 1}while (true) \{\n"
       fnHeader min name orig params ++ w ++ JsStmt.renderList min 2 body ++ s!"{indStr min 1}}{nl}}\n"
   | .fnTrampoline name orig params body =>
-      let ps := String.intercalate (if min then "," else ", ") params
+      let ps := String.intercalate sep params
       let (ind1, ind2) := (indStr min 1, indStr min 2)
       let (sf, rv, und, wt) := if min then ("_s", "_r", "void 0", "while(1){") else ("__step", "__r", "undefined", "while (true) {\n")
       fnHeader min name orig params ++
-        s!"{ind1}const {sf}{eq}(){sp}=>{sp}\{{nl}" ++ JsStmt.renderList min 2 body ++ s!"{ind1}};{nl}" ++
+        s!"{ind1}const {sf}{eq}(){sp}=>{sp}\{{nl}{JsStmt.renderList min 2 body}{ind1}};{nl}" ++
         s!"{ind1}{wt}{ind2}const {rv}{eq}{sf}();{nl}" ++
         s!"{ind2}if{sp}({rv}{sp}!=={sp}null{sp}&&{sp}typeof {rv}{sp}==={sp}\"object\"{sp}&&{sp}{rv}.__tc{sp}!=={sp}{und}){sp}\{{sp}[{ps}]{eq}{rv}.__tc;{sp}continue;{sp}}{nl}" ++
         s!"{ind2}return {rv};{nl}{ind1}}{nl}}\n"
@@ -501,29 +500,23 @@ def lowerDecl (c0 : Ctx) : Decl → Option JsDecl
 
 /-! ## Deterministic Identifier Minification (`--min`) -/
 
-private def identFirstChars : Array Char :=
-  "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".toList.toArray
-
-private def identRestChars : Array Char :=
+private def identChars : Array Char :=
   "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".toList.toArray
 
 private def encodeIdentRest : Nat → Nat → List Char → List Char
   | 0, _, acc => acc
   | fuel + 1, n, acc =>
-      let c := identRestChars[n % 62]!
+      let c := identChars[n % 62]!
       if n < 62 then c :: acc
       else encodeIdentRest fuel (n / 62 - 1) (c :: acc)
 
 /-- Bijective base-52/62 short JS identifier (`a`..`z`, `A`..`Z`, `aa`..).
     Never starts with `_` or `$`, so it cannot collide with runtime `$` or internal `_`-prefixed temporaries. -/
 def shortIdentAt (idx : Nat) : String :=
-  if idx < 52 then
-    String.singleton identFirstChars[idx]!
+  if idx < 52 then String.singleton identChars[idx]!
   else
     let n := idx - 52
-    let first := identFirstChars[n % 52]!
-    let rest := encodeIdentRest (n + 1) (n / 52) []
-    String.ofList (first :: rest)
+    String.ofList (identChars[n % 52]! :: encodeIdentRest (n + 1) (n / 52) [])
 
 def jsMinReservedSet : Std.HashSet String :=
   let words : List String := [
@@ -685,12 +678,9 @@ private def minifyFnBody (name : String) (params : List String) (body : List JsS
 def minifyDecl : JsDecl → JsDecl
   | d@(.memoInit ..) => d
   | .memoThunk name body => .memoThunk name (minifyFnBody name [] body).2
-  | .fnPlain name orig params body =>
-      let (ps', b') := minifyFnBody name params body; .fnPlain name orig ps' b'
-  | .fnDirectLoop name orig params body =>
-      let (ps', b') := minifyFnBody name params body; .fnDirectLoop name orig ps' b'
-  | .fnTrampoline name orig params body =>
-      let (ps', b') := minifyFnBody name params body; .fnTrampoline name orig ps' b'
+  | .fnPlain name orig params body => let (ps, b) := minifyFnBody name params body; .fnPlain name orig ps b
+  | .fnDirectLoop name orig params body => let (ps, b) := minifyFnBody name params body; .fnDirectLoop name orig ps b
+  | .fnTrampoline name orig params body => let (ps, b) := minifyFnBody name params body; .fnTrampoline name orig ps b
 
 /-! ## Source Map v3 (`.mjs.map`) VLQ Encoder & Generator -/
 
@@ -700,69 +690,43 @@ private def vlqChars : Array Char :=
 private def encodeVlqNatAux : Nat → Nat → List Char → List Char
   | 0, _, acc => acc.reverse
   | fuel + 1, u, acc =>
-      let digit := u &&& 31
       let rest := u >>> 5
-      let encoded := if rest > 0 then digit ||| 32 else digit
-      let ch := vlqChars[encoded]!
-      if rest == 0 then (ch :: acc).reverse
-      else encodeVlqNatAux fuel rest (ch :: acc)
+      let ch := vlqChars[if rest > 0 then (u &&& 31) ||| 32 else u &&& 31]!
+      if rest == 0 then (ch :: acc).reverse else encodeVlqNatAux fuel rest (ch :: acc)
 
 /-- Base64-VLQ encode a signed integer according to the Source Map v3 specification. -/
 def encodeVlqInt (v : Int) : String :=
   let u : Nat := if v < 0 then (((-v).toNat) <<< 1) + 1 else (v.toNat) <<< 1
   String.ofList (encodeVlqNatAux 64 u [])
 
-private def vlqCharVal (c : Char) : Option Nat :=
-  let n := c.toNat
-  if 'A'.toNat ≤ n && n ≤ 'Z'.toNat then some (n - 'A'.toNat)
-  else if 'a'.toNat ≤ n && n ≤ 'z'.toNat then some (n - 'a'.toNat + 26)
-  else if '0'.toNat ≤ n && n ≤ '9'.toNat then some (n - '0'.toNat + 52)
-  else if c == '+' then some 62
-  else if c == '/' then some 63
-  else none
-
-private def decodeVlqAux : List Char → Nat → Nat → Option (Int × List Char)
-  | [], _, _ => none
-  | c :: cs, shift, acc =>
-      match vlqCharVal c with
-      | none => none
-      | some d =>
-          let acc' := acc ||| ((d &&& 31) <<< shift)
-          if (d &&& 32) != 0 then
-            decodeVlqAux cs (shift + 5) acc'
-          else
-            let neg := (acc' &&& 1) == 1
-            let mag := acc' >>> 1
-            let val : Int := if neg then -(Int.ofNat mag) else Int.ofNat mag
-            some (val, cs)
-
 /-- Decode a single Base64-VLQ signed integer from a character list (used for round-trip verification). -/
-def decodeVlqInt (s : String) : Option Int :=
-  match decodeVlqAux s.toList 0 0 with
-  | some (v, []) => some v
-  | _            => none
-
-private def findDeclRangeAux (env : Environment) : Nat → Name → Option DeclarationRanges
-  | 0, _ => none
-  | fuel + 1, n =>
-      match Lean.declRangeExt.find? env n with
-      | some r => some r
-      | none =>
-          match n with
-          | .str p _ => findDeclRangeAux env fuel p
-          | .num p _ => findDeclRangeAux env fuel p
-          | .anonymous => none
+def decodeVlqInt (s : String) : Option Int := Id.run do
+  let mut shift := 0
+  let mut acc := 0
+  let mut done := false
+  for c in s.toList do
+    if done then return none
+    let some d := vlqChars.idxOf? c | return none
+    acc := acc ||| ((d &&& 31) <<< shift)
+    if (d &&& 32) != 0 then shift := shift + 5 else done := true
+  if !done then return none
+  return some (if (acc &&& 1) == 1 then -(Int.ofNat (acc >>> 1)) else Int.ofNat (acc >>> 1))
 
 /-- Look up `(sourceFile, origLine0, origCol0, origName)` for a Lean declaration in `env`. -/
-def findDeclSourceLoc (env : Environment) (n : Name) : Option (String × Nat × Nat × String) :=
+def findDeclSourceLoc (env : Environment) (n : Name) : Option (String × Nat × Nat × String) := Id.run do
   let modName := definingModule env n
-  if modName.isAnonymous then none
-  else
-    let sourceFile := (modName.toString.replace "." "/") ++ ".lean"
-    let (origLine, origCol) := match findDeclRangeAux env 8 n with
-      | some r => (if r.range.pos.line > 0 then r.range.pos.line - 1 else 0, r.range.pos.column)
-      | none   => (0, 0)
-    some (sourceFile, origLine, origCol, n.toString)
+  if modName.isAnonymous then return none
+  let mut cur := n
+  let mut range? : Option DeclarationRanges := none
+  for _ in [0:8] do
+    if let some r := Lean.declRangeExt.find? env cur then range? := some r; break
+    match cur with
+    | .str p _ | .num p _ => cur := p
+    | .anonymous => break
+  let (origLine, origCol) := match range? with
+    | some r => (r.range.pos.line - 1, r.range.pos.column)
+    | none   => (0, 0)
+  return some ((modName.toString.replace "." "/") ++ ".lean", origLine, origCol, n.toString)
 
 private structure DeclMapSpan where
   startLine  : Nat
@@ -885,37 +849,24 @@ def emitProgramWithSourceMap (env : Environment) (entries : List (Name × String
   let mut spans : Array DeclMapSpan := #[]
   let wantMap := sourceMapUrl?.isSome || !fileName.isEmpty
   for n in names do
-    match findEnvDecl env n with
-    | some d@(.fdecl ..) =>
-        match lowerDecl c d with
-        | some jd0 =>
-            let jd := if min then minifyDecl jd0 else jd0
-            let s := jd.render min
-            if !s.isEmpty then
-              let nLines := countNewlines s
-              if wantMap then
-                if let some (srcFile, oLine, oCol, oName) := findDeclSourceLoc env n then
-                  spans := spans.push {
-                    startLine := curLine
-                    lineCount := nLines
-                    nameCol := declNameColOffset jd
-                    sourceFile := srcFile
-                    origLine := oLine
-                    origCol := oCol
-                    origName := oName
-                  }
-              chunks := chunks.push s
-              curLine := curLine + nLines
-        | none => pure ()
-    | _ => pure ()
+    if let some d@(.fdecl ..) := findEnvDecl env n then
+      if let some jd0 := lowerDecl c d then
+        let jd := if min then minifyDecl jd0 else jd0
+        let s := jd.render min
+        if !s.isEmpty then
+          let lineCount := countNewlines s
+          if wantMap then
+            if let some (sourceFile, origLine, origCol, origName) := findDeclSourceLoc env n then
+              spans := spans.push { startLine := curLine, lineCount, nameCol := declNameColOffset jd, sourceFile, origLine, origCol, origName }
+          chunks := chunks.push s
+          curLine := curLine + lineCount
   let exportList := entries.map fun (n, s) =>
     let loc := c.js n
     if loc == s then s else s!"{loc} as {s}"
-  let sep := if min then "," else ", "
+  let (_, _, sep, eq) := fmtTokens min
   let exportChunk :=
     if min then s!"export\{{String.intercalate sep exportList}};\n"
     else s!"\nexport \{ {String.intercalate sep exportList} };\n"
-  let eq := if min then "=" else " = "
   let externsChunk := s!"export const __externs{eq}[{String.intercalate sep (externNames.map (s!"\"{·}\""))}];\n"
   chunks := chunks.push exportChunk |>.push externsChunk
   curLine := curLine + countNewlines exportChunk + countNewlines externsChunk
@@ -925,108 +876,94 @@ def emitProgramWithSourceMap (env : Environment) (entries : List (Name × String
   let sourceMap := if wantMap then buildSourceMapV3 fileName curLine spans else ""
   return (joinChunks chunks, sourceMap, externNames)
 
-def emitProgramWithExterns (env : Environment) (entries : List (Name × String)) (min : Bool := false) :
-    Except String (String × List String) := do
-  let (js, _, externNames) ← emitProgramWithSourceMap env entries min "" none
-  return (js, externNames)
+private def isJsIdentStart (c : Char) : Bool := c.isAlpha || c == '_' || c == '$'
 
-private def skipLine : List Char → List Char
-  | [] => []
-  | '\n' :: t => t
-  | _ :: t => skipLine t
-
-private def skipBlock : List Char → List Char
-  | [] => []
-  | '*' :: '/' :: t => t
-  | _ :: t => skipBlock t
-
-private def skipQuoted (q : Char) : List Char → List Char
-  | [] => []
-  | '\\' :: _ :: t => skipQuoted q t
-  | c :: t => if c == q then t else skipQuoted q t
-
-private def takeJsIdent (acc : String) : List Char → String × List Char
-  | c :: cs => if c.isAlphanum || c == '_' || c == '$' then takeJsIdent (acc.push c) cs else (acc, c :: cs)
-  | [] => (acc, [])
-
-private def nextRtToken : Nat → List Char → Option (String ⊕ Char) × List Char
-  | 0, _ | _ + 1, [] => (none, [])
-  | fuel + 1, c :: cs =>
-      if c.isWhitespace then nextRtToken fuel cs
-      else if c == '/' then
-        match cs with
-        | '/' :: t => nextRtToken fuel (skipLine t)
-        | '*' :: t => nextRtToken fuel (skipBlock t)
-        | _        => (some (.inr c), cs)
-      else if c == '"' || c == '\'' || c == '`' then nextRtToken fuel (skipQuoted c cs)
-      else if c.isAlpha || c == '_' || c == '$' then
-        let (id, rest) := takeJsIdent (String.singleton c) cs
-        (some (.inl id), rest)
-      else (some (.inr c), cs)
-
-private inductive ExportMode where
-  | none | afterExport | afterAsync | afterFn
-  | inVar (expectName : Bool)
-  | inBrace (expectName : Bool) (pending : Option String)
-
-private def stepBraceDepth (d : Nat) : String ⊕ Char → Nat
-  | .inr '(' | .inr '[' | .inr '{' => d + 1
-  | .inr ')' | .inr ']' | .inr '}' => d - 1
-  | _ => d
-
-private def stepExportMode (depth : Nat) (mode : ExportMode) (tok : String ⊕ Char)
-    (acc : Std.HashSet String) : Nat × ExportMode × Std.HashSet String :=
-  let addOpt := fun p => match p with | some s => acc.insert s | none => acc
-  match mode with
-  | .none =>
-      if depth == 0 && tok == .inl "export" then (0, .afterExport, acc)
-      else (stepBraceDepth depth tok, .none, acc)
-  | .afterExport =>
-      match tok with
-      | .inl "function" => (0, .afterFn, acc)
-      | .inl "async"    => (0, .afterAsync, acc)
-      | .inl "const" | .inl "let" | .inl "var" => (0, .inVar true, acc)
-      | .inr '{'        => (1, .inBrace true none, acc)
-      | _               => (stepBraceDepth depth tok, .none, acc)
-  | .afterAsync =>
-      match tok with
-      | .inl "function" => (0, .afterFn, acc)
-      | _               => (stepBraceDepth depth tok, .none, acc)
-  | .afterFn =>
-      match tok with
-      | .inl name => (0, .none, acc.insert name)
-      | _         => (stepBraceDepth depth tok, .none, acc)
-  | .inVar expectName =>
-      if depth != 0 then (stepBraceDepth depth tok, .inVar expectName, acc)
-      else match tok with
-        | .inr ';' => (0, .none, acc)
-        | .inr ',' => (0, .inVar true, acc)
-        | .inl "export" => if expectName then (0, .inVar false, acc.insert "export") else (0, .afterExport, acc)
-        | .inl name => (0, .inVar false, if expectName then acc.insert name else acc)
-        | _ => (stepBraceDepth 0 tok, .inVar expectName, acc)
-  | .inBrace expectName pending =>
-      match tok with
-      | .inr '}' => (0, .none, addOpt pending)
-      | .inr ',' => (depth, .inBrace true none, addOpt pending)
-      | .inl "as" => (depth, .inBrace true none, acc)
-      | .inl name => (depth, .inBrace false (if expectName then some name else pending), acc)
-      | _ => (depth, .inBrace expectName pending, acc)
-
-private def walkRtExports (fuel depth : Nat) (mode : ExportMode)
-    (cs : List Char) (acc : Std.HashSet String) : Std.HashSet String :=
-  match fuel with
-  | 0 => acc
-  | fuel + 1 =>
-      match nextRtToken (fuel + 1) cs with
-      | (none, _) => acc
-      | (some tok, rest) =>
-          let (d', m', acc') := stepExportMode depth mode tok acc
-          walkRtExports fuel d' m' rest acc'
+private def stepDepth (d : Nat) (t : String) : Nat :=
+  if t == "(" || t == "[" || t == "{" then d + 1
+  else if t == ")" || t == "]" || t == "}" then d - 1
+  else d
 
 /-- Parse named ESM exports (`export const`, `export function`, `export { ... }`) from a JS runtime module. -/
-def rtExports (rtSrc : String) : Std.HashSet String :=
-  let cs := rtSrc.toList
-  walkRtExports (cs.length + 1) 0 .none cs {}
+def rtExports (rtSrc : String) : Std.HashSet String := Id.run do
+  let cs := rtSrc.toList.toArray
+  let n := cs.size
+  let mut toks : Array String := #[]
+  let mut i := 0
+  for _ in [0:n] do
+    if i ≥ n then break
+    let c := cs[i]!
+    if c.isWhitespace then i := i + 1
+    else if c == '/' && i + 1 < n && (cs[i + 1]! == '/' || cs[i + 1]! == '*') then
+      let line := cs[i + 1]! == '/'
+      i := i + 2
+      for _ in [i:n] do
+        if i ≥ n then break
+        if line then
+          let d := cs[i]! == '\n'; i := i + 1
+          if d then break
+        else if cs[i]! == '*' && i + 1 < n && cs[i + 1]! == '/' then
+          i := i + 2; break
+        else i := i + 1
+    else if c == '"' || c == '\'' || c == '`' then
+      let q := c; i := i + 1
+      for _ in [i:n] do
+        if i ≥ n then break
+        if cs[i]! == '\\' then i := i + 2
+        else
+          let d := cs[i]! == q; i := i + 1
+          if d then break
+    else if isJsIdentStart c then
+      let start := i; i := i + 1
+      for _ in [i:n] do
+        if i < n && (isJsIdentStart cs[i]! || cs[i]!.isDigit) then i := i + 1 else break
+      toks := toks.push (String.ofList (cs.extract start i).toList)
+    else
+      toks := toks.push (String.singleton c); i := i + 1
+  let mut acc : Std.HashSet String := {}
+  let mut depth := 0
+  let mut k := 0
+  for _ in [0:toks.size] do
+    if k ≥ toks.size then break
+    let t := toks[k]!
+    if depth == 0 && t == "export" && k + 1 < toks.size then
+      let k1 := if toks[k + 1]! == "async" && k + 2 < toks.size && toks[k + 2]! == "function" then k + 2 else k + 1
+      match toks[k1]! with
+      | "function" =>
+          if k1 + 1 < toks.size then acc := acc.insert toks[k1 + 1]!
+          k := k1 + 2
+      | "const" | "let" | "var" =>
+          k := k1 + 1
+          let mut expect := true
+          for _ in [k:toks.size] do
+            if k ≥ toks.size then break
+            let tk := toks[k]!
+            if depth == 0 && (tk == ";" || (tk == "export" && !expect)) then
+              if tk == ";" then k := k + 1
+              break
+            if depth == 0 && tk == "," then expect := true
+            else if depth == 0 && expect && isJsIdentStart tk.front then
+              acc := acc.insert tk; expect := false
+            else depth := stepDepth depth tk
+            k := k + 1
+      | "{" =>
+          k := k1 + 1
+          let mut pending : Option String := none
+          for _ in [k:toks.size] do
+            if k ≥ toks.size then break
+            let tk := toks[k]!; k := k + 1
+            if tk == "}" then
+              if let some s := pending then acc := acc.insert s
+              break
+            else if tk == "," then
+              if let some s := pending then acc := acc.insert s
+              pending := none
+            else if tk == "as" then pending := none
+            else if pending.isNone && isJsIdentStart tk.front then pending := some tk
+      | _ => k := k + 1
+    else
+      depth := stepDepth depth t
+      k := k + 1
+  return acc
 
 /-- Verify that every extern name in `externNames` is present in `avail` (parsed from `runtime/qed_rt.mjs`). -/
 def checkRtExterns (avail : Std.HashSet String) (externNames : List String) : Except String Unit := do

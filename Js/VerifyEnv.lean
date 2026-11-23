@@ -27,18 +27,12 @@ private def rootTwoAux : Name → Option String → Option (String × Option Str
   | .num p _, _               => rootTwoAux p none
   | .anonymous, _             => none
 
+private def metaLeanPrefixes : Array String :=
+  #["Syntax", "TSyntax", "Macro", "Elab", "Meta", "Parser", "PrettyPrinter", "Environment", "IR"]
+
 private def isMetaNamespaceConst (n : Name) : Bool :=
   match rootTwoAux n none with
-  | some ("Lean", some s) =>
-      s.startsWith "Syntax" ||
-      s.startsWith "TSyntax" ||
-      s.startsWith "Macro" ||
-      s.startsWith "Elab" ||
-      s.startsWith "Meta" ||
-      s.startsWith "Parser" ||
-      s.startsWith "PrettyPrinter" ||
-      s.startsWith "Environment" ||
-      s.startsWith "IR"
+  | some ("Lean", some s) => metaLeanPrefixes.any (s.startsWith ·)
   | some ("Qq", _) => n != `Qq
   | _ => false
 
@@ -239,25 +233,25 @@ def isServerOnlyDeclName (env : Environment) : Name → Bool
       else
         isServerOnlyDeclName env owner
 
+private def serverOnlyModules : Array Name := #[
+  `Qed.Server.Prim, `Qed.Server.Native, `Qed.Server.Db.PgWire, `Qed.Server.Db.HttpSql,
+  `Qed.Auth.Oidc, `Qed.Deploy, `Qed.Cloud.Compile, `Qed.Cloud.Proofs
+]
+
+private def serverOnlyDecls : Array Name := #[
+  `Qed.Server.execExternalRaw, `Qed.Server.MonadServer.exec, `Qed.Server.MonadServer.httpCall,
+  `Qed.Server.MonadServer.dbExec, `Qed.Server.MonadServer.dbExecDdl, `Qed.Server.MonadServer.readEnv,
+  `Qed.Server.MonadServer.wsBroadcast, `Qed.Server.flushWsEmits,
+  `Qed.Server.MonadAtomic.runAtomic, `Qed.Server.MonadAtomic.runAtomicRead
+]
+
 /-- Returns an error message iff `n` is a server-only primitive, secret, state initializer,
     handler, or dispatcher that must never be bundled into client JavaScript. -/
 def clientLeakReason? (env : Environment) (n : Name) : Option String :=
   let modName := definingModule env n
-  if modName == `Qed.Server.Prim || modName == `Qed.Server.Native ||
-     modName == `Qed.Server.Db.PgWire || modName == `Qed.Server.Db.HttpSql ||
-     modName == `Qed.Auth.Oidc || modName == `Qed.Deploy ||
-     modName == `Qed.Cloud.Compile || modName == `Qed.Cloud.Proofs then
+  if serverOnlyModules.contains modName then
     some s!"client bundle leak gate: server runtime primitive `{n}` (`{modName}`) cannot be bundled into client JavaScript"
-  else if n == `Qed.Server.execExternalRaw ||
-          n == `Qed.Server.MonadServer.exec ||
-          n == `Qed.Server.MonadServer.httpCall ||
-          n == `Qed.Server.MonadServer.dbExec ||
-          n == `Qed.Server.MonadServer.dbExecDdl ||
-          n == `Qed.Server.MonadServer.readEnv ||
-          n == `Qed.Server.MonadServer.wsBroadcast ||
-          n == `Qed.Server.flushWsEmits ||
-          n == `Qed.Server.MonadAtomic.runAtomic ||
-          n == `Qed.Server.MonadAtomic.runAtomicRead then
+  else if serverOnlyDecls.contains n then
     some s!"client bundle leak gate: server I/O or state primitive `{n}` cannot be bundled into client JavaScript"
   else if isServerOnlyDeclName env n then
     some s!"client bundle leak gate: server secret/state/handler `{n}` cannot be bundled into client JavaScript"

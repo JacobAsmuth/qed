@@ -44,19 +44,19 @@ def cmdNew (dir : String) : IO UInt32 := do
   return 0
 
 def usage : IO UInt32 := do
-  IO.println "qed, a verified full-stack web toolchain\n"
-  IO.println "Usage: qed <command>\n"
-  IO.println "  dev            watch + rebuild + serve with live-reload"
-  IO.println "  build          production build → dist/ (JS client + native server, verified)"
-  IO.println "  start|preview  serve the build"
-  IO.println "  serve <dir>    serve a static directory natively"
-  IO.println "  manifest       emit & validate qed_deploy.json infrastructure manifest"
-  IO.println "  dev-auth [p]   run local ES256 OIDC dev identity provider"
-  IO.println "  test           run the native test suite (if present)"
-  IO.println "  check          verify proofs + no-sorry + axioms"
-  IO.println "  clean          remove build outputs"
-  IO.println "  new <dir>      scaffold a new app"
-  IO.println "  doctor         report which dependencies are present"
+  IO.print <|
+    "qed, a verified full-stack web toolchain\n\nUsage: qed <command>\n\n" ++
+    "  dev            watch + rebuild + serve with live-reload\n" ++
+    "  build          production build → dist/ (JS client + native server, verified)\n" ++
+    "  start|preview  serve the build\n" ++
+    "  serve <dir>    serve a static directory natively\n" ++
+    "  manifest       emit & validate qed_deploy.json infrastructure manifest\n" ++
+    "  dev-auth [p]   run local ES256 OIDC dev identity provider\n" ++
+    "  test           run the native test suite (if present)\n" ++
+    "  check          verify proofs + no-sorry + axioms\n" ++
+    "  clean          remove build outputs\n" ++
+    "  new <dir>      scaffold a new app\n" ++
+    "  doctor         report which dependencies are present\n"
   return 0
 
 end Qed.Cli

@@ -33,6 +33,7 @@ private structure JsCliFlags where
   sourceMap : Bool := false
   rt? : Option String := none
   css? : Option (String × String) := none
+  assetsDir? : Option String := none
 
 private def parseJsFlags : List String → JsCliFlags → Except String (JsCliFlags × List String)
   | [], f => .ok (f, [])
@@ -40,12 +41,10 @@ private def parseJsFlags : List String → JsCliFlags → Except String (JsCliFl
   | "--sourcemap" :: rest, f => parseJsFlags rest { f with sourceMap := true }
   | ["--rt"], _ => .error "missing argument for `--rt`"
   | "--rt" :: path :: rest, f => parseJsFlags rest { f with rt? := some path }
-  | ["--css"], _ => .error "missing arguments for `--css <out.css> <appDecl>`"
-  | ["--css", _], _ => .error "missing arguments for `--css <out.css> <appDecl>`"
+  | "--assets-dir" :: dir :: rest, f => parseJsFlags rest { f with assetsDir? := some dir }
+  | ["--css"], _ | ["--css", _], _ => .error "missing arguments for `--css <out.css> <appDecl>`"
   | "--css" :: cssPath :: appDecl :: rest, f => parseJsFlags rest { f with css? := some (cssPath, appDecl) }
-  | a :: rest, f => do
-      let (f', rem) ← parseJsFlags rest f
-      return (f', a :: rem)
+  | a :: rest, f => do let (f', rem) ← parseJsFlags rest f; return (f', a :: rem)
 
 private def writeJsBundle (env : Environment) (avail? : Option (Std.HashSet String))
     (outPath : String) (entryArgs : List String) (min : Bool) (sourceMap : Bool := false) : IO Unit := do
@@ -55,16 +54,15 @@ private def writeJsBundle (env : Environment) (avail? : Option (Std.HashSet Stri
   if let some dir := p.parent then IO.FS.createDirAll dir
   let fileName := p.fileName.getD "app.mjs"
   let mapFileName := fileName ++ ".map"
-  let (js, smJson, externs) ←
-    if sourceMap then orThrow (Js.emitProgramWithSourceMap env entries min fileName (some mapFileName))
-    else let (js, ex) ← orThrow (Js.emitProgramWithExterns env entries min); pure (js, "", ex)
+  let (js, smJson, externs) ← orThrow <| Js.emitProgramWithSourceMap env entries min
+    (if sourceMap then fileName else "") (if sourceMap then some mapFileName else none)
   if let some avail := avail? then orThrow (Js.checkRtExterns avail externs)
   IO.FS.writeFile p js
-  if sourceMap then
+  let mapNote ← if sourceMap then
     IO.FS.writeFile (System.FilePath.mk (outPath ++ ".map")) smJson
-    IO.println s!"wrote {outPath} ({js.length} bytes) + {mapFileName} ({smJson.length} bytes)"
-  else
-    IO.println s!"wrote {outPath} ({js.length} bytes)"
+    pure s!" + {mapFileName} ({smJson.length} bytes)"
+  else pure ""
+  IO.println s!"wrote {outPath} ({js.length} bytes){mapNote}"
 
 private def tryImport (mods : List String) : IO (Option Environment) :=
   (some <$> loadEnv mods) <|> return none
@@ -132,27 +130,16 @@ private def scanDeployAssets (dir : System.FilePath) : IO (List Qed.Deploy.Deplo
       out := out.push { path := "/" ++ name, mime, bytes := md.byteSize.toNat }
   return (out.qsort fun a b => a.path < b.path).toList
 
-private def splitAssetsDirFlag : List String → Option String × List String
-  | "--assets-dir" :: dir :: rest =>
-      let (_, rem) := splitAssetsDirFlag rest
-      (some dir, rem)
-  | a :: rest =>
-      let (d?, rem) := splitAssetsDirFlag rest
-      (d?, a :: rem)
-  | [] => (none, [])
-
 def main (args : List String) : IO Unit := do
   Lean.initSearchPath (← Lean.findSysroot)
   match args with
   | "--emit-deploy-manifest" :: outJson :: rootMod :: rest =>
-    let (assetsDir?, mods) := splitAssetsDirFlag rest
-    let loadMods := if mods.isEmpty then [rootMod] else mods
-    let env ← loadEnv loadMods (loadExts := true)
-    let baseManifest := Qed.Deploy.extractFromEnv env rootMod
-    let assets ← match assetsDir? with
+    let (flags, mods) ← orThrow (parseJsFlags rest {})
+    let env ← loadEnv (if mods.isEmpty then [rootMod] else mods) (loadExts := true)
+    let assets ← match flags.assetsDir? with
       | some d => scanDeployAssets (System.FilePath.mk d)
       | none   => pure []
-    let manifest : Qed.Deploy.DeployManifest := { baseManifest with assets }
+    let manifest : Qed.Deploy.DeployManifest := { Qed.Deploy.extractFromEnv env rootMod with assets }
     orThrow manifest.validate
     let p : System.FilePath := outJson
     if let some dir := p.parent then IO.FS.createDirAll dir

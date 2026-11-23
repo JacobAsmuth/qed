@@ -33,6 +33,16 @@ def jsRoot : IO String := do
   | some r => return r
   | none   => webRoot
 
+def readTrimmed? (p : FilePath) : IO (Option String) := do
+  if !(← p.pathExists) then return none
+  return some (← IO.FS.readFile p).cliTrim
+
+def nonEmptyLines (s : String) : List String :=
+  (s.splitOn "\n").map String.cliTrim |>.filter (!·.isEmpty)
+
+def parsePort (s : String) (default : Nat := 8000) : UInt16 :=
+  (s.toNat?.getD default).toUInt16
+
 def takeIdentChars (s : String) : String :=
   (s.takeWhile fun c => c.isAlphanum || c == '.' || c == '_' || c == '\'').toString
 
@@ -51,73 +61,43 @@ def parseLeanImports (src : String) : Array String := Id.run do
       if !m.isEmpty then imps := imps.push m
   return imps
 
-private def scanModuleTokens {α : Type} (mod : String) (init : α)
-    (onLine : List String → List String → α → Except α α) : IO α := do
-  let path := modLeanPath mod
-  if !(← path.pathExists) then return init
-  let src ← IO.FS.readFile path
-  let mut depth : Nat := 0
-  let mut nsStack : List String := []
-  let mut acc := init
-  for raw in src.splitOn "\n" do
-    let inComment := depth > 0
-    depth := depth + ((raw.splitOn "/-").length - 1) - ((raw.splitOn "-/").length - 1)
-    if inComment then continue
-    let toks := tokenizeCodeLine raw
-    match toks with
-    | "namespace" :: ns :: _ =>
-        let cleanNs := takeIdentChars ns
-        if !cleanNs.isEmpty then nsStack := cleanNs :: nsStack
-    | "end" :: _ =>
-        nsStack := nsStack.drop 1
-    | _ =>
-        match onLine nsStack toks acc with
-        | .error done => return done
-        | .ok next    => acc := next
-  return acc
-
-def fullstackAppName (mod : String) : IO (Option String) :=
-  scanModuleTokens mod none fun nsStack toks _ =>
-    match toks with
-    | "fullstack" :: rawName :: _ =>
-        let fs := takeIdentChars rawName
-        if fs.isEmpty then .ok none
-        else .error (some (String.intercalate "." (nsStack.reverse ++ [fs])))
-    | _ => .ok none
-
-def ssrAppName (mod : String) : IO (Option String) := do
-  let path := modLeanPath mod
-  if !(← path.pathExists) then return none
-  let src ← IO.FS.readFile path
-  match src.splitOn "Qed.run " with
-  | _ :: rest :: _ =>
-      let name := takeIdentChars (rest.dropWhile (· == ' ')).toString
-      return if name.isEmpty then none else some name
-  | _ => return none
-
-def componentAppName (mod : String) : IO (Option String) := do
-  let (lastTop, lastAny) ← scanModuleTokens mod (none, none) fun nsStack toks (lastTop, lastAny) =>
-    match toks with
-    | "component" :: rawName :: _ =>
-        let cName := takeIdentChars rawName
-        if cName.isEmpty then .ok (lastTop, lastAny)
-        else
-          let top' := if nsStack.isEmpty then some s!"{cName}.app" else lastTop
-          let any' := some (String.intercalate "." (nsStack.reverse ++ [cName, "app"]))
-          .ok (top', any')
-    | _ => .ok (lastTop, lastAny)
-  return lastTop.orElse (fun _ => lastAny)
-
 inductive AppMode where
   | fullstack (fsName : String)
   | ssr (appName : String)
   | component (appName : String)
   | raw
 
+/-- Determine how `mod` should be built in a single file read (`fullstack` > `ssr` > `component` > `raw`). -/
 def resolveAppMode (mod : String) : IO AppMode := do
-  if let some fsName ← fullstackAppName mod then return .fullstack fsName
-  if let some appName ← ssrAppName mod then return .ssr appName
-  if let some appName ← componentAppName mod then return .component appName
+  let path := modLeanPath mod
+  if !(← path.pathExists) then return .raw
+  let src ← IO.FS.readFile path
+  let mut depth : Nat := 0
+  let mut nsStack : List String := []
+  let mut lastTop : Option String := none
+  let mut lastAny : Option String := none
+  for raw in src.splitOn "\n" do
+    let inComment := depth > 0
+    depth := depth + ((raw.splitOn "/-").length - 1) - ((raw.splitOn "-/").length - 1)
+    if inComment then continue
+    match tokenizeCodeLine raw with
+    | "namespace" :: ns :: _ =>
+        let clean := takeIdentChars ns
+        if !clean.isEmpty then nsStack := clean :: nsStack
+    | "end" :: _ => nsStack := nsStack.drop 1
+    | "fullstack" :: rawName :: _ =>
+        let fs := takeIdentChars rawName
+        if !fs.isEmpty then return .fullstack (String.intercalate "." (nsStack.reverse ++ [fs]))
+    | "component" :: rawName :: _ =>
+        let cName := takeIdentChars rawName
+        if !cName.isEmpty then
+          if nsStack.isEmpty then lastTop := some s!"{cName}.app"
+          lastAny := some (String.intercalate "." (nsStack.reverse ++ [cName, "app"]))
+    | _ => pure ()
+  if let _ :: rest :: _ := src.splitOn "Qed.run " then
+    let name := takeIdentChars (rest.dropWhile (· == ' ')).toString
+    if !name.isEmpty then return .ssr name
+  if let some appName := lastTop.orElse (fun _ => lastAny) then return .component appName
   return .raw
 
 def driverEntries : Array String := #[
@@ -133,18 +113,17 @@ def driverEntries : Array String := #[
   "Qed.qedWsOpen:qed_ws_open", "Qed.qedWsBytes:qed_ws_bytes",
   "Qed.qedWsText:qed_ws_text", "Qed.qedWsClose:qed_ws_close"]
 
-def bold   (s : String) : String := s!"\x1b[1m{s}\x1b[0m"
-def green  (s : String) : String := s!"\x1b[32m{s}\x1b[0m"
-def red    (s : String) : String := s!"\x1b[31m{s}\x1b[0m"
-def step   (s : String) : IO Unit := IO.println (bold s!"▸ {s}")
-
-private def useColor : IO Bool := do
-  match ← env "NO_COLOR" with
-  | some v => return v.isEmpty
-  | none   => return true
-
 private def paint (enabled : Bool) (code s : String) : String :=
   if enabled then s!"\x1b[{code}m{s}\x1b[0m" else s
+
+def bold   (s : String) : String := paint true "1" s
+def green  (s : String) : String := paint true "32" s
+def red    (s : String) : String := paint true "31" s
+def step   (s : String) : IO Unit := IO.println (bold s!"▸ {s}")
+
+private def useColor : IO Bool := return ((← env "NO_COLOR").getD "").isEmpty
+
+private def spaces (n : Nat) : String := String.ofList (List.replicate n ' ')
 
 /-- Parses a Lean diagnostic header line like `error: File.lean:12:4: msg` or
     `File.lean:12:4: error: msg` into `(severity, path, line, col, msg)`. -/
@@ -167,26 +146,20 @@ private def readSourceSnippet (path : String) (ln col : Nat) (color : Bool) : IO
   let fp : FilePath := path
   if !(← fp.pathExists) || ln == 0 then return ""
   try
-    let content ← IO.FS.readFile fp
-    let lines := (content.splitOn "\n").toArray
+    let lines := ((← IO.FS.readFile fp).splitOn "\n").toArray
     if ln > lines.size then return ""
-    let srcLine := lines[ln - 1]!
-    let prevLine? := if ln >= 2 then some lines[ln - 2]! else none
-    let gutterW := max 3 (toString ln).length
-    let padNum (n : Nat) : String :=
-      let s := toString n
-      String.ofList (List.replicate (gutterW - s.length) ' ') ++ s
-    let blankGutter := String.ofList (List.replicate gutterW ' ')
+    let w := max 3 (toString ln).length
+    let pad (n : Nat) := let s := toString n; spaces (w - s.length) ++ s
     let bar := paint color "2" "|"
-    let caretPad := String.ofList (List.replicate col ' ')
-    let caret := paint color "1;31" "^"
-    let mut out := ""
-    if let some pl := prevLine? then
-      if !pl.cliTrim.isEmpty then
-        out := out ++ s!"  {paint color "2" (padNum (ln - 1))} {bar} {paint color "2" pl}\n"
-    out := out ++ s!"  {paint color "1" (padNum ln)} {bar} {srcLine}\n"
-    out := out ++ s!"  {blankGutter} {bar} {caretPad}{caret}\n"
-    return out
+    let mut rows : List String := []
+    if ln >= 2 then
+      let pl := lines[ln - 2]!
+      if !pl.cliTrim.isEmpty then rows := [s!"  {paint color "2" (pad (ln - 1))} {bar} {paint color "2" pl}"]
+    rows := rows ++ [
+      s!"  {paint color "1" (pad ln)} {bar} {lines[ln - 1]!}",
+      s!"  {spaces w} {bar} {spaces col}{paint color "1;31" "^"}"
+    ]
+    return String.intercalate "\n" rows
   catch _ => return ""
 
 initialize lastBuildErrorRef : IO.Ref String ← IO.mkRef ""
@@ -200,47 +173,33 @@ def getLastBuildError : IO String := lastBuildErrorRef.get
 def formatLakeDiagnostics (raw : String) (allowColor : Bool := true) : IO String := do
   if (← env "QED_VERBOSE") == some "1" && allowColor then return raw
   let color := allowColor && (← useColor)
-  let lines := raw.splitOn "\n"
   let mut out : Array String := #[]
-  let mut skipTargetBullets := false
-  let mut hasPrettyDiag := false
-  for line in lines do
+  let mut skipBullets := false
+  let mut hasPretty := false
+  for line in raw.splitOn "\n" do
     let t := line.cliTrim
     if ["error: Lean exited with code 1", "error: build failed", "info: stderr:"].contains t ||
-       ["trace: .>", "✔ [", "ℹ ["].any (t.startsWith ·) then continue
-    if t == "Some required targets logged failures:" then skipTargetBullets := true; continue
-    if skipTargetBullets then
-      if t.startsWith "- " then continue
-      else skipTargetBullets := false
-    if t.startsWith "✖ [" then continue
+       ["trace: .>", "✔ [", "ℹ [", "✖ ["].any (t.startsWith ·) then continue
+    if t == "Some required targets logged failures:" then skipBullets := true; continue
+    if skipBullets then
+      if t.startsWith "- " then continue else skipBullets := false
     match parseLeanDiagLine line with
     | some (sev, path, ln, col, msg) =>
         if ["hvalid", "valid_view", "hview", "hpres"].any (fun p =>
             msg == s!"could not synthesize default value for parameter '{p}' using tactics") then continue
-        hasPrettyDiag := true
-        let sevTag := if sev == "error" then paint color "1;31" "error" else paint color "1;33" "warning"
-        let locTag := paint color "1" s!"{path}:{ln}:{col}"
+        hasPretty := true
+        let sevTag := paint color (if sev == "error" then "1;31" else "1;33") sev
         let snippet ← readSourceSnippet path ln col color
         if !out.isEmpty then out := out.push ""
-        out := out.push s!"{sevTag}: {locTag}"
-        if !snippet.isEmpty then
-          let trimmedSnip := if snippet.endsWith "\n" then String.ofList snippet.toList.dropLast else snippet
-          out := out.push trimmedSnip
-        if !msg.isEmpty then
-          out := out.push s!"  {msg}"
+        out := out.push s!"{sevTag}: {paint color "1" s!"{path}:{ln}:{col}"}"
+        if !snippet.isEmpty then out := out.push snippet
+        if !msg.isEmpty then out := out.push s!"  {msg}"
     | none =>
-        if t.startsWith "Hint:" then
-          let rest := (t.drop 5).toString
-          out := out.push s!"  {paint color "1;36" "Hint:"}{rest}"
-        else if t.startsWith "• " then
-          let rest := (t.drop 2).toString
-          out := out.push s!"    {paint color "1;31" "•"} {rest}"
-        else if hasPrettyDiag && !t.isEmpty then
-          out := out.push s!"  {line}"
-        else if !t.isEmpty then
-          out := out.push line
+        if t.startsWith "Hint:" then out := out.push s!"  {paint color "1;36" "Hint:"}{(t.drop 5).toString}"
+        else if t.startsWith "• " then out := out.push s!"    {paint color "1;31" "•"} {(t.drop 2).toString}"
+        else if !t.isEmpty then out := out.push (if hasPretty then s!"  {line}" else line)
   let formatted := String.intercalate "\n" out.toList
-  if formatted.cliTrim.isEmpty then return raw else return formatted ++ "\n"
+  return if formatted.cliTrim.isEmpty then raw else formatted ++ "\n"
 
 def sh (cmd : String) (args : Array String) (extraEnv : Array (String × Option String) := #[]) : IO UInt32 := do
   let child ← IO.Process.spawn
@@ -359,11 +318,8 @@ def lakeEnvLeanPath : IO (Option String) := do
 
 def lakeQueryPaths (targets : Array String) : IO (Option (Array String)) := do
   let o ← IO.Process.output { cmd := "lake", args := #["query"] ++ targets }
-  if o.exitCode != 0 then
-    IO.eprint (o.stdout ++ o.stderr)
-    return none
-  let paths := (o.stdout.splitOn "\n").toArray.map String.cliTrim |>.filter (!·.isEmpty)
-  return some paths
+  if o.exitCode != 0 then IO.eprint (o.stdout ++ o.stderr); return none
+  return some (nonEmptyLines o.stdout).toArray
 
 def resolveQedjsBin (needBuild : Bool := true) : IO (Option FilePath) := do
   let qh ← frameworkHome
@@ -372,20 +328,14 @@ def resolveQedjsBin (needBuild : Bool := true) : IO (Option FilePath) := do
   if inRepo && (!needBuild || (← env "QED_PREBUILT") == some "1") && (← prebuilt.pathExists) then
     return some prebuilt
   if !inRepo && (← prebuilt.pathExists) then
-    let tcMatch ← do
-      let appTc : FilePath := "lean-toolchain"
-      let fwTc := qh / "lean-toolchain"
-      if (← appTc.pathExists) && (← fwTc.pathExists) then
-        pure ((← IO.FS.readFile appTc).cliTrim == (← IO.FS.readFile fwTc).cliTrim)
-      else pure false
-    if tcMatch then return some prebuilt
+    if let (some a, some b) := (← readTrimmed? "lean-toolchain", ← readTrimmed? (qh / "lean-toolchain")) then
+      if a == b then return some prebuilt
   let target := if inRepo then "qedjs" else "qed/qedjs"
   if needBuild then
     if (← shQuiet "lake" #["build", target]) != 0 then return none
-  if inRepo && (← prebuilt.pathExists) then
-    return some prebuilt
-  let some paths ← lakeQueryPaths #[target] | return none
-  return paths[0]?.map FilePath.mk
+  if inRepo then
+    if ← prebuilt.pathExists then return some prebuilt
+  return (← lakeQueryPaths #[target]).bind (·[0]?.map FilePath.mk)
 
 structure QedjsEnv where
   bin      : FilePath
@@ -396,17 +346,17 @@ def resolveQedjsEnv (needBuild : Bool := true) : IO (Option QedjsEnv) := do
   let some leanPath ← lakeEnvLeanPath | return none
   return some { bin, leanPath }
 
+private def QedjsEnv.envWith (q : QedjsEnv) (extraPath : Option String) : Array (String × Option String) :=
+  #[("LEAN_PATH", some (match extraPath with | some p => s!"{p}:{q.leanPath}" | none => q.leanPath))]
+
 def QedjsEnv.run (q : QedjsEnv) (args : Array String) (quiet : Bool := false)
     (extraPath : Option String := none) : IO Bool := do
-  let lp := match extraPath with | some p => s!"{p}:{q.leanPath}" | none => q.leanPath
-  let env := #[("LEAN_PATH", some lp)]
-  let code ← if quiet then shQuiet q.bin.toString args env else sh q.bin.toString args env
-  return code == 0
+  let e := q.envWith extraPath
+  return (← if quiet then shQuiet q.bin.toString args e else sh q.bin.toString args e) == 0
 
 def QedjsEnv.runOut (q : QedjsEnv) (args : Array String) (quiet : Bool := false)
     (extraPath : Option String := none) : IO (Bool × String) := do
-  let lp := match extraPath with | some p => s!"{p}:{q.leanPath}" | none => q.leanPath
-  let (code, out) ← shOut q.bin.toString args #[("LEAN_PATH", some lp)]
+  let (code, out) ← shOut q.bin.toString args (q.envWith extraPath)
   if code != 0 then
     IO.eprint out
     lastBuildErrorRef.set out

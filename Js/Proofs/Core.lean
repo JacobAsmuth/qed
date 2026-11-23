@@ -36,7 +36,7 @@ theorem genGlobalName_disjoint_all (counter : Nat) (x : VarId) (j : JoinPointId)
     genGlobalName counter ≠ "$." ++ ext ∧ genGlobalName counter ≠ "__step" ∧ genGlobalName counter ≠ "__r" ∧ genGlobalName counter ≠ "__externs" := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> · intro h; have hl := congrArg String.toList h; simp [genGlobalName, v, jp, inlineJpSlot, String.toList_append] at hl
 theorem ctxJs_fallback_startsWith_dollar (c : Ctx) (n : Name) (hmiss : c.names.get? n = none) : (c.js n).startsWith "$." = true := by
-  have hget : c.names[n]? = none := hmiss; simp [Ctx.js, hget, String.startsWith]
+  have hget : c.names[n]? = none := hmiss; simp [Ctx.js, hget]
 
 def jsReservedWords : List String :=
   ["break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "enum", "export", "extends", "false",
@@ -50,7 +50,9 @@ private theorem not_res_of_pfx {p t : String} (hp : ∀ r, isInternalTag (p.toBy
 theorem ident_ne_jsKeyword (x : VarId) (j : JoinPointId) (k i : Nat) (ext : String) :
     v x ∉ jsReservedWords ∧ jp j ∉ jsReservedWords ∧ genGlobalName k ∉ jsReservedWords ∧ inlineJpSlot j i ∉ jsReservedWords ∧ ("$." ++ ext) ∉ jsReservedWords :=
   ⟨not_res_of_pfx (p := "x") fun _ => rfl, not_res_of_pfx (p := "j") fun _ => rfl, not_res_of_pfx (p := "_g") fun _ => rfl,
-   by simpa only [inlineJpSlot, jp, toString_str_eq, String.append_assoc] using not_res_of_pfx (p := "_j") (t := toString j.idx ++ "_" ++ toString i) fun _ => rfl, not_res_of_pfx (p := "$.") fun _ => rfl⟩
+   by have heq : inlineJpSlot j i = "_j" ++ (toString j.idx ++ "_" ++ toString i) := by
+        simp only [inlineJpSlot, jp, toString_str_eq, String.append_assoc]; rw [← String.append_assoc (s₁ := "_") (s₂ := "j"), show "_" ++ "j" = "_j" from rfl]
+      rw [heq]; exact not_res_of_pfx (p := "_j") fun _ => rfl, not_res_of_pfx (p := "$.") fun _ => rfl⟩
 
 private def mangleStep (s : String) (c : Char) : String := if c.isAlphanum then s.push c else if c == '.' || c == '_' then s.push '_' else s ++ s!"x{c.toNat}"
 theorem mangle_chars_safe (n : Name) : ∀ ch ∈ (mangle n).toList, ch.isAlphanum = true ∨ ch = '_' := by
@@ -168,7 +170,7 @@ theorem jsTag_lowerCtor (env : String → JsVal) (info : CtorInfo) (ys : Array A
 theorem fieldProj_lowerCtor (c : Ctx) (ty : IRType) (env : String → JsVal) (x : VarId) (info : CtorInfo) (ys : Array Arg) (idx : Nat)
     (hboxed : ¬(info.size == 0 && info.usize == 0 && info.ssize == 0) = true) (hidx : idx < ys.toList.length) (hx : env (v x) = evalJsExpr env (lowerCtor info ys)) :
     evalJsExpr env (lowerExpr c ty (.proj idx x)) = evalJsExpr env (lowerArg (ys.toList.getD idx .erased)) := by
-  dsimp only [lowerExpr, evalJsExpr]; rw [hx]; dsimp only [lowerCtor]; rw [if_neg hboxed]; dsimp only [evalJsExpr]; rw [evalJsExprList_map]
+  dsimp only [lowerExpr, evalJsExpr]; rw [hx]; dsimp only [lowerCtor]; rw [ite_eq_right hboxed]; dsimp only [evalJsExpr]; rw [evalJsExprList_map]
   generalize ys.toList = args at hidx ⊢; induction args generalizing idx with | nil => nomatch hidx | cons _ _ ih => cases idx with | zero => rfl | succ k => exact ih k (Nat.lt_of_succ_lt_succ hidx)
 
 inductive RtFnVal (α : Type) where | ground (v : α) | pap (fn : List α → RtFnVal α) (arity : Nat) (acc : List α)
@@ -179,18 +181,18 @@ def rtApp : Nat → RtFnVal α → List α → Option (RtFnVal α)
       if xs.length < rem then some (.pap fn arity (acc ++ xs)) else if xs.length == rem then some (fn (acc ++ xs)) else rtApp fuel (fn (acc ++ xs.take rem)) (xs.drop rem)
 theorem rtApp_under_compose {α : Type} (fn : List α → RtFnVal α) (arity : Nat) (acc xs₁ xs₂ : List α) (fuel : Nat) (hunder : acc.length + xs₁.length < arity) :
     (rtApp (fuel + 1) (.pap fn arity acc) xs₁).bind (fun f' => rtApp (fuel + 1) f' xs₂) = rtApp (fuel + 1) (.pap fn arity acc) (xs₁ ++ xs₂) := by
-  dsimp only [rtApp]; rw [if_pos (by omega)]; simp only [Option.bind, rtApp, List.length_append, List.append_assoc]
-  by_cases hlt2 : xs₂.length < arity - (acc.length + xs₁.length); · rw [if_pos hlt2, if_pos (by omega)]
+  dsimp only [rtApp]; rw [ite_eq_left (by omega)]; simp only [Option.bind, rtApp, List.length_append, List.append_assoc]
+  by_cases hlt2 : xs₂.length < arity - (acc.length + xs₁.length); · rw [ite_eq_left hlt2, ite_eq_left (by omega)]
   have hrhs : ¬xs₁.length + xs₂.length < arity - acc.length := by omega
-  rw [if_neg hlt2, if_neg hrhs]; by_cases heq2 : xs₂.length = arity - (acc.length + xs₁.length); · rw [if_pos (beq_iff_eq.2 heq2), if_pos (beq_iff_eq.2 (by omega))]
-  rw [if_neg (fun h => heq2 (eq_of_beq h)), if_neg (fun h => heq2 (by have := eq_of_beq h; omega)), show arity - (acc.length + xs₁.length) = arity - acc.length - xs₁.length by omega,
+  rw [ite_eq_right hlt2, ite_eq_right hrhs]; by_cases heq2 : xs₂.length = arity - (acc.length + xs₁.length); · rw [ite_eq_left (beq_iff_eq.2 heq2), ite_eq_left (beq_iff_eq.2 (by omega))]
+  rw [ite_eq_right (fun h => heq2 (eq_of_beq h)), ite_eq_right (fun h => heq2 (by have := eq_of_beq h; omega)), show arity - (acc.length + xs₁.length) = arity - acc.length - xs₁.length by omega,
     show (xs₁ ++ xs₂).take (arity - acc.length) = xs₁ ++ xs₂.take (arity - acc.length - xs₁.length) by rw [List.take_append, List.take_of_length_le (by omega)],
     show (xs₁ ++ xs₂).drop (arity - acc.length) = xs₂.drop (arity - acc.length - xs₁.length) by rw [List.drop_append, List.drop_eq_nil_of_le (by omega), List.nil_append]]
 theorem rtApp_exact_equiv {α : Type} (fn : List α → RtFnVal α) (arity : Nat) (acc xs : List α) (fuel : Nat) (hacc : acc.length ≤ arity) (hsat : acc.length + xs.length = arity) :
     rtApp (fuel + 1) (rtPap fn arity acc) xs = some (fn (acc ++ xs)) := by simp [rtPap, rtApp, show ¬xs.length < arity - acc.length by omega, show (xs.length == arity - acc.length) = true from beq_iff_eq.2 (by omega)]
 theorem rtApp_over_equiv {α : Type} (fn : List α → RtFnVal α) (arity : Nat) (acc xs₁ xs₂ : List α) (fuel : Nat) (hacc : acc.length ≤ arity) (hsat : acc.length + xs₁.length = arity) (hmore : 0 < xs₂.length) :
     rtApp (fuel + 2) (rtPap fn arity acc) (xs₁ ++ xs₂) = rtApp (fuel + 1) (fn (acc ++ xs₁)) xs₂ := by
-  dsimp only [rtPap, rtApp]; rw [if_neg (by simp; omega), if_neg (fun h => by have := eq_of_beq h; simp at this; omega), show arity - acc.length = xs₁.length by omega, List.take_left, List.drop_left]
+  dsimp only [rtPap, rtApp]; rw [ite_eq_right (by simp; omega), ite_eq_right (fun h => by have := eq_of_beq h; simp at this; omega), show arity - acc.length = xs₁.length by omega, List.take_left, List.drop_left]
 def recEval {α β : Type} (step : α → Sum α β) : Nat → α → Option β | 0, _ => none | fuel + 1, a => match step a with | .inl n => recEval step fuel n | .inr r => some r
 def directLoopEval {α β : Type} (step : α → Sum α β) : Nat → α → Option β | 0, _ => none | fuel + 1, a => match step a with | .inl n => directLoopEval step fuel n | .inr r => some r
 theorem directLoop_equiv {α β : Type} (step : α → Sum α β) : ∀ (fuel : Nat) (init : α), directLoopEval step fuel init = recEval step fuel init

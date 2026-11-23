@@ -80,7 +80,7 @@ theorem everyElement_through_map {α β} (f : α → β) {Pα : String → List 
   | x :: xs => by
       cases x with
       | attr k _ | signalAttr _ k _ => by_cases hk : (k == "class") <;> simp [Attr.canonical, attrClasses, hk, attrClasses_canonical xs]
-      | _ => simp [Attr.canonical, attrClasses, attrClasses_canonical xs]
+      | _ => simp [List.filterMap_cons, Attr.canonical, attrClasses, attrClasses_canonical xs]
 
 @[simp] theorem attrRole_canonical (a : List (Attr msg)) : attrRole (a.filterMap Attr.canonical) = attrRole a := attrValue_canonical "data-role" (by decide) a
 

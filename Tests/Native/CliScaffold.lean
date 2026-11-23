@@ -110,7 +110,8 @@ def run : IO Bool := do
        "def initState : Nat := 1\ndef my_handler (n : Nat) : Nat := n\ndef my_step (n : Nat) : Nat := n\ndef admitted_sorry_msg : String := \"We are sorry, please admit this item\"\n")
     for (label, src, wantOk, wantSub) in [("benign comments/strings/client helpers pass qed check", withBenign, true, ""),
         ("real sorry inside interpolated string rejected", validSrc ++ "\ndef badInterp : String := s!\"{(by sorry : Nat)}\" -- never emit\n", false, "forbidden token `sorry`"),
-        ("partial def rejected by kernel gate", validSrc ++ "\npartial def spin (n : Nat) : Nat := spin n\n", false, "kernel gate: `partial` or `opaque` declaration `spin`")] do
+        ("partial def rejected by kernel gate", validSrc ++ "\npartial def spin (n : Nat) : Nat := spin n\n", false, "kernel gate: `partial` or `opaque` declaration `spin`"),
+        ("repeatM loop rejected by kernel gate", validSrc ++ "\ndef badRepeat (n : Nat) : Id Nat := repeatM (fun i => if i < n then pure (.inl (i + 1)) else pure (.inr i)) 0\n", false, "kernel gate: unbounded `while`/`repeat`/`partial_fixpoint` loop inside `badRepeat`")] do
       IO.FS.writeFile appLean src
       let (code, out, err) ← runCmd cli #["check"] (cwd := some appDir) (env := cleanEnv); let combined := out ++ err
       c.check label ((code == 0) == wantOk && (wantSub.isEmpty || combined.contains wantSub)) combined

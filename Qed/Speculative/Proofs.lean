@@ -126,8 +126,8 @@ private theorem step_resolve_cases (st : SpecState State Msg) (msg : Msg) (txId 
   match hlog : st.log with
   | .pending id0 m0 :: tail =>
       dsimp only; by_cases hc : (hit && id0 == txId) = true
-      · rw [if_pos hc]; rcases Bool.and_eq_true_iff.1 hc with ⟨hh, hi⟩; cases beq_iff_eq.1 hi; exact .inl ⟨m0, tail, rfl, hh, rfl⟩
-      · rw [if_neg hc]; exact .inr rfl
+      · rw [ite_eq_left hc]; rcases Bool.and_eq_true_iff.1 hc with ⟨hh, hi⟩; cases beq_iff_eq.1 hi; exact .inl ⟨m0, tail, rfl, hh, rfl⟩
+      · rw [ite_eq_right hc]; exact .inr rfl
   | [] | .regular _ :: _ | .resolved _ :: _ => exact .inr rfl
 
 private theorem step_preserves (P : SpecState State Msg → Prop)
@@ -168,7 +168,7 @@ theorem step_preserves_coherent (st : SpecState State Msg) (msg : Msg) (hcoh : C
   step_preserves upd classify (Coherent fun s m => (upd s m).1)
     (fun _ _ _ h he _ => by unfold appendNonPending; unfold Coherent at h ⊢; split; rfl; simp [List.foldl_append, replayEntry, he, h])
     (fun _ _ h => by unfold appendPending; unfold Coherent at h ⊢; simp [List.foldl_append, replayEntry, entryMsg, h])
-    (fun _ _ _ _ _ h hlog => by unfold resolveHeadHit; dsimp only; split; (unfold Coherent at h ⊢; dsimp only; rw [drainConfirmed_foldl_eq]; simpa [hlog, List.foldl_cons, replayEntry] using h); rfl)
+    (fun _ _ _ _ _ h hlog => by unfold resolveHeadHit; dsimp only; split; (unfold Coherent at h ⊢; dsimp only; rw [drainConfirmed_foldl_eq]; simpa [hlog, List.foldl_cons, replayEntry, entryMsg] using h); rfl)
     (fun _ _ _ _ => rfl) st msg hcoh
 
 private theorem wellFormedIds_of_sublist {st st' : SpecState State Msg} (h : WellFormedIds st)
@@ -230,7 +230,7 @@ private theorem step_resolve_empty_pending_drains (st : SpecState State Msg) (ms
   rcases step_resolve_cases upd classify st msg txId hit replMsgs confirmOnHit hcl with ⟨_, _, _, _, hstep⟩ | hstep <;>
     (rw [hstep] at hpe ⊢; first | unfold resolveHeadHit at hpe ⊢ | unfold resolveReplace at hpe ⊢; dsimp only at hpe ⊢)
   · split at hpe <;> (rename_i h2; simp only [h2, ↓reduceIte]; exact .inl (drainConfirmed_nil_of_pending _ _ _ hpe))
-  · split at hpe <;> (rename_i h2; first | (rw [if_pos h2]; exact .inr rfl) | (rw [if_neg h2]; exact .inl (drainConfirmed_nil_of_pending _ _ _ hpe)))
+  · split at hpe <;> (rename_i h2; first | (rw [ite_eq_left h2]; exact .inr rfl) | (rw [ite_eq_right h2]; exact .inl (drainConfirmed_nil_of_pending _ _ _ hpe)))
 
 private theorem step_resolve_pendingIds_split (st : SpecState State Msg) (msg : Msg) (txId : Nat) (sm : Msg)
     (hit : Bool) (replMsgs confirmOnHit : List Msg) (pre post : List (SpecEntry Msg))

@@ -195,7 +195,7 @@ def derivePreviewHost (prodHost subdomain : String) : HostPattern := .wildcard (
 
 theorem derivePreviewHost_disjoint (prodHost subLabel : String) : (derivePreviewHost prodHost subLabel).matches prodHost = false := by
   unfold derivePreviewHost HostPattern.matches
-  exact if_pos (by simp [String.toList_append]; omega)
+  exact ite_eq_left (by simp [String.toList_append]; omega)
 
 private def findAfterScheme : List Char → Option (List Char)
   | ':' :: '/' :: '/' :: rest => some rest

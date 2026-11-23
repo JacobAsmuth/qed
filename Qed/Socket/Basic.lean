@@ -25,7 +25,7 @@ instance : LawfulJson SocketStatus where
   depthBound := 1 + LawfulJson.depthBound Nat
   depth_toJson
     | .disconnected | .connecting | .connected | .failed _ => Nat.le_add_right 1 _
-    | .reconnecting n => Nat.add_le_add_left (by simpa [Json.maxObj] using LawfulJson.depth_toJson n) 1
+    | .reconnecting n => Nat.add_le_add_left (by simp [Json.maxObj, Json.depth]) 1
   fromJson_toJson
     | .disconnected | .connecting | .connected | .failed _ => rfl
     | .reconnecting n => by change (FromJson.fromJson (toJson n) : Except String Nat).map SocketStatus.reconnecting = _; rw [LawfulJson.fromJson_toJson n]; rfl
@@ -118,11 +118,11 @@ private theorem u32_be_roundtrip (v : UInt32) :
 private theorem byteArray_extract_append_right (a b : ByteArray) : (a ++ b).extract a.size (a ++ b).size = b :=
   ByteArray.ext <| Array.ext (by simp [ByteArray.size_append]) fun i h1 h2 => by
     change ((a ++ b).extract a.size (a ++ b).size)[i]'h1 = b[i]'h2
-    rw [ByteArray.getElem_extract, ByteArray.getElem_append_right (by omega)]; simp only [Nat.add_sub_cancel_left]; rfl
+    rw [ByteArray.getElem_extract, ByteArray.getElem_append_right (by omega)]; simp only [Nat.add_sub_cancel_left]
 private theorem decode_mkMuxHdr (op : UInt8) (sid : UInt32) (rest : ByteArray) :
     decode (mkMuxHdr op sid ++ rest) = decodeBody op sid rest := by
   have hsz : (mkMuxHdr op sid).size = 5 := rfl
-  unfold decode; rw [dif_pos (by rw [ByteArray.size_append, hsz]; omega)]
+  unfold decode; rw [dite_eq_left (by rw [ByteArray.size_append, hsz]; omega)]
   repeat rw [ByteArray.getElem_append_left (by rw [hsz]; omega)]
   have hrest := byteArray_extract_append_right (mkMuxHdr op sid) rest
   rw [hsz] at hrest; rw [hrest, show (mkMuxHdr op sid)[0] = op from rfl]; exact congrArg (decodeBody op · rest) (u32_be_roundtrip sid)

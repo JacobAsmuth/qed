@@ -229,7 +229,7 @@ def VAttr.mapScope (f : σ' → σ) : VAttr σ msg → VAttr σ' msg
 
 def withKey (k : String) : Html msg → Html msg | .element t as cs => .element t (.key k :: as) cs | h => h
 @[simp] theorem Html.validIn_withKey (ctx : HtmlCtx) (k : String) (h : Html msg) : Html.validIn ctx (withKey k h) = Html.validIn ctx h := by cases h <;> simp [withKey, Html.validIn, Attr.valid]
-@[simp] theorem Html.canonical_withKey (k : String) (h : Html msg) : Html.canonical (withKey k h) = Html.canonical h := by cases h <;> simp [withKey, Html.canonical, mkCanonicalElem, Attr.canonical]
+@[simp] theorem Html.canonical_withKey (k : String) (h : Html msg) : Html.canonical (withKey k h) = Html.canonical h := by cases h <;> simp [withKey, Html.canonical, mkCanonicalElem, List.filterMap_cons, Attr.canonical]
 
 mutual
   def View.mapScope (f : σ' → σ) : View σ msg → View σ' msg

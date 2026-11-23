@@ -29,7 +29,7 @@ private theorem encodeUTF8Loop_toList (bs : ByteArray) (i : Nat) :
   | zero => intro acc; rw [encodeUTF8Loop.eq_1 (acc := acc), encodeUTF8Loop.eq_1 (acc := "")]; simp [show ¬ i < bs.size by omega]
   | succ _ ih =>
       intro acc; have h : i < bs.size := by omega
-      rw [encodeUTF8Loop.eq_1 (acc := acc), encodeUTF8Loop.eq_1 (acc := ""), dif_pos h, dif_pos h]
+      rw [encodeUTF8Loop.eq_1 (acc := acc), encodeUTF8Loop.eq_1 (acc := ""), dite_eq_left h, dite_eq_left h]
       by_cases hu : isUnreserved bs[i] <;>
         (simp only [hu, Bool.false_eq_true, ↓reduceIte]; conv => rhs; rw [ih (i + 1) (by omega)]
          rw [ih (i + 1) (by omega)]; simp [String.toList_push, List.append_assoc])
@@ -48,13 +48,13 @@ private theorem decodeBytes_encodeUTF8Loop (bs : ByteArray) (i : Nat) :
     ∀ (acc : ByteArray), i ≤ bs.size →
       (decodeBytes (encodeUTF8Loop bs i "").toList acc).data.toList = acc.data.toList ++ bs.data.toList.drop i := by
   induction hfuel : bs.size - i generalizing i with
-  | zero => intro acc hi; obtain rfl : i = bs.size := (by omega); rw [encodeUTF8Loop.eq_1, dif_neg (Nat.lt_irrefl _)]; simp [List.drop_eq_nil_iff, decodeBytes]
+  | zero => intro acc hi; obtain rfl : i = bs.size := (by omega); rw [encodeUTF8Loop.eq_1, dite_eq_right (Nat.lt_irrefl _)]; simp [List.drop_eq_nil_iff, decodeBytes]
   | succ _ ih =>
       intro acc hi; have hlt : i < bs.size := (by omega)
       have hdrop : bs.data.toList.drop i = bs[i] :: bs.data.toList.drop (i + 1) := (List.getElem_cons_drop (by simpa using hlt)).symm
       suffices h : decodeBytes (encodeUTF8Loop bs i "").toList acc = decodeBytes (encodeUTF8Loop bs (i + 1) "").toList (acc.push bs[i]) by
         rw [h, ih (i + 1) (by omega) (acc.push bs[i]) (by omega), hdrop]; simp [ByteArray.push, List.append_assoc]
-      rw [encodeUTF8Loop.eq_1 (acc := ""), dif_pos hlt, encodeUTF8Loop_toList]
+      rw [encodeUTF8Loop.eq_1 (acc := ""), dite_eq_left hlt, encodeUTF8Loop_toList]
       by_cases hu : isUnreserved bs[i]
       · simp only [hu, ↓reduceIte, String.toList_push, String.toList_empty, List.nil_append, List.singleton_append]; exact decodeBytes_unreserved hu _ _
       · have ⟨hrecBV, hhiLt, hloLt⟩ := bitvec8_nibbles bs[i].toBitVec
@@ -65,7 +65,7 @@ private theorem decodeBytes_encodeUTF8Loop (bs : ByteArray) (i : Nat) :
 @[simp] theorem decodeSeg_encodeSeg (s : String) : decodeSeg (encodeSeg s) = s := by
   have hdata := decodeBytes_encodeUTF8Loop s.toUTF8 0 .empty (Nat.zero_le _); simp only [List.drop_zero, ByteArray.empty] at hdata
   have hba : decodeBytes (encodeSeg s).toList .empty = s.toUTF8 := ByteArray.ext (congrArg List.toArray (by simpa [encodeSeg] using hdata))
-  rw [decodeSeg, hba, String.toUTF8, String.fromUTF8?, dif_pos s.isValidUTF8]; rfl
+  rw [decodeSeg, hba, String.toUTF8, String.fromUTF8?, dite_eq_left s.isValidUTF8]; rfl
 
 private theorem isPctEncodedChar_props {c : Char} (h : isPctEncodedChar c = true) : c ≠ '/' ∧ c ≠ '?' ∧ c ≠ '#' := by
   simp only [isPctEncodedChar, Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at h
@@ -108,7 +108,7 @@ theorem Router.fromURL_toURL {α : Type} [Router α] (a : α) (hne : ∀ s ∈ R
   have hall : (joinSlash segs).toList.all (fun c => c != '#' && c != '?') = true :=
     joinSlash_all _ rfl _ fun s hs => List.all_eq_true.2 fun c hc => by
       have ⟨_, hq, hh⟩ := isPctEncodedChar_props (List.all_eq_true.1 (hnonempty s hs).2 c hc); simp [bne_iff_ne, hq, hh]
-  rw [hdrop, String.toList_ofList, List.takeWhile_cons, if_pos (by decide : ('/' != '#' && '/' != '?') = true),
+  rw [hdrop, String.toList_ofList, List.takeWhile_cons, ite_eq_left (by decide : ('/' != '#' && '/' != '?') = true),
     list_takeWhile_eq_self _ fun c hc => List.all_eq_true.1 hall c hc]
   change Router.parse ((("" :: splitSlashChars (joinSlash segs).toList []).filter (· ≠ "")).map decodeSeg) = _
   simp only [List.filter_cons, ne_eq, not_true_eq_false, decide_false, Bool.false_eq_true, ↓reduceIte, splitSlashChars_joinSlash _ hnonempty]

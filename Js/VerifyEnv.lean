@@ -38,7 +38,7 @@ private def isMetaNamespaceConst (env : Environment) (n : Name) : Bool :=
   | _ => false
 
 private def forbiddenRuntimeLoopExact : Std.HashSet Name := Std.HashSet.ofList [
-  `IO.iterate, `runST, `runEST, `IO.FS.Stream.mk, `IO.FS.Stream.readToEnd, `IO.FS.Stream.readBinToEnd,
+  `IO.iterate, `repeatM, `runST, `runEST, `IO.FS.Stream.mk, `IO.FS.Stream.readToEnd, `IO.FS.Stream.readBinToEnd,
   `IO.FS.Stream.readBinToEndInto, `IO.FS.Stream.lines, `Std.Stream.forIn, `Std.instForInOfMonadOfStream,
   `Std.Rci.iter, `Std.Roi.iter, `Std.Rii.iter, `Std.Rcc.iter, `Std.Rco.iter, `Std.Roc.iter, `Std.Roo.iter,
   `Std.Ric.iter, `Std.Rio.iter, `Std.Rxi.Iterator, `Std.Rxi.instIteratorIteratorIdOfUpwardEnumerable,
@@ -57,13 +57,15 @@ private def forbiddenRuntimeLoopExact : Std.HashSet Name := Std.HashSet.ofList [
   `Std.Channel.forAsync, `Std.CloseableChannel.forAsync, `Std.Channel.Sync.forIn, `Std.CloseableChannel.Sync.forIn,
   `Std.Channel.Sync.instForInOfInhabitedOfMonadOfMonadLiftTBaseIO,
   `Std.CloseableChannel.Sync.instForInOfMonadOfMonadLiftTBaseIO,
-  `Std.Internal.IO.Async.EAsync.forIn, `Std.Internal.IO.Async.EAsync.instForInLoopUnit,
+  `Std.Async.EAsync.forIn, `Std.Async.EAsync.instForInLoopUnit,
+  `Std.Async.ContextAsync.forIn, `Std.Async.ContextAsync.instForInLoopUnit,
   `Std.Http.Body.Stream.forIn, `Std.Http.Body.Stream.forIn', `Std.Http.Body.Stream.readAll,
+  `Std.Http.Body.Stream.drain,
   `Std.Http.Body.instForInAsyncStreamChunk, `Std.Http.Body.instForInContextAsyncStreamChunk
 ]
 private def forbiddenRuntimeLoopDottedSubstrs : Array String := #[
-  "IO.iterate", "IterM.Partial", "Lean.Loop.forIn", "Lean.Order.fix", "Std.Stream.forIn",
-  "IteratorLoop.defaultImplementation", "Parsec.manyCore", "Parsec.manyCharsCore"
+  "IO.iterate", "repeatM.erased", "repeatM.impl", "IterM.Partial", "Lean.Loop.forIn", "Lean.Order.fix",
+  "Std.Stream.forIn", "IteratorLoop.defaultImplementation", "Parsec.manyCore", "Parsec.manyCharsCore"
 ]
 private def wfOpaqueLeaves : Array String := #["opaqueFix", "opaqueFix₂", "opaqueFix₃"]
 private def wfExtrinsicLeaves : Array String := #[
@@ -101,10 +103,15 @@ private def forbiddenUserMutableRefExact : Std.HashSet Name := Std.HashSet.ofLis
   `ST.Prim.Ref.modifyGet, `IO.Ref.set, `IO.Ref.modify, `IO.Ref.modifyGet, `ST.Ref.swap, `ST.Prim.Ref.swap,
   `IO.Ref.swap, `ST.Ref.take, `ST.Prim.Ref.take, `IO.Ref.take, `IO.Promise.new, `IO.Promise.resolve,
   `IO.Promise.result?, `IO.Promise.result!, `IO.Promise.resultD, `Std.BaseMutex.new, `Std.BaseRecursiveMutex.new,
-  `Std.BaseSharedMutex.new, `Std.Mutex.new, `Std.Mutex.atomically, `Std.Mutex.atomicallyOnce,
-  `Std.RecursiveMutex.new, `Std.RecursiveMutex.atomically, `Std.SharedMutex.new, `Std.SharedMutex.atomically,
-  `Std.SharedMutex.tryAtomically, `StateRefT'.run, `StateRefT'.run', `StateRefT'.set, `StateRefT'.modifyGet,
-  `StateRefT'.instMonadStateOfOfMonadLiftTST, `Std.Channel.new, `Std.CloseableChannel.new, `Std.Broadcast.new,
+  `Std.BaseSharedMutex.new, `Std.Condvar.new, `Std.Barrier.new, `Std.Notify.new, `Std.Semaphore.new,
+  `Std.CancellationContext.new, `Std.CancellationToken.new,
+  `Std.Mutex.new, `Std.Mutex.atomically, `Std.Mutex.tryAtomically, `Std.Mutex.atomicallyOnce,
+  `Std.RecursiveMutex.new, `Std.RecursiveMutex.atomically, `Std.RecursiveMutex.tryAtomically,
+  `Std.SharedMutex.new, `Std.SharedMutex.atomically, `Std.SharedMutex.tryAtomically,
+  `Std.SharedMutex.atomicallyRead, `Std.SharedMutex.tryAtomicallyRead,
+  `StateRefT'.run, `StateRefT'.run', `StateRefT'.set, `StateRefT'.modifyGet,
+  `StateRefT'.instMonadStateOfOfMonadLiftTST, `Std.Channel.new, `Std.Channel.Sync.new,
+  `Std.CloseableChannel.new, `Std.CloseableChannel.Sync.new, `Std.Broadcast.new, `Std.Broadcast.Sync.new,
   `Std.Bounded.new, `Qed.Server.Prim.mkStateBox, `Qed.Server.Prim.atomicRead, `Qed.Server.Prim.atomicModify,
   `Qed.Server.Native.withStateBox, `Qed.Handlers.mkNew, `Qed.registerHandler, `Qed.dispatchStrWithRows,
   `Qed.localRerender, `Qed.localRun
@@ -342,6 +349,21 @@ private def checkIrCallee (env : Environment) (checkNonFw checkTcPartials : Bool
     if isForbiddenToolchainPartial env owner then
       throw s!"kernel gate: non-total toolchain `partial` declaration `{owner}` (via `{c}`) is {irCallSite irName modName transitive}"
 
+private def isCompilerCtorIdxImpl (env : Environment) (n : Name) : Bool :=
+  match n with
+  | .str (.str ind "ctorIdx") "_impl" =>
+      match env.find? ind, env.find? n, Compiler.getImplementedBy? env (Name.str ind "ctorIdx") with
+      | some (.inductInfo _), some (.defnInfo dv), some impl =>
+          if impl != n then false
+          else
+            let rec peel : Expr → Expr | .lam _ _ b _ => peel b | e => e
+            match peel dv.value with
+            | .app (.app (.const ``getObjTagNat _) ty) (.bvar 0) =>
+                match ty.getAppFn with | .const c _ => c == ind | _ => false
+            | _ => false
+      | _, _, _ => false
+  | _ => false
+
 private def verifyUserDecl (env : Environment) (modName n : Name) (ci? : Option ConstantInfo) (checkIr : Bool := true) : Except String Unit := do
   let ownerMod := if !modName.isAnonymous then modName else definingModule env ((owningKernelConst? env n).getD n)
   let isNonFw := !isFrameworkModule ownerMod
@@ -351,9 +373,11 @@ private def verifyUserDecl (env : Environment) (modName n : Name) (ci? : Option 
   if (Lean.getExportNameFor? env n).isSome && ownerMod != `Qed.Driver.Runtime then
     throw s!"kernel gate: `@[export]` declaration `{n}` in `{modName}` is forbidden outside `Qed.Driver.Runtime`"
   if let some impl := Compiler.getImplementedBy? env n then
-    throw s!"kernel gate: `@[implemented_by {impl}]` or `partial def` on `{n}` in `{modName}` is forbidden"
+    if !(impl == Name.str n "_impl" && isCompilerCtorIdxImpl env impl) then
+      throw s!"kernel gate: `@[implemented_by {impl}]` or `partial def` on `{n}` in `{modName}` is forbidden"
   if let some ci := ci? then
-    if ci.isUnsafe then throw s!"kernel gate: `unsafe` declaration `{n}` in `{modName}` is forbidden"
+    let isCtorIdxImpl := isCompilerCtorIdxImpl env n
+    if ci.isUnsafe && !isCtorIdxImpl then throw s!"kernel gate: `unsafe` declaration `{n}` in `{modName}` is forbidden"
     match unfoldReturnHead env forbiddenCustomClass ci.type with
     | .error err => throw s!"kernel gate: `{n}` in `{modName}` failed return-type check ({err})"
     | .ok (some rtHead) => if forbiddenCustomClass rtHead then throw s!"kernel gate: custom `{rtHead}` instance `{n}` in `{modName}` is forbidden"
@@ -362,7 +386,7 @@ private def verifyUserDecl (env : Environment) (modName n : Name) (ci? : Option 
     | .opaqueInfo _ => if !isLegitOpaque env modName n then
         throw s!"kernel gate: `partial` or `opaque` declaration `{n}` in `{modName}` is forbidden outside `Qed.Dom` and `Qed.Server.Prim`"
     | .defnInfo dv =>
-        if dv.safety != .safe && !isTotalCompilerAux env n then
+        if dv.safety != .safe && !isTotalCompilerAux env n && !isCtorIdxImpl then
           if let .str root "_unsafe_rec" := n then
             if let some (.opaqueInfo _) := env.find? root then
               throw s!"kernel gate: `partial` or `opaque` declaration `{root}` in `{modName}` is forbidden outside `Qed.Dom` and `Qed.Server.Prim`"

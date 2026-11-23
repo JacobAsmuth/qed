@@ -47,7 +47,7 @@ private theorem getAux_setAux [BEq K] [LawfulBEq K] (k k' : K) (v : V) :
       unfold setAux; split <;> rename_i h0
       · cases eq_of_beq h0; unfold getAux; cases (k == k') <;> rfl
       · unfold getAux; split <;> rename_i h1
-        · cases eq_of_beq h1; rw [if_neg fun h => h0 (by rw [eq_of_beq h, beq_self_eq_true])]
+        · cases eq_of_beq h1; rw [ite_eq_right fun h => h0 (by rw [eq_of_beq h, beq_self_eq_true])]
         · exact getAux_setAux k k' v xs
 
 @[simp] theorem get_set [BEq K] [LawfulBEq K] (d : Dict K V) (k k' : K) (v : V) : (d.set k v).get k' = if k == k' then some v else d.get k' := getAux_setAux k k' v d.entriesList
@@ -62,7 +62,7 @@ private theorem getAux_filter_ne [BEq K] [LawfulBEq K] (k k' : K) :
   | (k0, _) :: xs => by
       simp only [List.filter_cons]; cases h0 : (k0 == k)
       · simp only [Bool.not_false, ↓reduceIte, getAux]; split <;> rename_i h1
-        · rw [if_neg fun heq => by rw [eq_of_beq h1, eq_of_beq heq, beq_self_eq_true] at h0; cases h0]
+        · rw [ite_eq_right fun heq => by rw [eq_of_beq h1, eq_of_beq heq, beq_self_eq_true] at h0; cases h0]
         · exact getAux_filter_ne k k' xs
       · cases eq_of_beq h0; simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, getAux_filter_ne k k' xs, getAux]; cases (k == k') <;> rfl
 

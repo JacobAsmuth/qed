@@ -367,7 +367,7 @@ private theorem read_retainElem (prev names : List String) (st : SpecElemState m
   | attr _ => dsimp only [AttrSlot.read, AttrSlot.managedName, retainElem]; rw [lookupAssoc_filter keep]; exact hite ..
   | click _ => dsimp only [AttrSlot.read, AttrSlot.managedName, retainElem]; rw [lookupAssoc_filter (fun e => keep s!"data-qed-on-{e}")]; exact hite ..
   | input _ => dsimp only [AttrSlot.read, AttrSlot.managedName, retainElem]; rw [lookupAssoc_filter (fun e => keep s!"data-qed-onv-{e}")]; exact hite ..
-  | val | chk => simp only [AttrSlot.read, AttrSlot.managedName, retainElem]; split <;> rfl
+  | val | chk => simp only [AttrSlot.read, AttrSlot.managedName, retainElem]; split <;> simp only [Bool.false_eq_true, ↓reduceIte, *]
 
 private theorem ElemManaged_foldl_norm (attrs : List (Attr msg)) (s : SpecElemState msg)
     (hs : ElemManaged s ((normalizeAttrs attrs).filterMap managedAttrName)) :
@@ -424,11 +424,11 @@ theorem mem_normalizeAttrs_DomClean {attrs : List (Attr msg)} (hc : attrs.all At
     · cases List.mem_singleton.1 hm; rfl
   · exact hc x (List.mem_filter.1 (mem_dedupAttrs hd)).1
 
-private theorem startsWith_append_self (p e : String) : (p ++ e).startsWith p = true := by simp [String.startsWith]
+private theorem startsWith_append_self (p e : String) : (p ++ e).startsWith p = true := by simp
 private theorem append_ne_of_not_startsWith {p e s : String} (h : s.startsWith p = false) : p ++ e ≠ s :=
   fun heq => by rw [← heq, startsWith_append_self] at h; cases h
 private theorem on_ne_onv {e₁ e₂ : String} : "data-qed-on-" ++ e₁ ≠ "data-qed-onv-" ++ e₂ := fun heq => by
-  have h := congrArg (fun s => (s.toList.drop 11).head?) heq; dsimp only at h
+  have h := congrArg (fun s => (s.toList.drop 11).head?) heq
   rw [String.toList_append, String.toList_append,
     show "data-qed-on-".toList = ['d','a','t','a','-','q','e','d','-','o','n','-'] from rfl,
     show "data-qed-onv-".toList = ['d','a','t','a','-','q','e','d','-','o','n','v','-'] from rfl] at h; cases h
@@ -444,14 +444,14 @@ private theorem managedAttrName_clean_slot {x : Attr msg} {sl : AttrSlot}
     | (subst hname; first
         | rfl
         | (simp only [Attr.DomClean, isSpecialManagedKey, startsWith_append_self, Bool.or_true, Bool.true_or, Bool.not_true, Bool.or_false] at hxc
-           first | exact absurd hxc (by decide) | exact absurd (beq_iff_eq.1 hxc) (append_ne_of_not_startsWith (by simp [String.startsWith])))
+           first | exact absurd hxc (by decide) | exact absurd (beq_iff_eq.1 hxc) (append_ne_of_not_startsWith (by simp)))
         | (simp only [Attr.slotUpdate?, bne, beq_self_eq_true, Bool.and_true]; split <;> first
             | rfl | (rename_i h; simp at h; exact False.elim (hsp ⟨_, rfl, by simp [isSpecialManagedKey, h]⟩))))
     | (cases string_append_left_cancel hname; simp [Attr.slotUpdate?])
     | exact False.elim (hsp ⟨_, rfl, hname ▸ by simp [isSpecialManagedKey, startsWith_append_self]⟩)
     | exact absurd hname (by decide)
-    | exact absurd hname (append_ne_of_not_startsWith (by simp [String.startsWith]))
-    | exact absurd (Eq.symm hname) (append_ne_of_not_startsWith (by simp [String.startsWith]))
+    | exact absurd hname (append_ne_of_not_startsWith (by simp))
+    | exact absurd (Eq.symm hname) (append_ne_of_not_startsWith (by simp))
     | exact absurd hname on_ne_onv
     | exact absurd (Eq.symm hname) on_ne_onv
 
@@ -466,7 +466,7 @@ theorem stepSpecAttr_preserves_clean (s : SpecElemState msg) (a : Attr msg)
   have hnone : a.slotUpdate? (.attr k) = none := by
     cases a <;> simp only [Attr.slotUpdate?, Attr.DomClean] at hca ⊢ <;> first | rfl | (cases hca; done) | (
       split <;> first | rfl | (rename_i h; simp only [Bool.and_eq_true, bne_iff_ne, beq_iff_eq] at h; first
-        | (rw [← h] at hk; simp [isSpecialManagedKey, String.startsWith] at hk)
+        | (rw [← h] at hk; simp [isSpecialManagedKey] at hk)
         | (rcases h with ⟨hne, rfl⟩; simp [beq_eq_false_iff_ne.2 hne, hk] at hca)))
   have hr := read_stepSpecAttr s a (.attr k); rw [hnone] at hr; exact (SlotVal.optStr.inj hr).trans (hcs k hk)
 
@@ -655,7 +655,7 @@ theorem removeTailM_spec (a : DomArena msg) (node : Dom.Node) (atIdx : Nat) (k :
       a.set node (.element ns tag st mg (removeTailSpec (UInt32.ofNat atIdx).toNat k cs)) := by
   induction k generalizing cs with
   | zero => rfl
-  | succ _ ih => simp only [removeTailM, removeTailSpec, bind, StateT.bind, StateT.run, DomArena.modifyChildren, DomArena.modify, DomArena.get_set_self, DomArena.set_set]; exact ih _
+  | succ _ ih => simp only [removeTailM, removeTailSpec, bind, StateT.bind, StateT.run, MonadDom.removeChild, DomArena.modifyChildren, DomArena.modify, DomArena.get_set_self, DomArena.set_set]; exact ih _
 
 private abbrev IsParMk (mkPar : List Dom.Node → ArenaEntry msg) : Prop :=
   (∃ pns ptag pst pmg, ∀ ds, mkPar ds = .element pns ptag pst pmg ds) ∨ (∀ ds, mkPar ds = .fragment ds)
@@ -792,7 +792,7 @@ theorem buildDomM_spec_full (ns : String) (h : Html msg) (a : DomArena msg) (fue
           · simp only [hown, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
             exact ⟨by omega, by omega, ArenaExt_alloc (e := .element realNs tag st mg []) (by omega) (by omega),
               ⟨⟨by omega, by omega⟩, by dsimp only [aElem]; rw [DomArena.get_set_self]; exact fun _ h => nomatch h⟩,
-              by dsimp only [readDomTree, aElem, specDom]; rw [DomArena.get_set_self, if_pos hown]; rfl, fun hcl => by simp [Html.DomClean, hown] at hcl⟩
+              by dsimp only [readDomTree, aElem, specDom]; rw [DomArena.get_set_self, ite_eq_left hown]; rfl, fun hcl => by simp [Html.DomClean, hown] at hcl⟩
           · have hownF : ownsChildren attrs = false := Bool.eq_false_iff.2 hown
             simp only [hownF, Bool.not_false, ↓reduceIte]
             rcases buildDomListM_spec_full_of f (fun ns' h' a' => ih ns' h' a') (Dom.childNsOf ns tag) children a1 node

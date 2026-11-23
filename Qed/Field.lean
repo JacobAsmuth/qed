@@ -24,11 +24,11 @@ instance [DecidableEq α] : DecidableEq (Field p) := fun ⟨a, _⟩ ⟨b, _⟩ =
 private def mkField [DecidablePred p] (err : String) (a : α) : Except String (Field p) := if h : p a then .ok ⟨a, h⟩ else .error err
 instance [ToJson α] : ToJson (Field p) := .ofEquiv Field.val
 instance [DecidablePred p] [FromJson α] : FromJson (Field p) := .ofRetract (mkField "failed field refinement")
-instance [DecidablePred p] [LawfulJson α] : LawfulJson (Field p) := .ofRetract Field.val (mkField "failed field refinement") fun ⟨_, hok⟩ => dif_pos hok
+instance [DecidablePred p] [LawfulJson α] : LawfulJson (Field p) := .ofRetract Field.val (mkField "failed field refinement") fun ⟨_, hok⟩ => dite_eq_left hok
 instance [ToJson α] [NonNullJson α] : NonNullJson (Field p) := ⟨fun f => NonNullJson.toJson_ne_null f.val⟩
 instance [ToProto α] : ToProto (Field p) := .ofEquiv Field.val
 instance [DecidablePred p] [FromProto α] : FromProto (Field p) := .ofRetract (mkField "protobuf: failed field refinement")
-instance [DecidablePred p] [LawfulProto α] : LawfulProto (Field p) := .ofRetract Field.val (mkField "protobuf: failed field refinement") fun ⟨_, hok⟩ => dif_pos hok
+instance [DecidablePred p] [LawfulProto α] : LawfulProto (Field p) := .ofRetract Field.val (mkField "protobuf: failed field refinement") fun ⟨_, hok⟩ => dite_eq_left hok
 @[simp] theorem Proto.encode_field [ToProto α] (f : Field p) : Proto.encode f = Proto.encode f.val := rfl
 end FieldInstances
 

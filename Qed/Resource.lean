@@ -96,7 +96,7 @@ instance [LawfulJson α] : LawfulJson (Resource α) where
   depthBound := 1 + LawfulJson.depthBound α
   depth_toJson
     | .idle | .loading | .failed _ => Nat.le_add_right 1 _
-    | .ok a => Nat.add_le_add_left (by simpa [Json.maxObj] using LawfulJson.depth_toJson a) 1
+    | .ok a => Nat.add_le_add_left (by simpa [Json.maxObj, Json.depth] using LawfulJson.depth_toJson a) 1
   fromJson_toJson
     | .idle | .loading | .failed _ => rfl
     | .ok a => by change (fromJson (toJson a) : Except String α).map Resource.ok = _; rw [LawfulJson.fromJson_toJson a]; rfl

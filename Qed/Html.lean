@@ -527,7 +527,7 @@ private theorem hasCloseSeqStrLoop_false_eq (s : String) (i : Nat) (afterLt : Bo
     escapeCloseSeqBytesSpec afterLt (s.toByteArray.data.toList.drop i) = s.toByteArray.data.toList.drop i := by
   fun_induction hasCloseSeqStrLoop s i afterLt with
   | case1 => cases hfalse
-  | case2 i afterLt hi b hmiss ih => rw [List.drop_eq_getElem_cons (string_bytes_len s ▸ hi), escapeCloseSeqBytesSpec, show s.toByteArray.data.toList[i] = b from rfl, if_neg hmiss, ih hfalse]
+  | case2 i afterLt hi b hmiss ih => rw [List.drop_eq_getElem_cons (string_bytes_len s ▸ hi), escapeCloseSeqBytesSpec, show s.toByteArray.data.toList[i] = b from rfl, ite_eq_right hmiss, ih hfalse]
   | case3 i afterLt hge => rw [List.drop_eq_nil_of_le (Nat.le_of_not_lt (string_bytes_len s ▸ hge))]; rfl
 
 private theorem escapeRawBytesLoop_data (ba : ByteArray) (segStart i : Nat) (afterLt : Bool) (acc : ByteArray) (hle : segStart ≤ i) (hi : i ≤ ba.size) :
@@ -538,9 +538,9 @@ private theorem escapeRawBytesLoop_data (ba : ByteArray) (segStart i : Nat) (aft
       have h47 : b = 47 := beq_iff_eq.1 ((Bool.and_eq_true _ _).mp hhit).2
       rw [ih (by omega) (by omega), ByteArray.push, Array.toList_push, copySliceAppend_data ba segStart i acc hle,
           List.drop_eq_getElem_cons (i := i) (Array.length_toList.symm ▸ hlt), show ba.data.toList[i] = b from rfl,
-          escapeCloseSeqBytesSpec, if_pos hhit, show (b :: ba.data.toList.drop (i + 1)).take (i + 1 - i) = [47] by rw [show i + 1 - i = 1 by omega, h47]; rfl]; simp [List.append_assoc]
+          escapeCloseSeqBytesSpec, ite_eq_left hhit, show (b :: ba.data.toList.drop (i + 1)).take (i + 1 - i) = [47] by rw [show i + 1 - i = 1 by omega, h47]; rfl]; simp [List.append_assoc]
   | case2 segStart i afterLt acc hlt b hmiss ih =>
-      rw [ih (by omega) (by omega), List.drop_eq_getElem_cons (i := i) (Array.length_toList.symm ▸ hlt), show ba.data.toList[i] = b from rfl, escapeCloseSeqBytesSpec, if_neg hmiss]
+      rw [ih (by omega) (by omega), List.drop_eq_getElem_cons (i := i) (Array.length_toList.symm ▸ hlt), show ba.data.toList[i] = b from rfl, escapeCloseSeqBytesSpec, ite_eq_right hmiss]
       have hlen : i - segStart < (ba.data.toList.drop segStart).length := by rw [List.length_drop, Array.length_toList]; exact Nat.sub_lt_sub_right hle hlt
       rw [show i + 1 - segStart = (i - segStart) + 1 by omega, List.take_succ_eq_append_getElem hlen]; simp [List.getElem_drop, show segStart + (i - segStart) = i by omega, List.append_assoc]; rfl
   | case3 segStart i afterLt acc hge =>
@@ -587,7 +587,7 @@ theorem attrValue_canonical {msg : Type} (key : String) (hk : key ≠ "class") (
   have hcls : ("class" == key) = false := beq_false_of_ne (Ne.symm hk)
   induction as with
   | nil => rfl
-  | cons a _ ih => cases a with | cls _ => simp [Attr.canonical, attrValue, hcls, ih] | attr k _ | signalAttr _ k _ => by_cases heq : (k == key) <;> simp [Attr.canonical, attrValue, heq, ih] | _ => simp [Attr.canonical, attrValue, ih]
+  | cons a _ ih => cases a with | cls _ => simp [Attr.canonical, attrValue, hcls, ih] | attr k _ | signalAttr _ k _ => by_cases heq : (k == key) <;> simp [Attr.canonical, attrValue, heq, ih] | _ => simp [List.filterMap_cons, Attr.canonical, attrValue, ih]
 theorem hasAttr_canonical {msg : Type} (key : String) (hk : key ≠ "class") (as : List (Attr msg)) : hasAttr key (as.filterMap Attr.canonical) = hasAttr key as := by simp [hasAttr, attrValue_canonical key hk]
 theorem hasNonBlankAttr_canonical {msg : Type} (key : String) (hk : key ≠ "class") (as : List (Attr msg)) : hasNonBlankAttr key (as.filterMap Attr.canonical) = hasNonBlankAttr key as := by simp [hasNonBlankAttr, attrValue_canonical key hk]
 
@@ -622,7 +622,7 @@ def attrsValidAriaRoles : List (Attr msg) → Bool
 @[simp] theorem attrsValidAriaRoles_map {α β : Type} (f : α → β) (as : List (Attr α)) : attrsValidAriaRoles (as.map (Attr.map f)) = attrsValidAriaRoles as := by
   induction as with | nil => rfl | cons a _ ih => cases a <;> simp [Attr.map, attrsValidAriaRoles, ih]
 @[simp] theorem attrsValidAriaRoles_canonical {msg : Type} (as : List (Attr msg)) : attrsValidAriaRoles (as.filterMap Attr.canonical) = attrsValidAriaRoles as := by
-  induction as with | nil => rfl | cons a _ ih => cases a <;> simp [Attr.canonical, attrsValidAriaRoles, ih]
+  induction as with | nil => rfl | cons a _ ih => cases a <;> simp [List.filterMap_cons, Attr.canonical, attrsValidAriaRoles, ih]
 private theorem attrsValidAriaRoles_of_onlySignalBind {msg : Type} : ∀ as : List (Attr msg), onlySignalBind as = true → attrsValidAriaRoles as = true
   | [.signalBind _], _ => rfl | .key _ :: rest, h => attrsValidAriaRoles_of_onlySignalBind rest h
 

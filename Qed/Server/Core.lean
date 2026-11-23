@@ -280,7 +280,7 @@ theorem external_url_preserves_origin (base : String) (parts : List PathPart) (q
     url.startsWith (base ++ "/") = true ∧
     ∃ sfx : String, url = (base ++ "/") ++ sfx ∧ (∀ c ∈ sfx.toList, c ≠ '#' ∧ c ≠ '\\' ∧ c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' ∧ c ≠ '@') := by
   rcases except_bind_ok h with ⟨sfx, hs, hret⟩; injection hret with hret; subst hret
-  exact ⟨by simp [String.startsWith], sfx, rfl, fun c hc => isSafeExtSuffixChar_no_smuggle (List.all_eq_true.1 (buildExternalSuffix_safe hs) c hc)⟩
+  exact ⟨by simp, sfx, rfl, fun c hc => isSafeExtSuffixChar_no_smuggle (List.all_eq_true.1 (buildExternalSuffix_safe hs) c hc)⟩
 def buildExternalWsUrl (base : String) (parts : List PathPart) (query : List (String × QueryVal)) : Except ApiError String :=
   buildExternalUrl (toWsOrigin base) parts query
 theorem external_ws_url_preserves_origin (base : String) (parts : List PathPart) (query : List (String × QueryVal)) (url : String)

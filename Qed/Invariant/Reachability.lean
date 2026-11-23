@@ -35,7 +35,10 @@ elab "qedDischargeReachable" upd:term:max initT:term:max nm:ident labelLit:str :
     if inner.raw.isIdent then if let some cn ← try some <$> resolveGlobalConstNoOverload inner.raw catch _ => pure none then dynNames := dynNames.push cn
   try
     if let g :: rest ← getGoals then
-      setGoals (match ← simpGoalOnly g (← mkDynamicSimpCtx dynNames (some ("reachBase", reachBaseSimpNames))) with | none => rest | some g' => g' :: rest)
+      let ctx ← mkDynamicSimpCtx dynNames (some ("reachBase", reachBaseSimpNames))
+      let g1? ← simpGoalOnly g ctx (dsimpOnly := true)
+      let g2? ← match g1? with | none => pure none | some g1 => simpGoalOnly g1 ctx
+      setGoals (match g2? with | none => rest | some g' => g' :: rest)
     evalTactic (← `(tactic| qedUnfoldPresent []))
     let (bCtx, _) ← mkCachedSimpCtx "reachBool" reachBoolSimpNames
     setGoals <| ← (← getGoals).filterMapM (simpGoalAllHyps · bCtx)

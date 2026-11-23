@@ -93,7 +93,7 @@ private abbrev RouteRow := TSyntax `ident × Array (TSyntax `ident) × Array (TS
     def $parseId:ident (p : List String) : Option $t := match p with $[| $parsePatsAll:term => $parseRhssAll:term]*
     theorem $rtId:ident : ∀ a, $parseId:ident ($printId:ident a) = some a := by
       intro a; cases a <;>
-        (try simp only [$printId:ident, $parseId:ident, RouteParam.round_trip, RouteParam.toSeg_string]) <;>
+        (try simp only [$printId:ident, $parseId:ident, RouteParam.round_trip, RouteParam.toSeg_string, RouteParam.fromSeg_string]) <;>
         (try simp [$printId:ident, $parseId:ident, RouteParam.round_trip])
     instance : Router $t:ident := ⟨$printId, $parseId, $rtId⟩)
 end RouterElab

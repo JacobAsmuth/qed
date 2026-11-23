@@ -200,7 +200,7 @@ local macro "blockedV6 " n1:ident " => " xs1:term,* " ; " n2:ident " => " xs2:te
     theorem $n2 : isBlockedIpBytes (ByteArray.mk #[$xs2,*]) = true := rfl)
 blockedV4 isBlockedIpBytes_loopback_v4 b1 b2 b3 => 127, b1, b2, b3 ; isBlockedIpBytes_metadata_v4 b2 b3 => 169, 254, b2, b3
 blockedV4 isBlockedIpBytes_rfc1918_10 b1 b2 b3 => 10, b1, b2, b3 ; isBlockedIpBytes_testnet_v4 b3 => 192, 0, 2, b3
-theorem isBlockedIpBytes_benchmark_v4 (b2 b3 : UInt8) : isBlockedIpBytes (ByteArray.mk #[198, 18, b2, b3]) = true := by rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]; decide
+theorem isBlockedIpBytes_benchmark_v4 (b2 b3 : UInt8) : isBlockedIpBytes (ByteArray.mk #[198, 18, b2, b3]) = true := by rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]
 blockedV6 isBlockedIpBytes_loopback_v6 => 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1 ; isBlockedIpBytes_v4mapped_metadata => 0,0,0,0,0,0,0,0,0,0,0xFF,0xFF,169,254,169,254
 blockedV6 isBlockedIpBytes_nat64_metadata => 0,0x64,0xFF,0x9B,0,0,0,0,0,0,0,0,169,254,169,254 ; isBlockedIpBytes_nat64_local_v6 => 0,0x64,0xFF,0x9B,0,1,0,0,0,0,0,0,10,0,0,1
 blockedV6 isBlockedIpBytes_6to4_v6 => 0x20,0x02,169,254,169,254,0,0,0,0,0,0,0,0,0,1 ; isBlockedIpBytes_teredo_v6 => 0x20,0x01,0,0,0,0,0,0,0,0,0,0,0,0,0,1

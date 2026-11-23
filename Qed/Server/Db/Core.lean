@@ -550,7 +550,7 @@ theorem verifyMigrationSafe_nullable_addColumn (tbl : SqlIdent) (col : ColumnSch
 
 private theorem filterMap_contains_map_self {α β γ : Type} [BEq β] [LawfulBEq β] (xs : List α) (key : α → β) (g : α → γ) :
     xs.filterMap (fun x => if (xs.map key).contains (key x) then none else some (g x)) = [] :=
-  List.filterMap_eq_nil_iff.2 fun x hx => by rw [if_pos (List.contains_iff_mem.2 (List.mem_map.2 ⟨x, hx, rfl⟩))]
+  List.filterMap_eq_nil_iff.2 fun x hx => by rw [ite_eq_left (List.contains_iff_mem.2 (List.mem_map.2 ⟨x, hx, rfl⟩))]
 
 theorem diffTableSchema_self_empty (t : TableSchema) :
     diffTableSchema (t.columns.map (·.name.raw)) t.indexNames t true = [] := by

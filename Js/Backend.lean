@@ -558,7 +558,9 @@ private def assignTopLevelNames (env : Environment) (names : Array Name)
   for n in names do
     if let some (.fdecl ..) := findEnvDecl env n then
       match entryMap.get? n with | some s => nm := nm.insert n s | none => internals := internals.push n
-  if !min then for h : i in [:internals.size] do nm := nm.insert internals[i] s!"_g{i}"; return nm
+  if !min then
+    for h : i in [:internals.size] do nm := nm.insert internals[i] s!"_g{i}"
+    return nm
   let mut avoid := entries.foldl (fun s (_, n) => s.insert n) jsMinReservedSet
   let mut refCounts : Std.HashMap Name Nat := {}
   for n in names do

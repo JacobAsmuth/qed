@@ -101,7 +101,7 @@ private theorem patchViewM_ifElse_spec (cond : σ → Bool) (yes no : View σ ms
       dsimp only [PatchViewPost, StateT.run, StateT.bind, StateT.pure] at hih ⊢
       rcases hp : patchViewM (m := StateM (DomArena msg)) parent (UInt32.ofNat pre.length) targetV s₂ inner a with ⟨_, _⟩
       rw [hp] at hih; rcases hih with ⟨h1, h2, h3, h4, h5, h6, ⟨hcl', hm'⟩, heqv'⟩
-      cases hc₂ : cond s₂ <;> (simp only [targetV, hc₂, Bool.false_eq_true, ↓reduceIte] at hp hm' ⊢; rw [hp]; exact ⟨h1, hren.symm ▸ h2, h3, h4, h5, h6, ⟨hren.symm ▸ hcl', hc₂.symm, by rw [hc₂]; exact hm'⟩, hren.symm ▸ heqv'⟩)
+      cases hc₂ : cond s₂ <;> (simp only [targetV, hc₂, Bool.false_eq_true, ↓reduceIte, StateT.bind, StateT.pure] at hp hm' ⊢; rw [hp]; exact ⟨h1, hren.symm ▸ h2, h3, h4, h5, h6, ⟨hren.symm ▸ hcl', hc₂.symm, by rw [hc₂]; exact hm'⟩, hren.symm ▸ heqv'⟩)
     · simp only [beq_eq_false_iff_ne.2 hsame, Bool.false_eq_true, ↓reduceIte, StateT.bind]
       rw [show MonadDom.childNamespace (m := StateM (DomArena msg)) parent a = (childNs, a) by simp only [MonadDom.childNamespace, hpar, hchildNs]]; dsimp only [Bind.bind]
       have huJ : (UInt32.ofNat pre.length).toNat = pre.length := uint32_toNat_ofNat_lt pre.length (by omega)
@@ -113,7 +113,7 @@ private theorem patchViewM_ifElse_spec (cond : σ → Bool) (yes no : View σ ms
       have hVst' : VStateValid f childNs targetV s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) newInner := VStateValid_mono (fun _ => .inr) (VStateValid_frame (fun m hm => DomArena.get_set_ne _ _ fun e => Nat.not_lt.2 hm.1 (e ▸ hparLt)) hVstMid)
       have hVstIf : VStateValid f childNs (.ifElse cond yes no) s₂ a' (fun k => Sold k ∨ (a.nextId ≤ k ∧ k < a'.nextId)) (.cond (cond s₂) newInner) := ⟨hren.symm ▸ hVst'.1, rfl, by cases hc₂ : cond s₂ <;> (simp only [targetV, hc₂, ↓reduceIte, Bool.false_eq_true] at hVst' ⊢; exact hVst'.2)⟩
       suffices hPost : PatchViewPost f childNs parent pns ptag pst pmg (.ifElse cond yes no) s₂ pre suf Sold a (.cond (cond s₂) newInner, a') by
-        cases hc₂ : cond s₂ <;> (simp only [targetV, hc₂, Bool.false_eq_true, ↓reduceIte, StateT.bind, StateT.pure, Bind.bind] at hB ⊢; rw [hB]; simpa only [DomArena.modifyChildren, DomArena.modify, hparMid, huJ, listReplaceAt_append_middle, pure, a', hc₂] using hPost)
+        cases hc₂ : cond s₂ <;> (simp only [targetV, hc₂, Bool.false_eq_true, ↓reduceIte, StateT.bind, StateT.pure, Bind.bind] at hB ⊢; rw [hB]; simpa only [MonadDom.replaceChild, DomArena.modifyChildren, DomArena.modify, hparMid, huJ, listReplaceAt_append_middle, pure, a', hc₂] using hPost)
       exact ⟨haMidGe, hren.symm ▸ haMidBound, fun m hmPar _ hmLt => (DomArena.get_set_ne _ _ hmPar).trans (haMidFr m hmLt), by dsimp only [VState.rootNode]; rw [hn2Root]; exact DomArena.get_set_self ..,
         by dsimp only [VState.rootNode]; rw [hn2Root]; exact nodup_append_replace hnd (.inr fun hm => Nat.not_lt.2 (hn2Root ▸ VStateValid_root_mem hVstMid).1 (hparNodes n2 hm)),
         fun r hr => (List.mem_append.1 hr).elim (fun hp => Nat.lt_of_lt_of_le (hparNodes r (List.mem_append_left _ hp)) haMidGe) fun hc => (List.mem_cons.1 hc).elim (· ▸ (VStateValid_root_mem hVstMid).2) fun htl => Nat.lt_of_lt_of_le (hparNodes r (List.mem_append_right _ (.tail _ htl))) haMidGe,

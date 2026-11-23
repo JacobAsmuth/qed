@@ -46,7 +46,7 @@ theorem renderSig_resolved_spec (ns : String) (get : σ → String) (s₁ s₂ :
   dsimp only [View.renderSig, buildDomM, StateT.run, bind, StateT.bind, pure, StateT.pure, MonadDom.createElement, DomArena.alloc]
   rw [show ({ a with nextId := a.nextId + 1, store := fun m => if (m == node) = true then ArenaEntry.element realNs "span" {} [] [] else a.store m } : DomArena msg) =
         a1.set node (.element realNs "span" {} [] []) from rfl, applyAttrsM_fresh_element a1 node realNs "span" [] [.signalBind sigNm]]
-  dsimp only [ownsChildren, List.any, Bool.not_true, Bool.false_eq_true, ↓reduceIte, bind, StateT.bind, pure, StateT.pure, MonadDom.setSignal, View.render, specDom, readResolvedDomTree, DomArena.get]
+  simp only [ownsChildren, List.any, Bool.true_or, Bool.not_true, Bool.false_eq_true, ↓reduceIte, pure, StateT.pure, MonadDom.setSignal, View.render, specDom, readResolvedDomTree, DomArena.get]
   exact ⟨by simp only [show (evalSpecAttrs ([Attr.signalBind sigNm] : List (Attr msg))).sigBind = some sigNm from rfl, sigNm, node, DomArena.set, lookupAssoc_setAssoc, beq_self_eq_true, ↓reduceIte, Option.getD_some],
     rfl, fun m hm => DomArena.get_set_ne _ _ (node_ne_of_toNat_ne (by dsimp only [node]; rw [uint32_toNat_ofNat_lt a.nextId (by omega)]; omega))⟩
 

@@ -190,7 +190,7 @@ private def mkSpecBook (slot : Nat) (hSlot : slot ≤ 1000) (stock : Nat) (hStoc
   let uk := CatalogSpec.app.update; let catAuth := step uk CatalogSpec.app.init.1 (._onSession (some "alice")); let catUnpred := step uk catAuth (.orderOne 0)
   let sampleBook := mkSpecBook 0 (by omega) 10 (by omega); let actualBook := mkSpecBook 0 (by omega) 6 (by omega); let predBook := mkSpecBook 0 (by omega) 9 (by omega)
   let catPred := runTrace uk catAuth [.loadDemo #[sampleBook], .orderOne 0]
-  let catReconciled := step uk catPred (._specRes_0 0 0 predBook (.ok ⟨actualBook, by simp [CatalogSrv.order_ens, actualBook, mkSpecBook]; decide⟩))
+  let catReconciled := step uk catPred (._specRes_0 0 0 predBook (.ok ⟨actualBook, by simp [CatalogSrv.order_ens, actualBook, mkSpecBook]⟩))
   let ur := ResourceSpec.app.update; let rs1 := step ur ResourceSpec.app.init.1 .refresh; let rs2 := step ur rs1 (._specRes_0 0 #[1, 2, 3] (.ok #[10, 20]))
   let rs4 := runTrace ur rs2 [.refresh, ._specRes_0 1 #[1, 2, 3] (.failed "boom")]
   [(sDisp, (8, 10, "Pending: 8", "", 0, 1, 1, 1)), (sHit, (8, 8, "Confirmed: 8", "", 1, 1, 1, 0)), (sMisDisp, (7, 8, "Pending: 7", "", 1, 2, 2, 1)),

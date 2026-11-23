@@ -310,7 +310,7 @@ private theorem applyKeyedStepsM_fst (parent : Dom.Node) (live : Array Dom.Node)
     ∀ (steps : List (KeyedStep msg)) (j : Nat) (a : DomArena msg), j + steps.length < UInt32.size → (applyKeyedStepsM (m := ArenaM msg) parent live (UInt32.ofNat j) steps a).1.toNat = j + steps.length
   | [], j, _, h => by simpa [applyKeyedStepsM, pure, StateT.pure] using uint32_toNat_ofNat_lt j h
   | .reuse _ _ :: rest, j, _, h | .create _ :: rest, j, _, h => by
-      dsimp only [applyKeyedStepsM, bind, StateT.bind]; rw [uint32_ofNat_succ j (by simp at h; omega)]; split
+      dsimp only [applyKeyedStepsM, bind, StateT.bind]; rw [uint32_ofNat_succ j (by simp at h; omega)]; repeat' split
       rw [applyKeyedStepsM_fst parent live rest (j + 1) _ (by simp at h; omega)]; simp; omega
 
 theorem applyKeyedStepsM_reconcile_spec (f : Nat) (hPatch : @PatchSpecAt msg f) (parent : Dom.Node) (pns ptag : String) (pst : SpecElemState msg) (pmg : List String)
@@ -433,7 +433,7 @@ theorem applyToDomM_spec (fuel : Nat) : @PatchSpecAt msg fuel := by
               let epC : ElemPar msg := ⟨f, node, realNs, t₁, st', mg', Dom.childNsOf childNs t₁, hccNs.symm⟩
               have hRec : epC.tailOut c₂ (fun k => Sold k ∧ k ≠ node.toNat) a1 ((applyToDomM (m := ArenaM msg) parent (UInt32.ofNat pre.length) node (diff (.element t₁ a₁ c₁) (.element t₁ a₂ c₂))).run a).2 := by
                 dsimp only [StateT.run]; rw [hdiffEq]; dsimp only [applyToDomM, bind, StateT.bind, pure, StateT.pure]
-                rw [show applyAttrsM (m := ArenaM msg) node a₂ a = ((), a1) from rfl]; dsimp only; simp only [hownNewF, Bool.false_eq_true, ↓reduceIte, StateT.bind, bind]; rw [ha1Get]; dsimp only
+                rw [show applyAttrsM (m := ArenaM msg) node a₂ a = ((), a1) from rfl]; dsimp only; simp only [hownNewF, Bool.false_eq_true, ↓reduceIte, StateT.bind, bind, MonadDom.childCount]; rw [ha1Get]; dsimp only
                 by_cases hposSt : positional 0 steps = true
                 · simp only [hposSt, ↓reduceIte]; rcases cleanChildren_dom_bounds (ep := epC) hvalid.1 (by omega) hSrem hCleanCs1 with ⟨_, _, _, hsz⟩
                   have hfin := finish_reconcile_removeTail (ep := epC) (by simp at hsz; omega)

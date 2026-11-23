@@ -181,7 +181,7 @@ private theorem encNatAux_bounds (d k n : Nat) (hn : n < 10 ^ (d + 1)) (hk : d +
 
 private theorem encNat_len_bounds {d n : Nat} (hn : n < 10 ^ (d + 1)) (hd : d ≤ 9) :
     1 ≤ (encNat n).toList.length ∧ (encNat n).toList.length ≤ d + 1 := by
-  simpa [encNat] using encNatAux_bounds d 10 n hn (by omega) []
+  have h := encNatAux_bounds d 10 n hn (by omega) []; simp only [encNat, String.toList_ofList, List.length_nil, Nat.add_zero] at h ⊢; omega
 
 private theorem char_ofNat_digit (d : Nat) (hd : d < 10) :
     '0' ≤ Char.ofNat (48 + d) ∧ Char.ofNat (48 + d) ≤ '9' ∧ (Char.ofNat (48 + d)).toNat - 48 = d :=

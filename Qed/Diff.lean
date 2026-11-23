@@ -105,14 +105,14 @@ private theorem validatedKeyIndex_go_spec :
             have hkeyNone : acc[key]? = none := Std.HashMap.getElem?_eq_none hcon
             refine ⟨fun k j hkAcc => ?_, fun k j hkIdx => ?_, fun d hd => ?_⟩
             · have hne : (key == k) = false := beq_eq_false_iff_ne.2 fun h => by subst h; simp [hkeyNone] at hkAcc
-              exact ihMono k j (by rw [Std.HashMap.getElem?_insert, if_neg (by simp [hne])]; exact hkAcc)
+              exact ihMono k j (by rw [Std.HashMap.getElem?_insert, ite_eq_right (by simp [hne])]; exact hkAcc)
             · rcases ihInv k j hkIdx with hkIns | ⟨d, hd, hjd, hcd⟩
               · rw [Std.HashMap.getElem?_insert] at hkIns; split at hkIns
                 · rename_i hbeq; rcases eq_of_beq hbeq with rfl; cases hkIns; exact .inr ⟨0, by simp, by omega, hk⟩
                 · exact .inl hkIns
               · exact .inr ⟨d + 1, by simp only [List.length_cons]; omega, by omega, hcd⟩
             · cases d with
-              | zero => exact ⟨key, hk, ihMono key base (by rw [Std.HashMap.getElem?_insert, if_pos (beq_self_eq_true key)])⟩
+              | zero => exact ⟨key, hk, ihMono key base (by rw [Std.HashMap.getElem?_insert, ite_eq_left (beq_self_eq_true key)])⟩
               | succ d' => rcases ihElem d' (Nat.lt_of_succ_lt_succ hd) with ⟨k', hk', hidx'⟩; exact ⟨k', hk', by simpa [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using hidx'⟩
 
 theorem validatedKeyIndex_spec {cs : List (Html msg)} {index : Std.HashMap String Nat} (hval : validatedKeyIndex cs = some index) :

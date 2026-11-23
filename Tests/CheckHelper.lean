@@ -5,7 +5,8 @@ elab "rollback_env " cmd:command : command => withoutModifyingEnv (Elab.Command.
 
 macro "expect_err " msg:str " in " cmd:command : command =>
   let doc : Lean.TSyntax `Lean.Parser.Command.docComment :=
-    .mk (.node .none ``Lean.Parser.Command.docComment #[Lean.mkAtom "/--", Lean.mkAtom (msg.getString ++ " -/")])
+    .mk (.node .none ``Lean.Parser.Command.docComment #[Lean.mkAtom "/--",
+      .node .none ``Lean.Parser.Command.commentBody #[Lean.mkAtom msg.getString, Lean.mkAtom "-/"]])
   `($doc:docComment #guard_msgs (error, drop warning, substring := true) in rollback_env $cmd)
 
 macro "bad_a11y " rule:ident " : " v:qedExpr : command => do

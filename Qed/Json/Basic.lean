@@ -207,10 +207,10 @@ private theorem renderStrAcc_eq (s acc : String) : renderStrAcc s acc = acc ++ S
 
 private theorem pushNatAcc_eq (n : Nat) (acc : String) : pushNatAcc n acc = acc ++ String.ofList (natDigitsAux n []) := by
   unfold pushNatAcc; split
-  · rename_i h10; rw [natDigitsAux, if_pos h10, Nat.mod_eq_of_lt h10]; ext; simp
+  · rename_i h10; rw [natDigitsAux, ite_eq_left h10, Nat.mod_eq_of_lt h10]; ext; simp
   · rename_i hge10; split
     · rename_i h100; have hd : n / 10 < 10 := by omega
-      rw [natDigitsAux, if_neg hge10, natDigitsAux, if_pos hd, Nat.mod_eq_of_lt hd]; ext; simp [List.append_assoc]
+      rw [natDigitsAux, ite_eq_right hge10, natDigitsAux, ite_eq_left hd, Nat.mod_eq_of_lt hd]; ext; simp [List.append_assoc]
     · exact foldl_push_eq _ acc
 
 private theorem renderNumAcc_eq (n : JsonNumber) (acc : String) : renderNumAcc n acc = acc ++ String.ofList (renderNumL n) := by

@@ -14,7 +14,7 @@ theorem patchViewM_memo_hit (sm : SoundMemo σ msg) (s₁ s₂ : σ) (parent nod
     (hkey : sm.keyOf s₂ = sm.keyOf s₁) (hdom : readDomTree fuel a node = specDom ns (View.render (.memo sm) s₁)) :
     let (vst', a') := (patchViewM (m := StateM (DomArena msg)) parent idx (.memo sm) s₂ (.memo node (sm.keyOf s₁) (sm.eval s₁))).run a
     a' = a ∧ vst' = .memo node (sm.keyOf s₁) (sm.eval s₁) ∧ readDomTree fuel a' node = specDom ns (View.render (.memo sm) s₂) := by
-  dsimp only [patchViewM, StateT.run, pure, StateT.pure]; rw [if_pos (beq_iff_eq.2 hkey)]; exact ⟨rfl, rfl, by simpa only [View.render, sm.sound s₂ s₁ hkey] using hdom⟩
+  dsimp only [patchViewM, StateT.run, pure, StateT.pure]; rw [ite_eq_left (beq_iff_eq.2 hkey)]; exact ⟨rfl, rfl, by simpa only [View.render, sm.sound s₂ s₁ hkey] using hdom⟩
 
 theorem patchViewM_dyn_spec (get : σ → String) (s₁ s₂ : σ) (parent node : Dom.Node) (idx : UInt32) (a : DomArena msg) (fuel : Nat) (hf : 0 < fuel) :
     let a0 := a.set node (.text (get s₁))
@@ -22,8 +22,8 @@ theorem patchViewM_dyn_spec (get : σ → String) (s₁ s₂ : σ) (parent node 
     vst' = .dyn node (get s₂) ∧ readDomTree fuel a' node = specDom "" (View.render (.dyn get) s₂) := by
   cases fuel with | zero => omega | succ _ =>
   dsimp only [patchViewM, StateT.run]; cases h : (get s₂ != get s₁)
-  · simp only [Bool.false_eq_true, ↓reduceIte, bind, StateT.bind, pure, StateT.pure, DomArena.get_set_self, readDomTree, specDom, View.render, bne_eq_false_iff_eq.1 h, and_self]
-  · simp only [↓reduceIte, bind, StateT.bind, pure, StateT.pure, DomArena.modify, DomArena.get_set_self, DomArena.set_set, readDomTree, specDom, View.render, and_self]
+  · simp only [Bool.false_eq_true, ↓reduceIte, pure, StateT.pure, DomArena.get_set_self, readDomTree, specDom, View.render, bne_eq_false_iff_eq.1 h, and_self]
+  · simp only [↓reduceIte, bind, StateT.bind, pure, StateT.pure, MonadDom.setText, DomArena.modify, DomArena.get_set_self, DomArena.set_set, readDomTree, specDom, View.render, and_self]
 
 theorem forEach_disambiguated_keys_nodup (items : σ → Array α) (key : α → String) (s : σ) :
     (disambiguateKeys ((items s).map key)).toList.Nodup := disambiguateKeys_nodup ((items s).map key)

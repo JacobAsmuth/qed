@@ -554,7 +554,7 @@ private theorem patchViewM_keyedList_lis_spec {oldSigs : Array (Array (String ×
   · have ⟨hdomNd, hdomLen⟩ := CleanDomChildren_nodup ctx.hnode.2.2.2
     have hdomLtU32 : domCs.length < UInt32.size := Nat.lt_of_le_of_lt (nodup_nodes_lt_length_le a.nextId domCs hdomNd fun x hx => ctx.hpar.2.2.2.1 _ (CleanDomChildren_mem ctx.hnode.2.2.2 x hx).1) (Nat.lt_of_le_of_lt (Nat.le_add_right _ _) ctx.hbnd.1)
     have hsnap := snapshotChildrenM_spec a1 node realNs tag st' mg' domCs hdomLtU32 0 domCs.length #[] (Nat.zero_add _)
-    rw [DomArena.set_get_self a1 ha1Get] at hsnap; dsimp only [StateT.run, List.nil_append, List.drop_zero] at hsnap
+    rw [DomArena.set_get_self a1 ha1Get] at hsnap; simp only [StateT.run, List.nil_append, List.drop_zero] at hsnap
     let live : Array Dom.Node := ⟨domCs⟩; have hliveSz : live.size = (rowsHtml s₁).length := hdomLen
     have hremSpec := removeUnusedM_spec node realNs tag st' mg' live used 0 (Nat.zero_le _) [] a1 hdomNd ha1Get
     let aRem := (removeUnusedM (m := StateM (DomArena msg)) node live used 0).run a1 |>.2
@@ -570,7 +570,7 @@ private theorem patchViewM_keyedList_lis_spec {oldSigs : Array (Array (String ×
        ⟨by simpa only [List.nil_append, Nat.zero_add, Nat.sub_zero] using hremSpec.2.2, hkeptSpec.1⟩, ⟨rfl, rfl⟩,
        fun x => by rw [hkeptSpec.2.1 x]; simp only [List.not_mem_nil, or_false], ⟨hkeptSpec.2.2.1, (fun _ _ h => nomatch h), (fun _ _ h => nomatch h)⟩,
        by rw [List.append_nil]; exact hkeptSpec.2.2.2,
-       fun oi ho => by have hoD : oi < domCs.length := hdomLen ▸ ho; rw [show live.getD oi 0 = domCs[oi] by rw [Array.getD, dif_pos (show oi < live.size from hoD)]; rfl]
+       fun oi ho => by have hoD : oi < domCs.length := hdomLen ▸ ho; rw [show live.getD oi 0 = domCs[oi] by rw [Array.getD, dite_eq_left (show oi < live.size from hoD)]; rfl]
                        exact CleanDomSubtree_frame (fun m hm => haRemOut m (node_ne_of_toNat_ne (hSiSub oi m.toNat hm).2)) (hSiGet oi ho hoD),
        ⟨(fun _ h => h.elim), (fun _ _ _ _ _ _ h => h.elim)⟩, by rw [List.drop_length]; trivial⟩
     rw [bind_step (show MonadDom.childCount (m := StateM (DomArena msg)) node a1 = (UInt32.ofNat domCs.length, a1) by dsimp only [MonadDom.childCount]; rw [ha1Get]),

@@ -82,7 +82,7 @@ def _root_.Array.countWhere (xs : Array α) (p : α → Bool) : Nat := xs.sumBy 
 @[simp, grind =] theorem _root_.Array.countWhere_append (xs ys : Array α) (p : α → Bool) : (xs ++ ys).countWhere p = xs.countWhere p + ys.countWhere p := Array.sumBy_append xs ys _
 @[simp, grind =] theorem _root_.Array.countWhere_reverse (xs : Array α) (p : α → Bool) : xs.reverse.countWhere p = xs.countWhere p := Array.sumBy_reverse xs _
 @[simp, grind =] theorem _root_.Array.countWhere_mergeSort (xs : Array α) (le : α → α → Bool) (p : α → Bool) : (xs.mergeSort le).countWhere p = xs.countWhere p := Array.sumBy_mergeSort xs le _
-@[grind <=] theorem _root_.Array.countWhere_le_size (xs : Array α) (p : α → Bool) : xs.countWhere p ≤ xs.size := by simpa [Array.countWhere] using Array.sumBy_le_size_mul (xs := xs) (fun x => if p x then 1 else 0) 1 fun x _ => by dsimp only; split <;> omega
+@[grind <=] theorem _root_.Array.countWhere_le_size (xs : Array α) (p : α → Bool) : xs.countWhere p ≤ xs.size := by simpa [Array.countWhere] using Array.sumBy_le_size_mul (xs := xs) (fun x => if p x then 1 else 0) 1 fun x _ => by split <;> omega
 @[grind <=] theorem _root_.Array.countWhere_filter_le (xs : Array α) (q p : α → Bool) : (xs.filter q).countWhere p ≤ xs.countWhere p := Array.sumBy_filter_le xs q _
 @[grind <=] theorem _root_.Array.countWhere_pop_le (xs : Array α) (p : α → Bool) : xs.pop.countWhere p ≤ xs.countWhere p := Array.sumBy_pop_le xs _
 @[grind =] theorem _root_.Array.countWhere_set (xs : Array α) (i : Nat) (x : α) (h : i < xs.size) (p : α → Bool) : (xs.set i x h).countWhere p + (if p xs[i] then 1 else 0) = xs.countWhere p + (if p x then 1 else 0) := Array.sumBy_set xs _ i x h

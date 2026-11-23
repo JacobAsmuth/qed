@@ -13,6 +13,7 @@ instance : RouteParam String := ⟨id, some, fun _ => rfl⟩
 instance : RouteParam Nat    := ⟨Nat.repr, String.toNat?, Nat.toNat?_repr⟩
 instance : RouteParam Int    := ⟨Int.repr, String.toInt?, Int.toInt?_repr⟩
 @[simp] theorem RouteParam.toSeg_string (s : String) : RouteParam.toSeg s = s := rfl
+@[simp] theorem RouteParam.fromSeg_string (s : String) : (RouteParam.fromSeg s : Option String) = some s := rfl
 
 class Router (α : Type) where
   print : α → List String

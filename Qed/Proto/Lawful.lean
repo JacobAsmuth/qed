@@ -70,13 +70,13 @@ defScalarProto Bool WireVal.varint (fun b => if b then 1 else 0),
   (fun | 0 => .ok false | 1 => .ok true | n => .error s!"protobuf: invalid bool varint {n}"),
   "protobuf: expected varint for Bool", (by intro b; cases b <;> rfl)
 defScalarProto Int WireVal.varint zigzagEncode, (fun n => .ok (zigzagDecode n)),
-  "protobuf: expected ZigZag varint for Int", (fun i => by simp [FromProto.fromProtoVal, zigzagDecode_zigzagEncode])
+  "protobuf: expected ZigZag varint for Int", (fun i => by simp [ToProto.toProtoVal, FromProto.fromProtoVal, zigzagDecode_zigzagEncode])
 defScalarProto UInt8 WireVal.varint UInt8.toNat,
   (fun n => if n < 256 then .ok (UInt8.ofNat n) else .error s!"protobuf: UInt8 out of range ({n})"),
-  "protobuf: expected varint for UInt8", (fun b => by simp [FromProto.fromProtoVal, b.toNat_lt, UInt8.ofNat_toNat])
+  "protobuf: expected varint for UInt8", (fun b => by simp [ToProto.toProtoVal, FromProto.fromProtoVal, b.toNat_lt, UInt8.ofNat_toNat])
 defScalarProto String WireVal.bytes String.toUTF8,
   (fun b => (String.fromUTF8? b).elim (.error "protobuf: invalid UTF-8 string") .ok),
-  "protobuf: expected length-delimited UTF-8 string", (fun ⟨_, h⟩ => by simp [FromProto.fromProtoVal, String.fromUTF8?, String.toUTF8, h, String.fromUTF8])
+  "protobuf: expected length-delimited UTF-8 string", (fun ⟨_, h⟩ => by simp [ToProto.toProtoVal, FromProto.fromProtoVal, String.fromUTF8?, String.toUTF8, h, String.fromUTF8])
 
 instance : ToProto Float where toProtoVal f := .fixed64 f.toBits
 instance : FromProto Float where fromProtoVal | .fixed64 bits => .ok (Float.ofBits bits) | _ => .error "protobuf: expected fixed64 for Float"

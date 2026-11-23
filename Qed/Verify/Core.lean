@@ -109,7 +109,16 @@ def trySimpAll (g : MVarId) (ctx : Simp.Context) (sp : Simp.SimprocsArray := #[]
 def trySplitTarget (g : MVarId) : MetaM (Option (List MVarId)) := tryRestoreM none Option.isSome (g.withContext (Meta.splitTarget? g))
 def trySplitLocalDecl (g : MVarId) (fv : FVarId) : MetaM (Option (List MVarId)) := tryRestoreM none Option.isSome (g.withContext (Meta.splitLocalDecl? g fv))
 def tryApplyConst (g : MVarId) (c : Name) : MetaM (Option (List MVarId)) := tryRestoreM none (fun _ => true) (some <$> g.applyConst c)
-def tryReflGoal (g : MVarId) : MetaM Bool := tryRestoreM false id (do g.refl; return true)
+def tryReflGoal (g : MVarId) : MetaM Bool := tryRestoreM false id do
+  g.withContext do
+    let tgt ← instantiateMVars (← g.getType)
+    if let some (_, lhs, rhs) := tgt.eq? then
+      if ← isDefEq lhs rhs then
+        let pf ← mkEqRefl lhs
+        g.assign (if ← withTransparency .reducible (isDefEq lhs rhs) then pf else mkApp2 (mkConst ``id [Level.zero]) tgt pf)
+        return true
+      return false
+    g.refl; return true
 def tryTac (mk : TacticM (TSyntax `tactic)) (requireClosed : Bool := false) : TacticM Bool :=
   tryRestoreM false id do withoutRecover <| evalTactic (← mk); if requireClosed then return (← getGoals).isEmpty else return true
 

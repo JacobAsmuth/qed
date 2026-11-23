@@ -75,10 +75,12 @@ elab "qedDischargeForEach" upd:ident childInv:ident nm:ident pred:term : tactic 
           else "inserts an element not known to satisfy the contract."
         return some s!"  • {Qed.Diag.formatCaseTag (← g.getTag)}: {why}\n    must satisfy:  {s}")
 
-private def a11yForEachLiftPairs : Array (Name × Name) := #[
-  (``Qed.Html.imgsHaveAltList_mapList, ``Qed.Html.imgsHaveAlt_map), (``Qed.Html.buttonsAccessibleList_mapList, ``Qed.Html.buttonsAccessible_map),
-  (``Qed.Html.validAriaRolesList_mapList, ``Qed.Html.validAriaRoles_map), (``Qed.Html.labelsAssociatedList_mapList, ``Qed.Html.labelsAssociated_map),
-  (``Qed.Html.htmlHasLangList_mapList, ``Qed.Html.htmlHasLang_map)]
+private def a11yForEachLiftPairs : Array (Name × Name × Name) := #[
+  (``Qed.Html.imgsHaveAltList_mapList, ``Qed.Html.imgsHaveAlt_map, ``Qed.Html.imgsHaveAlt_canonical),
+  (``Qed.Html.buttonsAccessibleList_mapList, ``Qed.Html.buttonsAccessible_map, ``Qed.Html.buttonsAccessible_canonical),
+  (``Qed.Html.validAriaRolesList_mapList, ``Qed.Html.validAriaRoles_map, ``Qed.Html.validAriaRoles_canonical),
+  (``Qed.Html.labelsAssociatedList_mapList, ``Qed.Html.labelsAssociated_map, ``Qed.Html.labelsAssociated_canonical),
+  (``Qed.Html.htmlHasLangList_mapList, ``Qed.Html.htmlHasLang_map, ``Qed.Html.htmlHasLang_canonical)]
 
 elab "forEachStyleLift " view:ident childStyled:ident : tactic => do
   let c := mkIdent `c
@@ -91,7 +93,15 @@ elab "forEachStyleLift " view:ident childStyled:ident : tactic => do
   evalTactic (← `(tactic| (intro m; qedStyleReduce $view)))
   forEachGoal fun _ => do
     if ← tryTac (pure everyArm) (requireClosed := true) then return
-    discard <| a11yForEachLiftPairs.anyM fun (ml, m) => tryTac (requireClosed := true) `(tactic| (rw [$(mkIdent ml):ident]; intro $c _; simpa [$(mkIdent m):ident] using $childStyled $c))
+    discard <| a11yForEachLiftPairs.anyM fun (ml, m, can) => tryTac (requireClosed := true)
+      `(tactic| (rw [$(mkIdent ml):ident]; intro $c _; first
+        | (simpa [$(mkIdent m):ident] using $childStyled $c)
+        | (rw [← $(mkIdent can):ident]; split
+           · rename_i t as cs heq
+             rw [show Qed.Html.element t (Qed.Attr.key _ :: as) cs = Qed.withKey _ (Qed.Html.element t as cs) from rfl,
+                 Qed.Html.canonical_withKey, ← heq, $(mkIdent can):ident, ← Qed.Html.map, $(mkIdent m):ident]
+             exact $childStyled $c
+           · rw [$(mkIdent can):ident, ← Qed.Html.map, $(mkIdent m):ident]; exact $childStyled $c)))
 
 elab "qedDischargeStyledForEach" view:ident field:ident childStyled:ident nm:ident pred:term : tactic => do
   evalTactic (← `(tactic| forEachStyleLift $view $childStyled))

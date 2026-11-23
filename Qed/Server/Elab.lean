@@ -490,7 +490,7 @@ def elabQedServerMain : CommandElab := fun stx => do
   elabCommand (← `(command|
     def $(mkIdent `main):ident (args : List String) : IO UInt32 := do
       let (staticDir, port, devMode, numWorkers) ← $parseCliCall:term
-      if !(← $initDbCheck) then return 1
+      if !(← $initDbCheck:term) then return 1
       $runnerCall:term))
 
 end ServerFullElab

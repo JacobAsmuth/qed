@@ -55,6 +55,7 @@ export const Array_push = (a, x) => owned(a) ? (a.__m = undefined, a.push(x), a)
 export const Array_pop = (a) => owned(a) ? (a.__m = undefined, a.pop(), a) : own(a.slice(0, a.length - 1));
 export const Array_uset = (a, i, x) => { const b = mutArr(a); b[i] = x; return b; }, Array_set = (a, i, x) => Array_uset(a, Number(i), x);
 export const Array_swap = (a, i, j) => { const b = mutArr(a), x = Number(i), y = Number(j), t = b[x]; b[x] = b[y]; b[y] = t; return b; };
+export const Array_markLinear = (a) => a, Array_propagateMark = (_a, b) => b;
 
 // Strings & UTF-8 cache
 const ENC = new TextEncoder(), DEC = new TextDecoder(), DEC_FATAL = new TextDecoder('utf-8', { fatal: true });
@@ -142,6 +143,7 @@ export const ByteArray_emptyWithCapacity = (c) => mkBytes(Math.max(16, Number(c)
 export const ByteArray_mk = (arr) => { const u = mkBytes(Math.max(16, arr.length), arr.length); for (let i = 0; i < arr.length; i++) u[i] = Number(arr[i]); return u.subarray(0, arr.length); };
 export const ByteArray_data = (ba) => own(Array.from(ba)), ByteArray_size = (ba) => B(ba.length), ByteArray_usize = (ba) => ba.length;
 export const ByteArray_get = (ba, i) => ba[Number(i)], ByteArray_getx33 = (ba, i) => ba[Number(i)] ?? 0;
+export const ByteArray_decEq = (a, b) => { if (a === b) return 1; if (a.length !== b.length) return 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return 0; return 1; };
 export const ByteArray_push = (ba, b) => { const n = ba.length, u = ensureBytes(ba, n + 1, Math.max(16, (n + 1) * 2), true); u[n] = Number(b); return u.subarray(0, n + 1); };
 export const ByteArray_copySlice = (src, so, dst, dso, len, exact) => {
   const s = Math.min(Number(so), src.length), d = Number(dso), n = Math.min(Number(len), src.length - s);
@@ -155,7 +157,7 @@ export const Float_toBits = (f) => Number.isNaN(f) ? 0x7ff8000000000000n : (_f64
 export const Float_ofBits = (b) => (_f64.setBigUint64(0, B(b) & M64, true), _f64.getFloat64(0, true));
 
 // ST Refs, IO Streams & Panic
-export const ST_Prim_mkRef = (a, _w) => ({ v: a }), ST_Prim_Ref_get = (r, _w) => r.v, ST_Prim_Ref_set = (r, a, _w) => (r.v = a, PUnit);
+export const ST_Prim_mkRef = (a, _w) => ({ v: a }), ST_Prim_Ref_get = (r, _w) => r.v, ST_Prim_Ref_set = (r, a, _w) => (r.v = a, PUnit), ST_Prim_Ref_swap = (r, a, _w) => { const prev = r.v; r.v = a; return prev; };
 const mkStream = (log) => {
   const w = (s) => { const t = String(s).replace(/\n$/, ''); if (t) log(t); };
   return { t: 0, s: {}, u: {}, f: [pap(() => mkOk(PUnit), 1, []), pap(() => mkOk(new Uint8Array(0)), 2, []),
@@ -190,5 +192,7 @@ export {
   u64 as UInt64_toNat, uSize as USize_ofNat, uSize as USize_ofNatLT, nToNat as USize_toNat, nEq as USize_decEq, nLt as USize_decLt, Array_mkEmpty as Array_emptyWithCapacity, arrayToList as Array_toList,
   Array_getInternalBorrowed as Array_ugetBorrowed, Array_set as Array_setx33, String_append as String_Internal_append, String_mk as String_ofList, String_data as String_toList,
   String_get as String_decodeChar, String_get as String_Pos_Raw_get, String_next as String_Pos_Raw_next, String_next as String_Pos_next, String_atEnd as String_Pos_Raw_atEnd,
-  String_extract as String_Pos_Raw_extract, ByteArray_get as ByteArray_uget, ST_Prim_Ref_get as ST_Prim_Ref_take,
+  Array_markLinear as ByteArray_markLinear, Array_markLinear as String_markLinear, Array_markLinear as FloatArray_markLinear,
+  Array_propagateMark as ByteArray_propagateMark, Array_propagateMark as String_propagateMark, Array_propagateMark as FloatArray_propagateMark,
+  String_extract as String_Pos_Raw_extract, String_toUTF8 as String_toByteArray, ByteArray_get as ByteArray_uget, ByteArray_decEq as ByteArray_beq, ST_Prim_Ref_get as ST_Prim_Ref_take, ST_Prim_Ref_set as ST_Prim_Ref_put,
 };

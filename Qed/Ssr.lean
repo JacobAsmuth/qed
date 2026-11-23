@@ -274,7 +274,7 @@ theorem ssr_rpc_endpoint_routed (srvShort : String) (methods : List String)
     · exact hmNoQ c h
   unfold ssrDispatchRpc; dsimp only
   rw [show String.ofList ((pfx ++ m).toList.takeWhile (· ≠ '?')) = pfx ++ m by rw [list_takeWhile_eq_self _ fun c hc => decide_eq_true (hnoQ c hc), String.ofList_toList],
-      show (pfx ++ m).startsWith pfx = true by simp [String.startsWith],
+      show (pfx ++ m).startsWith pfx = true by simp,
       show (pfx ++ m).toList.drop pfx.length = m.toList by rw [String.toList_append, ← String.length_toList (s := pfx), List.drop_left]]
   simp only [beq_self_eq_true, Bool.and_self, ↓reduceIte, String.ofList_toList, hm]
 

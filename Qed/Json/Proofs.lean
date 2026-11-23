@@ -65,7 +65,7 @@ private theorem natDigitsAux_append (n : Nat) : ∀ acc : List Char, natDigitsAu
     intro acc; rw [natDigitsAux.eq_def (acc := acc), natDigitsAux.eq_def (acc := [])]
     by_cases h : n < 10
     · simp [h]
-    · simp only [if_neg h]; rw [ih (n / 10) (by omega), ih (n / 10) (by omega) [_]]; simp
+    · simp only [ite_eq_right h]; rw [ih (n / 10) (by omega), ih (n / 10) (by omega) [_]]; simp
 
 private theorem natDigits_spec (n : Nat) :
     natDigitsAux n [] ≠ [] ∧ (∀ c ∈ natDigitsAux n [], isDigit c = true) ∧ (natDigitsAux n []).foldl (fun acc c => acc * 10 + (c.toNat - '0'.toNat)) 0 = n := by
@@ -74,12 +74,12 @@ private theorem natDigits_spec (n : Nat) :
     have hunf : natDigitsAux n [] = (if n < 10 then [] else natDigitsAux (n / 10) []) ++ [Char.ofNat ('0'.toNat + n % 10)] := by
       rw [natDigitsAux.eq_def]; by_cases h : n < 10
       · simp [h]
-      · simp only [if_neg h]; exact natDigitsAux_append (n / 10) [_]
+      · simp only [ite_eq_right h]; exact natDigitsAux_append (n / 10) [_]
     rw [hunf]; have hd := digit_spec_fin ⟨n % 10, Nat.mod_lt _ (by omega)⟩
     refine ⟨by simp, fun c hc => (List.mem_append.1 hc).elim (fun h => if h10 : n < 10 then by simp [h10] at h else (ih (n / 10) (by omega)).2.1 c (by simpa [h10] using h)) (fun h => List.mem_singleton.1 h ▸ hd.2), ?_⟩
     rw [List.foldl_append]; by_cases h : n < 10
-    · simp only [if_pos h, List.foldl_nil, List.foldl_cons, hd.1]; omega
-    · simp only [if_neg h, List.foldl_cons, List.foldl_nil, (ih (n / 10) (by omega)).2.2, hd.1]; omega
+    · simp only [ite_eq_left h, List.foldl_nil, List.foldl_cons, hd.1]; omega
+    · simp only [ite_eq_right h, List.foldl_cons, List.foldl_nil, (ih (n / 10) (by omega)).2.2, hd.1]; omega
 
 private def numDelim : List Char → Bool | [] => true | c :: _ => !(isDigit c || c == '.' || c == 'e' || c == 'E')
 private theorem takeDigits_stop {cs : List Char} (h : numDelim cs = true) : takeDigits cs = ([], cs) := by
@@ -125,7 +125,7 @@ private theorem parseNum_render (n : JsonNumber) (rest : List Char) (hr : numDel
   have hne : (natDigitsAux m.natAbs []).isEmpty = false := List.isEmpty_eq_false_iff.2 (natDigits_spec _).1
   rw [show Json.renderNumL ⟨m, ex⟩ ++ rest = intCharsL m ++ tail by simp only [Json.renderNumL, tail, List.append_assoc]]
   unfold parseNum; rw [parseSigned_intCharsL false m tail htail.1]; dsimp only
-  rw [hne, if_neg Bool.false_ne_true, htail.2.1]; dsimp only; rw [htail.2.2]
+  rw [hne, ite_eq_right Bool.false_ne_true, htail.2.1]; dsimp only; rw [htail.2.2]
   simp only [List.append_nil, hd, List.length_nil, Except.ok.injEq, Prod.mk.injEq, JsonNumber.mk.injEq, and_true]
   split <;> omega
 
@@ -134,13 +134,13 @@ private theorem parseStrAux_escape (c : Char) (acc : String) (rest : List Char) 
   dsimp only [escapeCharL]; split <;> try rfl
   rename_i _ h1 h2 _ _ _
   by_cases hlt : c.toNat < 0x20
-  · simp only [if_pos hlt, hexEscapeL, List.cons_append, List.nil_append]; rw [parseStrAux.eq_def]
+  · simp only [ite_eq_left hlt, hexEscapeL, List.cons_append, List.nil_append]; rw [parseStrAux.eq_def]
     simp only [show ('\\' == '"') = false from rfl, beq_self_eq_true, Bool.false_eq_true, ↓reduceIte, hex4, hexVal]
     have h16 (k : Nat) : k % 16 < 16 := Nat.mod_lt _ (by omega)
     rw [unhexNat?_hexDigitLower (h16 _), unhexNat?_hexDigitLower (h16 _), unhexNat?_hexDigitLower (h16 _), unhexNat?_hexDigitLower (h16 _)]
     simp only [bind, Option.bind, pure, Option.elim]
     rw [show ((c.toNat / 4096 % 16 * 16 + c.toNat / 256 % 16) * 16 + c.toNat / 16 % 16) * 16 + c.toNat % 16 = c.toNat by omega, Char.ofNat_toNat]
-  · simp only [if_neg hlt, List.cons_append, List.nil_append]; rw [parseStrAux.eq_def]
+  · simp only [ite_eq_right hlt, List.cons_append, List.nil_append]; rw [parseStrAux.eq_def]
     simp only [beq_eq_false_iff_ne.2 h1, beq_eq_false_iff_ne.2 h2, Bool.false_eq_true, ↓reduceIte]
 
 private theorem parseStrAux_flatMap : ∀ (cs : List Char) (acc : String) (rest : List Char),

@@ -13,8 +13,8 @@ instance : LawfulJson Unit       where depthBound := 1; depth_toJson _ := Nat.le
 instance : LawfulJson JsonNumber where fromJson_toJson _ := rfl
 instance : LawfulJson Bool       where fromJson_toJson _ := rfl
 instance : LawfulJson String     where fromJson_toJson _ := rfl
-instance : LawfulJson Int        where fromJson_toJson _ := by simp [fromJson, JsonNumber.toInt?]
-instance : LawfulJson Nat        where fromJson_toJson _ := by simp [fromJson, JsonNumber.toInt?]
+instance : LawfulJson Int        where fromJson_toJson _ := by simp [toJson, fromJson, JsonNumber.toInt?]
+instance : LawfulJson Nat        where fromJson_toJson _ := by simp [toJson, fromJson, JsonNumber.toInt?]
 
 theorem list_mapM_map_ok {α β ε : Type} (f : α → β) (g : β → Except ε α) (h : ∀ a, g (f a) = .ok a) :
     ∀ xs : List α, (xs.map f).mapM (m := Except ε) g = .ok xs
@@ -53,8 +53,8 @@ instance [LawfulJson α] [LawfulJson β] : LawfulJson (α × β) where
 instance [LawfulJson α] [LawfulJson β] : LawfulJson (Sum α β) where
   depthBound := 1 + max (LawfulJson.depthBound α) (LawfulJson.depthBound β)
   depth_toJson
-    | .inl a => Nat.add_le_add_left (by simpa [Json.maxArr] using Nat.le_trans (LawfulJson.depth_toJson a) (Nat.le_max_left _ _)) 1
-    | .inr b => Nat.add_le_add_left (by simpa [Json.maxArr] using Nat.le_trans (LawfulJson.depth_toJson b) (Nat.le_max_right _ _)) 1
+    | .inl a => Nat.add_le_add_left (by simpa [Json.maxArr, Json.depth] using Nat.le_trans (LawfulJson.depth_toJson a) (Nat.le_max_left _ _)) 1
+    | .inr b => Nat.add_le_add_left (by simpa [Json.maxArr, Json.depth] using Nat.le_trans (LawfulJson.depth_toJson b) (Nat.le_max_right _ _)) 1
   fromJson_toJson
     | .inl a => congrArg (Except.map Sum.inl) (LawfulJson.fromJson_toJson a)
     | .inr b => congrArg (Except.map Sum.inr) (LawfulJson.fromJson_toJson b)

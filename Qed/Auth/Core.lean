@@ -6,34 +6,22 @@ import Qed.Router.Basic
 
 namespace Qed.Auth
 
-/-! ## Pure, Total, Kernel-Verified OIDC / JWT / JWKS Core (`Qed.Auth.Core`)
-    Implements RFC 7519 (JWT), RFC 7517 (JWK/JWKS), RFC 7636 (PKCE), and safe redirect
-    validation in pure, total Lean 4 with kernel-checked security invariants:
-    - Structurally forbids `alg: "none"` and symmetric `HS256` key-confusion attacks.
-    - Enforces `iss`, `aud`, `exp`, `nbf`, `nonce`, and non-empty `sub` via `VerifiedClaims`.
-    - Proves OAuth `returnTo` paths are strictly root-relative and CRLF/scheme-free. -/
+/-! ## Pure, Total, Kernel-Verified OIDC / JWT / JWKS Core (`Qed.Auth.Core`) -/
 
-/-! ### Verified RFC 4648 Base64URL (Unpadded) -/
-
-/-- Encodes bytes to RFC 4648 unpadded Base64URL (used for JWS, JWK, and PKCE S256). -/
 abbrev base64UrlEncode : ByteArray → String := Qed.Base64.encodeUrl
-
-/-- Decodes RFC 4648 Base64URL (padded or unpadded) into raw bytes. -/
 abbrev base64UrlDecode : String → Except String ByteArray := Qed.Base64.decodeUrl
 
-/-! ### Strict Asymmetric JWT Algorithm Allowlist (Zero `alg: none` / `HS256` Confusion) -/
+def decodeBase64UrlJson (b64 what : String) : Except String Json := do
+  let bs ← (base64UrlDecode b64).mapError (s!"{what}: invalid base64url: {·}")
+  let some raw := String.fromUTF8? bs | .error s!"{what}: invalid UTF-8"
+  (Json.parse raw).mapError (s!"{what}: invalid JSON: {·}")
 
-/-- Permitted OIDC JWS signature algorithms: strictly asymmetric public-key algorithms. -/
-inductive JwtAlg where
-  | rs256
-  | es256
+/-! ### Strict Asymmetric JWT Algorithm Allowlist (Zero `alg: none` / `HS256`) -/
+
+inductive JwtAlg where | rs256 | es256
 deriving Inhabited, DecidableEq, Repr
 
-def parseJwtAlg : String → Option JwtAlg
-  | "RS256" => some .rs256
-  | "ES256" => some .es256
-  | _       => none
-
+def parseJwtAlg : String → Option JwtAlg | "RS256" => some .rs256 | "ES256" => some .es256 | _ => none
 theorem parseJwtAlg_rejects_none : parseJwtAlg "none" = none := rfl
 theorem parseJwtAlg_rejects_hs256 : parseJwtAlg "HS256" = none := rfl
 
@@ -44,49 +32,25 @@ inductive JwkKey where
   | ecP256 (kid : String) (xBytes yBytes : ByteArray)
 deriving Inhabited
 
-def JwkKey.kid : JwkKey → String
-  | .rsa k _ _    => k
-  | .ecP256 k _ _ => k
-
-def JwkKey.alg : JwkKey → JwtAlg
-  | .rsa _ _ _    => .rs256
-  | .ecP256 _ _ _ => .es256
-
-private def strField? (j : Json) (k : String) : Option String :=
-  (j.get? k).bind (·.str?)
+def JwkKey.kid : JwkKey → String | .rsa k _ _ | .ecP256 k _ _ => k
+def JwkKey.alg : JwkKey → JwtAlg | .rsa _ _ _ => .rs256 | .ecP256 _ _ _ => .es256
 
 def parseJwk (j : Json) : Option JwkKey := do
-  let kty ← strField? j "kty"
-  -- Reject encryption-only keys (`use: "enc"`).
-  if let some useStr := strField? j "use" then
-    if useStr != "sig" then none
-  let kid := (strField? j "kid").getD ""
-  let b64Field (k : String) : Option ByteArray :=
-    (strField? j k).bind fun s => (base64UrlDecode s).toOption
-  if kty == "RSA" then
-    let nBytes ← b64Field "n"
-    let eBytes ← b64Field "e"
-    if nBytes.size >= 128 && !eBytes.isEmpty then some (.rsa kid nBytes eBytes) else none
-  else if kty == "EC" then
-    if strField? j "crv" != some "P-256" then none
-    let xBytes ← b64Field "x"
-    let yBytes ← b64Field "y"
-    if xBytes.size == 32 && yBytes.size == 32 then some (.ecP256 kid xBytes yBytes) else none
-  else
-    none
+  let kty ← j.strAt? "kty"
+  if let some u := j.strAt? "use" then guard (u == "sig")
+  let kid := j.strAtD "kid"
+  let b64 (k : String) := (j.strAt? k).bind fun s => (base64UrlDecode s).toOption
+  match kty with
+  | "RSA" => let n ← b64 "n"; let e ← b64 "e"; guard (n.size >= 128 && !e.isEmpty); some (.rsa kid n e)
+  | "EC"  => guard (j.strAt? "crv" == some "P-256"); let x ← b64 "x"; let y ← b64 "y"; guard (x.size == 32 && y.size == 32); some (.ecP256 kid x y)
+  | _ => none
 
-def parseJwks (j : Json) : Array JwkKey :=
-  match j.get? "keys" with
-  | some (.arr items) => (items.filterMap parseJwk).toArray
-  | _ => #[]
+def parseJwks (j : Json) : Array JwkKey := ((j.arrAt "keys").filterMap parseJwk).toArray
 
 def findMatchingJwk (keys : Array JwkKey) (alg : JwtAlg) (kid? : Option String) : Option JwkKey :=
   match kid? with
-  | some kid =>
-      keys.find? fun k => k.alg == alg && k.kid == kid
-  | none =>
-      let compat := keys.filter fun k => k.alg == alg
-      if compat.size == 1 then compat[0]? else none
+  | some kid => keys.find? fun k => k.alg == alg && k.kid == kid
+  | none     => let compat := keys.filter (·.alg == alg); if compat.size == 1 then compat[0]? else none
 
 /-! ### RFC 7519 JWT Parsing & Kernel-Verified Claim Validation -/
 
@@ -104,46 +68,22 @@ structure CompactJwt where
 
 def splitCompactJwt (token : String) : Except String (String × String × String) :=
   match token.splitOn "." with
-  | [h, p, s] =>
-      if h.isEmpty || p.isEmpty || s.isEmpty then
-        .error "jwt: empty segment"
-      else
-        .ok (h, p, s)
-  | _ => .error "jwt: expected 3 dot-separated segments"
+  | [h, p, s] => if h.isEmpty || p.isEmpty || s.isEmpty then .error "jwt: empty segment" else .ok (h, p, s)
+  | _         => .error "jwt: expected 3 dot-separated segments"
 
 def parseJwtHeader (j : Json) : Except String JwtHeader := do
-  let some algStr := strField? j "alg" | .error "jwt: missing `alg` header"
-  let some alg := parseJwtAlg algStr
-    | .error s!"jwt: disallowed algorithm `{algStr}` (only RS256 and ES256 are accepted)"
-  .ok { alg, kid? := strField? j "kid", typ? := strField? j "typ" }
+  let some algStr := j.strAt? "alg" | .error "jwt: missing `alg` header"
+  let some alg := parseJwtAlg algStr | .error s!"jwt: disallowed algorithm `{algStr}` (only RS256 and ES256 are accepted)"
+  .ok { alg, kid? := j.strAt? "kid", typ? := j.strAt? "typ" }
 
 def parseCompactJwt (token : String) : Except String CompactJwt := do
   let (hB64, pB64, sB64) ← splitCompactJwt token
-  let decJson (b64 what : String) : Except String Json := do
-    let some s := String.fromUTF8? (← base64UrlDecode b64) | .error s!"jwt: invalid UTF-8 in {what}"
-    Json.parse s
-  let header ← parseJwtHeader (← decJson hB64 "header")
-  let payloadJson ← decJson pB64 "payload"
-  .ok { signingInput := hB64 ++ "." ++ pB64, signature := ← base64UrlDecode sB64, header, payloadJson }
+  let header ← parseJwtHeader (← decodeBase64UrlJson hB64 "jwt header")
+  .ok { signingInput := hB64 ++ "." ++ pB64, signature := ← base64UrlDecode sB64, header, payloadJson := ← decodeBase64UrlJson pB64 "jwt payload" }
 
 private def jsonToClaimString : Json → Option String
-  | .str s  => some s
-  | .bool b => some (if b then "true" else "false")
-  | .num n  => if n.exponent == 0 then some (toString n.mantissa) else some (Json.render (.num n))
-  | _       => none
-
-private def extractFlatClaims : Json → List (String × String)
-  | .obj fields => fields.filterMap fun (k, v) => (jsonToClaimString v).map (k, ·)
-  | _           => []
-
-private def jsonToNatOpt : Json → Option Nat
-  | .num n => if n.exponent == 0 && n.mantissa >= 0 then some n.mantissa.toNat else none
-  | _      => none
-
-private def parseAudField : Json → List String
-  | .str s  => [s]
-  | .arr xs => xs.filterMap (·.str?)
-  | _       => []
+  | .str s => some s | .bool b => some (if b then "true" else "false")
+  | .num n => some (if n.exponent == 0 then toString n.mantissa else Json.render (.num n)) | _ => none
 
 structure JwtClaims where
   iss           : String
@@ -159,20 +99,16 @@ structure JwtClaims where
 deriving Inhabited, DecidableEq, Repr
 
 def JwtClaims.claim (c : JwtClaims) (key : String) : Option String :=
-  (c.flatClaims.lookup key).orElse fun _ =>
-    if key == "verified" then c.flatClaims.lookup "email_verified" else none
+  (c.flatClaims.lookup key).orElse fun _ => if key == "verified" then c.flatClaims.lookup "email_verified" else none
 
 def parseJwtClaims (j : Json) : Except String JwtClaims := do
-  let some iss := strField? j "iss" | .error "jwt: missing `iss` claim"
-  let some sub := strField? j "sub" | .error "jwt: missing `sub` claim"
-  let aud := match j.get? "aud" with | some v => parseAudField v | none => []
-  let some exp := (j.get? "exp").bind jsonToNatOpt | .error "jwt: missing or invalid `exp` claim"
-  let emailVerified := match j.get? "email_verified" with | some (.bool b) => b | _ => false
-  .ok {
-    iss, sub, aud, exp, nbf? := (j.get? "nbf").bind jsonToNatOpt,
-    iat? := (j.get? "iat").bind jsonToNatOpt, nonce? := strField? j "nonce",
-    email? := strField? j "email", emailVerified, flatClaims := extractFlatClaims j
-  }
+  let some iss := j.strAt? "iss" | .error "jwt: missing `iss` claim"
+  let some sub := j.strAt? "sub" | .error "jwt: missing `sub` claim"
+  let aud := match j.get? "aud" with | some (.str s) => [s] | some (.arr xs) => xs.filterMap (·.str?) | _ => []
+  let some exp := j.natAt? "exp" | .error "jwt: missing or invalid `exp` claim"
+  let flatClaims := match j with | .obj fs => fs.filterMap fun (k, v) => (jsonToClaimString v).map (k, ·) | _ => []
+  .ok { iss, sub, aud, exp, nbf? := j.natAt? "nbf", iat? := j.natAt? "iat", nonce? := j.strAt? "nonce",
+        email? := j.strAt? "email", emailVerified := (j.boolAt? "email_verified").getD false, flatClaims }
 
 structure OidcValidationCfg where
   issuer         : String
@@ -181,8 +117,7 @@ structure OidcValidationCfg where
   expectedNonce? : Option String := none
 deriving Inhabited, DecidableEq, Repr
 
-/-- Proof-carrying verified JWT claims: can only be constructed after passing issuer,
-    audience, expiry, not-before, non-empty subject, and optional nonce validation. -/
+/-- Proof-carrying verified JWT claims. -/
 structure VerifiedClaims (cfg : OidcValidationCfg) (nowSec : Nat) where
   claims      : JwtClaims
   alg         : JwtAlg
@@ -200,22 +135,19 @@ def validateJwtClaims (cfg : OidcValidationCfg) (nowSec : Nat) (alg : JwtAlg) (c
       if hExp : nowSec < c.exp + cfg.clockSkewSec then
         if hSub : c.sub ≠ "" then
           if hNbf : c.nbf?.all (· ≤ nowSec + cfg.clockSkewSec) then
-            let hNbfPf : ∀ n, c.nbf? = some n → n ≤ nowSec + cfg.clockSkewSec :=
-              fun n hn => by simp [hn] at hNbf; exact hNbf
+            let hNbfPf : ∀ n, c.nbf? = some n → n ≤ nowSec + cfg.clockSkewSec := fun n hn => by simp [hn] at hNbf; exact hNbf
             match hNonceCase : cfg.expectedNonce? with
             | none => .ok ⟨c, alg, hIss, hAud, hExp, hNbfPf, hSub, fun _ h => by rw [hNonceCase] at h; cases h⟩
-            | some en =>
-                if hNm : c.nonce? = some en then
-                  .ok ⟨c, alg, hIss, hAud, hExp, hNbfPf, hSub, fun _ h => by rw [hNonceCase] at h; cases h; exact hNm⟩
-                else .error "jwt: nonce mismatch"
+            | some en => if hNm : c.nonce? = some en then
+                .ok ⟨c, alg, hIss, hAud, hExp, hNbfPf, hSub, fun _ h => by rw [hNonceCase] at h; cases h; exact hNm⟩
+              else .error "jwt: nonce mismatch"
           else .error "jwt: token not yet valid (`nbf`)"
         else .error "jwt: empty `sub` claim"
       else .error "jwt: token expired"
     else .error "jwt: audience mismatch"
   else .error "jwt: issuer mismatch"
 
-private theorem validateJwtClaims_err_of {cfg nowSec alg c}
-    (hf : ∀ vc : VerifiedClaims cfg nowSec, vc.claims = c → False) :
+private theorem validateJwtClaims_err_of {cfg nowSec alg c} (hf : ∀ vc : VerifiedClaims cfg nowSec, vc.claims = c → False) :
     (validateJwtClaims cfg nowSec alg c).isOk = false := by
   cases h : validateJwtClaims cfg nowSec alg c with
   | error _ => rfl
@@ -225,57 +157,39 @@ private theorem validateJwtClaims_err_of {cfg nowSec alg c}
       all_goals rfl
 
 theorem validateJwtClaims_rejects_expired (cfg : OidcValidationCfg) (nowSec : Nat) (alg : JwtAlg) (c : JwtClaims)
-    (hExp : ¬ (nowSec < c.exp + cfg.clockSkewSec)) :
-    (validateJwtClaims cfg nowSec alg c).isOk = false :=
+    (hExp : ¬ (nowSec < c.exp + cfg.clockSkewSec)) : (validateJwtClaims cfg nowSec alg c).isOk = false :=
   validateJwtClaims_err_of fun vc hc => hExp (hc ▸ vc.hNotExpired)
 
 theorem validateJwtClaims_rejects_wrong_issuer (cfg : OidcValidationCfg) (nowSec : Nat) (alg : JwtAlg) (c : JwtClaims)
-    (hNe : c.iss ≠ cfg.issuer) :
-    (validateJwtClaims cfg nowSec alg c).isOk = false :=
+    (hNe : c.iss ≠ cfg.issuer) : (validateJwtClaims cfg nowSec alg c).isOk = false :=
   validateJwtClaims_err_of fun vc hc => hNe (hc ▸ vc.hIss)
 
 theorem validateJwtClaims_rejects_wrong_audience (cfg : OidcValidationCfg) (nowSec : Nat) (alg : JwtAlg) (c : JwtClaims)
-    (hNotIn : cfg.audience ∉ c.aud) :
-    (validateJwtClaims cfg nowSec alg c).isOk = false :=
+    (hNotIn : cfg.audience ∉ c.aud) : (validateJwtClaims cfg nowSec alg c).isOk = false :=
   validateJwtClaims_err_of fun vc hc => hNotIn (hc ▸ vc.hAud)
 
 theorem validateJwtClaims_rejects_empty_sub (cfg : OidcValidationCfg) (nowSec : Nat) (alg : JwtAlg) (c : JwtClaims)
-    (hEmpty : c.sub = "") :
-    (validateJwtClaims cfg nowSec alg c).isOk = false :=
+    (hEmpty : c.sub = "") : (validateJwtClaims cfg nowSec alg c).isOk = false :=
   validateJwtClaims_err_of fun vc hc => vc.hSub (hc ▸ hEmpty)
 
-/-! ### Safe Post-Login Redirect Validation (`isSafeReturnTo`, Zero Open Redirects) -/
+/-! ### Safe Post-Login Redirect Validation (`isSafeReturnTo`) -/
 
-private def isSafeReturnToChar (c : Char) : Bool :=
-  c != '\\' && c != '\r' && c != '\n' && c != '\x00' &&
-  decide (32 ≤ c.toNat ∧ c.toNat ≠ 127)
-
-/-- True iff `s` is a strictly root-relative path (`/foo?a=1#b`): starts with `/`,
-    is not protocol-relative (`//`), contains no backslashes, control chars, or CRLF. -/
 def isSafeReturnTo (s : String) : Bool :=
   match s.toList with
-  | '/' :: '/' :: _  => false
-  | '/' :: '\\' :: _ => false
-  | '/' :: rest      => rest.all isSafeReturnToChar
-  | _                => false
+  | '/' :: '/' :: _ | '/' :: '\\' :: _ => false
+  | '/' :: rest => rest.all fun c => c != '\\' && c != '\r' && c != '\n' && c != '\x00' && decide (32 ≤ c.toNat ∧ c.toNat ≠ 127)
+  | _ => false
 
-def sanitizeReturnTo (raw? : Option String) : String :=
-  match raw? with
-  | some s => if isSafeReturnTo s then s else "/"
-  | none   => "/"
+def sanitizeReturnTo (raw? : Option String) : String := match raw? with | some s => if isSafeReturnTo s then s else "/" | none => "/"
 
 theorem isSafeReturnTo_root : isSafeReturnTo "/" = true := by decide
 theorem isSafeReturnTo_rejects_protocol_relative : isSafeReturnTo "//evil.com" = false := by decide
 theorem isSafeReturnTo_rejects_javascript : isSafeReturnTo "javascript:alert(1)" = false := by decide
 
-theorem sanitizeReturnTo_safe (raw? : Option String) :
-    isSafeReturnTo (sanitizeReturnTo raw?) = true := by
-  unfold sanitizeReturnTo
-  cases raw? with
-  | none => exact isSafeReturnTo_root
-  | some s => dsimp only; split <;> simp_all [isSafeReturnTo_root]
+theorem sanitizeReturnTo_safe (raw? : Option String) : isSafeReturnTo (sanitizeReturnTo raw?) = true := by
+  unfold sanitizeReturnTo; cases raw? with | none => exact isSafeReturnTo_root | some s => dsimp only; split <;> simp_all [isSafeReturnTo_root]
 
-/-! ### Signed `v2` Session Cookie Payload Codec (Carrying Verified User ID + Claims) -/
+/-! ### Signed `v2` Session Cookie Payload & URL Form Helpers -/
 
 structure SessionPayloadV2 where
   userId : String
@@ -283,43 +197,25 @@ structure SessionPayloadV2 where
 deriving Inhabited, DecidableEq, Repr
 
 def encodeSessionPayloadV2 (p : SessionPayloadV2) : String :=
-  let claimObj := Json.obj (p.claims.map fun (k, v) => (k, Json.str v))
-  let j := Json.obj [("sub", Json.str p.userId), ("claims", claimObj)]
-  base64UrlEncode (Json.render j).toUTF8
+  base64UrlEncode (Json.render (Json.obj [("sub", .str p.userId), ("claims", Json.obj (p.claims.map fun (k, v) => (k, .str v)))])).toUTF8
 
 def decodeSessionPayloadV2 (b64 : String) : Except String SessionPayloadV2 := do
-  let bs ← base64UrlDecode b64
-  let some raw := String.fromUTF8? bs
-    | .error "session: invalid UTF-8"
-  let j ← Json.parse raw
-  let some uid := strField? j "sub" | .error "session: missing `sub`"
+  let j ← decodeBase64UrlJson b64 "session"
+  let some uid := j.strAt? "sub" | .error "session: missing `sub`"
   if uid.isEmpty then .error "session: empty `sub`"
-  else
-    let claims := match j.get? "claims" with
-      | some (.obj kvs) => kvs.filterMap fun (k, v) => v.str?.map (k, ·)
-      | _ => []
-    .ok { userId := uid, claims }
-
-/-! ### URL Query / Form-URLEncoded Helpers (Pure, Total) -/
+  else .ok { userId := uid, claims := match j.get? "claims" with | some (.obj kvs) => kvs.filterMap fun (k, v) => v.str?.map (k, ·) | _ => [] }
 
 abbrev urlEncodeComponent : String → String := Qed.encodeSeg
-
-def urlDecodeComponent (s : String) : String :=
-  (String.fromUTF8? (Qed.decodeBytes (s.replace "+" " ").toList .empty)).getD s
+def urlDecodeComponent (s : String) : String := (String.fromUTF8? (Qed.decodeBytes (s.replace "+" " ").toList .empty)).getD s
 
 def parseQueryParams (q : String) : List (String × String) :=
-  let trimmed := if q.startsWith "?" then String.ofList (q.toList.drop 1) else q
-  if trimmed.isEmpty then []
-  else
-    (trimmed.splitOn "&").filterMap fun pair =>
-      if pair.isEmpty then none
-      else match pair.splitOn "=" with
-        | []      => none
-        | [k]     => some (urlDecodeComponent k, "")
-        | k :: vs => some (urlDecodeComponent k, urlDecodeComponent (String.intercalate "=" vs))
+  let trimmed := if q.startsWith "?" then (q.drop 1).toString else q
+  if trimmed.isEmpty then [] else (trimmed.splitOn "&").filterMap fun pair =>
+    if pair.isEmpty then none else match pair.splitOn "=" with
+      | [] => none | k :: vs => some (urlDecodeComponent k, if vs.isEmpty then "" else urlDecodeComponent ("=".intercalate vs))
 
 def encodeFormBody (pairs : List (String × String)) : String :=
-  String.intercalate "&" (pairs.map fun (k, v) => urlEncodeComponent k ++ "=" ++ urlEncodeComponent v)
+  "&".intercalate (pairs.map fun (k, v) => urlEncodeComponent k ++ "=" ++ urlEncodeComponent v)
 
 /-! ### Declarative `auth` Runtime Specification (`OidcAuthSpec`) -/
 
@@ -329,8 +225,6 @@ structure AuthClaimSpec where
   defaultValue : String := ""
 deriving Inhabited, DecidableEq, Repr
 
-/-- Server-side OIDC configuration generated by an `auth <Name>:` block.
-    Never bundled into client JS (`Js.VerifyEnv.clientLeakReason?`). -/
 structure OidcAuthSpec where
   name             : String
   isManaged        : Bool := false
@@ -350,17 +244,9 @@ structure OidcAuthSpec where
   claims           : List AuthClaimSpec := []
 deriving Inhabited, DecidableEq, Repr
 
-/-- Typed claim extraction helper for generated `<Auth>.User` decoders and server policies. -/
 def parseBoolClaim (raw? : Option String) (defaultVal : Bool := false) : Bool :=
-  match raw? with
-  | some "true" | some "1" => true
-  | some "false" | some "0" => false
-  | _ => defaultVal
-
-def parseNatClaim (raw? : Option String) (defaultVal : Nat := 0) : Nat :=
-  (raw?.bind String.toNat?).getD defaultVal
-
-def parseIntClaim (raw? : Option String) (defaultVal : Int := 0) : Int :=
-  (raw?.bind String.toInt?).getD defaultVal
+  match raw? with | some "true" | some "1" => true | some "false" | some "0" => false | _ => defaultVal
+def parseNatClaim (raw? : Option String) (defaultVal : Nat := 0) : Nat := (raw?.bind String.toNat?).getD defaultVal
+def parseIntClaim (raw? : Option String) (defaultVal : Int := 0) : Int := (raw?.bind String.toInt?).getD defaultVal
 
 end Qed.Auth

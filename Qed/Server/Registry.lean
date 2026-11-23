@@ -11,11 +11,7 @@ namespace Qed
 @[simp] theorem QedVal.val_ensured {α : Type} {p : α → Prop} (e : Ensured α p) :
     Qed.Lang.QedVal.val e = Field.val e := rfl
 
-end Qed
-
-namespace Qed
-
-/-! ## Persistent Server RPC Metadata Registry (`serverRegistry`) -/
+/-! ## Persistent Server & Channel Metadata Registries -/
 
 structure ServerMethodInfo where
   name            : String
@@ -38,16 +34,16 @@ structure ServerMethodInfo where
 deriving Inhabited, Repr
 
 structure ServerInfo where
-  serverName       : Lean.Name
-  shortName        : String
-  hasState         : Bool
-  secrets          : Array String
-  ownSecrets       : Array String := #[]
-  envVars          : Array (String × String × Option String)
-  externalServices : Array (String × String)
-  methods          : Array ServerMethodInfo
-  channels         : Array String := #[]
-  jobs             : Array String := #[]
+  serverName         : Lean.Name
+  shortName          : String
+  hasState           : Bool
+  secrets            : Array String
+  ownSecrets         : Array String := #[]
+  envVars            : Array (String × String × Option String)
+  externalServices   : Array (String × String)
+  methods            : Array ServerMethodInfo
+  channels           : Array String := #[]
+  jobs               : Array String := #[]
   databases          : Array Lean.Name := #[]
   authName?          : Option Lean.Name := none
   authConfig?        : Option Lean.Name := none
@@ -56,44 +52,22 @@ structure ServerInfo where
   hasHttpRoutes      : Bool := false
 deriving Inhabited
 
-initialize serverRegistry :
-    Lean.SimplePersistentEnvExtension ServerInfo (Lean.NameMap ServerInfo) ←
-  Qed.Diag.mkNameMapExt (·.serverName)
+initialize serverRegistry : Lean.SimplePersistentEnvExtension ServerInfo (Lean.NameMap ServerInfo) ← Qed.Diag.mkNameMapExt (·.serverName)
 
-/-- Resolves a `Server.fn` reference from a component (`Catalog.order`, `CloudBooks.Catalog.order`,
-    or an `open Catalog` method name) against `serverRegistry`. -/
-def lookupServerMethod? (env : Lean.Environment) (currNs : Lean.Name)
-    (openDecls : List Lean.OpenDecl) (callName : Lean.Name) :
+def lookupServerMethod? (env : Lean.Environment) (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (callName : Lean.Name) :
     Option (ServerInfo × ServerMethodInfo) :=
   let reg := serverRegistry.getState env
-  let resolved := Lean.ResolveName.resolveGlobalName env {} currNs openDecls callName
-  let byResolved := resolved.findSome? fun (fullConst, _) =>
-    reg.toList.findSome? fun (_, srvInfo) =>
-      srvInfo.methods.findSome? fun mInfo =>
-        let pubConst := srvInfo.serverName ++ Lean.Name.mkSimple mInfo.name
-        if fullConst == pubConst || fullConst == mInfo.rawRpcConst then some (srvInfo, mInfo)
-        else none
-  byResolved.orElse fun _ =>
+  ((Lean.ResolveName.resolveGlobalName env {} currNs openDecls callName).findSome? fun (fc, _) =>
+    reg.toList.findSome? fun (_, srv) => srv.methods.findSome? fun m =>
+      if fc == srv.serverName ++ Lean.Name.mkSimple m.name || fc == m.rawRpcConst then some (srv, m) else none).orElse fun _ =>
     match callName with
     | .str srvPart mStr =>
-        let srvClean := srvPart.eraseMacroScopes
-        let cand1 := currNs ++ srvClean
-        let srv? := (reg.find? cand1).orElse (fun _ => reg.find? srvClean)
-          |>.orElse (fun _ => reg.toList.findSome? fun (_, info) =>
-            if info.shortName == srvClean.toString then some info else none)
-        srv?.bind fun srvInfo =>
-          (srvInfo.methods.find? (·.name == mStr)).map (srvInfo, ·)
+        let s := srvPart.eraseMacroScopes
+        ((reg.find? (currNs ++ s)).orElse (fun _ => reg.find? s) |>.orElse (fun _ => reg.toList.findSome? fun (_, i) => if i.shortName == s.toString then some i else none)).bind fun srv =>
+          (srv.methods.find? (·.name == mStr)).map (srv, ·)
     | _ => none
 
-
-/-! ## Unified Channel Registry (Fullstack `server` `channel` + 3rd-Party `external` `ws`) -/
-
-inductive ExtWsCodec where
-  | json
-  | proto
-  | text
-  | bytes
-deriving Inhabited, DecidableEq, Repr
+inductive ExtWsCodec where | json | proto | text | bytes deriving Inhabited, DecidableEq, Repr
 
 inductive ChannelKind where
   | fullstack (serverName : Lean.Name) (serverShort : String) (wsPath : String)
@@ -129,107 +103,70 @@ structure ChannelInfo where
   unsubHelperConst    : Lean.Name := .anonymous
 deriving Inhabited, Repr
 
-def ChannelInfo.mkDefault (ownerName : Lean.Name) (ownerShort : String) (chName : Lean.Name)
-    (kind : ChannelKind) (paramNames : Array Lean.Name) (paramTypeConsts : Array Lean.Name)
-    (defaultReconnect : Reconnect) : ChannelInfo :=
-  { fullName := ownerName ++ chName, ownerName, ownerShort, channelName := chName.toString, kind
-    paramNames, paramCount := paramNames.size, paramTypeConsts
-    eventTypeConst := ownerName ++ chName.appendAfter "_Event", defaultReconnect
-    keyHelperConst := ownerName ++ chName.appendAfter "_key"
-    subHelperConst := ownerName ++ chName.appendAfter "_sub"
-    unsubHelperConst := ownerName ++ chName.appendAfter "_unsub" }
+def ChannelInfo.mkDefault (ownerName : Lean.Name) (ownerShort : String) (chName : Lean.Name) (kind : ChannelKind)
+    (paramNames paramTypeConsts : Array Lean.Name) (defaultReconnect : Reconnect) : ChannelInfo :=
+  let sub (s : String) := ownerName ++ chName.appendAfter s
+  { fullName := ownerName ++ chName, ownerName, ownerShort, channelName := chName.toString, kind,
+    paramNames, paramCount := paramNames.size, paramTypeConsts, defaultReconnect,
+    eventTypeConst := sub "_Event", keyHelperConst := sub "_key", subHelperConst := sub "_sub", unsubHelperConst := sub "_unsub" }
 
-initialize channelRegistry :
-    Lean.SimplePersistentEnvExtension ChannelInfo (Lean.NameMap ChannelInfo) ←
-  Qed.Diag.mkNameMapExt (·.fullName)
+initialize channelRegistry : Lean.SimplePersistentEnvExtension ChannelInfo (Lean.NameMap ChannelInfo) ← Qed.Diag.mkNameMapExt (·.fullName)
 
-/-- Resolves a `<Server>.<chan>` or `<External>.<chan>` channel reference from a component
-    against `channelRegistry`. -/
-def lookupChannel? (env : Lean.Environment) (currNs : Lean.Name)
-    (openDecls : List Lean.OpenDecl) (callName : Lean.Name) :
-    Option ChannelInfo :=
+def lookupChannel? (env : Lean.Environment) (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (callName : Lean.Name) : Option ChannelInfo :=
   let reg := channelRegistry.getState env
-  let cand1 := currNs ++ callName
-  if let some info := reg.find? cand1 then some info
-  else if let some info := reg.find? callName then some info
-  else
-    let resolved := Lean.ResolveName.resolveGlobalName env {} currNs openDecls (callName.appendAfter "_sub")
-    let byResolved := resolved.findSome? fun (fullConst, _) =>
-      reg.toList.findSome? fun (_, info) =>
-        if info.subHelperConst == fullConst then some info else none
-    byResolved.orElse fun _ =>
-      match callName with
-      | .str ownerPart chStr =>
-          let ownerClean := ownerPart.eraseMacroScopes
-          reg.toList.findSome? fun (_, info) =>
-            if info.channelName == chStr &&
-               (info.ownerShort == ownerClean.toString ||
-                info.ownerName == currNs ++ ownerClean ||
-                info.ownerName == ownerClean) then
-              some info
-            else none
-      | _ => none
+  (reg.find? (currNs ++ callName)).orElse (fun _ => reg.find? callName)
+  |>.orElse (fun _ => (Lean.ResolveName.resolveGlobalName env {} currNs openDecls (callName.appendAfter "_sub")).findSome? fun (fc, _) =>
+      reg.toList.findSome? fun (_, i) => if i.subHelperConst == fc then some i else none)
+  |>.orElse fun _ => match callName with
+    | .str ownerPart chStr =>
+        let o := ownerPart.eraseMacroScopes
+        reg.toList.findSome? fun (_, i) => if i.channelName == chStr && (i.ownerShort == o.toString || i.ownerName == currNs ++ o || i.ownerName == o) then some i else none
+    | _ => none
 
-/-! ## Shared `reconnect` Policy Parser (`off` / `fixed(...)` / `backoff(...)`) -/
+/-! ## Shared `reconnect` Policy Parser -/
 
 section ReconnectParser
 open Lean Qed.Lang
 
 private def parseNatLitArg (stx : Syntax) : MacroM Nat := do
   let u := unwrapParens1 stx
-  if u.getKind == ``qedLitNum then
-    return (⟨(u.getArg 0)⟩ : TSyntax `num).getNat
-  else
-    Macro.throwErrorAt stx "expected a non-negative integer millisecond/retry literal in `reconnect` policy"
+  if u.getKind == ``qedLitNum then return (⟨u.getArg 0⟩ : TSyntax `num).getNat
+  else Macro.throwErrorAt stx "expected a non-negative integer millisecond/retry literal in `reconnect` policy"
 
 private def parseOptNatLitArg (stx : Syntax) : MacroM (Option Nat) := do
   let u := unwrapParens1 stx
   if u.getKind == ``qedIdent && (u.getArg 0).getId == `none then return none
   else if u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent && ((u.getArg 0).getArg 0).getId == `some then
     let args := (u.getArg 2).getSepArgs
-    if args.size == 1 && args[0]!.getKind == ``qedCallArgPos then
-      return some (← parseNatLitArg args[0]![0])
+    if args.size == 1 && args[0]!.getKind == ``qedCallArgPos then some <$> parseNatLitArg args[0]![0]
     else Macro.throwErrorAt stx "expected `some(<nat>)` or `<nat>`"
-  else
-    return some (← parseNatLitArg u)
+  else some <$> parseNatLitArg u
 
-/-- Parses `off`, `fixed(delayMs[, maxRetries])`, or `backoff(initialMs, maxMs[, maxRetries])`
-    (with optional named `maxRetries=...`) into a `Qed.Reconnect` value. -/
 def parseReconnectExpr (exprStx : Syntax) : MacroM Reconnect := do
   let u := unwrapParens1 exprStx
   if u.getKind == ``qedIdent then
-    let nm := (u.getArg 0).getId.eraseMacroScopes
-    if nm == `off || nm == `none then return .off
-    else if nm == `default || nm == `backoff then return .defaultPolicy
-    else Macro.throwErrorAt u s!"unknown `reconnect` policy `{nm}`; use `off`, `fixed(ms[, max])`, or `backoff(initMs, maxMs[, max])`"
+    match (u.getArg 0).getId.eraseMacroScopes with
+    | `off | `none => return .off
+    | `default | `backoff => return .defaultPolicy
+    | nm => Macro.throwErrorAt u s!"unknown `reconnect` policy `{nm}`; use `off`, `fixed(ms[, max])`, or `backoff(initMs, maxMs[, max])`"
   else if u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent then
     let fn := ((u.getArg 0).getArg 0).getId.eraseMacroScopes
-    let (posArgs, namedArgs) ← splitCallArgsMacro "reconnect" (u.getArg 2).getSepArgs (some ["maxRetries", "max"])
-    let mut maxRet? : Option (Option Nat) := none
-    for (_, valStx) in namedArgs do
-      maxRet? := some (← parseOptNatLitArg valStx)
-    if fn == `fixed then
-      if posArgs.size == 1 || (posArgs.size == 2 && maxRet?.isNone) then
-        let maxR ← if posArgs.size == 2 then parseOptNatLitArg posArgs[1]! else pure (maxRet?.getD none)
-        return .fixed (← parseNatLitArg posArgs[0]!) maxR
-      else
+    let (pos, named) ← splitCallArgsMacro "reconnect" (u.getArg 2).getSepArgs (some ["maxRetries", "max"])
+    let maxRet? ← named.foldlM (init := none) fun _ (_, v) => some <$> parseOptNatLitArg v
+    let getMax (i : Nat) := if pos.size == i + 1 then parseOptNatLitArg pos[i]! else pure (maxRet?.getD none)
+    match fn with
+    | `fixed =>
+        if pos.size == 1 || (pos.size == 2 && maxRet?.isNone) then return .fixed (← parseNatLitArg pos[0]!) (← getMax 1)
         Macro.throwErrorAt u "`reconnect fixed(...)` expects 1 or 2 arguments: `fixed(delayMs)` or `fixed(delayMs, maxRetries)`"
-    else if fn == `backoff then
-      if posArgs.size == 0 then
-        return .backoff 250 30000 (maxRet?.getD none)
-      else if posArgs.size == 2 || (posArgs.size == 3 && maxRet?.isNone) then
-        let initMs ← parseNatLitArg posArgs[0]!
-        let maxMs ← parseNatLitArg posArgs[1]!
-        if maxMs < initMs then
-          Macro.throwErrorAt u s!"`reconnect backoff({initMs}, {maxMs})` requires `initialMs <= maxMs`"
-        let maxR ← if posArgs.size == 3 then parseOptNatLitArg posArgs[2]! else pure (maxRet?.getD none)
-        return .backoff initMs maxMs maxR
-      else
+    | `backoff =>
+        if pos.size == 0 then return .backoff 250 30000 (maxRet?.getD none)
+        if pos.size == 2 || (pos.size == 3 && maxRet?.isNone) then
+          let initMs ← parseNatLitArg pos[0]!; let maxMs ← parseNatLitArg pos[1]!
+          if maxMs < initMs then Macro.throwErrorAt u s!"`reconnect backoff({initMs}, {maxMs})` requires `initialMs <= maxMs`"
+          return .backoff initMs maxMs (← getMax 2)
         Macro.throwErrorAt u "`reconnect backoff(...)` expects `backoff(initialMs, maxMs)` or `backoff(initialMs, maxMs, maxRetries)`"
-    else
-      Macro.throwErrorAt u s!"unknown `reconnect` policy `{fn}`; use `off`, `fixed(...)`, or `backoff(...)`"
-  else
-    Macro.throwErrorAt u "expected `reconnect` policy: `off`, `fixed(ms[, max])`, or `backoff(initMs, maxMs[, max])`"
+    | _ => Macro.throwErrorAt u s!"unknown `reconnect` policy `{fn}`; use `off`, `fixed(...)`, or `backoff(...)`"
+  else Macro.throwErrorAt u "expected `reconnect` policy: `off`, `fixed(ms[, max])`, or `backoff(initMs, maxMs[, max])`"
 
 def Reconnect.toSyntaxTerm : Reconnect → MacroM Term
   | .off => `(Qed.Reconnect.off)
@@ -240,7 +177,7 @@ end ReconnectParser
 
 namespace Server
 
-/-! ## Persistent `external` Service Registry & Shared Command Helpers -/
+/-! ## Persistent `external`, `database` & `auth` Registries and Shared Helpers -/
 
 structure ExternalServiceInfo where
   serviceName : Lean.Name
@@ -249,20 +186,26 @@ structure ExternalServiceInfo where
   methods     : Array Lean.Name
 deriving Inhabited
 
-initialize externalRegistry :
-    Lean.SimplePersistentEnvExtension ExternalServiceInfo (Lean.NameMap ExternalServiceInfo) ←
-  Qed.Diag.mkNameMapExt (·.serviceName)
+initialize externalRegistry : Lean.SimplePersistentEnvExtension ExternalServiceInfo (Lean.NameMap ExternalServiceInfo) ← Qed.Diag.mkNameMapExt (·.serviceName)
+
+private def reservedEnvNames : List String := [
+  "QED_DEPLOY_ENV", "PORT", "HOST", "PATH", "GOOGLE_APPLICATION_CREDENTIALS", "QED_INSECURE_SKIP_TLS_VERIFY",
+  "QED_CA_CERT_FILE", "QED_GCP_TOKEN_URL", "QED_CSP", "QED_RPC_ALLOWED_ORIGINS", "QED_WS_ALLOWED_ORIGINS",
+  "QED_AUTH_SECRET", "QED_AUTH_SECRET_PREV", "QED_AUTH_REQUIRE_EXP", "QED_HOST", "QED_WORKERS",
+  "QED_BLOCKING_THREADS", "QED_RATE_LIMIT_RPS", "QED_RATE_LIMIT_BURST"]
+
+private def isReservedEnvVarName (s : String) : Bool :=
+  let u := s.toUpper
+  reservedEnvNames.contains u || ["K_", "LD_", "SSL_CERT_", "CLOUD_RUN_", "QED_EXT_"].any (u.startsWith ·)
 
 def isValidEnvVarName (s : String) : Bool :=
-  !s.isEmpty && s.toList.all fun c =>
-    ('A' ≤ c && c ≤ 'Z') || ('a' ≤ c && c ≤ 'z') || ('0' ≤ c && c ≤ '9') || c == '_'
+  let isA (c : Char) := ('A' ≤ c && c ≤ 'Z') || ('a' ≤ c && c ≤ 'z') || c == '_'
+  match s.toList with
+  | [] => false
+  | first :: rest => s.length <= 128 && isA first && rest.all (fun c => isA c || ('0' ≤ c && c ≤ '9')) && !isReservedEnvVarName s
 
 def exprCallsOld (stx : Lean.Syntax) : Bool :=
-  Qed.Lang.stxAny (fun s =>
-    s.getKind == ``Qed.Lang.qedCall && (s.getArg 0).getKind == ``Qed.Lang.qedIdent &&
-    ((s.getArg 0).getArg 0).getId.eraseMacroScopes == `old) stx
-
-/-! ## Persistent `database` Schema & Policy Registry (`databaseRegistry`) -/
+  Qed.Lang.stxAny (fun s => s.getKind == ``Qed.Lang.qedCall && (s.getArg 0).getKind == ``Qed.Lang.qedIdent && ((s.getArg 0).getArg 0).getId.eraseMacroScopes == `old) stx
 
 structure DbColumnInfo where
   name         : String
@@ -301,92 +244,56 @@ structure DatabaseInfo where
   tables            : Array DbTableInfo
 deriving Inhabited, Repr
 
-initialize databaseRegistry :
-    Lean.SimplePersistentEnvExtension DatabaseInfo (Lean.NameMap DatabaseInfo) ←
-  Qed.Diag.mkNameMapExt (·.dbName)
-
-def lookupDatabase? (env : Lean.Environment) (currNs : Lean.Name)
-    (openDecls : List Lean.OpenDecl) (dbRef : Lean.Name) : Option DatabaseInfo :=
+initialize databaseRegistry : Lean.SimplePersistentEnvExtension DatabaseInfo (Lean.NameMap DatabaseInfo) ← Qed.Diag.mkNameMapExt (·.dbName)
+abbrev lookupDatabase? (env : Lean.Environment) (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (dbRef : Lean.Name) : Option DatabaseInfo :=
   Qed.Diag.lookupNameMapExt? databaseRegistry env currNs openDecls dbRef (some `config)
 
-/-! ## Persistent `auth` OIDC Configuration Registry (`authRegistry`) -/
-
 structure AuthInfo where
-  authName         : Lean.Name
-  shortName        : String
-  configConst      : Lean.Name
-  secrets          : Array String := #[]
-  spec             : Qed.Auth.OidcAuthSpec := default
+  authName    : Lean.Name
+  shortName   : String
+  configConst : Lean.Name
+  secrets     : Array String := #[]
+  spec        : Qed.Auth.OidcAuthSpec := default
 deriving Inhabited, Repr
 
-initialize authRegistry :
-    Lean.SimplePersistentEnvExtension AuthInfo (Lean.NameMap AuthInfo) ←
-  Qed.Diag.mkNameMapExt (·.authName)
-
-def lookupAuth? (env : Lean.Environment) (currNs : Lean.Name)
-    (openDecls : List Lean.OpenDecl) (authRef : Lean.Name) : Option AuthInfo :=
+initialize authRegistry : Lean.SimplePersistentEnvExtension AuthInfo (Lean.NameMap AuthInfo) ← Qed.Diag.mkNameMapExt (·.authName)
+abbrev lookupAuth? (env : Lean.Environment) (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (authRef : Lean.Name) : Option AuthInfo :=
   Qed.Diag.lookupNameMapExt? authRegistry env currNs openDecls authRef (some `config)
 
-def pushUnique [BEq α] (arr : Array α) (x : α) : Array α :=
-  if arr.contains x then arr else arr.push x
-
-def findNamedArg? (named : Array (String × Lean.Syntax)) (key : String) : Option Lean.Syntax :=
-  (named.find? (·.1 == key)).map Prod.snd
+def findNamedArg? (named : Array (String × Lean.Syntax)) (key : String) : Option Lean.Syntax := (named.find? (·.1 == key)).map Prod.snd
 
 section SyntaxHelpers
 open Lean
 
-def foldProjTerms {m : Type → Type} [Monad m] [MonadQuotation m]
-    (ref : Syntax) (base : Term) (fs : List Name) : m Term :=
+def foldProjTerms {m : Type → Type} [Monad m] [MonadQuotation m] (ref : Syntax) (base : Term) (fs : List Name) : m Term :=
   fs.foldlM (init := base) fun acc f => `(($acc).$(mkIdentFrom ref f):ident)
 
 def mkBoolConj {m : Type → Type} [Monad m] [MonadQuotation m] (terms : Array Term) : m Term :=
-  match terms.toList with
-  | [] => `(true)
-  | t :: rest => rest.foldlM (init := t) fun acc x => `($acc && $x)
+  match terms.toList with | [] => `(true) | t :: rest => rest.foldlM (init := t) fun acc x => `($acc && $x)
 
 def resolveAppTargetIdent (env : Environment) (currNs : Name) (id : Ident) : Ident :=
-  if env.contains (currNs ++ id.getId ++ `app) || env.contains (id.getId ++ `app) then
-    mkIdentFrom id (id.getId ++ `app)
-  else id
+  if env.contains (currNs ++ id.getId ++ `app) || env.contains (id.getId ++ `app) then mkIdentFrom id (id.getId ++ `app) else id
 
-def mkWsDecodeCb {m : Type → Type} [Monad m] [MonadQuotation m]
-    (onOk onStatus : Ident) (mkDec : Ident → m Term) : m Term := do
-  let argId := mkIdent `_wsMsg
-  `(fun $argId:ident => match $(← mkDec argId):term with
-    | Except.ok v    => $onOk v
-    | Except.error e => $onStatus (Qed.SocketStatus.failed e))
+def mkWsDecodeCb {m : Type → Type} [Monad m] [MonadQuotation m] (onOk onStatus : Ident) (mkDec : Ident → m Term) : m Term := do
+  let a := mkIdent `_wsMsg
+  `(fun $a:ident => match $(← mkDec a):term with | Except.ok v => $onOk v | Except.error e => $onStatus (Qed.SocketStatus.failed e))
 
 end SyntaxHelpers
 
 open Lean Elab Command in
-def elabParamTypeAbbrevs (refIdent : Ident) (ownerName fullOwnerName itemName : Name)
-    (suffix : String) (tyTerms : Array Term) : CommandElabM (Array Name) := do
-  let mut consts : Array Name := #[]
-  for (pTy, i) in tyTerms.zipIdx do
+def elabParamTypeAbbrevs (refIdent : Ident) (ownerName fullOwnerName itemName : Name) (suffix : String) (tyTerms : Array Term) : CommandElabM (Array Name) :=
+  tyTerms.zipIdx.mapM fun (pTy, i) => do
     let leaf := itemName.appendAfter s!"{suffix}{i}"
-    let pTyId := mkIdentFrom refIdent (ownerName ++ leaf)
-    elabCommand (← `(command| abbrev $pTyId : Type := $pTy))
-    consts := consts.push (fullOwnerName ++ leaf)
-  return consts
+    elabCommand (← `(command| abbrev $(mkIdentFrom refIdent (ownerName ++ leaf)) : Type := $pTy))
+    return fullOwnerName ++ leaf
 
 open Lean Meta in
-private def mkCharListExpr (s : String) : Expr :=
-  let charTy := mkConst ``Char
-  let nilE := mkApp (mkConst ``List.nil [0]) charTy
-  let consC := mkApp (mkConst ``List.cons [0]) charTy
-  s.toList.foldr (fun c acc => mkApp2 consC (mkApp (mkConst ``Char.ofNat) (mkNatLit c.toNat)) acc) nilE
-
-open Lean Meta in
-/-- Reduces `String.length "literal"` to a `Nat` literal using `String.length_ofList`,
-    shared by `Qed.Server.Invariant` and `Qed.Server.Db.Runtime`. -/
 simproc_decl qedReduceStrLen (String.length _) := fun e => do
   let some (Expr.lit (Literal.strVal s)) := e.getAppArgs[0]? | return .continue
-  let cs := mkCharListExpr s
+  let charTy := mkConst ``Char
+  let cs := s.toList.foldr (fun c acc => mkApp2 (mkApp (mkConst ``List.cons [0]) charTy) (mkApp (mkConst ``Char.ofNat) (mkNatLit c.toNat)) acc) (mkApp (mkConst ``List.nil [0]) charTy)
   let nExpr := mkNatLit s.length
-  let prf ← mkEqTrans (mkApp (mkConst ``String.length_ofList) cs) (← mkEqRefl nExpr)
-  return .done { expr := nExpr, proof? := some prf }
+  return .done { expr := nExpr, proof? := some (← mkEqTrans (mkApp (mkConst ``String.length_ofList) cs) (← mkEqRefl nExpr)) }
 
 end Server
-
 end Qed

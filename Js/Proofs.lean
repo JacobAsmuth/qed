@@ -1,17 +1,9 @@
-import Js.Proofs.Core
-import Js.Proofs.Semantics
 import Js.Proofs.SimIJ
 import Js.Proofs.SimJI
 
 namespace Js.Proofs
-
 open Lean IR
 
-/-!
-# End-to-End Semantics-Preservation & Hygiene Theorems for `Js.Backend`
--/
-
-/-- End-to-end statement/body lowering equivalence (both directions modulo fuel) covering all `FnBody` constructs. -/
 theorem lowerBody_equiv (prog : IrProg) (c0 c : Ctx) (jsProg : JsProg) (revName : String → Option Name) (hprog : ProgLowered prog c0 jsProg revName)
     (inlineJps recJps : List (Nat × Nat)) (allowTailCont : Bool) (b : FnBody) (irSt : IrState) (jsSt : JsState) (hnames : c.names = c0.names) (hmin : c.min = c0.min) (henv : c.env = c0.env)
     (hself : ∀ sf, c.selfFn = some sf → prog sf ≠ none ∧ c.selfParams.size > 0 ∧ (c.selfParams.toList.map (·.x.idx)).Nodup)
@@ -21,7 +13,6 @@ theorem lowerBody_equiv (prog : IrProg) (c0 c : Ctx) (jsProg : JsProg) (revName 
   ⟨fun fuel _ _ h => (eval_sim_ir_to_js prog c0 jsProg revName hprog fuel).2.2 c inlineJps recJps allowTailCont b irSt jsSt _ _ hnames hmin henv hself hwf hsm h,
    fun fuel _ _ h => (eval_sim_js_to_ir prog c0 jsProg revName hprog fuel).2.2 c inlineJps recJps allowTailCont b irSt jsSt _ _ hnames hmin henv hself hwf hsm h⟩
 
-/-- End-to-end whole-declaration compilation equivalence (both directions modulo fuel), including `fnPlain`, `fnDirectLoop`, `fnTrampoline`, `memoThunk`, and `memoInit`. -/
 theorem lowerDecl_equiv (prog : IrProg) (c0 : Ctx) (jsProg : JsProg) (revName : String → Option Name) (hprog : ProgLowered prog c0 jsProg revName)
     (h : CowHeap JsVal) (mIr : Name → MemoCell JsVal) (f : Name) (args : List JsVal) (jsSt : JsState)
     (hf : prog f ≠ none) (hhp : h = jsSt.heap) (hmEq : ∀ g, prog g ≠ none → mIr g = jsSt.memos (c0.js g)) (hmNo : ∀ g, (mIr g).val.elim True JsVal.noTc)
@@ -31,7 +22,6 @@ theorem lowerDecl_equiv (prog : IrProg) (c0 : Ctx) (jsProg : JsProg) (revName : 
   ⟨fun fuel _ _ _ hir => (eval_sim_ir_to_js prog c0 jsProg revName hprog fuel).1 h mIr f args jsSt _ _ _ hf hhp hmEq hmNo hargs hfns hir,
    fun fuel _ _ hjs => (eval_sim_js_to_ir prog c0 jsProg revName hprog fuel).1 h mIr f args jsSt _ _ hf hhp hmEq hmNo hargs hfns hjs⟩
 
-/-- End-to-end RC projection ref-transfer prefix equivalence bridging `collectProjSrc_subset_collectNonArr`, `hasDecOf_sound`, `collectNonArr_sound`, and `projRefTransfer_cowHeap_equiv`. -/
 theorem projTransfer_prefix_equiv (root cont : FnBody) (x : VarId) (p n id : Nat)
     (hsrc : (collectProjSrc {} {} root).get? x.idx = some p) (hdec : hasDecOf p cont = true) (hn : n ≥ 1) (ρ : Nat → RcVal) (hcon : NonArrConsistent ρ root) (h : CowHeap α) :
     ((collectNonArr {} root).contains p = true) ∧ DropsVar p cont ∧ (∀ m, h.rcInc (ρ p) m = h ∧ h.rcDec (ρ p) m = h) ∧

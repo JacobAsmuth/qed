@@ -1,10 +1,8 @@
 import Qed
+import Tests.CheckHelper
 open Qed
 
 namespace CssChecks
-
-/-! ## 1. First-class `theme` with Typed Tokens, Dark Mode, Resets & WCAG Contrast Proofs -/
-
 theme AppTheme:
   color brand   = #0055aa
   color surface = #ffffff
@@ -27,22 +25,14 @@ theme AppTheme:
   invariant textReadable:  contrast(text, surface) >= 4.5
   invariant brandReadable: contrast(brand, surface) >= 4.5
   invariant mutedReadable: contrast(muted, surface) >= 4.5
-
-#guard ["brand", "space-md"].all AppTheme.theme.definedTokens.contains &&
-  AppTheme.theme.darkComplete && AppTheme.style.isGlobal &&
-  [":root {", "@media (prefers-color-scheme: dark)", "[data-theme=\"dark\"]",
-   ":where(*) { box-sizing: border-box; margin: 0; }"].all (AppTheme.style.raw.contains ·)
-
--- WCAG contrast checks fail at compile time with exact ratio diagnostics
-/-- error: WCAG contrast invariant `badContrast` failed in light mode: contrast(fg=#777777, bg=#ffffff) is 4.47:1, required >= 4.50:1 -/
-#guard_msgs in
+#guard ["brand", "space-md"].all AppTheme.theme.definedTokens.contains && AppTheme.theme.darkComplete && AppTheme.style.isGlobal &&
+  [":root {", "@media (prefers-color-scheme: dark)", "[data-theme=\"dark\"]", ":where(*) { box-sizing: border-box; margin: 0; }"].all (AppTheme.style.raw.contains ·)
+expect_err "WCAG contrast invariant `badContrast` failed in light mode: contrast(fg=#777777, bg=#ffffff) is 4.47:1, required >= 4.50:1" in
 theme BadLightTheme:
   color fg = #777777
   color bg = #ffffff
   invariant badContrast: contrast(fg, bg) >= 4.5
-
-/-- error: WCAG contrast invariant `badDark` failed in dark mode: contrast(fg=#222222, bg=#111111) is 1.18:1, required >= 4.50:1 -/
-#guard_msgs in
+expect_err "WCAG contrast invariant `badDark` failed in dark mode: contrast(fg=#222222, bg=#111111) is 1.18:1, required >= 4.50:1" in
 theme BadDarkTheme:
   color fg = #111111
   color bg = #ffffff
@@ -50,9 +40,6 @@ theme BadDarkTheme:
     color fg = #222222
     color bg = #111111
   invariant badDark: contrast(fg, bg) >= 4.5
-
-/-! ## 2. First-class `keyframes` -/
-
 keyframes fadeIn:
   from:
     opacity: 0
@@ -60,11 +47,7 @@ keyframes fadeIn:
   to:
     opacity: 1
     transform: translateY(0)
-
 #guard fadeIn.rule == "@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }"
-
-/-! ## 3. First-class `style` DSL, Nesting, Option A `extends`, & `strict_tokens` -/
-
 style baseBtn:
   display: inline-flex
   align-items: center
@@ -77,7 +60,6 @@ style baseBtn:
     opacity: 0.9
   &:focus-visible:
     outline: 2px solid AppTheme.brand
-
 style primaryBtn extends baseBtn:
   background-color: AppTheme.brand
   color: #ffffff
@@ -88,7 +70,6 @@ style primaryBtn extends baseBtn:
     transform: translateY(-1px)
   @media (max-width: 600px):
     width: 100%
-
 style strictCard strict_tokens:
   padding: AppTheme.spaceMd
   background-color: AppTheme.surface
@@ -96,48 +77,17 @@ style strictCard strict_tokens:
   border-radius: AppTheme.radius
   margin: 0 auto
   max-width: 100%
-
 #guard baseBtn.className.startsWith "qed-baseBtn-" && primaryBtn.className.startsWith "qed-primaryBtn-" &&
-  (["background-color: var(--brand);", "border: 1px solid var(--brand);",
-    "&:hover { opacity: 1; transform: translateY(-1px); }",
-    "@media (max-width: 600px) { width: 100%; }"].all (primaryBtn.raw.contains ·)) &&
-  !primaryBtn.raw.contains "#d1d5db" &&
-  primaryBtn.extraRules.any (·.contains "@keyframes fadeIn") &&
+  ["background-color: var(--brand);", "border: 1px solid var(--brand);", "&:hover { opacity: 1; transform: translateY(-1px); }",
+   "@media (max-width: 600px) { width: 100%; }"].all (primaryBtn.raw.contains ·) &&
+  !primaryBtn.raw.contains "#d1d5db" && primaryBtn.extraRules.any (·.contains "@keyframes fadeIn") &&
   ["brand", "space-md"].all primaryBtn.usedTokens.contains
-
--- Compile-time CSS validation error checks
-/-- error: unknown CSS property `border-raduis` (did you mean `border-radius`?) -/
-#guard_msgs in
-style badPropTypo:
-  border-raduis: 8px
-
-/-- error: type mismatch in CSS `padding`: token `CssChecks.AppTheme.brand` has kind `color`, expected `len` -/
-#guard_msgs in
-style badTokenType:
-  padding: AppTheme.brand
-
-/-- error: in `color`: invalid hex color `#xyz` (expected 3, 4, 6, or 8 hex digits, e.g. `#06c` or `#2563eb`) -/
-#guard_msgs in
-style badHexLit:
-  color: #xyz
-
-/-- error: in `color`: `rgb(300, 0, 0)`: channel value `300` is out of range (must be 0..255) -/
-#guard_msgs in
-style badRgbLit:
-  color: rgb(300, 0, 0)
-
-/-- error: `strict_tokens` violation on `color`: raw color `#ffffff` is disallowed; use a `theme` color token instead -/
-#guard_msgs in
-style badStrictColor strict_tokens:
-  color: #ffffff
-
-/-- error: `strict_tokens` violation on `padding`: raw length `12px` is disallowed; use a `theme` length token instead -/
-#guard_msgs in
-style badStrictLen strict_tokens:
-  padding: 12px
-
-/-! ## 4. Modern CSS Features, Safe Dynamic Inline Styles & `Theme.render` At-Rules -/
-
+bad_style "unknown CSS property `border-raduis` (did you mean `border-radius`?)" badPropTypo : border-raduis: 8px
+bad_style "type mismatch in CSS `padding`: token `CssChecks.AppTheme.brand` has kind `color`, expected `len`" badTokenType : padding: AppTheme.brand
+bad_style "in `color`: invalid hex color `#xyz`" badHexLit : color: #xyz
+bad_style "in `color`: `rgb(300, 0, 0)`: channel value `300` is out of range (must be 0..255)" badRgbLit : color: rgb(300, 0, 0)
+bad_style_strict "`strict_tokens` violation on `color`: raw color `#ffffff` is disallowed" badStrictColor : color: #ffffff
+bad_style_strict "`strict_tokens` violation on `padding`: raw length `12px` is disallowed" badStrictLen : padding: 12px
 style modernStyle:
   box-sizing: border-box
   flex-wrap: wrap
@@ -151,21 +101,14 @@ style modernStyle:
   background-color: rgb(255, 255, 255)
   @media (prefers-color-scheme: dark):
     background-color: #111827
-
 #guard ["box-sizing: border-box;", "min-height: 100dvh;", "clamp(20rem, 50vw, 45rem)",
    "oklch(0.6 0.15 250)", "@media (prefers-color-scheme: dark)"].all (modernStyle.raw.contains ·)
-
-/-- error: unknown style `noSuchStyle` in `extends` (declare it with `style noSuchStyle:`) -/
-#guard_msgs in
+expect_err "unknown style `noSuchStyle` in `extends`" in
 style badExtends extends noSuchStyle:
   color: #ffffff
-
 #guard let r := renderThemeRule (.nest "@media (prefers-color-scheme: dark)" [color (hex "fff")])
   !r.contains ":where(" && r.contains "@media (prefers-color-scheme: dark)" &&
   ["<", "\"", "/*"].all (!(inlineStyleStr [background "red\" onclick=\"x\"/*evil*/</style>"]).contains ·)
-
-/-! ## 5. Component-Colocated `style`, `stylesheet`, Discovery & Invariants -/
-
 component StyledCard:
   prop title : String
   style wrapper:
@@ -174,7 +117,6 @@ component StyledCard:
     color: AppTheme.text
     border-radius: AppTheme.radius
   view: <article {wrapper}><h2>{title}</h2></article>
-
 component StyledShowcase:
   stylesheet "app.css"
   state active   : Bool = false
@@ -195,37 +137,19 @@ component StyledShowcase:
   action toggle: active = not active
   invariant activeValid: roleHasOneOf("toggle", [pillActive, pill])
   invariant exclusive:   noConflictingStyles([pillActive, pill])
-  view:
-    <div {shell}>
-      <StyledCard title="Verified CSS"/>
-      <button role="toggle" {pillActive if active else pill} onClick={.toggle}>Toggle</button>
-      <div {progressBox} {inlineStyle([width(pct(progress))])} {styleVars([cssVar(AppTheme.brand, hex("0055aa"))])}>
-        Progress: {progress}%
-      </div>
-    </div>
-
+  view: <div {shell}><StyledCard title="Verified CSS"/><button role="toggle" {pillActive if active else pill} onClick={.toggle}>Toggle</button><div {progressBox} {inlineStyle([width(pct(progress))])} {styleVars([cssVar(AppTheme.brand, hex("0055aa"))])}>Progress: {progress}%</div></div>
 #guard let css := renderStyleSheet StyledShowcase.app.styles
-  [":root {", "@media (prefers-color-scheme: dark)", StyledCard.wrapper.className,
-   StyledShowcase.shell.className, StyledShowcase.pillActive.className,
-   "border-radius: 999px;", "padding: 0.5rem; margin-top: 1rem;"].all (css.contains ·) &&
+  [":root {", "@media (prefers-color-scheme: dark)", StyledCard.wrapper.className, StyledShowcase.shell.className,
+   StyledShowcase.pillActive.className, "border-radius: 999px;", "padding: 0.5rem; margin-top: 1rem;"].all (css.contains ·) &&
   StyledShowcase.app.stylesheets == ["/app.css"] &&
   (renderDocument "Demo" "" (stylesheets := StyledShowcase.app.stylesheets)).contains "<link rel=\"stylesheet\" href=\"/app.css\">" &&
   (StyledShowcase.app.ssrStep "/" "Demo" "/qed.js" "").contains "/app.css"
-
-/-! ## 6. Kernel-Verified Theme Completeness (`verify_theme`) -/
-
 verify_theme AppTheme for StyledShowcase.app
-
 theme OtherTheme:
   color doesNotExist = #123456
-
 style orphanStyle:
   color: OtherTheme.doesNotExist
-
-/-- error: theme `AppTheme` does not define all CSS tokens used by `[orphanStyle]`.
-  Missing tokens: ["does-not-exist"]
-Add them to `theme AppTheme:`. -/
-#guard_msgs in
+expect_err "theme `AppTheme` does not define all CSS tokens used by `[orphanStyle]`.\n  Missing tokens: [\"does-not-exist\"]" in
 verify_theme AppTheme for [orphanStyle]
 
 end CssChecks

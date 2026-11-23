@@ -2,14 +2,11 @@ import Qed
 import Tests.ServerChecks
 
 namespace WebEssentialsFixture
-
 inductive TestRoute where | home | old | missing deriving Inhabited, DecidableEq
-
 instance : Qed.Router TestRoute where
   print | .home => [] | .old => ["old"] | .missing => ["missing"]
   parse | [] => some .home | ["old"] => some .old | _ => some .missing
   round_trip r := by cases r <;> rfl
-
 component RoutedSite:
   route : TestRoute = .home
   head:
@@ -26,7 +23,6 @@ component RoutedSite:
       title       "404 Not Found"
       description "Missing page"
   view: <main>ok</main>
-
 fullstack WebEssentialsApp:
   server ServerChecks.WebEssentialsSrv
   client RoutedSite

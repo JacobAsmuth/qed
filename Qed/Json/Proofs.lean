@@ -2,21 +2,31 @@ import Qed.Json.Basic
 
 namespace Qed
 
-set_option hygiene false in
-local macro "peel_ok" : tactic =>
-  `(tactic| repeat (any_goals first
-    | (cases h; exact Nat.zero_le _)
-    | (cases h; exact Nat.succ_le_succ (Nat.zero_le _))
-    | (cases h; done)
-    | split at h))
+private theorem map_ok {x : Except String α} {f : α → β} {y : β} (h : x.map f = .ok y) : ∃ a, x = .ok a ∧ f a = y := by
+  cases x with | error _ => cases h | ok a => exact ⟨a, rfl, Except.ok.inj h⟩
+private theorem bind_ok {x : Except String α} {f : α → Except String β} {y : β} (h : x.bind f = .ok y) : ∃ a, x = .ok a ∧ f a = .ok y := by
+  cases x with | error _ => cases h | ok a => exact ⟨a, rfl, h⟩
 
-set_option hygiene false in
-local macro "peel_cons" ihH:ident ihT:ident : tactic =>
-  `(tactic| (
-    · cases h; intro _ hm; rcases List.mem_cons.mp hm with rfl | hm
-      · exact $ihH _ _ _ _ ‹_›
-      · exact $ihT _ _ _ _ ‹_› _ hm
-    · cases h; intro _ hm; rcases List.mem_singleton.mp hm with rfl; exact $ihH _ _ _ _ ‹_›))
+private theorem parseContainer_depth {α : Type} {close : Char} {empty : Json} {wrap : α → Json}
+    {pItems : Nat → List Char → Except String (α × List Char)} {budget : Nat} {cs : List Char} {j : Json} {r : List Char}
+    (he : empty.depth ≤ 1) (hw : ∀ b xs r', pItems b r' = .ok (xs, r) → (wrap xs).depth ≤ b + 1)
+    (h : parseContainer close empty wrap pItems budget cs = .ok (j, r)) : j.depth ≤ budget := by
+  cases budget with | zero => cases h | succ b =>
+    dsimp only [parseContainer] at h; cases hws : skipWs cs with | nil => rw [hws] at h; cases h | cons c r' =>
+      rw [hws] at h; dsimp only at h; split at h
+      · cases h; omega
+      · obtain ⟨⟨xs, _⟩, hx, heq⟩ := map_ok h; cases heq; exact hw b xs _ hx
+
+private theorem parseSep_depth {α : Type} {P : α → Prop} {close : Char} {err : String}
+    {step : List Char → Except String (α × List Char)} {rec : List Char → Except String (List α × List Char)}
+    {cs : List Char} {xs : List α} {r : List Char}
+    (hs : ∀ cs v r', step cs = .ok (v, r') → P v) (hr : ∀ cs ys r', rec cs = .ok (ys, r') → ∀ y ∈ ys, P y)
+    (h : parseSep close err step rec cs = .ok (xs, r)) : ∀ x ∈ xs, P x := by
+  obtain ⟨⟨v, r1⟩, hv, h⟩ := bind_ok h; dsimp only at h
+  cases hws : skipWs r1 with | nil => rw [hws] at h; cases h | cons c r' =>
+    rw [hws] at h; dsimp only at h; split at h
+    · obtain ⟨⟨vs, _⟩, hvs, heq⟩ := map_ok h; cases heq; exact fun x hm => (List.mem_cons.1 hm).elim (fun e => e ▸ hs _ _ _ hv) (hr _ _ _ hvs x)
+    · split at h <;> cases h; exact fun x hm => List.mem_singleton.1 hm ▸ hs _ _ _ hv
 
 private theorem parseDepth_le_all (fuel : Nat) :
     (∀ budget cs j r, parseVal fuel budget cs = .ok (j, r) → j.depth ≤ budget) ∧
@@ -25,399 +35,210 @@ private theorem parseDepth_le_all (fuel : Nat) :
   induction fuel with
   | zero => exact ⟨(fun _ _ _ _ h => nomatch h), (fun _ _ _ _ h => nomatch h), (fun _ _ _ _ h => nomatch h)⟩
   | succ f ih =>
-      obtain ⟨ihV, ihE, ihM⟩ := ih
-      refine ⟨?_, ?_, ?_⟩
+      obtain ⟨ihV, ihE, ihM⟩ := ih; refine ⟨?_, ?_, ?_⟩
       · intro budget cs j r h
-        dsimp only [parseVal, bind, Except.bind, pure, Except.pure] at h; peel_ok
-        · cases h; have := Json.maxArr_le_iff.mpr (ihE _ _ _ _ ‹_›); simp only [Json.depth]; omega
-        · cases h; have := Json.maxObj_le_iff.mpr (ihM _ _ _ _ ‹_›); simp only [Json.depth]; omega
-      · intro budget cs es r h
-        dsimp only [parseElems, bind, Except.bind, pure, Except.pure] at h; peel_ok
-        peel_cons ihV ihE
+        dsimp only [parseVal] at h; cases hws : skipWs cs with | nil => rw [hws] at h; cases h | cons c r' =>
+          rw [hws] at h; dsimp only at h
+          split at h; · obtain ⟨⟨_, _⟩, _, heq⟩ := map_ok h; cases heq; exact Nat.zero_le _
+          split at h; · exact parseContainer_depth (by decide) (fun _ _ _ hx => by have := Json.maxArr_le_iff.2 (ihE _ _ _ _ hx); simp only [Json.depth]; omega) h
+          split at h; · exact parseContainer_depth (by decide) (fun _ _ _ hx => by have := Json.maxObj_le_iff.2 (ihM _ _ _ _ hx); simp only [Json.depth]; omega) h
+          split at h; · obtain ⟨⟨_, _⟩, _, heq⟩ := map_ok h; cases heq; exact Nat.zero_le _
+          unfold parseLit at h; split at h <;> cases h <;> exact Nat.zero_le _
+      · exact fun b _ _ _ h => parseSep_depth (P := fun e => e.depth ≤ b) (ihV b) (ihE b) h
       · intro budget cs ms r h
-        dsimp only [parseMembers, bind, Except.bind, pure, Except.pure] at h; peel_ok
-        peel_cons ihV ihM
+        refine parseSep_depth (P := fun kv : String × Json => kv.2.depth ≤ budget) (fun cs kv r' hs => ?_) (ihM budget) h
+        dsimp only [parseMember] at hs; cases hws : skipWs cs with | nil => rw [hws] at hs; cases hs | cons _ _ =>
+          rw [hws] at hs; dsimp only at hs; split at hs <;> try cases hs
+          obtain ⟨⟨_, r1⟩, _, hs⟩ := bind_ok hs; dsimp only at hs
+          cases hws1 : skipWs r1 with | nil => rw [hws1] at hs; cases hs | cons _ _ =>
+            rw [hws1] at hs; dsimp only at hs; split at hs <;> try cases hs
+            obtain ⟨⟨v, _⟩, hv, heq⟩ := map_ok hs; cases heq; exact ihV budget _ _ _ hv
 
-theorem parseVal_depth_le (fuel budget : Nat) (cs : List Char) (j : Json) (r : List Char)
-    (h : parseVal fuel budget cs = .ok (j, r)) : j.depth ≤ budget :=
-  (parseDepth_le_all fuel).1 budget cs j r h
+theorem parse_depth_le (s : String) (maxDepth : Nat) (j : Json) (h : parse s maxDepth = .ok j) : j.depth ≤ maxDepth := by
+  obtain ⟨⟨j0, r⟩, hval, h⟩ := bind_ok h; dsimp only at h; split at h <;> cases h; exact (parseDepth_le_all _).1 maxDepth _ _ _ hval
 
-theorem parse_depth_le (s : String) (maxDepth : Nat) (j : Json) :
-    parse s maxDepth = .ok j → j.depth ≤ maxDepth := by
-  intro h
-  simp only [parse] at h
-  split at h
-  · simp at h
-  · rename_i j0 r heq
-    split at h
-    · cases h; exact parseVal_depth_le _ maxDepth _ _ _ heq
-    · contradiction
+private theorem digit_spec_fin : ∀ k : Fin 10, (Char.ofNat ('0'.toNat + k.val)).toNat - '0'.toNat = k.val ∧ isDigit (Char.ofNat ('0'.toNat + k.val)) = true := by decide
 
-private theorem digit_spec_fin : ∀ k : Fin 10,
-    (Char.ofNat ('0'.toNat + k.val)).toNat - '0'.toNat = k.val
-    ∧ isDigit (Char.ofNat ('0'.toNat + k.val)) = true := by decide
-
-theorem digit_spec (k : Nat) (h : k < 10) :
-    (Char.ofNat ('0'.toNat + k)).toNat - '0'.toNat = k
-    ∧ isDigit (Char.ofNat ('0'.toNat + k)) = true :=
-  digit_spec_fin ⟨k, h⟩
-
-theorem natDigitsAux_append (n : Nat) : ∀ acc : List Char,
-    natDigitsAux n acc = natDigitsAux n [] ++ acc := by
+private theorem natDigitsAux_append (n : Nat) : ∀ acc : List Char, natDigitsAux n acc = natDigitsAux n [] ++ acc := by
   induction n using Nat.strongRecOn with
   | _ n ih =>
-    intro acc
-    rw [natDigitsAux.eq_def (acc := acc), natDigitsAux.eq_def (acc := [])]
+    intro acc; rw [natDigitsAux.eq_def (acc := acc), natDigitsAux.eq_def (acc := [])]
     by_cases h : n < 10
     · simp [h]
-    · simp only [if_neg h]
-      rw [ih (n / 10) (by omega), ih (n / 10) (by omega) [_]]
-      simp
+    · simp only [if_neg h]; rw [ih (n / 10) (by omega), ih (n / 10) (by omega) [_]]; simp
 
-theorem natDigits_unfold (n : Nat) :
-    natDigitsAux n [] = (if n < 10 then [] else natDigitsAux (n / 10) [])
-                        ++ [Char.ofNat ('0'.toNat + n % 10)] := by
-  rw [natDigitsAux.eq_def]
-  by_cases h : n < 10
-  · simp [h]
-  · simp only [if_neg h]
-    exact natDigitsAux_append (n / 10) [_]
-
-theorem natDigits_ne_nil (n : Nat) : natDigitsAux n [] ≠ [] := by
-  rw [natDigits_unfold]; simp
-
-theorem natDigits_digit (n : Nat) : ∀ c ∈ natDigitsAux n [], isDigit c = true := by
+private theorem natDigits_spec (n : Nat) :
+    natDigitsAux n [] ≠ [] ∧ (∀ c ∈ natDigitsAux n [], isDigit c = true) ∧ (natDigitsAux n []).foldl (fun acc c => acc * 10 + (c.toNat - '0'.toNat)) 0 = n := by
   induction n using Nat.strongRecOn with
   | _ n ih =>
-    rw [natDigits_unfold]
-    intro c hc
-    rw [List.mem_append] at hc
-    cases hc with
-    | inr h =>
-        rw [List.mem_singleton] at h; subst h
-        exact (digit_spec _ (Nat.mod_lt _ (by omega))).2
-    | inl h =>
-        by_cases h10 : n < 10
-        · simp [h10] at h
-        · exact ih (n / 10) (by omega) c (by simpa [h10] using h)
+    have hunf : natDigitsAux n [] = (if n < 10 then [] else natDigitsAux (n / 10) []) ++ [Char.ofNat ('0'.toNat + n % 10)] := by
+      rw [natDigitsAux.eq_def]; by_cases h : n < 10
+      · simp [h]
+      · simp only [if_neg h]; exact natDigitsAux_append (n / 10) [_]
+    rw [hunf]; have hd := digit_spec_fin ⟨n % 10, Nat.mod_lt _ (by omega)⟩
+    refine ⟨by simp, fun c hc => (List.mem_append.1 hc).elim (fun h => if h10 : n < 10 then by simp [h10] at h else (ih (n / 10) (by omega)).2.1 c (by simpa [h10] using h)) (fun h => List.mem_singleton.1 h ▸ hd.2), ?_⟩
+    rw [List.foldl_append]; by_cases h : n < 10
+    · simp only [if_pos h, List.foldl_nil, List.foldl_cons, hd.1]; omega
+    · simp only [if_neg h, List.foldl_cons, List.foldl_nil, (ih (n / 10) (by omega)).2.2, hd.1]; omega
 
-theorem foldl_natDigits (n : Nat) :
-    (natDigitsAux n []).foldl (fun acc c => acc * 10 + (c.toNat - '0'.toNat)) 0 = n := by
-  induction n using Nat.strongRecOn with
-  | _ n ih =>
-    rw [natDigits_unfold, List.foldl_append]
-    by_cases h : n < 10
-    · simp only [if_pos h, List.foldl_nil, List.foldl_cons]
-      rw [(digit_spec _ (Nat.mod_lt _ (by omega))).1]
-      omega
-    · simp only [if_neg h, List.foldl_cons, List.foldl_nil]
-      rw [ih (n / 10) (by omega), (digit_spec _ (Nat.mod_lt _ (by omega))).1]
-      omega
-
-theorem digitsToInt_natDigits (n : Nat) : digitsToInt (natDigitsAux n []) = (n : Int) := by
-  rw [digitsToInt, foldl_natDigits]
-
-def numDelim : List Char → Bool
-  | []     => true
-  | c :: _ => !(isDigit c || c == '.' || c == 'e' || c == 'E')
-
-theorem takeDigits_cons_not {c : Char} {t : List Char} (h : isDigit c = false) :
-    takeDigits (c :: t) = ([], c :: t) := by
-  simp [takeDigits, h]
-
-theorem takeDigits_stop {cs : List Char} (h : numDelim cs = true) :
-    takeDigits cs = ([], cs) := by
-  match cs with
-  | [] => rfl
-  | c :: t =>
-      simp only [numDelim, Bool.not_eq_true', Bool.or_eq_false_iff] at h
-      exact takeDigits_cons_not h.1.1.1
-
-theorem takeDigits_append (ds : List Char) (hds : ∀ c ∈ ds, isDigit c = true)
-    (rest : List Char) (hrest : takeDigits rest = ([], rest)) :
-    takeDigits (ds ++ rest) = (ds, rest) := by
-  induction ds with
-  | nil => simpa using hrest
-  | cons c t ih =>
-      have hc : isDigit c = true := hds c (by simp)
-      have ht := ih (fun x hx => hds x (by simp [hx]))
-      simp [takeDigits, hc, ht]
-
-theorem natDigits_cons (m : Nat) :
-    ∃ c t, natDigitsAux m [] = c :: t ∧ isDigit c = true := by
-  match h : natDigitsAux m [] with
-  | [] => exact absurd h (natDigits_ne_nil m)
-  | c :: t => exact ⟨c, t, rfl, natDigits_digit m c (h ▸ List.mem_cons_self ..)⟩
-
-private theorem isDigit_ne {c t : Char} (hc : isDigit c = true) (ht : isDigit t = false) : c ≠ t :=
-  fun e => by subst e; simp [hc] at ht
-
+private def numDelim : List Char → Bool | [] => true | c :: _ => !(isDigit c || c == '.' || c == 'e' || c == 'E')
+private theorem takeDigits_stop {cs : List Char} (h : numDelim cs = true) : takeDigits cs = ([], cs) := by
+  cases cs with | nil => rfl | cons c t => simp only [numDelim, Bool.not_eq_true', Bool.or_eq_false_iff] at h; simp [takeDigits, h.1.1.1]
+private theorem takeDigits_append : ∀ (ds : List Char), (∀ c ∈ ds, isDigit c = true) → ∀ rest, takeDigits rest = ([], rest) → takeDigits (ds ++ rest) = (ds, rest)
+  | [], _, _, hr => hr | c :: t, hd, r, hr => by simp [takeDigits, hd c (by simp), takeDigits_append t (fun x hx => hd x (by simp [hx])) r hr]
+private theorem isDigit_ne {c t : Char} (hc : isDigit c = true) (ht : isDigit t = false) : c ≠ t := fun e => by subst e; simp [hc] at ht
 private theorem isDigit_not_ws {c : Char} (h : isDigit c = true) : isWs c = false := by
-  simp only [isWs, Bool.or_eq_false_iff, beq_eq_false_iff_ne]
-  exact ⟨⟨⟨isDigit_ne h (by decide), isDigit_ne h (by decide)⟩, isDigit_ne h (by decide)⟩, isDigit_ne h (by decide)⟩
-
-theorem numDelim_head {c : Char} {t : List Char} (h : numDelim (c :: t) = true) :
-    isDigit c = false ∧ c ≠ '.' ∧ c ≠ 'e' ∧ c ≠ 'E' := by
-  simp only [numDelim, Bool.not_eq_true', Bool.or_eq_false_iff, beq_eq_false_iff_ne] at h
-  exact ⟨h.1.1.1, h.1.1.2, h.1.2, h.2⟩
+  simp only [isWs, Bool.or_eq_false_iff, beq_eq_false_iff_ne]; exact ⟨⟨⟨isDigit_ne h rfl, isDigit_ne h rfl⟩, isDigit_ne h rfl⟩, isDigit_ne h rfl⟩
 
 private theorem intCharsL_cases (i : Int) (tail : List Char) :
     (i < 0 ∧ intCharsL i ++ tail = '-' :: (natDigitsAux i.natAbs [] ++ tail)) ∨
-    (¬ i < 0 ∧ ∃ c t, intCharsL i ++ tail = c :: (t ++ tail) ∧
-      natDigitsAux i.natAbs [] = c :: t ∧ isDigit c = true) := by
+    (¬ i < 0 ∧ ∃ c t, intCharsL i ++ tail = c :: (t ++ tail) ∧ natDigitsAux i.natAbs [] = c :: t ∧ isDigit c = true) := by
   by_cases hi : i < 0
   · exact .inl ⟨hi, by simp [intCharsL, hi]⟩
-  · obtain ⟨c, t, h0, hc⟩ := natDigits_cons i.natAbs
-    exact .inr ⟨hi, c, t, by simp [intCharsL, hi, h0], h0, hc⟩
+  · match h0 : natDigitsAux i.natAbs [] with
+    | [] => exact absurd h0 (natDigits_spec _).1
+    | c :: t => exact .inr ⟨hi, c, t, by simp [intCharsL, hi, h0], rfl, (natDigits_spec _).2.1 c (h0 ▸ List.mem_cons_self ..)⟩
 
-theorem parseNum_render (n : JsonNumber) (rest : List Char) (hr : numDelim rest = true) :
+private theorem parseSigned_intCharsL (allowPlus : Bool) (i : Int) (tail : List Char) (hstop : takeDigits tail = ([], tail)) :
+    parseSigned allowPlus (intCharsL i ++ tail) = (if i < 0 then -1 else 1, natDigitsAux i.natAbs [], tail) := by
+  have htd := takeDigits_append _ (natDigits_spec i.natAbs).2.1 _ hstop
+  unfold parseSigned
+  rcases intCharsL_cases i tail with ⟨hi, h⟩ | ⟨hi, c, t, h, h0, hc⟩
+  · rw [h]; simp only [hi, beq_self_eq_true, ↓reduceIte, htd]
+  · rw [h]; dsimp only
+    simp only [hi, beq_eq_false_iff_ne.2 (isDigit_ne hc rfl : c ≠ '-'), beq_eq_false_iff_ne.2 (isDigit_ne hc rfl : c ≠ '+'), Bool.and_false, Bool.false_eq_true, ↓reduceIte]
+    rw [← List.cons_append, ← h0, htd]
+
+private theorem parseNum_render (n : JsonNumber) (rest : List Char) (hr : numDelim rest = true) :
     parseNum (Json.renderNumL n ++ rest) = .ok (n, rest) := by
   obtain ⟨m, ex⟩ := n
   let tail := (if ex == 0 then [] else 'e' :: intCharsL ex) ++ rest
-  have htailStop : takeDigits tail = ([], tail) := by
+  have hd (i : Int) : digitsToInt (natDigitsAux i.natAbs []) = (i.natAbs : Int) := congrArg Nat.cast (natDigits_spec i.natAbs).2.2
+  have htail : takeDigits tail = ([], tail) ∧ parseFrac tail = ([], tail) ∧ parseExp tail = (ex, rest) := by
     by_cases hex : ex = 0
-    · simp only [tail, hex, beq_self_eq_true, ↓reduceIte, List.nil_append]; exact takeDigits_stop hr
-    · simp only [tail, beq_eq_false_iff_ne.2 hex, Bool.false_eq_true, ↓reduceIte, List.cons_append]
-      exact takeDigits_cons_not (by decide)
-  have htd := takeDigits_append _ (natDigits_digit m.natAbs) _ htailStop
-  have hne : (natDigitsAux m.natAbs []).isEmpty = false := List.isEmpty_eq_false_iff.mpr (natDigits_ne_nil _)
+    · subst hex; have ht : tail = rest := by simp [tail]
+      rw [ht]; refine ⟨takeDigits_stop hr, ?_, ?_⟩ <;> (cases rest with | nil => rfl | cons c t => simp only [numDelim, Bool.not_eq_true', Bool.or_eq_false_iff] at hr; simp [parseFrac, parseExp, hr.1.1.2, hr.1.2, hr.2])
+    · have ht : tail = 'e' :: (intCharsL ex ++ rest) := by simp [tail, beq_eq_false_iff_ne.2 hex]
+      rw [ht]; refine ⟨by simp [takeDigits, isDigit], rfl, ?_⟩
+      simp only [parseExp, beq_self_eq_true, Bool.true_or, ↓reduceIte, parseSigned_intCharsL true ex rest (takeDigits_stop hr), hd]
+      congr 1; split <;> omega
+  have hne : (natDigitsAux m.natAbs []).isEmpty = false := List.isEmpty_eq_false_iff.2 (natDigits_spec _).1
   rw [show Json.renderNumL ⟨m, ex⟩ ++ rest = intCharsL m ++ tail by simp only [Json.renderNumL, tail, List.append_assoc]]
-  unfold parseNum
-  rcases intCharsL_cases m tail with ⟨hm, hcs⟩ | ⟨hm, c0, t0, hcs, hm0, hc0⟩ <;>
-    (rw [hcs]; try (simp [isDigit_ne hc0 (by decide : isDigit '-' = false)]; rw [← List.cons_append, ← hm0])) <;>
-    (simp only [htd, hne, natDigits_ne_nil, Bool.false_eq_true, ↓reduceIte];
-     by_cases hex : ex = 0
-     · subst hex
-       rw [show tail = rest by simp only [tail, beq_self_eq_true, ↓reduceIte, List.nil_append]]
-       cases rest with
-       | nil => simp [digitsToInt_natDigits]; omega
-       | cons c t => obtain ⟨_, hdot, he, hE⟩ := numDelim_head hr; simp [hdot, he, hE, digitsToInt_natDigits]; omega
-     · rw [show tail = 'e' :: (intCharsL ex ++ rest) by
-           simp only [tail, beq_eq_false_iff_ne.2 hex, Bool.false_eq_true, ↓reduceIte, List.cons_append]]
-       have htdE := takeDigits_append _ (natDigits_digit ex.natAbs) _ (takeDigits_stop hr)
-       rcases intCharsL_cases ex rest with ⟨hexn, hint⟩ | ⟨hexn, c1, t1, hint, hex0, hc1⟩ <;>
-         (rw [hint]; try (simp [isDigit_ne hc1 (by decide : isDigit '-' = false), isDigit_ne hc1 (by decide : isDigit '+' = false)]; rw [← List.cons_append, ← hex0])) <;>
-         (simp [htdE, digitsToInt_natDigits]; omega))
+  unfold parseNum; rw [parseSigned_intCharsL false m tail htail.1]; dsimp only
+  rw [hne, if_neg Bool.false_ne_true, htail.2.1]; dsimp only; rw [htail.2.2]
+  simp only [List.append_nil, hd, List.length_nil, Except.ok.injEq, Prod.mk.injEq, JsonNumber.mk.injEq, and_true]
+  split <;> omega
 
-theorem hexVal_toHexDigit (d : Nat) (h : d < 16) : hexVal (toHexDigit d) = some d :=
-  unhexNat?_hexDigitLower h
-
-theorem parseStrAux_escape (c : Char) (acc rest : List Char) :
-    parseStrAux acc (escapeCharL c ++ rest) = parseStrAux (c :: acc) rest := by
-  dsimp only [escapeCharL]
-  split <;> try rfl
+private theorem parseStrAux_escape (c : Char) (acc : String) (rest : List Char) :
+    parseStrAux acc (escapeCharL c ++ rest) = parseStrAux (acc.push c) rest := by
+  dsimp only [escapeCharL]; split <;> try rfl
   rename_i _ h1 h2 _ _ _
   by_cases hlt : c.toNat < 0x20
-  · simp only [if_pos hlt, List.cons_append, List.nil_append, parseStrAux, hex4]
-    have h16 : ∀ k : Nat, k % 16 < 16 := fun k => Nat.mod_lt _ (by omega)
-    rw [hexVal_toHexDigit _ (h16 _), hexVal_toHexDigit _ (h16 _),
-        hexVal_toHexDigit _ (h16 _), hexVal_toHexDigit _ (h16 _)]
-    simp only [bind, Option.bind, pure]
-    rw [show ((c.toNat / 4096 % 16 * 16 + c.toNat / 256 % 16) * 16 + c.toNat / 16 % 16) * 16
-          + c.toNat % 16 = c.toNat by omega, Char.ofNat_toNat]
-  · simp only [if_neg hlt, List.cons_append, List.nil_append]
-    rw [parseStrAux.eq_def]
-    split <;> (rename_i heq; cases heq <;> first | contradiction | rfl)
+  · simp only [if_pos hlt, hexEscapeL, List.cons_append, List.nil_append]; rw [parseStrAux.eq_def]
+    simp only [show ('\\' == '"') = false from rfl, beq_self_eq_true, Bool.false_eq_true, ↓reduceIte, hex4, hexVal]
+    have h16 (k : Nat) : k % 16 < 16 := Nat.mod_lt _ (by omega)
+    rw [unhexNat?_hexDigitLower (h16 _), unhexNat?_hexDigitLower (h16 _), unhexNat?_hexDigitLower (h16 _), unhexNat?_hexDigitLower (h16 _)]
+    simp only [bind, Option.bind, pure, Option.elim]
+    rw [show ((c.toNat / 4096 % 16 * 16 + c.toNat / 256 % 16) * 16 + c.toNat / 16 % 16) * 16 + c.toNat % 16 = c.toNat by omega, Char.ofNat_toNat]
+  · simp only [if_neg hlt, List.cons_append, List.nil_append]; rw [parseStrAux.eq_def]
+    simp only [beq_eq_false_iff_ne.2 h1, beq_eq_false_iff_ne.2 h2, Bool.false_eq_true, ↓reduceIte]
 
-theorem parseStrAux_flatMap (cs : List Char) : ∀ (acc rest : List Char),
-    parseStrAux acc (cs.flatMap escapeCharL ++ '"' :: rest)
-      = .ok (String.ofList (acc.reverse ++ cs), rest) := by
-  induction cs with
-  | nil => intro acc rest; simp [parseStrAux]
-  | cons c cs ih =>
-      intro acc rest
-      rw [List.flatMap_cons, List.append_assoc, parseStrAux_escape, ih]
-      simp
+private theorem parseStrAux_flatMap : ∀ (cs : List Char) (acc : String) (rest : List Char),
+    parseStrAux acc (cs.flatMap escapeCharL ++ '"' :: rest) = .ok (acc ++ String.ofList cs, rest)
+  | [], _, _ => by rw [List.flatMap_nil, List.nil_append, parseStrAux.eq_def]; simp
+  | c :: cs, _, _ => by rw [List.flatMap_cons, List.append_assoc, parseStrAux_escape, parseStrAux_flatMap cs]; congr 2; exact String.toList_injective (by simp [List.append_assoc])
 
-theorem parseStr_render (s : String) (rest : List Char) :
-    parseStr (s.toList.flatMap escapeCharL ++ '"' :: rest) = .ok (s, rest) := by
-  rw [parseStr, parseStrAux_flatMap]
-  simp [String.ofList_toList]
+private theorem parseStr_render (s : String) (rest : List Char) : parseStr (s.toList.flatMap escapeCharL ++ '"' :: rest) = .ok (s, rest) := by
+  rw [parseStr, parseStrAux_flatMap]; simp
 
-theorem numDelim_cons {c : Char} {t : List Char}
-    (h : (isDigit c || c == '.' || c == 'e' || c == 'E') = false) :
-    numDelim (c :: t) = true := by
-  simp [numDelim, h]
-
-theorem renderL_head (j : Json) :
-    ∃ c t, Json.renderL j = c :: t ∧ isWs c = false ∧ c ≠ ']' ∧ c ≠ '}' := by
+private theorem renderL_head (j : Json) : ∃ c t, Json.renderL j = c :: t ∧ isWs c = false ∧ c ≠ ']' ∧ c ≠ '}' := by
   cases j with
-  | null => exact ⟨'n', _, rfl, by decide⟩
-  | bool b => cases b <;> first | exact ⟨'t', _, rfl, by decide⟩ | exact ⟨'f', _, rfl, by decide⟩
-  | str _ => exact ⟨'"', _, rfl, by decide⟩
-  | arr _ => exact ⟨'[', _, rfl, by decide⟩
-  | obj _ => exact ⟨'{', _, rfl, by decide⟩
+  | null => exact ⟨'n', _, rfl, by decide⟩ | bool b => cases b <;> first | exact ⟨'t', _, rfl, by decide⟩ | exact ⟨'f', _, rfl, by decide⟩
+  | str _ => exact ⟨'"', _, rfl, by decide⟩ | arr _ => exact ⟨'[', _, rfl, by decide⟩ | obj _ => exact ⟨'{', _, rfl, by decide⟩
   | num n =>
-      rcases intCharsL_cases n.mantissa (if n.exponent == 0 then [] else 'e' :: intCharsL n.exponent) with
-        ⟨_, hcs⟩ | ⟨_, c0, _, hcs, _, hc0⟩
+      rcases intCharsL_cases n.mantissa (if n.exponent == 0 then [] else 'e' :: intCharsL n.exponent) with ⟨_, hcs⟩ | ⟨_, c0, _, hcs, _, hc0⟩
       · exact ⟨'-', _, hcs, by decide⟩
-      · exact ⟨c0, _, hcs, isDigit_not_ws hc0, isDigit_ne hc0 (by decide), isDigit_ne hc0 (by decide)⟩
+      · exact ⟨c0, _, hcs, isDigit_not_ws hc0, isDigit_ne hc0 rfl, isDigit_ne hc0 rfl⟩
 
-private theorem skipWs_cons {c : Char} {r : List Char} (h : isWs c = false) :
-    skipWs (c :: r) = c :: r := by
-  simp only [skipWs, h, Bool.false_eq_true, ↓reduceIte]
+private theorem skipWs_cons {c : Char} {r : List Char} (h : isWs c = false) : skipWs (c :: r) = c :: r := by simp only [skipWs, h, Bool.false_eq_true, ↓reduceIte]
+private theorem skipWs_renderL (j : Json) (x : List Char) : skipWs (Json.renderL j ++ x) = Json.renderL j ++ x := by
+  obtain ⟨c, _, hren, hcws, _, _⟩ := renderL_head j; rw [hren, List.cons_append, skipWs_cons hcws]
 
-theorem skipWs_renderL (j : Json) (x : List Char) :
-    skipWs (Json.renderL j ++ x) = Json.renderL j ++ x := by
-  obtain ⟨c, t, hren, hcws, _, _⟩ := renderL_head j
-  rw [hren, List.cons_append, skipWs_cons hcws]
-
-theorem skipWs_renderElemsL (e : Json) (es : List Json) (x : List Char) :
-    skipWs (Json.renderElemsL (e :: es) ++ x) = Json.renderElemsL (e :: es) ++ x := by
-  cases es <;> simp only [Json.renderElemsL, List.append_assoc] <;> exact skipWs_renderL e _
-
-theorem skipWs_renderMembersL (k : String) (v : Json) (ms : List (String × Json)) (x : List Char) :
-    skipWs (Json.renderMembersL ((k, v) :: ms) ++ x) = Json.renderMembersL ((k, v) :: ms) ++ x := by
-  cases ms <;> simp [Json.renderMembersL, Json.renderStrL, skipWs, isWs]
-
-theorem parseVal_to_parseNum (f b : Nat) (c0 : Char) (t : List Char)
-    (h0 : c0 = '-' ∨ isDigit c0 = true) :
-    parseVal (f + 1) b (c0 :: t)
-      = (match parseNum (c0 :: t) with
-         | .ok (n, r') => .ok (.num n, r')
-         | .error e => .error e) := by
-  have hws : isWs c0 = false := h0.elim (fun h => h ▸ rfl) isDigit_not_ws
-  have hg : (c0 == '-' || isDigit c0) = true := by rcases h0 with rfl | h <;> simp [*]
-  dsimp only [parseVal]; rw [skipWs_cons hws]
-  split <;> (rename_i heq; cases heq <;> first
-    | (rcases h0 with h | hd <;> first | exact absurd h (by decide) | exact absurd hd (by decide))
-    | (simp only [hg, ↓reduceIte, bind, Except.bind, pure, Except.pure]; rcases parseNum (c0 :: t) with _ | ⟨_, _⟩ <;> rfl))
-
-theorem parseVal_num (n : JsonNumber) (f b : Nat) (rest : List Char)
-    (hr : numDelim rest = true) :
+private theorem parseVal_num (n : JsonNumber) (f b : Nat) (rest : List Char) (hr : numDelim rest = true) :
     parseVal (f + 1) b (Json.renderNumL n ++ rest) = .ok (.num n, rest) := by
-  have hsplit : Json.renderNumL n ++ rest =
-      intCharsL n.mantissa ++ ((if n.exponent == 0 then [] else 'e' :: intCharsL n.exponent) ++ rest) := by
-    simp only [Json.renderNumL, List.append_assoc]
-  rcases intCharsL_cases n.mantissa ((if n.exponent == 0 then [] else 'e' :: intCharsL n.exponent) ++ rest) with
-    ⟨_, hcs⟩ | ⟨_, c0, _, hcs, _, hc0⟩ <;>
-    (have harg := hsplit.trans hcs
-     rw [harg, parseVal_to_parseNum f b _ _ (by first | exact .inl rfl | exact .inr hc0),
-       ← harg, parseNum_render n rest hr])
+  have toNum (c0 : Char) (t : List Char) (h0 : c0 = '-' ∨ isDigit c0 = true) :
+      parseVal (f + 1) b (c0 :: t) = (parseNum (c0 :: t)).map fun (n, r') => (.num n, r') := by
+    have hne (k : Char) (hk : k ≠ '-' ∧ isDigit k = false) : (c0 == k) = false := beq_eq_false_iff_ne.2 (h0.elim (fun h => h ▸ hk.1.symm) (fun hd => isDigit_ne hd hk.2))
+    have hg : (c0 == '-' || isDigit c0) = true := h0.elim (fun h => by simp [h]) (fun h => by simp [h])
+    simp only [parseVal, skipWs_cons (h0.elim (fun h => h ▸ rfl) isDigit_not_ws), hne '"' ⟨by decide, rfl⟩, hne '[' ⟨by decide, rfl⟩, hne '{' ⟨by decide, rfl⟩, hg, Bool.false_eq_true, ↓reduceIte]
+  have hsplit : Json.renderNumL n ++ rest = intCharsL n.mantissa ++ ((if n.exponent == 0 then [] else 'e' :: intCharsL n.exponent) ++ rest) := by simp only [Json.renderNumL, List.append_assoc]
+  rcases intCharsL_cases n.mantissa ((if n.exponent == 0 then [] else 'e' :: intCharsL n.exponent) ++ rest) with ⟨_, hcs⟩ | ⟨_, c0, _, hcs, _, hc0⟩ <;>
+    (have harg := hsplit.trans hcs; rw [harg, toNum _ _ (by first | exact .inl rfl | exact .inr hc0), ← harg, parseNum_render n rest hr]; rfl)
 
-theorem parseVal_arr (e : Json) (es : List Json) (f b : Nat) (rest : List Char) :
-    parseVal (f + 1) (b + 1) ('[' :: (Json.renderElemsL (e :: es) ++ ']' :: rest))
-      = (match parseElems f b (Json.renderElemsL (e :: es) ++ ']' :: rest) with
-         | .ok (vs, r') => .ok (Json.arr vs, r')
-         | .error msg   => .error msg) := by
-  obtain ⟨c, t, hren, _, hcbr, _⟩ := renderL_head e
-  unfold parseVal; simp only [skipWs_cons (by decide : isWs '[' = false)]
-  rw [skipWs_renderElemsL]
-  cases es <;> (simp only [Json.renderElemsL, hren, List.cons_append, List.append_assoc, if_neg hcbr,
-    bind, Except.bind, pure, Except.pure]; cases parseElems f b _ <;> rfl)
+private theorem parseSep_single {α : Type} {close : Char} {err : String}
+    {step : List Char → Except String (α × List Char)} {rec : List Char → Except String (List α × List Char)}
+    {cs rest : List Char} {v : α} (hws : isWs close = false) (hne : close ≠ ',') (hs : step cs = .ok (v, close :: rest)) :
+    parseSep close err step rec cs = .ok ([v], rest) := by
+  simp only [parseSep, hs, Except.bind, skipWs_cons hws, beq_eq_false_iff_ne.2 hne, beq_self_eq_true, Bool.false_eq_true, ↓reduceIte]
 
-theorem parseVal_obj (k : String) (v : Json) (ms : List (String × Json))
-    (f b : Nat) (rest : List Char) :
-    parseVal (f + 1) (b + 1) ('{' :: (Json.renderMembersL ((k, v) :: ms) ++ '}' :: rest))
-      = (match parseMembers f b (Json.renderMembersL ((k, v) :: ms) ++ '}' :: rest) with
-         | .ok (ms', r') => .ok (Json.obj ms', r')
-         | .error msg   => .error msg) := by
-  unfold parseVal; simp only [skipWs_cons (by decide : isWs '{' = false)]
-  rw [skipWs_renderMembersL]
-  cases ms <;> (simp only [Json.renderMembersL, Json.renderStrL, List.cons_append, List.append_assoc,
-    if_neg (by decide : ¬('"' = '}')), bind, Except.bind, pure, Except.pure]; cases parseMembers f b _ <;> rfl)
+private theorem parseSep_cons {α : Type} {close : Char} {err : String}
+    {step : List Char → Except String (α × List Char)} {rec : List Char → Except String (List α × List Char)}
+    {cs tail rest : List Char} {v : α} {vs : List α} (hs : step cs = .ok (v, ',' :: tail)) (hws : skipWs tail = tail) (hr : rec tail = .ok (vs, rest)) :
+    parseSep close err step rec cs = .ok (v :: vs, rest) := by
+  simp only [parseSep, hs, Except.bind, skipWs_cons (rfl : isWs ',' = false), beq_self_eq_true, ↓reduceIte, hws, hr, Except.map]
 
 private theorem rt_all (fuel : Nat) :
-    (∀ (j : Json) (budget : Nat) (rest : List Char),
-      j.depth ≤ budget → (Json.renderL j).length < fuel → numDelim rest = true →
+    (∀ j budget rest, j.depth ≤ budget → (Json.renderL j).length < fuel → numDelim rest = true →
       parseVal fuel budget (Json.renderL j ++ rest) = .ok (j, rest)) ∧
-    (∀ (e : Json) (es : List Json) (budget : Nat) (rest : List Char),
-      (∀ x ∈ e :: es, Json.depth x ≤ budget) →
-      (Json.renderElemsL (e :: es)).length + 1 < fuel →
+    (∀ e es budget rest, (∀ x ∈ e :: es, Json.depth x ≤ budget) → (Json.renderElemsL (e :: es)).length + 1 < fuel →
       parseElems fuel budget (Json.renderElemsL (e :: es) ++ ']' :: rest) = .ok (e :: es, rest)) ∧
-    (∀ (kv : String × Json) (ms : List (String × Json)) (budget : Nat) (rest : List Char),
-      (∀ x ∈ kv :: ms, Json.depth x.2 ≤ budget) →
-      (Json.renderMembersL (kv :: ms)).length + 1 < fuel →
+    (∀ kv ms budget rest, (∀ x ∈ kv :: ms, Json.depth x.2 ≤ budget) → (Json.renderMembersL (kv :: ms)).length + 1 < fuel →
       parseMembers fuel budget (Json.renderMembersL (kv :: ms) ++ '}' :: rest) = .ok (kv :: ms, rest)) := by
   induction fuel with
-  | zero =>
-      exact ⟨fun _ _ _ _ hf _ => absurd hf (Nat.not_lt_zero _),
-             fun _ _ _ _ _ hf => absurd hf (Nat.not_lt_zero _),
-             fun _ _ _ _ _ hf => absurd hf (Nat.not_lt_zero _)⟩
+  | zero => exact ⟨(fun _ _ _ _ hf _ => nomatch hf), (fun _ _ _ _ _ hf => nomatch hf), (fun _ _ _ _ _ hf => nomatch hf)⟩
   | succ f ih =>
-      obtain ⟨ihV, ihE, ihM⟩ := ih
-      refine ⟨?_, ?_, ?_⟩
+      obtain ⟨ihV, ihE, ihM⟩ := ih; refine ⟨?_, ?_, ?_⟩
       · intro j budget rest hd hf hr
         cases j with
-        | null => rfl
-        | bool b => cases b <;> rfl
-        | num n => exact parseVal_num n f budget rest hr
-        | str s =>
-            simp only [Json.renderL, Json.renderStrL, List.cons_append, List.nil_append, List.append_assoc,
-              parseVal, skipWs_cons (by decide : isWs '"' = false), parseStr_render,
-              bind, Except.bind, pure, Except.pure]
+        | null => rfl | bool b => cases b <;> rfl | num n => exact parseVal_num n f budget rest hr
+        | str s => simp only [Json.renderL, Json.renderStrL, List.cons_append, List.nil_append, List.append_assoc, parseVal, skipWs_cons (rfl : isWs '"' = false), beq_self_eq_true, ↓reduceIte, parseStr_render, Except.map]
         | arr es =>
-            cases budget with
-            | zero => simp only [Json.depth] at hd; omega
-            | succ b =>
-              cases es with
-              | nil => rfl
-              | cons e es =>
-                  simp only [Json.depth, Json.renderL, List.length_cons, List.length_append] at hd hf
-                  have key := ihE e es b rest (Json.maxArr_le_iff.mp (by omega)) (by omega)
-                  simp only [Json.renderL, List.cons_append, List.nil_append, List.append_assoc,
-                    parseVal_arr, key]
+            cases budget with | zero => simp only [Json.depth] at hd; omega | succ b =>
+              cases es with | nil => rfl | cons e es =>
+                simp only [Json.depth, Json.renderL, List.length_cons, List.length_append] at hd hf
+                have key := ihE e es b rest (Json.maxArr_le_iff.1 (by omega)) (by omega)
+                obtain ⟨c, _, hren, hcws, hcbr, _⟩ := renderL_head e
+                simp only [Json.renderL, List.cons_append, List.nil_append, List.append_assoc, parseVal, skipWs_cons (rfl : isWs '[' = false), show ('[' == '"') = false from rfl, beq_self_eq_true, Bool.false_eq_true, ↓reduceIte]
+                cases es <;> (simp only [Json.renderElemsL, hren, List.cons_append, List.append_assoc] at key ⊢; simp only [parseContainer, skipWs_cons hcws, beq_eq_false_iff_ne.2 hcbr, Bool.false_eq_true, ↓reduceIte, key, Except.map])
         | obj ms =>
-            cases budget with
-            | zero => simp only [Json.depth] at hd; omega
-            | succ b =>
-              cases ms with
-              | nil => rfl
-              | cons kv ms =>
-                  rcases kv with ⟨k, v⟩
-                  simp only [Json.depth, Json.renderL, List.length_cons, List.length_append] at hd hf
-                  have key := ihM (k, v) ms b rest (Json.maxObj_le_iff.mp (by omega)) (by omega)
-                  simp only [Json.renderL, List.cons_append, List.nil_append, List.append_assoc,
-                    parseVal_obj, key]
+            cases budget with | zero => simp only [Json.depth] at hd; omega | succ b =>
+              cases ms with | nil => rfl | cons kv ms =>
+                rcases kv with ⟨k, v⟩; simp only [Json.depth, Json.renderL, List.length_cons, List.length_append] at hd hf
+                have key := ihM (k, v) ms b rest (Json.maxObj_le_iff.1 (by omega)) (by omega)
+                simp only [Json.renderL, List.cons_append, List.nil_append, List.append_assoc, parseVal, skipWs_cons (rfl : isWs '{' = false), show ('{' == '"') = false from rfl, show ('{' == '[') = false from rfl, beq_self_eq_true, Bool.false_eq_true, ↓reduceIte]
+                cases ms <;> (simp only [Json.renderMembersL, Json.renderStrL, List.cons_append, List.append_assoc] at key ⊢; simp only [parseContainer, skipWs_cons (rfl : isWs '"' = false), show ('"' == '}') = false from rfl, Bool.false_eq_true, ↓reduceIte, key, Except.map])
       · intro e es budget rest hd hf
         cases es with
-        | nil =>
-            simp only [Json.renderElemsL] at hf ⊢
-            have hv := ihV e budget (']' :: rest) (hd e (List.mem_cons_self ..)) (by omega) (numDelim_cons (by decide))
-            simp only [parseElems, hv, skipWs_cons (by decide : isWs ']' = false), bind, Except.bind]
+        | nil => exact parseSep_single (rfl : isWs ']' = false) (by decide) (ihV e budget (']' :: rest) (hd e (List.mem_cons_self ..)) (by simpa [Json.renderElemsL] using hf) rfl)
         | cons x xs =>
-            rw [Json.renderElemsL.eq_def] at hf; dsimp only at hf
-            simp only [List.length_append, List.length_cons] at hf
-            have hv := ihV e budget (',' :: (Json.renderElemsL (x :: xs) ++ ']' :: rest))
-              (hd e (List.mem_cons_self ..)) (by omega) (numDelim_cons (by decide))
-            have key := ihE x xs budget rest (fun y hy => hd y (List.mem_cons_of_mem _ hy)) (by omega)
-            rw [Json.renderElemsL.eq_def]; dsimp only
-            rw [List.append_assoc, List.cons_append]
-            simp only [parseElems, hv, skipWs_cons (by decide : isWs ',' = false), skipWs_renderElemsL, key,
-              bind, Except.bind, pure, Except.pure]
-      · intro kv ms budget rest hd hf
-        rcases kv with ⟨k, v⟩
+            simp only [Json.renderElemsL, List.length_append, List.length_cons] at hf
+            exact parseSep_cons (by rw [Json.renderElemsL, List.append_assoc]; exact ihV e budget (',' :: (Json.renderElemsL (x :: xs) ++ ']' :: rest)) (hd e (List.mem_cons_self ..)) (by omega) rfl)
+              (by cases xs <;> simp only [Json.renderElemsL, List.append_assoc] <;> exact skipWs_renderL x _) (ihE x xs budget rest (fun y hy => hd y (List.mem_cons_of_mem _ hy)) (by omega))
+      · intro ⟨k, v⟩ ms budget rest hd hf
+        have hstep (tail : List Char) (hv : parseVal f budget (Json.renderL v ++ tail) = .ok (v, tail)) :
+            parseMember (parseVal f budget) (Json.renderStrL k ++ ':' :: (Json.renderL v ++ tail)) = .ok ((k, v), tail) := by
+          simp only [parseMember, Json.renderStrL, List.cons_append, List.nil_append, List.append_assoc, skipWs_cons (rfl : isWs '"' = false), beq_self_eq_true, ↓reduceIte, parseStr_render, Except.bind, skipWs_cons (rfl : isWs ':' = false), skipWs_renderL, hv, Except.map]
         cases ms with
         | nil =>
             simp only [Json.renderMembersL, Json.renderStrL, List.length_append, List.length_cons] at hf
-            have hv := ihV v budget ('}' :: rest) (hd (k, v) (List.mem_cons_self ..)) (by omega) (numDelim_cons (by decide))
-            simp only [Json.renderMembersL, Json.renderStrL, List.cons_append, List.nil_append, List.append_assoc,
-              parseMembers, skipWs_cons (by decide : isWs '"' = false), parseStr_render,
-              skipWs_cons (by decide : isWs ':' = false), skipWs_renderL, hv,
-              skipWs_cons (by decide : isWs '}' = false), bind, Except.bind]
+            exact parseSep_single (rfl : isWs '}' = false) (by decide) (by rw [Json.renderMembersL, List.append_assoc]; exact hstep _ (ihV v budget ('}' :: rest) (hd (k, v) (List.mem_cons_self ..)) (by omega) rfl))
         | cons kv' ms =>
-            rcases kv' with ⟨k', v'⟩
-            rw [Json.renderMembersL.eq_def] at hf; dsimp only at hf
-            simp only [Json.renderStrL, List.length_append, List.length_cons] at hf
-            have hv := ihV v budget (',' :: (Json.renderMembersL ((k', v') :: ms) ++ '}' :: rest))
-              (hd (k, v) (List.mem_cons_self ..)) (by omega) (numDelim_cons (by decide))
-            have key := ihM (k', v') ms budget rest (fun y hy => hd y (List.mem_cons_of_mem _ hy)) (by omega)
-            rw [Json.renderMembersL.eq_def]; dsimp only
-            simp only [Json.renderStrL, List.cons_append, List.nil_append, List.append_assoc,
-              parseMembers, skipWs_cons (by decide : isWs '"' = false), parseStr_render,
-              skipWs_cons (by decide : isWs ':' = false), skipWs_renderL, hv,
-              skipWs_cons (by decide : isWs ',' = false), skipWs_renderMembersL, key,
-              bind, Except.bind, pure, Except.pure]
+            rcases kv' with ⟨k', v'⟩; simp only [Json.renderMembersL, Json.renderStrL, List.length_append, List.length_cons] at hf
+            exact parseSep_cons (by rw [Json.renderMembersL, List.append_assoc, List.cons_append, List.append_assoc]; exact hstep _ (ihV v budget (',' :: (Json.renderMembersL ((k', v') :: ms) ++ '}' :: rest)) (hd (k, v) (List.mem_cons_self ..)) (by omega) rfl))
+              (by cases ms <;> simp [Json.renderMembersL, Json.renderStrL, skipWs, isWs]) (ihM (k', v') ms budget rest (fun y hy => hd y (List.mem_cons_of_mem _ hy)) (by omega))
 
-theorem rt_val (j : Json) (budget fuel : Nat) (rest : List Char)
-    (hd : j.depth ≤ budget) (hf : (Json.renderL j).length < fuel) (hr : numDelim rest = true) :
-    parseVal fuel budget (Json.renderL j ++ rest) = .ok (j, rest) :=
-  (rt_all fuel).1 j budget rest hd hf hr
-
-theorem parse_render {j : Json} {maxDepth : Nat}
-    (h : j.depth ≤ maxDepth) : parse (Json.render j) maxDepth = .ok j := by
-  have hv := rt_val j maxDepth ((Json.renderL j).length + 1) [] h (by omega) rfl
-  simp only [List.append_nil] at hv
-  simp only [parse, Json.render, String.toList_ofList, hv, skipWs, List.isEmpty_nil, if_true]
+theorem parse_render {j : Json} {maxDepth : Nat} (h : j.depth ≤ maxDepth) : parse (Json.render j) maxDepth = .ok j := by
+  have hv := (rt_all ((Json.renderL j).length + 1)).1 j maxDepth [] h (by omega) rfl
+  simp only [List.append_nil] at hv; simp only [parse, Json.render, String.toList_ofList, hv, Except.bind, skipWs, List.isEmpty_nil, ↓reduceIte]
 
 end Qed

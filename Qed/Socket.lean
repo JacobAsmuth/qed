@@ -3,84 +3,42 @@ import Qed.Runtime.AppCore
 
 namespace Qed
 
-/-! ## Generic Key-Diffing Reactive Lifecycle (`KeyedLifecycle`) -/
-
 namespace KeyedLifecycle
-
-@[reducible, simp] def applyRes {Model Msg : Type} (cmd : Cmd Msg)
-    (res : Model × Option (Cmd Msg)) : Model × Cmd Msg :=
-  (res.1, match res.2 with | some c => .batch [cmd, c] | none => cmd)
-
-@[reducible, simp] def boot {Item Model Msg : Type}
-    (key : Item → Model → String)
-    (onBoot : Item → String → Model → Model × Option (Cmd Msg))
+variable {Item Model Msg : Type}
+@[reducible, simp] def applyRes (cmd : Cmd Msg) (res : Model × Option (Cmd Msg)) : Model × Cmd Msg :=
+  (res.1, res.2.elim cmd (.batch [cmd, ·]))
+@[reducible, simp] def boot (key : Item → Model → String) (onBoot : Item → String → Model → Model × Option (Cmd Msg))
     (items : List Item) (ic : Model × Cmd Msg) : Model × Cmd Msg :=
-  items.foldl (fun mc it =>
-    let k0 := key it mc.1
-    if k0.isEmpty then mc else applyRes mc.2 (onBoot it k0 mc.1)) ic
-
-@[reducible, simp] def wrap {Item Model Msg : Type}
-    (key : Item → Model → String)
-    (onLeave : Item → Model → Model × Option (Cmd Msg))
-    (onEnter : Item → String → Model → Model × Option (Cmd Msg))
-    (items : List Item)
+  items.foldl (fun mc it => let k0 := key it mc.1; if k0.isEmpty then mc else applyRes mc.2 (onBoot it k0 mc.1)) ic
+@[reducible, simp] def wrap (key : Item → Model → String) (onLeave : Item → Model → Model × Option (Cmd Msg))
+    (onEnter : Item → String → Model → Model × Option (Cmd Msg)) (items : List Item)
     (update : Model → Msg → Model × Cmd Msg) : Model → Msg → Model × Cmd Msg :=
-  fun old msg =>
-    items.foldl (fun mc it =>
-      let kNew := key it mc.1
-      if key it old == kNew then mc
-      else if kNew.isEmpty then applyRes mc.2 (onLeave it mc.1)
-      else applyRes mc.2 (onEnter it kNew mc.1)) (update old msg)
-
-private theorem foldl_preserves {α β : Type} (P : α → Prop) (f : α → β → α)
-    (xs : List β) (acc : α) (hacc : P acc) (hf : ∀ x ∈ xs, ∀ a, P a → P (f a x)) :
-    P (xs.foldl f acc) := by
-  induction xs generalizing acc with
-  | nil => exact hacc
-  | cons x rest ih =>
-      exact ih _ (hf x (List.mem_cons_self ..) _ hacc) (fun y hy => hf y (List.mem_cons_of_mem x hy))
-
-theorem boot_preserves_inv {Item Model Msg : Type} (Inv : Model → Prop)
-    (key : Item → Model → String) (onBoot : Item → String → Model → Model × Option (Cmd Msg))
-    (items : List Item) (ic : Model × Cmd Msg) (hinit : Inv ic.1)
-    (hboot : ∀ it ∈ items, ∀ k m, Inv m → Inv (onBoot it k m).1) :
-    Inv (boot key onBoot items ic).1 :=
-  foldl_preserves (Inv ·.1) _ items ic hinit fun it hit mc hmc => by
-    dsimp only; split
-    · exact hmc
-    · exact hboot it hit _ _ hmc
-
-theorem wrap_preserves_inv {Item Model Msg : Type} (Inv : Model → Prop)
-    (key : Item → Model → String) (onLeave : Item → Model → Model × Option (Cmd Msg))
-    (onEnter : Item → String → Model → Model × Option (Cmd Msg))
-    (items : List Item) (upd : Model → Msg → Model × Cmd Msg) (old : Model) (msg : Msg)
-    (hacc : Inv (upd old msg).1) (hleave : ∀ it ∈ items, ∀ m, Inv m → Inv (onLeave it m).1)
-    (henter : ∀ it ∈ items, ∀ k m, Inv m → Inv (onEnter it k m).1) :
+  fun old msg => items.foldl (fun mc it =>
+    let kNew := key it mc.1
+    if key it old == kNew then mc else applyRes mc.2 (if kNew.isEmpty then onLeave it mc.1 else onEnter it kNew mc.1)) (update old msg)
+private theorem foldl_preserves {α β : Type} (P : α → Prop) (f : α → β → α) :
+    ∀ (xs : List β) (acc : α), P acc → (∀ x ∈ xs, ∀ a, P a → P (f a x)) → P (xs.foldl f acc)
+  | [], _, hacc, _ => hacc
+  | x :: rest, _, hacc, hf => foldl_preserves P f rest _ (hf x (.head _) _ hacc) fun y hy => hf y (.tail _ hy)
+theorem boot_preserves_inv (Inv : Model → Prop) (key : Item → Model → String)
+    (onBoot : Item → String → Model → Model × Option (Cmd Msg)) (items : List Item) (ic : Model × Cmd Msg)
+    (hinit : Inv ic.1) (hboot : ∀ it ∈ items, ∀ k m, Inv m → Inv (onBoot it k m).1) : Inv (boot key onBoot items ic).1 :=
+  foldl_preserves (Inv ·.1) _ items ic hinit fun it hit mc hmc => by dsimp only; split <;> first | exact hmc | exact hboot it hit _ _ hmc
+theorem wrap_preserves_inv (Inv : Model → Prop) (key : Item → Model → String)
+    (onLeave : Item → Model → Model × Option (Cmd Msg)) (onEnter : Item → String → Model → Model × Option (Cmd Msg))
+    (items : List Item) (upd : Model → Msg → Model × Cmd Msg) (old : Model) (msg : Msg) (hacc : Inv (upd old msg).1)
+    (hleave : ∀ it ∈ items, ∀ m, Inv m → Inv (onLeave it m).1) (henter : ∀ it ∈ items, ∀ k m, Inv m → Inv (onEnter it k m).1) :
     Inv (wrap key onLeave onEnter items upd old msg).1 :=
   foldl_preserves (Inv ·.1) _ items (upd old msg) hacc fun it hit mc hmc => by
-    dsimp only; split
-    · exact hmc
-    · split
-      · exact hleave it hit _ hmc
-      · exact henter it hit _ _ hmc
-
-theorem wrap_noop_when_keys_unchanged {Item Model Msg : Type}
-    (key : Item → Model → String) (onLeave : Item → Model → Model × Option (Cmd Msg))
-    (onEnter : Item → String → Model → Model × Option (Cmd Msg))
+    dsimp only; split; · exact hmc
+    · dsimp only [applyRes]; split <;> first | exact hleave it hit _ hmc | exact henter it hit _ _ hmc
+theorem wrap_noop_when_keys_unchanged (key : Item → Model → String)
+    (onLeave : Item → Model → Model × Option (Cmd Msg)) (onEnter : Item → String → Model → Model × Option (Cmd Msg))
     (items : List Item) (upd : Model → Msg → Model × Cmd Msg) (old : Model) (msg : Msg)
-    (hsame : ∀ it ∈ items, key it old = key it (upd old msg).1) :
-    wrap key onLeave onEnter items upd old msg = upd old msg :=
-  foldl_preserves (· = upd old msg) _ items (upd old msg) rfl fun it hit mc hmc => by
-    subst hmc; simp only [beq_iff_eq.2 (hsame it hit), ↓reduceIte]
-
+    (hsame : ∀ it ∈ items, key it old = key it (upd old msg).1) : wrap key onLeave onEnter items upd old msg = upd old msg :=
+  foldl_preserves (· = upd old msg) _ items (upd old msg) rfl fun it hit mc hmc => by subst hmc; simp only [beq_iff_eq.2 (hsame it hit), ↓reduceIte]
 end KeyedLifecycle
 
-/-! ## Reactive WebSocket Subscriptions (`Subscription`) & Formal Lifecycle Guarantees -/
-
-/-- A reactive, key-driven WebSocket subscription attached to a component `App`.
-    When `key m` is empty, the subscription is inactive; whenever `key` changes across
-    state transitions (e.g., route change or logout), the runtime automatically unsubscribes
-    or replaces the active subscription with a fresh `subId`. -/
 structure Subscription (Model Msg : Type) where
   slot     : String
   key      : Model → String
@@ -89,79 +47,35 @@ structure Subscription (Model Msg : Type) where
   onClose  : Model → Model := id
 
 namespace Subscription
-
-/-- Starts any subscriptions whose initial key is non-empty on non-SSR client boot. -/
-def boot {Model Msg : Type} (subs : List (Subscription Model Msg))
-    (ic : Model × Cmd Msg) : Model × Cmd Msg :=
+variable {Model Msg : Type}
+def boot (subs : List (Subscription Model Msg)) (ic : Model × Cmd Msg) : Model × Cmd Msg :=
   KeyedLifecycle.boot (·.key) (fun s k m => (m, s.openCmd k m)) subs ic
-
-/-- Starts active subscriptions after SSR rehydration on the browser client. -/
-def hydrateCmds {Model Msg : Type} (subs : List (Subscription Model Msg)) (m : Model) : Cmd Msg :=
-  .batch <| subs.filterMap fun s =>
-    let k := s.key m
-    if k.isEmpty then none else s.openCmd k m
-
-/-- Wraps `App.update` to diff subscription keys across every transition:
-    unchanged keys are a guaranteed no-op; cleared keys emit `closeCmd` and reset status;
-    new keys emit `openCmd` (which atomically supersedes the prior `subId` in the host). -/
-def wrap {Model Msg : Type} (subs : List (Subscription Model Msg))
-    (update : Model → Msg → Model × Cmd Msg) : Model → Msg → Model × Cmd Msg :=
-  KeyedLifecycle.wrap (·.key)
-    (fun s m => (s.onClose m, some s.closeCmd))
-    (fun s k m => match s.openCmd k m with
-      | some c => (m, some c)
-      | none   => (s.onClose m, some s.closeCmd))
-    subs update
-
-theorem boot_state_eq {Model Msg : Type} (subs : List (Subscription Model Msg))
-    (ic : Model × Cmd Msg) :
-    (boot subs ic).1 = ic.1 :=
-  KeyedLifecycle.boot_preserves_inv (· = ic.1) _ _ subs ic rfl (fun _ _ _ _ h => h)
-
-theorem boot_preserves_inv {Model Msg : Type} (P : Model → Prop)
-    (subs : List (Subscription Model Msg)) (ic : Model × Cmd Msg)
-    (hinit : P ic.1) :
-    P (boot subs ic).1 := by
-  rw [boot_state_eq]
-  exact hinit
-
-theorem wrap_preserves_inv {Model Msg : Type} (P : Model → Prop)
-    (subs : List (Subscription Model Msg))
-    (update : Model → Msg → Model × Cmd Msg)
-    (hupd : ∀ m msg, P m → P (update m msg).1)
-    (hclose : ∀ s ∈ subs, ∀ m, P m → P (s.onClose m)) :
+def hydrateCmds (subs : List (Subscription Model Msg)) (m : Model) : Cmd Msg :=
+  .batch <| subs.filterMap fun s => let k := s.key m; if k.isEmpty then none else s.openCmd k m
+def wrap (subs : List (Subscription Model Msg)) (update : Model → Msg → Model × Cmd Msg) : Model → Msg → Model × Cmd Msg :=
+  KeyedLifecycle.wrap (·.key) (fun s m => (s.onClose m, some s.closeCmd))
+    (fun s k m => (s.openCmd k m).elim (s.onClose m, some s.closeCmd) (m, some ·)) subs update
+theorem boot_state_eq (subs : List (Subscription Model Msg)) (ic : Model × Cmd Msg) : (boot subs ic).1 = ic.1 :=
+  KeyedLifecycle.boot_preserves_inv (· = ic.1) _ _ subs ic rfl fun _ _ _ _ h => h
+theorem boot_preserves_inv (P : Model → Prop) (subs : List (Subscription Model Msg)) (ic : Model × Cmd Msg) (hinit : P ic.1) : P (boot subs ic).1 :=
+  boot_state_eq subs ic ▸ hinit
+theorem wrap_preserves_inv (P : Model → Prop) (subs : List (Subscription Model Msg)) (update : Model → Msg → Model × Cmd Msg)
+    (hupd : ∀ m msg, P m → P (update m msg).1) (hclose : ∀ s ∈ subs, ∀ m, P m → P (s.onClose m)) :
     ∀ m msg, P m → P (wrap subs update m msg).1 :=
-  fun old msg hm => KeyedLifecycle.wrap_preserves_inv P _ _ _ subs update old msg
-    (hupd old msg hm) hclose (fun s hs k m hm => by
-      cases s.openCmd k m with
-      | some _ => exact hm
-      | none   => exact hclose s hs m hm)
-
-theorem wrap_noop_when_keys_unchanged {Model Msg : Type}
-    (subs : List (Subscription Model Msg))
-    (update : Model → Msg → Model × Cmd Msg)
-    (old : Model) (msg : Msg)
-    (hsame : ∀ s ∈ subs, s.key old = s.key (update old msg).1) :
-    wrap subs update old msg = update old msg := by
-  unfold wrap
-  exact KeyedLifecycle.wrap_noop_when_keys_unchanged _ _ _ subs update old msg hsame
-
+  fun old msg hm => KeyedLifecycle.wrap_preserves_inv P _ _ _ subs update old msg (hupd old msg hm) hclose
+    fun s hs k m hm => by cases s.openCmd k m <;> first | exact hclose s hs m hm | exact hm
+theorem wrap_noop_when_keys_unchanged (subs : List (Subscription Model Msg)) (update : Model → Msg → Model × Cmd Msg)
+    (old : Model) (msg : Msg) (hsame : ∀ s ∈ subs, s.key old = s.key (update old msg).1) : wrap subs update old msg = update old msg := by
+  unfold wrap; exact KeyedLifecycle.wrap_noop_when_keys_unchanged _ _ _ subs update old msg hsame
 end Subscription
 
 namespace Internal
-
-def App.withSubscriptions {Model Msg : Type} (subs : List (Subscription Model Msg))
-    (app : App Model Msg) : App Model Msg :=
-  Internal.App.setInitUpdateHydrate app
-    (Subscription.boot subs app.init)
-    (Subscription.wrap subs app.update)
+def App.withSubscriptions {Model Msg : Type} (subs : List (Subscription Model Msg)) (app : App Model Msg) : App Model Msg :=
+  Internal.App.setInitUpdateHydrate app (Subscription.boot subs app.init) (Subscription.wrap subs app.update)
     (fun m => .batch [app.onHydrate m, Subscription.hydrateCmds subs m])
-
 defAppProjSimps App.withSubscriptions (subs : List (Subscription Model Msg)) (app : App Model Msg) =>
     App.withSubscriptions subs app with
   [init := Subscription.boot subs app.init, update := Subscription.wrap subs app.update,
    template := app.template, dehydrate := app.dehydrate, rehydrate := app.rehydrate]
-
 end Internal
-
 end Qed

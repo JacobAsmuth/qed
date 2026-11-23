@@ -26,54 +26,30 @@ def srgbLinearX1M (c : Nat) : Nat :=
   | 15 => match c % 16 with | 0 => 871367 | 1 => 879622 | 2 => 887923 | 3 => 896269 | 4 => 904661 | 5 => 913099 | 6 => 921582 | 7 => 930111 | 8 => 938686 | 9 => 947307 | 10 => 955973 | 11 => 964686 | 12 => 973445 | 13 => 982251 | 14 => 991102 | _ => 1000000
   | _  => 1000000
 
-/-- WCAG 2.1 relative luminance scaled by `1_000_000` (`0` for black, `1_000_000` for white). -/
 def relLuminanceX1M (r g b : Nat) : Nat :=
   (2126 * srgbLinearX1M r + 7152 * srgbLinearX1M g + 722 * srgbLinearX1M b) / 10000
 
-/-- WCAG 2.1 contrast ratio scaled by `100` (e.g., `450` = `4.50:1`, `2100` = `21.00:1`). -/
 def rgbContrastX100 (c1 c2 : Nat × Nat × Nat) : Nat :=
-  let l1 := relLuminanceX1M c1.1 c1.2.1 c1.2.2
-  let l2 := relLuminanceX1M c2.1 c2.2.1 c2.2.2
-  let hi := max l1 l2
-  let lo := min l1 l2
-  ((hi + 50000) * 100) / (lo + 50000)
+  let l1 := relLuminanceX1M c1.1 c1.2.1 c1.2.2; let l2 := relLuminanceX1M c2.1 c2.2.1 c2.2.2
+  ((max l1 l2 + 50000) * 100) / (min l1 l2 + 50000)
 
-/-- Contrast ratio `× 100` for two `Color` values (`0` if either color lacks an opaque RGB value). -/
 def Color.contrastX100 (fg bg : Color) : Nat :=
-  match fg.rgb?, bg.rgb? with
-  | some c1, some c2 => rgbContrastX100 c1 c2
-  | _, _ => 0
+  match fg.rgb?, bg.rgb? with | some c1, some c2 => rgbContrastX100 c1 c2 | _, _ => 0
 
 def formatContrastX100 (ratio : Nat) : String :=
-  let whole := ratio / 100
-  let frac  := ratio % 100
-  let fracStr := if frac < 10 then s!"0{frac}" else s!"{frac}"
-  s!"{whole}.{fracStr}:1"
+  let frac := ratio % 100
+  s!"{ratio / 100}.{if frac < 10 then "0" else ""}{frac}:1"
 
-def wcagContrastAtLeast (fg bg : Color) (minX100 : Nat) : Bool :=
-  decide (Color.contrastX100 fg bg ≥ minX100)
-
-/-- WCAG 2.1 Level AA normal text contrast (`>= 4.50:1`). -/
+def wcagContrastAtLeast (fg bg : Color) (minX100 : Nat) : Bool := decide (Color.contrastX100 fg bg ≥ minX100)
 def wcagAA (fg bg : Color) : Bool := wcagContrastAtLeast fg bg 450
-
-/-- WCAG 2.1 Level AA large text / UI components contrast (`>= 3.00:1`). -/
 def wcagAALarge (fg bg : Color) : Bool := wcagContrastAtLeast fg bg 300
-
-/-- WCAG 2.1 Level AAA normal text contrast (`>= 7.00:1`). -/
 def wcagAAA (fg bg : Color) : Bool := wcagContrastAtLeast fg bg 700
 
-/-- Checks WCAG contrast across BOTH light mode and dark mode for a pair of typed color tokens. -/
 def TypedToken.wcagCheck (fg bg : TypedToken Color) (minX100 : Nat) : Bool :=
-  let lightOk := match fg.lightVal, bg.lightVal with
-    | some f, some b => wcagContrastAtLeast f b minX100
-    | _, _           => false
-  let darkOk :=
-    if fg.darkVal.isNone && bg.darkVal.isNone then true
-    else
-      match fg.darkVal.orElse (fun _ => fg.lightVal), bg.darkVal.orElse (fun _ => bg.lightVal) with
-      | some f, some b => wcagContrastAtLeast f b minX100
-      | _, _           => false
-  lightOk && darkOk
+  let chk (a b : Option Color) := match a, b with | some f, some bg => wcagContrastAtLeast f bg minX100 | _, _ => false
+  chk fg.lightVal bg.lightVal &&
+    ((fg.darkVal.isNone && bg.darkVal.isNone) ||
+      chk (fg.darkVal.orElse fun _ => fg.lightVal) (bg.darkVal.orElse fun _ => bg.lightVal))
 
 def TypedToken.wcagAA (fg bg : TypedToken Color) : Bool := TypedToken.wcagCheck fg bg 450
 def TypedToken.wcagAALarge (fg bg : TypedToken Color) : Bool := TypedToken.wcagCheck fg bg 300
@@ -81,44 +57,26 @@ def TypedToken.wcagAAA (fg bg : TypedToken Color) : Bool := TypedToken.wcagCheck
 
 /-! ## WCAG Contrast Theorems -/
 
-theorem rgbContrastX100_symm (c1 c2 : Nat × Nat × Nat) :
-    rgbContrastX100 c1 c2 = rgbContrastX100 c2 c1 := by
-  unfold rgbContrastX100
-  simp only [Nat.max_comm, Nat.min_comm]
+theorem rgbContrastX100_symm (c1 c2 : Nat × Nat × Nat) : rgbContrastX100 c1 c2 = rgbContrastX100 c2 c1 := by
+  simp only [rgbContrastX100, Nat.max_comm, Nat.min_comm]
 
-theorem Color.contrastX100_symm (fg bg : Color) :
-    Color.contrastX100 fg bg = Color.contrastX100 bg fg := by
-  unfold Color.contrastX100
-  cases fg.rgb? <;> cases bg.rgb?
-  · rfl
-  · rfl
-  · rfl
-  · exact rgbContrastX100_symm _ _
+theorem Color.contrastX100_symm (fg bg : Color) : Color.contrastX100 fg bg = Color.contrastX100 bg fg := by
+  unfold Color.contrastX100; cases fg.rgb? <;> cases bg.rgb? <;> first | exact rgbContrastX100_symm _ _ | rfl
 
-theorem rgbContrastX100_self (c : Nat × Nat × Nat) :
-    rgbContrastX100 c c = 100 := by
-  unfold rgbContrastX100
-  simp only [Nat.max_self, Nat.min_self]
-  have hpos : 0 < relLuminanceX1M c.1 c.2.1 c.2.2 + 50000 := by omega
-  exact Nat.mul_div_right 100 hpos
+theorem rgbContrastX100_self (c : Nat × Nat × Nat) : rgbContrastX100 c c = 100 := by
+  unfold rgbContrastX100; simp only [Nat.max_self, Nat.min_self]; exact Nat.mul_div_right 100 (Nat.add_pos_right _ (by decide))
 
-theorem Color.contrastX100_self (c : Color) (h : c.rgb?.isSome = true) :
-    Color.contrastX100 c c = 100 := by
-  unfold Color.contrastX100
-  cases hr : c.rgb? with
-  | none => simp [hr] at h
-  | some rgb => exact rgbContrastX100_self rgb
+theorem Color.contrastX100_self (c : Color) (h : c.rgb?.isSome = true) : Color.contrastX100 c c = 100 := by
+  unfold Color.contrastX100; cases hr : c.rgb? with | none => simp [hr] at h | some rgb => exact rgbContrastX100_self rgb
 
-theorem wcagAAA_implies_wcagAA (fg bg : Color) (h : wcagAAA fg bg = true) :
-    wcagAA fg bg = true := by
-  unfold wcagAAA wcagAA wcagContrastAtLeast at *
-  simp only [decide_eq_true_eq] at *
-  omega
+private theorem wcagContrastAtLeast_mono {fg bg : Color} {m n : Nat} (hmn : m ≤ n)
+    (h : wcagContrastAtLeast fg bg n = true) : wcagContrastAtLeast fg bg m = true := by
+  simp only [wcagContrastAtLeast, decide_eq_true_eq] at *; omega
 
-theorem wcagAA_implies_wcagAALarge (fg bg : Color) (h : wcagAA fg bg = true) :
-    wcagAALarge fg bg = true := by
-  unfold wcagAA wcagAALarge wcagContrastAtLeast at *
-  simp only [decide_eq_true_eq] at *
-  omega
+theorem wcagAAA_implies_wcagAA (fg bg : Color) (h : wcagAAA fg bg = true) : wcagAA fg bg = true :=
+  wcagContrastAtLeast_mono (by decide) h
+
+theorem wcagAA_implies_wcagAALarge (fg bg : Color) (h : wcagAA fg bg = true) : wcagAALarge fg bg = true :=
+  wcagContrastAtLeast_mono (by decide) h
 
 end Qed

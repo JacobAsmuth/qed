@@ -3,67 +3,48 @@
 #include <string.h>
 
 static pthread_once_t qed_empty_once = PTHREAD_ONCE_INIT;
-static lean_object *qed_empty_ba = NULL;
-static lean_object *qed_empty_str = NULL;
+static lean_object *qed_empty[2]; /* 0 = ByteArray, 1 = String */
 
-static void qed_init_empty_singletons(void) {
-    lean_object *ba = lean_alloc_sarray(1, 0, 0);
-    lean_mark_persistent(ba);
-    __atomic_store_n(&qed_empty_ba, ba, __ATOMIC_RELEASE);
-    lean_object *s = lean_mk_string("");
-    lean_mark_persistent(s);
-    __atomic_store_n(&qed_empty_str, s, __ATOMIC_RELEASE);
+static void qed_init_empty(void) {
+    lean_object *ba = lean_alloc_sarray(1, 0, 0), *s = lean_mk_string("");
+    lean_mark_persistent(ba); lean_mark_persistent(s);
+    __atomic_store_n(&qed_empty[0], ba, __ATOMIC_RELEASE);
+    __atomic_store_n(&qed_empty[1], s, __ATOMIC_RELEASE);
 }
-
-static inline lean_object *qed_get_empty(lean_object **slot) {
-    lean_object *obj = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
-    if (__builtin_expect(obj != NULL, 1)) return obj;
-    pthread_once(&qed_empty_once, qed_init_empty_singletons);
-    return __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+static inline lean_object *qed_get_empty(int idx) {
+    lean_object *o = __atomic_load_n(&qed_empty[idx], __ATOMIC_ACQUIRE);
+    if (__builtin_expect(o != NULL, 1)) return o;
+    pthread_once(&qed_empty_once, qed_init_empty);
+    return __atomic_load_n(&qed_empty[idx], __ATOMIC_ACQUIRE);
 }
 
 lean_object *qed_lean_io_mk_ok(lean_object *v) { return lean_io_result_mk_ok(v); }
 lean_object *qed_lean_io_mk_err(const char *msg) { return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(msg))); }
-int qed_lean_io_is_ok(lean_object *r) { return lean_io_result_is_ok(r) ? 1 : 0; }
-lean_object *qed_lean_io_val(lean_object *r) { return lean_io_result_get_value(r); }
-
-lean_object *qed_lean_mk_ctor_1(unsigned tag, lean_object *a) {
-    lean_object *o = lean_alloc_ctor(tag, 1, 0);
-    lean_ctor_set(o, 0, a);
-    return o;
-}
-lean_object *qed_lean_mk_prod(lean_object *a, lean_object *b) {
-    lean_object *o = lean_alloc_ctor(0, 2, 0);
-    lean_ctor_set(o, 0, a);
-    lean_ctor_set(o, 1, b);
-    return o;
-}
+lean_object *qed_lean_io_ok_val(lean_object *r) { return lean_io_result_is_ok(r) ? lean_io_result_get_value(r) : NULL; }
+lean_object *qed_lean_mk_ctor_1(unsigned tag, lean_object *a) { lean_object *o = lean_alloc_ctor(tag, 1, 0); lean_ctor_set(o, 0, a); return o; }
+lean_object *qed_lean_mk_prod(lean_object *a, lean_object *b) { lean_object *o = lean_alloc_ctor(0, 2, 0); lean_ctor_set(o, 0, a); lean_ctor_set(o, 1, b); return o; }
 
 lean_object *qed_lean_mk_ba(const uint8_t *data, size_t len) {
-    if (len == 0) return qed_get_empty(&qed_empty_ba);
+    if (len == 0) return qed_get_empty(0);
     lean_object *ba = lean_alloc_sarray(1, len, len);
     if (data) memcpy(lean_sarray_cptr(ba), data, len);
     return ba;
 }
 lean_object *qed_lean_alloc_ba_uninit(size_t cap) { return lean_alloc_sarray(1, 0, cap); }
-uint8_t *qed_lean_ba_ptr(lean_object *ba) { return lean_sarray_cptr(ba); }
-size_t qed_lean_ba_len(lean_object *ba) { return lean_sarray_size(ba); }
+uint8_t *qed_lean_ba_slice(lean_object *ba, size_t *len) { *len = lean_sarray_size(ba); return lean_sarray_cptr(ba); }
 void qed_lean_ba_set_size(lean_object *ba, size_t sz) { lean_sarray_set_size(ba, sz); }
 
 /* Caller (`mk_str(&str)` in Rust) guarantees valid UTF-8. Fast-path unchecked when NUL-free. */
 lean_object *qed_lean_mk_str_bytes(const uint8_t *data, size_t len) {
-    if (len == 0) return qed_get_empty(&qed_empty_str);
-    return memchr(data, 0, len) == NULL
-        ? lean_mk_string_from_bytes_unchecked((const char *)data, len)
-        : lean_mk_string_from_bytes((const char *)data, len);
+    if (len == 0) return qed_get_empty(1);
+    return memchr(data, 0, len) == NULL ? lean_mk_string_from_bytes_unchecked((const char *)data, len)
+                                        : lean_mk_string_from_bytes((const char *)data, len);
 }
-const char *qed_lean_str_cstr(lean_object *s) { return lean_string_cstr(s); }
-size_t qed_lean_str_len(lean_object *s) { size_t n = lean_string_size(s); return n > 0 ? n - 1 : 0; }
+const uint8_t *qed_lean_str_slice(lean_object *s, size_t *len) { size_t n = lean_string_size(s); *len = n ? n - 1 : 0; return (const uint8_t *)lean_string_cstr(s); }
 
 lean_object *qed_lean_array_with_cap(size_t cap) { return lean_alloc_array(0, cap); }
 size_t qed_lean_array_size(lean_object *a) { return lean_array_size(a); }
 lean_object *qed_lean_array_get_core(lean_object *a, size_t i) { return lean_array_get_core(a, i); }
-
 lean_object *qed_lean_ctor_get(lean_object *o, unsigned i) { return lean_ctor_get(o, i); }
 uint8_t qed_lean_ctor_get_u8(lean_object *o, unsigned offset) { return lean_ctor_get_uint8(o, offset); }
 unsigned qed_lean_obj_tag(lean_object *o) { return lean_obj_tag(o); }
@@ -72,39 +53,20 @@ size_t qed_lean_usize_of_nat(lean_object *o) { return lean_usize_of_nat(o); }
 lean_object *qed_lean_int64_to_int(int64_t n) { return lean_int64_to_int(n); }
 int qed_lean_int_to_i64_checked(lean_object *o, int64_t *out) {
     int64_t v = (int64_t)lean_int64_of_int(o);
-    if (!lean_is_scalar(o)) {
-        lean_object *rt = lean_int64_to_int(v);
-        bool ok = lean_int_eq(o, rt);
-        lean_dec(rt);
-        if (!ok) return 0;
-    }
-    *out = v;
-    return 1;
+    if (!lean_is_scalar(o)) { lean_object *rt = lean_int64_to_int(v); bool ok = lean_int_eq(o, rt); lean_dec(rt); if (!ok) return 0; }
+    return (*out = v, 1);
 }
-
-lean_object *qed_lean_box(size_t n) { return lean_box(n); }
-size_t qed_lean_unbox(lean_object *o) { return lean_unbox(o); }
 lean_object *qed_lean_box_u32(uint32_t n) { return lean_box_uint32(n); }
 lean_object *qed_lean_box_u64(uint64_t n) { return lean_box_uint64(n); }
-
 void qed_lean_inc(lean_object *o) { lean_inc(o); }
 void qed_lean_dec(lean_object *o) { lean_dec(o); }
-void qed_lean_dec_ref(lean_object *o) { lean_dec_ref(o); }
-
 lean_object *qed_lean_alloc_ext(lean_external_class *cls, void *data) { return lean_alloc_external(cls, data); }
 void *qed_lean_get_ext(lean_object *o) { return lean_get_external_data(o); }
 
 #if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
 #include <stdarg.h>
-/* Lean's bundled glibc 2.27 sysroot lacks `fcntl64`, while host glibc >= 2.28 headers
-   redirect `libsqlite3-sys`'s `fcntl` calls to `fcntl64`. On 64-bit Linux, `off_t` and
-   `struct flock` are already 64-bit, so `fcntl64` is identical to `fcntl`. */
-extern int fcntl(int fd, int cmd, ...);
+extern int fcntl(int fd, int cmd, ...); /* Weak glibc 2.27 sysroot shim: 64-bit Linux off_t/flock are already 64-bit. */
 __attribute__((weak)) int fcntl64(int fd, int cmd, ...) {
-    va_list ap;
-    va_start(ap, cmd);
-    void *arg = va_arg(ap, void *);
-    va_end(ap);
-    return fcntl(fd, cmd, arg);
+    va_list ap; va_start(ap, cmd); void *arg = va_arg(ap, void *); va_end(ap); return fcntl(fd, cmd, arg);
 }
 #endif

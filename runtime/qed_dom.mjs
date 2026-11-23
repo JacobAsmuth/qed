@@ -1,315 +1,156 @@
 import { mkOk, PUnit } from './qed_rt.mjs';
 
-function Q() {
-  const g = (globalThis.__qed ||= {});
-  g.nodes ||= [null];
-  g.sig ||= new Map();
-  g.sigVals ||= new Map();
-  g.sigEv ||= new Map();
-  g.tmpls ||= [null];
-  return g;
-}
-const ok = mkOk;
+const ok = mkOk, okU = () => ok(PUnit);
+const Q = () => { const g = (globalThis.__qed ||= {}); g.nodes ||= [null]; g.free ||= []; g.sig ||= new Map(); g.sigVals ||= new Map(); g.sigEv ||= new Map(); g.tmpls ||= [null]; return g; };
 
-const SVG_NS   = 'http://www.w3.org/2000/svg';
-const XLINK_NS = 'http://www.w3.org/1999/xlink';
-const XML_NS   = 'http://www.w3.org/XML/1998/namespace';
-const attrNS = (k) => k.startsWith('xlink:') ? XLINK_NS : (k.startsWith('xml:') ? XML_NS : null);
+const SVG_NS = 'http://www.w3.org/2000/svg', XLINK_NS = 'http://www.w3.org/1999/xlink', XML_NS = 'http://www.w3.org/XML/1998/namespace';
+const attrNS = (k) => k.startsWith('xlink:') ? XLINK_NS : k.startsWith('xml:') ? XML_NS : null;
 const attrLocal = (k) => k.slice(k.indexOf(':') + 1);
+const setAttr = (el, k, v, ns, loc) => ns ? (el.getAttributeNS(ns, loc) !== v && el.setAttributeNS(ns, k, v)) : (el.getAttribute(k) !== v && el.setAttribute(k, v));
+
 const managedAttrs = new WeakMap();
-const nodeId = (el) => {
-  if (!el) return 0;
-  const g = Q(), N = g.nodes, id = el.__qedId;
-  if (id !== undefined && N[id] === el) return id;
-  const F = (g.free ||= []);
-  const slot = F.length > 0 ? F.pop() : N.length;
-  N[slot] = el;
-  return (el.__qedId = slot);
-};
+const allocSlot = (el, N, F) => { const slot = F.length > 0 ? F.pop() : N.length; N[slot] = el; return (el.__qedId = slot); };
+const nodeId = (el) => { if (!el) return 0; const g = Q(), N = g.nodes, id = el.__qedId; return (id !== undefined && N[id] === el) ? id : allocSlot(el, N, g.free); };
 const freeSlot = (cur, N, F) => { const id = cur.__qedId; if (id !== undefined && N[id] === cur) { N[id] = null; cur.__qedId = undefined; F.push(id); } };
 const dropNode = (el) => {
   if (!el) return;
-  const g = Q(), N = g.nodes, F = (g.free ||= []);
+  const g = Q(), N = g.nodes, F = g.free;
   if (el.__qedTmpl) { freeSlot(el, N, F); el.__qedSlots = undefined; return; }
-  const sig = g.sig, sigVals = g.sigVals, q = [el];
-  while (q.length > 0) {
-    const cur = q.pop();
+  for (const { sig, sigVals } = g, q = [el]; q.length > 0; ) {
+    const cur = q.pop(), s = cur.__qedSigs;
     freeSlot(cur, N, F);
-    const s = cur.__qedSigs;
-    if (s !== undefined) {
-      for (let i = 0; i < s.length; i++) {
-        const nm = s[i];
-        if (sig.get(nm)?.el === cur) { sig.delete(nm); sigVals.delete(nm); }
-      }
-      cur.__qedSigs = undefined;
-    }
+    if (s) { for (let i = 0; i < s.length; i++) if (sig.get(s[i])?.el === cur) { sig.delete(s[i]); sigVals.delete(s[i]); } cur.__qedSigs = undefined; }
     if (cur.childNodes) for (let i = 0; i < cur.childNodes.length; i++) q.push(cur.childNodes[i]);
   }
 };
 
-const nthChild = (el, idx) => {
-  let c = el.firstChild;
-  for (let i = 0; i < idx && c; i++) c = c.nextSibling;
-  return c;
-};
+const nthChild = (el, idx) => { let c = el.firstChild; for (let i = 0; i < idx && c; i++) c = c.nextSibling; return c; };
 const makeWalker = (path) => {
-  const n = path.length;
+  const [a, b, c] = path, n = path.length;
   if (n === 0) return (r) => r;
-  if (n === 1) { const a = path[0]; return (r) => nthChild(r, a); }
-  if (n === 2) { const a = path[0], b = path[1]; return (r) => nthChild(nthChild(r, a), b); }
-  if (n === 3) { const a = path[0], b = path[1], c = path[2]; return (r) => nthChild(nthChild(nthChild(r, a), b), c); }
+  if (n === 1) return (r) => nthChild(r, a);
+  if (n === 2) return (r) => nthChild(nthChild(r, a), b);
+  if (n === 3) return (r) => nthChild(nthChild(nthChild(r, a), b), c);
   return (r) => { let cur = r; for (let i = 0; i < n && cur; i++) cur = nthChild(cur, path[i]); return cur; };
 };
 const walkOrCreateText = (root, path) => {
-  const n = path.length;
-  if (n === 0) return root;
-  let cur = root;
+  let cur = root; const n = path.length;
   for (let i = 0; i < n - 1 && cur; i++) cur = nthChild(cur, path[i]);
-  if (!cur) return null;
-  const last = path[n - 1];
-  let target = nthChild(cur, last);
-  if (!target) {
-    target = document.createTextNode('');
-    cur.appendChild(target);
-  }
-  return target;
+  if (!n || !cur) return cur;
+  let t = nthChild(cur, path[n - 1]);
+  return t || (cur.appendChild(t = document.createTextNode('')), t);
 };
+
 export const applySignalToEl = (el, attr, s) => {
   if (attr === 'value') { if (el.value !== s) el.value = s; }
   else if (attr === 'checked') { const on = (s !== '' && s !== 'false'); if (el.checked !== on) el.checked = on; }
   else if (attr) { if (el.getAttribute(attr) !== s) el.setAttribute(attr, s); }
   else if (el.textContent !== s) el.textContent = s;
 };
-const writeSlot = (target, kind, attrName, attrNs, attrLocal, v) => {
-  if (!target) return;
-  if (kind === 0) { if (target.nodeValue !== v) target.nodeValue = v; }
-  else if (kind === 1) { if (target.className !== v) target.className = v; }
-  else if (kind === 2) { if (target.value !== v) target.value = v; }
-  else if (attrNs) { if (target.getAttributeNS(attrNs, attrLocal) !== v) target.setAttributeNS(attrNs, attrName, v); }
-  else if (target.getAttribute(attrName) !== v) target.setAttribute(attrName, v);
+const writeSlot = (t, tmpl, j, v) => {
+  const k = t ? tmpl.kinds[j] : -1;
+  if (k === 0) { if (t.nodeValue !== v) t.nodeValue = v; }
+  else if (k === 1) { if (t.className !== v) t.className = v; }
+  else if (k === 2) { if (t.value !== v) t.value = v; }
+  else if (k === 3) setAttr(t, tmpl.attrNames[j], v, tmpl.attrNSs[j], tmpl.attrLocals[j]);
 };
 const cloneAndInitRow = (tmpl, vals) => {
-  const el = tmpl.proto.cloneNode(true);
-  const n = tmpl.n, walkers = tmpl.walkers, kinds = tmpl.kinds;
-  const attrNames = tmpl.attrNames, attrNSs = tmpl.attrNSs, attrLocals = tmpl.attrLocals;
-  const slots = new Array(n);
-  for (let j = 0; j < n; j++) {
-    const t = walkers[j](el);
-    slots[j] = t;
-    const v = vals[j];
-    if (v !== '' && t) writeSlot(t, kinds[j], attrNames[j], attrNSs[j], attrLocals[j], v);
-  }
-  el.__qedSlots = slots;
-  el.__qedTmpl = true;
-  return el;
+  const el = tmpl.proto.cloneNode(true), { n, walkers } = tmpl, slots = new Array(n);
+  for (let j = 0; j < n; j++) { const t = slots[j] = walkers[j](el), v = vals[j]; if (v !== '' && t) writeSlot(t, tmpl, j, v); }
+  return (el.__qedSlots = slots, el.__qedTmpl = true, el);
 };
 
-const fwd = (k) => (...a) => { const w = a.pop(), g = Q(); if (g[k]) g[k](...a); return ok(PUnit, w); };
-const bindSig = (node, name, attr, w) => {
-  const g = Q(), el = g.nodes[node]; if (!el) return ok(PUnit, w);
-  g.sig.set(name, { el, attr });
-  if (el.__qedSigs) el.__qedSigs.push(name); else el.__qedSigs = [name];
-  const v = g.sigVals.get(name);
-  if (v !== undefined) applySignalToEl(el, attr, v);
-  return ok(PUnit, w);
+const fwd = (k) => (...a) => { a.pop(); Q()[k]?.(...a); return okU(); };
+const bindSig = (node, name, attr) => {
+  const g = Q(), el = g.nodes[node];
+  if (el) { g.sig.set(name, { el, attr }); (el.__qedSigs ||= []).push(name); const v = g.sigVals.get(name); if (v !== undefined) applySignalToEl(el, attr, v); }
+  return okU();
 };
-
-const toNameSet = (namesList) => {
-  if (namesList instanceof Set) return namesList;
-  const names = new Set();
-  if (typeof namesList === 'string') {
-    for (const n of JSON.parse(namesList)) names.add(n);
-  } else {
-    for (let cur = namesList; cur && cur.t === 1; cur = cur.f[1]) names.add(cur.f[0]);
-  }
-  return names;
+const toNameSet = (xs) => {
+  if (xs instanceof Set) return xs;
+  if (typeof xs === 'string') return new Set(JSON.parse(xs));
+  const s = new Set(); for (let cur = xs; cur?.t === 1; cur = cur.f[1]) s.add(cur.f[0]); return s;
 };
-
-const placeBefore = (p, c, ref) => {
-  if (!p || !c || ref === c) return;
-  if (c.parentNode === p && p.moveBefore) { try { p.moveBefore(c, ref); return; } catch (e) {} }
-  p.insertBefore(c, ref);
-};
+const placeBefore = (p, c, ref) => { if (!p || !c || ref === c) return; if (c.parentNode === p && p.moveBefore) try { p.moveBefore(c, ref); return; } catch (_) {} p.insertBefore(c, ref); };
 
 export const dom = {
-  createElement(ns, tag, w) { const real = ns || (tag === 'svg' ? SVG_NS : ''); return ok(nodeId(real ? document.createElementNS(real, tag) : document.createElement(tag)), w); },
+  createElement(ns, tag) { const real = ns || (tag === 'svg' ? SVG_NS : ''); return ok(nodeId(real ? document.createElementNS(real, tag) : document.createElement(tag))); },
   // Children inherit SVG namespace inside `<svg>`, except `<foreignObject>` whose content is HTML.
-  childNamespace(node, w) { const el = Q().nodes[node]; const svg = !!el && el.namespaceURI === SVG_NS && el.localName !== 'foreignObject'; return ok(svg ? SVG_NS : '', w); },
-  createText(s, w)      { return ok(nodeId(document.createTextNode(s)), w); },
-  createFragment(w)     { return ok(nodeId(document.createDocumentFragment()), w); },
-  setAttribute(node, k, v, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) { if (el.getAttributeNS(ns, attrLocal(k)) !== v) el.setAttributeNS(ns, k, v); } else if (el.getAttribute(k) !== v) el.setAttribute(k, v); } return ok(PUnit, w); },
-  removeAttribute(node, k, w) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); if (ns) el.removeAttributeNS(ns, attrLocal(k)); else el.removeAttribute(k); } return ok(PUnit, w); },
-  retainAttributes(node, namesList, w) {
+  childNamespace(node) { const el = Q().nodes[node]; return ok(el?.namespaceURI === SVG_NS && el.localName !== 'foreignObject' ? SVG_NS : ''); },
+  createText(s) { return ok(nodeId(document.createTextNode(s))); }, createFragment() { return ok(nodeId(document.createDocumentFragment())); },
+  setAttribute(node, k, v) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); setAttr(el, k, v, ns, ns ? attrLocal(k) : k); } return okU(); },
+  removeAttribute(node, k) { const el = Q().nodes[node]; if (el) { const ns = attrNS(k); ns ? el.removeAttributeNS(ns, attrLocal(k)) : el.removeAttribute(k); } return okU(); },
+  retainAttributes(node, namesList) {
     const el = Q().nodes[node];
-    if (!el?.attributes) return ok(PUnit, w);
+    if (!el?.attributes) return okU();
     const prevRaw = managedAttrs.get(el);
     if (!prevRaw) {
       // Fresh element: defer Set allocation until a subsequent patch actually diffs attributes.
       if (namesList && (typeof namesList === 'string' || namesList.t === 1)) managedAttrs.set(el, namesList);
-      return ok(PUnit, w);
+      return okU();
     }
-    const previous = toNameSet(prevRaw);
-    const names = toNameSet(namesList);
-    // Only remove previously framework-managed attributes (preserving hydration/userland sentinels),
-    // and explicitly reset `value`/`checked` DOM properties that have no backing attribute.
-    if (previous.has('value') && !names.has('value')) el.value = '';
-    if (previous.has('checked') && !names.has('checked')) el.checked = false;
-    for (const attr of [...el.attributes]) {
-      if (previous.has(attr.name) && !names.has(attr.name)) el.removeAttributeNS(attr.namespaceURI, attr.localName);
-    }
-    if (names.size > 0) managedAttrs.set(el, names);
-    else managedAttrs.delete(el);
-    return ok(PUnit, w);
+    const prev = toNameSet(prevRaw), names = toNameSet(namesList);
+    if (prev.has('value') && !names.has('value')) el.value = '';
+    if (prev.has('checked') && !names.has('checked')) el.checked = false;
+    for (const a of [...el.attributes]) if (prev.has(a.name) && !names.has(a.name)) el.removeAttributeNS(a.namespaceURI, a.localName);
+    names.size > 0 ? managedAttrs.set(el, names) : managedAttrs.delete(el);
+    return okU();
   },
-  getAttribute(node, k, w)    { const el = Q().nodes[node]; const v = el ? el.getAttribute(k) : null; return ok(v == null ? '' : v, w); },
-  appState(w) {
-    if (typeof globalThis.__qedHmrState === 'string') {
-      const s = globalThis.__qedHmrState;
-      delete globalThis.__qedHmrState;
-      return ok(s, w);
-    }
-    const el = document.getElementById('qed-state');
-    return ok(el ? el.textContent : '', w);
-  },
-  clearHandlers(node, w) {
-    const el = Q().nodes[node];
-    if (el && el.attributes) {
-      const names = [];
-      for (const a of el.attributes) if (a.name.indexOf('data-qed-on') === 0) names.push(a.name);
-      for (const n of names) el.removeAttribute(n);
-    }
-    return ok(PUnit, w);
-  },
-  setValue(node, v, w)  { const el = Q().nodes[node]; if (el && el.value !== v) el.value = v; return ok(PUnit, w); },
-  setChecked(node, on, w) { const el = Q().nodes[node]; if (el) el.checked = !!on; return ok(PUnit, w); },
-  today(w) { const d = new Date(), p = (n) => (n < 10 ? '0' : '') + n; return ok(`${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`, w); },
-  fetchStream: fwd('fetchStream'),
-  httpSend: fwd('httpSend'),
-  httpSendBytes: fwd('httpSendBytes'),
-  currentPath(w) { return ok(location.pathname + location.search, w); },
-  pushPath(p, w) { history.pushState({}, '', p); return ok(PUnit, w); },
-  appendChild(parent, child, w) { const N = Q().nodes, p = N[parent], c = N[child]; if (p && c) { const isFrag = c.nodeType === 11 || c.localName === '#fragment'; p.appendChild(c); if (isFrag) dropNode(c); } return ok(PUnit, w); },
-  setText(node, s, w) { const el = Q().nodes[node]; if (el && el.textContent !== s) el.textContent = s; return ok(PUnit, w); },
-  childAt(parent, index, w) { const p = Q().nodes[parent]; return ok(nodeId(p ? p.childNodes[index] : null), w); },
-  childCount(parent, w) { const p = Q().nodes[parent]; return ok(p ? p.childNodes.length : 0, w); },
-  appRoot(w) { const root = document.getElementById('app'); return ok(nodeId(root ? root.firstElementChild : null), w); },
-  removeChild(parent, index, w) { const p = Q().nodes[parent], old = p && p.childNodes[index]; if (old) { p.removeChild(old); dropNode(old); } return ok(PUnit, w); },
-  replaceChild(parent, index, newChild, w) { const N = Q().nodes, p = N[parent], c = N[newChild], old = p && p.childNodes[index]; if (old && c) { p.replaceChild(c, old); if (old !== c) dropNode(old); } return ok(PUnit, w); },
-  insertBefore(parent, index, child, w) {
-    const N = Q().nodes, p = N[parent];
-    if (p) placeBefore(p, N[child], p.childNodes[index] || null);
-    return ok(PUnit, w);
-  },
-  insertBeforeRef(parent, ref, child, w) {
-    const N = Q().nodes;
-    placeBefore(N[parent], N[child], ref ? N[ref] : null);
-    return ok(PUnit, w);
-  },
-  removeNode(parent, child, w) {
-    const N = Q().nodes, p = N[parent], c = N[child];
-    if (p && c && c.parentNode === p) { p.removeChild(c); dropNode(c); }
-    return ok(PUnit, w);
-  },
-  clearChildren(parent, w) {
-    const p = Q().nodes[parent];
-    if (p) {
-      for (let c = p.firstChild; c; c = c.nextSibling) dropNode(c);
-      p.textContent = '';
-    }
-    return ok(PUnit, w);
-  },
-  mountRoot(node, w) { const root = document.getElementById('app'), el = Q().nodes[node]; if (root && el) root.replaceChildren(el); return ok(PUnit, w); },
-  isConnected(node, w) { const el = Q().nodes[node]; return ok((el && el.isConnected) ? 1 : 0, w); },
-  effect: fwd('effect'),
-  effectResult: fwd('effectResult'),
-  portSend(name, payload, w) { Q(); const p = globalThis.__qed.ports && globalThis.__qed.ports[name]; if (p) p(payload); return ok(PUnit, w); },
-  bindSignal(node, name, w) { return bindSig(node, name, null, w); },
-  bindSignalAttr: bindSig,
-  getSigSlot(name, w) { return ok(Q().sigEv.get(name) || 0, w); },
-  setSigSlot(name, slot, w) { Q().sigEv.set(name, slot); return ok(PUnit, w); },
-  compileRowTmpl(protoNode, slotPaths, slotAttrs, evPaths, evNames, w) {
+  getAttribute(node, k) { return ok(Q().nodes[node]?.getAttribute(k) ?? ''); },
+  appState() { const s = globalThis.__qedHmrState; if (typeof s === 'string') { delete globalThis.__qedHmrState; return ok(s); } return ok(document.getElementById('qed-state')?.textContent ?? ''); },
+  clearHandlers(node) { const el = Q().nodes[node]; if (el?.attributes) for (const a of [...el.attributes]) if (a.name.startsWith('data-qed-on')) el.removeAttribute(a.name); return okU(); },
+  setValue(node, v) { const el = Q().nodes[node]; if (el && el.value !== v) el.value = v; return okU(); }, setChecked(node, on) { const el = Q().nodes[node]; if (el) el.checked = !!on; return okU(); },
+  setText(node, s) { const el = Q().nodes[node]; if (el && el.textContent !== s) el.textContent = s; return okU(); },
+  today() { const d = new Date(), p = (n) => (n < 10 ? '0' : '') + n; return ok(`${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`); },
+  currentPath() { return ok(location.pathname + location.search); }, pushPath(p) { history.pushState({}, '', p); return okU(); },
+  appendChild(parent, child) { const N = Q().nodes, p = N[parent], c = N[child]; if (p && c) { const f = c.nodeType === 11 || c.localName === '#fragment'; p.appendChild(c); if (f) dropNode(c); } return okU(); },
+  childAt(parent, index) { return ok(nodeId(Q().nodes[parent]?.childNodes[index] ?? null)); }, childCount(parent) { return ok(Q().nodes[parent]?.childNodes.length ?? 0); },
+  appRoot() { return ok(nodeId(document.getElementById('app')?.firstElementChild ?? null)); }, isConnected(node) { return ok(Q().nodes[node]?.isConnected ? 1 : 0); },
+  removeChild(parent, index) { const p = Q().nodes[parent], old = p?.childNodes[index]; if (old) { p.removeChild(old); dropNode(old); } return okU(); },
+  replaceChild(parent, index, newChild) { const N = Q().nodes, p = N[parent], c = N[newChild], old = p?.childNodes[index]; if (old && c) { p.replaceChild(c, old); if (old !== c) dropNode(old); } return okU(); },
+  insertBefore(parent, index, child) { const N = Q().nodes, p = N[parent]; if (p) placeBefore(p, N[child], p.childNodes[index] || null); return okU(); },
+  insertBeforeRef(parent, ref, child) { const N = Q().nodes; placeBefore(N[parent], N[child], ref ? N[ref] : null); return okU(); },
+  removeNode(parent, child) { const N = Q().nodes, p = N[parent], c = N[child]; if (p && c && c.parentNode === p) { p.removeChild(c); dropNode(c); } return okU(); },
+  clearChildren(parent) { const p = Q().nodes[parent]; if (p) { for (let c = p.firstChild; c; c = c.nextSibling) dropNode(c); p.textContent = ''; } return okU(); },
+  mountRoot(node) { const root = document.getElementById('app'), el = Q().nodes[node]; if (root && el) root.replaceChildren(el); return okU(); },
+  portSend(name, payload) { Q().ports?.[name]?.(payload); return okU(); },
+  bindSignal(node, name) { return bindSig(node, name, null); }, bindSignalAttr: bindSig,
+  getSigSlot(name) { return ok(Q().sigEv.get(name) || 0); }, setSigSlot(name, slot) { Q().sigEv.set(name, slot); return okU(); },
+  compileRowTmpl(protoNode, slotPaths, slotAttrs, evPaths, evNames) {
     const g = Q(), proto = g.nodes[protoNode];
-    if (!proto) return ok(0, w);
-    // Detach prototype subtree from node/managedAttrs tables; cloned rows only register their root.
-    dropNode(proto);
-    const n = slotPaths.length;
-    const walkers = new Array(n), kinds = new Uint8Array(n);
-    const attrNames = new Array(n), attrNSs = new Array(n), attrLocals = new Array(n);
-    for (let i = 0; i < n; i++) {
-      walkers[i] = makeWalker(slotPaths[i]);
-      const a = attrNames[i] = slotAttrs[i];
-      if (a === '') kinds[i] = 0;
-      else if (a === 'class') kinds[i] = 1;
-      else if (a === 'value') kinds[i] = 2;
-      else { kinds[i] = 3; const ns = attrNSs[i] = attrNS(a); attrLocals[i] = ns ? attrLocal(a) : a; }
-    }
-    const evN = evPaths.length, evWalkers = new Array(evN);
-    for (let i = 0; i < evN; i++) {
-      const wk = makeWalker(evPaths[i]);
-      evWalkers[i] = wk;
-      const target = wk(proto);
-      if (target) target.setAttribute('data-qed-row-on-' + evNames[i], String(i));
-    }
-    const id = g.tmpls.length;
-    g.tmpls.push({ proto, n, slotPaths, walkers, kinds, attrNames, attrNSs, attrLocals, evN, evWalkers, evNames });
-    return ok(id, w);
+    if (!proto) return ok(0);
+    dropNode(proto); // Detach prototype subtree; cloned rows only register their root.
+    const n = slotPaths.length, walkers = slotPaths.map(makeWalker), attrNames = slotAttrs.slice();
+    const kinds = Uint8Array.from(attrNames, (a) => a === '' ? 0 : a === 'class' ? 1 : a === 'value' ? 2 : 3);
+    const attrNSs = attrNames.map((a, i) => kinds[i] === 3 ? attrNS(a) : null);
+    const attrLocals = attrNames.map((a, i) => attrNSs[i] ? attrLocal(a) : a);
+    const evWalkers = evPaths.map((p, i) => { const w = makeWalker(p); w(proto)?.setAttribute('data-qed-row-on-' + evNames[i], String(i)); return w; });
+    return ok(g.tmpls.push({ proto, n, slotPaths, walkers, kinds, attrNames, attrNSs, attrLocals, evN: evPaths.length, evWalkers, evNames }) - 1);
   },
-  mountTmplRow(tmplId, vals, w) {
-    const tmpl = Q().tmpls[tmplId];
-    if (!tmpl) return ok(0, w);
-    return ok(nodeId(cloneAndInitRow(tmpl, vals)), w);
-  },
-  mountTmplRows(parent, tmplId, valsPerRow, w) {
-    const g = Q(), p = g.nodes[parent], tmpl = g.tmpls[tmplId];
-    const m = valsPerRow.length, ids = new Array(m);
+  mountTmplRow(tmplId, vals) { const tmpl = Q().tmpls[tmplId]; return ok(tmpl ? nodeId(cloneAndInitRow(tmpl, vals)) : 0); },
+  mountTmplRows(parent, tmplId, valsPerRow) {
+    const g = Q(), p = g.nodes[parent], tmpl = g.tmpls[tmplId], m = valsPerRow.length, ids = new Array(m);
     ids.r = 1;
-    if (!p || !tmpl) { ids.fill(0); return ok(ids, w); }
-    const N = g.nodes, F = (g.free ||= []);
-    const frag = document.createDocumentFragment();
-    for (let i = 0; i < m; i++) {
-      const el = cloneAndInitRow(tmpl, valsPerRow[i]);
-      const slot = F.length > 0 ? F.pop() : N.length;
-      N[slot] = el;
-      el.__qedId = slot;
-      ids[i] = slot;
-      frag.appendChild(el);
-    }
+    if (!p || !tmpl) { ids.fill(0); return ok(ids); }
+    const N = g.nodes, F = g.free, frag = document.createDocumentFragment();
+    for (let i = 0; i < m; i++) { const el = cloneAndInitRow(tmpl, valsPerRow[i]); ids[i] = allocSlot(el, N, F); frag.appendChild(el); }
     p.appendChild(frag);
-    return ok(ids, w);
+    return ok(ids);
   },
-  patchTmplRow(node, tmplId, newVals, oldVals, w) {
+  patchTmplRow(node, tmplId, newVals, oldVals) {
+    const g = Q(), el = g.nodes[node], tmpl = g.tmpls[tmplId], slots = el?.__qedSlots;
+    if (slots && tmpl) for (let j = 0; j < tmpl.n; j++) { const v = newVals[j]; if (!oldVals || oldVals[j] !== v) writeSlot(slots[j], tmpl, j, v); }
+    return okU();
+  },
+  hydrateTmplRow(node, tmplId) {
     const g = Q(), el = g.nodes[node], tmpl = g.tmpls[tmplId];
-    if (!el || !tmpl) return ok(PUnit, w);
-    const slots = el.__qedSlots;
-    if (!slots) return ok(PUnit, w);
-    const n = tmpl.n, kinds = tmpl.kinds, attrNames = tmpl.attrNames, attrNSs = tmpl.attrNSs, attrLocals = tmpl.attrLocals;
-    for (let j = 0; j < n; j++) {
-      const v = newVals[j];
-      if (oldVals && oldVals[j] === v) continue;
-      writeSlot(slots[j], kinds[j], attrNames[j], attrNSs[j], attrLocals[j], v);
-    }
-    return ok(PUnit, w);
+    if (!el || !tmpl) return okU();
+    const slots = new Array(tmpl.n);
+    for (let j = 0; j < tmpl.n; j++) slots[j] = tmpl.kinds[j] === 0 ? walkOrCreateText(el, tmpl.slotPaths[j]) : tmpl.walkers[j](el);
+    for (let j = 0; j < tmpl.evN; j++) { const t = tmpl.evWalkers[j](el); if (t) { t.removeAttribute('data-qed-on-' + tmpl.evNames[j]); t.setAttribute('data-qed-row-on-' + tmpl.evNames[j], String(j)); } }
+    return (el.__qedSlots = slots, el.__qedTmpl = true, okU());
   },
-  hydrateTmplRow(node, tmplId, w) {
-    const g = Q(), el = g.nodes[node], tmpl = g.tmpls[tmplId];
-    if (!el || !tmpl) return ok(PUnit, w);
-    const n = tmpl.n, slots = new Array(n);
-    for (let j = 0; j < n; j++) {
-      slots[j] = tmpl.kinds[j] === 0 ? walkOrCreateText(el, tmpl.slotPaths[j]) : tmpl.walkers[j](el);
-    }
-    for (let j = 0; j < tmpl.evN; j++) {
-      const target = tmpl.evWalkers[j](el);
-      if (target) {
-        target.removeAttribute('data-qed-on-' + tmpl.evNames[j]);
-        target.setAttribute('data-qed-row-on-' + tmpl.evNames[j], String(j));
-      }
-    }
-    el.__qedSlots = slots;
-    el.__qedTmpl = true;
-    return ok(PUnit, w);
-  },
-  wsOpen(connId, url, isBin, w) { const fn = Q().wsOpen; if (fn) fn(connId, url, !!isBin); return ok(PUnit, w); },
-  wsSendBytes: fwd('wsSendBytes'),
-  wsSendText: fwd('wsSendText'),
-  wsClose: fwd('wsClose'),
+  wsOpen(connId, url, isBin) { Q().wsOpen?.(connId, url, !!isBin); return okU(); },
+  fetchStream: fwd('fetchStream'), httpSend: fwd('httpSend'), httpSendBytes: fwd('httpSendBytes'), effect: fwd('effect'),
+  effectResult: fwd('effectResult'), wsSendBytes: fwd('wsSendBytes'), wsSendText: fwd('wsSendText'), wsClose: fwd('wsClose'),
 };

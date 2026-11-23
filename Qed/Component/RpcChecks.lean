@@ -5,236 +5,148 @@ namespace Qed
 section CompElab
 open Lean Elab Command Term Meta Qed.Lang
 
-structure CheckOrigin where
-  callRef    : Syntax
-  srvShort   : String
-  methodName : String
-  argExprs   : Array Expr
-  lctx       : LocalContext
-  localInsts : LocalInstances
-  mctx       : MetavarContext
+structure CheckOrigin where mk ::
+  (callRef : Syntax) (srvShort methodName : String) (argExprs : Array Expr)
+  (lctx : LocalContext) (localInsts : LocalInstances) (mctx : MetavarContext)
 
-structure PendingRpcCheck extends CheckOrigin where
-  reqConst?    : Option Name
-  reqLabel     : String
-  requiresAuth : Bool
-  sessionVar?  : Option Name
+structure PendingRpcCheck extends CheckOrigin where mk ::
+  (reqConst? : Option Name) (reqLabel : String) (requiresAuth : Bool) (sessionVar? : Option Name)
 
-structure PendingPredictCheck extends CheckOrigin where
-  ensConst  : Name
-  isOptWrap : Bool
-  predExpr  : Expr
+structure PendingPredictCheck extends CheckOrigin where mk ::
+  (ensConst : Name) (isOptWrap : Bool) (predExpr : Expr)
 
-initialize pendingRpcChecks : IO.Ref (Array PendingRpcCheck) ← IO.mkRef #[]
-initialize pendingPredictChecks : IO.Ref (Array PendingPredictCheck) ← IO.mkRef #[]
-initialize currentCompSessionRef : IO.Ref (Option Ident) ← IO.mkRef none
+initialize pendingRpcChecks      : IO.Ref (Array PendingRpcCheck)     ← IO.mkRef #[]
+initialize pendingPredictChecks  : IO.Ref (Array PendingPredictCheck) ← IO.mkRef #[]
+initialize currentCompSessionRef : IO.Ref (Option Ident)              ← IO.mkRef none
 
 private def elabArgExprs (argTerms : Array Term) (paramTypeConsts : Array Name) : TermElabM (Array Expr) :=
-  argTerms.zipIdx.mapM fun (aT, i) => do
-    instantiateMVars (← elabTermEnsuringType aT (Lean.mkConst paramTypeConsts[i]!))
+  argTerms.zipIdx.mapM fun (aT, i) => do instantiateMVars (← elabTermEnsuringType aT (Lean.mkConst paramTypeConsts[i]!))
 
-private def extractArgExprsAndRecordRpcCheck (stx : Syntax) (resExpr : Expr)
+private def captureOrigin (callRef : Syntax) (srvShort methodName : String) (argExprs : Array Expr) : TermElabM CheckOrigin :=
+  return .mk callRef srvShort methodName argExprs (← getLCtx) (← getLocalInstances) (← getMCtx)
+
+private def elabAndRecordRpcLikeCheck (stx : Syntax) (expectedType? : Option Expr) (fullCall : Term)
     (fnConst : Name) (argTerms : Array Term) (paramCount : Nat) (paramTypeConsts : Array Name)
-    (srvShort methodName : String) (reqConst? : Option Name) (reqLabel : String)
-    (requiresAuth : Bool) (shouldRecord : Bool) : TermElabM Unit := do
-  let fnArgs := resExpr.getAppArgs
-  let argExprs ←
-    if resExpr.isAppOf fnConst && fnArgs.size ≥ 2 + paramCount then
-      (Array.range paramCount).mapM fun i => instantiateMVars fnArgs[2 + i]!
-    else elabArgExprs argTerms paramTypeConsts
-  if shouldRecord then
-    pendingRpcChecks.modify (·.push {
-      callRef := stx, srvShort, methodName, reqConst?, reqLabel, requiresAuth, argExprs,
-      lctx := ← getLCtx, localInsts := ← getLocalInstances, mctx := ← getMCtx,
-      sessionVar? := (← currentCompSessionRef.get).map (·.getId)
-    })
-
-private def lookupCheckedMethod (stx : Syntax) (srvId methId : Ident) (label : String) :
-    TermElabM (ServerInfo × ServerMethodInfo) := do
-  let srvName := srvId.getId; let methStr := methId.getId.toString
-  let some srvInfo := (serverRegistry.getState (← getEnv)).find? srvName
-    | throwErrorAt stx s!"internal: unknown server `{srvName}` in {label}"
-  let some mInfo := srvInfo.methods.find? (·.name == methStr)
-    | throwErrorAt stx s!"internal: unknown method `{methStr}` on `{srvName}` in {label}"
-  return (srvInfo, mInfo)
-
-@[term_elab qedCheckRpcCallTerm]
-def elabQedCheckRpcCall : TermElab := fun stx expectedType? => do
-  let argTerms : Array Term := (stx.getArg 4).getSepArgs.map (⟨·⟩)
-  let cbTerm : Term := ⟨(stx.getArg 6)⟩
-  let (srvInfo, mInfo) ← lookupCheckedMethod stx ⟨stx.getArg 1⟩ ⟨stx.getArg 2⟩ "RPC check"
-  let fullCall ← Qed.Lang.mkAppTerms (mkIdentFrom stx mInfo.rawRpcConst) (argTerms.push cbTerm)
+    (srvShort methodName : String) (reqConst? : Option Name) (reqLabel : String) (requiresAuth shouldRecord : Bool) : TermElabM Expr := do
   let resExpr ← instantiateMVars (← elabTerm fullCall expectedType?)
-  extractArgExprsAndRecordRpcCheck stx resExpr mInfo.rawRpcConst argTerms mInfo.paramCount mInfo.paramTypeConsts
-    srvInfo.shortName mInfo.name mInfo.clientReqConst mInfo.clientReqLabel mInfo.requiresAuth
-    (mInfo.hasClientReq || mInfo.requiresAuth)
+  let fnArgs := resExpr.getAppArgs
+  let argExprs ← if resExpr.isAppOf fnConst && fnArgs.size ≥ 2 + paramCount then
+    (Array.range paramCount).mapM fun i => instantiateMVars fnArgs[2 + i]! else elabArgExprs argTerms paramTypeConsts
+  if shouldRecord then
+    let origin ← captureOrigin stx srvShort methodName argExprs
+    let sessionVar? := (← currentCompSessionRef.get).map (·.getId)
+    pendingRpcChecks.modify (·.push (.mk origin reqConst? reqLabel requiresAuth sessionVar?))
   return resExpr
 
-@[term_elab qedCheckPredictTerm]
-def elabQedCheckPredict : TermElab := fun stx expectedType? => do
+private def lookupCheckedMethod (stx : Syntax) (srvId methId : Ident) (label : String) : TermElabM (ServerInfo × ServerMethodInfo) := do
+  let (srvName, methStr) := (srvId.getId, methId.getId.toString)
+  let some srvInfo := (serverRegistry.getState (← getEnv)).find? srvName | throwErrorAt stx s!"internal: unknown server `{srvName}` in {label}"
+  let some mInfo := srvInfo.methods.find? (·.name == methStr) | throwErrorAt stx s!"internal: unknown method `{methStr}` on `{srvName}` in {label}"
+  return (srvInfo, mInfo)
+
+@[term_elab qedCheckRpcCallTerm] def elabQedCheckRpcCall : TermElab := fun stx expectedType? => do
   let argTerms : Array Term := (stx.getArg 4).getSepArgs.map (⟨·⟩)
-  let predTerm : Term := ⟨(stx.getArg 6)⟩
+  let (srvInfo, mInfo) ← lookupCheckedMethod stx ⟨stx.getArg 1⟩ ⟨stx.getArg 2⟩ "RPC check"
+  let fullCall ← Qed.Lang.mkAppTerms (mkIdentFrom stx mInfo.rawRpcConst) (argTerms.push ⟨stx.getArg 6⟩)
+  elabAndRecordRpcLikeCheck stx expectedType? fullCall mInfo.rawRpcConst argTerms mInfo.paramCount mInfo.paramTypeConsts
+    srvInfo.shortName mInfo.name mInfo.clientReqConst mInfo.clientReqLabel mInfo.requiresAuth (mInfo.hasClientReq || mInfo.requiresAuth)
+
+@[term_elab qedCheckPredictTerm] def elabQedCheckPredict : TermElab := fun stx expectedType? => do
+  let argTerms : Array Term := (stx.getArg 4).getSepArgs.map (⟨·⟩)
   let (srvInfo, mInfo) ← lookupCheckedMethod stx ⟨stx.getArg 1⟩ ⟨stx.getArg 2⟩ "predict check"
-  let predExpr ← elabTerm predTerm expectedType?
-  synthesizeSyntheticMVarsNoPostponing
+  let predExpr ← elabTerm (stx.getArg 6) expectedType?; synthesizeSyntheticMVarsNoPostponing
   let predExpr ← instantiateMVars predExpr
-  if mInfo.hasEnsures then
-    if let some ensConst := mInfo.ensPredConst then
-      let argExprs ← elabArgExprs argTerms mInfo.paramTypeConsts
-      let predTy ← Meta.whnf (← Meta.inferType predExpr)
-      pendingPredictChecks.modify (·.push {
-        callRef := stx, srvShort := srvInfo.shortName, methodName := mInfo.name,
-        ensConst, isOptWrap := mInfo.isOption && predTy.isAppOfArity ``Option 1,
-        argExprs, predExpr,
-        lctx := ← getLCtx, localInsts := ← getLocalInstances, mctx := ← getMCtx
-      })
+  if mInfo.hasEnsures then if let some ensConst := mInfo.ensPredConst then
+    let origin ← captureOrigin stx srvInfo.shortName mInfo.name (← elabArgExprs argTerms mInfo.paramTypeConsts)
+    let predTy ← Meta.whnf (← Meta.inferType predExpr)
+    pendingPredictChecks.modify (·.push (.mk origin ensConst (mInfo.isOption && predTy.isAppOfArity ``Option 1) predExpr))
   return predExpr
 
-def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) :
-    CommandElabM Unit := do
-  let checks ← pendingRpcChecks.get
-  let predChecks ← pendingPredictChecks.get
+def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) : CommandElabM Unit := do
+  let (checks, predChecks) := (← pendingRpcChecks.get, ← pendingPredictChecks.get)
   if checks.isEmpty && predChecks.isEmpty then return
   let stateConstName ← liftCoreM <| realizeGlobalConstNoOverload spec.stateId
+  let mkProofLctx (lctx : LocalContext) : LocalContext := lctx.foldl (init := {}) fun acc decl =>
+    if decl.isAuxDecl then acc else match decl with
+    | .ldecl _ fv nm ty val _ k => acc.mkLetDecl fv nm ty val (nondep := false) (kind := k)
+    | .cdecl _ fv nm ty bi k    => acc.mkLocalDecl fv nm ty bi (kind := k)
   let buildInvProps (lctx : LocalContext) : TermElabM (Array Expr × Option Expr) := do
-    let mut invProps : Array Expr := #[]
-    let mut stateFVar? : Option Expr := none
+    let mut invProps : Array Expr := #[]; let mut stateFVar? : Option Expr := none
+    let fnTy := Expr.forallE `_ (Lean.mkConst stateConstName) (Expr.sort Level.zero) .default
     for decl in lctx do
       if !decl.isImplementationDetail && !decl.isLet then
         if (← Meta.whnf decl.type).isConstOf stateConstName then
           if stateFVar?.isNone then stateFVar? := some decl.toExpr
-          let fnTy := Expr.forallE `_ (Lean.mkConst stateConstName) (Expr.sort Level.zero) .default
           for predT in invPreds do
-            let predExpr ← Term.elabTermEnsuringType predT fnTy
-            Term.synthesizeSyntheticMVarsNoPostponing
-            let predExpr ← instantiateMVars predExpr
-            invProps := invProps.push ((Expr.app predExpr decl.toExpr).headBeta)
+            let predExpr ← Term.elabTermEnsuringType predT fnTy; Term.synthesizeSyntheticMVarsNoPostponing
+            invProps := invProps.push ((Expr.app (← instantiateMVars predExpr) decl.toExpr).headBeta)
     return (invProps, stateFVar?)
-  let cleanGoalExpr (e : Expr) : MetaM String := do
-    let e ← instantiateMVars e
-    let e ← Meta.zetaReduce e
-    Qed.Diag.ppQedExpr e ["m"]
-  let tryDischargeWith (invProps : Array Expr) (goalBody : Expr)
-      (tac : Tactic.TacticM Unit) (fallbackUnfold : Expr → MetaM Expr) :
-      TermElabM (Except String (Expr × Expr)) := do
-    let fullGoal ← invProps.foldrM (init := goalBody) fun hyp acc =>
-      pure (Expr.forallE `_ hyp acc .default)
-    let fullGoal ← instantiateMVars fullGoal
+  let cleanGoalExpr (e : Expr) : MetaM String := do Qed.Diag.ppQedExpr (← Meta.zetaReduce (← instantiateMVars e)) ["m"]
+  let tryDischargeWith (invProps : Array Expr) (goalBody : Expr) (tac : Tactic.TacticM Unit) (fallbackUnfold : Expr → MetaM Expr) : TermElabM (Except String (Expr × Expr)) := do
+    let fullGoal ← instantiateMVars (invProps.foldr (init := goalBody) fun hyp acc => Expr.forallE `_ hyp acc .default)
     let mv ← Meta.mkFreshExprSyntheticOpaqueMVar fullGoal
     try
       let unsolved ← Tactic.run mv.mvarId! tac
       if unsolved.isEmpty then return .ok (fullGoal, mv)
       return .error (← unsolved[0]!.withContext do cleanGoalExpr (← unsolved[0]!.getType))
-    catch _ =>
-      return .error (← cleanGoalExpr (← fallbackUnfold goalBody))
-  let mkProofLctx (lctx : LocalContext) : LocalContext :=
-    lctx.foldl (init := {}) fun acc decl =>
-      if decl.isAuxDecl then acc
-      else match decl with
-      | .ldecl _ fv nm ty val _ k => acc.mkLetDecl fv nm ty val (nondep := false) (kind := k)
-      | .cdecl _ fv nm ty bi k    => acc.mkLocalDecl fv nm ty bi (kind := k)
+    catch _ => return .error (← cleanGoalExpr (← fallbackUnfold goalBody))
+  let withOrigin (o : CheckOrigin) (k : LocalContext → Array Expr → Option Expr → TermElabM Unit) : CommandElabM Unit :=
+    liftTermElabM do
+      let proofLctx := mkProofLctx o.lctx
+      Meta.withMCtx o.mctx <| withLCtx proofLctx o.localInsts do let (invProps, stateFVar?) ← buildInvProps o.lctx; k proofLctx invProps stateFVar?
   let fmtObl (obl : String) : String := if obl.isEmpty then "" else s!"\n  • must satisfy:  {obl}"
   for chk in checks do
-    liftTermElabM do
-      Meta.withMCtx chk.mctx <| withLCtx (mkProofLctx chk.lctx) chk.localInsts do
-        let (invProps, stateFVar?) ← buildInvProps chk.lctx
-        let tryDischarge (g : Expr) := tryDischargeWith invProps g
-          (do Tactic.evalTactic (← `(tactic| intros; qedProveRpcReq)))
-          (fun e => return (← Meta.unfoldDefinition? e).getD e)
-        if chk.requiresAuth then
-          let some sfName := chk.sessionVar?
-            | throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`ctx.userId != none`), but `{spec.t.getId}` has no `session` field.\n\nHint: Add `session user` to `{spec.t.getId}` and guard the call with `if user.isSome:`."
-          let sfExpr : Expr ←
-            match chk.lctx.findDecl? fun decl =>
-                if !decl.isImplementationDetail && decl.userName.eraseMacroScopes == sfName then some decl.toExpr else none with
-            | some e => pure e
-            | none =>
-                let some sFVar := stateFVar?
-                  | throwErrorAt chk.callRef m!"internal: could not locate component state while checking session auth for `{chk.srvShort}.{chk.methodName}`"
-                Meta.mkProjection sFVar sfName
-          let sfTy ← Meta.whnf (← Meta.inferType sfExpr)
-          let elemTy := if sfTy.isAppOfArity ``Option 1 then sfTy.appArg! else Lean.mkConst ``String
-          let noneExpr ← Meta.mkAppOptM ``Option.none #[some elemTy]
-          let authGoal ← Meta.mkAppM ``Ne #[sfExpr, noneExpr]
-          if (← tryDischarge authGoal) matches .error _ then
-            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`{sfName} != none`), which could not be proved here.\n\nHint: Guard this call with `if {sfName}.isSome:` or `invariant ...: {sfName}.isSome`."
-        if let some reqConst := chk.reqConst? then
-          let reqGoal := mkAppN (Lean.mkConst reqConst) chk.argExprs
-          if let .error obl ← tryDischarge reqGoal then
-            throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` precondition `{chk.reqLabel}` could not be proved here:{fmtObl obl}\n\nHint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`."
+    withOrigin chk.toCheckOrigin fun _ invProps stateFVar? => do
+      let tryDischarge (g : Expr) := tryDischargeWith invProps g (do Tactic.evalTactic (← `(tactic| intros; qedProveRpcReq))) (fun e => return (← Meta.unfoldDefinition? e).getD e)
+      if chk.requiresAuth then
+        let some sfName := chk.sessionVar?
+          | throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`ctx.userId != none`), but `{spec.t.getId}` has no `session` field.\n\nHint: Add `session user` to `{spec.t.getId}` and guard the call with `if user.isSome:`."
+        let sfExpr : Expr ← match chk.lctx.findDecl? fun d => if !d.isImplementationDetail && d.userName.eraseMacroScopes == sfName then some d.toExpr else none with
+          | some e => pure e
+          | none   => let some sFVar := stateFVar? | throwErrorAt chk.callRef m!"internal: could not locate component state while checking session auth for `{chk.srvShort}.{chk.methodName}`"
+                      Meta.mkProjection sFVar sfName
+        let sfTy ← Meta.whnf (← Meta.inferType sfExpr)
+        let elemTy := if sfTy.isAppOfArity ``Option 1 then sfTy.appArg! else Lean.mkConst ``String
+        if (← tryDischarge (← Meta.mkAppM ``Ne #[sfExpr, ← Meta.mkAppOptM ``Option.none #[some elemTy]])) matches .error _ then
+          throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` requires an authenticated session (`{sfName} != none`), which could not be proved here.\n\nHint: Guard this call with `if {sfName}.isSome:` or `invariant ...: {sfName}.isSome`."
+      if let some reqConst := chk.reqConst? then
+        if let .error obl ← tryDischarge (mkAppN (Lean.mkConst reqConst) chk.argExprs) then
+          throwErrorAt chk.callRef m!"RPC `{chk.srvShort}.{chk.methodName}` precondition `{chk.reqLabel}` could not be proved here:{fmtObl obl}\n\nHint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`."
   let currNs ← getCurrNamespace
   for (chk, idx) in predChecks.zipIdx do
-    liftTermElabM do
-      let proofLctx := mkProofLctx chk.lctx
-      Meta.withMCtx chk.mctx <| withLCtx proofLctx chk.localInsts do
-        let (invProps, _) ← buildInvProps chk.lctx
-        let ensGoal : Expr ←
-          if chk.isOptWrap then
-            let predTy ← Meta.whnf (← Meta.inferType chk.predExpr)
-            let innerTy := predTy.appArg!
-            Meta.withLocalDeclD `_predInner innerTy fun vFVar => do
-              let someV ← Meta.mkAppOptM ``Option.some #[some innerTy, some vFVar]
-              let eqHyp ← Meta.mkEq chk.predExpr someV
-              let body := mkAppN (Lean.mkConst chk.ensConst) (chk.argExprs.push vFVar)
-              Meta.mkForallFVars #[vFVar] (Expr.forallE `_hPredSome eqHyp body .default)
-          else
-            pure (mkAppN (Lean.mkConst chk.ensConst) (chk.argExprs.push chk.predExpr))
-        let ensId := mkIdent (`_root_ ++ chk.ensConst)
-        match ← tryDischargeWith invProps ensGoal
-            (do Tactic.evalTactic (← `(tactic| intros; try simp only [$ensId:ident]; try qedProveRpcReq)))
-            (fun e => return (← Meta.unfold e chk.ensConst).expr) with
-        | .ok (fullGoal, mv) =>
-            -- Submit the complete proof term directly to Lean's kernel as a verified theorem
-            -- so it is typechecked by the kernel and audited by `qed check`.
-            let fvars := proofLctx.foldl (init := #[]) fun acc d =>
-              if d.isAuxDecl then acc else acc.push d.toExpr
-            let proofVal ← instantiateMVars mv
-            let closedType ← instantiateMVars (← Meta.mkForallFVars (usedOnly := false) (usedLetOnly := false) fvars fullGoal)
-            let closedVal ← instantiateMVars (← Meta.mkLambdaFVars (usedOnly := false) (usedLetOnly := false) fvars proofVal)
-            let levelParams := (collectLevelParams (collectLevelParams {} closedType) closedVal).params.toList
-            let thmName := currNs ++ spec.t.getId ++ Name.mkSimple s!"_specPredict_ens_{idx}"
-            Lean.addDecl (.thmDecl {
-              name := thmName
-              levelParams
-              type := closedType
-              value := closedVal
-            })
-        | .error obl =>
-            throwErrorAt chk.callRef m!"Predicted response for `{chk.srvShort}.{chk.methodName}` does not satisfy server `ensures` postcondition:{fmtObl obl}\n\nHint: Ensure the predicted value satisfies the server method's `ensures` clause (or guard it inside a `predict:` block)."
+    withOrigin chk.toCheckOrigin fun proofLctx invProps _ => do
+      let ensGoal : Expr ← if chk.isOptWrap then
+        let innerTy := (← Meta.whnf (← Meta.inferType chk.predExpr)).appArg!
+        Meta.withLocalDeclD `_predInner innerTy fun vFVar => do
+          let eqHyp ← Meta.mkEq chk.predExpr (← Meta.mkAppOptM ``Option.some #[some innerTy, some vFVar])
+          Meta.mkForallFVars #[vFVar] (Expr.forallE `_hPredSome eqHyp (mkAppN (Lean.mkConst chk.ensConst) (chk.argExprs.push vFVar)) .default)
+      else pure (mkAppN (Lean.mkConst chk.ensConst) (chk.argExprs.push chk.predExpr))
+      let ensId := mkIdent (`_root_ ++ chk.ensConst)
+      match ← tryDischargeWith invProps ensGoal (do Tactic.evalTactic (← `(tactic| intros; try simp only [$ensId:ident]; try qedProveRpcReq))) (fun e => return (← Meta.unfold e chk.ensConst).expr) with
+      | .ok (fullGoal, mv) =>
+          let fvars := proofLctx.foldl (init := #[]) fun acc d => if d.isAuxDecl then acc else acc.push d.toExpr
+          let closedType ← instantiateMVars (← Meta.mkForallFVars (usedOnly := false) (usedLetOnly := false) fvars fullGoal)
+          let closedVal ← instantiateMVars (← Meta.mkLambdaFVars (usedOnly := false) (usedLetOnly := false) fvars (← instantiateMVars mv))
+          let levelParams := (collectLevelParams (collectLevelParams {} closedType) closedVal).params.toList
+          Lean.addDecl (.thmDecl { name := currNs ++ spec.t.getId ++ Name.mkSimple s!"_specPredict_ens_{idx}", levelParams, type := closedType, value := closedVal })
+      | .error obl =>
+          throwErrorAt chk.callRef m!"Predicted response for `{chk.srvShort}.{chk.methodName}` does not satisfy server `ensures` postcondition:{fmtObl obl}\n\nHint: Ensure the predicted value satisfies the server method's `ensures` clause (or guard it inside a `predict:` block)."
 
-private def lookupCheckedChannel (stx : Syntax) (label : String) : TermElabM Qed.ChannelInfo := do
+private def elabAndRecordChanCheck (stx : Syntax) (expectedType? : Option Expr) (label : String)
+    (argTerms : Array Term) (slotLit : TSyntax `str) (trailingArgs : Array Term) (isSub : Bool) : TermElabM Expr := do
   let chFullName := (stx.getArg 1).getId
-  let some chInfo := (Qed.channelRegistry.getState (← getEnv)).find? chFullName
-    | throwErrorAt stx s!"internal: unknown channel `{chFullName}` in {label}"
-  return chInfo
+  let some chInfo := (Qed.channelRegistry.getState (← getEnv)).find? chFullName | throwErrorAt stx s!"internal: unknown channel `{chFullName}` in {label}"
+  let (helperConst, paramCount, paramTypeConsts, methodName, reqConst?, reqLabel, requiresAuth) :=
+    if isSub then (chInfo.subHelperConst, chInfo.paramCount, chInfo.paramTypeConsts, chInfo.channelName, chInfo.clientReqConst, chInfo.clientReqLabel, chInfo.requiresAuth)
+    else (chInfo.sendHelperConst, chInfo.sendParamCount, chInfo.sendParamTypeConsts, s!"{chInfo.channelName}.send", chInfo.sendReqConst, chInfo.sendReqLabel, false)
+  let fullCall ← (argTerms ++ trailingArgs).foldlM (init := ← `($(mkIdentFrom stx helperConst) $slotLit)) fun acc a => `($acc ($a))
+  elabAndRecordRpcLikeCheck stx expectedType? fullCall helperConst argTerms paramCount paramTypeConsts chInfo.ownerShort methodName reqConst? reqLabel requiresAuth (reqConst?.isSome || requiresAuth)
 
-private def elabAndRecordChanCheck (stx : Syntax) (expectedType? : Option Expr)
-    (argTerms : Array Term) (slotLit : TSyntax `str)
-    (helperConst : Name) (paramCount : Nat) (paramTypeConsts : Array Name)
-    (trailingArgs : Array Term) (srvShort methodName : String)
-    (reqConst? : Option Name) (reqLabel : String) (requiresAuth : Bool) : TermElabM Expr := do
-  let fnId := mkIdentFrom stx helperConst
-  let fullCall ← (argTerms ++ trailingArgs).foldlM (init := ← `($fnId $slotLit)) fun acc a => `($acc ($a))
-  let resExpr ← instantiateMVars (← elabTerm fullCall expectedType?)
-  extractArgExprsAndRecordRpcCheck stx resExpr helperConst argTerms paramCount paramTypeConsts
-    srvShort methodName reqConst? reqLabel requiresAuth (reqConst?.isSome || requiresAuth)
-  return resExpr
+@[term_elab qedCheckChanSubTerm] def elabCheckChanSub : TermElab := fun stx expectedType? =>
+  elabAndRecordChanCheck stx expectedType? "subscription check" ((stx.getArg 3).getSepArgs.map (⟨·⟩)) ⟨stx.getArg 5⟩ #[⟨stx.getArg 7⟩, ⟨stx.getArg 9⟩, ⟨stx.getArg 11⟩, ⟨stx.getArg 13⟩] true
 
-@[term_elab qedCheckChanSubTerm]
-def elabCheckChanSub : TermElab := fun stx expectedType? => do
-  let chInfo ← lookupCheckedChannel stx "subscription check"
-  elabAndRecordChanCheck stx expectedType? ((stx.getArg 3).getSepArgs.map (⟨·⟩)) ⟨(stx.getArg 5)⟩
-    chInfo.subHelperConst chInfo.paramCount chInfo.paramTypeConsts
-    #[⟨(stx.getArg 7)⟩, ⟨(stx.getArg 9)⟩, ⟨(stx.getArg 11)⟩, ⟨(stx.getArg 13)⟩]
-    chInfo.ownerShort chInfo.channelName chInfo.clientReqConst chInfo.clientReqLabel chInfo.requiresAuth
-
-@[term_elab qedCheckChanSendTerm]
-def elabCheckChanSend : TermElab := fun stx expectedType? => do
-  let chInfo ← lookupCheckedChannel stx "send check"
-  elabAndRecordChanCheck stx expectedType? ((stx.getArg 3).getSepArgs.map (⟨·⟩)) ⟨(stx.getArg 5)⟩
-    chInfo.sendHelperConst chInfo.sendParamCount chInfo.sendParamTypeConsts #[]
-    chInfo.ownerShort s!"{chInfo.channelName}.send" chInfo.sendReqConst chInfo.sendReqLabel false
-
+@[term_elab qedCheckChanSendTerm] def elabCheckChanSend : TermElab := fun stx expectedType? =>
+  elabAndRecordChanCheck stx expectedType? "send check" ((stx.getArg 3).getSepArgs.map (⟨·⟩)) ⟨stx.getArg 5⟩ #[] false
 
 end CompElab
 end Qed

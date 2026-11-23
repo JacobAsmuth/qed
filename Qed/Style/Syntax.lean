@@ -8,875 +8,421 @@ open Lean Parser Elab Command Term Meta
 
 /-! ## Persistent Compile-Time CSS Registries -/
 
-structure StyleMetaInfo where
-  fullName   : Name
-  items      : List Qed.Item
-  usedTokens : List String
-  extraRules : List String
-  themes     : List Name := []
-deriving Inhabited
+structure StyleMetaInfo     where mk :: (fullName : Name) (items : List Qed.Item) (usedTokens extraRules : List String) (themes : List Name := []) deriving Inhabited
+structure TokenMetaInfo     where mk :: (fullName : Name) (cssName kind : String) (themeName? : Option Name := none) deriving Inhabited
+structure KeyframesMetaInfo where mk :: (fullName : Name) (kfName rule : String) deriving Inhabited
+structure ThemeMetaInfo     where mk :: (fullName styleConst themeConst : Name) deriving Inhabited
 
-initialize styleMetaRegistry :
-    SimplePersistentEnvExtension StyleMetaInfo (NameMap StyleMetaInfo) ←
-  Qed.Diag.mkNameMapExt (·.fullName)
-
-structure TokenMetaInfo where
-  fullName   : Name
-  cssName    : String
-  kind       : String -- "color" | "len" | "num" | "font" | "time" | "any"
-  themeName? : Option Name := none
-deriving Inhabited
-
-initialize tokenMetaRegistry :
-    SimplePersistentEnvExtension TokenMetaInfo (NameMap TokenMetaInfo) ←
-  Qed.Diag.mkNameMapExt (·.fullName)
-
-structure KeyframesMetaInfo where
-  fullName : Name
-  kfName   : String
-  rule     : String
-deriving Inhabited
-
-initialize keyframesMetaRegistry :
-    SimplePersistentEnvExtension KeyframesMetaInfo (NameMap KeyframesMetaInfo) ←
-  Qed.Diag.mkNameMapExt (·.fullName)
-
-structure ThemeMetaInfo where
-  fullName   : Name
-  styleConst : Name
-  themeConst : Name
-deriving Inhabited
-
-initialize themeMetaRegistry :
-    SimplePersistentEnvExtension ThemeMetaInfo (NameMap ThemeMetaInfo) ←
-  Qed.Diag.mkNameMapExt (·.fullName)
+initialize styleMetaRegistry     : SimplePersistentEnvExtension StyleMetaInfo     (NameMap StyleMetaInfo)     ← Qed.Diag.mkNameMapExt (·.fullName)
+initialize tokenMetaRegistry     : SimplePersistentEnvExtension TokenMetaInfo     (NameMap TokenMetaInfo)     ← Qed.Diag.mkNameMapExt (·.fullName)
+initialize keyframesMetaRegistry : SimplePersistentEnvExtension KeyframesMetaInfo (NameMap KeyframesMetaInfo) ← Qed.Diag.mkNameMapExt (·.fullName)
+initialize themeMetaRegistry     : SimplePersistentEnvExtension ThemeMetaInfo     (NameMap ThemeMetaInfo)     ← Qed.Diag.mkNameMapExt (·.fullName)
 
 /-! ## Custom Non-Polluting CSS Line Parsers -/
 
 private def scanCssLine (input : String) : Nat → String.Pos.Raw → Bool → Char → Bool → String.Pos.Raw
   | 0, pos, _, _, _ => pos
-  | fuel + 1, pos, inStr, quote, escaped =>
-      if pos.atEnd input then pos
-      else
-        let ch := pos.get input
-        if ch == '\n' || ch == '\r' then pos
-        else if inStr then
-          if escaped then scanCssLine input fuel (pos.next input) true quote false
-          else if ch == '\\' then scanCssLine input fuel (pos.next input) true quote true
-          else if ch == quote then scanCssLine input fuel (pos.next input) false quote false
-          else scanCssLine input fuel (pos.next input) true quote false
-        else if ch == '"' || ch == '\'' then
-          scanCssLine input fuel (pos.next input) true ch false
-        else if ch == '-' && !((pos.next input).atEnd input) && (pos.next input).get input == '-' then
-          let after1 := pos.next input
-          let after2 := after1.next input
-          let isComment := after2.atEnd input || (after2.get input).isWhitespace
-          if isComment then pos
-          else scanCssLine input fuel after2 false quote false
-        else
-          scanCssLine input fuel (pos.next input) false quote false
+  | fuel + 1, pos, inStr, q, esc =>
+      if pos.atEnd input then pos else
+      let ch := pos.get input; let nxt := pos.next input
+      if ch == '\n' || ch == '\r' then pos
+      else if inStr then scanCssLine input fuel nxt (if esc then true else if ch == '\\' then true else ch != q) q (!esc && ch == '\\')
+      else if ch == '"' || ch == '\'' then scanCssLine input fuel nxt true ch false
+      else if ch == '-' && !nxt.atEnd input && nxt.get input == '-' then
+        let a2 := nxt.next input; if a2.atEnd input || (a2.get input).isWhitespace then pos else scanCssLine input fuel a2 false q false
+      else scanCssLine input fuel nxt false q false
 
 private def skipToEol (input : String) : Nat → String.Pos.Raw → String.Pos.Raw
-  | 0, pos => pos
-  | fuel + 1, pos =>
-      if pos.atEnd input then pos
-      else
-        let ch := pos.get input
-        if ch == '\n' || ch == '\r' then pos
-        else skipToEol input fuel (pos.next input)
+  | 0, pos => pos | fuel + 1, pos => if pos.atEnd input || pos.get input == '\n' || pos.get input == '\r' then pos else skipToEol input fuel (pos.next input)
 
-private def takeRestOfLineFn (kind : Name) (mustEndWithColon : Bool) : ParserFn := fun c s =>
-  let input := c.inputString
-  let startPos := s.pos
-  let fuel := input.utf8ByteSize - startPos.byteIdx + 1
-  let endPos := scanCssLine input fuel startPos false '"' false
-  let raw := String.Pos.Raw.extract input startPos endPos
-  let trimmed := raw.trimmed
-  if trimmed.isEmpty then
-    s.mkError "CSS declaration or nested block"
-  else
-    let endsColon := trimmed.endsWith ":"
-    if endsColon != mustEndWithColon then
-      s.mkError (if mustEndWithColon then "CSS block header ending with ':'" else "CSS declaration")
-    else
-      let stopPos := skipToEol input (input.utf8ByteSize - endPos.byteIdx + 1) endPos
-      let s1 := s.setPos endPos
-      let s2 := mkNodeToken kind startPos true c s1
-      let s3 := s2.setPos stopPos
-      whitespace c s3
+private def takeRestOfLineFn (kind : Name) (mustColon : Bool) : ParserFn := fun c s =>
+  let input := c.inputString; let startPos := s.pos
+  let endPos := scanCssLine input (input.utf8ByteSize - startPos.byteIdx + 1) startPos false '"' false
+  let trimmed := (String.Pos.Raw.extract input startPos endPos).trimmed
+  if trimmed.isEmpty then s.mkError "CSS declaration or nested block"
+  else if trimmed.endsWith ":" != mustColon then s.mkError (if mustColon then "CSS block header ending with ':'" else "CSS declaration")
+  else whitespace c ((mkNodeToken kind startPos true c (s.setPos endPos)).setPos (skipToEol input (input.utf8ByteSize - endPos.byteIdx + 1) endPos))
 
 local macro "def_css_line_parser " id:Parser.ident mustColon:term : command => do
   let full := Name.mkStr3 "Qed" "StyleDsl" id.getId.toString
-  let fmtId := mkIdent (id.getId ++ `formatter)
-  let parId := mkIdent (id.getId ++ `parenthesizer)
   `(def $id : Parser := { fn := takeRestOfLineFn $(quote full) $mustColon }
-    @[combinator_formatter $(mkIdent full)] def $fmtId : PrettyPrinter.Formatter := PrettyPrinter.Formatter.visitAtom $(quote full)
-    @[combinator_parenthesizer $(mkIdent full)] def $parId : PrettyPrinter.Parenthesizer := PrettyPrinter.Parenthesizer.visitToken)
+    @[combinator_formatter $(mkIdent full)] def $(mkIdent (id.getId ++ `formatter)) : PrettyPrinter.Formatter := PrettyPrinter.Formatter.visitAtom $(quote full)
+    @[combinator_parenthesizer $(mkIdent full)] def $(mkIdent (id.getId ++ `parenthesizer)) : PrettyPrinter.Parenthesizer := PrettyPrinter.Parenthesizer.visitToken)
 
 def_css_line_parser cssBlockHeader true
 def_css_line_parser cssDeclLine false
 
 declare_syntax_cat cssBlockItem
+@[cssBlockItem_parser] def cssNestedBlock : Parser := leading_parser withPosition (cssBlockHeader >> many1 (checkColGt >> categoryParser `cssBlockItem 0))
+@[cssBlockItem_parser] def cssSimpleDecl  : Parser := leading_parser cssDeclLine
 
-@[cssBlockItem_parser] def cssNestedBlock : Parser := leading_parser
-  withPosition (cssBlockHeader >> many1 (checkColGt >> categoryParser `cssBlockItem 0))
+def styleExtendsClause : Parser := leading_parser atomic (symbol "extends") >> sepBy1 Parser.ident ","
+def styleStrictClause  : Parser := leading_parser atomic (identEq `strict_tokens)
 
-@[cssBlockItem_parser] def cssSimpleDecl : Parser := leading_parser
-  cssDeclLine
+private def cssCmd (kw : String) (extra : Parser := skip) : Parser :=
+  optional Command.docComment >> withPosition (symbol kw >> Parser.ident >> extra >> ":" >> many1 (checkColGt >> categoryParser `cssBlockItem 0))
 
-def styleExtendsClause : Parser := leading_parser
-  atomic (symbol "extends") >> sepBy1 Parser.ident ","
-
-def styleStrictClause : Parser := leading_parser
-  atomic (identEq `strict_tokens)
-
-@[command_parser] def styleCmd : Parser := leading_parser
-  optional Command.docComment >>
-  withPosition (
-    "style " >>
-    Parser.ident >>
-    optional styleExtendsClause >>
-    optional styleStrictClause >>
-    ":" >>
-    many1 (checkColGt >> categoryParser `cssBlockItem 0))
-
-@[command_parser] def keyframesCmd : Parser := leading_parser
-  optional Command.docComment >>
-  withPosition (
-    "keyframes " >>
-    Parser.ident >> ":" >>
-    many1 (checkColGt >> categoryParser `cssBlockItem 0))
-
-@[command_parser] def themeCmd : Parser := leading_parser
-  optional Command.docComment >>
-  withPosition (
-    "theme " >>
-    Parser.ident >> ":" >>
-    many1 (checkColGt >> categoryParser `cssBlockItem 0))
-
-@[command_parser] def verifyThemeCmd : Parser := leading_parser
-  "verify_theme " >> Parser.ident >> symbol "for" >> termParser
+@[command_parser] def styleCmd       : Parser := leading_parser cssCmd "style " (optional styleExtendsClause >> optional styleStrictClause)
+@[command_parser] def keyframesCmd   : Parser := leading_parser cssCmd "keyframes "
+@[command_parser] def themeCmd       : Parser := leading_parser cssCmd "theme "
+@[command_parser] def verifyThemeCmd : Parser := leading_parser "verify_theme " >> Parser.ident >> symbol "for" >> termParser
 
 /-! ## CSS Property & Value Validation Engine -/
 
-private inductive CssPropKind where
-  | color | len | border | num | time | any
-  | enum (vals : List String)
-
+private inductive CssPropKind where | color | len | border | num | time | any | enum (vals : List String)
 private def ws (s : String) : List String := s.splitOn " "
-private def commonGlobalKw : List String := ws "inherit initial unset revert revert-layer"
+private def commonGlobalKw  : List String := ws "inherit initial unset revert revert-layer"
 private def borderStyleVals : List String := ws "solid dashed dotted double groove ridge inset outset none hidden"
-private def overflowVals : List String := ws "visible hidden clip scroll auto"
+private def isGlobalOrVar (a : String) : Bool := a.startsWith "var(" || commonGlobalKw.contains a
 
 private def cssPropMap : Std.HashMap String CssPropKind := Id.run do
   let mut m : Std.HashMap String CssPropKind := {}
-  let add (k : CssPropKind) (props : String) (m : Std.HashMap String CssPropKind) :=
-    (ws props).foldl (fun acc p => acc.insert p k) m
-  m := add .color "color background-color border-color border-top-color border-right-color border-bottom-color border-left-color outline-color text-decoration-color fill stroke accent-color caret-color" m
-  m := add .len "width height min-width max-width min-height max-height padding padding-top padding-right padding-bottom padding-left padding-inline padding-block padding-inline-start padding-inline-end margin margin-top margin-right margin-bottom margin-left margin-inline margin-block margin-inline-start margin-inline-end inset top right bottom left gap row-gap column-gap font-size border-radius border-width outline-offset letter-spacing flex-basis" m
-  m := add .border "border border-top border-right border-bottom border-left outline" m
-  m := add .num "font-weight line-height opacity z-index" m
-  m := add .time "animation-duration transition-duration" m
-  m := add .any "aspect-ratio isolation float clear content vertical-align object-position flex flex-flow flex-grow flex-shrink justify-items align-content place-items place-content place-self order grid grid-template grid-template-columns grid-template-rows grid-template-areas grid-column grid-row grid-area grid-auto-flow grid-auto-columns grid-auto-rows font font-family font-variant word-spacing text-decoration text-decoration-thickness text-underline-offset text-indent text-shadow overflow-wrap hyphens tab-size background background-image background-position background-size background-repeat background-clip background-origin border-top-width border-right-width border-bottom-width border-left-width border-top-left-radius border-top-right-radius border-bottom-left-radius border-bottom-right-radius border-collapse border-spacing outline-width outline-style box-shadow filter backdrop-filter mix-blend-mode clip-path mask mask-image transform transform-origin perspective rotate scale translate transition transition-property transition-timing-function transition-delay animation animation-name animation-timing-function animation-delay animation-iteration-count animation-direction animation-fill-mode animation-play-state will-change resize appearance touch-action list-style list-style-type list-style-position table-layout caption-side empty-cells stroke-width stroke-linecap stroke-linejoin stroke-dasharray scroll-margin scroll-padding scroll-snap-type scroll-snap-align overscroll-behavior container-type container-name container" m
+  for (k, props) in [
+    (.color,  "color background-color border-color border-top-color border-right-color border-bottom-color border-left-color outline-color text-decoration-color fill stroke accent-color caret-color"),
+    (.len,    "width height min-width max-width min-height max-height padding padding-top padding-right padding-bottom padding-left padding-inline padding-block padding-inline-start padding-inline-end margin margin-top margin-right margin-bottom margin-left margin-inline margin-block margin-inline-start margin-inline-end inset top right bottom left gap row-gap column-gap font-size border-radius border-width outline-offset letter-spacing flex-basis"),
+    (.border, "border border-top border-right border-bottom border-left outline"),
+    (.num,    "font-weight line-height opacity z-index"), (.time, "animation-duration transition-duration"),
+    (.any,    "aspect-ratio isolation float clear content vertical-align object-position flex flex-flow flex-grow flex-shrink justify-items align-content place-items place-content place-self order grid grid-template grid-template-columns grid-template-rows grid-template-areas grid-column grid-row grid-area grid-auto-flow grid-auto-columns grid-auto-rows font font-family font-variant word-spacing text-decoration text-decoration-thickness text-underline-offset text-indent text-shadow overflow-wrap hyphens tab-size background background-image background-position background-size background-repeat background-clip background-origin border-top-width border-right-width border-bottom-width border-left-width border-top-left-radius border-top-right-radius border-bottom-left-radius border-bottom-right-radius border-collapse border-spacing outline-width outline-style box-shadow filter backdrop-filter mix-blend-mode clip-path mask mask-image transform transform-origin perspective rotate scale translate transition transition-property transition-timing-function transition-delay animation animation-name animation-timing-function animation-delay animation-iteration-count animation-direction animation-fill-mode animation-play-state will-change resize appearance touch-action list-style list-style-type list-style-position table-layout caption-side empty-cells stroke-width stroke-linecap stroke-linejoin stroke-dasharray scroll-margin scroll-padding scroll-snap-type scroll-snap-align overscroll-behavior container-type container-name container")
+  ] do for p in ws props do m := m.insert p k
+  let ov := "visible hidden clip scroll auto"
   for (p, vs) in [
-    ("display", ws "flex inline-flex grid inline-grid block inline inline-block table table-row table-cell flow-root contents none list-item"),
-    ("position", ws "static relative absolute fixed sticky"),
-    ("text-align", ws "left right center justify start end"),
-    ("flex-direction", ws "row column row-reverse column-reverse"),
-    ("flex-wrap", ws "nowrap wrap wrap-reverse"),
-    ("justify-content", ws "flex-start flex-end start end center space-between space-around space-evenly stretch normal"),
-    ("align-items", ws "flex-start flex-end start end center stretch baseline normal"),
-    ("align-self", ws "auto flex-start flex-end start end center stretch baseline"),
-    ("justify-self", ws "auto start end center stretch"),
-    ("box-sizing", ws "content-box border-box"),
-    ("cursor", ws "auto default pointer not-allowed text move grab grabbing wait progress help crosshair zoom-in zoom-out col-resize row-resize ew-resize ns-resize none"),
-    ("overflow", overflowVals), ("overflow-x", overflowVals), ("overflow-y", overflowVals),
-    ("white-space", ws "normal nowrap pre pre-wrap pre-line break-spaces"),
-    ("object-fit", ws "fill contain cover none scale-down"),
-    ("pointer-events", ws "auto none all"),
-    ("user-select", ws "auto none text all contain"),
-    ("visibility", ws "visible hidden collapse"),
-    ("font-style", ws "normal italic oblique"),
-    ("text-transform", ws "none capitalize uppercase lowercase full-width"),
-    ("text-overflow", ws "clip ellipsis"),
-    ("word-break", ws "normal break-all keep-all break-word"),
-    ("scroll-behavior", ws "auto smooth"),
-    ("border-style", borderStyleVals)
-  ] do
-    m := m.insert p (.enum vs)
-  return m
+    ("display", "flex inline-flex grid inline-grid block inline inline-block table table-row table-cell flow-root contents none list-item"),
+    ("position", "static relative absolute fixed sticky"), ("text-align", "left right center justify start end"),
+    ("flex-direction", "row column row-reverse column-reverse"), ("flex-wrap", "nowrap wrap wrap-reverse"),
+    ("justify-content", "flex-start flex-end start end center space-between space-around space-evenly stretch normal"),
+    ("align-items", "flex-start flex-end start end center stretch baseline normal"),
+    ("align-self", "auto flex-start flex-end start end center stretch baseline"), ("justify-self", "auto start end center stretch"),
+    ("box-sizing", "content-box border-box"), ("scroll-behavior", "auto smooth"),
+    ("cursor", "auto default pointer not-allowed text move grab grabbing wait progress help crosshair zoom-in zoom-out col-resize row-resize ew-resize ns-resize none"),
+    ("overflow", ov), ("overflow-x", ov), ("overflow-y", ov), ("white-space", "normal nowrap pre pre-wrap pre-line break-spaces"),
+    ("object-fit", "fill contain cover none scale-down"), ("pointer-events", "auto none all"), ("user-select", "auto none text all contain"),
+    ("visibility", "visible hidden collapse"), ("font-style", "normal italic oblique"), ("text-overflow", "clip ellipsis"),
+    ("text-transform", "none capitalize uppercase lowercase full-width"), ("word-break", "normal break-all keep-all break-word")
+  ] do m := m.insert p (.enum (ws vs))
+  return m.insert "border-style" (.enum borderStyleVals)
 
-private def knownCssProps : List String := cssPropMap.keys
-
-private def namedCssColors : List String :=
-  ws "transparent currentcolor currentColor black white red green blue yellow orange purple pink gray grey cyan magenta navy teal maroon olive silver lime aqua fuchsia indigo violet gold coral crimson salmon tomato khaki plum orchid tan beige ivory linen snow azure mintcream honeydew lavender aliceblue whitesmoke gainsboro lightgray lightgrey darkgray darkgrey dimgray dimgrey slategray slategrey none"
-
-private def validUnits : List String :=
-  ws "px rem em % vh vw dvh svh lvh dvw svw lvw fr ch ex vmin vmax pt cm mm in cqw cqh cqi cqb"
-
-private def validTimeUnits : List String := ["ms", "s"]
+private def knownCssProps  : List String := cssPropMap.keys
+private def namedCssColors : List String := ws "transparent currentcolor currentColor black white red green blue yellow orange purple pink gray grey cyan magenta navy teal maroon olive silver lime aqua fuchsia indigo violet gold coral crimson salmon tomato khaki plum orchid tan beige ivory linen snow azure mintcream honeydew lavender aliceblue whitesmoke gainsboro lightgray lightgrey darkgray darkgrey dimgray dimgrey slategray slategrey none"
+private def validUnits     : List String := ws "px rem em % vh vw dvh svh lvh dvw svw lvw fr ch ex vmin vmax pt cm mm in cqw cqh cqi cqb"
 
 private def parseNumberWithUnit (tok : String) : Option (String × String) :=
-  let cs := tok.toList
-  let (sign, rest0) := match cs with
-    | '-' :: r => ("-", r)
-    | '+' :: r => ("", r)
-    | r        => ("", r)
-  let (d1, rest1) := rest0.span Char.isDigit
-  let (numCs, unitCs) := match rest1 with
-    | '.' :: r2 =>
-        let (d2, u) := r2.span Char.isDigit
-        if d2.isEmpty then (d1, '.' :: r2) else (d1 ++ '.' :: d2, u)
-    | _ => (d1, rest1)
-  if numCs.isEmpty then none
-  else some (sign ++ String.ofList numCs, String.ofList unitCs)
+  let (sign, r0) := match tok.toList with | '-' :: r => ("-", r) | '+' :: r => ("", r) | r => ("", r)
+  let (d1, r1) := r0.span Char.isDigit
+  let (numCs, unitCs) := match r1 with
+    | '.' :: r2 => let (d2, u) := r2.span Char.isDigit; if d2.isEmpty then (d1, '.' :: r2) else (d1 ++ '.' :: d2, u) | _ => (d1, r1)
+  if numCs.isEmpty then none else some (sign ++ String.ofList numCs, String.ofList unitCs)
 
-private def isNumericString (s : String) : Bool :=
-  (parseNumberWithUnit s).any (·.2.isEmpty)
-
+private def isNumericString (s : String) : Bool := (parseNumberWithUnit s).any (·.2.isEmpty)
 private def isValidLenAtom (tok : String) : Bool :=
-  tok == "0" || tok == "auto" || tok == "none" ||
-  tok == "fit-content" || tok == "min-content" || tok == "max-content" ||
-  commonGlobalKw.contains tok ||
-  tok.startsWith "var(" || tok.startsWith "calc(" || tok.startsWith "clamp(" ||
-  tok.startsWith "min(" || tok.startsWith "max(" ||
-  match parseNumberWithUnit tok with
-  | some (_, u) => !u.isEmpty && validUnits.contains u
-  | none        => false
-
+  isGlobalOrVar tok || ["0", "auto", "none", "fit-content", "min-content", "max-content"].contains tok ||
+  ["calc(", "clamp(", "min(", "max("].any (tok.startsWith ·) || (parseNumberWithUnit tok).any fun (_, u) => !u.isEmpty && validUnits.contains u
 private def isValidTimeAtom (tok : String) : Bool :=
-  tok == "0" || tok.startsWith "var(" ||
-  match parseNumberWithUnit tok with
-  | some (_, u) => validTimeUnits.contains u
-  | none        => false
+  tok == "0" || tok.startsWith "var(" || (parseNumberWithUnit tok).any fun (_, u) => u == "ms" || u == "s"
 
 private def splitTopLevel (sep : Char) (s : String) : List String :=
-  let rec go (cs : List Char) (depth : Nat) (inStr : Bool) (q : Char) (cur : List Char) (acc : List String) : List String :=
-    match cs with
-    | [] =>
-        let t := (String.ofList cur.reverse).trimmed
-        (if t.isEmpty then acc else t :: acc).reverse
-    | c :: rest =>
-        if inStr then
-          go rest depth (c != q) q (c :: cur) acc
-        else if c == '"' || c == '\'' then
-          go rest depth true c (c :: cur) acc
-        else if c == '(' then
-          go rest (depth + 1) false q (c :: cur) acc
-        else if c == ')' then
-          go rest (depth - 1) false q (c :: cur) acc
-        else if depth == 0 && (if sep == ' ' then c.isWhitespace else c == sep) then
-          let t := (String.ofList cur.reverse).trimmed
-          go rest 0 false q [] (if t.isEmpty then acc else t :: acc)
-        else
-          go rest depth false q (c :: cur) acc
+  let flush (cur : List Char) (acc : List String) := let t := (String.ofList cur.reverse).trimmed; if t.isEmpty then acc else t :: acc
+  let rec go : List Char → Nat → Bool → Char → List Char → List String → List String
+    | [], _, _, _, cur, acc => (flush cur acc).reverse
+    | c :: rest, d, true, q, cur, acc => go rest d (c != q) q (c :: cur) acc
+    | c :: rest, d, false, q, cur, acc =>
+        if c == '"' || c == '\'' then go rest d true c (c :: cur) acc
+        else if c == '(' then go rest (d + 1) false q (c :: cur) acc
+        else if c == ')' then go rest (d - 1) false q (c :: cur) acc
+        else if d == 0 && (if sep == ' ' then c.isWhitespace else c == sep) then go rest 0 false q [] (flush cur acc)
+        else go rest d false q (c :: cur) acc
   go s.toList 0 false '"' [] []
 
 private def parseFuncCall? (tok : String) : Option (String × String) :=
-  let cs := tok.toList
-  let (fnCs, rest) := cs.span (fun c => c.isAlphanum || c == '-' || c == '_')
-  if fnCs.isEmpty then none
-  else
-    match rest with
-    | '(' :: inner =>
-        match inner.reverse with
-        | ')' :: revArgs => some (String.ofList fnCs, (String.ofList revArgs.reverse).trimmed)
-        | _ => none
-    | _ => none
+  let (fnCs, rest) := tok.toList.span fun c => c.isAlphanum || c == '-' || c == '_'
+  match fnCs, rest with
+  | _ :: _, '(' :: inner => match inner.reverse with | ')' :: revArgs => some (String.ofList fnCs, (String.ofList revArgs.reverse).trimmed) | _ => none
+  | _, _ => none
 
 private def validateRgbArgs (fnName argsStr : String) : Except String (Option (Nat × Nat × Nat)) := do
-  let parts :=
-    let byComma := splitTopLevel ',' argsStr
-    if byComma.length > 1 then byComma else splitTopLevel ' ' (argsStr.replace "/" " ")
-  let need := if fnName == "rgba" then 4 else 3
-  if parts.length < 3 || parts.length > 4 then
-    throw s!"`{fnName}({argsStr})` expects {need} arguments"
+  let byComma := splitTopLevel ',' argsStr
+  let parts := if byComma.length > 1 then byComma else splitTopLevel ' ' (argsStr.replace "/" " ")
+  if parts.length < 3 || parts.length > 4 then throw s!"`{fnName}({argsStr})` expects {if fnName == "rgba" then 4 else 3} arguments"
   let mut chs : Array Nat := #[]
   for i in [0:3] do
-    let p := parts[i]!
-    if p.startsWith "var(" then return none
-    match p.toNat? with
-    | some n =>
-        if n > 255 then
-          throw s!"`{fnName}({argsStr})`: channel value `{n}` is out of range (must be 0..255)"
-        chs := chs.push n
-    | none =>
-        throw s!"`{fnName}({argsStr})`: expected integer channel 0..255, got `{p}`"
+    let p := parts[i]!; if p.startsWith "var(" then return none
+    let some n := p.toNat? | throw s!"`{fnName}({argsStr})`: expected integer channel 0..255, got `{p}`"
+    if n > 255 then throw s!"`{fnName}({argsStr})`: channel value `{n}` is out of range (must be 0..255)"
+    chs := chs.push n
   if parts.length == 4 then
-    let aStr := parts[3]!
-    if aStr.startsWith "var(" then return none
-    if !isNumericString aStr && !(aStr.endsWith "%" && isNumericString (String.ofList (aStr.toList.dropLast))) then
-      throw s!"`{fnName}({argsStr})`: invalid alpha value `{aStr}`"
-    if aStr == "1" || aStr == "1.0" || aStr == "100%" then
-      return some (chs[0]!, chs[1]!, chs[2]!)
-    else
-      return none
+    let aStr := parts[3]!; if aStr.startsWith "var(" then return none
+    if !isNumericString aStr && !(aStr.endsWith "%" && isNumericString (String.ofList aStr.toList.dropLast)) then throw s!"`{fnName}({argsStr})`: invalid alpha value `{aStr}`"
+    if aStr != "1" && aStr != "1.0" && aStr != "100%" then return none
   return some (chs[0]!, chs[1]!, chs[2]!)
 
 private def validateColorLiteral (tok : String) : Except String (Option (Nat × Nat × Nat)) := do
   if tok.startsWith "#" then
-    if !Qed.isValidHexColor tok then
-      throw s!"invalid hex color `{tok}` (expected 3, 4, 6, or 8 hex digits, e.g. `#06c` or `#2563eb`)"
+    if !Qed.isValidHexColor tok then throw s!"invalid hex color `{tok}` (expected 3, 4, 6, or 8 hex digits, e.g. `#06c` or `#2563eb`)"
     return Qed.parseHexRgb? tok
   else if namedCssColors.contains tok || commonGlobalKw.contains tok then
-    if tok == "white" then return some (255, 255, 255)
-    else if tok == "black" then return some (0, 0, 0)
-    else return none
-  else if tok.startsWith "var(" then
-    return none
-  else if let some (fn, args) := parseFuncCall? tok then
-    match fn with
+    return if tok == "white" then some (255, 255, 255) else if tok == "black" then some (0, 0, 0) else none
+  else if tok.startsWith "var(" then return none
+  else if let some (fn, args) := parseFuncCall? tok then match fn with
     | "rgb" | "rgba" => validateRgbArgs fn args
     | "hsl" | "hsla" | "oklch" | "oklab" | "lab" | "lch" | "color-mix" | "light-dark" => return none
     | _ => throw s!"unknown color function `{fn}(...)` in `{tok}`"
-  else
-    throw s!"invalid CSS color value `{tok}`"
+  else throw s!"invalid CSS color value `{tok}`"
 
 /-! ## Environment Resolution for Tokens, Styles, Themes & Keyframes -/
 
-def resolveInRegistry {α : Type} (reg : NameMap α) (env : Environment)
-    (currNs : Name) (openDecls : List OpenDecl) (rawName : String) : Option α :=
+def resolveInRegistry {α : Type} (reg : NameMap α) (env : Environment) (currNs : Name) (openDecls : List OpenDecl) (rawName : String) : Option α :=
   Qed.Diag.lookupNameMap? reg env currNs openDecls rawName.toName
 
 private def isIdentLike (tok : String) : Bool :=
-  match tok.toList with
-  | [] => false
-  | c :: rest => (c.isAlpha || c == '_') && rest.all (fun ch => ch.isAlphanum || ch == '_' || ch == '.')
+  match tok.toList with | c :: rest => (c.isAlpha || c == '_') && rest.all fun ch => ch.isAlphanum || ch == '_' || ch == '.' | [] => false
 
-private structure ResolvedCssValue where
-  cssText    : String
-  usedTokens : List String := []
-  extraRules : List String := []
-  themes     : List Name := []
+private structure ResolvedCssValue where mk :: (cssText : String) (usedTokens extraRules : List String := []) (themes : List Name := [])
 
-private def checkTokenKindForProp (ref : Syntax) (prop : String) (kind : CssPropKind) (tokInfo : TokenMetaInfo) : CoreM Unit := do
-  if tokInfo.kind == "any" then return
-  let expected? := match kind with
-    | .color => some "color" | .len => some "len" | .num => some "num" | .time => some "time" | _ => none
-  if let some expected := expected? then
-    if tokInfo.kind != expected then
-      throwErrorAt ref s!"type mismatch in CSS `{prop}`: token `{tokInfo.fullName}` has kind `{tokInfo.kind}`, expected `{expected}`"
-
-private def checkStrictTokensForProp (ref : Syntax) (p : String) (kind : CssPropKind) (resolvedAtoms : List String) : CoreM Unit := do
-  for a in resolvedAtoms do
-    match kind with
-    | .color =>
-        unless a.startsWith "var(" || a == "transparent" || a == "currentColor" ||
-               a == "currentcolor" || commonGlobalKw.contains a do
-          throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw color `{a}` is disallowed; use a `theme` color token instead"
-    | .len =>
-        unless a.startsWith "var(" || a == "0" || a == "auto" || a == "none" ||
-               a == "100%" || commonGlobalKw.contains a do
-          throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw length `{a}` is disallowed; use a `theme` length token instead"
-    | .border =>
-        if a.startsWith "#" || a.startsWith "rgb(" || a.startsWith "rgba(" || a.startsWith "hsl(" || a.startsWith "oklch(" then
-          throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw color `{a}` is disallowed; use a `theme` color token instead"
+private def checkStrictAndValidate (ref : Syntax) (strict : Bool) (p resolvedVal : String) (kind : CssPropKind) (atoms : List String) : CoreM Unit := do
+  let checkOrThrow {α : Type} : Except String α → CoreM Unit | .ok _ => pure () | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
+  if strict then for a in atoms do match kind with
+    | .color  => unless isGlobalOrVar a || ["transparent", "currentColor", "currentcolor"].contains a do throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw color `{a}` is disallowed; use a `theme` color token instead"
+    | .len    => unless isGlobalOrVar a || ["0", "auto", "none", "100%"].contains a do throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw length `{a}` is disallowed; use a `theme` length token instead"
+    | .border => if ["#", "rgb(", "rgba(", "hsl(", "oklch("].any (a.startsWith ·) then throwErrorAt ref s!"`strict_tokens` violation on `{p}`: raw color `{a}` is disallowed; use a `theme` color token instead"
     | _ => pure ()
-
-private def validatePropValue (ref : Syntax) (p resolvedVal : String) (kind : CssPropKind) (resolvedAtoms : List String) : CoreM Unit := do
-  let checkOrThrow {α : Type} : Except String α → CoreM Unit
-    | .ok _ => pure ()
-    | .error msg => throwErrorAt ref s!"in `{p}`: {msg}"
   match kind with
-  | .enum allowed =>
-      for a in resolvedAtoms do
-        unless allowed.contains a || commonGlobalKw.contains a || a.startsWith "var(" do
-          throwErrorAt ref s!"invalid value `{a}` for CSS property `{p}` (expected one of: {String.intercalate ", " allowed})"
+  | .enum allowed => for a in atoms do unless allowed.contains a || isGlobalOrVar a do throwErrorAt ref s!"invalid value `{a}` for CSS property `{p}` (expected one of: {String.intercalate ", " allowed})"
   | .color =>
-      if resolvedAtoms.length != 1 then
-        throwErrorAt ref s!"CSS color property `{p}` expects a single color value, got `{resolvedVal}`"
-      checkOrThrow (validateColorLiteral resolvedAtoms.head!)
-  | .len =>
-      for a in resolvedAtoms do
-        unless isValidLenAtom a do
-          throwErrorAt ref s!"invalid length `{a}` for CSS property `{p}` (use a unit like `px`, `rem`, `em`, `%`, `vh`, `vw`, `0`, `auto`, `calc(...)`, or a `len` token)"
+      if atoms.length != 1 then throwErrorAt ref s!"CSS color property `{p}` expects a single color value, got `{resolvedVal}`"
+      checkOrThrow (validateColorLiteral atoms.head!)
+  | .len => for a in atoms do unless isValidLenAtom a do throwErrorAt ref s!"invalid length `{a}` for CSS property `{p}` (use a unit like `px`, `rem`, `em`, `%`, `vh`, `vw`, `0`, `auto`, `calc(...)`, or a `len` token)"
   | .border =>
-      if resolvedAtoms == ["none"] || resolvedAtoms == ["0"] || resolvedAtoms.all (fun a => commonGlobalKw.contains a || a.startsWith "var(") then
-        pure ()
-      else if resolvedAtoms.length == 3 then
-        let w := resolvedAtoms[0]!; let s := resolvedAtoms[1]!; let c := resolvedAtoms[2]!
+      if atoms == ["none"] || atoms == ["0"] || atoms.all isGlobalOrVar then pure ()
+      else if let [w, s, c] := atoms then
         unless isValidLenAtom w do throwErrorAt ref s!"in `{p}`: invalid border width `{w}`"
         unless borderStyleVals.contains s || s.startsWith "var(" do throwErrorAt ref s!"in `{p}`: invalid border style `{s}`"
         checkOrThrow (validateColorLiteral c)
-      else
-        throwErrorAt ref s!"`{p}` expects `none`, `0`, or `<width> <style> <color>` (e.g. `1px solid #ddd`), got `{resolvedVal}`"
-  | .time =>
-      for a in resolvedAtoms do
-        unless isValidTimeAtom a do
-          throwErrorAt ref s!"invalid duration `{a}` for `{p}` (expected e.g. `200ms` or `0.3s`)"
-  | .num | .any =>
-      for a in resolvedAtoms do
-        if a.startsWith "#" && !Qed.isValidHexColor a then
-          throwErrorAt ref s!"in `{p}`: invalid hex color `{a}`"
-        if let some (fn, args) := parseFuncCall? a then
-          if fn == "rgb" || fn == "rgba" then checkOrThrow (validateRgbArgs fn args)
+      else throwErrorAt ref s!"`{p}` expects `none`, `0`, or `<width> <style> <color>` (e.g. `1px solid #ddd`), got `{resolvedVal}`"
+  | .time => for a in atoms do unless isValidTimeAtom a do throwErrorAt ref s!"invalid duration `{a}` for `{p}` (expected e.g. `200ms` or `0.3s`)"
+  | .num | .any => for a in atoms do
+      if a.startsWith "#" && !Qed.isValidHexColor a then throwErrorAt ref s!"in `{p}`: invalid hex color `{a}`"
+      if let some (fn, args) := parseFuncCall? a then if fn == "rgb" || fn == "rgba" then checkOrThrow (validateRgbArgs fn args)
 
-private def addUnique {α : Type} [BEq α] (xs : List α) (x : α) : List α :=
-  if xs.contains x then xs else xs ++ [x]
-
-private def mergeUnique {α : Type} [BEq α] (xs ys : List α) : List α :=
-  ys.foldl addUnique xs
-
-private def resolveAndValidateDecl (ref : Syntax) (env : Environment) (currNs : Name)
-    (openDecls : List OpenDecl) (strictTokens : Bool) (prop rawVal : String) :
-    CoreM ResolvedCssValue := do
-  let p := prop.trimmed
-  let vRaw := rawVal.trimmed
+private def resolveAndValidateDecl (ref : Syntax) (env : Environment) (currNs : Name) (openDecls : List OpenDecl) (strictTokens : Bool) (prop rawVal : String) : CoreM ResolvedCssValue := do
+  let p := prop.trimmed; let vRaw := rawVal.trimmed
   let v := if vRaw.endsWith ";" then (String.ofList vRaw.toList.dropLast).trimmed else vRaw
   if p.isEmpty then throwErrorAt ref "empty CSS property name"
   if v.isEmpty then throwErrorAt ref s!"missing value for CSS property `{p}`"
-  let isCustomProp := p.startsWith "--"
-  let propKind ← if isCustomProp then pure CssPropKind.any else
-    match cssPropMap[p]? with
-    | some k => pure k
-    | none   => throwErrorAt ref s!"unknown CSS property `{p}`{Qed.Diag.didYouMean p knownCssProps}"
-  let tokReg := tokenMetaRegistry.getState env
-  let kfReg  := keyframesMetaRegistry.getState env
-  let atoms := splitTopLevel ' ' v
-  let mut outAtoms : Array String := #[]
-  let mut usedToks : List String := []
-  let mut extraRules : List String := []
-  let mut usedThemes : List Name := []
-  for a in atoms do
+  let isCustom := p.startsWith "--"
+  let propKind ← if isCustom then pure CssPropKind.any else match cssPropMap[p]? with | some k => pure k | none => throwErrorAt ref s!"unknown CSS property `{p}`{Qed.Diag.didYouMean p knownCssProps}"
+  let (tokReg, kfReg) := (tokenMetaRegistry.getState env, keyframesMetaRegistry.getState env)
+  let mut outAtoms : Array String := #[]; let mut usedToks : List String := []; let mut extraRules : List String := []; let mut usedThemes : List Name := []
+  for a in splitTopLevel ' ' v do
     if isIdentLike a then
       if let some tInfo := resolveInRegistry tokReg env currNs openDecls a then
-        checkTokenKindForProp ref p propKind tInfo
-        outAtoms := outAtoms.push s!"var(--{tInfo.cssName})"
-        usedToks := usedToks ++ [tInfo.cssName]
-        if let some thNm := tInfo.themeName? then usedThemes := addUnique usedThemes thNm
+        if tInfo.kind != "any" then
+          let exp? := match propKind with | .color => some "color" | .len => some "len" | .num => some "num" | .time => some "time" | _ => none
+          if let some exp := exp? then if tInfo.kind != exp then throwErrorAt ref s!"type mismatch in CSS `{p}`: token `{tInfo.fullName}` has kind `{tInfo.kind}`, expected `{exp}`"
+        outAtoms := outAtoms.push s!"var(--{tInfo.cssName})"; usedToks := usedToks ++ [tInfo.cssName]
+        if let some thNm := tInfo.themeName? then usedThemes := (usedThemes ++ [thNm]).eraseDups
         continue
       if p == "animation" || p == "animation-name" then
         if let some kfInfo := resolveInRegistry kfReg env currNs openDecls a then
-          outAtoms := outAtoms.push kfInfo.kfName
-          extraRules := addUnique extraRules kfInfo.rule
-          continue
+          outAtoms := outAtoms.push kfInfo.kfName; extraRules := (extraRules ++ [kfInfo.rule]).eraseDups; continue
     outAtoms := outAtoms.push a
-  let resolvedVal := String.intercalate " " outAtoms.toList
-  let resolvedAtoms := outAtoms.toList
-  if strictTokens && !isCustomProp then
-    checkStrictTokensForProp ref p propKind resolvedAtoms
-  if !isCustomProp then
-    validatePropValue ref p resolvedVal propKind resolvedAtoms
-  let extraTokens := Qed.extractVarNames resolvedVal
-  return {
-    cssText    := resolvedVal
-    usedTokens := usedToks ++ extraTokens
-    extraRules
-    themes     := usedThemes
-  }
+  let resolvedAtoms := outAtoms.toList; let resolvedVal := String.intercalate " " resolvedAtoms
+  if !isCustom then checkStrictAndValidate ref strictTokens p resolvedVal propKind resolvedAtoms
+  return .mk resolvedVal (usedToks ++ Qed.extractVarNames resolvedVal) extraRules usedThemes
 
-/-! ## Lowering Parsed CSS Blocks to `List Item` -/
+/-! ## Lowering Parsed CSS Blocks & Quoting Literals -/
 
-private def atomText (stx : Syntax) : String :=
-  match stx with
-  | .node _ _ #[.atom _ v] => v
-  | .atom _ v              => v
-  | _                      => ""
-
-private def stripTrailingColon (stx : Syntax) : String :=
-  (String.ofList (atomText stx).trimmed.toList.dropLast).trimmed
-
-private def optDocComment (stx : Syntax) : Option (TSyntax ``Lean.Parser.Command.docComment) :=
-  if (stx.getArg 0).getNumArgs == 1 then some ⟨(stx.getArg 0).getArg 0⟩ else none
-
-private def getCssScope : CommandElabM (Environment × Name × List OpenDecl) :=
-  return (← getEnv, ← getCurrNamespace, (← getScope).openDecls)
+private def atomText : Syntax → String | .node _ _ #[.atom _ v] | .atom _ v => v | _ => ""
+private def stripTrailingColon (stx : Syntax) : String := (String.ofList (atomText stx).trimmed.toList.dropLast).trimmed
+private def optDocComment (stx : Syntax) : Option (TSyntax ``Lean.Parser.Command.docComment) := if (stx.getArg 0).getNumArgs == 1 then some ⟨(stx.getArg 0).getArg 0⟩ else none
+private def getCssScope : CommandElabM (Environment × Name × List OpenDecl) := return (← getEnv, ← getCurrNamespace, (← getScope).openDecls)
 
 private def splitFirstChar (sep : Char) (s : String) : Option (String × String) :=
   let (lhs, rhs) := s.toList.span (· != sep)
-  match rhs with
-  | c :: rest => if c == sep then some ((String.ofList lhs).trimmed, (String.ofList rest).trimmed) else none
-  | _ => none
+  match rhs with | c :: rest => if c == sep then some ((String.ofList lhs).trimmed, (String.ofList rest).trimmed) else none | _ => none
 
-private structure CompiledCssBlock where
-  items      : List Qed.Item
-  usedTokens : List String
-  extraRules : List String
-  themes     : List Name
+private structure CompiledCssBlock where mk :: (items : List Qed.Item) (usedTokens extraRules : List String) (themes : List Name)
 
-private partial def compileCssBlockItems (env : Environment) (currNs : Name)
-    (openDecls : List OpenDecl) (strictTokens : Bool) (stxs : Array Syntax) :
-    CoreM CompiledCssBlock := do
-  let mut items : List Qed.Item := []
-  let mut toks  : List String := []
-  let mut rules : List String := []
-  let mut thms  : List Name := []
+private partial def compileCssBlockItems (env : Environment) (currNs : Name) (openDecls : List OpenDecl) (strictTokens : Bool) (stxs : Array Syntax) : CoreM CompiledCssBlock := do
+  let mut items : List Qed.Item := []; let mut toks : List String := []; let mut rules : List String := []; let mut thms : List Name := []
   for stx in stxs do
-    if stx.getKind == ``cssNestedBlock then
-      let sel := stripTrailingColon (stx.getArg 0)
-      if sel.isEmpty then throwErrorAt (stx.getArg 0) "empty nested CSS selector"
-      let sub ← compileCssBlockItems env currNs openDecls strictTokens (stx.getArg 1).getArgs
-      items := items ++ [.nest sel sub.items]
-      toks  := toks ++ sub.usedTokens
-      rules := rules ++ sub.extraRules
-      thms  := mergeUnique thms sub.themes
-    else if stx.getKind == ``cssSimpleDecl then
-      let line := (atomText (stx.getArg 0)).trimmed
-      let some (p, v) := splitFirstChar ':' line
-        | throwErrorAt (stx.getArg 0) s!"expected CSS declaration `property: value`, got `{line}`"
-      let res ← resolveAndValidateDecl (stx.getArg 0) env currNs openDecls strictTokens p v
-      items := items ++ [.decl p.trimmed res.cssText]
-      toks  := toks ++ res.usedTokens
-      rules := rules ++ res.extraRules
-      thms  := mergeUnique thms res.themes
-    else
-      throwErrorAt stx s!"unexpected syntax in CSS block ({stx.getKind})"
-  return { items, usedTokens := Qed.dedupStrings toks, extraRules := Qed.dedupStrings rules, themes := thms }
+    let (item, t, r, th) ←
+      if stx.getKind == ``cssNestedBlock then
+        let sel := stripTrailingColon (stx.getArg 0); if sel.isEmpty then throwErrorAt (stx.getArg 0) "empty nested CSS selector"
+        let sub ← compileCssBlockItems env currNs openDecls strictTokens (stx.getArg 1).getArgs
+        pure (.nest sel sub.items, sub.usedTokens, sub.extraRules, sub.themes)
+      else if stx.getKind == ``cssSimpleDecl then
+        let line := (atomText (stx.getArg 0)).trimmed
+        let some (p, v) := splitFirstChar ':' line | throwErrorAt (stx.getArg 0) s!"expected CSS declaration `property: value`, got `{line}`"
+        let res ← resolveAndValidateDecl (stx.getArg 0) env currNs openDecls strictTokens p v
+        pure (.decl p.trimmed res.cssText, res.usedTokens, res.extraRules, res.themes)
+      else throwErrorAt stx s!"unexpected syntax in CSS block ({stx.getKind})"
+    items := items ++ [item]; toks := toks ++ t; rules := rules ++ r; thms := (thms ++ th).eraseDups
+  return .mk items toks.eraseDups rules.eraseDups thms
 
 private partial def quoteItem : Qed.Item → MacroM Term
-  | .decl p v => `(Qed.Item.decl $(Syntax.mkStrLit p) $(Syntax.mkStrLit v))
-  | .nest sel body => do `(Qed.Item.nest $(Syntax.mkStrLit sel) $(← quoteItems body))
-where
-  quoteItems (items : List Qed.Item) : MacroM Term := do
-    let ts ← items.toArray.mapM quoteItem
-    `([$[$ts],*])
-
-private def quoteStringList (xs : List String) : MacroM Term := do
-  let lits := xs.toArray.map Syntax.mkStrLit
-  `([$[$lits:str],*])
-
+  | .decl p v => `(Qed.Item.decl $(quote p) $(quote v))
+  | .nest sel body => do `(Qed.Item.nest $(quote sel) [$(← body.toArray.mapM quoteItem),*])
+private def quoteItems (items : List Qed.Item) : MacroM Term := do `([$(← items.toArray.mapM quoteItem),*])
 private def quoteStyleLiteral (s : Qed.Style) : MacroM Term := do
-  let isGlob : Term ← if s.isGlobal then `(Bool.true) else `(Bool.false)
-  `({ className  := $(Syntax.mkStrLit s.className)
-      raw        := $(Syntax.mkStrLit s.raw)
-      items      := $(← quoteItem.quoteItems s.items)
-      usedTokens := $(← quoteStringList s.usedTokens)
-      extraRules := $(← quoteStringList s.extraRules)
-      isGlobal   := $isGlob : Qed.Style })
+  `({ className := $(quote s.className), raw := $(quote s.raw), items := $(← quoteItems s.items),
+      usedTokens := $(quote s.usedTokens), extraRules := $(quote s.extraRules), isGlobal := $(quote s.isGlobal) : Qed.Style })
 
-/-! ## `style <name> [extends ...] [strict_tokens]:` Elaborator -/
+/-! ## `style`, `keyframes`, `theme`, and `verify_theme` Elaborators -/
 
-def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment))
-    (nameId : Ident) (extendsIds : Array Ident) (strictTokens : Bool)
-    (bodyStxs : Array Syntax) : CommandElabM Unit := do
-  let (env, currNs, openDecls) ← getCssScope
-  let compiled ← liftCoreM <| compileCssBlockItems env currNs openDecls strictTokens bodyStxs
+def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment)) (nameId : Ident) (extendsIds : Array Ident) (strictTokens : Bool) (bodyStxs : Array Syntax) : CommandElabM Unit := do
+  let (env, currNs, openDecls) ← getCssScope; let compiled ← liftCoreM <| compileCssBlockItems env currNs openDecls strictTokens bodyStxs
   let styleReg := styleMetaRegistry.getState env
-  let shortLabel := nameId.getId.getString!
-  let fullName := currNs ++ nameId.getId
-  let mut baseMetas : Array StyleMetaInfo := #[]
-  for bId in extendsIds do
-    let some bm := resolveInRegistry styleReg env currNs openDecls bId.getId.toString
-      | throwErrorAt bId s!"unknown style `{bId.getId}` in `extends` (declare it with `style {bId.getId}:`)"
-    baseMetas := baseMetas.push bm
-  let mergedItems := baseMetas.foldl (fun acc bm => Qed.Item.mergeItems acc bm.items) []
-  let finalItems  := Qed.Item.mergeItems mergedItems compiled.items
-  let rawCss      := Qed.Item.renderList finalItems
-  let clean       := Qed.sanitizeCssIdent shortLabel
-  let cls         := if clean.isEmpty then s!"qed-{Qed.shortHexHash (Qed.cssHash rawCss)}"
-                     else s!"qed-{clean}-{Qed.shortHexHash (Qed.cssHash rawCss)}"
-  let allToks  := Qed.dedupStrings ((baseMetas.foldl (fun acc bm => acc ++ bm.usedTokens) []) ++ compiled.usedTokens ++ Qed.collectItemTokens finalItems)
-  let allExtra := Qed.dedupStrings ((baseMetas.foldl (fun acc bm => acc ++ bm.extraRules) []) ++ compiled.extraRules)
-  let allThemes := baseMetas.foldl (fun acc bm => mergeUnique acc bm.themes) compiled.themes
-  let baked : Qed.Style := {
-    className := cls, raw := rawCss, items := finalItems,
-    usedTokens := allToks, extraRules := allExtra, isGlobal := false
-  }
-  let valTerm ← liftMacroM <| quoteStyleLiteral baked
-  elabCommand (← `(command| $[$doc?:docComment]? def $nameId : Qed.Style := $valTerm))
-  modifyEnv fun e => styleMetaRegistry.addEntry e {
-    fullName, items := finalItems, usedTokens := allToks, extraRules := allExtra, themes := allThemes
-  }
+  let baseMetas : Array StyleMetaInfo ← extendsIds.mapM fun bId => do
+    let some bm := resolveInRegistry styleReg env currNs openDecls bId.getId.toString | throwErrorAt bId s!"unknown style `{bId.getId}` in `extends` (declare it with `style {bId.getId}:`)"
+    pure bm
+  let finalItems := Qed.Item.mergeItems (baseMetas.foldl (fun acc bm => Qed.Item.mergeItems acc bm.items) []) compiled.items
+  let (rawCss, clean) := (Qed.Item.renderList finalItems, Qed.sanitizeCssIdent nameId.getId.getString!)
+  let cls := s!"qed-{if clean.isEmpty then "" else clean ++ "-"}{Qed.shortHexHash (Qed.cssHash rawCss)}"
+  let allToks  := (baseMetas.toList.flatMap (·.usedTokens) ++ compiled.usedTokens ++ Qed.collectItemTokens finalItems).eraseDups
+  let allExtra := (baseMetas.toList.flatMap (·.extraRules) ++ compiled.extraRules).eraseDups
+  let allThemes := (compiled.themes ++ baseMetas.toList.flatMap (·.themes)).eraseDups
+  let baked : Qed.Style := { className := cls, raw := rawCss, items := finalItems, usedTokens := allToks, extraRules := allExtra }
+  elabCommand (← `(command| $[$doc?:docComment]? def $nameId : Qed.Style := $(← liftMacroM <| quoteStyleLiteral baked)))
+  modifyEnv fun e => styleMetaRegistry.addEntry e (.mk (currNs ++ nameId.getId) finalItems allToks allExtra allThemes)
 
-def extractStyleExtends (optStx : Syntax) : Array Ident :=
-  if optStx.getNumArgs == 1 then ((optStx.getArg 0).getArg 1).getSepArgs.map (⟨·⟩) else #[]
+def extractStyleExtends (optStx : Syntax) : Array Ident := if optStx.getNumArgs == 1 then ((optStx.getArg 0).getArg 1).getSepArgs.map (⟨·⟩) else #[]
 
-@[command_elab styleCmd] def elabStyleCmd : CommandElab := fun stx => do
-  elabStyleDef (optDocComment stx) ⟨stx.getArg 2⟩ (extractStyleExtends (stx.getArg 3))
-    ((stx.getArg 4).getNumArgs == 1) (stx.getArg 6).getArgs
-
-/-! ## `keyframes <name>:` Elaborator -/
+@[command_elab styleCmd] def elabStyleCmd : CommandElab := fun stx =>
+  elabStyleDef (optDocComment stx) ⟨stx.getArg 2⟩ (extractStyleExtends (stx.getArg 3)) ((stx.getArg 4).getNumArgs == 1) (stx.getArg 6).getArgs
 
 @[command_elab keyframesCmd] def elabKeyframesCmd : CommandElab := fun stx => do
-  let nameId : Ident := ⟨(stx.getArg 2)⟩
-  let kfName := Qed.sanitizeCssIdent nameId.getId.getString!
-  let (env, currNs, openDecls) ← getCssScope
-  let mut steps : List (String × List Qed.Item) := []
-  for stepStx in (stx.getArg 4).getArgs do
-    unless stepStx.getKind == ``cssNestedBlock do
-      throwErrorAt stepStx "expected keyframe stop (`from:`, `to:`, or `50%:`)"
-    let compiled ← liftCoreM <| compileCssBlockItems env currNs openDecls false (stepStx.getArg 1).getArgs
-    steps := steps ++ [(stripTrailingColon (stepStx.getArg 0), compiled.items)]
-  let kf : Qed.Keyframes := { name := kfName, steps }
-  let stepTerms ← liftMacroM <| steps.toArray.mapM fun (sel, body) => do
-    `(($(Syntax.mkStrLit sel), $(← quoteItem.quoteItems body)))
-  let doc? := optDocComment stx
-  elabCommand (← `(command| $[$doc?:docComment]? def $nameId : Qed.Keyframes :=
-    Qed.keyframes $(Syntax.mkStrLit kfName) [$[$stepTerms],*]))
-  let fullName := currNs ++ nameId.getId
-  modifyEnv fun e => keyframesMetaRegistry.addEntry e {
-    fullName, kfName, rule := kf.rule
-  }
+  let nameId : Ident := ⟨stx.getArg 2⟩; let kfName := Qed.sanitizeCssIdent nameId.getId.getString!; let (env, currNs, openDecls) ← getCssScope
+  let steps ← (stx.getArg 4).getArgs.toList.mapM fun stepStx => do
+    unless stepStx.getKind == ``cssNestedBlock do throwErrorAt stepStx "expected keyframe stop (`from:`, `to:`, or `50%:`)"
+    pure (stripTrailingColon (stepStx.getArg 0), (← liftCoreM <| compileCssBlockItems env currNs openDecls false (stepStx.getArg 1).getArgs).items)
+  let stepTerms ← liftMacroM <| steps.toArray.mapM fun (sel, body) => do `(($(quote sel), $(← quoteItems body)))
+  elabCommand (← `(command| $[$(optDocComment stx):docComment]? def $nameId : Qed.Keyframes := Qed.keyframes $(quote kfName) [$[$stepTerms],*]))
+  modifyEnv fun e => keyframesMetaRegistry.addEntry e (.mk (currNs ++ nameId.getId) kfName ({ name := kfName, steps } : Qed.Keyframes).rule)
 
-/-! ## `theme <Name>:` Elaborator (Typed Tokens + Dark Mode + Resets + WCAG Contrast Proofs!) -/
-
-private structure ThemeTokEntry where
-  ref      : Syntax
-  ident    : String
-  cssName  : String
-  kind     : String -- "color" | "len" | "num" | "font" | "time"
-  lightCss : String
-  lightRgb : Option (Nat × Nat × Nat) := none
-  darkCss? : Option String := none
-  darkRgb? : Option (Nat × Nat × Nat) := none
+private structure ThemeTokEntry where mk ::
+  (ref : Syntax) (ident cssName kind lightCss : String) (lightRgb : Option (Nat × Nat × Nat) := none)
+  (darkCss? : Option String := none) (darkRgb? : Option (Nat × Nat × Nat) := none)
 deriving Inhabited
 
-private structure ThemeContrastInv where
-  ref      : Syntax
-  invName  : String
-  fgName   : String
-  bgName   : String
-  minX100  : Nat
+private structure ThemeContrastInv where mk :: (ref : Syntax) (invName fgName bgName : String) (minX100 : Nat)
 
-private def parseTokenLine (ref : Syntax) (line : String) : CoreM (String × String × String) := do
-  -- Format: `<kind> <name> = <value>`
-  let some (lhs, val) := splitFirstChar '=' line
-    | throwErrorAt ref s!"expected `<kind> <name> = <value>` in `theme`, got `{line}`"
-  match splitTopLevel ' ' lhs with
-  | [kind, nm] =>
-      unless ["color", "len", "num", "font", "time"].contains kind do
-        throwErrorAt ref s!"unknown theme token kind `{kind}` (expected `color`, `len`, `num`, `font`, or `time`)"
-      unless isIdentLike nm && !nm.contains '.' do
-        throwErrorAt ref s!"invalid theme token name `{nm}`"
-      if val.isEmpty then throwErrorAt ref s!"missing value for token `{nm}`"
-      return (kind, nm, val)
-  | _ => throwErrorAt ref s!"expected `<kind> <name> = <value>` in `theme`, got `{line}`"
+private def parseAndValidateTokenLine (ref : Syntax) (line : String) : CoreM (String × String × String × Option (Nat × Nat × Nat)) := do
+  let some (lhs, val) := splitFirstChar '=' line | throwErrorAt ref s!"expected `<kind> <name> = <value>` in `theme`, got `{line}`"
+  let [kind, nm] := splitTopLevel ' ' lhs | throwErrorAt ref s!"expected `<kind> <name> = <value>` in `theme`, got `{line}`"
+  unless ["color", "len", "num", "font", "time"].contains kind do throwErrorAt ref s!"unknown theme token kind `{kind}` (expected `color`, `len`, `num`, `font`, or `time`)"
+  unless isIdentLike nm && !nm.contains '.' do throwErrorAt ref s!"invalid theme token name `{nm}`"
+  if val.isEmpty then throwErrorAt ref s!"missing value for token `{nm}`"
+  let (cleanVal, rgb?) ← match kind with
+    | "color" => match validateColorLiteral val with | .ok rgb? => pure (val, rgb?) | .error msg => throwErrorAt ref s!"invalid theme color value: {msg}"
+    | "len"   => if !isValidLenAtom val then throwErrorAt ref s!"invalid theme length value `{val}`" else pure (val, none)
+    | "num"   => if !isNumericString val then throwErrorAt ref s!"invalid theme numeric value `{val}`" else pure (val, none)
+    | "time"  => if !isValidTimeAtom val then throwErrorAt ref s!"invalid theme time value `{val}`" else pure (val, none)
+    | _       => pure (if val.startsWith "\"" && val.endsWith "\"" && val.length >= 2 then String.ofList (val.toList.drop 1 |>.dropLast) else val, none)
+  return (kind, nm, cleanVal, rgb?)
 
-private def parseDecimalX100 (s : String) : Option Nat :=
-  let t := s.trimmed
-  match t.splitOn "." with
+private def parseDecimalX100 (s : String) : Option Nat := match s.trimmed.splitOn "." with
   | [w] => w.toNat?.map (· * 100)
-  | [w, f] => do
-      let wn ← w.toNat?
-      let fcs := f.toList
-      if fcs.isEmpty || !fcs.all Char.isDigit then none
-      else if fcs.length == 1 then
-        let fn ← f.toNat?
-        some (wn * 100 + fn * 10)
-      else
-        let fn ← (String.ofList (fcs.take 2)).toNat?
-        some (wn * 100 + fn)
+  | [w, f] => do let wn ← w.toNat?; let fcs := f.toList; guard (!fcs.isEmpty && fcs.all Char.isDigit)
+                 some (wn * 100 + (← if fcs.length == 1 then f.toNat?.map (· * 10) else (String.ofList (fcs.take 2)).toNat?))
   | _ => none
 
 private def parseContrastInvLine (ref : Syntax) (line : String) : CoreM ThemeContrastInv := do
-  -- Format: `invariant <name>: contrast(<fg>, <bg>) >= <ratio>`
-  let some (lhs, rhs) := splitFirstChar ':' line
-    | throwErrorAt ref s!"expected `invariant <name>: contrast(fg, bg) >= <ratio>`, got `{line}`"
-  let lhsParts := splitTopLevel ' ' lhs
-  let invName ← match lhsParts with
-    | ["invariant", nm] => pure nm
-    | _ => throwErrorAt ref s!"expected `invariant <name>: ...`, got `{lhs}`"
-  let rhsParts := rhs.splitOn ">="
-  let (callStr, threshStr) ← match rhsParts with
-    | [c, t] => pure (c.trimmed, t.trimmed)
-    | _ => throwErrorAt ref s!"expected `contrast(fg, bg) >= <ratio>`, got `{rhs}`"
-  let some (fn, argsStr) := parseFuncCall? callStr
-    | throwErrorAt ref s!"expected `contrast(fg, bg)`, got `{callStr}`"
-  unless fn == "contrast" do
-    throwErrorAt ref s!"expected `contrast(fg, bg)` in theme invariant, got `{fn}(...)`"
-  let args := splitTopLevel ',' argsStr
-  let (fgName, bgName) ← match args with
-    | [a, b] => pure (a.trimmed, b.trimmed)
-    | _ => throwErrorAt ref s!"`contrast(...)` expects 2 token names, got `{argsStr}`"
-  let some minX100 := parseDecimalX100 threshStr
-    | throwErrorAt ref s!"invalid contrast threshold `{threshStr}` (expected e.g. `4.5`, `3.0`, or `7.0`)"
-  return { ref, invName, fgName, bgName, minX100 }
-
-private def validateThemeVal (ref : Syntax) (kind val : String) : CoreM (String × Option (Nat × Nat × Nat)) := do
-  match kind with
-  | "color" =>
-      match validateColorLiteral val with
-      | .ok rgb? => return (val, rgb?)
-      | .error msg => throwErrorAt ref s!"invalid theme color value: {msg}"
-  | "len" =>
-      unless isValidLenAtom val do
-        throwErrorAt ref s!"invalid theme length value `{val}`"
-      return (val, none)
-  | "num" =>
-      unless isNumericString val do
-        throwErrorAt ref s!"invalid theme numeric value `{val}`"
-      return (val, none)
-  | "time" =>
-      unless isValidTimeAtom val do
-        throwErrorAt ref s!"invalid theme time value `{val}`"
-      return (val, none)
-  | "font" =>
-      let clean := if val.startsWith "\"" && val.endsWith "\"" && val.length >= 2 then
-        String.ofList (val.toList.drop 1 |>.dropLast)
-      else val
-      return (clean, none)
-  | _ => throwErrorAt ref s!"unknown token kind `{kind}`"
+  let some (lhs, rhs) := splitFirstChar ':' line | throwErrorAt ref s!"expected `invariant <name>: contrast(fg, bg) >= <ratio>`, got `{line}`"
+  let ["invariant", invName] := splitTopLevel ' ' lhs | throwErrorAt ref s!"expected `invariant <name>: ...`, got `{lhs}`"
+  let [c, t] := rhs.splitOn ">=" | throwErrorAt ref s!"expected `contrast(fg, bg) >= <ratio>`, got `{rhs}`"
+  let some (fn, argsStr) := parseFuncCall? c.trimmed | throwErrorAt ref s!"expected `contrast(fg, bg)`, got `{c.trimmed}`"
+  unless fn == "contrast" do throwErrorAt ref s!"expected `contrast(fg, bg)` in theme invariant, got `{fn}(...)`"
+  let [fgName, bgName] := (splitTopLevel ',' argsStr).map String.trimmed | throwErrorAt ref s!"`contrast(...)` expects 2 token names, got `{argsStr}`"
+  let some minX100 := parseDecimalX100 t.trimmed | throwErrorAt ref s!"invalid contrast threshold `{t.trimmed}` (expected e.g. `4.5`, `3.0`, or `7.0`)"
+  return .mk ref invName fgName bgName minX100
 
 private def toKebabCase (s : String) : String :=
-  let rec go : List Char → List Char
-    | [] => []
-    | c :: cs =>
-        if c.isUpper then '-' :: c.toLower :: go cs
-        else if c == '_' then '-' :: go cs
-        else c :: go cs
-  match go s.toList with
-  | '-' :: rest => String.ofList rest
-  | cs          => String.ofList cs
-
-private def quoteOptColor (cssStr? : Option String) (rgb? : Option (Nat × Nat × Nat)) : MacroM Term := do
-  let some cssStr := cssStr? | `(none)
-  let rgbT ← match rgb? with
-    | some (r, g, b) => `(some ($(Syntax.mkNumLit (toString r)), $(Syntax.mkNumLit (toString g)), $(Syntax.mkNumLit (toString b))))
-    | none           => `(none)
-  `(some ({ raw := $(Syntax.mkStrLit cssStr), rgb? := $rgbT } : Qed.Color))
+  let cs := s.toList.flatMap fun c => if c.isUpper then ['-', c.toLower] else if c == '_' then ['-'] else [c]
+  String.ofList (match cs with | '-' :: r => r | _ => cs)
 
 private def emitThemeTokens (themeNm fullThemeName : Name) (entries : Array ThemeTokEntry) : CommandElabM Unit := do
+  let quoteOpt (ty? : Option Term) (css? : Option String) (rgb? : Option (Nat × Nat × Nat) := none) : MacroM Term := match css?, ty? with
+    | none, _ => `(none) | some s, some ty => `(some ({ raw := $(quote s) } : $ty))
+    | some s, none => do let rT ← match rgb? with | some (r, g, b) => `(some ($(quote r), $(quote g), $(quote b))) | none => `(none)
+                         `(some ({ raw := $(quote s), rgb? := $rT } : Qed.Color))
   for e in entries do
     let tokId := mkIdentFrom e.ref (themeNm ++ Name.mkSimple e.ident)
-    let mkOptRaw (ty : Term) : Option String → MacroM Term
-      | some s => `(some ({ raw := $(Syntax.mkStrLit s) } : $ty))
-      | none   => `(none)
     let (tyTerm, lTerm, dTerm) ← match e.kind with
-      | "color" => pure (← `(Qed.Color), ← liftMacroM <| quoteOptColor (some e.lightCss) e.lightRgb, ← liftMacroM <| quoteOptColor e.darkCss? e.darkRgb?)
+      | "color" => pure (← `(Qed.Color), ← liftMacroM <| quoteOpt none (some e.lightCss) e.lightRgb, ← liftMacroM <| quoteOpt none e.darkCss? e.darkRgb?)
       | "len" | "num" | "time" =>
           let ty ← match e.kind with | "len" => `(Qed.Len) | "num" => `(Qed.CssNum) | _ => `(Qed.Time)
-          pure (ty, ← liftMacroM <| mkOptRaw ty (some e.lightCss), ← liftMacroM <| mkOptRaw ty e.darkCss?)
-      | _ =>
-          let d ← match e.darkCss? with | some dc => `(some $(Syntax.mkStrLit dc)) | none => `(none)
-          pure (← `(String), ← `(some $(Syntax.mkStrLit e.lightCss)), d)
-    elabCommand (← `(command| def $tokId : Qed.TypedToken $tyTerm :=
-      { name := $(Syntax.mkStrLit e.cssName), lightVal := $lTerm, darkVal := $dTerm }))
-    modifyEnv fun env' => tokenMetaRegistry.addEntry env' {
-      fullName := fullThemeName ++ Name.mkSimple e.ident, cssName := e.cssName
-      kind := e.kind, themeName? := some fullThemeName
-    }
+          pure (ty, ← liftMacroM <| quoteOpt (some ty) (some e.lightCss), ← liftMacroM <| quoteOpt (some ty) e.darkCss?)
+      | _ => pure (← `(String), ← `(some $(quote e.lightCss)), ← `(($(quote e.darkCss?) : Option String)))
+    elabCommand (← `(command| def $tokId : Qed.TypedToken $tyTerm := { name := $(quote e.cssName), lightVal := $lTerm, darkVal := $dTerm }))
+    modifyEnv fun env' => tokenMetaRegistry.addEntry env' (.mk (fullThemeName ++ Name.mkSimple e.ident) e.cssName e.kind (some fullThemeName))
 
-private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntry)
-    (invs : Array ThemeContrastInv) : CommandElabM Unit := do
+private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntry) (invs : Array ThemeContrastInv) : CommandElabM Unit := do
   for inv in invs do
-    let some fgE := entries.find? (·.ident == inv.fgName)
-      | throwErrorAt inv.ref s!"unknown token `{inv.fgName}` in contrast invariant `{inv.invName}`"
-    let some bgE := entries.find? (·.ident == inv.bgName)
-      | throwErrorAt inv.ref s!"unknown token `{inv.bgName}` in contrast invariant `{inv.invName}`"
-    unless fgE.kind == "color" && bgE.kind == "color" do
-      throwErrorAt inv.ref s!"`contrast({inv.fgName}, {inv.bgName})` requires two `color` tokens"
+    let findTok (nm : String) : CommandElabM ThemeTokEntry :=
+      match entries.find? (·.ident == nm) with
+      | some e => pure e
+      | none => throwErrorAt inv.ref s!"unknown token `{nm}` in contrast invariant `{inv.invName}`"
+    let (fgE, bgE) := (← findTok inv.fgName, ← findTok inv.bgName)
+    unless fgE.kind == "color" && bgE.kind == "color" do throwErrorAt inv.ref s!"`contrast({inv.fgName}, {inv.bgName})` requires two `color` tokens"
     let checkMode (mode : String) (fg bg : Qed.Color) : CommandElabM Unit := do
       let ratio := Qed.Color.contrastX100 fg bg
-      if ratio < inv.minX100 then
-        throwErrorAt inv.ref s!"WCAG contrast invariant `{inv.invName}` failed in {mode} mode: contrast({inv.fgName}={fg.raw}, {inv.bgName}={bg.raw}) is {Qed.formatContrastX100 ratio}, required >= {Qed.formatContrastX100 inv.minX100}"
+      if ratio < inv.minX100 then throwErrorAt inv.ref s!"WCAG contrast invariant `{inv.invName}` failed in {mode} mode: contrast({inv.fgName}={fg.raw}, {inv.bgName}={bg.raw}) is {Qed.formatContrastX100 ratio}, required >= {Qed.formatContrastX100 inv.minX100}"
     checkMode "light" ⟨fgE.lightCss, fgE.lightRgb⟩ ⟨bgE.lightCss, bgE.lightRgb⟩
     if fgE.darkCss?.isSome || bgE.darkCss?.isSome then
-      checkMode "dark" ⟨fgE.darkCss?.getD fgE.lightCss, fgE.darkRgb?.orElse (fun _ => fgE.lightRgb)⟩
-        ⟨bgE.darkCss?.getD bgE.lightCss, bgE.darkRgb?.orElse (fun _ => bgE.lightRgb)⟩
-    let invId := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple inv.invName)
-    let fgId  := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple inv.fgName)
-    let bgId  := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple inv.bgName)
-    elabCommand (← `(command|
-      theorem $invId : Qed.TypedToken.wcagCheck $fgId $bgId $(Syntax.mkNumLit (toString inv.minX100)) = true := by decide))
+      checkMode "dark" ⟨fgE.darkCss?.getD fgE.lightCss, fgE.darkRgb?.orElse fun _ => fgE.lightRgb⟩ ⟨bgE.darkCss?.getD bgE.lightCss, bgE.darkRgb?.orElse fun _ => bgE.lightRgb⟩
+    let mkId (nm : String) := mkIdentFrom inv.ref (themeNm ++ Name.mkSimple nm)
+    elabCommand (← `(command| theorem $(mkId inv.invName) : Qed.TypedToken.wcagCheck $(mkId inv.fgName) $(mkId inv.bgName) $(quote inv.minX100) = true := by decide))
 
 @[command_elab themeCmd] def elabThemeCmd : CommandElab := fun stx => do
-  let doc? := optDocComment stx
-  let themeId : Ident := ⟨(stx.getArg 2)⟩
-  let themeNm := themeId.getId
-  let (env, currNs, openDecls) ← getCssScope
-  let mut entries : Array ThemeTokEntry := #[]
-  let mut resets  : List Qed.Item := []
-  let mut invs    : Array ThemeContrastInv := #[]
+  let themeId : Ident := ⟨stx.getArg 2⟩; let themeNm := themeId.getId; let (env, currNs, openDecls) ← getCssScope
+  let mut entries : Array ThemeTokEntry := #[]; let mut resets : List Qed.Item := []; let mut invs : Array ThemeContrastInv := #[]
   for itemStx in (stx.getArg 4).getArgs do
     if itemStx.getKind == ``cssSimpleDecl then
       let line := (atomText (itemStx.getArg 0)).trimmed
-      if line.startsWith "invariant " then
-        invs := invs.push (← liftCoreM <| parseContrastInvLine (itemStx.getArg 0) line)
+      if line.startsWith "invariant " then invs := invs.push (← liftCoreM <| parseContrastInvLine (itemStx.getArg 0) line)
       else
-        let (kind, nm, rawVal) ← liftCoreM <| parseTokenLine (itemStx.getArg 0) line
-        if entries.any (·.ident == nm) then
-          throwErrorAt (itemStx.getArg 0) s!"duplicate token `{nm}` in theme `{themeNm}`"
-        let (cleanVal, rgb?) ← liftCoreM <| validateThemeVal (itemStx.getArg 0) kind rawVal
-        entries := entries.push {
-          ref := (itemStx.getArg 0), ident := nm, cssName := toKebabCase nm,
-          kind, lightCss := cleanVal, lightRgb := rgb?
-        }
+        let (kind, nm, cleanVal, rgb?) ← liftCoreM <| parseAndValidateTokenLine (itemStx.getArg 0) line
+        if entries.any (·.ident == nm) then throwErrorAt (itemStx.getArg 0) s!"duplicate token `{nm}` in theme `{themeNm}`"
+        entries := entries.push (.mk (itemStx.getArg 0) nm (toKebabCase nm) kind cleanVal rgb? none none)
     else if itemStx.getKind == ``cssNestedBlock then
       let hdr := stripTrailingColon (itemStx.getArg 0)
       if hdr == "dark" then
         for dStx in (itemStx.getArg 1).getArgs do
-          unless dStx.getKind == ``cssSimpleDecl do
-            throwErrorAt dStx "expected `<kind> <name> = <value>` inside `dark:`"
-          let (kind, nm, rawVal) ← liftCoreM <| parseTokenLine (dStx.getArg 0) (atomText (dStx.getArg 0)).trimmed
-          let some idx := entries.findIdx? (·.ident == nm)
-            | throwErrorAt (dStx.getArg 0) s!"dark override for unknown token `{nm}` (declare it in light mode first)"
+          unless dStx.getKind == ``cssSimpleDecl do throwErrorAt dStx "expected `<kind> <name> = <value>` inside `dark:`"
+          let (kind, nm, cleanVal, rgb?) ← liftCoreM <| parseAndValidateTokenLine (dStx.getArg 0) (atomText (dStx.getArg 0)).trimmed
+          let some idx := entries.findIdx? (·.ident == nm) | throwErrorAt (dStx.getArg 0) s!"dark override for unknown token `{nm}` (declare it in light mode first)"
           let prev := entries[idx]!
-          unless prev.kind == kind do
-            throwErrorAt (dStx.getArg 0) s!"dark override kind mismatch for `{nm}`: declared as `{prev.kind}`, overridden as `{kind}`"
-          let (cleanVal, rgb?) ← liftCoreM <| validateThemeVal (dStx.getArg 0) kind rawVal
+          unless prev.kind == kind do throwErrorAt (dStx.getArg 0) s!"dark override kind mismatch for `{nm}`: declared as `{prev.kind}`, overridden as `{kind}`"
           entries := entries.set! idx { prev with darkCss? := some cleanVal, darkRgb? := rgb? }
       else if hdr.startsWith "reset " then
-        let sel := (String.ofList (hdr.toList.drop 6)).trimmed
         let compiled ← liftCoreM <| compileCssBlockItems env currNs openDecls false (itemStx.getArg 1).getArgs
-        resets := resets ++ [.nest sel compiled.items]
-      else
-        throwErrorAt (itemStx.getArg 0) s!"unknown section `{hdr}:` in `theme` (expected `dark:` or `reset <selector>:`)"
-  let lightDecls : List Qed.Item := entries.toList.map fun e => .decl ("--" ++ e.cssName) e.lightCss
+        resets := resets ++ [.nest (String.ofList (hdr.toList.drop 6)).trimmed compiled.items]
+      else throwErrorAt (itemStx.getArg 0) s!"unknown section `{hdr}:` in `theme` (expected `dark:` or `reset <selector>:`)"
   let darkEntries := entries.toList.filter (·.darkCss?.isSome)
-  let darkDecls : List Qed.Item := darkEntries.map fun e => .decl ("--" ++ e.cssName) (e.darkCss?.getD "")
-  let defToks : List String := entries.toList.map (·.cssName)
-  let darkToks : List String := darkEntries.map (·.cssName)
-  let thVal : Qed.Theme := {
-    name := themeNm.getString!, lightDecls, darkDecls, resets,
-    definedTokens := defToks, darkTokens := darkToks
-  }
-  let thStyle := thVal.asStyle
-  let fullThemeName := currNs ++ themeNm
+  let (lightDecls, darkDecls) := (entries.toList.map fun e => Qed.Item.decl ("--" ++ e.cssName) e.lightCss, darkEntries.map fun e => Qed.Item.decl ("--" ++ e.cssName) (e.darkCss?.getD ""))
+  let (defToks, darkToks) := (entries.toList.map (·.cssName), darkEntries.map (·.cssName))
+  let thVal : Qed.Theme := .mk themeNm.getString! lightDecls darkDecls resets defToks darkToks; let fullThemeName := currNs ++ themeNm
   emitThemeTokens themeNm fullThemeName entries
-  let themeConstId := mkIdentFrom themeId (themeNm ++ `theme)
-  let styleConstId := mkIdentFrom themeId (themeNm ++ `style)
-  let themeLit ← liftMacroM do
-    `({ name          := $(Syntax.mkStrLit thVal.name)
-        lightDecls    := $(← quoteItem.quoteItems lightDecls)
-        darkDecls     := $(← quoteItem.quoteItems darkDecls)
-        resets        := $(← quoteItem.quoteItems resets)
-        definedTokens := $(← quoteStringList defToks)
-        darkTokens    := $(← quoteStringList darkToks) })
-  elabCommand (← `(command| $[$doc?:docComment]? def $themeConstId : Qed.Theme := $themeLit))
-  elabCommand (← `(command| def $styleConstId : Qed.Style := $(← liftMacroM <| quoteStyleLiteral thStyle)))
+  let themeLit ← liftMacroM do `({ name := $(quote thVal.name), lightDecls := $(← quoteItems lightDecls), darkDecls := $(← quoteItems darkDecls), resets := $(← quoteItems resets), definedTokens := $(quote defToks), darkTokens := $(quote darkToks) })
+  elabCommand (← `(command| $[$(optDocComment stx):docComment]? def $(mkIdentFrom themeId (themeNm ++ `theme)) : Qed.Theme := $themeLit))
+  elabCommand (← `(command| def $(mkIdentFrom themeId (themeNm ++ `style)) : Qed.Style := $(← liftMacroM <| quoteStyleLiteral thVal.asStyle)))
   emitThemeContrastInvs themeNm entries invs
-  modifyEnv fun env' => themeMetaRegistry.addEntry env' {
-    fullName := fullThemeName, styleConst := fullThemeName ++ `style, themeConst := fullThemeName ++ `theme
-  }
-
-/-! ## `verify_theme <Theme> for <app>` Command (Kernel Proof of Token Completeness) -/
+  modifyEnv fun env' => themeMetaRegistry.addEntry env' (.mk fullThemeName (fullThemeName ++ `style) (fullThemeName ++ `theme))
 
 @[command_elab verifyThemeCmd] def elabVerifyThemeCmd : CommandElab := fun stx => do
-  let thId : Ident := ⟨(stx.getArg 1)⟩
-  let target : Term := ⟨(stx.getArg 3)⟩
-  let (env, currNs, openDecls) ← getCssScope
-  let some thInfo := resolveInRegistry (themeMetaRegistry.getState env) env currNs openDecls thId.getId.toString
-    | throwErrorAt thId s!"unknown `theme` `{thId.getId}`"
+  let (thId, target) : Ident × Term := (⟨stx.getArg 1⟩, ⟨stx.getArg 3⟩); let (env, currNs, openDecls) ← getCssScope
+  let some thInfo := resolveInRegistry (themeMetaRegistry.getState env) env currNs openDecls thId.getId.toString | throwErrorAt thId s!"unknown `theme` `{thId.getId}`"
   let thConst := mkIdentFrom thId thInfo.themeConst
-  -- Determine whether target is an `App` (use `.styles`) or already a `List Style`
   let stylesTerm : Term ← liftTermElabM do
-    let e ← elabTerm target none
-    synthesizeSyntheticMVarsNoPostponing
-    let ty ← whnf (← instantiateMVars (← inferType e))
-    if ty.isAppOf `Qed.App then
-      return (← `(($target).styles))
-    else
-      return target
-  -- Run kernel proof and produce actionable error listing missing tokens if it fails
-  let savedMsgs := (← get).messages
-  modify fun s => { s with messages := {} }
-  let ok ← try
-    elabCommand (← `(command|
-      example : ($thConst).coversAll ($stylesTerm) = true := by decide))
-    pure (!(← get).messages.hasErrors)
-  catch _ => pure false
-  if ok then
-    let newMsgs := (← get).messages
-    modify fun s => { s with messages := savedMsgs ++ newMsgs }
-  else
-    modify fun s => { s with messages := savedMsgs }
+    let e ← elabTerm target none; synthesizeSyntheticMVarsNoPostponing
+    if (← whnf (← instantiateMVars (← inferType e))).isAppOf `Qed.App then `(($target).styles) else pure target
+  let savedMsgs := (← get).messages; modify fun s => { s with messages := {} }
+  let ok ← try elabCommand (← `(command| example : ($thConst).coversAll ($stylesTerm) = true := by decide)); pure (!(← get).messages.hasErrors) catch _ => pure false
+  let newMsgs := (← get).messages; modify fun s => { s with messages := if ok then savedMsgs ++ newMsgs else savedMsgs }
+  if !ok then
     let missingStr ← liftTermElabM do
-      try
-        let expr ← elabTerm (← `(($thConst).missingTokens ($stylesTerm))) none
-        let xs : List String ← Lean.Meta.reduceEval expr
-        return "[" ++ String.intercalate ", " (xs.map fun s => s!"\"{s}\"") ++ "]"
+      try let xs : List String ← Lean.Meta.reduceEval (← elabTerm (← `(($thConst).missingTokens ($stylesTerm))) none)
+          return "[" ++ String.intercalate ", " (xs.map fun s => s!"\"{s}\"") ++ "]"
       catch _ => return "(unknown)"
-    let targetLabel := (target.raw.reprint.getD "target").trimmed
-    throwErrorAt stx s!"theme `{thId.getId}` does not define all CSS tokens used by `{targetLabel}`.\n  Missing tokens: {missingStr}\nAdd them to `theme {thId.getId}:`."
+    throwErrorAt stx s!"theme `{thId.getId}` does not define all CSS tokens used by `{(target.raw.reprint.getD "target").trimmed}`.\n  Missing tokens: {missingStr}\nAdd them to `theme {thId.getId}:`."
 
 end Qed.StyleDsl

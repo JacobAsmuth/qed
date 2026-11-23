@@ -267,6 +267,8 @@ partial def stxMentionsVar (v : String) (stx : Syntax) : Bool :=
   else stx.getArgs.any (stxMentionsVar v)
 
 def extractElseSuite (optElse : Syntax) : Option (Array Syntax) := if optElse.getNumArgs == 3 then some (suiteStmts (optElse.getArg 2)) else none
+def extractOptElseExpr? (optElse : Syntax) : Option Syntax :=
+  if optElse.getNumArgs == 2 then some (optElse.getArg 1) else if optElse.getNumArgs == 3 then some (optElse.getArg 2) else none
 def desugarElifs (elifs : Array Syntax) (optElse : Syntax) : Option (Array Syntax) :=
   if elifs.isEmpty then extractElseSuite optElse else
   let f := elifs[0]!; let i := f.getHeadInfo
@@ -511,7 +513,8 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m] (hooks
     let lowerValOp (s : Syntax) : m Term := do let t ← go .val s; if isPlainLiteralOrCtor s then return t else `(Qed.Lang.QedVal.val $t)
     let finish := finishTermMode mode
     let lowerOptElse (ref optNode thenStx : Syntax) (thenT : Term) (errMsg : String) : m Term :=
-      if optNode.getNumArgs == 2 then go mode (optNode.getArg 1) else if hooks.allowOptElse then hooks.optElseFallback thenStx thenT else hooks.throwErr ref errMsg
+      if let some elseStx := extractOptElseExpr? optNode then go mode elseStx
+      else if hooks.allowOptElse then hooks.optElseFallback thenStx thenT else hooks.throwErr ref errMsg
     match stx.getKind with
     | .str (.str (.str .anonymous "Qed") "Lang") k =>
       match k with

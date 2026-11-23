@@ -115,7 +115,7 @@ private def isCheckboxAttrs (attrStxs : Array Syntax) : Bool := attrStxs.any fun
 mutual
 
 private partial def isListJsxExpr (stx : Syntax) : Bool :=
-  let optElse (tI eI : Nat) := isListJsxExpr (stx.getArg tI) || ((stx.getArg eI).getNumArgs == 2 && isListJsxExpr ((stx.getArg eI).getArg 1))
+  let optElse (tI eI : Nat) := isListJsxExpr (stx.getArg tI) || (Qed.Lang.extractOptElseExpr? (stx.getArg eI)).any isListJsxExpr
   let k := stx.getKind
   if k == ``qedExprJsx then (stx.getArg 0).getKind == ``jsxFragment
   else if k == ``Qed.Lang.qedRawTerm then isMapCall (stx.getArg 1)

@@ -138,6 +138,8 @@ schema Ticket:
   kind     : select([("bug", "Bug"), ("feat", "Feature")])
 def jsxErgonomicsView (items : Array Nat) (note? : Option String) (highlight : Bool) : Html Unit :=
   <div {chipStyle if highlight} data-tag={"hi" if highlight}><><span>Header</span>{<em>!</em> if highlight}{if let some(note) = note?: <p>{note}</p>}</><ul><li key="head">Top</li>{for n in items: <li key={n}>{n}</li>}{for n in ([3, 4] : List Nat): <li key={f"l{n}"}>{n}</li>}</ul></div>
+def jsxElseBranchesView (note? : Option String) (highlight : Bool) (extra : List (Html Unit)) : Html Unit :=
+  <div>{if highlight: <span>yes</span> else: <span>no</span>}{if let some(note) = note?: <p>{note}</p> else: <p>empty</p>}{if highlight: extra else: <><b>f1</b><b>f2</b></>}{if let some(_) = note?: extra else: <><i>m1</i><i>m2</i></>}</div>
 inductive FilterTab | all | tagged (tag : String) deriving DecidableEq
 structure PlainNote where
   id : Nat
@@ -164,6 +166,8 @@ example : Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 2) =
   let ssr := Html.renderWith Counter.regs (<div><style>{".a > .b { content: \"</style>\"; }"}</style><br/>{defaults}</div> : Html Unit)
   let draft : Ticket.Draft := { title := "Fix parser", priority := "2" }
   let jx := Html.render (jsxErgonomicsView #[1, 2] (some "ok") true)
+  let jxElseT := Html.render (jsxElseBranchesView (some "hi") true [<span>ex</span>])
+  let jxElseF := Html.render (jsxElseBranchesView none false [<span>ex</span>])
   (Html.renderWith Counter.regs defaults).contains "8</button>" &&
   ids.length == 3 && ["SyntaxChecks.HelperApp", "SyntaxChecks.LocalNested.Widget", "SyntaxChecks.LocalNested.Tag"].all ids.contains &&
   (Html.render (<Owned state={{ id = 4, count = 2 }} caption="Live" onMsg={Prod.mk}/> : Html (String × Owned.Msg))).contains "Live" &&
@@ -179,6 +183,8 @@ example : Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 2) =
   [("/orgs/acme/repos/qed/edit", some (RepoRoute.edit "acme" "qed")), ("/orgs/acme/repos/qed", some (RepoRoute.blob "acme" "qed")), ("/orgs/acme/issues/3", some (RepoRoute.issues "acme" 3))].all (fun (u, w) => Router.fromURL u == w) &&
   ((Json.parse (Json.render (toJson draft))).bind fromJson).toOption == some draft &&
   ["<p>ok</p>", "<li>3</li><li>4</li>"].all (jx.contains ·) && !(Html.render (jsxErgonomicsView #[] none false)).contains "<em>" &&
+  ["<span>yes</span>", "<p>hi</p>", "<span>ex</span><span>ex</span>"].all (jxElseT.contains ·) &&
+  ["<span>no</span>", "<p>empty</p>", "<b>f1</b><b>f2</b>", "<i>m1</i><i>m2</i>"].all (jxElseF.contains ·) &&
   (RichAuto.app.rehydrate (RichAuto.app.dehydrate { tab := .tagged "lean", notes := #[{ id := 1, text := "hello" }], pick := some { id := 2, text := "pinned" }, cache := ({} : Cached String).put "k" (.ok "v") "k", child := { count := 42, saved := 0 } })).map
     (fun m => m.tab == .tagged "lean" && m.notes == #[{ id := 1, text := "hello" }] && m.pick == some { id := 2, text := "pinned" } && m.cache.lookup "k" == some "v" && m.child.count == 42) == some true &&
   ((PartialFn.app.rehydrate (PartialFn.app.dehydrate { count := 8, fn := (· * 2) })).map fun m => (m.count, m.fn 5)) == some (8, 15)
@@ -365,6 +371,11 @@ component PythonicShowcase:
     match tab:
       case .all: label = "all"
       case .tagged(t): label = f"tag:{t}"
+  action exprBranches(n: Nat, opt: Nat?):
+    let a = if n > 0: "pos" else: "zero"
+    let b = if let some(v) = opt: f":{v}" else: ":none"
+    label = a ++ b
+  invariant exprElseProp: (if score > 0: score else: 0) == score and (if let some(v) = pick: v else: 0) >= 0
   view: <div><span>{label}</span><span>{"has-lean" if "lean" in tags and pick is not none else "none"}</span></div>
 #guard
   let vd : Ticket.Draft := { title := "Fix bug", priority := "3", kind := "bug" }
@@ -374,9 +385,13 @@ component PythonicShowcase:
   !(Html.render (SelfHostedFormKeep.view { picked := none, _form_0 := vd })).contains "disabled" &&
   (match Ticket.parse vd with | some t => let sK := SelfHostedFormKeep.update { picked := none, _form_0 := vd } (.set_picked (some t)); let sR := SelfHostedFormReset.update { picked := none, _form_0 := vd } ._form_reset_0; sK.picked.map (·.title.val) == some t.title.val && sK._form_0 == vd && sR.picked.map (·.title.val) == some t.title.val && sR._form_0 == Ticket.Draft.empty | none => false) &&
   MultiParamAndAutoDefaults.init.xs == #[] && MultiParamAndAutoDefaults.init.x.isNone &&
-  [(.classify 5, "low:5"), (.classify 25, "mid:25"), (.classify 80, "high:80"), (.addTag "qed", "tags:2"), (.usePick, "score=4"), (.describeTab (.tagged "ui"), "tag:ui")].all (fun (m, want) => (upd m).label == want) &&
+  [(.classify 5, "low:5"), (.classify 25, "mid:25"), (.classify 80, "high:80"), (.addTag "qed", "tags:2"), (.usePick, "score=4"), (.describeTab (.tagged "ui"), "tag:ui"),
+   (.exprBranches 3 (some 7), "pos:7"), (.exprBranches 0 none, "zero:none")].all (fun (m, want) => (upd m).label == want) &&
   (upd (.addTag "lean")).tags.size == 1 && (Html.render (PythonicShowcase.view PythonicShowcase.init)).contains "has-lean" &&
   Json.pathStr "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}" "choices.0.delta.content" == "hi" && Json.pathStr "{\"choices\":[]}" "choices.0.delta.content" == ""
+bad_srv1 "`if cond: ...` expression requires `else:` here" BadExprIfNoElse : def go() -> Nat: return if true: 1
+bad_srv1 "`if let pat = expr: ...` expression requires `else:` here" BadExprIfLetNoElse : def go(opt: Nat?) -> Nat: return if let some(v) = opt: v
+expect_err "invalid HTML5 nesting: <div> is not allowed inside <p>" in def badElseBranchNesting : Html Unit := <p>{if true: <span>ok</span> else: <div>bad</div>}</p>
 
 -- ── Automated Quantified, Collection-Query, Nonlinear & Extended `for_each` Invariants ──
 schema LineItem:

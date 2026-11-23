@@ -383,9 +383,7 @@ theorem compileInfra_scale_valid (key : DeployKey) (buildHash : String)
   apply htier
   · split <;> split <;> omega
   · split <;> omega
-  · split
-    · decide
-    · cases spec.compute <;> decide
+  · decide
   · cases ht : spec.timeoutSec? with
     | none => cases (m.server?.map fun s => !s.channels.isEmpty).getD false <;> decide
     | some t => simpa [ht] using hto t ht

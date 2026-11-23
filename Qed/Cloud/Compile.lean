@@ -62,7 +62,7 @@ def compileInfra (key : DeployKey) (buildHash : String)
       maxInstances := if isSingleInstance then 1 else 100
       memoryMb     := spec.compute.memoryMb
       cpuMilli     := spec.compute.cpuMilli
-      concurrency  := if hasState || hasChannels then 1000 else spec.compute.defaultConcurrency
+      concurrency  := 1000
       timeoutSec   := spec.timeoutSec?.getD (if hasChannels then 3600 else 60)
     }
     serviceAccountId := renderSaId key, cloudRunName := renderCloudRunName key

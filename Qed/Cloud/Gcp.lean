@@ -60,16 +60,15 @@ inductive ComputeTier where
   | xlarge       -- 8 vCPU, 16 GB RAM
 deriving Inhabited, DecidableEq, Repr
 
-/-- `(memoryMb, cpuMilli, defaultConcurrency)` tuned for Qed's epoll Rust/Lean runtime. -/
-def ComputeTier.specs : ComputeTier → Nat × Nat × Nat
-  | .standard    => (2048, 1000, 250)
-  | .performance => (4096, 2000, 500)
-  | .large       => (8192, 4000, 1000)
-  | .xlarge      => (16384, 8000, 1000)
+/-- `(memoryMb, cpuMilli)` pairs for each bundled compute tier. -/
+def ComputeTier.specs : ComputeTier → Nat × Nat
+  | .standard    => (2048, 1000)
+  | .performance => (4096, 2000)
+  | .large       => (8192, 4000)
+  | .xlarge      => (16384, 8000)
 
 def ComputeTier.memoryMb (t : ComputeTier) : Nat := t.specs.1
-def ComputeTier.cpuMilli (t : ComputeTier) : Nat := t.specs.2.1
-def ComputeTier.defaultConcurrency (t : ComputeTier) : Nat := t.specs.2.2
+def ComputeTier.cpuMilli (t : ComputeTier) : Nat := t.specs.2
 
 def ComputeTier.toString : ComputeTier → String
   | .standard    => "standard"
@@ -87,7 +86,7 @@ structure ScaleSpec where
   maxInstances : Nat := 100
   memoryMb     : Nat := 2048
   cpuMilli     : Nat := 1000
-  concurrency  : Nat := 250
+  concurrency  : Nat := 1000
   timeoutSec   : Nat := 60
 deriving Inhabited, DecidableEq, Repr
 

@@ -36,59 +36,46 @@ private def parseDurationUnit (stx : Syntax) : CommandElabM Nat := do
 
 /-! ## Term Builders for `DeploySpec` -/
 
-private def regionToTerm : GcpRegion → CommandElabM Term
-  | .us_central1     => `(Qed.Cloud.GcpRegion.us_central1)
-  | .us_east1        => `(Qed.Cloud.GcpRegion.us_east1)
-  | .us_east4        => `(Qed.Cloud.GcpRegion.us_east4)
-  | .us_west1        => `(Qed.Cloud.GcpRegion.us_west1)
-  | .europe_west1    => `(Qed.Cloud.GcpRegion.europe_west1)
-  | .europe_west4    => `(Qed.Cloud.GcpRegion.europe_west4)
-  | .asia_east1      => `(Qed.Cloud.GcpRegion.asia_east1)
-  | .asia_northeast1 => `(Qed.Cloud.GcpRegion.asia_northeast1)
+private def regionTerm (r : GcpRegion) : Term :=
+  mkIdent (`Qed.Cloud.GcpRegion ++ Name.mkSimple (r.toString.replace "-" "_"))
 
-private def computeToTerm : ComputeTier → CommandElabM Term
-  | .standard    => `(Qed.Cloud.ComputeTier.standard)
-  | .performance => `(Qed.Cloud.ComputeTier.performance)
-  | .large       => `(Qed.Cloud.ComputeTier.large)
-  | .xlarge      => `(Qed.Cloud.ComputeTier.xlarge)
+private def computeTerm (t : ComputeTier) : Term :=
+  mkIdent (`Qed.Cloud.ComputeTier ++ Name.mkSimple t.toString)
 
 private def deploySpecToTerm (d : DeploySpec) : CommandElabM Term := do
-  let regTms ← d.regions.toArray.mapM regionToTerm
-  let optTerm {α : Type} (f : α → CommandElabM Term) : Option α → CommandElabM Term
-    | none   => `(Option.none)
-    | some v => do `(Option.some $(← f v))
-  let hpToTm : HostPattern → CommandElabM Term
-    | .exact h    => `(Qed.Cloud.HostPattern.exact $(Syntax.mkStrLit h))
-    | .wildcard s => `(Qed.Cloud.HostPattern.wildcard $(Syntax.mkStrLit s))
-  let protTm : Term ← match d.preview.protection with
-    | .team_only => `(Qed.Cloud.PreviewProtection.team_only)
-    | .pub       => `(Qed.Cloud.PreviewProtection.pub)
-  let mkN (n : Nat) : Term := Syntax.mkNumLit (toString n)
-  let optStr : Option String → CommandElabM Term := optTerm fun s => pure (Syntax.mkStrLit s : Term)
-  let optNat : Option Nat → CommandElabM Term := optTerm fun n => pure (mkN n)
+  let regTms : Array Term := d.regions.toArray.map regionTerm
+  let hostTm : Term ← match d.preview.host? with
+    | none             => `(Option.none)
+    | some (.exact h)  => `(Option.some (Qed.Cloud.HostPattern.exact $(quote h)))
+    | some (.wildcard s) => `(Option.some (Qed.Cloud.HostPattern.wildcard $(quote s)))
+  let protTm : Term := mkIdent <| match d.preview.protection with
+    | .team_only => `Qed.Cloud.PreviewProtection.team_only
+    | .pub       => `Qed.Cloud.PreviewProtection.pub
   `(({
-    name        := $(Syntax.mkStrLit d.name)
-    appName     := $(Syntax.mkStrLit d.appName)
+    name        := $(quote d.name)
+    appName     := $(quote d.appName)
     regions     := [$[$regTms:term],*]
-    domain?     := $(← optStr d.domain?)
-    compute     := $(← computeToTerm d.compute)
-    timeoutSec? := $(← optNat d.timeoutSec?)
+    domain?     := $(quote d.domain?)
+    compute     := $(computeTerm d.compute)
+    timeoutSec? := $(quote d.timeoutSec?)
     preview     := {
       enabled    := $(quote d.preview.enabled)
-      subdomain? := $(← optStr d.preview.subdomain?)
-      host?      := $(← optTerm hpToTm d.preview.host?)
+      subdomain? := $(quote d.preview.subdomain?)
+      host?      := $hostTm
       protection := $protTm
-      ttlSec     := $(mkN d.preview.ttlSec)
+      ttlSec     := $(quote d.preview.ttlSec)
     }
   } : Qed.Cloud.DeploySpec))
 
 /-! ## Lowering Inline `deploy` Invariant Expressions -/
 
+private def deploySpecFields : Array (String × Name) := #[
+  ("compute", `compute), ("timeout_sec", `timeoutSec?), ("regions", `regions), ("domain", `domain?)
+]
+
 private def lowerDeployInvExpr (specId : Ident) (stx : Syntax) : CommandElabM Term := do
   let fail (ref : Syntax) (msg : String) : ReaderT (Array String) CommandElabM Term :=
     throwErrorAt ref msg
-  let foldProjs (ref : Syntax) (base : Term) (fs : List Name) : ReaderT (Array String) CommandElabM Term :=
-    fs.foldlM (init := base) fun acc f => `(($acc).$(mkIdentFrom ref f):ident)
   let mapPreviewField (ref : Syntax) (f : String) : ReaderT (Array String) CommandElabM Name :=
     match f with
     | "enabled"   | "on_pr"       => return `enabled
@@ -104,40 +91,30 @@ private def lowerDeployInvExpr (specId : Ident) (stx : Syntax) : CommandElabM Te
     withLocals := fun names act => withReader (· ++ names) act
     lowerIdent := fun ref id mode => do
       let locals ← read
-      let comps := id.getId.eraseMacroScopes.components
-      match comps with
+      match id.getId.eraseMacroScopes.components with
       | [] => throwErrorAt ref "empty identifier in deploy invariant"
-      | [single] =>
-          let s := single.toString
-          if locals.contains s then return mkIdentFrom ref single
-          else if s == "true" then if mode == .propInv then `(True) else `(true)
-          else if s == "false" then if mode == .propInv then `(False) else `(false)
-          else if s == "none" then `(Option.none)
-          else if s == "team_only" then `(Qed.Cloud.PreviewProtection.team_only)
-          else if s == "anyone" || s == "pub" then `(Qed.Cloud.PreviewProtection.pub)
-          else if s == "compute" then `(($specId).compute)
-          else if s == "timeout_sec" then `(($specId).timeoutSec?)
-          else if s == "timeout" then throwErrorAt ref "use `timeout_sec` (Option Nat, in seconds) inside deploy invariants"
-          else if s == "preview" then `(($specId).preview)
-          else if s == "regions" then `(($specId).regions)
-          else if s == "domain" then `(($specId).domain?)
-          else if let some tier := ComputeTier.parse? s then liftM (computeToTerm tier)
-          else if let some reg := GcpRegion.parse? s then liftM (regionToTerm reg)
-          else return mkIdentFrom ref single
       | root :: rest =>
           let rs := root.toString
-          if locals.contains rs then foldProjs ref (mkIdentFrom ref root) rest
+          if locals.contains rs then foldProjTerms ref (mkIdentFrom ref root) rest
           else if rs == "preview" then
             match rest with
+            | [] => `(($specId).preview)
             | f :: more =>
                 let fn ← mapPreviewField ref f.toString
-                foldProjs ref (← `(($specId).preview.$(mkIdentFrom ref fn):ident)) more
-            | [] => `(($specId).preview)
-          else if rs == "compute"     then foldProjs ref (← `(($specId).compute)) rest
-          else if rs == "timeout_sec" then foldProjs ref (← `(($specId).timeoutSec?)) rest
-          else if rs == "regions"     then foldProjs ref (← `(($specId).regions)) rest
-          else if rs == "domain"      then foldProjs ref (← `(($specId).domain?)) rest
-          else foldProjs ref (mkIdentFrom ref root) rest
+                foldProjTerms ref (← `(($specId).preview.$(mkIdentFrom ref fn):ident)) more
+          else if let some (_, fld) := deploySpecFields.find? (·.1 == rs) then
+            foldProjTerms ref (← `(($specId).$(mkIdentFrom ref fld):ident)) rest
+          else if rest.isEmpty then
+            if rs == "true" then if mode == .propInv then `(True) else `(true)
+            else if rs == "false" then if mode == .propInv then `(False) else `(false)
+            else if rs == "none" then `(Option.none)
+            else if rs == "team_only" then `(Qed.Cloud.PreviewProtection.team_only)
+            else if rs == "anyone" || rs == "pub" then `(Qed.Cloud.PreviewProtection.pub)
+            else if rs == "timeout" then throwErrorAt ref "use `timeout_sec` (Option Nat, in seconds) inside deploy invariants"
+            else if let some tier := ComputeTier.parse? rs then pure (computeTerm tier)
+            else if let some reg := GcpRegion.parse? rs then pure (regionTerm reg)
+            else pure (mkIdentFrom ref root)
+          else foldProjTerms ref (mkIdentFrom ref root) rest
   }
   (lowerQedExpr hooks .propInv stx).run #[]
 
@@ -150,8 +127,8 @@ def elabDeployCmd : CommandElab := fun stx => do
   let depShort := depName.toString
   let currNs ← getCurrNamespace
   let fullDepName := currNs ++ depName
-  let clauses := (stx.getArg 3).getArgs
 
+  let mut seenTop     : Array Name := #[]
   let mut appIdent?   : Option Ident := none
   let mut regions?    : Option (List GcpRegion) := none
   let mut regionsRef? : Option Syntax := none
@@ -164,42 +141,37 @@ def elabDeployCmd : CommandElab := fun stx => do
   let mut previewRef? : Option Syntax := none
   let mut invs        : Array (Ident × Array Syntax) := #[]
 
-  for c in clauses do
+  for c in (stx.getArg 3).getArgs do
     let k := c.getKind
+    if k != ``deployInvClause then
+      if seenTop.contains k then
+        throwErrorAt c s!"duplicate clause in `deploy {depShort}`"
+      seenTop := seenTop.push k
     if k == ``deployAppClause then
-      if appIdent?.isSome then throwErrorAt c s!"duplicate `app` clause in `deploy {depShort}`"
       appIdent? := some ⟨c.getArg 1⟩
     else if k == ``deployRegionsClause then
-      if regions?.isSome then throwErrorAt c s!"duplicate `regions` clause in `deploy {depShort}`"
       regionsRef? := some c
       let mut regs : Array GcpRegion := #[]
       for rId in (c.getArg 2).getSepArgs do
         let rs := rId.getId.eraseMacroScopes.toString
-        match GcpRegion.parse? rs with
-        | some r =>
-            if regs.contains r then throwErrorAt rId s!"duplicate region `{rs}` in `deploy {depShort}`"
-            regs := regs.push r
-        | none =>
-            throwErrorAt rId s!"unknown GCP region `{rs}`{Qed.Diag.didYouMean rs GcpRegion.allNames} (supported: {String.intercalate ", " GcpRegion.allNames})"
+        let some r := GcpRegion.parse? rs
+          | throwErrorAt rId s!"unknown GCP region `{rs}`{Qed.Diag.didYouMean rs GcpRegion.allNames} (supported: {String.intercalate ", " GcpRegion.allNames})"
+        if regs.contains r then throwErrorAt rId s!"duplicate region `{rs}` in `deploy {depShort}`"
+        regs := regs.push r
       regions? := some regs.toList
     else if k == ``deployDomainClause then
-      if domain?.isSome then throwErrorAt c s!"duplicate `domain` clause in `deploy {depShort}`"
       domain? := some (⟨c.getArg 1⟩ : TSyntax `str).getString
       domainRef? := some (c.getArg 1)
     else if k == ``deployComputeClause then
-      if compute?.isSome then throwErrorAt c s!"duplicate `compute` clause in `deploy {depShort}`"
       let tId := c.getArg 1
       let ts := tId.getId.eraseMacroScopes.toString
-      match ComputeTier.parse? ts with
-      | some tier => compute? := some tier
-      | none =>
-          throwErrorAt tId s!"unknown `compute` tier `{ts}`{Qed.Diag.didYouMean ts ComputeTier.allNames} (supported: {String.intercalate ", " ComputeTier.allNames})"
+      let some tier := ComputeTier.parse? ts
+        | throwErrorAt tId s!"unknown `compute` tier `{ts}`{Qed.Diag.didYouMean ts ComputeTier.allNames} (supported: {String.intercalate ", " ComputeTier.allNames})"
+      compute? := some tier
     else if k == ``deployTimeoutClause then
-      if timeoutSec?.isSome then throwErrorAt c s!"duplicate `timeout` clause in `deploy {depShort}`"
       timeoutSec? := some (← parseDurationUnit (c.getArg 1))
       timeoutRef? := some (c.getArg 1)
     else if k == ``deployPreviewBlockClause then
-      if previewRef?.isSome then throwErrorAt c s!"duplicate `preview:` block in `deploy {depShort}`"
       previewRef? := some c
       let mut seen : Array Name := #[]
       let mut rawPreviewDomain? : Option (Syntax × String) := none
@@ -209,16 +181,15 @@ def elabDeployCmd : CommandElab := fun stx => do
           throwErrorAt pc s!"duplicate clause in `preview:` of `deploy {depShort}`"
         seen := seen.push pk
         if pk == ``deployPreviewOnPrClause then
-          let bStr := (pc.getArg 1).getId.eraseMacroScopes.toString
-          preview := { preview with enabled := bStr == "true" }
-        else if pk == ``deployPreviewSubdomainClause then
-          if rawPreviewDomain?.isSome then
+          preview := { preview with enabled := (pc.getArg 1).getId.eraseMacroScopes == `true }
+        else if pk == ``deployPreviewSubdomainClause || pk == ``deployPreviewDomainClause then
+          if seen.contains ``deployPreviewSubdomainClause && seen.contains ``deployPreviewDomainClause then
             throwErrorAt pc s!"cannot specify both `subdomain` and `domain` in `preview:` of `deploy {depShort}`"
-          preview := { preview with subdomain? := some (⟨pc.getArg 1⟩ : TSyntax `str).getString, host? := none }
-        else if pk == ``deployPreviewDomainClause then
-          if seen.contains ``deployPreviewSubdomainClause then
-            throwErrorAt pc s!"cannot specify both `subdomain` and `domain` in `preview:` of `deploy {depShort}`"
-          rawPreviewDomain? := some (pc.getArg 1, (⟨pc.getArg 1⟩ : TSyntax `str).getString)
+          let s := (⟨pc.getArg 1⟩ : TSyntax `str).getString
+          if pk == ``deployPreviewSubdomainClause then
+            preview := { preview with subdomain? := some s, host? := none }
+          else
+            rawPreviewDomain? := some (pc.getArg 1, s)
         else if pk == ``deployPreviewProtectionClause then
           let arg := pc.getArg 1
           let isPub := arg.getAtomVal == "public" || arg.getId.eraseMacroScopes == `anyone
@@ -228,12 +199,10 @@ def elabDeployCmd : CommandElab := fun stx => do
         else
           throwErrorAt pc s!"unexpected clause in `preview:`"
       if let some (dRef, rawDom) := rawPreviewDomain? then
-        if preview.enabled then
-          let some hp := HostPattern.parse? rawDom
-            | throwErrorAt dRef s!"`deploy {depShort}`: invalid preview `domain` `{rawDom}` (expected RFC 1123 host or `*.example.com`)"
-          preview := { preview with host? := some hp, subdomain? := none }
-        else
-          preview := { preview with host? := HostPattern.parse? rawDom, subdomain? := none }
+        let hp? := HostPattern.parse? rawDom
+        if preview.enabled && hp?.isNone then
+          throwErrorAt dRef s!"`deploy {depShort}`: invalid preview `domain` `{rawDom}` (expected RFC 1123 host or `*.example.com`)"
+        preview := { preview with host? := hp?, subdomain? := none }
     else if k == ``deployInvClause then
       let invId : Ident := ⟨c.getArg 1⟩
       let leaf := invId.getId.eraseMacroScopes
@@ -262,10 +231,7 @@ def elabDeployCmd : CommandElab := fun stx => do
     | some fi, some _ => pure fi.fullstackName.toString
     | none, some si   => pure si.serverName.toString
     | _, none =>
-        let compTarget : Ident :=
-          if env.contains (currNs ++ appIdent.getId ++ `app) || env.contains (appIdent.getId ++ `app) then
-            mkIdentFrom appIdent (appIdent.getId ++ `app)
-          else appIdent
+        let compTarget := resolveAppTargetIdent env currNs appIdent
         match ← (try some <$> liftCoreM (realizeGlobalConstNoOverloadWithInfo compTarget) catch _ => pure none) with
         | some resolved => pure resolved.toString
         | none =>

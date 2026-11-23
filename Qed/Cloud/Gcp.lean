@@ -38,19 +38,15 @@ def GcpRegion.toString : GcpRegion → String
 
 instance : ToString GcpRegion := ⟨GcpRegion.toString⟩
 
-def GcpRegion.parse? : String → Option GcpRegion
-  | "us_central1"     | "us-central1"     => some .us_central1
-  | "us_east1"        | "us-east1"        => some .us_east1
-  | "us_east4"        | "us-east4"        => some .us_east4
-  | "us_west1"        | "us-west1"        => some .us_west1
-  | "europe_west1"    | "europe-west1"    => some .europe_west1
-  | "europe_west4"    | "europe-west4"    => some .europe_west4
-  | "asia_east1"      | "asia-east1"      => some .asia_east1
-  | "asia_northeast1" | "asia-northeast1" => some .asia_northeast1
-  | _                                     => none
+def GcpRegion.all : List GcpRegion :=
+  [.us_central1, .us_east1, .us_east4, .us_west1, .europe_west1, .europe_west4, .asia_east1, .asia_northeast1]
 
 def GcpRegion.allNames : List String :=
-  ["us_central1", "us_east1", "us_east4", "us_west1", "europe_west1", "europe_west4", "asia_east1", "asia_northeast1"]
+  GcpRegion.all.map fun r => r.toString.replace "-" "_"
+
+def GcpRegion.parse? (s : String) : Option GcpRegion :=
+  let norm := s.replace "_" "-"
+  GcpRegion.all.find? (·.toString == norm)
 
 def GcpRegion.inEu : GcpRegion → Bool
   | .europe_west1 | .europe_west4 => true
@@ -64,34 +60,26 @@ inductive ComputeTier where
   | xlarge       -- 8 vCPU, 16 GB RAM
 deriving Inhabited, DecidableEq, Repr
 
-def ComputeTier.memoryMb : ComputeTier → Nat
-  | .standard    => 2048
-  | .performance => 4096
-  | .large       => 8192
-  | .xlarge      => 16384
+/-- `(memoryMb, cpuMilli, defaultConcurrency)` tuned for Qed's epoll Rust/Lean runtime. -/
+def ComputeTier.specs : ComputeTier → Nat × Nat × Nat
+  | .standard    => (2048, 1000, 250)
+  | .performance => (4096, 2000, 500)
+  | .large       => (8192, 4000, 1000)
+  | .xlarge      => (16384, 8000, 1000)
 
-def ComputeTier.cpuMilli : ComputeTier → Nat
-  | .standard    => 1000
-  | .performance => 2000
-  | .large       => 4000
-  | .xlarge      => 8000
+def ComputeTier.memoryMb (t : ComputeTier) : Nat := t.specs.1
+def ComputeTier.cpuMilli (t : ComputeTier) : Nat := t.specs.2.1
+def ComputeTier.defaultConcurrency (t : ComputeTier) : Nat := t.specs.2.2
 
-/-- Default Cloud Run per-instance concurrency tuned for Qed's epoll Rust/Lean runtime. -/
-def ComputeTier.defaultConcurrency : ComputeTier → Nat
-  | .standard    => 250
-  | .performance => 500
-  | .large       => 1000
-  | .xlarge      => 1000
+def ComputeTier.toString : ComputeTier → String
+  | .standard    => "standard"
+  | .performance => "performance"
+  | .large       => "large"
+  | .xlarge      => "xlarge"
 
-def ComputeTier.parse? : String → Option ComputeTier
-  | "standard"    => some .standard
-  | "performance" => some .performance
-  | "large"       => some .large
-  | "xlarge"      => some .xlarge
-  | _             => none
-
-def ComputeTier.allNames : List String :=
-  ["standard", "performance", "large", "xlarge"]
+def ComputeTier.all : List ComputeTier := [.standard, .performance, .large, .xlarge]
+def ComputeTier.allNames : List String := ComputeTier.all.map ComputeTier.toString
+def ComputeTier.parse? (s : String) : Option ComputeTier := ComputeTier.all.find? (·.toString == s)
 
 /-- Compiled Cloud Run container scaling & hardware configuration (platform-derived in `compileInfra`). -/
 structure ScaleSpec where
@@ -103,42 +91,33 @@ structure ScaleSpec where
   timeoutSec   : Nat := 60
 deriving Inhabited, DecidableEq, Repr
 
+def minCpuRules : List (Nat × Nat × String) :=
+  [(24576, 8000, "8 vCPU"), (16384, 6000, "at least 6 vCPU"), (8192, 4000, "at least 4 vCPU"),
+   (4096, 2000, "at least 2 vCPU"), (1024, 1000, "at least 1 vCPU"), (512, 500, "at least 500m CPU")]
+
+def minMemRules : List (Nat × Nat × String) :=
+  [(6000, 4096, "4gb"), (4000, 2048, "2gb"), (2000, 512, "512mb")]
+
 /-- Exact Cloud Run hardware coupling & tier validation. -/
-def ScaleSpec.validate (s : ScaleSpec) : Except String Unit :=
+def ScaleSpec.validate (s : ScaleSpec) : Except String Unit := do
   if s.maxInstances == 0 then
     .error "scale: `max_instances` must be at least 1"
-  else if s.minInstances > s.maxInstances then
+  if s.minInstances > s.maxInstances then
     .error s!"scale: `min_instances` ({s.minInstances}) cannot exceed `max_instances` ({s.maxInstances})"
-  else if s.memoryMb < 128 || s.memoryMb > 32768 then
+  if s.memoryMb < 128 || s.memoryMb > 32768 then
     .error s!"scale: unsupported Cloud Run `memory` ({s.memoryMb}mb; expected 128mb..32gb)"
-  else if !(s.cpuMilli ∈ [250, 500, 1000, 2000, 4000, 6000, 8000]) then
+  if !(s.cpuMilli ∈ [250, 500, 1000, 2000, 4000, 6000, 8000]) then
     .error s!"scale: unsupported Cloud Run `cpu` ({s.cpuMilli}m)"
-  else if s.memoryMb > 24576 && s.cpuMilli < 8000 then
-    .error s!"scale: Cloud Run `memory` {s.memoryMb}mb requires 8 vCPU"
-  else if s.memoryMb > 16384 && s.cpuMilli < 6000 then
-    .error s!"scale: Cloud Run `memory` {s.memoryMb}mb requires at least 6 vCPU"
-  else if s.memoryMb > 8192 && s.cpuMilli < 4000 then
-    .error s!"scale: Cloud Run `memory` {s.memoryMb}mb requires at least 4 vCPU"
-  else if s.memoryMb > 4096 && s.cpuMilli < 2000 then
-    .error s!"scale: Cloud Run `memory` {s.memoryMb}mb requires at least 2 vCPU"
-  else if s.memoryMb > 1024 && s.cpuMilli < 1000 then
-    .error s!"scale: Cloud Run `memory` {s.memoryMb}mb requires at least 1 vCPU"
-  else if s.memoryMb > 512 && s.cpuMilli < 500 then
-    .error s!"scale: Cloud Run `memory` {s.memoryMb}mb requires at least 500m CPU"
-  else if s.cpuMilli ≥ 6000 && s.memoryMb < 4096 then
-    .error s!"scale: Cloud Run {s.cpuMilli / 1000} vCPU requires at least 4gb `memory` (got {s.memoryMb}mb)"
-  else if s.cpuMilli ≥ 4000 && s.memoryMb < 2048 then
-    .error s!"scale: Cloud Run 4 vCPU requires at least 2gb `memory` (got {s.memoryMb}mb)"
-  else if s.cpuMilli ≥ 2000 && s.memoryMb < 512 then
-    .error s!"scale: Cloud Run 2 vCPU requires at least 512mb `memory` (got {s.memoryMb}mb)"
-  else if s.cpuMilli < 1000 && s.concurrency > 1 then
+  if let some (_, _, req) := minCpuRules.find? fun (m, c, _) => s.memoryMb > m && s.cpuMilli < c then
+    .error s!"scale: Cloud Run `memory` {s.memoryMb}mb requires {req}"
+  if let some (_, _, req) := minMemRules.find? fun (c, m, _) => s.cpuMilli ≥ c && s.memoryMb < m then
+    .error s!"scale: Cloud Run {s.cpuMilli / 1000} vCPU requires at least {req} `memory` (got {s.memoryMb}mb)"
+  if s.cpuMilli < 1000 && s.concurrency > 1 then
     .error "scale: fractional `cpu` (< 1 vCPU) on Cloud Run requires `concurrency` = 1 (or raise `cpu` to >= 1)"
-  else if s.concurrency == 0 || s.concurrency > 1000 then
+  if s.concurrency == 0 || s.concurrency > 1000 then
     .error s!"scale: `concurrency` ({s.concurrency}) must be between 1 and 1000"
-  else if s.timeoutSec == 0 || s.timeoutSec > 3600 then
+  if s.timeoutSec == 0 || s.timeoutSec > 3600 then
     .error s!"scale: `timeout` ({s.timeoutSec}s) must be between 1s and 3600s"
-  else
-    .ok ()
 
 theorem ScaleSpec.validate_default_ok : ({} : ScaleSpec).validate = .ok () := rfl
 
@@ -285,46 +264,35 @@ def decNat (s : String) : Option Nat :=
   | [] => none
   | cs => decDigitsAux 0 cs
 
-private theorem encNatAux_length_pos (k n : Nat) (acc : List Char) (hk : 0 < k) :
-    0 < (encNatAux k n acc).length := by
-  induction k generalizing n acc with
-  | zero => omega
-  | succ k ih =>
-      simp only [encNatAux]
-      split
-      · simp
-      · cases k with
-        | zero => simp [encNatAux]
-        | succ k' => exact ih (n / 10) (Char.ofNat (48 + n % 10) :: acc) (Nat.succ_pos k')
-
-private theorem encNatAux_length_bound (d k n : Nat) (hn : n < 10 ^ (d + 1)) (hk : d + 1 ≤ k)
+private theorem encNatAux_bounds (d k n : Nat) (hn : n < 10 ^ (d + 1)) (hk : d + 1 ≤ k)
     (acc : List Char) :
-    (encNatAux k n acc).length ≤ d + 1 + acc.length := by
+    acc.length < (encNatAux k n acc).length ∧ (encNatAux k n acc).length ≤ d + 1 + acc.length := by
   induction d generalizing k n acc with
   | zero =>
       cases k with
       | zero => omega
-      | succ k' =>
-          simp only [Nat.zero_add, Nat.pow_one] at hn
-          simp [encNatAux, hn]; omega
+      | succ _ =>
+          have h10 : n < 10 := by simpa using hn
+          simp [encNatAux, h10]; omega
   | succ d ih =>
       cases k with
       | zero => omega
       | succ k' =>
-          simp only [encNatAux]
-          split
+          simp only [encNatAux]; split
           · simp; omega
-          · have hdiv : n / 10 < 10 ^ (d + 1) := by rw [Nat.pow_succ] at hn; omega
-            have h := ih k' (n / 10) hdiv (by omega) (Char.ofNat (48 + n % 10) :: acc)
-            simp at h
-            omega
+          · have h := ih k' (n / 10) (by rw [Nat.pow_succ] at hn; omega) (by omega)
+              (Char.ofNat (48 + n % 10) :: acc)
+            simp at h; omega
+
+private theorem encNat_len_bounds {d n : Nat} (hn : n < 10 ^ (d + 1)) (hd : d ≤ 9) :
+    1 ≤ (encNat n).toList.length ∧ (encNat n).toList.length ≤ d + 1 := by
+  have h := encNatAux_bounds d 10 n hn (by omega) []
+  simpa [encNat] using h
 
 private theorem char_ofNat_digit (d : Nat) (hd : d < 10) :
-    '0' ≤ Char.ofNat (48 + d) ∧ Char.ofNat (48 + d) ≤ '9' ∧ (Char.ofNat (48 + d)).toNat - 48 = d := by
-  have hall : ∀ i : Fin 10,
-      '0' ≤ Char.ofNat (48 + i.val) ∧ Char.ofNat (48 + i.val) ≤ '9' ∧ (Char.ofNat (48 + i.val)).toNat - 48 = i.val := by
-    decide
-  exact hall ⟨d, hd⟩
+    '0' ≤ Char.ofNat (48 + d) ∧ Char.ofNat (48 + d) ≤ '9' ∧ (Char.ofNat (48 + d)).toNat - 48 = d :=
+  (by decide : ∀ i : Fin 10, '0' ≤ Char.ofNat (48 + i.val) ∧ Char.ofNat (48 + i.val) ≤ '9' ∧
+    (Char.ofNat (48 + i.val)).toNat - 48 = i.val) ⟨d, hd⟩
 
 private theorem encNatAux_all_digits (k n : Nat) (acc : List Char)
     (hacc : ∀ c ∈ acc, '0' ≤ c ∧ c ≤ '9') :
@@ -332,18 +300,12 @@ private theorem encNatAux_all_digits (k n : Nat) (acc : List Char)
   induction k generalizing n acc with
   | zero => exact hacc
   | succ k ih =>
-      simp only [encNatAux]
       have hd := char_ofNat_digit (n % 10) (Nat.mod_lt _ (by decide))
-      split
-      · intro c hc
-        rcases List.mem_cons.mp hc with rfl | hc'
-        · exact ⟨hd.1, hd.2.1⟩
-        · exact hacc c hc'
-      · apply ih
-        intro c hc
-        rcases List.mem_cons.mp hc with rfl | hc'
-        · exact ⟨hd.1, hd.2.1⟩
-        · exact hacc c hc'
+      have hnext : ∀ c ∈ Char.ofNat (48 + n % 10) :: acc, '0' ≤ c ∧ c ≤ '9' := fun c hc =>
+        (List.mem_cons.mp hc).elim (fun h => h ▸ ⟨hd.1, hd.2.1⟩) (hacc c)
+      simp only [encNatAux]; split
+      · exact hnext
+      · exact ih (n / 10) _ hnext
 
 private theorem decDigitsAux_append_digit (acc d : Nat) (hd : d < 10) (cs : List Char) :
     decDigitsAux acc (Char.ofNat (48 + d) :: cs) = decDigitsAux (acc * 10 + d) cs := by
@@ -353,44 +315,29 @@ private theorem decDigitsAux_append_digit (acc d : Nat) (hd : d < 10) (cs : List
 private theorem decDigitsAux_encNatAux (k n : Nat) (hbound : n < 10 ^ k) (cs : List Char) :
     decDigitsAux 0 (encNatAux k n cs) = decDigitsAux n cs := by
   induction k generalizing n cs with
-  | zero =>
-      simp at hbound; subst hbound; rfl
+  | zero => simp at hbound; subst hbound; rfl
   | succ k ih =>
-      simp only [encNatAux]
-      split
+      simp only [encNatAux]; split
       · rename_i hlt
         rw [decDigitsAux_append_digit 0 (n % 10) (Nat.mod_lt _ (by decide))]
         simp [Nat.mod_eq_of_lt hlt]
-      · have hdiv : n / 10 < 10 ^ k := by rw [Nat.pow_succ] at hbound; omega
-        rw [ih (n / 10) hdiv (Char.ofNat (48 + n % 10) :: cs)]
-        rw [decDigitsAux_append_digit (n / 10) (n % 10) (Nat.mod_lt _ (by decide))]
-        have hrec : n / 10 * 10 + n % 10 = n := by omega
-        rw [hrec]
+      · rw [ih (n / 10) (by rw [Nat.pow_succ] at hbound; omega) (Char.ofNat (48 + n % 10) :: cs),
+            decDigitsAux_append_digit (n / 10) (n % 10) (Nat.mod_lt _ (by decide)),
+            show n / 10 * 10 + n % 10 = n by omega]
 
 theorem decNat_encNat (n : Nat) (hn : n < 10000000000) : decNat (encNat n) = some n := by
-  unfold decNat encNat
-  rw [String.toList_ofList]
-  have hne : encNatAux 10 n [] ≠ [] := fun heq => by
-    have hpos := encNatAux_length_pos 10 n [] (by decide)
-    rw [heq] at hpos; simp at hpos
+  unfold decNat encNat; rw [String.toList_ofList]
+  have hpos := (encNatAux_bounds 9 10 n hn (by decide) []).1
   cases h : encNatAux 10 n [] with
-  | nil => exact absurd h hne
-  | cons c cs =>
-      have hdec := decDigitsAux_encNatAux 10 n hn []
-      rw [h] at hdec; exact hdec
+  | nil => rw [h] at hpos; simp at hpos
+  | cons _ _ => have hdec := decDigitsAux_encNatAux 10 n hn []; rw [h] at hdec; exact hdec
 
 theorem encNat_injective {a b : Nat} (ha : a < 10000000000) (hb : b < 10000000000)
-    (heq : encNat a = encNat b) : a = b := by
-  have h1 := decNat_encNat a ha
-  have h2 := decNat_encNat b hb
-  rw [heq] at h1
-  rw [h1] at h2
-  exact Option.some.inj h2
+    (heq : encNat a = encNat b) : a = b :=
+  Option.some.inj ((decNat_encNat a ha).symm.trans (heq ▸ decNat_encNat b hb))
 
-theorem encNat_no_hyphen (n : Nat) : '-' ∉ (encNat n).toList := by
-  unfold encNat
-  rw [String.toList_ofList]
-  intro hmem
+theorem encNat_no_hyphen (n : Nat) : '-' ∉ (encNat n).toList := fun hmem => by
+  rw [encNat, String.toList_ofList] at hmem
   have hle : (48 : Nat) ≤ ('-').toNat := (encNatAux_all_digits 10 n [] (by simp) '-' hmem).1
   revert hle; decide
 
@@ -415,26 +362,23 @@ def renderCloudRunName (k : DeployKey) : String :=
 private theorem append_hyphen_inj {a₁ b₁ a₂ b₂ : List Char}
     (h1 : '-' ∉ a₁) (h2 : '-' ∉ a₂)
     (heq : a₁ ++ '-' :: b₁ = a₂ ++ '-' :: b₂) : a₁ = a₂ ∧ b₁ = b₂ := by
-  induction a₁ generalizing a₂ with
-  | nil =>
-      cases a₂ with
-      | nil => simp_all
-      | cons c cs =>
-          simp only [List.nil_append, List.cons_append, List.cons.injEq] at heq
-          rcases heq with ⟨rfl, _⟩; exact absurd List.mem_cons_self h2
-  | cons c cs ih =>
-      cases a₂ with
-      | nil =>
-          simp only [List.nil_append, List.cons_append, List.cons.injEq] at heq
-          rcases heq with ⟨rfl, _⟩; exact absurd List.mem_cons_self h1
-      | cons d ds =>
-          simp only [List.cons_append, List.cons.injEq] at heq
-          rcases heq with ⟨rfl, htail⟩
-          rcases ih (fun hm => h1 (List.mem_cons_of_mem _ hm)) (fun hm => h2 (List.mem_cons_of_mem _ hm)) htail with ⟨rfl, rfl⟩
-          exact ⟨rfl, rfl⟩
+  match a₁, a₂ with
+  | [], [] => simp_all
+  | [], c :: _ => cases heq; exact absurd List.mem_cons_self h2
+  | c :: _, [] => cases heq; exact absurd List.mem_cons_self h1
+  | c :: cs, d :: ds =>
+      injection heq with hcd htail; subst hcd
+      have ⟨hcs, hb⟩ := append_hyphen_inj
+        (fun hm => h1 (List.mem_cons_of_mem _ hm)) (fun hm => h2 (List.mem_cons_of_mem _ hm)) htail
+      exact ⟨congrArg (c :: ·) hcs, hb⟩
 
 private theorem str_eq_of_toList {s₁ s₂ : String} (h : s₁.toList = s₂.toList) : s₁ = s₂ := by
   rw [← String.ofList_toList (s := s₁), ← String.ofList_toList (s := s₂), h]
+
+private theorem str_append_left_inj {p a b : String} (h : p ++ a = p ++ b) : a = b := by
+  have hl := congrArg String.toList h
+  simp only [String.toList_append] at hl
+  exact str_eq_of_toList (List.append_cancel_left hl)
 
 private theorem renderEnvTag_injective {e₁ e₂ : EnvInstance}
     (heq : renderEnvTag e₁ = renderEnvTag e₂) : e₁ = e₂ := by
@@ -443,89 +387,66 @@ private theorem renderEnvTag_injective {e₁ e₂ : EnvInstance}
   · rfl
   · rfl
   case preview.preview pr₁ pr₂ =>
-    rcases pr₁ with ⟨n₁, h₁⟩; rcases pr₂ with ⟨n₂, h₂⟩
-    have hn : n₁ = n₂ := encNat_injective (by omega) (by omega) (str_eq_of_toList hlist)
-    subst hn; rfl
+    have hn := encNat_injective (by have := pr₁.valid; omega) (by have := pr₂.valid; omega) (str_eq_of_toList hlist)
+    cases pr₁; cases pr₂; simp_all
 
 theorem renderKeySlug_injective {k₁ k₂ : DeployKey}
     (hshard : k₁.shard = k₂.shard) (heq : renderKeySlug k₁ = renderKeySlug k₂) : k₁ = k₂ := by
-  rcases k₁ with ⟨sh₁, ⟨t₁, ht₁⟩, ⟨a₁, ha₁⟩, e₁⟩
-  rcases k₂ with ⟨sh₂, ⟨t₂, ht₂⟩, ⟨a₂, ha₂⟩, e₂⟩
+  rcases k₁ with ⟨sh₁, ⟨t₁, _⟩, ⟨a₁, _⟩, e₁⟩
+  rcases k₂ with ⟨sh₂, ⟨t₂, _⟩, ⟨a₂, _⟩, e₂⟩
   simp only at hshard; subst hshard
   have hlist :
       (encNat t₁).toList ++ '-' :: ((encNat a₁).toList ++ '-' :: (renderEnvTag e₁).toList) =
       (encNat t₂).toList ++ '-' :: ((encNat a₂).toList ++ '-' :: (renderEnvTag e₂).toList) := by
-    have := congrArg String.toList heq
-    simpa [renderKeySlug, String.toList_append, List.append_assoc] using this
+    simpa [renderKeySlug, String.toList_append, List.append_assoc] using congrArg String.toList heq
   rcases append_hyphen_inj (encNat_no_hyphen t₁) (encNat_no_hyphen t₂) hlist with ⟨htL, hrest⟩
   rcases append_hyphen_inj (encNat_no_hyphen a₁) (encNat_no_hyphen a₂) hrest with ⟨haL, heL⟩
-  have htEq : t₁ = t₂ := encNat_injective (by omega) (by omega) (str_eq_of_toList htL)
-  have haEq : a₁ = a₂ := encNat_injective (by omega) (by omega) (str_eq_of_toList haL)
-  have heEq : e₁ = e₂ := renderEnvTag_injective (str_eq_of_toList heL)
+  have htEq := encNat_injective (by omega) (by omega) (str_eq_of_toList htL)
+  have haEq := encNat_injective (by omega) (by omega) (str_eq_of_toList haL)
+  have heEq := renderEnvTag_injective (str_eq_of_toList heL)
   subst htEq; subst haEq; subst heEq; rfl
 
 /-- **SA Injectivity Theorem:** Distinct `(tenant, app, env)` deployments in a shard ALWAYS map
     to distinct GCP Service Account IDs (zero collision/truncation risk). -/
 theorem renderSaId_injective {k₁ k₂ : DeployKey}
-    (hshard : k₁.shard = k₂.shard) (heq : renderSaId k₁ = renderSaId k₂) : k₁ = k₂ := by
-  have hlist := congrArg String.toList heq
-  simp only [renderSaId, String.toList_append] at hlist
-  have hq : "q-".toList = ['q', '-'] := by decide
-  rw [hq] at hlist
-  exact renderKeySlug_injective hshard (str_eq_of_toList (List.cons.inj (List.cons.inj hlist).2).2)
+    (hshard : k₁.shard = k₂.shard) (heq : renderSaId k₁ = renderSaId k₂) : k₁ = k₂ :=
+  renderKeySlug_injective hshard (str_append_left_inj heq)
 
 /-- **Cloud Run Service Injectivity Theorem:** Distinct `(tenant, app, env)` deployments in a shard
     ALWAYS map to distinct Cloud Run service names. -/
 theorem renderCloudRunName_injective {k₁ k₂ : DeployKey}
-    (hshard : k₁.shard = k₂.shard) (heq : renderCloudRunName k₁ = renderCloudRunName k₂) : k₁ = k₂ := by
-  have hlist := congrArg String.toList heq
-  simp only [renderCloudRunName, String.toList_append] at hlist
-  have hcr : "cr-".toList = ['c', 'r', '-'] := by decide
-  rw [hcr] at hlist
-  exact renderKeySlug_injective hshard (str_eq_of_toList (List.cons.inj (List.cons.inj (List.cons.inj hlist).2).2).2)
+    (hshard : k₁.shard = k₂.shard) (heq : renderCloudRunName k₁ = renderCloudRunName k₂) : k₁ = k₂ :=
+  renderKeySlug_injective hshard (str_append_left_inj heq)
 
 private theorem renderKeySlug_length_bounds (k : DeployKey) :
     5 ≤ (renderKeySlug k).toList.length ∧ (renderKeySlug k).toList.length ≤ 19 := by
-  have htPos : 0 < (encNat k.tenant.num).toList.length := by
-    simpa [encNat] using encNatAux_length_pos 10 k.tenant.num [] (by decide)
-  have haPos : 0 < (encNat k.app.num).toList.length := by
-    simpa [encNat] using encNatAux_length_pos 10 k.app.num [] (by decide)
-  have htLe : (encNat k.tenant.num).toList.length ≤ 6 := by
-    simpa [encNat] using encNatAux_length_bound 5 10 k.tenant.num k.tenant.valid (by decide) []
-  have haLe : (encNat k.app.num).toList.length ≤ 5 := by
-    simpa [encNat] using encNatAux_length_bound 4 10 k.app.num k.app.valid (by decide) []
-  have heBounds : 1 ≤ (renderEnvTag k.env).toList.length ∧ (renderEnvTag k.env).toList.length ≤ 6 := by
+  have ht := encNat_len_bounds (d := 5) k.tenant.valid (by decide)
+  have ha := encNat_len_bounds (d := 4) k.app.valid (by decide)
+  have he : 1 ≤ (renderEnvTag k.env).toList.length ∧ (renderEnvTag k.env).toList.length ≤ 6 := by
     cases h : k.env with
-    | prod => decide
-    | staging => decide
+    | prod | staging => decide
     | preview pr =>
-        have hprLe : (encNat pr.num).toList.length ≤ 5 := by
-          simpa [encNat] using encNatAux_length_bound 4 10 pr.num pr.valid (by decide) []
-        have hcat : (renderEnvTag (.preview pr)).toList.length = 1 + (encNat pr.num).toList.length := by
-          simp [renderEnvTag, String.toList_append]; omega
+        have hpr := encNat_len_bounds (d := 4) pr.valid (by decide)
+        simp only [renderEnvTag, String.toList_append, List.length_append]
+        have hr : "r".toList.length = 1 := rfl
         omega
-  have htot : (renderKeySlug k).toList.length =
-      (encNat k.tenant.num).toList.length + 1 + (encNat k.app.num).toList.length + 1 + (renderEnvTag k.env).toList.length := by
-    simp only [renderKeySlug, String.toList_append, List.length_append]
-    have hd : "-".toList.length = 1 := by decide
-    omega
+  simp only [renderKeySlug, String.toList_append, List.length_append]
+  have hd : "-".toList.length = 1 := rfl
   omega
 
 /-- **GCP SA Length-Bound Theorem:** Every SA ID length is in `[7, 21]` (strictly inside `[6, 30]`). -/
 theorem renderSaId_gcp_length_valid (k : DeployKey) :
     6 ≤ (renderSaId k).toList.length ∧ (renderSaId k).toList.length ≤ 30 := by
   have hb := renderKeySlug_length_bounds k
-  have hq : "q-".toList.length = 2 := by decide
   simp only [renderSaId, String.toList_append, List.length_append]
-  omega
+  have hq : "q-".toList.length = 2 := rfl; omega
 
 /-- **Cloud Run Name Length-Bound Theorem:** Every Cloud Run service name length is in `[8, 22]` (≤ 63). -/
 theorem renderCloudRunName_gcp_length_valid (k : DeployKey) :
     6 ≤ (renderCloudRunName k).toList.length ∧ (renderCloudRunName k).toList.length ≤ 63 := by
   have hb := renderKeySlug_length_bounds k
-  have hcr : "cr-".toList.length = 3 := by decide
   simp only [renderCloudRunName, String.toList_append, List.length_append]
-  omega
+  have hcr : "cr-".toList.length = 3 := rfl; omega
 
 /-! ### 4. Open Principal Universe, Typed Roles (No `owner`/`editor`), & IAM Semantics -/
 
@@ -685,20 +606,12 @@ inductive GcpAction where
 deriving Inhabited, DecidableEq, Repr
 
 def GcpAction.phase : GcpAction → RolloutPhase
-  | .uploadAssets _ _ _       => .phase1_provision
-  | .ensureSecret _ _         => .phase1_provision
-  | .ensureDb _ _ _           => .phase1_provision
-  | .grantBinding _           => .phase1_provision
-  | .putDenyRule _            => .phase1_provision
-  | .setEgressRules _ _       => .phase1_provision
-  | .deployRevisionZero _ _ _ => .phase2_deployZero
-  | .healthCheck _ _          => .phase2_deployZero
-  | .shiftTraffic100 _ _      => .phase3_shiftTraffic
-  | .revokeBinding _          => .phase4_cleanup
-  | .deleteSecret _ _         => .phase4_cleanup
-  | .narrowEgressRules _ _    => .phase4_cleanup
-  | .deleteService _          => .phase4_cleanup
-  | .dropPreviewDb _ _        => .phase4_cleanup
+  | .uploadAssets _ _ _ | .ensureSecret _ _ | .ensureDb _ _ _
+  | .grantBinding _ | .putDenyRule _ | .setEgressRules _ _        => .phase1_provision
+  | .deployRevisionZero _ _ _ | .healthCheck _ _                  => .phase2_deployZero
+  | .shiftTraffic100 _ _                                          => .phase3_shiftTraffic
+  | .revokeBinding _ | .deleteSecret _ _ | .narrowEgressRules _ _
+  | .deleteService _ | .dropPreviewDb _ _                         => .phase4_cleanup
 
 def GcpAction.isDestructive : GcpAction → Bool
   | .revokeBinding _ | .deleteSecret _ _ | .narrowEgressRules _ _
@@ -706,20 +619,12 @@ def GcpAction.isDestructive : GcpAction → Bool
   | _ => false
 
 def GcpAction.targetKey : GcpAction → DeployKey
-  | .uploadAssets k _ _       => k
-  | .ensureSecret k _         => k
-  | .ensureDb _ k _           => k
-  | .grantBinding b           => b.resource.ownerKey
-  | .putDenyRule d            => d.resource.ownerKey
-  | .setEgressRules k _       => k
-  | .deployRevisionZero k _ _ => k
-  | .healthCheck k _          => k
-  | .shiftTraffic100 k _      => k
-  | .revokeBinding b          => b.resource.ownerKey
-  | .deleteSecret k _         => k
-  | .narrowEgressRules k _    => k
-  | .deleteService k          => k
-  | .dropPreviewDb k _        => k
+  | .grantBinding b | .revokeBinding b => b.resource.ownerKey
+  | .putDenyRule d                     => d.resource.ownerKey
+  | .uploadAssets k _ _ | .ensureSecret k _ | .ensureDb _ k _
+  | .setEgressRules k _ | .deployRevisionZero k _ _ | .healthCheck k _
+  | .shiftTraffic100 k _ | .deleteSecret k _ | .narrowEgressRules k _
+  | .deleteService k | .dropPreviewDb k _ => k
 
 /-- Monotonicity predicate: every action list is non-decreasing in `RolloutPhase.rank`. -/
 def actionsPhaseOrdered : List GcpAction → Prop

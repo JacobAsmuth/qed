@@ -51,11 +51,11 @@ def encodeTursoPipelineBody (sql : String) (params : Array SqlVal) : ByteArray :
 /-- Decodes a single Turso Hrana v2 cell (`{type, value}`). -/
 def decodeTursoCell : Json → Except String SqlVal
   | j@(.obj _) =>
-      match j.get? "type" |>.bind (·.str?) with
+      match jsonStrAt j "type" with
       | some "null"    => .ok .null
       | some "integer" => parseJsonIntCell (j.get? "value") "turso bad int" "turso missing integer value"
       | some "text"    =>
-          match j.get? "value" |>.bind (·.str?) with
+          match jsonStrAt j "value" with
           | some s => .ok (.text s)
           | none   => .error "turso missing text value"
       | some "float"   =>
@@ -64,7 +64,7 @@ def decodeTursoCell : Json → Except String SqlVal
           | some (.num n) => .ok (.int n.mantissa)
           | _ => .error "turso missing float value"
       | some "blob"    =>
-          match j.get? "base64" |>.bind (·.str?) with
+          match jsonStrAt j "base64" with
           | some s => (Proto.decodeHex s).map .bytes
           | none   => .error "turso missing blob payload"
       | _ => .error "turso unknown cell type"
@@ -75,9 +75,9 @@ def decodeTursoResponse (raw : String) : Except String DbResult := do
   let j@(.obj _) ← Json.parse raw 128 | return ← .error "turso response is not an object"
   let some (.arr (first :: _)) := j.get? "results" | return ← .error "turso missing results array"
   let .obj _ := first | return ← .error "turso result entry is not an object"
-  match first.get? "type" |>.bind (·.str?) with
+  match jsonStrAt first "type" with
   | some "error" =>
-      .error ((first.get? "error" |>.bind (·.get? "message") |>.bind (·.str?)).getD "turso error")
+      .error ((first.get? "error" |>.bind (jsonStrAt · "message")).getD "turso error")
   | some "ok" =>
       let some resp@(.obj _) := first.get? "response" | return ← .error "turso missing response"
       let some res@(.obj _) := resp.get? "result" | return ← .error "turso missing result"

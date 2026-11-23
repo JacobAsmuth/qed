@@ -350,30 +350,30 @@ def isBlockedIpBytes (addr : ByteArray) : Bool :=
   else
     true
 
+private theorem isBlockedIpBytes_v4 (b0 b1 b2 b3 : UInt8) :
+    isBlockedIpBytes (ByteArray.mk #[b0, b1, b2, b3]) = isBlockedIpv4 b0 b1 b2 b3 := by
+  simp only [isBlockedIpBytes, ByteArray.getElem_eq_getElem_data]
+  simp [ByteArray.size, -ByteArray.size_data]
+
 theorem isBlockedIpBytes_loopback_v4 (b1 b2 b3 : UInt8) :
     isBlockedIpBytes (ByteArray.mk #[127, b1, b2, b3]) = true := by
-  simp only [isBlockedIpBytes, isBlockedIpv4, ByteArray.getElem_eq_getElem_data]
-  simp [ByteArray.size, -ByteArray.size_data]
+  rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]
 
 theorem isBlockedIpBytes_metadata_v4 (b2 b3 : UInt8) :
     isBlockedIpBytes (ByteArray.mk #[169, 254, b2, b3]) = true := by
-  simp only [isBlockedIpBytes, isBlockedIpv4, ByteArray.getElem_eq_getElem_data]
-  simp [ByteArray.size, -ByteArray.size_data]
+  rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]
 
 theorem isBlockedIpBytes_rfc1918_10 (b1 b2 b3 : UInt8) :
     isBlockedIpBytes (ByteArray.mk #[10, b1, b2, b3]) = true := by
-  simp only [isBlockedIpBytes, isBlockedIpv4, ByteArray.getElem_eq_getElem_data]
-  simp [ByteArray.size, -ByteArray.size_data]
+  rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]
 
 theorem isBlockedIpBytes_testnet_v4 (b3 : UInt8) :
     isBlockedIpBytes (ByteArray.mk #[192, 0, 2, b3]) = true := by
-  simp only [isBlockedIpBytes, isBlockedIpv4, ByteArray.getElem_eq_getElem_data]
-  simp [ByteArray.size, -ByteArray.size_data]
+  rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]
 
 theorem isBlockedIpBytes_benchmark_v4 (b2 b3 : UInt8) :
     isBlockedIpBytes (ByteArray.mk #[198, 18, b2, b3]) = true := by
-  simp only [isBlockedIpBytes, isBlockedIpv4, ByteArray.getElem_eq_getElem_data]
-  simp [ByteArray.size, -ByteArray.size_data]; decide
+  rw [isBlockedIpBytes_v4]; simp [isBlockedIpv4]; decide
 
 theorem isBlockedIpBytes_loopback_v6 :
     isBlockedIpBytes (ByteArray.mk #[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]) = true := by
@@ -593,5 +593,9 @@ def parseHttpResponseHead (headBytes : ByteArray) : Except String ParsedRespHead
             connClose := true
           hdrs := hdrs.push (k, v)
     return { status, headers := hdrs, isChunked, connClose, contentLen := contentLen? }
+
+@[inline] def liftE {ε α : Type} (x : IO (Except ε α)) : ExceptT ε IO α := ExceptT.mk x
+@[inline] def liftP {ε α : Type} (x : Except ε α) : ExceptT ε IO α := ExceptT.mk (pure x)
+@[inline] def liftIO {ε α : Type} (x : IO α) : ExceptT ε IO α := liftM x
 
 end Qed.Server.Net

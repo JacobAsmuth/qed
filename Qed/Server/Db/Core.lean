@@ -112,7 +112,7 @@ def endsWithLikeVal (s : String) : SqlVal := .text ("%" ++ escapeLikePattern s)
 
 @[inline] def isSqlIdentBodyChar (c : Char) : Bool :=
   let n := c.toNat
-  (48 ≤ n && n ≤ 57) || (65 ≤ n && n ≤ 90) || (97 ≤ n && n ≤ 122) || n == 95
+  (48 ≤ n && n ≤ 57) || isSqlIdentHeadChar c
 
 def isSafeSqlIdent (s : String) : Bool :=
   match s.toList with
@@ -132,15 +132,10 @@ theorem isSafeSqlIdent_all_body {s : String} (h : isSafeSqlIdent s = true) :
   cases hcs : s.toList with
   | nil => rw [hcs] at h; contradiction
   | cons hd tl =>
-      rw [hcs] at h
-      simp only [Bool.and_eq_true, List.all_eq_true] at h
+      rw [hcs] at h; simp only [Bool.and_eq_true, List.all_eq_true] at h
       intro c hc
       rcases List.mem_cons.1 hc with rfl | htl
-      · have hhd := h.1.1
-        unfold isSqlIdentHeadChar at hhd
-        unfold isSqlIdentBodyChar
-        simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at hhd ⊢
-        omega
+      · simp [isSqlIdentBodyChar, h.1.1]
       · exact h.1.2 c htl
 
 /-- No validated `SqlIdent` can ever contain quotes, semicolons, dashes, slashes, spaces, or NUL bytes. -/
@@ -149,7 +144,7 @@ theorem isSafeSqlIdent_no_inject (id : SqlIdent) :
       c ≠ '\'' ∧ c ≠ '"' ∧ c ≠ ';' ∧ c ≠ '-' ∧ c ≠ '/' ∧ c ≠ '\\' ∧ c ≠ ' ' ∧ c ≠ '\x00' := by
   intro c hc
   have hb := isSafeSqlIdent_all_body id.valid c hc
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> (intro heq; subst heq; simp [isSqlIdentBodyChar] at hb)
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> (intro heq; subst heq; simp [isSqlIdentBodyChar, isSqlIdentHeadChar] at hb)
 
 private theorem str_append_no_semi {a b : String}
     (ha : ∀ c ∈ a.toList, c ≠ ';') (hb : ∀ c ∈ b.toList, c ≠ ';') :
@@ -180,17 +175,9 @@ inductive SqlBinOp where
 deriving Inhabited, DecidableEq, Repr
 
 def SqlBinOp.render : SqlBinOp → String
-  | .eq  => " = "
-  | .ne  => " <> "
-  | .lt  => " < "
-  | .le  => " <= "
-  | .gt  => " > "
-  | .ge  => " >= "
-  | .and => " AND "
-  | .or  => " OR "
-  | .add => " + "
-  | .sub => " - "
-  | .mul => " * "
+  | .eq  => " = "  | .ne  => " <> " | .lt  => " < "  | .le  => " <= "
+  | .gt  => " > "  | .ge  => " >= " | .and => " AND " | .or  => " OR "
+  | .add => " + "  | .sub => " - "  | .mul => " * "
 
 theorem SqlBinOp.render_no_semicolon (op : SqlBinOp) :
     ∀ c ∈ op.render.toList, c ≠ ';' := by
@@ -681,10 +668,9 @@ theorem evalSelect_satisfies_policy {Row : Type}
     (RowInv ReadPolicy : Row → Prop) (tbl : List Row) (wherePred : Row → Bool)
     (htbl : ∀ r ∈ tbl, RowInv r)
     (hpol : ∀ r, RowInv r → wherePred r = true → ReadPolicy r) :
-    ∀ r ∈ evalSelect tbl wherePred, RowInv r ∧ ReadPolicy r := by
-  intro r hr
-  rw [evalSelect, List.mem_filter] at hr
-  exact ⟨htbl r hr.1, hpol r (htbl r hr.1) hr.2⟩
+    ∀ r ∈ evalSelect tbl wherePred, RowInv r ∧ ReadPolicy r := fun r hr =>
+  let ⟨hm, hw⟩ := List.mem_filter.1 hr
+  ⟨htbl r hm, hpol r (htbl r hm) hw⟩
 
 /-- Pure relational semantics of `INSERT`: appends a verified row. -/
 def evalInsert {Row : Type} (tbl : List Row) (newRow : Row) : List Row :=
@@ -692,14 +678,9 @@ def evalInsert {Row : Type} (tbl : List Row) (newRow : Row) : List Row :=
 
 theorem evalInsert_preserves_inv {Row : Type}
     (RowInv InsertPolicy : Row → Prop) (tbl : List Row) (newRow : Row)
-    (htbl : ∀ r ∈ tbl, RowInv r)
-    (hinv : RowInv newRow)
-    (_hpol : InsertPolicy newRow) :
-    ∀ r ∈ evalInsert tbl newRow, RowInv r := by
-  intro r hr
-  rcases List.mem_cons.1 hr with rfl | hmem
-  · exact hinv
-  · exact htbl r hmem
+    (htbl : ∀ r ∈ tbl, RowInv r) (hinv : RowInv newRow) (_hpol : InsertPolicy newRow) :
+    ∀ r ∈ evalInsert tbl newRow, RowInv r := fun r hr =>
+  (List.mem_cons.1 hr).elim (· ▸ hinv) (htbl r)
 
 /-- Pure relational semantics of `UPDATE`: transforms every row matching `wherePred` via `setFn`. -/
 def evalUpdate {Row : Type} (tbl : List Row) (wherePred : Row → Bool) (setFn : Row → Row) : List Row :=
@@ -715,18 +696,13 @@ theorem evalUpdate_preserves_inv_and_trans {Row : Type}
     (htrans : ∀ r, RowInv r → wherePred r = true → TransInv r (setFn r)) :
     (∀ r ∈ evalUpdate tbl wherePred setFn, RowInv r) ∧
     (∀ r ∈ tbl, wherePred r = true →
-      UpdatePolicy r ∧ UpdatePolicy (setFn r) ∧ TransInv r (setFn r)) := by
-  constructor
-  · intro r' hr'
-    rw [evalUpdate, List.mem_map] at hr'
-    rcases hr' with ⟨r, hmem, rfl⟩
-    have hr := htbl r hmem
-    cases hw : wherePred r
-    · simpa [hw] using hr
-    · simpa [hw] using hinv r hr hw
-  · intro r hmem hw
-    have hr := htbl r hmem
-    exact ⟨hpolOld r hr hw, hpolNew r hr hw, htrans r hr hw⟩
+      UpdatePolicy r ∧ UpdatePolicy (setFn r) ∧ TransInv r (setFn r)) :=
+  ⟨fun _ hr' => by
+    rcases List.mem_map.1 hr' with ⟨r, hm, rfl⟩
+    cases hw : wherePred r <;> simp
+    · exact htbl r hm
+    · exact hinv r (htbl r hm) hw,
+   fun r hm hw => ⟨hpolOld r (htbl r hm) hw, hpolNew r (htbl r hm) hw, htrans r (htbl r hm) hw⟩⟩
 
 /-- Pure relational semantics of `DELETE`: removes every row matching `wherePred`. -/
 def evalDelete {Row : Type} (tbl : List Row) (wherePred : Row → Bool) : List Row :=
@@ -737,13 +713,8 @@ theorem evalDelete_preserves_inv_and_policy {Row : Type}
     (htbl : ∀ r ∈ tbl, RowInv r)
     (hpol : ∀ r, RowInv r → wherePred r = true → DeletePolicy r) :
     (∀ r ∈ evalDelete tbl wherePred, RowInv r) ∧
-    (∀ r ∈ tbl, wherePred r = true → DeletePolicy r) := by
-  constructor
-  · intro r hr
-    rw [evalDelete, List.mem_filter] at hr
-    exact htbl r hr.1
-  · intro r hmem hw
-    exact hpol r (htbl r hmem) hw
+    (∀ r ∈ tbl, wherePred r = true → DeletePolicy r) :=
+  ⟨fun r hr => htbl r (List.mem_filter.1 hr).1, fun r hm hw => hpol r (htbl r hm) hw⟩
 
 /-! ## Schema Metadata & SQL DDL / Postgres RLS Generator -/
 
@@ -776,18 +747,16 @@ structure TableSchema where
   rlsWrite? : Option String := none
 deriving Inhabited, Repr
 
+private def optClause (opt : Option α) (f : α → String) : String :=
+  match opt with | some x => f x | none => ""
+
 def ColumnSchema.renderDef (d : SqlDialect) (c : ColumnSchema) : String :=
-  let base := c.name.quoteIdent ++ " " ++ c.colType.render d
-  let nn   := if c.nullable then "" else " NOT NULL"
-  let pk   := if c.isPrimaryKey then " PRIMARY KEY" else ""
-  let uniq := if c.isUnique && !c.isPrimaryKey then " UNIQUE" else ""
-  let fk   := match c.references? with
-    | some (rt, rc) => " REFERENCES " ++ rt.quoteIdent ++ "(" ++ rc.quoteIdent ++ ")"
-    | none => ""
-  let chk  := match c.checkSql? with
-    | some sql => " CHECK (" ++ sql ++ ")"
-    | none => ""
-  base ++ nn ++ pk ++ uniq ++ fk ++ chk
+  c.name.quoteIdent ++ " " ++ c.colType.render d ++
+    (if c.nullable then "" else " NOT NULL") ++
+    (if c.isPrimaryKey then " PRIMARY KEY" else "") ++
+    (if c.isUnique && !c.isPrimaryKey then " UNIQUE" else "") ++
+    optClause c.references? (fun (rt, rc) => " REFERENCES " ++ rt.quoteIdent ++ "(" ++ rc.quoteIdent ++ ")") ++
+    optClause c.checkSql? (" CHECK (" ++ · ++ ")")
 
 def TableSchema.renderCreateTable (d : SqlDialect) (t : TableSchema) : String :=
   let cols := String.intercalate ", " (t.columns.map (·.renderDef d))
@@ -807,20 +776,10 @@ def TableSchema.renderDdlStatements (d : SqlDialect) (t : TableSchema) : List St
   t.renderCreateTable d :: t.renderIndexes
 
 def TableSchema.renderPostgresRls (t : TableSchema) : List String :=
-  if t.rlsRead?.isNone && t.rlsWrite?.isNone then []
-  else
-    let enable := "ALTER TABLE " ++ t.name.quoteIdent ++ " ENABLE ROW LEVEL SECURITY"
-    let readPol := match t.rlsRead? with
-      | some expr =>
-          ["CREATE POLICY \"qed_read_" ++ t.name.raw ++ "\" ON " ++ t.name.quoteIdent ++
-           " FOR SELECT USING (" ++ expr ++ ")"]
-      | none => []
-    let writePol := match t.rlsWrite? with
-      | some expr =>
-          ["CREATE POLICY \"qed_write_" ++ t.name.raw ++ "\" ON " ++ t.name.quoteIdent ++
-           " FOR ALL USING (" ++ expr ++ ") WITH CHECK (" ++ expr ++ ")"]
-      | none => []
-    enable :: (readPol ++ writePol)
+  let pols :=
+    (t.rlsRead?.map fun e => s!"CREATE POLICY \"qed_read_{t.name.raw}\" ON {t.name.quoteIdent} FOR SELECT USING ({e})").toList ++
+    (t.rlsWrite?.map fun e => s!"CREATE POLICY \"qed_write_{t.name.raw}\" ON {t.name.quoteIdent} FOR ALL USING ({e}) WITH CHECK ({e})").toList
+  if pols.isEmpty then [] else ("ALTER TABLE " ++ t.name.quoteIdent ++ " ENABLE ROW LEVEL SECURITY") :: pols
 
 def renderDatabaseDdl (d : SqlDialect) (tables : List TableSchema) : String :=
   String.intercalate ";\n" (tables.flatMap (·.renderDdlStatements d)) ++
@@ -893,19 +852,11 @@ def diffTableSchemas (oldTables newTables : List TableSchema) : List MigrationSt
 def MigrationStep.render (d : SqlDialect) : MigrationStep → String
   | .createTable t => t.renderCreateTable d
   | .addColumn tbl col explicitDef? =>
-      let addKw := match d with
-        | .postgres => " ADD COLUMN IF NOT EXISTS "
-        | .sqlite   => " ADD COLUMN "
-      let effDef? := explicitDef?.orElse fun _ => col.safeDefaultSql d
-      let nn := if col.nullable then "" else " NOT NULL"
-      let defClause := match effDef? with
-        | some lit => " DEFAULT " ++ lit
-        | none     => ""
-      let chk := match col.checkSql? with
-        | some sql => " CHECK (" ++ sql ++ ")"
-        | none     => ""
-      "ALTER TABLE " ++ tbl.quoteIdent ++ addKw ++ col.name.quoteIdent ++ " " ++
-        col.colType.render d ++ nn ++ defClause ++ chk
+      let addKw := match d with | .postgres => " ADD COLUMN IF NOT EXISTS " | .sqlite => " ADD COLUMN "
+      "ALTER TABLE " ++ tbl.quoteIdent ++ addKw ++ col.name.quoteIdent ++ " " ++ col.colType.render d ++
+        (if col.nullable then "" else " NOT NULL") ++
+        optClause (explicitDef?.orElse fun _ => col.safeDefaultSql d) (" DEFAULT " ++ ·) ++
+        optClause col.checkSql? (" CHECK (" ++ · ++ ")")
   | .createIndex tbl idxName cols => renderCreateIndex tbl idxName cols
 
 def renderMigrationDdl (d : SqlDialect) (steps : List MigrationStep) : String :=
@@ -1009,6 +960,9 @@ def jsonNatAt (j : Json) (k : String) : Nat :=
   match j.get? k with
   | some (.num n) => if 0 ≤ n.mantissa then n.mantissa.toNat else 0
   | _ => 0
+
+def jsonStrAt (j : Json) (k : String) : Option String :=
+  (j.get? k).bind (·.str?)
 
 def parseJsonIntCell (v? : Option Json) (badPfx missingErr : String) : Except String SqlVal :=
   match v? with

@@ -51,12 +51,10 @@ private theorem compileInfra_binding_runtimeSa_owner {key : DeployKey} {buildHas
     (kSa.env.isPreview = true → b.resource.isProdResource = false) := by
   rcases compileInfra_binding_mem hb with
     ⟨_, _, rfl⟩ | ⟨_, _, rfl⟩ | rfl | rfl | rfl <;> try cases hp
-  · refine ⟨rfl, rfl, fun hprev => ?_⟩
-    cases h : key.env <;> simp [h, EnvInstance.isPreview, EnvInstance.isProd, GcpResource.isProdResource,
-      GcpResource.ownerKey] at hprev ⊢
-  · refine ⟨rfl, rfl, fun hprev => ?_⟩
-    cases h : key.env <;> simp [h, EnvInstance.isPreview, clusterForEnv, GcpResource.isProdResource,
-      GcpResource.ownerKey, EnvInstance.isProd] at hprev ⊢
+  all_goals
+    refine ⟨rfl, rfl, fun hprev => ?_⟩
+    cases h : key.env <;> simp [h, EnvInstance.isPreview, EnvInstance.isProd, clusterForEnv,
+      GcpResource.isProdResource, GcpResource.ownerKey] at hprev ⊢
 
 /-! ### Theorem 1: Zero Privilege Escalation (`canStep` is Empty Everywhere) -/
 
@@ -260,18 +258,17 @@ private theorem actionsPhaseOrdered_four {p1 p2 p3 p4 : List GcpAction}
     (h1 : ∀ a ∈ p1, a.phase.rank = 1) (h2 : ∀ a ∈ p2, a.phase.rank = 2)
     (h3 : ∀ a ∈ p3, a.phase.rank = 3) (h4 : ∀ a ∈ p4, a.phase.rank = 4) :
     actionsPhaseOrdered (((p1 ++ p2) ++ p3) ++ p4) := by
-  have h12 := actionsPhaseOrdered_append (actionsPhaseOrdered_const_rank h1) (actionsPhaseOrdered_const_rank h2)
-    fun a ha b hb => by rw [h1 a ha, h2 b hb]; decide
-  have h123 := actionsPhaseOrdered_append h12 (actionsPhaseOrdered_const_rank h3) fun a ha b hb => by
-    rcases List.mem_append.mp ha with ha | ha
-    · rw [h1 a ha, h3 b hb]; decide
-    · rw [h2 a ha, h3 b hb]; decide
-  exact actionsPhaseOrdered_append h123 (actionsPhaseOrdered_const_rank h4) fun a ha b hb => by
-    rcases List.mem_append.mp ha with ha | ha
-    · rcases List.mem_append.mp ha with ha | ha
-      · rw [h1 a ha, h4 b hb]; decide
-      · rw [h2 a ha, h4 b hb]; decide
-    · rw [h3 a ha, h4 b hb]; decide
+  have step {xs ys} {rx ry : Nat} (hx : actionsPhaseOrdered xs) (hry : ∀ b ∈ ys, b.phase.rank = ry)
+      (hbx : ∀ a ∈ xs, a.phase.rank ≤ rx) (hle : rx ≤ ry) :
+      actionsPhaseOrdered (xs ++ ys) ∧ ∀ a ∈ xs ++ ys, a.phase.rank ≤ ry :=
+    ⟨actionsPhaseOrdered_append hx (actionsPhaseOrdered_const_rank hry) fun a ha b hb => by
+       have := hbx a ha; rw [hry b hb]; omega,
+     fun a ha => (List.mem_append.1 ha).elim (fun h => Nat.le_trans (hbx a h) hle)
+       (fun h => by rw [hry a h]; exact Nat.le_refl _)⟩
+  have ⟨h12, b12⟩ := step (rx := 1) (actionsPhaseOrdered_const_rank h1) h2
+    (fun a ha => by rw [h1 a ha]; exact Nat.le_refl _) (by decide)
+  have ⟨h123, b123⟩ := step h12 h3 b12 (by decide)
+  exact (step h123 h4 b123 (by decide)).1
 
 /-- **Zero-Downtime Rollout Ordering Theorem:** For ANY live state and desired plan,
     `planRollout` emits actions in non-decreasing phase order:
@@ -285,42 +282,47 @@ theorem planRollout_zero_downtime_order (live : GcpObservedState) (desired : Gcp
     simp only [List.mem_append, List.mem_map, List.mem_cons, List.not_mem_nil, or_false] at ha
     rcases ha with (((((hA | ⟨_, _, rfl⟩) | ⟨_, _, rfl⟩) | ⟨_, _, rfl⟩) | ⟨_, _, rfl⟩) | rfl) <;> try rfl
     split at hA <;> simp at hA; subst hA; rfl
-  · intro a ha
-    simp only [List.mem_cons, List.not_mem_nil, or_false] at ha
-    rcases ha with rfl | rfl <;> rfl
-  · intro a ha
-    simp only [List.mem_cons, List.not_mem_nil, or_false] at ha
-    subst ha; rfl
+  · intro a ha; simp only [List.mem_cons, List.not_mem_nil, or_false] at ha; rcases ha with rfl | rfl <;> rfl
+  · intro a ha; simp only [List.mem_cons, List.not_mem_nil, or_false] at ha; subst ha; rfl
   · intro a ha
     simp only [List.mem_append, List.mem_map] at ha
     rcases ha with (⟨_, _, rfl⟩ | ⟨_, _, rfl⟩) | hN <;> try rfl
     split at hN <;> simp at hN; rcases hN with ⟨_, rfl⟩; rfl
+
+private theorem planRollout_mem_spec {live : GcpObservedState} {desired : GcpPlan} {a : GcpAction}
+    (ha : a ∈ planRollout live desired) :
+    a.isDestructive = false ∨
+      (a.phase = .phase4_cleanup ∧ a.targetKey = desired.key ∧ live.key = desired.key) := by
+  simp only [planRollout, List.mem_append, List.mem_map, List.mem_filter, List.mem_cons,
+    List.not_mem_nil, or_false] at ha
+  rcases ha with (((((((hA | ⟨_, _, rfl⟩) | ⟨_, _, rfl⟩) | ⟨_, _, rfl⟩) | ⟨_, _, rfl⟩) | rfl) | (rfl | rfl)) | rfl) |
+    ((⟨b, ⟨hbL, hfilt⟩, rfl⟩ | ⟨s, hsL, rfl⟩) | hN) <;> try exact Or.inl rfl
+  · split at hA <;> simp at hA; subst hA; exact Or.inl rfl
+  · split at hbL <;> simp_all [GcpAction.targetKey]
+    exact Or.inr rfl
+  · split at hsL <;> simp_all [GcpAction.targetKey]
+    exact Or.inr rfl
+  · split at hN
+    · rename_i hne; simp at hN; rcases hN with ⟨_, rfl⟩
+      simp_all [GcpAction.targetKey]; exact Or.inr rfl
+    · simp at hN
 
 /-- Every destructive action emitted by `planRollout` occurs strictly in Phase 4 (after traffic flip)
     and targets ONLY `desired.key`. -/
 theorem planRollout_destructive_scoped_phase4 (live : GcpObservedState) (desired : GcpPlan)
     (a : GcpAction) (ha : a ∈ planRollout live desired) (hdest : a.isDestructive = true) :
     a.phase = .phase4_cleanup ∧ a.targetKey = desired.key := by
-  simp only [planRollout, List.mem_append, List.mem_map, List.mem_filter, List.mem_cons,
-    List.not_mem_nil, or_false] at ha
-  rcases ha with (((((((hA | ⟨_, _, rfl⟩) | ⟨_, _, rfl⟩) | ⟨_, _, rfl⟩) | ⟨_, _, rfl⟩) | rfl) | (rfl | rfl)) | rfl) |
-    ((⟨b, ⟨_, hfilt⟩, rfl⟩ | ⟨s, _, rfl⟩) | hN) <;> try (simp [GcpAction.isDestructive] at hdest)
-  · split at hA <;> simp at hA; subst hA; simp at hdest
-  · simp only [Bool.and_eq_true, beq_iff_eq] at hfilt
-    exact ⟨rfl, hfilt.1.1⟩
-  · exact ⟨rfl, rfl⟩
-  · split at hN <;> simp at hN; rcases hN with ⟨_, rfl⟩; exact ⟨rfl, rfl⟩
+  rcases planRollout_mem_spec ha with hnd | ⟨hp, ht, _⟩
+  · rw [hnd] at hdest; cases hdest
+  · exact ⟨hp, ht⟩
 
 /-- If `live.key ≠ desired.key`, `planRollout` safely ignores `live` and emits ZERO destructive actions. -/
 theorem planRollout_mismatched_live_no_destructive (live : GcpObservedState) (desired : GcpPlan)
     (hne : live.key ≠ desired.key) (a : GcpAction) (ha : a ∈ planRollout live desired) :
     a.isDestructive = false := by
-  have hbeq : (live.key == desired.key) = false := beq_false_of_ne hne
-  simp only [planRollout, hbeq, Bool.false_eq_true, ↓reduceIte, List.filter_nil, List.map_nil,
-    List.any_nil, List.append_nil, List.mem_append, List.mem_map, List.mem_cons,
-    List.not_mem_nil, or_false] at ha
-  rcases ha with ((((((hA | ⟨_, _, rfl⟩) | ⟨_, _, rfl⟩) | ⟨_, _, rfl⟩) | ⟨_, _, rfl⟩) | rfl) | (rfl | rfl)) | rfl <;> try rfl
-  split at hA <;> simp at hA; subst hA; rfl
+  rcases planRollout_mem_spec ha with hnd | ⟨_, _, hkey⟩
+  · exact hnd
+  · exact absurd hkey hne
 
 /-- Any preview deployment with an ephemeral DB is pinned to `maxInstances = 1` and at most 1 region. -/
 theorem compileInfra_ephemeral_preview_pinned (key : DeployKey) (buildHash : String)
@@ -356,11 +358,8 @@ theorem compileInfra_channels_socket_ready (key : DeployKey) (buildHash : String
     (spec : DeploySpec) (m : Qed.Deploy.DeployManifest)
     (hch : (m.server?.map fun s => !s.channels.isEmpty).getD false = true) :
     (compileInfra key buildHash spec m).scale.concurrency = 1000 ∧
-    (spec.timeoutSec? = none → (compileInfra key buildHash spec m).scale.timeoutSec = 3600) := by
-  constructor
-  · simp [compileInfra, hch]
-  · intro hnone
-    simp [compileInfra, hch, hnone]
+    (spec.timeoutSec? = none → (compileInfra key buildHash spec m).scale.timeoutSec = 3600) :=
+  ⟨by simp [compileInfra, hch], fun hnone => by simp [compileInfra, hch, hnone]⟩
 
 /-- Every `GcpPlan` emitted by `compileInfra` with an omitted or in-range `timeoutSec?`
     satisfies Cloud Run's full hardware & scaling `ScaleSpec.validate` contract by construction. -/
@@ -375,14 +374,12 @@ theorem compileInfra_scale_valid (key : DeployKey) (buildHash : String)
         memoryMb := tier.memoryMb, cpuMilli := tier.cpuMilli,
         concurrency := conc, timeoutSec := t
       } = .ok () := by
-    have h1 : (maxI == 0) = false := beq_false_of_ne (by omega)
-    have h2 : ¬ (minI > maxI) := by omega
-    have h3 : (conc == 0) = false := beq_false_of_ne (by omega)
-    have h4 : ¬ (conc > 1000) := by omega
-    have h5 : (t == 0) = false := beq_false_of_ne (by omega)
-    have h6 : ¬ (t > 3600) := by omega
     unfold ScaleSpec.validate
-    cases tier <;> simp [ComputeTier.memoryMb, ComputeTier.cpuMilli, h1, h2, h3, h4, h5, h6]
+    cases tier <;>
+      (simp [ComputeTier.memoryMb, ComputeTier.cpuMilli, ComputeTier.specs, minCpuRules, minMemRules,
+            beq_false_of_ne (show maxI ≠ 0 by omega), show ¬ (minI > maxI) by omega,
+            beq_false_of_ne (show conc ≠ 0 by omega), show ¬ (conc > 1000) by omega,
+            beq_false_of_ne (show t ≠ 0 by omega), show ¬ (t > 3600) by omega]; rfl)
   apply htier
   · split <;> split <;> omega
   · split <;> omega

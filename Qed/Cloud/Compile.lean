@@ -41,55 +41,34 @@ def compileInfra (key : DeployKey) (buildHash : String)
   let secretNames := fp.secrets.map (·.envVar)
   let cl := clusterForEnv key.env
   let managedDbs := fp.managedDbs.map fun (dbName, _) => (dbName, cl)
-  let secretBindings : List GcpIamBinding :=
-    secretNames.map fun s =>
-      { principal := .runtimeSa key, role := .secretManagerAccessor, resource := .secret key s }
-  let dbBindings : List GcpIamBinding :=
-    managedDbs.map fun (dbName, c) =>
-      { principal := .runtimeSa key, role := .cloudSqlClient, resource := .cloudSqlDb c key dbName }
-  let runBinding : GcpIamBinding :=
-    { principal := .edgeRouter, role := .runInvoker, resource := .cloudRun key }
+  let secretBindings := secretNames.map fun s =>
+    { principal := .runtimeSa key, role := .secretManagerAccessor, resource := .secret key s : GcpIamBinding }
+  let dbBindings := managedDbs.map fun (dbName, c) =>
+    { principal := .runtimeSa key, role := .cloudSqlClient, resource := .cloudSqlDb c key dbName : GcpIamBinding }
+  let runBinding : GcpIamBinding := { principal := .edgeRouter, role := .runInvoker, resource := .cloudRun key }
   let assetBindings : List GcpIamBinding :=
     [ { principal := .builder,  role := .storageObjectAdmin,  resource := .assetPrefix key buildHash },
       { principal := .allUsers, role := .storageObjectViewer, resource := .assetPrefix key buildHash } ]
-  let runDeny : GcpDenyRule :=
-    { principals  := [.allUsers, .allAuthenticatedUsers],
-      permissions := [.runInvoke],
-      resource    := .cloudRun key }
-  let secretDenies : List GcpDenyRule :=
-    secretNames.map fun s =>
-      { principals  := [.allUsers, .allAuthenticatedUsers],
-        permissions := [.secretAccessor],
-        resource    := .secret key s }
+  let denyPub (perms : List GcpPermission) (resource : GcpResource) : GcpDenyRule :=
+    { principals := [.allUsers, .allAuthenticatedUsers], permissions := perms, resource }
   let hasState    := (m.server?.map (·.hasState)).getD false
   let hasJobs     := (m.server?.map fun s => !s.jobs.isEmpty).getD false
   let hasChannels := (m.server?.map fun s => !s.channels.isEmpty).getD false
-  let isEphemPreview := !fp.ephemeralDbs.isEmpty && key.env.isPreview
-  let isSingleInstance := hasState || isEphemPreview
-  let effectiveScale : ScaleSpec := {
-    minInstances := if hasJobs then 1 else 0
-    maxInstances := if isSingleInstance then 1 else 100
-    memoryMb     := spec.compute.memoryMb
-    cpuMilli     := spec.compute.cpuMilli
-    concurrency  := if hasState || hasChannels then 1000 else spec.compute.defaultConcurrency
-    timeoutSec   := spec.timeoutSec?.getD (if hasChannels then 3600 else 60)
-  }
-  let effectiveRegions : List GcpRegion :=
-    if isSingleInstance then spec.regions.take 1 else spec.regions
-  {
-    key
-    buildHash
-    regions          := effectiveRegions
-    scale            := effectiveScale
-    serviceAccountId := renderSaId key
-    cloudRunName     := renderCloudRunName key
-    secretNames
-    managedDbs
-    assetPaths       := m.assets.map (·.path)
-    egressAllow      := fp.egress
+  let isSingleInstance := hasState || (!fp.ephemeralDbs.isEmpty && key.env.isPreview)
+  { key, buildHash
+    regions          := if isSingleInstance then spec.regions.take 1 else spec.regions
+    scale := {
+      minInstances := if hasJobs then 1 else 0
+      maxInstances := if isSingleInstance then 1 else 100
+      memoryMb     := spec.compute.memoryMb
+      cpuMilli     := spec.compute.cpuMilli
+      concurrency  := if hasState || hasChannels then 1000 else spec.compute.defaultConcurrency
+      timeoutSec   := spec.timeoutSec?.getD (if hasChannels then 3600 else 60)
+    }
+    serviceAccountId := renderSaId key, cloudRunName := renderCloudRunName key
+    secretNames, managedDbs, assetPaths := m.assets.map (·.path), egressAllow := fp.egress
     bindings         := secretBindings ++ dbBindings ++ [runBinding] ++ assetBindings
-    denies           := runDeny :: secretDenies
-  }
+    denies           := denyPub [.runInvoke] (.cloudRun key) :: secretNames.map (denyPub [.secretAccessor] ∘ .secret key) }
 
 /-- Aggregates an arbitrary multi-tenant list of compiled `GcpPlan`s into one org-wide
     `GcpPolicyState` for cross-tenant & preview-vs-prod isolation verification. -/

@@ -152,6 +152,20 @@ private def hasSrvHelperConst (e : Expr) : Bool :=
     c == ``srvGetAt || c == ``Qed.Lang.QedVal.val || c == ``SrvIdx.toNat ||
     c == ``SrvLiftOpt.liftOpt || c == ``id
 
+private def isUserDecl (decl : LocalDecl) : Bool :=
+  !decl.isImplementationDetail && !decl.isLet
+
+private def goalType (g : MVarId) : MetaM Expr :=
+  g.withContext do instantiateMVars (← g.getType)
+
+private def dsimpTargetOnly (g : MVarId) : MetaM (Option MVarId) := do
+  simpGoalOnly g (← mkEmptyDsimpCtx) #[] #[] true true
+
+private def maybeEnsureType (expectedType? : Option Expr) (e : Expr) : TermElabM Expr :=
+  match expectedType? with
+  | some expTy => ensureHasType expTy e
+  | none       => return e
+
 private def nextFreshSrvName (g : MVarId) (pfx : String) (startIdx : Nat) : MetaM (Name × Nat) := do
   let lctx ← g.withContext getLCtx
   let mut i := startIdx
@@ -161,21 +175,24 @@ private def nextFreshSrvName (g : MVarId) (pfx : String) (startIdx : Nat) : Meta
     cand := Name.mkSimple s!"{pfx}{i}"
   return (cand, i + 1)
 
+private def maybeRenameMacro (g : MVarId) (decl : LocalDecl) (pfx : String) (idx : Nat) :
+    MetaM (MVarId × Nat) := do
+  if !decl.userName.hasMacroScopes then return (g, idx)
+  let (cand, nxt) ← nextFreshSrvName g pfx idx
+  return (← g.rename decl.fvarId cand, nxt)
+
 private def unfoldSrvHelpersGoal (g0 : MVarId) : MetaM MVarId := do
   let mut g := g0
   let lctx0 ← g.withContext getLCtx
   let mut hIdx : Nat := lctx0.size
   let mut propFVars : Array FVarId := #[]
   for decl in lctx0 do
-    if !decl.isImplementationDetail && !decl.isLet && !isSrvEqDecl decl then
+    if isUserDecl decl && !isSrvEqDecl decl then
       let ty ← g.withContext (instantiateMVars decl.type)
       if (← g.withContext (try isProp ty catch _ => pure false)) then
-        if decl.userName.hasMacroScopes then
-          let (cand, nxt) ← nextFreshSrvName g "_srvSplitH" hIdx
-          hIdx := nxt
-          g ← g.rename decl.fvarId cand
-        if hasSrvHelperConst ty then
-          propFVars := propFVars.push decl.fvarId
+        let (g', nxt) ← maybeRenameMacro g decl "_srvSplitH" hIdx
+        g := g'; hIdx := nxt
+        if hasSrvHelperConst ty then propFVars := propFVars.push decl.fvarId
   for revIdx in [0:propFVars.size] do
     let fv := propFVars[propFVars.size - 1 - revIdx]!
     if let some decl := (← g.withContext getLCtx).find? fv then
@@ -183,24 +200,28 @@ private def unfoldSrvHelpersGoal (g0 : MVarId) : MetaM MVarId := do
       if hasSrvHelperConst ty then
         let ty' ← g.withContext (unfoldSrvHelpersExpr ty)
         if ty' != ty then
-          if (← g.withContext (instantiateMVars (← g.getType))).containsFVar fv then
+          if (← goalType g).containsFVar fv then
             let (cand, nxt) ← nextFreshSrvName g "_srvFreeH" hIdx
             hIdx := nxt
             g := (← (← g.assert cand ty' (mkFVar fv)).intro1P).2
           g ← tryGoalM g (·.changeLocalDecl fv ty')
-  let tgt ← g.withContext (instantiateMVars (← g.getType))
+  let tgt ← goalType g
   if hasSrvHelperConst tgt then
     let tgt' ← g.withContext (unfoldSrvHelpersExpr tgt)
-    if tgt' != tgt then
-      g ← tryGoalM g (·.change tgt')
+    if tgt' != tgt then g ← tryGoalM g (·.change tgt')
   return g
 
+private def filterUserDecls (g : MVarId) (p : LocalDecl → MetaM Bool) : MetaM (Array FVarId) := do
+  let mut fvs : Array FVarId := #[]
+  for decl in (← g.withContext getLCtx) do
+    if isUserDecl decl && (← g.withContext (p decl)) then
+      fvs := fvs.push decl.fvarId
+  return fvs
+
 private def simpHypsEachGoal (g0 : MVarId) : MetaM (Option MVarId) := do
-  let mut hFVars : Array FVarId := #[]
-  for decl in (← g0.withContext getLCtx) do
-    if !decl.isImplementationDetail && !decl.isLet && !decl.userName.hasMacroScopes && !isSrvEqDecl decl then
-      if (← g0.withContext (try isProp decl.type catch _ => pure false)) then
-        hFVars := hFVars.push decl.fvarId
+  let hFVars ← filterUserDecls g0 fun decl => do
+    if decl.userName.hasMacroScopes || isSrvEqDecl decl then return false
+    try isProp decl.type catch _ => pure false
   let mut g := g0
   if !hFVars.isEmpty then
     let (hypCtx, _) ← mkCachedSimpCtx "hypSimpEach" hypSimpEachNames
@@ -332,9 +353,7 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
   synthesizeSyntheticMVars (postpone := .yes)
   let ty ← whnf (← instantiateMVars (← inferType e))
   let e ← if ty.isAppOfArity ``Qed.Field 2 then mkAppM ``Qed.Field.val #[e] else pure e
-  match expectedType? with
-  | some expTy => ensureHasType expTy e
-  | none       => return e
+  maybeEnsureType expectedType? e
 
 @[term_elab srvAutoEmitStx]
 def elabSrvAutoEmit : TermElab := fun stx expectedType? => do
@@ -354,9 +373,7 @@ def elabSrvTypedAs : TermElab := fun stx expectedType? => do
   let tplExpr ← elabTerm (stx.getArg 1) none
   synthesizeSyntheticMVarsNoPostponing
   let valExpr ← elabTermEnsuringType (stx.getArg 3) (some (← instantiateMVars (← inferType tplExpr)))
-  match expectedType? with
-  | some expTy => ensureHasType expTy valExpr
-  | none       => return valExpr
+  maybeEnsureType expectedType? valExpr
 
 /-! ## Bounds Checking (`srvGetElem`, `srvSetElem`) — O(N) Size-Chain Fast Path -/
 
@@ -384,19 +401,18 @@ private def proveSizeEqChain (lctx : LocalContext) (startArr : Expr) : MetaM (Ex
     seen := seen.push fv
     let mut next? : Option (Expr × Expr) := none
     for decl in lctx do
-      if !decl.isImplementationDetail && !decl.isLet then
+      if isUserDecl decl then
         if let some (_, lhs, rhs) := (← instantiateMVars decl.type).eq? then
           if lhs.consumeMData == Expr.fvar fv then
             let rhsC := rhs.consumeMData
             let arrTy ← whnf (← inferType cur)
             let elemTy := if arrTy.isAppOfArity ``Array 1 then arrTy.getAppArgs[0]! else mkConst ``Unit
+            let mkSizeCongr := do mkAppM ``congrArg #[← mkAppOptM ``Array.size #[some elemTy], decl.toExpr]
             if let some (prevArr, eqSet) ← try unwrapSizeSet? rhsC 8 catch _ => pure none then
-              let eqCur ← mkAppM ``congrArg #[← mkAppOptM ``Array.size #[some elemTy], decl.toExpr]
-              next? := some (prevArr, ← mkEqSymm (← mkEqTrans eqCur eqSet))
+              next? := some (prevArr, ← mkEqSymm (← mkEqTrans (← mkSizeCongr) eqSet))
               break
             else if !rhsC.containsFVar fv && !(rhsC.getUsedConstants.any (· == ``srvLetEq)) then
-              let curEqRhs ← mkAppM ``congrArg #[← mkAppOptM ``Array.size #[some elemTy], decl.toExpr]
-              next? := some (rhsC, ← mkEqSymm curEqRhs)
+              next? := some (rhsC, ← mkEqSymm (← mkSizeCongr))
               break
     match next? with
     | some (prevArr, prevEqCur) =>
@@ -405,24 +421,21 @@ private def proveSizeEqChain (lctx : LocalContext) (startArr : Expr) : MetaM (Ex
     | none => break
   return (cur, eqOpt?)
 
-private def collectSizeBoundHypFVars (lctx : LocalContext) : MetaM (Array FVarId) := do
-  let mut fvs : Array FVarId := #[]
-  for decl in lctx do
-    if !decl.isImplementationDetail && !decl.isLet && !decl.userName.hasMacroScopes then
-      let ty ← instantiateMVars decl.type
-      if (← try isProp ty catch _ => pure false) then
-        let cs := ty.getUsedConstants
-        let hasRel := cs.any fun c => c == ``Array.size || c == ``LT.lt || c == ``LE.le || c == ``GE.ge || c == ``GT.gt
-        let hasHeavy := cs.any fun c => c == ``srvGetAt || c == ``RequestCtx || c == ``Array.set
-        if hasRel && !hasHeavy then fvs := fvs.push decl.fvarId
-  return fvs
+private def collectSizeBoundHypFVars (g : MVarId) : MetaM (Array FVarId) :=
+  filterUserDecls g fun decl => do
+    if decl.userName.hasMacroScopes then return false
+    let ty ← instantiateMVars decl.type
+    if !(← try isProp ty catch _ => pure false) then return false
+    let cs := ty.getUsedConstants
+    return (cs.any fun c => c == ``Array.size || c == ``LT.lt || c == ``LE.le || c == ``GE.ge || c == ``GT.gt) &&
+      !(cs.any fun c => c == ``srvGetAt || c == ``RequestCtx || c == ``Array.set)
 
 private def solveBoundsFast (g0 : MVarId) : MetaM Bool := do
   if ← tryCloseSrvTrivial g0 then return true
   let (tgtCtx, _) ← mkCachedSimpCtx "boundsTgt" boundsTgtSimpNames { zetaDelta := true }
   let some g1 ← tryGoalOptM g0 (simpGoalOnly · tgtCtx) | return true
   let mut g := g1
-  let sizeFVars ← g.withContext do collectSizeBoundHypFVars (← getLCtx)
+  let sizeFVars ← collectSizeBoundHypFVars g
   unless sizeFVars.isEmpty do
     let (hypCtx, _) ← mkCachedSimpCtx "boundsHyp" boundsHypSimpNames
     match ← tryGoalOptM g (simpGoalOnly · hypCtx #[] sizeFVars false false) with
@@ -502,9 +515,7 @@ private def elabSrvArrOrDictOp (stx : Syntax) (arrStx idxStx : Term) (valStx? : 
   let resExpr ← match valExpr? with
     | none         => mkAppOptM ``srvGetAt #[some elemTy, some arrExpr, some idxNatExpr, some ltPrf]
     | some valExpr => mkAppOptM ``Array.set #[some elemTy, some arrExpr, some idxNatExpr, some valExpr, some ltPrf]
-  match expectedType? with
-  | some expTy => ensureHasType expTy resExpr
-  | none       => return resExpr
+  maybeEnsureType expectedType? resExpr
 
 @[term_elab srvGetElemStx]
 def elabSrvGetElem : TermElab := fun stx expectedType? =>
@@ -574,7 +585,7 @@ private def collectReadySrvLetEqs (e : Expr) : Nat → MetaM (Array Expr)
 
 private def tryPickSrvLetEq (gGoal : MVarId) (cands : Array Expr) (revCount : Nat) :
     MetaM (Option (Expr × Expr × MVarId × Nat)) := do
-  let tgtNow ← gGoal.withContext (instantiateMVars (← gGoal.getType))
+  let tgtNow ← goalType gGoal
   for letApp in cands do
     let s ← saveState
     let res? ← try
@@ -606,13 +617,13 @@ private def finishElimSrvLetEq (kFun absBody : Expr) (newGoal : MVarId) (reverte
   if revertedCount > 0 then tryGoalM g3 fun x => Prod.snd <$> x.introN revertedCount else pure g3
 
 private def elimSrvLetEqGoal (g : MVarId) (allowHyps : Bool := true) : MetaM (Option MVarId) := do
-  let tgt ← g.withContext (instantiateMVars (← g.getType))
+  let tgt ← goalType g
   let mut picked? : Option (Expr × Expr × MVarId × Nat) := none
   if tgt.getUsedConstants.any (· == ``Qed.Server.srvLetEq) then
     picked? ← tryPickSrvLetEq g (← collectReadySrvLetEqs tgt 1024) 0
   if picked?.isNone && allowHyps then
     for decl in (← g.withContext getLCtx) do
-      if !decl.isImplementationDetail && !decl.isLet then
+      if isUserDecl decl then
         let dty ← g.withContext (instantiateMVars decl.type)
         if dty.getUsedConstants.any (· == ``Qed.Server.srvLetEq) then
           let cands ← collectReadySrvLetEqs dty 1024
@@ -638,7 +649,7 @@ private def elimAllSrvLetEqTarget (g0 : MVarId) : MetaM (MVarId × Bool) := do
 private def rewriteTargetByFVar (g : MVarId) (eqFVar : FVarId) : MetaM (Option MVarId) := do
   let s ← saveState
   try
-    let tgt ← g.withContext (instantiateMVars (← g.getType))
+    let tgt ← goalType g
     let rwRes ← g.withContext (g.rewrite tgt (mkFVar eqFVar))
     return some (← g.replaceTargetEq rwRes.eNew rwRes.eqProof)
   catch _ => restoreState s; return none
@@ -654,7 +665,7 @@ private def mkArrCongrLemmas (elemTy lhs rhs hE : Expr) : MetaM (Expr × Expr) :
 private def rewriteTargetEqsLinearGoal (g0 : MVarId) : MetaM (Option MVarId) := do
   let mut eqDecls : Array (FVarId × Option (Expr × Expr × Expr) × FVarId) := #[]
   for decl in (← g0.withContext getLCtx) do
-    if !decl.isImplementationDetail && !decl.isLet && isSrvEqDecl decl then
+    if isUserDecl decl && isSrvEqDecl decl then
       if let some (eqTy, lhs, rhs) := (← g0.withContext (instantiateMVars decl.type)).eq? then
         if let .fvar fv := lhs.consumeMData then
           if !rhs.containsFVar fv then
@@ -668,7 +679,7 @@ private def rewriteTargetEqsLinearGoal (g0 : MVarId) : MetaM (Option MVarId) := 
   let mut g := g0
   for revIdx in [0:eqDecls.size] do
     let (fv, arrInfo?, eqFv) := eqDecls[eqDecls.size - 1 - revIdx]!
-    if (← g.withContext (instantiateMVars (← g.getType))).containsFVar fv then
+    if (← goalType g).containsFVar fv then
       let mut progressed := false
       if let some (elemTy, lhs, rhs) := arrInfo? then
         let arrCongrRes ← g.withContext do
@@ -684,7 +695,7 @@ private def rewriteTargetEqsLinearGoal (g0 : MVarId) : MetaM (Option MVarId) := 
           match ← simpGoalOnly g ctx sp with
           | none    => return none
           | some g' => g := g'; progressed := true
-        if (← g.withContext (instantiateMVars (← g.getType))).containsFVar fv then
+        if (← goalType g).containsFVar fv then
           if let some g' ← rewriteTargetByFVar g eqFv then g := g'; progressed := true
       else if let some g' ← rewriteTargetByFVar g eqFv then g := g'; progressed := true
       if progressed then
@@ -698,27 +709,24 @@ private theorem srv_forall_push {α : Type} {P : α → Prop} {xs : Array α} {v
   (Array.forall_push (P := P) (xs := xs) (v := v)).2 ⟨hxs, hv⟩
 
 private def peelArrayForallGoal (g0 : MVarId) (allowDeepFallback : Bool := true) : TacticM (List MVarId) := do
-  let emptyDsimpCtx ← mkEmptyDsimpCtx
   let rec loop : Nat → MVarId → TacticM (List MVarId)
     | 0, g => return [g]
     | fuel + 1, g => do
-        let some g ← simpGoalOnly g emptyDsimpCtx #[] #[] true true | return []
+        let some g ← dsimpTargetOnly g | return []
         if ← tryCloseSrvTrivial g then return []
-        let some arrExpr := extractForEachColl? (← g.withContext (instantiateMVars (← g.getType))) | return [g]
+        let some arrExpr := extractForEachColl? (← goalType g) | return [g]
         for (ctor, arity, lem) in #[(``Array.set, 5, ``Array.forall_set), (``Array.push, 3, ``srv_forall_push)] do
           if arrExpr.isAppOfArity ctor arity then
             if let some [gPrev, gElem] ← tryApplyConst g lem then
-              let elemRem : List MVarId ← match ← simpGoalOnly gElem emptyDsimpCtx #[] #[] true true with
-                | none => pure []
-                | some ge1 => match ← rewriteTargetEqsLinearGoal ge1 with
-                    | none => pure []
-                    | some ge2 => match ← finishAtomGoal ge2 allowDeepFallback with
-                        | none => pure [] | some ge3 => pure [ge3]
+              let elemRem : List MVarId ← do
+                let some ge1 ← dsimpTargetOnly gElem | pure []
+                let some ge2 ← rewriteTargetEqsLinearGoal ge1 | pure []
+                pure (← finishAtomGoal ge2 allowDeepFallback).toList
               return (← loop fuel gPrev) ++ elemRem
         if let .fvar fv := arrExpr then
           let lctx ← g.withContext getLCtx
           let eqFv? := (← lctx.foldlM (init := none) fun acc decl => do
-            if acc.isSome || decl.isImplementationDetail || decl.isLet || decl.userName.hasMacroScopes then return acc
+            if acc.isSome || !isUserDecl decl || decl.userName.hasMacroScopes then return acc
             if let some (_, lhs, _) := (← g.withContext (instantiateMVars decl.type)).eq? then
               if lhs.consumeMData == .fvar fv then return some decl.fvarId
             return none)
@@ -744,7 +752,7 @@ private def substMatchEqHypsGoal (g0 : MVarId) : MetaM MVarId := do
         try some <$> (Prod.snd <$> Meta.substCore g declFv (symm := symm))
         catch _ => restoreState sSub; pure none
     for decl in lctx do
-      if substGoal?.isNone && !decl.isImplementationDetail && !decl.isLet then
+      if substGoal?.isNone && isUserDecl decl then
         let uname := decl.userName.toString
         if uname.startsWith "_srvMatchEq" || uname.startsWith "_srvSplitH" then
           if let some (_, lhs, rhs) := (← g.withContext (instantiateMVars decl.type)).eq? then
@@ -758,21 +766,20 @@ private def substMatchEqHypsGoal (g0 : MVarId) : MetaM MVarId := do
 
 private def closeLeafGoal (g0 : MVarId) (allowDeepFallback : Bool := true) : TacticM (List MVarId) := do
   let simpWithNewState (g : MVarId) : MetaM (Option MVarId) := do
-    if (← g.withContext (instantiateMVars (← g.getType))).consumeMData.isAppOf ``Qed.Server.srvWithNewState then
+    if (← goalType g).consumeMData.isAppOf ``Qed.Server.srvWithNewState then
       let (wCtx, _) ← mkCachedSimpCtx "withNewState" #[``Qed.Server.srvWithNewState_apply]
       simpGoalOnly g wCtx
     else pure (some g)
   let some g ← simpWithNewState g0 | return []
   if ← tryCloseSrvTrivial g then return []
-  let emptyDsimpCtx ← mkEmptyDsimpCtx
-  let some g ← simpGoalOnly g emptyDsimpCtx #[] #[] true true | return []
+  let some g ← dsimpTargetOnly g | return []
   if ← tryCloseSrvTrivial g then return []
   let g ← tryGoalM g unfoldSrvHelpersGoal
   let (g, _) ← splitAndHypsGoal g
   let some g ← tryGoalOptM g simpHypsEachGoal | return []
   let g ← substMatchEqHypsGoal g
   let some g ← simpWithNewState g | return []
-  let some g ← simpGoalOnly g emptyDsimpCtx #[] #[] true true | return []
+  let some g ← dsimpTargetOnly g | return []
   let some g ← dsimpCodecGoal g | return []
   if ← tryCloseSrvTrivial g then return []
   let (g, didSplit2) ← splitAndHypsGoal g
@@ -798,13 +805,11 @@ private def splitEqHypGoal (g0 : MVarId) : MetaM (Option (List MVarId)) := do
   let mut gCur := g0
   let mut eqFVars : Array FVarId := #[]
   for decl in lctx do
-    if !decl.isImplementationDetail && !decl.isLet then
+    if isUserDecl decl then
       let ty ← gCur.withContext (instantiateMVars decl.type)
       if ty.isEq && exprHasSplittable ty then
-        if decl.userName.hasMacroScopes then
-          let (cand, nxt) ← nextFreshSrvName gCur "_srvMatchEq" idx
-          idx := nxt
-          gCur ← gCur.rename decl.fvarId cand
+        let (g', nxt) ← maybeRenameMacro gCur decl "_srvMatchEq" idx
+        gCur := g'; idx := nxt
         eqFVars := eqFVars.push decl.fvarId
   for fv in eqFVars do
     if let some sgs ← trySplitLocalDecl gCur fv then return some sgs
@@ -812,7 +817,7 @@ private def splitEqHypGoal (g0 : MVarId) : MetaM (Option (List MVarId)) := do
 
 private def goalHasSplittableHyp (g : MVarId) : MetaM Bool := do
   for decl in (← g.withContext getLCtx) do
-    if !decl.isImplementationDetail && !decl.isLet then
+    if isUserDecl decl then
       let ty ← g.withContext (instantiateMVars decl.type)
       if ty.getUsedConstants.any (· == ``Qed.Server.srvLetEq) || (ty.isEq && exprHasSplittable ty) then
         return true
@@ -827,27 +832,22 @@ private def proveStepSingleGoal (g0 : MVarId) (allStepCtx stepFloatCtx : Simp.Co
     | _, [] => return []
     | fuel + 1, g :: rest => do
         if ← tryCloseSrvTrivial g then return ← stepTargetLoop fuel rest
+        let pushSimp (g' : MVarId) := do stepTargetLoop fuel ((← simpGoalOnly g' stepFloatCtx).toList ++ rest)
         let (gLet, didLet) ← elimAllSrvLetEqTarget g
-        if didLet then
-          match ← simpGoalOnly gLet stepFloatCtx with
-          | none    => return ← stepTargetLoop fuel rest
-          | some g' => return ← stepTargetLoop fuel (g' :: rest)
+        if didLet then return ← pushSimp gLet
         match ← trySplitTarget g with
         | some sgs =>
             return ← stepTargetLoop fuel ((← sgs.filterMapM (simpGoalOnly · stepFloatCtx)) ++ rest)
         | none =>
-            if !(← goalHasSplittableHyp g) then
-              return (← closeLeafGoal g (allowDeepFallback := true)) ++ (← stepTargetLoop fuel rest)
-            let s ← saveState
-            if (← closeLeafGoal g (allowDeepFallback := false)).isEmpty then
-              return ← stepTargetLoop fuel rest
-            restoreState s
-            if let some gHypLet ← elimSrvLetEqGoal g (allowHyps := true) then
-              match ← simpGoalOnly gHypLet stepFloatCtx with
-              | none    => return ← stepTargetLoop fuel rest
-              | some g' => return ← stepTargetLoop fuel (g' :: rest)
-            if let some eqSgs ← splitEqHypGoal g then
-              return ← stepTargetLoop fuel ((← eqSgs.filterMapM (simpGoalAllHyps · stepFloatCtx)) ++ rest)
+            if ← goalHasSplittableHyp g then
+              let s ← saveState
+              if (← closeLeafGoal g (allowDeepFallback := false)).isEmpty then
+                return ← stepTargetLoop fuel rest
+              restoreState s
+              if let some gHypLet ← elimSrvLetEqGoal g (allowHyps := true) then
+                return ← pushSimp gHypLet
+              if let some eqSgs ← splitEqHypGoal g then
+                return ← stepTargetLoop fuel ((← eqSgs.filterMapM (simpGoalAllHyps · stepFloatCtx)) ++ rest)
             return (← closeLeafGoal g (allowDeepFallback := true)) ++ (← stepTargetLoop fuel rest)
   stepTargetLoop 256 [g2]
 
@@ -901,7 +901,7 @@ private def initAsyncGoal (g0 : MVarId) (handlerConst : Name) (dCtx sCtx : Simp.
 
 private def tryCloseConstMutInv (g0 : MVarId) : TacticM (Option MVarId) := do
   let (_, g1) ← g0.intros
-  let tgtC := (← g1.withContext (instantiateMVars (← g1.getType))).consumeMData
+  let tgtC := (← goalType g1).consumeMData
   if tgtC.isAppOfArity ``Qed.Server.ProgPreservesStepRel 5 then
     if let .lam _ _ (.lam _ _ body _) _ := tgtC.getAppArgs[3]!.consumeMData then
       if body.isAppOfArity ``Or 2 && !body.getAppArgs[1]!.hasLooseBVars then
@@ -965,7 +965,7 @@ private def stepAsyncLoop (spec : AsyncStepSpec) (dCtx sCtx : Simp.Context) (gIn
     | 0, gs => return gs
     | _, [] => return []
     | fuel + 1, g :: rest => do
-        let tgtC := (← g.withContext (instantiateMVars (← g.getType))).consumeMData
+        let tgtC := (← goalType g).consumeMData
         let prog? : Option Expr :=
           if spec.isPreserves then
             if tgtC.isAppOfArity ``Qed.Server.ProgPreservesStepRel 5 then some tgtC.getAppArgs[4]!

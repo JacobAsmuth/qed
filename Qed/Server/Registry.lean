@@ -129,6 +129,16 @@ structure ChannelInfo where
   unsubHelperConst    : Lean.Name := .anonymous
 deriving Inhabited, Repr
 
+def ChannelInfo.mkDefault (ownerName : Lean.Name) (ownerShort : String) (chName : Lean.Name)
+    (kind : ChannelKind) (paramNames : Array Lean.Name) (paramTypeConsts : Array Lean.Name)
+    (defaultReconnect : Reconnect) : ChannelInfo :=
+  { fullName := ownerName ++ chName, ownerName, ownerShort, channelName := chName.toString, kind
+    paramNames, paramCount := paramNames.size, paramTypeConsts
+    eventTypeConst := ownerName ++ chName.appendAfter "_Event", defaultReconnect
+    keyHelperConst := ownerName ++ chName.appendAfter "_key"
+    subHelperConst := ownerName ++ chName.appendAfter "_sub"
+    unsubHelperConst := ownerName ++ chName.appendAfter "_unsub" }
+
 initialize channelRegistry :
     Lean.SimplePersistentEnvExtension ChannelInfo (Lean.NameMap ChannelInfo) ←
   Qed.Diag.mkNameMapExt (·.fullName)
@@ -221,14 +231,10 @@ def parseReconnectExpr (exprStx : Syntax) : MacroM Reconnect := do
   else
     Macro.throwErrorAt u "expected `reconnect` policy: `off`, `fixed(ms[, max])`, or `backoff(initMs, maxMs[, max])`"
 
-def Reconnect.toSyntaxTerm (r : Reconnect) : MacroM Term := do
-  let optNat : Option Nat → MacroM Term
-    | none   => `(none)
-    | some m => `(some $(Syntax.mkNumLit (toString m)))
-  match r with
+def Reconnect.toSyntaxTerm : Reconnect → MacroM Term
   | .off => `(Qed.Reconnect.off)
-  | .fixed d m? => `(Qed.Reconnect.fixed $(Syntax.mkNumLit (toString d)) $(← optNat m?))
-  | .backoff i mx m? => `(Qed.Reconnect.backoff $(Syntax.mkNumLit (toString i)) $(Syntax.mkNumLit (toString mx)) $(← optNat m?))
+  | .fixed d m? => `(Qed.Reconnect.fixed $(quote d) $(quote m?))
+  | .backoff i mx m? => `(Qed.Reconnect.backoff $(quote i) $(quote mx) $(quote m?))
 
 end ReconnectParser
 
@@ -271,15 +277,6 @@ deriving Inhabited, Repr
 structure DbTableInfo where
   tableName         : String
   rowTypeConst      : Lean.Name
-  rowInvConst       : Lean.Name
-  rowInvBoolConst   : Lean.Name
-  rowInvSoundConst  : Lean.Name
-  transInvConst     : Lean.Name
-  readPolicyConst   : Lean.Name
-  insertPolicyConst : Lean.Name
-  updatePolicyConst : Lean.Name
-  deletePolicyConst : Lean.Name
-  decodeRowConst    : Lean.Name
   columns           : Array DbColumnInfo
   hasReadPolicy     : Bool := false
   hasInsertPolicy   : Bool := false
@@ -329,6 +326,38 @@ initialize authRegistry :
 def lookupAuth? (env : Lean.Environment) (currNs : Lean.Name)
     (openDecls : List Lean.OpenDecl) (authRef : Lean.Name) : Option AuthInfo :=
   Qed.Diag.lookupNameMapExt? authRegistry env currNs openDecls authRef (some `config)
+
+def pushUnique [BEq α] (arr : Array α) (x : α) : Array α :=
+  if arr.contains x then arr else arr.push x
+
+def findNamedArg? (named : Array (String × Lean.Syntax)) (key : String) : Option Lean.Syntax :=
+  (named.find? (·.1 == key)).map Prod.snd
+
+section SyntaxHelpers
+open Lean
+
+def foldProjTerms {m : Type → Type} [Monad m] [MonadQuotation m]
+    (ref : Syntax) (base : Term) (fs : List Name) : m Term :=
+  fs.foldlM (init := base) fun acc f => `(($acc).$(mkIdentFrom ref f):ident)
+
+def mkBoolConj {m : Type → Type} [Monad m] [MonadQuotation m] (terms : Array Term) : m Term :=
+  match terms.toList with
+  | [] => `(true)
+  | t :: rest => rest.foldlM (init := t) fun acc x => `($acc && $x)
+
+def resolveAppTargetIdent (env : Environment) (currNs : Name) (id : Ident) : Ident :=
+  if env.contains (currNs ++ id.getId ++ `app) || env.contains (id.getId ++ `app) then
+    mkIdentFrom id (id.getId ++ `app)
+  else id
+
+def mkWsDecodeCb {m : Type → Type} [Monad m] [MonadQuotation m]
+    (onOk onStatus : Ident) (mkDec : Ident → m Term) : m Term := do
+  let argId := mkIdent `_wsMsg
+  `(fun $argId:ident => match $(← mkDec argId):term with
+    | Except.ok v    => $onOk v
+    | Except.error e => $onStatus (Qed.SocketStatus.failed e))
+
+end SyntaxHelpers
 
 open Lean Elab Command in
 def elabParamTypeAbbrevs (refIdent : Ident) (ownerName fullOwnerName itemName : Name)

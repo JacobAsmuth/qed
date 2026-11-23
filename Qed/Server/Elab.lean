@@ -32,12 +32,12 @@ private def emitClientRpcStubs (fnStr : String) (fnIdent : Ident)
   let outcomeRhs : Term ← match errTypeId? with
     | some errId => `(Qed.RpcOutcome $errId $ensPayloadTerm)
     | none       => `(Qed.RpcSimpleOutcome $ensPayloadTerm)
-  if ensSpec?.isSome then
-    liftM <| elabCommand (← `(command|
-      set_option linter.unusedVariables false in
-      abbrev $outcomeId $[($pIdents:ident : $pTyTerms:term)]* : Type := $outcomeRhs))
-  else
-    liftM <| elabCommand (← `(command| abbrev $outcomeId : Type := $outcomeRhs))
+  let outBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) ←
+    if ensSpec?.isSome then (pIdents.zip pTyTerms).mapM fun (p, t) => `(bracketedBinder| ($p:ident : $t:term))
+    else pure #[]
+  liftM <| elabCommand (← `(command|
+    set_option linter.unusedVariables false in
+    abbrev $outcomeId $[$outBinders:bracketedBinder]* : Type := $outcomeRhs))
 
   let rawRpcId := mkIdentFrom fnIdent (c.srvName ++ Name.mkSimple s!"_rpc_{fnStr}")
   let clientFnId := mkIdentFrom fnIdent (c.srvName ++ fnIdent.getId)
@@ -68,11 +68,8 @@ private def mkFnDispatchArm (fnStr : String) (reqBytesId reqVar : Ident)
     (reqPropTerms : Array Term) (reqHypIds : Array Ident) (reqLabels : Array String)
     (hasDomainErr : Bool) (runExpr : Term) : CommandElabM (TSyntax ``Lean.Parser.Term.matchAltExpr) := do
   let fnLit := Syntax.mkStrLit fnStr
-  let initGuarded ←
-    if hasDomainErr then
-      `($runExpr >>= fun _fnRes => Pure.pure ((Qed.Server.SrvFailure.toWire _fnRes).map Qed.Proto.encode))
-    else
-      `($runExpr >>= fun _fnRes => Pure.pure (_fnRes.map Qed.Proto.encode))
+  let resExpr ← if hasDomainErr then `(Qed.Server.SrvFailure.toWire _fnRes) else `(_fnRes)
+  let initGuarded ← `($runExpr >>= fun _fnRes => Pure.pure (($resExpr).map Qed.Proto.encode))
   let guardedRun ← wrapReqs reqPropTerms reqHypIds reqLabels initGuarded
   let decoded ← mkProtoDecodeBind reqBytesId reqVar reqTupleTy pIdents projs guardedRun
   `(Lean.Parser.Term.matchAltExpr| | $fnLit => $decoded)
@@ -140,7 +137,7 @@ private def elabServerFnClause (existingMethods : Array ServerMethodInfo) (fc : 
   let reqVar := mkIdent `_reqVal
   let projs ← extractTupleProjections reqVar pTyTerms.size
   let some (runExpr, isReadOnly, _) ← elabServerHandler hasAwait fnStr fnIdent
-      (pIdents ++ reqs.reqHypIds) (pTyTerms ++ reqs.reqHypTys) (projs ++ reqs.reqHypIds.map (⟨·.raw⟩))
+      (pIdents ++ reqs.reqHypIds) (pTyTerms ++ reqs.reqPropTerms) (projs ++ reqs.reqHypIds.map (⟨·.raw⟩))
       payloadTerm errTyTerm baseCtx bodyStmts ensSpec? | return none
 
   let arm ← liftM <| mkFnDispatchArm fnStr c.reqBytesId reqVar reqTupleTy pIdents projs
@@ -197,13 +194,11 @@ private def elabServerHttpRouteClause (routeIdx : Nat) (existingRoutes : Array (
   let hasAwait := blockHasAwait bodyStmts
   let baseCtx ← mkBaseLowerCtx routeLabel #[] hasAwait true true (isHttpRoute := !isStream) (isStreamRoute := isStream)
   let some (runExpr, _, _) ← elabServerHandler hasAwait routeLabel routeIdent
-      reqs.reqHypIds reqs.reqHypTys (reqs.reqHypIds.map (⟨·.raw⟩))
+      reqs.reqHypIds reqs.reqPropTerms (reqs.reqHypIds.map (⟨·.raw⟩))
       payloadTerm errTyTerm baseCtx bodyStmts none | return none
 
-  let wrappedRun ← if isStream then
-      `($runExpr >>= fun _httpRes => Pure.pure (_httpRes.map (fun _ => Option.some (Qed.Server.HttpResponse.sse []))))
-    else
-      `($runExpr >>= fun _httpRes => Pure.pure (_httpRes.map Option.some))
+  let mapFn ← if isStream then `(fun _ => Option.some (Qed.Server.HttpResponse.sse [])) else `(Option.some)
+  let wrappedRun ← `($runExpr >>= fun _httpRes => Pure.pure (_httpRes.map $mapFn))
   let guardedRun ← liftM <| wrapReqs reqs.reqPropTerms reqs.reqHypIds reqs.reqLabels wrappedRun
   let arm ← `(Lean.Parser.Term.matchAltExpr| | $(Syntax.mkStrLit methodStr), $(Syntax.mkStrLit pathStr) => $guardedRun)
   return some ((methodStr, pathStr), arm)
@@ -261,21 +256,16 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
       unless (← elabServerStateCmds parsed.stateDecls) do return
 
     let mut chanHeaders : Array ParsedChanHeader := #[]
-    let mut chanSigs : Array SrvChanSig := #[]
-    let mut chanNames : Array String := #[]
     for cc in parsed.chanClauses do
-      let some hdr ← elabServerChannelHeader chanNames cc | return
+      let some hdr ← elabServerChannelHeader (chanHeaders.map ParsedChanHeader.chStr) cc | return
       chanHeaders := chanHeaders.push hdr
-      chanSigs := chanSigs.push hdr.sig
-      chanNames := chanNames.push hdr.chStr
 
-    withReader (fun (c : SrvElabCtx) => { c with chanSigs }) do
+    withReader (fun (c : SrvElabCtx) => { c with chanSigs := chanHeaders.map ParsedChanHeader.sig }) do
       let mut methodInfos : Array ServerMethodInfo := #[]
       let mut dispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
       for fc in parsed.fnClauses do
         let some (info, arm) ← elabServerFnClause methodInfos fc | return
-        methodInfos := methodInfos.push info
-        dispatchArms := dispatchArms.push arm
+        methodInfos := methodInfos.push info; dispatchArms := dispatchArms.push arm
 
       let mut wsDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
       for hdr in chanHeaders do
@@ -286,22 +276,18 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
       let mut httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
       for (hc, idx) in parsed.httpClauses.zipIdx do
         let some (rt, arm) ← elabServerHttpRouteClause idx httpRoutes hc | return
-        httpRoutes := httpRoutes.push rt
-        httpDispatchArms := httpDispatchArms.push arm
+        httpRoutes := httpRoutes.push rt; httpDispatchArms := httpDispatchArms.push arm
 
       let some jobNames ← elabServerJobs methodInfos parsed.jobClauses | return
 
-      let mut onCreateRun? : Option Term := none
-      let mut onSignInRun? : Option Term := none
-      if let some authDecl := parsed.authDecl? then
-        if let some cc := parsed.onCreateAccountClause? then
-          let some re ← elabServerAuthHook "onCreateAccount" `_onCreateAccount authDecl cc | return
-          onCreateRun? := some re
-        if let some sc := parsed.onSignInClause? then
-          let some re ← elabServerAuthHook "onSignIn" `_onSignIn authDecl sc | return
-          onSignInRun? := some re
+      let elabHook? (lbl : String) (leaf : Name) (cl? : Option Syntax) : SrvElabM (Option (Option Term)) := do
+        match parsed.authDecl?, cl? with
+        | some ad, some hc => Option.map some <$> elabServerAuthHook lbl leaf ad hc
+        | _, _ => return some none
+      let some onCreateRun? ← elabHook? "onCreateAccount" `_onCreateAccount parsed.onCreateAccountClause? | return
+      let some onSignInRun? ← elabHook? "onSignIn" `_onSignIn parsed.onSignInClause? | return
 
-      elabServerDispatchCmds methodInfos dispatchArms chanNames wsDispatchArms
+      elabServerDispatchCmds methodInfos dispatchArms (chanHeaders.map ParsedChanHeader.chStr) wsDispatchArms
         httpDispatchArms jobNames onCreateRun? onSignInRun?
   ).run initCtx
 

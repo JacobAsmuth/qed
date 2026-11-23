@@ -35,6 +35,9 @@ structure VerifiedJob (σ : Type) (Inv : σ → Prop) extends ServerJob σ where
 structure StatelessJob extends JobMeta where
   runM : {m : Type → Type} → [Monad m] → [MonadServer m] → m (Except ApiError Unit)
 
+def StatelessJob.toUnitJob (j : StatelessJob) : ServerJob Unit :=
+  { j.toJobMeta with runM := fun {m} [Monad m] [MonadServer m] [MonadAtomic Unit m] => @j.runM m _ _ }
+
 /-! ### Linearizability & Composition Lemmas for Verified Jobs -/
 
 /-- Spawning any `VerifiedJob` into a multi-core server execution is a sound `MultiCoreStep`,

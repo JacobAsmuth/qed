@@ -12,6 +12,7 @@ namespace Qed.Server.Native
 
 open Qed.Server.Net
 open Qed.Server.Http
+open Qed.Auth.Oidc (nowSec loadNonEmptyEnv)
 
 /-! ## Unified CSRF & CSWSH Origin / Fetch-Metadata Verification -/
 
@@ -137,14 +138,6 @@ private def readCrlfLineAt (handle : UInt64) (buf : ByteArray) (off : Nat) :
     (fun _ => .error "unexpected EOF in chunked framing")
     buf 256
 
-private def liftE {ε α : Type} (x : IO (Except ε α)) : ExceptT ε IO α := ExceptT.mk x
-private def liftP {ε α : Type} (x : Except ε α) : ExceptT ε IO α := ExceptT.mk (pure x)
-private def liftIO {ε α : Type} (x : IO α) : ExceptT ε IO α := liftM x
-private def nowSec : IO Nat := return (← Prim.nowMs).toNat / 1000
-
-private def loadNonEmptyEnv (name : String) : IO (Option String) := do
-  return (← Prim.getEnv name).bind fun v => let t := trimWs v; if t.isEmpty then none else some t
-
 private def drainChunkTrailers (handle : UInt64) (rx : ByteArray) (off : Nat) :
     Nat → ExceptT String IO Bool
   | 0 => throw "too many chunked trailers"
@@ -264,12 +257,12 @@ def fetchGcpBearerToken (cache? : Option (Prim.StateBox (Array GcpTokenCacheEntr
     (saJson scope : String) : IO (Except String String) :=
   ExceptT.run do
     let j ← liftP ((Json.parse saJson).mapError (s!"invalid GCP service account JSON: {·}"))
-    let some clientEmail := (j.get? "client_email").bind (·.str?)
+    let some clientEmail := Db.jsonStrAt j "client_email"
       | throw "GCP service account JSON missing `client_email`"
-    let some privateKey := (j.get? "private_key").bind (·.str?)
+    let some privateKey := Db.jsonStrAt j "private_key"
       | throw "GCP service account JSON missing `private_key`"
     let tokenUri := ((← loadNonEmptyEnv "QED_GCP_TOKEN_URL").orElse fun _ =>
-      (j.get? "token_uri").bind (·.str?)).getD "https://oauth2.googleapis.com/token"
+      Db.jsonStrAt j "token_uri").getD "https://oauth2.googleapis.com/token"
     let now ← nowSec
     if let some cache := cache? then
       if let some cached ← liftIO (Prim.atomicRead cache (gcpCacheLookup · clientEmail scope tokenUri now)) then
@@ -286,7 +279,7 @@ def fetchGcpBearerToken (cache? : Option (Prim.StateBox (Array GcpTokenCacheEntr
       signingInput ++ "." ++ base64UrlEncode sigBytes
     let rj ← liftE (Qed.Auth.Oidc.execJsonHttp execHttpCall "POST" tokenUri
       #[("Content-Type", "application/x-www-form-urlencoded")] formBody.toUTF8 false "GCP OAuth2")
-    let some accessToken := (rj.get? "access_token").bind (·.str?)
+    let some accessToken := Db.jsonStrAt rj "access_token"
       | throw "GCP OAuth2 response missing `access_token`"
     let expiresIn : Nat := match rj.get? "expires_in" with
       | some (.num n) =>
@@ -341,26 +334,17 @@ def loadServerConfig (devMode : Bool) : IO ServerConfig := do
   let reqExp   := (← loadNonEmptyEnv "QED_AUTH_REQUIRE_EXP") == some "1"
   let rpcOrig? ← loadNonEmptyEnv "QED_RPC_ALLOWED_ORIGINS"
   let wsOrig?  ← loadNonEmptyEnv "QED_WS_ALLOWED_ORIGINS"
-  let host?    ← loadNonEmptyEnv "QED_HOST"
-  let bindHost ← match host? with
+  let bindHost ← match ← loadNonEmptyEnv "QED_HOST" with
     | some h => pure h
-    | none   => match ← loadNonEmptyEnv "HOST" with
-        | some h => pure h
-        | none   => pure (if devMode then "127.0.0.1" else "0.0.0.0")
+    | none   => pure ((← loadNonEmptyEnv "HOST").getD (if devMode then "127.0.0.1" else "0.0.0.0"))
   let csp? ← match ← loadNonEmptyEnv "QED_CSP" with
     | some v =>
         let lv := v.toLower
         if lv == "off" || lv == "none" || lv == "disabled" then pure none
         else pure (some (sanitizeHeader v))
     | none => pure (some defaultCsp)
-  return {
-    authSecrets        := secrets
-    requireExpiring    := reqExp
-    rpcAllowedOrigins? := rpcOrig?
-    wsAllowedOrigins?  := wsOrig?
-    bindHost           := bindHost
-    csp?               := csp?
-  }
+  return { authSecrets := secrets, requireExpiring := reqExp, rpcAllowedOrigins? := rpcOrig?,
+           wsAllowedOrigins? := wsOrig?, bindHost, csp? }
 
 private def parseCookiePairs (raw : String) : List (String × String) :=
   (raw.splitOn ";").filterMap fun seg =>
@@ -497,9 +481,13 @@ private def resolveDbConfigCore (rawDeployEnv? : Option String) (onCloudRun : Bo
           | none =>
               return .error (ApiError.internal s!"database `{cfg.name}` unavailable: {primaryErr}")
 
-private def resolveDbConfig (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDbTransport) := do
+private def loadDeployEnvFlags : IO (Option String × Bool) := do
   let rawDeployEnv? ← Prim.getEnv "QED_DEPLOY_ENV"
   let onCloudRun ← if rawDeployEnv?.isNone then pure (← loadNonEmptyEnv "K_SERVICE").isSome else pure false
+  return (rawDeployEnv?, onCloudRun)
+
+private def resolveDbConfig (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDbTransport) := do
+  let (rawDeployEnv?, onCloudRun) ← loadDeployEnvFlags
   resolveDbConfigCore rawDeployEnv? onCloudRun cfg
 
 private structure DbCacheEntry where
@@ -507,6 +495,9 @@ private structure DbCacheEntry where
   devFallback?  : Option Db.DbEndpoint
   envEndpoints? : Option (Qed.Cloud.EnvMap Db.DbEndpoint)
   transport     : ResolvedDbTransport
+
+private def DbCacheEntry.ofConfig (cfg : Db.DbConfig) (transport : ResolvedDbTransport) : DbCacheEntry :=
+  { endpoint := cfg.endpoint, devFallback? := cfg.devFallback?, envEndpoints? := cfg.envEndpoints?, transport }
 
 private def DbCacheEntry.matches (e : DbCacheEntry) (cfg : Db.DbConfig) : Bool :=
   e.endpoint == cfg.endpoint && e.devFallback? == cfg.devFallback? && e.envEndpoints? == cfg.envEndpoints?
@@ -518,14 +509,13 @@ private structure DbResolveCache where
   byName        : Prim.StateBox (Std.HashMap String DbCacheEntry)
 
 private def mkDbResolveCache (primaryDb? : Option Db.DbConfig) : IO DbResolveCache := do
-  let rawDeployEnv? ← Prim.getEnv "QED_DEPLOY_ENV"
-  let onCloudRun ← if rawDeployEnv?.isNone then pure (← loadNonEmptyEnv "K_SERVICE").isSome else pure false
+  let (rawDeployEnv?, onCloudRun) ← loadDeployEnvFlags
   let byName ← Prim.mkStateBox (∅ : Std.HashMap String DbCacheEntry)
   let primary? ← match primaryDb? with
     | none => pure none
     | some cfg =>
         match ← resolveDbConfigCore rawDeployEnv? onCloudRun cfg with
-        | .ok tr => pure (some (cfg.name, { endpoint := cfg.endpoint, devFallback? := cfg.devFallback?, envEndpoints? := cfg.envEndpoints?, transport := tr }))
+        | .ok tr => pure (some (cfg.name, DbCacheEntry.ofConfig cfg tr))
         | .error _ => pure none
   return { rawDeployEnv?, onCloudRun, primary?, byName }
 
@@ -542,9 +532,7 @@ private def resolveDbConfigWith (cache? : Option DbResolveCache) (cfg : Db.DbCon
           return .ok hit.transport
       match ← resolveDbConfigCore cache.rawDeployEnv? cache.onCloudRun cfg with
       | .ok tr =>
-          let entry : DbCacheEntry := {
-            endpoint := cfg.endpoint, devFallback? := cfg.devFallback?, envEndpoints? := cfg.envEndpoints?, transport := tr
-          }
+          let entry := DbCacheEntry.ofConfig cfg tr
           Prim.atomicModify cache.byName fun m =>
             ((if m.size < 32 then m.insert cfg.name entry else m), ())
           return .ok tr
@@ -795,22 +783,21 @@ def withStateBox {σ : Type} (box : Prim.StateBox σ) : MonadAtomic σ IO where
 
 /-! ## Fail-Closed Startup Secret Check -/
 
-def verifyRequiredSecrets (secrets : Array String) : IO Bool := do
-  secrets.foldlM (init := true) fun ok name => do
-    match ← requireSecretEnv name with
+private def checkAllStartup {α β ε : Type} (xs : Array α) (run : α → IO (Except ε β))
+    (errMsg : α → ε → String) : IO Bool :=
+  xs.foldlM (init := true) fun ok x => do
+    match ← run x with
     | .ok _    => return ok
-    | .error _ =>
-        IO.eprintln s!"✗ missing required secret `{name}` (set `{name}` before starting the server)"
-        return false
+    | .error e => IO.eprintln (errMsg x e); return false
+
+def verifyRequiredSecrets (secrets : Array String) : IO Bool :=
+  checkAllStartup secrets requireSecretEnv fun name _ =>
+    s!"✗ missing required secret `{name}` (set `{name}` before starting the server)"
 
 /-- Initializes declared database schemas (`CREATE TABLE IF NOT EXISTS ...`) idempotently at server boot. -/
-def initDatabases (dbs : Array Db.DbConfig) : IO Bool := do
-  dbs.foldlM (init := true) fun ok cfg => do
-    match ← execNativeDbDdl cfg with
-    | .ok () => return ok
-    | .error e =>
-        IO.eprintln s!"✗ database `{cfg.name}` initialization failed: {e.message}"
-        return false
+def initDatabases (dbs : Array Db.DbConfig) : IO Bool :=
+  checkAllStartup dbs execNativeDbDdl fun cfg e =>
+    s!"✗ database `{cfg.name}` initialization failed: {e.message}"
 
 private def authUsersDdlSqlite : String :=
   "CREATE TABLE IF NOT EXISTS \"_qed_auth_users\" (\"sub\" TEXT PRIMARY KEY, \"created_at\" INTEGER NOT NULL)"
@@ -1065,13 +1052,18 @@ private def cookieHeaders (cookies : List SetCookie) : List (String × String) :
 private def isSsrRedirectStatus (status : Nat) : Bool :=
   status == 301 || status == 302 || status == 303 || status == 307 || status == 308
 
+private def tryGzip (body : ByteArray) (compressible : Bool) : IO (Option ByteArray) := do
+  if compressible && body.size >= 256 then
+    let gz ← Prim.gzipCompress body
+    if !gz.isEmpty && gz.size < body.size then return some gz
+  return none
+
 private def maybeGzipResponse (status : Nat) (contentType : String) (body : ByteArray)
     (isHead keepAlive noStore acceptsGzip compressible : Bool)
     (etag? : Option String := none) (cacheCtrl? : Option String := none)
     (extraHeaders : List (String × String) := []) (contentLen : Nat := body.size) : IO ByteArray := do
-  if !isHead && acceptsGzip && compressible && body.size >= 256 then
-    let gz ← Prim.gzipCompress body
-    if !gz.isEmpty && gz.size < body.size then
+  if !isHead && acceptsGzip then
+    if let some gz ← tryGzip body compressible then
       let hdrs :=
         if extraHeaders.any (fun (k, _) => eqCI k "vary") then
           ("Content-Encoding", "gzip") :: extraHeaders
@@ -1099,13 +1091,8 @@ private def serveStaticAsset (staticDirFd : Prim.StaticDir)
         else "public, max-age=0, must-revalidate"
       let varyHdrs : List (String × String) := if compressible then [("Vary", "Accept-Encoding")] else []
       if cacheable && fsize <= 2 * 1024 * 1024 then
-        let gzip? ←
-          if compressible && fsize >= 256 then do
-            let gz ← Prim.gzipCompress fbytes
-            if !gz.isEmpty && gz.size < fsize then
-              pure (some (WireVariants.build st.mime gz etag cacheCtrl [("Content-Encoding", "gzip"), ("Vary", "Accept-Encoding")]))
-            else pure none
-          else pure none
+        let gzip? := (← tryGzip fbytes compressible).map fun gz =>
+          WireVariants.build st.mime gz etag cacheCtrl [("Content-Encoding", "gzip"), ("Vary", "Accept-Encoding")]
         let entry : CachedStaticAsset := {
           etag, plain := WireVariants.build st.mime fbytes etag cacheCtrl varyHdrs, gzip?
         }
@@ -1406,13 +1393,19 @@ def runStatefulFullstack {σ Model Msg : Type}
       withCookieSink gcpCache (some dbCache) fun srv => @hookM IO _ srv atomicInst ctx kind
   }
 
+/-- Parses standard Qed server CLI arguments (`[staticDir] [port] [--dev]`) plus `PORT`/`QED_WORKERS` env vars. -/
+def parseServerCliArgs (args : List String) : IO (String × UInt16 × Bool × UInt32) := do
+  let staticDir := args[0]?.getD "dist"
+  let envPort ← Prim.getEnv "PORT"
+  let port := ((args[1]?.getD (envPort.getD "8000")).toNat?.getD 8000).toUInt16
+  let devMode := args.contains "--dev"
+  let numWorkers := (((← Prim.getEnv "QED_WORKERS").bind String.toNat?).getD 0).toUInt32
+  return (staticDir, port, devMode, numWorkers)
+
 /-- Serves a standalone `Qed.App` (`component` or `Qed.run`) with native in-memory SSR and static asset serving. -/
 def runStandaloneApp {Model Msg : Type} (app : Qed.App Model Msg) (title : String)
     (args : List String) : IO UInt32 := do
-  let staticDir := args.getD 0 "dist"
-  let port : UInt16 := ((args.getD 1 "8000").toNat?.getD 8000).toUInt16
-  let devMode := args.contains "--dev"
-  let numWorkers : UInt32 := (((← Prim.getEnv "QED_WORKERS").bind String.toNat?).getD 0).toUInt32
+  let (staticDir, port, devMode, numWorkers) ← parseServerCliArgs args
   runFullstackCore app {
     title, serverShortName := "_app", requiredSecrets := #[], port, staticDir, devMode, numWorkers,
     dispatchFn := fun _ _ _ => pure (.error (ApiError.notFound "no RPC server configured"), #[]),

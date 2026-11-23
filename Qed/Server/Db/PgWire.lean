@@ -263,9 +263,9 @@ private def xorBytes (a b : ByteArray) : ByteArray :=
 
 /-! ### Live Wire Execution (Total Fuel-Bounded Socket Loops) -/
 
+open Qed.Server.Net (liftE liftP)
+
 private abbrev PgM := ExceptT String IO
-private def liftE {α : Type} (x : IO (Except String α)) : PgM α := ExceptT.mk x
-private def liftP {α : Type} (x : Except String α) : PgM α := ExceptT.mk (pure x)
 private def mapErr {α : Type} (pfx : String) (x : PgM α) : PgM α :=
   ExceptT.mk ((·.mapError fun e => s!"{pfx}: {e}") <$> x.run)
 
@@ -348,22 +348,17 @@ private def collectQueryResultLoop (handle : UInt64) (buf : ByteArray) (off : Na
   | 0 => throw "postgres query response exceeded frame limit"
   | fuel + 1 => do
       let (f, b1, o1) ← readNextFrame handle buf off 4096
-      if f.tag == 0x5A then -- 'Z' ReadyForQuery
-        let qRes := match err? with | some e => Except.error e | none => Except.ok { rows, affected }
-        return (qRes, b1, o1, readyStatusByte f.payload)
-      else if f.tag == 0x45 then -- 'E' ErrorResponse
-        collectQueryResultLoop handle b1 o1 oids rows affected (some (parseErrorResponse f.payload)) fuel
-      else if f.tag == 0x54 then -- 'T' RowDescription
-        collectQueryResultLoop handle b1 o1 (parseRowDescription f.payload) rows affected err? fuel
-      else if f.tag == 0x44 then -- 'D' DataRow
-        match parseDataRow oids f.payload with
-        | .ok row  => collectQueryResultLoop handle b1 o1 oids (rows.push row) affected err? fuel
-        | .error e => collectQueryResultLoop handle b1 o1 oids rows affected (some e) fuel
-      else if f.tag == 0x43 then -- 'C' CommandComplete
-        collectQueryResultLoop handle b1 o1 oids rows (parseCommandTagAffected f.payload) err? fuel
-      else
-        -- ParseComplete ('1'), BindComplete ('2'), NoData ('n'), NoticeResponse ('N'), EmptyQuery ('I')
-        collectQueryResultLoop handle b1 o1 oids rows affected err? fuel
+      let next (o := oids) (rs := rows) (aff := affected) (e := err?) :=
+        collectQueryResultLoop handle b1 o1 o rs aff e fuel
+      match f.tag with
+      | 0x5A => return (err?.elim (.ok { rows, affected }) .error, b1, o1, readyStatusByte f.payload) -- 'Z' ReadyForQuery
+      | 0x45 => next (e := some (parseErrorResponse f.payload)) -- 'E' ErrorResponse
+      | 0x54 => next (o := parseRowDescription f.payload)       -- 'T' RowDescription
+      | 0x44 => match parseDataRow oids f.payload with          -- 'D' DataRow
+          | .ok row  => next (rs := rows.push row)
+          | .error e => next (e := some e)
+      | 0x43 => next (aff := parseCommandTagAffected f.payload) -- 'C' CommandComplete
+      | _    => next -- ParseComplete ('1'), BindComplete ('2'), NoData ('n'), NoticeResponse ('N'), EmptyQuery ('I')
 
 /-! ### Thread-Safe Per-DSN Connection Pool (`PgConn` & `pgPoolBox`) -/
 

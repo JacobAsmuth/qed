@@ -52,20 +52,23 @@ def JwkKey.alg : JwkKey → JwtAlg
   | .rsa _ _ _    => .rs256
   | .ecP256 _ _ _ => .es256
 
+private def strField? (j : Json) (k : String) : Option String :=
+  (j.get? k).bind (·.str?)
+
 def parseJwk (j : Json) : Option JwkKey := do
-  let kty ← (j.get? "kty").bind (·.str?)
+  let kty ← strField? j "kty"
   -- Reject encryption-only keys (`use: "enc"`).
-  if let some useStr := (j.get? "use").bind (·.str?) then
+  if let some useStr := strField? j "use" then
     if useStr != "sig" then none
-  let kid := ((j.get? "kid").bind (·.str?)).getD ""
+  let kid := (strField? j "kid").getD ""
   let b64Field (k : String) : Option ByteArray :=
-    ((j.get? k).bind (·.str?)).bind fun s => (base64UrlDecode s).toOption
+    (strField? j k).bind fun s => (base64UrlDecode s).toOption
   if kty == "RSA" then
     let nBytes ← b64Field "n"
     let eBytes ← b64Field "e"
     if nBytes.size >= 128 && !eBytes.isEmpty then some (.rsa kid nBytes eBytes) else none
   else if kty == "EC" then
-    if (j.get? "crv").bind (·.str?) != some "P-256" then none
+    if strField? j "crv" != some "P-256" then none
     let xBytes ← b64Field "x"
     let yBytes ← b64Field "y"
     if xBytes.size == 32 && yBytes.size == 32 then some (.ecP256 kid xBytes yBytes) else none
@@ -109,32 +112,19 @@ def splitCompactJwt (token : String) : Except String (String × String × String
   | _ => .error "jwt: expected 3 dot-separated segments"
 
 def parseJwtHeader (j : Json) : Except String JwtHeader := do
-  let some algStr := (j.get? "alg").bind (·.str?)
-    | .error "jwt: missing `alg` header"
+  let some algStr := strField? j "alg" | .error "jwt: missing `alg` header"
   let some alg := parseJwtAlg algStr
     | .error s!"jwt: disallowed algorithm `{algStr}` (only RS256 and ES256 are accepted)"
-  let kid? := (j.get? "kid").bind (·.str?)
-  let typ? := (j.get? "typ").bind (·.str?)
-  .ok { alg, kid?, typ? }
+  .ok { alg, kid? := strField? j "kid", typ? := strField? j "typ" }
 
 def parseCompactJwt (token : String) : Except String CompactJwt := do
   let (hB64, pB64, sB64) ← splitCompactJwt token
-  let hBytes ← base64UrlDecode hB64
-  let pBytes ← base64UrlDecode pB64
-  let sig    ← base64UrlDecode sB64
-  let some hStr := String.fromUTF8? hBytes
-    | .error "jwt: invalid UTF-8 in header"
-  let some pStr := String.fromUTF8? pBytes
-    | .error "jwt: invalid UTF-8 in payload"
-  let hJson ← Json.parse hStr
-  let pJson ← Json.parse pStr
-  let header ← parseJwtHeader hJson
-  .ok {
-    signingInput := hB64 ++ "." ++ pB64
-    signature    := sig
-    header
-    payloadJson  := pJson
-  }
+  let decJson (b64 what : String) : Except String Json := do
+    let some s := String.fromUTF8? (← base64UrlDecode b64) | .error s!"jwt: invalid UTF-8 in {what}"
+    Json.parse s
+  let header ← parseJwtHeader (← decJson hB64 "header")
+  let payloadJson ← decJson pB64 "payload"
+  .ok { signingInput := hB64 ++ "." ++ pB64, signature := ← base64UrlDecode sB64, header, payloadJson }
 
 private def jsonToClaimString : Json → Option String
   | .str s  => some s
@@ -173,21 +163,15 @@ def JwtClaims.claim (c : JwtClaims) (key : String) : Option String :=
     if key == "verified" then c.flatClaims.lookup "email_verified" else none
 
 def parseJwtClaims (j : Json) : Except String JwtClaims := do
-  let some iss := (j.get? "iss").bind (·.str?)
-    | .error "jwt: missing `iss` claim"
-  let some sub := (j.get? "sub").bind (·.str?)
-    | .error "jwt: missing `sub` claim"
+  let some iss := strField? j "iss" | .error "jwt: missing `iss` claim"
+  let some sub := strField? j "sub" | .error "jwt: missing `sub` claim"
   let aud := match j.get? "aud" with | some v => parseAudField v | none => []
-  let some exp := (j.get? "exp").bind jsonToNatOpt
-    | .error "jwt: missing or invalid `exp` claim"
-  let nbf? := (j.get? "nbf").bind jsonToNatOpt
-  let iat? := (j.get? "iat").bind jsonToNatOpt
-  let nonce? := (j.get? "nonce").bind (·.str?)
-  let email? := (j.get? "email").bind (·.str?)
-  let emailVerified := match (j.get? "email_verified") with | some (.bool b) => b | _ => false
+  let some exp := (j.get? "exp").bind jsonToNatOpt | .error "jwt: missing or invalid `exp` claim"
+  let emailVerified := match j.get? "email_verified" with | some (.bool b) => b | _ => false
   .ok {
-    iss, sub, aud, exp, nbf?, iat?, nonce?, email?, emailVerified
-    flatClaims := extractFlatClaims j
+    iss, sub, aud, exp, nbf? := (j.get? "nbf").bind jsonToNatOpt,
+    iat? := (j.get? "iat").bind jsonToNatOpt, nonce? := strField? j "nonce",
+    email? := strField? j "email", emailVerified, flatClaims := extractFlatClaims j
   }
 
 structure OidcValidationCfg where
@@ -289,10 +273,7 @@ theorem sanitizeReturnTo_safe (raw? : Option String) :
   unfold sanitizeReturnTo
   cases raw? with
   | none => exact isSafeReturnTo_root
-  | some s =>
-      by_cases h : isSafeReturnTo s = true
-      · simp [h]
-      · simp [h, isSafeReturnTo_root]
+  | some s => dsimp only; split <;> simp_all [isSafeReturnTo_root]
 
 /-! ### Signed `v2` Session Cookie Payload Codec (Carrying Verified User ID + Claims) -/
 
@@ -311,8 +292,7 @@ def decodeSessionPayloadV2 (b64 : String) : Except String SessionPayloadV2 := do
   let some raw := String.fromUTF8? bs
     | .error "session: invalid UTF-8"
   let j ← Json.parse raw
-  let some uid := (j.get? "sub").bind (·.str?)
-    | .error "session: missing `sub`"
+  let some uid := strField? j "sub" | .error "session: missing `sub`"
   if uid.isEmpty then .error "session: empty `sub`"
   else
     let claims := match j.get? "claims" with

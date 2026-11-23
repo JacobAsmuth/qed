@@ -247,18 +247,11 @@ def msg (data : String) (event : Option String := none) (id : Option String := n
 
 /-- Renders one RFC 8895 / WHATWG `text/event-stream` frame (`event:`, `id:`, `retry:`, multiline `data:`, `\n\n`). -/
 def render (ev : SseEvent) : String :=
-  let evLine := match ev.event with
-    | some e => "event: " ++ sanitizeHeader e ++ "\n"
-    | none   => ""
-  let idLine := match ev.id with
-    | some i => "id: " ++ sanitizeHeader i ++ "\n"
-    | none   => ""
-  let retryLine := match ev.retry with
-    | some ms => "retry: " ++ toString ms ++ "\n"
-    | none    => ""
+  let line (k : String) (v? : Option String) := (v?.map (s!"{k}: {·}\n")).getD ""
   let cleanData := ev.data.replace "\r\n" "\n" |>.replace "\r" "\n"
-  let dataLines := String.join ((cleanData.splitOn "\n").map fun l => "data: " ++ l ++ "\n")
-  evLine ++ idLine ++ retryLine ++ dataLines ++ "\n"
+  let dataLines := String.join ((cleanData.splitOn "\n").map ("data: " ++ · ++ "\n"))
+  line "event" (ev.event.map sanitizeHeader) ++ line "id" (ev.id.map sanitizeHeader) ++
+    line "retry" (ev.retry.map toString) ++ dataLines ++ "\n"
 
 def formatStream (events : List SseEvent) : ByteArray :=
   (String.join (events.map SseEvent.render)).toUTF8
@@ -276,25 +269,25 @@ deriving Inhabited
 
 namespace HttpResponse
 
-def text (body : String) (status : Nat := 200)
+def bytes (contentType : String) (body : ByteArray) (status : Nat := 200)
     (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
-  { status, contentType := "text/plain; charset=utf-8", body := body.toUTF8, headers, cookies }
+  { status, contentType, body, headers, cookies }
 
-def json (body : String) (status : Nat := 200)
-    (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
-  { status, contentType := "application/json; charset=utf-8", body := body.toUTF8, headers, cookies }
+def text (body : String) (status : Nat := 200) (headers : List (String × String) := [])
+    (cookies : List SetCookie := []) : HttpResponse :=
+  bytes "text/plain; charset=utf-8" body.toUTF8 status headers cookies
+
+def json (body : String) (status : Nat := 200) (headers : List (String × String) := [])
+    (cookies : List SetCookie := []) : HttpResponse :=
+  bytes "application/json; charset=utf-8" body.toUTF8 status headers cookies
 
 def jsonOf {α : Type} [ToJson α] (val : α) (status : Nat := 200)
     (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
   json (Json.render (toJson val)) status headers cookies
 
-def html (body : String) (status : Nat := 200)
-    (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
-  { status, contentType := "text/html; charset=utf-8", body := body.toUTF8, headers, cookies }
-
-def bytes (contentType : String) (body : ByteArray) (status : Nat := 200)
-    (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
-  { status, contentType, body, headers, cookies }
+def html (body : String) (status : Nat := 200) (headers : List (String × String) := [])
+    (cookies : List SetCookie := []) : HttpResponse :=
+  bytes "text/html; charset=utf-8" body.toUTF8 status headers cookies
 
 def redirect (location : String) (status : Nat := 302) (cookies : List SetCookie := []) : HttpResponse :=
   { status, contentType := "text/plain; charset=utf-8", body := ByteArray.empty,
@@ -373,6 +366,10 @@ theorem encodeSingleSeg_safe {s out : String} (h : encodeSingleSeg s = .ok out) 
     simp only [Bool.or_eq_true, String.isEmpty_iff, beq_iff_eq, not_or] at hbad
     exact ⟨hbad.1.1, hbad.1.2, hbad.2, rawSingleSeg_safe s⟩
 
+private theorem except_bind_ok {ε α β : Type} {x : Except ε α} {f : α → Except ε β} {b : β}
+    (h : (x >>= f) = .ok b) : ∃ a, x = .ok a ∧ f a = .ok b := by
+  cases x with | error _ => cases h | ok a => exact ⟨a, rfl, h⟩
+
 private theorem list_mapM_loop_ok {α β ε : Type} {f : α → Except ε β} {P : β → Prop}
     (hf : ∀ a b, f a = .ok b → P b) :
     ∀ (xs : List α) (acc ys : List β), (∀ y ∈ acc, P y) →
@@ -380,13 +377,9 @@ private theorem list_mapM_loop_ok {α β ε : Type} {f : α → Except ε β} {P
   | [], acc, _, hacc, h => by
       injection h with h; subst h; intro y hy; exact hacc y (List.mem_reverse.1 hy)
   | x :: xs, acc, ys, hacc, h => by
-      unfold List.mapM.loop at h; dsimp only [bind, Except.bind] at h
-      cases hx : f x with
-      | error _ => rw [hx] at h; contradiction
-      | ok b =>
-          rw [hx] at h
-          exact list_mapM_loop_ok hf xs (b :: acc) ys
-            (fun y hy => (List.mem_cons.1 hy).elim (· ▸ hf x b hx) (hacc y)) h
+      rcases except_bind_ok h with ⟨b, hx, hrest⟩
+      exact list_mapM_loop_ok hf xs (b :: acc) ys
+        (fun y hy => (List.mem_cons.1 hy).elim (· ▸ hf x b hx) (hacc y)) hrest
 
 private theorem list_mapM_except_all {α β ε : Type} {f : α → Except ε β} {P : β → Prop}
     (hf : ∀ a b, f a = .ok b → P b) {xs : List α} {ys : List β}
@@ -425,18 +418,15 @@ def encodeMultiSeg (s : String) : Except ApiError String := do
 
 theorem encodeMultiSeg_safe {s out : String} (h : encodeMultiSeg s = .ok out) :
     out.toList.all isSafeExtSuffixChar = true := by
-  unfold encodeMultiSeg at h
-  dsimp only [bind, Except.bind, pure, Except.pure] at h
+  unfold encodeMultiSeg at h; dsimp only at h
   split at h
-  · contradiction
-  · cases hm : List.mapM encodeMultiSegElem _ with
-    | error _ => rw [hm] at h; contradiction
-    | ok segs =>
-        rw [hm] at h; injection h with h; subst h
-        refine joinDelim_safe (sep := '/') rfl segs (list_mapM_except_all (fun a b hab => ?_) hm)
-        unfold encodeMultiSegElem at hab; split at hab
-        · contradiction
-        · exact safeSeg_implies_extSuffix (encodeSingleSeg_safe hab).2.2.2
+  · cases h
+  · rcases except_bind_ok h with ⟨segs, hm, hret⟩
+    cases hret
+    refine joinDelim_safe (sep := '/') rfl segs (list_mapM_except_all (fun a b hab => ?_) hm)
+    unfold encodeMultiSegElem at hab; split at hab
+    · cases hab
+    · exact safeSeg_implies_extSuffix (encodeSingleSeg_safe hab).2.2.2
 
 inductive PathPart where
   | lit (seg : String)
@@ -522,18 +512,13 @@ theorem buildExternalSuffix_safe {parts : List PathPart} {query : List (String �
     (h : buildExternalSuffix parts query = .ok sfx) :
     sfx.toList.all isSafeExtSuffixChar = true := by
   unfold buildExternalSuffix at h
-  dsimp only [bind, Except.bind, pure, Except.pure] at h
-  cases hr : renderPathParts parts with
-  | error _ => rw [hr] at h; contradiction
-  | ok segs =>
-      rw [hr] at h; dsimp only at h
-      have hpath := joinDelim_safe (sep := '/') rfl segs (renderPathParts_safe hr)
-      by_cases hq : query.isEmpty
-      · simp [hq] at h; subst h; exact hpath
-      · simp [hq] at h; subst h
-        have hqchar : isSafeExtSuffixChar '?' = true := rfl
-        have hamp := joinDelim_safe (sep := '&') rfl (renderQueryPairs query) (renderQueryPairs_safe query)
-        simp [String.toList_append, hpath, hqchar, hamp]
+  rcases except_bind_ok h with ⟨segs, hr, hret⟩
+  have hpath := joinDelim_safe (sep := '/') rfl segs (renderPathParts_safe hr)
+  by_cases hq : query.isEmpty <;> (simp [hq, pure, Except.pure] at hret; subst hret)
+  · exact hpath
+  · have hqchar : isSafeExtSuffixChar '?' = true := rfl
+    have hamp := joinDelim_safe (sep := '&') rfl (renderQueryPairs query) (renderQueryPairs_safe query)
+    simp [String.toList_append, hpath, hqchar, hamp]
 
 /-- Builds a complete SSRF-pinned outbound URL `base ++ "/" ++ suffix` for an `external` endpoint. -/
 def buildExternalUrl (base : String) (parts : List PathPart) (query : List (String × QueryVal)) :
@@ -552,17 +537,10 @@ theorem external_url_preserves_origin
     ∃ sfx : String,
       url = (base ++ "/") ++ sfx ∧
       (∀ c ∈ sfx.toList, c ≠ '#' ∧ c ≠ '\\' ∧ c ≠ '\r' ∧ c ≠ '\n' ∧ c ≠ '\x00' ∧ c ≠ '@') := by
-  unfold buildExternalUrl at h
-  dsimp only [bind, Except.bind, pure, Except.pure] at h
-  cases hs : buildExternalSuffix parts query with
-  | error _ => rw [hs] at h; contradiction
-  | ok sfx =>
-      rw [hs] at h; injection h with h; subst h
-      refine ⟨by simp [String.startsWith], sfx, rfl, ?_⟩
-      have hsfx := buildExternalSuffix_safe hs
-      rw [List.all_eq_true] at hsfx
-      intro c hc
-      exact isSafeExtSuffixChar_no_smuggle (hsfx c hc)
+  rcases except_bind_ok h with ⟨sfx, hs, hret⟩
+  injection hret with hret; subst hret
+  refine ⟨by simp [String.startsWith], sfx, rfl, fun c hc => ?_⟩
+  exact isSafeExtSuffixChar_no_smuggle (List.all_eq_true.1 (buildExternalSuffix_safe hs) c hc)
 
 /-- Builds an SSRF/origin-pinned WebSocket URL `toWsOrigin base ++ "/" ++ suffix` for a 3rd-party `external` `ws` channel. -/
 def buildExternalWsUrl (base : String) (parts : List PathPart) (query : List (String × QueryVal)) :
@@ -1460,7 +1438,7 @@ theorem getElem_congr_arr {α : Type} {xs ys : Array α} {j : Nat}
 
 theorem srvGetAt_congr_arr {α : Type} {xs ys : Array α} {j : Nat}
     (heq : ys = xs) (hj : j < ys.size) :
-    srvGetAt ys j hj = xs[j]'(heq ▸ hj) := by
-  cases heq; rfl
+    srvGetAt ys j hj = xs[j]'(heq ▸ hj) :=
+  getElem_congr_arr heq hj
 
 end Qed.Server

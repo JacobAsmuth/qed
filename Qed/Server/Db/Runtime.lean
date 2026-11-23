@@ -54,25 +54,16 @@ private theorem decodeCheckedList_sound {Row : Type}
     ∀ (raws : List DbRow) (out : List Row),
       decodeCheckedList decode check errMsg raws = .ok out →
       ∀ r ∈ out, check r = true
-  | [], _, h => by
-      injection h with h; subst h; intro _ hm; exact False.elim (List.not_mem_nil hm)
+  | [], _, h => by cases h; intro _ hm; nomatch hm
   | raw :: rest, _, h => by
-      unfold decodeCheckedList at h
-      simp only [bind, Except.bind, pure, Except.pure] at h
-      cases hd : decode raw with
-      | error _ => rw [hd] at h; contradiction
-      | ok row =>
-          rw [hd] at h; dsimp only at h
-          cases hc : check row with
-          | false => simp [hc] at h
-          | true =>
-              simp only [hc, ↓reduceIte] at h
-              cases hr : decodeCheckedList decode check errMsg rest with
-              | error _ => rw [hr] at h; contradiction
-              | ok tl =>
-                  rw [hr] at h; injection h with h; subst h
-                  intro r hm
-                  exact (List.mem_cons.1 hm).elim (· ▸ hc) (decodeCheckedList_sound decode check errMsg rest tl hr r)
+      simp only [decodeCheckedList, bind, Except.bind, pure, Except.pure] at h
+      cases hd : decode raw <;> rw [hd] at h <;> try cases h
+      rename_i row
+      cases hc : check row <;> simp only [hc, ↓reduceIte, Bool.false_eq_true] at h <;> try cases h
+      cases hr : decodeCheckedList decode check errMsg rest <;> rw [hr] at h <;> try cases h
+      rename_i tl
+      intro r hm
+      exact (List.mem_cons.1 hm).elim (· ▸ hc) (decodeCheckedList_sound decode check errMsg rest tl hr r)
 
 private def decodeCheckedOne {Row : Type}
     (decode : DbRow → Except String Row) (check : Row → Bool) (errMsg : String)
@@ -240,12 +231,8 @@ abbrev dbSumInt {Row : Type} {m : Type → Type} [Monad m] [MonadServer m] :=
 /-- Verified `SELECT MIN(col)` / `MAX(col)` returning `Option Val` (`none` when 0 rows match),
     inferring `Val` from `_proj` and requiring `ReadPolicy` on all aggregated rows. -/
 abbrev dbAggOpt {Row Val : Type} [FromSql Val] {m : Type → Type} [Monad m] [MonadServer m]
-    (cfg : DbConfig) (q : SqlQuery) (_proj : Row → Val)
-    (RowInv : Row → Prop) (wherePred : Row → Bool)
-    (ReadPolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
-    (hPolicy : ∀ r, RowInv r → wherePred r = true → ReadPolicy ctx r)
-    (txId? : Option UInt64 := none) : m (Except ApiError (Option Val)) :=
-  dbRun cfg q txId? (decodeFirstCell (α := Val) some (some none) none "aggregate") hPolicy
+    (cfg : DbConfig) (q : SqlQuery) (_proj : Row → Val) :=
+  @dbPolicyRun Row (Option Val) m _ _ (decodeFirstCell (α := Val) some (some none) none "aggregate") cfg q
 
 /-- Verified typed `INNER JOIN` checking BOTH tables' `ReadPolicy` at compile time and
     zero-trust verifying both `RowInv`s, both `wherePred`s, and the join key equality on every row. -/

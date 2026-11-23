@@ -58,54 +58,41 @@ private def isLocalDevIssuer (issuer : String) : Bool :=
   issuer.startsWith "http://127.0.0.1:" || issuer.startsWith "http://localhost:" ||
   issuer == "http://127.0.0.1" || issuer == "http://localhost"
 
-private def nowSec : IO Nat := return (← Prim.nowMs).toNat / 1000
+def nowSec : IO Nat := return (← Prim.nowMs).toNat / 1000
 
 private def ResolvedOidcConfig.ssrfGuard (cfg : ResolvedOidcConfig) : Bool :=
   !(cfg.devMode && isLocalDevIssuer cfg.issuer)
 
+def loadNonEmptyEnv (envName : String) : IO (Option String) := do
+  return (← Prim.getEnv envName).bind fun v => let t := trimWs v; if t.isEmpty then none else some t
+
 private def resolveEnvWithDefault (envName : String) (default? : Option String) : IO (Option String) := do
-  let raw? := (← Prim.getEnv envName).bind fun v => let t := trimWs v; if t.isEmpty then none else some t
-  return raw?.orElse fun _ => default?
+  return (← loadNonEmptyEnv envName).orElse fun _ => default?
 
 /-- Resolves an `OidcAuthSpec` from OS environment variables at server boot.
     In `devMode`, synthesizes an ephemeral CSPRNG cookie-signing key if `QED_AUTH_SECRET` is unset. -/
 def initOidcRuntime (spec : OidcAuthSpec) (baseSecrets : List String) (devMode : Bool) :
     IO (Option OidcRuntime) := do
-  let some rawIss ← resolveEnvWithDefault spec.issuerEnv spec.issuerDefault?
-    | return none
+  let some rawIss ← resolveEnvWithDefault spec.issuerEnv spec.issuerDefault? | return none
   let issuer := stripTrailingSlashes (trimWs rawIss)
   if issuer.isEmpty then return none
   let audience := (← resolveEnvWithDefault spec.audienceEnv spec.audienceDefault?).getD spec.name
-  let clientId ← match spec.clientIdEnv? with
-    | some envName => do pure ((← resolveEnvWithDefault envName spec.clientIdDefault?).getD audience)
-    | none         => pure (spec.clientIdDefault?.getD audience)
-  let clientSecret? ← match spec.clientSecretEnv? with
-    | some envName => resolveEnvWithDefault envName none
-    | none         => pure none
+  let clientId := (← spec.clientIdEnv?.bindM fun e => resolveEnvWithDefault e spec.clientIdDefault?).orElse
+    (fun _ => spec.clientIdDefault?) |>.getD audience
+  let clientSecret? ← spec.clientSecretEnv?.bindM (resolveEnvWithDefault · none)
   let sessionSecrets ←
     if !baseSecrets.isEmpty then pure baseSecrets
-    else if devMode then
-      let eph ← Prim.randomHex 32
-      pure [eph]
+    else if devMode then pure [← Prim.randomHex 32]
     else pure []
-  let cache ← Prim.mkStateBox ({} : OidcCacheState)
   return some {
     cfg := {
-      name := spec.name
-      issuer
-      audience
-      clientId
-      clientSecret?
-      sessionSecrets
+      name := spec.name, issuer, audience, clientId, clientSecret?, sessionSecrets
       sessionTtlSec := if spec.sessionTtlSec == 0 then 86400 else spec.sessionTtlSec
-      loginPath := spec.loginPath
-      callbackPath := spec.callbackPath
-      logoutPath := spec.logoutPath
-      mePath := spec.mePath
-      claimNames := spec.claims.map (·.name)
-      devMode
+      loginPath := spec.loginPath, callbackPath := spec.callbackPath
+      logoutPath := spec.logoutPath, mePath := spec.mePath
+      claimNames := spec.claims.map (·.name), devMode
     }
-    cache
+    cache := ← Prim.mkStateBox ({} : OidcCacheState)
   }
 
 /-! ### Cryptographic JWK Verification (`RS256` & `ES256` via `ring`) -/
@@ -118,9 +105,6 @@ def verifyJwkSignature (key : JwkKey) (signingInput : String) (sig : ByteArray) 
       Prim.ecP256JwkVerify xBytes yBytes signingInput.toUTF8 sig
 
 private abbrev OidcM := ExceptT String IO
-private def liftE {α : Type} (x : IO (Except String α)) : OidcM α := ExceptT.mk x
-private def liftP {α : Type} (x : Except String α) : OidcM α := ExceptT.mk (pure x)
-private def liftIO {α : Type} (x : IO α) : OidcM α := liftM x
 
 private def verifyParsedJwtWithKeys (cfg : OidcValidationCfg) (keys : Array JwkKey)
     (parsed : CompactJwt) (now : Nat) : OidcM (VerifiedClaims cfg now) := do
@@ -164,15 +148,15 @@ def fetchDiscovery (httpExec : HttpExecFn) (rt : OidcRuntime) (force : Bool := f
       if let some cached ← liftIO (Prim.atomicRead rt.cache (·.discovery?)) then
         if now < cached.fetchedAtSec + 300 then return cached
     let j ← liftE (execJsonHttp httpExec "GET" (rt.cfg.issuer ++ "/.well-known/openid-configuration") (ssrfGuard := rt.cfg.ssrfGuard))
-    let iss := ((j.get? "issuer").bind (·.str?)).map (stripTrailingSlashes ∘ trimWs) |>.getD rt.cfg.issuer
+    let iss := (Db.jsonStrAt j "issuer").map (stripTrailingSlashes ∘ trimWs) |>.getD rt.cfg.issuer
     if iss != rt.cfg.issuer then
       throw s!"oidc discovery issuer mismatch: expected `{rt.cfg.issuer}`, got `{iss}`"
-    let some jwksUri := (j.get? "jwks_uri").bind (·.str?)
+    let some jwksUri := Db.jsonStrAt j "jwks_uri"
       | throw "oidc discovery missing `jwks_uri`"
     let disc : OidcDiscovery := {
       issuer := iss
-      authorizationEndpoint := ((j.get? "authorization_endpoint").bind (·.str?)).getD (rt.cfg.issuer ++ "/authorize")
-      tokenEndpoint := ((j.get? "token_endpoint").bind (·.str?)).getD (rt.cfg.issuer ++ "/token")
+      authorizationEndpoint := (Db.jsonStrAt j "authorization_endpoint").getD (rt.cfg.issuer ++ "/authorize")
+      tokenEndpoint := (Db.jsonStrAt j "token_endpoint").getD (rt.cfg.issuer ++ "/token")
       jwksUri
       fetchedAtSec := now
     }
@@ -276,23 +260,15 @@ private def verifyAuthTxCookie (secrets : List String) (raw : String) (nowSec : 
   let .ok bs := base64UrlDecode b64 | return none
   let some js := String.fromUTF8? bs | return none
   let .ok j := Json.parse js | return none
-  let some state := (j.get? "state").bind (·.str?) | return none
-  let some nonce := (j.get? "nonce").bind (·.str?) | return none
-  let some verifier := (j.get? "verifier").bind (·.str?) | return none
-  let returnTo := sanitizeReturnTo ((j.get? "returnTo").bind (·.str?))
-  let some redirectUri := (j.get? "redirectUri").bind (·.str?) | return none
+  let some state := Db.jsonStrAt j "state" | return none
+  let some nonce := Db.jsonStrAt j "nonce" | return none
+  let some verifier := Db.jsonStrAt j "verifier" | return none
+  let returnTo := sanitizeReturnTo (Db.jsonStrAt j "returnTo")
+  let some redirectUri := Db.jsonStrAt j "redirectUri" | return none
   return some { state, nonce, codeVerifier := verifier, returnTo, redirectUri }
 
 private def mkHardenedCookie (name value : String) (maxAge : Nat) (devMode : Bool) : SetCookie :=
-  {
-    name
-    value
-    path := "/"
-    maxAge? := some maxAge
-    httpOnly := true
-    secure := !devMode
-    sameSite := .lax
-  }
+  { name, value, path := "/", maxAge? := some maxAge, httpOnly := true, secure := !devMode, sameSite := .lax }
 
 private def inferOriginFromReq (req : ParsedReqHead) (devMode : Bool) : String :=
   let host := (req.host?.map trimWs).getD "127.0.0.1:8000"
@@ -332,8 +308,11 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
     match cfg.sessionSecrets.head? with
     | some k => pure k
     | none   => throw (500, "auth error: QED_AUTH_SECRET is not configured")
-  let fetchDiscOr502 : ExceptT (Nat × String) IO OidcDiscovery :=
-    ExceptT.mk ((·.mapError (502, ·)) <$> fetchDiscovery httpExec rt false)
+  let liftErr {α : Type} (st : Nat) (x : IO (Except String α)) (fmt : String → String := id) :
+      ExceptT (Nat × String) IO α :=
+    ExceptT.mk ((·.mapError fun e => (st, fmt e)) <$> x)
+  let setCookieHdrs (cs : List SetCookie) : List (String × String) := cs.map fun c => ("Set-Cookie", c.render)
+  let fetchDiscOr502 := liftErr 502 (fetchDiscovery httpExec rt false)
   if req.method == "GET" && pathOnly == cfg.loginPath then
     runRoute do
       let signKey ← requireSignKey
@@ -352,7 +331,7 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
         ("code_challenge", codeChallenge), ("code_challenge_method", "S256")
       ]
       let sep := if disc.authorizationEndpoint.contains "?" then "&" else "?"
-      return redirectResp (sanitizeHeader (disc.authorizationEndpoint ++ sep ++ authQuery)) [("Set-Cookie", txCookie.render)]
+      return redirectResp (sanitizeHeader (disc.authorizationEndpoint ++ sep ++ authQuery)) (setCookieHdrs [txCookie])
 
   else if req.method == "GET" && pathOnly == cfg.callbackPath then
     runRoute do
@@ -372,29 +351,27 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
       let formPairs := match cfg.clientSecret? with
         | some cs => formPairsBase ++ [("client_secret", cs)]
         | none    => formPairsBase
-      let tokJson ← ExceptT.mk ((·.mapError (502, ·)) <$> execJsonHttp httpExec "POST" disc.tokenEndpoint
+      let tokJson ← liftErr 502 (execJsonHttp httpExec "POST" disc.tokenEndpoint
         #[("Content-Type", "application/x-www-form-urlencoded"), ("Accept", "application/json")]
         (encodeFormBody formPairs).toUTF8 cfg.ssrfGuard "oidc token endpoint")
-      let some idToken := (tokJson.get? "id_token").bind (·.str?)
+      let some idToken := Db.jsonStrAt tokJson "id_token"
         | throw (502, "oidc token response missing `id_token`")
-      let claims ← ExceptT.mk ((·.mapError fun e => (401, s!"oidc id_token verification failed: {e}")) <$>
-        verifyOidcJwt httpExec rt idToken (expectedNonce? := some tx.nonce))
+      let claims ← liftErr 401 (verifyOidcJwt httpExec rt idToken (expectedNonce? := some tx.nonce))
+        (s!"oidc id_token verification failed: {·}")
       let sessPayload : SessionPayloadV2 := {
         userId := claims.sub
         claims := filterSessionClaims cfg.claimNames claims
       }
       let extraHookCookies ← match onCallbackAuthenticated? with
-        | some onAuth =>
-            let cs ← ExceptT.mk (onAuth sessPayload.userId sessPayload.claims)
-            pure (cs.toList.map fun c => ("Set-Cookie", c.render))
+        | some onAuth => setCookieHdrs <$> Array.toList <$> ExceptT.mk (onAuth sessPayload.userId sessPayload.claims)
         | none => pure []
       let sessTok ← signSessionCookieV2 signKey sessPayload cfg.sessionTtlSec
       let sessCookie := mkHardenedCookie "qed_session" sessTok cfg.sessionTtlSec cfg.devMode
-      let hdrs := [("Set-Cookie", (SetCookie.clear "qed_auth_tx" "/").render), ("Set-Cookie", sessCookie.render)] ++ extraHookCookies
+      let hdrs := setCookieHdrs [SetCookie.clear "qed_auth_tx" "/", sessCookie] ++ extraHookCookies
       return redirectResp (sanitizeReturnTo (some tx.returnTo)) hdrs
 
   else if (req.method == "POST" || req.method == "GET") && pathOnly == cfg.logoutPath then
-    let hdrs := [("Set-Cookie", (SetCookie.clear "qed_session" "/").render), ("Set-Cookie", (SetCookie.clear "qed_auth_tx" "/").render)]
+    let hdrs := setCookieHdrs [SetCookie.clear "qed_session" "/", SetCookie.clear "qed_auth_tx" "/"]
     match (parseQueryParams queryStr).lookup "returnTo" with
     | some rawRt => return some (redirectResp (sanitizeReturnTo (some rawRt)) hdrs)
     | none => return some (formatHttpResponse 200 "application/json" "{\"ok\":true}".toUTF8 isHead req.keepAlive true (extraHeaders := hdrs))

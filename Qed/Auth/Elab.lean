@@ -27,7 +27,6 @@ private inductive AuthClaimKind where
 deriving DecidableEq
 
 private structure ParsedClaimDecl where
-  ref        : Syntax
   ident      : Ident
   name       : String
   kind       : AuthClaimKind
@@ -61,7 +60,7 @@ private def parseClaimDecl (stx : Syntax) : CommandElabM ParsedClaimDecl := do
       let valStx := defOpt.getArg 1
       pure ((valStx.reprint.getD "").trimAscii.toString, ← liftMacroM <| lowerSimpleQedExpr .val valStx)
     else pure (defStr0, defTm0)
-  return { ref := stx, ident := id, name, kind, typeName, tyTm, defaultStr := defStr, defaultTm := defTm }
+  return { ident := id, name, kind, typeName, tyTm, defaultStr := defStr, defaultTm := defTm }
 
 private def claimExtractTerm (c : ParsedClaimDecl) (lookupFn : Term) : CommandElabM Term := do
   let kLit := Syntax.mkStrLit c.name
@@ -74,20 +73,16 @@ private def claimExtractTerm (c : ParsedClaimDecl) (lookupFn : Term) : CommandEl
   | .optStr => `(($lookupFn $kLit).orElse (fun _ => $defTm))
 
 private def oidcAuthSpecToTerm (s : OidcAuthSpec) : CommandElabM Term := do
-  let optStr : Option String → CommandElabM Term
-    | none   => `(Option.none)
-    | some v => `(Option.some $(Syntax.mkStrLit v))
-  let provs : Array Term := s.providers.toArray.map (Syntax.mkStrLit ·)
+  let provs : Array Term := s.providers.toArray.map quote
   let claimTms ← s.claims.toArray.mapM fun cl =>
-    `({ name := $(Syntax.mkStrLit cl.name), typeName := $(Syntax.mkStrLit cl.typeName),
-        defaultValue := $(Syntax.mkStrLit cl.defaultValue) : Qed.Auth.AuthClaimSpec })
-  `({ name := $(Syntax.mkStrLit s.name), isManaged := $(quote s.isManaged),
-      issuerEnv := $(Syntax.mkStrLit s.issuerEnv),
-      issuerDefault? := $(← optStr s.issuerDefault?), audienceEnv := $(Syntax.mkStrLit s.audienceEnv),
-      audienceDefault? := $(← optStr s.audienceDefault?), clientIdEnv? := $(← optStr s.clientIdEnv?),
-      clientIdDefault? := $(← optStr s.clientIdDefault?), clientSecretEnv? := $(← optStr s.clientSecretEnv?),
-      providers := [$[$provs],*], sessionTtlSec := $(Syntax.mkNumLit (toString s.sessionTtlSec)),
-      claims := [$[$claimTms],*] : Qed.Auth.OidcAuthSpec })
+    `({ name := $(quote cl.name), typeName := $(quote cl.typeName),
+        defaultValue := $(quote cl.defaultValue) : Qed.Auth.AuthClaimSpec })
+  `({ name := $(quote s.name), isManaged := $(quote s.isManaged),
+      issuerEnv := $(quote s.issuerEnv), issuerDefault? := $(quote s.issuerDefault?),
+      audienceEnv := $(quote s.audienceEnv), audienceDefault? := $(quote s.audienceDefault?),
+      clientIdEnv? := $(quote s.clientIdEnv?), clientIdDefault? := $(quote s.clientIdDefault?),
+      clientSecretEnv? := $(quote s.clientSecretEnv?), providers := [$[$provs],*],
+      sessionTtlSec := $(quote s.sessionTtlSec), claims := [$[$claimTms],*] : Qed.Auth.OidcAuthSpec })
 
 @[command_elab authCmd]
 def elabAuthCmd : CommandElab := fun stx => do
@@ -99,6 +94,7 @@ def elabAuthCmd : CommandElab := fun stx => do
   let clauses := (stx.getArg 3).getArgs
 
   let mut isManaged : Bool := false
+  let mut hasExplicitOidc : Bool := false
   let mut seen : Array Name := #[]
   let mut issuerEnv : String := "QED_AUTH_ISSUER"
   let mut issuerDefault? : Option String := none
@@ -113,18 +109,16 @@ def elabAuthCmd : CommandElab := fun stx => do
   let mut secrets : Array String := #[]
 
   let pushProviders (args : Array Syntax) (cur : Array String) : Array String :=
-    args.foldl (init := cur) fun acc p =>
-      let ps := p.getId.eraseMacroScopes.toString
-      if acc.contains ps then acc else acc.push ps
+    args.foldl (init := cur) fun acc p => pushUnique acc p.getId.eraseMacroScopes.toString
 
   for c in clauses do
     let k := c.getKind
-    if seen.contains k then
+    let seenKey := if k == ``authEnvClause then (c.getArg 0).getId.eraseMacroScopes else k
+    if seen.contains seenKey then
       throwErrorAt c s!"duplicate clause in `auth {authShort}`"
-    seen := seen.push k
+    seen := seen.push seenKey
     if k == ``authManagedClause then
-      if seen.any fun sk => sk == ``authIssuerClause || sk == ``authAudienceClause ||
-          sk == ``authClientIdClause || sk == ``authClientSecretClause || sk == ``authProvidersClause then
+      if hasExplicitOidc then
         throwErrorAt c s!"cannot combine `managed [...]` with explicit OIDC/provider clauses in `auth {authShort}`"
       isManaged := true
       audienceDefault? := none
@@ -132,19 +126,21 @@ def elabAuthCmd : CommandElab := fun stx => do
       clientSecretEnv? := some "QED_AUTH_CLIENT_SECRET"
       secrets := secrets.push "QED_AUTH_CLIENT_SECRET"
       providers := pushProviders (c.getArg 2).getSepArgs providers
-    else if k == ``authIssuerClause || k == ``authAudienceClause ||
-       k == ``authClientIdClause || k == ``authClientSecretClause then
+    else if k == ``authEnvClause then
       if isManaged then
         throwErrorAt c s!"cannot combine `managed [...]` with explicit OIDC clauses in `auth {authShort}`"
+      hasExplicitOidc := true
       let r ← parseQedEnvRef "`auth`" (c.getArg 1)
-      if r.isSecret && !secrets.contains r.envKey then secrets := secrets.push r.envKey
-      if k == ``authIssuerClause then issuerEnv := r.envKey; issuerDefault? := r.default?
-      else if k == ``authAudienceClause then audienceEnv := r.envKey; audienceDefault? := r.default?
-      else if k == ``authClientIdClause then clientIdEnv? := some r.envKey; clientIdDefault? := r.default?
-      else clientSecretEnv? := some r.envKey
+      if r.isSecret then secrets := pushUnique secrets r.envKey
+      match seenKey with
+      | `issuer   => issuerEnv := r.envKey; issuerDefault? := r.default?
+      | `audience => audienceEnv := r.envKey; audienceDefault? := r.default?
+      | `clientId => clientIdEnv? := some r.envKey; clientIdDefault? := r.default?
+      | _         => clientSecretEnv? := some r.envKey
     else if k == ``authProvidersClause then
       if isManaged then
         throwErrorAt c s!"cannot combine `managed [...]` with `providers` in `auth {authShort}`"
+      hasExplicitOidc := true
       providers := pushProviders (c.getArg 2).getSepArgs providers
     else if k == ``authSessionClause then
       let ttl := (⟨c.getArg 3⟩ : TSyntax `num).getNat

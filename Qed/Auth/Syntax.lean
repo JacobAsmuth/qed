@@ -15,17 +15,10 @@ def authEnvRefParser : Parser :=
   node `Qed.Auth.envRef
     ((identEq `secret <|> identEq `env) >> "(" >> strLit >> ")" >> optional (" ?? " >> strLit))
 
-@[authClause_parser] def authIssuerClause : Parser := leading_parser
-  withPosition (atomic (identEq `issuer) >> authEnvRefParser)
-
-@[authClause_parser] def authAudienceClause : Parser := leading_parser
-  withPosition (atomic (identEq `audience) >> authEnvRefParser)
-
-@[authClause_parser] def authClientIdClause : Parser := leading_parser
-  withPosition (atomic (identEq `clientId) >> authEnvRefParser)
-
-@[authClause_parser] def authClientSecretClause : Parser := leading_parser
-  withPosition (atomic (identEq `clientSecret) >> authEnvRefParser)
+@[authClause_parser] def authEnvClause : Parser := leading_parser
+  withPosition (
+    atomic (identEq `issuer <|> identEq `audience <|> identEq `clientId <|> identEq `clientSecret) >>
+    authEnvRefParser)
 
 @[authClause_parser] def authManagedClause : Parser := leading_parser
   withPosition (atomic (identEq `managed) >> "[" >> sepBy1 ident "," >> "]")

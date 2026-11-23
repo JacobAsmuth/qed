@@ -80,9 +80,7 @@ def elabServerChannelHeader (existingChanNames : Array String) (chStx : Syntax) 
 
   let some ensRes? ← elabEnsuresAbbrev chIdent chStr `event paramNames pIdents pTyTerms evTyTerm ensExprs
     | return none
-  let (ensId?, ensConst?) := match ensRes? with
-    | some (eid, econst, _) => (some eid, some econst)
-    | none                  => (none, none)
+  let (ensId?, ensConst?) := (ensRes?.map (·.1), ensRes?.map (·.2.1))
 
   -- Emit `<S>.<ch>_mkEmit` (checked at every `emit <ch>(...)` site!)
   let mkEmitId := mkIdentFrom chIdent (c.srvName ++ chName.appendAfter "_mkEmit")
@@ -135,7 +133,7 @@ private def runChanSubHandler (cb : ChanBodyCtx) (subSuffix : String)
   let subFnIdent := mkIdentFrom hdr.chIdent (hdr.chName.appendAfter s!"_{subSuffix}")
   let hasAwait := blockHasAwait bodyStmts
   let extraBinderIds := hdr.pIdents ++ extraIds ++ hdr.reqs.reqHypIds ++ extraReqIds
-  let extraBinderTys := hdr.pTyTerms ++ extraTys ++ hdr.reqs.reqHypTys ++ extraReqTys
+  let extraBinderTys := hdr.pTyTerms ++ extraTys ++ hdr.reqs.reqPropTerms ++ extraReqTys
   let extraCallArgs : Array Term :=
     cb.pProjs ++ extraProjs ++ hdr.reqs.reqHypIds.map (⟨·.raw⟩) ++ extraReqIds.map (⟨·.raw⟩)
   let baseCtx ← mkBaseLowerCtx subFnStr (hdr.paramNames ++ extraIds.map (·.getId.toString))
@@ -190,7 +188,7 @@ private def elabChanOnSend (cb : ChanBodyCtx) : SrvElabM (Option ChanSendInfo) :
   let sendTupleTy ← liftMacroM <| buildProdType spTyTerms
   let sTupleVar := mkIdent `_chSendVal
   let sProjs ← extractTupleProjections sTupleVar spTyTerms.size
-  let some sendRun ← runChanSubHandler cb "onSend" spIdents spTyTerms sProjs sReqs.reqHypIds sReqs.reqHypTys (← `(Unit)) true sBody | return none
+  let some sendRun ← runChanSubHandler cb "onSend" spIdents spTyTerms sProjs sReqs.reqHypIds sReqs.reqPropTerms (← `(Unit)) true sBody | return none
   let sendOut ← liftM (wrapEmptyWs sendRun)
   let sendGuarded ← liftM <| wrapReqs (hdr.reqs.reqPropTerms ++ sReqs.reqPropTerms)
     (hdr.reqs.reqHypIds ++ sReqs.reqHypIds) (hdr.reqs.reqLabels ++ sReqs.reqLabels) sendOut
@@ -225,9 +223,7 @@ private def emitChanClientHelpers (cb : ChanBodyCtx) (hasJoinSnapshot : Bool) (j
   let wsPathStr := s!"/_qed/ws/{c.srvShort}"
   let wsPathLit := Syntax.mkStrLit wsPathStr
   let mkProtoCb (ty : Term) (onOk : Ident) : CommandElabM Term :=
-    `(fun bs => match Qed.Proto.decode (α := $ty) bs with
-      | Except.ok v    => $onOk v
-      | Except.error e => $onStatusId (Qed.SocketStatus.failed e))
+    mkWsDecodeCb onOk onStatusId fun bs => `(Qed.Proto.decode (α := $ty) $bs)
   let onJoinDecTerm ← if hasJoinSnapshot then liftM (mkProtoCb joinTyTerm onJoinId) else `(fun _ => $onJoinId ())
   let onEvDecTerm ← liftM (mkProtoCb wireEvTerm onMsgId)
   liftM <| elabCommand (← `(command|
@@ -273,22 +269,16 @@ def elabServerChannelBody (hdr : ParsedChanHeader) :
   let (wsPathStr, sendHelperConst) ← emitChanClientHelpers cb hasJoinSnapshot joinTyTerm sendInfo
   if (← hasSrvErrors) then return none
   modifyEnv fun env => Qed.channelRegistry.addEntry env {
-    fullName := c.fullSrvName ++ hdr.chName, ownerName := c.fullSrvName, ownerShort := c.srvShort
-    channelName := hdr.chStr, kind := .fullstack c.fullSrvName c.srvShort wsPathStr
-    paramNames := hdr.pIdents.map (·.getId), paramCount := hdr.pIdents.size
-    paramTypeConsts := hdr.paramTypeConsts
-    eventTypeConst := c.fullSrvName ++ hdr.chName.appendAfter "_Event"
+    ChannelInfo.mkDefault c.fullSrvName c.srvShort hdr.chName
+      (.fullstack c.fullSrvName c.srvShort wsPathStr)
+      (hdr.pIdents.map (·.getId)) hdr.paramTypeConsts hdr.recPolicy with
     hasJoinSnapshot, joinTypeConst := c.fullSrvName ++ hdr.chName.appendAfter "_Join"
     hasSend := sendInfo.hasSend
     sendParamCount := sendInfo.spIdents.size, sendParamTypeConsts := sendInfo.sendParamTypeConsts
     sendReqConst := sendInfo.sendReqConst?, sendReqLabel := sendInfo.sendReqLabel
     requiresAuth := hdr.reqs.requiresAuth, clientReqConst := hdr.reqs.clientReqConst?
     clientReqLabel := hdr.reqs.clientReqLabel, hasEnsures := hdr.ensConst?.isSome
-    ensPredConst := hdr.ensConst?, defaultReconnect := hdr.recPolicy
-    keyHelperConst := c.fullSrvName ++ hdr.chName.appendAfter "_key"
-    subHelperConst := c.fullSrvName ++ hdr.chName.appendAfter "_sub"
-    sendHelperConst
-    unsubHelperConst := c.fullSrvName ++ hdr.chName.appendAfter "_unsub"
+    ensPredConst := hdr.ensConst?, sendHelperConst
   }
   return some arms
 

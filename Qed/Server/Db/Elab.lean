@@ -22,7 +22,6 @@ open Qed.Lang
     - Persistent `databaseRegistry` metadata for `server` `use db : <Name>` lowering -/
 
 private structure ParsedCol where
-  ref          : Lean.Syntax
   ident        : Lean.Ident
   colName      : String
   tyTerm       : Lean.Term
@@ -37,7 +36,6 @@ private structure ParsedCol where
   whereExprs   : Array Lean.Syntax
 
 private structure ParsedTable where
-  ref           : Lean.Syntax
   ident         : Lean.Ident
   tableName     : String
   cols          : Array ParsedCol
@@ -58,15 +56,12 @@ private def parseEndpointSpec (stx : Syntax) (pinEnv? : Option Qed.Cloud.DeployE
   let scope : Qed.Cloud.SecretScope := match pinEnv? with
     | some e => .pinned e
     | none   => .envScoped
-  let optStrLit : Option String → CommandElabM Term
-    | some d => `(some $(Syntax.mkStrLit d))
-    | none   => `(none)
   let readRef (s : Syntax) (recordSec := true) (onlyIfNoDefault := false) :
       CommandElabM (Term × Term × String × Option String) := do
     let er ← parseQedEnvRef "database" s
     if recordSec && er.isSecret && (!onlyIfNoDefault || er.default?.isNone) then
       secsRef.modify (·.push er.envKey)
-    return (Syntax.mkStrLit er.envKey, ← optStrLit er.default?, er.envKey, er.default?)
+    return (quote er.envKey, quote er.default?, er.envKey, er.default?)
   let (epT, spec) : (Term × Qed.Cloud.DbEnvSpec) ←
     if k == ``dbEpUrl then
       let (kT, _, kS, _) ← readRef (stx.getArg 1)
@@ -121,8 +116,6 @@ private partial def lowerDbExpr (colNames : Array String) (rowVar : Ident)
   let hooks : LowerHooks CommandElabM := { LowerHooks.mkDefault fail with
     lowerIdent := fun ref id mode => do
       let comps := id.getId.eraseMacroScopes.components
-      let foldProjs (base : Term) (rest : List Name) : CommandElabM Term :=
-        rest.foldlM (init := base) fun acc f => `(($acc).$(mkIdentFrom ref f):ident)
       let t ← match comps with
         | [] => throwErrorAt ref "empty identifier in database predicate"
         | root :: rest =>
@@ -130,12 +123,12 @@ private partial def lowerDbExpr (colNames : Array String) (rowVar : Ident)
             if rest.isEmpty && rs == "true" then if mode == .propInv then `(True) else `(true)
             else if rest.isEmpty && rs == "false" then if mode == .propInv then `(False) else `(false)
             else if rest.isEmpty && rs == "none" then `(Option.none)
-            else if rs == "row" then foldProjs ⟨rowVar.raw⟩ rest
+            else if rs == "row" then foldProjTerms ref ⟨rowVar.raw⟩ rest
             else if rs == "ctx" then
               let some cv := ctxVar?
                 | throwErrorAt ref "`ctx` is only in scope inside `policy ... requires ...`"
-              foldProjs ⟨cv.raw⟩ rest
-            else if colNames.contains rs then foldProjs (← `($rowVar.$(mkIdentFrom ref root))) rest
+              foldProjTerms ref ⟨cv.raw⟩ rest
+            else if colNames.contains rs then foldProjTerms ref (← `($rowVar.$(mkIdentFrom ref root))) rest
             else pure ⟨id.raw⟩
       if mode == .propInv && comps != [`true] && comps != [`false] then `(qedAsProp($t)) else pure t
     lowerProj := fun _ base field mode => do
@@ -247,15 +240,12 @@ def elabDatabaseCmd : CommandElab := fun stx => do
   let mut tables         : Array ParsedTable := #[]
   let dbShort := dbName.toString
 
-  let pushSecrets (secs : Array String) (cur : Array String) : Array String :=
-    secs.foldl (init := cur) fun acc s => if acc.contains s then acc else acc.push s
+  let pushSecrets (secs cur : Array String) : Array String := secs.foldl pushUnique cur
 
   let managedSpecToTerm : Qed.Cloud.DbEnvSpec → CommandElabM Term
-    | .managedPostgres nm .prod    => `(Qed.Server.Db.DbEndpoint.managedPostgres $(Syntax.mkStrLit nm) Qed.Cloud.DeployEnv.prod)
-    | .managedPostgres nm .staging => `(Qed.Server.Db.DbEndpoint.managedPostgres $(Syntax.mkStrLit nm) Qed.Cloud.DeployEnv.staging)
-    | .managedPostgres nm .preview => `(Qed.Server.Db.DbEndpoint.managedPostgres $(Syntax.mkStrLit nm) Qed.Cloud.DeployEnv.preview)
-    | .managedPostgres nm .dev     => `(Qed.Server.Db.DbEndpoint.managedPostgres $(Syntax.mkStrLit nm) Qed.Cloud.DeployEnv.dev)
-    | .ephemeralSqlite p | .byoSqlite p => `(Qed.Server.Db.DbEndpoint.sqlitePath $(Syntax.mkStrLit p))
+    | .managedPostgres nm env =>
+        `(Qed.Server.Db.DbEndpoint.managedPostgres $(quote nm) $(mkIdent (`Qed.Cloud.DeployEnv ++ Name.mkSimple env.toString)))
+    | .ephemeralSqlite p | .byoSqlite p => `(Qed.Server.Db.DbEndpoint.sqlitePath $(quote p))
     | _ => throwErrorAt dbIdent s!"internal error lowering managed database target in `database {dbName}`"
 
   let setEnvSlot (ref : Syntax) (envStr : String) (epStx : Syntax) (inManaged : Bool)
@@ -274,8 +264,7 @@ def elabDatabaseCmd : CommandElab := fun stx => do
   for c in clauses do
     let k := c.getKind
     if k == ``dbManagedClause then
-      if isManaged || primaryEp?.isSome || envSlots.prod.isSome ||
-         envSlots.staging.isSome || envSlots.preview.isSome || envSlots.dev.isSome then
+      if isManaged || primaryEp?.isSome || Qed.Cloud.DeployEnv.all.any (envSlots.get · |>.isSome) then
         throwErrorAt c s!"cannot combine `managed postgres` with other endpoint clauses in `database {dbName}` (nest overrides under `managed postgres:`)"
       isManaged := true
       hasExplicitEnv := true
@@ -363,23 +352,20 @@ def elabDatabaseCmd : CommandElab := fun stx => do
           let whereOpt := sc.getArg 4
           let whereExprs := if whereOpt.getNumArgs == 2 then (whereOpt.getArg 1).getSepArgs else #[]
           cols := cols.push {
-            ref := sc, ident := colId, colName, tyTerm, sqlColType,
+            ident := colId, colName, tyTerm, sqlColType,
             isNullable, isNat, isBytes, isPrimaryKey := isPk, isImmutable := isImm,
             isUnique := isUniq, refs?, whereExprs
           }
         else if sk == ``dbTablePolicyClause then
-          let ops := (sc.getArg 1).getSepArgs
           let exprs := (sc.getArg 3).getSepArgs
-          for opNode in ops do
-            let opName := (opNode.getArg 0).getId.eraseMacroScopes
-            if opName == `read then readPols := readPols ++ exprs
-            else if opName == `insert then insertPols := insertPols ++ exprs
-            else if opName == `update then updatePols := updatePols ++ exprs
-            else if opName == `delete then deletePols := deletePols ++ exprs
-            else if opName == `write then
-              insertPols := insertPols ++ exprs
-              updatePols := updatePols ++ exprs
-              deletePols := deletePols ++ exprs
+          for opNode in (sc.getArg 1).getSepArgs do
+            match (opNode.getArg 0).getId.eraseMacroScopes with
+            | `read   => readPols := readPols ++ exprs
+            | `insert => insertPols := insertPols ++ exprs
+            | `update => updatePols := updatePols ++ exprs
+            | `delete => deletePols := deletePols ++ exprs
+            | `write  => insertPols := insertPols ++ exprs; updatePols := updatePols ++ exprs; deletePols := deletePols ++ exprs
+            | _       => pure ()
         else if sk == ``dbTableTransInvClause then
           let targetExpr := sc.getArg 4
           let rawChains := (sc.getArg 6).getSepArgs
@@ -402,30 +388,21 @@ def elabDatabaseCmd : CommandElab := fun stx => do
       if cols.isEmpty then
         throwErrorAt tIdent s!"`table {tName}` must declare at least one column"
       tables := tables.push {
-        ref := c, ident := tIdent, tableName := tName, cols,
+        ident := tIdent, tableName := tName, cols,
         readPols, insertPols, updatePols, deletePols,
         singleInvs, transInvs, transChains, indexes
       }
     else
       throwErrorAt c s!"unexpected clause in `database {dbName}`"
 
-  let resolveSlot (e : Qed.Cloud.DeployEnv) : CommandElabM (Term × Qed.Cloud.DbEnvSpec) :=
-    match envSlots.get e with
-    | some p => pure p
-    | none   =>
-        match primaryEp? with
-        | some p => pure p
-        | none   =>
-            throwErrorAt dbIdent s!"`database {dbName}` is missing a `{e}` endpoint (specify `{e} ...`, a default endpoint, or use `managed postgres`)"
   let some _ := envSlots.prod.orElse (fun _ => primaryEp?)
     | throwErrorAt dbIdent s!"`database {dbName}` must specify an endpoint (e.g. `managed postgres`, `postgres ...`, `sqlite ...`, `url secret(\"DATABASE_URL\")`, `d1 ...`, `turso ...`, or `http ...`)"
-  let (prodEpT, prodSpec)       ← resolveSlot .prod
-  let (stagingEpT, stagingSpec) ← resolveSlot .staging
-  let (previewEpT, previewSpec) ← resolveSlot .preview
-  let (devEpT, devSpec)         ← resolveSlot .dev
-  let envSpecs : Qed.Cloud.EnvMap Qed.Cloud.DbEnvSpec := {
-    dev := devSpec, preview := previewSpec, staging := stagingSpec, prod := prodSpec
-  }
+  let resolved ← envSlots.mapM fun e slot? =>
+    match slot?.orElse (fun _ => primaryEp?) with
+    | some p => pure p
+    | none   => throwErrorAt dbIdent s!"`database {dbName}` is missing a `{e}` endpoint (specify `{e} ...`, a default endpoint, or use `managed postgres`)"
+  let envSpecs : Qed.Cloud.EnvMap Qed.Cloud.DbEnvSpec :=
+    { dev := resolved.dev.2, preview := resolved.preview.2, staging := resolved.staging.2, prod := resolved.prod.2 }
   if tables.isEmpty then
     throwErrorAt dbIdent s!"`database {dbName}` must declare at least one `table`"
 
@@ -480,9 +457,7 @@ def elabDatabaseCmd : CommandElab := fun stx => do
       rowInvBools := rowInvBools.push (← lowerDbExpr colNames rowVar none none false w)
 
     let rowInvPropTerm ← Qed.mkConjBody rowInvProps (ascribeProp := false)
-    let rowInvBoolTerm ← match rowInvBools.toList with
-      | [] => `(true)
-      | b :: rest => rest.foldlM (init := b) fun acc x => `($acc && $x)
+    let rowInvBoolTerm ← mkBoolConj rowInvBools
 
     let rowInvId := mkIdentFrom t.ident (rowTypeName ++ `RowInv)
     let rowInvBoolId := mkIdentFrom t.ident (rowTypeName ++ `rowInvBool)
@@ -528,23 +503,19 @@ def elabDatabaseCmd : CommandElab := fun stx => do
 
     -- 4. Row-Level Authorization Policies (`ReadPolicy`, `InsertPolicy`, `UpdatePolicy`, `DeletePolicy`)
     let ctxVar := mkIdent `_ctx
-    let mkPolDef (polSuffix : Name) (polExprs : Array Syntax) : CommandElabM (Ident × String) := do
-      let mut ps : Array Term := #[]
-      let mut lbls : Array String := #[]
-      for pe in polExprs do
-        ps := ps.push (← lowerDbExpr colNames rowVar none (some ctxVar) true pe)
-        lbls := lbls.push ((pe.reprint.getD "policy").trimAscii.toString)
+    let mkPolDef (polSuffix : Name) (polExprs : Array Syntax) : CommandElabM String := do
+      let ps ← polExprs.mapM (lowerDbExpr colNames rowVar none (some ctxVar) true)
       let conj ← Qed.mkConjBody ps (ascribeProp := false)
       let pid := mkIdentFrom t.ident (rowTypeName ++ polSuffix)
       elabCommand (← `(command|
         set_option linter.unusedVariables false in
         @[simp] abbrev $pid ($ctxVar:ident : Qed.Server.RequestCtx) ($rowVar:ident : $rowTypeId) : Prop := $conj))
-      return (pid, String.intercalate " and " lbls.toList)
+      return String.intercalate " and " (polExprs.toList.map fun pe => (pe.reprint.getD "policy").trimAscii.toString)
 
-    let (_, readPolLbl) ← mkPolDef `ReadPolicy t.readPols
-    let (_, insertPolLbl) ← mkPolDef `InsertPolicy t.insertPols
-    let (_, updatePolLbl) ← mkPolDef `UpdatePolicy t.updatePols
-    let (_, deletePolLbl) ← mkPolDef `DeletePolicy t.deletePols
+    let readPolLbl ← mkPolDef `ReadPolicy t.readPols
+    let insertPolLbl ← mkPolDef `InsertPolicy t.insertPols
+    let updatePolLbl ← mkPolDef `UpdatePolicy t.updatePols
+    let deletePolLbl ← mkPolDef `DeletePolicy t.deletePols
 
     -- 5. Zero-trust SQL row decoder (`decodeRow`)
     let valsVar := mkIdent `_vals
@@ -563,9 +534,8 @@ def elabDatabaseCmd : CommandElab := fun stx => do
         return { $[$fIds:ident := $fVals2:ident],* }))
 
     -- 6. TableSchema metadata + DDL / Postgres RLS
-    let optSqlStr (parts : Array String) : CommandElabM Term :=
-      if parts.isEmpty then `(none)
-      else `(some $(Syntax.mkStrLit (String.intercalate " AND " parts.toList)))
+    let optSqlStr (parts : Array String) : Term :=
+      quote (if parts.isEmpty then none else some (String.intercalate " AND " parts.toList))
     let tblSqlId ← mkSqlIdentTerm t.ident t.tableName
     let colSchemaTerms ← t.cols.mapM fun col => do
       let cSqlId ← mkSqlIdentTerm col.ident col.colName
@@ -580,13 +550,13 @@ def elabDatabaseCmd : CommandElab := fun stx => do
         col.whereExprs.filterMap (renderSqlPred? colNames false)
       `({ name := $cSqlId, colType := $cTyT, nullable := $(quote col.isNullable),
           isPrimaryKey := $(quote col.isPrimaryKey), isUnique := $(quote col.isUnique),
-          isImmutable := $(quote col.isImmutable), references? := $refT, checkSql? := $(← optSqlStr chkParts)
+          isImmutable := $(quote col.isImmutable), references? := $refT, checkSql? := $(optSqlStr chkParts)
           : Qed.Server.Db.ColumnSchema })
     let idxTerms ← t.indexes.mapM fun idxs => do
       let ids ← idxs.mapM fun ic => mkSqlIdentTerm ic ic.getId.eraseMacroScopes.toString
       `([$[$ids:term],*])
-    let rlsReadT ← optSqlStr (t.readPols.filterMap (renderSqlPred? colNames true))
-    let rlsWriteT ← optSqlStr (t.updatePols.filterMap (renderSqlPred? colNames true))
+    let rlsReadT := optSqlStr (t.readPols.filterMap (renderSqlPred? colNames true))
+    let rlsWriteT := optSqlStr (t.updatePols.filterMap (renderSqlPred? colNames true))
 
     let schemaId := mkIdentFrom t.ident (rowTypeName ++ `schema)
     elabCommand (← `(command|
@@ -602,15 +572,6 @@ def elabDatabaseCmd : CommandElab := fun stx => do
     tableInfos := tableInfos.push {
       tableName         := t.tableName
       rowTypeConst      := fullRowTypeName
-      rowInvConst       := fullRowTypeName ++ `RowInv
-      rowInvBoolConst   := fullRowTypeName ++ `rowInvBool
-      rowInvSoundConst  := fullRowTypeName ++ `rowInvBool_sound
-      transInvConst     := fullRowTypeName ++ `TransInv
-      readPolicyConst   := fullRowTypeName ++ `ReadPolicy
-      insertPolicyConst := fullRowTypeName ++ `InsertPolicy
-      updatePolicyConst := fullRowTypeName ++ `UpdatePolicy
-      deletePolicyConst := fullRowTypeName ++ `DeletePolicy
-      decodeRowConst    := fullRowTypeName ++ `decodeRow
       columns           := t.cols.map fun c => {
         name := c.colName, isPrimaryKey := c.isPrimaryKey, isImmutable := c.isImmutable,
         isUnique := c.isUnique, isNullable := c.isNullable, isNat := c.isNat,
@@ -631,7 +592,8 @@ def elabDatabaseCmd : CommandElab := fun stx => do
   let devEpTerm ← match envSlots.dev with | some (dt, _) => `(some $dt) | none => `(none)
   let envEndpointsTerm ←
     if hasExplicitEnv then
-      `(some ({ dev := $devEpT, preview := $previewEpT, staging := $stagingEpT, prod := $prodEpT } : Qed.Cloud.EnvMap Qed.Server.Db.DbEndpoint))
+      `(some ({ dev := $(resolved.dev.1), preview := $(resolved.preview.1),
+                staging := $(resolved.staging.1), prod := $(resolved.prod.1) } : Qed.Cloud.EnvMap Qed.Server.Db.DbEndpoint))
     else `(none)
   let (configId, ddlId, rlsDdlId, secretsId, ensureId, safeEnsureId, mId) :=
     (mkIdentFrom dbIdent (dbName ++ `config), mkIdentFrom dbIdent (dbName ++ `ddl),
@@ -641,7 +603,7 @@ def elabDatabaseCmd : CommandElab := fun stx => do
   for cmd in #[
     ← `(command| def $secretsId : Array String := #[$[$secLits:term],*]),
     ← `(command| def $configId : Qed.Server.Db.DbConfig := {
-        name := $(Syntax.mkStrLit dbShort), endpoint := $prodEpT,
+        name := $(Syntax.mkStrLit dbShort), endpoint := $(resolved.prod.1),
         devFallback? := $devEpTerm, envEndpoints? := $envEndpointsTerm,
         isManaged := $(quote isManaged), tables := [$[$tableSchemaTerms:term],*] }),
     ← `(command| def $ddlId (dialect : Qed.Server.Db.SqlDialect := .postgres) : String :=

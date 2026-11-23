@@ -74,6 +74,11 @@ def EnvMap.set {α : Type} (m : EnvMap α) (e : DeployEnv) (v : α) : EnvMap α 
   | .staging => { m with staging := v }
   | .prod    => { m with prod    := v }
 
+def EnvMap.mapM {m : Type → Type} [Monad m] {α β : Type} (f : DeployEnv → α → m β) (mp : EnvMap α) :
+    m (EnvMap β) := do
+  return { dev := ← f .dev mp.dev, preview := ← f .preview mp.preview,
+           staging := ← f .staging mp.staging, prod := ← f .prod mp.prod }
+
 theorem EnvMap.get_set_eq {α : Type} (m : EnvMap α) (e : DeployEnv) (v : α) :
     (m.set e v).get e = v := by
   cases e <;> rfl
@@ -132,10 +137,8 @@ inductive DbEnvSpec where
 deriving Inhabited, DecidableEq, Repr
 
 def DbEnvSpec.isEphemeral : DbEnvSpec → Bool
-  | .ephemeralSqlite _ => true
-  | .byoSqlite _       => true
-  | .byoSqliteEnv _ _  => true
-  | _                  => false
+  | .ephemeralSqlite _ | .byoSqlite _ | .byoSqliteEnv _ _ => true
+  | _ => false
 
 def DbEnvSpec.cluster? : DbEnvSpec → Option DbCluster
   | .managedPostgres _ .prod => some .prodCluster
@@ -144,12 +147,8 @@ def DbEnvSpec.cluster? : DbEnvSpec → Option DbCluster
 
 def DbEnvSpec.secrets : DbEnvSpec → List SecretRef
   | .managedPostgres dbName env => [{ envVar := managedPostgresSecretVar dbName, scope := .pinned env }]
-  | .byoPostgres s              => [s]
-  | .byoUrl s                   => [s]
-  | .byoD1 _ _ tok              => [tok]
-  | .byoTurso _ tok             => [tok]
-  | .byoHttpSql _ (some tok)    => [tok]
-  | _                           => []
+  | .byoPostgres s | .byoUrl s | .byoD1 _ _ s | .byoTurso _ s | .byoHttpSql _ (some s) => [s]
+  | _ => []
 
 /-- Known static HTTPS egress origins implied by a database transport (for default-deny firewalls). -/
 def DbEnvSpec.egressOrigins : DbEnvSpec → List String
@@ -255,8 +254,7 @@ def HostPattern.render : HostPattern → String
   | .wildcard s => "*." ++ s
 
 def HostPattern.isValid : HostPattern → Bool
-  | .exact h    => isValidHostname h
-  | .wildcard s => isValidHostname s
+  | .exact s | .wildcard s => isValidHostname s
 
 /-- Parses an exact RFC 1123 hostname or `*.<hostname>` wildcard pattern. -/
 def HostPattern.parse? (raw : String) : Option HostPattern :=

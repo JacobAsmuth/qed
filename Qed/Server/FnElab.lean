@@ -6,42 +6,32 @@ open Qed.Lang
 /-! ## `server` Command Elaborator — Context & Shared Builders (`SrvElabCtx` / `SrvElabM`) -/
 
 structure ParsedEnvDecl where
-  ref      : Lean.Syntax
   ident    : Lean.Ident
   osKey    : String
   default? : Option String
 
 structure ParsedStateDecl where
-  ref          : Lean.Syntax
   ident        : Lean.Ident
   tyTerm       : Lean.Term
   initStx?     : Option Lean.Syntax
   defaultTerm? : Option Lean.Term
 
 structure ParsedMutInv where
-  ref      : Lean.Syntax
-  name     : Lean.Ident
   fieldId  : Lean.Ident
   condStx  : Lean.Syntax
   label    : String
 
 structure ParsedInv where
-  ref      : Lean.Syntax
-  name     : Lean.Ident
   exprStx  : Lean.Syntax
   isTwoSt  : Bool
   label    : String
 
 structure ParsedDbDecl where
-  ref        : Lean.Syntax
   aliasIdent : Lean.Ident
-  dbRefIdent : Lean.Ident
   info       : DatabaseInfo
 
 structure ParsedAuthDecl where
-  ref          : Lean.Syntax
   aliasIdent   : Lean.Ident
-  authRefIdent : Lean.Ident
   info         : AuthInfo
 
 structure ParsedServerBlock where
@@ -173,20 +163,19 @@ def parseSrvParams (ctxLabel tyDescPrefix : String) (rawParams : Array Syntax)
     names := names.push pstr
   return (idents, tyTerms, names)
 
+private def lowerSrvExpr (ctx : LowerCtx) (mode : ExprMode) (stx : Syntax) : SrvElabM Term :=
+  return (← liftM <| (lowerExpr ctx mode stx).run {}).1
+
 def elabServerStateCmds (stateDecls : Array ParsedStateDecl) : SrvElabM Bool := do
   let c ← read
-  let mut stFieldIds : Array Ident := #[]
-  let mut stFieldTys : Array Term := #[]
-  let mut stInitVals : Array Term := #[]
-  let initCtx : LowerCtx := { fnName := "initState" }
-  for sd in stateDecls do
+  let stFieldIds := stateDecls.map (·.ident)
+  let stFieldTys := stateDecls.map (·.tyTerm)
+  let stInitVals ← stateDecls.mapM fun sd => do
     let initTerm ← match sd.initStx?, sd.defaultTerm? with
-      | some stx, _ => pure (← liftM <| (lowerExpr initCtx .val stx).run {}).1
+      | some stx, _ => lowerSrvExpr { fnName := "initState" } .val stx
       | none, some dt => pure dt
       | none, none => unreachable!
-    stFieldIds := stFieldIds.push sd.ident
-    stFieldTys := stFieldTys.push sd.tyTerm
-    stInitVals := stInitVals.push (← `(srvAutoField($initTerm)))
+    `(srvAutoField($initTerm))
   liftM <| elabCommand (← `(command|
     structure $(c.stateId) where
       $[$stFieldIds:ident : $stFieldTys:term]*))
@@ -195,16 +184,11 @@ def elabServerStateCmds (stateDecls : Array ParsedStateDecl) : SrvElabM Bool := 
   if (← hasSrvErrors) then return false
 
   let sParam := mkIdent `_s
-  let sOldDummy := mkIdent `_sOld
-  let mut singleProps : Array Term := #[]
-  for inv in c.invs do
-    if !inv.isTwoSt then
-      let invCtx : LowerCtx := {
-        fnName := "invariant", stateFields := c.stateFieldNames, envVars := c.envVarNames
-        stateRule := .invariantProp sParam sOldDummy false
-      }
-      let (pTerm, _) ← liftM <| (lowerExpr invCtx .propInv inv.exprStx).run {}
-      singleProps := singleProps.push pTerm
+  let invCtx : LowerCtx := {
+    fnName := "invariant", stateFields := c.stateFieldNames, envVars := c.envVarNames
+    stateRule := .invariantProp sParam (mkIdent `_sOld) false
+  }
+  let singleProps ← (c.invs.filter (!·.isTwoSt)).mapM fun inv => lowerSrvExpr invCtx .propInv inv.exprStx
   let invBody ← Qed.mkConjBody singleProps (ascribeProp := false)
   let initInvLbl := Syntax.mkStrLit ("init: " ++ singleInvLabelStr c.invs)
   liftM <| elabCommand (← `(command|
@@ -231,24 +215,24 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Synt
   let mut onSignInClause?        : Option Syntax := none
   for c in clauses do
     let k := c.getKind
+    let hasDecl (nm : Name) : Bool :=
+      dbDecls.any (·.aliasIdent.getId == nm) || authDecl?.any (·.aliasIdent.getId == nm) ||
+      envDecls.any (·.ident.getId == nm) || stateDecls.any (·.ident.getId == nm)
     if k == ``srvDbClause then
       let aliasRaw := c.getArg 1
       let aliasId : Ident := if aliasRaw.isIdent then ⟨aliasRaw⟩ else mkIdentFrom aliasRaw `auth
       let refId : Ident := ⟨(c.getArg 3)⟩
-      if dbDecls.any (·.aliasIdent.getId == aliasId.getId) ||
-         authDecl?.any (·.aliasIdent.getId == aliasId.getId) ||
-         envDecls.any (·.ident.getId == aliasId.getId) ||
-         stateDecls.any (·.ident.getId == aliasId.getId) then
+      if hasDecl aliasId.getId then
         throwErrorAt aliasId s!"duplicate declaration `{aliasId.getId}` in `server {srvName}`"
       let env ← getEnv
       let currNs ← getCurrNamespace
       let openDecls ← getOpenDecls
       if let some dbInfo := Qed.Server.lookupDatabase? env currNs openDecls refId.getId then
-        dbDecls := dbDecls.push { ref := c, aliasIdent := aliasId, dbRefIdent := refId, info := dbInfo }
+        dbDecls := dbDecls.push { aliasIdent := aliasId, info := dbInfo }
       else if let some authInfo := Qed.Server.lookupAuth? env currNs openDecls refId.getId then
         if authDecl?.isSome then
           throwErrorAt refId s!"`server {srvName}` can declare at most one `use ... : <auth>` provider"
-        authDecl? := some { ref := c, aliasIdent := aliasId, authRefIdent := refId, info := authInfo }
+        authDecl? := some { aliasIdent := aliasId, info := authInfo }
       else
         throwErrorAt refId s!"unknown `database` or `auth` `{refId.getId}` in `use {aliasId.getId} : {refId.getId}`"
     else if k == ``srvEnvClause then
@@ -257,7 +241,7 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Synt
       let def? := if (c.getArg 4).getNumArgs == 2 then some ((⟨((c.getArg 4).getArg 1)⟩ : TSyntax `str).getString) else none
       if envDecls.any (·.ident.getId == id.getId) then
         throwErrorAt id s!"duplicate `env {id.getId}` in `server {srvName}`"
-      envDecls := envDecls.push { ref := c, ident := id, osKey, default? := def? }
+      envDecls := envDecls.push { ident := id, osKey, default? := def? }
     else if k == ``srvStateClause then
       let id : Ident := ⟨(c.getArg 1)⟩
       let ty ← liftMacroM <| lowerSrvType (c.getArg 3) (allowFallible := false) s!"state field `{id.getId}`"
@@ -268,19 +252,17 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Synt
         else match ← liftMacroM (inferQedTypeDefault? (c.getArg 3)) with
           | some dt => pure (none, some dt)
           | none    => throwErrorAt id s!"state field `{id.getId}` requires an initial value `= ...`"
-      stateDecls := stateDecls.push { ref := c, ident := id, tyTerm := ty.term, initStx?, defaultTerm? }
+      stateDecls := stateDecls.push { ident := id, tyTerm := ty.term, initStx?, defaultTerm? }
     else if k == ``srvInvMutatingClause || k == ``srvInvClause then
       let nameId : Ident := ⟨c.getArg 1⟩
       if seenInvNames.contains nameId.getId then
         throwErrorAt nameId s!"duplicate invariant `{nameId.getId}` in `server {srvName}`"
       seenInvNames := seenInvNames.push nameId.getId
       if k == ``srvInvMutatingClause then
-        mutInvs := mutInvs.push {
-          ref := c, name := nameId, fieldId := ⟨c.getArg 4⟩, condStx := c.getArg 6, label := s!"mutating:{nameId.getId}"
-        }
+        mutInvs := mutInvs.push { fieldId := ⟨c.getArg 4⟩, condStx := c.getArg 6, label := s!"mutating:{nameId.getId}" }
       else
         for e in (c.getArg 3).getSepArgs do
-          invs := invs.push { ref := c, name := nameId, exprStx := e, isTwoSt := exprCallsOld e, label := nameId.getId.toString }
+          invs := invs.push { exprStx := e, isTwoSt := exprCallsOld e, label := nameId.getId.toString }
     else if k == ``srvFnClause then fnClauses := fnClauses.push c
     else if k == ``srvChannelClause then chanClauses := chanClauses.push c
     else if k == ``srvHttpRouteClause || k == ``srvStreamClause then httpClauses := httpClauses.push c
@@ -293,10 +275,9 @@ def parseServerClauses (srvIdent : Ident) (srvName : Name) (clauses : Array Synt
       onSignInClause? := some c
     else
       throwErrorAt c "unexpected clause in `server` block"
-  if let some c := onCreateAccountClause? then
-    if authDecl?.isNone then throwErrorAt c s!"`onCreateAccount` in `server {srvName}` requires `use auth : <Auth>`"
-  if let some c := onSignInClause? then
-    if authDecl?.isNone then throwErrorAt c s!"`onSignIn` in `server {srvName}` requires `use auth : <Auth>`"
+  for (hookNm, hook?) in #[("onCreateAccount", onCreateAccountClause?), ("onSignIn", onSignInClause?)] do
+    if let some c := hook? then
+      if authDecl?.isNone then throwErrorAt c s!"`{hookNm}` in `server {srvName}` requires `use auth : <Auth>`"
   if fnClauses.isEmpty && chanClauses.isEmpty && httpClauses.isEmpty && jobClauses.isEmpty &&
      onCreateAccountClause?.isNone && onSignInClause?.isNone then
     throwErrorAt srvIdent s!"`server {srvName}` must declare at least one `def`, `channel`, `http`, `stream`, `every` job, or auth hook"
@@ -358,7 +339,6 @@ def wrapReqs (reqProps : Array Term) (reqHIds : Array Ident) (reqLbls : Array St
 structure LoweredRequires where
   reqPropTerms    : Array Term
   reqHypIds       : Array Ident
-  reqHypTys       : Array Term
   reqLabels       : Array String
   requiresAuth    : Bool
   clientReqId?    : Option Ident
@@ -374,13 +354,11 @@ def elabRequiresClauses (refIdent : Ident) (itemName : Name)
   let c ← read
   let mut reqPropTerms : Array Term := #[]
   let mut reqHypIds : Array Ident := #[]
-  let mut reqHypTys : Array Term := #[]
   let mut reqLabels : Array String := #[]
   let mut clientReqProps : Array Term := #[]
   let mut clientReqLabels : Array String := #[]
   let mut requiresAuth := false
-  for idx in [0:reqExprs.size] do
-    let rExpr := reqExprs[idx]!
+  for (rExpr, idx) in reqExprs.zipIdx do
     if exprHasAwait rExpr then throwErrorAt rExpr "`requires` precondition cannot contain `await`"
     let reqCtx : LowerCtx := {
       fnName := fnLabel, stateFields := c.stateFieldNames, envVars := c.envVarNames,
@@ -390,7 +368,6 @@ def elabRequiresClauses (refIdent : Ident) (itemName : Name)
     recordSrvExtRoots rSt.extRoots
     reqPropTerms := reqPropTerms.push pTerm
     reqHypIds := reqHypIds.push (mkIdent (Name.mkSimple s!"{hypPrefix}{idx}"))
-    reqHypTys := reqHypTys.push pTerm
     reqLabels := reqLabels.push ((rExpr.reprint.getD "requires").trimAscii.toString)
     for conj in splitAndStx rExpr do
       let (mentionsCtx, mentionsEnv) := scanCtxEnv c.envVarNames serverLocals conj
@@ -402,8 +379,7 @@ def elabRequiresClauses (refIdent : Ident) (itemName : Name)
             fnName := fnLabel, stateFields := c.stateFieldNames, locals := clientLocals,
             stateRule := .forbidInRequires, forbidCtxEnv := true
           }
-          let (cpTerm, _) ← liftM <| (lowerExpr cliReqCtx .propInv conj).run {}
-          clientReqProps := clientReqProps.push cpTerm
+          clientReqProps := clientReqProps.push (← lowerSrvExpr cliReqCtx .propInv conj)
           clientReqLabels := clientReqLabels.push ((conj.reprint.getD "requires").trimAscii.toString)
   let (clientReqId?, clientReqConst?) ←
     if clientReqProps.isEmpty then pure (none, none)
@@ -416,7 +392,7 @@ def elabRequiresClauses (refIdent : Ident) (itemName : Name)
         @[simp] abbrev $cid $[($clientBindIds:ident : $clientBindTys:term)]* : Prop := $reqConj))
       pure (some cid, some (c.fullSrvName ++ leaf))
   return {
-    reqPropTerms, reqHypIds, reqHypTys, reqLabels, requiresAuth,
+    reqPropTerms, reqHypIds, reqLabels, requiresAuth,
     clientReqId?, clientReqConst?,
     clientReqLabel := String.intercalate " && " clientReqLabels.toList
   }
@@ -427,17 +403,14 @@ def elabEnsuresAbbrev (ownerIdent : Ident) (fnLabel : String) (binderName : Name
     SrvElabM (Option (Option (Ident × Name × String))) := do
   if ensExprs.isEmpty then return some none
   let c ← read
-  let mut ensProps : Array Term := #[]
-  let mut ensLabels : Array String := #[]
-  for eExpr in ensExprs do
+  let ensCtx : LowerCtx := {
+    fnName := fnLabel, stateFields := c.stateFieldNames, envVars := c.envVarNames,
+    locals := paramNames.push binderName.toString, stateRule := .forbidInEnsures, forbidCtxEnv := true
+  }
+  let ensProps ← ensExprs.mapM fun eExpr => do
     if exprHasAwait eExpr then throwErrorAt eExpr "`ensures` postcondition cannot contain `await`"
-    let ensCtx : LowerCtx := {
-      fnName := fnLabel, stateFields := c.stateFieldNames, envVars := c.envVarNames,
-      locals := paramNames.push binderName.toString, stateRule := .forbidInEnsures, forbidCtxEnv := true
-    }
-    let (pTerm, _) ← liftM <| (lowerExpr ensCtx .propInv eExpr).run {}
-    ensProps := ensProps.push pTerm
-    ensLabels := ensLabels.push ((eExpr.reprint.getD "ensures").trimAscii.toString)
+    lowerSrvExpr ensCtx .propInv eExpr
+  let ensLabels := ensExprs.toList.map fun e => (e.reprint.getD "ensures").trimAscii.toString
   let leaf := ownerIdent.getId.appendAfter "_ens"
   let ensId := mkIdentFrom ownerIdent (c.srvName ++ leaf)
   let resIdent := mkIdent binderName
@@ -447,7 +420,7 @@ def elabEnsuresAbbrev (ownerIdent : Ident) (fnLabel : String) (binderName : Name
     @[simp] abbrev $ensId $[($pIdents:ident : $pTyTerms:term)]* ($resIdent:ident : $resTyTerm) : Prop :=
       $ensConj))
   if (← hasSrvErrors) then return none
-  return some (some (ensId, c.fullSrvName ++ leaf, String.intercalate " && " ensLabels.toList))
+  return some (some (ensId, c.fullSrvName ++ leaf, String.intercalate " && " ensLabels))
 
 private partial def scanFailCallsAux (stx : Syntax) (tags : Array Ident) (hasPlain : Bool) :
     CommandElabM (Array Ident × Bool) := do
@@ -506,26 +479,24 @@ private def collectServerSecretsAndExts : SrvElabM (Array String × Array String
   let allExtRoots ← c.extRootsRef.get
   let mut reqSecrets : Array String := #[]
   let mut ownSecrets : Array String := #[]
-  let pushSec (s : String) (arr : Array String) := if arr.contains s then arr else arr.push s
   for dbd in c.dbDecls do
     let es := dbd.info.envSpecs
-    let uniformNonDev := es.prod == es.staging && es.prod == es.preview
-    if !dbd.info.hasDevFallback && uniformNonDev then
-      reqSecrets := dbd.info.secrets.foldl (fun a s => pushSec s a) reqSecrets
+    if !dbd.info.hasDevFallback && es.prod == es.staging && es.prod == es.preview then
+      reqSecrets := dbd.info.secrets.foldl pushUnique reqSecrets
   for ed in c.envDecls do
     if ed.default?.isNone then
-      reqSecrets := pushSec ed.osKey reqSecrets
-      ownSecrets := pushSec ed.osKey ownSecrets
+      reqSecrets := pushUnique reqSecrets ed.osKey
+      ownSecrets := pushUnique ownSecrets ed.osKey
   if let some ad := c.authDecl? then
     if !ad.info.spec.isManaged then
-      reqSecrets := ad.info.secrets.foldl (fun a s => pushSec s a) reqSecrets
+      reqSecrets := ad.info.secrets.foldl pushUnique reqSecrets
   let mut usedExts : Array (String × String) := #[]
   for root in allExtRoots do
     if let some extInfo := Qed.Diag.lookupNameMapExt? externalRegistry env currNs openDecls root then
       let sStr := root.toString
       unless usedExts.any (·.1 == sStr) do usedExts := usedExts.push (sStr, extInfo.baseOrigin)
-      reqSecrets := extInfo.secrets.foldl (fun a s => pushSec s a) reqSecrets
-      ownSecrets := extInfo.secrets.foldl (fun a s => pushSec s a) ownSecrets
+      reqSecrets := extInfo.secrets.foldl pushUnique reqSecrets
+      ownSecrets := extInfo.secrets.foldl pushUnique ownSecrets
   return (reqSecrets, ownSecrets, usedExts)
 
 /-- Wraps `innerRun` (and optionally a `ProgPreservesInv` proof) with `readEnv` bindings for `envDecls`. -/
@@ -629,8 +600,9 @@ def elabServerDispatchCmds
       let (authUserVar, hFromCtxVar, hAuthId, hAuthEqId) := (mkIdent `_authUser, mkIdent `_hFromCtx, mkIdent `_hAuth, mkIdent `_hAuthEq)
       let fromCtxId := mkIdentFrom c.srvIdent (authDecl.info.authName ++ `fromCtx)
       let fromCtxUserIdThm := mkIdentFrom c.srvIdent (authDecl.info.authName ++ `fromCtx_userId)
-      let createBody ← match onCreateRun? with | some t => pure t | none => `(Pure.pure (Except.ok ()))
-      let signInBody ← match onSignInRun? with | some t => pure t | none => `(Pure.pure (Except.ok ()))
+      let emptyOk ← `(Pure.pure (Except.ok ()))
+      let createBody := onCreateRun?.getD emptyOk
+      let signInBody := onSignInRun?.getD emptyOk
       let authBody ← `(
         match $hFromCtxVar:ident : $fromCtxId $(c.ctxId) with
         | Option.none => Pure.pure (Except.error (Qed.Server.ApiError.unauthorized "missing authenticated user"))
@@ -686,13 +658,12 @@ def elabServerFnInvariants (isAsync : Bool) (fnStr : String) (fnIdent targetId :
         fnName := "invariant", stateFields := c.stateFieldNames, envVars := c.envVarNames
         stateRule := .invariantProp sNewId sOldId false
       }
-      let relProp := (← liftM <| (lowerExpr twoCtx .propInv inv.exprStx).run {}).1
+      let relProp ← lowerSrvExpr twoCtx .propInv inv.exprStx
       let pureGoal ← `(Qed.Server.srvWithNewState (($targetCall).1) (fun ($sNewId:ident : $(c.stateId)) => $relProp))
       unless (← emitStepRelInv s!"_twoInv{twoIdx}" inv.label relProp pureGoal) do return false
       twoIdx := twoIdx + 1
   for (mi, mutIdx) in c.mutInvs.zipIdx do
-    let miCtx : LowerCtx := { fnName := fnStr, envVars := c.envVarNames }
-    let miProp := (← liftM <| (lowerExpr miCtx .propInv mi.condStx).run {}).1
+    let miProp ← lowerSrvExpr { fnName := fnStr, envVars := c.envVarNames } .propInv mi.condStx
     let fldId := mi.fieldId
     let asyncRel ← `(($sNewId).$fldId:ident = ($sOldId).$fldId:ident ∨ $miProp)
     let pureGoal ← `((($targetCall).1).$fldId:ident = ($sOldId).$fldId:ident ∨ $miProp)
@@ -736,6 +707,13 @@ def elabServerHandler (isAsync : Bool) (fnStr : String) (fnIdent : Ident)
   let callArgs : Array Term := c.envIdents.map (⟨·.raw⟩) ++ #[ctxArg?.getD ⟨c.ctxId.raw⟩] ++ extraCallArgs
   let fnLit := Syntax.mkStrLit fnStr
   let hasEmit := blockHasEmit bodyStmts
+  let invThmId := mkIdentFrom fnIdent (c.srvName ++ fnIdent.getId.appendAfter "_inv")
+  let singleInvLbl := Syntax.mkStrLit (singleInvLabelStr c.invs)
+  let deferInvProofs (isAsync : Bool) (targetId : Ident) (targetCall : Term) (invCmd : Command) : SrvElabM Unit :=
+    deferSrvProof do
+      elabCommand invCmd
+      if hasNewErrors (← get).messages c.priorRep c.priorUnrep then return false
+      (elabServerFnInvariants isAsync fnStr fnIdent targetId allBinderIds allBinderTys targetCall).run c
   if c.hasState && !isAsync then
     let s0Id := mkIdent `_s0
     let es0Id := mkIdent `_es0
@@ -765,17 +743,11 @@ def elabServerHandler (isAsync : Bool) (fnStr : String) (fnIdent : Ident)
             ($stepCall).1 = $s0Id := by
           qedSrvProveStep [$stepId] $fnLit $roLbl))
     else
-      let invThmId := mkIdentFrom fnIdent (c.srvName ++ fnIdent.getId.appendAfter "_inv")
-      let singleInvLbl := Syntax.mkStrLit (singleInvLabelStr c.invs)
-      let invCmd ← `(command|
+      deferInvProofs false stepId stepCall (← `(command|
         theorem $invThmId ($s0Id:ident : $(c.stateId)) $[($allBinderIds:ident : $allBinderTys:term)]*
             (_hInv : $(c.stateInvId) $s0Id) :
             $(c.stateInvId) ($stepCall).1 := by
-          qedSrvProveStep [$(c.stateInvId), $stepId] $fnLit $singleInvLbl)
-      deferSrvProof do
-        elabCommand invCmd
-        if hasNewErrors (← get).messages c.priorRep c.priorUnrep then return false
-        (elabServerFnInvariants false fnStr fnIdent stepId allBinderIds allBinderTys stepCall).run c
+          qedSrvProveStep [$(c.stateInvId), $stepId] $fnLit $singleInvLbl))
 
     if let some ensSpec := ensSpec? then
       let ensId := ensSpec.ensId
@@ -816,17 +788,11 @@ def elabServerHandler (isAsync : Bool) (fnStr : String) (fnIdent : Ident)
 
     let hCall ← mkAppTerms handlerId (allBinderIds.map (⟨·.raw⟩))
     if c.hasState then
-      let asyncInvId := mkIdentFrom fnIdent (c.srvName ++ fnIdent.getId.appendAfter "_inv")
-      let singleInvLbl := Syntax.mkStrLit (singleInvLabelStr c.invs)
-      let invCmd ← `(command|
-        theorem $asyncInvId $[($allBinderIds:ident : $allBinderTys:term)]* :
+      deferInvProofs true handlerId hCall (← `(command|
+        theorem $invThmId $[($allBinderIds:ident : $allBinderTys:term)]* :
             Qed.Server.ProgPreservesInv $(c.stateInvId)
               ($hCall : Qed.Server.ThreadProg $(c.stateId) _) := by
-          qedSrvProveAsync $handlerId [$(c.stateInvId)] $fnLit $singleInvLbl)
-      deferSrvProof do
-        elabCommand invCmd
-        if hasNewErrors (← get).messages c.priorRep c.priorUnrep then return false
-        (elabServerFnInvariants true fnStr fnIdent handlerId allBinderIds allBinderTys hCall).run c
+          qedSrvProveAsync $handlerId [$(c.stateInvId)] $fnLit $singleInvLbl))
 
     if let some ensSpec := ensSpec? then
       let (invT, tyT, extra) ← if c.hasState then pure (⟨c.stateInvId.raw⟩, ⟨c.stateId.raw⟩, #[c.stateInvId])

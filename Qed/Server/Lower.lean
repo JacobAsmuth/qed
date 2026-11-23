@@ -89,7 +89,7 @@ structure LowerCtx where
 
 inductive HoistedStep where
   | awaitUnwrap (ref : Lean.Syntax) (tmp : Lean.Ident) (callTerm : Lean.Term)
-  | pureUnwrap  (ref : Lean.Syntax) (tmp : Lean.Ident) (valTerm : Lean.Term)
+  | pureUnwrap  (tmp : Lean.Ident) (valTerm : Lean.Term)
 
 structure LowerState where
   nextId       : Nat := 0
@@ -105,13 +105,11 @@ private def freshIdent (prefixStr : String) : LowerM Lean.Ident := do
   modify fun s => { s with nextId := s.nextId + 1 }
   return Lean.mkIdent (Lean.Name.mkSimple s!"{prefixStr}{st.nextId}")
 
-private def recordMutated (f : String) : LowerM Unit := do
-  modify fun s =>
-    if s.mutated.contains f then s else { s with mutated := s.mutated.push f }
+private def recordMutated (f : String) : LowerM Unit :=
+  modify fun s => { s with mutated := pushUnique s.mutated f }
 
-private def recordExtRoot (n : Lean.Name) : LowerM Unit := do
-  modify fun s =>
-    if s.extRoots.contains n then s else { s with extRoots := s.extRoots.push n }
+private def recordExtRoot (n : Lean.Name) : LowerM Unit :=
+  modify fun s => { s with extRoots := pushUnique s.extRoots n }
 
 /-! ## Static AST Queries (`exprHasAwait`, `blockHasAwait`, `allPathsReturn`) -/
 
@@ -233,7 +231,9 @@ end
 
 /-! ## Expression Lowering (`lowerExpr`) -/
 
-open Lean Elab Command in
+section ExprLowering
+open Lean Elab Command
+
 private def peelIdentTrailingQ (id : Ident) : (Ident × Nat) :=
   let raw := id.getId.toString
   let chars := raw.toList
@@ -245,7 +245,6 @@ private def peelIdentTrailingQ (id : Ident) : (Ident × Nat) :=
     let baseName := (baseStr.splitOn ".").foldl (fun acc seg => Name.str acc seg) .anonymous
     (mkIdentFrom id baseName, qCount)
 
-open Lean Elab Command in
 private def checkStateRead (ref : Syntax) (ctx : LowerCtx) (field : String) : LowerM Ident := do
   match ctx.stateRule with
   | .pureStep sv _ => return sv
@@ -259,7 +258,6 @@ private def checkStateRead (ref : Syntax) (ctx : LowerCtx) (field : String) : Lo
   | .statelessServer =>
       throwErrorAt ref s!"unknown identifier `{field}`"
 
-open Lean Elab Command in
 private def resolveStateFieldBase (ref : Syntax) (ctx : LowerCtx) (field : Name) : LowerM Term := do
   let sv ← checkStateRead ref ctx field.toString
   if let .pureStep _ ovs := ctx.stateRule then
@@ -267,11 +265,6 @@ private def resolveStateFieldBase (ref : Syntax) (ctx : LowerCtx) (field : Name)
       return ⟨mkIdentFrom ref ovId.getId⟩
   `(($sv).$(mkIdentFrom ref field):ident)
 
-open Lean Elab Command in
-private def foldProjections (ref : Syntax) (base : Term) (fields : List Name) : LowerM Term :=
-  fields.foldlM (init := base) fun acc f => `(($acc).$(mkIdentFrom ref f):ident)
-
-open Lean Elab Command in
 private def resolveDottedIdent (ref : Syntax) (ctx : LowerCtx) (id : Ident) : LowerM Term := do
   match id.getId.components with
   | [] => throwErrorAt ref "empty identifier"
@@ -281,35 +274,36 @@ private def resolveDottedIdent (ref : Syntax) (ctx : LowerCtx) (id : Ident) : Lo
       else if rest.isEmpty && rStr == "false" then `(false)
       else if rest.isEmpty && rStr == "none" then `(none)
       else if ctx.locals.contains rStr then
-        foldProjections ref ⟨mkIdentFrom ref root⟩ rest
+        foldProjTerms ref ⟨mkIdentFrom ref root⟩ rest
       else if rStr == "ctx" || ctx.envVars.contains rStr then
         if ctx.forbidCtxEnv then
           let what := if rest.isEmpty && rStr != "ctx" then s!"`env` binding `{rStr}`" else s!"`{rStr}`"
           throwErrorAt ref s!"`ensures` postcondition in `{ctx.fnName}` cannot reference {what} because client decoders re-verify `ensures` on the wire"
-        foldProjections ref ⟨mkIdentFrom ref root⟩ rest
+        foldProjTerms ref ⟨mkIdentFrom ref root⟩ rest
       else if ctx.stateFields.contains rStr then
         let base ← resolveStateFieldBase ref ctx root
-        foldProjections ref base rest
+        foldProjTerms ref base rest
       else
         if !rest.isEmpty then recordExtRoot root
         return ⟨id⟩
 
-open Lean Elab Command in
+private def checkAllowUnwrap (ref : Syntax) (ctx : LowerCtx)
+    (msg : String := s!"operator `?` cannot be used here in `{ctx.fnName}` (return type must be `T!` or `T?`, and `?` cannot appear inside lambdas or invariants)") :
+    CommandElabM Unit := do
+  unless ctx.allowUnwrap do throwErrorAt ref msg
+
 private def hoistPureUnwraps (ref : Syntax) (ctx : LowerCtx) (qCount : Nat) (term0 : Term) : LowerM Term := do
   if qCount == 0 then return term0
-  unless ctx.allowUnwrap do
-    throwErrorAt ref s!"operator `?` cannot be used here in `{ctx.fnName}` (return type must be `T!` or `T?`, and `?` cannot appear inside lambdas or invariants)"
+  liftM <| checkAllowUnwrap ref ctx
   let mut term := term0
   for _ in [0:qCount] do
     let tmp ← freshIdent "_srvUnw"
-    modify fun s => { s with hoisted := s.hoisted.push (.pureUnwrap ref tmp term) }
+    modify fun s => { s with hoisted := s.hoisted.push (.pureUnwrap tmp term) }
     term := ⟨tmp⟩
   return term
 
-open Lean Elab Command in
 private abbrev SrvExprM := ReaderT LowerCtx LowerM
 
-open Lean Elab Command in
 private partial def lowerJsonPayload (go : ExprMode → Syntax → SrvExprM Term) (stx : Syntax) : SrvExprM Term := do
   let u := unwrapParens1 stx
   if u.getKind == ``qedRecLit && (u.getArg 1).getNumArgs != 2 then
@@ -327,7 +321,6 @@ private partial def lowerJsonPayload (go : ExprMode → Syntax → SrvExprM Term
     let v ← go .val stx
     `(Qed.toJson $v)
 
-open Lean Elab Command in
 private def lowerSrvCallHook (stx calleeStx : Syntax) (rawArgs : Array Syntax) (mode : ExprMode)
     (go : ExprMode → Syntax → SrvExprM Term) : SrvExprM (Option Term) := do
   let ctx ← read
@@ -376,32 +369,26 @@ private def lowerSrvCallHook (stx calleeStx : Syntax) (rawArgs : Array Syntax) (
     let shadowed := ctx.locals.contains fnName || ctx.stateFields.contains fnName || ctx.envVars.contains fnName
     if !shadowed && (fnName == "text" || fnName == "json" || fnName == "html" || fnName == "bytes" || fnName == "redirect") then
       let (posArgs, namedArgs) ← splitCallArgs fnName rawArgs (some ["status"])
-      let statusStx? := (namedArgs.find? (·.1 == "status")).map Prod.snd
-      let defaultStatus : Nat := if fnName == "redirect" then 302 else 200
-      let stT ← match statusStx? with
+      let stT ← match findNamedArg? namedArgs "status" with
         | some s => go .val s
-        | none   => let lit := Syntax.mkNumLit (toString defaultStatus); liftM (show CommandElabM Term from `(($lit : Nat)))
+        | none   => liftM (show CommandElabM Term from `(($(quote (if fnName == "redirect" then 302 else 200)) : Nat)))
       if fnName == "bytes" then
         if posArgs.size != 2 then
           throwErrorAt stx "`bytes(contentType, body[, status = 200])` expects a content type and body"
         return some (← `(Qed.Server.HttpResponse.bytes $(← go .val posArgs[0]!) $(← go .val posArgs[1]!) $stT))
-      else
-        if posArgs.size != 1 then
-          throwErrorAt stx s!"`{fnName}(...)` expects one positional argument (and optional `status = ...`)"
-        match fnName with
-        | "text"     => return some (← `(Qed.Server.HttpResponse.text $(← go .val posArgs[0]!) $stT))
-        | "json"     => return some (← `(Qed.Server.HttpResponse.jsonOf $(← lowerJsonPayload go posArgs[0]!) $stT))
-        | "html"     => return some (← `(Qed.Server.HttpResponse.html $(← go .val posArgs[0]!) $stT))
-        | "redirect" => return some (← `(Qed.Server.HttpResponse.redirect $(← go .val posArgs[0]!) $stT))
-        | _          => pure ()
+      if posArgs.size != 1 then
+        throwErrorAt stx s!"`{fnName}(...)` expects one positional argument (and optional `status = ...`)"
+      let argT ← if fnName == "json" then lowerJsonPayload go posArgs[0]! else go .val posArgs[0]!
+      let ctor := mkIdent <| match fnName with
+        | "text" => `Qed.Server.HttpResponse.text | "json" => `Qed.Server.HttpResponse.jsonOf
+        | "html" => `Qed.Server.HttpResponse.html | _ => `Qed.Server.HttpResponse.redirect
+      return some (← `($ctor $argT $stT))
   return none
 
-open Lean Elab Command in
 private def checkAllowAwait (ref : Syntax) : SrvExprM Unit := do
   unless (← read).allowAwait do
     throwErrorAt ref "`await` cannot be used inside an `atomic` block, lambda, `requires`, or `invariant`; perform external I/O outside `atomic`"
 
-open Lean Elab Command in
 private def hoistAwaitUnwrap (recGo : ExprMode → Syntax → SrvExprM Term)
     (stx awaitRef callStx : Syntax) (mode : ExprMode) : SrvExprM Term := do
   checkAllowAwait awaitRef
@@ -410,12 +397,10 @@ private def hoistAwaitUnwrap (recGo : ExprMode → Syntax → SrvExprM Term)
   modify fun s => { s with hoisted := s.hoisted.push (.awaitUnwrap stx tmp callTerm) }
   liftMacroM (finishTermMode mode ⟨tmp⟩)
 
-open Lean Elab Command in
 private def lowerSrvUnwrapHook (recGo : ExprMode → Syntax → SrvExprM Term)
     (stx innerRaw : Syntax) (mode : ExprMode) : SrvExprM Term := do
   let ctx ← read
-  unless ctx.allowUnwrap do
-    throwErrorAt stx s!"operator `?` cannot be used here in `{ctx.fnName}` (return type must be `T!` or `T?`, and `?` cannot appear inside lambdas or invariants)"
+  liftM <| checkAllowUnwrap stx ctx
   let inner := unwrapParens1 innerRaw
   if inner.getKind == ``qedAwait then
     hoistAwaitUnwrap recGo stx inner (inner.getArg 1) mode
@@ -423,20 +408,18 @@ private def lowerSrvUnwrapHook (recGo : ExprMode → Syntax → SrvExprM Term)
     let term ← liftM <| hoistPureUnwraps stx ctx 1 (← recGo .val innerRaw)
     liftMacroM (finishTermMode mode term)
 
-open Lean Elab Command in
 private def lowerSrvAwaitHook (recGo : ExprMode → Syntax → SrvExprM Term)
     (stx argRaw : Syntax) (mode : ExprMode) : SrvExprM Term := do
   checkAllowAwait stx
   let inner := unwrapParens1 argRaw
   if inner.getKind == ``qedUnwrap then
     let ctx ← read
-    unless ctx.allowUnwrap do
-      throwErrorAt stx s!"operator `?` cannot be used in `{ctx.fnName}` because its return type is neither fallible (`T!`) nor optional (`T?`); handle the `await` error with `let x = await ... catch err:`"
+    liftM <| checkAllowUnwrap stx ctx
+      s!"operator `?` cannot be used in `{ctx.fnName}` because its return type is neither fallible (`T!`) nor optional (`T?`); handle the `await` error with `let x = await ... catch err:`"
     hoistAwaitUnwrap recGo stx stx (inner.getArg 0) mode
   else
     throwErrorAt stx "unhandled fallible `await` expression; append `?` to propagate errors or use `let x = await ... catch err:` to handle them inline"
 
-open Lean Elab Command in
 private def mkSrvLowerHooks (recGo : ExprMode → Syntax → SrvExprM Term) : LowerHooks SrvExprM :=
   { LowerHooks.mkDefault (fun ref msg => throwErrorAt ref msg) with
     lowerIdent := fun stx id mode => do
@@ -463,23 +446,23 @@ private def mkSrvLowerHooks (recGo : ExprMode → Syntax → SrvExprM Term) : Lo
     useDirectArray := true
     freshIdent := fun pfx => liftM <| freshIdent pfx }
 
-open Lean Elab Command in
 private partial def lowerExprM (mode : ExprMode) (stx : Syntax) : SrvExprM Term :=
   lowerQedExpr (mkSrvLowerHooks lowerExprM) mode stx
 
-open Lean Elab Command in
 def lowerExpr (ctx : LowerCtx) (mode : ExprMode) (stx : Syntax) : LowerM Term :=
   (lowerExprM mode stx).run ctx
 
-open Lean Elab Command in
-private def lowerExprCollectingHoists (ctx : LowerCtx) (mode : ExprMode) (stx : Syntax) :
-    LowerM (Term × Array HoistedStep) := do
+private def withCollectedHoists {α : Type} (act : LowerM α) : LowerM (α × Array HoistedStep) := do
   let saved := (← get).hoisted
   modify fun s => { s with hoisted := #[] }
-  let term ← lowerExpr ctx mode stx
+  let res ← act
   let steps := (← get).hoisted
   modify fun s => { s with hoisted := saved }
-  return (term, steps)
+  return (res, steps)
+
+private def lowerExprCollectingHoists (ctx : LowerCtx) (mode : ExprMode) (stx : Syntax) :
+    LowerM (Term × Array HoistedStep) :=
+  withCollectedHoists (lowerExpr ctx mode stx)
 
 /-! ## LValue Mutation Path Parsing & Functional Lens Construction -/
 
@@ -487,7 +470,6 @@ private inductive LValStep where
   | field (id : Lean.Ident)
   | index (idxTerm : Lean.Term)
 
-open Lean Elab Command in
 private partial def parseLValPath (ctx : LowerCtx) (stx : Syntax) :
     LowerM (Ident × Array LValStep) := do
   let k := stx.getKind
@@ -519,7 +501,6 @@ private partial def parseLValPath (ctx : LowerCtx) (stx : Syntax) :
   else
     throwErrorAt stx "invalid mutation target; expected `stateField`, `stateField.sub`, or `stateField[i].sub`"
 
-open Lean Elab Command in
 private partial def withUpdatedPathCPS (steps : Array LValStep) (idx : Nat) (curVal : Term)
     (mkLeafNew : Term → LowerM Term) (k : Term → LowerM Term) : LowerM Term := do
   if h : idx < steps.size then
@@ -540,18 +521,15 @@ private partial def withUpdatedPathCPS (steps : Array LValStep) (idx : Nat) (cur
     let leafNew ← mkLeafNew curVal
     k leafNew
 
-open Lean Elab Command in
 private def getPureOverrides (ctx : LowerCtx) : Array (String × Ident) :=
   match ctx.stateRule with
   | .pureStep _ ovs => ovs
   | _ => #[]
 
-open Lean Elab Command in
 private def setPureOverride (ctx : LowerCtx) (sCur : Ident) (fld : String) (vId : Ident) : LowerCtx :=
   let ovs := (getPureOverrides ctx).filter (·.1 != fld)
   { ctx with stateRule := .pureStep sCur (ovs.push (fld, vId)) }
 
-open Lean Elab Command in
 private def materializeState (sCur : Ident) (overrides : Array (String × Ident)) : CommandElabM Term := do
   if overrides.isEmpty then
     `(($sCur))
@@ -562,12 +540,10 @@ private def materializeState (sCur : Ident) (overrides : Array (String × Ident)
 
 /-! ## Return Value Auto-Lifting & Hoist Wrapping -/
 
-open Lean Elab Command in
 private def isFailCall (stx : Syntax) : Bool :=
   let u := unwrapParens1 stx
   u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent && ((u.getArg 0).getArg 0).getId == `fail
 
-open Lean Elab Command in
 private def wrapOkValue (ctx : LowerCtx) (valTerm : Term) : CommandElabM Term := do
   let inner ← if let some innerTy := ctx.innerOptTy? then
     if valTerm.raw.isIdent && valTerm.raw.getId.eraseMacroScopes == `none then
@@ -581,25 +557,21 @@ private def wrapOkValue (ctx : LowerCtx) (valTerm : Term) : CommandElabM Term :=
   else
     `(Except.ok $inner)
 
-open Lean Elab Command in
 private def errTyOf (ctx : LowerCtx) : CommandElabM Term :=
   match ctx.domainErrTy? with
   | some et => `(Qed.Server.SrvFailure $et)
   | none    => `(Qed.Server.ApiError)
 
-open Lean Elab Command in
 private def mkPureLeaf (ctx : LowerCtx) (stTerm optTerm : Term) : CommandElabM Term :=
   match ctx.emitAcc? with
   | some esId => `(($stTerm, $esId, $optTerm))
   | none      => `(($stTerm, $optTerm))
 
-open Lean Elab Command in
 private def mkPureErrLeaf (ctx : LowerCtx) (s₀ : Ident) (errTerm : Term) : CommandElabM Term :=
   match ctx.emitAcc? with
   | some _ => `(($s₀, ([] : List Qed.Server.WsEmit), some (Except.error $errTerm)))
   | none   => `(($s₀, some (Except.error $errTerm)))
 
-open Lean Elab Command in
 private def lowerEmitCall (ctx : LowerCtx) (stmt : Syntax) (chId : Ident) (rawArgs : Array Syntax) :
     LowerM (Term × Array HoistedStep) := do
   let chanNameStr := chId.getId.eraseMacroScopes.toString
@@ -608,14 +580,10 @@ private def lowerEmitCall (ctx : LowerCtx) (stmt : Syntax) (chId : Ident) (rawAr
       throwErrorAt chId s!"unknown WebSocket `channel` `{chanNameStr}` in `.emit(...)` (declared channels: [{avail}])"
   if rawArgs.size != chSig.paramCount + 1 then
     throwErrorAt stmt s!"`{chanNameStr}.emit(...)` expects {chSig.paramCount + 1} argument(s) ({chSig.paramCount} channel param(s) + 1 event), got {rawArgs.size}"
-  let mut argTerms : Array Term := #[]
-  let mut allSteps : Array HoistedStep := #[]
-  for ra in rawArgs do
+  let (argTerms, allSteps) ← withCollectedHoists <| rawArgs.mapM fun ra => do
     unless ra.getKind == ``qedCallArgPos do
       throwErrorAt ra s!"named arguments are not supported in `{chanNameStr}.emit(...)`"
-    let (at_, ss) ← lowerExprCollectingHoists ctx .val (ra.getArg 0)
-    argTerms := argTerms.push at_
-    allSteps := allSteps ++ ss
+    lowerExpr ctx .val (ra.getArg 0)
   let paramTerms := argTerms.extract 0 chSig.paramCount
   let evTerm := argTerms[chSig.paramCount]!
   let mut call ← mkAppTerms (chSig.mkEmitId : Term) paramTerms
@@ -623,6 +591,8 @@ private def lowerEmitCall (ctx : LowerCtx) (stmt : Syntax) (chId : Ident) (rawAr
   if chSig.hasEnsures then
     call ← `($call (srvAutoEmit(True)))
   return (call, allSteps)
+
+end ExprLowering
 
 private inductive BlockMode where
   | pure  (inAtomic : Bool) (s₀ sCur : Lean.Ident) (matCur : Lean.Term)
@@ -678,7 +648,7 @@ private def wrapHoists (mode : BlockMode) (ctx : LowerCtx)
     | .awaitUnwrap _ tmp callTerm, .async _ =>
         let rawTmp ← freshIdent "_srvRaw"
         `($callTerm >>= fun $rawTmp:ident => $(← liftM <| wrapUnwrapStep mode ctx tmp ⟨rawTmp⟩ acc))
-    | .pureUnwrap _ tmp valTerm, _ =>
+    | .pureUnwrap tmp valTerm, _ =>
         liftM <| wrapUnwrapStep mode ctx tmp valTerm acc
 
 private def bindOptIdent (xStx : Syntax) (val cont : Term) : CommandElabM Term :=
@@ -734,12 +704,7 @@ private partial def lowerCatchFallback? (ctx : LowerCtx) (stmts : Array Syntax) 
 
 private def lowerMatchScrutineesAndAlts (ctx : LowerCtx) (stmt : Syntax) (rest : Array Syntax)
     (lowerArm : LowerCtx → Array Syntax → LowerM Term) : LowerM (Term × Array HoistedStep) := do
-  let mut scrutTerms : Array Term := #[]
-  let mut allSteps : Array HoistedStep := #[]
-  for sc in (stmt.getArg 1).getSepArgs do
-    let (st, ss) ← lowerExprCollectingHoists ctx .val sc
-    scrutTerms := scrutTerms.push st
-    allSteps := allSteps ++ ss
+  let (scrutTerms, allSteps) ← withCollectedHoists <| (stmt.getArg 1).getSepArgs.mapM (lowerExpr ctx .val)
   let cases := (stmt.getArg 3).getArgs
   let allRet := cases.all fun c => blockAlwaysReturns (suiteStmts (c.getArg 3))
   let alts ← cases.mapM fun c => do
@@ -769,18 +734,17 @@ private def lowerCatchBody (stmt : Syntax) (catchCtx : LowerCtx) (xStx : Syntax)
     (errId : Ident) (scrutTerm okTerm : Term) (catchStmts : Array Syntax)
     (bindFallback : Syntax → Term → Term → LowerM Term)
     (lowerCatchBlock : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
+  let mkUnwrapMatch (errBody : Term) (okId : Ident) (okBody : Term) : CommandElabM Term :=
+    `(match Qed.Server.SrvUnwrap.unwrap (E := Qed.Server.ApiError) $scrutTerm with
+      | Except.error $errId:ident => $errBody | Except.ok $okId:ident => $okBody)
   if let some fbTerm ← lowerCatchFallback? catchCtx catchStmts then
     let okValId ← freshIdent "_catchOk"
-    let valMatch ← `(match Qed.Server.SrvUnwrap.unwrap (E := Qed.Server.ApiError) $scrutTerm with
-      | Except.error $errId:ident => $fbTerm | Except.ok $okValId:ident => $okValId)
-    bindFallback xStx valMatch okTerm
+    bindFallback xStx (← liftM <| mkUnwrapMatch fbTerm okValId ⟨okValId.raw⟩) okTerm
   else
     unless blockAlwaysReturns catchStmts do
       throwErrorAt stmt "the `catch` block must either `return` on all paths or end with a fallback value expression"
-    let catchTerm ← lowerCatchBlock catchCtx catchStmts
     let bindId : Ident := if xStx.isIdent then ⟨xStx⟩ else mkIdent `_srvDiscard
-    `(match Qed.Server.SrvUnwrap.unwrap (E := Qed.Server.ApiError) $scrutTerm with
-      | Except.error $errId:ident => $catchTerm | Except.ok $bindId:ident => $okTerm)
+    liftM <| mkUnwrapMatch (← lowerCatchBlock catchCtx catchStmts) bindId okTerm
 
 private def lowerBranch (mode : BlockMode) (ctx : LowerCtx)
     (rest thenStmts : Array Syntax) (thenCtx : LowerCtx)
@@ -805,17 +769,14 @@ private def lowerBranch (mode : BlockMode) (ctx : LowerCtx)
     match mode with
     | .pure .. =>
         let sNext ← freshIdent "_s"
+        let baseJoinCtx := { ctx with stateRule := if ctx.stateFields.isEmpty then .statelessServer else .pureStep sNext #[] }
         match ctx.emitAcc? with
         | some _ =>
             let esNext ← freshIdent "_es"
-            let joinCtx := { ctx with
-              stateRule := if ctx.stateFields.isEmpty then .statelessServer else .pureStep sNext #[]
-              emitAcc? := some esNext }
-            let cont ← recWithState joinCtx sNext rest
+            let cont ← recWithState { baseJoinCtx with emitAcc? := some esNext } sNext rest
             `(Qed.Server.srvEmitSeq $br (fun $sNext:ident $esNext:ident => $cont))
         | none =>
-            let joinCtx := { ctx with stateRule := if ctx.stateFields.isEmpty then .statelessServer else .pureStep sNext #[] }
-            let cont ← recWithState joinCtx sNext rest
+            let cont ← recWithState baseJoinCtx sNext rest
             if allowPureLetJoin && !blockMayReturnEarly thenStmts && !(elseStmts?.map blockMayReturnEarly |>.getD false) then
               let hJoin ← freshIdent "_srvEq"
               `(Qed.Server.srvLetEq (($br : _ × Option Unit).1) (fun $sNext:ident $hJoin:ident => $cont))
@@ -850,14 +811,11 @@ private def lowerReturn (mode : BlockMode) (ctx : LowerCtx) (stmt : Syntax) : Lo
             | none =>
                 `($callTerm >>= fun $rawId:ident => Pure.pure (some (Qed.Server.SrvUnwrap.unwrap (E := $errTy) $rawId)))
           return ← wrapHoists mode ctx steps leaf
-    if isFailCall retExpr then
-      unless ctx.hasFallible do
-        throwErrorAt retExpr s!"`fail(...)` can only be returned from a fallible `T!` function (`{ctx.fnName}` is not declared `-> ...!`)"
-      let (errTerm, steps) ← lowerExprCollectingHoists ctx .val retExpr
-      wrapHoists mode ctx steps (← liftM <| mkErrLeaf mode ctx errTerm)
-    else
-      let (valTerm, steps) ← lowerExprCollectingHoists ctx .val retExpr
-      wrapHoists mode ctx steps (← liftM <| mkOkLeaf mode ctx valTerm)
+    let isFail := isFailCall retExpr
+    if isFail && !ctx.hasFallible then
+      throwErrorAt retExpr s!"`fail(...)` can only be returned from a fallible `T!` function (`{ctx.fnName}` is not declared `-> ...!`)"
+    let (term, steps) ← lowerExprCollectingHoists ctx .val retExpr
+    wrapHoists mode ctx steps (← liftM <| (if isFail then mkErrLeaf else mkOkLeaf) mode ctx term)
 
 private def lowerLet (mode : BlockMode) (ctx : LowerCtx) (stmt : Syntax) (rest : Array Syntax)
     (recBlock : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
@@ -1016,69 +974,56 @@ private def lowerAtomicStmt (aCtx : LowerCtx) (stateTyTerm? : Option Term)
   let (stateTyTerm, s0Id, atomBody, readOnly, hasEmit) ← lowerScopedAtomicBody stmt atomCtx stateTyTerm? bodyStmts lowerPure
   emitAtomicRun s0Id stateTyTerm atomBody readOnly hasEmit isFinish onResult
 
-private def lowerHoistedArg (ctx : LowerCtx) (stepsRef : IO.Ref (Array HoistedStep))
-    (stx : Syntax) : LowerM Term := do
-  let (t, hs) ← lowerExprCollectingHoists ctx .val stx
-  stepsRef.modify (· ++ hs)
-  return t
-
-private def lowerOptArg (ctx : LowerCtx) (stepsRef : IO.Ref (Array HoistedStep))
-    (arg? : Option Syntax) (wrap : Term → CommandElabM Term) (default : CommandElabM Term) :
-    LowerM Term := do
+private def lowerOptArg (ctx : LowerCtx) (arg? : Option Syntax)
+    (wrap : Term → CommandElabM Term) (default : CommandElabM Term) : LowerM Term := do
   match arg? with
-  | some s => liftM (wrap (← lowerHoistedArg ctx stepsRef s))
+  | some s => liftM (wrap (← lowerExpr ctx .val s))
   | none   => liftM default
 
-private def lowerOptSomeArg (ctx : LowerCtx) (stepsRef : IO.Ref (Array HoistedStep))
-    (namedArgs : Array (String × Syntax)) (k : String) (ty : CommandElabM Term) : LowerM Term :=
-  lowerOptArg ctx stepsRef ((namedArgs.find? (·.1 == k)).map Prod.snd)
-    (fun t => do `(some ($t : $(← ty)))) `(none)
+private def lowerOptSomeArg (ctx : LowerCtx) (namedArgs : Array (String × Syntax))
+    (k : String) (ty : CommandElabM Term) : LowerM Term :=
+  lowerOptArg ctx (findNamedArg? namedArgs k) (fun t => do `(some ($t : $(← ty)))) `(none)
 
 private def lowerSetCookieCall (ctx : LowerCtx) (stmt : Syntax) (isClear : Bool) (rawArgs : Array Syntax) :
-    LowerM (Term × Array HoistedStep) := do
+    LowerM (Term × Array HoistedStep) := withCollectedHoists do
   let validKeys := if isClear then none else some ["name", "value", "path", "httpOnly", "secure", "sameSite", "maxAge", "domain"]
   let (posArgs, namedArgs) ← splitCallArgs (if isClear then "clearCookie" else "setCookie") rawArgs validKeys (errRef := stmt)
-  let findN (k : String) : Option Syntax := (namedArgs.find? (·.1 == k)).map Prod.snd
-  let stepsRef ← IO.mkRef (#[] : Array HoistedStep)
-  let optVal (k : String) (d : CommandElabM Term) : LowerM Term := lowerOptArg ctx stepsRef (findN k) pure d
+  let findN := findNamedArg? namedArgs
+  let optVal (k : String) (d : CommandElabM Term) : LowerM Term := lowerOptArg ctx (findN k) pure d
   if isClear then
     let some nameStx := posArgs[0]? |>.orElse (fun _ => findN "name")
       | throwErrorAt stmt "`clearCookie(name[, path = \"/\"])` requires a cookie name"
-    let nameT ← lowerHoistedArg ctx stepsRef nameStx
-    let pathT ← lowerOptArg ctx stepsRef ((findN "path").orElse (fun _ => posArgs[1]?)) pure `("/")
-    return (← `(Qed.Server.SetCookie.clear $nameT $pathT), ← stepsRef.get)
+    `(Qed.Server.SetCookie.clear $(← lowerExpr ctx .val nameStx)
+        $(← lowerOptArg ctx ((findN "path").orElse (fun _ => posArgs[1]?)) pure `("/")))
   else
     let some nameStx := posArgs[0]? |>.orElse (fun _ => findN "name")
       | throwErrorAt stmt "`setCookie(name, value, ...)` requires a cookie name"
     let some valStx := posArgs[1]? |>.orElse (fun _ => findN "value")
       | throwErrorAt stmt "`setCookie(name, value, ...)` requires a cookie value"
-    let cTerm ← `({
-      name := $(← lowerHoistedArg ctx stepsRef nameStx), value := $(← lowerHoistedArg ctx stepsRef valStx),
+    `({
+      name := $(← lowerExpr ctx .val nameStx), value := $(← lowerExpr ctx .val valStx),
       path := $(← optVal "path" `("/")), httpOnly := $(← optVal "httpOnly" `(true)),
       sameSite := ($(← optVal "sameSite" `(Qed.Server.SameSite.lax)) : Qed.Server.SameSite),
       secure := $(← optVal "secure" `(false)),
-      maxAge? := $(← lowerOptSomeArg ctx stepsRef namedArgs "maxAge" `(Nat)),
-      domain? := $(← lowerOptSomeArg ctx stepsRef namedArgs "domain" `(String))
+      maxAge? := $(← lowerOptSomeArg ctx namedArgs "maxAge" `(Nat)),
+      domain? := $(← lowerOptSomeArg ctx namedArgs "domain" `(String))
       : Qed.Server.SetCookie })
-    return (cTerm, ← stepsRef.get)
 
 private def lowerSseSendCall (ctx : LowerCtx) (stmt : Syntax) (rawArgs : Array Syntax) :
-    LowerM (Term × Array HoistedStep) := do
+    LowerM (Term × Array HoistedStep) := withCollectedHoists do
   unless ctx.isStreamRoute do
     throwErrorAt stmt "`send(...)` is only available inside `stream \"/...\":` routes"
   let (posArgs, namedArgs) ← splitCallArgs "send" rawArgs (some ["data", "event", "id", "retry"]) (errRef := stmt)
-  let some dataStx := posArgs[0]? |>.orElse (fun _ => (namedArgs.find? (·.1 == "data")).map Prod.snd)
+  let some dataStx := posArgs[0]? |>.orElse (fun _ => findNamedArg? namedArgs "data")
     | throwErrorAt stmt "`send(data[, event = ..., id = ..., retry = ...])` requires an event data string"
   if posArgs.size > 1 then
     throwErrorAt stmt "`send(...)` takes one positional `data` argument; pass `event = ...`, `id = ...`, or `retry = ...` as named arguments"
-  let stepsRef ← IO.mkRef (#[] : Array HoistedStep)
-  let evTerm ← `({
-    data := $(← lowerHoistedArg ctx stepsRef dataStx),
-    event := $(← lowerOptSomeArg ctx stepsRef namedArgs "event" `(String)),
-    id := $(← lowerOptSomeArg ctx stepsRef namedArgs "id" `(String)),
-    retry := $(← lowerOptSomeArg ctx stepsRef namedArgs "retry" `(Nat))
+  `({
+    data := $(← lowerExpr ctx .val dataStx),
+    event := $(← lowerOptSomeArg ctx namedArgs "event" `(String)),
+    id := $(← lowerOptSomeArg ctx namedArgs "id" `(String)),
+    retry := $(← lowerOptSomeArg ctx namedArgs "retry" `(Nat))
     : Qed.Server.SseEvent })
-  return (evTerm, ← stepsRef.get)
 
 private def lowerTxStmt (aCtx : LowerCtx) (stmt aliasRef : Syntax) (aliasName : String)
     (txStmts rest : Array Syntax) (recAsync : LowerCtx → Array Syntax → LowerM Term) : LowerM Term := do
@@ -1140,17 +1085,13 @@ private partial def lowerBlock (isPure : Bool) (inAtomic : Bool) (s₀ sCur : Id
     let .pure _ _ _ matCur := mode | unreachable!
     liftM <| mkPureLeaf bCtx matCur (← `(some $wrapped))
   else if let some (isClear, rawArgs) := matchSetCookieStmt? stmt then
-    if isPure then
-      throwErrorAt stmt "cannot call `setCookie`/`clearCookie` inside an `atomic:` block; emit cookies outside `atomic:`"
-    let (cookieTerm, steps) ← lowerSetCookieCall bCtx stmt isClear rawArgs
-    let cont ← recSame bCtx rest
-    wrapHoists mode bCtx steps (← `(Qed.Server.MonadServer.setCookie $cookieTerm >>= fun _ => $cont))
+    if isPure then throwErrorAt stmt "cannot call `setCookie`/`clearCookie` inside an `atomic:` block; emit cookies outside `atomic:`"
+    let (argT, steps) ← lowerSetCookieCall bCtx stmt isClear rawArgs
+    wrapHoists mode bCtx steps (← `(Qed.Server.MonadServer.setCookie $argT >>= fun _ => $(← recSame bCtx rest)))
   else if let some rawArgs := matchSseSendStmt? stmt then
-    if isPure then
-      throwErrorAt stmt "cannot call `send(...)` inside an `atomic:` block; emit SSE events outside `atomic:`"
-    let (evTerm, steps) ← lowerSseSendCall bCtx stmt rawArgs
-    let cont ← recSame bCtx rest
-    wrapHoists mode bCtx steps (← `(Qed.Server.MonadServer.sendSse $evTerm >>= fun _ => $cont))
+    if isPure then throwErrorAt stmt "cannot call `send(...)` inside an `atomic:` block; emit SSE events outside `atomic:`"
+    let (argT, steps) ← lowerSseSendCall bCtx stmt rawArgs
+    wrapHoists mode bCtx steps (← `(Qed.Server.MonadServer.sendSse $argT >>= fun _ => $(← recSame bCtx rest)))
   else if let some (aliasRef, aliasName, txStmts) := matchTxStmt? stmt then
     if isPure then
       throwErrorAt stmt "cannot start a database `transaction` inside an `atomic:` block; run database transactions outside `atomic:`"

@@ -23,8 +23,7 @@ private partial def stxCollectRowCols (rowVar : String) (colNames : Array String
   | some [rv, col] => if rv == rowVar && colNames.contains col then #[col] else #[]
   | _ =>
       stx.getArgs.foldl (init := #[]) fun acc child =>
-        (stxCollectRowCols rowVar colNames child).foldl (init := acc) fun a c =>
-          if a.contains c then a else a.push c
+        (stxCollectRowCols rowVar colNames child).foldl pushUnique acc
 
 private def sqlBinOpTable : Array (Lean.Name × Lean.Name) := #[
   (``qedAdd, `Qed.Server.Db.SqlBinOp.add), (``qedSub, `Qed.Server.Db.SqlBinOp.sub),
@@ -97,19 +96,14 @@ private structure TableIdents where
   allColsListT : Term
 
 private def mkTableIdents (stx : Syntax) (tbl : DbTableInfo) : CommandElabM TableIdents := do
+  let id (s : Name) := mkIdentFrom stx (tbl.rowTypeConst ++ s)
   let tblSqlId ← mkSqlIdentTerm stx tbl.tableName
   let colSqlIds ← tbl.columns.mapM fun c => mkSqlIdentTerm stx c.name
   return {
     rowTyId := mkIdentFrom stx tbl.rowTypeConst
-    rowInvId := mkIdentFrom stx tbl.rowInvConst
-    rowInvBId := mkIdentFrom stx tbl.rowInvBoolConst
-    rowInvSId := mkIdentFrom stx tbl.rowInvSoundConst
-    transInvId := mkIdentFrom stx tbl.transInvConst
-    readPolId := mkIdentFrom stx tbl.readPolicyConst
-    insPolId := mkIdentFrom stx tbl.insertPolicyConst
-    updPolId := mkIdentFrom stx tbl.updatePolicyConst
-    delPolId := mkIdentFrom stx tbl.deletePolicyConst
-    decRowId := mkIdentFrom stx tbl.decodeRowConst
+    rowInvId := id `RowInv, rowInvBId := id `rowInvBool, rowInvSId := id `rowInvBool_sound
+    transInvId := id `TransInv, readPolId := id `ReadPolicy, insPolId := id `InsertPolicy
+    updPolId := id `UpdatePolicy, delPolId := id `DeletePolicy, decRowId := id `decodeRow
     tblSqlId, allColsListT := ← `([$[$colSqlIds:term],*])
   }
 
@@ -256,7 +250,7 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
             decRowId, tblSqlId, allColsListT } ← liftM (mkTableIdents stx tbl)
       let ctxId := mkIdent `ctx
       let (posArgs, namedArgs) ← splitCallArgs "database" rawArgs (allowWhere := true)
-      let findNamed (k : String) : Option Syntax := (namedArgs.find? (·.1 == k)).map Prod.snd
+      let findNamed := findNamedArg? namedArgs
       let whereArg? : Option Syntax :=
         (findNamed "where").orElse fun _ => (findNamed "filter").orElse fun _ => posArgs[0]?
       let opQual := s!"{fnName} → {dbInfo.shortName}.{tbl.tableName}.{opName}"
@@ -264,21 +258,22 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
       let mkReadPolHint (t : DbTableInfo) (clause := "`where = r => ...`") (tblDesc := "the table's") : String :=
         mkPolHint t.readPolicyLabel s!"Check {clause} against {tblDesc} `policy read`."
           s!"Ensure {clause} (together with `requires` / `if` guards) implies"
+      let mkPolCall (fn : Name) (qT predT polId pf : Term) : M Term :=
+        `($(mkIdent fn) $cfgId $qT $rowInvId $predT $polId $ctxId $pf $txOptT)
 
       if opName == "select" || opName == "findOne" || opName == "count" then
         let (predT, sqlWhereT, _) ← parseWhereArg lowerVal lowerValWithLocal tbl rowTyId whereArg?
         let pf ← mkDbProveTac #[rowInvId, readPolId] readPolKind opQual (mkReadPolHint tbl)
-        if opName == "select" then
-          let (ordT, limT, offT) ← parseQueryWindow tbl lowerVal findNamed
-          let qT ← `(Qed.Server.Db.SqlQuery.select $tblSqlId $allColsListT $sqlWhereT $ordT $limT $offT)
-          return (← `(Qed.Server.Db.dbSelect $cfgId $qT $decRowId $rowInvId $rowInvBId $rowInvSId $predT $readPolId $ctxId $pf $txOptT), false)
-        else if opName == "findOne" then
-          let ordT ← liftM (parseOrderByArg tbl (findNamed "orderBy"))
-          let qT ← `(Qed.Server.Db.SqlQuery.select $tblSqlId $allColsListT $sqlWhereT $ordT (some 1) none)
-          return (← `(Qed.Server.Db.dbFindOne $cfgId $qT $decRowId $rowInvId $rowInvBId $rowInvSId $predT $readPolId $ctxId $pf $txOptT), false)
-        else
-          let qT ← `(Qed.Server.Db.SqlQuery.count $tblSqlId $sqlWhereT)
-          return (← `(Qed.Server.Db.dbCount $cfgId $qT $rowInvId $predT $readPolId $ctxId $pf $txOptT), false)
+        if opName == "count" then
+          return (← mkPolCall `Qed.Server.Db.dbCount (← `(Qed.Server.Db.SqlQuery.count $tblSqlId $sqlWhereT)) predT readPolId pf, false)
+        let (ordT, limT, offT, fn) ←
+          if opName == "select" then
+            let (o, l, f) ← parseQueryWindow tbl lowerVal findNamed
+            pure (o, l, f, `Qed.Server.Db.dbSelect)
+          else
+            pure (← liftM (parseOrderByArg tbl (findNamed "orderBy")), ← `(some 1), ← `(none), `Qed.Server.Db.dbFindOne)
+        let qT ← `(Qed.Server.Db.SqlQuery.select $tblSqlId $allColsListT $sqlWhereT $ordT $limT $offT)
+        return (← `($(mkIdent fn) $cfgId $qT $decRowId $rowInvId $rowInvBId $rowInvSId $predT $readPolId $ctxId $pf $txOptT), false)
 
       else if opName == "sum" || opName == "min" || opName == "max" then
         let some colStx := (findNamed "col").orElse fun _ => posArgs[0]?
@@ -289,12 +284,11 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
         let (predT, sqlWhereT, _) ← parseWhereArg lowerVal lowerValWithLocal tbl rowTyId aggWhereArg?
         let pf ← mkDbProveTac #[rowInvId, readPolId] readPolKind opQual (mkReadPolHint tbl)
         let cSqlId ← liftM (mkSqlIdentTerm colStx colInfo.name)
-        let aggOpT ← if opName == "sum" then `(Qed.Server.Db.SqlAggOp.sum)
-          else if opName == "min" then `(Qed.Server.Db.SqlAggOp.min) else `(Qed.Server.Db.SqlAggOp.max)
+        let aggOpT := mkIdent <| match opName with
+          | "sum" => `Qed.Server.Db.SqlAggOp.sum | "min" => `Qed.Server.Db.SqlAggOp.min | _ => `Qed.Server.Db.SqlAggOp.max
         let qT ← `(Qed.Server.Db.SqlQuery.aggregate $aggOpT $tblSqlId $cSqlId $sqlWhereT)
         if opName == "sum" then
-          let fnId := if colInfo.isNat then mkIdent `Qed.Server.Db.dbSumNat else mkIdent `Qed.Server.Db.dbSumInt
-          return (← `($fnId $cfgId $qT $rowInvId $predT $readPolId $ctxId $pf $txOptT), false)
+          return (← mkPolCall (if colInfo.isNat then `Qed.Server.Db.dbSumNat else `Qed.Server.Db.dbSumInt) qT predT readPolId pf, false)
         else
           let projT ← `(fun (_r : $rowTyId) => _r.$(mkIdentFrom colStx (Name.mkSimple colInfo.name)))
           return (← `(Qed.Server.Db.dbAggOpt $cfgId $qT $projT $rowInvId $predT $readPolId $ctxId $pf $txOptT), false)
@@ -343,8 +337,7 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
           "Check the `where = r => ...` clause against the table's `policy delete` / `policy write`."
           "Ensure `where = r => ...` implies"
         let pf ← mkDbProveTac #[rowInvId, delPolId] s!"delete policy `{dbInfo.shortName}.{tbl.tableName}.delete`" opQual hintMsg
-        let qT ← `(Qed.Server.Db.SqlQuery.delete $tblSqlId $sqlWhereT [])
-        return (← `(Qed.Server.Db.dbDelete $cfgId $qT $rowInvId $predT $delPolId $ctxId $pf $txOptT), true)
+        return (← mkPolCall `Qed.Server.Db.dbDelete (← `(Qed.Server.Db.SqlQuery.delete $tblSqlId $sqlWhereT [])) predT delPolId pf, true)
 
       else if opName == "insert" then
         let rowTerm : Term ←
@@ -384,8 +377,7 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
 
       else if opName == "update" || opName == "updateOne" then
         let some setRaw := findNamed "set"
-          | let msg := "`" ++ dbInfo.shortName ++ "." ++ tbl.tableName ++ "." ++ opName ++ "` requires `set = r => { col = expr, ... }`"
-            throwErrorAt stx "{msg}"
+          | throwErrorAt stx "`{dbInfo.shortName}.{tbl.tableName}.{opName}` requires `set = r => \{ col = expr, ... }`"
         let (predT, sqlWhereT, whereInfo?) ← parseWhereArg lowerVal lowerValWithLocal tbl rowTyId whereArg?
         let uSet := unwrapParens1 setRaw
         let (setRowVar, recStx) : (Ident × Syntax) ←
@@ -393,12 +385,9 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
             let b := uSet.getArg 0
             pure (if b.isIdent then ⟨b⟩ else mkIdent `_row, unwrapParens1 (uSet.getArg 2))
           else if uSet.getKind == ``qedRecLit then pure (mkIdent `_row, uSet)
-          else
-            let msg := "`set` must be `r => { col = expr, ... }` or `{ col = expr, ... }`"
-            throwErrorAt setRaw "{msg}"
+          else throwErrorAt setRaw "`set` must be `r => \{ col = expr, ... }` or `\{ col = expr, ... }`"
         if recStx.getKind != ``qedRecLit then
-          let msg := "`set` body must be a record update `{ col = expr, ... }`"
-          throwErrorAt recStx "{msg}"
+          throwErrorAt recStx "`set` body must be a record update `\{ col = expr, ... }`"
         let setFields := (recStx.getArg 2).getSepArgs
         if setFields.isEmpty then throwErrorAt recStx "`set` must update at least one column"
         let setRowName := setRowVar.getId.eraseMacroScopes.toString
@@ -438,11 +427,7 @@ def lowerDbCall {M : Type → Type} [Monad M] [MonadLiftT CommandElabM M]
               let wRowId := mkIdent (Name.mkSimple wRowName)
               postChecks := postChecks.push (← `((fun ($wRowId:ident : $rowTyId) => ($wRenamed : Bool)) $postRowVar))
 
-        let postPredT : Term ← match postChecks.toList with
-          | []        => `(fun (_ : $rowTyId) => true)
-          | c :: rest => do
-              let conj ← rest.foldlM (init := c) fun acc x => `($acc && $x)
-              `(fun ($postRowVar:ident : $rowTyId) => $conj)
+        let postPredT ← `(fun ($postRowVar:ident : $rowTyId) => $(← mkBoolConj postChecks))
 
         let setFnT ← `(fun ($setRowVar:ident : $rowTyId) => { $setRowVar with $[$leanFieldIds:ident := $leanFieldVals:term],* })
         let qT ← `(Qed.Server.Db.SqlQuery.update $tblSqlId [$[$sqlSetPairs:term],*] $sqlWhereT $allColsListT)

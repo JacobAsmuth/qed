@@ -93,13 +93,20 @@ private def readLoop {α : Type} (handle : UInt64) (chunkSz : UInt32)
               else readLoop handle chunkSz check onEof (buf ++ chunk) fuel
 
 private def readUntilCrlfCrlf (handle : UInt64) : IO (Except String (ByteArray × Nat)) :=
-  readLoop handle 8192
-    (fun buf =>
-      if let some pos := findCrlfCrlf buf then .ok (some (buf, pos))
-      else if buf.size > maxReqHdrBytes then .error "HTTP response headers too large"
-      else .ok none)
-    (fun _ => .error "unexpected EOF in HTTP response headers")
-    ByteArray.empty 4096
+  let rec go (buf : ByteArray) (scanFrom : Nat) : Nat → IO (Except String (ByteArray × Nat))
+    | 0 => return .error "HTTP read limit exceeded"
+    | fuel + 1 => do
+        if let some pos := findCrlfCrlf buf scanFrom then
+          return .ok (buf, pos)
+        else if buf.size > maxReqHdrBytes then
+          return .error "HTTP response headers too large"
+        else
+          match ← Prim.outboundReadSome handle 8192 with
+          | .error e => return .error e
+          | .ok chunk =>
+              if chunk.isEmpty then return .error "unexpected EOF in HTTP response headers"
+              else go (buf ++ chunk) (buf.size - 3) fuel
+  go ByteArray.empty 0 4096
 
 private def readAtLeast (handle : UInt64) (buf : ByteArray) (target : Nat) : IO (Except String ByteArray) :=
   readLoop handle 16384
@@ -162,7 +169,7 @@ private def readChunkedBody (handle : UInt64) (rx : ByteArray) (off : Nat) (out 
         if h : off1 + sz + 1 < full.size then
           if full[off1 + sz]'(by omega) != 13 || full[off1 + sz + 1] != 10 then
             throw "missing CRLF after chunk data"
-          readChunkedBody handle full (off1 + sz + 2) (full.copySlice off1 out out.size sz) fuel
+          readChunkedBody handle full (off1 + sz + 2) (full.copySlice off1 out out.size sz false) fuel
         else
           throw "truncated chunk data"
 
@@ -191,7 +198,7 @@ private def execHttpAttempt (method : String) (u : ParsedUrl) (wireReq : ByteArr
               return .error e
           | .ok head =>
               let initBody := rxBuf.extract (hdrEnd + 4) rxBuf.size
-              let baseReuse := !head.connClose && !ssrfGuard
+              let baseReuse := !head.connClose
               let bodyRes : Except String (ByteArray × Bool) ←
                 if method == "HEAD" || head.status == 204 || head.status == 304 then
                   pure (.ok (ByteArray.empty, baseReuse && initBody.isEmpty))
@@ -199,7 +206,7 @@ private def execHttpAttempt (method : String) (u : ParsedUrl) (wireReq : ByteArr
                   (·.map fun (b, clean) => (b, baseReuse && clean)) <$> (readChunkedBody handle initBody 0 ByteArray.empty 65536).run
                 else if let some cl := head.contentLen then
                   if cl > maxRespBodyBytes then pure (.error "Content-Length too large")
-                  else (·.map fun full => (full.extract 0 cl, baseReuse && full.size == cl)) <$> readAtLeast handle initBody cl
+                  else (·.map fun full => (if full.size == cl then full else full.extract 0 cl, baseReuse && full.size == cl)) <$> readAtLeast handle initBody cl
                 else
                   (·.map fun b => (b, false)) <$> readUntilEof handle initBody
               match bodyRes with
@@ -463,9 +470,10 @@ private def resolveDbEndpoint (ep : Db.DbEndpoint) : IO (Except String ResolvedD
         let envKey := Qed.Cloud.managedPostgresSecretVar dbName
         .postgres <$> liftE (requireEnv envKey "managed PostgreSQL secret")
 
-private def resolveDbConfig (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDbTransport) := do
+private def resolveDbConfigCore (rawDeployEnv? : Option String) (onCloudRun : Bool)
+    (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDbTransport) := do
   -- Fail-closed environment dispatch whenever `QED_DEPLOY_ENV` is set (including empty string) or on Cloud Run (`K_SERVICE`).
-  match ← Prim.getEnv "QED_DEPLOY_ENV" with
+  match rawDeployEnv? with
   | some rawEnv =>
       match Qed.Cloud.DeployEnv.parse? (trimWs rawEnv) with
       | none =>
@@ -476,7 +484,6 @@ private def resolveDbConfig (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDb
           | .error err =>
               return .error (ApiError.internal s!"database `{cfg.name}` unavailable for env `{env}`: {err}")
   | none =>
-      let onCloudRun := (← loadNonEmptyEnv "K_SERVICE").isSome
       match ← resolveDbEndpoint cfg.endpoint with
       | .ok tr => return .ok tr
       | .error primaryErr =>
@@ -489,6 +496,59 @@ private def resolveDbConfig (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDb
               | .error fbErr => return .error (ApiError.internal s!"database `{cfg.name}` unavailable: {primaryErr} (fallback: {fbErr})")
           | none =>
               return .error (ApiError.internal s!"database `{cfg.name}` unavailable: {primaryErr}")
+
+private def resolveDbConfig (cfg : Db.DbConfig) : IO (Except ApiError ResolvedDbTransport) := do
+  let rawDeployEnv? ← Prim.getEnv "QED_DEPLOY_ENV"
+  let onCloudRun ← if rawDeployEnv?.isNone then pure (← loadNonEmptyEnv "K_SERVICE").isSome else pure false
+  resolveDbConfigCore rawDeployEnv? onCloudRun cfg
+
+private structure DbCacheEntry where
+  endpoint      : Db.DbEndpoint
+  devFallback?  : Option Db.DbEndpoint
+  envEndpoints? : Option (Qed.Cloud.EnvMap Db.DbEndpoint)
+  transport     : ResolvedDbTransport
+
+private def DbCacheEntry.matches (e : DbCacheEntry) (cfg : Db.DbConfig) : Bool :=
+  e.endpoint == cfg.endpoint && e.devFallback? == cfg.devFallback? && e.envEndpoints? == cfg.envEndpoints?
+
+private structure DbResolveCache where
+  rawDeployEnv? : Option String
+  onCloudRun    : Bool
+  primary?      : Option (String × DbCacheEntry)
+  byName        : Prim.StateBox (Std.HashMap String DbCacheEntry)
+
+private def mkDbResolveCache (primaryDb? : Option Db.DbConfig) : IO DbResolveCache := do
+  let rawDeployEnv? ← Prim.getEnv "QED_DEPLOY_ENV"
+  let onCloudRun ← if rawDeployEnv?.isNone then pure (← loadNonEmptyEnv "K_SERVICE").isSome else pure false
+  let byName ← Prim.mkStateBox (∅ : Std.HashMap String DbCacheEntry)
+  let primary? ← match primaryDb? with
+    | none => pure none
+    | some cfg =>
+        match ← resolveDbConfigCore rawDeployEnv? onCloudRun cfg with
+        | .ok tr => pure (some (cfg.name, { endpoint := cfg.endpoint, devFallback? := cfg.devFallback?, envEndpoints? := cfg.envEndpoints?, transport := tr }))
+        | .error _ => pure none
+  return { rawDeployEnv?, onCloudRun, primary?, byName }
+
+private def resolveDbConfigWith (cache? : Option DbResolveCache) (cfg : Db.DbConfig) :
+    IO (Except ApiError ResolvedDbTransport) := do
+  match cache? with
+  | none => resolveDbConfig cfg
+  | some cache =>
+      if let some (pName, pEntry) := cache.primary? then
+        if cfg.name == pName && pEntry.matches cfg then
+          return .ok pEntry.transport
+      if let some hit ← Prim.atomicRead cache.byName (fun m => m[cfg.name]?) then
+        if hit.matches cfg then
+          return .ok hit.transport
+      match ← resolveDbConfigCore cache.rawDeployEnv? cache.onCloudRun cfg with
+      | .ok tr =>
+          let entry : DbCacheEntry := {
+            endpoint := cfg.endpoint, devFallback? := cfg.devFallback?, envEndpoints? := cfg.envEndpoints?, transport := tr
+          }
+          Prim.atomicModify cache.byName fun m =>
+            ((if m.size < 32 then m.insert cfg.name entry else m), ())
+          return .ok tr
+      | .error e => return .error e
 
 private def d1QueryUrl (acc db : String) : String :=
   s!"https://api.cloudflare.com/client/v4/accounts/{Qed.encodeSeg acc}/d1/database/{Qed.encodeSeg db}/query"
@@ -626,11 +686,11 @@ private def withPgTx {α : Type} (txId : UInt64) (f : Db.PgWire.PgConn → IO (E
     | return .error (ApiError.internal "unknown or closed PostgreSQL transaction")
   f conn
 
-private def withTxTransport {α : Type} (cfg : Db.DbConfig)
+private def withTxTransport {α : Type} (dbCache? : Option DbResolveCache) (cfg : Db.DbConfig)
     (onSqlite : String → IO (Except ApiError α))
     (onPg : String → IO (Except ApiError α)) : IO (Except ApiError α) :=
   ExceptT.run do
-    match ← liftE (resolveDbConfig cfg) with
+    match ← liftE (resolveDbConfigWith dbCache? cfg) with
     | .sqlite path  => liftE (onSqlite path)
     | .postgres url => liftE (onPg url)
     | _             => throw (ApiError.internal "multi-statement transactions require SQLite or PostgreSQL transport")
@@ -642,8 +702,8 @@ private def finishPgTx (conn : Db.PgWire.PgConn) (cmd : String) : IO (Except Api
   | .error e   => Db.PgWire.releaseConn { conn' with healthy := false }
                   return .error (ApiError.internal s!"postgres {cmd} failed: {e}")
 
-private def execNativeDbTxBegin (cfg : Db.DbConfig) : IO (Except ApiError UInt64) :=
-  withTxTransport cfg
+private def execNativeDbTxBegin (dbCache? : Option DbResolveCache) (cfg : Db.DbConfig) : IO (Except ApiError UInt64) :=
+  withTxTransport dbCache? cfg
     (fun path => return (← Prim.sqliteTxBegin path).mapError ApiError.internal)
     (fun url => (·.mapError ApiError.internal) <$> ExceptT.run do
       let p ← liftP (Db.PgWire.parsePgUrl url)
@@ -653,9 +713,9 @@ private def execNativeDbTxBegin (cfg : Db.DbConfig) : IO (Except ApiError UInt64
       | .error e => Db.PgWire.releaseConn { conn' with healthy := false }; throw s!"postgres BEGIN failed: {e}"
       | .ok cReady => pgTxBox.modifyGet fun (nextId, m) => (nextId, (nextId + 1, m.insert nextId cReady)))
 
-private def execNativeDbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery) :
+private def execNativeDbTxExec (dbCache? : Option DbResolveCache) (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQuery) :
     IO (Except ApiError Db.DbResult) :=
-  withTxTransport cfg
+  withTxTransport dbCache? cfg
     (fun _ => do
       let (sql, params) := q.compile .sqlite
       return (← Prim.sqliteTxExec txId sql params).mapError ApiError.internal)
@@ -671,20 +731,20 @@ private def execNativeDbTxExec (cfg : Db.DbConfig) (txId : UInt64) (q : Db.SqlQu
           else Db.PgWire.releaseConn conn'
           return .error (ApiError.internal e))
 
-private def execNativeDbTxCommit (cfg : Db.DbConfig) (txId : UInt64) : IO (Except ApiError Unit) :=
-  withTxTransport cfg
+private def execNativeDbTxCommit (dbCache? : Option DbResolveCache) (cfg : Db.DbConfig) (txId : UInt64) : IO (Except ApiError Unit) :=
+  withTxTransport dbCache? cfg
     (fun _ => return (← Prim.sqliteTxCommit txId).mapError ApiError.internal)
     (fun _ => withPgTx txId (finishPgTx · "COMMIT"))
 
-private def execNativeDbTxRollback (cfg : Db.DbConfig) (txId : UInt64) : IO Unit := do
-  match ← resolveDbConfig cfg with
+private def execNativeDbTxRollback (dbCache? : Option DbResolveCache) (cfg : Db.DbConfig) (txId : UInt64) : IO Unit := do
+  match ← resolveDbConfigWith dbCache? cfg with
   | .ok (.sqlite _)   => Prim.sqliteTxRollback txId
   | .ok (.postgres _) => if let some conn ← popPgTx txId then discard <| finishPgTx conn "ROLLBACK"
   | _                 => pure ()
 
-private def execNativeDbQuery (cfg : Db.DbConfig) (q : Db.SqlQuery) : IO (Except ApiError Db.DbResult) :=
+private def execNativeDbQuery (dbCache? : Option DbResolveCache) (cfg : Db.DbConfig) (q : Db.SqlQuery) : IO (Except ApiError Db.DbResult) :=
   ExceptT.run do
-    match ← liftE (resolveDbConfig cfg) with
+    match ← liftE (resolveDbConfigWith dbCache? cfg) with
     | tr@(.postgres _) =>
         let (sqlPg, paramsPg) := q.compile .postgres
         liftE (execRawOnTransport tr "" sqlPg paramsPg [])
@@ -693,9 +753,10 @@ private def execNativeDbQuery (cfg : Db.DbConfig) (q : Db.SqlQuery) : IO (Except
         liftE (execRawOnTransport tr sqlSq "" paramsSq (Db.HttpSql.queryExpectedCols q))
 
 @[implicit_reducible]
-def mkNativeServerInst (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEntry)))
+private def mkNativeServerInstWith (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEntry)))
     (cookieSink? : Option (IO.Ref (Array SetCookie)) := none)
-    (sseSink? : Option (IO.Ref (Array SseEvent)) := none) : MonadServer IO where
+    (sseSink? : Option (IO.Ref (Array SseEvent)) := none)
+    (dbCache? : Option DbResolveCache := none) : MonadServer IO where
   exec
     | .httpCall req => ExceptT.run do
         let authHdrs ← liftE (resolveAuthHeaders gcpCache? req.auth)
@@ -705,12 +766,12 @@ def mkNativeServerInst (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEn
           ApiError.internal s!"external HTTP transport error ({req.serviceName}): {e}") <$>
           execHttpCall req.method fullUrl allHdrs req.body req.ssrfGuard)
         return { status := status.toUInt32, body := respBody, headers := respHdrs.toList }
-    | .dbExec cfg q         => execNativeDbQuery cfg q
+    | .dbExec cfg q         => execNativeDbQuery dbCache? cfg q
     | .dbExecDdl cfg        => execNativeDbDdl cfg
-    | .dbTxBegin cfg        => execNativeDbTxBegin cfg
-    | .dbTxExec cfg tid q   => execNativeDbTxExec cfg tid q
-    | .dbTxCommit cfg tid   => execNativeDbTxCommit cfg tid
-    | .dbTxRollback cfg tid => execNativeDbTxRollback cfg tid
+    | .dbTxBegin cfg        => execNativeDbTxBegin dbCache? cfg
+    | .dbTxExec cfg tid q   => execNativeDbTxExec dbCache? cfg tid q
+    | .dbTxCommit cfg tid   => execNativeDbTxCommit dbCache? cfg tid
+    | .dbTxRollback cfg tid => execNativeDbTxRollback dbCache? cfg tid
     | .setCookie c          => if let some ref := cookieSink? then ref.modify (·.push c) else pure ()
     | .sendSse ev           => if let some ref := sseSink? then ref.modify (·.push ev) else pure ()
     | .readEnv v            => Prim.getEnv v
@@ -718,6 +779,12 @@ def mkNativeServerInst (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEn
     | .randomHex n          => Prim.randomHex n
     | .hmacSha256 key msg   => Prim.hmacSha256 key msg
     | .wsBroadcast t p      => Prim.wsBroadcast t p
+
+@[implicit_reducible]
+def mkNativeServerInst (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEntry)))
+    (cookieSink? : Option (IO.Ref (Array SetCookie)) := none)
+    (sseSink? : Option (IO.Ref (Array SseEvent)) := none) : MonadServer IO :=
+  mkNativeServerInstWith gcpCache? cookieSink? sseSink? none
 
 instance : MonadServer IO := mkNativeServerInst none none
 
@@ -926,7 +993,6 @@ private def extractQuery (target : String) : String :=
 private def resolveAuthPrincipal (cfg : ServerConfig) (oidcRt? : Option Qed.Auth.Oidc.OidcRuntime)
     (bearer? : Option String) (cookies : List (String × String)) :
     IO (Option String × List (String × String)) := do
-  let now ← nowSec
   -- 1. If an OIDC runtime is configured and a 3-segment Bearer JWT is supplied, verify via JWKS.
   if let (some rt, some tok) := (oidcRt?, bearer?) then
     if (tok.splitOn ".").length == 3 then
@@ -938,6 +1004,7 @@ private def resolveAuthPrincipal (cfg : ServerConfig) (oidcRt? : Option Qed.Auth
     | some rt => if !rt.cfg.sessionSecrets.isEmpty then rt.cfg.sessionSecrets else cfg.authSecrets
     | none    => cfg.authSecrets
   if let some tok := bearer?.orElse (fun _ => cookies.lookup "qed_session") then
+    let now ← nowSec
     if tok.startsWith "v2." then
       if let some p ← Qed.Auth.Oidc.verifySessionCookieV2 sessionSecrets tok now then
         return (some p.userId, p.claims)
@@ -1129,9 +1196,9 @@ private structure FullstackConfig where
   primaryDb?       : Option Db.DbConfig := none
 
 private def withCookieSink {α : Type} (gcpCache : Prim.StateBox (Array GcpTokenCacheEntry))
-    (f : MonadServer IO → IO α) : IO (α × Array SetCookie) := do
+    (dbCache? : Option DbResolveCache) (f : MonadServer IO → IO α) : IO (α × Array SetCookie) := do
   let cookieRef ← IO.mkRef (#[] : Array SetCookie)
-  let res ← f (mkNativeServerInst (some gcpCache) (some cookieRef))
+  let res ← f (mkNativeServerInstWith (some gcpCache) (some cookieRef) none dbCache?)
   return (res, ← cookieRef.get)
 
 private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : FullstackConfig) : IO UInt32 := do
@@ -1260,22 +1327,25 @@ private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : 
             (req.dupOrigin || req.dupSfs) cfg.wsAllowedOrigins? true "WebSocket upgrade" with
         | .error (code, msg) => return .doneClose (formatErrorResponse code msg)
         | .ok () =>
+            if inline != 0 && oidcRt?.isSome && req.auth?.isSome then
+              return .deferHead
             let baseCtx ← buildRequestCtxReq cfg req clientIp ByteArray.empty oidcRt?
             return .wsUpgrade (formatWsUpgradeResponse acceptB64) { baseCtx with connId := "ws-" ++ (← Prim.randomHex 12) }
       let isGetOrHead := req.method == "GET" || req.method == "HEAD"
       let staticTarget? := if isGetOrHead then classifyStaticPath req.method req.target fc.devMode else none
       if inline != 0 then
+        let deferBody := if req.keepAlive then .deferBodyKeep req.contentLen req else .deferBodyClose req.contentLen req
         if let some st := staticTarget? then
           if !fc.devMode && !st.noStore && isContentHashedAsset st.relPath then
             if let some hit ← Prim.atomicRead assetCache (fun m => m[st.relPath]?) then
               return finishHeadWire req (hit.serve req st.isHead req.keepAlive)
-          return .deferHead
-        if oidcRt?.isSome && (pathOnly.startsWith "/_qed/auth/" || req.auth?.isSome) then return .deferHead
-        if fc.httpDispatchFn?.isSome && !pathOnly.startsWith "/_qed/" then return .deferHead
+          return deferBody
+        if oidcRt?.isSome && (pathOnly.startsWith "/_qed/auth/" || req.auth?.isSome) then return deferBody
+        if fc.httpDispatchFn?.isSome && !pathOnly.startsWith "/_qed/" then return deferBody
         if hasBlockingMethods then
           if req.method == "POST" && pathOnly.startsWith rpcPrefix then
-            if methodMayBlock (dropPrefixBytes pathOnly rpcPrefixBytes) then return .deferHead
-          else if isGetOrHead && !pathOnly.startsWith "/_qed/" then return .deferHead
+            if methodMayBlock (dropPrefixBytes pathOnly rpcPrefixBytes) then return deferBody
+          else if isGetOrHead && !pathOnly.startsWith "/_qed/" then return deferBody
       if req.contentLen == 0 then
         return finishHeadWire req (← dispatchAppReqWith req ByteArray.empty clientIp pathOnly staticTarget?)
       else
@@ -1309,19 +1379,20 @@ def runStatefulFullstack {σ Model Msg : Type}
     (primaryDb? : Option Db.DbConfig := none) : IO UInt32 := do
   let box ← Prim.mkStateBox initState
   let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry)
-  let wsSrvInst : MonadServer IO := mkNativeServerInst (some gcpCache) none
+  let dbCache ← mkDbResolveCache primaryDb?
+  let wsSrvInst : MonadServer IO := mkNativeServerInstWith (some gcpCache) none none (some dbCache)
   let atomicInst : MonadAtomic σ IO := withStateBox box
   runFullstackCore app {
     title, serverShortName, requiredSecrets, port, staticDir, devMode, numWorkers,
     blockingMethods?, authSpec?, authHookFlags, primaryDb?,
     dispatchFn := fun ctx mName reqBytes =>
-      withCookieSink gcpCache fun srv => @dispatchM IO _ srv atomicInst ctx mName reqBytes,
+      withCookieSink gcpCache (some dbCache) fun srv => @dispatchM IO _ srv atomicInst ctx mName reqBytes,
     wsDispatchFn? := wsDispatchM?.map fun wsM ctx kind ch params payload =>
       @wsM IO _ wsSrvInst atomicInst ctx kind ch params payload,
     httpDispatchFn? := httpDispatchM?.map fun httpM ctx method path => do
       let cookieRef ← IO.mkRef (#[] : Array SetCookie)
       let sseRef ← IO.mkRef (#[] : Array SseEvent)
-      let res ← @httpM IO _ (mkNativeServerInst (some gcpCache) (some cookieRef) (some sseRef)) atomicInst ctx method path
+      let res ← @httpM IO _ (mkNativeServerInstWith (some gcpCache) (some cookieRef) (some sseRef) (some dbCache)) atomicInst ctx method path
       let sseEvs ← sseRef.get
       let res' := match res with
         | .ok (some resp) =>
@@ -1332,7 +1403,7 @@ def runStatefulFullstack {σ Model Msg : Type}
       return (res', ← cookieRef.get),
     jobs := jobs.map (·.toIoJob wsSrvInst atomicInst),
     authHookFn? := authHookM?.map fun hookM ctx kind =>
-      withCookieSink gcpCache fun srv => @hookM IO _ srv atomicInst ctx kind
+      withCookieSink gcpCache (some dbCache) fun srv => @hookM IO _ srv atomicInst ctx kind
   }
 
 /-- Serves a standalone `Qed.App` (`component` or `Qed.run`) with native in-memory SSR and static asset serving. -/

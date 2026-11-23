@@ -174,11 +174,13 @@ opaque wsBroadcast (topicKey : @& String) (payload : @& ByteArray) : IO Unit
 /-- Decision returned by Lean's verified HTTP/1.1 head handler to the Rust socket loop.
     All constructor fields are object-typed so the FFI never relies on scalar field layout. -/
 inductive HttpHeadAction (Req Ctx : Type) where
-  | doneClose     (respWire : ByteArray)
-  | doneKeepAlive (respWire : ByteArray)
-  | needBodyClose (contentLen : Nat) (req : Req)
-  | needBodyKeep  (contentLen : Nat) (req : Req)
-  | wsUpgrade     (respWire : ByteArray) (wsCtx : Ctx)
+  | doneClose      (respWire : ByteArray)
+  | doneKeepAlive  (respWire : ByteArray)
+  | needBodyClose  (contentLen : Nat) (req : Req)
+  | needBodyKeep   (contentLen : Nat) (req : Req)
+  | wsUpgrade      (respWire : ByteArray) (wsCtx : Ctx)
+  | deferBodyClose (contentLen : Nat) (req : Req)
+  | deferBodyKeep  (contentLen : Nat) (req : Req)
   | deferHead
 
 /-- Subscription table mutation emitted by Lean's verified WebSocket frame/mux handler. -/

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ffi::{c_void, CString};
 use std::io::Read;
 use std::os::fd::FromRawFd;
@@ -113,21 +114,31 @@ pub unsafe extern "C" fn qed_server_open_static_dir(path_obj: *mut LeanObj) -> *
 }
 
 fn open_beneath_nofollow(dirfd: libc::c_int, rel_path: &str) -> Option<libc::c_int> {
-    if dirfd < 0 || rel_path.is_empty() || rel_path.starts_with('/') || rel_path.contains('\0') {
+    if dirfd < 0 || rel_path.is_empty() || rel_path.starts_with('/') {
         return None;
     }
     #[cfg(target_os = "linux")]
     {
         #[repr(C)]
         struct OpenHow { flags: u64, mode: u64, resolve: u64 }
-        if let Ok(cs) = CString::new(rel_path) {
-            let how = OpenHow { flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64, mode: 0, resolve: 0x0C };
-            let fd = unsafe {
-                libc::syscall(libc::SYS_openat2, dirfd, cs.as_ptr(), &how as *const OpenHow, std::mem::size_of::<OpenHow>())
-            };
-            if fd >= 0 { return Some(fd as libc::c_int); }
-            if last_errno() != libc::ENOSYS { return None; }
-        }
+        let bytes = rel_path.as_bytes();
+        if bytes.contains(&0) { return None; }
+        let how = OpenHow { flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64, mode: 0, resolve: 0x0C };
+        let mut stack_buf = [0u8; 512];
+        let heap_cstr;
+        let cptr = if bytes.len() < stack_buf.len() {
+            stack_buf[..bytes.len()].copy_from_slice(bytes);
+            stack_buf[bytes.len()] = 0;
+            stack_buf.as_ptr() as *const libc::c_char
+        } else {
+            heap_cstr = CString::new(bytes).ok()?;
+            heap_cstr.as_ptr()
+        };
+        let fd = unsafe {
+            libc::syscall(libc::SYS_openat2, dirfd, cptr, &how as *const OpenHow, std::mem::size_of::<OpenHow>())
+        };
+        if fd >= 0 { return Some(fd as libc::c_int); }
+        if last_errno() != libc::ENOSYS { return None; }
     }
     // Portable fallback (macOS & pre-5.6 Linux): segment-by-segment `openat` + `O_NOFOLLOW`.
     let segs: Vec<&str> = rel_path.split('/').collect();
@@ -149,6 +160,34 @@ fn open_beneath_nofollow(dirfd: libc::c_int, rel_path: &str) -> Option<libc::c_i
     Some(cur)
 }
 
+fn read_exact_or_eof(file: &mut std::fs::File, dst: &mut [u8]) -> Option<usize> {
+    let mut filled = 0;
+    while filled < dst.len() {
+        match file.read(&mut dst[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    Some(filled)
+}
+
+fn read_tail_capped(file: &mut std::fs::File, head: &[u8], extra: &[u8]) -> Option<Vec<u8>> {
+    let base_len = head.len().checked_add(extra.len())?;
+    if (base_len as u64) > MAX_STATIC_FILE_BYTES { return None; }
+    let mut out = Vec::with_capacity(base_len);
+    out.extend_from_slice(head);
+    out.extend_from_slice(extra);
+    let limit = MAX_STATIC_FILE_BYTES - (base_len as u64) + 1;
+    if file.by_ref().take(limit).read_to_end(&mut out).is_err()
+        || (out.len() as u64) > MAX_STATIC_FILE_BYTES
+    {
+        return None;
+    }
+    Some(out)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_read_static_file(
     dir_obj: *mut LeanObj,
@@ -163,14 +202,42 @@ pub unsafe extern "C" fn qed_server_read_static_file(
         let mtime_ms = meta.modified().ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map_or(0usize, |d| d.as_millis().min(usize::MAX as u128) as usize);
-        let (size, buf) = if head_only != 0 {
-            (meta.len() as usize, Vec::new())
+        let meta_len = meta.len() as usize;
+        let (size, ba_obj) = if head_only != 0 {
+            (meta_len, mk_ba(&[]))
+        } else if meta_len == 0 {
+            let mut extra = [0u8; 64];
+            let n = read_exact_or_eof(&mut file, &mut extra)?;
+            if n == 0 {
+                (0, mk_ba(&[]))
+            } else {
+                let tail = read_tail_capped(&mut file, &[], &extra[..n])?;
+                (tail.len(), mk_ba(&tail))
+            }
         } else {
-            let mut b = Vec::with_capacity(meta.len() as usize);
-            if file.read_to_end(&mut b).is_err() || (b.len() as u64) > MAX_STATIC_FILE_BYTES { return None; }
-            (b.len(), b)
+            let ba = LeanRef(qed_lean_alloc_ba_uninit(meta_len));
+            let dst = std::slice::from_raw_parts_mut(qed_lean_ba_ptr(ba.0), meta_len);
+            let filled = read_exact_or_eof(&mut file, dst)?;
+            if filled < meta_len {
+                if filled == 0 {
+                    (0, mk_ba(&[]))
+                } else {
+                    qed_lean_ba_set_size(ba.0, filled);
+                    (filled, ba.into_raw())
+                }
+            } else {
+                let mut extra = [0u8; 64];
+                let extra_n = read_exact_or_eof(&mut file, &mut extra)?;
+                if extra_n == 0 {
+                    qed_lean_ba_set_size(ba.0, filled);
+                    (filled, ba.into_raw())
+                } else {
+                    let grown = read_tail_capped(&mut file, &dst[..filled], &extra[..extra_n])?;
+                    (grown.len(), mk_ba(&grown))
+                }
+            }
         };
-        let inner = qed_lean_mk_prod(qed_lean_usize_to_nat(mtime_ms), mk_ba(&buf));
+        let inner = qed_lean_mk_prod(qed_lean_usize_to_nat(mtime_ms), ba_obj);
         Some(qed_lean_mk_prod(qed_lean_usize_to_nat(size), inner))
     })();
     qed_lean_io_mk_ok(mk_opt(res))
@@ -189,30 +256,112 @@ pub unsafe extern "C" fn qed_server_now_ms() -> *mut LeanObj {
     qed_lean_io_mk_ok(qed_lean_box_u64(ms))
 }
 
-fn encode_hex(bs: &[u8]) -> String {
+fn write_hex(src: &[u8], dst: &mut [u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bs.len() * 2);
-    for &b in bs {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0F) as usize] as char);
+    debug_assert_eq!(dst.len(), src.len() * 2);
+    for (&b, pair) in src.iter().zip(dst.chunks_exact_mut(2)) {
+        pair[0] = HEX[(b >> 4) as usize];
+        pair[1] = HEX[(b & 0x0F) as usize];
     }
-    out
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_random_hex(num_bytes: u32) -> *mut LeanObj {
-    if num_bytes == 0 { return qed_lean_io_mk_ok(mk_str("")); }
-    let mut raw = vec![0u8; (num_bytes as usize).min(65536)];
+    let n = (num_bytes as usize).min(65536);
+    if n == 0 { return qed_lean_io_mk_ok(mk_str("")); }
+    if n <= 64 {
+        let mut raw = [0u8; 64];
+        if SystemRandom::new().fill(&mut raw[..n]).is_err() {
+            return qed_lean_io_mk_err(c"CSPRNG failure".as_ptr());
+        }
+        let mut hex = [0u8; 128];
+        write_hex(&raw[..n], &mut hex[..n * 2]);
+        return qed_lean_io_mk_ok(mk_str(std::str::from_utf8_unchecked(&hex[..n * 2])));
+    }
+    let mut raw = vec![0u8; n];
     if SystemRandom::new().fill(&mut raw).is_err() {
         return qed_lean_io_mk_err(c"CSPRNG failure".as_ptr());
     }
-    qed_lean_io_mk_ok(mk_str(&encode_hex(&raw)))
+    let mut hex = vec![0u8; n * 2];
+    write_hex(&raw, &mut hex);
+    qed_lean_io_mk_ok(mk_str(std::str::from_utf8_unchecked(&hex)))
+}
+
+const HMAC_CACHE_SLOTS: usize = 4;
+const HMAC_CACHE_MAX_KEY: usize = 256;
+
+struct HmacCacheEntry {
+    len: usize,
+    raw: [u8; HMAC_CACHE_MAX_KEY],
+    key: hmac::Key,
+}
+
+struct HmacKeyCache {
+    slots: Vec<HmacCacheEntry>,
+    order: [u8; HMAC_CACHE_SLOTS],
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
+}
+
+impl HmacKeyCache {
+    const fn new() -> Self {
+        Self { slots: Vec::new(), order: [0, 1, 2, 3] }
+    }
+
+    fn get_or_insert(&mut self, key_bytes: &[u8]) -> &hmac::Key {
+        let len = self.slots.len();
+        for rank in 0..len {
+            let idx = self.order[rank] as usize;
+            let e = &self.slots[idx];
+            if ct_eq(&e.raw[..e.len], key_bytes) {
+                if rank > 0 {
+                    self.order[..=rank].rotate_right(1);
+                }
+                return &self.slots[idx].key;
+            }
+        }
+        let key = hmac::Key::new(hmac::HMAC_SHA256, key_bytes);
+        if len < HMAC_CACHE_SLOTS {
+            let mut raw = [0u8; HMAC_CACHE_MAX_KEY];
+            raw[..key_bytes.len()].copy_from_slice(key_bytes);
+            self.slots.push(HmacCacheEntry { len: key_bytes.len(), raw, key });
+            self.order[..=len].rotate_right(1);
+            self.order[0] = len as u8;
+            &self.slots[len].key
+        } else {
+            let victim = self.order[HMAC_CACHE_SLOTS - 1] as usize;
+            let slot = &mut self.slots[victim];
+            slot.len = key_bytes.len();
+            slot.raw[..key_bytes.len()].copy_from_slice(key_bytes);
+            slot.key = key;
+            self.order.rotate_right(1);
+            &self.slots[victim].key
+        }
+    }
+}
+
+thread_local! {
+    static HMAC_KEY_CACHE: RefCell<HmacKeyCache> = const { RefCell::new(HmacKeyCache::new()) };
+}
+
+fn with_hmac_key<R>(key_bytes: &[u8], f: impl FnOnce(&hmac::Key) -> R) -> R {
+    if key_bytes.len() > HMAC_CACHE_MAX_KEY {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, key_bytes);
+        return f(&key);
+    }
+    HMAC_KEY_CACHE.with(|cell| f(cell.borrow_mut().get_or_insert(key_bytes)))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn qed_server_hmac_sha256(key_obj: *mut LeanObj, msg_obj: *mut LeanObj) -> *mut LeanObj {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, ba_slice(key_obj));
-    let tag = hmac::sign(&key, ba_slice(msg_obj));
+    let tag = with_hmac_key(ba_slice(key_obj), |k| hmac::sign(k, ba_slice(msg_obj)));
     qed_lean_io_mk_ok(mk_ba(tag.as_ref()))
 }
 
@@ -222,8 +371,8 @@ pub unsafe extern "C" fn qed_server_hmac_sha256_verify(
     msg_obj: *mut LeanObj,
     sig_obj: *mut LeanObj,
 ) -> *mut LeanObj {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, ba_slice(key_obj));
-    mk_io_bool(hmac::verify(&key, ba_slice(msg_obj), ba_slice(sig_obj)).is_ok())
+    let ok = with_hmac_key(ba_slice(key_obj), |k| hmac::verify(k, ba_slice(msg_obj), ba_slice(sig_obj)).is_ok());
+    mk_io_bool(ok)
 }
 
 fn parse_rsa_keypair(pem: &str) -> Option<RsaKeyPair> {
@@ -284,36 +433,63 @@ pub unsafe extern "C" fn qed_server_pbkdf2_sha256(
 
 // ---- RFC 7517 JWK Verification (RS256 & ES256) & Ephemeral P-256 Keygen/Sign ----
 
-fn der_push_len(out: &mut Vec<u8>, len: usize) {
+const RSA_DER_BUF_CAP: usize = 1120;
+
+fn der_len_size(len: usize) -> usize {
+    if len < 0x80 { 1 } else if len < 0x100 { 2 } else { 3 }
+}
+
+fn der_write_len(out: &mut [u8], pos: &mut usize, len: usize) {
     if len < 0x80 {
-        out.push(len as u8);
+        out[*pos] = len as u8;
+        *pos += 1;
+    } else if len < 0x100 {
+        out[*pos] = 0x81;
+        out[*pos + 1] = len as u8;
+        *pos += 2;
     } else {
-        let be = len.to_be_bytes();
-        let sig = &be[be.iter().position(|&b| b != 0).unwrap_or(be.len() - 1)..];
-        out.push(0x80 | (sig.len() as u8));
-        out.extend_from_slice(sig);
+        out[*pos] = 0x82;
+        out[*pos + 1] = (len >> 8) as u8;
+        out[*pos + 2] = len as u8;
+        *pos += 3;
     }
 }
 
-fn der_push_uint(out: &mut Vec<u8>, raw: &[u8]) {
+fn der_trim_uint(raw: &[u8]) -> (&[u8], bool) {
     let trimmed = raw.iter().position(|&b| b != 0).map_or(&[0u8][..], |i| &raw[i..]);
-    let pad = usize::from(trimmed[0] & 0x80 != 0);
-    out.push(0x02); // INTEGER
-    der_push_len(out, trimmed.len() + pad);
-    if pad != 0 { out.push(0x00); }
-    out.extend_from_slice(trimmed);
+    (trimmed, trimmed[0] & 0x80 != 0)
 }
 
-fn encode_rsa_pub_der(n: &[u8], e: &[u8]) -> Option<Vec<u8>> {
+fn der_uint_encoded_len(trimmed: &[u8], pad: bool) -> usize {
+    let vlen = trimmed.len() + usize::from(pad);
+    1 + der_len_size(vlen) + vlen
+}
+
+fn der_write_uint(out: &mut [u8], pos: &mut usize, trimmed: &[u8], pad: bool) {
+    let vlen = trimmed.len() + usize::from(pad);
+    out[*pos] = 0x02; // INTEGER
+    *pos += 1;
+    der_write_len(out, pos, vlen);
+    if pad {
+        out[*pos] = 0x00;
+        *pos += 1;
+    }
+    out[*pos..*pos + trimmed.len()].copy_from_slice(trimmed);
+    *pos += trimmed.len();
+}
+
+fn encode_rsa_pub_der<'a>(n: &[u8], e: &[u8], buf: &'a mut [u8; RSA_DER_BUF_CAP]) -> Option<&'a [u8]> {
     if n.is_empty() || e.is_empty() || n.len() > 1024 || e.len() > 64 { return None; }
-    let mut body = Vec::with_capacity(n.len() + e.len() + 16);
-    der_push_uint(&mut body, n);
-    der_push_uint(&mut body, e);
-    let mut seq = Vec::with_capacity(body.len() + 8);
-    seq.push(0x30); // SEQUENCE
-    der_push_len(&mut seq, body.len());
-    seq.extend_from_slice(&body);
-    Some(seq)
+    let (tn, pn) = der_trim_uint(n);
+    let (te, pe) = der_trim_uint(e);
+    let body_len = der_uint_encoded_len(tn, pn) + der_uint_encoded_len(te, pe);
+    let mut pos = 0;
+    buf[pos] = 0x30; // SEQUENCE
+    pos += 1;
+    der_write_len(buf, &mut pos, body_len);
+    der_write_uint(buf, &mut pos, tn, pn);
+    der_write_uint(buf, &mut pos, te, pe);
+    Some(&buf[..pos])
 }
 
 #[no_mangle]
@@ -323,7 +499,8 @@ pub unsafe extern "C" fn qed_server_rsa_jwk_verify(
     msg_obj: *mut LeanObj,
     sig_obj: *mut LeanObj,
 ) -> *mut LeanObj {
-    let ok = encode_rsa_pub_der(ba_slice(n_obj), ba_slice(e_obj)).is_some_and(|der| {
+    let mut der_buf = [0u8; RSA_DER_BUF_CAP];
+    let ok = encode_rsa_pub_der(ba_slice(n_obj), ba_slice(e_obj), &mut der_buf).is_some_and(|der| {
         UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, der)
             .verify(ba_slice(msg_obj), ba_slice(sig_obj)).is_ok()
     });
@@ -378,4 +555,67 @@ pub unsafe extern "C" fn qed_server_ec_p256_sign(
         .map_err(|_| "invalid P-256 PKCS#8 private key")
         .and_then(|kp| kp.sign(&rng, ba_slice(msg_obj)).map_err(|_| "ES256 signing failed"));
     mk_io_except(res, |sig| mk_ba(sig.as_ref()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_rsa_pub_der_edge_cases() {
+        let mut buf = [0u8; RSA_DER_BUF_CAP];
+        // Bounds rejections
+        assert!(encode_rsa_pub_der(&[], &[1], &mut buf).is_none());
+        assert!(encode_rsa_pub_der(&[1], &[], &mut buf).is_none());
+        assert!(encode_rsa_pub_der(&[1u8; 1025], &[1], &mut buf).is_none());
+        assert!(encode_rsa_pub_der(&[1], &[1u8; 65], &mut buf).is_none());
+
+        // Leading zeros stripped + all-zeros -> 0x00 + high-bit 0x00 pad
+        let der = encode_rsa_pub_der(&[0, 0, 0x80, 0x01], &[0, 0], &mut buf).unwrap();
+        assert_eq!(der, &[0x30, 0x08, 0x02, 0x03, 0x00, 0x80, 0x01, 0x02, 0x01, 0x00]);
+
+        // 1-byte long length (0x81) for 128-byte high-bit n (vlen = 129)
+        let n128 = [0x80u8; 128];
+        let der = encode_rsa_pub_der(&n128, &[0x01, 0x00, 0x01], &mut buf).unwrap();
+        assert_eq!(&der[..7], &[0x30, 0x81, 0x89, 0x02, 0x81, 0x81, 0x00]);
+        assert_eq!(der.len(), 140);
+
+        // 2-byte long length (0x82) at max bounds (n=1024 high-bit, e=64 high-bit) -> 1100 <= 1120
+        let der = encode_rsa_pub_der(&[0xFFu8; 1024], &[0xFFu8; 64], &mut buf).unwrap();
+        assert_eq!(&der[..8], &[0x30, 0x82, 0x04, 0x48, 0x02, 0x82, 0x04, 0x01]);
+        assert_eq!(der.len(), 1100);
+    }
+
+    #[test]
+    fn write_hex_and_hmac_key_cache() {
+        let mut out = [0u8; 10];
+        write_hex(&[0x00, 0x0f, 0x10, 0xab, 0xff], &mut out);
+        assert_eq!(&out, b"000f10abff");
+        write_hex(&[], &mut []);
+
+        // Cache hit, MRU promotion, eviction past 4 slots, and >256B uncached fallback
+        let msg = b"session-payload-v2";
+        let keys: Vec<Vec<u8>> = (0u8..6).map(|i| vec![b'k' + i; 32]).collect();
+        let mut cache = HmacKeyCache::new();
+        for k in &keys[..4] {
+            let tag = hmac::sign(cache.get_or_insert(k), msg);
+            let fresh = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, k), msg);
+            assert_eq!(tag.as_ref(), fresh.as_ref());
+        }
+        assert_eq!(cache.slots.len(), 4);
+        // Promote keys[0] (currently LRU) to MRU, then insert keys[4] -> evicts keys[1]
+        let _ = cache.get_or_insert(&keys[0]);
+        let mru = &cache.slots[cache.order[0] as usize];
+        assert_eq!(&mru.raw[..mru.len], &keys[0][..]);
+        let _ = cache.get_or_insert(&keys[4]);
+        assert_eq!(cache.slots.len(), 4);
+        assert!(!cache.slots.iter().any(|e| &e.raw[..e.len] == &keys[1][..]));
+
+        // with_hmac_key across cached (<=256B) and uncached (>256B) keys
+        for k in [keys[0].as_slice(), keys[5].as_slice(), &[0x42u8; 300][..]] {
+            let tag = with_hmac_key(k, |hk| hmac::sign(hk, msg));
+            assert!(with_hmac_key(k, |hk| hmac::verify(hk, msg, tag.as_ref()).is_ok()));
+            assert_eq!(tag.as_ref(), hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, k), msg).as_ref());
+        }
+    }
 }

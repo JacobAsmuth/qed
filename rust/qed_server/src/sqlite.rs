@@ -1,15 +1,25 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
-use rusqlite::types::{Value, ValueRef};
+use rusqlite::types::{ToSqlOutput, ValueRef};
 use rusqlite::{params_from_iter, Connection, OpenFlags};
 
 use crate::lean_ffi::*;
 use crate::{HandleTable, lock_unpoison};
 
-const MAX_READERS_PER_DB: usize = 16;
+const STMT_CACHE_CAPACITY: usize = 128;
+const TLS_POOL_CACHE_CAP: usize = 4;
+const INLINE_PARAM_CAP: usize = 16;
+
+fn max_readers_per_db() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::thread::available_parallelism().map_or(16, |n| n.get().clamp(8, 32))
+    })
+}
 
 struct SqliteDbPool {
     path: String,
@@ -46,14 +56,18 @@ impl SqliteDbPool {
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let conn = Connection::open_with_flags(&self.path, flags)
             .map_err(|e| format!("sqlite open read-only `{}` failed: {e}", self.path))?;
+        conn.set_prepared_statement_cache_capacity(STMT_CACHE_CAPACITY);
         let _ = conn.busy_timeout(Duration::from_secs(5));
-        let _ = conn.execute_batch("PRAGMA query_only = ON;");
+        let _ = conn.execute_batch(
+            "PRAGMA query_only = ON; PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY; \
+             PRAGMA cache_size = -2000; PRAGMA mmap_size = 67108864;",
+        );
         Ok(conn)
     }
 
     fn return_reader(&self, conn: Connection) {
         let mut pool = lock_unpoison(&self.readers);
-        if pool.len() < MAX_READERS_PER_DB {
+        if pool.len() < max_readers_per_db() {
             pool.push(conn);
         }
     }
@@ -72,8 +86,8 @@ impl<'a> ConnGuard<'a> {
     fn reader(pool: &'a SqliteDbPool) -> Result<Self, String> {
         Ok(Self { pool, conn: Some(pool.checkout_reader()?), is_writer: false })
     }
-    fn conn_mut(&mut self) -> &mut Connection {
-        self.conn.as_mut().expect("connection checked out")
+    fn conn(&self) -> &Connection {
+        self.conn.as_ref().expect("connection checked out")
     }
 }
 
@@ -113,20 +127,39 @@ impl Drop for ActiveSqliteTx {
     fn drop(&mut self) { let _ = self.finish(false); }
 }
 
-static SQLITE_POOL: OnceLock<Mutex<HashMap<String, Arc<SqliteDbPool>>>> = OnceLock::new();
+static SQLITE_POOL: OnceLock<RwLock<HashMap<String, Arc<SqliteDbPool>>>> = OnceLock::new();
 static ACTIVE_TXS: HandleTable<Arc<Mutex<ActiveSqliteTx>>> = HandleTable::new();
+
+thread_local! {
+    static TLS_DB_CACHE: RefCell<Vec<(String, Arc<SqliteDbPool>)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn cache_tls_pool(path: &str, db: &Arc<SqliteDbPool>) {
+    TLS_DB_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if !cache.iter().any(|(k, _)| k == path) {
+            if cache.len() >= TLS_POOL_CACHE_CAP {
+                cache.remove(0);
+            }
+            cache.push((path.to_owned(), db.clone()));
+        }
+    });
+}
 
 fn is_memory_path(path: &str) -> bool {
     path == ":memory:" || path.is_empty() || path.contains("mode=memory") || path.starts_with("file::memory:")
 }
 
 fn open_db_pool(path: &str) -> Result<Arc<SqliteDbPool>, String> {
-    let pool = SQLITE_POOL.get_or_init(|| Mutex::new(HashMap::new()));
-    {
-        let map = lock_unpoison(pool);
-        if let Some(db) = map.get(path) {
-            return Ok(db.clone());
-        }
+    if let Some(db) = TLS_DB_CACHE.with(|c| {
+        c.borrow().iter().find(|(k, _)| k == path).map(|(_, v)| v.clone())
+    }) {
+        return Ok(db);
+    }
+    let pool = SQLITE_POOL.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(db) = pool.read().unwrap_or_else(|e| e.into_inner()).get(path).cloned() {
+        cache_tls_pool(path, &db);
+        return Ok(db);
     }
     let is_mem = is_memory_path(path);
     if !is_mem {
@@ -143,8 +176,16 @@ fn open_db_pool(path: &str) -> Result<Arc<SqliteDbPool>, String> {
         Connection::open(path)
     }
     .map_err(|e| format!("sqlite open `{path}` failed: {e}"))?;
+    conn.set_prepared_statement_cache_capacity(STMT_CACHE_CAPACITY);
     let _ = conn.busy_timeout(Duration::from_secs(5));
-    let _ = conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+    let pragmas = if is_mem {
+        "PRAGMA foreign_keys = ON; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -8000;"
+    } else {
+        "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; \
+         PRAGMA temp_store = MEMORY; PRAGMA cache_size = -8000; \
+         PRAGMA mmap_size = 67108864; PRAGMA journal_size_limit = 67108864;"
+    };
+    let _ = conn.execute_batch(pragmas);
     let arc = Arc::new(SqliteDbPool {
         path: path.to_owned(),
         is_memory: is_mem,
@@ -152,56 +193,105 @@ fn open_db_pool(path: &str) -> Result<Arc<SqliteDbPool>, String> {
         writer_cv: Condvar::new(),
         readers: Mutex::new(Vec::new()),
     });
-    let mut map = lock_unpoison(pool);
-    Ok(map.entry(path.to_owned()).or_insert_with(|| arc.clone()).clone())
+    let db = {
+        let mut map = pool.write().unwrap_or_else(|e| e.into_inner());
+        map.entry(path.to_owned()).or_insert_with(|| arc).clone()
+    };
+    cache_tls_pool(path, &db);
+    Ok(db)
+}
+
+fn exec_ddl(db: &SqliteDbPool, ddl: &str) -> Result<(), String> {
+    let writer = ConnGuard::writer(db);
+    let r = writer.conn().execute_batch(ddl).map_err(|e| format!("sqlite ddl failed: {e}"));
+    // Drop cached read-only connections so schema changes are immediately visible cleanly.
+    lock_unpoison(&db.readers).clear();
+    r
 }
 
 /// Returns true iff `sql` is a pure single-statement `SELECT` query safe to execute on the
 /// concurrent read-only WAL reader pool (no write ops, no `RETURNING`, no stacked statements).
 fn is_readonly_select(sql: &str) -> bool {
-    let trimmed = sql.trim_start();
-    if trimmed.contains(';') {
-        return false;
-    }
-    let upper = trimmed.to_ascii_uppercase();
-    let starts_select = upper.starts_with("SELECT ") || upper.starts_with("SELECT\t") || upper.starts_with("SELECT\n");
-    if !starts_select {
-        return false;
-    }
-    // Reject any mutating clauses (e.g. CTE writes or RETURNING)
-    const WRITE_TOKENS: &[&str] = &[
-        "INSERT ", "UPDATE ", "DELETE ", "REPLACE ", "DROP ", "ALTER ",
-        "CREATE ", "ATTACH ", "DETACH ", "VACUUM", "REINDEX", "RETURNING",
+    const WRITE_WS_TOKS: &[&[u8]] = &[
+        b"INSERT", b"UPDATE", b"DELETE", b"REPLACE", b"DROP",
+        b"ALTER", b"CREATE", b"ATTACH", b"DETACH",
     ];
-    !WRITE_TOKENS.iter().any(|kw| upper.contains(kw))
+    const WRITE_ANY_TOKS: &[&[u8]] = &[b"VACUUM", b"REINDEX", b"RETURNING"];
+
+    let bytes = sql.trim_start().as_bytes();
+    if bytes.len() < 7
+        || !bytes[..6].eq_ignore_ascii_case(b"SELECT")
+        || !bytes[6].is_ascii_whitespace()
+    {
+        return false;
+    }
+    let tail = &bytes[7..];
+    for (i, &b) in tail.iter().enumerate() {
+        if b == b';' {
+            return false;
+        }
+        match b | 0x20 {
+            b'a' | b'c' | b'd' | b'i' | b'r' | b'u' | b'v' => {
+                let rest = &tail[i..];
+                for &kw in WRITE_WS_TOKS {
+                    if rest.len() > kw.len()
+                        && rest[..kw.len()].eq_ignore_ascii_case(kw)
+                        && rest[kw.len()].is_ascii_whitespace()
+                    {
+                        return false;
+                    }
+                }
+                for &kw in WRITE_ANY_TOKS {
+                    if rest.len() >= kw.len() && rest[..kw.len()].eq_ignore_ascii_case(kw) {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 // ---- Direct Lean-Object `SqlVal` / `DbResult` FFI Conversion ----
 // Matches `Qed.Server.Db.SqlVal` (tags 0=null, 1=int, 2=text, 3=bool[u8@0], 4=bytes)
 // and `Qed.Server.Db.DbResult` (tag 0, 2 objs: rows, affected).
 
-unsafe fn params_from_lean(params_arr: *mut LeanObj) -> Result<Vec<Value>, String> {
-    let n = qed_lean_array_size(params_arr);
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let elem = qed_lean_array_get_core(params_arr, i);
-        let val = match qed_lean_obj_tag(elem) {
-            0 => Value::Null,
-            1 => {
-                let mut v: i64 = 0;
-                if qed_lean_int_to_i64_checked(qed_lean_ctor_get(elem, 0), &mut v) == 0 {
-                    return Err("SQLite integer parameter out of i64 range".to_owned());
-                }
-                Value::Integer(v)
+unsafe fn decode_lean_param<'a>(elem: *mut LeanObj) -> Result<ValueRef<'a>, String> {
+    match qed_lean_obj_tag(elem) {
+        0 => Ok(ValueRef::Null),
+        1 => {
+            let mut v: i64 = 0;
+            if qed_lean_int_to_i64_checked(qed_lean_ctor_get(elem, 0), &mut v) == 0 {
+                return Err("SQLite integer parameter out of i64 range".to_owned());
             }
-            2 => Value::Text(str_slice(qed_lean_ctor_get(elem, 0)).to_owned()),
-            3 => Value::Integer(if qed_lean_ctor_get_u8(elem, 0) != 0 { 1 } else { 0 }),
-            4 => Value::Blob(ba_slice(qed_lean_ctor_get(elem, 0)).to_vec()),
-            tag => return Err(format!("unknown SqlVal constructor tag {tag}")),
-        };
-        out.push(val);
+            Ok(ValueRef::Integer(v))
+        }
+        2 => Ok(ValueRef::Text(str_slice(qed_lean_ctor_get(elem, 0)).as_bytes())),
+        3 => Ok(ValueRef::Integer(if qed_lean_ctor_get_u8(elem, 0) != 0 { 1 } else { 0 })),
+        4 => Ok(ValueRef::Blob(ba_slice(qed_lean_ctor_get(elem, 0)))),
+        tag => Err(format!("unknown SqlVal constructor tag {tag}")),
     }
-    Ok(out)
+}
+
+unsafe fn with_lean_params<R>(
+    params_arr: *mut LeanObj,
+    f: impl FnOnce(&[ValueRef<'_>]) -> Result<R, String>,
+) -> Result<R, String> {
+    let n = qed_lean_array_size(params_arr);
+    if n <= INLINE_PARAM_CAP {
+        let mut stack = [ValueRef::Null; INLINE_PARAM_CAP];
+        for (i, slot) in stack[..n].iter_mut().enumerate() {
+            *slot = decode_lean_param(qed_lean_array_get_core(params_arr, i))?;
+        }
+        f(&stack[..n])
+    } else {
+        let mut heap = Vec::with_capacity(n);
+        for i in 0..n {
+            heap.push(decode_lean_param(qed_lean_array_get_core(params_arr, i))?);
+        }
+        f(&heap)
+    }
 }
 
 unsafe fn sqlite_val_to_lean(v: ValueRef<'_>) -> *mut LeanObj {
@@ -209,23 +299,33 @@ unsafe fn sqlite_val_to_lean(v: ValueRef<'_>) -> *mut LeanObj {
         ValueRef::Null => qed_lean_box(0),
         ValueRef::Integer(i) => qed_lean_mk_ctor_1(1, qed_lean_int64_to_int(i)),
         ValueRef::Real(f) => qed_lean_mk_ctor_1(2, mk_str(&f.to_string())),
-        ValueRef::Text(bs) => qed_lean_mk_ctor_1(2, mk_str(&String::from_utf8_lossy(bs))),
+        ValueRef::Text(bs) => {
+            let s = match std::str::from_utf8(bs) {
+                Ok(valid) => mk_str(valid),
+                Err(_) => mk_str(&String::from_utf8_lossy(bs)),
+            };
+            qed_lean_mk_ctor_1(2, s)
+        }
         ValueRef::Blob(bs) => qed_lean_mk_ctor_1(4, mk_ba(bs)),
     }
 }
 
-unsafe fn exec_on_conn(conn: &Connection, sql: &str, params: &[Value]) -> Result<*mut LeanObj, String> {
+unsafe fn exec_on_conn(
+    conn: &Connection,
+    sql: &str,
+    params: &[ValueRef<'_>],
+) -> Result<*mut LeanObj, String> {
     let mut stmt = conn.prepare_cached(sql).map_err(|e| format!("sqlite prepare failed: {e}"))?;
+    let bound = params_from_iter(params.iter().copied().map(ToSqlOutput::Borrowed));
     let col_count = stmt.column_count();
     if col_count > 0 {
-        let mut rows = stmt.query(params_from_iter(params.iter()))
-            .map_err(|e| format!("sqlite query failed: {e}"))?;
-        let mut rows_arr = LeanRef(qed_lean_array_with_cap(0));
+        let mut rows = stmt.query(bound).map_err(|e| format!("sqlite query failed: {e}"))?;
+        let mut rows_arr = LeanRef(qed_lean_array_with_cap(16));
         let mut row_count: usize = 0;
         while let Some(row) = rows.next().map_err(|e| format!("sqlite step failed: {e}"))? {
             let mut row_arr = LeanRef(qed_lean_array_with_cap(col_count));
             for ci in 0..col_count {
-                let v = row.get_ref(ci).map_err(|e| format!("sqlite col {ci} failed: {e}"))?;
+                let v = row.get_ref_unwrap(ci);
                 row_arr.0 = qed_lean_array_push(row_arr.0, sqlite_val_to_lean(v));
             }
             rows_arr.0 = qed_lean_array_push(rows_arr.0, row_arr.into_raw());
@@ -233,8 +333,7 @@ unsafe fn exec_on_conn(conn: &Connection, sql: &str, params: &[Value]) -> Result
         }
         Ok(qed_lean_mk_prod(rows_arr.into_raw(), qed_lean_usize_to_nat(row_count)))
     } else {
-        let affected = stmt.execute(params_from_iter(params.iter()))
-            .map_err(|e| format!("sqlite execute failed: {e}"))?;
+        let affected = stmt.execute(bound).map_err(|e| format!("sqlite execute failed: {e}"))?;
         Ok(qed_lean_mk_prod(qed_lean_array_with_cap(0), qed_lean_usize_to_nat(affected)))
     }
 }
@@ -248,16 +347,15 @@ pub unsafe extern "C" fn qed_server_sqlite_exec(
     let path = str_slice(path_obj);
     let sql = str_slice(sql_obj);
 
-    let res: Result<*mut LeanObj, String> = (|| {
-        let params = params_from_lean(params_arr)?;
+    let res: Result<*mut LeanObj, String> = with_lean_params(params_arr, |params| {
         let db = open_db_pool(path)?;
-        let mut guard = if !db.is_memory && is_readonly_select(sql) {
+        let guard = if !db.is_memory && is_readonly_select(sql) {
             ConnGuard::reader(&db)?
         } else {
             ConnGuard::writer(&db)
         };
-        exec_on_conn(guard.conn_mut(), sql, &params)
-    })();
+        exec_on_conn(guard.conn(), sql, params)
+    });
     mk_io_except(res, |obj| obj)
 }
 
@@ -268,14 +366,7 @@ pub unsafe extern "C" fn qed_server_sqlite_ddl(
 ) -> *mut LeanObj {
     let path = str_slice(path_obj);
     let ddl = str_slice(ddl_obj);
-    let res: Result<(), String> = (|| {
-        let db = open_db_pool(path)?;
-        let mut writer = ConnGuard::writer(&db);
-        let r = writer.conn_mut().execute_batch(ddl).map_err(|e| format!("sqlite ddl failed: {e}"));
-        // Drop cached read-only connections so schema changes are immediately visible cleanly.
-        lock_unpoison(&db.readers).clear();
-        r
-    })();
+    let res: Result<(), String> = open_db_pool(path).and_then(|db| exec_ddl(&db, ddl));
     mk_io_except(res, |()| qed_lean_box(0))
 }
 
@@ -301,14 +392,13 @@ pub unsafe extern "C" fn qed_server_sqlite_tx_exec(
     params_arr: *mut LeanObj,
 ) -> *mut LeanObj {
     let sql = str_slice(sql_obj);
-    let res: Result<*mut LeanObj, String> = (|| {
-        let params = params_from_lean(params_arr)?;
+    let res: Result<*mut LeanObj, String> = with_lean_params(params_arr, |params| {
         let tx_arc = ACTIVE_TXS.get(tx_id)
             .ok_or_else(|| format!("invalid sqlite transaction handle {tx_id}"))?;
         let tx = lock_unpoison(&tx_arc);
         let conn = tx.conn.as_ref().ok_or_else(|| "sqlite transaction already finished".to_owned())?;
-        exec_on_conn(conn, sql, &params)
-    })();
+        exec_on_conn(conn, sql, params)
+    });
     mk_io_except(res, |obj| obj)
 }
 
@@ -326,4 +416,103 @@ pub unsafe extern "C" fn qed_server_sqlite_tx_rollback(tx_id: u64) -> *mut LeanO
         let _ = lock_unpoison(&tx).finish(false);
     }
     mk_io_unit()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn is_readonly_select_cases() {
+        let cases: &[(&str, bool)] = &[
+            ("SELECT 1", true),
+            ("  \t\nselect\tid, name FROM users WHERE id = ?1", true),
+            ("SeLeCt\r\nCOUNT(*) FROM notes", true),
+            ("SELECT \"created_at\", \"updated_at\", \"deleted_at\" FROM items", true),
+            ("", false),
+            ("   ", false),
+            ("SELECT", false),
+            ("SELECTX FROM t", false),
+            ("INSERT INTO t VALUES (1)", false),
+            ("UPDATE t SET a = 1", false),
+            ("DELETE FROM t", false),
+            ("PRAGMA table_info(t)", false),
+            ("SELECT 1; DROP TABLE t", false),
+            ("SELECT 1;", false),
+            ("WITH x AS (INSERT INTO t VALUES (1)) SELECT * FROM t", false),
+            ("SELECT * FROM (WITH x AS (uPdAtE t SET a = 1) SELECT 1)", false),
+            ("SELECT * FROM (INSERT\tINTO t VALUES (1))", false),
+            ("SELECT * FROM t RETURNING id", false),
+            ("select * from t returning *", false),
+            ("SELECT * FROM t VACUUM", false),
+            ("SELECT * FROM t REINDEX", false),
+            ("SELECT * FROM t REPLACE INTO x", false),
+            ("SELECT * FROM t DROP TABLE x", false),
+            ("SELECT * FROM t ALTER TABLE x", false),
+            ("SELECT * FROM t CREATE TABLE x", false),
+            ("SELECT * FROM t ATTACH 'x'", false),
+            ("SELECT * FROM t DETACH x", false),
+        ];
+        for &(sql, want) in cases {
+            assert_eq!(is_readonly_select(sql), want, "sql={sql:?}");
+        }
+    }
+
+    #[test]
+    fn open_db_pool_wal_concurrent_readers_and_ddl_clear() {
+        struct TempDir(PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let uniq = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let tmp = TempDir(std::env::temp_dir().join(format!("qed_sqlite_test_{}_{}", std::process::id(), uniq)));
+        let db_path = tmp.0.join("sub").join("test.db").to_string_lossy().into_owned();
+
+        let db = open_db_pool(&db_path).expect("open_db_pool");
+        assert!(Arc::ptr_eq(&db, &open_db_pool(&db_path).expect("tls cache hit")));
+
+        {
+            let w = ConnGuard::writer(&db);
+            let mode: String = w.conn().query_row("PRAGMA journal_mode;", [], |r| r.get(0)).unwrap();
+            assert_eq!(mode.to_ascii_lowercase(), "wal");
+            let sync: i64 = w.conn().query_row("PRAGMA synchronous;", [], |r| r.get(0)).unwrap();
+            assert_eq!(sync, 1); // NORMAL
+            let fk: i64 = w.conn().query_row("PRAGMA foreign_keys;", [], |r| r.get(0)).unwrap();
+            assert_eq!(fk, 1);
+            w.conn().execute_batch(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT NOT NULL);
+                 INSERT INTO items VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+            ).unwrap();
+        }
+
+        // Concurrent WAL reads + writer across threads & query_only enforcement
+        std::thread::scope(|s| {
+            let p = db_path.as_str();
+            s.spawn(move || {
+                let pool = open_db_pool(p).expect("writer open");
+                let w = ConnGuard::writer(&pool);
+                w.conn().execute("INSERT INTO items VALUES (4, 'd')", []).unwrap();
+            });
+            for _ in 0..8 {
+                s.spawn(move || {
+                    let pool = open_db_pool(p).expect("thread open");
+                    let r = ConnGuard::reader(&pool).expect("reader");
+                    let cnt: i64 = r.conn().query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0)).unwrap();
+                    assert!(cnt == 3 || cnt == 4, "unexpected row count {cnt}");
+                    assert!(r.conn().execute("INSERT INTO items VALUES (99, 'x')", []).is_err());
+                });
+            }
+        });
+        assert!(!lock_unpoison(&db.readers).is_empty());
+
+        // DDL must clear cached readers and expose the new column cleanly
+        exec_ddl(&db, "ALTER TABLE items ADD COLUMN extra INTEGER NOT NULL DEFAULT 7;").expect("ddl");
+        assert!(lock_unpoison(&db.readers).is_empty());
+        let sum: i64 = ConnGuard::reader(&db).unwrap().conn()
+            .query_row("SELECT SUM(extra) FROM items", [], |r| r.get(0)).unwrap();
+        assert_eq!(sum, 28);
+        assert_eq!(lock_unpoison(&db.readers).len(), 1);
+    }
 }

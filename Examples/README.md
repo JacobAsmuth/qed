@@ -23,7 +23,7 @@ QED_WEB_ROOT=Examples.CloudBooks ./scripts/qed dev
 QED_WEB_ROOT=Examples.LiveRoom ./scripts/qed dev
 ```
 
-Run all proof checks and the 4 native test suites from the repo root:
+Run all proof checks and the 6 native test suites from the repo root:
 
 ```bash
 ./scripts/qed check

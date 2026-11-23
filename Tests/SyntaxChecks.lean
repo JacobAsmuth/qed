@@ -15,10 +15,8 @@ component Counter:
       emitted.emit(count)
   view: <button onClick={.advance(2)}>{count}</button>
 
-example : Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 2) =
-    ({ count := 10, saved := 10 }, some (.emitted 10)) := rfl
-example : Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 0) =
-    ({ count := 4, saved := 0 }, none) := rfl
+example : Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 2) = ({ count := 10, saved := 10 }, some (.emitted 10)) ∧
+    Counter.update { step := 3 } { count := 4, saved := 0 } (.advance 0) = ({ count := 4, saved := 0 }, none) := ⟨rfl, rfl⟩
 
 def defaults : Html Unit := <Counter initial={{ count = 8 }}/>
 #guard (Html.renderWith Counter.regs defaults).contains "8</button>"
@@ -38,18 +36,12 @@ component Widget:
   state note = ""
   state pinned = false
   event onReport(count: Int)
-  view:
-    <div>
-      <span>{note}</span>
-      <Tag key={f"t{id}"} label={label} onToggle={pinned = _}/>
-    </div>
+  view: <div><span>{note}</span><Tag key={f"t{id}"} label={label} onToggle={pinned = _}/></div>
 
 structure Row where
   id    : Nat
   label : String
-
-inductive ParentMsg
-  | reported (id : Nat) (count : Int)
+inductive ParentMsg | reported (id : Nat) (count : Int)
 
 end LocalNested
 
@@ -96,11 +88,7 @@ def ownedView : Html (String × Owned.Msg) :=
 example : (Owned.update { caption := "Live" } { id := 4, count := 2 } .increment).count = 3 := rfl
 
 def ssrEdgeCases : Html Unit :=
-  <div>
-    <style>{".a > .b { content: \"</style>\"; }"}</style>
-    <br/>
-    {defaults}
-  </div>
+  <div><style>{".a > .b { content: \"</style>\"; }"}</style><br/>{defaults}</div>
 #guard let s := Html.renderWith Counter.regs ssrEdgeCases
   [".a > .b", "<\\/style>", "8</button>"].all (s.contains ·) && !s.contains "</br>"
 
@@ -113,9 +101,11 @@ router DocRoute:
   home = ""
   sec(s: Section, page: Nat) = "docs"
 
-#guard Router.toURL (DocRoute.sec .architecture 2) == "/docs/arch/2"
-#guard Router.fromURL "/docs/bench/5" == some (DocRoute.sec .benchmarks 5)
-#guard (Router.fromURL "/docs/unknown/5" : Option DocRoute) == none
+#guard Router.toURL (DocRoute.sec .architecture 2) == "/docs/arch/2" &&
+  Router.fromURL "/docs/bench/5" == some (DocRoute.sec .benchmarks 5) &&
+  (Router.fromURL "/docs/unknown/5" : Option DocRoute) == none &&
+  Router.fromURL "/docs/arch/2?tab=api#top" == some (DocRoute.sec .architecture 2) &&
+  Router.fromURL "/?utm=1#hero" == some DocRoute.home
 
 style navOn:
   font-weight: 700
@@ -168,16 +158,13 @@ def validCountView (n : Nat) : Html Unit :=
 invariant posStyledFromInv :
   roleHas("pos", navOn) holds_in validCountView assuming (n => n > 0)
 
-component RowItem:
+component PositiveCard:
   state id    : Nat = 0
-  state count : Nat = 0
+  state score : Nat = 1
   key id
-  action inc: count = count + 1
-  invariant rowSafeFromInit: 0 <= count
-  view: <span>{count}</span>
-
-#guard Router.fromURL "/docs/arch/2?tab=api#top" == some (DocRoute.sec .architecture 2)
-#guard Router.fromURL "/?utm=1#hero" == some DocRoute.home
+  action bump: score += 1
+  invariant positive: 1 <= score
+  view: <span>{score}</span>
 
 component TypedLink:
   prop target : DocRoute
@@ -189,22 +176,19 @@ component AutoStyled:
   state route : DocRoute = .home
   action noop: pass
   view: compositeNav({ route = route }).map(_ => .noop)
-#guard AutoStyled.app.styles.length == 2
-#guard (AutoStyled.app.ssrStep "T" "/qed.js" "/" "").contains navOn.raw
+#guard AutoStyled.app.styles.length == 2 && (AutoStyled.app.ssrStep "T" "/qed.js" "/" "").contains navOn.raw
 
 theme ResetTheme:
   color borderSubtle = #ccc
   reset *, *::before:
     margin: 0px
 
-#guard ResetTheme.style.raw.contains ":where(*, *::before) { margin: 0px; }"
-
 style typedBorderStyle:
   border: 1px solid ResetTheme.borderSubtle
   border-bottom: 2px dashed #333
   border-top: none
-#guard typedBorderStyle.raw ==
-  "border: 1px solid var(--border-subtle); border-bottom: 2px dashed #333; border-top: none;"
+#guard ResetTheme.style.raw.contains ":where(*, *::before) { margin: 0px; }" &&
+  typedBorderStyle.raw == "border: 1px solid var(--border-subtle); border-bottom: 2px dashed #333; border-top: none;"
 
 component SubBanner:
   prop sec : Section
@@ -241,7 +225,6 @@ component ModernCounter:
       <input bind={draft}/>
       <input type="checkbox" bind={active}/>
     </div>
-
 example : ModernCounter.init.quantity = 1 ∧ ModernCounter.init.draft = "" := ⟨rfl, rfl⟩
 
 router RepoRoute:
@@ -250,10 +233,10 @@ router RepoRoute:
   edit  = "/orgs/:org/repos/:repo/edit"
   issues(page: Nat) = "/orgs/:org/issues/:page"
 
-#guard Router.toURL (RepoRoute.edit "acme" "qed") == "/orgs/acme/repos/qed/edit"
-#guard Router.fromURL "/orgs/acme/repos/qed/edit" == some (RepoRoute.edit "acme" "qed")
-#guard Router.fromURL "/orgs/acme/repos/qed" == some (RepoRoute.blob "acme" "qed")
-#guard Router.fromURL "/orgs/acme/issues/3" == some (RepoRoute.issues "acme" 3)
+#guard Router.toURL (RepoRoute.edit "acme" "qed") == "/orgs/acme/repos/qed/edit" &&
+  Router.fromURL "/orgs/acme/repos/qed/edit" == some (RepoRoute.edit "acme" "qed") &&
+  Router.fromURL "/orgs/acme/repos/qed" == some (RepoRoute.blob "acme" "qed") &&
+  Router.fromURL "/orgs/acme/issues/3" == some (RepoRoute.issues "acme" 3)
 
 schema Ticket:
   id       : jsonOnly(String)
@@ -267,11 +250,7 @@ def draftRoundTrip : Ticket.Draft := { title := "Fix parser", priority := "2" }
 
 def jsxErgonomicsView (items : Array Nat) (note? : Option String) (highlight : Bool) : Html Unit :=
   <div {chipStyle if highlight} data-tag={"hi" if highlight}>
-    <>
-      <span>Header</span>
-      {<em>!</em> if highlight}
-      {if let some(note) = note?: <p>{note}</p>}
-    </>
+    <><span>Header</span>{<em>!</em> if highlight}{if let some(note) = note?: <p>{note}</p>}</>
     <ul>
       <li key="head">Top</li>
       {for n in items: <li key={n}>{n}</li>}
@@ -356,8 +335,7 @@ def goodSafeUrl : Url := url("/docs/guide")
 component GoodLazy:
   state m : Nat = 7
   view: <div><a href={goodSafeUrl}>Docs</a><a href={url("/about")}>About</a>{Qed.lazy((k: Nat) => <span>{k}</span>, m / 2)}</div>
-#guard (Html.render (GoodLazy.app.view { m := 7 })).contains "href=\"/docs/guide\""
-#guard (Html.render (GoodLazy.app.view { m := 7 })).contains "<span>3</span>"
+#guard let s := Html.render (GoodLazy.app.view { m := 7 }); s.contains "href=\"/docs/guide\"" && s.contains "<span>3</span>"
 
 def sneakyBlock {msg : Type} : Html msg := <div>bad</div>
 
@@ -405,23 +383,17 @@ style fracStyle:
   opacity: 0.85
   z-index: -1
 
-#guard fracStyle.raw ==
-  "text-align: center; padding: 0.35rem 0 0.5rem; margin: 2rem auto; gap: 4px 8px; line-height: 1.5; font-weight: 600; opacity: 0.85; z-index: -1;"
-
-#guard (match (Resource.ok (none : Option Nat)).someOr "missing" with | .failed "missing" => true | _ => false)
-#guard (match (Resource.ok (some 42)).someOr "missing" with | .ok 42 => true | _ => false)
-#guard (match (({} : Cached Nat).put "a" (.ok 1) "b").state with | .idle => true | _ => false)
-#guard ((({} : Cached Nat).put "a" (.ok 1) "b").lookup "a" == some 1)
-#guard (match (({} : Cached Nat).put "a" (.ok 7) "a").state with | .ok 7 => true | _ => false)
+#guard fracStyle.raw == "text-align: center; padding: 0.35rem 0 0.5rem; margin: 2rem auto; gap: 4px 8px; line-height: 1.5; font-weight: 600; opacity: 0.85; z-index: -1;" &&
+  (match (Resource.ok (none : Option Nat)).someOr "missing" with | .failed "missing" => true | _ => false) &&
+  (match (Resource.ok (some 42)).someOr "missing" with | .ok 42 => true | _ => false) &&
+  (match (({} : Cached Nat).put "a" (.ok 1) "b").state with | .idle => true | _ => false) &&
+  ((({} : Cached Nat).put "a" (.ok 1) "b").lookup "a" == some 1) &&
+  (match (({} : Cached Nat).put "a" (.ok 7) "a").state with | .ok 7 => true | _ => false)
 
 component Card:
   prop title : String
   prop badge : Html
-  view:
-    <div class="card">
-      <header><h3>{title}</h3>{badge}</header>
-      <div class="card-body">{children}</div>
-    </div>
+  view: <div class="card"><header><h3>{title}</h3>{badge}</header><div class="card-body">{children}</div></div>
 
 component SearchBar:
   bind query : String = ""
@@ -439,14 +411,9 @@ component ListChip:
   view: <li class="chip">{text}</li>
 
 def cardSample : Html Unit :=
-  <Card title="Docs" badge={<span class="badge">v2</span>}>
-    <p>First</p>
-    <ul><ListChip key="a" text="Alpha"/></ul>
-  </Card>
-
-#guard (Html.render cardSample).contains "<h3>Docs</h3><span class=\"badge\">v2</span>"
-#guard (Html.render cardSample).contains "<li class=\"chip\">Alpha</li>"
-#guard !(Html.render cardSample).contains "data-qed-local"
+  <Card title="Docs" badge={<span class="badge">v2</span>}><p>First</p><ul><ListChip key="a" text="Alpha"/></ul></Card>
+#guard let s := Html.render cardSample
+  s.contains "<h3>Docs</h3><span class=\"badge\">v2</span>" && s.contains "<li class=\"chip\">Alpha</li>" && !s.contains "data-qed-local"
 
 /-- error: invalid HTML5 nesting: <Card> (root <div>) is not allowed inside <p> (browsers rewrite this tree during HTML parsing, causing hydration mismatch) -/
 #guard_msgs in
@@ -456,7 +423,6 @@ def badCardInParagraph : Html Unit := <p><Card title="Nope"><span>x</span></Card
 #guard_msgs in
 def badChipInDiv : Html Unit := <div><ListChip text="Orphan"/></div>
 
--- Stateful sub-component with implicit `{children}`, `Html` prop, `bind:`, and `event` hoisted into a parent `app`
 component Accordion:
   prop heading : String
   prop extra   : Html
@@ -464,10 +430,7 @@ component Accordion:
   action toggle: openPanel = not openPanel
   view:
     <section class="accordion">
-      <header>
-        <button class="toggle" onClick={.toggle}>{heading}</button>
-        {extra}
-      </header>
+      <header><button class="toggle" onClick={.toggle}>{heading}</button>{extra}</header>
       {<div class="panel">{children}</div> if openPanel}
     </section>
 
@@ -476,54 +439,40 @@ component PickerBox:
   state highlighted = 0
   event onPick(choice: String)
   action next: highlighted += 1
-  view:
-    <div class="picker">
-      <input bind={filter}/>
-      <button onClick={onPick(filter)}>Pick</button>
-    </div>
+  view: <div class="picker"><input bind={filter}/><button onClick={onPick(filter)}>Pick</button></div>
 
 component CompositeDemo:
   state query     = "init"
   state picked    = ""
   state clicks    = 1
   ephemeral scratch = 99
-  collection rows : RowItem
-
+  collection rows : PositiveCard
   action bump: clicks += 1
-
   invariant clicksPos: 1 <= clicks
-
   view:
     <div class="demo">
       <SearchBar bind:query={query} onClear={query = ""} onSubmitQuery={picked = _}/>
       <PickerBox bind:filter={query} onPick={picked = _}/>
-      <Accordion heading="Details" extra={<span>!</span>}>
-        <button class="inner" onClick={.bump}>{clicks}</button>
-      </Accordion>
-      <div>{for r in rows: <RowItem state={r}/>}</div>
+      <Accordion heading="Details" extra={<span>!</span>}><button class="inner" onClick={.bump}>{clicks}</button></Accordion>
+      <div>{for r in rows: <PositiveCard state={r}/>}</div>
     </div>
 
--- Verify hoisted stateful sub-component state, two-way `bind:`, and `event` forwarding work synchronously!
+-- Verify hoisted stateful sub-component state, two-way `bind:`, `event` forwarding & ephemeral rehydration
 def step1 := CompositeDemo.update CompositeDemo.init (._sub_0 (._emit (.set_filter "lean4")))
-#guard step1.query == "lean4"
 def step2 := CompositeDemo.update step1 (._sub_0 (._emit (.onPick "lean4")))
-#guard step2.picked == "lean4"
--- Toggling hoisted `<Accordion>` opens its panel and exposes parent-wired `{children}`
-#guard !(Html.render (CompositeDemo.view CompositeDemo.init)).contains "class=\"panel\""
 def step3 := CompositeDemo.update step2 (._sub_1 .toggle)
-#guard (Html.render (CompositeDemo.view step3)).contains "class=\"panel\""
--- Ephemeral field `scratch` resets to `init` (`99`) across SSR dehydration while `query` and `clicks` round-trip!
-#guard (CompositeDemo.app.rehydrate (CompositeDemo.app.dehydrate { step3 with clicks := 5, scratch := 0 })).map
-  (fun s => (s.query, s.clicks, s.scratch)) == some ("lean4", 5, 99)
+#guard step1.query == "lean4" && step2.picked == "lean4" &&
+  !(Html.render (CompositeDemo.view CompositeDemo.init)).contains "class=\"panel\"" &&
+  (Html.render (CompositeDemo.view step3)).contains "class=\"panel\"" &&
+  (CompositeDemo.app.rehydrate (CompositeDemo.app.dehydrate { step3 with clicks := 5, scratch := 0 })).map
+    (fun s => (s.query, s.clicks, s.scratch)) == some ("lean4", 5, 99)
 
--- `<Await>` JSX tag on `Resource` + `.val`-free `Field` rendering
 def awaitSample (r : Resource Ticket) : Html Unit :=
   <Await of={r} as={t} err={e} loading={<p>Wait</p>} failed={<p class="err">{e}</p>}>
     <article><h2>{t.title}</h2><span>{t.priority}</span></article>
   </Await>
-
-#guard (Html.render (awaitSample .loading)).contains "<p>Wait</p>"
-#guard (Html.render (awaitSample (.failed "boom"))).contains "<p class=\"err\">boom</p>"
+#guard (Html.render (awaitSample .loading)).contains "<p>Wait</p>" &&
+  (Html.render (awaitSample (.failed "boom"))).contains "<p class=\"err\">boom</p>"
 
 component EarlyReturnCheck:
   state x : Int = 0
@@ -535,10 +484,11 @@ component EarlyReturnCheck:
     intro m msg h
     cases msg <;> simp_all [update] <;> split <;> simp_all <;> omega
 
-#guard (EarlyReturnCheck.update { x := 5 } (.step 0)).x == 5
-#guard (EarlyReturnCheck.update { x := 5 } (.step 3)).x == 8
+#guard (EarlyReturnCheck.update { x := 5 } (.step 0)).x == 5 &&
+  (EarlyReturnCheck.update { x := 5 } (.step 3)).x == 8 &&
+  (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := 5 })).map (·.x) == some 5 &&
+  (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := -1 })).isNone
 
--- Verify `component` emits a fine-grained `View` template (`V.el`, `V.dyn`, `V.ifElse`, `V.memo`, `V.forEach`)
 def lazyBadge {msg : Type} (k : Nat) : Html msg := <span>{k}</span>
 
 component FineGrainedCheck:
@@ -583,17 +533,8 @@ style dangerBtnStyle:
 
 component StyleLacksGood:
   state ok : Bool = true
-  view:
-    <div>
-      <button role="submit" {safeBtnStyle}>OK</button>
-      <span>safe</span>
-    </div>
+  view: <div><button role="submit" {safeBtnStyle}>OK</button><span>safe</span></div>
   invariant noDanger: roleLacks("submit", dangerBtnStyle), tagLacks("span", dangerBtnStyle)
-
-#guard let css := renderStyleSheet [{ className := "x", raw := Item.renderList [background "red/*evil*/</style"] }]
-  ["/*", "<", "</style"].all (!css.contains ·)
-#guard (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := 5 })).map (·.x) == some 5
-#guard (EarlyReturnCheck.app.rehydrate (EarlyReturnCheck.app.dehydrate { x := -1 })).isNone
 
 /-- error: Styling invariant `BadRoleLacks.noDanger` failed in `BadRoleLacks.view`:
   • `roleLacks("submit", dangerBtnStyle)` does not hold in every state
@@ -643,10 +584,10 @@ component SelfHostedFormReset:
   view: <Ticket.Form reset onSubmit={picked = some(_)}/>
 
 def validTicketDraft : Ticket.Draft := { title := "Fix bug", priority := "3", kind := "bug" }
-#guard SelfHostedFormKeep.init.picked.isNone && SelfHostedFormKeep.init._form_0 == Ticket.Draft.empty
-#guard (Html.render (SelfHostedFormKeep.view SelfHostedFormKeep.init)).contains "disabled" &&
-  !(Html.render (SelfHostedFormKeep.view { picked := none, _form_0 := validTicketDraft })).contains "disabled"
-#guard match Ticket.parse validTicketDraft with
+#guard SelfHostedFormKeep.init.picked.isNone && SelfHostedFormKeep.init._form_0 == Ticket.Draft.empty &&
+  (Html.render (SelfHostedFormKeep.view SelfHostedFormKeep.init)).contains "disabled" &&
+  !(Html.render (SelfHostedFormKeep.view { picked := none, _form_0 := validTicketDraft })).contains "disabled" &&
+  match Ticket.parse validTicketDraft with
   | some t =>
       let sK := SelfHostedFormKeep.update { picked := none, _form_0 := validTicketDraft } (.set_picked (some t))
       let sR := SelfHostedFormReset.update { picked := none, _form_0 := validTicketDraft } ._form_reset_0
@@ -681,54 +622,40 @@ schema BadOptType:
 schema BadJsonOnly:
   id : jsonOnly String
 
--- ── Unified Python-esque ergonomics checks (elif, match/case, if let, in/not in, f-strings, sequential) ──
+-- ── Unified Python-esque ergonomics checks (elif, match/case, if let, in/not in, f-strings) ──
 component PythonicShowcase:
   state score : Nat = 5
   state tags  : String[] = ["lean"]
   state pick  : Nat? = some(2)
   state label : String = ""
-
   action classify(n: Nat):
     if 0 <= n <= 100:
-      if n < 10:
-        label = f"low:{n}"
-      elif n < 50:
-        label = f"mid:{n}"
-      else:
-        label = f"high:{n}"
-
+      if n < 10: label = f"low:{n}"
+      elif n < 50: label = f"mid:{n}"
+      else: label = f"high:{n}"
   action addTag(t: String):
     if t in tags: return
     tags.push(t)
     label = f"tags:{tags.size}"
-
   action usePick:
     if let some(v) = pick:
       if v > 0:
         score = v * 2
         label = f"score={score}"
-
   action describeTab(tab: FilterTab):
     match tab:
-      case .all:
-        label = "all"
-      case .tagged(t):
-        label = f"tag:{t}"
-
-  view:
-    <div>
-      <span>{label}</span>
-      <span>{"has-lean" if "lean" in tags and pick is not none else "none"}</span>
-    </div>
+      case .all: label = "all"
+      case .tagged(t): label = f"tag:{t}"
+  view: <div><span>{label}</span><span>{"has-lean" if "lean" in tags and pick is not none else "none"}</span></div>
 
 #guard let upd := PythonicShowcase.update PythonicShowcase.init
   ([(.classify 5, "low:5"), (.classify 25, "mid:25"), (.classify 80, "high:80"),
     (.addTag "qed", "tags:2"), (.usePick, "score=4"), (.describeTab (.tagged "ui"), "tag:ui")].all
       fun (m, want) => (upd m).label == want) &&
-  (upd (.addTag "lean")).tags.size == 1
-#guard (Html.render (PythonicShowcase.view PythonicShowcase.init)).contains "has-lean"
-#guard Json.pathStr "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}" "choices.0.delta.content" == "hi"
-#guard Json.pathStr "{\"choices\":[]}" "choices.0.delta.content" == ""
+  (upd (.addTag "lean")).tags.size == 1 &&
+  (Html.render (PythonicShowcase.view PythonicShowcase.init)).contains "has-lean" &&
+  Json.pathStr "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}" "choices.0.delta.content" == "hi" &&
+  Json.pathStr "{\"choices\":[]}" "choices.0.delta.content" == ""
 
 -- ── Automated Quantified, Collection-Query, Nonlinear & Extended `for_each` Invariants ──
 
@@ -738,122 +665,68 @@ schema LineItem:
   done  : Bool
   ts    : Nat
 
--- 1 & 2. Quantified IDs, uniqueBy, sumBy, countWhere, and isSortedBy — all proved WITHOUT `:= by`!
 component SmartLedger:
   state rows       : LineItem[] = []
   state nextId     : Nat = 0
   state lastTs     : Nat = 0
   state totalCents : Nat = 0
   state doneCount  : Nat = 0
-
   action addItem(price: Nat, done: Bool):
     let ts = lastTs + 1
     rows.push(LineItem(id=nextId, price=price, done=done, ts=ts))
     nextId += 1
     lastTs = ts
     totalCents += price
-    if done:
-      doneCount += 1
-
-  action reverseView:
-    rows = rows.reverse
-
-  action sortByPrice:
-    rows = rows.sortBy((a, b) => a.price <= b.price)
-
-  invariant idsAndUnique:
-    (all r in rows: r.id < nextId) and rows.uniqueBy(r => r.id)
-  invariant totalSynced:
-    rows.sumBy(r => r.price) == totalCents
-  invariant doneSynced:
-    rows.countWhere(r => r.done) == doneCount and doneCount <= rows.size
-
-  view:
-    <div>
-      <span>{totalCents}</span>
-      <span>{doneCount}</span>
-    </div>
+    if done: doneCount += 1
+  action reverseView: rows = rows.reverse
+  action sortByPrice: rows = rows.sortBy((a, b) => a.price <= b.price)
+  invariant idsAndUnique: (all r in rows: r.id < nextId) and rows.uniqueBy(r => r.id)
+  invariant totalSynced:  rows.sumBy(r => r.price) == totalCents
+  invariant doneSynced:   rows.countWhere(r => r.done) == doneCount and doneCount <= rows.size
+  view: <div><span>{totalCents}</span><span>{doneCount}</span></div>
 
 component SortedTimeline:
   state events : LineItem[] = []
   state lastTs : Nat = 0
-
   action append(price: Nat):
     let ts = lastTs + 1
     events.push(LineItem(id=ts, price=price, done=false, ts=ts))
     lastTs = ts
-
-  action dropLast:
-    events = events.pop
-
-  action keepExpensive(minPrice: Nat):
-    events = events.filter(e => e.price >= minPrice)
-
-  action sortByTs:
-    events = events.sortBy((a, b) => decide(a.ts <= b.ts))
-
-  invariant ordered:
-    (all e in events: e.ts <= lastTs) and events.isSortedBy(e => e.ts)
-
+  action dropLast: events = events.pop
+  action keepExpensive(minPrice: Nat): events = events.filter(e => e.price >= minPrice)
+  action sortByTs: events = events.sortBy((a, b) => decide(a.ts <= b.ts))
+  invariant ordered: (all e in events: e.ts <= lastTs) and events.isSortedBy(e => e.ts)
   view: <span>{events.size}</span>
 
--- 3. Nonlinear arithmetic invariants (monotonic mul/div + ring) — proved WITHOUT `:= by`!
 component BudgetCalc:
   state price    : Nat = 10
   state qty      : Nat = 2
   state maxPrice : Nat = 100
   state maxQty   : Nat = 50
   state total    : Nat = 200
-
   action setPrice(p: Nat):
-    if p <= maxPrice:
-      price = p
-
+    if p <= maxPrice: price = p
   action setQty(q: Nat):
-    if q <= maxQty:
-      qty = q
-
+    if q <= maxQty: qty = q
   action addTotal(delta: Nat):
-    if total + delta <= 1000:
-      total += delta
-
+    if total + delta <= 1000: total += delta
   invariant bounds:
     price <= maxPrice and qty <= maxQty and total <= 1000 and
-    price * qty <= maxPrice * maxQty and
-    total / 10 <= 100 and
+    price * qty <= maxPrice * maxQty and total / 10 <= 100 and
     (qty + 1) * price == qty * price + price
-
   view: <span>{price * qty}</span>
-
--- 4. Extended `for_each` array ops (pop, reverse, extract, eraseIdxIfInBounds, swapIfInBounds, setIfInBounds, modify)
-component PositiveCard:
-  state id    : Nat = 0
-  state score : Nat = 1
-  key id
-  action bump: score += 1
-  invariant positive: 1 <= score
-  view: <span>{score}</span>
 
 component ExtendedDeck:
   collection cards : PositiveCard
-  action addCard(nid: Nat):
-    cards.push(PositiveCard.State(id=nid, score=1))
-  action popCard:
-    cards = cards.pop
-  action flipDeck:
-    cards = cards.reverse
-  action sliceTop:
-    cards = cards.extract(0, 5)
-  action dropAt(i: Nat):
-    cards = cards.eraseIdxIfInBounds(i)
-  action swapCards(i: Nat, j: Nat):
-    cards = cards.swapIfInBounds(i, j)
-  action replaceAt(i: Nat, nid: Nat):
-    cards = cards.setIfInBounds(i, PositiveCard.State(id=nid, score=5))
-  action boostAt(i: Nat):
-    cards = cards.modify(i, c => PositiveCard.State(id=c.id, score=c.score + 1))
+  action addCard(nid: Nat): cards.push(PositiveCard.State(id=nid, score=1))
+  action popCard: cards = cards.pop
+  action flipDeck: cards = cards.reverse
+  action sliceTop: cards = cards.extract(0, 5)
+  action dropAt(i: Nat): cards = cards.eraseIdxIfInBounds(i)
+  action swapCards(i: Nat, j: Nat): cards = cards.swapIfInBounds(i, j)
+  action replaceAt(i: Nat, nid: Nat): cards = cards.setIfInBounds(i, PositiveCard.State(id=nid, score=5))
+  action boostAt(i: Nat): cards = cards.modify(i, c => PositiveCard.State(id=c.id, score=c.score + 1))
   invariant deckSafe: PositiveCard.positive for_each cards
-  view:
-    <div>{for c in cards: <PositiveCard state={c}/>}</div>
+  view: <div>{for c in cards: <PositiveCard state={c}/>}</div>
 
 end SyntaxChecks

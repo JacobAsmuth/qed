@@ -6,18 +6,14 @@ namespace ServerChecks
 
 external PingApi:
   base "https://api.example.com"
-
-  get "/ping"
-    ping() -> String
+  get "/ping" ping() -> String
 
 schema CheckedItem:
   label : String where 1 <= label.length <= 32
   stock : Nat    where stock <= 100
 
 -- 1. Rejects TOCTOU state read outside `atomic` in an `await`-using function
-/--
-error: cannot access server state `count` outside an `atomic` block in `bump` because `bump` uses `await` (prevents TOCTOU data races across suspension points)
--/
+/-- error: cannot access server state `count` outside an `atomic` block in `bump` because `bump` uses `await` (prevents TOCTOU data races across suspension points) -/
 #guard_msgs in
 server BadToctouRead:
   state count: Nat = 0
@@ -27,9 +23,7 @@ server BadToctouRead:
     return c
 
 -- 2. Rejects state mutation outside `atomic` in an `await`-using function
-/--
-error: cannot access server state `count` outside an `atomic` block in `bump` because `bump` uses `await` (prevents TOCTOU data races across suspension points)
--/
+/-- error: cannot access server state `count` outside an `atomic` block in `bump` because `bump` uses `await` (prevents TOCTOU data races across suspension points) -/
 #guard_msgs in
 server BadOutsideAtomicMut:
   state count: Nat = 0
@@ -39,21 +33,16 @@ server BadOutsideAtomicMut:
     return 1
 
 -- 3. Rejects redundant `atomic` in a synchronous function ("only one way")
-/--
-error: redundant `atomic` block: `bump` has no `await` calls, so it already executes atomically
--/
+/-- error: redundant `atomic` block: `bump` has no `await` calls, so it already executes atomically -/
 #guard_msgs in
 server BadRedundantAtomic:
   state count: Nat = 0
   def bump() -> Nat:
-    atomic:
-      count += 1
+    atomic: count += 1
     return count
 
 -- 4. Rejects `await` inside an `atomic` block (locks never span network I/O)
-/--
-error: cannot use `await` inside an `atomic` block; perform external I/O outside `atomic` so shared locks never span network calls
--/
+/-- error: cannot use `await` inside an `atomic` block; perform external I/O outside `atomic` so shared locks never span network calls -/
 #guard_msgs in
 server BadAwaitInAtomic:
   state count: Nat = 0
@@ -65,9 +54,7 @@ server BadAwaitInAtomic:
     return 1
 
 -- 5. Rejects unhandled fallible `await` binding without `?` or `catch`
-/--
-error: unhandled fallible `await` expression; append `?` to propagate errors or use `let x = await ... catch err:` to handle them inline
--/
+/-- error: unhandled fallible `await` expression; append `?` to propagate errors or use `let x = await ... catch err:` to handle them inline -/
 #guard_msgs in
 server BadUnhandledError:
   def callIt() -> String:
@@ -75,36 +62,28 @@ server BadUnhandledError:
     return "ok"
 
 -- 6. Rejects unproven array indexing `items[idx]` without bounds guard
-/--
-error: Array index `idx` could be out of bounds for `items`:
+/-- error: Array index `idx` could be out of bounds for `items`:
   • must satisfy:  idx < items.size
 
-Hint: Guard this access with `if idx < items.size:`.
--/
+Hint: Guard this access with `if idx < items.size:`. -/
 #guard_msgs in
 server BadArrayBounds:
   state items: Nat[] = [10, 20]
-  def readAt(idx: Nat) -> Nat:
-    return items[idx]
+  def readAt(idx: Nat) -> Nat: return items[idx]
 
 -- 7. Rejects invalid `schema` `Field` refinement at compile time
-/--
-error: Schema field rule `1 <= "".length and "".length <= 32` failed for `""`.
+/-- error: Schema field rule `1 <= "".length and "".length <= 32` failed for `""`.
 
-Hint: Guard this value with `if ...:` or a `requires` precondition so it satisfies the schema's `where` rule.
--/
+Hint: Guard this value with `if ...:` or a `requires` precondition so it satisfies the schema's `where` rule. -/
 #guard_msgs in
 server BadFieldRefinement:
-  def makeEmpty() -> CheckedItem:
-    return CheckedItem(label="", stock=5)
+  def makeEmpty() -> CheckedItem: return CheckedItem(label="", stock=5)
 
 -- 8. Rejects mutation that can violate a single-state `invariant`
-/--
-error: Server invariant `maxStock` failed in `overflow`:
+/-- error: Server invariant `maxStock` failed in `overflow`:
   • must satisfy:  stock + 50 <= 100
 
-Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant holds across every branch.
--/
+Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant holds across every branch. -/
 #guard_msgs in
 server BadSingleStateInv:
   state stock: Nat = 10
@@ -114,12 +93,10 @@ server BadSingleStateInv:
     return stock
 
 -- 9. Rejects mutation that violates a two-state `old(...)` monotonicity `invariant`
-/--
-error: Server invariant `ordersMonotonic` failed in `resetOrders`:
+/-- error: Server invariant `ordersMonotonic` failed in `resetOrders`:
   • must satisfy:  0 >= orders
 
-Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant holds across every branch.
--/
+Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant holds across every branch. -/
 #guard_msgs in
 server BadTwoStateInv:
   state orders: Nat = 5
@@ -129,12 +106,10 @@ server BadTwoStateInv:
     return orders
 
 -- 10. Rejects mutation that violates `invariant <name>: mutating <field> requires <cond>`
-/--
-error: Server invariant `authItems` failed in `unauthenticatedPush`:
+/-- error: Server invariant `authItems` failed in `unauthenticatedPush`:
   • must satisfy:  items.push x = items or ctx.userId != none
 
-Hint: Add a matching `requires` clause or guard mutations of that field with `if ...:`.
--/
+Hint: Add a matching `requires` clause or guard mutations of that field with `if ...:`. -/
 #guard_msgs in
 server BadMutatingAuthInv:
   state items: Nat[] = [1]
@@ -144,12 +119,10 @@ server BadMutatingAuthInv:
     return items.size
 
 -- 11. Rejects false server `ensures` postcondition at compile time
-/--
-error: Server postcondition `ensures result > 10` failed in `compute`:
+/-- error: Server postcondition `ensures result > 10` failed in `compute`:
   • must satisfy:  5 > 10
 
-Hint: Ensure every successful return path establishes `result > 10`.
--/
+Hint: Ensure every successful return path establishes `result > 10`. -/
 #guard_msgs in
 server BadServerEnsures:
   def compute(x: Nat) -> Nat:
@@ -162,23 +135,18 @@ server CheckedSrv:
     requires ctx.userId != none
     requires 1 <= qty <= 50
     ensures result == qty, 1 <= result <= 50
-    if qty == 49:
-      return fail(.soldOut)
-    elif qty == 50:
-      return fail(.limitReached)
+    if qty == 49: return fail(.soldOut)
+    elif qty == 50: return fail(.limitReached)
     return qty
 
 server OtherSrv:
-  def ping() -> Nat:
-    return 1
+  def ping() -> Nat: return 1
 
 -- 12. Rejects client RPC call when server parameter `requires` cannot be proved
-/--
-error: RPC `CheckedSrv.buy` precondition `1 <= qty <= 50` could not be proved here:
+/-- error: RPC `CheckedSrv.buy` precondition `1 <= qty <= 50` could not be proved here:
   • must satisfy:  1 <= 0 and 0 <= 50
 
-Hint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`.
--/
+Hint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`. -/
 #guard_msgs in
 component BadClientRequiresParam:
   session user
@@ -191,11 +159,9 @@ component BadClientRequiresParam:
   view: <span>{last}</span>
 
 -- 13. Rejects client RPC call requiring `ctx.userId != none` without authenticated `session`
-/--
-error: RPC `CheckedSrv.buy` requires an authenticated session (`ctx.userId != none`), but `BadClientRequiresAuth` has no `session` field.
+/-- error: RPC `CheckedSrv.buy` requires an authenticated session (`ctx.userId != none`), but `BadClientRequiresAuth` has no `session` field.
 
-Hint: Add `session user` to `BadClientRequiresAuth` and guard the call with `if user.isSome:`.
--/
+Hint: Add `session user` to `BadClientRequiresAuth` and guard the call with `if user.isSome:`. -/
 #guard_msgs in
 component BadClientRequiresAuth:
   state last : Nat = 0
@@ -206,9 +172,7 @@ component BadClientRequiresAuth:
   view: <span>{last}</span>
 
 -- 14. Rejects non-exhaustive client `await ... catch` missing a typed `fail(.tag)` branch
-/--
-error: `await CheckedSrv.buy(...)` has unhandled domain error(s): .limitReached; handle them with `catch: case .limitReached: ...`
--/
+/-- error: `await CheckedSrv.buy(...)` has unhandled domain error(s): .limitReached; handle them with `catch: case .limitReached: ...` -/
 #guard_msgs in
 component BadClientNonExhaustiveCatch:
   session user
@@ -224,13 +188,10 @@ component BadClientNonExhaustiveCatch:
 -- 15. Rejects `fullstack` whose client calls an RPC on an unmounted server
 component CallsOther:
   state v : Resource Nat
-  action go:
-    v = await OtherSrv.ping()
+  action go: v = await OtherSrv.ping()
   view: <span>ok</span>
 
-/--
-error: `fullstack BadFs` mounts `server CheckedSrv`, but client `CallsOther` calls RPC `OtherSrv.ping` on unmounted server `OtherSrv`
--/
+/-- error: `fullstack BadFs` mounts `server CheckedSrv`, but client `CallsOther` calls RPC `OtherSrv.ping` on unmounted server `OtherSrv` -/
 #guard_msgs in
 fullstack BadFs:
   server CheckedSrv
@@ -245,8 +206,7 @@ component InvariantSatisfiesRequires:
   invariant qtyInBounds: 1 <= qty <= 50
   invariant boughtValid: bought == 0 or 1 <= bought <= 50
   action setQty(q: Nat):
-    if 1 <= q <= 50:
-      qty = q
+    if 1 <= q <= 50: qty = q
   action purchase:
     if not user.isSome: return
     let got = await CheckedSrv.buy(qty) catch:
@@ -268,21 +228,17 @@ server QuerySrv:
     return qty
 
 -- 17. Rejects reactive `query` calling a mutating server RPC (read-only gate)
-/--
-error: reactive `query count` cannot call mutating server RPC `QuerySrv.bump`; `query` only permits read-only server functions
--/
+/-- error: reactive `query count` cannot call mutating server RPC `QuerySrv.bump`; `query` only permits read-only server functions -/
 #guard_msgs in
 component BadMutatingQuery:
   query count = QuerySrv.bump()
   view: <span>ok</span>
 
 -- 18. Rejects reactive `query` when server parameter `requires` cannot be proved
-/--
-error: RPC `QuerySrv.quote` precondition `1 <= qty <= 50` could not be proved here:
+/-- error: RPC `QuerySrv.quote` precondition `1 <= qty <= 50` could not be proved here:
   • must satisfy:  1 <= 0 and 0 <= 50
 
-Hint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`.
--/
+Hint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`. -/
 #guard_msgs in
 component BadQueryRequiresParam:
   session user
@@ -290,11 +246,9 @@ component BadQueryRequiresParam:
   view: <span>ok</span>
 
 -- 19. Rejects reactive `query` requiring `ctx.userId != none` without an active session guard
-/--
-error: RPC `QuerySrv.quote` requires an authenticated session (`user != none`), which could not be proved here.
+/-- error: RPC `QuerySrv.quote` requires an authenticated session (`user != none`), which could not be proved here.
 
-Hint: Guard this call with `if user.isSome:` or `invariant ...: user.isSome`.
--/
+Hint: Guard this call with `if user.isSome:` or `invariant ...: user.isSome`. -/
 #guard_msgs in
 component BadQueryRequiresAuth:
   session user
@@ -311,8 +265,7 @@ component VerifiedQueryFlow:
   query echoed = QuerySrv.quote(v) if let .ok(v) = quote.state, user.isSome
   invariant echoedValid: echoed.all(v => 1 <= v <= 50)
   action setQty(q: Nat):
-    if 1 <= q <= 50:
-      qty = q
+    if 1 <= q <= 50: qty = q
   view:
     <div>
       <Await of={quote} as={v}><span>{f"{v}"}</span></Await>
@@ -320,29 +273,23 @@ component VerifiedQueryFlow:
     </div>
 
 -- 21. Rejects 3rd-party `external` combining client-usable `ws` channels with server `auth` secrets
-/--
-error: `external BadAuthWs` declares client-usable `ws` channels and cannot attach server `auth` secrets; split server-authenticated HTTP endpoints into a separate `external` block
--/
+/-- error: `external BadAuthWs` declares client-usable `ws` channels and cannot attach server `auth` secrets; split server-authenticated HTTP endpoints into a separate `external` block -/
 #guard_msgs in
 external BadAuthWs:
   base "wss://ws.example.com"
   auth bearer(secret("WS_SECRET"))
-  ws "/stream"
-    feed() -> String
+  ws "/stream" feed() -> String
 
 -- 22. Rejects `emit` violating channel `ensures` at compile time
-/--
-error: Channel `ensures` postcondition failed at `emit`:
+/-- error: Channel `ensures` postcondition failed at `emit`:
   • must satisfy:  99 <= 50
 
-Hint: Ensure the emitted event satisfies the channel's `ensures` clause.
--/
+Hint: Ensure the emitted event satisfies the channel's `ensures` clause. -/
 #guard_msgs in
 server BadEmitSrv:
   channel bounded() -> Nat:
     ensures event <= 50
-    on_join:
-      pass
+    on_join: pass
   def pushBad() -> Unit:
     bounded.emit(99)
     return ()
@@ -352,71 +299,56 @@ server WsCheckSrv:
     requires ctx.userId != none
     requires room <= 10
     ensures event <= 50
-    on_join:
-      pass
+    on_join: pass
     on_send(v: Nat):
       requires v <= 50
       gauge.emit(room, v)
-    on_leave:
-      pass
+    on_leave: pass
 
 -- 23. Rejects `subscribe` requiring `ctx.userId != none` without session guard
-/--
-error: RPC `WsCheckSrv.gauge` requires an authenticated session (`user != none`), which could not be proved here.
+/-- error: RPC `WsCheckSrv.gauge` requires an authenticated session (`user != none`), which could not be proved here.
 
-Hint: Guard this call with `if user.isSome:` or `invariant ...: user.isSome`.
--/
+Hint: Guard this call with `if user.isSome:` or `invariant ...: user.isSome`. -/
 #guard_msgs in
 component BadSubNoAuth:
   session user
   subscribe g = WsCheckSrv.gauge(1):
-    on_message(v):
-      pass
+    on_message(v): pass
   view: <span>ok</span>
 
 -- 24. Rejects `subscribe` violating channel parameter `requires`
-/--
-error: RPC `WsCheckSrv.gauge` precondition `room <= 10` could not be proved here:
+/-- error: RPC `WsCheckSrv.gauge` precondition `room <= 10` could not be proved here:
   • must satisfy:  99 <= 10
 
-Hint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`.
--/
+Hint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`. -/
 #guard_msgs in
 component BadSubBadParam:
   session user
   subscribe g = WsCheckSrv.gauge(99) if user.isSome:
-    on_message(v):
-      pass
+    on_message(v): pass
   view: <span>ok</span>
 
 -- 25. Rejects `send` violating channel `on_send` `requires`
-/--
-error: RPC `WsCheckSrv.gauge.send` precondition `v <= 50` could not be proved here:
+/-- error: RPC `WsCheckSrv.gauge.send` precondition `v <= 50` could not be proved here:
   • must satisfy:  77 <= 50
 
-Hint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`.
--/
+Hint: Pass valid arguments, guard with `if ...:`, or add a component `invariant`. -/
 #guard_msgs in
 component BadSendParam:
   session user
   subscribe g = WsCheckSrv.gauge(1) if user.isSome:
-    on_message(v):
-      pass
-  action go:
-    g.send(77)
+    on_message(v): pass
+  action go: g.send(77)
   view: <span>ok</span>
 
 -- 26. Rejects `fullstack` mounting a server when client subscribes to a different server's channel
 component SubOtherWs:
   session user
   subscribe g = WsCheckSrv.gauge(1) if user.isSome:
-    on_message(_):
-      pass
+    on_message(_): pass
   view: <span>ok</span>
 
-/--
-error: `fullstack BadWsFs` mounts `server CheckedSrv`, but client `SubOtherWs` subscribes to WebSocket channel `WsCheckSrv.gauge` on unmounted server `WsCheckSrv`
--/
+/-- error: `fullstack BadWsFs` mounts `server CheckedSrv`, but client `SubOtherWs` subscribes to WebSocket channel `WsCheckSrv.gauge` on unmounted server `WsCheckSrv` -/
 #guard_msgs in
 fullstack BadWsFs:
   server CheckedSrv
@@ -429,102 +361,62 @@ component VerifiedWsEnsures:
   state lastVal : Nat = 0
   invariant lastBounded: lastVal <= 50
   subscribe g = WsCheckSrv.gauge(1) if user.isSome:
-    on_message(v):
-      lastVal = v
+    on_message(v): lastVal = v
   action sendOk(n: Nat):
-    if n <= 50:
-      g.send(n)
+    if n <= 50: g.send(n)
   view: <span>{lastVal}</span>
 
 /-! ## Production Server & Web Essentials Compile-Time Checks -/
 
--- 28. `SetCookie` safe defaults & CRLF sanitization
+-- 28-30. `SetCookie` safe defaults/CRLF, `Accept-Encoding: gzip`, `<head>` escaping & `safeCanonicalHref`
 #guard
-  let c := Qed.Server.SetCookie.mkSafe "qed_session" "tok\r\nX-Evil: 1" (maxAge? := some 3600) (secure := true)
-  let s := c.render
-  s.contains "qed_session=tokX-Evil: 1" &&
-  s.contains "HttpOnly" &&
-  s.contains "SameSite=Lax" &&
-  s.contains "Secure" &&
-  s.contains "Max-Age=3600" &&
-  !s.contains '\r' && !s.contains '\n'
-
--- 29. `Http.parseRequestHead` detects `Accept-Encoding: gzip`
-#guard
-  match Qed.Server.Http.parseRequestHead "GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br, gzip, deflate".toUTF8 with
-  | .ok req => req.acceptsGzip == true
-  | .error _ => false
-
-#guard
-  match Qed.Server.Http.parseRequestHead "GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip;q=0".toUTF8 with
-  | .ok req => req.acceptsGzip == false
-  | .error _ => false
-
--- 30. Per-route `<head>` metadata escaping & `ssrStatus` on `Qed.App`
-#guard
+  let ck := (Qed.Server.SetCookie.mkSafe "qed_session" "tok\r\nX-Evil: 1" (maxAge? := some 3600) (secure := true)).render
+  let gzOk := (Qed.Server.Http.parseRequestHead "GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br, gzip, deflate".toUTF8).toOption.map (·.acceptsGzip) == some true
+  let gzNo := (Qed.Server.Http.parseRequestHead "GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip;q=0".toUTF8).toOption.map (·.acceptsGzip) == some false
   let hm : Qed.HeadMeta := {
-    title := some "Page </title><script>alert(1)</script>"
-    description := some "Desc \"quoted\" <tag>"
-    metaTags := [("og:title", "OG \"bad\"")]
-    canonical := some "https://example.com/posts/1"
+    title := some "Page </title><script>alert(1)</script>", description := some "Desc \"quoted\" <tag>",
+    metaTags := [("og:title", "OG \"bad\"")], canonical := some "https://example.com/posts/1"
   }
   let doc := Qed.renderDocument "Default" "<p>ok</p>" "/qed_host.mjs" (headMeta := hm)
-  doc.contains "<title>Page &lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>" &&
-  doc.contains "<meta name=\"description\" content=\"Desc &quot;quoted&quot; &lt;tag&gt;\">" &&
-  doc.contains "<meta name=\"og:title\" content=\"OG &quot;bad&quot;\">" &&
-  doc.contains "<link rel=\"canonical\" href=\"https://example.com/posts/1\">" &&
-  !doc.contains "<script>alert(1)</script>"
-
--- Unsafe `javascript:` canonical URL is dropped by `safeCanonicalHref`
-#guard
-  let hm : Qed.HeadMeta := { canonical := some "javascript:alert(1)" }
-  let doc := Qed.renderDocument "Default" "<p>ok</p>" "/qed_host.mjs" (headMeta := hm)
-  !doc.contains "rel=\"canonical\"" && !doc.contains "javascript:"
+  let badDoc := Qed.renderDocument "Default" "<p>ok</p>" "/qed_host.mjs" (headMeta := { canonical := some "javascript:alert(1)" })
+  ["qed_session=tokX-Evil: 1", "HttpOnly", "SameSite=Lax", "Secure", "Max-Age=3600"].all (ck.contains ·) &&
+  !ck.contains '\r' && !ck.contains '\n' && gzOk && gzNo &&
+  ["<title>Page &lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;</title>",
+   "<meta name=\"description\" content=\"Desc &quot;quoted&quot; &lt;tag&gt;\">",
+   "<meta name=\"og:title\" content=\"OG &quot;bad&quot;\">",
+   "<link rel=\"canonical\" href=\"https://example.com/posts/1\">"].all (doc.contains ·) &&
+  !doc.contains "<script>alert(1)</script>" && !badDoc.contains "rel=\"canonical\"" && !badDoc.contains "javascript:"
 
 -- 31. Declarative `setCookie`, custom `get`/`post`, and server-side `stream` SSE routes with invariants
 server WebEssentialsSrv:
   state hits : Nat = 0
   invariant hitsBounded: hits <= 1000
-
   def login(token: String) -> String:
     setCookie("qed_session", token)
     return "ok"
-
-  get "/robots.txt":
-    return text("User-agent: *\nAllow: /\n")
-
+  get "/robots.txt": return text("User-agent: *\nAllow: /\n")
   post "/webhook":
     requires ctx.isAuthenticated
     atomic:
-      if hits < 1000:
-        hits += 1
+      if hits < 1000: hits += 1
     setCookie("wh_seen", "1")
     return json({ ok = true })
-
   post "/echo-cookie":
     atomic:
-      if hits < 1000:
-        hits += 1
+      if hits < 1000: hits += 1
     setCookie("echo_ck", ctx.body)
     return json({ ok = true })
-
-  get "/stats":
-    return json({ ok = true, hits = hits })
-
-  get "/hits":
-    return json(hits)
-
+  get "/stats": return json({ ok = true, hits = hits })
+  get "/hits": return json(hits)
   stream "/events":
     send("hello", event = "greeting", id = "1")
     send("world")
 
--- 32. Negative: custom HTTP route violating server `invariant` is rejected at compile time!
-/--
-error: Server invariant `hitsBounded` failed in `POST /bad`:
+-- 32. Negative: custom HTTP route violating server `invariant` is rejected at compile time
+/-- error: Server invariant `hitsBounded` failed in `POST /bad`:
   • must satisfy:  hits + 5 <= 10
 
-Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant holds across every branch.
--/
+Hint: Guard state mutations with `if ...:` or `requires ...` so this invariant holds across every branch. -/
 #guard_msgs in
 server BadHttpRouteInv:
   state hits : Nat = 0
@@ -534,9 +426,7 @@ server BadHttpRouteInv:
     return text("oops")
 
 -- 33. Negative: `send(...)` outside `stream` is rejected at compile time
-/--
-error: `send(...)` is only available inside `stream "/...":` routes
--/
+/-- error: `send(...)` is only available inside `stream "/...":` routes -/
 #guard_msgs in
 server BadSendOutsideStream:
   get "/bad-send":
@@ -549,22 +439,17 @@ component SimpleHeadPage:
     title       "Simple Page"
     description "Static head metadata"
     meta        "og:site_name", "Qed"
-  view:
-    <main><h1>Hello</h1></main>
+  view: <main><h1>Hello</h1></main>
 
-example : (SimpleHeadPage.app.headFor SimpleHeadPage.init).title = some "Simple Page" := rfl
-example : SimpleHeadPage.app.ssrStatus SimpleHeadPage.init = 200 := rfl
+example : (SimpleHeadPage.app.headFor SimpleHeadPage.init).title = some "Simple Page" ∧
+    SimpleHeadPage.app.ssrStatus SimpleHeadPage.init = 200 := ⟨rfl, rfl⟩
 
 -- 35. Negative: `case` in `head:` on a component without `route` is rejected cleanly
-/--
-error: `case` inside `head:` requires a `route` declaration on `component BadHeadCase`
--/
+/-- error: `case` inside `head:` requires a `route` declaration on `component BadHeadCase` -/
 #guard_msgs in
 component BadHeadCase:
   head:
-    case .home:
-      title "Nope"
-  view:
-    <main>ok</main>
+    case .home: title "Nope"
+  view: <main>ok</main>
 
 end ServerChecks

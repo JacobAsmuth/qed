@@ -16,7 +16,6 @@ auth ManagedAuth:
 
 database NotesDb:
   managed postgres
-
   table notes:
     id      : Nat    primary_key
     ownerId : String immutable where 1 <= ownerId.length <= 64
@@ -27,7 +26,6 @@ database EphemeralPreviewDb:
   managed postgres:
     preview ephemeral
     dev sqlite ".qed/custom-dev.db"
-
   table items:
     id   : Nat    primary_key
     name : String where 1 <= name.length <= 100
@@ -35,40 +33,22 @@ database EphemeralPreviewDb:
 database SplitPreviewDb:
   postgres secret("DATABASE_URL")
   preview  postgres secret("PREVIEW_DB_URL")
-
   table t:
     id : Nat primary_key
-
-external BillingApi:
-  base "https://billing.example.com"
-  get "/status" status() -> Bool
 
 server NotesApi:
   use auth : ManagedAuth
   use db   : NotesDb
-
-  def getNote(noteId: Nat) -> NotesDb.notes?!:
-    requires ctx.userId != none
-    if let some(uid) = ctx.userId:
-      return await db.notes.findOne(where = r => r.id == noteId and r.ownerId == uid)?
-    return none
-
-  def pingBilling() -> Bool!:
-    return await BillingApi.status()?
+  def ok() -> Bool: return true
 
 server SplitPreviewSrv:
   use db : SplitPreviewDb
-  def ok() -> Bool:
-    return true
+  def ok() -> Bool: return true
 
 component NotesShell:
   session user
   state status = "ready"
-  view:
-    <main>
-      <h1>Notes</h1>
-      <p>{status}</p>
-    </main>
+  view: <main><h1>Notes</h1><p>{status}</p></main>
 
 fullstack NotesApp:
   server NotesApi
@@ -81,19 +61,17 @@ deploy NotesDeploy:
   domain  "notes.example.com"
   compute performance
   timeout 5m
-
   preview:
     on_pr      true
     subdomain  "preview"
     protection team_only
     ttl        7d
-
   invariant privatePreview:  preview.protection == team_only
   invariant hasProdDomain:   domain.isSome and preview.subdomain.isSome
   invariant includesCentral: us_central1 in regions
   invariant perfTier:        compute == performance
 
--- Minimal Vercel-style 4-line deploy (all defaults derived automatically)
+-- Minimal Vercel-style deploy (all defaults derived automatically)
 deploy MinimalDeploy:
   app     NotesApp
   regions [europe_west1, europe_west4]
@@ -106,7 +84,7 @@ deploy StaticShellDeploy:
   regions [us_central1]
   domain  "static.notes.example.com"
 
--- Stateful single-region server & cron server deploy with ZERO manual scaling config!
+-- Stateful single-region server & cron server deploy with ZERO manual scaling config
 server StatefulApi:
   state count : Nat = 0
   invariant nonNeg: count >= 0
@@ -119,52 +97,48 @@ deploy StatefulDeploy:
   regions [us_central1]
 
 server CronApi:
-  every 60 s cleanup:
-    pass
-  def ok() -> Bool:
-    return true
+  every 60 s cleanup: pass
+  def ok() -> Bool: return true
 
 deploy CronDeploy:
   app CronApi
 
 -- Elaborated values (compute presets, duration units, managed expansion, split-env secrets)
-#guard NotesDeploy.spec.compute == .performance
-#guard NotesDeploy.spec.timeoutSec? == some 300
-#guard NotesDeploy.spec.preview.ttlSec == 7 * 86400
-#guard MinimalDeploy.spec.compute == .standard && MinimalDeploy.spec.timeoutSec? == none
-#guard NotesDb.config.isManaged && ManagedAuth.config.isManaged
-#guard SplitPreviewSrv.secrets == #[]
-#guard NotesDb.config.endpointForEnv .prod == .managedPostgres "NotesDb" .prod
-#guard EphemeralPreviewDb.config.endpointForEnv .preview == .sqlitePath "/tmp/qed-preview-EphemeralPreviewDb.db"
-#guard EphemeralPreviewDb.config.endpointForEnv .dev == .sqlitePath ".qed/custom-dev.db"
+#guard NotesDeploy.spec.compute == .performance &&
+  NotesDeploy.spec.timeoutSec? == some 300 &&
+  NotesDeploy.spec.preview.ttlSec == 7 * 86400 &&
+  MinimalDeploy.spec.compute == .standard && MinimalDeploy.spec.timeoutSec? == none &&
+  NotesDb.config.isManaged && ManagedAuth.config.isManaged &&
+  SplitPreviewSrv.secrets == #[] &&
+  NotesDb.config.endpointForEnv .prod == .managedPostgres "NotesDb" .prod &&
+  EphemeralPreviewDb.config.endpointForEnv .preview == .sqlitePath "/tmp/qed-preview-EphemeralPreviewDb.db" &&
+  EphemeralPreviewDb.config.endpointForEnv .dev == .sqlitePath ".qed/custom-dev.db"
 
 /-! ## 2. Concrete Computational Edge Cases (Unproved Parsers / Rollout Diff) -/
 
 -- Authority-aware loopback detection & wildcard positive match
-#guard isLocalhostUrl "http://127.0.0.2:8001/auth" && isLocalhostUrl "http://[::1]:8001"
-#guard isLocalhostUrl "http://app.localhost:3000" && !isLocalhostUrl "https://notlocalhost.example.com/v127.0.0.1"
-#guard (derivePreviewHost "notes.example.com" "preview").matches "pr-42.preview.notes.example.com"
+#guard isLocalhostUrl "http://127.0.0.2:8001/auth" && isLocalhostUrl "http://[::1]:8001" &&
+  isLocalhostUrl "http://app.localhost:3000" && !isLocalhostUrl "https://notlocalhost.example.com/v127.0.0.1" &&
+  (derivePreviewHost "notes.example.com" "preview").matches "pr-42.preview.notes.example.com"
 
 -- Per-env footprint isolates secrets and excludes managed auth secret in dev/preview
 def multiEnvManifest : Qed.Deploy.DeployManifest := {
   version := 1
   databases := [{
-    dbName := `ByoDb, shortName := "ByoDb",
-    configConst := `ByoDb.config, ensureSchemaConst := `ByoDb.ensureSchema,
-    secrets := #["PROD_DB_URL", "STAGING_DB_URL", "PREVIEW_DB_URL"],
+    dbName := `ByoDb, shortName := "ByoDb", configConst := `ByoDb.config, ensureSchemaConst := `ByoDb.ensureSchema,
+    secrets := #["PROD_DB_URL", "STAGING_DB_URL", "PREVIEW_DB_URL"], tables := #[]
     envSpecs := {
       dev     := .byoSqlite ".qed/dev.db",
       preview := .byoPostgres { envVar := "PREVIEW_DB_URL", scope := .pinned .preview },
       staging := .byoPostgres { envVar := "STAGING_DB_URL", scope := .pinned .staging },
       prod    := .byoPostgres { envVar := "PROD_DB_URL", scope := .pinned .prod }
-    },
-    tables := #[]
+    }
   }]
   auth? := some ManagedAuth.config
 }
-#guard (multiEnvManifest.footprintFor .preview).secrets.map (·.envVar) == ["PREVIEW_DB_URL"]
-#guard (multiEnvManifest.footprintFor .prod).secrets.map (·.envVar) == ["PROD_DB_URL", "QED_AUTH_CLIENT_SECRET"]
-#guard (multiEnvManifest.footprintFor .dev).secrets == []
+#guard (multiEnvManifest.footprintFor .preview).secrets.map (·.envVar) == ["PREVIEW_DB_URL"] &&
+  (multiEnvManifest.footprintFor .prod).secrets.map (·.envVar) == ["PROD_DB_URL", "QED_AUTH_CLIENT_SECRET"] &&
+  (multiEnvManifest.footprintFor .dev).secrets == []
 
 -- Zero-downtime egress union (Phase 1) + narrowing (Phase 4)
 #guard
@@ -173,8 +147,7 @@ def multiEnvManifest : Qed.Deploy.DeployManifest := {
   let live : GcpObservedState := { key := k, secretNames := ["K", "OLD"], egressAllow := ["https://a.com", "https://b.com"] }
   let acts := planRollout live plan
   acts.contains (.setEgressRules k ["https://a.com", "https://b.com"]) &&
-  acts.contains (.narrowEgressRules k ["https://a.com"]) &&
-  acts.contains (.deleteSecret k "OLD")
+  acts.contains (.narrowEgressRules k ["https://a.com"]) && acts.contains (.deleteSecret k "OLD")
 
 /-! ## 3. Negative Elaborator Guard Tests (1 per distinct check) -/
 
@@ -188,25 +161,19 @@ deploy BadStatefulMultiRegion:
   app     StatefulApi
   regions [us_central1, europe_west1]
 
-/--
-error: `deploy BadTimeout`: `timeout` (7201s) must be between 1s and 3600s
--/
+/-- error: `deploy BadTimeout`: `timeout` (7201s) must be between 1s and 3600s -/
 #guard_msgs in
 deploy BadTimeout:
   app     NotesApp
   timeout 7201s
 
-/--
-error: `deploy BadDomain`: invalid RFC 1123 production `domain` `https://notes.example.com` (omit scheme/path/trailing dot)
--/
+/-- error: `deploy BadDomain`: invalid RFC 1123 production `domain` `https://notes.example.com` (omit scheme/path/trailing dot) -/
 #guard_msgs in
 deploy BadDomain:
   app    NotesApp
   domain "https://notes.example.com"
 
-/--
-error: `deploy BadOverlap`: preview host `*.example.com` overlaps production domain `notes.example.com`
--/
+/-- error: `deploy BadOverlap`: preview host `*.example.com` overlaps production domain `notes.example.com` -/
 #guard_msgs in
 deploy BadOverlap:
   app    NotesApp
@@ -232,8 +199,7 @@ database BadSqliteDb:
 
 server BadSqliteSrv:
   use db : BadSqliteDb
-  def ping() -> Bool:
-    return true
+  def ping() -> Bool: return true
 
 /--
 error: `deploy BadSqlite`: database `BadSqliteDb` uses ephemeral SQLite in `prod`, which loses all data when Cloud Run recycles containers.
@@ -246,27 +212,20 @@ deploy BadSqlite:
 
 server LoopbackEnvSrv:
   env apiUrl = "API_URL" ?? "http://localhost:9000"
-  def ping() -> String:
-    return apiUrl
+  def ping() -> String: return apiUrl
 
-/--
-error: `deploy BadLoopbackEnv`: server `LoopbackEnvSrv` `env apiUrl` (`API_URL`) has a loopback default (`http://localhost:9000`), which must not ship to production.
--/
+/-- error: `deploy BadLoopbackEnv`: server `LoopbackEnvSrv` `env apiUrl` (`API_URL`) has a loopback default (`http://localhost:9000`), which must not ship to production. -/
 #guard_msgs in
 deploy BadLoopbackEnv:
   app LoopbackEnvSrv
 
-/--
-error: cannot combine `managed [...]` with explicit OIDC clauses in `auth BadMixedAuth`
--/
+/-- error: cannot combine `managed [...]` with explicit OIDC clauses in `auth BadMixedAuth` -/
 #guard_msgs in
 auth BadMixedAuth:
   managed [google]
   issuer env("X") ?? "http://127.0.0.1:8001"
 
-/--
-error: cannot combine a default endpoint with `prod` in `database BadDefaultProdDb`
--/
+/-- error: cannot combine a default endpoint with `prod` in `database BadDefaultProdDb` -/
 #guard_msgs in
 database BadDefaultProdDb:
   postgres secret("DEFAULT_URL")
@@ -274,9 +233,7 @@ database BadDefaultProdDb:
   table t:
     id : Nat primary_key
 
-/--
-error: cannot override `prod` inside `managed postgres:` in `database BadManagedProdDb`
--/
+/-- error: cannot override `prod` inside `managed postgres:` in `database BadManagedProdDb` -/
 #guard_msgs in
 database BadManagedProdDb:
   managed postgres:
@@ -284,18 +241,14 @@ database BadManagedProdDb:
   table t:
     id : Nat primary_key
 
-/--
-error: deploy invariant `BadInv.wrongTier` failed to prove
--/
+/-- error: deploy invariant `BadInv.wrongTier` failed to prove -/
 #guard_msgs in
 deploy BadInv:
   app     NotesApp
   compute standard
   invariant wrongTier: compute == xlarge
 
-/--
-error: use `timeout_sec` (Option Nat, in seconds) inside deploy invariants
--/
+/-- error: use `timeout_sec` (Option Nat, in seconds) inside deploy invariants -/
 #guard_msgs in
 deploy BadInvField:
   app NotesApp

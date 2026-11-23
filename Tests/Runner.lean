@@ -14,23 +14,14 @@ def main : IO UInt32 := do
     ("verification-and-jobs", Tests.Native.VerificationAndJobs.run),
     ("auth-and-deploy",       Tests.Native.AuthAndDeploy.run)
   ]
-  -- Run all 4 independent native suites concurrently!
-  let mut tasks : Array (String × Task (Except IO.Error Bool)) := #[]
-  for (name, fn) in suites do
-    let t ← IO.asTask (prio := .dedicated) fn
-    tasks := tasks.push (name, t)
+  -- Run all independent native suites concurrently.
+  let tasks ← suites.mapM fun (name, fn) => return (name, ← IO.asTask (prio := .dedicated) fn)
   let mut failed := 0
   for (name, t) in tasks do
     match ← IO.wait t with
     | .ok true  => pure ()
     | .ok false => failed := failed + 1
-    | .error e  =>
-        IO.eprintln s!"  ✗ {name}: exception: {e}"
-        failed := failed + 1
-  let total := suites.size
+    | .error e  => IO.eprintln s!"  ✗ {name}: exception: {e}"; failed := failed + 1
   if failed == 0 then
-    IO.println s!"\x1b[32m✓ {total}/{total} test suites passed\x1b[0m"
-    return 0
-  else
-    IO.eprintln s!"\x1b[31m✗ {failed}/{total} test suite(s) failed\x1b[0m"
-    return 1
+    IO.println s!"\x1b[32m✓ {suites.size}/{suites.size} test suites passed\x1b[0m"; return 0
+  IO.eprintln s!"\x1b[31m✗ {failed}/{suites.size} test suite(s) failed\x1b[0m"; return 1

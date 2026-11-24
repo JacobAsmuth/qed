@@ -1,4 +1,5 @@
 import Cli.Build
+import Cli.Cloud
 import Qed.Cloud.Executor
 
 open System (FilePath)
@@ -180,7 +181,21 @@ private def runDeploy (args : List String) : ExceptT String IO UInt32 := do
   let n ← liftE (executeRollout cfg plan imageUri outDir actions fun a => IO.println s!"  ▸ [P{a.phase.rank}] {formatAction a}")
   liftIO (IO.println (green s!"✓ deploy complete: {plan.cloudRunName} ({n} action(s) across 4 phases)")); return 0
 
+private def isLocalGcpDeployInvocation (args : List String) : IO Bool := do
+  let localFlags := ["--local-gcp", "--dry-run", "--check-drift", "--teardown", "--skip-build",
+    "--project", "--prod-project", "--nonprod-project", "--tenant", "--app-id",
+    "--image", "--api-base", "--dist"]
+  if args.any (localFlags.contains ·) then return true
+  if args.any (fun a => a == "--api" || a == "--app" || a == "--no-wait") then return false
+  let hasGcpEnv ← orB (← (·.isSome) <$> nonEmptyEnv "QED_GCP_PROJECT") ((·.isSome) <$> nonEmptyEnv "QED_GCP_PROD_PROJECT")
+  let hasCloudEnv ← orB (← (·.isSome) <$> nonEmptyEnv "QED_CLOUD_API") ((·.isSome) <$> nonEmptyEnv "QED_CREDENTIALS_FILE")
+  return hasGcpEnv && !hasCloudEnv
+
 def cmdDeploy (args : List String) : IO UInt32 := do
-  match ← (runDeploy args).run with | .ok code => return code | .error e => IO.eprintln (red s!"✗ {e}"); return 1
+  if ← isLocalGcpDeployInvocation args then
+    let filtered := args.filter (· != "--local-gcp")
+    match ← (runDeploy filtered).run with | .ok code => return code | .error e => IO.eprintln (red s!"✗ {e}"); return 1
+  else
+    cmdHostedDeploy args
 
 end Qed.Cli

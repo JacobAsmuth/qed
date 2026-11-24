@@ -29,7 +29,14 @@ def usage : IO UInt32 := do
     "  start|preview  serve the build\n" ++
     "  serve <dir>    serve a static directory natively\n" ++
     "  manifest       emit & validate qed_deploy.json infrastructure manifest\n" ++
-    "  deploy         verified 4-phase Cloud Run deploy (--dry-run, --check-drift, --teardown)\n" ++
+    "  login          authenticate this CLI with Qed Cloud (browser device flow)\n" ++
+    "  logout         remove stored Qed Cloud credentials\n" ++
+    "  whoami         show the logged-in Qed Cloud account\n" ++
+    "  deploy         deploy to hosted Qed Cloud (or `--local-gcp` for direct GCP deploy)\n" ++
+    "  status [app]   show deployed apps, statuses, and URLs\n" ++
+    "  logs <id>      view or follow (`-f`) deployment verification & rollout logs\n" ++
+    "  secrets        manage app secrets (`list <app>` | `set <app> <NAME>`)\n" ++
+    "  rollback       roll back an app to a previous deployment\n" ++
     "  dev-auth [p]   run local ES256 OIDC dev identity provider\n" ++
     "  test           run the native test suite (if present)\n" ++
     "  check          verify proofs + no-sorry + axioms\n" ++

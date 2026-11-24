@@ -1,6 +1,7 @@
 import Cli.Common
 import Cli.Verify
 import Cli.Build
+import Cli.Cloud
 import Cli.Deploy
 import Cli.Test
 import Cli.Scaffold
@@ -18,6 +19,13 @@ def main (args : List String) : IO UInt32 := do
   | ["start"] | ["preview"] => cmdStart
   | "serve" :: rest         => cmdServe rest
   | "manifest" :: rest      => cmdManifest rest
+  | "login" :: rest         => cmdLogin rest
+  | ["logout"]              => cmdLogout
+  | "whoami" :: rest        => cmdWhoami rest
+  | "status" :: rest        => cmdStatus rest
+  | "logs" :: rest          => cmdLogs rest
+  | "secrets" :: rest       => cmdSecrets rest
+  | "rollback" :: rest      => cmdRollback rest
   | "deploy" :: rest        => cmdDeploy rest
   | "dev-auth" :: rest      => cmdDevAuth rest
   | ["test"]                => cmdTest

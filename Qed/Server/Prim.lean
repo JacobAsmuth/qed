@@ -35,6 +35,8 @@ instance : Nonempty StaticDir := StaticDirPointed.property
 @[extern "qed_server_ec_p256_sign"]       opaque ecP256Sign       (pkcs8Der msg : @& ByteArray) : IO (Except String ByteArray)
 @[extern "qed_server_sha256"]             opaque sha256           (data : @& ByteArray) : IO ByteArray
 @[extern "qed_server_pbkdf2_sha256"]      opaque pbkdf2HmacSha256 (password salt : @& ByteArray) (iterations : UInt32) : IO ByteArray
+@[extern "qed_server_aead_encrypt"]       opaque aeadEncrypt      (key aad pt : @& ByteArray) : IO (Except String ByteArray)
+@[extern "qed_server_aead_decrypt"]       opaque aeadDecrypt      (key aad ct : @& ByteArray) : IO (Except String ByteArray)
 @[extern "qed_server_gzip_compress"]      opaque gzipCompress     (data : @& ByteArray) : IO ByteArray
 
 -- Pooled SQLite WAL queries & pinned transactions

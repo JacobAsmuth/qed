@@ -232,6 +232,38 @@ private def runMigrationSuite (c : TestChecker) (tmpDir : String) : IO Unit := d
     c.expectOk "[migrate] v2 idempotent" (← Native.migrateDatabase v2Cfg) fun steps => c.checkEq "[migrate] v2 re-run is idempotent (0 steps)" steps.length 0
     c.checkErrContains "[migrate] unsafe v3 migration rejected" (← Native.migrateDatabase (mkCfg { v2Table with columns := v2Table.columns ++ [unsafeCol] })) "unsafe additive migration"
 
+private def runEncryptedColumnSuite (c : TestChecker) (srvInst : MonadServer IO) : IO Unit := do
+  let cfg := DbChecks.EncVaultDb.config
+  c.expectOk "[enc-db] schema init" (← @MonadServer.dbExecDdl IO srvInst cfg) fun () => do
+    let alice (fn : String) (req := ByteArray.empty) := @DbChecks.EncVaultApi.dispatchM IO _ srvInst { userId := some "alice" } fn req
+    let some inp1 := DbChecks.SecretNoteInput.parse { body := "top-secret payload 🔐" } | c.check "[enc-db] parse inp1" false; return
+    let some inp2 := DbChecks.SecretNoteInput.parse { body := "updated secret 🔑" } | c.check "[enc-db] parse inp2" false; return
+    let blob := ByteArray.mk #[1, 2, 3, 255]
+    c.checkRpcDomainOk (E := DbChecks.EncVaultApi.save.Error) (α := DbChecks.EncVaultDb.entries) "[enc-db] insert row 1"
+      (← alice "save" (Qed.Proto.encode ((1 : Nat), (inp1, (some blob : Option ByteArray))))) fun r1 =>
+      c.check "[enc-db] insert returns plaintext" (r1.body == "top-secret payload 🔐" && r1.raw == some blob)
+    c.expectOk "[enc-db] insert row 2 (same plaintext)" (← alice "save" (Qed.Proto.encode ((2 : Nat), (inp1, (none : Option ByteArray))))) fun _ => pure ()
+    let rawQ := SqlQuery.select ⟨"entries", by decide⟩ [⟨"id", by decide⟩, ⟨"body", by decide⟩] .litTrue (some (⟨"id", by decide⟩, .asc)) none none
+    c.expectOk "[enc-db] raw SQLite read" (← @MonadServer.dbExec IO srvInst cfg rawQ) fun res => do
+      c.check "[enc-db] 2 raw rows stored" (res.rows.size == 2)
+      match res.rows[0]?.bind (·[1]?), res.rows[1]?.bind (·[1]?) with
+      | some (SqlVal.text ct1), some (SqlVal.text ct2) =>
+          c.check "[enc-db] ciphertext hides plaintext" (!ct1.contains "top-secret" && !ct2.contains "top-secret")
+          c.check "[enc-db] ciphertext satisfies derived CHECK bounds" (40 <= ct1.length && ct1.length <= 304 && 40 <= ct2.length && ct2.length <= 304)
+          c.check "[enc-db] randomized AES-GCM nonces differ" (ct1 != ct2)
+      | _, _ => c.check "[enc-db] raw body cells are TEXT" false
+    c.checkProtoBy (α := Option DbChecks.EncVaultDb.entries) "[enc-db] findOne decrypts row 1"
+      (← alice "get" (Qed.Proto.encode (1 : Nat))) (fun opt => opt.map fun r => (r.body, r.raw)) (some ("top-secret payload 🔐", some blob))
+    c.checkProtoBy (α := Array DbChecks.EncVaultDb.entries) "[enc-db] select decrypts all rows"
+      (← alice "list") (fun rs => rs.map fun r => (r.id, r.body, r.raw)) #[(1, "top-secret payload 🔐", some blob), (2, "top-secret payload 🔐", none)]
+    c.checkProtoBy (α := Option DbChecks.EncVaultDb.entries) "[enc-db] updateOne re-encrypts"
+      (← alice "edit" (Qed.Proto.encode ((1 : Nat), inp2))) (fun opt => opt.map (·.body)) (some "updated secret 🔑")
+    let tamperQ := SqlQuery.update ⟨"entries", by decide⟩ [(⟨"body", by decide⟩, .param (.text (String.ofList (List.replicate 44 'A'))))] (.binOp .eq (.col ⟨"id", by decide⟩) (.param (.int 2))) []
+    c.expectOk "[enc-db] raw tamper update" (← @MonadServer.dbExec IO srvInst cfg tamperQ) fun _ => do
+      c.check "[enc-db] tampered ciphertext rejected on read" (!(← alice "get" (Qed.Proto.encode (2 : Nat))).isOk)
+    let badLenQ := SqlQuery.insert ⟨"entries", by decide⟩ [(⟨"id", by decide⟩, .int 99), (⟨"ownerId", by decide⟩, .text "alice"), (⟨"body", by decide⟩, .text (String.ofList (List.replicate 308 'A'))), (⟨"note", by decide⟩, .text (String.ofList (List.replicate 44 'A'))), (⟨"raw", by decide⟩, .null)] []
+    c.check "[enc-db] SQLite CHECK rejects oversized ciphertext" (!(← @MonadServer.dbExec IO srvInst cfg badLenQ).isOk)
+
 def run : IO Bool := do
   let c ← mkChecker "database"
   withDevApp c "Tests.DbChecks" fun dir => do
@@ -255,6 +287,7 @@ def run : IO Bool := do
           c.check "[pg-wire] SQLi payload NEVER interpolated into Parse SQL" (!(parsed.any (·.contains "DROP TABLE")))
           c.check "[pg-wire] Parse used $1 placeholders with Bind params" (parsed.any (·.contains "$1"))
       runShopDirectSuite c "sqlite-direct" (withRedirectedDb (.sqlitePath s!"{tmpDir}/shop_direct.db")) (testConcurrentReaders := true)
+      runEncryptedColumnSuite c (withRedirectedDb (.sqlitePath s!"{tmpDir}/enc_vault.db"))
       runMigrationSuite c tmpDir
       withMockServer c "[pg-shop] start mock" (startPgWireMock s!"{tmpDir}/shop_pg_mock.db" "shopuser" "shoppass" "shopdb") (fun m => do Db.PgWire.clearPool; m.stop) fun shopPgMock => do
         runShopDirectSuite c "pg-direct" (withRedirectedDb (.postgresUrl shopPgMock.url))

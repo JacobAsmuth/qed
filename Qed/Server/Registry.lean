@@ -215,6 +215,7 @@ structure DbColumnInfo where
   isNullable   : Bool := false
   isNat        : Bool := false
   refs?        : Option (String × String) := none
+  encKey?      : Option (String × Option String × Bool) := none
 deriving Inhabited, Repr
 
 structure DbTableInfo where

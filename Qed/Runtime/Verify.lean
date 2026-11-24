@@ -678,7 +678,7 @@ private def viewEquivBaseNames : Array Name :=
     ``Attr.isSignalBind_ite, ``Attr.canonical_ite, ``List.map_cons, ``List.map_nil, ``List.map_map,
     ``List.filterMap_cons, ``List.filterMap_nil, ``List.all_cons, ``List.all_nil, ``List.isEmpty_cons, ``List.isEmpty_nil,
     ``Function.comp_def, ``Array.toList_map, ``id_eq, ``Bool.false_eq_true, ``Option.map_some, ``Option.map_none,
-    ``mkCanonicalElem, ``onlySignalBind, ``Attr.canonical] ++ boolConstSimpNames
+    ``mkCanonicalElem, ``onlySignalBind, ``Attr.canonical, `Qed.toString_field, ``toString_string] ++ boolConstSimpNames
 
 private def runProveViewEquiv (appId viewId : Ident) : TacticM Unit := do
   let appName ← realizeGlobalConstNoOverloadWithInfo appId; let viewName ← realizeGlobalConstNoOverloadWithInfo viewId

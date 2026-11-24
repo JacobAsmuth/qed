@@ -449,6 +449,19 @@ end RelModel
 
 /-! ## Schema Metadata & SQL DDL / Postgres RLS Generator -/
 
+/-- Specification for an `encrypted(...)` column (AES-256-GCM + Base64). -/
+structure EncColSpec where
+  keyEnv    : String
+  fallback? : Option String := none
+  aad       : ByteArray
+  isBytes   : Bool := false
+deriving Inhabited
+
+abbrev aeadOverhead : Nat := 28
+abbrev aeadBase64Len (plainBytes : Nat) : Nat := 4 * ((plainBytes + aeadOverhead + 2) / 3)
+theorem aeadBase64Len_mono {a b : Nat} (h : a ≤ b) : aeadBase64Len a ≤ aeadBase64Len b := by
+  simp only [aeadBase64Len, aeadOverhead]; omega
+
 inductive SqlColType where | text | int | bool | bytes deriving Inhabited, DecidableEq, Repr
 def SqlColType.render (d : SqlDialect) : SqlColType → String
   | .text => "TEXT" | .int => d.pick "BIGINT" "INTEGER" | .bool => d.pick "BOOLEAN" "INTEGER" | .bytes => d.pick "BYTEA" "BLOB"

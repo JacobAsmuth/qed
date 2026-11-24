@@ -14,6 +14,7 @@ variable {α : Type} {p : α → Prop}
 @[reducible] instance {msg : Type} [Coe α (Html msg)] : CoeHTCT (Field p) (Html msg) := ⟨fun f => (f.val : Html msg)⟩
 @[reducible] instance : CoeHTCT (Option (Field p)) (Option α) := ⟨Option.map Field.val⟩
 instance [ToString α] : ToString (Field p) := ⟨fun f => toString f.val⟩
+@[simp] theorem toString_field [ToString α] (f : Field p) : toString f = toString f.val := rfl
 instance [BEq α] : BEq (Field p) := ⟨fun a b => a.val == b.val⟩
 instance [Repr α] : Repr (Field p) := ⟨fun f n => reprPrec f.val n⟩
 instance [BEq α] [LawfulBEq α] : LawfulBEq (Field p) where
@@ -31,5 +32,76 @@ instance [DecidablePred p] [FromProto α] : FromProto (Field p) := .ofRetract (m
 instance [DecidablePred p] [LawfulProto α] : LawfulProto (Field p) := .ofRetract Field.val (mkField "protobuf: failed field refinement") fun ⟨_, hok⟩ => dite_eq_left hok
 @[simp] theorem Proto.encode_field [ToProto α] (f : Field p) : Proto.encode f = Proto.encode f.val := rfl
 end FieldInstances
+
+def Field.map {α β : Type} {p : α → Prop} {q : β → Prop} (f : α → β)
+    (hf : ∀ a, p a → q (f a)) (x : Field p) : Field q :=
+  ⟨f x.val, hf x.val x.ok⟩
+
+abbrev Field.length {p : String → Prop} (f : Field p) : Nat := f.val.length
+abbrev Field.utf8ByteSize {p : String → Prop} (f : Field p) : Nat := f.val.utf8ByteSize
+abbrev Field.toUTF8 {p : String → Prop} (f : Field p) : ByteArray := f.val.toUTF8
+abbrev Field.size {p : ByteArray → Prop} (f : Field p) : Nat := f.val.size
+
+@[simp] theorem toUTF8_size (s : String) : s.toUTF8.size = s.utf8ByteSize := Nat.add_zero _
+@[simp] theorem fromUTF8?_toUTF8 (s : String) : String.fromUTF8? s.toUTF8 = some s := by
+  simp [String.fromUTF8?, String.toUTF8, s.isValidUTF8]
+
+/-- Unwraps fallible (`Except String α`) or optional (`Option α`) results inside `mapping` `decode` blocks. -/
+class MappingUnwrap (α : Type) (β : outParam Type) where
+  unwrap : α → Except String β
+
+instance {α : Type} : MappingUnwrap (Except String α) α := ⟨id⟩
+instance {α : Type} : MappingUnwrap (Option α) α := ⟨fun | some a => .ok a | none => .error "mapping decode failed"⟩
+
+@[simp] theorem MappingUnwrap.unwrap_ok {α : Type} (a : α) : MappingUnwrap.unwrap (Except.ok a : Except String α) = .ok a := rfl
+@[simp] theorem MappingUnwrap.unwrap_error {α : Type} (e : String) : MappingUnwrap.unwrap (Except.error e : Except String α) = .error e := rfl
+@[simp] theorem MappingUnwrap.unwrap_some {α : Type} (a : α) : MappingUnwrap.unwrap (some a : Option α) = .ok a := rfl
+@[simp] theorem MappingUnwrap.unwrap_none {α : Type} : MappingUnwrap.unwrap (none : Option α) = .error "mapping decode failed" := rfl
+
+/-- Verified bidirectional mapping between a source representation `A` (invariant `pA`)
+    and a target representation `B` (invariant `pB`), e.g. plaintext <-> ciphertext,
+    bytes <-> Base64, or domain units <-> wire formats. -/
+structure Mapping {A B : Type} (pA : A → Prop) (pB : B → Prop) where
+  toTarget  : A → B
+  toSource  : B → Except String A
+  encode_ok : ∀ a, pA a → pB (toTarget a)
+  decode_ok : ∀ b a, toSource b = .ok a → pA a
+  roundtrip : ∀ a, pA a → toSource (toTarget a) = .ok a
+
+namespace Mapping
+variable {A B : Type} {pA : A → Prop} {pB : B → Prop}
+
+def encode (m : Mapping pA pB) (a : A) (ha : pA a := by trivial) : Field pB :=
+  ⟨m.toTarget a, m.encode_ok a ha⟩
+
+def encodeField (m : Mapping pA pB) (a : Field pA) : Field pB :=
+  Field.map m.toTarget m.encode_ok a
+
+def decode (m : Mapping pA pB) (b : B) : Except String (Field pA) :=
+  match h : m.toSource b with
+  | .ok a    => .ok ⟨a, m.decode_ok b a h⟩
+  | .error e => .error e
+
+theorem decode_encode (m : Mapping pA pB) (a : A) (ha : pA a) :
+    m.decode (m.encode a ha).val = .ok ⟨a, ha⟩ := by
+  unfold decode encode; split
+  · rename_i _ h; cases Except.ok.inj ((m.roundtrip a ha).symm.trans h); rfl
+  · rename_i _ h; cases (m.roundtrip a ha).symm.trans h
+
+def comp {A B C : Type} {pA : A → Prop} {pB pB' : B → Prop} {pC : C → Prop}
+    (m2 : Mapping pB' pC) (m1 : Mapping pA pB)
+    (hCompat : ∀ b, pB b → pB' b := by intro _ h; exact h) : Mapping pA pC where
+  toTarget a := m2.toTarget (m1.toTarget a)
+  toSource c := (m2.toSource c).bind m1.toSource
+  encode_ok a ha := m2.encode_ok _ (hCompat _ (m1.encode_ok a ha))
+  decode_ok c a h := by
+    cases h2 : m2.toSource c with
+    | error _ => simp [h2, Except.bind] at h
+    | ok b => simp only [h2, Except.bind] at h; exact m1.decode_ok b a h
+  roundtrip a ha := by
+    have h2 := m2.roundtrip (m1.toTarget a) (hCompat _ (m1.encode_ok a ha))
+    simp only [h2, Except.bind, m1.roundtrip a ha]
+
+end Mapping
 
 end Qed

@@ -1,5 +1,5 @@
 use std::{cell::RefCell, ffi::{c_void, CString}, io::Read, os::fd::FromRawFd, sync::{OnceLock, RwLock}, time::{SystemTime, UNIX_EPOCH}};
-use ring::{digest, hmac, pbkdf2, rand::{SecureRandom, SystemRandom}};
+use ring::{aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN}, digest, hmac, pbkdf2, rand::{SecureRandom, SystemRandom}};
 use ring::signature::{
     EcdsaKeyPair, KeyPair, RsaKeyPair, UnparsedPublicKey, VerificationAlgorithm,
     ECDSA_P256_SHA256_FIXED, ECDSA_P256_SHA256_FIXED_SIGNING, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256,
@@ -122,6 +122,36 @@ thread_local! { static HMAC_KEY_CACHE: RefCell<HmacKeyCache> = const { RefCell::
 fn with_hmac_key<R>(kb: &[u8], f: impl FnOnce(&hmac::Key) -> R) -> R {
     if kb.len() > HMAC_CACHE_MAX_KEY { return f(&hmac::Key::new(hmac::HMAC_SHA256, kb)); }
     HMAC_KEY_CACHE.with(|c| f(c.borrow_mut().get_or_insert(kb)))
+}
+fn derive_aes256_key(raw: &[u8]) -> Result<LessSafeKey, &'static str> {
+    if raw.is_empty() { return Err("encryption key must not be empty"); }
+    let mut ctx = digest::Context::new(&digest::SHA256);
+    ctx.update(b"qed-aead-aes256gcm-v1:");
+    ctx.update(raw);
+    let d = ctx.finish();
+    Ok(LessSafeKey::new(UnboundKey::new(&AES_256_GCM, d.as_ref()).map_err(|_| "AEAD key init failed")?))
+}
+fn aead_aes256_gcm_seal(key: &[u8], aad: &[u8], pt: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let lsk = derive_aes256_key(key)?;
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    SystemRandom::new().fill(&mut nonce_bytes).map_err(|_| "CSPRNG failure")?;
+    let mut out = Vec::with_capacity(NONCE_LEN + pt.len() + AES_256_GCM.tag_len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(pt);
+    let tag = lsk.seal_in_place_separate_tag(Nonce::assume_unique_for_key(nonce_bytes), Aad::from(aad), &mut out[NONCE_LEN..])
+        .map_err(|_| "AEAD encryption failed")?;
+    out.extend_from_slice(tag.as_ref());
+    Ok(out)
+}
+fn aead_aes256_gcm_open(key: &[u8], aad: &[u8], ct: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let lsk = derive_aes256_key(key)?;
+    if ct.len() < NONCE_LEN + AES_256_GCM.tag_len() { return Err("AEAD ciphertext too short"); }
+    let nonce_bytes: [u8; NONCE_LEN] = ct[..NONCE_LEN].try_into().unwrap();
+    let mut buf = ct[NONCE_LEN..].to_vec();
+    let pt_len = lsk.open_in_place(Nonce::assume_unique_for_key(nonce_bytes), Aad::from(aad), &mut buf)
+        .map_err(|_| "AEAD decryption failed")?.len();
+    buf.truncate(pt_len);
+    Ok(buf)
 }
 fn parse_rsa_keypair(pem: &str) -> Option<RsaKeyPair> {
     parse_pem_blocks(pem, "PRIVATE KEY").into_iter().next().and_then(|d| RsaKeyPair::from_pkcs8(&d).ok())
@@ -263,6 +293,10 @@ ffi_export! {
             .map_err(|_| "invalid P-256 PKCS#8 private key")
             .and_then(|kp| kp.sign(&rng, ba_slice(msg_obj)).map_err(|_| "ES256 signing failed")), |sig| mk_ba(sig.as_ref()))
     };
+    qed_server_aead_encrypt(key_obj: *mut LeanObj, aad_obj: *mut LeanObj, pt_obj: *mut LeanObj) =>
+        mk_io_except(aead_aes256_gcm_seal(ba_slice(key_obj), ba_slice(aad_obj), ba_slice(pt_obj)), |ct| mk_ba(&ct));
+    qed_server_aead_decrypt(key_obj: *mut LeanObj, aad_obj: *mut LeanObj, ct_obj: *mut LeanObj) =>
+        mk_io_except(aead_aes256_gcm_open(ba_slice(key_obj), ba_slice(aad_obj), ba_slice(ct_obj)), |pt| mk_ba(&pt));
 }
 
 #[cfg(test)]
@@ -301,5 +335,25 @@ mod tests {
             assert!(with_hmac_key(k, |hk| hmac::verify(hk, msg, tag.as_ref()).is_ok()));
             assert_eq!(tag.as_ref(), hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, k), msg).as_ref());
         }
+    }
+
+    #[test]
+    fn aead_aes256_gcm_roundtrip_and_tamper_rejection() {
+        let (key, aad) = (b"super-secret-notes-key", b"notes.body");
+        for pt in [&b""[..], b"hello", "unicode \u{1f512} secret".as_bytes(), &[0xABu8; 512][..]] {
+            let c1 = aead_aes256_gcm_seal(key, aad, pt).unwrap();
+            let c2 = aead_aes256_gcm_seal(key, aad, pt).unwrap();
+            assert_eq!(c1.len(), pt.len() + 28);
+            assert_ne!(c1, c2);
+            assert_eq!(aead_aes256_gcm_open(key, aad, &c1).unwrap(), pt);
+            assert_eq!(aead_aes256_gcm_open(key, aad, &c2).unwrap(), pt);
+            assert!(aead_aes256_gcm_open(b"wrong-key", aad, &c1).is_err());
+            assert!(aead_aes256_gcm_open(key, b"other.col", &c1).is_err());
+            let mut tampered = c1.clone();
+            tampered[c1.len() - 1] ^= 0x01;
+            assert!(aead_aes256_gcm_open(key, aad, &tampered).is_err());
+        }
+        assert!(aead_aes256_gcm_seal(b"", aad, b"x").is_err());
+        assert!(aead_aes256_gcm_open(key, aad, &[0u8; 27]).is_err());
     }
 }

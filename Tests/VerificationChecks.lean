@@ -99,7 +99,10 @@ bad_a11y headingsOrdered   : <div><h1>Title</h1><h3>Skipped h2</h3></div>
 bad_a11y htmlHasLang       : <html><body>Hello</body></html>
 
 /-! ## 3. Binary File Uploads & Verified Base64 -/
-example (bs : ByteArray) : Qed.Base64.decode (Qed.Base64.encode bs) = .ok bs := Qed.Base64.decode_encode bs
+example (bs : ByteArray) : Qed.Base64.decode (Qed.Base64.encode bs) = .ok bs ∧
+    (Qed.Base64.encode bs).length = Qed.Base64.encodedLength bs.size ∧
+    (Qed.Base64.encodeUrl bs).length = Qed.Base64.encodedUrlLength bs.size :=
+  ⟨Qed.Base64.decode_encode bs, Qed.Base64.encode_length bs, Qed.Base64.encodeUrl_length bs⟩
 #guard Qed.Base64.encode (ByteArray.mk #[]) == "" && Qed.Base64.encode (ByteArray.mk #[0, 1, 2, 255]) == "AAEC/w==" &&
   (match Qed.FileBytes.decode "{\"name\":\"pic.png\",\"mime\":\"image/png\",\"size\":4,\"base64\":\"AAEC/w==\"}" with
    | .ok fb => (fb.name, fb.mime, fb.size, fb.bytes.data) == ("pic.png", "image/png", 4, #[0, 1, 2, 255]) | .error _ => false) &&

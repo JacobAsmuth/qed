@@ -132,7 +132,7 @@ Qed.ForEach: forall_append forall_pop forall_reverse forall_extract forall_erase
   forall_swap forall_modify
 Qed.Server.Db: isSafeSqlIdent_no_inject evalSelect_satisfies_policy evalInsert_preserves_inv
   evalUpdate_preserves_inv_and_trans evalDelete_preserves_inv_and_policy diffTableSchema_self_empty
-  verifyMigrationSafe_nullable_addColumn
+  verifyMigrationSafe_nullable_addColumn aeadBase64Len_mono
 Qed.Server.Db.SqlExpr: compile_sameShape
 Qed.Server.Db.SqlQuery: compile_sameShape compile_no_semicolon
 Qed.Server.Db.PgWire: encodeMsg_size
@@ -147,6 +147,16 @@ Qed.Auth: parseJwtAlg_rejects_none parseJwtAlg_rejects_hs256 validateJwtClaims_r
   validateJwtClaims_rejects_empty_sub isSafeReturnTo_rejects_protocol_relative
   isSafeReturnTo_rejects_javascript sanitizeReturnTo_safe
 Qed.Deploy: validate_rejects_bad_version validate_rejects_unsafe_auth_callback validate_default_ok
+Qed.Base64: decode_encode encode_length encodeUrl_length
+Qed.Mapping: decode_encode
+Qed.Codec: run_refine_text run_refine_textarea
+Qed: toString_field fromUTF8?_toUTF8
+DbChecks.EncVaultDb.entries: rowInvBool_sound
+DbChecks.EncVaultApi: save_ensures edit_ensures get_ensures
+DbChecks.Base64BoundsMap: encode_ok decode_ok roundtrip decode_encode
+DbChecks.DollarsToCentsMap: encode_ok decode_ok roundtrip decode_encode
+DbChecks.NoteCipherMap: encode_ok decode_ok roundtrip decode_encode
+DbChecks.FieldRenderCheck: app_view_eq
 AuthChecks.AuthApi: adminAction_mutInv0
 "
 
@@ -176,6 +186,6 @@ open Lean in
       let bad := axs.filter (!allowed.contains ·)
       unless bad.isEmpty do
         throwError "unexpected axiom(s) in {n}: {bad.toList}"
-  unless seen.size == 386 do
-    throwError "expected 386 theorems in axioms manifest, checked {seen.size}"
+  unless seen.size == 412 do
+    throwError "expected 412 theorems in axioms manifest, checked {seen.size}"
   IO.println s!"✓ {seen.size} theorems checked: 0 unexpected axioms"

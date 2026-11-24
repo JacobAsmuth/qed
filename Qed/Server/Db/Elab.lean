@@ -41,6 +41,9 @@ private def dbIndented (msg : String) (cat : Name) : Parser := ":" >> checkColGt
 
 def dbPolicyOp : Parser := node `Qed.Server.Db.policyOp (identEq `read <|> identEq `write <|> identEq `insert <|> identEq `update <|> identEq `delete)
 def dbTransEdge : Parser := node `Qed.Server.Db.transEdge (sepBy1 (categoryParser `qedExpr 55) "->")
+def dbEncColTy : Parser := node `Qed.Server.Db.encColTy
+  (atomic (identEq `encrypted >> checkNoWsBefore "" >> "(") >>
+    categoryParser `qedType 91 >> "," >> identEq `key >> "=" >> dbSecretOrEnv >> ")" >> optional "?")
 
 @[dbTableClause_parser] def dbTablePolicyClause : Parser := leading_parser withPosition (atomic (identEq `policy) >> sepBy1 dbPolicyOp "," >> kw "requires" >> sepBy1 dbExpr ",")
 @[dbTableClause_parser] def dbTableTransInvClause : Parser := leading_parser withPosition (atomic ("invariant " >> ident >> ":" >> identEq `transition) >> categoryParser `qedExpr 90 >> ":" >> sepBy1 dbTransEdge ",")
@@ -48,7 +51,7 @@ def dbTransEdge : Parser := node `Qed.Server.Db.transEdge (sepBy1 (categoryParse
 @[dbTableClause_parser] def dbTableIndexClause : Parser := leading_parser withPosition (atomic (identEq `index) >> "(" >> sepBy1 ident "," >> ")")
 @[dbTableClause_parser] def dbTableColClause : Parser := leading_parser
   withPosition (notFollowedBy (identEq `policy <|> identEq `index <|> symbol "invariant") "column" >>
-    ident >> ":" >> categoryParser `qedType 91 >> many (checkLineEq >> categoryParser `dbColMod 0) >>
+    ident >> ":" >> (dbEncColTy <|> categoryParser `qedType 91) >> many (checkLineEq >> categoryParser `dbColMod 0) >>
     optional (checkLineEq >> symbol "where" >> sepBy1 dbExpr ","))
 
 @[dbManagedSubClause_parser] def dbManagedPreviewEphemeral : Parser := leading_parser withPosition (atomic (identEq `preview >> identEq `ephemeral))
@@ -78,12 +81,14 @@ private structure ParsedCol where
   isImmutable  : Bool
   isUnique     : Bool
   refs?        : Option (Lean.Ident × Lean.Ident)
+  encKey?      : Option (String × Option String × Bool) := none
   whereExprs   : Array Lean.Syntax
 
 private structure ParsedTable where
   ident       : Lean.Ident
   tableName   : String
   cols        : Array ParsedCol
+  encSecrets  : Array String := #[]
   readPols    : Array Lean.Syntax
   insertPols  : Array Lean.Syntax
   updatePols  : Array Lean.Syntax
@@ -193,12 +198,43 @@ private partial def renderSqlPred? (colNames : Array String) (forRls : Bool) (st
     some (String.intercalate " AND " parts.toList)
   else none
 
+private def extractPlainByteBounds (colName : String) (isBytes : Bool) (acc : Nat × Option Nat) (stx : Syntax) : Nat × Option Nat :=
+  let u := unwrapParens1 stx
+  if u.getKind != ``qedCmp then acc else
+  let metric? (s : Syntax) : Option (Nat × Nat) := match extractDottedChain? (unwrapParens1 s) with
+    | some [c, m] | some ["row", c, m] =>
+        if c != colName then none else if m == "utf8ByteSize" || (isBytes && m == "size") then some (1, 1)
+        else if !isBytes && m == "length" then some (1, 4) else none
+    | _ => none
+  let litNat? (s : Syntax) : Option Nat := let v := unwrapParens1 s; if v.getKind == ``qedLitNum then some (⟨v.getArg 0⟩ : TSyntax `num).getNat else none
+  let updMax (cur : Nat × Option Nat) (v : Nat) : Nat × Option Nat := (cur.1, some (cur.2.elim v (min · v)))
+  let applyCmp (cur : Nat × Option Nat) (opStr : String) (m : Nat × Nat) (n : Nat) : Nat × Option Nat := match opStr with
+    | "<=" => updMax cur (n * m.2) | "<" => updMax cur (if n > 0 then (n - 1) * m.2 else 0)
+    | ">=" => (max cur.1 (n * m.1), cur.2) | ">" => (max cur.1 ((n + 1) * m.1), cur.2)
+    | "==" => updMax (max cur.1 (n * m.1), cur.2) (n * m.2) | _ => cur
+  let flipOp : String → String | "<=" => ">=" | "<" => ">" | ">=" => "<=" | ">" => "<" | s => s
+  ((u.getArg 1).getArgs.foldl (init := (u.getArg 0, acc)) fun (lhs, cur) lk =>
+    let opStr := cmpOpKind (lk.getArg 0); let rhs := lk.getArg 1
+    let cur' := match metric? lhs, litNat? rhs, litNat? lhs, metric? rhs with
+      | some m, some n, _, _ => applyCmp cur opStr m n
+      | _, _, some n, some m => applyCmp cur (flipOp opStr) m n
+      | _, _, _, _ => cur
+    (rhs, cur')).2
+
+private def renderEncryptedCheckSql (colName : String) (isBytes : Bool) (whereExprs : Array Syntax) : String :=
+  let (minB, maxB?) := (whereExprs.flatMap splitAndStx).foldl (extractPlainByteBounds colName isBytes) (0, none)
+  let minC := aeadBase64Len minB
+  match maxB? with
+  | some maxB => s!"{minC} <= LENGTH(\"{colName}\") AND LENGTH(\"{colName}\") <= {aeadBase64Len maxB}"
+  | none => s!"{minC} <= LENGTH(\"{colName}\")"
+
 @[noinline]
 private def parseTableClause (dbName : Name) (existing : Array ParsedTable) (c : Syntax) : CommandElabM ParsedTable := do
   let tIdent : Ident := ⟨c.getArg 1⟩; let tName := tIdent.getId.eraseMacroScopes.toString
   if !isSafeSqlIdent tName then throwErrorAt tIdent s!"invalid SQL table name `{tName}`"
   if existing.any (·.tableName == tName) then throwErrorAt tIdent s!"duplicate `table {tName}` in `database {dbName}`"
-  let mut cols : Array ParsedCol := #[]; let mut readPols : Array Syntax := #[]; let mut insertPols : Array Syntax := #[]
+  let mut cols : Array ParsedCol := #[]; let mut encSecrets : Array String := #[]
+  let mut readPols : Array Syntax := #[]; let mut insertPols : Array Syntax := #[]
   let mut updatePols : Array Syntax := #[]; let mut deletePols : Array Syntax := #[]; let mut singleInvs : Array Syntax := #[]
   let mut transInvs : Array Syntax := #[]; let mut transChains : Array (Syntax × Array (Array Syntax)) := #[]; let mut indexes : Array (Array Ident) := #[]
   for sc in (c.getArg 3).getArgs do
@@ -207,17 +243,40 @@ private def parseTableClause (dbName : Name) (existing : Array ParsedTable) (c :
       let colId : Ident := ⟨sc.getArg 0⟩; let colName := colId.getId.eraseMacroScopes.toString
       if !isSafeSqlIdent colName then throwErrorAt colId s!"invalid SQL column name `{colName}`"
       if cols.any (·.colName == colName) then throwErrorAt colId s!"duplicate column `{colName}` in `table {tName}`"
-      let pty ← liftMacroM <| lowerSrvType (sc.getArg 2) false s!"column `{colName}`"
-      let (sqlColType, isNullable, isNat, isBytes) := inferSqlColType pty
+      let tyStx := sc.getArg 2
+      let (tyTerm, sqlColType, isNullable, isNat, isBytes, encKey?) ←
+        if tyStx.getKind == `Qed.Server.Db.encColTy then
+          let inner ← liftMacroM <| lowerSrvType (tyStx.getArg 2) false s!"encrypted column `{colName}`"
+          let isB := inner.baseName == `Bytes || inner.baseName == `ByteArray
+          unless inner.baseName == `String || isB do
+            throwErrorAt (tyStx.getArg 2) s!"`encrypted(...)` column `{colName}` only supports `String` or `Bytes` inner types"
+          let outerOpt := (tyStx.getArg 8).getNumArgs == 1
+          let isNull := inner.isOption || outerOpt
+          let tyT ← if outerOpt && !inner.isOption then `(Option $(inner.term)) else pure inner.term
+          let er ← parseQedEnvRef "database" (tyStx.getArg 6)
+          if er.isSecret && er.default?.isNone then encSecrets := pushUnique encSecrets er.envKey
+          pure (tyT, SqlColType.text, isNull, false, isB, some (er.envKey, er.default?, isB))
+        else
+          let pty ← liftMacroM <| lowerSrvType tyStx false s!"column `{colName}`"
+          let (sqlTy, isNull, isN, isB) := inferSqlColType pty
+          pure (pty.term, sqlTy, isNull, isN, isB, none)
       let mut isPk := false; let mut isImm := false; let mut isUniq := false; let mut refs? : Option (Ident × Ident) := none
       for m in (sc.getArg 3).getArgs do
         let mk := m.getKind
-        if mk == ``dbModPk then isPk := true else if mk == ``dbModImmutable then isImm := true
-        else if mk == ``dbModUnique then isUniq := true else if mk == ``dbModRefs then refs? := some (⟨m.getArg 1⟩, ⟨m.getArg 3⟩)
+        if mk == ``dbModPk then
+          if encKey?.isSome then throwErrorAt m s!"encrypted column `{tName}.{colName}` cannot be `primary_key`"
+          isPk := true
+        else if mk == ``dbModImmutable then isImm := true
+        else if mk == ``dbModUnique then
+          if encKey?.isSome then throwErrorAt m s!"encrypted column `{tName}.{colName}` cannot be `unique` (AES-256-GCM uses randomized nonces)"
+          isUniq := true
+        else if mk == ``dbModRefs then
+          if encKey?.isSome then throwErrorAt m s!"encrypted column `{tName}.{colName}` cannot use `references`"
+          refs? := some (⟨m.getArg 1⟩, ⟨m.getArg 3⟩)
       let wOpt := sc.getArg 4
       cols := cols.push {
-        ident := colId, colName, tyTerm := pty.term, sqlColType, isNullable, isNat, isBytes,
-        isPrimaryKey := isPk, isImmutable := isImm, isUnique := isUniq, refs?,
+        ident := colId, colName, tyTerm, sqlColType, isNullable, isNat, isBytes,
+        isPrimaryKey := isPk, isImmutable := isImm, isUnique := isUniq, refs?, encKey?,
         whereExprs := if wOpt.getNumArgs == 2 then (wOpt.getArg 1).getSepArgs else #[] }
     else if sk == ``dbTablePolicyClause then
       let es := (sc.getArg 3).getSepArgs
@@ -233,7 +292,7 @@ private def parseTableClause (dbName : Name) (existing : Array ParsedTable) (c :
     else if sk == ``dbTableIndexClause then indexes := indexes.push ((sc.getArg 2).getSepArgs.map fun s => (⟨s⟩ : Ident))
     else throwErrorAt sc s!"unexpected clause in `table {tName}`"
   if cols.isEmpty then throwErrorAt tIdent s!"`table {tName}` must declare at least one column"
-  return { ident := tIdent, tableName := tName, cols, readPols, insertPols, updatePols, deletePols, singleInvs, transInvs, transChains, indexes }
+  return { ident := tIdent, tableName := tName, cols, encSecrets, readPols, insertPols, updatePols, deletePols, singleInvs, transInvs, transChains, indexes }
 
 @[noinline]
 private def elabTableSchema (t : ParsedTable) (rowTypeName : Name) (colNames : Array String) : CommandElabM Term := do
@@ -246,7 +305,10 @@ private def elabTableSchema (t : ParsedTable) (rowTypeName : Name) (colNames : A
           let rcT ← mkSqlIdentTerm rc rc.getId.eraseMacroScopes.toString
           `(some ($rtT, $rcT))
       | none => `(none)
-    let chkParts := (if col.isNat && !col.isNullable then #["\"" ++ col.colName ++ "\" >= 0"] else #[]) ++ col.whereExprs.filterMap (renderSqlPred? colNames false)
+    let chkParts := if col.encKey?.isSome then
+        #[renderEncryptedCheckSql col.colName col.isBytes col.whereExprs]
+      else
+        (if col.isNat && !col.isNullable then #["\"" ++ col.colName ++ "\" >= 0"] else #[]) ++ col.whereExprs.filterMap (renderSqlPred? colNames false)
     let colNameT ← mkSqlIdentTerm col.ident col.colName
     `({ name := $colNameT, colType := $cTyT, nullable := $(quote col.isNullable),
         isPrimaryKey := $(quote col.isPrimaryKey), isUnique := $(quote col.isUnique), isImmutable := $(quote col.isImmutable),
@@ -310,7 +372,8 @@ private def elabTable (dbName fullDbName : Name) (t : ParsedTable) : CommandElab
   let schemaTerm ← elabTableSchema t rowTypeName colNames
   let colInfos : Array DbColumnInfo := t.cols.map fun c => {
     name := c.colName, isPrimaryKey := c.isPrimaryKey, isImmutable := c.isImmutable, isUnique := c.isUnique,
-    isNullable := c.isNullable, isNat := c.isNat, refs? := c.refs?.map fun (rt, rc) => (rt.getId.eraseMacroScopes.toString, rc.getId.eraseMacroScopes.toString) }
+    isNullable := c.isNullable, isNat := c.isNat, refs? := c.refs?.map fun (rt, rc) => (rt.getId.eraseMacroScopes.toString, rc.getId.eraseMacroScopes.toString),
+    encKey? := c.encKey? }
   return ({
     tableName := t.tableName, rowTypeConst := fullDbName ++ t.ident.getId, columns := colInfos,
     hasReadPolicy := !t.readPols.isEmpty, hasInsertPolicy := !t.insertPols.isEmpty, hasUpdatePolicy := !t.updatePols.isEmpty,
@@ -365,7 +428,10 @@ def elabDatabaseCmd : CommandElab := fun stx => do
       if envStr == "prod" && primaryEp?.isSome then throwErrorAt c s!"cannot combine a default endpoint with `prod` in `database {dbName}`"
       if envStr != "dev" then hasExplicitEnv := true
       let (ns, nsec) ← setEnvSlot c envStr (c.getArg 1) false envSlots secrets; envSlots := ns; secrets := nsec
-    else if k == ``dbTableClauseTop then tables := tables.push (← parseTableClause dbName tables c)
+    else if k == ``dbTableClauseTop then
+      let tbl ← parseTableClause dbName tables c
+      secrets := pushSecs tbl.encSecrets secrets
+      tables := tables.push tbl
     else throwErrorAt c s!"unexpected clause in `database {dbName}`"
 
   let some _ := envSlots.prod.orElse (fun _ => primaryEp?)
@@ -383,6 +449,8 @@ def elabDatabaseCmd : CommandElab := fun stx => do
     for idxCols in t.indexes do for ic in idxCols do
       let cn := ic.getId.eraseMacroScopes.toString
       unless colNames.contains cn do throwErrorAt ic s!"index on `table {t.tableName}` references unknown column `{cn}`"
+      if t.cols.any fun c => c.colName == cn && c.encKey?.isSome then
+        throwErrorAt ic s!"cannot index encrypted column `{t.tableName}.{cn}` (AES-256-GCM uses randomized nonces)"
 
   let mkDb (s : Name) := mkIdentFrom dbIdent (dbName ++ s)
   let (markerId, secretsId, configId, ddlId, rlsDdlId, ensureId, instId, mId) :=

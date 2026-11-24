@@ -320,12 +320,15 @@ inductive ServerEffect : Type where
   | dbTxCommit (cfg : Db.DbConfig) (txId : UInt64) | dbTxRollback (cfg : Db.DbConfig) (txId : UInt64)
   | setCookie (cookie : SetCookie) | sendSse (ev : SseEvent) | readEnv (v : String) | nowMs
   | randomHex (n : UInt32) | hmacSha256 (key msg : ByteArray) | wsBroadcast (t : String) (p : ByteArray)
+  | aeadEncrypt (keyEnv : String) (fallback? : Option String) (aad pt : ByteArray)
+  | aeadDecrypt (keyEnv : String) (fallback? : Option String) (aad ct : ByteArray)
 
 @[reducible] def ServerEffect.Resp : ServerEffect → Type
   | .httpCall _ => Except ApiError OutboundResp | .dbExec _ _ | .dbTxExec _ _ _ => Except ApiError Db.DbResult
   | .dbExecDdl _ | .dbTxCommit _ _ => Except ApiError Unit | .dbTxBegin _ => Except ApiError UInt64
   | .dbTxRollback _ _ | .setCookie _ | .sendSse _ | .wsBroadcast _ _ => Unit
   | .readEnv _ => Option String | .nowMs => UInt64 | .randomHex _ => String | .hmacSha256 _ _ => ByteArray
+  | .aeadEncrypt _ _ _ _ | .aeadDecrypt _ _ _ _ => Except ApiError ByteArray
 
 class MonadServer (m : Type → Type) where exec : (eff : ServerEffect) → m eff.Resp
 
@@ -341,6 +344,7 @@ srvEff2 dbTxRollback (cfg : Db.DbConfig) (txId : UInt64) : Unit => .dbTxRollback
 srvEff2 sendSse (ev : SseEvent) : Unit => .sendSse ev ; readEnv (v : String) : Option String => .readEnv v
 srvEff2 nowMs : UInt64 => .nowMs ; randomHex (n : UInt32) : String => .randomHex n
 srvEff2 hmacSha256 (key msg : ByteArray) : ByteArray => .hmacSha256 key msg ; wsBroadcast (t : String) (p : ByteArray) : Unit => .wsBroadcast t p
+srvEff2 aeadEncrypt (keyEnv : String) (fallback? : Option String) (aad pt : ByteArray) : Except ApiError ByteArray => .aeadEncrypt keyEnv fallback? aad pt ; aeadDecrypt (keyEnv : String) (fallback? : Option String) (aad ct : ByteArray) : Except ApiError ByteArray => .aeadDecrypt keyEnv fallback? aad ct
 end MonadServer
 
 structure WsEmit where

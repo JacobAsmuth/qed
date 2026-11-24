@@ -51,11 +51,27 @@ private def mkTblSqlParts (stx : Syntax) (tbl : DbTableInfo) : CommandElabM (Ter
   let colSqlIds ← tbl.columns.mapM fun c => mkSqlIdentTerm stx c.name
   return (← mkSqlIdentTerm stx tbl.tableName, ← `([$[$colSqlIds:term],*]))
 
+private def mkTblEncPairs (tbl : DbTableInfo) (mkKey : DbColumnInfo → Nat → Term) : CommandElabM (Array Term) := do
+  let mut out : Array Term := #[]
+  for (c, i) in tbl.columns.zipIdx do
+    if let some (kEnv, fb?, isB) := c.encKey? then
+      let fbT : Term ← match fb? with | some fb => `(some $(Syntax.mkStrLit fb)) | none => `(none)
+      let sp ← `({ keyEnv := $(Syntax.mkStrLit kEnv), fallback? := $fbT, aad := ($(Syntax.mkStrLit s!"{tbl.tableName}.{c.name}") : String).toUTF8, isBytes := $(quote isB) : Qed.Server.Db.EncColSpec })
+      out := out.push (← `(($(mkKey c i), $sp)))
+  return out
+
+private def mkTblEncRead (tbl : DbTableInfo) (colOffset : Nat := 0) : CommandElabM (Array Term) :=
+  mkTblEncPairs tbl fun _ i => Syntax.mkNumLit (toString (colOffset + i))
+
+private def mkTblEncWriteTerm (tbl : DbTableInfo) : CommandElabM Term := do
+  let es ← mkTblEncPairs tbl fun c _ => Syntax.mkStrLit c.name; `([$[$es:term],*])
+
 private def parseOrderByArg (tbl : DbTableInfo) (ordStx? : Option Syntax) : CommandElabM Term := do
   let some stx := ordStx? | return ← `(none)
   let some raw := parseStrLitArg? stx | throwErrorAt stx "`orderBy` must be a string column name (e.g. `orderBy = \"id\"` or `orderBy = \"-version\"`)"
   let (colName, isDesc) := if raw.startsWith "-" then (String.ofList (raw.toList.drop 1), true) else (raw, false)
-  let _ ← findDbCol stx tbl colName (fun c t => s!"`orderBy` references unknown column `{c}` on table `{t}`")
+  let colInfo ← findDbCol stx tbl colName (fun c t => s!"`orderBy` references unknown column `{c}` on table `{t}`")
+  if colInfo.encKey?.isSome then throwErrorAt stx s!"cannot `orderBy` encrypted column `{tbl.tableName}.{colName}` (AES-256-GCM uses randomized nonces)"
   let dirT ← if isDesc then `(Qed.Server.Db.SqlOrderDir.desc) else `(Qed.Server.Db.SqlOrderDir.asc)
   `(some ($(← mkSqlIdentTerm stx colName), $dirT))
 
@@ -67,7 +83,9 @@ private def parseAggColArg (tbl : DbTableInfo) (colStx : Syntax) : CommandElabM 
       let b := u.getArg 0; let rName := if b.isIdent then b.getId.eraseMacroScopes.toString else ""
       match extractDottedChain? (u.getArg 2) with | some [rv, col] => if rv == rName then pure col else throwErrorAt colStx errMsg | _ => throwErrorAt colStx errMsg
     else throwErrorAt colStx errMsg
-  findDbCol colStx tbl colName
+  let colInfo ← findDbCol colStx tbl colName
+  if colInfo.encKey?.isSome then throwErrorAt colStx s!"cannot compute SQL aggregate on encrypted column `{tbl.tableName}.{colName}`"
+  return colInfo
 
 variable [MonadLiftT CommandElabM M]
 
@@ -78,11 +96,20 @@ private partial def lowerRowSqlExpr (lowerVal : Syntax → M Term) (tbl : DbTabl
       match (u.getArg 0).getId.eraseMacroScopes with
       | `true => return ← `(Qed.Server.Db.SqlExpr.litTrue) | `false => return ← `(Qed.Server.Db.SqlExpr.litFalse) | _ => pure ()
     return ← `(Qed.Server.Db.SqlExpr.param (Qed.Server.Db.ToSql.toSql $(← lowerVal u)))
+  let checkNotEnc (colInfo : DbColumnInfo) (col : String) : M Unit :=
+    if colInfo.encKey?.isSome then
+      throwErrorAt u s!"cannot reference encrypted column `{tbl.tableName}.{col}` inside SQL `where` or row-dependent `set` expression (AES-256-GCM uses randomized nonces)"
+    else pure ()
   match extractDottedChain? u with
   | some [rv, col] =>
-      if rv == rowVar then let _ ← findDbCol u tbl col; return ← `(Qed.Server.Db.SqlExpr.col $(← liftM (mkSqlIdentTerm u col)))
+      if rv == rowVar then
+        let colInfo ← findDbCol u tbl col; checkNotEnc colInfo col
+        return ← `(Qed.Server.Db.SqlExpr.col $(← liftM (mkSqlIdentTerm u col)))
   | some [rv, col, "length"] =>
-      if rv == rowVar && tbl.columns.any (·.name == col) then return ← `(Qed.Server.Db.SqlExpr.strLen (Qed.Server.Db.SqlExpr.col $(← liftM (mkSqlIdentTerm u col))))
+      if rv == rowVar then
+        if let some colInfo := tbl.columns.find? (·.name == col) then
+          checkNotEnc colInfo col
+          return ← `(Qed.Server.Db.SqlExpr.strLen (Qed.Server.Db.SqlExpr.col $(← liftM (mkSqlIdentTerm u col))))
   | _ => pure ()
   let sub := lowerRowSqlExpr lowerVal tbl rowVar
   if k == ``qedProj then
@@ -145,6 +172,7 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocal : String → S
       let tid (t : DbTableInfo) (s : Name) := mkIdentFrom stx (t.rowTypeConst ++ s)
       let (rowTyId, rowInvId, readPolId, ctxId) := (mkIdentFrom stx tbl.rowTypeConst, tid tbl `RowInv, tid tbl `ReadPolicy, mkIdent `ctx)
       let (tblSqlId, allColsT) ← liftM (mkTblSqlParts stx tbl)
+      let mkEncReadT : M Term := do let es ← liftM (mkTblEncRead tbl); `([$[$es:term],*])
       let (posArgs, namedArgs) ← splitCallArgs "database" rawArgs (allowWhere := true)
       let findNamed := findNamedArg? namedArgs
       let whereArg? := (findNamed "where").orElse fun _ => (findNamed "filter").orElse fun _ => posArgs[0]?
@@ -161,7 +189,7 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocal : String → S
         let (ordT, limT, offT, fn) ← if opName == "select" then let (o, l, f) ← parseQueryWindow tbl lowerVal findNamed; pure (o, l, f, `Qed.Server.Db.dbSelect)
           else pure (← liftM (parseOrderByArg tbl (findNamed "orderBy")), ← `(some 1), ← `(none), `Qed.Server.Db.dbFindOne)
         let qT ← `(Qed.Server.Db.SqlQuery.select $tblSqlId $allColsT $sqlW $ordT $limT $offT)
-        return (← `($(mkIdent fn) $cfgId $qT $(tid tbl `decodeRow) $rowInvId $(tid tbl `rowInvBool) $(tid tbl `rowInvBool_sound) $predT $readPolId $ctxId $pf $txOptT), false)
+        return (← `($(mkIdent fn) $cfgId $qT $(tid tbl `decodeRow) $rowInvId $(tid tbl `rowInvBool) $(tid tbl `rowInvBool_sound) $predT $readPolId $ctxId $pf $txOptT $(← mkEncReadT)), false)
 
       else if opName == "sum" || opName == "min" || opName == "max" then
         let some colStx := (findNamed "col").orElse fun _ => posArgs[0]?
@@ -191,11 +219,13 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocal : String → S
         let qT ← `(Qed.Server.Db.SqlQuery.joinSelect $tblSqlId $rTblSqlId $allColsT $rAllColsT $(← liftM (mkSqlIdentTerm stx lCol)) $(← liftM (mkSqlIdentTerm stx rCol)) $lSqlW $rSqlW $ordT $limT $offT)
         let lPf ← mkDbProveTac #[rowInvId, readPolId] readPolKind opQual (mkReadPolHint tbl)
         let rPf ← mkDbProveTac #[tid rightTbl `RowInv, tid rightTbl `ReadPolicy] s!"read policy `{dbInfo.shortName}.{rightTbl.tableName}.read` (joined table)" opQual (mkReadPolHint rightTbl "`rightWhere = r => ...`" "the joined table's")
+        let joinEncElems := (← liftM (mkTblEncRead tbl)) ++ (← liftM (mkTblEncRead rightTbl tbl.columns.size))
+        let joinEncReadT : Term ← `([$[$joinEncElems:term],*])
         return (← `(Qed.Server.Db.dbJoinSelect $cfgId $qT $(Syntax.mkNumLit (toString tbl.columns.size))
             $(tid tbl `decodeRow) $(tid rightTbl `decodeRow) $rowInvId $(tid tbl `rowInvBool) $(tid tbl `rowInvBool_sound)
             $(tid rightTbl `RowInv) $(tid rightTbl `rowInvBool) $(tid rightTbl `rowInvBool_sound)
             $lPredT $rPredT (fun (_l : $rowTyId) => _l.$(mkIdentFrom stx (Name.mkSimple lCol))) (fun (_r : $rRowTyId) => _r.$(mkIdentFrom stx (Name.mkSimple rCol)))
-            $readPolId $(tid rightTbl `ReadPolicy) $ctxId $lPf $rPf $txOptT), false)
+            $readPolId $(tid rightTbl `ReadPolicy) $ctxId $lPf $rPf $txOptT $joinEncReadT), false)
 
       else if opName == "delete" then
         let (predT, sqlW, _) ← parseWhereArg lowerVal lowerValWithLocal tbl rowTyId whereArg?
@@ -219,7 +249,7 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocal : String → S
         let pairTs ← tbl.columns.mapM fun col => do `(($(← liftM (mkSqlIdentTerm stx col.name)), Qed.Server.Db.ToSql.toSql (($rowVar).$(mkIdentFrom stx (Name.mkSimple col.name)))))
         let invPf ← mkDbProveTac #[rowInvId] s!"table constraint `{dbInfo.shortName}.{tbl.tableName}.RowInv`" opQual "Guard input parameters with `requires` or `if` so every column `where` constraint and table `invariant` holds."
         let polPf ← mkDbProveTac #[insPolId] s!"insert policy `{dbInfo.shortName}.{tbl.tableName}.insert`" opQual (mkPolHint tbl.insertPolicyLabel "Ensure inserted row satisfies the table's `policy insert` / `policy write`." "Ensure inserted row satisfies")
-        return (← `(let $rowVar:ident : $rowTyId := $rowTerm; Qed.Server.Db.dbInsert $cfgId (Qed.Server.Db.SqlQuery.insert $tblSqlId [$[$pairTs:term],*] []) $rowVar $rowInvId $insPolId $ctxId $invPf $polPf $txOptT), true)
+        return (← `(let $rowVar:ident : $rowTyId := $rowTerm; Qed.Server.Db.dbInsert $cfgId (Qed.Server.Db.SqlQuery.insert $tblSqlId [$[$pairTs:term],*] []) $rowVar $rowInvId $insPolId $ctxId $invPf $polPf $txOptT $(← liftM (mkTblEncWriteTerm tbl))), true)
 
       else if opName == "update" || opName == "updateOne" then
         let some setRaw := findNamed "set" | throwErrorAt stx s!"`{dbInfo.shortName}.{tbl.tableName}.{opName}` requires `set = r => \{ col = expr, ... }`"
@@ -237,7 +267,10 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocal : String → S
         let mut sqlSetPairs : Array Term := #[]; let mut postChecks : Array Term := #[]
         for sf in setFields do
           let colId : Ident := ⟨sf.getArg 0⟩; let colName := colId.getId.eraseMacroScopes.toString; let valStx := sf.getArg 2
-          if (← findDbCol colId tbl colName).isImmutable then throwErrorAt colId s!"cannot update `immutable` column `{dbInfo.shortName}.{tbl.tableName}.{colName}` in `{fnName}`"
+          let colInfo ← findDbCol colId tbl colName
+          if colInfo.isImmutable then throwErrorAt colId s!"cannot update `immutable` column `{dbInfo.shortName}.{tbl.tableName}.{colName}` in `{fnName}`"
+          if colInfo.encKey?.isSome && stxMentionsVar setRowName valStx then
+            throwErrorAt valStx s!"cannot update encrypted column `{dbInfo.shortName}.{tbl.tableName}.{colName}` using a row-dependent SQL expression"
           setColNames := setColNames.push colName; let fId := mkIdentFrom colId (Name.mkSimple colName)
           leanFIds := leanFIds.push fId; leanFVals := leanFVals.push (← lowerValWithLocal setRowName valStx)
           sqlSetPairs := sqlSetPairs.push (← `(($(← liftM (mkSqlIdentTerm colId colName)), $(← lowerRowSqlExpr lowerVal tbl setRowName valStx))))
@@ -259,7 +292,7 @@ def lowerDbCall (lowerVal : Syntax → M Term) (lowerValWithLocal : String → S
         let transPf ← mkDbProveTac #[rowInvId, transInvId] s!"transition/monotonicity invariant `{dbInfo.shortName}.{tbl.tableName}.TransInv`" opQual "Ensure the `where` clause matches a valid predecessor state for all `old(...)` and `transition` invariants."
         return (← `($(mkIdent (if opName == "updateOne" then `Qed.Server.Db.dbUpdateOne else `Qed.Server.Db.dbUpdate))
             $cfgId $qT $(tid tbl `decodeRow) $rowInvId $(tid tbl `rowInvBool) $(tid tbl `rowInvBool_sound) $transInvId
-            $predT $setFnT $postPredT $updPolId $ctxId $polOldPf $polNewPf $invPf $transPf $txOptT), true)
+            $predT $setFnT $postPredT $updPolId $ctxId $polOldPf $polNewPf $invPf $transPf $txOptT $(← liftM (mkTblEncWriteTerm tbl)) $(← mkEncReadT)), true)
 
       else throwErrorAt stx s!"unknown database table method `{opName}` on `{dbInfo.shortName}.{tbl.tableName}` (expected `select`, `findOne`, `count`, `sum`, `min`, `max`, `join`, `insert`, `update`, `updateOne`, or `delete`)"
   | _ => throwErrorAt stx s!"invalid database call; expected `<db>.<table>.<op>(...)` or `<db>.ensureSchema()`"

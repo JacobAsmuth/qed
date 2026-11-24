@@ -84,6 +84,23 @@ private theorem encodeListWith_all (f : Nat → Char) (p : Char → Bool) (hf : 
 theorem encodeUrl_safe (bs : ByteArray) : (encodeUrl bs).toList.all isUrlChar = true := by
   unfold encodeUrl; rw [String.toList_ofList]; exact encodeListWith_all (fun n => toUrlChar (encodeChar n)) isUrlChar (fun h => (char_spec ⟨_, h⟩).2) bs.data.toList
 
+abbrev encodedLength (n : Nat) : Nat := 4 * ((n + 2) / 3)
+abbrev encodedUrlLength (n : Nat) : Nat := (4 * n + 2) / 3
+
+private theorem encodeListWith_length (f : Nat → Char) (pad : Bool) :
+    ∀ bs : List UInt8, (encodeListWith f pad bs).length = if pad then encodedLength bs.length else encodedUrlLength bs.length
+  | [] => by cases pad <;> rfl
+  | [_] | [_, _] => by cases pad <;> simp [encodeListWith, encodedLength, encodedUrlLength]
+  | _ :: _ :: _ :: rest => by
+      have ih := encodeListWith_length f pad rest
+      cases pad <;> simp only [encodeListWith, List.length_cons, encodedLength, encodedUrlLength, ↓reduceIte, Bool.false_eq_true] at ih ⊢ <;> omega
+
+theorem encode_length (bs : ByteArray) : (encode bs).length = encodedLength bs.size := by
+  unfold encode; rw [String.length_ofList, encodeListWith_length]; rfl
+
+theorem encodeUrl_length (bs : ByteArray) : (encodeUrl bs).length = encodedUrlLength bs.size := by
+  unfold encodeUrl; rw [String.length_ofList, encodeListWith_length]; rfl
+
 /-! ## Tail-Recursive O(1)-Stack Fast Implementations (`@[csimp]`) -/
 
 private def encodeListRevAccWith (f : Nat → Char) (pad : Bool) : List UInt8 → List Char → List Char

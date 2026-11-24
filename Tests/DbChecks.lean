@@ -225,4 +225,205 @@ bad_db "Database insert policy `ShopDb.items.insert` failed in `badTxInsert → 
     requires ctx.userId != none, 1 <= aid.length <= 64, 1 <= iid.length <= 64
     db.transaction: return await db.items.insert(id = iid, authorId = aid, ownerId = "victim", title = "oops", price = 10)?
 
+/-! ## Verified Bidirectional Mappings & `Field`/`Ensured` DB Fact Harvesting -/
+schema SecretNoteInput:
+  body : String where 1 <= body.utf8ByteSize <= 200
+schema PlainNoteInput:
+  body : String where 1 <= body.length <= 2000
+database CipherDb:
+  url secret("QED_TEST_CIPHER_URL")
+  dev sqlite ".qed/cipher_checks.db"
+  table sealedNotes:
+    id         : Nat    primary_key
+    ownerId    : String immutable where 1 <= ownerId.length <= 64
+    ciphertext : String           where 40 <= ciphertext.length <= 304
+    policy read, write requires some(row.ownerId) == ctx.userId
+
+mapping Base64BoundsMap:
+  from bs : Bytes  where 29 <= bs.size <= 228
+  to   s  : String where 40 <= s.length <= 304
+  encode(bs): return Qed.Base64.encode(bs)
+  decode(s):  return Qed.Base64.decode(s)?
+
+def sealPrefixBytes : Mapping (fun _ : SecretNoteInput => True) (fun bs : ByteArray => 29 ≤ bs.size ∧ bs.size ≤ 228) where
+  toTarget input := ByteArray.mk (Array.replicate 28 0 ++ input.body.val.toUTF8.data)
+  toSource ct := do
+    if ct.size < 28 then .error "short"
+    let pt := ByteArray.mk (ct.data.extract 28 ct.data.size)
+    let s ← match String.fromUTF8? pt with | some s => .ok s | none => .error "utf8"
+    if h : 1 ≤ s.utf8ByteSize ∧ s.utf8ByteSize ≤ 200 then .ok { body := ⟨s, h⟩ } else .error "bounds"
+  encode_ok input _ := by
+    have hpt : 1 ≤ input.body.val.utf8ByteSize ∧ input.body.val.utf8ByteSize ≤ 200 := input.body.ok
+    have hsz := Qed.toUTF8_size input.body.val
+    show 29 ≤ (Array.replicate 28 (0 : UInt8) ++ input.body.val.toUTF8.data).size ∧ (Array.replicate 28 (0 : UInt8) ++ input.body.val.toUTF8.data).size ≤ 228
+    rw [Array.size_append, Array.size_replicate]; simp only [ByteArray.size] at hsz; omega
+  decode_ok _ _ _ := trivial
+  roundtrip input _ := by
+    have hlt : ¬ (Array.replicate 28 (0 : UInt8) ++ input.body.val.toUTF8.data).size < 28 := by rw [Array.size_append, Array.size_replicate]; omega
+    have hpt : 1 ≤ input.body.val.utf8ByteSize ∧ input.body.val.utf8ByteSize ≤ 200 := input.body.ok
+    have hExt : ByteArray.mk ((Array.replicate 28 (0 : UInt8) ++ input.body.val.toUTF8.data).extract 28 (Array.replicate 28 (0 : UInt8) ++ input.body.val.toUTF8.data).size) = input.body.val.toUTF8 := by
+      cases input.body.val.toUTF8 with | mk data =>
+      congr 1; apply Array.ext
+      · simp [Array.size_append, Array.size_replicate]
+      · intro i _ _; rw [Array.getElem_extract, Array.getElem_append_right]
+        · simp [Array.size_replicate]
+        · rw [Array.size_replicate]; omega
+    simp only [ByteArray.size, hlt, ↓reduceIte, bind, Except.bind, hExt, Qed.fromUTF8?_toUTF8, dite_eq_left hpt]
+
+def sealedNoteMap := Base64BoundsMap.mapping.comp sealPrefixBytes
+example (input : SecretNoteInput) :
+    sealedNoteMap.decode (sealedNoteMap.encode input).val = .ok ⟨input, trivial⟩ ∧
+    (Base64BoundsMap.mapping.encodeField (sealPrefixBytes.encode input)).val = (sealedNoteMap.encode input).val :=
+  ⟨sealedNoteMap.decode_encode input trivial, rfl⟩
+def widerCipherMap : Mapping (fun _ : SecretNoteInput => True) (fun s : String => 40 ≤ s.length ∧ s.length ≤ 368) :=
+  { toTarget := sealedNoteMap.toTarget, toSource := sealedNoteMap.toSource
+    encode_ok := fun d hd => have h := sealedNoteMap.encode_ok d hd; by omega
+    decode_ok := sealedNoteMap.decode_ok, roundtrip := sealedNoteMap.roundtrip }
+
+#guard
+  match SecretNoteInput.parse { body := "hello" } with
+  | none => false
+  | some sample =>
+    let ct := sealedNoteMap.encode sample
+    40 <= ct.val.length && ct.val.length <= 304 &&
+    (match sealedNoteMap.toSource ct.val with | .ok d => d.body.val == "hello" | .error _ => false)
+
+server CipherApi:
+  use db : CipherDb
+  use vdb : VaultDb
+  def saveSealed(noteId: Nat, input: SecretNoteInput) -> CipherDb.sealedNotes!:
+    requires ctx.userId != none
+    let uid = ctx.userId.getD("")
+    if not (1 <= uid.length <= 64): return fail(.invalidUser)
+    let ct = sealedNoteMap.encode(input)
+    return await db.sealedNotes.insert(id = noteId, ownerId = uid, ciphertext = ct)?
+  def editSealed(noteId: Nat, input: SecretNoteInput) -> CipherDb.sealedNotes?!:
+    requires ctx.userId != none
+    let uid = ctx.userId.getD("")
+    let ct = sealedNoteMap.encode(input)
+    return await db.sealedNotes.updateOne(where = r => r.id == noteId and r.ownerId == uid, set = r => { ciphertext = ct })?
+  def savePlainFromSchema(noteId: Nat, input: PlainNoteInput) -> VaultDb.notes!:
+    requires ctx.userId != none
+    let uid = ctx.userId.getD("")
+    if not (1 <= uid.length <= 64): return fail(.invalidUser)
+    return await vdb.notes.insert(id = noteId, ownerId = uid, body = input.body, version = 0, status = "draft")?
+
+bad_db "Database table constraint `CipherDb.sealedNotes.RowInv` failed in `driftInsert → CipherDb.sealedNotes.insert`" CipherDb :
+  def driftInsert(noteId: Nat, input: SecretNoteInput) -> CipherDb.sealedNotes!:
+    requires ctx.userId != none
+    let uid = ctx.userId.getD("")
+    if not (1 <= uid.length <= 64): return fail(.invalidUser)
+    let ct = widerCipherMap.encode(input)
+    return await db.sealedNotes.insert(id = noteId, ownerId = uid, ciphertext = ct)?
+
+/-! ## Surface `mapping` DSL, Built-in `encrypted(...)` DB Columns & `{field}` View Rendering -/
+mapping DollarsToCentsMap:
+  from dollars : Nat where dollars <= 10000
+  to   cents   : Nat where cents <= 1000000
+  encode(d): return d * 100
+  decode(c):
+    if c % 100 == 0: return c / 100
+    fail("must be whole dollars")
+
+#guard
+  let cents := DollarsToCentsMap.encode ⟨25, by decide⟩
+  cents.val == 2500 &&
+  (match DollarsToCentsMap.decode cents.val with | .ok d => d.val == 25 | .error _ => false) &&
+  (match DollarsToCentsMap.decode 2550 with | .error msg => msg == "must be whole dollars" | .ok _ => false) &&
+  (match DollarsToCentsMap.decode 1000100 with | .error _ => true | .ok _ => false)
+
+structure TestAeadSpec where
+  sealBytes   : ByteArray → ByteArray
+  unsealBytes : ByteArray → Except String ByteArray
+  seal_size   : ∀ pt, (sealBytes pt).size = pt.size + 28
+  roundtrip   : ∀ pt, unsealBytes (sealBytes pt) = .ok pt
+
+mapping NoteCipherMap(cipher: TestAeadSpec):
+  from SecretNoteInput
+  to   ct : String where 40 <= ct.length <= 304
+  using [cipher.seal_size, cipher.roundtrip]
+  encode(input): return Qed.Base64.encode(cipher.sealBytes(input.body.toUTF8))
+  decode(ct):
+    let raw = Qed.Base64.decode(ct)?
+    let pt  = cipher.unsealBytes(raw)?
+    return SecretNoteInput.parse({ body = String.fromUTF8?(pt)? })?
+
+expect_err "Mapping `DriftMap` failed target constraint `40 <= s.length <= 100`" in
+mapping DriftMap:
+  from bs : Bytes  where 29 <= bs.size <= 228
+  to   s  : String where 40 <= s.length <= 100
+  encode(bs): return Qed.Base64.encode(bs)
+  decode(s):  return Qed.Base64.decode(s)?
+
+database EncSecretDb:
+  url secret("QED_TEST_ENC_DB_URL")
+  dev sqlite ".qed/enc_secret_check.db"
+  table items:
+    id   : Nat primary_key
+    body : encrypted(String, key = secret("QED_REQUIRED_ENC_KEY")) where 1 <= body.utf8ByteSize <= 200
+
+database EncVaultDb:
+  url secret("QED_TEST_ENC_VAULT_URL")
+  dev sqlite ".qed/enc_vault_checks.db"
+  table entries:
+    id      : Nat    primary_key
+    ownerId : String immutable where 1 <= ownerId.length <= 64
+    body    : encrypted(String, key = secret("QED_TEST_ENC_KEY") ?? "qed-test-enc-key") where 1 <= body.utf8ByteSize <= 200
+    note    : encrypted(String, key = secret("QED_TEST_ENC_KEY") ?? "qed-test-enc-key") where 1 <= note.length <= 200
+    raw     : encrypted(Bytes,  key = secret("QED_TEST_ENC_KEY") ?? "qed-test-enc-key")?
+    policy read, write requires some(row.ownerId) == ctx.userId
+
+#guard
+  let pg := EncVaultDb.ddl .postgres
+  pg.contains "\"body\" TEXT NOT NULL CHECK (40 <= LENGTH(\"body\") AND LENGTH(\"body\") <= 304)" &&
+  pg.contains "\"note\" TEXT NOT NULL CHECK (40 <= LENGTH(\"note\") AND LENGTH(\"note\") <= 1104)" &&
+  pg.contains "\"raw\" TEXT CHECK (40 <= LENGTH(\"raw\"))" &&
+  EncSecretDb.secrets.contains "QED_REQUIRED_ENC_KEY" &&
+  !(EncVaultDb.secrets.contains "QED_TEST_ENC_KEY")
+
+server EncVaultApi:
+  use db : EncVaultDb
+  def save(noteId: Nat, input: SecretNoteInput, rawOpt: Bytes?) -> EncVaultDb.entries!:
+    requires ctx.userId != none
+    ensures result.id == noteId
+    let uid = ctx.userId.getD("")
+    if not (1 <= uid.length <= 64): return fail(.invalidUser)
+    return await db.entries.insert(id = noteId, ownerId = uid, body = input.body, note = "ok", raw = rawOpt)?
+  def edit(noteId: Nat, input: SecretNoteInput) -> EncVaultDb.entries?!:
+    requires ctx.userId != none
+    ensures result.id == noteId
+    let uid = ctx.userId.getD("")
+    return await db.entries.updateOne(where = r => r.id == noteId and r.ownerId == uid, set = r => { body = input.body })?
+  def get(noteId: Nat) -> EncVaultDb.entries?!:
+    requires ctx.userId != none
+    ensures result.id == noteId
+    let uid = ctx.userId.getD("")
+    return await db.entries.findOne(where = r => r.id == noteId and r.ownerId == uid)?
+  def list() -> EncVaultDb.entries[]!:
+    requires ctx.userId != none
+    let uid = ctx.userId.getD("")
+    return await db.entries.select(where = r => r.ownerId == uid, orderBy = "id")?
+
+component FieldRenderCheck:
+  state items : SecretNoteInput[] = []
+  view: <ul>{for item in items: <li key={item.body}><span>{item.body}</span></li>}</ul>
+
+bad_db1 "cannot reference encrypted column `entries.body` inside SQL `where`" EncVaultDb badWhere(q: String) -> EncVaultDb.entries[]! : return await db.entries.select(where = r => r.ownerId == ctx.userId.getD("") and r.body == q)?
+bad_db1 "cannot `orderBy` encrypted column `entries.body`" EncVaultDb badOrder(x: Nat) -> EncVaultDb.entries[]! : return await db.entries.select(where = r => r.ownerId == ctx.userId.getD(""), orderBy = "body")?
+bad_db1 "cannot compute SQL aggregate on encrypted column `entries.body`" EncVaultDb badAgg(x: Nat) -> String?! : return await db.entries.min(col = "body", where = r => r.ownerId == ctx.userId.getD(""))?
+bad_db1 "cannot update encrypted column `EncVaultDb.entries.body` using a row-dependent SQL expression" EncVaultDb badSet(x: Nat) -> EncVaultDb.entries?! : return await db.entries.updateOne(where = r => r.id == x and r.ownerId == ctx.userId.getD(""), set = r => { body = r.body })?
+expect_err "cannot index encrypted column `bad.body`" in
+database BadEncIndexDb:
+  sqlite ".qed/bad_idx.db"
+  table bad:
+    id   : Nat primary_key
+    body : encrypted(String, key = secret("K"))
+    index (body)
+expect_err "encrypted column `bad.body` cannot be `unique`" in
+database BadEncUniqueDb:
+  sqlite ".qed/bad_uniq.db"
+  table bad:
+    id   : Nat primary_key
+    body : encrypted(String, key = secret("K")) unique
+
 end DbChecks

@@ -24,7 +24,7 @@ def appWrapperBases : Array Name := #[`Qed.Internal.mkApp, `Qed.Internal.mkRoute
 def appProjSimpNames (env : Environment) (suffixes : Array String) : Array Name :=
   appWrapperBases.foldl (init := #[]) fun out base =>
     suffixes.foldl (init := out) fun acc suf => let nm := base.appendAfter s!"_{suf}"; if env.contains nm then acc.push nm else acc
-def dbBaseSimpNames : Array Name := boolSimpNames ++ valUnwrapBaseNames ++ #[``Option.isSome_iff_ne_none, ``Option.getD_some,
+def dbBaseSimpNames : Array Name := boolSimpNames ++ valUnwrapBaseNames ++ optCodecSimpNames ++ #[``Option.isSome_iff_ne_none, ``Option.getD_some,
   `Qed.Server.Db.some_getD_eq_self_iff, ``true_and, ``and_true, ``false_or, ``or_false, ``true_or, ``or_true, ``id_eq, ``ne_eq]
 
 private def addSimpNamesWithEqns (st : SimpTheorems) (names : Array Name) (dsimpOnly : Bool := false) (withEqns : Bool := false) :
@@ -316,16 +316,21 @@ def closeWithFallback (g : MVarId) (cfg : CloseFallbackConfig := {}) : TacticM B
     `(tactic| first | qedNonlinearClose | (try simp_all [$[$simpArgs],*]; try (repeat' (split <;> try simp_all [$[$simpArgs],*])); all_goals (first | omega | decide | rfl)) | grind)
   setGoals saved; return ok
 
-def solveWithUnfolds (unfoldNames extraSimpNames : Array Name) (simprocNames : Array Name := #[]) (simpCfg : Simp.Config := { zetaDelta := true }) : TacticM Bool := do
-  let simplify (g0 : MVarId) : MetaM (Option MVarId) := do
+def solveWithUnfolds (unfoldNames extraSimpNames : Array Name) (simprocNames : Array Name := #[])
+    (simpCfg : Simp.Config := { zetaDelta := true }) (harvestFacts : Bool := false) : TacticM Bool := do
+  let simplify (g0 : MVarId) (withFacts : Bool) : MetaM (Option MVarId) := do
     let (_, g1) ← g0.intros; let sp ← getCachedSimprocs simprocNames
     let g2 ← if unfoldNames.isEmpty then pure g1 else do
       let some g' ← simpGoalAllHyps g1 (← mkDynamicSimpCtx unfoldNames none simpCfg true) #[] true | return none
       pure g'
+    let (g2, hasFacts) ← if !withFacts then pure (g2, false) else do
+      let (g2', fvs) ← collectAndAssertFacts g2 "_dbFact" { scanLCtx := true, scanLCtxValues := true, includeFin := true }
+      pure (g2', !fvs.isEmpty)
     let some g3 ← simpGoalAllHyps g2 (← mkDynamicSimpCtx (unfoldNames ++ extraSimpNames) none simpCfg) sp | return none
+    let g3 ← if hasFacts then pure (← splitAndHypsGoal g3).1 else pure g3
     trySimpAll g3 (← mkDynamicSimpCtx extraSimpNames none simpCfg) sp
   let runPass (close : Bool) : TacticM Unit := forEachGoal fun g => do
-    let some g' ← simplify g | setGoals []
+    let some g' ← simplify g (close && harvestFacts) | setGoals []
     if !close then setGoals [g']
     else if ← tryCloseBasic g' then setGoals []
     else do setGoals [g']; discard <| tryTac `(tactic| grind)

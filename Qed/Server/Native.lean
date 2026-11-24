@@ -391,6 +391,12 @@ private def finishPgTx (conn : Db.PgWire.PgConn) (cmd : String) : IO (Except Api
   | .ok cFinal => Db.PgWire.releaseConn cFinal; return .ok ()
   | .error e => Db.PgWire.releaseConn { conn' with healthy := false }; return .error (ApiError.internal s!"postgres {cmd} failed: {e}")
 
+private def runAead (op : ByteArray → ByteArray → ByteArray → IO (Except String ByteArray))
+    (keyEnv : String) (fallback? : Option String) (aad data : ByteArray) : IO (Except ApiError ByteArray) := do
+  match (← loadNonEmptyEnv keyEnv).orElse fun _ => fallback?.bind fun s => if s.isEmpty then none else some s with
+  | some k => mapApi (op k.toUTF8 aad data)
+  | none => return .error (ApiError.internal s!"missing required encryption key `{keyEnv}`")
+
 @[implicit_reducible]
 private def mkNativeServerInstWith (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEntry)))
     (cookieSink? : Option (IO.Ref (Array SetCookie)) := none) (sseSink? : Option (IO.Ref (Array SseEvent)) := none)
@@ -428,6 +434,8 @@ private def mkNativeServerInstWith (gcpCache? : Option (Prim.StateBox (Array Gcp
     | .sendSse ev => if let some ref := sseSink? then ref.modify (·.push ev) else pure ()
     | .readEnv v => Prim.getEnv v | .nowMs => Prim.nowMs | .randomHex n => Prim.randomHex n
     | .hmacSha256 key msg => Prim.hmacSha256 key msg | .wsBroadcast t p => Prim.wsBroadcast t p
+    | .aeadEncrypt kEnv fb aad pt => runAead Prim.aeadEncrypt kEnv fb aad pt
+    | .aeadDecrypt kEnv fb aad ct => runAead Prim.aeadDecrypt kEnv fb aad ct
 
 @[implicit_reducible]
 def mkNativeServerInst (gcpCache? : Option (Prim.StateBox (Array GcpTokenCacheEntry)))

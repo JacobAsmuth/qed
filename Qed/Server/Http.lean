@@ -209,6 +209,9 @@ def formatHttpResponseHead (status : Nat) (contentType : String) (contentLen : N
 def formatNotModifiedResponse (etag : String) (keepAlive : Bool) : ByteArray :=
   ("HTTP/1.1 304 Not Modified\r\nX-Content-Type-Options: nosniff\r\n" ++ optHeaderLine "ETag" (some etag) ++
    s!"Cache-Control: public, max-age=0, must-revalidate\r\nConnection: {connVal keepAlive}\r\n\r\n").toUTF8
+def formatNoContentResponse (keepAlive : Bool) (cacheControl? : Option String := none) : ByteArray :=
+  ("HTTP/1.1 204 No Content\r\nX-Content-Type-Options: nosniff\r\n" ++ optHeaderLine "Cache-Control" cacheControl? ++
+   s!"Connection: {connVal keepAlive}\r\n\r\n").toUTF8
 private def stripWeakPrefix (s : String) : String := let t := trimOws s; if t.startsWith "W/" then String.ofList (t.toList.drop 2) else t
 def etagMatchesIfNoneMatch (headers : Array (String × String)) (etag : String) : Bool :=
   let target := stripWeakPrefix etag

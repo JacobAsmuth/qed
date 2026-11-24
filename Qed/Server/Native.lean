@@ -612,6 +612,8 @@ private def serveStaticAsset (staticDirFd : Prim.StaticDir) (assetCache? : Optio
     else return ← sendFile true none none []
   else if st.isBuildId then
     return formatHttpResponse 200 st.mime (if st.relPath == "__dev_status" then "{\"id\":\"0\",\"status\":\"ok\"}".toUTF8 else "0".toUTF8) st.isHead req.keepAlive true
+  else if st.relPath == "favicon.ico" then
+    return formatNoContentResponse req.keepAlive (some "public, max-age=86400")
   else return formatTextResponse 404 "not found" st.isHead req.keepAlive
 
 private structure HttpLoopCtx where

@@ -26,6 +26,6 @@ Once tests pass and before replying to the user, run a dedicated self-review on 
 - **JS runtime V8 ICs**: Keep BigInt and Number arithmetic helpers monomorphic (never mix BigInt and Number in the same hot arithmetic function) and preserve exported runtime symbols/contracts checked by `qed check` and tests.
 
 ## 3. Repository Hygiene & Verification Gates
-- **No em/en dashes**: Never use U+2014 or U+2013 in repository files (enforced by `.claude/settings.json`); use colons, commas, or periods.
+- **No em/en dashes**: Never use U+2014 or U+2013 in repository files; use colons, commas, or periods.
 - **Do not weaken gates**: Keep benchmarks, `scripts/axioms.lean` (zero `sorry`, zero unexpected axioms), and all test assertions intact.
 - **Verification commands**: Run `./scripts/qed check`, `lake env lean scripts/axioms.lean`, `cargo test --manifest-path rust/qed_server/Cargo.toml`, and `./scripts/qed test` after substantive changes.

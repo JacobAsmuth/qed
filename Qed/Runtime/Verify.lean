@@ -130,6 +130,8 @@ private def isSafeKeyLit (k : Expr) : Bool := (strLitVal? k).any Qed.isSafeAttrN
 private def isSafeKeyValLit (k v : Expr) : Bool :=
   (strLitVal? k).any fun ks => Qed.isSafeAttrName ks && (!Qed.isUrlAttrName ks || (strLitVal? v).any Qed.isSafeUrl)
 
+private def stripLetFuel : Nat := 256
+
 def stripLetE : Nat → Expr → Expr
   | 0, e => e.consumeMData.headBeta
   | fuel + 1, e => match e.consumeMData.headBeta with | .letE _ _ val body _ => stripLetE fuel (body.instantiate1 val) | e => e
@@ -137,7 +139,7 @@ def stripLetE : Nat → Expr → Expr
 private inductive AttrKind where | zeroCostNonCell | zeroCostCell | nonCellSafe | nonCellCheck (defValid : Bool) | unknown
 
 private def classifyAttr (a : Expr) : AttrKind :=
-  let a := stripLetE 32 a; let args := a.getAppArgs
+  let a := stripLetE stripLetFuel a; let args := a.getAppArgs
   match a.getAppFn.constName? with
   | some fn =>
       if #[``Attr.cls, ``Qed.cls, ``Attr.key, ``Qed.key, ``Attr.empty, ``Attr.signalBind].contains fn then .zeroCostNonCell
@@ -252,7 +254,7 @@ private def proveListCombinator? (spec : ListCombinatorSpec) (xs : Expr) (proveE
 private def proveAttrValid (env : Environment) (msgTy a : Expr) : Nat → ProveValidM Expr
   | 0 => emitValidMVar (mkBoolEqTrue (mkApp2 (mkConst ``Attr.valid) msgTy a))
   | fuel + 1 => do
-      let a := stripLetE 32 a; let kind := classifyAttr a
+      let a := stripLetE stripLetFuel a; let kind := classifyAttr a
       if kind.isZeroCost then return rflBoolTrue
       if let some pf := ValidLemmas.fastAttrValidProof? msgTy a then return pf
       if kind.isDefValid then return rflBoolTrue
@@ -283,7 +285,7 @@ private def proveAttrValidList (env : Environment) (msgTy attrs : Expr) : Nat �
 private def proveAttrIsLocalCellFalse (msgTy a : Expr) : Nat → Option Expr
   | 0 => none
   | fuel + 1 =>
-      let a := stripLetE 32 a
+      let a := stripLetE stripLetFuel a
       if (classifyAttr a).isNonCell then some rflBoolFalse
       else
         let args := a.getAppArgs
@@ -390,7 +392,7 @@ mutual
     match fuel with
     | 0 => emitValidMVar goalTy
     | fuel + 1 =>
-        let node := stripLetE 32 node; let a := node.getAppArgs; let fn? := node.getAppFn.constName?
+        let node := stripLetE stripLetFuel node; let a := node.getAppArgs; let fn? := node.getAppFn.constName?
         let elemArgs? : Option (Expr × Expr × Expr) := match kind with
           | .html => if node.isAppOfArity ``Html.element 4 || node.isAppOfArity ``Qed.el 4 then some (a[1]!, a[2]!, a[3]!) else none
           | .view _ _ => if node.isAppOfArity ``View.element 5 || node.isAppOfArity ``V.el 5 then some (a[2]!, a[3]!, a[4]!) else none
@@ -457,7 +459,7 @@ mutual
     match fuel with
     | 0 => emitValidMVar goalTy
     | fuel + 1 =>
-        let cs := stripLetE 32 cs; let a := cs.getAppArgs; let fn? := cs.getAppFn.constName?
+        let cs := stripLetE stripLetFuel cs; let a := cs.getAppArgs; let fn? := cs.getAppFn.constName?
         if fn? == some `Qed.ForEachItems.toList || fn? == some ``Qed.mapList then
           if let some csUnf ← Meta.unfoldDefinition? cs then return ← proveNodeList fuel env kind ctxV ctxE msgTy csUnf
         match kind with

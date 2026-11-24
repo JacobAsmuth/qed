@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Enforce a clean build, proof/axiom verification, and full test suite
+# against the exact committed tree(s) being pushed, inside an isolated
+# temporary git worktree so local build caches and uncommitted WIP stay intact.
+set -euo pipefail
+
+export PATH="${HOME}/.elan/bin:${HOME}/.cargo/bin:${PATH}"
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+WORKTREE_DIR=""
+
+cleanup() {
+  if [ -n "${WORKTREE_DIR}" ]; then
+    git -C "${REPO_ROOT}" worktree remove --force "${WORKTREE_DIR}" >/dev/null 2>&1 || true
+    rm -rf "${WORKTREE_DIR}"
+    git -C "${REPO_ROOT}" worktree prune >/dev/null 2>&1 || true
+    WORKTREE_DIR=""
+  fi
+}
+trap cleanup EXIT INT TERM
+
+SEEN_SHAS=""
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ -z "${local_sha:-}" ] && continue
+  # Skip ref deletions (all-zero SHA) and unchanged refs.
+  if [[ "${local_sha}" =~ ^0+$ ]] || [ "${local_sha}" = "${remote_sha}" ]; then
+    continue
+  fi
+  commit_sha="$(git -C "${REPO_ROOT}" rev-parse --verify "${local_sha}^{commit}" 2>/dev/null || true)"
+  [ -z "${commit_sha}" ] && continue
+  case " ${SEEN_SHAS} " in
+    *" ${commit_sha} "*) ;;
+    *) SEEN_SHAS="${SEEN_SHAS:+${SEEN_SHAS} }${commit_sha}" ;;
+  esac
+done
+
+if [ -z "${SEEN_SHAS}" ]; then
+  exit 0
+fi
+
+for sha in ${SEEN_SHAS}; do
+  short_sha="${sha:0:8}"
+  echo "▸ pre-push: clean build & test for ${short_sha} in isolated worktree"
+  WORKTREE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/qed-prepush.${short_sha}.XXXXXX")"
+  git -C "${REPO_ROOT}" worktree add --quiet --detach "${WORKTREE_DIR}" "${sha}"
+
+  (
+    cd "${WORKTREE_DIR}"
+    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR \
+      GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX \
+      QED_HOME QED_WEB_ROOT QED_JS_ROOT QED_OUT_DIR QED_SKIP_VERIFY QED_PREBUILT LEAN_PATH
+
+    echo "▸ pre-push [${short_sha}]: cargo test"
+    cargo test --manifest-path rust/qed_server/Cargo.toml
+
+    echo "▸ pre-push [${short_sha}]: ./scripts/qed check"
+    ./scripts/qed check
+
+    echo "▸ pre-push [${short_sha}]: lake env lean scripts/axioms.lean"
+    lake env lean scripts/axioms.lean
+
+    echo "▸ pre-push [${short_sha}]: ./scripts/qed test"
+    ./scripts/qed test
+  )
+
+  cleanup
+  echo "✓ pre-push: clean build & test passed for ${short_sha}"
+done

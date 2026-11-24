@@ -34,6 +34,18 @@ fn walk_tree(dir: &Path, is_rt: bool, skip: &HashSet<String>, visit_files: bool,
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn coalesce_events(mut mask: u32, mut poll_more: impl FnMut(Duration) -> Option<u32>) -> u32 {
+    let cap = Instant::now() + Duration::from_millis(120);
+    while let Some(rem) = cap.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
+        match poll_more(rem.min(Duration::from_millis(35))) {
+            Some(m) => mask |= m,
+            None => break,
+        }
+    }
+    mask
+}
+
 #[cfg(target_os = "linux")]
 mod os_watch {
     use super::*;
@@ -99,8 +111,11 @@ mod os_watch {
                     _ => mask |= self.drain_events(),
                 }
             }
-            if crate::poll_in(self.fd, 20) > 0 { mask |= self.drain_events(); } // coalesce atomic saves
-            mask
+            coalesce_events(mask, |d| match crate::poll_in(self.fd, d.as_millis().max(1) as i32) {
+                rc if rc < 0 => if crate::last_errno() == libc::EINTR { Some(0) } else { None },
+                0 => None,
+                _ => Some(self.drain_events()),
+            })
         }
     }
 }
@@ -140,26 +155,35 @@ mod os_watch {
             });
             mask
         }
+        fn poll_once(&mut self, evs: &mut [libc::kevent; 64], timeout: Duration) -> Result<Option<u32>, ()> {
+            let ts = libc::timespec { tv_sec: timeout.as_secs() as libc::time_t, tv_nsec: timeout.subsec_nanos() as libc::c_long };
+            let n = unsafe { libc::kevent(self.kq, std::ptr::null(), 0, evs.as_mut_ptr(), 64, &ts) };
+            if n < 0 { return if crate::last_errno() == libc::EINTR { Ok(Some(0)) } else { Err(()) }; }
+            if n == 0 { return Ok(None); }
+            let mut mask = 0u32;
+            for ev in &evs[..n as usize] {
+                let (fd, deleted) = (ev.ident as i32, (ev.fflags & (libc::NOTE_DELETE | libc::NOTE_RENAME)) != 0);
+                let Some(info) = self.entries.get(&fd) else { continue };
+                let (is_dir, is_rt, fmask, path) = (info.is_dir, info.is_rt, info.fmask, info.path.clone());
+                mask |= if !is_dir { fmask } else { let nm = self.add_tree(&path, is_rt, true); if nm != 0 { nm } else if is_rt { CHANGE_RUNTIME } else { CHANGE_LEAN | CHANGE_CSS } };
+                if deleted {
+                    self.entries.remove(&fd); self.paths.remove(&path); close_fd(fd);
+                    if path.exists() { Self::register(self.kq, &mut self.entries, &mut self.paths, &path, is_dir, is_rt, fmask); }
+                }
+            }
+            Ok(Some(mask))
+        }
         pub fn wait(&mut self, timeout_ms: u32) -> u32 {
             let (deadline, mut mask, mut evs): (_, u32, [libc::kevent; 64]) = (Instant::now() + Duration::from_millis(timeout_ms as u64), 0, unsafe { std::mem::zeroed() });
             while mask == 0 {
                 let Some(rem) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else { return 0 };
-                let ts = libc::timespec { tv_sec: rem.as_secs() as libc::time_t, tv_nsec: rem.subsec_nanos() as libc::c_long };
-                let n = unsafe { libc::kevent(self.kq, std::ptr::null(), 0, evs.as_mut_ptr(), 64, &ts) };
-                if n < 0 { if crate::last_errno() == libc::EINTR { continue; } return CHANGE_ERROR; }
-                if n == 0 { return 0; }
-                for ev in &evs[..n as usize] {
-                    let (fd, deleted) = (ev.ident as i32, (ev.fflags & (libc::NOTE_DELETE | libc::NOTE_RENAME)) != 0);
-                    let Some(info) = self.entries.get(&fd) else { continue };
-                    let (is_dir, is_rt, fmask, path) = (info.is_dir, info.is_rt, info.fmask, info.path.clone());
-                    mask |= if !is_dir { fmask } else { let nm = self.add_tree(&path, is_rt, true); if nm != 0 { nm } else if is_rt { CHANGE_RUNTIME } else { CHANGE_LEAN | CHANGE_CSS } };
-                    if deleted {
-                        self.entries.remove(&fd); self.paths.remove(&path); close_fd(fd);
-                        if path.exists() { Self::register(self.kq, &mut self.entries, &mut self.paths, &path, is_dir, is_rt, fmask); }
-                    }
+                match self.poll_once(&mut evs, rem) {
+                    Err(()) => return CHANGE_ERROR,
+                    Ok(None) => return 0,
+                    Ok(Some(m)) => mask |= m,
                 }
             }
-            mask
+            coalesce_events(mask, |d| self.poll_once(&mut evs, d).ok().flatten())
         }
     }
 }
@@ -276,5 +300,40 @@ mod tests {
         let mut got = [0u8; 64];
         let n = healthy_cli.read(&mut got).unwrap();
         assert_eq!((&got[..n], stalled_cli.peer_addr().is_ok()), (&b"data: {\"status\":\"ok\"}\n\n"[..], true));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn os_watcher_coalesces_split_write_without_stale_followup() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("qed-watch-test-{}-{nanos}", std::process::id()));
+        let (proj, rt) = (base.join("proj"), base.join("rt"));
+        std::fs::create_dir_all(proj.join(".lake")).unwrap();
+        std::fs::create_dir_all(&rt).unwrap();
+        let (lean_p, css_p, rt_p) = (proj.join("Demo.lean"), proj.join("site.css"), rt.join("qed_dev.mjs"));
+        for (p, b) in [(&lean_p, b"def x := 1\n".as_slice()), (&css_p, b"body{}\n"), (&rt_p, b"// v1\n")] { std::fs::write(p, b).unwrap(); }
+        let skip = [".lake".to_string()].into_iter().collect();
+        let watcher = Arc::new(Mutex::new(os_watch::OsWatcher::open(proj.to_str().unwrap(), rt.to_str().unwrap(), skip).unwrap()));
+        let wait_bg = || { let w = watcher.clone(); std::thread::spawn(move || lock_unpoison(&w).wait(1500)) };
+
+        // Split open(O_TRUNC), write(), and close() to verify coalescing leaves no stale event behind.
+        let t = wait_bg();
+        std::thread::sleep(Duration::from_millis(20));
+        {
+            let mut f = std::fs::File::create(&lean_p).unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            f.write_all(b"def x := 2\n").unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(t.join().unwrap(), CHANGE_LEAN);
+        assert_eq!(lock_unpoison(&watcher).wait(60), 0);
+
+        for (path, bytes, want) in [(&css_p, b"body{color:red}\n".as_slice(), CHANGE_CSS), (&rt_p, b"// v2\n", CHANGE_RUNTIME)] {
+            let tn = wait_bg();
+            std::thread::sleep(Duration::from_millis(20));
+            std::fs::write(path, bytes).unwrap();
+            assert_eq!(tn.join().unwrap(), want);
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

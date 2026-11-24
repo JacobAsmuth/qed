@@ -82,7 +82,7 @@ def run : IO Bool := do
         let evSkip ← w.wait 80; c.check "OS watcher ignores skipped .lake/ directory" (!evSkip.any && !evSkip.error) (reprStr evSkip)
         for (label, path, content, proj) in [(".lean", watchRoot / "Demo.lean", "def x := 2\n", fun (e : WatchEvents) => e.lean),
             (".css", watchRoot / "site.css", "body{color:red}\n", fun e => e.css), ("runtime .mjs", watchRt / "qed_dev.mjs", "// v2\n", fun e => e.runtime)] do
-          let t ← IO.asTask (w.wait 1500); IO.sleep 30; IO.FS.writeFile path content
+          let t ← IO.asTask (prio := .dedicated) (w.wait 1500); IO.sleep 30; IO.FS.writeFile path content
           let ev := (← IO.wait t).toOption.getD { lean := false, css := false, runtime := false, error := true }
           c.check s!"OS watcher detects {label} modification" (proj ev && !ev.error) (reprStr ev)
       finally w.close

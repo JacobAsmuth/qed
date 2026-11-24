@@ -1,11 +1,65 @@
 import Qed.Component.Rewrite
 import Qed.Runtime.Cmd
+import Qed.Invariant.State
 
 namespace Qed
 section CompElab
 open Lean Elab Command Qed.Lang
 
 /-! ## Shared Structure, Binder & Codegen Helpers -/
+
+def subKeyDefName   (tId : Name) (h : HoistedSub) : Name := tId ++ Name.mkSimple s!"_subKey_{h.fieldId.getId}"
+def subPropsDefName (tId : Name) (h : HoistedSub) : Name := tId ++ Name.mkSimple s!"_subProps_{h.fieldId.getId}"
+
+@[noinline]
+def mkPureCompFnCmds (spec : ComponentSpec) (fieldTys : Array (Name × Term)) : CommandElabM (Array CmdStx) := do
+  let mut cmds : Array CmdStx := #[]
+  for f in spec.pureFns do
+    let some retTy := f.retTy? | continue
+    let capBinders : Array BinderStx ← f.capturedFields.mapM fun cn => do
+      let some (_, ty) := fieldTys.find? (·.1 == cn)
+        | throwErrorAt f.id s!"internal: missing resolved type for field `{cn}` in `fn {f.id.getId}`"
+      `(bracketedBinder| ($(mkIdent cn):ident : $ty))
+    let pBinders : Array BinderStx ← f.params.mapM fun (pid, pty) => `(bracketedBinder| ($pid:ident : $pty))
+    let bodyT ← lowerPureFnStmts s!"fn {spec.t.getId}.{f.id.getId}" f.stmts.toList (lowerCompExpr .val) (lowerCompExpr .propGuard)
+    cmds := cmds.push (← `(command|
+      set_option linter.unusedVariables false in
+      def $(spec.id f.id.getId) $[$capBinders:bracketedBinder]* $[$pBinders:bracketedBinder]* : $retTy := $bodyT))
+  return cmds
+
+private partial def anonymizePat (stx : Syntax) : Syntax :=
+  let mapSep (n : Syntax) := Syntax.node n.getHeadInfo n.getKind (n.getArgs.map fun a => if a.isAtom then a else anonymizePat a)
+  let mapInner (i : Nat) := let inner := stx.getArg i; setStxArg stx i (setStxArg inner 1 (mapSep (inner.getArg 1)))
+  let k := stx.getKind
+  if k == ``qedPatIdent then
+    if (stx.getArg 1).getNumArgs == 3 then mapInner 1
+    else
+      let vn := (stx.getArg 0).getId.eraseMacroScopes; let s := vn.toString
+      if vn.isAtomic && !["_", "none", "true", "false"].contains s && !s.front.isUpper then
+        Syntax.node stx.getHeadInfo ``qedPatWild #[Syntax.atom stx.getHeadInfo "_"]
+      else stx
+  else if k == ``qedPatDot && (stx.getArg 2).getNumArgs == 3 then mapInner 2
+  else if k == ``qedPatParen then setStxArg stx 1 (mapSep (stx.getArg 1))
+  else stx
+
+@[noinline]
+def wrapViewGuards (guards : Array ViewGuard) (leaf fallback : Term) : CommandElabM Term :=
+  guards.foldrM (init := leaf) fun g acc => do
+    match g with
+    | .ifCond cond isThen =>
+        let cT ← lowerCompExpr .propGuard cond
+        if isThen then `(if $cT then $acc else $fallback) else `(if $cT then $fallback else $acc)
+    | .ifLet pat scrut isThen =>
+        let (pT, sT) := (← liftMacroM (lowerQedPat pat), ← lowerCompExpr .val scrut)
+        if isThen then `(match $sT:term with | $pT:term => $acc | _ => $fallback)
+        else `(match $sT:term with | $(← liftMacroM (lowerQedPat (anonymizePat pat))):term => $fallback | _ => $acc)
+    | .matchArm scruts allArmPats activeIdx =>
+        let scrutTs ← scruts.mapM (lowerCompExpr .val)
+        let alts ← allArmPats.zipIdx.mapM fun (pats, i) => do
+          let patTs ← pats.mapM fun p => liftMacroM (lowerQedPat (if i == activeIdx then p else anonymizePat p))
+          let rhs := if i == activeIdx then acc else fallback
+          `(Lean.Parser.Term.matchAltExpr| | $[$patTs:term],* => $rhs)
+        `(match $[$scrutTs:term],* with $[$alts:matchAlt]*)
 
 def mkStructBinder (f : FieldDecl) : CommandElabM (TSyntax ``Lean.Parser.Command.structExplicitBinder) :=
   match f.ty?, f.def? with
@@ -76,8 +130,23 @@ private def flushMutated (sBase : Term) (mutated : Array Name) : CommandElabM Te
   let fIds := mutated.toList.eraseDups.toArray.map mkIdent; let fVals : Array Term := fIds.map (⟨·.raw⟩)
   `({ $sBase with $[$fIds:ident := $fVals:term],* })
 
+private def appWithProps (spec : ComponentSpec) (fn : Ident) (args : Array Term := #[]) : CommandElabM Term := do
+  let pT ← `(p); Qed.Lang.mkAppTerms fn (if spec.hasProps then #[pT] ++ args else args)
+
 private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
     (mutated : Array Name) (out? : Option Term) (cmds : Array Term) (stmts : List Syntax) : CommandElabM Term := do
+  let continueFromSub (brId : Ident) (subTerm : Term) (priorOut? : Option Term) (priorCmds : Array Term) (rest : List Syntax) : CommandElabM Term := do
+    let (sNext, oNext, cOpt) ← unpackRetTuple spec.outTy?.isSome spec.hasEffects brId
+    let cNext := match cOpt with | some c => priorCmds.push c | none => priorCmds
+    let tail ← match oNext with
+      | none => compileStmts spec sNext #[] priorOut? cNext rest
+      | some oExpr =>
+          let oVal := mkIdent `_qedOut
+          `(match $oExpr:term with | none => $(← compileStmts spec sNext #[] priorOut? cNext rest) | some $oVal:ident => $(← compileStmts spec sNext #[] (some ⟨oVal.raw⟩) cNext rest))
+    let mut rebound := tail
+    for fn in spec.fieldNames.reverse do
+      if rest.any (mentionsIdent · fn) then let fId := mkIdent fn; rebound ← `(let $fId:ident := ($sNext).$fId:ident; $rebound)
+    `(let $brId:ident := $subTerm; $rebound)
   match stmts with
   | [] => mkUpdateRet spec (← flushMutated sBase mutated) out? cmds
   | s :: rest =>
@@ -94,6 +163,15 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
         wrap (← compileStmts spec sBase (mutated.push fname) out? cmds rest)
       else if sk == ``qedStmtExpr then
         let exprStx := s.getArg 0
+        let uExpr := unwrapParens1 exprStx
+        if uExpr.getKind == ``qedCall && (uExpr.getArg 0).getKind == ``qedIdent then
+          let cn := ((uExpr.getArg 0).getArg 0).getId.eraseMacroScopes
+          if let some mfn := spec.mutFns.find? (·.id.getId.eraseMacroScopes == cn) then
+            let argTs ← lowerPosCallArgs exprStx s!"{cn}(...)" (some mfn.params.size) (uExpr.getArg 2).getSepArgs
+            let sFlushed ← flushMutated sBase mutated
+            let fnCall ← appWithProps spec (spec.id mfn.id.getId) (#[sFlushed] ++ argTs)
+            if rest.isEmpty && out?.isNone && cmds.isEmpty then return fnCall
+            return ← continueFromSub (mkIdent `_qedFn) fnCall out? cmds rest
         let bindCmd (pfx : String) (cmdT : Term) : CommandElabM Term := do
           let cmdId := mkIdent (Name.mkSimple s!"_{pfx}_{cmds.size}")
           `(let $cmdId:ident := $cmdT; $(← compileStmts spec sBase mutated out? (cmds.push cmdId) rest))
@@ -120,21 +198,8 @@ private partial def compileStmts (spec : ComponentSpec) (sBase : Term)
         let passTail := !rest.isEmpty && hasReturnStmt s; let sFlushed ← flushMutated sBase mutated
         let branchTerm ← lowerControlFlowStmt s (lowerCompExpr .val) fun seq => compileStmts spec sFlushed #[] out? cmds (seq.toList ++ if passTail then rest else [])
         if passTail || rest.isEmpty then return branchTerm
-        let brId := mkIdent `_qedBr; let (sNext, oNext, cOpt) ← unpackRetTuple spec.outTy?.isSome spec.hasEffects brId
-        let cNext := match cOpt with | some c => #[c] | none => #[]
-        let tail ← match oNext with
-          | none => compileStmts spec sNext #[] none cNext rest
-          | some oExpr =>
-              let oVal := mkIdent `_qedOut
-              `(match $oExpr:term with | none => $(← compileStmts spec sNext #[] none cNext rest) | some $oVal:ident => $(← compileStmts spec sNext #[] (some ⟨oVal.raw⟩) cNext rest))
-        let mut rebound := tail
-        for fn in spec.fieldNames.reverse do
-          if rest.any (mentionsIdent · fn) then let fId := mkIdent fn; rebound ← `(let $fId:ident := ($sNext).$fId:ident; $rebound)
-        `(let $brId:ident := $branchTerm; $rebound)
+        continueFromSub (mkIdent `_qedBr) branchTerm none #[] rest
       else let sn := stxSnippet s; throwErrorAt s s!"unsupported statement{if sn.isEmpty then "" else s!" `{sn}`"} in component action"
-
-private def appWithProps (spec : ComponentSpec) (fn : Ident) (args : Array Term := #[]) : CommandElabM Term := do
-  let pT ← `(p); Qed.Lang.mkAppTerms fn (if spec.hasProps then #[pT] ++ args else args)
 
 private def mkGuardedBranches (spec : ComponentSpec) (pfx : String) (paramTypeConsts : Array Name)
     (args : Array Term) (whenPat? : Option (Term × Term × Array Name)) (whenGuards : Array Term)
@@ -208,7 +273,8 @@ private def mkSubUpdateArms (spec : ComponentSpec) (sub : SubDecl) (unchanged : 
       | some (b?, stmts) => let b ← compileStmts spec sBase #[] none #[] stmts.toList
                             wrapBody b? (← bindMentionedFields spec (fun g => skipField? != some g && mentionsIdent b.raw g) b)
       | none => pure fallback
-    `(Lean.Parser.Term.matchAltExpr| | $(spec.msgCtor ctorName):ident _wk $valId:ident => if $wsKeyId s == _wk then $body else $unchanged)
+    let wsKeyCall ← appWithProps spec wsKeyId #[← `(s)]
+    `(Lean.Parser.Term.matchAltExpr| | $(spec.msgCtor ctorName):ident _wk $valId:ident => if $wsKeyCall == _wk then $body else $unchanged)
   let (sBase, snapId, evId, stId) := (← `(s), mkIdent `_wsnap, mkIdent `_wev, mkIdent `_wst)
   let sWithSt ← `({ s with $subNm:ident := $stId:ident })
   pure #[
@@ -242,48 +308,112 @@ private def mkOwnUpdateArms (spec : ComponentSpec) (sites : Array SetSite) (unch
   for sub in spec.subscriptions do arms := arms ++ (← mkSubUpdateArms spec sub unchanged)
   return arms
 
-private def mkHoistedSubArm (spec : ComponentSpec) (stepOwnId : Ident) (h : HoistedSub) : CommandElabM MatchAltStx := do
+private def mkHoistedSubArm (spec : ComponentSpec) (stepOwnId : Ident) (unchanged : Term) (h : HoistedSub) : CommandElabM MatchAltStx := do
   let (subCtor, subF, cmVar, crVar, s1Var) := (spec.msgCtor h.ctorName, h.fieldId, mkIdent `_cm, mkIdent `_cr, mkIdent `_s1)
   let cUpd := mkIdent (h.info.fullName ++ `update)
-  let cCall ← if h.info.hasProps then `($cUpd $(← mkHoistedPropsTerm h) s.$subF:ident $cmVar:ident) else `($cUpd s.$subF:ident $cmVar:ident)
-  let (csExpr, coExpr?, rawC?) ← unpackRetTuple h.info.hasOut h.info.hasEffects crVar
-  let ccExpr? ← rawC?.mapM fun rc => `(Cmd.map $subCtor $rc)
-  let noOutRet ← mkUpdateRet spec ⟨s1Var.raw⟩ none (match ccExpr? with | some c => #[c] | none => #[])
-  let afterSub : Term ← match coExpr? with
-    | some coE =>
-        if h.outArms.isEmpty then pure noOutRet else do
-          let (outVar, pmVar, srVar) := (mkIdent `_co, mkIdent `_pm, mkIdent `_sr)
-          let pmOpt ← liftMacroM <| mkOutMatchTerm h.info.fullName (h.info.events.size + h.info.bindNames.size) h.outArms outVar
-          let stepCall ← appWithProps spec stepOwnId #[s1Var, pmVar]
-          let mergedStep ← match ccExpr?, spec.hasEffects with
-            | some cc, true =>
-                let (srS, srO?, srC?) ← unpackRetTuple spec.outTy?.isSome true srVar
-                `(let $srVar:ident := $stepCall; $(← mkUpdateRet spec srS srO? #[cc, srC?.get!]))
-            | _, _ => pure stepCall
-          `(match $coE:term with | none => $noOutRet | some $outVar:ident => match $pmOpt:term with | none => $noOutRet | some $pmVar:ident => $mergedStep)
-    | none => pure noOutRet
-  let armBody ← `(let $crVar:ident := $cCall; let $s1Var:ident := { s with $subF:ident := $csExpr }; $afterSub)
+  let slotPfxLit := Syntax.mkStrLit s!"{h.fieldId.getId}."
+  let buildDispatch (propsArg? : Option Term) : CommandElabM Term := do
+    let cCall ← match propsArg? with | some pt => `($cUpd $pt s.$subF:ident $cmVar:ident) | none => `($cUpd s.$subF:ident $cmVar:ident)
+    let (csExpr, coExpr?, rawC?) ← unpackRetTuple h.info.hasOut h.info.hasEffects crVar
+    let ccExpr? ← rawC?.mapM fun rc => `(Cmd.mapScoped $slotPfxLit $subCtor $rc)
+    let noOutRet ← mkUpdateRet spec ⟨s1Var.raw⟩ none (match ccExpr? with | some c => #[c] | none => #[])
+    let afterSub : Term ← match coExpr? with
+      | some coE =>
+          if h.outArms.isEmpty then pure noOutRet else do
+            let (outVar, pmVar, srVar) := (mkIdent `_co, mkIdent `_pm, mkIdent `_sr)
+            let pmOpt ← liftMacroM <| mkOutMatchTerm h.info.fullName (h.info.events.size + h.info.bindNames.size) h.outArms outVar
+            let stepCall ← appWithProps spec stepOwnId #[s1Var, pmVar]
+            let mergedStep ← match ccExpr?, spec.hasEffects with
+              | some cc, true =>
+                  let (srS, srO?, srC?) ← unpackRetTuple spec.outTy?.isSome true srVar
+                  `(let $srVar:ident := $stepCall; $(← mkUpdateRet spec srS srO? #[cc, srC?.get!]))
+              | _, _ => pure stepCall
+            `(match $coE:term with | none => $noOutRet | some $outVar:ident => match $pmOpt:term with | none => $noOutRet | some $pmVar:ident => $mergedStep)
+      | none => pure noOutRet
+    `(let $crVar:ident := $cCall; let $s1Var:ident := { s with $subF:ident := $csExpr }; $afterSub)
+  let armBody : Term ←
+    if h.hasLifecycle then
+      if h.info.hasProps then
+        let cpVar := mkIdent `_cp
+        let propsCall ← appWithProps spec (mkIdent (subPropsDefName spec.t.getId h)) #[← `(s)]
+        let disp ← buildDispatch (some ⟨cpVar.raw⟩)
+        `(match $propsCall:term with | Option.none => $unchanged | Option.some $cpVar:ident => $disp)
+      else do
+        let keyCall ← appWithProps spec (mkIdent (subKeyDefName spec.t.getId h)) #[← `(s)]
+        let disp ← buildDispatch none
+        `(if ($keyCall).isEmpty then $unchanged else $disp)
+    else do
+      let pArg? ← if h.info.hasProps then some <$> mkHoistedPropsTerm h else pure none
+      buildDispatch pArg?
   `(Lean.Parser.Term.matchAltExpr| | $subCtor $cmVar:ident => $(← bindMentionedFields spec (mentionsIdent armBody.raw) armBody))
+
+@[noinline]
+private def mkReconcileHoistedCmd (spec : ComponentSpec) (pBinders : Array BinderStx) (retTy : Term) : CommandElabM CmdStx := do
+  let lifecycleSubs := spec.hoisted.filter HoistedSub.hasLifecycle
+  let (sOldV, resV) := (mkIdent `_sOld, mkIdent `_res)
+  let (sCur0, outCur?, cmdCur?) ← unpackRetTuple spec.outTy?.isSome spec.hasEffects resV
+  let sId := mkIdent `_rs; let cId := mkIdent `_rc
+  let mut stepBody ← mkUpdateRet spec ⟨sId.raw⟩ outCur? (if spec.hasEffects then #[⟨cId.raw⟩] else #[])
+  for h in lifecycleSubs.reverse do
+    let keyCallOld ← appWithProps spec (mkIdent (subKeyDefName spec.t.getId h)) #[⟨sOldV.raw⟩]
+    let keyCallNew ← appWithProps spec (mkIdent (subKeyDefName spec.t.getId h)) #[⟨sId.raw⟩]
+    let resetState ← `({ $sId:ident with $(h.fieldId):ident := $(mkIdent (h.info.fullName ++ `init)) })
+    let nextCmd : Term ← if !spec.hasEffects then pure ⟨cId.raw⟩
+      else if !h.info.hasStart then pure ⟨cId.raw⟩
+      else do
+        let cStart := mkIdent (h.info.fullName ++ `startCmd)
+        let subCtor := spec.msgCtor h.ctorName
+        let pfxLit := Syntax.mkStrLit s!"{h.fieldId.getId}."
+        let startCmdExpr ← if h.info.hasProps then
+            let propsCall ← appWithProps spec (mkIdent (subPropsDefName spec.t.getId h)) #[resetState]
+            `(match $propsCall:term with | Option.none => $cId:ident | Option.some _cp => Qed.Cmd.batch [$cId:ident, Cmd.mapScoped $pfxLit $subCtor ($cStart _cp)])
+          else `(Qed.Cmd.batch [$cId:ident, Cmd.mapScoped $pfxLit $subCtor $cStart])
+        `(if (_kNew).isEmpty then $cId:ident else $startCmdExpr)
+    let updatePair ← if spec.hasEffects then
+        `(let $cId:ident := if _kOld == _kNew then $cId:ident else $nextCmd; let $sId:ident := if _kOld == _kNew then $sId:ident else $resetState; $stepBody)
+      else
+        `(let $sId:ident := if _kOld == _kNew then $sId:ident else $resetState; $stepBody)
+    stepBody ← `(let _kOld := $keyCallOld; let _kNew := $keyCallNew; $updatePair)
+  let fullBody ← if spec.hasEffects then `(let $sId:ident := $sCur0; let $cId:ident := $(cmdCur?.get!); $stepBody) else `(let $sId:ident := $sCur0; $stepBody)
+  `(command| set_option linter.unusedVariables false in def $(spec.id `_reconcileHoisted) $[$pBinders:bracketedBinder]* ($sOldV:ident : $(spec.stateId)) ($resV:ident : $retTy) : $retTy := $fullBody)
 
 def mkMsgAndUpdateCmds (spec : ComponentSpec) (sites : Array SetSite) : CommandElabM (Array CmdStx) := do
   let mut outCmds ← mkMsgInductiveCmds spec sites
+  let pBinders ← mkPropsBinders spec
   for sub in spec.subscriptions do
     let keyBody ← mkSubBranches spec sub (← `("")) false fun qaIds => Qed.Lang.mkAppTerms (mkIdentFrom sub.chanRef sub.chInfo.keyHelperConst) (qaIds.map (⟨·.raw⟩))
-    outCmds := outCmds.push (← `(command| set_option linter.unusedVariables false in def $(mkIdent (subKeyFnName spec.t.getId sub)) (s : $(spec.stateId)) : String := $keyBody))
-  let unchanged ← mkUpdateRet spec (← `(s))
-  let ownArms ← mkOwnUpdateArms spec sites unchanged
+    outCmds := outCmds.push (← `(command| set_option linter.unusedVariables false in def $(mkIdent (subKeyFnName spec.t.getId sub)) $[$pBinders:bracketedBinder]* (s : $(spec.stateId)) : String := $keyBody))
   let retTy : Term ← match spec.outTy?, spec.hasEffects with
     | none, false => `($(spec.stateId)) | some o, false => `($(spec.stateId) × Option $o)
     | none, true  => `($(spec.stateId) × Cmd $(spec.msgId)) | some o, true => `($(spec.stateId) × Option $o × Cmd $(spec.msgId))
-  let pBinders ← mkPropsBinders spec
-  let mkUpdDef (fnId : Ident) (arms : Array MatchAltStx) : CommandElabM CmdStx := do
-    let body ← if arms.isEmpty then `(fun m => nomatch m) else `(fun m => match m with $[$arms:matchAlt]*)
-    `(command| def $fnId $[$pBinders:bracketedBinder]* (s : $(spec.stateId)) : $(spec.msgId) → $retTy := $body)
+  for f in spec.mutFns do
+    let fnBinders : Array BinderStx ← f.params.mapM fun (pid, pty) => `(bracketedBinder| ($pid:ident : $pty))
+    let rawBody ← compileStmts spec (← `(s)) #[] none #[] f.stmts.toList
+    let body ← bindMentionedFields spec (mentionsIdent rawBody.raw) rawBody
+    outCmds := outCmds.push (← `(command| set_option linter.unusedVariables false in def $(spec.id f.id.getId) $[$pBinders:bracketedBinder]* (s : $(spec.stateId)) $[$fnBinders:bracketedBinder]* : $retTy := $body))
+  for h in spec.hoisted do
+    if h.hasLifecycle then
+      let keyLeaf ← match h.keyExpr? with | some k => `("k:" ++ toString ($k)) | none => `("1")
+      let keyRaw ← wrapViewGuards h.guards keyLeaf (← `(""))
+      let keyBody ← bindMentionedFields spec (mentionsIdent keyRaw.raw) keyRaw
+      outCmds := outCmds.push (← `(command| set_option linter.unusedVariables false in def $(mkIdent (subKeyDefName spec.t.getId h)) $[$pBinders:bracketedBinder]* (s : $(spec.stateId)) : String := $keyBody))
+      if h.info.hasProps then
+        let propsRaw ← wrapViewGuards h.guards (← `(Option.some $(← mkHoistedPropsTerm h))) (← `(Option.none))
+        let propsBody ← bindMentionedFields spec (mentionsIdent propsRaw.raw) propsRaw
+        outCmds := outCmds.push (← `(command| set_option linter.unusedVariables false in def $(mkIdent (subPropsDefName spec.t.getId h)) $[$pBinders:bracketedBinder]* (s : $(spec.stateId)) : Option $(mkIdent (h.info.fullName ++ `Props)) := $propsBody))
+  let hasLifecycleHoisted := spec.hoisted.any HoistedSub.hasLifecycle
+  if hasLifecycleHoisted then outCmds := outCmds.push (← mkReconcileHoistedCmd spec pBinders retTy)
+  let unchanged ← mkUpdateRet spec (← `(s))
+  let ownArms ← mkOwnUpdateArms spec sites unchanged
+  let mkUpdDef (fnId : Ident) (arms : Array MatchAltStx) (reconcile : Bool := false) : CommandElabM CmdStx := do
+    let core ← if arms.isEmpty then `(nomatch m) else `(match m with $[$arms:matchAlt]*)
+    let wrapped ← if reconcile && hasLifecycleHoisted then appWithProps spec (spec.id `_reconcileHoisted) #[← `(s), core] else pure core
+    `(command| def $fnId $[$pBinders:bracketedBinder]* (s : $(spec.stateId)) : $(spec.msgId) → $retTy := fun m => $wrapped)
   if spec.hoisted.isEmpty && spec.resetForms.isEmpty then return outCmds.push (← mkUpdDef spec.updateId ownArms)
   let stepOwnId := spec.id `stepOwn
   let subNoops ← spec.hoisted.mapM fun h => `(Lean.Parser.Term.matchAltExpr| | $(spec.msgCtor h.ctorName) _ => $unchanged)
   let rfNoops ← spec.resetForms.mapM fun rf => `(Lean.Parser.Term.matchAltExpr| | $(spec.msgCtor rf.ctorName) => $unchanged)
-  let mut fullArms ← spec.hoisted.mapM (mkHoistedSubArm spec stepOwnId)
+  let mut fullArms ← spec.hoisted.mapM (mkHoistedSubArm spec stepOwnId unchanged)
   for rf in spec.resetForms do
     let (df, fvId) := (rf.draftField, mkIdent `_fv)
     let ab ← `(match ($(rf.parseCall) s.$df:ident) with
@@ -291,7 +421,7 @@ def mkMsgAndUpdateCmds (spec : ComponentSpec) (sites : Array SetSite) : CommandE
       | none => $unchanged)
     fullArms := fullArms.push (← `(Lean.Parser.Term.matchAltExpr| | $(spec.msgCtor rf.ctorName) => $(← bindMentionedFields spec (mentionsIdent ab.raw) ab)))
   if !ownArms.isEmpty then fullArms := fullArms.push (← `(Lean.Parser.Term.matchAltExpr| | _m => $(← appWithProps spec stepOwnId #[← `(s), ← `(_m)])))
-  return outCmds ++ #[← mkUpdDef stepOwnId (ownArms ++ subNoops ++ rfNoops), ← mkUpdDef spec.updateId fullArms]
+  return outCmds ++ #[← mkUpdDef stepOwnId (ownArms ++ subNoops ++ rfNoops), ← mkUpdDef spec.updateId fullArms (reconcile := true)]
 
 def mkViewCmds (spec : ComponentSpec) (body' : Term) (msgAndUpdateCmds : Array CmdStx) : CommandElabM (Array CmdStx) := do
   let (renderId, pBinders) := (spec.id `_qed_render, ← mkPropsBinders spec)

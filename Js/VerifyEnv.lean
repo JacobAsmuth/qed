@@ -434,7 +434,7 @@ private def isBenignEmptyCseThunk (env : Environment) (n : Name) : Bool :=
   | _ => false
 
 private def serverOnlyLeaves : Array String := #[
-  "dispatchM", "wsDispatchM", "httpDispatchM", "authHookM", "initState", "runServer",
+  "dispatchM", "wsDispatchM", "wsProject", "httpDispatchM", "authHookM", "initState", "runServer",
   "jobs", "verifiedJobs", "jobNames", "readOnlyMethods", "methods", "channels"
 ]
 private def dbOnlyLeaves : Array String := #["config", "ensureSchema", "ddl", "rlsDdl", "instSafeIOEnsureSchema"]
@@ -443,7 +443,7 @@ def isServerOnlyDeclName (env : Environment) : Name → Bool
   | .anonymous => false | .num p _ => isServerOnlyDeclName env p
   | .str owner s =>
       if s.startsWith "_closed_" then isServerOnlyDeclName env owner && !isBenignEmptyCseThunk env (.str owner s)
-      else ((serverOnlyLeaves.contains s || s.endsWith "_step" || s.endsWith "_handler") && isServerOwner env owner) ||
+      else ((serverOnlyLeaves.contains s || s.endsWith "_step" || s.endsWith "_handler" || s.endsWith "_project") && isServerOwner env owner) ||
         (dbOnlyLeaves.contains s && isDatabaseOwner env owner) ||
         ((s == "schema" || s == "decodeRow") && (isDatabaseOwner env owner || isDatabaseOwner env owner.getPrefix)) ||
         (s == "config" && isAuthOwner env owner) || (s == "spec" && isDeployOwner env owner) ||

@@ -4,6 +4,9 @@ import Qed.Proto.Lawful
 
 namespace Qed
 
+@[inline] def decidableEqOfLawfulBEq {α : Type} [BEq α] [LawfulBEq α] : DecidableEq α :=
+  fun a b => if h : a == b then isTrue (eq_of_beq h) else isFalse fun heq => h (heq ▸ beq_self_eq_true a)
+
 structure Field {α : Type} (p : α → Prop) where
   val : α
   ok  : p val

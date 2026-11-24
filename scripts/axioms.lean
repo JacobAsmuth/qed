@@ -57,6 +57,8 @@ Qed.View: render_showIf collectDyn_showIf renderSig_showIf DomClean_forEach
 Qed.Route: round_trip
 Qed.TypedRoute: round_trip
 Qed.Demo.Signup: canSubmit_iff instLawfulBEq
+Qed.Demo: fixture_codecs_sound fixtureContrastBtn_contrast fixtureProject_ensures fixtureProject_blindTo
+Qed.Demo.FixtureCompFn: inactiveClean app_view_eq
 Qed.Json: render_eq_renderFast
 Qed.LawfulJson: parse_render_toJson
 Qed.Dict: get_set get_remove size_set size_remove_le
@@ -115,6 +117,7 @@ Qed.Reconnect: nextDelayMs_off nextDelayMs_exhausted_fixed nextDelayMs_exhausted
 Qed.WsMuxFrame: decode_encode_unsub decode_encode_send decode_encode_joinOk decode_encode_event
 Qed.Subscription: boot_preserves_inv wrap_preserves_inv wrap_noop_when_keys_unchanged
 LiveRoom.Hub: inv_init announce_inv announce_ensures room_onJoin_inv room_onSend_inv room_onLeave_inv
+  secretFeed_project_ensures secretFeed_project_blindTo secretFeed_project_channel_ensures
   concurrent_linearizable
 LiveRoom.LiveApp: allMsgsValidRoom app_view_eq
 LiveRoom.App: ws_endpoints_valid
@@ -186,6 +189,6 @@ open Lean in
       let bad := axs.filter (!allowed.contains ·)
       unless bad.isEmpty do
         throwError "unexpected axiom(s) in {n}: {bad.toList}"
-  unless seen.size == 412 do
-    throwError "expected 412 theorems in axioms manifest, checked {seen.size}"
+  unless seen.size == 421 do
+    throwError "expected 421 theorems in axioms manifest, checked {seen.size}"
   IO.println s!"✓ {seen.size} theorems checked: 0 unexpected axioms"

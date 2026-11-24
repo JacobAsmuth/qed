@@ -42,6 +42,24 @@ def Cmd.mapList (f : α → β) : List (Cmd α) → List (Cmd β) | [] => [] | c
 end
 
 mutual
+def Cmd.prefixSlots (pfx : String) : Cmd α → Cmd α
+  | .batch cmds => .batch (Cmd.prefixSlotsList pfx cmds)
+  | .wsMuxSub s u ch p rec j m st => .wsMuxSub (pfx ++ s) u ch p rec j m st
+  | .wsMuxSend s p => .wsMuxSend (pfx ++ s) p
+  | .wsMuxUnsub s => .wsMuxUnsub (pfx ++ s)
+  | .wsExtOpen s u bin rec j t b st => .wsExtOpen (pfx ++ s) u bin rec j t b st
+  | .wsExtSendText s t => .wsExtSendText (pfx ++ s) t
+  | .wsExtSendBytes s p => .wsExtSendBytes (pfx ++ s) p
+  | .wsExtClose s => .wsExtClose (pfx ++ s)
+  | c => c
+def Cmd.prefixSlotsList (pfx : String) : List (Cmd α) → List (Cmd α)
+  | [] => [] | c :: cs => Cmd.prefixSlots pfx c :: Cmd.prefixSlotsList pfx cs
+end
+
+def Cmd.mapScoped (pfx : String) (f : α → β) (c : Cmd α) : Cmd β :=
+  Cmd.map f (if pfx.isEmpty then c else Cmd.prefixSlots pfx c)
+
+mutual
 def Cmd.flatten : Cmd msg → List (Cmd msg) | .batch cmds => Cmd.flattenList cmds | c => [c]
 def Cmd.flattenList : List (Cmd msg) → List (Cmd msg) | [] => [] | c :: cs => Cmd.flatten c ++ Cmd.flattenList cs
 end

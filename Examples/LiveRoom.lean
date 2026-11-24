@@ -24,6 +24,15 @@ schema PriceTick:
 schema PricePing:
   action : String
 
+record SecretBroadcast:
+  roomId      : Nat
+  secret      : String
+  redactedFor : String[]
+
+record SecretView:
+  roomId : Nat
+  secret : String?
+
 external TickerWs:
   base "ws://127.0.0.1:19455"
 
@@ -83,6 +92,24 @@ server Hub:
 
     on_leave:
       if online > 0: online -= 1
+
+  def broadcastSecret(roomId: Nat, secretVal: String, hideFrom: String) -> Unit:
+    requires ctx.userId != none
+    requires roomId <= 100
+    secretFeed.emit(roomId, { roomId = roomId, secret = secretVal, redactedFor = [hideFrom] })
+
+  channel secretFeed(id: Nat) -> SecretView:
+    requires ctx.userId != none
+    requires id <= 100
+    ensures event.roomId == id
+    project(raw: SecretBroadcast):
+      if ctx.userId.getD("") in raw.redactedFor:
+        ensures result.secret == none
+        blindTo raw.secret
+      let hidden = ctx.userId.getD("") in raw.redactedFor
+      return { roomId = id, secret = none if hidden else some(raw.secret) }
+    on_join:
+      pass
 
 def statusLabel : Qed.SocketStatus → String
   | .disconnected   => "disconnected"

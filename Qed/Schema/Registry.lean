@@ -92,16 +92,39 @@ def mkStructJsonCmds (t : Ident) (fields : Array StructFieldSpec) (opts : Struct
     ← `(command| instance $(mkIdent (tId ++ `instLawfulJson)):ident : Qed.LawfulJson $t where
           depthBound := $depthBoundExpr; depth_toJson := fun $xId:ident => Nat.add_le_add_left $depthProofExpr 1; fromJson_toJson := $thmId) ]
 
-def mkStructProtoCmds (t : Ident) (fields : Array StructFieldSpec) (opts : StructProtoOpts := {}) : CommandElabM (Array (TSyntax `command)) := do
-  let (tId, fsId, n) := (t.getId, mkIdent `fs, fields.size)
-  let (cbns, cbts, xId, tApp, appTo, fs, reads) ← mkStructCodecCtx t fields opts.ctxBinders
-  let (toId, fromId) := (mkIdent (tId ++ `toProtoFields), mkIdent (tId ++ `fromProtoFields))
-  let (toApp, fromApp) := (← appTo ⟨toId.raw⟩, ← appTo ⟨fromId.raw⟩)
+def mkProtoFieldTailsAndTags (reads : Array Term) (needTagsPf : Bool) : CommandElabM (Array Term × Term) := do
+  let n := reads.size
   let mut tails := Array.replicate (n + 1) (← `(term| ([] : List (Nat × Qed.Proto.WireVal))))
   let mut tagsPosPf ← `(term| (fun (_ : Nat × Qed.Proto.WireVal) h => False.elim (List.not_mem_nil h)))
   for i in (Array.range n).reverse do
     tails := tails.set! i (← `(term| Qed.ToProtoField.encodeProtoField $(numLit (i + 1)) $(reads[i]!) ++ $(tails[i + 1]!)))
-    if cbns.isEmpty && opts.emitLawful then tagsPosPf ← `(term| Qed.Proto.msg_tags_pos_encodeAppend (Nat.zero_lt_succ $(numLit i)) $(reads[i]!) $tagsPosPf)
+    if needTagsPf then tagsPosPf ← `(term| Qed.Proto.msg_tags_pos_encodeAppend (Nat.zero_lt_succ $(numLit i)) $(reads[i]!) $tagsPosPf)
+  return (tails, tagsPosPf)
+
+def mkProtoFieldRoundtripTacs (fields : Array StructFieldSpec) (reads tails : Array Term) (xId? : Option Ident := none) :
+    CommandElabM (Array Ident × Array (TSyntax `tactic)) := do
+  let n := fields.size; let protoBody := tails[0]!
+  let mut pIdents : Array Ident := #[]; let mut pHaveTacs : Array (TSyntax `tactic) := #[]
+  for i in [0:n] do
+    let kLit := numLit (i + 1); let f := fields[i]!
+    let mut gtPf ← `(term| Qed.Proto.allTagsGt_nil $kLit)
+    for j in (Array.range n).extract (i + 1) n |>.reverse do
+      gtPf ← `(term| Qed.Proto.allTagsGt_encodeAppend (Nat.lt_of_sub_eq_succ (rfl : $(numLit (j + 1)) - $kLit = Nat.succ $(numLit (j - i - 1)))) $(reads[j]!) $gtPf)
+    let mut rawEq ← `(term| Qed.Proto.decodeProtoField_hit $kLit $(reads[i]!) $(tails[i + 1]!) $gtPf)
+    for j in (Array.range i).reverse do
+      rawEq ← `(term| Eq.trans (Qed.Proto.decodeProtoField_skip (α := $(f.valTy)) (Nat.ne_of_lt (Nat.lt_of_sub_eq_succ (rfl : $kLit - $(numLit (j + 1)) = Nat.succ $(numLit (i - j - 1))))) $(reads[j]!) $(tails[j + 1]!)) $rawEq)
+    let wrappedEq ← match f.codecTerm?, xId? with
+      | some inp, some xId => let fId := f.ident; `(term| $(mkIdent `Qed.Codec.fromProtoField_of_field) $inp $kLit $protoBody ($xId.$fId:ident) $rawEq)
+      | _, _ => pure rawEq
+    let hId := mkIdent (Name.mkSimple s!"_hp{i}"); pIdents := pIdents.push hId; pHaveTacs := pHaveTacs.push (← `(tactic| have $hId:ident := $wrappedEq))
+  return (pIdents, pHaveTacs)
+
+def mkStructProtoCmds (t : Ident) (fields : Array StructFieldSpec) (opts : StructProtoOpts := {}) : CommandElabM (Array (TSyntax `command)) := do
+  let (tId, fsId) := (t.getId, mkIdent `fs)
+  let (cbns, cbts, xId, tApp, appTo, fs, reads) ← mkStructCodecCtx t fields opts.ctxBinders
+  let (toId, fromId) := (mkIdent (tId ++ `toProtoFields), mkIdent (tId ++ `fromProtoFields))
+  let (toApp, fromApp) := (← appTo ⟨toId.raw⟩, ← appTo ⟨fromId.raw⟩)
+  let (tails, tagsPosPf) ← mkProtoFieldTailsAndTags reads (cbns.isEmpty && opts.emitLawful)
   let protoBody := tails[0]!
   let protoDecodes ← fields.zipIdx.mapM fun (f, i) => let kLit := numLit (i + 1); match f.codecTerm? with
     | some inp => `(($inp).fromProtoField $kLit $fsId) | none => `(Qed.FromProtoField.decodeProtoField (α := $(f.valTy)) $kLit $fsId)
@@ -117,17 +140,7 @@ def mkStructProtoCmds (t : Ident) (fields : Array StructFieldSpec) (opts : Struc
   cmds := cmds ++ #[← `(command| instance $(mkIdent (tId ++ `instToProto)):ident : Qed.ToProto $t := .ofFields $toId),
                     ← `(command| instance $(mkIdent (tId ++ `instFromProto)):ident : Qed.FromProto $t := .ofFields $fromId)]
   if !opts.emitLawful then return cmds
-  let mut pIdents : Array Ident := #[]; let mut pHaveTacs : Array (TSyntax `tactic) := #[]
-  for i in [0:n] do
-    let kLit := numLit (i + 1); let f := fields[i]!; let fId := f.ident
-    let mut gtPf ← `(term| Qed.Proto.allTagsGt_nil $kLit)
-    for j in (Array.range n).extract (i + 1) n |>.reverse do
-      gtPf ← `(term| Qed.Proto.allTagsGt_encodeAppend (Nat.lt_of_sub_eq_succ (rfl : $(numLit (j + 1)) - $kLit = Nat.succ $(numLit (j - i - 1)))) $(reads[j]!) $gtPf)
-    let mut rawEq ← `(term| Qed.Proto.decodeProtoField_hit $kLit $(reads[i]!) $(tails[i + 1]!) $gtPf)
-    for j in (Array.range i).reverse do
-      rawEq ← `(term| Eq.trans (Qed.Proto.decodeProtoField_skip (α := $(f.valTy)) (Nat.ne_of_lt (Nat.lt_of_sub_eq_succ (rfl : $kLit - $(numLit (j + 1)) = Nat.succ $(numLit (i - j - 1))))) $(reads[j]!) $(tails[j + 1]!)) $rawEq)
-    let wrappedEq ← match f.codecTerm? with | some inp => `(term| $(mkIdent `Qed.Codec.fromProtoField_of_field) $inp $kLit $protoBody ($xId.$fId:ident) $rawEq) | none => pure rawEq
-    let hId := mkIdent (Name.mkSimple s!"_hp{i}"); pIdents := pIdents.push hId; pHaveTacs := pHaveTacs.push (← `(tactic| have $hId:ident := $wrappedEq))
+  let (pIdents, pHaveTacs) ← mkProtoFieldRoundtripTacs fields reads tails (some xId)
   let thmId := mkIdent (tId ++ `_fromProto_toProto)
   return cmds ++ #[
     ← `(command| private theorem $thmId ($xId:ident : $t) : $fromId ($toId $xId) = Except.ok $xId := by

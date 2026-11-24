@@ -239,4 +239,76 @@ component BadHeadCase:
     case .home: title "Nope"
   view: <main>ok</main>
 
+-- Stateless `server` and per-viewer `channel ... project(...)` with `blindTo`
+record RawGameRoom:
+  code           : String
+  secretLocation : String
+  secretPack     : String
+  spyIds         : String[]
+
+record RedactedGameView:
+  code           : String
+  secretLocation : String?
+  secretPack     : String?
+  isSpy          : Bool
+
+server stateless RedactedHub:
+  channel room(code: String) -> RedactedGameView:
+    requires ctx.userId != none
+    ensures event.code == code
+    project(raw: RawGameRoom):
+      if ctx.userId.getD("") in raw.spyIds:
+        ensures result.secretLocation == none, result.secretPack == none
+        blindTo raw.{secretLocation, secretPack}
+      let isSpy = ctx.userId.getD("") in raw.spyIds
+      return {
+        code = code,
+        secretLocation = none if isSpy else some(raw.secretLocation),
+        secretPack = none if isSpy else some(raw.secretPack),
+        isSpy = isSpy
+      }
+    on_join:
+      pass
+
+  def pushState(code: String, loc: String, pack: String, spies: String[]) -> Unit:
+    requires ctx.userId != none
+    room.emit(code, { code = code, secretLocation = loc, secretPack = pack, spyIds = spies })
+
+example := @RedactedHub.is_stateless
+example := @RedactedHub.room_project_ensures
+example := @RedactedHub.room_project_blindTo
+example := @RedactedHub.room_project_channel_ensures
+
+#guard
+  let raw : RawGameRoom := { code := "ABCD", secretLocation := "Casino", secretPack := "Classic", spyIds := #["bob"] }
+  let params := Qed.Proto.encode "ABCD"
+  let payload := Qed.Proto.encode raw
+  let aliceOut := (RedactedHub.wsProject { userId := some "alice" } "room" params payload).bind id
+  let bobOut   := (RedactedHub.wsProject { userId := some "bob" } "room" params payload).bind id
+  let otherOut := RedactedHub.wsProject { userId := some "alice" } "other" params payload
+  (aliceOut.bind fun bs => (Qed.Proto.decode (α := RedactedGameView) bs).toOption) ==
+    some { code := "ABCD", secretLocation := some "Casino", secretPack := some "Classic", isSpy := false } &&
+  (bobOut.bind fun bs => (Qed.Proto.decode (α := RedactedGameView) bs).toOption) ==
+    some { code := "ABCD", secretLocation := none, secretPack := none, isSpy := true } &&
+  otherOut == Qed.Server.WsProjectOut.passthrough
+
+expect_err "`server stateless BadStatelessSrv` forbids in-memory `state` field `count`" in
+server stateless BadStatelessSrv:
+  state count : Nat = 0
+  def getCount() -> Nat:
+    return count
+
+expect_err "`blindTo raw.secretLocation` failed in `LeakyProjSrv.room_project`" in
+server stateless LeakyProjSrv:
+  channel room(code: String) -> RedactedGameView:
+    project(raw: RawGameRoom):
+      if ctx.userId.getD("") in raw.spyIds:
+        blindTo raw.secretLocation
+      return {
+        code = f"{code}:{raw.secretLocation}",
+        secretLocation = none,
+        secretPack = none,
+        isSpy = true
+      }
+
 end ServerChecks

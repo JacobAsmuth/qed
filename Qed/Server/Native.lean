@@ -623,11 +623,13 @@ private structure HttpLoopCtx where
 private def serveHttpLoop (staticDir : String) (port : UInt16) (devMode : Bool) (numWorkers : UInt32)
     (setup : HttpLoopCtx → IO ((ParsedReqHead → String → String → Nat → IO (Prim.HttpHeadAction ParsedReqHead RequestCtx)) ×
       (ParsedReqHead → ByteArray → String → IO ByteArray) ×
-      (RequestCtx → ByteArray → WsFragState → WsSubs → IO (Prim.WsStepOut WsFragState)) × (RequestCtx → String → ByteArray → IO Unit))) : IO UInt32 := do
+      (RequestCtx → ByteArray → WsFragState → WsSubs → IO (Prim.WsStepOut WsFragState)) ×
+      (RequestCtx → String → ByteArray → IO Unit) ×
+      Option (RequestCtx → String → ByteArray → ByteArray → WsProjectOut))) : IO UInt32 := do
   let cfg ← loadServerConfig devMode; let staticDirFd ← Prim.openStaticDir staticDir
   let mkHealth (ka : Bool) := formatHttpResponse 200 "application/json" "{\"ok\":true}".toUTF8 false ka false
   let healthKA := mkHealth true; let healthClose := mkHealth false
-  let (onParsedHead, onBody, onWsBytes, onWsLeave) ← setup { cfg, staticDirFd, healthKA, healthClose, htmlCspHdrs := cfg.csp?.elim [] fun p => [("Content-Security-Policy", p)] }
+  let (onParsedHead, onBody, onWsBytes, onWsLeave, onWsProject) ← setup { cfg, staticDirFd, healthKA, healthClose, htmlCspHdrs := cfg.csp?.elim [] fun p => [("Content-Security-Policy", p)] }
   let onHead (headBytes : ByteArray) (clientIp : String) (inline : Nat) : IO (Prim.HttpHeadAction ParsedReqHead RequestCtx) := do
     match parseRequestHead headBytes with
     | .error (code, msg) => return .doneClose (formatErrorResponse code msg)
@@ -635,7 +637,7 @@ private def serveHttpLoop (staticDir : String) (port : UInt16) (devMode : Bool) 
         let pathOnly := stripQuery req.target
         if req.method == "GET" && pathOnly == "/_qed/health" && req.contentLen == 0 then return if req.keepAlive then .doneKeepAlive healthKA else .doneClose healthClose
         onParsedHead req clientIp pathOnly inline
-  Prim.serveNative cfg.bindHost port numWorkers ({} : WsFragState) onHead onBody onWsBytes onWsLeave
+  Prim.serveNative cfg.bindHost port numWorkers ({} : WsFragState) onHead onBody onWsBytes onWsLeave onWsProject
 private def finishHeadWire (req : ParsedReqHead) (wire : ByteArray) : Prim.HttpHeadAction ParsedReqHead RequestCtx :=
   if req.keepAlive then .doneKeepAlive wire else .doneClose wire
 private def closedWsBytes (_ : RequestCtx) (rx : ByteArray) (frag : WsFragState) (_ : WsSubs) :
@@ -658,6 +660,7 @@ private structure FullstackConfig where
   authHookFn?      : Option (RequestCtx → UInt8 → IO (Except ApiError Unit × Array SetCookie)) := none
   authHookFlags    : Bool × Bool := (false, false)
   primaryDb?       : Option Db.DbConfig := none
+  wsProjectFn?     : Option (RequestCtx → String → ByteArray → ByteArray → WsProjectOut) := none
 
 private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : FullstackConfig) : IO UInt32 := do
   let activeEnv? := (← Prim.getEnv "QED_DEPLOY_ENV").bind fun s => Qed.Cloud.DeployEnv.parse? (trimWs s)
@@ -779,7 +782,7 @@ private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : 
     let onWsBytes := fc.wsDispatchFn?.elim closedWsBytes fun fn ctx rx frag subs => stepWsRxLoop fn ctx rx 0 frag subs ByteArray.empty #[]
     let onWsLeave (ctx : RequestCtx) (ch : String) (params : ByteArray) : IO Unit := do if let some fn := fc.wsDispatchFn? then discard <| fn ctx 3 ch params ByteArray.empty
     let _ ← if fc.jobs.isEmpty then pure #[] else spawnServerJobs fc.jobs
-    return (onParsedHead, dispatchAppReq, onWsBytes, onWsLeave)
+    return (onParsedHead, dispatchAppReq, onWsBytes, onWsLeave, fc.wsProjectFn?)
 private abbrev SrvHandlerM (σ : Type) (F : (Type → Type) → Type) := {m : Type → Type} → [Monad m] → [MonadServer m] → [MonadAtomic σ m] → F m
 
 def runStatefulFullstack {σ Model Msg : Type} (app : Qed.App Model Msg) (title serverShortName : String) (initState : σ) (requiredSecrets : Array String)
@@ -787,14 +790,15 @@ def runStatefulFullstack {σ Model Msg : Type} (app : Qed.App Model Msg) (title 
     (wsDispatchM? : Option (SrvHandlerM σ fun m => RequestCtx → UInt8 → String → ByteArray → ByteArray → m (Except ApiError ByteArray)) := none) (blockingMethods? : Option (Array String) := none)
     (httpDispatchM? : Option (SrvHandlerM σ fun m => RequestCtx → String → String → m (Except ApiError (Option HttpResponse))) := none) (jobs : Array (ServerJob σ) := #[])
     (authSpec? : Option Qed.Auth.OidcAuthSpec := none) (authHookM? : Option (SrvHandlerM σ fun m => RequestCtx → UInt8 → m (Except ApiError Unit)) := none)
-    (authHookFlags : Bool × Bool := (false, false)) (primaryDb? : Option Db.DbConfig := none) : IO UInt32 := do
+    (authHookFlags : Bool × Bool := (false, false)) (primaryDb? : Option Db.DbConfig := none)
+    (wsProjectFn? : Option (RequestCtx → String → ByteArray → ByteArray → WsProjectOut) := none) : IO UInt32 := do
   let box ← Prim.mkStateBox initState; let gcpCache ← Prim.mkStateBox (#[] : Array GcpTokenCacheEntry); let dbCache ← mkDbResolveCache primaryDb?
   let gcpSsrfGuard := !devMode; let wsSrvInst := mkNativeServerInstWith (some gcpCache) none none (some dbCache) gcpSsrfGuard; let atomicInst := withStateBox box
   let withCookies {α : Type} (sseRef? : Option (IO.Ref (Array SseEvent)) := none) (f : MonadServer IO → IO α) : IO (α × Array SetCookie) := do
     let cRef ← IO.mkRef (#[] : Array SetCookie)
     return (← f (mkNativeServerInstWith (some gcpCache) (some cRef) sseRef? (some dbCache) gcpSsrfGuard), ← cRef.get)
   runFullstackCore app {
-    title, serverShortName, requiredSecrets, port, staticDir, devMode, numWorkers, blockingMethods?, authSpec?, authHookFlags, primaryDb?,
+    title, serverShortName, requiredSecrets, port, staticDir, devMode, numWorkers, blockingMethods?, authSpec?, authHookFlags, primaryDb?, wsProjectFn?,
     dispatchFn := fun ctx mName reqBytes => withCookies none fun srv => @dispatchM IO _ srv atomicInst ctx mName reqBytes,
     wsDispatchFn? := wsDispatchM?.map fun wsM ctx kind ch params payload => @wsM IO _ wsSrvInst atomicInst ctx kind ch params payload,
     httpDispatchFn? := httpDispatchM?.map fun httpM ctx method path => do
@@ -825,5 +829,5 @@ def runStaticDir (staticDir : String) (port : UInt16) (devMode : Bool := false) 
       match ← Prim.readStaticFile loop.staticDirFd "index.html" (if isHead then 1 else 0) with
       | some (fsize, _, bytes) => maybeGzipResponse 200 "text/html; charset=utf-8" bytes isHead req.keepAlive true req.acceptsGzip true (extraHeaders := loop.htmlCspHdrs ++ [("Vary", "Accept-Encoding")]) (contentLen := fsize)
       | none => return formatTextResponse 404 "not found" isHead req.keepAlive
-    return (fun req _ _ _ => finishHeadWire req <$> dispatchReq req ByteArray.empty "", dispatchReq, closedWsBytes, fun _ _ _ => pure ())
+    return (fun req _ _ _ => finishHeadWire req <$> dispatchReq req ByteArray.empty "", dispatchReq, closedWsBytes, fun _ _ _ => pure (), none)
 end Qed.Server.Native

@@ -445,4 +445,286 @@ component ExtendedDeck:
   invariant deckSafe: PositiveCard.positive for_each cards
   view: <div>{for c in cards: <PositiveCard state={c}/>}</div>
 
+-- ── `enum`, `record`, `schema` Option/Bare-Type Lawfulness & Proto Mapping ──
+enum GamePhase:
+  lobby
+  playing
+
+enum RoleCard:
+  none
+  spy
+  agent(role: String, note: String?)
+
+enum TickEvent:
+  empty
+  tick(t: Nat, label: String)
+
+record RoomSnapshotRec:
+  code       : String
+  phase      : GamePhase = .lobby
+  spyCount   : Nat       = 1 where 1 <= spyCount <= 4
+  scores     : (String, Nat)[] = []
+  role       : RoleCard? = none
+  secretLoc  : String?   = none
+  example sample: code = "ABCD", phase = .playing, spyCount = 2, scores = [("a", 1)], role = some(.agent("Pilot", some("hi"))), secretLoc = some("Airplane")
+
+schema OptSchema:
+  title : String
+  note  : String?
+  phase : GamePhase?
+
+-- Backwards-compatible explicit deriving + custom Inhabited override
+deriving instance Repr, DecidableEq for OptSchema
+record CustomInhabRec:
+  count : Nat
+instance : Inhabited CustomInhabRec := ⟨{ count := 42 }⟩
+
+-- Bare field types (no `Codec.Val` wrapper on unrefined schema/record fields)
+example (s : OptSchema) : String := s.title
+example (s : OptSchema) : Option String := s.note
+example : (default : GamePhase) = .lobby := rfl
+example : (default : RoomSnapshotRec).phase = .lobby ∧ (default : RoomSnapshotRec).spyCount.val = 1 := ⟨rfl, rfl⟩
+example : (default : CustomInhabRec).count = 42 := rfl
+example : LawfulJson GamePhase := inferInstance
+example : LawfulProto GamePhase := inferInstance
+example : LawfulJson (Option GamePhase) := inferInstance
+example : LawfulJson RoleCard := inferInstance
+example : LawfulProto RoleCard := inferInstance
+example : LawfulJson (Option RoleCard) := inferInstance
+example : LawfulJson TickEvent := inferInstance
+example : LawfulProto TickEvent := inferInstance
+example : LawfulJson RoomSnapshotRec := inferInstance
+example : LawfulProto RoomSnapshotRec := inferInstance
+example : LawfulJson (Option RoomSnapshotRec) := inferInstance
+example : LawfulJson OptSchema := inferInstance
+example : LawfulProto OptSchema := inferInstance
+example : DecidableEq RoomSnapshotRec := inferInstance
+example : Repr RoomSnapshotRec := inferInstance
+example : DecidableEq RoleCard := inferInstance
+example : Repr RoleCard := inferInstance
+
+mapping RoomFrameMap:
+  from RoomSnapshotRec
+  to String
+  encode(v):
+    return Proto.encodeHex(Proto.encode(v))
+  decode(frame):
+    let bytes = Proto.decodeHex(frame)?
+    return Proto.decode(bytes)?
+
+#guard
+  let r := RoomSnapshotRec.sample
+  let tick := TickEvent.tick 7 "go"
+  (GamePhase.ofString (toString GamePhase.playing)).toOption == some .playing &&
+  (GamePhase.decode (GamePhase.encode .playing)).toOption == some .playing &&
+  (GamePhase.decodeBytes (GamePhase.encodeBytes .playing)).toOption == some .playing &&
+  (RoleCard.decode (RoleCard.encode (.agent "Pilot" (some "ok")))).toOption == some (.agent "Pilot" (some "ok")) &&
+  (RoleCard.decodeBytes (RoleCard.encodeBytes (.agent "Pilot" none))).toOption == some (.agent "Pilot" none) &&
+  (TickEvent.decode (TickEvent.encode tick)).toOption == some tick &&
+  (TickEvent.decodeBytes (TickEvent.encodeBytes tick)).toOption == some tick &&
+  (RoomSnapshotRec.decode (RoomSnapshotRec.encode r)).toOption == some r &&
+  (RoomSnapshotRec.decodeBytes (RoomSnapshotRec.encodeBytes r)).toOption == some r &&
+  (OptSchema.decode (OptSchema.encode { title := "x", note := some "n", phase := some .playing })).toOption == some { title := "x", note := some "n", phase := some .playing } &&
+  (OptSchema.decode (OptSchema.encode { title := "x", note := none, phase := none })).toOption == some { title := "x", note := none, phase := none } &&
+  (RoomFrameMap.decode (RoomFrameMap.encode r).val).toOption == some r
+
+expect_err "duplicate variant `a` in `enum DupEnum`" in
+enum DupEnum:
+  a
+  a
+expect_err "duplicate field `x` in variant `pair` of `enum DupEnumField`" in
+enum DupEnumField:
+  pair(x: Nat, x: String)
+expect_err "Record `BadRecDefault` default for field `qty` failed `where` constraint" in
+record BadRecDefault:
+  qty : Nat = 99 where 1 <= qty <= 4
+expect_err "Record `UnsatRec` is unsatisfiable: field `qty` has contradictory `where` constraints" in
+record UnsatRec:
+  qty : Nat where 10 <= qty, qty <= 2
+
+-- Pure `fn` contracts (`requires`, `ensures`, `if`, `blindTo`)
+record SecretRoom:
+  code           : String
+  secretLocation : String
+  secretPack     : String
+  spyIds         : String[]
+
+record RedactedView:
+  code           : String
+  secretLocation : String?
+  secretPack     : String?
+  isSpy          : Bool
+
+fn projectSecretRoom(room: SecretRoom, viewerId: String) -> RedactedView:
+  requires room.code != ""
+  if viewerId in room.spyIds:
+    ensures result.secretLocation == none, result.secretPack == none, result.isSpy == true
+    blindTo room.{secretLocation, secretPack}
+  if viewerId not in room.spyIds:
+    ensures result.secretLocation == some(room.secretLocation), result.isSpy == false
+  let isSpy = viewerId in room.spyIds
+  return {
+    code = room.code,
+    secretLocation = none if isSpy else some(room.secretLocation),
+    secretPack = none if isSpy else some(room.secretPack),
+    isSpy = isSpy
+  }
+
+fn clampRoundMins(n: Nat) -> Nat:
+  ensures 3 <= result, result <= 15
+  if n < 3: return 3
+  if n > 15: return 15
+  return n
+
+fn hideWholeParam(pubTag: String, secret: String, masked: Bool) -> String:
+  if masked:
+    ensures result == pubTag
+    blindTo secret
+  if masked: return pubTag
+  return secret
+
+fn redactSingleField(room: SecretRoom, viewerId: String) -> String?:
+  if viewerId in room.spyIds:
+    blindTo room.secretLocation
+  if viewerId in room.spyIds: return none
+  return some(room.secretLocation)
+
+example := @projectSecretRoom_ensures_1
+example := @projectSecretRoom_ensures_2
+example := @projectSecretRoom_blindTo
+example := @clampRoundMins_ensures
+example := @hideWholeParam_ensures
+example := @hideWholeParam_blindTo
+example := @redactSingleField_blindTo
+
+expect_err "`blindTo room.secretLocation` failed in `leakyProjection`" in
+fn leakyProjection(room: SecretRoom, viewerId: String) -> RedactedView:
+  if viewerId in room.spyIds:
+    ensures result.secretLocation == none
+    blindTo room.secretLocation
+  let isSpy = viewerId in room.spyIds
+  return {
+    code = f"{room.code}:{room.secretLocation}",
+    secretLocation = none if isSpy else some(room.secretLocation),
+    secretPack = none,
+    isSpy = isSpy
+  }
+
+expect_err "`ensures` contract failed for `badClamp`" in
+fn badClamp(n: Nat) -> Nat:
+  ensures result <= 10
+  return n
+
+-- Component `fn` (pure + state-mutating), implication invariants, per-action `prove:`, and keyed hoisted sub-components
+enum ViewTab:
+  home
+  room(code: String)
+
+component PureFnBadge:
+  prop name : String
+  fn label(prefixStr: String) -> String:
+    return f"{prefixStr}: {name}"
+  view: <span>{label("Hi")}</span>
+
+component CompFnAndProve:
+  state tab : ViewTab = .home
+  state title : String = ""
+  state busy : Bool = false
+  state counter : Nat = 0
+
+  fn isHome() -> Bool:
+    match tab:
+      case .home: return true
+      case .room(_): return false
+
+  fn heading(pfx: String) -> String:
+    return f"{pfx} {title} ({counter})"
+
+  fn applyRoom(t: String, clearBusy: Bool):
+    title = t
+    if clearBusy: busy = false
+
+  action openRoom(c: String, t: String):
+    tab = .room(c)
+    applyRoom(t, true)
+
+  action goHome:
+    tab = .home
+    title = ""
+    busy = false
+
+  action rename(t: String):
+    match tab:
+      case .home: pass
+      case .room(_): applyRoom(t, false)
+
+  action inc:
+    counter += 1
+
+  invariant homeClean: isHome() -> title == ""
+  invariant nonNeg: counter >= 0
+    prove:
+      case inc:
+        omega
+
+  view: <div><span>{heading("Room")}</span><PureFnBadge name={title}/></div>
+
+example := @CompFnAndProve.homeClean
+example := @CompFnAndProve.nonNeg
+example := @CompFnAndProve.app_view_eq
+
+expect_err "unknown action/message `noSuchAction` in `prove:` on invariant `BadProveCase.ok`" in
+component BadProveCase:
+  state n : Nat = 0
+  action inc: n += 1
+  invariant ok: n >= 0
+    prove:
+      case noSuchAction:
+        omega
+  view: <span>{n}</span>
+
+expect_err "`fn reset` has no `-> ReturnType` and mutates component state" in
+component BadMutFnInPure:
+  prop x : Nat = 0
+  fn reset(): pass
+  view: <span>{x}</span>
+
+-- Keyed / conditional hoisted sub-components with lifecycle reset, `start`, and lifted `subscribe`
+server SubHostSrv:
+  channel feed(code: String) -> String:
+    on_join -> String:
+      return code
+
+component SubRoomChild:
+  prop code : String
+  state ticks : Nat = 0
+  state latest : String = ""
+  start Cmd.after(10, .tick)
+  subscribe ws = SubHostSrv.feed(code):
+    on_message(msg): latest = msg
+  action tick: ticks += 1
+  view: <div><span>{code}</span><span>{ticks}</span><span>{latest}</span></div>
+
+component SubHostShell:
+  state tab : ViewTab = .home
+  action openRoom(c: String): tab = .room(c)
+  action leaveRoom: tab = .home
+  view:
+    <div>
+      {match tab:
+        case .home: <p>Home</p>
+        case .room(code): <SubRoomChild key={code} code={code}/>}
+    </div>
+
+example :
+  let s0 := SubHostShell.init
+  let (s1, _) := SubHostShell.update s0 (.openRoom "AAA")
+  let (s2, _) := SubHostShell.update s1 (._sub_0 .tick)
+  let (s3, _) := SubHostShell.update s2 (.openRoom "BBB")
+  let (s4, _) := SubHostShell.update s3 (._sub_0 .tick)
+  let (s5, _) := SubHostShell.update s4 .leaveRoom
+  s2._sub_0.ticks = 1 ∧ s3._sub_0.ticks = 0 ∧ s4._sub_0.ticks = 1 ∧ s5._sub_0.ticks = 0 ∧
+  SubHostShell.subscriptions.length = 1 := by
+  decide
+
 end SyntaxChecks

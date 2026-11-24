@@ -75,6 +75,28 @@ def Query.boot {Model Msg : Type} (qs : List (Query Model Msg)) (ic : Model × C
   KeyedLifecycle.boot (·.key) (fun q k m => let r := q.load k m; (r.1, some r.2)) qs ic
 def Query.wrap {Model Msg : Type} (qs : List (Query Model Msg)) (update : Model → Msg → Model × Cmd Msg) : Model → Msg → Model × Cmd Msg :=
   KeyedLifecycle.wrap (·.key) (fun q m => (q.idle m, none)) (fun q k m => let r := q.load k m; (r.1, some r.2)) qs update
+def Query.liftWithProps {PModel PMsg CModel CMsg Props : Type}
+    (getKey : PModel → String) (getProps : PModel → Option Props)
+    (getState : PModel → CModel) (setState : CModel → PModel → PModel) (wrapMsg : CMsg → PMsg)
+    (childQuery : Props → Query CModel CMsg) : Query PModel PMsg :=
+  { key := fun pm =>
+      let pk := getKey pm
+      if pk.isEmpty then ""
+      else match getProps pm with
+        | none => ""
+        | some p => let ck := (childQuery p).key (getState pm); if ck.isEmpty then "" else pk ++ "|" ++ ck,
+    load := fun _ pm =>
+      match getProps pm with
+      | none => (pm, .none)
+      | some p =>
+          let q := childQuery p
+          let ck := q.key (getState pm)
+          let (cs', c) := q.load ck (getState pm)
+          (setState cs' pm, Cmd.map wrapMsg c),
+    idle := fun pm =>
+      match getProps pm with
+      | none => pm
+      | some p => setState ((childQuery p).idle (getState pm)) pm }
 
 namespace Internal
 def App.withQueries {Model Msg : Type} (qs : List (Query Model Msg)) (app : App Model Msg) : App Model Msg :=

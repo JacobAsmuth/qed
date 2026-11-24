@@ -14,12 +14,19 @@ section CompElab
 open Lean Elab Command Qed.Lang
 
 private def elabPureComponent (spec : ComponentSpec) (body' : Term) : CommandElabM Unit := do
+  for f in spec.mutFns do
+    throwErrorAt f.id s!"`fn {f.id.getId}` has no `-> ReturnType` and mutates component state, but `{spec.t.getId}` has no `state`/`event`/`bind`; add `-> Type` for a pure helper or declare `state`"
   let msgV := mkIdent `msg
   let mut pBinders ← spec.props.mapM mkStructBinder
+  let mut pureFieldTys : Array (Name × Term) := #[]
+  for pr in spec.props do
+    let ty ← match pr.ty?, pr.def? with | some t, _ => pure t | none, some d => `(type_of% $d) | none, none => throwErrorAt pr.id s!"`prop {pr.id.getId}` needs a type or default"
+    pureFieldTys := pureFieldTys.push (pr.id.getId, ty)
   for sl in spec.slots do
     pBinders := pBinders.push (← `(Lean.Parser.Command.structExplicitBinder| ($(sl.id) : Html $msgV := $(← sl.def?.getDM `(Qed.Html.empty)))))
   for bd in spec.binds do
     let bTy ← resolveBindTy bd
+    pureFieldTys := pureFieldTys.push (bd.id.getId, bTy)
     pBinders := pBinders.push (← mkStructBinder { bd with ty? := some bTy })
       |>.push (← `(Lean.Parser.Command.structExplicitBinder| ($(mkIdentFrom bd.id (bindSetName bd.id.getId)) : $bTy → $msgV)))
   for ev in spec.events do
@@ -28,6 +35,10 @@ private def elabPureComponent (spec : ComponentSpec) (body' : Term) : CommandEla
   if spec.hasChildren then
     pBinders := pBinders.push (← `(Lean.Parser.Command.structExplicitBinder| ($(mkIdent `children) : List (Html $msgV) := [])))
   elabCommand (← `(command| structure $(spec.propsId) ($msgV : Type) where $[$pBinders:structExplicitBinder]*))
+  if !spec.pureFns.isEmpty then
+    let rwCtx ← mkRewriteCtx spec true (allowHoist := false)
+    let rwPureFns ← spec.pureFns.mapM fun f => return { f with stmts := ← f.stmts.mapM (rewriteIn rwCtx false) }
+    (← mkPureCompFnCmds { spec with fns := rwPureFns } pureFieldTys).forM elabCommand
   let propReadNames := spec.propNames ++ spec.slots.map (·.id.getId) ++ spec.binds.map (·.id.getId) ++
     spec.events.map (·.id.getId) ++ (if spec.hasChildren then #[`children] else #[])
   let viewBody ← propReadNames.reverse.foldlM (init := body') fun acc g =>
@@ -39,10 +50,12 @@ private def elabPureComponent (spec : ComponentSpec) (body' : Term) : CommandEla
   for invStx in spec.invariants do
     if invStx.getKind == ``compForEachInvClause || invStx.getKind == ``compExampleClause then
       throwErrorAt invStx "a pure component has no local state; `for_each` and `example` apply to stateful components"
+    if (invStx.getArg 5).getNumArgs > 0 then
+      throwErrorAt (invStx.getArg 5) "per-action `prove:` applies to stateful components, not pure `view` components"
     let invId := resolveInvIdent invStx spec.t.getId; let rawClauses := (invStx.getArg 2).getSepArgs
     let (vPred, predStr) ← mkViewPredAndStr invStx rawClauses (← rawClauses.mapM (lowerCompExpr .val)) "empty view invariant"
     let vCall ← if needsProps then `($(spec.viewId) p) else `(($(spec.viewId) : Html $msgV))
-    let pf? : Option Term := if (invStx.getArg 5).getNumArgs == 2 then some ⟨(invStx.getArg 5).getArg 1⟩ else none
+    let pf? : Option Term := if (invStx.getArg 6).getNumArgs == 2 then some ⟨(invStx.getArg 6).getArg 1⟩ else none
     let rhs ← pf?.getDM `(by let _qed_hv := fun (_ : Unit) => $vCall; suffices ∀ u, ($vPred) (_qed_hv u) = true from this (); qedDischargeStyling _qed_hv $invId $(Syntax.mkStrLit predStr))
     elabCommand (← `(command| set_option linter.unusedSimpArgs false in theorem $invId:ident $[$viewBinders:bracketedBinder]* : ($vPred) $vCall = true := $rhs))
   let info ← mkBaseCompInfo spec .pureView needsProps
@@ -98,9 +111,35 @@ private def mkEnsuredExistentialWrap (ensConst : Name) (qaIds : Array Ident) (el
   return (← Qed.Lang.mkAppTerms (mkIdent ensConst) (qaIds.map (⟨·.raw⟩)),
           ← qaIds.foldrM (init := ← `(($elemVar:ident).ok)) fun qa acc => `(Exists.intro $qa $acc))
 
-private def mkCompQueriesCmd? (spec : ComponentSpec) : CommandElabM (Option CmdStx) := do
-  if spec.queries.isEmpty then return none
-  let qTerms ← spec.queries.mapM fun q => do
+@[noinline]
+private def mkHoistedKeyAndPropsFns (spec : ComponentSpec) (h : HoistedSub) : CommandElabM (Term × Term) := do
+  let keyFn : Term ← if h.hasLifecycle then
+      let kId := mkIdent (subKeyDefName spec.t.getId h)
+      if spec.hasProps then `(fun pm => match _getProps pm with | Option.none => "" | Option.some p => let pk := _getKey pm; if pk.isEmpty then "" else let hk := $kId p (_getState pm); if hk.isEmpty then "" else pk ++ "|" ++ hk)
+      else `(fun pm => let pk := _getKey pm; if pk.isEmpty then "" else let hk := $kId (_getState pm); if hk.isEmpty then "" else pk ++ "|" ++ hk)
+    else `(_getKey)
+  let propsFn : Term ← if h.info.hasProps then
+      if h.hasLifecycle then
+        let pId := mkIdent (subPropsDefName spec.t.getId h)
+        if spec.hasProps then `(fun pm => (_getProps pm).bind fun p => $pId p (_getState pm))
+        else `(fun pm => $pId (_getState pm))
+      else
+        let recT ← bindMentionedFields spec (mentionsIdent (← mkHoistedPropsTerm h).raw) (← mkHoistedPropsTerm h)
+        if spec.hasProps then `(fun pm => (_getProps pm).map fun p => let s := _getState pm; $recT)
+        else `(fun pm => let s := _getState pm; Option.some $recT)
+    else `(fun _ => Option.some ({} : $(mkIdent (h.info.fullName ++ `Props))))
+  return (keyFn, propsFn)
+
+private def mkAppendListExpr (ownTerms hoistedParts : Array Term) : CommandElabM Term := do
+  let base : Array Term ← if ownTerms.isEmpty then pure #[] else do pure #[← `([$[$ownTerms],*])]
+  match (base ++ hoistedParts).toList with
+  | [] => `([])
+  | p :: ps => ps.foldlM (init := p) fun acc x => `($acc ++ $x)
+
+@[noinline]
+private def mkCompQueriesCmds (spec : ComponentSpec) (isTopMount : Bool) : CommandElabM (Array CmdStx) := do
+  if !spec.hasAnyQueries then return #[]
+  let ownTerms ← spec.queries.mapM fun q => do
     let rspec := q.rpc; let reqTupleTy ← Qed.Lang.buildProdType (rspec.mInfo.paramTypeConsts.map fun n => (mkIdent n : Term))
     let fetchBody ← mkRpcQueryBranches spec rspec fun qaIds => do
       let cbTerm : Term ← if !rspec.hasMsgEnsured then `(_qgot _qk) else do
@@ -109,26 +148,65 @@ private def mkCompQueriesCmd? (spec : ComponentSpec) : CommandElabM (Option CmdS
         `(fun (_qr : Qed.Resource (Qed.Ensured $(q.ty) ($ensApp))) => _qgot _qk (_qr.map fun $qeId => ⟨($qeId:ident).val, $exPrf⟩))
       let qaTerms : Array Term := qaIds.map (⟨·.raw⟩)
       `(some $(← withRef rspec.rpcRef `(qedCheckRpcCall% $(mkIdentFrom rspec.rpcRef rspec.srvInfo.serverName):ident $(mkIdentFrom rspec.rpcRef (Name.mkSimple rspec.mInfo.name)):ident [$[$qaTerms:term],*] $cbTerm)))
-    `(Qed.Resource.rpcQuery (Req := $reqTupleTy) (params? := fun (s : $(spec.stateId)) => $(← mkRpcQueryParamsBody spec rspec))
+    let qCore ← `(Qed.Resource.rpcQuery (Req := $reqTupleTy) (params? := fun (s : $(spec.stateId)) => $(← mkRpcQueryParamsBody spec rspec))
         (fetch := fun (s : $(spec.stateId)) _qgot _qk => $fetchBody) (got := $(spec.msgCtor q.ctorName))
         (get := fun (s : $(spec.stateId)) => s.$(q.id):ident) (set := fun c (s : $(spec.stateId)) => { s with $(q.id):ident := c }))
-  return some (← `(command| set_option linter.unusedVariables false in def $(spec.id `queries) : List (Query $(spec.stateId) $(spec.msgId)) := [$[$qTerms],*]))
+    `(Qed.Query.liftWithProps _getKey _getProps _getState _setState _wrapMsg (fun (p : $(spec.propsId)) => $qCore))
+  let mut hoistedParts : Array Term := #[]
+  for h in spec.hoisted do
+    if h.info.hasQueries then
+      let (hkFn, hpFn) ← mkHoistedKeyAndPropsFns spec h; let subF := h.fieldId
+      hoistedParts := hoistedParts.push (← `($(mkIdent (h.info.fullName ++ `liftQueries)) $hkFn $hpFn
+        (fun pm => (_getState pm).$subF:ident) (fun cs pm => _setState { _getState pm with $subF:ident := cs } pm) (_wrapMsg ∘ $(spec.msgCtor h.ctorName))))
+  let listExpr ← mkAppendListExpr ownTerms hoistedParts
+  let mut cmds : Array CmdStx := #[← `(command|
+    set_option linter.unusedVariables false in
+    def $(spec.id `liftQueries) {PModel PMsg : Type} (_getKey : PModel → String) (_getProps : PModel → Option $(spec.propsId))
+        (_getState : PModel → $(spec.stateId)) (_setState : $(spec.stateId) → PModel → PModel) (_wrapMsg : $(spec.msgId) → PMsg) : List (Query PModel PMsg) :=
+      $listExpr)]
+  if isTopMount then
+    cmds := cmds.push (← `(command|
+      def $(spec.id `queries) : List (Query $(spec.stateId) $(spec.msgId)) :=
+        $(spec.id `liftQueries) (fun _ => "1") (fun _ => Option.some ({} : $(spec.propsId))) id (fun s _ => s) id))
+  return cmds
 
-private def mkCompSubscriptionsCmd? (spec : ComponentSpec) : CommandElabM (Option CmdStx) := do
-  if spec.subscriptions.isEmpty then return none
-  let subTerms ← spec.subscriptions.mapM fun sub => do
+@[noinline]
+private def mkCompSubscriptionsCmds (spec : ComponentSpec) (isTopMount : Bool) : CommandElabM (Array CmdStx) := do
+  if !spec.hasAnySubscriptions then return #[]
+  let ownTerms ← spec.subscriptions.mapM fun sub => do
     let (slotLit, msgCtor, recTerm) := (Syntax.mkStrLit sub.id.getId.toString, spec.msgCtor (sub.ctor "Msg"), ← liftMacroM <| sub.reconnect.toSyntaxTerm)
+    let slotId := mkIdent `_subSlot
     let openBody ← mkSubBranches spec sub (← `(none)) true fun qaIds => do
       let onMsgCb ← if !sub.hasMsgEnsured then `($msgCtor _wk) else do
         let some ensConst := sub.chInfo.ensPredConst | throwErrorAt sub.chanRef "internal: missing channel `ensures` predicate in `subscribe`"
         let weId := mkIdent `_we; let (ensApp, exPrf) ← mkEnsuredExistentialWrap ensConst qaIds weId
         `(fun ($weId : Qed.Ensured $(mkIdentFrom sub.chanRef sub.chInfo.eventTypeConst) ($ensApp)) => $msgCtor _wk ⟨($weId:ident).val, $exPrf⟩)
       let qaTerms : Array Term := qaIds.map (⟨·.raw⟩)
-      `(some $(← withRef sub.chanRef `(qedCheckChanSub% $(mkIdentFrom sub.chanRef sub.chInfo.fullName):ident [$[$qaTerms:term],*] $slotLit:str ($recTerm, $(spec.msgCtor (sub.ctor "Join")) _wk, $onMsgCb, $(spec.msgCtor (sub.ctor "Status")) _wk))))
-    `(Qed.Subscription.mk $slotLit $(mkIdent (subKeyFnName spec.t.getId sub))
-        (fun _wk (s : $(spec.stateId)) => $openBody) ($(mkIdentFrom sub.chanRef sub.chInfo.unsubHelperConst) $slotLit)
+      `(some $(← withRef sub.chanRef `(qedCheckChanSub% $(mkIdentFrom sub.chanRef sub.chInfo.fullName):ident [$[$qaTerms:term],*] $slotId:ident ($recTerm, $(spec.msgCtor (sub.ctor "Join")) _wk, $onMsgCb, $(spec.msgCtor (sub.ctor "Status")) _wk))))
+    let keyFnId := mkIdent (subKeyFnName spec.t.getId sub)
+    let childKeyFn : Term ← if spec.hasProps then `(fun (p : $(spec.propsId)) (s : $(spec.stateId)) => $keyFnId p s) else `(fun (_ : $(spec.propsId)) (s : $(spec.stateId)) => $keyFnId s)
+    `(Qed.Subscription.liftWithProps _getKey _getProps _getState _setState _wrapMsg
+        (_slotPfx ++ $slotLit) $childKeyFn
+        (fun ($slotId:ident : String) (p : $(spec.propsId)) _wk (s : $(spec.stateId)) => $openBody)
+        (fun ($slotId:ident : String) => $(mkIdentFrom sub.chanRef sub.chInfo.unsubHelperConst) $slotId)
         (fun (s : $(spec.stateId)) => { s with $(sub.id):ident := Qed.SocketStatus.disconnected }))
-  return some (← `(command| set_option linter.unusedVariables false in def $(spec.id `subscriptions) : List (Qed.Subscription $(spec.stateId) $(spec.msgId)) := [$[$subTerms],*]))
+  let mut hoistedParts : Array Term := #[]
+  for h in spec.hoisted do
+    if h.info.hasSubscriptions then
+      let (hkFn, hpFn) ← mkHoistedKeyAndPropsFns spec h; let subF := h.fieldId; let pfxSeg := Syntax.mkStrLit s!"{subF.getId}."
+      hoistedParts := hoistedParts.push (← `($(mkIdent (h.info.fullName ++ `liftSubscriptions)) (_slotPfx ++ $pfxSeg) $hkFn $hpFn
+        (fun pm => (_getState pm).$subF:ident) (fun cs pm => _setState { _getState pm with $subF:ident := cs } pm) (_wrapMsg ∘ $(spec.msgCtor h.ctorName))))
+  let listExpr ← mkAppendListExpr ownTerms hoistedParts
+  let mut cmds : Array CmdStx := #[← `(command|
+    set_option linter.unusedVariables false in
+    def $(spec.id `liftSubscriptions) {PModel PMsg : Type} (_slotPfx : String) (_getKey : PModel → String) (_getProps : PModel → Option $(spec.propsId))
+        (_getState : PModel → $(spec.stateId)) (_setState : $(spec.stateId) → PModel → PModel) (_wrapMsg : $(spec.msgId) → PMsg) : List (Qed.Subscription PModel PMsg) :=
+      $listExpr)]
+  if isTopMount then
+    cmds := cmds.push (← `(command|
+      def $(spec.id `subscriptions) : List (Qed.Subscription $(spec.stateId) $(spec.msgId)) :=
+        $(spec.id `liftSubscriptions) "" (fun _ => "1") (fun _ => Option.some ({} : $(spec.propsId))) id (fun s _ => s) id))
+  return cmds
 
 private def mkSpecStepPf (sVar mVar : Ident) : List Ident → Term → CommandElabM Term
   | [], _ => `(trivial) | [id0], hTerm => `(($id0:ident).2 $sVar $mVar $hTerm)
@@ -164,7 +242,7 @@ private def mkSpecAppCmds (spec : ComponentSpec) (finalApp : Term) (compInv? : O
         (← `(Qed.Internal.App.withSpeculative_init_coherent $clsId $baseId)) (← `(Qed.Internal.App.withSpeculative_step_coherent $clsId $baseId)))
     ++ (← mkSpecPropPair spec "wellFormedIds" (← `(Qed.SpecEngine.WellFormedIds))
         (← `(Qed.Internal.App.withSpeculative_init_wellFormedIds $clsId $baseId)) (← `(Qed.Internal.App.withSpeculative_step_wellFormedIds $clsId $baseId)))
-  if spec.queries.isEmpty && spec.subscriptions.isEmpty then
+  if !spec.hasAnyQueries && !spec.hasAnySubscriptions then
     if let (some inv, some invIds) := (compInv?, stateInvEntries.foldl (init := some #[]) fun acc (_, id?) => match acc, id? with | some arr, some id => some (arr.push id) | _, _ => none) then
       if !invIds.isEmpty then
         let initPf ← match invIds.toList with | id0 :: rest => rest.foldlM (init := ← `(($id0:ident).1)) fun acc id => `(And.intro $acc ($id:ident).1) | [] => `(trivial)
@@ -238,8 +316,8 @@ private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool
   if !spec.stylesheets.isEmpty then appT ← `(Qed.Internal.App.withStylesheets [$(spec.stylesheets.map Syntax.mkStrLit):str,*] $appT)
   appT ← if spec.ephemeralFields.isEmpty then `(qedInternalAutoDehydrate% $(spec.initId) $appT)
          else `(Qed.Internal.App.withDehydrate (Dehydrate.except $(spec.initId) [$[$spec.ephemeralFields:ident],*]) $appT)
-  if !spec.queries.isEmpty then appT ← `(Qed.Internal.App.withQueries $(spec.id `queries) $appT)
-  if !spec.subscriptions.isEmpty then appT ← `(Qed.Internal.App.withSubscriptions $(spec.id `subscriptions) $appT)
+  if spec.hasAnyQueries then appT ← `(Qed.Internal.App.withQueries $(spec.id `queries) $appT)
+  if spec.hasAnySubscriptions then appT ← `(Qed.Internal.App.withSubscriptions $(spec.id `subscriptions) $appT)
   if spec.headClause?.isSome then let hId := spec.id `headInfo; appT ← `(Qed.App.withSsrStatus (fun _s => ($hId _s).2) (Qed.App.withHead (fun _s => ($hId _s).1) $appT))
   let stateInvPreds := stateInvEntries.map (·.1)
   let compInv? : Option Term ← if stateInvPreds.isEmpty then pure none
@@ -260,8 +338,19 @@ private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (i
     let pBinders ← mkPropsBinders spec
     let subStarts ← hoistedStarts.mapM fun h => do
       let cStart := mkIdent (h.info.fullName ++ `startCmd)
-      let call ← if h.info.hasProps then `($cStart $(← mkHoistedPropsTerm h)) else `($cStart)
-      `(Cmd.map $(spec.msgCtor h.ctorName) $call)
+      let pfxLit := Syntax.mkStrLit s!"{h.fieldId.getId}."
+      let subCtor := spec.msgCtor h.ctorName
+      if h.hasLifecycle then
+        let kId := mkIdent (subKeyDefName spec.t.getId h)
+        let kCall ← if spec.hasProps then `($kId p s) else `($kId s)
+        if h.info.hasProps then
+          let pId := mkIdent (subPropsDefName spec.t.getId h)
+          let pCall ← if spec.hasProps then `($pId p s) else `($pId s)
+          `(if ($kCall).isEmpty then Qed.Cmd.none else match $pCall:term with | Option.none => Qed.Cmd.none | Option.some _cp => Cmd.mapScoped $pfxLit $subCtor ($cStart _cp))
+        else `(if ($kCall).isEmpty then Qed.Cmd.none else Cmd.mapScoped $pfxLit $subCtor $cStart)
+      else
+        let call ← if h.info.hasProps then `($cStart $(← mkHoistedPropsTerm h)) else `($cStart)
+        `(Cmd.mapScoped $pfxLit $subCtor $call)
     let mut startBody ← mkCmdBatch (starts' ++ subStarts)
     if spec.mountable then
       startBody ← bindMentionedFields spec (mentionsIdent startBody.raw) startBody
@@ -295,23 +384,30 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
     match sub.chInfo.kind with | .fullstack _ srvShort _ => pushUnique a (srvShort, sub.chInfo.channelName) | _ => a
   let allUsedChannels := acc.hoisted.foldl (fun a h => h.info.usedChannels.foldl pushUnique a) ownChans
   let eventNames := rawSpec.events.map (·.id.getId)
+  let specWithRwFns := { rawSpec with fns := rw.fns, subscriptions := rw.subscriptions }
+  let pureMut := specWithRwFns.pureMutFnNames
   let ownHasEffects := !rw.starts.isEmpty || !rawSpec.portOuts.isEmpty || !rawSpec.portIns.isEmpty ||
     !rawSpec.queries.isEmpty || !rawSpec.subscriptions.isEmpty || !acc.specResolves.isEmpty ||
-    acc.sites.any (fun s => s.stmts?.any (·.any (hasEffectStmt eventNames))) ||
-    (rw.route?.any fun rd => rd.alts.any (hasEffectStmt eventNames)) || acc.hoisted.any (·.info.hasEffects)
-  let spec ← elabStructsAndResolveTypes {
-    rawSpec with route? := rw.route?, hasEffects := ownHasEffects, usedRpcs := allUsedRpcs, usedChannels := allUsedChannels,
-                 specDispatches := acc.specDispatches, specNodes := acc.specNodes, specResolves := acc.specResolves
+    acc.sites.any (fun s => s.stmts?.any (·.any (hasEffectStmt eventNames · pureMut))) ||
+    rw.fns.any (fun f => f.isMut && f.stmts.any (hasEffectStmt eventNames · pureMut)) ||
+    (rw.route?.any fun rd => rd.alts.any (hasEffectStmt eventNames · pureMut)) || acc.hoisted.any (·.info.hasEffects)
+  let spec ← elabStructsAndResolveTypes { specWithRwFns with
+    route? := rw.route?, hasEffects := ownHasEffects, usedRpcs := allUsedRpcs, usedChannels := allUsedChannels,
+    specDispatches := acc.specDispatches, specNodes := acc.specNodes, specResolves := acc.specResolves
   } acc.hoisted acc.formDrafts acc.resetForms
   currentCompSessionRef.set spec.sessionField?
   let errsBefore ← getErrorCount
+  if !spec.pureFns.isEmpty then
+    let fieldTys := (spec.states ++ spec.props).map fun d => (d.id.getId, d.ty)
+    (← mkPureCompFnCmds spec fieldTys).forM elabCommand
   (← mkViewCmds spec rw.body (← mkMsgAndUpdateCmds spec acc.sites)).forM elabCommand
   let (mountCmds, hasStart, hasLocalDef) ← mkCodecAndMountCmds spec rw.starts (Syntax.mkStrLit compNs.toString)
   mountCmds.forM elabCommand
   let isTopMount := spec.mountable && spec.outTy?.isNone && !spec.hasProps && !spec.hasSlotsOrKids
+  (← mkCompQueriesCmds spec isTopMount).forM elabCommand
+  (← mkCompSubscriptionsCmds spec isTopMount).forM elabCommand
   if isTopMount then
-    for cmd? in #[← mkCompQueriesCmd? spec, ← mkCompSubscriptionsCmd? spec, ← mkCompHeadCmd? spec] do
-      if let some c := cmd? then elabCommand c
+    if let some c ← mkCompHeadCmd? spec then elabCommand c
     (← mkSpecClassifyCmds spec).forM elabCommand
   let stateInvEntries ← withOpenNs compNs (elabInlineInvariantsPhase spec false)
   let activeInvEntries := if (← getErrorCount) == errsBefore then stateInvEntries else #[]
@@ -328,7 +424,8 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
   let baseInfo ← mkBaseCompInfo spec .stateful spec.hasProps
   modifyEnv fun env => componentRegistry.addEntry env { baseInfo with
     hasOut := spec.outTy?.isSome, hasEffects := spec.hasEffects, hasStart, mountable := spec.mountable,
-    hasLocalDef, usedRpcs := allUsedRpcs, usedChannels := allUsedChannels }
+    hasLocalDef, hasQueries := spec.hasAnyQueries, hasSubscriptions := spec.hasAnySubscriptions,
+    usedRpcs := allUsedRpcs, usedChannels := allUsedChannels }
 
 @[command_elab componentCmd] def elabComponentCmd : CommandElab := fun stx => do
   let (savedEnv, errsInit, priorTasks) := (← getEnv, ← getErrorCount, (← get).snapshotTasks.size)
@@ -341,7 +438,8 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
       withOpenNs compNs do
         let sNameId : Ident := ⟨stCl.getArg 1⟩
         Qed.StyleDsl.elabStyleDef none (mkIdentFrom sNameId (rawSpec.t.getId ++ sNameId.getId))
-          (Qed.StyleDsl.extractStyleExtends (stCl.getArg 2)) ((stCl.getArg 3).getNumArgs == 1) (stCl.getArg 5).getArgs
+          (Qed.StyleDsl.extractStyleExtends (stCl.getArg 2)) ((stCl.getArg 3).getNumArgs == 1)
+          (stCl.getArg 6).getArgs (Qed.StyleDsl.extractOptChild (stCl.getArg 4))
     withOpenNs compNs (elabStatefulComponentBody compNs rawSpec)
     okRef.set true
   finally

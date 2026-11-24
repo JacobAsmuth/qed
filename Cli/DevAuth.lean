@@ -130,6 +130,6 @@ def runDevAuthServer (port : UInt16) : IO UInt32 := do
                  else return if req.keepAlive then .needBodyKeep req.contentLen req else .needBodyClose req.contentLen req
   let onWsBytes (_ : Unit) (rx : ByteArray) (frag : Unit) (_ : Array (Nat × String × ByteArray)) :=
     pure { consumed := rx.size, outWire := ByteArray.empty, closeFlag := 1, fragState := frag, subOps := #[] : Prim.WsStepOut Unit }
-  Prim.serveNative "127.0.0.1" port 1 () onHead dispatchReq onWsBytes (fun _ _ _ => pure ())
+  Prim.serveNative "127.0.0.1" port 1 () onHead dispatchReq onWsBytes (fun _ _ _ => pure ()) none
 
 end Qed.Cli.DevAuth

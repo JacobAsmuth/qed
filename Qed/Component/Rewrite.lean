@@ -10,7 +10,7 @@ open Lean Elab Command Qed.Lang
 
 syntax (name := qedCheckRpcCallTerm) "qedCheckRpcCall% " ident ident "[" term,* "]" term : term
 syntax (name := qedCheckPredictTerm) "qedCheckPredict% " ident ident "[" term,* "]" term : term
-syntax (name := qedCheckChanSubTerm) "qedCheckChanSub% " ident "[" term,* "]" str "(" term "," term "," term "," term ")" : term
+syntax (name := qedCheckChanSubTerm) "qedCheckChanSub% " ident "[" term,* "]" term:max "(" term "," term "," term "," term ")" : term
 syntax (name := qedCheckChanSendTerm) "qedCheckChanSend% " ident "[" term,* "]" str : term
 
 /-! ## Component Spec Structures & Rewriting -/
@@ -19,7 +19,21 @@ structure FieldDecl where mk :: (id : Ident) (ty? def? : Option Term := none) (t
 structure EventDecl where mk :: (id : Ident) (params : Array (Ident × Term))
 structure SlotDecl  where mk :: (id : Ident) (def? : Option Term)
 structure RouteDecl where mk :: (field : Ident) (ty init : Term) (alts : Array Syntax)
-structure HoistedSub where mk :: (fieldId : Ident) (ctorName : Name) (info : ComponentInfo) (dataProps : Array (Ident × Term)) (outArms : Array OutArm)
+structure CompFnDecl where mk ::
+  (id : Ident) (params : Array (Ident × Term)) (retTy? : Option Term := none)
+  (stmts : Array Syntax := #[]) (capturedFields : Array Name := #[])
+def CompFnDecl.isPure (f : CompFnDecl) : Bool := f.retTy?.isSome
+def CompFnDecl.isMut  (f : CompFnDecl) : Bool := f.retTy?.isNone
+
+inductive ViewGuard where
+  | ifCond (cond : Syntax) (isThen : Bool)
+  | ifLet (pat scrut : Syntax) (isThen : Bool)
+  | matchArm (scruts : Array Syntax) (allArmPats : Array (Array Syntax)) (activeIdx : Nat)
+
+structure HoistedSub where mk ::
+  (fieldId : Ident) (ctorName : Name) (info : ComponentInfo) (dataProps : Array (Ident × Term))
+  (outArms : Array OutArm) (keyExpr? : Option Term := none) (guards : Array ViewGuard := #[])
+def HoistedSub.hasLifecycle (h : HoistedSub) : Bool := h.keyExpr?.isSome || !h.guards.isEmpty
 structure ResetFormSub where mk :: (ctorName : Name) (draftField : Ident) (schemaName : Name) (parseCall resetCond handler : Term)
 structure SetSite where mk :: (key : String) (ctor : Name) (params : Array (Ident × Term) := #[]) (assigns : Array (Name × Option Term) := #[]) (send? : Option Term := none) (stmts? : Option (Array Syntax) := none)
 structure PortOutDecl where mk :: (id : Ident) (ty : Term)
@@ -66,6 +80,7 @@ structure ComponentSpec where mk ::
   (ephemeralFields : Array Ident := #[]) (slots : Array SlotDecl := #[]) (hasChildren : Bool := false)
   (events : Array EventDecl := #[]) (keyF? sessionField? : Option Ident := none) (outTy? : Option Term := none)
   (route? : Option RouteDecl := none) (starts actions invariants styles : Array Syntax := #[])
+  (fns : Array CompFnDecl := #[])
   (portOuts : Array PortOutDecl := #[]) (portIns : Array PortInDecl := #[])
   (queries : Array QueryDecl := #[]) (subscriptions : Array SubDecl := #[])
   (body : Syntax := .missing) (hoisted : Array HoistedSub := #[]) (resetForms : Array ResetFormSub := #[])
@@ -73,8 +88,16 @@ structure ComponentSpec where mk ::
   (stylesheets : Array String := #[]) (themes : Array Ident := #[]) (headClause? : Option Syntax := none)
   (specDispatches : Array SpecDispatchArm := #[]) (specNodes : Array SpecDispatchNode := #[]) (specResolves : Array SpecResolveSite := #[])
 
-def ComponentSpec.hasProps       (s : ComponentSpec) : Bool := !s.props.isEmpty || !s.binds.isEmpty
-def ComponentSpec.hasSpeculative (s : ComponentSpec) : Bool := !s.specResolves.isEmpty
+def ComponentSpec.hasProps            (s : ComponentSpec) : Bool := !s.props.isEmpty || !s.binds.isEmpty
+def ComponentSpec.hasSpeculative      (s : ComponentSpec) : Bool := !s.specResolves.isEmpty
+def ComponentSpec.hasAnyQueries       (s : ComponentSpec) : Bool := !s.queries.isEmpty || s.hoisted.any (·.info.hasQueries)
+def ComponentSpec.hasAnySubscriptions (s : ComponentSpec) : Bool := !s.subscriptions.isEmpty || s.hoisted.any (·.info.hasSubscriptions)
+def ComponentSpec.pureFns             (s : ComponentSpec) : Array CompFnDecl := s.fns.filter CompFnDecl.isPure
+def ComponentSpec.mutFns              (s : ComponentSpec) : Array CompFnDecl := s.fns.filter CompFnDecl.isMut
+def ComponentSpec.pureMutFnNames      (s : ComponentSpec) : Array Name :=
+  let evNames := s.events.map (·.id.getId)
+  s.mutFns.foldl (init := #[]) fun acc f =>
+    if f.stmts.any (hasEffectStmt evNames · acc) then acc else acc.push f.id.getId.eraseMacroScopes
 def ComponentSpec.fieldNames     (s : ComponentSpec) : Array Name := s.states.map (·.id.getId)
 def ComponentSpec.propNames      (s : ComponentSpec) : Array Name := s.props.map (·.id.getId)
 def ComponentSpec.bindNames      (s : ComponentSpec) : Array Name := s.binds.map (·.id.getId)
@@ -159,7 +182,7 @@ structure RewriteAccum where mk ::
 
 structure RewriteCtx where mk ::
   (spec : ComponentSpec) (isPureComp : Bool) (inPerform : Bool := false) (allowHoist : Bool := false)
-  (wrapMsg? : Option Ident := none) (accum : IO.Ref RewriteAccum)
+  (wrapMsg? : Option Ident := none) (guards : Array ViewGuard := #[]) (accum : IO.Ref RewriteAccum)
 
 def RewriteCtx.stateFields (c : RewriteCtx) : Array Name := if c.isPureComp then #[] else c.spec.fieldNames
 private def RewriteCtx.hasEv      (c : RewriteCtx) (n : Name) : Bool := !c.isPureComp && c.spec.events.any (·.id.getId == n)
@@ -168,7 +191,7 @@ private def RewriteCtx.hasPortOut (c : RewriteCtx) (n : Name) : Bool := !c.isPur
 private def RewriteCtx.hasAct     (c : RewriteCtx) (n : Name) : Bool := !c.isPureComp && (c.spec.actions.any (·[1].getId == n) || c.spec.portIns.any (·.id.getId == n))
 
 def mkRewriteCtx (spec : ComponentSpec) (isPureComp : Bool) (allowHoist : Bool := false) : CommandElabM RewriteCtx := do
-  return .mk spec isPureComp false allowHoist none (← IO.mkRef {})
+  return .mk spec isPureComp false allowHoist none #[] (← IO.mkRef {})
 
 def registerSite (accum : IO.Ref RewriteAccum) (assigns : Array (Name × Option Term)) (send? : Option Term) : CommandElabM Name := do
   let pp : Option Term → String := fun | some e => e.raw.reprint.getD (toString e.raw) | none => "_"
@@ -323,10 +346,14 @@ private def rewriteHoistedChild (ctx : RewriteCtx) (inLambda : Bool) (stx : Synt
     throwErrorAt stx s!"<{tag}> uses effects, `Html` props, `children`, or `bind:` and cannot be dynamically mounted inside a loop lambda; hoist its state into the parent or use `collection`"
   let subName := Name.mkSimple s!"_sub_{(← ctx.accum.get).hoisted.size}"; let subFieldId := mkIdentFrom stx subName
   let mut dataProps : Array (Ident × Term) := #[]; let mut outArms : Array OutArm := #[]; let mut keptAttrs : Array Syntax := #[]
+  let mut keyExpr? : Option Term := none
   for a in rewrittenAttrs do
     if let some (nameRef, aname, valNode) := matchNamedAttr? a then
       let vT : Term ← if valNode.getNumArgs == 0 then `(Bool.true) else expandAttrValM valNode (← `(""))
-      if let some ev := cInfo.events.find? (·.name.toString == aname) then outArms := outArms.push (.mk ev.name ev.arity vT)
+      if aname == "key" then
+        keyExpr? := some vT
+        keptAttrs := keptAttrs.push a
+      else if let some ev := cInfo.events.find? (·.name.toString == aname) then outArms := outArms.push (.mk ev.name ev.arity vT)
       else if let some (bStr, valPart, setPart) ← liftMacroM (unpackBindProp aname vT) then
         let bNm := Name.mkSimple bStr
         dataProps := dataProps.push (mkIdentFrom nameRef bNm, valPart)
@@ -336,7 +363,7 @@ private def rewriteHoistedChild (ctx : RewriteCtx) (inLambda : Bool) (stx : Synt
         if cInfo.propNames.contains pId.getId then dataProps := dataProps.push (pId, vT)
         keptAttrs := keptAttrs.push a
     else keptAttrs := keptAttrs.push a
-  ctx.accum.modify fun a => { a with hoisted := a.hoisted.push (.mk subFieldId subName cInfo dataProps outArms) }
+  ctx.accum.modify fun a => { a with hoisted := a.hoisted.push (.mk subFieldId subName cInfo dataProps outArms keyExpr? ctx.guards) }
   let subRoute ← wrapMsgArity ctx.wrapMsg? 1 ⟨ctx.spec.msgCtor subName⟩
   return some (rebuildJsxEl stx (keptAttrs.push (mkJsxAttrExpr "_hoist" (← `(($subRoute, $subFieldId))))) kids?)
 
@@ -423,9 +450,47 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
           if (← liftCoreM getEnv).contains (cInfo.fullName ++ `keyOf) then
             bodyRewritten ← injectAutoKey bodyRewritten cInfo.fullName ⟨patStx.getArg 0⟩
     return Syntax.node .none k #[stx.getArg 0, patStx, stx.getArg 2, collRewritten, stx.getArg 4, bodyRewritten]
+  else if k == ``qedExprIf then
+    let cond' ← rewriteIn ctx inLambda (stx.getArg 1)
+    let then' ← rewriteIn { ctx with guards := ctx.guards.push (.ifCond cond' true) } inLambda (stx.getArg 3)
+    let optE := stx.getArg 4
+    let optE' ← if optE.getNumArgs == 3 then
+        let e' ← rewriteIn { ctx with guards := ctx.guards.push (.ifCond cond' false) } inLambda (optE.getArg 2)
+        pure (setStxArg optE 2 e')
+      else pure optE
+    return Syntax.node stx.getHeadInfo k #[stx.getArg 0, cond', stx.getArg 2, then', optE']
+  else if k == ``qedTernary then
+    let cond' ← rewriteIn ctx inLambda (stx.getArg 2)
+    let then' ← rewriteIn { ctx with guards := ctx.guards.push (.ifCond cond' true) } inLambda (stx.getArg 0)
+    let optE := stx.getArg 3
+    let optE' ← if optE.getNumArgs == 2 then
+        let e' ← rewriteIn { ctx with guards := ctx.guards.push (.ifCond cond' false) } inLambda (optE.getArg 1)
+        pure (setStxArg optE 1 e')
+      else pure optE
+    return Syntax.node stx.getHeadInfo k #[then', stx.getArg 1, cond', optE']
+  else if k == ``qedExprIfLet then
+    let pat := stx.getArg 2; let scrut' ← rewriteIn ctx inLambda (stx.getArg 4)
+    let then' ← rewriteIn { ctx with guards := ctx.guards.push (.ifLet pat scrut' true) } inLambda (stx.getArg 6)
+    let optE := stx.getArg 7
+    let optE' ← if optE.getNumArgs == 3 then
+        let e' ← rewriteIn { ctx with guards := ctx.guards.push (.ifLet pat scrut' false) } inLambda (optE.getArg 2)
+        pure (setStxArg optE 2 e')
+      else pure optE
+    return Syntax.node stx.getHeadInfo k #[stx.getArg 0, stx.getArg 1, pat, stx.getArg 3, scrut', stx.getArg 5, then', optE']
+  else if k == ``qedExprMatch then
+    let scrutsNode := stx.getArg 1
+    let scrutsNode' ← rewriteIn ctx inLambda scrutsNode
+    let scrutsRewritten := scrutsNode'.getSepArgs
+    let casesNode := stx.getArg 3
+    let rawCases := casesNode.getArgs
+    let allArmPats := rawCases.map fun c => (c.getArg 1).getSepArgs
+    let cases' ← rawCases.zipIdx.mapM fun (c, idx) => do
+      let b' ← rewriteIn { ctx with guards := ctx.guards.push (.matchArm scrutsRewritten allArmPats idx) } inLambda (c.getArg 3)
+      pure (setStxArg c 3 b')
+    return Syntax.node stx.getHeadInfo k #[stx.getArg 0, scrutsNode', stx.getArg 2, Syntax.node casesNode.getHeadInfo casesNode.getKind cases']
   else if k == ``qedStmtExpr then
     let e := stx.getArg 0
-    let isHandleOrPush := isCollMutExpr e || match matchIdentMethodCall? e with
+    let isHandleOrPush := isCollMutExpr e || isPlainCallTo (ctx.spec.mutFns.map (·.id.getId.eraseMacroScopes)) e || match matchIdentMethodCall? e with
       | some (id, "emit", _) => ctx.hasEv id.getId.eraseMacroScopes
       | some (id, "send", _) => let nm := id.getId.eraseMacroScopes; ctx.hasSub nm || ctx.hasPortOut nm
       | _ => false
@@ -445,6 +510,14 @@ partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : Comm
         if ctx.allowHoist && ctx.hasEv evId.getId.eraseMacroScopes then
           return mkRawExpr (← mkSiteExpr ctx #[] (some (← lowerEmitCall stx evId rawArgs)))
     | _ => pure ()
+    if (stx.getArg 0).getKind == ``qedIdent then
+      let calleeId : Ident := ⟨(stx.getArg 0).getArg 0⟩
+      let cn := calleeId.getId.eraseMacroScopes
+      if let some pfn := ctx.spec.pureFns.find? (·.id.getId.eraseMacroScopes == cn) then
+        let argTs ← lowerPosCallArgs stx s!"{cn}(...)" (some pfn.params.size) (stx.getArg 2).getSepArgs
+          (fun e => do lowerCompExpr .val (← rewriteIn ctx inLambda e))
+        let capTs : Array Term := pfn.capturedFields.map fun fn => ⟨(mkIdentFrom calleeId fn).raw⟩
+        return mkRawExpr (← Qed.Lang.mkAppTerms (mkIdentFrom calleeId (ctx.spec.t.getId ++ pfn.id.getId)) (capTs ++ argTs))
     return Syntax.node stx.getHeadInfo k (← stx.getArgs.mapM (rewriteIn ctx inLambda))
   else if k == ``Qed.Jsx.attrValAssign then
     let more := (stx.getArg 4).getArgs.map fun m =>
@@ -594,6 +667,11 @@ private def parseCompClause (acc : ComponentSpec) (cl : Syntax) : CommandElabM C
       return { acc with stylesheets := acc.stylesheets.push normPath }
   | `Qed.compThemeClause => return { acc with themes := acc.themes.push ⟨cl.getArg 1⟩ }
   | `Qed.compHeadClause  => rejectDup cl acc.headClause?.isSome "duplicate `head:` clause in component"; return { acc with headClause? := some cl }
+  | `Qed.compFnClause =>
+      let fnId : Ident := ⟨cl.getArg 1⟩
+      let params ← parseParamList (cl.getArg 2)
+      let retTy? ← if (cl.getArg 3).getNumArgs == 2 then some <$> lowerTypeStx ((cl.getArg 3).getArg 1) else pure none
+      return { acc with fns := acc.fns.push (.mk fnId params retTy? (suiteStmts (cl.getArg 5)) #[]) }
   | `Qed.compActionClause => return { acc with actions := acc.actions.push cl }
   | `Qed.compInvariantClause | `Qed.compForEachInvClause | `Qed.compExampleClause => return { acc with invariants := acc.invariants.push cl }
   | _ => return acc
@@ -617,19 +695,40 @@ def parseComponentSpec (stx : Syntax) : CommandElabM ComponentSpec := do
     return { f with def? }
   let fieldNames := resolvedStates.map (·.id.getId)
   let allDeclNames := fieldNames ++ acc.props.map (·.id.getId) ++ acc.binds.map (·.id.getId) ++
-    acc.slots.map (·.id.getId) ++ acc.events.map (·.id.getId) ++ acc.portOuts.map (·.id.getId)
+    acc.slots.map (·.id.getId) ++ acc.events.map (·.id.getId) ++ acc.portOuts.map (·.id.getId) ++ acc.fns.map (·.id.getId)
   discard <| allDeclNames.foldlM (init := (#[] : Array Name)) fun seen dn => do
-    if seen.contains dn then throwErrorAt t s!"duplicate declaration name `{dn}` in component `{t.getId}`; state fields, props, binds, events, and ports must have distinct names"
+    if seen.contains dn then throwErrorAt t s!"duplicate declaration name `{dn}` in component `{t.getId}`; state fields, props, binds, events, ports, and `fn` helpers must have distinct names"
     return seen.push dn
+  let actionNames := acc.actions.map (·[1].getId) ++ acc.portIns.map (·.id.getId)
+  for f in acc.fns do
+    if actionNames.contains f.id.getId then
+      throwErrorAt f.id s!"`fn {f.id.getId}` conflicts with action/port `{f.id.getId}` in component `{t.getId}`"
   let outTy? : Option Term := if !acc.events.isEmpty || !acc.binds.isEmpty then some (mkIdent (t.getId ++ `Out)) else none
   if let some kf := acc.keyF? then
     unless fieldNames.contains kf.getId.eraseMacroScopes do throwErrorAt kf s!"`key {kf.getId}`: `{kf.getId}` is not a `state` field of `{t.getId}` ({formatStateFieldList fieldNames})"
     if outTy?.isSome then throwErrorAt kf "`key` marks the row identity for parent-owned use, and a parent-owned child's `event` output would have no receiver; drop one of the two"
+  let baseAllNames := (fieldNames ++ acc.props.map (·.id.getId) ++ acc.binds.map (·.id.getId)).toList.eraseDups.toArray
+  let mut resolvedFns : Array CompFnDecl := #[]
+  for f in acc.fns do
+    if f.isPure then
+      let pNames := f.params.map (·.1.getId.eraseMacroScopes)
+      let mut caps := baseAllNames.filter fun n => !pNames.contains n && f.stmts.any (mentionsIdent · n)
+      for prev in resolvedFns do
+        if prev.isPure && f.stmts.any (mentionsIdent · prev.id.getId.eraseMacroScopes) then
+          for c in prev.capturedFields do
+            if !pNames.contains c then caps := pushUnique caps c
+      resolvedFns := resolvedFns.push { f with capturedFields := caps }
+    else resolvedFns := resolvedFns.push f
   let spec : ComponentSpec := { acc with
-    states := resolvedStates, hasChildren := !allDeclNames.contains `children && hasFreeIdent `children bodyStx,
+    states := resolvedStates, fns := resolvedFns,
+    hasChildren := !allDeclNames.contains `children && hasFreeIdent `children bodyStx,
     outTy?, invariants := acc.invariants ++ (stx.getArg 8).getArgs }
-  if let some q0 := spec.queries[0]? then checkTopLevelMountable spec q0.id s!"reactive `query {q0.id.getId}`"
-  else if let some s0 := spec.subscriptions[0]? then checkTopLevelMountable spec s0.id s!"reactive `subscribe {s0.id.getId}`"
+  let uninit := spec.states.filter (·.def?.isNone)
+  if !uninit.isEmpty then
+    if let some q0 := spec.queries[0]? then
+      throwErrorAt q0.id s!"reactive `query {q0.id.getId}` requires all `state` fields on `{spec.t.getId}` to have default values"
+    else if let some s0 := spec.subscriptions[0]? then
+      throwErrorAt s0.id s!"reactive `subscribe {s0.id.getId}` requires all `state` fields on `{spec.t.getId}` to have default values"
   return spec
 
 def bindMentionedFields (spec : ComponentSpec) (shouldBind : Name → Bool) (body : Term) : CommandElabM Term := do

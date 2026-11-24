@@ -162,7 +162,7 @@ impl WorkerInbox {
     fn drain_wake(&self) { self.wake_fd.drain(); self.wake_pending.store(false, Ordering::SeqCst); }
 }
 
-struct Callbacks { init_frag: LeanRef, on_head: LeanRef, on_body: LeanRef, on_ws_bytes: LeanRef, on_ws_leave: LeanRef }
+struct Callbacks { init_frag: LeanRef, on_head: LeanRef, on_body: LeanRef, on_ws_bytes: LeanRef, on_ws_leave: LeanRef, on_ws_project: Option<LeanRef> }
 enum PoolJob {
     Head { token: u64, head_ba: LeanRef, ip: LeanRef, inbox: Arc<WorkerInbox> },
     Body { token: u64, req: LeanRef, body: LeanRef, ip: LeanRef, keep_alive: bool, inbox: Arc<WorkerInbox> },
@@ -580,7 +580,24 @@ impl Worker {
         for msg in bcast.drain(..) {
             for &(token, sid) in self.topics.get(&msg.topic).into_iter().flatten() {
                 if let Some(c) = self.conns.get_mut(token) {
-                    if c.is_ws && !c.close_after_tx && !c.send_ws_event(&self.poller, sid, &msg.payload) { c.close_after_tx = true; to_close.push(token); }
+                    if !c.is_ws || c.close_after_tx { continue; }
+                    let sent = if let Some(proj_fn) = &self.cbs.on_ws_project {
+                        let (Some(ws_ctx), Some(sub)) = (c.ws_ctx.as_ref(), c.subs.iter().find(|s| s.sub_id == sid)) else { continue };
+                        unsafe {
+                            let out = lean_apply_4(proj_fn.clone_ptr(), ws_ctx.clone_ptr(), mk_str(&sub.channel), mk_ba(&sub.params), mk_ba(&msg.payload));
+                            let ok = if qed_lean_obj_tag(out) == 0 {
+                                c.send_ws_event(&self.poller, sid, &msg.payload)
+                            } else {
+                                let inner = qed_lean_ctor_get(out, 0);
+                                if qed_lean_obj_tag(inner) == 1 { c.send_ws_event(&self.poller, sid, ba_slice(qed_lean_ctor_get(inner, 0))) } else { true }
+                            };
+                            qed_lean_dec(out);
+                            ok
+                        }
+                    } else {
+                        c.send_ws_event(&self.poller, sid, &msg.payload)
+                    };
+                    if !sent { c.close_after_tx = true; to_close.push(token); }
                 }
             }
         }
@@ -755,7 +772,7 @@ ffi_export! {
     };
     qed_server_run(
         host_obj: *mut LeanObj, port_in: u16, num_workers_in: u32,
-        init_frag: *mut LeanObj, on_head: *mut LeanObj, on_body: *mut LeanObj, on_ws_bytes: *mut LeanObj, on_ws_leave: *mut LeanObj,
+        init_frag: *mut LeanObj, on_head: *mut LeanObj, on_body: *mut LeanObj, on_ws_bytes: *mut LeanObj, on_ws_leave: *mut LeanObj, on_ws_project_opt: *mut LeanObj,
     ) => {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -770,16 +787,27 @@ ffi_export! {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("✗ {e}");
-                for obj in [init_frag, on_head, on_body, on_ws_bytes, on_ws_leave] { qed_lean_dec(obj); }
+                for obj in [init_frag, on_head, on_body, on_ws_bytes, on_ws_leave, on_ws_project_opt] { qed_lean_dec(obj); }
                 return qed_lean_io_mk_ok(qed_lean_box_u32(1));
             }
         };
 
         let per_worker_threads = env_parse::<usize>("QED_BLOCKING_THREADS").map(|n| n.clamp(1, 256).div_ceil(num_workers as usize).max(1))
             .unwrap_or_else(|| (64usize / (num_workers as usize).max(1)).clamp(2, 4));
+        let on_ws_project = if qed_lean_obj_tag(on_ws_project_opt) == 1 {
+            let f = qed_lean_ctor_get(on_ws_project_opt, 0);
+            qed_lean_inc(f);
+            let r = LeanRef::new_persistent(f);
+            qed_lean_dec(on_ws_project_opt);
+            Some(r)
+        } else {
+            qed_lean_dec(on_ws_project_opt);
+            None
+        };
         let cbs = Arc::new(Callbacks {
             init_frag: LeanRef::new_persistent(init_frag), on_head: LeanRef::new_persistent(on_head),
-            on_body: LeanRef::new_persistent(on_body), on_ws_bytes: LeanRef::new_persistent(on_ws_bytes), on_ws_leave: LeanRef::new_persistent(on_ws_leave),
+            on_body: LeanRef::new_persistent(on_body), on_ws_bytes: LeanRef::new_persistent(on_ws_bytes),
+            on_ws_leave: LeanRef::new_persistent(on_ws_leave), on_ws_project,
         });
         let port = if port_in == 0 { bound_port(first_fd) } else { port_in };
         let inboxes: Vec<Arc<WorkerInbox>> = (0..num_workers).map(|_| Arc::new(WorkerInbox::new())).collect();

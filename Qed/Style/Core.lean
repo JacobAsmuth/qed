@@ -179,8 +179,20 @@ def cssHash (s : String) : UInt64 := cssHashLoop s.toUTF8.data.toList 1469598103
 def shortHexHash (h : UInt64) : String :=
   String.ofList ([28, 24, 20, 16, 12, 8, 4, 0].map fun sh => hexDigitLower (h.toNat >>> sh))
 
+structure ThemeColorEntry where mk ::
+  (cssName : String) (lightRgb : Nat × Nat × Nat) (darkRgb? : Option (Nat × Nat × Nat) := none)
+deriving Inhabited, BEq, Repr
+
+structure StyleColorCheck where mk ::
+  (scope fgCss bgCss : String)
+  (fgRgb? bgRgb? : Option (Nat × Nat × Nat) := none)
+  (fgTok? bgTok? : Option String := none)
+  (forcedDark : Bool := false)
+deriving Inhabited, BEq, Repr
+
 structure Style where mk ::
   (className raw : String) (items : List Item := []) (usedTokens extraRules : List String := []) (isGlobal : Bool := false)
+  (colorChecks : List StyleColorCheck := []) (themePalette : List ThemeColorEntry := [])
 deriving Inhabited
 instance : Coe Style (Attr msg) := ⟨fun s => .cls s.className⟩
 
@@ -201,6 +213,7 @@ def renderThemeRule : Item → String
 
 structure Theme where mk ::
   (name : String) (lightDecls darkDecls resets : List Item := []) (definedTokens darkTokens : List String := [])
+  (colorPalette : List ThemeColorEntry := [])
 deriving Inhabited
 
 def Theme.render (th : Theme) : String :=
@@ -210,7 +223,8 @@ def Theme.render (th : Theme) : String :=
     "[data-theme=\"dark\"] { " ++ Item.renderList th.darkDecls ++ " }"]
   cssJoinLines (lightPart ++ darkPart ++ th.resets.map renderThemeRule)
 
-def Theme.asStyle (th : Theme) : Style := { className := s!"__qed_theme_{sanitizeCssIdent th.name}", raw := th.render, isGlobal := true }
+def Theme.asStyle (th : Theme) : Style :=
+  { className := s!"__qed_theme_{sanitizeCssIdent th.name}", raw := th.render, isGlobal := true, themePalette := th.colorPalette }
 def Theme.coversStyle (th : Theme) (s : Style) : Bool := s.usedTokens.all th.definedTokens.contains
 def Theme.missingTokensForStyle (th : Theme) (s : Style) : List String := s.usedTokens.filter (!th.definedTokens.contains ·)
 def Theme.coversAll (th : Theme) (styles : List Style) : Bool := styles.all th.coversStyle

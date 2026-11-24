@@ -67,6 +67,27 @@ theorem wrap_preserves_inv (P : Model → Prop) (subs : List (Subscription Model
 theorem wrap_noop_when_keys_unchanged (subs : List (Subscription Model Msg)) (update : Model → Msg → Model × Cmd Msg)
     (old : Model) (msg : Msg) (hsame : ∀ s ∈ subs, s.key old = s.key (update old msg).1) : wrap subs update old msg = update old msg := by
   unfold wrap; exact KeyedLifecycle.wrap_noop_when_keys_unchanged _ _ _ subs update old msg hsame
+def liftWithProps {PModel PMsg CModel CMsg Props : Type}
+    (getKey : PModel → String) (getProps : PModel → Option Props)
+    (getState : PModel → CModel) (setState : CModel → PModel → PModel) (wrapMsg : CMsg → PMsg)
+    (slot : String) (childKey : Props → CModel → String)
+    (childOpen : String → Props → String → CModel → Option (Cmd CMsg))
+    (childClose : String → Cmd CMsg) (childOnClose : CModel → CModel) : Subscription PModel PMsg :=
+  { slot,
+    key := fun pm =>
+      let pk := getKey pm
+      if pk.isEmpty then ""
+      else match getProps pm with
+        | none => ""
+        | some p => let ck := childKey p (getState pm); if ck.isEmpty then "" else pk ++ "|" ++ ck,
+    openCmd := fun _ pm =>
+      match getProps pm with
+      | none => none
+      | some p =>
+          let ck := childKey p (getState pm)
+          if ck.isEmpty then none else (childOpen slot p ck (getState pm)).map (Cmd.map wrapMsg),
+    closeCmd := Cmd.map wrapMsg (childClose slot),
+    onClose := fun pm => setState (childOnClose (getState pm)) pm }
 end Subscription
 
 namespace Internal

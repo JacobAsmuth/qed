@@ -152,4 +152,69 @@ style orphanStyle:
 expect_err "theme `AppTheme` does not define all CSS tokens used by `[orphanStyle]`.\n  Missing tokens: [\"does-not-exist\"]" in
 verify_theme AppTheme for [orphanStyle]
 
+-- ── Style & Stylesheet WCAG Contrast Verification ──
+style goodContrastBtn extends baseBtn contrast >= 4.5:
+  color: #ffffff
+  background-color: #15694b
+  &:hover:
+    background-color: #0d4a34
+
+style goodThemedCard contrast >= 4.5:
+  color: AppTheme.text
+  background-color: AppTheme.surface
+
+style goodFgOnlyLabel contrast >= 4.5 on AppTheme.surface:
+  color: AppTheme.muted
+
+style goodRgbPill contrast >= 4.5:
+  color: rgb(255, 255, 255)
+  background-color: rgb(20, 21, 24)
+
+component ContrastCard:
+  style body contrast >= 4.5:
+    color: AppTheme.text
+    background-color: AppTheme.surface
+  view: <div {body}>Readable</div>
+
+example := (goodContrastBtn_contrast, goodThemedCard_contrast, goodFgOnlyLabel_contrast, goodRgbPill_contrast, ContrastCard.body_contrast)
+
+verify_contrast >= 4.5 for StyledShowcase.app with AppTheme
+verify_contrast >= 4.5 for [goodContrastBtn, goodThemedCard, goodRgbPill, primaryBtn, strictCard] with AppTheme
+verify_contrast >= 4.5 for [goodFgOnlyLabel] with AppTheme on AppTheme.surface
+
+expect_err "WCAG contrast check failed (required >= 4.50:1):\n  • style `qed-lowContrastBtn-" in
+style lowContrastBtn contrast >= 4.5:
+  color: #888888
+  background-color: #ffffff
+
+expect_err "WCAG contrast check failed (required >= 4.50:1):\n  • style `qed-badHoverContrast-" in
+style badHoverContrast contrast >= 4.5:
+  color: #ffffff
+  background-color: #141518
+  &:hover:
+    background-color: #cccccc
+
+theme SplitContrastTheme:
+  color ink = #111827
+  color bg  = #ffffff
+  dark:
+    color ink = #222222
+    color bg  = #111111
+
+expect_err "(dark): color `var(--ink)` on background-color `var(--bg)` is 1.18:1" in
+style badDarkModeBtn contrast >= 4.5:
+  color: SplitContrastTheme.ink
+  background-color: SplitContrastTheme.bg
+
+expect_err "`contrast >= 4.50:1` on style `fgOnlyMissingBg` requires both `color` and `background-color` (or `on <bg>`)." in
+style fgOnlyMissingBg contrast >= 4.5:
+  color: #141518
+
+style badVerifyBtn:
+  color: #999999
+  background-color: #ffffff
+
+expect_err "is 2.84:1" in
+verify_contrast >= 4.5 for [goodContrastBtn, badVerifyBtn]
+
 end CssChecks

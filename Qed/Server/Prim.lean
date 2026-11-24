@@ -88,6 +88,7 @@ opaque serveNative {Req Ctx Frag : Type}
     (onHead : ByteArray → String → Nat → IO (HttpHeadAction Req Ctx))
     (onBody : Req → ByteArray → String → IO ByteArray)
     (onWsBytes : Ctx → ByteArray → Frag → Array (Nat × String × ByteArray) → IO (WsStepOut Frag))
-    (onWsLeave : Ctx → String → ByteArray → IO Unit) : IO UInt32
+    (onWsLeave : Ctx → String → ByteArray → IO Unit)
+    (onWsProject : Option (Ctx → String → ByteArray → ByteArray → Option (Option ByteArray))) : IO UInt32
 
 end Qed.Server.Prim

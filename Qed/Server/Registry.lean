@@ -50,6 +50,7 @@ structure ServerInfo where
   hasOnCreateAccount : Bool := false
   hasOnSignIn        : Bool := false
   hasHttpRoutes      : Bool := false
+  hasWsProject       : Bool := false
 deriving Inhabited
 
 initialize serverRegistry : Lean.SimplePersistentEnvExtension ServerInfo (Lean.NameMap ServerInfo) ← Qed.Diag.mkNameMapExt (·.serverName)

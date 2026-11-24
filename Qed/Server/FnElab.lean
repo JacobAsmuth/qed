@@ -394,6 +394,7 @@ private def elabServerAuthHookDispatch (atomicBinders : Array (TSyntax `Lean.Par
 @[noinline]
 def elabServerDispatchCmds (methodInfos : Array ServerMethodInfo) (dispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
     (chanNames : Array String) (wsDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr))
+    (wsProjectArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[])
     (httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]) (jobNames : Array String := #[])
     (onCreateRun? : Option Term := none) (onSignInRun? : Option Term := none) : SrvElabM Unit := do
   let c ← read; let (reqSecrets, ownSecrets, usedExts) ← collectServerSecretsAndExts
@@ -406,6 +407,13 @@ def elabServerDispatchCmds (methodInfos : Array ServerMethodInfo) (dispatchArms 
     let (wsKindVar, wsChanVar, wsParamsVar, wsPayloadVar) := (mkIdent `wsKind, mkIdent `wsChannel, mkIdent `wsParams, mkIdent `wsPayload)
     elabDispatchDef `wsDispatchM atomicBinders #[wsKindVar, wsChanVar, wsParamsVar, wsPayloadVar] #[u8Ty, strTy, bytesTy, bytesTy] bytesTy
       (← `(match $wsKindVar:ident, $wsChanVar:ident with $[$(wsDispatchArms.push (← `(Lean.Parser.Term.matchAltExpr| | _, _ => Pure.pure (Except.error (Qed.Server.ApiError.notFound ("unknown WebSocket channel: " ++ $wsChanVar)))))):matchAlt]*))
+  if !wsProjectArms.isEmpty then
+    let (wsChanVar, wsParamsVar, wsPayloadVar) := (mkIdent `wsChannel, mkIdent `wsParams, mkIdent `wsPayload)
+    let fallback ← `(Lean.Parser.Term.matchAltExpr| | _ => Qed.Server.WsProjectOut.passthrough)
+    elabSrvCmd (← `(command|
+      set_option linter.unusedVariables false in
+      @[noinline] def $(c.subId `wsProject) ($(c.ctxId):ident : Qed.Server.RequestCtx) ($wsChanVar:ident : String) ($wsParamsVar:ident : ByteArray) ($wsPayloadVar:ident : ByteArray) : Qed.Server.WsProjectOut :=
+        match $wsChanVar:ident with $[$(wsProjectArms.push fallback):matchAlt]*))
   if !httpDispatchArms.isEmpty then
     let (httpMethodVar, httpPathVar) := (mkIdent `httpMethod, mkIdent `httpPath)
     elabDispatchDef `httpDispatchM atomicBinders #[httpMethodVar, httpPathVar] #[strTy, strTy] (← `(Option Qed.Server.HttpResponse))
@@ -416,7 +424,8 @@ def elabServerDispatchCmds (methodInfos : Array ServerMethodInfo) (dispatchArms 
     envVars := c.envDecls.map fun (id, k, d?) => (id.getId.toString, k, d?), externalServices := usedExts,
     methods := methodInfos, channels := chanNames, jobs := jobNames, databases := c.dbDecls.map (·.2.configConst),
     authName? := c.authDecl?.map (·.2.authName), authConfig? := c.authDecl?.map (·.2.configConst),
-    hasOnCreateAccount := onCreateRun?.isSome, hasOnSignIn := onSignInRun?.isSome, hasHttpRoutes := !httpDispatchArms.isEmpty }
+    hasOnCreateAccount := onCreateRun?.isSome, hasOnSignIn := onSignInRun?.isSome,
+    hasHttpRoutes := !httpDispatchArms.isEmpty, hasWsProject := !wsProjectArms.isEmpty }
 
 @[noinline]
 def elabServerFnInvariants (isAsync : Bool) (fnStr : String) (fnIdent targetId : Ident)

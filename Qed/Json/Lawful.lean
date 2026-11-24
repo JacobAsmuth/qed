@@ -84,8 +84,32 @@ theorem NonNullJson.iso {α β : Type} (inst : LawfulJson β) (hnn : @NonNullJso
     (toB : α → β) (fromB : β → α) (left_inv : ∀ a, fromB (toB a) = a) : @NonNullJson α (LawfulJson.iso inst toB fromB left_inv).toToJson :=
   @NonNullJson.mk α (LawfulJson.iso inst toB fromB left_inv).toToJson fun a => @NonNullJson.toJson_ne_null β inst.toToJson hnn (toB a)
 
-@[simp] theorem LawfulJson.fromField_of_field {α : Type} [LawfulJson α] (j : Json) (k : String) (a : α)
-    (h : j.field k = .ok (toJson a)) : (FromJsonField.fromField j k : Except String α) = .ok a := by
-  simp [FromJsonField.fromField, fromFieldVal, Except.bind, h]
+class LawfulFromJsonField (α : Type) [ToJson α] [FromJsonField α] : Prop where
+  fromField_of_field : ∀ (j : Json) (k : String) (a : α),
+    j.field k = .ok (toJson a) → (FromJsonField.fromField j k : Except String α) = .ok a
+
+instance (priority := low) {α : Type} [LawfulJson α] : LawfulFromJsonField α where
+  fromField_of_field j k a h := by
+    simp [FromJsonField.fromField, fromFieldVal, Except.bind, h]
+
+instance {α : Type} [LawfulJson α] [NonNullJson α] : LawfulFromJsonField (Option α) where
+  fromField_of_field j k opt h := by
+    have hget : j.get? k = some (toJson opt) := by rw [Json.get?, h]; rfl
+    cases opt with
+    | none => simp [FromJsonField.fromField, hget, toJson, Option.elim]
+    | some a =>
+        have hnn := NonNullJson.toJson_ne_null a
+        simp only [FromJsonField.fromField, hget, toJson, Option.elim]
+        cases hj : toJson a with
+        | null => exact absurd hj hnn
+        | bool _ | num _ | str _ | arr _ | obj _ =>
+            have hfa := LawfulJson.fromJson_toJson a
+            rw [hj] at hfa
+            simp [fromFieldVal, hfa, Except.map]
+
+@[simp] theorem LawfulJson.fromField_of_field {α : Type} [ToJson α] [FromJsonField α] [LawfulFromJsonField α]
+    (j : Json) (k : String) (a : α) (h : j.field k = .ok (toJson a)) :
+    (FromJsonField.fromField j k : Except String α) = .ok a :=
+  LawfulFromJsonField.fromField_of_field j k a h
 
 end Qed

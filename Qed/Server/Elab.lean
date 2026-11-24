@@ -27,6 +27,7 @@ private structure ParsedChanHeader where
   onJoin?         : Option (Option Lean.Syntax × Array Lean.Syntax)
   onSend?         : Option (Array Lean.Syntax × Array Lean.Syntax × Array Lean.Syntax)
   onLeave?        : Option (Array Lean.Syntax)
+  project?        : Option (Lean.Ident × Lean.Term × Lean.Ident) := none
   sig             : SrvChanSig
 
 section ServerFullElab
@@ -41,6 +42,7 @@ private def elabServerChannelHeader (existingChanNames : Array String) (chStx : 
   let mut reqExprs : Array Syntax := #[]; let mut ensExprs : Array Syntax := #[]; let mut recPolicy : Qed.Reconnect := .defaultPolicy
   let mut hasRec := false; let mut onJoin? : Option (Option Syntax × Array Syntax) := none
   let mut onSend? : Option (Array Syntax × Array Syntax × Array Syntax) := none; let mut onLeave? : Option (Array Syntax) := none
+  let mut rawProject? : Option (Syntax × Option Syntax × Array Syntax × Array Syntax) := none
   if (chStx.getArg 7).getNumArgs == 2 then
     for sub in ((chStx.getArg 7).getArg 1).getArgs do
       let sk := sub.getKind
@@ -58,6 +60,10 @@ private def elabServerChannelHeader (existingChanNames : Array String) (chStx : 
       else if sk == ``srvChanOnLeaveClause then
         if onLeave?.isSome then throwErrorAt sub s!"duplicate `on_leave` in `channel {chStr}`"
         onLeave? := some (suiteStmts (sub.getArg 2))
+      else if sk == ``srvChanProjectClause then
+        if rawProject?.isSome then throwErrorAt sub s!"duplicate `project` in `channel {chStr}`"
+        let optRet? := if (sub.getArg 4).getNumArgs == 2 then some ((sub.getArg 4).getArg 1) else none
+        rawProject? := some (sub.getArg 2, optRet?, (sub.getArg 6).getArgs, (sub.getArg 7).getArgs)
       else throwErrorAt sub s!"unexpected clause in `channel {chStr}`"
   let evId := c.fnSubId chIdent "_Event"
   elabSrvCmd (← `(command| abbrev $evId : Type := $evTyTerm))
@@ -65,18 +71,52 @@ private def elabServerChannelHeader (existingChanNames : Array String) (chStx : 
   let reqs ← elabRequiresClauses chIdent chName chStr "_hChReq" "_req" paramNames paramNames pIdents pTyTerms reqExprs
   let some ensRes? ← elabEnsuresAbbrev chIdent chStr `event paramNames pIdents pTyTerms evTyTerm ensExprs | return none
   let (ensId?, ensConst?) : Option Ident × Option Name := (ensRes?.map (·.1), ensRes?.map (·.2.1))
+  let mut projectInfo? : Option (Ident × Term × Ident) := none
+  if let some (rawParamStx, optRet?, projContracts, projStmts) := rawProject? then
+    let (rIds, rTys, _) ← parseSrvParams s!"`channel {chStr}.project`" "`project` parameter" #[rawParamStx] (reserved := #["result"]) (extraShadow := paramNames)
+    let (rawId, rawTyTerm) := (rIds[0]!, rTys[0]!)
+    let projRetTy : Term ← match optRet? with
+      | some rt => pure (← liftMacroM <| lowerSrvType rt false s!"return type of `channel {chStr}.project`").term
+      | none    => pure evTyTerm
+    let projFnId := c.fnSubId chIdent "_project"
+    let ctxTy ← `(Qed.Server.RequestCtx)
+    let bodyTerm ← liftM <| Qed.lowerPureFnStmts s!"channel {chStr}.project" projStmts.toList
+    elabSrvCmd (← `(command|
+      set_option linter.unusedVariables false in
+      def $projFnId ($(c.ctxId):ident : $ctxTy) $[($pIdents:ident : $pTyTerms:term)]* ($rawId:ident : $rawTyTerm) : $evTyTerm := ($bodyTerm : $projRetTy)))
+    if (← hasSrvErrors) then return none
+    let allPIds := #[c.ctxId] ++ pIdents ++ #[rawId]
+    let allPTys := #[ctxTy] ++ pTyTerms ++ #[rawTyTerm]
+    let preHyps := reqs.reqHypIds.zip reqs.reqPropTerms
+    liftM <| Qed.elabPureFnContracts projFnId projFnId allPIds allPTys evTyTerm projContracts preHyps
+    if let some eid := ensId? then
+      let ensApp ← mkAppTerms eid (pIdents.map (⟨·.raw⟩))
+      let callT ← mkAppTerms projFnId (allPIds.map (⟨·.raw⟩))
+      let reqBs : Array (TSyntax `Lean.Parser.Term.bracketedBinder) ← preHyps.mapM fun (hid, hty) => `(bracketedBinder| ($hid:ident : $hty))
+      let chEnsThmId := c.fnSubId chIdent "_project_channel_ensures"
+      elabSrvCmd (← `(command|
+        set_option linter.unusedVariables false in
+        theorem $chEnsThmId ($(c.ctxId):ident : $ctxTy) $[($pIdents:ident : $pTyTerms:term)]* ($rawId:ident : $rawTyTerm) $[$reqBs:bracketedBinder]* :
+            $ensApp ($callT) := by qedProveFnEnsures $projFnId $chEnsThmId))
+    if (← hasSrvErrors) then return none
+    projectInfo? := some (rawId, rawTyTerm, projFnId)
   let mkEmitId := c.fnSubId chIdent "_mkEmit"; let evVar := mkIdent `_ev
   let paramTupleVal ← liftMacroM <| buildTupleVal (pIdents.map (⟨·.raw⟩))
-  let extraBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) ← match ensId? with
-    | some eid => pure #[← `(bracketedBinder| (_hEns : $(← mkAppTerms eid ((pIdents.push evVar).map (⟨·.raw⟩)))))] | none => pure #[]
+  let (emitPayloadTy, needEmitEns) := match projectInfo? with
+    | some (_, rawTy, _) => (rawTy, false)
+    | none               => (evTyTerm, ensId?.isSome)
+  let extraBinders : Array (TSyntax `Lean.Parser.Term.bracketedBinder) ← match ensId?, needEmitEns with
+    | some eid, true => pure #[← `(bracketedBinder| (_hEns : $(← mkAppTerms eid ((pIdents.push evVar).map (⟨·.raw⟩)))))]
+    | _, _ => pure #[]
   elabSrvCmd (← `(command|
     set_option linter.unusedVariables false in
-    @[inline] def $mkEmitId $[($pIdents:ident : $pTyTerms:term)]* ($evVar:ident : $evTyTerm) $[$extraBinders:bracketedBinder]* : Qed.Server.WsEmit :=
+    @[inline] def $mkEmitId $[($pIdents:ident : $pTyTerms:term)]* ($evVar:ident : $emitPayloadTy) $[$extraBinders:bracketedBinder]* : Qed.Server.WsEmit :=
       { topic := Qed.wsTopicKey $(Syntax.mkStrLit chStr) $paramTupleVal, payload := Qed.Proto.encode $evVar }))
   if (← hasSrvErrors) then return none
   return some {
     chIdent, chName, chStr, pIdents, pTyTerms, paramNames, paramTypeConsts, evTyTerm, reqs, ensId?, ensConst?, recPolicy, onJoin?, onSend?, onLeave?,
-    sig := { name := chStr, mkEmitId, paramCount := pIdents.size, hasEnsures := ensId?.isSome } }
+    project? := projectInfo?,
+    sig := { name := chStr, mkEmitId, paramCount := pIdents.size, hasEnsures := needEmitEns } }
 
 @[noinline]
 private def elabChanClientHelpers (hdr : ParsedChanHeader) (hasJoinSnapshot hasSend : Bool)
@@ -106,7 +146,8 @@ private def elabChanClientHelpers (hdr : ParsedChanHeader) (hasJoinSnapshot hasS
   return (wsPathStr, sendHelperConst)
 
 @[noinline]
-private def elabServerChannelBody (hdr : ParsedChanHeader) : SrvElabM (Option (Array (TSyntax ``Lean.Parser.Term.matchAltExpr))) := do
+private def elabServerChannelBody (hdr : ParsedChanHeader) :
+    SrvElabM (Option (Array (TSyntax ``Lean.Parser.Term.matchAltExpr) × Option (TSyntax ``Lean.Parser.Term.matchAltExpr))) := do
   let c ← read; let errTyTerm ← `(Qed.Server.ApiError); let chLit := Syntax.mkStrLit hdr.chStr
   let paramTupleTy ← liftMacroM <| buildProdType hdr.pTyTerms; let pProjs ← extractTupleProjections (mkIdent `_chParams) hdr.pTyTerms.size
   let wrapEmpty (r : Term) : CommandElabM Term := `($r >>= fun _wsRes => Pure.pure (_wsRes.map fun _ => ByteArray.empty))
@@ -155,13 +196,22 @@ private def elabServerChannelBody (hdr : ParsedChanHeader) : SrvElabM (Option (A
     | none => `(Pure.pure (Except.ok ByteArray.empty))
   let leaveArm ← liftM <| mkArm "3" (← liftM <| wrapReqs hdr.reqs.reqPropTerms hdr.reqs.reqHypIds hdr.reqs.reqLabels leaveRunTerm)
   let (wsPathStr, sendHelperConst) ← elabChanClientHelpers hdr hasJoinSnapshot hasSend joinTyTerm spIdents spTyTerms
+  let projArm? : Option (TSyntax ``Lean.Parser.Term.matchAltExpr) ← match hdr.project? with
+    | none => pure none
+    | some (_, rawTyTerm, projFnId) =>
+        let (wsPId, wsPayId, chPId, rawVar) := (mkIdent `wsParams, mkIdent `wsPayload, mkIdent `_chParams, mkIdent `_rawVal)
+        let projCall ← mkAppTerms projFnId (#[⟨c.ctxId.raw⟩] ++ pProjs ++ #[⟨rawVar.raw⟩])
+        some <$> `(Lean.Parser.Term.matchAltExpr| | $chLit =>
+          match Qed.Proto.decode (α := $paramTupleTy) $wsPId:ident, Qed.Proto.decode (α := $rawTyTerm) $wsPayId:ident with
+          | Except.ok $chPId:ident, Except.ok $rawVar:ident => Qed.Server.WsProjectOut.send (Qed.Proto.encode ($projCall))
+          | _, _ => Qed.Server.WsProjectOut.drop)
   if (← hasSrvErrors) then return none
   modifyEnv fun env => Qed.channelRegistry.addEntry env {
     ChannelInfo.mkDefault c.fullSrvName c.srvName.toString hdr.chName (.fullstack c.fullSrvName c.srvName.toString wsPathStr) (hdr.pIdents.map (·.getId)) hdr.paramTypeConsts hdr.recPolicy with
     hasJoinSnapshot, joinTypeConst := c.fullSrvName ++ hdr.chName.appendAfter "_Join", hasSend, sendParamCount := spIdents.size, sendParamTypeConsts,
     sendReqConst := sendReqConst?, sendReqLabel, requiresAuth := hdr.reqs.requiresAuth, clientReqConst := hdr.reqs.clientReqConst?,
     clientReqLabel := hdr.reqs.clientReqLabel, hasEnsures := hdr.ensConst?.isSome, ensPredConst := hdr.ensConst?, sendHelperConst }
-  return some (#[joinArm] ++ sendArm?.toArray ++ #[leaveArm])
+  return some (#[joinArm] ++ sendArm?.toArray ++ #[leaveArm], projArm?)
 
 /-! ## Background `every` Job Elaborator -/
 
@@ -326,8 +376,12 @@ private def elabServerAuthHook (hookLabel : String) (hookLeaf : Name) (authInfo 
 
 @[noinline]
 private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun stx => do
-  let srvIdent : Ident := ⟨stx.getArg 1⟩; let srvName := srvIdent.getId
-  let parsed ← parseServerClauses srvIdent srvName (stx.getArg 3).getArgs
+  let isStateless := (stx.getArg 1).getNumArgs == 1
+  let srvIdent : Ident := ⟨stx.getArg 2⟩; let srvName := srvIdent.getId
+  let parsed ← parseServerClauses srvIdent srvName (stx.getArg 4).getArgs
+  if isStateless then
+    if let some (stId, _, _, _) := parsed.stateDecls[0]? then
+      throwErrorAt stId s!"`server stateless {srvName}` forbids in-memory `state` field `{stId.getId}`; persist state in a `database` (`use db : ...`) or remove `stateless`"
   let initCtx : SrvElabCtx := {
     priorRep, priorUnrep, srvIdent, srvName, fullSrvName := (← getCurrNamespace) ++ srvName, hasState := !parsed.stateDecls.isEmpty,
     dbDecls := parsed.dbDecls, authDecl? := parsed.authDecl?, envDecls := parsed.envDecls,
@@ -335,6 +389,7 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
     invs := parsed.invs, mutInvs := parsed.mutInvs, deferredProofs := ← IO.mkRef #[], extRootsRef := ← IO.mkRef #[] }
   (do
     if initCtx.hasState then unless (← elabServerStateCmds parsed.stateDecls) do return
+    if isStateless then elabSrvCmd (← `(command| theorem $(initCtx.subId `is_stateless) : True := True.intro))
     let mut chanHeaders : Array ParsedChanHeader := #[]
     for cc in parsed.chanClauses do
       let some hdr ← elabServerChannelHeader (chanHeaders.map ParsedChanHeader.chStr) cc | return
@@ -345,9 +400,11 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
         let some (info, arm) ← elabServerFnClause methodInfos fc | return
         methodInfos := methodInfos.push info; dispatchArms := dispatchArms.push arm
       let mut wsDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
+      let mut wsProjectArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
       for hdr in chanHeaders do
-        let some chArms ← elabServerChannelBody hdr | return
+        let some (chArms, projArm?) ← elabServerChannelBody hdr | return
         wsDispatchArms := wsDispatchArms ++ chArms
+        if let some pa := projArm? then wsProjectArms := wsProjectArms.push pa
       let mut httpRoutes : Array (String × String) := #[]; let mut httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
       for (hc, idx) in parsed.httpClauses.zipIdx do
         let some (rt, arm) ← elabServerHttpRouteClause idx httpRoutes hc | return
@@ -357,7 +414,7 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
         match parsed.authDecl?, cl? with | some (_, ai), some hc => Option.map some <$> elabServerAuthHook lbl leaf ai hc | _, _ => pure (some none)
       let some onCreateRun? ← elabHook? "onCreateAccount" `_onCreateAccount parsed.onCreateAccountClause? | return
       let some onSignInRun? ← elabHook? "onSignIn" `_onSignIn parsed.onSignInClause? | return
-      elabServerDispatchCmds methodInfos dispatchArms (chanHeaders.map ParsedChanHeader.chStr) wsDispatchArms httpDispatchArms jobNames onCreateRun? onSignInRun?
+      elabServerDispatchCmds methodInfos dispatchArms (chanHeaders.map ParsedChanHeader.chStr) wsDispatchArms wsProjectArms httpDispatchArms jobNames onCreateRun? onSignInRun?
   ).run initCtx
   for runProof in ← initCtx.deferredProofs.get do unless (← runProof) do return
 
@@ -479,12 +536,13 @@ def elabQedServerMain : CommandElab := fun stx => do
   let asyncNames : Array Term := srvInfo.methods.filterMap fun m => if m.isAsync then some (Syntax.mkStrLit m.name) else none
   let initStateArg : Term ← if srvInfo.hasState then pure (srvId `initState : Term) else `((() : Unit))
   let jobsArg : Term ← if srvInfo.jobs.isEmpty then `(#[]) else if srvInfo.hasState then pure (srvId `jobs : Term) else `(($(srvId `jobs)).map Qed.Server.StatelessJob.toUnitJob)
+  let wsProjArg : Term ← if srvInfo.hasWsProject then `(Option.some $(srvId `wsProject)) else `(Option.none)
   let runnerCall ← `($(mkIdent `Qed.Server.Native.runStatefulFullstack) $(mkIdentFrom fsIdent (fsInfo.fullstackName ++ `clientApp))
       $(quote fsInfo.title) $(quote srvInfo.shortName) $initStateArg $(srvId `secrets) $(← wrapHandler (srvId `dispatchM))
       port staticDir devMode numWorkers $(← optHandler (!srvInfo.channels.isEmpty) (srvId `wsDispatchM)) (some #[$asyncNames,*])
       $(← optHandler srvInfo.hasHttpRoutes (srvId `httpDispatchM)) $jobsArg $(← optId (srvInfo.authConfig?.map (mkIdentFrom fsIdent ·)))
       $(← optHandler (srvInfo.hasOnCreateAccount || srvInfo.hasOnSignIn) (srvId `authHookM))
-      ($(quote srvInfo.hasOnCreateAccount), $(quote srvInfo.hasOnSignIn)) $(← optId dbCfgIds[0]?))
+      ($(quote srvInfo.hasOnCreateAccount), $(quote srvInfo.hasOnSignIn)) $(← optId dbCfgIds[0]?) $wsProjArg)
   let initDbCheck ← if dbCfgIds.isEmpty then `(pure true) else `($(mkIdent `Qed.Server.Native.initDatabases) #[$[$dbCfgIds:ident],*])
   let parseCliCall ← `($(mkIdent `Qed.Server.Native.parseServerCliArgs) args)
   elabCommand (← `(command|

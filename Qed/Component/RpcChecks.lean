@@ -133,13 +133,13 @@ def verifyPendingRpcChecks (spec : ComponentSpec) (invPreds : Array Term) : Comm
           throwErrorAt chk.callRef m!"Predicted response for `{chk.srvShort}.{chk.methodName}` does not satisfy server `ensures` postcondition:{fmtObl obl}\n\nHint: Ensure the predicted value satisfies the server method's `ensures` clause (or guard it inside a `predict:` block)."
 
 private def elabAndRecordChanCheck (stx : Syntax) (expectedType? : Option Expr) (label : String)
-    (argTerms : Array Term) (slotLit : TSyntax `str) (trailingArgs : Array Term) (isSub : Bool) : TermElabM Expr := do
+    (argTerms : Array Term) (slotTerm : Term) (trailingArgs : Array Term) (isSub : Bool) : TermElabM Expr := do
   let chFullName := (stx.getArg 1).getId
   let some chInfo := (Qed.channelRegistry.getState (← getEnv)).find? chFullName | throwErrorAt stx s!"internal: unknown channel `{chFullName}` in {label}"
   let (helperConst, paramCount, paramTypeConsts, methodName, reqConst?, reqLabel, requiresAuth) :=
     if isSub then (chInfo.subHelperConst, chInfo.paramCount, chInfo.paramTypeConsts, chInfo.channelName, chInfo.clientReqConst, chInfo.clientReqLabel, chInfo.requiresAuth)
     else (chInfo.sendHelperConst, chInfo.sendParamCount, chInfo.sendParamTypeConsts, s!"{chInfo.channelName}.send", chInfo.sendReqConst, chInfo.sendReqLabel, false)
-  let fullCall ← (argTerms ++ trailingArgs).foldlM (init := ← `($(mkIdentFrom stx helperConst) $slotLit)) fun acc a => `($acc ($a))
+  let fullCall ← (argTerms ++ trailingArgs).foldlM (init := ← `($(mkIdentFrom stx helperConst) $slotTerm)) fun acc a => `($acc ($a))
   elabAndRecordRpcLikeCheck stx expectedType? fullCall helperConst argTerms paramCount paramTypeConsts chInfo.ownerShort methodName reqConst? reqLabel requiresAuth (reqConst?.isSome || requiresAuth)
 
 @[term_elab qedCheckChanSubTerm] def elabCheckChanSub : TermElab := fun stx expectedType? =>

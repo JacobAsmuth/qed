@@ -352,6 +352,15 @@ structure WsEmit where
   payload : ByteArray
 deriving Inhabited, DecidableEq
 
+/-- Per-subscriber WebSocket broadcast projection result (`Option (Option ByteArray)` ABI for FFI):
+    `none` = passthrough raw payload, `some (some bytes)` = send projected bytes, `some none` = drop. -/
+abbrev WsProjectOut := Option (Option ByteArray)
+namespace WsProjectOut
+@[inline] def passthrough : WsProjectOut := none
+@[inline] def send (payload : ByteArray) : WsProjectOut := some (some payload)
+@[inline] def drop : WsProjectOut := some none
+end WsProjectOut
+
 @[specialize] def flushWsEmits {m : Type → Type} [Monad m] [MonadServer m] : List WsEmit → m Unit
   | [] => pure () | e :: es => MonadServer.wsBroadcast e.topic e.payload >>= fun _ => flushWsEmits es
 

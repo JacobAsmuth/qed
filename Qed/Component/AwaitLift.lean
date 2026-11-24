@@ -99,9 +99,10 @@ private def forEachControlSubSuite (st : Syntax) (f : Array Syntax → CommandEl
   else if k == ``qedStmtMatch then for c in (st.getArg 3).getArgs do f (suiteStmts (c.getArg 3))
 
 private partial def checkPureSpecCont (ctx : RewriteCtx) (stmts : Array Syntax) : CommandElabM Unit := do
+  let pureMut := ctx.spec.pureMutFnNames
   for st in stmts do
     let k := st.getKind
-    if k == ``qedStmtExpr && !isCollMutExpr (st.getArg 0) then
+    if k == ``qedStmtExpr && !isCollMutExpr (st.getArg 0) && !isPlainCallTo pureMut (st.getArg 0) then
       throwErrorAt st "cannot run side effects or emit events inside a speculative continuation after `predict` (side effects cannot be rolled back); move it into `on_confirm:`"
     else if isAwaitStmt st then throwErrorAt st "cannot `await` inside a speculative continuation after `predict`; move sequential `await` calls into `on_confirm:`"
     else if k == ``qedStmtAssign && (st.getArg 0).getKind == ``qedIdent then
@@ -385,17 +386,29 @@ private def registerActionOrPort (spec : ComponentSpec) (baseCtx : RewriteCtx) (
       throwErrorAt errRef s!"action `{name}` declares explicit parameter(s) and cannot use the `_` placeholder; assign explicitly (e.g. `{dummyAssigns[0]!.1} = {params[0]!.1.getId}`)"
   pushSite baseCtx kindPrefix name params stmts dummyAssigns
 
-structure RewriteResult where mk :: (accum : RewriteAccum) (route? : Option RouteDecl) (starts : Array Term) (body : Term)
+structure RewriteResult where mk ::
+  (accum : RewriteAccum) (route? : Option RouteDecl) (starts : Array Term) (body : Term)
+  (fns : Array CompFnDecl) (subscriptions : Array SubDecl)
+
+private def checkCompParams (spec : ComponentSpec) (kindLabel : String) (ownerName : Name) (params : Array (Ident × Term)) : CommandElabM Unit := do
+  discard <| params.foldlM (init := (#[] : Array Name)) fun seen (pId, _) => do
+    let pn := pId.getId
+    if seen.contains pn then throwErrorAt pId s!"duplicate parameter `{pn}` in {kindLabel} `{ownerName}`"
+    if spec.allNames.contains pn then throwErrorAt pId s!"parameter `{pn}` in {kindLabel} `{ownerName}` shadows a component field; rename the parameter"
+    pure (seen.push pn)
 
 def collectSitesAndRewriteStateful (spec : ComponentSpec) : CommandElabM RewriteResult := do
   let baseCtx ← mkRewriteCtx spec false
+  let mut rwFns : Array CompFnDecl := #[]
+  for f in spec.fns do
+    checkCompParams spec "fn" f.id.getId f.params
+    let stmts' ← f.stmts.mapM (rewriteIn baseCtx false)
+    if stmts'.any stmtContainsAwait then
+      throwErrorAt f.id s!"cannot use `await` inside component `fn {f.id.getId}`; perform `await` in the calling `action` and pass the result to `{f.id.getId}`"
+    rwFns := rwFns.push { f with stmts := stmts' }
   for a in spec.actions do
     let name := (a.getArg 1).getId; let params ← parseParamList (a.getArg 2)
-    discard <| params.foldlM (init := (#[] : Array Name)) fun seen (pId, _) => do
-      let pn := pId.getId
-      if seen.contains pn then throwErrorAt pId s!"duplicate parameter `{pn}` in action `{name}`"
-      if spec.allNames.contains pn then throwErrorAt pId s!"parameter `{pn}` in action `{name}` shadows a component field; rename the parameter"
-      pure (seen.push pn)
+    checkCompParams spec "action" name params
     registerActionOrPort spec baseCtx "action" "action" "action" (a.getArg 1) a name params (a.getArg 4) true
   for p in spec.portIns do
     if spec.allNames.contains p.argId.getId then throwErrorAt p.argId s!"port parameter `{p.argId.getId}` on `port {p.id.getId}` shadows a component field; rename the parameter"
@@ -409,10 +422,15 @@ def collectSitesAndRewriteStateful (spec : ComponentSpec) : CommandElabM Rewrite
     if altPairs.any (·.2.2.isSome) then
       pushSpecDisp baseCtx `_onRoute rParams #[rFieldAssign, mkMatchStx rd.field rParamId (altPairs.map fun (_, alt, ac?) => setStxArg alt 3 (packSuite alt (ac?.getD #[])))]
     pure { rd with alts := altPairs.map (·.1) }
+  let rwSubs ← spec.subscriptions.mapM fun sub => do
+    let onJoin'? ← sub.onJoin?.mapM fun (b?, ss) => return (b?, ← ss.mapM (rewriteIn baseCtx false))
+    let onMsg'? ← sub.onMsg?.mapM fun (b, ss) => return (b, ← ss.mapM (rewriteIn baseCtx false))
+    let onStatus'? ← sub.onStatus?.mapM fun (b, ss) => return (b, ← ss.mapM (rewriteIn baseCtx false))
+    return { sub with onJoin? := onJoin'?, onMsg? := onMsg'?, onStatus? := onStatus'? }
   for q in spec.queries do recordUsedRpc baseCtx.accum q.rpc.srvInfo.shortName q.rpc.mInfo.name
   let starts ← spec.starts.mapM fun st => do lowerCompExpr .val (← rewriteIn { baseCtx with inPerform := true } false st)
   let body ← lowerCompExpr .val (← rewriteIn { baseCtx with allowHoist := true, wrapMsg? := if spec.hasSlotsOrKids then some (mkIdent `_wrap) else none } false spec.body)
-  return .mk (← baseCtx.accum.get) route'? starts body
+  return .mk (← baseCtx.accum.get) route'? starts body rwFns rwSubs
 
 end CompElab
 end Qed

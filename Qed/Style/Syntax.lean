@@ -56,16 +56,24 @@ declare_syntax_cat cssBlockItem
 @[cssBlockItem_parser] def cssNestedBlock : Parser := leading_parser withPosition (cssBlockHeader >> many1 (checkColGt >> categoryParser `cssBlockItem 0))
 @[cssBlockItem_parser] def cssSimpleDecl  : Parser := leading_parser cssDeclLine
 
-def styleExtendsClause : Parser := leading_parser atomic (symbol "extends") >> sepBy1 Parser.ident ","
-def styleStrictClause  : Parser := leading_parser atomic (identEq `strict_tokens)
+def styleExtendsClause  : Parser := leading_parser atomic (symbol "extends") >> sepBy1 Parser.ident ","
+def styleStrictClause   : Parser := leading_parser atomic (identEq `strict_tokens)
+def styleContrastBgP    : Parser := strLit <|> Parser.ident
+def styleContrastRatioP : Parser := scientificLit <|> numLit
+def styleContrastClause : Parser := leading_parser
+  atomic (identEq `contrast >> ">=") >> styleContrastRatioP >> optional (atomic (identEq `on) >> styleContrastBgP)
 
 private def cssCmd (kw : String) (extra : Parser := skip) : Parser :=
   optional Command.docComment >> withPosition (symbol kw >> Parser.ident >> extra >> ":" >> many1 (checkColGt >> categoryParser `cssBlockItem 0))
 
-@[command_parser] def styleCmd       : Parser := leading_parser cssCmd "style " (optional styleExtendsClause >> optional styleStrictClause)
+@[command_parser] def styleCmd       : Parser := leading_parser cssCmd "style " (optional styleExtendsClause >> optional styleStrictClause >> optional styleContrastClause)
 @[command_parser] def keyframesCmd   : Parser := leading_parser cssCmd "keyframes "
 @[command_parser] def themeCmd       : Parser := leading_parser cssCmd "theme "
 @[command_parser] def verifyThemeCmd : Parser := leading_parser "verify_theme " >> Parser.ident >> symbol "for" >> termParser
+@[command_parser] def verifyContrastCmd : Parser := leading_parser
+  "verify_contrast " >> ">=" >> styleContrastRatioP >> symbol "for" >> termParser maxPrec >>
+  optional (atomic (symbol "with") >> Parser.ident) >>
+  optional (atomic (identEq `on) >> styleContrastBgP)
 
 /-! ## CSS Property & Value Validation Engine -/
 
@@ -262,13 +270,78 @@ private partial def quoteItem : Qed.Item → MacroM Term
   | .decl p v => `(Qed.Item.decl $(quote p) $(quote v))
   | .nest sel body => do `(Qed.Item.nest $(quote sel) [$(← body.toArray.mapM quoteItem),*])
 private def quoteItems (items : List Qed.Item) : MacroM Term := do `([$(← items.toArray.mapM quoteItem),*])
+private def quoteRgbOpt : Option (Nat × Nat × Nat) → MacroM Term
+  | none => `(none)
+  | some (r, g, b) => `(some ($(quote r), $(quote g), $(quote b)))
+
+private def quoteThemeColorEntry (e : Qed.ThemeColorEntry) : MacroM Term := do
+  `({ cssName := $(quote e.cssName), lightRgb := ($(quote e.lightRgb.1), $(quote e.lightRgb.2.1), $(quote e.lightRgb.2.2)),
+      darkRgb? := $(← quoteRgbOpt e.darkRgb?) : Qed.ThemeColorEntry })
+
+private def quoteThemePalette (ps : List Qed.ThemeColorEntry) : MacroM Term := do
+  `([$(← ps.toArray.mapM quoteThemeColorEntry),*])
+
+private def quoteStyleColorCheck (c : Qed.StyleColorCheck) : MacroM Term := do
+  `({ scope := $(quote c.scope), fgCss := $(quote c.fgCss), bgCss := $(quote c.bgCss),
+      fgRgb? := $(← quoteRgbOpt c.fgRgb?), bgRgb? := $(← quoteRgbOpt c.bgRgb?),
+      fgTok? := $(quote c.fgTok?), bgTok? := $(quote c.bgTok?), forcedDark := $(quote c.forcedDark) : Qed.StyleColorCheck })
+
+private def quoteFallbackBgOpt : Option Qed.ContrastFallbackBg → MacroM Term
+  | none => `(none)
+  | some fb => do `(some ({ css := $(quote fb.css), rgb? := $(← quoteRgbOpt fb.rgb?), tok? := $(quote fb.tok?) : Qed.ContrastFallbackBg }))
+
 private def quoteStyleLiteral (s : Qed.Style) : MacroM Term := do
   `({ className := $(quote s.className), raw := $(quote s.raw), items := $(← quoteItems s.items),
-      usedTokens := $(quote s.usedTokens), extraRules := $(quote s.extraRules), isGlobal := $(quote s.isGlobal) : Qed.Style })
+      usedTokens := $(quote s.usedTokens), extraRules := $(quote s.extraRules), isGlobal := $(quote s.isGlobal),
+      colorChecks := [$(← s.colorChecks.toArray.mapM quoteStyleColorCheck),*],
+      themePalette := $(← quoteThemePalette s.themePalette) : Qed.Style })
 
-/-! ## `style`, `keyframes`, `theme`, and `verify_theme` Elaborators -/
+/-! ## `style`, `keyframes`, `theme`, `verify_theme`, and `verify_contrast` Elaborators -/
 
-def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment)) (nameId : Ident) (extendsIds : Array Ident) (strictTokens : Bool) (bodyStxs : Array Syntax) : CommandElabM Unit := do
+private def parseDecimalX100 (s : String) : Option Nat := match s.trimmed.splitOn "." with
+  | [w] => w.toNat?.map (· * 100)
+  | [w, f] => do let wn ← w.toNat?; let fcs := f.toList; guard (!fcs.isEmpty && fcs.all Char.isDigit)
+                 some (wn * 100 + (← if fcs.length == 1 then f.toNat?.map (· * 10) else (String.ofList (fcs.take 2)).toNat?))
+  | _ => none
+
+private def parseContrastRatioStx (stx : Syntax) : CoreM Nat := do
+  let raw := (stx.reprint.getD "").trimmed
+  let some n := parseDecimalX100 raw | throwErrorAt stx s!"invalid WCAG contrast threshold `{raw}` (expected e.g. `4.5`, `3.0`, or `7.0`)"
+  return n
+
+private def resolveContrastBgStx (env : Environment) (currNs : Name) (openDecls : List OpenDecl) (bgStx : Syntax) : CoreM (Qed.ContrastFallbackBg × Option Name) := do
+  if let some s := bgStx.isStrLit? then
+    match validateColorLiteral s.trimmed with
+    | .ok (some rgb) => return ({ css := s.trimmed, rgb? := some rgb, tok? := none }, none)
+    | .ok none => throwErrorAt bgStx s!"`on \"{s}\"` must be an opaque hex, `rgb(...)`, `white`, or `black` color so contrast can be verified"
+    | .error msg => throwErrorAt bgStx s!"in `on`: {msg}"
+  else
+    let idStr := bgStx.getId.eraseMacroScopes.toString
+    let some tInfo := resolveInRegistry (tokenMetaRegistry.getState env) env currNs openDecls idStr
+      | throwErrorAt bgStx s!"unknown color token `{idStr}` in `on {idStr}`"
+    unless tInfo.kind == "color" do
+      throwErrorAt bgStx s!"token `{tInfo.fullName}` has kind `{tInfo.kind}`, expected `color` in `on {idStr}`"
+    return ({ css := s!"var(--{tInfo.cssName})", rgb? := none, tok? := some tInfo.cssName }, tInfo.themeName?)
+
+private def mkThemePaletteTerm (env : Environment) (themeNames : List Name) : MacroM Term := do
+  let thReg := themeMetaRegistry.getState env
+  let thConsts := themeNames.eraseDups.filterMap fun nm => (thReg.find? nm).map (·.themeConst)
+  match thConsts with
+  | [] => `(([] : List Qed.ThemeColorEntry))
+  | c :: rest => rest.foldlM (init := ← `($(mkIdent c).colorPalette)) fun acc n => do `($acc ++ $(mkIdent n).colorPalette)
+
+private def resolveStylesTargetTerm (target : Term) : CommandElabM Term := liftTermElabM do
+  let e ← elabTerm target none; synthesizeSyntheticMVarsNoPostponing
+  if (← whnf (← instantiateMVars (← inferType e))).isAppOf `Qed.App then `(($target).styles) else pure target
+
+private def checkContrastEval (ref : Syntax) (minX100 : Nat) (violsTerm : Term) : CommandElabM Unit := do
+  let errStr : String ← liftTermElabM do
+    try Lean.Meta.reduceEval (← elabTerm (← `(Qed.formatContrastViolations $(quote minX100) $violsTerm)) none)
+    catch _ => pure ""
+  unless errStr.isEmpty do throwErrorAt ref errStr
+
+def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment)) (nameId : Ident) (extendsIds : Array Ident)
+    (strictTokens : Bool) (bodyStxs : Array Syntax) (contrastOpt? : Option Syntax := none) : CommandElabM Unit := do
   let (env, currNs, openDecls) ← getCssScope; let compiled ← liftCoreM <| compileCssBlockItems env currNs openDecls strictTokens bodyStxs
   let styleReg := styleMetaRegistry.getState env
   let baseMetas : Array StyleMetaInfo ← extendsIds.mapM fun bId => do
@@ -280,14 +353,30 @@ def elabStyleDef (doc? : Option (TSyntax ``Lean.Parser.Command.docComment)) (nam
   let allToks  := (baseMetas.toList.flatMap (·.usedTokens) ++ compiled.usedTokens ++ Qed.collectItemTokens finalItems).eraseDups
   let allExtra := (baseMetas.toList.flatMap (·.extraRules) ++ compiled.extraRules).eraseDups
   let allThemes := (compiled.themes ++ baseMetas.toList.flatMap (·.themes)).eraseDups
-  let baked : Qed.Style := { className := cls, raw := rawCss, items := finalItems, usedTokens := allToks, extraRules := allExtra }
+  let colorChecks := Qed.collectStyleColorChecks none none false "" finalItems
+  let baked : Qed.Style := { className := cls, raw := rawCss, items := finalItems, usedTokens := allToks, extraRules := allExtra, colorChecks }
   elabCommand (← `(command| $[$doc?:docComment]? def $nameId : Qed.Style := $(← liftMacroM <| quoteStyleLiteral baked)))
   modifyEnv fun e => styleMetaRegistry.addEntry e (.mk (currNs ++ nameId.getId) finalItems allToks allExtra allThemes)
+  if let some cStx := contrastOpt? then
+    let minX100 ← liftCoreM <| parseContrastRatioStx (cStx.getArg 2)
+    let (bgOpt?, extraTheme?) ← if (cStx.getArg 3).getNumArgs == 2 then do
+        let (bg, th?) ← liftCoreM <| resolveContrastBgStx env currNs openDecls ((cStx.getArg 3).getArg 1)
+        pure (some bg, th?)
+      else pure (none, none)
+    unless baked.hasContrastPair bgOpt? do
+      throwErrorAt cStx s!"`contrast >= {Qed.formatContrastX100 minX100}` on style `{nameId.getId}` requires both `color` and `background-color` (or `on <bg>`)."
+    let themes := match extraTheme? with | some th => (allThemes ++ [th]).eraseDups | none => allThemes
+    let palTerm ← liftMacroM <| mkThemePaletteTerm env themes
+    let bgTerm ← liftMacroM <| quoteFallbackBgOpt bgOpt?
+    checkContrastEval cStx minX100 (← `(Qed.Style.contrastViolations $(quote minX100) $palTerm $bgTerm $nameId))
+    let thmId := mkIdentFrom cStx (nameId.getId.appendAfter "_contrast")
+    elabCommand (← `(command| theorem $thmId : Qed.Style.checkContrast $(quote minX100) $palTerm $bgTerm $nameId = true := by decide))
 
 def extractStyleExtends (optStx : Syntax) : Array Ident := if optStx.getNumArgs == 1 then ((optStx.getArg 0).getArg 1).getSepArgs.map (⟨·⟩) else #[]
+def extractOptChild (optStx : Syntax) : Option Syntax := if optStx.getNumArgs == 1 then some (optStx.getArg 0) else none
 
 @[command_elab styleCmd] def elabStyleCmd : CommandElab := fun stx =>
-  elabStyleDef (optDocComment stx) ⟨stx.getArg 2⟩ (extractStyleExtends (stx.getArg 3)) ((stx.getArg 4).getNumArgs == 1) (stx.getArg 6).getArgs
+  elabStyleDef (optDocComment stx) ⟨stx.getArg 2⟩ (extractStyleExtends (stx.getArg 3)) ((stx.getArg 4).getNumArgs == 1) (stx.getArg 7).getArgs (extractOptChild (stx.getArg 5))
 
 @[command_elab keyframesCmd] def elabKeyframesCmd : CommandElab := fun stx => do
   let nameId : Ident := ⟨stx.getArg 2⟩; let kfName := Qed.sanitizeCssIdent nameId.getId.getString!; let (env, currNs, openDecls) ← getCssScope
@@ -318,12 +407,6 @@ private def parseAndValidateTokenLine (ref : Syntax) (line : String) : CoreM (St
     | "time"  => if !isValidTimeAtom val then throwErrorAt ref s!"invalid theme time value `{val}`" else pure (val, none)
     | _       => pure (if val.startsWith "\"" && val.endsWith "\"" && val.length >= 2 then String.ofList (val.toList.drop 1 |>.dropLast) else val, none)
   return (kind, nm, cleanVal, rgb?)
-
-private def parseDecimalX100 (s : String) : Option Nat := match s.trimmed.splitOn "." with
-  | [w] => w.toNat?.map (· * 100)
-  | [w, f] => do let wn ← w.toNat?; let fcs := f.toList; guard (!fcs.isEmpty && fcs.all Char.isDigit)
-                 some (wn * 100 + (← if fcs.length == 1 then f.toNat?.map (· * 10) else (String.ofList (fcs.take 2)).toNat?))
-  | _ => none
 
 private def parseContrastInvLine (ref : Syntax) (line : String) : CoreM ThemeContrastInv := do
   let some (lhs, rhs) := splitFirstChar ':' line | throwErrorAt ref s!"expected `invariant <name>: contrast(fg, bg) >= <ratio>`, got `{line}`"
@@ -400,9 +483,11 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
   let darkEntries := entries.toList.filter (·.darkCss?.isSome)
   let (lightDecls, darkDecls) := (entries.toList.map fun e => Qed.Item.decl ("--" ++ e.cssName) e.lightCss, darkEntries.map fun e => Qed.Item.decl ("--" ++ e.cssName) (e.darkCss?.getD ""))
   let (defToks, darkToks) := (entries.toList.map (·.cssName), darkEntries.map (·.cssName))
-  let thVal : Qed.Theme := .mk themeNm.getString! lightDecls darkDecls resets defToks darkToks; let fullThemeName := currNs ++ themeNm
+  let colorPalette : List Qed.ThemeColorEntry := entries.toList.filterMap fun e =>
+    if e.kind == "color" then e.lightRgb.map fun l => { cssName := e.cssName, lightRgb := l, darkRgb? := e.darkRgb? } else none
+  let thVal : Qed.Theme := .mk themeNm.getString! lightDecls darkDecls resets defToks darkToks colorPalette; let fullThemeName := currNs ++ themeNm
   emitThemeTokens themeNm fullThemeName entries
-  let themeLit ← liftMacroM do `({ name := $(quote thVal.name), lightDecls := $(← quoteItems lightDecls), darkDecls := $(← quoteItems darkDecls), resets := $(← quoteItems resets), definedTokens := $(quote defToks), darkTokens := $(quote darkToks) })
+  let themeLit ← liftMacroM do `({ name := $(quote thVal.name), lightDecls := $(← quoteItems lightDecls), darkDecls := $(← quoteItems darkDecls), resets := $(← quoteItems resets), definedTokens := $(quote defToks), darkTokens := $(quote darkToks), colorPalette := $(← quoteThemePalette colorPalette) })
   elabCommand (← `(command| $[$(optDocComment stx):docComment]? def $(mkIdentFrom themeId (themeNm ++ `theme)) : Qed.Theme := $themeLit))
   elabCommand (← `(command| def $(mkIdentFrom themeId (themeNm ++ `style)) : Qed.Style := $(← liftMacroM <| quoteStyleLiteral thVal.asStyle)))
   emitThemeContrastInvs themeNm entries invs
@@ -412,9 +497,7 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
   let (thId, target) : Ident × Term := (⟨stx.getArg 1⟩, ⟨stx.getArg 3⟩); let (env, currNs, openDecls) ← getCssScope
   let some thInfo := resolveInRegistry (themeMetaRegistry.getState env) env currNs openDecls thId.getId.toString | throwErrorAt thId s!"unknown `theme` `{thId.getId}`"
   let thConst := mkIdentFrom thId thInfo.themeConst
-  let stylesTerm : Term ← liftTermElabM do
-    let e ← elabTerm target none; synthesizeSyntheticMVarsNoPostponing
-    if (← whnf (← instantiateMVars (← inferType e))).isAppOf `Qed.App then `(($target).styles) else pure target
+  let stylesTerm ← resolveStylesTargetTerm target
   let savedMsgs := (← get).messages; modify fun s => { s with messages := {} }
   let ok ← try elabCommand (← `(command| example : ($thConst).coversAll ($stylesTerm) = true := by decide)); pure (!(← get).messages.hasErrors) catch _ => pure false
   let newMsgs := (← get).messages; modify fun s => { s with messages := if ok then savedMsgs ++ newMsgs else savedMsgs }
@@ -424,5 +507,26 @@ private def emitThemeContrastInvs (themeNm : Name) (entries : Array ThemeTokEntr
           return "[" ++ String.intercalate ", " (xs.map fun s => s!"\"{s}\"") ++ "]"
       catch _ => return "(unknown)"
     throwErrorAt stx s!"theme `{thId.getId}` does not define all CSS tokens used by `{(target.raw.reprint.getD "target").trimmed}`.\n  Missing tokens: {missingStr}\nAdd them to `theme {thId.getId}:`."
+
+@[noinline, command_elab verifyContrastCmd] def elabVerifyContrastCmd : CommandElab := fun stx => do
+  let minX100 ← liftCoreM <| parseContrastRatioStx (stx.getArg 2)
+  let target : Term := ⟨stx.getArg 4⟩
+  let (env, currNs, openDecls) ← getCssScope
+  let mut themeNames : List Name := []
+  if (stx.getArg 5).getNumArgs == 2 then
+    let thId : Ident := ⟨(stx.getArg 5).getArg 1⟩
+    let some thInfo := resolveInRegistry (themeMetaRegistry.getState env) env currNs openDecls thId.getId.toString
+      | throwErrorAt thId s!"unknown `theme` `{thId.getId}`"
+    themeNames := themeNames ++ [thInfo.fullName]
+  let bgOpt? ← if (stx.getArg 6).getNumArgs == 2 then do
+      let (bg, th?) ← liftCoreM <| resolveContrastBgStx env currNs openDecls ((stx.getArg 6).getArg 1)
+      if let some th := th? then themeNames := themeNames ++ [th]
+      pure (some bg)
+    else pure none
+  let stylesTerm ← resolveStylesTargetTerm target
+  let palTerm ← liftMacroM <| mkThemePaletteTerm env themeNames
+  let bgTerm ← liftMacroM <| quoteFallbackBgOpt bgOpt?
+  checkContrastEval stx minX100 (← `(Qed.findStylesContrastViolations $(quote minX100) $palTerm $bgTerm ($stylesTerm)))
+  elabCommand (← `(command| example : Qed.checkStylesContrast $(quote minX100) $palTerm $bgTerm ($stylesTerm) = true := by decide))
 
 end Qed.StyleDsl

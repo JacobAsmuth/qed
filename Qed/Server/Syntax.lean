@@ -1,5 +1,6 @@
 import Lean
 import Qed.Lang
+import Qed.Invariant.State
 
 namespace Qed.Server
 
@@ -64,6 +65,11 @@ def extHttpMethod : Parser := identEq `get <|> identEq `post <|> identEq `put <|
 @[srvChanSubClause_parser] def srvChanOnSendClause : Parser := leading_parser
   withPosition (atomic (identEq `on_send >> checkNoWsBefore "" >> "(") >> sepBy1 srvParam "," >> ")" >> ":" >> srvContractSuite "expected indented `on_send` body" srvRequiresLine)
 @[srvChanSubClause_parser] def srvChanOnLeaveClause : Parser := leading_parser withPosition (atomic (identEq `on_leave) >> ":" >> qedSuite)
+@[srvChanSubClause_parser] def srvChanProjectClause : Parser := leading_parser
+  withPosition (atomic (identEq `project >> checkNoWsBefore "" >> "(") >> srvParam >> ")" >> optional (" -> " >> qType) >> ":" >>
+    checkColGt "expected indented `project` body" >>
+    withPosition (many (atomic (checkColEq "contract" >> categoryParser `qedFnContract 0)) >>
+                  many1 (checkColEq "statement" >> categoryParser `qedStmt 0)))
 @[srvClause_parser] def srvChannelClause : Parser := leading_parser
   withPosition (atomic (identEq `channel) >> callSig srvParam >> optional (indentedCat "expected indented `channel` clauses" `srvChanSubClause))
 
@@ -82,7 +88,8 @@ private def identDotTransaction : Parser :=
 @[srvClause_parser] def srvJobClause : Parser := leading_parser withPosition (atomic (identEq `every) >> numLit >> ident >> ident >> ":" >> qedSuite)
 @[srvClause_parser] def srvOnCreateAccountClause : Parser := leading_parser authHook `onCreateAccount
 @[srvClause_parser] def srvOnSignInClause : Parser := leading_parser authHook `onSignIn
-@[command_parser] def serverCmd : Parser := leading_parser blockCmd "server " "expected indented `server` body" `srvClause
+@[command_parser] def serverCmd : Parser := leading_parser
+  withPosition ("server " >> optional (atomic (identEq `stateless)) >> ident >> indentedCat "expected indented `server` body" `srvClause)
 
 @[fullstackClause_parser] def fsServerClause : Parser := leading_parser withPosition ("server " >> ident)
 @[fullstackClause_parser] def fsClientClause : Parser := leading_parser withPosition (atomic (identEq `client) >> ident)

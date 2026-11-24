@@ -15,6 +15,7 @@ structure ComponentInfo where mk ::
   (fullName : Lean.Name) (kind : CompMountKind) (hasProps : Bool)
   (propNames slotNames bindNames : Array Lean.Name) (hasChildren : Bool) (events : Array CompEventSig)
   (hasOut hasEffects hasStart : Bool := false) (mountable : Bool := true) (hasLocalDef : Bool := false)
+  (hasQueries hasSubscriptions : Bool := false)
   (rootTag? : Option String) (usedRpcs usedChannels : Array (String × String) := #[])
 deriving Inhabited
 
@@ -34,7 +35,7 @@ private abbrev pType : Parser := categoryParser `qedType 0
 private abbrev pPat  : Parser := categoryParser `qedPat 0
 private abbrev kwPos (k : Name) (p : Parser) : Parser := withPosition (atomic (identEq k) >> p)
 private def compParam     : Parser := node `Qed.componentParam (ident >> ":" >> pType)
-private def compParamsOpt : Parser := optional (checkLineEq >> "(" >> sepBy1 compParam "," >> ")")
+private def compParamsOpt : Parser := optional (checkLineEq >> "(" >> sepBy compParam "," >> ")")
 
 def compFieldClause : Parser := leading_parser withPosition (
   (atomic (identEq `state) <|> atomic (identEq `ephemeral) <|> atomic (identEq `prop) <|> atomic (identEq `bind) <|> atomic (identEq `collection)) >>
@@ -60,17 +61,25 @@ def compSubscribeClause : Parser := leading_parser withPosition (
   atomic (identEq `subscribe >> ident >> "=") >> ident >> "(" >> sepBy pExpr "," >> ")" >> optional compIfCond >>
   optional (":" >> checkColGt "expected indented `subscribe` handlers" >> many1Indent compSubHandler))
 
+def compFnClause     : Parser := leading_parser kwPos `fn (ident >> compParamsOpt >> optional (" -> " >> pType) >> ":" >> qedSuite)
 def compActionClause : Parser := leading_parser kwPos `action (ident >> compParamsOpt >> ":" >> qedSuite)
 def compInvName      : Parser := leading_parser ident >> ":"
+def compInvProveCase : Parser := node `Qed.compInvProveCase
+  (withPosition (atomic (kw "case") >> sepBy1 ident "," >> ":" >> checkColGt "expected indented proof tactics" >> Parser.Tactic.tacticSeq))
+def compInvProveClause : Parser := node `Qed.compInvProveClause
+  (withPosition (atomic (identEq `prove >> ":") >> checkColGt "expected indented `case <action>:` proofs" >> many1Indent compInvProveCase))
 def compForEachInvClause : Parser := leading_parser withPosition (
   atomic ("invariant " >> compInvName >> pExpr >> kw "for_each" >> ident) >>
   optional (kw "holds_in" >> identEq `view) >> optional (kw "using" >> ident) >> optional (":=" >> termParser))
 def compInvariantClause : Parser := leading_parser withPosition (
   "invariant " >> compInvName >> sepBy1 pExpr "," >>
   optional (kw "holds_in" >> identEq `view >> optional (kw "assuming" >> pExpr)) >>
-  optional (kw "using" >> "[" >> sepBy termParser "," >> "]") >> optional (":=" >> termParser))
+  optional (kw "using" >> "[" >> sepBy termParser "," >> "]") >>
+  optional ((checkColGt <|> checkLineEq) >> compInvProveClause) >>
+  optional (":=" >> termParser))
 def compStyleClause : Parser := leading_parser withPosition (
-  "style " >> ident >> optional Qed.StyleDsl.styleExtendsClause >> optional Qed.StyleDsl.styleStrictClause >> ":" >> many1 (checkColGt >> categoryParser `cssBlockItem 0))
+  "style " >> ident >> optional Qed.StyleDsl.styleExtendsClause >> optional Qed.StyleDsl.styleStrictClause >>
+  optional Qed.StyleDsl.styleContrastClause >> ":" >> many1 (checkColGt >> categoryParser `cssBlockItem 0))
 def compStylesheetClause : Parser := leading_parser kwPos `stylesheet strLit
 def compThemeClause      : Parser := leading_parser withPosition ("theme " >> ident)
 
@@ -93,7 +102,7 @@ def compInvAny : Parser := compForEachInvClause <|> compInvariantClause <|> comp
 def compClause : Parser :=
   compSessionClause <|> compFieldClause <|> compKeyClause <|> compEventClause <|> compStartClause <|>
   compRouteClause <|> compPortOutClause <|> compPortInClause <|> compRpcQueryClause <|> compSubscribeClause <|>
-  compStyleClause <|> compStylesheetClause <|> compThemeClause <|> compHeadClause <|> compActionClause <|> compInvAny
+  compStyleClause <|> compStylesheetClause <|> compThemeClause <|> compHeadClause <|> compFnClause <|> compActionClause <|> compInvAny
 
 @[command_parser] def componentCmd : Parser := leading_parser
   optional Command.docComment >>
@@ -127,8 +136,11 @@ def isAwaitStmt (s : Syntax) : Bool :=
 def isCollMutExpr (e : Syntax) : Bool := (matchPushCall? e).isSome || (matchRemoveCall? e).isSome
 def unpackBindProp (nm : String) (v : Term) : MacroM (Option (String × Term × Term)) := do
   if nm.startsWith "bind:" then return some ((nm.drop 5).toString, ← `(($v).1), ← `(($v).2)) else return none
-def hasEffectStmt (eventNames : Array Name) (stx : Syntax) : Bool :=
-  stxAny (fun s => (s.getKind == ``qedStmtExpr && !isCollMutExpr (s.getArg 0) && !isEventEmitExpr eventNames (s.getArg 0)) || isAwaitStmt s) stx
+def isPlainCallTo (names : Array Name) (exprStx : Syntax) : Bool :=
+  let u := unwrapParens1 exprStx
+  u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent && names.contains (((u.getArg 0).getArg 0).getId.eraseMacroScopes)
+def hasEffectStmt (eventNames : Array Name) (stx : Syntax) (pureMutFns : Array Name := #[]) : Bool :=
+  stxAny (fun s => (s.getKind == ``qedStmtExpr && !isCollMutExpr (s.getArg 0) && !isEventEmitExpr eventNames (s.getArg 0) && !isPlainCallTo pureMutFns (s.getArg 0)) || isAwaitStmt s) stx
 def hasReturnStmt (stx : Syntax) : Bool := stxAny (·.getKind == ``qedStmtReturn) stx
 def lowerTypeStx (stx : Syntax) : CommandElabM Term := liftMacroM (return (← lowerQedType stx false).1)
 def lowerOptType (optNode : Syntax) : CommandElabM (Option Term) := if optNode.getNumArgs == 2 then some <$> lowerTypeStx (optNode.getArg 1) else pure none

@@ -64,7 +64,7 @@ private def withWsConn (c : TestChecker) (who : String) (port : UInt16) (origin 
 def run : IO Bool := do
   let c ← mkChecker "websockets"
   withDevApp c "Examples.LiveRoom" fun dir => do
-    checkLeakGate c "Examples.LiveRoom" #["LiveRoom.Hub.initState", "LiveRoom.Hub.dispatchM", "LiveRoom.Hub.wsDispatchM"]
+    checkLeakGate c "Examples.LiveRoom" #["LiveRoom.Hub.initState", "LiveRoom.Hub.dispatchM", "LiveRoom.Hub.wsDispatchM", "LiveRoom.Hub.wsProject"]
     let authSecret := "ws-test-secret-key"; let (aliceTok, bobTok) := (← signSessionToken authSecret "alice", ← signSessionToken authSecret "bob")
     withNativeServer c "LiveRoom native server healthy" dir #[("QED_WORKERS", some "2"), ("QED_AUTH_SECRET", some authSecret)] (dev := true) fun srv => do
       let sameOrigin := s!"http://127.0.0.1:{srv.port}"
@@ -89,7 +89,27 @@ def run : IO Bool := do
           expectEvent "alice broadcast" wsA (some 1) "hello live room"; expectEvent "bob broadcast" wsB (some 2) "hello live room"
           c.checkRpcDomainErr (E := LiveRoom.Hub.announce.Error) (α := LiveRoom.ChatMsg) "ROLLBACK returned domain error" ((← hubRpc "announce" (Qed.Proto.encode ((1 : Nat), "ROLLBACK")) (some aliceTok)).map (·.body))
           discard <| hubRpc "announce" (Qed.Proto.encode ((1 : Nat), "after rollback")) (some aliceTok)
-          expectEvent "after-rollback" wsA none "after rollback"; wsB.sendBin (WsMuxFrame.encode (.unsub 2)); IO.sleep 60
+          expectEvent "after-rollback" wsA none "after rollback"
+          expectEvent "after-rollback bob" wsB none "after rollback"
+          -- Per-viewer projected channel: alice sees the secret, bob receives redacted `none`!
+          wsA.sendBin (WsMuxFrame.encode (.sub 3 "secretFeed" (Qed.Proto.encode (1 : Nat))))
+          match ← wsA.recvMux with | some (.joinOk got _) => c.checkEq "alice secretFeed joinOk" got 3 | _ => c.check "alice secretFeed joinOk" false
+          wsB.sendBin (WsMuxFrame.encode (.sub 4 "secretFeed" (Qed.Proto.encode (1 : Nat))))
+          match ← wsB.recvMux with | some (.joinOk got _) => c.checkEq "bob secretFeed joinOk" got 4 | _ => c.check "bob secretFeed joinOk" false
+          c.checkStatus "broadcastSecret RPC status 200" (← hubRpc "broadcastSecret" (Qed.Proto.encode ((1 : Nat), ("Casino", "bob"))) (some aliceTok)) 200
+          match ← wsA.recvMux with
+          | some (.event sid payload) =>
+              c.checkEq "alice projected subId=3" sid 3
+              c.expectOk "alice decode SecretView" (Qed.Proto.decode (α := LiveRoom.SecretView) payload) fun v =>
+                c.checkEq "alice sees unredacted secret" v.secret (some "Casino")
+          | _ => c.check "alice received projected SecretView" false
+          match ← wsB.recvMux with
+          | some (.event sid payload) =>
+              c.checkEq "bob projected subId=4" sid 4
+              c.expectOk "bob decode SecretView" (Qed.Proto.decode (α := LiveRoom.SecretView) payload) fun v =>
+                c.checkEq "bob receives redacted secret (none)" v.secret none
+          | _ => c.check "bob received projected SecretView" false
+          wsB.sendBin (WsMuxFrame.encode (.unsub 2)); IO.sleep 60
           c.checkRpcProto "onlineCount == 1 after bob unsub" (← hubRpc "onlineCount") (1 : Nat)
       withWsConn c "anon" srv.port sameOrigin #[] fun _ wsAnon => do
         wsAnon.sendBin (WsMuxFrame.encode (.sub 9 "room" (Qed.Proto.encode (1 : Nat))))

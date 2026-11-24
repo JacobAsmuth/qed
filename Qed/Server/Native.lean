@@ -172,7 +172,7 @@ def fetchGcpBearerToken (cache? : Option (Prim.StateBox (Array GcpTokenCacheEntr
 /-! ## Constant-Time HMAC Token Verification & Startup-Cached Server Config -/
 
 private def isReservedTokenTag (tag : String) : Bool :=
-  match tag.toList with | 'v' :: d :: rest | 't' :: 'x' :: d :: rest => d.isDigit && rest.all Char.isDigit | _ => false
+  match tag.toList with | 'v' :: d :: rest | 't' :: 'x' :: d :: rest | 'o' :: 't' :: d :: rest => d.isDigit && rest.all Char.isDigit | _ => false
 def verifyUserTokenWithNow (secrets : List String) (token : String) (now : Nat) (requireExpiring : Bool := false) : IO (Option String) := do
   if secrets.isEmpty then return none
   match (token.splitOn ".").reverse with
@@ -672,6 +672,12 @@ private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : 
   serveHttpLoop fc.staticDir fc.port fc.devMode fc.numWorkers fun loop => do
     let cfg := loop.cfg
     let oidcRt? ← fc.authSpec?.bindM fun spec => Qed.Auth.Oidc.initOidcRuntime spec cfg.authSecrets fc.devMode
+    let htmlSecHdrs : List (String × String) :=
+      if oidcRt?.any (·.cfg.googleOneTapEnabled) && cfg.csp? == some defaultCsp then
+        [("Content-Security-Policy",
+          "default-src 'self'; script-src 'self' https://accounts.google.com/gsi/client; style-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/style; frame-src 'self' https://accounts.google.com/gsi/; connect-src 'self' https://accounts.google.com/gsi/; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"),
+         ("Cross-Origin-Opener-Policy", "same-origin-allow-popups")]
+      else loop.htmlCspHdrs
     let memSeenAuthUsers ← Prim.mkStateBox (∅ : Std.HashSet String)
     let hostScript ← if fc.devMode then pure "/qed_host.mjs" else do
       let h? := (← Prim.readStaticFile loop.staticDirFd "qed_manifest.json" 0).bind fun (_, _, bytes) =>
@@ -690,8 +696,8 @@ private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : 
       if let some st := staticTarget? then if isContentHashedAsset st.relPath then return ← serveStatic st
       let ctx ← buildRequestCtxReq cfg req clientIp body oidcRt?
       if pathOnly.startsWith "/_qed/auth/" then if let some rt := oidcRt? then
-        if (req.method == "POST" || req.method == "GET") && pathOnly == rt.cfg.logoutPath then
-          if let .error (code, msg) := checkOriginAndFetchSite req cfg.rpcAllowedOrigins? false "auth logout" then return textResp code msg
+        if ((req.method == "POST" || req.method == "GET") && pathOnly == rt.cfg.logoutPath) || (req.method == "POST" && pathOnly == "/_qed/auth/onetap") then
+          if let .error (code, msg) := checkOriginAndFetchSite req cfg.rpcAllowedOrigins? false "auth endpoint" then return textResp code msg
         let onAuthCallback? := fc.authHookFn?.map fun hookFn sub filteredClaims => ExceptT.run do
           let hookCtx : RequestCtx := { ctx with userId := some sub, claims := filteredClaims }
           let runHook (kind : UInt8) (onErr : IO Unit := pure ()) : ExceptT (Nat × String) IO (Array SetCookie) := do
@@ -703,7 +709,7 @@ private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : 
               outCookies := outCookies ++ (← runHook 0 (releaseAuthUser fc.primaryDb? memSeenAuthUsers sub))
           if hasOnSignIn then outCookies := outCookies ++ (← runHook 1)
           return outCookies
-        if let some authResp ← Qed.Auth.Oidc.handleAuthRoute execHttpCall rt req pathOnly ctx.query ctx.cookies ctx.userId ctx.claims isHead onAuthCallback? then return authResp
+        if let some authResp ← Qed.Auth.Oidc.handleAuthRoute execHttpCall rt req pathOnly ctx.query ctx.cookies ctx.userId ctx.claims isHead onAuthCallback? body then return authResp
       if req.method == "POST" && pathOnly.startsWith rpcPrefix then
         let isProtoCt (v : String) := eqCI (trimWs ((findByte v 0 59).elim v fun s => String.Pos.Raw.extract v ⟨0⟩ ⟨s⟩)) "application/x-protobuf"
         let csrfRes : Except (Nat × String) Unit := do
@@ -723,7 +729,7 @@ private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : 
         match hRes with
         | .error apiErr => return apiErrResp apiErr cookies
         | .ok (some resp) =>
-            let cspHdrs := if startsWithCI resp.contentType "text/html" && !resp.headers.any (fun (k, _) => eqCI k "content-security-policy") then loop.htmlCspHdrs else []
+            let cspHdrs := if startsWithCI resp.contentType "text/html" && !resp.headers.any (fun (k, _) => eqCI k "content-security-policy") then htmlSecHdrs else []
             return ← maybeGzipResponse resp.status resp.contentType resp.body isHead req.keepAlive false req.acceptsGzip
               (!startsWithCI resp.contentType "text/event-stream" && isCompressibleMime resp.contentType)
               (extraHeaders := resp.headers ++ cspHdrs ++ cookieHeaders (cookies.toList ++ resp.cookies))
@@ -739,7 +745,7 @@ private def runFullstackCore {Model Msg : Type} (app : Qed.App Model Msg) (fc : 
         let redirectHdrs := if ssrStatus ∈ [301, 302, 303, 307, 308] then
           (headMeta.redirect.orElse fun _ => headMeta.canonical).elim [] fun loc => if isSafeUrl loc then [("Location", sanitizeHeader loc)] else [] else []
         return ← maybeGzipResponse ssrStatus "text/html; charset=utf-8" finalHtml isHead req.keepAlive false req.acceptsGzip true
-          (extraHeaders := redirectHdrs ++ loop.htmlCspHdrs ++ [("Vary", "Accept-Encoding")])
+          (extraHeaders := redirectHdrs ++ htmlSecHdrs ++ [("Vary", "Accept-Encoding")])
       else return textResp 404 "not found"
 
     let dispatchAppReq (req : ParsedReqHead) (body : ByteArray) (clientIp : String) : IO ByteArray :=

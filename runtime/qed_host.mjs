@@ -33,8 +33,8 @@ function ensureEvent(event) {
     const et = active && e.target;
     if (!et?.closest) return;
     if (event === 'click' && e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
-      const a = et.closest('a[href], [data-qed-link]'), href = a && !a.target && !a.hasAttribute('download') ? (a.getAttribute('href') || '') : null;
-      if (href !== null && (a.hasAttribute('data-qed-link') || (href.startsWith('/') && !href.startsWith('//')))) { e.preventDefault(); history.pushState({}, '', href); active.urlChanged(href); return; }
+      const a = et.closest('a[href], [data-qed-link]'), href = a && !a.target && !a.hasAttribute('download') && !a.hasAttribute('data-qed-external') ? (a.getAttribute('href') || '') : null;
+      if (href !== null && !href.startsWith('/_qed/') && (a.hasAttribute('data-qed-link') || (href.startsWith('/') && !href.startsWith('//')))) { e.preventDefault(); history.pushState({}, '', href); active.urlChanged(href); return; }
     }
     const nt = et.closest(`[${onA}]`);
     if (nt) { if (event === 'submit') e.preventDefault(); const id = intAttr(nt, onA); if (id !== null) active.fire(nt, id); }
@@ -188,5 +188,42 @@ function mountApp(app, isTimeTravel = false) {
   return active;
 }
 
-export function boot() { mountApp(initialApp); }
+let oneTapStarted = false;
+function initGoogleOneTap() {
+  if (oneTapStarted || typeof document === 'undefined' || !document.querySelector('a[href^="/_qed/auth/login"]')) return;
+  oneTapStarted = true;
+  fetch('/_qed/auth/onetap', { credentials: 'same-origin' })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((cfg) => {
+      if (!cfg?.enabled || !cfg.clientId || !cfg.nonce) return;
+      const start = () => {
+        const gsi = globalThis.google?.accounts?.id;
+        if (!gsi) return;
+        gsi.initialize({
+          client_id: cfg.clientId,
+          nonce: cfg.nonce,
+          use_fedcm_for_prompt: true,
+          auto_select: false,
+          callback: (resp) => {
+            if (!resp?.credential) return;
+            fetch('/_qed/auth/onetap', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ credential: resp.credential }),
+            }).then((res) => { if (res.ok) location.reload(); }).catch(() => {});
+          },
+        });
+        gsi.prompt();
+      };
+      if (globalThis.google?.accounts?.id) return start();
+      const s = document.createElement('script');
+      s.src = 'https://accounts.google.com/gsi/client';
+      s.async = true; s.defer = true; s.onload = start;
+      document.head.appendChild(s);
+    })
+    .catch(() => {});
+}
+
+export function boot() { mountApp(initialApp); initGoogleOneTap(); }
 if (typeof document !== 'undefined') document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', boot) : boot();

@@ -44,6 +44,9 @@ structure ResolvedOidcConfig where
   devMode : Bool := false
 deriving Inhabited, Repr
 
+def ResolvedOidcConfig.googleOneTapEnabled (cfg : ResolvedOidcConfig) : Bool :=
+  cfg.issuer == "https://accounts.google.com" && !cfg.clientId.isEmpty
+
 structure OidcRuntime where
   cfg   : ResolvedOidcConfig
   cache : Prim.StateBox OidcCacheState
@@ -145,10 +148,14 @@ def anySecretVerify (secrets : List String) (payload sigBytes : ByteArray) : IO 
   secrets.anyM fun sec => Prim.hmacSha256Verify sec.toUTF8 payload sigBytes
 
 private def envelopeSigningKey (secret tag : String) : IO ByteArray :=
-  if tag == "tx1" then Prim.hmacSha256 secret.toUTF8 "qed-tx-subkey-v1".toUTF8 else pure secret.toUTF8
+  if tag == "tx1" then Prim.hmacSha256 secret.toUTF8 "qed-tx-subkey-v1".toUTF8
+  else if tag == "ot1" then Prim.hmacSha256 secret.toUTF8 "qed-ot-subkey-v1".toUTF8
+  else pure secret.toUTF8
 
 private def envelopeMacInput (tag body : String) : ByteArray :=
-  if tag == "tx1" then s!"qed-tx\x00{body}".toUTF8 else body.toUTF8
+  if tag == "tx1" then s!"qed-tx\x00{body}".toUTF8
+  else if tag == "ot1" then s!"qed-ot\x00{body}".toUTF8
+  else body.toUTF8
 
 private def signHmacEnvelope (secret tag : String) (expSec : Nat) (b64 : String) : IO String := do
   let body := s!"{tag}.{expSec}.{b64}"
@@ -201,12 +208,13 @@ private def filterSessionClaims (claimNames : List String) (c : JwtClaims) : Lis
   let base := c.flatClaims.filter fun (k, _) => k == "email" || k == "email_verified" || k == "name" || claimNames.contains k
   addMissing (c.email?.elim base (addMissing base "email")) "email_verified" (if c.emailVerified then "true" else "false")
 
-/-! ### Built-In OIDC Auth Endpoints (`/_qed/auth/login`, `/callback`, `/logout`, `/me`) -/
+/-! ### Built-In OIDC Auth Endpoints (`/_qed/auth/login`, `/callback`, `/logout`, `/me`, `/onetap`) -/
 
 def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqHead)
     (pathOnly queryStr : String) (cookies : List (String × String))
     (resolvedUser? : Option String) (resolvedClaims : List (String × String)) (isHead : Bool)
-    (onCallbackAuthenticated? : Option (String → List (String × String) → IO (Except (Nat × String) (Array SetCookie))) := none) :
+    (onCallbackAuthenticated? : Option (String → List (String × String) → IO (Except (Nat × String) (Array SetCookie))) := none)
+    (reqBody : ByteArray := ByteArray.empty) :
     IO (Option ByteArray) := do
   let cfg := rt.cfg
   let jsonResp (st : Nat) (body : String) (hdrs : List (String × String) := []) :=
@@ -220,6 +228,12 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
   let liftErr {α : Type} (st : Nat) (x : IO (Except String α)) (fmt : String → String := id) : ExceptT (Nat × String) IO α :=
     ExceptT.mk ((·.mapError fun e => (st, fmt e)) <$> x)
   let setCookieHdrs (cs : List SetCookie) := cs.map fun c => ("Set-Cookie", c.render)
+  let issueSessionHdrs (signKey clearCookieName : String) (claims : JwtClaims) : ExceptT (Nat × String) IO (List (String × String)) := do
+    let sessPayload : SessionPayloadV2 := { userId := claims.sub, claims := filterSessionClaims cfg.claimNames claims }
+    let extraHookCookies ← match onCallbackAuthenticated? with
+      | some onAuth => setCookieHdrs <$> Array.toList <$> ExceptT.mk (onAuth sessPayload.userId sessPayload.claims) | none => pure []
+    let sessTok ← signSessionCookieV2 signKey sessPayload cfg.sessionTtlSec
+    return setCookieHdrs [SetCookie.clear clearCookieName "/", mkHardenedCookie "qed_session" sessTok cfg.sessionTtlSec cfg.devMode] ++ extraHookCookies
 
   if req.method == "GET" && pathOnly == cfg.loginPath then
     runRoute do
@@ -251,12 +265,31 @@ def handleAuthRoute (httpExec : HttpExecFn) (rt : OidcRuntime) (req : ParsedReqH
         #[("Content-Type", "application/x-www-form-urlencoded"), ("Accept", "application/json")] (encodeFormBody formPairs).toUTF8 cfg.ssrfGuard "oidc token endpoint")
       let some idToken := tokJson.strAt? "id_token" | throw (502, "oidc token response missing `id_token`")
       let claims ← liftErr 401 (verifyOidcJwt httpExec rt idToken (expectedNonce? := some tx.nonce)) (s!"oidc id_token verification failed: {·}")
-      let sessPayload : SessionPayloadV2 := { userId := claims.sub, claims := filterSessionClaims cfg.claimNames claims }
-      let extraHookCookies ← match onCallbackAuthenticated? with
-        | some onAuth => setCookieHdrs <$> Array.toList <$> ExceptT.mk (onAuth sessPayload.userId sessPayload.claims) | none => pure []
-      let sessTok ← signSessionCookieV2 signKey sessPayload cfg.sessionTtlSec
-      return redirectResp (sanitizeReturnTo (some tx.returnTo))
-        (setCookieHdrs [SetCookie.clear "qed_auth_tx" "/", mkHardenedCookie "qed_session" sessTok cfg.sessionTtlSec cfg.devMode] ++ extraHookCookies)
+      return redirectResp (sanitizeReturnTo (some tx.returnTo)) (← issueSessionHdrs signKey "qed_auth_tx" claims)
+
+  else if req.method == "GET" && pathOnly == "/_qed/auth/onetap" then
+    if resolvedUser?.isSome || !cfg.googleOneTapEnabled then
+      return some (jsonResp 200 "{\"enabled\":false}" [("Cache-Control", "no-store")])
+    runRoute do
+      let signKey ← requireSignKey
+      let nonce ← Prim.randomHex 24
+      let cookieVal ← signHmacEnvelope signKey "ot1" ((← nowSec) + 600) (base64UrlEncode nonce.toUTF8)
+      let body := Json.render (Json.obj [("enabled", .bool true), ("clientId", .str cfg.clientId), ("nonce", .str nonce)])
+      return jsonResp 200 body (("Cache-Control", "no-store") :: setCookieHdrs [mkHardenedCookie "qed_onetap_nonce" cookieVal 600 cfg.devMode])
+
+  else if req.method == "POST" && pathOnly == "/_qed/auth/onetap" then
+    if !cfg.googleOneTapEnabled then return some (jsonResp 404 "{\"error\":\"Google One Tap not enabled\"}")
+    runRoute do
+      let signKey ← requireSignKey
+      let some rawNonceCookie := cookies.lookup "qed_onetap_nonce" | throw (400, "missing One Tap nonce cookie")
+      let some nonceB64 ← verifyHmacEnvelope cfg.sessionSecrets "ot1" rawNonceCookie (← nowSec) | throw (400, "invalid or expired One Tap nonce cookie")
+      let .ok nonceBytes := base64UrlDecode nonceB64 | throw (400, "corrupt One Tap nonce cookie")
+      let some expectedNonce := String.fromUTF8? nonceBytes | throw (400, "corrupt One Tap nonce cookie")
+      let some bodyStr := String.fromUTF8? reqBody | throw (400, "invalid UTF-8 body")
+      let .ok bodyJson := Json.parse bodyStr | throw (400, "invalid JSON body")
+      let some credential := bodyJson.strAt? "credential" | throw (400, "missing `credential`")
+      let claims ← liftErr 401 (verifyOidcJwt httpExec rt credential (expectedNonce? := some expectedNonce)) (s!"Google One Tap verification failed: {·}")
+      return jsonResp 200 "{\"ok\":true}" (("Cache-Control", "no-store") :: (← issueSessionHdrs signKey "qed_onetap_nonce" claims))
 
   else if (req.method == "POST" || req.method == "GET") && pathOnly == cfg.logoutPath then
     let hdrs := setCookieHdrs [SetCookie.clear "qed_session" "/", SetCookie.clear "qed_auth_tx" "/"]

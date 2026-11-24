@@ -10,6 +10,10 @@ schema ProtoRec:
   qty : Nat    where qty <= 500
   raw : Bytes
 
+private inductive GateTag where
+  | a | b | c | d | e | f | g | h | n (v : Nat) | s (v : String)
+  deriving BEq, Ord
+
 private def protoRT {α : Type} [ToProto α] [FromProto α] (a : α) (eq : α → α → Bool) : String :=
   let bs := Proto.encode a; s!"{Proto.encodeHex bs}|{match Proto.decode (α := α) bs with | .ok b => eq a b | .error _ => false}"
 private def tailSumAcc : Nat → Nat → Nat | 0, acc => acc | k + 1, acc => tailSumAcc k (acc + k + 1)
@@ -51,7 +55,9 @@ def run (probe i : Nat) : String :=
       let fs : Array WsMuxFrame := #[.sub 1 "room" (ByteArray.mk #[8]), .unsub 2, .send 3 "hi".toUTF8, .joinOk 4 (ByteArray.mk #[1]), .event 5 (ByteArray.mk #[2]), .err 6 "e", .closed 7 "c"]
       let mux := fs.foldl (init := "") fun acc f => acc ++ match WsMuxFrame.decode (WsMuxFrame.encode f) with | .ok d => s!"{decide (d == f)}" | .error err => err
       let recD := s!"{Reconnect.off.nextDelayMs 0}|{Reconnect.fixed 120 (some 3) |>.nextDelayMs 2}|{Reconnect.backoff 80 1000 none |>.nextDelayMs 3}"
-      s!"{sty}|{mux}|{recD}|{(fun (a b : Nat) => a * 17 + b) i (tailSumAcc (i + 5) 0)}"
+      let tags : Array GateTag := #[.a, .e, .n i, .s "ok"]
+      let tagEq := s!"{GateTag.a == .a}|{GateTag.a == .h}|{GateTag.n i == .n i}|{GateTag.n i == .s "ok"}|{tags.map (·.ctorIdx)}|{compare (GateTag.c) (.n i) == .lt}"
+      s!"{sty}|{mux}|{recD}|{tagEq}|{(fun (a b : Nat) => a * 17 + b) i (tailSumAcc (i + 5) 0)}"
 
 def counts (_ : Nat) : Nat := 1
 def probeCount : Nat := 4

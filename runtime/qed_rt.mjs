@@ -11,6 +11,7 @@ export function memo(f) { let v, done = false; return () => { if (!done) { v = f
 
 // BigInt arithmetic (monomorphic BigInt ICs)
 const B = BigInt, biAdd = (a, b) => a + b, biMul = (a, b) => a * b;
+export const getObjTagNat = (o) => B(tag(o));
 const biEq = (a, b) => a === b ? 1 : 0, biLe = (a, b) => a <= b ? 1 : 0, biLt = (a, b) => a < b ? 1 : 0;
 export const Int_sub = (a, b) => a - b, Int_neg = (a) => -a, Int_ofNat = (n) => n, Int_negSucc = (n) => -(n + 1n), Int_natAbs = (a) => a < 0n ? -a : a;
 export const Int_emod = (a, b) => { if (b === 0n) return a; const r = a % b; return r < 0n ? r + Int_natAbs(b) : r; };
@@ -82,14 +83,16 @@ export const String_length = (s) => {
   for (let i = 0; i < s.length; i++) if ((s.charCodeAt(i) & 0xFC00) === 0xD800 && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xFC00) === 0xDC00) { n--; i++; }
   return B(n);
 };
-export const String_decidableLT = (a, b) => {
+export const String_compare = (a, b) => {
+  if (a === b) return 1;
   for (let i = 0, j = 0; i < a.length && j < b.length; ) {
     const x = a.codePointAt(i), y = b.codePointAt(j);
-    if (x !== y) return x < y ? 1 : 0;
+    if (x !== y) return x < y ? 0 : 2;
     i += x > 0xFFFF ? 2 : 1; j += y > 0xFFFF ? 2 : 1;
   }
-  return a.length < b.length ? 1 : 0;
+  return a.length < b.length ? 0 : a.length > b.length ? 2 : 1;
 };
+export const String_decidableLT = (a, b) => String_compare(a, b) === 0 ? 1 : 0;
 export const String_get = (s, pos) => {
   const p = Number(pos), info = getStrInfo(s);
   if (p >= info.len) return 0;
@@ -144,6 +147,13 @@ export const ByteArray_mk = (arr) => { const u = mkBytes(Math.max(16, arr.length
 export const ByteArray_data = (ba) => own(Array.from(ba)), ByteArray_size = (ba) => B(ba.length), ByteArray_usize = (ba) => ba.length;
 export const ByteArray_get = (ba, i) => ba[Number(i)], ByteArray_getx33 = (ba, i) => ba[Number(i)] ?? 0;
 export const ByteArray_decEq = (a, b) => { if (a === b) return 1; if (a.length !== b.length) return 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return 0; return 1; };
+export const ByteArray_compare = (a, b) => {
+  if (a === b) return 1;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) if (a[i] !== b[i]) return a[i] < b[i] ? 0 : 2;
+  return a.length < b.length ? 0 : a.length > b.length ? 2 : 1;
+};
+export const ByteArray_decidableLT = (a, b) => ByteArray_compare(a, b) === 0 ? 1 : 0;
 export const ByteArray_push = (ba, b) => { const n = ba.length, u = ensureBytes(ba, n + 1, Math.max(16, (n + 1) * 2), true); u[n] = Number(b); return u.subarray(0, n + 1); };
 export const ByteArray_copySlice = (src, so, dst, dso, len, exact) => {
   const s = Math.min(Number(so), src.length), d = Number(dso), n = Math.min(Number(len), src.length - s);

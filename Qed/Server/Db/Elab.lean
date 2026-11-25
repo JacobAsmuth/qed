@@ -172,6 +172,9 @@ private partial def lowerDbExpr (colNames : Array String) (rowVar : Ident)
 private partial def renderSqlPred? (colNames : Array String) (forRls : Bool) (stx : Syntax) : Option String :=
   let recR := renderSqlPred? colNames forRls; let k := stx.getKind
   if !forRls && k == ``qedLitNum then some (toString (⟨stx.getArg 0⟩ : TSyntax `num).getNat)
+  else if !forRls && k == ``qedLitStr then
+    let s := (⟨stx.getArg 0⟩ : TSyntax `str).getString
+    if s.any (· == '\x00') then none else some ("'" ++ s.replace "'" "''" ++ "'")
   else if forRls && k == ``qedCall then
     let c := stx.getArg 0; let args := (stx.getArg 2).getSepArgs
     if c.getKind == ``qedIdent && (c.getArg 0).getId.eraseMacroScopes == `some && args.size == 1 && args[0]!.getKind == ``qedCallArgPos then recR (args[0]!.getArg 0) else none
@@ -317,9 +320,10 @@ private def elabTableSchema (t : ParsedTable) (rowTypeName : Name) (colNames : A
     let idxColTs ← idxs.mapM fun ic => mkSqlIdentTerm ic ic.getId.eraseMacroScopes.toString
     `([$[$idxColTs:term],*])
   let tblNameT ← mkSqlIdentTerm t.ident t.tableName; let schemaId := mkIdentFrom t.ident (rowTypeName ++ `schema)
+  let tblCheckTerms : Array Term := (t.singleInvs.filterMap (renderSqlPred? colNames false)).map quote
   let rlsReadT := optSqlStr (t.readPols.filterMap (renderSqlPred? colNames true))
   let rlsWriteT := optSqlStr (t.updatePols.filterMap (renderSqlPred? colNames true))
-  elabCommand (← `(command| def $schemaId : Qed.Server.Db.TableSchema := { name := $tblNameT, columns := [$[$colSchemaTerms:term],*], indexes := [$[$idxTerms:term],*], rlsRead? := $rlsReadT, rlsWrite? := $rlsWriteT }))
+  elabCommand (← `(command| def $schemaId : Qed.Server.Db.TableSchema := { name := $tblNameT, columns := [$[$colSchemaTerms:term],*], indexes := [$[$idxTerms:term],*], checks := [$[$tblCheckTerms:term],*], rlsRead? := $rlsReadT, rlsWrite? := $rlsWriteT }))
   `($schemaId)
 
 @[noinline]

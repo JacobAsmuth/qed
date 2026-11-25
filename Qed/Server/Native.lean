@@ -369,8 +369,16 @@ def migrateDatabase (cfg : Db.DbConfig) : IO (Except ApiError (List Db.Migration
       for tbl in cfg.tables do
         if ok then match ← introspectTable (Db.PgWire.execParameterized url · #[.text tbl.name.raw]) colSql idxSql 0 true with
           | .error _ => ok := false | .ok (ex, cols, idxs) => allSteps := allSteps ++ Db.diffTableSchema cols idxs tbl ex
-      if ok then liftE (applyMigrationSteps .postgres allSteps (Db.PgWire.execDdl url))
-      else liftApi (Db.PgWire.execDdl url (Db.renderDatabaseDdl .postgres cfg.tables)); return cfg.tables.map .createTable
+      if ok then
+        let steps ← liftE (applyMigrationSteps .postgres allSteps (Db.PgWire.execDdl url))
+        let chkDdl := Db.renderDatabaseCheckDdl cfg.tables
+        if !chkDdl.isEmpty then liftApi (Db.PgWire.execDdl url chkDdl)
+        return steps
+      else
+        liftApi (Db.PgWire.execDdl url (Db.renderDatabaseDdl .postgres cfg.tables))
+        let chkDdl := Db.renderDatabaseCheckDdl cfg.tables
+        if !chkDdl.isEmpty then liftApi (Db.PgWire.execDdl url chkDdl)
+        return cfg.tables.map .createTable
   | tr => liftE (execDdlOnTransport tr (cfg.tables.flatMap (·.renderDdlStatements .sqlite)) ""); return cfg.tables.map .createTable
 
 initialize pgTxBox : IO.Ref (UInt64 × Std.HashMap UInt64 Db.PgWire.PgConn) ← IO.mkRef (1, {})

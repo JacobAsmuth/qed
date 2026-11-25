@@ -481,6 +481,7 @@ structure TableSchema where
   name      : SqlIdent
   columns   : List ColumnSchema
   indexes   : List (List SqlIdent) := []
+  checks    : List String := []
   rlsRead?  : Option String := none
   rlsWrite? : Option String := none
 deriving Inhabited, Repr
@@ -495,8 +496,11 @@ def ColumnSchema.renderDef (d : SqlDialect) (c : ColumnSchema) : String :=
   c.renderCore d <| (if c.isPrimaryKey then " PRIMARY KEY" else "") ++
     (if c.isUnique && !c.isPrimaryKey then " UNIQUE" else "") ++
     optClause c.references? fun (rt, rc) => " REFERENCES " ++ rt.quoteIdent ++ "(" ++ rc.quoteIdent ++ ")"
+def TableSchema.chkName (t : TableSchema) (i : Nat) : String := "qed_chk_" ++ t.name.raw ++ "_" ++ toString i
 def TableSchema.renderCreateTable (d : SqlDialect) (t : TableSchema) : String :=
-  "CREATE TABLE IF NOT EXISTS " ++ t.name.quoteIdent ++ " (" ++ String.intercalate ", " (t.columns.map (·.renderDef d)) ++ ")"
+  let chkDefs := t.checks.zipIdx.map fun (chk, i) => "CONSTRAINT \"" ++ t.chkName i ++ "\" CHECK (" ++ chk ++ ")"
+  let defs := t.columns.map (·.renderDef d) ++ chkDefs
+  "CREATE TABLE IF NOT EXISTS " ++ t.name.quoteIdent ++ " (" ++ String.intercalate ", " defs ++ ")"
 def TableSchema.idxName (t : TableSchema) (i : Nat) : String := "idx_" ++ t.name.raw ++ "_" ++ toString i
 private def renderCreateIndex (tbl : SqlIdent) (idxName : String) (cols : List SqlIdent) : String :=
   "CREATE INDEX IF NOT EXISTS \"" ++ idxName ++ "\" ON " ++ tbl.quoteIdent ++ " (" ++ SqlIdent.joinQuoted cols ++ ")"
@@ -504,12 +508,17 @@ def TableSchema.renderIndexes (t : TableSchema) : List String :=
   t.indexes.zipIdx.map fun (cols, i) => renderCreateIndex t.name (t.idxName i) cols
 def TableSchema.renderDdlStatements (d : SqlDialect) (t : TableSchema) : List String :=
   t.renderCreateTable d :: t.renderIndexes
+def TableSchema.renderPostgresChecks (t : TableSchema) : List String :=
+  t.checks.zipIdx.map fun (chk, i) =>
+    let cn := t.chkName i
+    s!"DO $qed_chk$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '{cn}' AND conrelid = '{t.name.quoteIdent}'::regclass) THEN ALTER TABLE {t.name.quoteIdent} ADD CONSTRAINT \"{cn}\" CHECK ({chk}) NOT VALID; END IF; END $qed_chk$"
 def TableSchema.renderPostgresRls (t : TableSchema) : List String :=
   let pols :=
     (t.rlsRead?.map fun e => s!"CREATE POLICY \"qed_read_{t.name.raw}\" ON {t.name.quoteIdent} FOR SELECT USING ({e})").toList ++
     (t.rlsWrite?.map fun e => s!"CREATE POLICY \"qed_write_{t.name.raw}\" ON {t.name.quoteIdent} FOR ALL USING ({e}) WITH CHECK ({e})").toList
   if pols.isEmpty then [] else ("ALTER TABLE " ++ t.name.quoteIdent ++ " ENABLE ROW LEVEL SECURITY") :: pols
 def renderDatabaseDdl (d : SqlDialect) (tables : List TableSchema) : String := joinSqlStmts (tables.flatMap (·.renderDdlStatements d))
+def renderDatabaseCheckDdl (tables : List TableSchema) : String := joinSqlStmts (tables.flatMap (·.renderPostgresChecks))
 def renderDatabaseRlsDdl (tables : List TableSchema) : String := joinSqlStmts (tables.flatMap (·.renderPostgresRls))
 
 /-! ## Pure Verified Schema Diffing & Safe Additive Migrations (`MigrationStep`) -/

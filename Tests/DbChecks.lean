@@ -426,4 +426,28 @@ database BadEncUniqueDb:
     id   : Nat primary_key
     body : encrypted(String, key = secret("K")) unique
 
+database TierCheckDb:
+  sqlite ".qed/tier_checks.db"
+  table scaling:
+    id           : String primary_key where 1 <= id.length <= 64
+    plan         : String
+    minInstances : Nat
+    maxInstances : Nat
+    invariant freeScaling:
+      minInstances <= maxInstances,
+      (plan == "pro" or plan == "enterprise") or (minInstances == 0 and maxInstances <= 1)
+
+#guard
+  let pg := TierCheckDb.ddl .postgres
+  let chk := Qed.Server.Db.renderDatabaseCheckDdl TierCheckDb.config.tables
+  pg.contains "CONSTRAINT \"qed_chk_scaling_0\" CHECK (\"minInstances\" <= \"maxInstances\")" &&
+  pg.contains "CONSTRAINT \"qed_chk_scaling_1\" CHECK ((((\"plan\" = 'pro' OR \"plan\" = 'enterprise')) OR ((\"minInstances\" = 0 AND \"maxInstances\" <= 1))))" &&
+  chk.contains "ADD CONSTRAINT \"qed_chk_scaling_1\" CHECK" &&
+  chk.contains "NOT VALID"
+
+bad_db "Database table constraint `TierCheckDb.scaling.RowInv` failed in `badFreeWarm → TierCheckDb.scaling.insert`" TierCheckDb :
+  def badFreeWarm(appId: String) -> TierCheckDb.scaling!:
+    requires 1 <= appId.length <= 64
+    return await db.scaling.insert(id = appId, plan = "free", minInstances = 1, maxInstances = 1)?
+
 end DbChecks

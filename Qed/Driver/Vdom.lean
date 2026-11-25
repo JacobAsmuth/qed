@@ -10,9 +10,11 @@ structure Handlers (msg : Type) where
   input      : IO.Ref (Array (String → msg))
   rowEv      : IO.Ref (Array (Nat → Nat → Option msg))
   mountLocal : String → String → Option String → String → (String → Option msg) → Dom.Node → IO Unit
+  reuseSlots : Bool := true
 
-def Handlers.mkNew {msg : Type} (mountLocal : String → String → Option String → String → (String → Option msg) → Dom.Node → IO Unit) : IO (Handlers msg) := do
-  return { click := ← IO.mkRef #[], input := ← IO.mkRef #[], rowEv := ← IO.mkRef #[], mountLocal }
+def Handlers.mkNew {msg : Type} (mountLocal : String → String → Option String → String → (String → Option msg) → Dom.Node → IO Unit)
+    (reuseSlots : Bool := true) : IO (Handlers msg) := do
+  return { click := ← IO.mkRef #[], input := ← IO.mkRef #[], rowEv := ← IO.mkRef #[], mountLocal, reuseSlots }
 def rowEvBase : UInt32 := 0x80000000
 def dispatchStrWithRows {msg : Type} (inputRef : IO.Ref (Array (String → msg)))
     (rowEvRef : IO.Ref (Array (Nat → Nat → Option msg))) (dispatchMsg : msg → IO Unit) (id : UInt32) (s : String) : IO Unit := do
@@ -72,10 +74,11 @@ private def buildStaticProtoDom {msg : Type} (ns : String) : Html msg → IO Dom
       for c in children do Dom.appendChild node (← buildStaticProtoDom (Dom.childNsOf ns tag) c)
       return node
 
-def registerHandler {α : Type} (tbl : IO.Ref (Array α)) (node : Dom.Node) (key : String) (v : α) : IO Unit := do
+def registerHandler {α : Type} (tbl : IO.Ref (Array α)) (node : Dom.Node) (key : String) (v : α) (reuse : Bool := true) : IO Unit := do
   let ts ← tbl.get; let next := toString ts.size -- capture `ts.size` before `push` (JS mutates in place)
-  if let some i := (← Dom.getAttribute node key).toNat? then
-    if i < ts.size then tbl.set (ts.set! i v); return
+  if reuse then
+    if let some i := (← Dom.getAttribute node key).toNat? then
+      if i < ts.size then tbl.set (ts.set! i v); return
   tbl.set (ts.push v); Dom.setAttribute node key next
 
 @[inline] private def listenEv (e : String) : IO Unit := Dom.effect "event.listen" e "" ""
@@ -115,9 +118,14 @@ instance : MonadDom msg (DomM msg) where
     let slot ← Dom.getSigSlot name
     if slot > 0 then let i := slot.toNat - 1; let ts ← h.click.get; if i < ts.size then h.click.set (ts.set! i m)
     else discard <| allocSigSlot h name m
-  onEvent n ev m := fun h => do listenEv ev; registerHandler h.click n s!"data-qed-on-{ev}" m
-  onValueEvent n ev f := fun h => do listenEv ev; registerHandler h.input n s!"data-qed-onv-{ev}" f
-  mountLocalCell n key comp init props bubble := fun h => do Dom.setAttribute n "data-qed-local" (localKey comp key); h.mountLocal key comp init props bubble n
+  onEvent n ev m := fun h => do listenEv ev; registerHandler h.click n s!"data-qed-on-{ev}" m h.reuseSlots
+  onValueEvent n ev f := fun h => do listenEv ev; registerHandler h.input n s!"data-qed-onv-{ev}" f h.reuseSlots
+  mountLocalCell n key comp init props bubble := fun h => do
+    let fk := localKey comp key
+    if (← Dom.getAttribute n "data-qed-local") != fk then
+      if (← Dom.childCount n) > 0 then Dom.clearChildren n
+      Dom.setAttribute n "data-qed-local" fk
+    h.mountLocal key comp init props bubble n
   compileRowTmpl ns proto slotPaths slotAttrs evPaths evNames := fun _ => do evNames.forM listenEv; Dom.compileRowTmpl (← buildStaticProtoDom ns proto) slotPaths slotAttrs evPaths evNames
   allocRowEvSlot node fn := fun h => do
     let ts ← h.rowEv.get; let slot := ts.size; h.rowEv.set (ts.push fn)

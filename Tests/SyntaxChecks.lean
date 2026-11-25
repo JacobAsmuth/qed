@@ -727,4 +727,53 @@ example :
   SubHostShell.subscriptions.length = 1 := by
   decide
 
+-- Pure component forwarding events to pure children, keyed local children, and `bind:` children
+component PureLangSelect:
+  prop lang : String
+  event onSelect(code : String)
+  event onReset
+  view:
+    <div class="lang-select">
+      <button class="fr" onClick={onSelect("fr")}>{lang}</button>
+      <button class="rst" onClick={onReset}>Reset</button>
+    </div>
+
+component KeyedTagPicker:
+  state count : Nat = 0
+  event onPick(tag : String)
+  action pick: count += 1; onPick.emit("picked")
+  view: <button class="tag-pick" onClick={.pick}>{count}</button>
+
+component PureContentPage:
+  prop lang : String
+  bind query : String = ""
+  event onLang(code : String)
+  event onClear
+  event onTag(tag : String)
+  view:
+    <section class="content-page">
+      <PureLangSelect lang={lang} onSelect={onLang} onReset={onClear}/>
+      <PureLangSelect lang={lang} onSelect={c => onLang(c)} onReset={onClear}/>
+      <SearchBar bind:query={query} onClear={query = ""} onSubmitQuery={onTag}/>
+      <KeyedTagPicker key="tp" onPick={onTag}/>
+    </section>
+
+component PureForwardHost:
+  state lang : String = "en"
+  state query : String = ""
+  state tag : String = ""
+  action setLang(c : String): lang = c
+  view: <main><PureContentPage lang={lang} bind:query={query} onLang={.setLang} onClear={lang = "en"} onTag={tag = _}/></main>
+
+example := @PureForwardHost.app_view_eq
+example : Type → Type := PureContentPage.Props
+#guard
+  let rendered := Html.render (PureForwardHost.view PureForwardHost.init)
+  let (_, hs) := renderNode #[] (PureForwardHost.view PureForwardHost.init)
+  let s1 := PureForwardHost.update PureForwardHost.init (hs[0]?.getD (.setLang ""))
+  let s2 := PureForwardHost.update s1 (hs[1]?.getD (.setLang ""))
+  rendered.contains "class=\"lang-select\"" && rendered.contains "data-qed-local=\"SyntaxChecks.KeyedTagPicker@tp\"" &&
+  PureForwardHost.app.locals.any (·.id == "SyntaxChecks.KeyedTagPicker") &&
+  s1.lang == "fr" && s2.lang == "en"
+
 end SyntaxChecks

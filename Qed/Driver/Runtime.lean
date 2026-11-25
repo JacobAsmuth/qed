@@ -176,8 +176,7 @@ private def renderModel : IO Unit := do
   | some vst =>
       let vst' ← patchView env.handlers st.root 0 env.app.template st.model vst
       env.state.modify fun s => { s with vstate := some vst' }
-  for (k, inst) in (← env.localCtx.instances.get).toList do
-    unless (← Dom.isConnected inst.host) do env.localCtx.instances.modify (·.erase k); env.localCtx.store.modify (·.erase k)
+  gcLocals env.localCtx
 private def performHttp (cb : HttpCb Msg) (send : UInt32 → IO Unit) : IO Unit := do
   let id ← allocCbId env
   let tid? ← if env.httpTimeoutMs == 0 then pure none else setTimer env s!"http:{id}" none (some (env.httpTimeoutMs, do
@@ -328,6 +327,7 @@ def runWithHttpTimeout (app : App Model Msg) (httpTimeoutMs : Nat) : IO Unit := 
       if let .ok (.obj members) := Json.parse s then
         for (k, v) in members do if let .str st := v then localCtx.store.modify (·.insert k st)
         for (k, _) in (← localCtx.instances.get).toList do withLocal k fun inst => do localRerender inst ((← localCtx.store.get).getD k "")
+        gcLocals localCtx
     dehydrate := do return app.dehydrate (← state.get).model
     effectDone := fun id result => do
       if let some act ← state.modifyGet fun s => (s.effectCb[id.toNat]?, { s with effectCb := s.effectCb.erase id.toNat }) then act result

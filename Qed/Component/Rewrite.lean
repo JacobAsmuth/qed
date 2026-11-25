@@ -421,13 +421,14 @@ private def rewriteUpperElement (ctx : RewriteCtx) (inLambda : Bool) (stx : Synt
   if let some sInfo := sInfo? then
     match ← rewriteSchemaFormElement ctx inLambda stx tag sInfo attrNames pairs kids? origBindField? with
     | .inl doneStx => return doneStx | .inr pairs' => pairs := pairs'
-  let evList : Array (String × Nat) :=
-    if let some cInfo := cInfo? then cInfo.events.map fun sig => (sig.name.toString, sig.arity)
-    else if sInfo?.isSome && ctx.wrapMsg?.isSome then #[("onSubmit", 1)] else #[]
-  if !evList.isEmpty then
-    let attrs' ← wrapEventAttrs pairs ctx.spec.msgId ctx.wrapMsg? fun aname => do
-      match evList.find? (·.1 == aname) with | some (_, arity) => some <$> (Array.range arity).mapM fun _ => `(_) | none => pure none
-    return rebuildJsxEl stx attrs' kids?
+  if !ctx.isPureComp then
+    let evList : Array (String × Nat) :=
+      if let some cInfo := cInfo? then cInfo.events.map fun sig => (sig.name.toString, sig.arity)
+      else if sInfo?.isSome && ctx.wrapMsg?.isSome then #[("onSubmit", 1)] else #[]
+    if !evList.isEmpty then
+      let attrs' ← wrapEventAttrs pairs ctx.spec.msgId ctx.wrapMsg? fun aname => do
+        match evList.find? (·.1 == aname) with | some (_, arity) => some <$> (Array.range arity).mapM fun _ => `(_) | none => pure none
+      return rebuildJsxEl stx attrs' kids?
   return rebuildJsxEl stx (pairs.map (·.2)) kids?
 
 partial def rewriteIn (ctx : RewriteCtx) (inLambda : Bool) (stx : Syntax) : CommandElabM Syntax := do

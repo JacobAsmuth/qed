@@ -1,4 +1,5 @@
 import Qed
+import Qed.Driver
 open Qed
 
 namespace JsGate
@@ -62,5 +63,82 @@ def run (probe i : Nat) : String :=
 def counts (_ : Nat) : Nat := 1
 def probeCount : Nat := 4
 def names : Array String := #["dom", "core", "proto", "wsStyle"]
+
+component LocalPanel:
+  prop tag : String = "p"
+  state mode : Nat = 0
+  state last : String = "none"
+  state newDraft : String = ""
+  state cardDraft : String = ""
+  event onHit(label : String)
+  action setMode(m : Nat): mode = m
+  action hit(lbl : String): last = lbl; onHit.emit(lbl)
+  view:
+    <div class="local-panel" data-mode={mode} data-last={last} data-new={newDraft} data-card={cardDraft} data-tag={tag}>
+      {<p class="idle">idle</p> if mode == 0 else
+        <div class="banner">
+          <button class="new0" onClick={.hit("new0")}>New0</button>
+          <button class="new1" onClick={.hit("new1")}>New1</button>
+          <input class="in-new" bind={newDraft}/>
+        </div>}
+      <div class="card">
+        <button class="card0" onClick={.hit("card0")}>Card0</button>
+        <button class="card1" onClick={.hit("card1")}>Card1</button>
+        <button class="toggle" onClick={.setMode(1 if mode == 0 else 0)}>Toggle</button>
+        <input class="in-card" bind={cardDraft}/>
+      </div>
+      {<div class="klist"><div key="kc"><button class="kcard" onClick={.hit("kcard")}>KC</button></div></div> if mode == 0 else
+        <div class="klist">
+          <div key="kb"><button class="knew" onClick={.hit("knew")}>KN</button></div>
+          <div key="kc"><button class="kcard" onClick={.hit("kcard")}>KC</button></div>
+        </div>}
+    </div>
+
+component LocalLeaf:
+  prop label : String = "leaf"
+  state n : Nat = 0
+  action bump: n += 1
+  view: <div class="leaf" data-label={label} data-n={n}><button class="leaf-inc" onClick={.bump}>Inc</button></div>
+
+component LocalNestParent:
+  state showChild : Bool = true
+  action toggle: showChild = not showChild
+  view:
+    <div class="nest-parent">
+      <button class="nest-toggle" onClick={.toggle}>ToggleChild</button>
+      {<LocalLeaf key="child" label="nested"/> if showChild else <span class="hidden">off</span>}
+    </div>
+
+component LocalBugsApp:
+  state page : Nat = 0
+  state bubbled : String = ""
+  action setPage(p : Nat): page = p
+  action record(s : String): bubbled = s
+  view:
+    <div class="root" data-page={page} data-bubbled={bubbled}>
+      <nav>
+        <button class="p0" onClick={.setPage(0)}>0</button>
+        <button class="p1" onClick={.setPage(1)}>1</button>
+        <button class="p2" onClick={.setPage(2)}>2</button>
+        <button class="p3" onClick={.setPage(3)}>3</button>
+        <button class="p4" onClick={.setPage(4)}>4</button>
+        <button class="p5" onClick={.setPage(5)}>5</button>
+        <button class="p6" onClick={.setPage(6)}>6</button>
+        <button class="p7" onClick={.setPage(7)}>7</button>
+      </nav>
+      {match page:
+        case 0: <div class="plain-page">Loading text child</div>
+        case 1: <LocalPanel key="p1" tag="v1" onHit={.record}/>
+        case 2: <LocalLeaf key="leaf2" label="alt"/>
+        case 3: <section class="wrap-a"><LocalLeaf key="moved" label="in-a"/></section>
+        case 4: <main class="wrap-b"><LocalLeaf key="moved" label="in-b"/></main>
+        case 5: <LocalNestParent key="nest"/>
+        case 6: <div class="move-a"><div class="slot0"><LocalLeaf key="swap" label="s0"/></div><span class="slot1">empty</span></div>
+        case _: <div class="move-b"><span class="slot0">empty</span><div class="slot1"><LocalLeaf key="swap" label="s1"/></div></div>}
+    </div>
+
+def localBugsMain : IO Unit := Qed.run LocalBugsApp.app
+def localBugsSsrPage1 : String := LocalBugsApp.app.renderModel { page := 1, bubbled := "" }
+def localBugsStatePage1 : String := LocalBugsApp.app.dehydrate { page := 1, bubbled := "" }
 
 end JsGate

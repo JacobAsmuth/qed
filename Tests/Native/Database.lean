@@ -264,6 +264,44 @@ private def runEncryptedColumnSuite (c : TestChecker) (srvInst : MonadServer IO)
     let badLenQ := SqlQuery.insert ⟨"entries", by decide⟩ [(⟨"id", by decide⟩, .int 99), (⟨"ownerId", by decide⟩, .text "alice"), (⟨"body", by decide⟩, .text (String.ofList (List.replicate 308 'A'))), (⟨"note", by decide⟩, .text (String.ofList (List.replicate 44 'A'))), (⟨"raw", by decide⟩, .null)] []
     c.check "[enc-db] SQLite CHECK rejects oversized ciphertext" (!(← @MonadServer.dbExec IO srvInst cfg badLenQ).isOk)
 
+private def runRoadmapSuite (c : TestChecker) (tmpDir : String) : IO Unit := do
+  let dbPath := s!"{tmpDir}/roadmap_worker.db"
+  let cfg := { DbChecks.RoadmapDb.config with endpoint := .sqlitePath dbPath, devFallback? := none, envEndpoints? := none }
+  let db := DbChecks.RoadmapDb.clientWith cfg
+  c.expectOk "[roadmap] migrateDatabase creates tables" (← Native.migrateDatabase cfg) fun _ => do
+    c.expectOk "[roadmap] client insert org" (← db.orgs.insert { id := "org1", name := "Acme" }) fun o =>
+      c.checkEq "[roadmap] org inserted" o.name "Acme"
+    c.expectOk "[roadmap] client insert project with null note" (← db.projects.insert { id := "p1", orgId := "org1", ownerId := "alice", stage := .queued, note := none }) fun p =>
+      c.checkEq "[roadmap] enum roundtrip (.queued)" p.stage DbChecks.DeployStage.queued
+    -- Re-run migrateDatabase to verify declarative `backfill` populates NULL notes.
+    c.expectOk "[roadmap] migrateDatabase runs backfill" (← Native.migrateDatabase cfg) fun _ => do
+      c.expectOk "[roadmap] backfill updated null note to migrated" (← db.projects.findOne (.eq "id" "p1")) fun
+        | some p => c.checkEq "[roadmap] note == some migrated" p.note (some "migrated")
+        | none => c.check "[roadmap] backfilled project exists" false
+    -- Standalone client upsert (insert new + update existing + policy-guarded conflict)
+    c.expectOk "[roadmap] client upsert updates existing row" (← db.projects.upsert { id := "p1", orgId := "org1", ownerId := "alice", stage := .building, note := some "v2" } ["id"] ["stage", "note"] (conflictWhere? := some (.eq "ownerId" "alice"))) fun
+      | some p => c.checkEq "[roadmap] upsert updated stage & note" (p.stage, p.note) (DbChecks.DeployStage.building, some "v2")
+      | none => c.check "[roadmap] upsert returned updated row" false
+    c.expectOk "[roadmap] client upsert rejects conflict when owner mismatches" (← db.projects.upsert { id := "p1", orgId := "org1", ownerId := "alice", stage := .live, note := some "hijack" } ["id"] ["stage", "note"] (conflictWhere? := some (.eq "ownerId" "bob"))) fun opt =>
+      c.check "[roadmap] conflict where filtered out update" opt.isNone
+    c.expectOk "[roadmap] client updateReturning" (← db.projects.updateReturning [sqlSet "stage" DbChecks.DeployStage.live] (.eq "id" "p1")) fun rows =>
+      c.checkEq "[roadmap] updateReturning returned live row" (rows.size, rows[0]?.map (·.stage)) (1, some DbChecks.DeployStage.live)
+    c.expectOk "[roadmap] client count with enum filter" (← db.projects.count (.eq "stage" DbChecks.DeployStage.live)) fun n =>
+      c.checkEq "[roadmap] live count == 1" n 1
+    -- Transaction rollback leaves DB untouched
+    let txRes ← db.transaction fun tx => do
+      let _ ← db.orgs.insert { id := "org_rb", name := "Rolled Back" } (txId? := some tx)
+      return (.error (ApiError.badRequest "abort tx") : Except ApiError Unit)
+    c.check "[roadmap] transaction returned error" (!txRes.isOk)
+    c.expectOk "[roadmap] rolled-back org not present" (← db.orgs.findOne (.eq "id" "org_rb")) fun opt =>
+      c.check "[roadmap] rollback verified" opt.isNone
+    -- Unknown column rejected cleanly before SQL compilation
+    let badCol ← db.projects.select (.eq "nonexistent_col" "x")
+    c.check "[roadmap] unknown column rejected" (!badCol.isOk)
+    -- Delete cleanup
+    c.expectOk "[roadmap] client delete project" (← db.projects.delete (.eq "id" "p1")) fun n =>
+      c.checkEq "[roadmap] deleted 1 row" n 1
+
 def run : IO Bool := do
   let c ← mkChecker "database"
   withDevApp c "Tests.DbChecks" fun dir => do
@@ -289,8 +327,11 @@ def run : IO Bool := do
       runShopDirectSuite c "sqlite-direct" (withRedirectedDb (.sqlitePath s!"{tmpDir}/shop_direct.db")) (testConcurrentReaders := true)
       runEncryptedColumnSuite c (withRedirectedDb (.sqlitePath s!"{tmpDir}/enc_vault.db"))
       runMigrationSuite c tmpDir
+      runRoadmapSuite c tmpDir
       withMockServer c "[pg-shop] start mock" (startPgWireMock s!"{tmpDir}/shop_pg_mock.db" "shopuser" "shoppass" "shopdb") (fun m => do Db.PgWire.clearPool; m.stop) fun shopPgMock => do
-        runShopDirectSuite c "pg-direct" (withRedirectedDb (.postgresUrl shopPgMock.url))
+        let ssrfRes ← Db.PgWire.execParameterized shopPgMock.url "SELECT 1" #[] (ssrfGuard := true)
+        c.check "[pg-ssrf] dynamic postgresUrl SSRF guard rejects loopback 127.0.0.1" (match ssrfRes with | .error _ => true | .ok _ => false) "expected SSRF rejection"
+        runShopDirectSuite c "pg-direct" (withRedirectedDb (.postgresUrl shopPgMock.url (ssrfGuard := false)))
         let (scramCnt, parsed) := (← shopPgMock.scramCountRef.get, ← shopPgMock.parsedSqlRef.get)
         c.check s!"[pg-direct] connection pool reused sockets across tx & queries (scram={scramCnt}, queries={parsed.size})" (scramCnt > 0 && scramCnt <= 3 && parsed.size >= 10) s!"scram={scramCnt}, queries={parsed.size}"
   c.finish

@@ -55,10 +55,10 @@ server Hub:
   invariant msgsMonotonic: totalMsgs >= old(totalMsgs)
   invariant roomsValid: all m in recent: m.roomId <= 100
 
-  def onlineCount() -> Nat:
+  rpc onlineCount() -> Nat:
     return online
 
-  def announce(roomId: Nat, text: String) -> ChatMsg!:
+  rpc announce(roomId: Nat, text: String) -> ChatMsg!:
     requires ctx.userId != none
     requires roomId <= 100, 1 <= text.length <= 280
     ensures result.roomId == roomId
@@ -93,7 +93,7 @@ server Hub:
     on_leave:
       if online > 0: online -= 1
 
-  def broadcastSecret(roomId: Nat, secretVal: String, hideFrom: String) -> Unit:
+  rpc broadcastSecret(roomId: Nat, secretVal: String, hideFrom: String) -> Unit:
     requires ctx.userId != none
     requires roomId <= 100
     secretFeed.emit(roomId, { roomId = roomId, secret = secretVal, redactedFor = [hideFrom] })

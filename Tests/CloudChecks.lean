@@ -32,10 +32,10 @@ database SplitPreviewDb:
 server NotesApi:
   use auth : ManagedAuth
   use db   : NotesDb
-  def ok() -> Bool: return true
+  rpc ok() -> Bool: return true
 server SplitPreviewSrv:
   use db : SplitPreviewDb
-  def ok() -> Bool: return true
+  rpc ok() -> Bool: return true
 component NotesShell:
   session user
   state status = "ready"
@@ -71,7 +71,7 @@ deploy StaticShellDeploy:
 server StatefulApi:
   state count : Nat = 0
   invariant nonNeg: count >= 0
-  def inc() -> Nat:
+  rpc inc() -> Nat:
     count += 1
     return count
 deploy StatefulDeploy:
@@ -79,7 +79,7 @@ deploy StatefulDeploy:
   regions [us_central1]
 server CronApi:
   every 60 s cleanup: pass
-  def ok() -> Bool: return true
+  rpc ok() -> Bool: return true
 deploy CronDeploy:
   app CronApi
 def multiEnvManifest : Qed.Deploy.DeployManifest := {
@@ -141,11 +141,11 @@ database BadSqliteDb:
     id : Nat primary_key
 server BadSqliteSrv:
   use db : BadSqliteDb
-  def ping() -> Bool: return true
+  rpc ping() -> Bool: return true
 bad_deploy "`deploy BadSqlite`: database `BadSqliteDb` uses ephemeral SQLite in `prod`" BadSqlite BadSqliteSrv
 server LoopbackEnvSrv:
   env apiUrl = "API_URL" ?? "http://localhost:9000"
-  def ping() -> String: return apiUrl
+  rpc ping() -> String: return apiUrl
 bad_deploy "`deploy BadLoopbackEnv`: server `LoopbackEnvSrv` `env apiUrl` (`API_URL`) has a loopback default (`http://localhost:9000`)" BadLoopbackEnv LoopbackEnvSrv
 expect_err "cannot combine `managed [...]` with explicit OIDC clauses in `auth BadMixedAuth`" in
 auth BadMixedAuth:

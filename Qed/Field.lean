@@ -1,4 +1,5 @@
 import Qed.Html
+import Qed.Router.Basic
 import Qed.Json.Lawful
 import Qed.Proto.Lawful
 
@@ -25,15 +26,30 @@ instance [BEq α] [LawfulBEq α] : LawfulBEq (Field p) where
   rfl {a} := beq_self_eq_true a.val
 instance [DecidableEq α] : DecidableEq (Field p) := fun ⟨a, _⟩ ⟨b, _⟩ =>
   if h : a = b then isTrue (by cases h; rfl) else isFalse fun heq => h (congrArg Field.val heq)
-private def mkField [DecidablePred p] (err : String) (a : α) : Except String (Field p) := if h : p a then .ok ⟨a, h⟩ else .error err
+@[inline] def Field.parse? {α : Type} (p : α → Prop) [DecidablePred p] (a : α) : Option (Field p) :=
+  if h : p a then some ⟨a, h⟩ else none
+@[inline] def Field.parse {α : Type} (p : α → Prop) [DecidablePred p] (err : String) (a : α) : Except String (Field p) :=
+  if h : p a then .ok ⟨a, h⟩ else .error err
+@[simp] theorem Field.parse?_val {α : Type} {p : α → Prop} [DecidablePred p] (x : Field p) : Field.parse? p x.val = some x :=
+  dite_eq_left x.ok
+@[simp] theorem Field.parse_val {α : Type} {p : α → Prop} [DecidablePred p] (err : String) (x : Field p) : Field.parse p err x.val = .ok x :=
+  dite_eq_left x.ok
 instance [ToJson α] : ToJson (Field p) := .ofEquiv Field.val
-instance [DecidablePred p] [FromJson α] : FromJson (Field p) := .ofRetract (mkField "failed field refinement")
-instance [DecidablePred p] [LawfulJson α] : LawfulJson (Field p) := .ofRetract Field.val (mkField "failed field refinement") fun ⟨_, hok⟩ => dite_eq_left hok
+instance [DecidablePred p] [FromJson α] : FromJson (Field p) := .ofRetract (Field.parse p "failed field refinement")
+instance [DecidablePred p] [LawfulJson α] : LawfulJson (Field p) := .ofRetract Field.val (Field.parse p "failed field refinement") (Field.parse_val _)
 instance [ToJson α] [NonNullJson α] : NonNullJson (Field p) := ⟨fun f => NonNullJson.toJson_ne_null f.val⟩
 instance [ToProto α] : ToProto (Field p) := .ofEquiv Field.val
-instance [DecidablePred p] [FromProto α] : FromProto (Field p) := .ofRetract (mkField "protobuf: failed field refinement")
-instance [DecidablePred p] [LawfulProto α] : LawfulProto (Field p) := .ofRetract Field.val (mkField "protobuf: failed field refinement") fun ⟨_, hok⟩ => dite_eq_left hok
+instance [DecidablePred p] [FromProto α] : FromProto (Field p) := .ofRetract (Field.parse p "protobuf: failed field refinement")
+instance [DecidablePred p] [LawfulProto α] : LawfulProto (Field p) := .ofRetract Field.val (Field.parse p "protobuf: failed field refinement") (Field.parse_val _)
 @[simp] theorem Proto.encode_field [ToProto α] (f : Field p) : Proto.encode f = Proto.encode f.val := rfl
+instance [ToHref α] : ToHref (Field p) := ⟨fun f => ToHref.toUrl f.val⟩
+instance [LawfulKey α] : LawfulKey (Field p) where
+  toKey f := LawfulKey.toKey f.val
+  injective a b h := by cases a; cases b; cases LawfulKey.injective _ _ h; rfl
+instance [RouteParam α] [DecidablePred p] : RouteParam (Field p) where
+  toSeg f := RouteParam.toSeg f.val
+  fromSeg s := (RouteParam.fromSeg s).bind (Field.parse? p)
+  round_trip f := by simp [RouteParam.round_trip]
 end FieldInstances
 
 def Field.map {α β : Type} {p : α → Prop} {q : β → Prop} (f : α → β)

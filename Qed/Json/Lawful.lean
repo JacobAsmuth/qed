@@ -112,4 +112,9 @@ instance {α : Type} [LawfulJson α] [NonNullJson α] : LawfulFromJsonField (Opt
     (FromJsonField.fromField j k : Except String α) = .ok a :=
   LawfulFromJsonField.fromField_of_field j k a h
 
+/-- Typeclass implemented by every nullary `enum` declaration, providing a lossless wire string codec. -/
+class StringEnum (α : Type) where
+  toWire : α → String
+  ofWire : String → Except String α
+
 end Qed

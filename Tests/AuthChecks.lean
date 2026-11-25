@@ -38,23 +38,32 @@ server AuthApi:
   invariant adminOnly: mutating adminCalls requires ctx.userId != none and ctx.hasClaim("role", "admin")
   onCreateAccount(user): if 1 <= user.id.length <= 128 and user.email.length <= 254: await db.profiles.insert(id = user.id, email = user.email, logins = 0)?
   onSignIn(user): if user.email.length <= 254: await db.profiles.updateOne(where = r => r.id == user.id, set = r => { email = user.email, logins = r.logins + 1 })?
-  def whoami() -> CloudAuth.User!:
+  rpc whoami() -> CloudAuth.User!:
     requires ctx.userId != none
     if let some(u) = CloudAuth.fromCtx(ctx): return u
     return fail(.unauthorized)
-  def getProfile() -> AuthNotesDb.profiles?!:
+  rpc getProfile() -> AuthNotesDb.profiles?!:
     requires ctx.userId != none
     if let some(uid) = ctx.userId: return await db.profiles.findOne(where = r => r.id == uid)?
     return none
-  def adminAction() -> Nat!:
+  rpc adminAction() -> Nat!:
     requires ctx.userId != none, ctx.hasClaim("role", "admin")
     adminCalls += 1
     return adminCalls
-  def pingBilling() -> Bool!: return await BillingApi.status()?
+  rpc pingBilling() -> Bool!: return await BillingApi.status()?
+  rpc whoamiUser() -> String!:
+    requires auth(user)
+    return f"{user.id}:{user.role}"
+
+router AuthRoute:
+  home      = "/"
+  dashboard = "/dashboard"
+  project   = "/projects/:slug"
+
 component AuthShell:
   session user
   state status = "ready"
-  view: <main><h1>Auth Test</h1><a href={CloudAuth.loginUrl("/dashboard")}>Sign in</a><a href={CloudAuth.logoutUrl("/")}>Sign out</a><p>{status}</p></main>
+  view: <main><h1>Auth Test</h1><a href={CloudAuth.loginUrl("/dashboard")}>Sign in</a><a href={CloudAuth.loginUrl(AuthRoute.dashboard)}>Sign in typed</a><a href={CloudAuth.logoutUrl("/")}>Sign out</a><a href={CloudAuth.logoutUrl(AuthRoute.home)}>Sign out typed</a><p>{status}</p></main>
 fullstack AuthApp:
   server AuthApi
   client AuthShell
@@ -63,10 +72,21 @@ example : Qed.LawfulJson CloudAuth.User × Qed.LawfulProto CloudAuth.User := (in
 example : Qed.Auth.parseJwtAlg "none" = none ∧ Qed.Auth.parseJwtAlg "HS256" = none ∧
     Qed.Auth.isSafeReturnTo "//evil.com" = false ∧ Qed.Auth.isSafeReturnTo "javascript:alert(1)" = false ∧
     (CloudAuth.loginUrl "//evil.com").raw = (CloudAuth.loginUrl "/").raw ∧
-    (CloudAuth.logoutUrl "//evil.com").raw = (CloudAuth.logoutUrl "/").raw :=
+    (CloudAuth.logoutUrl "//evil.com").raw = (CloudAuth.logoutUrl "/").raw ∧
+    (CloudAuth.loginUrl).raw = (CloudAuth.loginUrl "/").raw :=
   ⟨Qed.Auth.parseJwtAlg_rejects_none, Qed.Auth.parseJwtAlg_rejects_hs256,
-   Qed.Auth.isSafeReturnTo_rejects_protocol_relative, Qed.Auth.isSafeReturnTo_rejects_javascript, rfl, rfl⟩
+   Qed.Auth.isSafeReturnTo_rejects_protocol_relative, Qed.Auth.isSafeReturnTo_rejects_javascript,
+   rfl, rfl, rfl⟩
 #guard Qed.Auth.isSafeReturnTo "/dashboard?tab=1" && (CloudAuth.logoutUrl "/bye").raw == "/_qed/auth/logout?returnTo=%2Fbye" &&
+  (CloudAuth.loginUrl AuthRoute.dashboard).raw == (CloudAuth.loginUrl "/dashboard").raw &&
+  (CloudAuth.loginUrl (AuthRoute.project "demo")).raw == (CloudAuth.loginUrl "/projects/demo").raw &&
+  (CloudAuth.logoutUrl AuthRoute.home).raw == (CloudAuth.logoutUrl "/").raw &&
+  AuthRoute.dashboard.toPath == "/dashboard" &&
+  (AuthRoute.project "demo").toPath == "/projects/demo" &&
+  (AuthRoute.project "demo").toUrl.raw == "/projects/demo" &&
+  AuthRoute.fromPath "/projects/demo?tab=1" == some (.project "demo") &&
+  toString (AuthRoute.project "demo") == "/projects/demo" &&
+  s!"https://qed.cloud{AuthRoute.project "demo"}" == "https://qed.cloud/projects/demo" &&
   Qed.Auth.sanitizeReturnTo (some "//evil.com") == "/" && Qed.Auth.sanitizeReturnTo (some "/dashboard") == "/dashboard" &&
   CloudAuth.fromCtx { userId := some "u1", claims := [("email", "a@b.c"), ("role", "admin"), ("orgId", "org_1"), ("email_verified", "true")] } ==
     some { id := "u1", email := "a@b.c", role := "admin", orgId := some "org_1", verified := true }

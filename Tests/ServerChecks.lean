@@ -11,60 +11,60 @@ schema CheckedItem:
   label : String where 1 <= label.length <= 32
   stock : Nat    where stock <= 100
 bad_srv_st "cannot access server state `count` outside an `atomic` block in `bump`" BadToctouRead count : Nat = 0 |
-  def bump() -> Nat!:
+  rpc bump() -> Nat!:
     let c = count
     await PingApi.ping()?
     return c
 bad_srv_st "cannot access server state `count` outside an `atomic` block in `bump`" BadOutsideAtomicMut count : Nat = 0 |
-  def bump() -> Nat!:
+  rpc bump() -> Nat!:
     await PingApi.ping()?
     count += 1
     return 1
 bad_srv_st "redundant `atomic` block: `bump` has no `await` calls" BadRedundantAtomic count : Nat = 0 |
-  def bump() -> Nat:
+  rpc bump() -> Nat:
     atomic: count += 1
     return count
 bad_srv_st "cannot use `await` inside an `atomic` block" BadAwaitInAtomic count : Nat = 0 |
-  def bump() -> Nat!:
+  rpc bump() -> Nat!:
     await PingApi.ping()?
     atomic:
       await PingApi.ping()?
       count += 1
     return 1
 bad_srv1 "unhandled fallible `await` expression" BadUnhandledError :
-  def callIt() -> String:
+  rpc callIt() -> String:
     let res = await PingApi.ping()
     return "ok"
-bad_srv_st "Array index `idx` could be out of bounds for `items`:\n  • must satisfy:  idx < items.size" BadArrayBounds items : Nat[] = [10, 20] | def readAt(idx: Nat) -> Nat: return items[idx]
-bad_srv1 "Schema field rule `1 <= \"\".length and \"\".length <= 32` failed for `\"\"`." BadFieldRefinement : def makeEmpty() -> CheckedItem: return CheckedItem(label="", stock=5)
+bad_srv_st "Array index `idx` could be out of bounds for `items`:\n  • must satisfy:  idx < items.size" BadArrayBounds items : Nat[] = [10, 20] | rpc readAt(idx: Nat) -> Nat: return items[idx]
+bad_srv1 "Schema field rule `1 <= \"\".length and \"\".length <= 32` failed for `\"\"`." BadFieldRefinement : rpc makeEmpty() -> CheckedItem: return CheckedItem(label="", stock=5)
 bad_srv_inv "Server invariant `maxStock` failed in `overflow`:\n  • must satisfy:  stock + 50 <= 100" BadSingleStateInv stock : Nat = 10 | maxStock : stock <= 100 |
-  def overflow() -> Nat:
+  rpc overflow() -> Nat:
     stock += 50
     return stock
 bad_srv_inv "Server invariant `ordersMonotonic` failed in `resetOrders`:\n  • must satisfy:  0 >= orders" BadTwoStateInv orders : Nat = 5 | ordersMonotonic : orders >= old(orders) |
-  def resetOrders() -> Nat:
+  rpc resetOrders() -> Nat:
     orders = 0
     return orders
 expect_err "Server invariant `authItems` failed in `unauthenticatedPush`:\n  • must satisfy:  items.push x = items or ctx.userId != none" in
 server BadMutatingAuthInv:
   state items: Nat[] = [1]
   invariant authItems: mutating items requires ctx.userId != none
-  def unauthenticatedPush(x: Nat) -> Nat:
+  rpc unauthenticatedPush(x: Nat) -> Nat:
     items.push(x)
     return items.size
 bad_srv1 "Server postcondition `ensures result > 10` failed in `compute`:\n  • must satisfy:  5 > 10" BadServerEnsures :
-  def compute(x: Nat) -> Nat:
+  rpc compute(x: Nat) -> Nat:
     ensures result > 10
     return 5
 server CheckedSrv:
-  def buy(qty: Nat) -> Nat!:
+  rpc buy(qty: Nat) -> Nat!:
     requires ctx.userId != none, 1 <= qty <= 50
     ensures result == qty, 1 <= result <= 50
     if qty == 49: return fail(.soldOut)
     elif qty == 50: return fail(.limitReached)
     return qty
 server OtherSrv:
-  def ping() -> Nat: return 1
+  rpc ping() -> Nat: return 1
 bad_comp_sess "RPC `CheckedSrv.buy` precondition `1 <= qty <= 50` could not be proved here:\n  • must satisfy:  1 <= 0 and 0 <= 50" BadClientRequiresParam :
   if user.isSome:
     let _ = await CheckedSrv.buy(0) catch:
@@ -102,10 +102,10 @@ component InvariantSatisfiesRequires:
   view: <span>{bought}</span>
 server QuerySrv:
   state hits : Nat = 0
-  def bump() -> Nat:
+  rpc bump() -> Nat:
     hits += 1
     return hits
-  def quote(qty: Nat) -> Nat:
+  rpc quote(qty: Nat) -> Nat:
     requires ctx.userId != none, 1 <= qty <= 50
     ensures result == qty, 1 <= result <= 50
     return qty
@@ -143,7 +143,7 @@ server BadEmitSrv:
   channel bounded() -> Nat:
     ensures event <= 50
     on_join: pass
-  def pushBad() -> Unit:
+  rpc pushBad() -> Unit:
     bounded.emit(99)
     return ()
 server WsCheckSrv:
@@ -200,7 +200,7 @@ component VerifiedWsEnsures:
 server WebEssentialsSrv:
   state hits : Nat = 0
   invariant hitsBounded: hits <= 1000
-  def login(token: String) -> String:
+  rpc login(token: String) -> String:
     setCookie("qed_session", token)
     return "ok"
   get "/robots.txt": return text("User-agent: *\nAllow: /\n")
@@ -270,7 +270,7 @@ server stateless RedactedHub:
     on_join:
       pass
 
-  def pushState(code: String, loc: String, pack: String, spies: String[]) -> Unit:
+  rpc pushState(code: String, loc: String, pack: String, spies: String[]) -> Unit:
     requires ctx.userId != none
     room.emit(code, { code = code, secretLocation = loc, secretPack = pack, spyIds = spies })
 
@@ -295,7 +295,7 @@ example := @RedactedHub.room_project_channel_ensures
 expect_err "`server stateless BadStatelessSrv` forbids in-memory `state` field `count`" in
 server stateless BadStatelessSrv:
   state count : Nat = 0
-  def getCount() -> Nat:
+  rpc getCount() -> Nat:
     return count
 
 expect_err "`blindTo raw.secretLocation` failed in `LeakyProjSrv.room_project`" in
@@ -310,5 +310,106 @@ server stateless LeakyProjSrv:
         secretPack = none,
         isSpy = true
       }
+
+/-! ## Track 0 & 1 & 3 & 4: `rpc` vs private `fn`, `before:`, `requires auth`, `newId`, `mintBearerToken`, `gcpMetadata`, 5xx redaction -/
+
+enum ExtTab:
+  overview
+  deployLogs = "deploy-logs"
+
+external GcpAdcExt:
+  base "https://run.googleapis.com"
+  auth gcpMetadata
+  get "/v2/projects/:proj/locations/:tab" listLocs(proj: String, tab: ExtTab) -> String
+
+record EchoReq:
+  msg : String
+
+external GcpIdExt:
+  base "https://my-svc.run.app"
+  auth gcpMetadata("https://my-svc.run.app")
+  get "/health" health() -> String
+
+#guard GcpAdcExt.secrets.isEmpty && GcpIdExt.secrets.isEmpty
+
+router GuardedRoute:
+  home    = "/"
+  project = "/projects/:slug"
+
+server GuardedApi:
+  state hits : Nat = 0
+  state revoked : String[] = []
+  invariant hitsNonNeg: hits >= 0
+
+  before:
+    if let some(authHdr) = ctx.header("authorization"):
+      if authHdr in revoked:
+        return fail(401, "token revoked")
+
+  fn bump(n: Nat) -> Nat:
+    atomic:
+      hits += n
+      return hits
+
+  fn formatGreeting(who: String) -> String:
+    return f"hi {who}"
+
+  fn mintAndHash(uid: String) -> (String, String)!:
+    let tok = await Qed.Server.mintBearerToken(uid, 3600)?
+    let digest = await Qed.Server.hashBearerToken(tok)?
+    return (tok, digest)
+
+  rpc hello() -> String!:
+    requires auth
+    let n = await bump(1)?
+    let id = await Qed.Server.newId("req_")?
+    if id.val.length < 1: return fail(400, "unreachable")
+    return f"{formatGreeting(uid)}:{n}"
+
+  rpc whoNamed() -> String!:
+    requires auth(callerId)
+    return callerId
+
+  rpc createToken() -> (String, String)!:
+    requires auth
+    return await mintAndHash(uid)?
+
+  rpc revokeHeader(hdr: String) -> Unit:
+    revoked.push(hdr)
+
+  get "/api/ping":
+    return Qed.Server.HttpResponse.text("pong")
+
+  get "/legacy":
+    return redirect(GuardedRoute.project("demo"))
+
+  post "/api/echo":
+    let req = ctx.parseJson(EchoReq)?
+    let tag = ctx.queryParam("tag").getD("none")
+    return text(f"{tag}:{req.msg}")
+
+  channel feed() -> String:
+    on_join: pass
+    on_send(msg: String):
+      feed.emit(msg)
+
+#guard
+  !GuardedApi.methods.contains "bump" &&
+  !GuardedApi.methods.contains "formatGreeting" &&
+  !GuardedApi.methods.contains "mintAndHash" &&
+  GuardedApi.methods.contains "hello" &&
+  GuardedApi.methods.contains "whoNamed" &&
+  GuardedApi.methods.contains "createToken" &&
+  (Qed.Server.ApiError.internal "pg password leaked").wireMessage false == "internal server error" &&
+  (Qed.Server.ApiError.internal "pg password leaked").wireMessage true == "pg password leaked" &&
+  (Qed.Server.ApiError.forbidden "nope").wireMessage false == "nope" &&
+  (Qed.Server.HttpResponse.redirect GuardedRoute.home).headers == [("Location", "/")] &&
+  (Qed.Server.HttpResponse.redirect (GuardedRoute.project "demo")).headers == [("Location", "/projects/demo")] &&
+  (Qed.Server.HttpResponse.redirect "/raw").headers == [("Location", "/raw")] &&
+  (Qed.Server.HttpResponse.redirect (Qed.Server.WebhookUrl.make "https://hooks.example.com/ok")).headers == [("Location", "https://hooks.example.com/ok")] &&
+  (Qed.Server.WebhookUrl.parse? "http://insecure.example.com").isNone &&
+  ({ query := "?a=1&tag=hi+qed", body := "{\"msg\":\"yo\"}" : Qed.Server.RequestCtx }).queryParam "tag" == some "hi qed"
+
+example := @Qed.Server.ApiError.wireMessage_prod_5xx
 
 end ServerChecks

@@ -1,5 +1,7 @@
+import Qed.Field
 import Qed.Json.Lawful
 import Qed.Proto
+import Qed.Date
 import Qed.Cloud.Env
 
 namespace Qed.Server.Db
@@ -42,6 +44,14 @@ instance : FromSql ByteArray := ⟨fun
   | .null => .error "expected BLOB, got NULL" | _ => .error "expected BLOB"⟩
 instance [ToSql α] : ToSql (Option α) := ⟨fun | none => .null | some a => ToSql.toSql a⟩
 instance [FromSql α] : FromSql (Option α) := ⟨fun | .null => .ok none | v => (FromSql.fromSql (α := α) v).map some⟩
+instance {α : Type} [Qed.StringEnum α] : ToSql α := ⟨fun x => .text (Qed.StringEnum.toWire x)⟩
+instance {α : Type} [Qed.StringEnum α] : FromSql α := ⟨fun v => (FromSql.fromSql (α := String) v).bind Qed.StringEnum.ofWire⟩
+instance : ToSql Qed.Date := ⟨fun d => .text (toString d)⟩
+instance : FromSql Qed.Date := ⟨fun v => (FromSql.fromSql (α := String) v).bind fun s => (Qed.Date.parse? s).elim (.error s!"invalid Date '{s}' (expected YYYY-MM-DD)") .ok⟩
+instance {α : Type} {p : α → Prop} [ToSql α] : ToSql (Qed.Field p) := ⟨fun f => ToSql.toSql f.val⟩
+instance {α : Type} {p : α → Prop} [FromSql α] [DecidablePred p] : FromSql (Qed.Field p) :=
+  ⟨fun v => (FromSql.fromSql (α := α) v).bind (Qed.Field.parse p "database column value violated field constraint")⟩
+@[inline] def toSqlLike {Row α : Type} [ToSql α] (_proj : Row → α) (v : α) : SqlVal := ToSql.toSql v
 
 class ToSqlList (α : Type) where toSqlList : α → List SqlVal
 instance [ToSql α] : ToSqlList (List α) := ⟨List.map ToSql.toSql⟩
@@ -282,6 +292,8 @@ inductive SqlQuery where
                (leftJoinCol rightJoinCol : SqlIdent) (leftWhere rightWhere : SqlExpr)
                (orderBy : Option (SqlIdent × SqlOrderDir) := none) (limit offset : Option Nat := none)
   | insert (table : SqlIdent) (cols : List (SqlIdent × SqlVal)) (returning : List SqlIdent)
+  | upsert (table : SqlIdent) (cols : List (SqlIdent × SqlVal)) (conflictCols : List SqlIdent)
+           (updateCols : List SqlIdent) (conflictWhere? : Option SqlExpr) (returning : List SqlIdent)
   | update (table : SqlIdent) (sets : List (SqlIdent × SqlExpr)) (whereExpr : SqlExpr) (returning : List SqlIdent)
   | delete (table : SqlIdent) (whereExpr : SqlExpr) (returning : List SqlIdent)
 deriving Inhabited, DecidableEq
@@ -308,11 +320,20 @@ private theorem compileSets_no_semicolon (d : SqlDialect) :
   compileSepList_no_semicolon (α := SqlIdent × SqlExpr) _ fun (col, e) p =>
     (NoSemi.app col.quoteIdent_no_semicolon (NoSemi.lit " = " rfl)).app (e.compile_no_semicolon d p)
 
+private def renderUpsertSets : List SqlIdent → String
+  | [] => "" | [c] => c.quoteIdent ++ " = EXCLUDED." ++ c.quoteIdent
+  | c :: cs => c.quoteIdent ++ " = EXCLUDED." ++ c.quoteIdent ++ ", " ++ renderUpsertSets cs
+private theorem renderUpsertSets_no_semicolon : ∀ cs : List SqlIdent, NoSemi (renderUpsertSets cs)
+  | [] => NoSemi.lit "" rfl
+  | [c] => NoSemi.app (NoSemi.app c.quoteIdent_no_semicolon (NoSemi.lit " = EXCLUDED." rfl)) c.quoteIdent_no_semicolon
+  | c :: d :: rest => NoSemi.app (NoSemi.app (NoSemi.app (NoSemi.app c.quoteIdent_no_semicolon (NoSemi.lit " = EXCLUDED." rfl)) c.quoteIdent_no_semicolon) (NoSemi.lit ", " rfl)) (renderUpsertSets_no_semicolon (d :: rest))
+
 def SqlQuery.eraseVals : SqlQuery → SqlQuery
   | .select t c w o l off => .select t c w.eraseVals o l off
   | .count t w => .count t w.eraseVals | .aggregate op t c w => .aggregate op t c w.eraseVals
   | .joinSelect lt rt lc rc lj rj lw rw o l off => .joinSelect lt rt lc rc lj rj lw.eraseVals rw.eraseVals o l off
   | .insert t cols ret => .insert t (cols.map fun (c, _) => (c, .null)) ret
+  | .upsert t cols cc uc cw ret => .upsert t (cols.map fun (c, _) => (c, .null)) cc uc (cw.map SqlExpr.eraseVals) ret
   | .update t s w ret => .update t (s.map fun (c, e) => (c, e.eraseVals)) w.eraseVals ret
   | .delete t w ret => .delete t w.eraseVals ret
 abbrev SqlQuery.sameShape (q₁ q₂ : SqlQuery) : Prop := q₁.eraseVals = q₂.eraseVals
@@ -367,6 +388,15 @@ def SqlQuery.compile (d : SqlDialect) : SqlQuery → String × Array SqlVal
       let (valsSql, params) := compileInParams d (cols.map Prod.snd) #[]
       ("INSERT INTO " ++ tbl.quoteIdent ++ " (" ++ SqlIdent.joinQuoted (cols.map Prod.fst) ++
        ") VALUES (" ++ valsSql ++ ")" ++ renderReturning ret, params)
+  | .upsert tbl cols conflictCols updateCols conflictWhere? ret =>
+      let (valsSql, p1) := compileInParams d (cols.map Prod.snd) #[]
+      let conflictClause := " ON CONFLICT (" ++ SqlIdent.joinQuoted conflictCols ++ ") " ++
+        if updateCols.isEmpty then "DO NOTHING" else "DO UPDATE SET " ++ renderUpsertSets updateCols
+      let (whereSql, p2) := match conflictWhere? with
+        | none => ("", p1)
+        | some cw => let (ws, p2) := cw.compileQual d (tbl.quoteIdent ++ ".") p1; (" WHERE " ++ ws, p2)
+      ("INSERT INTO " ++ tbl.quoteIdent ++ " (" ++ SqlIdent.joinQuoted (cols.map Prod.fst) ++
+       ") VALUES (" ++ valsSql ++ ")" ++ conflictClause ++ whereSql ++ renderReturning ret, p2)
   | .update tbl sets whereExpr ret =>
       let (setSql, p1) := compileSets d sets #[]
       let (wSql, p2) := whereExpr.compile d p1
@@ -374,6 +404,8 @@ def SqlQuery.compile (d : SqlDialect) : SqlQuery → String × Array SqlVal
   | .delete tbl whereExpr ret =>
       let (wSql, params) := whereExpr.compile d #[]
       ("DELETE FROM " ++ tbl.quoteIdent ++ " WHERE " ++ wSql ++ renderReturning ret, params)
+
+instance : Repr SqlQuery := ⟨fun q _ => repr (q.compile .postgres).1⟩
 
 private theorem SqlQuery.compile_eraseVals (d : SqlDialect) (q : SqlQuery) : (q.compile d).1 = (q.eraseVals.compile d).1 := by
   cases q with
@@ -387,6 +419,15 @@ private theorem SqlQuery.compile_eraseVals (d : SqlDialect) (q : SqlQuery) : (q.
       have hsnd : (cols.map fun (c, _) => (c, SqlVal.null)).map Prod.snd = (cols.map Prod.snd).map fun _ => .null := by simp [List.map_map, Function.comp_def]
       have ⟨h, _⟩ := compileInParams_eraseVals d (cols.map Prod.snd) #[] #[] rfl
       simp [SqlQuery.eraseVals, SqlQuery.compile, hfst, hsnd, h]
+  | upsert tbl cols cc uc cw ret =>
+      have hfst : (cols.map fun (c, _) => (c, SqlVal.null)).map Prod.fst = cols.map Prod.fst := by simp [List.map_map, Function.comp_def]
+      have hsnd : (cols.map fun (c, _) => (c, SqlVal.null)).map Prod.snd = (cols.map Prod.snd).map fun _ => .null := by simp [List.map_map, Function.comp_def]
+      have ⟨h, hsz⟩ := compileInParams_eraseVals d (cols.map Prod.snd) #[] #[] rfl
+      cases cw with
+      | none => simp [SqlQuery.eraseVals, SqlQuery.compile, hfst, hsnd, h]
+      | some e =>
+          have ⟨he, _⟩ := e.compileQual_eraseVals d (tbl.quoteIdent ++ ".") _ _ hsz
+          simp [SqlQuery.eraseVals, SqlQuery.compile, hfst, hsnd, h, he]
   | update _ sets w _ =>
       have ⟨hS, hszS⟩ := compileSets_eraseVals d sets #[] #[] rfl
       have ⟨hW, _⟩ := w.compileQual_eraseVals d "" _ _ hszS; simp [SqlQuery.eraseVals, SqlQuery.compile, SqlExpr.compile, hS, hW]
@@ -397,20 +438,40 @@ private theorem SqlQuery.compile_eraseVals (d : SqlDialect) (q : SqlQuery) : (q.
 theorem SqlQuery.compile_sameShape (d : SqlDialect) {q₁ q₂ : SqlQuery} (hsh : q₁.sameShape q₂) :
     (q₁.compile d).1 = (q₂.compile d).1 := by rw [q₁.compile_eraseVals d, hsh, ← q₂.compile_eraseVals d]
 
+private theorem upsertTail_no_semicolon (d : SqlDialect) (tbl : SqlIdent) (cc uc : List SqlIdent) (cw : Option SqlExpr) (p1 : Array SqlVal) :
+    NoSemi ((" ON CONFLICT (" ++ SqlIdent.joinQuoted cc ++ ") " ++ if uc.isEmpty then "DO NOTHING" else "DO UPDATE SET " ++ renderUpsertSets uc) ++
+      (match cw with | none => ("", p1) | some e => let (ws, p2) := e.compileQual d (tbl.quoteIdent ++ ".") p1; (" WHERE " ++ ws, p2)).1) := by
+  refine (((((NoSemi.lit _ rfl).app (SqlIdent.joinQuotedPrefixed_no_semicolon _ (NoSemi.lit _ rfl) cc)).app (NoSemi.lit _ rfl)).app ?_)).app ?_
+  · split
+    · exact NoSemi.lit _ rfl
+    · exact (NoSemi.lit _ rfl).app (renderUpsertSets_no_semicolon uc)
+  · cases cw with
+    | none => exact NoSemi.lit _ rfl
+    | some e => exact (NoSemi.lit _ rfl).app (e.compileQual_no_semicolon d (tbl.quoteIdent ++ ".") (NoSemi.app tbl.quoteIdent_no_semicolon (NoSemi.lit "." rfl)) p1)
+
 theorem SqlQuery.compile_no_semicolon (d : SqlDialect) (q : SqlQuery) : ∀ c ∈ (q.compile d).1.toList, c ≠ ';' := by
-  cases q <;> ((intro c hc); (simp only [SqlQuery.compile, String.toList_append, List.mem_append] at hc); (revert hc); (try simp only [or_imp]); repeat any_goals constructor) <;>
-    (intro hc; first
-      | with_reducible exact SqlIdent.quoteIdent_no_semicolon _ c hc
-      | with_reducible exact SqlIdent.joinQuotedPrefixed_no_semicolon _ (NoSemi.lit _ rfl) _ c hc
-      | with_reducible exact SqlAggOp.render_no_semicolon _ c hc
-      | with_reducible exact SqlExpr.compile_no_semicolon _ _ _ c hc
-      | with_reducible exact SqlExpr.compileQual_no_semicolon _ _ (NoSemi.lit _ rfl) _ _ c hc
-      | with_reducible exact compileInParams_no_semicolon _ _ _ c hc
-      | with_reducible exact compileSets_no_semicolon _ _ _ c hc
-      | with_reducible exact renderReturning_no_semicolon _ c hc
-      | with_reducible exact renderLimitOffset_no_semicolon _ _ _ c hc
-      | with_reducible exact renderOrderBy_no_semicolon _ (NoSemi.lit _ rfl) _ c hc
-      | exact NoSemi.lit _ rfl c hc)
+  cases q with
+  | upsert tbl cols cc uc cw ret =>
+      intro c hc
+      have h1 : NoSemi ("INSERT INTO " ++ tbl.quoteIdent ++ " (" ++ SqlIdent.joinQuoted (cols.map Prod.fst) ++ ") VALUES (" ++ (compileInParams d (cols.map Prod.snd) #[]).1 ++ ")") :=
+        ((((((NoSemi.lit _ rfl).app tbl.quoteIdent_no_semicolon).app (NoSemi.lit _ rfl)).app (SqlIdent.joinQuotedPrefixed_no_semicolon _ (NoSemi.lit _ rfl) _)).app (NoSemi.lit _ rfl)).app (compileInParams_no_semicolon d _ _)).app (NoSemi.lit _ rfl)
+      have h2 := upsertTail_no_semicolon d tbl cc uc cw (compileInParams d (cols.map Prod.snd) #[]).2
+      have hAll := (h1.app h2).app (renderReturning_no_semicolon ret)
+      simpa [SqlQuery.compile, String.append_assoc] using hAll c (by simpa [SqlQuery.compile, String.append_assoc] using hc)
+  | select _ _ _ _ _ _ | count _ _ | aggregate _ _ _ _ | joinSelect _ _ _ _ _ _ _ _ _ _ _ | insert _ _ _ | update _ _ _ _ | delete _ _ _ =>
+      ((intro c hc); (simp only [SqlQuery.compile, String.toList_append, List.mem_append] at hc); (revert hc); (try simp only [or_imp]); repeat any_goals constructor) <;>
+        (intro hc; first
+          | with_reducible exact SqlIdent.quoteIdent_no_semicolon _ c hc
+          | with_reducible exact SqlIdent.joinQuotedPrefixed_no_semicolon _ (NoSemi.lit _ rfl) _ c hc
+          | with_reducible exact SqlAggOp.render_no_semicolon _ c hc
+          | with_reducible exact SqlExpr.compile_no_semicolon _ _ _ c hc
+          | with_reducible exact SqlExpr.compileQual_no_semicolon _ _ (NoSemi.lit _ rfl) _ _ c hc
+          | with_reducible exact compileInParams_no_semicolon _ _ _ c hc
+          | with_reducible exact compileSets_no_semicolon _ _ _ c hc
+          | with_reducible exact renderReturning_no_semicolon _ c hc
+          | with_reducible exact renderLimitOffset_no_semicolon _ _ _ c hc
+          | with_reducible exact renderOrderBy_no_semicolon _ (NoSemi.lit _ rfl) _ c hc
+          | exact NoSemi.lit _ rfl c hc)
 
 /-! ## Abstract Relational Policy & Invariant Soundness Model -/
 
@@ -466,6 +527,10 @@ inductive SqlColType where | text | int | bool | bytes deriving Inhabited, Decid
 def SqlColType.render (d : SqlDialect) : SqlColType → String
   | .text => "TEXT" | .int => d.pick "BIGINT" "INTEGER" | .bool => d.pick "BOOLEAN" "INTEGER" | .bytes => d.pick "BYTEA" "BLOB"
 
+inductive OnDeleteAction where | noAction | cascade | setNull | restrict deriving Inhabited, DecidableEq, Repr
+def OnDeleteAction.render : OnDeleteAction → String
+  | .noAction => "" | .cascade => " ON DELETE CASCADE" | .setNull => " ON DELETE SET NULL" | .restrict => " ON DELETE RESTRICT"
+
 structure ColumnSchema where
   name         : SqlIdent
   colType      : SqlColType
@@ -474,6 +539,7 @@ structure ColumnSchema where
   isUnique     : Bool := false
   isImmutable  : Bool := false
   references?  : Option (SqlIdent × SqlIdent) := none
+  onDelete     : OnDeleteAction := .noAction
   checkSql?    : Option String := none
 deriving Inhabited, Repr
 
@@ -495,7 +561,7 @@ private def ColumnSchema.renderCore (d : SqlDialect) (c : ColumnSchema) (mid : S
 def ColumnSchema.renderDef (d : SqlDialect) (c : ColumnSchema) : String :=
   c.renderCore d <| (if c.isPrimaryKey then " PRIMARY KEY" else "") ++
     (if c.isUnique && !c.isPrimaryKey then " UNIQUE" else "") ++
-    optClause c.references? fun (rt, rc) => " REFERENCES " ++ rt.quoteIdent ++ "(" ++ rc.quoteIdent ++ ")"
+    optClause c.references? fun (rt, rc) => " REFERENCES " ++ rt.quoteIdent ++ "(" ++ rc.quoteIdent ++ ")" ++ c.onDelete.render
 def TableSchema.chkName (t : TableSchema) (i : Nat) : String := "qed_chk_" ++ t.name.raw ++ "_" ++ toString i
 def TableSchema.renderCreateTable (d : SqlDialect) (t : TableSchema) : String :=
   let chkDefs := t.checks.zipIdx.map fun (chk, i) => "CONSTRAINT \"" ++ t.chkName i ++ "\" CHECK (" ++ chk ++ ")"
@@ -585,7 +651,7 @@ theorem diffTableSchema_self_empty (t : TableSchema) :
 inductive DbEndpoint where
   | urlEnv       (envVar : String)
   | postgresEnv  (urlEnvVar : String)
-  | postgresUrl  (url : String)
+  | postgresUrl  (url : String) (ssrfGuard : Bool := true)
   | sqlitePath   (path : String)
   | sqliteEnv    (envVar : String) (defaultPath? : Option String := none)
   | cloudflareD1 (accountEnv : String) (accountDefault? : Option String)
@@ -602,6 +668,7 @@ structure DbConfig where
   envEndpoints? : Option (Qed.Cloud.EnvMap DbEndpoint) := none
   isManaged     : Bool := false
   tables        : List TableSchema := []
+  backfills     : List SqlQuery := []
 deriving Inhabited, Repr
 
 def DbConfig.endpointForEnv (cfg : DbConfig) (env : Qed.Cloud.DeployEnv) : DbEndpoint :=

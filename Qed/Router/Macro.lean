@@ -44,6 +44,7 @@ private abbrev RouteRow := TSyntax `ident × Array (TSyntax `ident) × Array (TS
   let t : Ident := ⟨stx.getArg 1⟩
   let err (s : Syntax) (msg : String) := Macro.throwErrorAt s s!"router `{t.getId}`: {msg}"
   let (printId, parseId, rtId) := (mkIdent (t.getId ++ `print), mkIdent (t.getId ++ `parse), mkIdent (t.getId ++ `round_trip))
+  let (toPathId, toUrlId, fromPathId) := (mkIdent (t.getId ++ `toPath), mkIdent (t.getId ++ `toUrl), mkIdent (t.getId ++ `fromPath))
   let (rows, _, markedCtor) ← (stx.getArg 3).getArgs.foldlM
     (init := ((#[], #[], none) : Array RouteRow × Array (TSyntax `ident × Array (Option String)) × Option (TSyntax `ident)))
     fun (rows, patShapes, markedCtor) alt => do
@@ -95,6 +96,10 @@ private abbrev RouteRow := TSyntax `ident × Array (TSyntax `ident) × Array (TS
       intro a; cases a <;>
         (try simp only [$printId:ident, $parseId:ident, RouteParam.round_trip, RouteParam.toSeg_string, RouteParam.fromSeg_string]) <;>
         (try simp [$printId:ident, $parseId:ident, RouteParam.round_trip])
-    instance : Router $t:ident := ⟨$printId, $parseId, $rtId⟩)
+    instance : Router $t:ident := ⟨$printId, $parseId, $rtId⟩
+    @[inline, simp] def $toPathId:ident (r : $t) : String := Router.toURL r
+    @[inline, simp] def $toUrlId:ident (r : $t) : Url := Router.toUrl r
+    @[inline, simp] def $fromPathId:ident (p : String) : Option $t := Router.fromURL p
+    instance : ToString $t:ident := ⟨$toPathId⟩)
 end RouterElab
 end Qed

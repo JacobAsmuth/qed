@@ -251,6 +251,7 @@ private structure CompiledCssBlock where mk :: (items : List Qed.Item) (usedToke
 
 private partial def compileCssBlockItems (env : Environment) (currNs : Name) (openDecls : List OpenDecl) (strictTokens : Bool) (stxs : Array Syntax) : CoreM CompiledCssBlock := do
   let mut items : List Qed.Item := []; let mut toks : List String := []; let mut rules : List String := []; let mut thms : List Name := []
+  let mut seenProps : Array String := #[]
   for stx in stxs do
     let (item, t, r, th) ←
       if stx.getKind == ``cssNestedBlock then
@@ -260,8 +261,12 @@ private partial def compileCssBlockItems (env : Environment) (currNs : Name) (op
       else if stx.getKind == ``cssSimpleDecl then
         let line := (atomText (stx.getArg 0)).trimmed
         let some (p, v) := splitFirstChar ':' line | throwErrorAt (stx.getArg 0) s!"expected CSS declaration `property: value`, got `{line}`"
+        let propKey := p.trimmed
+        if seenProps.contains propKey then
+          throwErrorAt (stx.getArg 0) s!"duplicate CSS property `{propKey}` in the same style block (remove the redundant declaration)"
+        seenProps := seenProps.push propKey
         let res ← resolveAndValidateDecl (stx.getArg 0) env currNs openDecls strictTokens p v
-        pure (.decl p.trimmed res.cssText, res.usedTokens, res.extraRules, res.themes)
+        pure (.decl propKey res.cssText, res.usedTokens, res.extraRules, res.themes)
       else throwErrorAt stx s!"unexpected syntax in CSS block ({stx.getKind})"
     items := items ++ [item]; toks := toks ++ t; rules := rules ++ r; thms := (thms ++ th).eraseDups
   return .mk items toks.eraseDups rules.eraseDups thms

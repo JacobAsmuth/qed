@@ -28,6 +28,7 @@ def main (args : List String) : IO UInt32 := do
   | "rollback" :: rest      => cmdRollback rest
   | "deploy" :: rest        => cmdDeploy rest
   | "dev-auth" :: rest      => cmdDevAuth rest
+  | "stage-sdk" :: rest     => cmdStageSdk rest
   | ["test"]                => cmdTest
   | ["check"]               => cmdCheck
   | ["clean"]               => cmdClean

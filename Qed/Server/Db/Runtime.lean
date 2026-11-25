@@ -1,5 +1,4 @@
 import Lean
-import Qed.Field
 import Qed.Base64
 import Qed.Diag
 import Qed.Server.Core
@@ -8,12 +7,6 @@ import Qed.Server.Db.Core
 import Qed.Verify.Core
 
 namespace Qed.Server.Db
-
-instance {α : Type} {p : α → Prop} [ToSql α] : ToSql (Qed.Field p) := ⟨fun f => ToSql.toSql f.val⟩
-instance {α : Type} {p : α → Prop} [FromSql α] [DecidablePred p] : FromSql (Qed.Field p) where
-  fromSql v := do
-    let a ← FromSql.fromSql (α := α) v
-    if h : p a then .ok ⟨a, h⟩ else .error "database column value violated table `where` constraint"
 
 /-! ## Generic Zero-Trust Proof-Checked Database Operations -/
 
@@ -90,11 +83,12 @@ private def mapExceptList {α β : Type} (f : α → m (Except ApiError β)) : L
   | x :: xs => f x >>= fun | .error e => pure (.error e) | .ok y => (·.map (y :: ·)) <$> mapExceptList f xs
 
 def dbEncryptQuery (encWrite : List (String × EncColSpec)) (q : SqlQuery) : m (Except ApiError SqlQuery) :=
+  let encCols (cols : List (SqlIdent × SqlVal)) := mapExceptList (fun (c, v) =>
+    match encWrite.lookup c.raw with | some spec => (·.map (c, ·)) <$> dbEncryptVal spec v | none => pure (.ok (c, v))) cols
   if encWrite.isEmpty then pure (.ok q)
   else match q with
-    | .insert tbl cols ret =>
-        (·.map fun cs => .insert tbl cs ret) <$> mapExceptList (fun (c, v) =>
-          match encWrite.lookup c.raw with | some spec => (·.map (c, ·)) <$> dbEncryptVal spec v | none => pure (.ok (c, v))) cols
+    | .insert tbl cols ret => (·.map fun cs => .insert tbl cs ret) <$> encCols cols
+    | .upsert tbl cols cc uc cw ret => (·.map fun cs => .upsert tbl cs cc uc cw ret) <$> encCols cols
     | .update tbl sets w ret =>
         (·.map fun ss => .update tbl ss w ret) <$> mapExceptList (fun (c, e) =>
           match encWrite.lookup c.raw, e with
@@ -142,7 +136,7 @@ private theorem noAtomic_dbEncryptQuery (encWrite : List (String × EncColSpec))
   unfold dbEncryptQuery; split
   · exact NoAtomic.pure _
   · cases q with
-    | insert _ cols _ =>
+    | insert _ cols _ | upsert _ cols _ _ _ _ =>
         exact noAtomic_map _ (noAtomic_mapExceptList _ (fun (c, v) => by
           dsimp only; cases encWrite.lookup c.raw with
           | none => exact NoAtomic.pure _ | some spec => exact noAtomic_map _ (noAtomic_dbEncryptVal spec v)) cols)
@@ -299,6 +293,30 @@ abbrev dbInsert (cfg : DbConfig) (q : SqlQuery) (newRow : Row) (RowInv : Row →
   dbRunChecked (Q := fun res => match res with | .ok r => r = newRow ∧ RowInv r | .error _ => True)
     cfg q txId? (fun _ => .ok newRow) (fun _ => ⟨rfl, hInv⟩) (fun _ => trivial) hPolicy encWrite []
 
+abbrev dbUpsert (cfg : DbConfig) (q : SqlQuery) (newRow : Row) (decode : DbRow → Except String Row)
+    (RowInv : Row → Prop) (rowInvBool : Row → Bool) (hInvSound : ∀ r, rowInvBool r = true → RowInv r)
+    (TransInv : Row → Row → Prop) (conflictPred : Row → Bool)
+    (InsertPolicy UpdatePolicy : RequestCtx → Row → Prop) (ctx : RequestCtx)
+    (hInv : RowInv newRow) (hInsPol : InsertPolicy ctx newRow) (hUpdPolNew : UpdatePolicy ctx newRow)
+    (hUpdPolOld : ∀ r, RowInv r → conflictPred r = true → UpdatePolicy ctx r)
+    (hTrans : ∀ r, RowInv r → conflictPred r = true → TransInv r newRow)
+    (txId? : Option UInt64 := none)
+    (encWrite : List (String × EncColSpec) := []) (encRead : List (Nat × EncColSpec) := []) : m (Except ApiError Row) :=
+  dbRunChecked (Q := fun res => match res with | .ok r => RowInv r | .error _ => True)
+    cfg q txId?
+    (fun dbRes =>
+      match decodeCheckedOne decode rowInvBool "upserted database row violated verified table invariant" dbRes with
+      | .error e => .error e
+      | .ok (some r) => .ok r
+      | .ok none => .error (ApiError.forbidden "upsert conflict rejected by policy"))
+    (fun dbRes => by
+      cases hd : decodeCheckedOne decode rowInvBool "upserted database row violated verified table invariant" dbRes with
+      | error _ => trivial
+      | ok opt => cases opt with
+        | none => trivial
+        | some r => exact decodeCheckedOne_post decode rowInvBool _ hInvSound dbRes r hd)
+    (fun _ => trivial) (And.intro hInv (And.intro hInsPol (And.intro hUpdPolNew (And.intro hUpdPolOld hTrans)))) encWrite encRead
+
 end DbOps
 
 abbrev dbAggOpt {Row Val : Type} [FromSql Val] {m : Type → Type} [Monad m] [MonadServer m] (cfg : DbConfig) (q : SqlQuery) (_proj : Row → Val) :=
@@ -324,11 +342,165 @@ abbrev dbJoinSelect {RowL RowR Key : Type} [BEq Key] {m : Type → Type} [Monad 
 
 theorem some_getD_eq_self_iff {α : Type} (o : Option α) (d : α) : some (o.getD d) = o ↔ o ≠ none := by cases o <;> simp
 
+/-! ## Standalone Typed DB Client (for background workers & scripts outside `server`) -/
+
+inductive DbFilter where
+  | litTrue
+  | cmp       (op : SqlBinOp) (col : String) (val : SqlVal)
+  | isNull    (col : String)
+  | isNotNull (col : String)
+  | and       (a b : DbFilter)
+  | or        (a b : DbFilter)
+  | not       (a : DbFilter)
+
+private def resolveDbCol (tblName : String) (cols : List SqlIdent) (col : String) : Except ApiError SqlIdent :=
+  match cols.find? (·.raw == col) with
+  | some cid => .ok cid
+  | none => .error (ApiError.badRequest s!"unknown column `{col}` on table `{tblName}`")
+
+namespace DbFilter
+def eq {α : Type} [ToSql α] (col : String) (v : α) : DbFilter := .cmp .eq col (ToSql.toSql v)
+def ne {α : Type} [ToSql α] (col : String) (v : α) : DbFilter := .cmp .ne col (ToSql.toSql v)
+def lt {α : Type} [ToSql α] (col : String) (v : α) : DbFilter := .cmp .lt col (ToSql.toSql v)
+def le {α : Type} [ToSql α] (col : String) (v : α) : DbFilter := .cmp .le col (ToSql.toSql v)
+def gt {α : Type} [ToSql α] (col : String) (v : α) : DbFilter := .cmp .gt col (ToSql.toSql v)
+def ge {α : Type} [ToSql α] (col : String) (v : α) : DbFilter := .cmp .ge col (ToSql.toSql v)
+
+def toSqlExpr (tblName : String) (cols : List SqlIdent) : DbFilter → Except ApiError SqlExpr
+  | .litTrue => .ok .litTrue
+  | .cmp op col v => (resolveDbCol tblName cols col).map fun cid => .binOp op (.col cid) (.param v)
+  | .isNull col => (resolveDbCol tblName cols col).map fun cid => .isNull (.col cid)
+  | .isNotNull col => (resolveDbCol tblName cols col).map fun cid => .isNotNull (.col cid)
+  | .and a b => do return .binOp .and (← toSqlExpr tblName cols a) (← toSqlExpr tblName cols b)
+  | .or a b => do return .binOp .or (← toSqlExpr tblName cols a) (← toSqlExpr tblName cols b)
+  | .not a => do return .not (← toSqlExpr tblName cols a)
+end DbFilter
+
+@[inline] def sqlSet {α : Type} [ToSql α] (col : String) (v : α) : String × SqlVal := (col, ToSql.toSql v)
+
+structure TableHandle (Row : Type) where
+  config     : DbConfig
+  tableName  : SqlIdent
+  columns    : List SqlIdent
+  decodeRow  : DbRow → Except String Row
+  encodeRow  : Row → List (SqlIdent × SqlVal)
+  rowInvBool : Row → Bool
+  encWrite   : List (String × EncColSpec) := []
+  encRead    : List (Nat × EncColSpec) := []
+
+namespace TableHandle
+
+private def resolveCol {Row : Type} (h : TableHandle Row) (col : String) : Except ApiError SqlIdent :=
+  resolveDbCol h.tableName.raw h.columns col
+
+section Ops
+variable {Row : Type} {m : Type → Type} [Monad m] [MonadServer m]
+
+private def runDec {α : Type} (h : TableHandle Row) (qRes : Except ApiError SqlQuery) (txId? : Option UInt64)
+    (dec : DbResult → Except ApiError α) (doEnc doDec : Bool) : m (Except ApiError α) := do
+  match qRes with
+  | .error e => return .error e
+  | .ok q =>
+      let q' ← if doEnc then dbEncryptQuery h.encWrite q else pure (.ok q)
+      match q' with
+      | .error e => return .error e
+      | .ok qEnc =>
+          match ← execDbMaybeTx h.config qEnc txId? with
+          | .error e => return .error e
+          | .ok dbRes =>
+              let decRes ← if doDec then dbDecryptResult h.encRead dbRes else pure (.ok dbRes)
+              return decRes.bind dec
+
+def select (h : TableHandle Row) (where_ : DbFilter := .litTrue) (orderBy? : Option (String × Bool) := none)
+    (limit? : Option Nat := none) (offset? : Option Nat := none) (txId? : Option UInt64 := none) : m (Except ApiError (Array Row)) :=
+  runDec h (do
+    let wExpr ← where_.toSqlExpr h.tableName.raw h.columns
+    let ob ← orderBy?.mapM fun (col, asc) => (·, if asc then SqlOrderDir.asc else SqlOrderDir.desc) <$> h.resolveCol col
+    return .select h.tableName h.columns wExpr ob limit? offset?) txId?
+    (decodeCheckedArr (decodeRowErr h.decodeRow) h.rowInvBool s!"database row in `{h.tableName.raw}` violated table invariant")
+    (doEnc := false) (doDec := true)
+
+def findOne (h : TableHandle Row) (where_ : DbFilter) (orderBy? : Option (String × Bool) := none)
+    (txId? : Option UInt64 := none) : m (Except ApiError (Option Row)) :=
+  (·.map (·[0]?)) <$> h.select where_ orderBy? (limit? := some 1) (txId? := txId?)
+
+def count (h : TableHandle Row) (where_ : DbFilter := .litTrue) (txId? : Option UInt64 := none) : m (Except ApiError Nat) :=
+  runDec h (do return .count h.tableName (← where_.toSqlExpr h.tableName.raw h.columns)) txId?
+    (decodeFirstCell (α := Int) Int.toNat none 0 "count") (doEnc := false) (doDec := false)
+
+def insert (h : TableHandle Row) (row : Row) (txId? : Option UInt64 := none) : m (Except ApiError Row) :=
+  runDec h (do
+    if !h.rowInvBool row then throw (ApiError.badRequest s!"row violated table invariant for `{h.tableName.raw}`")
+    return .insert h.tableName (h.encodeRow row) h.columns) txId?
+    (fun dbRes => match decodeCheckedOne h.decodeRow h.rowInvBool s!"inserted row in `{h.tableName.raw}` violated table invariant" dbRes with
+      | .error e => .error e | .ok (some r) => .ok r
+      | .ok none => .error (ApiError.internal s!"insert into `{h.tableName.raw}` returned no row"))
+    (doEnc := true) (doDec := true)
+
+def upsert (h : TableHandle Row) (row : Row) (conflictCols : List String) (updateCols : List String)
+    (conflictWhere? : Option DbFilter := none) (txId? : Option UInt64 := none) : m (Except ApiError (Option Row)) :=
+  runDec h (do
+    if !h.rowInvBool row then throw (ApiError.badRequest s!"row violated table invariant for `{h.tableName.raw}`")
+    if conflictCols.isEmpty then throw (ApiError.badRequest s!"upsert on `{h.tableName.raw}` requires at least one conflict column")
+    let ccs ← conflictCols.mapM h.resolveCol
+    let ucs ← updateCols.mapM h.resolveCol
+    let cw? ← conflictWhere?.mapM (·.toSqlExpr h.tableName.raw h.columns)
+    return .upsert h.tableName (h.encodeRow row) ccs ucs cw? h.columns) txId?
+    (decodeCheckedOne h.decodeRow h.rowInvBool s!"upserted row in `{h.tableName.raw}` violated table invariant")
+    (doEnc := true) (doDec := true)
+
+private def runUpdate {α : Type} (h : TableHandle Row) (sets : List (String × SqlVal)) (where_ : DbFilter)
+    (retCols : List SqlIdent) (dec : DbResult → Except ApiError α) (doDec : Bool) (txId? : Option UInt64) : m (Except ApiError α) :=
+  runDec h (do
+    if sets.isEmpty then throw (ApiError.badRequest s!"update on `{h.tableName.raw}` requires at least one column assignment")
+    let sPairs ← sets.mapM fun (c, v) => (·, .param v) <$> h.resolveCol c
+    return .update h.tableName sPairs (← where_.toSqlExpr h.tableName.raw h.columns) retCols) txId? dec (doEnc := true) (doDec := doDec)
+
+def update (h : TableHandle Row) (sets : List (String × SqlVal)) (where_ : DbFilter := .litTrue)
+    (txId? : Option UInt64 := none) : m (Except ApiError Nat) :=
+  runUpdate h sets where_ [] (fun r => .ok r.affected) false txId?
+
+def updateReturning (h : TableHandle Row) (sets : List (String × SqlVal)) (where_ : DbFilter := .litTrue)
+    (txId? : Option UInt64 := none) : m (Except ApiError (Array Row)) :=
+  runUpdate h sets where_ h.columns
+    (decodeCheckedArr (decodeRowErr h.decodeRow) h.rowInvBool s!"updated row in `{h.tableName.raw}` violated table invariant")
+    true txId?
+
+def delete (h : TableHandle Row) (where_ : DbFilter) (txId? : Option UInt64 := none) : m (Except ApiError Nat) :=
+  runDec h (do return .delete h.tableName (← where_.toSqlExpr h.tableName.raw h.columns) []) txId?
+    (fun r => .ok r.affected) (doEnc := false) (doDec := false)
+
+end Ops
+end TableHandle
+
+def withTransaction {m : Type → Type} {α : Type} [Monad m] [MonadServer m]
+    (cfg : DbConfig) (body : UInt64 → m (Except ApiError α)) : m (Except ApiError α) := do
+  match ← MonadServer.dbTxBegin cfg with
+  | .error e => return .error e
+  | .ok tid =>
+      match ← body tid with
+      | .error e => MonadServer.dbTxRollback cfg tid; return .error e
+      | .ok v => (·.map fun () => v) <$> MonadServer.dbTxCommit cfg tid
+
+def sqlCmpOps : Array (String × Lean.Name) := #[
+  ("==", `Qed.Server.Db.SqlBinOp.eq), ("!=", `Qed.Server.Db.SqlBinOp.ne), ("<", `Qed.Server.Db.SqlBinOp.lt),
+  ("<=", `Qed.Server.Db.SqlBinOp.le), (">", `Qed.Server.Db.SqlBinOp.gt), (">=", `Qed.Server.Db.SqlBinOp.ge)]
+
 open Lean Elab Command in
 def mkSqlIdentTerm (ref : Syntax) (raw : String) : CommandElabM Term := do
   if !isSafeSqlIdent raw then
     throwErrorAt ref s!"invalid SQL identifier `{raw}` (must start with an ASCII letter or `_` and contain only ASCII letters, digits, and `_`, max 63 chars)"
   `(Qed.Server.Db.SqlIdent.mk $(Syntax.mkStrLit raw) (by decide))
+
+open Lean in
+@[noinline, nospecialize]
+def mkTypedSqlParamTerm {M : Type → Type} [Monad M] [MonadQuotation M] (rowTyId fId : Ident) (valT : Term) : M Term :=
+  `(Qed.Server.Db.SqlExpr.param (Qed.Server.Db.toSqlLike (fun (_r : $rowTyId) => _r.$fId) $valT))
+
+open Lean Elab Command in
+@[noinline]
+def mkEncColSpecTerm (tableName colName keyEnv : String) (fallback? : Option String) (isBytes : Bool) : CommandElabM Term :=
+  `({ keyEnv := $(Syntax.mkStrLit keyEnv), fallback? := $(quote fallback?), aad := ($(Syntax.mkStrLit s!"{tableName}.{colName}") : String).toUTF8, isBytes := $(quote isBytes) : Qed.Server.Db.EncColSpec })
 
 syntax (name := qedDbProveTac) "qedDbProve" "[" ident,* "]" str str str : tactic
 

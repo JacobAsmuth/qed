@@ -76,6 +76,23 @@ def decodeBytes : List Char → ByteArray → ByteArray
   | [], acc => acc
 def decodeSeg (s : String) : String := (String.fromUTF8? (decodeBytes s.toList .empty)).getD s
 
+def urlDecodeComponent (s : String) : String :=
+  (String.fromUTF8? (decodeBytes (s.toList.map fun c => if c == '+' then ' ' else c) .empty)).getD s
+
+private def splitAmp : List Char → List Char → List String
+  | [], acc => [String.ofList acc.reverse]
+  | c :: cs, acc => if c == '&' then String.ofList acc.reverse :: splitAmp cs [] else splitAmp cs (c :: acc)
+
+private def splitFirstEq : List Char → List Char → String × String
+  | [], acc => (String.ofList acc.reverse, "")
+  | c :: cs, acc => if c == '=' then (String.ofList acc.reverse, String.ofList cs) else splitFirstEq cs (c :: acc)
+
+def parseQueryParams (q : String) : List (String × String) :=
+  let cs := match q.toList with | '?' :: rest => rest | rest => rest
+  if cs.isEmpty then [] else (splitAmp cs []).filterMap fun pair =>
+    if pair.isEmpty then none
+    else let (k, v) := splitFirstEq pair.toList []; some (urlDecodeComponent k, urlDecodeComponent v)
+
 def joinSlash : List String → String
   | [] => "" | [s] => s | s :: ss => s ++ "/" ++ joinSlash ss
 theorem joinSlash_all (p : Char → Bool) (hslash : p '/' = true) :
@@ -123,4 +140,16 @@ instance [Router R] : ToHref R := ⟨Router.toUrl⟩
 @[simp] theorem ToHref.toHref_url (u : Url) : ToHref.toHref u = u.raw := rfl
 @[simp] theorem ToHref.toHref_route {R : Type} [Router R] (r : R) : ToHref.toHref r = Router.toURL r := rfl
 @[simp] theorem ToHref.isSafeUrl_toHref {α : Type} [ToHref α] (v : α) : isSafeUrl (ToHref.toHref v) = true := (ToHref.toUrl v).safe
+
+/-- URL or path destination accepted by redirects, `head: canonical`, and auth `returnTo` helpers.
+    Accepts `String`, `Qed.Url`, or any typed `router` value via `ToHref`. -/
+structure HrefTarget where
+  raw : String
+deriving Inhabited, DecidableEq, Repr
+
+namespace HrefTarget
+def root : HrefTarget := ⟨"/"⟩
+instance : Coe String HrefTarget := ⟨HrefTarget.mk⟩
+instance {α : Type} [ToHref α] : CoeTC α HrefTarget := ⟨fun a => ⟨ToHref.toHref a⟩⟩
+end HrefTarget
 end Qed

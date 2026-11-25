@@ -14,6 +14,9 @@ def view (r : Resource α) (ready : α → Html msg) (loading : Html msg := .tex
     (failed : String → Html msg := fun e => .text e) (idle : Html msg := .text "") : Html msg :=
   match r with | .idle => idle | .loading => loading | .ok a => ready a | .failed e => failed e
 def get? : Resource α → Option α | .ok a => some a | _ => none
+def getD (r : Resource α) (fallback : α) : α := (r.get?).getD fallback
+def isOk : Resource α → Bool | .ok _ => true | _ => false
+def isLoading : Resource α → Bool | .loading => true | _ => false
 def map (f : α → β) : Resource α → Resource β
   | .idle => .idle | .loading => .loading | .ok a => .ok (f a) | .failed e => .failed e
 def someOr (err : String := "Not found") : Resource (Option α) → Resource α
@@ -39,6 +42,19 @@ def put (c : Cached α) (issuedKey : String) (r : Resource α) (currentKey : Str
   { state := if issuedKey == currentKey then r else c.state
     seen  := match r with | .ok a => ((issuedKey, a) :: c.seen.filter (·.1 != issuedKey)).take 32 | _ => c.seen }
 def activate (c : Cached α) (k : String) : Cached α := { c with state := (c.lookup k).elim .loading .ok }
+def map (f : α → β) (c : Cached α) : Cached β :=
+  { state := c.state.map f, seen := c.seen.map fun (k, v) => (k, f v) }
+def getD (c : Cached α) (fallback : α) : α := c.state.getD fallback
+def isOk (c : Cached α) : Bool := c.state.isOk
+def isLoading (c : Cached α) : Bool := c.state.isLoading
+def updateCurrent (c : Cached α) (currentKey : String) (f : α → α) : Cached α :=
+  match c.state with
+  | .ok a => c.put currentKey (.ok (f a)) currentKey
+  | _ => c
+def setKey (c : Cached α) (currentKey : String) (val : α) : Cached α :=
+  c.put currentKey (.ok val) currentKey
+def invalidateKey (c : Cached α) (currentKey : String) : Cached α :=
+  { state := .idle, seen := c.seen.filter (·.1 != currentKey) }
 def view (c : Cached α) (ready : α → Html msg) (loading : Html msg := .text "Loading…")
     (failed : String → Html msg := fun e => .text e) (idle : Html msg := .text "") : Html msg :=
   c.state.view ready loading failed idle
@@ -201,6 +217,16 @@ theorem Cached.all_put {P : α → Prop} {c : Cached α} {k currentKey : String}
     | _ => exact hall.2 kv hkv⟩
 theorem Cached.all_lookup_state {P : α → Prop} {c : Cached α} {k : String} (hall : c.all P) : (c.activate k).all P :=
   ⟨by dsimp only [Cached.activate]; cases hlk : c.lookup k with | none => trivial | some a => exact Cached.lookup_of_all (P := P) hall hlk, hall.2⟩
+theorem Cached.all_setKey {P : α → Prop} {c : Cached α} {k : String} {v : α} (hall : c.all P) (hv : P v) :
+    (c.setKey k v).all P := Cached.all_put hall hv
+theorem Cached.all_updateCurrent {P : α → Prop} {c : Cached α} {k : String} {f : α → α} (hall : c.all P)
+    (hf : ∀ a, P a → P (f a)) : (c.updateCurrent k f).all P := by
+  unfold Cached.updateCurrent; cases hs : c.state with
+  | ok a => have h1 := hall.1; rw [hs] at h1; exact Cached.all_put hall (hf a h1)
+  | _ => exact hall
+theorem Cached.all_invalidateKey {P : α → Prop} {c : Cached α} {k : String} (hall : c.all P) :
+    (c.invalidateKey k).all P :=
+  ⟨trivial, fun kv hkv => hall.2 kv (List.mem_filter.1 hkv).1⟩
 end CachedProofs
 
 section QueryProofs

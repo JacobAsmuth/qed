@@ -21,6 +21,91 @@ def cmdNew (dir : String) : IO UInt32 := do
     "import Qed\nopen Qed\n\ncomponent Quantity:\n  state quantity = 1\n  action increase:\n    if quantity < 10: quantity += 1\n  action decrease:\n    if quantity > 1: quantity -= 1\n  invariant inRange: 1 <= quantity <= 10\n  view:\n    <div>\n      <button onClick={.decrease}>−</button>\n      <span>{quantity}</span>\n      <button onClick={.increase}>+</button>\n    </div>\n"
   IO.println (green s!"✓ created {dir}/"); IO.println s!"  next:  cd {dir} && qed dev"; return 0
 
+private def copyFileRaw (src dst : FilePath) (exec : Bool := false) : IO Unit := do
+  if let some parent := dst.parent then IO.FS.createDirAll parent
+  IO.FS.writeBinFile dst (← IO.FS.readBinFile src)
+  if exec then
+    let rx : IO.AccessRight := { read := true, execution := true }
+    IO.setAccessRights dst { user := { read := true, write := true, execution := true }, group := rx, other := rx }
+
+private def copyFileIfExists (src dst : FilePath) (exec : Bool := false) : IO Unit := do
+  if ← src.pathExists then copyFileRaw src dst exec
+
+private partial def copyTree (src dst : FilePath) : IO Unit := do
+  let md ← src.metadata
+  if md.type == .dir then
+    IO.FS.createDirAll dst
+    for entry in ← src.readDir do copyTree entry.path (dst / entry.fileName)
+  else if md.type == .file then copyFileRaw src dst
+
+private def copyTreeIfExists (src dst : FilePath) : IO Unit := do
+  if ← src.pathExists then copyTree src dst
+
+private def copyWithSufs (srcDir dstDir : FilePath) (base : String) (sufs : List String) : IO Unit := do
+  for suf in sufs do copyFileIfExists (srcDir / (base ++ suf)) (dstDir / (base ++ suf))
+
+private def extractQedServerBlock (lakeSrc : String) : Except String String := do
+  let lines := lakeSrc.splitOn "\n"
+  let rec go (inBlock : Bool) (acc : List String) : List String → List String
+    | [] => acc.reverse
+    | ln :: rest =>
+        if !inBlock then
+          if ln.startsWith "lean_lib QedServer" then go true [ln] rest
+          else go false acc rest
+        else
+          if ln.cliTrim.isEmpty then acc.reverse
+          else go true (ln :: acc) rest
+  let block := go false [] lines
+  if block.isEmpty then .error "could not find `lean_lib QedServer` block in source lakefile.lean"
+  else .ok ("\n".intercalate block)
+
+def renderStagedLakefile (lakeSrc : String) : Except String String := do
+  let srvBlock ← extractQedServerBlock lakeSrc
+  return "import Lake\nopen Lake DSL\n\npackage qed where\n\n" ++
+    "extern_lib libqed_server pkg := do\n" ++
+    "  inputBinFile (pkg.staticLibDir / nameToStaticLib \"qed_server\")\n\n" ++
+    "@[default_target]\nlean_lib Qed where\n\n" ++
+    srvBlock ++ "\n"
+
+def cmdStageSdk (args : List String) : IO UInt32 := do
+  let (flags, pos) := args.partition (·.startsWith "-")
+  let noBins := flags.contains "--no-bins"
+  unless flags.all (· == "--no-bins") && pos.length == 1 do
+    IO.eprintln "usage: qed stage-sdk <dir> [--no-bins]"; return 1
+  let dst : FilePath := pos[0]!
+  let home ← frameworkHome
+  let lakePath := home / "lakefile.lean"
+  unless ← lakePath.pathExists do
+    IO.eprintln (red s!"cannot find Qed framework lakefile.lean at `{lakePath}` (set QED_HOME)"); return 1
+  let libDir := home / ".lake" / "build" / "lib"
+  for req in [libDir / "libqed_server.a", libDir / "lean" / "Qed.olean"] do
+    unless ← req.pathExists do
+      IO.eprintln (red s!"missing prebuilt artifact `{req}`; run `lake build Qed QedServer` first"); return 1
+  let lakeSrc ← IO.FS.readFile lakePath
+  let stagedLake ← match renderStagedLakefile lakeSrc with
+    | .ok s => pure s
+    | .error e => IO.eprintln (red e); return 1
+  step s!"staging prebuilt Qed SDK into {dst}"
+  IO.FS.createDirAll dst
+  IO.FS.writeFile (dst / "lakefile.lean") stagedLake
+  for rel in [FilePath.mk "lean-toolchain", "Qed.lean", FilePath.mk "scripts" / "axioms.lean"] do
+    copyFileIfExists (home / rel) (dst / rel)
+  for dir in ["Qed", "runtime"] do copyTreeIfExists (home / dir) (dst / dir)
+  let dstLib := dst / ".lake" / "build" / "lib"
+  for base in ["libqed_server.a", "libqed_Qed.a", "libqed_QedServer.a"] do
+    copyWithSufs libDir dstLib base ["", ".hash", ".rsp", ".trace"]
+  let (srcLean, dstLean) := (libDir / "lean", dstLib / "lean")
+  copyWithSufs srcLean dstLean "Qed" [".olean", ".olean.private", ".olean.server", ".ilean", ".trace"]
+  copyTreeIfExists (srcLean / "Qed") (dstLean / "Qed")
+  let (srcIr, dstIr) := (home / ".lake" / "build" / "ir", dst / ".lake" / "build" / "ir")
+  copyWithSufs srcIr dstIr "Qed" [".c", ".c.o", ".c.o.export", ".c.o.noexport", ".setup.json", ".trace", ".c.trace"]
+  copyTreeIfExists (srcIr / "Qed") (dstIr / "Qed")
+  if !noBins then
+    for b in ["qed", "qedjs"] do
+      copyFileIfExists (home / ".lake" / "build" / "bin" / b) (dst / ".lake" / "build" / "bin" / b) (exec := true)
+  IO.println (green s!"✓ staged prebuilt Qed SDK at {dst}/")
+  return 0
+
 def usage : IO UInt32 := do
   IO.print <|
     "qed, a verified full-stack web toolchain\n\nUsage: qed <command>\n\n" ++
@@ -38,6 +123,7 @@ def usage : IO UInt32 := do
     "  secrets        manage app secrets (`list <app>` | `set <app> <NAME>`)\n" ++
     "  rollback       roll back an app to a previous deployment\n" ++
     "  dev-auth [p]   run local ES256 OIDC dev identity provider\n" ++
+    "  stage-sdk <d>  stage prebuilt Qed SDK (`Qed`, `QedServer`, `libqed_server.a`) for containers\n" ++
     "  test           run the native test suite (if present)\n" ++
     "  check          verify proofs + no-sorry + axioms\n" ++
     "  clean          remove build outputs\n" ++

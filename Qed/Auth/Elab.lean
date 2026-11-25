@@ -120,8 +120,8 @@ def elabAuthCmd : CommandElab := fun stx => do
   elabCommand (← `(command| theorem $(mkSub `fromCtx_userId) (ctx : Qed.Server.RequestCtx) (u : $userTyId) (h : $fromCtxId ctx = some u) : some u.id = ctx.userId := by
     unfold $fromCtxId at h; cases hUid : ctx.userId <;> simp [hUid] at h; cases h; rfl))
   for (fnLeaf, pfx) in [(`loginUrl, "/_qed/auth/login?returnTo="), (`logoutUrl, "/_qed/auth/logout?returnTo=")] do
-    elabCommand (← `(command| def $(mkSub fnLeaf) (returnTo : String := "/") : Qed.Url :=
-      (Qed.Url.parse? ($(Syntax.mkStrLit pfx) ++ Qed.Auth.urlEncodeComponent (Qed.Auth.sanitizeReturnTo (some returnTo)))).getD Qed.Url.root))
+    elabCommand (← `(command| def $(mkSub fnLeaf) (returnTo : Qed.HrefTarget := Qed.HrefTarget.root) : Qed.Url :=
+      (Qed.Url.parse? ($(Syntax.mkStrLit pfx) ++ Qed.Auth.urlEncodeComponent (Qed.Auth.sanitizeReturnTo (some returnTo.raw)))).getD Qed.Url.root))
   let secLits : Array Term := secrets.map (Syntax.mkStrLit ·)
   let spec : OidcAuthSpec := {
     name := authShort, isManaged, issuerEnv, issuerDefault?, audienceEnv, audienceDefault?,

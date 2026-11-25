@@ -129,7 +129,7 @@ private def parseExternalClauses (svcIdent : Ident) (svcName : Name) (clauses : 
       let trimmed := if rawBase.endsWith "/" then String.ofList (rawBase.toList.take (rawBase.length - 1)) else rawBase
       unless isValidWsBaseOrigin trimmed do throwErrorAt c s!"invalid `base` URL `{rawBase}`: expected pinned `https://`, `http://`, `wss://`, or `ws://` origin without `?`, `#`, `@`, or `\\`"
       baseOrigin? := some (c, trimmed)
-    else if k == ``extAuthBearer || k == ``extAuthHeader || k == ``extAuthGcp then
+    else if k == ``extAuthBearer || k == ``extAuthHeader || k == ``extAuthGcp || k == ``extAuthGcpMeta then
       if hasAuth then throwErrorAt c s!"duplicate `auth` clause in `external {svcName}`"
       hasAuth := true
       let checkEnv (stx : Syntax) : CommandElabM String := do
@@ -141,7 +141,11 @@ private def parseExternalClauses (svcIdent : Ident) (svcName : Name) (clauses : 
         let hdrName := (⟨c.getArg 3⟩ : TSyntax `str).getString
         if hdrName.isEmpty then throwErrorAt (c.getArg 3) "header name cannot be empty"
         authSpec := .headerSecret hdrName (← checkEnv (c.getArg 7))
-      else authSpec := .gcpServiceAccount (← checkEnv (c.getArg 5)) (if (c.getArg 7).getNumArgs == 2 then (⟨(c.getArg 7).getArg 1⟩ : TSyntax `str).getString else "https://www.googleapis.com/auth/cloud-platform")
+      else if k == ``extAuthGcp then
+        authSpec := .gcpServiceAccount (← checkEnv (c.getArg 5)) (if (c.getArg 7).getNumArgs == 2 then (⟨(c.getArg 7).getArg 1⟩ : TSyntax `str).getString else "https://www.googleapis.com/auth/cloud-platform")
+      else
+        let aud? : Option String := if (c.getArg 2).getNumArgs == 3 then some (⟨(c.getArg 2).getArg 1⟩ : TSyntax `str).getString else none
+        authSpec := .gcpMetadata aud?
     else if k == ``extEndpointClause then epClauses := epClauses.push c
     else if k == ``extWsClause then wsClauses := wsClauses.push c
     else throwErrorAt c "unexpected clause in `external` block"
@@ -315,6 +319,7 @@ def elabExternalCmd : CommandElab := fun stx => do
     | .none => `(Qed.Server.AuthSpec.none) | .bearerSecret v => `(Qed.Server.AuthSpec.bearerSecret $(quote v))
     | .headerSecret h v => `(Qed.Server.AuthSpec.headerSecret $(quote h) $(quote v))
     | .gcpServiceAccount v sc => `(Qed.Server.AuthSpec.gcpServiceAccount $(quote v) $(quote sc))
+    | .gcpMetadata aud? => `(Qed.Server.AuthSpec.gcpMetadata $(quote aud?))
   let hdrCmds : Array Syntax := #[
     ← if secretsList.isEmpty then `(command| def $baseId : String := $(quote baseOrigin)) else `(command| @[noinline] def $baseId : String := $(quote baseOrigin)),
     ← `(command| @[noinline] def $secId : Array String := $(quote secretsList)),

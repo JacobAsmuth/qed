@@ -30,39 +30,39 @@ def sameCompiledSql (q1 q2 : Qed.Server.Db.SqlQuery) : Bool := (q1.compile .post
   ["ENABLE ROW LEVEL SECURITY", "current_setting('qed.user_id', true)"].all (VaultDb.rlsDdl.contains ·) && sameCompiledSql (mk "alice") (mk "' OR 1=1; DROP TABLE notes; --")
 server VaultApi:
   use db : VaultDb
-  def listBooks() -> VaultDb.books[]!: return await db.books.select(orderBy = "id")?
-  def listMyNotes() -> VaultDb.notes[]!:
+  rpc listBooks() -> VaultDb.books[]!: return await db.books.select(orderBy = "id")?
+  rpc listMyNotes() -> VaultDb.notes[]!:
     requires ctx.userId != none
     return await db.notes.select(where = r => r.ownerId == ctx.userId.getD(""), orderBy = "-version", limit = 50)?
-  def getNote(noteId: Nat) -> VaultDb.notes?!:
+  rpc getNote(noteId: Nat) -> VaultDb.notes?!:
     requires ctx.userId != none
     ensures result.id == noteId
     if let some(uid) = ctx.userId: return await db.notes.findOne(where = r => r.id == noteId and r.ownerId == uid)?
     return none
-  def countMyNotes() -> Nat!:
+  rpc countMyNotes() -> Nat!:
     requires ctx.userId != none
     return await db.notes.count(where = r => r.ownerId == ctx.userId.getD(""))?
-  def createNote(noteId: Nat, body: String) -> VaultDb.notes!:
+  rpc createNote(noteId: Nat, body: String) -> VaultDb.notes!:
     requires ctx.userId != none, 1 <= body.length <= 2000
     ensures result.id == noteId, result.body == body, 1 <= result.body.length <= 2000
     let uid = ctx.userId.getD("")
     if not (1 <= uid.length <= 64): return fail(.invalidUser)
     return await db.notes.insert(id = noteId, ownerId = uid, body = body, version = 0, status = "draft")?
-  def editNote(noteId: Nat, body: String) -> VaultDb.notes?!:
+  rpc editNote(noteId: Nat, body: String) -> VaultDb.notes?!:
     requires ctx.userId != none, 1 <= body.length <= 2000
     ensures result.id == noteId, result.body == body
     return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == ctx.userId.getD(""), set = r => { body = body, version = r.version + 1 })?
-  def publishNote(noteId: Nat) -> VaultDb.notes?!:
+  rpc publishNote(noteId: Nat) -> VaultDb.notes?!:
     requires ctx.userId != none
     ensures result.id == noteId, result.status == "published"
     return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == ctx.userId.getD("") and r.status == "draft", set = r => { status = "published", version = r.version + 1 })?
-  def deleteNote(noteId: Nat) -> Nat!:
+  rpc deleteNote(noteId: Nat) -> Nat!:
     requires ctx.userId != none
     return await db.notes.delete(where = r => r.id == noteId and r.ownerId == ctx.userId.getD(""))?
-  def seedBook(bookId: String, title: String, stock: Nat) -> VaultDb.books!:
+  rpc seedBook(bookId: String, title: String, stock: Nat) -> VaultDb.books!:
     requires ctx.userId != none, 1 <= bookId.length <= 64, 1 <= title.length <= 200, stock <= 10000
     return await db.books.insert(id = bookId, title = title, stock = stock)?
-  def orderBook(bookId: String, qty: Nat) -> VaultDb.books?!:
+  rpc orderBook(bookId: String, qty: Nat) -> VaultDb.books?!:
     requires ctx.userId != none, 1 <= qty <= 50
     ensures result.id == bookId, result.stock <= 10000
     return await db.books.updateOne(where = r => r.id == bookId and r.stock >= qty, set = r => { stock = r.stock - qty })?
@@ -89,7 +89,7 @@ fullstack VaultApp:
 
 /-! ## Negative Compile-Time Verification Tests -/
 bad_db1 "Database read policy `VaultDb.notes.read` failed in `leakNote → VaultDb.notes.findOne`:\n  • must prove: some ownerId = ctx.userId" VaultDb leakNote(noteId: Nat) -> VaultDb.notes?! : return await db.notes.findOne(where = r => r.id == noteId)?
-bad_db "Database read policy `VaultDb.notes.read` failed in `dumpAll → VaultDb.notes.select`:\n  • must prove: some ownerId = ctx.userId" VaultDb : def dumpAll() -> VaultDb.notes[]!: return await db.notes.select()?
+bad_db "Database read policy `VaultDb.notes.read` failed in `dumpAll → VaultDb.notes.select`:\n  • must prove: some ownerId = ctx.userId" VaultDb : rpc dumpAll() -> VaultDb.notes[]!: return await db.notes.select()?
 bad_db1 "Database delete policy `VaultDb.notes.delete` failed in `nukeNote → VaultDb.notes.delete`:\n  • must prove: some ownerId = ctx.userId" VaultDb nukeNote(noteId: Nat) -> Nat! : return await db.notes.delete(where = r => r.id == noteId)?
 /-- error: Database update policy `VaultDb.notes.update` failed in `hijackEdit → VaultDb.notes.updateOne`:
   • must prove: some ownerId = ctx.userId
@@ -103,16 +103,16 @@ Hint: Ensure `where = r => ...` implies `some(row.ownerId) == ctx.userId`. -/
 #guard_msgs in rollback_env
 server BadUpdateIdor:
   use db : VaultDb
-  def hijackEdit(noteId: Nat, body: String) -> VaultDb.notes?!:
+  rpc hijackEdit(noteId: Nat, body: String) -> VaultDb.notes?!:
     requires ctx.userId != none, 1 <= body.length <= 2000
     return await db.notes.updateOne(where = r => r.id == noteId, set = r => { body = body, version = r.version + 1 })?
 bad_db "Database insert policy `VaultDb.notes.insert` failed in `spoofInsert → VaultDb.notes.insert`:\n  • must prove: some \"victim\" = ctx.userId" VaultDb :
-  def spoofInsert(noteId: Nat, body: String) -> VaultDb.notes!:
+  rpc spoofInsert(noteId: Nat, body: String) -> VaultDb.notes!:
     requires ctx.userId != none, 1 <= body.length <= 2000
     return await db.notes.insert(id = noteId, ownerId = "victim", body = body, version = 0, status = "draft")?
 bad_db1 "cannot update `immutable` column `VaultDb.notes.ownerId` in `stealOwner`" VaultDb stealOwner(noteId: Nat) -> VaultDb.notes?! : return await db.notes.updateOne(where = r => r.id == noteId and r.ownerId == ctx.userId.getD(""), set = r => { ownerId = "attacker" })?
 bad_db "Database table constraint `VaultDb.notes.RowInv` failed in `emptyNote → VaultDb.notes.insert`" VaultDb :
-  def emptyNote(noteId: Nat) -> VaultDb.notes!:
+  rpc emptyNote(noteId: Nat) -> VaultDb.notes!:
     requires ctx.userId != none
     let uid = ctx.userId.getD("")
     if not (1 <= uid.length <= 64): return fail(.badUser)
@@ -178,34 +178,34 @@ server ShopApi:
   use db : ShopDb
   state txOps : Nat = 0
   invariant txOpsNonNeg: txOps >= 0
-  def searchItems(pfx: String, sub: String, pageOffset: Nat) -> ShopDb.items[]!:
+  rpc searchItems(pfx: String, sub: String, pageOffset: Nat) -> ShopDb.items[]!:
     requires ctx.userId != none
     return await db.items.select(where = r => r.ownerId == ctx.userId.getD("") and r.title.startsWith(pfx) and r.title.contains(sub), orderBy = "-price", limit = 20, offset = pageOffset)?
-  def filterByIds(ids: String[]) -> ShopDb.items[]!:
+  rpc filterByIds(ids: String[]) -> ShopDb.items[]!:
     requires ctx.userId != none
     return await db.items.select(where = r => r.ownerId == ctx.userId.getD("") and ids.contains(r.id), orderBy = "id", limit = 50, offset = 0)?
-  def totalInventoryValue() -> Nat!:
+  rpc totalInventoryValue() -> Nat!:
     requires ctx.userId != none
     return await db.items.sum(col = "price", where = r => r.ownerId == ctx.userId.getD(""))?
-  def cheapestPrice() -> Nat?!:
+  rpc cheapestPrice() -> Nat?!:
     requires ctx.userId != none
     return await db.items.min(col = "price", where = r => r.ownerId == ctx.userId.getD(""))?
-  def highestPrice() -> Nat?!:
+  rpc highestPrice() -> Nat?!:
     requires ctx.userId != none
     return await db.items.max(col = "price", where = r => r.ownerId == ctx.userId.getD(""))?
-  def itemsWithAuthors() -> (ShopDb.items, ShopDb.authors)[]!:
+  rpc itemsWithAuthors() -> (ShopDb.items, ShopDb.authors)[]!:
     requires ctx.userId != none
     return await db.items.join(table = authors, where = r => r.ownerId == ctx.userId.getD(""), orderBy = "-price", limit = 25, offset = 0)?
-  def logsWithProfiles() -> (ShopDb.secretLogs, ShopDb.privateProfiles)[]!:
+  rpc logsWithProfiles() -> (ShopDb.secretLogs, ShopDb.privateProfiles)[]!:
     requires ctx.userId != none
     return await db.secretLogs.join(table = privateProfiles, where = r => r.ownerId == ctx.userId.getD(""), rightWhere = p => p.ownerId == ctx.userId.getD(""))?
-  def createAuthorAndItem(aid: String, aname: String, iid: String, title: String, price: Nat) -> ShopDb.items!:
+  rpc createAuthorAndItem(aid: String, aname: String, iid: String, title: String, price: Nat) -> ShopDb.items!:
     requires ctx.userId != none, 1 <= aid.length <= 64, 1 <= aname.length <= 120, 1 <= iid.length <= 64, 1 <= title.length <= 200, price <= 100000
     ensures result.id == iid, result.price == price
     let uid = ctx.userId.getD("")
     if not (1 <= uid.length <= 64): return fail(.badUser)
     db.transaction: let _a = await db.authors.insert(id = aid, name = aname)?; let created = await db.items.insert(id = iid, authorId = aid, ownerId = uid, title = title, price = price)?; atomic: txOps += 1; return created
-  def createPairDotSyntax(aid: String, aname: String, iid: String, title: String, price: Nat) -> ShopDb.items!:
+  rpc createPairDotSyntax(aid: String, aname: String, iid: String, title: String, price: Nat) -> ShopDb.items!:
     requires ctx.userId != none, 1 <= aid.length <= 64, 1 <= aname.length <= 120, 1 <= iid.length <= 64, 1 <= title.length <= 200, price <= 100000
     ensures result.id == iid
     let uid = ctx.userId.getD("")
@@ -215,13 +215,13 @@ server ShopApi:
       if price == 99999: return fail(.aborted)
       let created = await db.items.insert(id = iid, authorId = aid, ownerId = uid, title = title, price = price)?
       return created
-bad_db "Database read policy `ShopDb.items.read` failed in `leakSum → ShopDb.items.sum`:\n  • must prove: some ownerId = ctx.userId" ShopDb : def leakSum() -> Nat!: return await db.items.sum(col = "price")?
+bad_db "Database read policy `ShopDb.items.read` failed in `leakSum → ShopDb.items.sum`:\n  • must prove: some ownerId = ctx.userId" ShopDb : rpc leakSum() -> Nat!: return await db.items.sum(col = "price")?
 bad_db "Database read policy `ShopDb.privateProfiles.read` (joined table) failed in `leakProfileJoin → ShopDb.secretLogs.join`:\n  • must prove: some ownerId = ctx.userId" ShopDb :
-  def leakProfileJoin() -> (ShopDb.secretLogs, ShopDb.privateProfiles)[]!:
+  rpc leakProfileJoin() -> (ShopDb.secretLogs, ShopDb.privateProfiles)[]!:
     requires ctx.userId != none
     return await db.secretLogs.join(table = privateProfiles, where = r => r.ownerId == ctx.userId.getD(""))?
 bad_db "Database insert policy `ShopDb.items.insert` failed in `badTxInsert → ShopDb.items.insert`:\n  • must prove: some \"victim\" = ctx.userId" ShopDb :
-  def badTxInsert(aid: String, iid: String) -> ShopDb.items!:
+  rpc badTxInsert(aid: String, iid: String) -> ShopDb.items!:
     requires ctx.userId != none, 1 <= aid.length <= 64, 1 <= iid.length <= 64
     db.transaction: return await db.items.insert(id = iid, authorId = aid, ownerId = "victim", title = "oops", price = 10)?
 
@@ -291,25 +291,25 @@ def widerCipherMap : Mapping (fun _ : SecretNoteInput => True) (fun s : String =
 server CipherApi:
   use db : CipherDb
   use vdb : VaultDb
-  def saveSealed(noteId: Nat, input: SecretNoteInput) -> CipherDb.sealedNotes!:
+  rpc saveSealed(noteId: Nat, input: SecretNoteInput) -> CipherDb.sealedNotes!:
     requires ctx.userId != none
     let uid = ctx.userId.getD("")
     if not (1 <= uid.length <= 64): return fail(.invalidUser)
     let ct = sealedNoteMap.encode(input)
     return await db.sealedNotes.insert(id = noteId, ownerId = uid, ciphertext = ct)?
-  def editSealed(noteId: Nat, input: SecretNoteInput) -> CipherDb.sealedNotes?!:
+  rpc editSealed(noteId: Nat, input: SecretNoteInput) -> CipherDb.sealedNotes?!:
     requires ctx.userId != none
     let uid = ctx.userId.getD("")
     let ct = sealedNoteMap.encode(input)
     return await db.sealedNotes.updateOne(where = r => r.id == noteId and r.ownerId == uid, set = r => { ciphertext = ct })?
-  def savePlainFromSchema(noteId: Nat, input: PlainNoteInput) -> VaultDb.notes!:
+  rpc savePlainFromSchema(noteId: Nat, input: PlainNoteInput) -> VaultDb.notes!:
     requires ctx.userId != none
     let uid = ctx.userId.getD("")
     if not (1 <= uid.length <= 64): return fail(.invalidUser)
     return await vdb.notes.insert(id = noteId, ownerId = uid, body = input.body, version = 0, status = "draft")?
 
 bad_db "Database table constraint `CipherDb.sealedNotes.RowInv` failed in `driftInsert → CipherDb.sealedNotes.insert`" CipherDb :
-  def driftInsert(noteId: Nat, input: SecretNoteInput) -> CipherDb.sealedNotes!:
+  rpc driftInsert(noteId: Nat, input: SecretNoteInput) -> CipherDb.sealedNotes!:
     requires ctx.userId != none
     let uid = ctx.userId.getD("")
     if not (1 <= uid.length <= 64): return fail(.invalidUser)
@@ -383,23 +383,23 @@ database EncVaultDb:
 
 server EncVaultApi:
   use db : EncVaultDb
-  def save(noteId: Nat, input: SecretNoteInput, rawOpt: Bytes?) -> EncVaultDb.entries!:
+  rpc save(noteId: Nat, input: SecretNoteInput, rawOpt: Bytes?) -> EncVaultDb.entries!:
     requires ctx.userId != none
     ensures result.id == noteId
     let uid = ctx.userId.getD("")
     if not (1 <= uid.length <= 64): return fail(.invalidUser)
     return await db.entries.insert(id = noteId, ownerId = uid, body = input.body, note = "ok", raw = rawOpt)?
-  def edit(noteId: Nat, input: SecretNoteInput) -> EncVaultDb.entries?!:
+  rpc edit(noteId: Nat, input: SecretNoteInput) -> EncVaultDb.entries?!:
     requires ctx.userId != none
     ensures result.id == noteId
     let uid = ctx.userId.getD("")
     return await db.entries.updateOne(where = r => r.id == noteId and r.ownerId == uid, set = r => { body = input.body })?
-  def get(noteId: Nat) -> EncVaultDb.entries?!:
+  rpc get(noteId: Nat) -> EncVaultDb.entries?!:
     requires ctx.userId != none
     ensures result.id == noteId
     let uid = ctx.userId.getD("")
     return await db.entries.findOne(where = r => r.id == noteId and r.ownerId == uid)?
-  def list() -> EncVaultDb.entries[]!:
+  rpc list() -> EncVaultDb.entries[]!:
     requires ctx.userId != none
     let uid = ctx.userId.getD("")
     return await db.entries.select(where = r => r.ownerId == uid, orderBy = "id")?
@@ -446,8 +446,96 @@ database TierCheckDb:
   chk.contains "NOT VALID"
 
 bad_db "Database table constraint `TierCheckDb.scaling.RowInv` failed in `badFreeWarm → TierCheckDb.scaling.insert`" TierCheckDb :
-  def badFreeWarm(appId: String) -> TierCheckDb.scaling!:
+  rpc badFreeWarm(appId: String) -> TierCheckDb.scaling!:
     requires 1 <= appId.length <= 64
     return await db.scaling.insert(id = appId, plan = "free", minInstances = 1, maxInstances = 1)?
+
+/-! ## Track 3 & 4: Unit `enum` columns, `on_delete`, `backfill`, `upsert`, and standalone `<Db>.client` -/
+
+enum DeployStage:
+  queued
+  building   = "in-progress"
+  live
+  failed
+
+field ServiceSlug : String where s => 1 <= s.length <= 32
+field ServicePort : Nat where p => 1 <= p <= 65535
+
+database RoadmapDb:
+  sqlite ".qed/roadmap_checks.db"
+  table orgs:
+    id   : String primary_key where 1 <= id.length <= 64
+    name : String where 1 <= name.length <= 120
+  table projects:
+    id      : String primary_key where 1 <= id.length <= 64
+    orgId   : String references orgs(id) on_delete cascade
+    ownerId : String where 1 <= ownerId.length <= 128
+    stage   : DeployStage
+    note    : String?
+    policy read, write requires some(row.ownerId) == ctx.userId
+    invariant stageOrder: transition row.stage: .queued -> .building -> .live, .building -> .failed
+  table audits:
+    id        : String primary_key where 1 <= id.length <= 64
+    projectId : String? references projects(id) on_delete set_null
+    orgId     : String references orgs(id) on_delete restrict
+    day       : Date?
+  table services:
+    slug    : ServiceSlug primary_key
+    port    : ServicePort
+    altPort : ServicePort?
+  backfill projects set { note = "migrated" } where r => r.note == none
+
+#guard
+  let pg := RoadmapDb.ddl .postgres
+  let sq := RoadmapDb.ddl .sqlite
+  let d? := Date.mk? 2026 11 25
+  pg.contains "ON DELETE CASCADE" &&
+  pg.contains "ON DELETE SET NULL" &&
+  pg.contains "ON DELETE RESTRICT" &&
+  pg.contains "CHECK (\"stage\" IN ('queued', 'in-progress', 'live', 'failed'))" &&
+  pg.contains "\"slug\" TEXT NOT NULL PRIMARY KEY" &&
+  pg.contains "\"port\" BIGINT NOT NULL CHECK (\"port\" >= 0)" &&
+  pg.contains "\"altPort\" BIGINT" &&
+  sq.contains "\"port\" INTEGER NOT NULL CHECK (\"port\" >= 0)" &&
+  sq.contains "ON DELETE CASCADE" &&
+  (match d?.map fun d => Qed.Server.Db.FromSql.fromSql (α := Date) (Qed.Server.Db.ToSql.toSql d) with
+   | some (.ok d') => some d' == d? | _ => false) &&
+  RoadmapDb.config.backfills.length == 1 &&
+  (RoadmapDb.config.backfills[0]?.map fun q => (q.compile .postgres).1.contains "UPDATE \"projects\" SET \"note\" = $1 WHERE (\"note\" IS NULL)") == some true
+
+server RoadmapApi:
+  use db : RoadmapDb
+  rpc createAndUpsert(orgId: String, projId: String, stg: DeployStage) -> RoadmapDb.projects!:
+    requires auth, 1 <= orgId.length <= 64, 1 <= projId.length <= 64, stg == .queued
+    let _o = await db.orgs.upsert(on = "id", id = orgId, name = "Acme")?
+    return await db.projects.upsert(on = ["id"], where = r => r.ownerId == uid and r.stage == .queued, id = projId, orgId = orgId, ownerId = uid, stage = .queued, note = some("ok"))?
+  rpc listLive() -> RoadmapDb.projects[]!:
+    requires auth
+    return await db.projects.select(where = r => r.ownerId == uid and r.stage == .live)?
+  rpc advanceToBuilding(projId: String) -> RoadmapDb.projects?!:
+    requires auth
+    return await db.projects.updateOne(where = r => r.id == projId and r.ownerId == uid and r.stage == .queued, set = { stage = .building })?
+  rpc registerService(rawSlug: String, rawPort: Nat) -> RoadmapDb.services!:
+    let s = ServiceSlug.parse(rawSlug)?
+    let p = ServicePort.parse(rawPort)?
+    return await db.services.insert(slug = s, port = p, altPort = some(ServicePort.make(8443)))?
+  rpc registerDefaultService() -> RoadmapDb.services!:
+    return await db.services.insert(slug = "api", port = 8080)?
+
+example : RoadmapDb.Client := RoadmapDb.client
+
+bad_db "Database upsert conflict update policy `RoadmapDb.projects.update` failed in `badUpsert → RoadmapDb.projects.upsert`" RoadmapDb :
+  rpc badUpsert(orgId: String, projId: String) -> RoadmapDb.projects!:
+    requires auth, 1 <= orgId.length <= 64, 1 <= projId.length <= 64
+    return await db.projects.upsert(on = "id", id = projId, orgId = orgId, ownerId = uid, stage = .queued, note = none)?
+
+expect_err "`on_delete set_null` on `bad.orgId` requires a nullable column (`T?`)" in
+database BadSetNullDb:
+  sqlite ".qed/bad_set_null.db"
+  table orgs:
+    id : String primary_key
+  table bad:
+    id    : String primary_key
+    orgId : String references orgs(id) on_delete set_null
 
 end DbChecks

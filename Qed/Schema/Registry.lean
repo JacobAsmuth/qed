@@ -9,6 +9,16 @@ structure SchemaFormInfo where mk :: (fullName formViewName : Lean.Name) (ctxBin
 
 initialize schemaFormRegistry : Lean.SimplePersistentEnvExtension SchemaFormInfo (Lean.NameMap SchemaFormInfo) ← Qed.Diag.mkNameMapExt (·.fullName)
 
+structure UnitEnumInfo where
+  fullName : Lean.Name
+  variants : Array String
+deriving Inhabited, Repr
+
+initialize unitEnumRegistry : Lean.SimplePersistentEnvExtension UnitEnumInfo (Lean.NameMap UnitEnumInfo) ← Qed.Diag.mkNameMapExt (·.fullName)
+
+def lookupUnitEnum? (env : Lean.Environment) (currNs : Lean.Name) (openDecls : List Lean.OpenDecl) (tyName : Lean.Name) : Option UnitEnumInfo :=
+  Qed.Diag.lookupNameMapExt? unitEnumRegistry env currNs openDecls tyName
+
 open Lean in
 def lookupSchemaForm? (cName : Name) : CoreM (Option SchemaFormInfo) := do
   let (env, ns, openDecls) := (← getEnv, ← getCurrNamespace, ← getOpenDecls)

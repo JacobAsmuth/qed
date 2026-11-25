@@ -146,7 +146,13 @@ private def elabChanClientHelpers (hdr : ParsedChanHeader) (hasJoinSnapshot hasS
   return (wsPathStr, sendHelperConst)
 
 @[noinline]
-private def elabServerChannelBody (hdr : ParsedChanHeader) :
+private def wrapWithBefore? (beforeRun? : Option Term) (body : Term) : CommandElabM Term :=
+  match beforeRun? with
+  | none => pure body
+  | some br => `($br >>= fun | Except.error _beforeErr => Pure.pure (Except.error _beforeErr) | Except.ok () => $body)
+
+@[noinline]
+private def elabServerChannelBody (hdr : ParsedChanHeader) (beforeRun? : Option Term := none) :
     SrvElabM (Option (Array (TSyntax ``Lean.Parser.Term.matchAltExpr) × Option (TSyntax ``Lean.Parser.Term.matchAltExpr))) := do
   let c ← read; let errTyTerm ← `(Qed.Server.ApiError); let chLit := Syntax.mkStrLit hdr.chStr
   let paramTupleTy ← liftMacroM <| buildProdType hdr.pTyTerms; let pProjs ← extractTupleProjections (mkIdent `_chParams) hdr.pTyTerms.size
@@ -159,10 +165,10 @@ private def elabServerChannelBody (hdr : ParsedChanHeader) :
     let body := if isUnit then ensureUnitReturn hdr.chIdent norm else norm
     if !isUnit && !blockAlwaysReturns body then throwErrorAt hdr.chIdent s!"missing `return` on fallthrough path of `{hdr.chStr}.{suf}`"
     let subStr := s!"{hdr.chStr}_{suf}"; let hasAw := blockHasAwait body
-    let baseCtx ← mkBaseLowerCtx subStr (hdr.paramNames ++ eIds.map (·.getId.toString)) hasAw true true (includeDbs := false)
+    let baseCtx ← mkBaseLowerCtx subStr (hdr.paramNames ++ hdr.reqs.extraLocals ++ eIds.map (·.getId.toString)) hasAw true true (includeDbs := false)
     let some (r, _, _) ← elabServerHandler hasAw subStr (mkIdentFrom hdr.chIdent (hdr.chName.appendAfter s!"_{suf}"))
-        (hdr.pIdents ++ eIds ++ hdr.reqs.reqHypIds ++ eReqIds) (hdr.pTyTerms ++ eTys ++ hdr.reqs.reqPropTerms ++ eReqTys)
-        (pProjs ++ eProjs ++ hdr.reqs.reqHypIds.map (⟨·.raw⟩) ++ eReqIds.map (⟨·.raw⟩)) retTy errTyTerm baseCtx body none | return none
+        (hdr.pIdents ++ eIds ++ hdr.reqs.allBinderIds ++ eReqIds) (hdr.pTyTerms ++ eTys ++ hdr.reqs.allBinderTys ++ eReqTys)
+        (pProjs ++ eProjs ++ hdr.reqs.allBinderArgs ++ eReqIds.map (⟨·.raw⟩)) retTy errTyTerm baseCtx body none | return none
     return some r
   let (hasJoinSnapshot, joinTyTerm, joinRunTerm) ← match hdr.onJoin? with
     | some (some snapTyStx, stmts) =>
@@ -174,27 +180,27 @@ private def elabServerChannelBody (hdr : ParsedChanHeader) :
         let some r ← runSub "onJoin" #[] #[] #[] #[] #[] jt true stmts | return none
         pure (false, jt, ← liftM (wrapEmpty r))
     | none => pure (false, ← `(Unit), ← `(Pure.pure (Except.ok ByteArray.empty)))
-  let joinArm ← liftM <| mkArm "1" (← liftM <| wrapReqs hdr.reqs.reqPropTerms hdr.reqs.reqHypIds hdr.reqs.reqLabels joinRunTerm)
+  let joinArm ← liftM <| mkArm "1" (← liftM <| wrapWithBefore? beforeRun? (← liftM <| wrapAuthAndReqs hdr.reqs joinRunTerm))
   let mut hasSend := false; let mut spIdents : Array Ident := #[]; let mut spTyTerms : Array Term := #[]
   let mut sendParamTypeConsts : Array Name := #[]; let mut sendReqConst? : Option Name := none; let mut sendReqLabel := ""
   let mut sendArm? : Option (TSyntax ``Lean.Parser.Term.matchAltExpr) := none
   if let some (rawSParams, rawSReqs, sBody) := hdr.onSend? then
-    let (spIds, spTys, spNames) ← parseSrvParams s!"`channel {hdr.chStr}`" "`on_send` parameter" rawSParams (extraShadow := hdr.paramNames)
+    let (spIds, spTys, spNames) ← parseSrvParams s!"`channel {hdr.chStr}`" "`on_send` parameter" rawSParams (extraShadow := hdr.paramNames ++ hdr.reqs.extraLocals)
     hasSend := true; spIdents := spIds; spTyTerms := spTys
     sendParamTypeConsts ← liftM <| elabParamTypeAbbrevs hdr.chIdent c.srvName c.fullSrvName hdr.chName "_SendParam_" spTys
     let sReqs ← elabRequiresClauses hdr.chIdent hdr.chName s!"{hdr.chStr}.on_send" "_hSReq" "_send_req"
-      (hdr.paramNames ++ spNames) spNames spIds spTys rawSReqs (excludedClientVars := hdr.paramNames) (trackAuth := false)
+      (hdr.paramNames ++ hdr.reqs.extraLocals ++ spNames) spNames spIds spTys rawSReqs (excludedClientVars := hdr.paramNames ++ hdr.reqs.extraLocals) (trackAuth := false)
     sendReqConst? := sReqs.clientReqConst?; sendReqLabel := sReqs.clientReqLabel
     let sendTupleTy ← liftMacroM <| buildProdType spTys; let sTupleVar := mkIdent `_chSendVal; let sProjs ← extractTupleProjections sTupleVar spTys.size
     let some sr ← runSub "onSend" spIds spTys sProjs sReqs.reqHypIds sReqs.reqPropTerms (← `(Unit)) true sBody | return none
-    let sGuarded ← liftM <| wrapReqs (hdr.reqs.reqPropTerms ++ sReqs.reqPropTerms) (hdr.reqs.reqHypIds ++ sReqs.reqHypIds) (hdr.reqs.reqLabels ++ sReqs.reqLabels) (← liftM (wrapEmpty sr))
+    let sGuarded ← liftM <| wrapWithBefore? beforeRun? (← liftM <| wrapAuthAndReqs hdr.reqs (← liftM <| wrapReqs sReqs.reqPropTerms sReqs.reqHypIds sReqs.reqLabels (← liftM (wrapEmpty sr))))
     sendArm? := some (← liftM <| mkArm "2" (← liftM <| mkProtoDecodeBind (mkIdent `wsPayload) sTupleVar sendTupleTy spIds sProjs sGuarded))
   let leaveRunTerm ← match hdr.onLeave? with
     | some stmts =>
         let some r ← runSub "onLeave" #[] #[] #[] #[] #[] (← `(Unit)) true stmts | return none
         liftM (wrapEmpty r)
     | none => `(Pure.pure (Except.ok ByteArray.empty))
-  let leaveArm ← liftM <| mkArm "3" (← liftM <| wrapReqs hdr.reqs.reqPropTerms hdr.reqs.reqHypIds hdr.reqs.reqLabels leaveRunTerm)
+  let leaveArm ← liftM <| mkArm "3" (← liftM <| wrapAuthAndReqs hdr.reqs leaveRunTerm)
   let (wsPathStr, sendHelperConst) ← elabChanClientHelpers hdr hasJoinSnapshot hasSend joinTyTerm spIdents spTyTerms
   let projArm? : Option (TSyntax ``Lean.Parser.Term.matchAltExpr) ← match hdr.project? with
     | none => pure none
@@ -291,17 +297,161 @@ private def elabFnClientStubs (fnIdent : Ident) (fnStr : String) (pIdents : Arra
         $rawCall onDone)]
   return paramTypeConsts
 
+private def parseSrvContracts (kindLabel : String) (clauses : Array Syntax) : CommandElabM (Array Syntax × Array Syntax) := do
+  let mut reqs : Array Syntax := #[]; let mut enss : Array Syntax := #[]
+  for cl in clauses do
+    if cl.getKind == ``srvRequiresLine then reqs := reqs ++ (cl.getArg 1).getSepArgs
+    else if cl.getKind == ``srvEnsuresLine then enss := enss ++ (cl.getArg 1).getSepArgs
+    else throwErrorAt cl s!"unexpected contract clause in {kindLabel}"
+  return (reqs, enss)
+
+private def mkFnEnsSpec? (ensRes? : Option (Ident × Name × String)) (pTerms : Array Term) (isOpt : Bool) : Option FnEnsSpec :=
+  ensRes?.map fun (ensId, _, labelStr) => (ensId, fun outT => do
+    let ensApp ← mkAppTerms ensId pTerms
+    if isOpt then `(Qed.Server.srvEnsPostOpt ($ensApp) $outT) else `(Qed.Server.srvEnsPost ($ensApp) $outT), labelStr)
+
 @[noinline]
-private def elabServerFnClause (existingMethods : Array ServerMethodInfo) (fc : Syntax) :
+private def elabServerHelperClause (hc : Syntax) : SrvElabM (Option (SrvHelperSig × Array Ident)) := do
+  let c ← read; let fnIdent : Ident := ⟨hc.getArg 1⟩; let fnStr := fnIdent.getId.toString
+  if c.helpers.any (·.name == fnStr) then throwErrorAt fnIdent s!"duplicate helper `fn {fnStr}` in `server {c.srvName}`"
+  let (reqExprs, ensExprs) ← liftM <| parseSrvContracts "server `fn`" (hc.getArg 7).getArgs
+  let (pIdents, pTyTerms, paramNames) ← parseSrvParams s!"server helper `fn {fnStr}`" "parameter" (hc.getArg 3).getSepArgs (reserved := if ensExprs.isEmpty then #[] else #["result"])
+  let hasExplicitRet := (hc.getArg 5).getNumArgs == 2
+  let (payloadTerm, innerOpt?, isFallible, isUnitPayload) ←
+    if hasExplicitRet then
+      let rt ← liftMacroM <| lowerSrvType ((hc.getArg 5).getArg 1) true s!"return type of helper `fn {fnStr}`"
+      pure (rt.term, rt.innerOpt?, rt.isFallible, (rt.mods.filter (· != .fallible)).isEmpty && rt.baseName == `Unit)
+    else pure (← `(Unit), none, true, true)
+  let bodyStmts := if isUnitPayload then ensureUnitReturn fnIdent (hc.getArg 8).getArgs else (hc.getArg 8).getArgs
+  if !isUnitPayload && !blockAlwaysReturns bodyStmts then throwErrorAt fnIdent s!"missing `return` on fallthrough path of helper `fn {fnStr}`"
+  let (domainTagIdents, hasPlainFail) ← liftM <| scanBodyFailTags bodyStmts
+  if !domainTagIdents.isEmpty then throwErrorAt fnIdent s!"typed `fail(.tag)` is only supported in `rpc` endpoints; use `fail(code, msg)` or `fail(msg)` in private helper `fn {fnStr}`"
+  if hasPlainFail && !isFallible then throwErrorAt fnIdent s!"`fail(...)` can only be returned from a fallible `T!` helper (`fn {fnStr}` is not declared `-> ...!`)"
+  let errTyTerm ← `(Qed.Server.ApiError); let defLeaf := Name.mkSimple s!"_fn_{fnStr}"; let defId := c.subId defLeaf fnIdent
+  let envStrTy ← `(String); let ctxTy ← `(Qed.Server.RequestCtx)
+  let baseBinderIds := c.envIdents ++ #[c.ctxId] ++ pIdents
+  let baseBinderTys := (c.envDecls.map fun _ => envStrTy) ++ #[ctxTy] ++ pTyTerms
+  let reqs ← elabRequiresClauses fnIdent defLeaf fnStr "_hFnReq" "_req" paramNames paramNames pIdents pTyTerms reqExprs (trackAuth := false)
+  let some ensRes? ← elabEnsuresAbbrev (mkIdentFrom fnIdent defLeaf) fnStr `result paramNames pIdents pTyTerms (innerOpt?.getD payloadTerm) ensExprs | return none
+  let pTerms : Array Term := pIdents.map (⟨·.raw⟩)
+  let ensSpec? := mkFnEnsSpec? ensRes? pTerms innerOpt?.isSome
+  let hasAwait := blockHasAwait bodyStmts; let hasEmit := blockHasEmit bodyStmts
+  let touchesState := c.hasState && (blockHasAtomic bodyStmts ||
+    c.stateFieldNames.any (fun sf => bodyStmts.any (stxMentionsVar sf)) ||
+    c.helpers.any (fun h => h.takesAtomic && bodyStmts.any (stxMentionsVar h.name)))
+  let callsMonadicHelper := c.helpers.any fun h => h.isMonadic && bodyStmts.any (stxMentionsVar h.name)
+  let isMonadic := hasAwait || hasEmit || touchesState || callsMonadicHelper
+  let bodyHasUnwrap := bodyStmts.any (stxAny exprHasUnwrap)
+  let bodyHasCatch := bodyStmts.any (stxAny fun s => s.getKind == ``qedStmtLet && (s.getArg 5).getNumArgs > 0)
+  let isPureSync := !isMonadic && !isFallible && reqExprs.isEmpty && !bodyHasUnwrap && !bodyHasCatch && !hasPlainFail && hasExplicitRet
+  if isPureSync then
+    let lCtx : LowerCtx := {
+      fnName := fnStr, envVars := c.envVarNames, envIdents := c.envIdents, locals := paramNames,
+      stateRule := .statelessServer, helpers := c.helpers, dbs := #[] }
+    let bodyTerm ← liftM <| Qed.lowerPureFnStmts s!"fn {fnStr}" bodyStmts.toList
+      (fun s => do let (t, st) ← (lowerExpr lCtx .val s).run {}; (recordSrvExtRoots st.extRoots).run c; pure t)
+      (fun s => do let (t, st) ← (lowerExpr lCtx .propGuard s).run {}; (recordSrvExtRoots st.extRoots).run c; pure t)
+    elabSrvCmd (← `(command|
+      set_option linter.unusedVariables false in
+      @[noinline] def $defId $[($baseBinderIds:ident : $baseBinderTys:term)]* : $payloadTerm := srvAutoField($bodyTerm)))
+    if (← hasSrvErrors) then return none
+    if let some (ensId, _, labelStr) := ensRes? then
+      let callT ← mkAppTerms defId (baseBinderIds.map (⟨·.raw⟩))
+      let ensApp ← mkAppTerms ensId pTerms
+      let goal ← if innerOpt?.isSome then `(∀ _r, $callT = some _r → $ensApp _r) else `($ensApp ($callT))
+      deferSrvCmd (← `(command| theorem $(c.subId (defLeaf.appendAfter "_ensures") fnIdent) $[($baseBinderIds:ident : $baseBinderTys:term)]* :
+          $goal := by qedSrvProveStep [$defId, $ensId] $(Syntax.mkStrLit fnStr) $(Syntax.mkStrLit s!"ensures: {labelStr}")))
+    return some ({ name := fnStr, defId, paramCount := pIdents.size, isMonadic := false, takesAtomic := false, mutatesState := false, dbWrite := false }, #[])
+  else if !isMonadic then
+    let sUnitId := mkIdent `_sUnit
+    let lCtx : LowerCtx := {
+      fnName := fnStr, envVars := c.envVarNames, envIdents := c.envIdents, locals := paramNames ++ reqs.extraLocals,
+      stateRule := .statelessServer, allowAwait := false, allowUnwrap := isFallible || innerOpt?.isSome,
+      hasFallible := isFallible, innerOptTy? := innerOpt?, helpers := c.helpers, dbs := #[] }
+    let (pureBody, lSt) ← liftM <| (lowerPureBlock lCtx false sUnitId sUnitId bodyStmts).run {}
+    recordSrvExtRoots lSt.extRoots
+    let inner ← `(let $sUnitId:ident : Unit := (); (Qed.Server.srvFinish $sUnitId $pureBody).2)
+    let wrapped ← liftM <| wrapAuthAndReqs reqs inner (pureWrap := false)
+    elabSrvCmd (← `(command|
+      set_option linter.unusedVariables false in
+      @[noinline] def $defId $[($baseBinderIds:ident : $baseBinderTys:term)]* : Except $errTyTerm $payloadTerm := $wrapped))
+    if (← hasSrvErrors) then return none
+    if let some (ensId, postFn, labelStr) := ensSpec? then
+      let callT ← mkAppTerms defId (baseBinderIds.map (⟨·.raw⟩))
+      let postGoal ← liftM <| postFn callT
+      deferSrvCmd (← `(command| theorem $(c.subId (defLeaf.appendAfter "_ensures") fnIdent) $[($baseBinderIds:ident : $baseBinderTys:term)]* :
+          $postGoal := by qedSrvProveStep [$defId, $ensId] $(Syntax.mkStrLit fnStr) $(Syntax.mkStrLit s!"ensures: {labelStr}")))
+    return some ({ name := fnStr, defId, paramCount := pIdents.size, isMonadic := false, takesAtomic := false, mutatesState := false, dbWrite := lSt.dbWrite }, #[])
+  else if touchesState then
+    let isAsync := hasAwait || blockHasAtomic bodyStmts || callsMonadicHelper
+    let fnInnerIdent := mkIdentFrom fnIdent defLeaf
+    let some (runExpr, isReadOnly, _) ← elabServerHandler isAsync fnStr fnInnerIdent (pIdents ++ reqs.allBinderIds) (pTyTerms ++ reqs.allBinderTys)
+        (pTerms ++ reqs.allBinderArgs) payloadTerm errTyTerm
+        (← mkBaseLowerCtx fnStr (paramNames ++ reqs.extraLocals) isAsync (isFallible || innerOpt?.isSome) isFallible innerOpt?) bodyStmts ensSpec? | return none
+    let guarded ← liftM <| wrapAuthAndReqs reqs runExpr
+    let atomicBinders ← liftM c.atomicBinders
+    elabSrvCmd (← `(command|
+      set_option linter.unusedVariables false in
+      @[noinline] def $defId {m : Type → Type} [Monad m] [Qed.Server.MonadServer m] $[$atomicBinders:bracketedBinder]* $[($baseBinderIds:ident : $baseBinderTys:term)]* :
+          m (Except $errTyTerm $payloadTerm) := $guarded))
+    if (← hasSrvErrors) then return none
+    let innerId := c.fnSubId fnInnerIdent (if isAsync then "_handler" else "_step")
+    return some ({ name := fnStr, defId, paramCount := pIdents.size, isMonadic := true, takesAtomic := true, mutatesState := !isReadOnly, dbWrite := true }, #[defId, innerId])
+  else
+    let baseCtx ← mkBaseLowerCtx fnStr (paramNames ++ reqs.extraLocals) true (isFallible || innerOpt?.isSome) isFallible innerOpt?
+    let (asyncBody, lSt) ← liftM <| (lowerAsyncBlock { baseCtx with stateFields := #[] } none bodyStmts).run {}
+    recordSrvExtRoots lSt.extRoots
+    let guarded ← liftM <| wrapAuthAndReqs reqs (← `(Qed.Server.srvFinishM $asyncBody))
+    let mId := mkIdent `m
+    elabSrvCmd (← `(command|
+      set_option linter.unusedVariables false in
+      @[noinline] def $defId {$mId:ident : Type → Type} [Monad $mId] [Qed.Server.MonadServer $mId] $[($baseBinderIds:ident : $baseBinderTys:term)]* :
+          $mId (Except $errTyTerm $payloadTerm) := $guarded))
+    if (← hasSrvErrors) then return none
+    let callT ← mkAppTerms (← `($defId ($mId := Qed.Server.ThreadProg _σ))) (baseBinderIds.map (⟨·.raw⟩))
+    let noAtomId := c.subId (defLeaf.appendAfter "_noAtomic") fnIdent
+    let noAtomApp ← mkAppTerms noAtomId (baseBinderIds.map (⟨·.raw⟩))
+    elabSrvCmd (← `(command|
+      set_option linter.unusedVariables false in
+      theorem $noAtomId {_σ : Type} $[($baseBinderIds:ident : $baseBinderTys:term)]* :
+          Qed.Server.NoAtomic $callT := by qedSrvProveSafeIO $defId))
+    elabSrvCmd (← `(command|
+      set_option linter.unusedVariables false in
+      instance {_σ : Type} $[($baseBinderIds:ident : $baseBinderTys:term)]* :
+          Qed.Server.SafeIO $callT := ⟨$noAtomApp⟩))
+    if let some (ensId, postFn, labelStr) := ensSpec? then
+      let outVar := mkIdent `_srvOut; let postBody ← liftM <| postFn ⟨outVar.raw⟩
+      let ensThmId := c.subId (defLeaf.appendAfter "_ensures") fnIdent
+      let ensThmApp ← mkAppTerms ensThmId (baseBinderIds.map (⟨·.raw⟩))
+      elabSrvCmd (← `(command|
+        set_option linter.unusedVariables false in
+        theorem $ensThmId {_σ : Type} {_Inv : _σ → Prop} $[($baseBinderIds:ident : $baseBinderTys:term)]* :
+            Qed.Server.ProgEnsures _Inv (fun ($outVar:ident : Except $errTyTerm $payloadTerm) => $postBody) $callT := by
+          qedSrvProveAsyncEnsures $defId [$ensId] $(Syntax.mkStrLit fnStr) $(Syntax.mkStrLit s!"ensures: {labelStr}")))
+      elabSrvCmd (← `(command|
+        set_option linter.unusedVariables false in
+        instance {_σ : Type} $[($baseBinderIds:ident : $baseBinderTys:term)]* :
+            Qed.Server.SafeIOEnsures $callT (fun ($outVar:ident : Except $errTyTerm $payloadTerm) => $postBody) :=
+          ⟨$noAtomApp, fun {_Inv} => $ensThmApp⟩))
+    if (← hasSrvErrors) then return none
+    return some ({ name := fnStr, defId, paramCount := pIdents.size, isMonadic := true, takesAtomic := false, mutatesState := false, dbWrite := lSt.dbWrite }, #[])
+
+@[noinline]
+private def elabServerBeforeClause (bc : Syntax) : SrvElabM (Option Term) := do
+  let c ← read; let beforeIdent := mkIdentFrom bc `_before
+  let bodyStmts := ensureUnitReturn beforeIdent (suiteStmts (bc.getArg 2))
+  let hasAwait := blockHasAwait bodyStmts; let isAsync := if c.hasState then hasAwait || blockHasAtomic bodyStmts else true
+  let some (runExpr, _, _) ← elabServerHandler isAsync "before" beforeIdent #[] #[] #[] (← `(Unit)) (← `(Qed.Server.ApiError))
+      (← mkBaseLowerCtx "before" #[] (if c.hasState then isAsync else hasAwait) true true) bodyStmts none | return none
+  return some runExpr
+
+@[noinline]
+private def elabServerFnClause (existingMethods : Array ServerMethodInfo) (fc : Syntax) (beforeRun? : Option Term := none) :
     SrvElabM (Option (ServerMethodInfo × TSyntax ``Lean.Parser.Term.matchAltExpr)) := do
   let c ← read; let fnIdent : Ident := ⟨fc.getArg 1⟩; let fnStr := fnIdent.getId.toString
-  if existingMethods.any (·.name == fnStr) then throwErrorAt fnIdent s!"duplicate function `{fnStr}` in `server {c.srvName}`"
-  let mut reqExprs : Array Syntax := #[]; let mut ensExprs : Array Syntax := #[]
-  for cl in (fc.getArg 8).getArgs do
-    if cl.getKind == ``srvRequiresLine then reqExprs := reqExprs ++ (cl.getArg 1).getSepArgs
-    else if cl.getKind == ``srvEnsuresLine then ensExprs := ensExprs ++ (cl.getArg 1).getSepArgs
-    else throwErrorAt cl "unexpected contract clause in `def`"
-  let (pIdents, pTyTerms, paramNames) ← parseSrvParams s!"server function `{fnStr}`" "parameter" (fc.getArg 3).getSepArgs (reserved := if ensExprs.isEmpty then #[] else #["result"])
+  if existingMethods.any (·.name == fnStr) || c.helpers.any (·.name == fnStr) then throwErrorAt fnIdent s!"duplicate function `{fnStr}` in `server {c.srvName}`"
+  let (reqExprs, ensExprs) ← liftM <| parseSrvContracts "`rpc`" (fc.getArg 8).getArgs
+  let (pIdents, pTyTerms, paramNames) ← parseSrvParams s!"server RPC `{fnStr}`" "parameter" (fc.getArg 3).getSepArgs (reserved := if ensExprs.isEmpty then #[] else #["result"])
   let retTy ← liftMacroM <| lowerSrvType (fc.getArg 6) true s!"return type of `{fnStr}`"
   let (payloadTerm, innerOpt?) := (retTy.term, retTy.innerOpt?)
   let isUnitPayload := (retTy.mods.filter (· != .fallible)).isEmpty && retTy.baseName == `Unit
@@ -317,27 +467,27 @@ private def elabServerFnClause (existingMethods : Array ServerMethodInfo) (fc : 
   let reqs ← elabRequiresClauses fnIdent fnIdent.getId fnStr "_hReq" "_req" paramNames paramNames pIdents pTyTerms reqExprs
   let some ensRes? ← elabEnsuresAbbrev fnIdent fnStr `result paramNames pIdents pTyTerms (innerOpt?.getD payloadTerm) ensExprs | return none
   let pTerms : Array Term := pIdents.map (⟨·.raw⟩)
-  let ensSpec? : Option FnEnsSpec := ensRes?.map fun (ensId, _, labelStr) => (ensId, fun outT => do
-    let ensApp ← mkAppTerms ensId pTerms; if innerOpt?.isSome then `(Qed.Server.srvEnsPostOpt ($ensApp) $outT) else `(Qed.Server.srvEnsPost ($ensApp) $outT), labelStr)
+  let ensSpec? := mkFnEnsSpec? ensRes? pTerms innerOpt?.isSome
   let hasAwait := blockHasAwait bodyStmts; let reqTupleTy ← liftMacroM <| buildProdType pTyTerms; let reqVar := mkIdent `_reqVal
   let projs ← extractTupleProjections reqVar pTyTerms.size
-  let some (runExpr, isReadOnly, _) ← elabServerHandler hasAwait fnStr fnIdent (pIdents ++ reqs.reqHypIds) (pTyTerms ++ reqs.reqPropTerms)
-      (projs ++ reqs.reqHypIds.map (⟨·.raw⟩)) payloadTerm errTyTerm
-      (← mkBaseLowerCtx fnStr paramNames hasAwait (retTy.isFallible || innerOpt?.isSome) retTy.isFallible innerOpt? domainErrTyTerm?) bodyStmts ensSpec? | return none
+  let some (runExpr, isReadOnly, _) ← elabServerHandler hasAwait fnStr fnIdent (pIdents ++ reqs.allBinderIds) (pTyTerms ++ reqs.allBinderTys)
+      (projs ++ reqs.allBinderArgs) payloadTerm errTyTerm
+      (← mkBaseLowerCtx fnStr (paramNames ++ reqs.extraLocals) hasAwait (retTy.isFallible || innerOpt?.isSome) retTy.isFallible innerOpt? domainErrTyTerm?) bodyStmts ensSpec? | return none
   let resExpr ← if domainErrTyTerm?.isSome then `(Qed.Server.SrvFailure.toWire _fnRes) else `(_fnRes)
   let arm : TSyntax ``Lean.Parser.Term.matchAltExpr ← liftM <| do
-    let dec ← mkProtoDecodeBind (mkIdent `reqBytes) reqVar reqTupleTy pIdents projs (← wrapReqs reqs.reqPropTerms reqs.reqHypIds reqs.reqLabels (← `($runExpr >>= fun _fnRes => Pure.pure (($resExpr).map Qed.Proto.encode))))
-    `(Lean.Parser.Term.matchAltExpr| | $(Syntax.mkStrLit fnStr) => $dec)
+    let dec ← mkProtoDecodeBind (mkIdent `reqBytes) reqVar reqTupleTy pIdents projs (← wrapAuthAndReqs reqs (← `($runExpr >>= fun _fnRes => Pure.pure (($resExpr).map Qed.Proto.encode))))
+    let guardedDec ← wrapWithBefore? beforeRun? dec
+    `(Lean.Parser.Term.matchAltExpr| | $(Syntax.mkStrLit fnStr) => $guardedDec)
   let paramTypeConsts ← elabFnClientStubs fnIdent fnStr pIdents pTyTerms reqTupleTy payloadTerm innerOpt? errTypeId? ensSpec? reqs
   return some ({
-    name := fnStr, paramNames := pIdents.map (·.getId), paramCount := pIdents.size, isReadOnly, isAsync := hasAwait,
+    name := fnStr, paramNames := pIdents.map (·.getId), paramCount := pIdents.size, isReadOnly, isAsync := hasAwait || beforeRun?.isSome,
     isFallible := retTy.isFallible, isOption := innerOpt?.isSome, hasClientReq := reqs.clientReqId?.isSome, requiresAuth := reqs.requiresAuth,
     clientReqConst := reqs.clientReqConst?, clientReqLabel := reqs.clientReqLabel, hasEnsures := ensSpec?.isSome, ensPredConst := ensRes?.map (·.2.1),
     domainErrTags := domainTagIdents.map (·.getId.toString), rawRpcConst := c.fullSrvName ++ Name.mkSimple s!"_rpc_{fnStr}",
     outcomeConst := c.fullSrvName ++ fnIdent.getId.appendAfter "_Outcome", paramTypeConsts }, arm)
 
 @[noinline]
-private def elabServerHttpRouteClause (routeIdx : Nat) (existingRoutes : Array (String × String)) (hc : Syntax) :
+private def elabServerHttpRouteClause (routeIdx : Nat) (existingRoutes : Array (String × String)) (hc : Syntax) (beforeRun? : Option Term := none) :
     SrvElabM (Option ((String × String) × TSyntax ``Lean.Parser.Term.matchAltExpr)) := do
   let c ← read; let isStream := hc.getKind == ``srvStreamClause
   let methodStr := if isStream then "GET" else (hc.getArg 0).getId.toString.toUpper
@@ -355,11 +505,11 @@ private def elabServerHttpRouteClause (routeIdx : Nat) (existingRoutes : Array (
   if !isStream && !blockAlwaysReturns bodyStmts then throwErrorAt pathStx s!"missing `return` on fallthrough path of `{routeLabel}`"
   let reqs ← elabRequiresClauses routeIdent routeLeaf routeLabel "_hHttpReq" "_req" #[] #[] #[] #[] reqExprs (trackAuth := true)
   let hasAwait := blockHasAwait bodyStmts
-  let some (runExpr, _, _) ← elabServerHandler hasAwait routeLabel routeIdent reqs.reqHypIds reqs.reqPropTerms (reqs.reqHypIds.map (⟨·.raw⟩))
+  let some (runExpr, _, _) ← elabServerHandler hasAwait routeLabel routeIdent reqs.allBinderIds reqs.allBinderTys reqs.allBinderArgs
       (← if isStream then `(Unit) else `(Qed.Server.HttpResponse)) (← `(Qed.Server.ApiError))
-      (← mkBaseLowerCtx routeLabel #[] hasAwait true true (isHttpRoute := !isStream) (isStreamRoute := isStream)) bodyStmts none | return none
+      (← mkBaseLowerCtx routeLabel reqs.extraLocals hasAwait true true (isHttpRoute := !isStream) (isStreamRoute := isStream)) bodyStmts none | return none
   let mapFn ← if isStream then `(fun _ => Option.some (Qed.Server.HttpResponse.sse [])) else `(Option.some)
-  let guardedRun ← liftM <| wrapReqs reqs.reqPropTerms reqs.reqHypIds reqs.reqLabels (← `($runExpr >>= fun _httpRes => Pure.pure (_httpRes.map $mapFn)))
+  let guardedRun ← liftM <| wrapWithBefore? beforeRun? (← liftM <| wrapAuthAndReqs reqs (← `($runExpr >>= fun _httpRes => Pure.pure (_httpRes.map $mapFn))))
   return some ((methodStr, pathStr), ← `(Lean.Parser.Term.matchAltExpr| | $(Syntax.mkStrLit methodStr), $(Syntax.mkStrLit pathStr) => $guardedRun))
 
 @[noinline]
@@ -395,26 +545,34 @@ private def elabServerCmdCore (priorRep priorUnrep : Nat) : CommandElab := fun s
       let some hdr ← elabServerChannelHeader (chanHeaders.map ParsedChanHeader.chStr) cc | return
       chanHeaders := chanHeaders.push hdr
     withReader (fun (c : SrvElabCtx) => { c with chanSigs := chanHeaders.map ParsedChanHeader.sig }) do
-      let mut methodInfos : Array ServerMethodInfo := #[]; let mut dispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
-      for fc in parsed.fnClauses do
-        let some (info, arm) ← elabServerFnClause methodInfos fc | return
-        methodInfos := methodInfos.push info; dispatchArms := dispatchArms.push arm
-      let mut wsDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
-      let mut wsProjectArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
-      for hdr in chanHeaders do
-        let some (chArms, projArm?) ← elabServerChannelBody hdr | return
-        wsDispatchArms := wsDispatchArms ++ chArms
-        if let some pa := projArm? then wsProjectArms := wsProjectArms.push pa
-      let mut httpRoutes : Array (String × String) := #[]; let mut httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
-      for (hc, idx) in parsed.httpClauses.zipIdx do
-        let some (rt, arm) ← elabServerHttpRouteClause idx httpRoutes hc | return
-        httpRoutes := httpRoutes.push rt; httpDispatchArms := httpDispatchArms.push arm
-      let some jobNames ← elabServerJobs methodInfos parsed.jobClauses | return
-      let elabHook? (lbl : String) (leaf : Name) (cl? : Option Syntax) : SrvElabM (Option (Option Term)) :=
-        match parsed.authDecl?, cl? with | some (_, ai), some hc => Option.map some <$> elabServerAuthHook lbl leaf ai hc | _, _ => pure (some none)
-      let some onCreateRun? ← elabHook? "onCreateAccount" `_onCreateAccount parsed.onCreateAccountClause? | return
-      let some onSignInRun? ← elabHook? "onSignIn" `_onSignIn parsed.onSignInClause? | return
-      elabServerDispatchCmds methodInfos dispatchArms (chanHeaders.map ParsedChanHeader.chStr) wsDispatchArms wsProjectArms httpDispatchArms jobNames onCreateRun? onSignInRun?
+      let mut helperSigs : Array SrvHelperSig := #[]; let mut statefulHelperIds : Array Ident := #[]
+      for hlc in parsed.helperClauses do
+        let some (hs, shIds) ← withReader (fun (c : SrvElabCtx) => { c with helpers := helperSigs, statefulHelperIds }) (elabServerHelperClause hlc) | return
+        helperSigs := helperSigs.push hs; statefulHelperIds := statefulHelperIds ++ shIds
+      withReader (fun (c : SrvElabCtx) => { c with helpers := helperSigs, statefulHelperIds }) do
+        let beforeRun? : Option Term ← match parsed.beforeClause? with
+          | none => pure none
+          | some bc => match ← elabServerBeforeClause bc with | some br => pure (some br) | none => return
+        let mut methodInfos : Array ServerMethodInfo := #[]; let mut dispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
+        for fc in parsed.fnClauses do
+          let some (info, arm) ← elabServerFnClause methodInfos fc beforeRun? | return
+          methodInfos := methodInfos.push info; dispatchArms := dispatchArms.push arm
+        let mut wsDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
+        let mut wsProjectArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
+        for hdr in chanHeaders do
+          let some (chArms, projArm?) ← elabServerChannelBody hdr beforeRun? | return
+          wsDispatchArms := wsDispatchArms ++ chArms
+          if let some pa := projArm? then wsProjectArms := wsProjectArms.push pa
+        let mut httpRoutes : Array (String × String) := #[]; let mut httpDispatchArms : Array (TSyntax ``Lean.Parser.Term.matchAltExpr) := #[]
+        for (hc, idx) in parsed.httpClauses.zipIdx do
+          let some (rt, arm) ← elabServerHttpRouteClause idx httpRoutes hc beforeRun? | return
+          httpRoutes := httpRoutes.push rt; httpDispatchArms := httpDispatchArms.push arm
+        let some jobNames ← elabServerJobs methodInfos parsed.jobClauses | return
+        let elabHook? (lbl : String) (leaf : Name) (cl? : Option Syntax) : SrvElabM (Option (Option Term)) :=
+          match parsed.authDecl?, cl? with | some (_, ai), some hc => Option.map some <$> elabServerAuthHook lbl leaf ai hc | _, _ => pure (some none)
+        let some onCreateRun? ← elabHook? "onCreateAccount" `_onCreateAccount parsed.onCreateAccountClause? | return
+        let some onSignInRun? ← elabHook? "onSignIn" `_onSignIn parsed.onSignInClause? | return
+        elabServerDispatchCmds methodInfos dispatchArms (chanHeaders.map ParsedChanHeader.chStr) wsDispatchArms wsProjectArms httpDispatchArms jobNames onCreateRun? onSignInRun?
   ).run initCtx
   for runProof in ← initCtx.deferredProofs.get do unless (← runProof) do return
 

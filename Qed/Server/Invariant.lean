@@ -208,6 +208,15 @@ def elabSrvAutoField : TermElab := fun stx expectedType? => do
     if !expTy.getAppFn.isMVar then
       let expWhnf ← whnf expTy
       if expWhnf.isAppOfArity ``Qed.Field 2 then
+        let saved ← saveState; let preMsgs := (← Core.getMessageLog).toList.length
+        let direct? ← try
+          let e ← Term.withoutErrToSorry <| elabTermEnsuringType valStx (some expTy)
+          synthesizeSyntheticMVarsNoPostponing
+          let e ← instantiateMVars e
+          if (← Core.getMessageLog).toList.length == preMsgs && !e.hasMVar then pure (some e) else pure none
+        catch _ => pure none
+        if let some direct := direct? then return direct
+        restoreState saved
         let innerTy := expWhnf.getAppArgs[0]!; let predFn := expWhnf.getAppArgs[1]!
         let valExpr ← elabTermEnsuringType valStx (some innerTy); synthesizeSyntheticMVarsNoPostponing
         let valExpr ← instantiateMVars valExpr; let goalProp := mkApp predFn valExpr
@@ -617,13 +626,22 @@ private def stepAsyncLoop (isPreserves : Bool) (dCtx sCtx : Simp.Context) (gInit
         if prog.isAppOf ``Qed.Server.srvLetEq then
           if let some gLet ← elimSrvLetEqGoal g false then return ← loop fuel ((← normCont gLet 0) ++ rest)
         if isPreserves && !(prog.getUsedConstants.any fun c => c == ``Qed.Server.MonadAtomic.runAtomic || c == ``Qed.Server.MonadAtomic.runAtomicRead) then
-          if let some [] ← tryApplyConst g ``Qed.Server.safeIO_preservesStepRel then return ← loop fuel rest
+          if let some [] ← tryApplyConst g ``Qed.Server.ProgSpec.of_safeIO then return ← loop fuel rest
         match ← trySplitTarget g with
         | some sgs => return ← loop fuel ((← normSplits sgs) ++ rest)
         | none =>
-            if isPreserves then if let some [] ← tryApplyConst g ``Qed.Server.safeIO_preservesStepRel then return ← loop fuel rest
+            if isPreserves then if let some [] ← tryApplyConst g ``Qed.Server.ProgSpec.of_safeIO then return ← loop fuel rest
             return g :: (← loop fuel rest)
   loop 256 [gInit]
+
+private def initAsyncSimpAndNorm (g : MVarId) (unfoldConsts : Array Name) :
+    TacticM (Simp.Context × Simp.Context × Option MVarId) := do
+  let (dCtx, _) ← mkCachedSimpCtx "asyncDsimp" #[``Qed.Server.srvSeqM, ``Qed.Server.dbRunTx, ``Qed.Server.SrvUnwrap.unwrap, ``Qed.Server.SrvErr.ofApi, ``Qed.Server.SrvUnwrapOpt.unwrapOpt] { zetaDelta := false } #[] true
+  let (sCtx, _) ← mkCachedSimpCtx "asyncNorm" (stepCombSimpNames ++ stepLetEqSimpNames ++ ensPostSimpNames ++ #[``Qed.Server.threadProg_pure_bind, ``Qed.Server.threadProg_pure_bind', ``Qed.Server.threadProg_bind_assoc])
+  let gInit? ← runGoalPipe (← g.intros).2 [
+    fun g => do tryGoalOptM g (simpGoalOnly · (← mkDynamicSimpCtx unfoldConsts (some ("asyncInit", #[``Qed.Server.srvFinishM, ``Qed.Server.srvSeqM, ``Qed.Server.dbRunTx])))),
+    (normAsyncContGoal · dCtx sCtx)]
+  return (dCtx, sCtx, gInit?)
 
 private def elabAsyncProve (isPreserves : Bool) (handlerId : Ident) (invUnfoldIds : Array Ident) (fnLabel invLabel : String) : TacticM Unit := do
   let g0 ← getMainGoal
@@ -632,16 +650,46 @@ private def elabAsyncProve (isPreserves : Bool) (handlerId : Ident) (invUnfoldId
       pure g'
     else pure g0
   let handlerConst ← resolveGlobalConstNoOverload handlerId; let userNames ← invUnfoldIds.mapM resolveGlobalConstNoOverload
-  let (dCtx, _) ← mkCachedSimpCtx "asyncDsimp" #[``Qed.Server.srvSeqM, ``Qed.Server.dbRunTx, ``Qed.Server.SrvUnwrap.unwrap, ``Qed.Server.SrvErr.ofApi, ``Qed.Server.SrvUnwrapOpt.unwrapOpt] { zetaDelta := false } #[] true
-  let (sCtx, _) ← mkCachedSimpCtx "asyncNorm" (stepCombSimpNames ++ stepLetEqSimpNames ++ ensPostSimpNames ++ #[``Qed.Server.threadProg_pure_bind, ``Qed.Server.threadProg_pure_bind', ``Qed.Server.threadProg_bind_assoc])
-  let some gInit ← runGoalPipe (← g1.intros).2 [
-    fun g => do tryGoalOptM g (simpGoalOnly · (← mkDynamicSimpCtx #[handlerConst] (some ("asyncInit", #[``Qed.Server.srvFinishM, ``Qed.Server.srvSeqM, ``Qed.Server.dbRunTx])))),
-    (normAsyncContGoal · dCtx sCtx)] | replaceMainGoal []; return
-  runProveStepOnGoals (← stepAsyncLoop isPreserves dCtx sCtx gInit) userNames fnLabel invLabel
+  let (helperConsts, invConsts) := userNames.partition fun n => n.getString!.startsWith "_fn_"
+  let (dCtx, sCtx, some gInit) ← initAsyncSimpAndNorm g1 (#[handlerConst] ++ helperConsts) | replaceMainGoal []; return
+  runProveStepOnGoals (← stepAsyncLoop isPreserves dCtx sCtx gInit) invConsts fnLabel invLabel
+
+private def stepSafeIOLoop (dCtx sCtx : Simp.Context) (gInit : MVarId) : TacticM (List MVarId) :=
+  let norm1 (g' : MVarId) : TacticM (List MVarId) := return (← normAsyncContGoal g' dCtx sCtx).toList
+  let rec loop : Nat → List MVarId → TacticM (List MVarId)
+    | _, [] => return []
+    | 0, gs => return gs
+    | fuel + 1, g :: rest => do
+        if let some [] ← tryApplyConst g ``Qed.Server.NoAtomic.pure then return ← loop fuel rest
+        if let some [] ← tryApplyConst g ``Qed.Server.SafeIO.noAtomic then return ← loop fuel rest
+        let tgtC := (← g.withContext do instantiateMVars (← g.getType)).consumeMData
+        if tgtC.isAppOfArity ``Qed.Server.NoAtomic 3 then
+          let prog := tgtC.getAppArgs[2]!.consumeMData
+          if prog.isAppOf ``Bind.bind || prog.isAppOf ``Qed.Server.ThreadProg.bind then
+            if let some [gLeft, gRight] ← tryApplyConst g ``Qed.Server.noAtomic_bind then
+              let gLeftRem ← match ← tryApplyConst gLeft ``Qed.Server.SafeIO.noAtomic with | some [] => pure [] | _ => pure [gLeft]
+              let (_, gR1) ← gRight.intro1P
+              return ← loop fuel (gLeftRem ++ (← norm1 gR1) ++ rest)
+          if prog.isAppOf ``Qed.Server.srvLetEq then
+            if let some gLet ← elimSrvLetEqGoal g false then return ← loop fuel ((← norm1 gLet) ++ rest)
+        match ← trySplitTarget g with
+        | some sgs => return ← loop fuel ((← sgs.filterMapM (normAsyncContGoal · dCtx sCtx)) ++ rest)
+        | none => return g :: (← loop fuel rest)
+  loop 256 [gInit]
+
+@[noinline]
+private def elabSafeIOProve (fnId : Ident) : TacticM Unit := do
+  let g0 ← getMainGoal; let fnConst ← resolveGlobalConstNoOverload fnId
+  let (dCtx, sCtx, some gInit) ← initAsyncSimpAndNorm g0 #[fnConst] | replaceMainGoal []; return
+  let rem ← stepSafeIOLoop dCtx sCtx gInit
+  setGoals rem
+  unless rem.isEmpty do
+    Qed.Diag.throwUnsolvedGoals m!"Server helper `{fnConst}` could not be proved `SafeIO` (no atomic state mutation):" m!"" (maxShown? := some 1) (goals? := some rem)
 
 elab_rules : tactic
   | `(tactic| qedSrvProveAsync $handlerId:ident [$[$invUnfoldIds:ident],*] $fnLabel:str $invLabel:str) => elabAsyncProve true handlerId invUnfoldIds fnLabel.getString invLabel.getString
   | `(tactic| qedSrvProveAsyncEnsures $handlerId:ident [$[$invUnfoldIds:ident],*] $fnLabel:str $invLabel:str) => elabAsyncProve false handlerId invUnfoldIds fnLabel.getString invLabel.getString
+  | `(tactic| qedSrvProveSafeIO $fnId:ident) => elabSafeIOProve fnId
 
 /-! ## Client RPC Precondition Prover (`qedProveRpcReq`) -/
 

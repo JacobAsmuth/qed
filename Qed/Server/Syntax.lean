@@ -40,6 +40,8 @@ def extHttpMethod : Parser := identEq `get <|> identEq `post <|> identEq `put <|
 @[extClause_parser] def extAuthBearer : Parser := leading_parser authP `bearer secretArg
 @[extClause_parser] def extAuthHeader : Parser := leading_parser authP `header (strLit >> ", " >> secretArg)
 @[extClause_parser] def extAuthGcp : Parser := leading_parser authP `gcpServiceAccount (secretArg >> optional (", " >> strLit))
+@[extClause_parser] def extAuthGcpMeta : Parser := leading_parser
+  withPosition (atomic (identEq `auth >> identEq `gcpMetadata) >> optional ("(" >> strLit >> ")"))
 @[extClause_parser] def extEndpointClause : Parser := leading_parser
   withPosition (extHttpMethod >> strLit >> checkColGt "expected endpoint signature" >> callSig (categoryParser `extParam 0))
 @[extWsSubClause_parser] def extWsReqClause : Parser := leading_parser srvRequiresLine
@@ -84,7 +86,11 @@ private def identDotTransaction : Parser :=
 @[qedStmt_parser] def qedStmtDbTransaction : Parser := leading_parser withPosition (atomic (identDotTransaction >> ":") >> qedSuite)
 @[srvClause_parser] def srvHttpRouteClause : Parser := leading_parser withPosition (atomic (extHttpMethod >> strLit >> ":") >> srvContractSuite "expected indented HTTP route body" srvContractLine)
 @[srvClause_parser] def srvStreamClause : Parser := leading_parser withPosition (atomic (identEq `stream) >> strLit >> ":" >> srvContractSuite "expected indented `stream` body" srvContractLine)
-@[srvClause_parser] def srvFnClause : Parser := leading_parser withPosition (symbol "def" >> callSig srvParam >> ":" >> srvContractSuite "expected indented function body" srvContractLine)
+@[srvClause_parser] def srvFnClause : Parser := leading_parser withPosition (atomic (identEq `rpc) >> callSig srvParam >> ":" >> srvContractSuite "expected indented RPC body" srvContractLine)
+@[srvClause_parser] def srvHelperFnClause : Parser := leading_parser
+  withPosition (atomic (identEq `fn) >> ident >> checkNoWsBefore "" >> "(" >> sepBy srvParam "," >> ")" >> optional (" -> " >> qType) >> ":" >>
+    srvContractSuite "expected indented helper function body" srvContractLine)
+@[srvClause_parser] def srvBeforeClause : Parser := leading_parser withPosition (atomic (identEq `before >> ":") >> qedSuite)
 @[srvClause_parser] def srvJobClause : Parser := leading_parser withPosition (atomic (identEq `every) >> numLit >> ident >> ident >> ":" >> qedSuite)
 @[srvClause_parser] def srvOnCreateAccountClause : Parser := leading_parser authHook `onCreateAccount
 @[srvClause_parser] def srvOnSignInClause : Parser := leading_parser authHook `onSignIn
@@ -110,6 +116,7 @@ syntax (name := srvSetElemStx)   "srvSetElem(" term ", " term ", " term ")" : te
 syntax "qedSrvProveStep " "[" ident,* "]" str str : tactic
 syntax "qedSrvProveAsync " ident "[" ident,* "]" str str : tactic
 syntax "qedSrvProveAsyncEnsures " ident "[" ident,* "]" str str : tactic
+syntax "qedSrvProveSafeIO " ident : tactic
 syntax "qedProveRpcReq" : tactic
 
 end Qed.Server

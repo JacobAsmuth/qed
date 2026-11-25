@@ -22,6 +22,11 @@ def forbidden    (msg : String := "forbidden") : ApiError := ⟨403, msg⟩
 def notFound     (msg : String := "not found") : ApiError := ⟨404, msg⟩
 def internal     (msg : String) : ApiError := ⟨500, msg⟩
 def httpStatus   (e : ApiError) : UInt32 := if 400 ≤ e.code && e.code < 600 then e.code.toUInt32 else 400
+def wireMessage  (e : ApiError) (devMode : Bool) : String :=
+  if !devMode && 500 ≤ e.httpStatus.toNat then "internal server error" else e.message
+theorem wireMessage_prod_5xx (e : ApiError) (h : 500 ≤ e.httpStatus.toNat) :
+    e.wireMessage false = "internal server error" := by
+  simp [wireMessage, h]
 instance : ToString ApiError := ⟨(·.message)⟩
 instance : LawfulJson ApiError := .ofEquiv (fun e => (e.code, e.message)) (fun p => ⟨p.1, p.2⟩) (fun ⟨_, _⟩ => rfl)
 instance : NonNullJson ApiError := ⟨nofun⟩
@@ -48,17 +53,27 @@ def claim (ctx : RequestCtx) (name : String) : Option String :=
   (ctx.claims.lookup name).orElse fun _ => if name == "verified" then ctx.claims.lookup "email_verified" else none
 def hasClaim (ctx : RequestCtx) (name expected : String) : Bool := ctx.claim name == some expected
 def isAuthenticated (ctx : RequestCtx) : Bool := ctx.userId.isSome
+def queryParams (ctx : RequestCtx) : List (String × String) := Qed.parseQueryParams ctx.query
+def queryParam (ctx : RequestCtx) (key : String) : Option String := ctx.queryParams.lookup key
+def parseJson (ctx : RequestCtx) (α : Type) [FromJson α] (maxDepth : Nat := 64) : Except ApiError α :=
+  ((Json.parse ctx.body maxDepth).bind FromJson.fromJson).mapError fun e => ApiError.badRequest s!"invalid JSON body: {e}"
 end RequestCtx
 
 /-! ## Validated HTTPS Webhook URLs & CRLF Header / Cookie Injection Closure -/
 
 abbrev isValidWebhookUrl (s : String) : Bool :=
-  s.startsWith "https://" && decide (8 < s.length) && !s.startsWith "https:///" &&
-  s.toList.all fun c => isSafeUrlChar c && c != '\\' && decide (32 < c.toNat ∧ c.toNat ≠ 127)
+  Qed.Str.startsWith s "https://" && Qed.isSafeUrl s && s.toList.all fun c => c != '\\'
 abbrev WebhookUrl := Qed.Field (fun s : String => isValidWebhookUrl s = true)
-@[match_pattern] abbrev WebhookUrl.mk (raw : String) (valid : isValidWebhookUrl raw = true) : WebhookUrl := Qed.Field.mk raw valid
+@[match_pattern] abbrev WebhookUrl.make (raw : String) (valid : isValidWebhookUrl raw = true := by decide) : WebhookUrl := Qed.Field.mk raw valid
+@[inline] def WebhookUrl.parse? (raw : String) : Option WebhookUrl := Qed.Field.parse? (fun s => isValidWebhookUrl s = true) raw
+@[inline] def WebhookUrl.parse (raw : String) : Except String WebhookUrl := Qed.Field.parse (fun s => isValidWebhookUrl s = true) "invalid WebhookUrl: expected safe https:// URL" raw
 abbrev WebhookUrl.raw (u : WebhookUrl) : String := u.val
 abbrev WebhookUrl.valid (u : WebhookUrl) : isValidWebhookUrl u.raw = true := u.ok
+
+theorem WebhookUrl.isSafeUrl (u : WebhookUrl) : Qed.isSafeUrl u.raw = true := by
+  have h := u.valid; simp only [isValidWebhookUrl, Bool.and_eq_true] at h; exact h.1.2
+
+instance : Qed.ToHref WebhookUrl := ⟨fun u => ⟨u.raw, u.isSafeUrl⟩⟩
 
 @[inline] def isSafeHeaderChar (c : Char) : Bool := let n := c.toNat; 32 ≤ n && n ≠ 127
 def sanitizeHeader (s : String) : String := String.ofList (s.toList.filter isSafeHeaderChar)
@@ -170,8 +185,8 @@ respStr json "application/json; charset=utf-8"
 respStr html "text/html; charset=utf-8"
 def jsonOf {α : Type} [ToJson α] (val : α) (status : Nat := 200) (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
   json (Json.render (toJson val)) status headers cookies
-def redirect (location : String) (status : Nat := 302) (cookies : List SetCookie := []) : HttpResponse :=
-  bytes "text/plain; charset=utf-8" ByteArray.empty status [("Location", sanitizeHeader location)] cookies
+def redirect (location : Qed.HrefTarget) (status : Nat := 302) (cookies : List SetCookie := []) : HttpResponse :=
+  bytes "text/plain; charset=utf-8" ByteArray.empty status [("Location", sanitizeHeader location.raw)] cookies
 def sse (events : List SseEvent) (headers : List (String × String) := []) (cookies : List SetCookie := []) : HttpResponse :=
   bytes "text/event-stream; charset=utf-8" (SseEvent.formatStream events) 200 ([("Cache-Control", "no-cache"), ("X-Accel-Buffering", "no")] ++ headers) cookies
 end HttpResponse
@@ -292,10 +307,11 @@ theorem external_ws_url_preserves_origin (base : String) (parts : List PathPart)
 /-! ## External Auth Specs, Outbound HTTP & `MonadServer` / `MonadAtomic` -/
 
 inductive AuthSpec where
-  | none | bearerSecret (envVar : String) | headerSecret (headerName envVar : String) | gcpServiceAccount (envVar scope : String)
+  | none | bearerSecret (envVar : String) | headerSecret (headerName envVar : String)
+  | gcpServiceAccount (envVar scope : String) | gcpMetadata (audience? : Option String := none)
 deriving Inhabited, DecidableEq, Repr
 def AuthSpec.requiredSecrets : AuthSpec → List String
-  | .none => [] | .bearerSecret v | .headerSecret _ v | .gcpServiceAccount v _ => [v]
+  | .none | .gcpMetadata _ => [] | .bearerSecret v | .headerSecret _ v | .gcpServiceAccount v _ => [v]
 
 structure OutboundReq where
   serviceName  : String
@@ -442,8 +458,62 @@ instance (p : ThreadProg σ α) (k : α → ThreadProg σ β) [hp : SafeIO p] [h
 theorem noAtomic_flushWsEmits : ∀ es : List WsEmit, NoAtomic (flushWsEmits (m := ThreadProg σ) es)
   | [] => .pure () | e :: es => noAtomic_bind (.io (.wsBroadcast e.topic e.payload) _ .pure) fun _ => noAtomic_flushWsEmits es
 instance (es : List WsEmit) : SafeIO (flushWsEmits (m := ThreadProg σ) es) := ⟨noAtomic_flushWsEmits es⟩
+
+/-! ### Verified Server Helpers (`newId`, `mintBearerToken`, `hashBearerToken`) -/
+
+abbrev BoundedId := Qed.Field (fun s : String => 1 ≤ s.length ∧ s.length ≤ 128)
+
+def newId {m : Type → Type} [Monad m] [MonadServer m] (pfx : String := "") (bytes : UInt32 := 12) :
+    m (Except ApiError BoundedId) :=
+  MonadServer.randomHex bytes >>= fun rnd =>
+    let raw := if pfx.isEmpty then rnd else pfx ++ "_" ++ rnd
+    Pure.pure (if h : 1 ≤ raw.length ∧ raw.length ≤ 128 then .ok ⟨raw, h⟩ else .error (ApiError.internal "generated identifier length out of bounds (1..128)"))
+
+theorem noAtomic_newId (pfx : String) (bytes : UInt32) : NoAtomic (newId (m := ThreadProg σ) pfx bytes) :=
+  noAtomic_bind (.io (.randomHex bytes) _ .pure) fun _ => .pure _
+instance (pfx : String) (bytes : UInt32) : SafeIO (newId (m := ThreadProg σ) pfx bytes) := ⟨noAtomic_newId pfx bytes⟩
+
+def mintBearerToken {m : Type → Type} [Monad m] [MonadServer m] (userId : String) (ttlSec : Nat := 86400 * 30)
+    (secretEnv : String := "QED_AUTH_SECRET") : m (Except ApiError String) :=
+  if userId.isEmpty || userId.contains '\x00' then Pure.pure (.error (ApiError.badRequest "invalid user id for bearer token"))
+  else MonadServer.readEnv secretEnv >>= fun sec? =>
+    match sec? with
+    | none => Pure.pure (.error (ApiError.internal s!"missing required secret `{secretEnv}`"))
+    | some sec =>
+        if sec.isEmpty then Pure.pure (.error (ApiError.internal s!"secret `{secretEnv}` is empty"))
+        else MonadServer.nowMs >>= fun now =>
+          let payload := "v1." ++ toString (now.toNat / 1000 + ttlSec) ++ "." ++ userId
+          MonadServer.hmacSha256 sec.toUTF8 payload.toUTF8 >>= fun sig =>
+            Pure.pure (.ok (payload ++ "." ++ Proto.encodeHex sig))
+
+theorem noAtomic_mintBearerToken (userId : String) (ttlSec : Nat) (secretEnv : String) :
+    NoAtomic (mintBearerToken (m := ThreadProg σ) userId ttlSec secretEnv) := by
+  unfold mintBearerToken; split
+  · exact .pure _
+  · refine noAtomic_bind (.io (.readEnv secretEnv) _ .pure) fun r => ?_
+    cases r with
+    | none => exact .pure _
+    | some sec =>
+        by_cases h : sec.isEmpty
+        · simp only [h, ↓reduceIte]; exact .pure _
+        · simp only [h, Bool.false_eq_true, ↓reduceIte]
+          exact noAtomic_bind (.io .nowMs _ .pure) fun _ =>
+            noAtomic_bind (.io (.hmacSha256 _ _) _ .pure) fun _ => .pure _
+instance (userId : String) (ttlSec : Nat) (secretEnv : String) : SafeIO (mintBearerToken (m := ThreadProg σ) userId ttlSec secretEnv) :=
+  ⟨noAtomic_mintBearerToken userId ttlSec secretEnv⟩
+
+def hashBearerToken {m : Type → Type} [Monad m] [MonadServer m] (token : String) : m (Except ApiError String) :=
+  MonadServer.hmacSha256 "qed-token-fingerprint-v1".toUTF8 token.toUTF8 >>= fun mac =>
+    Pure.pure (.ok (Proto.encodeHex mac))
+
+theorem noAtomic_hashBearerToken (token : String) : NoAtomic (hashBearerToken (m := ThreadProg σ) token) :=
+  noAtomic_bind (.io (.hmacSha256 _ _) _ .pure) fun _ => .pure _
+instance (token : String) : SafeIO (hashBearerToken (m := ThreadProg σ) token) := ⟨noAtomic_hashBearerToken token⟩
+
 theorem ProgSpec.safeIO_bind (p : ThreadProg σ α) [hp : SafeIO p] {k : α → ThreadProg σ β} (hk : ∀ a, ProgSpec Inv A Step Post (k a)) :
     ProgSpec Inv A Step Post (p >>= k) := (ProgSpec.of_noAtomic hp.noAtomic).bind fun a _ => hk a
+theorem ProgSpec.of_safeIO (p : ThreadProg σ α) [hp : SafeIO p] : ProgSpec Inv A Step (fun _ => True) p :=
+  ProgSpec.of_noAtomic hp.noAtomic
 theorem safeIO_preservesStepRel (p : ThreadProg σ α) [hp : SafeIO p] : ProgPreservesStepRel Inv Rel p := ProgSpec.of_noAtomic hp.noAtomic
 theorem safeIO_bind_preservesStepRel (p : ThreadProg σ α) [SafeIO p] {k : α → ThreadProg σ β} (hk : ∀ a, ProgPreservesStepRel Inv Rel (k a)) :
     ProgPreservesStepRel Inv Rel (p >>= k) := ProgSpec.safeIO_bind p hk

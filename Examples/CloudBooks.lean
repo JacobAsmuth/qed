@@ -52,19 +52,19 @@ server Catalog:
   invariant ordersMonotonic: totalOrders >= old(totalOrders)
   invariant authBooks: mutating books requires ctx.userId != none
 
-  def list() -> Book[]:
+  rpc list() -> Book[]:
     return books
 
-  def findAt(idx: Nat) -> Book?:
+  rpc findAt(idx: Nat) -> Book?:
     ensures result.slot == idx
     if idx < books.size and books[idx].slot == idx:
       return books[idx]
     return none
 
-  def cover(key: String) -> Bytes!:
+  rpc cover(key: String) -> Bytes!:
     return await GcpStorage.download(gcsBucket, f"covers/{key}")
 
-  def order(idx: Nat, qty: Nat) -> Book!:
+  rpc order(idx: Nat, qty: Nat) -> Book!:
     requires ctx.userId != none
     requires 1 <= qty <= 50
     ensures result.slot == idx, result.stock < 10000
@@ -85,7 +85,7 @@ server Catalog:
       totalOrders += 1
       return books[idx]
 
-  def addBook(id: String, title: String, stock: Nat, coverPng: Bytes) -> Book!:
+  rpc addBook(id: String, title: String, stock: Nat, coverPng: Bytes) -> Book!:
     requires ctx.userId != none
     requires 1 <= id.length <= 64, 1 <= title.length <= 200, stock <= 10000
     ensures result.id == id, result.stock == stock

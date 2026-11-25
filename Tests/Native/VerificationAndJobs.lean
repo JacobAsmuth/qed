@@ -177,7 +177,7 @@ server JobRunnerDemo:
   state resets : Nat = 0
   invariant bounded: ticks <= 50
   invariant mono: resets >= old(resets)
-  def getTicks() -> Nat: return ticks
+  rpc getTicks() -> Nat: return ticks
   every 15ms heartbeat: if ticks < 50: ticks += 1
   every 40ms markReset: atomic: resets += 1
 

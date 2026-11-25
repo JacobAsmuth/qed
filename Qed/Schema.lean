@@ -175,6 +175,15 @@ theorem submitBtn_validIn {msg α : Type} (inForm : Bool) (o : Option α) (submi
   have hb := step_inForm inForm (tag := "button") rfl rfl
   cases o <;> (simp only [submitBtn, Html.validListIn, Bool.and_true]; exact validIn_el hb (.inl rfl) (by solve_attrs))
 
+def ofField {α : Type} (c : Codec α) (p : α → Prop) [DecidablePred p] : Codec (Field p) where
+  parse s := (c.parse s).bind (Field.parse? p)
+  render := c.render
+  valid _ := True
+  dec _ := inferInstance
+  inForm := c.inForm
+  wrapLabel := c.wrapLabel
+  render_valid := c.render_valid
+
 end Codec
 
 class DefaultCodec (α : Type) where codec : Codec α
@@ -183,6 +192,8 @@ class DefaultCodec (α : Type) where codec : Codec α
 @[reducible] instance : DefaultCodec Int    := ⟨Codec.int⟩
 @[reducible] instance : DefaultCodec Bool   := ⟨Codec.checkbox⟩
 @[reducible] instance : DefaultCodec Date   := ⟨Codec.date⟩
+@[reducible] instance {α : Type} {p : α → Prop} [DefaultCodec α] [DecidablePred p] : DefaultCodec (Field p) :=
+  ⟨Codec.ofField DefaultCodec.codec p⟩
 @[reducible] instance (priority := low) {α : Type} [ToJson α] [FromJson α] : DefaultCodec α := ⟨Codec.json α⟩
 
 section SchemaParsers
@@ -208,10 +219,14 @@ def recordItemP : Parser := schemaExampleP <|> recordFieldP
     checkColGt "expected indented `record` fields" >> many1Indent recordItemP)
 def enumParamP   : Parser := node `Qed.enumParam (ident >> ":" >> pType)
 def enumVariantP : Parser := node `Qed.enumVariant (withPosition (
-  ident >> optional (checkNoWsBefore "" >> "(" >> sepBy1 enumParamP "," >> ")")))
+  ident >> optional (checkNoWsBefore "" >> "(" >> sepBy1 enumParamP "," >> ")") >> optional (checkLineEq >> "=" >> strLit)))
 @[command_parser] def enumCmd : Parser := leading_parser
   optional Command.docComment >> withPosition (
     atomic (identEq `enum) >> ident >> ":" >> checkColGt "expected indented `enum` variants" >> many1Indent enumVariantP)
+@[command_parser] def fieldCmd : Parser := leading_parser
+  optional Command.docComment >> withPosition (
+    atomic (identEq `field) >> ident >> optional (checkLineEq >> "(" >> sepBy1 schemaCtxParamP "," >> ")") >>
+    ":" >> pType >> checkColGt >> symbol "where" >> ident >> "=>" >> sepBy1 pExpr ",")
 end SchemaParsers
 
 section SchemaElab
@@ -396,7 +411,7 @@ private def tryCheckPropWithTactic (goalTerm : Term) (tacStx : TSyntax `tactic) 
 private def mkSchemaRefinementTacs : CommandElabM (TSyntax `tactic × TSyntax `tactic) := do
   let simpTac ← `(tactic| simp only [Qed.Codec.valid, Qed.Codec.refine, Qed.Codec.jsonOnly, Qed.Codec.text, Qed.Codec.textarea,
       Qed.Codec.nat, Qed.Codec.int, Qed.Codec.checkbox, Qed.Codec.date, Qed.Codec.select, Qed.Codec.radios, Qed.Codec.json, Qed.Lang.QedVal.val_id])
-  let pfTac ← `(tactic| ($simpTac:tactic <;> first | rfl | decide | omega | trivial | (simp_all; try rfl; try decide; try omega)))
+  let pfTac ← `(tactic| ((try $simpTac:tactic) <;> first | rfl | decide | omega | trivial | (simp_all; try rfl; try decide; try omega)))
   return (simpTac, pfTac)
 
 private def synthesizeFieldWitness? (pfTac : TSyntax `tactic) (rf : ResolvedField) (rawWheres : Array Syntax) : CommandElabM (Option Term) := do
@@ -446,6 +461,11 @@ private def elabSchemaExampleClause (sc : SchemaCtx) (pfTac : TSyntax `tactic) (
   elabCommand (← `(command| def $sampleId $[($cbns:ident : $cbts:term)]* : $tApp := { $[$fs:ident := $fieldTerms:term],* }))
   if emitSatisfiable then emitSatisfiableCmds sc exStx (← sc.appTo ⟨sampleId.raw⟩)
 
+private def checkFieldUnsat (ref : Syntax) (valTy predTerm : Term) (simpTac : TSyntax `tactic) (errMsg : MessageData) : CommandElabM Unit := do
+  if ← tryCheckPropWithTactic (← `(∀ _qed_x : $valTy, ¬ $predTerm _qed_x))
+      (← `(tactic| (intro _qed_x; (try $simpTac:tactic) <;> first | omega | decide | (cases _qed_x <;> decide)))) then
+    throwErrorAt ref errMsg
+
 private def checkSchemaSatAndExamples (sc : SchemaCtx) (resolved : Array ResolvedField)
     (whereRawExprs : Array (Array Syntax)) (exampleStxs : Array Syntax) : CommandElabM Unit := do
   let (simpTac, pfTac) ← mkSchemaRefinementTacs
@@ -454,9 +474,8 @@ private def checkSchemaSatAndExamples (sc : SchemaCtx) (resolved : Array Resolve
   else if sc.cbns.isEmpty then
     for (rf, i) in resolved.zipIdx do
       if rf.isRefined then
-        if ← tryCheckPropWithTactic (← `(∀ _qed_x : $(rf.valTy), ¬ $(rf.predTerm) _qed_x))
-            (← `(tactic| (intro _qed_x; $simpTac:tactic; first | omega | decide | (cases _qed_x <;> decide)))) then
-          throwErrorAt sc.fs[i]! m!"{sc.kindName} `{sc.t.getId}` is unsatisfiable: field `{sc.fs[i]!.getId}` has contradictory `where` constraints (`{sc.whereLabels[i]!}`) -- no value can ever satisfy it.\n\nHint: Fix or remove the conflicting `where` conditions on `{sc.fs[i]!.getId}`."
+        checkFieldUnsat sc.fs[i]! rf.valTy rf.predTerm simpTac
+          m!"{sc.kindName} `{sc.t.getId}` is unsatisfiable: field `{sc.fs[i]!.getId}` has contradictory `where` constraints (`{sc.whereLabels[i]!}`) -- no value can ever satisfy it.\n\nHint: Fix or remove the conflicting `where` conditions on `{sc.fs[i]!.getId}`."
     if let some synthTerms ← resolved.zipIdx.foldlM (init := some #[]) fun acc? (rf, i) => do
         let some arr := acc? | return none
         return (← synthesizeFieldWitness? pfTac rf whereRawExprs[i]!).map arr.push then
@@ -571,8 +590,9 @@ private def mkDataCodecCmds (sc : SchemaCtx) (resolved : Array ResolvedField) (d
     checkSchemaSatAndExamples sc resolved hdr.whereRawExprs hdr.exampleStxs
 
 private structure ParsedEnumVariant where
-  ident  : Ident
-  params : Array (Ident × Term)
+  ident    : Ident
+  params   : Array (Ident × Term)
+  wireName : String
 deriving Inhabited
 
 private def mkLeMaxProof (idx total : Nat) : MacroM Term := do
@@ -584,9 +604,9 @@ private def mkLeMaxProof (idx total : Nat) : MacroM Term := do
 private def mkUnitEnumCmds (t : Ident) (variants : Array ParsedEnumVariant) : CommandElabM (Array (TSyntax `command)) := do
   let tId := t.getId
   let toStrAlts ← variants.mapM fun v =>
-    `(Lean.Parser.Term.matchAltExpr| | $(mkIdent (tId ++ v.ident.getId)) => $(Syntax.mkStrLit v.ident.getId.toString))
+    `(Lean.Parser.Term.matchAltExpr| | $(mkIdent (tId ++ v.ident.getId)) => $(Syntax.mkStrLit v.wireName))
   let ofStrAlts ← variants.mapM fun v =>
-    `(Lean.Parser.Term.matchAltExpr| | $(Syntax.mkStrLit v.ident.getId.toString) => Except.ok $(mkIdent (tId ++ v.ident.getId)))
+    `(Lean.Parser.Term.matchAltExpr| | $(Syntax.mkStrLit v.wireName) => Except.ok $(mkIdent (tId ++ v.ident.getId)))
   let ofStrAlts := ofStrAlts.push (← `(Lean.Parser.Term.matchAltExpr| | other => Except.error ($(Syntax.mkStrLit s!"invalid {tId} '") ++ other ++ "'")))
   let toProtoAlts ← variants.zipIdx.mapM fun (v, i) =>
     `(Lean.Parser.Term.matchAltExpr| | $(mkIdent (tId ++ v.ident.getId)) => Qed.Proto.WireVal.varint $(Syntax.mkNumLit (toString i)))
@@ -595,13 +615,19 @@ private def mkUnitEnumCmds (t : Ident) (variants : Array ParsedEnumVariant) : Co
   let fromProtoAlts := fromProtoAlts ++ #[
     ← `(Lean.Parser.Term.matchAltExpr| | Qed.Proto.WireVal.varint n => Except.error ($(Syntax.mkStrLit s!"protobuf: invalid {tId} tag ") ++ toString n)),
     ← `(Lean.Parser.Term.matchAltExpr| | _ => Except.error $(Syntax.mkStrLit s!"protobuf: expected varint for {tId}"))]
-  let (toStrId, ofStrId) := (mkIdent (tId ++ `toString), mkIdent (tId ++ `ofString))
+  let (toStrId, ofStrId, rtId) := (mkIdent (tId ++ `toString), mkIdent (tId ++ `ofString), mkIdent (tId ++ `ofString_toString))
   let (toJsonId, fromJsonId) := (mkIdent (tId ++ `toJson), mkIdent (tId ++ `fromJson))
   pure #[
     ← `(command| def $toStrId : $t → String $[$toStrAlts:matchAlt]*),
     ← `(command| def $ofStrId : String → Except String $t $[$ofStrAlts:matchAlt]*),
     ← `(command| instance $(mkIdent (tId ++ `instToString)):ident : ToString $t := ⟨$toStrId⟩),
-    ← `(command| @[simp] theorem $(mkIdent (tId ++ `ofString_toString)) (x : $t) : $ofStrId ($toStrId x) = Except.ok x := by cases x <;> rfl),
+    ← `(command| instance $(mkIdent (tId ++ `instStringEnum)):ident : Qed.StringEnum $t := ⟨$toStrId, $ofStrId⟩),
+    ← `(command| @[simp] theorem $rtId (x : $t) : $ofStrId ($toStrId x) = Except.ok x := by cases x <;> rfl),
+    ← `(command| instance $(mkIdent (tId ++ `instRouteParam)):ident : Qed.RouteParam $t where
+          toSeg := $toStrId
+          fromSeg s := ($ofStrId s).toOption
+          round_trip x := by simp only [$rtId:ident, Except.toOption]),
+    ← `(command| instance $(mkIdent (tId ++ `instLawfulKey)):ident : Qed.LawfulKey $t := .ofRouteParam),
     ← `(command| def $toJsonId (x : $t) : Qed.Json := Qed.Json.str ($toStrId x)),
     ← `(command| def $fromJsonId : Qed.Json → Except String $t | Qed.Json.str s => $ofStrId s | _ => Except.error $(Syntax.mkStrLit s!"expected {tId} string")),
     ← `(command| def $(mkIdent (tId ++ `encode)) (x : $t) : String := Qed.Json.render ($toJsonId x)),
@@ -622,7 +648,7 @@ private def mkPayloadEnumJsonCmds (t : Ident) (variants : Array ParsedEnumVarian
   let (toId, fromId, jId, tagId) := (mkIdent (tId ++ `toJson), mkIdent (tId ++ `fromJson), mkIdent `j, mkIdent `_tag)
   let toAlts ← variants.mapM fun v => do
     let ctorId := mkIdent (tId ++ v.ident.getId); let pTerms : Array Term := v.params.map fun (p, _) => ⟨p.raw⟩
-    let pairs := #[← `(($tagKeyLit, Qed.ToJson.toJson $(Syntax.mkStrLit v.ident.getId.toString)))] ++
+    let pairs := #[← `(($tagKeyLit, Qed.ToJson.toJson $(Syntax.mkStrLit v.wireName)))] ++
       (← v.params.mapM fun (pId, _) => `(($(Syntax.mkStrLit pId.getId.toString), Qed.ToJson.toJson $pId:ident)))
     `(Lean.Parser.Term.matchAltExpr| | $ctorId $pTerms* => Qed.Json.obj [$[$pairs:term],*])
   let fromChain ← variants.foldrM (init := ← `(Except.error ($(Syntax.mkStrLit s!"unknown {tId} variant '") ++ $tagId ++ "'"))) fun v acc => do
@@ -632,7 +658,7 @@ private def mkPayloadEnumJsonCmds (t : Ident) (variants : Array ParsedEnumVarian
     let okBr ← if pIds.isEmpty then `(Except.ok $ctorApp) else `(do
       $[let $pIds:ident ← $decs:term]*
       return $ctorApp)
-    `(if $tagId == $(Syntax.mkStrLit v.ident.getId.toString) then $okBr else $acc)
+    `(if $tagId == $(Syntax.mkStrLit v.wireName) then $okBr else $acc)
   let mut cmds : Array (TSyntax `command) := #[
     ← `(command| def $toId : $t → Qed.Json $[$toAlts:matchAlt]*),
     ← `(command| def $fromId ($jId:ident : Qed.Json) : Except String $t := do let $tagId:ident ← Qed.FromJsonField.fromField (α := String) $jId $tagKeyLit; $fromChain:term),
@@ -657,7 +683,7 @@ private def mkPayloadEnumJsonCmds (t : Ident) (variants : Array ParsedEnumVarian
     depthAlts := depthAlts.push (← `(Lean.Parser.Term.matchAltExpr| | $ctorId $pTerms* => $fullPf))
   let mut rtCases : Array (TSyntax ``Lean.Parser.Tactic.inductionAlt) := #[]
   for (v, vi) in variants.zipIdx do
-    let vName := v.ident.getId; let vLit := Syntax.mkStrLit vName.toString; let pIds := v.params.map (·.1)
+    let vName := v.ident.getId; let vLit := Syntax.mkStrLit v.wireName; let pIds := v.params.map (·.1)
     let ctorVal ← Qed.Lang.mkAppTerms (mkIdent (tId ++ vName)) (pIds.map (⟨·.raw⟩))
     let mut hIdents : Array Ident := #[]; let mut hTacs : Array (TSyntax `tactic) := #[]
     let hTagId := mkIdent `_htag; hIdents := hIdents.push hTagId
@@ -666,7 +692,7 @@ private def mkPayloadEnumJsonCmds (t : Ident) (variants : Array ParsedEnumVarian
       let hfId := mkIdent (Name.mkSimple s!"_hf{pi}"); hIdents := hIdents.push hfId
       hTacs := hTacs.push (← `(tactic| have $hfId:ident := Qed.LawfulJson.fromField_of_field ($toId $ctorVal) $(Syntax.mkStrLit pId.getId.toString) $pId:ident rfl))
     for prevIdx in [0:vi] do
-      let prevLit := Syntax.mkStrLit variants[prevIdx]!.ident.getId.toString
+      let prevLit := Syntax.mkStrLit variants[prevIdx]!.wireName
       let hneId := mkIdent (Name.mkSimple s!"_hne{prevIdx}"); hIdents := hIdents.push hneId
       hTacs := hTacs.push (← `(tactic| have $hneId:ident : ($vLit == $prevLit) = false := rfl))
     rtCases := rtCases.push (← `(Lean.Parser.Tactic.inductionAlt| | $(mkIdent vName):ident $[$pIds:ident]* =>
@@ -725,7 +751,7 @@ private def mkPayloadEnumProtoCmds (t : Ident) (variants : Array ParsedEnumVaria
   let t : Ident := ⟨stx.getArg 2⟩; let tId := t.getId
   let rawVariants := (stx.getArg 4).getArgs
   if rawVariants.isEmpty then throwErrorAt t s!"`enum {tId}` must declare at least one variant"
-  let mut variants : Array ParsedEnumVariant := #[]; let mut seenV : Std.HashSet Name := {}
+  let mut variants : Array ParsedEnumVariant := #[]; let mut seenV : Std.HashSet Name := {}; let mut seenWire : Std.HashSet String := {}
   for vStx in rawVariants do
     let vId : Ident := ⟨vStx.getArg 0⟩; let vNm := vId.getId.eraseMacroScopes
     if seenV.contains vNm then throwErrorAt vId s!"duplicate variant `{vNm}` in `enum {tId}`"
@@ -738,7 +764,12 @@ private def mkPayloadEnumProtoCmds (t : Ident) (variants : Array ParsedEnumVaria
         if seenP.contains pNm then throwErrorAt pId s!"duplicate field `{pNm}` in variant `{vNm}` of `enum {tId}`"
         seenP := seenP.insert pNm
         params := params.push (pId, ← liftMacroM (return (← Qed.Lang.lowerQedType (pStx.getArg 2) false).1))
-    variants := variants.push { ident := vId, params }
+    let optWire := vStx.getArg 2
+    let wireName := if optWire.getNumArgs == 2 then (⟨optWire.getArg 1⟩ : TSyntax `str).getString else vNm.toString
+    if seenWire.contains wireName then
+      throwErrorAt (if optWire.getNumArgs == 2 then optWire.getArg 1 else vId.raw) s!"duplicate wire name `{wireName}` in `enum {tId}`"
+    seenWire := seenWire.insert wireName
+    variants := variants.push { ident := vId, params, wireName }
   let isUnit := variants.all (·.params.isEmpty)
   let ctors ← variants.mapM fun v => do
     let pIds := v.params.map (·.1); let pTys := v.params.map (·.2)
@@ -773,6 +804,57 @@ private def mkPayloadEnumProtoCmds (t : Ident) (variants : Array ParsedEnumVaria
     if allJson then cmds := cmds ++ (← mkPayloadEnumJsonCmds t variants allLawfulJ)
     if allProto then cmds := cmds ++ (← mkPayloadEnumProtoCmds t variants allLawfulP)
   cmds.forM elabCommand
+  if isUnit then
+    let fullEnum := (← getCurrNamespace) ++ tId
+    modifyEnv fun env => unitEnumRegistry.addEntry env { fullName := fullEnum, variants := variants.map (·.wireName) }
+
+@[noinline, command_elab fieldCmd] def elabFieldCmd : CommandElab := fun stx => do
+  let doc? : Option (TSyntax ``Lean.Parser.Command.docComment) := if (stx.getArg 0).getNumArgs == 1 then some ⟨(stx.getArg 0).getArg 0⟩ else none
+  let t : Ident := ⟨stx.getArg 2⟩; let tId := t.getId
+  let rawCtx := if (stx.getArg 3).getNumArgs == 3 then ((stx.getArg 3).getArg 1).getSepArgs else #[]
+  let cbns : Array Ident := rawCtx.map (⟨·.getArg 0⟩)
+  let cbts ← rawCtx.mapM fun cp => liftMacroM (return (← Qed.Lang.lowerQedType (cp.getArg 2) false).1)
+  let rawTy ← liftMacroM (return (← Qed.Lang.lowerQedType (stx.getArg 5) false).1)
+  let vId : Ident := ⟨stx.getArg 7⟩
+  let rawWheres := (stx.getArg 9).getSepArgs
+  let whereLabel := String.intercalate ", " (rawWheres.toList.map fun w => let s := Qed.Lang.stxSnippet w; if s.isEmpty then "constraint" else s)
+  let wherePreds ← rawWheres.mapM fun w => liftMacroM (Qed.Lang.lowerSimpleQedExpr .propInv w)
+  let predBody ← mkConjBody wherePreds
+  let predTerm : Term ← `(fun $vId:ident : $rawTy => $predBody)
+  let (tyName, hasInhab) ← liftTermElabM <| withCtxDecls cbns cbts do
+    let α ← elabType rawTy
+    let savedLog ← Core.getMessageLog; let preCount := savedLog.toList.length
+    let predE ← elabTermEnsuringType predTerm (some (← mkArrow α (mkSort Level.zero)))
+    let decInst? ← trySynthInstance (← mkAppM ``DecidablePred #[predE])
+    unless decInst? matches .some _ do
+      checkDecPredErrors "field" t predTerm savedLog preCount
+      throwErrorAt predTerm m!"field `{tId}` has a refinement that isn't decidable (no `DecidablePred` for it).\n\nWrite it inline with `where ...` or as an `abbrev`, or provide a `DecidablePred` instance."
+    return (((← whnf α).constName?.getD .anonymous), ← probeInst ``Inhabited α)
+  let validId := mkIdentFrom t (tId ++ `Valid)
+  let tApp ← Qed.Lang.mkAppTerms ⟨t.raw⟩ (cbns.map (⟨·.raw⟩))
+  let validApp ← Qed.Lang.mkAppTerms ⟨validId.raw⟩ (cbns.map (⟨·.raw⟩))
+  elabCommand (← `(command| abbrev $validId $[($cbns:ident : $cbts:term)]* ($vId:ident : $rawTy) : Prop := $predBody))
+  let validCId := mkCIdent ((← getCurrNamespace) ++ tId ++ `Valid)
+  let parseErrLit := Syntax.mkStrLit s!"invalid {tId}: failed constraint `{whereLabel}`"
+  let cmds : Array (TSyntax `command) := #[
+    ← `(command| $[$doc?:docComment]? abbrev $t $[($cbns:ident : $cbts:term)]* : Type := Qed.Field ($validApp)),
+    ← `(command| @[inline] abbrev $(mkIdentFrom t (tId ++ `make)) $[($cbns:ident : $cbts:term)]* ($vId:ident : $rawTy)
+          (ok : $validApp $vId := by (try dsimp only [$validCId:ident]) <;> first | rfl | decide | omega | (simp_all; try rfl; try decide; try omega)) : $tApp :=
+          Qed.Field.mk $vId ok),
+    ← `(command| @[inline] def $(mkIdentFrom t (tId ++ `parse?)) $[($cbns:ident : $cbts:term)]* ($vId:ident : $rawTy) : Option ($tApp) :=
+          Qed.Field.parse? ($validApp) $vId),
+    ← `(command| @[inline] def $(mkIdentFrom t (tId ++ `parse)) $[($cbns:ident : $cbts:term)]* ($vId:ident : $rawTy) : Except String ($tApp) :=
+          Qed.Field.parse ($validApp) $parseErrLit $vId)
+  ]
+  cmds.forM elabCommand
+  if cbns.isEmpty then
+    let (simpTac, pfTac) ← mkSchemaRefinementTacs
+    checkFieldUnsat t rawTy predTerm simpTac
+      m!"Field `{tId}` is unsatisfiable: contradictory `where` constraints (`{whereLabel}`) -- no value can ever satisfy it.\n\nHint: Fix or remove the conflicting `where` conditions on `{tId}`."
+    let rf : ResolvedField := .mk rawTy rawTy predTerm true false false false false false false tyName hasInhab false
+    if let some witness ← synthesizeFieldWitness? pfTac rf rawWheres then
+      elabCommand (← `(command| theorem $(mkIdentFrom t (tId ++ `satisfiable)) : ∃ _x : $t, True := ⟨$witness, trivial⟩))
+      elabCommand (← `(command| instance $(mkIdentFrom t (tId ++ `instNonempty)):ident : Nonempty $t := ⟨$witness⟩))
 
 end SchemaElab
 
@@ -962,11 +1044,10 @@ private partial def lowerMapStmts (isDecode : Bool) (locals : Array String) (stm
       let mut scrTs : Array Term := #[]; let mut allHs : Array (Ident × Term) := #[]
       for ss in scrStxs do let (t, hs) ← lowerMapExprWithHoists isDecode locals .val ss; scrTs := scrTs.push t; allHs := allHs ++ hs
       let alts ← (st.getArg 3).getArgs.mapM fun c => do
-        let ps := (c.getArg 1).getSepArgs
-        let patTs ← ps.mapM fun p => liftMacroM (lowerQedPat p)
-        let pNs := ps.foldl (fun acc p => acc ++ (collectQedPatIds p).map (·.toString)) #[]
+        let altTerms ← liftMacroM (lowerCasePatAlts (c.getArg 1))
+        let pNs := (collectCasePatIds (extractCasePatAlts (c.getArg 1))).map (·.toString)
         let bodyT ← lowerMapStmts isDecode (locals ++ pNs) (suiteStmts (c.getArg 3))
-        `(Lean.Parser.Term.matchAltExpr| | $[$patTs:term],* => $bodyT)
+        mkMatchAltFromAlts altTerms bodyT
       liftM <| wrapMapHoists allHs (← `(match $[$scrTs:term],* with $[$alts:matchAlt]*))
     else if k == ``qedStmtExpr && isLast then
       let (valT, hs) ← lowerMapExprWithHoists isDecode locals .val (st.getArg 0)

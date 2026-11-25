@@ -95,12 +95,13 @@ def parseCommandTagAffected (payload : ByteArray) : Nat :=
 
 inductive PgSslMode where | disable | prefer | require deriving Inhabited, DecidableEq, Repr
 structure PgConnParams where
-  user     : String := "postgres"
-  password : String := ""
-  host     : String := "127.0.0.1"
-  port     : UInt16 := 5432
-  database : String := "postgres"
-  sslMode  : PgSslMode := .prefer
+  user      : String := "postgres"
+  password  : String := ""
+  host      : String := "127.0.0.1"
+  port      : UInt16 := 5432
+  database  : String := "postgres"
+  sslMode   : PgSslMode := .prefer
+  ssrfGuard : Bool := false
 deriving Inhabited, Repr
 
 def parsePgUrl (rawUrl : String) : Except String PgConnParams := do
@@ -194,7 +195,7 @@ private def collectQueryResultLoop (handle : UInt64) (buf : ByteArray) (off : Na
       | 0x43 => next (aff := parseCommandTagAffected f.payload) | _ => next
 
 def PgConnParams.poolKey (cfg : PgConnParams) : String :=
-  s!"{cfg.user}:{cfg.password}@{cfg.host.toLower}:{cfg.port}/{cfg.database}?ssl={match cfg.sslMode with | .disable => "disable" | .prefer => "prefer" | .require => "require"}"
+  s!"{cfg.user}:{cfg.password}@{cfg.host.toLower}:{cfg.port}/{cfg.database}?ssl={match cfg.sslMode with | .disable => "disable" | .prefer => "prefer" | .require => "require"}&ssrf={if cfg.ssrfGuard then "1" else "0"}"
 
 structure PgConn where
   poolKey  : String
@@ -214,7 +215,7 @@ private def partitionPoolEntries (arr : Array (UInt64 × Nat)) (nowMs : Nat) : A
   arr.foldl (init := (#[], [])) fun (l, ex) e => if nowMs - e.2 ≤ pgPoolIdleTimeoutMs then (l.push e, ex) else (l, e.1 :: ex)
 
 private def connectPg (cfg : PgConnParams) : PgM PgConn := do
-  let (handleNat, _) ← mapErr "postgres connect failed" <| liftE (Prim.outboundAcquire 0 cfg.host cfg.port 0 (fun _ => false))
+  let (handleNat, _) ← mapErr "postgres connect failed" <| liftE (Prim.outboundAcquire 0 cfg.host cfg.port (if cfg.ssrfGuard then 1 else 0) (if cfg.ssrfGuard then Net.isBlockedIpBytes else fun _ => false))
   let handle := UInt64.ofNat handleNat
   let writeOr (lbl : String) (bs : ByteArray) := mapErr s!"postgres {lbl} write failed" <| liftE (Prim.outboundWriteAll handle bs)
   try
@@ -277,13 +278,14 @@ private def execParameterizedAttempt (cfg : PgConnParams) (sql : String) (params
       match res with
       | .ok (dbRes, cFinal) => releaseConn cFinal; return dbRes
       | .error e => releaseConn conn'; if !conn'.healthy && wasReused && attemptsLeft > 0 then execParameterizedAttempt cfg sql params attemptsLeft else throw e
-def execParameterized (pgUrl : String) (sql : String) (params : Array SqlVal) : IO (Except String DbResult) :=
-  ExceptT.run do execParameterizedAttempt (← liftP (parsePgUrl pgUrl)) sql params 2
+def execParameterized (pgUrl : String) (sql : String) (params : Array SqlVal) (ssrfGuard : Bool := false) : IO (Except String DbResult) :=
+  ExceptT.run do let cfg ← liftP (parsePgUrl pgUrl); execParameterizedAttempt { cfg with ssrfGuard } sql params 2
 def clearPool : IO Unit := do
   (← pgPoolBox.modifyGet fun m => (m.toList.foldl (init := []) (fun acc (_, arr) => arr.foldl (init := acc) fun a e => e.1 :: a), {})).forM (closePgHandle · true)
-def execDdl (pgUrl : String) (ddl : String) : IO (Except String Unit) :=
+def execDdl (pgUrl : String) (ddl : String) (ssrfGuard : Bool := false) : IO (Except String Unit) :=
   ExceptT.run do
     if ddl.trimAscii.toString.isEmpty then return ()
-    let (conn, _) ← liftE (acquireConn (← liftP (parsePgUrl pgUrl)))
+    let cfg ← liftP (parsePgUrl pgUrl)
+    let (conn, _) ← liftE (acquireConn { cfg with ssrfGuard })
     let (res, conn') ← execSimpleOnConn conn ddl; releaseConn conn'; discard <| liftP res
 end Qed.Server.Db.PgWire

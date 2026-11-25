@@ -118,13 +118,13 @@ server ScheduledWorker:
   state total : Nat = 0
   invariant bounded: count <= 100
   invariant mono: total >= old(total)
-  def status() -> Nat: return count
+  rpc status() -> Nat: return count
   every 500ms tick: if count < 100: count += 1; total += 1
   every 60s cleanup: atomic: count = 0
   every 5m syncRemote: let _ = await HealthPing.ping()?; atomic: total += 1
   every 1h hourlyNote: atomic: if count < 100: count += 1
 server StatelessCron:
-  def ping() -> String: return "pong"
+  rpc ping() -> String: return "pong"
   every 10s heartbeat: let _ = await HealthPing.ping()?; return
 example : ScheduledWorker.jobs.size = 4 ∧ ScheduledWorker.verifiedJobs.size = 4 ∧
     ScheduledWorker.jobNames = ["tick", "cleanup", "syncRemote", "hourlyNote"] ∧ StatelessCron.jobs.size = 1 := ⟨rfl, rfl, rfl, rfl⟩
@@ -160,11 +160,11 @@ server ScoreboardApi:
   state scores : {String: Nat}
   state nested : {String: Nat[]}
   invariant capped: scores.size <= 100
-  def record(name: String, pts: Nat) -> {String: Nat}:
+  rpc record(name: String, pts: Nat) -> {String: Nat}:
     if scores.size < 100 or name in scores: scores[name] = pts
     return scores
-  def lookup(name: String) -> Nat?: return scores[name]
-  def clear(name: String) -> Unit: scores.remove(name)
+  rpc lookup(name: String) -> Nat?: return scores[name]
+  rpc clear(name: String) -> Unit: scores.remove(name)
   get "/scores": return json(scores)
   get "/by-id":
     let byId : {Nat: String} = {1: "one", 2: "two"}
@@ -173,6 +173,6 @@ expect_err "Server invariant `capped` failed in `recordUnsafe`:\n  • must sati
 server BadDictCap:
   state scores : {String: Nat}
   invariant capped: scores.size <= 100
-  def recordUnsafe(name: String, pts: Nat) -> Unit: scores[name] = pts
+  rpc recordUnsafe(name: String, pts: Nat) -> Unit: scores[name] = pts
 
 end VerificationChecks

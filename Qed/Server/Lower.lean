@@ -58,10 +58,20 @@ structure SrvChanSig where
   paramCount : Nat
   hasEnsures : Bool
 
+structure SrvHelperSig where
+  name         : String
+  defId        : Lean.Ident
+  paramCount   : Nat
+  isMonadic    : Bool
+  takesAtomic  : Bool
+  mutatesState : Bool
+  dbWrite      : Bool
+
 structure LowerCtx where
   fnName           : String
   stateFields      : Array String := #[]
   envVars          : Array String := #[]
+  envIdents        : Array Lean.Ident := #[]
   locals           : Array String := #[]
   stateRule        : StateAccessRule := .statelessServer
   allowAwait       : Bool := false
@@ -71,6 +81,7 @@ structure LowerCtx where
   forbidCtxEnv     : Bool := false
   domainErrTy?     : Option Lean.Term := none
   channels         : Array SrvChanSig := #[]
+  helpers          : Array SrvHelperSig := #[]
   emitAcc?         : Option Lean.Ident := none
   wrapReturnSumInl : Bool := false
   dbs              : Array (String × DatabaseInfo) := #[]
@@ -232,7 +243,7 @@ private def lowerSrvCallHook (stx calleeStx : Syntax) (rawArgs : Array Syntax) (
       if let some aliasName := chain.head? then
         if let some (_, dbInfo) := ctx.dbs.find? (·.1 == aliasName) then
           let txIdTerm? := ctx.activeDbTx?.bind fun (a, tid) => if a == aliasName then some ⟨tid.raw⟩ else none
-          let (dbTerm, isWrite) ← Db.lowerDbCall (go .val) (fun loc e => withReader (fun c => { c with locals := c.locals.push loc }) (go .val e)) ctx.fnName dbInfo stx chain rawArgs txIdTerm?
+          let (dbTerm, isWrite) ← Db.lowerDbCall (go .val) (fun loc e => withReader (fun c => { c with locals := c.locals.push loc }) (go .val e)) ctx.fnName dbInfo stx chain rawArgs txIdTerm? (fun t => `(srvAutoField($t)))
           if isWrite then modify fun s => { s with dbWrite := true }
           return some dbTerm
   if calleeStx.getKind == ``qedIdent then
@@ -255,6 +266,20 @@ private def lowerSrvCallHook (stx calleeStx : Syntax) (rawArgs : Array Syntax) (
       if rawArgs.size == 1 then return some (← `(Qed.Server.mkFail1 $(← go .val rawArgs[0]![0])))
       if rawArgs.size == 2 then return some (← `(Qed.Server.mkFail2 $(← go .val rawArgs[0]![0]) $(← go .val rawArgs[1]![0])))
       throwErrorAt stx "`fail(...)` expects `(.tag)`, `(.tag, msg)`, `(message)`, or `(code, message)`"
+    let cstr := cname.toString
+    if !(ctx.locals.contains cstr || ctx.stateFields.contains cstr || ctx.envVars.contains cstr) then
+      if let some hSig := ctx.helpers.find? (·.name == cstr) then
+        if ctx.forbidCtxEnv then
+          throwErrorAt stx s!"server helper `{cstr}` cannot be called inside `ensures` or client-checked `requires`"
+        if rawArgs.any (·.getKind == ``qedCallArgNamed) then
+          throwErrorAt stx s!"named arguments are not supported when calling server helper `{cstr}`"
+        if rawArgs.size != hSig.paramCount then
+          throwErrorAt stx s!"server helper `{cstr}` expects {hSig.paramCount} argument(s), got {rawArgs.size}"
+        let argTerms ← rawArgs.mapM fun ra => go .val (ra.getArg 0)
+        if hSig.dbWrite then modify fun s => { s with dbWrite := true }
+        if hSig.mutatesState then recordMutated "__helper__"
+        let implicitArgs : Array Term := ctx.envIdents.map (⟨·.raw⟩) ++ #[⟨mkIdent `ctx⟩]
+        return some (← mkAppTerms (hSig.defId : Term) (implicitArgs ++ argTerms))
     if ctx.isHttpRoute then
       let fnName := cname.toString
       if !(ctx.locals.contains fnName || ctx.stateFields.contains fnName || ctx.envVars.contains fnName) then
@@ -479,9 +504,10 @@ private def lowerMatchScrutineesAndAlts (ctx : LowerCtx) (stmt : Syntax) (rest :
   let (scrutTerms, allSteps) ← withCollectedHoists <| (stmt.getArg 1).getSepArgs.mapM (lowerExpr ctx .val)
   let cases := (stmt.getArg 3).getArgs; let allRet := cases.all fun c => blockAlwaysReturns (suiteStmts (c.getArg 3))
   let alts ← cases.mapM fun c => do
-    let pats ← (c.getArg 1).getSepArgs.mapM fun p => liftMacroM (lowerQedPat p)
-    let pIds := ((c.getArg 1).getSepArgs.flatMap collectQedPatIds).map (·.toString)
-    `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $(← lowerArm { ctx with locals := ctx.locals ++ pIds } (suiteStmts (c.getArg 3) ++ if allRet then #[] else rest)))
+    let altTerms ← liftMacroM (lowerCasePatAlts (c.getArg 1))
+    let pIds := (collectCasePatIds (extractCasePatAlts (c.getArg 1))).map (·.toString)
+    let rhs ← lowerArm { ctx with locals := ctx.locals ++ pIds } (suiteStmts (c.getArg 3) ++ if allRet then #[] else rest)
+    mkMatchAltFromAlts altTerms rhs
   return (← `(match $[$scrutTerms:term],* with $[$alts:matchAlt]*), allSteps)
 
 private def extractSrvLetCatch? (clausesNode : Syntax) : LowerM (Option Syntax) := do

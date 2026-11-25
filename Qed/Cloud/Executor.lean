@@ -12,6 +12,7 @@ open Qed Qed.Server Qed.Server.Net Qed.Server.Native
 inductive GcpAuthMode where
   | serviceAccountJson (saJson : String)
   | bearerToken        (token : String)
+  | metadata
   | none
 deriving Inhabited, Repr
 
@@ -52,6 +53,7 @@ def resolveToken (cfg : GcpExecConfig) (audience? : Option String := none) : IO 
   | none,     .bearerToken tok       => return .ok (if tok.isEmpty then none else some tok)
   | some aud, .serviceAccountJson js => (·.map some) <$> fetchGcpBearerToken none js aud (isIdToken := true) (ssrfGuard := cfg.ssrfGuard)
   | none,     .serviceAccountJson js => (·.map some) <$> fetchGcpBearerToken none js gcpCloudPlatformScope (isIdToken := false) (ssrfGuard := cfg.ssrfGuard)
+  | aud?,     .metadata              => (·.map some) <$> fetchGcpMetadataToken none aud?
 
 private def sendGcpRaw (cfg : GcpExecConfig) (req : GcpHttpRequest) (bodyBytes : ByteArray) (tok? : Option String) : IO (Except String (Nat × String)) := do
   let authHdr := tok?.elim #[] fun t => #[("Authorization", s!"Bearer {t}")]

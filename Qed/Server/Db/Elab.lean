@@ -37,7 +37,9 @@ private def dbIndented (msg : String) (cat : Name) : Parser := ":" >> checkColGt
 @[dbColMod_parser] def dbModPk        : Parser := leading_parser atomic (identEq `primary_key)
 @[dbColMod_parser] def dbModImmutable : Parser := leading_parser atomic (identEq `immutable)
 @[dbColMod_parser] def dbModUnique    : Parser := leading_parser atomic (identEq `unique)
-@[dbColMod_parser] def dbModRefs      : Parser := leading_parser atomic (identEq `references) >> ident >> "(" >> ident >> ")"
+@[dbColMod_parser] def dbModRefs      : Parser := leading_parser
+  atomic (identEq `references) >> ident >> "(" >> ident >> ")" >>
+    optional (checkLineEq >> identEq `on_delete >> (identEq `cascade <|> identEq `set_null <|> identEq `restrict))
 
 def dbPolicyOp : Parser := node `Qed.Server.Db.policyOp (identEq `read <|> identEq `write <|> identEq `insert <|> identEq `update <|> identEq `delete)
 def dbTransEdge : Parser := node `Qed.Server.Db.transEdge (sepBy1 (categoryParser `qedExpr 55) "->")
@@ -60,6 +62,10 @@ def dbEncColTy : Parser := node `Qed.Server.Db.encColTy
 @[dbClause_parser] def dbManagedClause : Parser := leading_parser withPosition (atomic (identEq `managed >> identEq `postgres) >> optional (dbIndented "expected indented `managed postgres:` clauses" `dbManagedSubClause))
 @[dbClause_parser] def dbEnvEpClause : Parser := leading_parser withPosition (atomic (identEq `prod <|> identEq `staging <|> identEq `preview <|> identEq `dev) >> categoryParser `dbEndpointSpec 0)
 @[dbClause_parser] def dbPrimaryEpClause : Parser := leading_parser withPosition (categoryParser `dbEndpointSpec 0)
+def dbBackfillSetItem : Parser := node `Qed.Server.Db.backfillSetItem (ident >> "=" >> dbExpr)
+@[dbClause_parser] def dbBackfillClause : Parser := leading_parser
+  withPosition (atomic (identEq `backfill) >> ident >> identEq `set >> "{" >> sepBy1 dbBackfillSetItem "," >> "}" >>
+    optional (checkLineEq >> symbol "where" >> dbExpr))
 @[dbClause_parser] def dbTableClauseTop : Parser := leading_parser withPosition (atomic (identEq `table) >> ident >> dbIndented "expected indented `table` columns/policies" `dbTableClause)
 @[command_parser] def databaseCmd : Parser := leading_parser withPosition ("database " >> ident >> dbIndented "expected indented `database` clauses" `dbClause)
 
@@ -70,19 +76,21 @@ end DbParsers
 open Qed.Lang
 
 private structure ParsedCol where
-  ident        : Lean.Ident
-  colName      : String
-  tyTerm       : Lean.Term
-  sqlColType   : SqlColType
-  isNullable   : Bool
-  isNat        : Bool
-  isBytes      : Bool
-  isPrimaryKey : Bool
-  isImmutable  : Bool
-  isUnique     : Bool
-  refs?        : Option (Lean.Ident × Lean.Ident)
-  encKey?      : Option (String × Option String × Bool) := none
-  whereExprs   : Array Lean.Syntax
+  ident         : Lean.Ident
+  colName       : String
+  tyTerm        : Lean.Term
+  sqlColType    : SqlColType
+  isNullable    : Bool
+  isNat         : Bool
+  isBytes       : Bool
+  isPrimaryKey  : Bool
+  isImmutable   : Bool
+  isUnique      : Bool
+  refs?         : Option (Lean.Ident × Lean.Ident)
+  onDelete      : OnDeleteAction := .noAction
+  enumVariants? : Option (Array String) := none
+  encKey?       : Option (String × Option String × Bool) := none
+  whereExprs    : Array Lean.Syntax
 
 private structure ParsedTable where
   ident       : Lean.Ident
@@ -128,11 +136,23 @@ private def parseEndpointSpec (stx : Syntax) (pinEnv? : Option Qed.Cloud.DeployE
     else throwErrorAt stx "unexpected database endpoint specification"
   return (epT, ← secsRef.get, spec)
 
-private def inferSqlColType (pty : LoweredQedType) : SqlColType × Bool × Bool × Bool :=
-  match pty.baseName with
-  | `Nat => (.int, pty.isOption, true, false) | `Int => (.int, pty.isOption, false, false)
-  | `Bool => (.bool, pty.isOption, false, false) | `Bytes | `ByteArray => (.bytes, pty.isOption, false, true)
-  | _ => (.text, pty.isOption, false, false)
+private partial def unwrapFieldTypeName (e : Expr) : MetaM Name := do
+  let e' ← Meta.whnf e
+  if e'.isAppOfArity ``Qed.Field 2 then unwrapFieldTypeName e'.getAppArgs[0]!
+  else pure (e'.constName?.getD .anonymous)
+
+private def inferSqlColType (pty : LoweredQedType) : CommandElabM (SqlColType × Bool × Bool × Bool) := do
+  let mut base := pty.baseName
+  if base != `Nat && base != `Int && base != `Bool && base != `Bytes && base != `ByteArray && base != `String && base != `Date then
+    let innerTerm := pty.innerOpt?.getD pty.term
+    if let some resolved ← liftTermElabM (try pure (some (← unwrapFieldTypeName (← Term.elabType innerTerm))) catch _ => pure none) then
+      base := resolved
+  match base with
+  | `Nat => pure (.int, pty.isOption, true, false)
+  | `Int => pure (.int, pty.isOption, false, false)
+  | `Bool => pure (.bool, pty.isOption, false, false)
+  | `Bytes | `ByteArray => pure (.bytes, pty.isOption, false, true)
+  | _ => pure (.text, pty.isOption, false, false)
 
 private partial def lowerDbExpr (colNames : Array String) (rowVar : Ident)
     (oldVar? ctxVar? : Option Ident) (asProp : Bool) (stx : Syntax) : CommandElabM Term := do
@@ -169,12 +189,14 @@ private partial def lowerDbExpr (colNames : Array String) (rowVar : Ident)
   }
   lowerQedExpr hooks (if asProp then .propInv else .val) stx
 
+private def quoteSqlLit (s : String) : String := "'" ++ s.replace "'" "''" ++ "'"
+
 private partial def renderSqlPred? (colNames : Array String) (forRls : Bool) (stx : Syntax) : Option String :=
   let recR := renderSqlPred? colNames forRls; let k := stx.getKind
   if !forRls && k == ``qedLitNum then some (toString (⟨stx.getArg 0⟩ : TSyntax `num).getNat)
-  else if !forRls && k == ``qedLitStr then
-    let s := (⟨stx.getArg 0⟩ : TSyntax `str).getString
-    if s.any (· == '\x00') then none else some ("'" ++ s.replace "'" "''" ++ "'")
+  else if !forRls && (k == ``qedLitStr || k == ``qedDotIdent) then
+    let s := if k == ``qedLitStr then (⟨stx.getArg 0⟩ : TSyntax `str).getString else (stx.getArg 1).getId.eraseMacroScopes.toString
+    if s.any (· == '\x00') then none else some (quoteSqlLit s)
   else if forRls && k == ``qedCall then
     let c := stx.getArg 0; let args := (stx.getArg 2).getSepArgs
     if c.getKind == ``qedIdent && (c.getArg 0).getId.eraseMacroScopes == `some && args.size == 1 && args[0]!.getKind == ``qedCallArgPos then recR (args[0]!.getArg 0) else none
@@ -247,7 +269,7 @@ private def parseTableClause (dbName : Name) (existing : Array ParsedTable) (c :
       if !isSafeSqlIdent colName then throwErrorAt colId s!"invalid SQL column name `{colName}`"
       if cols.any (·.colName == colName) then throwErrorAt colId s!"duplicate column `{colName}` in `table {tName}`"
       let tyStx := sc.getArg 2
-      let (tyTerm, sqlColType, isNullable, isNat, isBytes, encKey?) ←
+      let (tyTerm, sqlColType, isNullable, isNat, isBytes, encKey?, enumVariants?) ←
         if tyStx.getKind == `Qed.Server.Db.encColTy then
           let inner ← liftMacroM <| lowerSrvType (tyStx.getArg 2) false s!"encrypted column `{colName}`"
           let isB := inner.baseName == `Bytes || inner.baseName == `ByteArray
@@ -258,12 +280,14 @@ private def parseTableClause (dbName : Name) (existing : Array ParsedTable) (c :
           let tyT ← if outerOpt && !inner.isOption then `(Option $(inner.term)) else pure inner.term
           let er ← parseQedEnvRef "database" (tyStx.getArg 6)
           if er.isSecret && er.default?.isNone then encSecrets := pushUnique encSecrets er.envKey
-          pure (tyT, SqlColType.text, isNull, false, isB, some (er.envKey, er.default?, isB))
+          pure (tyT, SqlColType.text, isNull, false, isB, some (er.envKey, er.default?, isB), none)
         else
           let pty ← liftMacroM <| lowerSrvType tyStx false s!"column `{colName}`"
-          let (sqlTy, isNull, isN, isB) := inferSqlColType pty
-          pure (pty.term, sqlTy, isNull, isN, isB, none)
-      let mut isPk := false; let mut isImm := false; let mut isUniq := false; let mut refs? : Option (Ident × Ident) := none
+          let (sqlTy, isNull, isN, isB) ← inferSqlColType pty
+          let enumVs? := (Qed.lookupUnitEnum? (← getEnv) (← getCurrNamespace) (← getOpenDecls) pty.baseName).map (·.variants)
+          pure (pty.term, sqlTy, isNull, isN, isB, none, enumVs?)
+      let mut isPk := false; let mut isImm := false; let mut isUniq := false
+      let mut refs? : Option (Ident × Ident) := none; let mut onDelete : OnDeleteAction := .noAction
       for m in (sc.getArg 3).getArgs do
         let mk := m.getKind
         if mk == ``dbModPk then
@@ -276,10 +300,19 @@ private def parseTableClause (dbName : Name) (existing : Array ParsedTable) (c :
         else if mk == ``dbModRefs then
           if encKey?.isSome then throwErrorAt m s!"encrypted column `{tName}.{colName}` cannot use `references`"
           refs? := some (⟨m.getArg 1⟩, ⟨m.getArg 3⟩)
+          let odOpt := m.getArg 5
+          if odOpt.getNumArgs == 2 then
+            onDelete ← match (odOpt.getArg 1).getId.eraseMacroScopes with
+              | `cascade => pure .cascade
+              | `set_null =>
+                  unless isNullable do throwErrorAt (odOpt.getArg 1) s!"`on_delete set_null` on `{tName}.{colName}` requires a nullable column (`T?`)"
+                  pure .setNull
+              | `restrict => pure .restrict
+              | other => throwErrorAt (odOpt.getArg 1) s!"unknown `on_delete` action `{other}` (expected `cascade`, `set_null`, or `restrict`)"
       let wOpt := sc.getArg 4
       cols := cols.push {
         ident := colId, colName, tyTerm, sqlColType, isNullable, isNat, isBytes,
-        isPrimaryKey := isPk, isImmutable := isImm, isUnique := isUniq, refs?, encKey?,
+        isPrimaryKey := isPk, isImmutable := isImm, isUnique := isUniq, refs?, onDelete, enumVariants?, encKey?,
         whereExprs := if wOpt.getNumArgs == 2 then (wOpt.getArg 1).getSepArgs else #[] }
     else if sk == ``dbTablePolicyClause then
       let es := (sc.getArg 3).getSepArgs
@@ -308,14 +341,23 @@ private def elabTableSchema (t : ParsedTable) (rowTypeName : Name) (colNames : A
           let rcT ← mkSqlIdentTerm rc rc.getId.eraseMacroScopes.toString
           `(some ($rtT, $rcT))
       | none => `(none)
+    let onDelT : Term := mkIdent <| match col.onDelete with
+      | .noAction => `Qed.Server.Db.OnDeleteAction.noAction | .cascade => `Qed.Server.Db.OnDeleteAction.cascade
+      | .setNull => `Qed.Server.Db.OnDeleteAction.setNull | .restrict => `Qed.Server.Db.OnDeleteAction.restrict
+    let enumChkParts := match col.enumVariants? with
+      | some vs =>
+          if vs.isEmpty then #[]
+          else #["\"" ++ col.colName ++ "\" IN (" ++ String.intercalate ", " (vs.toList.map quoteSqlLit) ++ ")"]
+      | none => #[]
     let chkParts := if col.encKey?.isSome then
         #[renderEncryptedCheckSql col.colName col.isBytes col.whereExprs]
       else
-        (if col.isNat && !col.isNullable then #["\"" ++ col.colName ++ "\" >= 0"] else #[]) ++ col.whereExprs.filterMap (renderSqlPred? colNames false)
+        (if col.isNat && !col.isNullable then #["\"" ++ col.colName ++ "\" >= 0"] else #[]) ++
+        enumChkParts ++ col.whereExprs.filterMap (renderSqlPred? colNames false)
     let colNameT ← mkSqlIdentTerm col.ident col.colName
     `({ name := $colNameT, colType := $cTyT, nullable := $(quote col.isNullable),
         isPrimaryKey := $(quote col.isPrimaryKey), isUnique := $(quote col.isUnique), isImmutable := $(quote col.isImmutable),
-        references? := $refT, checkSql? := $(optSqlStr chkParts) : Qed.Server.Db.ColumnSchema })
+        references? := $refT, onDelete := $onDelT, checkSql? := $(optSqlStr chkParts) : Qed.Server.Db.ColumnSchema })
   let idxTerms ← t.indexes.mapM fun idxs => do
     let idxColTs ← idxs.mapM fun ic => mkSqlIdentTerm ic ic.getId.eraseMacroScopes.toString
     `([$[$idxColTs:term],*])
@@ -330,14 +372,24 @@ private def elabTableSchema (t : ParsedTable) (rowTypeName : Name) (colNames : A
 private def elabTable (dbName fullDbName : Name) (t : ParsedTable) : CommandElabM (DbTableInfo × Term) := do
   let rowTypeName := dbName ++ t.ident.getId; let rowTypeId := mkIdentFrom t.ident rowTypeName
   let (colNames, fIds, fTys) := (t.cols.map (·.colName), t.cols.map (·.ident), t.cols.map (·.tyTerm))
-  let derives := if t.cols.any (·.isBytes) then #[mkIdent `Inhabited, mkIdent `DecidableEq] else #[mkIdent `Inhabited, mkIdent `DecidableEq, mkIdent `Repr]
+  let (allInhab, allRepr) ← liftTermElabM do
+    let mut (hI, hR) := (true, !t.cols.any (·.isBytes))
+    for tyT in fTys do
+      let ty ← Term.elabType tyT.raw
+      if hI then hI := (← Meta.trySynthInstance (← Meta.mkAppM ``Inhabited #[ty])) matches .some _
+      if hR then hR := (← Meta.trySynthInstance (← Meta.mkAppM ``Repr #[ty])) matches .some _
+    return (hI, hR)
+  let mut derives : Array Ident := #[mkIdent `DecidableEq]
+  if allInhab then derives := derives.push (mkIdent `Inhabited)
+  if allRepr then derives := derives.push (mkIdent `Repr)
   elabCommand (← `(command| structure $rowTypeId where $[$fIds:ident : $fTys:term]* deriving $[$derives:ident],*))
   let specs : Array Qed.StructFieldSpec := t.cols.map fun c => { ident := c.ident, wireKey := c.colName, valTy := c.tyTerm }
   for cmd in (← Qed.mkStructJsonCmds rowTypeId specs { emitNamedDefs := false }) ++ (← Qed.mkStructProtoCmds rowTypeId specs { emitBytesCodec := false, emitLawful := true }) do elabCommand cmd
   let (rowVar, oldVar, ctxVar, valsVar) := (mkIdent `_row, mkIdent `_old, mkIdent `_ctx, mkIdent `_vals)
   let mkSub (s : Name) := mkIdentFrom t.ident (rowTypeName ++ s)
   let allRowExprs := t.cols.flatMap (·.whereExprs) ++ t.singleInvs
-  let (rowInvId, rowInvBoolId, rowInvSoundId, transInvId, decodeRowId) := (mkSub `RowInv, mkSub `rowInvBool, mkSub `rowInvBool_sound, mkSub `TransInv, mkSub `decodeRow)
+  let (rowInvId, rowInvBoolId, rowInvSoundId, transInvId, decodeRowId, encodeRowId) :=
+    (mkSub `RowInv, mkSub `rowInvBool, mkSub `rowInvBool_sound, mkSub `TransInv, mkSub `decodeRow, mkSub `encodeRow)
   let mut transProps ← t.transInvs.mapM (lowerDbExpr colNames rowVar (some oldVar) none true)
   for (tgtStx, chains) in t.transChains do
     let oldTgt ← lowerDbExpr colNames oldVar none none false tgtStx; let newTgt ← lowerDbExpr colNames rowVar none none false tgtStx
@@ -357,6 +409,8 @@ private def elabTable (dbName fullDbName : Name) (t : ParsedTable) : CommandElab
   let rowInvBody ← Qed.mkConjBody (← allRowExprs.mapM (lowerDbExpr colNames rowVar none none true)) (ascribeProp := false)
   let rowInvBoolBody ← mkBoolConj (← allRowExprs.mapM (lowerDbExpr colNames rowVar none none false))
   let transInvBody ← Qed.mkConjBody transProps (ascribeProp := false)
+  let encPairs ← t.cols.mapM fun col => do
+    `(($(← mkSqlIdentTerm col.ident col.colName), Qed.Server.Db.ToSql.toSql ($rowVar:ident).$(col.ident):ident))
   let tableCmds : Array Syntax := #[
     ← `(command| set_option linter.unusedVariables false in @[simp] abbrev $rowInvId ($rowVar:ident : $rowTypeId) : Prop := $rowInvBody),
     ← `(command| set_option linter.unusedVariables false in def $rowInvBoolId ($rowVar:ident : $rowTypeId) : Bool := $rowInvBoolBody),
@@ -369,7 +423,10 @@ private def elabTable (dbName fullDbName : Name) (t : ParsedTable) : CommandElab
     ← `(command|
         def $decodeRowId ($valsVar:ident : Qed.Server.Db.DbRow) : Except String $rowTypeId := do
           $[let $fIds:ident ← $colDecStmts:term]*
-          return { $[$fIds:ident := $fVals2:ident],* })]
+          return { $[$fIds:ident := $fVals2:ident],* }),
+    ← `(command|
+        def $encodeRowId ($rowVar:ident : $rowTypeId) : List (Qed.Server.Db.SqlIdent × Qed.Server.Db.SqlVal) :=
+          [$[$encPairs:term],*])]
   for cmd in tableCmds do elabCommand cmd
   let (readPolLbl, insertPolLbl, updatePolLbl, deletePolLbl) :=
     (← mkPolDef `ReadPolicy t.readPols, ← mkPolDef `InsertPolicy t.insertPols, ← mkPolDef `UpdatePolicy t.updatePols, ← mkPolDef `DeletePolicy t.deletePols)
@@ -384,12 +441,90 @@ private def elabTable (dbName fullDbName : Name) (t : ParsedTable) : CommandElab
     hasDeletePolicy := !t.deletePols.isEmpty, hasTransInv := !t.transInvs.isEmpty || !t.transChains.isEmpty,
     readPolicyLabel := readPolLbl, insertPolicyLabel := insertPolLbl, updatePolicyLabel := updatePolLbl, deletePolicyLabel := deletePolLbl }, schemaTerm)
 
+private def backfillBinOps : Array (Lean.Name × Lean.Name) := #[
+  (``qedAnd, `Qed.Server.Db.SqlBinOp.and), (``qedOr, `Qed.Server.Db.SqlBinOp.or),
+  (``qedAdd, `Qed.Server.Db.SqlBinOp.add), (``qedSub, `Qed.Server.Db.SqlBinOp.sub), (``qedMul, `Qed.Server.Db.SqlBinOp.mul)]
+
+@[noinline]
+private partial def lowerBackfillSqlExpr (tbl : ParsedTable) (rowTyId : Ident) (rowVar? : Option String) (stx : Syntax) : CommandElabM Term := do
+  let u := unwrapParens1 stx; let k := u.getKind
+  let colNames := tbl.cols.map (·.colName)
+  let matchCol? (s : Syntax) : Option String :=
+    match extractDottedChain? (unwrapParens1 s) with
+    | some [rv, col] => if rowVar? == some rv && colNames.contains col then some col else none
+    | some [col] => if rowVar?.isNone && colNames.contains col then some col else none
+    | _ => none
+  let checkNotEnc (ref : Syntax) (col : String) : CommandElabM Unit := do
+    if tbl.cols.any fun c => c.colName == col && c.encKey?.isSome then
+      throwErrorAt ref s!"`backfill` cannot reference encrypted column `{tbl.tableName}.{col}`"
+  let lowerConst (colHint? : Option String) (valStx : Syntax) : CommandElabM Term := do
+    let uv := unwrapParens1 valStx
+    if uv.getKind == ``qedIdent then
+      match (uv.getArg 0).getId.eraseMacroScopes with
+      | `true => return ← `(Qed.Server.Db.SqlExpr.litTrue) | `false => return ← `(Qed.Server.Db.SqlExpr.litFalse) | _ => pure ()
+    let vT ← liftMacroM (lowerSimpleQedExpr .val valStx)
+    match colHint? with
+    | some col => mkTypedSqlParamTerm rowTyId (mkIdentFrom valStx (Name.mkSimple col)) vT
+    | none => `(Qed.Server.Db.SqlExpr.param (Qed.Server.Db.ToSql.toSql $vT))
+  if let some col := matchCol? u then
+    checkNotEnc u col; return ← `(Qed.Server.Db.SqlExpr.col $(← mkSqlIdentTerm u col))
+  match extractDottedChain? u with
+  | some [rv, col, "length"] => if rowVar? == some rv && colNames.contains col then
+      checkNotEnc u col; return ← `(Qed.Server.Db.SqlExpr.strLen (Qed.Server.Db.SqlExpr.col $(← mkSqlIdentTerm u col)))
+  | some [col, "length"] => if rowVar?.isNone && colNames.contains col then
+      checkNotEnc u col; return ← `(Qed.Server.Db.SqlExpr.strLen (Qed.Server.Db.SqlExpr.col $(← mkSqlIdentTerm u col)))
+  | _ => pure ()
+  let sub := lowerBackfillSqlExpr tbl rowTyId rowVar?
+  if let some (_, op) := backfillBinOps.find? (·.1 == k) then `(Qed.Server.Db.SqlExpr.binOp $(mkIdent op) $(← sub (u.getArg 0)) $(← sub (u.getArg 2)))
+  else if k == ``qedNot then `(Qed.Server.Db.SqlExpr.not $(← sub (u.getArg 1)))
+  else if k == ``qedCmp then
+    let mut lhs := u.getArg 0; let mut cs : Array Term := #[]
+    for lk in (u.getArg 1).getArgs do
+      let opStr := ((lk.getArg 0).reprint.getD "").trimAscii.toString; let rhs := lk.getArg 1
+      let rhsNone := (unwrapParens1 rhs).getKind == ``qedIdent && ((unwrapParens1 rhs).getArg 0).getId.eraseMacroScopes == `none
+      let c ← if rhsNone && (opStr == "==" || opStr == "!=") then
+          let l ← sub lhs; if opStr == "==" then `(Qed.Server.Db.SqlExpr.isNull $l) else `(Qed.Server.Db.SqlExpr.isNotNull $l)
+        else
+          let some (_, op) := sqlCmpOps.find? (·.1 == opStr) | throwErrorAt lk s!"unsupported SQL comparison operator `{opStr}` in `backfill`"
+          let lowerSide (side other : Syntax) := match matchCol? other with
+            | some col => if (matchCol? side).isNone && !rowVar?.any (stxMentionsVar · side) then lowerConst (some col) side else sub side
+            | none => sub side
+          `(Qed.Server.Db.SqlExpr.binOp $(mkIdent op) $(← lowerSide lhs rhs) $(← lowerSide rhs lhs))
+      cs := cs.push c; lhs := rhs
+    match cs.toList with | [] => `(Qed.Server.Db.SqlExpr.litTrue) | c :: rs => rs.foldlM (init := c) fun a x => `(Qed.Server.Db.SqlExpr.binOp .and $a $x)
+  else lowerConst none u
+
+@[noinline]
+private def elabBackfillClause (dbName : Name) (tables : Array ParsedTable) (bc : Syntax) : CommandElabM Term := do
+  let tblId : Ident := ⟨bc.getArg 1⟩; let tblName := tblId.getId.eraseMacroScopes.toString
+  let some tbl := tables.find? (·.tableName == tblName) | throwErrorAt tblId s!"`backfill` references unknown table `{tblName}` in `database {dbName}`"
+  let rowTyId := mkIdentFrom tblId (dbName ++ tbl.ident.getId)
+  let setItems := (bc.getArg 4).getSepArgs
+  let mut setPairs : Array Term := #[]
+  for item in setItems do
+    let colId : Ident := ⟨item.getArg 0⟩; let colName := colId.getId.eraseMacroScopes.toString; let valStx := item.getArg 2
+    let some col := tbl.cols.find? (·.colName == colName) | throwErrorAt colId s!"`backfill {tblName}` references unknown column `{colName}`"
+    if col.isPrimaryKey then throwErrorAt colId s!"`backfill {tblName}` cannot modify `primary_key` column `{colName}`"
+    if col.encKey?.isSome then throwErrorAt colId s!"`backfill {tblName}` cannot modify encrypted column `{colName}`"
+    let valT ← liftMacroM (lowerSimpleQedExpr .val valStx)
+    let sqlValT ← mkTypedSqlParamTerm rowTyId (mkIdentFrom colId (Name.mkSimple colName)) valT
+    setPairs := setPairs.push (← `(($(← mkSqlIdentTerm colId colName), $sqlValT)))
+  let whereT ← if (bc.getArg 6).getNumArgs == 2 then
+      let wRaw := unwrapParens1 ((bc.getArg 6).getArg 1)
+      if wRaw.getKind == ``qedLam1 then
+        let b := wRaw.getArg 0; let rVar := if b.isIdent then b.getId.eraseMacroScopes.toString else "_row"
+        lowerBackfillSqlExpr tbl rowTyId (some rVar) (wRaw.getArg 2)
+      else lowerBackfillSqlExpr tbl rowTyId none wRaw
+    else `(Qed.Server.Db.SqlExpr.litTrue)
+  `(Qed.Server.Db.SqlQuery.update $(← mkSqlIdentTerm tblId tblName) [$[$setPairs:term],*] $whereT [])
+
 @[noinline, command_elab databaseCmd]
 def elabDatabaseCmd : CommandElab := fun stx => do
   let dbIdent : Ident := ⟨stx.getArg 1⟩; let dbName := dbIdent.getId; let dbShort := dbName.toString; let fullDbName := (← getCurrNamespace) ++ dbName
   let mut primaryEp? : Option (Term × Qed.Cloud.DbEnvSpec) := none
   let mut envSlots : Qed.Cloud.EnvMap (Option (Term × Qed.Cloud.DbEnvSpec)) := Qed.Cloud.EnvMap.ofDefault none
-  let mut isManaged := false; let mut hasExplicitEnv := false; let mut secrets : Array String := #[]; let mut tables : Array ParsedTable := #[]
+  let mut isManaged := false; let mut hasExplicitEnv := false; let mut secrets : Array String := #[]
+  let mut tables : Array ParsedTable := #[]; let mut backfillClauses : Array Syntax := #[]
   let pushSecs (secs cur : Array String) := secs.foldl pushUnique cur
   let managedSpecToTerm : Qed.Cloud.DbEnvSpec → CommandElabM Term
     | .managedPostgres nm env => `(Qed.Server.Db.DbEndpoint.managedPostgres $(quote nm) $(mkIdent (`Qed.Cloud.DeployEnv ++ Name.mkSimple env.toString)))
@@ -436,6 +571,8 @@ def elabDatabaseCmd : CommandElab := fun stx => do
       let tbl ← parseTableClause dbName tables c
       secrets := pushSecs tbl.encSecrets secrets
       tables := tables.push tbl
+    else if k == ``dbBackfillClause then
+      backfillClauses := backfillClauses.push c
     else throwErrorAt c s!"unexpected clause in `database {dbName}`"
 
   let some _ := envSlots.prod.orElse (fun _ => primaryEp?)
@@ -461,16 +598,49 @@ def elabDatabaseCmd : CommandElab := fun stx => do
     (mkDb `_qed_database_marker, mkDb `secrets, mkDb `config, mkDb `ddl, mkDb `rlsDdl, mkDb `ensureSchema, mkDb `instSafeIOEnsureSchema, mkIdent `m)
   elabCommand (← `(command| def $markerId : Unit := ()))
   let (tableInfos, tableSchemaTerms) := (← tables.mapM (elabTable dbName fullDbName)).unzip
+  let backfillTerms ← backfillClauses.mapM (elabBackfillClause dbName tables)
   let devEpTerm ← match envSlots.dev with | some (dt, _) => `(some $dt) | none => `(none)
   let envEndpointsTerm ← if hasExplicitEnv then `(some ({ dev := $(resolved.dev.1), preview := $(resolved.preview.1), staging := $(resolved.staging.1), prod := $(resolved.prod.1) } : Qed.Cloud.EnvMap Qed.Server.Db.DbEndpoint)) else `(none)
   let secLits := secrets.map Syntax.mkStrLit
+  let clientStructId := mkDb `Client
+  let clientWithId := mkDb `clientWith
+  let clientId := mkDb `client
+  let cfgParamId := mkIdent `_cfg
+  let mut clientFields : Array (Ident × Term) := #[(mkIdent `config, ← `(Qed.Server.Db.DbConfig))]
+  let mut clientInits : Array (Ident × Term) := #[(mkIdent `config, ⟨cfgParamId.raw⟩)]
+  for t in tables do
+    let rowTyId := mkIdentFrom t.ident (dbName ++ t.ident.getId)
+    let tblNameT ← mkSqlIdentTerm t.ident t.tableName
+    let colIdTs ← t.cols.mapM fun c => mkSqlIdentTerm c.ident c.colName
+    let mut ewTs : Array Term := #[]; let mut erTs : Array Term := #[]
+    for (c, idx) in t.cols.zipIdx do
+      if let some (kEnv, fb?, isB) := c.encKey? then
+        let sp ← mkEncColSpecTerm t.tableName c.colName kEnv fb? isB
+        ewTs := ewTs.push (← `(($(Syntax.mkStrLit c.colName), $sp)))
+        erTs := erTs.push (← `(($(Syntax.mkNumLit (toString idx)), $sp)))
+    let fldId := mkIdentFrom t.ident (Name.mkSimple t.tableName)
+    let hTy ← `(Qed.Server.Db.TableHandle $rowTyId)
+    let hVal ← `({ config := $cfgParamId, tableName := $tblNameT, columns := [$[$colIdTs:term],*],
+                   decodeRow := $(mkIdentFrom t.ident (dbName ++ t.ident.getId ++ `decodeRow)),
+                   encodeRow := $(mkIdentFrom t.ident (dbName ++ t.ident.getId ++ `encodeRow)),
+                   rowInvBool := $(mkIdentFrom t.ident (dbName ++ t.ident.getId ++ `rowInvBool)),
+                   encWrite := [$[$ewTs:term],*], encRead := [$[$erTs:term],*] : Qed.Server.Db.TableHandle $rowTyId })
+    clientFields := clientFields.push (fldId, hTy)
+    clientInits := clientInits.push (fldId, hVal)
+  let cfIds := clientFields.map (·.1); let cfTys := clientFields.map (·.2)
+  let ciIds := clientInits.map (·.1); let ciVals := clientInits.map (·.2)
   for cmd in #[
     ← `(command| def $secretsId : Array String := #[$[$secLits:term],*]),
-    ← `(command| def $configId : Qed.Server.Db.DbConfig := { name := $(Syntax.mkStrLit dbShort), endpoint := $(resolved.prod.1), devFallback? := $devEpTerm, envEndpoints? := $envEndpointsTerm, isManaged := $(quote isManaged), tables := [$[$tableSchemaTerms:term],*] }),
+    ← `(command| def $configId : Qed.Server.Db.DbConfig := { name := $(Syntax.mkStrLit dbShort), endpoint := $(resolved.prod.1), devFallback? := $devEpTerm, envEndpoints? := $envEndpointsTerm, isManaged := $(quote isManaged), tables := [$[$tableSchemaTerms:term],*], backfills := [$[$backfillTerms:term],*] }),
     ← `(command| def $ddlId (dialect : Qed.Server.Db.SqlDialect := .postgres) : String := Qed.Server.Db.renderDatabaseDdl dialect ($configId).tables),
     ← `(command| def $rlsDdlId : String := Qed.Server.Db.renderDatabaseRlsDdl ($configId).tables),
     ← `(command| def $ensureId {$mId:ident : Type → Type} [Monad $mId] [Qed.Server.MonadServer $mId] : $mId (Except Qed.Server.ApiError Unit) := Qed.Server.MonadServer.dbExecDdl $configId),
-    ← `(command| instance $instId:ident {_σ : Type} : Qed.Server.SafeIO (@$ensureId (Qed.Server.ThreadProg _σ) _ _) where noAtomic := .io (.dbExecDdl $configId) _ .pure)
+    ← `(command| instance $instId:ident {_σ : Type} : Qed.Server.SafeIO (@$ensureId (Qed.Server.ThreadProg _σ) _ _) where noAtomic := .io (.dbExecDdl $configId) _ .pure),
+    ← `(command| structure $clientStructId where $[$cfIds:ident : $cfTys:term]*),
+    ← `(command| def $clientWithId ($cfgParamId:ident : Qed.Server.Db.DbConfig) : $clientStructId := { $[$ciIds:ident := $ciVals:term],* }),
+    ← `(command| def $clientId : $clientStructId := $clientWithId $configId),
+    ← `(command| def $(mkIdentFrom dbIdent (dbName ++ `Client ++ `ensureSchema)) {$mId:ident : Type → Type} [Monad $mId] [Qed.Server.MonadServer $mId] (_c : $clientStructId) : $mId (Except Qed.Server.ApiError Unit) := Qed.Server.MonadServer.dbExecDdl _c.config),
+    ← `(command| def $(mkIdentFrom dbIdent (dbName ++ `Client ++ `transaction)) {$mId:ident : Type → Type} {α : Type} [Monad $mId] [Qed.Server.MonadServer $mId] (_c : $clientStructId) (body : UInt64 → $mId (Except Qed.Server.ApiError α)) : $mId (Except Qed.Server.ApiError α) := Qed.Server.Db.withTransaction _c.config body)
   ] do elabCommand cmd
   modifyEnv fun env => databaseRegistry.addEntry env {
     dbName := fullDbName, shortName := dbShort, configConst := fullDbName ++ `config, ensureSchemaConst := fullDbName ++ `ensureSchema,

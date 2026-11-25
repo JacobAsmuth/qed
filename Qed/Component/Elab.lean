@@ -107,10 +107,6 @@ private def canSynthDecidablePred (stateId : Ident) (pred : Term) : CommandElabM
     Term.synthesizeSyntheticMVarsNoPostponing
     return (← Meta.trySynthInstance (← Meta.mkAppM ``DecidablePred #[pVal])) matches .some _
 
-private def mkEnsuredExistentialWrap (ensConst : Name) (qaIds : Array Ident) (elemVar : Ident) : CommandElabM (Term × Term) := do
-  return (← Qed.Lang.mkAppTerms (mkIdent ensConst) (qaIds.map (⟨·.raw⟩)),
-          ← qaIds.foldrM (init := ← `(($elemVar:ident).ok)) fun qa acc => `(Exists.intro $qa $acc))
-
 @[noinline]
 private def mkHoistedKeyAndPropsFns (spec : ComponentSpec) (h : HoistedSub) : CommandElabM (Term × Term) := do
   let keyFn : Term ← if h.hasLifecycle then
@@ -141,15 +137,10 @@ private def mkCompQueriesCmds (spec : ComponentSpec) (isTopMount : Bool) : Comma
   if !spec.hasAnyQueries then return #[]
   let ownTerms ← spec.queries.mapM fun q => do
     let rspec := q.rpc; let reqTupleTy ← Qed.Lang.buildProdType (rspec.mInfo.paramTypeConsts.map fun n => (mkIdent n : Term))
-    let fetchBody ← mkRpcQueryBranches spec rspec fun qaIds => do
-      let cbTerm : Term ← if !rspec.hasMsgEnsured then `(_qgot _qk) else do
-        let some ensConst := rspec.mInfo.ensPredConst | throwErrorAt rspec.rpcRef "internal: missing server `ensures` predicate in `query`"
-        let qeId := mkIdent `_qe; let (ensApp, exPrf) ← mkEnsuredExistentialWrap ensConst qaIds qeId
-        `(fun (_qr : Qed.Resource (Qed.Ensured $(q.ty) ($ensApp))) => _qgot _qk (_qr.map fun $qeId => ⟨($qeId:ident).val, $exPrf⟩))
-      let qaTerms : Array Term := qaIds.map (⟨·.raw⟩)
-      `(some $(← withRef rspec.rpcRef `(qedCheckRpcCall% $(mkIdentFrom rspec.rpcRef rspec.srvInfo.serverName):ident $(mkIdentFrom rspec.rpcRef (Name.mkSimple rspec.mInfo.name)):ident [$[$qaTerms:term],*] $cbTerm)))
-    let qCore ← `(Qed.Resource.rpcQuery (Req := $reqTupleTy) (params? := fun (s : $(spec.stateId)) => $(← mkRpcQueryParamsBody spec rspec))
-        (fetch := fun (s : $(spec.stateId)) _qgot _qk => $fetchBody) (got := $(spec.msgCtor q.ctorName))
+    let pCall ← appWithProps spec (mkIdent (queryParamsFnName spec.t.getId q)) #[← `(s)]
+    let fCall ← appWithProps spec (mkIdent (queryFetchFnName spec.t.getId q)) #[← `(s), ← `(_qk)]
+    let qCore ← `(Qed.Resource.rpcQuery (Req := $reqTupleTy) (params? := fun (s : $(spec.stateId)) => $pCall)
+        (fetch := fun (s : $(spec.stateId)) _ _qk => $fCall) (got := $(spec.msgCtor q.ctorName))
         (get := fun (s : $(spec.stateId)) => s.$(q.id):ident) (set := fun c (s : $(spec.stateId)) => { s with $(q.id):ident := c }))
     `(Qed.Query.liftWithProps _getKey _getProps _getState _setState _wrapMsg (fun (p : $(spec.propsId)) => $qCore))
   let mut hoistedParts : Array Term := #[]
@@ -258,14 +249,16 @@ private def mkSpecAppCmds (spec : ComponentSpec) (finalApp : Term) (compInv? : O
 
 private def applyHeadDirectives (hmId stId : Ident) (dirs : Array Syntax) (tail : Term) : CommandElabM Term :=
   dirs.foldrM (init := tail) fun d acc => do match d.getKind with
-    | `Qed.compHeadTitle | `Qed.compHeadDescription | `Qed.compHeadCanonical =>
-        let fId := mkIdent <| match d.getKind with | `Qed.compHeadTitle => `title | `Qed.compHeadDescription => `description | _ => `canonical
+    | `Qed.compHeadTitle | `Qed.compHeadDescription =>
+        let fId := mkIdent <| if d.getKind == `Qed.compHeadTitle then `title else `description
         `(let $hmId:ident := { $hmId with $fId:ident := Option.some ($(← lowerCompExpr .val (d.getArg 1)) : String) }; $acc)
+    | `Qed.compHeadCanonical =>
+        `(let $hmId:ident := { $hmId with canonical := Option.some (($(← lowerCompExpr .val (d.getArg 1)) : Qed.HrefTarget).raw) }; $acc)
     | `Qed.compHeadMeta   => `(let $hmId:ident := { $hmId with metaTags := ($hmId).metaTags ++ [(($(← lowerCompExpr .val (d.getArg 1)) : String), ($(← lowerCompExpr .val (d.getArg 3)) : String))] }; $acc)
     | `Qed.compHeadStatus => `(let $stId:ident : Nat := $(← lowerCompExpr .val (d.getArg 1)); $acc)
     | `Qed.compHeadRedirect =>
         let stT ← if (d.getArg 2).getNumArgs == 4 then lowerCompExpr .val ((d.getArg 2).getArg 3) else `((302 : Nat))
-        `(let $hmId:ident := { $hmId with redirect := Option.some ($(← lowerCompExpr .val (d.getArg 1)) : String) }; let $stId:ident : Nat := $stT; $acc)
+        `(let $hmId:ident := { $hmId with redirect := Option.some (($(← lowerCompExpr .val (d.getArg 1)) : Qed.HrefTarget).raw) }; let $stId:ident : Nat := $stT; $acc)
     | _ => throwErrorAt d "unexpected directive in `head:`"
 
 private def mkCompHeadCmd? (spec : ComponentSpec) : CommandElabM (Option CmdStx) := do
@@ -281,7 +274,7 @@ private def mkCompHeadCmd? (spec : ComponentSpec) : CommandElabM (Option CmdStx)
     let mut alts : Array MatchAltStx := #[]
     for c in caseItems do
       let armBody ← applyHeadDirectives hmId stId (c.getArg 3).getArgs (← `(($hmId, $stId)))
-      for p in (c.getArg 1).getSepArgs do alts := alts.push (← `(Lean.Parser.Term.matchAltExpr| | $(← liftMacroM (lowerQedPat p)) => $armBody))
+      alts := alts.push (← mkMatchAltFromAlts (← liftMacroM (lowerCasePatAlts (c.getArg 1))) armBody)
     `(match $(rd.field):ident with $[$alts:matchAlt]*)
   let fullBody ← `(let $hmId:ident : Qed.HeadMeta := {}; let $stId:ident : Nat := 200; $(← applyHeadDirectives hmId stId sharedDirs coreTail))
   return some (← `(command| set_option linter.unusedVariables false in def $(spec.id `headInfo) (s : $(spec.stateId)) : Qed.HeadMeta × Nat := $(← bindMentionedFields spec (mentionsIdent fullBody.raw) fullBody)))
@@ -300,7 +293,7 @@ private def mkCompAppCmds (spec : ComponentSpec) (body' : Term) (hasStart : Bool
   let templateTerm ← spec.portOuts.reverse.foldlM (init := templateTerm0) fun acc po =>
     if mentionsIdent acc.raw po.id.getId then `(let $(mkIdent po.id.getId):ident := $(spec.id po.id.getId); $acc) else pure acc
   let appUpdate ← if spec.hasEffects then `($(spec.updateId)) else `(fun s m => ($(spec.updateId) s m, Qed.Cmd.none))
-  let onSessionArg ← if spec.sessionField?.isSome then `(some $(spec.msgCtor `_onSession)) else `(none)
+  let onSessionArg ← if spec.hasAnySession then `(some $(spec.msgCtor `_onSession)) else `(none)
   let mut appT : Term ← (if spec.route?.isSome then
     `(Qed.Internal.mkRoutedApp $(spec.initId) $appUpdate $templateTerm (onRoute := $(spec.msgCtor `_onRoute))
         (onSession := $onSessionArg) (start := $startArg) (locals := $(spec.id `regs)) (styles := qedInternalStyles% $(spec.viewId)) (onPort := $onPortArg))
@@ -361,7 +354,7 @@ private def mkCodecAndMountCmds (spec : ComponentSpec) (starts' : Array Term) (i
   let outJsonOk ← if spec.outTy?.isSome then outCtorSpecs.allM fun (_, ps) => ps.allM (canSynthJson ``FromJsonField ·.2) else pure true
   if canEmitCodecs then cmds := cmds ++ (← mkCompStructJsonCmds (tId ++ `Props) spec.props) ++ (← mkCompStructJsonCmds (tId ++ `State) spec.states)
   if spec.outTy?.isSome && outJsonOk then cmds := cmds ++ (← mkOutJsonCmds tId outCtorSpecs)
-  let hasLocalDef := spec.mountable && !spec.hasEffects && !spec.hasSlotsOrKids && canEmitCodecs && outJsonOk
+  let hasLocalDef := spec.mountable && !spec.hasEffects && !spec.hasSlotsOrKids && !spec.hasAnySession && canEmitCodecs && outJsonOk
   if hasLocalDef then cmds := cmds ++ (← mkCompLocalDefCmds spec idLit)
   let own ← if hasLocalDef then `([$(spec.id `reg)]) else `(([] : List LocalDef))
   return (cmds.push (← `(command| def $(spec.id `regs) : List LocalDef := LocalDef.dedupe ($own ++ qedInternalLocalRegistrations% $(spec.viewId)))), hasStart, hasLocalDef)
@@ -425,7 +418,7 @@ private def elabStatefulComponentBody (compNs : Name) (rawSpec : ComponentSpec) 
   modifyEnv fun env => componentRegistry.addEntry env { baseInfo with
     hasOut := spec.outTy?.isSome, hasEffects := spec.hasEffects, hasStart, mountable := spec.mountable,
     hasLocalDef, hasQueries := spec.hasAnyQueries, hasSubscriptions := spec.hasAnySubscriptions,
-    usedRpcs := allUsedRpcs, usedChannels := allUsedChannels }
+    hasSession := spec.hasAnySession, usedRpcs := allUsedRpcs, usedChannels := allUsedChannels }
 
 @[command_elab componentCmd] def elabComponentCmd : CommandElab := fun stx => do
   let (savedEnv, errsInit, priorTasks) := (← getEnv, ← getErrorCount, (← get).snapshotTasks.size)

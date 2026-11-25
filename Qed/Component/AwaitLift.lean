@@ -15,11 +15,13 @@ private def mkPatIdent (i : SourceInfo) (nm : Name) (args : Array Syntax := #[])
   Syntax.node i ``qedPatIdent #[mkIdent nm, if args.isEmpty then Syntax.node i nullKind #[] else Syntax.node i nullKind #[Syntax.atom i "(", Syntax.node i nullKind sep, Syntax.atom i ")"]]
 private def mkPatDot (i : SourceInfo) (tag : Name) : Syntax := Syntax.node i ``qedPatDot #[Syntax.atom i ".", mkIdent tag, Syntax.node i nullKind #[]]
 private def mkPatWild (i : SourceInfo) : Syntax := Syntax.node i ``qedPatWild #[Syntax.atom i "_"]
+private def mkTypedLetStmt (info : SourceInfo) (varId : Ident) (rawTy? : Option Syntax) (rhsExpr : Syntax) : Syntax :=
+  let tyNode := match rawTy? with
+    | some tyStx => Syntax.node info nullKind #[Syntax.atom info ":", tyStx]
+    | none       => Syntax.node info nullKind #[]
+  Syntax.node info ``qedStmtLet #[Syntax.atom info "let", varId.raw, tyNode, Syntax.atom info "=", rhsExpr, Syntax.node info nullKind #[]]
 private def mkLetRawSt (i : SourceInfo) (id : Ident) (ty? : Option Term) (rhsExpr : Syntax) : Syntax :=
-  let tyNode := match ty? with
-    | some ty => Syntax.node i nullKind #[Syntax.atom i ":", Syntax.node i ``qedTypeAtom #[mkIdentFrom ty ty.raw.getId, Syntax.node i nullKind #[]]]
-    | none    => Syntax.node i nullKind #[]
-  Syntax.node i ``qedStmtLet #[Syntax.atom i "let", id, tyNode, Syntax.atom i "=", rhsExpr, Syntax.node i nullKind #[]]
+  mkTypedLetStmt i id (ty?.map fun (ty : Term) => Syntax.node i ``qedTypeAtom #[mkIdentFrom ty ty.raw.getId, Syntax.node i nullKind #[]]) rhsExpr
 private def mkCaseStx (st patS : Syntax) (bStmts : Array Syntax) : Syntax :=
   let i := SourceInfo.fromRef st; Syntax.node i ``qedStmtCase #[Syntax.atom i "case", Syntax.node i nullKind #[patS], Syntax.atom i ":", packSuite st bStmts]
 private def mkWildPassCase (st : Syntax) : Syntax := let i := SourceInfo.fromRef st; mkCaseStx st (mkPatWild i) #[mkPassSt i]
@@ -29,11 +31,8 @@ private def mkMatchStx (st : Syntax) (scrutId : Ident) (cases : Array Syntax) : 
 
 private inductive CatchPatKind | wildcard | dotTag (tag : String) (binder? : Option Syntax)
 
-private def classifyCatchCase (validTags : Array String) (isOption : Bool) (cStx : Syntax) : CommandElabM (CatchPatKind × Array Syntax) := do
-  let pats := (cStx.getArg 1).getSepArgs
-  if pats.size != 1 then throwErrorAt cStx "each `catch` case must match a single pattern (`case .tag:`, `case .tag(err):`, `case .failed(err):`, or `case _:`)"
-  let (pat, body) := (pats[0]!, suiteStmts (cStx.getArg 3))
-  if pat.getKind == ``qedPatWild then return (.wildcard, body)
+private def classifyCatchCase (validTags : Array String) (isOption : Bool) (cStx : Syntax) : CommandElabM (Array (CatchPatKind × Array Syntax)) := do
+  let body := suiteStmts (cStx.getArg 3)
   let checkTag (tagRef : Syntax) (tag : String) (binder? : Option Syntax) : CommandElabM (CatchPatKind × Array Syntax) := do
     if tag == "failed" then return (.dotTag "failed" binder?, body)
     if tag == "none" then
@@ -44,16 +43,21 @@ private def classifyCatchCase (validTags : Array String) (isOption : Bool) (cStx
       let validList := validTags.toList.map (s!".{·}") ++ (if isOption then [".none"] else []) ++ [".failed"]
       throwErrorAt tagRef s!"unknown error tag `.{tag}` in `catch` (valid patterns: {String.intercalate ", " validList})"
     return (.dotTag tag binder?, body)
-  if pat.getKind == ``qedPatDot then
-    let tag := (pat.getArg 1).getId.toString
-    if (pat.getArg 2).getNumArgs != 3 then return ← checkTag pat tag none
-    let args := ((pat.getArg 2).getArg 1).getSepArgs
-    if args.size == 1 then
-      let b := args[0]!
-      unless b.getKind == ``qedPatWild || (b.getKind == ``qedPatIdent && (b.getArg 1).getNumArgs == 0) do
-        throwErrorAt b "error message pattern in `catch` must be an identifier or `_`"
-      return ← checkTag pat tag (some b)
-  throwErrorAt pat "unsupported `catch` pattern; expected `.tag`, `.tag(msg)`, `.failed(err)`, `.none`, or `_`"
+  let classifyOne (pat : Syntax) : CommandElabM (CatchPatKind × Array Syntax) := do
+    if pat.getKind == ``qedPatWild then return (.wildcard, body)
+    if pat.getKind == ``qedPatDot then
+      let tag := (pat.getArg 1).getId.toString
+      if (pat.getArg 2).getNumArgs != 3 then return ← checkTag pat tag none
+      let args := ((pat.getArg 2).getArg 1).getSepArgs
+      if args.size == 1 then
+        let b := args[0]!
+        unless b.getKind == ``qedPatWild || (b.getKind == ``qedPatIdent && (b.getArg 1).getNumArgs == 0) do
+          throwErrorAt b "error message pattern in `catch` must be an identifier or `_`"
+        return ← checkTag pat tag (some b)
+    throwErrorAt pat "unsupported `catch` pattern; expected `.tag`, `.tag(msg)`, `.failed(err)`, `.none`, or `_`"
+  (extractCasePatAlts (cStx.getArg 1)).mapM fun pats => do
+    if pats.size != 1 then throwErrorAt cStx "each `catch` case must match a single pattern (`case .tag:`, `case .tag(err):`, `case .failed(err):`, or `case _:`)"
+    classifyOne pats[0]!
 
 private def stmtContainsAwait (st : Syntax) : Bool := stxAny isAwaitStmt st
 
@@ -210,7 +214,7 @@ private def buildCatchArms (liftRec : LiftRecFn) (ac : AwaitCallCtx) (forCtorPar
   return (arms, wildArms, covFailed, covNone)
 
 private def pushSite (ctx : RewriteCtx) (keyPfx : String) (ctor : Name) (params : Array (Ident × Term)) (stmts : Array Syntax)
-    (assigns : Array (Name × Option Term) := #[]) : IO Unit :=
+    (assigns : Array SiteAssign := #[]) : IO Unit :=
   ctx.accum.modify fun a => { a with sites := a.sites.push { key := s!"{keyPfx}:{ctor}", ctor, params, assigns, stmts? := some stmts } }
 
 private def pushSpecDisp (ctx : RewriteCtx) (ctor : Name) (params : Array (Ident × Term)) (stmts : Array Syntax) : IO Unit :=
@@ -295,11 +299,10 @@ private partial def liftAwaitStmts (ctx : RewriteCtx) (actionParams outerParams 
       if k == ``qedStmtAssign && (unwrapParens1 (st.getArg 2)).getKind == ``qedAwait then
         let op := atomStr (st.getArg 1)
         if op != "=" then throwErrorAt (st.getArg 1) s!"`await` assignment requires `=`, not `{op}` (use `let v = await ...` then update the field)"
-        unless (st.getArg 0).getKind == ``qedIdent do
+        let some (fRef, fname, path) := parseCompLVal? (st.getArg 0) | do
           let sn := stxSnippet (st.getArg 0)
-          throwErrorAt (st.getArg 0) s!"`field = await ...` requires a simple `Resource` state field on the left-hand side{if sn.isEmpty then "" else s!", got `{sn}`"}"
-        let fId : Ident := ⟨(st.getArg 0).getArg 0⟩; let fname := fId.getId.eraseMacroScopes
-        checkMutableField ctx fId s!"`{fname} = await ...`" fname
+          throwErrorAt (st.getArg 0) s!"`field = await ...` requires a `Resource` state field path on the left-hand side{if sn.isEmpty then "" else s!", got `{sn}`"}"
+        checkMutableField ctx fRef s!"`{fname} = await ...`" fname
         let (rpcId, rawArgs) ← unpackAwaitCall st (unwrapParens1 (st.getArg 2))
         let (srvInfo, mInfo) ← resolveRpcForAwait ctx rpcId rawArgs.size
         let mkResAssign (rhs : Term) : Syntax := Syntax.node info ``qedStmtAssign #[st.getArg 0, Syntax.atom info "=", mkRawExpr rhs, Syntax.node info nullKind #[]]
@@ -312,7 +315,7 @@ private partial def liftAwaitStmts (ctx : RewriteCtx) (actionParams outerParams 
           return ← liftPredictedAwait ctx actionParams liftRec (.mk st xId none rpcId rawArgs srvInfo mInfo parsedCatch outerParams localNames)
             predBody none none #[] preStmts #[mkResAssign (← `(Qed.Resource.loading))] (mkResAssign (← `(Qed.Resource.ok $xId)) :: rest)
         let assignSt := mkResAssign (← `(Qed.Resource.loading))
-        let perfSt ← mkRpcPerformStmt ctx st rpcId srvInfo mInfo (← registerSite ctx.accum #[(fname, none)] none) #[] rawArgs
+        let perfSt ← mkRpcPerformStmt ctx st rpcId srvInfo mInfo (← registerSite ctx.accum #[.mk fname path none] none) #[] rawArgs
         let (tail, tailCls?) ← go outerParams localNames (preStmts ++ #[assignSt, perfSt]) rest
         return (#[assignSt, perfSt] ++ tail, tailCls?)
       if k == ``qedStmtAssign && st.getNumArgs > 3 && (st.getArg 3).getNumArgs > 0 then
@@ -326,7 +329,8 @@ private partial def liftAwaitStmts (ctx : RewriteCtx) (actionParams outerParams 
         let catchCases : Array Syntax ← match clauses.catch? with
           | some (_, cNode) => if cNode.getKind == `Qed.Lang.catchArms then pure (cNode.getArg 1).getArgs else throwErrorAt cNode "in client components, use `catch:` with `case .tag: ...` arms"
           | none => pure #[]
-        let ac : AwaitCallCtx := .mk st xId optTy? rpcId rawArgs srvInfo mInfo (← catchCases.mapM (classifyCatchCase mInfo.domainErrTags mInfo.isOption)) outerParams localNames
+        let parsedCatch ← catchCases.foldlM (init := #[]) fun acc c => do pure (acc ++ (← classifyCatchCase mInfo.domainErrTags mInfo.isOption c))
+        let ac : AwaitCallCtx := .mk st xId optTy? rpcId rawArgs srvInfo mInfo parsedCatch outerParams localNames
         if let some (_, predBody) := clauses.predict? then
           return ← liftPredictedAwait ctx actionParams liftRec ac predBody clauses.onConfirm? clauses.rollback? catchCases preStmts #[] rest
         let restArr := rest.toArray; let prep ← prepareAwaitCall ctx ac (restArr ++ catchCases)
@@ -364,26 +368,95 @@ private partial def liftAwaitStmts (ctx : RewriteCtx) (actionParams outerParams 
           let mkIfL (t : Array Syntax) (e : Syntax) := setStxArg (setStxArg st 6 (packSuite st t)) 7 e
           return (#[mkIfL tL eOpt], if tC?.isNone && eC?.isNone then none else some #[mkIfL (tC?.getD #[]) (packOptElse eC?)])
         else
-          let cRes ← (st.getArg 3).getArgs.mapM fun c => liftNode c 3 ((c.getArg 1).getSepArgs.flatMap collectQedPatIds)
+          let cRes ← (st.getArg 3).getArgs.mapM fun c =>
+            liftNode c 3 (collectCasePatIds (extractCasePatAlts (c.getArg 1)))
           let mkM (cs : Array Syntax) := setStxArg st 3 (Syntax.node (st.getArg 3).getHeadInfo (st.getArg 3).getKind cs)
           return (#[mkM (cRes.map (·.1))], if !cRes.any (·.2.2) then none else some #[mkM (cRes.map (·.2.1))])
       let (tail, tailCls?) ← go outerParams localNames (preStmts.push st) rest
       return (#[st] ++ tail, tailCls?.map (#[st] ++ ·))
   go outerParams localLetNames initPreStmts stmts.toList
 
-private def registerActionOrPort (spec : ComponentSpec) (baseCtx : RewriteCtx) (kindPrefix dupLabel conflictLabel : String)
-    (nameRef errRef : Syntax) (name : Name) (params : Array (Ident × Term)) (bodyStx : Syntax) (checkPlaceholders : Bool) : CommandElabM Unit := do
+private partial def collectDirectMutFnCalls (mutNames : Array Name) (stx : Syntax) : Array Name :=
+  let k := stx.getKind
+  if k == ``qedStmtExpr then
+    let u := unwrapParens1 (stx.getArg 0)
+    if u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent then
+      let cn := ((u.getArg 0).getArg 0).getId.eraseMacroScopes
+      if mutNames.contains cn then #[cn] else #[]
+    else #[]
+  else stx.getArgs.foldl (init := #[]) fun acc ch => (collectDirectMutFnCalls mutNames ch).foldl pushUnique acc
+
+private partial def checkAsyncFnCycles (fnMap : Std.HashMap Name CompFnDecl) (edges : Std.HashMap Name (Array Name))
+    (visiting visited : Std.HashSet Name) (cur : Name) : CommandElabM (Std.HashSet Name) := do
+  if visiting.contains cur then
+    let ref := (fnMap[cur]?.map (·.id.raw)).getD Syntax.missing
+    throwErrorAt ref s!"recursive `await` call cycle in component `fn {cur}`"
+  if visited.contains cur then return visited
+  let v1 := visiting.insert cur
+  let mut vis := visited
+  for nxt in edges[cur]?.getD #[] do
+    vis ← checkAsyncFnCycles fnMap edges v1 vis nxt
+  return vis.insert cur
+
+private partial def inlineAsyncMutFns (asyncMap : Std.HashMap Name CompFnDecl) (cntRef : IO.Ref Nat)
+    (fuel : Nat) (stmts : Array Syntax) : CommandElabM (Array Syntax) := do
+  if asyncMap.isEmpty then return stmts
+  let mapSuite (ref : Syntax) (s : Syntax) := packSuite ref <$> inlineAsyncMutFns asyncMap cntRef fuel (suiteStmts s)
+  let mapOptElse (eNode : Syntax) :=
+    if eNode.getNumArgs == 3 then setStxArg eNode 2 <$> mapSuite eNode (eNode.getArg 2) else pure eNode
+  let mut out : Array Syntax := #[]
+  for i in [0:stmts.size] do
+    let st := stmts[i]!; let k := st.getKind; let info := SourceInfo.fromRef st
+    if k == ``qedStmtExpr then
+      let u := unwrapParens1 (st.getArg 0)
+      if u.getKind == ``qedCall && (u.getArg 0).getKind == ``qedIdent then
+        let cn := ((u.getArg 0).getArg 0).getId.eraseMacroScopes
+        if let some mfn := asyncMap[cn]? then
+          if fuel == 0 then throwErrorAt st s!"`fn {cn}` expansion exceeded depth limit"
+          let rawArgs := (u.getArg 2).getSepArgs
+          if rawArgs.size != mfn.params.size then
+            throwErrorAt st s!"`{cn}(...)` expects {mfn.params.size} argument(s), got {rawArgs.size}"
+          for ra in rawArgs do
+            unless ra.getKind == ``qedCallArgPos do throwErrorAt ra s!"named arguments are not supported in `{cn}(...)`"
+          if i + 1 < stmts.size && mfn.stmts.any hasReturnStmt then
+            throwErrorAt st s!"cannot have trailing statements after calling async `fn {cn}` which uses `return`"
+          let callIdx ← cntRef.modifyGet fun n => (n, n + 1)
+          let mut argTmps : Array Ident := #[]
+          for j in [0:rawArgs.size] do
+            let tmpId := mkIdentFrom st (Name.mkSimple s!"_fnArg_{callIdx}_{j}")
+            argTmps := argTmps.push tmpId
+            out := out.push (mkTypedLetStmt info tmpId mfn.rawParamTys[j]? (rawArgs[j]!.getArg 0))
+          for j in [0:mfn.params.size] do
+            out := out.push (mkTypedLetStmt info mfn.params[j]!.1 mfn.rawParamTys[j]? (Syntax.node info ``qedIdent #[argTmps[j]!.raw]))
+          out := out ++ (← inlineAsyncMutFns asyncMap cntRef (fuel - 1) mfn.stmts)
+          continue
+      out := out.push st
+    else if k == ``qedStmtIf then
+      let els' ← (st.getArg 4).getArgs.mapM fun el => setStxArg el 3 <$> mapSuite el (el.getArg 3)
+      out := out.push (setStxArg (setStxArg (setStxArg st 3 (← mapSuite st (st.getArg 3))) 4 (Syntax.node info nullKind els')) 5 (← mapOptElse (st.getArg 5)))
+    else if k == ``qedStmtIfLet then
+      out := out.push (setStxArg (setStxArg st 6 (← mapSuite st (st.getArg 6))) 7 (← mapOptElse (st.getArg 7)))
+    else if k == ``qedStmtMatch then
+      let cs' ← (st.getArg 3).getArgs.mapM fun c => setStxArg c 3 <$> mapSuite c (c.getArg 3)
+      out := out.push (setStxArg st 3 (Syntax.node (st.getArg 3).getHeadInfo (st.getArg 3).getKind cs'))
+    else out := out.push st
+  return out
+
+private def registerActionOrPort (spec : ComponentSpec) (baseCtx : RewriteCtx) (asyncMap : Std.HashMap Name CompFnDecl) (cntRef : IO.Ref Nat)
+    (kindPrefix dupLabel conflictLabel : String) (nameRef errRef : Syntax) (name : Name)
+    (params : Array (Ident × Term)) (bodyStx : Syntax) (checkPlaceholders : Bool) : CommandElabM Unit := do
   if (← baseCtx.accum.get).sites.any (·.ctor == name) then throwErrorAt nameRef s!"duplicate {dupLabel} name `{name}`"
   if spec.collections.any (·.1.getId == name) then throwErrorAt nameRef s!"{conflictLabel} name `{name}` conflicts with `collection {name}`"
-  let (stmts, dispCls?) ← liftAwaitStmts baseCtx params params #[] (suiteStmts (← rewriteIn baseCtx false bodyStx))
+  let expanded ← inlineAsyncMutFns asyncMap cntRef 32 (suiteStmts (← rewriteIn baseCtx false bodyStx))
+  let (stmts, dispCls?) ← liftAwaitStmts baseCtx params params #[] expanded
   if let some dispStmts := dispCls? then pushSpecDisp baseCtx name params dispStmts
-  let mut dummyAssigns : Array (Name × Option Term) := #[]
+  let mut dummyAssigns : Array SiteAssign := #[]
   if checkPlaceholders then
     for s in stmts do
       if s.getKind == ``qedStmtAssign && (s.getArg 0).getKind == ``qedIdent && atomStr (s.getArg 1) == "=" && isPlaceholder (s.getArg 2) then
         dummyAssigns ← pushHandlerAssign baseCtx dummyAssigns ((s.getArg 0).getArg 0) none
     if !params.isEmpty && !dummyAssigns.isEmpty then
-      throwErrorAt errRef s!"action `{name}` declares explicit parameter(s) and cannot use the `_` placeholder; assign explicitly (e.g. `{dummyAssigns[0]!.1} = {params[0]!.1.getId}`)"
+      throwErrorAt errRef s!"action `{name}` declares explicit parameter(s) and cannot use the `_` placeholder; assign explicitly (e.g. `{dummyAssigns[0]!.field} = {params[0]!.1.getId}`)"
   pushSite baseCtx kindPrefix name params stmts dummyAssigns
 
 structure RewriteResult where mk ::
@@ -399,34 +472,63 @@ private def checkCompParams (spec : ComponentSpec) (kindLabel : String) (ownerNa
 
 def collectSitesAndRewriteStateful (spec : ComponentSpec) : CommandElabM RewriteResult := do
   let baseCtx ← mkRewriteCtx spec false
-  let mut rwFns : Array CompFnDecl := #[]
+  let mut allRwFns : Array CompFnDecl := #[]
   for f in spec.fns do
     checkCompParams spec "fn" f.id.getId f.params
     let stmts' ← f.stmts.mapM (rewriteIn baseCtx false)
-    if stmts'.any stmtContainsAwait then
-      throwErrorAt f.id s!"cannot use `await` inside component `fn {f.id.getId}`; perform `await` in the calling `action` and pass the result to `{f.id.getId}`"
-    rwFns := rwFns.push { f with stmts := stmts' }
+    if f.isPure && stmts'.any stmtContainsAwait then
+      throwErrorAt f.id s!"cannot use `await` inside pure component `fn {f.id.getId}`; remove `-> ReturnType` for an async mutating helper, or perform `await` in the calling `action`"
+    allRwFns := allRwFns.push { f with stmts := stmts' }
+  let mutFnNames := (allRwFns.filter CompFnDecl.isMut).map (·.id.getId.eraseMacroScopes)
+  let mut fnMap : Std.HashMap Name CompFnDecl := {}
+  let mut edges : Std.HashMap Name (Array Name) := {}
+  let mut asyncMap : Std.HashMap Name CompFnDecl := {}
+  for f in allRwFns do
+    if f.isMut then
+      let nm := f.id.getId.eraseMacroScopes
+      fnMap := fnMap.insert nm f
+      let callees := f.stmts.foldl (init := #[]) fun acc s => (collectDirectMutFnCalls mutFnNames s).foldl pushUnique acc
+      edges := edges.insert nm callees
+      if f.stmts.any stmtContainsAwait then asyncMap := asyncMap.insert nm f
+  let mut changed := true
+  while changed do
+    changed := false
+    for nm in mutFnNames do
+      if !asyncMap.contains nm && (edges[nm]?.getD #[]).any asyncMap.contains then
+        if let some f := fnMap[nm]? then asyncMap := asyncMap.insert nm f; changed := true
+  let mut visited : Std.HashSet Name := {}
+  for nm in mutFnNames do
+    if asyncMap.contains nm then visited ← checkAsyncFnCycles fnMap edges {} visited nm
+  let rwFns := allRwFns.filter fun f => !(f.isMut && asyncMap.contains f.id.getId.eraseMacroScopes)
+  let cntRef ← IO.mkRef 0
   for a in spec.actions do
     let name := (a.getArg 1).getId; let params ← parseParamList (a.getArg 2)
     checkCompParams spec "action" name params
-    registerActionOrPort spec baseCtx "action" "action" "action" (a.getArg 1) a name params (a.getArg 4) true
+    registerActionOrPort spec baseCtx asyncMap cntRef "action" "action" "action" (a.getArg 1) a name params (a.getArg 4) true
   for p in spec.portIns do
     if spec.allNames.contains p.argId.getId then throwErrorAt p.argId s!"port parameter `{p.argId.getId}` on `port {p.id.getId}` shadows a component field; rename the parameter"
-    registerActionOrPort spec baseCtx "port" "port/action" "port" p.id p.id p.id.getId #[(p.argId, p.argTy)] p.body false
+    registerActionOrPort spec baseCtx asyncMap cntRef "port" "port/action" "port" p.id p.id p.id.getId #[(p.argId, p.argTy)] p.body false
   let route'? ← spec.route?.mapM fun rd => do
     let (rParamId, rParams) := (mkIdent `_r, #[(mkIdent `_r, rd.ty)])
     let rFieldAssign := Syntax.node .none ``qedStmtAssign #[Syntax.node .none ``qedIdent #[rd.field.raw], Syntax.atom .none "=", Syntax.node .none ``qedIdent #[rParamId.raw], Syntax.node .none nullKind #[]]
     let altPairs ← rd.alts.mapM fun alt => do
-      let (lifted, altC?) ← liftAwaitStmts baseCtx rParams #[] ((alt.getArg 1).getSepArgs.flatMap collectQedPatIds) (suiteStmts (← rewriteIn baseCtx false (alt.getArg 3))) (initPreStmts := #[rFieldAssign])
+      let expanded ← inlineAsyncMutFns asyncMap cntRef 32 (suiteStmts (← rewriteIn baseCtx false (alt.getArg 3)))
+      let (lifted, altC?) ← liftAwaitStmts baseCtx rParams #[] (collectCasePatIds (extractCasePatAlts (alt.getArg 1))) expanded (initPreStmts := #[rFieldAssign])
       pure (setStxArg alt 3 (packSuite alt lifted), alt, altC?)
     if altPairs.any (·.2.2.isSome) then
       pushSpecDisp baseCtx `_onRoute rParams #[rFieldAssign, mkMatchStx rd.field rParamId (altPairs.map fun (_, alt, ac?) => setStxArg alt 3 (packSuite alt (ac?.getD #[])))]
     pure { rd with alts := altPairs.map (·.1) }
+  let rwSubBranch (ss : Array Syntax) : CommandElabM (Array Syntax) := do
+    let ss' ← ss.mapM (rewriteIn baseCtx false)
+    for s in ss' do
+      if let some bad := (collectDirectMutFnCalls mutFnNames s).find? asyncMap.contains then
+        throwErrorAt s s!"cannot call async `fn {bad}` inside a `subscribe` handler"
+    return ss'
   let rwSubs ← spec.subscriptions.mapM fun sub => do
-    let onJoin'? ← sub.onJoin?.mapM fun (b?, ss) => return (b?, ← ss.mapM (rewriteIn baseCtx false))
-    let onMsg'? ← sub.onMsg?.mapM fun (b, ss) => return (b, ← ss.mapM (rewriteIn baseCtx false))
-    let onStatus'? ← sub.onStatus?.mapM fun (b, ss) => return (b, ← ss.mapM (rewriteIn baseCtx false))
-    return { sub with onJoin? := onJoin'?, onMsg? := onMsg'?, onStatus? := onStatus'? }
+    return { sub with
+      onJoin? := ← sub.onJoin?.mapM fun (b?, ss) => return (b?, ← rwSubBranch ss)
+      onMsg? := ← sub.onMsg?.mapM fun (b, ss) => return (b, ← rwSubBranch ss)
+      onStatus? := ← sub.onStatus?.mapM fun (b, ss) => return (b, ← rwSubBranch ss) }
   for q in spec.queries do recordUsedRpc baseCtx.accum q.rpc.srvInfo.shortName q.rpc.mInfo.name
   let starts ← spec.starts.mapM fun st => do lowerCompExpr .val (← rewriteIn { baseCtx with inPerform := true } false st)
   let body ← lowerCompExpr .val (← rewriteIn { baseCtx with allowHoist := true, wrapMsg? := if spec.hasSlotsOrKids then some (mkIdent `_wrap) else none } false spec.body)

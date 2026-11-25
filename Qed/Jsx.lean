@@ -122,6 +122,7 @@ private partial def isListJsxExpr (stx : Syntax) : Bool :=
   else if k == ``Qed.Lang.qedParen then (stx.getArg 1).getSepArgs.size == 1 && isListJsxExpr (stx.getArg 1).getSepArgs[0]!
   else if k == ``Qed.Lang.qedIdent then (stx.getArg 0).getId.eraseMacroScopes == `children
   else if k == ``Qed.Lang.qedTernary then optElse 0 3
+  else if k == ``Qed.Lang.qedExprLet then isListJsxExpr (stx.getArg 6)
   else if k == ``Qed.Lang.qedExprIf then optElse 3 4
   else if k == ``Qed.Lang.qedExprIfLet then optElse 6 7
   else if k == ``Qed.Lang.qedExprMatch then (stx.getArg 3).getArgs.any fun c => isListJsxExpr (c.getArg 3)

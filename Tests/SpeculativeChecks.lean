@@ -10,21 +10,21 @@ schema SpecBook:
 server StoreSrv:
   state stock : Nat = 10
   invariant maxStock: stock <= 10000
-  def placeOrder(qty: Nat) -> Nat!:
+  rpc placeOrder(qty: Nat) -> Nat!:
     requires ctx.userId != none, 1 <= qty <= 10
     ensures result <= 10000
     if stock < qty: return fail(.outOfStock)
     stock -= qty
     return stock
-  def claim(id: Nat) -> Nat!:
+  rpc claim(id: Nat) -> Nat!:
     ensures result <= 100
     if id == 0: return fail(.locked)
     if id == 99: return 2
     return 1
-  def fetchItems() -> Nat[]: return [10, 20]
+  rpc fetchItems() -> Nat[]: return [10, 20]
 server CatalogSrv:
   state books : SpecBook[] = [SpecBook(slot=0, title="Lean 4", stock=10), SpecBook(slot=1, title="Qed", stock=5)]
-  def order(idx: Nat, qty: Nat) -> SpecBook!:
+  rpc order(idx: Nat, qty: Nat) -> SpecBook!:
     requires ctx.userId != none, 1 <= qty <= 10
     ensures result.slot == idx, result.stock < 10000
     if idx >= books.size: return fail(.notFound)
@@ -87,7 +87,7 @@ bad_spec_act "`predict:` computes a predicted server response and cannot mutate 
         case _: pass
     remaining = rem
 bad_srv1 "`predict`, `on_confirm`, and `rollback` are only supported on client `component` `await` calls, not in `server` functions" BadServerPredict :
-  def f() -> Nat:
+  rpc f() -> Nat:
     let x = 1 predict 1
     return x
 bad_spec_act "`await StoreSrv.placeOrder(...)` has unhandled domain error(s): .outOfStock" BadPredictUnhandledDomainErr :

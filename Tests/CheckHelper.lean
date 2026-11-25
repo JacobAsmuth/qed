@@ -50,7 +50,7 @@ macro "bad_db1 " msg:str dbNm:ident fn:ident "(" p:ident ":" pt:qedType ")" " ->
   `(expect_err $msg in
     server $nm:ident:
       use $d:ident : $dbNm:ident
-      def $fn:ident($p:ident : $pt:qedType) -> $ret:qedType:
+      rpc $fn:ident($p:ident : $pt:qedType) -> $ret:qedType:
         requires ($ctx:ident).userId != $noneI:ident
         $body:qedStmt)
 macro "bad_srv1 " msg:str nm:ident " : " fn:srvClause : command => `(expect_err $msg in

@@ -414,9 +414,9 @@ partial def lowerPureFnStmts (fnDesc : String) (stmts : List Syntax)
       else if sk == ``qedStmtMatch then
         let scruts ← (s.getArg 1).getSepArgs.mapM lowerVal
         let alts ← (s.getArg 3).getArgs.mapM fun alt => do
-          let pats ← (alt.getArg 1).getSepArgs.mapM fun p => liftMacroM (lowerQedPat p)
+          let altTerms ← liftMacroM (lowerCasePatAlts (alt.getArg 1))
           let body ← lowerPureFnStmts fnDesc ((suiteStmts (alt.getArg 3)).toList ++ rest) lowerVal lowerGuard
-          `(Lean.Parser.Term.matchAltExpr| | $[$pats:term],* => $body)
+          mkMatchAltFromAlts altTerms body
         `(match $[$scruts:term],* with $[$alts:matchAlt]*)
       else
         let sn := stxSnippet s

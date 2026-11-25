@@ -95,6 +95,7 @@ private abbrev pTypeMods : Parser := many (categoryParser `qedTypeMod 0)
 @[qedType_parser] def qedTypeDict  : Parser := leading_parser:maxPrec atomic ("{" >> pType >> ":") >> pType >> "}" >> pTypeMods
 @[qedType_parser] def qedTypeParen : Parser := leading_parser:maxPrec "(" >> sepBy1 pType "," >> ")" >> pTypeMods
 @[qedType_parser] def qedTypeAtom  : Parser := leading_parser:maxPrec ident >> pTypeMods
+@[qedType_parser] def qedTypeNum   : Parser := leading_parser:maxPrec numLit
 @[qedType_parser 90] def qedTypeApp   : TrailingParser := trailing_parser:90 checkLineEq >> pType 91
 @[qedType_parser 25] def qedTypeArrow : TrailingParser := trailing_parser:25 symbol "->" >> pType 25
 
@@ -113,7 +114,9 @@ private abbrev pPatArgsOpt : Parser := optional (checkNoWsBefore "" >> "(" >> se
 
 def qedRecField  : Parser := node `Qed.Lang.recField  (atomic (ident >> "=") >> pExpr)
 def qedDictEntry : Parser := node `Qed.Lang.dictEntry (pExpr >> ":" >> pExpr)
-def qedExprCase  : Parser := leading_parser withPosition (atomic (kw "case") >> sepBy1 pPat "," >> ":" >> pExpr)
+def qedPatAlt    : Parser := node `Qed.Lang.qedPatAlt (sepBy1 pPat ",")
+def qedCasePats  : Parser := sepBy1 qedPatAlt "|"
+def qedExprCase  : Parser := leading_parser withPosition (atomic (kw "case") >> qedCasePats >> ":" >> pExpr)
 def qedLamParam  : Parser := node `Qed.Lang.lamParam  (qedBinder >> optional (":" >> pType))
 
 private def notReservedExprKw : Parser := notFollowedBy (
@@ -168,6 +171,7 @@ def qedCmpLink : Parser := node `Qed.Lang.cmpLink (qedCmpOp >> pExpr 55)
 @[qedExpr_parser 15] def qedAnyIn   : Parser := leading_parser:15 atomic (kw "any" >> ident >> symbol "in") >> pExpr 55 >> ":" >> pExpr 15
 @[qedExpr_parser 15] def qedAllVars : Parser := leading_parser:15 atomic (kw "all" >> sepBy1 ident "," >> ":") >> pExpr 15
 
+@[qedExpr_parser 10] def qedExprLet   : Parser := leading_parser:10 withPosition (symbol "let" >> qedBinder >> optional (":" >> pType) >> "=" >> pExpr >> ";" >> pExpr)
 @[qedExpr_parser 10] def qedExprIfLet : Parser := leading_parser:10 withPosition (atomic (symbol "if" >> symbol "let") >> pPat >> "=" >> pExpr >> ":" >> pExpr >> optional (atomic (checkColGe >> symbol "else" >> ":") >> pExpr))
 @[qedExpr_parser 10] def qedExprIf    : Parser := leading_parser:10 withPosition (symbol "if" >> notFollowedBy (symbol "let") "let" >> pExpr >> ":" >> pExpr >> optional (atomic (checkColGe >> symbol "else" >> ":") >> pExpr))
 @[qedExpr_parser 10] def qedExprFor   : Parser := leading_parser:10 withPosition (atomic (symbol "for" >> pPat >> symbol "in") >> pExpr >> ":" >> pExpr)
@@ -176,7 +180,7 @@ def qedCmpLink : Parser := node `Qed.Lang.cmpLink (qedCmpOp >> pExpr 55)
 def qedSuite : Parser := node `Qed.Lang.suite (
   (checkLineEq >> sepBy1 (categoryParser `qedStmt 0) ";") <|>
   (checkColGt "expected indented block" >> withPosition (many1 (checkColEq "expected aligned statement" >> categoryParser `qedStmt 0))))
-def qedStmtCase        : Parser := leading_parser withPosition (atomic (kw "case") >> sepBy1 pPat "," >> ":" >> qedSuite)
+def qedStmtCase        : Parser := leading_parser withPosition (atomic (kw "case") >> qedCasePats >> ":" >> qedSuite)
 def qedElifClause      : Parser := node `Qed.Lang.elifClause      (atomic (checkColEq >> kw "elif") >> pExpr >> ":" >> qedSuite)
 def qedCatchArms       : Parser := node `Qed.Lang.catchArms       (":" >> many1 (checkColGt >> qedStmtCase))
 def qedCatchSingle     : Parser := node `Qed.Lang.catchSingle     (qedBinder >> ":" >> qedSuite)
@@ -258,11 +262,39 @@ partial def collectQedPatIds (stx : Syntax) : Array Name :=
   else if k == ``qedPatDot && (stx.getArg 2).getNumArgs == 3 then ((stx.getArg 2).getArg 1).getSepArgs.flatMap collectQedPatIds
   else if k == ``qedPatParen then (stx.getArg 1).getSepArgs.flatMap collectQedPatIds else #[]
 
+def extractCasePatAlts (patsNode : Syntax) : Array (Array Syntax) :=
+  let items := patsNode.getSepArgs
+  if items.any (·.getKind == `Qed.Lang.qedPatAlt) then
+    items.map fun alt => if alt.getKind == `Qed.Lang.qedPatAlt then (alt.getArg 0).getSepArgs else #[alt]
+  else
+    #[items]
+
+def collectCasePatIds (altStxs : Array (Array Syntax)) : Array Name :=
+  altStxs.foldl (init := #[]) fun acc ps => acc ++ ps.flatMap collectQedPatIds
+
+@[noinline, nospecialize]
+def mkMatchAltFromAlts {m : Type → Type} [Monad m] [MonadQuotation m]
+    (altPatTerms : Array (Array Term)) (rhs : Term) : m (TSyntax ``Lean.Parser.Term.matchAltExpr) := do
+  if h : altPatTerms.size = 1 then
+    let ps := altPatTerms[0]
+    `(Lean.Parser.Term.matchAltExpr| | $[$ps:term],* => $rhs)
+  else
+    let groups : Array Syntax ← altPatTerms.mapM fun ps => do
+      let a ← `(Lean.Parser.Term.matchAltExpr| | $[$ps:term],* => $rhs)
+      pure ((a.raw.getArg 1).getArg 0)
+    let mut sepArgs : Array Syntax := #[]
+    for (g, i) in groups.zipIdx do
+      if i > 0 then sepArgs := sepArgs.push (Syntax.atom .none "|")
+      sepArgs := sepArgs.push g
+    let base ← `(Lean.Parser.Term.matchAltExpr| | _ => $rhs)
+    return ⟨base.raw.setArg 1 (Syntax.node .none nullKind sepArgs)⟩
+
 partial def stxMentionsVar (v : String) (stx : Syntax) : Bool :=
   let k := stx.getKind; let isB (b : Syntax) := b.isIdent && b.getId.eraseMacroScopes.toString == v
   if k == ``qedIdent then match (stx.getArg 0).getId.eraseMacroScopes.components with | root :: _ => root.toString == v | [] => false
   else if k == ``qedLam1 then !isB (stx.getArg 0) && stxMentionsVar v (stx.getArg 2)
   else if k == ``qedLamN then !(stx.getArg 1).getSepArgs.any (fun p => isB (p.getArg 0)) && stxMentionsVar v (stx.getArg 4)
+  else if k == ``qedExprLet then stxMentionsVar v (stx.getArg 4) || (!isB (stx.getArg 1) && stxMentionsVar v (stx.getArg 6))
   else if k == ``qedExprFor then stxMentionsVar v (stx.getArg 3) || (!(collectQedPatIds (stx.getArg 1)).any (·.toString == v) && stxMentionsVar v (stx.getArg 5))
   else stx.getArgs.any (stxMentionsVar v)
 
@@ -364,12 +396,13 @@ partial def lowerQedTypeInfo (stx : Syntax) (allowFallible := false) (allowHighe
       let ls ← (s.getArg 1).getSepArgs.mapM fun p => return (← go p false (some "fallible `!` modifier cannot appear inside a tuple type")).term
       finishMods (← buildProdType ls) (← parseMods (s.getArg 3)) `Prod
     else if k == ``qedTypeAtom then let (baseId, initMods) ← splitIdentMods ⟨s.getArg 0⟩; finishMods (resolveBaseTypeTerm baseId) (initMods ++ (← parseMods (s.getArg 1))) baseId.getId.eraseMacroScopes
+    else if k == ``qedTypeNum then return { term := ⟨s.getArg 0⟩ }
     else if k == ``qedTypeApp || k == ``qedTypeArrow then
       if k == ``qedTypeApp && (s.getArg 0).getKind == ``qedTypeAtom && ((s.getArg 0).getArg 1).getArgs.isEmpty then
         let fnName := ((s.getArg 0).getArg 0).getId.eraseMacroScopes; let argStr := let sn := stxSnippet (s.getArg 1); if sn.isEmpty then "T" else sn
         if fnName == `Array || fnName == `Option then Macro.throwErrorAt s s!"use `{argStr}{if fnName == `Array then "[]" else "?"}` instead of `{fnName} {argStr}`"
         if allowHigherOrder && fnName == `jsonOnly then Macro.throwErrorAt s s!"use `jsonOnly({argStr})` with parentheses instead of `jsonOnly {argStr}`"
-      if !allowHigherOrder then return ← mkInvalidErr s
+      if k == ``qedTypeArrow && !allowHigherOrder then return ← mkInvalidErr s
       let (l, r) := ((← go (s.getArg 0) false none).term, (← go (s.getArg (if k == ``qedTypeApp then 1 else 2)) false none).term)
       return { term := ← if k == ``qedTypeApp then `($l $r) else `($l → $r) }
     else mkInvalidErr s
@@ -400,6 +433,9 @@ partial def lowerQedPat (stx : Syntax) : MacroM Term := do
     let argsNode := stx.getArg (if k == ``qedPatDot then 2 else 1)
     if argsNode.getNumArgs == 3 then `($headT $(← (argsNode.getArg 1).getSepArgs.mapM lowerQedPat)*) else return headT
   else let sn := stxSnippet stx; Macro.throwErrorAt stx s!"unsupported pattern{if sn.isEmpty then "" else s!" `{sn}`"}; expected `_`, a literal, an identifier, `.ctor(a, b)`, or a tuple `(a, b)`"
+
+def lowerCasePatAlts (patsNode : Syntax) : MacroM (Array (Array Term)) :=
+  (extractCasePatAlts patsNode).mapM (·.mapM lowerQedPat)
 
 /-! ## Unified Expression Lowering (`ExprMode`, `lowerQedExpr`, `lowerSimpleQedExpr`) -/
 
@@ -576,6 +612,15 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m] (hooks
         let vIds : Array Ident := (stx.getArg 1).getSepArgs.map (⟨·⟩)
         let bodyT ← hooks.withLocals (vIds.map (·.getId.toString)) (go mode (stx.getArg 3))
         vIds.foldrM (init := bodyT) fun vid acc => `(∀ $vid:ident, $acc)
+      | "qedExprLet" =>
+        let bStx := stx.getArg 1; let valT ← go .val (stx.getArg 4); let optTy := stx.getArg 2
+        let bodyLocals := if bStx.isIdent then #[bStx.getId.eraseMacroScopes.toString] else #[]
+        let bodyT ← hooks.withLocals bodyLocals (go mode (stx.getArg 6))
+        if bStx.isIdent then
+          let bId : Ident := ⟨bStx⟩
+          if optTy.getNumArgs == 2 then `(let $bId:ident : $(← hooks.lowerType (optTy.getArg 1)) := $valT; $bodyT)
+          else `(let $bId:ident := $valT; $bodyT)
+        else `(let _ := $valT; $bodyT)
       | "qedExprIfLet" =>
         let (patT, scrutT, thenT) := (← hooks.lowerPat (stx.getArg 2), ← go .val (stx.getArg 4), ← go mode (stx.getArg 6))
         let elseT ← lowerOptElse stx (stx.getArg 7) (stx.getArg 6) thenT "`if let pat = expr: ...` expression requires `else:` here"
@@ -583,7 +628,10 @@ partial def lowerQedExpr {m : Type → Type} [Monad m] [MonadQuotation m] (hooks
       | "qedExprMatch" =>
         let scruts ← (stx.getArg 1).getSepArgs.mapM (go .val)
         let alts ← (stx.getArg 3).getArgs.mapM fun c => do
-          `(Lean.Parser.Term.matchAltExpr| | $[$(← (c.getArg 1).getSepArgs.mapM hooks.lowerPat):term],* => $(← go mode (c.getArg 3)))
+          let altStxs := extractCasePatAlts (c.getArg 1)
+          let altTerms ← altStxs.mapM (·.mapM hooks.lowerPat)
+          let rhs ← hooks.withLocals ((collectCasePatIds altStxs).map (·.toString)) (go mode (c.getArg 3))
+          mkMatchAltFromAlts altTerms rhs
         `(match $[$scruts:term],* with $[$alts:matchAlt]*)
       | "qedExprFor" =>
         let (patStx, bodyStx) := (stx.getArg 1, stx.getArg 5); let xsT ← go .val (stx.getArg 3)

@@ -15,7 +15,7 @@ structure ComponentInfo where mk ::
   (fullName : Lean.Name) (kind : CompMountKind) (hasProps : Bool)
   (propNames slotNames bindNames : Array Lean.Name) (hasChildren : Bool) (events : Array CompEventSig)
   (hasOut hasEffects hasStart : Bool := false) (mountable : Bool := true) (hasLocalDef : Bool := false)
-  (hasQueries hasSubscriptions : Bool := false)
+  (hasQueries hasSubscriptions hasSession : Bool := false)
   (rootTag? : Option String) (usedRpcs usedChannels : Array (String × String) := #[])
 deriving Inhabited
 
@@ -89,7 +89,7 @@ def compHeadDirective : Parser :=
   compHeadDir1 `Qed.compHeadCanonical `canonical <|> compHeadDir1 `Qed.compHeadStatus `status <|>
   node `Qed.compHeadMeta (withPosition (atomic (symbol "meta") >> pExpr >> "," >> pExpr)) <|>
   node `Qed.compHeadRedirect (kwPos `redirect (pExpr >> optional ("," >> identEq `status >> "=" >> pExpr)))
-def compHeadCase   : Parser := node `Qed.compHeadCase (withPosition (atomic (kw "case") >> sepBy1 pPat "," >> ":" >> checkColGt "expected indented `head` directives" >> many1Indent compHeadDirective))
+def compHeadCase   : Parser := node `Qed.compHeadCase (withPosition (atomic (kw "case") >> qedCasePats >> ":" >> checkColGt "expected indented `head` directives" >> many1Indent compHeadDirective))
 def compHeadItem   : Parser := compHeadCase <|> compHeadDirective
 def compHeadClause : Parser := leading_parser withPosition (atomic (identEq `head >> ":") >> checkColGt "expected indented `head` directives" >> many1Indent compHeadItem)
 

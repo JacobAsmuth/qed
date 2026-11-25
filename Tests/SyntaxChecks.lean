@@ -389,8 +389,8 @@ component PythonicShowcase:
    (.exprBranches 3 (some 7), "pos:7"), (.exprBranches 0 none, "zero:none")].all (fun (m, want) => (upd m).label == want) &&
   (upd (.addTag "lean")).tags.size == 1 && (Html.render (PythonicShowcase.view PythonicShowcase.init)).contains "has-lean" &&
   Json.pathStr "{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}" "choices.0.delta.content" == "hi" && Json.pathStr "{\"choices\":[]}" "choices.0.delta.content" == ""
-bad_srv1 "`if cond: ...` expression requires `else:` here" BadExprIfNoElse : def go() -> Nat: return if true: 1
-bad_srv1 "`if let pat = expr: ...` expression requires `else:` here" BadExprIfLetNoElse : def go(opt: Nat?) -> Nat: return if let some(v) = opt: v
+bad_srv1 "`if cond: ...` expression requires `else:` here" BadExprIfNoElse : rpc go() -> Nat: return if true: 1
+bad_srv1 "`if let pat = expr: ...` expression requires `else:` here" BadExprIfLetNoElse : rpc go(opt: Nat?) -> Nat: return if let some(v) = opt: v
 expect_err "invalid HTML5 nesting: <div> is not allowed inside <p>" in def badElseBranchNesting : Html Unit := <p>{if true: <span>ok</span> else: <div>bad</div>}</p>
 
 -- ── Automated Quantified, Collection-Query, Nonlinear & Extended `for_each` Invariants ──
@@ -775,5 +775,226 @@ example : Type → Type := PureContentPage.Props
   rendered.contains "class=\"lang-select\"" && rendered.contains "data-qed-local=\"SyntaxChecks.KeyedTagPicker@tp\"" &&
   PureForwardHost.app.locals.any (·.id == "SyntaxChecks.KeyedTagPicker") &&
   s1.lang == "fr" && s2.lang == "en"
+
+/-! ## Track 2, 4 & 5: Session propagation, query controls, async component `fn`, nested struct mutation, or-patterns, JSX `let`, CSS dup check, `Qed.Str`/`Qed.Time` -/
+
+enum PolishTab:
+  overview
+  db         = "database"
+  deployLogs = "deploy-logs"
+
+enum PolishEvent:
+  deployStarted(id: String) = "deploy-started"
+  deployFailed(err: String) = "deploy-failed"
+
+field ShortSlug : String where s => 1 <= s.length <= 32
+field ServicePort : Nat where p => 1 <= p <= 65535
+field BoundedStr(maxLen: Nat) : String where s => 1 <= s.length <= maxLen
+
+schema ServiceFieldForm:
+  slug : ShortSlug
+  port : ServicePort
+  tag  : BoundedStr 16
+
+router PolishRoute:
+  home                              = "/"
+  account                           = "/account"
+  tokens                            = "/tokens"
+  item                              = "/items/:id"
+  appTab(slug: ShortSlug, tab: PolishTab) = "/apps/:slug/:tab"
+  report(day: Date)                 = "/reports/:day"
+
+structure NestedFilter where
+  page   : Nat := 0
+  search : String := ""
+  tags   : Array String := #[]
+deriving Inhabited, DecidableEq, Repr
+
+instance : ToJson NestedFilter where
+  toJson f := .obj [("page", toJson f.page), ("search", toJson f.search), ("tags", toJson f.tags)]
+instance : FromJson NestedFilter where
+  fromJson j := do
+    return { page := ← FromJsonField.fromField j "page", search := ← FromJsonField.fromField j "search", tags := ← FromJsonField.fromField j "tags" }
+
+server PolishRpcSrv:
+  rpc listItems(q: String) -> String[]!:
+    return [q, "item-a"]
+  rpc saveItem(name: String) -> String!:
+    if name == "": return fail(.badInput, "empty")
+    return f"saved:{name}"
+
+component SessionChildPanel:
+  session user
+  prop tab : String = "main"
+  state clicks : Nat = 0
+  action inc: clicks += 1
+  view: <div class="sess-child">{user.getD("anon")}:{tab}:{clicks}</div>
+
+component SessionParentShell:
+  route current : PolishRoute = .home:
+    case .account | .tokens:
+      visits += 1
+    case _:
+      pass
+  state visits : Nat = 0
+  state flt : NestedFilter = { page = 0, search = "", tags = ["a"] }
+  state lastSaved : String = ""
+  query items = PolishRpcSrv.listItems(flt.search)
+  head:
+    title "Polish App"
+    canonical f"https://qed.cloud{current}"
+    case .account | .tokens:
+      title "Settings"
+      redirect PolishRoute.home, status = 301
+    case _:
+      title "Home"
+      canonical PolishRoute.home
+  fn doSave(label: String):
+    let res = await PolishRpcSrv.saveItem(label) catch:
+      case .badInput(e) | .failed(e):
+        lastSaved = f"err:{e}"
+    lastSaved = f"{label}->{res}"
+    items.refetch()
+  action saveCurrent:
+    doSave(flt.search)
+  action bumpNested:
+    flt.page += 1
+    flt.tags.push("b")
+    flt.tags[0] = "z"
+  action refreshItems:
+    items.invalidate()
+  action optimisticAdd(x: String):
+    items.update(xs => xs.push(x))
+  action replaceItems(xs: String[]):
+    items.set(xs)
+  view:
+    <main>
+      <input bind={flt.search}/>
+      <button onClick={flt.page = 0}>Reset Page</button>
+      <button onClick={items.refetch()}>Refetch</button>
+      <SessionChildPanel key={match current: case .account | .tokens: "settings" case _: "other"} tab={match current: case .account | .tokens: "settings" case _: "main"}/>
+      {let trimmed = Qed.Str.trim(flt.search); let ts = Qed.Time.formatIsoUtc(0); <p class="let-view">{trimmed}|{ts}</p>}
+      <ul>{let xs = flt.tags; for t in xs: <li>{t}</li>}</ul>
+    </main>
+
+style spliceBaseBtn:
+  padding: 4px 8px
+style spliceActiveBtn:
+  background-color: #2563eb
+
+component MultiStyleSpliceDemo:
+  state active : Bool = false
+  action toggle: active = not active
+  view: <button {spliceBaseBtn} {spliceActiveBtn if active} onClick={.toggle}>Go</button>
+
+expect_err "duplicate CSS property `padding` in the same style block" in
+style BadDupCssProp:
+  padding: 4px
+  padding: 8px
+
+expect_err "recursive `await` call cycle in component `fn ping`" in
+component BadAsyncCycleComp:
+  state x : String = ""
+  fn ping():
+    let _r = await PolishRpcSrv.saveItem("a") catch:
+      case _: pass
+    pong()
+  fn pong():
+    ping()
+  action go: ping()
+  view: <span>{x}</span>
+
+expect_err "cannot use `await` inside pure component `fn pureBad`; remove `-> ReturnType` for an async mutating helper, or perform `await` in the calling `action`" in
+component BadPureAwaitComp:
+  state x : String = ""
+  fn pureBad() -> String:
+    let r = await PolishRpcSrv.saveItem("a")
+    return r
+  view: <span>{x}</span>
+
+expect_err "duplicate wire name `dup` in `enum BadDupWireEnum`" in
+enum BadDupWireEnum:
+  a = "dup"
+  b = "dup"
+
+expect_err "Field `BadImpossibleField` is unsatisfiable" in
+field BadImpossibleField : Nat where n => n > 10, n < 5
+
+example := @ShortSlug.satisfiable
+example := @ServicePort.satisfiable
+example := @SessionParentShell.app_view_eq
+example := @MultiStyleSpliceDemo.app_view_eq
+
+#guard
+  let s0 := SessionParentShell.init
+  let (s1, _) := SessionParentShell.update s0 (._onSession (some "alice"))
+  let (s2, _) := SessionParentShell.update s1 (._onRoute .account)
+  let (s3, _) := SessionParentShell.update s2 (._onRoute .tokens)
+  let (s4, _) := SessionParentShell.update s3 (._onRoute .home)
+  let (s5, _) := SessionParentShell.update s4 .bumpNested
+  let (s6, _) := SessionParentShell.update s5 (.replaceItems #["one"])
+  let (s7, _) := SessionParentShell.update s6 (.optimisticAdd "two")
+  let (_, cRef) := SessionParentShell.update s7 .refreshItems
+  let rOff := Html.render (MultiStyleSpliceDemo.view MultiStyleSpliceDemo.init)
+  let rOn  := Html.render (MultiStyleSpliceDemo.view { active := true })
+  let c0 : Cached Nat := ({} : Cached Nat).setKey "k" 10
+  let c1 := c0.updateCurrent "k" (· + 5)
+  let c2 := c1.map (· * 2)
+  let c3 := c2.invalidateKey "k"
+  s1._sub_0.user == some "alice" &&
+  s2.visits == 1 && s2._sub_0.user == some "alice" &&
+  s3.visits == 2 && s3._sub_0.user == some "alice" &&
+  s4._sub_0.user == some "alice" &&
+  s5.flt.page == 1 && s5.flt.tags == #["z", "b"] &&
+  s6.items.getD #[] == #["one"] && s6.items.isOk &&
+  s7.items.getD #[] == #["one", "two"] &&
+  (match cRef with | .none => false | _ => true) &&
+  (SessionParentShell.headInfo s2).1.title == some "Settings" &&
+  (SessionParentShell.headInfo s2).1.canonical == some "https://qed.cloud/account" &&
+  (SessionParentShell.headInfo s2).1.redirect == some "/" &&
+  (SessionParentShell.headInfo s2).2 == 301 &&
+  (SessionParentShell.headInfo s4).1.title == some "Home" &&
+  (SessionParentShell.headInfo s4).1.canonical == some "/" &&
+  (PolishRoute.item "42").toPath == "/items/42" &&
+  PolishRoute.fromPath "/items/42" == some (.item "42") &&
+  toString (PolishRoute.item "42") == "/items/42" &&
+  (PolishRoute.appTab (ShortSlug.make "my-app") .deployLogs).toPath == "/apps/my-app/deploy-logs" &&
+  PolishRoute.fromPath "/apps/my-app/database" == some (.appTab (ShortSlug.make "my-app") .db) &&
+  ShortSlug.parse? "" == none &&
+  ShortSlug.parse? "ok" == some (ShortSlug.make "ok") &&
+  (match ShortSlug.parse "" with | .error _ => true | .ok _ => false) &&
+  (ServicePort.make 8080).val == 8080 &&
+  ServicePort.parse? 0 == none &&
+  (BoundedStr.make 16 "hello").val == "hello" &&
+  BoundedStr.parse? 4 "too-long" == none &&
+  (ServiceFieldForm.parse { slug := "api", port := "8080", tag := "v1" }).isSome &&
+  (ServiceFieldForm.parse { slug := "", port := "8080", tag := "v1" }).isNone &&
+  (ServiceFieldForm.parse { slug := "api", port := "70000", tag := "v1" }).isNone &&
+  (Html.render (ServiceFieldForm.formView { slug := "api", port := "8080", tag := "v1" } id (fun _ => ServiceFieldForm.Draft.empty))).contains "type=\"number\"" &&
+  (match Date.mk? 2026 11 25 with
+   | some d => (PolishRoute.report d).toPath == "/reports/2026-11-25" && PolishRoute.fromPath "/reports/2026-11-25" == some (.report d)
+   | none => false) &&
+  (match Date.mk? (-44) 3 15 with
+   | some d => d.toString == "-0044-03-15" && Date.parse? d.toString == some d
+   | none => false) &&
+  LawfulKey.toKey PolishTab.deployLogs == "deploy-logs" &&
+  LawfulKey.toKey (ShortSlug.make "my-app") == "my-app" &&
+  (PolishEvent.encode (.deployStarted "r1")).contains "\"deploy-started\"" &&
+  (match PolishEvent.decode (PolishEvent.encode (.deployFailed "oom")) with | .ok (.deployFailed "oom") => true | _ => false) &&
+  rOff.contains spliceBaseBtn.className && !rOff.contains spliceActiveBtn.className &&
+  rOn.contains spliceBaseBtn.className && rOn.contains spliceActiveBtn.className &&
+  c0.getD 0 == 10 && c1.getD 0 == 15 && c2.getD 0 == 30 && !c3.isOk &&
+  Qed.Str.trim "  hi\t\n " == "hi" &&
+  Qed.Str.containsCI "Hello Qed" "qed" &&
+  Qed.Str.startsWith "foobar" "foo" && Qed.Str.endsWith "foobar" "bar" &&
+  Qed.Str.split "a::b::c" "::" == ["a", "b", "c"] &&
+  Qed.Str.replace "a-b-c" "-" "_" == "a_b_c" &&
+  Qed.Str.truncate "abcdef" 5 == "ab..." &&
+  Qed.Str.parseNat? "42" == some 42 && Qed.Str.parseInt? "-7" == some (-7) &&
+  Qed.Time.formatIsoUtc 0 == "1970-01-01T00:00:00Z" &&
+  Qed.Time.formatDateUtc (11016 * 86400) == "2000-02-29" &&
+  Qed.Time.formatUtc 1700000000 == "2023-11-14 22:13 UTC" &&
+  Qed.Time.formatDuration 125 == "2m 5s" &&
+  Qed.Time.formatRelative 1000 700 == "5m ago"
 
 end SyntaxChecks

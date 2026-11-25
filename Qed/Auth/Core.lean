@@ -206,13 +206,8 @@ def decodeSessionPayloadV2 (b64 : String) : Except String SessionPayloadV2 := do
   else .ok { userId := uid, claims := match j.get? "claims" with | some (.obj kvs) => kvs.filterMap fun (k, v) => v.str?.map (k, ·) | _ => [] }
 
 abbrev urlEncodeComponent : String → String := Qed.encodeSeg
-def urlDecodeComponent (s : String) : String := (String.fromUTF8? (Qed.decodeBytes (s.replace "+" " ").toList .empty)).getD s
-
-def parseQueryParams (q : String) : List (String × String) :=
-  let trimmed := if q.startsWith "?" then (q.drop 1).toString else q
-  if trimmed.isEmpty then [] else (trimmed.splitOn "&").filterMap fun pair =>
-    if pair.isEmpty then none else match pair.splitOn "=" with
-      | [] => none | k :: vs => some (urlDecodeComponent k, if vs.isEmpty then "" else urlDecodeComponent ("=".intercalate vs))
+abbrev urlDecodeComponent : String → String := Qed.urlDecodeComponent
+abbrev parseQueryParams : String → List (String × String) := Qed.parseQueryParams
 
 def encodeFormBody (pairs : List (String × String)) : String :=
   "&".intercalate (pairs.map fun (k, v) => urlEncodeComponent k ++ "=" ++ urlEncodeComponent v)

@@ -67,7 +67,7 @@ server Store:
   invariant ordersMonotonic: totalOrders >= old(totalOrders)
   invariant authStock: mutating stock requires ctx.userId != none
 
-  def placeOrder(qty: Nat) -> Nat!:
+  rpc placeOrder(qty: Nat) -> Nat!:
     requires ctx.userId != none
     requires 1 <= qty <= 10
     ensures result <= 10000
@@ -129,13 +129,13 @@ database NotesDb:
 server NotesApi:
   use db : NotesDb
 
-  def getNote(noteId: Nat) -> NotesDb.notes?!:
+  rpc getNote(noteId: Nat) -> NotesDb.notes?!:
     requires ctx.userId != none
     if let some(uid) = ctx.userId:
       return await db.notes.findOne(where = r => r.id == noteId and r.ownerId == uid)?
     return none
 
-  def publishNote(noteId: Nat) -> NotesDb.notes?!:
+  rpc publishNote(noteId: Nat) -> NotesDb.notes?!:
     requires ctx.userId != none
     let uid = ctx.userId.getD("")
     return await db.notes.updateOne(

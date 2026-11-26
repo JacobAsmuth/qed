@@ -115,12 +115,13 @@ def usage : IO UInt32 := do
     "  serve <dir>    serve a static directory natively\n" ++
     "  manifest       emit & validate qed_deploy.json infrastructure manifest\n" ++
     "  login          authenticate this CLI with Qed Cloud (browser device flow)\n" ++
-    "  logout         remove stored Qed Cloud credentials\n" ++
+    "  logout         revoke token and remove stored Qed Cloud credentials\n" ++
     "  whoami         show the logged-in Qed Cloud account\n" ++
     "  deploy         deploy to hosted Qed Cloud (or `--local-gcp` for direct GCP deploy)\n" ++
     "  status [app]   show deployed apps, statuses, and URLs\n" ++
-    "  logs <id>      view or follow (`-f`) deployment verification & rollout logs\n" ++
-    "  secrets        manage app secrets (`list <app>` | `set <app> <NAME>`)\n" ++
+    "  logs <target>  view or follow (`-f`) deployment or `--runtime` logs\n" ++
+    "  cancel <id>    cancel a queued or in-progress deployment\n" ++
+    "  secrets        manage app secrets (`list` | `set` | `delete`)\n" ++
     "  rollback       roll back an app to a previous deployment\n" ++
     "  dev-auth [p]   run local ES256 OIDC dev identity provider\n" ++
     "  stage-sdk <d>  stage prebuilt Qed SDK (`Qed`, `QedServer`, `libqed_server.a`) for containers\n" ++

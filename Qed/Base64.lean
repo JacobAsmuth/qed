@@ -27,10 +27,12 @@ def encodeListWith (f : Nat → Char) (pad : Bool) : List UInt8 → List Char
 def decodeQuad (c0 c1 c2 c3 : Char) (isLast : Bool) : Except String (List UInt8) :=
   (decChar c0).bind fun v0 => (decChar c1).bind fun v1 =>
     let b0 := UInt8.ofNat (v0 * 4 + v1 / 16)
-    if isLast && c2 == '=' && c3 == '=' then .ok [b0]
+    if isLast && c2 == '=' && c3 == '=' then
+      if v1 % 16 == 0 then .ok [b0] else .error "base64: non-canonical padding bits"
     else (decChar c2).bind fun v2 =>
       let b1 := UInt8.ofNat ((v1 % 16) * 16 + v2 / 4)
-      if isLast && c3 == '=' then .ok [b0, b1]
+      if isLast && c3 == '=' then
+        if v2 % 4 == 0 then .ok [b0, b1] else .error "base64: non-canonical padding bits"
       else (decChar c3).map fun v3 => [b0, b1, UInt8.ofNat ((v2 % 4) * 64 + v3)]
 
 def decodeList : List Char → Except String (List UInt8)
@@ -44,14 +46,16 @@ theorem decodeList_encodeList : ∀ bs : List UInt8, decodeList (encodeListWith 
   | [] => rfl
   | [b0] => by
       have := b0.toNat_lt
+      have hpad : ((b0.toNat % 4) * 16) % 16 = 0 := by omega
       simp only [encodeListWith, decodeList, decodeQuad, List.isEmpty_nil, beq_self_eq_true, Bool.and_self, ↓reduceIte, List.cons_append, List.nil_append]
       repeat rw [dec_enc _ (by omega)]
-      simp only [Except.bind, Except.map, List.append_nil, Except.ok.injEq, List.cons.injEq, and_true]; exact u8_eq b0 (by omega)
+      simp only [Except.bind, Except.map, hpad, beq_self_eq_true, ↓reduceIte, List.append_nil, Except.ok.injEq, List.cons.injEq, and_true]; exact u8_eq b0 (by omega)
   | [b0, b1] => by
       have := b0.toNat_lt; have := b1.toNat_lt
+      have hpad : ((b1.toNat % 16) * 4) % 4 = 0 := by omega
       simp only [encodeListWith, ↓reduceIte, List.cons_append, List.nil_append, decodeList, decodeQuad, List.isEmpty_nil]
       repeat rw [dec_enc _ (by omega)]
-      simp only [Except.bind, enc_ne_pad ((b1.toNat % 16) * 4) (by omega), beq_self_eq_true, Bool.true_and, Bool.false_and, Bool.false_eq_true, ↓reduceIte, Except.map, List.append_nil, Except.ok.injEq, List.cons.injEq, and_true]
+      simp only [Except.bind, enc_ne_pad ((b1.toNat % 16) * 4) (by omega), hpad, beq_self_eq_true, Bool.true_and, Bool.false_and, Bool.false_eq_true, ↓reduceIte, Except.map, List.append_nil, Except.ok.injEq, List.cons.injEq, and_true]
       exact ⟨u8_eq b0 (by omega), u8_eq b1 (by omega)⟩
   | b0 :: b1 :: b2 :: rest => by
       have := b0.toNat_lt; have := b1.toNat_lt; have := b2.toNat_lt

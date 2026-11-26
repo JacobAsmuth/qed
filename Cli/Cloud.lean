@@ -446,8 +446,11 @@ private def runLogout (args : List String) : ExceptT String IO UInt32 := do
   let validatedFlagApi? ← flagApi?.mapM (fun raw => liftP (validateCloudApiBase raw))
   if let some tok ← resolveExplicitToken flagTok? (allowEnv := false) then
     let apiBase ← resolveApiBase validatedFlagApi? none
-    liftIO (bestEffortRevokeToken apiBase tok)
-    liftIO (IO.println (green "✓ token revoked"))
+    let resp : TokenRevokeResp ← cloudHttpJson apiBase "POST" "/api/v1/tokens/revoke-current" (some tok) (some (.obj []))
+    if resp.revoked then
+      liftIO (IO.println (green "✓ token revoked"))
+    else
+      liftIO (IO.println "token was already revoked or inactive")
     return 0
   let p ← liftIO credentialsPath
   if ← liftIO p.pathExists then

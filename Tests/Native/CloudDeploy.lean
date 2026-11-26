@@ -784,12 +784,15 @@ private def testCloudProtocolAndCli (c : TestChecker) : IO Unit := do
       c.check "qed logout calls POST /api/v1/tokens/revoke-current and removes credentials file"
         (rcLo1 == 0 && !outLo1.contains "tok_stored_777" && !(← (System.FilePath.mk credsFile).pathExists) &&
           (← stRef.get).reqs.any fun r => r.1 == "POST" && r.2.1 == "/api/v1/tokens/revoke-current" && r.2.2.1 == some "Bearer tok_stored_777") outLo1
-      -- Server error on revoke: warns and still removes local credentials
+      -- Server error on revoke: stored-creds logout warns & removes local file; explicit --token fails non-zero
       stRef.modify fun s => { s with failRevoke := true }
       IO.FS.writeFile (System.FilePath.mk credsFile) ((toJson seedCreds).render ++ "\n")
       let (rcLo2, outLo2) ← runCli #["logout", "--api", apiUrl]
       c.check "qed logout warns and still removes local credentials when remote revoke fails"
         (rcLo2 == 0 && outLo2.contains "warning:" && !(← (System.FilePath.mk credsFile).pathExists)) outLo2
+      let (rcLoTokFail, outLoTokFail) ← runCli #["logout", "--api", apiUrl, "--token", "tok_fail_secret"]
+      c.check "qed logout --token fails non-zero on server error without printing success or token"
+        (rcLoTokFail != 0 && !outLoTokFail.contains "token revoked" && !outLoTokFail.contains "tok_fail_secret") outLoTokFail
 
 def run : IO Bool := do let c ← mkChecker "cloud-deploy"; testCloudDeployEndToEnd c; testCloudProtocolAndCli c; c.finish
 

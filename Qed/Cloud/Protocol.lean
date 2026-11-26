@@ -1,3 +1,4 @@
+import Qed.Base64
 import Qed.Json
 import Qed.Server.Net
 
@@ -9,11 +10,17 @@ namespace Qed.Cloud.Protocol
 
 open Qed Qed.Server.Net
 
-/-! ### 1. Bounds & Input Validators -/
+/-! ### 1. Bounds, Base64 & Input Validators -/
 
 def maxSourceFiles      : Nat := 500
-def maxSourceFileBytes  : Nat := 1024 * 1024
-def maxTotalSourceBytes : Nat := 8 * 1024 * 1024
+def maxSourceFileBytes  : Nat := 2 * 1024 * 1024
+def maxTotalSourceBytes : Nat := 16 * 1024 * 1024
+
+/-- Pure, total standard Base64 encoder backed by formally verified `Qed.Base64.encode`. -/
+def encodeBase64 (bs : ByteArray) : String := Qed.Base64.encode bs
+
+/-- Pure, total standard Base64 decoder backed by formally verified `Qed.Base64.decode`. -/
+def decodeBase64? (s : String) : Option ByteArray := (Qed.Base64.decode s).toOption
 
 def isValidAppSlug (s : String) : Bool :=
   match s.toList with
@@ -28,7 +35,14 @@ def isValidEnvName (s : String) : Bool :=
   s == "prod" || s == "staging" || s == "preview"
 
 def isValidDeployStatus (s : String) : Bool :=
-  ["queued", "verifying", "building", "deploying", "live", "failed"].contains s
+  ["queued", "verifying", "building", "deploying", "live", "failed", "canceled"].contains s
+
+def isValidDeploymentId (s : String) : Bool :=
+  1 ≤ s.length && s.length ≤ 128 &&
+  s.toList.all (fun c => c.isAlphanum || c == '_' || c == '-')
+
+def isValidLogSeverity (s : String) : Bool :=
+  ["debug", "info", "warn", "error"].contains s
 
 def isValidDeviceUserCode (s : String) : Bool :=
   let cs := s.toList
@@ -47,17 +61,32 @@ def isValidSecretKey (s : String) : Bool :=
 private def forbiddenSourceTopDirs : List String :=
   [".git", ".lake", ".qed", "dist", "node_modules", "target", ".claude", ".gemini"]
 
+private def allowedSourceExactNames : List String :=
+  ["lean-toolchain", "lakefile.lean", "lakefile.toml", "lake-manifest.json",
+   "qed.json", "robots.txt", "sitemap.xml", "manifest.json"]
+
+private def binarySourceExts : List String :=
+  [".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".woff", ".woff2", ".ttf", ".otf"]
+
+private def textSourceExts : List String :=
+  [".lean", ".css", ".html", ".js", ".mjs", ".json", ".txt", ".xml", ".webmanifest", ".svg"]
+
+private def hasExtIn (exts : List String) (seg : String) : Bool :=
+  let lower := seg.toLower
+  exts.any fun ext => lower.length > ext.length && lower.endsWith ext
+
+def isBinarySourceExt (seg : String) : Bool :=
+  hasExtIn binarySourceExts seg
+
 private def isAllowedSourceExt (seg : String) : Bool :=
-  seg == "lean-toolchain" || seg == "lakefile.lean" || seg == "lakefile.toml" ||
-  seg == "lake-manifest.json" || seg == "qed.json" ||
-  seg.endsWith ".lean" || seg.endsWith ".css"
+  allowedSourceExactNames.contains seg || hasExtIn textSourceExts seg || hasExtIn binarySourceExts seg
 
 def isValidSourceRelPath (p : String) : Bool :=
   !p.isEmpty && p.length ≤ 240 && !p.startsWith "/" && !p.endsWith "/" &&
   !p.toList.any (fun c => c.toNat < 0x20 || c.toNat == 0x7F || c == '\\' || c == '?' || c == '#' || c == ':') &&
   let segs := p.splitOn "/"
   !segs.isEmpty &&
-  segs.all (fun seg => !seg.isEmpty && seg != "." && seg != ".." && !seg.startsWith ".env" && !forbiddenSourceTopDirs.contains seg) &&
+  segs.all (fun seg => !seg.isEmpty && seg != "." && seg != ".." && !seg.toLower.startsWith ".env" && !forbiddenSourceTopDirs.contains seg.toLower) &&
   isAllowedSourceExt (segs.getLastD "")
 
 def normalizeApiBase (raw : String) : String :=
@@ -155,15 +184,27 @@ instance : FromJson WhoamiResp where
 /-! ### 3. Source Bundle & Deployment Protocol -/
 
 structure SourceFile where
-  path    : String
-  content : String
+  path     : String
+  content  : String
+  encoding : String := "utf8"
 deriving Inhabited, DecidableEq, Repr
 
+def SourceFile.decodedBytes (f : SourceFile) : Except String ByteArray :=
+  if f.encoding == "utf8" then .ok f.content.toUTF8
+  else if f.encoding == "base64" then
+    match decodeBase64? f.content with
+    | some bs => .ok bs
+    | none    => .error s!"source file `{f.path}` has invalid base64 content"
+  else
+    .error s!"source file `{f.path}` has invalid encoding `{f.encoding}` (expected utf8 or base64)"
+
 instance : ToJson SourceFile where
-  toJson f := .obj [("path", .str f.path), ("content", .str f.content)]
+  toJson f := .obj [("path", .str f.path), ("content", .str f.content), ("encoding", .str f.encoding)]
 
 instance : FromJson SourceFile where
-  fromJson j := return { path := ← fromField j "path", content := ← fromField j "content" }
+  fromJson j := do
+    let enc? : Option String ← fromField j "encoding"
+    return { path := ← fromField j "path", content := ← fromField j "content", encoding := enc?.getD "utf8" }
 
 structure SourceBundle where
   files : Array SourceFile
@@ -177,7 +218,17 @@ def SourceBundle.validate (b : SourceBundle) : Except String Unit := do
   for f in b.files do
     if !isValidSourceRelPath f.path then throw s!"invalid source file path `{f.path}`"
     if seen.contains f.path then throw s!"duplicate source file path `{f.path}`"
-    let sz := f.content.utf8ByteSize
+    let sz ←
+      if f.encoding == "utf8" then
+        pure f.content.utf8ByteSize
+      else if f.encoding == "base64" then
+        if f.content.utf8ByteSize > Qed.Base64.encodedLength maxSourceFileBytes then
+          throw s!"source file `{f.path}` exceeds max size (> {maxSourceFileBytes} bytes)"
+        match decodeBase64? f.content with
+        | some bs => pure bs.size
+        | none    => throw s!"source file `{f.path}` has invalid base64 content"
+      else
+        throw s!"source file `{f.path}` has invalid encoding `{f.encoding}` (expected utf8 or base64)"
     if sz > maxSourceFileBytes then throw s!"source file `{f.path}` exceeds max size ({sz} > {maxSourceFileBytes} bytes)"
     totalBytes := totalBytes + sz
     if totalBytes > maxTotalSourceBytes then throw s!"source bundle exceeds max total size ({maxTotalSourceBytes} bytes)"
@@ -367,6 +418,30 @@ instance : ToJson SecretsListResp where
 instance : FromJson SecretsListResp where
   fromJson j := return { appSlug := ← fromField j "appSlug", names := ← fromField j "names" }
 
+structure SecretDeleteReq where
+  appSlug : String
+  env     : String := "prod"
+  name    : String
+deriving Inhabited, DecidableEq, Repr
+
+def SecretDeleteReq.validate (r : SecretDeleteReq) : Except String Unit := do
+  if !isValidAppSlug r.appSlug then throw s!"invalid app slug `{r.appSlug}`"
+  if !isValidEnvName r.env then throw s!"invalid env `{r.env}`"
+  if !isValidSecretKey r.name then throw s!"invalid secret name `{r.name}` (use UPPER_SNAKE_CASE)"
+
+instance : ToJson SecretDeleteReq where
+  toJson r := .obj [("appSlug", .str r.appSlug), ("env", .str r.env), ("name", .str r.name)]
+
+instance : FromJson SecretDeleteReq where
+  fromJson j := do
+    let env? : Option String ← fromField j "env"
+    let r : SecretDeleteReq := {
+      appSlug := ← fromField j "appSlug",
+      env := env?.getD "prod",
+      name := ← fromField j "name" }
+    r.validate
+    return r
+
 structure RollbackReq where
   appSlug      : String
   deploymentId : String
@@ -378,10 +453,94 @@ instance : ToJson RollbackReq where
 instance : FromJson RollbackReq where
   fromJson j := return { appSlug := ← fromField j "appSlug", deploymentId := ← fromField j "deploymentId" }
 
+structure CancelDeployReq where
+  deploymentId : String
+deriving Inhabited, DecidableEq, Repr
+
+def CancelDeployReq.validate (r : CancelDeployReq) : Except String Unit := do
+  if !isValidDeploymentId r.deploymentId then throw s!"invalid deployment id `{r.deploymentId}`"
+
+instance : ToJson CancelDeployReq where
+  toJson r := .obj [("deploymentId", .str r.deploymentId)]
+
+instance : FromJson CancelDeployReq where
+  fromJson j := do
+    let r : CancelDeployReq := { deploymentId := ← fromField j "deploymentId" }
+    r.validate
+    return r
+
+structure RuntimeLogView where
+  id        : String
+  timestamp : String
+  severity  : String
+  source    : String
+  message   : String
+deriving Inhabited, DecidableEq, Repr
+
+instance : ToJson RuntimeLogView where
+  toJson e := .obj [
+    ("id", .str e.id), ("timestamp", .str e.timestamp),
+    ("severity", .str e.severity), ("source", .str e.source),
+    ("message", .str e.message)]
+
+instance : FromJson RuntimeLogView where
+  fromJson j := do
+    return {
+      id := ← fromField j "id", timestamp := ← fromField j "timestamp",
+      severity := ← fromField j "severity", source := ← fromField j "source",
+      message := ← fromField j "message" }
+
+structure RuntimeLogsResp where
+  appSlug       : String
+  env           : String
+  pr            : Nat := 0
+  logs          : Array RuntimeLogView
+  nextPageToken : Option String := none
+deriving Inhabited, DecidableEq, Repr
+
+instance : ToJson RuntimeLogsResp where
+  toJson r := .obj [
+    ("appSlug", .str r.appSlug), ("env", .str r.env), ("pr", toJson r.pr),
+    ("logs", toJson r.logs), ("nextPageToken", toJson r.nextPageToken)]
+
+instance : FromJson RuntimeLogsResp where
+  fromJson j := do
+    let pr? : Option Nat ← fromField j "pr"
+    return {
+      appSlug := ← fromField j "appSlug", env := ← fromField j "env",
+      pr := pr?.getD 0, logs := ← fromField j "logs",
+      nextPageToken := ← fromField j "nextPageToken" }
+
+structure TokenRevokeResp where
+  revoked : Bool
+deriving Inhabited, DecidableEq, Repr
+
+instance : ToJson TokenRevokeResp where
+  toJson r := .obj [("revoked", .bool r.revoked)]
+
+instance : FromJson TokenRevokeResp where
+  fromJson j := return { revoked := ← fromField j "revoked" }
+
 #guard isValidAppSlug "my-app-1" && !isValidAppSlug "A" && !isValidAppSlug "my--app" && !isValidAppSlug "-bad"
-#guard isValidSourceRelPath "App.lean" && isValidSourceRelPath "styles/main.css" && isValidSourceRelPath "lean-toolchain"
-#guard !isValidSourceRelPath "../secret.lean" && !isValidSourceRelPath ".env.prod" && !isValidSourceRelPath ".lake/a.lean" && !isValidSourceRelPath "/etc/passwd"
-#guard isValidCloudApiUrl "http://127.0.0.1:8080" && isValidCloudApiUrl "https://qed-cloud-abc-uc.a.run.app" && !isValidCloudApiUrl "http://example.com" && !isValidCloudApiUrl "https://a.run.app/path"
+#guard isValidDeployStatus "live" && isValidDeployStatus "canceled" && !isValidDeployStatus "unknown"
+#guard
+  ["App.lean", "styles/main.css", "lean-toolchain", "lakefile.lean", "lakefile.toml", "lake-manifest.json",
+   "qed.json", "robots.txt", "sitemap.xml", "manifest.json", "public/logo.png", "public/hero.jpg",
+   "public/photo.jpeg", "public/anim.gif", "public/icon.svg", "public/img.webp", "public/favicon.ico",
+   "fonts/inter.woff", "fonts/inter.woff2", "fonts/inter.ttf", "fonts/inter.otf", "public/data.json",
+   "public/notes.txt", "public/feed.xml", "public/site.webmanifest", "public/index.html",
+   "public/app.js", "public/mod.mjs"].all isValidSourceRelPath
+#guard
+  ["../secret.lean", "../logo.png", ".env", ".env.prod", ".env.json", ".ENV.txt",
+   ".git/config.txt", ".lake/a.lean", ".qed/cache.json", "dist/app.mjs",
+   "node_modules/pkg/index.js", "target/out.txt", "/etc/passwd", "public/a\\b.png",
+   "public/a.png?v=1", "public/a.png#frag", "public/a:b.png", "public/a\nb.png", ".png", ".json"].all (!isValidSourceRelPath ·)
+#guard
+  [ByteArray.empty, ByteArray.mk #[0], ByteArray.mk #[0, 1], ByteArray.mk #[0, 1, 2],
+   ByteArray.mk #[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF]].all fun bs =>
+    (decodeBase64? (encodeBase64 bs)).map (·.data) == some bs.data
+#guard (decodeBase64? "abc").isNone && (decodeBase64? "ab!d").isNone && (decodeBase64? "AA==AAAA").isNone
+#guard isValidCloudApiUrl "http://127.0.0.1:8080" && isValidCloudApiUrl "https://api.qed.cloud" && isValidCloudApiUrl "https://qed-cloud-abc-uc.a.run.app" && !isValidCloudApiUrl "http://example.com" && !isValidCloudApiUrl "https://a.run.app/path"
 #guard isValidDeviceUserCode "ABCD-2345" && !isValidDeviceUserCode "abcd-2345" && !isValidDeviceUserCode "ABCD2345"
 
 end Qed.Cloud.Protocol

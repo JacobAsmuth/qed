@@ -58,6 +58,11 @@ private def saveCredentials (c : CloudCredentials) : ExceptT String IO Unit := d
   IO.FS.writeFile p ((toJson c).render ++ "\n")
   discard <| liftIO (shQuiet "chmod" #["600", p.toString])
 
+def redactArg (s : String) : String :=
+  match s.splitOn "=" with
+  | k :: _ :: _ => s!"{k}=<redacted>"
+  | _           => s
+
 private def liftP {α : Type} (e : Except String α) : ExceptT String IO α :=
   ExceptT.mk (pure e)
 
@@ -69,7 +74,7 @@ private def runCloudCmd (act : ExceptT String IO UInt32) : IO UInt32 := do
 private def validateCloudApiBase (raw : String) : Except String String :=
   let u := normalizeApiBase raw
   if isValidCloudApiUrl u then .ok u
-  else .error s!"invalid Qed Cloud API URL `{raw}` (must be `https://<host>[:port]` or local loopback `http://127.0.0.1[:port]`)"
+  else .error s!"invalid Qed Cloud API URL `{redactArg raw}` (must be `https://<host>[:port]` or local loopback `http://127.0.0.1[:port]`)"
 
 private def resolveApiBase (flagApi? : Option String) (creds? : Option CloudCredentials) : ExceptT String IO String := do
   let envApi? ← liftIO (nonEmptyEnv "QED_CLOUD_API")
@@ -153,14 +158,16 @@ private def defaultAppSlug : IO String := do
   let cwd ← IO.currentDir
   return sanitizeSlugFromDir (cwd.fileName.getD "qed-app")
 
+private def symlinkMetadata? (p : FilePath) : IO (Option IO.FS.Metadata) :=
+  try some <$> p.symlinkMetadata catch _ => pure none
+
 private def collectSourceFilesLoop (rootReal : FilePath) (rootPfx : String) :
     Nat → List (FilePath × String) → Array SourceFile → Nat → ExceptT String IO SourceBundle
   | 0, _, _, _ => throw "source directory traversal exceeded depth/file budget"
   | _, [], acc, _ => do
       let b : SourceBundle := { files := acc }
-      match b.validate with
-      | .ok ()   => return b
-      | .error e => throw e
+      liftP b.validate
+      return b
   | fuel + 1, (dir, relPfx) :: rest, acc, totalBytes => do
       let entries ← liftIO (dir.readDir)
       let sorted := entries.qsort (fun a b => a.fileName < b.fileName)
@@ -171,16 +178,21 @@ private def collectSourceFilesLoop (rootReal : FilePath) (rootPfx : String) :
         let name := e.fileName
         if name.startsWith "." || ["dist", "node_modules", "target"].contains name.toLower then continue
         let full := dir / name
-        let some ty ← liftIO (symlinkType? full) | continue
-        if ty == .symlink then continue
+        let some md ← liftIO (symlinkMetadata? full) | continue
+        if md.type == .symlink then continue
         let some rp ← liftIO (realPath? full) | continue
         if !rp.toString.startsWith rootPfx then continue
         let rel := if relPfx.isEmpty then name else s!"{relPfx}/{name}"
-        if ty == .dir then
+        if md.type == .dir then
           nextDirs := (full, rel) :: nextDirs
-        else if ty == .file && isValidSourceRelPath rel then
+        else if md.type == .file && isValidSourceRelPath rel then
           if nextAcc.size >= maxSourceFiles then
             throw s!"project exceeds maximum of {maxSourceFiles} source files"
+          let metaBytes := md.byteSize.toNat
+          if metaBytes > maxSourceFileBytes then
+            throw s!"source file `{rel}` exceeds {maxSourceFileBytes} bytes"
+          if nextBytes + metaBytes > maxTotalSourceBytes then
+            throw s!"project source exceeds {maxTotalSourceBytes} bytes"
           let bytes ← liftIO (IO.FS.readBinFile full)
           if bytes.size > maxSourceFileBytes then
             throw s!"source file `{rel}` exceeds {maxSourceFileBytes} bytes"
@@ -188,13 +200,13 @@ private def collectSourceFilesLoop (rootReal : FilePath) (rootPfx : String) :
           if nextBytes > maxTotalSourceBytes then
             throw s!"project source exceeds {maxTotalSourceBytes} bytes"
           let file : SourceFile ←
-            if isBinarySourceExt rel then
+            if isBinarySourceExt name then
               pure { path := rel, content := encodeBase64 bytes, encoding := "base64" }
             else
               match String.fromUTF8? bytes with
               | some content => pure { path := rel, content, encoding := "utf8" }
               | none =>
-                  if rel.endsWith ".lean" then
+                  if rel.toLower.endsWith ".lean" then
                     throw s!"source file `{rel}` is not valid UTF-8"
                   else
                     pure { path := rel, content := encodeBase64 bytes, encoding := "base64" }
@@ -207,6 +219,10 @@ def collectSourceBundle (rootDir : FilePath) : ExceptT String IO SourceBundle :=
 
 /-! ### Pure CLI Parsers & Query Builders -/
 
+private def stripFlagEq? (flag : String) (arg : String) : Option String :=
+  let pfx := flag ++ "="
+  if arg.startsWith pfx then some (arg.drop pfx.length).toString else none
+
 def parseCloudFlags (args : List String) : Except String (Option String × Option String × List String) :=
   let rec go (api? tok? : Option String) (acc : List String) :
       List String → Except String (Option String × Option String × List String)
@@ -217,7 +233,10 @@ def parseCloudFlags (args : List String) : Except String (Option String × Optio
     | ["--token"] => .error "missing value for `--token`"
     | "--value" :: v :: r => go api? tok? (v :: "--value" :: acc) r
     | "--search" :: q :: r => go api? tok? (q :: "--search" :: acc) r
-    | x :: r => go api? tok? (x :: acc) r
+    | x :: r =>
+        if let some u := stripFlagEq? "--api" x then go (some u) tok? acc r
+        else if let some t := stripFlagEq? "--token" x then go api? (some t) acc r
+        else go api? tok? (x :: acc) r
   go none none [] args
 
 def splitSecretAssignment (s : String) : Option (String × String) :=
@@ -243,7 +262,10 @@ def parseSecretsSetArgs (args : List String) : Except String SecretSetParsed := 
     | "--value" :: v :: r => go app? envStr (some v) pos r
     | ["--value"] => .error "missing value for `--value`"
     | x :: r =>
-        if x.startsWith "-" then .error s!"unknown `qed secrets set` flag: `{x}`"
+        if let some a := stripFlagEq? "--app" x then go (some a) envStr val? pos r
+        else if let some e := stripFlagEq? "--env" x then go app? e val? pos r
+        else if let some v := stripFlagEq? "--value" x then go app? envStr (some v) pos r
+        else if x.startsWith "-" then .error s!"unknown `qed secrets set` flag: `{redactArg x}`"
         else go app? envStr val? (x :: pos) r
   let (appFlag?, envStr, valFlag?, pos) ← go none "prod" none [] args
   let (appSlug, target) ← match appFlag?, pos with
@@ -269,7 +291,9 @@ private def parseSecretsAppEnvArgs (subCmd : String) (args : List String) (needN
     | "--env" :: e :: r => go app? (some e) pos r
     | ["--env"] => .error "missing value for `--env`"
     | x :: r =>
-        if x.startsWith "-" then .error s!"unknown `qed secrets {subCmd}` flag: `{x}`"
+        if let some a := stripFlagEq? "--app" x then go (some a) env? pos r
+        else if let some e := stripFlagEq? "--env" x then go app? (some e) pos r
+        else if x.startsWith "-" then .error s!"unknown `qed secrets {subCmd}` flag: `{redactArg x}`"
         else go app? env? (x :: pos) r
   let (appFlag?, envFlag?, pos) ← go none none [] args
   if needName then
@@ -294,26 +318,33 @@ structure LogsCliOpts where
 deriving Inhabited, DecidableEq, Repr
 
 def parseLogsArgs (args : List String) : Except String LogsCliOpts := do
-  let rec go (o : LogsCliOpts) (hasRuntimeFlag : Bool) (pos : List String) :
-      List String → Except String (LogsCliOpts × Bool × List String)
-    | [] => .ok (o, hasRuntimeFlag, pos.reverse)
-    | "--runtime" :: r => go { o with runtime := true } hasRuntimeFlag pos r
-    | "--follow" :: r | "-f" :: r => go { o with follow := true } hasRuntimeFlag pos r
-    | "--env" :: v :: r => go { o with envStr := v } true pos r
+  let rec go (o : LogsCliOpts) (hasRuntimeFlag hasPrFlag : Bool) (pos : List String) :
+      List String → Except String (LogsCliOpts × Bool × Bool × List String)
+    | [] => .ok (o, hasRuntimeFlag, hasPrFlag, pos.reverse)
+    | "--runtime" :: r => go { o with runtime := true } hasRuntimeFlag hasPrFlag pos r
+    | "--follow" :: r | "-f" :: r => go { o with follow := true } hasRuntimeFlag hasPrFlag pos r
+    | "--env" :: v :: r => go { o with envStr := v } true hasPrFlag pos r
     | ["--env"] => .error "missing value for `--env`"
     | "--pr" :: v :: r =>
         match v.toNat? with
-        | some n => go { o with pr := n } true pos r
-        | none   => .error s!"invalid `--pr`: `{v}`"
+        | some n => go { o with pr := n } true true pos r
+        | none   => .error s!"invalid `--pr`: `{redactArg v}`"
     | ["--pr"] => .error "missing value for `--pr`"
-    | "--severity" :: v :: r => go { o with severity? := some v.toLower } true pos r
+    | "--severity" :: v :: r => go { o with severity? := some v.toLower } true hasPrFlag pos r
     | ["--severity"] => .error "missing value for `--severity`"
-    | "--search" :: v :: r => go { o with search? := some v } true pos r
+    | "--search" :: v :: r => go { o with search? := some v } true hasPrFlag pos r
     | ["--search"] => .error "missing value for `--search`"
     | x :: r =>
-        if x.startsWith "-" then .error s!"unknown `qed logs` flag: `{x}`"
-        else go o hasRuntimeFlag (x :: pos) r
-  let (o, hasRuntimeFlag, pos) ← go {} false [] args
+        if let some v := stripFlagEq? "--env" x then go { o with envStr := v } true hasPrFlag pos r
+        else if let some v := stripFlagEq? "--pr" x then
+          match v.toNat? with
+          | some n => go { o with pr := n } true true pos r
+          | none   => .error s!"invalid `--pr`: `{redactArg v}`"
+        else if let some v := stripFlagEq? "--severity" x then go { o with severity? := some v.toLower } true hasPrFlag pos r
+        else if let some v := stripFlagEq? "--search" x then go { o with search? := some v } true hasPrFlag pos r
+        else if x.startsWith "-" then .error s!"unknown `qed logs` flag: `{redactArg x}`"
+        else go o hasRuntimeFlag hasPrFlag (x :: pos) r
+  let (o, hasRuntimeFlag, hasPrFlag, pos) ← go {} false false [] args
   let target ← match pos with
     | [t] => .ok t
     | []  => .error "usage: qed logs <deployment-id> [--follow] | qed logs <app-slug> --runtime [--env prod|staging|preview] [--pr <N>] [--severity info|warn|error|debug] [--search <q>] [--follow]"
@@ -321,14 +352,14 @@ def parseLogsArgs (args : List String) : Except String LogsCliOpts := do
   let o := { o with target }
   if !o.runtime then
     if hasRuntimeFlag then .error "`--env`, `--pr`, `--severity`, and `--search` require `--runtime`"
-    if !isValidDeploymentId o.target then .error s!"invalid deployment id `{o.target}`"
+    if !isValidDeploymentId o.target then .error s!"invalid deployment id `{redactArg o.target}`"
   else
-    if !isValidAppSlug o.target then .error s!"invalid app slug `{o.target}`"
-    if !isValidEnvName o.envStr then .error s!"invalid env `{o.envStr}` (expected prod, staging, or preview)"
+    if !isValidAppSlug o.target then .error s!"invalid app slug `{redactArg o.target}`"
+    if !isValidEnvName o.envStr then .error s!"invalid env `{redactArg o.envStr}` (expected prod, staging, or preview)"
     if o.envStr == "preview" && o.pr == 0 then .error "preview runtime logs require `--pr <positive-number>`"
-    if o.envStr != "preview" && o.pr != 0 then .error "`--pr` is only valid with `--env preview`"
+    if o.envStr != "preview" && (hasPrFlag || o.pr != 0) then .error "`--pr` is only valid with `--env preview`"
     if let some sev := o.severity? then
-      if !isValidLogSeverity sev then .error s!"invalid severity `{sev}` (expected debug, info, warn, or error)"
+      if !isValidLogSeverity sev then .error s!"invalid severity `{redactArg sev}` (expected debug, info, warn, or error)"
   .ok o
 
 def buildRuntimeLogsPath (appSlug envStr : String) (pr : Nat := 0)
@@ -354,11 +385,21 @@ private def pollDeviceLoop (apiBase deviceCode : String) (intervalMs : UInt32) :
       liftIO (IO.sleep intervalMs)
       pollDeviceLoop apiBase deviceCode intervalMs fuel
 
+private def rejectLeadingDashFlags (cmdName : String) (args : List String) : Except String Unit :=
+  match args.find? (·.startsWith "-") with
+  | some f => .error s!"unknown `{cmdName}` flag: `{redactArg f}`"
+  | none   => .ok ()
+
+private def validateSecretMeta (appSlug envStr name : String) : Except String Unit := do
+  if !isValidAppSlug appSlug then .error s!"invalid app slug `{redactArg appSlug}`"
+  if !isValidEnvName envStr then .error s!"invalid env `{redactArg envStr}` (expected prod, staging, or preview)"
+  if !isValidSecretKey name then .error s!"invalid secret name `{redactArg name}` (use UPPER_SNAKE_CASE)"
+
 private def runLogin (args : List String) : ExceptT String IO UInt32 := do
   let (flagApi?, flagTok?, rest) ← liftP (parseCloudFlags args)
   if flagTok?.isSome then throw "`--token` is not valid for `qed login`"
   let noOpen := rest.contains "--no-open"
-  for f in rest do if f != "--no-open" then throw s!"unknown `qed login` flag: `{f}`"
+  for f in rest do if f != "--no-open" then throw s!"unknown `qed login` flag: `{redactArg f}`"
   let creds? ← liftIO loadCredentials?
   let apiBase ← resolveApiBase flagApi? creds?
   liftIO (step s!"starting Qed Cloud login at {apiBase}")
@@ -393,40 +434,46 @@ private def bestEffortRevokeToken (apiBase token : String) : IO Unit := do
   | .error e =>
       IO.eprintln s!"warning: could not revoke token on server ({e})"
 
+private def deleteCredentialsFile (p : FilePath) : ExceptT String IO Unit := do
+  let err? ← liftIO (try IO.FS.removeFile p; pure none catch e => pure (some (toString e)))
+  if ← liftIO p.pathExists then
+    let detail := err?.elim "file still exists" id
+    throw s!"failed to remove credentials file `{p}`: {detail}"
+
 private def runLogout (args : List String) : ExceptT String IO UInt32 := do
   let (flagApi?, flagTok?, rest) ← liftP (parseCloudFlags args)
-  if !rest.isEmpty then throw s!"unexpected arguments to `qed logout`: {" ".intercalate rest}"
+  if !rest.isEmpty then throw s!"unexpected arguments to `qed logout`: {" ".intercalate (rest.map redactArg)}"
   let validatedFlagApi? ← flagApi?.mapM (fun raw => liftP (validateCloudApiBase raw))
+  if let some tok ← resolveExplicitToken flagTok? (allowEnv := false) then
+    let apiBase ← resolveApiBase validatedFlagApi? none
+    liftIO (bestEffortRevokeToken apiBase tok)
+    liftIO (IO.println (green "✓ token revoked"))
+    return 0
   let p ← liftIO credentialsPath
   if ← liftIO p.pathExists then
     if let some creds ← liftIO loadCredentials? then
       if !creds.token.isEmpty then
         let storedBase := normalizeApiBase creds.apiBase
         let revokeBase? : Option String := match validatedFlagApi? with
-          | some u => if storedBase.isEmpty || storedBase == u then some u else none
+          | some u => if !storedBase.isEmpty && storedBase == u then some u else none
           | none   => if !storedBase.isEmpty && isValidCloudApiUrl storedBase then some storedBase else none
         match revokeBase? with
         | some base => liftIO (bestEffortRevokeToken base creds.token)
         | none =>
             if let some u := validatedFlagApi? then
               liftIO (IO.eprintln s!"warning: stored credentials are for `{creds.apiBase}`, not `{u}`; skipping remote token revoke")
-    liftIO (removeIfExists p)
+    deleteCredentialsFile p
     liftIO (IO.println (green "✓ logged out of Qed Cloud"))
     return 0
   else
-    if let some tok ← resolveExplicitToken flagTok? (allowEnv := false) then
-      let apiBase ← resolveApiBase validatedFlagApi? none
-      liftIO (bestEffortRevokeToken apiBase tok)
-      liftIO (IO.println (green "✓ logged out of Qed Cloud"))
-    else
-      liftIO (IO.println "already logged out")
+    liftIO (IO.println "already logged out")
     return 0
 
 def cmdLogout (args : List String := []) : IO UInt32 := runCloudCmd (runLogout args)
 
 private def runWhoami (args : List String) : ExceptT String IO UInt32 := do
   let (flagApi?, flagTok?, rest) ← liftP (parseCloudFlags args)
-  if !rest.isEmpty then throw s!"unexpected arguments to `qed whoami`: {" ".intercalate rest}"
+  if !rest.isEmpty then throw s!"unexpected arguments to `qed whoami`: {" ".intercalate (rest.map redactArg)}"
   let (apiBase, creds) ← resolveCloudAuth flagApi? flagTok?
   let me : WhoamiResp ← cloudHttpJson apiBase "GET" "/api/v1/whoami" (some creds.token)
   liftIO <| IO.println s!"{green "✓"} {me.email} (id={me.userId}, tenant={me.tenantId}, apps={me.appsCount}) @ {apiBase}"
@@ -436,9 +483,12 @@ def cmdWhoami (args : List String) : IO UInt32 := runCloudCmd (runWhoami args)
 
 private def runStatus (args : List String) : ExceptT String IO UInt32 := do
   let (flagApi?, flagTok?, rest) ← liftP (parseCloudFlags args)
+  liftP (rejectLeadingDashFlags "qed status" rest)
   let filterSlug? ← match rest with
     | []  => pure none
-    | [s] => pure (some s)
+    | [s] =>
+        if !isValidAppSlug s then throw s!"invalid app slug `{redactArg s}`"
+        pure (some s)
     | _   => throw "usage: qed status [app] [--api <url>] [--token <tok>]"
   let (apiBase, creds) ← resolveCloudAuth flagApi? flagTok?
   let resp : AppsListResp ← cloudHttpJson apiBase "GET" "/api/v1/apps" (some creds.token)
@@ -547,7 +597,9 @@ def cmdLogs (args : List String) : IO UInt32 := runCloudCmd (runLogs args)
 
 private def runCancel (args : List String) : ExceptT String IO UInt32 := do
   let (flagApi?, flagTok?, rest) ← liftP (parseCloudFlags args)
+  liftP (rejectLeadingDashFlags "qed cancel" rest)
   let [deployId] := rest | throw "usage: qed cancel <deployment-id> [--api <url>] [--token <tok>]"
+  if !isValidDeploymentId deployId then throw s!"invalid deployment id `{redactArg deployId}`"
   let req : CancelDeployReq := { deploymentId := deployId }
   liftP req.validate
   let (apiBase, creds) ← resolveCloudAuth flagApi? flagTok?
@@ -563,9 +615,9 @@ private def runSecrets (args : List String) : ExceptT String IO UInt32 := do
   match rest with
   | "list" :: tail =>
       let (appSlug, env?, _) ← liftP (parseSecretsAppEnvArgs "list" tail false)
-      if !isValidAppSlug appSlug then throw s!"invalid app slug `{appSlug}`"
+      if !isValidAppSlug appSlug then throw s!"invalid app slug `{redactArg appSlug}`"
       if let some e := env? then
-        if !isValidEnvName e then throw s!"invalid env `{e}` (expected prod, staging, or preview)"
+        if !isValidEnvName e then throw s!"invalid env `{redactArg e}` (expected prod, staging, or preview)"
       let (apiBase, creds) ← resolveCloudAuth flagApi? flagTok?
       let envQ := env?.elim "" fun e => s!"&env={Qed.encodeSeg e}"
       let r : SecretsListResp ← cloudHttpJson apiBase "GET" s!"/api/v1/secrets?app={Qed.encodeSeg appSlug}{envQ}" (some creds.token)
@@ -579,11 +631,14 @@ private def runSecrets (args : List String) : ExceptT String IO UInt32 := do
       return 0
   | "set" :: tail =>
       let parsed ← liftP (parseSecretsSetArgs tail)
+      liftP (validateSecretMeta parsed.appSlug parsed.env parsed.name)
       let secretVal ← match parsed.value? with
         | some v => pure v
         | none =>
-            match ← liftIO (nonEmptyEnv "QED_SECRET_VALUE") with
-            | some v => pure v
+            match ← liftIO (IO.getEnv "QED_SECRET_VALUE") with
+            | some v =>
+                if v.isEmpty then throw "provide secret value via `KEY=VALUE`, `--value <val>`, or `QED_SECRET_VALUE` env var"
+                else pure v
             | none => throw "provide secret value via `KEY=VALUE`, `--value <val>`, or `QED_SECRET_VALUE` env var"
       let req : SecretSetReq := { appSlug := parsed.appSlug, env := parsed.env, name := parsed.name, value := secretVal }
       liftP req.validate
@@ -594,7 +649,9 @@ private def runSecrets (args : List String) : ExceptT String IO UInt32 := do
   | "delete" :: tail =>
       let (appSlug, env?, name?) ← liftP (parseSecretsAppEnvArgs "delete" tail true)
       let some name := name? | throw "usage: qed secrets delete <app> <NAME> [--env prod|staging|preview]"
-      let req : SecretDeleteReq := { appSlug, env := env?.getD "prod", name }
+      let envStr := env?.getD "prod"
+      liftP (validateSecretMeta appSlug envStr name)
+      let req : SecretDeleteReq := { appSlug, env := envStr, name }
       liftP req.validate
       let (apiBase, creds) ← resolveCloudAuth flagApi? flagTok?
       let _ : Json ← cloudHttpJson apiBase "POST" "/api/v1/secrets/delete" (some creds.token) (some (toJson req))
@@ -606,9 +663,10 @@ def cmdSecrets (args : List String) : IO UInt32 := runCloudCmd (runSecrets args)
 
 private def runRollback (args : List String) : ExceptT String IO UInt32 := do
   let (flagApi?, flagTok?, rest) ← liftP (parseCloudFlags args)
+  liftP (rejectLeadingDashFlags "qed rollback" rest)
   let [appSlug, deploymentId] := rest | throw "usage: qed rollback <app> <deployment-id> [--api <url>] [--token <tok>]"
-  if !isValidAppSlug appSlug then throw s!"invalid app slug `{appSlug}`"
-  if !isValidDeploymentId deploymentId then throw s!"invalid deployment id `{deploymentId}`"
+  if !isValidAppSlug appSlug then throw s!"invalid app slug `{redactArg appSlug}`"
+  if !isValidDeploymentId deploymentId then throw s!"invalid deployment id `{redactArg deploymentId}`"
   let (apiBase, creds) ← resolveCloudAuth flagApi? flagTok?
   let resp : DeployUploadResp ← cloudHttpJson apiBase "POST" "/api/v1/rollback" (some creds.token)
     (some (toJson ({ appSlug, deploymentId } : RollbackReq)))
@@ -633,17 +691,34 @@ private def parseHostedDeployOpts : List String → HostedDeployOpts → Except 
   | "--token" :: v :: r, o => parseHostedDeployOpts r { o with token? := some v }
   | "--app" :: v :: r, o => parseHostedDeployOpts r { o with appSlug? := some v }
   | "--env" :: v :: r, o => parseHostedDeployOpts r { o with envStr := v }
-  | "--pr" :: v :: r, o => match v.toNat? with | some n => parseHostedDeployOpts r { o with pr := n } | none => .error s!"invalid `--pr`: `{v}`"
+  | "--pr" :: v :: r, o => match v.toNat? with | some n => parseHostedDeployOpts r { o with pr := n } | none => .error s!"invalid `--pr`: `{redactArg v}`"
   | "--mod" :: v :: r, o => parseHostedDeployOpts r { o with mod? := some v }
   | "--deploy" :: v :: r, o => parseHostedDeployOpts r { o with deployName := v }
   | "--no-wait" :: r, o => parseHostedDeployOpts r { o with noWait := true }
-  | flag :: _, _ => .error s!"unknown or incomplete `qed deploy` flag: `{flag}`"
+  | x :: r, o =>
+      if let some v := stripFlagEq? "--api" x then parseHostedDeployOpts r { o with api? := some v }
+      else if let some v := stripFlagEq? "--token" x then parseHostedDeployOpts r { o with token? := some v }
+      else if let some v := stripFlagEq? "--app" x then parseHostedDeployOpts r { o with appSlug? := some v }
+      else if let some v := stripFlagEq? "--env" x then parseHostedDeployOpts r { o with envStr := v }
+      else if let some v := stripFlagEq? "--pr" x then
+        match v.toNat? with
+        | some n => parseHostedDeployOpts r { o with pr := n }
+        | none   => .error s!"invalid `--pr`: `{redactArg v}`"
+      else if let some v := stripFlagEq? "--mod" x then parseHostedDeployOpts r { o with mod? := some v }
+      else if let some v := stripFlagEq? "--deploy" x then parseHostedDeployOpts r { o with deployName := v }
+      else .error s!"unknown or incomplete `qed deploy` flag: `{redactArg x}`"
 
 private def runHostedDeploy (args : List String) : ExceptT String IO UInt32 := do
   let opts ← liftP (parseHostedDeployOpts args {})
   let (apiBase, creds) ← resolveCloudAuth opts.api? opts.token?
   let appSlug ← match opts.appSlug? with | some s => pure s | none => liftIO defaultAppSlug
+  if !isValidAppSlug appSlug then throw s!"invalid app slug `{redactArg appSlug}`"
+  if !isValidEnvName opts.envStr then throw s!"invalid env `{redactArg opts.envStr}` (expected prod, staging, or preview)"
   let mod ← match opts.mod? with | some m => pure m | none => liftIO jsRoot
+  if mod.isEmpty || mod.length > 128 || !mod.toList.all (fun c => c.isAlphanum || c == '.' || c == '_') then
+    throw s!"invalid root module `{redactArg mod}`"
+  if !opts.deployName.isEmpty && (opts.deployName.length > 128 || !opts.deployName.toList.all (fun c => c.isAlphanum || c == '.' || c == '_')) then
+    throw s!"invalid deploy spec name `{redactArg opts.deployName}`"
   liftIO (step s!"bundling verified source for `{appSlug}` (root={mod}, env={opts.envStr})")
   let bundle ← collectSourceBundle (FilePath.mk ".")
   let req : DeployUploadReq := { appSlug, env := opts.envStr, pr := opts.pr, mod, deployName := opts.deployName, bundle }

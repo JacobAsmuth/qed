@@ -186,7 +186,8 @@ private def isLocalGcpDeployInvocation (args : List String) : IO Bool := do
     "--project", "--prod-project", "--nonprod-project", "--tenant", "--app-id",
     "--image", "--api-base", "--dist"]
   if args.any (localFlags.contains ·) then return true
-  if args.any (fun a => a == "--api" || a == "--app" || a == "--no-wait" || a == "--token") then return false
+  if args.any (fun a => a == "--api" || a.startsWith "--api=" || a == "--app" || a.startsWith "--app=" ||
+      a == "--no-wait" || a == "--token" || a.startsWith "--token=") then return false
   let hasGcpEnv ← orB (← (·.isSome) <$> nonEmptyEnv "QED_GCP_PROJECT") ((·.isSome) <$> nonEmptyEnv "QED_GCP_PROD_PROJECT")
   let hasCloudEnv ← orB (← (·.isSome) <$> nonEmptyEnv "QED_CLOUD_API") do
     orB (← (·.isSome) <$> nonEmptyEnv "QED_CREDENTIALS_FILE") ((·.isSome) <$> nonEmptyEnv "QED_CLOUD_TOKEN")

@@ -37,9 +37,16 @@ def isValidEnvName (s : String) : Bool :=
 def isValidDeployStatus (s : String) : Bool :=
   ["queued", "verifying", "building", "deploying", "live", "failed", "canceled"].contains s
 
+private def isAsciiAlnum (c : Char) : Bool :=
+  ('a' ≤ c && c ≤ 'z') || ('A' ≤ c && c ≤ 'Z') || ('0' ≤ c && c ≤ '9')
+
 def isValidDeploymentId (s : String) : Bool :=
-  1 ≤ s.length && s.length ≤ 128 &&
-  s.toList.all (fun c => c.isAlphanum || c == '_' || c == '-')
+  match s.toList with
+  | c :: rest =>
+      let cs := c :: rest
+      1 ≤ cs.length && cs.length ≤ 128 && isAsciiAlnum c &&
+      cs.all (fun ch => isAsciiAlnum ch || ch == '_' || ch == '-')
+  | [] => false
 
 def isValidLogSeverity (s : String) : Bool :=
   ["debug", "info", "warn", "error"].contains s
@@ -59,7 +66,7 @@ def isValidSecretKey (s : String) : Bool :=
   | [] => false
 
 private def forbiddenSourceTopDirs : List String :=
-  [".git", ".lake", ".qed", "dist", "node_modules", "target", ".claude", ".gemini"]
+  ["dist", "node_modules", "target"]
 
 private def allowedSourceExactNames : List String :=
   ["lean-toolchain", "lakefile.lean", "lakefile.toml", "lake-manifest.json",
@@ -75,8 +82,9 @@ private def hasExtIn (exts : List String) (seg : String) : Bool :=
   let lower := seg.toLower
   exts.any fun ext => lower.length > ext.length && lower.endsWith ext
 
-def isBinarySourceExt (seg : String) : Bool :=
-  hasExtIn binarySourceExts seg
+def isBinarySourceExt (p : String) : Bool :=
+  let seg := (p.splitOn "/").getLastD p
+  !seg.startsWith "." && hasExtIn binarySourceExts seg
 
 private def isAllowedSourceExt (seg : String) : Bool :=
   allowedSourceExactNames.contains seg || hasExtIn textSourceExts seg || hasExtIn binarySourceExts seg
@@ -86,7 +94,7 @@ def isValidSourceRelPath (p : String) : Bool :=
   !p.toList.any (fun c => c.toNat < 0x20 || c.toNat == 0x7F || c == '\\' || c == '?' || c == '#' || c == ':') &&
   let segs := p.splitOn "/"
   !segs.isEmpty &&
-  segs.all (fun seg => !seg.isEmpty && seg != "." && seg != ".." && !seg.toLower.startsWith ".env" && !forbiddenSourceTopDirs.contains seg.toLower) &&
+  segs.all (fun seg => !seg.isEmpty && !seg.startsWith "." && !forbiddenSourceTopDirs.contains seg.toLower) &&
   isAllowedSourceExt (segs.getLastD "")
 
 def normalizeApiBase (raw : String) : String :=
@@ -522,6 +530,7 @@ instance : FromJson TokenRevokeResp where
   fromJson j := return { revoked := ← fromField j "revoked" }
 
 #guard isValidAppSlug "my-app-1" && !isValidAppSlug "A" && !isValidAppSlug "my--app" && !isValidAppSlug "-bad"
+#guard isValidDeploymentId "dep_abc-1" && isValidDeploymentId "0123" && !isValidDeploymentId "" && !isValidDeploymentId "-bad" && !isValidDeploymentId "--help" && !isValidDeploymentId "_bad"
 #guard isValidDeployStatus "live" && isValidDeployStatus "canceled" && !isValidDeployStatus "unknown"
 #guard
   ["App.lean", "styles/main.css", "lean-toolchain", "lakefile.lean", "lakefile.toml", "lake-manifest.json",
@@ -532,14 +541,17 @@ instance : FromJson TokenRevokeResp where
    "public/app.js", "public/mod.mjs"].all isValidSourceRelPath
 #guard
   ["../secret.lean", "../logo.png", ".env", ".env.prod", ".env.json", ".ENV.txt",
-   ".git/config.txt", ".lake/a.lean", ".qed/cache.json", "dist/app.mjs",
-   "node_modules/pkg/index.js", "target/out.txt", "/etc/passwd", "public/a\\b.png",
-   "public/a.png?v=1", "public/a.png#frag", "public/a:b.png", "public/a\nb.png", ".png", ".json"].all (!isValidSourceRelPath ·)
+   ".git/config.txt", ".lake/a.lean", ".qed/cache.json", ".config/qed/credentials.json",
+   ".docker/config.json", ".ssh/id_rsa.txt", ".htaccess.txt", "..png", ".a.png",
+   "dist/app.mjs", "node_modules/pkg/index.js", "target/out.txt", "/etc/passwd", "public/a\\b.png",
+   "public/a.png?v=1", "public/a.png#frag", "public/a:b.png", "public/a\nb.png", ".png", "public/.png", ".json"].all (!isValidSourceRelPath ·)
+#guard isBinarySourceExt "public/logo.png" && !isBinarySourceExt "public/.png" && !isBinarySourceExt "public/.a.png" && !isBinarySourceExt ".png"
 #guard
   [ByteArray.empty, ByteArray.mk #[0], ByteArray.mk #[0, 1], ByteArray.mk #[0, 1, 2],
    ByteArray.mk #[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF]].all fun bs =>
     (decodeBase64? (encodeBase64 bs)).map (·.data) == some bs.data
-#guard (decodeBase64? "abc").isNone && (decodeBase64? "ab!d").isNone && (decodeBase64? "AA==AAAA").isNone
+#guard
+  ["abc", "ab!d", "AA==AAAA", "AB==", "AP==", "AAB=", "///=", "//=="].all fun s => (decodeBase64? s).isNone
 #guard isValidCloudApiUrl "http://127.0.0.1:8080" && isValidCloudApiUrl "https://api.qed.cloud" && isValidCloudApiUrl "https://qed-cloud-abc-uc.a.run.app" && !isValidCloudApiUrl "http://example.com" && !isValidCloudApiUrl "https://a.run.app/path"
 #guard isValidDeviceUserCode "ABCD-2345" && !isValidDeviceUserCode "abcd-2345" && !isValidDeviceUserCode "ABCD2345"
 
